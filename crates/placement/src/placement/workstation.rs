@@ -14,7 +14,7 @@ pub use super::devices::{
     census_usable, device_on_host, label, listed_index, resolve, spec_of_device, visible,
     word_picks, workstation_spec,
 };
-use super::{Card, Host, HostTotals, Machine, PlacementError, Plan};
+use super::{Card, Host, HostTotals, Machine, PlacementError, Plan, UnifiedPool};
 
 pub const MIB: u64 = 1 << 20;
 
@@ -40,6 +40,10 @@ pub struct CardSpec {
     /// The other processes holding the device at census time, one named
     /// list, when the tool that reads them answered; `None` names none.
     pub held_by: Option<&'static str>,
+    /// The device allocates from host memory ([`DeviceInfo::integrated`]):
+    /// its free reading is the host's room, and a machine of it plans
+    /// against one pool ([`unified_of`]). False for a card by name.
+    pub integrated: bool,
 }
 
 impl CardSpec {
@@ -68,6 +72,7 @@ pub const A6000: CardSpec = CardSpec {
     device: None,
     free_bytes: None,
     held_by: None,
+    integrated: false,
 };
 
 /// The RTX 3090 [measured, `nvidia-smi`].
@@ -78,6 +83,7 @@ pub const RTX_3090: CardSpec = CardSpec {
     device: None,
     free_bytes: None,
     held_by: None,
+    integrated: false,
 };
 
 /// Every card a plan names by name, the most usable bytes first: the names
@@ -186,13 +192,54 @@ pub fn host() -> Host {
     }
 }
 
+/// The pool a machine of `spec` plans against: the census's reading of an
+/// integrated device ([`CardSpec::integrated`]), which is the host's room;
+/// `None` for a card with memory of its own.
+///
+/// # Panics
+///
+/// On an integrated spec with no free reading: its pool was never read, and
+/// planning it as a card of its own beside this workstation's host would
+/// count the one memory twice. A census spec ([`spec_of_device`]) always
+/// carries the reading.
+#[must_use]
+pub fn unified_of(spec: &CardSpec) -> Option<UnifiedPool> {
+    if !spec.integrated {
+        return None;
+    }
+    let Some(bytes) = spec.free_bytes else {
+        panic!(
+            "{}: an integrated card with no free reading has no pool to plan against; take its \
+             spec from the census (spec_of_device)",
+            spec.name
+        );
+    };
+    Some(UnifiedPool { bytes })
+}
+
+/// The host a machine of `spec` plans beside: on a unified machine the
+/// pool, with no OS reserve, because the reading already leaves out what the
+/// OS and every other process hold; this workstation's [`host`] otherwise.
+/// Panics as [`unified_of`] does.
+#[must_use]
+pub fn host_of(spec: &CardSpec) -> Host {
+    match unified_of(spec) {
+        Some(pool) => Host {
+            usable_bytes: pool.bytes,
+            reserves: Vec::new(),
+        },
+        None => host(),
+    }
+}
+
 /// `spec` runs all `layers` and the head, beside the host tier alone.
 #[must_use]
 pub fn plan_on(spec: CardSpec, layers: usize) -> Machine {
     Machine {
         cards: vec![card(spec, 0..layers, true)],
         tiers: Vec::new(),
-        host: host(),
+        host: host_of(&spec),
+        unified: unified_of(&spec),
     }
 }
 
@@ -213,6 +260,7 @@ pub fn plan_b(layers: usize) -> Machine {
         ],
         tiers: Vec::new(),
         host: host(),
+        unified: None,
     }
 }
 
@@ -459,7 +507,7 @@ fn tiered(
             t
         })
         .collect();
-    let mut h = host();
+    let mut h = host_of(&stage);
     if !tiers.is_empty() {
         h.reserves
             .push((TIER_BATCH_HOST_RESERVE.to_string(), host_rows));
@@ -468,6 +516,7 @@ fn tiered(
         cards: vec![card(stage, 0..layers, true)],
         tiers,
         host: h,
+        unified: unified_of(&stage),
     }
 }
 
@@ -492,8 +541,9 @@ pub fn spec_of(card: &Card) -> Option<CardSpec> {
 /// the smaller room under a cgroup v2 limit ([`host_room`]): the plan's
 /// host experts and tables, the
 /// cards' ring shadows, the host's reserves, `extra` (a residency churn
-/// pool the host set also holds) and the NVMe expert tier's RAM arena
-/// ([`HostNeed::arena`]), less the reserve named [`OS_RESERVE`] —
+/// pool the host set also holds), the NVMe expert tier's RAM arena
+/// ([`HostNeed::arena`]) and on a unified machine the cards' share of the
+/// pool ([`HostNeed::cards`]), less the reserve named [`OS_RESERVE`] —
 /// `MemAvailable` already leaves out what the OS and every other process
 /// hold. The page cache the host set will reuse is inside `MemAvailable`
 /// already, as reclaimable file pages, so no term adds it.
@@ -515,6 +565,10 @@ pub struct HostNeed {
     /// without one. [`HostNeed::bytes`] counts it;
     /// [`HostNeed::plan_bytes`] leaves it to the split dial that shapes it.
     pub arena: u64,
+    /// On a unified machine, what the cards take from the pool the host's
+    /// room is read from (`HostTotals::pool_card_bytes`); 0 where each card
+    /// has memory of its own.
+    pub cards: u64,
     pub os: u64,
     /// The plan was made under a card budget.
     pub card_budget: bool,
@@ -545,6 +599,7 @@ impl HostNeed {
             reserves: totals.reserve_bytes,
             extra,
             arena: totals.nvme_arena_bytes,
+            cards: totals.pool_card_bytes,
             os: os_reserve(host),
             card_budget,
         }
@@ -560,21 +615,29 @@ impl HostNeed {
         host.usable_bytes.saturating_sub(os_reserve(host))
     }
 
-    /// The bytes `MemAvailable` must cover: the plan's host terms, `extra`
-    /// and the arena — what a placed load of this plan holds.
+    /// The bytes `MemAvailable` must cover: the plan's host terms, `extra`,
+    /// the arena and the cards' share of a unified pool — what a placed load
+    /// of this plan holds.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        (self.experts + self.tables + self.shadows + self.reserves + self.extra + self.arena)
+        (self.experts
+            + self.tables
+            + self.shadows
+            + self.reserves
+            + self.extra
+            + self.arena
+            + self.cards)
             .saturating_sub(self.os)
     }
 
-    /// [`HostNeed::bytes`] with the arena out: the plan's own host terms
-    /// and `extra` — the sum the plan-time room arithmetic of
-    /// `expert_nvme_tier` shapes, the arena being its own dial beside it
-    /// (the room that arithmetic splits has already lost the arena).
+    /// [`HostNeed::bytes`] with the arena out: the plan's own host terms,
+    /// `extra` and the cards' share of a unified pool — the sum the
+    /// plan-time room arithmetic of `expert_nvme_tier` shapes, the arena
+    /// being its own dial beside it (the room that arithmetic splits has
+    /// already lost the arena).
     #[must_use]
     pub fn plan_bytes(&self) -> u64 {
-        (self.experts + self.tables + self.shadows + self.reserves + self.extra)
+        (self.experts + self.tables + self.shadows + self.reserves + self.extra + self.cards)
             .saturating_sub(self.os)
     }
 
@@ -633,6 +696,9 @@ impl fmt::Display for HostShort {
         if n.arena > 0 {
             write!(f, " + NVMe tier arena {} B", n.arena)?;
         }
+        if n.cards > 0 {
+            write!(f, " + the cards' share of the unified pool {} B", n.cards)?;
+        }
         write!(
             f,
             " − the OS reserve {} B, which MemAvailable leaves out already. Free host memory, or \
@@ -653,6 +719,12 @@ impl fmt::Display for HostShort {
             write!(
                 f,
                 "; BLOOMERY_CARD_BUDGET moves bytes from the cards to the host, so unset it"
+            )?;
+        }
+        if n.cards > 0 {
+            write!(
+                f,
+                "; the cards take from the same pool, so a smaller --ctx or quant lowers their share"
             )?;
         }
         Ok(())
@@ -875,10 +947,11 @@ pub fn host_room(meminfo: &str, levels: &[CgroupLevel<'_>]) -> Result<(u64, Host
 #[cfg(test)]
 mod tests {
     use super::{
-        A6000, CardSpec, CgroupLevel, DRAFT_RESERVE, HostNeed, HostRead, Machine, PLAN_ROOM,
-        PlacementError, RTX_3090, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes,
-        TierDraft, card, cgroup_room, cgroup_v2_path, host, host_room, mem_available, plan_a,
-        plan_bp, plan_gate, plan_tiers, tier, tier_batch_bytes,
+        A6000, CardSpec, CgroupLevel, DRAFT_RESERVE, DeviceInfo, Host, HostNeed, HostRead, Machine,
+        PLAN_ROOM, PlacementError, RTX_3090, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
+        TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room, cgroup_v2_path, host, host_room,
+        mem_available, plan_a, plan_bp, plan_gate, plan_on, plan_tiers, spec_of_device, tier,
+        tier_batch_bytes, unified_of,
     };
 
     /// One plan room: `tools/ref/plan-room.sh --room`, the room
@@ -914,6 +987,7 @@ mod tests {
             cards: vec![card(spec, 0..layers, true)],
             tiers: Vec::new(),
             host: host(),
+            unified: None,
         }
     }
 
@@ -930,6 +1004,7 @@ mod tests {
             cards: vec![card(A6000, 0..layers, true)],
             tiers: vec![t],
             host: h,
+            unified: None,
         }
     }
 
@@ -1049,6 +1124,68 @@ mod tests {
             plan_tiers(4, A6000, &[t1, t2], None, huge),
             Err(PlacementError::TierBatchHost { tiers: 2, .. })
         ));
+    }
+
+    /// An integrated card's machine plans against one pool: the census's
+    /// reading of it is the pool ([`super::unified_of`]) and the host's
+    /// figure, with no OS reserve ([`super::host_of`]), and a whole load sizes
+    /// its card with the host's reserves among the card's own
+    /// ([`Machine::whole_card`]). The same device with memory of its own
+    /// plans beside this workstation's host, its whole load on its card.
+    #[test]
+    fn an_integrated_card_plans_against_one_pool() {
+        const ROOM: u64 = 120 << 30;
+        let device = |integrated| DeviceInfo {
+            ordinal: 0,
+            name: "NVIDIA GB10".to_string(),
+            total_bytes: 128 << 30,
+            free_bytes: ROOM,
+            integrated,
+            uuid: [0x10; 16],
+            pci_bus: "000f:01:00.0".to_string(),
+            held_by: None,
+        };
+        let pinned = ("pinned".to_string(), 1 << 30);
+        for integrated in [true, false] {
+            let mut m = plan_on(spec_of_device(&device(integrated)), 4);
+            let (pool, figure) = if integrated {
+                let figure = Host {
+                    usable_bytes: ROOM,
+                    reserves: Vec::new(),
+                };
+                (Some(UnifiedPool { bytes: ROOM }), figure)
+            } else {
+                (None, host())
+            };
+            assert_eq!(
+                (m.unified, &m.host),
+                (pool, &figure),
+                "integrated {integrated}"
+            );
+            m.host.reserves.push(pinned.clone());
+            let mut whole = m.cards[0].clone();
+            if integrated {
+                whole.reserves.push(pinned.clone());
+            }
+            assert_eq!(
+                m.whole_card(),
+                Some(whole),
+                "integrated {integrated}: the whole load's card"
+            );
+        }
+    }
+
+    /// An integrated spec with no free reading is refused by name, not
+    /// planned as a card of its own beside this workstation's host.
+    #[test]
+    #[should_panic(
+        expected = "an integrated card with no free reading has no pool to plan against"
+    )]
+    fn an_integrated_card_with_no_reading_has_no_pool() {
+        let _ = unified_of(&CardSpec {
+            integrated: true,
+            ..A6000
+        });
     }
 
     /// V4.1's tier batch at the host union's 512 columns: the allocation
@@ -1263,6 +1400,7 @@ mod tests {
             reserves: 500,
             extra: 50,
             arena: 0,
+            cards: 0,
             os: 400,
             card_budget: true,
         };

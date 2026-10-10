@@ -411,8 +411,8 @@ pub struct PromptBytes {
     pub total: usize,
     /// The units made: as many as the group holds batches.
     pub units: usize,
-    /// The card's free device bytes after them, which the load's plan
-    /// reserved none of them out of.
+    /// The card's free device bytes after them ([`Gpu::alloc_room`]), which
+    /// the load's plan reserved none of them out of.
     pub free: usize,
 }
 
@@ -421,7 +421,7 @@ pub fn prompt_bytes(m: &Mimo2Model) -> Result<Option<PromptBytes>, GpuError> {
     let Some(b) = m.body(WHAT)?.prompt.batch.as_deref() else {
         return Ok(None);
     };
-    let (free, _) = m.gpu().mem_info()?;
+    let free = m.gpu().alloc_room()?;
     Ok(Some(PromptBytes {
         total: b.bytes(),
         units: b.units.len(),
@@ -512,17 +512,17 @@ impl Body {
     }
 
     /// Refused by name when `units` more units of `cap` tokens and `shared`
-    /// more bytes pass the card's free device bytes: the load's plan reserves
-    /// none for the prompt batch, so its buffers come out of what the load
-    /// left free, and a batch that does not fit is refused here, not by the
-    /// driver.
+    /// more bytes pass the card's free device bytes ([`Gpu::alloc_room`]): the
+    /// load's plan reserves none for the prompt batch, so its buffers come out
+    /// of what the load left free, and a batch that does not fit is refused
+    /// here, not by the driver.
     fn refuse_unreserved(&self, gpu: &Gpu, units: usize, shared: usize) -> Result<(), GpuError> {
         let cap = cap_of(self.ctx);
         let need = shared + units * UnitBufs::planned(self.dims.embd, cap);
         if need == 0 {
             return Ok(());
         }
-        let (free, _) = gpu.mem_info()?;
+        let free = gpu.alloc_room()?;
         if need <= free {
             return Ok(());
         }

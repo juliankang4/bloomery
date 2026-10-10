@@ -26,7 +26,13 @@ pub mod workstation;
 /// when none is broken, else every violation it breaks, for the caller's
 /// own refusal of them (each family's `Broken`).
 pub fn checked<'a>(plan: Plan<'a>) -> Result<Plan<'a>, Vec<Violation>> {
-    let broken = plan.violations();
+    checked_beside(plan, 0)
+}
+
+/// [`checked`] for a plan whose load holds `beside` bytes past the plan's
+/// own terms ([`Plan::violations_beside`]).
+pub(crate) fn checked_beside<'a>(plan: Plan<'a>, beside: u64) -> Result<Plan<'a>, Vec<Violation>> {
+    let broken = plan.violations_beside(beside);
     if broken.is_empty() {
         Ok(plan)
     } else {

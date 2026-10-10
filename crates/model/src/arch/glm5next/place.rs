@@ -22,8 +22,8 @@ use crate::arch::coverage;
 use crate::placement::workstation::{self, GRANULE, TierBatchBytes};
 use crate::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine,
-    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation, checked,
-    joined,
+    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
+    checked_beside, joined,
 };
 
 const F16_BYTES: u64 = 2;
@@ -455,7 +455,9 @@ impl PlanInputs {
         if let Some(t) = plan.cards.first_mut() {
             t.grow_kv(beside);
         }
-        let plan = checked(plan).map_err(PlaceError::Broken)?;
+        // The front stays beside the plan's terms (`refuse_front` holds it to
+        // the card), so a unified pool counts it beside them.
+        let plan = checked_beside(plan, front).map_err(PlaceError::Broken)?;
         if let (Some(card), Some(t)) = (machine.cards.first(), plan.cards.first()) {
             let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
             refuse_front(card, card_terms(t), limit, front)?;
@@ -599,6 +601,7 @@ fn nextn_machine() -> Machine {
             usable_bytes: u64::MAX,
             reserves: Vec::new(),
         },
+        unified: None,
     }
 }
 
@@ -771,7 +774,8 @@ impl PlanInputs {
         )?;
         let arena = NEXTN_ARENA_BYTES;
         let front = prompt_reserve_bytes(&self.hp, ctx_max, !machine.tiers.is_empty());
-        let reserve = (nextn_card_bytes(&draft.cards[0]) + arena + front).saturating_add(beside);
+        let nextn_card = nextn_card_bytes(&draft.cards[0]);
+        let reserve = (nextn_card + arena + front).saturating_add(beside);
         let mut plan = placement::plan_routed_reserving(
             &self.model,
             machine,
@@ -784,12 +788,14 @@ impl PlanInputs {
         // The bytes beside the stores ride the stage card's KV term, as
         // [`PlanInputs::plan_slots`] counts them.
         plan.cards[0].grow_kv(beside);
-        let total = card_terms(&plan.cards[0]) + nextn_card_bytes(&draft.cards[0]) + arena;
+        let total = card_terms(&plan.cards[0]) + nextn_card + arena;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let host_headroom = plan.host.headroom_bytes - i128::from(draft.host.expert_bytes);
+        // On a unified machine the pool holds the draft and the front beside
+        // the target's own terms.
         let mut broken: Vec<Violation> = plan
-            .violations()
+            .violations_beside(nextn_card + arena + front + draft.host.expert_bytes)
             .into_iter()
             .filter(|v| !matches!(v, Violation::CardOver { .. } | Violation::HostOver { .. }))
             .chain(
@@ -806,10 +812,13 @@ impl PlanInputs {
                 limit,
             });
         }
-        if host_headroom < 0 {
+        // The host's own bound, as [`Plan::violations`] holds it: a unified
+        // pool's share of the cards is the pool's bound, above.
+        let host_own = host_headroom + i128::from(plan.host.pool_card_bytes);
+        if host_own < 0 {
             let usable = machine.host.usable_bytes;
             broken.push(Violation::HostOver {
-                total: u64::try_from(i128::from(usable) - host_headroom).unwrap_or(u64::MAX),
+                total: u64::try_from(i128::from(usable) - host_own).unwrap_or(u64::MAX),
                 usable,
             });
         }
@@ -1223,9 +1232,13 @@ mod tests {
         use models::{Arch, ChatSpec, ModelSpec};
 
         use super::super::super::hparams::{Hc, Hparams, Indexer};
-        use super::super::{KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlanInputs, row_bytes};
+        use super::super::{
+            KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlaceError, PlanInputs,
+            prompt_reserve_bytes, row_bytes,
+        };
         use crate::placement::{
-            Card, Host, Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role,
+            Card, Host, Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role, UnifiedPool,
+            Violation,
         };
 
         const LAYERS: usize = 4;
@@ -1323,6 +1336,49 @@ mod tests {
                     usable_bytes: u64::MAX,
                     reserves: Vec::new(),
                 },
+                unified: None,
+            }
+        }
+
+        /// [`machine`] on one pool whose census read `pool`: the card's free
+        /// reading and the host's figure are the pool, the host holding a
+        /// pinned reserve so the pool binds before the card's own bound.
+        fn unified(pool: u64) -> Machine {
+            let mut m = machine(LAYERS);
+            m.cards[0].free_bytes = Some(pool);
+            m.host = Host {
+                usable_bytes: pool,
+                reserves: vec![("pinned".to_string(), 1 << 30)],
+            };
+            m.unified = Some(UnifiedPool { bytes: pool });
+            m
+        }
+
+        /// The next-token layer: one norm, a routed down stack (Q8_0, 4,096
+        /// rows of 2,048 an expert) the plan puts on the host, and a latent
+        /// store.
+        fn nextn() -> NextnInputs {
+            let mut model = norms(1);
+            let dims = vec![2048, 4096, 288];
+            model.tensors.push(ModelTensor {
+                name: "blk.0.ffn_down_exps.weight".to_string(),
+                shard: 0,
+                layer: Some(0),
+                role: Role::RoutedExperts,
+                ty: GgmlType::Q8_0,
+                file_bytes: dims.iter().product::<u64>() / 32 * 34,
+                dims,
+                gathered_rows: None,
+            });
+            NextnInputs {
+                index: LAYERS,
+                model,
+                machine: machine(1),
+                kv: NextnKv {
+                    row: row_bytes(512, 128),
+                    pool_row: 256,
+                    kpool: 4,
+                },
             }
         }
 
@@ -1377,18 +1433,8 @@ mod tests {
         /// plan with the next-token layer, at two and three slots.
         #[test]
         fn slot_plans_keep_the_headroom_usable_less_every_term() {
-            let (inputs, machine) = (inputs(), machine(LAYERS));
+            let (inputs, machine, nextn) = (inputs(), machine(LAYERS), nextn());
             let levers = PlanLevers::default();
-            let nextn = NextnInputs {
-                index: LAYERS,
-                model: norms(1),
-                machine: self::machine(1),
-                kv: NextnKv {
-                    row: row_bytes(512, 128),
-                    pool_row: 256,
-                    kpool: 4,
-                },
-            };
             for n in [2, 3] {
                 let plain = inputs
                     .plan_slots(&machine, CTX, &levers, KdaLanes::One, n)
@@ -1400,6 +1446,69 @@ mod tests {
                     .expect("the plan with the next-token layer");
                 let (got, want) = headroom(&with.plan);
                 assert_eq!(got, want, "{n} slots: the plan with the next-token layer");
+            }
+        }
+
+        /// On one pool a plan counts what its load holds beside the plan's own
+        /// terms once on each side: the prompt front of a plain plan, the
+        /// next-token layer's card bytes and arena, its routed experts on the
+        /// host and the front on a plan with it. A pool of exactly the need the
+        /// plan's host headroom counts plans clean, and one byte under it is
+        /// refused once, by the pool's bound, naming those bytes beside the
+        /// plan.
+        #[test]
+        fn slot_plans_on_one_pool_count_the_bytes_beside_once() {
+            let (inputs, nextn) = (inputs(), nextn());
+            let levers = PlanLevers::default();
+            let front = prompt_reserve_bytes(&inputs.hp, CTX, false);
+            let ample: u64 = 1 << 40;
+            let check = |at: &str, plan: &dyn Fn(u64) -> Result<i128, PlaceError>, beside: u64| {
+                let room = plan(ample).unwrap_or_else(|e| panic!("{at}, an ample pool: {e}"));
+                let need = ample - u64::try_from(room).expect("a headroom within the pool");
+                if let Err(e) = plan(need) {
+                    panic!("{at}, a pool of the host's need {need} B: {e}");
+                }
+                match plan(need - 1) {
+                    Err(PlaceError::Broken(v)) => match v.as_slice() {
+                        [Violation::PoolOver { beside: b, .. }] => {
+                            assert_eq!(*b, beside, "{at}: the bytes beside the plan");
+                        }
+                        v => panic!("{at}: {v:?}, not one PoolOver"),
+                    },
+                    other => panic!("{at}, a pool one byte under the need: {other:?}"),
+                }
+            };
+            for n in [1, 2] {
+                check(
+                    &format!("{n} slot(s)"),
+                    &|pool| {
+                        inputs
+                            .plan_slots(&unified(pool), CTX, &levers, KdaLanes::One, n)
+                            .map(|p| p.host.headroom_bytes)
+                    },
+                    front,
+                );
+                let on = unified(ample);
+                let with = inputs
+                    .plan_nextn_slots(&on, CTX, &levers, &nextn, n)
+                    .expect("the plan with the next-token layer");
+                assert!(
+                    with.nextn.host.expert_bytes > 0,
+                    "the draft's experts on the host"
+                );
+                let beside = with.nextn_card_bytes()
+                    + with.arena_bytes
+                    + front
+                    + with.nextn.host.expert_bytes;
+                check(
+                    &format!("{n} slot(s) with the next-token layer"),
+                    &|pool| {
+                        inputs
+                            .plan_nextn_slots(&unified(pool), CTX, &levers, &nextn, n)
+                            .map(|p| p.host_headroom_bytes)
+                    },
+                    beside,
+                );
             }
         }
     }

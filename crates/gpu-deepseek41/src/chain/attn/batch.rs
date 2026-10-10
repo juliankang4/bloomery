@@ -614,7 +614,8 @@ impl BatchCx<'_> {
 impl AttnChain {
     /// The buffers of [`AttnChain::enqueue_batch_layer`] for groups of up to
     /// `sets` batches of up to `tokens` positions, refused by name when they
-    /// do not fit the card's free memory. Load-time only.
+    /// do not fit the card's free memory ([`Gpu::alloc_room`]). Load-time
+    /// only.
     pub fn batch(&self, gpu: &Gpu, tokens: usize, sets: usize) -> Result<AttnBatch, GpuError> {
         let d = &self.dims;
         let stream = gpu.stream();
@@ -666,7 +667,7 @@ impl AttnChain {
             hc_k: HC_STREAMS * d.n_embd,
         };
         let need = lens.bytes();
-        let (free, _) = gpu.mem_info()?;
+        let free = gpu.alloc_room()?;
         if tokens == 0 || sets == 0 || need > free {
             return Err(GpuError::Shape {
                 what: WHAT_BATCH,

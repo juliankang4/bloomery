@@ -156,7 +156,10 @@ gguf 9 2 0
 # PIN(2026-10-11): gpu 1647 -> 1658 blocks, 180 -> 181 fns, moved from gpu-deepseek41 (card sum/places), not new code:
 # card_slots.rs holds the entries ds41_ffn_places, ds41_ffn_card_acc and ds41_ffn_card_acc_8 with their helper fn and
 # launchers, each block with its SAFETY line; gpu-deepseek41 comes down by the same blocks and fn below.
-gpu 1658 181 8
+# PIN(2026-10-11): gpu 1658 -> 1659 blocks, new code, not old code relaxed: the census reads
+# CU_DEVICE_ATTRIBUTE_INTEGRATED (lib.rs raw_device_integrated, one block, with its SAFETY line), the census calls
+# beside it being raw driver calls of the same form.
+gpu 1659 181 8
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

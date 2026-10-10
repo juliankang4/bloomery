@@ -11,6 +11,11 @@
 //! Q6_K head's walk adds its activation (`mtp_head_act_bytes`) beside the
 //! arena; on that card the fill must give an expert back for it.
 //!
+//! On one pool (GB10) the drafted plan counts the draft once on each side:
+//! the host's need leaves the cards their share with the draft's card bytes
+//! in it, under either expert rule, and the pool's bound holds the draft
+//! beside the plan's own terms.
+//!
 //! No file, no card: the four-layer synthetic file of the place module's
 //! slot tests, each layer's three routed stacks of types the card experts
 //! read, and the shared MTP draft as its header states it.
@@ -24,10 +29,13 @@ use model::arch::models::{
 use model::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, Variant};
 use model::arch::qwen35moe::mtp::BorrowedHead;
 use model::arch::qwen35moe::place::{
-    Experts, FileTensor, KvLayout, MtpInputs, PlanInputs, mtp_head_act_bytes, mtp_tensors,
+    Experts, FileTensor, KvLayout, MtpInputs, PlaceError, PlanInputs, mtp_head_act_bytes,
+    mtp_tensors,
 };
 use model::placement::workstation::{CONTEXT, GRANULE, MARGIN, SCRATCH};
-use model::placement::{Card, Host, Machine, ModelTensor, ModelTensors, PlanLevers, Role};
+use model::placement::{
+    Card, Host, Machine, ModelTensor, ModelTensors, PlanLevers, Role, UnifiedPool, Violation,
+};
 
 const CTX: u64 = 4096;
 const LAYERS: usize = 4;
@@ -298,6 +306,7 @@ fn machine(usable: u64) -> Machine {
             usable_bytes: u64::MAX,
             reserves: Vec::new(),
         },
+        unified: None,
     }
 }
 
@@ -347,5 +356,60 @@ fn a_drafted_card_plan_keeps_its_bound_at_any_slack() {
             with.draft_card_bytes() + with.arena_bytes,
             "{slots} slot(s): a plan (b′) reserve is not what the drafted plan counts"
         );
+    }
+}
+
+/// [`machine`] on one pool whose census read `pool`: the card's free reading
+/// and the host's figure are the pool, with no OS reserve
+/// (`workstation::host_of`).
+fn unified(usable: u64, pool: u64) -> Machine {
+    let mut m = machine(usable);
+    m.cards[0].free_bytes = Some(pool);
+    m.host = Host {
+        usable_bytes: pool,
+        reserves: Vec::new(),
+    };
+    m.unified = Some(UnifiedPool { bytes: pool });
+    m
+}
+
+/// A pool of exactly the need the plan's host headroom counts plans clean,
+/// and one byte under it is one `PoolOver` naming the draft's card bytes
+/// beside the plan: the two sides count the cards, the draft and the
+/// context's own creation cost alike.
+#[test]
+fn a_drafted_plan_on_one_pool_counts_the_draft_once() {
+    let inputs = inputs();
+    let levers = PlanLevers::default();
+    let q8 = mtp(BorrowedHead::Q8_0);
+    // The plan's host headroom, or its refusal.
+    let plan = |experts, slots, pool| {
+        inputs
+            .plan_mtp_with_slots(&unified(WIDE, pool), CTX, &levers, &q8, experts, slots)
+            .map(|p| p.plan.host.headroom_bytes)
+    };
+    let ample: u64 = 1 << 40;
+    for experts in [Experts::Card, Experts::Host] {
+        for slots in [1, 2] {
+            let at = format!("{experts:?}, {slots} slot(s)");
+            let room =
+                plan(experts, slots, ample).unwrap_or_else(|e| panic!("{at}, an ample pool: {e}"));
+            let need = ample - u64::try_from(room).expect("a headroom within the pool");
+            if let Err(e) = plan(experts, slots, need) {
+                panic!("{at}, a pool of the host's need {need} B: {e}");
+            }
+            match plan(experts, slots, need - 1) {
+                Err(PlaceError::Broken(v)) => match v.as_slice() {
+                    [Violation::PoolOver { beside, .. }] => assert_eq!(
+                        *beside,
+                        q8.card_bytes_of(CTX, slots)
+                            .expect("the draft's card bytes"),
+                        "{at}: the bytes beside the plan"
+                    ),
+                    v => panic!("{at}: {v:?}, not one PoolOver"),
+                },
+                other => panic!("{at}, a pool one byte under the need: {other:?}"),
+            }
+        }
     }
 }

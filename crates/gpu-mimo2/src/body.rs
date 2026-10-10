@@ -1008,10 +1008,10 @@ impl Slots for Body {
     /// A sequence of the load's shape in the state the load leaves
     /// ([`ChainBody::reset`]'s contract): zeroed stores of the live ones'
     /// positions and kv heads. Refused by name past the sequences the load's
-    /// plan counts ([`Body::open_placed_slots`]), and when the card has
-    /// fewer free bytes than the stores take (the prompt batch's buffers
-    /// are unreserved and come out of the same free bytes). Load-time
-    /// allocation.
+    /// plan counts ([`Body::open_placed_slots`]), and when the card has fewer
+    /// free bytes ([`Gpu::alloc_room`]) than the stores take (the prompt
+    /// batch's buffers are unreserved and come out of the same free bytes).
+    /// Load-time allocation.
     fn new_seq(&mut self, gpu: &Gpu) -> Result<Seq, GpuError> {
         if self.slots_made >= self.slots_planned {
             return Err(shape(format!(
@@ -1022,7 +1022,7 @@ impl Slots for Body {
             )));
         }
         let need = self.seq_bytes();
-        let (free, _) = gpu.mem_info()?;
+        let free = gpu.alloc_room()?;
         if need > free {
             return Err(shape(format!(
                 "a sequence of {need} B of stores, and the card has {free} B free"

@@ -940,8 +940,9 @@ pub struct PromptBytes {
     pub units: usize,
     /// The host sums' buffer.
     pub hsum: usize,
-    /// The card's free device bytes after them: what a group's units past
-    /// the first came out of, the plan reserving none for them.
+    /// The card's free device bytes after them ([`Gpu::alloc_room`]): what a
+    /// group's units past the first came out of, the plan reserving none for
+    /// them.
     pub free: usize,
 }
 
@@ -950,7 +951,7 @@ pub fn prompt_bytes(m: &Glm5nextModel) -> Result<Option<PromptBytes>, GpuError> 
     let Some(b) = m.body(WHAT)?.prompt.batch.as_deref() else {
         return Ok(None);
     };
-    let (free, _) = m.gpu().mem_info()?;
+    let free = m.gpu().alloc_room()?;
     Ok(Some(PromptBytes {
         shared: b.bufs.bytes(),
         unit: b.units.first().map_or(0, UnitBufs::bytes),
@@ -1398,11 +1399,11 @@ impl Body {
         Ok(())
     }
 
-    /// Refused by name when `units` more units of a group ([`unit_bytes`]
-    /// each) pass the card's free device bytes: the plan reserves the units
-    /// a group of [`place::PROMPT_GROUP`] holds past the first
-    /// ([`place::prompt_reserve_bytes`]), and a larger group's come out of
-    /// what the load left free, its margin included, so a group that does
+    /// Refused by name when `units` more units of a group ([`unit_bytes`] each)
+    /// pass the card's free device bytes ([`Gpu::alloc_room`]): the plan
+    /// reserves the units a group of [`place::PROMPT_GROUP`] holds past the
+    /// first ([`place::prompt_reserve_bytes`]), and a larger group's come out
+    /// of what the load left free, its margin included, so a group that does
     /// not fit is refused here, not by the driver.
     fn refuse_unreserved(&self, gpu: &Gpu, units: usize) -> Result<(), GpuError> {
         if units == 0 {
@@ -1410,7 +1411,7 @@ impl Body {
         }
         let cap = T_MAX.min(self.ctx);
         let extra = units * unit_bytes(self.dims.embd, cap, self.card.tier().is_some());
-        let (free, _) = gpu.mem_info()?;
+        let free = gpu.alloc_room()?;
         if extra <= free {
             return Ok(());
         }
