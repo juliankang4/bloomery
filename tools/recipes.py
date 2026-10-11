@@ -3710,8 +3710,9 @@ def carrier_covered(c: Carrier, bin: str, bundles: Iterable[str]) -> bool:
     return bin == c.bin if c.bin is not None else bin not in c.siblings
 
 
-def kernel_carriers(side: Side, gates: list[str]) -> list[Carrier]:
+def kernel_carriers(side: Side, gates: list[str], skip: dict[str, str] | None = None) -> list[Carrier]:
     tree = side.tree
+    skip = CARRIER_SKIP if skip is None else skip
 
     def has_kernels(src: str) -> bool:
         files, _ = tree.tree_of(src)
@@ -3720,7 +3721,7 @@ def kernel_carriers(side: Side, gates: list[str]) -> list[Carrier]:
     out: list[Carrier] = []
     for p in sorted(tree.packages.values(), key=lambda p: p.name):
         for t in p.targets:
-            if t.kind not in ("lib", "bin") or not has_kernels(t.src):
+            if t.kind not in ("lib", "bin") or (p.name == SCAN_PACKAGE and t.kind == "bin" and t.name in skip) or not has_kernels(t.src):
                 continue
             if t.kind == "lib":
                 files = set(tree.lib_files(p.name))
@@ -3844,6 +3845,11 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
 # `just narrow` prints per bin shows which bundles each scan carried.
 
 SCAN_PACKAGE = "bloomery-gpu-gates"  # the package whose bins `just ptx-scan` builds and tools/ptx-scan.sh reads
+# A bin of SCAN_PACKAGE with kernels of its own left out of the kernel carriers: bin name -> reason. No scan set
+# builds it and narrow() keeps no gate for it, so a bin some gate links cannot be named here (scan_set_self_test).
+CARRIER_SKIP: dict[str, str] = {
+    "link_probe": "the probe's kernel is its own and no gate links it",
+}
 
 
 @dataclass
@@ -3885,7 +3891,7 @@ def scan_set(side: Side) -> list[ScanPick]:
     shapes = scan_shapes(side)
     pkg = side.tree.packages[SCAN_PACKAGE]
     cands: list[tuple[str, tuple[str, ...], list[int]]] = []
-    for bin_name in sorted(shapes):
+    for bin_name in sorted(set(shapes) - set(CARRIER_SKIP)):
         for feats in sorted(shapes[bin_name]):
             bundles = set(side.tree.closure(pkg, list(feats), False))
             bundles |= {c.bundle for c in carriers if c.bundle == pkg.name and c.bin in (None, bin_name)}
@@ -7052,6 +7058,14 @@ def scan_set_self_test(expect, side: Side) -> None:
            f"scan-set: the real tree's picks leave {sorted({c.label for c in carriers} - covered)} uncovered")
     expect({c.bin for c in carriers if c.bin} <= {p.bin for p in picks}, f"scan-set: a bin carrier whose own scan is not in the set: {[(p.bin, p.features) for p in picks]}")
     expect(all(c.bundle for c in carriers), "scan-set: a carrier with no bundle name")
+    # a bin of the package with kernels and no gate is left out by name, and every name left out is such a bin
+    every = {c.bin: c.recipes for c in kernel_carriers(side, gates, {}) if c.bin and c.bundle == SCAN_PACKAGE}
+    for n in sorted(every):
+        expect(n in CARRIER_SKIP or every[n], f"scan-set: bin {n} has kernels and no gate links it, and CARRIER_SKIP does not name it")
+    for n, why in sorted(CARRIER_SKIP.items()):
+        expect(n in every, f"scan-set: CARRIER_SKIP names {n}, which is no bin of {SCAN_PACKAGE} with kernels")
+        expect(not every.get(n), f"scan-set: CARRIER_SKIP names {n}, which {' '.join(every.get(n) or [])} links")
+        expect(why.strip() != "", f"scan-set: CARRIER_SKIP {n}: no reason")
 
     def build(tmp: str, name: str, libc: bool = False, other: bool = False, recipe: str = "") -> Side:
         root = os.path.join(tmp, name)

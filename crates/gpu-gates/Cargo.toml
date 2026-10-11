@@ -339,6 +339,10 @@ name = "h2d_probe"
 required-features = ["gpu"]
 
 [[bin]]
+name = "link_probe"
+required-features = ["gpu"]
+
+[[bin]]
 name = "forced_probe"
 required-features = ["gpu"]
 

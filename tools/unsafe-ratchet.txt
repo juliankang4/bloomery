@@ -224,7 +224,16 @@ gpu-deepseek41 402 45 0
 # block, its SAFETY line) — the model crate's mincore reader is private to the lock walk, and the clause's
 # instrument must not be the engine's own mapping.
 # PIN(2026-10-11): gpu-gates 62 -> 61 blocks, lowered to the tree's count (the base holds one block fewer than its pin).
-gpu-gates 61 5 1
+# PIN(2026-10-11): gpu-gates 61 -> 120 blocks, 5 -> 26 fns, new code, not old code relaxed: link_probe (the 8.9
+# protocol probe) and its shared/verbs.rs. The blocks are the calls into libibverbs loaded at run time (dlopen, dlsym,
+# one per resolved entry, the verbs and the context's post and poll entries), the CUDA driver calls on the probe's host
+# page and streams, and the lines kernel's accesses, each with its SAFETY line. The fns are the `unsafe extern "C" fn`
+# pointer types the loader fills, and two unsafe fns: the symbol lookup (the caller names the prototype) and the memory
+# registration (the caller keeps the range allocated).
+# PIN(2026-10-11): on main's 61 5 1: 61 + 46 verbs (dlopen, dlsym and its cast 3, the 16 entries, 26 calls and reads,
+# link_probe's call of the registration 1) + 9 CUDA (the module load, the window, 4 driver calls, the page's zeroing and
+# word view, the memop zero) + 4 kernel accesses = 120 blocks, 5 + 19 fn pointer types + 2 unsafe fns = 26 fns.
+gpu-gates 120 26 1
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and
