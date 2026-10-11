@@ -69,6 +69,16 @@
 //! - room: a ring the card's free bytes past `keep_free` cannot hold is
 //!   refused by its own name (`XSTREAM_ROOM`), which a caller resolving an
 //!   unset lever tells from every other refusal.
+//! - drop: a stream of more experts than staging slots into a half whose
+//!   read the engine stream holds, dropped with fill threads waiting for a
+//!   slot those copies drain, and the read let go [`DROP_HOLD`] into the
+//!   drop: the drop drains the copy stream once the read goes, within the
+//!   deadline (mutant: the drop's `u32::MAX` store, which the cyclic wait
+//!   does not pass, published or not; or no release, which leaves the jobs
+//!   the stopped threads never published: the drop runs out its deadline,
+//!   or, where the driver's frees past the leak wait on the copy stream,
+//!   never returns, and the clause ends the process red past
+//!   [`DROP_BOUND`]).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -83,8 +93,8 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
     use bloomery_gpu::host::batch::BatchKey;
@@ -99,6 +109,7 @@ mod gate {
     use cuda_core::{CudaStream, DeviceBuffer, sys};
     use runtime::sched::{Item, Overlap, PortKind, order_in};
     use runtime::xsplit::{Constants, Split};
+    use threads::helper::{Placement, spawn_helper};
 
     const L: usize = 2;
     const E: usize = 16;
@@ -118,6 +129,12 @@ mod gate {
     /// stream is issued: past the copies' time, so copies that did not wait
     /// for the half's read event land under the held snapshot.
     const HOST_WAIT: Duration = Duration::from_millis(100);
+    /// How long `drop` holds the half's read into the drop: past the fill
+    /// threads' stop and join, under a third of the deadline.
+    const DROP_HOLD: Duration = Duration::from_millis(200);
+    /// How long after the held read goes `drop` waits for the drop to
+    /// return before it ends the process red: past the drop's own deadline.
+    const DROP_BOUND: Duration = Duration::from_secs(5);
 
     /// The gate's costs: a host column far dearer than a copy of the
     /// synthetic expert and its card columns, so neither the floor nor the
@@ -716,6 +733,64 @@ mod gate {
         );
         ok &= room_ok;
 
+        // drop: layer 0's next stream takes the half whose read the engine
+        // stream holds; past the staging slots, its fill threads wait for
+        // the held copies to drain their slots when the drop stops them.
+        let mut held = XStream::new(
+            ctx,
+            stream,
+            Arc::clone(&src) as Arc<dyn SwapSource>,
+            L,
+            cfg(2, 4),
+        )?;
+        let slots = held.staging_slots();
+        if slots != 4 {
+            return Err(format!("drop: the stream has {slots} staging slots, want 4").into());
+        }
+        let lever = Arc::new(HostFlags::new(ctx, 1)?);
+        lever.clear(0)?;
+        held.begin_call();
+        let _ = unit(&mut held, stream, 0, &ca)?;
+        lever.enqueue_wait(stream, 0)?;
+        held.read(0, stream)?;
+        let _ = unit(&mut held, stream, 1, &ca)?;
+        held.read(1, stream)?;
+        let streamed = unit(&mut held, stream, 0, &ca)?.streamed;
+        let (go, dropping) = mpsc::channel::<()>();
+        let (raised_tx, raised) = mpsc::channel();
+        let (done, returned) = mpsc::channel::<()>();
+        let raiser = Arc::clone(&lever);
+        let (raise, _) = spawn_helper("xstream-drop-raise", Placement::Float, move || {
+            let _ = dropping.recv();
+            std::thread::sleep(DROP_HOLD);
+            let _ = raised_tx.send(raiser.raise(0));
+            // A drop blocked inside the driver has nothing that returns it.
+            if let Err(mpsc::RecvTimeoutError::Timeout) = returned.recv_timeout(DROP_BOUND) {
+                println!(
+                    "drop: the drop did not return in {DROP_BOUND:?} after the held read went {}",
+                    verdict(false)
+                );
+                std::process::abort();
+            }
+        })?;
+        let _ = go.send(());
+        let t0 = Instant::now();
+        drop(held);
+        let dropped = t0.elapsed();
+        let _ = done.send(());
+        let _ = raise.join();
+        raised
+            .recv()
+            .map_err(|_| "the thread raising the held read ended before it raised")??;
+        let drop_ok = streamed > slots && dropped >= DROP_HOLD && dropped < DEADLINE;
+        println!(
+            "drop: {streamed} experts over {slots} staging slots behind a read held {DROP_HOLD:?} \
+             into the drop: dropped in {dropped:?} (want under the {DEADLINE:?} deadline) {}",
+            verdict(drop_ok)
+        );
+        ok &= drop_ok;
+        stream.synchronize()?;
+
         if ok {
             println!(
                 "gate_xstream: PASS — the stream is the rule's set cut at the half in rank order, \
@@ -724,8 +799,9 @@ mod gate {
                  stream waits for the half's read, an unread stream refuses the call's end, \
                  units of a layer share its stream and close it at the last read, the \
                  walk's order marks a unit's front before its sibling's landing, a \
-                 stuck lane is a named error within its deadline, and a ring with no room is \
-                 refused by its own name."
+                 stuck lane is a named error within its deadline, a ring with no room is \
+                 refused by its own name, and a drop with copies waiting on unpublished staging \
+                 drains once their half's read goes."
             );
             Ok(())
         } else {

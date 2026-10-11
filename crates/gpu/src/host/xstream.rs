@@ -560,6 +560,23 @@ impl LaneShared {
         self.word(2 * k + 1)
     }
 
+    /// Let through every copy the copy stream holds behind a staging word,
+    /// `issued` jobs issued: each slot's word gets the last ticket issued to
+    /// it, which every wait on that slot is at or below. The wait is cyclic
+    /// (`(i32)(word - ticket) >= 0`), so `u32::MAX` would not release a
+    /// ticket below 2^31. For the drop only, once the fill threads are
+    /// joined. Every issued ticket fits u32 (`copy_expert` refuses one past
+    /// it).
+    fn release_waits(&self, issued: u64) {
+        let slots = self.slots as u64;
+        for n in issued.saturating_sub(slots)..issued {
+            if let Ok(ticket) = u32::try_from(n / slots + 1) {
+                self.staged((n % slots) as usize)
+                    .fetch_max(ticket, Ordering::AcqRel);
+            }
+        }
+    }
+
     /// Wait until `ready`, within the deadline: `Ok(false)` when the lane
     /// stops first.
     fn wait_until(&self, ready: impl Fn() -> bool, what: &str) -> Result<bool, GpuError> {
@@ -1541,7 +1558,7 @@ impl Drop for XStream {
             shared,
             tx,
             threads,
-            ..
+            jobs,
         } = &mut self.lane
         {
             shared.stop.store(true, Ordering::Release);
@@ -1549,11 +1566,10 @@ impl Drop for XStream {
             for t in threads.drain(..) {
                 let _ = t.join();
             }
-            // Every copy still waiting on a staging word goes through: the
-            // bytes it copies land in a half no reader is left for.
-            for k in 0..shared.slots {
-                shared.staged(k).store(u32::MAX, Ordering::Release);
-            }
+            // Every copy still waiting on a staging word goes through, the
+            // ones whose job a stopped fill thread never published among
+            // them: the bytes it copies land in a half no reader is left for.
+            shared.release_waits(*jobs);
         }
         if let Err(e) = poll_drained(&self.copy, self.cfg.deadline) {
             let why = match e {
