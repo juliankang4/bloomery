@@ -1,151 +1,337 @@
-# `just contrib-check`: one off-box verification command (T0 and T1 implemented, T2 designed)
+# Checking a change on your own machine
 
-A contributor needs one command that answers "is my change green?" on their own machine. The gates are `just gate-*`
-recipes, and 278 lines of the `justfile` run through `tools/box.sh`, which ssh's to the maintainers' one workstation
-(`tools/box.sh:42,225`, `docs/BUILD.md:5`). `just contrib-check` runs the tiers that need no workstation: T0 and T1 are
-built (`tools/contrib-check.sh`, with the unit runner it shares with the nightly, `tools/nightly/units.sh`), and
-`.github/workflows/pr.yml` runs T0 on every pull request. T2, the card and fixture tier, is designed below and not built;
-this page lists the box assumptions it must bypass with their size, and who does each change. Every claim cites
-`path:line`, and `[unverified]` marks what I could not check. The result of `contrib-check` is the contributor's evidence in
-a pull request, never landing evidence: the maintainers' box record still decides (`AGENTS.md`, "Never run a gate on the
-Mac").
+This page is for a contributor who wants to check a change before opening a pull request. It says what to run on a Mac,
+on a Linux machine with no card and on a Linux machine with an NVIDIA card, what a green result shows, and what to paste
+into the pull request. How a pull request is then verified and merged is in `CONTRIBUTING.md`, "How a pull request is
+verified and merged"; what a number from your own card must carry is in its "Rules", "Numbers carry their conditions".
 
-## What already runs off the box
+One line per machine. On any OS, `just contrib-check --tier t0`. On a Mac, also `just mac-static`, once its environment
+file exists. On x86_64 or aarch64 Linux, with or without a card, `just contrib-check --tier t1`. On Linux with an NVIDIA
+card, also the gates themselves in local mode: `BLOOMERY_BOX_LOCAL=1 BLOOMERY_TIER=fixture just gate-<x>`. A Mac never
+runs a gate. Without `BLOOMERY_BOX_LOCAL=1`, a `just gate-*` recipe sends its command over ssh to the maintainers'
+workstation (the box), which a contributor cannot reach.
 
-- **Pure crates:** `python3 tools/recipes.py pure-crates` derives the list (today `bloomery-decision`, `-hf`, `-jinja`,
-  `-levers`, `-models`, `-placement`, `-refset`, `-runtime`, `-sampler`, `-serve`, `-tokenizer`, `-vision`);
-  `just mac-test` runs `cargo test -p` on each natively on a Mac (`tools/mac-check.sh:1-15`).
-- **The Mac static tier:** `just mac-static [BASE]` runs fmt-check, clippy as an x86_64-linux cross check, the scoped
-  build shapes (`recipes.py combos`) and every `tools/check-*.sh` in two lanes (`tools/mac-static.sh:1-15`).
-- **The host tier, x86_64 or aarch64 Linux, no card, no model file:** `python3 tools/recipes.py host-nightly` prints one unit a
-  line, `name<TAB>command` (`bloomery-app`, `-gguf`, `-model`, `-qdot`, `-threads`, ... each `bash tools/gate.sh --release
-  --locked -p <crate> --no-fail-fast`, then every `tools/check-*.sh` and `recipes-self-test`); `--excluded` names the six
-  device crates it leaves out. `tools/nightly/run.sh` runs that list nightly on a VPS that is not the box and its header
-  states that machine's differences: `RUSTFLAGS='-C target-cpu=x86-64-v3'` overrides the repo's `znver3`
-  (`run.sh:55`), libclang 18 for bindgen, the CUDA 13.3 headers only, no model file (`run.sh:36-39`;
-  `tools/nightly/install.sh:7-17` lists the apt and CUDA header packages).
-- **A recipe's inner command:** `python3 tools/recipes.py box-command RECIPE` prints the text inside a recipe's
-  `./tools/box.sh '…'` (`tools/recipes.py:15,1907`; `gate-mimo2-meta` prints `bash tools/gate.sh --release -p
-  bloomery-model --lib -- arch::mimo2 …`). It refuses a recipe whose box call carries an env prefix such as
-  `BLOOMERY_MODEL=qwen4exp` (verified by running it on `gate-gpu-qwen4exp-e2e`), because the prefix is the model
-  profile that only `box.sh` applies. `tools/gate.sh` itself is a `cargo test` with a bound and runs on any host
-  with GNU `timeout`.
-- **The affected list:** `just affected BASE` prints the gate recipes a change selects, on any machine with `python3`
-  and `just`, building nothing (`justfile:87`).
+Two pieces are not built yet: T2, one command that runs your gate list on your card, and the command that prints that
+list. Section 3 gives the steps to use until then, and section 6 lists everything that is still only designed.
 
-## The command
+Words this page uses. A *gate* is a `just gate-*` recipe that checks the code against a reference, most of them on a
+card. The *real tier* runs a gate on the model's real file; the *fixture tier* (`BLOOMERY_TIER=fixture`) runs it on the
+family's *fixture*, a small file of the same architecture with generated weights. A *real-only* gate has no fixture-tier
+form, and a *real-file* gate still opens the real file at the fixture tier; neither is on a contributor's list
+(section 3). The `fx_` *reference sets* are what the fixture-tier gates compare against, dumped by `ik` (ik_llama.cpp,
+the numerical reference). The *lease* is the machine-wide lock a timing run takes, and a *hold* is a file that makes
+other box commands wait while it exists. An *arm* is one configuration a timing run measures, and the *ruler* is how far
+runs of the same binary scatter on one machine. *DSpark* is V4.1's draft model for speculative decoding.
 
-`just contrib-check [--tier t0|t1]` is a recipe that calls one script, `tools/contrib-check.sh` (`just check-recipes`
-forbids a test recipe with `||` or a bare `cargo test`, so the logic lives in the script). The default tier is T1 on
-x86_64 Linux and T0 elsewhere; `--tier t2` prints `T2 is not built yet` and exits 64, and `--tier t1` on a host other than
-x86_64 or aarch64 Linux is a named 64. The script reads every list from its owner and copies none: the pure crates
-from `recipes.py pure-crates`, the Python self-tests from the `selftests=(` array of `tools/check-recipes.sh`, the host
-units from `recipes.py host-nightly`.
+## 1. What to run on your machine
+
+| Machine | Command | A green result shows | Needs |
+|---|---|---|---|
+| Any OS, a Mac included | `just contrib-check --tier t0` | formatting, the pure crates' tests, the Python tool self-tests and every `tools/check-*.sh` pass | the pinned nightly through rustup, `python3` 3.11 or later with numpy and PIL, `just` (section 2) |
+| Mac | `just mac-static [BASE]` | formatting, clippy and the build shapes `BASE`'s change touches check as x86_64 Linux, and every check script passes; no test or gate runs | the environment file the header of `tools/mac-check.sh` describes (section 2) |
+| x86_64 or aarch64 Linux, with or without a card | `just contrib-check --tier t1` | T0, then the tests of every crate that reaches no card | the CUDA headers, libclang, numpy and PIL (section 2) |
+| Linux with an NVIDIA card | `BLOOMERY_BOX_LOCAL=1 BLOOMERY_TIER=fixture just gate-<x>`, for each gate of your list | that gate passes on your card at the fixture tier | an environment file, the fixtures and the reference sets (sections 3 and 4) |
+
+Paste what each command printed into the pull request: for `contrib-check`, its header block, its unit lines and its
+`DONE` line; for a gate, its summary lines and its exit code. Name the machine as `CONTRIBUTING.md` asks ("Pull requests
+for your own hardware"). CI runs `just contrib-check --tier t0` on every pull request (`.github/workflows/pr.yml`).
+
+## 2. `just contrib-check` (T0 and T1)
+
+`just contrib-check [--tier t0|t1] [--only REGEX]` runs one script, `tools/contrib-check.sh`. The default tier is T1 on
+x86_64 Linux and T0 everywhere else, aarch64 Linux included, where `--tier t1` runs T1. `--tier t1` on any other host is
+a named exit 64, and `--tier t2` prints `T2 is not built yet` and exits 64. `--only REGEX` runs just the units whose name
+matches, for example a red unit again. The script reads every list from its owner and copies none: the pure crates from
+`python3 tools/recipes.py pure-crates`, the Python self-tests from the `selftests=(` array of `tools/check-recipes.sh`,
+and the host units from `python3 tools/recipes.py host-nightly`.
 
 | Tier | Where | Runs |
 |---|---|---|
-| T0 | any OS with the pinned nightly (rustup, rustfmt) | `cargo fmt --all -- --check`; `cargo test -p <crate>` for each crate of `recipes.py pure-crates`; `python3 tools/recipes.py --self-test`; each Python tool self-test `check-recipes.sh` lists; every `tools/check-*.sh`. None of the check scripts is left out: each reads the tree and runs no cargo and no box command, `host-nightly` runs the same set, and all ran green on a Mac. The earlier draft of this page excluded `check-rustflags` as the maintainers' after a CPU change; it holds `.cargo/config.toml` against `.cargo/cuda-oxide.toml` and never reads this machine's CPU, so it runs |
-| T1 | x86_64 or aarch64 Linux, no card needed | T0, then every unit of `recipes.py host-nightly` that T0 did not already run under the same name (the check scripts and `recipes-self-test` run once), each `bash tools/gate.sh --release --locked -p <crate>` under a bound (`CONTRIB_UNIT_BOUND`, default 1200 s). Needs what `tools/nightly/install.sh` lists: the CUDA 13.3 headers, libclang for bindgen, python3-numpy and python3-pil |
-| T2 | T1 plus an NVIDIA card and fixtures | **not built.** The fixture-tier family gates: `just affected BASE`, run serially under `BLOOMERY_TIER=fixture`; a recipe the tier refuses by name (rc 66 from `tools/ref/real-only.sh` or `ref-paths.sh`; `gate-batch.sh` counts such items as `deferred`) is printed `DEFER`, never counted green (`tools/ref/fixture-only.sh` stops only the real tier, so a fixture-only recipe runs here) |
+| T0 | any OS with the pinned nightly (rustup, rustfmt) and `python3` 3.11 or later (`tools/recipes.py` reads `Cargo.lock` with `tomllib`) with numpy and PIL | `cargo fmt --all -- --check`; `cargo test -p <crate>` for each crate of `recipes.py pure-crates`; `python3 tools/recipes.py --self-test`; each Python tool self-test `check-recipes.sh` lists (some import numpy and PIL, which CI installs before T0); every `tools/check-*.sh`. Each check script reads the tree and runs no cargo and no box command, so none is left out |
+| T1 | x86_64 or aarch64 Linux, no card needed | T0, then every unit of `recipes.py host-nightly` that T0 did not already run under the same name, each `bash tools/gate.sh --release --locked -p <crate>`. Needs what `tools/nightly/install.sh` lists: the CUDA 13.3 headers under `CUDA_TOOLKIT_PATH`, libclang for bindgen, python3-numpy and python3-pil |
 
-`RUSTFLAGS`: on x86_64 Linux the script sets `-C target-cpu=native` for every cargo unit unless `RUSTFLAGS` is already set
-(a binary built for the repo's `znver3` may stop with an illegal instruction on another CPU, `docs/BUILD.md:51`). The nightly
-sets `x86-64-v3` for its own VPS (`tools/nightly/run.sh:55`). The two callers share one unit runner, `tools/nightly/units.sh`
-(`run_unit`, `unit_failure`): how a unit's exit code, counts and failing tests are read is one piece of code.
+T1 leaves out the six device crates (`python3 tools/recipes.py host-nightly --excluded` names them). A device crate is
+built only with `cargo oxide`, never with plain `cargo` (`AGENTS.md`, "Never"), and the gate recipes of section 3 build
+them that way.
 
-Output (built): a header (commit, host, toolchain, `RUSTFLAGS`, bound), one line per unit, `<name> rc=<n> <seconds>s`, under a
-red one its failing tests or first red lines and its log path, then `DONE tier=… total=… red=… wall=…s`. Each unit's log is
-in `target/contrib-check/<time>/<name>.log`. A host without GNU `timeout` (macOS) runs units unbounded and the header says
-so. Exit: 0 every unit green, 1 a unit red, 64 usage, 69 a prerequisite is missing (named, with how it is made), 70 a list
-the script reads is empty (75 stays contention, which a retry is for: `AGENTS.md`'s rc 75, so a missing card must not use
-it). `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, as `NIGHTLY_INJECT_FAIL` does (`run.sh:33`), so the red path
-is shown to fail first.
+`RUSTFLAGS`: on x86_64 Linux the script sets `-C target-cpu=native` for every cargo unit unless `RUSTFLAGS` is already
+set, because a binary built for the repo's `znver3` may stop with an illegal instruction on another CPU (`docs/BUILD.md`,
+"The CPU flag"). On aarch64 it sets nothing: the repo's `.cargo/config.toml` already builds for the native CPU there. The
+nightly sets `x86-64-v3` for its own machine (`tools/nightly/run.sh:55`), and both callers share one unit runner,
+`tools/nightly/units.sh`.
 
-Not built, still designed: the `--base` and `--require T2` flags, a `report.txt` per run (the header and the log directory
-carry its facts), the `SKIP`/`DEFER` unit states (no unit is skipped in T0 or T1), a call of `mac-static` on a Mac (it needs
-the maintainers' Mac environment file; `just mac-static` stays the Mac's static tier beside this command), and the T2 tier.
-aarch64 Linux runs T0 by default and T1 with `--tier t1` (`docs/contrib/dgx-spark.md`).
+Output: a header (commit, host, toolchain, `RUSTFLAGS`, bound, log directory), one line per unit,
+`<name> rc=<n> <seconds>s`, under a red one its failing tests or first red lines and its log path, then
+`DONE tier=… total=… red=… wall=…s`. Each unit's log is in `target/contrib-check/<time>/<name>.log`. Every unit, in
+both tiers, runs under a bound of `CONTRIB_UNIT_BOUND` seconds (default 1200) through GNU `timeout`, or `gtimeout` when
+only that is installed; a host with neither (macOS as shipped) runs units unbounded, and the header says so. Exit: 0
+every unit green, 1 a unit red, 64 usage, 69 a prerequisite is missing (named, with how it is made), 70 a list the
+script reads is empty or `--only` matches no unit. `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, so the
+red path can be shown to fail first.
 
-## The box assumptions T2 must bypass
+Exceptions:
 
-| # | Assumption | Where | Change | Size | Who |
-|---|---|---|---|---|---|
-| 1 | Commands run on host `ws` after an rsync of the tree and `source ~/bloomery-env.sh` | `tools/box.sh:42,108,225` | a new `BLOOMERY_BOX_LOCAL=1` (`BLOOMERY_BOX` already names the ssh host, `box.sh:42`): run the already composed command string (profile, tier, env exports, `:144-223`) with `bash -c` in the current tree, skip the rsync, source `$BLOOMERY_ENV` (default `~/bloomery-env.sh`). Every `just gate-*` then works unchanged. Its tests extend `tools/ref/card-tests/run.sh:500-521`, which drives `box.sh` through a fake ssh | S-M | maintainers |
-| 2 | The environment file of the box (nightly, LLVM 21, CUDA 13.3) | `tools/box.sh:4` | ship `tools/local-env.example.sh` from the `docs/BUILD.md:34-40` block | XS | contributor |
-| 3 | A timing lease and holds under `/root` gate every command | `tools/ref/lease-probe.sh:14,45` | already overridable (`BLOOMERY_LEASE_LOCK`, `BLOOMERY_LEASE_HOLDS`); local mode points both at a file in a user directory so the guard finds no lease | XS | maintainers |
-| 4 | Gate locks per card name at `/root/bloomery-gate*.lock`, the V4.1 load lock, the batch hold | `tools/gpu-gate.sh:48-50` | a lock directory variable, and the lock keyed by card UUID so `any` takes the card that exists | M | maintainers |
-| 5 | Cards are found by exact name, `NVIDIA GeForce RTX 3090` and `NVIDIA RTX A6000` | `tools/ref/cards.sh:33-34`; `box.sh` `a6000\|both` pick, `:116-134` | local mode accepts only the default pick; a one-card host is the card the census finds. Which fixture gates open on a card that is neither named one is `[unverified]`: `AGENTS.md` ("The 3090 pins today") lists the pinned ones, the first run answers the rest | M | maintainers |
-| 6 | The device arch was `sm_86` in 139 `justfile` lines and `tools/gate.sh` | the justfile's `arch` variable, `tools/arch.sh` | **Done:** `BLOOMERY_ARCH`, default `sm_86`, read by the justfile and by the tools on the box, forwarded by `box.sh`; `check-recipes` fails on a literal. The ptx-spill table (`tools/ref/ptx-shapes.tsv`) stays sm_86 only: `gate-ptx-spill`, `ptx-scan`, `just narrow` and `release-build` refuse another arch by name | done | maintainers |
-| 7 | The cuda-oxide backend is a prebuilt `.so` per rev, and `cargo oxide` refuses (rc 70) without it | `tools/box.sh:217` | local mode leaves `CUDA_OXIDE_BACKEND` unset so `cargo-oxide` builds from the fork checkout (`docs/BUILD.md:32`) | XS | maintainers |
-| 8 | The CPU flag `znver3` in both cargo files | `.cargo/config.toml`, `.cargo/cuda-oxide.toml` (`[target.x86_64-unknown-linux-gnu]`) | host units: `RUSTFLAGS` as the nightly does. A `cargo oxide` build on another CPU needs both files edited (`docs/BUILD.md`, "The CPU flag"); whether `RUSTFLAGS` reaches `cargo oxide` is `[unverified]` | S | maintainers |
-| 9 | Real model files at `/models/...`: 133 path literals in `crates/**/*.rs` (`grep -rn '"/models/\|"/root/\|/home/user'`, comments included), e.g. `crates/model/tests/mimo2_meta.rs:20` | tests, `tools/ref/models/*.sh` | one resolver (`crates/model/tests/common/model_path.rs:4` reads `$BLOOMERY_MODEL` already) and `BLOOMERY_DATA` (`tools/ref/ref-paths.sh:67`, overridable) | M, mechanical | contributor |
-| 10 | Fixtures at `/models/fixtures/<dir>` and the sets under `$BLOOMERY_DATA` | `tools/ref/ref-paths.sh:88`, `crates/refset/src/fixture.rs:23,33` | see below | M | maintainers |
+- **`just` is a T0 prerequisite.** Three T0 units call it: `recipes-self-test`, `check-recipes` and the self-test of
+  `tools/check-comment-only.py`. The script's own preflight checks only `python3` and `rustup`
+  ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
+- **aarch64 Linux.** `tools/nightly/install.sh` installs the x86_64 packages only. One DGX Spark ran T1 with the CUDA 13.3
+  headers of the `nvidia/cuda:13.3.1-devel-ubuntu24.04` image, LLVM 21.1.8's libclang, the distribution's numpy and
+  PIL, and `just` built from source (same link).
+- **A locale other than English.** `check-recipes` runs `tools/ref/lease.sh --self-test`, and one of its cases matches
+  the English `strerror` text. On a host whose libc messages are translated (`LANG=ko_KR.utf8`, say) that case fails, on
+  main as well. Run under `LC_ALL=C` ([#38](https://github.com/midagedev/bloomery/pull/38), "What I ran into").
+- **The Mac's environment file.** `just mac-static` checks the Linux build, so bindgen needs the CUDA 13.3 headers and
+  an x86_64 Linux `/usr/include` on the Mac, beside libclang from the Xcode command line tools. The header of
+  `tools/mac-check.sh` copies the two directories from the maintainers' workstation. Any x86_64 Linux host with CUDA 13.3
+  has the same two, `/usr/local/cuda-13.3/include` and `/usr/include`; without CUDA there, the headers are in the three
+  `.deb` files `tools/nightly/install.sh` names.
 
-## Fixtures: what a contributor would download
+## 3. Gates on your own card: local mode
 
-The fixture tier is what makes a family's gates runnable without the 100 GB to 350 GB real files
-(`tools/ref/ref-paths.sh:33-46`). Three families have a fixture (`crates/refset/src/fixture.rs:33-37`); MiMo and the
-older families do not. Measured on the box with `du -sh` on 2026-10-10 (read-only): `glm5next` 8.0 GB, `qwen38`
-11 GB, `v41` 16 GB, `v41-r8` (the V4.1 sidecar) 7.3 GB. A contributor does not download those files: `fixture
-generate` writes random weights whose bytes are a function of the seed and the source header alone
-(`crates/model/src/fixture/mod.rs:29`) and hashes headers only (`plan.rs:224`), so a family's fixture is made again
-from the source repo's headers, each grown to its file's listed length as a sparse file, since the loader refuses a
-file too short to hold its tensors (`dgx-spark.md` section 3.4).
-Measured by the `fxfetch` round: `fixture fetch` made the qwen38 fixture (with its MTP
-draft), the v41 fixture (with the r8 sidecar) and the glm5next fixture (at its pinned revision) byte-identical to the
-files on the box. What a contributor cannot make is the `fx_` reference sets: they are ik's output, and
-they are published as one dataset. The download is those sets: 6.48 GB in 17 sets and 29,941 files (the dry run of 2026-10-10, `just refset-publish-dry`;
-`du -sh` of the `fx_*` directories said 6.4 GB). Published after 0.2.10.
+`BLOOMERY_BOX_LOCAL=1` makes `tools/box.sh` run, in your tree and with `bash`, the same command line it would send to the
+box: the guard, the model profile, the tier and the exports, with no ssh and no rsync. So every `just gate-*` recipe runs
+unchanged on a Linux machine with a card of its own. The header of `tools/box.sh` is the full contract; this section is
+what a contributor sets up and what to expect.
 
-1. **Make the fixture of each family** (the verb is added by `fxfetch`):
+**Set up once:**
 
-       fixture fetch <family> /models/fixtures/<dir>
+1. **The environment file.** `BLOOMERY_ENV_FILE`, default `~/bloomery-env.sh`, is sourced before the command; a
+   missing file exits 69. It exports the toolchain of `docs/BUILD.md` ("Toolchain") in four variables: `PATH` (cargo,
+   `cargo-oxide`, LLVM 21 and CUDA 13.3's `bin`), `CUDA_TOOLKIT_PATH`, `LIBCLANG_PATH` and `CUDA_OXIDE_LLC`, the path of
+   LLVM 21's `llc`. Without `CUDA_OXIDE_LLC`, cuda-oxide takes the Rust toolchain's `llc` first (`docs/BUILD.md`), and
+   the pinned nightly's LLVM is 23. One DGX Spark run exported these four, with LLVM 21.1.8's `llc`
+   ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082), "Reproduce"). T1 (section 2) needs
+   `PATH` and `CUDA_TOOLKIT_PATH` as well. Local mode unsets `CUDA_OXIDE_BACKEND` after the file, so `cargo oxide`
+   builds its own backend from the pinned fork rev.
+2. **The pinned `cargo-oxide`.** Before a command that builds with `cargo oxide`, `tools/box.sh` checks with
+   `cargo install --list` that the `cargo-oxide` on `PATH` was installed from the pinned rev, and stops with exit 70
+   when it was not. The install command is in `docs/BUILD.md` ("Toolchain").
+3. **The lock directory.** `BLOOMERY_LOCK_DIR`, an absolute path, default `~/.cache/bloomery/locks`, made when missing.
+   It holds the timing lease, the holds and the gate locks. `tools/gpu-gate.sh` takes one lock there,
+   `bloomery-gate-local.lock`, for whatever card the machine shows, so on a machine with several cards the gates run one
+   at a time.
+4. **The card.** `BLOOMERY_CARD` unset, `3090` or `a6000` runs on your card, and the command sees
+   `BLOOMERY_BOX_CARD=local`. `tools/box.sh` reads `BLOOMERY_CARD` before its local branch, so any other value is
+   refused (below). `CUDA_VISIBLE_DEVICES` is yours, or the environment file's when it sets one. A recipe's own
+   `BLOOMERY_GATE_CARD`, the card it asks `tools/gpu-gate.sh` for, may be unset, `3090`, `a6000` or `any` in local mode.
+5. **The CPU flag, on x86_64.** The cargo files build for Zen 3 (`znver3`) on x86_64, and local mode does not change
+   that, so on another x86_64 CPU a gate binary may stop with an illegal instruction. Set
+   `RUSTFLAGS='-C target-cpu=native'` in your shell or the environment file. Plain `cargo` then takes it in place of
+   `.cargo/config.toml`'s flags, and `cargo oxide` adds it after `.cargo/cuda-oxide.toml`'s `extra-rustflags`, so the
+   later `target-cpu` wins. On an RTX 5090 host (x86_64) at `b289130a`, with cargo-oxide 0.2.1 at the pinned rev, this
+   build passed `-C target-cpu=x86-64-v2` after `-C target-cpu=znver3 -C target-feature=-sse4a` in every `rustc`
+   call:
 
-   The family's source (repo, quant, revision) is its row of the fixture table in `crates/model/src/bin/fixture.rs`
-   (`SPECS`, or the path `fxfetch` reports); it is not copied here. `<family>` and `<dir>` are the pairs of
-   `crates/refset/src/fixture.rs` DIRS (the dataset README lists them). It reads a few MB per shard by HTTP Range.
-   The V4.1 DSpark draft fixture cannot be fetched (its source is the maintainers' own copy), and no set of it is
-   published.
-2. **Download the reference sets** into `$BLOOMERY_DATA`. The dataset mirrors that directory, so this one command is the
-   install (`--include` takes one family's sets; the dataset README lists them by name):
+       RUSTFLAGS='-C target-cpu=x86-64-v2' cargo oxide build --arch sm_86 -- \
+         -p bloomery-gpu-gates --features gpu --release --bin gate_kquant -v
+
+   The other way is to edit both files (`docs/BUILD.md`, "The CPU flag"). On aarch64 the files already build for the
+   native CPU.
+6. **The inputs.** `BLOOMERY_DATA` names your copy of the reference sets and reaches the command as you set it; unset,
+   it is the maintainers' `/root/bloomery-data`. The fixtures sit under `/models/fixtures`. Section 4 says how to make
+   both.
+
+**Run one gate:**
+
+    BLOOMERY_BOX_LOCAL=1 BLOOMERY_TIER=fixture BLOOMERY_DATA=<your sets> just gate-<x>
+
+`BLOOMERY_TIER=fixture` makes `tools/ref/ref-paths.sh` resolve the family's fixture and the card budget its header names.
+Each gate runs under `BLOOMERY_GATE_BOUND` seconds, default 900 (`tools/gate-bound.sh`); one DGX Spark run set it to 1800
+for every item with `BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_BOUND=1800'` (same link).
+
+A recipe the fixture tier cannot run ends in one of three ways:
+
+- a real-only gate stops before it builds with exit 66 from `tools/ref/real-only.sh`, which names it;
+- a gate of a family with no fixture stops with exit 66 from `ref-paths.sh`, which names the family;
+- a gate of a family whose fixture row is `self` (no fixture file) runs on the profile's real file, and the gate
+  fence, `Tier::check_file` in `crates/gpu-gates/src/tier.rs`, refuses that file, so the gate ends red.
+
+A *variant item* runs a recipe on a variant fixture: the family's fixture requantized to one type map of
+`tools/fixture-variants.tsv`. `just affected` lists it as `<recipe>@BLOOMERY_FIXTURE_VARIANT=<tag>`, and
+`tools/gate-batch.sh` names a recipe's second and later items `<recipe>-2`, `<recipe>-3`. Run one by adding
+`BLOOMERY_FIXTURE_VARIANT=<tag>` to `BLOOMERY_BOX_ENV`. `just fixture-requant` makes the variant fixture with `ik`'s
+`llama-quantize`; without the variant fixture the item stops with exit 66. Its reference sets are not published
+(section 6).
+
+**Refused (exit 64):** a host that is not Linux (a Mac runs `just mac-static`); a `BLOOMERY_CARD` other than `3090` or
+`a6000`: `both`, so every two-card recipe, and any other name; `BLOOMERY_BOX_QUEUE=1`; a relative `BLOOMERY_LOCK_DIR`,
+or one that is `/root`; an environment file that moves the lock directory or sets a `BLOOMERY_ARCH` other than the one
+the recipe expanded; and the box itself.
+
+**Which gates.** The contributor's list is `just affected` minus the real-file and real-only gates, `gate-ptx-spill` and
+the timing runners; a fixture-only gate stays ([`dgx-spark.md`](dgx-spark.md) section 5, answer 4). No command prints it
+yet (section 6). Until one does, build it as one DGX Spark run did
+([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082), "Reproduce"):
+
+    python3 tools/recipes.py affected <base> --no-box > affected.txt
+    bash tools/gate-batch.sh --list affected.txt --tier fixture --dry-run
+
+`<base>` is the upstream commit your branch starts from; `upstream/main` works, because `affected` diffs from its merge
+base with `HEAD`, so it needs a git clone with that history. `--no-box` keeps `affected` from reading the box's build
+information over ssh. The dry run touches neither the box nor an output directory, and prints one `lane` line per item.
+A line `lane -  <item>` followed by `deferred to the real tier (<kind>)` is an item the fixture tier does not run:
+real-only, real-file, or of a family with no fixture. A line `lane A`, `lane B` or `lane X` is an item it runs, with its
+command. Your list is the items of the second kind, less `gate-ptx-spill` (its PTX shape table is `sm_86` only).
+
+**What the card name closes.** Two machines whose card is neither the RTX 3090 nor the RTX A6000 ran a fixture-tier list
+in local mode. The two runs used different commits and different lists, so their counts do not add up:
+
+- One DGX Spark (GB10), main `697790c4`, the 93 items of the rule above: 14 green items open the card, and the other 15
+  green items do not open it ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
+- One RTX 5090, main `e8e32a38`, 42 fixture-tier gates: 18 passed, host gates included
+  ([#54](https://github.com/midagedev/bloomery/issues/54), "The rest of the fixture tier"). Its `gate-gpu-kquant` red
+  came from the `llc` that built the PTX; since [#63](https://github.com/midagedev/bloomery/pull/63) the gate passes
+  under that `llc` (#63's runs on an RTX 5090 and a DGX Spark).
+
+In both runs, the one gate that stopped on the card's name was `gate-gpu-qwen38-serve`, whose `--place gate` opens the
+RTX 3090 by name (`crates/placement/src/placement/devices.rs:230`). A recipe outside these two lists may also open a
+card by name. `gate-gpu-ds41-dspark-loop` also passes `--place gate`, but only at the real tier; at the fixture tier it
+runs `--place a`. The two-card recipes stop at the `BLOOMERY_CARD` refusal above. Every other closed GPU item stopped
+on an input the machine did not have, except `gate-gpu-kquant` on the RTX 5090.
+
+## 4. Fixtures and reference sets
+
+A fixture-tier gate reads two inputs: the family's fixture and the `fx_` reference sets. Three families have a fixture
+(`crates/refset/src/fixture.rs`, `DIRS`); MiMo and the older families do not.
+
+1. **Make `/models/fixtures` exist** on your machine; a symlink to where you keep the files is enough, and it needs
+   root once ([`dgx-spark.md`](dgx-spark.md) section 5, answer 2). A set's `# model` line states the first shard's
+   full path, which `first_shard` in `crates/refset/src/fixture.rs` builds from the root. The published sets were
+   dumped under `/models/fixtures`, so they read as stale under another root, even though `BLOOMERY_FIXTURE_ROOT` moves
+   the files.
+2. **Make the fixture of each family** with the `fixture` binary of `bloomery-model`, one command a family. It runs
+   `curl`, which must be on `PATH`, and on x86_64 that is not Zen 3 it needs the `RUSTFLAGS` of section 3:
+
+       cargo run --release -p bloomery-model --bin fixture -- fetch qwen38 /models/fixtures/qwen38
+       cargo run --release -p bloomery-model --bin fixture -- fetch v41 /models/fixtures/v41
+       cargo run --release -p bloomery-model --bin fixture -- fetch glm5next /models/fixtures/glm5next
+
+   The word after `fetch` is the family's name in `SOURCES` (`crates/model/src/bin/fixture.rs`), whose row gives the
+   source repo, quant and revision. The directory is the one `DIRS` maps the family's architecture to (`qwen4exp` to
+   `qwen38`, `deepseek41` to `v41`, `glm5next` to `glm5next`), and `fetch` refuses it when it exists already. `fetch`
+   reads a few MB of headers per shard by HTTP Range and writes each shard at its listed length as a sparse file. A
+   fixture's bytes are a function of the seed and the source header alone (`crates/model/src/fixture/mod.rs`), and the
+   loader refuses a file too short to hold its tensors, so a header grown to the file's listed length is enough. On one
+   DGX Spark, two `fixture fetch qwen38` runs and `fixture generate` from the real files, whole or cut to their headers
+   and grown back, wrote the same bytes; cut and not grown back, generate refused
+   ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)). The maintainers checked on their
+   machine that `fixture fetch` makes the qwen38 fixture (with its MTP draft), the v41 fixture (with the r8 sidecar) and
+   the glm5next fixture (at its pinned revision) byte-identical to their files. There, `du -sh` on 2026-10-10 measured
+   `glm5next` 8.0 GB, `qwen38` 11 GB, `v41` 16 GB and `v41-r8` (the V4.1 sidecar) 7.3 GB. The V4.1 DSpark draft
+   fixture cannot be fetched (its source is the maintainers' own copy), and no set of it is published.
+3. **Download the reference sets** into `$BLOOMERY_DATA`. They are `ik`'s output, so a contributor cannot make them, and
+   they are published as one dataset, <https://huggingface.co/datasets/midagedev/bloomery-refsets>: 6.48 GB in 17 sets
+   and 29,941 files (the dry run of 2026-10-10, `just refset-publish-dry`; `du -sh` of the `fx_*` directories said
+   6.4 GB). The dataset mirrors that directory, so this one command is the install (`--include` takes one family's
+   sets; the dataset README lists them by name):
 
        hf download --repo-type dataset midagedev/bloomery-refsets --local-dir "$BLOOMERY_DATA"
 
    `just refset-publish-dry` is the maintainers' dry run of the dataset (`tools/refset-publish.sh`): it lists every
    file with its sha256 and says which sets are left out (the fixture variants and the DSpark draft sets) and why.
-   The upload is a separate step after the 0.2.10 tag.
 
-- **The path is part of the identity.** A set's `# model` line states the first shard's full path `{root}/{dir}/{file}`
-  (`crates/refset/src/fixture.rs:96-107`), so sets dumped under `/models/fixtures` are stale under another root even
-  though `BLOOMERY_FIXTURE_ROOT` moves the files (`:23`). The contributor makes `/models/fixtures` exist (a symlink;
-  needs root once). Keying the identity on `bloomery.fixture.source_header_sha256` (`plan.rs:224`) instead touches
-  every family's check: M, the maintainers' design, `[unverified]` beyond that.
+## 5. Timing on your own card
 
-## Order and sizes
+Local mode also times your card, with one runner. Under `BLOOMERY_BOX_CARD=local`, `tools/ref/timing-card.sh` times the
+one card `nvidia-smi` lists, picked by UUID, or among several cards the one `BLOOMERY_TIMING_GPU` names
+([#39](https://github.com/midagedev/bloomery/pull/39)). The lease and its trace, `bloomery-sittings.log`, sit in
+`BLOOMERY_LOCK_DIR`.
 
-1. **C1, T0 and T1: built** (`tools/contrib-check.sh`, the shared runner `tools/nightly/units.sh`, the recipe, and the T0
-   pull-request workflow `.github/workflows/pr.yml`). Every pure-crate and host-tier change is checkable alone. T1 is not in
-   the workflow: it needs three NVIDIA `.deb` files unpacked by hand, more than apt packages (`pr.yml` header).
-2. **Rows 1, 2, 3, 7** (the `BLOOMERY_BOX_LOCAL` mode of `box.sh` and the env example): S-M, maintainers. After it `just gate-<x>` runs on a
-   host with no card for the gates that open none (`gate-mimo2-meta`'s header test given the file).
-3. **Rows 4, 5, 6, 8, 9, 10**: the card and fixture half, M each; row 10's publication is a maintainers' decision first.
-   C1 gains T2 when row 1 and 10 land: S.
+- **The runner.** Only `tools/ref/depth-qwen3moe.sh` opts in, through `just depth-gpu-qwen3moe`, `depth-gpu-qwen35moe`
+  and `depth-gpu-qwen4exp`. Any other runner prints the reason and exits 64 before it takes the lease. These recipes
+  time a real model file, the profile's (`BLOOMERY_REF_MODEL` moves it, `tools/ref/ref-paths.sh`), not a fixture. The
+  reference engine arms read the profile's `IK`, `LCPP` and `MRS` trees, which you build yourself; no recipe builds
+  them.
+- **The prediction card.** The lease starts a run only with a card file written before it: what the run measures, the
+  band the derivation predicts and the next step for each outcome. Write it as `docs/cards/<slug>.card` in your tree
+  (the format is the header of `tools/ref/card.py`; `docs/cards/example-*.card` show each kind and are refused as a
+  run's card), and name it through `BLOOMERY_BOX_ENV`:
 
-`just check-recipes` must stay green: the recipe takes no lock itself, runs no bare `cargo test`, and is not a
-`gate-*` recipe.
+      BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/<slug>.card' just depth-gpu-qwen3moe
 
-## Open questions for the maintainers
+  Without one, the lease refuses with exit 66.
+- **Placement.** Only placement `a` runs. `gate` is refused because it loads the card named 3090, and `bp` because it
+  loads two cards (`tools/ref/arm-place.sh`).
+- **Xid.** Before the lease, the run checks that the kernel journal answers. A user outside the `adm` and
+  `systemd-journal` groups gets an empty answer, and the run stops with exit 69. After each arm, an NVRM Xid or a card
+  that stopped answering fails that arm.
+- **The witness.** Before and after every arm the runner prints the card (name, power limit, SM clock, clock-event
+  counters), the Xid count, `cpu-freq`, the binary's hash, CPU load, the shared memory pool and the machine (OS, kernel,
+  driver, `nvcc`).
+- **The ruler.** The same-binary spread in `AGENTS.md` ("Know the ruler", SD 0.6 %) was measured on the maintainers'
+  box; your machine's spread is its own. An A/A arm, the same binary twice, shows it, and `AGENTS.md` asks for one
+  under any claim below 1 %.
 
-1. Row 5, and row 6's open half (the arch is `BLOOMERY_ARCH` now): do you accept a card that is neither the 3090 nor the A6000 and an arch other than `sm_86` for
-   contributor evidence, and which fixture gates must stay on named cards?
-2. Row 10: where do fixtures and the `fx_` sets live, and may a contributor regenerate fixtures from headers?
-   **Answered 2026-10-11, the first half:** the `fx_` sets are public at
-   <https://huggingface.co/datasets/midagedev/bloomery-refsets> (17 sets, 6.48 GB, with each base model's licence;
-   `dgx-spark.md` section 5, answer 3).
-   **Answered 2026-10-12, the second half:** yes, from headers grown to each file's listed length as sparse files,
-   which is what `fixture fetch` writes; `fixture generate` reads no tensor data, but the loader refuses a file too
-   short to hold its tensors, such as a header cut at the data offset (`dgx-spark.md` section 3.4,
-   [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)).
-3. Is a local mode (`BLOOMERY_BOX_LOCAL`) acceptable in the maintainers' own `box.sh`, given the guard and lease rules around it, or
-   should the local path be a separate script?
-   **Answered 2026-10-11:** in `box.sh`, as `BLOOMERY_BOX_LOCAL=1` (`dgx-spark.md` section 5, answer 10).
+A number from this runner is evidence for your pull request on your card when it carries what `CONTRIBUTING.md` lists
+under "Numbers carry their conditions". It can be published in a table of its own for that card; a table never mixes
+cards.
+
+## 6. Not built yet
+
+- **T2.** `just contrib-check --tier t2` would run the contributor's list (section 3) serially under
+  `BLOOMERY_TIER=fixture`. A recipe the tier refuses by name (exit 66 from `tools/ref/real-only.sh` or `ref-paths.sh`,
+  which `tools/gate-batch.sh` counts as `deferred`) would print `DEFER`, never count green. A fixture-only recipe runs
+  there, because `tools/ref/fixture-only.sh` stops only the real tier. The recipe must keep `just check-recipes` green:
+  it takes no lock itself, runs no bare `cargo test`, and is not a `gate-*` recipe. How it counts a two-card recipe is
+  open question 4.
+- **The list command.** The maintainers own it, as one derived command ([`dgx-spark.md`](dgx-spark.md) section 5,
+  answer 4). Until it exists, section 3 builds the list by hand.
+- **`contrib-check` flags and states:** `--base`, `--require T2`, a `report.txt` per run (the header and the log
+  directory carry its facts), the `SKIP` and `DEFER` unit states (no unit is skipped in T0 or T1), and a call of
+  `mac-static` on a Mac (`just mac-static` stays the Mac's static tier beside this command).
+- **T1 in CI.** `.github/workflows/pr.yml` runs T0 only: T1 needs three NVIDIA `.deb` files unpacked by hand, more than
+  apt packages (its header).
+- **An example environment file** for local mode (reference row 2).
+- **One model path resolver** for the path literals of reference row 9.
+- **A root-relative set identity,** so the fixtures could sit under another root: it comes as its own change when a
+  contributor needs it ([`dgx-spark.md`](dgx-spark.md) section 5, answer 2).
+- **Gaps in the fixture tier the maintainers took**
+  ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134411281), answer 6), from the DGX Spark run's
+  points 1 to 5 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Until they land,
+  these items stay closed for a contributor:
+  - `gate-gpu-qwen4exp-e2e` and `-mtp` read the real-tier sets `ref_qwen4exp` and `ref-mtp/qwen4exp_prose64_n64_k1` on
+    the fixture tier, and only the `fx_` sets are published.
+  - The V4.1 DSpark draft fixture is not fetchable, and five of the gates that need it also read
+    `engram/corpus-prose.ids`, which is not published.
+  - `glm5next/corpus-prose.ids` and `fx_ref_glm5next_vis_taps` are not published.
+  - `--place gate` opens the RTX 3090 by name (section 3).
+  - The list rule keeps host gates that need a real file or a `just dump-ref` oracle (the V2-Lite gates) and a public
+    real file (the bf16 projector of `gate-gpu-glm5next-media-seat`); a no-input class would keep them off the list.
+- **Variant sets.** The dataset publishes no set of a fixture variant: its README lists them under "Left out", because
+  the variant file is requantized on the maintainers' machine and cannot be made again byte for byte off it. The
+  variant items (section 3) stay closed for a contributor.
+
+## 7. Reference: the box assumptions
+
+The design listed what a run off the box must bypass. This table keeps that list with each row's state at `3bc2a172`.
+
+| # | Assumption | Where | State |
+|---|---|---|---|
+| 1 | Commands run on the maintainers' workstation after an rsync of the tree and `source ~/bloomery-env.sh` | `tools/box.sh` | **Built** ([#38](https://github.com/midagedev/bloomery/pull/38)): section 3; its tests are in `tools/ref/card-tests/run.sh` |
+| 2 | The box's environment file (nightly, LLVM 21, CUDA 13.3) | `tools/box.sh` header | **Not built:** an example file from the toolchain block of `docs/BUILD.md`; what it exports is in section 3 |
+| 3 | A timing lease and holds under `/root` gate every command | `tools/ref/lease-probe.sh:17` | **Built** (#38): one `BLOOMERY_LOCK_DIR` moves the lease and the holds (section 3) |
+| 4 | Gate locks per card name at `/root/bloomery-gate*.lock`, the V4.1 load lock, the batch hold | `tools/gpu-gate.sh:86-89` | **Built** (#38): every lock under `BLOOMERY_LOCK_DIR`, and one local lock for the machine's card (section 3) |
+| 5 | Cards are found by exact name, `NVIDIA GeForce RTX 3090` and `NVIDIA RTX A6000` | `tools/ref/cards.sh:33-34`; the card pick in `tools/box.sh` | **Built** (#38): the `BLOOMERY_CARD` values that run and the ones refused, and the gates the name still closes, are in section 3 |
+| 6 | The device arch was `sm_86` in 139 `justfile` lines and `tools/gate.sh` | the justfile's `arch` variable, `tools/arch.sh` | **Done:** `BLOOMERY_ARCH`, default `sm_86`, read by the justfile and by the tools on the box, forwarded by `box.sh`; `check-recipes` fails on a literal. The ptx-spill table (`tools/ref/ptx-shapes.tsv`) stays sm_86 only: `gate-ptx-spill`, `ptx-scan`, `just narrow` and `release-build` refuse another arch by name |
+| 7 | The cuda-oxide backend is a prebuilt `.so` per rev, and `cargo oxide` refuses (rc 70) without it | `tools/box.sh` | **Built** (#38): local mode lets `cargo-oxide` build its own backend (section 3) |
+| 8 | The CPU flag `znver3` in both cargo files | `.cargo/config.toml`, `.cargo/cuda-oxide.toml` | **aarch64 done** (`f0139df3`): each file has a table per target triple, `target-cpu=native` for aarch64. **x86_64:** the files stay `znver3`, and a caller's `RUSTFLAGS` reaches both plain `cargo` and `cargo oxide` builds (measured, section 3) |
+| 9 | Real model files at `/models/...`: ~~133~~ 151 lines with a path literal in `crates/**/*.rs`, comments included (`git grep -n '"/models/\|"/root/\|/home/user' -- 'crates/**/*.rs' \| wc -l` at `3bc2a172`), e.g. `crates/model/tests/mimo2_meta.rs:20` | tests, `tools/ref/models/*.sh` | **Not built:** one resolver (`crates/model/tests/common/model_path.rs` reads `$BLOOMERY_MODEL` already) and `BLOOMERY_DATA` (`tools/ref/ref-paths.sh:75`, overridable) |
+| 10 | Fixtures at `/models/fixtures/<dir>` and the sets under `$BLOOMERY_DATA` | `tools/ref/ref-paths.sh`, `crates/refset/src/fixture.rs:31,33` | **Published:** the sets are a public dataset and `fixture fetch` makes the fixtures (section 4). The root-relative identity is not built (section 6) |
+
+Without local mode, every `just` recipe that calls `tools/box.sh` runs on the box: ~~278~~ 291 lines of the `justfile`
+outside comments name `tools/box.sh` at `3bc2a172` (`grep -vE '^\s*#' justfile | grep -c 'tools/box\.sh'`).
+
+## 8. Open questions for the maintainers
+
+1. `CONTRIBUTING.md` ("Numbers carry their conditions") makes a number from a contributor's own card evidence for that
+   pull request on that card. Does the same hold for a gate result from a card whose arch is not `sm_86`, beyond the
+   DGX Spark's Arm evidence ([`dgx-spark.md`](dgx-spark.md) section 5, answer 5)? Which fixture gates the card name
+   closed in two such runs is in section 3.
+2. **Answered:** the `fx_` sets are public, and a contributor regenerates fixtures from headers grown to each file's
+   listed length (section 4).
+3. **Answered:** local mode lives in `box.sh` as `BLOOMERY_BOX_LOCAL=1` ([`dgx-spark.md`](dgx-spark.md) section 5,
+   answer 10), and it is built (section 3).
+4. Local mode refuses a two-card recipe with exit 64, a usage error, while T2's design counts a named refusal with exit 66
+   as `DEFER`. On a one-card machine a two-card gate is "cannot run here" rather than a caller's mistake, so a T2 runner
+   would count these recipes red. Should the code be 66, 69 or another
+   ([#38](https://github.com/midagedev/bloomery/pull/38), question 2)?
