@@ -59,13 +59,14 @@ pub fn refuse_head(
     headroom_bytes: i128,
     pool_bytes: u64,
 ) -> Result<(i128, Machine), GateError> {
-    let short = i128::from(machine.host.usable_bytes) - headroom_bytes + i128::from(pool_bytes) - 1;
+    let short =
+        i128::from(machine.host().usable_bytes) - headroom_bytes + i128::from(pool_bytes) - 1;
     let mut small = machine.clone();
-    small.host.usable_bytes = u64::try_from(short).map_err(|_| {
+    small.host_mut().usable_bytes = u64::try_from(short).map_err(|_| {
         format!(
             "refuse: the short host {short} B (usable {} - headroom {headroom_bytes} + pool \
              {pool_bytes} - 1) is below 0",
-            machine.host.usable_bytes
+            machine.host().usable_bytes
         )
     })?;
     Ok((short, small))

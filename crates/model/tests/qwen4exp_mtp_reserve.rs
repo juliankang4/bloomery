@@ -367,11 +367,11 @@ fn a_drafted_card_plan_keeps_its_bound_at_any_slack() {
 fn unified(usable: u64, pool: u64) -> Machine {
     let mut m = machine(usable);
     m.cards[0].free_bytes = Some(pool);
-    m.host = Host {
+    *m.host_mut() = Host {
         usable_bytes: pool,
         reserves: Vec::new(),
     };
-    m.unified = Some(UnifiedPool { bytes: pool });
+    *m.unified_mut() = Some(UnifiedPool { bytes: pool });
     m
 }
 

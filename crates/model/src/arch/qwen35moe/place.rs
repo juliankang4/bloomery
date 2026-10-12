@@ -1344,7 +1344,7 @@ pub fn machine_bp_on(
         token_embedding: false,
         reserves: vec![(TIER_BATCH_RESERVE.to_string(), batch.card())],
     });
-    m.host
+    m.host_mut()
         .reserves
         .push((TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
     m
@@ -3412,7 +3412,7 @@ mod tests {
                     tier.reserves,
                     vec![(TIER_BATCH_RESERVE.to_string(), 845_710_360)]
                 );
-                let names: Vec<&str> = m.host.reserves.iter().map(|(n, _)| n.as_str()).collect();
+                let names: Vec<&str> = m.host().reserves.iter().map(|(n, _)| n.as_str()).collect();
                 // PIN(2026-10-07): the OS reserve and the tier batch's rows;
                 // was [ROW_CACHE_RESERVE, OS_RESERVE, TIER_BATCH_HOST_RESERVE].
                 // workstation::host() carries the OS's reserve alone: the row
@@ -3420,8 +3420,8 @@ mod tests {
                 // lie on the NVMe tier (HostTotals::row_reserve_bytes), so the
                 // machine's list is its host's plus the tiers' batch rows.
                 assert_eq!(names, [OS_RESERVE, TIER_BATCH_HOST_RESERVE]);
-                assert_eq!(m.host.reserves[1].1, 839_188_480);
-                assert_eq!(m.host.usable_bytes, a.host.usable_bytes);
+                assert_eq!(m.host().reserves[1].1, 839_188_480);
+                assert_eq!(m.host().usable_bytes, a.host().usable_bytes);
             }
         }
 

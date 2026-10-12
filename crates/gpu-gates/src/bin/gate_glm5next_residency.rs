@@ -819,9 +819,10 @@ mod gate {
         let pool = ChurnPool::of(&np.plan, 0, 0).map_err(|e| format!("{path}: {e}"))?;
         let (_, hosted) = np.host_runs().map_err(|e| format!("{path}: {e}"))?;
         let need = i128::from(pool.bytes) + i128::from(hosted);
-        let short = i128::from(machine.host.usable_bytes) - np.plan.host.headroom_bytes + need - 1;
+        let short =
+            i128::from(machine.host().usable_bytes) - np.plan.host.headroom_bytes + need - 1;
         let mut small = machine.clone();
-        small.host.usable_bytes = u64::try_from(short)?;
+        small.host_mut().usable_bytes = u64::try_from(short)?;
         let place = glm5next_tier::plan_levers(levers, 0)?;
         let planner = match inputs.plan_nextn(&small, CTX as u64, &place, nextn) {
             Ok(p) => {

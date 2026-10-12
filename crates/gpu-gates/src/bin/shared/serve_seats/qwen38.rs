@@ -601,7 +601,7 @@ impl Place38 {
         if mtp.is_some() {
             let bytes = point_row_budget38(gdn_layers(inputs), ctx)?;
             machine
-                .host
+                .host_mut()
                 .reserves
                 .push((POINT_ROWS_RESERVE.to_owned(), pinned(slots, bytes)));
         }

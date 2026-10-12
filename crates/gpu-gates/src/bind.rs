@@ -4978,12 +4978,12 @@ mod tests {
                 m
             };
             let v41 = declared(Seqs::none(2));
-            assert_eq!(v41.host.reserves, vec![("os".to_owned(), 1_000)]);
+            assert_eq!(v41.host().reserves, vec![("os".to_owned(), 1_000)]);
             assert_eq!(checkpoints_reserved(&v41), 0);
             let slot = FOUR_GIB.budget(4_096).expect("a budget");
             let q38 = declared(Seqs::priced(2, FOUR_GIB));
             assert_eq!(
-                q38.host.reserves,
+                q38.host().reserves,
                 vec![
                     ("os".to_owned(), 1_000),
                     (CHECKPOINTS_RESERVE.to_owned(), 2 * slot)

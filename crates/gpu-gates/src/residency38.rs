@@ -109,7 +109,7 @@ pub fn reserve_checkpoints(
 fn declare_checkpoints(machine: &mut Machine, bytes: Option<u64>) {
     assert!(
         !machine
-            .host
+            .host()
             .reserves
             .iter()
             .any(|(name, _)| name == CHECKPOINTS_RESERVE),
@@ -118,7 +118,7 @@ fn declare_checkpoints(machine: &mut Machine, bytes: Option<u64>) {
     );
     if let Some(bytes) = bytes {
         machine
-            .host
+            .host_mut()
             .reserves
             .push((CHECKPOINTS_RESERVE.to_owned(), bytes));
     }
@@ -150,7 +150,7 @@ pub fn check_reserve(machine: &Machine, slots: usize, budget: u64) -> Result<(),
 #[must_use]
 pub fn checkpoints_reserved(machine: &Machine) -> u64 {
     machine
-        .host
+        .host()
         .reserves
         .iter()
         .filter(|(name, _)| name == CHECKPOINTS_RESERVE)

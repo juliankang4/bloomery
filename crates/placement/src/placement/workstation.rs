@@ -576,7 +576,7 @@ impl HostNeed {
     #[must_use]
     pub fn of(plan: &Plan<'_>, extra: u64) -> HostNeed {
         HostNeed::of_totals(
-            &plan.machine.host,
+            plan.machine.host(),
             &plan.host,
             plan.card_budget.is_some(),
             extra,
@@ -1208,7 +1208,7 @@ mod tests {
         };
         let m = plan_tiers(4, A6000, &[t1, t2], None, batch).expect("two tiers");
         let rows: Vec<&(String, u64)> = m
-            .host
+            .host()
             .reserves
             .iter()
             .filter(|(n, _)| n == TIER_BATCH_HOST_RESERVE)
@@ -1257,11 +1257,11 @@ mod tests {
                 (None, host())
             };
             assert_eq!(
-                (m.unified, &m.host),
+                (m.unified(), m.host()),
                 (pool, &figure),
                 "integrated {integrated}"
             );
-            m.host.reserves.push(pinned.clone());
+            m.host_mut().reserves.push(pinned.clone());
             let mut whole = m.cards[0].clone();
             if integrated {
                 whole.reserves.push(pinned.clone());

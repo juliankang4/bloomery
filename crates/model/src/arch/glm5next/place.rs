@@ -1018,7 +1018,7 @@ impl PlanInputs {
         // pool's share of the cards is the pool's bound, above.
         let host_own = host_headroom + i128::from(plan.host.pool_card_bytes);
         if host_own < 0 {
-            let usable = machine.host.usable_bytes;
+            let usable = machine.host().usable_bytes;
             broken.push(Violation::HostOver {
                 total: u64::try_from(i128::from(usable) - host_own).unwrap_or(u64::MAX),
                 usable,
@@ -1593,11 +1593,11 @@ mod tests {
         fn unified(pool: u64) -> Machine {
             let mut m = machine(LAYERS);
             m.cards[0].free_bytes = Some(pool);
-            m.host = Host {
+            *m.host_mut() = Host {
                 usable_bytes: pool,
                 reserves: vec![("pinned".to_string(), 1 << 30)],
             };
-            m.unified = Some(UnifiedPool { bytes: pool });
+            *m.unified_mut() = Some(UnifiedPool { bytes: pool });
             m
         }
 

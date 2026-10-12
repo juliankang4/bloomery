@@ -277,7 +277,7 @@ mod tests {
         let made_at = |room: (u64, HostRead)| {
             let mut plan = with_headroom(&model, &machine, 0);
             plan.host.expert_bytes = 300;
-            plan.host.headroom_bytes = i128::from(HostNeed::machine_room(&machine.host))
+            plan.host.headroom_bytes = i128::from(HostNeed::machine_room(machine.host()))
                 - i128::from(HostNeed::of(&plan, 0).bytes());
             plan.plan_at(&room);
             plan

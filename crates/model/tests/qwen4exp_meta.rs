@@ -435,7 +435,7 @@ fn hw_qwen4exp_plan() {
             }
             let h = &plan.host;
             let terms = h.expert_bytes + h.table_bytes + h.shadow_bytes + h.reserve_bytes;
-            let headroom = i128::from(machine.host.usable_bytes) - i128::from(terms);
+            let headroom = i128::from(machine.host().usable_bytes) - i128::from(terms);
             check(
                 &mut o,
                 format!(

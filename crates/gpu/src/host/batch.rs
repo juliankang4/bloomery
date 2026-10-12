@@ -1125,7 +1125,7 @@ impl<H: HostExperts> HostTier<H> {
         }
         rows.push((
             "the host",
-            &machine.host.reserves,
+            &machine.host().reserves,
             TIER_BATCH_HOST_RESERVE,
             port.tier_host_bytes(),
         ));

@@ -1774,9 +1774,9 @@ fn spark(free: u64) -> Machine {
     };
     let spec = resolve(&[Pick::Rank(0)], &[device]).expect("resolved")[0];
     let mut m = machine_a(spec);
-    m.host = host_of(&spec);
-    m.unified = unified_of(&spec);
-    m.host
+    *m.host_mut() = host_of(&spec);
+    *m.unified_mut() = unified_of(&spec);
+    m.host_mut()
         .reserves
         .push(("checkpoints".to_string(), SPARK_CHECKPOINTS));
     m
@@ -1980,7 +1980,7 @@ fn expert_bytes_on_12(
     let q4 = model(false);
     let mut card = machine_a(CARD_12);
     let ctx = ctx as u64;
-    card.host.reserves.push((
+    card.host_mut().reserves.push((
         "checkpoints".to_string(),
         slots * points_38(ctx) * CHECKPOINT_38,
     ));

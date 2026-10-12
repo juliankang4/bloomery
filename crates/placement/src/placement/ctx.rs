@@ -370,7 +370,7 @@ impl Veto {
     /// word.
     #[must_use]
     pub fn of(machine: &Machine) -> Veto {
-        if machine.unified.is_some() {
+        if machine.unified().is_some() {
             Veto::Ladder
         } else {
             Veto::Binary

@@ -282,13 +282,13 @@ mod gate {
             .into());
         }
         let mut out = machine.clone();
+        *out.host_mut() = bp.host().clone();
+        *out.unified_mut() = bp.unified();
         out.tiers = bp.tiers;
         for t in &mut out.tiers {
             t.name.clone_from(&machine.cards[0].name);
             t.device = machine.cards[0].device;
         }
-        out.host = bp.host;
-        out.unified = bp.unified;
         Ok(out)
     }
 

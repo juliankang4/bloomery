@@ -247,6 +247,29 @@ pub struct Machine {
 }
 
 impl Machine {
+    /// The host of this process's node.
+    #[must_use]
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    /// The host of this process's node, to change.
+    pub fn host_mut(&mut self) -> &mut Host {
+        &mut self.host
+    }
+
+    /// The pool of this process's node ([`UnifiedPool`]); `None` where each
+    /// card has memory of its own.
+    #[must_use]
+    pub fn unified(&self) -> Option<UnifiedPool> {
+        self.unified
+    }
+
+    /// The pool of this process's node, to change.
+    pub fn unified_mut(&mut self) -> &mut Option<UnifiedPool> {
+        &mut self.unified
+    }
+
     /// Every card, stage cards then tiers: the index space of
     /// [`Device::Card`] and of [`Plan::cards`].
     pub fn all_cards(&self) -> impl Iterator<Item = &Card> {
@@ -269,8 +292,8 @@ impl Machine {
     #[must_use]
     pub fn whole_card(&self) -> Option<Card> {
         let mut card = self.cards.first()?.clone();
-        if self.unified.is_some() {
-            card.reserves.extend(self.host.reserves.iter().cloned());
+        if self.unified().is_some() {
+            card.reserves.extend(self.host().reserves.iter().cloned());
         }
         Some(card)
     }
@@ -2215,7 +2238,7 @@ fn plan_rule<'a>(
     );
     // What the caller plans beside this plan on each card comes out of a
     // unified pool too.
-    if machine.unified.is_some() {
+    if machine.unified().is_some() {
         let beside = reserve * machine.all_cards().count() as u64;
         plan.host.pool_card_bytes += beside;
         plan.host.headroom_bytes -= i128::from(beside);
@@ -2707,7 +2730,7 @@ pub fn row_table_tier(
             ),
         )
     })?;
-    let floor = if plan.machine.unified.is_some() {
+    let floor = if plan.machine.unified().is_some() {
         floor
     } else {
         0
@@ -3362,7 +3385,7 @@ fn totals<'a>(
         .collect();
     let row_reserve = row_cache_reserve(model, &rows);
     let reserve_bytes: u64 =
-        machine.host.reserves.iter().map(|(_, b)| b).sum::<u64>() + row_reserve;
+        machine.host().reserves.iter().map(|(_, b)| b).sum::<u64>() + row_reserve;
     let shadow_bytes: u64 = kv_bytes.iter().map(|&(_, shadow)| shadow).sum();
     let mut host = HostTotals {
         expert_bytes: host_experts,
@@ -3377,7 +3400,7 @@ fn totals<'a>(
         shadow_bytes,
         reserve_bytes,
         row_reserve_bytes: row_reserve,
-        pool_card_bytes: if machine.unified.is_some() {
+        pool_card_bytes: if machine.unified().is_some() {
             pool_cards
         } else {
             0
@@ -3388,8 +3411,8 @@ fn totals<'a>(
     // The room the machine's figure leaves past the plan's host need, the
     // need's own arithmetic (`HostNeed`).
     host.headroom_bytes =
-        workstation::HostNeed::of_totals(&machine.host, &host, card_budget.is_some(), 0)
-            .headroom(workstation::HostNeed::machine_room(&machine.host));
+        workstation::HostNeed::of_totals(machine.host(), &host, card_budget.is_some(), 0)
+            .headroom(workstation::HostNeed::machine_room(machine.host()));
     Plan {
         model,
         machine,
@@ -3427,7 +3450,7 @@ impl Plan<'_> {
         let planned = workstation::plan_room(room);
         self.host.room = Some((room.0, planned));
         if room.1 == workstation::HostRead::Given {
-            let figure = workstation::HostNeed::machine_room(&self.machine.host);
+            let figure = workstation::HostNeed::machine_room(self.machine.host());
             self.host.headroom_bytes =
                 workstation::HostNeed::of(self, 0).headroom(planned.min(figure));
         }
@@ -3562,7 +3585,7 @@ impl Plan<'_> {
         // split's, sized to the room it read and held to that room
         // ([`expert_nvme_tier`]), not to the machine's figure; a unified
         // pool's share of the cards is the pool's bound, below.
-        let host = &self.machine.host;
+        let host = self.machine.host();
         let need = workstation::HostNeed {
             experts: host_resident,
             tables: 0,
@@ -3580,7 +3603,7 @@ impl Plan<'_> {
         }
         // One pool holds the cards, re-derived from the rows here, and the
         // host's whole need with the split's arena and window.
-        if let Some(unified) = self.machine.unified {
+        if let Some(unified) = self.machine.unified() {
             let need = workstation::HostNeed {
                 experts: host_resident,
                 tables: 0,
