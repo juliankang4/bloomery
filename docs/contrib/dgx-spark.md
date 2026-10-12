@@ -40,7 +40,7 @@ A fact that no NVIDIA page stated carries no number.
 | CPU architecture | "DGX Spark is based on ARMv9.2-A architecture." | <https://docs.nvidia.com/dgx/dgx-spark-porting-guide/optimization.html> |
 | CPU layout | "The cores in DGX Spark are organized as two clusters with up to 5 P-cores and 5 E-cores each." Cache lines are 64 bytes | same page |
 | Compiler target | "Since LLVM version 21 and gcc version 15, it is also possible to specifically target DGX Spark with -mcpu=gb10"; "-march=native" selects it when compiling on the Spark | same page |
-| NEON / SVE2 / dot-product / i8mm | not stated by NVIDIA on any page read. The SIMD page (`.../porting/simd.html`) speaks of SVE and SVE2 in general only | `[unverified]`; first action on a Spark: `grep -m1 Features /proc/cpuinfo` |
+| NEON / SVE2 / dot-product / i8mm | not stated by NVIDIA on any page read. The SIMD page (`.../porting/simd.html`) speaks of SVE and SVE2 in general only | ~~`[unverified]`; first action on a Spark: `grep -m1 Features /proc/cpuinfo`~~ read on two DGX Sparks: the ISA row of the readings below (`asimd`, `asimddp`, `i8mm`, `sve`, `sve2` among them) `[#13]` |
 | Memory | "128 GB LPDDR5x unified system memory, 256-bit interface, 4266 MHz, 273 GB/s bandwidth" | hardware.html |
 | Memory variants | "64 GB LPDDR5X* or 128 GB LPDDR5x, coherent unified system memory"; the 64 GB model is listed as "Coming Soon … exclusively through participating OEM partners" | product page |
 | NVMe | "1 TB or 4 TB NVMe M.2 with self-encryption" | hardware.html |
@@ -81,23 +81,36 @@ The question for the port is what a Spark is for. The decomposition below uses o
 **Anchor [measured, not re-measured since 0.2.3].** Qwen3.6-35B-A3B `Q4_K_M`, whole model on one RTX 3090 at its 250 W
 cap: 193.9 tok/s, one request's rate (`README.md:111` and footnote 1), which is 5.16 ms a token `[derived]`.
 
-**Terms of one decode token, whole model on the card:**
+**Terms of one decode token, whole model on the card.** Both machines read the same weight bytes a token: 1.8 GB, 3 B
+active parameters (the "A3B") × 4.85 bits (21.2 GB file, `docs/models.md:33`, over 35 B parameters) `[derived]`. The
+byte time is bytes / bandwidth. Each machine has its own table.
 
-| Term | 3090 box | Spark | How it is obtained |
-|---|---|---|---|
-| Weight bytes a token reads | 1.8 GB | 1.8 GB | 3 B active parameters (the "A3B") × 4.85 bits (21.2 GB file, `docs/models.md:33`, over 35 B parameters) `[derived]` |
-| Byte time at the memory | 2.6 ms at ~700 GB/s (`AGENTS.md`, "a grid near ~700 GB/s") | 6.7 ms at the 273 GB/s peak; 8.3 ms at 80 % of it `[assumed 80 %]` | bytes / bandwidth |
-| Rest of the step (launch chain, attention, norms) | 5.16 − 2.6 = 2.6 ms `[derived]` | 2.6 ms if it is latency, 4.4 ms if it scales with SMs (82 / 48 = 1.7; the 3090's 82 SMs are `[unverified]` here) | — |
-| H2D / PCIe | 0 | no PCIe leg for weights | the whole-card seat has no host tier |
-| NVMe | 0 after load | 0 after load; the load reads the file once | — |
+| Term, 3090 box | Value |
+|---|---|
+| Byte time at the memory | 2.6 ms at ~700 GB/s (`AGENTS.md`, "a grid near ~700 GB/s") |
+| Rest of the step (launch chain, attention, norms) | 5.16 − 2.6 = 2.6 ms `[derived]` |
+| H2D / PCIe | 0 |
+| NVMe | 0 after load |
 
-**Prediction [derived]:** a step of 8.3 ms (bytes hide the rest) to 12.7 ms (bytes plus an SM-scaled rest), so 79–120 tok/s,
+| Term, Spark | Value |
+|---|---|
+| Byte time at the memory | 6.7 ms at the 273 GB/s peak; ~~8.3 ms at 80 % of it `[assumed 80 %]`~~ 9.5 ms at the measured 208.8 GB/s on `b289130a`, 76 % of 273, for the gemv kernels' 1,978 MB a step (8.6 ms for this row's 1.8 GB) `[derived]` ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6136140998)). At `04d0c0ae` the same bytes took 11.1 ms at 177.5 GB/s `[derived]`; under `nsys` that gemv time splits into 8.40 ms at the plain read rate and 2.75 ms past it, and the other kernels take 1.12 ms more ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)) |
+| Rest of the step (launch chain, attention, norms) | ~~2.6 ms if it is latency, 4.4 ms if it scales with SMs (82 / 48 = 1.7; the 3090's 82 SMs are `[unverified]` here)~~ measured: the gaps between kernels take 0.076 ms a step ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104377342)), and the 2.75 ms past the plain read rate sits inside the gemv kernels, inside the 11.1 ms of `04d0c0ae` above ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439), [maintainers](https://github.com/midagedev/bloomery/issues/17#issuecomment-6105032860)) |
+| H2D / PCIe | no PCIe leg for weights: the whole-card seat has no host tier |
+| NVMe | 0 after load; the load reads the file once |
+
+**Prediction [derived], from the struck terms above:** a step of 8.3 ms (bytes hide the rest) to 12.7 ms (bytes plus an SM-scaled rest), so 79–120 tok/s,
 point 92 tok/s (bytes plus latency, 10.9 ms). That is 0.4–0.6 of the 3090's rate, and the byte term is 2.6–3.2 times
 longer than on the box. The `machineaxes` round reached 2.47× for the A6000 (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L200).
+Measured: 84.44 tok/s @ n=96, depth 6, GB10, on main `6854c2e9` with the
+tools of #38 and #39, SM clock 2,411 to 2,515 MHz ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), inside the band. That build is older than #27's row
+prefetch, which made the step 1.6 to 1.7 ms shorter ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6105836896)).
+On `b289130a`, which has #27: 99.46 tok/s @ n=96, depth 6, GB10 (the mean of six rounds) on another DGX Spark, SM clock
+2,418 to 2,541 MHz, stock clocks, A/A 1.0014 ± 0.0046 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)), also inside the band.
 
 **Resource timeline per decode token (whole on card, Spark).** Host CPU: a graph launch and the sampler, off the critical
-path (no host tier), cost `[unmeasured]`. Card SMs: the 2.6–4.4 ms rest, overlapped with the byte stream. Card DRAM and
-host DRAM are **one resource**, the 273 GB/s pool: the 6.7–8.3 ms byte term. PCIe: 0. NVMe: 0. The wall is that one
+path (no host tier), cost `[unmeasured]`. Card SMs: ~~the 2.6–4.4 ms rest, overlapped with the byte stream~~ the rest sits inside the gemv kernels (the table above). Card DRAM and
+host DRAM are **one resource**, the 273 GB/s pool: the ~~6.7–8.3 ms~~ 9.5 ms byte term at the measured rate of `b289130a` (11.1 ms at `04d0c0ae`) `[derived]`. PCIe: 0. NVMe: 0. The wall is that one
 resource's time (or at most bytes plus the latency part), not the sum of five. Consequences:
 
 - Host/card asynchrony (overlapping CPU expert work under card work) is worth 0 here: there is no host expert work to hide
@@ -110,11 +123,17 @@ resource's time (or at most bytes plus the latency part), not the sum of five. C
   with 13.9 GB of the idle `MemAvailable` (116.6 GiB = 125.2 GB, section 1) left for KV and runtime `[derived from #13]`.
 
 **The one term a run must settle, with its expected value:** the sustained read rate of our decode gemv kernels on the
-LPDDR5x with the CPU idle. Expected 200–235 GB/s (73–86 % of 273). A plain read kernel measured 233 GB/s on `cuMemAlloc` memory (0.85 of 273)
+LPDDR5x with the CPU idle. Expected 200–235 GB/s (73–86 % of 273). Measured on `b289130a`, which has #27's row prefetch: 208.8 GB/s, the
+byte-weighted rate of the gemv kernels in the decode flow (median of three runs, 208.3 to 211.4), on one DGX Spark at
+stock clocks with nothing locked and a median SM clock of 2,418 MHz over busy samples ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6136140998)), inside the expected band. At `04d0c0ae`, before #27, the same method
+read 177.5 GB/s (median of three runs, 175.6 to 179.2, the SM at 2,418 to 2,437 MHz, [#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), and that
+build read 177.8 again in the `b289130a` session. A plain read kernel measured 233 GB/s on `cuMemAlloc` memory (0.85 of 273)
 and 235 GB/s on write-combined `cuMemHostAlloc` pages ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921));
-our gemv kernels' own rate is still unread. Decision rule: at or
+~~our gemv kernels' own rate is still unread~~. Decision rule: at or
 above 200 the decode flow is byte-bound and P3 kernel work predicts 0 beyond byte-saving levers; below 160, look at page
-size, TLB reach and clocks (`nvidia-smi` clock-event reasons) before any kernel work. Everything else in this file is
+size, TLB reach and clocks (`nvidia-smi` clock-event reasons) before any kernel work. The 208.8 GB/s of `b289130a` is above the rule's 200
+line. The 177.5 GB/s of `04d0c0ae` fell in the 160 to 200 band the rule leaves open, and
+[`sparkdec.md`](../research/sparkdec.md) reads that band from those runs. Everything else in this file is
 settled by reading.
 
 ## 3. What stands between the tree and a passing fixture tier
@@ -137,7 +156,7 @@ tensor-name strings (`…dflash_kv_input_target_features…`) and a comment, `cr
 | `crates/model/src/ops.rs:5529` | bare `std::arch::x86_64::_mm_prefetch` in `warm_touch` | no-op or the `paced` read off x86 (the aarch64 prefetch intrinsic is unstable `[unverified]`) | S |
 | `crates/model/src/bin/markov-accept.rs:137-165`, `crates/model/tests/attn.rs` (6 detects), `crates/model/tests/moe.rs` (2 refs) | x86 kernels in a bin and in tests | cfg or a named skip | S |
 | `.cargo/config.toml`, `.cargo/cuda-oxide.toml` | per-triple CPU flags: `znver3` (with `-sse4a`) for x86_64, `native` for aarch64, the same list in both files | none: done in S2. The flat `znver3` warned on every crate and crashed rustc (SIGSEGV) on some on aarch64 `[#13]`; `tools/check-rustflags.sh` refuses an x86 name in the aarch64 lists | done |
-| `crates/threads/src/lib.rs:786-850` | pool topology from sysfs (`thread_siblings_list`, `cache/index3/*`); with no L3 file it falls back to one group (`:798`, `:806-819`) | none to compile. Default thread count is the primary-core count (`:422`: 20 on GB10) with equal chunks (`:711`), so the 10 E-cores gate every barrier; the pool's two groups follow the two L3 clusters (section 1), but the P/E split inside a group is not modeled | none for P0–P2; M in P3 |
+| `crates/threads/src/lib.rs:786-850` | pool topology from sysfs (`thread_siblings_list`, `cache/index3/*`); with no L3 file it falls back to one group (`:798`, `:806-819`) | none to compile. Default thread count is the primary-core count (`:422`: 20 on GB10) with equal chunks (`:711`), ~~so the 10 E-cores gate every barrier~~ but on the default Spark path no decode or prefill step dispatches to the pool, which runs only the load's upload ([#41](https://github.com/midagedev/bloomery/issues/41)); the pool's two groups follow the two L3 clusters (section 1), but the P/E split inside a group is not modeled | none for P0–P2; ~~M in P3~~ none on the default path ([#41](https://github.com/midagedev/bloomery/issues/41)) |
 | `crates/placement/src/placement/workstation.rs:132`, `paged_drop.rs:181` | `ROW_PAGE` and `PAGE` are 4096, commented "on x86_64" | the DGX OS base page size is 4096 `[#13]`, so the constants hold; a `sysconf` read that refuses another size by name is still the right guard | S |
 | `tools/mac-check.sh:69` (`TARGET=x86_64-unknown-linux-gnu`, also `:178,192,321-323`, `BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu` `:45,330`) | the Mac's cross check | take the triple from `BLOOMERY_CHECK_TARGET`: P0 is then provable without a Spark with `cargo check --target aarch64-unknown-linux-gnu` over the host chain (`-p bloomery-qdot -p bloomery-model -p bloomery-threads …`, no bindgen needed). Needs `rustup target add --toolchain nightly-2026-08-28 aarch64-unknown-linux-gnu`, which the Mac's toolchain lacks today | S |
 
@@ -154,8 +173,8 @@ irrelevant to a whole-on-card run that never starts a host service.
 ### 3.2 The card
 
 - **Targets today.** Recipes pass `--arch {{arch}}`, the justfile's variable (139 lines): `BLOOMERY_ARCH`, default `sm_86`,
-  so `BLOOMERY_ARCH=sm_121 just <recipe>` passes `--arch sm_121`; whether the pinned toolchain accepts it is `[unverified]`
-  (the `sm_121` bullet below). `tools/gate.sh`, `tools/lds-scan.sh` and
+  so `BLOOMERY_ARCH=sm_121 just <recipe>` passes `--arch sm_121`; ~~whether the pinned toolchain accepts it is `[unverified]`~~
+  it does (the `sm_121` bullet below). `tools/gate.sh`, `tools/lds-scan.sh` and
   `tools/sass-scan.sh` read it through `tools/arch.sh`; `tools/ptx-scan.sh` refuses any arch but `sm_86`. The kernels are SIMT code with no generation-specific
   instruction (the three `ptx_asm!` sites are `cvta`, `ld.global`, `max.f32`: `crates/gpu/src/linear/delta.rs:121-157`,
   `flash_gqa_prefill.rs:289`; `fault.rs:714` not read).
@@ -178,20 +197,25 @@ irrelevant to a whole-on-card run that never starts a host service.
   in place; the difference, 8.3 to 8.4 s, is the JIT of every entry by the same subtraction `[derived]`. The first
   start is inside the 10 to 25 s measured on the box (`README.release.md`).
 - **`sm_121` for P3.** The fork's target table has `capability: 121` (`cuda-target-spec/src/lib.rs:382,417,447`) and its
-  selection tests name `sm_121a`/`sm_121f` (`cuda-oxide-codegen/src/target/tests/selection.rs:162-179`). Whether LLVM 21's
-  NVPTX backend accepts `sm_121` is `[unverified]`; `cargo oxide doctor` passes on aarch64 `[#13]`. The fork's `tcgen05` path
+  selection tests name `sm_121a`/`sm_121f` (`cuda-oxide-codegen/src/target/tests/selection.rs:162-179`). ~~Whether LLVM 21's
+  NVPTX backend accepts `sm_121` is `[unverified]`~~ LLVM 21 emits `sm_121` PTX and the driver loads it; on GB10 the
+  driver JIT gives the same SASS from `sm_86` and `sm_121` PTX for 213 of the 215 functions of `generate_qwen3moe`, the
+  generated ids are the same, and a timed sitting found no decode difference outside its margin ([#42](https://github.com/midagedev/bloomery/issues/42)); `cargo oxide doctor` passes on aarch64 `[#13]`. The fork's `tcgen05` path
   is datacenter-Blackwell only (`rustc-codegen-cuda/README.md:107-108`: "need `sm_100a`, which a consumer `sm_120` lacks"),
   and we use no such instruction.
 - **Pins that follow the compute capability.** `tools/ref/ptx-shapes.tsv:6` pins spill and `jit_local` from "sm_86, JIT on
   the RTX 3090" and carries a `# arch: sm_86` line; `tools/recipes.py:1960-1965` says the JIT columns follow the capability;
   `tools/ptx-scan.sh` hard-codes the sm_86 occupancy column. So under `BLOOMERY_ARCH=sm_121` `gate-ptx-spill` ends with "no
   ptx-shapes rows for sm_121; the shape pins are sm_86 only" and `ptx-scan` (so `just narrow`) refuses by name, and no sm_121
-  scan is read against sm_86 rows; per-arch rows are P3 (memo M1). A Spark contributor leaves them out.
+  scan is read against sm_86 rows; per-arch rows are P3 (memo M1). A Spark contributor leaves them out. `gate-ptx-spill` is red on GB10 at the default
+  `sm_86` too: 13 `generate_ds41` and 8 `gate_e2e` rows, each `jit_local` above its pin ([#42](https://github.com/midagedev/bloomery/issues/42)).
 - **Bit gates.** The memo concludes the bit gates have no generation dependence by structure (they compare against oracle
   files) and names two residual risks: `ptxas` contracting `.rn`-less mul-then-add differently, and the `ex2.approx`-class
   approximate instructions in about 30 places (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L198, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/machine-axes.md#L10-L16). The proof is
-  one bit-gate pass on the Spark (`gate-gpu-e2e`'s count pin and the card family gates). The repo has only ever run
-  cc 8.6 (`tools/recipes.py:1960`: "both cards here are sm_86").
+  one bit-gate pass on the Spark (`gate-gpu-e2e`'s count pin and the card family gates). ~~The repo has only ever run
+  cc 8.6~~ The box has only ever run cc 8.6 (`tools/recipes.py:1960`: "both cards here are sm_86"). On GB10 the
+  contributor list defers `gate-gpu-e2e` as real-file, so the first bit-gate pass on cc 12.1 is still open
+  ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
 - **Device pick.** The real-tier gate plan opens the card by the names in `CARDS` and refuses any other card by name
   (`crates/gpu-gates/src/bin/shared/gate_card.rs:8-9, 38-47`: "none of this workstation's cards"). The fixture tier plans on
   `--place a`, "the largest visible card as the device reports itself" (`gate_card.rs:4-6`) and is not affected. The real
@@ -223,7 +247,7 @@ with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemG
 | CPU expert compute | stays possible but pointless: 20 Arm cores against 48 SMs on the same bytes. It is the path the fixture tier exercises (3.4) |
 | The pool's bandwidth | stays, as the single term (section 2) |
 | Page cache of the model file plus the device copy | stays and doubles the footprint until dropped; `nvtier.rs:12-30` already drops pages after use (`MADV_DONTNEED`, the `release_union` path) for the NVMe tier |
-| NVMe → DRAM stream for models above the pool | stays; its rate on a Spark is `[unverified]`. Today the NVMe tier lends its RAM slots to the host leg (`crates/gpu/src/host/nvtier.rs:1-9`), so the CPU computes those experts; on one pool the card can read the same slots without a copy, so the card computes them (P4, section 7) |
+| NVMe → DRAM stream for models above the pool | stays; ~~its rate on a Spark is `[unverified]`~~ its rate depends on the drive (section 7). Today the NVMe tier lends its RAM slots to the host leg (`crates/gpu/src/host/nvtier.rs:1-9`), so the CPU computes those experts; on one pool the card can read the same slots without a copy, so the card computes them (P4, section 7) |
 | KV cache bytes | stay, and they come out of the same pool |
 
 **Smallest first placement: everything on the card, no host tier, no NVMe tier.** Two ways in, both generic already:
@@ -336,7 +360,7 @@ must exist before a contributor can start; "contributor" is what the Spark's own
 | **P0** compiles on aarch64 (done, [#14](https://github.com/midagedev/bloomery/pull/14)) | `cargo check` of the host chain passes on aarch64 Linux (on a Spark, or the cross check of 3.1 from any machine), then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; and on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | `crates/qdot/src/lib.rs`, `crates/model/src/arch/deepseek2/attn.rs`, `crates/model/src/ops.rs:5529`, `markov-accept.rs`, the two test files; `tools/mac-check.sh` triple; a local `.cargo/cuda-oxide.toml` | M | **Contributor** writes it. **Maintainers first**: decide Q1 (R or S) and answer Q5; **maintainers after**: run the x86 landing batch on the PR (the box is the only x86 judge) |
 | **P1** fixture gates pass (`qdot` design S: [#15](https://github.com/midagedev/bloomery/pull/15)) | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | `crates/qdot/src/lib.rs` (design S), `gpu-gate.sh`, `box.sh`, `lease*.sh`, `cards.sh` (3.4); the spin sites if a red points there | L | **Maintainers first**: the fixture recipe published beside the reference sets (answer 3; the sets are public), the contributor gate list (Q4), the fixture path rule (Q2). **Contributor**: the local runner mode (M, answer 10; the maintainers review it), then run, triage, fix Arm-only defects; leaves `gate-ptx-spill` out |
 | **P2** a real model runs (the pool invariant: [#16](https://github.com/midagedev/bloomery/pull/16), section 3.6) | Clef-Flash, then Qwen3-30B-A3B and Qwen3.6-35B-A3B, answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool; the published P2 tape replayed byte for byte once it exists (answer 14) | `crates/placement/src/placement.rs` (`unified: Option<UnifiedPool>`), `workstation.rs` (`unified_of`, `host_of`), `crates/gpu/src/lib.rs` (`census` reads `CU_DEVICE_ATTRIBUTE_INTEGRATED`; free bytes from `MemAvailable` on an integrated device) | M | **Contributor** (`bloomery-placement` is a pure crate: the invariant is testable off the box); the shape is answer 11. **Maintainers first** for the tape clause: the P2 tape and its reference rows (answer 14) |
-| **P3** Spark-specific speed | the section 2 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | `ptx-shapes.tsv` per-arch rows (the arch owner, S3, is in: `justfile` `arch`, `tools/arch.sh`), the fork's per-triple key (S2), `crates/threads` P/E split, `timing-card.sh` single-card mode | L | **Maintainers**: S2 (it touches the fork pin). **Contributor**: the measurement, the table |
+| **P3** Spark-specific speed | the section 2 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | `ptx-shapes.tsv` per-arch rows (the arch owner, S3, is in: `justfile` `arch`, `tools/arch.sh`), the fork's per-triple key (S2), ~~`crates/threads` P/E split~~ ([#41](https://github.com/midagedev/bloomery/issues/41)), `timing-card.sh` single-card mode | L | **Maintainers**: S2 (it touches the fork pin). **Contributor**: the measurement, the table |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots; the section 7 term measured | the unified tier's slot seam (section 7), `crates/gpu/src/host/nvtier.rs`, the card leg | L | **Maintainers first**: the unified tier and its integrated-device seam. **Contributor**: the read-rate measurement, then runs and extends the seam on the Spark |
 | **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 8 criteria, N = 2 first: split (a), the star, with raw verbs and a pump thread a node (8.5, 8.6); the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 (8.8) | `crates/placement` (`Machine { cards, tiers, nodes, fabric }`, `nodes_scale`), `crates/gpu/src/host/{mod,tier}.rs` (monotonic words, a `Link` seam), the transport (8.6) | L | **Maintainers first**: single-node P1 (the host-tier protocol on Arm); #16 with its doc line, then `host` and `unified` into `nodes[0]`; the per-node `Machine` and `nodes_scale`; the monotonic-word change and the `Link` seam; the `libibverbs` decision under `just deny` (8.9). **Contributor**: the two measurements of 8.9 (`ib_write_bw` / `ib_write_lat`, then the GPU flag ping-pong probe, which takes N as an argument), then the transport and the N = 2 run |
 
@@ -388,10 +412,12 @@ The aarch64 build of P0 and the readings of section 1 are the contributor's reco
 ([#13](https://github.com/midagedev/bloomery/issues/13), [#14](https://github.com/midagedev/bloomery/pull/14)), and
 the readings in sections 3.2 and 3.4 are the contributor's on one Spark
 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)); the maintainers' checks ran on
-x86_64. Still open: LLVM 21 and `sm_121` PTX; the host-tier protocol's correctness on Arm
-(its spin sites, section 3.1); the card's read rate over pageable memory (section 7); the NVMe read rate on a Spark;
-of section 8, the latency of a direct link, small-message bandwidth in protocol mode, `cuStreamWaitValue32` on a page
-the NIC wrote, the hit rates, S₁, BW and the switch hop (8.10). Its link facts (8.1) are sourced.
+x86_64. Still open: ~~LLVM 21 and `sm_121` PTX~~ ([#42](https://github.com/midagedev/bloomery/issues/42)); ~~the host-tier protocol's correctness on Arm~~
+(its spin sites, section 3.1; [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)); ~~the card's read rate over pageable memory~~ (section 7,
+[#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921)); ~~the NVMe read rate on a Spark~~ ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921), [#71](https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679)); of section 8, ~~the latency of a
+direct link~~ ([#44](https://github.com/midagedev/bloomery/pull/44)), small-message bandwidth in protocol mode, ~~`cuStreamWaitValue32` on a page the NIC
+wrote~~ ([#44](https://github.com/midagedev/bloomery/pull/44)), the hit rates (V4.1's replayed in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124845802); GLM's assumed), S₁ (a first reading, 8.4),
+~~BW~~ (section 2) and the switch hop (8.10). Its link facts (8.1) are sourced.
 
 ## 7. Above the pool: the card computes the NVMe tier
 
@@ -418,8 +444,11 @@ seam and prove on x86 what they can, then the contributor runs and extends it on
 `cuMemAlloc` memory, (ii) `cuMemHostAlloc` memory (the reading asked for on #13) and (iii) an anonymous mapping as the
 arena allocates it, with the CPU idle. The suspect term is translation reach: the arena's pages are 4 KiB today, since
 THP is in `madvise` mode `[#13]` and `AnonMap` is memmap2's `map_anon` with no `MADV_HUGEPAGE`
-(`crates/engram/src/direct.rs:145-150`). Expected: (iii) under (i) by the 4 KiB translations, (ii) near (i)
-`[predicted, no Spark number exists]`. The rule follows the copy's cost: a copy into card memory moves 2 × the slot's
+(`crates/engram/src/direct.rs:145-150`). Expected: (iii) under (i) ~~by the 4 KiB translations~~, (ii) near (i)
+~~`[predicted, no Spark number exists]`~~. Measured with a kernel that does a decode step's gate_up reads without the
+arithmetic, repeat reads, the median of 4 runs, outside the lease runner (exploratory readings,
+[#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921)): (i) 233.3, (ii) 223.6 (199.4 on the first read after a fill) and with
+`WRITECOMBINED` 235.1, (iii) 157.4 GB/s; (iii) with 2 MiB pages reads 159.2, so translation reach is not the cause. The rule follows the copy's cost: a copy into card memory moves 2 × the slot's
 bytes through the same pool once per fill (section 3.3's table), and the slower read is paid on every use, so with h
 uses per fill the card reads in place while 1/r(iii) − 1/r(i) < 2 / (h · r_pool) `[derived]` (h = 1: down to a third
 of (i); h = 10: at 0.83 of (i) or above):
@@ -429,7 +458,10 @@ of (i); h = 10: at 0.83 of (i) or above):
   `[unverified]`);
 - otherwise: copy each filled slot into card memory before its use, on the copy engines.
 
-The NVMe read rate on a Spark is `[unverified]`. Our box's drive reads 6.77 GB/s at queue depth 16
+~~The NVMe read rate on a Spark is `[unverified]`.~~ The NVMe read rate on a Spark depends on the drive: a 4 TB PCIe
+Gen5 drive reads 11.16 GB/s with 1 MiB `O_DIRECT` preads at queue depth 16 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921)), and a 1 TB PCIe Gen4
+DRAM-less drive about 4.0 GB/s with about 1 MB expert parts at random offsets at queue depth 8 ([#71](https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679)). Under one load, expert parts read by `probe_nvread` at queue
+depth 16, the two drives read 8.4 to 8.9 and 5.8 GB/s ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288), row 3). Our box's drive reads 6.77 GB/s at queue depth 16
 (`docs/cards/qdsweep.card`); that number belongs to that drive and does not carry over. Above the pool the decode is
 bound by the tier's misses, whose flow model is the unified tier's.
 
@@ -476,6 +508,24 @@ Derived from the rows above:
   the peer mapping that cuda.html says does not work (that no such path works on GB10 is `[unverified]`). A host thread
   posts every send.
 
+Measured on two DGX Sparks with one direct cable, one RoCE device a side (RoCE v2, MTU 4096, perftest 6.20; [#44](https://github.com/midagedev/bloomery/pull/44),
+[#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288) row 5 and [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)). These are a contributor's readings, kept apart from NVIDIA's rows above.
+The `-t 1` and `-t 128` rows and the second `ib_write_lat` row come from one session after the EC, SoC and VBIOS update
+of 2026-10-13, with 100,000 iterations a run (#44's bandwidth runs used 500,000). Their direction means of three runs
+are `[derived]`. In the perftest rows, strict ordering means the tool printed `PCIe relax order: OFF`: `ib_write_bw`
+takes `--disable_pcie_relaxed` for it, and `ib_write_lat` has no option and prints `OFF`.
+
+| Reading | Value |
+|---|---|
+| `ib_write_bw`, 64 KB, one rail, both directions, relaxed ordering on (perftest's default) | 109.15 to 109.30 Gb/s |
+| `ib_write_bw`, 3 MiB, one rail | 109.04 Gb/s = 13.63 GB/s |
+| `ib_write_bw`, one write in flight (`-t 1`), strict ordering, both directions | 24.7 and 25.2 Gb/s at 16 KB, 39.7 and 40.1 at 32 KB, 56.6 and 57.6 at 64 KB (direction means of three runs `[derived]`): 5.20 to 5.30, 6.54 to 6.61 and 9.10 to 9.27 µs a write `[derived]` ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)) |
+| `ib_write_bw`, 128 writes in flight (`-t 128`), strict ordering, 16 to 64 KB | 108.71 to 109.26 Gb/s (direction means of three runs `[derived]`) ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)) |
+| `ib_write_lat`, one way (`t_typical`), strict ordering, before the 2026-10-13 update ([#44](https://github.com/midagedev/bloomery/pull/44)) | 4.80 to 4.85 µs at 16 KB, 8.98 to 9.12 µs at 64 KB (the range of two runs a direction; no 32 KB run) |
+| `ib_write_lat`, one way (`t_typical`), strict ordering, after the update | A to B: 5.00 µs at 16 KB, 7.03 at 32 KB, 9.43 at 64 KB. B to A: 5.03, 6.86 and 9.56 µs (direction means of three runs `[derived]`, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)) |
+| `all_gather_perf` busbw, 8 GiB | 13.78 to 13.82 GB/s out of place, 13.91 to 13.92 GB/s in place |
+| `link_probe` round trip λ_probe (16 KB out, 64 KB back, strict ordering) | p50 29.76 to 30.27 µs, 0 stale lines; the engine's λ is 37 to 60 µs `[derived]` in #44 |
+
 ### 8.2 The shape
 
 A node is one unified machine (section 3.6). A remote GB10 does what a tier card does today: it computes routed experts
@@ -514,11 +564,11 @@ pub struct Link { pub rail: u64 /* bytes/s, one message */, pub round_trip_ns: u
   tensor bytes and roles, so no model supplies them. On the box's PCIe the same formula holds with the lane's rate, so
   it is one owner for both machines, not a Spark branch.
 - **With the unified tier.** The second node is a compute site with its own residency, not one more tier in the read
-  path: reading a remote V4.1 expert costs 16.8 MB / 11.6 GB/s = 1.4 ms, against 16.8 MB / 219 GB/s = 77 µs to compute
-  it in place `[derived]`. The tier's ledger gains a node column, (node, id) to state. Node 1 runs its own books over
+  path: reading a remote V4.1 expert costs ~~16.8 MB / 11.6 GB/s = 1.4 ms, against 16.8 MB / 219 GB/s = 77 µs~~ 16.8 MB / 13.63 GB/s = 1.2 ms, against
+  16.8 MB / 208.8 GB/s (section 2) = 80 µs to compute it in place `[derived]`. The tier's ledger gains a node column, (node, id) to state. Node 1 runs its own books over
   its own pool, arena and file copy. On a unified node a card slot and a host segment collapse (section 7), so a node's
-  states are pool, arena and file. One new move is pool of node 0 to pool of node 1: a link copy of an expert (0.7–1.4
-  ms) on a background lane, at a step boundary, rare. The router's counts go to node 1 once a window for its arena
+  states are pool, arena and file. One new move is pool of node 0 to pool of node 1: a link copy of an expert (~~0.7–1.4
+  ms at 11.6 GB/s a rail~~ 0.6 to 1.2 ms at the measured 13.63 GB/s a rail, 8.1 `[derived]`) on a background lane, at a step boundary, rare. The router's counts go to node 1 once a window for its arena
   eviction and drive the cross-node balance. The unified tier's per-node byte ledger, plan-time rule and prefetch rounds
   are the ones this touches. None needs to change now.
 
@@ -540,23 +590,35 @@ latency term; (b) adds latency and splits no bytes for one request. (d), tensor 
 
 ### 8.4 Bands `[derived]`
 
-**Assumptions, stated once.** Every figure below holds under them; none was measured on a Spark.
-- **BW**, the pool read of our kernels: 219 GB/s, the 80 % of 273 GB/s that section 2 assumes (band 200–235). A plain
-  read kernel measured 233 GB/s on `cuMemAlloc` memory (#13); our kernels' own rate, section 2's one term, is unread.
+**Assumptions, stated once.** Every derived figure below holds under the first inputs stated here; the measured values
+now written beside them are not fed back into the tables.
+- **BW**, the pool read of our kernels: ~~219 GB/s, the 80 % of 273 GB/s that section 2 assumes (band 200–235)~~
+  measured 208.8 GB/s on `b289130a` (177.5 GB/s on `04d0c0ae`, before #27; section 2). A plain read kernel measured 233 GB/s on `cuMemAlloc`
+  memory (#13); ~~our kernels' own rate, section 2's one term, is unread~~.
 - **λ**, the exposed round trip a layer, link and protocol: 25–70 µs. Terms: two one-way RDMA trips of 3–8 µs `[assumed:
-  no direct-link source]`; send serialization 0.5–1.4 µs and rows serialization 4.4–11.3 µs at 11.6 GB/s (51–131 KB);
+  no direct-link source]` (measured one way: 4.80 to 4.85 µs at 16 KB, 8.1); send serialization 0.5–1.4 µs and rows serialization 4.4–11.3 µs at 11.6 GB/s (51–131 KB);
   two pump wake-ups of 1–3 µs `[assumed]`; two stream-wait passes of 2–5 µs `[assumed]`; the tier graph's copy nodes
-  (`c_node` 0.85 µs, [rig-log plan.md:71](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md#L71)). The one measured protocol number in the repo is the host-tier bridge floor,
+  (`c_node` 0.85 µs, [rig-log plan.md:71](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md#L71);
+  on GB10 0.553 µs, the fastest of three direct runs of `cnode_probe --time` (0.553 to 0.557), SM clock 2,372 to
+  2,424 MHz, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288) row 6, on main `23ee2100` ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984))). The one measured protocol number in the repo is the host-tier bridge floor,
   21–36 µs a layer on PCIe ([rig-log plan.md:78](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md#L78)).
+  Measured on one direct cable: λ_probe p50 29.76 to 30.27 µs, and the engine's λ 37 to 60 µs `[derived]` (8.1), inside
+  the band.
 - **U**, the usable pool a node for model, KV and scratch: about 115 GB `[assumed]`. Section 1 reads 116.6–116.9 GiB
   (125 GB) of idle `MemAvailable` on a Spark `[#13]` and #16 reads it at plan time, so U is a cautious planning figure.
-- **NVMe**: 6.77 GB/s, our box's drive at queue depth 16 (`docs/cards/qdsweep.card`). A Spark's drive rate is
-  `[unverified]`.
+- **NVMe**: 6.77 GB/s, our box's drive at queue depth 16 (`docs/cards/qdsweep.card`). ~~A Spark's drive rate is
+  `[unverified]`.~~ A Spark's drive rate depends on the drive (section 7): 11.16 GB/s at queue depth 16 on a 4 TB Gen5
+  drive, about 4.0 GB/s at queue depth 8 on a 1 TB Gen4 one.
 - N = 4 adds a 1.5 µs switch hop and 1 µs for a further post `[assumed]`.
-- The non-byte "rest" of a step (launch chain and latency, 2.6–4.4 ms a token, section 2) is not in the bands. It lowers
+- The non-byte "rest" of a step (~~launch chain and latency, 2.6–4.4 ms a token~~; measured inside the gemv kernels,
+  section 2) is not in the bands. It lowers
   every absolute figure by about 5–15 % and moves the ratios by under 5 % `[derived at the GLM and Qwen3.8 midpoints]`.
 - V4.1 and GLM hit rates on one node (ρ₁ 0.6–0.75 and 0.75–0.9) and on two (ρ₂ 0.93–0.98) are `[assumed]`. The V4.1 and
-  GLM bands are only as good as they are.
+  GLM bands are only as good as they are. For V4.1, a chat route trace recorded on a DGX Spark gives two rows ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124845802)): a fixed set
+  ranked by other requests' counts, ρ₁ 0.736 and ρ₂ 0.960, inside the bands, and a shared LRU that keeps its state from
+  one request to the next, 0.943 and 0.994, above them. The replay scores the 5,793 generated-token positions of 24 held
+  requests on 38 of the 40 layers, with 154 and 320 experts a layer as proxies for these rooms. Neither row charges for a
+  fill or an eviction, and neither is the engine's own shape (a fixed set plus a per-layer LRU of arena slots).
 - The (a) figures come from a Monte Carlo of the per-layer window: each routed slot lands on node j with the ownership
   probability the rule picks, and the window is the max over the nodes of `Sh + slots·e` (node 0) or `λ + hop + posts +
   rows ingress + slots·e` (a remote). Node 0's share is optimized: 0.55–0.72 at N = 2 for Qwen3.8 and 0.07–0.15 at N = 4
@@ -571,8 +633,8 @@ latency term; (b) adds latency and splits no bytes for one request. (d), tensor 
 | experts / top-k k / expert ff | 384 / 6 / 2304 | 288 / 8 / 2048 | 512 / 10 / 640 |
 | bytes an expert | 16.77 MB | 15.20 MB | 3.17 MB |
 | R, routed bytes read a token (k × e × L) | 4.03 GB | 5.11 GB | 1.52 GB |
-| Sh, shared and dense FFN a token | 0.8–1.5 GB | 1.4 GB | 0.14 GB |
-| A, attention, norms, router and head a token | 3.2–5.8 GB | 4.7–8.2 GB | 3.4–4.4 GB |
+| Sh, shared and dense FFN a token | 0.8–1.5 GB | ~~1.4 GB~~ 1.60 GB: shared expert 1.12, dense FFN of layers 0 to 2 0.48 (a header read, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)) | 0.14 GB |
+| A, attention, norms, router and head a token | 3.2–5.8 GB | 4.7–8.2 GB; the header read gives 7.36 GB: attention 6.45 (linear-attention q, k and v 3.64, attention output 2.00, MLA 0.59, the rest 0.23), head 0.67, router 0.20, the rest 0.04 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)) | 3.4–4.4 GB |
 | file; fits | 347.3 GB; neither one nor two Sparks | 199.7 GB; two, not one | 111.3 GB; one, marginal |
 
 **The per-layer model.** A layer is `attention → router → handoff → [node 0: shared + its routed share ‖ node 1: λ + its
@@ -585,7 +647,7 @@ routed share] → join`. The next layer's attention needs the join, so node 1 id
   per token (Qwen3.8 has the room; the handoff kernel must write places per token).
 - Gain over one node, when the model fits it: `ΔT = L·(F_l/BW − λ)/2 − L·Δ_l/BW`, with `F_l = (Sh + R)/L` and Δ_l the
   per-layer imbalance. The break-even per-layer round trip is `λ* = (F_l − 2·Δ_l)/BW`: **Qwen3.8 122 µs, GLM 556 µs,
-  V4.1 410–490 µs**.
+  V4.1 410–490 µs** at the first BW, 219 GB/s, not recomputed.
 - (b) with one request in flight: the wall is the sum of the nodes plus the hops. With two in flight, the max.
 - (c) with one request equals (a) at a fixed s = 0.5, and both nodes carry the dense weights. With two requests,
   attention is data-parallel (one request a node) and the all-to-all runs both ways: `t = (A + Sh + R(2)/2)/BW + L·λ`,
@@ -601,6 +663,9 @@ routed share] → join`. The next layer's attention needs the join, so node 1 id
 
 For Qwen3.8 at N = 2 under (a), node 0 holds about 75 GB (4.5 non-routed + 28.8 PLE + about 39 routed + KV) against
 about 114 GB on one node, and node 1 about 40 GB.
+
+The tables below and the "fires" table of 8.7 are `[derived]` from the assumptions above as first written: BW 219 GB/s,
+NVMe 6.77 GB/s and the assumed ρ. They are not recomputed with the measured inputs.
 
 **Decode, tok/s, one request / N requests in flight (total):**
 
@@ -621,7 +686,9 @@ about 114 GB on one node, and node 1 about 40 GB.
 - For Qwen3.8, A is 67–73 % of the bytes, so (a) gains 1.05–1.10× at one request on two nodes.
 
 **Prompt, P = 4096, in units of S₁** (one node's in-pool prompt rate at this P, a rate of a card and model pair;
-**S₁ is unmeasured on a Spark**) **and the absolute cap that binds:**
+~~**S₁ is unmeasured on a Spark**~~ a first reading on one Spark: 1,038.3 and 1,054.5 tok/s for Qwen3.8 `UD-Q4_K_XL`
+prompts of 4,087 and 4,092 tokens at `v0.3.0`'s serving defaults, MTP draft on, [#46](https://github.com/midagedev/bloomery/issues/46#issuecomment-6116080838)) **and the absolute cap
+that binds:**
 
 | Split | N = 2 | N = 4 | Cap that binds |
 |---|---|---|---|
@@ -681,6 +748,9 @@ the serial A is tensor parallel (8.5).
   exposed (`L·λ`, 1.0–3.4 ms), and each node's NIC caps its prompt (2,870 tok/s a node for GLM at N = 4).
 
 ### 8.5 Recommendation, and tensor parallel
+
+The rates below are 8.4's `[derived]` bands at their first inputs (BW 219 GB/s, the box's NVMe, the assumed ρ), not
+recomputed with the measured values.
 
 1. **(a), the star, for one request: plan (b′) with the second Spark as the expert tier and the link in place of PCIe.**
    - It keeps the bits. The join already reads one f32 row per routed slot from the tier
@@ -785,7 +855,7 @@ cannot it names why (`NodeIdle { reason }`, a prompt-mode note). An unset `--pla
 11. **A lost node ends the request by name**, as a lost tier card does today (`tier.rs:48-53`): the go deadline names
     it, and node 1's own deadline drains its streams (8.6, item 6). No failover.
 
-**Where each fires** `[derived]`, one row per model, N in {1, 2, 3, 4}, λ in {25, 70} µs, A low and high, and the prompt
+**Where each fires** `[derived]` from 8.4's first inputs (BW 219 GB/s, NVMe 6.77 GB/s, the assumed ρ), one row per model, N in {1, 2, 3, 4}, λ in {25, 70} µs, A low and high, and the prompt
 at S₁ in {1,000, 3,000} tok/s (the pins of the gate in 8.8):
 
 | Model | Decode step (ms), N = 1 → 2 → 3 → 4, λ 25 / 70, A low | Criterion 2 fires | Criterion 7 fires | Criterion 5 fires (prompt) |
@@ -847,10 +917,11 @@ start, so nothing in it assumes a pair.
    Then `all_gather_perf` per NVIDIA's NCCL playbook.
    - Expected bandwidth 92–109 Gb/s a rail (11.6–13.7 GB/s): NVIDIA's 92.57 and 97.28 and the user's 109.28 (8.1). Below
      90 Gb/s a rail `[a decision line, not a source: the 90 Gb/s line of the N = 4 switch check below, applied to the
-     direct link]` the cable, MTU or ordering setup is wrong: fix it before the probe.
+     direct link]` the cable, MTU or ordering setup is wrong: fix it before the probe. Measured: 109.15 to 109.30 Gb/s
+     (8.1).
    - Expected one-way latency as perftest prints it: 4–10 µs at 16 KB and 8–14 µs at 64 KB `[derived from an assumed 3–8
      µs base]`. Above 10 µs at 16 KB, λ's band of 25–70 µs is low by twice the excess `[derived]`: redo 8.4 before
-     trusting criterion 2.
+     trusting criterion 2. Measured: 4.80 to 4.85 µs at 16 KB and 8.98 to 9.12 µs at 64 KB (8.1).
 2. **The protocol probe** (a small bin, contributor-sized).
    - Node 0's kernel writes a 16 KB image and a go generation into a `cudaHostAlloc` page registered with `ibv_reg_mr`
      (strict ordering). A pump posts one RDMA write. Node 1's stream waits on its page (greater-or-equal), runs a null
@@ -859,7 +930,7 @@ start, so nothing in it assumes a pair.
      lines seen after the flag.
    - **Expected λ_probe p50 = 18–40 µs `[derived]`.** The engine's λ is λ_probe plus 7–30 µs: the tier graph's copy-in
      and copy-out nodes, the stage's handoff, go and wait memops and the join. That gives the 25–70 µs of 8.4. Expected
-     stale lines: 0.
+     stale lines: 0. Measured: p50 29.76 to 30.27 µs and 0 stale lines (8.1), so (a) holds.
    - Decision rule on λ_probe, against the break-even λ* per model (8.4: Qwen3.8 122 µs, GLM 556 µs, V4.1 410–490 µs):
      - **at most 40 µs** (engine at most 70 µs): (a) as predicted; Qwen3.8 1.05–1.10× at one request; GLM and V4.1 are
        decided by fit.
@@ -867,7 +938,8 @@ start, so nothing in it assumes a pair.
        so it stays on one node.
      - **over 120 µs**: the pump or wake-up path is wrong; fix it before any engine work.
      - **stale lines over 0**: switch to write-with-immediate and measure again.
-3. Then the single-node term section 2 names (sustained BW), which sets every band above.
+3. Then the single-node term section 2 names (sustained BW), which sets every band above. Measured: 177.5 GB/s
+   (section 2).
 
 **What carries from N = 2 to N = 4 unchanged:** the pump threads, the strict-order registration, the generation waits
 and the stale-line check, the pair λ, each node's NIC cap (the same SoC links) and the per-node census over the control
@@ -883,13 +955,19 @@ channel.
 
 ### 8.10 Still open
 
-- GLM's A band (4.7–8.2 GB a token) is wide: the file minus routed leaves about 3.5 GB that the tensor shapes do not
-  explain. A header read of the `UD-Q4_K_XL` file's non-routed tensors closes it on a Mac.
-- V4.1's hit rates ρ₁ and ρ₂ are assumptions. A Mac-only replay of the route trace at the two room sizes could replace
-  them before any Spark run.
-- Whether `cuStreamWaitValue32` on a `cudaHostAlloc` page written by the NIC behaves on GB10 is `[unverified]`. The
-  probe answers it.
-- Unverified besides: a latency for a direct link, small-message (16–64 KB) bandwidth in protocol mode (strict ordering,
-  one message in flight; at least 4.8–5.6 µs of serialization on one rail plus the one-way latency `[derived]`), the
-  switch hop, BW, S₁, and the Spark drive's NVMe rate.
+- ~~GLM's A band (4.7–8.2 GB a token) is wide: the file minus routed leaves about 3.5 GB that the tensor shapes do not
+  explain.~~ A header read of the `UD-Q4_K_XL` file's non-routed tensors gives A 7.36 GB and Sh 1.60 GB a token (8.4,
+  [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)).
+- ~~V4.1's hit rates ρ₁ and ρ₂ are assumptions.~~ A replay of a route trace recorded on a Spark gives two rows (8.4,
+  [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124845802)).
+- ~~Whether `cuStreamWaitValue32` on a `cudaHostAlloc` page written by the NIC behaves on GB10 is `[unverified]`.~~ It
+  does: the probe's stream waits on such a page with no stale line ([#44](https://github.com/midagedev/bloomery/pull/44)).
+- Unverified besides: ~~a latency for a direct link~~ (8.1), small-message (16–64 KB) bandwidth in protocol mode (strict
+  ordering, one message in flight; at least 4.8–5.6 µs of serialization on one rail plus the one-way latency
+  `[derived]`; with strict ordering and one write in flight on perftest's host buffers, not the protocol's pinned
+  pages, the time per write derived from throughput at 64 KB is 9.10 and 9.27 µs, 0.33 and 0.29 µs under the same
+  session's mean one-way `t_typical` `[derived]` (8.1, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)); a time per write
+  from throughput and half a ping-pong round trip are different quantities, so this neither confirms nor refutes the
+  floor), the switch hop, ~~BW~~ (section 2), S₁ (a first reading, 8.4), and ~~the Spark drive's NVMe rate~~
+  (section 7).
 - Whether to take tensor parallel first instead of (a) is the maintainers' decision (8.5).
