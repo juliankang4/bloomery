@@ -194,6 +194,13 @@
 //!   budget's, fewer than the planned budget's — and decodes the arm's steps
 //!   bit for bit the paged arm's; a reading short by the room above the
 //!   floor and one byte is refused naming the floor.
+//! - `devslot` (clause 14, the paged arm, after its steps): every part of
+//!   every id the arena holds filled, pinned, read through the card's
+//!   address of its slot (`TierPin::device_slot`, a synchronous DtoH copy)
+//!   equals the bytes `TierSlots::slot` lends, on an arena of
+//!   `BLOOMERY_NVTIER_MEM=pinned`; on an anonymous arena (the lever unset) no
+//!   pin gives an address. The paged arm's landings free slots that later
+//!   fills take, so the parts read include slots refilled after a release.
 //!
 //! PIN(2026-10-11): clause 7 judges 0 interior pages after the prompt, where it judged at most `layers x cpus x 2R`. Derived, not measured: the prompt's union reads every tier id from its arena slot (`prefetch_pinned`), so it faults no page of a drop run, and no drop follows it (`release_union` is gone), so a page of a run read after the prompt would stay. The interiors leave out the edge bands where the host segment's own reads reach. The pre-change run (R4b-1, the same union) read 0 against the old bound of 196608. FAIL-first: a layer left unattached to the tier reads the mapping and its interior pages stay, turning the clause red.
 //!
@@ -245,7 +252,7 @@ use bloomery_gpu::arch::qwen3moe::{Body38, SplitWalk};
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats};
 use bloomery_gpu::host::nvtier::{
-    DropRuns, Heat, NvTier, NvTierStats, ReaderStats, UnionBook, advice_disjoint,
+    ArenaKind, DropRuns, Heat, NvTier, NvTierStats, ReaderStats, UnionBook, advice_disjoint,
 };
 use bloomery_gpu::host::swap::{LateLog, PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
@@ -256,7 +263,7 @@ use bloomery_levers::{
 };
 use gguf::Split;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
-use model::moe::UNION_BATCH_IDS;
+use model::moe::{TierSlots, UNION_BATCH_IDS};
 use model::placement::churn::ChurnPool;
 use model::placement::host_lock::page_bytes;
 use model::placement::workstation::{ArenaGrant, HostNeed, HostRead};
@@ -384,6 +391,9 @@ struct ArmRun {
     split_walk: (SplitWalk, Option<String>),
     /// The arena's books right after the prompt call, on a load with a tier.
     claim: Option<ClaimBooks>,
+    /// The card's reads of the filled slots after the steps, on a load with
+    /// a tier.
+    devslot: Option<DevSlot>,
 }
 
 /// One paged layer's arena as the prompt call left it: the union call the
@@ -629,6 +639,20 @@ struct Seam {
     counters: [NvTierStats; 2],
 }
 
+/// `devslot`'s reading: the filled parts the card read through a pin's
+/// address (`read`) and those it read other than the slot (`wrong`), the
+/// parts a pin gave no address (`unaddressed`), and the ids a lane's victim
+/// fill evicted between the read of the books and the pin (`gone`): the
+/// lane prepares victims on its own thread, and a job of the last boundary
+/// can run past the last step.
+#[derive(Default)]
+struct DevSlot {
+    read: usize,
+    wrong: usize,
+    unaddressed: usize,
+    gone: usize,
+}
+
 /// The plan of `file` on `machine` with `room` given, or the machine's own
 /// reading when `None`.
 fn inputs_of(file: &Split, room: Option<u64>) -> Result<PlanInputs, GateError> {
@@ -766,6 +790,7 @@ fn arm(
         steps: None,
         split_walk,
         claim: None,
+        devslot: None,
     };
     let note = |s: &mut Session<Body38>, run: &mut ArmRun| -> Result<(), GateError> {
         for (_, r) in take_passes(s)? {
@@ -879,6 +904,14 @@ fn arm(
         });
     }
     run.seam = seam_of(&s, plan.model.layers, plan.model.experts as u32)?;
+    if let Some(t) = &tier {
+        run.devslot = Some(devslot_of(
+            &s,
+            t,
+            plan.model.layers,
+            plan.model.experts as u32,
+        )?);
+    }
     run.late_flips = s.model_mut().body_parts(NAME)?.2.take_late_flips();
     if record::nvtier_of(tier.as_deref()).is_some() != room.is_some() {
         return Err(
@@ -915,6 +948,53 @@ fn seam_of(s: &Session<Body38>, layers: usize, experts: u32) -> Result<Option<Se
     }
     seam.counters[1] = tier.stats();
     Ok(Some(seam))
+}
+
+/// `devslot`: each id of `tier` filled now, pinned alone, each of its parts
+/// copied from the card's address of its slot and held to the slot's bytes.
+/// A pin refused while the books still hold the id filled fails by name;
+/// one refused because the id left its slot since the read is counted gone.
+fn devslot_of(
+    s: &Session<Body38>,
+    tier: &NvTier,
+    layers: usize,
+    experts: u32,
+) -> Result<DevSlot, GateError> {
+    s.model().gpu().context().bind_to_thread()?;
+    let mut d = DevSlot::default();
+    for l in (0..layers).filter(|&l| tier.covers(l)) {
+        for id in (0..experts).filter(|&id| tier.serves(l, id) && tier.slot_filled(l, id)) {
+            let pin = match tier.pin(l, &[id]) {
+                Ok(pin) => pin,
+                Err(_) if !tier.slot_filled(l, id) => {
+                    d.gone += 1;
+                    continue;
+                }
+                Err(e) => return Err(format!("devslot: layer {l} expert {id}, filled: {e}").into()),
+            };
+            for part in 0..EXPERT_PARTS as usize {
+                let host = TierSlots::slot(tier, l, id, part)
+                    .ok_or_else(|| format!("layer {l} expert {id} part {part}: pinned, unlent"))?;
+                let Some(dev) = pin.device_slot(id, part) else {
+                    d.unaddressed += 1;
+                    continue;
+                };
+                let mut got = vec![0u8; host.len()];
+                // SAFETY: the context is current on this thread (bound
+                // above); `dev` addresses `host.len()` bytes of the slot the
+                // pin holds filled, and `got` is a host buffer of that length.
+                let rc = unsafe {
+                    cuda_core::sys::cuMemcpyDtoH_v2(got.as_mut_ptr().cast(), dev, got.len())
+                };
+                if rc != cuda_core::sys::cudaError_enum_CUDA_SUCCESS {
+                    return Err(format!("cuMemcpyDtoH_v2 of layer {l} expert {id}: {rc:?}").into());
+                }
+                d.read += 1;
+                d.wrong += usize::from(got != host);
+            }
+        }
+    }
+    Ok(d)
 }
 
 /// What the residency machine's lane did since the load
@@ -2313,6 +2393,31 @@ fn run() -> Result<(), GateError> {
     );
     pass &= seam_ok;
 
+    // `devslot` (clause 14): the lever this process reads says which arena
+    // the paged arm built.
+    let pinned = bloomery_levers::nvtier_levers()?.pinned;
+    let dev = paged
+        .devslot
+        .as_ref()
+        .ok_or("the paged arm read no devslot")?;
+    let devslot_ok = dev.wrong == 0
+        && if pinned {
+            dev.read > 0 && dev.unaddressed == 0
+        } else {
+            dev.read == 0 && dev.unaddressed > 0
+        };
+    println!(
+        "devslot: on a{} arena, {} filled parts the card read through a pin's address, {} not the \
+         slot's bytes, {} with no address, {} ids gone before their pin: {}",
+        if pinned { " pinned" } else { "n anonymous" },
+        dev.read,
+        dev.wrong,
+        dev.unaddressed,
+        dev.gone,
+        verdict(devslot_ok)
+    );
+    pass &= devslot_ok;
+
     let flips = paged.landed > 0;
     // `late`, printed: one line a late flip the machine's debug ring holds,
     // where its job stood at the boundary and the five terms its
@@ -2831,7 +2936,7 @@ fn refuse_clauses(
     let with_arena = |bytes: u64| {
         let mut p = plan.clone();
         p.host.nvme_arena_bytes = bytes;
-        NvTier::of_paged(&p, &split, true, ArenaGrant::whole(bytes))
+        NvTier::of_paged(&p, &split, true, ArenaGrant::whole(bytes), ArenaKind::Anon)
     };
     let slot = match with_arena(1) {
         Err(e) => e.to_string().contains("carves 0 slots"),

@@ -1,5 +1,6 @@
 //! The NVMe expert tier's RAM arena: one anonymous mapping
-//! ([`engram::direct::AnonMap`]) carved into slots — one expert a slot,
+//! ([`engram::direct::AnonMap`]), or one allocation of pinned host memory the
+//! card maps ([`ArenaKind::Pinned`]), carved into slots — one expert a slot,
 //! each of its parts in its own [`DIRECT_ALIGN`]-aligned window, the bytes
 //! landing at the skew an aligned read of the part's file range needs —
 //! filled on a miss by [`DirectFile::read_span`] — over the resident pool for
@@ -15,8 +16,14 @@
 //! arena's one give-back (`ArenaMem::give_back`, the only door to the
 //! mapping's advice), which frees an anonymous range's pages — that is why
 //! the arena is anonymous and not the page cache, whose warm set nothing
-//! else can flush. An eviction returns none: the slot's next fill, in the
-//! same call, overwrites the bytes it reads in place. The model
+//! else can flush. A pinned arena returns none: its allocation is the
+//! plan's for the load. On write-combined pages (an integrated device's) a
+//! `MADV_DONTNEED` leaves the range unbacked for the host and for a
+//! `cuMemcpyDtoH` from its device address: the next fill's read fails with
+//! `EFAULT`, and a CPU read or that copy faults. On a card across PCIe the
+//! pages are a shared mapping, which keeps them through the advice. An
+//! eviction returns none: the slot's next fill, in the same call, overwrites
+//! the bytes it reads in place. The model
 //! file's mapping is its readers': a lane's copy of an id the arena holds
 //! unfilled reads it through the mapping, which faults its pages in from the
 //! drive, and once the copy has consumed them the tier drops them from the
@@ -85,6 +92,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use cuda_core::CudaContext;
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::Split;
 use model::moe::{Claim, PinRelease, PinToken, Ticket, TierError, TierPin, TierSlots};
@@ -112,27 +120,42 @@ const READER_STOP_BOUND: Duration = Duration::from_secs(30);
 
 /// The arena's one mapping, and the one door its pages and bytes pass
 /// through. The mapping is a private field of [`ArenaMem`]: a slot's pages go
-/// back through [`ArenaMem::give_back`] and no other call, so a later arena
-/// whose slots a device holds registered changes that one function; and a
-/// fill writes straight into a slot's windows ([`ArenaMem::read_into`]),
-/// never through a bounce buffer.
+/// back through [`ArenaMem::give_back`] and no other call; and a fill writes
+/// straight into a slot's windows ([`ArenaMem::read_into`]), never through a
+/// bounce buffer. The mapping is anonymous memory, or pinned host memory the
+/// card maps ([`ArenaKind`]), whose pages stay for the arena's life.
 mod arena_mem {
+    use std::sync::Arc;
+
+    use cuda_core::CudaContext;
     use engram::EngramError;
-    use engram::direct::{AnonMap, DirectFile};
+    use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile};
+
+    use crate::GpuError;
+    use crate::graph::MappedHost;
+
+    enum Pages {
+        Anon(AnonMap),
+        Pinned(MappedHost),
+    }
 
     pub(super) struct ArenaMem {
-        map: AnonMap,
+        pages: Pages,
         /// The mapping's first byte, as the fills write it.
         base: *mut u8,
         len: usize,
     }
 
-    // SAFETY: `base` is the first byte of `map`, which lives and moves with
+    // SAFETY: `base` is the first byte of `pages`, which lives and moves with
     // this value.
     unsafe impl Send for ArenaMem {}
-    // SAFETY: the mapping is read only over slots the books hold filled and
-    // written only through `read_into`, whose callers own disjoint windows (a
-    // slot's, by the books), so no byte is read and written at once.
+    // SAFETY: the mapping is read only through `slice`, over a slot a pin
+    // or a lane's open read holds filled ([`ArenaMem::slice`]'s contract),
+    // and written only through `read_into`, whose callers own disjoint
+    // windows (a slot's, by the books): no claim takes a pinned slot, so no
+    // byte is read and written at once. The card's alias of pinned pages
+    // reads no window either: the only device address a slot gives is a
+    // pin's ([`model::moe::TierPin::device_slot`]), under the same contract.
     unsafe impl Sync for ArenaMem {}
 
     impl ArenaMem {
@@ -140,8 +163,33 @@ mod arena_mem {
             ArenaMem {
                 base: map.as_ptr().cast_mut(),
                 len: map.bytes().len(),
-                map,
+                pages: Pages::Anon(map),
             }
+        }
+
+        /// `len` bytes of pinned host memory on `ctx` the card maps
+        /// ([`MappedHost::read_in_place`]), from the allocation's first
+        /// [`DIRECT_ALIGN`]-aligned byte, which a direct fill's window
+        /// starts on. `cuMemHostAlloc` promises no alignment, and a driver
+        /// can hand a small allocation out of a chunk it shares with others,
+        /// off a page boundary, so the allocation takes one page more.
+        pub(super) fn pinned(ctx: &Arc<CudaContext>, len: usize) -> Result<ArenaMem, GpuError> {
+            let page = MappedHost::read_in_place(
+                ctx,
+                len + DIRECT_ALIGN,
+                "cuMemHostAlloc (the NVMe tier's arena)",
+            )?;
+            let first = page.host_at(0) as usize;
+            let base = page.host_at(first.next_multiple_of(DIRECT_ALIGN) - first);
+            assert!(
+                (base as usize).is_multiple_of(DIRECT_ALIGN),
+                "the pinned arena's first byte {base:p} is not {DIRECT_ALIGN}-aligned"
+            );
+            Ok(ArenaMem {
+                base,
+                len,
+                pages: Pages::Pinned(page),
+            })
         }
 
         /// The mapping's first byte's address.
@@ -149,15 +197,43 @@ mod arena_mem {
             self.base as usize
         }
 
+        /// The mapping's first byte as the card addresses it; `None` on an
+        /// anonymous mapping.
+        pub(super) fn device_start(&self) -> Option<u64> {
+            match &self.pages {
+                Pages::Anon(_) => None,
+                Pages::Pinned(page) => {
+                    Some(page.dev_at(self.base as usize - page.host_at(0) as usize))
+                }
+            }
+        }
+
         /// The mapping's length.
         pub(super) fn len(&self) -> usize {
             self.len
         }
 
-        /// Bytes `at .. at + len` of the mapping, a slot's part the books
-        /// hold filled. Panics past the mapping.
+        /// The mapping's byte `at`, the first of `len` inside it. Panics
+        /// past the mapping.
+        fn window(&self, at: usize, len: usize) -> *mut u8 {
+            assert!(
+                at.checked_add(len).is_some_and(|end| end <= self.len),
+                "the arena's window {at}+{len} is past its {} B",
+                self.len
+            );
+            self.base.wrapping_add(at)
+        }
+
+        /// Bytes `at .. at + len` of the mapping, a slot's part. The caller
+        /// holds the slot filled through a pin or a lane's open read while
+        /// the borrow lives ([`model::moe::TierSlots::slot`]'s contract): no
+        /// claim takes such a slot, so no fill writes it. Panics past the
+        /// mapping.
         pub(super) fn slice(&self, at: usize, len: usize) -> &[u8] {
-            &self.map.bytes()[at..at + len]
+            // SAFETY: inside the mapping (`window` checks), which lives as
+            // long as `self`; by this function's contract the slot is pinned
+            // filled, so no fill writes the bytes while the borrow lives.
+            unsafe { std::slice::from_raw_parts(self.window(at, len), len) }
         }
 
         /// Read `len` bytes of `file` from `from` into the mapping at `at`,
@@ -174,27 +250,40 @@ mod arena_mem {
             at: usize,
             len: usize,
         ) -> Result<usize, EngramError> {
-            assert!(
-                at.checked_add(len).is_some_and(|end| end <= self.len),
-                "the arena's window {at}+{len} is past its {} B",
-                self.len
-            );
-            // SAFETY: inside the mapping (checked above); the window is the
+            // SAFETY: inside the mapping (`window` checks); the window is the
             // calling pick's own slot's, owned through the books until the
             // fill publishes it, and the picks of a fill are disjoint slots.
-            let window = unsafe { std::slice::from_raw_parts_mut(self.base.add(at), len) };
+            let window = unsafe { std::slice::from_raw_parts_mut(self.window(at, len), len) };
             file.read_span(window, from)
         }
 
         /// Return the pages of `at .. at + len` — whole pages of a slot the
         /// books gave up — to the kernel: the next touch reads zeroes. The
-        /// one place the arena's pages are advised.
+        /// one place the arena's pages are advised. Nothing on pinned pages:
+        /// the allocation is the plan's for the load, and on write-combined
+        /// pages advice leaves the range unbacked for the next fill and for a
+        /// copy from its device address (the module's head).
         pub(super) fn give_back(&self, at: usize, len: usize) -> Result<(), EngramError> {
-            self.map.dontneed(at, len)
+            match &self.pages {
+                Pages::Anon(map) => map.dontneed(at, len),
+                Pages::Pinned(_) => Ok(()),
+            }
         }
     }
 }
 use arena_mem::ArenaMem;
+
+/// The memory an arena is ([`NvTier::of_paged`]): an anonymous mapping, or
+/// one `cuMemHostAlloc` on `ctx` the card maps (write-combined on an
+/// integrated device alone,
+/// [`MappedHost::read_in_place`](crate::graph::MappedHost::read_in_place)),
+/// whose filled slots a pin gives the card's address of
+/// ([`TierPin::device_slot`]).
+#[derive(Clone, Copy)]
+pub enum ArenaKind<'a> {
+    Anon,
+    Pinned(&'a Arc<CudaContext>),
+}
 
 /// A slot's state, as a pick reads it without the lock.
 const FREE: u32 = 0;
@@ -623,6 +712,8 @@ struct LayerArena {
     slot_bytes: usize,
     /// The layer's first byte in the mapping ([`layer_bases`]).
     base: usize,
+    /// The mapping's first byte as the card addresses it, on a pinned arena.
+    dev: Option<u64>,
     /// The plan's stack row each of the leg's parts reads, resolved at the
     /// attach by name ([`NvTier::note_parts`]); unread until then, and
     /// every pick of the layer refused by name after.
@@ -676,6 +767,22 @@ impl LayerArena {
     /// Slot `slot`'s first byte in the mapping.
     fn slot_off(&self, slot: usize) -> usize {
         self.base + slot * self.slot_bytes
+    }
+
+    /// Where part `part` (as [`TierSlots::slot`] counts parts) of expert
+    /// `id`'s filled slot lies in the mapping: its first byte and length.
+    /// `None` before the attach resolved the parts, past them, and for an id
+    /// with no filled slot. The one reading the host's bytes of a slot and
+    /// the card's address of it share.
+    fn part_at(&self, id: u32, part: usize) -> Option<(usize, usize)> {
+        let row = *self.part_of.get()?.get(part)?;
+        let slot = self.filled(id)?;
+        Some(window_span(
+            self.slot_off(slot),
+            &self.windows,
+            row,
+            self.parts[id as usize][row],
+        ))
     }
 
     /// Whether a lane's open read pins slot `s`: the expert it holds is read
@@ -919,6 +1026,12 @@ impl Drop for BatchPin<'_> {
 impl PinRelease for LayerArena {
     fn release(&self, token: PinToken) {
         self.unpin(token.layer, token.ids);
+    }
+
+    fn device_slot(&self, id: u32, part: usize) -> Option<u64> {
+        let dev = self.dev?;
+        let (at, _) = self.part_at(id, part)?;
+        Some(dev + at as u64)
     }
 }
 
@@ -1246,9 +1359,9 @@ struct Books {
 }
 
 impl NvTier {
-    /// The arena of `plan`'s NVMe expert tier over `split`'s shards, read
-    /// `O_DIRECT` (`direct`) or through the page cache: `None` on a plan
-    /// that pages no routed expert or took no arena bytes (`arena.granted`
+    /// The arena of `plan`'s NVMe expert tier over `split`'s shards, in
+    /// `mem`'s memory, read `O_DIRECT` (`direct`) or through the page cache:
+    /// `None` on a plan that pages no routed expert or took no arena bytes (`arena.granted`
     /// 0 — the mapping path as it stands). The slots' budget is the arena
     /// the load was granted (`plan.host.nvme_arena_bytes` less what the
     /// host's reading cut, [`HostNeed::grant`](model::placement::workstation::HostNeed::grant);
@@ -1265,6 +1378,7 @@ impl NvTier {
         split: &Arc<Split>,
         direct: bool,
         arena: ArenaGrant,
+        mem: ArenaKind<'_>,
     ) -> Result<Option<NvTier>, GpuError> {
         const WHAT: &str = "NvTier::of_paged";
         if plan.host.nvme_expert_bytes == 0 || arena.granted == 0 {
@@ -1429,6 +1543,7 @@ impl NvTier {
                 windows,
                 slot_bytes,
                 base: 0,
+                dev: None,
                 part_of: OnceLock::new(),
                 files: rows_files.map(|i| Arc::clone(&files[i])),
                 shards: rows_shards,
@@ -1452,11 +1567,17 @@ impl NvTier {
             slots_of(arena.granted, &slot_sizes, &least).map_err(|e| GpuError::shape(WHAT, e))?;
         let page = page_bytes().map_err(|e| GpuError::plan(WHAT, e))?;
         let bytes = count * slot_sizes.iter().sum::<usize>();
-        let map = AnonMap::new(bytes)
-            .map_err(|e| GpuError::shape(WHAT, format!("the arena's {bytes} B: {e}")))?;
+        let mem = match mem {
+            ArenaKind::Anon => ArenaMem::new(
+                AnonMap::new(bytes)
+                    .map_err(|e| GpuError::shape(WHAT, format!("the arena's {bytes} B: {e}")))?,
+            ),
+            ArenaKind::Pinned(ctx) => ArenaMem::pinned(ctx, bytes)?,
+        };
         let bases = layer_bases(count, &slot_sizes);
         for (arena, base) in arenas.iter_mut().flatten().zip(bases) {
             arena.base = base;
+            arena.dev = mem.device_start();
             arena.slots = (0..count)
                 .map(|_| SlotBook {
                     state: AtomicU32::new(FREE),
@@ -1491,7 +1612,7 @@ impl NvTier {
             })
             .map_err(|e| GpuError::shape(WHAT, format!("the dropper thread: {e}")))?;
         Ok(Some(NvTier {
-            mem: Arc::new(ArenaMem::new(map)),
+            mem: Arc::new(mem),
             reader,
             by_layer: arenas,
             books: Mutex::new(Books::default()),
@@ -1681,7 +1802,7 @@ impl NvTier {
     }
 
     /// The arena's mapping as an address range `[start, end)`: the only
-    /// pages its slot releases return.
+    /// pages its slot releases return (none on a pinned arena).
     #[must_use]
     pub fn range(&self) -> (usize, usize) {
         let start = self.mem.start();
@@ -1784,8 +1905,9 @@ impl NvTier {
 
     /// Layer `layer`'s expert `id` went to the card: its slot is freed — the
     /// state back to free, the slot's pages returned (`MADV_DONTNEED`, the
-    /// arena's own range only) — and the bytes the slot takes returned, 0 for
-    /// an id the arena serves no filled slot of (an id the plan's host
+    /// arena's own range only; a pinned arena keeps them) — and the bytes
+    /// the slot takes returned, 0 for an id the arena serves no filled slot
+    /// of (an id the plan's host
     /// segment holds, one never filled, one the LRU took since its copy
     /// staged). Done under the books' lock, so no claim takes the slot
     /// between its freeing and its pages' return. Refused by name: a layer
@@ -2666,11 +2788,7 @@ impl TierSlots for NvTier {
     }
 
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]> {
-        let arena = self.by_layer.get(layer)?.as_ref()?;
-        let part = *arena.part_of.get()?.get(part)?;
-        let slot = arena.filled(id)?;
-        let r = arena.parts[id as usize][part];
-        let (at, len) = window_span(arena.slot_off(slot), &arena.windows, part, r);
+        let (at, len) = self.by_layer.get(layer)?.as_ref()?.part_at(id, part)?;
         Some(self.mem.slice(at, len))
     }
 
@@ -3826,6 +3944,173 @@ mod tests {
         }
     }
 
+    /// A directory under the workspace's `target`, on the tree's disk (the
+    /// system's temp directory can be a tmpfs, which may refuse an
+    /// `O_DIRECT` open), removed on drop, a failed test's included.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target")
+                .join(format!("nvtier-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            Scratch(d)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `devmap` over a pinned arena: layer base and slot past 0, each stack
+    /// row its own file and range, the leg's parts resolved to other rows
+    /// (`[2, 0, 1]`), and an expert in the slot before. Each round fills
+    /// expert 7's slot from files whose bytes differ from every other
+    /// round's and row's at every offset, read `O_DIRECT` (`direct`) or
+    /// through the page cache, pins it, and holds the card's read through
+    /// the pin's address of each part, then the host's view, to the file's
+    /// bytes; the slot is given back between rounds. The arena is
+    /// write-combined on an integrated device alone, and allocated after a
+    /// small allocation of the same kind.
+    fn devmap_rounds(direct: bool) {
+        use crate::graph::{MappedHost, cu};
+        use engram::direct::DirectFile;
+        use model::moe::TierPin;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering::Relaxed;
+        const PAGE: usize = DIRECT_ALIGN;
+        // Per stack row: the file range, inside one window at its skew.
+        const ROWS: [(usize, usize); PARTS] =
+            [(37, 100), (PAGE + 5, PAGE + 50), (2 * PAGE + 300, 200)];
+        let bytes_of = |row: usize, round: usize| -> Vec<u8> {
+            (0..3 * PAGE)
+                .map(|i| ((i % 251) as u8).wrapping_add((83 * row + 29 * round + 1) as u8))
+                .collect()
+        };
+        let (ctx, _stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let scratch = Scratch::new(if direct { "devmap-direct" } else { "devmap" });
+        let paths: [_; PARTS] = std::array::from_fn(|row| scratch.0.join(format!("row{row}")));
+        let mut arena = arena_of(8, 2);
+        arena.windows = [0, PAGE, 3 * PAGE];
+        arena.slot_bytes = 4 * PAGE;
+        arena.base = arena.slot_bytes;
+        arena.parts = vec![
+            std::array::from_fn(|row| PartRange {
+                at: ROWS[row].0 as u64,
+                len: ROWS[row].1,
+                skew: ROWS[row].0 % PAGE,
+            });
+            8
+        ];
+        arena.part_of.set([2, 0, 1]).unwrap();
+        let bytes = arena.base + 2 * arena.slot_bytes;
+        // A small allocation of the same kind first, live for the test: a
+        // driver that shares a chunk among small allocations puts the arena's
+        // off a page boundary.
+        let _before =
+            MappedHost::read_in_place(&ctx, 1, "cuMemHostAlloc (before the test's arena)")
+                .expect("a pinned byte");
+        let mem = super::ArenaMem::pinned(&ctx, bytes).expect("a pinned arena");
+        let mut flags = 0u32;
+        // SAFETY: the host address is the arena's first byte, inside the
+        // allocation and live until `mem` drops, and `flags` is a local the
+        // call writes.
+        let rc = unsafe {
+            cuda_core::sys::cuMemHostGetFlags(&mut flags, mem.start() as *mut std::ffi::c_void)
+        };
+        cu(rc, "cuMemHostGetFlags").unwrap();
+        assert_eq!(
+            flags & cuda_core::sys::CU_MEMHOSTALLOC_WRITECOMBINED != 0,
+            crate::raw_device_integrated(ctx.cu_device()).unwrap(),
+            "the arena is write-combined on an integrated device alone"
+        );
+        arena.dev = mem.device_start();
+        let fill = |arena: &mut super::LayerArena, slot: usize, id: u32, round: usize| {
+            for (row, path) in paths.iter().enumerate() {
+                std::fs::write(path, bytes_of(row, round)).unwrap();
+            }
+            arena.files = std::array::from_fn(|row| {
+                Arc::new(if direct {
+                    DirectFile::open(&paths[row]).expect("a disk-backed file opens O_DIRECT")
+                } else {
+                    DirectFile::open_buffered(&paths[row]).unwrap()
+                })
+            });
+            let pick = super::Pick {
+                slot,
+                id,
+                gone: None,
+            };
+            super::read_pick(&mem, &super::read_of(arena, &pick))
+                .unwrap_or_else(|e| panic!("round {round} slot {slot}: the slot's fill: {e}"));
+            arena.of_id[id as usize].store(slot as u32 + 1, Relaxed);
+            arena.slots[slot].state.store(FILLED, Relaxed);
+        };
+        fill(&mut arena, 0, 3, 7);
+        ctx.bind_to_thread().unwrap();
+        for round in 0..3 {
+            if round > 0 {
+                mem.give_back(arena.slot_off(1), arena.slot_bytes)
+                    .expect("the give-back of a pinned slot");
+            }
+            fill(&mut arena, 1, 7, round);
+            let pin = TierPin::new(
+                &arena,
+                arena.pin_batch(0, &[7], "devmap").unwrap().into_token(),
+            );
+            for part in 0..PARTS {
+                let row = arena.part_of.get().unwrap()[part];
+                let (at, len) = ROWS[row];
+                let file = bytes_of(row, round);
+                let want = &file[at..at + len];
+                let dev = pin.device_slot(7, part).expect("a pinned slot's address");
+                let mut got = vec![0u8; len];
+                // SAFETY: the context is current (bound above); `dev` addresses
+                // `len` bytes of the allocation, and `got` holds `len` bytes.
+                let rc =
+                    unsafe { cuda_core::sys::cuMemcpyDtoH_v2(got.as_mut_ptr().cast(), dev, len) };
+                cu(rc, "cuMemcpyDtoH_v2").unwrap();
+                assert_eq!(
+                    got, want,
+                    "round {round} part {part}: the card's read of the slot"
+                );
+                let (at, len) = arena.part_at(7, part).unwrap();
+                assert_eq!(
+                    mem.slice(at, len),
+                    want,
+                    "round {round} part {part}: the host's view"
+                );
+            }
+            assert_eq!(
+                pin.device_slot(3, 0),
+                None,
+                "an id the pin does not hold has no address"
+            );
+        }
+    }
+
+    /// `devmap`: the card's address of a pinned arena's filled slot reads
+    /// the bytes the slot lends, after the first fill and after each release
+    /// and refill through the page cache: the release keeps the pages, so
+    /// the refill lands in the pages the card reads. On an integrated device
+    /// and on a card across PCIe alike.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_devmap_a_pinned_slot_reads_on_the_card_as_on_the_host_across_a_release() {
+        devmap_rounds(false);
+    }
+
+    /// `devmap` with the tier's default reads: `O_DIRECT` fills land in the
+    /// pinned slot, and the card reads them as the host does.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_devmap_a_direct_fill_lands_in_a_pinned_slot() {
+        devmap_rounds(true);
+    }
+
     /// A pin names what it refuses and pins nothing then: an id with no
     /// filled slot, and an id past the experts; an id of the host segment is
     /// the mapping's and pins nothing.
@@ -3952,6 +4237,7 @@ mod tests {
             windows: [0; PARTS],
             slot_bytes: DIRECT_ALIGN,
             base: 0,
+            dev: None,
             part_of: std::sync::OnceLock::new(),
             files: [file.clone(), file.clone(), file],
             shards: [0; PARTS],
