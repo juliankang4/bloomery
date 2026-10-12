@@ -1650,12 +1650,6 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "Seconds `tools/ref/build-dump-draft.sh` lets the reference build run.",
     ),
     runner(
-        "BLOOMERY_BUILD_COMMIT",
-        Some("release/build.sh"),
-        "The commit a release build's `--version` names, read by cargo at build time \
-         (`model_file::version`); `unknown` when unset. A running binary never reads it.",
-    ),
-    runner(
         "BLOOMERY_BUNDLE_BAND_DUMP",
         None,
         "The model attention gate's handshake with the child it runs of its own test \
@@ -1830,9 +1824,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     runner(
         "BLOOMERY_GIT_COMMIT",
         Some("box.sh"),
-        "The commit of the synced tree (`-dirty` when the Mac tree held changes): \
-         `tools/box.sh` exports it into every box command; `bloomery-serve`'s build \
-         script and `tools/ref/depth-ds41.sh` read it.",
+        "The commit a build names, in `bloomery-serve --version` and `/props` \
+         (`serve::COMMIT`, set by the serve crate's build script): `tools/box.sh` exports \
+         the synced tree's commit (`-dirty` when the Mac tree held changes) into every box \
+         command, and `tools/release/build.sh` sets it for its cargo build; unset, the \
+         serve build script reads `git rev-parse --short=8 HEAD`, else `unknown`. \
+         `tools/ref/depth-ds41.sh` reads it too. A running binary never reads it.",
     ),
     runner(
         "BLOOMERY_GPU_ARMS",

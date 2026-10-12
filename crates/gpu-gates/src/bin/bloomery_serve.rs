@@ -378,7 +378,11 @@ models (the --model word is optional with a model file: the file's architecture 
     pub fn run() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
         if args.iter().any(|a| a == "--version") {
-            println!("{}", model_file::version(NAME));
+            println!(
+                "{NAME} {} (commit {})",
+                env!("CARGO_PKG_VERSION"),
+                serve::COMMIT
+            );
             return ExitCode::SUCCESS;
         }
         let (word, rest) = match take_model(&args) {

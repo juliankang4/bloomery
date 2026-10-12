@@ -77,6 +77,16 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 
 Build artifacts land in the workspace root `target/`.
 
+### The commit a binary names
+
+`bloomery-serve --version` (`bloomery-serve <version> (commit <c>)`) and `/props`' `engine.version` (`<version> (<c>)`) print one value, fixed when the binary is built (`serve::COMMIT`, set by `crates/serve/build.rs`). The build takes it from the first of these that gives one:
+
+1. `BLOOMERY_GIT_COMMIT`, trimmed, when it is not empty;
+2. `git rev-parse --short=8 HEAD` run in the source tree, which marks no uncommitted changes;
+3. `unknown`, when git finds no commit there: a tree without `.git` (a `git archive` or a tarball) outside any other checkout, or a host without `git`. A tarball unpacked inside another checkout names that checkout's HEAD.
+
+Only the build reads the variable, for example `BLOOMERY_GIT_COMMIT=$(git rev-parse --short=12 HEAD) cargo oxide build …`; a running binary never does. `tools/release/build.sh` passes the release commit this way, and `tools/box.sh` exports its tree's commit to every box command, because the box's copy has no `.git`.
+
 ## Picking the card
 
 The placement plans are built from the development machine's two cards and its RAM (`crates/model/src/placement/workstation.rs`). A binary finds a plan's card by its CUDA device name: `--place gate` needs one visible device whose name contains `3090`, `--place a` one whose name contains `A6000`, and `--place bp` both. Two visible devices that match the same name are an error (`2 visible devices are named like "3090"`), so on a host with two 3090s make one visible with `CUDA_VISIBLE_DEVICES`. Two 3090s together are not supported: nothing places a model or a draft across two cards of one name. A card named like `3090 Ti` also matches `3090`.

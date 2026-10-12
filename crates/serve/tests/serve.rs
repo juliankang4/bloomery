@@ -1273,7 +1273,7 @@ fn hw_props_engine_object() {
         .strip_prefix(concat!(env!("CARGO_PKG_VERSION"), " ("))
         .and_then(|v| v.strip_suffix(") mock"))
         .unwrap_or_default();
-    assert!(!commit.is_empty(), "version {version:?}");
+    assert_eq!(commit, serve::COMMIT, "version {version:?}");
     let mut argv = vec![env!("CARGO_BIN_EXE_bloomery-serve").to_owned()];
     argv.extend(args.iter().map(|a| (*a).to_owned()));
     assert_eq!(e["args"], json!(argv), "{e}");

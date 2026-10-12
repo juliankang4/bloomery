@@ -53,8 +53,8 @@ else
   export RUSTFLAGS="-C target-cpu=x86-64-v3"
   bin_args=()
   for b in "${BINS[@]}"; do bin_args+=(--bin "$b"); done
-  # The commit goes to cargo alone: the servers refuse a BLOOMERY_* variable they do not read.
-  BLOOMERY_BUILD_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release "${bin_args[@]}"
+  # The commit goes to cargo alone: the serve build script reads it, and a running binary never does.
+  BLOOMERY_GIT_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release "${bin_args[@]}"
 fi
 
 fail=0

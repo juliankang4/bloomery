@@ -205,14 +205,3 @@ pub fn name(flags: &Flags) -> Result<(), GateError> {
     }
     Ok(())
 }
-
-/// `<bin> <version> (commit <c>)`: this crate's version and the commit the
-/// build came from, `BLOOMERY_BUILD_COMMIT` at build time (the release
-/// script sets it), `unknown` when it was unset.
-pub fn version(bin: &str) -> String {
-    format!(
-        "{bin} {} (commit {})",
-        env!("CARGO_PKG_VERSION"),
-        option_env!("BLOOMERY_BUILD_COMMIT").unwrap_or("unknown")
-    )
-}

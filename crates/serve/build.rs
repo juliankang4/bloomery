@@ -1,5 +1,6 @@
-//! Sets `BLOOMERY_SERVE_COMMIT`, the commit `/props` names in
-//! `engine.version`: `BLOOMERY_GIT_COMMIT` when the builder sets it, else
+//! Sets `BLOOMERY_SERVE_COMMIT`, the commit `serve::COMMIT` holds, which
+//! `/props` names in `engine.version` and `bloomery-serve --version` prints:
+//! `BLOOMERY_GIT_COMMIT` when the builder sets it, else
 //! `git rev-parse --short=8 HEAD` in this package's tree, else `unknown`. A tree
 //! without git (the box's copy carries no `.git`) still builds and says `unknown`.
 

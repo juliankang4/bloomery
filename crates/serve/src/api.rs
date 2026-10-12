@@ -1802,8 +1802,10 @@ fn props(state: &State) -> Value {
     })
 }
 
-/// `engine.version`: the crate version and the commit the build script found
-/// (`unknown` for a tree without git).
+/// The commit this build names, set by `build.rs`. `--version` reads it too.
+pub const COMMIT: &str = env!("BLOOMERY_SERVE_COMMIT");
+
+/// `engine.version`: the crate version and [`COMMIT`].
 pub const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",

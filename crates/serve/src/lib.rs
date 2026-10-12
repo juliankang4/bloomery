@@ -41,7 +41,7 @@ mod swap;
 mod worker;
 
 pub use api::{
-    EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE, MAX_CONNECTIONS, ServeError, Server,
+    COMMIT, EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE, MAX_CONNECTIONS, ServeError, Server,
     ServerConfig, VERSION,
 };
 pub use engine::{
