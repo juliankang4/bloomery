@@ -557,8 +557,8 @@ pub struct HostNeed {
     pub reserves: u64,
     pub extra: u64,
     /// The plan's NVMe expert tier arena (`HostTotals::nvme_arena_bytes`):
-    /// the anonymous bytes the tier's slots fill beside these terms, 0
-    /// without one. [`HostNeed::bytes`] counts it;
+    /// the bytes the tier's slots fill beside these terms, anonymous or
+    /// pinned, 0 without one. [`HostNeed::bytes`] counts it;
     /// [`HostNeed::plan_bytes`] leaves it to the split dial that shapes it.
     pub arena: u64,
     /// On a unified machine, what the cards take from the pool the host's

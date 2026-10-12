@@ -2526,6 +2526,7 @@ impl Body {
         // is attached before the run's first call.
         let first = host_first(hp, &layers);
         let host = bloomery_gpu::model::host_run(
+            gpu.context(),
             plan,
             &file,
             first,

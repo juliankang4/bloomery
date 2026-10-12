@@ -410,14 +410,29 @@ pub fn capturing(stream: &CudaStream) -> Result<bool, GpuError> {
     Ok(status != sys::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE)
 }
 
+/// The flags beside `PORTABLE | DEVICEMAP` of memory the card and the CPU
+/// both read ([`MappedHost::read_in_place`]): `WRITECOMBINED` on an
+/// integrated device, whose card reads such pages at the rate of its own
+/// memory; none on a card across PCIe, whose CPU reads write-combined pages
+/// uncached.
+fn in_place_flags(integrated: bool) -> u32 {
+    if integrated {
+        sys::CU_MEMHOSTALLOC_WRITECOMBINED
+    } else {
+        0
+    }
+}
+
 /// Pinned host memory mapped into the device's address space
-/// (`cuMemHostAlloc` with `PORTABLE | DEVICEMAP`): the host reaches it at
-/// `host`, kernels, copies and stream memory operations at `dev`, from every
-/// context of the process. Zeroed at allocation, freed on drop. The one owner
-/// of mapped host memory: the host flags ([`HostFlags`]) and the host tier's
-/// page are views over it. Its owner keeps every stream and graph that
-/// addresses it from running past the drop: it drains the stream, drops the
-/// graph first, or ends the process without dropping it.
+/// (`cuMemHostAlloc` with `PORTABLE | DEVICEMAP`, and `WRITECOMBINED` from
+/// [`MappedHost::read_in_place`] on an integrated device): the host reaches
+/// it at `host`, kernels, copies and stream memory operations at `dev`, from
+/// every context of the process. Zeroed by [`MappedHost::new`], freed on
+/// drop. The one owner of mapped host memory: the host flags
+/// ([`HostFlags`]) and the host tier's page are views over it. Its owner
+/// keeps every stream and graph that addresses it from running past the
+/// drop: it drains the stream, drops the graph first, or ends the process
+/// without dropping it.
 pub struct MappedHost {
     host: *mut u8,
     dev: sys::CUdeviceptr,
@@ -447,6 +462,34 @@ impl MappedHost {
         bytes: usize,
         what: &'static str,
     ) -> Result<MappedHost, GpuError> {
+        let page = MappedHost::alloc(ctx, bytes, 0, what)?;
+        // SAFETY: the allocation holds `bytes` writable bytes and nothing else
+        // references it yet.
+        unsafe { ptr::write_bytes(page.host, 0, bytes) };
+        Ok(page)
+    }
+
+    /// [`MappedHost::new`] not zeroed, for bytes the card and the CPU both
+    /// read in place: write-combined on an integrated device alone
+    /// ([`in_place_flags`]). Its owner reads no byte it did not write.
+    /// Load-time only.
+    pub(crate) fn read_in_place(
+        ctx: &Arc<CudaContext>,
+        bytes: usize,
+        what: &'static str,
+    ) -> Result<MappedHost, GpuError> {
+        let flags = in_place_flags(crate::raw_device_integrated(ctx.cu_device())?);
+        MappedHost::alloc(ctx, bytes, flags, what)
+    }
+
+    /// The one `cuMemHostAlloc` of mapped host memory, with `flags` beside
+    /// `PORTABLE | DEVICEMAP`, its bytes as the driver gave them.
+    fn alloc(
+        ctx: &Arc<CudaContext>,
+        bytes: usize,
+        flags: u32,
+        what: &'static str,
+    ) -> Result<MappedHost, GpuError> {
         ctx.bind_to_thread()?;
         let mut host: *mut c_void = ptr::null_mut();
         // SAFETY: the context is current on this thread (bound above) and
@@ -455,7 +498,7 @@ impl MappedHost {
             sys::cuMemHostAlloc(
                 &mut host,
                 bytes,
-                sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP,
+                sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP | flags,
             )
         };
         cu(rc, what)?;
@@ -467,9 +510,6 @@ impl MappedHost {
             unsafe { sys::cuMemFreeHost(host) };
             return Err(e);
         }
-        // SAFETY: the allocation holds `bytes` writable bytes and nothing else
-        // references it yet.
-        unsafe { ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
         Ok(MappedHost {
             host: host.cast(),
             dev,
@@ -498,17 +538,17 @@ impl MappedHost {
             .is_some_and(|end| end <= self.bytes)
     }
 
-    /// The u32 at byte `off` as an atomic; `None` when it is not 4-aligned
-    /// or passes the allocation.
+    /// The u32 at byte `off` as an atomic; `None` when its address is not
+    /// 4-aligned or it passes the allocation.
     pub fn atomic_u32(&self, off: usize) -> Option<&AtomicU32> {
-        if !off.is_multiple_of(4) || off.checked_add(4).is_none_or(|end| end > self.bytes) {
+        let word = self.host_at(off).cast::<AtomicU32>();
+        if !word.is_aligned() || off.checked_add(4).is_none_or(|end| end > self.bytes) {
             return None;
         }
-        // SAFETY: the word is 4-aligned and inside the allocation (checked
-        // above; the allocation is page-aligned); `AtomicU32` has `u32`'s
-        // layout, and every host access to a flag word goes through this
-        // view.
-        Some(unsafe { &*self.host_at(off).cast::<AtomicU32>() })
+        // SAFETY: the word's address is aligned and the word is inside the
+        // allocation (both checked above); `AtomicU32` has `u32`'s layout,
+        // and every host access to a flag word goes through this view.
+        Some(unsafe { &*word })
     }
 
     /// The `len` f32 at byte `off`, for the host to write; `None` when not
@@ -783,13 +823,26 @@ impl Drop for Graph {
 
 #[cfg(test)]
 mod tests {
-    use super::{FLAG_WAIT_OPS, Graph, HostFlags, capturing, cu};
+    use super::{FLAG_WAIT_OPS, Graph, HostFlags, capturing, cu, in_place_flags};
     use crate::{DeviceTensor, Gpu, GpuError, Q8Act, capsync};
     use cuda_core::{DeviceBuffer, PinnedHostBuffer, sys};
     use std::ffi::c_void;
     use std::panic::AssertUnwindSafe;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// Memory the card and the CPU both read is write-combined on an
+    /// integrated device alone: on a card across PCIe the CPU's reads of
+    /// such pages go uncached.
+    #[test]
+    fn read_in_place_is_write_combined_on_an_integrated_device_alone() {
+        assert_eq!(
+            in_place_flags(true),
+            sys::CU_MEMHOSTALLOC_WRITECOMBINED,
+            "an integrated device"
+        );
+        assert_eq!(in_place_flags(false), 0, "a card across PCIe");
+    }
 
     /// A captured wait on a flag holds the copy behind it until the host
     /// raises the flag: the graph is launched before the host writes the

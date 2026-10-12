@@ -15,7 +15,8 @@
 
 use std::fs::File;
 use std::io::ErrorKind;
-use std::os::unix::fs::FileExt;
+use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use memmap2::MmapMut;
@@ -61,7 +62,7 @@ impl DirectFile {
     /// with the path and the errno, not a read that fails later at a fill.
     pub fn open(path: &Path) -> Result<DirectFile, EngramError> {
         let file = open_direct(path)?;
-        let mut probe = vec![0u8; 2 * DIRECT_ALIGN];
+        let mut probe = vec![MaybeUninit::<u8>::uninit(); 2 * DIRECT_ALIGN];
         let off = probe.as_ptr().align_offset(DIRECT_ALIGN);
         let buf = &mut probe[off..off + DIRECT_ALIGN];
         read_all(&file, buf, 0).map_err(|source| EngramError::DirectProbe {
@@ -109,6 +110,21 @@ impl DirectFile {
     /// `at` and the length are each a multiple of [`DIRECT_ALIGN`]; anything
     /// else is a named refusal, not a read the kernel silently drops.
     pub fn read_span(&self, dst: &mut [u8], at: u64) -> Result<usize, EngramError> {
+        // SAFETY: `[MaybeUninit<u8>]` has `[u8]`'s layout, and the read only
+        // writes bytes into it, so `dst` stays initialized.
+        let dst = unsafe { &mut *(std::ptr::from_mut(dst) as *mut [MaybeUninit<u8>]) };
+        self.read_span_uninit(dst, at)
+    }
+
+    /// [`DirectFile::read_span`] into bytes not yet written: the same
+    /// contract and refusals, and on return the first `n` bytes of `dst`
+    /// are the file's, `n` the bytes placed; the rest keep what they held.
+    /// For the caller whose buffer the allocator hands out unwritten.
+    pub fn read_span_uninit(
+        &self,
+        dst: &mut [MaybeUninit<u8>],
+        at: u64,
+    ) -> Result<usize, EngramError> {
         check_span(self.direct, dst.as_ptr() as usize, at, dst.len()).map_err(|_| {
             EngramError::DirectUnaligned {
                 path: self.path.clone(),
@@ -197,16 +213,28 @@ fn check_span(direct: bool, ptr: usize, at: u64, len: usize) -> Result<(), ()> {
 }
 
 /// `file`'s bytes `at .. at + dst.len()` into `dst`, advancing past short
-/// reads and retrying `EINTR`; the bytes placed, fewer than asked only when
-/// the file ends first. Every other failure names its errno to the caller.
-fn read_all(file: &File, dst: &mut [u8], at: u64) -> Result<usize, std::io::Error> {
+/// reads and retrying `EINTR`; the bytes placed, `dst[..n]`, fewer than
+/// asked only when the file ends first. Every other failure names its errno
+/// to the caller. `pread` writes into the buffer as it stands, so a buffer
+/// never written reads in place.
+fn read_all(file: &File, dst: &mut [MaybeUninit<u8>], at: u64) -> Result<usize, std::io::Error> {
     let mut got = 0usize;
     while got < dst.len() {
-        match file.read_at(&mut dst[got..], at + got as u64) {
+        let rest = &mut dst[got..];
+        let off = libc::off_t::try_from(at + got as u64)
+            .map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
+        // SAFETY: `rest` is `rest.len()` bytes this call borrows mutably, and
+        // `pread` writes at most that many into it.
+        let n = unsafe { libc::pread(file.as_raw_fd(), rest.as_mut_ptr().cast(), rest.len(), off) };
+        match usize::try_from(n) {
             Ok(0) => break,
             Ok(n) => got += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+            Err(_) => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
         }
     }
     Ok(got)

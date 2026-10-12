@@ -43,6 +43,7 @@ pub const FORCE_IDS: &str = "BLOOMERY_FORCE_IDS";
 pub const HOST_ROOM: &str = "BLOOMERY_HOST_ROOM";
 pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
 pub const NVTIER_READ: &str = "BLOOMERY_NVTIER_READ";
+pub const NVTIER_MEM: &str = "BLOOMERY_NVTIER_MEM";
 pub const SCREEN: &str = "BLOOMERY_SCREEN";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
@@ -313,6 +314,23 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               page cache serves, exact at the same bytes and counted by the tier's stats as \
               buffered — the fallback the probe's refusal names, not a preference. Read where \
               the tier is built.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: NVTIER_MEM,
+        class: Class::A,
+        kind: Kind::Words(&["auto", "anon", "pinned"]),
+        default: Unset::Is("auto"),
+        doc: "The memory the NVMe expert tier's RAM arena is: `anon` an anonymous mapping, whose \
+              slots a landing gives back to the kernel; `pinned` one `cuMemHostAlloc` the card \
+              maps, priced at load and never given back, its slots read by the host leg as \
+              `anon`'s are, write-combined on an integrated device alone (a discrete card's \
+              CPU reads write-combined pages uncached); `auto` is `pinned` on an integrated \
+              device and `anon` on a card with its own memory. `anon` and `pinned` are the \
+              same-binary arms. Read where the tier is built.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

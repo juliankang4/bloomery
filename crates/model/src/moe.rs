@@ -2178,6 +2178,12 @@ pub trait PinRelease: Sync {
     /// drop is: a count already at zero is a broken invariant the tier
     /// panics on by name (unless the thread is unwinding).
     fn release(&self, token: PinToken);
+    /// The card's address of part `part` of `id`'s filled slot, on a tier
+    /// whose slots the card maps; `None` everywhere else, and where
+    /// [`TierSlots::slot`] lends nothing.
+    fn device_slot(&self, _id: u32, _part: usize) -> Option<u64> {
+        None
+    }
 }
 
 /// A batch of experts pinned in the tier's slots ([`TierSlots::pin`]): the
@@ -2203,6 +2209,18 @@ impl<'a> TierPin<'a> {
     #[must_use]
     pub fn ids(&self) -> &[u32] {
         self.token.as_ref().map_or(&[], |t| &t.ids)
+    }
+
+    /// The card's address of part `part` (as [`TierSlots::slot`] counts
+    /// parts) of `id`, one of this pin's ids, in its layer's slot: the bytes
+    /// [`TierSlots::slot`] lends, which stay put while the pin lives. `None`
+    /// for an id the pin does not hold and on a tier the card does not map.
+    #[must_use]
+    pub fn device_slot(&self, id: u32, part: usize) -> Option<u64> {
+        if !self.ids().contains(&id) {
+            return None;
+        }
+        self.release.device_slot(id, part)
     }
 }
 
@@ -2320,7 +2338,10 @@ pub trait TierSlots: Send + Sync {
         self.ensure_pinned(layer, ids, claim).map(Ticket::ready)
     }
     /// Layer `layer`, expert `id`, part `part`'s bytes as the tier holds
-    /// them; `None` when its slot is unfilled.
+    /// them; `None` when its slot is unfilled. The caller reads the bytes
+    /// only while it holds `id` pinned ([`TierSlots::pin`],
+    /// [`TierSlots::ensure_pinned`], a [`Ticket`]'s pin): no claim takes a
+    /// pinned slot, and an unpinned one is the LRU's to refill.
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]>;
     /// A prompt union call on `layer`, told once per tiered union call,
     /// before its first batch's claim, as it takes its path: `batched` when

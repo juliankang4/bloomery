@@ -40,14 +40,16 @@ fn retired() -> impl Iterator<Item = &'static LeverSpec> {
 }
 
 /// Whether the pool reads it: it is on every binary's list.
-/// The rows read below every binary's `main` — the pool's two and the NVMe
-/// tier's two ([`nvtier_levers`]) — which no `at_main` list refuses.
+/// The rows read below every binary's `main` (the pool's two, the host's
+/// room and the NVMe tier's three, [`nvtier_levers`]), which no `at_main`
+/// list refuses.
 fn pool(r: &LeverSpec) -> bool {
     r.name == THREADS
         || r.name == SPIN
         || r.name == HOST_ROOM
         || r.name == NVTIER_BYTES
         || r.name == NVTIER_READ
+        || r.name == NVTIER_MEM
 }
 
 /// Every file that reads a lever in place, with its round.
@@ -374,6 +376,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.hoststream(), None);
     assert_eq!(unset.lane_prefetch(), LANE_PREFETCH_DEFAULT);
     assert_eq!(unset.host_lanes(), HOST_LANES_DEFAULT);
+    assert_eq!(unset.nvtier_mem(), NvTierMem::Auto);
     assert_eq!(unset.gen_slots(), 1);
     assert_eq!(
         unset.host(),
@@ -415,6 +418,7 @@ fn accessors_read_their_rows() {
             (QWEN3_KV, "q8_0"),
             (LANE_PREFETCH, "on"),
             (HOST_LANES, "flat"),
+            (NVTIER_MEM, "pinned"),
             (PREFILL_GROUP, "8"),
             (GEN_SLOTS, "2"),
         ]),
@@ -448,6 +452,23 @@ fn accessors_read_their_rows() {
     assert_eq!(set.split_walk(), Some(false));
     assert!(set.lane_prefetch());
     assert_eq!(set.host_lanes(), HostLanes::Flat);
+    assert_eq!(set.nvtier_mem(), NvTierMem::Pinned);
+    // Each word as the tier's build reads it, and whether it pins the arena
+    // on an integrated device and on a card with its own memory.
+    for (word, integrated, discrete) in [
+        ("auto", true, false),
+        ("anon", false, false),
+        ("pinned", true, true),
+    ] {
+        let mem = read(&env(&[(NVTIER_MEM, word)]), Scope::NvTier)
+            .expect("a word the row takes")
+            .nvtier_mem();
+        assert_eq!(
+            (mem.pinned(true), mem.pinned(false)),
+            (integrated, discrete),
+            "{word}"
+        );
+    }
     assert_eq!(set.gen_slots(), 2);
     assert_eq!(
         set.host(),
@@ -475,6 +496,7 @@ fn accessors_read_their_rows() {
             HOST_ROOM,
             NVTIER_BYTES,
             NVTIER_READ,
+            NVTIER_MEM,
             PIN_MAIN,
             DRAFT,
             MTP_HEAD_ROWS,

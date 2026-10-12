@@ -39,7 +39,7 @@ use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
 use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
-use crate::host::nvtier::NvTier;
+use crate::host::nvtier::{ArenaKind, NvTier};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
@@ -48,7 +48,7 @@ use crate::watchdog;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use bloomery_levers::{ChurnHosting, HostCfg};
-use cuda_core::CudaStream;
+use cuda_core::{CudaContext, CudaStream};
 use gguf::Split;
 use model::arch::Arch;
 use model::moe::HostLayer;
@@ -1768,13 +1768,16 @@ fn launch_served<B: ChainBody>(
 /// the arena `arena` grants (the split dial's `HostTotals::nvme_arena_bytes`,
 /// or what the host's reading left of it at load, [`HostResidency::arena`])
 /// over `file`'s shards, read `O_DIRECT` or — the lever's fallback —
-/// through the page cache ([`bloomery_levers::nvtier_levers`]). `None`
+/// through the page cache, in pinned host memory `ctx`'s card maps or in
+/// anonymous memory, as the lever asks of `ctx`'s device: pinned on an
+/// integrated device by default ([`bloomery_levers::NvTierMem`]). `None`
 /// on a plan that pages no routed expert or reserved no arena: the host
 /// leg reads the file mapping as it stands. Refused by name: a load
 /// whose r8 pair reads a sidecar while the plan pages routed experts —
 /// the slot's bytes follow the sidecar resolution, which the tier does
 /// not carry yet.
 pub fn nvme_tier(
+    ctx: &Arc<CudaContext>,
     plan: &Plan<'_>,
     file: &Arc<Split>,
     r8: bool,
@@ -1795,14 +1798,20 @@ pub fn nvme_tier(
              reads the source: same bits)",
         ));
     }
-    NvTier::of_paged(plan, file, levers.direct, arena).map(|t| t.map(Arc::new))
+    let mem = ArenaKind::of(ctx, levers.mem)?;
+    NvTier::of_paged(plan, file, levers.direct, arena, mem).map(|t| t.map(Arc::new))
 }
 
 /// The host leg of a load on `plan`: the routed layers `first ..` built by
 /// `layers`, given the NVMe tier's arena `arena` grants when the plan pages
-/// routed experts and reserved one ([`nvme_tier`], then [`HostRun::build`],
+/// routed experts and reserved one, on `ctx`'s card ([`nvme_tier`], then [`HostRun::build`],
 /// then [`HostRun::attach_tier`]). The one owner of a body's host-run build.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the run's plan, file, first layer, widths and layers, and its tier's card, r8 lever and arena, each named"
+)]
 pub fn host_run<E>(
+    ctx: &Arc<CudaContext>,
     plan: &Plan<'_>,
     file: &Arc<Split>,
     first: usize,
@@ -1814,7 +1823,7 @@ pub fn host_run<E>(
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    let arena = nvme_tier(plan, file, r8, arena)?;
+    let arena = nvme_tier(ctx, plan, file, r8, arena)?;
     let mut run = HostRun::build(Arc::clone(file), first, r8, widths, layers)?;
     run.attach_tier(arena)?;
     Ok(run)

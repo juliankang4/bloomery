@@ -245,7 +245,7 @@ use bloomery_gpu::arch::qwen3moe::{Body38, SplitWalk};
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats};
 use bloomery_gpu::host::nvtier::{
-    DropRuns, Heat, NvTier, NvTierStats, ReaderStats, UnionBook, advice_disjoint,
+    ArenaKind, DropRuns, Heat, NvTier, NvTierStats, ReaderStats, UnionBook, advice_disjoint,
 };
 use bloomery_gpu::host::swap::{LateLog, PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
@@ -2831,7 +2831,7 @@ fn refuse_clauses(
     let with_arena = |bytes: u64| {
         let mut p = plan.clone();
         p.host.nvme_arena_bytes = bytes;
-        NvTier::of_paged(&p, &split, true, ArenaGrant::whole(bytes))
+        NvTier::of_paged(&p, &split, true, ArenaGrant::whole(bytes), ArenaKind::Anon)
     };
     let slot = match with_arena(1) {
         Err(e) => e.to_string().contains("carves 0 slots"),

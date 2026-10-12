@@ -1185,7 +1185,9 @@ pub struct PassReport {
     pub stage_us: u64,
     pub prepare_us: u64,
     /// The slots of the flips that landed here that the source freed
-    /// ([`SwapSource::release_host`]), and their bytes.
+    /// ([`SwapSource::release_host`]), and the bytes those slots take: the
+    /// room a later fill takes, which an anonymous arena also returns to the
+    /// kernel and a pinned one keeps.
     pub released: usize,
     pub released_bytes: u64,
     /// Of the flips that landed here, microseconds from the first one's issue
