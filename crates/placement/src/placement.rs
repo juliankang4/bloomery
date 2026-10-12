@@ -37,9 +37,12 @@ pub mod card_budget;
 pub mod churn;
 pub mod ctx;
 pub mod devices;
+pub mod nodes;
 pub mod paged_drop;
 pub mod workstation;
 
+#[cfg(test)]
+mod nodes_scale;
 #[cfg(test)]
 mod qwen38_cards;
 
@@ -289,6 +292,26 @@ impl Machine {
     /// The pool of this process's node, to change.
     pub fn unified_mut(&mut self) -> &mut Option<UnifiedPool> {
         &mut self.this_node_mut().unified
+    }
+
+    /// The pool [`PoolNeed::pool`] reads: this process's node's unified
+    /// pool with each card's context self cost added back, as [`capped`]
+    /// adds it to a card; `None` where each card has memory of its own. A
+    /// sum past u64 is refused by name, so every card plan is made on a pool
+    /// that passed here ([`plan_rule`]).
+    fn pool_bytes(&self) -> Result<Option<u64>, PlacementError> {
+        let Some(unified) = self.unified() else {
+            return Ok(None);
+        };
+        let context = self.all_cards().map(Card::context_in_free).sum();
+        unified
+            .bytes
+            .checked_add(context)
+            .map(Some)
+            .ok_or(PlacementError::PoolPastU64 {
+                bytes: unified.bytes,
+                context,
+            })
     }
 
     /// Every card, stage cards then tiers: the index space of
@@ -1095,6 +1118,17 @@ pub enum PlacementError {
          expert of the layers whose stacks a card can hold; plan without it"
     )]
     IdleTier { card: String, tier: usize },
+    /// A machine of several nodes: this plan holds one node's pool and host,
+    /// and [`nodes::plan_nodes`] plans the others.
+    #[error(
+        "a machine of {nodes} nodes: the card plan plans one node; plan the others with \
+         placement::nodes"
+    )]
+    Nodes { nodes: usize },
+    /// A unified pool whose bytes and its cards' context self cost
+    /// ([`PoolNeed::pool`]) pass u64.
+    #[error("a unified pool of {bytes} B and its cards' context of {context} B pass u64 bytes")]
+    PoolPastU64 { bytes: u64, context: u64 },
     /// A tier card on a plan that keeps every routed stack on the host
     /// ([`plan_host_routed`]): no card holds a routed expert, so the tier
     /// has nothing to hold.
@@ -2143,6 +2177,12 @@ fn plan_rule<'a>(
     routed: Option<RoutedRule>,
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
+    if machine.nodes.len() != 1 {
+        return Err(PlacementError::Nodes {
+            nodes: machine.nodes.len(),
+        });
+    }
+    machine.pool_bytes()?;
     let stages = Stages::new(model.layers, &machine.cards)?;
     let mut rows: Vec<Option<Row>> = vec![None; model.tensors.len()];
     let mut stacks: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
@@ -3448,6 +3488,25 @@ fn totals<'a>(
     }
 }
 
+/// What a unified plan holds in its one pool, and the pool
+/// ([`Plan::pool_need`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolNeed {
+    /// The cards' [`Violation::CardOver`] totals with their margins.
+    pub cards: u64,
+    /// The host's need.
+    pub host: u64,
+    /// The pool's bytes with each card's context self cost added back, as
+    /// [`capped`] adds it to a card.
+    pub pool: u64,
+}
+
+/// `card`'s total against usable − margin: its uploads' granules, its KV
+/// and its set-aside.
+fn card_total(card: &Card, totals: &CardTotals, heap: &Heap) -> u64 {
+    heap.taken + totals.kv_bytes + card.set_aside_bytes()
+}
+
 impl Plan<'_> {
     /// The room a plan with the host room `room` is made at, which this
     /// plan then names ([`HostTotals::room`]): the one caller of
@@ -3540,7 +3599,6 @@ impl Plan<'_> {
         let stage_cards = self.machine.cards.len();
         let mut out = Vec::new();
         let mut times = vec![0usize; model.tensors.len()];
-        let mut host_resident = 0u64;
         for r in &self.rows {
             let Some(t) = model.tensors.get(r.tensor) else {
                 continue;
@@ -3571,8 +3629,7 @@ impl Plan<'_> {
                             });
                         }
                     }
-                    Device::Host => host_resident += s.resident_bytes,
-                    Device::Nvme | Device::Unused => {}
+                    Device::Host | Device::Nvme | Device::Unused => {}
                 }
             }
         }
@@ -3586,10 +3643,8 @@ impl Plan<'_> {
         }
         let (heaps, unsized_segments) = card_heaps(model, &cards, &self.rows);
         out.extend(unsized_segments);
-        let mut card_sum = 0u64;
         for ((card, totals), heap) in cards.iter().zip(&self.cards).zip(&heaps) {
-            let total = heap.taken + totals.kv_bytes + card.set_aside_bytes();
-            card_sum += total + card.margin_bytes;
+            let total = card_total(card, totals, heap);
             let limit = self.usable_bytes(card).saturating_sub(card.margin_bytes);
             if total > limit {
                 out.push(Violation::CardOver {
@@ -3608,7 +3663,7 @@ impl Plan<'_> {
         // pool's share of the cards is the pool's bound, below.
         let host = self.machine.host();
         let need = workstation::HostNeed {
-            experts: host_resident,
+            experts: self.host_resident(),
             tables: 0,
             reserves: host.reserves.iter().map(|(_, b)| b).sum::<u64>()
                 + self.host.row_reserve_bytes,
@@ -3622,27 +3677,59 @@ impl Plan<'_> {
                 usable: host.usable_bytes,
             });
         }
-        // One pool holds the cards, re-derived from the rows here, and the
-        // host's whole need with the split's arena and window.
-        if let Some(unified) = self.machine.unified() {
-            let need = workstation::HostNeed {
-                experts: host_resident,
-                tables: 0,
-                cards: 0,
-                ..workstation::HostNeed::of(self, 0)
-            };
-            let host = need.bytes();
-            let pool = unified.bytes + cards.iter().map(|c| c.context_in_free()).sum::<u64>();
-            if card_sum + host + beside > pool {
-                out.push(Violation::PoolOver {
-                    cards: card_sum,
-                    host,
-                    beside,
-                    pool,
-                });
-            }
+        if let Some(PoolNeed { cards, host, pool }) = self.pool_need()
+            && cards + host + beside > pool
+        {
+            out.push(Violation::PoolOver {
+                cards,
+                host,
+                beside,
+                pool,
+            });
         }
         out
+    }
+
+    /// The bytes the rows hold on the host.
+    fn host_resident(&self) -> u64 {
+        self.rows
+            .iter()
+            .filter(|r| r.tensor < self.model.tensors.len())
+            .flat_map(|r| &r.segments)
+            .filter(|s| s.device == Device::Host)
+            .map(|s| s.resident_bytes)
+            .sum()
+    }
+
+    /// On a unified machine, what the plan holds in the one pool and the
+    /// pool ([`Violation::PoolOver`]'s terms): the cards, re-derived from
+    /// the rows, and the host's whole need with the split's arena and
+    /// window. `None` where each card has memory of its own.
+    #[must_use]
+    pub fn pool_need(&self) -> Option<PoolNeed> {
+        let pool = self
+            .machine
+            .pool_bytes()
+            .expect("the plan was made on a pool that fits u64")?;
+        let cards: Vec<&Card> = self.machine.all_cards().collect();
+        let (heaps, _) = card_heaps(self.model, &cards, &self.rows);
+        let cards_bytes = cards
+            .iter()
+            .zip(&self.cards)
+            .zip(&heaps)
+            .map(|((card, totals), heap)| card_total(card, totals, heap) + card.margin_bytes)
+            .sum();
+        let host = workstation::HostNeed {
+            experts: self.host_resident(),
+            tables: 0,
+            cards: 0,
+            ..workstation::HostNeed::of(self, 0)
+        };
+        Some(PoolNeed {
+            cards: cards_bytes,
+            host: host.bytes(),
+            pool,
+        })
     }
 
     /// The tier the plan's row-gathered tables ([`Role::EngramTable`]) are

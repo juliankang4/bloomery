@@ -39,7 +39,7 @@ budget solver.
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
 | **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | the contributor's part is done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)) | per-arch `ptx-shapes.tsv` rows (maintainers; section 6) |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 refuse to load at serving defaults on one Spark; a fix is in progress ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134430861)) | the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
-| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6) | the placement half (contributor, answer 20); the protocol half, started by the contributor with the `Link` seam; its monotonic words stay the maintainers' unless they hand them over (section 9.6) |
+| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words | the placement half's engine side: a remote node's census, the card plans each node's budget comes from, and decode at n = N (contributor, answer 20; section 10); the protocol half, started by the contributor with the `Link` seam; its monotonic words stay the maintainers' unless they hand them over (section 9.6) |
 
 Files the open work touches: P1, the fixture-tier inputs and `--place gate`
 (`crates/placement/src/placement/devices.rs:221`); P3, the per-arch rows of `tools/ref/ptx-shapes.tsv` and
@@ -520,8 +520,11 @@ node is a node, not a new device kind. It cannot be a tier with a link cost on t
 every card of `all_cards()` into one pool, so a remote tier would be charged to node 0's pool, and node 1's host-side
 rows and arena to node 0's host.
 
-The owner shape. None of it is in the tree (`Machine` is `{ cards, tiers, host }` at main,
-`crates/placement/src/placement.rs:223-229`; #16 adds `unified`):
+The owner shape as designed is below. Part of it is in the tree. `Machine::nodes` holds each node's `host` and
+`unified`, this process's node first ([#94](https://github.com/midagedev/bloomery/pull/94)). `Fabric`, and `LinkCost` for
+the `Link` below, are in `crates/placement/src/placement/nodes.rs` ([#95](https://github.com/midagedev/bloomery/pull/95)),
+on `Nodes` beside the machine and not on `Machine`. `LinkCost` carries λ only, and the read rate, the NIC and the ruler
+sit on `Nodes` for every node alike. `Card` has no `node` field and `Node` no `nic` yet:
 
 ```rust
 pub struct Card { /* … */ pub node: usize }       // an index into Machine::nodes; 0 is this process's node
@@ -537,18 +540,19 @@ pub enum Fabric { Alone,                          // N = 1: every machine today
 pub struct Link { pub rail: u64 /* bytes/s, one message */, pub round_trip_ns: u64 }
 ```
 
-- **#16 lands as it is**, with one doc line on `unified` and `host`: "this process's node", so nothing reads them as
-  machine-wide. Moving both into `nodes[0]` is the first step of the placement half, the contributor's (answer 20): a
-  move-class change in a pure crate, every caller through one accessor, before any remote node exists. With one node in the list the plan is exactly section 7's.
-- `CardOver` stays per card. `HostOver` and `PoolOver` run once per node, over the cards whose `node` matches.
-  `HostNeed` gains no field and is evaluated per node.
+- **`host` and `unified` live in `nodes[0]`** ([#94](https://github.com/midagedev/bloomery/pull/94)), read through
+  `Machine::host` and `Machine::unified`. With one node in the list the plan is exactly section 7's. Today's card plan
+  refuses a machine of more than one node by name (`PlacementError::Nodes`).
+- `CardOver` stays per card. The node plans hold `PoolOver` once per node: each node's budget is the card plan of that
+  node alone, and its routed ids are the node plan's split (9.9). `HostNeed` gains no field and is evaluated per node.
 - **Node 1's figures come from a remote census.** The census reads only this process's CUDA devices. Node 1's `CardSpec`
   and its `MemAvailable` reading must reach node 0 over the control channel before `plan_tiers` runs.
 - **One rule term, common to every family.** A tier takes "each layer's next ids after the stage's prefix"
   (`crates/placement/src/placement/workstation.rs:352-362`). Over a link the rule spreads the hot ids to reach the read
   share s that balances `Sh + s·R = λ·BW + (1 − s)·R` per layer (terms in 9.7). A, Sh and R come from the plan's own
-  tensor bytes and roles, so no model supplies them. On the box's PCIe the same formula holds with the lane's rate, so
-  it is one owner for both machines, not a Spark branch.
+  tensor bytes and roles, so no model supplies them. The node plans in the tree split by id count, as if every id were
+  used alike; the router's counts that spread the hot ids reach the split when the engine side calls it. On the box's
+  PCIe the same formula holds with the lane's rate, so it is one owner for both machines, not a Spark branch.
 - **With the unified tier.** The second node is a compute site with its own residency, not one more tier in the read
   path: reading a remote V4.1 expert costs ~~16.8 MB / 11.6 GB/s = 1.4 ms, against 16.8 MB / 219 GB/s = 77 µs~~ 16.8 MB / 13.63 GB/s = 1.2 ms, against
   16.8 MB / 208.8 GB/s (section 5) = 80 µs to compute it in place `[derived]`. The tier's ledger gains a node column, (node, id) to state. Node 1 runs its own books over
@@ -858,17 +862,19 @@ the serial A is tensor parallel (9.4).
 ### 9.8 Reference: scaling criteria
 
 One numbered list. Criteria 1–8 are numeric conditions that the unit gate of 9.9 holds on synthetic machines at N = 1,
-2, 3 and 4; criteria 9–11 are held by runs and review. The planner gains a predictor, `Plan::predict(&Workload) ->
-Prediction { step, per_node: { pool, nic, msgs_per_layer } }`. It reads the plan's own tensor bytes and roles, the card
-spec's BW, the nodes' `nic` and the fabric's `Link`, and needs no model file and no per-model code. The workload carries
-decode at n in {1, N} and the prompt at P = 4096 with its S₁ (a rate of a card and model pair, so on the workload, not
-the card spec). The thresholds come from a machine parameter, `ruler`: the useful-gain line is 2 × the machine's 95 %
-interval. The box's default is 2 % (A6000, SD 0.6 %); a Spark's own A/A sets its value (section 4). Our ruler is never
-baked in.
+2, 3 and 4; criteria 9–11 are held by runs and review. The predictor is `NodePlan::predict() -> Prediction { step_ns,
+link_ns, per_node: [NodeLoad { pool, window_ns, nic_permille, msgs_per_layer, fills_milli }] }`, on the plan that
+`plan_nodes(&Nodes, &Terms, &[NodeBudget], Workload)` makes (`crates/placement/src/placement/nodes.rs`). It reads node
+0's card plan's tensor bytes and roles (`Terms::of`), the nodes' read rate (BW) and NIC and the fabric's `LinkCost`, and
+needs no model file and no per-model code. The workload carries the prompt's S₁ (a rate of a card and model pair, so on
+the workload, not the card spec), whether every id must be held, and the NVMe fills. The step is decode at n = 1;
+decode at n = N is not predicted yet (section 10). The thresholds come from a machine parameter, `ruler`: the
+useful-gain line is 2 × the machine's 95 % interval. The box's default is 2 % (A6000, SD 0.6 %); a Spark's own A/A
+sets its value (section 4). Our ruler is never baked in.
 
 **Only criterion 1 refuses a plan**, as `CardOver` and `HostOver` do. Criteria 2–7 are **objectives** (6 is a structural
 assertion): the planner chooses which nodes it uses, the ownership and later the prompt mode to meet them, and where it
-cannot it names why (`NodeIdle { reason }`, a prompt-mode note). An unset `--place` on four Sparks still plans. Criteria
+cannot it names why (`NodeIdle { node, why }`, a prompt-mode note). An unset `--place` on four Sparks still plans. Criteria
 8–11 carry over from the earlier list and are not in S1–S6 of the design round.
 
 1. **Pool (S2-i), the one hard refusal.** Every node's planned need is at most its pool: `PoolOver` per node. Today's
@@ -887,7 +893,7 @@ cannot it names why (`NodeIdle { reason }`, a prompt-mode note). An unset `--pla
    (c), never O(k·N); messages × `c_post` (1 µs `[assumed]`) at most 2 % of the layer. One message per slot would be 30
    posts a layer for Qwen3.8 at N = 4. A unit assertion.
 7. **Never slower (S6), objective.** Each node used gains at least 2 × ruler (2 % on the box) over the plan without it;
-   otherwise `NodeIdle { reason }`. A smaller gain cannot be confirmed by an A/B.
+   otherwise `NodeIdle { node, why }`. A smaller gain cannot be confirmed by an A/B.
 8. **N = 1 plans exactly as a single Spark** (gate clause 1).
 9. **Prefill.** `pp tok/s @ P = 512 and 4096` at each N is measured and judged like decode, in the machine's own table;
    the prompt predictor of criterion 5 is checked against it. It is a run criterion, not a unit-gate clause.
@@ -907,29 +913,57 @@ at S₁ in {1,000, 3,000} tok/s (the pins of the gate in 9.9):
 | V4.1 (pool only) | 38.2 → 30.1 / 31.1 → 27.0 / 28.3 → 25.5 / 26.9 | never | never | N ≥ 3 at S₁ 3,000 (72–90 %) |
 
 Nothing fires at S₁ = 1,000. At N = 2 nothing fires except GLM's prompt, which sits on the 50 % line (4,286 against
-8,610): the gate's boundary case, at ≤ and not <.
+8,610): the gate's boundary case, at ≤ and not <. The predictor in the tree reads the measured BW and node 0's real split,
+and differs from this table in criterion 5's column; 9.9 gives its cells.
 
 ### 9.9 Reference: the gate, `nodes_scale`
 
-None of this exists yet. It is the placement half's gate (answer 20), built with the shape of 9.2. `nodes_scale` is a set of unit tests in
-`crates/placement`, a pure crate, so `just mac-test` and the box's lib gate both run it.
-- **Machines.** `workstation::spark_nodes(n, fabric)` builds synthetic GB10 nodes (`integrated: true`, a 115 GB pool,
-  `nic` 23.7 GB/s): N = 1 `Alone`, 2 `Pair`, 3 `Ring`, 4 `Switch`. `Link` is set at λ = 25 and 70 µs and `ruler` at the
-  box default.
+`nodes_scale` is the placement half's gate (answer 20), built with the shape of 9.2. It is a set of unit tests in
+`crates/placement/src/placement/nodes_scale.rs`, a pure crate, so `just mac-test` and the box's lib gate both run it. It
+runs the node plans of `crates/placement/src/placement/nodes.rs` ([#95](https://github.com/midagedev/bloomery/pull/95)).
+Where the gate holds a clause differently from its words below, the clause says how, and section 10 lists it.
+
+- **Machines.** The test helper `workstation::spark_nodes(n, layers, fabric)` builds synthetic GB10 nodes. Node 0 is
+  today's machine of a GB10 that the census reads with a 115 GB pool free (`workstation::gb10`, through
+  `spec_of_device`); each other node is that pool. Every node reads at BW 208.8 GB/s (section 5) and has a 23.7 GB/s
+  NIC. N = 1 is `Alone`, 2 `Pair`, 3 `Ring` and 4 `Switch`. `LinkCost` (the `Link` of 9.2) is set at λ = 25 and 70 µs
+  and the ruler at `workstation::RULER`, 10 ‰.
 - **Models.** Three synthetic shapes carry 9.7's terms for V4.1, GLM and Qwen3.8 (L, `n_embd`, k, e, A low and high,
-  Sh). No file is read.
+  Sh), each term rounded down to whole Q4_K rows; GLM's A and Sh are the header read's 7.36 and 1.60 GB. Clause 1 also
+  plans the Qwen3.8 file's tensor table for its first two layers, by its program's routed rule. No model file is read.
+- **Terms.** `Terms::of` reads node 0's card plan: each tensor's rows the plan reads a token, in the card's format on
+  a card (a BF16 tensor counts its f32 bytes) and in the file's on the host. Routed experts count their file bytes, the
+  bytes the split holds them at. A row table left on the NVMe tier is refused by name, since the predictor has no fill
+  term for it. The row width is an input, the model's embedding length.
 - **Expected sets.** The table of 9.8, pinned from a derivation script that moves into `tools/` beside the gate with its
-  own self-test, so the pins have one derivation.
+  own self-test, so the pins have one derivation. The script is not in the tree yet. Until it is, the gate pins the
+  predictor's own cells, which match 9.8's table in criteria 2 and 7 and differ in criterion 5 (clause 5).
 - **Clauses:**
-  1. `n1_is_today`: every N = 1 plan equals today's plan byte for byte.
+  1. `n1_is_today`: every N = 1 plan equals today's plan byte for byte. The gate holds it where node 0 holds every id:
+     node 0's bytes are today's pool need, or both plans refuse the model by the same bytes. Paged, it holds node 0 to
+     today's terms before their NVMe split and every id its pool has room for, because today's plan of one Spark does
+     not page yet (section 10). The step and node 0's window are the shape's bytes over BW.
   2. `pool_per_node`: criterion 1 refuses V4.1 whole at N = 2 and places it whole at N = 4. No other machine is refused.
+     A node is used while the pools before it cannot hold every id. A node whose own budget passes its pool, or that
+     the final split gives no id, is named idle.
   3. `read_balance`: criterion 4 holds on every plan.
-  4. `link_share`: criterion 2 holds on the chosen plan. Qwen3.8 at N = 4, λ 70, A low uses at most 3 nodes.
+  4. `link_share`: criterion 2 holds on the chosen plan. Qwen3.8 at N = 4, λ 70, A low uses at most 3 nodes. The
+     predictor's plan of that cell uses two of the four: a third switched node exposes 2.270 of 22.351 ms, 10.2 %.
   5. `nic_not_max`: criterion 5 either holds or carries the named prompt-mode note, exactly in the cells of the "fires"
-     column.
-  6. `messages_o_n`: criterion 6.
+     column. The gate pins the predictor's cells: at S₁ 3,000, V4.1 and GLM at N ≥ 2, except three of V4.1's four cells
+     at N = 2, and never Qwen3.8; at 1,000, none. Node 0 takes the rows of the remotes' share as the split sets it,
+     where 9.8 assumed an even split: GLM at N = 2, λ 25, A low splits its ids [111, 177], and node 0's NIC is busy
+     551 ‰. In the cells that fire, the busiest NIC runs from 500 to 941 ‰ for V4.1 and from 531 to 1,007 ‰ for GLM;
+     Qwen3.8's stays at or below 465 ‰.
+  6. `messages_o_n`: criterion 6. The busiest node posts 2 × min(k, N − 1) messages a layer, because node 0 sends the
+     handoff only to the remotes that hold one of the token's slots in that layer.
   7. `never_slower`: `NodeIdle` names exactly the cells of criterion 7's column, and no chosen plan is slower than its
-     N − 1 plan.
+     N − 1 plan. The gate's cells are the column's but N = 4, λ 70, A low, where criterion 2 names the node first. It
+     compares each plan with the N − 1 plan on the same link (a pair for a ring of three, three switched Sparks for
+     four). The N − 1 plan on its own fabric can be faster: Qwen3.8 on four switched Sparks takes 20.997 ms at λ 25,
+     A low, and on a ring of three 20.955 ms, by the switch's hop.
+  - C3 of `tierengine.md` (k), `fills_balance`: the split counts each node's NVMe fills and pages no id while a pool
+    has room.
 - **FAIL-first, one mutant a clause:**
   - M1: `PoolOver` over `all_cards()` into node 0's pool → clause 2 red at N ≥ 2.
   - M2: plan only `nodes[..2]` (a hidden 2) → clause 2 red, because V4.1 is not whole at N = 4.
@@ -962,6 +996,14 @@ Each open item; the owner is named where one is agreed. An item that a measureme
 - The `[derived]` bands and criteria of 9.7 and 9.8 still use their first inputs. `nodes_scale`'s derivation script, in
   the placement half, recomputes them (the placement half as proposed in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134316241), accepted in
   answer 20).
+- Where `nodes_scale` ([#95](https://github.com/midagedev/bloomery/pull/95)) holds a clause of 9.9 differently from its
+  words, for the maintainers to accept or change: until the derivation script lands, it pins the predictor's cells,
+  which differ from 9.8's table in criterion 5 (clause 5); clause 1 is byte for byte only where node 0 holds every id,
+  since today's plan of one Spark does not page V4.1 or GLM yet; clause 7 compares each plan with the N − 1 plan on
+  the same link, which the planner can choose, not on the N − 1 plan's own fabric.
+- The placement half's engine side: the contributor (answer 20). It is a remote node's census over the control channel
+  (9.2), the API that builds the card plans node 0's and each remote's budget come from, the router's counts in the
+  split (9.2), and decode at n = N in the predictor (9.8).
 - GLM's hit rates are assumptions; V4.1's come from a replay (9.7).
 - S₁ has a first reading on one Spark (9.7), at `v0.3.0` serving defaults with the MTP draft on.
 - Small-message (16 to 64 KB) bandwidth in protocol mode, strict ordering and one message in flight: the contributor,

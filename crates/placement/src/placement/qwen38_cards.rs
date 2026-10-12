@@ -17,9 +17,9 @@ use super::churn::ChurnPool;
 use super::ctx::{CtxError, NVME_SLACK_DIV, RULE_FIT, RULE_MARGIN, within_cache};
 use super::workstation::{
     A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_DRIFT, HostNeed,
-    HostRead, MARGIN, MIB, PLAN_ROOM, Pick, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
-    TIER_BATCH_RESERVE, census_usable, host, host_of, plan_room, resolve, tier_batch_host_bytes,
-    tier_batch_staging_bytes, unified_of,
+    HostRead, MARGIN, MIB, PLAN_ROOM, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+    TIER_BATCH_RESERVE, census_usable, gb10, host, host_of, plan_room, resolve,
+    tier_batch_host_bytes, tier_batch_staging_bytes, unified_of,
 };
 use super::{
     ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, Device, KvBytes, Machine,
@@ -146,7 +146,7 @@ fn q3_type(name: &str, ty: GgmlType) -> GgmlType {
 
 /// The file's tensors as the plan reads them: the Q4 file's table, or under
 /// `q3` the Q3 file's types with each tensor's bytes from its type's blocks.
-fn model(q3: bool) -> ModelTensors {
+pub(super) fn model(q3: bool) -> ModelTensors {
     let tensors = Q4_TABLE
         .lines()
         .filter(|l| !l.starts_with('#'))
@@ -1766,17 +1766,7 @@ const SPARK_FROM: usize = 262_144;
 /// free bytes are the pool): one stage card beside the pool, the host with
 /// no OS reserve and the checkpoints the seat's load pins.
 fn spark(free: u64) -> Machine {
-    let device = DeviceInfo {
-        ordinal: 0,
-        name: "NVIDIA GB10".to_string(),
-        total_bytes: 130_661_761_024,
-        free_bytes: free,
-        uuid: [0x10; 16],
-        pci_bus: "000f:01:00.0".to_string(),
-        held_by: None,
-        integrated: true,
-    };
-    let spec = resolve(&[Pick::Rank(0)], &[device]).expect("resolved")[0];
+    let spec = gb10(free);
     let mut m = machine_a(spec);
     *m.host_mut() = host_of(&spec);
     *m.unified_mut() = unified_of(&spec);

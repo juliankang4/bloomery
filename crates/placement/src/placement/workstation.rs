@@ -14,6 +14,8 @@ pub use super::devices::{
     census_usable, device_on_host, label, listed_index, resolve, spec_of_device, visible,
     word_picks, workstation_spec,
 };
+#[cfg(test)]
+use super::nodes::{Fabric, Nodes};
 use super::{Card, Host, HostTotals, Machine, Node, PlacementError, Plan, UnifiedPool};
 
 pub const MIB: u64 = 1 << 20;
@@ -530,6 +532,69 @@ fn tiered(
 #[must_use]
 pub fn plan_gate(layers: usize) -> Machine {
     plan_on(RTX_3090, layers)
+}
+
+/// A DGX Spark's pool as the node plans read it: the usable pool for model,
+/// cache and scratch [assumed, `docs/contrib/dgx-spark.md` §9.7 U], below the
+/// idle reading the census takes.
+#[cfg(test)]
+pub(crate) const GB10_POOL: u64 = 115_000_000_000;
+
+/// The rate our kernels read a GB10's pool at, bytes a second [measured,
+/// `docs/contrib/dgx-spark.md` §9.7 BW].
+#[cfg(test)]
+pub(crate) const GB10_READ: u64 = 208_800_000_000;
+
+/// A Spark's NIC a direction, bytes a second: the SoC side, whatever the port
+/// count [derived, `docs/contrib/dgx-spark.md` §9.1].
+#[cfg(test)]
+pub(crate) const GB10_NIC: u64 = 23_700_000_000;
+
+/// This workstation's ruler in permille: the 95 % interval on a difference
+/// of two arm means at four rounds (AGENTS.md, "Know the ruler").
+#[cfg(test)]
+pub(crate) const RULER: u64 = 10;
+
+/// A DGX Spark's GB10 as the census reads it with `free` bytes free
+/// ([`spec_of_device`]): an integrated device of a synthetic identity.
+#[cfg(test)]
+pub(crate) fn gb10(free: u64) -> CardSpec {
+    spec_of_device(&super::devices::DeviceInfo {
+        ordinal: 0,
+        name: "NVIDIA GB10".to_string(),
+        total_bytes: 130_661_761_024,
+        free_bytes: free,
+        uuid: [0x10; 16],
+        pci_bus: "000f:01:00.0".to_string(),
+        held_by: None,
+        integrated: true,
+    })
+}
+
+/// `n` synthetic DGX Sparks on `fabric` ([`super::nodes`]): [`plan_on`] a
+/// [`gb10`] with [`GB10_POOL`] free for all `layers` and the head, with
+/// `n − 1` more nodes of that pool each; the read rate and NIC a GB10's,
+/// the ruler this workstation's.
+///
+/// # Panics
+///
+/// At `n` 0: a machine has this process's node.
+#[cfg(test)]
+pub(crate) fn spark_nodes(n: usize, layers: usize, fabric: Fabric) -> Nodes {
+    assert!(n > 0, "spark_nodes(0): a machine has this process's node");
+    let spec = gb10(GB10_POOL);
+    let mut machine = plan_on(spec, layers);
+    machine.nodes.extend((1..n).map(|_| Node {
+        host: host_of(&spec),
+        unified: unified_of(&spec),
+    }));
+    Nodes {
+        machine,
+        fabric,
+        read: GB10_READ,
+        nic: GB10_NIC,
+        ruler_permille: RULER,
+    }
 }
 
 /// The card spec a plan's card is named after.
