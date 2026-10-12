@@ -3698,7 +3698,9 @@ fn quantize_col_non_finite_panics_on_both_paths() {
 /// included, which real rows rarely carry. One block per type, the scale fields swept
 /// over all 65,536 bit patterns, every second field with its sign flipped so a kernel
 /// that reads one field in another's place (Q4_K's `dmin` for `d`) differs, the rest
-/// fixed pseudo-random bytes.
+/// fixed pseudo-random bytes. `dot_row` must
+/// give the AVX2 kernel's bits too: it runs Q4_K's AVX-512 VNNI body where the CPU
+/// has one ([`qdot::q4k_avx512`]).
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn f16_scales_bit_identical_kernel_vs_mirror() {
@@ -3745,11 +3747,18 @@ fn f16_scales_bit_identical_kernel_vs_mirror() {
             }
             let a = dot_row_avx2(w, &row, &acol, 256).unwrap();
             let b = dot_row_scalar(w, &row, &acol, 256).unwrap();
+            let c = dot_row(w, &row, &acol, 256).unwrap();
             assert!(
                 a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
                 "{w:?} scale {h:#06x}: kernel {a:e} (bits {:#x}) vs mirror {b:e} (bits {:#x})",
                 a.to_bits(),
                 b.to_bits()
+            );
+            assert!(
+                c.to_bits() == a.to_bits() || (c.is_nan() && a.is_nan()),
+                "{w:?} scale {h:#06x}: dot_row {c:e} (bits {:#x}) vs kernel {a:e} (bits {:#x})",
+                c.to_bits(),
+                a.to_bits()
             );
         }
     }
@@ -5910,7 +5919,7 @@ fn lane_columns(ty: GgmlType, k: usize) -> Vec<Vec<u8>> {
 /// ([`lane_fill`]) at 4,096, with Q6_K's 0x00 group beside it — lanes =
 /// `dot_row` per (row, column), bit for bit ([`assert_lanes_match`]).
 #[test]
-#[ignore = "hw: the box's CPU (the row lanes run on AVX2); reads no model file"]
+#[ignore = "hw: the box's CPU (AVX2; Q4_K's AVX-512 VNNI body where it has one); reads no model file"]
 fn hw_lanes_match_dot_row_synthetic() {
     for ty in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
         let (block, _) = lane_block(ty);
@@ -5950,6 +5959,90 @@ fn hw_lanes_match_dot_row_synthetic() {
             );
             eprintln!("{ty:?} lanes: {label} (k = {k}): {calls} calls, bit-identical");
         }
+    }
+}
+
+/// Q4_K's two bodies on synthetic rows: seeded rows at k = 256, 2,048, 2,304
+/// and 4,096 and the 0xFF rows ([`lane_fill`]: every code 15, scales and mins
+/// 63) at 4,096, against [`lane_columns`]. `dot_row`, which runs the AVX-512
+/// VNNI body where [`qdot::q4k_avx512`] holds, equals `dot_row_avx2` and the
+/// scalar mirror per (row, column), bit for bit; then the tile and the row
+/// lanes, which take the same body, equal `dot_row` ([`assert_tile_matches`],
+/// [`assert_lanes_match`]). On a CPU without the ISA, or under
+/// `BLOOMERY_QDOT_AVX512=0`, every side is the AVX2 body and the line printed
+/// says so.
+#[test]
+#[ignore = "hw: the box's CPU (AVX2; the AVX-512 VNNI bodies where it has them); reads no model file"]
+#[cfg(target_arch = "x86_64")]
+fn hw_q4k_avx512_matches_avx2_synthetic() {
+    let ty = GgmlType::Q4_K;
+    let isa = std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c")
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni");
+    assert!(
+        isa || !qdot::q4k_avx512(),
+        "q4k_avx512 picked the AVX-512 VNNI bodies on a CPU without their ISA"
+    );
+    let body = if qdot::q4k_avx512() {
+        "AVX-512 VNNI"
+    } else {
+        "AVX2 (no AVX-512 VNNI body on this CPU or under BLOOMERY_QDOT_AVX512=0)"
+    };
+    let (block, _) = lane_block(ty);
+    let mut sets: Vec<(String, usize, Vec<u8>)> = [
+        (256usize, 16usize, 0x5a12_0001u64),
+        (512, 16, 0x5a12_0005),
+        (768, 16, 0x5a12_0006),
+        (2048, 16, 0x5a12_0002),
+        (2304, 16, 0x5a12_0003),
+        (4096, 24, 0x5a12_0004),
+    ]
+    .iter()
+    .map(|&(k, rows, seed)| {
+        (
+            format!("seeded rows (k = {k})"),
+            k,
+            lane_rows(ty, k, rows, seed),
+        )
+    })
+    .collect();
+    sets.push((
+        "0xFF rows (k = 4096)".into(),
+        4096,
+        lane_fill(ty, 4096, 0xFF),
+    ));
+    for (label, k, bytes) in &sets {
+        let (k, row_bytes) = (*k, k / 256 * block);
+        let acols = lane_columns(ty, k);
+        for (r, src) in bytes.chunks_exact(row_bytes).enumerate() {
+            for (j, a) in acols.iter().enumerate() {
+                let got = dot_row(ty, src, a, k).unwrap();
+                for (side, want) in [
+                    ("dot_row_avx2", dot_row_avx2(ty, src, a, k).unwrap()),
+                    ("dot_row_scalar", dot_row_scalar(ty, src, a, k).unwrap()),
+                ] {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{label}: row {r}, column {j}: dot_row ({body}) {got:e} (bits {:#x}) \
+                         vs {side} {want:e} (bits {:#x})",
+                        got.to_bits(),
+                        want.to_bits()
+                    );
+                }
+            }
+        }
+        let tiles = assert_tile_matches(ty, label, k, row_bytes, bytes, &acols);
+        let lanes = assert_lanes_match(ty, label, k, row_bytes, bytes, &acols);
+        eprintln!(
+            "Q4_K {body}: {label}, {} rows x {} columns: dot_row = dot_row_avx2 = scalar, \
+             {tiles} tile calls and {lanes} lane calls = dot_row, bit-identical",
+            bytes.len() / row_bytes,
+            acols.len()
+        );
     }
 }
 
