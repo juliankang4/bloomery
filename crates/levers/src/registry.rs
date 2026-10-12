@@ -72,11 +72,13 @@ pub const GEN_SLOTS_MAX: u64 = 8;
 const R03: &str = "[03]";
 const V2FENCE: &str = "v2fence";
 const SESSION: &str = "session";
+const ISA_OWNER: &str = "isa-owner";
 
 const OPS: &str = "crates/model/src/ops.rs";
 const ATTN: &str = "crates/model/src/arch/deepseek2/attn.rs";
 const HYBRID: &str = "crates/gpu/src/hybrid.rs";
 const DECODE: &str = "crates/model/src/bin/bloomery-decode.rs";
+const QDOT: &str = "crates/qdot/src/lib.rs";
 
 /// What an unset name that is no lever means.
 const OWNERS: Unset = Unset::Means("its owner's default");
@@ -1049,6 +1051,23 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             at: &[InPlace {
                 file: ATTN,
                 round: V2FENCE,
+            }],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: "BLOOMERY_QDOT_AVX512",
+        class: Class::A,
+        kind: Kind::Flag,
+        default: Unset::Is("1"),
+        doc: "Host tier, Q4_K weights: `1` runs the one-column kernel, the tile and the \
+              row lanes through their AVX-512 VNNI bodies on a CPU with AVX-512 F, BW and \
+              VNNI; `0` keeps the AVX2 bodies, the same-binary arm. Both write the same bits. \
+              Read once a process (`qdot::q4k_avx512`).",
+        site: Site::Direct {
+            at: &[InPlace {
+                file: QDOT,
+                round: ISA_OWNER,
             }],
             phase: Phase::Load,
         },
