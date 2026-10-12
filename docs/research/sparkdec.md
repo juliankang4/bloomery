@@ -1,23 +1,39 @@
-# sparkdec: the GB10 gemv read gap, and the two decode levers it was asked about
+# sparkdec: why GB10 decode gemvs read below the plain rate, and what was measured
 
-Design round, 2026-10-11, main `347a86e5`. No box run, no Spark run. Model: Qwen3.6-35B-A3B `Q4_K_M` whole on one
-DGX Spark (GB10). Every number below is either the contributor's measurement (cited by comment), read from the code
-(`path:line` at `347a86e5`), cited from a source (URL and one quoted line), or `[derived]` from those.
+This is a design round from 2026-10-11 on main `347a86e5`, written before any run. It splits why the decode gemvs (GEMV:
+a matrix times a vector, one kernel per weight matrix) on one DGX Spark (GB10) read slower than a plain read of the same
+memory (235.6 GB/s), and it predicts the two levers it was asked about. The model is Qwen3.6-35B-A3B `Q4_K_M`, whole on
+one DGX Spark. What was measured after the design is in §10.
 
-## Verdict
+Where it stands: DRAM row locality was the main term. An L2 row prefetch (#27, `fed530d2`) cut the step at depth 6 from
+11.83 to 10.18 ms and from 11.81 to 10.12 ms on two DGX Sparks at stock clocks. It runs only on an integrated device,
+because the form that prefetched on every card decoded at 0.9570 of main's speed on the A6000. PDL (programmatic
+dependent launch, which lets a kernel start while the one before it is still finishing) is closed by measurement (§4.4).
+The router regrid (`sparkrouter`, §7.1) is still open, and no run of it is recorded. The three terms §9 left open are
+all answered.
 
-| Lever | GB10 step Δ (11.50 ms) | A6000 Δ | Decision |
-|---|---|---|---|
-| 1a. `qwen35moe_router_norm` regridded: 8 rows a block (one a warp), 33 blocks, the first weight chunk issued before the norm | −0.07 … −0.22 ms (−0.6 … −1.9 %), center −1.3 % `[derived]` | −0.06 … +0.02 ms (−1.0 … +0.4 %) `[derived]` | **Open** (round `sparkrouter`, §7.1): a kernel defect on 48 SMs (a second wave), not a PDL question. Its one-warp routing tail (2.5–4 µs a launch, 0.10–0.16 ms a step) stays; a bit-keeping rewrite of it is worth −0.02 … −0.04 ms, model says 0 |
-| 1b. PDL across the step's 520 nodes | −0.20 … −0.67 ms (−1.7 … −5.8 %) `[derived]`, band too wide | 0 by construction (sm_86 PTX cannot carry it) | **Not yet**: needs the `sm_121` target (`archkey`), a fork patch (ledger row 42), and one term, GB10 `c_node` (§4.4) |
-| 1c. `qwen3moe_o_resid_q4k` second wave (256 blocks on 192 slots `[derived]`, §9 term 3) | −0.07 ms (−0.6 %), if the regrid removes the whole tail (§4.3) | 0 | **Model says 0, do not open** (under the ruler; PDL would fill it) |
-| 1d. `q4k_gemv_sel` tail (half-warp at K = 512, a dependent id load) | ≤ −0.09 ms (−0.8 %) | 0 | **Model says 0, do not open** |
-| 2. More bytes in flight per SM on the layer gemvs and the head | Little's-law form (more warps, blocks or loads to cover latency): 0. The same code shape for DRAM row locality (a row's loads issued together): up to −1.4 ms, undecided | 0 | **Little's-law form: model says 0, do not open** (§5.3). **Row-locality form: undecided until the probe's arm P** (§5.4), which also tests load width (arm W); the 1.63 ms the gemvs lose is that term |
+How to read it: every number is a contributor's or the maintainers' measurement (cited by comment), read from the code
+(`path:line` at `347a86e5` unless another commit is named), cited from a source (URL and one quoted line), or
+`[derived]` from those. A struck value (~~like this~~) is one a measurement showed wrong. In the text the corrected
+value and the link to the measuring comment stand next to it; in the Verdict table a pointer to §10, which holds the
+measured values, stands next to it. To open a round, read §7; to measure one on a Spark, read §8.
+
+## Verdict: where each lever stands
+
+| Lever | GB10 step Δ (11.50 ms) | A6000 Δ | Decision | Status |
+|---|---|---|---|---|
+| 1a. `qwen35moe_router_norm` regridded: 8 rows a block (one a warp), 33 blocks, the first weight chunk issued before the norm | −0.07 … −0.22 ms (−0.6 … −1.9 %), center −1.3 % `[derived]` | −0.06 … +0.02 ms (−1.0 … +0.4 %) `[derived]` | **Open** (round `sparkrouter`, §7.1): a kernel defect on 48 SMs (a second wave), not a PDL question. Its one-warp routing tail (2.5–4 µs a launch, 0.10–0.16 ms a step) stays; a bit-keeping rewrite of it is worth −0.02 … −0.04 ms, model says 0 | **Open, not run.** A rewrite of the routing rescan landed (#35, `81355f2f`); it pays at 512 experts and reads main's speed on Qwen3.6, as the model said (§10) |
+| 1b. PDL across the step's 520 nodes | −0.20 … −0.67 ms (−1.7 … −5.8 %) `[derived]`, band too wide | 0 by construction (sm_86 PTX cannot carry it) | **Not yet**: needs the `sm_121` target (`archkey`), a fork patch (ledger row 42), and one term, GB10 `c_node` (§4.4) | **Closed by §10's measurement** (§4.4). `archkey` is in (`232237be`) |
+| 1c. `qwen3moe_o_resid_q4k` second wave (256 blocks on 192 slots `[derived]`, §9 term 3) | −0.07 ms (−0.6 %), if the regrid removes the whole tail (§4.3) | 0 | **Model says 0, do not open** (under the ruler; PDL would fill it) | Not opened |
+| 1d. `q4k_gemv_sel` tail (half-warp at K = 512, a dependent id load) | ≤ −0.09 ms (−0.8 %) | 0 | **Model says 0, do not open** | Not opened |
+| 2. More bytes in flight per SM on the layer gemvs and the head | Little's-law form (more warps, blocks or loads to cover latency): 0. The same code shape for DRAM row locality (a row's loads issued together): ~~up to −1.4 ms~~ a bound the step passed (measured: §10), undecided at design time | Little's-law form: 0. Row-locality form: ~~0~~ a loss (measured: §10), so it landed for integrated devices only | **Little's-law form: model says 0, do not open** (§5.3). **Row-locality form: undecided until the probe's arm P** (§5.4), which also tests load width (arm W); the 1.63 ms the gemvs lose is that term | Little's-law form: not opened. **Row-locality form: in main** for integrated devices (#27, `fed530d2`); `lpddrwidth` and `lpddrrows` are superseded (§7.3) |
 
 The rule in `docs/contrib/dgx-spark.md` §5 leaves 160–200 GB/s open. This reading closes it: of the 2.75 ms the
 gemvs spend past the plain read rate, about 1.63 ms is a steady-rate deficit that every big gemv shares (the head
 included, at 99.8 % SM active), about 0.67 ms is per-kernel tails, about 0.23 ms is the per-launch intercept,
-mostly nsys's own, and the last ~0.2 ms is the small grid-8 `qkv_q4k` and grid-64 `q6k_gemv` launches (§2). Neither lever as asked reaches the 1.63 ms: in-flight bytes are not what it is short of (§5.3).
+mostly nsys's own, and the last ~0.2 ms is the small grid-8 `qkv_q4k` and grid-64 `q6k_gemv` launches (§2). Neither
+lever as asked reaches the 1.63 ms, because in-flight bytes are not what it is short of (§5.3). The row-locality form
+of lever 2 was the term (§5.4, measured in §10).
 
 ## 1. Facts used
 
@@ -43,12 +59,13 @@ load). Per-SM limits at cc 12.x equal cc 8.6's: 1536 threads, 48 warps, 64 K reg
 ([CUDA programming guide, compute capabilities](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html)).
 `cuDeviceGetAttribute` on two Sparks reads the same: 1536 threads, 65536 registers and 102400 B of shared memory per
 SM, 48 SMs ([#17 comment 6117957831](https://github.com/midagedev/bloomery/issues/17#issuecomment-6117957831)). The
-JIT's registers differ, though. Of the plain entries, which §2 timed, two fit fewer blocks per SM on the Spark than in
-the scan: `qwen3moe_gate_up_swiglu_q4k` and `qwen3moe_o_resid_q4k` fit 4, not 5; of the `_prefetch` entries a Spark
-launches, `q4k_gemv_sel_prefetch` also fits 4 (§9 term 3). A grid's resident slots are 48 × blocks/SM on GB10, with
+JIT's registers differ, though; §9 term 3 holds its values. A grid's resident slots are 48 × blocks/SM on GB10, with
 §9's plain cc 12.1 values, and 84 × blocks/SM on the A6000, with the scan's.
 
 ## 2. Paper decomposition of the step
+
+The big gemvs hold a steady 196.8 to 199.2 GB/s against the plain 235.6, and that deficit, more than tails or launch
+cost, is most of the 2.75 ms `[derived]`.
 
 Steady rate and intercept from the one kernel that runs at four sizes, `qwen3moe_qkv_q4k` (grids 520 and 1536):
 slope (72.99 − 25.39) / (14.176 − 4.810) = 5.082 µs/MB, i.e. **R_ss = 196.8 GB/s**, intercept **t0 = 0.95 µs**
@@ -86,6 +103,8 @@ not SM-bound.
 
 ## 3. Resource timeline per decode step (GB10, graph mode, 11.50 ms)
 
+The step is a sum of 520 dependent kernels, and inside each one memory sets the time, not the SMs.
+
 | Resource | Busy | Basis |
 |---|---|---|
 | LPDDR5x (one pool for card and host) | 8.75 ms at 235.6 GB/s; delivered 2061.4 MB / 11.50 ms = 179 GB/s average | contributor bytes; #13 rate |
@@ -103,7 +122,10 @@ order the timeline asks:
 - **Bulk**: fewer nodes (fold the grid-8 `qkv_q4k` launches; §9).
 - **SIMD/wider loads**: only if §5.4's probe says the request stream, not the bytes, sets the plateau.
 
-## 4. Lever 1 — PDL and launch tails
+## 4. Lever 1: PDL and launch tails
+
+Of lever 1, only the router regrid is still open (§4.2). PDL is closed by §10's measurement (§4.4), and the model puts
+the other tails at 0 (§4.3).
 
 ### 4.1 The toolchain at the pin (`4da6c13`)
 
@@ -124,8 +146,14 @@ order the timeline asks:
   data." ([CUDA programming guide 4.5](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html)).
   The same page: "These APIs require at least compute capability 9.0 to provide overlapping execution", and the wait
   "Will block until all primary kernels the secondary kernel is dependent on have completed" (and flushed).
+- **Since this reading.** `archkey` landed (`232237be`): recipes pass `--arch {{arch}}`, the justfile's `BLOOMERY_ARCH`,
+  whose default is still `sm_86`. LLVM 21 emits `sm_121` PTX and the GB10 driver loads it
+  ([#42](https://github.com/midagedev/bloomery/issues/42)). PDL is closed by measurement (§4.4), so no round uses this.
 
 ### 4.2 `qwen35moe_router_norm`: the kernel defect (lever 1a)
+
+**Open, not run.** The kernel loses a second wave and a one-warp routing tail; a regrid to 33 blocks removes the
+second wave and leaves the routing tail (`sparkrouter`, §7.1).
 
 The entry (`crates/gpu/src/arch/qwen3moe/router.rs:2594-2669`) launches `ROWS = 257` blocks of 256
 (`:2494`, `:3414`). In every block: phase A, the FFN norm's sum of squares over `x` on all 256 threads (`:955-978`);
@@ -173,7 +201,9 @@ a null is the nsys line on the candidate: `qwen35moe_router_norm`'s in-flow µs 
 the step did not (a term outside §4.2, report it); it did not fall → the second wave was not the tail, and the routing
 tail is the term to re-derive from the cc 12.1 SASS. A routing rewrite that keeps the bits (each lane
 sorts its 8 entries once, then each round pops the warp argmax of the lanes' heads) removes only the per-round scan,
-~0.4–1.0 µs a launch, −0.02 … −0.04 ms: **model says 0, do not open** as its own round. A6000: one wave today, so only the hidden norm (≤ 1 µs) and the L2 traffic cut
+~0.4–1.0 µs a launch, −0.02 … −0.04 ms: **model says 0, do not open** as its own round. A rewrite of the same
+rescan landed (#35, `81355f2f`): it pays at 512 experts and reads main's speed on Qwen3.6, as predicted (§10).
+A6000: one wave today, so only the hidden norm (≤ 1 µs) and the L2 traffic cut
 (4.1 → 0.54 MB) move: **−1.5 … +0.5 µs a launch, −0.06 … +0.02 ms on a ~5.6 ms step** (193.9 tok/s on the 3090,
 `README.md:115`, scaled to 768 GB/s) `[derived]`. On 33 SMs the per-SM read rate is 7.1 GB/s on GB10 (2.9 B/cycle) and
 ~20 GB/s on the A6000 (11 B/cycle), both far under one SM's L2 port. In flight: one row a warp is 64 four-byte loads a
@@ -185,22 +215,30 @@ show as a GB10 Δ above the band's −0.07 edge and the nsys µs above 16.7.
 
 ### 4.3 The other tails (levers 1c, 1d)
 
-- **`qwen3moe_o_resid_q4k`**, grid `rows / 8` (`crates/gpu/src/arch/qwen3moe/proj.rs:692`), 2048 rows of K = 4096:
-  256 blocks on 192 slots (4 blocks/SM under the cc 12.1 JIT, §9 term 3), so 64 blocks run a second wave `[derived]`.
-  Their 512 warps hold 128 to 576 B each a round (§5.2), about 66 to 295 KB in flight, against the 118 to 353 KB the
-  pool needs (§5.1) `[derived]`; §5.2's bytes a warp assume the cc 12.1 JIT does not overlap two iterations' loads
+- **`qwen3moe_o_resid_q4k`**, grid `rows / 8` (`crates/gpu/src/arch/qwen3moe/proj.rs:692`), 2048 rows of K = 4096: 256
+  blocks on 192 slots (4 blocks/SM under the cc 12.1 JIT, §9 term 3), so 64 blocks run a second wave `[derived]`. Their
+  512 warps hold 128 to 576 B each a round (§5.2), about 66 to 295 KB in flight, against the 118 to 353 KB the pool
+  needs (§5.1) `[derived]`; §5.2's bytes a warp assume the cc 12.1 JIT does not overlap two iterations' loads
   `[unverified]`. The old count (74 KB, under the need at every L) no longer holds, and this count alone cannot
-  say whether the second wave is short of bytes (Little alone is ambiguous here, as in §5.3). The cause of the 1.76 µs
-  tail in §2 is `[unverified]`. A uniform two rows a warp (128 blocks, one wave on both cards) removes the partial
-  wave. The Δ is §2's whole tail, 1.76 µs × 40: **−0.07 ms, −0.6 %**; it assumes the regrid removes all of it, which
-  is `[unverified]`: `gate_up_swiglu_q4k` has a 2.89 µs tail in 3.00 whole waves (§2). Under the ruler: **model says
-  0, do not open.**
+  say whether the second wave is short of bytes (Little alone is ambiguous here, as in §5.3). The old count took the
+  scan's 5 blocks per SM; the cc 12.1 JIT gives 4
+  ([#17 comment 6117957831](https://github.com/midagedev/bloomery/issues/17#issuecomment-6117957831)).
+  The cause of the 1.76 µs tail in §2 is `[unverified]`. A uniform two rows a warp (128 blocks, one wave on both cards)
+  removes the partial wave. The Δ is §2's whole tail, 1.76 µs × 40: **−0.07 ms, −0.6 %**; it assumes the regrid removes
+  all of it, which is `[unverified]`: `gate_up_swiglu_q4k` has a 2.89 µs tail in 3.00 whole waves (§2). Under the ruler:
+  **model says 0, do not open.**
 - **`q4k_gemv_sel`** at K = 512 (`n_sb = 2`): the core's guard `sbp < n_sb` (`crates/gpu/src/cores.rs:395-404`) leaves
   lanes with `grp ≥ 2` idle, so a warp reads 288 B with half its lanes, after a dependent `sel` load
   (`crates/gpu/src/q4k_sel.rs:84`). Its 4.60 µs tail is the ceiling of any fix: **≤ −0.09 ms, −0.8 %. Model says 0, do
   not open.** (`q6k_gemv_sel` reads 201 GB/s alone and 176 in flow; that 5.6 µs is a boundary effect, not its body.)
 
 ### 4.4 PDL proper (lever 1b)
+
+**Closed by §10's measurement.** With GB10's measured `c_node` (below), this section's rule gives
+520 × (0.553 + 0.5) µs = 0.548 ms ≥ 0.35 ms `[derived]`, so the rule alone would schedule `sparkpdl`. §10 then measured
+PDL on the same gemvs on top of the row prefetch at +0.9 to +1.1 % (slower), and that measurement holds over the rule,
+which was written before it. The band below was derived for a step without the prefetch, a different condition, so it
+stays as derived.
 
 Per node boundary PDL can hide the next kernel's launch and dispatch, its prologue, and, for a kernel whose first
 reads are weights at addresses its predecessor did not write, its first DRAM round trip, under the previous kernel's
@@ -214,10 +252,15 @@ the next kernel's first blocks.
 
 The band spans 3.5×, so the round does not open on it. The one term: **`c_node` on GB10**, the empty-node price of a
 captured graph, `cnode_probe --time` (`crates/gpu-gates/src/bin/cnode_probe.rs`, the `time-gpu-cnode` recipe's binary),
-expected 0.6–1.5 µs. Decide: 520 × (`c_node` + 0.5 µs) ≥ 0.35 ms (3 %) → schedule `sparkpdl` (§7.2) after `archkey`;
+expected ~~0.6–1.5 µs~~ 0.553 µs a node, measured
+([#13 comment 6128568288](https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288); §9 term 2).
+Decide: 520 × (`c_node` + 0.5 µs) ≥ 0.35 ms (3 %) → schedule `sparkpdl` (§7.2) after `archkey`;
 below → model says 0 for PDL on this model.
 
-## 5. Lever 2 — bytes in flight per SM
+## 5. Lever 2: bytes in flight and row locality
+
+The Little's-law form of this lever predicts 0 (§5.3). The row-locality form, which the design left undecided (§5.4),
+was measured in §10 and is in main for integrated devices (#27).
 
 ### 5.1 The latency
 
@@ -291,15 +334,21 @@ the knee (§5.3). What stays different between them and `rows_k` (235.6) is the 
   273, 85 % of the plain read), so the walk loses more on LPDDR5x than on GDDR6.
 
 Neither is fixable by derivation. **The one term: the read rate of `hostread2`'s `rows_k` with our request stream**, on
-the Spark, same buffers: arm W (4-byte loads in the Q4_K lane-to-word map, whole row at once), arm P (16-byte loads,
-the row in four pieces chained through a dependent register), against today's arm (16-byte, whole row, 235.6).
-Expected `[derived]`: if (a), W ≈ 190–205 and P ≈ 230–236; if (b), P ≈ 190–205 and W ≈ 230–236; if neither, both
-≥ 228 and the 1.63 ms goes to a reading round with ncu memory-side metrics before any kernel work. Next action: (a) →
-round `lpddrwidth`: `U32x4` loads for the Q4_K walk (`cuda_device::vector::U32x4` is in use, `crates/gpu/src/iq.rs:85`;
-the header and `qs` offsets are 16-byte aligned since 144 = 9 × 16), Q6_K needs a load-time layout (210 B super-blocks
-are 2-byte aligned); (b) → round `lpddrrows`: issue a row's pieces together (registers allow it at Q6_K; the Q4_K walk
-needs the decode moved after the loads). Either predicts up to −1.4 ms on GB10 (1978 MB from 196.8 to ≥ 230 GB/s,
-−12 %) and 0 ± ruler on the A6000 (the q3gemma precedent: −39 % L1TEX wavefronts at ~700 GB/s moved no cycles).
+the Spark, same buffers: arm W (4-byte loads in the Q4_K lane-to-word map, whole row at once), arm P (16-byte loads, the
+row in four pieces chained through a dependent register), against today's arm (16-byte, whole row, 235.6). Expected
+`[derived]`: if (a), W ≈ 190–205 and P ≈ 230–236; if (b), P ≈ 190–205 and W ≈ 230–236; if neither, both ≥ 228 and the
+1.63 ms goes to a reading round with ncu memory-side metrics before any kernel work. Next action: (a) → round
+`lpddrwidth`: `U32x4` loads for the Q4_K walk (`cuda_device::vector::U32x4` is in use, `crates/gpu/src/iq.rs:85`; the
+header and `qs` offsets are 16-byte aligned since 144 = 9 × 16), Q6_K needs a load-time layout (210 B super-blocks are
+2-byte aligned); (b) → round `lpddrrows`: issue a row's pieces together (registers allow it at Q6_K; the Q4_K walk needs
+the decode moved after the loads). Either predicts ~~up to −1.4 ms~~ on GB10
+(1978 MB from 196.8 to ≥ 230 GB/s, ~~−12 %~~) a bound the step passed: −1.550 ms on public commits
+([#13 comment](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)) and −1.65 and −1.69 ms under a lease
+([#27](https://github.com/midagedev/bloomery/pull/27)), all at stock clocks, and −1.62 ms at a 1989 MHz SM clock cap
+([#17 comment 6105096461](https://github.com/midagedev/bloomery/issues/17#issuecomment-6105096461)); and ~~0 ± ruler~~
+on the A6000 (the q3gemma precedent: −39 % L1TEX wavefronts at ~700 GB/s moved no cycles), measured at 0.9570 ± 0.0006
+of main's decode tok/s ([#27 comment
+6106637752](https://github.com/midagedev/bloomery/pull/27#issuecomment-6106637752)). §10 gives each run's conditions.
 
 ## 6. Reference designs
 
@@ -321,7 +370,10 @@ ours for the bits (warp-per-row, pinned), ik's "a row's loads before its decode"
 
 ## 7. Round specs
 
-### 7.1 `sparkrouter` (opens now; class: occupancy/geometry — grid and per-block work change, each row's arithmetic does not)
+Of the rounds below, only `sparkrouter` is open. `sparkpdl` is closed, and #27 superseded `lpddrwidth` and
+`lpddrrows`. Their specs stay as the record of each round.
+
+### 7.1 `sparkrouter` (open, not run; class: occupancy/geometry, where the grid and per-block work change and each row's arithmetic does not)
 
 - **File.** `crates/gpu/src/arch/qwen3moe/router.rs` only: the `gated` one-token entry `qwen35moe_router_norm`
   (`:2594`), `norm_row_body` (`:926`, the row → warp map and the hoisted first chunk, or a sibling body for the
@@ -344,12 +396,15 @@ ours for the bits (warp-per-row, pinned), ik's "a row's loads before its decode"
   ours (the candidate tree) / `bin:<base>`, so + means the candidate is faster; the card's band is in that direction.
 - **On GB10.** The contributor's command, §8, predicted band −0.07 … −0.22 ms.
 
-### 7.2 `sparkpdl` (after `archkey` and the GB10 `c_node` reading; class: launch/dependency — no arithmetic moves)
+### 7.2 `sparkpdl` (closed by §10; class: launch/dependency, where no arithmetic moves)
 
-- **Prerequisites.** (i) `--arch sm_121` builds of the qwen3moe bins (`archkey`, maintainers). (ii) A fork commit on
-  `bloomery`: a PDL form of the typed launch (`#[cuda_module]` / `cuda_launch!` option next to `cooperative`, through
-  `launch_kernel_pdl`), with FAIL-first: a captured two-kernel graph whose edge reads back as programmatic, and red with
-  the option off. (iii) Ledger row 42 moves to that commit.
+**Closed by §10's measurement** (§4.4).
+
+- **Prerequisites.** (i) `--arch sm_121` builds of the qwen3moe bins: `archkey` is in (`232237be`,
+  `BLOOMERY_ARCH=sm_121`), and the GB10 driver loads the PTX ([#42](https://github.com/midagedev/bloomery/issues/42)).
+  (ii) A fork commit on `bloomery`: a PDL form of the typed launch (`#[cuda_module]` / `cuda_launch!` option next to
+  `cooperative`, through `launch_kernel_pdl`), with FAIL-first: a captured two-kernel graph whose edge reads back as
+  programmatic, and red with the option off. (iii) Ledger row 42 moves to that commit.
 - **Files.** The Qwen3.6 decode chain's launchers (`crates/gpu/src/arch/qwen3moe/{proj,experts,router,body35}.rs`,
   `crates/gpu/src/{q4k_sel,q6k_sel}.rs`, the flash and delta launchers), and in each entry: `wait()` before the first
   read of a predecessor's output, `trigger_dependents()` after the block's weight loads are issued, the first weight
@@ -359,11 +414,15 @@ ours for the bits (warp-per-row, pinned), ik's "a row's loads before its decode"
   add a spin in the producer's last block → the consumer reads the previous step's activation → red.
 - **A/B.** GB10 only (§8); predicted band from §4.4 narrowed by the measured `c_node`.
 
-### 7.3 `lpddrwidth` / `lpddrrows` (only on §5.4's probe outcome)
+### 7.3 `lpddrwidth` / `lpddrrows` (superseded by #27)
+
+**Superseded.** #27 (`fed530d2`) landed the row-locality form as a per-warp L2 row prefetch, on integrated devices
+only (§10).
 
 Files `crates/gpu/src/cores.rs` (Q4_K walk), `q6k_sel.rs`, `lib.rs` `q6k_gemv`, the head; gates the qwen35moe and
-qwen3moe family gates bit-identical (only load width or order changes), `gate-gpu-e2e`; A/B the A6000 noninf as 7.1
-and GB10 by §8. Predicted up to −1.4 ms on GB10.
+qwen3moe family gates bit-identical (only load width or order changes), `gate-gpu-e2e`; A/B the A6000 noninf as 7.1 and
+GB10 by §8. Predicted ~~up to −1.4 ms~~ on GB10 a bound the step passed: −1.550 ms on public commits and −1.65 and −1.69
+ms under a lease, all at stock clocks, and −1.62 ms at a 1989 MHz SM clock cap; §10 has each run's conditions and links.
 
 ## 8. The contributor's command
 
@@ -379,10 +438,17 @@ noisier session widens r and cannot make a false "real"). At s ≤ 0.057, r = ±
 the report names which §4.2 term was off. **|Δ| < r**: the band is refuted; the next action is §4.2's (the nsys line on
 the candidate). **Δ ≥ +r**: reject.
 
-## 9. Open terms, in the order they decide something
+## 9. Open terms, all answered
+
+The design left three terms open, listed in the order they decide something. All three are answered.
 
 1. §5.4's probe on the Spark (rows_k W and P arms): decides whether 1.4 ms is reachable and by which round.
-2. GB10 `c_node` (`cnode_probe --time` on the Spark): decides `sparkpdl`.
+   **Answered** by §10, which measured the lever itself: the row prefetch took 1.62 ms off the step, so the term is
+   row locality, and #27 landed it.
+2. GB10 `c_node` (`cnode_probe --time` on the Spark): decides `sparkpdl`. **Answered**: 0.553 µs a node on GB10, a
+   direct run ([#13 comment 6128568288](https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288); the
+   run's commit and clocks are in `docs/research/tierengine.md` §6.2, row 6). §4.4 applies it, and §10's measurement
+   closes `sparkpdl`.
 3. The cc 12.1 JIT's registers for the eight entries (`cuFuncGetAttribute(NUM_REGS)` on the Spark): the waves column
    assumed the sm_86 scan's blocks/SM. **Answered** by a contributor's reading with driver 595.84 (the plain entries on
    two Sparks, the `_prefetch` entries on one;
@@ -404,19 +470,53 @@ the candidate). **Δ ≥ +r**: reject.
    | `qwen35moe_router_norm` | 47 / 5 | 48 / 5 | 42 / 5 |
 
    No entry has local memory. `gate_up_swiglu_q4k` and `o_resid_q4k` fit 4 blocks per SM, not 5, and
-   `q4k_gemv_sel_prefetch` also fits 4. §2's measured numbers do not move. The terms built on the scan's values are
-   corrected in place: the Verdict's 1c, §1's per-SM limits and slots, §2's waves column, §4.2's registers, §4.3's
-   `o_resid_q4k` tail, §5.2's warps per SM and register premise, and §5.3's in-flight ratio.
+   `q4k_gemv_sel_prefetch` also fits 4. §2's measured numbers do not move.
 
-## 10. Measured after the design (contributor @juliankang4, #17 comment 6105096461)
+## 10. Measured after the design
 
-Interleaved runs of the contributor's own script on one Spark, 4 rounds, ids identical across arms, SM clock capped at
-1989 MHz; leads, not lease-runner numbers.
-- §5.4's row-locality form, as a per-warp `prefetch.global.L2` of every 128-byte line of the weight row before the
-  walk, on every decode gemv: step 11.97 → 10.35 ms (−1.62 ms). That is past this design's −1.4 ms upper bound, so the
-  term was row locality and the bound was low; open term 1 is decided. Lookahead into the next wave (+2.4 %, +6 %), a
-  side-stream L2 fill (+7.7 %), a prefetch node before the short kernels (±0.1 %) and `launch_bounds(256, 6)` (spills,
-  +27 %) lost. The A6000 Δ is not measured; the landing needs the noninf A/B of §7.1's form.
-- PDL on the same gemvs on top of the prefetch: +0.9 … +1.1 % (slower). `sparkpdl` stays closed after the prefetch.
-- The router's top-k tail (each lane keeps its best untaken expert): Qwen3.6 +0.17 % ± 0.19 % (model said 0, §4.2);
-  Qwen3.8 (512 experts) −0.89 % ± 0.17 %.
+Row locality was the term. A per-warp L2 row prefetch took 1.62 ms off the step in the contributor's first runs (SM
+clock capped at 1989 MHz), 1.550 ms on public commits at stock clocks, and 1.65 and 1.69 ms under a lease on two DGX
+Sparks. It landed for integrated devices only (#27, `fed530d2`), because the form that prefetched on every card was
+slower on the A6000. PDL on top of the prefetch was slower too.
+
+- **First runs** ([#17 comment 6105096461](https://github.com/midagedev/bloomery/issues/17#issuecomment-6105096461)):
+  interleaved runs of the contributor's own script on one Spark, 4 rounds, ids identical across arms. They were leads,
+  not lease-runner numbers; the next two items have the public-commit pair and the lease numbers.
+  - §5.4's row-locality form, as a per-warp `prefetch.global.L2` of every 128-byte line of the weight row before the
+    walk, on every decode gemv, at depth 6, n = 96, with the SM clock capped at 1989 MHz, on a commit that was not
+    published: step 11.97 → 10.35 ms (−1.62 ms). That is past this design's −1.4 ms upper bound, so the term was row
+    locality and the bound was low; open term 1 is decided. Lookahead into the next wave (+2.4 %, +6 %), a side-stream
+    L2 fill (+7.7 %), a prefetch node before the short kernels (±0.1 %) and `launch_bounds(256, 6)` (spills, +27 %)
+    lost.
+  - PDL on the same gemvs on top of the prefetch: +0.9 … +1.1 % (slower), on the same unpublished build. It was not
+    rerun on public commits ([#13 comment](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)): the PDL prototype edits the gemvs' inline prefetch, and #27 moved the prefetch into
+    separate `_prefetch` entries, so the prototype does not apply to `fed530d2`. `sparkpdl` stays closed after the
+    prefetch (§4.4).
+  - The router's top-k tail in the form where each lane keeps its best untaken expert: Qwen3.6 +0.17 % ± 0.19 %
+    (model said 0, §4.2); Qwen3.8 (512 experts, stock clocks, the draft off, on top of other Qwen3.8 decode changes)
+    −0.89 % ± 0.17 %. This form did not land (the last item).
+- **The prefetch pair on public commits** ([#13 comment](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)): #27's prefetch (`fed530d2`) against
+  its parent (`4a896395`), at stock clocks, not under a lease: step 11.439 → 9.889 ms, −1.550 ms (−13.5 % `[derived]`),
+  with §8's ruler at ±0.099 ms `[derived]` for 4 rounds. The first runs' −1.62 ms stands under its own conditions (a
+  1989 MHz cap, another commit). Conditions here: one DGX Spark, driver 595.84, SM clock 2470 to 2522 MHz while busy
+  with no clock event reason; Qwen3.6-35B-A3B `Q4_K_M`, depth 6 by token ids, n = 96, `--ctx 256`, graph mode;
+  both commits built with `cargo oxide` for sm_86; 4 interleaved rounds, one process an arm, page cache dropped before
+  each, ids identical across arms.
+- **Under a lease** ([#27](https://github.com/midagedev/bloomery/pull/27), its description's tables, and
+  [#27 comment 6108992236](https://github.com/midagedev/bloomery/pull/27#issuecomment-6108992236)): #27's form, which
+  launches a `_prefetch` entry only on a device that reports `CU_DEVICE_ATTRIBUTE_INTEGRATED`, against main
+  `2ce989d7`, both arms built on it. `tools/ref/depth-qwen3moe.sh` in `tools/box.sh`'s local mode, one lease on each of
+  two DGX Sparks, six rounds, n = 96, driver 595.84, stock clocks (SM 2411 to 2483 MHz around the arms). At depth 6
+  the decode tok/s ratio is 1.1616 ± 0.0070 and 1.1668 ± 0.0022, and the step goes 11.83 → 10.18 ms and
+  11.81 → 10.12 ms. It landed as `fed530d2`.
+- **On the A6000** ([#27 comment 6106637752](https://github.com/midagedev/bloomery/pull/27#issuecomment-6106637752),
+  the maintainers' run): the form that prefetched on every card, depth 6, 14 interleaved rounds, one process per arm,
+  one lease: decode at 0.9570 ± 0.0006 of main's tok/s (203.58 → 194.82). The landed form launches only the plain
+  entries on a card with its own memory, and their PTX has main's md5 for every one of main's entries, so the A6000
+  needed no second A/B.
+- **The routing rescan that landed** ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`): each lane
+  reads its entries four at a time in the rescan, unlike the form above. Both expert counts take it, and it pays at
+  512. On Qwen3.6, one lease on one DGX Spark against main `68609e1c`, six rounds, n = 96, depth 6, stock clocks
+  (SM 2411 to 2502 MHz): 1.0010 ± 0.0033 of main's decode tok/s, as the model said (§4.2). On Qwen3.8 the
+  `qwen35moe_router_fused_512` launch takes 34.1 to 34.5 µs against main's 39.8 to 39.9 µs (nsys, outside a lease).
+  The form above read slower than main in a lease on Qwen3.6 at depth 6, and it did not land.

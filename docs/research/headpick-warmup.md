@@ -590,7 +590,7 @@ LFU write the same words unless the region overflows, where only the victim row 
 |---|---|---|---|---|
 | tail copy (recommended) | <= 8 KB (0.31 us at 26.28 GB/s `[measured link]`) | 1 async copy, fixed cost `[unmeasured]`, assumed <= 20 us | 0 | no kernel, graph untouched; <= 0.057 % of the window in a changed window, <= 0.007 % averaged at 12 % changed windows `[derived]` |
 | whole map | 304 KB (11.6 us) | 1 | 0 | simpler, same order |
-| (id, row) pairs in the existing inbox copy, applied by a captured scatter | 36 B | 0 | +1 per refresh-walk key (0.852 us, `c_node`, `sparkdec.md:209`) | a new kernel (an `add` entry for ptx-scan and `gate-ptx-spill`) for a term already at 0: not worth it |
+| (id, row) pairs in the existing inbox copy, applied by a captured scatter | 36 B | 0 | +1 per refresh-walk key (0.852 us, `c_node`, `sparkdec.md` §4.4) | a new kernel (an `add` entry for ptx-scan and `gate-ptx-spill`) for a term already at 0: not worth it |
 
 ### 5.2 Does a fixed-count map keep the captured graph
 
