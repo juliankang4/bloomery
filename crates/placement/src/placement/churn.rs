@@ -162,7 +162,7 @@ fn beside_text(beside: u64) -> String {
 mod tests {
     use super::*;
     use crate::placement::workstation::{HostNeed, HostRead};
-    use crate::placement::{Host, HostTotals, Machine, ModelTensors};
+    use crate::placement::{Host, HostTotals, Machine, ModelTensors, Node};
 
     /// A plan whose host leaves `headroom` bytes, and nothing else: the
     /// check reads the headroom alone.
@@ -212,11 +212,13 @@ mod tests {
         let machine = Machine {
             cards: Vec::new(),
             tiers: Vec::new(),
-            host: Host {
-                usable_bytes: 0,
-                reserves: Vec::new(),
-            },
-            unified: None,
+            nodes: vec![Node {
+                host: Host {
+                    usable_bytes: 0,
+                    reserves: Vec::new(),
+                },
+                unified: None,
+            }],
         };
         let plan = with_headroom(&model, &machine, 150);
         let pool = ChurnPool {
@@ -262,11 +264,13 @@ mod tests {
         let machine = Machine {
             cards: Vec::new(),
             tiers: Vec::new(),
-            host: Host {
-                usable_bytes: 1000,
-                reserves: Vec::new(),
-            },
-            unified: None,
+            nodes: vec![Node {
+                host: Host {
+                    usable_bytes: 1000,
+                    reserves: Vec::new(),
+                },
+                unified: None,
+            }],
         };
         let pool = ChurnPool {
             pinned: 0,

@@ -23,8 +23,8 @@ use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::workstation::{self, GRANULE, HostRead, TierBatchBytes};
 use crate::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine,
-    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role, Unimplemented, Violation,
-    checked_beside, joined,
+    ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers, Role, Unimplemented,
+    Violation, checked_beside, joined,
 };
 
 const F16_BYTES: u64 = 2;
@@ -779,11 +779,13 @@ fn nextn_machine() -> Machine {
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
-        host: Host {
-            usable_bytes: u64::MAX,
-            reserves: Vec::new(),
-        },
-        unified: None,
+        nodes: vec![Node {
+            host: Host {
+                usable_bytes: u64::MAX,
+                reserves: Vec::new(),
+            },
+            unified: None,
+        }],
     }
 }
 
@@ -1484,8 +1486,8 @@ mod tests {
         use crate::placement::churn::ChurnPool;
         use crate::placement::workstation::{HostNeed, HostRead};
         use crate::placement::{
-            Card, Host, Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role, UnifiedPool,
-            Violation,
+            Card, Host, Machine, ModelTensor, ModelTensors, Node, Plan, PlanLevers, Role,
+            UnifiedPool, Violation,
         };
 
         const LAYERS: usize = 4;
@@ -1579,11 +1581,13 @@ mod tests {
                     reserves: vec![("draft".to_string(), 3 << 20)],
                 }],
                 tiers: Vec::new(),
-                host: Host {
-                    usable_bytes: u64::MAX,
-                    reserves: Vec::new(),
-                },
-                unified: None,
+                nodes: vec![Node {
+                    host: Host {
+                        usable_bytes: u64::MAX,
+                        reserves: Vec::new(),
+                    },
+                    unified: None,
+                }],
             }
         }
 

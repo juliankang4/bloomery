@@ -40,7 +40,7 @@ use model::arch::dspark::{self, DraftCardBytes};
 use model::placement::accepts::{Program, routed_rule};
 use model::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, KvBytes, Machine, ModelTensor,
-    ModelTensors, PlacementError, Plan, PlanLevers, Role, workstation,
+    ModelTensors, Node, PlacementError, Plan, PlanLevers, Role, workstation,
 };
 
 /// One card's pinned totals, and the n_l band on the layers that can hold experts.
@@ -1343,14 +1343,18 @@ fn tier_takes_the_next_ranks_evenly() {
     let machine = Machine {
         cards: vec![stage.clone()],
         tiers: vec![byte_card("tier1", 4 * EXPERT_Q4K, 0..0), t2],
-        host: workstation::host(),
-        unified: None,
+        nodes: vec![Node {
+            host: workstation::host(),
+            unified: None,
+        }],
     };
     let alone = Machine {
         cards: vec![stage],
         tiers: Vec::new(),
-        host: workstation::host(),
-        unified: None,
+        nodes: vec![Node {
+            host: workstation::host(),
+            unified: None,
+        }],
     };
     let base = placement::plan_with(&model, &alone, 4096, &NoKv, None).expect("no tier");
     let plan = placement::plan_with(&model, &machine, 4096, &NoKv, None).expect("tiers");
@@ -1401,8 +1405,10 @@ fn tier_card_runs_no_stage() {
         let machine = Machine {
             cards: vec![stage.clone()],
             tiers: vec![tier],
-            host: workstation::host(),
-            unified: None,
+            nodes: vec![Node {
+                host: workstation::host(),
+                unified: None,
+            }],
         };
         match placement::plan_with(&model, &machine, 4096, &NoKv, None) {
             Err(e @ PlacementError::Tier { .. }) => {

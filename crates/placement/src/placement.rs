@@ -228,46 +228,67 @@ pub struct UnifiedPool {
     pub bytes: u64,
 }
 
+/// One node of a machine: its host and, where its cards allocate from host
+/// memory, the pool they share.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Node {
+    pub host: Host,
+    /// The pool the node's cards and its host share, on a node whose card
+    /// allocates from host memory ([`workstation::unified_of`]); `None` where
+    /// each card has memory of its own.
+    pub unified: Option<UnifiedPool>,
+}
+
 /// The devices: the cards in stage order, the expert tier cards and the
-/// host. The NVMe tier has no figure here — it holds its tensors in place and
-/// never loads them.
+/// nodes. The NVMe tier has no figure here — it holds its tensors in place
+/// and never loads them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Machine {
     pub cards: Vec<Card>,
     /// Expert tier cards: no stage, only routed experts, planned after every
     /// stage card in this order.
     pub tiers: Vec<Card>,
-    /// The host of this process's node.
-    pub host: Host,
-    /// The pool of this process's node, which its cards and its host share,
-    /// on a machine whose card allocates from host memory
-    /// ([`workstation::unified_of`]); `None` where each card has memory of its
-    /// own.
-    pub unified: Option<UnifiedPool>,
+    /// The nodes, this process's first: the plan reads [`Machine::host`] and
+    /// [`Machine::unified`], both of `nodes[0]`.
+    pub nodes: Vec<Node>,
 }
 
 impl Machine {
+    /// This process's node, `nodes[0]`. A machine with no node is refused by
+    /// name: there is no host to plan beside.
+    fn this_node(&self) -> &Node {
+        self.nodes
+            .first()
+            .expect("a machine lists this process's node first")
+    }
+
+    /// This process's node, to change.
+    fn this_node_mut(&mut self) -> &mut Node {
+        self.nodes
+            .first_mut()
+            .expect("a machine lists this process's node first")
+    }
+
     /// The host of this process's node.
     #[must_use]
     pub fn host(&self) -> &Host {
-        &self.host
+        &self.this_node().host
     }
 
     /// The host of this process's node, to change.
     pub fn host_mut(&mut self) -> &mut Host {
-        &mut self.host
+        &mut self.this_node_mut().host
     }
 
-    /// The pool of this process's node ([`UnifiedPool`]); `None` where each
-    /// card has memory of its own.
+    /// The pool of this process's node ([`Node::unified`]).
     #[must_use]
     pub fn unified(&self) -> Option<UnifiedPool> {
-        self.unified
+        self.this_node().unified
     }
 
     /// The pool of this process's node, to change.
     pub fn unified_mut(&mut self) -> &mut Option<UnifiedPool> {
-        &mut self.unified
+        &mut self.this_node_mut().unified
     }
 
     /// Every card, stage cards then tiers: the index space of
@@ -3898,8 +3919,10 @@ mod tests {
         let machine = |stage: u64, tier: u64| Machine {
             cards: vec![bytes_card("stage", HEAD + stage * EXPERT, 0..3)],
             tiers: vec![bytes_card("tier", tier * EXPERT, 0..0)],
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         let whole = machine(24, 4);
         match plan_with(&model, &whole, 4096, &NoKv, None) {
@@ -3939,8 +3962,10 @@ mod tests {
         let machine = |stage: u64, tier: u64| Machine {
             cards: vec![bytes_card("stage", HEAD + stage * EXPERT, 0..3)],
             tiers: vec![bytes_card("tier", tier * EXPERT, 0..0)],
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         let hosted = |plan: &Plan<'_>| -> Vec<u64> {
             (0..model.layers)
@@ -4020,8 +4045,10 @@ mod tests {
         let machine = |layers: usize| Machine {
             cards: vec![bytes_card("stage", 1 << 30, 0..layers)],
             tiers: Vec::new(),
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         let (m1, m4) = (machine(1), machine(4));
         let levers = PlanLevers::default();
@@ -4081,8 +4108,10 @@ mod tests {
                 ..bytes_card("held", usable, 0..3)
             }],
             tiers: Vec::new(),
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         let held_machine = machine(Some(HEAD + 12 * EXPERT));
         let plan = plan_with(&model, &held_machine, 4096, &NoKv, None).expect("a held card plans");
@@ -4160,11 +4189,13 @@ mod tests {
                 tiers: Vec::new(),
                 // On a unified machine the host is the pool
                 // (`workstation::host_of`).
-                host: Host {
-                    usable_bytes: pool.unwrap_or(1 << 40),
-                    reserves: vec![("pinned".to_string(), pinned)],
-                },
-                unified: pool.map(|bytes| UnifiedPool { bytes }),
+                nodes: vec![Node {
+                    host: Host {
+                        usable_bytes: pool.unwrap_or(1 << 40),
+                        reserves: vec![("pinned".to_string(), pinned)],
+                    },
+                    unified: pool.map(|bytes| UnifiedPool { bytes }),
+                }],
             };
             let mut plan = plan_with(&model, &machine, 4096, &Kv, None).expect("plans");
             assert!(plan.host.experts > 0, "the host holds experts");
@@ -4240,8 +4271,10 @@ mod tests {
                 ..bytes_card("card", usable, 0..3)
             }],
             tiers: Vec::new(),
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         let (none, idle, busy, budgeted) = (
             machine(None),
@@ -4292,8 +4325,10 @@ mod tests {
                 ..bytes_card("held", usable, 0..3)
             }],
             tiers: Vec::new(),
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         let held = machine(HEAD - 1);
         match plan_with(&model, &held, 4096, &NoKv, None) {
@@ -4345,8 +4380,10 @@ mod tests {
                 ..bytes_card("stage", HEAD + 24 * EXPERT + 100_000, 0..3)
             }],
             tiers: Vec::new(),
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         let plan_at = |budget: u64, beside: u64| {
             let levers = PlanLevers {
@@ -4442,8 +4479,10 @@ mod tests {
                 ..bytes_card("held", usable, 0..3)
             }],
             tiers: Vec::new(),
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         let plan_at = |free: u64, beside: u64| {
             plan_routed_reserving(
@@ -4656,8 +4695,10 @@ mod tests {
         let machine = Machine {
             cards: vec![bytes_card("dev", usable, 0..3)],
             tiers: vec![bytes_card("dev", usable, 0..0)],
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         match plan_with(&model, &machine, 4096, &NoKv, None) {
             Err(e @ PlacementError::DeviceTwice { .. }) => assert_eq!(
@@ -4698,8 +4739,10 @@ mod tests {
         let machine = |a, b| Machine {
             cards: vec![on(bytes_card("3090", usable, 0..3), a)],
             tiers: vec![on(bytes_card("3090", usable, 0..0), b)],
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         let two = machine(dev(0), dev(1));
         let plan = plan_with(&model, &two, 4096, &NoKv, None).expect("two 3090s");
@@ -4780,8 +4823,10 @@ mod tests {
                 ..bytes_card("stage", HEAD + 12 * EXPERT + 6_000 + 5_000, 0..3)
             }],
             tiers: Vec::new(),
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         };
         let mut plan = plan_routed_reserving(
             &model,
@@ -4827,11 +4872,13 @@ mod tests {
             let machine = |usable: u64| Machine {
                 cards: vec![bytes_card("stage", HEAD + 12 * EXPERT, 0..3)],
                 tiers: Vec::new(),
-                host: Host {
-                    usable_bytes: usable,
-                    reserves: vec![(os.to_string(), 7_000), ("pool".to_string(), 1_000)],
-                },
-                unified: None,
+                nodes: vec![Node {
+                    host: Host {
+                        usable_bytes: usable,
+                        reserves: vec![(os.to_string(), 7_000), ("pool".to_string(), 1_000)],
+                    },
+                    unified: None,
+                }],
             };
             let probe = machine(1 << 40);
             let plan = plan_with(&model, &probe, 4096, &NoKv, None).expect("the plan");

@@ -23,7 +23,7 @@ use super::workstation::{
 };
 use super::{
     ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, Card, Device, KvBytes, Machine,
-    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Role, nvme_arena_of,
+    ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers, Role, nvme_arena_of,
     plan_routed_reserving,
 };
 use crate::accepts::{Program, routed_rule};
@@ -273,8 +273,10 @@ fn machine_a(spec: CardSpec) -> Machine {
     Machine {
         cards: vec![stage(spec)],
         tiers: Vec::new(),
-        host: host(),
-        unified: None,
+        nodes: vec![Node {
+            host: host(),
+            unified: None,
+        }],
     }
 }
 
@@ -311,8 +313,10 @@ fn machine_bp(stage_spec: CardSpec, tier: CardSpec) -> Machine {
                 tier_batch_staging_bytes(2560, 10, 4096) + 348_980_248,
             )],
         }],
-        host: h,
-        unified: None,
+        nodes: vec![Node {
+            host: h,
+            unified: None,
+        }],
     }
 }
 

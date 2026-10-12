@@ -34,7 +34,7 @@ use model::arch::qwen35moe::place::{
 };
 use model::placement::workstation::{CONTEXT, GRANULE, MARGIN, SCRATCH};
 use model::placement::{
-    Card, Host, Machine, ModelTensor, ModelTensors, PlanLevers, Role, UnifiedPool, Violation,
+    Card, Host, Machine, ModelTensor, ModelTensors, Node, PlanLevers, Role, UnifiedPool, Violation,
 };
 
 const CTX: u64 = 4096;
@@ -304,11 +304,13 @@ fn machine(usable: u64) -> Machine {
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
-        host: Host {
-            usable_bytes: u64::MAX,
-            reserves: Vec::new(),
-        },
-        unified: None,
+        nodes: vec![Node {
+            host: Host {
+                usable_bytes: u64::MAX,
+                reserves: Vec::new(),
+            },
+            unified: None,
+        }],
     }
 }
 

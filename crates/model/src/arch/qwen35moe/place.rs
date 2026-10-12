@@ -57,8 +57,8 @@ use crate::placement::workstation::{
     tier_batch_staging_bytes, unified_of,
 };
 use crate::placement::{
-    self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError,
-    Plan, PlanLevers, RoutedRule, Unimplemented, Violation, checked, joined,
+    self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Node,
+    PlacementError, Plan, PlanLevers, RoutedRule, Unimplemented, Violation, checked, joined,
 };
 
 use runtime::stores::{
@@ -1226,8 +1226,10 @@ pub fn machine_for_experts(
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
-        host: host_of(&card),
-        unified: unified_of(&card),
+        nodes: vec![Node {
+            host: host_of(&card),
+            unified: unified_of(&card),
+        }],
     }
 }
 
@@ -2056,11 +2058,13 @@ fn draft_machine() -> Machine {
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
-        host: Host {
-            usable_bytes: 0,
-            reserves: Vec::new(),
-        },
-        unified: None,
+        nodes: vec![Node {
+            host: Host {
+                usable_bytes: 0,
+                reserves: Vec::new(),
+            },
+            unified: None,
+        }],
     }
 }
 
@@ -2247,7 +2251,7 @@ mod tests {
         use super::super::{PROGRAM, card_routed, host_only_reason, routed_rule};
         use crate::placement::{
             self, Card, CardFormat, Device, Format, Host, KvBytes, Machine, ModelTensor,
-            ModelTensors, Plan, PlanLevers, Role,
+            ModelTensors, Node, Plan, PlanLevers, Role,
         };
 
         const MIB: u64 = 1 << 20;
@@ -2356,11 +2360,13 @@ mod tests {
                     reserves: Vec::new(),
                 }],
                 tiers: Vec::new(),
-                host: Host {
-                    usable_bytes: u64::MAX,
-                    reserves: Vec::new(),
-                },
-                unified: None,
+                nodes: vec![Node {
+                    host: Host {
+                        usable_bytes: u64::MAX,
+                        reserves: Vec::new(),
+                    },
+                    unified: None,
+                }],
             }
         }
 
@@ -2864,7 +2870,7 @@ mod tests {
         };
         use crate::placement::workstation::HostRead;
         use crate::placement::{
-            self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Plan,
+            self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Node, Plan,
             PlanLevers, Role, RoutedRule,
         };
 
@@ -2996,11 +3002,13 @@ mod tests {
                     reserves: Vec::new(),
                 }],
                 tiers: Vec::new(),
-                host: Host {
-                    usable_bytes: u64::MAX,
-                    reserves: Vec::new(),
-                },
-                unified: None,
+                nodes: vec![Node {
+                    host: Host {
+                        usable_bytes: u64::MAX,
+                        reserves: Vec::new(),
+                    },
+                    unified: None,
+                }],
             }
         }
 

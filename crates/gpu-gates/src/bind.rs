@@ -3587,7 +3587,7 @@ mod tests {
     fn the_residency38_room_reads_the_reserved_need() {
         use crate::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
         use model::placement::workstation::{HostNeed, HostRead};
-        use model::placement::{Host, Machine};
+        use model::placement::{Host, Machine, Node};
         use runtime::seqstate::Price;
         // Points of 1 GiB spaced 512 apart: a slot of 4,096 positions takes
         // eight and the host budget fits four, 4 GiB a slot.
@@ -3615,11 +3615,13 @@ mod tests {
             let mut machine = Machine {
                 cards: Vec::new(),
                 tiers: Vec::new(),
-                host: Host {
-                    usable_bytes: 0,
-                    reserves: Vec::new(),
-                },
-                unified: None,
+                nodes: vec![Node {
+                    host: Host {
+                        usable_bytes: 0,
+                        reserves: Vec::new(),
+                    },
+                    unified: None,
+                }],
             };
             reserve_checkpoints(&mut machine, seqs, 4_096).expect("a reserve");
             checkpoints_reserved(&machine)
@@ -4691,7 +4693,7 @@ mod tests {
             CHECKPOINTS_RESERVE, Seqs, check_reserve, checkpoints_pinned, checkpoints_reserved,
             glm_machine, reserve_checkpoints,
         };
-        use model::placement::{Host, Machine};
+        use model::placement::{Host, Machine, Node};
         use runtime::seqstate::{HOST_BUDGET, Price};
 
         /// One GLM checkpoint's bytes: 34 KDA layers' recurrent state and
@@ -4716,11 +4718,13 @@ mod tests {
             Machine {
                 cards: Vec::new(),
                 tiers: Vec::new(),
-                host: Host {
-                    usable_bytes: 0,
-                    reserves: vec![("os".to_owned(), os)],
-                },
-                unified: None,
+                nodes: vec![Node {
+                    host: Host {
+                        usable_bytes: 0,
+                        reserves: vec![("os".to_owned(), os)],
+                    },
+                    unified: None,
+                }],
             }
         }
 

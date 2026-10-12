@@ -21,7 +21,7 @@ use crate::placement::workstation::{
     CONTEXT, CardSpec, GRANULE, MARGIN, SCRATCH, host_of, unified_of,
 };
 use crate::placement::{
-    self, Card, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Violation,
+    self, Card, KvBytes, Machine, ModelTensors, Node, PlacementError, Plan, PlanLevers, Violation,
     checked, joined,
 };
 use runtime::stores::{kv_q8_row_bytes, kv_row_bytes};
@@ -61,8 +61,10 @@ pub fn machine(card: CardSpec, layers: usize, arena: u64) -> Machine {
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
-        host: host_of(&card),
-        unified: unified_of(&card),
+        nodes: vec![Node {
+            host: host_of(&card),
+            unified: unified_of(&card),
+        }],
     }
 }
 

@@ -14,7 +14,7 @@ pub use super::devices::{
     census_usable, device_on_host, label, listed_index, resolve, spec_of_device, visible,
     word_picks, workstation_spec,
 };
-use super::{Card, Host, HostTotals, Machine, PlacementError, Plan, UnifiedPool};
+use super::{Card, Host, HostTotals, Machine, Node, PlacementError, Plan, UnifiedPool};
 
 pub const MIB: u64 = 1 << 20;
 
@@ -238,8 +238,10 @@ pub fn plan_on(spec: CardSpec, layers: usize) -> Machine {
     Machine {
         cards: vec![card(spec, 0..layers, true)],
         tiers: Vec::new(),
-        host: host_of(&spec),
-        unified: unified_of(&spec),
+        nodes: vec![Node {
+            host: host_of(&spec),
+            unified: unified_of(&spec),
+        }],
     }
 }
 
@@ -259,8 +261,10 @@ pub fn plan_b(layers: usize) -> Machine {
             card(RTX_3090, CUT..layers, true),
         ],
         tiers: Vec::new(),
-        host: host(),
-        unified: None,
+        nodes: vec![Node {
+            host: host(),
+            unified: None,
+        }],
     }
 }
 
@@ -511,8 +515,10 @@ fn tiered(
     Machine {
         cards: vec![card(stage, 0..layers, true)],
         tiers,
-        host: h,
-        unified: unified_of(&stage),
+        nodes: vec![Node {
+            host: h,
+            unified: unified_of(&stage),
+        }],
     }
 }
 
@@ -1047,10 +1053,10 @@ pub fn host_room(meminfo: &str, levels: &[CgroupLevel<'_>]) -> Result<(u64, Host
 mod tests {
     use super::{
         A6000, ArenaGrant, CardSpec, CgroupLevel, DRAFT_RESERVE, DeviceInfo, HOST_DRIFT, Host,
-        HostNeed, HostRead, Machine, PLAN_ROOM, PlacementError, RTX_3090, TIER_BATCH_HOST_RESERVE,
-        TIER_BATCH_RESERVE, TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room,
-        cgroup_v2_path, host, host_room, mem_available, plan_a, plan_bp, plan_gate, plan_on,
-        plan_room, plan_tiers, spec_of_device, tier, tier_batch_bytes, unified_of,
+        HostNeed, HostRead, Machine, Node, PLAN_ROOM, PlacementError, RTX_3090,
+        TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, TierDraft, UnifiedPool, card,
+        cgroup_room, cgroup_v2_path, host, host_room, mem_available, plan_a, plan_bp, plan_gate,
+        plan_on, plan_room, plan_tiers, spec_of_device, tier, tier_batch_bytes, unified_of,
     };
 
     /// One plan room: `tools/ref/plan-room.sh --room`, the room
@@ -1085,8 +1091,10 @@ mod tests {
         Machine {
             cards: vec![card(spec, 0..layers, true)],
             tiers: Vec::new(),
-            host: host(),
-            unified: None,
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
         }
     }
 
@@ -1102,8 +1110,10 @@ mod tests {
         Machine {
             cards: vec![card(A6000, 0..layers, true)],
             tiers: vec![t],
-            host: h,
-            unified: None,
+            nodes: vec![Node {
+                host: h,
+                unified: None,
+            }],
         }
     }
 
