@@ -418,6 +418,7 @@ mod cli {
     use gguf::Split;
     use model::arch::Arch;
     use model::arch::qwen35moe::head_list::head_rows_of;
+    use model::arch::qwen35moe::hparams::Hparams;
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
     };
@@ -510,10 +511,19 @@ mod cli {
 
     /// The model file ([`ref_model_path`]) and its engine, read from its
     /// first shard's header: `qwen4exp` by its name, else `Arch::detect`'s
-    /// qwen3moe, qwen35moe or nemotron_h; any other file is refused by name.
+    /// qwen3moe, qwen35moe, nemotron_h or nemotron_h_moe; dense qwen35 also uses Body35.
+    /// Other files are refused by name.
     fn open_file() -> Result<(Split, Family), GateError> {
         let path = ref_model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        if file.architecture() == Some("qwen35") {
+            if file.value("qwen35.decision.type").is_some() {
+                return Err(
+                    "a qwen35 decision model belongs to the decide seat, not generation".into(),
+                );
+            }
+            return Ok((file, Family::Qwen35));
+        }
         if file.architecture() == Some("qwen4exp") {
             return Ok((file, Family::Qwen38));
         }
@@ -526,7 +536,7 @@ mod cli {
             Arch::NemotronH => Ok((file, Family::NemotronH)),
             Arch::NemotronHMoe => Ok((file, Family::NemotronHMoe)),
             other => Err(format!(
-                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen4exp, \
+                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen35, qwen4exp, \\
                  nemotron_h and nemotron_h_moe files",
                 path.display(),
                 file.architecture().unwrap_or(other.name())
@@ -1607,7 +1617,15 @@ mod cli {
                 (Chosen::Qwen3(Body::path(prefill)?, place), None, lane)
             }
             Family::Qwen35 => {
-                draft_refused_on_other(&levers, family)?;
+                if file.architecture() == Some("qwen35") {
+                    if levers.draft().is_some_and(|w| w != "off") {
+                        return Err(
+                            "BLOOMERY_DRAFT: dense qwen35 generation serves no draft".into()
+                        );
+                    }
+                } else {
+                    draft_refused_on_other(&levers, family)?;
+                }
                 let (place, lane) = place_q3(place.as_deref(), prefill)?;
                 (Chosen::Qwen35(Body35::path(prefill)?, place), None, lane)
             }
@@ -2383,9 +2401,11 @@ mod cli {
         lane: Lane,
         t: Instant,
     ) -> Result<Qwen35moeModel, GateError> {
+        let arch = file.architecture().unwrap_or("<missing>").to_owned();
+        let hp = Hparams::read(&file)?;
         let o = Open35 {
             ctx,
-            mma: true,
+            mma: bloomery_gpu_gates::qwen_seat::decode_mma(hp.head_dim, hp.n_head / hp.n_head_kv)?,
             ubatch: ubatch_size()?,
             kv,
             media: false,
@@ -2441,7 +2461,7 @@ mod cli {
             record::lane(card, rate).print();
         }
         println!(
-            "load arch=qwen35moe resident_bytes={} ctx={ctx} cache={} layers={} mode={} \
+            "load arch={arch} resident_bytes={} ctx={ctx} cache={} layers={} mode={} \
              flash_mma={} store_bytes={} ubatch_attn=gqa_prefill_flash_256 ubatch={} in {:.1} s \
              (runtime value)",
             m.resident_bytes(),

@@ -1,5 +1,5 @@
-//! A placed load of a qwen3moe (Qwen3-30B-A3B) or qwen35moe
-//! (Qwen3.6-35B-A3B) file, as `generate_qwen3moe` and the qwen3 serve seat
+//! A placed load of qwen3moe (Qwen3-30B-A3B), qwen35moe
+//! (Qwen3.6-35B-A3B), or dense qwen35, as `generate_qwen3moe` and the qwen3 serve seat
 //! open one under `--place`: the placement word's stage card
 //! (`generate::Place`, an alias or a card list of one card; a tier card is
 //! refused by name, the program hangs none), the machine
@@ -39,11 +39,11 @@ use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, choose_ctx, short_in};
 use bloomery_gpu_gates::image_plan;
+use bloomery_gpu_gates::qwen_seat::{Family, decode_mma};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{checkpoints_pinned, reserve_checkpoints};
 use bloomery_levers::{HostCfg, Levers};
 use gguf::Split;
-use model::arch::Arch;
 use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
@@ -377,7 +377,11 @@ impl PlaceQ3 {
         )?;
         Ok(PlaceQ3 {
             place,
-            arch: "qwen35moe",
+            arch: if file.architecture() == Some("qwen35") {
+                "qwen35"
+            } else {
+                "qwen35moe"
+            },
             inputs,
             kv: o.kv,
             seqs,
@@ -831,7 +835,6 @@ pub fn unplaced_qwen35_slots(
 )]
 #[derive(Clone, Copy)]
 pub struct ServeOpts<'a> {
-    pub arch: Arch,
     pub place: Option<Place>,
     pub levers: &'a PlanLevers,
     pub kv: KvQ8,
@@ -863,20 +866,21 @@ pub enum ServeLoad {
     },
 }
 
-/// What a qwen35moe file's serve load opens at with a `ctx`-row cache: the
-/// tensor-core decode flash, the levers' ubatch and the `kv` planes, as
+/// What a Body35 file's serve load opens at with a `ctx`-row cache: the
+/// decode flash selected from its head shape, the levers' ubatch and the `kv` planes, as
 /// `generate_qwen3moe` opens it, with `media`'s rotation tables.
 ///
 /// # Errors
-/// The ubatch lever's refusal.
+/// The file's head shape or the ubatch lever's refusal.
 #[allow(
     dead_code,
     reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
 )]
-pub fn serve_open35(ctx: usize, kv: KvQ8, media: bool) -> Result<Open35, GateError> {
+pub fn serve_open35(split: &Split, ctx: usize, kv: KvQ8, media: bool) -> Result<Open35, GateError> {
+    let hp = model::arch::qwen35moe::hparams::Hparams::read(split)?;
     Ok(Open35 {
         ctx,
-        mma: true,
+        mma: decode_mma(hp.head_dim, hp.n_head / hp.n_head_kv)?,
         ubatch: bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size()?,
         kv,
         media,
@@ -899,9 +903,12 @@ pub fn serve_load(
     (total, slots): (usize, usize),
     o: ServeOpts<'_>,
 ) -> Result<ServeLoad, GateError> {
-    let unplaced = match (o.arch, o.place) {
-        (Arch::Qwen35moe, Some(p)) => {
-            let at = share(&serve_open35(total, o.kv, o.media)?, total, slots);
+    let unplaced = match (
+        Family::from_name(split.architecture().unwrap_or("<missing>")),
+        o.place,
+    ) {
+        (Some(Family::Qwen35moe | Family::Qwen35), Some(p)) => {
+            let at = share(&serve_open35(split, total, o.kv, o.media)?, total, slots);
             let seqs = seqs_qwen35(split, at.ubatch, slots)?;
             let q = PlaceQ3::qwen35_on(split, p, census, at, seqs, o.beside)?;
             let plan = q.plan(total, o.levers)?;
@@ -913,12 +920,12 @@ pub fn serve_load(
                 whole,
             });
         }
-        (Arch::Qwen35moe, None) => {
-            let open = serve_open35(total, o.kv, o.media)?;
+        (Some(Family::Qwen35moe | Family::Qwen35), None) => {
+            let open = serve_open35(split, total, o.kv, o.media)?;
             let seqs = seqs_qwen35(split, open.ubatch, slots)?;
             unplaced_qwen35_slots(split, census, &open, seqs, o.beside)?
         }
-        (_, Some(p)) => {
+        (Some(Family::Qwen3moe), Some(p)) => {
             let q = PlaceQ3::qwen3_on(split, p, census, total, o.kv, o.beside)?;
             let plan = q.plan(total, o.levers)?;
             let whole = q.whole_card_qwen3(split, &plan, (total, slots))?;
@@ -929,7 +936,16 @@ pub fn serve_load(
                 whole,
             });
         }
-        (_, None) => unplaced_qwen3_slots(split, census, total, slots, (o.kv, o.beside))?,
+        (Some(Family::Qwen3moe), None) => {
+            unplaced_qwen3_slots(split, census, total, slots, (o.kv, o.beside))?
+        }
+        (None, _) => {
+            return Err(format!(
+                "the Qwen generative planner refuses architecture {:?}",
+                split.architecture()
+            )
+            .into());
+        }
     };
     Ok(match unplaced {
         Unplaced::Whole(card) => ServeLoad::Whole(card),
