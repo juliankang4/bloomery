@@ -1,16 +1,36 @@
 # tierengine — one tier engine for expert placement across card, RAM and NVMe (design, Fable 5.1, 2026-10-11)
 
+This is the design of one tier engine for MoE experts held on the card, in host RAM and on NVMe. One ledger, one NVMe
+reader and one memory policy replace today's two readers, two heat sources and two memory policies (§1). The same code
+serves a discrete card and a DGX Spark (GB10), whose CPU and GPU share one memory pool, so the card reads host pages
+in place.
+
+As of main `9bd7d577`, S1 (refill) has landed and part of S0 has; a contributor holds S7, its card leg and S13's
+placement half (§5). DGX Spark measurements answered five of the six questions (k) asked and changed three inputs:
+a hit's price on GB10 now rests on whole-line loads over 128-B aligned parts, a fill at QD 3 (three reads in flight to
+the drive) takes longer than (j) interpolated, and one link rail moves faster than the cited rate (§6).
+
+§1 and §2 describe the engine the design started from, §3 is the target, §4 the cost model on the maintainers' box,
+§5 the steps and their status, §6 the DGX Spark measurements, §7 the work in flight when the design was written, §8
+the decisions and §9 the prior work. The provenance, tags and terms follow.
+
 Round `tierengine` (unitier, read-only; no code, no box run, no lease). Tree read: the r4d branch at
 WIP `7cec21ad` (R4d-a landed; r4db2's uncommitted edits in `lane.rs`, `record.rs`, `gate_qwen38_serve.rs` not read).
 Round `tierengine2` (Fable 5.1, 2026-10-11) added §3 (g)–(l) (host RAM, unified memory, the GPU's NVMe path, read
-granularity, N-node Spark, KV + placement), S10–S13 in §5, six rows in §6 and questions 7–12 in §7; the Spark numbers
+granularity, N-node Spark, KV + placement), S10–S13 in §5, six rows in §7 and questions 7–12 in §8; the Spark numbers
 are the contributor's (#13, #17), the main-tree lines (`workstation.rs`, `ctx.rs`, `checkpoint/`) are read on main.
 Tags: [measured, source] a printed number; [derived] arithmetic from code and measured terms; [assumption] stated.
 Lines are the r4d tree's unless a path says otherwise. "S" = slots a paged layer carves, "B" = union batch (16),
 "fill" = one expert's three parts read into its slot (Qwen3.8: 3.134 MB, slot 3.16 MB).
+A "part" is one of an expert's three tensors (gate, up, down); "WC" is write-combined host memory
+(`CU_MEMHOSTALLOC_WRITECOMBINED`); "QD" is queue depth, the reads in flight to the drive. Design notes cited by path
+or round name (`r4/decisions.md`, `plan-triage.md`, rig-log, spark2x, attach-design, the r4d rounds) are not in this
+repository; they name a source.
 
-## 1. The current shape, as built
+## 1. The engine as built
 
+This section is a snapshot of the r4d tree at WIP `7cec21ad`, before S1 and R4d-c landed; its line numbers are that
+tree's and were not read again.
 Two syscall-level readers of expert bytes exist: (A) `O_DIRECT` `pread` into the anonymous arena — one body,
 `read_pick` (`crates/gpu/src/host/nvtier.rs:2240`: `give_back` of the evicted slot's pages at `:2243`, then three
 `read_into` at `:2250` → `DirectFile::read_span` `crates/engram/src/direct.rs:111`, `read_at` `:205`, `O_DIRECT` `:38`) —
@@ -37,7 +57,10 @@ Threads on a paged Qwen3.8 load: the pool (32), the step thread, `nvtier-fill` �
 is a third executor with its own ring and deadline that no longer reads NVMe for arena ids (R4d-a) but still blocks on
 the reader under its receive lock, and still faults the mapping for an unfilled id.
 
-## 2. Per-common-owner attach table
+## 2. Owners per model
+
+Each row is one owner that every model shares: the model columns say where each model attaches to it, and the last
+column is what an architecture fact keeps per model.
 
 | Owner (one place) | V4.1 | GLM-5.3-Flash | Qwen3.8 | MiMo (`gpu-mimo2`) | What an architecture fact forces (stays per model) |
 |---|---|---|---|---|---|
@@ -55,6 +78,22 @@ build beside `model.rs:1710`, the room field copied per family, and the per-fami
 `RoomShort` to three `*Why` enums).
 
 ## 3. The target architecture
+
+The target makes three decisions: heat moves into the slot book, so one ledger ranks every move ((a)); the reader
+becomes the only NVMe reader of paged ids ((b)); and the memory kind becomes a parameter of one memory policy ((d)).
+The subsections:
+- (a) one slot book per layer across card slots and the RAM arena;
+- (b) one I/O scheduler;
+- (c) decode prefetch;
+- (d) the memory kind behind one policy;
+- (e) the off rule;
+- (f) records;
+- (g) host RAM: its terms, the split, the owner, the page cache's limit;
+- (h) unified memory on GB10, and where the arena sits;
+- (i) how the GPU reaches NVMe;
+- (j) read granularity, queue depth, prefetch depth, bytes in flight;
+- (k) N-node Spark;
+- (l) KV and placement in one policy.
 
 ### (a) One slot book per layer across card slots and the RAM arena
 
@@ -150,7 +189,7 @@ segment + dense tensors, populated at load, and the page cache's size is the pla
 The budget is asserted, not managed: `mapping_reads == 0` for paged ids (r4da measured 0, the first anchor), `drops ==
 0` once the dropper retires, and a census line `page_cache_bytes` beside `HostNeed` (from `/proc/self/smaps_rollup`'s
 file-backed RSS) printed per span. `BLOOMERY_HOST_LOCK=1` on a paged plan keeps the kernel from reclaiming the host
-segment under the arena's writes (attach-design Part 2's lower-bound caveat) — a default the user decides (§7).
+segment under the arena's writes (attach-design Part 2's lower-bound caveat) — a default the user decides (§8).
 
 ### (e) The off rule
 
@@ -187,7 +226,7 @@ allocatable [measured, #13]) less the cards' share (`HostNeed.cards`, PR #16). T
 
 | Term | Discrete (box) | GB10 | Class | Owner / rule |
 |---|---|---|---|---|
-| host segment (`experts`: what the CPU computes) | the paged plan's host picks, populated at load, locked under `HOST_LOCK` (§7 Q4) | 0 — the CPU computes nothing (`docs/contrib/dgx-spark.md` §8: 20 cores beside 48 SMs on one 273 GB/s add contention) | fixed | placement (`expert_nvme_tier`'s H/2 rule, `placement.rs:2864`) |
+| host segment (`experts`: what the CPU computes) | the paged plan's host picks, populated at load, locked under `HOST_LOCK` (§8 Q4) | 0 — the CPU computes nothing (`docs/contrib/dgx-spark.md` §8: 20 cores beside 48 SMs on one 273 GB/s add contention) | fixed | placement (`expert_nvme_tier`'s H/2 rule, `placement.rs:2864`) |
 | `tables`, `shadows` | engram row tables when on host; V4.1's window shadows, pinned (`deepseek41/kv.rs` module doc) | the same bytes, in the pool | fixed | placement (role rule) |
 | `arena` (the NVMe tier's slots) | `AnonMap`; `NVTIER_BYTES` or the H/2 rule; r4b shape 21.47 GB, S ≈ 141 | `cuMemHostAlloc` WC, counted as card bytes ((h)) | budgeted, elastic down to `ArenaFloor` 2B+1 = 33 slots a layer (`:2686`) | placement sizes it; the engine fills it |
 | churn pool (adaptive residency's host share) | the card's experts past `pinned` (`churn.rs` header: "the plan's host headroom … must take the pool's bytes"); 0 on a paged stack | 0 (no card mover, (h)) | budgeted | placement |
@@ -231,9 +270,10 @@ read efficiently by most CPUs" (https://docs.nvidia.com/cuda/cuda-driver-api/gro
 
 Decision — one policy, the memory kind as its parameter:
 1. **The tier states collapse from four to two on GB10.** `Card`, `Arena` and the host segment are one state, `Pool`
-   (a slot the card reads in place at 235 GB/s = `cuMemAlloc`'s 233: a copy between them saves 0 bytes a use and costs
-   2 × 3.134 MB of pool traffic a fill); `File` stays. Card residency on GB10 *is* arena residency: a layer's "card
-   experts" are the slots of the one arena, S_pool = ⌊(pool − dense − KV − floor) / slot bytes / layers⌋; the card
+   (a slot the card reads in place at 235 GB/s = `cuMemAlloc`'s 233 for sequential rows, and a random slot gather
+   keeps that rate only with whole-line loads over 128-B aligned parts, §6.2 row 1; a copy between them saves 0 bytes
+   a use and costs 2 × 3.134 MB of pool traffic a fill); `File` stays. Card residency on GB10 *is* arena residency: a
+   layer's "card experts" are the slots of the one arena, S_pool = ⌊(pool − dense − KV − floor) / slot bytes / layers⌋; the card
    mover is `off` with the why `Unified` (no second level to move to); the book's heat ranks eviction (arena → file)
    and the lookahead's prefetch (file → arena) only. Promotion is the fill itself. The step port's leg is the card leg
    (`TierLeg::Card`): `TierPin` yields `device_slot(layer, id, part) -> u64` (Q18) from `cuMemHostGetDevicePointer` on
@@ -243,22 +283,29 @@ Decision — one policy, the memory kind as its parameter:
    Q18's plan. The `Registered` variant goes (157–160 GB/s registered or not [measured, #13]: worth 0). On discrete the
    arena stays `Anon`: the CPU reads it 480 picks a token, WC "cannot be read efficiently by most CPUs", and the
    27.8 GB/s streaming figure says nothing about qdot's 32-B row walks. `give_back` is a no-op on `Pinned` ((d)): the
-   arena is a fixed pool allocation priced at load, counted in `HostNeed.cards` / `pool_card_bytes` (`placement.rs:859`),
-   and a `MADV_DONTNEED` would only split the device alias (D1). A fill overwrites the slot's windows; the DMA write of
+   arena is a fixed pool allocation priced at load (a linear cost in its size, §6.2 row 2), counted in
+   `HostNeed.cards` / `pool_card_bytes` (`placement.rs:859`), and a `MADV_DONTNEED` would only split the device alias
+   (D1). A fill overwrites the slot's windows; the DMA write of
    3.134 MB into the pool is 13 µs of the 235 GB/s [derived], paid once, no copy after it.
 3. **The pool's budget is one number.** #16's `PoolOver` (Σ card + host ≤ `MemAvailable`) stays the refusal; the
    arena's `cards` term makes the (g) table's "arena" and "card experts" rows one row on GB10. A model above the pool
    (GLM UD-Q4_K_XL 199.7 GB, V4.1 Q3_K_M 347 GB) is the only reason the NVMe tier exists there; a model inside it
    (Qwen3.8 UD-Q4_K_XL 111.3 GB) plans every expert into `Pool`: S = all, 0 fills.
-4. **Per fill on GB10** [derived from #13's drive]: 3 parts of ~1.045 MB at QD 3 ≈ 7.3 GB/s (Q1 3.73 → Q4 8.29,
-   interpolated) = 0.43 ms; 0.28 ms at the 11.2 GB/s plateau; the CPU's part is three preads (≈ 30 µs [assumption,
-   10 µs a pread]). A hit costs the card 3.134 MB / 235 GB/s = 13 µs an expert: the host leg's 23.6 µs and the whole
-   host-CPU row of (c)'s timeline are gone on GB10. Above the pool the decode wall is card bytes at 235 + fills ×
-   0.28–0.43 ms: GLM on one Spark, 88 GB paged [spark2x capacity row], at the box's gate-plan miss rate (45.7 fills a
-   token [measured]) adds 13–20 ms to a ~50 ms step [derived; the Spark's own miss rate is (k)'s ask #4].
+4. **Per fill on GB10** [derived from the drives of §6.2 row 3]: 3 parts of ~1.045 MB at QD 3 ≈ ~~7.3 GB/s (Q1 3.73 → Q4
+   8.29, interpolated) = 0.43 ms~~ 4.57 to 5.45 GB/s [measured] = 0.58 to 0.69 ms [derived] ([#13 k-rows][krows]). That
+   is one fill's share of a 48-part batch read at QD 3; a fill of 3 parts timed alone took 0.61 to 1.34 ms (§6.2 row
+   3). At the 11.2 GB/s plateau a fill takes 0.28 ms (#13's 1 MiB loop at QD 16 to 32 on its 4 TB drive, not a decode
+   fill's QD 3). The CPU's part is three preads (≈ 30 µs [assumption, 10 µs a pread]). A hit costs the card 3.134 MB /
+   ~~235~~ 241.4 GB/s = 13 µs an expert [derived], read with whole-line loads over 128-B aligned parts ([#13
+   k-rows][krows]; today's slower gather is in §6.2 row 1). The host leg's 23.6 µs and the whole host-CPU row of (c)'s
+   timeline are gone on GB10. Above the pool the decode wall is card bytes at 235 (slot hits ~~235~~ 241.4, as above) +
+   fills × a fill (0.28 ms at the plateau, ~~0.43 ms~~ 0.58 to 0.69 ms at QD 3): GLM on one Spark, 88 GB paged [spark2x
+   capacity row], at the box's gate-plan miss rate (45.7 fills a token [measured]) adds 13 ms at the plateau and ~~20
+   ms~~ 26.5 to 31.5 ms at QD 3 [derived: 45.7 fills × a fill's batch share], up to about 61 ms with the fill timed
+   alone [derived: 45.7 × 1.34], to a ~50 ms step [derived; the Spark's own miss rate is (k)'s ask #4, §6.2 row 4].
 
-Still unmeasured after #13: a `_sel`-shaped gather (random slot rows, 32-B strided) from WC pages against the
-sequential `hostread2` rows kernel, and the time of one ≥ 60 GB `cuMemHostAlloc` ((k)'s #1 and #2).
+Measured since (§6.2 rows 1 and 2): a `_sel`-shaped gather (random slot rows, 32-B strided) from WC pages against the
+sequential `hostread2` rows kernel, and the time of one ≥ 60 GB `cuMemHostAlloc`.
 
 ### (i) How the GPU reaches NVMe: host bounce, GDS/cuFile, or the in-place read
 
@@ -280,9 +327,9 @@ Per expert (Qwen3.8: 3.134 MB a fill, 3.16 MB a slot) [derived from the measured
 | Path | Drive bytes | DRAM / pool passes | CPU bytes copied | CPU time | Latency until the leg can read it |
 |---|---|---|---|---|---|
 | A. host bounce, discrete, `Anon` (today): `O_DIRECT` → slot; a promotion stages slot → ring (memcpy) → H2D | 3.134 MB | write 3.134; a promotion reads 3.16 + writes 3.16 | 3.16 MB, promotions only | 3 preads ≈ 30 µs [assumption]; a promotion's memcpy at ~10 GB/s one thread ≈ 0.3 ms [assumption] | fill 0.64 ms (QD 3) + promotion 0.3 + H2D 3.16 / 26.28 GB/s = 0.12 ms |
-| A′. as A, `Pinned` arena (§7 Q5): the lane DMAs from the slot | 3.134 | write 3.134; the DMA reads 3.16 | 0 | 30 µs | 0.64 + 0.12 |
+| A′. as A, `Pinned` arena (§8 Q5): the lane DMAs from the slot | 3.134 | write 3.134; the DMA reads 3.16 | 0 | 30 µs | 0.64 + 0.12 |
 | B. GDS/cuFile direct, A6000 only: drive → VRAM | 3.134 | 0 | 0 | the cuFile call | 0.64–1.25 ms, paid per card use |
-| C. GB10 in-place: `O_DIRECT` → WC arena; the SMs read it | 3.134 | write 3.134 | 0 | 30 µs | 0.28–0.43 ms; nothing after |
+| C. GB10 in-place: `O_DIRECT` → WC arena; the SMs read it | 3.134 | write 3.134 | 0 | 30 µs | a fill: 0.28 ms at #13's 1 MiB plateau; at QD 3 ~~0.43 ms~~ (measured: §6.2 row 3); nothing after |
 | C′. GB10 cuFile compat: POSIX read → bounce → copy into `cuMemAlloc` | 3.134 | write 3.134 + read 3.134 + write 3.134 | 3.134 MB | the read + the copy | ≥ C + 3.134 / ~100 GB/s ≈ C + 0.03 ms, plus page-cache bytes (no `O_DIRECT`) |
 
 Decision: **host bounce on discrete, in-place on GB10, one code path — `O_DIRECT` into the arena's slot, and the leg
@@ -306,13 +353,13 @@ read wastes ≤ 2 partial pages = ≤ 8 KiB, 0.8 % of 1.045 MB [derived]; a 1/8-
 
 | Choice | Rule | Box | Spark |
 |---|---|---|---|
-| unit | the part (3 a fill), as (b) and S2 | 1.045 MB = 1 command; a fill at QD 3 ≈ 4.9 GB/s (4.15 → 5.67 interpolated) = 0.64 ms vs 1.25 serial [derived] | 1 MiB = 8 commands; QD 3 ≈ 7.3 GB/s = 0.43 ms [derived] |
-| sub-unit (S2b: only if S2's measured QD-3 fill is ≥ 0.6 ms) | part / 3 ≈ 350 KB, so one fill carries 9 units ≥ the knee | QD 9 ≈ 6.5 GB/s: 0.48 ms, −0.16 ms a fill = −7 ms a token at 45.7 fills (−8 % of 85) [derived]; +6 preads ≈ +60 µs CPU across threads; waste 2.3 % | ≈ Q9 ~10 GB/s [interpolated Q4 8.29 → Q16 11.16]: 0.31 ms, −0.12 a fill |
-| queue depth (reader threads) | the plateau's QD | 16 (6.77; QD 8 is 96 % of it) | 16 (11.16; Q32 11.20) |
+| unit | the part (3 a fill), as (b) and S2 | 1.045 MB = 1 command; a fill at QD 3 ≈ 4.9 GB/s (4.15 → 5.67 interpolated) = 0.64 ms vs 1.25 serial [derived] | 1 MiB = 8 commands; QD 3 ~~≈ 7.3 GB/s = 0.43 ms [derived]~~ (measured: §6.2 row 3) |
+| sub-unit (S2b: only if S2's measured QD-3 fill is ≥ 0.6 ms) | part / 3 ≈ 350 KB, so one fill carries 9 units ≥ the knee | QD 9 ≈ 6.5 GB/s: 0.48 ms, −0.16 ms a fill = −7 ms a token at 45.7 fills (−8 % of 85) [derived]; +6 preads ≈ +60 µs CPU across threads; waste 2.3 % | ~~≈ Q9 ~10 GB/s [interpolated Q4 8.29 → Q16 11.16]: 0.31 ms, −0.12 a fill~~ (derived again from the measured rates: §6.2 row 3) |
+| queue depth (reader threads) | the plateau's QD | 16 (6.77; QD 8 is 96 % of it) | 16 (11.16; Q32 11.20), #13's 1 MiB loop; parts at QD 16: §6.2 row 3 |
 | background share during steps | Victim + Prefetch ≤ the knee, so a Step's 3 units take threads at once | ≤ 8 threads: a Step unit never waits a background unit's sojourn (16.7 MB / 6.77 GB/s = 2.47 ms at a full QD 16) | ≤ 8 |
 | prefetch depth, decode | one layer ahead: a layer's compute (37 ms / 48 = 0.77 ms at the gate plan) ≥ a QD-3 fill (0.64) hides it; two ahead hides nothing more and doubles the (1 − r) waste [derived] | 1 layer, ≤ 3 × misses units (≈ 3 at 0.95 miss a layer) | 1 layer |
 | prefetch depth, prompt | one batch ahead (built): 16 picks = 48 units = QD 16 | 48 units | 48 units |
-| bytes in flight (Little: L = N / R) | at the plateau | 16 × 1.045 = 16.7 MB; a unit's sojourn 2.47 ms (the prompt's regime); an idle-queue Step fill sees QD 3: 0.64 ms | 16.8 MB; 1.5 ms; Step 0.43 ms |
+| bytes in flight (Little: L = N / R) | at the plateau | 16 × 1.045 = 16.7 MB; a unit's sojourn 2.47 ms (the prompt's regime); an idle-queue Step fill sees QD 3: 0.64 ms | 16.8 MB; 1.5 ms (both at #13's 1 MiB plateau); Step ~~0.43 ms~~ (measured: §6.2 row 3) |
 
 This amends (b)'s "shares, not reservations" by one number: a background class holds at most 8 of the 16 threads while
 a step runs, and any thread between steps (the prompt batch is all 16). The per-drive parameters (`max_sectors_kb`,
@@ -327,8 +374,8 @@ Gigabits per second (Gb/s)"; the NIC reaches the SoC "through two independent PC
 three DGX Spark systems connected directly through cables, and up to four systems when using a switch"; "The QSFP ports
 support Ethernet configuration only". No GPUDirect RDMA on GB10 (the porting guide, quoted in `docs/contrib/dgx-spark.md`
 §9.1): the NIC reaches only `cudaHostAlloc` pages — which the WC arena *is*. One cable measured 189.85 Gb/s = 23.7 GB/s
-a direction, one rail and QP 92.57 Gb/s = 11.6 GB/s (NVIDIA's playbook, dgx-spark.md §9.1). λ (one round trip) is unmeasured;
-spark2x derives 25–70 µs.
+a direction, one rail and QP 92.57 Gb/s = 11.6 GB/s (NVIDIA's playbook, dgx-spark.md §9.1). λ (one round trip) is ~~unmeasured~~
+measured on two DGX Sparks ([#44][lambda]; the value is in `docs/contrib/dgx-spark.md` §9.1); spark2x derives 25–70 µs.
 
 Decision — **a per-node engine over a static placement split** (spark2x Q4's shape), by three numeric criteria:
 - **C1, claims are local.** Books per node, `(node, layer, id) → state`, each node its own `NvTier` over its own pool
@@ -336,29 +383,27 @@ Decision — **a per-node engine over a static placement split** (spark2x Q4's s
   claims a token × 2 messages × 25–70 µs = 24–67 ms against a 20–50 ms step → refused for every N ≥ 2. The rule: λ ×
   remote claims a token ≤ 1 % of the step (≤ 3–12 claims a token), which only a local book meets.
 - **C2, no remote-arena tier.** The I/O scheduler is per node: a node's misses go to its own drive (a 4 TB Gen5 part
-  each, 11.2 GB/s plateau each — drives scale with N, rails do not). Node j's pool as node 0's slow tier (a fetch of
-  3.134 MB a use at 11.6 GB/s + λ = 0.30–0.34 ms) pays only when the id is reused ≥ 0.30 / 0.013 ≈ 23 times before
-  node 0 evicts it, since node j computes it in place in 13 µs + λ — a hot id the split already homes where it is
-  used. The NVMe plateau (11.2) equals one rail (11.6): the link is not a faster drive.
+  each, 11.2 GB/s plateau each — drives scale with N, rails do not). Drives differ between units: 11.2 GB/s is one
+  unit's 4 TB Gen5 drive ([#13 drive][drive13]), and a 1 TB Gen4 DRAM-less unit reads less ([#71][drive71], §6.2 row 3).
+  Node j's pool as node 0's slow tier (a fetch of 3.134 MB a use at ~~11.6 GB/s + λ = 0.30–0.34 ms~~ the measured
+  13.63 GB/s plus λ_probe's p50 of 30 µs = 0.26 ms [derived, [#13 k-rows][krows]; `docs/contrib/dgx-spark.md` §9.1])
+  pays only when the id is reused ≥ ~~0.30 / 0.013 ≈ 23~~ 0.26 / 0.013 = 20 times before node 0 evicts it, since
+  node j computes it in place in 13 µs + λ — a hot id the split already homes where it is used. ~~The NVMe plateau
+  (11.2) equals one rail (11.6)~~ One rail moves 1.22 times the 11.2 GB/s drive plateau [derived,
+  [#13 k-rows][krows]]: the link is not a faster drive.
 - **C3, balance includes fills.** The window per layer is the max over nodes of (its slots × 13 µs + its misses ×
-  0.28–0.43 ms + λ for a remote); a node with the colder set bounds the step, so the balancer's objective gains the
-  predicted fills per node within 10 % of each other (spark2x's S2-ii extended to fills) beside S3's byte balance.
+  a fill (0.28 ms at the plateau, ~~0.43 ms~~ 0.58 to 0.69 ms [derived] at QD 3; (h) item 4) + λ for a remote); a
+  node with the colder set bounds the step, so the balancer's objective gains the predicted fills per node within 10 %
+  of each other (spark2x's S2-ii extended to fills) beside S3's byte balance.
 - Heat stays one source: node 0's tally ships E × L u32 = 512 × 48 × 4 B = 98 KB a window [derived] to each node for
-  its eviction; the cross-node mover (Pool@i ↔ Pool@j, 3.134 MB a move at 11.6 GB/s = 0.27 ms of NIC, off the step)
-  rebalances on heat drift under S4 (NIC ≤ 50 % of the step: ≤ 74 moves a token at a 40 ms step — never binding). The
+  its eviction; the cross-node mover (Pool@i ↔ Pool@j, 3.134 MB a move = ~~0.27 ms at 11.6 GB/s~~ 0.230 ms at the
+  measured 13.63 GB/s [derived, [#13 k-rows][krows]] of NIC, off the step) rebalances on heat drift under S4 (NIC
+  ≤ 50 % of the step: ≤ ~~74~~ 87 moves a token at a 40 ms step [derived, [#13 k-rows][krows]] — never binding). The
   split is static per load (each paged id has a home node from the byte ledger, S2-i per node); the runtime moves only
   inside a node's budgets; a home change is the mover's, never the plan's.
 
-The contributor's part — the Spark-only facts the design cannot derive, one command each:
-
-| # | Fact | Command (one) | The number decides | We build first |
-|---|---|---|---|---|
-| 1 | a `_sel`-shaped gather from WC pages: random slot rows, 32-B strided, vs `hostread2`'s sequential rows | `hostread2 2 host-wc` with a `ROWS=random` arm (≈ 20 lines on the comment's kernel; we post the patch on #13) | ≥ 200 GB/s → (h) as written; < 160 → each slot row gets a 128-B pad (a plan-bytes change) | nothing: the kernel is the contributor's |
-| 2 | one `cuMemHostAlloc(WC)` of 64 GiB: success and seconds | `FILL=$M hostread2 1 host-wc` with a 64 GiB size arg | ≤ 5 s → S7 prices the arena at load; failure → S7 allocates per layer (48 calls) | S7 (`ArenaMem::Pinned`, `device_slot`) |
-| 3 | the part-unit curve on the Spark's drive at our shape: 1.045 MB, QD 3 / 8 / 16, random offsets | `probe_nvread --threads 3,8,16 --file $M --unit 1045000` | QD-3 ≥ 7 GB/s → (j)'s unit holds; < 6 → S2b's tiles on the Spark | a plain-file arm of `probe_nvread` (today it opens a qwen4exp split set, #13) |
-| 4 | fills a token above the pool: GLM UD-Q4_K_XL on one Spark, 88 GB paged | `bloomery-serve … --place auto`, S0's `nvtier` record, one 512 prompt + 96 steps | fills × 0.43 ms against the step: > 20 % → (c)'s lookahead opens on GB10 first | S0 (records by kind), S7 |
-| 5 | λ and the 3 MiB-message rate on one rail | `ib_write_lat` / `ib_write_bw -s 3145728` between two Sparks (spark2x Q5's first step) | λ ≤ 70 µs → C1/C2 as derived; the move rate sets the mover's cap | nothing |
-| 6 | GB10 `c_node` | `cnode_probe --time` (sparkdec §9) | the lookahead's 48 launches a token (0.04 ms on the A6000) on GB10 | nothing: the bin exists |
+The six Spark-only facts the design could not derive went to a contributor; the asks, their results and the
+decisions they changed are in §6.
 
 ### (l) KV and placement in one policy
 
@@ -405,27 +450,6 @@ Owners (the §2 table's new row): the budget — placement (`within_cache`, the 
 each card's KV term in `CardTotals`); the pool — `crates/gpu/src/checkpoint/{saved,staging}.rs` (`SeqState`,
 `SaveLane`, `Staging::pinned` at load); per family only the state's composition.
 
-### Design followed, and where the three diverge
-
-- **Followed:** Mixtral offloading (Eliseev & Mazur, https://arxiv.org/abs/2312.17238: "accelerates offloading by
-  taking advantage of innate properties of MoE LLMs") for the LRU cache + gate lookahead pair — with the cache in host
-  RAM and the experts *computed on the host* (Fiddler's point, https://arxiv.org/abs/2402.07033: "strategically
-  utilizes CPU and GPU resources by determining the optimal execution strategy", 1.26× single batch), not copied to the
-  card; and a ranked single reader (MoE-Infinity's "sparsity-aware expert cache, which can trace the sparse activation
-  of experts during inference", https://arxiv.org/abs/2401.14361, uses traces for prefetch — ours uses the gate and the
-  prompt keep set, no trace at run time). Pre-gated MoE (https://arxiv.org/abs/2308.12066, "pre-gating function which
-  alleviates the dynamic nature of sparse expert activation") retrains the router — not applicable to a GGUF we do not
-  train.
-- **mistral.rs** (HEAD `b0f26d5cd` 2026-09-17, grep by a Haiku sweep): placement is
-  fixed at load (`device_map/mappers.rs:63` `set_device` per layer; activations move, `:50-52`), no expert cache, no
-  router prefetch; the only runtime weight copies are the diffusion `offloaded` path. Divergence: we move experts
-  between three tiers at run time.
-- **exllamav3**: no copy on the Mac (`/home/user/exllamav3-src` absent; stated, not read). Its README
-  (https://github.com/turboderp-org/exllamav3): "CPU offloading - Allows large MoE models to run with limited GPU
-  resources. AVX2 and AVX512 support." — no prefetch or cache named. ik stays the numeric oracle; its `-ot=CPU` is a
-  static split. Divergence from all three: a budgeted RAM arena with an NVMe tier behind it and the slot book as the one
-  ledger.
-
 ## 4. The cost model
 
 Per token unless named. r4b shape = A6000, plan a, ctx 3072, `BLOOMERY_HOST_ROOM=27G` + `BLOOMERY_NVTIER_BYTES=20G`
@@ -463,97 +487,143 @@ the long-decode curve (the second open term) says whether the A6000 shape ever l
 Each step lands alone (express) unless named; every step's A/B runs at a shape with fills (gate plan or n ≥ 1024) or
 is refused by its own card. "Deletes" is what leaves the tree in that step or the next.
 
-| # | Step | Class, proof | Gates, FAIL-first | The one box measurement, expected | Deletes |
-|---|---|---|---|---|---|
-| S0 | **Records by kind + the runner keeps arm stderr** (f): `KindStats.run_ns`, `{step,keep,transient}_*`, `fill_{fault,read}_ns`; `depth-qwen3moe.sh`/`ab-decode.sh` write `<log>.arm<n>.err` and fold `nvtier`/`residency` into the row | records (Kind change → `records-refresh`); host only, ptx-scan identical | `gate-gpu-nvtier` kind test (re-pinned with its derivation); runner self-test: an arm without stderr → red | none (a functional gate run prints the keys; the fault/read split is read on the next card as a beside field) | `count_fill`'s `pinned` key; the arm-record gap named in r4d-decode.card and r4dc-default.card |
-| S1 | **refill**: delete the pre-read `give_back` in `read_pick` (`:2243`, `PickRead.give_back`, `Pick.gone`'s use); keep `release`'s | host dispatch path → same-lease A/B (refill's card, at the gate plan or n ≥ 1024) | `gate-gpu-nvtier` bit identity (same bytes, the audit); FAIL-first: a short read must still refuse by name (`:2252`) | fill 1.05 → 0.6–0.75 ms, −16..−23 ms a token at the gate plan (+19..+37 % tok/s); at the r4b warm window inside the ruler → refused | the refault; `AnonMap::dontneed` keeps one caller |
-| S2 | **One reader, part units, `Kind::Step`** (b): the step's misses submitted to the reader at rank 0, the chain waits on the latch; unit = part; Victim/Prefetch take a thread only while Step is empty | host dispatch path; ptx-scan identical; the reader's count identity `fills == step_units/3 + prompt_units/3 + victim_units/3` | `gate-gpu-nvtier`: a new clause "the pool makes no NVMe read" (`step_jobs > 0`, pool fill count 0); FAIL-first: route Step through the pool → red; a Victim ahead of a queued Step → red | step fill 0.63–0.75 → net with S1 ≥ 0.46 ms; −14..−19 ms a token at the gate plan on top of S1 (bounded: S1+S2 ≤ −27 ms); the hand-off 0.05–0.15 ms a job is the term to watch (noninf margin 5 %) | `NvTier::fill` (pool path), `ensure`/`ensure_as` sync forms, `fill_victims`' own submit (a victim is a job like any), the lane's blocking under the receive lock while the reader runs (the lane submits, then stages when the latch opens) |
-| S3 | **In-layer overlap**: `experts_into_on` computes the hits while the Step job is in flight; per-expert outputs stored, summed in list order | host path; bits identical by construction (same order of the final sum); proof: `gate-gpu-e2e` tokens equal | `gate-gpu-nvtier` steps clause; FAIL-first: sum in landing order → the bit pin red | −5..−10 ms a token at the gate plan (0.21 ms × layers with a miss); 0 at the warm window | nothing (the fill's join moves after the hits' compute) |
-| S4 | **Off rule derived** (e): `GainUnderRuler` in `room_for`, the `Paged` clause's 36 sites go (r4dc2), one `RoomShort` → each family's why | host plan path; levers unit tests; proof: the probe table of r4dc1 §2 reproduces (plan a → `mid-p0-s1`, GLM 3090 → `off` NoCardExperts) | levers tests (FAIL-first: restore the clause → the paged-shape pin red); `gate_nvtier` clause 5 re-pinned to the word; `nvtier_family` per-family pick | r4dc-default.card as written (−2..+10 %, 10 rounds, the flip's own A/B) | `PlanTier`, `PagedText`, `ResidencyWhy::Paged`, `Residency38Why::Paged`, `GlmWhy::Paged`, `RoomShort::Paged` |
-| S5 | **Gate lookahead** (c): probe first (a `lookahead` record, functional, no lease); then the round: router_{l+1} on the pre-attention residual in the card graph, k ids on the handoff page, `Kind::Prefetch` jobs cancelled by a landing Step claim | add class on the card (ptx-scan = base + the router entry, `gate-ptx-spill` red on it before pinning) + host path; launch count Δt = 48 × c_node | `gate-gpu-e2e` (bits: the real router unchanged); new nvtier clause `prefetch_hit + cancelled + wasted == issued`; FAIL-first: a prefetch that claims a pinned slot → red | the probe: r at k = m, expected 0.6–0.85; the round's A/B at the gate plan: −10..−20 ms a token at r 0.6–0.85 after S1–S3; refused below r 0.5 | nothing until measured; at r < 0.5 the step is dropped and (c) closes with the three slot-level levers |
-| S6 | **Heat in the book** (a): one count per (layer, id) written by the tally, read by the rule and `pick_slot`; `SwapRule.counts` a view | move; proof: a Mac route-trace replay plans identical flips from both sources; `ptx-scan` identical | `gate-gpu-qwen38-residency` / `gate-gpu-swap` flips pin; `gate-gpu-nvtier` eviction clause (coldest count, transient first); FAIL-first: evict by tick alone → the clause red | none (counting identity); read beside: fills a token at n 1024 (expected to fall with count-ranked eviction vs tick LRU, unmeasured) | `SwapRule.counts` as a second copy; `NvTier::Heat`/`slot_heat` (no caller) or they become the owner |
-| S7 | **`ArenaMem::Pinned`** (d): the enum, `give_back` no-op on Pinned, `device_slot` for an integrated read, `devmap` clause on the A6000 | add behind `BLOOMERY_NVTIER_MEM` (default `auto` = integrated only) | Q18's clause: DtoH of `device_slot` == `slot()` bytes; FAIL-first D1 (dontneed on Pinned → stale alias red), D2 (part skew dropped → red) | the one term: `cuMemHostRegister`/`cuMemHostAlloc` over 20 GB works and its time (expected 2–4 s [assumption]); bits equal | the integrated arena as a separate plan |
-| S8 | **Dropper and mapping path for paged ids go** | delete; per entry the grep with no caller; `mapping_reads == 0` and `drops == 0` pinned | `gate-gpu-nvtier` clause 9 `exclusive` turns the tolerated mapping reads into a 0 pin (dated); FAIL-first: a lane stage of an unfilled id through the mapping → red | none (a functional run prints the pins) | `nvtier-drop`, `drop_layer`, `end_read`'s queue, `PageDrop` for paged ids, `source()`'s mapping fallthrough for arena ids |
-| S9 | **Lift the copies** (§2): Qwen3.8's host-run build onto `model.rs:1710`; one `placement::Room` read per `describe`; MiMo's body attach through the same call | move; `ptx-scan` identical; `just affected --narrow` | each family's nvtier gate (`nvtier_family.rs` with a MiMo caller) | none | `body38.rs:1451-1456`'s own build; three room fields |
-| S10 | **One budget solver** (g, l): a `MemoryModel` per device (`Card | Host | Pool`, capacity, bandwidth, reclaim class) whose terms are card experts / S_pool, the KV pool at ctx × slots × state bytes, the arena's S, the cache budget and floor, the churn pool, the page-cache assertion; the (g) reclaim order at a serve-time `--ctx` | host plan path, pure crate; proof: every plan in `tools/ref/plan-room.sh`'s room prints the same budgets as before (a counting identity) and the four replaced rules' tests re-point to the solver's terms | placement lib tests; `gate-gpu-qwen38-serve`'s two paged clauses re-pinned to the terms (dated); FAIL-first: a reclaim that touches the host segment → red; a cache under the two-state floor → red | none | `expert_nvme_tier`'s room arithmetic, `ArenaFloor` as a free rule, `grow_kv`, the paged cache default, the per-family room fields (with S9) |
-| S11 | **Reader shares and per-drive parameters** (j): background ≤ 8 of 16 threads during steps; `max_sectors_kb`, r1, R_p, the knee read at load; S2b (part/3 tiles) opened only if S2's measured QD-3 fill ≥ 0.6 ms | host path; the reader's unit tests | `gate-gpu-nvtier` clause: a Step unit's `wait_ns` ≤ one background unit's service time; FAIL-first: a 16-thread background class → red | S2b's own card: −0.16 ms a fill, −7 ms a token at the gate plan (−8 %) | nothing |
-| S12 | **`Kind::State`** (l): sealed states' NVMe tier behind the pool's `NoRoom`, through the reader at rank 4 | add, host only; `ptx-scan` identical | `gate-gpu-qwen38-serve` clause: a state evicted to NVMe resumes bit-identical (tokens equal); FAIL-first: one page short on the restore → red | a 32K restore 0.18 s (1.19 GB / 6.77 GB/s), functional | the request-path fallback for a sealed state that found no room |
-| S13 | **N-node** (k): `Machine.nodes` + `Fabric` (spark2x Amendment 1), per-node `NvTier`, the 98 KB heat window, the mover lane under S4's cap | placement first (pure; `nodes_scale` + C3), then the lane; after S7 and the contributor's #5 | `nodes_scale` with the per-node fills criterion; the lane's bit identity on two processes of one box (loopback) | λ on one rail (the contributor's) | nothing in this tree |
+| # | Step | Class, proof | Gates, FAIL-first | The one box measurement, expected | Deletes | Status (main `9bd7d577`) |
+|---|---|---|---|---|---|---|
+| S0 | **Records by kind + the runner keeps arm stderr** (f): `KindStats.run_ns`, `{step,keep,transient}_*`, `fill_{fault,read}_ns`; `depth-qwen3moe.sh`/`ab-decode.sh` write `<log>.arm<n>.err` and fold `nvtier`/`residency` into the row | records (Kind change → `records-refresh`); host only, ptx-scan identical | `gate-gpu-nvtier` kind test (re-pinned with its derivation); runner self-test: an arm without stderr → red | none (a functional gate run prints the keys; the fault/read split is read on the next card as a beside field) | `count_fill`'s `pinned` key; the arm-record gap named in r4d-decode.card and r4dc-default.card | Partly in: records by kind are in (`967f083f`, `3301f20c`); each arm's `nvtier` record reaches `depth-qwen3moe.sh`'s log (`44b2d409`); the fault/read split and the per-arm stderr file are not |
+| S1 | **refill**: delete the pre-read `give_back` in `read_pick` (`:2243`, `PickRead.give_back`, `Pick.gone`'s use); keep `release`'s | host dispatch path → same-lease A/B (refill's card, at the gate plan or n ≥ 1024) | `gate-gpu-nvtier` bit identity (same bytes, the audit); FAIL-first: a short read must still refuse by name (`:2252`) | fill 1.05 → 0.6–0.75 ms, −16..−23 ms a token at the gate plan (+19..+37 % tok/s); at the r4b warm window inside the ruler → refused | the refault; `AnonMap::dontneed` keeps one caller | In (`af6d0eba`); its card read +7.07 % ± 1.61 % (95 %, 10 rounds) at n=1024, residency off, on the A6000 paged plan (27G + 20G), not the gate plan (`docs/cards/refill-decode.card`: main `b00ff641` against `b00ff641` with `af6d0eba` reverted; the result in `23ee2100`) |
+| S2 | **One reader, part units, `Kind::Step`** (b): the step's misses submitted to the reader at rank 0, the chain waits on the latch; unit = part; Victim/Prefetch take a thread only while Step is empty | host dispatch path; ptx-scan identical; the reader's count identity `fills == step_units/3 + prompt_units/3 + victim_units/3` | `gate-gpu-nvtier`: a new clause "the pool makes no NVMe read" (`step_jobs > 0`, pool fill count 0); FAIL-first: route Step through the pool → red; a Victim ahead of a queued Step → red | step fill 0.63–0.75 → net with S1 ≥ 0.46 ms; −14..−19 ms a token at the gate plan on top of S1 (bounded: S1+S2 ≤ −27 ms); the hand-off 0.05–0.15 ms a job is the term to watch (noninf margin 5 %) | `NvTier::fill` (pool path), `ensure`/`ensure_as` sync forms, `fill_victims`' own submit (a victim is a job like any), the lane's blocking under the receive lock while the reader runs (the lane submits, then stages when the latch opens) | Not in main |
+| S3 | **In-layer overlap**: `experts_into_on` computes the hits while the Step job is in flight; per-expert outputs stored, summed in list order | host path; bits identical by construction (same order of the final sum); proof: `gate-gpu-e2e` tokens equal | `gate-gpu-nvtier` steps clause; FAIL-first: sum in landing order → the bit pin red | −5..−10 ms a token at the gate plan (0.21 ms × layers with a miss); 0 at the warm window | nothing (the fill's join moves after the hits' compute) | Not in main |
+| S4 | **Off rule derived** (e): `GainUnderRuler` in `room_for`, the `Paged` clause's 36 sites go (r4dc2), one `RoomShort` → each family's why | host plan path; levers unit tests; proof: the probe table of r4dc1 §2 reproduces (plan a → `mid-p0-s1`, GLM 3090 → `off` NoCardExperts) | levers tests (FAIL-first: restore the clause → the paged-shape pin red); `gate_nvtier` clause 5 re-pinned to the word; `nvtier_family` per-family pick | r4dc-default.card as written (−2..+10 %, 10 rounds, the flip's own A/B) | `PlanTier`, `PagedText`, `ResidencyWhy::Paged`, `Residency38Why::Paged`, `GlmWhy::Paged`, `RoomShort::Paged` | The `Paged` clause, `PlanTier`, `PagedText` and `RoomShort::Paged` went with R4d-c (`967f083f`); `GainUnderRuler` is deferred (§8) |
+| S5 | **Gate lookahead** (c): probe first (a `lookahead` record, functional, no lease); then the round: router_{l+1} on the pre-attention residual in the card graph, k ids on the handoff page, `Kind::Prefetch` jobs cancelled by a landing Step claim | add class on the card (ptx-scan = base + the router entry, `gate-ptx-spill` red on it before pinning) + host path; launch count Δt = 48 × c_node | `gate-gpu-e2e` (bits: the real router unchanged); new nvtier clause `prefetch_hit + cancelled + wasted == issued`; FAIL-first: a prefetch that claims a pinned slot → red | the probe: r at k = m, expected 0.6–0.85; the round's A/B at the gate plan: −10..−20 ms a token at r 0.6–0.85 after S1–S3; refused below r 0.5 | nothing until measured; at r < 0.5 the step is dropped and (c) closes with the three slot-level levers | Not in main |
+| S6 | **Heat in the book** (a): one count per (layer, id) written by the tally, read by the rule and `pick_slot`; `SwapRule.counts` a view | move; proof: a Mac route-trace replay plans identical flips from both sources; `ptx-scan` identical | `gate-gpu-qwen38-residency` / `gate-gpu-swap` flips pin; `gate-gpu-nvtier` eviction clause (coldest count, transient first); FAIL-first: evict by tick alone → the clause red | none (counting identity); read beside: fills a token at n 1024 (expected to fall with count-ranked eviction vs tick LRU, unmeasured) | `SwapRule.counts` as a second copy; `NvTier::Heat`/`slot_heat` (no caller) or they become the owner | Not in main |
+| S7 | **`ArenaMem::Pinned`** (d): the enum, `give_back` no-op on Pinned, `device_slot` for an integrated read, `devmap` clause checked on any card ([#13 devmap][devmap]) | add behind `BLOOMERY_NVTIER_MEM` (default `auto` = integrated only) | Q18's clause: DtoH of `device_slot` == `slot()` bytes; FAIL-first D1 (dontneed on Pinned → stale alias red), D2 (part skew dropped → red) | the one term: `cuMemHostRegister`/`cuMemHostAlloc` over 20 GB works and its time (~~expected 2–4 s [assumption]~~ measured on GB10: both work; `cuMemHostAlloc` 1.59 s at 19.91 GiB (median) and 5.288 s at 64 GiB ([#13 k-rows][krows]), `cuMemHostRegister` 0.543 s over 19.91 GiB of pages already touched (median, [#13 register][measure13]); conditions in §6.2 row 2); bits equal | the integrated arena as a separate plan | A contributor is building it (§8); not in main. Its PR settles the default of `BLOOMERY_NVTIER_MEM` and whether the arena is one allocation per tier or per layer; (d), (h) item 2 and Q5 follow it once it lands. The card leg ((h) item 1) follows in its own PR |
+| S8 | **Dropper and mapping path for paged ids go** | delete; per entry the grep with no caller; `mapping_reads == 0` and `drops == 0` pinned | `gate-gpu-nvtier` clause 9 `exclusive` turns the tolerated mapping reads into a 0 pin (dated); FAIL-first: a lane stage of an unfilled id through the mapping → red | none (a functional run prints the pins) | `nvtier-drop`, `drop_layer`, `end_read`'s queue, `PageDrop` for paged ids, `source()`'s mapping fallthrough for arena ids | Not in main |
+| S9 | **Lift the copies** (§2): Qwen3.8's host-run build onto `model.rs:1710`; one `placement::Room` read per `describe`; MiMo's body attach through the same call | move; `ptx-scan` identical; `just affected --narrow` | each family's nvtier gate (`nvtier_family.rs` with a MiMo caller) | none | `body38.rs:1451-1456`'s own build; three room fields | Not in main |
+| S10 | **One budget solver** (g, l): a `MemoryModel` per device (`Card | Host | Pool`, capacity, bandwidth, reclaim class) whose terms are card experts / S_pool, the KV pool at ctx × slots × state bytes, the arena's S, the cache budget and floor, the churn pool, the page-cache assertion; the (g) reclaim order at a serve-time `--ctx` | host plan path, pure crate; proof: every plan in `tools/ref/plan-room.sh`'s room prints the same budgets as before (a counting identity) and the four replaced rules' tests re-point to the solver's terms | placement lib tests; `gate-gpu-qwen38-serve`'s two paged clauses re-pinned to the terms (dated); FAIL-first: a reclaim that touches the host segment → red; a cache under the two-state floor → red | none | `expert_nvme_tier`'s room arithmetic, `ArenaFloor` as a free rule, `grow_kv`, the paged cache default, the per-family room fields (with S9) | Not in main |
+| S11 | **Reader shares and per-drive parameters** (j): background ≤ 8 of 16 threads during steps; `max_sectors_kb`, r1, R_p, the knee read at load; S2b (part/3 tiles) opened only if S2's measured QD-3 fill ≥ 0.6 ms | host path; the reader's unit tests | `gate-gpu-nvtier` clause: a Step unit's `wait_ns` ≤ one background unit's service time; FAIL-first: a 16-thread background class → red | S2b's own card: −0.16 ms a fill, −7 ms a token at the gate plan (−8 %) | nothing | Not in main |
+| S12 | **`Kind::State`** (l): sealed states' NVMe tier behind the pool's `NoRoom`, through the reader at rank 4 | add, host only; `ptx-scan` identical | `gate-gpu-qwen38-serve` clause: a state evicted to NVMe resumes bit-identical (tokens equal); FAIL-first: one page short on the restore → red | a 32K restore 0.18 s (1.19 GB / 6.77 GB/s), functional | the request-path fallback for a sealed state that found no room | Not in main |
+| S13 | **N-node** (k): `Machine.nodes` + `Fabric` (spark2x Amendment 1), per-node `NvTier`, the 98 KB heat window, the mover lane under S4's cap | placement first (pure; `nodes_scale` + C3), then the lane; after S7 and the contributor's #5 | `nodes_scale` with the per-node fills criterion; the lane's bit identity on two processes of one box (loopback) | λ on one rail (the contributor's) | nothing in this tree | Not in main. A contributor holds the placement half (`Machine.nodes`, `nodes_scale` + C3; `docs/contrib/dgx-spark.md` §9 and §9.6 item 2), which does not wait for S10 (§8); the lane half follows S7 |
 
-Order and trains: S0 → S1 (in flight) → S2 → S3 → S4 + S10 (one owner of `placement`/`levers`: S10 replaces the same
+Order and trains: S0 (partly in) → S1 (in) → S2 → S3 → S4 + S10 (one owner of `placement`/`levers`: S10 replaces the same
 rules r4dc2's clause removal touches) → S5 probe (free, any time after S0) → S6 → S7 → S11 (reads S2's measured QD-3
 fill) → S8 → S9 → S12 → S13. S1+S2 share `read_pick`/`fill`: S2 rebases on S1. S2 and S4 touch `gate_nvtier.rs` and
 `nvtier.rs`: one owner per round, S4 after S2. Every step deletes or converts a path within two steps: S2 removes the
 pool reader that S1 touched; S8 removes the mapping path S2 made unreachable; S10 removes the four scattered budget
 rules the moment the solver prints their numbers. GB10-only behaviour enters as parameters of S7, S10 and S11
-(`ArenaMem::Pinned`, the `Pool` device kind, the drive's constants), never as a step of its own.
+(`ArenaMem::Pinned`, the `Pool` device kind, the drive's constants), never as a step of its own. A contributor holds
+S7 (with its card leg) and S13's placement half; the placement half does not wait for S10 ([#13 answer][answer]), and
+the lane half stays after S7.
 
-## 6. The in-flight work
+## 6. Measured on DGX Spark
+
+Five of the six Spark-only facts that (k) asked a contributor for are measured ([#13 k-rows][krows]); row 4 is open.
+The decisions of (h) and (k) stand, and three inputs change: a hit is priced on whole-line loads, a fill at QD 3 takes
+0.58 to 0.69 ms [derived] instead of 0.43, and one rail moves more than the cited 11.6 GB/s. (k)'s rule points the
+Spark to S2b's tiles, and S11's gate on S2's measured fill decides (row 3). The results and their conditions are in
+§6.2. Where §3's prose used a replaced value, it is struck and corrected in place; §3's tables strike it and point
+to §6.2.
+
+Rows 1, 2, 3, 5 and 6 ran on GB10 with driver 595.84, kernel 6.17.0-1032-nvidia, GPU clocks stock (not capped) and
+serving off; row 4 has not run. Each row's own conditions are in its last column, and the full setup is in the
+linked comment.
+
+### 6.1 The asks, as (k) planned them
+
+The table is (k)'s, moved here. Rows 1 and 2 carry the maintainers' rule corrections of 2026-10-13 (answers 1 and 2 in
+[#13 answer][answer]).
+
+| # | Fact | Command (one) | The number decides | We build first |
+|---|---|---|---|---|
+| 1 | a `_sel`-shaped gather from WC pages: random slot rows, 32-B strided, vs `hostread2`'s sequential rows | `hostread2 2 host-wc` with a `ROWS=random` arm (≈ 20 lines on the comment's kernel; we post the patch on #13) | ≥ 200 GB/s → (h) as written; 160 to 200 → record it and reprice (h) (answer 1); < 160 → each slot row gets a 128-B pad (a plan-bytes change) | nothing: the kernel is the contributor's |
+| 2 | one `cuMemHostAlloc(WC)` of 64 GiB: success and seconds | `FILL=$M hostread2 1 host-wc` with a 64 GiB size arg | success → S7 prices the arena at load as a linear cost in its size (answer 2); failure → S7 allocates per layer (48 calls) | S7 (`ArenaMem::Pinned`, `device_slot`) |
+| 3 | the part-unit curve on the Spark's drive at our shape: 1.045 MB, QD 3 / 8 / 16, random offsets | `probe_nvread --threads 3,8,16 --file $M --unit 1045000` | QD-3 ≥ 7 GB/s → (j)'s unit holds; < 6 → S2b's tiles on the Spark | a plain-file arm of `probe_nvread` (today it opens a qwen4exp split set, #13) |
+| 4 | fills a token above the pool: GLM UD-Q4_K_XL on one Spark, 88 GB paged | `bloomery-serve … --place auto`, S0's `nvtier` record, one 512 prompt + 96 steps | fills × ~~0.43 ms~~ 0.58 to 0.69 ms (§6.2 row 3) against the step: > 20 % → (c)'s lookahead opens on GB10 first | S0 (records by kind), S7 |
+| 5 | λ and the 3 MiB-message rate on one rail | `ib_write_lat` / `ib_write_bw -s 3145728` between two Sparks (spark2x Q5's first step) | λ ≤ 70 µs → C1/C2 as derived; the move rate sets the mover's cap | nothing |
+| 6 | GB10 `c_node` | `cnode_probe --time` (sparkdec §9) | the lookahead's 48 launches a token (0.04 ms on the A6000) on GB10 | nothing: the bin exists |
+
+### 6.2 Results
+
+All results are from [#13 k-rows][krows] unless a row names another source.
+
+| # | Result | Decision | Conditions |
+|---|---|---|---|
+| 1 | Today's `_sel` gather (4-byte loads, mixed 32-B part offsets) reads random slot rows of a 19.91 GiB WC arena at 167.8 GB/s, 18.7 µs a hit [derived]. `rows_k`'s lane mapping (whole-line loads) over 128-B aligned parts reads 241.4 GB/s on WC and 240.7 on `cuMemAlloc`, 13.0 µs a hit [derived]. Sequential rows read 237.6. | (h) assumes whole-line loads over 128-B aligned parts (241.4 ≥ 200) and keeps 13 µs a hit; 167.8 stays on record as today's gather ([#13 answer][answer]). The < 160 branch's pad does not help today's form (170.7 GB/s with every part aligned, 168.9 mixed). How parts land on 128-B boundaries under `O_DIRECT`'s 4 KiB alignment is not measured or designed yet: the card leg chooses its load shape and part alignment from measurements ([#13 answer][answer]). | 167.8 and 237.6: one Spark (the first in the comment, which also ran row 2's 64 GiB), 6 interleaved rounds, prefetch loop on, memset fill, slots not read since the fill. 241.4 and 240.7: another Spark, one of the two #44 ran on, 3 rounds, prefetch loop off (`PF=0`), arena touched once after its fill, loads only (no decode). |
+| 2 | One `cuMemHostAlloc(PORTABLE \| DEVICEMAP \| WRITECOMBINED)` of 64 GiB succeeds in 5.288 s (12.1 GiB/s). The time is linear in size: 1.56 to 2.04 s at 19.91 GiB (median 1.59). One `cuMemHostRegister(PORTABLE \| DEVICEMAP)` over an anonymous 19.91 GiB mapping succeeds in 0.543 s (median, 0.538 to 0.604), 36.7 GiB/s [derived] ([#13 register][measure13]). That time excludes touching the pages first (4.2 to 5.8 s), so it does not compare with `cuMemHostAlloc`'s 1.59 s. | S7 prices the arena at load as a linear cost; 5.288 s is a success ([#13 answer][answer]). No decision rests on the register time: (h) item 2 already drops the `Registered` variant on its read rate. | 64 GiB: one run on row 1's first Spark, filled by `O_DIRECT` reads of a GGUF. 19.91 GiB: row 1's allocations. Register: one Spark (its comment does not say which unit), 3 runs, each a new process; 4 KiB pages (transparent huge pages unused), every page written before the call, so a huge-page mapping is not measured; a driver API program outside the tree, so no bloomery commit. |
+| 3 | 1.045 MB parts at random offsets, QD 3: 4.97 and 5.45 GB/s on a 4 TB PCIe Gen5 drive, 4.67 and 4.57 on a 1 TB PCIe Gen4 DRAM-less drive (two sessions each). As one fill's share of those 48-part batches, a fill takes 0.58 to 0.69 ms [derived]; a fill of 3 parts timed alone took 0.61 to 1.34 ms (each run's median). QD 8 reads 8.35 to 8.48 GB/s (Gen5) and 5.91 to 6.01 (Gen4), QD 16 8.4 to 8.9 (Gen5) and 5.8 (Gen4). (j)'s 7.3 GB/s at QD 3 was an interpolation. | Under 6 on both drives, so (k)'s rule points to S2b's tiles (part / 3, 9 units a fill) on the Spark. Nine tiles at the QD-8 rate would take about 0.37 ms (Gen5) and 0.52 ms (Gen4) [derived: 3.134 MB / 8.48 and / 6.01 GB/s; the tile size itself was not measured]. S11's condition (S2's measured QD-3 fill ≥ 0.6 ms) stays the final test, and one Gen5 session's batch rate gives 0.58 ms. | `probe_nvread` built from main `23ee2100`, run through `tools/ref/nvtier-read.sh` under a lease in `box.sh` local mode, on Qwen3.8's real expert parts (k16 batches of 48 parts); page cache dropped before each queue depth; medians of 24 batches. |
+| 4 | Not measured yet: fills a token, and fills × the fill time as a share of the step. | Waits only for GLM to load at the serving default (the load-refusal fix, #53). S0's records by kind (`KindStats.run_ns`) are on main, and S7 and its card leg are not needed for this reading: P4 needs them after it (`docs/contrib/dgx-spark.md` §8). | |
+| 5 | λ and the 3 MiB rate on one rail are in `docs/contrib/dgx-spark.md` §9.1. With (k)'s formulas, the 13.63 GB/s rail rate and λ_probe's p50 of 30 µs ([#44][lambda]) they give: a 3.134 MB move takes 0.230 ms of NIC, the mover's cap is 87 moves a token, and C2's remote fetch takes 0.26 ms and breaks even at 20 reuses [derived]. With the engine's λ of 37 to 60 µs (`[derived]` in §9.1) the fetch is 0.27 to 0.29 ms and the break-even about 21 to 22 reuses [derived]. | λ is under 70 µs, so C1 and C2 stand. One rail moves 1.22 times one drive's 11.2 GB/s plateau [derived]: the link is still not a faster drive. | two DGX Sparks, one direct cable; the rest in `docs/contrib/dgx-spark.md` §9.1. |
+| 6 | `c_node` is 0.553 µs a node (784-node graph, fastest of 3 runs; the 504-node graph gives 0.555 to 0.559). The lookahead's 48 launches cost 0.027 ms a token [derived]. | That is 0.05 to 0.13 % of a 20 to 50 ms step [derived]: nothing that matters on GB10. `docs/research/sparkdec.md` uses this value for `sparkpdl`. | Direct runs of `cnode_probe --time`, not under a lease (a direct run serves, [#13 answer][answer]); built from main `23ee2100` ([#13][measure13]) with `cargo oxide` for sm_86, the driver JIT-compiling the PTX for sm_121; SM clock 2372 to 2424 MHz read after each run (stock). |
+
+## 7. Work in flight (2026-10-11)
+
+The verdicts on the work in flight when the design was written. Items marked landed are in main, and the reasons of the
+integrated-arena and §8.1 rows are updated; the rest is as written.
 
 | Item | Verdict | Reason |
 |---|---|---|
-| R4d-b (seat refusal flip, `paged_set_residency_serves`) | **keep** | it is the user-facing "residency on a paged plan"; its asserts (landed flips > 0, slot reads > 0, mapping reads 0) are the target's pins, and S8 only tightens the third |
-| R4d-c (Paged clause removal + union counters by kind) | **keep, one change** | the counters-by-kind half is S0's first half — extend its keys to Step/Victim and add `run_ns` in the same Kind change (one `records-refresh`); the clause removal lands as S4 with `GainUnderRuler` as the replacement why, so the unset word on a paged plan carries the derived terms, not "plan a"; r4dc-default.card runs as written |
-| refill | **keep, one condition** | it is S1, the largest single derivable term (−16..−23 ms at the gate plan); its card must run at a shape with fills — at the r4b warm window (fills ≈ 0) the predicted effect is inside the ruler and `lease_take` refuses it; and its measurement is the fault/read split S0 makes readable (`fill_fault_ns`) |
+| R4d-b (seat refusal flip, `paged_set_residency_serves`; landed, `6be94008`) | **keep** | it is the user-facing "residency on a paged plan"; its asserts (landed flips > 0, slot reads > 0, mapping reads 0) are the target's pins, and S8 only tightens the third |
+| R4d-c (Paged clause removal + union counters by kind; landed, `967f083f`) | **keep, one change** | the counters-by-kind half is S0's first half — extend its keys to Step/Victim and add `run_ns` in the same Kind change (one `records-refresh`); the clause removal lands as S4 with `GainUnderRuler` as the replacement why, so the unset word on a paged plan carries the derived terms, not "plan a"; r4dc-default.card runs as written |
+| refill (landed as S1, `af6d0eba`) | **keep, one condition** | it is S1, the largest single derivable term (−16..−23 ms at the gate plan); its card must run at a shape with fills — at the r4b warm window (fills ≈ 0) the predicted effect is inside the ruler and `lease_take` refuses it; and its measurement is the fault/read split S0 makes readable (`fill_fault_ns`) |
 | r7 / r7g (V4.1 and GLM attach) | **keep** | the attach points are §2's owners; two changes after rebase: the per-family expected pick goes through S4's common clause, and `nvtier_family.rs` pins `mapping_reads == 0` as a contract once S2 lands (today printed, not judged) |
-| integrated arena (Spark, Q18) | **change** | not a separate plan: it is S7 behind `ArenaMem`, and it waits for S1 (one give-back site, one time) — the fixed arena priced at load and the Spark ask stand |
+| integrated arena (Spark, Q18) | **change** | not a separate plan: it is S7 behind `ArenaMem`, and it follows S1, landed in `af6d0eba` (one give-back site, one time) — the fixed arena priced at load and the Spark ask stand |
 | per-part parallel reads (held by the lead) | **absorb into S2** | the part unit is the reader's unit, not a pool-side split; the timeline (pool idle during a decode fill, drive at QD 1) says it pays only on the step path, which S2 moves to the reader anyway |
 | r4d-decode.card (R4d-a's A/B) | **keep, re-shape** | its −0.7..0 prediction at the warm window is inside the ruler at 6 rounds in the no-fills regime; run it after S0 at the gate plan where the victim's reader path is exercised beside 45 fills a token, or merge it into S2's card |
 | KV pool v2 (landed: `checkpoint/{saved,staging}.rs`, `-c` = the pool) | **keep** | its owners are (l)'s; S12 adds the NVMe tier behind its `NoRoom`; the active sequence's blocks never move (the f × 35–142 ms derivation) |
 | PR #16 (the pool invariant, `pool_card_bytes`) | **keep, one doc line** | `pool_card_bytes` is (h)'s budget term for the WC arena; S13 later moves `host`/`unified` into `nodes[0]` (a move) |
 | spark2x (two-Spark design, `specs/leader/spark2x/design.md`) | **keep, absorbed** | its Q4 shape is (k); C1–C3 join its S1–S6; its first step (λ on one rail) is the contributor's #5 |
 | sparkdec's row-locality prefetch (the contributor's, #17) | **keep** | (h)'s `_sel` gather inherits the per-row `prefetch.global.L2`; (k) #1 measures WC rows under it |
-| `docs/contrib/dgx-spark.md` §8.1's decision rule (read in place vs copy) | **close** | #13 measured (ii) WC at 235 = (i) 233: the band's first branch holds; `dgx-spark.md` §8.1 now states only the branch taken |
+| `docs/contrib/dgx-spark.md` §8.1's decision rule (read in place vs copy) | **close** | #13 measured (ii) WC at 235 = (i) 233 for whole-line reads, (h)'s premise (a random gather keeps that rate only with whole-line loads over 128-B aligned parts, §6.2 row 1, [#13 k-rows][krows]): the band's first branch holds; `dgx-spark.md` §8.1 now states only the branch taken |
 
-## 7. Open questions for the user
+## 8. Decisions
 
-1. **Which shape is the public decode number on the A6000 — the 96-token warm window after a prompt (fills ≈ 0, every
-   fill lever 0) or a long decode / the gate plan where the drive is 55 % of the token?** It decides whether S1–S5 are
-   worth opening on the A6000 at all. Recommendation: both rows in rig-log; every fill card at the gate plan or n 1024.
-2. **The off rule's run-time half**: print only (never flip; 10-06 "residency never auto-off"), or allow a per-window
-   `off` when the measured gain is under the ruler? Recommendation: print only; the plan-time `GainUnderRuler` is the
-   rule.
-3. **The gate lookahead touches the card graph** (one router launch per layer, an id field on the handoff) for a
-   host-tier gain. Open it only on a measured r ≥ 0.6 from the free probe? Recommendation: yes — the probe first, no
-   lease, and the round only if r clears k = m.
-4. **`BLOOMERY_HOST_LOCK=1` as the default on a paged plan** (the host segment pinned so the page-cache budget is the
-   plan's; needs `RLIMIT_MEMLOCK` or root; a refused lock is recorded, not fatal)? Recommendation: populate always, lock
-   when permitted, record the refusal.
-5. **A pinned arena on discrete cards** (`cuMemHostAlloc` for the 20 GB arena: the lane could DMA a promotion straight
-   from the slot without the ring copy; costs registration time at load and non-swappable RSS). Recommendation: `auto` =
-   integrated only until S7's clause and a measured registration time exist.
-6. **The small-host pair** (mid vs off on an NVMe-bound token) — the off rule's (iv) has no ground truth without
-   it. Run it after S2 (the dispatch mutex and the lane's reads are then off the chain)? Recommendation: yes, after S2,
-   one load an arm.
-7. **A WC arena on discrete** (Q5 revisited by (i) A′): the lane could DMA a promotion from a `Pinned` slot (−0.3 ms of
-   host thread a promotion, 5.75 a token = −1.7 ms, off the step), but qdot would then walk WC pages, whose CPU rate on
-   32-B rows is unmeasured (#13 measured a streaming copy only). Recommendation: `Anon` on discrete; one box probe only
-   if the host term ever becomes the step's max.
-8. **The KV pool's pageable states under `HOST_LOCK`** (today pageable by design, `saved.rs:44-45`): lock them with the
-   host segment? Recommendation: no — a sealed state is reclaimable room by (g)'s order, and locking it would take the
-   two-state floor out of the kernel's hands.
-9. **The residency word on GB10**: print `off` with the why `Unified` (the card mover has nothing to move), or `mid`
-   with 0 flips? Recommendation: `off`/`Unified`; a flip count of 0 would read as a defect.
-10. **The N-node home split**: static per load (a home change is the mover's) or re-planned per window?
-    Recommendation: static; S4's NIC cap allows ≤ 74 moves a token at a 40 ms step, and the plan prints each node's
-    predicted fills (C3).
-11. **When the contributor's six asks go onto #13**: #1, #5, #6 need no engine code and can go now; #2–#4 want S7 and
-    the `probe_nvread` plain-file arm. Recommendation: post the three now with their decision rules; the rest with S7.
-12. **`Kind::State` (S12) before or after 0.3.0?** It is the only KV move the derivation admits, and it pays 200× on a
-    128K resume, but no user has asked for a prompt cache past host RAM. Recommendation: after; keep the derivation.
+Each question the design raised, with its decision. The user decided Q1 to Q12 on 2026-10-11 by their stated
+tendencies; the maintainers answered the DGX Spark results on 2026-10-13 ([#13 answer][answer], [#13 devmap][devmap]).
 
-## 8. Decided (2026-10-11)
+| # | Question | Decision | Date |
+|---|---|---|---|
+| Q1 | Which shape is the public decode number on the A6000: the 96-token warm window after a prompt (fills ≈ 0, every fill lever 0), or a long decode / the gate plan, where the drive is 55 % of the token? It decides whether S1–S5 are worth opening on the A6000 at all. | both rows go in rig-log. Every fill card is read at a decode with fills (n 1024, or the gate plan). | 2026-10-11 |
+| Q2 | The off rule's run-time half: print only (never flip; 10-06 "residency never auto-off"), or a per-window `off` when the measured gain is under the ruler? Recommendation: print only; the plan-time `GainUnderRuler` is the rule. | print only. | 2026-10-11 |
+| Q3 | The gate lookahead touches the card graph (one router launch per layer, an id field on the handoff) for a host-tier gain. Open it only on a measured r ≥ 0.6 from the free probe? Recommendation: yes; the probe first, no lease, and the round only if r clears k = m. | the free recall probe first; open it only at r ≥ 0.6. | 2026-10-11 |
+| Q4 | `BLOOMERY_HOST_LOCK=1` as the default on a paged plan (the host segment pinned so the page-cache budget is the plan's; needs `RLIMIT_MEMLOCK` or root; a refused lock is recorded, not fatal)? | populate always, lock when permitted, record a refusal. | 2026-10-11 |
+| Q5/Q7 | Q5: a pinned arena on discrete cards (`cuMemHostAlloc` for the 20 GB arena: the lane could DMA a promotion straight from the slot without the ring copy; it costs registration time at load and non-swappable RSS)? Recommendation: `auto` = integrated only until S7's clause and a measured registration time exist. Q7: a WC arena on discrete ((i) A′): the lane could DMA a promotion from a `Pinned` slot (−0.3 ms of host thread a promotion, 5.75 a token = −1.7 ms, off the step), but qdot would then walk WC pages, whose CPU rate on 32-B rows is unmeasured (#13 measured a streaming copy only). Recommendation: `Anon` on discrete; one box probe only if the host term ever becomes the step's max. | anonymous memory on a discrete card; `auto` is integrated only. | 2026-10-11 |
+| Q6 | The small-host pair (mid vs off on an NVMe-bound token), without which the off rule's (iv) has no ground truth: run it after S2, when the dispatch mutex and the lane's reads are off the chain? Recommendation: yes, after S2, one load an arm. | after S2. | 2026-10-11 |
+| Q8 | Lock the KV pool's pageable states (`saved.rs:44-45`) with the host segment under `HOST_LOCK`? Recommendation: no; a sealed state is reclaimable room by (g)'s order, and locking it would take the two-state floor out of the kernel's hands. | no. | 2026-10-11 |
+| Q9 | The residency word on GB10: `off` with the why `Unified` (the card mover has nothing to move), or `mid` with 0 flips? Recommendation: `off`/`Unified`; a flip count of 0 would read as a defect. | off, why Unified. | 2026-10-11 |
+| Q10 | The N-node home split: static per load (a home change is the mover's), or re-planned per window? Recommendation: static; S4's NIC cap allows ≤ ~~74~~ 87 moves a token at a 40 ms step [derived, [#13 k-rows][krows]], and the plan prints each node's predicted fills (C3). | static per load. | 2026-10-11 |
+| Q11 | When do the contributor's six asks ((k), now §6.1) go onto #13? #1, #5 and #6 need no engine code; #2 to #4 want S7 and the `probe_nvread` plain-file arm. Recommendation: post the three now with their decision rules; the rest with S7. | batched through the lead at the next milestone. | 2026-10-11 |
+| Q12 | `Kind::State` (S12) before or after 0.3.0? It is the only KV move the derivation admits, and it pays 200× on a 128K resume, but no user has asked for a prompt cache past host RAM. Recommendation: after; keep the derivation. | after 0.3.0. | 2026-10-11 |
+| (e) (iii) | `GainUnderRuler` as the plan-time off rule. | GainUnderRuler (iii) is deferred: the step floor is not derivable at plan time. | 2026-10-11 |
+| (h) | What a hit costs on GB10 when today's `_sel` gather reads WC pages at a rate between the two branches of §6.1 row 1 (§6.2 row 1). | (h) assumes 128-B aligned parts read with whole-line loads; today's gather rate is recorded beside it; a rate from 160 to 200 GB/s means "record it and reprice (h)". | 2026-10-13 |
+| S7 | Is S7's arena rule "≤ 5 s", or a cost priced at load? | The linear cost, priced at load; the 64 GiB time (§6.2 row 2) is a success. | 2026-10-13 |
+| S7, card leg | Who builds S7 with its `devmap` clause and the card leg, and on which card are they checked? | A contributor builds both; a design that differs from (d) and (h) stands on its reasons. Any card may check them. The card leg's load shape and part alignment follow measurements. | 2026-10-13 |
+| S13 | Does S13's placement half wait for S10? | No; it goes up when ready. | 2026-10-13 |
+| §6.2 row 6 | Does a direct run serve for `c_node`, outside a lease? | Yes, with its SM clock and commit stated. | 2026-10-13 |
 
-The user's rule: decide by their stated tendencies. Each answer below closes the matching §7 question.
-- Q1: both rows go in rig-log. Every fill card is read at a decode with fills (n 1024, or the gate plan).
-- Q2 (the off rule's run-time half): print only.
-- Q3 (lookahead): the free recall probe first; open it only at r ≥ 0.6.
-- Q4 (HOST_LOCK on a paged plan): populate always, lock when permitted, record a refusal.
-- Q5/Q7 (pinned or write-combined arena on a discrete card): anonymous memory on a discrete card; `auto` is integrated only.
-- Q6 (the small-host pair): after S2.
-- Q8 (lock the KV states): no.
-- Q9 (the GB10 word): off, why Unified.
-- Q10 (the N-node home): static per load.
-- Q11 (contributor asks): batched through the lead at the next milestone.
-- Q12 (Kind::State): after 0.3.0.
-- GainUnderRuler (iii) is deferred: the step floor is not derivable at plan time.
+## 9. Prior work: the designs followed, and where the three diverge
+
+- **Followed:** Mixtral offloading (Eliseev & Mazur, https://arxiv.org/abs/2312.17238: "accelerates offloading by
+  taking advantage of innate properties of MoE LLMs") for the LRU cache + gate lookahead pair — with the cache in host
+  RAM and the experts *computed on the host* (Fiddler's point, https://arxiv.org/abs/2402.07033: "strategically
+  utilizes CPU and GPU resources by determining the optimal execution strategy", 1.26× single batch), not copied to the
+  card; and a ranked single reader (MoE-Infinity's "sparsity-aware expert cache, which can trace the sparse activation
+  of experts during inference", https://arxiv.org/abs/2401.14361, uses traces for prefetch — ours uses the gate and the
+  prompt keep set, no trace at run time). Pre-gated MoE (https://arxiv.org/abs/2308.12066, "pre-gating function which
+  alleviates the dynamic nature of sparse expert activation") retrains the router — not applicable to a GGUF we do not
+  train.
+- **mistral.rs** (HEAD `b0f26d5cd` 2026-09-17, grep by a Haiku sweep): placement is
+  fixed at load (`device_map/mappers.rs:63` `set_device` per layer; activations move, `:50-52`), no expert cache, no
+  router prefetch; the only runtime weight copies are the diffusion `offloaded` path. Divergence: we move experts
+  between three tiers at run time.
+- **exllamav3**: no copy on the Mac (`/home/user/exllamav3-src` absent; stated, not read). Its README
+  (https://github.com/turboderp-org/exllamav3): "CPU offloading - Allows large MoE models to run with limited GPU
+  resources. AVX2 and AVX512 support." — no prefetch or cache named. ik stays the numeric oracle; its `-ot=CPU` is a
+  static split. Divergence from all three: a budgeted RAM arena with an NVMe tier behind it and the slot book as the one
+  ledger.
+
+[krows]: https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288
+[answer]: https://github.com/midagedev/bloomery/issues/13#issuecomment-6134411281
+[devmap]: https://github.com/midagedev/bloomery/issues/13#issuecomment-6134437490
+[lambda]: https://github.com/midagedev/bloomery/pull/44
+[measure13]: https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984
+[drive13]: https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921
+[drive71]: https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679

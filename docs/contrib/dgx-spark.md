@@ -1064,7 +1064,7 @@ Added 2026-10-13 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecom
 16. **The hit-rate rows:** the maintainers lean to showing both rows (the ranked fixed set and LRU); whoever read the
     trace decides.
     *Now: both rows (9.7).*
-17. **`cnode_probe` (`tierengine.md` (k) row 6):** a direct run is enough, so `time-gate.sh` needs no local opt-in for
+17. **`cnode_probe` (`tierengine.md` §6.2 row 6):** a direct run is enough, so `time-gate.sh` needs no local opt-in for
     it; name the SM clock and the commit.
     *Now: the GB10 `c_node` in 9.7 is such a run.*
 18. **`gate-engram` and the fixture gaps:** for the eviction clause the maintainers lean to (b), adjacent rows in one
