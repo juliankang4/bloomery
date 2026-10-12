@@ -1673,6 +1673,7 @@ impl Body {
         // is attached before the run's first call. The run includes the
         // NextN layer's index, which the tier does not cover.
         let experts = bloomery_gpu::model::host_run(
+            gpu.context(),
             plan,
             &file,
             run.start,

@@ -549,6 +549,7 @@ impl Placed {
         // is attached before the run's first call, the plan's host segments
         // keep the mapping and every other id the arena serves.
         let mut experts = crate::model::host_run(
+            gpu.context(),
             o.plan,
             &o.file,
             0,
