@@ -784,6 +784,18 @@ impl TierPage {
         self.layout.word_off(tier, w)
     }
 
+    /// Release every wait of both cards on tier `tier`'s words that is still
+    /// pending, for good: the tier's counters and go counters go far past
+    /// anything a step subtracts, every row's go and done in one link call
+    /// ([`Link::release`]).
+    pub(super) fn release(&self, tier: usize) {
+        let offs: Vec<usize> = (0..self.layout.rows)
+            .flat_map(|r| [TWord::Go(r), TWord::Cnt(r)])
+            .map(|w| self.off(tier, w))
+            .collect();
+        self.link.release(&offs, RELEASE);
+    }
+
     /// Why the link stopped carrying for good ([`Link::broken`]), as the
     /// note an error ends with; empty while it carries.
     pub(super) fn broken_note(&self) -> String {
@@ -1474,15 +1486,9 @@ impl TierCard {
     }
 
     /// Release every wait of both cards on this tier's words that is still
-    /// pending, for good: the tier's counters and go counters go far past
-    /// anything a step subtracts.
+    /// pending, for good ([`TierPage::release`]).
     pub(super) fn release(&self, page: &TierPage) {
-        for r in 0..page.layout.rows {
-            page.link
-                .release(page.off(self.index, TWord::Go(r)), RELEASE);
-            page.link
-                .release(page.off(self.index, TWord::Cnt(r)), RELEASE);
-        }
+        page.release(self.index);
     }
 
     /// Whether the tier's words hold what a drained step leaves: no go and
@@ -1800,10 +1806,13 @@ fn copy_page(
 #[cfg(test)]
 mod tests {
     use super::{
-        TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierSet, TierShape, chain_slot,
+        TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierPage, TierSet, TierShape,
+        chain_slot,
     };
+    use crate::Gpu;
     use crate::host::slots::{HOST, Slot, SlotMap, TIER};
-    use crate::host::step::Chain;
+    use crate::host::step::{Chain, RELEASE};
+    use bloomery_levers::TierLink;
     use model::ops::DEFER_MAX_COLS;
 
     /// A set's rows are ascending ids below the stack, each once; a map's
@@ -1888,6 +1897,28 @@ mod tests {
         assert!(TierLayout::new(TierShape { rows: 5, ..V41 }, 512, 32, 1).is_err());
         assert!(TierLayout::new(V41, 512, 32, 0).is_err());
         assert!(TierLayout::new(V41, 512, 32, 9).is_err());
+    }
+
+    /// A release over the loopback takes all of a tier's counters in one
+    /// hold of the pump's lock. The released tier card runs on: after each
+    /// release the tier's done steps by three on the tier cards' page and the
+    /// pump passes once. Released together, the done is stopped before that
+    /// pass and carries nothing; released one counter at a time, the pass
+    /// between the go and the done would see the done three ahead and stop
+    /// the pump by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_release_takes_a_tiers_counters_in_one_hold_of_the_pump() {
+        let stage = Gpu::with_device(0).expect("a Gpu on device 0");
+        let tier = Gpu::with_device(0).expect("a second Gpu on device 0");
+        let layout = TierLayout::new(V41, 512, 32, 1).expect("V4.1's tier page");
+        let mut page =
+            TierPage::new(&stage, &tier, layout, TierLink::Loopback).expect("a loopback page");
+        let done = layout.word_off(0, TWord::Cnt(0));
+        page.link.run_on(done, 3);
+        page.release(0);
+        assert_eq!(page.link.broken(), None);
+        assert_eq!(page.link.load(done), RELEASE);
     }
 
     /// A page of three tiers: each tier's flag lines its own, past the

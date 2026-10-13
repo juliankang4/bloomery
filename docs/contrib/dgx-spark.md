@@ -349,7 +349,7 @@ with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemG
 | Term | On the Spark |
 |---|---|
 | H2D promotion over PCIe (`cuMemcpyHtoDAsync`, `crates/gpu/src/host/xstream.rs:1223,1261` at `cce176c5`; the staging rings `:283,760,1614`) | vanishes as a PCIe cost; a copy from pageable memory into a `cudaMalloc` buffer is still a DRAM-to-DRAM copy at half the pool's rate (reads and writes both cross it: 21.2 GB in ~0.16 s `[derived]`), negligible beside the file read |
-| Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/link.rs:136`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
+| Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/link.rs:143`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
 | CPU expert compute | stays possible but pointless: 20 Arm cores against 48 SMs on the same bytes. It is the path the fixture tier exercises (section 4) |
 | The pool's bandwidth | stays, as the single term (section 5) |
 | Page cache of the model file plus the device copy | stays and doubles the footprint until dropped; `nvtier.rs:12-30` already drops pages after use (`MADV_DONTNEED`, the `release_union` path) for the NVMe tier |
@@ -632,7 +632,7 @@ decision.
 (`all_gather_perf` per NVIDIA's NCCL playbook), and the fallback only if the probe of 9.6 shows our pump path slower
 than NCCL's point to point. Without GPUDirect NCCL stages through host bounce buffers with its proxy thread `[derived
 from the cuda.html line; NCCL internals unverified]`, and a send or receive kernel per message would occupy SMs. The
-handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/link.rs:136`), which is what 9.1's "what to
+handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/link.rs:143`), which is what 9.1's "what to
 use instead" asks for, so the NIC reads the same LPDDR with no copy. The protocol stays `host/mod.rs`'s alone
 (`crates/gpu/src/host/mod.rs:56-58`), behind a `Link` seam (`crates/gpu/src/host/link.rs`). It has two impls: the
 shared page (PCIe and one Spark, identity) and the loopback (two pages on one machine, a host pump thread between them,
@@ -654,8 +654,9 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    the counter on the reader's page, and the reading card waits for at least one and takes it back, as on the shared
    page. A step of 0 carries nothing, a step of 1 carries one, and any other step publishes nothing and stops the pump
    by name, since a row has at most one go or done in flight. The host's progress word on the stage's page counts the
-   dones the pump carried and is written after their bytes, so it never runs ahead of them. A release stops its
-   counter, and that counter's reset takes its generations as carried and resumes it
+   dones the pump carried and is written after their bytes, so it never runs ahead of them. A release takes all of the
+   tier's counters in one hold of the pump's lock, so no pass falls between two of them while the released card runs on
+   and steps the counters it writes; each counter's reset takes its generations as carried and resumes it
    (`crates/gpu/src/host/link/pump.rs`). On the shared page nothing changes: the same words, values, card operations
    and graphs. On two nodes the writer's pump posts each generation to an inbox word on the reader's node, after the
    bytes, and the reader's pump holds it to the same step rule; that split is the transport's.
@@ -1289,7 +1290,7 @@ is not a trap in the sites grepped.
 
 **Memory ordering.** NVIDIA's porting guide warns that "some reorderings cannot happen on x86_64 but can happen on ARM"
 (`.../porting/memorder.html`). The host tier's card/host protocol spins on host-mapped words (`crates/gpu/src/host/mod.rs:466`,
-`step.rs:1287`, `tier.rs:1458`, `lane.rs:513`, `xstream.rs:431`, `swap.rs:3761`: 6 `spin_loop` sites) and
+`step.rs:1287`, `tier.rs:1471`, `lane.rs:513`, `xstream.rs:431`, `swap.rs:3761`: 6 `spin_loop` sites) and
 `crates/gpu/src/host/*.rs` holds 29 `Ordering::Relaxed` loads. ~~Not audited; it is a P1 risk for the host-tier gates, and
 irrelevant to a whole-on-card run that never starts a host service.~~ The audit found no site in the host tier that is
 correct only under x86's ordering, and no code change is needed

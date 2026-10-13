@@ -220,14 +220,22 @@ impl Relays {
             .expect("every counter of the tier page crosses the link")
     }
 
-    /// Stop carrying the counter at byte `off` and set its reader's counter
-    /// to `v`. The other counters carry on.
-    pub(super) fn release(&mut self, off: usize, v: u32, stage: &dyn Page, tier: &dyn Page) {
-        let i = self.line(off);
-        let line = &mut self.lines[i];
-        line.stopped = true;
-        let [_, r] = Relays::sides(&line.c, stage, tier);
-        r.word(off).store(v, Ordering::Release);
+    /// Stop carrying the counters at bytes `offs` and set each reader's
+    /// counter to `v`, within the caller's one hold of the lock: no pass
+    /// sees one of them stopped and another still carried while the released
+    /// card runs on and steps the counters it writes. Every line is found
+    /// before any is stopped, so a counter that does not cross panics with
+    /// nothing changed. The other counters carry on.
+    pub(super) fn release(&mut self, offs: &[usize], v: u32, stage: &dyn Page, tier: &dyn Page) {
+        let lines: Vec<usize> = offs.iter().map(|&off| self.line(off)).collect();
+        for &i in &lines {
+            self.lines[i].stopped = true;
+        }
+        for &i in &lines {
+            let c = &self.lines[i].c;
+            let [_, r] = Relays::sides(c, stage, tier);
+            r.word(c.counter).store(v, Ordering::Release);
+        }
     }
 
     /// Whether the counter at byte `off` is at rest after one more pass:
@@ -433,12 +441,10 @@ mod tests {
         let run = || -> Result<(), String> {
             let card = tier_card(tier.clone(), 1..=N + K, N, until);
             stage_card(&stage, 1..=N, N, until)?;
-            for off in [GO, CNT] {
-                relays
-                    .lock()
-                    .unwrap()
-                    .release(off, RELEASE, &*stage, &*tier);
-            }
+            relays
+                .lock()
+                .unwrap()
+                .release(&[GO, CNT], RELEASE, &*stage, &*tier);
             stage_card(&stage, N + 1..=N + K, N, until)?;
             card.join().unwrap()?;
             relays.lock().unwrap().reset(GO, &*stage, &*tier);
@@ -456,8 +462,8 @@ mod tests {
         let ran = run();
         quit.store(true, Ordering::Release);
         pump.join().unwrap();
-        assert_eq!(ran, Ok(()));
         let mut r = relays.lock().unwrap();
+        assert_eq!(ran, Ok(()), "the pump: {:?}", r.broken());
         assert_eq!(r.broken(), None);
         assert!(r.at_rest(GO, &*stage, &*tier) && r.at_rest(CNT, &*stage, &*tier));
         assert_eq!(
@@ -475,8 +481,7 @@ mod tests {
         let stage = page(&[]);
         let tier = page(&[]);
         let mut r = Relays::new(row(), &*stage, &*tier);
-        r.release(GO, RELEASE, &*stage, &*tier);
-        r.release(CNT, RELEASE, &*stage, &*tier);
+        r.release(&[GO, CNT], RELEASE, &*stage, &*tier);
         assert_eq!(stage.word(CNT).load(Ordering::Acquire), RELEASE);
         tier.word(CNT).store(2, Ordering::Release);
         tier.word(PROG).store(2, Ordering::Release);

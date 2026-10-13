@@ -19,10 +19,13 @@
 //!   on the writer's page; the cards' operations are the shared page's.
 //!
 //! The host touches the page's flag words through the link alone: it reads a
-//! word ([`Link::load`]), stores one ([`Link::store`]), and releases, checks
-//! at rest and resets a counter ([`Link::release`], [`Link::at_rest`],
-//! [`Link::reset`]). On the shared page each is one load or store; on the
-//! loopback each acts on the side of the counter it names.
+//! word ([`Link::load`]), stores one ([`Link::store`]),
+//! checks at rest and resets a counter ([`Link::at_rest`], [`Link::reset`]),
+//! and releases a tier's counters, all of them in one call
+//! ([`Link::release`]). On the shared page each word access is one load or
+//! store, and a release one store a counter; on the loopback each acts on
+//! the side of the counter it names, and a release on all of its counters
+//! under one hold of the pump's lock.
 
 mod pump;
 
@@ -53,6 +56,9 @@ pub(super) struct Link {
 struct Mirror {
     pump: Arc<Pump>,
     thread: Option<JoinHandle<()>>,
+    /// A test's tier card that runs on once released ([`Link::run_on`]).
+    #[cfg(test)]
+    run_on: Option<(usize, u32)>,
 }
 
 /// What the pump thread and the host share.
@@ -190,6 +196,8 @@ impl Link {
             mirror: Some(Mirror {
                 pump,
                 thread: Some(thread),
+                #[cfg(test)]
+                run_on: None,
             }),
             page,
         })
@@ -268,13 +276,22 @@ impl Link {
         self.word(off).store(v, Ordering::Release);
     }
 
-    /// Release every wait on the counter at byte `off` until a reset: the
-    /// counter its reader waits on goes to `v`, far past anything a step
-    /// subtracts. On the loopback that counter stops carrying first.
-    pub(super) fn release(&self, off: usize, v: u32) {
+    /// Release every wait on the counters at bytes `offs`, a tier's every
+    /// counter, until their resets: the counter each reader waits on goes to
+    /// `v`, far past anything a step subtracts. A tier's counters go in one
+    /// call: on the loopback it holds the pump's lock across all of them, so
+    /// no pass falls between two of them while the released card runs on and
+    /// steps the counters it writes.
+    pub(super) fn release(&self, offs: &[usize], v: u32) {
         match &self.mirror {
-            None => self.store(off, v),
-            Some(m) => m.pump.lock().release(off, v, &*m.pump.stage, &*m.pump.tier),
+            None => offs.iter().for_each(|&off| self.store(off, v)),
+            Some(m) => {
+                m.pump
+                    .lock()
+                    .release(offs, v, &*m.pump.stage, &*m.pump.tier);
+                #[cfg(test)]
+                m.after_release();
+            }
         }
     }
 
@@ -311,5 +328,27 @@ impl Link {
             .as_ref()
             .is_some_and(JoinHandle::is_finished)
             .then(|| "the link's pump thread has ended".to_string())
+    }
+}
+
+#[cfg(test)]
+impl Link {
+    /// A tier card that runs on once released, for a test over the
+    /// loopback: after each release the counter at byte `off` steps by `by`
+    /// on the tier cards' page, and the pump makes one pass before the host
+    /// takes its lock again.
+    pub(super) fn run_on(&mut self, off: usize, by: u32) {
+        self.mirror.as_mut().expect("a loopback link").run_on = Some((off, by));
+    }
+}
+
+#[cfg(test)]
+impl Mirror {
+    /// [`Link::run_on`]'s step, after a release has dropped the pump's lock.
+    fn after_release(&self) {
+        if let Some((off, by)) = self.run_on {
+            pump::Page::word(&*self.pump.tier, off).fetch_add(by, Ordering::Release);
+            self.pump.lock().pass(&*self.pump.stage, &*self.pump.tier);
+        }
     }
 }
