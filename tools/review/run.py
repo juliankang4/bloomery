@@ -72,7 +72,7 @@ def available_engines(env):
 
 def read(path):
     try:
-        return open(path, encoding="utf-8").read()
+        return open(path, encoding="utf-8", errors="replace").read()
     except OSError:
         return None
 
