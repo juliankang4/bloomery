@@ -98,6 +98,7 @@ pub mod census;
 pub mod handoff;
 pub mod lane;
 pub mod leg;
+mod link;
 pub mod nvtier;
 pub mod page;
 pub mod prompt_stream;

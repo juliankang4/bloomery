@@ -10,17 +10,18 @@
 //! tier:  wait tier go, −1 → copy x, places in → [gate·up → h q8_1 → down] → copy rows out → barrier → cnt +1, prog +1
 //! ```
 //!
-//! The tiers' words live in one host-mapped page ([`TierPage`], laid out by
-//! [`TierLayout`]) the host tier owns. Per tier it holds that tier's flag
-//! lines: per row a go counter the stage card adds one to and the tier takes
-//! back, and a counter the tier adds one to and the stage card's wait takes
-//! back — the host tier's counter rule, one writer at a time — then the
-//! progress word, which the tier adds one to per layer served and the host
-//! reads, and the tier's fault copy. Per row it holds the image the stage
-//! card's handoff writes — each tier's places of the routed slots, then the
-//! stage card's q8_1 activation, which every tier reads — and the rows the
-//! tiers' downs computed, one per routed slot, each tier its own slots, which
-//! the stage card's join reads in place.
+//! The tiers' words live in one page ([`TierPage`], laid out by
+//! [`TierLayout`]) the host tier owns, which the stage card, each tier card
+//! and the host reach over its link (the `link` module). Per tier it holds
+//! that tier's flag lines: per row a go counter the stage card adds one to
+//! and the tier takes back, and a counter the tier adds one to and the stage
+//! card's wait takes back — the host tier's counter rule, one writer at a
+//! time — then the progress word, which the tier adds one to per layer
+//! served and the host reads, and the tier's fault copy. Per row it holds
+//! the image the stage card's handoff writes — each tier's places of the
+//! routed slots, then the stage card's q8_1 activation, which every tier
+//! reads — and the rows the tiers' downs computed, one per routed slot, each
+//! tier its own slots, which the stage card's join reads in place.
 //!
 //! A tier's launches write their rows into the tier card's own memory
 //! ([`TierIo::rows`]), and one copy a layer moves the go's columns of them
@@ -63,11 +64,12 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread}
 use cuda_host::cuda_module;
 use model::placement::Machine;
 
+use super::link::{Link, LinkEnd};
 use super::page::MAX_ROWS;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::step::{Boundary, Chain, RELEASE};
 use crate::fault::{FAULT_NONE, Fault};
-use crate::graph::{Graph, MappedHost, cu, mem_batch, op_add, op_barrier_sys, op_wait_geq};
+use crate::graph::{Graph, cu, mem_batch, op_add, op_barrier_sys, op_wait_geq};
 use crate::tensor::window;
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError, Q8Act};
@@ -537,15 +539,15 @@ impl Drop for StageRow {
     }
 }
 
-/// The tier page: the host-mapped memory every tier card and the stage card
-/// reach at one address ([`TierLayout`]), allocated in the stage card's
+/// The tier page: the bytes every tier card and the stage card reach over
+/// the link ([`TierLayout`] lays them out), allocated in the stage card's
 /// context, and the stage card's windows over it. The host tier owns it and
 /// drops it after its tier cards, whose graphs and windows address it.
 ///
-/// Field order is drop order: the windows before the page.
+/// Field order is drop order: the windows before the link.
 pub struct TierPage {
     stage: Vec<StageRow>,
-    page: MappedHost,
+    link: Link,
     layout: TierLayout,
 }
 
@@ -558,17 +560,18 @@ impl TierPage {
         let bytes = layout
             .bytes()
             .ok_or_else(|| GpuError::shape("TierPage::new", "the page's size passes usize"))?;
-        let page = MappedHost::new(ctx, bytes, "cuMemHostAlloc (tier page)")?;
+        let link = Link::shared(ctx, bytes)?;
         for t in 0..layout.tiers {
             // SAFETY: tier t's fault copy's two words lie in its flag lines,
             // inside the page.
             unsafe {
-                page.host_at(layout.word_off(t, TWord::Fault))
+                link.host_at(layout.word_off(t, TWord::Fault))
                     .cast::<u32>()
                     .write_volatile(FAULT_NONE);
             }
         }
         let img = layout.image;
+        let end = link.stage_end();
         let stage_rows = (0..layout.rows)
             .map(|r| {
                 // SAFETY: row r's image (`img.words()` words, every tier's
@@ -579,9 +582,9 @@ impl TierPage {
                 // the page (field order).
                 unsafe {
                     StageRow {
-                        image: window::<u32>(page.dev_at(layout.image_off(r)), img.words(), ctx),
+                        image: window::<u32>(end.dev(layout.image_off(r)), img.words(), ctx),
                         rows: window::<f32>(
-                            page.dev_at(layout.rows_off(r)),
+                            end.dev(layout.rows_off(r)),
                             img.n_used * img.cols * img.hidden,
                             ctx,
                         ),
@@ -591,7 +594,7 @@ impl TierPage {
             .collect();
         Ok(TierPage {
             stage: stage_rows,
-            page,
+            link,
             layout,
         })
     }
@@ -663,10 +666,11 @@ impl TierPage {
         self.check_row(row, what)?;
         let k = self.check_tiers(tiers, layer as usize, what)?;
         let (lyr, gen_, seq) = boundary.go_words(row, what)?;
+        let end = self.link.stage_end();
         let mut ops = [op_barrier_sys(); 5 + MAX_TIERS];
         ops[1] = crate::graph::op_write(lyr, layer);
         for (op, &t) in ops[2..].iter_mut().zip(tiers) {
-            *op = op_add(self.page.dev_at(self.layout.word_off(t, TWord::Go(row))), 1);
+            *op = op_add(end.dev(self.layout.word_off(t, TWord::Go(row))), 1);
         }
         ops[3 + k] = op_add(gen_, 1);
         ops[4 + k] = op_add(seq, 1);
@@ -702,10 +706,11 @@ impl TierPage {
         self.check_row(row, what)?;
         let k = self.check_tiers(tiers, layer, what)?;
         let host = boundary.cnt_word(row, what)?;
+        let end = self.link.stage_end();
         let mut ops = [op_wait_geq(host, 1); 2 + 2 * MAX_TIERS];
         ops[1 + k] = op_add(host, u32::MAX);
         for (i, &t) in tiers.iter().enumerate() {
-            let cnt = self.page.dev_at(self.layout.word_off(t, TWord::Cnt(row)));
+            let cnt = end.dev(self.layout.word_off(t, TWord::Cnt(row)));
             ops[1 + i] = op_wait_geq(cnt, 1);
             ops[2 + k + i] = op_add(cnt, u32::MAX);
         }
@@ -743,19 +748,14 @@ impl TierPage {
         }
     }
 
-    /// The device address of tier `tier`'s word `w`.
-    fn dev(&self, tier: usize, w: TWord) -> sys::CUdeviceptr {
-        self.page.dev_at(self.layout.word_off(tier, w))
-    }
-
     /// Tier `tier`'s word `w` as the host reads and writes it.
     fn word(&self, tier: usize, w: TWord) -> &AtomicU32 {
         self.word_at(self.layout.word_off(tier, w))
     }
 
     fn word_at(&self, off: usize) -> &AtomicU32 {
-        self.page
-            .atomic_u32(off)
+        self.link
+            .word(off)
             .expect("every tier flag word lies in the page's flag lines")
     }
 }
@@ -968,6 +968,9 @@ pub struct TierCard {
     /// Per row, the page's routed rows in this card's context: made when the
     /// host tier binds the card to its page ([`TierCard::bind`]).
     rows: Vec<TierRows>,
+    /// The card's end of the page's link, in this card's context: made when
+    /// the host tier binds the card to its page.
+    end: Option<LinkEnd>,
     /// The card's tier on the page: its index in the host tier's tiers.
     index: usize,
     shape: TierShape,
@@ -1045,6 +1048,7 @@ impl TierCard {
             out: DeviceBuffer::zeroed(stream, cols * shape.n_used * shape.hidden)?,
             act,
             rows: Vec::new(),
+            end: None,
             index: 0,
             shape,
             cols,
@@ -1188,14 +1192,13 @@ impl TierCard {
             .enqueue_block(&self.gpu, &self.weights, layer, io)
     }
 
-    /// Bind the card to `page` as tier `index`: its windows over the page's
-    /// routed rows in its own context, and `stage`'s stream and fault word
-    /// kept. The page was allocated in `stage`'s context, and the card's
-    /// staging copies and its waits take the page's device address from
-    /// there, so the page must sit at that address in this card's context too
-    /// (unified addressing), else the call is refused by name; a page laid
-    /// out for another shape is refused too. The host tier's load-time call;
-    /// `stage`'s context is current on return.
+    /// Bind the card to `page` as tier `index`: its end of the page's link
+    /// and its windows over the page's routed rows, in its own context, and
+    /// `stage`'s stream and fault word kept. The card's staging copies and
+    /// its waits take their addresses from that end; an end the link refuses
+    /// ([`Link::tier_end`]) refuses the call by name, and so does a page laid
+    /// out for another shape. The host tier's load-time call; `stage`'s
+    /// context is current on return.
     pub(super) fn bind(
         &mut self,
         page: &TierPage,
@@ -1214,25 +1217,7 @@ impl TierCard {
             ));
         }
         let ctx = self.gpu.context();
-        ctx.bind_to_thread()?;
-        let mut dev: sys::CUdeviceptr = 0;
-        // SAFETY: this card's context is current on this thread (bound
-        // above), `dev` is a live local the call writes, and the page's first
-        // byte is the start of its live mapped allocation; the flags must be 0.
-        let rc =
-            unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, page.page.host_at(0).cast(), 0) };
-        cu(rc, "cuMemHostGetDevicePointer_v2 (tier page, tier context)")?;
-        if dev != page.page.dev_at(0) {
-            return Err(GpuError::shape(
-                BIND,
-                format!(
-                    "the tier page is at {:#x} in the stage card's context and at {dev:#x} in the \
-                     tier {}'s: the tier's copies and the stage's waits need one address",
-                    page.page.dev_at(0),
-                    self.name
-                ),
-            ));
-        }
+        let end = page.link.tier_end(ctx, BIND, &self.name)?;
         let img = layout.image;
         self.rows = (0..layout.rows)
             .map(|r| {
@@ -1242,13 +1227,14 @@ impl TierCard {
                 // its cards.
                 TierRows(unsafe {
                     window::<f32>(
-                        page.page.dev_at(layout.rows_off(r)),
+                        end.dev(layout.rows_off(r)),
                         img.n_used * img.cols * img.hidden,
                         ctx,
                     )
                 })
             })
             .collect();
+        self.end = Some(end);
         self.index = index;
         self.stage = Some(Stage {
             stream: stage.stream_handle(),
@@ -1346,6 +1332,7 @@ impl TierCard {
             sel,
             out,
             rows,
+            end,
             index,
             weights,
             gpu,
@@ -1359,6 +1346,7 @@ impl TierCard {
             out,
             rows,
             page,
+            end: *end,
             index: *index,
             weights,
             gpu,
@@ -1614,6 +1602,10 @@ struct Parts<'a> {
     out: &'a mut DeviceBuffer<f32>,
     rows: &'a mut [TierRows],
     page: &'a TierPage,
+    /// The card's end of the page's link: every device address the layer's
+    /// copies and stream memory operations take. Set with `rows`; a card
+    /// without it has no rows and refuses every row.
+    end: Option<LinkEnd>,
     index: usize,
     weights: &'a Weights,
     gpu: &'a Gpu,
@@ -1638,17 +1630,20 @@ impl Parts<'_> {
         let stream = self.gpu.stream();
         let (page, t) = (self.page, self.index);
         let img = page.layout.image(t)?;
-        if row >= self.rows.len() || !(1..=img.cols).contains(&cols) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "row {row} of {cols} columns on a tier page of {} rows of {} columns",
-                    self.rows.len(),
-                    img.cols
-                ),
-            ));
-        }
-        let go = page.dev(t, TWord::Go(row));
+        let end = match self.end {
+            Some(end) if row < self.rows.len() && (1..=img.cols).contains(&cols) => end,
+            _ => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "row {row} of {cols} columns on a tier page of {} rows of {} columns",
+                        self.rows.len(),
+                        img.cols
+                    ),
+                ));
+            }
+        };
+        let go = end.dev(page.layout.word_off(t, TWord::Go(row)));
         // SAFETY: this tier's go word of row `row` lies in the page (row
         // checked above), which the host tier drops after its tier cards and
         // so after every graph that captured this batch.
@@ -1683,27 +1678,27 @@ impl Parts<'_> {
                 copy_page(
                     stream,
                     a.q3.cu_deviceptr(),
-                    page.page.dev_at(at + 4 * img.q3),
+                    end.dev(at + 4 * img.q3),
                     4 * part(img.q3_words),
                 )?;
                 copy_page(
                     stream,
                     a.d8.cu_deviceptr(),
-                    page.page.dev_at(at + 4 * img.d8),
+                    end.dev(at + 4 * img.d8),
                     4 * part(img.d8_len),
                 )?;
             }
             Staged::F32(x) => copy_page(
                 stream,
                 x.cu_deviceptr(),
-                page.page.dev_at(at + 4 * img.x),
+                end.dev(at + 4 * img.x),
                 4 * part(img.x_len),
             )?,
         }
         copy_page(
             stream,
             self.sel.cu_deviceptr(),
-            page.page.dev_at(at + 4 * img.sel),
+            end.dev(at + 4 * img.sel),
             4 * img.n_used * cols,
         )?;
         self.experts.enqueue_layer(
@@ -1728,7 +1723,8 @@ impl Parts<'_> {
             // SAFETY: the fault copy's two words lie in this tier's flag
             // lines; the window is used for this launch only and never
             // dropped as a buffer (its raw parts are, below).
-            let mut out = unsafe { window::<u32>(page.dev(t, TWord::Fault), 2, ctx) };
+            let mut out =
+                unsafe { window::<u32>(end.dev(page.layout.word_off(t, TWord::Fault)), 2, ctx) };
             let prep = self
                 .module
                 .prepare_tier_fault_copy(LaunchConfig1D::new(1, 32, 0))?;
@@ -1748,8 +1744,8 @@ impl Parts<'_> {
                 stream,
                 &mut [
                     op_barrier_sys(),
-                    op_add(page.dev(t, TWord::Cnt(row)), 1),
-                    op_add(page.dev(t, TWord::Prog), 1),
+                    op_add(end.dev(page.layout.word_off(t, TWord::Cnt(row))), 1),
+                    op_add(end.dev(page.layout.word_off(t, TWord::Prog)), 1),
                 ],
                 "cuStreamBatchMemOp_v2 (tier signal)",
             )
