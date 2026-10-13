@@ -3,8 +3,8 @@
 #
 # No person is in the loop. Signals are outcomes code can see (tools/review/signals.py); the model only proposes
 # (candidates.json); ledger.py writes the issue body, puts each candidate in force with its guards, renews a lesson
-# that was used and expires one that was not. A maintainer's one move is a veto (strike a line). The key and the
-# issues-write token never share a job.
+# that was used and expires one that was not. A maintainer's one move is a veto (strike a line). The logins and the
+# issues-write token never share a job. The engine is chosen as in review.yml (REVIEW_ENGINE, then the fallback).
 name: Shingler learner
 
 on:
@@ -27,6 +27,9 @@ concurrency:
 env:
   CLAUDE_CODE_VERSION: 2.1.284
   REVIEW_MODEL: claude-sonnet-5-5
+  CODEX_VERSION: 0.160.0
+  REVIEW_CODEX_MODEL: gpt-6.1-sol
+  REVIEW_ENGINE: ${{ vars.REVIEW_ENGINE || 'claude' }}
 
 jobs:
   collect:
@@ -68,7 +71,9 @@ jobs:
     needs: collect
     if: needs.collect.outputs.has_signals == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45   # the learner may run on both engines, 15 + 15 minutes (tools/review/run.py MINUTES)
+    outputs:
+      learned: ${{ steps.learn.outputs.done }}
     permissions:
       contents: read
     steps:
@@ -81,20 +86,77 @@ jobs:
         with:
           name: signals
           path: ctx
+      # The logins, as in review.yml: each secret is read in this step only.
+      - name: Logins
+        id: logins
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          set -euo pipefail
+          claude=false; codex=false
+          [ -z "$ANTHROPIC_API_KEY" ] || claude=true
+          if [ -n "$CODEX_AUTH_JSON" ]; then
+            mkdir -m 700 "$CODEX_HOME"
+            (umask 077; printenv CODEX_AUTH_JSON > "$CODEX_HOME/auth.json")
+            jq -r '.. | strings | select(length >= 16)' "$CODEX_HOME/auth.json" | while IFS= read -r v; do
+              echo "::add-mask::$v"
+            done || echo "::warning::CODEX_AUTH_JSON is not JSON"
+            codex=true
+          fi
+          case "$REVIEW_ENGINE" in
+            claude|codex) ;;
+            *) echo "::warning::REVIEW_ENGINE is '$REVIEW_ENGINE', not claude or codex; claude goes first" ;;
+          esac
+          printf 'claude=%s\ncodex=%s\n' "$claude" "$codex" >> "$GITHUB_OUTPUT"
+          echo "logins: claude=$claude codex=$codex; tried first: $REVIEW_ENGINE" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/cache@v4
         with:
           path: ~/.npm
-          key: npm-claude-code-${{ env.CLAUDE_CODE_VERSION }}
+          key: npm-claude-code-${{ env.CLAUDE_CODE_VERSION }}-codex-${{ env.CODEX_VERSION }}
+      # A failed install leaves that engine out, as in review.yml.
       - name: Install Claude Code
+        if: steps.logins.outputs.claude == 'true'
+        continue-on-error: true
         run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+      - name: Install Codex
+        if: steps.logins.outputs.codex == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          npm install -g "@openai/codex@$CODEX_VERSION"
+          if [ "$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo 1)" != 1 ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      # With no engine able to run (run.py exit 75) there are no candidates this week: the update still runs, and its
+      # run line says "learner not run".
       - name: Learn
+        id: learn
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+          CODEX_HOME: ${{ runner.temp }}/codex-home
         run: |
+          set -o pipefail
           mkdir -p out trace
-          bash base/tools/review/run-claude.sh learner "$PWD/base" "$PWD/base" "$PWD/ctx" "$PWD/out" "$PWD/trace"
-          test -f out/candidates.json || echo '[]' > out/candidates.json
+          rc=0
+          python3 base/tools/review/run.py learner "$PWD/base" "$PWD/base" "$PWD/ctx" "$PWD/out" "$PWD/trace" \
+            | tee -a "$GITHUB_STEP_SUMMARY" || rc=$?
+          echo "done=$([ "$rc" -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -eq 75 ]; then
+            echo "::warning::no engine could run the learner; no candidates this week (see the summary)"
+            exit 0
+          fi
+          exit "$rc"
+      - name: Delete the Codex login
+        if: always()
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: rm -rf "$CODEX_HOME"
       - name: Record usage
         if: always()
         run: |
@@ -103,7 +165,7 @@ jobs:
           p = "trace/learner.usage.json"
           if os.path.exists(p):
               u = json.load(open(p))
-              print(f"learner: {u['subtype']} turns={u['num_turns']} cost_usd={u['cost_usd']} "
+              print(f"learner: {u.get('engine', 'claude')} {u['subtype']} turns={u['num_turns']} cost_usd={u['cost_usd']} "
                     f"ctx_max={u['context_max']} ctx_sum={u['context_sum']} tools={u['tools']}")
           EOF
       - uses: actions/upload-artifact@v4
@@ -113,6 +175,7 @@ jobs:
           path: trace
           retention-days: 30
       - uses: actions/upload-artifact@v4
+        if: steps.learn.outputs.done == 'true'
         with:
           name: candidates
           path: |
@@ -138,7 +201,7 @@ jobs:
           name: signals
           path: ctx
       - uses: actions/download-artifact@v4
-        if: needs.learn.result == 'success'
+        if: needs.learn.outputs.learned == 'true'
         with:
           name: candidates
           path: cand

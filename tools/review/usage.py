@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
-"""Token and tool accounting for one review bot run, from Claude Code's stream-json transcript.
+"""Token and tool accounting for one review bot run, from Claude Code's stream-json transcript or Codex's JSONL events.
 
-    tools/review/usage.py ROLE TRANSCRIPT.ndjson OUT.json
+    tools/review/usage.py ROLE TRANSCRIPT.ndjson OUT.json [claude|codex]
     tools/review/usage.py --self-test
 
-Writes OUT.json and prints one line. The fields are what a later optimization needs: how the run ended, its turns,
-cost and wall time; tokens by kind (input, cache read, cache write, output); the context each request carried (max
-and sum: every turn re-sends it, so the sum is what the run paid for); tool calls by tool, denials, and the files
-read most often with how many times. Exit 1 when the transcript has no result event or the result is an error;
-OUT.json is written either way.
+Writes OUT.json and prints one line. The fields are what a later optimization needs: the engine, how the run ended,
+its turns, cost and wall time; tokens by kind (input, cache read, cache write, output); the context each request
+carried (max and sum: every turn re-sends it, so the sum is what the run paid for); tool calls by tool, denials, and
+the files read most often with how many times; the last error message, whole (tools/review/run.py removes
+credentials from it before it shortens it). A Codex stream (`codex exec --json`) reports only the turn's summed tokens
+and no cost (a ChatGPT login has no per-run price), so its requests, context_max, turns, cost and reads are None; its
+tools are the item types, and a command the sandbox refused counts as a denial. Without ENGINE, a stream with Codex's
+thread or turn events is Codex's. Exit 1 when the transcript has no result event (Codex: no completed turn) or the
+result is an error; OUT.json is written either way.
 """
 
 import collections
 import json
+import re
 import sys
 import tempfile
 
 
-def summarize(role, lines):
-    tools = collections.Counter()
-    reads = collections.Counter()
-    denied = 0
-    contexts = []
-    result = None
-    seen_msgs = set()
+def events(lines):
     for raw in lines:
         raw = raw.strip()
         if not raw:
@@ -32,6 +31,70 @@ def summarize(role, lines):
             ev = json.loads(raw)
         except ValueError:
             continue
+        if isinstance(ev, dict):
+            yield ev
+
+
+def summarize_codex(role, evs):
+    tools = collections.Counter()
+    denied = 0
+    done = failed = False
+    usage, error = {}, None
+    for ev in evs:
+        kind = ev.get("type")
+        item = ev.get("item") or {}
+        if kind == "item.completed" and item.get("type") not in (None, "agent_message", "reasoning", "todo_list",
+                                                                 "error"):
+            tools[item["type"]] += 1
+            refused = r"Operation not permitted|Permission denied|Read-only file system"
+            if item["type"] == "command_execution" and item.get("exit_code") != 0 and re.search(
+                    refused, item.get("aggregated_output") or ""):
+                denied += 1
+        elif kind == "turn.completed":
+            done, usage = True, ev.get("usage") or {}
+        elif kind == "turn.failed":
+            failed, error = True, (ev.get("error") or {}).get("message")
+        elif kind == "error":
+            error = ev.get("message")
+    total, cached = usage.get("input_tokens"), usage.get("cached_input_tokens") or 0
+    return {
+        "role": role,
+        "engine": "codex",
+        "subtype": "error" if failed else "success" if done else "no-result",
+        "is_error": failed or not done,
+        "error": error or None,
+        "num_turns": None,
+        "duration_ms": None,
+        "cost_usd": None,
+        "tokens": {
+            "input": None if total is None else total - cached,
+            "cache_read": usage.get("cached_input_tokens"),
+            "cache_write": usage.get("cache_write_input_tokens"),
+            "output": usage.get("output_tokens"),
+            "reasoning": usage.get("reasoning_output_tokens"),
+        },
+        "requests": None,
+        "context_max": None,
+        "context_sum": total,
+        "tools": dict(tools.most_common()),
+        "tool_calls": sum(tools.values()),
+        "denied": denied,
+        "reads_top": [],
+        "reads_distinct": None,
+    }
+
+
+def summarize(role, lines, engine=None):
+    evs = list(events(lines))
+    if engine == "codex" or engine is None and any(e.get("type") in ("thread.started", "turn.started") for e in evs):
+        return summarize_codex(role, evs)
+    tools = collections.Counter()
+    reads = collections.Counter()
+    denied = 0
+    contexts = []
+    result = None
+    seen_msgs = set()
+    for ev in evs:
         kind = ev.get("type")
         if kind == "assistant":
             msg = ev.get("message", {})
@@ -59,10 +122,13 @@ def summarize(role, lines):
             result = ev
     r = result or {}
     u = r.get("usage") or {}
+    is_error = bool(r.get("is_error", result is None))
     return {
         "role": role,
+        "engine": "claude",
         "subtype": r.get("subtype", "no-result"),
-        "is_error": bool(r.get("is_error", result is None)),
+        "is_error": is_error,
+        "error": (str(r.get("result") or "") or None) if is_error else None,
         "num_turns": r.get("num_turns"),
         "duration_ms": r.get("duration_ms"),
         "cost_usd": r.get("total_cost_usd"),
@@ -86,7 +152,8 @@ def summarize(role, lines):
 def line(s):
     tools = ",".join(f"{k}:{v}" for k, v in s["tools"].items()) or "none"
     cost = s["cost_usd"]
-    return (f"{s['role']}: {s['subtype']} turns={s['num_turns']} requests={s['requests']} "
+    return (f"{s['role']}: {s['engine']} {s['subtype']} turns={s['num_turns']} "
+            f"requests={s['requests']} "
             f"cost_usd={cost if cost is None else round(cost, 4)} ctx_max={s['context_max']} ctx_sum={s['context_sum']} "
             f"out={s['tokens']['output']} tools={tools} denied={s['denied']} reads={s['reads_distinct']}")
 
@@ -119,6 +186,23 @@ def self_test():
     assert "tools=Read:2,Grep:1" in line(s) and "cost_usd=0.0123" in line(s), line(s)
     none = summarize("validator", [])
     assert none["subtype"] == "no-result" and none["is_error"], none
+    cx = [{"type": "thread.started", "thread_id": "t"}, {"type": "turn.started"},
+          {"type": "item.completed", "item": {"type": "agent_message", "text": "x"}},
+          {"type": "item.completed", "item": {"type": "command_execution", "exit_code": 0, "aggregated_output": "a"}},
+          {"type": "item.completed", "item": {"type": "command_execution", "exit_code": 1,
+                                              "aggregated_output": "cat: /h/auth.json: Operation not permitted"}},
+          {"type": "item.completed", "item": {"type": "file_change", "status": "completed"}},
+          {"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 800,
+                                               "cache_write_input_tokens": 0, "output_tokens": 50}}]
+    c = summarize("reviewer", [json.dumps(e) for e in cx])
+    assert (c["engine"], c["subtype"], c["is_error"], c["cost_usd"]) == ("codex", "success", False, None), c
+    assert c["tools"] == {"command_execution": 2, "file_change": 1} and c["denied"] == 1, c
+    assert c["tokens"]["input"] == 200 and c["context_sum"] == 1000 and "codex success" in line(c), c
+    cf = summarize("reviewer", [json.dumps(e) for e in cx[:2] + [
+        {"type": "turn.failed", "error": {"message": "You've hit your usage limit."}}]])
+    assert cf["is_error"] and cf["subtype"] == "error" and "usage limit" in cf["error"], cf
+    # A Codex run that died before its first event is still Codex's.
+    assert summarize("reviewer", ["Reading additional input"], "codex")["engine"] == "codex"
     with tempfile.NamedTemporaryFile("w", suffix=".ndjson", delete=False) as f:
         f.write("\n".join(json.dumps(e) for e in ev))
     out = f.name + ".json"
@@ -131,14 +215,14 @@ def main(argv):
     if argv[1:] == ["--self-test"]:
         self_test()
         return 0
-    if len(argv) != 4:
+    if len(argv) not in (4, 5) or argv[4:] not in ([], ["claude"], ["codex"]):
         print(__doc__, file=sys.stderr)
         return 64
     try:
         lines = open(argv[2], encoding="utf-8", errors="replace").readlines()
     except OSError:
         lines = []
-    s = summarize(argv[1], lines)
+    s = summarize(argv[1], lines, argv[4] if len(argv) == 5 else None)
     with open(argv[3], "w", encoding="utf-8") as f:
         json.dump(s, f, indent=1)
     print(line(s))

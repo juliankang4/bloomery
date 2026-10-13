@@ -6,11 +6,19 @@
 # pull_request_target, so a fork's pull request gets the API key, and the trust rules that follow from it:
 # - This file, the instructions and tools/review/ come from the base branch. A pull request cannot change what
 #   reviews it.
-# - Nothing from the PR head is executed. Its tree is checked out as data; the diagnostics parse it, the reviewer
-#   reads it with Read/Grep/Glob only (no Bash, no web).
-# - The API key and the write token never share a job: `review` holds the key with a read-only token, `post` holds
-#   pull-requests and issues write and no key. post.py refuses to post output that carries the key or a token-shaped
-#   string, and files at most two issues a run.
+# - The PR head is checked out as data. The diagnostics parse it, and Claude reads it with Read/Grep/Glob only (no
+#   Bash, no web). Codex reads it with shell commands, and the PR's text can steer which commands the model runs,
+#   scripts from the PR included. Those commands run in a sandbox (tools/review/run-codex.sh): they read the trees,
+#   CTX, the Codex install and system paths such as /usr and /etc, write only OUT, and have no network. Before each
+#   run a sandbox check tries a read beside the login, a write into the PR tree and a connection; if one works, Codex
+#   does not run.
+# - The engine: REVIEW_ENGINE (a repository variable; claude when unset) is tried first and the other engine is the
+#   fallback, each only when its login is there (tools/review/run.py). With no engine able to review, the run ends
+#   without a review and says why in the summary.
+# - The logins and the write token never share a job: `review` holds ANTHROPIC_API_KEY and the Codex login
+#   (CODEX_AUTH_JSON, written to a file outside the trees) with a read-only token, `post` holds pull-requests and
+#   issues write and no login. post.py refuses to post output that carries a login or a token-shaped string, and
+#   files at most two issues a run.
 name: Shingler
 
 on:
@@ -32,6 +40,9 @@ concurrency:
 env:
   CLAUDE_CODE_VERSION: 2.1.284
   REVIEW_MODEL: claude-sonnet-5-5
+  CODEX_VERSION: 0.160.0
+  REVIEW_CODEX_MODEL: gpt-6.1-sol
+  REVIEW_ENGINE: ${{ vars.REVIEW_ENGINE || 'claude' }}
   # The automatic reviews a pull request gets before it needs a workflow_dispatch run.
   REVIEW_CAP: 5
 
@@ -174,10 +185,13 @@ jobs:
     needs: [gate, diagnostics]
     if: always() && needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Each role may run on both engines: reviewer 20 + 20 minutes, validator 10 + 10 (tools/review/run.py MINUTES).
+    timeout-minutes: 75
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      reviewed: ${{ steps.check.outcome == 'success' }}
     steps:
       # Instructions, contracts and tools at the head of the branch this workflow runs from, not the pull request's
       # base commit: the review holds a PR to today's contract, and an older base may predate the tools.
@@ -194,7 +208,8 @@ jobs:
           ref: ${{ needs.gate.outputs.head_sha }}
           path: pr
           persist-credentials: false
-          # A fork head under pull_request_target: checked out as data only (nothing from it runs; see the header).
+          # A fork head under pull_request_target: checked out as data (Codex's commands run in its sandbox; see the
+          # header).
           allow-unsafe-pr-checkout: true
       - uses: actions/download-artifact@v4
         continue-on-error: true
@@ -244,37 +259,115 @@ jobs:
           if [ -f ctx-diag/diagnostics.md ]; then cp ctx-diag/diagnostics.md ctx/; else
             echo "The diagnostics job did not finish; no dryer or crapper results for this review." > ctx/diagnostics.md; fi
           echo "context: mode=$mode diff=$(wc -l < ctx/diff.patch) lines files=$(wc -l < ctx/files.txt)" | tee -a "$GITHUB_STEP_SUMMARY"
+      # The logins: each secret is read in this step only. The Codex login becomes CODEX_HOME/auth.json, outside the
+      # trees and OUT, and every long string in it is masked in the log; the cleanup step below deletes it.
+      - name: Logins
+        id: logins
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          set -euo pipefail
+          claude=false; codex=false
+          [ -z "$ANTHROPIC_API_KEY" ] || claude=true
+          if [ -n "$CODEX_AUTH_JSON" ]; then
+            mkdir -m 700 "$CODEX_HOME"
+            (umask 077; printenv CODEX_AUTH_JSON > "$CODEX_HOME/auth.json")
+            jq -r '.. | strings | select(length >= 16)' "$CODEX_HOME/auth.json" | while IFS= read -r v; do
+              echo "::add-mask::$v"
+            done || echo "::warning::CODEX_AUTH_JSON is not JSON"
+            codex=true
+          fi
+          case "$REVIEW_ENGINE" in
+            claude|codex) ;;
+            *) echo "::warning::REVIEW_ENGINE is '$REVIEW_ENGINE', not claude or codex; claude goes first" ;;
+          esac
+          printf 'claude=%s\ncodex=%s\n' "$claude" "$codex" >> "$GITHUB_OUTPUT"
+          echo "logins: claude=$claude codex=$codex; tried first: $REVIEW_ENGINE" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/cache@v4
         with:
           path: ~/.npm
-          key: npm-claude-code-${{ env.CLAUDE_CODE_VERSION }}
+          key: npm-claude-code-${{ env.CLAUDE_CODE_VERSION }}-codex-${{ env.CODEX_VERSION }}
+      # A failed install leaves that engine out (run.py finds no CLI) and the other one still runs.
       - name: Install Claude Code
+        if: steps.logins.outputs.claude == 'true'
+        continue-on-error: true
         run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+      # The Codex sandbox is bubblewrap, which needs unprivileged user namespaces; Ubuntu's AppArmor gate denies them.
+      # When it cannot start, run-codex.sh's sandbox check fails and Claude runs.
+      - name: Install Codex
+        if: steps.logins.outputs.codex == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          npm install -g "@openai/codex@$CODEX_VERSION"
+          if [ "$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo 1)" != 1 ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      # run.py prints which engine did each role and why another did not; exit 75 is "no engine could", which ends the
+      # job without a review and with a warning instead of failing it.
       - name: Review
+        id: review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
-        run: bash base/tools/review/run-claude.sh reviewer "$PWD/base" "$PWD/pr" "$PWD/ctx" "$PWD/out" "$PWD/trace"
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          set -o pipefail
+          rc=0
+          python3 base/tools/review/run.py reviewer "$PWD/base" "$PWD/pr" "$PWD/ctx" "$PWD/out" "$PWD/trace" \
+            | tee -a "$GITHUB_STEP_SUMMARY" || rc=$?
+          echo "done=$([ "$rc" -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -eq 75 ]; then
+            echo "::warning::no engine could run the reviewer; no review this run (see the summary)"
+            exit 0
+          fi
+          exit "$rc"
       - name: Validate
+        id: validate
+        if: steps.review.outputs.done == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
-        run: bash base/tools/review/run-claude.sh validator "$PWD/base" "$PWD/pr" "$PWD/ctx" "$PWD/out" "$PWD/trace"
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          set -o pipefail
+          rc=0
+          python3 base/tools/review/run.py validator "$PWD/base" "$PWD/pr" "$PWD/ctx" "$PWD/out" "$PWD/trace" \
+            | tee -a "$GITHUB_STEP_SUMMARY" || rc=$?
+          echo "done=$([ "$rc" -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -eq 75 ]; then
+            echo "::warning::no engine could run the validator; no review this run (see the summary)"
+            exit 0
+          fi
+          exit "$rc"
       - name: Check the output
+        id: check
+        if: steps.validate.outputs.done == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
         run: |
           python3 base/tools/review/post.py check --out out --diff ctx/diff.patch --pr-json ctx/pr.json --files ctx/files.txt \
             --device ctx/device-dirs.txt \
-            --base "$PWD/base" --secret-env ANTHROPIC_API_KEY \
+            --base "$PWD/base" --secret-env ANTHROPIC_API_KEY --secret-file "$CODEX_HOME/auth.json" \
             --usage trace/reviewer.usage.json --usage trace/validator.usage.json
+      - name: Delete the Codex login
+        if: always()
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: rm -rf "$CODEX_HOME"
       # Token and tool accounting for later optimization: the summary lines here, the full transcripts and
       # tools/review/usage.py's JSON in the review-trace artifact (also on a failed run).
       - name: Record usage
         if: always()
         run: |
           for r in reviewer validator; do
-            [ -f "trace/$r.usage.json" ] && python3 -c "import json,sys;u=json.load(open(sys.argv[1]));print(f\"{u['role']}: turns={u['num_turns']} requests={u['requests']} cost_usd={u['cost_usd']} ctx_max={u['context_max']} ctx_sum={u['context_sum']} out={u['tokens']['output']} tools={u['tools']} denied={u['denied']} reads={u['reads_distinct']}\")" "trace/$r.usage.json"
+            [ -f "trace/$r.usage.json" ] && python3 -c "import json,sys;u=json.load(open(sys.argv[1]));print(f\"{u['role']}: engine={u.get('engine', 'claude')} turns={u['num_turns']} requests={u['requests']} cost_usd={u['cost_usd']} ctx_max={u['context_max']} ctx_sum={u['context_sum']} out={u['tokens']['output']} tools={u['tools']} denied={u['denied']} reads={u['reads_distinct']}\")" "trace/$r.usage.json"
           done | tee -a "$GITHUB_STEP_SUMMARY"
           wc -l ctx/diff.patch | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
@@ -284,6 +377,7 @@ jobs:
           path: trace/
           retention-days: 30
       - uses: actions/upload-artifact@v4
+        if: steps.check.outcome == 'success'
         with:
           name: review
           path: |
@@ -308,7 +402,7 @@ jobs:
 
   post:
     needs: [gate, review]
-    if: needs.review.result == 'success'
+    if: needs.review.result == 'success' && needs.review.outputs.reviewed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

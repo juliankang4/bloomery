@@ -213,10 +213,14 @@ def update(repo, token, cand_path, stats_path, usage_path=None, secret_env=(), d
         return 3
     run_line = clean(read(stats_path, "").strip().splitlines()[0] if read(stats_path, "").strip() else "", 400, False)
     try:
-        cost = json.loads(read(usage_path, "{}") or "{}").get("cost_usd")
+        usage = json.loads(read(usage_path, "{}") or "{}")
     except ValueError:
-        cost = None
-    run_line += f" · learner ${cost:.2f}" if isinstance(cost, (int, float)) else " · learner not run"
+        usage = {}
+    cost = usage.get("cost_usd")
+    # A Codex run on a ChatGPT login has no price: it is named instead.
+    run_line += (f" · learner ${cost:.2f}" if isinstance(cost, (int, float))
+                 else f" · learner {usage['engine']}" if usage.get("subtype") == "success" and usage.get("engine")
+                 else " · learner not run")
     # Read the issue as late as possible, so a veto made while the learner ran is the one copied.
     issue = find(repo, token, call)
     body = issue["body"] if issue else ""
@@ -297,6 +301,9 @@ def self_test():
         open(sp, "w").write("2026-10-19 · reviews 1 · ~~x~~\n")
         assert update(repo, "t", cp, sp, up, dry=out, call=fake, today=day) == 0
         assert "- 2026-10-19 · reviews 1 · x · learner $0.20" in open(out).read()
+        json.dump({"cost_usd": None, "engine": "codex", "subtype": "success"}, open(up, "w"))
+        assert update(repo, "t", cp, sp, up, dry=out, call=fake, today=day) == 0
+        assert "· x · learner codex" in open(out).read()
         assert update(repo, "t", cp, sp, call=fake, today=day) == 0
         assert calls[-1] == ("PATCH", "https://api.github.com/repos/o/r/issues/9")
         json.dump([{"kind": "escape", "title": "k", "rule": "sk-ant-" + "a" * 20, "evidence": []}], open(cp, "w"))

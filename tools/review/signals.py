@@ -198,7 +198,7 @@ def collect(repo, d, days, lookback, ref, token, out, call=api, download=gh_down
             if r["submitted_at"] >= s19:
                 m = FOOT_RE.search(r["body"])
                 stats.append((m.group(2) if m else "?", int(m.group(3)) if m else 0, int(m.group(4)) if m else 0,
-                              sum(float(x) for x in COST_RE.findall(r["body"]))))
+                              sum(float(x) for x in COST_RE.findall(r["body"])), "cost_usd=None" in r["body"]))
         pr = call("GET", f"https://api.github.com/repos/{repo}/pulls/{n}", token)
         if pr.get("merged") and pr.get("merge_commit_sha"):
             try:
@@ -286,11 +286,13 @@ def collect(repo, d, days, lookback, ref, token, out, call=api, download=gh_down
 
 def write(out, repo, since, now, days, reviewed, escapes, outcomes, removals, lessons, aims, stats):
     v = {k: sum(1 for s in stats if s[0] == k) for k in ("CLEAN", "MUST_FIX")}
+    uncosted = sum(s[4] for s in stats)  # a Codex run on a ChatGPT login reports no cost
     acted = [o for o in outcomes if o["outcome"] == "acted"]
     ignored = [o for o in outcomes if o["outcome"] == "ignored"]
     line = (f"{now.date()} · last {days} d · reviews {len(stats)} (CLEAN {v['CLEAN']}, MUST_FIX {v['MUST_FIX']}) · "
             f"must-fix {sum(s[1] for s in stats)}, ⚠ {sum(s[2] for s in stats)} · "
-            f"review cost ${sum(s[3] for s in stats):.2f} · findings acted {len(acted)}, ignored {len(ignored)} · "
+            f"review cost ${sum(s[3] for s in stats):.2f}{f' ({uncosted} with no cost)' if uncosted else ''} · "
+            f"findings acted {len(acted)}, ignored {len(ignored)} · "
             f"validator removed {len(removals)} · escapes {len(escapes)}"
             + "".join(f" · {t} aimed {a['aimed']} (acted {a['acted']}, ignored {a['ignored']})"
                       for t, a in sorted(aims.items())))
@@ -357,7 +359,7 @@ def self_test():
         ts = (now - dt.timedelta(days=1)).isoformat()[:19] + "Z"
         h1, h2 = "1" * 40, "2" * 40
         rv = (body + f"\n<!-- {MARKER} head_sha={h1} verdict=MUST_FIX must_fix=1 warn=2 mode=full ledger=x run=55 -->\n"
-              "<!-- bloomery-usage reviewer: cost_usd=0.5; validator: cost_usd=0.25 -->")
+              "<!-- bloomery-usage reviewer: cost_usd=None engine=codex; validator: cost_usd=0.25 engine=claude -->")
 
         def fake(method, url, token, payload=None):
             u = url.split("?")[0]
@@ -400,7 +402,8 @@ def self_test():
         assert json.load(open(os.path.join(out, "lesson-stats.json"))) == {
             "L3": {"raised": 1, "acted": 1, "suppressed": 0}, "L4": {"raised": 0, "acted": 0, "suppressed": 1}}
         stats = open(os.path.join(out, "stats.md")).read()
-        assert "reviews 1 (CLEAN 0, MUST_FIX 1)" in stats and "acted 1, ignored 2" in stats and "$0.75" in stats, stats
+        assert "reviews 1 (CLEAN 0, MUST_FIX 1)" in stats and "acted 1, ignored 2" in stats, stats
+        assert "review cost $0.25 (1 with no cost) · " in stats, stats
         assert "crapper aimed 1 (acted 1, ignored 0) · dryer aimed 2 (acted 0, ignored 1)" in stats, stats
         assert open(os.path.join(out, "has_signals.txt")).read() == "true\n"
         # A squash commit stands alone; a merge commit brings its second parent's side.

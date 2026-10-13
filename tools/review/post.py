@@ -2,7 +2,7 @@
 """Check and post the review bot's output (.github/workflows/review.yml).
 
     tools/review/post.py check  --out DIR --diff FILE --pr-json FILE [--files FILE] [--device FILE] [--freeze FILE]
-                                [--base DIR] [--secret-env NAME]... [--usage FILE]...
+                                [--base DIR] [--secret-env NAME]... [--secret-file FILE]... [--usage FILE]...
     tools/review/post.py device --root DIR --out FILE
     tools/review/post.py freeze --repo OWNER/NAME --out FILE                                             (GH_TOKEN)
     tools/review/post.py issues --out DIR --repo OWNER/NAME --pr N
@@ -19,8 +19,9 @@ learner reads the run's artifact back, tools/review/signals.py), and a
 second marker carrying each --usage file's accounting (tools/review/usage.py: turns, cost, context, tool calls) kept
 in DIR/usage.txt so a later check without the files keeps it. Issue candidates (issues.json: defects outside the
 diff) are kept when well formed, at most MAX_ISSUES, and with --base only when every evidence path exists there. It
-refuses (exit 3, nothing written) when the output carries a credential: the value of each --secret-env variable, or a
-token-shaped string. A missing or unreadable output is exit 65.
+refuses (exit 3, nothing written) when the output carries a credential: the value of each --secret-env variable, every
+string of 16 or more characters in each --secret-file JSON file (a Codex login's auth.json: its tokens, as the run left
+them), or a token-shaped string. A missing or unreadable output is exit 65.
 
 `issues` files each candidate as an issue labelled ISSUE_LABEL, unless an issue with that label and the same title
 exists (open or closed), and writes the numbers to DIR/filed.txt.
@@ -46,6 +47,7 @@ body alone and says so in the body.
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -73,9 +75,12 @@ TOKEN_RE = re.compile(
     r"sk-ant-[A-Za-z0-9_-]{16,}"
     r"|gh[pousr]_[A-Za-z0-9]{30,}"
     r"|github_pat_[A-Za-z0-9_]{30,}"
+    r"|\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}"
+    r"|\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*"
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
 )
 VERDICT_RE = re.compile(r"^\*\*Verdict:\s*(MUST_FIX|CLEAN)\*\*", re.M)
+VALIDATOR_LINE = "<!-- validator:"
 
 
 class Refused(Exception):
@@ -115,9 +120,43 @@ def secrets_in(texts, secret_values):
     found = []
     for name, value in secret_values:
         if value and len(value) >= 8 and any(value in t for t in texts):
-            found.append("env:" + name)
+            found.append(name if ":" in name else "env:" + name)
     if any(TOKEN_RE.search(t) for t in texts):
         found.append("token-shape")
+    return found
+
+
+def unsafe_entries(d):
+    """The paths under d, relative to it, that are neither a regular file nor a directory: a symbolic link (listed,
+    not followed), a FIFO, a socket, a device."""
+    bad = []
+    for root, dirs, files in os.walk(d):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            mode = os.lstat(p).st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                bad.append(os.path.relpath(p, d))
+    return sorted(bad)
+
+
+def secret_file_values(path):
+    """[(name, value)] for every string of 16 or more characters in a JSON file, at any depth; [] when it is missing."""
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return []
+    try:
+        stack, found = [json.loads(text)], []
+    except ValueError:
+        return [("file:" + os.path.basename(path), text.strip())]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, dict):
+            stack.extend(v.values())
+        elif isinstance(v, list):
+            stack.extend(v)
+        elif isinstance(v, str) and len(v) >= 16:
+            found.append(("file:" + os.path.basename(path), v))
     return found
 
 
@@ -191,7 +230,8 @@ def usage_marker(paths):
         cost = u.get("cost_usd")
         parts.append(f"{u.get('role')}: turns={u.get('num_turns')} cost_usd={cost if cost is None else round(cost, 4)} "
                      f"ctx_max={u.get('context_max')} ctx_sum={u.get('context_sum')} "
-                     f"out={(u.get('tokens') or {}).get('output')} tools={tools} denied={u.get('denied')}")
+                     f"out={(u.get('tokens') or {}).get('output')} tools={tools} denied={u.get('denied')} "
+                     f"engine={u.get('engine', 'claude')}")
     return "<!-- bloomery-usage " + "; ".join(parts) + " -->" if parts else ""
 
 
@@ -251,7 +291,7 @@ def event_for(verdict, decision, body, paths):
         return "REQUEST_CHANGES", None
     if decision != verdict:
         return "COMMENT", "decision.txt disagreed with the verdict line"
-    if "<!-- validator:" not in body:
+    if VALIDATOR_LINE not in body:
         return "COMMENT", "the validator did not finish"
     guarded = [p for p in paths if p.startswith(APPROVE_GUARD)]
     if guarded:
@@ -261,7 +301,10 @@ def event_for(verdict, decision, body, paths):
 
 
 def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None, files_path=None, device_path=None,
-          freeze_path=None):
+          freeze_path=None, secret_files=()):
+    bad = unsafe_entries(out)
+    if bad:
+        raise Refused(3, f"the review output holds what is not a regular file ({', '.join(bad)}); nothing is posted")
     try:
         body = open(os.path.join(out, "review.md"), encoding="utf-8").read()
         decision = open(os.path.join(out, "decision.txt"), encoding="utf-8").read().strip()
@@ -287,7 +330,8 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None, files_
     except ValueError as e:
         raise Refused(65, f"issues.json is not JSON: {e}")
     leaked = secrets_in([body, decision, comments_text, issues_text],
-                        [(n, os.environ.get(n, "")) for n in secret_env])
+                        [(n, os.environ.get(n, "")) for n in secret_env]
+                        + [kv for p in secret_files for kv in secret_file_values(p)])
     if leaked:
         raise Refused(3, "the review output carries a credential (" + ", ".join(leaked) + "); nothing is posted")
     if not body.strip():
@@ -509,6 +553,11 @@ def self_test():
     assert secrets_in(["key sk-ant-api03-abcdefghijklmnopqrst"], []) == ["token-shape"]
     assert secrets_in(["x MYSECRETVALUE y"], [("K", "MYSECRETVALUE")]) == ["env:K"]
     assert secrets_in(["ghp_" + "a" * 36], []) == ["token-shape"]
+    assert secrets_in(["Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkw.sig"], []) == ["token-shape"]
+    jwt = ".".join(["eyJhbGciOiJSUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkw", "c2lnbmF0dXJl"])
+    assert TOKEN_RE.sub("-", f"a {jwt} b") == "a - b"
+    assert secrets_in(["k sk-proj-" + "a" * 30, "a disk-usage-reporting-tool-v2"], []) == ["token-shape"]
+    assert secrets_in(["a disk-usage-reporting-tool-v2 and task-runner-for-every-build"], []) == []
 
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "out")
@@ -641,6 +690,7 @@ def self_test():
         posted = open(os.path.join(out, "review.md")).read()
         assert posted.count("<!-- bloomery-usage reviewer: turns=7 cost_usd=0.5123 ctx_max=90000") == 1, posted
         assert posted.count("<!-- bloomery-review") == 1 and "tools=Read:20,Grep:9" in posted, posted
+        assert "denied=0 engine=claude -->" in posted, posted
 
         base = os.path.join(d, "base")
         os.makedirs(os.path.join(base, "crates"))
@@ -700,6 +750,28 @@ def self_test():
         except Refused as e:
             assert e.code == 3
 
+        # A Codex login's auth.json: every long string in it is refused, whatever the key; a short one is not a secret.
+        auth = os.path.join(d, "auth.json")
+        json.dump({"auth_mode": "chatgpt", "tokens": {"refresh_token": "refresh-refresh-refresh",
+                                                      "account_id": "acct-1"}}, open(auth, "w"))
+        assert [v for _, v in secret_file_values(auth)] == ["refresh-refresh-refresh"]
+        assert secret_file_values(os.path.join(d, "none.json")) == []
+        write("**Verdict: CLEAN**: fine.\nrefresh-refresh-refresh\n", "CLEAN")
+        try:
+            check(out, dp, pj, [], secret_files=[auth])
+            raise AssertionError("an auth.json token in review.md was not refused")
+        except Refused as e:
+            assert e.code == 3 and "file:auth.json" in str(e), e
+
+        write("**Verdict: CLEAN**: fine.\n", "CLEAN")
+        os.symlink(auth, os.path.join(out, "notes.md"))
+        try:
+            check(out, dp, pj, [])
+            raise AssertionError("a symbolic link in the output was not refused")
+        except Refused as e:
+            assert e.code == 3 and "notes.md" in str(e), e
+        os.remove(os.path.join(out, "notes.md"))
+
         write("No verdict line.\n", "CLEAN")
         try:
             check(out, dp, pj, [])
@@ -720,7 +792,7 @@ def main(argv):
     if len(argv) < 2 or argv[1] not in ("check", "device", "freeze", "issues", "post", "labels"):
         print(__doc__, file=sys.stderr)
         return 64
-    opts, secret_env, usage, rest = {}, [], [], argv[2:]
+    opts, secret_env, secret_files, usage, rest = {}, [], [], [], argv[2:]
     while rest:
         k = rest.pop(0)
         if not rest:
@@ -729,6 +801,8 @@ def main(argv):
         v = rest.pop(0)
         if k == "--secret-env":
             secret_env.append(v)
+        elif k == "--secret-file":
+            secret_files.append(v)
         elif k == "--usage":
             usage.append(v)
         else:
@@ -737,7 +811,7 @@ def main(argv):
         if argv[1] == "check":
             verdict, n, notes = check(opts["--out"], opts["--diff"], opts["--pr-json"], secret_env, usage,
                                       opts.get("--base"), opts.get("--files"), opts.get("--device"),
-                                      opts.get("--freeze"))
+                                      opts.get("--freeze"), secret_files)
             event = open(os.path.join(opts["--out"], "event.txt"), encoding="utf-8").read().strip()
             label = json.load(open(os.path.join(opts["--out"], "labels.json"), encoding="utf-8")).get("set")
             print(f"check: verdict={verdict} event={event} card={label or '-'} inline={n}"

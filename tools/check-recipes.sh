@@ -492,6 +492,7 @@ blk_pytools() {
     "tools/review/labels.py --self-test"
     "tools/review/ledger.py --self-test"
     "tools/review/post.py --self-test"
+    "tools/review/run.py --self-test"
     "tools/review/signals.py --self-test"
     "tools/review/usage.py --self-test"
     "tools/type-census.py --self-test"
