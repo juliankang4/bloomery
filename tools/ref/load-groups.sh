@@ -167,8 +167,9 @@ lg_process() {
     prev_out=$out
   }
   while :; do
-    if ! IFS= read -r -t "$BOUND" -u "$rfd" line; then
-      st=$?
+    st=0
+    IFS= read -r -t "$BOUND" -u "$rfd" line || st=$?
+    if [ "$st" != 0 ]; then
       if [ "$st" -gt 128 ]; then
         echo "[load] r$r: no line for ${BOUND} s; killing the process (pid $pid)" >&2
         kill "$pid" 2> /dev/null
@@ -235,8 +236,8 @@ lg_process() {
   [ ${#LG_LEFT[@]} -eq 0 ] || echo "[load] r$r: arm ${ARMS[${arms[$k]}]} failed (rc $rc); the ${#LG_LEFT[@]} arm(s) after it run in a fresh load"
 }
 
-# `bash tools/ref/load-groups.sh --self-test`: the grouping and the order on fixed keys (just
-# check-recipes runs it on the Mac; the driver itself is depth-ds41-stub.sh's, on the box).
+# `bash tools/ref/load-groups.sh --self-test`: the grouping and the order on fixed keys, and the idle bound on
+# a stalled arm (just check-recipes runs it on the Mac; the driver's runs are depth-ds41-stub.sh's, on the box).
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   fails=0
   check() {
@@ -261,6 +262,32 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   lg_is_solo "X=1" && s=1 || s=0
   check not-solo "$s" 0
   check env-key "$(lg_env_key "Y=2,X=1")" "X=1,Y=2"
+  # lg_process on a stalled arm: the process prints its arm line and then nothing, so the idle bound of BOUND s (the
+  # idle second, scaled with the load: tools/bloomery/selftest.py) sends its timeout a TERM, which ends it with 143,
+  # and the arms behind it are left for a fresh load. The outer bound, BOUND x (arms + 1), would end it with 124.
+  # A host with no timeout takes tools/ref/stub-timeout.py, which ends the same two ways.
+  stall_case() {
+    local sd
+    sd=$(mktemp -d "${TMPDIR:-/tmp}/load-groups-selftest.XXXXXX")
+    command -v timeout > /dev/null || cp "${BASH_SOURCE[0]%/*}/stub-timeout.py" "$sd/timeout"
+    lg_majflt() { echo 0; }
+    lg_pre() { :; }
+    lg_post() { echo "post $1 rc=$3" >> "$sd/post.log"; }
+    lg_cmd() { LG_CMD=(sh -c 'echo "arm s0"; exec sleep 1000'); LG_ENV=(); }
+    ARMS=(s0 s1 s2)
+    BOUND=$(python3 "${BASH_SOURCE[0]%/*}/../bloomery/selftest.py" 1) || exit 2
+    (PATH="$sd:$PATH"; lg_process 1 0 1 2; echo "left=${LG_LEFT[*]}" >> "$sd/post.log") > /dev/null 2> "$sd/err.log"
+    check stall-killed "$(grep -c "no line for $BOUND s; killing the process" "$sd/err.log")" 1
+    check stall-term "$(grep '^post 0 ' "$sd/post.log")" "post 0 rc=143"
+    check stall-left "$(grep '^left=' "$sd/post.log")" "left=1 2"
+    rm -rf "$sd"
+  }
+  # lg_process opens its descriptors with `exec {fd}<>`, which needs bash 4.1: the macOS bash 3.2 skips the case.
+  if [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -ge 1 ]; }; then
+    stall_case
+  else
+    echo "skip stall: bash ${BASH_VERSION} has no exec {fd}<>"
+  fi
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($fails failures)"
   [ "$fails" = 0 ]
   exit

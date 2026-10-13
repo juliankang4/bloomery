@@ -405,11 +405,7 @@ sys.exit(subprocess.call(cmd) if cmd else 0)
 PY
     chmod +x "$t/bin/flock"
   fi
-  if ! command -v timeout > /dev/null; then
-    printf '%s\n' '#!/usr/bin/env python3' 'import subprocess, sys' 'a = [x for x in sys.argv[1:] if not x.startswith("--kill-after")]' \
-      'try: sys.exit(subprocess.run(a[1:], timeout=float(a[0])).returncode)' 'except subprocess.TimeoutExpired: sys.exit(124)' > "$t/bin/timeout"
-    chmod +x "$t/bin/timeout"
-  fi
+  command -v timeout > /dev/null || cp "$(dirname "$self")/ref/stub-timeout.py" "$t/bin/timeout"
   PATH=$t/bin:$PATH
   # The tree's cards resolve through the stub above: timing-card.sh's two names are what it
   # answers, and the UUIDs the cases below compare against are the stub's.

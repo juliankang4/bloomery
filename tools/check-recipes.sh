@@ -192,7 +192,7 @@ blk_boxtracks() {
   echo "${bt##*$'\n'}"
 }
 # load-groups.sh decides which arms of a depth runner share one load, and their order: its grouping and
-# rotation are tested on fixed keys, no process started.
+# rotation are tested on fixed keys, and under bash 4.1 or later its idle bound on a stalled process.
 blk_loadgroups() {
   if ! lg=$(bash "$(dirname "$0")/ref/load-groups.sh" --self-test 2>&1); then
     echo "$lg" >&2
