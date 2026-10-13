@@ -14,7 +14,7 @@ DGX Spark (GB10). Every number below is either the contributor's measurement (ci
 | 1d. `q4k_gemv_sel` tail (half-warp at K = 512, a dependent id load) | ≤ −0.09 ms (−0.8 %) | 0 | **Model says 0, do not open** |
 | 2. More bytes in flight per SM on the layer gemvs and the head | Little's-law form (more warps, blocks or loads to cover latency): 0. The same code shape for DRAM row locality (a row's loads issued together): up to −1.4 ms, undecided | 0 | **Little's-law form: model says 0, do not open** (§5.3). **Row-locality form: undecided until the probe's arm P** (§5.4), which also tests load width (arm W); the 1.63 ms the gemvs lose is that term |
 
-The rule in `docs/contrib/dgx-spark.md:112-117` leaves 160–200 GB/s open. This reading closes it: of the 2.75 ms the
+The rule in `docs/contrib/dgx-spark.md` §5 leaves 160–200 GB/s open. This reading closes it: of the 2.75 ms the
 gemvs spend past the plain read rate, about 1.63 ms is a steady-rate deficit that every big gemv shares (the head
 included, at 99.8 % SM active), about 0.67 ms is per-kernel tails, about 0.23 ms is the per-launch intercept,
 mostly nsys's own, and the last ~0.2 ms is the small grid-8 `qkv_q4k` and grid-64 `q6k_gemv` launches (§2). Neither lever as asked reaches the 1.63 ms: in-flight bytes are not what it is short of (§5.3).
@@ -91,7 +91,7 @@ not SM-bound.
 | LPDDR5x (one pool for card and host) | 8.75 ms at 235.6 GB/s; delivered 2061.4 MB / 11.50 ms = 179 GB/s average | contributor bytes; #13 rate |
 | Card SMs | warps resident most of the step (SM active 87–94 % on the gemvs), issue ≤ ~12 %, L1 ≤ 25 % | §2 |
 | Host CPU | one graph launch and the sampler a token; off the critical path while the graph runs | `[unmeasured on the Spark]` |
-| PCIe, NVMe | 0 (whole on card, integrated device) | `docs/contrib/dgx-spark.md` §2 |
+| PCIe, NVMe | 0 (whole on card, integrated device) | `docs/contrib/dgx-spark.md` §5 |
 
 Inside a kernel the wall is a **max** (bytes at the stream's rate against the warps' chain, overlapped). Across
 kernels it is a **sum**: 520 dependent nodes on one stream, each paying its own ramp (first bytes one DRAM latency after
@@ -117,9 +117,9 @@ order the timeline asks:
   `cooperative` (`cuda-macros/src/lib.rs:1053-1060`) and otherwise go through `launch_kernel_on_stream` → `cuLaunchKernel`
   (`cuda-core/src/simt/mod.rs:102-121`). A kernel of ours could take PDL only by hand-building its parameter array.
   Recorded as `docs/upstream/nvlabs-ledger.md` row 42 (feature gap, not a defect).
-- **Our PTX cannot carry it.** Every recipe builds `--arch sm_86` (`docs/contrib/dgx-spark.md:157`), and `griddepcontrol`
+- **Our PTX cannot carry it.** Every recipe builds `--arch sm_86` (`docs/contrib/dgx-spark.md` §6), and `griddepcontrol`
   needs sm_90. PDL on the Spark rides on the `sm_121` target the maintainers' `archkey`/S2 items add
-  (`docs/contrib/dgx-spark.md:321`). The A6000 and 3090 keep sm_86 PTX: no PDL there, Δ = 0 by construction.
+  (`docs/contrib/dgx-spark.md` §6). The A6000 and 3090 keep sm_86 PTX: no PDL there, Δ = 0 by construction.
 - **Graphs keep it.** "Programmatic Dependent Launch can be used in CUDA Graphs via stream capture or directly via edge
   data." ([CUDA programming guide 4.5](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html)).
   The same page: "These APIs require at least compute capability 9.0 to provide overlapping execution", and the wait

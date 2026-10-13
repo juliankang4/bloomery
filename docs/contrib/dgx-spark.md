@@ -1,33 +1,82 @@
 # Porting bloomery to the NVIDIA DGX Spark
 
-A map of what stands between this tree and "builds and passes the fixture-tier gates on a DGX Spark", written for a
-person who owns one. Every claim about the code cites `path:line` as of main `6b630e5e` (sections 1–3.5; a line re-read
-on 2026-10-11 is at `61039d6e`) or `61039d6e` (sections 3.6 and 7; section 8's code citations were re-read at `cce176c5`);
-a thing that was not seen is marked `[unverified]`, a number that is computed here is marked `[derived]`. The maintainers
-ran nothing on a Spark. A contributor's readings on two DGX Sparks are in section 1 and marked `[#13]`
-([issue #13](https://github.com/midagedev/bloomery/issues/13)).
+This is the map for a contributor who owns a DGX Spark (GB10: an Arm CPU and a Blackwell GPU on one unified memory) and
+wants to build, run or extend bloomery on it. It says where the port stands, how to build and check a change on a Spark
+today, and which work is left and whose it is. The work is cut into phases P0 to P5 (section 1). P0 and P2 are done,
+the contributor's part of P3 is done, and P1 is not finished.
 
-Two earlier documents already sized this work: [machine-axes.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/machine-axes.md) (the
-`machineaxes` memo, 2026-09-27; its round names `sparkprep` S1–S4, `archkey`, `isarefuse` and "M1–M3" are used below) and
-[rebuild.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md) (the "machineaxes" result bullets, lines 197–200). Their line numbers are stale; the
-citations here are re-read. Related: [`new-model.md`](new-model.md) (the other contribution track),
-[`local-check.md`](local-check.md) (the off-box check design; this file keeps only what is Spark-specific).
+Today a Spark builds the tree from source, runs a model that fits its memory whole on the card, and runs the fixture-tier
+gates (the gates that run on small generated model files, section 4) in local mode, which runs a gate recipe on your own
+machine (sections 2 and 4). What a Spark's memory and card change, and what was measured on them, is in sections 3, 5,
+6 and 7.
 
-**Where it stands (2026-10-11).** P0 is in main ([#14](https://github.com/midagedev/bloomery/pull/14)). P1's `qdot`
-part is [#15](https://github.com/midagedev/bloomery/pull/15), reviewed. P2's pool invariant is
-[#16](https://github.com/midagedev/bloomery/pull/16), in review. The maintainers are finishing the unified tier, which
-section 7 needs. Section 8 is the design for several Sparks: sourced link facts and derived bands, nothing run on two
-Sparks. The Spark-prep rounds of the earlier memo:
+The large work left is models larger than the memory pool (P4, section 8) and several linked Sparks (P5, section 9).
+Section 10 lists every open item, and section 11 holds the maintainers' decisions. To start: build and run a first
+model (section 2), then run the contributor gate list in local mode (section 4), and take an item marked for a
+contributor in section 10.
 
-| Round (memo name) | What | In the tree today |
-|---|---|---|
-| `sparkprep` S1: cfg guards on the x86 bodies | `qdot`, `deepseek2/attn`, one bin | done in [#14](https://github.com/midagedev/bloomery/pull/14) (P0): every AVX2 item under `cfg(target_arch = "x86_64")`, design R off it |
-| `sparkprep` S2: per-triple `extra-rustflags` | fork patch | done: the fork's `87bc9518` reads `[target.<triple>] extra-rustflags`; `.cargo/cuda-oxide.toml` and `.cargo/config.toml` carry `znver3` for x86_64 and `native` for aarch64, and `tools/check-rustflags.sh` holds both triples |
-| `sparkprep` S3 / `archkey`: one owner of `--arch` | 139 recipe lines | done: the justfile's `arch` variable reads `BLOOMERY_ARCH` (default `sm_86`; unset, every recipe expands as before), the tools that run on the box read it through `tools/arch.sh`, `tools/box.sh` forwards it, and `tools/check-recipes.sh` fails on an arch literal. `gate-ptx-spill`, `ptx-scan`, `just narrow` and `release-build` refuse another arch by name; the per-arch pin rows are P3 |
-| `sparkprep` S4: tools for N cards | `cards.sh`, `timing-card.sh`, `gpu-gate.sh` | not done: `tools/ref/cards.sh:31-35` names two cards |
-| `isarefuse`: CPU check at `main` | x86-64-v3 refusal | partly: `crates/serve/src/preflight.rs` and `crates/gpu-gates/src/bin/bloomery_serve.rs:70-71` (`cpu_gate`, x86-only); no other bin calls it |
+**How to read the numbers.** A claim about the code cites `path:line`. Lines are at main `6b630e5e` unless the text names
+another commit: the pool invariant (section 7.2) and section 8 were read at `61039d6e`, section 9 at `cce176c5`, and a
+line marked "at `b289130a`" was re-read for this revision. A thing that was not seen is marked `[unverified]`, and a
+number computed here is marked `[derived]`. "The contributor" is the one contributor who did the Spark work so far on
+two DGX Sparks; a reading of theirs is marked `[#13]` or links its comment, with its conditions. A number that a
+measurement proved wrong is struck through and stays in place, with the measured value and its comment beside it
+(`AGENTS.md`). The maintainers ran nothing on a Spark.
 
-## 1. Facts
+Related documents: [`local-check.md`](local-check.md) (checking a change on your own machine: local mode and timing
+mode), [`new-model.md`](new-model.md) (the other contribution track), [`sparkdec.md`](../research/sparkdec.md) (the GB10
+decode step, kernel by kernel) and [`tierengine.md`](../research/tierengine.md) (the unified tier, one residency across
+card, RAM and NVMe). `tierengine.md` letters its design items, among them (d) the memory kind behind the arena, (h)
+unified memory and (k) N nodes, and numbers its migration steps S0 to S13, among them S7, the pinned arena, and S10, one
+budget solver.
+
+## 1. Where the port stands
+
+| Phase | Done when | State (2026-10-13) | Left, and who |
+|---|---|---|---|
+| **P0** compiles on aarch64 | `cargo check` of the host chain passes on aarch64 Linux, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | done: [#14](https://github.com/midagedev/bloomery/pull/14), `d95c7ec9` (design R: `qdot` refuses its host-tier types off x86, answer 1) | nothing (the site map is Appendix A) |
+| **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the unpublished fixture-tier inputs and `--place gate` (maintainers, answer 18); `gate-engram`'s eviction clause (contributor, answer 18); a gate for the first cc 12.1 bit pass (section 10) |
+| **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
+| **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | the contributor's part is done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)) | per-arch `ptx-shapes.tsv` rows (maintainers; section 6) |
+| **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). GLM and V4.1 refuse to load at serving defaults on one Spark; a fix is in progress ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134430861)) | S7 (the pinned arena, `device_slot`, `devmap`) and the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
+| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6) | the placement half (contributor, answer 20); the protocol half, started by the contributor with the `Link` seam; its monotonic words stay the maintainers' unless they hand them over (section 9.6) |
+
+Files the open work touches: P1, the fixture-tier inputs and `--place gate`
+(`crates/placement/src/placement/devices.rs:221`); P3, the per-arch rows of `tools/ref/ptx-shapes.tsv` and
+`tools/ptx-scan.sh`; P4, the arena in `crates/gpu/src/host/nvtier.rs` (S7) and the card's gather kernels (the card
+leg); P5, `crates/placement` (`Machine`, `nodes_scale`), `crates/gpu/src/host/mod.rs` and `tier.rs` (the monotonic
+words and the `Link` seam) and the transport (9.5).
+
+## 2. Build and first run on a Spark
+
+**Build.** The contributor's builds run in the `nvidia/cuda:13.3.1-devel-ubuntu24.04` container (CUDA 13.3 for aarch64,
+the tested toolkit, answer 7) with LLVM 21.1.8's ARM64 release `llc` named by `CUDA_OXIDE_LLC` `[#13]`. Name it: without
+`CUDA_OXIDE_LLC`, cuda-oxide picks the Rust toolchain's `llc` (LLVM 23) first (section 6). The host driver needs CUDA 13.0 or later
+(`crates/serve/src/preflight.rs:16`). `.cargo/config.toml` and `.cargo/cuda-oxide.toml` carry `target-cpu=native` for
+`aarch64-unknown-linux-gnu` (`f0139df3`), so a Spark needs no local flag. Device crates build with `cargo oxide` only,
+for example:
+
+```sh
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2 --release --bin bloomery-serve
+```
+
+The binary carries `sm_86` PTX, and the driver compiles it for cc 12.1 at the first start, about 6.5 s on the Arm cores
+`[derived]` once per `CUDA_CACHE_PATH` (section 6).
+
+**Smallest first placement: everything on the card, no host tier, no NVMe tier.** Two ways in, both generic already:
+`--place a` is `Pick::Rank(0)`, "the largest visible card" (`crates/placement/src/placement/devices.rs:219-224`), and an
+unknown card takes the census path with its own total and free bytes (`devices.rs:98-123`); the Qwen3 and Qwen3.6 seat
+opens "CUDA device 0" (`crates/gpu/src/lib.rs:2124`; `docs/BUILD.md:100` at `b289130a`). `--place gate` needs a card named 3090
+(`devices.rs:221`) and is refused. (`docs/BUILD.md:102` at `b289130a` still says `a` needs a card named A6000; that is stale.) The plan
+reads an integrated device's room from `MemAvailable` (section 7.2), so it no longer needs a `drop_caches` before the
+load, as the first run did (section 3).
+
+Models by size, in the order to try them (`docs/models.md:12,31-34`, `docs/BUILD.md` table): Clef-Flash 4.8–9.7 GB,
+Qwen3-30B-A3B `Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M` 21.2 GB; then Qwen3.8 `UD-Q4_K_XL` 111.3 GB and GLM-5.3-Flash
+`UD-Q2_K_XL` 101.3 GiB (the size chosen "to fit a DGX Spark", https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L359) if the first `MemAvailable` reading
+allows. A 64 GB Spark (section 3; announced, not yet shipping) holds only the first three.
+
+## 3. The machine
 
 Every row was read from NVIDIA's own pages on 2026-10-10, by `curl` of the page and a text search for the quoted string.
 A fact that no NVIDIA page stated carries no number.
@@ -71,12 +120,83 @@ LLVM 21.1.8's ARM64 release tarball `[#13]`.
 | L3 | `cache/index3`: cpus 0-9 share 8 MiB, 10-19 share 16 MiB, the split of `cluster_cpus_list`; the pool's `detect_topology` forms two groups of ten |
 | cpufreq | `scaling_cur_freq` present; driver `cppc_cpufreq` |
 | `nvidia-smi` | `memory.*`, `power.limit`, `clocks.mem` are `[N/A]`; `clocks.max.sm` 3003 MHz |
-| Build | `cargo oxide doctor` passes; the flat `target-cpu=znver3` makes rustc crash (SIGSEGV in LLVM) on some crates, so a Spark owner sets `target-cpu=native` in the local `.cargo/cuda-oxide.toml` until S2 |
-| First run | Qwen3.6-35B-A3B `Q4_K_M` loads whole on the card and answers, after `drop_caches`: before it the plan read 3,762,335,744 B free, put 10,102 experts on the host tier, and the host union refused every `Q4_K` stack by name (section 3.3's invariant in a P0 run); the sm_86 PTX JIT-compiles for cc 12.1 on driver 595.84 |
+| Build | `cargo oxide doctor` passes; the flat `target-cpu=znver3` made rustc crash (SIGSEGV in LLVM) on some crates; `f0139df3` (S2) gives aarch64 `target-cpu=native` |
+| NVMe drive | one Spark: a 4 TB PCIe Gen5 x4 drive ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921)); another, read on 2026-10-12: a 1 TB PCIe Gen4 x4 DRAM-less drive ([#71](https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679)). Units ship different drives; their read rates are in section 8 |
+| First run | Qwen3.6-35B-A3B `Q4_K_M` loads whole on the card and answers, after `drop_caches`: before it the plan read 3,762,335,744 B free, put 10,102 experts on the host tier, and the host union refused every `Q4_K` stack by name (section 7's invariant in a P0 run); the sm_86 PTX JIT-compiles for cc 12.1 on driver 595.84 |
 
-## 2. The cost model on paper
+## 4. Gates and timing on your own Spark
 
-The question for the port is what a Spark is for. The decomposition below uses only repo numbers and the facts above.
+Gates and timed runs on your own card go through `tools/box.sh`'s local mode and its single-card timing mode.
+[`local-check.md`](local-check.md) section 3 (local mode) and section 5 (timing) say how to set them up and what they
+refuse. This section has only what is different on a Spark. The P1 run used one command per item, from a clean tree of
+the commit:
+
+```sh
+BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_BOUND=1800' just <recipe>
+```
+
+**What differs on a Spark.**
+
+- **Fixture paths.** `BLOOMERY_DATA` and the fixture root move by environment (`tools/ref/ref-paths.sh:67,88`), but a
+  reference set's identity is the first shard's full path (`AGENTS.md`; a set's `# model` line,
+  `crates/refset/src/fixture.rs:19-20`). `/models/fixtures` stays the one legal root, so on a Spark it is a symlink
+  (answer 2).
+- **Card names.** A Spark's card is named neither 3090 nor A6000, and local mode takes the one local card without a name
+  match. `--place gate` opens the 3090 by name, so a gate that uses it stays closed on GB10, and local mode refuses the
+  two-card recipes (rc 64) ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Which
+  fixture gates open on a card with no box name is in `local-check.md` section 3. `nvidia-smi` prints `[N/A]` for
+  GB10's memory fields `[#13]`; the census reads the driver API (`gpu/src/lib.rs:1789`).
+- **`gate-ptx-spill`** stays off the contributor list: its pins come from the 3090's JIT, and it is red on GB10 at
+  `sm_86` too (section 6).
+
+**Fixtures.** A fixture is "a model file much smaller than the real one that keeps every
+per-layer shape" (`crates/model/src/fixture/mod.rs:1-4`) and "its bytes are a function of the seed and the source header
+alone" (`:29-32`), pinned by per-type digests (`fixture/digest.rs:1-10`). `fixture generate <real first shard> <out dir>`
+writes it (`crates/model/src/bin/fixture.rs:4-5`). Three families have fixtures (`crates/refset/src/fixture.rs:33-37`:
+`qwen4exp`, `deepseek41`, `glm5next`); every other family is `self` in the table (`ref-paths.sh:75-79`) and its
+gates are deferred by name as real-file. So "P1 fixture gates" means those three families plus the host gates whose
+inputs are in process or published, not every `gate-*` recipe. A text classification of the `justfile` (not the batch
+tool's): of 136 classified recipes, 44 are host-only and 60 take a card in both tiers, and 32 are real-tier only
+(`real-only.sh` or an inline exit 66); several host gates (`gate-qdot`) read harness dumps under `$BLOOMERY_DATA`.
+
+A contributor cannot make the **reference sets**: they are `ik` node dumps of each fixture (`dump-ref-fixture`,
+`justfile:609`) from the C++ harness the maintainers build (`just build-ref`). They are public at
+<https://huggingface.co/datasets/midagedev/bloomery-refsets> (17 sets, 6.48 GB, with each base model's licence). The
+fixture files themselves need no download, because their bytes are reproducible: `fixture fetch` makes them from each
+source model's header; their sizes on disk are in [`local-check.md`](local-check.md) section 4. `fixture generate` does not read the source's tensor data,
+but it opens each source file through the loader's bounds check, which refuses a tensor that ends past the end of the
+file (`crates/gguf/src/lib.rs:957` at `e659f4fe`). On qwen38
+([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)), the real shards and the same shards
+cut at the data offset and grown back to their full length as holes gave the same bytes, and a cut shard left short was
+refused (`data at 18720+0 size 675430400 exceeds the file`); no length in between was tried. So a header grown to the
+file's length as a sparse file is enough, which is what `fixture fetch` writes, at the size the repo lists for each
+file (`crates/model/src/bin/fixture.rs:24-27` at `e659f4fe`). The shortest length the check passes is the end of the
+last tensor, which the header's tensor offsets and sizes give `[derived]`. On aarch64 the fill matches the x86_64
+pins: the digest test passes with all 12 pinned cases, and `fixture fetch glm5next` run twice wrote identical bytes,
+shard 1 with the sha256 pinned as `FIXTURE_SHA256`. The generator copies the source's `tokenizer.*` and `general.*` keys
+(`fixture/mod.rs:12-14`), so a fixture carries the source model's tokenizer; answer 3 says which families are published.
+
+**What the fixture tier exercises on a Spark.** The fixture header "names the card budget that forces the plan to offload"
+(`ref-paths.sh:33-35`), so the fixture gates run the **host tier**: `qdot`, the CPU attention, the card/host protocol. A
+Spark contributor therefore needs design S for `qdot` at P1 (scalar mirrors, correct bits, slow), not just design R.
+
+**Timing.** Only `tools/ref/depth-qwen3moe.sh` opts in to the timing mode today (`TIMING_LOCAL_RUNNER=1`,
+`tools/ref/timing-card.sh:34`); another runner refuses `BLOOMERY_BOX_CARD=local`. On GB10 the witness reads
+`power.limit` as `[N/A]` and `scaling_cur_freq` from `cppc_cpufreq` `[#13]`. The Spark's own ruler comes from an A/A of
+one binary against itself, six rounds a sitting: decode 0.9987 ± 0.0065 at depth 6 and 1.0026 ± 0.0063 at depth 512,
+prefill 0.9971 ± 0.0024 at P = 512 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)).
+A reference engine's arm in the same lease is a build the contributor makes for aarch64; no recipe makes it.
+
+**Evidence.** A Spark number carries CONTRIBUTING.md's evidence list and `tok/s @ n=N, depth D, card` (`AGENTS.md`). It
+decides a pull request on the Spark, and it can be published in the Spark's own table with the machine named; a table
+never mixes cards (`AGENTS.md`, "Public numbers name their machine"). A direct run of `cnode_probe` is enough when it
+names the SM clock and the commit (answer 17).
+
+## 5. Decode on one Spark: the cost model against the measurements
+
+The question for the port is what a Spark is for. The decomposition below was written from repo numbers and the facts of
+section 3 before any Spark run; the measured values now sit beside its predictions. [`sparkdec.md`](../research/sparkdec.md)
+breaks the measured step down kernel by kernel.
 
 **Anchor [measured, not re-measured since 0.2.3].** Qwen3.6-35B-A3B `Q4_K_M`, whole model on one RTX 3090 at its 250 W
 cap: 193.9 tok/s, one request's rate (`README.md:111` and footnote 1), which is 5.16 ms a token `[derived]`.
@@ -120,7 +240,7 @@ resource's time (or at most bytes plus the latency part), not the sum of five. C
   size), launch count when the latency part is the larger one, and SM occupancy only if the rest is compute.
 - A Spark's value is its 128 GB, not its bandwidth: V4.1 `Q3_K_M` (347.3 GB) and GLM-5.3-Flash `UD-Q4_K_XL` (199.7 GB)
   (`docs/BUILD.md`, model table) do not fit the pool and would need the NVMe tier; Qwen3.8 `UD-Q4_K_XL` (111.3 GB) fits
-  with 13.9 GB of the idle `MemAvailable` (116.6 GiB = 125.2 GB, section 1) left for KV and runtime `[derived from #13]`.
+  with 13.9 GB of the idle `MemAvailable` (116.6 GiB = 125.2 GB, section 3) left for KV and runtime `[derived from #13]`.
 
 **The one term a run must settle, with its expected value:** the sustained read rate of our decode gemv kernels on the
 LPDDR5x with the CPU idle. Expected 200–235 GB/s (73–86 % of 273). Measured on `b289130a`, which has #27's row prefetch: 208.8 GB/s, the
@@ -131,46 +251,15 @@ build read 177.8 again in the `b289130a` session. A plain read kernel measured 2
 and 235 GB/s on write-combined `cuMemHostAlloc` pages ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921));
 ~~our gemv kernels' own rate is still unread~~. Decision rule: at or
 above 200 the decode flow is byte-bound and P3 kernel work predicts 0 beyond byte-saving levers; below 160, look at page
-size, TLB reach and clocks (`nvidia-smi` clock-event reasons) before any kernel work. The 208.8 GB/s of `b289130a` is above the rule's 200
-line. The 177.5 GB/s of `04d0c0ae` fell in the 160 to 200 band the rule leaves open, and
-[`sparkdec.md`](../research/sparkdec.md) reads that band from those runs. Everything else in this file is
-settled by reading.
+size, TLB reach and clocks (`nvidia-smi` clock-event reasons) before any kernel work. The 208.8 GB/s of `b289130a` is above
+the rule's 200 line, so the first branch holds. The 177.5 GB/s of `04d0c0ae` fell in the 160 to 200 band the rule
+leaves open, and [`sparkdec.md`](../research/sparkdec.md) reads that band from those runs. Everything else in this file
+is settled by reading.
 
-## 3. What stands between the tree and a passing fixture tier
+## 6. The card
 
-### 3.1 The host on aarch64
-
-`python3 tools/recipes.py pure-crates` (run on the Mac) already classifies the crates. Twelve are pure (`bloomery-decision`,
-`-hf`, `-jinja`, `-levers`, `-models`, `-placement`, `-refset`, `-runtime`, `-sampler`, `-serve`, `-tokenizer`, `-vision`):
-no x86 code, no device root. Three reasons in its output block aarch64 **Linux**: `x86_64 intrinsics`, `#[target_feature]`,
-`is_x86_feature_detected!`. The other reasons (Linux `/proc` paths, `libc` items such as `sched_setaffinity`,
-`posix_fadvise`, `RUSAGE_THREAD`) are all POSIX on Linux and are not blockers on DGX OS `[unverified until a compile]`. No
-crate named `crates/gpu*` contains an x86 intrinsic (`grep -rE 'std::arch|core::arch|target_feature' crates/gpu*` finds only a
-tensor-name strings (`…dflash_kv_input_target_features…`) and a comment, `crates/gpu-gates/src/ik_q8_2.rs:51`).
-
-| Site | What is there | What a portable fallback needs | Size |
-|---|---|---|---|
-| `crates/qdot/src/lib.rs:44` | `use std::arch::x86_64::*;` unconditional: the whole crate, and with it every crate that depends on `bloomery-qdot` (`model`, `gpu-gates`; `gpu` through `model`), fails to compile. 39 `#[target_feature]` fns, 16 `is_x86_feature_detected!` sites (`:204-206`, `:280`, `:2270`, …) | `#[cfg(target_arch = "x86_64")]` on each AVX2 fn and on the import. The pattern exists in the same file: `dot_f32` and `sum_sq_f64` are already gated (`:7657-7714`), as are `crates/gguf/tests/f16.rs:23,70,102-104`, `crates/serve/src/preflight.rs:127,188`, `bloomery_serve.rs:70`. Per-function `cfg`, not a module move: `AGENTS.md` bans splitting a `#[target_feature]` body into helpers (10–13 % loss) | M (mechanical, 7.9 k lines) |
-| `crates/qdot/src/lib.rs:186-228` (`supports`, `fuses`, `has_features`) | "The weight type has a kernel **and** the CPU has the ISA" are one predicate. The matmul dispatch sends everything that fails it to an f32 dequant path (`:194`, doc "anything else dequantizes the row to f32 first") | Two designs, see Q1: **R** `supports` false off x86 plus a named refusal of host-tier types (the memo's S1); **S** `supports` true and route to the scalar mirrors, which are bit-identical to the AVX2 kernels (`:42`: "Each AVX2 kernel has a bit-identical scalar mirror"). `tile_kind` (`:527`), `has_lanes` (`:884`) and the `dot_row` match (`:363`) must then ask a separate "SIMD present" predicate | S–M |
-| `crates/model/src/arch/deepseek2/attn.rs:757-940, 1603-1700, 1811-2320` | 7 `#[target_feature]` fns, helpers `v_expf8` (`:760`), `lane_tree8` (`:818`), `lane_tree8x8` (`:836`); `kq_dot_simd` asserts the ISA and **panics** without it by design (`:939-944`, "no quiet fall back"); tests at `:3116-3140` | cfg-gate the kernels; `flash_simd` (`:1067-1077`) returns false off x86, which selects the scalar flash path that `BLOOMERY_FLASH_SIMD=0` already selects (`:1065-1070`); keep the named panic in `kq_dot_simd` | M |
-| `crates/model/src/ops.rs:5529` | bare `std::arch::x86_64::_mm_prefetch` in `warm_touch` | no-op or the `paced` read off x86 (the aarch64 prefetch intrinsic is unstable `[unverified]`) | S |
-| `crates/model/src/bin/markov-accept.rs:137-165`, `crates/model/tests/attn.rs` (6 detects), `crates/model/tests/moe.rs` (2 refs) | x86 kernels in a bin and in tests | cfg or a named skip | S |
-| `.cargo/config.toml`, `.cargo/cuda-oxide.toml` | per-triple CPU flags: `znver3` (with `-sse4a`) for x86_64, `native` for aarch64, the same list in both files | none: done in S2. The flat `znver3` warned on every crate and crashed rustc (SIGSEGV) on some on aarch64 `[#13]`; `tools/check-rustflags.sh` refuses an x86 name in the aarch64 lists | done |
-| `crates/threads/src/lib.rs:786-850` | pool topology from sysfs (`thread_siblings_list`, `cache/index3/*`); with no L3 file it falls back to one group (`:798`, `:806-819`) | none to compile. Default thread count is the primary-core count (`:422`: 20 on GB10) with equal chunks (`:711`), ~~so the 10 E-cores gate every barrier~~ but on the default Spark path no decode or prefill step dispatches to the pool, which runs only the load's upload ([#41](https://github.com/midagedev/bloomery/issues/41)); the pool's two groups follow the two L3 clusters (section 1), but the P/E split inside a group is not modeled | none for P0–P2; ~~M in P3~~ none on the default path ([#41](https://github.com/midagedev/bloomery/issues/41)) |
-| `crates/placement/src/placement/workstation.rs:132`, `paged_drop.rs:181` | `ROW_PAGE` and `PAGE` are 4096, commented "on x86_64" | the DGX OS base page size is 4096 `[#13]`, so the constants hold; a `sysconf` read that refuses another size by name is still the right guard | S |
-| `tools/mac-check.sh:69` (`TARGET=x86_64-unknown-linux-gnu`, also `:178,192,321-323`, `BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu` `:45,330`) | the Mac's cross check | take the triple from `BLOOMERY_CHECK_TARGET`: P0 is then provable without a Spark with `cargo check --target aarch64-unknown-linux-gnu` over the host chain (`-p bloomery-qdot -p bloomery-model -p bloomery-threads …`, no bindgen needed). Needs `rustup target add --toolchain nightly-2026-08-28 aarch64-unknown-linux-gnu`, which the Mac's toolchain lacks today | S |
-
-Third-party dependencies are portable (`Cargo.lock` has `cpufeatures`, `half`, `sha2`, `libc`, `memmap2`; none is x86-only).
-`std::ffi::c_char` is used for the driver's name buffers (`crates/gpu/src/lib.rs:1749,1791`), so the aarch64 `u8` `c_char`
-is not a trap in the sites grepped.
-
-**Memory ordering.** NVIDIA's porting guide warns that "some reorderings cannot happen on x86_64 but can happen on ARM"
-(`.../porting/memorder.html`). The host tier's card/host protocol spins on host-mapped words (`crates/gpu/src/host/mod.rs:466`,
-`step.rs:1287`, `tier.rs:1429`, `lane.rs:513`, `xstream.rs:431`, `swap.rs:3761`: 6 `spin_loop` sites) and
-`crates/gpu/src/host/*.rs` holds 29 `Ordering::Relaxed` loads. Not audited; it is a P1 risk for the host-tier gates, and
-irrelevant to a whole-on-card run that never starts a host service.
-
-### 3.2 The card
+The card runs the tree's `sm_86` PTX through the driver's JIT. `sm_121` PTX was checked on GB10 and gives the same SASS for
+213 of 215 functions, so it is a question of pins, not of speed.
 
 - **Targets today.** Recipes pass `--arch {{arch}}`, the justfile's variable (139 lines): `BLOOMERY_ARCH`, default `sm_86`,
   so `BLOOMERY_ARCH=sm_121 just <recipe>` passes `--arch sm_121`; ~~whether the pinned toolchain accepts it is `[unverified]`~~
@@ -180,13 +269,14 @@ irrelevant to a whole-on-card run that never starts a host service.
   `flash_gqa_prefill.rs:289`; `fault.rs:714` not read).
 - **Documented state.** `docs/cuda-oxide.md:5`: "Everything here runs on Ampere (sm_86) only." The toolchain ledger
   (`docs/upstream/nvlabs-ledger.md`) has no `sm_121` or Blackwell row; its only Spark-related entry is row 32 (the flat
-  `extra-rustflags`). So no defect of the pinned cuda-oxide on Blackwell is known, because none has been tried.
+  `extra-rustflags`). The GB10 runs below found no defect of the pinned cuda-oxide; the one gate they saw fail was decided by the
+  `llc` or libNVVM that made the code (the K-quant bullet).
 - **P0–P2 need no new target.** The binary carries `.target sm_86` PTX and the driver JIT-compiles it at load; the release
   states it (`tools/release/README.release.md:15-16`: "the archive carries sm_86 PTX, which the driver compiles for the
   card on first start"), and the loader says it for Blackwell: "A payload built for a standard pre-Blackwell target, such as
   `sm_86`, may instead be converted to PTX and JIT-compiled by the driver on Blackwell"
   (`cuda-host/src/embedded.rs:58-62` at fork rev `4da6c13`, `Cargo.toml:30`), and the first run on a Spark did it
-  (section 1 `[#13]`). The first JIT on the Arm cores, measured on one Spark (driver 595.84,
+  (section 3 `[#13]`). The first JIT on the Arm cores, measured on one Spark (driver 595.84,
   [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)): a first start of `bloomery-serve`
   with Qwen3.6-35B-A3B `Q4_K_M` and an empty `CUDA_CACHE_PATH` took 10.5 to 11.8 s to `listening`, and a later start
   with the cache in place 4.1 s. The start without the cache minus the start with it, 6.4 to 7.7 s (median 6.5 s), is
@@ -207,7 +297,7 @@ irrelevant to a whole-on-card run that never starts a host service.
   the RTX 3090" and carries a `# arch: sm_86` line; `tools/recipes.py:1960-1965` says the JIT columns follow the capability;
   `tools/ptx-scan.sh` hard-codes the sm_86 occupancy column. So under `BLOOMERY_ARCH=sm_121` `gate-ptx-spill` ends with "no
   ptx-shapes rows for sm_121; the shape pins are sm_86 only" and `ptx-scan` (so `just narrow`) refuses by name, and no sm_121
-  scan is read against sm_86 rows; per-arch rows are P3 (memo M1). A Spark contributor leaves them out. `gate-ptx-spill` is red on GB10 at the default
+  scan is read against sm_86 rows; per-arch rows are P3 (item M1 of the `machineaxes` memo, Appendix A). A Spark contributor leaves them out. `gate-ptx-spill` is red on GB10 at the default
   `sm_86` too: 13 `generate_ds41` and 8 `gate_e2e` rows, each `jit_local` above its pin ([#42](https://github.com/midagedev/bloomery/issues/42)).
 - **Bit gates.** The memo concludes the bit gates have no generation dependence by structure (they compare against oracle
   files) and names two residual risks: `ptxas` contracting `.rn`-less mul-then-add differently, and the `ex2.approx`-class
@@ -219,23 +309,35 @@ irrelevant to a whole-on-card run that never starts a host service.
 - **Device pick.** The real-tier gate plan opens the card by the names in `CARDS` and refuses any other card by name
   (`crates/gpu-gates/src/bin/shared/gate_card.rs:8-9, 38-47`: "none of this workstation's cards"). The fixture tier plans on
   `--place a`, "the largest visible card as the device reports itself" (`gate_card.rs:4-6`) and is not affected. The real
-  tier is the maintainers' tier regardless (section 3.4).
+  tier is the maintainers' tier regardless (section 4).
+- **K-quant bits and the `llc`.** `gate-gpu-kquant` failed when the PTX came from the Rust toolchain's `llc` (LLVM 23),
+  which cuda-oxide picks ahead of LLVM 21, and passed under LLVM 21.1.8
+  ([#54](https://github.com/midagedev/bloomery/issues/54)). [#63](https://github.com/midagedev/bloomery/pull/63)
+  (`0d3c28ab`) spells the one-column walk's rounding, so neither `llc` nor libNVVM decides its bits. Which `llc` a build
+  names is still #54's open item.
+- **MXFP4 on Blackwell.** The block-scaled FP4 MMA `mma_m16n8k32_mxf8f6f4_f32_e2m1_e2m1` gives GGUF MXFP4's values bit
+  for bit on GB10 at `sm_121a`, `sm_121f` and `sm_120f`, with the raw GGUF bytes and each e2m1 code in bits 5:2 of its
+  byte. `sm_120a` PTX does not load on GB10 (`a PTX JIT compilation failed`; `ptxas` says a `sm_120a` program "cannot be
+  compiled to future architecture"), so a Spark build names `sm_121a`, or `sm_120f` or `sm_121f` for a family build
+  ([#19](https://github.com/midagedev/bloomery/issues/19#issuecomment-6104507343)). FP4 prefill stays parked
+  ([maintainers](https://github.com/midagedev/bloomery/issues/19#issuecomment-6105033234)).
 
-### 3.3 Unified memory
+## 7. One pool
 
-Placement assumes a discrete card, a PCIe host tier and an NVMe tier (`crates/placement/src/placement.rs:223-229`:
-`Machine { cards, tiers, host }`; there is no pool field at main, and the only `unified` under `crates/placement/src` is
-the cgroup reader's "unified hierarchy", `workstation.rs:726-747`; [#16](https://github.com/midagedev/bloomery/pull/16)
-adds `Machine::unified`, section 3.6, and for several Sparks `host` and `unified` move into `nodes[0]` of a per-node
-`Machine`, section 8.2).
+### 7.1 The double count
+
+Placement was built for a discrete card, a PCIe host tier and an NVMe tier (`Machine { cards, tiers, host }` at
+`6b630e5e`). On a Spark the card and the host share one memory, so the plan must count them against one pool.
+[#16](https://github.com/midagedev/bloomery/pull/16) (`7507942c`) does that with `Machine::unified` (7.2), and for
+several Sparks `host` and `unified` move into `nodes[0]` of a per-node `Machine` (section 9.2).
 
 **The double count, concretely.** Three readers see one pool:
 `cuDeviceTotalMem` (`crates/gpu/src/lib.rs:1789`), `cuMemGetInfo` (`:1995`, `:2302`: the card's `free_bytes`, which caps the
 plan's card budget, `devices.rs:98-123`) and `/proc/meminfo` `MemAvailable` (`workstation.rs:667`, `host_room` `:858`: the
-host room). A plan checks card bytes and host bytes each against its own figure, so on a Spark it can admit up to twice the
-pool. NVIDIA adds that `cudaMemGetInfo` under-reads, because reclaimable page cache and swap are not counted (section 1), so
+host room). A plan that checks card bytes and host bytes each against its own figure can admit up to twice the pool on a
+Spark. NVIDIA adds that `cudaMemGetInfo` under-reads, because reclaimable page cache and swap are not counted (section 3), so
 the card's figure is also too small right after the model file was read. The invariant needed is one: Σ card + host ≤ pool,
-with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemGetInfo` (memo M4: extend `Machine` and
+with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemGetInfo` (item M4 of the `machineaxes` memo: extend `Machine` and
 `workstation.rs`, no parallel type).
 
 **Which terms vanish and which stay:**
@@ -244,95 +346,16 @@ with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemG
 |---|---|
 | H2D promotion over PCIe (`cuMemcpyHtoDAsync`, `crates/gpu/src/host/xstream.rs:1223,1261` at `cce176c5`; the staging rings `:283,760,1614`) | vanishes as a PCIe cost; a copy from pageable memory into a `cudaMalloc` buffer is still a DRAM-to-DRAM copy at half the pool's rate (reads and writes both cross it: 21.2 GB in ~0.16 s `[derived]`), negligible beside the file read |
 | Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/tier.rs:561`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
-| CPU expert compute | stays possible but pointless: 20 Arm cores against 48 SMs on the same bytes. It is the path the fixture tier exercises (3.4) |
-| The pool's bandwidth | stays, as the single term (section 2) |
+| CPU expert compute | stays possible but pointless: 20 Arm cores against 48 SMs on the same bytes. It is the path the fixture tier exercises (section 4) |
+| The pool's bandwidth | stays, as the single term (section 5) |
 | Page cache of the model file plus the device copy | stays and doubles the footprint until dropped; `nvtier.rs:12-30` already drops pages after use (`MADV_DONTNEED`, the `release_union` path) for the NVMe tier |
-| NVMe → DRAM stream for models above the pool | stays; ~~its rate on a Spark is `[unverified]`~~ its rate depends on the drive (section 7). Today the NVMe tier lends its RAM slots to the host leg (`crates/gpu/src/host/nvtier.rs:1-9`), so the CPU computes those experts; on one pool the card can read the same slots without a copy, so the card computes them (P4, section 7) |
+| NVMe → DRAM stream for models above the pool | stays; ~~its rate on a Spark is `[unverified]`~~ its rate depends on the drive (section 8). Today the NVMe tier lends its RAM slots to the host leg (`crates/gpu/src/host/nvtier.rs:1-9`), so the CPU computes those experts; on one pool the card can read the same slots without a copy, so the card computes them (P4, section 8) |
 | KV cache bytes | stay, and they come out of the same pool |
 
-**Smallest first placement: everything on the card, no host tier, no NVMe tier.** Two ways in, both generic already:
-`--place a` is `Pick::Rank(0)`, "the largest visible card" (`crates/placement/src/placement/devices.rs:219-224`), and an
-unknown card takes the census path with its own total and free bytes (`devices.rs:98-123`); the Qwen3 and Qwen3.6 seat
-opens "CUDA device 0" (`crates/gpu/src/lib.rs:2124`, `docs/BUILD.md:88`). `--place gate` needs a card named 3090
-(`devices.rs:221`) and is refused. (`docs/BUILD.md:77` still says `a` needs a card named A6000; that is stale.)
+### 7.2 The pool invariant (#16)
 
-Models by size, in the order to try them (`docs/models.md:12,31-34`, `docs/BUILD.md` table): Clef-Flash 4.8–9.7 GB,
-Qwen3-30B-A3B `Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M` 21.2 GB; then Qwen3.8 `UD-Q4_K_XL` 111.3 GB and GLM-5.3-Flash
-`UD-Q2_K_XL` 101.3 GiB (the size chosen "to fit a DGX Spark", https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L359) if the first `MemAvailable` reading
-allows. A 64 GB Spark (section 1; announced, not yet shipping) holds only the first three.
-
-### 3.4 Running the gates off our machine
-
-What a contributor's host must not assume, and the smallest change for each (the design of the one off-box command is
-`local-check.md`'s):
-
-| Assumption | Where | Smallest change | Size |
-|---|---|---|---|
-| Work runs over ssh on host `ws`, in `~/repo/<tree>`, after an rsync | `tools/box.sh:42,43,108,225` | a `BLOOMERY_BOX=local` mode: run the recipe's command in the same tree, sourcing `$BLOOMERY_ENV` instead of `~/bloomery-env.sh` | S |
-| Locks and holds under `/root` | `/root/bloomery-cpu.lock`, `-<owner>-hold` (`box.sh:10-11`, `tools/ref/lease-probe.sh`), `/root/bloomery-gate*.lock`, `-v41-load.lock`, `-batch.gpuhold` (`tools/gpu-gate.sh:48-50`); 41 `/root/` occurrences in `box.sh` 5, `gpu-gate.sh` 8, `lease-probe.sh` 4, `lease.sh` 5, `gate-batch.sh` 11, `justfile` 7, `ref-paths.sh` 1; in all 30 files under `tools/` name `/root/`, 17 of them under `tools/ref/` (the model profiles `tools/ref/models/*.sh` that `ref-paths.sh` sources, the dump scripts, the C++ harnesses) | one `BLOOMERY_LOCK_DIR` (default `/root`). Precedent: `gpu-gate.sh --test-locks DIR` already moves the three locks and the hold file for its self-test (header, line 17) | M |
-| Two named cards | `tools/ref/cards.sh:31-35` matches the exact driver names `NVIDIA GeForce RTX 3090` and `NVIDIA RTX A6000`; `gpu-gate.sh:697-726` picks `3090\|a6000\|any\|both`; a Spark has neither, so both UUIDs stay empty | `BLOOMERY_GATE_CARD=local`: one lock under the lock dir, no name match, same bound and exit codes (`tools/gate.sh` stays the owner of the code). `nvidia-smi` prints `[N/A]` for GB10's memory fields `[#13]`; our census uses the driver API, `gpu/src/lib.rs:1789` | M (`gpu-gate.sh` is 1,021 lines; its self-test needs cases) |
-| Data and fixture roots | `BLOOMERY_DATA` defaults to `/root/bloomery-data` (`tools/ref/ref-paths.sh:67`); fixtures to `/models/fixtures` (`ref-paths.sh:88`, `crates/refset/src/fixture.rs:23-24`) | both are env-movable already | none |
-| A reference set names the fixture's path | a set's `# model` line states the first-shard path the dumper was given (`refset/src/fixture.rs:19-20`) and `AGENTS.md` makes "the first shard's full path" the identity, so a root other than `/models/fixtures` makes the check refuse the set `[unverified: the comparison itself was not read]` | either the contributor uses `/models/fixtures` literally, or the check compares root-relative (Q2) | S |
-| cuda-oxide backend at a fixed path | `box.sh` exports `CUDA_OXIDE_BACKEND=$HOME/.cargo/cuda-oxide-bloomery/<rev>/librustc_codegen_cuda.so` and stops with rc 70 when it or its `source-rev.txt` is missing (`AGENTS.md`, Toolchain pins) | the contributor builds the backend at the pinned fork rev on aarch64 with LLVM 21 and records `source-rev.txt`; an aarch64 build of the backend has never been done here `[unverified]` | M, one time |
-
-**Fixtures: what has to be published.** A fixture is "a model file much smaller than the real one that keeps every
-per-layer shape" (`crates/model/src/fixture/mod.rs:1-4`) and "its bytes are a function of the seed and the source header
-alone" (`:29-32`), pinned by per-type digests (`fixture/digest.rs:1-10`). `fixture generate <real first shard> <out dir>`
-writes it (`crates/model/src/bin/fixture.rs:4-5`). Three families have fixtures (`crates/refset/src/fixture.rs:33-37`:
-`qwen4exp`, `deepseek41`, `glm5next`); every other family is `self` in the table (`ref-paths.sh:75-79`) and its
-gates are deferred by name as real-file. So "P1 fixture gates" means those three families plus the host gates whose
-inputs are in process or published, not every `gate-*` recipe. A text classification of the `justfile` (not the batch
-tool's): of 136 classified recipes, 44 are host-only and 60 take a card in both tiers, and 32 are real-tier only
-(`real-only.sh` or an inline exit 66); several host gates (`gate-qdot`) read harness dumps under `$BLOOMERY_DATA`.
-
-What a contributor cannot make off our box is the **reference sets**: they are `ik` node dumps of each fixture
-(`dump-ref-fixture`, `justfile:609`) from the C++ harness the maintainers build (`just build-ref`). The maintainers publish
-them: the reference sets are at <https://huggingface.co/datasets/midagedev/bloomery-refsets> (public, 17 sets, 6.48 GB,
-with each base model's licence), and how to regenerate the fixtures goes with them. The fixture files are about 49 GB in all, measured on the box (glm5next 8 GB, qwen38 11 GB, v41 16 GB, v41-r8
-7.3 GB, the `fx_` reference sets 6.4 GB; see [`local-check.md`](local-check.md)), but because the bytes are reproducible, publishing
-them is optional: publish each source model's header (a few MB per
-shard), each shard's length and the seed, plus the sets. `fixture generate` does not read the source's tensor data,
-but it opens each source file through the loader's bounds check, which refuses a tensor that ends past the end of the
-file (`crates/gguf/src/lib.rs:957` at `e659f4fe`). On qwen38
-([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)), the real shards and the same shards
-cut at the data offset and grown back to their full length as holes gave the same bytes, and a cut shard left short was
-refused (`data at 18720+0 size 675430400 exceeds the file`); no length in between was tried. So a header grown to the
-file's length as a sparse file is enough, which is what `fixture fetch` writes, at the size the repo lists for each
-file (`crates/model/src/bin/fixture.rs:24-27` at `e659f4fe`). The shortest length the check passes is the end of the
-last tensor, which the header's tensor offsets and sizes give `[derived]`. On aarch64 the fill matches the x86_64
-pins: the digest test passes with all 12 pinned cases, and `fixture fetch glm5next` run twice wrote identical bytes,
-shard 1 with the sha256 pinned as `FIXTURE_SHA256`. A licence question
-comes with publishing: the generator copies the source's `tokenizer.*` and `general.*` keys (`fixture/mod.rs:12-14`), so
-a fixture carries the source model's tokenizer (Q3).
-
-**What the fixture tier exercises on a Spark.** The fixture header "names the card budget that forces the plan to offload"
-(`ref-paths.sh:33-35`), so the fixture gates run the **host tier**: `qdot`, the CPU attention, the card/host protocol. A
-Spark contributor therefore needs design S for `qdot` at P1 (scalar mirrors, correct bits, slow), not just design R.
-
-### 3.5 Timing
-
-The timing runners pin the A6000 by name: `tools/ref/timing-card.sh:36` (`TIMING_GPU=${BLOOMERY_TIMING_GPU:-$GPU_A6000}`),
-and a UUID that is neither named card is refused while a named card is missing (`:92-93`). A Spark number is admissible
-when a lease runner on the contributor's own machine produced it and it sits in the machine's own table, never beside ours
-(`AGENTS.md`: "3090 numbers … and A6000 numbers never share a table"; the same holds for a third machine). What the runners
-need:
-
-- A single-card timing mode: the lease file under `BLOOMERY_LOCK_DIR`, no 3090/A6000 branches, a prediction card per run
-  (`BLOOMERY_LEASE_CARD`, `tools/ref/card.py`). M.
-- A witness for this machine: card name and power limit (`timing-card.sh:130`; `power.limit` is `[N/A]` on GB10
-  `[#13]`), clock-event counters, the Xid count (`:27`, needs the kernel journal), and, because the pool is shared,
-  CPU load, `MemAvailable` and page-cache state at the start and end of every arm (NVIDIA's `drop_caches` line is the
-  debugging aid, section 1). `cpu-freq` reads `scaling_cur_freq`, present on GB10 (driver `cppc_cpufreq`) `[#13]`.
-- Every number carries `tok/s @ n=N, depth D, card` (`AGENTS.md`) plus the machine line: GB10, memory, DGX OS, driver,
-  CUDA toolkit, clocks.
-- The ruler is theirs: the 0.6 % same-binary SD is our box's (`AGENTS.md`, "Know the ruler"). The first Spark run is an
-  A/A of at least six rounds, and `tools/ref/card.py` then sets the round count for any claim.
-- A reference engine arm, interleaved in the same lease (`AGENTS.md`, "the line to beat"), is a build the contributor makes
-  for aarch64; no repo recipe does it today.
-
-### 3.6 The pool invariant as #16 builds it
-
-[#16](https://github.com/midagedev/bloomery/pull/16) (in review) takes M4's shape cut to what P2 reads:
+[#16](https://github.com/midagedev/bloomery/pull/16), landed as `7507942c`, takes M4's shape cut to what P2 reads
+(answer 11):
 
 - `census()` reads `CU_DEVICE_ATTRIBUTE_INTEGRATED` into `DeviceInfo::integrated`. On an integrated device the card's
   free bytes are the host's room (`MemAvailable` and the cgroup levels), not `cuMemGetInfo`. Nothing matches on a card
@@ -342,84 +365,21 @@ need:
 - `Plan::violations` gains a named `PoolOver`: the cards' totals with their margins plus the host's whole need (the NVMe
   split's arena and window included) must fit the pool. `HostNeed::cards` gives the cards their share wherever the host's
   need is read.
-- On a card with its own memory nothing moves: `integrated` is false, `unified` is `None`, `HostNeed::cards` is 0. The
-  maintainers' review checks this claim hunk by hunk, and the x86 landing batch is the gate.
-- A model above the pool is refused by name (`PoolOver`); sizing it onto the NVMe tier is P4's (section 7).
+- On a card with its own memory nothing moves: `integrated` is false, `unified` is `None`, `HostNeed::cards` is 0.
+- A model above the pool is refused by name (`PoolOver`); sizing it onto the NVMe tier is P4's (section 8).
 
 The placed fill keeps its card budget. On one pool an expert costs the same bytes on either side, so a split does not
-change the sum, and moving experts to the host only moves them to the slower side (section 3.3's table). The default
+change the sum, and moving experts to the host only moves them to the slower side (the table in 7.1). The default
 placement on a Spark stays "everything on the card".
 
-## 4. Phased plan
+## 8. Models larger than the pool (P4)
 
-Sizes are S ≤ a day, M a few days, L a week or more of work for someone who knows the code. "Maintainers first" is what
-must exist before a contributor can start; "contributor" is what the Spark's owner does.
-
-| Phase | Done when | Files | Size | Who |
-|---|---|---|---|---|
-| **P0** compiles on aarch64 (done, [#14](https://github.com/midagedev/bloomery/pull/14)) | `cargo check` of the host chain passes on aarch64 Linux (on a Spark, or the cross check of 3.1 from any machine), then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; and on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | `crates/qdot/src/lib.rs`, `crates/model/src/arch/deepseek2/attn.rs`, `crates/model/src/ops.rs:5529`, `markov-accept.rs`, the two test files; `tools/mac-check.sh` triple; a local `.cargo/cuda-oxide.toml` | M | **Contributor** writes it. **Maintainers first**: decide Q1 (R or S) and answer Q5; **maintainers after**: run the x86 landing batch on the PR (the box is the only x86 judge) |
-| **P1** fixture gates pass (`qdot` design S: [#15](https://github.com/midagedev/bloomery/pull/15)) | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | `crates/qdot/src/lib.rs` (design S), `gpu-gate.sh`, `box.sh`, `lease*.sh`, `cards.sh` (3.4); the spin sites if a red points there | L | **Maintainers first**: the fixture recipe published beside the reference sets (answer 3; the sets are public), the contributor gate list (Q4), the fixture path rule (Q2). **Contributor**: the local runner mode (M, answer 10; the maintainers review it), then run, triage, fix Arm-only defects; leaves `gate-ptx-spill` out |
-| **P2** a real model runs (the pool invariant: [#16](https://github.com/midagedev/bloomery/pull/16), section 3.6) | Clef-Flash, then Qwen3-30B-A3B and Qwen3.6-35B-A3B, answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool; the published P2 tape replayed byte for byte once it exists (answer 14) | `crates/placement/src/placement.rs` (`unified: Option<UnifiedPool>`), `workstation.rs` (`unified_of`, `host_of`), `crates/gpu/src/lib.rs` (`census` reads `CU_DEVICE_ATTRIBUTE_INTEGRATED`; free bytes from `MemAvailable` on an integrated device) | M | **Contributor** (`bloomery-placement` is a pure crate: the invariant is testable off the box); the shape is answer 11. **Maintainers first** for the tape clause: the P2 tape and its reference rows (answer 14) |
-| **P3** Spark-specific speed | the section 2 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | `ptx-shapes.tsv` per-arch rows (the arch owner, S3, is in: `justfile` `arch`, `tools/arch.sh`), the fork's per-triple key (S2), ~~`crates/threads` P/E split~~ ([#41](https://github.com/midagedev/bloomery/issues/41)), `timing-card.sh` single-card mode | L | **Maintainers**: S2 (it touches the fork pin). **Contributor**: the measurement, the table |
-| **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots; the section 7 term measured | the unified tier's slot seam (section 7), `crates/gpu/src/host/nvtier.rs`, the card leg | L | **Maintainers first**: the unified tier and its integrated-device seam. **Contributor**: the read-rate measurement, then runs and extends the seam on the Spark |
-| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 8 criteria, N = 2 first: split (a), the star, with raw verbs and a pump thread a node (8.5, 8.6); the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 (8.8) | `crates/placement` (`Machine { cards, tiers, nodes, fabric }`, `nodes_scale`), `crates/gpu/src/host/{mod,tier}.rs` (monotonic words, a `Link` seam), the transport (8.6) | L | **Maintainers first**: single-node P1 (the host-tier protocol on Arm); #16 with its doc line, then `host` and `unified` into `nodes[0]`; the per-node `Machine` and `nodes_scale`; the monotonic-word change and the `Link` seam; the `libibverbs` decision under `just deny` (8.9). **Contributor**: the two measurements of 8.9 (`ib_write_bw` / `ib_write_lat`, then the GPU flag ping-pong probe, which takes N as an argument), then the transport and the N = 2 run |
-
-Order inside P0: gate the import and the 39 functions first (the crate then compiles with every call site still behind
-`has_features`), then the predicate split of Q1, then `attn.rs`, then `ops.rs`. Each step can be checked by the cross check
-before any Spark run.
-
-## 5. Maintainers' answers (2026-10-10)
-
-1. **`qdot` off x86:** refuse (R) in the P0 pull request, so the crate compiles and whole-on-card models run; scalar
-   mirrors (S) in P1, because the fixture tier offloads to the host tier. NEON only when a host-tier gate's wall asks for it.
-2. **Fixture identity:** `/models/fixtures` stays the one legal root for now; on another machine, symlink it. A
-   root-relative check comes when a contributor needs it, as its own change.
-3. **Publishing:** the maintainers publish the reference sets and the fixture regeneration inputs per family on Hugging
-   Face, each with its source model's licence file. A family whose source licence does not allow redistribution of its
-   `tokenizer.*` keys is not published. The reference sets are up:
-   <https://huggingface.co/datasets/midagedev/bloomery-refsets> (public, 17 sets, 6.48 GB, with each base model's
-   licence).
-4. **The contributor gate list:** the maintainers own it, as one derived command (`local-check.md`): `just affected`
-   minus real-file and real-only gates, `gate-ptx-spill` and the timing runners (a fixture-only gate stays: its tier is the
-   fixture tier).
-5. **Arm evidence:** a contributor's recorded run on the Spark (its own table, with the machine named) is the Arm
-   evidence; the maintainers' x86 batch is the gate for main.
-6. **P2 golden:** yes. A published Clef-Flash tape, byte for byte, is the P2 criterion once it is published (answer 14);
-   until then P2's criterion is "answers, plan clean, `PoolOver` holds".
-7. **Toolkit:** CUDA 13.3 for aarch64 (sbsa) is the tested set, not DGX OS's 13.0. `sm_86` PTX through the JIT until P3;
-   `sm_121` PTX is a P3 item (`BLOOMERY_ARCH=sm_121`, section 3.2).
-8. **64 GB Spark:** best effort, for the models that fit; not a target.
-9. **An aarch64 release tarball:** P3 or later.
-
-Added 2026-10-11:
-
-10. **The local runner mode** ([`local-check.md`](local-check.md) open question 3): in `tools/box.sh` as
-    `BLOOMERY_BOX_LOCAL=1`, not a separate script. The command string, the guard and the env exports have one owner;
-    a second script would copy them. The contributor builds it, as offered on #13; the maintainers review it.
-11. **P2's shape:** the cut of M4 (`unified: Option<UnifiedPool>`) and its own `PoolOver`, as #16 builds them. The full
-    `MachineSpec` waits for a reader.
-12. **Above the pool:** the card computes the NVMe tier's experts from their slots, through the unified tier (section 7).
-    The host leg is not the Spark's path for them.
-13. **Several Sparks:** one design for N nodes, run at N = 2 first; no code may assume N = 2 (section 8).
-14. **The P2 tape, where:** the tape's `Q4_K_M` file and the rows `e2e.py` reads are not public yet
-    ([#16](https://github.com/midagedev/bloomery/pull/16)). The maintainers publish the Clef-Flash P2 tape and its
-    reference rows in the refsets dataset (answer 3). Until then P2's criterion is "answers, plan clean, `PoolOver`
-    holds".
-
-## 6. Not verified
-
-The aarch64 build of P0 and the readings of section 1 are the contributor's records on two DGX Sparks
-([#13](https://github.com/midagedev/bloomery/issues/13), [#14](https://github.com/midagedev/bloomery/pull/14)), and
-the readings in sections 3.2 and 3.4 are the contributor's on one Spark
-([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)); the maintainers' checks ran on
-x86_64. Still open: ~~LLVM 21 and `sm_121` PTX~~ ([#42](https://github.com/midagedev/bloomery/issues/42)); ~~the host-tier protocol's correctness on Arm~~
-(its spin sites, section 3.1; [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)); ~~the card's read rate over pageable memory~~ (section 7,
-[#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921)); ~~the NVMe read rate on a Spark~~ ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921), [#71](https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679)); of section 8, ~~the latency of a
-direct link~~ ([#44](https://github.com/midagedev/bloomery/pull/44)), small-message bandwidth in protocol mode, ~~`cuStreamWaitValue32` on a page the NIC
-wrote~~ ([#44](https://github.com/midagedev/bloomery/pull/44)), the hit rates (V4.1's replayed in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124845802); GLM's assumed), S₁ (a first reading, 8.4),
-~~BW~~ (section 2) and the switch hop (8.10). Its link facts (8.1) are sourced.
-
-## 7. Above the pool: the card computes the NVMe tier
+A model larger than one Spark's pool keeps its overflow on the NVMe tier, and on one pool the card computes those
+experts from the tier's slots in place (answer 12). The read rates that choice rests on are measured (8.1). The arena
+moves to write-combined pinned pages, and S7 and the card leg are the contributor's next pieces (answer 19). GLM-5.3-Flash
+`UD-Q4_K_XL` and V4.1 `Q3_K_M` refuse to load at serving defaults on one Spark, because the NVMe tier's floor needs more
+host room than the plan leaves; a fix that plans again under a lower card budget is in progress
+([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134430861)). P4 is done when one of them answers on one Spark with the card computing from the slots.
 
 **Today, on a machine with PCIe.** The NVMe tier's RAM arena is one anonymous mapping carved into slots, filled by
 `O_DIRECT` reads and "lent to the host leg through the model side's `TierSlots` seam" (`crates/gpu/src/host/nvtier.rs:1-9`):
@@ -427,20 +387,23 @@ the CPU computes those experts with `qdot`. On a PCIe machine that is the right 
 place and a copy to the card would cross the slower bus.
 
 **On one pool.** The card can address pageable memory, an anonymous mapping included, through the host's page tables
-(section 1: `CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS` 1, "coherently accessing pageable memory without
+(section 3: `CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS` 1, "coherently accessing pageable memory without
 `cudaHostRegister`", and `..._USES_HOST_PAGE_TABLES` 1 `[#13]`; the attributes' text is the CUDA driver API reference's).
 So the card can compute the experts in the arena's slots where they lie, with no copy. The attributes promise no rate
-and no residency: a slot page the kernel swapped out (16 GiB swap, section 1), compacted or migrated costs the card a
+and no residency: a slot page the kernel swapped out (16 GiB swap, section 3), compacted or migrated costs the card a
 translation fault that the kernel serves. The arena must hold its pages (`mlock` or an equal guard), and the rule below
-measures the rate. The CPU computes nothing on the decode path, which matches section 2's timeline: 20 Arm cores beside
+measures the rate. The CPU computes nothing on the decode path, which matches section 5's timeline: 20 Arm cores beside
 48 SMs on the same 273 GB/s add only contention.
 
-**The owner.** The maintainers' unified tier: one residency across the card, RAM and NVMe, whose rounds are landing now.
-On an integrated device its card and RAM levels are one pool, so the residency has two levels, the pool and the NVMe
-drive. Its slot seam hands a filled slot's address to the card leg instead of the host leg; the maintainers build the
-seam and prove on x86 what they can, then the contributor runs and extends it on the Spark (P4).
+**The owner.** The unified tier ([`tierengine.md`](../research/tierengine.md)): one residency across the card, RAM
+and NVMe. On an integrated device its card and RAM levels are one pool, so the residency has two levels, the pool and
+the NVMe drive. Its slot seam hands a filled slot's address to the card leg instead of the host leg. Its design for an
+integrated device is `tierengine.md` (h). S7 there (the pinned arena, `device_slot` and the `devmap` clause, checked on
+any card) and the card leg that reads from the slots are the contributor's (answer 19).
 
-**The term to measure first, with its decision rule.** One card gemv kernel reading the same expert bytes from (i)
+### 8.1 What was measured
+
+**The read rate, against its decision rule.** One card gemv kernel reading the same expert bytes from (i)
 `cuMemAlloc` memory, (ii) `cuMemHostAlloc` memory (the reading asked for on #13) and (iii) an anonymous mapping as the
 arena allocates it, with the CPU idle. The suspect term is translation reach: the arena's pages are 4 KiB today, since
 THP is in `madvise` mode `[#13]` and `AnonMap` is memmap2's `map_anon` with no `MADV_HUGEPAGE`
@@ -449,30 +412,52 @@ THP is in `madvise` mode `[#13]` and `AnonMap` is memmap2's `map_anon` with no `
 arithmetic, repeat reads, the median of 4 runs, outside the lease runner (exploratory readings,
 [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921)): (i) 233.3, (ii) 223.6 (199.4 on the first read after a fill) and with
 `WRITECOMBINED` 235.1, (iii) 157.4 GB/s; (iii) with 2 MiB pages reads 159.2, so translation reach is not the cause. The rule follows the copy's cost: a copy into card memory moves 2 × the slot's
-bytes through the same pool once per fill (section 3.3's table), and the slower read is paid on every use, so with h
+bytes through the same pool once per fill (the table in 7.1), and the slower read is paid on every use, so with h
 uses per fill the card reads in place while 1/r(iii) − 1/r(i) < 2 / (h · r_pool) `[derived]` (h = 1: down to a third
-of (i); h = 10: at 0.83 of (i) or above):
-- (iii) inside that band: the card reads the arena in place;
-- (iii) outside it: `MADV_HUGEPAGE` on the arena and measure again;
-- still outside, and (ii) inside: allocate the arena with `cuMemHostAlloc` (`O_DIRECT` reads into those pages
-  `[unverified]`);
-- otherwise: copy each filled slot into card memory before its use, on the copy engines.
+of (i); h = 10: at 0.83 of (i) or above).
 
-~~The NVMe read rate on a Spark is `[unverified]`.~~ The NVMe read rate on a Spark depends on the drive: a 4 TB PCIe
+With these rates (iii) is outside the band for every h above 3, and `MADV_HUGEPAGE` does not bring it inside. (ii) with
+`WRITECOMBINED` reads at (i)'s rate on first and repeat reads, so it is inside the band for every h, and `O_DIRECT`
+reads land correctly in those pages at the drive's rate (11.20 GB/s against 11.16 into an anonymous mapping, the same
+comment). So on an integrated device the arena moves to `cuMemHostAlloc` with `WRITECOMBINED`, and the card reads its
+slots in place ([maintainers](https://github.com/midagedev/bloomery/issues/13#issuecomment-6104493159)). The rule's other branches (huge pages, a copy on the copy engines) are not taken.
+
+**A slot hit.** A decode kernel gathers random slot rows, not whole buffers. On one Spark, today's `_sel`-shaped load
+form reads random slot rows of a WC arena at 167.8 GB/s (6 interleaved rounds, slots no launch had read since the
+fill), and whole-line loads on 128-B aligned parts at 241.4 GB/s (the prefetch loop off, the arena touched once after
+its fill, 3 rounds on another Spark) ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288), row 1; loads only, no decode). One `cuMemHostAlloc` with `WRITECOMBINED` of 64 GiB took
+5.288 s, linear in size (row 2). How these readings price a hit and the arena's allocation is `tierengine.md` (h) and
+its S7 row, as the maintainers answered ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134411281)).
+
+**The drive.** ~~The NVMe read rate on a Spark is `[unverified]`.~~ The NVMe read rate on a Spark depends on the drive: a 4 TB PCIe
 Gen5 drive reads 11.16 GB/s with 1 MiB `O_DIRECT` preads at queue depth 16 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921)), and a 1 TB PCIe Gen4
 DRAM-less drive about 4.0 GB/s with about 1 MB expert parts at random offsets at queue depth 8 ([#71](https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679)). Under one load, expert parts read by `probe_nvread` at queue
 depth 16, the two drives read 8.4 to 8.9 and 5.8 GB/s ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288), row 3). Our box's drive reads 6.77 GB/s at queue depth 16
 (`docs/cards/qdsweep.card`); that number belongs to that drive and does not carry over. Above the pool the decode is
-bound by the tier's misses, whose flow model is the unified tier's.
+bound by the tier's misses, whose flow model is the unified tier's. Reads of expert parts at queue depth 3, the unit a
+fill uses, ran at 4.6 to 5.5 GB/s on these two drives ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288), row 3; `tierengine.md` (j) takes
+that curve).
 
-## 8. Several Sparks (×2, ×4)
+## 9. Several Sparks (P5)
 
-This section is the result of a read-only design round (2026-10-11): no code, no run. The facts in 8.1 are NVIDIA's
-pages (two forum rows excepted, marked "user"), each with its URL and quoted line. Every figure in 8.4 and 8.7 is
-`[derived]` from section 2's cost model, the repo's byte counts and the assumptions stated once in 8.4. Nothing was
-measured on two Sparks. The contributor has two Sparks `[#13]`.
+P5 runs one model across N linked Sparks, N = 2 first, and no code may assume N = 2 (answer 13). The design came from
+a read-only round (2026-10-11). Since then the fabric and the protocol probe ran on two Sparks with one direct cable
+(9.1, 9.6). The figures in 9.7 and 9.8 are still `[derived]` from section 5's cost model, the repo's byte counts and the
+assumptions stated once in 9.7. No engine code has run on two Sparks.
 
-### 8.1 Link facts
+The work splits in two halves, as proposed in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134316241) and accepted in answer 20. The
+placement half needs no Arm protocol: `host` and `unified` into `nodes[0]`, the per-node shape of 9.2 and the unit gate
+`nodes_scale` (9.9). It is the contributor's and does not wait for S10. The protocol half is the monotonic words, the
+`Link` seam, the transport of 9.5 and the N = 2 run. It starts when the contributor judges P1's protocol part closed,
+which they did on `b289130a`, starting with the `Link` seam ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)). The monotonic words
+stay the module owner's (the maintainers') unless they hand them over; the contributor asked on that comment.
+
+Plans are judged by eleven criteria (9.8). Only criterion 1, every node's need within its own pool, refuses a plan.
+Criteria 2 to 7 are objectives that the planner meets or names why it cannot, criterion 8 is gate clause 1, and criteria 9
+to 11 are held by runs and review. The derived tables of 9.7 and 9.8 use inputs that measurements have since replaced,
+and `nodes_scale`'s derivation script recomputes them (section 10).
+
+### 9.1 Link facts
 
 Read by `curl` on 2026-10-11, with a text search for each quoted string. The two rows marked "user" are forum posts by
 users, not NVIDIA.
@@ -503,7 +488,7 @@ Derived from the rows above:
   189.85 Gb/s = 23.7 GB/s a direction, and one RoCE device with one QP saw 92.57 Gb/s = 11.6 GB/s. A ring of three (both
   ports) and a switch do not raise the cap. Every node, the stage node included, has about 23.7 GB/s a direction
   whatever N is.
-- One decode message (at most 131 KB, 8.4) rides one rail. A prompt batch can stripe over both rails.
+- One decode message (at most 131 KB, 9.7) rides one rail. A prompt batch can stripe over both rails.
 - A GPU cannot post to the NIC: without GPUDirect, the paths where a kernel rings the doorbell (IBGDA, NVSHMEM) rest on
   the peer mapping that cuda.html says does not work (that no such path works on GB10 is `[unverified]`). A host thread
   posts every send.
@@ -526,9 +511,9 @@ takes `--disable_pcie_relaxed` for it, and `ib_write_lat` has no option and prin
 | `all_gather_perf` busbw, 8 GiB | 13.78 to 13.82 GB/s out of place, 13.91 to 13.92 GB/s in place |
 | `link_probe` round trip λ_probe (16 KB out, 64 KB back, strict ordering) | p50 29.76 to 30.27 µs, 0 stale lines; the engine's λ is 37 to 60 µs `[derived]` in #44 |
 
-### 8.2 The shape
+### 9.2 The shape
 
-A node is one unified machine (section 3.6). A remote GB10 does what a tier card does today: it computes routed experts
+A node is one unified machine (section 7). A remote GB10 does what a tier card does today: it computes routed experts
 in place from a handoff and returns rows. `Device::Card(i)` over `all_cards()` already names such a card, so the second
 node is a node, not a new device kind. It cannot be a tier with a link cost on today's `Machine`: #16's `PoolOver` sums
 every card of `all_cards()` into one pool, so a remote tier would be charged to node 0's pool, and node 1's host-side
@@ -543,7 +528,7 @@ pub struct Machine { pub cards: Vec<Card>, pub tiers: Vec<Card>,
                      pub nodes: Vec<Node>,        // nodes[0]: #16's `host` and `unified` move here
                      pub fabric: Fabric }
 pub struct Node { pub host: Host, pub unified: Option<UnifiedPool>,
-                  pub nic: u64 }                  // bytes/s a direction, the SoC side (8.1: about 23.7 GB/s)
+                  pub nic: u64 }                  // bytes/s a direction, the SoC side (9.1: about 23.7 GB/s)
 pub enum Fabric { Alone,                          // N = 1: every machine today
                   Pair { link: Link },            // N = 2, one cable
                   Ring { link: Link },            // N = 3, both ports
@@ -552,27 +537,27 @@ pub struct Link { pub rail: u64 /* bytes/s, one message */, pub round_trip_ns: u
 ```
 
 - **#16 lands as it is**, with one doc line on `unified` and `host`: "this process's node", so nothing reads them as
-  machine-wide. The maintainers then move both into `nodes[0]`: a move-class change in a pure crate, every caller
-  through one accessor, before any remote node exists. With one node in the list the plan is exactly section 3.6's.
+  machine-wide. Moving both into `nodes[0]` is the first step of the placement half, the contributor's (answer 20): a
+  move-class change in a pure crate, every caller through one accessor, before any remote node exists. With one node in the list the plan is exactly section 7's.
 - `CardOver` stays per card. `HostOver` and `PoolOver` run once per node, over the cards whose `node` matches.
   `HostNeed` gains no field and is evaluated per node.
 - **Node 1's figures come from a remote census.** The census reads only this process's CUDA devices. Node 1's `CardSpec`
   and its `MemAvailable` reading must reach node 0 over the control channel before `plan_tiers` runs.
 - **One rule term, common to every family.** A tier takes "each layer's next ids after the stage's prefix"
   (`crates/placement/src/placement/workstation.rs:352-362`). Over a link the rule spreads the hot ids to reach the read
-  share s that balances `Sh + s·R = λ·BW + (1 − s)·R` per layer (terms in 8.4). A, Sh and R come from the plan's own
+  share s that balances `Sh + s·R = λ·BW + (1 − s)·R` per layer (terms in 9.7). A, Sh and R come from the plan's own
   tensor bytes and roles, so no model supplies them. On the box's PCIe the same formula holds with the lane's rate, so
   it is one owner for both machines, not a Spark branch.
 - **With the unified tier.** The second node is a compute site with its own residency, not one more tier in the read
   path: reading a remote V4.1 expert costs ~~16.8 MB / 11.6 GB/s = 1.4 ms, against 16.8 MB / 219 GB/s = 77 µs~~ 16.8 MB / 13.63 GB/s = 1.2 ms, against
-  16.8 MB / 208.8 GB/s (section 2) = 80 µs to compute it in place `[derived]`. The tier's ledger gains a node column, (node, id) to state. Node 1 runs its own books over
-  its own pool, arena and file copy. On a unified node a card slot and a host segment collapse (section 7), so a node's
+  16.8 MB / 208.8 GB/s (section 5) = 80 µs to compute it in place `[derived]`. The tier's ledger gains a node column, (node, id) to state. Node 1 runs its own books over
+  its own pool, arena and file copy. On a unified node a card slot and a host segment collapse (section 8), so a node's
   states are pool, arena and file. One new move is pool of node 0 to pool of node 1: a link copy of an expert (~~0.7–1.4
-  ms at 11.6 GB/s a rail~~ 0.6 to 1.2 ms at the measured 13.63 GB/s a rail, 8.1 `[derived]`) on a background lane, at a step boundary, rare. The router's counts go to node 1 once a window for its arena
+  ms at 11.6 GB/s a rail~~ 0.6 to 1.2 ms at the measured 13.63 GB/s a rail, 9.1 `[derived]`) on a background lane, at a step boundary, rare. The router's counts go to node 1 once a window for its arena
   eviction and drive the cross-node balance. The unified tier's per-node byte ledger, plan-time rule and prefetch rounds
   are the ones this touches. None needs to change now.
 
-### 8.3 Three ways to split a model
+### 9.3 Three ways to split a model
 
 L is the layer count, `t_hop` one message's one-way latency on the link. Per decode token a message carries a hidden
 vector or a few rows of them, tens of KB, so the link's bytes are small and its latency is the term `[derived]`. A
@@ -585,33 +570,155 @@ activations (`crates/gpu/src/host/xstream.rs:5-19`) and no expert ever crosses t
 | (b) pipeline by layers | each node holds its layers' KV | N − 1 messages | P × 16 × n_embd B (the 4 hc streams in f32) at each of the N − 1 node boundaries: V4.1 336 MB, GLM 268 MB, Qwen3.8 168 MB | capacity only: one request still walks the nodes in turn; several requests fill the pipeline |
 | (c) expert-parallel: every node computes its share of each layer's experts in parallel | every node runs attention on the same hidden state, so the KV cache is held N times; without that, (c) is (a) | about 2·L messages per node pair, spread over the NICs | per layer every node's partial sums, P × n_embd × 4 B, to each other node | capacity and the per-node byte term, if the expert bytes are balanced |
 
-Decode on one Spark is bound by the pool's bytes (section 2). (a) and (c) split those bytes over the nodes and add the
-latency term; (b) adds latency and splits no bytes for one request. (d), tensor parallel, is what NVIDIA documents: 8.5.
+Decode on one Spark is bound by the pool's bytes (section 5). (a) and (c) split those bytes over the nodes and add the
+latency term; (b) adds latency and splits no bytes for one request. (d), tensor parallel, is what NVIDIA documents: 9.4.
 
-### 8.4 Bands `[derived]`
+### 9.4 Recommendation, and tensor parallel
+
+The rates below are 9.7's `[derived]` bands at their first inputs (BW 219 GB/s, the box's NVMe, the assumed ρ), not
+recomputed with the measured values.
+
+1. **(a), the star, for one request: plan (b′) with the second Spark as the expert tier and the link in place of PCIe.**
+   - It keeps the bits. The join already reads one f32 row per routed slot from the tier
+     (`crates/gpu/src/host/tier.rs:19-23`), so moving those bytes over RDMA moves no float.
+   - Every family already has a tier path: `TierAct::Q8` for V4.1 (`crates/gpu-deepseek41/src/body.rs:2613`),
+     `TierAct::F32` for GLM (`crates/gpu-glm5next/src/tier.rs:461`) and Qwen3.8
+     (`crates/gpu/src/arch/qwen3moe/tier38.rs:563`). It needs no new device kind.
+   - **The gain comes from fit, not from a second memory bus.** Per decode layer (a) halves only the FFN bytes;
+     attention stays serial on node 0. GLM (fits two Sparks, not one): 17.5–24.9 tok/s against 3.9–8.3 on one,
+     NVMe-bound. V4.1 (fits neither): the NVMe share of routed reads falls from about 25–40 % to 2–7 % and the rate from
+     3.5–5.6 to 15.6–29.1 tok/s, on assumed hit rates. Qwen3.8 (fits one): 1.05–1.10× at one request, and the real gain
+     is room, node 0 dropping from about 114 to about 75 GB, which frees context.
+2. **(b), pipeline by layers, as a second mode on the same node shape**, for several requests in flight: with two
+   requests it ties or edges (a), and it is the better prompt split (1.78 × S₁ at N = 2). It fits the shape as two stage
+   cards with layer ranges on two nodes (`cards` is already in stage order, and plan (b) staged V4.1 on both PCIe
+   cards).
+3. **(c) is left out.** Two stage cards that each run all layers for different requests and share experts are a replica
+   kind, which the shape does not have.
+
+**Tensor parallel, TP = 2, is what NVIDIA documents** (9.1: vLLM `--tensor-parallel-size 2`, TRT-LLM `--tp_size 2`).
+`[derived]` `t = (A + Sh + R)/(2·BW) + L·m·λ` with m sync points a layer. At m = 2 on two nodes it reads GLM 25–36 tok/s
+and Qwen3.8 49–71 tok/s at one request, which beats (a) where A dominates. It shards every family's attention and dense
+kernels (an MLA latent cache replicated), changes the float sum order (a row-parallel all-reduce; column-only splits
+avoid that but take 2–4 gathers a layer), and needs an NCCL-class all-reduce every layer. It is the ceiling to remember,
+not the first step: a per-family rewrite against "Common code first". Whether to take it instead is the maintainers'
+decision.
+
+### 9.5 Transport
+
+**Raw verbs (rdma-core) under our own word protocol, with one host pump thread per node.** NCCL is the fabric check
+(`all_gather_perf` per NVIDIA's NCCL playbook), and the fallback only if the probe of 9.6 shows our pump path slower
+than NCCL's point to point. Without GPUDirect NCCL stages through host bounce buffers with its proxy thread `[derived
+from the cuda.html line; NCCL internals unverified]`, and a send or receive kernel per message would occupy SMs. The
+handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/tier.rs:561`), which is what 9.1's "what to
+use instead" asks for, so the NIC reads the same LPDDR with no copy. The protocol stays `host/mod.rs`'s alone
+(`crates/gpu/src/host/mod.rs:56-58`), behind a `Link` seam with two impls: the shared page (PCIe, identity, a move-class
+change) and mirrored pages (RDMA). ~~A raw-verbs build adds `libibverbs`, whose licence under `just deny` is
+`[unverified]`.~~ The probe loads `libibverbs` at run time with `dlopen`, so no build links it (9.6, item 5).
+
+What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
+1. **Two pages, one a node.** Every word keeps one writer node. The link mirrors a region one way, one RDMA write a
+   message.
+2. **Monotonic single-writer words.** Today the go counter is added to by the stage and taken back by the tier, and the
+   done counter the other way (`tier.rs:14-18`): two writers, at different times. A mirrored absolute write would erase
+   the remote decrement. Each becomes a generation the writer stores and the reader waits on with greater-or-equal. This
+   is box-provable first on PCIe: the bits are identical and the wait condition changes.
+3. **A pump thread a node.** The card cannot post to the NIC. The pump load-acquires the go generation (Arm needs an
+   explicit acquire: the memorder row) before posting. The card's system-scope barrier before go
+   (`crates/gpu/src/host/mod.rs:20-24`) orders the image before the word.
+4. **Data before flag across the NIC.** Register the pages without `IBV_ACCESS_RELAXED_ORDERING`, so write-after-write
+   order holds (the `ibv_reg_mr` row), with the flag last on the same QP. Or use write-with-immediate, where the remote
+   pump writes the flag after the completion: one more hop, ordered by the completion rule. NVIDIA's perftest ran with
+   relaxed ordering on, so its bandwidth is not protocol-mode bandwidth.
+5. **The remote is another process.** Node 1 runs a tier server: it loads its experts from its own copy of the file,
+   captures its graphs from the go order it is sent at load, and launches a replay on a "replay r of chain c" message,
+   which the first image can carry (today the stage process launches the tier's graph, `tier.rs:36-41`). Before the
+   plan, the same channel carries node 1's census to node 0.
+6. **Loss.** The go deadline already names a lost tier (`tier.rs:48-53`, `CardLost`). A down link also means the stage
+   cannot write `RELEASE` to node 1's words, so node 1 needs its own deadline that drains its streams.
+7. **Faults and sequence.** The tier's fault-word copy already rides before its signal (`tier.rs:41-43`). The handoff's
+   sequence word detects a stale or doubled image across the mirror.
+
+### 9.6 First step, and what it measured
+
+**Before two nodes run the engine.**
+1. Single-node P1 is the precondition: ~~the host-tier protocol's correctness on Arm is still open (section 6)~~ the
+   host tier's Arm memory order is audited ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), but the contributor gate list is not green
+   (section 1). Two nodes add a protocol layer on top of it.
+2. #16 landed with its doc line (`7507942c`). Moving `host` and `unified` into `nodes[0]` (a move-class change, before
+   any remote node), the shape of 9.2 and `nodes_scale` are the placement half (answer 20).
+3. The monotonic-word change in `host/mod.rs` and `tier.rs` (9.5, item 2): a protocol change in the protocol half; it
+   stays the module owner's (the maintainers') unless they hand it over (answer 20). It is bit-identical on PCIe: one owning-gate run and a same-lease A/B on the box.
+4. A `Link` seam where the tier page is written and read: a move-class change, `ptx-scan` identical.
+5. ~~Decide the `libibverbs` dependency under `just deny`.~~ Decided in #44's review: `verbs.rs` loads the system's
+   `libibverbs.so.1` with `dlopen`, so no crate links it, and it stays in `gpu-gates` until a second user moves it to
+   its own crate ([#44](https://github.com/midagedev/bloomery/pull/44)).
+
+**The contributor's first step needs no engine code.** It is done: `link_probe`
+([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`) and the fabric runs, with the results in 9.1. On two Sparks, one cable, one rail, under a prediction card
+(`tools/ref/card.py` format; their own table, the machine named). The probe takes N from the command line from the
+start, so nothing in it assumes a pair.
+1. **Fabric.** `ib_write_bw -s 65536` and `ib_write_lat -s 16384` and `-s 65536` on one RoCE device, both directions.
+   Then `all_gather_perf` per NVIDIA's NCCL playbook.
+   - Expected bandwidth 92–109 Gb/s a rail (11.6–13.7 GB/s): NVIDIA's 92.57 and 97.28 and the user's 109.28 (9.1). Below
+     90 Gb/s a rail `[a decision line, not a source: the 90 Gb/s line of the N = 4 switch check below, applied to the
+     direct link]` at perftest's default of 128 writes in flight, the cable, MTU or ordering setup is wrong: fix it
+     before the probe (one write in flight reads far less, 9.1). Measured: at the band's top (9.1).
+   - Expected one-way latency as perftest prints it: 4–10 µs at 16 KB and 8–14 µs at 64 KB `[derived from an assumed 3–8
+     µs base]`. Above 10 µs at 16 KB, λ's band of 25–70 µs is low by twice the excess `[derived]`: redo 9.7 before
+     trusting criterion 2. Measured: inside both bands (9.1).
+2. **The protocol probe** (a small bin, contributor-sized).
+   - Node 0's kernel writes a 16 KB image and a go generation into a `cudaHostAlloc` page registered with `ibv_reg_mr`
+     (strict ordering). A pump posts one RDMA write. Node 1's stream waits on its page (greater-or-equal), runs a null
+     kernel and writes 64 KB of rows and a generation. Its pump posts back, and node 0's stream wait passes.
+   - 10⁵ iterations, p50 and p99. Every 64-byte line of the image carries the sequence, and the probe counts the stale
+     lines seen after the flag.
+   - **Expected λ_probe p50 = 18–40 µs `[derived]`.** The engine's λ is λ_probe plus 7–30 µs: the tier graph's copy-in
+     and copy-out nodes, the stage's handoff, go and wait memops and the join. That gives the 25–70 µs of 9.7. Expected
+     stale lines: 0. Measured: inside the band, with 0 stale lines (9.1), so (a) holds.
+   - Decision rule on λ_probe, against the break-even λ* per model (9.7: Qwen3.8 122 µs, GLM 556 µs, V4.1 410–490 µs):
+     - **at most 40 µs** (engine at most 70 µs): (a) as predicted; Qwen3.8 1.05–1.10× at one request; GLM and V4.1 are
+       decided by fit.
+     - **40–120 µs**: (a) only for the models that do not fit one Spark (GLM, V4.1). Qwen3.8 sits near its λ* of 122 µs,
+       so it stays on one node.
+     - **over 120 µs**: the pump or wake-up path is wrong; fix it before any engine work.
+     - **stale lines over 0**: switch to write-with-immediate and measure again.
+3. Then the single-node term section 5 names (sustained BW), which sets every band above. Measured: section 5.
+
+**What carries from N = 2 to N = 4 unchanged:** the pump threads, the strict-order registration, the generation waits
+and the stale-line check, the pair λ, each node's NIC cap (the same SoC links) and the per-node census over the control
+channel.
+
+**What N = 4 adds:**
+- **A switch health check first.** `ib_write_bw` through the switch at 90 Gb/s a rail or more, before anything else. The
+  switch's own settings can hold a link far under line rate, and no source here measures a switched Spark
+  `[unverified]`.
+- **The switch hop**, measured as λ_switch − λ_pair. Expected +0.5–2 µs `[assumed]`.
+- **A fan-out and fan-in mode in the probe.** Node 0 posts to 3 peers and takes 3 rows messages. Expected λ_fanout =
+  λ_pair + 2 µs of posts + 3 × 61 KB / 23.7 GB/s ingress (7.7 µs) ≈ λ_pair + 10 µs `[derived]`.
+
+### 9.7 Reference: bands `[derived]`
 
 **Assumptions, stated once.** Every derived figure below holds under the first inputs stated here; the measured values
 now written beside them are not fed back into the tables.
 - **BW**, the pool read of our kernels: ~~219 GB/s, the 80 % of 273 GB/s that section 2 assumes (band 200–235)~~
-  measured 208.8 GB/s on `b289130a` (177.5 GB/s on `04d0c0ae`, before #27; section 2). A plain read kernel measured 233 GB/s on `cuMemAlloc`
+  measured 208.8 GB/s on `b289130a` (177.5 GB/s on `04d0c0ae`, before #27; section 5). A plain read kernel measured 233 GB/s on `cuMemAlloc`
   memory (#13); ~~our kernels' own rate, section 2's one term, is unread~~.
 - **λ**, the exposed round trip a layer, link and protocol: 25–70 µs. Terms: two one-way RDMA trips of 3–8 µs `[assumed:
-  no direct-link source]` (measured one way: 4.80 to 4.85 µs at 16 KB, 8.1); send serialization 0.5–1.4 µs and rows serialization 4.4–11.3 µs at 11.6 GB/s (51–131 KB);
+  no direct-link source]` (measured one way: 9.1); send serialization 0.5–1.4 µs and rows serialization 4.4–11.3 µs at 11.6 GB/s (51–131 KB);
   two pump wake-ups of 1–3 µs `[assumed]`; two stream-wait passes of 2–5 µs `[assumed]`; the tier graph's copy nodes
   (`c_node` 0.85 µs, [rig-log plan.md:71](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md#L71);
   on GB10 0.553 µs, the fastest of three direct runs of `cnode_probe --time` (0.553 to 0.557), SM clock 2,372 to
   2,424 MHz, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288) row 6, on main `23ee2100` ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984))). The one measured protocol number in the repo is the host-tier bridge floor,
   21–36 µs a layer on PCIe ([rig-log plan.md:78](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md#L78)).
-  Measured on one direct cable: λ_probe p50 29.76 to 30.27 µs, and the engine's λ 37 to 60 µs `[derived]` (8.1), inside
-  the band.
-- **U**, the usable pool a node for model, KV and scratch: about 115 GB `[assumed]`. Section 1 reads 116.6–116.9 GiB
+  Measured on one direct cable: λ_probe and the engine's λ `[derived]` are inside the band (9.1).
+- **U**, the usable pool a node for model, KV and scratch: about 115 GB `[assumed]`. Section 3 reads 116.6–116.9 GiB
   (125 GB) of idle `MemAvailable` on a Spark `[#13]` and #16 reads it at plan time, so U is a cautious planning figure.
 - **NVMe**: 6.77 GB/s, our box's drive at queue depth 16 (`docs/cards/qdsweep.card`). ~~A Spark's drive rate is
-  `[unverified]`.~~ A Spark's drive rate depends on the drive (section 7): 11.16 GB/s at queue depth 16 on a 4 TB Gen5
-  drive, about 4.0 GB/s at queue depth 8 on a 1 TB Gen4 one.
+  `[unverified]`.~~ A Spark's drive rate depends on the drive (section 8).
 - N = 4 adds a 1.5 µs switch hop and 1 µs for a further post `[assumed]`.
 - The non-byte "rest" of a step (~~launch chain and latency, 2.6–4.4 ms a token~~; measured inside the gemv kernels,
-  section 2) is not in the bands. It lowers
+  section 5) is not in the bands. It lowers
   every absolute figure by about 5–15 % and moves the ratios by under 5 % `[derived at the GLM and Qwen3.8 midpoints]`.
 - V4.1 and GLM hit rates on one node (ρ₁ 0.6–0.75 and 0.75–0.9) and on two (ρ₂ 0.93–0.98) are `[assumed]`. The V4.1 and
   GLM bands are only as good as they are. For V4.1, a chat route trace recorded on a DGX Spark gives two rows ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124845802)): a fixed set
@@ -622,7 +729,7 @@ now written beside them are not fed back into the tables.
 - The (a) figures come from a Monte Carlo of the per-layer window: each routed slot lands on node j with the ownership
   probability the rule picks, and the window is the max over the nodes of `Sh + slots·e` (node 0) or `λ + hop + posts +
   rows ingress + slots·e` (a remote). Node 0's share is optimized: 0.55–0.72 at N = 2 for Qwen3.8 and 0.07–0.15 at N = 4
-  for GLM and V4.1. The script moves into `tools/` beside the gate (8.8).
+  for GLM and V4.1. The script moves into `tools/` beside the gate (9.9).
 
 **Model terms** `[derived]` from each model's tensor table (file sizes: `docs/models.md`):
 
@@ -664,7 +771,7 @@ routed share] → join`. The next layer's attention needs the join, so node 1 id
 For Qwen3.8 at N = 2 under (a), node 0 holds about 75 GB (4.5 non-routed + 28.8 PLE + about 39 routed + KV) against
 about 114 GB on one node, and node 1 about 40 GB.
 
-The tables below and the "fires" table of 8.7 are `[derived]` from the assumptions above as first written: BW 219 GB/s,
+The tables below and the "fires" table of 9.8 are `[derived]` from the assumptions above as first written: BW 219 GB/s,
 NVMe 6.77 GB/s and the assumed ρ. They are not recomputed with the measured inputs.
 
 **Decode, tok/s, one request / N requests in flight (total):**
@@ -726,7 +833,7 @@ The wall is A plus the max of the two FFN halves, not the sum of the five resour
 (stagger two requests so node 1 works during node 0's attention) loses to batching them, because node 0 would read the
 attention weights twice (a GLM layer for two requests: 1.70 ms staggered, 1.34 ms batched); **bulk** is already one
 message each way a layer; **SIMT** over the batch is the existing columns form (`Chain::Cols`). The only lever left on
-the serial A is tensor parallel (8.5).
+the serial A is tensor parallel (9.4).
 
 **Which resource is the max, and where each split stops scaling:**
 - **(a), one request.** The floor is `A/BW + L·(λ + e/BW)`: the attention is never split, and the routing imbalance
@@ -747,81 +854,15 @@ the serial A is tensor parallel (8.5).
 - **(c)** scales throughput with N requests, but every node re-reads the dense weights, the all-to-all latency is
   exposed (`L·λ`, 1.0–3.4 ms), and each node's NIC caps its prompt (2,870 tok/s a node for GLM at N = 4).
 
-### 8.5 Recommendation, and tensor parallel
+### 9.8 Reference: scaling criteria
 
-The rates below are 8.4's `[derived]` bands at their first inputs (BW 219 GB/s, the box's NVMe, the assumed ρ), not
-recomputed with the measured values.
-
-1. **(a), the star, for one request: plan (b′) with the second Spark as the expert tier and the link in place of PCIe.**
-   - It keeps the bits. The join already reads one f32 row per routed slot from the tier
-     (`crates/gpu/src/host/tier.rs:19-23`), so moving those bytes over RDMA moves no float.
-   - Every family already has a tier path: `TierAct::Q8` for V4.1 (`crates/gpu-deepseek41/src/body.rs:2613`),
-     `TierAct::F32` for GLM (`crates/gpu-glm5next/src/tier.rs:461`) and Qwen3.8
-     (`crates/gpu/src/arch/qwen3moe/tier38.rs:563`). It needs no new device kind.
-   - **The gain comes from fit, not from a second memory bus.** Per decode layer (a) halves only the FFN bytes;
-     attention stays serial on node 0. GLM (fits two Sparks, not one): 17.5–24.9 tok/s against 3.9–8.3 on one,
-     NVMe-bound. V4.1 (fits neither): the NVMe share of routed reads falls from about 25–40 % to 2–7 % and the rate from
-     3.5–5.6 to 15.6–29.1 tok/s, on assumed hit rates. Qwen3.8 (fits one): 1.05–1.10× at one request, and the real gain
-     is room, node 0 dropping from about 114 to about 75 GB, which frees context.
-2. **(b), pipeline by layers, as a second mode on the same node shape**, for several requests in flight: with two
-   requests it ties or edges (a), and it is the better prompt split (1.78 × S₁ at N = 2). It fits the shape as two stage
-   cards with layer ranges on two nodes (`cards` is already in stage order, and plan (b) staged V4.1 on both PCIe
-   cards).
-3. **(c) is left out.** Two stage cards that each run all layers for different requests and share experts are a replica
-   kind, which the shape does not have.
-
-**Tensor parallel, TP = 2, is what NVIDIA documents** (8.1: vLLM `--tensor-parallel-size 2`, TRT-LLM `--tp_size 2`).
-`[derived]` `t = (A + Sh + R)/(2·BW) + L·m·λ` with m sync points a layer. At m = 2 on two nodes it reads GLM 25–36 tok/s
-and Qwen3.8 49–71 tok/s at one request, which beats (a) where A dominates. It shards every family's attention and dense
-kernels (an MLA latent cache replicated), changes the float sum order (a row-parallel all-reduce; column-only splits
-avoid that but take 2–4 gathers a layer), and needs an NCCL-class all-reduce every layer. It is the ceiling to remember,
-not the first step: a per-family rewrite against "Common code first". Whether to take it instead is the maintainers'
-decision.
-
-### 8.6 Transport
-
-**Raw verbs (rdma-core) under our own word protocol, with one host pump thread per node.** NCCL is the fabric check
-(`all_gather_perf` per NVIDIA's NCCL playbook), and the fallback only if the probe of 8.9 shows our pump path slower
-than NCCL's point to point. Without GPUDirect NCCL stages through host bounce buffers with its proxy thread `[derived
-from the cuda.html line; NCCL internals unverified]`, and a send or receive kernel per message would occupy SMs. The
-handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/tier.rs:561`), which is what 8.1's "what to
-use instead" asks for, so the NIC reads the same LPDDR with no copy. The protocol stays `host/mod.rs`'s alone
-(`crates/gpu/src/host/mod.rs:56-58`), behind a `Link` seam with two impls: the shared page (PCIe, identity, a move-class
-change) and mirrored pages (RDMA). A raw-verbs build adds `libibverbs`, whose licence under `just deny` is
-`[unverified]`.
-
-What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
-1. **Two pages, one a node.** Every word keeps one writer node. The link mirrors a region one way, one RDMA write a
-   message.
-2. **Monotonic single-writer words.** Today the go counter is added to by the stage and taken back by the tier, and the
-   done counter the other way (`tier.rs:14-18`): two writers, at different times. A mirrored absolute write would erase
-   the remote decrement. Each becomes a generation the writer stores and the reader waits on with greater-or-equal. This
-   is box-provable first on PCIe: the bits are identical and the wait condition changes.
-3. **A pump thread a node.** The card cannot post to the NIC. The pump load-acquires the go generation (Arm needs an
-   explicit acquire: the memorder row) before posting. The card's system-scope barrier before go
-   (`crates/gpu/src/host/mod.rs:20-24`) orders the image before the word.
-4. **Data before flag across the NIC.** Register the pages without `IBV_ACCESS_RELAXED_ORDERING`, so write-after-write
-   order holds (the `ibv_reg_mr` row), with the flag last on the same QP. Or use write-with-immediate, where the remote
-   pump writes the flag after the completion: one more hop, ordered by the completion rule. NVIDIA's perftest ran with
-   relaxed ordering on, so its bandwidth is not protocol-mode bandwidth.
-5. **The remote is another process.** Node 1 runs a tier server: it loads its experts from its own copy of the file,
-   captures its graphs from the go order it is sent at load, and launches a replay on a "replay r of chain c" message,
-   which the first image can carry (today the stage process launches the tier's graph, `tier.rs:36-41`). Before the
-   plan, the same channel carries node 1's census to node 0.
-6. **Loss.** The go deadline already names a lost tier (`tier.rs:48-53`, `CardLost`). A down link also means the stage
-   cannot write `RELEASE` to node 1's words, so node 1 needs its own deadline that drains its streams.
-7. **Faults and sequence.** The tier's fault-word copy already rides before its signal (`tier.rs:41-43`). The handoff's
-   sequence word detects a stale or doubled image across the mirror.
-
-### 8.7 Scaling criteria
-
-One numbered list. Criteria 1–8 are numeric conditions that the unit gate of 8.8 holds on synthetic machines at N = 1,
+One numbered list. Criteria 1–8 are numeric conditions that the unit gate of 9.9 holds on synthetic machines at N = 1,
 2, 3 and 4; criteria 9–11 are held by runs and review. The planner gains a predictor, `Plan::predict(&Workload) ->
 Prediction { step, per_node: { pool, nic, msgs_per_layer } }`. It reads the plan's own tensor bytes and roles, the card
 spec's BW, the nodes' `nic` and the fabric's `Link`, and needs no model file and no per-model code. The workload carries
 decode at n in {1, N} and the prompt at P = 4096 with its S₁ (a rate of a card and model pair, so on the workload, not
 the card spec). The thresholds come from a machine parameter, `ruler`: the useful-gain line is 2 × the machine's 95 %
-interval. The box's default is 2 % (A6000, SD 0.6 %); a Spark's own A/A sets its value (section 3.5). Our ruler is never
+interval. The box's default is 2 % (A6000, SD 0.6 %); a Spark's own A/A sets its value (section 4). Our ruler is never
 baked in.
 
 **Only criterion 1 refuses a plan**, as `CardOver` and `HostOver` do. Criteria 2–7 are **objectives** (6 is a structural
@@ -849,14 +890,14 @@ cannot it names why (`NodeIdle { reason }`, a prompt-mode note). An unset `--pla
 8. **N = 1 plans exactly as a single Spark** (gate clause 1).
 9. **Prefill.** `pp tok/s @ P = 512 and 4096` at each N is measured and judged like decode, in the machine's own table;
    the prompt predictor of criterion 5 is checked against it. It is a run criterion, not a unit-gate clause.
-10. **Host threads.** One pump thread a node posts every send, because no GPU path to the NIC works on GB10 (8.1, 8.6).
+10. **Host threads.** One pump thread a node posts every send, because no GPU path to the NIC works on GB10 (9.1, 9.5).
     Its cost, two wake-ups of 1–3 µs a layer, is inside λ, so criteria 2 and 6 hold it. No other host thread stands on
     the per-layer path. This replaces the earlier "no host thread" wording.
 11. **A lost node ends the request by name**, as a lost tier card does today (`tier.rs:48-53`): the go deadline names
-    it, and node 1's own deadline drains its streams (8.6, item 6). No failover.
+    it, and node 1's own deadline drains its streams (9.5, item 6). No failover.
 
-**Where each fires** `[derived]` from 8.4's first inputs (BW 219 GB/s, NVMe 6.77 GB/s, the assumed ρ), one row per model, N in {1, 2, 3, 4}, λ in {25, 70} µs, A low and high, and the prompt
-at S₁ in {1,000, 3,000} tok/s (the pins of the gate in 8.8):
+**Where each fires** `[derived]` from 9.7's first inputs (BW 219 GB/s, NVMe 6.77 GB/s, the assumed ρ), one row per model, N in {1, 2, 3, 4}, λ in {25, 70} µs, A low and high, and the prompt
+at S₁ in {1,000, 3,000} tok/s (the pins of the gate in 9.9):
 
 | Model | Decode step (ms), N = 1 → 2 → 3 → 4, λ 25 / 70, A low | Criterion 2 fires | Criterion 7 fires | Criterion 5 fires (prompt) |
 |---|---|---|---|---|
@@ -867,16 +908,16 @@ at S₁ in {1,000, 3,000} tok/s (the pins of the gate in 8.8):
 Nothing fires at S₁ = 1,000. At N = 2 nothing fires except GLM's prompt, which sits on the 50 % line (4,286 against
 8,610): the gate's boundary case, at ≤ and not <.
 
-### 8.8 The gate: `nodes_scale`
+### 9.9 Reference: the gate, `nodes_scale`
 
-None of this exists yet. It is what the maintainers build with the shape of 8.2. `nodes_scale` is a set of unit tests in
+None of this exists yet. It is the placement half's gate (answer 20), built with the shape of 9.2. `nodes_scale` is a set of unit tests in
 `crates/placement`, a pure crate, so `just mac-test` and the box's lib gate both run it.
 - **Machines.** `workstation::spark_nodes(n, fabric)` builds synthetic GB10 nodes (`integrated: true`, a 115 GB pool,
   `nic` 23.7 GB/s): N = 1 `Alone`, 2 `Pair`, 3 `Ring`, 4 `Switch`. `Link` is set at λ = 25 and 70 µs and `ruler` at the
   box default.
-- **Models.** Three synthetic shapes carry 8.4's terms for V4.1, GLM and Qwen3.8 (L, `n_embd`, k, e, A low and high,
+- **Models.** Three synthetic shapes carry 9.7's terms for V4.1, GLM and Qwen3.8 (L, `n_embd`, k, e, A low and high,
   Sh). No file is read.
-- **Expected sets.** The table of 8.7, pinned from a derivation script that moves into `tools/` beside the gate with its
+- **Expected sets.** The table of 9.8, pinned from a derivation script that moves into `tools/` beside the gate with its
   own self-test, so the pins have one derivation.
 - **Clauses:**
   1. `n1_is_today`: every N = 1 plan equals today's plan byte for byte.
@@ -898,76 +939,213 @@ None of this exists yet. It is what the maintainers build with the shape of 8.2.
   - M7: `ruler` fixed at 2 % instead of read from the machine → clause 7 red on a synthetic machine whose ruler is 4 %
     (Qwen3.8 at N = 2 then gains under 8 % and must name node 1 idle).
 
-### 8.9 First step
+## 10. Still open
 
-**Maintainers first.**
-1. Single-node P1 is the precondition: the host-tier protocol's correctness on Arm is still open (section 6). Two nodes
-   add a protocol layer on top of it.
-2. Agree the per-node shape of 8.2 and land #16 with its doc line. Then move `host` and `unified` into `nodes[0]`, a
-   move-class change, before any remote node.
-3. The monotonic-word change in `host/mod.rs` and `tier.rs` (8.6, item 2): a protocol change, the module owner's. It is
-   bit-identical on PCIe: one owning-gate run and a same-lease A/B on the box.
-4. A `Link` seam where the tier page is written and read: a move-class change, `ptx-scan` identical.
-5. Decide the `libibverbs` dependency under `just deny`.
+Each open item; the owner is named where one is agreed. An item that a measurement closed is in the list after it.
 
-**The contributor's first step needs no engine code.** On two Sparks, one cable, one rail, under a prediction card
-(`tools/ref/card.py` format; their own table, the machine named). The probe takes N from the command line from the
-start, so nothing in it assumes a pair.
-1. **Fabric.** `ib_write_bw -s 65536` and `ib_write_lat -s 16384` and `-s 65536` on one RoCE device, both directions.
-   Then `all_gather_perf` per NVIDIA's NCCL playbook.
-   - Expected bandwidth 92–109 Gb/s a rail (11.6–13.7 GB/s): NVIDIA's 92.57 and 97.28 and the user's 109.28 (8.1). Below
-     90 Gb/s a rail `[a decision line, not a source: the 90 Gb/s line of the N = 4 switch check below, applied to the
-     direct link]` the cable, MTU or ordering setup is wrong: fix it before the probe. Measured: 109.15 to 109.30 Gb/s
-     (8.1).
-   - Expected one-way latency as perftest prints it: 4–10 µs at 16 KB and 8–14 µs at 64 KB `[derived from an assumed 3–8
-     µs base]`. Above 10 µs at 16 KB, λ's band of 25–70 µs is low by twice the excess `[derived]`: redo 8.4 before
-     trusting criterion 2. Measured: 4.80 to 4.85 µs at 16 KB and 8.98 to 9.12 µs at 64 KB (8.1).
-2. **The protocol probe** (a small bin, contributor-sized).
-   - Node 0's kernel writes a 16 KB image and a go generation into a `cudaHostAlloc` page registered with `ibv_reg_mr`
-     (strict ordering). A pump posts one RDMA write. Node 1's stream waits on its page (greater-or-equal), runs a null
-     kernel and writes 64 KB of rows and a generation. Its pump posts back, and node 0's stream wait passes.
-   - 10⁵ iterations, p50 and p99. Every 64-byte line of the image carries the sequence, and the probe counts the stale
-     lines seen after the flag.
-   - **Expected λ_probe p50 = 18–40 µs `[derived]`.** The engine's λ is λ_probe plus 7–30 µs: the tier graph's copy-in
-     and copy-out nodes, the stage's handoff, go and wait memops and the join. That gives the 25–70 µs of 8.4. Expected
-     stale lines: 0. Measured: p50 29.76 to 30.27 µs and 0 stale lines (8.1), so (a) holds.
-   - Decision rule on λ_probe, against the break-even λ* per model (8.4: Qwen3.8 122 µs, GLM 556 µs, V4.1 410–490 µs):
-     - **at most 40 µs** (engine at most 70 µs): (a) as predicted; Qwen3.8 1.05–1.10× at one request; GLM and V4.1 are
-       decided by fit.
-     - **40–120 µs**: (a) only for the models that do not fit one Spark (GLM, V4.1). Qwen3.8 sits near its λ* of 122 µs,
-       so it stays on one node.
-     - **over 120 µs**: the pump or wake-up path is wrong; fix it before any engine work.
-     - **stale lines over 0**: switch to write-with-immediate and measure again.
-3. Then the single-node term section 2 names (sustained BW), which sets every band above. Measured: 177.5 GB/s
-   (section 2).
+**P1 and the card.**
+- The unpublished fixture-tier inputs and `--place gate`, which hold most of the contributor list's reds: the
+  maintainers (answer 18, section 1).
+- `gate-engram`'s eviction clause on a Spark: the contributor (answer 18).
+- Which gate carries the first bit-gate pass on cc 12.1 (asked of the maintainers, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
+- Per-arch `ptx-shapes.tsv` rows, so `gate-ptx-spill` can read `sm_121` PTX: the maintainers (section 6).
+- Which `llc` a build names ([#54](https://github.com/midagedev/bloomery/issues/54), section 6).
 
-**What carries from N = 2 to N = 4 unchanged:** the pump threads, the strict-order registration, the generation waits
-and the stale-line check, the pair λ, each node's NIC cap (the same SoC links) and the per-node census over the control
-channel.
+**P4.**
+- GLM-5.3-Flash and V4.1 refuse to load at serving defaults on one Spark; the fix is in progress (answer 21, section 8).
+- S7 and the card leg: the contributor (answer 19).
+- `probe_nvread`'s per-part drop (`evict_rows`) leaves some pages of a part resident on ext4, so a run redraws batches.
+  The cause is not proven; one guess is large folios that straddle two experts
+  ([#71](https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679)).
 
-**What N = 4 adds:**
-- **A switch health check first.** `ib_write_bw` through the switch at 90 Gb/s a rail or more, before anything else. The
-  switch's own settings can hold a link far under line rate, and no source here measures a switched Spark
-  `[unverified]`.
-- **The switch hop**, measured as λ_switch − λ_pair. Expected +0.5–2 µs `[assumed]`.
-- **A fan-out and fan-in mode in the probe.** Node 0 posts to 3 peers and takes 3 rows messages. Expected λ_fanout =
-  λ_pair + 2 µs of posts + 3 × 61 KB / 23.7 GB/s ingress (7.7 µs) ≈ λ_pair + 10 µs `[derived]`.
+**P5.**
+- The `[derived]` bands and criteria of 9.7 and 9.8 still use their first inputs. `nodes_scale`'s derivation script, in
+  the placement half, recomputes them (the placement half as proposed in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134316241), accepted in
+  answer 20).
+- GLM's hit rates are assumptions; V4.1's come from a replay (9.7).
+- S₁ has a first reading on one Spark (9.7), at `v0.3.0` serving defaults with the MTP draft on.
+- Small-message (16 to 64 KB) bandwidth in protocol mode, strict ordering and one message in flight: the contributor,
+  with the protocol half (answer 20). The floor is one message's serialization on one rail plus the one-way trip without
+  it `[derived]`: floor = bytes × 8 / R + (t_typical − bytes × 8 / R₁₂₈). R is 9.1's 109.28 or 92.57 Gb/s, so the
+  serialization is 1.2 to 1.4 µs at 16 KB, 2.4 to 2.8 µs at 32 KB and 4.8 to 5.7 µs at 64 KB. t_typical is
+  `ib_write_lat`'s one-way time and R₁₂₈ the `-t 128` rate, each the mean of three runs in one session (9.1). R₁₂₈
+  (108.71 to 109.26 Gb/s) is close to 109.28, so the floor's low end lands within 0.01 µs of t_typical by construction,
+  and only the range of R sets the floor's width: 0.22, 0.43 and 0.87 µs at 16, 32 and 64 KB. With one write in flight
+  on perftest's host buffers ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)), the time
+  per write derived from throughput at 64 KB is 9.10 µs A to B and 9.27 µs B to A, 0.33 and 0.29 µs under the mean
+  t_typical of the same direction `[derived]`. A time per write from throughput and half a ping-pong round trip are
+  different quantities, and neither ran on the protocol's pinned pages, so this reading neither confirms nor refutes the
+  floor. The item closes with the same sizes measured on the protocol's pinned pages, with strict ordering and one
+  message written at a time.
+- The switch hop: no switched Spark was measured (9.6).
+- Whether to take tensor parallel first instead of (a) is the maintainers' decision (9.4).
 
-### 8.10 Still open
-
-- ~~GLM's A band (4.7–8.2 GB a token) is wide: the file minus routed leaves about 3.5 GB that the tensor shapes do not
-  explain.~~ A header read of the `UD-Q4_K_XL` file's non-routed tensors gives A 7.36 GB and Sh 1.60 GB a token (8.4,
-  [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)).
-- ~~V4.1's hit rates ρ₁ and ρ₂ are assumptions.~~ A replay of a route trace recorded on a Spark gives two rows (8.4,
+**Closed.**
+- ~~LLVM 21 and `sm_121` PTX~~ ([#42](https://github.com/midagedev/bloomery/issues/42), section 6).
+- ~~the host-tier protocol's correctness on Arm~~ (its spin sites, Appendix A; [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)).
+- ~~the card's read rate over pageable memory~~ (section 8, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921)).
+- ~~the NVMe read rate on a Spark~~ ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921), [#71](https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679)); ~~the Spark drive's NVMe rate~~ (section 8).
+- ~~the latency of a direct link~~ ([#44](https://github.com/midagedev/bloomery/pull/44)); ~~a latency for a direct link~~ (9.1).
+- ~~`cuStreamWaitValue32` on a page the NIC wrote~~ ([#44](https://github.com/midagedev/bloomery/pull/44)). ~~Whether
+  `cuStreamWaitValue32` on a `cudaHostAlloc` page written by the NIC behaves on GB10 is `[unverified]`.~~ It does: the
+  probe's stream waits on such a page with no stale line ([#44](https://github.com/midagedev/bloomery/pull/44)).
+- ~~V4.1's hit rates ρ₁ and ρ₂ are assumptions.~~ A replay of a route trace recorded on a Spark gives two rows (9.7,
   [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124845802)).
-- ~~Whether `cuStreamWaitValue32` on a `cudaHostAlloc` page written by the NIC behaves on GB10 is `[unverified]`.~~ It
-  does: the probe's stream waits on such a page with no stale line ([#44](https://github.com/midagedev/bloomery/pull/44)).
-- Unverified besides: ~~a latency for a direct link~~ (8.1), small-message (16–64 KB) bandwidth in protocol mode (strict
-  ordering, one message in flight; at least 4.8–5.6 µs of serialization on one rail plus the one-way latency
-  `[derived]`; with strict ordering and one write in flight on perftest's host buffers, not the protocol's pinned
-  pages, the time per write derived from throughput at 64 KB is 9.10 and 9.27 µs, 0.33 and 0.29 µs under the same
-  session's mean one-way `t_typical` `[derived]` (8.1, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)); a time per write
-  from throughput and half a ping-pong round trip are different quantities, so this neither confirms nor refutes the
-  floor), the switch hop, ~~BW~~ (section 2), S₁ (a first reading, 8.4), and ~~the Spark drive's NVMe rate~~
-  (section 7).
-- Whether to take tensor parallel first instead of (a) is the maintainers' decision (8.5).
+- ~~GLM's A band (4.7–8.2 GB a token) is wide: the file minus routed leaves about 3.5 GB that the tensor shapes do not
+  explain.~~ A header read of the `UD-Q4_K_XL` file's non-routed tensors gives A 7.36 GB and Sh 1.60 GB a token (9.7,
+  [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)).
+- ~~BW~~ (section 5): 208.8 GB/s on `b289130a`, 177.5 GB/s on `04d0c0ae`.
+
+## 11. Maintainers' decisions
+
+The maintainers' answers on #13, numbered for citation. Answers 1 to 14 keep their wording, so a section number inside
+one is this page's old number; the italic line under an answer gives its state at this revision and the current section.
+Answers 15 to 21 are an English rendering of the maintainers' Korean comments of 2026-10-13; the linked comment is the
+authority. The maintainers let the contributor's measurements override these leanings. Answers from the same comment on
+`tierengine.md` (h), S7's allocation rule and `sparkdec.md` §4.4 are recorded in those documents. The first nine
+answers came on 2026-10-10.
+
+1. **`qdot` off x86:** refuse (R) in the P0 pull request, so the crate compiles and whole-on-card models run; scalar
+   mirrors (S) in P1, because the fixture tier offloads to the host tier. NEON only when a host-tier gate's wall asks for it.
+   *Now: R landed in [#14](https://github.com/midagedev/bloomery/pull/14) (`d95c7ec9`), S in [#15](https://github.com/midagedev/bloomery/pull/15) (`021dab61`).*
+2. **Fixture identity:** `/models/fixtures` stays the one legal root for now; on another machine, symlink it. A
+   root-relative check comes when a contributor needs it, as its own change.
+   *Now: holds; section 4 says what it means on a Spark.*
+3. **Publishing:** the maintainers publish the reference sets and the fixture regeneration inputs per family on Hugging
+   Face, each with its source model's licence file. A family whose source licence does not allow redistribution of its
+   `tokenizer.*` keys is not published. The reference sets are up:
+   <https://huggingface.co/datasets/midagedev/bloomery-refsets> (public, 17 sets, 6.48 GB, with each base model's
+   licence).
+   *Now: as above; [`local-check.md`](local-check.md) section 4 says how a contributor fetches the fixtures and sets.*
+4. **The contributor gate list:** the maintainers own it, as one derived command (`local-check.md`): `just affected`
+   minus real-file and real-only gates, `gate-ptx-spill` and the timing runners (a fixture-only gate stays: its tier is the
+   fixture tier).
+   *Now: no command prints the list yet. The P1 list was built by this rule on `697790c4` ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); [`local-check.md`](local-check.md) section 6.*
+5. **Arm evidence:** a contributor's recorded run on the Spark (its own table, with the machine named) is the Arm
+   evidence; the maintainers' x86 batch is the gate for main.
+   *Now: the Spark's tables are on [#13](https://github.com/midagedev/bloomery/issues/13), each with the machine named.*
+6. **P2 golden:** yes. A published Clef-Flash tape, byte for byte, is the P2 criterion once it is published (answer 14);
+   until then P2's criterion is "answers, plan clean, `PoolOver` holds".
+   *Now: P2 is done (section 1); the Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)).*
+7. **Toolkit:** CUDA 13.3 for aarch64 (sbsa) is the tested set, not DGX OS's 13.0. `sm_86` PTX through the JIT until P3;
+   `sm_121` PTX is a P3 item (`BLOOMERY_ARCH=sm_121`, section 3.2).
+   *Now: `sm_121` PTX was checked on GB10 ([#42](https://github.com/midagedev/bloomery/issues/42)); section 6.*
+8. **64 GB Spark:** best effort, for the models that fit; not a target.
+   *Now: unchanged.*
+9. **An aarch64 release tarball:** P3 or later.
+   *Now: unchanged.*
+
+Added 2026-10-11:
+
+10. **The local runner mode** ([`local-check.md`](local-check.md) open question 3): in `tools/box.sh` as
+    `BLOOMERY_BOX_LOCAL=1`, not a separate script. The command string, the guard and the env exports have one owner;
+    a second script would copy them. The contributor builds it, as offered on #13; the maintainers review it.
+    *Now: built in [#38](https://github.com/midagedev/bloomery/pull/38); [`local-check.md`](local-check.md) section 3.*
+11. **P2's shape:** the cut of M4 (`unified: Option<UnifiedPool>`) and its own `PoolOver`, as #16 builds them. The full
+    `MachineSpec` waits for a reader.
+    *Now: landed in `7507942c`; section 7.*
+12. **Above the pool:** the card computes the NVMe tier's experts from their slots, through the unified tier (section 7).
+    The host leg is not the Spark's path for them.
+    *Now: section 8. The tier's arena becomes write-combined `cuMemHostAlloc` memory ([maintainers](https://github.com/midagedev/bloomery/issues/13#issuecomment-6104493159)).*
+13. **Several Sparks:** one design for N nodes, run at N = 2 first; no code may assume N = 2 (section 8).
+    *Now: section 9.*
+14. **The P2 tape, where:** the tape's `Q4_K_M` file and the rows `e2e.py` reads are not public yet
+    ([#16](https://github.com/midagedev/bloomery/pull/16)). The maintainers publish the Clef-Flash P2 tape and its
+    reference rows in the refsets dataset (answer 3). Until then P2's criterion is "answers, plan clean, `PoolOver`
+    holds".
+    *Now: as answer 6.*
+
+Added 2026-10-13 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134411281), [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134437490), [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134443223)):
+
+15. **Numbers a measurement proved wrong:** strike them through, do not delete them, and put the corrected value and the
+    measurement's comment beside them (`AGENTS.md`). The rows the maintainers said on #41 and #42 they would fix (the
+    card section, the open list and the P/E row) may be fixed in the same rewrite, if the contributor wants.
+    *Now: done in this revision (sections 6 and 10, Appendix A).*
+16. **The hit-rate rows:** the maintainers lean to showing both rows (the ranked fixed set and LRU); whoever read the
+    trace decides.
+    *Now: both rows (9.7).*
+17. **`cnode_probe` (`tierengine.md` (k) row 6):** a direct run is enough, so `time-gate.sh` needs no local opt-in for
+    it; name the SM clock and the commit.
+    *Now: the GB10 `c_node` in 9.7 is such a run.*
+18. **`gate-engram` and the fixture gaps:** for the eviction clause the maintainers lean to (b), adjacent rows in one
+    call; whoever measured the cause decides. The fixture and public set gaps and `--place gate` are the maintainers'; a
+    contributor may take any of them.
+    *Now: the contributor takes the eviction clause as (b) ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)); the rest is in
+    section 10.*
+19. **S7, `devmap` and the card leg:** the contributor's, `devmap`'s clause included. A design that departs from (d) and
+    (h) goes ahead on its grounds; the contributor decides the load shape and the slice alignment from the
+    measurements. Verification may run on any card, and the maintainers take a result checked on the contributor's card
+    (GB10, RTX 5090 or others) as it is. The A6000 is the maintainers' card for their own timing; the public numbers
+    come from the 3090 alone and the 3090 with the A6000.
+    *Now: open (section 8). Since `8fb237f2` any card's number with its evidence can be published, in a table of its
+    own for that card (`AGENTS.md`).*
+20. **P5:** split as proposed. The placement half need not wait for S10 and goes up when ready; where it overlaps the
+    maintainers' train, they rebase. The protocol half starts when the contributor judges P1's protocol part closed from
+    its results.
+    *Now: the contributor judged it closed on `b289130a` and started with the `Link` seam; the monotonic words stay the
+    maintainers' unless they hand them over, which the contributor asked ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)); section 9.*
+21. **The serving-default load refusal of GLM and V4.1:** the contributor's, as a pull request after one review.
+    *Now: the fix of the NVMe tier's floor is in progress ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134430861)); section 8.
+    [#93](https://github.com/midagedev/bloomery/pull/93) (`7a7a282b`) is a separate fix: a GLM split NextN plan's host
+    headroom took the draft's routed experts out twice. It does not lift the refusal.*
+
+## Appendix A. The P0 site map
+
+P0 is done ([#14](https://github.com/midagedev/bloomery/pull/14), `d95c7ec9`, design R). This appendix keeps the map
+the work was cut from. Its lines are at `6b630e5e` unless a line names another commit.
+
+Two earlier documents sized this work: [machine-axes.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/machine-axes.md)
+(the `machineaxes` memo, 2026-09-27, whose round names `sparkprep` S1 to S4, `archkey` and `isarefuse` the table below
+uses, and whose items M1 and M4 sections 6 and 7.1 cite) and [rebuild.md](https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md) (the "machineaxes"
+result bullets, lines 197 to 200). Their line numbers are stale; the citations here are re-read.
+
+| Round (memo name) | What | In the tree today |
+|---|---|---|
+| `sparkprep` S1: cfg guards on the x86 bodies | `qdot`, `deepseek2/attn`, one bin | done in [#14](https://github.com/midagedev/bloomery/pull/14) (P0): every AVX2 item under `cfg(target_arch = "x86_64")`, design R off it |
+| `sparkprep` S2: per-triple `extra-rustflags` | fork patch | done: the fork's `87bc9518` reads `[target.<triple>] extra-rustflags`; `.cargo/cuda-oxide.toml` and `.cargo/config.toml` carry `znver3` for x86_64 and `native` for aarch64, and `tools/check-rustflags.sh` holds both triples |
+| `sparkprep` S3 / `archkey`: one owner of `--arch` | 139 recipe lines | done: the justfile's `arch` variable reads `BLOOMERY_ARCH` (default `sm_86`; unset, every recipe expands as before), the tools that run on the box read it through `tools/arch.sh`, `tools/box.sh` forwards it, and `tools/check-recipes.sh` fails on an arch literal. `gate-ptx-spill`, `ptx-scan`, `just narrow` and `release-build` refuse another arch by name; the per-arch pin rows are P3 |
+| `sparkprep` S4: tools for N cards | `cards.sh`, `timing-card.sh`, `gpu-gate.sh` | ~~not done: `tools/ref/cards.sh:31-35` names two cards~~ partly: local mode ([#38](https://github.com/midagedev/bloomery/pull/38)) and the single-card timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)) run on one local card; `tools/ref/cards.sh:33-34` still names the box's two |
+| `isarefuse`: CPU check at `main` | x86-64-v3 refusal | partly: `crates/serve/src/preflight.rs` and `crates/gpu-gates/src/bin/bloomery_serve.rs:70-71` (`cpu_gate`, x86-only); no other bin calls it |
+
+Order inside P0, as it was done: gate the import and the 39 functions first (the crate then compiles with every call
+site still behind `has_features`), then the predicate split of answer 1, then `attn.rs`, then `ops.rs`. Each step can
+be checked by the cross check before any Spark run.
+
+`python3 tools/recipes.py pure-crates` (run on the Mac) already classifies the crates. Twelve are pure (`bloomery-decision`,
+`-hf`, `-jinja`, `-levers`, `-models`, `-placement`, `-refset`, `-runtime`, `-sampler`, `-serve`, `-tokenizer`, `-vision`):
+no x86 code, no device root. Three reasons in its output block aarch64 **Linux**: `x86_64 intrinsics`, `#[target_feature]`,
+`is_x86_feature_detected!`. The other reasons (Linux `/proc` paths, `libc` items such as `sched_setaffinity`,
+`posix_fadvise`, `RUSAGE_THREAD`) are all POSIX on Linux and are not blockers on DGX OS `[unverified until a compile]`. No
+crate named `crates/gpu*` contains an x86 intrinsic (`grep -rE 'std::arch|core::arch|target_feature' crates/gpu*` finds only a
+tensor-name strings (`…dflash_kv_input_target_features…`) and a comment, `crates/gpu-gates/src/ik_q8_2.rs:51`).
+
+Sizes are S ≤ a day, M a few days, L a week or more of work for someone who knows the code.
+
+| Site | What is there | What a portable fallback needs | Size |
+|---|---|---|---|
+| `crates/qdot/src/lib.rs:44` | `use std::arch::x86_64::*;` unconditional: the whole crate, and with it every crate that depends on `bloomery-qdot` (`model`, `gpu-gates`; `gpu` through `model`), fails to compile. 39 `#[target_feature]` fns, 16 `is_x86_feature_detected!` sites (`:204-206`, `:280`, `:2270`, …) | `#[cfg(target_arch = "x86_64")]` on each AVX2 fn and on the import. The pattern exists in the same file: `dot_f32` and `sum_sq_f64` are already gated (`:7657-7714`), as are `crates/gguf/tests/f16.rs:23,70,102-104`, `crates/serve/src/preflight.rs:127,188`, `bloomery_serve.rs:70`. Per-function `cfg`, not a module move: `AGENTS.md` bans splitting a `#[target_feature]` body into helpers (10–13 % loss) | M (mechanical, 7.9 k lines) |
+| `crates/qdot/src/lib.rs:186-228` (`supports`, `fuses`, `has_features`) | "The weight type has a kernel **and** the CPU has the ISA" are one predicate. The matmul dispatch sends everything that fails it to an f32 dequant path (`:194`, doc "anything else dequantizes the row to f32 first") | Two designs (answer 1): **R** `supports` false off x86 plus a named refusal of host-tier types (the memo's S1); **S** `supports` true and route to the scalar mirrors, which are bit-identical to the AVX2 kernels (`:42`: "Each AVX2 kernel has a bit-identical scalar mirror"). `tile_kind` (`:527`), `has_lanes` (`:884`) and the `dot_row` match (`:363`) must then ask a separate "SIMD present" predicate | S–M |
+| `crates/model/src/arch/deepseek2/attn.rs:757-940, 1603-1700, 1811-2320` | 7 `#[target_feature]` fns, helpers `v_expf8` (`:760`), `lane_tree8` (`:818`), `lane_tree8x8` (`:836`); `kq_dot_simd` asserts the ISA and **panics** without it by design (`:939-944`, "no quiet fall back"); tests at `:3116-3140` | cfg-gate the kernels; `flash_simd` (`:1067-1077`) returns false off x86, which selects the scalar flash path that `BLOOMERY_FLASH_SIMD=0` already selects (`:1065-1070`); keep the named panic in `kq_dot_simd` | M |
+| `crates/model/src/ops.rs:5529` | bare `std::arch::x86_64::_mm_prefetch` in `warm_touch` | no-op or the `paced` read off x86 (the aarch64 prefetch intrinsic is unstable `[unverified]`) | S |
+| `crates/model/src/bin/markov-accept.rs:137-165`, `crates/model/tests/attn.rs` (6 detects), `crates/model/tests/moe.rs` (2 refs) | x86 kernels in a bin and in tests | cfg or a named skip | S |
+| `.cargo/config.toml`, `.cargo/cuda-oxide.toml` | per-triple CPU flags: `znver3` (with `-sse4a`) for x86_64, `native` for aarch64, the same list in both files | none: done in S2. The flat `znver3` warned on every crate and crashed rustc (SIGSEGV) on some on aarch64 `[#13]`; `tools/check-rustflags.sh` refuses an x86 name in the aarch64 lists | done |
+| `crates/threads/src/lib.rs:786-850` | pool topology from sysfs (`thread_siblings_list`, `cache/index3/*`); with no L3 file it falls back to one group (`:798`, `:806-819`) | none to compile. Default thread count is the primary-core count (`:422`: 20 on GB10) with equal chunks (`:711`), ~~so the 10 E-cores gate every barrier~~ but on the default Spark path no decode or prefill step dispatches to the pool, which runs only the load's upload ([#41](https://github.com/midagedev/bloomery/issues/41)); the pool's two groups follow the two L3 clusters (section 3), but the P/E split inside a group is not modeled | none for P0–P2; ~~M in P3~~ none on the default path ([#41](https://github.com/midagedev/bloomery/issues/41)) |
+| `crates/placement/src/placement/workstation.rs:138` (at `b289130a`), `paged_drop.rs:181` | `ROW_PAGE` and `PAGE` are 4096, commented "on x86_64" | the DGX OS base page size is 4096 `[#13]`, so the constants hold; a `sysconf` read that refuses another size by name is still the right guard | S |
+| `tools/mac-check.sh:69` (`TARGET=x86_64-unknown-linux-gnu`, also `:178,192,321-323`, `BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu` `:45,330`) | the Mac's cross check | take the triple from `BLOOMERY_CHECK_TARGET`: P0 is then provable without a Spark with `cargo check --target aarch64-unknown-linux-gnu` over the host chain (`-p bloomery-qdot -p bloomery-model -p bloomery-threads …`, no bindgen needed). Needs `rustup target add --toolchain nightly-2026-08-28 aarch64-unknown-linux-gnu`, which the Mac's toolchain lacks today | S |
+
+Third-party dependencies are portable (`Cargo.lock` has `cpufeatures`, `half`, `sha2`, `libc`, `memmap2`; none is x86-only).
+`std::ffi::c_char` is used for the driver's name buffers (`crates/gpu/src/lib.rs:1749,1791`), so the aarch64 `u8` `c_char`
+is not a trap in the sites grepped.
+
+**Memory ordering.** NVIDIA's porting guide warns that "some reorderings cannot happen on x86_64 but can happen on ARM"
+(`.../porting/memorder.html`). The host tier's card/host protocol spins on host-mapped words (`crates/gpu/src/host/mod.rs:466`,
+`step.rs:1287`, `tier.rs:1429`, `lane.rs:513`, `xstream.rs:431`, `swap.rs:3761`: 6 `spin_loop` sites) and
+`crates/gpu/src/host/*.rs` holds 29 `Ordering::Relaxed` loads. ~~Not audited; it is a P1 risk for the host-tier gates, and
+irrelevant to a whole-on-card run that never starts a host service.~~ The audit found no site in the host tier that is
+correct only under x86's ordering, and no code change is needed
+([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122), which read main `23ee2100`). It counts
+121 `Relaxed` tokens under `crates/gpu/src/host/` (loads, stores and read-modify-writes, `nvtier/reader.rs` included;
+the 29 above are loads only, at `6b630e5e`), and they are stat counters, same-thread data or books written under a lock. The one
+point the code could not settle, whether the GB10 card sees a CPU Release as ordering the plain stores before it, was
+probed on one Spark: with the payload pushed out of the cache, a plain `str` flag let the card read stale lines, and a
+`stlr` or `ldaddl` publish did not.

@@ -187,7 +187,7 @@ allocatable [measured, #13]) less the cards' share (`HostNeed.cards`, PR #16). T
 
 | Term | Discrete (box) | GB10 | Class | Owner / rule |
 |---|---|---|---|---|
-| host segment (`experts`: what the CPU computes) | the paged plan's host picks, populated at load, locked under `HOST_LOCK` (§7 Q4) | 0 — the CPU computes nothing (`docs/contrib/dgx-spark.md` §7: 20 cores beside 48 SMs on one 273 GB/s add contention) | fixed | placement (`expert_nvme_tier`'s H/2 rule, `placement.rs:2864`) |
+| host segment (`experts`: what the CPU computes) | the paged plan's host picks, populated at load, locked under `HOST_LOCK` (§7 Q4) | 0 — the CPU computes nothing (`docs/contrib/dgx-spark.md` §8: 20 cores beside 48 SMs on one 273 GB/s add contention) | fixed | placement (`expert_nvme_tier`'s H/2 rule, `placement.rs:2864`) |
 | `tables`, `shadows` | engram row tables when on host; V4.1's window shadows, pinned (`deepseek41/kv.rs` module doc) | the same bytes, in the pool | fixed | placement (role rule) |
 | `arena` (the NVMe tier's slots) | `AnonMap`; `NVTIER_BYTES` or the H/2 rule; r4b shape 21.47 GB, S ≈ 141 | `cuMemHostAlloc` WC, counted as card bytes ((h)) | budgeted, elastic down to `ArenaFloor` 2B+1 = 33 slots a layer (`:2686`) | placement sizes it; the engine fills it |
 | churn pool (adaptive residency's host share) | the card's experts past `pinned` (`churn.rs` header: "the plan's host headroom … must take the pool's bytes"); 0 on a paged stack | 0 (no card mover, (h)) | budgeted | placement |
@@ -211,7 +211,7 @@ Numbers (Qwen3.8 UD-Q4_K_XL, 111.3 GB): one sealed state = 28,416 B a position +
 `qwen38_state_bytes`'s pinned formula, `qwen35moe/place.rs:2267-2300`: 12 attention layers × (2,304 + 256/4) B a
 position; 2 × (36 × 3,596,288 + 696,320) B] → 1.19 GB at 32K, 3.98 GB at 128K, 7.71 GB at 262K [the last pinned by
 the test]. Box: the two-state floor 2.4 / 8.0 GB against a 263 GB room never binds (the 27G room is the gate dial, not
-the box). GB10: 125.2 − 111.3 = 13.9 GB for KV and runtime [derived, dgx-spark.md:110] → at 128K one slot's state 3.98
+the box). GB10: 125.2 − 111.3 = 13.9 GB for KV and runtime [derived, dgx-spark.md §5] → at 128K one slot's state 3.98
 + the floor 7.97 = 11.95 GB fits; at 262K 7.71 + 15.42 = 23.1 GB does not — the cache-bounded default context
 (`f51eea22`: a Spark's Q4 default 198,144 positions) is this arithmetic, already in the tree.
 
@@ -326,8 +326,8 @@ has two QSFP ports (sometimes called “ConnectX-7 ports”) on the back of the 
 Gigabits per second (Gb/s)"; the NIC reaches the SoC "through two independent PCIe Gen 5 x4 links"; "It supports up to
 three DGX Spark systems connected directly through cables, and up to four systems when using a switch"; "The QSFP ports
 support Ethernet configuration only". No GPUDirect RDMA on GB10 (the porting guide, quoted in `docs/contrib/dgx-spark.md`
-§8.1): the NIC reaches only `cudaHostAlloc` pages — which the WC arena *is*. One cable measured 189.85 Gb/s = 23.7 GB/s
-a direction, one rail and QP 92.57 Gb/s = 11.6 GB/s (NVIDIA's playbook, §8.1). λ (one round trip) is unmeasured;
+§9.1): the NIC reaches only `cudaHostAlloc` pages — which the WC arena *is*. One cable measured 189.85 Gb/s = 23.7 GB/s
+a direction, one rail and QP 92.57 Gb/s = 11.6 GB/s (NVIDIA's playbook, dgx-spark.md §9.1). λ (one round trip) is unmeasured;
 spark2x derives 25–70 µs.
 
 Decision — **a per-node engine over a static placement split** (spark2x Q4's shape), by three numeric criteria:
@@ -503,7 +503,7 @@ rules the moment the solver prints their numbers. GB10-only behaviour enters as 
 | PR #16 (the pool invariant, `pool_card_bytes`) | **keep, one doc line** | `pool_card_bytes` is (h)'s budget term for the WC arena; S13 later moves `host`/`unified` into `nodes[0]` (a move) |
 | spark2x (two-Spark design, `specs/leader/spark2x/design.md`) | **keep, absorbed** | its Q4 shape is (k); C1–C3 join its S1–S6; its first step (λ on one rail) is the contributor's #5 |
 | sparkdec's row-locality prefetch (the contributor's, #17) | **keep** | (h)'s `_sel` gather inherits the per-row `prefetch.global.L2`; (k) #1 measures WC rows under it |
-| `docs/contrib/dgx-spark.md` §7's decision rule (read in place vs copy) | **close** | #13 measured (ii) WC at 235 = (i) 233: the band's first branch holds, so the rule's three fallbacks (hugepage, copy on the copy engines) are dead text to remove with S7 |
+| `docs/contrib/dgx-spark.md` §8.1's decision rule (read in place vs copy) | **close** | #13 measured (ii) WC at 235 = (i) 233: the band's first branch holds; `dgx-spark.md` §8.1 now states only the branch taken |
 
 ## 7. Open questions for the user
 

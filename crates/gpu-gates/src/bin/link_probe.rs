@@ -1,4 +1,4 @@
-//! The protocol probe of `docs/contrib/dgx-spark.md` section 8.9: the host
+//! The protocol probe of `docs/contrib/dgx-spark.md` section 9.6: the host
 //! tier's word protocol carried between nodes over RDMA, timed as one round
 //! trip a generation.
 //!

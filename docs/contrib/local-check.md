@@ -159,7 +159,7 @@ or one that is `/root`; an environment file that moves the lock directory or set
 the recipe expanded; and the box itself.
 
 **Which gates.** The contributor's list is `just affected` minus the real-file and real-only gates, `gate-ptx-spill` and
-the timing runners; a fixture-only gate stays ([`dgx-spark.md`](dgx-spark.md) section 5, answer 4). No command prints it
+the timing runners; a fixture-only gate stays ([`dgx-spark.md`](dgx-spark.md) section 11, answer 4). No command prints it
 yet (section 6). Until one does, build it as one DGX Spark run did
 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082), "Reproduce"):
 
@@ -195,7 +195,7 @@ A fixture-tier gate reads two inputs: the family's fixture and the `fx_` referen
 (`crates/refset/src/fixture.rs`, `DIRS`); MiMo and the older families do not.
 
 1. **Make `/models/fixtures` exist** on your machine; a symlink to where you keep the files is enough, and it needs
-   root once ([`dgx-spark.md`](dgx-spark.md) section 5, answer 2). A set's `# model` line states the first shard's
+   root once ([`dgx-spark.md`](dgx-spark.md) section 11, answer 2). A set's `# model` line states the first shard's
    full path, which `first_shard` in `crates/refset/src/fixture.rs` builds from the root. The published sets were
    dumped under `/models/fixtures`, so they read as stale under another root, even though `BLOOMERY_FIXTURE_ROOT` moves
    the files.
@@ -274,7 +274,7 @@ cards.
   there, because `tools/ref/fixture-only.sh` stops only the real tier. The recipe must keep `just check-recipes` green:
   it takes no lock itself, runs no bare `cargo test`, and is not a `gate-*` recipe. How it counts a two-card recipe is
   open question 4.
-- **The list command.** The maintainers own it, as one derived command ([`dgx-spark.md`](dgx-spark.md) section 5,
+- **The list command.** The maintainers own it, as one derived command ([`dgx-spark.md`](dgx-spark.md) section 11,
   answer 4). Until it exists, section 3 builds the list by hand.
 - **`contrib-check` flags and states:** `--base`, `--require T2`, a `report.txt` per run (the header and the log
   directory carry its facts), the `SKIP` and `DEFER` unit states (no unit is skipped in T0 or T1), and a call of
@@ -284,11 +284,10 @@ cards.
 - **An example environment file** for local mode (reference row 2).
 - **One model path resolver** for the path literals of reference row 9.
 - **A root-relative set identity,** so the fixtures could sit under another root: it comes as its own change when a
-  contributor needs it ([`dgx-spark.md`](dgx-spark.md) section 5, answer 2).
-- **Gaps in the fixture tier the maintainers took**
-  ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134411281), answer 6), from the DGX Spark run's
-  points 1 to 5 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Until they land,
-  these items stay closed for a contributor:
+  contributor needs it ([`dgx-spark.md`](dgx-spark.md) section 11, answer 2).
+- **Gaps in the fixture tier the maintainers took** ([`dgx-spark.md`](dgx-spark.md) section 11, answer 18), from the
+  DGX Spark run's points 1 to 5 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Until
+  they land, these items stay closed for a contributor:
   - `gate-gpu-qwen4exp-e2e` and `-mtp` read the real-tier sets `ref_qwen4exp` and `ref-mtp/qwen4exp_prose64_n64_k1` on
     the fixture tier, and only the `fx_` sets are published.
   - The V4.1 DSpark draft fixture is not fetchable, and five of the gates that need it also read
@@ -325,11 +324,12 @@ outside comments name `tools/box.sh` at `3bc2a172` (`grep -vE '^\s*#' justfile |
 
 1. `CONTRIBUTING.md` ("Numbers carry their conditions") makes a number from a contributor's own card evidence for that
    pull request on that card. Does the same hold for a gate result from a card whose arch is not `sm_86`, beyond the
-   DGX Spark's Arm evidence ([`dgx-spark.md`](dgx-spark.md) section 5, answer 5)? Which fixture gates the card name
-   closed in two such runs is in section 3.
+   DGX Spark's Arm evidence ([`dgx-spark.md`](dgx-spark.md) section 11, answer 5)? Which fixture gates the card name
+   closed in two such runs is in section 3. For S7's `devmap` clause the answer is yes: a result checked on the
+   contributor's card is taken as it is ([`dgx-spark.md`](dgx-spark.md) section 11, answer 19).
 2. **Answered:** the `fx_` sets are public, and a contributor regenerates fixtures from headers grown to each file's
    listed length (section 4).
-3. **Answered:** local mode lives in `box.sh` as `BLOOMERY_BOX_LOCAL=1` ([`dgx-spark.md`](dgx-spark.md) section 5,
+3. **Answered:** local mode lives in `box.sh` as `BLOOMERY_BOX_LOCAL=1` ([`dgx-spark.md`](dgx-spark.md) section 11,
    answer 10), and it is built (section 3).
 4. Local mode refuses a two-card recipe with exit 64, a usage error, while T2's design counts a named refusal with exit 66
    as `DEFER`. On a one-card machine a two-card gate is "cannot run here" rather than a caller's mistake, so a T2 runner
