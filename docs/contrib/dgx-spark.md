@@ -38,7 +38,7 @@ budget solver.
 | **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), `gate-engram`'s eviction clause (`1dc4c184`, answer 18). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the unpublished fixture-tier inputs and `--place gate` (maintainers, answer 18); a gate for the first cc 12.1 bit pass (section 10) |
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
 | **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | the contributor's part is done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)) | per-arch `ptx-shapes.tsv` rows (maintainers; section 6) |
-| **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 refuse to load at serving defaults on one Spark; a fix is in progress ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134430861)) | the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
+| **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8) | the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
 | **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words | the placement half's engine side: a remote node's census, the card plans each node's budget comes from, and decode at n = N (contributor, answer 20; section 10); the protocol half, started by the contributor with the `Link` seam; its monotonic words stay the maintainers' unless they hand them over (section 9.6) |
 
 Files the open work touches: P1, the fixture-tier inputs and `--place gate`
@@ -366,21 +366,32 @@ with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemG
   split's arena and window included) must fit the pool. `HostNeed::cards` gives the cards their share wherever the host's
   need is read.
 - On a card with its own memory nothing moves: `integrated` is false, `unified` is `None`, `HostNeed::cards` is 0.
-- A model above the pool is refused by name (`PoolOver`); sizing it onto the NVMe tier is P4's (section 8).
+- A plan above the pool is refused by name (`PoolOver`). A model above the pool keeps its overflow on the NVMe tier
+  (section 8).
 
-The placed fill keeps its card budget. On one pool an expert costs the same bytes on either side, so a split does not
-change the sum, and moving experts to the host only moves them to the slower side (the table in 7.1). The default
-placement on a Spark stays "everything on the card".
+A model that fits the pool keeps its card budget. On one pool an expert costs the same bytes on either side, so a split
+does not change the sum, and moving experts to the host only moves them to the slower side (the table in 7.1). The
+default placement on a Spark stays "everything on the card" for such a model. A model above the pool gives up card
+bytes to the NVMe tier's floor (section 8).
 
 ## 8. Models larger than the pool (P4)
 
 A model larger than one Spark's pool keeps its overflow on the NVMe tier, and on one pool the card computes those
 experts from the tier's slots in place (answer 12). The read rates that choice rests on are measured (8.1). With S7 the
 arena on a Spark is write-combined pinned pages by default (`BLOOMERY_NVTIER_MEM` unset or `auto`; `anon` keeps the
-anonymous mapping), and the card leg is the contributor's next piece (answer 19). GLM-5.3-Flash
-`UD-Q4_K_XL` and V4.1 `Q3_K_M` refuse to load at serving defaults on one Spark, because the NVMe tier's floor needs more
-host room than the plan leaves; a fix that plans again under a lower card budget is in progress
-([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134430861)). P4 is done when one of them answers on one Spark with the card computing from the slots.
+anonymous mapping), and the card leg is the contributor's next piece (answer 19). P4 is done when GLM-5.3-Flash
+`UD-Q4_K_XL` or V4.1 `Q3_K_M` answers on one Spark with the card computing from the slots.
+
+**The load at serving defaults ([#100](https://github.com/midagedev/bloomery/pull/100)).** Both models load at serving defaults on one Spark and answer. The NVMe
+tier's floor is the least host room a plan with that tier needs, and on one pool the cards' share of the pool is one of
+its terms. A card filled up to the pool's reading left the room under that floor, so both plans were refused.
+`placement::plan_in_pool` now plans such a model again under a lower card budget until the floor holds. A card budget
+the user gives (`BLOOMERY_CARD_BUDGET`) is planned as given, and a card with memory of its own plans as before.
+
+**No arena at serving defaults.** Those default plans give the tier no RAM arena (`arena=0 arena_slots=0` in the `plan`
+line). Their room is above half of the host leg's routed-expert bytes, and there the split dial (`nvme_arena_of`) pages
+the overflow through the file mapping instead. So the default load reads no slot, and S7's pinned arena and the card
+leg are not on its path. How a plan on one Spark gets an arena is in section 10.
 
 **Today, on a machine with PCIe.** The NVMe tier's RAM arena is one anonymous mapping carved into slots, filled by
 `O_DIRECT` reads and "lent to the host leg through the model side's `TierSlots` seam" (`crates/gpu/src/host/nvtier.rs:1-9`):
@@ -941,8 +952,8 @@ Where the gate holds a clause differently from its words below, the clause says 
 - **Clauses:**
   1. `n1_is_today`: every N = 1 plan equals today's plan byte for byte. The gate holds it where node 0 holds every id:
      node 0's bytes are today's pool need, or both plans refuse the model by the same bytes. Paged, it holds node 0 to
-     today's terms before their NVMe split and every id its pool has room for, because today's plan of one Spark does
-     not page yet (section 10). The step and node 0's window are the shape's bytes over BW.
+     today's terms before their NVMe split and every id its pool has room for, because the node plans do not plan one
+     Spark's paged model as today's plan does (section 10). The step and node 0's window are the shape's bytes over BW.
   2. `pool_per_node`: criterion 1 refuses V4.1 whole at N = 2 and places it whole at N = 4. No other machine is refused.
      A node is used while the pools before it cannot hold every id. A node whose own budget passes its pool, or that
      the final split gives no id, is named idle.
@@ -986,7 +997,13 @@ Each open item; the owner is named where one is agreed. An item that a measureme
 - Which `llc` a build names ([#54](https://github.com/midagedev/bloomery/issues/54), section 6).
 
 **P4.**
-- GLM-5.3-Flash and V4.1 refuse to load at serving defaults on one Spark; the fix is in progress (answer 21, section 8).
+- An arena at serving defaults. The default plans of GLM-5.3-Flash and V4.1 on one Spark have none (section 8). A
+  given `BLOOMERY_NVTIER_BYTES` alone is refused there: the lowered card budget leaves the room just above the NVMe
+  tier's floor, and the arena's least on GLM `UD-Q4_K_XL` is 23,867,015,168 B. (GLM with `BLOOMERY_NVTIER_BYTES=24G`,
+  on this change merged with #120's head `905e7ac5` before either reached main: a room of 120,021,311,488 B against
+  floors of 120,017,099,844 B and 120,013,539,120 B in its refusals.) With a lower `BLOOMERY_CARD_BUDGET` given as well
+  (`BLOOMERY_CARD_BUDGET=70G BLOOMERY_NVTIER_BYTES=23G`), GLM plans a 38-slot arena (24,696,061,952 B), loads and
+  answers (on `905e7ac5`; under a given card budget this change plans as before).
 - The card leg: the contributor (answer 19).
 - `probe_nvread`'s per-part drop (`evict_rows`) leaves some pages of a part resident on ext4, so a run redraws batches.
   The cause is not proven; one guess is large folios that straddle two experts
@@ -999,8 +1016,9 @@ Each open item; the owner is named where one is agreed. An item that a measureme
 - Where `nodes_scale` ([#95](https://github.com/midagedev/bloomery/pull/95)) holds a clause of 9.9 differently from its
   words, for the maintainers to accept or change: until the derivation script lands, it pins the predictor's cells,
   which differ from 9.8's table in criterion 5 (clause 5); clause 1 is byte for byte only where node 0 holds every id,
-  since today's plan of one Spark does not page V4.1 or GLM yet; clause 7 compares each plan with the N − 1 plan on
-  the same link, which the planner can choose, not on the N − 1 plan's own fabric.
+  since today's plan of one Spark pages V4.1 and GLM under a card budget lowered to the NVMe tier's floor
+  (`plan_in_pool`, section 8) and the node plans take node 0's terms before that split; clause 7 compares each plan
+  with the N − 1 plan on the same link, which the planner can choose, not on the N − 1 plan's own fabric.
 - The placement half's engine side: the contributor (answer 20). It is a remote node's census over the control channel
   (9.2), the API that builds the card plans node 0's and each remote's budget come from, the router's counts in the
   split (9.2), and decode at n = N in the predictor (9.8).
@@ -1131,9 +1149,9 @@ Added 2026-10-13 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecom
     *Now: the contributor judged it closed on `b289130a` and started with the `Link` seam; the monotonic words stay the
     maintainers' unless they hand them over, which the contributor asked ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)); section 9.*
 21. **The serving-default load refusal of GLM and V4.1:** the contributor's, as a pull request after one review.
-    *Now: the fix of the NVMe tier's floor is in progress ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134430861)); section 8.
-    [#93](https://github.com/midagedev/bloomery/pull/93) (`7a7a282b`) is a separate fix: a GLM split NextN plan's host
-    headroom took the draft's routed experts out twice. It does not lift the refusal.*
+    *Now: done in [#100](https://github.com/midagedev/bloomery/pull/100): a plan the NVMe tier's floor refuses on one pool is planned again under a lower card
+    budget, and both models load at serving defaults; section 8. [#93](https://github.com/midagedev/bloomery/pull/93)
+    (`7a7a282b`) is a separate fix: a GLM split NextN plan's host headroom took the draft's routed experts out twice.*
 
 ## Appendix A. The P0 site map
 
