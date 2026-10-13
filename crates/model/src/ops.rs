@@ -4259,7 +4259,9 @@ impl<'p> UnionPlanView<'p> {
 /// ([`qdot::fuses`]). Otherwise [`crate::ModelError::HostStack`], naming
 /// `what`, the stack `tensor`, its type and `k`, which every expert of the
 /// stack shares. The one check [`UnionStack::of`] makes of a stack, and the
-/// one a load that hands a layer to the host tier asks before it uploads.
+/// one a load that hands a layer to the host tier asks before it uploads. A
+/// Q4_K stack also fixes qdot's Q4_K body here ([`qdot::q4k_avx512`]), so a
+/// `BLOOMERY_QDOT_AVX512` value it refuses stops the load by name.
 pub fn host_stack_runs(
     what: &'static str,
     tensor: &str,
@@ -4281,6 +4283,9 @@ pub fn host_stack_runs(
             k,
             gran: qdot::k_granularity(ty),
         }));
+    }
+    if ty == GgmlType::Q4_K {
+        let _ = qdot::q4k_avx512();
     }
     Ok(())
 }
