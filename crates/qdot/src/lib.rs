@@ -49,6 +49,8 @@
 //! qs[64] @+32, scales[12] @+96, f16 d @+108.
 //!
 //! Each AVX2 kernel has a bit-identical scalar mirror for fallback and verification.
+//! Q4_K's one-column kernel, its tile and its row lanes also have AVX-512 VNNI
+//! bodies, picked at run time ([`q4k_avx512`]) and bit-identical to the AVX2 ones.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -261,6 +263,40 @@ fn has_features(_: GgmlType) -> bool {
     false
 }
 
+/// Whether Q4_K's one-column kernel, its tile and its row lanes run their
+/// AVX-512 VNNI bodies on this machine: the CPU has AVX-512 F, BW and VNNI
+/// beside the AVX2 kernels' ISA ([`has_features`]), and
+/// `BLOOMERY_QDOT_AVX512` is unset or `1`; `0` keeps the AVX2 bodies, the
+/// same-binary arm. Both bodies write the same bits. Read once a process; a
+/// value other than `0` or `1` is refused by name. The host tier's load asks
+/// it for every Q4_K stack (`model::ops::host_stack_runs`), so a refused value
+/// stops the load.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn q4k_avx512() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let wanted = match std::env::var_os("BLOOMERY_QDOT_AVX512") {
+            None => true,
+            Some(v) if v == "1" => true,
+            Some(v) if v == "0" => false,
+            Some(v) => panic!("BLOOMERY_QDOT_AVX512={v:?}: takes 0 or 1"),
+        };
+        wanted
+            && has_features(GgmlType::Q4_K)
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+    })
+}
+
+/// Off x86_64 no AVX-512 body is compiled.
+#[cfg(not(target_arch = "x86_64"))]
+#[must_use]
+pub fn q4k_avx512() -> bool {
+    false
+}
+
 /// The `k` contract: `k` must be a multiple of the weight format's block size
 /// (256 for K-quants, IQ2_XS, IQ3_XXS, IQ3_S and IQ4_XS, 64 for Q2_0, 32 for Q5_0, Q5_1, Q8_0,
 /// MXFP4 and IQ4_NL). A type with no kernel here gets the K-quant contract: its callers outside this crate
@@ -428,8 +464,9 @@ fn quantize_col_check(w: GgmlType, x: &[f32], out: &[u8]) {
 
 /// Quantized row dot product: `dot(weight row, quantized activation column)`.
 ///
-/// Returns Err on shape or alignment mismatch. Uses AVX2 kernels when supported,
-/// falling back to scalar mirrors.
+/// Returns Err on shape or alignment mismatch. Uses AVX2 kernels when supported
+/// (Q4_K's AVX-512 VNNI body where [`q4k_avx512`] says so), falling back to
+/// scalar mirrors.
 #[cfg(target_arch = "x86_64")]
 pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
     let nb = check_row(w, wrow.len(), acol.len(), k)?;
@@ -438,6 +475,11 @@ pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, Q
         (GgmlType::Q3_K, true) => {
             // SAFETY: AVX2 was just detected; lengths validated by check_row.
             Ok(unsafe { dot_q3k_q8k_avx2(wrow, acol, nb) })
+        }
+        (GgmlType::Q4_K, true) if q4k_avx512() => {
+            // SAFETY: q4k_avx512 saw AVX-512 F+BW+VNNI and AVX2+FMA+F16C;
+            // check_row sized the row and the column for nb super-blocks.
+            Ok(unsafe { dot_q4k_q82x4_tile_avx512::<1>(wrow, &[acol.as_ptr()], nb) }[0])
         }
         (GgmlType::Q4_K, true) => {
             // SAFETY: AVX2+FMA were just detected; lengths validated above.
@@ -538,7 +580,9 @@ fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     }
 }
 
-/// Direct AVX2 kernel call behind [`dot_row`]; panics if required features are missing.
+/// Calls the AVX2 kernel of `w` directly. [`dot_row`] runs the same kernel,
+/// except for Q4_K when [`q4k_avx512`] is true: then it runs the AVX-512 VNNI
+/// body. Panics if required features are missing.
 #[cfg(target_arch = "x86_64")]
 pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
     let nb = check_row(w, wrow.len(), acol.len(), k)?;
@@ -706,6 +750,18 @@ pub fn dot_row_cols(
             return Ok(());
         }
     };
+    if matches!(kind, TileKind::Q4K) && q4k_avx512() {
+        match c {
+            2 => tile_q4k_avx512::<2>(wrow, acols, nb, out),
+            3 => tile_q4k_avx512::<3>(wrow, acols, nb, out),
+            4 => tile_q4k_avx512::<4>(wrow, acols, nb, out),
+            5 => tile_q4k_avx512::<5>(wrow, acols, nb, out),
+            6 => tile_q4k_avx512::<6>(wrow, acols, nb, out),
+            7 => tile_q4k_avx512::<7>(wrow, acols, nb, out),
+            _ => tile_q4k_avx512::<8>(wrow, acols, nb, out),
+        }
+        return Ok(());
+    }
     match c {
         2 => tile::<2>(kind, wrow, acols, nb, out),
         3 => tile::<3>(kind, wrow, acols, nb, out),
@@ -758,6 +814,22 @@ fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize,
         TileKind::Mxfp4 => unsafe { dot_mxfp4_q82x4_tile_avx2::<C>(wrow, &cols, nb) },
     };
     out.copy_from_slice(&v);
+}
+
+/// [`tile`] for Q4_K on its AVX-512 VNNI body ([`q4k_avx512`]).
+#[cfg(target_arch = "x86_64")]
+fn tile_q4k_avx512<const C: usize>(wrow: &[u8], acols: &[&[u8]], nb: usize, out: &mut [f32]) {
+    let cols: [*const u8; C] = std::array::from_fn(|j| acols[j].as_ptr());
+    // SAFETY: q4k_avx512 saw AVX-512 F+BW+VNNI and AVX2+FMA+F16C; check_row
+    // sized the row and every column for nb super-blocks.
+    let v = unsafe { dot_q4k_q82x4_tile_avx512::<C>(wrow, &cols, nb) };
+    out.copy_from_slice(&v);
+}
+
+/// Off x86_64 [`q4k_avx512`] is false, so no call reaches it.
+#[cfg(not(target_arch = "x86_64"))]
+fn tile_q4k_avx512<const C: usize>(_: &[u8], _: &[&[u8]], _: usize, _: &mut [f32]) {
+    unreachable!("no qdot tile kernel off x86_64")
 }
 
 /// Off x86_64 [`tile_kind`] is `None` for every type, so no call reaches a tile.
@@ -1188,38 +1260,51 @@ pub fn dot_lanes_cols(
             k,
         });
     }
-    let q6 = w == GgmlType::Q6_K;
+    let kind = match w {
+        GgmlType::Q6_K => LaneKind::Q6K,
+        GgmlType::Q4_K if q4k_avx512() => LaneKind::Q4KAvx512,
+        _ => LaneKind::Q45K,
+    };
     for (cols, out) in acols.chunks(LANE_COLS).zip(out.chunks_mut(LANE_COLS)) {
         match cols.len() {
-            1 => lanes::<1>(q6, packed, cols, nb, out),
-            2 => lanes::<2>(q6, packed, cols, nb, out),
-            3 => lanes::<3>(q6, packed, cols, nb, out),
-            _ => lanes::<4>(q6, packed, cols, nb, out),
+            1 => lanes::<1>(kind, packed, cols, nb, out),
+            2 => lanes::<2>(kind, packed, cols, nb, out),
+            3 => lanes::<3>(kind, packed, cols, nb, out),
+            _ => lanes::<4>(kind, packed, cols, nb, out),
         }
     }
     Ok(())
 }
 
+/// The row-lane kernel [`dot_lanes_cols`] runs for a packed group.
+#[derive(Clone, Copy)]
+enum LaneKind {
+    Q45K,
+    Q4KAvx512,
+    Q6K,
+}
+
 /// The `C`-column row-lane kernel over validated inputs: `packed` holds `nb`
-/// packed super-blocks (of Q6_K rows with `q6`, else of Q4_K or Q5_K rows),
-/// `acols` `C` columns of at least `nb` super-blocks' x4 groups, `out` `C`
-/// values.
+/// packed super-blocks of the type `kind` runs, `acols` `C` columns of at
+/// least `nb` super-blocks' x4 groups, `out` `C` values.
 #[cfg(target_arch = "x86_64")]
 fn lanes<const C: usize>(
-    q6: bool,
+    kind: LaneKind,
     packed: &[u8],
     acols: &[&[u8]],
     nb: usize,
     out: &mut [[f32; LANE_ROWS]],
 ) {
     let cols: [*const u8; C] = std::array::from_fn(|j| acols[j].as_ptr());
-    // SAFETY: the caller saw AVX2+FMA+F16C (has_lanes); it sized `packed` for
-    // nb packed super-blocks of the type and every column for nb super-blocks.
+    // SAFETY: the caller saw AVX2+FMA+F16C (has_lanes), and q4k_avx512 saw
+    // AVX-512 F+BW+VNNI for LaneKind::Q4KAvx512; the caller sized `packed`
+    // for nb packed super-blocks of the type and every column for nb
+    // super-blocks.
     let v = unsafe {
-        if q6 {
-            dot_lanes_q6k_avx2::<C>(packed, &cols, nb)
-        } else {
-            dot_lanes_avx2::<C>(packed, &cols, nb)
+        match kind {
+            LaneKind::Q6K => dot_lanes_q6k_avx2::<C>(packed, &cols, nb),
+            LaneKind::Q4KAvx512 => dot_lanes_avx512::<C>(packed, &cols, nb),
+            LaneKind::Q45K => dot_lanes_avx2::<C>(packed, &cols, nb),
         }
     };
     out.copy_from_slice(&v);
@@ -1227,7 +1312,7 @@ fn lanes<const C: usize>(
 
 /// Off x86_64 [`has_lanes`] is false for every type, so [`dot_lanes_cols`] refuses first.
 #[cfg(not(target_arch = "x86_64"))]
-fn lanes<const C: usize>(_: bool, _: &[u8], _: &[&[u8]], _: usize, _: &mut [[f32; LANE_ROWS]]) {
+fn lanes<const C: usize>(_: LaneKind, _: &[u8], _: &[&[u8]], _: usize, _: &mut [[f32; LANE_ROWS]]) {
     unreachable!("no qdot row-lane kernel off x86_64")
 }
 
@@ -3746,6 +3831,66 @@ unsafe fn hsum_float_8(x: __m256) -> f32 {
     }
 }
 
+/// Super-block `i`'s column factors in the Q4_K and Q5_K kernels, read from
+/// the heads of its two Q8_2_X4 groups: `dy` holds the eight blocks' bf16
+/// scales as f32, and `my` is `dy` times the blocks' i16 sums.
+///
+/// # Safety
+/// AVX2 must be available (taken from the caller, being `#[inline(always)]`);
+/// `col` must point at a column whose groups `2 * i` and `2 * i + 1` are
+/// readable.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn q82x4_dy_my(col: *const u8, i: usize) -> (__m256, __m256) {
+    // SAFETY: 16 readable bytes at the head of each of the two groups (the
+    // four scales, then the four sums) per contract.
+    unsafe {
+        let g0 = col.add((2 * i) * Q82X4_STRIDE);
+        let g1 = col.add((2 * i + 1) * Q82X4_STRIDE);
+        let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
+        let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
+        let dy = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
+        let m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g0.add(8) as *const __m128i));
+        let m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g1.add(8) as *const __m128i));
+        let my = _mm256_mul_ps(dy, _mm256_cvtepi32_ps(_mm256_set_m128i(m4_2, m4_1)));
+        (dy, my)
+    }
+}
+
+/// A Q4_K or Q5_K block's eight sub-block scales, as f32, from bytes 0..8 of
+/// its unpacked scales and mins `utmp` ([`make_q4_scales`]). The kernels
+/// multiply them by the block's `d`.
+///
+/// # Safety
+/// AVX2 must be available (taken from the caller, being `#[inline(always)]`).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn q45k_scales_ps(utmp: &[u32; 4]) -> __m256 {
+    // SAFETY: AVX2 per contract; the load reads bytes 0..8 of `utmp`.
+    unsafe {
+        _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+            utmp.as_ptr() as *const __m128i
+        )))
+    }
+}
+
+/// A Q4_K or Q5_K block's eight sub-block mins, as f32, from bytes 8..16 of
+/// its unpacked scales and mins `utmp` ([`make_q4_scales`]). The kernels
+/// multiply them by the block's `-dmin`.
+///
+/// # Safety
+/// AVX2 must be available (taken from the caller, being `#[inline(always)]`).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn q45k_mins_ps(utmp: &[u32; 4]) -> __m256 {
+    // SAFETY: AVX2 per contract; the load reads bytes 8..16 of `utmp`.
+    unsafe {
+        _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+            utmp.as_ptr().add(2) as *const __m128i
+        )))
+    }
+}
+
 /// AVX2+FMA row dot: Q4_K weights against Q8_2_X4 column.
 /// i16: codes 0..15 against activations in [-127, 127], a maddubs pair peaks at
 /// 2*15*127 = 3810; saturation is unreachable.
@@ -3766,32 +3911,14 @@ unsafe fn dot_q4k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
             let (d, dmin) = f16c_pair_to_f32([wb[0], wb[1], wb[2], wb[3]]);
 
             let utmp = make_q4_scales(&wb[4..16]);
-            // SAFETY: 8 readable bytes inside the local u32[4].
-            let mins_v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                utmp.as_ptr().add(2) as *const __m128i,
-            )));
+            let mins_v = q45k_mins_ps(&utmp);
             let mins = _mm256_mul_ps(_mm256_set1_ps(-dmin), mins_v);
 
-            // SAFETY: 8 readable bytes at the head of each validated group.
-            let g0 = acol.as_ptr().add((2 * i) * Q82X4_STRIDE);
-            let g1 = acol.as_ptr().add((2 * i + 1) * Q82X4_STRIDE);
-            let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
-            let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
-            let dy = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
+            // SAFETY: the column holds super-block i's two validated groups.
+            let (dy, my) = q82x4_dy_my(acol.as_ptr(), i);
             let dy4 = [_mm256_castps256_ps128(dy), _mm256_extractf128_ps(dy, 1)];
-            // SAFETY: 8 readable bytes at offset 8 of each group.
-            let m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g0.add(8) as *const __m128i));
-            let m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g1.add(8) as *const __m128i));
-            let myi = _mm256_set_m128i(m4_2, m4_1);
-            let my = _mm256_mul_ps(dy, _mm256_cvtepi32_ps(myi));
 
-            // SAFETY: 8 readable bytes inside the local u32[4].
-            let all_scales = _mm256_mul_ps(
-                _mm256_set1_ps(d),
-                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                    utmp.as_ptr() as *const __m128i
-                ))),
-            );
+            let all_scales = _mm256_mul_ps(_mm256_set1_ps(d), q45k_scales_ps(&utmp));
             let lo = _mm256_castps256_ps128(all_scales);
             let hi = _mm256_extractf128_ps(all_scales, 1);
             let scales = [_mm256_set_m128(lo, lo), _mm256_set_m128(hi, hi)];
@@ -4480,32 +4607,14 @@ unsafe fn dot_q5k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
             let (d, dmin) = f16c_pair_to_f32([wb[0], wb[1], wb[2], wb[3]]);
 
             let utmp = make_q4_scales(&wb[4..16]);
-            // SAFETY: 8 readable bytes inside the local u32[4].
-            let mins_v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                utmp.as_ptr().add(2) as *const __m128i,
-            )));
+            let mins_v = q45k_mins_ps(&utmp);
             let mins = _mm256_mul_ps(_mm256_set1_ps(-dmin), mins_v);
 
-            // SAFETY: 8 readable bytes at the head of each validated group.
-            let g0 = acol.as_ptr().add((2 * i) * Q82X4_STRIDE);
-            let g1 = acol.as_ptr().add((2 * i + 1) * Q82X4_STRIDE);
-            let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
-            let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
-            let dy = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
+            // SAFETY: the column holds super-block i's two validated groups.
+            let (dy, my) = q82x4_dy_my(acol.as_ptr(), i);
             let dy4 = [_mm256_castps256_ps128(dy), _mm256_extractf128_ps(dy, 1)];
-            // SAFETY: 8 readable bytes at offset 8 of each group.
-            let m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g0.add(8) as *const __m128i));
-            let m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g1.add(8) as *const __m128i));
-            let myi = _mm256_set_m128i(m4_2, m4_1);
-            let my = _mm256_mul_ps(dy, _mm256_cvtepi32_ps(myi));
 
-            // SAFETY: 8 readable bytes inside the local u32[4].
-            let all_scales = _mm256_mul_ps(
-                _mm256_set1_ps(d),
-                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                    utmp.as_ptr() as *const __m128i
-                ))),
-            );
+            let all_scales = _mm256_mul_ps(_mm256_set1_ps(d), q45k_scales_ps(&utmp));
             let lo = _mm256_castps256_ps128(all_scales);
             let hi = _mm256_extractf128_ps(all_scales, 1);
             let scales = [_mm256_set_m128(lo, lo), _mm256_set_m128(hi, hi)];
@@ -4713,35 +4822,18 @@ unsafe fn dot_q45k_q82x4_tile_avx2<const C: usize, const Q5: bool>(
             let (d, dmin) = f16c_pair_to_f32([wb[0], wb[1], wb[2], wb[3]]);
 
             let utmp = make_q4_scales(&wb[4..16]);
-            // SAFETY: 8 readable bytes inside the local u32[4].
-            let mins_v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                utmp.as_ptr().add(2) as *const __m128i,
-            )));
+            let mins_v = q45k_mins_ps(&utmp);
             let mins = _mm256_mul_ps(_mm256_set1_ps(-dmin), mins_v);
 
             let mut dy = [_mm256_setzero_ps(); C];
             for ((col, dyc), acc) in acols.iter().zip(dy.iter_mut()).zip(accd.iter_mut()) {
-                // SAFETY: 8 readable bytes at the head of each of the column's two groups.
-                let g0 = col.add((2 * i) * Q82X4_STRIDE);
-                let g1 = col.add((2 * i + 1) * Q82X4_STRIDE);
-                let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
-                let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
-                *dyc = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
-                // SAFETY: 8 readable bytes at offset 8 of each group.
-                let m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g0.add(8) as *const __m128i));
-                let m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g1.add(8) as *const __m128i));
-                let myi = _mm256_set_m128i(m4_2, m4_1);
-                let my = _mm256_mul_ps(*dyc, _mm256_cvtepi32_ps(myi));
+                // SAFETY: every column holds super-block i's two validated groups.
+                let (dyv, my) = q82x4_dy_my(*col, i);
+                *dyc = dyv;
                 *acc = _mm256_fmadd_ps(my, mins, *acc);
             }
 
-            // SAFETY: 8 readable bytes inside the local u32[4].
-            let all_scales = _mm256_mul_ps(
-                _mm256_set1_ps(d),
-                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                    utmp.as_ptr() as *const __m128i
-                ))),
-            );
+            let all_scales = _mm256_mul_ps(_mm256_set1_ps(d), q45k_scales_ps(&utmp));
             let lo = _mm256_castps256_ps128(all_scales);
             let hi = _mm256_extractf128_ps(all_scales, 1);
             let scales = [_mm256_set_m128(lo, lo), _mm256_set_m128(hi, hi)];
@@ -4825,6 +4917,132 @@ unsafe fn dot_q45k_q82x4_tile_avx2<const C: usize, const Q5: bool>(
                     let d4d8 = _mm256_mul_ps(*sj, _mm256_set_m128(dy4, dy4));
                     *acc = _mm256_fmadd_ps(d4d8, _mm256_cvtepi32_ps(sumi), *acc);
                 }
+            }
+        }
+
+        let mut out = [0.0f32; C];
+        for (o, acc) in out.iter_mut().zip(&accd) {
+            *o = hsum_float_8(*acc);
+        }
+        out
+    }
+}
+
+/// AVX-512 VNNI tile: one Q4_K weight row against `C` Q8_2_X4 columns,
+/// value `c` equal to `dot_q4k_q82x4_avx2` of column `c` bit for bit; at
+/// `C = 1` it is [`dot_row`]'s Q4_K kernel on a CPU with the ISA
+/// ([`q4k_avx512`]).
+///
+/// The float side is the AVX2 kernels' per block and column: the same
+/// `mins`, `my`, `scales` and `dy4` products and the three fmas
+/// `fma(my, mins)`, `fma(scales_0 * dy4_0, sumi_0)`, `fma(scales_1 * dy4_1,
+/// sumi_1)` in that order, then `hsum_float_8`. Only the integer sums move:
+/// zmm `t` holds sub-block `t`'s codes beside sub-block `4 + t`'s and the
+/// column's blocks `t` of its two groups, so one `vpdpbusd` a sub-block pair
+/// sums four products a dword, and the AVX2 kernels' 4×4 transpose, done per
+/// 128-bit lane on i32, leaves in each of `sumi`'s quarters the four
+/// sub-blocks' 16-value halves: half 0 then half 1 of sub-blocks 0..4, then
+/// of 4..8. Those are `sumi_0` and `sumi_1`, the same integers (codes ≤ 15
+/// against |q| ≤ 128: nothing saturates on either side).
+///
+/// # Safety
+/// CPU must support AVX-512 F+BW+VNNI and AVX2+FMA+F16C; `wrow` must hold
+/// `nb` Q4_K blocks and each `acols[c]` point at the `2 * nb` readable
+/// Q8_2_X4 groups of `nb` super-blocks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx512f",
+    enable = "avx512bw",
+    enable = "avx512vnni",
+    enable = "avx2",
+    enable = "fma",
+    enable = "f16c"
+)]
+unsafe fn dot_q4k_q82x4_tile_avx512<const C: usize>(
+    wrow: &[u8],
+    acols: &[*const u8; C],
+    nb: usize,
+) -> [f32; C] {
+    // SAFETY: the ISA is present, `wrow` holds nb blocks and every column
+    // 2 * nb groups per contract.
+    unsafe {
+        let ml = _mm512_set1_epi8(0xF);
+        let mut accd = [_mm256_setzero_ps(); C];
+
+        for i in 0..nb {
+            let wb = &wrow[i * Q4K_BLOCK..(i + 1) * Q4K_BLOCK];
+
+            let (d, dmin) = f16c_pair_to_f32([wb[0], wb[1], wb[2], wb[3]]);
+            let utmp = make_q4_scales(&wb[4..16]);
+            let all_scales = _mm256_mul_ps(_mm256_set1_ps(d), q45k_scales_ps(&utmp));
+            let mins = _mm256_mul_ps(_mm256_set1_ps(-dmin), q45k_mins_ps(&utmp));
+
+            let lo = _mm256_castps256_ps128(all_scales);
+            let hi = _mm256_extractf128_ps(all_scales, 1);
+            let scales = [_mm256_set_m128(lo, lo), _mm256_set_m128(hi, hi)];
+
+            // Code bytes 32 c..32 c + 32 hold sub-block 2 c in their low
+            // nibbles and 2 c + 1 in their high ones: w[t] is sub-block t
+            // beside sub-block 4 + t.
+            // 32-byte loads, as in the AVX2 kernels: a 64-byte load at a block's
+            // 144-byte pitch splits a cache line far more often, which costs
+            // at DRAM speed.
+            // SAFETY: four 32-byte loads covering the block's 128 code bytes.
+            let q4 = wb.as_ptr().add(16);
+            let half = |o: usize, p: usize| {
+                _mm512_inserti64x4::<1>(
+                    _mm512_castsi256_si512(_mm256_loadu_si256(q4.add(o) as *const __m256i)),
+                    _mm256_loadu_si256(q4.add(p) as *const __m256i),
+                )
+            };
+            let b02 = half(0, 64);
+            let b13 = half(32, 96);
+            let w = [
+                _mm512_and_si512(b02, ml),
+                _mm512_and_si512(_mm512_srli_epi16::<4>(b02), ml),
+                _mm512_and_si512(b13, ml),
+                _mm512_and_si512(_mm512_srli_epi16::<4>(b13), ml),
+            ];
+
+            for (col, acc) in acols.iter().zip(accd.iter_mut()) {
+                // SAFETY: every column holds super-block i's two validated groups.
+                let (dy, my) = q82x4_dy_my(*col, i);
+                let g0 = col.add((2 * i) * Q82X4_STRIDE);
+                let g1 = col.add((2 * i + 1) * Q82X4_STRIDE);
+
+                // SAFETY: eight 32-byte loads covering each group's 128 code bytes.
+                let act = |o: usize| {
+                    _mm512_inserti64x4::<1>(
+                        _mm512_castsi256_si512(
+                            _mm256_loadu_si256(g0.add(16 + o) as *const __m256i),
+                        ),
+                        _mm256_loadu_si256(g1.add(16 + o) as *const __m256i),
+                    )
+                };
+                let zero = _mm512_setzero_si512();
+                let s0 = _mm512_dpbusd_epi32(zero, w[0], act(0));
+                let s1 = _mm512_dpbusd_epi32(zero, w[1], act(32));
+                let s2 = _mm512_dpbusd_epi32(zero, w[2], act(64));
+                let s3 = _mm512_dpbusd_epi32(zero, w[3], act(96));
+                let t1 =
+                    _mm512_add_epi32(_mm512_unpacklo_epi32(s0, s1), _mm512_unpackhi_epi32(s0, s1));
+                let t3 =
+                    _mm512_add_epi32(_mm512_unpacklo_epi32(s2, s3), _mm512_unpackhi_epi32(s2, s3));
+                let sumi = _mm512_cvtepi32_ps(_mm512_add_epi32(
+                    _mm512_unpacklo_epi64(t1, t3),
+                    _mm512_unpackhi_epi64(t1, t3),
+                ));
+                let sumi_0 = _mm512_castps512_ps256(sumi);
+                let sumi_1 = _mm256_castpd_ps(_mm512_extractf64x4_pd::<1>(_mm512_castps_pd(sumi)));
+
+                let dy4 = [_mm256_castps256_ps128(dy), _mm256_extractf128_ps(dy, 1)];
+                let d4d8 = [
+                    _mm256_mul_ps(scales[0], _mm256_set_m128(dy4[0], dy4[0])),
+                    _mm256_mul_ps(scales[1], _mm256_set_m128(dy4[1], dy4[1])),
+                ];
+                *acc = _mm256_fmadd_ps(my, mins, *acc);
+                *acc = _mm256_fmadd_ps(d4d8[0], sumi_0, *acc);
+                *acc = _mm256_fmadd_ps(d4d8[1], sumi_1, *acc);
             }
         }
 
@@ -5011,19 +5229,8 @@ unsafe fn pack_lanes_avx2<const Q5: bool, const AHEAD: bool>(
                 let b = std::slice::from_raw_parts(wb[r], block);
                 let (d, dmin) = f16c_pair_to_f32([b[0], b[1], b[2], b[3]]);
                 let utmp = make_q4_scales(&b[4..16]);
-                // SAFETY: 8 readable bytes inside the local u32[4], twice.
-                sc[r] = _mm256_mul_ps(
-                    _mm256_set1_ps(d),
-                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                        utmp.as_ptr() as *const __m128i
-                    ))),
-                );
-                mn[r] = _mm256_mul_ps(
-                    _mm256_set1_ps(-dmin),
-                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                        utmp.as_ptr().add(2) as *const __m128i
-                    ))),
-                );
+                sc[r] = _mm256_mul_ps(_mm256_set1_ps(d), q45k_scales_ps(&utmp));
+                mn[r] = _mm256_mul_ps(_mm256_set1_ps(-dmin), q45k_mins_ps(&utmp));
             }
             let sc = transpose8_ps(sc);
             let mn = transpose8_ps(mn);
@@ -5169,9 +5376,9 @@ unsafe fn pack_lanes_q6k_avx2<const AHEAD: bool>(
     }
 }
 
-/// Super-blocks one pass of [`dot_lanes_avx2`] walks before it moves to the
-/// next lane: their packed codes (10 KB) and the columns' activation bytes
-/// stay in L1 across the eight lanes.
+/// Super-blocks one pass of [`dot_lanes_avx2`] (and [`dot_lanes_avx512`])
+/// walks before it moves to the next lane: their packed codes (10 KB) and the
+/// columns' activation bytes stay in L1 across the eight lanes.
 #[cfg(target_arch = "x86_64")]
 const LANE_CHUNK: usize = 4;
 
@@ -5211,21 +5418,13 @@ unsafe fn dot_lanes_avx2<const C: usize>(
         while i0 < nb {
             let n = (nb - i0).min(LANE_CHUNK);
             // Column c's d8 and my vectors of super-block i0 + ii at [c][ii]:
-            // the one-column kernel's `dy` and `my`.
+            // the one-column kernel's `dy` and `my` ([`q82x4_dy_my`]).
             let mut dy = [[[0.0f32; 8]; LANE_CHUNK]; C];
             let mut my = [[[0.0f32; 8]; LANE_CHUNK]; C];
             for c in 0..C {
                 for ii in 0..n {
-                    let i = i0 + ii;
-                    let g0 = acols[c].add((2 * i) * Q82X4_STRIDE);
-                    let g1 = acols[c].add((2 * i + 1) * Q82X4_STRIDE);
-                    let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
-                    let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
-                    let dyv =
-                        _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
-                    let m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g0.add(8) as *const __m128i));
-                    let m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g1.add(8) as *const __m128i));
-                    let myv = _mm256_mul_ps(dyv, _mm256_cvtepi32_ps(_mm256_set_m128i(m4_2, m4_1)));
+                    // SAFETY: every column holds super-block i0 + ii's two validated groups.
+                    let (dyv, myv) = q82x4_dy_my(acols[c], i0 + ii);
                     _mm256_storeu_ps(dy[c][ii].as_mut_ptr(), dyv);
                     _mm256_storeu_ps(my[c][ii].as_mut_ptr(), myv);
                 }
@@ -5287,6 +5486,146 @@ unsafe fn dot_lanes_avx2<const C: usize>(
             let mut lanes = [_mm256_setzero_ps(); 8];
             for (x, a) in lanes.iter_mut().zip(&acc) {
                 *x = a[c];
+            }
+            let rows = transpose8_ps(lanes);
+            for (o, &v) in o.iter_mut().zip(&rows) {
+                *o = hsum_float_8(v);
+            }
+        }
+        out
+    }
+}
+
+/// AVX-512 VNNI row-lane kernel for Q4_K: one packed Q4_K group
+/// ([`pack_lanes`]) against `C` Q8_2_X4 columns; `out[c][r]` equals
+/// `dot_q4k_q82x4_avx2` of row `r` and column `c` bit for bit.
+///
+/// [`dot_lanes_avx2`]'s walk with two columns a zmm: its low half holds
+/// column `2 p`'s ymm lanes and its high half column `2 p + 1`'s (an odd `C`
+/// pairs its last column with itself), each lane a row as there, so every
+/// (row, column) gets the same products and the same fused adds in the same
+/// order. The integer dot of a half is four `vpdpbusd` of the rows' code
+/// dwords against the columns' broadcast activation dwords, the same integer
+/// as the four maddubs and the madd (Q4_K codes ≤ 15: nothing saturates).
+///
+/// # Safety
+/// CPU must support AVX-512 F+BW+VNNI and AVX2+FMA+F16C; `packed` must hold
+/// `nb` packed Q4_K super-blocks and every column `nb` super-blocks' Q8_2_X4
+/// groups.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx512f",
+    enable = "avx512bw",
+    enable = "avx512vnni",
+    enable = "avx2",
+    enable = "fma",
+    enable = "f16c"
+)]
+unsafe fn dot_lanes_avx512<const C: usize>(
+    packed: &[u8],
+    acols: &[*const u8; C],
+    nb: usize,
+) -> [[f32; LANE_ROWS]; C] {
+    // SAFETY: the ISA is present; every read lies inside a packed super-block
+    // or a column's validated groups (the caller's sizes).
+    unsafe {
+        let pairs = C.div_ceil(2);
+        let pair = |p: usize| (2 * p, (2 * p + 1).min(C - 1));
+        let mut acc = [[_mm512_setzero_ps(); C]; 8];
+        let mut i0 = 0;
+        while i0 < nb {
+            let n = (nb - i0).min(LANE_CHUNK);
+            // Column c's d8 and my vectors of super-block i0 + ii at [c][ii]:
+            // the one-column kernel's `dy` and `my` ([`q82x4_dy_my`]).
+            let mut dy = [[[0.0f32; 8]; LANE_CHUNK]; C];
+            let mut my = [[[0.0f32; 8]; LANE_CHUNK]; C];
+            for c in 0..C {
+                for ii in 0..n {
+                    // SAFETY: every column holds super-block i0 + ii's two validated groups.
+                    let (dyv, myv) = q82x4_dy_my(acols[c], i0 + ii);
+                    _mm256_storeu_ps(dy[c][ii].as_mut_ptr(), dyv);
+                    _mm256_storeu_ps(my[c][ii].as_mut_ptr(), myv);
+                }
+            }
+            for l in 0..8 {
+                let (t, h) = (l % 4, l / 4);
+                let mut a = acc[l];
+                for ii in 0..n {
+                    let i = i0 + ii;
+                    let base = packed.as_ptr().add(i * LANE_SB_BYTES);
+                    let mins = _mm512_castpd_ps(_mm512_broadcast_f64x4(_mm256_loadu_pd(
+                        base.add(LANE_MN + 32 * l) as *const f64,
+                    )));
+                    for (p, a) in a.iter_mut().enumerate().take(pairs) {
+                        let (c0, c1) = pair(p);
+                        let m = _mm512_mask_mov_ps(
+                            _mm512_set1_ps(my[c0][ii][l]),
+                            0xFF00,
+                            _mm512_set1_ps(my[c1][ii][l]),
+                        );
+                        *a = _mm512_fmadd_ps(m, mins, *a);
+                    }
+                    for j in 0..2 {
+                        let s = 4 * j + t;
+                        let sc = _mm512_castpd_ps(_mm512_broadcast_f64x4(_mm256_loadu_pd(
+                            base.add(LANE_SC + 32 * s) as *const f64,
+                        )));
+                        let mut w = [_mm512_setzero_si512(); 4];
+                        for (g, w) in w.iter_mut().enumerate() {
+                            *w = _mm512_broadcast_i64x4(_mm256_loadu_si256(
+                                base.add(32 * (8 * s + 4 * h + g)) as *const __m256i,
+                            ));
+                        }
+                        for (p, a) in a.iter_mut().enumerate().take(pairs) {
+                            let (c0, c1) = pair(p);
+                            let at = (2 * i + j) * Q82X4_STRIDE + 16 + 32 * t + 16 * h;
+                            // Column c0's four activation dwords in each 128-bit
+                            // lane of the low half, c1's in the high half; an
+                            // in-lane shuffle spreads dword g over each half.
+                            let q = _mm512_inserti64x4::<1>(
+                                _mm512_castsi256_si512(_mm256_broadcastsi128_si256(
+                                    _mm_loadu_si128(acols[c0].add(at) as *const __m128i),
+                                )),
+                                _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                                    acols[c1].add(at) as *const __m128i
+                                )),
+                            );
+                            let zero = _mm512_setzero_si512();
+                            let s01 = _mm512_dpbusd_epi32(
+                                _mm512_dpbusd_epi32(zero, w[0], _mm512_shuffle_epi32::<0x00>(q)),
+                                w[1],
+                                _mm512_shuffle_epi32::<0x55>(q),
+                            );
+                            let s23 = _mm512_dpbusd_epi32(
+                                _mm512_dpbusd_epi32(zero, w[2], _mm512_shuffle_epi32::<0xAA>(q)),
+                                w[3],
+                                _mm512_shuffle_epi32::<0xFF>(q),
+                            );
+                            let sumi = _mm512_add_epi32(s01, s23);
+                            let d8 = _mm512_mask_mov_ps(
+                                _mm512_set1_ps(dy[c0][ii][s]),
+                                0xFF00,
+                                _mm512_set1_ps(dy[c1][ii][s]),
+                            );
+                            let d4d8 = _mm512_mul_ps(sc, d8);
+                            *a = _mm512_fmadd_ps(d4d8, _mm512_cvtepi32_ps(sumi), *a);
+                        }
+                    }
+                }
+                acc[l] = a;
+            }
+            i0 += n;
+        }
+        let mut out = [[0.0f32; LANE_ROWS]; C];
+        for (c, o) in out.iter_mut().enumerate() {
+            let mut lanes = [_mm256_setzero_ps(); 8];
+            for (x, a) in lanes.iter_mut().zip(&acc) {
+                let both = _mm512_castps_pd(a[c / 2]);
+                *x = _mm256_castpd_ps(if c % 2 == 0 {
+                    _mm512_castpd512_pd256(both)
+                } else {
+                    _mm512_extractf64x4_pd::<1>(both)
+                });
             }
             let rows = transpose8_ps(lanes);
             for (o, &v) in o.iter_mut().zip(&rows) {
