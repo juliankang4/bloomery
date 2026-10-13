@@ -1744,7 +1744,13 @@ impl<H: HostExperts> HostTier<H> {
                 ));
             }
         }
-        let page = TierPage::new(stage, tiers[0].page_layout(tiers.len())?)?;
+        let kind = bloomery_levers::tier_link().map_err(|e| GpuError::plan(WHAT, e))?;
+        let page = TierPage::new(
+            stage,
+            tiers[0].gpu(),
+            tiers[0].page_layout(tiers.len())?,
+            kind,
+        )?;
         for (t, tier) in tiers.iter_mut().enumerate() {
             tier.bind(&page, t, stage)?;
         }
@@ -2320,9 +2326,10 @@ impl<H: HostExperts> HostTier<H> {
                         format!(
                             "the stream has drained and the expert tier is not at rest \
                              (progress {} of {} asked): a go the tier never took, or a signal \
-                             no wait took back",
+                             no wait took back{}",
                             t.progress(page),
-                            t.issued()
+                            t.issued(),
+                            page.broken_note()
                         ),
                     ));
                 }

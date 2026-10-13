@@ -8,7 +8,7 @@
 #             queued — or given:<minutes> for an item with no times row
 #   why       one line: what the item is for
 # The recipe's justfile groups (solo, v41-load) are read from the justfile by fill-list, not repeated here.
-weekly-gpu-ds41-lost	both	times:weekly-gpu-ds41-lost	weekly tier: the lost-card clauses of the V4.1 engine
+weekly-gpu-ds41-lost	both	times:weekly-gpu-ds41-lost	weekly tier: the lost-card clauses of the V4.1 engine, and its tier gate over the loopback link
 weekly-gpu-ds41-cand	any	times:weekly-gpu-ds41-cand	weekly tier: the V4.1 prefill past 16,384 and its candidate launches
 weekly-gpu-ds41-flowcounts	3090	times:weekly-gpu-ds41-flowcounts	weekly tier: the prefill flow model's queue-entry counts against the engine's records
 weekly-gpu-ds41-serve	both	times:weekly-gpu-ds41-serve	weekly tier: the V4.1 server gate, eight loads (plain, media, drafted, two-card)

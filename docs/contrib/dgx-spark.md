@@ -39,11 +39,11 @@ budget solver.
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
 | **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6) | nothing |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8) | the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
-| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words | the placement half's engine side: a remote node's census, the card plans each node's budget comes from, and decode at n = N (contributor, answer 20; section 10); the protocol half, started by the contributor with the `Link` seam; its monotonic words stay the maintainers' unless they hand them over (section 9.6) |
+| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words | the placement half's engine side: a remote node's census, the card plans each node's budget comes from, and decode at n = N (contributor, answer 20; section 10); the protocol half, started by the contributor with the `Link` seam and the counter relay (section 9.5, item 2) on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828); the transport and the N = 2 run are left |
 
 Files the open work touches: P1, the fixture-tier inputs; P4, the card's gather kernels that read the arena in
 `crates/gpu/src/host/nvtier.rs` (the card leg); P5, `crates/placement` (`Machine`, `nodes_scale`),
-`crates/gpu/src/host/mod.rs` and `tier.rs` (the monotonic words and the `Link` seam) and the transport (9.5).
+`crates/gpu/src/host/link.rs` and `link/pump.rs` (the `Link` seam and the counter relay) and the transport (9.5).
 
 ## 2. Build and first run on a Spark
 
@@ -349,7 +349,7 @@ with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemG
 | Term | On the Spark |
 |---|---|
 | H2D promotion over PCIe (`cuMemcpyHtoDAsync`, `crates/gpu/src/host/xstream.rs:1223,1261` at `cce176c5`; the staging rings `:283,760,1614`) | vanishes as a PCIe cost; a copy from pageable memory into a `cudaMalloc` buffer is still a DRAM-to-DRAM copy at half the pool's rate (reads and writes both cross it: 21.2 GB in ~0.16 s `[derived]`), negligible beside the file read |
-| Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/tier.rs:561`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
+| Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/link.rs:136`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
 | CPU expert compute | stays possible but pointless: 20 Arm cores against 48 SMs on the same bytes. It is the path the fixture tier exercises (section 4) |
 | The pool's bandwidth | stays, as the single term (section 5) |
 | Page cache of the model file plus the device copy | stays and doubles the footprint until dropped; `nvtier.rs:12-30` already drops pages after use (`MADV_DONTNEED`, the `release_union` path) for the NVMe tier |
@@ -463,10 +463,12 @@ assumptions stated once in 9.7. No engine code has run on two Sparks.
 
 The work splits in two halves, as proposed in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134316241) and accepted in answer 20. The
 placement half needs no Arm protocol: `host` and `unified` into `nodes[0]`, the per-node shape of 9.2 and the unit gate
-`nodes_scale` (9.9). It is the contributor's and does not wait for S10. The protocol half is the monotonic words, the
-`Link` seam, the transport of 9.5 and the N = 2 run. It starts when the contributor judges P1's protocol part closed,
-which they did on `b289130a`, starting with the `Link` seam ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)). The monotonic words
-stay the module owner's (the maintainers') unless they hand them over; the contributor asked on that comment.
+`nodes_scale` (9.9). It is the contributor's and does not wait for S10. The protocol half is the counters that cross
+the link, the `Link` seam, the transport of 9.5 and the N = 2 run. It starts when the contributor judges P1's protocol
+part closed, which they did on `b289130a`, starting with the `Link` seam ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)). The
+contributor asked on that comment to carry the crossing counters, which are the module owner's (the maintainers'),
+and the maintainer agreed in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828) to the counter relay, which carries them on the link and
+leaves the cards' operations as they are (9.5, item 2).
 
 Plans are judged by eleven criteria (9.8). Only criterion 1, every node's need within its own pool, refuses a plan.
 Criteria 2 to 7 are objectives that the planner meets or names why it cannot, criterion 8 is gate clause 1, and criteria 9
@@ -600,7 +602,7 @@ recomputed with the measured values.
 
 1. **(a), the star, for one request: plan (b′) with the second Spark as the expert tier and the link in place of PCIe.**
    - It keeps the bits. The join already reads one f32 row per routed slot from the tier
-     (`crates/gpu/src/host/tier.rs:19-23`), so moving those bytes over RDMA moves no float.
+     (`crates/gpu/src/host/tier.rs:20-24`), so moving those bytes over RDMA moves no float.
    - Every family already has a tier path: `TierAct::Q8` for V4.1 (`crates/gpu-deepseek41/src/body.rs:2613`),
      `TierAct::F32` for GLM (`crates/gpu-glm5next/src/tier.rs:461`) and Qwen3.8
      (`crates/gpu/src/arch/qwen3moe/tier38.rs:563`). It needs no new device kind.
@@ -630,19 +632,33 @@ decision.
 (`all_gather_perf` per NVIDIA's NCCL playbook), and the fallback only if the probe of 9.6 shows our pump path slower
 than NCCL's point to point. Without GPUDirect NCCL stages through host bounce buffers with its proxy thread `[derived
 from the cuda.html line; NCCL internals unverified]`, and a send or receive kernel per message would occupy SMs. The
-handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/tier.rs:561`), which is what 9.1's "what to
+handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/link.rs:136`), which is what 9.1's "what to
 use instead" asks for, so the NIC reads the same LPDDR with no copy. The protocol stays `host/mod.rs`'s alone
-(`crates/gpu/src/host/mod.rs:56-58`), behind a `Link` seam with two impls: the shared page (PCIe, identity, a move-class
-change) and mirrored pages (RDMA). ~~A raw-verbs build adds `libibverbs`, whose licence under `just deny` is
-`[unverified]`.~~ The probe loads `libibverbs` at run time with `dlopen`, so no build links it (9.6, item 5).
+(`crates/gpu/src/host/mod.rs:56-58`), behind a `Link` seam (`crates/gpu/src/host/link.rs`). It has two impls: the
+shared page (PCIe and one Spark, identity) and the loopback (two pages on one machine, a host pump thread between them,
+picked by `BLOOMERY_TIER_LINK=loopback`). Mirrored pages over RDMA are the transport's impl. The relay's step rule and
+its order (the bytes, then the progress, then the generation) carry to it; a pump a node, the inbox word between them
+and the release of a remote node's words are the transport's. ~~A raw-verbs build adds `libibverbs`, whose licence
+under `just deny` is `[unverified]`.~~ The probe loads `libibverbs` at run time with `dlopen`, so no build links it
+(9.6, item 5).
 
 What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
 1. **Two pages, one a node.** Every word keeps one writer node. The link mirrors a region one way, one RDMA write a
    message.
-2. **Monotonic single-writer words.** Today the go counter is added to by the stage and taken back by the tier, and the
-   done counter the other way (`tier.rs:14-18`): two writers, at different times. A mirrored absolute write would erase
-   the remote decrement. Each becomes a generation the writer stores and the reader waits on with greater-or-equal. This
-   is box-provable first on PCIe: the bits are identical and the wait condition changes.
+2. **The counters cross as generations; the cards keep their operations.** A row's go counter is added to by the stage
+   and taken back by the tier, and its done counter the other way: two writers, at different times. A mirrored absolute
+   write would erase the remote take back. A captured wait also keeps its value fixed on every replay
+   (`crates/gpu/src/graph.rs`, `HostFlags`), so a wait for a target that rises each replay cannot be captured. So the
+   counter is split across the two pages. On the writer's page only the writing card adds one to it, and that value is
+   a generation. For each new generation the pump copies the bytes it publishes to the reader's page, then adds one to
+   the counter on the reader's page, and the reading card waits for at least one and takes it back, as on the shared
+   page. A step of 0 carries nothing, a step of 1 carries one, and any other step publishes nothing and stops the pump
+   by name, since a row has at most one go or done in flight. The host's progress word on the stage's page counts the
+   dones the pump carried and is written after their bytes, so it never runs ahead of them. A release stops its
+   counter, and that counter's reset takes its generations as carried and resumes it
+   (`crates/gpu/src/host/link/pump.rs`). On the shared page nothing changes: the same words, values, card operations
+   and graphs. On two nodes the writer's pump posts each generation to an inbox word on the reader's node, after the
+   bytes, and the reader's pump holds it to the same step rule; that split is the transport's.
 3. **A pump thread a node.** The card cannot post to the NIC. The pump load-acquires the go generation (Arm needs an
    explicit acquire: the memorder row) before posting. The card's system-scope barrier before go
    (`crates/gpu/src/host/mod.rs:20-24`) orders the image before the word.
@@ -652,11 +668,11 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    relaxed ordering on, so its bandwidth is not protocol-mode bandwidth.
 5. **The remote is another process.** Node 1 runs a tier server: it loads its experts from its own copy of the file,
    captures its graphs from the go order it is sent at load, and launches a replay on a "replay r of chain c" message,
-   which the first image can carry (today the stage process launches the tier's graph, `tier.rs:36-41`). Before the
+   which the first image can carry (today the stage process launches the tier's graph, `tier.rs:37-42`). Before the
    plan, the same channel carries node 1's census to node 0.
-6. **Loss.** The go deadline already names a lost tier (`tier.rs:48-53`, `CardLost`). A down link also means the stage
+6. **Loss.** The go deadline already names a lost tier (`tier.rs:49-54`, `CardLost`). A down link also means the stage
    cannot write `RELEASE` to node 1's words, so node 1 needs its own deadline that drains its streams.
-7. **Faults and sequence.** The tier's fault-word copy already rides before its signal (`tier.rs:41-43`). The handoff's
+7. **Faults and sequence.** The tier's fault-word copy already rides before its signal (`tier.rs:42-44`). The handoff's
    sequence word detects a stale or doubled image across the mirror.
 
 ### 9.6 First step, and what it measured
@@ -667,8 +683,11 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    (section 1). Two nodes add a protocol layer on top of it.
 2. #16 landed with its doc line (`7507942c`). Moving `host` and `unified` into `nodes[0]` (a move-class change, before
    any remote node), the shape of 9.2 and `nodes_scale` are the placement half (answer 20).
-3. The monotonic-word change in `host/mod.rs` and `tier.rs` (9.5, item 2): a protocol change in the protocol half; it
-   stays the module owner's (the maintainers') unless they hand it over (answer 20). It is bit-identical on PCIe: one owning-gate run and a same-lease A/B on the box.
+3. The crossing counters (9.5, item 2), the counter relay in `host/link.rs` and `link/pump.rs`: a protocol change in
+   the protocol half, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828). The maintainer takes it on
+   the structural proof of #96 (`ptx-scan` identical, the graph node count, eager = replay, the e2e set identical) in
+   place of a same-lease A/B on the box (same comment). `weekly-gpu-ds41-lost` runs the owning gate's clauses over the
+   loopback (`BLOOMERY_TIER_LINK=loopback`) on one card.
 4. A `Link` seam where the tier page is written and read: a move-class change, `ptx-scan` identical.
 5. ~~Decide the `libibverbs` dependency under `just deny`.~~ Decided in #44's review: `verbs.rs` loads the system's
    `libibverbs.so.1` with `dlopen`, so no crate links it, and it stays in `gpu-gates` until a second user moves it to
@@ -705,7 +724,7 @@ start, so nothing in it assumes a pair.
      - **stale lines over 0**: switch to write-with-immediate and measure again.
 3. Then the single-node term section 5 names (sustained BW), which sets every band above. Measured: section 5.
 
-**What carries from N = 2 to N = 4 unchanged:** the pump threads, the strict-order registration, the generation waits
+**What carries from N = 2 to N = 4 unchanged:** the pump threads, the strict-order registration, the relay's step rule
 and the stale-line check, the pair λ, each node's NIC cap (the same SoC links) and the per-node census over the control
 channel.
 
@@ -946,7 +965,7 @@ cannot it names why (`NodeIdle { node, why }`, a prompt-mode note). An unset `--
 10. **Host threads.** One pump thread a node posts every send, because no GPU path to the NIC works on GB10 (9.1, 9.5).
     Its cost, two wake-ups of 1–3 µs a layer, is inside λ, so criteria 2 and 6 hold it. No other host thread stands on
     the per-layer path. This replaces the earlier "no host thread" wording.
-11. **A lost node ends the request by name**, as a lost tier card does today (`tier.rs:48-53`): the go deadline names
+11. **A lost node ends the request by name**, as a lost tier card does today (`tier.rs:49-54`): the go deadline names
     it, and node 1's own deadline drains its streams (9.5, item 6). No failover.
 
 **Where each fires** `[derived]` from 9.7's first inputs (BW 219 GB/s, NVMe 6.77 GB/s, the assumed ρ), one row per model, N in {1, 2, 3, 4}, λ in {25, 70} µs, A low and high, and the prompt
@@ -1213,8 +1232,8 @@ Added 2026-10-13 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecom
 20. **P5:** split as proposed. The placement half need not wait for S10 and goes up when ready; where it overlaps the
     maintainers' train, they rebase. The protocol half starts when the contributor judges P1's protocol part closed from
     its results.
-    *Now: the contributor judged it closed on `b289130a` and started with the `Link` seam; the monotonic words stay the
-    maintainers' unless they hand them over, which the contributor asked ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)); section 9.*
+    *Now: the contributor judged it closed on `b289130a`, started with the `Link` seam and added the counter relay that
+    carries the crossing counters, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828); section 9.*
 21. **The serving-default load refusal of GLM and V4.1:** the contributor's, as a pull request after one review.
     *Now: done in [#100](https://github.com/midagedev/bloomery/pull/100): a plan the NVMe tier's floor refuses on one pool is planned again under a lower card
     budget, and both models load at serving defaults; section 8. [#93](https://github.com/midagedev/bloomery/pull/93)
@@ -1270,7 +1289,7 @@ is not a trap in the sites grepped.
 
 **Memory ordering.** NVIDIA's porting guide warns that "some reorderings cannot happen on x86_64 but can happen on ARM"
 (`.../porting/memorder.html`). The host tier's card/host protocol spins on host-mapped words (`crates/gpu/src/host/mod.rs:466`,
-`step.rs:1287`, `tier.rs:1429`, `lane.rs:513`, `xstream.rs:431`, `swap.rs:3761`: 6 `spin_loop` sites) and
+`step.rs:1287`, `tier.rs:1458`, `lane.rs:513`, `xstream.rs:431`, `swap.rs:3761`: 6 `spin_loop` sites) and
 `crates/gpu/src/host/*.rs` holds 29 `Ordering::Relaxed` loads. ~~Not audited; it is a P1 risk for the host-tier gates, and
 irrelevant to a whole-on-card run that never starts a host service.~~ The audit found no site in the host tier that is
 correct only under x86's ordering, and no code change is needed

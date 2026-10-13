@@ -41,8 +41,8 @@ fn retired() -> impl Iterator<Item = &'static LeverSpec> {
 
 /// Whether the pool reads it: it is on every binary's list.
 /// The rows read below every binary's `main` (the pool's two, the host's
-/// room and the NVMe tier's three, [`nvtier_levers`]), which no `at_main`
-/// list refuses.
+/// room and the NVMe tier's three, [`nvtier_levers`], and the tier link,
+/// [`tier_link`]), which no `at_main` list refuses.
 fn pool(r: &LeverSpec) -> bool {
     r.name == THREADS
         || r.name == SPIN
@@ -50,6 +50,7 @@ fn pool(r: &LeverSpec) -> bool {
         || r.name == NVTIER_BYTES
         || r.name == NVTIER_READ
         || r.name == NVTIER_MEM
+        || r.name == TIER_LINK
 }
 
 /// Every file that reads a lever in place, with its round.
@@ -497,6 +498,7 @@ fn accessors_read_their_rows() {
             NVTIER_BYTES,
             NVTIER_READ,
             NVTIER_MEM,
+            TIER_LINK,
             PIN_MAIN,
             DRAFT,
             MTP_HEAD_ROWS,

@@ -63,7 +63,7 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread}
 use cuda_host::cuda_module;
 use model::placement::Machine;
 
-use super::link::{Link, LinkEnd};
+use super::link::{Crossing, Link, LinkEnd, Reader};
 use super::page::MAX_ROWS;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::step::{Boundary, Chain, RELEASE};
@@ -72,6 +72,7 @@ use crate::graph::{Graph, cu, mem_batch, op_add, op_barrier_sys, op_wait_geq};
 use crate::tensor::window;
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError, Q8Act};
+use bloomery_levers::TierLink;
 use model::ops::DEFER_MAX_COLS;
 
 /// What the tier's errors name.
@@ -499,6 +500,36 @@ impl TierLayout {
         self.payload_off() + self.rows * self.image_stride + row * self.rows_stride
     }
 
+    /// Every counter of the page and the bytes it publishes, as a link that
+    /// mirrors the page carries them: per tier and row the go, which
+    /// publishes the row's image, and the done, which publishes the row's
+    /// routed rows and the tier's fault copy and counts in its progress word.
+    fn crossings(&self) -> Vec<Crossing> {
+        let image = 4 * self.image.words();
+        let rows = 4 * self.image.n_used * self.image.cols * self.image.hidden;
+        (0..self.tiers)
+            .flat_map(|t| (0..self.rows).map(move |r| (t, r)))
+            .flat_map(|(t, r)| {
+                let fault = self.word_off(t, TWord::Fault);
+                let go = self.image_off(r)..self.image_off(r) + image;
+                [
+                    Crossing {
+                        counter: self.word_off(t, TWord::Go(r)),
+                        reader: Reader::Tier,
+                        spans: vec![go],
+                        prog: None,
+                    },
+                    Crossing {
+                        counter: self.word_off(t, TWord::Cnt(r)),
+                        reader: Reader::Stage,
+                        spans: vec![self.rows_off(r)..self.rows_off(r) + rows, fault..fault + 8],
+                        prog: Some(self.word_off(t, TWord::Prog)),
+                    },
+                ]
+            })
+            .collect()
+    }
+
     /// Bytes the page holds.
     fn bytes(&self) -> Option<usize> {
         self.rows
@@ -551,15 +582,22 @@ pub struct TierPage {
 }
 
 impl TierPage {
-    /// The page laid out by `layout`, in `stage`'s context, every tier's
-    /// fault copy clean, with the stage card's windows. Load-time only;
-    /// `stage`'s context is current on return.
-    pub(super) fn new(stage: &Gpu, layout: TierLayout) -> Result<TierPage, GpuError> {
+    /// The page laid out by `layout` over a link of kind `kind`, in
+    /// `stage`'s context (and on the loopback, the tier cards' side in
+    /// `tier`'s), every tier's fault copy clean, with the stage card's
+    /// windows. Load-time only; `stage`'s context is current on return.
+    pub(super) fn new(
+        stage: &Gpu,
+        tier: &Gpu,
+        layout: TierLayout,
+        kind: TierLink,
+    ) -> Result<TierPage, GpuError> {
+        const NEW: &str = "TierPage::new";
         let ctx = stage.context();
         let bytes = layout
             .bytes()
-            .ok_or_else(|| GpuError::shape("TierPage::new", "the page's size passes usize"))?;
-        let link = Link::shared(ctx, bytes)?;
+            .ok_or_else(|| GpuError::shape(NEW, "the page's size passes usize"))?;
+        let link = Link::new(kind, ctx, tier.context(), bytes, layout.crossings(), NEW)?;
         for t in 0..layout.tiers {
             link.store(layout.word_off(t, TWord::Fault), FAULT_NONE);
         }
@@ -744,6 +782,14 @@ impl TierPage {
     /// Byte offset of tier `tier`'s word `w`.
     fn off(&self, tier: usize, w: TWord) -> usize {
         self.layout.word_off(tier, w)
+    }
+
+    /// Why the link stopped carrying for good ([`Link::broken`]), as the
+    /// note an error ends with; empty while it carries.
+    pub(super) fn broken_note(&self) -> String {
+        self.link
+            .broken()
+            .map_or_else(String::new, |b| format!(" ({b})"))
     }
 }
 
@@ -1419,10 +1465,11 @@ impl TierCard {
     /// long the host `waited` for it.
     pub(super) fn lost_detail(&self, page: &TierPage, waited: Duration) -> String {
         format!(
-            "the expert tier on {} served {} of the {} layers asked of it and signalled nothing more in {waited:.1?}: the card is lost",
+            "the expert tier on {} served {} of the {} layers asked of it and signalled nothing more in {waited:.1?}: the card is lost{}",
             self.name,
             self.progress(page),
-            self.issued
+            self.issued,
+            page.broken_note()
         )
     }
 

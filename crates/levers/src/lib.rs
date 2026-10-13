@@ -36,7 +36,7 @@ pub use registry::{
     LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS,
     NVTIER_BYTES, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
     PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN,
-    STEP_STATS, THREADS,
+    STEP_STATS, THREADS, TIER_LINK,
 };
 pub use registry::{SPLIT_WALK, XSTREAM};
 
@@ -625,6 +625,9 @@ pub(crate) enum Scope<'a> {
     /// placement dial and the tier's build, all below every binary's `main`
     /// — like the pool's two.
     NvTier,
+    /// How the tier page crosses ([`tier_link`]), read where the host tier
+    /// takes its tier cards, below every binary's `main`.
+    TierLink,
 }
 
 /// The levers of `scope` over `env`, every name once — the last of a name
@@ -645,6 +648,7 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
     let nvtier = |name: &str| {
         name == HOST_ROOM || name == NVTIER_BYTES || name == NVTIER_READ || name == NVTIER_MEM
     };
+    let link = |name: &str| name == TIER_LINK;
     let mut entries = Vec::new();
     let mut refused = Vec::new();
     for row in REGISTRY {
@@ -652,13 +656,18 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
             Site::Parsed { .. } => {
                 let acts = match scope {
                     Scope::Main { acts_on, .. } => {
-                        pool(row.name) || nvtier(row.name) || acts_on.contains(&row.name)
+                        pool(row.name)
+                            || nvtier(row.name)
+                            || link(row.name)
+                            || acts_on.contains(&row.name)
                     }
                     Scope::Every => true,
                     Scope::Pool if pool(row.name) => true,
                     Scope::Pool => continue,
                     Scope::NvTier if nvtier(row.name) => true,
                     Scope::NvTier => continue,
+                    Scope::TierLink if link(row.name) => true,
+                    Scope::TierLink => continue,
                 };
                 match (get(row.name), scope) {
                     (Some(v), Scope::Main { bin, .. }) if !acts => refused.push(Refusal {
@@ -2537,6 +2546,28 @@ pub fn nvtier_levers() -> Result<NvTierLevers, LeverError> {
         direct,
         mem: levers.nvtier_mem(),
     })
+}
+
+/// How the expert tier cards' page crosses ([`TIER_LINK`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TierLink {
+    /// One page every card reaches.
+    Shared,
+    /// Two pages and a host pump thread between them.
+    Loopback,
+}
+
+/// `BLOOMERY_TIER_LINK` from the process environment, parsed as [`at_main`]
+/// parses it, and refused when it is set to a value its kind does not take
+/// and when a retired name is set. Nothing else.
+pub fn tier_link() -> Result<TierLink, LeverError> {
+    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let levers = read(&env, Scope::TierLink)?;
+    match &levers.entry(TIER_LINK).value {
+        None | Some(Value::Word("shared")) => Ok(TierLink::Shared),
+        Some(Value::Word("loopback")) => Ok(TierLink::Loopback),
+        v => panic!("{TIER_LINK} holds {v:?}, not shared or loopback"),
+    }
 }
 
 /// The registry as a Markdown table — name, class, what it takes, what unset

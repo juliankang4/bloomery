@@ -44,6 +44,7 @@ pub const HOST_ROOM: &str = "BLOOMERY_HOST_ROOM";
 pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
 pub const NVTIER_READ: &str = "BLOOMERY_NVTIER_READ";
 pub const NVTIER_MEM: &str = "BLOOMERY_NVTIER_MEM";
+pub const TIER_LINK: &str = "BLOOMERY_TIER_LINK";
 pub const SCREEN: &str = "BLOOMERY_SCREEN";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
@@ -336,6 +337,24 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               CPU reads write-combined pages uncached); `auto` is `pinned` on an integrated \
               device and `anon` on a card with its own memory. `anon` and `pinned` are the \
               same-binary arms. Read where the tier is built.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: TIER_LINK,
+        class: Class::M,
+        kind: Kind::Words(&["shared", "loopback"]),
+        default: Unset::Is("shared"),
+        doc: "How the expert tier cards' page crosses between the stage card and the tier \
+              cards. `shared` is one host-mapped page every card reaches. `loopback` gives the \
+              tier cards a page of their own and a host pump thread that carries each go and \
+              done between the two pages as a generation, with the bytes it publishes; the \
+              cards' operations, graphs and bits are the shared page's. It checks the relay on \
+              one machine (`weekly-gpu-ds41-lost` runs the V4.1 tier gate over it), and the pump \
+              spins on one core while the load lives. Read where the host tier takes its tier \
+              cards.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
