@@ -216,9 +216,10 @@
 //! every row as a flip fails.
 //!
 //! Tiers (`BLOOMERY_TIER`, `crates/gpu-gates/src/tier.rs`): the fixture tier runs the
-//! self-consistency clauses, replays the real set's rows as the feed (the fixture copies the
-//! vocabulary, and ik's hidden rows are finite inputs) and leaves every comparison with the real
-//! set's output to the real tier (`deferred(real)`). Beside them it runs the two fixture-oracle
+//! self-consistency clauses, replays the rows of the real set's mirror on the fixture as the feed
+//! (`tier::input_set`; ik's hidden rows are finite inputs), reads the deep prompt from D3K's
+//! mirror, and leaves every comparison with the real set's output to the real tier
+//! (`deferred(real)`). Beside them it runs the two fixture-oracle
 //! clauses against ik's MTP set dumped on the fixture (`refset::arch::qwen4exp::fixture`, each
 //! opened by `tier::fixture_set`), declared in [`FX_ORACLE`] and held to the gate's end:
 //! - (elhfx) the fixture set's graphs replayed as (e), (l) and (h) replay the real one, at the
@@ -263,9 +264,7 @@ mod gate {
     use bloomery_gpu_gates::q38_fixture::Shape;
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
-    use bloomery_gpu_gates::{
-        GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
-    };
+    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, ref_model_path, verdict};
     use bloomery_levers::{CARD_BUDGET, HostCfg, Levers};
     use gguf::quant::{GgmlType, half_to_f32};
     use gguf::{Gguf, Split};
@@ -437,9 +436,6 @@ mod gate {
     const LIST_ROWS: u32 = 40_960;
     /// The shipped list's rows ([`SHIPPED`]'s first line).
     const SHIPPED_ROWS: usize = 76_000;
-    /// The draft layer's index in ik's node names: the real file's 48 target
-    /// layers. ik's sets are the real tier's, so the names stay.
-    const IK_LAYER: usize = 48;
     /// Streams of a hidden row, and the values of one.
     const STREAMS: usize = 4;
     const HIDDEN: usize = 2560;
@@ -687,29 +683,13 @@ mod gate {
         }
     }
 
-    /// The draft layer's index in a set's node names: the one `N` of its `mtp_eh_proj-N` rows
-    /// ([`IK_LAYER`] on the real file's set, the target's layer count on the fixture's).
+    /// The draft layer's index in a set's node names: the header's ([`draft_layer`]), which the
+    /// set's `mtp_eh_proj-N` rows must name (`MtpSet::check_draft_layer`; the real file's 48 on its
+    /// set, the fixture target's layer count on the fixture's).
     fn ik_layer(set: &MtpSet) -> Result<usize, GateError> {
-        let mut found: Vec<usize> = Vec::new();
-        for r in &set.rows {
-            let layer = r
-                .name
-                .strip_prefix("mtp_eh_proj-")
-                .and_then(|n| n.parse::<usize>().ok());
-            if let Some(n) = layer
-                && !found.contains(&n)
-            {
-                found.push(n);
-            }
-        }
-        match found[..] {
-            [n] => Ok(n),
-            _ => Err(format!(
-                "{}: the mtp_eh_proj rows name the draft layers {found:?}, one is wanted",
-                set.dir.display()
-            )
-            .into()),
-        }
+        let layer = draft_layer();
+        set.check_draft_layer(layer)?;
+        Ok(layer)
     }
 
     /// The set's graphs in the order ik computed them: the warmup, then each
@@ -3096,9 +3076,12 @@ mod gate {
         Ok((m, ok))
     }
 
-    /// D3K's prefill, the e2e family's deep prompt (the set's `# tokens`).
+    /// D3K's prefill, the e2e family's deep prompt (the set's `# tokens`), from this tier's set
+    /// ([`tier::input_set`]).
     fn deep_prompt() -> Result<Vec<u32>, GateError> {
-        let man = RefManifest::open(&data_dir().join(refset::arch::qwen4exp::D3K), &IK)?;
+        let d3k = refset::arch::qwen4exp::D3K;
+        let set = tier::input_set("the deep prompt", (d3k, &IK), fixture::mirror(d3k))?;
+        let man = RefManifest::open(&set.path, set.family)?;
         let (_, _, prefill) = man.step()?;
         Ok(prefill.to_vec())
     }
@@ -5564,8 +5547,13 @@ mod gate {
 
     pub(super) fn run() -> Result<(), GateError> {
         let witnessed = init()?;
-        let dir = MTP.path(MTP_SET);
-        let set = MtpSet::open(&dir, &MTP)?;
+        let input = tier::input_set(
+            "the MTP draft set's feed",
+            (MTP_SET, &MTP),
+            fixture::mirror(MTP_SET),
+        )?;
+        let dir = input.path;
+        let set = MtpSet::open(&dir, input.family)?;
         let prompt = set
             .tokens
             .clone()
@@ -5577,7 +5565,7 @@ mod gate {
             order.len(),
             set.blocks().len(),
             prompt.len(),
-            MTP.name
+            input.family.name
         );
         println!(
             "bands: eh {:.4e} router {:.4e} the argmax cap's {:.4e} free {FREE_BAND:.2}; the \
@@ -5649,16 +5637,17 @@ mod gate {
         let mut last = None;
         let mut warm = None;
         tier::sc("(n) the node-local pins and (h)'s kernel on every replayed row")?;
-        // The fixture set's replay comes first: the real set's, which every later clause starts from,
-        // then rewrites every row of the draft's store.
+        // The fixture set's oracle replay comes first: this tier's set's replay, which every later
+        // clause starts from, then rewrites every row of the draft's store.
         ok &= elh_fx(&mut m, &host, (&head_file, &draft))?;
         let vs_ik = tier::run_clause(
             "(e)(l)(h) every graph of ik's set replayed: eh_proj, routes, l_out and the argmax against ik's",
             Tag::Oracle,
         )?;
         let vs = if vs_ik { Vs::Real } else { Vs::Nothing };
+        let layer = ik_layer(&set)?;
         for &(b, g) in &order {
-            let ig = IkGraph::read(&set, b, g, IK_LAYER)?;
+            let ig = IkGraph::read(&set, b, g, layer)?;
             replay(&mut m, &ig, &host, &mut r, vs)?;
             if g == Graph::Warmup {
                 warm = Some(ig);

@@ -223,3 +223,26 @@ fn the_mtp_family_refuses_a_set_of_another_draft() -> Result<(), RefError> {
     }
     remove(&dir)
 }
+
+/// Every real set has its mirror: the set of the fixture family of its kind under the `fx_` name;
+/// a name that is no real qwen4exp set has none.
+#[test]
+fn every_set_has_its_fixture_mirror() {
+    use super::fixture::{self, mirror};
+    use super::mtp::MTP;
+    let real = IK.sets.iter().map(|s| (*s, &fixture::IK));
+    for (set, family) in real.chain(MTP.sets.iter().map(|s| (*s, &fixture::MTP))) {
+        let (fx, of) = mirror(set).unwrap_or_else(|| panic!("{set}: no mirror"));
+        let want = match set.rsplit_once('/') {
+            Some((dir, name)) => format!("{dir}/fx_{name}"),
+            None => format!("fx_{set}"),
+        };
+        assert_eq!((fx, of.name), (want.as_str(), family.name), "{set}");
+        assert!(
+            of.sets.contains(&fx),
+            "{set}: {fx} is no set of {}",
+            of.name
+        );
+    }
+    assert!(mirror(fixture::BATCH).is_none());
+}

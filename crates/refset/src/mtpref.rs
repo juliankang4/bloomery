@@ -303,6 +303,35 @@ impl MtpSet {
         Ok(())
     }
 
+    /// The draft layer's index the set's node names carry, the one `N` of its
+    /// `mtp_eh_proj-N` rows, held to `want`, the draft layer of the file a
+    /// run of it loads. A set that names none, several or another is
+    /// `Malformed`.
+    pub fn check_draft_layer(&self, want: usize) -> Result<(), RefError> {
+        let mut found: Vec<usize> = Vec::new();
+        for r in &self.rows {
+            let layer = r
+                .name
+                .strip_prefix("mtp_eh_proj-")
+                .and_then(|n| n.parse::<usize>().ok());
+            if let Some(n) = layer
+                && !found.contains(&n)
+            {
+                found.push(n);
+            }
+        }
+        if found == [want] {
+            return Ok(());
+        }
+        Err(RefError::malformed(
+            format!("mtpref: {}", self.dir.display()),
+            format!(
+                "the mtp_eh_proj rows name the draft layers {found:?}, the file's draft layer is \
+                 {want}"
+            ),
+        ))
+    }
+
     /// One `#` line, its leading `#` taken off.
     fn header_line(
         &mut self,

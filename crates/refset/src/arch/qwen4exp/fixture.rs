@@ -52,6 +52,22 @@ fn draft() -> Result<String, RefError> {
     }
 }
 
+/// The fixture's mirror of the real set `set` ([`super::IK`]'s or [`mtp::MTP`]'s): the set of this
+/// module dumped on the fixture for the same ids, and its family; `None` for any other name.
+#[must_use]
+pub fn mirror(set: &str) -> Option<(&'static str, &'static Family)> {
+    let fx = match set {
+        super::BATCH => BATCH,
+        super::STEP4 => STEP4,
+        super::STEP4_EVERY_NODE => STEP4_EVERY_NODE,
+        super::D1K => D1K,
+        super::D3K => D3K,
+        mtp::MTP_SET => return Some((MTP_SET, &MTP)),
+        _ => return None,
+    };
+    Some((fx, &IK))
+}
+
 /// [`super::IK`] on the fixture.
 pub static IK: Family = Family {
     name: "fx-ik-qwen4exp",

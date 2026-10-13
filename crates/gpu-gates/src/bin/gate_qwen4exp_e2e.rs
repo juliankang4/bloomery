@@ -31,8 +31,10 @@
 //! real file's ik sets (the free arm's layer outputs, flips and last argmax,
 //! the step sets, each ubatch arm's last argmax) is an oracle clause and prints
 //! a `deferred(real)` line; the real tier prints a `fixture-only(oracle)` line
-//! for each fixture-oracle clause. The sets' token ids are read in both tiers:
-//! the fixture copies the real file's vocabulary. Every layer count, node count
+//! for each fixture-oracle clause. The ids every clause feeds are read from
+//! this tier's sets (`tier::input_set`): the real sets in the real tier, and
+//! in the fixture tier their mirrors, dumped on the fixture for the same ids
+//! (the fixture copies the real file's vocabulary). Every layer count, node count
 //! and store byte is derived from the header (`q38_fixture::Shape`); the real
 //! tier prints each beside the literal it replaced and requires them equal
 //! (`move proof` lines). The gate's end holds the fixture-oracle clauses that
@@ -356,8 +358,8 @@ mod gate {
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
-        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ref_model_path,
-        topk_ids_logical_within, verdict,
+        Fnv1a64, GateError, RefManifest, checks_failed, ref_model_path, topk_ids_logical_within,
+        verdict,
     };
     use bloomery_levers::{CARD_BUDGET, HostCfg};
     use cuda_core::{DeviceBuffer, sys};
@@ -711,6 +713,22 @@ mod gate {
         let sel = CTX * (2 * N_KV * HEAD * 2 + IDX_DIM * 2) + CTX.div_ceil(POOL) * IDX_DIM * 2;
         let ple = ((PLE_TAPS - 1) * PLE_DILATION + PASS_ROWS) * STREAMS * HIDDEN * 4;
         n_gdn() * rec + n_qsa() * sel + ple
+    }
+
+    /// The set this tier reads `name`'s ids from ([`tier::input_set`]): `name` of [`IK`] in the
+    /// real tier, its mirror on the fixture ([`fixture::mirror`]) in the fixture tier.
+    fn input_set(name: &str) -> Result<tier::InputSet<'_>, GateError> {
+        tier::input_set(
+            &format!("the ids of {name}"),
+            (name, &IK),
+            fixture::mirror(name),
+        )
+    }
+
+    /// [`input_set`]'s manifest, and the set's name as the lines print it.
+    fn input_manifest(name: &str) -> Result<(RefManifest, &str), GateError> {
+        let set = input_set(name)?;
+        Ok((RefManifest::open(&set.path, set.family)?, set.name))
     }
 
     /// Whether our last argmax `top` is ik's `result_output` argmax, and
@@ -1240,9 +1258,10 @@ mod gate {
         if !vs_ik && !feeds {
             return Ok(None);
         }
-        let (man, pos, tok, prefill, held) = set_open((name, &IK), band)?;
+        let input = input_set(name)?;
+        let (man, pos, tok, prefill, held) = set_open((input.name, input.family), band)?;
         Ok(Some(StepSet {
-            name,
+            name: input.name,
             path,
             vs_ik,
             man,
@@ -1341,7 +1360,9 @@ mod gate {
     /// run: the step's token, logits, layer outputs and every store bit for
     /// bit.
     fn pass_selects(m: &mut Qwen38Model, name: &str, steps: &Run) -> Result<bool, GateError> {
-        let (_, _, tok, prefill, _) = set_open((name, &IK), None)?;
+        let input = input_set(name)?;
+        let name = input.name;
+        let (_, _, tok, prefill, _) = set_open((name, input.family), None)?;
         fresh(m)?;
         let t = Instant::now();
         m.prompt38(&prefill, Prompt38::Pass)?;
@@ -1592,9 +1613,11 @@ mod gate {
     /// the last, bit for bit. A window the two arms differ at is named, the
     /// first.
     fn pass_windows(m: &mut Qwen38Model) -> Result<bool, GateError> {
-        let (_, _, tok, prefill, _) = set_open((D3K, &IK), None)?;
+        let d3k = input_set(D3K)?;
+        let (_, _, tok, prefill, _) = set_open((d3k.name, d3k.family), None)?;
         let n = prefill.len();
-        let dense_from = set_open((D1K, &IK), None)?.3.len();
+        let d1k = input_set(D1K)?;
+        let dense_from = set_open((d1k.name, d1k.family), None)?.3.len();
         let ws = windows(n);
         let mut covered = Vec::new();
         for (i, w) in ws.iter().enumerate() {
@@ -2064,11 +2087,11 @@ mod gate {
     /// those rows; the pooled rows past the count poisoned, then the two
     /// steps after, the prefill's next ids.
     fn verify_deep(m: &mut Qwen38Model) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
+        let (man, d3k) = input_manifest(D3K)?;
         let (_, _, prefill) = man.step()?;
         let ids = prefill
             .get(..DEEP + LANES)
-            .ok_or_else(|| format!("{D3K}: a prefill of {} ids", prefill.len()))?
+            .ok_or_else(|| format!("{d3k}: a prefill of {} ids", prefill.len()))?
             .to_vec();
         let (prefix, rows) = (Prefix::Gemm(&ids[..DEEP]), &ids[DEEP..]);
         let rows: [u32; LANES] = std::array::from_fn(|i| rows[i]);
@@ -3032,7 +3055,7 @@ mod gate {
     /// against the rule's; and the step after the one ubatch against ik's,
     /// taken before the cut walk starts from a reset.
     fn gemm_d3k(m: &mut Qwen38Model, ties: &mut usize) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
+        let (man, d3k) = input_manifest(D3K)?;
         let (_, _, prefill) = man.step()?;
         let prefill = prefill.to_vec();
         let rows = m.body("gemm_d3k")?.ubatch_rows();
@@ -3063,7 +3086,7 @@ mod gate {
         let want = (dense, prefill.len() - dense);
         let split_ok = rows >= prefill.len() && split == Some(want);
         println!(
-            "gemm {D3K}: {} ids in one ubatch (the load's size {rows}; {fed:.1} s, runtime \
+            "gemm {d3k}: {} ids in one ubatch (the load's size {rows}; {fed:.1} s, runtime \
              value); the selecting layers' rows by the prefill flash and by the selection {split:?} \
              (want {want:?}, from KEPT and POOL) {}",
             prefill.len(),
@@ -3077,7 +3100,7 @@ mod gate {
             ok &= step_after(m, &set, t, ties)?.0;
         }
         println!(
-            "{D3K}: ik cuts its selection by cells and keeps up to three keys of the 513th pool \
+            "{d3k}: ik cuts its selection by cells and keeps up to three keys of the 513th pool \
              ours does not read (a named difference, its logits printed)"
         );
         fresh(m)?;
@@ -3098,8 +3121,8 @@ mod gate {
             &one,
             true,
         );
-        ok &= gemm_timed(m, &prefill, &one)?;
-        ok &= gemm_split(m, &prefill, &one, split)?;
+        ok &= gemm_timed(m, (d3k, &prefill), &one)?;
+        ok &= gemm_split(m, (d3k, &prefill), &one, split)?;
         Ok(ok)
     }
 
@@ -3112,7 +3135,7 @@ mod gate {
     /// [`gemm_split_timed`]. The cut set back to one unit either way.
     fn gemm_split(
         m: &mut Qwen38Model,
-        prefill: &[u32],
+        (d3k, prefill): (&str, &[u32]),
         one: &Run,
         one_split: Option<(usize, usize)>,
     ) -> Result<bool, GateError> {
@@ -3137,20 +3160,20 @@ mod gate {
             };
             let shape_ok = units == 2 && split.is_some() && split == one_split;
             println!(
-                "gemm {D3K}: the split walk of {} ids: {units} units (want 2), the selecting \
+                "gemm {d3k}: the split walk of {} ids: {units} units (want 2), the selecting \
                  layers' rows by the prefill flash and by the selection {split:?} (the one \
                  unit's {one_split:?}) {}",
                 prefill.len(),
                 verdict(shape_ok)
             );
             let bits_ok = same_run(
-                &format!("D3K by a split walk of two units vs one unit ({D3K})"),
+                &format!("D3K by a split walk of two units vs one unit ({d3k})"),
                 &two,
                 one,
                 true,
             );
-            let odd_ok = gemm_split_odd(m, prefill)?;
-            Ok(shape_ok && bits_ok && odd_ok && gemm_split_timed(m, prefill, &two)?)
+            let odd_ok = gemm_split_odd(m, (d3k, prefill))?;
+            Ok(shape_ok && bits_ok && odd_ok && gemm_split_timed(m, (d3k, prefill), &two)?)
         })();
         set(m, SplitWalk::Off)?;
         r
@@ -3161,7 +3184,10 @@ mod gate {
     /// units of `⌈m/2⌉` and `⌊m/2⌋` rows (the second unit's one-expert table
     /// filled for a row fewer than the first's), the last token, logits and
     /// every store bit for bit. Leaves the split walk set.
-    fn gemm_split_odd(m: &mut Qwen38Model, prefill: &[u32]) -> Result<bool, GateError> {
+    fn gemm_split_odd(
+        m: &mut Qwen38Model,
+        (d3k, prefill): (&str, &[u32]),
+    ) -> Result<bool, GateError> {
         let odd = &prefill[..prefill.len() - usize::from(prefill.len().is_multiple_of(2))];
         let run = |m: &mut Qwen38Model, w| -> Result<(Run, usize), GateError> {
             m.body_parts("gemm_split_odd")?.2.set_split_walk(w)?;
@@ -3184,7 +3210,7 @@ mod gate {
         let (two, two_units) = run(m, SplitWalk::Every)?;
         let units_ok = one_units == 1 && two_units == 2;
         println!(
-            "gemm {D3K}: its first {} ids, an odd count: {two_units} units by the split walk, \
+            "gemm {d3k}: its first {} ids, an odd count: {two_units} units by the split walk, \
              {one_units} by one unit (want 2 and 1) {}",
             odd.len(),
             verdict(units_ok)
@@ -3211,7 +3237,7 @@ mod gate {
     /// the first's card route.
     fn gemm_split_timed(
         m: &mut Qwen38Model,
-        prefill: &[u32],
+        (d3k, prefill): (&str, &[u32]),
         two: &Run,
     ) -> Result<bool, GateError> {
         m.set_prompt38_stats(true)?;
@@ -3267,7 +3293,7 @@ mod gate {
         }
         let order_ok = out_of_order.is_empty();
         println!(
-            "gemm {D3K}: the timed split walk's record: {} batch(es) (want 2) in {} walk(s) (want \
+            "gemm {d3k}: the timed split walk's record: {} batch(es) (want 2) in {} walk(s) (want \
              1), {} rows (want {}), each a unit's half of the columns, every column's slots on the \
              host {rows_ok}; layers whose first unit's gap does not hold the second unit's front \
              and download {out_of_order:?} (want none) {order_ok}: {}",
@@ -3290,7 +3316,11 @@ mod gate {
     /// columns a sub-sum of consistent shape (`cols_hot ≤ slots`, none hot
     /// exactly when none summed, each hot expert past [`HOT_COLS`]), and
     /// `Σ m² ≥ slots²/experts` (Cauchy–Schwarz).
-    fn gemm_timed(m: &mut Qwen38Model, prefill: &[u32], one: &Run) -> Result<bool, GateError> {
+    fn gemm_timed(
+        m: &mut Qwen38Model,
+        (d3k, prefill): (&str, &[u32]),
+        one: &Run,
+    ) -> Result<bool, GateError> {
         m.set_prompt38_stats(true)?;
         fresh(m)?;
         let tok = m.prompt38(prefill, Prompt38::Gemm)?;
@@ -3331,7 +3361,7 @@ mod gate {
         let layers = n_layer();
         let rec_ok = ubatches == 1 && rows == layers && spans == layers;
         println!(
-            "gemm {D3K}: the timed walk's record: {ubatches} ubatch(es) (want 1), {rows} layer rows \
+            "gemm {d3k}: the timed walk's record: {ubatches} ubatch(es) (want 1), {rows} layer rows \
              (want {layers}), {spans} with every card span read (want {layers}) {}",
             verdict(rec_ok)
         );
@@ -3359,7 +3389,7 @@ mod gate {
         let want = rows as u64 * prefill.len() as u64 * N_USED as u64;
         let counts_ok = rec_ok && bad == 0 && sum == want;
         println!(
-            "gemm {D3K}: the timed walk's routing counts: {bad} layer row(s) off of {rows} (Σ slots \
+            "gemm {d3k}: the timed walk's routing counts: {bad} layer row(s) off of {rows} (Σ slots \
              {sum}, want rows·P·N_USED {want}; m_max {m_max}) {}",
             verdict(counts_ok)
         );
@@ -3912,8 +3942,8 @@ mod gate {
         );
         // D3K's prefill, one walk and two cut inside the selecting rows, bit
         // for bit — the only walk that crosses the route's run boundary.
-        let d3k = RefManifest::open(&data_dir().join(D3K), &IK)?;
-        let (_, _, prefill) = d3k.step()?;
+        let (man, d3k) = input_manifest(D3K)?;
+        let (_, _, prefill) = man.step()?;
         let prefill = prefill.to_vec();
         fresh(m)?;
         let last = m.prompt38(&prefill, Prompt38::Gemm)?;
@@ -3939,7 +3969,7 @@ mod gate {
             ple_ring: cut_ring,
         };
         ok &= same_run(
-            &format!("card plan: {D3K} by ubatches cut at {SPLIT} vs one ubatch"),
+            &format!("card plan: {d3k} by ubatches cut at {SPLIT} vs one ubatch"),
             &cut,
             &one,
             true,
@@ -4429,7 +4459,7 @@ mod gate {
 
     /// Set `name`'s prefill ids.
     fn prefill_of(name: &str) -> Result<Vec<u32>, GateError> {
-        let man = RefManifest::open(&data_dir().join(name), &IK)?;
+        let (man, _) = input_manifest(name)?;
         let (_, _, prefill) = man.step()?;
         Ok(prefill.to_vec())
     }
@@ -4714,7 +4744,7 @@ mod gate {
     /// and the ubatch call whose later ubatches are read ahead. The step
     /// thread's faults across each arm's graph steps are printed.
     fn ple_nvme(toks: &[u32]) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
+        let (man, _) = input_manifest(D3K)?;
         let (_, _, prefill) = man.step()?;
         let prefill = prefill.to_vec();
         // The host arm's need is read off the plan the loads below make: the
@@ -5660,7 +5690,7 @@ mod gate {
         let mut m = open(Experts::Host)?;
         tier::sc("(s) structure: the header's layer kinds, store bytes and node counts")?;
         ok &= structure(&mut m)?;
-        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
+        let (man, _) = input_manifest(BATCH)?;
         let (_, toks, _) = man.step()?;
         let toks = toks.to_vec();
         tier::sc("(h) the head of m rows: finite rows, NaN faults")?;

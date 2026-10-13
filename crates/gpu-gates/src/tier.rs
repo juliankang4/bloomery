@@ -701,6 +701,40 @@ pub fn fixture_set(clause: &str, family: &Family, set: &str) -> Result<PathBuf, 
     Ok(fixture_set_in(&crate::data_dir(), clause, family, set)?)
 }
 
+/// A set a clause reads only as its input ([`input_set`]): its name, its family and its path.
+pub struct InputSet<'a> {
+    pub name: &'a str,
+    pub family: &'static Family,
+    pub path: PathBuf,
+}
+
+/// The set a clause reads only as its input, the ids it feeds or the rows it replays, never as an
+/// oracle, in this process's tier: `real` in the real tier; in the fixture tier `mirror`, the real
+/// set's mirror dumped on the fixture for the same ids, through [`fixture_set`] (missing, stale,
+/// foreign or unfinished ends the gate by name). The fixture tier never opens the real set.
+///
+/// # Errors
+/// In the fixture tier, a real set with no mirror or [`fixture_set`]'s refusal.
+pub fn input_set<'a>(
+    clause: &str,
+    (name, family): (&'a str, &'static Family),
+    mirror: Option<(&'static str, &'static Family)>,
+) -> Result<InputSet<'a>, GateError> {
+    match Tier::from_env()? {
+        Tier::Real => Ok(InputSet {
+            name,
+            family,
+            path: family.path(name),
+        }),
+        Tier::Fixture => {
+            let (name, family) = mirror
+                .ok_or_else(|| format!("{clause}: the set {name} has no mirror on the fixture"))?;
+            let path = fixture_set(clause, family, name)?;
+            Ok(InputSet { name, family, path })
+        }
+    }
+}
+
 /// [`fixture_set`] under `data_dir`. The set is resolved as the family's [`Family::path_in`] does,
 /// then opened through the family's check ([`Family::check_set`]): the file it was dumped from,
 /// the generation of that file (`# fixture`), the ik build and the completion trailer. A set that

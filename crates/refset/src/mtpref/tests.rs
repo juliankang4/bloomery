@@ -359,3 +359,39 @@ fn a_node_file_of_another_length_is_malformed() {
     assert!(matches!(set.f32s(out), Err(RefError::Malformed { .. })));
     remove(&dir);
 }
+
+/// The draft layer the set's `mtp_eh_proj-N` rows name is the file's: a set
+/// renumbered to another layer, or naming none, is `Malformed` naming what
+/// it names.
+#[test]
+fn the_draft_layer_is_the_files() {
+    let dir = set_dir("draft-layer");
+    let eh = |n: usize| {
+        format!(
+            "tensor\tmtp_eh_proj-{n}\t0\tf32\t4096\t1\t1\t1\t16384\t0.5\tMUL_MAT\t1\t0\t-\t-\t0\t-\t1\t\
+             update"
+        )
+    };
+    let open = |layer: Option<usize>| {
+        let row = layer.map(eh);
+        let mut rows: Vec<&str> = own_rows();
+        rows.extend(row.as_deref());
+        open_own(&dir, &rows).unwrap_or_else(|e| panic!("{e}"))
+    };
+    open(Some(48))
+        .check_draft_layer(48)
+        .unwrap_or_else(|e| panic!("{e}"));
+    for (layer, named) in [(Some(47), "[47]"), (None, "[]")] {
+        let e = open(layer)
+            .check_draft_layer(48)
+            .expect_err("another draft layer");
+        let want = format!(
+            "the mtp_eh_proj rows name the draft layers {named}, the file's draft layer is 48"
+        );
+        assert!(
+            matches!(&e, RefError::Malformed { what, .. } if *what == want),
+            "{layer:?}: {e}"
+        );
+    }
+    remove(&dir);
+}

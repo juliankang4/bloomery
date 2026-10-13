@@ -1074,7 +1074,7 @@ Added 2026-10-13 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecom
     call; whoever measured the cause decides. The fixture and public set gaps and `--place gate` are the maintainers'; a
     contributor may take any of them.
     *Now: the eviction clause is done as (b), with each run of adjacent rows dropped in one call (section 10, Closed).
-    The contributor takes `--place gate`; the rest is in section 10.*
+    The contributor takes `--place gate` and the two qwen4exp gates' tier check; the rest is in section 10.*
 19. **S7, `devmap` and the card leg:** the contributor's, `devmap`'s clause included. A design that departs from (d) and
     (h) goes ahead on its grounds; the contributor decides the load shape and the slice alignment from the
     measurements. Verification may run on any card, and the maintainers take a result checked on the contributor's card

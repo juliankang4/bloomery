@@ -289,8 +289,6 @@ cards.
 - **Gaps in the fixture tier the maintainers took** ([`dgx-spark.md`](dgx-spark.md) section 11, answer 18), from the
   DGX Spark run's points 1 to 5 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Until
   they land, these items stay closed for a contributor:
-  - `gate-gpu-qwen4exp-e2e` and `-mtp` read the real-tier sets `ref_qwen4exp` and `ref-mtp/qwen4exp_prose64_n64_k1` on
-    the fixture tier, and only the `fx_` sets are published.
   - The V4.1 DSpark draft fixture is not fetchable, and five of the gates that need it also read
     `engram/corpus-prose.ids`, which is not published.
   - `glm5next/corpus-prose.ids` and `fx_ref_glm5next_vis_taps` are not published.
