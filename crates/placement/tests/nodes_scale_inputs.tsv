@@ -1,0 +1,53 @@
+# nodes_scale's inputs (docs/contrib/dgx-spark.md §9.9): the rows tools/flow/nodes_scale.py derives the gate's cells from, and the
+# rows the gate holds its own constants and budgets to. A model's rows are <model>/<term>. kind: measured (a recorded run),
+# derived (arithmetic on recorded numbers, code or datasheets), assumed (no record). Every value is a whole number.
+name	value	unit	kind	source
+read	208800000000	B/s	measured	BW, our kernels' pool read on one Spark: §5 and §9.7
+nic	23700000000	B/s	derived	a Spark's NIC a direction, the SoC side: §9.1
+pool	115284164096	B	derived	a node's pool: a GB10 the census reads with 115 GB free (§9.7 U), as NodeBudget::pool reads its card plan
+lambda_lo	25000	ns	derived	λ's band, the exposed round trip a layer: §9.7
+lambda_hi	70000	ns	derived	λ's band: §9.7
+hop	1500	ns	assumed	the switch's hop at N = 4: §9.7
+post	1000	ns	assumed	a further post of node 0's pump: §9.7, §9.8 criterion 6
+row_value	4	B	derived	a value of the handoff and the rows, one f32
+vocab	151552	rows	assumed	the synthetic shapes' head rows
+ruler	10	permille	derived	the box's 95 % interval at four rounds: AGENTS.md, "Know the ruler"
+ruler_wide	40	permille	assumed	a machine whose ruler is 4 %: §9.9 M7
+s1_lo	1000	tok/s	assumed	S₁ at the low end of §9.8's pins
+s1_hi	3000	tok/s	assumed	S₁ at the high end of §9.8's pins
+V4.1/layers	40	layers	derived	§9.7 model terms
+V4.1/n_embd	5120	values	derived	§9.7 model terms
+V4.1/experts	384	experts	derived	§9.7 model terms
+V4.1/top_k	6	slots	derived	§9.7 model terms
+V4.1/expert	16770000	B	derived	§9.7 model terms, an expert's bytes
+V4.1/shared_lo	800000000	B	derived	§9.7 Sh, the band's low end
+V4.1/shared_hi	1500000000	B	derived	§9.7 Sh, the band's high end
+V4.1/serial_lo	3200000000	B	derived	§9.7 A, the band's low end
+V4.1/serial_hi	5800000000	B	derived	§9.7 A, the band's high end
+V4.1/fixed0_lo	12286314624	B	derived	node 0's bytes beside the routed ids at A low: NodeBudget::fixed of the shape's card plan, KV 2 GB at 4,096 positions
+V4.1/fixed0_hi	15555949824	B	derived	the same at A high
+V4.1/fixed1	1744456576	B	derived	a remote's bytes beside its routed ids: NodeBudget::fixed of the routed stacks' card plan, no KV
+GLM/layers	42	layers	derived	§9.7 model terms
+GLM/n_embd	4096	values	derived	§9.7 model terms
+GLM/experts	288	experts	derived	§9.7 model terms
+GLM/top_k	8	slots	derived	§9.7 model terms
+GLM/expert	15200000	B	derived	§9.7 model terms, an expert's bytes
+GLM/shared_lo	1600000000	B	derived	§9.7 Sh, the UD-Q4_K_XL header read
+GLM/shared_hi	1600000000	B	derived	§9.7 Sh, the UD-Q4_K_XL header read
+GLM/serial_lo	7360000000	B	derived	§9.7 A, the UD-Q4_K_XL header read
+GLM/serial_hi	7360000000	B	derived	§9.7 A, the UD-Q4_K_XL header read
+GLM/fixed0_lo	23768122598	B	derived	node 0's bytes beside the routed ids: NodeBudget::fixed of the shape's card plan, KV 2 GB at 4,096 positions
+GLM/fixed0_hi	23768122598	B	derived	the same at A high
+GLM/fixed1	1747080960	B	derived	a remote's bytes beside its routed ids: NodeBudget::fixed of the routed stacks' card plan, no KV
+Qwen3.8/layers	48	layers	derived	§9.7 model terms
+Qwen3.8/n_embd	2560	values	derived	§9.7 model terms
+Qwen3.8/experts	512	experts	derived	§9.7 model terms
+Qwen3.8/top_k	10	slots	derived	§9.7 model terms
+Qwen3.8/expert	3170000	B	derived	§9.7 model terms, an expert's bytes
+Qwen3.8/shared_lo	140000000	B	derived	§9.7 Sh
+Qwen3.8/shared_hi	140000000	B	derived	§9.7 Sh
+Qwen3.8/serial_lo	3400000000	B	derived	§9.7 A, the band's low end
+Qwen3.8/serial_hi	4400000000	B	derived	§9.7 A, the band's high end
+Qwen3.8/fixed0_lo	8341707616	B	derived	node 0's bytes beside the routed ids at A low: NodeBudget::fixed of the shape's card plan, KV 2 GB at 4,096 positions
+Qwen3.8/fixed0_hi	9348340576	B	derived	the same at A high
+Qwen3.8/fixed1	1698955264	B	derived	a remote's bytes beside its routed ids: NodeBudget::fixed of the routed stacks' card plan, no KV

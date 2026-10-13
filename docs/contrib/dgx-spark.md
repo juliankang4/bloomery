@@ -749,7 +749,9 @@ now written beside them are not fed back into the tables.
 - The (a) figures come from a Monte Carlo of the per-layer window: each routed slot lands on node j with the ownership
   probability the rule picks, and the window is the max over the nodes of `Sh + slots·e` (node 0) or `λ + hop + posts +
   rows ingress + slots·e` (a remote). Node 0's share is optimized: 0.55–0.72 at N = 2 for Qwen3.8 and 0.07–0.15 at N = 4
-  for GLM and V4.1. The script moves into `tools/` beside the gate (9.9).
+  for GLM and V4.1. The script moves into `tools/` beside the gate (9.9). The gate's cells and the (a) rows at the
+  gate's inputs below come from `tools/flow/nodes_scale.py` instead, which sums over the count tuples of a token's slots
+  rather than sampling them (9.9).
 
 **Model terms** `[derived]` from each model's tensor table (file sizes: `docs/models.md`):
 
@@ -784,9 +786,18 @@ routed share] → join`. The next layer's attention needs the join, so node 1 id
 
 | N | V4.1 (needs about 268 GB resident) | GLM (about 203 GB) | Qwen3.8 (about 114 GB) |
 |---|---|---|---|
-| 1 | no: about 154 GB of routed on NVMe | no: about 88 GB on NVMe | yes, marginal |
-| 2 | no: about 43 GB on NVMe ((b): about 19 GB a node) | yes, about 25 GB spare | yes |
+| 1 | no: ~~about 154 GB of routed on NVMe~~ node 0's pool has room for 154 of the 384 routed ids at 4,096 positions and 153 at 32,768, so 230 (155.0 GB) and 231 (155.7 GB) do not fit | no: ~~about 88 GB on NVMe~~ 128 of 288 ids on NVMe, 82.4 GB | yes, marginal |
+| 2 | no: about 43 GB on NVMe ((b): about 19 GB a node) | yes, ~~about 25 GB spare~~ every id held: the pools have room for 160 and 176 of the 288 ids | yes |
 | 4 | yes, about 190 GB spare ((b) about 67 GB a stage; (c) adds 6 GB of dense a node) | yes ((c) adds 11.4 GB of dense a node) | yes |
+
+The cells that replace the struck figures are `[derived]` from the files' headers (V4.1 `Q3_K_M`, GLM `UD-Q4_K_XL`)
+at `cb5688c9`, with node 0's card plan of the file and a pool a node of the 115 GB that 9.7 assumes, the same at 4,096
+and 32,768 positions where no position count is named. GLM's are the plans of `plan_nodes`
+([#95](https://github.com/midagedev/bloomery/pull/95)). The node plans refuse the V4.1 file at every N: node 0's card
+plan leaves its engram tables (84.5 GB) on the NVMe tier and reads 5,280 B of them a token, and `Terms::of` refuses
+such rows by name (9.9, Terms). V4.1's cell at N = 1 comes from the room node 0's budget (`NodeBudget::of`) leaves for
+routed ids: the pool the plan reads from those 115 GB, 115.28 GB, less its fixed bytes (10.86 GB at 4,096 positions,
+12.14 GB at 32,768), over 673.9 MB an id.
 
 For Qwen3.8 at N = 2 under (a), node 0 holds about 75 GB (4.5 non-routed + 28.8 PLE + about 39 routed + KV) against
 about 114 GB on one node, and node 1 about 40 GB.
@@ -838,6 +849,26 @@ that binds:**
 | (a) star | V4.1 3.08 MB, 80 messages; GLM 3.99 MB, 84; Qwen3.8 2.45 MB, 95 | V4.1 4.98 MB, 211; GLM 6.84 MB, 237; Qwen3.8 3.98 MB, 250 | all on node 0's NIC; per layer at most 2·min(k, N−1) messages |
 | (b) pipeline | one boundary (16·n_embd B: 82, 66, 41 KB) and a token id | N − 1 boundaries and a token id | spread: each NIC one in, one out |
 | (c) EP | as (a) with uniform ownership | as (a) | spread: each node at most 4(N−1) a layer |
+
+**(a) at the gate's inputs** `[derived]` by `tools/flow/nodes_scale.py --table` (9.9): BW 208.8 GB/s, the 23.7 GB/s
+NIC, a 115 GB pool a node, the gate's synthetic shapes (GLM's A and Sh from the header read), λ from 25 to 70 µs and A
+from low to high, one request. N is the Sparks offered; the plan may leave some of them idle (criteria 2 and 7 of 9.8),
+and node 0's share is the split's, not an even one. Decode carries no NVMe term, so for a model that pages it is the
+pool's time only. The prompt is the Amdahl term above with the slowest node's FFN at the split, and the NIC cap is node
+0's rows ingress at the split's remote share. Messages count a handoff and its rows for each remote a token reaches.
+
+| (a) star at the gate's inputs | N | Nodes used | Decode, one request (tok/s) | Prompt (× S₁) | Node 0's NIC ingress cap (tok/s) | Link bytes a token (MB) | Messages a token |
+|---|---|---|---|---|---|---|---|
+| V4.1 | 2 | 2 | 22.0 to 32.7 (pool only: pages 62 to 67 ids) | 1.28 to 1.40 | 7,846 to 9,140 | 3.40 to 3.84 | 79 to 80 |
+| V4.1 | 4 | 4 | 24.5 to 38.1 | 1.49 to 1.75 | 4,895 to 6,031 | 6.00 to 7.07 | 203 to 218 |
+| GLM | 2 | 2 | 17.8 to 18.1 | 1.28 to 1.29 | 7,005 to 7,216 | 3.97 to 4.07 | 84 |
+| GLM | 4 | 4 | 19.9 to 20.5 | 1.48 to 1.52 | 4,551 to 4,825 | 6.85 to 7.17 | 237 to 240 |
+| Qwen3.8 | 2 | 2 | 36.2 to 45.9 | 1.09 to 1.16 | 10,396 to 15,055 | 2.06 to 2.77 | 94 to 96 |
+| Qwen3.8 | 4 | 2 to 3 | 36.2 to 47.6 | 1.09 to 1.22 | 7,968 to 15,269 | 2.03 to 3.93 | 94 to 187 |
+
+The rest of the decode, prompt and link tables above is not recomputed. The one-node and NVMe rows need ρ and the
+drive's rate, (b) a pipeline model, (c) the union R(2), and N requests in flight a batched step; none of them is an
+input of the script (section 10).
 
 **One GLM decode layer under (a), one request, N = 2 (midpoints), the resource timeline:**
 
@@ -931,6 +962,22 @@ Nothing fires at S₁ = 1,000. At N = 2 nothing fires except GLM's prompt, which
 8,610): the gate's boundary case, at ≤ and not <. The predictor in the tree reads the measured BW and node 0's real split,
 and differs from this table in criterion 5's column; 9.9 gives its cells.
 
+**Where each fires at the gate's inputs** `[derived]` by `tools/flow/nodes_scale.py --table` (9.9): BW 208.8 GB/s, the
+23.7 GB/s NIC, a 115 GB pool a node, GLM's header read, node 0's NIC at the split's own share, and the gate's `RULER`,
+10 ‰ (question 1 of [#95](https://github.com/midagedev/bloomery/pull/95) asks whether that is the box's ruler). An N
+alone names every λ and A at it.
+
+| Model | Decode step (ms) at the gate's inputs, N = 1 → 2 → 3 → 4, λ 25 / 70, A low | Criterion 2 fires | Criterion 7 fires | Criterion 5 fires, S₁ 1,000 | Criterion 5 fires, S₁ 3,000 |
+|---|---|---|---|---|---|
+| V4.1 | 38.4 → 30.6 / 31.4 → 27.7 / 29.0 → 26.3 / 27.7 | never | never | never | N = 2, λ 25, A low; N = 3; N = 4 |
+| GLM | 67.4 → 55.2 / 56.2 → 50.9 / 52.3 → 48.7 / 50.3 | never | never | never | N = 2; N = 3; N = 4 |
+| Qwen3.8 | 24.2 → 21.8 / 22.8 → 21.0 / 22.3 → 21.0 / 22.8 | N = 4, λ 70, A low | N = 3, λ 70, A high; N = 4, λ 25, A low and high; N = 4, λ 70, A high | never | never |
+
+Two cells sit on a line within the change one id moved makes. V4.1 at N = 2, λ 25, A low has its busiest NIC at
+501 ± 5 ‰ at S₁ 3,000, on the 500 ‰ line, and criterion 5 fires there. Qwen3.8 at N = 3, λ 70, A low has its third
+node's link share at 99,956 ± 78 ppm, on the tenth, and the node is used. The cells file names each as an edge in every
+row of a ruler and S₁ it is derived at, four rows in all, and the gate pins its side (9.9).
+
 ### 9.9 Reference: the gate, `nodes_scale`
 
 `nodes_scale` is the placement half's gate (answer 20), built with the shape of 9.2. It is a set of unit tests in
@@ -951,8 +998,18 @@ Where the gate holds a clause differently from its words below, the clause says 
   bytes the split holds them at. A row table left on the NVMe tier is refused by name, since the predictor has no fill
   term for it. The row width is an input, the model's embedding length.
 - **Expected sets.** The table of 9.8, pinned from a derivation script that moves into `tools/` beside the gate with its
-  own self-test, so the pins have one derivation. The script is not in the tree yet. Until it is, the gate pins the
-  predictor's own cells, which match 9.8's table in criteria 2 and 7 and differ in criterion 5 (clause 5).
+  own self-test, so the pins have one derivation. ~~The script is not in the tree yet. Until it is, the gate pins the
+  predictor's own cells, which match 9.8's table in criteria 2 and 7 and differ in criterion 5 (clause 5).~~ The script
+  is `tools/flow/nodes_scale.py`, with no code or method shared with the planner: node 0's share in real numbers by
+  9.2's rule, found by bisection, and each window an expectation over the count tuples of a token's slots, built one
+  slot at a time. It reads `crates/placement/tests/nodes_scale_inputs.tsv`, one row per input with its kind (measured,
+  derived or assumed) and source, and writes the 144 cells (a model, N, λ and A, at the gate's `RULER` and S₁ 1,000 and
+  3,000 and at a 4 % ruler and S₁ 3,000) to `nodes_scale_cells.tsv` beside it; `--table` prints 9.8's table at the
+  gate's inputs and 9.7's (a) rows, and `--check` holds the file and both doc tables to them. Each value carries the
+  largest change one id moved between two used nodes makes, because the planner splits whole ids. Where that band holds
+  a line (the NIC's half, the link share's tenth, twice the ruler), the cell names an edge, the gate pins its side by
+  hand, and the planner's value is held to the band besides. `--self-test` runs hand-worked cases, the refusals and
+  `--check`; `just check-recipes` runs it.
 - **Clauses:**
   1. `n1_is_today`: every N = 1 plan equals today's plan byte for byte. The gate holds it where node 0 holds every id:
      node 0's bytes are today's pool need, or both plans refuse the model by the same bytes. Paged, it holds node 0 to
@@ -965,11 +1022,12 @@ Where the gate holds a clause differently from its words below, the clause says 
   4. `link_share`: criterion 2 holds on the chosen plan. Qwen3.8 at N = 4, λ 70, A low uses at most 3 nodes. The
      predictor's plan of that cell uses two of the four: a third switched node exposes 2.270 of 22.351 ms, 10.2 %.
   5. `nic_not_max`: criterion 5 either holds or carries the named prompt-mode note, exactly in the cells of the "fires"
-     column. The gate pins the predictor's cells: at S₁ 3,000, V4.1 and GLM at N ≥ 2, except three of V4.1's four cells
-     at N = 2, and never Qwen3.8; at 1,000, none. Node 0 takes the rows of the remotes' share as the split sets it,
-     where 9.8 assumed an even split: GLM at N = 2, λ 25, A low splits its ids [111, 177], and node 0's NIC is busy
-     551 ‰. In the cells that fire, the busiest NIC runs from 500 to 941 ‰ for V4.1 and from 531 to 1,007 ‰ for GLM;
-     Qwen3.8's stays at or below 465 ‰.
+     column. The gate pins the ~~predictor's~~ derived cells: at S₁ 3,000, V4.1 and GLM at N ≥ 2, except three of V4.1's
+     four cells at N = 2, and never Qwen3.8; at 1,000, none. The figures that follow are the predictor's; the gate holds
+     each busiest NIC to the derived one within one id's change. Node 0 takes the rows of the remotes' share as the
+     split sets it, where 9.8 assumed an even split: GLM at N = 2, λ 25, A low splits its ids [111, 177], and node 0's
+     NIC is busy 551 ‰. In the cells that fire, the busiest NIC runs from 500 to 941 ‰ for V4.1 and from 531 to 1,007 ‰
+     for GLM; Qwen3.8's stays at or below 465 ‰.
   6. `messages_o_n`: criterion 6. The busiest node posts 2 × min(k, N − 1) messages a layer, because node 0 sends the
      handoff only to the remotes that hold one of the token's slots in that layer.
   7. `never_slower`: `NodeIdle` names exactly the cells of criterion 7's column, and no chosen plan is slower than its
@@ -1015,10 +1073,14 @@ Each open item; the owner is named where one is agreed. An item that a measureme
 **P5.**
 - The `[derived]` bands and criteria of 9.7 and 9.8 still use their first inputs. `nodes_scale`'s derivation script, in
   the placement half, recomputes them (the placement half as proposed in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134316241), accepted in
-  answer 20).
+  answer 20). `tools/flow/nodes_scale.py` (9.9) recomputes 9.8's "where each fires" table and 9.7's (a) rows at the
+  gate's inputs. 9.7's one-node and NVMe rows, (b), (c) and N requests in flight still use their first inputs: they need
+  ρ, the NVMe rate, a pipeline model, the union R(2) and a batched step, none of which is an input of the script.
+- A fill term in the node plans for rows read from the NVMe tier, so that they can plan the V4.1 file (9.7, 9.9
+  Terms).
 - Where `nodes_scale` ([#95](https://github.com/midagedev/bloomery/pull/95)) holds a clause of 9.9 differently from its
-  words, for the maintainers to accept or change: until the derivation script lands, it pins the predictor's cells,
-  which differ from 9.8's table in criterion 5 (clause 5); clause 1 is byte for byte only where node 0 holds every id,
+  words, for the maintainers to accept or change: it pins the cells `tools/flow/nodes_scale.py` derives, which differ from
+  9.8's table as first written in criterion 5 (clause 5); clause 1 is byte for byte only where node 0 holds every id,
   since today's plan of one Spark pages V4.1 and GLM under a card budget lowered to the NVMe tier's floor
   (`plan_in_pool`, section 8) and the node plans take node 0's terms before that split; clause 7 compares each plan
   with the N − 1 plan on the same link, which the planner can choose, not on the N − 1 plan's own fabric.

@@ -473,6 +473,7 @@ blk_pytools() {
     "tools/check-ptx-names.py --self-test"
     "tools/check-records.py --self-test"
     "tools/flow/ds41_prefill.py --self-test"
+    "tools/flow/nodes_scale.py --self-test"
     "tools/flow/pplb.py --self-test"
     "tools/flow/q38_step.py --self-test"
     "tools/flow/q38width.py --self-test"

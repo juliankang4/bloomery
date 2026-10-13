@@ -1,9 +1,10 @@
 //! `nodes_scale` (`docs/contrib/dgx-spark.md` §9.9): the node plans on
-//! synthetic DGX Sparks, N = 1 to 4, against the cells of §9.8's "where each
-//! fires" table as the predictor derives them; a clause whose cells differ
-//! from the table names the difference. Three synthetic shapes carry §9.7's
-//! model terms for V4.1, GLM-5.3-Flash and Qwen3.8, A low and high; no file
-//! is read but where a clause reads the Qwen3.8 file's tensor table.
+//! synthetic DGX Sparks, N = 1 to 4, against the expected cells that
+//! `tools/flow/nodes_scale.py` derives from §9.7's model and §9.8's
+//! criteria apart from the planner (`tests/nodes_scale_cells.tsv`). Three
+//! synthetic shapes carry §9.7's model terms for V4.1, GLM-5.3-Flash and
+//! Qwen3.8, A low and high; no file is read but where a clause reads the
+//! Qwen3.8 file's tensor table.
 
 use std::sync::OnceLock;
 
@@ -412,6 +413,380 @@ fn used(plan: &NodePlan<'_>) -> u64 {
         .count() as u64
 }
 
+/// The inputs `tools/flow/nodes_scale.py` derives the expected cells from.
+const INPUTS: &str = include_str!("../../tests/nodes_scale_inputs.tsv");
+
+/// The expected cells (§9.9 "Expected sets"), as that script writes them.
+const CELLS: &str = include_str!("../../tests/nodes_scale_cells.tsv");
+
+/// The value of the inputs row `name`.
+fn input(name: &str) -> u64 {
+    INPUTS
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .skip(1)
+        .find_map(|l| {
+            let mut c = l.split('\t');
+            (c.next() == Some(name)).then(|| c.next())
+        })
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("nodes_scale_inputs.tsv: no whole number for {name}"))
+}
+
+/// A derived value whose band holds its criterion's line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edge {
+    /// The busiest NIC, on criterion 5's half.
+    Nic,
+    /// Node `node`'s link share in ppm, on criterion 2's tenth.
+    Link { node: usize, ppm: u64, tol: u64 },
+    /// Node `node`'s gain in ppm, on criterion 7's twice the ruler.
+    Gain { node: usize, ppm: u64, tol: u64 },
+}
+
+impl Edge {
+    fn criterion(self) -> &'static str {
+        match self {
+            Edge::Nic => "nic",
+            Edge::Link { .. } => "link",
+            Edge::Gain { .. } => "gain",
+        }
+    }
+}
+
+/// One derived cell: a cell at a ruler and S₁, what the script derives of
+/// its plan, and each value's tolerance, the largest change one id moved
+/// between two used nodes makes.
+#[derive(Debug)]
+struct Derived {
+    cell: Cell,
+    ruler: u64,
+    rate: u64,
+    used: u64,
+    /// The idle nodes and why, `node:pool`, `node:link` or `node:gain`, or
+    /// `-`.
+    idle: String,
+    paged: u64,
+    /// Each node's paged ids, to one id.
+    paged_nodes: Vec<u64>,
+    step_ns: u64,
+    step_tol: u64,
+    nic: u64,
+    nic_tol: u64,
+    fires: bool,
+    /// Node 0's messages in the layer that reaches the most remotes.
+    msgs: u64,
+    edges: Vec<Edge>,
+}
+
+/// Every derived cell.
+fn derived() -> &'static [Derived] {
+    static DERIVED: OnceLock<Vec<Derived>> = OnceLock::new();
+    DERIVED.get_or_init(|| {
+        let mut rows = CELLS.lines().filter(|l| !l.starts_with('#'));
+        assert_eq!(
+            rows.next(),
+            Some(
+                "model\ta\tn\tlambda_us\truler\ts1\tused\tidle\tpaged\tpaged_nodes\tstep_ns\tstep_tol\tnic\tnic_tol\tfires\tmsgs\tedge"
+            ),
+            "nodes_scale_cells.tsv's header"
+        );
+        rows.map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            let [model, a, n, lambda, ruler, rate, used, idle, paged, per, step, step_tol, nic, nic_tol, fires, msgs, edge] =
+                c[..]
+            else {
+                panic!("nodes_scale_cells.tsv: {l:?} is not 17 cells");
+            };
+            let num = |v: &str| -> u64 {
+                v.parse()
+                    .unwrap_or_else(|_| panic!("nodes_scale_cells.tsv: {v:?} in {l:?}"))
+            };
+            let name = SHAPES
+                .iter()
+                .map(|s| s.name)
+                .find(|&s| s == model)
+                .unwrap_or_else(|| panic!("nodes_scale_cells.tsv: no shape {model}"));
+            let edges = edge
+                .split(',')
+                .filter(|&e| e != "-")
+                .map(|e| {
+                    let f: Vec<&str> = e.split(':').collect();
+                    match f[..] {
+                        ["nic"] => Edge::Nic,
+                        ["link", node, ppm, tol] => Edge::Link {
+                            node: num(node) as usize,
+                            ppm: num(ppm),
+                            tol: num(tol),
+                        },
+                        ["gain", node, ppm, tol] => Edge::Gain {
+                            node: num(node) as usize,
+                            ppm: num(ppm),
+                            tol: num(tol),
+                        },
+                        _ => panic!("nodes_scale_cells.tsv: edge {e:?} in {l:?}"),
+                    }
+                })
+                .collect();
+            Derived {
+                cell: (name, num(n) as usize, num(lambda), a == "high"),
+                ruler: num(ruler),
+                rate: num(rate),
+                used: num(used),
+                idle: idle.to_string(),
+                paged: num(paged),
+                paged_nodes: per.split(',').map(num).collect(),
+                step_ns: num(step),
+                step_tol: num(step_tol),
+                nic: num(nic),
+                nic_tol: num(nic_tol),
+                fires: fires == "1",
+                msgs: num(msgs),
+                edges,
+            }
+        })
+        .collect()
+    })
+}
+
+/// The derived cell of `cell` at `ruler` and S₁ `rate`.
+fn derived_at(cell: Cell, ruler: u64, rate: u64) -> &'static Derived {
+    derived()
+        .iter()
+        .find(|d| d.cell == cell && d.ruler == ruler && d.rate == rate)
+        .unwrap_or_else(|| panic!("no derived cell {cell:?} at ruler {ruler}, S₁ {rate}"))
+}
+
+/// The side of each derived edge, pinned here: a cell, its ruler and S₁, the
+/// edge's criterion, and whether that criterion fires there (criterion 2 or
+/// 7 leaves the node idle, criterion 5 names the NIC).
+const SIDES: [(Cell, u64, u64, &str, bool); 4] = [
+    (("V4.1", 2, 25, false), RULER, 3_000, "nic", true),
+    (("V4.1", 2, 25, false), 4 * RULER, 3_000, "nic", true),
+    (("Qwen3.8", 3, 70, false), RULER, 1_000, "link", false),
+    (("Qwen3.8", 3, 70, false), RULER, 3_000, "link", false),
+];
+
+/// Holds the derived side of `e` in `d` to its pin in [`SIDES`]; an edge
+/// with no pin, or whose derived side is not its pin, panics by name.
+fn side(d: &Derived, e: Edge) {
+    let fires = match e {
+        Edge::Nic => d.fires,
+        Edge::Link { node, .. } => d.idle.split(',').any(|i| i == format!("{node}:link")),
+        Edge::Gain { node, .. } => d.idle.split(',').any(|i| i == format!("{node}:gain")),
+    };
+    let (_, _, _, _, pin) = SIDES
+        .iter()
+        .find(|s| s.0 == d.cell && s.1 == d.ruler && s.2 == d.rate && s.3 == e.criterion())
+        .unwrap_or_else(|| {
+            panic!(
+                "{:?} at ruler {}, S₁ {}: a {} edge with no pinned side",
+                d.cell,
+                d.ruler,
+                d.rate,
+                e.criterion()
+            )
+        });
+    assert_eq!(
+        fires,
+        *pin,
+        "{:?} at ruler {}, S₁ {}: the derived {} side is not the pinned one",
+        d.cell,
+        d.ruler,
+        d.rate,
+        e.criterion()
+    );
+}
+
+/// Whether a link of `link_ns` can pass a tenth of a step of `step_ns`,
+/// both rounded down to whole nanoseconds: the link is under `link_ns + 1`
+/// and the step at least `step_ns`.
+fn past_tenth(link_ns: u64, step_ns: u64) -> bool {
+    10 * (link_ns + 1) > step_ns
+}
+
+/// The idle nodes of `plan` as the derived cells name them.
+fn idle_of(plan: &NodePlan<'_>) -> String {
+    let idle: Vec<String> = plan
+        .idle()
+        .iter()
+        .map(|i| {
+            let why = match i.why {
+                IdleWhy::Pool { .. } => "pool",
+                IdleWhy::LinkShare { .. } => "link",
+                IdleWhy::Gain { .. } => "gain",
+            };
+            format!("{}:{why}", i.node)
+        })
+        .collect();
+    if idle.is_empty() {
+        "-".to_string()
+    } else {
+        idle.join(",")
+    }
+}
+
+/// §9.9 "Expected sets": the cells are `tools/flow/nodes_scale.py`'s,
+/// derived from `nodes_scale_inputs.tsv`, whose rows are this gate's own
+/// machine, shapes and budgets. In every cell the plan uses the derived
+/// nodes and leaves the others idle for the derived criterion, pages the
+/// derived ids in all and on each node to one id, and its step and busiest
+/// NIC are the derived ones to one id's change. Where a derived value's band
+/// holds its line, the side is pinned in [`SIDES`], and a link share is
+/// held to the band, read from the node's `NodeIdle` or, where the node is
+/// the last used, from the plan; so is a gain, from a node's `NodeIdle`.
+#[test]
+fn expected_sets() {
+    for (name, value) in [
+        ("read", GB10_READ),
+        ("nic", GB10_NIC),
+        ("pool", case_of(("V4.1", 1, 25, false)).budgets[0].pool()),
+        ("lambda_lo", LAMBDAS[0]),
+        ("lambda_hi", LAMBDAS[1]),
+        ("hop", HOP_NS),
+        ("post", POST_NS),
+        ("row_value", 4),
+        ("vocab", VOCAB),
+        ("ruler", RULER),
+        ("ruler_wide", 4 * RULER),
+        ("s1_lo", PROMPT_RATES[0]),
+        ("s1_hi", PROMPT_RATES[1]),
+    ] {
+        assert_eq!(input(name), value, "{name}");
+    }
+    for case in cases() {
+        let s = case.shape;
+        let end = if case.high { "hi" } else { "lo" };
+        let at = usize::from(case.high);
+        for (term, value) in [
+            ("layers".to_string(), s.layers as u64),
+            ("n_embd".to_string(), s.n_embd),
+            ("experts".to_string(), s.experts),
+            ("top_k".to_string(), s.used),
+            ("expert".to_string(), s.expert),
+            (format!("shared_{end}"), s.shared[at]),
+            (format!("serial_{end}"), s.serial[at]),
+            (format!("fixed0_{end}"), case.budgets[0].fixed()),
+            ("fixed1".to_string(), case.budgets[1].fixed()),
+        ] {
+            assert_eq!(
+                input(&format!("{}/{term}", s.name)),
+                value,
+                "{}/{term}",
+                s.name
+            );
+        }
+        assert_eq!(case.budgets[1].pool(), case.budgets[0].pool());
+    }
+    let mut seen = 0;
+    let mut pinned = Vec::new();
+    for (ruler, rate) in [
+        (RULER, PROMPT_RATES[0]),
+        (RULER, PROMPT_RATES[1]),
+        (4 * RULER, PROMPT_RATES[1]),
+    ] {
+        each_cell(ruler, rate, |cell, plan| {
+            seen += 1;
+            let d = derived_at(cell, ruler, rate);
+            let at = format!("{cell:?} at ruler {ruler}, S₁ {rate}");
+            assert_eq!(
+                (used(plan), idle_of(plan)),
+                (d.used, d.idle.clone()),
+                "{at}: the nodes used and idle"
+            );
+            let p = plan.predict().expect("a prediction");
+            let id: u64 = plan.terms().layers.iter().map(|l| l.expert).sum();
+            let paged: Vec<u64> = plan
+                .owned()
+                .iter()
+                .enumerate()
+                .map(|(j, &o)| {
+                    let held = if o == 0 {
+                        0
+                    } else {
+                        let fixed = case_of(cell).budgets[j.min(1)].fixed();
+                        p.per_node[j]
+                            .pool
+                            .checked_sub(fixed)
+                            .expect("a used node's pool holds its budget")
+                            / id
+                    };
+                    o.checked_sub(held).expect("a node holds at most its ids")
+                })
+                .collect();
+            assert!(
+                paged.iter().sum::<u64>() == d.paged
+                    && paged.len() == d.paged_nodes.len()
+                    && paged
+                        .iter()
+                        .zip(&d.paged_nodes)
+                        .all(|(a, b)| a.abs_diff(*b) <= 1),
+                "{at}: paged {paged:?}, derived {} as {:?} to one id each",
+                d.paged,
+                d.paged_nodes
+            );
+            assert!(
+                p.step_ns.abs_diff(d.step_ns) <= d.step_tol,
+                "{at}: step {} ns, derived {} ± {} ns",
+                p.step_ns,
+                d.step_ns,
+                d.step_tol
+            );
+            let busiest = p.per_node.iter().map(|l| l.nic_permille).max().unwrap_or(0);
+            assert!(
+                busiest.abs_diff(d.nic) <= d.nic_tol,
+                "{at}: NIC {busiest} ‰, derived {} ± {} ‰",
+                d.nic,
+                d.nic_tol
+            );
+            for &e in &d.edges {
+                side(d, e);
+                pinned.push((cell, ruler, rate, e.criterion()));
+                let (node, want, tol) = match e {
+                    Edge::Nic => continue,
+                    Edge::Link { node, ppm, tol } | Edge::Gain { node, ppm, tol } => {
+                        (node, ppm, tol)
+                    }
+                };
+                let why = plan.idle().iter().find(|i| i.node == node).map(|i| i.why);
+                let last = used(plan) == node as u64 + 1;
+                let ppm = match (e, why) {
+                    (Edge::Link { .. }, Some(IdleWhy::LinkShare { link_ns, step_ns })) => {
+                        assert!(past_tenth(link_ns, step_ns), "{at}: {why:?}");
+                        i128::from(link_ns) * 1_000_000 / i128::from(step_ns)
+                    }
+                    (Edge::Link { .. }, None) if last => {
+                        i128::from(p.link_ns) * 1_000_000 / i128::from(p.step_ns)
+                    }
+                    (
+                        Edge::Gain { .. },
+                        Some(IdleWhy::Gain {
+                            without_ns,
+                            with_ns,
+                        }),
+                    ) => {
+                        (i128::from(without_ns) - i128::from(with_ns)) * 1_000_000
+                            / i128::from(without_ns)
+                    }
+                    (Edge::Gain { .. }, None) => continue,
+                    _ => panic!("{at}: no witness of {e:?} on node {node}, idle {why:?}"),
+                };
+                assert!(
+                    ppm.abs_diff(i128::from(want)) <= u128::from(tol),
+                    "{at}: node {node}'s {} {ppm} ppm, derived {want} ± {tol}",
+                    e.criterion()
+                );
+            }
+        });
+    }
+    assert_eq!(seen, derived().len());
+    let mut sides: Vec<_> = SIDES.iter().map(|s| (s.0, s.1, s.2, s.3)).collect();
+    pinned.sort();
+    sides.sort();
+    assert_eq!(pinned, sides, "a pinned side with no derived edge");
+}
+
 /// Clause 1, `n1_is_today`: one Spark's machine is [`plan_on`] the GB10,
 /// and its plan is today's: held whole, node 0's bytes are today's pool sum
 /// ([`PoolNeed`]), or both refuse it by the same bytes; paged, node 0 holds
@@ -818,15 +1193,23 @@ fn read_balance() {
 }
 
 /// Clause 4, `link_share`: the chosen plan's link term is at most a tenth of
-/// its step, and a node is dropped for it exactly where criterion 2 fires,
-/// as §9.8's table names: Qwen3.8 at N = 4, λ 70, A low, which then uses
-/// two of the four nodes. The share is read on the exact steps: three ids
-/// of 1,000 B at top-k 1 read at 10¹¹ B/s, λ 17,000 ps, split [2, 1],
-/// expose 5,666⅔ of 55,666⅔ ps (10.2 %), and three of 19,199 B at
-/// 10¹² B/s, λ 32,000 ps, expose 10,666⅔ of 106,661⅔ ps, past a tenth by
-/// ½ ps.
+/// its step, and a node dropped for it would pass the tenth, read on its
+/// whole nanoseconds ([`past_tenth`]). [`expected_sets`] holds the nodes
+/// dropped for it to the derived cells where criterion 2 fires; here, a plan
+/// that drops one uses two nodes, and Qwen3.8 at N = 4, λ 70, A low is among
+/// them. The share is read on the exact steps: three ids of 1,000 B at
+/// top-k 1 read at 10¹¹ B/s, λ 17,000 ps, split [2, 1], expose 5,666⅔ of
+/// 55,666⅔ ps (10.2 %), and three of 19,199 B at 10¹² B/s, λ 32,000 ps,
+/// expose 10,666⅔ of 106,661⅔ ps, past a tenth by ½ ps.
 #[test]
 fn link_share() {
+    let dropped_past = |at: &dyn std::fmt::Debug, plan: &NodePlan<'_>| {
+        for i in plan.idle() {
+            if let IdleWhy::LinkShare { link_ns, step_ns } = i.why {
+                assert!(past_tenth(link_ns, step_ns), "{at:?}: {i:?}");
+            }
+        }
+    };
     let mut fired = Vec::new();
     each_cell(RULER, 3_000, |cell, plan| {
         let step = plan.step_ps().expect("a step");
@@ -835,6 +1218,7 @@ fn link_share() {
             link.times(10).expect("ten links") <= step,
             "{cell:?}: link {link:?} of step {step:?}"
         );
+        dropped_past(&cell, plan);
         if plan
             .idle()
             .iter()
@@ -844,7 +1228,7 @@ fn link_share() {
             assert_eq!(used(plan), 2, "{cell:?}");
         }
     });
-    assert_eq!(fired, vec![("Qwen3.8", 4, 70, false)]);
+    assert!(fired.contains(&("Qwen3.8", 4, 70, false)), "{fired:?}");
     let model = tiny(3, 1, 1_000);
     let machine = spark(GB10_POOL, 1);
     let link = LinkCost { round_trip_ns: 17 };
@@ -884,21 +1268,26 @@ fn link_share() {
             }
         }]
     );
+    dropped_past(&"19,199 B ids", &plan);
 }
 
-/// Node 0's NIC, in permille, on a plan of `owned` ids: a token's mean
-/// rows, one a slot on a remote, kept a fraction, against the decode step
-/// and a prompt batch at S₁ times the one-node token's bytes over A and the
-/// slowest node's FFN, node 0's with Sh.
-fn nic_of(shape: Shape, owned: &[u64], step_ns: u64, s1: u64) -> u128 {
+/// Node 0's bytes a token on a plan of `owned` ids, times the experts: the
+/// mean rows of its slots on the remotes, one a slot, kept a fraction.
+fn nic_bytes(shape: Shape, owned: &[u64]) -> u128 {
+    let layers = shape.layers as u64;
+    let k = u128::from(shape.used);
+    let remote: u128 = owned[1..].iter().map(|&o| u128::from(o)).sum();
+    u128::from(layers * 4 * shape.n_embd) * k * remote
+}
+
+/// Node 0's NIC share of a prompt batch on such a plan at S₁ `s1`, a NIC of
+/// one byte a second: S₁ times the one-node token's bytes over A and the
+/// slowest node's FFN, node 0's with Sh, as a numerator and a denominator.
+fn nic_prompt(shape: Shape, owned: &[u64], s1: u64) -> (u128, u128) {
     let (a, sh, e) = shape.bytes(false);
     let layers = shape.layers as u64;
     let (sh, id) = (u128::from(sh * layers), u128::from(e * layers));
     let (k, ex) = (u128::from(shape.used), u128::from(shape.experts));
-    let remote: u128 = owned[1..].iter().map(|&o| u128::from(o)).sum();
-    let bytes = u128::from(layers * 4 * shape.n_embd) * k * remote;
-    let nic = u128::from(GB10_NIC);
-    let decode = bytes * PS * 1000 / (u128::from(step_ns) * 1000 * nic * ex);
     let ffn = owned
         .iter()
         .enumerate()
@@ -906,33 +1295,43 @@ fn nic_of(shape: Shape, owned: &[u64], step_ns: u64, s1: u64) -> u128 {
         .max()
         .unwrap_or(0);
     let one = u128::from(a) + sh + k * id;
-    let prompt = u128::from(s1) * one * bytes * 1000 / ((u128::from(a) * ex + ffn) * nic);
-    decode.max(prompt)
+    (
+        u128::from(s1) * one * nic_bytes(shape, owned),
+        u128::from(a) * ex + ffn,
+    )
+}
+
+/// Node 0's NIC, in permille, on such a plan: against the decode step and
+/// the prompt batch, the larger.
+fn nic_of(shape: Shape, owned: &[u64], step_ns: u64, s1: u64) -> u128 {
+    let nic = u128::from(GB10_NIC);
+    let ex = u128::from(shape.experts);
+    let decode = nic_bytes(shape, owned) * PS * 1000 / (u128::from(step_ns) * 1000 * nic * ex);
+    let (num, den) = nic_prompt(shape, owned, s1);
+    decode.max(num * 1000 / (den * nic))
 }
 
 /// Clause 5, `nic_not_max`: a plan whose NIC passes half a decode step or a
-/// prompt batch names the node and its busy share, which is the node's
-/// reported one and the busiest, exactly where criterion 5 fires on the
-/// chosen plan at its split: node 0 takes the rows of the remotes' share of
-/// the slots. At S₁ 3,000 that is V4.1 and GLM at N ≥ 2 but three of
-/// V4.1's four cells at N = 2 (all but λ 25, A low, on the line at 500 ‰),
-/// and never Qwen3.8, whose node 0 keeps the most ids; none at 1,000.
-/// §9.8's table, from an even split, names N ≥ 3 for all three. The prompt
-/// counts the split's own shares: a remote that owns every id gains the
-/// prompt only Sh. A token's mean bytes stay a fraction: three ids a layer
-/// at top-k 1, owned [1, 2], take 8/3 B a token, two thirds of a 4 B row,
-/// and node 0's prompt share is 4/7, past the line. The decode line reads
-/// the exact step: the same split of ids of 666,666,664 B read at 10¹⁰ B/s,
-/// a NIC of 16 B/s and λ 2,000 ps take a step of 333,333,333,333⅓ ps, twice
-/// node 0's NIC time of 166,666,666,666⅔ ps, so on the line. Paged, each
-/// window's read and fill round down once, together: forty ids of
-/// 649,500,000 B at top-k 1 read at 10¹⁹ B/s on two nodes of one id's room
-/// each, at a hit rate of 999 ‰ and a miss's fill of 1,000 ps, split
-/// [20, 20], take a step of 325.7 ps that reads 324 ps (a read of 64.95 ps
-/// and a fill of 19/20 ps a window). A row of 647 values at 8 × 10¹² B/s
-/// gives node 0 a NIC time of 161.75 ps, half of 323.5 ps, 2.2 ps under the
-/// step and so past the 2 ps a one-layer step can read low: no node is
-/// named.
+/// prompt batch names the node and its busy share, which is the node's reported
+/// one and the busiest, exactly in the derived cells where criterion 5 fires on
+/// the chosen plan at its split: node 0 takes the rows of the remotes' share of
+/// the slots. On the line the side is the one [`expected_sets`] pins: V4.1 at
+/// N = 2, λ 25, A low fires at S₁ 3,000. A share of exactly one half reads
+/// 500 ‰ and does not fire, at ≤ and not <, and one just past it reads 500 ‰
+/// and fires. The prompt counts the split's own shares: a remote that owns
+/// every id gains the prompt only Sh. A token's mean bytes stay a fraction:
+/// three ids a layer at top-k 1, owned [1, 2], take 8/3 B a token, two thirds
+/// of a 4 B row, and node 0's prompt share is 4/7, past the line. The decode
+/// line reads the exact step: the same split of ids of 666,666,664 B read at
+/// 10¹⁰ B/s, a NIC of 16 B/s and λ 2,000 ps take a step of
+/// 333,333,333,333⅓ ps, twice node 0's NIC time of 166,666,666,666⅔ ps, so
+/// on the line. Paged, each window's read and fill round down once, together:
+/// forty ids of 649,500,000 B at top-k 1 read at 10¹⁹ B/s on two nodes of one
+/// id's room each, at a hit rate of 999 ‰ and a miss's fill of 1,000 ps, split
+/// [20, 20], take a step of 325.7 ps that reads 324 ps (a read of 64.95 ps and a
+/// fill of 19/20 ps a window). A row of 647 values at 8 × 10¹² B/s gives node 0
+/// a NIC time of 161.75 ps, half of 323.5 ps, 2.2 ps under the step and so past
+/// the 2 ps a one-layer step can read low: no node is named.
 #[test]
 fn nic_not_max() {
     for rate in PROMPT_RATES {
@@ -955,9 +1354,7 @@ fn nic_not_max() {
                 }
                 None => assert!(busiest <= 500, "{cell:?}: {:?}", p.per_node),
             }
-            let below =
-                cell.0 == "V4.1" && cell.1 == 2 && cell.2 == 70 || cell == ("V4.1", 2, 25, true);
-            if rate == 3_000 && cell.1 >= 2 && cell.0 != "Qwen3.8" && !below {
+            if derived_at(cell, RULER, rate).fires {
                 expected.push(cell);
             }
         });
@@ -995,6 +1392,27 @@ fn nic_not_max() {
         p.per_node[0].nic_permille
     );
     assert_eq!(plan.nic_bound().expect("a prediction"), None);
+    let (_, den) = nic_prompt(shape, plan.owned(), 1);
+    let s1 = u64::try_from(den).expect("an S₁");
+    let (num, _) = nic_prompt(shape, plan.owned(), s1);
+    let line = u64::try_from(2 * num / den).expect("a NIC rate");
+    let at = |nic: u64| {
+        let mut nodes = spark_nodes(2, shape.layers, fabric(2, LAMBDAS[0]));
+        nodes.nic = nic;
+        let budgets = budgets_on(&model, &mut nodes, &machines);
+        let whole = Workload {
+            prompt_rate: s1,
+            ..whole
+        };
+        let plan = plan_nodes(&nodes, &terms, &budgets, whole).expect("two Sparks");
+        let bound = plan.nic_bound().expect("a prediction");
+        (
+            plan.predict().expect("a prediction").per_node[0].nic_permille,
+            bound.map(|b| b.node),
+        )
+    };
+    assert_eq!(at(line), (500, None), "a NIC at exactly half");
+    assert_eq!(at(line - 1), (500, Some(0)), "a NIC just past half");
     let id = 1_000_000_000;
     let model = tiny(3, 1, id);
     let link = LinkCost { round_trip_ns: 0 };
@@ -1071,7 +1489,8 @@ fn nic_not_max() {
 /// slot, and their posts take at most 2 % of the layer. Also where k is
 /// under N − 1: one expert a token of seven, two ids a pool, on four Sparks
 /// the pools all need, where a token's handoff goes only to the node its
-/// slot lands on, and the step and node 0's NIC are that rule's.
+/// slot lands on, and the step and node 0's NIC are that rule's. In every
+/// cell node 0's count is the derived cell's.
 #[test]
 fn messages_o_n() {
     let check = |cell: Cell, plan: &NodePlan<'_>| {
@@ -1090,7 +1509,15 @@ fn messages_o_n() {
             "{cell:?}: {busiest} messages a layer"
         );
     };
-    each_cell(RULER, 3_000, check);
+    each_cell(RULER, PROMPT_RATES[1], |cell, plan| {
+        check(cell, plan);
+        let p = plan.predict().expect("a prediction");
+        assert_eq!(
+            p.per_node[0].msgs_per_layer,
+            derived_at(cell, RULER, PROMPT_RATES[1]).msgs,
+            "{cell:?}: node 0's messages"
+        );
+    });
     let shape = Shape {
         name: "k1",
         experts: 7,
@@ -1130,16 +1557,16 @@ fn messages_o_n() {
     );
 }
 
-/// Clause 7, `never_slower`: a node is named idle for its gain exactly in
-/// §9.8's criterion 7 cells but Qwen3.8 at N = 4, λ 70, A low, where
-/// criterion 2 names it first, and no chosen plan is slower than the N − 1
-/// plan on the same link: a pair for a ring of three, three switched Sparks
-/// for four. The ruler is read from the machine: on one whose ruler is 4 %,
-/// Qwen3.8 names node 1 idle at N = 2 where it gains under 8 %, at λ 70.
-/// The gain is read on the exact steps: three ids of 5,000 B at top-k 2
-/// read at 10¹² B/s take 30,000 ps on one node and 27,777⁷⁄₉ ps on two, a
-/// gain of 7.4 %, under a ruler of 5 % twice, and read at 10¹⁴ B/s 300 and
-/// 277⁷⁄₉ ps, a gain of 7.41 %, under a ruler of 3.8 % twice.
+/// Clause 7, `never_slower`: no chosen plan is slower than the N − 1 plan on
+/// the same link: a pair for a ring of three, three switched Sparks for four.
+/// [`expected_sets`] holds the nodes named idle for their gain to the derived
+/// cells where criterion 7 fires. The ruler is read from the machine: on one
+/// whose ruler is 4 %, Qwen3.8 names node 1 idle at N = 2 where it gains
+/// under 8 %, at λ 70, and at `RULER` it does not. The gain is read on the
+/// exact steps: three ids of 5,000 B at top-k 2 read at 10¹² B/s take
+/// 30,000 ps on one node and 27,777⁷⁄₉ ps on two, a gain of 7.4 %, under a
+/// ruler of 5 % twice, and read at 10¹⁴ B/s 300 and 277⁷⁄₉ ps, a gain of
+/// 7.41 %, under a ruler of 3.8 % twice.
 #[test]
 fn never_slower() {
     let gain = |plan: &NodePlan<'_>| {
@@ -1150,7 +1577,7 @@ fn never_slower() {
     let mut fired = Vec::new();
     let mut slower = Vec::new();
     each_cell(RULER, 3_000, |cell, plan| {
-        if gain(plan) {
+        if cell.0 == "Qwen3.8" && cell.1 == 2 && gain(plan) {
             fired.push(cell);
         }
         let (_, n, lambda, _) = cell;
@@ -1172,15 +1599,7 @@ fn never_slower() {
         }
     });
     let qwen = |n, lambda, high| ("Qwen3.8", n, lambda, high);
-    assert_eq!(
-        fired,
-        vec![
-            qwen(4, 25, false),
-            qwen(4, 25, true),
-            qwen(3, 70, true),
-            qwen(4, 70, true),
-        ]
-    );
+    assert_eq!(fired, vec![]);
     assert_eq!(slower, vec![]);
     let mut wide = Vec::new();
     each_cell(4 * RULER, 3_000, |cell, plan| {
