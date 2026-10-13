@@ -949,7 +949,7 @@ fn strict_tensors(
                 blck,
             });
         }
-        let nbytes = sized(&t.name, ty, blck, tsz, &t.dims)?;
+        let nbytes = tsz * (t.dims[0] / blck) * t.dims[1..].iter().product::<u64>();
         strict.push(TensorInfo {
             name: t.name,
             dims: t.dims,
