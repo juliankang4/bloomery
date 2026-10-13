@@ -581,16 +581,18 @@ impl TableBytes<'_> {
     }
 
     /// Row `id`'s bytes; refused by name past the table, so a wrong id never
-    /// slices into the next tensor.
+    /// slices into the next tensor. The id is checked before its offset is
+    /// computed, so a product that wraps cannot land on another row.
     fn row(&self, id: u32) -> Result<&[u8], EngramError> {
-        let at = id as usize * self.row_bytes;
-        self.bytes
-            .get(at..at + self.row_bytes)
-            .ok_or_else(|| EngramError::RowOutOfRange {
+        if u64::from(id) >= self.rows() {
+            return Err(EngramError::RowOutOfRange {
                 name: self.name.to_owned(),
                 id,
                 rows: self.rows(),
-            })
+            });
+        }
+        let at = id as usize * self.row_bytes;
+        Ok(&self.bytes[at..at + self.row_bytes])
     }
 
     /// The whole pages that hold row `id`: the row's start rounded down to a
