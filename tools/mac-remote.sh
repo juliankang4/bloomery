@@ -797,13 +797,19 @@ remote_main() {
   return "$ssh_rc"
 }
 
-# fake_remote HOME CHANNEL: a remote home that passes the preflight, its tools stubs: just prints its arguments to
-# just.args, appends a green ledger line under its directory's name and exits $STUB_JUST_RC.
+# fake_remote HOME CHANNEL: a remote home that passes the preflight, its tools stubs: uname answers Darwin and the Mac
+# arch its toolchain is built for, just prints its arguments to just.args, appends a green ledger line under its
+# directory's name and exits $STUB_JUST_RC.
 fake_remote() {
-  local rh=$1 ch=$2 h t
-  case $(uname -m) in arm64) h=aarch64-apple-darwin ;; *) h=x86_64-apple-darwin ;; esac
+  local rh=$1 ch=$2 h m t
+  case $(uname -m) in
+    arm64) h=aarch64-apple-darwin; m=arm64 ;;
+    *) h=x86_64-apple-darwin; m=x86_64 ;;
+  esac
   mkdir -p "$rh/.rustup/toolchains/$ch-$h/bin" "$rh/.rustup/toolchains/$ch-$h/lib/rustlib/x86_64-unknown-linux-gnu/lib" \
     "$rh/opt/bloomery-bin" "$rh/opt/cuda/include" "$rh/opt/clang" "$rh/opt/sr/usr/include"
+  printf '#!/bin/sh\ncase $1 in -s) echo Darwin ;; -m) echo %s ;; *) /usr/bin/env -i PATH=/usr/bin:/bin uname "$@" ;; esac\n' "$m" > "$rh/opt/bloomery-bin/uname"
+  chmod +x "$rh/opt/bloomery-bin/uname"
   for t in cargo rustc cargo-clippy clippy-driver cargo-fmt rustfmt; do
     printf '#!/bin/sh\nexit 0\n' > "$rh/.rustup/toolchains/$ch-$h/bin/$t"
     chmod +x "$rh/.rustup/toolchains/$ch-$h/bin/$t"
@@ -888,10 +894,9 @@ self_test() {
   if command -v setsid > /dev/null; then
     local lr=$d/lockrem lb
     fake_remote "$lr" nightly-x
-    printf '#!/bin/sh\ncase $1 in -s) echo Darwin ;; *) /usr/bin/env -i PATH=/usr/bin:/bin uname "$@" ;; esac\n' > "$lr/opt/bloomery-bin/uname"
     printf '#!/bin/bash\nwhile [ "${1:-}" != "" ] && [ "${1#-}" != "$1" ]; do [ "$1" = -t ] && shift; shift; done\nshift\nexec "$@"\n' > "$lr/opt/bloomery-bin/lockf"
     printf '#!/bin/sh\n[ "$1" != --version ] || { echo "just 9.9.9"; exit 0; }\necho $$ > "$HOME/just.pid"\nsleep 30\n' > "$lr/opt/bloomery-bin/just"
-    chmod +x "$lr/opt/bloomery-bin/uname" "$lr/opt/bloomery-bin/lockf" "$lr/opt/bloomery-bin/just"
+    chmod +x "$lr/opt/bloomery-bin/lockf" "$lr/opt/bloomery-bin/just"
     lb=$lr/$RBASE
     mkdir -p "$lb/.lock-tdead" "$lb/.lock-tlive"
     echo "gone/1" > "$lb/.lock-tdead/owner"; echo $(( $(date +%s) - 900 )) > "$lb/.lock-tdead/heartbeat"
