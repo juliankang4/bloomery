@@ -809,7 +809,8 @@ impl KvBytes for NextnKv {
 pub struct NextnPlan<'a> {
     /// The target's plan: [`PlanInputs::plan`]'s expert rule within the
     /// card's budget less the NextN layer's card bytes and arena, so the sum
-    /// fits; its totals are the target's alone.
+    /// fits; its totals are the target's alone. Its host headroom leaves the
+    /// NextN layer's routed experts in, for the load to take out beside it.
     pub plan: Plan<'a>,
     /// The NextN layer's plan on [`NextnInputs::machine`]: its tensors but
     /// the routed stacks on its card, the routed stacks every expert on the
@@ -982,17 +983,17 @@ impl PlanInputs {
             ))
         })?;
         placement::expert_nvme_tier(&mut plan, room, self.arena)?;
+        // A split plan's headroom is what the room it ran at left, a room
+        // short of the draft's experts. An unsplit plan's headroom never took
+        // them out; the split one's gets them back, so the load, which hosts
+        // them beside the plan, takes them out once.
+        if plan.host.nvme_expert_bytes > 0 {
+            plan.host.headroom_bytes += i128::from(draft_host);
+        }
         let total = card_terms(&plan.cards[0]) + nextn_card + arena;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
-        // A split plan's headroom is what the room it ran at left, and that
-        // room lost the draft's experts already; an unsplit plan's is the
-        // machine's figure or a stated room's, which have not.
-        let host_headroom = if plan.host.nvme_expert_bytes > 0 {
-            plan.host.headroom_bytes
-        } else {
-            plan.host.headroom_bytes - i128::from(draft_host)
-        };
+        let host_headroom = plan.host.headroom_bytes - i128::from(draft_host);
         // On a unified machine the pool holds the draft and the front beside
         // the target's own terms.
         let mut broken: Vec<Violation> = plan
@@ -1480,7 +1481,8 @@ mod tests {
             DenseForms, KdaLanes, Kind, KvLayout, NextnInputs, NextnKv, PlaceError, PlanInputs,
             card_leg_bytes, card_leg_needed, card_routed, prompt_reserve_bytes, row_bytes,
         };
-        use crate::placement::workstation::HostRead;
+        use crate::placement::churn::ChurnPool;
+        use crate::placement::workstation::{HostNeed, HostRead};
         use crate::placement::{
             Card, Host, Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role, UnifiedPool,
             Violation,
@@ -1863,6 +1865,66 @@ mod tests {
                     },
                     beside,
                 );
+            }
+        }
+
+        /// [`inputs`] at `room` as given, with Q4_K routed stacks (gate, up
+        /// and down, 1,024 rows of 4,096 an expert) on every trunk layer.
+        fn routed(room: u64) -> PlanInputs {
+            let mut i = inputs();
+            for l in 0..LAYERS {
+                for (stem, dims) in [
+                    ("ffn_gate_exps", [4096, 1024, 288]),
+                    ("ffn_up_exps", [4096, 1024, 288]),
+                    ("ffn_down_exps", [1024, 4096, 288]),
+                ] {
+                    i.model.tensors.push(ModelTensor {
+                        name: format!("blk.{l}.{stem}.weight"),
+                        shard: 0,
+                        layer: Some(l),
+                        role: Role::RoutedExperts,
+                        ty: GgmlType::Q4_K,
+                        file_bytes: dims.iter().product::<u64>() / 256 * 144,
+                        dims: dims.to_vec(),
+                        gathered_rows: None,
+                    });
+                }
+            }
+            i.room = (room, HostRead::Given);
+            i
+        }
+
+        /// The load hosts the next-token layer's routed experts beside the
+        /// plan and takes them out of its host headroom once
+        /// (`ChurnPool::check_beside`, a pool of 0 B): what is left, and the
+        /// plan's `host_headroom_bytes`, are the room less the host need with
+        /// them, whether the trunk's experts fit an ample room or split through
+        /// the NVMe tier at one byte under that need (mutants: a split plan's
+        /// headroom short of the draft's experts, or given them back twice;
+        /// an unsplit plan's given them again).
+        #[test]
+        fn a_nextn_plan_leaves_the_draft_experts_in_its_host_headroom() {
+            let (m, nextn) = (machine(LAYERS), nextn());
+            let levers = PlanLevers {
+                card_budget_bytes: Some(1 << 30),
+            };
+            let ample = routed(u64::MAX);
+            let whole = ample
+                .plan_nextn_slots(&m, CTX, &levers, &nextn, 1)
+                .expect("the plan at an ample room");
+            let short = HostNeed::of(&whole.plan, whole.nextn.host.expert_bytes).bytes() - 1;
+            for (room, split) in [(u64::MAX, false), (short, true)] {
+                let i = routed(room);
+                let np = i
+                    .plan_nextn_slots(&m, CTX, &levers, &nextn, 1)
+                    .unwrap_or_else(|e| panic!("{room} B: {e}"));
+                assert_eq!(np.plan.host.nvme_expert_bytes > 0, split, "{room} B");
+                let (_, beside) = np.host_runs().expect("the draft's host runs");
+                let want = i128::from(room) - i128::from(HostNeed::of(&np.plan, beside).bytes());
+                let left = ChurnPool::of(&np.plan, 0, usize::MAX)
+                    .and_then(|pool| pool.check_beside(&np.plan, beside))
+                    .map_err(|e| e.to_string());
+                assert_eq!((np.host_headroom_bytes, left), (want, Ok(want)), "{room} B");
             }
         }
     }
