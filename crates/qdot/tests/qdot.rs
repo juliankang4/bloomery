@@ -4375,6 +4375,35 @@ fn hw_q3k_tile_matches_dot_row() {
 #[ignore = "hw: needs the box, the model file, the V4.1 shards and $BLOOMERY_DATA/ref"]
 fn hw_q4k_tile_matches_dot_row() {
     let ty = GgmlType::Q4_K;
+    // PIN(2026-10-14): synthetic tile fixtures consolidated here from
+    // hw_q4k_avx512_matches_avx2_synthetic; coverage retained.
+    let (block, _) = lane_block(ty);
+    for (k, rows, seed) in [
+        (256usize, 16usize, 0x5a12_0001u64),
+        (512, 16, 0x5a12_0005),
+        (768, 16, 0x5a12_0006),
+        (2048, 16, 0x5a12_0002),
+        (2304, 16, 0x5a12_0003),
+        (4096, 24, 0x5a12_0004),
+    ] {
+        let bytes = lane_rows(ty, k, rows, seed);
+        assert_tile_matches(
+            ty,
+            &format!("seeded rows (k = {k})"),
+            k,
+            k / 256 * block,
+            &bytes,
+            &lane_columns(ty, k),
+        );
+    }
+    assert_tile_matches(
+        ty,
+        "0xFF rows (k = 4096)",
+        4096,
+        16 * block,
+        &lane_fill(ty, 4096, 0xFF),
+        &lane_columns(ty, 4096),
+    );
     let g = gguf::Gguf::open(model_path()).unwrap();
     let w = g
         .iter_tensors()
@@ -5964,15 +5993,9 @@ fn hw_lanes_match_dot_row_synthetic() {
     }
 }
 
-/// Q4_K's two bodies on synthetic rows: seeded rows at k = 256, 2,048, 2,304
-/// and 4,096 and the 0xFF rows ([`lane_fill`]: every code 15, scales and mins
-/// 63) at 4,096, against [`lane_columns`]. `dot_row`, which runs the AVX-512
-/// VNNI body where [`qdot::q4k_avx512`] holds, equals `dot_row_avx2` and the
-/// scalar mirror per (row, column), bit for bit; then the tile and the row
-/// lanes, which take the same body, equal `dot_row` ([`assert_tile_matches`],
-/// [`assert_lanes_match`]). On a CPU without the ISA, or under
-/// `BLOOMERY_QDOT_AVX512=0`, every side is the AVX2 body and the line printed
-/// says so.
+/// Q4_K's selected one-column body equals its AVX2 body and scalar mirror
+/// bit for bit on seeded and full-code rows. Its row lanes equal dot_row.
+/// The printed line names the selected body.
 #[test]
 #[ignore = "hw: the box's CPU (AVX2; the AVX-512 VNNI bodies where it has them); reads no model file"]
 #[cfg(target_arch = "x86_64")]
@@ -6040,11 +6063,11 @@ fn hw_q4k_avx512_matches_avx2_synthetic() {
                 }
             }
         }
-        let tiles = assert_tile_matches(ty, label, k, row_bytes, bytes, &acols);
+        // PIN(2026-10-14): tile fixtures moved to hw_q4k_tile_matches_dot_row.
         let lanes = assert_lanes_match(ty, label, k, row_bytes, bytes, &acols);
         eprintln!(
             "Q4_K {body}: {label}, {} rows x {} columns: dot_row = dot_row_avx2 = scalar, \
-             {tiles} tile calls and {lanes} lane calls = dot_row, bit-identical",
+             {lanes} lane calls = dot_row, bit-identical",
             bytes.len() / row_bytes,
             acols.len()
         );
