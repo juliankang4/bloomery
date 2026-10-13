@@ -3696,7 +3696,9 @@ fn quantize_col_non_finite_panics_on_both_paths() {
 /// scales with F16C, the mirrors with `half_to_f32`, and the two converters must agree
 /// on every f16 but a NaN (whose payload F16C may quiet) — subnormal and extreme scales
 /// included, which real rows rarely carry. One block per type, the scale fields swept
-/// over all 65,536 bit patterns, the rest fixed pseudo-random bytes.
+/// over all 65,536 bit patterns, every second field with its sign flipped so a kernel
+/// that reads one field in another's place (Q4_K's `dmin` for `d`) differs, the rest
+/// fixed pseudo-random bytes.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn f16_scales_bit_identical_kernel_vs_mirror() {
@@ -3737,8 +3739,9 @@ fn f16_scales_bit_identical_kernel_vs_mirror() {
             if (h >> 10) & 0x1f == 0x1f && h & 0x3ff != 0 {
                 continue; // NaN: only the payload may differ
             }
-            for &f in fields {
-                row[f..f + 2].copy_from_slice(&h.to_le_bytes());
+            for (j, &f) in fields.iter().enumerate() {
+                let hj = h ^ ((j as u16 & 1) << 15);
+                row[f..f + 2].copy_from_slice(&hj.to_le_bytes());
             }
             let a = dot_row_avx2(w, &row, &acol, 256).unwrap();
             let b = dot_row_scalar(w, &row, &acol, 256).unwrap();

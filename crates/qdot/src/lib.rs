@@ -3704,6 +3704,31 @@ unsafe fn f16c_to_f32(h: u16) -> f32 {
     unsafe { _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(i32::from(h)))) }
 }
 
+/// Two adjacent little-endian f16s (a K-quant block's `d` and `dmin`) to f32
+/// through one 32-bit move and one `vcvtph2ps`. [`f16c_to_f32`] on each would
+/// insert each half with a `vpinsrw`, which merges into a register LLVM picks
+/// and so waits for that register's last write (in the row-lane pack, the
+/// previous row's mins).
+///
+/// # Safety
+/// F16C and SSE3 must be available on the target; being `#[inline(always)]`,
+/// it takes them from its caller's features.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn f16c_pair_to_f32(h: [u8; 4]) -> (f32, f32) {
+    // SAFETY: SSE2 present per contract; register-only, no memory is touched.
+    let halves = unsafe { _mm_cvtsi32_si128(i32::from_le_bytes(h)) };
+    // SAFETY: F16C present per contract; register-only, no memory is touched.
+    let v = unsafe { _mm_cvtph_ps(halves) };
+    // SAFETY: SSE3 present per contract; register-only, no memory is touched.
+    let high = unsafe { _mm_movehdup_ps(v) };
+    // SAFETY: SSE present per contract; register-only, no memory is touched.
+    let d = unsafe { _mm_cvtss_f32(v) };
+    // SAFETY: SSE present per contract; register-only, no memory is touched.
+    let dmin = unsafe { _mm_cvtss_f32(high) };
+    (d, dmin)
+}
+
 /// Horizontal f32 sum of an `__m256`. Reduction order is load-bearing.
 ///
 /// # Safety
@@ -3738,8 +3763,7 @@ unsafe fn dot_q4k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         for i in 0..nb {
             let wb = &wrow[i * Q4K_BLOCK..(i + 1) * Q4K_BLOCK];
 
-            let d = f16c_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
-            let dmin = f16c_to_f32(u16::from_le_bytes([wb[2], wb[3]]));
+            let (d, dmin) = f16c_pair_to_f32([wb[0], wb[1], wb[2], wb[3]]);
 
             let utmp = make_q4_scales(&wb[4..16]);
             // SAFETY: 8 readable bytes inside the local u32[4].
@@ -4453,8 +4477,7 @@ unsafe fn dot_q5k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         for i in 0..nb {
             let wb = &wrow[i * Q5K_BLOCK..(i + 1) * Q5K_BLOCK];
 
-            let d = f16c_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
-            let dmin = f16c_to_f32(u16::from_le_bytes([wb[2], wb[3]]));
+            let (d, dmin) = f16c_pair_to_f32([wb[0], wb[1], wb[2], wb[3]]);
 
             let utmp = make_q4_scales(&wb[4..16]);
             // SAFETY: 8 readable bytes inside the local u32[4].
@@ -4687,8 +4710,7 @@ unsafe fn dot_q45k_q82x4_tile_avx2<const C: usize, const Q5: bool>(
         for i in 0..nb {
             let wb = &wrow[i * block..(i + 1) * block];
 
-            let d = f16c_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
-            let dmin = f16c_to_f32(u16::from_le_bytes([wb[2], wb[3]]));
+            let (d, dmin) = f16c_pair_to_f32([wb[0], wb[1], wb[2], wb[3]]);
 
             let utmp = make_q4_scales(&wb[4..16]);
             // SAFETY: 8 readable bytes inside the local u32[4].
@@ -4987,8 +5009,7 @@ unsafe fn pack_lanes_avx2<const Q5: bool, const AHEAD: bool>(
             let mut mn = [_mm256_setzero_ps(); LANE_ROWS];
             for r in 0..LANE_ROWS {
                 let b = std::slice::from_raw_parts(wb[r], block);
-                let d = f16c_to_f32(u16::from_le_bytes([b[0], b[1]]));
-                let dmin = f16c_to_f32(u16::from_le_bytes([b[2], b[3]]));
+                let (d, dmin) = f16c_pair_to_f32([b[0], b[1], b[2], b[3]]);
                 let utmp = make_q4_scales(&b[4..16]);
                 // SAFETY: 8 readable bytes inside the local u32[4], twice.
                 sc[r] = _mm256_mul_ps(
