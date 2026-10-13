@@ -4378,14 +4378,7 @@ fn hw_q4k_tile_matches_dot_row() {
     // PIN(2026-10-14): synthetic tile fixtures consolidated here from
     // hw_q4k_avx512_matches_avx2_synthetic; coverage retained.
     let (block, _) = lane_block(ty);
-    for (k, rows, seed) in [
-        (256usize, 16usize, 0x5a12_0001u64),
-        (512, 16, 0x5a12_0005),
-        (768, 16, 0x5a12_0006),
-        (2048, 16, 0x5a12_0002),
-        (2304, 16, 0x5a12_0003),
-        (4096, 24, 0x5a12_0004),
-    ] {
+    for (k, rows, seed) in Q4K_SYNTHETIC_ROWS {
         let bytes = lane_rows(ty, k, rows, seed);
         assert_tile_matches(
             ty,
@@ -5755,6 +5748,20 @@ fn q3k_r8_unpack_refuses_bad_shapes() {
 // sub-block, the same f32 products, the same fused adds per (row, column)
 // lane and the same lane sum — so any differing value is a bug.
 
+/// Q4_K's synthetic row sets, `(k, rows, seed)` for [`lane_rows`]: one, two
+/// and three super-blocks, two and four whole chunks, and two chunks with a
+/// one-super-block tail. The tile clause ([`hw_q4k_tile_matches_dot_row`])
+/// and the AVX-512 clause ([`hw_q4k_avx512_matches_avx2_synthetic`]) both
+/// read it.
+const Q4K_SYNTHETIC_ROWS: [(usize, usize, u64); 6] = [
+    (256, 16, 0x5a12_0001),
+    (512, 16, 0x5a12_0005),
+    (768, 16, 0x5a12_0006),
+    (2048, 16, 0x5a12_0002),
+    (2304, 16, 0x5a12_0003),
+    (4096, 24, 0x5a12_0004),
+];
+
 /// Bytes of one super-block of a row-lane type, and where its f16 scales
 /// sit: Q4_K and Q5_K's `d` and `dmin` at 0 and 2, Q6_K's `d` at 208.
 fn lane_block(ty: GgmlType) -> (usize, &'static [usize]) {
@@ -5993,6 +6000,45 @@ fn hw_lanes_match_dot_row_synthetic() {
     }
 }
 
+/// `dot_row` on a Q4_K row refuses a `BLOOMERY_QDOT_AVX512` value other than
+/// `0` or `1` by name on every architecture and CPU, before it picks a body:
+/// the test reruns itself in a fresh process with the lever at `2`, since
+/// [`qdot::q4k_avx512`] reads it once a process.
+#[test]
+fn dot_row_refuses_a_qdot_lever_value_by_name() {
+    // The fresh process's own argument: a filter no test's name is.
+    const FRESH: &str = "a-fresh-process-for-the-qdot-lever";
+    if !std::env::args().any(|a| a == FRESH) {
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "dot_row_refuses_a_qdot_lever_value_by_name",
+                FRESH,
+            ])
+            .env("BLOOMERY_QDOT_AVX512", "2")
+            .output()
+            .expect("the fresh process");
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "the fresh process: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let ty = GgmlType::Q4_K;
+    let row = lane_rows(ty, 256, 1, 0x5a12_0001);
+    let col = &lane_columns(ty, 256)[0];
+    let dot = std::panic::catch_unwind(|| qdot::dot_row(ty, &row, col, 256));
+    let e = dot.expect_err("a refused lever value must stop dot_row");
+    let e = e.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        e.contains("BLOOMERY_QDOT_AVX512=\"2\""),
+        "the refusal names the lever, got {e:?}"
+    );
+    println!("refusal: {e}");
+}
+
 /// Q4_K's selected one-column body equals its AVX2 body and scalar mirror
 /// bit for bit on seeded and full-code rows. Its row lanes equal dot_row.
 /// The printed line names the selected body.
@@ -6020,23 +6066,16 @@ fn hw_q4k_avx512_matches_avx2_synthetic() {
         "AVX2 (no AVX-512 VNNI body on this CPU or under BLOOMERY_QDOT_AVX512=0)"
     };
     let (block, _) = lane_block(ty);
-    let mut sets: Vec<(String, usize, Vec<u8>)> = [
-        (256usize, 16usize, 0x5a12_0001u64),
-        (512, 16, 0x5a12_0005),
-        (768, 16, 0x5a12_0006),
-        (2048, 16, 0x5a12_0002),
-        (2304, 16, 0x5a12_0003),
-        (4096, 24, 0x5a12_0004),
-    ]
-    .iter()
-    .map(|&(k, rows, seed)| {
-        (
-            format!("seeded rows (k = {k})"),
-            k,
-            lane_rows(ty, k, rows, seed),
-        )
-    })
-    .collect();
+    let mut sets: Vec<(String, usize, Vec<u8>)> = Q4K_SYNTHETIC_ROWS
+        .iter()
+        .map(|&(k, rows, seed)| {
+            (
+                format!("seeded rows (k = {k})"),
+                k,
+                lane_rows(ty, k, rows, seed),
+            )
+        })
+        .collect();
     sets.push((
         "0xFF rows (k = 4096)".into(),
         4096,
