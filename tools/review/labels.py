@@ -6,13 +6,15 @@
 
 A pull request's area labels come from the paths it changes, never from its tree: an open one's `pulls/<n>/files`, a
 merged one's merge commit against its first parent (a closed pull request's file list runs from a base that may be
-stale, so it can hold a whole stack). A pull request closed unmerged is skipped. An issue's area labels come from the
-prefix of its title (`serve: …`, `tools, model: …`): each comma-separated word is a crate directory (CRATE_AREA), an
-alias (ALIASES) or a path (path_labels). A prefix that names a concept rather than a place (`paged`, `MTP`, `prefill`)
-gets no area. A crate CRATE_AREA lacks is `gpu` when its name starts with `gpu-` or it reaches cuda-core, else it gets
-no area and the output names it. `dgx-spark` and `measure` come from the title of either, and `dgx-spark` also from
-SPARK_PATHS; `bug` and `hardware` from an issue title in its template's form. `new-model` is the template's alone: a
-`model:` title cannot tell a new architecture from work on crates/model. `tracking` is defined and set by a person.
+stale, so it can hold a whole stack). A merge only adds labels: a rebase merge has no merge commit, so its diff is its
+last commit's and can leave out what the earlier ones changed. A pull request closed unmerged is skipped. An issue's
+area labels come from the prefix of its title (`serve: …`, `tools, model: …`): each comma-separated word is a crate
+directory (CRATE_AREA), an alias (ALIASES) or a path (path_labels). A prefix that names a concept rather than a place
+(`paged`, `MTP`, `prefill`) gets no area. A crate CRATE_AREA lacks is `gpu` when its name starts with `gpu-` or it
+reaches cuda-core, else it gets no area and the output names it. `dgx-spark` and `measure` come from the title of
+either, and `dgx-spark` also from SPARK_PATHS; `bug` and `hardware` from an issue title in its template's form.
+`new-model` is the template's alone: a `model:` title cannot tell a new architecture from work on crates/model.
+`tracking` is defined and set by a person.
 
 The card label follows Shingler (tools/review/post.py) on an open pull request whose file list is complete and whose
 device crates are known (post.py device_dirs, tools/recipes.py pure-crates on the trusted tree). One that changes a
@@ -237,7 +239,7 @@ def run(repo, token, number=None, state="open", root=ROOT, dry=False, call=api, 
         want, unmapped = wanted(it["title"], paths, is_pr, dirs or ())
         have = [x["name"] for x in it.get("labels", [])]
         add, remove, kept = decide(have, want, events, card if it["state"] == "open" else None)
-        remove = [] if short else remove
+        remove = [] if short or kind == "merged" else remove
         if (add or remove) and not dry:
             if wrote:
                 time.sleep(PAUSE)
@@ -359,7 +361,7 @@ def self_test():
             ({"title": "x", "pr": pr(), "files": [{"filename": "tools/a.sh"}]}, None, {"tools"}),
             ({"title": "x", "pr": pr(n=2), "files": [gpu_file]}, None, {"gpu"} | stale),  # a short file list
             ({"title": "x", "pr": pr("closed", merged=True), "files": [gpu_file], "merged": [{"filename": "tools/a"}]},
-             None, {"tools", "needs-gpu"}),
+             None, {"tools"} | stale),
             ({"title": "x", "pr": pr("closed"), "files": [gpu_file]}, None, stale)):
         s.update(labels=set(stale) if s["pr"] else set(), events=[ev("labeled", x, BOT) for x in stale])
         run("o/r", "t", None, "all", call=github(s), dirs=dirs if dirs is not None else ["crates/gpu/"])
