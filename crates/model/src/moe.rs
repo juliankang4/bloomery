@@ -3110,6 +3110,51 @@ mod tests {
         }
     }
 
+    /// A `BLOOMERY_QDOT_AVX512` value qdot refuses stops the host tier's load:
+    /// in a fresh process with the lever at `2`, building a Q4_K layer panics
+    /// naming the lever ([`qdot::q4k_avx512`], which [`ops::host_stack_runs`]
+    /// asks for every Q4_K stack), before any call. The lever is read before
+    /// the CPU's features, so a CPU without AVX-512 refuses it too.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn host_layer_build_refuses_a_qdot_lever_value_by_name() {
+        // The fresh process's own argument: a filter no test's name is.
+        const FRESH: &str = "a-fresh-process-for-the-qdot-lever";
+        if !std::env::args().any(|a| a == FRESH) {
+            let (_, tests) = module_path!().split_once("::").expect("a crate path");
+            let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args([
+                    "--exact",
+                    &format!("{tests}::host_layer_build_refuses_a_qdot_lever_value_by_name"),
+                    FRESH,
+                ])
+                .env("BLOOMERY_QDOT_AVX512", "2")
+                .output()
+                .expect("the fresh process");
+            assert!(
+                out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+                "the fresh process: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let (embd, ff, n_expert) = (256, 256, 2);
+        let path = layer_file("qdot-lever", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_layer(&split, embd, ff, n_expert).map(drop)
+        }));
+        std::fs::remove_file(&path).unwrap();
+        let e = built.expect_err("a refused lever value must stop the build");
+        let e = e.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            e.contains("BLOOMERY_QDOT_AVX512=\"2\""),
+            "the refusal names the lever, got {e:?}"
+        );
+        println!("refusal: {e}");
+    }
+
     /// A union call whose up reads other bytes than its gate — a Q3_K gate
     /// (q8_K columns) and a Q4_K up (q8_2_x4) — writes, column for column and
     /// bit for bit, what the one-column call writes, in both of its forms: a
