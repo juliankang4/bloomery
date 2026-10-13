@@ -4681,6 +4681,312 @@ mod tests {
         devmap_rounds(true);
     }
 
+    /// The arena entries over a pinned tier's slot that each round refills
+    /// in place with another expert, through the tier's own fill (`O_DIRECT`
+    /// and through the page cache): right after each refill, the Q4_K
+    /// gate·up and Q5_K down arena entries, eager and from a graph captured
+    /// in the first round, read the slot through its pin's addresses and
+    /// write that round's expert's rows, the stack `_sel` launches' over the
+    /// same bytes bit for bit and never the round before's. The parts are a
+    /// few hundred KiB, so a line of the expert before can still sit in the
+    /// card's cache when the refill lands; nothing else reads the arena in
+    /// between.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_refilled_pinned_slot_reads_as_its_new_expert_in_the_arena_entries() {
+        use super::{ArenaKind, NvTier};
+        use crate::Gpu;
+        use crate::card_leg::tests::{stack_bytes, words_of};
+        use crate::graph::Graph;
+        use crate::kquant::{
+            Act, GateUpAct, GateUpAt, KquantKernels, PART_DOWN, PART_GATE, PART_UP, SelDown,
+            SelDownAt,
+        };
+        use crate::q4k_sel::QuantSel;
+        use crate::tensor::{DeviceTensor, Q8Act, window};
+        use cuda_core::DeviceBuffer;
+        use engram::direct::DirectFile;
+        use gguf::write::{Layout, TensorDecl, Writer};
+        use gguf::{GgmlType, Split};
+        use model::placement::workstation::ArenaGrant;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering::Relaxed;
+        const PAGE: usize = DIRECT_ALIGN;
+        const LAYER: usize = 1;
+        const ID: u32 = 7;
+        const ROUNDS: usize = 4;
+        // The model width and the routed width: two and one super-blocks.
+        const N: usize = 512;
+        const FF: usize = 256;
+        // Per part (gate, up, down): its type, rows and k.
+        const ROLES: [(GgmlType, usize, usize); PARTS] = [
+            (GgmlType::Q4_K, FF, N),
+            (GgmlType::Q4_K, FF, N),
+            (GgmlType::Q5_K, N, FF),
+        ];
+        // Each part's first byte in its file: on a word, off the page.
+        const AT: [usize; PARTS] = [1248, PAGE + 36, 2 * PAGE + 4000];
+        let expert = |round: usize, p: usize| {
+            stack_bytes(
+                ROLES[p].0,
+                ROLES[p].1,
+                ROLES[p].2,
+                (round * PARTS + p) as u64 + 0x5eed,
+            )
+        };
+        let len: [usize; PARTS] = std::array::from_fn(|p| expert(0, p).len());
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let (stream, ctx) = (gpu.stream(), gpu.context());
+        let kq = KquantKernels::load(ctx, gpu.fault_word()).expect("the kquant module");
+        let sink = gpu.layer_sink(0).expect("a sink");
+        let rule = Act::SwigluClamp { limit: 0.25 };
+        let normed: Vec<f32> = (0..N)
+            .map(|i| ((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let normed = DeviceBuffer::from_host(stream, &normed).expect("the normed row");
+        let mut act_x = Q8Act::with_tier_cols(stream, 1, N).expect("act_x");
+        gpu.enqueue_quantize_q8_1_cols(&normed, &mut act_x, 1, 0)
+            .expect("q8_1");
+        let one = DeviceBuffer::from_host(stream, &[0u32]).expect("the place");
+
+        // The reference: the rounds' experts as stacks, round r's at id r.
+        let stacks: Vec<DeviceTensor<u32>> = (0..PARTS)
+            .map(|p| {
+                let rows = ROUNDS * ROLES[p].1;
+                let bytes: Vec<u8> = (0..ROUNDS).flat_map(|r| expert(r, p)).collect();
+                let words = words_of(&bytes, rows);
+                let n = words.len();
+                DeviceTensor::upload(stream, &words, rows, n / rows).expect("a stack")
+            })
+            .collect();
+        let want: Vec<(Vec<f32>, Vec<f32>)> = (0..ROUNDS)
+            .map(|r| {
+                let sel = DeviceBuffer::from_host(stream, &[r as u32]).expect("the id");
+                let mut h = DeviceBuffer::<f32>::zeroed(stream, FF).expect("h");
+                let mut act_h = Q8Act::with_slots(stream, 1, FF).expect("act_h");
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, N).expect("y");
+                let a = GateUpAct {
+                    wg: &stacks[PART_GATE],
+                    wu: &stacks[PART_UP],
+                    act: &act_x,
+                    sel: &sel,
+                    n_slots: 1,
+                    rows_per_expert: FF,
+                    slots_per_col: 1,
+                    rule,
+                };
+                kq.enqueue_gate_up_q4k(stream, &a, sink, &mut h)
+                    .expect("the stack gate·up");
+                let q = QuantSel {
+                    x: &h,
+                    cols: 0..1,
+                    sel: &one,
+                    n_card: 1,
+                };
+                gpu.q4k_sel()
+                    .enqueue_quantize_sel(stream, &q, sink, &mut act_h)
+                    .expect("the quantizer");
+                let d = SelDown {
+                    w: &stacks[PART_DOWN],
+                    act: &act_h,
+                    sel: &sel,
+                    n_slots: 1,
+                    rows_per_expert: N,
+                };
+                kq.enqueue_gemv_q5k_sel(stream, &d, sink, &mut y)
+                    .expect("the stack down");
+                (
+                    h.to_host_vec(stream).expect("h"),
+                    y.to_host_vec(stream).expect("y"),
+                )
+            })
+            .collect();
+        for r in 1..ROUNDS {
+            assert_ne!(
+                want[r],
+                want[r - 1],
+                "rounds {} and {r} have the same rows",
+                r - 1
+            );
+        }
+
+        // The tier: two paged layers, each part its own file at AT, each
+        // window the part's aligned span.
+        let mut windows = [0usize; PARTS];
+        let mut slot_bytes = 0;
+        for p in 0..PARTS {
+            windows[p] = slot_bytes;
+            slot_bytes += engram::direct::aligned_span(AT[p] as u64, len[p] as u64).1;
+        }
+        for direct in [false, true] {
+            let tag = if direct { "refill-direct" } else { "refill" };
+            let scratch = Scratch::new(tag);
+            let paths: [_; PARTS] = std::array::from_fn(|p| scratch.0.join(format!("part{p}")));
+            let model = scratch.0.join("model.gguf");
+            let decl = TensorDecl {
+                name: "x".into(),
+                dims: vec![4],
+                type_id: 0,
+                nbytes: 16,
+            };
+            let layout = Layout::new(&[], vec![decl]).unwrap();
+            let mut w = Writer::new(std::fs::File::create(&model).unwrap(), layout).unwrap();
+            w.tensor("x", &[0; 16]).unwrap();
+            w.finish().unwrap();
+            let split = Arc::new(Split::open(&model).unwrap());
+            let layer = || {
+                let mut arena = arena_of(8, 0);
+                arena.windows = windows;
+                arena.slot_bytes = slot_bytes;
+                arena.parts = vec![
+                    std::array::from_fn(|p| PartRange {
+                        at: AT[p] as u64,
+                        len: len[p],
+                        skew: AT[p] % PAGE,
+                    });
+                    8
+                ];
+                arena.part_of.set([0, 1, 2]).unwrap();
+                Some(arena)
+            };
+            let pinned = ArenaKind::of(ctx, bloomery_levers::NvTierMem::Pinned).unwrap();
+            let slots = [slot_bytes; 2];
+            let grant = ArenaGrant::whole((2 * slots.iter().sum::<usize>()) as u64);
+            let mut tier =
+                NvTier::carve(vec![layer(), layer()], &slots, 2, grant, 0, &split, pinned)
+                    .expect("the tier's carve");
+            let dev0 = tier
+                .mem
+                .device_start()
+                .expect("a pinned arena's card address");
+            // SAFETY: the tier's whole mapping, live until `tier` drops after
+            // the window and every launch that read it.
+            let arena = unsafe { window::<u32>(dev0, tier.mem.len() / 4, ctx) };
+            let mut offs = DeviceBuffer::<u64>::zeroed(stream, PARTS).expect("the table");
+            let mut h = DeviceBuffer::<f32>::zeroed(stream, FF).expect("h");
+            let mut act_h = Q8Act::with_slots(stream, 1, FF).expect("act_h");
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, N).expect("y");
+            let mut graph: Option<Graph> = None;
+            let mut table: Option<Vec<u64>> = None;
+            for round in 0..ROUNDS {
+                let case = format!("{tag} round {round}");
+                for (p, path) in paths.iter().enumerate() {
+                    let mut file = vec![0xA5u8; AT[p]];
+                    file.extend(expert(round, p));
+                    file.resize(file.len().next_multiple_of(PAGE), 0x5A);
+                    std::fs::write(path, file).unwrap();
+                }
+                let arena_l = tier.by_layer[LAYER].as_mut().unwrap();
+                arena_l.files = std::array::from_fn(|p| {
+                    Arc::new(if direct {
+                        DirectFile::open(&paths[p]).expect("a disk-backed file opens O_DIRECT")
+                    } else {
+                        DirectFile::open_buffered(&paths[p]).unwrap()
+                    })
+                });
+                let pick = super::Pick {
+                    slot: 1,
+                    id: ID,
+                    gone: None,
+                };
+                super::read_pick(&tier.mem, &super::read_of(arena_l, &pick))
+                    .unwrap_or_else(|e| panic!("{case}: the slot's fill: {e}"));
+                arena_l.of_id[ID as usize].store(2, Relaxed);
+                arena_l.slots[1].state.store(FILLED, Relaxed);
+                let pin = tier.pin(LAYER, &[ID]).unwrap();
+                let t: Vec<u64> = (0..PARTS)
+                    .map(|p| {
+                        let at = pin.device_slot(ID, p).expect("a pinned slot's address") - dev0;
+                        assert_eq!(at % 4, 0, "{case}: part {p} starts off a word");
+                        at / 4
+                    })
+                    .collect();
+                if let Some(t0) = &table {
+                    assert_eq!(&t, t0, "{case}: the slot moved");
+                } else {
+                    offs.copy_from_host(stream, &t).expect("the table");
+                    table = Some(t);
+                }
+                let run = |s: &cuda_core::CudaStream,
+                           h: &mut DeviceBuffer<f32>,
+                           act_h: &mut Q8Act,
+                           y: &mut DeviceBuffer<f32>|
+                 -> Result<(), crate::GpuError> {
+                    let a = GateUpAt {
+                        arena: &arena,
+                        offs: &offs,
+                        act: &act_x,
+                        n_slots: 1,
+                        rows_per_expert: FF,
+                        slots_per_col: 1,
+                        rule,
+                    };
+                    kq.enqueue_gate_up_q4k_at(s, &a, sink, h)?;
+                    let q = QuantSel {
+                        x: h,
+                        cols: 0..1,
+                        sel: &one,
+                        n_card: 1,
+                    };
+                    gpu.q4k_sel().enqueue_quantize_sel(s, &q, sink, act_h)?;
+                    let d = SelDownAt {
+                        arena: &arena,
+                        offs: &offs,
+                        act: act_h,
+                        n_slots: 1,
+                        rows_per_expert: N,
+                    };
+                    kq.enqueue_gemv_q5k_sel_at(s, &d, sink, y)
+                };
+                for how in ["eager", "graph"] {
+                    h.copy_from_host(stream, &[f32::NAN; FF]).expect("h");
+                    y.copy_from_host(stream, &[f32::NAN; N]).expect("y");
+                    if how == "eager" {
+                        run(stream, &mut h, &mut act_h, &mut y).expect("the arena entries");
+                    } else {
+                        if graph.is_none() {
+                            graph = Some(
+                                Graph::capture(stream, |s| run(s, &mut h, &mut act_h, &mut y))
+                                    .expect("the capture"),
+                            );
+                        }
+                        graph.as_ref().unwrap().launch(stream).expect("the replay");
+                    }
+                    let got = (
+                        h.to_host_vec(stream).expect("h"),
+                        y.to_host_vec(stream).expect("y"),
+                    );
+                    assert!(
+                        gpu.take_fault().expect("the fault word").is_none(),
+                        "{case} {how}: a fault"
+                    );
+                    if round > 0 {
+                        assert_ne!(
+                            got,
+                            want[round - 1],
+                            "{case} {how}: the slot still reads the round before's expert"
+                        );
+                    }
+                    for (what, g, w) in [
+                        ("h", &got.0, &want[round].0),
+                        ("down", &got.1, &want[round].1),
+                    ] {
+                        if let Some(i) = (0..w.len()).find(|&i| g[i].to_bits() != w[i].to_bits()) {
+                            panic!(
+                                "{case} {how}: {what} row {i}: arena {:#010x}, stack {:#010x}",
+                                g[i].to_bits(),
+                                w[i].to_bits()
+                            );
+                        }
+                    }
+                }
+                drop(pin);
+            }
+            drop(graph.take());
+            drop(std::mem::ManuallyDrop::into_inner(arena).into_raw_parts());
+        }
+    }
+
     /// A pin names what it refuses and pins nothing then: an id with no
     /// filled slot, and an id past the experts; an id of the host segment is
     /// the mapping's and pins nothing.
