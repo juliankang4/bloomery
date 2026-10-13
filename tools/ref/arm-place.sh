@@ -7,12 +7,14 @@
 # BLOOMERY_GEN_PLACE), the word against the mode and the timing card, and after an arm in the two-card mode
 # its load record's cards against its placement. The two-card witness (Xid, the 3090's cap, a lost card) is
 # timing-card.sh's, which this file calls. Sourced by the runner before it parses its arms; place_check and
-# place_arm_cards need timing-card.sh sourced first.
+# place_arm_cards need timing-card.sh sourced first. arm_items_ok, the check of an arm's NAME=VALUE list as
+# given, is here too, for every runner with such a list (depth-serve.sh's through lever-arms.sh's arm_envs_ok).
 #
 # The runner sets, before it calls a function here:
 #   PLACE_RUNNER     the runner's name, which opens every message here
 #   PLACE_BIN        its binary's name, for the messages
 #   PLACE_WORDS      the place words the runner runs its binary at, space-separated (a gate bp)
+#   arm_refuse       (arm_items_ok) <arm> <why>: the runner's refusal of an arm, which exits 64
 #   PLACE_LOAD_KIND  (place_arm_cards, optional) the records.py kind of the binary's load record, default load
 #   PLACE_LOAD_BIN   (place_arm_cards, optional) the binary whose checked-in schema reads it, default
 #                    records.py's (generate_ds41)
@@ -44,12 +46,20 @@ place_words_text() {
     echo "${head//,/, } or ${w[${#w[@]} - 1]}"
   fi
 }
+# arm_items_ok <arm> <NAME=VALUE list>: a list with white space or an empty item is refused by name (arm_refuse,
+# exit 64). The splitters drop an empty item and a read stops at a newline, so a runner calls this on the list as
+# given, before it takes an item out; lever-arms.sh's arm_envs_ok calls it too.
+arm_items_ok() {
+  case $2 in *[[:space:]]*) arm_refuse "$1" "white space in '$2' (a value holds none)" ;; esac
+  case ,$2, in *,,*) arm_refuse "$1" "an empty item in '$2' (NAME=VALUE items are separated by one ',')" ;; esac
+}
 # arm_place_split <arm> <NAME=VALUE list>: the list's place= item into ARM_PLACE (empty without one) and the
-# rest, every other item as given and in order (an empty one too: the runner's list check names it), into
-# ARM_REST. An empty place= value, place given twice and a word outside PLACE_WORDS are refused by name.
+# rest, every other item as given and in order, into ARM_REST. An empty place= value, place given twice and a
+# word outside PLACE_WORDS are refused by name, and so is a list arm_items_ok refuses.
 arm_place_split() {
   local a=$1 s="$2," e rest='' seen=''
   ARM_PLACE=''
+  arm_items_ok "$a" "$2"
   while [ -n "$s" ]; do
     e=${s%%,*} s=${s#*,}
     case $e in

@@ -923,7 +923,7 @@ q3_self_test() {
   run_parse -- 6@model=q3.gguf
   want model-relative 64 "model=q3.gguf is a relative path"
   run_parse -- '6@model=/m/q 3.gguf'
-  want model-space 64 "the path of model= holds white space"
+  want model-space 64 "white space in 'model=/m/q 3.gguf'"
   run_parse -- '6@model=/m/q|3.gguf'
   want model-bar 64 "the path of model= holds '|'"
   run_parse -- 6@model=/m/q@3.gguf
@@ -1010,11 +1010,20 @@ q3_self_test() {
   run_parse -- 6@prefill=pass,prefill=gemm
   want prefill-twice 64 "depth-qwen3moe.sh: arm '6@prefill=pass,prefill=gemm': prefill is given twice"
   # A comma with nothing between is an empty item. The splitters drop it, so these two would
-  # otherwise leave ENVS empty and skip the lever check. The list as given is refused first.
+  # otherwise leave ENVS empty and skip the lever check. arm_place_split refuses the list as given first.
   run_parse -- 6@prefill=pass,
   want prefill-trail-comma 64 "an empty item in 'prefill=pass,'"
   run_parse -- 6@,prefill=pass
   want prefill-lead-comma 64 "an empty item in ',prefill=pass'"
+  # A bin: arm's list too, before model= and mem= are taken out of it.
+  run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6@,mem=4G
+  want bin-empty-lead 64 "an empty item in ',mem=4G'"
+  run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6@model=/m/q.gguf,
+  want bin-empty-trail 64 "an empty item in 'model=/m/q.gguf,'"
+  run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6@model=/m/q.gguf,,mem=4G
+  want bin-empty-mid 64 "an empty item in 'model=/m/q.gguf,,mem=4G'"
+  run_parse -- bin:/root/r/t/target/release/generate_qwen3moe:6@
+  want bin-empty-list 64 "an empty item in ''"
   for ex in lcpp:6@prefill=pass lcppsrv:6@prefill=pass ik:6@prefill=pass; do
     run_parse -- "$ex"
     want "prefill-ref-${ex%%:*}" 64 "depth-qwen3moe.sh: arm '$ex': prefill= sets generate_qwen3moe's --prefill, and ${ex%%:*} is a reference engine's arm"
@@ -1441,9 +1450,9 @@ arm_mem_split() {
 # arm_model_split <arm> <NAME=VALUE list>: the list's model= item into ARM_MODEL (empty without one) and
 # the rest, every other item as given and in order, into ARM_MODEL_REST. The item is no lever: it is the
 # arm's model file (the header's model=), BLOOMERY_REF_MODEL for that arm's process alone. A relative
-# path, one holding '@', '|' or white space, and model given twice are refused by name (a ',' in the path
-# is not representable: the list's grammar separates items with it, so a path with one parses as more
-# items and is refused by that grammar).
+# path, one holding '@' or '|', and model given twice are refused by name; white space in the list never
+# reaches here (arm-place.sh's arm_items_ok refuses it first). A ',' in the path is not representable: the
+# list's grammar separates items with it, so a path with one parses as more items and is refused by that grammar.
 arm_model_split() {
   local a=$1 s="$2," e rest='' seen=''
   ARM_MODEL=''
@@ -1465,9 +1474,6 @@ arm_model_split() {
         esac
         case $ARM_MODEL in
           *'|'*) arm_refuse "$a" "the path of model= holds '|', the separator of this runner's records" ;;
-        esac
-        case $ARM_MODEL in
-          *[[:space:]]*) arm_refuse "$a" "the path of model= holds white space" ;;
         esac
         ;;
       *) rest+="${seen:+,}$e" seen=1 ;;
@@ -1592,9 +1598,6 @@ split_at() {
   arm_place_split "$1" "$2"
   arm_mem_split "$1" "$ARM_REST"
   arm_model_split "$1" "$ARM_MEM_REST"
-  # Empty items are dropped by the splitters, so `prefill=pass,` and `,prefill=pass` would
-  # leave ENVS empty and skip arm_envs_ok. Refuse the list as given, before prefill= is taken out.
-  case ,$AT, in *,,*) arm_envs_ok "$1" "$AT" ;; esac
   arm_prefill_split "$1" "$ARM_MODEL_REST"
   ENVS=$ARM_PREFILL_REST APLACE=$ARM_PLACE AMEM=$ARM_MEM AMODEL=$ARM_MODEL APREFILL=$ARM_PREFILL
   [ -z "$ENVS" ] || arm_envs_ok "$1" "$ENVS"
@@ -1655,7 +1658,7 @@ for a in "${ARMS[@]}"; do
       # ours lever arm's — the registry is this tree's — with the model= and mem= items among it (mem= the
       # header's Mem, as an ours arm's). place= is an ours arm's item here and is refused by name.
       case $bin in
-        *@*) blist=${bin#*@} bin=${bin%%@*} ;;
+        *@*) blist=${bin#*@} bin=${bin%%@*}; arm_items_ok "$a" "$blist" ;;
         *) blist='' ;;
       esac
       dep=${bin##*:} bin=${bin%:*}

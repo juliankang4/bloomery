@@ -877,6 +877,19 @@ ds41_self_test() {
   want parse-past 64 "a prose prompt of 1000 ids (2 slots × 500); $st/data/engram/corpus-prose.ids holds 801 (1..801)"
   run_parse BLOOMERY_GEN_SLOTS=2 -- 6
   want parse-env 64 "BLOOMERY_GEN_SLOTS=2 is set in the runner's own environment"
+  # An empty item and white space are refused by name wherever they stand (arm-place.sh's arm_items_ok, on the list
+  # as given): split off, place= would leave nothing for arm_envs_ok to see, and its read drops a trailing empty
+  # item and stops at a newline.
+  run_parse -- 6@place=a,
+  want parse-empty-trail 64 "depth-ds41.sh: arm '6@place=a,': an empty item in 'place=a,' (NAME=VALUE items are separated by one ',')"
+  run_parse -- 6@,place=a
+  want parse-empty-lead 64 "depth-ds41.sh: arm '6@,place=a': an empty item in ',place=a'"
+  run_parse -- 6@BLOOMERY_GEN_SLOTS=2,
+  want parse-empty-env 64 "depth-ds41.sh: arm '6@BLOOMERY_GEN_SLOTS=2,': an empty item in 'BLOOMERY_GEN_SLOTS=2,'"
+  run_parse -- $'6@X=1,\nY=2'
+  want parse-newline 64 "white space in 'X=1,"
+  run_parse -- $'6@X=1,\n'
+  want parse-newline-trail 64 "white space in 'X=1,"
   # The load's header lines (the hook the driver calls): every line a kind of generate_ds41's schema reads, and
   # the plain lines ARM_PLAIN names; a line of no kind and a `host ` line (nothing prints one) are not echoed.
   local hp hh hl hf

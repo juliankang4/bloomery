@@ -175,8 +175,9 @@
 # nvidia-smi and journalctl first on PATH; red on the runner before them, which has no two-card mode, refuses
 # place= as no lever row and BLOOMERY_GEN_PLACE=bp as no word):
 #   bp-onecard, bp-onecard-arm  BLOOMERY_GEN_PLACE=bp and 6@place=bp under one card: refused by name, rc 64.
-#   place-ref, place-word, place-twice, place-card  place= on lcpp27752:6, place=b2, place given twice,
-#                6@place=gate with the A6000 the timing card: each refused by name, rc 64.
+#   place-ref, place-word, place-twice, place-card, place-empty-trail, place-empty-lead  place= on lcpp27752:6,
+#                place=b2, place given twice, 6@place=gate with the A6000 the timing card, 6@place=a, and
+#                6@,place=a: each refused by name, rc 64.
 #   twocard-gate 6@place=gate in the two-card mode: refused by name, rc 64.
 #   twocard-place  BLOOMERY_GEN_PLACE=bp, 6 6@place=a lcpp27752:6, one round, the stub naming its load's cards
 #                (STUB_GEN_CARDS_ON): the two ours rows at `place bp` and `place a`, every row `A6000+3090`,
@@ -839,6 +840,8 @@ place_refused bp-onecard-arm "^depth-glm5next.sh: arm '6@place=bp': place=bp is 
 place_refused place-ref "^depth-glm5next.sh: arm 'lcpp27752:6@place=a': place= sets generate_glm5next's --place, and lcpp27752 is a reference engine's arm, which takes no placement of ours$" -- 6 lcpp27752:6@place=a
 place_refused place-word "^depth-glm5next.sh: arm '6@place=b2': place=b2: generate_glm5next takes --place a, gate or bp in this runner$" -- 6 6@place=b2
 place_refused place-twice "^depth-glm5next.sh: arm '6@place=a,place=a': place is given twice$" -- 6 6@place=a,place=a
+place_refused place-empty-trail "^depth-glm5next.sh: arm '6@place=a,' is .* — an empty item in 'place=a,' \(NAME=VALUE items are separated by one ','\)$" -- 6 6@place=a,
+place_refused place-empty-lead "^depth-glm5next.sh: arm '6@,place=a' is .* — an empty item in ',place=a' \(NAME=VALUE items are separated by one ','\)$" -- 6 6@,place=a
 place_refused place-card "^depth-glm5next.sh: arm '6@place=gate': place=gate is the gate plan, which loads on the 3090, and the timing card is " -- 6 6@place=gate
 place_refused twocard-gate "^depth-glm5next.sh: arm '6@place=gate': place=gate is the gate plan, which loads the 3090 alone; the two-card mode times a \(plan \(a\) on the A6000, the 3090 idle\) or bp \(plan \(b′\), both cards\)$" "${TC[@]}" -- 6 6@place=gate
 

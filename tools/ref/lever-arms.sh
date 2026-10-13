@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # A lever arm's NAME=VALUE list, checked the same way in the depth runners that take one
 # (depth-qwen3moe.sh, depth-glm5next.sh): `<D>@NAME=VALUE[,NAME=VALUE...]` sets those variables for that
-# arm's process only. Sourced by the runner before it parses its arms.
+# arm's process only. Sourced by the runner before it parses its arms, with arm-place.sh (arm_items_ok).
 #
 # The runner sets, before it sources this file:
 #   LEVER_ARM_RUNNER   the runner's name, which opens every message here
@@ -71,8 +71,7 @@ arm_envs_ok() {
   local a=$1 list=$2 e name val site seen=,
   local -a kv
   [ -n "$list" ] || arm_refuse "$a" "an empty NAME=VALUE list after '@'"
-  case $list in *[[:space:]]*) arm_refuse "$a" "white space in '$list' (a value holds none)" ;; esac
-  case ,$list, in *,,*) arm_refuse "$a" "an empty item in '$list' (NAME=VALUE items are separated by one ',')" ;; esac
+  arm_items_ok "$a" "$list"
   IFS=, read -r -a kv <<< "$list"
   for e in "${kv[@]}"; do
     case $e in *=*) ;; *) arm_refuse "$a" "'$e' is no NAME=VALUE (a ',' separates two variables, so a value holds none)" ;; esac

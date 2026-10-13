@@ -103,6 +103,8 @@ if [ "$MODE" != summary ]; then
   source "$HERE/lcpp-warm.sh"
   # shellcheck source=tools/ref/lever-arms.sh
   source "$HERE/lever-arms.sh" || exit 2
+  # shellcheck source=tools/ref/arm-place.sh
+  source "$HERE/arm-place.sh" || exit 2
 fi
 
 SERVE_BIN=target/release/bloomery-serve
