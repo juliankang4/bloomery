@@ -222,22 +222,14 @@ fn blocks_with_nextn_tensors(source: &Split) -> BTreeSet<usize> {
         .collect()
 }
 
-/// Bytes of a tensor of `dims` at type `ty`.
-fn row_bytes(ty: GgmlType, dims: &[u64]) -> Option<u64> {
-    let (blck, size) = (ty.blck_size()?, ty.type_size()?);
-    dims[0]
-        .is_multiple_of(blck)
-        .then(|| size * (dims[0] / blck) * dims[1..].iter().product::<u64>())
-}
-
 /// The tensors of `source` that `row`'s map retypes, in the source's tensor order.
 ///
 /// # Errors
 /// The source is of another architecture than the row's family; a role no tensor of the scope has; a
 /// role whose every tensor in the scope is already at the type the map gives it (a row that changes
-/// nothing is a mistake); a tensor the type cannot hold (its rows are not whole blocks). A tensor of a
-/// role already at the map's type, beside others of the role that are not, is left out: the quantizer
-/// copies it as it is, as the source's own mix of types for that role holds it.
+/// nothing is a mistake); a tensor the type cannot hold (its rows are not whole blocks, or its bytes
+/// pass u64). A tensor of a role already at the map's type, beside others of the role that are not, is
+/// left out: the quantizer copies it as it is, as the source's own mix of types for that role holds it.
 pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
     let tag = &row.tag;
     if source.architecture() != Some(row.family.as_str()) {
@@ -276,12 +268,23 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
                 already.push(t.name.as_str());
                 continue;
             }
-            if row_bytes(*to, &t.dims).is_none() {
+            let sized = to.blck_size().zip(to.type_size());
+            let Some((blck, size)) = sized.filter(|&(blck, _)| t.dims[0].is_multiple_of(blck))
+            else {
                 return Err(err(
                     tag,
                     format!(
                         "tensor {}: {to} takes rows of whole blocks, its rows are {} long",
                         t.name, t.dims[0]
+                    ),
+                ));
+            };
+            if gguf::tensor_bytes(blck, size, &t.dims).is_none() {
+                return Err(err(
+                    tag,
+                    format!(
+                        "tensor {}: at {to}, dims {:?} hold more bytes than a u64 counts",
+                        t.name, t.dims
                     ),
                 ));
             }

@@ -156,9 +156,7 @@ mod gate {
             |name: &str, dims: &[u64], ty: u32| -> Result<gguf::write::TensorDecl, GateError> {
                 let (_, blck, tsz) = gguf::ggml_type_info(ty)
                     .ok_or_else(|| format!("tensor {name}: ggml type {ty} has no block info"))?;
-                let bytes = dims[1..]
-                    .iter()
-                    .try_fold(tsz * (dims[0] / blck), |acc, d| acc.checked_mul(*d))
+                let bytes = gguf::tensor_bytes(blck, tsz, dims)
                     .ok_or_else(|| format!("tensor {name}: its bytes overflow u64"))?;
                 Ok(gguf::write::TensorDecl {
                     name: name.to_owned(),

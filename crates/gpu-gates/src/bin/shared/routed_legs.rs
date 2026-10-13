@@ -1381,9 +1381,7 @@ fn retype_split(
                     .map_or(t.ty, |&(_, ty)| ty);
                 let (_, blck, tsz) = gguf::ggml_type_info(ty.as_u32())
                     .ok_or_else(|| format!("{}: {ty} has no block info", t.name))?;
-                let bytes = t.dims[1..]
-                    .iter()
-                    .try_fold(tsz * (t.dims[0] / blck), |acc, d| acc.checked_mul(*d))
+                let bytes = gguf::tensor_bytes(blck, tsz, &t.dims)
                     .ok_or_else(|| format!("{}: its bytes overflow u64", t.name))?;
                 tensors.push(TensorDecl {
                     name: t.name.clone(),

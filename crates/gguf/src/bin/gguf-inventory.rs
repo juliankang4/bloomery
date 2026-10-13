@@ -179,6 +179,20 @@ fn has_decoder(id: u32) -> bool {
     GgmlType::from_u32(id).has_dequant()
 }
 
+/// The bytes of every tensor of a known size over all shards, or the shard and the tensor at
+/// which that sum passes u64. Every other byte sum the report prints is a part of this one.
+fn known_bytes(shards: &[Shard]) -> Result<u64, String> {
+    let mut total = 0u64;
+    for s in shards {
+        for t in &s.inv.tensors {
+            total = total.checked_add(t.nbytes.unwrap_or(0)).ok_or_else(|| {
+                format!("{}: tensor {}: the tensor bytes pass u64", s.path, t.name)
+            })?;
+        }
+    }
+    Ok(total)
+}
+
 fn main() -> ExitCode {
     let mut md_path: Option<String> = None;
     let mut paths: Vec<String> = Vec::new();
@@ -265,14 +279,21 @@ fn main() -> ExitCode {
     let block_count = meta_of("block_count");
     let first_k_dense = meta_of("first_k_dense_replace");
 
-    // Group sums, per-block exps sums, type census.
+    let total_known = match known_bytes(&shards) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("gguf-inventory: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Group sums, per-block exps sums, type census: each a part of `total_known`.
     let mut group_bytes: BTreeMap<Group, u64> = BTreeMap::new();
     let mut group_count: BTreeMap<Group, usize> = BTreeMap::new();
     let mut group_unknown: BTreeMap<Group, usize> = BTreeMap::new();
     let mut group_names: BTreeMap<Group, Vec<String>> = BTreeMap::new();
     let mut block_exps: BTreeMap<u32, u64> = BTreeMap::new();
     let mut types: BTreeMap<u32, (usize, u64, usize)> = BTreeMap::new(); // count, bytes, unknown
-    let mut total_known = 0u64;
     let mut total_unknown = 0usize;
     let mut total_file = 0u64;
     for s in &shards {
@@ -286,7 +307,6 @@ fn main() -> ExitCode {
                 Some(n) => {
                     *group_bytes.entry(g).or_default() += n;
                     e.1 += n;
-                    total_known += n;
                     if g == Group::RoutedExps
                         && let Some(b) = block_of(&t.name)
                     {
@@ -683,8 +703,39 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_decoder, in_engine_type};
+    use super::{Shard, has_decoder, in_engine_type, known_bytes};
     use gguf::quant::{GgmlType, dequant_row};
+    use gguf::{Inventory, RawTensorInfo};
+
+    /// Byte sums are checked: two F32 tensors of 2^63 bytes each, in two shards, pass u64 at the
+    /// second, and the refusal names its shard and tensor.
+    #[test]
+    fn a_byte_sum_past_u64_names_the_tensor() {
+        let shard = |ordinal: usize, name: &str| Shard {
+            ordinal,
+            path: format!("s{ordinal}.gguf"),
+            inv: Inventory {
+                version: 3,
+                meta: Vec::new(),
+                tensors: vec![RawTensorInfo {
+                    name: name.to_string(),
+                    dims: vec![1 << 61, 1],
+                    type_id: 0,
+                    offset: 0,
+                    nbytes: Some(1 << 63),
+                }],
+                header_end: 0,
+                data_base: 0,
+                alignment: 32,
+                file_len: 0,
+            },
+        };
+        assert_eq!(known_bytes(&[shard(1, "a")]), Ok(1 << 63));
+        assert_eq!(
+            known_bytes(&[shard(1, "a"), shard(2, "b")]),
+            Err("s2.gguf: tensor b: the tensor bytes pass u64".to_string())
+        );
+    }
 
     /// The type ids V4.1's first shard carries that the crate decodes.
     // PIN(2026-09-24): the public file's first shard: f32, q3_K, q5_K, q6_K, bf16.

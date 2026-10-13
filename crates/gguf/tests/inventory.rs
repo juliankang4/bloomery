@@ -2,7 +2,8 @@
 //! what the strict reader refuses, reports unknown sizes as `None`, agrees
 //! with `Gguf::open` on every field for types both accept, and refuses, as
 //! it does, metadata ggml does not read (an array of arrays, an alignment
-//! that is 0 or not a u32).
+//! that is 0 or not a u32) and a tensor whose byte count passes u64. The
+//! same synthetic files hold `Gguf::data` to the mapping's bounds.
 
 use std::path::PathBuf;
 
@@ -193,4 +194,44 @@ fn inventory_agrees_with_the_strict_reader_on_supported_types() {
         assert_eq!(t.nbytes, Some(s.nbytes));
         assert_eq!(t.nbytes, Some(bytes as u64));
     }
+}
+
+/// A tensor whose byte count passes u64 is refused by name at both entry
+/// points: F32 dims [2^62 + 1, 1] need 2^64 + 4 bytes, which a wrapping
+/// product counts as 4, and the file holds exactly 4.
+#[test]
+fn a_byte_count_past_u64_is_refused_by_name() {
+    let p = tmp("too-large.gguf");
+    write_gguf(&p, &[("big", &[(1 << 62) + 1, 1], 0)], 4);
+    for r in both(&p) {
+        match r {
+            Err(LoadError::TooLarge { name, dims, ty }) => {
+                assert_eq!(
+                    (name.as_str(), dims, ty),
+                    ("big", vec![(1 << 62) + 1, 1], GgmlType::F32)
+                );
+            }
+            other => panic!("the tensor must be refused as too large, got {other:?}"),
+        }
+    }
+    std::fs::remove_file(&p).unwrap();
+}
+
+/// `Gguf::data` refuses a `TensorInfo` whose offset wraps the start of its
+/// slice, as it refuses one whose end runs past the mapping: offset u64::MAX
+/// would start one byte before the data.
+#[test]
+fn data_refuses_an_offset_past_the_mapping() {
+    let p = tmp("data-offset.gguf");
+    write_gguf(&p, &[("f", &[4], 0)], 16);
+    let g = Gguf::open(&p).expect("open");
+    let mut t = g.find("f").expect("tensor f").clone();
+    t.offset = u64::MAX;
+    match g.data(&t) {
+        Err(LoadError::OutOfBounds { name, off, .. }) => {
+            assert_eq!((name.as_str(), off), ("f", u64::MAX));
+        }
+        other => panic!("an offset past the mapping must be refused, got {other:?}"),
+    }
+    std::fs::remove_file(&p).unwrap();
 }

@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::ops::Range;
 
-use crate::{GENERAL_ALIGNMENT, Value, ggml_type_info};
+use crate::{GENERAL_ALIGNMENT, Value, ggml_type_info, tensor_bytes};
 
 /// The alignment of a file whose metadata does not set one.
 pub const DEFAULT_ALIGNMENT: u64 = 32;
@@ -239,12 +239,9 @@ fn check_tensor(t: &TensorDecl) -> Result<(), WriteError> {
             blck,
         });
     }
-    let want = t.dims[1..]
-        .iter()
-        .try_fold(tsz * (t.dims[0] / blck), |acc, d| acc.checked_mul(*d))
-        .ok_or_else(|| WriteError::TooLarge {
-            name: t.name.clone(),
-        })?;
+    let want = tensor_bytes(blck, tsz, &t.dims).ok_or_else(|| WriteError::TooLarge {
+        name: t.name.clone(),
+    })?;
     if want != t.nbytes {
         return Err(WriteError::TensorBytes {
             name: t.name.clone(),
@@ -653,6 +650,10 @@ mod tests {
         }
         match layout_err(&[], vec![decl("big", &[4], 1011, u64::MAX - 8)]) {
             WriteError::TooLarge { name } => assert_eq!(name, "big"),
+            other => panic!("wrong refusal: {other}"),
+        }
+        match layout_err(&[], vec![decl("wide", &[(1 << 62) + 1, 1], 0, 4)]) {
+            WriteError::TooLarge { name } => assert_eq!(name, "wide"),
             other => panic!("wrong refusal: {other}"),
         }
         let mut twice = kv("k", Value::U8(1));

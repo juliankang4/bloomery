@@ -356,7 +356,12 @@ fn planned(
             detail: format!("ne[0] {} is not whole blocks of {blck}", dims[0]),
         });
     }
-    let nbytes = tsz * (dims[0] / blck) * dims[1..].iter().product::<u64>();
+    let Some(nbytes) = gguf::tensor_bytes(blck, tsz, &dims) else {
+        return Err(FixtureError::Tensor {
+            name,
+            detail: format!("{ty} dims {dims:?} hold more bytes than a u64 counts"),
+        });
+    };
     Ok(PlannedTensor {
         name,
         source: source.to_string(),
