@@ -55,7 +55,8 @@ jobs:
       - name: Checkout the branch this workflow runs from (the script and the crate graph)
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          # No ref: the default checkout is the commit GitHub set for the event. An explicit ref that equals a merged
+          # pull request's merge_commit_sha, as github.sha does after a merge made on GitHub, is refused.
           persist-credentials: false
       - name: Label
         env:
