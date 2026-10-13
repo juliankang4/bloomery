@@ -67,7 +67,8 @@ language is not one of the reasons: the kernels are Rust (274 of them, through
 - **Disk rows read ahead of the step (V4.1).** V4.1's engram table (195 GiB) stays on NVMe, and every token
   reads 48 scattered rows. In a bench of that path, read on demand from a cold cache they took 4.69 ms a token;
   with the next token's read-ahead issued early, 0.31 ms ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-22.md#p-the-engram-path-costs-a-third-of-a-millisecond-and-it-is-syscalls)).
-- **CPU experts at memory speed.** AVX2 kernels take the dot products on the quantized weights as stored, and
+- **CPU experts at memory speed.** AVX2 kernels take the dot products on the quantized weights as stored (Q4_K's
+  switch to AVX-512 VNNI bodies on a CPU that has AVX-512 F, BW and VNNI), and
   a step's host experts go out as 82 grouped dispatches on a pinned worker pool instead of 720 per-matrix
   ones. In a bench of that leg on an earlier V4.1 file: 31.1 ms against 35.5 ms for the same bytes, at 130 GB/s of the machine's 148
   ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-23.md#v41-host-leg)). The kernels are not faster than ik_llama.cpp's on one core;
