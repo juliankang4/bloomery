@@ -443,6 +443,16 @@ blk_carry() {
   fi
   echo "${cy##*$'\n'}"
 }
+# build.sh's host-code scan (an instruction past x86-64-v3 outside a runtime-dispatched function) on fixture listings: the
+# release check runs only on the box, so its scan is held here.
+blk_releasebuild() {
+  if ! rb=$(bash "$(dirname "$0")/release/build.sh" --self-test 2>&1); then
+    echo "$rb" >&2
+    echo "check-recipes: the release build.sh self-test failed" >&2
+    return 1
+  fi
+  echo "${rb##*$'\n'}"
+}
 # Every Python tool's own tests, on the Mac and the Linux host nightly (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison below fails on one that is not. The tools run as
 # parallel jobs (they are independent processes on their own temp fixtures); their failures land in one
@@ -764,7 +774,7 @@ proc_leg
 unset CPU_GUARD_PROC_LEG
 
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry pytools boxqcodes fixturevariants
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants
   refsetpublish orphan archowner wt)
 for b in "${BLOCKS[@]}"; do
   ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc
