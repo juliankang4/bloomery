@@ -329,7 +329,13 @@ placement 0 0 0
 # PIN(2026-10-13): qdot 136 -> 141 blocks, 76 -> 77 fns, a shared helper, not old code relaxed: the Q4_K and Q5_K
 # kernels read a block's d and dmin through f16c_pair_to_f32 (one #[inline(always)] unsafe fn of five blocks, one per
 # intrinsic call, register only), each with its SAFETY line.
-qdot 141 77 0
+# PIN(2026-10-14): qdot 141 -> 172 blocks, 77 -> 80 fns, new kernels, not old code relaxed: Q4_K's AVX-512 VNNI
+# tile (dot_q4k_q82x4_tile_avx512, also the one-column kernel at C = 1, 7 blocks) and row lanes (dot_lanes_avx512,
+# 12 blocks), two unsafe fns with one block per load, store, pointer offset or unsafe call, and the dot_row arm and
+# tile_q4k_avx512 that call the tile (2 blocks); q82x4_dy_my (one unsafe fn of 8 blocks, one per pointer offset and
+# load) and q45k_scales_ps and q45k_mins_ps (safe AVX2 fns of one load block each), the Q4_K and Q5_K kernels'
+# column factors and their scale and min loads taken out of their bodies; each with its SAFETY line.
+qdot 172 80 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1
