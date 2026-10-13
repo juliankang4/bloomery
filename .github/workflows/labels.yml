@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: read
       issues: write
-      pull-requests: read
+      pull-requests: write  # a label on a pull request: with issues: write alone it is refused (HTTP 403)
     steps:
       - name: Checkout the branch this workflow runs from (the script and the crate graph)
         uses: actions/checkout@v7
