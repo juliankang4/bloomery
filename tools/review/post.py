@@ -61,7 +61,7 @@ MAX_BODY = 12000
 MAX_COMMENTS = 10
 CARD_LABELS = {
     "needs-gpu": ("d93f0b", "Changes code a card must check, and carries no gate run on a card"),
-    "gpu-evidence": ("0e8a16", "Verified on the author's card: the pull request carries the gate run and its output"),
+    "gpu-evidence": ("bfe5bf", "Verified on the author's card: the pull request carries the gate run and its output"),
 }
 FREEZE_LABEL = "release-freeze"
 APPROVE_GUARD = (".github/", "tools/review/", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "CONTRIBUTING.ko.md",

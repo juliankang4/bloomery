@@ -489,6 +489,7 @@ blk_pytools() {
     "tools/ref/set-diff.py --self-test"
     "tools/ref/window-union.py --self-test"
     "tools/review/diagnostics.py --self-test"
+    "tools/review/labels.py --self-test"
     "tools/review/ledger.py --self-test"
     "tools/review/post.py --self-test"
     "tools/review/signals.py --self-test"

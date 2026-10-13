@@ -1,0 +1,77 @@
+# Area and kind labels on every issue and pull request: a pull request's area labels from the paths it changes (an
+# open one's file list, a merged one's merge commit against its first parent), an issue's from its title prefix, and
+# `needs-gpu` on an open pull request that changes a crate reaching cuda-core and has neither `gpu-evidence` nor
+# `gpu-verified` (Shingler swaps it for `gpu-evidence` when the pull request carries a gate run). The tables and the
+# rules are tools/review/labels.py; it adds and removes only the labels it manages, and never adds one a person removed
+# or removes one a person added, `needs-gpu` aside, which follows the paths.
+#
+# An issue or pull request that another workflow opens with GITHUB_TOKEN (the review bot's issues, the ledger) starts
+# no workflow, so it gets its labels only from a workflow_dispatch run.
+#
+# pull_request_target, so a fork's pull request gets a token that can label it. Nothing from the pull request is
+# checked out or run: the changed paths come from the API, the script and the crate graph from the branch this
+# workflow runs from. Only the issue or pull request number reaches the script, through env, never a title. An edit
+# runs the job only when it changes the title or the base, and a close only when it merges.
+#
+# workflow_dispatch labels every open issue and pull request (or all, closed ones too) once; dry_run prints what it
+# would change in the job summary and sends no write. A rerun is safe: a label already on is not added again.
+name: Labels
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, closed]
+  issues:
+    types: [opened, edited]
+  workflow_dispatch:
+    inputs:
+      state:
+        description: Which issues and pull requests to label
+        type: choice
+        options: [open, all]
+        default: open
+      dry_run:
+        description: Print what would change and change nothing
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  label:
+    if: >-
+      (github.event.action != 'edited' || github.event.changes.title || github.event.changes.base)
+      && (github.event.action != 'closed' || github.event.pull_request.merged)
+    concurrency:
+      group: labels-${{ github.event.pull_request.number || github.event.issue.number || 'all' }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Checkout the branch this workflow runs from (the script and the crate graph)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          STATE: ${{ inputs.state }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          # tools/recipes.py reads the workspace with `cargo metadata --offline`, which stable does; without this,
+          # rust-toolchain.toml would install the pinned nightly and its components first.
+          RUSTUP_TOOLCHAIN: stable
+        run: |
+          set -euo pipefail
+          args=(run --repo "$REPO")
+          if [ -n "$NUMBER" ]; then args+=(--number "$NUMBER"); else args+=(--state "${STATE:-open}"); fi
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          python3 tools/review/labels.py "${args[@]}" > labels.txt
+          cat labels.txt
+          { echo '```'; cat labels.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
