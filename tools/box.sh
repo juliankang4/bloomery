@@ -401,8 +401,10 @@ case $HOLD_OWNER in
 esac
 # The tier (the header), named before anything is synced: a refusal touches nothing on the box.
 TIER_MAC=${BLOOMERY_TIER:-} TIER_BOX=
-read -r -a tier_env <<< "${BLOOMERY_BOX_ENV:-}"
-for kv in ${tier_env[@]+"${tier_env[@]}"}; do
+# BLOOMERY_BOX_ENV is split once, on spaces, tabs and newlines (as tools/gate-batch.sh word-splits it).
+read -r -d '' -a box_env < <(printf '%s\0' "${BLOOMERY_BOX_ENV:-}") ||
+  { echo "box.sh: BLOOMERY_BOX_ENV could not be read" >&2; exit 70; }
+for kv in ${box_env[@]+"${box_env[@]}"}; do
   [ "${kv%%=*}" != BLOOMERY_TIER ] || TIER_BOX=${kv#*=}
 done
 for t in "$TIER_MAC" "$TIER_BOX"; do
@@ -421,7 +423,7 @@ TIERX=
 [ -z "$TIER_MAC$TIER_BOX" ] || TIERX="export BLOOMERY_TIER=$TIER && "
 # The fixture variant (the header), read the same way: a BLOOMERY_BOX_ENV entry is exported after the profile, too late for the file it names.
 VAR_MAC=${BLOOMERY_FIXTURE_VARIANT:-} VAR_BOX=
-for kv in ${tier_env[@]+"${tier_env[@]}"}; do
+for kv in ${box_env[@]+"${box_env[@]}"}; do
   [ "${kv%%=*}" != BLOOMERY_FIXTURE_VARIANT ] || VAR_BOX=${kv#*=}
 done
 if [ -n "$VAR_MAC" ] && [ -n "$VAR_BOX" ] && [ "$VAR_MAC" != "$VAR_BOX" ]; then
@@ -441,7 +443,7 @@ VARX=
 # The arch (the header), named before anything is synced: a refusal touches nothing on the box.
 ARCHX='' ARCH_ENTRY='' RECIPE_ARCH=sm_86
 ARCH_SEEN=0
-for kv in ${tier_env[@]+"${tier_env[@]}"}; do
+for kv in ${box_env[@]+"${box_env[@]}"}; do
   if [ "${kv%%=*}" = BLOOMERY_ARCH ]; then
     ARCH_SEEN=1 ARCH_ENTRY=${kv#*=}
   fi
@@ -701,14 +703,13 @@ fi
 DATA="${DATA}__d=\$(. tools/ref/ref-paths.sh && printf %s \"\$BLOOMERY_DATA\") && export BLOOMERY_DATA=\"\$__d\" && unset __d"
 # BLOOMERY_BOX_ENV="NAME=value NAME2=value2" exports those variables into the command, so a lever arm
 # reaches the binary through an unchanged recipe (tools/gpu-ab.py's env arms). Entries are split on
-# spaces and quote nothing; each value is quoted for the remote shell. So a value with a space cannot
+# spaces, tabs and newlines and quote nothing; each value is quoted for the remote shell. So a value with a space cannot
 # cross: an entry that holds a quote, or one that is not an upper-case NAME=value (the second half of a
 # spaced value), is refused by name — such a value goes in the command itself, or in an arm word (a
 # server arm's +t<N>, +nopo<0|1>, +k<K>: tools/ref/lcpp-warm.sh).
 ENVS=
-read -r -a box_env <<< "${BLOOMERY_BOX_ENV:-}"
 prev=
-spaced="BLOOMERY_BOX_ENV splits on spaces and quotes nothing, so a value with a space does not cross it; put it in the command, or in an arm word (a server arm's +t<N>, +nopo<0|1>, +k<K>)"
+spaced="BLOOMERY_BOX_ENV splits on white space and quotes nothing, so a value with a space does not cross it; put it in the command, or in an arm word (a server arm's +t<N>, +nopo<0|1>, +k<K>)"
 for kv in ${box_env[@]+"${box_env[@]}"}; do
   name=${kv%%=*} after=
   [ -z "$prev" ] || after=" (after '$prev': the rest of a value with a space? $spaced)"
