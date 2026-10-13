@@ -1504,7 +1504,8 @@ gate-ds41-bind:
 # The Qwen3.8 serve seat's feed rules (bloomery-serve-qwen38's own unit tests, behind the deepseek41 feature like bind):
 # the route trace takes only the step feed, no MTP draft, one slot and no residency word but off; the step feed takes
 # no MTP draft and no such word; a step-fed prompt is never cut at a message start; the one levers list the server and its
-# gate parse (shared/qwen38_levers.rs) holds exactly the levers the seat reads. Host only, no card or gate lock.
+# gate parse (shared/qwen38_levers.rs) holds exactly the levers the seat reads; the default slot count's floor fallback
+# answers the NVMe tier floor's refusal and a unified pool's PoolBudget, and no other. Host only, no card or gate lock.
 [group('host')]
 gate-q38-serve-rules:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --bin bloomery-serve-qwen38'

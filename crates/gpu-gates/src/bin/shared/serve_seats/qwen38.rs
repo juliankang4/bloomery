@@ -827,9 +827,8 @@ fn draft38(
 /// The default slot count's plan, refused because the host room is under the
 /// NVMe expert tier's floor, answered by the one-column rule's own plan: the
 /// first plan the context search asks, at one position (`fit38`), is the
-/// asked slots' — its refusal, [`PlacementError::HostRoomFloor`], matched by
-/// type through the [`PlaceError`] that [`Plans::expert_bytes`] hands back as it came
-/// — and the arena of the one-slot plan with no draft, which the rule loads
+/// asked slots' — its refusal the floor's ([`floor_refused`]) — and the
+/// arena of the one-slot plan with no draft, which the rule loads
 /// (`one`), when that plan pages (an arena past 0: the rule's own condition;
 /// a plan with none serves as asked, so the refusal stands for [`ctx38`] to
 /// name). The floor counts every slot's checkpoints ([`reserve_checkpoints`]),
@@ -845,11 +844,9 @@ fn floor_fallback(
     let Err(refused) = asked.expert_bytes(1) else {
         return Ok(None);
     };
-    let Some(PlaceError::Placement(PlacementError::HostRoomFloor { .. })) =
-        refused.downcast_ref::<PlaceError>()
-    else {
+    if !floor_refused(&refused) {
         return Ok(None);
-    };
+    }
     let one = Plans {
         mtp: None,
         slots: 1,
@@ -858,6 +855,20 @@ fn floor_fallback(
     let rule = ctx38(&one, None)?;
     let arena = one.host(rule.ctx(), set)?.2;
     Ok((arena > 0).then_some(arena))
+}
+
+/// Whether `refused`, the asked slots' refusal as [`Plans::expert_bytes`]
+/// hands it back, is the NVMe expert tier floor's, matched by type through
+/// its [`PlaceError`]: [`PlacementError::HostRoomFloor`], or on a unified
+/// pool [`PlacementError::PoolBudget`] (the card budget lowered toward the
+/// floor and still refused).
+pub(crate) fn floor_refused(refused: &GateError) -> bool {
+    matches!(
+        refused.downcast_ref::<PlaceError>(),
+        Some(PlaceError::Placement(
+            PlacementError::HostRoomFloor { .. } | PlacementError::PoolBudget { .. },
+        ))
+    )
 }
 
 /// The residency the load of `plan` at `place` runs: `set` (the word and

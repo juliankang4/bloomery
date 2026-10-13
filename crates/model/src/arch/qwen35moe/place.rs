@@ -589,6 +589,11 @@ impl PlanInputs {
     /// `ctx_max` ([`PlanInputs::seq_state_bytes`], the draft's side under
     /// `beside`'s draft) — a function of the context being planned and the file's
     /// layers alone, so it needs no plan to be read first.
+    /// On a unified machine the card rule's plan is planned in the pool
+    /// ([`placement::plan_in_pool`]): a card share that leaves the host's room
+    /// under the NVMe tier's floor is lowered until the floor holds. The
+    /// all-host rule puts no routed expert on the card, so a lower card
+    /// budget leaves its floor where it is, and it is planned once.
     /// The all-host rule's own refusal of a tier card
     /// ([`PlaceError::TierHost`]) is wrapped to carry the program's lever and
     /// plan.
@@ -601,33 +606,39 @@ impl PlanInputs {
         beside: Beside<'_>,
         kv: &dyn KvBytes,
     ) -> Result<Plan<'a>, PlaceError> {
-        let mut plan = match rule {
-            None => placement::plan_host_routed_reserving(
-                &self.model,
-                machine,
-                ctx_max,
-                kv,
-                levers,
-                beside.reserve,
-            )
-            .map_err(tier_host)?,
-            Some(rule) => placement::plan_routed_reserving(
-                &self.model,
-                machine,
-                ctx_max,
-                kv,
-                levers,
-                rule,
-                beside.reserve,
-            )?,
+        let make = |levers: &PlanLevers| -> Result<Plan<'a>, PlacementError> {
+            let mut plan = match rule {
+                None => placement::plan_host_routed_reserving(
+                    &self.model,
+                    machine,
+                    ctx_max,
+                    kv,
+                    levers,
+                    beside.reserve,
+                )?,
+                Some(rule) => placement::plan_routed_reserving(
+                    &self.model,
+                    machine,
+                    ctx_max,
+                    kv,
+                    levers,
+                    rule,
+                    beside.reserve,
+                )?,
+            };
+            let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
+            let room = plan.plan_at(&self.room);
+            placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
+            plan.host
+                .step_slots(beside.slots, placement::STEP_PORT_COLUMNS)?;
+            placement::expert_nvme_tier(&mut plan, room, self.arena)?;
+            Ok(plan)
         };
-        let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
-        let room = plan.plan_at(&self.room);
-        placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
-        plan.host
-            .step_slots(beside.slots, placement::STEP_PORT_COLUMNS)?;
-        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
-        Ok(plan)
+        let plan = match rule {
+            None => make(levers),
+            Some(_) => placement::plan_in_pool(machine, levers, make),
+        };
+        plan.map_err(tier_host)
     }
 
     /// The target's plan, unchecked, under the card rule `rule`: every
@@ -2875,8 +2886,8 @@ mod tests {
         };
         use crate::placement::workstation::HostRead;
         use crate::placement::{
-            self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Node, Plan,
-            PlanLevers, Role, RoutedRule,
+            self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Node,
+            PlacementError, Plan, PlanLevers, Role, RoutedRule, UnifiedPool,
         };
 
         const CTX: u64 = 4096;
@@ -3214,6 +3225,66 @@ mod tests {
                     (want, want),
                     "{n} slots: the drafted plan (b′)"
                 );
+            }
+        }
+
+        /// On one pool of 64 GiB, which the card's free reading and the
+        /// host's figure both read, the card rule's plan of one and of two
+        /// slots under the card's whole bytes leaves the host's room under
+        /// the NVMe tier's floor and is refused by name; with no budget given,
+        /// the card budget is lowered until the floor holds: the card keeps
+        /// experts, the rest page through the tier, and the budget is marked
+        /// as the pool's. The all-host rule, under its floor on a room of
+        /// 32 GiB, keeps the floor's refusal: a lower card budget does not
+        /// move its floor, so it is planned once.
+        #[test]
+        fn a_unified_pool_lowers_the_card_rules_budget_to_the_tiers_floor() {
+            let pool: u64 = 64 << 30;
+            let mut machine = machine();
+            machine.cards[0].free_bytes = Some(pool);
+            *machine.host_mut() = Host {
+                usable_bytes: pool,
+                reserves: vec![("pinned".to_string(), 1 << 30)],
+            };
+            *machine.unified_mut() = Some(UnifiedPool { bytes: pool });
+            let mut inputs = routed(inputs());
+            inputs.room = (pool, HostRead::Given);
+            let whole = PlanLevers {
+                card_budget_bytes: Some(u64::MAX),
+            };
+            for n in [1, 2] {
+                match inputs.plan_with_slots(&machine, CTX, &whole, Experts::Card, n) {
+                    Err(PlaceError::Placement(PlacementError::HostRoomFloor {
+                        room,
+                        floor,
+                        ..
+                    })) => assert!(floor > room, "{n} slot(s): {floor} B over {room} B"),
+                    other => panic!("{n} slot(s): not the floor's refusal: {:?}", other.err()),
+                }
+                let plan = inputs
+                    .plan_with_slots(&machine, CTX, &PlanLevers::default(), Experts::Card, n)
+                    .unwrap_or_else(|e| panic!("{n} slot(s): {e}"));
+                let budget = plan.card_budget.expect("a card budget");
+                assert!(
+                    plan.budget_from_pool && budget < pool,
+                    "{n} slot(s): the pool's budget, {budget} B"
+                );
+                assert!(
+                    plan.host.nvme_expert_bytes > 0 && plan.n_l.iter().any(|&l| l > 0),
+                    "{n} slot(s): card experts and paged experts"
+                );
+            }
+            inputs.room = (32 << 30, HostRead::Given);
+            match inputs.plan_with_slots(&machine, CTX, &PlanLevers::default(), Experts::Host, 1) {
+                Err(PlaceError::Placement(PlacementError::HostRoomFloor {
+                    room, floor, ..
+                })) => {
+                    assert!(floor > room, "the all-host rule: {floor} B over {room} B")
+                }
+                other => panic!(
+                    "the all-host rule: not the floor's refusal: {:?}",
+                    other.err()
+                ),
             }
         }
 
