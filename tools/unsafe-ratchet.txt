@@ -333,7 +333,12 @@ placement 0 0 0
 # tile (dot_q4k_q82x4_tile_avx512, also the one-column kernel at C = 1) and row lanes (dot_lanes_avx512), two unsafe
 # fns with one block per pointer operation, load, store and unsafe helper call and each pointer offset apart from its load (R1, 37 blocks), and the dot_row and
 # tile arms that call them, each with its SAFETY line.
-qdot 180 79 0
+# PIN(2026-10-14): qdot 180 -> 172 blocks, 79 -> 80 fns, new code, not old code relaxed: the tile's AVX-512 choice
+# moves ahead of tile::<C> into tile_q4k_avx512 (1 block), and the Q4_K and Q5_K kernels take their column factors
+# from q82x4_dy_my (one unsafe fn of 8 blocks, one per pointer offset and load) and their scale and min loads from
+# q45k_scales_ps and q45k_mins_ps (safe AVX2 fns of one load block each); the two AVX-512 bodies keep one block per
+# load, store, pointer offset or unsafe call (7 and 12); each with its SAFETY line.
+qdot 172 80 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1
