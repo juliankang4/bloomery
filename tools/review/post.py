@@ -205,6 +205,7 @@ def pr_paths(files_path, diff):
 
 def device_dirs(root):
     """`crates/<dir>/` for every workspace crate whose dependency closure reaches cuda-core."""
+    root = os.path.abspath(root)
     r = subprocess.run([sys.executable, os.path.join(root, "tools", "recipes.py"), "pure-crates"], cwd=root,
                        capture_output=True, text=True)
     names = {ln.split()[1] for ln in r.stdout.splitlines()
@@ -565,6 +566,19 @@ def self_test():
             check(out, dp, pj, [], files_path=fp if files is not None else None)
             assert open(os.path.join(out, "review.md")).read() == text  # a second check changes nothing
         assert pr_paths(None, "--- a/x.rs\n+++ b/x.rs\n--- /dev/null\n+++ b/.github/y\n") == [".github/y", "x.rs"]
+
+        # The workflow passes a root relative to the directory above the tree.
+        tree = os.path.join(d, "tree")
+        os.makedirs(os.path.join(tree, "tools"))
+        os.makedirs(os.path.join(tree, "crates", "foo"))
+        open(os.path.join(tree, "tools", "recipes.py"), "w").write('print("rejected foo reaches the device root")\n')
+        open(os.path.join(tree, "crates", "foo", "Cargo.toml"), "w").write('name = "foo"\n')
+        here = os.getcwd()
+        os.chdir(d)
+        try:
+            assert device_dirs("tree") == ["crates/foo/"]
+        finally:
+            os.chdir(here)
 
         # Card labels: only for a change under a device crate; a freeze holds a needs-gpu approval.
         dev, frz = os.path.join(d, "device.txt"), os.path.join(d, "freeze.txt")

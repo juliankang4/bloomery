@@ -209,6 +209,9 @@ jobs:
           HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
           PREV_SHA: ${{ needs.gate.outputs.prev_sha }}
           TREE_SHA: ${{ github.sha }}
+          # tools/recipes.py reads the workspace with `cargo metadata --offline`, which stable does; without this,
+          # rust-toolchain.toml would install the pinned nightly and its components first.
+          RUSTUP_TOOLCHAIN: stable
         run: |
           set -euo pipefail
           mkdir -p ctx out trace
