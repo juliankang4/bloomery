@@ -185,11 +185,12 @@ pub enum EngramError {
         product: u64,
         nbytes: u64,
     },
-    #[error("{name}: data at {at} + {nbytes} B runs past the {len} B file {path}")]
+    #[error("{name}: data at {base}+{off} + {nbytes} B runs past the {len} B file {path}")]
     PastEndOfFile {
         name: String,
         path: PathBuf,
-        at: u64,
+        base: u64,
+        off: u64,
         nbytes: u64,
         len: u64,
     },
@@ -283,16 +284,17 @@ impl Site {
                 nbytes,
             });
         }
-        let base = data_base + t.offset;
-        if base + nbytes > file_len {
-            return Err(EngramError::PastEndOfFile {
+        let base = data_base
+            .checked_add(t.offset)
+            .filter(|b| b.checked_add(nbytes).is_some_and(|end| end <= file_len))
+            .ok_or_else(|| EngramError::PastEndOfFile {
                 name: t.name.clone(),
                 path: path.to_path_buf(),
-                at: base,
+                base: data_base,
+                off: t.offset,
                 nbytes,
                 len: file_len,
-            });
-        }
+            })?;
 
         let page = page_size() as u64;
 
@@ -958,7 +960,37 @@ fn faults_of(who: libc::c_int) -> Faults {
 
 #[cfg(test)]
 mod tests {
-    use super::adjacent_runs;
+    use super::{EngramError, RawTensorInfo, Site, adjacent_runs};
+
+    /// A table whose start or end passes u64 is past the end of its file, named
+    /// with the data base and the header's offset: an F32 [4, 1] table in an
+    /// 80-byte file whose data starts at 64, at an offset that wraps the start
+    /// to the last header byte, and at one that wraps the end to 8.
+    #[test]
+    fn a_table_whose_range_passes_u64_is_past_the_end() {
+        let (data_base, len) = (64, 80);
+        let path = std::env::temp_dir().join(format!("engram-wrap-{}", std::process::id()));
+        std::fs::write(&path, [0u8; 80]).unwrap();
+        for offset in [u64::MAX, u64::MAX - data_base - 7] {
+            let t = RawTensorInfo {
+                name: "blk.1.engram_embd.weight".to_string(),
+                dims: vec![4, 1],
+                type_id: 0,
+                offset,
+                nbytes: Some(16),
+            };
+            match Site::open(&path, data_base, len, &t) {
+                Err(EngramError::PastEndOfFile { base, off, .. }) => {
+                    assert_eq!((base, off), (data_base, offset));
+                }
+                other => panic!(
+                    "offset {offset} must be past the end, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
 
     /// Runs come out sorted, without repeats, adjacent ids joined, and the
     /// last id a `u32` holds joins its neighbour without an overflow.

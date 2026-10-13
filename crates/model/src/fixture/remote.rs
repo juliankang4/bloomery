@@ -195,24 +195,32 @@ pub fn sparse_shard(
 fn check_size(dest: &Path, file: &str, size: u64) -> Result<(), RemoteError> {
     let g = match Gguf::open(dest) {
         Ok(g) => g,
-        Err(LoadError::OutOfBounds {
-            name,
-            base,
-            off,
-            nbytes,
-            ..
-        }) => {
-            return Err(RemoteError::ListedShort {
-                file: file.to_string(),
-                listed: size,
-                tensor: name,
-                end: base + off + nbytes,
-            });
-        }
         Err(source) => {
-            return Err(RemoteError::Header {
-                file: file.to_string(),
-                source,
+            // A tensor whose end passes u64 has no end to report: it keeps the reader's refusal.
+            let short = match &source {
+                LoadError::OutOfBounds {
+                    name,
+                    base,
+                    off,
+                    nbytes,
+                    ..
+                } => base
+                    .checked_add(*off)
+                    .and_then(|e| e.checked_add(*nbytes))
+                    .map(|end| (name.clone(), end)),
+                _ => None,
+            };
+            return Err(match short {
+                Some((tensor, end)) => RemoteError::ListedShort {
+                    file: file.to_string(),
+                    listed: size,
+                    tensor,
+                    end,
+                },
+                None => RemoteError::Header {
+                    file: file.to_string(),
+                    source,
+                },
             });
         }
     };
@@ -535,6 +543,32 @@ mod tests {
                 }
                 (other, _) => panic!("{what}: {other:?}"),
             }
+        }
+    }
+
+    /// A tensor whose end passes u64 is the reader's own refusal, not a listing that is too short:
+    /// its offset, the last field of the header, set to `u64::MAX`.
+    #[test]
+    fn a_tensor_end_past_u64_keeps_the_readers_refusal() {
+        let d = scratch("wrap");
+        let mut file = gguf_bytes(4, 1);
+        let p = d.join("whole.gguf");
+        fs::write(&p, &file).expect("whole file");
+        let at = gguf::inventory_of(&p).expect("inventory").header_end as usize - 8;
+        file[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let log = RefCell::new(Vec::new());
+        match sparse_shard(
+            &d.join("s.gguf"),
+            "m.gguf",
+            file.len() as u64,
+            FIRST_RANGE,
+            &mut reader(&file, &log),
+        ) {
+            Err(RemoteError::Header {
+                source: LoadError::OutOfBounds { name, off, .. },
+                ..
+            }) => assert_eq!((name.as_str(), off), ("t0", u64::MAX)),
+            other => panic!("{other:?}"),
         }
     }
 

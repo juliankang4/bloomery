@@ -100,7 +100,8 @@ pub struct RawTensorInfo {
     pub offset: u64,
     /// `type_size * (ne[0]/blck) * ne[1] * …` from ggml's table — the same
     /// product `ggml_row_size` computes — or `None` for a type id outside
-    /// both [`GgmlType`] and [`ggml_type_info`].
+    /// both [`GgmlType`] and [`ggml_type_info`]. A product past u64 is
+    /// [`LoadError::TooLarge`], never a value here.
     pub nbytes: Option<u64>,
 }
 
@@ -141,6 +142,13 @@ pub enum LoadError {
     UnsupportedType { name: String, ty: GgmlType },
     #[error("tensor {name:?}: ne[0] {ne0} is not a multiple of the block size {blck}")]
     UnalignedRow { name: String, ne0: u64, blck: u64 },
+    /// A tensor whose byte count passes u64: no file holds it.
+    #[error("tensor {name:?}: {ty} dims {dims:?} hold more bytes than a u64 counts")]
+    TooLarge {
+        name: String,
+        dims: Vec<u64>,
+        ty: GgmlType,
+    },
     #[error("tensor {name:?}: data at {base}+{off} size {nbytes} exceeds the file ({len})")]
     OutOfBounds {
         name: String,
@@ -436,26 +444,21 @@ impl Gguf {
     /// slice arithmetic is checked again here, so a stale `TensorInfo` from
     /// another file errors instead of panicking.
     pub fn data<'a>(&'a self, t: &TensorInfo) -> Result<&'a [u8], LoadError> {
-        let start = self.data_base as usize + t.offset as usize;
+        // A closure, so the name is cloned only for a refusal.
+        let out_of_bounds = || LoadError::OutOfBounds {
+            name: t.name.clone(),
+            base: self.data_base,
+            off: t.offset,
+            nbytes: t.nbytes,
+            len: self.map.len() as u64,
+        };
+        let start = (self.data_base as usize)
+            .checked_add(t.offset as usize)
+            .ok_or_else(out_of_bounds)?;
         let end = start
             .checked_add(t.nbytes as usize)
-            // `ok_or_else`: the eager form cloned the name on every call, hit or not.
-            .ok_or_else(|| LoadError::OutOfBounds {
-                name: t.name.clone(),
-                base: self.data_base,
-                off: t.offset,
-                nbytes: t.nbytes,
-                len: self.map.len() as u64,
-            })?;
-        if end > self.map.len() {
-            return Err(LoadError::OutOfBounds {
-                name: t.name.clone(),
-                base: self.data_base,
-                off: t.offset,
-                nbytes: t.nbytes,
-                len: self.map.len() as u64,
-            });
-        }
+            .filter(|&end| end <= self.map.len())
+            .ok_or_else(out_of_bounds)?;
         Ok(&self.map[start..end])
     }
 
@@ -784,12 +787,26 @@ pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
     Some((name, blck, tsz))
 }
 
-/// `type_size * (ne[0]/blck) * ne[1] * …` for a type id ggml's table knows,
-/// else `None`. The product is `ggml_row_size`'s: integer division, missing
-/// dims implicit 1s.
-fn row_bytes(type_id: u32, dims: &[u64]) -> Option<u64> {
-    let (_, blck, tsz) = ggml_type_info(type_id)?;
-    Some(tsz * (dims[0] / blck) * dims[1..].iter().product::<u64>())
+/// `type_size * (ne[0]/blck) * ne[1] * …`, the bytes of a tensor of `tsz`-byte
+/// blocks of `blck` values, or `None` when the product passes u64. The
+/// product is `ggml_row_size`'s: integer division (a caller that needs whole
+/// blocks checks ne[0] first), missing dims implicit 1s. The reader, the
+/// writer and the model crate's fixture planner size every tensor here.
+///
+/// # Panics
+/// On empty `dims` or a `blck` of 0.
+pub fn tensor_bytes(blck: u64, tsz: u64, dims: &[u64]) -> Option<u64> {
+    let row = tsz.checked_mul(dims[0] / blck)?;
+    dims[1..].iter().try_fold(row, |acc, &d| acc.checked_mul(d))
+}
+
+/// [`tensor_bytes`], or [`LoadError::TooLarge`] naming the tensor.
+fn sized(name: &str, ty: GgmlType, blck: u64, tsz: u64, dims: &[u64]) -> Result<u64, LoadError> {
+    tensor_bytes(blck, tsz, dims).ok_or_else(|| LoadError::TooLarge {
+        name: name.to_string(),
+        dims: dims.to_vec(),
+        ty,
+    })
 }
 
 impl Value {
@@ -891,9 +908,10 @@ const FILE_TABLE_IDS: [u32; 2] = [2, 3];
 
 /// The strict pass over a parsed header's tensors: every tensor must be sized
 /// by this engine's `GgmlType`, by ggml's table for the ids in
-/// [`FILE_TABLE_IDS`], or by its entry in `private`, and its first dim must be
-/// block-aligned; then every tensor must sit inside the `len`-byte file — the
-/// placement invariant the coverage gate re-checks per tensor.
+/// [`FILE_TABLE_IDS`], or by its entry in `private`, its first dim must be
+/// block-aligned and its bytes must fit a u64; then every tensor must sit
+/// inside the `len`-byte file — the placement invariant the coverage gate
+/// re-checks per tensor.
 fn strict_tensors(
     raw: Vec<RawTensorInfo>,
     data_base: u64,
@@ -931,9 +949,7 @@ fn strict_tensors(
                 blck,
             });
         }
-        // Missing dims are implicit 1s (ggml tensors are 4-D); the
-        // product below folds them in.
-        let nbytes = tsz * (t.dims[0] / blck) * t.dims[1..].iter().product::<u64>();
+        let nbytes = sized(&t.name, ty, blck, tsz, &t.dims)?;
         strict.push(TensorInfo {
             name: t.name,
             dims: t.dims,
@@ -1014,8 +1030,11 @@ fn parse_header(b: &[u8], len: u64) -> Result<Header, LoadError> {
         }
         let type_id = rd.u32()?;
         let offset = rd.u64()?;
+        let nbytes = ggml_type_info(type_id)
+            .map(|(_, blck, tsz)| sized(&name, GgmlType::from_u32(type_id), blck, tsz, &dims))
+            .transpose()?;
         tensors.push(RawTensorInfo {
-            nbytes: row_bytes(type_id, &dims),
+            nbytes,
             name,
             dims,
             type_id,
@@ -1453,8 +1472,10 @@ mod private_tests {
     /// A file tagged with a private id opens only through a table that lists
     /// it: the strict opens and the split refuse it by the tensor's name,
     /// `open_private` sizes it from the entry and keeps the id, an id outside
-    /// the table is still refused, and a table naming an id this build sizes,
-    /// sizing nothing or repeating an id is refused before any file is read.
+    /// the table is still refused, an entry whose size makes the tensor's
+    /// bytes pass u64 is refused by the tensor's name, and a table naming an
+    /// id this build sizes, sizing nothing or repeating an id is refused
+    /// before any file is read.
     #[test]
     fn a_private_type_opens_only_through_its_table() {
         let d = set_dir("tag");
@@ -1516,6 +1537,20 @@ mod private_tests {
                     other.map(|_| ())
                 ),
             }
+        }
+        let huge = [PrivateType {
+            id: TAG,
+            blck: 256,
+            size: u64::MAX / 2,
+        }];
+        match Gguf::open_private(&p, LAZY, &huge) {
+            Err(LoadError::TooLarge { name, ty, .. }) => {
+                assert_eq!((name.as_str(), ty), ("q", GgmlType::Unknown(TAG)));
+            }
+            other => panic!(
+                "a size past u64 must be refused, got {:?}",
+                other.map(|_| ())
+            ),
         }
         let empty = [PrivateType {
             id: TAG,
