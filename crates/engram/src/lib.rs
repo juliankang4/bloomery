@@ -284,17 +284,17 @@ impl Site {
                 nbytes,
             });
         }
-        let base = data_base
-            .checked_add(t.offset)
-            .filter(|b| b.checked_add(nbytes).is_some_and(|end| end <= file_len))
-            .ok_or_else(|| EngramError::PastEndOfFile {
+        let base = data_base + t.offset;
+        if base + nbytes > file_len {
+            return Err(EngramError::PastEndOfFile {
                 name: t.name.clone(),
                 path: path.to_path_buf(),
                 base: data_base,
                 off: t.offset,
                 nbytes,
                 len: file_len,
-            })?;
+            });
+        }
 
         let page = page_size() as u64;
 

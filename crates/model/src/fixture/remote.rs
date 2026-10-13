@@ -204,10 +204,7 @@ fn check_size(dest: &Path, file: &str, size: u64) -> Result<(), RemoteError> {
                     off,
                     nbytes,
                     ..
-                } => base
-                    .checked_add(*off)
-                    .and_then(|e| e.checked_add(*nbytes))
-                    .map(|end| (name.clone(), end)),
+                } => Some((name.clone(), base + off + nbytes)),
                 _ => None,
             };
             return Err(match short {

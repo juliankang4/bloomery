@@ -452,9 +452,7 @@ impl Gguf {
             nbytes: t.nbytes,
             len: self.map.len() as u64,
         };
-        let start = (self.data_base as usize)
-            .checked_add(t.offset as usize)
-            .ok_or_else(out_of_bounds)?;
+        let start = self.data_base as usize + t.offset as usize;
         let end = start
             .checked_add(t.nbytes as usize)
             .filter(|&end| end <= self.map.len())
@@ -1031,8 +1029,7 @@ fn parse_header(b: &[u8], len: u64) -> Result<Header, LoadError> {
         let type_id = rd.u32()?;
         let offset = rd.u64()?;
         let nbytes = ggml_type_info(type_id)
-            .map(|(_, blck, tsz)| sized(&name, GgmlType::from_u32(type_id), blck, tsz, &dims))
-            .transpose()?;
+            .map(|(_, blck, tsz)| tsz * (dims[0] / blck) * dims[1..].iter().product::<u64>());
         tensors.push(RawTensorInfo {
             nbytes,
             name,

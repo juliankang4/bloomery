@@ -185,9 +185,7 @@ fn known_bytes(shards: &[Shard]) -> Result<u64, String> {
     let mut total = 0u64;
     for s in shards {
         for t in &s.inv.tensors {
-            total = total.checked_add(t.nbytes.unwrap_or(0)).ok_or_else(|| {
-                format!("{}: tensor {}: the tensor bytes pass u64", s.path, t.name)
-            })?;
+            total += t.nbytes.unwrap_or(0);
         }
     }
     Ok(total)

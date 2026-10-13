@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::ops::Range;
 
-use crate::{GENERAL_ALIGNMENT, Value, ggml_type_info, tensor_bytes};
+use crate::{GENERAL_ALIGNMENT, Value, ggml_type_info};
 
 /// The alignment of a file whose metadata does not set one.
 pub const DEFAULT_ALIGNMENT: u64 = 32;
@@ -239,9 +239,12 @@ fn check_tensor(t: &TensorDecl) -> Result<(), WriteError> {
             blck,
         });
     }
-    let want = tensor_bytes(blck, tsz, &t.dims).ok_or_else(|| WriteError::TooLarge {
-        name: t.name.clone(),
-    })?;
+    let want = t.dims[1..]
+        .iter()
+        .try_fold(tsz * (t.dims[0] / blck), |acc, d| acc.checked_mul(*d))
+        .ok_or_else(|| WriteError::TooLarge {
+            name: t.name.clone(),
+        })?;
     if want != t.nbytes {
         return Err(WriteError::TensorBytes {
             name: t.name.clone(),
