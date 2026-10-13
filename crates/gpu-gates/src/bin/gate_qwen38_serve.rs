@@ -472,7 +472,6 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
         PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore, server_log,
-        stage_usable,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -4807,6 +4806,9 @@ mod gate {
         prompt: &str,
         reference: &[u32],
     ) -> Result<bool, GateError> {
+        // The devices' totals for the plan line's bound, read before the
+        // server holds any of them.
+        let census = bloomery_gpu::census()?;
         let exe = Served38::exe()?;
         let err_log = dir.join("server.err");
         let mut cmd = Command::new(&exe);
@@ -4823,17 +4825,21 @@ mod gate {
         let (st, body) = curl(&url("/health"), None, false)?;
         println!("health {st} {body}");
         check(&mut ok, "health_ok", st == 200 && body.contains("\"ok\""));
-        // The seat's `plan` line names its stage card's free bytes at plan
-        // time, at most the device's usable bytes — the census term the
-        // expert rule filled within (memguard). FAIL-first: a plan line that
-        // drops it, or names it past the usable bytes, turns this red.
+        // PIN(2026-10-14): the bound is the stage device's, not the bytes its
+        // card plans: under `--place gate` on a larger device the card plans
+        // fewer bytes than the device's, and `card_free` is still the
+        // device's reading. The seat's `plan` line names its stage card's
+        // free bytes at plan time, at most the device's usable bytes and under
+        // its total: the census term the expert rule filled within
+        // (memguard). FAIL-first: a plan line that drops it, or names it past
+        // that bound, turns this red.
         let plan = seat_log(&err_log)?.one(&record::PLAN38)?;
         let free = plan.opt_u64("card_free")?;
-        let usable = stage_usable(&plan)?;
-        let free_named = free.is_some_and(|f| f <= usable);
+        let limit = record::stage_device_free_limit(&plan, &census)?;
+        let free_named = free.is_some_and(|f| f <= limit);
         println!(
             "plan names the stage card's free bytes {free_named}: card_free={free:?}, usable \
-             {usable}"
+             {limit}"
         );
         check(&mut ok, "plan_names_the_cards_free_bytes", free_named);
         check(

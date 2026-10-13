@@ -1204,9 +1204,9 @@ else
   arm='timing_cards_start > /dev/null; timing_cards_arm log; echo "arm 0"; export STUB_GONE=1; timing_cards_arm log || echo "arm $?: $TWOCARD_WHY"'
   locx 'timing-card.sh local: a lost card fails the arm' 0 "^arm 1: the timing card \\($FAKE_GB10\\) does not answer nvidia-smi \\(rc 15\\)\$" "$arm"
   has 'timing-card.sh local: the card answering passes the arm' '^arm 0$'
-  # arm-place.sh: one card, so bp (two cards by size rank) is refused by name, as gate (the card named 3090) is.
+  # arm-place.sh: one card, so bp (two cards by size rank) is refused by name, as gate (the 3090's rows) is.
   locx 'timing-card.sh local: arm-place.sh refuses bp (64)' 64 \
-    "^r: BLOOMERY_GEN_PLACE=bp: local mode times this machine's one card, at a \\(gate loads the card named 3090, bp two cards by size rank\\)\$" \
+    "^r: BLOOMERY_GEN_PLACE=bp: local mode times this machine's one card, at a \\(gate's rows are the 3090's, bp two cards by size rank\\)\$" \
     'source "${1%/*}/arm-place.sh"; PLACE_RUNNER=r PLACE_BIN=b PLACE_WORDS="a gate bp"; place_check "" bp'
 fi
 

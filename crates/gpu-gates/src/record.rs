@@ -44,8 +44,10 @@ use bloomery_gpu::hybrid::HostResidency;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::prompt_timing::PromptStats;
 use bloomery_levers::ChurnHosting;
-use model::placement::workstation::{HostRead, plan_room};
+use model::placement::workstation::{self, DeviceInfo, HostRead, plan_room, spec_of_device};
 use model::placement::{Machine, Plan, arena_slots};
+
+use crate::GateError;
 
 /// The schema's version, the first line of `--records-schema`.
 pub const VERSION: u32 = 1;
@@ -3792,6 +3794,47 @@ pub fn plan_devices(machine: &Machine) -> Vec<String> {
         .collect()
 }
 
+/// The most a census device's free reading may be, inclusive: its usable
+/// bytes (`workstation::spec_of_device`) held under its total. The free
+/// reading stays under the total; a device whose total is a whole number of
+/// MiB has usable bytes equal to that total, so the usable bytes alone would
+/// pass a reading that names the total. A zero total is a named error.
+pub fn device_free_limit(device: &DeviceInfo) -> Result<u64, GateError> {
+    let below_total = device.total_bytes.checked_sub(1).ok_or_else(|| {
+        format!(
+            "census device cuda{} ({}) reads a zero total",
+            device.ordinal, device.name
+        )
+    })?;
+    Ok(spec_of_device(device).usable_bytes().min(below_total))
+}
+
+/// The most a `plan` record's `card_free` may read ([`PLAN`] or
+/// [`PLAN38`]), inclusive: the free limit of the device its stage card runs
+/// on, as `census` gives that device ([`device_free_limit`]). `card_free` is
+/// the device's free reading. The stage item ([`plan_devices`]) names the
+/// device by its ordinal; its bytes are what the card plans, fewer than the
+/// device's under `--place gate` on a larger device. A stage the plan opens by
+/// name, or an ordinal the census does not hold, is a named error.
+pub fn stage_device_free_limit(plan: &Fields, census: &[DeviceInfo]) -> Result<u64, GateError> {
+    let devices = plan.csv("devices")?;
+    let stage = devices
+        .first()
+        .ok_or_else(|| format!("a `plan` record with no device: {}", plan.line()))?;
+    let device = stage
+        .rsplit(':')
+        .nth(1)
+        .and_then(|at| at.strip_prefix("cuda")?.parse::<u32>().ok())
+        .and_then(|o| census.iter().find(|d| d.ordinal == o))
+        .ok_or_else(|| {
+            format!(
+                "a `plan` record's stage device {stage:?} is no device of the census (visible: {})",
+                workstation::visible(census)
+            )
+        })?;
+    device_free_limit(device)
+}
+
 /// The order this process's CUDA ordinals follow: `CUDA_DEVICE_ORDER`, or
 /// the driver's default when it is unset.
 #[must_use]
@@ -5058,6 +5101,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A serve gate holds a `plan` record's `card_free` to its stage
+    /// device's usable bytes ([`stage_device_free_limit`]): on the box's
+    /// 3090 and A6000, and on a GB10 under `--place gate`, whose stage plans
+    /// the 3090's bytes while the free reading is the device's own. A line
+    /// that names the device's total in place of its free reading passes
+    /// that bound on none of them, nor on a device whose total is a whole
+    /// number of MiB, whose usable bytes are that total; the bound there is
+    /// a byte under the total ([`device_free_limit`], which the memory
+    /// guard's census clause also reads). A device with a zero total is a
+    /// named error.
+    #[test]
+    fn card_free_is_held_to_the_stage_devices_usable_bytes() {
+        let device = |ordinal: u32, name: &str, total_bytes: u64, integrated: bool| DeviceInfo {
+            ordinal,
+            name: name.to_string(),
+            total_bytes,
+            free_bytes: 0,
+            integrated,
+            uuid: [7; 16],
+            pci_bus: format!("0000:0{ordinal}:00.0"),
+            held_by: None,
+        };
+        let the_box = [
+            device(0, "NVIDIA GeForce RTX 3090", 25_351_356_416, false),
+            device(1, "NVIDIA RTX A6000", 50_952_536_064, false),
+        ];
+        let gb10 = [device(0, "NVIDIA GB10", 130_596_122_624, true)];
+        let gb10_gate = "plan place=gate card=GB10 experts=card ctx_max=8192 host_experts=1235 \
+            card_experts=813 card_free=124798394368 room=124566859776 plan_room=124029988864 \
+            devices=[stage:GB10:cuda0:25350373376] cuda_order=unset(FASTEST_FIRST)";
+        let cases: [(&str, &[&Kind], &Kind, &[DeviceInfo]); 3] = [
+            (PLAN38_PLACED, BLOOMERY_SERVE_QWEN3, &PLAN38, &the_box),
+            (PLAN_BP, BLOOMERY_SERVE_DS41, &PLAN, &the_box),
+            (gb10_gate, BLOOMERY_SERVE_QWEN38, &PLAN38, &gb10),
+        ];
+        for (line, kinds, kind, census) in cases {
+            let plan = Log::of(line, kinds).one(kind).unwrap();
+            let limit = stage_device_free_limit(&plan, census).unwrap();
+            let free = plan.u64("card_free").unwrap();
+            assert!(free <= limit, "{line}: limit {limit}");
+            let total = census
+                .iter()
+                .find(|d| limit == spec_of_device(d).usable_bytes())
+                .unwrap()
+                .total_bytes;
+            assert!(total > limit, "{line}: total {total}");
+        }
+        // The GB10's total rounded down to a whole MiB [assumed total].
+        let whole_mib = gb10[0].total_bytes / workstation::MIB * workstation::MIB;
+        let aligned = [device(0, "NVIDIA GB10", whole_mib, true)];
+        let plan = Log::of(gb10_gate, BLOOMERY_SERVE_QWEN38)
+            .one(&PLAN38)
+            .unwrap();
+        let limit = stage_device_free_limit(&plan, &aligned).unwrap();
+        assert_eq!(limit, whole_mib - 1, "a whole-MiB total {whole_mib}");
+        let zero = [device(0, "NVIDIA GB10", 0, true)];
+        let err = stage_device_free_limit(&plan, &zero)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reads a zero total"), "a zero total: {err}");
     }
 
     /// An optional part the line leaves out reads as absent, and the parts

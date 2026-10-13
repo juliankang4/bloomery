@@ -35,14 +35,13 @@ budget solver.
 | Phase | Done when | State (2026-10-13) | Left, and who |
 |---|---|---|---|
 | **P0** compiles on aarch64 | `cargo check` of the host chain passes on aarch64 Linux, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | done: [#14](https://github.com/midagedev/bloomery/pull/14), `d95c7ec9` (design R: `qdot` refuses its host-tier types off x86, answer 1) | nothing (the site map is Appendix A) |
-| **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), `gate-engram`'s eviction clause (`1dc4c184`, answer 18). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the unpublished fixture-tier inputs and `--place gate` (maintainers, answer 18); a gate for the first cc 12.1 bit pass (section 10) |
+| **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), `gate-engram`'s eviction clause (`86022f32`, answer 18). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the unpublished fixture-tier inputs (maintainers, answer 18); a gate for the first cc 12.1 bit pass (section 10) |
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
 | **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | the contributor's part is done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)) | per-arch `ptx-shapes.tsv` rows (maintainers; section 6) |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 refuse to load at serving defaults on one Spark; a fix is in progress ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134430861)) | the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
 | **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6) | the placement half (contributor, answer 20); the protocol half, started by the contributor with the `Link` seam; its monotonic words stay the maintainers' unless they hand them over (section 9.6) |
 
-Files the open work touches: P1, the fixture-tier inputs and `--place gate`
-(`crates/placement/src/placement/devices.rs:221`); P3, the per-arch rows of `tools/ref/ptx-shapes.tsv` and
+Files the open work touches: P1, the fixture-tier inputs; P3, the per-arch rows of `tools/ref/ptx-shapes.tsv` and
 `tools/ptx-scan.sh`; P4, the card's gather kernels that read the arena in `crates/gpu/src/host/nvtier.rs` (the card
 leg); P5, `crates/placement` (`Machine`, `nodes_scale`), `crates/gpu/src/host/mod.rs` and `tier.rs` (the monotonic
 words and the `Link` seam) and the transport (9.5).
@@ -64,10 +63,10 @@ The binary carries `sm_86` PTX, and the driver compiles it for cc 12.1 at the fi
 `[derived]` once per `CUDA_CACHE_PATH` (section 6).
 
 **Smallest first placement: everything on the card, no host tier, no NVMe tier.** Two ways in, both generic already:
-`--place a` is `Pick::Rank(0)`, "the largest visible card" (`crates/placement/src/placement/devices.rs:219-224`), and an
+`--place a` is `Pick::Rank(0)`, "the largest visible card" (`crates/placement/src/placement/devices.rs:236-243`), and an
 unknown card takes the census path with its own total and free bytes (`devices.rs:98-123`); the Qwen3 and Qwen3.6 seat
-opens "CUDA device 0" (`crates/gpu/src/lib.rs:2124`; `docs/BUILD.md:100` at `b289130a`). `--place gate` needs a card named 3090
-(`devices.rs:221`) and is refused. (`docs/BUILD.md:102` at `b289130a` still says `a` needs a card named A6000; that is stale.) The plan
+opens "CUDA device 0" (`crates/gpu/src/lib.rs:2124`; `docs/BUILD.md:100` at `b289130a`). `--place gate` plans the 3090's bytes on the
+smallest visible card with the room for them (`devices.rs:241`), which on a Spark is the GB10 with a 3090's share. The plan
 reads an integrated device's room from `MemAvailable` (section 7.2), so it no longer needs a `drop_caches` before the
 load, as the first run did (section 3).
 
@@ -142,7 +141,7 @@ BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_BOUND
   `crates/refset/src/fixture.rs:19-20`). `/models/fixtures` stays the one legal root, so on a Spark it is a symlink
   (answer 2).
 - **Card names.** A Spark's card is named neither 3090 nor A6000, and local mode takes the one local card without a name
-  match. `--place gate` opens the 3090 by name, so a gate that uses it stays closed on GB10, and local mode refuses the
+  match. `--place gate` plans the 3090's bytes on the smallest visible card with the room for them, the GB10 here, and local mode refuses the
   two-card recipes (rc 64) ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Which
   fixture gates open on a card with no box name is in `local-check.md` section 3. `nvidia-smi` prints `[N/A]` for
   GB10's memory fields `[#13]`; the census reads the driver API (`gpu/src/lib.rs:1789`).
@@ -945,7 +944,7 @@ None of this exists yet. It is the placement half's gate (answer 20), built with
 Each open item; the owner is named where one is agreed. An item that a measurement closed is in the list after it.
 
 **P1 and the card.**
-- The unpublished fixture-tier inputs and `--place gate`, which hold most of the contributor list's reds: the
+- The unpublished fixture-tier inputs, which hold most of the contributor list's reds: the
   maintainers (answer 18, section 1).
 - Which gate carries the first bit-gate pass on cc 12.1 (asked of the maintainers, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
 - Per-arch `ptx-shapes.tsv` rows, so `gate-ptx-spill` can read `sm_121` PTX: the maintainers (section 6).
@@ -995,7 +994,7 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   explain.~~ A header read of the `UD-Q4_K_XL` file's non-routed tensors gives A 7.36 GB and Sh 1.60 GB a token (9.7,
   [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6139352984)).
 - ~~BW~~ (section 5): 208.8 GB/s on `b289130a`, 177.5 GB/s on `04d0c0ae`.
-- ~~`gate-engram`'s eviction clause on a Spark~~ (answer 18). At `1dc4c184` an eviction drops each run of adjacent
+- ~~`gate-engram`'s eviction clause on a Spark~~ (answer 18). At `86022f32` an eviction drops each run of adjacent
   rows in one call (`adjacent_runs`, `crates/engram/src/lib.rs:567`; `SplitTable::evict_rows`,
   `crates/engram/src/rows.rs:196`), and the clause (`crates/engram/tests/engram.rs:706`) checks every page of the named
   experts after each eviction.
@@ -1075,7 +1074,7 @@ Added 2026-10-13 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecom
     call; whoever measured the cause decides. The fixture and public set gaps and `--place gate` are the maintainers'; a
     contributor may take any of them.
     *Now: the eviction clause is done as (b), with each run of adjacent rows dropped in one call (section 10, Closed).
-    The rest is in section 10.*
+    The contributor takes `--place gate`; the rest is in section 10.*
 19. **S7, `devmap` and the card leg:** the contributor's, `devmap`'s clause included. A design that departs from (d) and
     (h) goes ahead on its grounds; the contributor decides the load shape and the slice alignment from the
     measurements. Verification may run on any card, and the maintainers take a result checked on the contributor's card

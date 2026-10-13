@@ -89,7 +89,7 @@ Only the build reads the variable, for example `BLOOMERY_GIT_COMMIT=$(git rev-pa
 
 ## Picking the card
 
-The placement plans are built from the development machine's two cards and its RAM (`crates/model/src/placement/workstation.rs`). A binary finds a plan's card by its CUDA device name: `--place gate` needs one visible device whose name contains `3090`, `--place a` one whose name contains `A6000`, and `--place bp` both. Two visible devices that match the same name are an error (`2 visible devices are named like "3090"`), so on a host with two 3090s make one visible with `CUDA_VISIBLE_DEVICES`. Two 3090s together are not supported: nothing places a model or a draft across two cards of one name. A card named like `3090 Ti` also matches `3090`.
+The placement plans are built from the development machine's two cards and its RAM (`crates/model/src/placement/workstation.rs`). A binary picks a plan's cards among the visible devices by their usable bytes: `--place a` takes the largest visible card, `--place bp` the largest and the next-largest, and `--place gate` plans a 3090's bytes (24,176 MiB usable) on one card: the smallest visible card with at least those bytes, or with `3090` in its name. A tie goes to the lower CUDA index. On this machine that is the A6000 for `a`, the A6000 and the 3090 for `bp`, and the 3090 for `gate`. A `--place` list of card names, such as `A6000+3090`, picks by CUDA device name instead. There, two visible devices that match one name are an error (`2 visible devices carry the name 3090`), so name one by its CUDA index (`cuda1`). A card named like `3090 Ti` also matches `3090`.
 
 | Binary | `--place` takes | Default |
 |---|---|---|
@@ -151,7 +151,7 @@ BLOOMERY_REF_MODEL="$M" target/release/bloomery-serve-ds41 --host 127.0.0.1 --po
 ```
 
 <!-- pending: default-place-a -->
-The commands above use the default `--place a`, an A6000. On a single RTX 3090, add `--place gate` to each of the three: the same plan shape on a card named `3090`, with fewer routed experts on the card. The binaries read the model file from `BLOOMERY_REF_MODEL`; they have no default path and stop if it is unset.
+The commands above use the default `--place a`, an A6000. On a single RTX 3090, add `--place gate` to each of the three: the same plan shape on the 3090, with fewer routed experts on the card. The binaries read the model file from `BLOOMERY_REF_MODEL`; they have no default path and stop if it is unset.
 
 **The r8 sidecar.** The host expert tier reads its routed gate and up weights from a second file, the r8 sidecar, laid out for the CPU kernels: `<model dir>-r8/<name>-r8.gguf` beside the model directory, 155.7 GB. For the download above that is `~/models/DeepSeek-V4.1-Flash-Q3_K_M-r8/DeepSeek-V4.1-Flash-Q3_K_M-r8.gguf`; `r8conv path` prints it. `r8conv convert` writes it from the model file and `r8conv verify` checks it against the model file. It is on by default (`BLOOMERY_R8`). Without the file the engine reads the model file instead, with the same output bit for bit, and says so on its `load` line: `load host_tier r8=off (no sidecar at <path>: just r8-sidecar)`. A sidecar that does not match the model file is an error, never a fall-back. Budget the disk for both files. `r8conv convert` picks V4.1's routed stacks by itself; the other models' host tiers also read a sidecar when one is there, but this page does not cover writing one for them.
 
@@ -165,8 +165,8 @@ The commands above use the default `--place a`, an A6000. On a single RTX 3090, 
 |---|---|
 | `--tokens a,b,c` | the prompt as token ids; the example is "The capital of France is" without a BOS token (or `--prompt-id P` for a row under `$BLOOMERY_DATA/greedy-ds41/`) |
 | `-n N` | tokens to generate (default 32) |
-| `--place a` | plan (a), the default: all layers and the head on a card named `A6000`, each routed layer's expert prefix the budget allows, the rest on the host |
-| `--place gate` | the same shape on a card named `3090` |
+| `--place a` | plan (a), the default: all layers and the head on the largest visible card (the A6000 here), each routed layer's expert prefix the budget allows, the rest on the host |
+| `--place gate` | the same shape with a 3090's bytes, on the smallest visible card with the room for them (the 3090 here) |
 | `--place bp` | plan (b′): plan (a) on the A6000, and the 3090 as an expert tier under the host tier |
 | `--ctx C` | context length (default 32,768); a call past it is refused by name. From position 16,384 on, each index top-k of layers 24, 28, 32 and 36 is taken inside the two-level candidate mask layer 20 ranks, as in the V4.1 reference |
 | `--depth D` | feed a fixed synthetic id sequence to depth D before generating; used by the timing tables |

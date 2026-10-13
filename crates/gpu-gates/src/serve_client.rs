@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::record::{self, Fields, Kind, Log, Record};
+use crate::record::{self, Kind, Log, Record};
 use crate::{GateError, verdict};
 
 /// The longest gap between two reads of the server's stderr in
@@ -219,22 +219,6 @@ pub fn server_log(err_log: &Path, kinds: &[&'static Kind]) -> Result<Log, GateEr
     let text =
         std::fs::read_to_string(err_log).map_err(|e| format!("{}: {e}", err_log.display()))?;
     Ok(Log::of(&text, kinds).named(err_log.display().to_string()))
-}
-
-/// The usable bytes of a `plan` record's stage card (`record::PLAN` or
-/// `record::PLAN38`): the last term of its first `devices` item
-/// (`stage:<name>:<ordinal>:<usable bytes>`, `record::plan_devices`).
-pub fn stage_usable(plan: &Fields) -> Result<u64, GateError> {
-    let devices = plan.csv("devices")?;
-    let stage = devices
-        .first()
-        .ok_or_else(|| format!("a `plan` record with no device: {}", plan.line()))?;
-    let usable = stage
-        .rsplit(':')
-        .next()
-        .and_then(|n| n.parse().ok())
-        .ok_or_else(|| format!("a `plan` record's stage device {stage:?} names no bytes"))?;
-    Ok(usable)
 }
 
 /// The JSON of a 200 response; any other status is an error naming it.

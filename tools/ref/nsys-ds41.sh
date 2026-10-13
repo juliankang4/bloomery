@@ -39,8 +39,8 @@
 #
 # Placement: BLOOMERY_GEN_PLACE (a, the default, gate or bp) is the --place every profiled
 # generate_ds41 loads by, named in the [config] line. Plan (a) loads on the largest visible card
-# (workstation::ALIASES: the binary finds its cards by device) and the gate plan on the one card
-# named 3090 (plan_gate), so with the 3090 as the one timing card (TIMING_GPU, timing-card.sh's
+# (workstation::ALIASES: the binary finds its cards by device) and the gate plan, the 3090's bytes,
+# on the smallest card with the room for them (plan_gate), so with the 3090 as the one timing card (TIMING_GPU, timing-card.sh's
 # pick) a is refused (64) and with the A6000 gate is. bp is plan (b′), both cards: it
 # runs only in the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090, timing-card.sh; the profile's
 # two-card line says what loads where), is refused (64) outside it, and inside it a and gate are

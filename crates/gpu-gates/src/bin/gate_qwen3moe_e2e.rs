@@ -166,7 +166,8 @@
 //!
 //! - (m) the memory guard, `--memguard-only` (the card as the runner pins
 //!   it, nothing loaded): the census reads device 0's free bytes (at most
-//!   its usable bytes); with the card quiet the `--place`-unset load is
+//!   its usable bytes and under its total, `record::device_free_limit`);
+//!   with the card quiet the `--place`-unset load is
 //!   today's whole-card one (`q3place::unplaced_qwen3` answers `Whole`, no
 //!   plan record); holding all but [`MEMGUARD_LEFT`] of the free bytes in
 //!   one device buffer, the plan on device 0 is refused by name with every
@@ -1116,6 +1117,7 @@ mod gate {
     /// hold is dropped.
     fn memguard() -> Result<bool, GateError> {
         use bloomery_gpu_gates::gpu_census::census;
+        use bloomery_gpu_gates::record::device_free_limit;
         use model::placement::workstation::census_usable;
         let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
         let d0 = census()?
@@ -1123,11 +1125,15 @@ mod gate {
             .find(|d| d.ordinal == 0)
             .ok_or("the census reads no device 0")?;
         let usable = census_usable(d0.total_bytes);
+        let limit = device_free_limit(&d0)?;
         println!(
-            "memguard census: cuda0 {} free {} B of usable {usable} B",
+            "memguard census: cuda0 {} free {} B of at most {limit} B",
             d0.name, d0.free_bytes
         );
-        let mut ok = d0.free_bytes <= usable;
+        // PIN(2026-10-14): the free reading is held under the total too, as
+        // the serve gates hold `card_free`: on a total of whole MiB the
+        // usable bytes are the total, and they alone pass a reading of it.
+        let mut ok = d0.free_bytes <= limit;
         // The quiet card: the unset load is today's whole-card one.
         let whole = matches!(
             q3place::unplaced_qwen3(&file, CTX, KvQ8::F16)?,

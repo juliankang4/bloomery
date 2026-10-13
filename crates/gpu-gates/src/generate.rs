@@ -67,7 +67,7 @@ pub fn lane_at(place: Place) -> Result<Lane, GateError> {
 /// Which placement the engine loads by: a stage card that runs every layer
 /// and the head, then the expert tier cards beside the host tier. The flag
 /// word is an alias — `a` (the stage on the largest visible card), `bp`
-/// (that stage and the next-largest as its tier), `gate` (the card named
+/// (that stage and the next-largest as its tier), `gate` (the bytes of a
 /// 3090, alone) — or the list `<stage>[+<tier>…]` of card names and device
 /// ordinals (`workstation::word_picks`); a list of an alias's cards on this
 /// workstation by name prints as that alias.
@@ -231,7 +231,9 @@ impl Place {
     /// The serving plan: the stage on the largest visible card
     /// (`workstation::plan_a` on this workstation, the A6000).
     pub const A: Place = alias(0);
-    /// The step gate's plan (`workstation::plan_gate`), on the 3090.
+    /// The step gate's plan (`workstation::plan_gate`): the 3090's bytes, on
+    /// this workstation the 3090; resolved, on the smallest visible card with
+    /// the room for them.
     pub const Gate: Place = alias(1);
     /// Plan (b′): plan (a)'s stage, the next-largest card an expert tier
     /// under the host tier (`workstation::plan_bp` on this workstation, the
@@ -1701,10 +1703,10 @@ mod tests {
         let largest = Place::A.on(&ada).expect("a");
         assert_eq!(largest.cards(), vec!["RTX_6000_Ada_Generation"]);
         let two = census(&["3090", "3090"]);
-        let e = Place::Gate.on(&two).expect_err("two 3090s").to_string();
-        assert!(
-            e.starts_with("--place gate: 2 visible devices carry the name 3090"),
-            "{e}"
+        let gate = Place::Gate.on(&two).expect("two 3090s");
+        assert_eq!(
+            gate.card_specs().expect("resolved")[0].device,
+            Some(two[0].device())
         );
         let bp = Place::Bp.on(&two).expect("two 3090s");
         assert_eq!(bp.cards(), vec!["3090", "3090"]);

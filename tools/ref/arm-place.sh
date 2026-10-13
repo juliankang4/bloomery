@@ -18,11 +18,11 @@
 #                    records.py's (generate_ds41)
 #
 # The words: a is plan (a), on the largest visible card (workstation::ALIASES: the binary finds its cards by
-# device); gate the gate plan, on the one device named 3090 (plan_gate); bp plan (b′), plan (a) with the
+# device); gate the gate plan, the 3090's bytes on the smallest card with the room for them (plan_gate); bp plan (b′), plan (a) with the
 # next-largest card its expert tier (plan_bp): on this box the A6000, then the 3090. One card (no
 # BLOOMERY_TIMING_CARDS) times the timing card alone, and the protocol's a rows are the A6000's: a needs the
 # A6000 as the timing card (on the 3090 alone it would plan the gate plan's card under a's label), gate the
-# 3090 (on the A6000 alone the binary finds no 3090), and bp is refused. The two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090) shows both cards to every arm: bp
+# 3090 (on the A6000 alone it would time the A6000 under gate's label), and bp is refused. The two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090) shows both cards to every arm: bp
 # loads both, a loads the A6000 and leaves the 3090 idle (place_arm_cards holds each a arm's load record to
 # the A6000 alone), and gate, a 3090-only row in the A6000+3090 table, is refused. Local mode
 # (timing-card.sh's TIMING_LOCAL) times this machine's one card at a, and gate and bp are refused.
@@ -92,7 +92,7 @@ place_check() {
     esac
   fi
   if [ -n "$TIMING_LOCAL" ]; then
-    [ "$p" = a ] || place_refuse "$a" "$what: local mode times this machine's one card, at a (gate loads the card named 3090, bp two cards by size rank)"
+    [ "$p" = a ] || place_refuse "$a" "$what: local mode times this machine's one card, at a (gate's rows are the 3090's, bp two cards by size rank)"
     return 0
   fi
   case $p in

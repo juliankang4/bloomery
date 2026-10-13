@@ -1920,8 +1920,8 @@ for i in "${!ARMS[@]}"; do
 done
 timing_cards_arms "$BIN" ${TC_ARMS[@]+"${TC_ARMS[@]}"} || exit $?
 # Each ours and bin: arm's placement against the mode and the timing card (tools/ref/arm-place.sh): Qwen3.8's
-# placement finds its cards by device (workstation::ALIASES: a the largest visible card, gate the one card
-# named 3090, bp the two largest), and the timing card is TIMING_GPU's, timing-card.sh's pick
+# placement finds its cards by device (workstation::ALIASES: a the largest visible card, gate the 3090's
+# bytes on the smallest card with the room for them, bp the two largest), and the timing card is TIMING_GPU's, timing-card.sh's pick
 # (BLOOMERY_TIMING_GPU overrides), never a name the binary sees;
 # BLOOMERY_GEN_PLACE once for the arms that follow it, an arm's place= for that arm. With no --place the
 # binary runs a, which the two-card mode checks as a; under one card it is not checked, as before.

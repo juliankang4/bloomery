@@ -183,10 +183,11 @@ in local mode. The two runs used different commits and different lists, so their
   came from the `llc` that built the PTX; since [#63](https://github.com/midagedev/bloomery/pull/63) the gate passes
   under that `llc` (#63's runs on an RTX 5090 and a DGX Spark).
 
-In both runs, the one gate that stopped on the card's name was `gate-gpu-qwen38-serve`, whose `--place gate` opens the
-RTX 3090 by name (`crates/placement/src/placement/devices.rs:230`). A recipe outside these two lists may also open a
-card by name. `gate-gpu-ds41-dspark-loop` also passes `--place gate`, but only at the real tier; at the fixture tier it
-runs `--place a`. The two-card recipes stop at the `BLOOMERY_CARD` refusal above. Every other closed GPU item stopped
+In both runs, the one gate that stopped on the card's name was `gate-gpu-qwen38-serve`: its `--place gate` opened the
+RTX 3090 by name at those commits. `gate` plans the 3090's bytes on the smallest visible card with the room for them
+(`ALIASES` in `crates/placement/src/placement/devices.rs`), so the item opens on any such card. A recipe outside these
+two lists may still open a card by name. `gate-gpu-ds41-dspark-loop` also passes `--place gate`, but only at the real
+tier; at the fixture tier it runs `--place a`. The two-card recipes stop at the `BLOOMERY_CARD` refusal above. Every other closed GPU item stopped
 on an input the machine did not have, except `gate-gpu-kquant` on the RTX 5090.
 
 ## 4. Fixtures and reference sets
@@ -250,8 +251,8 @@ one card `nvidia-smi` lists, picked by UUID, or among several cards the one `BLO
       BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/<slug>.card' just depth-gpu-qwen3moe
 
   Without one, the lease refuses with exit 66.
-- **Placement.** Only placement `a` runs. `gate` is refused because it loads the card named 3090, and `bp` because it
-  loads two cards (`tools/ref/arm-place.sh`).
+- **Placement.** Only placement `a` runs. `gate` is refused because its rows are the 3090's, and `bp` because it loads
+  two cards (`tools/ref/arm-place.sh`).
 - **Xid.** Before the lease, the run checks that the kernel journal answers. A user outside the `adm` and
   `systemd-journal` groups gets an empty answer, and the run stops with exit 69. After each arm, an NVRM Xid or a card
   that stopped answering fails that arm.
@@ -293,7 +294,6 @@ cards.
   - The V4.1 DSpark draft fixture is not fetchable, and five of the gates that need it also read
     `engram/corpus-prose.ids`, which is not published.
   - `glm5next/corpus-prose.ids` and `fx_ref_glm5next_vis_taps` are not published.
-  - `--place gate` opens the RTX 3090 by name (section 3).
   - The list rule keeps host gates that need a real file or a `just dump-ref` oracle (the V2-Lite gates) and a public
     real file (the bf16 projector of `gate-gpu-glm5next-media-seat`); a no-input class would keep them off the list.
 - **Variant sets.** The dataset publishes no set of a fixture variant: its README lists them under "Left out", because

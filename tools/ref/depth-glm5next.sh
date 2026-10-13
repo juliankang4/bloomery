@@ -208,7 +208,7 @@
 # per-round list is what `tools/ref/card.py verdict` reads for a bp-against-a card. place= on a reference arm, a word outside a|gate|bp, an empty one and place given twice are
 # refused by name before anything runs (tools/ref/arm-place.sh, shared with depth-ds41.sh). Plan (a) loads
 # on the largest visible card (workstation::ALIASES: the binary finds its cards by device — on this box
-# the A6000), the gate plan on the one card named 3090 (plan_gate), plan (b′) on the two largest
+# the A6000), the gate plan's 3090 bytes on the smallest card with the room for them (plan_gate), plan (b′) on the two largest
 # (plan_bp: the 3090 the host tier's expert tier); the timing card is TIMING_GPU's, timing-card.sh's pick
 # (BLOOMERY_TIMING_GPU overrides), never a name the binary sees. Under one card the arms see the timing
 # card alone, so a placement whose card is not the timing card is refused (64) before the lease, and bp is
@@ -470,7 +470,7 @@ T975=$(python3 "${BASH_SOURCE[0]%/*}/tdist.py" "$ROUNDS") || {
 }
 # Each ours arm's placement against the mode and the timing card (tools/ref/arm-place.sh): plan (a) is made
 # for the largest visible card (the binary finds its cards by device; on this box the A6000), the gate plan
-# for the one card named 3090, plan (b′) for the two largest in the two-card mode; the timing card is
+# for the smallest card with the room for the 3090's bytes, plan (b′) for the two largest in the two-card mode; the timing card is
 # TIMING_GPU's, timing-card.sh's pick (BLOOMERY_TIMING_GPU overrides), never a name the binary sees.
 # BLOOMERY_GEN_PLACE once for the arms that follow it, an arm's place= for that arm.
 PLACE_SEEN=0 PLACES_SET='' PLACE_ARMS=()

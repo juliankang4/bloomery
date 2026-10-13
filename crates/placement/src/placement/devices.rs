@@ -207,6 +207,11 @@ pub enum Pick {
     /// The one device whose driver name holds this card name, a [`CARDS`]
     /// name.
     Name(&'static str),
+    /// The device of the fewest usable bytes ([`spec_of_device`]) among
+    /// those of at least this card's and those the census labels as this
+    /// card ([`label`]), ties by the lower ordinal; it plans this card's
+    /// bytes.
+    Room(&'static CardSpec),
     /// The device of this process's ordinal.
     Ordinal(u32),
 }
@@ -217,6 +222,12 @@ impl fmt::Display for Pick {
             Pick::Rank(0) => write!(f, "the largest visible card"),
             Pick::Rank(k) => write!(f, "visible card {} by size", k + 1),
             Pick::Name(n) => write!(f, "{n}"),
+            Pick::Room(c) => write!(
+                f,
+                "the {} or a card of at least its {} MiB usable",
+                c.name,
+                c.usable_bytes() / MIB
+            ),
             Pick::Ordinal(o) => write!(f, "cuda{o}"),
         }
     }
@@ -224,17 +235,17 @@ impl fmt::Display for Pick {
 
 /// The placement aliases' picks: `a` the stage on the largest visible card,
 /// `bp` that stage with the next-largest as its one expert tier, `gate` the
-/// card named 3090 alone.
+/// 3090's bytes alone on the smallest visible card with the room for them.
 pub const ALIASES: [(&str, &[Pick]); 3] = [
     ("a", &[Pick::Rank(0)]),
-    ("gate", &[Pick::Name(RTX_3090.name)]),
+    ("gate", &[Pick::Room(&RTX_3090)]),
     ("bp", &[Pick::Rank(0), Pick::Rank(1)]),
 ];
 
 /// What `pick` is on this workstation with no census, by name: a rank is
-/// [`CARDS`] in its order (the most usable bytes first), a name that card;
-/// an ordinal has no meaning without the census of the process that numbers
-/// it.
+/// [`CARDS`] in its order (the most usable bytes first), a name that card, a
+/// room its own card; an ordinal has no meaning without the census of the
+/// process that numbers it.
 #[must_use]
 pub const fn workstation_spec(pick: Pick) -> Option<CardSpec> {
     match pick {
@@ -256,6 +267,7 @@ pub const fn workstation_spec(pick: Pick) -> Option<CardSpec> {
             }
             None
         }
+        Pick::Room(card) => Some(*card),
         Pick::Ordinal(_) => None,
     }
 }
@@ -390,9 +402,10 @@ impl fmt::Display for WordError {
 impl std::error::Error for WordError {}
 
 /// The card specs `picks` resolve to on `census`, in pick order, each naming
-/// its device ([`spec_of_device`]). A pick no visible device answers, a name
-/// two devices carry, and a device two picks land on are refused by name,
-/// with every visible device.
+/// its device ([`spec_of_device`]); a room's carries its card's bytes in
+/// place of the device's. A pick no visible device answers, a name two
+/// devices carry, and a device two picks land on are refused by name, with
+/// every visible device.
 pub fn resolve(picks: &[Pick], census: &[DeviceInfo]) -> Result<Vec<CardSpec>, PickError> {
     let mut ranked: Vec<(u64, &DeviceInfo)> = census
         .iter()
@@ -411,6 +424,14 @@ pub fn resolve(picks: &[Pick], census: &[DeviceInfo]) -> Result<Vec<CardSpec>, P
                 .get(usize::from(k))
                 .map(|&(_, d)| d)
                 .ok_or_else(|| refuse(pick, PickWhy::Few(census.len())))?,
+            Pick::Room(card) => ranked
+                .iter()
+                .filter(|&&(usable, d)| {
+                    usable >= card.usable_bytes() || label(&d.name) == card.name
+                })
+                .min_by_key(|&&(usable, d)| (usable, d.ordinal))
+                .map(|&(_, d)| d)
+                .ok_or_else(|| refuse(pick, PickWhy::Missing))?,
             Pick::Ordinal(o) => census
                 .iter()
                 .find(|d| d.ordinal == o)
@@ -431,7 +452,15 @@ pub fn resolve(picks: &[Pick], census: &[DeviceInfo]) -> Result<Vec<CardSpec>, P
         if out.iter().any(|s| s.device == Some(d.device())) {
             return Err(refuse(pick, PickWhy::Twice(d.ordinal)));
         }
-        out.push(spec_of_device(d));
+        let spec = spec_of_device(d);
+        out.push(match pick {
+            Pick::Room(card) => CardSpec {
+                total_bytes: card.total_bytes,
+                driver_reserve_bytes: card.driver_reserve_bytes,
+                ..spec
+            },
+            _ => spec,
+        });
     }
     Ok(out)
 }
@@ -652,17 +681,26 @@ mod tests {
         device_on_host, listed_index, resolve, spec_of_device, visible, word_picks,
         workstation_spec,
     };
-    use crate::placement::PlacementError;
     use crate::placement::workstation::{
-        A6000, CardSpec, MIB, RTX_3090, plan_a, plan_bp, plan_tiers, tier_batch_bytes,
+        A6000, CardSpec, MIB, RTX_3090, plan_a, plan_bp, plan_on, plan_tiers, tier_batch_bytes,
     };
+    use crate::placement::{PlacementError, UnifiedPool};
 
     /// `cuDeviceTotalMem` of this workstation's two cards [measured].
     const TOTAL_3090: u64 = 25_351_356_416;
     const TOTAL_A6000: u64 = 50_952_536_064;
     const NAME_3090: &str = "NVIDIA GeForce RTX 3090";
     const NAME_A6000: &str = "NVIDIA RTX A6000";
+    /// A 24 GB card no measured figure names, and its total [assumed
+    /// total].
     const NAME_4090: &str = "NVIDIA GeForce RTX 4090";
+    const TOTAL_4090: u64 = 24_564 * MIB;
+    /// A card of fewer usable bytes than the 3090 [assumed total].
+    const NAME_SMALL: &str = "NVIDIA GeForce RTX 3060";
+    /// A DGX Spark's integrated device as its driver names it, and its
+    /// `cuDeviceTotalMem` [measured].
+    const NAME_GB10: &str = "NVIDIA GB10";
+    const TOTAL_GB10: u64 = 130_596_122_624;
 
     /// A fake census of `(name, total)` devices, by ordinal, each of its own
     /// UUID and its full usable bytes free (a quiet card) and no holder
@@ -730,11 +768,11 @@ mod tests {
         );
         // Another device: its census total, the sub-MiB tail its reserve,
         // its label from the driver name.
-        let other = census(&[(NAME_4090, 24_564 * MIB + 77)]);
+        let other = census(&[(NAME_4090, TOTAL_4090 + 77)]);
         let s = spec_of_device(&other[0]);
         assert_eq!(
             (s.name, s.total_bytes, s.usable_bytes()),
-            ("GeForce_RTX_4090", 24_564 * MIB + 77, 24_564 * MIB)
+            ("GeForce_RTX_4090", TOTAL_4090 + 77, TOTAL_4090)
         );
         // A known name whose total gives other bytes (ECC on, say) takes the
         // census rule, not the measured constant.
@@ -794,6 +832,9 @@ mod tests {
         type Want = [Result<Vec<(&'static str, u32)>, PickWhy>; 5];
         let ok = |v: &[(&'static str, u32)]| Ok(v.to_vec());
         let r4090 = ("GeForce_RTX_4090", 0);
+        let r_small = ("GeForce_RTX_3060", 0);
+        let mut gb10 = census(&[(NAME_GB10, TOTAL_GB10)]);
+        gb10[0].integrated = true;
         let hosts: Vec<(&str, Vec<DeviceInfo>, Want)> = vec![
             (
                 "the box, BLOOMERY_CARD=both (3090 first)",
@@ -819,11 +860,11 @@ mod tests {
             ),
             (
                 "one 4090",
-                census(&[(NAME_4090, 24_564 * MIB)]),
+                census(&[(NAME_4090, TOTAL_4090)]),
                 [
                     ok(&[r4090]),
                     Err(PickWhy::Few(1)),
-                    Err(PickWhy::Missing),
+                    ok(&[r4090]),
                     Err(PickWhy::Missing),
                     Err(PickWhy::Missing),
                 ],
@@ -834,14 +875,14 @@ mod tests {
                 [
                     ok(&[("3090", 0)]),
                     ok(&[("3090", 0), ("3090", 1)]),
-                    Err(PickWhy::Several(vec![0, 1])),
+                    ok(&[("3090", 0)]),
                     ok(&[("3090", 0), ("3090", 1)]),
                     ok(&[("3090", 1), ("3090", 0)]),
                 ],
             ),
             (
                 "4090 + 3090",
-                census(&[(NAME_4090, 24_564 * MIB), (NAME_3090, TOTAL_3090)]),
+                census(&[(NAME_4090, TOTAL_4090), (NAME_3090, TOTAL_3090)]),
                 [
                     ok(&[r4090]),
                     ok(&[r4090, ("3090", 1)]),
@@ -867,9 +908,75 @@ mod tests {
                 [
                     ok(&[("A6000", 0)]),
                     ok(&[("A6000", 0), ("A6000", 1)]),
-                    Err(PickWhy::Missing),
+                    ok(&[("A6000", 0)]),
                     ok(&[("A6000", 0), ("A6000", 1)]),
                     ok(&[("A6000", 1), ("A6000", 0)]),
+                ],
+            ),
+            (
+                "one 3090 a MiB short of its measured total",
+                census(&[(NAME_3090, TOTAL_3090 - MIB)]),
+                [
+                    ok(&[("3090", 0)]),
+                    Err(PickWhy::Few(1)),
+                    ok(&[("3090", 0)]),
+                    Err(PickWhy::Missing),
+                    Err(PickWhy::Missing),
+                ],
+            ),
+            (
+                "A6000 + a 3090 a MiB short",
+                census(&[(NAME_A6000, TOTAL_A6000), (NAME_3090, TOTAL_3090 - MIB)]),
+                [
+                    ok(&[("A6000", 0)]),
+                    ok(&[("A6000", 0), ("3090", 1)]),
+                    ok(&[("3090", 1)]),
+                    ok(&[("A6000", 0), ("3090", 1)]),
+                    ok(&[("3090", 1), ("A6000", 0)]),
+                ],
+            ),
+            (
+                "one other card a MiB under the 3090",
+                census(&[(NAME_4090, TOTAL_3090 - MIB)]),
+                [
+                    ok(&[r4090]),
+                    Err(PickWhy::Few(1)),
+                    Err(PickWhy::Missing),
+                    Err(PickWhy::Missing),
+                    Err(PickWhy::Missing),
+                ],
+            ),
+            (
+                "a 12 GiB card + 3090",
+                census(&[(NAME_SMALL, 12_288 * MIB), (NAME_3090, TOTAL_3090)]),
+                [
+                    ok(&[("3090", 1)]),
+                    ok(&[("3090", 1), r_small]),
+                    ok(&[("3090", 1)]),
+                    ok(&[r_small, ("3090", 1)]),
+                    ok(&[("3090", 1), r_small]),
+                ],
+            ),
+            (
+                "one 12 GiB card",
+                census(&[(NAME_SMALL, 12_288 * MIB)]),
+                [
+                    ok(&[r_small]),
+                    Err(PickWhy::Few(1)),
+                    Err(PickWhy::Missing),
+                    Err(PickWhy::Missing),
+                    Err(PickWhy::Missing),
+                ],
+            ),
+            (
+                "one GB10",
+                gb10,
+                [
+                    ok(&[("GB10", 0)]),
+                    Err(PickWhy::Few(1)),
+                    ok(&[("GB10", 0)]),
+                    Err(PickWhy::Missing),
+                    Err(PickWhy::Missing),
                 ],
             ),
             (
@@ -906,11 +1013,11 @@ mod tests {
     const TOTAL_PRO6000: u64 = 97_339 * MIB;
 
     /// One, two and four such cards: each its census total, labelled from
-    /// the driver name; `a` the lowest ordinal among equal usable bytes —
-    /// whatever each card read free, so a card another process holds is
-    /// still picked first — `bp` the two lowest, and `gate`, the 3090 by
-    /// name, none. A card of fewer usable bytes (ECC on, say) ranks below
-    /// the others.
+    /// the driver name; `a` the lowest ordinal among equal usable bytes
+    /// (whatever each card read free, so a card another process holds is
+    /// still picked first, and so is `gate`'s), `bp` the two lowest, and
+    /// `gate` the lowest as well, each holding the gate plan's bytes. A card
+    /// of fewer usable bytes (ECC on, say) ranks below the others.
     #[test]
     fn equal_large_cards_rank_by_ordinal() {
         let label = "RTX_PRO_6000_Blackwell_Max-Q_Workstation_Edition";
@@ -928,22 +1035,63 @@ mod tests {
                 Ok(vec![(label, 0), (label, 1)])
             };
             assert_eq!(place("bp", &c).map_err(|e| e.why), bp, "{n} cards");
-            assert_eq!(
-                place("gate", &c).map_err(|e| e.why),
-                Err(PickWhy::Missing),
-                "{n} cards"
-            );
+            assert_eq!(place("gate", &c), Ok(vec![(label, 0)]), "{n} cards");
             c[0].free_bytes = 8192 * MIB;
-            assert_eq!(
-                place("a", &c),
-                Ok(vec![(label, 0)]),
-                "{n} cards, cuda0 held"
-            );
+            for word in ["a", "gate"] {
+                assert_eq!(
+                    place(word, &c),
+                    Ok(vec![(label, 0)]),
+                    "{n} cards, cuda0 held: {word}"
+                );
+            }
         }
         let mut c = census(&[(NAME_PRO6000, TOTAL_PRO6000); 4]);
         c[0].total_bytes -= 2048 * MIB;
         assert_eq!(place("a", &c), Ok(vec![(label, 1)]));
         assert_eq!(place("bp", &c), Ok(vec![(label, 1), (label, 2)]));
+    }
+
+    /// `gate` plans the 3090's bytes on the card it picks: the device, its
+    /// name, free reading, holders and whether it is integrated are the
+    /// census's, the total and the driver reserve the 3090's. On the box's
+    /// 3090 that is the 3090's own spec. On a GB10 the card plans the 3090's
+    /// usable bytes and the pool is the census's reading, the host's room.
+    #[test]
+    fn gate_plans_the_3090s_bytes_on_its_card() {
+        let gate = |c: &[DeviceInfo]| resolve(alias("gate"), c).expect("gate")[0];
+        let mut a6000 = census(&[(NAME_A6000, TOTAL_A6000)]);
+        a6000[0].free_bytes = 20_480 * MIB;
+        a6000[0].held_by = Some("pid 7 (977 MiB)".to_string());
+        assert_eq!(
+            gate(&a6000),
+            CardSpec {
+                name: A6000.name,
+                device: Some(a6000[0].device()),
+                free_bytes: Some(20_480 * MIB),
+                held_by: Some("pid 7 (977 MiB)"),
+                ..RTX_3090
+            }
+        );
+        let box_3090 = census(&[(NAME_A6000, TOTAL_A6000), (NAME_3090, TOTAL_3090)]);
+        assert_eq!(gate(&box_3090), spec_of_device(&box_3090[1]));
+        let room = 110_000 * MIB;
+        let mut gb10 = census(&[(NAME_GB10, TOTAL_GB10)]);
+        gb10[0].integrated = true;
+        gb10[0].free_bytes = room;
+        let spec = gate(&gb10);
+        assert_eq!(
+            (spec.name, spec.integrated, spec.free_bytes),
+            ("GB10", true, Some(room))
+        );
+        assert_eq!(
+            (spec.total_bytes, spec.driver_reserve_bytes),
+            (RTX_3090.total_bytes, RTX_3090.driver_reserve_bytes)
+        );
+        let m = plan_on(spec, 43);
+        assert_eq!(
+            (m.cards[0].usable_bytes, m.unified()),
+            (RTX_3090.usable_bytes(), Some(UnifiedPool { bytes: room }))
+        );
     }
 
     /// Two 3090s plan as a stage and its tier ([`plan_tiers`]), where the

@@ -328,7 +328,7 @@ mod gate {
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
         self, PrefixRestore, agree, base64, beside, check, completion, curl, ids_of, json_of,
-        metric, parse_ids, prefix_restore, rendered, server_log, sha256, stage_usable, tokenized,
+        metric, parse_ids, prefix_restore, rendered, server_log, sha256, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -1035,18 +1035,23 @@ mod gate {
                 .iter()
                 .all(|&(pinned, after)| pinned == 0 && after >= 0),
         );
-        // Every plan line names its stage card's free bytes at plan time, at
-        // most its usable bytes — the census term the expert rule filled
-        // within (memguard). FAIL-first: a plan line that drops it, or names
-        // it past the card's usable bytes, turns this red.
+        // PIN(2026-10-14): the bound is the stage device's, not the bytes its
+        // card plans: under `--place gate` on a larger device the card plans
+        // fewer bytes than the device's, and `card_free` is still the
+        // device's reading. Every plan line names its stage card's free bytes
+        // at plan time, at most its device's usable bytes and under its
+        // total: the census term the expert rule filled within (memguard).
+        // FAIL-first: a plan line that drops it, or names it past that bound,
+        // turns this red.
+        let census = bloomery_gpu::census()?;
         for (place, lines) in [("a", &a), ("bp", &bp), ("gate", &g)] {
             let plan = seat_log(lines).one(&record::PLAN)?;
             let free = plan.opt_u64("card_free")?;
-            let usable = stage_usable(&plan)?;
-            let named = free.is_some_and(|f| f <= usable);
+            let limit = record::stage_device_free_limit(&plan, &census)?;
+            let named = free.is_some_and(|f| f <= limit);
             println!(
                 "--place {place}: card_free named and within usable {named}: card_free={free:?}, \
-                 usable {usable}"
+                 usable {limit}"
             );
             check(&mut ok, "plan_names_the_cards_free_bytes", named);
         }

@@ -24,8 +24,9 @@
 # Lanes (--lanes 2, the default), read from each recipe's text and attributes in `just --dump` (and
 # its dependencies'), and from the scripts that text runs, followed transitively (walk() below):
 #   A  fixed, the 3090: a tools/gpu-gate.sh call, in the recipe or a script it runs, without
-#      BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} (V4.1 `--place gate` gates; gate-gpu-hybrid, whose host tier spins
-#      the worker pool on the cores a V4.1 gate's pool is pinned to), or device code run with no gate lock at all
+#      BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} (V4.1 `--place gate` gates, which this lane keeps on
+#      the 3090; gate-gpu-hybrid, whose host tier spins the worker pool on the cores a V4.1 gate's pool
+#      is pinned to), or device code run with no gate lock at all
 #      (`tools/gate.sh --oxide`, `cargo oxide test|run`, a `target/release/` binary of a recipe that
 #      runs `cargo oxide`: it lands on the box env's 3090 pin). A gpu-gate.sh recipe here runs with
 #      BLOOMERY_GATE_CARD=3090 in BLOOMERY_BOX_ENV, so a mixed recipe's `any` calls stay on the 3090.
@@ -4215,7 +4216,8 @@ def placement(name, lane, lanes):
         return "F", "balanced", ["-"], ["none"]
     if group_of(name, "v41-load") and tier == "real":
         # One lane: two V4.1 loads at once evict each other's host set from the page cache. Lane A,
-        # where the 3090-only (`--place gate`) loads already are; an `any` member runs on the 3090.
+        # where the `--place gate` loads already are (their gpu-gate.sh calls carry no `any`); an `any`
+        # member runs on the 3090.
         # Not in the fixture tier: a fixture load takes no V4.1 load lock and has no such host set.
         return "A", "fixed", (["3090"] if uses_gpu_gate else ["-"]), ["3090"]
     if lane == "A":
