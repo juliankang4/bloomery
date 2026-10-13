@@ -1341,9 +1341,19 @@ fn a_paged_plan_serves_its_asked_slots() {
     // draft that would run, or that only its yield to the context turned
     // off (judged on the plan of several slots the load abandons), goes off
     // by the paged rule; every other reason holds whatever the plan, and
-    // stays.
+    // stays. A plan with no arena keeps its draft and its reason as asked.
     let paged = Some(Draft38Off::Paged { arena });
     let y = DraftYield::of(702, 6165, 4096, 2_842_413_228).expect("the 3060's yield");
+    assert_eq!(
+        paged_draft(&at(0, 1, false, true, false), None),
+        (true, None),
+        "an unset draft runs on a plan with no arena"
+    );
+    assert_eq!(
+        paged_draft(&at(0, 2, false, false, false), Some(Draft38Off::Yield(y))),
+        (false, Some(Draft38Off::Yield(y))),
+        "a yield on a plan with no arena stays"
+    );
     assert_eq!(
         paged_draft(&at(arena, 2, true, true, true), None),
         (true, None),

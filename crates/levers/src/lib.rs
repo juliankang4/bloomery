@@ -2108,17 +2108,21 @@ pub fn paged_floor(at: &PagedAt) -> Paged {
     }
 }
 
-/// The draft a paged plan ([`PagedAt::arena`] above 0) runs, and why a
-/// reduced load ([`Paged::Reduced`]) runs without it, as its `load draft=off`
-/// record names it: a set draft runs as asked; unset, a draft that would run
-/// (`at.draft`), or that only its yield to the context turned off — a
-/// verdict on the plan of several slots the load abandons — goes off with
-/// [`Draft38Off::Paged`]; any other reason (set, the placement, the file, a
-/// window past the context) holds whatever the plan, and stays. A plan that
-/// would not draft is untouched. The Qwen3.8 seat's and `generate_qwen3moe`'s
-/// one owner.
+/// The draft a plan runs under the paged rule, and why a reduced load
+/// ([`Paged::Reduced`]) runs without it, as its `load draft=off` record names
+/// it: a plan with no arena ([`PagedAt::arena`] 0) keeps its draft and its
+/// reason as asked; on a paged plan a set draft runs as asked; unset, a draft
+/// that would run (`at.draft`), or that only its yield to the context turned
+/// off — a verdict on the plan of several slots the load abandons — goes off
+/// with [`Draft38Off::Paged`]; any other reason (set, the placement, the
+/// file, a window past the context) holds whatever the plan, and stays. A
+/// plan that would not draft is untouched. The Qwen3.8 seat's and
+/// `generate_qwen3moe`'s one owner.
 #[must_use]
 pub fn paged_draft(at: &PagedAt, off: Option<Draft38Off>) -> (bool, Option<Draft38Off>) {
+    if at.arena == 0 {
+        return (at.draft, off);
+    }
     let asked = at.asked_draft(off.as_ref());
     (
         at.draft && at.draft_set,
