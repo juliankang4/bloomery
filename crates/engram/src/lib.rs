@@ -451,20 +451,27 @@ impl Site {
     }
 
     /// Drop `ids`' pages from this process and from the page cache, so the next
-    /// read of them is a real device read again.
+    /// read of them is a real device read again: one eviction per run of
+    /// adjacent rows (`adjacent_runs`), over the whole pages that hold it.
+    /// An id past the table is refused by name before anything is dropped.
     ///
     /// Order is load-bearing: `posix_fadvise(DONTNEED)` skips a folio that is
     /// still mapped, so the mapping's page-table entries go first.
     pub fn evict_rows(&self, ids: &[u32]) -> Result<(), EngramError> {
-        for &id in ids {
-            if u64::from(id) >= self.rows {
-                return Err(EngramError::RowOutOfRange {
-                    name: self.name.clone(),
-                    id,
-                    rows: self.rows,
-                });
-            }
-            self.evict_range(self.file_offset(id), self.row_bytes)?;
+        let runs = adjacent_runs(ids);
+        let last = runs.last().map(|&(_, last)| last);
+        if let Some(id) = last.filter(|&id| u64::from(id) >= self.rows) {
+            return Err(EngramError::RowOutOfRange {
+                name: self.name.clone(),
+                id,
+                rows: self.rows,
+            });
+        }
+        for (first, last) in runs {
+            self.evict_range(
+                self.file_offset(first),
+                (u64::from(last) - u64::from(first) + 1) * self.row_bytes,
+            )?;
         }
         Ok(())
     }
@@ -548,6 +555,29 @@ fn fadvise_dontneed(file: &File, at: usize, len: usize) -> Result<(), std::io::E
     }
 }
 
+/// `ids` as runs of adjacent rows, each `(first, last)` inclusive, sorted and
+/// without repeats: `[8, 3, 0, 2]` is `(0, 0), (2, 3), (8, 8)`.
+///
+/// The unit an eviction drops. `posix_fadvise(DONTNEED)` drops only the
+/// folios that lie whole inside its range, and a large folio can hold several
+/// rows, so a call per row keeps every folio that crosses a row boundary. A
+/// call per run keeps only a folio that crosses one of the run's two edges: a
+/// page the run shares with a row or bytes outside it may stay, with the rest
+/// of its folio.
+fn adjacent_runs(ids: &[u32]) -> Vec<(u32, u32)> {
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for id in sorted {
+        match runs.last_mut() {
+            Some((_, last)) if id - *last == 1 => *last = id,
+            _ => runs.push((id, id)),
+        }
+    }
+    runs
+}
+
 /// Pages one `mincore` call covers.
 const MINCORE_PAGES: usize = 8;
 
@@ -598,9 +628,16 @@ impl TableBytes<'_> {
     /// The whole pages that hold row `id`: the row's start rounded down to a
     /// page and its end up — a row that straddles a boundary names both.
     fn pages(&self, id: u32) -> Result<(usize, usize), EngramError> {
-        let start = self.row(id)?.as_ptr() as usize;
+        self.run_pages(id, id)
+    }
+
+    /// The whole pages that hold rows `first ..= last`, rounded out as
+    /// [`TableBytes::pages`] rounds one row.
+    fn run_pages(&self, first: u32, last: u32) -> Result<(usize, usize), EngramError> {
+        let start = self.row(first)?.as_ptr() as usize;
+        let end = self.row(last)?.as_ptr() as usize + self.row_bytes;
         let first = start / self.page * self.page;
-        let end = (start + self.row_bytes).div_ceil(self.page) * self.page;
+        let end = end.div_ceil(self.page) * self.page;
         Ok((first, end - first))
     }
 
@@ -916,5 +953,23 @@ fn faults_of(who: libc::c_int) -> Faults {
     Faults {
         major: usage.ru_majflt.max(0) as u64,
         minor: usage.ru_minflt.max(0) as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adjacent_runs;
+
+    /// Runs come out sorted, without repeats, adjacent ids joined, and the
+    /// last id a `u32` holds joins its neighbour without an overflow.
+    #[test]
+    fn adjacent_runs_sorts_dedups_and_joins() {
+        assert_eq!(adjacent_runs(&[]), []);
+        assert_eq!(adjacent_runs(&[5, 5]), [(5, 5)]);
+        assert_eq!(adjacent_runs(&[8, 3, 0, 2]), [(0, 0), (2, 3), (8, 8)]);
+        assert_eq!(
+            adjacent_runs(&[u32::MAX - 1, u32::MAX]),
+            [(u32::MAX - 1, u32::MAX)]
+        );
     }
 }

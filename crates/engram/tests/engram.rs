@@ -686,13 +686,21 @@ fn hw_engram_refuses_other_ranks_by_name() {
 }
 
 /// An eviction leaves none of the named experts' pages in the page cache, a
-/// prefetch and populate leave all of them, and the file range a row names is
-/// where the header puts it.
+/// prefetch and populate leave all of them, an eviction that names an id past
+/// the stack drops nothing, and the file range a row names is where the
+/// header puts it.
 ///
 /// The drop is checked by `mincore`, which reports the page cache of a file
-/// mapping to the file's owner (the box's gates run as the owner). The whole
-/// stack is dropped first so a neighbour's page shared with a named expert
-/// does not stay resident from the write.
+/// mapping to the file's owner (the box's gates run as the owner).
+/// `posix_fadvise(DONTNEED)` drops only the folios that lie whole inside its
+/// range, and a page-cache folio starts at a multiple of its own size, so the
+/// check rests on three premises. The page is 4 KiB, and the stack's whole
+/// pages are bytes [0, 64 KiB) of the file, so a folio of the file's write of
+/// up to 64 KiB lies whole inside them or outside: both are asserted first.
+/// The pages a populate reads back are single-page folios, so each run's
+/// whole pages drop with it, its edge pages included. The first set goes in
+/// reversed, so its run comes only from sorting; the second holds a run of
+/// three between two single experts.
 #[test]
 #[ignore = "hw: the box's disk-backed target directory"]
 fn hw_engram_expert_stack_evicts_and_reads_back() {
@@ -701,8 +709,8 @@ fn hw_engram_expert_stack_evicts_and_reads_back() {
     let base = header_offset(&path, STACK);
     let split = Arc::new(Split::open(&path).unwrap());
     let table = open_table(&split, STACK).unwrap();
-    let all: Vec<u32> = (0..EXPERTS as u32).collect();
-    let ids = [0u32, 3, 8];
+    let all: Vec<u32> = (0..EXPERTS as u32).rev().collect();
+    let ids = [0u32, 3, 4, 5, 8];
 
     for &id in &all {
         assert_eq!(
@@ -719,20 +727,57 @@ fn hw_engram_expert_stack_evicts_and_reads_back() {
         "a range past the stack is refused by name"
     );
 
-    table.evict_rows(&all).unwrap();
-    let cold = table.resident_pages(&ids).unwrap();
-    assert!(cold.total > 0, "the named experts span pages");
+    let page = table.page_bytes();
+    assert_eq!(page, 4096, "the clause rests on 4 KiB pages");
+    let whole = |id: u32| {
+        let (at, len) = table.file_range(id).unwrap();
+        (at / page * page, (at + len).div_ceil(page) * page)
+    };
     assert_eq!(
-        cold.resident, 0,
-        "after an eviction no page of the named experts is in the page cache ({} of {})",
-        cold.resident, cold.total
+        (whole(0).0, whole(EXPERTS as u32 - 1).1),
+        (0, 64 << 10),
+        "the clause rests on the stack's whole pages being bytes [0, 64 KiB) of the file"
     );
-    assert_eq!(table.resident_rows(&ids).unwrap(), 0);
+    let pages = |ids: &[u32]| -> u64 {
+        ids.iter()
+            .map(|&id| {
+                let (first, end) = whole(id);
+                (end - first) / page
+            })
+            .sum()
+    };
+    let kept = |ids: &[u32]| -> Vec<u32> {
+        ids.iter()
+            .copied()
+            .filter(|&id| table.resident_pages(&[id]).unwrap().resident > 0)
+            .collect()
+    };
+
+    table.evict_rows(&all).unwrap();
+    let cold = table.resident_pages(&all).unwrap();
+    assert_eq!(
+        cold.total,
+        pages(&all),
+        "a row spans the whole pages its file range rounds out to"
+    );
+    assert_eq!(
+        cold.resident,
+        0,
+        "after an eviction of the stack no page of it is in the page cache ({} of {}; experts that kept a page: {:?})",
+        cold.resident,
+        cold.total,
+        kept(&all)
+    );
+    assert_eq!(table.resident_rows(&all).unwrap(), 0);
 
     table.prefetch(&ids).unwrap();
     table.populate(&ids).unwrap();
     let warm = table.resident_pages(&ids).unwrap();
-    assert_eq!(warm.total, cold.total, "the same pages are counted");
+    assert_eq!(
+        warm.total,
+        pages(&ids),
+        "the named experts' whole pages are counted"
+    );
     assert_eq!(
         warm.resident, warm.total,
         "after a populate every page of the named experts is resident"
@@ -740,17 +785,30 @@ fn hw_engram_expert_stack_evicts_and_reads_back() {
     assert_eq!(table.resident_rows(&ids).unwrap(), ids.len() as u64);
 
     table.evict_rows(&ids).unwrap();
+    let again = table.resident_pages(&ids).unwrap();
     assert_eq!(
-        table.resident_pages(&ids).unwrap().resident,
+        again.resident,
         0,
-        "the experts just read are dropped again"
+        "the experts just read are dropped again, their runs' edge pages included ({} of {}; experts that kept a page: {:?})",
+        again.resident,
+        again.total,
+        kept(&ids)
     );
+
+    table.prefetch(&[4]).unwrap();
+    table.populate(&[4]).unwrap();
+    assert_eq!(table.resident_rows(&[4]).unwrap(), 1);
     assert!(
         matches!(
-            table.evict_rows(&[EXPERTS as u32]),
+            table.evict_rows(&[4, EXPERTS as u32]),
             Err(EngramError::RowOutOfRange { .. })
         ),
         "an eviction past the stack is refused by name"
+    );
+    assert_eq!(
+        table.resident_rows(&[4]).unwrap(),
+        1,
+        "a refused eviction drops nothing, not even the expert named ahead of the bad id"
     );
 }
 

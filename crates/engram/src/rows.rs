@@ -19,7 +19,9 @@ use std::sync::{Arc, OnceLock};
 
 use gguf::{Gguf, Split, TensorInfo};
 
-use crate::{EngramError, RowTable, RowTables, TableBytes, fadvise_dontneed, page_size};
+use crate::{
+    EngramError, RowTable, RowTables, TableBytes, adjacent_runs, fadvise_dontneed, page_size,
+};
 
 /// The advice a table's pages take when it opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,17 +185,23 @@ impl SplitTable {
     }
 
     /// Drop `ids`' pages from this process and from the page cache, so the
-    /// next read of them is a device read again: the whole pages of each row,
-    /// the mapping's entries first (`posix_fadvise(DONTNEED)` skips a folio
-    /// that is still mapped), then the cache. A cold path: the shard is
-    /// opened for it on the first call. A page shared with a neighbouring
-    /// row, or held mapped or locked by another process, may stay.
+    /// next read of them is a device read again: one eviction per run of
+    /// adjacent rows over the whole pages that hold it, the mapping's entries
+    /// first (`posix_fadvise(DONTNEED)` skips a folio that is still mapped),
+    /// then the cache. An id past the table is refused by name before
+    /// anything is dropped. A cold path: the shard is opened for it on the
+    /// first call. A page a run shares with a row or bytes outside it may
+    /// stay, with the rest of its folio, as may a page another process holds
+    /// mapped or locked.
     pub fn evict_rows(&self, ids: &[u32]) -> Result<(), EngramError> {
         let view = self.view()?;
+        let spans = adjacent_runs(ids)
+            .into_iter()
+            .map(|(first, last)| view.run_pages(first, last))
+            .collect::<Result<Vec<_>, _>>()?;
         let file = self.file()?;
         let base = self.shard()?.mapping().as_ptr() as usize;
-        for &id in ids {
-            let (first, span) = view.pages(id)?;
+        for (first, span) in spans {
             view.advise_pages(first, span, libc::MADV_DONTNEED, "madvise(DONTNEED)")?;
             fadvise_dontneed(file, first - base, span)
                 .map_err(|e| view.io("posix_fadvise(DONTNEED)", e))?;
