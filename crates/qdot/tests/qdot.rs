@@ -5912,16 +5912,18 @@ fn lane_columns(ty: GgmlType, k: usize) -> Vec<Vec<u8>> {
     coded_columns(ty, k, ends)
 }
 
-/// Row-lane clause on synthetic rows: for Q4_K, Q5_K and Q6_K, groups of
+/// Row-lane clause on synthetic rows: for Q5_K and Q6_K, groups of
 /// seeded rows at k = 256 (one super-block, a short chunk), 2,048 and 4,096
 /// (GLM's routed down and gate/up widths: two and four whole chunks) and
 /// 2,304 (two chunks and a one-super-block tail), and the 0xFF group
 /// ([`lane_fill`]) at 4,096, with Q6_K's 0x00 group beside it — lanes =
 /// `dot_row` per (row, column), bit for bit ([`assert_lanes_match`]).
 #[test]
-#[ignore = "hw: the box's CPU (AVX2; Q4_K's AVX-512 VNNI body where it has one); reads no model file"]
+#[ignore = "hw: the box's CPU (AVX2); reads no model file"]
 fn hw_lanes_match_dot_row_synthetic() {
-    for ty in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
+    // PIN(2026-10-14): Q4_K's clause moved to hw_q4k_avx512_matches_avx2_synthetic,
+    // which holds it at k = 512 and 768 too.
+    for ty in [GgmlType::Q5_K, GgmlType::Q6_K] {
         let (block, _) = lane_block(ty);
         for (k, rows, seed) in [
             (256usize, 16usize, 0x1a2e_0001u64),
@@ -5982,9 +5984,12 @@ fn hw_q4k_avx512_matches_avx2_synthetic() {
         && std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
         && std::arch::is_x86_feature_detected!("avx512vnni");
-    assert!(
-        isa || !qdot::q4k_avx512(),
-        "q4k_avx512 picked the AVX-512 VNNI bodies on a CPU without their ISA"
+    let wanted = std::env::var_os("BLOOMERY_QDOT_AVX512").is_none_or(|v| v == "1");
+    assert_eq!(
+        qdot::q4k_avx512(),
+        isa && wanted,
+        "q4k_avx512 must pick the AVX-512 VNNI bodies exactly where the CPU has their ISA and \
+         BLOOMERY_QDOT_AVX512 is not 0"
     );
     let body = if qdot::q4k_avx512() {
         "AVX-512 VNNI"

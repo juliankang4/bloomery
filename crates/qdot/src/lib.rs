@@ -4914,31 +4914,27 @@ unsafe fn dot_q4k_q82x4_tile_avx512<const C: usize>(
     acols: &[*const u8; C],
     nb: usize,
 ) -> [f32; C] {
-    // SAFETY: the ISA is present, `wrow` holds nb blocks and every column
-    // 2 * nb groups per contract.
-    unsafe {
+    {
         let ml = _mm512_set1_epi8(0xF);
         let mut accd = [_mm256_setzero_ps(); C];
 
         for i in 0..nb {
             let wb = &wrow[i * Q4K_BLOCK..(i + 1) * Q4K_BLOCK];
 
-            let d = f16c_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
-            let dmin = f16c_to_f32(u16::from_le_bytes([wb[2], wb[3]]));
+            // SAFETY: F16C is enabled on this fn; register-only conversions.
+            let (d, dmin) = unsafe { f16c_pair_to_f32([wb[0], wb[1], wb[2], wb[3]]) };
 
             let utmp = make_q4_scales(&wb[4..16]);
-            // SAFETY: 8 readable bytes inside the local u32[4].
-            let mins_v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                utmp.as_ptr().add(2) as *const __m128i,
-            )));
+            // SAFETY: 8 readable bytes at u32 2..4 of the local u32[4].
+            let mins8 = unsafe { _mm_loadl_epi64(utmp.as_ptr().add(2) as *const __m128i) };
+            let mins_v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(mins8));
             let mins = _mm256_mul_ps(_mm256_set1_ps(-dmin), mins_v);
 
-            // SAFETY: 8 readable bytes inside the local u32[4].
+            // SAFETY: 8 readable bytes at the head of the local u32[4].
+            let sc8 = unsafe { _mm_loadl_epi64(utmp.as_ptr() as *const __m128i) };
             let all_scales = _mm256_mul_ps(
                 _mm256_set1_ps(d),
-                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                    utmp.as_ptr() as *const __m128i
-                ))),
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(sc8)),
             );
             let lo = _mm256_castps256_ps128(all_scales);
             let hi = _mm256_extractf128_ps(all_scales, 1);
@@ -4950,13 +4946,17 @@ unsafe fn dot_q4k_q82x4_tile_avx512<const C: usize>(
             // 32-byte loads, as in the AVX2 kernels: a 64-byte load at a block's
             // 144-byte pitch splits a cache line far more often, which costs
             // at DRAM speed.
-            // SAFETY: four 32-byte loads covering the block's 128 code bytes.
-            let q4 = wb.as_ptr().add(16);
+            let q4 = &wb[16..Q4K_BLOCK];
             let half = |o: usize, p: usize| {
-                _mm512_inserti64x4::<1>(
-                    _mm512_castsi256_si512(_mm256_loadu_si256(q4.add(o) as *const __m256i)),
-                    _mm256_loadu_si256(q4.add(p) as *const __m256i),
-                )
+                // SAFETY: o + 32 and p + 32 <= 128 = q4.len(); AVX-512 F is enabled on this fn.
+                unsafe {
+                    _mm512_inserti64x4::<1>(
+                        _mm512_castsi256_si512(_mm256_loadu_si256(
+                            q4[o..o + 32].as_ptr() as *const __m256i
+                        )),
+                        _mm256_loadu_si256(q4[p..p + 32].as_ptr() as *const __m256i),
+                    )
+                }
             };
             let b02 = half(0, 64);
             let b13 = half(32, 96);
@@ -4968,26 +4968,43 @@ unsafe fn dot_q4k_q82x4_tile_avx512<const C: usize>(
             ];
 
             for (col, acc) in acols.iter().zip(accd.iter_mut()) {
-                // SAFETY: 8 readable bytes at the head of each of the column's two groups.
-                let g0 = col.add((2 * i) * Q82X4_STRIDE);
-                let g1 = col.add((2 * i + 1) * Q82X4_STRIDE);
-                let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
-                let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
+                // SAFETY: i < nb; the column holds 2 * nb Q8_2_X4 groups.
+                let g0 = unsafe { col.add((2 * i) * Q82X4_STRIDE) };
+                // SAFETY: 2 i + 1 < 2 nb, the column's group count.
+                let g1 = unsafe { col.add((2 * i + 1) * Q82X4_STRIDE) };
+                // SAFETY: a group's first 8 bytes are its four d halves.
+                let (h1, h2) = unsafe {
+                    (
+                        _mm_loadl_epi64(g0 as *const __m128i),
+                        _mm_loadl_epi64(g1 as *const __m128i),
+                    )
+                };
+                let d4_1 = _mm_cvtepu16_epi32(h1);
+                let d4_2 = _mm_cvtepu16_epi32(h2);
                 let dy = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
-                // SAFETY: 8 readable bytes at offset 8 of each group.
-                let m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g0.add(8) as *const __m128i));
-                let m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g1.add(8) as *const __m128i));
+                // SAFETY: bytes 8..16 of each group are its four sums.
+                let (s1, s2) = unsafe {
+                    (
+                        _mm_loadl_epi64(g0.add(8) as *const __m128i),
+                        _mm_loadl_epi64(g1.add(8) as *const __m128i),
+                    )
+                };
+                let m4_1 = _mm_cvtepi16_epi32(s1);
+                let m4_2 = _mm_cvtepi16_epi32(s2);
                 let myi = _mm256_set_m128i(m4_2, m4_1);
                 let my = _mm256_mul_ps(dy, _mm256_cvtepi32_ps(myi));
 
-                // SAFETY: eight 32-byte loads covering each group's 128 code bytes.
                 let act = |o: usize| {
-                    _mm512_inserti64x4::<1>(
-                        _mm512_castsi256_si512(
-                            _mm256_loadu_si256(g0.add(16 + o) as *const __m256i),
-                        ),
-                        _mm256_loadu_si256(g1.add(16 + o) as *const __m256i),
-                    )
+                    // SAFETY: o <= 96, so 16 + o + 32 <= 144 lies in each group's 128 code
+                    // bytes after its 16-byte head; AVX-512 F is enabled on this fn.
+                    unsafe {
+                        _mm512_inserti64x4::<1>(
+                            _mm512_castsi256_si512(_mm256_loadu_si256(
+                                g0.add(16 + o) as *const __m256i
+                            )),
+                            _mm256_loadu_si256(g1.add(16 + o) as *const __m256i),
+                        )
+                    }
                 };
                 let zero = _mm512_setzero_si512();
                 let s0 = _mm512_dpbusd_epi32(zero, w[0], act(0));
@@ -5018,7 +5035,8 @@ unsafe fn dot_q4k_q82x4_tile_avx512<const C: usize>(
 
         let mut out = [0.0f32; C];
         for (o, acc) in out.iter_mut().zip(&accd) {
-            *o = hsum_float_8(*acc);
+            // SAFETY: AVX2 is enabled on this fn; register-only.
+            *o = unsafe { hsum_float_8(*acc) };
         }
         out
     }
@@ -5515,9 +5533,7 @@ unsafe fn dot_lanes_avx512<const C: usize>(
     acols: &[*const u8; C],
     nb: usize,
 ) -> [[f32; LANE_ROWS]; C] {
-    // SAFETY: the ISA is present; every read lies inside a packed super-block
-    // or a column's validated groups (the caller's sizes).
-    unsafe {
+    {
         let pairs = C.div_ceil(2);
         let pair = |p: usize| (2 * p, (2 * p + 1).min(C - 1));
         let mut acc = [[_mm512_setzero_ps(); C]; 8];
@@ -5531,17 +5547,36 @@ unsafe fn dot_lanes_avx512<const C: usize>(
             for c in 0..C {
                 for ii in 0..n {
                     let i = i0 + ii;
-                    let g0 = acols[c].add((2 * i) * Q82X4_STRIDE);
-                    let g1 = acols[c].add((2 * i + 1) * Q82X4_STRIDE);
-                    let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
-                    let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
+                    // SAFETY: i < nb; every column holds 2 * nb Q8_2_X4 groups.
+                    let g0 = unsafe { acols[c].add((2 * i) * Q82X4_STRIDE) };
+                    // SAFETY: 2 i + 1 < 2 nb, the column's group count.
+                    let g1 = unsafe { acols[c].add((2 * i + 1) * Q82X4_STRIDE) };
+                    // SAFETY: a group's first 8 bytes are its four d halves.
+                    let (h1, h2) = unsafe {
+                        (
+                            _mm_loadl_epi64(g0 as *const __m128i),
+                            _mm_loadl_epi64(g1 as *const __m128i),
+                        )
+                    };
+                    let d4_1 = _mm_cvtepu16_epi32(h1);
+                    let d4_2 = _mm_cvtepu16_epi32(h2);
                     let dyv =
                         _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
-                    let m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g0.add(8) as *const __m128i));
-                    let m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g1.add(8) as *const __m128i));
+                    // SAFETY: bytes 8..16 of each group are its four sums.
+                    let (s1, s2) = unsafe {
+                        (
+                            _mm_loadl_epi64(g0.add(8) as *const __m128i),
+                            _mm_loadl_epi64(g1.add(8) as *const __m128i),
+                        )
+                    };
+                    let m4_1 = _mm_cvtepi16_epi32(s1);
+                    let m4_2 = _mm_cvtepi16_epi32(s2);
                     let myv = _mm256_mul_ps(dyv, _mm256_cvtepi32_ps(_mm256_set_m128i(m4_2, m4_1)));
-                    _mm256_storeu_ps(dy[c][ii].as_mut_ptr(), dyv);
-                    _mm256_storeu_ps(my[c][ii].as_mut_ptr(), myv);
+                    // SAFETY: dy[c][ii] and my[c][ii] are local [f32; 8], 32 writable bytes each.
+                    unsafe {
+                        _mm256_storeu_ps(dy[c][ii].as_mut_ptr(), dyv);
+                        _mm256_storeu_ps(my[c][ii].as_mut_ptr(), myv);
+                    }
                 }
             }
             for l in 0..8 {
@@ -5549,10 +5584,11 @@ unsafe fn dot_lanes_avx512<const C: usize>(
                 let mut a = acc[l];
                 for ii in 0..n {
                     let i = i0 + ii;
-                    let base = packed.as_ptr().add(i * LANE_SB_BYTES);
-                    let mins = _mm512_castpd_ps(_mm512_broadcast_f64x4(_mm256_loadu_pd(
-                        base.add(LANE_MN + 32 * l) as *const f64,
-                    )));
+                    let base = &packed[i * LANE_SB_BYTES..(i + 1) * LANE_SB_BYTES];
+                    let mn = &base[LANE_MN + 32 * l..LANE_MN + 32 * l + 32];
+                    // SAFETY: mn is 32 readable bytes of the packed super-block.
+                    let mn = unsafe { _mm256_loadu_pd(mn.as_ptr() as *const f64) };
+                    let mins = _mm512_castpd_ps(_mm512_broadcast_f64x4(mn));
                     for (p, a) in a.iter_mut().enumerate().take(pairs) {
                         let (c0, c1) = pair(p);
                         let m = _mm512_mask_mov_ps(
@@ -5564,14 +5600,18 @@ unsafe fn dot_lanes_avx512<const C: usize>(
                     }
                     for j in 0..2 {
                         let s = 4 * j + t;
-                        let sc = _mm512_castpd_ps(_mm512_broadcast_f64x4(_mm256_loadu_pd(
-                            base.add(LANE_SC + 32 * s) as *const f64,
-                        )));
+                        let scb = &base[LANE_SC + 32 * s..LANE_SC + 32 * s + 32];
+                        // SAFETY: scb is 32 readable bytes of the packed super-block.
+                        let scb = unsafe { _mm256_loadu_pd(scb.as_ptr() as *const f64) };
+                        let sc = _mm512_castpd_ps(_mm512_broadcast_f64x4(scb));
                         let mut w = [_mm512_setzero_si512(); 4];
                         for (g, w) in w.iter_mut().enumerate() {
-                            *w = _mm512_broadcast_i64x4(_mm256_loadu_si256(
-                                base.add(32 * (8 * s + 4 * h + g)) as *const __m256i,
-                            ));
+                            let o = 32 * (8 * s + 4 * h + g);
+                            let code = &base[o..o + 32];
+                            // SAFETY: code is 32 readable bytes of the packed super-block.
+                            let code =
+                                unsafe { _mm256_loadu_si256(code.as_ptr() as *const __m256i) };
+                            *w = _mm512_broadcast_i64x4(code);
                         }
                         for (p, a) in a.iter_mut().enumerate().take(pairs) {
                             let (c0, c1) = pair(p);
@@ -5579,13 +5619,17 @@ unsafe fn dot_lanes_avx512<const C: usize>(
                             // Column c0's four activation dwords in each 128-bit
                             // lane of the low half, c1's in the high half; an
                             // in-lane shuffle spreads dword g over each half.
-                            let q = _mm512_inserti64x4::<1>(
-                                _mm512_castsi256_si512(_mm256_broadcastsi128_si256(
+                            // SAFETY: (2 i + j) < 2 nb, and 16 + 32 t + 16 h + 16 <= 144 lies
+                            // in that group of columns c0 and c1 (both < C).
+                            let (q0, q1) = unsafe {
+                                (
                                     _mm_loadu_si128(acols[c0].add(at) as *const __m128i),
-                                )),
-                                _mm256_broadcastsi128_si256(_mm_loadu_si128(
-                                    acols[c1].add(at) as *const __m128i
-                                )),
+                                    _mm_loadu_si128(acols[c1].add(at) as *const __m128i),
+                                )
+                            };
+                            let q = _mm512_inserti64x4::<1>(
+                                _mm512_castsi256_si512(_mm256_broadcastsi128_si256(q0)),
+                                _mm256_broadcastsi128_si256(q1),
                             );
                             let zero = _mm512_setzero_si512();
                             let s01 = _mm512_dpbusd_epi32(
@@ -5624,9 +5668,11 @@ unsafe fn dot_lanes_avx512<const C: usize>(
                     _mm512_extractf64x4_pd::<1>(both)
                 });
             }
-            let rows = transpose8_ps(lanes);
+            // SAFETY: AVX2 is enabled on this fn; register-only shuffles.
+            let rows = unsafe { transpose8_ps(lanes) };
             for (o, &v) in o.iter_mut().zip(&rows) {
-                *o = hsum_float_8(v);
+                // SAFETY: AVX2 is enabled on this fn; register-only.
+                *o = unsafe { hsum_float_8(v) };
             }
         }
         out
