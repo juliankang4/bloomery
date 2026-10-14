@@ -18,22 +18,50 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-dirs=()
-for d in crates/*/src crates/*/tests; do
-  [ -d "$d" ] || continue
-  case "$(basename "$(dirname "$d")")" in
-    oxide-ice-unroll) ;;
-    *) dirs+=("$d") ;;
-  esac
-done
-files=()
-while IFS= read -r f; do files+=("$f"); done < <(find "${dirs[@]}" -name '*.rs' | LC_ALL=C sort)
-rc=0
-comments=$(python3 tools/check-comment-only.py --comments "${files[@]}") || rc=$?
-if [ "$rc" != 0 ]; then
-  echo "check-comments: the comment reader failed (rc $rc, above) — no verdict" >&2
-  exit "$rc"
-fi
+# The router-frequency card list and its lever are deleted: the placement ranks no card set.
+RETIRED_WORDS='h[o]t.?list|뜨[거]운 목록|핫 ?리[스]트'
+
+# rs_files CRATES : every .rs under CRATES/*/src and CRATES/*/tests, sorted, into files (global), the reproducer
+# oxide-ice-unroll left out.
+rs_files() {
+  local dirs=() d f
+  for d in "$1"/*/src "$1"/*/tests; do
+    [ -d "$d" ] || continue
+    case "$(basename "$(dirname "$d")")" in
+      oxide-ice-unroll) ;;
+      *) dirs+=("$d") ;;
+    esac
+  done
+  files=()
+  while IFS= read -r f; do files+=("$f"); done < <(find "${dirs[@]}" -name '*.rs' | LC_ALL=C sort)
+}
+
+# comment_lines FILE… : into comments (global), every comment line of FILE… as `path:line:text`.
+comment_lines() {
+  local rc=0
+  comments=$(python3 tools/check-comment-only.py --comments "$@") || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "check-comments: the comment reader failed (rc $rc, above) — no verdict" >&2
+    exit "$rc"
+  fi
+}
+
+# retired : into words (global), every line of the files git sees that carries a retired word.
+retired() {
+  local split
+  words=$(git grep --untracked -nIiE -- "$RETIRED_WORDS" || [ "$?" = 1 ])
+  # The English word wrapped across a line break ("… a h""ot" / "// list …"), which a line grep cannot see; reported
+  # at the line the word starts on.
+  split=$(git grep --untracked -zIl -e . | xargs -0 awk '
+    FNR == 1 { prev = "" }
+    { cur = tolower($0) }
+    prev ~ /h[o]t[ -]?$/ && cur ~ /^[[:space:]]*[\/!#*-]*[[:space:]]*list/ { print FILENAME ":" FNR - 1 ":" last " / " $0 }
+    { prev = cur; last = $0 }')
+  [ -z "$split" ] || words=$(printf '%s\n%s\n' "$words" "$split" | sed '/^$/d')
+}
+
+rs_files crates
+comment_lines "${files[@]}"
 # shellcheck source=tools/grep-answer.sh
 source "$ROOT/tools/grep-answer.sh"
 # Each line is `path:line:text`; a rule matches the text after the line number.
@@ -79,22 +107,12 @@ if [ -n "$cites" ]; then
   echo "check-comments: $n line(s) under tools/ cite a doc by line number — cite its section heading plus a table row's first cell or a quoted phrase, or a rig-log anchor" >&2
   fail=1
 fi
-# The router-frequency card list and its lever are deleted: the placement ranks no card set.
-RETIRED_WORDS='h[o]t.?list|뜨[거]운 목록|핫 ?리[스]트'
 WORD_ALLOW=(
   'crates/levers/src/registry.rs|name: "BLOOMERY_HOT_|the retired row refuses the name when it is set'
 )
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || { echo "check-comments: not a git work tree — the retired-word rule reads the tracked files; no verdict" >&2; exit 69; }
-words=$(git grep --untracked -nIiE -- "$RETIRED_WORDS" || [ "$?" = 1 ])
-# The English word wrapped across a line break ("… a h""ot" / "// list …"), which a line grep cannot see; reported
-# at the line the word starts on.
-split=$(git grep --untracked -zIl -e . | xargs -0 awk '
-  FNR == 1 { prev = "" }
-  { cur = tolower($0) }
-  prev ~ /h[o]t[ -]?$/ && cur ~ /^[[:space:]]*[\/!#*-]*[[:space:]]*list/ { print FILENAME ":" FNR - 1 ":" last " / " $0 }
-  { prev = cur; last = $0 }')
-[ -n "$split" ] && words=$(printf '%s\n%s\n' "$words" "$split" | sed '/^$/d')
+retired
 wunmatched=()
 wallowed=0
 for a in "${WORD_ALLOW[@]}"; do
