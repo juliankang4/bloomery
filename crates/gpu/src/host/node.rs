@@ -354,7 +354,7 @@ impl NodeOpen {
 
     /// The open as its request carries it; a layer of the set's range with
     /// no row is refused by name.
-    fn write(&self, o: &mut Out) -> Result<(), GpuError> {
+    pub fn write(&self, o: &mut Out) -> Result<(), GpuError> {
         o.str(&self.family).str(&self.name);
         match self.device {
             Some(d) => o.u8(1).u32(d.ordinal).bytes(&d.uuid),

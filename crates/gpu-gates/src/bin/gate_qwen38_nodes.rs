@@ -19,6 +19,8 @@
 //!   naming the segment's other bytes. The copy is the shard that segment
 //!   is in, the smallest such shard, under `$BLOOMERY_DATA`, beside links to
 //!   the other shards; it is removed after.
+//! - Bind: a symlink under the tier page's name is refused after a valid
+//!   open; its target is unchanged after disconnect and the server's drain.
 //! - Bits: the history (`q38_history`) on node 0 with the tier on node 1,
 //!   every token and logits row bit for bit the same plan's history in one
 //!   process, the tier a card of that process. Structure: node 0's stage
@@ -76,7 +78,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model, SplitWalk};
     use bloomery_gpu::host::PoisonKind;
-    use bloomery_gpu::host::node::wire::{In, Out as Payload, Tag};
+    use bloomery_gpu::host::node::wire::{In, MAX_FRAME, Out as Payload, Tag};
     use bloomery_gpu::host::node::{NodeOpen, TierNode, node_cards};
     use bloomery_gpu::host::slots::SlotMap;
     use bloomery_gpu::host::swap::Residency;
@@ -657,6 +659,113 @@ mod gate {
         Ok(ok)
     }
 
+    /// One server frame, bounded as the node protocol's frames are.
+    fn node_frame(s: &mut TcpStream) -> Result<Vec<u8>, GateError> {
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len)?;
+        let len = u32::from_le_bytes(len) as usize;
+        if !(1..=MAX_FRAME).contains(&len) {
+            return Err(format!("node 1 sent a frame of {len} bytes").into());
+        }
+        let mut frame = vec![0u8; len];
+        s.read_exact(&mut frame)?;
+        Ok(frame)
+    }
+
+    /// Send one request and read its reply on the clause's bounded stream.
+    fn node_reply(s: &mut TcpStream, tag: Tag, body: &[u8]) -> Result<Vec<u8>, GateError> {
+        let len = u32::try_from(body.len() + 1)?;
+        s.write_all(&len.to_le_bytes())?;
+        s.write_all(&[tag as u8])?;
+        s.write_all(body)?;
+        node_frame(s)
+    }
+
+    /// A valid open followed by a bind to a symlink is refused; after the
+    /// channel ends without Close, the target's bytes are still its own.
+    fn symlink_bind(c: &Common, plan: &Plan<'_>, file: &Split) -> Result<bool, GateError> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut open = tier_open(plan, file)?;
+        open.shape.hidden = usize::try_from(c.inputs.spec.hidden)?;
+        open.shape.n_used = usize::try_from(plan.model.experts_used)?;
+        open.block = (
+            1,
+            usize::try_from(model::arch::qwen35moe::place::tier_route_scratch_bytes(1))?,
+        );
+        let (mut n1, addr) = node1(None)?;
+        let target = std::env::temp_dir().join(format!("{NAME}-{}.target", std::process::id()));
+        let alias =
+            Path::new("/dev/shm").join(format!("bloomery-tier-{}-symlink", std::process::id()));
+        let before = vec![0x5Au8; 1 << 20];
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target)?;
+        let mut linked = false;
+        let r = (|| -> Result<bool, GateError> {
+            f.write_all(&before)?;
+            drop(f);
+            std::os::unix::fs::symlink(&target, &alias)?;
+            linked = true;
+
+            let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(60))?;
+            s.set_read_timeout(Some(Duration::from_secs(600)))?;
+            s.set_write_timeout(Some(Duration::from_secs(60)))?;
+            let census = node_frame(&mut s)?;
+            if census[0] != Tag::Census as u8 {
+                return Err("bind: node 1 sent no census".into());
+            }
+            let mut payload = Payload::default();
+            open.write(&mut payload)?;
+            let opened = node_reply(&mut s, Tag::Open, payload.done())?;
+            if opened[0] != Tag::Ok as u8 {
+                return Err(format!("bind: node 1 refused the valid open: {opened:?}").into());
+            }
+            let path = alias.to_str().ok_or("a symlink path not UTF-8")?;
+            payload.clear().str(path).len(before.len()).len(1).len(0);
+            let reply = node_reply(&mut s, Tag::Bind, payload.done())?;
+            let refused =
+                reply[0] == Tag::Err as u8 && String::from_utf8_lossy(&reply[1..]).contains(path);
+            s.shutdown(Shutdown::Both)?;
+            drop(s);
+            let ended = n1.wait_within(Duration::from_secs(60))?;
+            let drained = ended.is_some_and(|s| !s.success())
+                && n1
+                    .stderr()
+                    .contains("the tier held no page and its stream drained");
+            if ended.is_none() {
+                return Err("bind: node 1 did not end after disconnect".into());
+            }
+            let unchanged = std::fs::read(&target)? == before;
+            let ok = refused && drained && unchanged;
+            println!(
+                "{} bind: symlink refused {refused}, disconnected server drained {drained}, \
+                 target unchanged {unchanged}",
+                if ok { "ok" } else { "FAIL" }
+            );
+            Ok(ok)
+        })();
+        let mut errors = Vec::new();
+        for path in [linked.then_some(alias.as_path()), Some(target.as_path())]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(e) = std::fs::remove_file(path) {
+                errors.push(format!("remove {}: {e}", path.display()));
+            }
+        }
+        if errors.is_empty() {
+            r
+        } else {
+            if let Err(e) = r {
+                errors.insert(0, format!("bind: {e}"));
+            }
+            Err(errors.join("; ").into())
+        }
+    }
+
     /// The open clause on other bytes: a copy of `file` under
     /// `$BLOOMERY_DATA` whose one tier segment's first byte is flipped, its
     /// headers `file`'s, served by a second node 1; the plan's tier opened
@@ -929,16 +1038,13 @@ mod gate {
         release: &Mutex<Receiver<bool>>,
     ) {
         loop {
-            let mut len = [0u8; 4];
-            let mut frame = Vec::new();
-            let read = down.read_exact(&mut len).and_then(|()| {
-                frame.resize(u32::from_le_bytes(len) as usize, 0);
-                down.read_exact(&mut frame)
-            });
-            if read.is_err() {
+            let Ok(frame) = node_frame(&mut down) else {
                 drop(up.shutdown(Shutdown::Write));
                 return;
-            }
+            };
+            let len = u32::try_from(frame.len())
+                .expect("node_frame bounds its length below u32::MAX")
+                .to_le_bytes();
             let mut close = false;
             if frame.first().copied() == Some(Tag::Launch as u8)
                 && armed.swap(false, Ordering::SeqCst)
@@ -1082,6 +1188,10 @@ mod gate {
         pass &= swapped_open(&plan, &file, addr)?;
         tier::sc("open: node 1 refuses a copy of the file whose tier segment holds other bytes")?;
         pass &= other_bytes_open(&plan, &file)?;
+        tier::sc(
+            "bind: node 1 refuses a symlink and leaves its target unchanged after disconnect",
+        )?;
+        pass &= symlink_bind(c, &plan, &file)?;
         drop(file);
 
         tier::sc("bits: node 0 with the tier on node 1 = one process, bit for bit")?;

@@ -15,7 +15,7 @@ pub(super) const VERSION: u32 = 3;
 
 /// The longest frame either side takes: an open's rows are the largest, a
 /// few hundred kilobytes.
-const MAX_FRAME: usize = 1 << 26;
+pub const MAX_FRAME: usize = 1 << 26;
 
 /// How long one read or write of the stream blocks: a wait looks at its
 /// deadline, and the server at its stage side's progress, this often.

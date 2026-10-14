@@ -29,6 +29,7 @@ bloomery-runtime = { path = "../runtime" }
 bloomery-verbs = { path = "../verbs" }
 # The expert tier's page shared with a tier node's process through a /dev/shm file (`graph::MappedHost`).
 memmap2.workspace = true
+libc.workspace = true
 # The pinned pool the hybrid host tier waits on and computes with (the CPU
 # engine dispatches its expert matmuls on the same pool).
 bloomery-threads = { path = "../threads" }

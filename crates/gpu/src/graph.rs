@@ -606,6 +606,7 @@ impl MappedHost {
             .write(true)
             .create_new(create)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .map_err(|e| GpuError::link(what, format!("{}: {e}", path.display())))?;
         let r = MappedHost::map_file(ctx, &file, path, bytes, create, what);
