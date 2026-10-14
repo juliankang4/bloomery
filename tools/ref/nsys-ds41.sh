@@ -9,8 +9,8 @@
 #       tables again, no profile; the depth argument is the number the analysis reads, and a
 #       corpus arm (prose:<P>, code:<P>, the run form's spelling) is accepted as its P
 #   bash tools/ref/nsys-ds41.sh --self-test
-#       the decode-form analysis held to synthetic traces (no box, no nsys: the fixtures are
-#       ds41copy.py's Synth, and every case runs this script's own --analyze)
+#       decode analysis on ds41copy.py's synthetic traces and pre-lease refusals on stub cards
+#       (no box, no nsys, no real lease)
 #
 # The V4.1 sibling of nsys-gpu.sh. Its step boundary is the same (a kernel that runs exactly once
 # per replay, counted against the replays the run makes) and so is its refusal: no table when the
@@ -419,11 +419,10 @@ analyze_prefill() {
   py_bounded "$PP" tables "$@" --layer "$LAYER" --blocked-us "$BLOCKED_US"
 }
 
-# The decode-form analysis held to synthetic traces, no box and no nsys: ds41copy.py's Synth
-# writes the sqlite tables the analyzer queries, and every case runs this script's own --analyze
-# and holds its exit code, its refusals and the numbers it prints.
+# Synthetic decode traces and stub-card runs hold the analyzer's output and the real path's
+# pre-lease refusals to their exit codes and named reasons, without a box, nsys or a real lease.
 self_test() {
-  local t out rc n=0 bad=0 lastcp
+  local t out rc n=0 bad=0 lastcp ref T fault setting want why
   t=$(mktemp -d)
   trap 'rm -rf "$t"' RETURN
   python3 - "$t" "${BASH_SOURCE[0]%/*}/ds41copy.py" << 'FIX'
@@ -521,6 +520,69 @@ FIX
   case_ arm-accepted 0 "-> OK"
   rc=0; out=$(bash "$0" --analyze "$t/tier.sqlite" prose:x 4 2>&1) || rc=$?
   case_ arm-refused 64 "got 'prose:x'"
+
+  ref=${BASH_SOURCE[0]%/*}
+  T=$t/tree
+  mkdir -p "$T/tools/ref" "$T/crates/stub" "$T/target/release" "$T/bin" || return $?
+  cp "$ref/nsys-ds41.sh" "$ref/timing-card.sh" "$ref/lease.sh" \
+    "$ref/lease-probe.sh" "$ref/dspark-path.sh" "$T/tools/ref/" || return $?
+  # shellcheck source=tools/ref/depth-stub-cards.sh
+  ( trap - RETURN; STUB_CARDS_FILE_ONLY=; . "$ref/depth-stub-cards.sh" ) || return $?
+  echo 'lease_take() { echo "[stub] lease taken"; exit 42; }' >> "$T/tools/ref/lease.sh" || return 1
+  cat > "$T/tools/ref/ref-paths.sh" << 'PATHS' || return $?
+MODEL_NAME=deepseek41
+MODEL=stub.gguf
+BLOOMERY_DATA=.
+TWO_CARD_PLACEMENT='the stub two-card line'
+PATHS
+  : > "$T/Cargo.toml" || return $?
+  : > "$T/Cargo.lock" || return $?
+  : > "$T/crates/stub/Cargo.toml" || return $?
+  printf '#!/bin/sh\necho "stub generate_ds41"\n' > "$T/target/release/generate_ds41" || return $?
+  printf '#!/bin/sh\necho "stub nsys"\n' > "$T/bin/nsys" || return $?
+  chmod +x "$T/target/release/generate_ds41" "$T/bin/nsys" || return $?
+  if ! command -v timeout > /dev/null; then
+    cat > "$T/bin/timeout" << 'TIMEOUT' || return $?
+#!/bin/sh
+case $1 in --kill-after=*) shift ;; esac
+shift
+exec "$@"
+TIMEOUT
+    chmod +x "$T/bin/timeout" || return $?
+  fi
+  for fault in ok cap gone journal; do
+    case $fault in
+      ok)
+        setting=STUB_3090_LIMIT=250.00 want=42 why='[stub] lease taken'
+        ;;
+      cap)
+        setting=STUB_3090_LIMIT=300.00 want=78
+        why="nsys-ds41.sh: two cards, refused before the lease: the 3090's power limit reads 300.00 W (enforced 300.00 W), not its 250 W cap"
+        ;;
+      gone)
+        setting=STUB_3090_GONE=1 want=69
+        why='does not answer nvidia-smi (rc 15)'
+        ;;
+      journal)
+        setting=STUB_JOURNAL_FAIL=1 want=69
+        why='nsys-ds41.sh: two cards, refused before the lease: journalctl -k does not answer (rc 1)'
+        ;;
+    esac
+    rc=0; out=$(
+      cd "$T" || exit $?
+      unset BLOOMERY_BOX_CARD BLOOMERY_DRAFT BLOOMERY_DRY BLOOMERY_NSYS_FORM \
+        BLOOMERY_TIMING_GPU BLOOMERY_GEN_BIN STUB_3090_LIMIT STUB_3090_GONE STUB_JOURNAL_FAIL || exit $?
+      env LC_ALL=C PATH="$T/bin:$PATH" TMPDIR="$t" NSYS="$T/bin/nsys" \
+        BLOOMERY_NSYS_OUT="$t/out" BLOOMERY_LOCK_DIR="$t" \
+        BLOOMERY_TIMING_CARDS=a6000+3090 BLOOMERY_GEN_PLACE=bp \
+        "$setting" bash tools/ref/nsys-ds41.sh 6 2>&1
+    ) || rc=$?
+    if [ "$fault" = ok ]; then
+      case_ twocard-lease "$want" "$why"
+    else
+      case_ "twocard-$fault" "$want" "$why" '[stub] lease taken'
+    fi
+  done
   echo "nsys-ds41.sh: self-test $([ "$bad" = 0 ] && echo ok || echo FAIL) ($n cases, $bad failed)"
   [ "$bad" = 0 ]
 }
@@ -690,6 +752,7 @@ fi
 # shellcheck disable=SC2034 # read by lease.sh's witness()
 WITNESS=(head-open indent card busiest model mem pgmajfault)
 
+timing_cards_before_lease
 lease_take
 timing_cards_start
 echo "[config] form=$FORM nsys=$($NSYS --version) n=$NGEN place=$PLACE args='${DEPTHS[*]}' last=$LAST out=$OUTDIR bound=${BOUND}s"
