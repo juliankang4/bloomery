@@ -1174,6 +1174,14 @@ mod gate {
         Ok(failed && ended)
     }
 
+    /// Remove a saved run; an early node failure may have written none.
+    fn remove_run(path: &Path) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }
+    }
+
     fn gate(c: &Common) -> Result<(), GateError> {
         let mut pass = true;
         tier::sc("census: node 1's census over the channel is the plan's tier card")?;
@@ -1230,7 +1238,7 @@ mod gate {
                 pass = false;
             }
         }
-        std::fs::remove_file(&out).map_err(|e| format!("remove {}: {e}", out.display()))?;
+        remove_run(&out).map_err(|e| format!("remove {}: {e}", out.display()))?;
         let killed = n1.wait_within(Duration::from_secs(60))?;
         println!("node 1 ended {killed:?} (killed by node 0's lost node clause)");
 
@@ -1275,9 +1283,10 @@ mod gate {
             Mode::Hold0 { gib } => run_hold0(&c, gib),
         }
     }
+
     #[cfg(test)]
     mod tests {
-        use super::{PlaceError, PlacementError, plan_refusal};
+        use super::{NAME, PlaceError, PlacementError, plan_refusal, remove_run};
 
         #[test]
         fn plan_refusals_retry_only_budget_candidates() {
@@ -1316,6 +1325,19 @@ mod gate {
                     }
                 }
             }
+        }
+
+        #[test]
+        fn run_cleanup_accepts_only_missing_files() {
+            let dir = std::env::temp_dir().join(format!("{NAME}-cleanup-{}", std::process::id()));
+            std::fs::create_dir(&dir).expect("the cleanup directory");
+            let out = dir.join("node0.run");
+            remove_run(&out).expect("an early node failure wrote no run");
+            std::fs::write(&out, b"a saved run").expect("the saved run");
+            remove_run(&out).expect("the saved run removed");
+            assert!(!out.exists());
+            assert!(remove_run(&dir).is_err(), "a directory is not a run file");
+            std::fs::remove_dir(&dir).expect("the cleanup directory removed");
         }
     }
 }
