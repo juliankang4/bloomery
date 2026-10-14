@@ -153,11 +153,12 @@ mod gate {
     };
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{Gpu, GpuError, window};
+    use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn, prefill_bound};
     use bloomery_gpu_gates::qwen3moe::dev::{SENTINEL_Q8_CODE, SENTINEL_Q8_SCALE};
     use bloomery_gpu_gates::qwen3moe::{f16_logical_bits, step_sets};
     use bloomery_gpu_gates::rounding::{U, gamma};
     use bloomery_gpu_gates::{
-        GateError, activations, bits_equal, checks_failed, mask_bits_in, open_split,
+        GateError, activations, bits_equal, checks_failed, mask_bits_in, open_split, par_map,
         ref_tensor_logical_in, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -869,44 +870,20 @@ mod gate {
     }
 
     fn exact(q: &[f32], kh: &[f32], vh: &[f32], n: usize, scale: f32) -> Exact {
-        let sc = f64::from(scale);
-        let s: Vec<f64> = (0..n)
-            .map(|j| {
-                let k = &kh[j * HEAD..(j + 1) * HEAD];
-                sc * q
-                    .iter()
-                    .zip(k)
-                    .map(|(&a, &b)| f64::from(a) * f64::from(b))
-                    .sum::<f64>()
-            })
-            .collect();
-        let a: Vec<f64> = (0..n)
-            .map(|j| {
-                let k = &kh[j * HEAD..(j + 1) * HEAD];
-                sc.abs()
-                    * q.iter()
-                        .zip(k)
-                        .map(|(&a, &b)| (f64::from(a) * f64::from(b)).abs())
-                        .sum::<f64>()
-            })
-            .collect();
-        // The tensor-core pass's scores also carry the query's f16 rounding:
-        // 2^-11 of a normal value, 2^-25 absolute below f16's normal range
-        // (2^-14 of the key magnitudes then, relative to the 2^-11 term).
-        let a16: Vec<f64> = (0..n)
-            .map(|j| {
-                let k = &kh[j * HEAD..(j + 1) * HEAD];
-                a[j] + sc.abs()
-                    * 2f64.powi(-14)
-                    * k.iter().map(|&b| f64::from(b).abs()).sum::<f64>()
-            })
-            .collect();
-        let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let p: Vec<f64> = s.iter().map(|&v| (v - m).exp()).collect();
-        let z: f64 = p.iter().sum();
-        let pb: Vec<f64> = p.iter().map(|&v| v / z).collect();
-        let x: Vec<f64> = s.iter().map(|&v| m - v).collect();
-        let xmax = x.iter().copied().fold(0.0f64, f64::max);
+        let ex = exact_attn(q, kh, vh, HEAD, n, scale);
+        // The prefill flash (module doc): one rescale per 64-key tile, the
+        // f16 weights normalized by their own sum, the tensor core's value
+        // accumulation and the lanes' weight sums.
+        let bound_pref = prefill_bound(&ex, vh, HEAD, PREF_TILE);
+        let ExactAttn {
+            o,
+            a,
+            a16,
+            pb,
+            x,
+            xmax,
+            ..
+        } = ex;
         // The cut read through `seg_span` (module doc): at or below 5,120
         // keys span = SEG_KEYS and segs = `n.div_ceil(SEG_KEYS)`.
         let span = seg_span(n, SEGMENTS, SEG_KEYS);
@@ -918,38 +895,11 @@ mod gate {
         // truncate: twice γ(130) for the dot of exact f16 products.
         let es_m = 2f64.powi(-11) + 2.0 * gamma(130);
         let (acc_o, acc_i) = (gamma(span + segs + 8), gamma(n + 40));
-        // The prefill flash (module doc): one rescale per 64-key tile, the
-        // f16 weights normalized by their own sum, the tensor core's value
-        // accumulation and the lanes' weight sums.
-        let r_pref = n.div_ceil(PREF_TILE) as f64;
-        let w16: Vec<f64> = pb
-            .iter()
-            .zip(&p)
-            .map(|(&q, &pm)| {
-                let rel = 2f64.powi(-11) * q;
-                if pm >= 2f64.powi(-14) {
-                    rel
-                } else {
-                    rel.max(2f64.powi(-25) / z)
-                }
-            })
-            .collect();
-        let dbar: f64 = w16.iter().sum();
-        let acc_pv = 2.0 * gamma(n.div_ceil(16) + 16);
-        let acc_l = gamma(n.div_ceil(4) + n.div_ceil(PREF_TILE) + 2);
-        let mut o = vec![0.0f64; HEAD];
-        for (j, &w) in pb.iter().enumerate() {
-            for d in 0..HEAD {
-                o[d] += w * f64::from(vh[j * HEAD + d]);
-            }
-        }
         let mut bo = vec![0.0f64; HEAD];
         let mut bm = vec![0.0f64; HEAD];
         let mut bi = vec![0.0f64; HEAD];
-        let mut bp = vec![0.0f64; HEAD];
         for d in 0..HEAD {
-            let (mut t_o, mut t_m, mut t_i, mut t_p, mut pv) =
-                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let (mut t_o, mut t_m, mut t_i, mut pv) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
             for j in 0..n {
                 let v = f64::from(vh[j * HEAD + d]);
                 let dev = (v - o[d]).abs();
@@ -957,23 +907,18 @@ mod gate {
                 t_o += pb[j] * (es_o * a[j] + ee + 4.0 * U * r_ours + 2.0 * U * xmax) * dev;
                 t_m += pb[j] * (es_m * a16[j] + ee + 4.0 * U * r_ours + 2.0 * U * xmax) * dev;
                 t_i += pb[j] * (es_i * a[j] + ee + 4.0 * U * r_ik + 2.0 * U * xmax) * dev;
-                t_p += (pb[j] * (es_m * a16[j] + ee + 4.0 * U * r_pref + 2.0 * U * xmax)
-                    + w16[j]
-                    + pb[j] * dbar)
-                    * dev;
                 pv += pb[j] * v.abs();
             }
             bo[d] = t_o + acc_o * (pv + o[d].abs()) + 2.0 * U * o[d].abs();
             bm[d] = t_m + acc_o * (pv + o[d].abs()) + 2.0 * U * o[d].abs();
             bi[d] = t_i + acc_i * (pv + o[d].abs()) + 2.0 * U * o[d].abs();
-            bp[d] = t_p + acc_pv * pv + acc_l * o[d].abs() + 2.0 * U * o[d].abs();
         }
         Exact {
             o,
             bound_ours: bo,
             bound_mma: bm,
             bound_ik: bi,
-            bound_pref: bp,
+            bound_pref,
         }
     }
 
@@ -1031,39 +976,25 @@ mod gate {
         y: &[f32],
     ) -> (bool, f64) {
         let n_head = g.n_kv * GROUP;
-        let workers = std::thread::available_parallelism().map_or(8, |n| n.get().min(16));
-        let chunk = counts.len().div_ceil(workers).max(1);
-        let parts: Vec<(bool, f64)> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..counts.len())
-                .step_by(chunk)
-                .map(|r0| {
-                    sc.spawn(move || {
-                        let (mut ok, mut worst) = (true, 0.0f64);
-                        for (t, &n) in counts.iter().enumerate().skip(r0).take(chunk) {
-                            for h in 0..n_head {
-                                let plane = (h / GROUP) * g.ctx * HEAD;
-                                let row = (t * n_head + h) * HEAD;
-                                let ex = exact(
-                                    &q[row..row + HEAD],
-                                    &cache.kf[plane..plane + n * HEAD],
-                                    &cache.vf[plane..plane + n * HEAD],
-                                    n,
-                                    g.scale,
-                                );
-                                for d in 0..HEAD {
-                                    let e = (f64::from(y[row + d]) - ex.o[d]).abs();
-                                    worst = worst.max(e / ex.bound_pref[d]);
-                                    ok &= e <= ex.bound_pref[d];
-                                }
-                            }
-                        }
-                        (ok, worst)
-                    })
-                })
-                .collect();
-            hs.into_iter()
-                .map(|h| h.join().unwrap_or((false, f64::INFINITY)))
-                .collect()
+        let parts = par_map(counts.len() * n_head, |i| {
+            let (t, h) = (i / n_head, i % n_head);
+            let n = counts[t];
+            let plane = (h / GROUP) * g.ctx * HEAD;
+            let row = i * HEAD;
+            let ex = exact(
+                &q[row..row + HEAD],
+                &cache.kf[plane..plane + n * HEAD],
+                &cache.vf[plane..plane + n * HEAD],
+                n,
+                g.scale,
+            );
+            let (mut ok, mut worst) = (true, 0.0f64);
+            for d in 0..HEAD {
+                let e = (f64::from(y[row + d]) - ex.o[d]).abs();
+                worst = worst.max(e / ex.bound_pref[d]);
+                ok &= e <= ex.bound_pref[d];
+            }
+            (ok, worst)
         });
         parts
             .iter()

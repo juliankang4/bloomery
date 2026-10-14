@@ -21,6 +21,7 @@ pub mod ctx_ladder;
 pub mod ds41_media;
 pub mod ds41_meta;
 pub mod engine;
+pub mod flash_band;
 pub mod flip;
 pub mod gemm32;
 #[cfg(feature = "gpu")]
@@ -511,6 +512,24 @@ impl GateRng {
     pub fn uni(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * self.unit()
     }
+}
+
+/// `f(i)` for every `i < n`, in order, the units shared among worker
+/// threads; a unit that panics panics the caller.
+#[must_use]
+pub fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let workers = std::thread::available_parallelism().map_or(8, |n| n.get().min(16));
+    let chunk = n.div_ceil(workers).max(1);
+    let f = &f;
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..n)
+            .step_by(chunk)
+            .map(|i0| sc.spawn(move || (i0..n.min(i0 + chunk)).map(f).collect::<Vec<T>>()))
+            .collect();
+        hs.into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    })
 }
 
 /// The values of `v` with a comma between each two — how a gate's line

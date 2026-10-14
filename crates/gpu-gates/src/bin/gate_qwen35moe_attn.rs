@@ -220,12 +220,14 @@ mod gate {
     use bloomery_gpu::route_core::sigmoid;
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{Gpu, GpuError, Q8Act, window};
+    use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn, prefill_bound};
     use bloomery_gpu_gates::qwen3moe::dev::{SENTINEL_Q8_CODE, SENTINEL_Q8_SCALE};
     use bloomery_gpu_gates::rounding::{U, U_F32, butterfly, gamma};
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
         GateError, Layout, RefManifest, RowKind, activations, bits_equal, checks_failed, data_dir,
-        no_local_depot, ref_ints, ref_model_path, ref_tensor_logical_in, split_f32, verdict,
+        no_local_depot, par_map, ref_ints, ref_model_path, ref_tensor_logical_in, split_f32,
+        verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
@@ -806,35 +808,17 @@ mod gate {
     /// `gate_qwen3moe_flash`'s model at a head of [`HEAD`] (module doc):
     /// `q` one head's query, `kh`/`vh` its key head's first `n` rows.
     fn exact(q: &[f32], kh: &[f32], vh: &[f32], n: usize, scale: f32) -> Exact {
-        let sc = f64::from(scale);
-        let dot = |j: usize, abs: bool| -> f64 {
-            let k = &kh[j * HEAD..(j + 1) * HEAD];
-            q.iter()
-                .zip(k)
-                .map(|(&a, &b)| {
-                    let p = f64::from(a) * f64::from(b);
-                    if abs { p.abs() } else { p }
-                })
-                .sum::<f64>()
-        };
-        let s: Vec<f64> = (0..n).map(|j| sc * dot(j, false)).collect();
-        let a: Vec<f64> = (0..n).map(|j| sc.abs() * dot(j, true)).collect();
-        // The tensor-core scores also carry the query's f16 rounding: 2^-25
-        // absolute below f16's normal range.
-        let a16: Vec<f64> = (0..n)
-            .map(|j| {
-                let k = &kh[j * HEAD..(j + 1) * HEAD];
-                a[j] + sc.abs()
-                    * 2f64.powi(-14)
-                    * k.iter().map(|&b| f64::from(b).abs()).sum::<f64>()
-            })
-            .collect();
-        let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let p: Vec<f64> = s.iter().map(|&v| (v - m).exp()).collect();
-        let z: f64 = p.iter().sum();
-        let pb: Vec<f64> = p.iter().map(|&v| v / z).collect();
-        let x: Vec<f64> = s.iter().map(|&v| m - v).collect();
-        let xmax = x.iter().copied().fold(0.0f64, f64::max);
+        let ex = exact_attn(q, kh, vh, HEAD, n, scale);
+        let bound_pref = prefill_bound(&ex, vh, HEAD, PREF_TILE);
+        let ExactAttn {
+            o,
+            a,
+            a16,
+            pb,
+            x,
+            xmax,
+            ..
+        } = ex;
         // The cut read through `seg_span`: at or below 5,120 keys (every
         // count but the deep clause's dense ones) span = SEG_KEYS and segs
         // = `n.div_ceil(SEG_KEYS)`, the 64-key cut's bound value for value.
@@ -847,54 +831,26 @@ mod gate {
         // Each half's tensor-core chain, their sum, and the query's f16.
         let es_m = 2f64.powi(-11) + 2.0 * gamma(HEAD + 2);
         let acc_o = gamma(span + segs + 8);
-        let r_pref = n.div_ceil(PREF_TILE) as f64;
-        let w16: Vec<f64> = pb
-            .iter()
-            .zip(&p)
-            .map(|(&q, &pm)| {
-                let rel = 2f64.powi(-11) * q;
-                if pm >= 2f64.powi(-14) {
-                    rel
-                } else {
-                    rel.max(2f64.powi(-25) / z)
-                }
-            })
-            .collect();
-        let dbar: f64 = w16.iter().sum();
-        let acc_pv = 2.0 * gamma(n.div_ceil(16) + 16);
-        let acc_l = gamma(n.div_ceil(4) + n.div_ceil(PREF_TILE) + 2);
-        let mut o = vec![0.0f64; HEAD];
-        for (j, &w) in pb.iter().enumerate() {
-            for (d, od) in o.iter_mut().enumerate() {
-                *od += w * f64::from(vh[j * HEAD + d]);
-            }
-        }
         let mut bo = vec![0.0f64; HEAD];
         let mut bm = vec![0.0f64; HEAD];
-        let mut bp = vec![0.0f64; HEAD];
         for d in 0..HEAD {
-            let (mut t_o, mut t_m, mut t_p, mut pv) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let (mut t_o, mut t_m, mut pv) = (0.0f64, 0.0f64, 0.0f64);
             for j in 0..n {
                 let v = f64::from(vh[j * HEAD + d]);
                 let dev = (v - o[d]).abs();
                 let ee = 4.0 * U + 2.0 * U * x[j];
                 t_o += pb[j] * (es_o * a[j] + ee + 4.0 * U * r_ours + 2.0 * U * xmax) * dev;
                 t_m += pb[j] * (es_m * a16[j] + ee + 4.0 * U * r_ours + 2.0 * U * xmax) * dev;
-                t_p += (pb[j] * (es_m * a16[j] + ee + 4.0 * U * r_pref + 2.0 * U * xmax)
-                    + w16[j]
-                    + pb[j] * dbar)
-                    * dev;
                 pv += pb[j] * v.abs();
             }
             bo[d] = t_o + acc_o * (pv + o[d].abs()) + 2.0 * U * o[d].abs();
             bm[d] = t_m + acc_o * (pv + o[d].abs()) + 2.0 * U * o[d].abs();
-            bp[d] = t_p + acc_pv * pv + acc_l * o[d].abs() + 2.0 * U * o[d].abs();
         }
         Exact {
             o,
             bound_scalar: bo,
             bound_mma: bm,
-            bound_pref: bp,
+            bound_pref,
         }
     }
 
@@ -921,23 +877,6 @@ mod gate {
         kf: Vec<f32>,
         vf: Vec<f32>,
         ctx: usize,
-    }
-
-    /// `f(i)` for every `i < n`, in order, the units shared among worker
-    /// threads; a unit that panics panics the caller.
-    fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
-        let workers = std::thread::available_parallelism().map_or(8, |n| n.get().min(16));
-        let chunk = n.div_ceil(workers).max(1);
-        let f = &f;
-        std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..n)
-                .step_by(chunk)
-                .map(|i0| sc.spawn(move || (i0..n.min(i0 + chunk)).map(f).collect::<Vec<T>>()))
-                .collect();
-            hs.into_iter()
-                .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
-                .collect()
-        })
     }
 
     /// The exact attention of every (row, head) of a launch, in the order the

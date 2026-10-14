@@ -1,0 +1,132 @@
+//! The exact attention the flash gates judge against, and the prefill
+//! flash's band: one query head's attention over its first `n` keys in f64
+//! on the cache's f16 values, the terms every flash band reads, and the
+//! first-order bound of the `flash_gqa_prefill` walk at a head of `head`
+//! values and a key tile of `tile` keys. The model is `gate_qwen3moe_flash`'s
+//! (its module doc derives each term); each gate keeps the bounds of its own
+//! kernels and computes them from these terms.
+
+use crate::rounding::{U, gamma};
+
+/// One query head's exact attention over its first `n` keys, in f64, and
+/// the terms the bands read: `s_j = scale·q·k_j`, `M = max s_j`.
+pub struct ExactAttn {
+    /// The output, `Σ_j p̄_j·v_j`, `head` values.
+    pub o: Vec<f64>,
+    /// `A_j = |scale|·Σ_d |q_d·k_jd|`.
+    pub a: Vec<f64>,
+    /// `A_j` with the query's f16 rounding below f16's normal range:
+    /// `A_j + |scale|·2^-14·Σ_d |k_jd|`.
+    pub a16: Vec<f64>,
+    /// `p_j = exp(s_j − M)`.
+    pub p: Vec<f64>,
+    /// `z = Σ_j p_j`.
+    pub z: f64,
+    /// `p̄_j = p_j / z`.
+    pub pb: Vec<f64>,
+    /// `X_j = M − s_j`.
+    pub x: Vec<f64>,
+    /// `max_j X_j` (0 for no key).
+    pub xmax: f64,
+}
+
+/// [`ExactAttn`] of the query head `q` (`head` values) over the key and
+/// value rows `kh`, `vh` (at least `n` rows of `head` values each) at
+/// `scale`. Every sum runs over `j` or `d` ascending.
+#[must_use]
+pub fn exact_attn(
+    q: &[f32],
+    kh: &[f32],
+    vh: &[f32],
+    head: usize,
+    n: usize,
+    scale: f32,
+) -> ExactAttn {
+    let sc = f64::from(scale);
+    let dot = |j: usize, abs: bool| -> f64 {
+        let k = &kh[j * head..(j + 1) * head];
+        q.iter()
+            .zip(k)
+            .map(|(&a, &b)| {
+                let p = f64::from(a) * f64::from(b);
+                if abs { p.abs() } else { p }
+            })
+            .sum::<f64>()
+    };
+    let s: Vec<f64> = (0..n).map(|j| sc * dot(j, false)).collect();
+    let a: Vec<f64> = (0..n).map(|j| sc.abs() * dot(j, true)).collect();
+    let a16: Vec<f64> = (0..n)
+        .map(|j| {
+            let k = &kh[j * head..(j + 1) * head];
+            a[j] + sc.abs() * 2f64.powi(-14) * k.iter().map(|&b| f64::from(b).abs()).sum::<f64>()
+        })
+        .collect();
+    let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let p: Vec<f64> = s.iter().map(|&v| (v - m).exp()).collect();
+    let z: f64 = p.iter().sum();
+    let pb: Vec<f64> = p.iter().map(|&v| v / z).collect();
+    let x: Vec<f64> = s.iter().map(|&v| m - v).collect();
+    let xmax = x.iter().copied().fold(0.0f64, f64::max);
+    let mut o = vec![0.0f64; head];
+    for (j, &w) in pb.iter().enumerate() {
+        for (d, od) in o.iter_mut().enumerate() {
+            *od += w * f64::from(vh[j * head + d]);
+        }
+    }
+    ExactAttn {
+        o,
+        a,
+        a16,
+        p,
+        z,
+        pb,
+        x,
+        xmax,
+    }
+}
+
+/// The prefill flash's bound on each output value of `ex` (`vh` its value
+/// rows): the tensor-core scores (each dim chain, their sum and the query's
+/// f16 rounding, `2^-11 + 2·γ(head + 2)` on `a16`), one rescale per
+/// `tile`-key tile, each weight rounded to f16 for the value product and
+/// normalized by the rounded weights' own sum, the tensor core's value
+/// accumulation over `⌈n/16⌉ + 16` roundings twice, and the lanes' weight
+/// sums over `⌈n/4⌉` weights and a rescale a tile.
+#[must_use]
+pub fn prefill_bound(ex: &ExactAttn, vh: &[f32], head: usize, tile: usize) -> Vec<f64> {
+    let n = ex.pb.len();
+    let es = 2f64.powi(-11) + 2.0 * gamma(head + 2);
+    let r = n.div_ceil(tile) as f64;
+    let w16: Vec<f64> = ex
+        .pb
+        .iter()
+        .zip(&ex.p)
+        .map(|(&q, &pm)| {
+            let rel = 2f64.powi(-11) * q;
+            if pm >= 2f64.powi(-14) {
+                rel
+            } else {
+                rel.max(2f64.powi(-25) / ex.z)
+            }
+        })
+        .collect();
+    let dbar: f64 = w16.iter().sum();
+    let acc_pv = 2.0 * gamma(n.div_ceil(16) + 16);
+    let acc_l = gamma(n.div_ceil(4) + n.div_ceil(tile) + 2);
+    (0..head)
+        .map(|d| {
+            let (mut t_p, mut pv) = (0.0f64, 0.0f64);
+            for j in 0..n {
+                let v = f64::from(vh[j * head + d]);
+                let dev = (v - ex.o[d]).abs();
+                let ee = 4.0 * U + 2.0 * U * ex.x[j];
+                t_p += (ex.pb[j] * (es * ex.a16[j] + ee + 4.0 * U * r + 2.0 * U * ex.xmax)
+                    + w16[j]
+                    + ex.pb[j] * dbar)
+                    * dev;
+                pv += ex.pb[j] * v.abs();
+            }
+            t_p + acc_pv * pv + acc_l * ex.o[d].abs() + 2.0 * U * ex.o[d].abs()
+        })
+        .collect()
+}
