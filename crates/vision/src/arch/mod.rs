@@ -197,7 +197,7 @@ mod tests {
             let t = table("qwen3vl_merger").with("clip.vision.projection_dim", Value::U32(out));
             let (card, media) = open_table(&t, "clip").expect("open");
             assert_eq!((card.weights, card.scratch), (weights, scratch), "{out}");
-            assert_eq!(media.image_token(), 248_056);
+            assert_eq!(media.image_token(), Some(248_056));
             assert_eq!(media.part_join(), PartJoin::LlamaServer);
         }
     }
@@ -216,7 +216,7 @@ mod tests {
                 (1_128_026_112, scratch),
                 "{max}"
             );
-            assert_eq!(media.image_token(), 154_854);
+            assert_eq!(media.image_token(), Some(154_854));
             assert_eq!(media.part_join(), PartJoin::LlamaServer);
         }
         let image = crate::Rgb8::filled(1000, 600, [90, 120, 30]);

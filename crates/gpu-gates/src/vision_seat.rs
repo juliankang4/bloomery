@@ -420,20 +420,23 @@ impl Projector {
                 ))
             )));
         }
-        let image = self.media.image_token();
         match text.ple {
             PleImage::Absent => {}
             PleImage::NoKey => {
                 return Err(at(&"the text model carries per-layer embeddings and no \
                     ple.image_token_id, which must be the projector's image token"));
             }
-            PleImage::Id(id) if id != image => {
-                return Err(at(&format!(
-                    "the text model's ple.image_token_id is {id}, the projector's image token \
-                     is {image}"
-                )));
+            PleImage::Id(id) => {
+                let image = self.media.image_token().ok_or_else(|| {
+                    at(&"the projector has no chat image token for ple.image_token_id")
+                })?;
+                if id != image {
+                    return Err(at(&format!(
+                        "the text model's ple.image_token_id is {id}, the projector's image token \
+                         is {image}"
+                    )));
+                }
             }
-            PleImage::Id(_) => {}
         }
         Ok(())
     }
@@ -1459,8 +1462,8 @@ mod tests {
         fn image_marker(&self) -> &str {
             "<img>"
         }
-        fn image_token(&self) -> u32 {
-            self.0
+        fn image_token(&self) -> Option<u32> {
+            Some(self.0)
         }
         fn prepare(&self, _: &vision::Rgb8) -> Result<vision::Prepared, VisionError> {
             Err(VisionError::Limits {

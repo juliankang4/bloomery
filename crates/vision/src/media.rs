@@ -99,7 +99,8 @@ pub trait MediaModel {
     /// The id [`expand_spans`] finds in the tokenized prompt and expands to one copy
     /// per position of the image ([`Prepared::span_len`]): the one id V4.1's placeholder
     /// tokenizes to, and the `<|image_pad|>` between the two delimiter ids Clef's tokenizes to.
-    fn image_token(&self) -> u32;
+    /// None when the model has no chat placeholder token.
+    fn image_token(&self) -> Option<u32>;
 
     /// The separator between a message's content parts when they are flattened into one text:
     /// the separator of a [`PartJoin::Uniform`] join.
