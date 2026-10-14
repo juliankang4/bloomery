@@ -83,6 +83,22 @@
 //! four (Qwen3.5-9B's 24/4): a block takes two heads of thirty-two positions,
 //! an m16 fragment eight positions × two heads.
 //!
+//! [`FlashGqaPrefill::enqueue_256_p2_lower`] (`gqa_prefill_flash_256_p2_lower`)
+//! is the pack-of-two walk with a lower bound a row: row `t` attends over keys
+//! `[k_first[t], n_keys[t])`, a window the host sets (an encoder's symmetric
+//! sliding window; a global layer of a non-causal pass is `k_first = 0`,
+//! `n_keys = n`). The block starts at the tile holding its smallest first key
+//! and stages zeros below it, as it does at and past its largest count; a key
+//! below a row's first is `−inf` and weighs 0, as one at or past its count. A
+//! tile below every first key of a warp's rows is skipped by that warp, and a
+//! tile that only some rows of a lane see leaves the others' state untouched
+//! (their max stays `−inf`, no rescale, zero weights), so over finite cache
+//! values a row's bits are still those of its one-row launch. A non-finite
+//! value below a row's first key that the block stages for another row
+//! reaches that row through its zero weight, as one between a row's count and
+//! the block's largest does. A first key at or past the row's count is
+//! refused as a bad count is.
+//!
 //! The `_q8` entries ([`FlashGqaPrefill::enqueue_q8`] and its eight-head
 //! `_256` kin; no packed q8 entry exists) run the same walks over the Q8_0
 //! cache the quantizing appends write (`rope_neox`'s two-plane layout: a
@@ -641,14 +657,17 @@ const _: () = assert!(DYN_BYTES_256_Q8 == 100_352);
 /// n_head + head0 + j)·256 ..]` and its output written at the same index of
 /// `y`. The key tile, the value tile and the score exchange live in the
 /// block's dynamic shared memory, and a q8 cache's two scales tiles after
-/// them. The formats differ only in a tile's staging: the f16 rows land by
-/// `cp.async` in the permuted layout; a q8 tile's raw code words land in the
+/// them. With `LOWER`, row `t` also reads its first key `k_first_buf[t]` and
+/// masks the keys below it (the module doc's lower-bound paragraph); without,
+/// `k_first_buf` is never read. The formats differ only in a tile's staging:
+/// the f16 rows land by `cp.async` in the permuted layout; a q8 tile's raw code words land in the
 /// low halves of its rows and its scales in its scales tile, and the
 /// in-place widening (`dequant_row`, `zero_row`) and its barrier run before
 /// the tile is read. Every guard
 /// around a shuffle or a barrier
 /// is block- or warp-pair-uniform: `live` and the unmasked path read the
-/// slice's largest and smallest counts; a lane's two rows mask by their own.
+/// slice's largest and smallest counts and first keys; a lane's two rows
+/// mask by their own.
 ///
 /// SAFETY: the entry's launch contract at `n_kv · packs · PACK` query heads
 /// over `src`'s planes (every buffer bound it names), a block of
@@ -664,10 +683,11 @@ const _: () = assert!(DYN_BYTES_256_Q8 == 100_352);
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
+unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const LOWER: bool, S: KvSrc>(
     q: &[f32],
     src: S,
     n_keys_buf: &[u32],
+    k_first_buf: &[u32],
     scale: f32,
     n_kv: u32,
     ctx: u32,
@@ -741,40 +761,61 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
     // copy's `s` and `i` are literals and no count is kept in an array indexed
     // at run time. The warp keeps its own slice's largest and smallest count
     // (the walk's warp-uniform bounds) and refusal, and its two rows' own
-    // (`row_pos`).
+    // (`row_pos`). With `LOWER`, the first keys of the live rows likewise:
+    // the block's smallest, the slice's smallest and largest, the two rows'.
     let mut hi = 0u32;
     let mut warp_hi = 0u32;
     let mut warp_lo = u32::MAX;
+    let mut lo = u32::MAX;
+    let mut warp_first_lo = u32::MAX;
+    let mut warp_first_hi = 0u32;
     let mut any_bad = false;
     let mut cnt = [0u32; 2];
+    let mut first = [0u32; 2];
     let mut bad = [false; 2];
     for s in 0..SLICES_256 {
         cuda_device::thread::__unroll_config::<0>();
         for i in 0..SLICE_POS {
             cuda_device::thread::__unroll_config::<0>();
             let t = t0 + s * SLICE_POS + i;
-            let (c, refused) = if t < rows {
+            let (c, k0, refused) = if t < rows {
                 // SAFETY: t < t_rows <= n_keys_buf.len() (launch contract).
                 let c = unsafe { *n_keys_buf.get_unchecked(t) };
-                if c == 0 || c > ctx {
-                    (0, true)
+                let k0 = if LOWER {
+                    // SAFETY: t < t_rows <= k_first_buf.len() (the LOWER
+                    // entry's launch contract); read only under LOWER.
+                    unsafe { *k_first_buf.get_unchecked(t) }
                 } else {
-                    (c, false)
+                    0
+                };
+                if c == 0 || c > ctx || (LOWER && k0 >= c) {
+                    (0, 0, true)
+                } else {
+                    (c, k0, false)
                 }
             } else {
-                (0, false)
+                (0, 0, false)
             };
             hi = hi.max(c);
+            if LOWER && c > 0 {
+                lo = lo.min(k0);
+            }
             if s == rs {
                 warp_hi = warp_hi.max(c);
                 warp_lo = warp_lo.min(c);
+                if LOWER && c > 0 {
+                    warp_first_lo = warp_first_lo.min(k0);
+                    warp_first_hi = warp_first_hi.max(k0);
+                }
                 any_bad = any_bad || refused;
                 if i == row_pos::<PACK>(g, 0) {
                     cnt[0] = c;
+                    first[0] = k0;
                     bad[0] = refused;
                 }
                 if i == row_pos::<PACK>(g, 1) {
                     cnt[1] = c;
+                    first[1] = k0;
                     bad[1] = refused;
                 }
             }
@@ -869,8 +910,15 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
     let vq_src = v_rows.wrapping_add(rowq * (HEAD_256 / 4));
     let vd_src = v_scales.wrapping_add(rowq * (HEAD_256 / 32) / 2);
     let tiles = hi.div_ceil(KEY_TILE_U32);
+    // The walk's first tile: the one holding the block's smallest first key.
+    let kb_first = if LOWER {
+        (lo / KEY_TILE_U32).min(tiles)
+    } else {
+        0
+    };
     // Stage tile `kb` of the plane `src` into `dst` (the 128 body's
-    // `stage!` at this row width).
+    // `stage!` at this row width). A key below `lo` is staged as a key past
+    // `hi` is.
     macro_rules! stage {
         ($dst:expr, $src:expr, $kb:expr, $full:literal) => {{
             let (dst, src, kb): (*mut u32, *const u32, u32) = ($dst, $src, $kb);
@@ -884,7 +932,8 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
                 // whole: the 16 destination bytes are inside the tile and
                 // 16-byte aligned.
                 let d = unsafe { dst.add(at) };
-                if $full || key0 + ((i * PASS_KEYS_256) as u32) < hi {
+                let key = key0 + ((i * PASS_KEYS_256) as u32);
+                if $full || (key < hi && (!LOWER || key >= lo)) {
                     // SAFETY: the key is below hi <= ctx, so its row is
                     // inside key head kh's plane (launch contract); rows
                     // are 512 bytes and both planes start 16-byte aligned
@@ -907,9 +956,9 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
     // Stage tile `kb` of one side's q8 planes (the module doc's `_q8`
     // paragraph): the code words as 16-byte `cp.async` copies into the low
     // half of the f16 tile's rows (four chunks a thread), the scales as one
-    // 16-byte copy a row, a key at or past `hi` zeroed and never read,
-    // committed as one group. `full` (a literal) is the tile lying below
-    // `hi`.
+    // 16-byte copy a row, a key at or past `hi` (or below `lo` with LOWER)
+    // zeroed and never read, committed as one group. `full` (a literal) is
+    // the tile lying below `hi` and, with LOWER, at or above `lo`.
     macro_rules! stage_q8 {
         ($tile:expr, $sk:expr, $qs:expr, $ds:expr, $kb:expr, $full:literal) => {{
             let (tile, sk, qs, ds, kb): (*mut u32, *mut u16, *const u32, *const u32, u32) =
@@ -924,7 +973,8 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
                 // chunk of the row's low half: the 16 destination bytes are
                 // inside the tile and 16-byte aligned.
                 let d = unsafe { tile.add(row * ROW_WORDS_256 + 4 * col) };
-                if $full || kb * KEY_TILE_U32 + (row as u32) < hi {
+                let key = kb * KEY_TILE_U32 + (row as u32);
+                if $full || (key < hi && (!LOWER || key >= lo)) {
                     // SAFETY: the key is below hi <= ctx, so its row is inside
                     // this key head's codes plane (launch contract); rows are
                     // HEAD_256/4 words and the plane starts 16-byte aligned
@@ -949,7 +999,8 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
                 // SAFETY: the row's HEAD_256/32 u16 are one aligned 16-byte
                 // chunk of the scales tile, this thread's row alone.
                 let d = unsafe { sk32.add(4 * tid) };
-                if $full || kb * KEY_TILE_U32 + (tid as u32) < hi {
+                let key = kb * KEY_TILE_U32 + (tid as u32);
+                if $full || (key < hi && (!LOWER || key >= lo)) {
                     // SAFETY: the key is below hi <= ctx: its scales are
                     // inside the plane (launch contract), one 16-byte aligned
                     // chunk of HEAD_256/32 u16.
@@ -986,15 +1037,16 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
     }
     // A q8 tile's in-place widening, `$tile` with its scales `$scales`:
     // warp `wid` widens its own rows (`dequant_row` reads before its warp
-    // sync and writes after), a key at or past `hi` four zero words, then a
-    // barrier publishes the tile.
+    // sync and writes after), a key at or past `hi` (or below `lo` with
+    // LOWER) four zero words, then a barrier publishes the tile.
     macro_rules! widen {
         ($tile:expr, $scales:expr, $kb:expr) => {{
             let rows0 = wid * WID_ROWS;
             for r in 0..WID_ROWS {
                 let row = rows0 + r;
                 let base = row * ROW_WORDS_256;
-                if $kb * KEY_TILE_U32 + (row as u32) < hi {
+                let key = $kb * KEY_TILE_U32 + (row as u32);
+                if key < hi && (!LOWER || key >= lo) {
                     // SAFETY: the row is this warp's alone, its raw words and
                     // scales published by the barrier before this expansion.
                     dequant_row!(2, $tile, base, $scales.wrapping_add(row * 8), row & 7, lane);
@@ -1006,11 +1058,11 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
             thread::sync_threads();
         }};
     }
-    if tiles > 0 {
-        if KEY_TILE_U32 <= hi {
-            stage_side!(K, 0, true);
+    if kb_first < tiles {
+        if KEY_TILE_U32 * (kb_first + 1) <= hi && (!LOWER || KEY_TILE_U32 * kb_first >= lo) {
+            stage_side!(K, kb_first, true);
         } else {
-            stage_side!(K, 0, false);
+            stage_side!(K, kb_first, false);
         }
     }
 
@@ -1049,7 +1101,7 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
     let mut m = [f32::NEG_INFINITY; 2];
     let mut l = [0.0f32; 2];
     let mut o = [[0.0f32; 4]; 2 * DIM_PAIRS_256];
-    let mut kb = 0u32;
+    let mut kb = kb_first;
     while kb < tiles {
         let end = KEY_TILE_U32 * (kb + 1);
         // Key tile kb has landed, and every warp is done reading the
@@ -1063,13 +1115,13 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
         if S::Q8 {
             widen!(kt, sk, kb);
         }
-        if end <= hi {
+        if end <= hi && (!LOWER || KEY_TILE_U32 * kb >= lo) {
             stage_side!(V, kb, true);
         } else {
             stage_side!(V, kb, false);
         }
         // Both warps of a pair hold the same rows, so the same `live`.
-        let live = KEY_TILE_U32 * kb < warp_hi;
+        let live = KEY_TILE_U32 * kb < warp_hi && (!LOWER || end > warp_first_lo);
 
         // ---- S_w = Q·Kᵀ over the warp's half, published.
         let mut sc = [[0.0f32; 4]; KEY_NT];
@@ -1134,7 +1186,9 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
                         for j in 0usize..4 {
                             cuda_device::thread::__unroll_config::<0>();
                             let key = kb0 + (8 * nt + j % 2) as u32;
-                            let v = if !$masked || key < cnt[j / 2] {
+                            let v = if !$masked
+                                || (key < cnt[j / 2] && (!LOWER || key >= first[j / 2]))
+                            {
                                 mul_rn_f32(sc[nt][j], scale)
                             } else {
                                 f32::NEG_INFINITY
@@ -1169,12 +1223,14 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
                             let j0 = 2 * (e % 2);
                             let h = e % 2;
                             let key = kb0 + (8 * nt) as u32;
-                            let p0 = if !$masked || key < cnt[h] {
+                            let p0 = if !$masked || (key < cnt[h] && (!LOWER || key >= first[h])) {
                                 exp_weight(sc[nt][j0] - mn[h])
                             } else {
                                 0.0
                             };
-                            let p1 = if !$masked || key + 1 < cnt[h] {
+                            let p1 = if !$masked
+                                || (key + 1 < cnt[h] && (!LOWER || key + 1 >= first[h]))
+                            {
                                 exp_weight(sc[nt][j0 + 1] - mn[h])
                             } else {
                                 0.0
@@ -1187,7 +1243,7 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
                     }
                 }};
             }
-            if end <= warp_lo {
+            if end <= warp_lo && (!LOWER || KEY_TILE_U32 * kb >= warp_first_hi) {
                 softmax!(false);
             } else {
                 softmax!(true);
@@ -2293,9 +2349,10 @@ mod flash_gqa_prefill_kernels {
         // heads per key head, and the block is THREADS_256 threads with
         // DYN_BYTES_256 bytes of dynamic shared memory.
         unsafe {
-            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, _>(
+            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, false, _>(
                 q,
                 F16Kv { k: kc, v: vc },
+                n_keys_buf,
                 n_keys_buf,
                 scale,
                 n_kv,
@@ -2346,10 +2403,68 @@ mod flash_gqa_prefill_kernels {
         // heads per key head, and the block is THREADS_256 threads with
         // DYN_BYTES_256 bytes of dynamic shared memory.
         unsafe {
-            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }, _>(
+            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }, false, _>(
                 q,
                 F16Kv { k: kc, v: vc },
                 n_keys_buf,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                t_rows,
+                packs as usize,
+                fault,
+                y,
+            )
+        };
+    }
+
+    /// [`gqa_prefill_flash_256_p2`] with a first key a row ([`prefill_256_p`]
+    /// at `PACK_2` with `LOWER`): row `t` attends over keys `[k_first[t],
+    /// n_keys[t])`, the module doc's lower-bound paragraph.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        dynamic_shared = 98304,
+        requires = (
+            n_keys_buf.len() >= t_rows,
+            k_first_buf.len() >= t_rows,
+            q.len() >= t_rows * n_kv * packs * 2 * 256,
+            kc.len() >= n_kv * ctx * 256,
+            vc.len() >= n_kv * ctx * 256,
+            y.len() >= t_rows * n_kv * packs * 2 * 256
+        )
+    )]
+    pub fn gqa_prefill_flash_256_p2_lower(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        k_first_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        t_rows: u32,
+        packs: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract is `prefill_256_p`'s at `packs · PACK_2`
+        // heads per key head with `k_first_buf` bound at `t_rows`, and the
+        // block is THREADS_256 threads with DYN_BYTES_256 bytes of dynamic
+        // shared memory.
+        unsafe {
+            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }, true, _>(
+                q,
+                F16Kv { k: kc, v: vc },
+                n_keys_buf,
+                k_first_buf,
                 scale,
                 n_kv,
                 ctx,
@@ -2403,9 +2518,10 @@ mod flash_gqa_prefill_kernels {
         // THREADS_256 threads with DYN_BYTES_256_Q8 bytes of dynamic shared
         // memory.
         unsafe {
-            prefill_256_p::<GROUP, { SLICE_ROWS / GROUP }, _>(
+            prefill_256_p::<GROUP, { SLICE_ROWS / GROUP }, false, _>(
                 q,
                 Q8Kv { kq, kd, vq, vd },
+                n_keys_buf,
                 n_keys_buf,
                 scale,
                 n_kv,
@@ -3206,7 +3322,13 @@ impl FlashGqaPrefill {
         stream: &CudaStream,
         args: GqaPrefillArgs<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_packed("flash_gqa_prefill::enqueue_256_p4", stream, args, PACK_4)
+        self.enqueue_packed(
+            "flash_gqa_prefill::enqueue_256_p4",
+            stream,
+            args,
+            PACK_4,
+            None,
+        )
     }
 
     /// [`FlashGqaPrefill::enqueue_256_p4`] in blocks of [`PACK_2`]: `n_head` a
@@ -3218,18 +3340,47 @@ impl FlashGqaPrefill {
         stream: &CudaStream,
         args: GqaPrefillArgs<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_packed("flash_gqa_prefill::enqueue_256_p2", stream, args, PACK_2)
+        self.enqueue_packed(
+            "flash_gqa_prefill::enqueue_256_p2",
+            stream,
+            args,
+            PACK_2,
+            None,
+        )
+    }
+
+    /// [`FlashGqaPrefill::enqueue_256_p2`] with a first key a row: row `t`
+    /// attends over keys `[k_first[t], n_keys[t])` (the module doc's
+    /// lower-bound paragraph), `k_first` on the device, `t` of them (refused by
+    /// name when shorter). A first key at or past its row's count raises
+    /// [`FaultSite::KeyCount`] and leaves that row NaN. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_256_p2_lower(
+        &self,
+        stream: &CudaStream,
+        args: GqaPrefillArgs<'_>,
+        k_first: &DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_packed(
+            "flash_gqa_prefill::enqueue_256_p2_lower",
+            stream,
+            args,
+            PACK_2,
+            Some(k_first),
+        )
     }
 
     /// The packed entries' one launcher: the group refused unless a nonzero
     /// multiple of `pack` ([`PACK_4`] or [`PACK_2`]), the buffers and their
-    /// alignment checked, then that pack's entry.
+    /// alignment checked, then that pack's entry, its lower-bound form when
+    /// `k_first` is given.
     fn enqueue_packed(
         &self,
         what: &'static str,
         stream: &CudaStream,
         args: GqaPrefillArgs<'_>,
         pack: usize,
+        k_first: Option<&DeviceBuffer<u32>>,
     ) -> Result<(), GpuError> {
         let GqaPrefillArgs {
             q,
@@ -3265,6 +3416,7 @@ impl FlashGqaPrefill {
             ("kc", kc.len(), n_kv * ctx * HEAD_256),
             ("vc", vc.len(), n_kv * ctx * HEAD_256),
             ("n_keys", n_keys.len(), t),
+            ("k_first", k_first.map_or(t, DeviceBuffer::len), t),
             ("y", y.len(), t * n_head * HEAD_256),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -3301,14 +3453,20 @@ impl FlashGqaPrefill {
         let ctx = launch_u32(what, "ctx", ctx)?;
         let t = launch_u32(what, "t", t)?;
         let cfg = LaunchConfig1D::new(grid, THREADS_256_U32, DYN_BYTES_256_U32);
-        match pack {
-            PACK_2 => {
+        match (pack, k_first) {
+            (PACK_2, None) => {
                 let prep = self.module.prepare_gqa_prefill_flash_256_p2(cfg)?;
                 self.module.gqa_prefill_flash_256_p2(
                     stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
                 )?;
             }
-            PACK_4 => {
+            (PACK_2, Some(k_first)) => {
+                let prep = self.module.prepare_gqa_prefill_flash_256_p2_lower(cfg)?;
+                self.module.gqa_prefill_flash_256_p2_lower(
+                    stream, &prep, q, kc, vc, n_keys, k_first, scale, n_kv, ctx, t, packs, fault, y,
+                )?;
+            }
+            (PACK_4, None) => {
                 let prep = self.module.prepare_gqa_prefill_flash_256_p4(cfg)?;
                 self.module.gqa_prefill_flash_256_p4(
                     stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
@@ -3516,5 +3674,343 @@ impl FlashGqaPrefill {
             stream, &prep, q, kq, kd, vq, vd, n_keys, scale, n_kv, ctx, t, fault, y,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Gpu;
+    use gguf::quant::f32_to_f16_bits;
+
+    /// EmbeddingGemma 2's sliding layers: four query heads over two key heads.
+    const N_KV: usize = 2;
+    const N_HEAD: usize = 4;
+    /// Rows and keys: a tail block of 16 rows and a tail tile of 48 keys.
+    const T: usize = 1200;
+    const ROW: usize = N_HEAD * HEAD_256;
+    const NAN16: u16 = 0x7e00;
+
+    /// One launch's inputs: `k_first` picks the lower-bound entry.
+    struct Case<'a> {
+        q: &'a [f32],
+        kc: &'a [u16],
+        vc: &'a [u16],
+        ctx: usize,
+        n_keys: &'a [u32],
+        k_first: Option<&'a [u32]>,
+    }
+
+    fn run(
+        gpu: &Gpu,
+        k: &FlashGqaPrefill,
+        c: &Case<'_>,
+        fault: FaultSink,
+    ) -> Result<Vec<f32>, GpuError> {
+        let s = gpu.stream();
+        let t = c.n_keys.len();
+        let q = DeviceBuffer::from_host(s, c.q)?;
+        let kc = DeviceBuffer::from_host(s, c.kc)?;
+        let vc = DeviceBuffer::from_host(s, c.vc)?;
+        let nk = DeviceBuffer::from_host(s, c.n_keys)?;
+        let kf = c
+            .k_first
+            .map(|f| DeviceBuffer::from_host(s, f))
+            .transpose()?;
+        let mut y = DeviceBuffer::<f32>::zeroed(s, t * ROW)?;
+        let args = GqaPrefillArgs {
+            q: &q,
+            kc: &kc,
+            vc: &vc,
+            n_keys: &nk,
+            scale: 1.0,
+            n_head: N_HEAD,
+            n_kv: N_KV,
+            ctx: c.ctx,
+            t,
+            fault,
+            y: &mut y,
+        };
+        match &kf {
+            Some(kf) => k.enqueue_256_p2_lower(s, args, kf)?,
+            None => k.enqueue_256_p2(s, args)?,
+        }
+        s.synchronize()?;
+        Ok(y.to_host_vec(s)?)
+    }
+
+    fn same(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// The symmetric window of half-width `w` over `T` keys: row `i` sees `[i − w, i + w]`.
+    fn window(w: usize) -> (Vec<u32>, Vec<u32>) {
+        (0..T)
+            .map(|i| (i.saturating_sub(w) as u32, (i + w + 1).min(T) as u32))
+            .unzip()
+    }
+
+    /// The lower-bound entry against the plain pack-of-two entry and itself, at half windows of
+    /// 256, 300 and 512 keys: each sampled row (the first 32, every 13th, the last 8) of a window
+    /// launch bit for bit its one-row launch over a cache holding NaN outside the row's window,
+    /// a rerun the same bits; first keys of zero the plain entry's bits; a first key of 192 for
+    /// every row the plain entry's bits on the cache from row 192 on; a dominant key at 229
+    /// (inside a tile) the output of the rows whose window
+    /// holds it and of no other row; a slice skips NaN tiles below all its first keys and masks
+    /// a dominant value below its first keys in a live tile; a first key at or past its count
+    /// `key_count` at the launch's layer with NaN in that row alone; a short `k_first` refused by
+    /// name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_p2_lower_is_each_rows_window() {
+        const LAYER: usize = 9;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let k = FlashGqaPrefill::load(gpu.context()).expect("the prefill module");
+        let none = gpu.unlabelled_sink();
+        let mut st = 0x2545_f491u32;
+        let mut next = move || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (st >> 16) & 0x3ff
+        };
+        // Multiples of 1/512 in [−1, 1): exact in f16.
+        let mut plane = || -> Vec<u16> {
+            (0..N_KV * T * HEAD_256)
+                .map(|_| f32_to_f16_bits(next() as f32 / 512.0 - 1.0))
+                .collect()
+        };
+        let (kc, vc) = (plane(), plane());
+        let q: Vec<f32> = (0..T * ROW)
+            .map(|i| ((i * 37) % 1000) as f32 / 1000.0 - 0.5)
+            .collect();
+        let base = Case {
+            q: &q,
+            kc: &kc,
+            vc: &vc,
+            ctx: T,
+            n_keys: &[],
+            k_first: None,
+        };
+        let at = |n_keys: &[u32], k_first: Option<&[u32]>, fault: FaultSink| {
+            run(
+                &gpu,
+                &k,
+                &Case {
+                    n_keys,
+                    k_first,
+                    ..base
+                },
+                fault,
+            )
+        };
+
+        // 300: every other block's first keys straddle a tile boundary.
+        for w in [256, 300, 512] {
+            let (first, count) = window(w);
+            let y = at(&count, Some(&first), none).expect("window launch");
+            assert!(
+                y.iter().all(|v| v.is_finite()),
+                "w={w}: a non-finite output"
+            );
+            let again = at(&count, Some(&first), none).expect("rerun");
+            assert!(same(&y, &again), "w={w}: a rerun moved a bit");
+            for i in (0..T).filter(|&i| i < 32 || i.is_multiple_of(13) || i >= T - 8) {
+                let (f, c) = (first[i] as usize, count[i] as usize);
+                let fence = |p: &[u16]| -> Vec<u16> {
+                    let mut p = p.to_vec();
+                    for (j, r) in p.chunks_mut(HEAD_256).enumerate() {
+                        if !(f..c).contains(&(j % T)) {
+                            r.fill(NAN16);
+                        }
+                    }
+                    p
+                };
+                let (kn, vn) = (fence(&kc), fence(&vc));
+                let one = Case {
+                    q: &q[i * ROW..(i + 1) * ROW],
+                    kc: &kn,
+                    vc: &vn,
+                    ctx: T,
+                    n_keys: &count[i..=i],
+                    k_first: Some(&first[i..=i]),
+                };
+                let y1 = run(&gpu, &k, &one, none).expect("one-row launch");
+                assert!(
+                    same(&y[i * ROW..(i + 1) * ROW], &y1),
+                    "w={w} row {i}: not its one-row launch"
+                );
+            }
+            let zeros = vec![0u32; T];
+            let lower = at(&count, Some(&zeros), none).expect("first keys of zero");
+            let plain = at(&count, None, none).expect("plain");
+            assert!(
+                same(&lower, &plain),
+                "w={w}: first keys of zero are not the plain entry"
+            );
+        }
+
+        const SHIFT: usize = 192;
+        let count: Vec<u32> = (0..T)
+            .map(|i| (SHIFT + 1 + (i * 7) % (T - SHIFT)) as u32)
+            .collect();
+        let at_shift = vec![SHIFT as u32; T];
+        let lower = at(&count, Some(&at_shift), none).expect("shift");
+        let cut = |p: &[u16]| -> Vec<u16> {
+            p.chunks(T * HEAD_256)
+                .flat_map(|h| h[SHIFT * HEAD_256..].iter().copied())
+                .collect()
+        };
+        let (kcut, vcut) = (cut(&kc), cut(&vc));
+        let shifted: Vec<u32> = count.iter().map(|c| c - SHIFT as u32).collect();
+        let plain = Case {
+            q: &q,
+            kc: &kcut,
+            vc: &vcut,
+            ctx: T - SHIFT,
+            n_keys: &shifted,
+            k_first: None,
+        };
+        let plain = run(&gpu, &k, &plain, none).expect("plain on the cut cache");
+        assert!(
+            same(&lower, &plain),
+            "a first key of {SHIFT}: not the plain entry from row {SHIFT}"
+        );
+
+        // Key 229 scores 512 on every head, every other key at most 64: its weight is 1 and
+        // theirs 0, so a row whose window holds it returns its value row exactly.
+        const P: usize = 229;
+        let (mut kd, mut vd) = (kc.clone(), vc.clone());
+        for h in 0..N_KV {
+            let r = (h * T + P) * HEAD_256;
+            kd[r..r + HEAD_256].fill(f32_to_f16_bits(8.0));
+            vd[r..r + HEAD_256].fill(f32_to_f16_bits(1000.0));
+        }
+        let qd = vec![0.25f32; 96 * ROW];
+        let first: Vec<u32> = (0..96).map(|i| (P - 1 + i % 3) as u32).collect();
+        let count = vec![T as u32; 96];
+        let dom = Case {
+            q: &qd,
+            kc: &kd,
+            vc: &vd,
+            ctx: T,
+            n_keys: &count,
+            k_first: Some(&first),
+        };
+        let y = run(&gpu, &k, &dom, none).expect("dominant key");
+        for (i, r) in y.chunks(ROW).enumerate() {
+            if first[i] as usize <= P {
+                assert!(
+                    r.iter().all(|&v| v == 1000.0),
+                    "row {i}: key {P} in its window, not its value"
+                );
+            } else {
+                assert!(
+                    r.iter().all(|v| v.abs() <= 1.001),
+                    "row {i}: key {P} below its window was read"
+                );
+            }
+        }
+        assert!(
+            gpu.fault().expect("the fault word").is_none(),
+            "a clean launch raised"
+        );
+
+        // The first slice keeps tile zero in the block's walk. Later slices skip its NaNs,
+        // then include or mask key 64 while an upper bound alone would take unmasked softmax.
+        const BLOCK: usize = Q_ROWS_256 / PACK_2;
+        const SLICE: usize = SLICE_ROWS / PACK_2;
+        const CTX: usize = 3 * KEY_TILE;
+        let qs = vec![0.0f32; BLOCK * ROW];
+        let ks = vec![0u16; N_KV * CTX * HEAD_256];
+        let mut vs = vec![f32_to_f16_bits(1.0); ks.len()];
+        for h in 0..N_KV {
+            let start = h * CTX * HEAD_256;
+            vs[start..start + KEY_TILE * HEAD_256].fill(NAN16);
+            let key = start + KEY_TILE * HEAD_256;
+            vs[key..key + HEAD_256].fill(f32_to_f16_bits(1000.0));
+        }
+        let first: Vec<u32> = (0..BLOCK)
+            .map(|i| {
+                if i < SLICE {
+                    0
+                } else if i < 2 * SLICE {
+                    KEY_TILE as u32
+                } else {
+                    (KEY_TILE + i % 2) as u32
+                }
+            })
+            .collect();
+        let count: Vec<u32> = first
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| {
+                if i < SLICE {
+                    CTX as u32
+                } else {
+                    f + KEY_TILE_U32
+                }
+            })
+            .collect();
+        let slices = Case {
+            q: &qs,
+            kc: &ks,
+            vc: &vs,
+            ctx: CTX,
+            n_keys: &count,
+            k_first: Some(&first),
+        };
+        let y = run(&gpu, &k, &slices, none).expect("slices with disjoint first tiles");
+        for (i, r) in y.chunks(ROW).enumerate().skip(SLICE) {
+            // Zero queries give 64 unit weights: a mean of 64 ones, or of 1000 and 63 ones.
+            let want = if first[i] == KEY_TILE_U32 {
+                1063.0f32 / 64.0
+            } else {
+                1.0f32
+            };
+            assert!(
+                r.iter().all(|v| v.to_bits() == want.to_bits()),
+                "row {i}: a skipped NaN tile or a masked value reached its output"
+            );
+        }
+
+        let (good, count) = window(256);
+        let mut first = good.clone();
+        first[37] = count[37];
+        first[500] = count[500] + 5;
+        let clean = at(&count, Some(&good), none).expect("clean");
+        let sink = gpu.layer_sink(LAYER).expect("a sink");
+        let equal = at(&count[37..=37], Some(&first[37..=37]), sink).expect("equal first key");
+        let f = gpu
+            .take_fault()
+            .expect("the fault word")
+            .expect("an equal first key raises a fault");
+        assert_eq!(f.layer, LAYER as u32);
+        assert_eq!(f.site(), Some(FaultSite::KeyCount));
+        assert!(equal.iter().all(|v| v.is_nan()));
+        let y = at(&count, Some(&first), sink).expect("bad first keys");
+        let f = gpu
+            .take_fault()
+            .expect("the fault word")
+            .expect("a raised fault");
+        assert!(
+            f.layer == LAYER as u32 && f.site() == Some(FaultSite::KeyCount),
+            "bad first keys raised {f:?}"
+        );
+        for (i, (r, c)) in y.chunks(ROW).zip(clean.chunks(ROW)).enumerate() {
+            if i == 37 || i == 500 {
+                assert!(
+                    r.iter().all(|v| v.is_nan()),
+                    "row {i}: a bad first key, not NaN"
+                );
+            } else {
+                assert!(same(r, c), "row {i}: moved by another row's bad first key");
+            }
+        }
+
+        let e = at(&count, Some(&first[..T - 1]), none).expect_err("a short k_first");
+        let e = e.to_string();
+        assert!(
+            e.contains("enqueue_256_p2_lower") && e.contains("k_first"),
+            "a short k_first: {e}"
+        );
     }
 }

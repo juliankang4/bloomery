@@ -166,6 +166,7 @@ generate_ds41   gqa_out_gate_f32                         0           0
 generate_ds41   gqa_prefill_flash                        0           0
 generate_ds41   gqa_prefill_flash_256                    0           0
 generate_ds41   gqa_prefill_flash_256_p2                 0           0
+generate_ds41   gqa_prefill_flash_256_p2_lower           0           0
 generate_ds41   gqa_prefill_flash_256_p4                 0           0
 generate_ds41   gqa_prefill_flash_256_q8                 0           0
 generate_ds41   gqa_prefill_flash_q8                     0           0
@@ -415,6 +416,7 @@ gate_e2e   gqa_out_gate_f32                         0           0
 gate_e2e   gqa_prefill_flash                        0           0
 gate_e2e   gqa_prefill_flash_256                    0           0
 gate_e2e   gqa_prefill_flash_256_p2                 0           0
+gate_e2e   gqa_prefill_flash_256_p2_lower           0           0
 gate_e2e   gqa_prefill_flash_256_p4                 0           0
 gate_e2e   gqa_prefill_flash_256_q8                 0           0
 gate_e2e   gqa_prefill_flash_q8                     0           0
