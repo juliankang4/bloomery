@@ -68,10 +68,6 @@ def rne_f32_bits(v: int) -> int:
     return sign | ((e + 127) << 23) | (mant & 0x7FFFFF)
 
 
-def safe_name(name: str) -> str:
-    return name.replace("/", "_").replace("\\", "_").replace(" ", "_")
-
-
 def read_manifest(path):
     """The set's header, its integer-typed rows' shapes, its `int` rows and whether it is
     complete, every row read by its column line's names (tools/bloomery/manifest.py)."""
@@ -119,10 +115,9 @@ def check_set(d: str):
             fails.append(f"{where}: twin of a {row['type']} row claims type {r['type']}")
             continue
         want_twin = "i64" if row["type"] == "i64" else "i32"
-        stem = f"{safe_name(name)}.{occ}" + (".input" if kind == "input" else "")
-        suffix = ".logical." if r["layout"] == "logical" else "."
-        if r["twin"] != want_twin or r["file"] != stem + suffix + want_twin or r["layout"] not in ("flat", "logical"):
-            fails.append(f"{where}: want {stem}{suffix}{want_twin} ({want_twin}, {r['layout']})")
+        want = manifest.dump_file_name(name, occ, kind, r["layout"], want_twin)
+        if r["twin"] != want_twin or r["file"] != want or r["layout"] not in ("flat", "logical"):
+            fails.append(f"{where}: want {want} ({want_twin}, {r['layout']})")
             continue
         seen.add((r["key"], r["layout"]))
         if r["count"] != row["count"] or r["bytes"] != r["count"] * WIDTH[want_twin]:
@@ -130,7 +125,7 @@ def check_set(d: str):
             continue
         try:
             raw = open(os.path.join(d, r["file"]), "rb").read()
-            f32 = open(os.path.join(d, stem + suffix + "f32"), "rb").read()
+            f32 = open(os.path.join(d, manifest.dump_file_name(name, occ, kind, r["layout"], "f32")), "rb").read()
         except OSError as e:
             fails.append(f"{where}: {e}")
             continue
@@ -206,17 +201,18 @@ def write_set(d, tensors, tokens, drop_int=(), f32_patch=None, prefill=None):
         "# input\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1",
     ]
     for kind, name, ty, flat, logical in tensors:
-        stem = f"{safe_name(name)}.0" + (".input" if kind == "input" else "")
         twin = "i64" if ty == "i64" else "i32"
-        layouts = [("flat", flat, ".")] + ([("logical", logical, ".logical.")] if logical else [])
+        layouts = [("flat", flat)] + ([("logical", logical)] if logical else [])
         lines.append("\t".join(map(str, [kind, name, 0, ty, len(flat), 1, 1, 1, 4 * len(flat), 0.0,
                                         "NONE", 0 if logical else 1, 1 if logical else 0, "-", "-"])))
-        for layout, vals, suffix in layouts:
+        for layout, vals in layouts:
+            file = manifest.dump_file_name(name, 0, kind, layout, twin)
             bits = [rne_f32_bits(v) for v in vals]
             if f32_patch and f32_patch[0] == (name, layout):
                 bits[f32_patch[1]] = f32_patch[2]
-            open(os.path.join(d, stem + suffix + "f32"), "wb").write(struct.pack(f"<{len(bits)}I", *bits))
-            open(os.path.join(d, stem + suffix + twin), "wb").write(
+            open(os.path.join(d, manifest.dump_file_name(name, 0, kind, layout, "f32")), "wb").write(
+                struct.pack(f"<{len(bits)}I", *bits))
+            open(os.path.join(d, file), "wb").write(
                 struct.pack(f"<{len(vals)}{'q' if twin == 'i64' else 'i'}", *vals))
             if (name, layout) in drop_int:
                 continue
@@ -224,7 +220,7 @@ def write_set(d, tensors, tokens, drop_int=(), f32_patch=None, prefill=None):
             total = total - (1 << 64) if total >> 63 else total
             lines.append("\t".join(map(str, ["int", name, 0, kind, ty, twin, layout, len(vals),
                                             len(vals) * WIDTH[twin], total, max(abs(v) for v in vals),
-                                            stem + suffix + twin])))
+                                            file])))
     lines.append("# complete\t1\t0")
     open(os.path.join(d, "MANIFEST.tsv"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
 

@@ -141,6 +141,16 @@ def read(path):
     return m
 
 
+def dump_file_name(name, occurrence, of, layout, ext):
+    """The name the dumpers give a row's file, as dump_file_name in crates/refset/src/ik.rs:
+    `<stem>.<occurrence>[.input][.logical].<ext>`, `.input` when `of` is "input" and `.logical` when
+    `layout` is "logical". The stem is the manifest name with every `/`, `\\` and space made `_`, the
+    dumpers' `safe_name`, which keeps it one path element."""
+    stem = name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return (f"{stem}.{occurrence}{'.input' if of == 'input' else ''}"
+            f"{'.logical' if layout == 'logical' else ''}.{ext}")
+
+
 def self_test():
     """Rows read by name whatever their order, and each refusal by name."""
     kind = "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1"
@@ -196,6 +206,10 @@ def self_test():
             raise AssertionError("a field the line does not name was read")
         except ManifestError as e:
             assert "names no op field" in str(e), str(e)
+    for args, want in [(("attn/q\\k v-0.(view)", 0, "input", "logical", "i32"),
+                        "attn_q_k_v-0.(view).0.input.logical.i32"),
+                       (("l_out-3", 2, "tensor", "flat", "f32"), "l_out-3.2.f32")]:
+        assert dump_file_name(*args) == want, (dump_file_name(*args), want)
     print("manifest: self-test ok")
     return 0
 

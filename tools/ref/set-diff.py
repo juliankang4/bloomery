@@ -49,10 +49,6 @@ def layer_of(name):
     return int(m.group(1)) if m else -1
 
 
-def stem(name):
-    return name.replace("/", "_").replace("\\", "_").replace(" ", "_")
-
-
 def side(path):
     m = manifest.read(path)
     if m.complete is None:
@@ -76,7 +72,8 @@ def read_array(f, code, want):
 
 def values(m, row, logical):
     occ = row.int("occurrence")
-    f = os.path.join(m.dir, f"{stem(row['name'])}.{occ}{'.logical' if logical else ''}.f32")
+    f = os.path.join(m.dir, manifest.dump_file_name(row["name"], occ, "tensor",
+                                                    "logical" if logical else "flat", "f32"))
     want = 1
     for ne in ("ne0", "ne1", "ne2", "ne3"):
         want *= row.int(ne)
