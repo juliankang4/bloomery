@@ -19,6 +19,14 @@ and fails a row no source declares (`stale`) and a declared entry with no row (`
   <bin> <entry> stale                         (in the table, declared by none of the binary's crates)
   <bin> <entry> unpinned (<file>:<line>)      (declared, not in the table)
 
+The other tables the recipe names, one per PTX arch and card capability (an argument that ends in `/` is every
+`*.tsv` in that directory, and one with none is a refusal), are read for stale rows only:
+
+  <bin> <entry> stale (<table>)               (in that table, declared by none of the binary's crates)
+
+A kernel added on a cc 8.6 card has no jit_local reading for another capability, so its row there comes from a
+scan on that card; until then that table's gate on that card names it unpinned.
+
 What declares an entry. A `#[kernel]` attribute (its attribute stack may span lines: `#[allow(..)]`,
 `#[launch_bounds(..)]`, `#[launch_contract(..)]` and doc lines sit between it and the `fn`) on a line of its own,
 not in a comment; the entry is the `fn` that follows. The one generated family is a `macro_rules!` whose kernel
@@ -28,9 +36,9 @@ glm5next and mimo2 routers). A `$name` the macro's pattern does not bind, a `#[k
 a kernel under a `#[cfg(..)]` attribute or inside a `#[cfg(test)]` module, and a binary or recipe this file does
 not know are each a named refusal, never a skipped entry.
 
-Which binaries and crates. The binaries come from the `gate-ptx-spill` recipe's `ptx-spill-check.sh
-tools/ref/ptx-shapes.tsv <bin>[:<substring>]...` call (the one owner of what is pinned); BIN_CRATES names the
-device crates each links under the features the recipe builds it with (`generate_ds41`: gpu + deepseek41,
+Which tables, binaries and crates. The tables and binaries come from the `gate-ptx-spill` recipe's `ptx-spill-check.sh
+tools/ref/ptx-shapes.tsv [<table>...] <bin>[:<substring>]...` call (the one owner of what is pinned); BIN_CRATES
+names the device crates each links under the features the recipe builds it with (`generate_ds41`: gpu + deepseek41,
 `gate_e2e`: gpu, `gate_qwen3vl_tower`: vision = gpu + gpu-vision). A substring after `:` is ptx-scan's own entry
 filter: the binary's expected entries are the crates' kernels that hold it. A binary in the recipe or the
 table that BIN_CRATES lacks is a refusal that says what to add.
@@ -47,6 +55,7 @@ Exit: 0 every binary's rows equal its declared entries; 1 a violation or a refus
 binary read before the verdict); 2 a usage error or an unreadable input.
 """
 
+import glob
 import os
 import re
 import shutil
@@ -259,8 +268,8 @@ def read_table(path):
     return rows
 
 
-def recipe_bins(justfile):
-    """[(bin, filter or '')] from the gate-ptx-spill recipe's ptx-spill-check.sh call."""
+def recipe_call(justfile):
+    """([the other tables], [(bin, filter or '')]) from the gate-ptx-spill recipe's ptx-spill-check.sh call."""
     with open(justfile, encoding="utf-8") as fh:
         lines = fh.read().split("\n")
     at = [i for i, ln in enumerate(lines) if re.match(rf"^{re.escape(RECIPE)}\s*:", ln)]
@@ -274,17 +283,19 @@ def recipe_bins(justfile):
     calls = re.findall(r"ptx-spill-check\.sh\s+" + re.escape(TABLE) + r"\s+([^'\"\n]+)", "\n".join(body))
     if len(calls) != 1:
         raise Refuse(f"{justfile}: recipe {RECIPE} has {len(calls)} `ptx-spill-check.sh {TABLE} <bins>` calls, want 1")
-    return [tuple(a.split(":", 1)) if ":" in a else (a, "") for a in calls[0].split()]
+    args = calls[0].split()
+    n = next((i for i, a in enumerate(args) if "/" not in a), len(args))
+    return args[:n], [tuple(a.split(":", 1)) if ":" in a else (a, "") for a in args[n:]]
 
 
 def check(root):
     """(violation lines, summary) for the tree under root. Raises Refuse for a thing it cannot read."""
-    bins = recipe_bins(os.path.join(root, JUSTFILE))
+    others, bins = recipe_call(os.path.join(root, JUSTFILE))
     rows = read_table(os.path.join(root, TABLE))
     problems = []
     for b in sorted(set(rows) - {b for b, _ in bins}):
         problems.append(f"{b}: the table pins this binary, the {RECIPE} recipe does not run it")
-    kern, nrows, ndecl = {}, 0, 0
+    kern, nrows, ndecl, decl = {}, 0, 0, {}
     for b, flt in bins:
         if b not in BIN_CRATES:
             raise Refuse(f"{b}: the {RECIPE} recipe pins this binary and BIN_CRATES (tools/check-ptx-names.py) does not "
@@ -297,6 +308,7 @@ def check(root):
             for name, site in kern[c].items():
                 if flt in name:
                     declared.setdefault(name, site)
+        decl[b] = declared
         have = rows.get(b, {})
         for e in sorted(set(have) - set(declared)):
             problems.append(f"{b} {e} stale")
@@ -304,7 +316,24 @@ def check(root):
             problems.append(f"{b} {e} unpinned ({declared[e][0]}:{declared[e][1]})")
         nrows += len(have)
         ndecl += len(declared)
-    return problems, f"{len(bins)} binaries, {nrows} rows = {ndecl} declared entries"
+    tables = []
+    for rel in others:
+        if not rel.endswith("/"):
+            tables.append(rel)
+            continue
+        found = sorted(glob.glob(os.path.join(root, rel, "*.tsv")))
+        if not found:
+            raise Refuse(f"recipe {RECIPE} names the directory {rel}, which holds no table")
+        tables += [os.path.relpath(p, root) for p in found]
+    for rel in tables:
+        brows = read_table(os.path.join(root, rel))
+        for b in sorted(set(brows) - set(decl)):
+            problems.append(f"{b}: {rel} pins this binary, the {RECIPE} recipe does not run it")
+        for b in decl:
+            for e in sorted(set(brows.get(b, {})) - set(decl[b])):
+                problems.append(f"{b} {e} stale ({rel})")
+    tail = f"; {len(tables)} tables beside it read for stale rows" if tables else ""
+    return problems, f"{len(bins)} binaries, {nrows} rows = {ndecl} declared entries{tail}"
 
 
 def main_check(root):
@@ -422,6 +451,9 @@ gate-after:
     echo after
 """
 
+BESIDE_FIXTURE = "tools/ref/ptx-shapes/sm_121-cc12.1.tsv"
+BESIDE_DIR = "tools/ref/ptx-shapes/"
+
 TABLE_ROWS = {
     "generate_ds41": ["k_one", "k_two_8", "alpha_router", "alpha_scores", "beta_router", "beta_scores", "ds_plain"],
     "gate_e2e": ["k_one", "k_two_8"],
@@ -441,8 +473,10 @@ def table_text(rows):
     return "\n".join(out) + "\n"
 
 
-def write_fixture(root, gpu=GPU_RS, ds=DS_RS, vis=VIS_RS, justfile=JUSTFILE_TXT, rows=TABLE_ROWS, table=None):
-    for rel, text in (
+def write_fixture(root, gpu=GPU_RS, ds=DS_RS, vis=VIS_RS, justfile=JUSTFILE_TXT, rows=TABLE_ROWS, table=None, beside=None):
+    if beside is not None:
+        justfile = justfile.replace(f"{TABLE} ", f"{TABLE} {BESIDE_DIR} ")
+    for rel, text in (*(((BESIDE_FIXTURE, beside),) if beside is not None else ()),
         ("crates/gpu/src/lib.rs", gpu),
         ("crates/gpu-deepseek41/src/router.rs", ds),
         ("crates/gpu-vision/src/vis.rs", vis),
@@ -525,6 +559,18 @@ def self_test():
             fails.append(f"unknown binary: {out!r}")
         out = run("table: a binary the recipe does not run", 1, ["gate_old: the table pins this binary, the gate-ptx-spill recipe does not run it"],
                   rows=dict(TABLE_ROWS, gate_old=["k_one"]))
+        # a table beside the base: a row no source declares is stale there too; an entry it lacks is not a failure
+        lag = {b: [e for e in es if e != "k_two_8"] for b, es in TABLE_ROWS.items()}
+        out = run("beside: a missing row is not checked", 0, [], beside=table_text(lag))
+        if "1 tables beside it read for stale rows" not in out:
+            fails.append(f"beside summary: {out!r}")
+        run("beside: a deleted kernel's row there is stale", 1,
+            [f"generate_ds41 k_old stale ({BESIDE_FIXTURE})"],
+            beside=table_text(dict(TABLE_ROWS, generate_ds41=TABLE_ROWS["generate_ds41"] + ["k_old"])))
+        out = run("refusal: a directory of tables that holds none", 1, [],
+                  justfile=JUSTFILE_TXT.replace(f"{TABLE} ", f"{TABLE} {BESIDE_DIR} "))
+        if f"names the directory {BESIDE_DIR}, which holds no table" not in out:
+            fails.append(f"empty directory: {out!r}")
         out = run("refusal: no ptx-spill-check call in the recipe", 1, [], justfile=JUSTFILE_TXT.replace("ptx-spill-check.sh", "other.sh"))
         if "has 0 `ptx-spill-check.sh" not in out:
             fails.append(f"no call: {out!r}")

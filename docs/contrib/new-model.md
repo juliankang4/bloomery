@@ -142,7 +142,8 @@ Per family: a `gate-<fam>-meta` recipe, an e2e (or a weekly while there is no fi
 Bookkeeping that turns a check red when missed (`just check-recipes`, A):
 
 - `tools/gate-paths.tsv` rows (e.g. `:85`, `:156-160`); `tools/gate-batch-resources.tsv:36` for a solo recipe;
-- `tools/ref/ptx-shapes.tsv:200-202` for each PTX entry; `tools/unsafe-ratchet.txt:174` for a new crate;
+- `tools/ref/ptx-shapes.tsv:200-202` for each PTX entry (the cc 12.1 tables in `tools/ref/ptx-shapes/` take the entry's row
+  from a scan on a cc 12.1 card); `tools/unsafe-ratchet.txt:174` for a new crate;
 - the hard-coded device-crate list in `tools/recipes.py:8499`; `[[bin]] required-features` in
   `crates/gpu-gates/Cargo.toml`; a new workspace member in the root `Cargo.toml:3`.
 

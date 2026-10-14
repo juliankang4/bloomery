@@ -2,8 +2,8 @@
 
 This is the map for a contributor who owns a DGX Spark (GB10: an Arm CPU and a Blackwell GPU on one unified memory) and
 wants to build, run or extend bloomery on it. It says where the port stands, how to build and check a change on a Spark
-today, and which work is left and whose it is. The work is cut into phases P0 to P5 (section 1). P0 and P2 are done,
-the contributor's part of P3 is done, and P1 is not finished.
+today, and which work is left and whose it is. The work is cut into phases P0 to P5 (section 1). P0, P2 and P3 are
+done, and P1 is not finished.
 
 Today a Spark builds the tree from source, runs a model that fits its memory whole on the card, and runs the fixture-tier
 gates (the gates that run on small generated model files, section 4) in local mode, which runs a gate recipe on your own
@@ -37,14 +37,13 @@ budget solver.
 | **P0** compiles on aarch64 | `cargo check` of the host chain passes on aarch64 Linux, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | done: [#14](https://github.com/midagedev/bloomery/pull/14), `d95c7ec9` (design R: `qdot` refuses its host-tier types off x86, answer 1) | nothing (the site map is Appendix A) |
 | **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), `gate-engram`'s eviction clause (`86022f32`, answer 18). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the unpublished fixture-tier inputs (maintainers, answer 18); a gate for the first cc 12.1 bit pass (section 10) |
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
-| **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | the contributor's part is done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)) | per-arch `ptx-shapes.tsv` rows (maintainers; section 6) |
+| **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6) | nothing |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8) | the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
 | **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words | the placement half's engine side: a remote node's census, the card plans each node's budget comes from, and decode at n = N (contributor, answer 20; section 10); the protocol half, started by the contributor with the `Link` seam; its monotonic words stay the maintainers' unless they hand them over (section 9.6) |
 
-Files the open work touches: P1, the fixture-tier inputs; P3, the per-arch rows of `tools/ref/ptx-shapes.tsv` and
-`tools/ptx-scan.sh`; P4, the card's gather kernels that read the arena in `crates/gpu/src/host/nvtier.rs` (the card
-leg); P5, `crates/placement` (`Machine`, `nodes_scale`), `crates/gpu/src/host/mod.rs` and `tier.rs` (the monotonic
-words and the `Link` seam) and the transport (9.5).
+Files the open work touches: P1, the fixture-tier inputs; P4, the card's gather kernels that read the arena in
+`crates/gpu/src/host/nvtier.rs` (the card leg); P5, `crates/placement` (`Machine`, `nodes_scale`),
+`crates/gpu/src/host/mod.rs` and `tier.rs` (the monotonic words and the `Link` seam) and the transport (9.5).
 
 ## 2. Build and first run on a Spark
 
@@ -145,8 +144,7 @@ BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_BOUND
   two-card recipes (rc 64) ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Which
   fixture gates open on a card with no box name is in `local-check.md` section 3. `nvidia-smi` prints `[N/A]` for
   GB10's memory fields `[#13]`; the census reads the driver API (`gpu/src/lib.rs:1789`).
-- **`gate-ptx-spill`** stays off the contributor list: its pins come from the 3090's JIT, and it is red on GB10 at
-  `sm_86` too (section 6).
+- **`gate-ptx-spill`** runs on GB10 at `sm_86` and `sm_121`, against the cc 12.1 tables (section 6).
 
 **Fixtures.** A fixture is "a model file much smaller than the real one that keeps every
 per-layer shape" (`crates/model/src/fixture/mod.rs:1-4`) and "its bytes are a function of the seed and the source header
@@ -263,7 +261,8 @@ The card runs the tree's `sm_86` PTX through the driver's JIT. `sm_121` PTX was 
 - **Targets today.** Recipes pass `--arch {{arch}}`, the justfile's variable (139 lines): `BLOOMERY_ARCH`, default `sm_86`,
   so `BLOOMERY_ARCH=sm_121 just <recipe>` passes `--arch sm_121`; ~~whether the pinned toolchain accepts it is `[unverified]`~~
   it does (the `sm_121` bullet below). `tools/gate.sh`, `tools/lds-scan.sh` and
-  `tools/sass-scan.sh` read it through `tools/arch.sh`; `tools/ptx-scan.sh` refuses any arch but `sm_86`. The kernels are SIMT code with no generation-specific
+  `tools/sass-scan.sh` read it through `tools/arch.sh`; `tools/ptx-scan.sh` takes `sm_86`, `sm_120` and `sm_121` (the
+  bullet on pins below) and refuses any other arch. The kernels are SIMT code with no generation-specific
   instruction (the three `ptx_asm!` sites are `cvta`, `ld.global`, `max.f32`: `crates/gpu/src/linear/delta.rs:121-157`,
   `flash_gqa_prefill.rs:289`; `fault.rs:714` not read).
 - **Documented state.** `docs/cuda-oxide.md:5`: "Everything here runs on Ampere (sm_86) only." The toolchain ledger
@@ -292,12 +291,18 @@ The card runs the tree's `sm_86` PTX through the driver's JIT. `sm_121` PTX was 
   generated ids are the same, and a timed sitting found no decode difference outside its margin ([#42](https://github.com/midagedev/bloomery/issues/42)); `cargo oxide doctor` passes on aarch64 `[#13]`. The fork's `tcgen05` path
   is datacenter-Blackwell only (`rustc-codegen-cuda/README.md:107-108`: "need `sm_100a`, which a consumer `sm_120` lacks"),
   and we use no such instruction.
-- **Pins that follow the compute capability.** `tools/ref/ptx-shapes.tsv:6` pins spill and `jit_local` from "sm_86, JIT on
-  the RTX 3090" and carries a `# arch: sm_86` line; `tools/recipes.py:1960-1965` says the JIT columns follow the capability;
-  `tools/ptx-scan.sh` hard-codes the sm_86 occupancy column. So under `BLOOMERY_ARCH=sm_121` `gate-ptx-spill` ends with "no
-  ptx-shapes rows for sm_121; the shape pins are sm_86 only" and `ptx-scan` (so `just narrow`) refuses by name, and no sm_121
-  scan is read against sm_86 rows; per-arch rows are P3 (item M1 of the `machineaxes` memo, Appendix A). A Spark contributor leaves them out. `gate-ptx-spill` is red on GB10 at the default
-  `sm_86` too: 13 `generate_ds41` and 8 `gate_e2e` rows, each `jit_local` above its pin ([#42](https://github.com/midagedev/bloomery/issues/42)).
+- **Pins that follow the compute capability.** `gate-ptx-spill` reads one table per PTX arch and card capability,
+  because `spill` follows the arch ptxas assembles for and `jit_local` the capability the driver JITs for.
+  `tools/ref/ptx-shapes.tsv` is `sm_86` on cc 8.6 (the RTX 3090). In `tools/ref/ptx-shapes/`, `sm_86-cc12.1.tsv` and
+  `sm_121-cc12.1.tsv` were pinned on GB10 (driver 595.84). The recipe names the base table and that directory, and
+  `tools/ptx-spill-check.sh` reads each binary against the one its scan's banner names (`arch=`, `jit-cc=`). On cc 12.1 the JIT keeps more local memory than on
+  cc 8.6 for 23 rows, 22 of which have none on cc 8.6 (14 rows of `generate_ds41`, 9 of `gate_e2e`; the largest is
+  `q4k_gemv_tiles`, 184 bytes a thread). The two arches give these rows the same `jit_local`, and at `sm_121` ptxas also spills on them; each nonzero
+  row carries a PIN line. A kernel added on a cc 8.6 card gets its
+  cc 12.1 rows from a scan on a Spark; until then `gate-ptx-spill` on a Spark names it unpinned, and
+  `tools/check-ptx-names.py` reads the cc 12.1 tables for stale rows only. `tools/ptx-scan.sh`'s blk/SM column takes
+  cc 12.x's limits for `sm_120` and `sm_121` (24 resident blocks an SM, where 8.6 has 16); on GB10 it equals the
+  driver's `cuOccupancyMaxActiveBlocksPerMultiprocessor` for all 551 entries of the three binaries at `sm_121`.
 - **Bit gates.** The memo concludes the bit gates have no generation dependence by structure (they compare against oracle
   files) and names two residual risks: `ptxas` contracting `.rn`-less mul-then-add differently, and the `ex2.approx`-class
   approximate instructions in about 30 places (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/rebuild.md#L198, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/machine-axes.md#L10-L16). The proof is
@@ -992,7 +997,6 @@ Each open item; the owner is named where one is agreed. An item that a measureme
 - The unpublished fixture-tier inputs, which hold most of the contributor list's reds: the
   maintainers (answer 18, section 1).
 - Which gate carries the first bit-gate pass on cc 12.1 (asked of the maintainers, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
-- Per-arch `ptx-shapes.tsv` rows, so `gate-ptx-spill` can read `sm_121` PTX: the maintainers (section 6).
 - Which `llc` a build names ([#54](https://github.com/midagedev/bloomery/issues/54), section 6).
 
 **P4.**
@@ -1041,6 +1045,7 @@ Each open item; the owner is named where one is agreed. An item that a measureme
 
 **Closed.**
 - ~~LLVM 21 and `sm_121` PTX~~ ([#42](https://github.com/midagedev/bloomery/issues/42), section 6).
+- ~~Per-arch `ptx-shapes.tsv` rows, so `gate-ptx-spill` can read `sm_121` PTX~~: the cc 12.1 tables (section 6).
 - ~~the host-tier protocol's correctness on Arm~~ (its spin sites, Appendix A; [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)).
 - ~~the card's read rate over pageable memory~~ (section 8, [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921)).
 - ~~the NVMe read rate on a Spark~~ ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6102768921), [#71](https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679)); ~~the Spark drive's NVMe rate~~ (section 8).
@@ -1083,7 +1088,7 @@ answers came on 2026-10-10.
 4. **The contributor gate list:** the maintainers own it, as one derived command (`local-check.md`): `just affected`
    minus real-file and real-only gates, `gate-ptx-spill` and the timing runners (a fixture-only gate stays: its tier is the
    fixture tier).
-   *Now: no command prints the list yet. The P1 list was built by this rule on `697790c4` ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); [`local-check.md`](local-check.md) section 6.*
+   *Now: no command prints the list yet. The P1 list was built by this rule on `697790c4` ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); [`local-check.md`](local-check.md) section 6. `gate-ptx-spill` is on the list where its tables pin the card (section 6).*
 5. **Arm evidence:** a contributor's recorded run on the Spark (its own table, with the machine named) is the Arm
    evidence; the maintainers' x86 batch is the gate for main.
    *Now: the Spark's tables are on [#13](https://github.com/midagedev/bloomery/issues/13), each with the machine named.*
@@ -1092,7 +1097,8 @@ answers came on 2026-10-10.
    *Now: P2 is done (section 1); the Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)).*
 7. **Toolkit:** CUDA 13.3 for aarch64 (sbsa) is the tested set, not DGX OS's 13.0. `sm_86` PTX through the JIT until P3;
    `sm_121` PTX is a P3 item (`BLOOMERY_ARCH=sm_121`, section 3.2).
-   *Now: `sm_121` PTX was checked on GB10 ([#42](https://github.com/midagedev/bloomery/issues/42)); section 6.*
+   *Now: `sm_121` PTX was checked on GB10 ([#42](https://github.com/midagedev/bloomery/issues/42)), and both arches have
+   cc 12.1 `ptx-shapes` tables; section 6.*
 8. **64 GB Spark:** best effort, for the models that fit; not a target.
    *Now: unchanged.*
 9. **An aarch64 release tarball:** P3 or later.
@@ -1166,7 +1172,7 @@ result bullets, lines 197 to 200). Their line numbers are stale; the citations h
 |---|---|---|
 | `sparkprep` S1: cfg guards on the x86 bodies | `qdot`, `deepseek2/attn`, one bin | done in [#14](https://github.com/midagedev/bloomery/pull/14) (P0): every AVX2 item under `cfg(target_arch = "x86_64")`, design R off it |
 | `sparkprep` S2: per-triple `extra-rustflags` | fork patch | done: the fork's `87bc9518` reads `[target.<triple>] extra-rustflags`; `.cargo/cuda-oxide.toml` and `.cargo/config.toml` carry `znver3` for x86_64 and `native` for aarch64, and `tools/check-rustflags.sh` holds both triples |
-| `sparkprep` S3 / `archkey`: one owner of `--arch` | 139 recipe lines | done: the justfile's `arch` variable reads `BLOOMERY_ARCH` (default `sm_86`; unset, every recipe expands as before), the tools that run on the box read it through `tools/arch.sh`, `tools/box.sh` forwards it, and `tools/check-recipes.sh` fails on an arch literal. `gate-ptx-spill`, `ptx-scan`, `just narrow` and `release-build` refuse another arch by name; the per-arch pin rows are P3 |
+| `sparkprep` S3 / `archkey`: one owner of `--arch` | 139 recipe lines | done: the justfile's `arch` variable reads `BLOOMERY_ARCH` (default `sm_86`; unset, every recipe expands as before), the tools that run on the box read it through `tools/arch.sh`, `tools/box.sh` forwards it, and `tools/check-recipes.sh` fails on an arch literal. `just narrow` and `release-build` refuse another arch by name; `ptx-scan` also takes `sm_120` and `sm_121`, and `gate-ptx-spill` reads a table per arch and card capability (section 6) |
 | `sparkprep` S4: tools for N cards | `cards.sh`, `timing-card.sh`, `gpu-gate.sh` | ~~not done: `tools/ref/cards.sh:31-35` names two cards~~ partly: local mode ([#38](https://github.com/midagedev/bloomery/pull/38)) and the single-card timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)) run on one local card; `tools/ref/cards.sh:33-34` still names the box's two |
 | `isarefuse`: CPU check at `main` | x86-64-v3 refusal | partly: `crates/serve/src/preflight.rs` and `crates/gpu-gates/src/bin/bloomery_serve.rs:70-71` (`cpu_gate`, x86-only); no other bin calls it |
 

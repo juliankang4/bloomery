@@ -137,7 +137,7 @@ The raise itself is a few lines of `ptx_asm!` (`red.relaxed.gpu.global.min.u32`)
 Register use and spills do not change any output bit, only speed, so the bit-exact tests cannot see them. We check them at build time:
 
 - **`just ptx-scan <bin>`** prints, for every kernel entry, its registers, shared memory, ptxas spill bytes and the driver JIT's local bytes, with an md5 of its PTX. A change that should not touch device code (a rename, host-only work) must leave this table identical.
-- **`just gate-ptx-spill`** compares every entry's spill and local bytes with the pins in `tools/ref/ptx-shapes.tsv`. Any change, up or down, a new entry without a pin, or a pin whose entry disappeared is a failure. A non-zero pin carries a comment that gives its reason.
+- **`just gate-ptx-spill`** compares every entry's spill and local bytes with the pins in `tools/ref/ptx-shapes.tsv`, or in the table of `tools/ref/ptx-shapes/` for the scan's arch and card capability. Any change, up or down, a new entry without a pin, or a pin whose entry disappeared is a failure. A non-zero pin carries a comment that gives its reason.
 
 ## Upstream
 

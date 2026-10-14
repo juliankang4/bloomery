@@ -59,7 +59,7 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds; tools/recipes.py SCAN_PACKAGE
-ARCH=sm_86 # the arch of the scans: tools/ptx-scan.sh's blk/SM column is its arithmetic and it refuses another (BLOOMERY_ARCH, tools/arch.sh)
+ARCH=sm_86 # the arch of the scans, the recipes' default (BLOOMERY_ARCH, tools/arch.sh); the pairs are built at no other
 USAGE="usage: narrow-scan.sh BASE [HEAD | --worktree] [--out DIR] [--dry-run] | --self-test"
 
 die() { # die <rc> <message>
@@ -577,8 +577,9 @@ if [ "${1:-}" = --self-test ]; then
   exit
 fi
 
-# The scan pairs are sm_86's (ARCH): ptx-scan.sh refuses another arch, and a box build at one would end there.
-[ "${BLOOMERY_ARCH-$ARCH}" = "$ARCH" ] || die 64 "BLOOMERY_ARCH is '$BLOOMERY_ARCH': the scan pairs are $ARCH's (tools/ptx-scan.sh refuses another arch: its blk/SM column is $ARCH's occupancy arithmetic)"
+# The scan pairs are sm_86's (ARCH): the runner builds both sides at ARCH, so a narrowing asked at another arch would read
+# scans of the wrong code.
+[ "${BLOOMERY_ARCH-$ARCH}" = "$ARCH" ] || die 64 "BLOOMERY_ARCH is '$BLOOMERY_ARCH': the scan pairs are $ARCH's (this script builds both sides at $ARCH only)"
 
 BASE='' HEAD_REV='' OUT='' DRY=0 WORKTREE=0
 while [ $# -gt 0 ]; do

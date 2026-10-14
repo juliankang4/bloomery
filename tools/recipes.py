@@ -10535,8 +10535,10 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     expect("gate-attn" in common and "gate-kv" not in common, f"tests/common/asserts.rs selects {sorted(common)}")
     fixture = sel("crates/serve/tests/fixtures/qwen3-renders.json")
     expect(fixture == {"gate-serve"}, f"serve fixture selects {sorted(fixture)}")
-    spill = sel("tools/ref/ptx-shapes.tsv")
-    expect(spill == {"gate-ptx-spill"}, f"ptx-shapes.tsv selects {sorted(spill)}")
+    # every table the recipe names: the base and the directory of the other archs and capabilities, a table added there too
+    for table in ("tools/ref/ptx-shapes.tsv", "tools/ref/ptx-shapes/sm_121-cc12.1.tsv", "tools/ref/ptx-shapes/sm_90-cc9.0.tsv"):
+        spill = sel(table)
+        expect(spill == {"gate-ptx-spill"}, f"{table} selects {sorted(spill)}")
     # a whole-string .rs literal of a workspace package is documentation, not a run-time read: levers'
     # registry names the in-place lever files, and only the targets that compile such a file select it
     dspark = sel("crates/gpu-gates/src/bin/shared/ds41_dspark.rs")

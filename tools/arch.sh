@@ -6,13 +6,15 @@
 #
 # The value is `sm_` and the capability's digits, with the `a` or `f` suffix cargo-oxide accepts: sm_86, sm_121,
 # sm_121a. Anything else is refused by name, set-and-empty included: a recipe would hand `--arch ` to cargo-oxide.
-# Which archs a tool supports is the tool's own refusal, after this one (the shape pins and the occupancy column
-# are sm_86's; the release archive is sm_86's).
+# Which archs a tool supports is the tool's own refusal, after this one (the shape pins hold sm_86 and sm_121
+# tables, the occupancy column sm_86's and sm_120/sm_121's limits; narrow-scan and the release archive are sm_86's).
 #
 #   bloomery_arch <tool>   ARCH=<the value>, or the refusal on stderr and 64
+#   ARCH_SHAPE             the value's shape, for a tool that reads an arch elsewhere (a ptx-shapes table's `# arch:`)
+ARCH_SHAPE='^sm_[1-9][0-9]{1,2}[af]?$'
 bloomery_arch() {
   local v=${BLOOMERY_ARCH-sm_86}
-  if ! [[ $v =~ ^sm_[1-9][0-9]{1,2}[af]?$ ]]; then
+  if ! [[ $v =~ $ARCH_SHAPE ]]; then
     echo "$1: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: sm_86), got '$v'" >&2
     return 64
   fi
