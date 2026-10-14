@@ -1880,15 +1880,15 @@ gate-gpu-ds41-residency-a:
 # V4.1's attach of the NVMe expert tier (shared/nvtier_family.rs, whose clauses a second family calls): a paged arm
 # against an all-RAM arm on the same file, plan (a), the residency off, the r8 pair off — the paged plan's arena is
 # the given slots, the tier built and covering every paged layer, one prompt call and greedy steps bit for bit the
-# all-RAM arm's, the room under the floor, the arena under its floor and the r8 sidecar on a paged plan each refused
-# by name, and the unset residency `off` with why `paged`. Each arm's room and arena reach the plan through
-# PlanInputs, so no environment crosses the tiers. The A6000 alone, one load at a time.
+# all-RAM arm's, the tier's card leg unattached, the room under the floor, the arena under its floor and the r8
+# sidecar on a paged plan each refused by name, and the unset residency `off` with why `paged`. Each arm's room and
+# arena reach the plan through PlanInputs, so no environment crosses the tiers. The A6000 alone, one load at a time.
 # Group solo-real, reason r1 (its host set is the whole file on the real tier, ~15 GB on a fixture) on one card, the A6000 by
 # box.sh's pick (`BLOOMERY_CARD=a6000`): alone in the real tier, and in the fixture tier fixed to lane B.
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-ds41-nvtier:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_nvtier && bash tools/gpu-gate.sh gate_ds41_nvtier'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --bin gate_ds41_nvtier && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_nvtier && bash tools/gpu-gate.sh gate_ds41_nvtier'
 
 # V4.1 long runs on the gate placement, three arms on one load, the host set populated and locked
 # (BLOOMERY_HOST_LOCK=1 unless the environment says otherwise: populated pages alone are reclaimed under
@@ -2737,16 +2737,20 @@ gate-gpu-glm5next-mtp:
 # glm5next (GLM-5.3-Flash)'s attach of the NVMe expert tier (shared/nvtier_family.rs, whose clauses V4.1's gate calls first): a
 # paged arm against an all-RAM arm on the same file on the gate placement, the residency off — the paged plan's arena is the
 # given slots (sized from the file: at most 64, fewer where the need leaves less above the floor), the tier built and covering
-# every paged layer, one prompt call and greedy steps bit for bit the all-RAM arm's, the room under the floor and the arena
-# under its floor each refused by name, the NextN plan refused at the room the draft layer's routed experts leave under the
-# floor and planned above it, and the unset residency as the plan's numbers say, never why `paged`.
-# Each arm's room and arena reach the plan through PlanInputs, so no environment crosses the tiers. The fixture tier runs on
-# the `q6kdown` variant (tools/fixture-variants.tsv: every routed layer on the host). Group solo-real, reason r1 (the real tier
-# loads the whole file twice), balanced over the cards in the fixture tier, under the big-load lock the V4.1 loads take.
+# every paged layer, one prompt call and greedy steps on the host leg's paged arm bit for bit the all-RAM arm's, the card
+# leg's paged arm (a pinned arena: on an integrated device by default, else a child of the gate at BLOOMERY_NVTIER_MEM=pinned)
+# claiming on the step port only the ids the leg held and replaying its eager steps bit for bit, the
+# room under the floor and the arena under its floor each refused by name, the NextN plan refused at the room the draft
+# layer's routed experts leave under the floor and planned above it, and the unset residency as the plan's numbers say,
+# never why `paged`.
+# Each arm's room and arena reach the plan through PlanInputs, so no environment crosses the tiers; the one variable the gate
+# sets is its arm child's BLOOMERY_NVTIER_MEM. The fixture tier runs on the `q6kdown` variant (tools/fixture-variants.tsv:
+# every routed layer on the host). Group solo-real, reason r1 (the real tier loads the whole file three times, one load at a
+# time), balanced over the cards in the fixture tier, under the big-load lock the V4.1 loads take.
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-nvtier:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_nvtier && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_nvtier'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next --bin gate_glm5next_nvtier && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_nvtier && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_nvtier'
 
 # glm5next (GLM-5.3-Flash) on plan (b′): the stage on the A6000, the expert tier on the 3090 (`app::arch::glm5next::open_pair`
 # at --place bp, two KDA lanes, under a card budget on both cards: 16 GiB in the real tier, the header's in the fixture

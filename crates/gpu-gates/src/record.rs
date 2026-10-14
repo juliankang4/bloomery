@@ -1863,6 +1863,21 @@ pub static NVTIER: Kind = Kind {
     ],
 };
 
+/// The NVMe family gate child's reply.
+pub static NVTIER_ARM: Kind = Kind {
+    name: "nvtier_arm",
+    head: "arm-child",
+    doc: "The paged arm state, counts and graph/eager positions.",
+    parts: &[
+        key("leg", Word, ""),
+        key("claims", U64, ""),
+        key("card_ids", U64, ""),
+        key("fills", U64, ""),
+        key("run", Csv, ""),
+        key("eager", Csv, ""),
+    ],
+};
+
 /// One span's tier census on a paged load (`bloomery_gpu::host::census`): the
 /// span's phase, its tokens, the routed picks its host services saw and where
 /// each was served — the stage card (or a tier card), the NVMe tier's arena,
@@ -3828,9 +3843,16 @@ pub fn mtp_stats(
     })
 }
 
-/// `gate_nvtier`'s rows: the tier's counters, the residency rule's two
-/// records of the paged plan and the tier census of each phase.
-pub static GATE_NVTIER: &[&Kind] = &[&NVTIER, &RESIDENCY_UNSET, &RESIDENCY_HOST, &TIER_CENSUS];
+/// The NVMe family gates' rows: the tier's counters, the residency rule's
+/// two records of the paged plan, the tier census of each phase and the
+/// paged arm child's reply.
+pub static GATE_NVTIER: &[&Kind] = &[
+    &NVTIER,
+    &RESIDENCY_UNSET,
+    &RESIDENCY_HOST,
+    &TIER_CENSUS,
+    &NVTIER_ARM,
+];
 
 /// The printed plan's host-only causes under its actual expert rule.
 /// `None` is the user's all-host choice and emits no kernel diagnosis.

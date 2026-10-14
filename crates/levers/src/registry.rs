@@ -333,11 +333,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Is("auto"),
         doc: "The memory the NVMe expert tier's RAM arena is: `anon` an anonymous mapping, whose \
               slots a landing gives back to the kernel; `pinned` one `cuMemHostAlloc` the card \
-              maps, priced at load and never given back, its slots read by the host leg as \
-              `anon`'s are, write-combined on an integrated device alone (a discrete card's \
-              CPU reads write-combined pages uncached); `auto` is `pinned` on an integrated \
-              device and `anon` on a card with its own memory. `anon` and `pinned` are the \
-              same-binary arms. Read where the tier is built.",
+              maps, priced at load and never given back, write-combined on an integrated device \
+              alone (a discrete card's CPU reads write-combined pages uncached); a step's ids in \
+              its slots are read on the card by the step port's card leg where the family \
+              attaches it (GLM-5.3-Flash with no residency machine), which quantizes the \
+              activation as q8_1 and sums in its own order, and by the host leg as `anon`'s are \
+              elsewhere (a prompt's batch, every other load); `auto` is `pinned` on an \
+              integrated device and `anon` on a card with its own memory. `anon` and `pinned` are \
+              the same-binary arms. Read where the tier is built.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
