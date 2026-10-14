@@ -479,14 +479,22 @@ pub fn q8_1_exact(x: &[f32]) -> Vec<f64> {
         .collect()
 }
 
+/// Panics, naming quantizer `name`, on the first non-finite value of `x`.
+#[track_caller]
+fn refuse_non_finite(name: &str, x: &[f32]) {
+    if let Some(i) = x.iter().position(|v| !v.is_finite()) {
+        panic!("{name}: non-finite value {} at offset {i}", x[i]);
+    }
+}
+
 /// Our q8_1 activation of `x` as codes: per block of [`Q8_1_BLOCK`] (a short
 /// last block on its own) `d = amax/127` (1 for an all-zero block) and
 /// `q = round(x/d)` half away from zero, clamped to ±127; the codes in value
-/// order and the block scales. A NaN codes as 0 where the card's quantizer
-/// refuses its block, so a caller passes finite values or checks the card's
-/// scales against these.
+/// order and the block scales. Panics on a non-finite value, which the
+/// card's quantizer refuses with a NaN scale and this form has no code for.
 #[must_use]
 pub fn q8_1_codes(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    refuse_non_finite("q8_1_codes", x);
     let (mut q, mut d8) = (Vec::with_capacity(x.len()), Vec::new());
     for b in x.chunks(Q8_1_BLOCK) {
         let amax = b.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
@@ -646,7 +654,7 @@ pub fn q3k_shared_input_bound(rows: &[Q3kRow], k: usize) -> Vec<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Act, QK_K, dot_q3k, q3k_scales, quantize_q8_k};
+    use super::{Act, QK_K, dot_q3k, q3k_scales, q8_1_codes, quantize_q8_k};
     use gguf::quant::{GgmlType, dequant_row};
 
     /// A super-block's scales decode as `dequant_row` reads them: every
@@ -709,6 +717,17 @@ mod tests {
             .sum();
         let got = f64::from(dot_q3k(&row, &a, 0));
         assert!((got - exact).abs() <= 1e-5 * abs, "{got} vs {exact}");
+    }
+
+    /// A NaN or an infinity anywhere in the column panics instead of coding.
+    #[test]
+    fn q8_1_codes_refuses_a_non_finite_value() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut x = crate::activations(2 * QK_K, 1, 7);
+            x[300] = bad;
+            let r = std::panic::catch_unwind(|| q8_1_codes(&x));
+            assert!(r.is_err(), "{bad} was coded");
+        }
     }
 }
 
