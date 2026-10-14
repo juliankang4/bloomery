@@ -1245,9 +1245,11 @@ gate-gpu-gemma-embedding2-head512:
 # EmbeddingGemma 2's encoder (gpu-gemma-embedding2) end to end on the Q8_0 file the sets are dumped from
 # (refset's gemma_embedding2::MODEL, held to its sha256; the sets' `# model` line names the same path): every
 # text case of mainline's card set (just dump-ref-emb2) through one pass, its taps within the CPU twin's band,
-# a rerun bit for bit, and the refusals by name.
+# a rerun bit for bit, and the refusals by name. The
+# key bounds first hold every key of the symmetric mask, independently of the tap bands.
 gate-gpu-gemma-embedding2-e2e:
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gemma-embedding2 --lib -- --include-ignored'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding2::spec::tests::key_bounds_are_the_symmetric_mask --exact'
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gemma-embedding2 --bin gate_gemma_embedding2_e2e'
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e'
 

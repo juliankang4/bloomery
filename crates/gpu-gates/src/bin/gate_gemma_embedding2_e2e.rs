@@ -164,10 +164,12 @@ mod gate {
         c: &Case,
         man: &RefManifest,
         cpu: &RefManifest,
+        hp: &Hparams,
     ) -> Result<(bool, Pass), GateError> {
         let t0 = Instant::now();
         let pass = enc.pass(&c.ids, true)?;
         let taps = pass.taps.as_ref().ok_or("a pass with taps returned none")?;
+        assert_eq!(taps.l_out.len(), hp.n_layer, "missing l_out taps");
         let row = |m: &RefManifest, name: &str| tap(m, &format!("{}/{name}", c.id));
         let held = |name: &str, ours: &[f32]| -> Result<Held, GateError> {
             Ok(Held::of(ours, &row(man, name)?, &row(cpu, name)?))
@@ -221,8 +223,8 @@ mod gate {
     /// A case long enough for a dropped window to leave the tap bands:
     /// some row's keys stop short of the input's ends. The host test holds
     /// the exact edges. No sliding layer passes; a set with no such case fails.
-    fn window(hp: &Hparams, cases: &[Case]) -> bool {
-        let Some(reach) = (0..hp.n_layer).filter_map(|l| hp.reach(l)).max() else {
+    fn window(reach: &[Option<u32>], cases: &[Case]) -> bool {
+        let Some(reach) = reach.iter().flatten().copied().max().map(|r| r as usize) else {
             return true;
         };
         let longest = cases.iter().map(|c| c.ids.len()).max().unwrap_or(0);
@@ -297,6 +299,12 @@ mod gate {
         }
         let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         let hp = Hparams::read(&split).map_err(|e| format!("{MODEL}: {e}"))?;
+        let read = model::arch::spec(&split).map_err(|e| format!("{MODEL}: {e}"))?;
+        let encoder = read
+            .spec
+            .encoder
+            .as_ref()
+            .ok_or("gemma-embedding2 has no encoder description")?;
         let ctx = CARD_CTX;
         let bytes = card_bytes(&split, ctx)?;
         let man = open(&TEXT)?;
@@ -310,13 +318,13 @@ mod gate {
             gpu.device_name()?,
             cases.len()
         );
-        let mut ok = window(&hp, &cases);
+        let mut ok = window(&encoder.reach, &cases);
         let t = Instant::now();
         let mut enc = Encoder::open(split, ctx, gpu)?;
         elapsed("(open)", &t);
         let mut longest: Option<(usize, Pass)> = None;
         for (i, c) in cases.iter().enumerate() {
-            let r = case(&mut enc, c, &man, &cpu).map(|(pass_ok, pass)| {
+            let r = case(&mut enc, c, &man, &cpu, &hp).map(|(pass_ok, pass)| {
                 if longest
                     .as_ref()
                     .is_none_or(|(j, _)| c.ids.len() > cases[*j].ids.len())
@@ -368,7 +376,19 @@ mod gate {
 
     #[cfg(test)]
     mod tests {
-        use super::{RefHeader, check_case_identities};
+        use super::{Case, RefHeader, check_case_identities, window};
+
+        #[test]
+        fn a_window_case_reaches_past_the_longest_sliding_layer() {
+            let mut cases = [Case {
+                id: "window".to_owned(),
+                ids: vec![0; 3],
+            }];
+            assert!(window(&[None], &[]));
+            assert!(!window(&[Some(1), None, Some(2)], &cases));
+            cases[0].ids.push(0);
+            assert!(window(&[Some(1), None, Some(2)], &cases));
+        }
 
         #[test]
         fn a_cpu_case_of_another_digest_is_refused_by_name() {
