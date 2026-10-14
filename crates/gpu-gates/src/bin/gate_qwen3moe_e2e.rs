@@ -683,10 +683,7 @@ mod gate {
             let pos0 = m.pos();
             let plan = m.prefill_plan(n, PrefillPath::Auto)?.to_string();
             let mut tokens = vec![m.prefill_with(&prose[first..first + n], PrefillPath::Auto)?];
-            for _ in 0..steps {
-                let last = *tokens.last().ok_or("no token")?;
-                tokens.push(m.step(&[last])?);
-            }
+            slots_gate::greedy(m, &mut tokens, steps)?;
             let logits = Fnv1a64::default().f32s(&m.logits()?).value();
             let end = usize::try_from(m.pos())?;
             let kv = m
@@ -1842,10 +1839,7 @@ mod gate {
             m.set_mode(StepMode::Graph);
             m.reset()?;
             let mut plain = vec![m.prefill_with(&s.prompt, PrefillPath::Pass)?];
-            for _ in 1..TAP_GEN {
-                let last = plain[plain.len() - 1];
-                plain.push(m.step(&[last])?);
-            }
+            slots_gate::greedy(m, &mut plain, TAP_GEN - 1)?;
             let (head, tail) = ids.split_at(row.n_prompt.min(ids.len()));
             let ids_ok = row.n_prompt == TAP_PROMPT
                 && row.n_total == TAP_PROMPT + TAP_GEN
@@ -2776,16 +2770,6 @@ mod gate {
     /// The steps the reset-isolation contract of (n) runs on each slot.
     const N_STEPS: usize = 8;
 
-    /// `steps` more greedy steps on the model as it stands, appended to
-    /// `out` (its last id the first step's input).
-    fn step_more(m: &mut Qwen3moeModel, out: &mut Vec<u32>, steps: usize) -> Result<(), GateError> {
-        for _ in 0..steps {
-            let last = *out.last().ok_or("no token")?;
-            out.push(m.step(&[last])?);
-        }
-        Ok(())
-    }
-
     /// FNV-1a 64 of every layer's K/V rows below `end` — the (k) clause's
     /// hash of the same readback.
     fn kv_fnv(m: &mut Qwen3moeModel, end: usize) -> Result<u64, GateError> {
@@ -2930,7 +2914,7 @@ mod gate {
         m.select_slot(0)?;
         m.reset()?;
         let mut back = vec![body.prompt(m, 0)?];
-        step_more(m, &mut back, SlotsQ3::STEPS)?;
+        slots_gate::greedy(m, &mut back, SlotsQ3::STEPS)?;
         let harness_ok = s.finish()?;
         Ok(fault_ok && harness_ok)
     }

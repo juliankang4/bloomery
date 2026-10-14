@@ -253,6 +253,7 @@ mod gate {
         Answer, PrefixTurns, Served, agree, chat_is_those_ids, check, curl, edit_and_extension,
         greedy, json_of, metric, rendered, serve_cmd, server_log, tokenized,
     };
+    use bloomery_gpu_gates::slots_gate;
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, ref_model_path};
     use bloomery_levers::CARD_BUDGET;
     use gguf::Split;
@@ -1474,10 +1475,7 @@ mod gate {
         }
         let mut ids = vec![m.step(&[*last])?];
         let first_logits = m.logits()?;
-        while ids.len() < n {
-            let prev = *ids.last().ok_or("no id")?;
-            ids.push(m.step(&[prev])?);
-        }
+        slots_gate::greedy(m, &mut ids, n.saturating_sub(1))?;
         Ok((ids, first_logits))
     }
 

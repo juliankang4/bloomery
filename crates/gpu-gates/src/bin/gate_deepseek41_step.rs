@@ -1869,10 +1869,7 @@ mod gate {
         let traced = (|| -> Result<(Vec<u32>, TraceSet), GateError> {
             <Body as Prompt>::prompt(m, call)?;
             let mut out = vec![m.step(last)?];
-            for _ in 0..TRACE_GREEDY {
-                let t = *out.last().ok_or("no token")?;
-                out.push(m.step(&[t])?);
-            }
+            slots_gate::greedy(m, &mut out, TRACE_GREEDY)?;
             Ok((out, TraceSet::read(&dir)?))
         })();
         let detached = m.body_parts(WHAT)?.2.hybrid_mut().take_route_trace();

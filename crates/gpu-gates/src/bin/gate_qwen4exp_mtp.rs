@@ -263,6 +263,7 @@ mod gate {
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::q38_fixture::Shape;
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
+    use bloomery_gpu_gates::slots_gate;
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, ref_model_path, verdict};
     use bloomery_levers::{CARD_BUDGET, HostCfg, Levers};
@@ -3127,10 +3128,7 @@ mod gate {
         let mut m = m;
         m.reset()?;
         let mut tokens = vec![m.prompt38(ids, path)?];
-        for _ in 1..n {
-            let t = m.step(&[tokens[tokens.len() - 1]])?;
-            tokens.push(t);
-        }
+        slots_gate::greedy(&mut m, &mut tokens, n.saturating_sub(1))?;
         let stores = {
             let (gpu, _, b) = m.body_parts("plain")?;
             b.stores_host(gpu)?
@@ -4106,9 +4104,7 @@ mod gate {
         m.reset()?;
         let plain = |m: &mut Qwen38Model, ids: &[u32]| -> Result<Vec<u32>, GateError> {
             let mut t = vec![m.prompt38(ids, Prompt38::Auto)?];
-            for _ in 1..N {
-                t.push(m.step(&[t[t.len() - 1]])?);
-            }
+            slots_gate::greedy(m, &mut t, N - 1)?;
             Ok(t)
         };
         let _ = m.prompt38(prompt, Prompt38::Auto)?;

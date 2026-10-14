@@ -2553,16 +2553,6 @@ mod gate {
         Ok(m.body("slots")?.checkpoints().positions())
     }
 
-    /// `n` greedy steps on the selected slot, appended to `ids` (its last id
-    /// the first step's input).
-    fn greedy(m: &mut Qwen35moeModel, ids: &mut Vec<u32>, n: usize) -> Result<(), GateError> {
-        for _ in 0..n {
-            let last = *ids.last().ok_or("no token")?;
-            ids.push(m.step(&[last])?);
-        }
-        Ok(())
-    }
-
     /// (n) (module doc): the harness's contracts, and between its halves
     /// each slot's checkpoints its own under a cut and a reset of the other
     /// slot. The clause's model is dropped with its second sequence.
@@ -2617,7 +2607,7 @@ mod gate {
             .get(U_GATE..)
             .ok_or("stream B shorter than the first mark")?;
         let mut ids = vec![<Body35 as app::Prompt>::prompt(m, rest)?];
-        greedy(m, &mut ids, SLOT_STEPS + SLOT_TAIL)?;
+        slots_gate::greedy(m, &mut ids, SLOT_STEPS + SLOT_TAIL)?;
         let b_now = (a.state_hash(m)?, points(m)?, m.pos());
         let last = ids.last().copied();
         let refed_ok = last == Some(b_last) && b_now == b_held;

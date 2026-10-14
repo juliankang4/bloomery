@@ -605,7 +605,7 @@ fn check(name: &str, arm: Result<(bool, String), GateError>) -> bool {
 
 /// `n` greedy steps on the selected slot as it stands, each fed the id
 /// before it, appended to `ids` (its last id the first step's input).
-fn greedy<B: ChainBody>(
+pub fn greedy<B: ChainBody>(
     m: &mut GpuModel<B>,
     ids: &mut Vec<u32>,
     n: usize,
