@@ -76,6 +76,7 @@ use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, m
 use crate::glmxml::ArgTypes;
 use crate::http::{self, EventStream, Request};
 use crate::media::{self, ExpandError, MediaError, Prompt, SharedMediaModel};
+use crate::models::Listed;
 use crate::qwenxml::ParamKinds;
 use crate::reasoning::{ReasoningFormat, ThinkEntry};
 use crate::sampling;
@@ -489,6 +490,14 @@ struct State {
 
 pub(crate) fn relock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A caught panic's message, as the failure it ends the server with names it.
+pub(crate) fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".to_owned())
 }
 
 /// The arrival tickets of the board ([`crate::sched::Board`]): drawn in
@@ -1779,10 +1788,12 @@ fn health(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
 
 fn models(state: &State) -> Value {
     crate::models::listing(
-        &state.alias,
+        vec![Listed {
+            id: &state.alias,
+            meta: json!({ "n_vocab": state.info.n_vocab, "n_ctx_train": state.info.ctx_max }),
+            max_model_len: Some(state.info.ctx_max),
+        }],
         state.start_unix,
-        json!({ "n_vocab": state.info.n_vocab, "n_ctx_train": state.info.ctx_max }),
-        Some(state.info.ctx_max),
     )
 }
 
@@ -2194,7 +2205,7 @@ fn tokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
     let t = &*state.tok;
     let ids = match b.get("content") {
         None => return Err(invalid("'content' is required")),
-        Some(v) => prompt_ids(state, "content", v, add_special && t.add_bos())?,
+        Some(v) => prompt_ids(t, "content", v, add_special)?,
     };
     let tokens: Vec<Value> = if with_pieces {
         ids.iter()
@@ -2211,12 +2222,12 @@ fn tokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
 fn detokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
     let ids = match b.get("tokens") {
         None => return Err(invalid("'tokens' is required")),
-        Some(v) => token_ids(state, v)?,
+        Some(v) => token_ids(&*state.tok, v)?,
     };
     Ok(json!({ "content": state.tok.decode(&ids) }))
 }
 
-fn token_ids(state: &State, v: &Value) -> Result<Vec<u32>, ApiError> {
+fn token_ids(tok: &dyn Tokenizer, v: &Value) -> Result<Vec<u32>, ApiError> {
     let Value::Array(a) = v else {
         return Err(invalid("tokens must be an array of token ids"));
     };
@@ -2224,7 +2235,7 @@ fn token_ids(state: &State, v: &Value) -> Result<Vec<u32>, ApiError> {
         .map(|x| {
             x.as_u64()
                 .and_then(|id| u32::try_from(id).ok())
-                .filter(|&id| (id as usize) < state.info.n_vocab)
+                .filter(|&id| (id as usize) < tok.n_vocab())
                 .ok_or_else(|| invalid(format!("invalid token id {x}")))
         })
         .collect()
@@ -3141,7 +3152,7 @@ fn completion_ids(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiError
     match v {
         Some(o) if carries_media(o) => Err(no_media()),
         Some(v @ (Value::String(_) | Value::Array(_))) => {
-            prompt_ids(state, "prompt", v, state.tok.add_bos())
+            prompt_ids(&*state.tok, "prompt", v, true)
         }
         _ => Err(invalid("'prompt' must be a string or an array of tokens")),
     }
@@ -3151,29 +3162,31 @@ fn no_media() -> ApiError {
     invalid("Multimodal data provided, but model does not support multimodal requests.")
 }
 
-/// The field `k`, a string or an array of strings and token ids, as token ids:
-/// each string encoded, each id checked against the vocabulary. `bos` puts the
-/// tokenizer's BOS first when it starts with text. Any other type is a 400
-/// naming `k` and the type it got.
-fn prompt_ids(state: &State, k: &str, v: &Value, bos: bool) -> Result<Vec<u32>, ApiError> {
-    let e = &*state.tok;
+/// The field `k`, a string or an array of strings and token ids, as `tok`'s token ids, as
+/// llama-server's `tokenize_mixed` reads it: each string encoded, each id checked against the
+/// vocabulary. `special` puts the vocabulary's BOS first ([`Tokenizer::add_bos`]) when the input
+/// starts with text. Any other type is a 400 naming `k` and the type it got.
+fn prompt_ids(
+    tok: &dyn Tokenizer,
+    k: &str,
+    v: &Value,
+    special: bool,
+) -> Result<Vec<u32>, ApiError> {
     let mut ids = Vec::new();
-    match v {
-        Value::String(s) => {
-            if bos {
-                ids.push(e.bos());
-            }
-            ids.extend(e.encode(s));
+    let text = |ids: &mut Vec<u32>, s: &str, special: bool| {
+        if special && tok.add_bos() {
+            ids.push(tok.bos());
         }
+        ids.extend(tok.encode(s));
+    };
+    match v {
+        Value::String(s) => text(&mut ids, s, special),
         Value::Array(a) => {
-            if bos && a.first().is_some_and(Value::is_string) {
-                ids.push(e.bos());
-            }
-            for x in a {
+            for (i, x) in a.iter().enumerate() {
                 match x {
-                    Value::String(s) => ids.extend(e.encode(s)),
+                    Value::String(s) => text(&mut ids, s, special && i == 0),
                     o if carries_media(o) => return Err(no_media()),
-                    other => ids.extend(token_ids(state, &Value::Array(vec![other.clone()]))?),
+                    other => ids.extend(token_ids(tok, &Value::Array(vec![other.clone()]))?),
                 }
             }
         }

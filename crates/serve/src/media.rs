@@ -624,6 +624,27 @@ fn base64(text: &str) -> Result<Vec<u8>, MediaError> {
     Ok(out)
 }
 
+/// `bytes` as standard base64 with padding (RFC 4648 §4), the text [`base64`] reads back.
+#[must_use]
+pub fn encode_base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = c
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= c.len() {
+                char::from(A[(n >> (18 - 6 * i) & 63) as usize])
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
 /// At most the first 64 characters of a value an error names, so a refusal never echoes a payload.
 fn short(s: &str) -> String {
     match s.char_indices().nth(64) {
@@ -641,8 +662,8 @@ mod tests {
 
     use super::{
         ExpandError, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, NumberedMedia,
-        Part, PartJoin, Prepared, Rgb8, VisionError, common_prefix, expand_prompt, flatten,
-        keep_whole_spans, load, parse_part, prepare,
+        Part, PartJoin, Prepared, Rgb8, VisionError, common_prefix, encode_base64, expand_prompt,
+        flatten, keep_whole_spans, load, parse_part, prepare,
     };
 
     /// A 2×1 RGB PNG of the colour (200, 100, 50).
@@ -702,26 +723,6 @@ mod tests {
 
     fn data(mime: &str, b64: &str) -> String {
         format!("data:{mime};base64,{b64}")
-    }
-
-    /// Standard base64 with padding (RFC 4648 §4), to build payloads.
-    fn encode(bytes: &[u8]) -> String {
-        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut s = String::new();
-        for c in bytes.chunks(3) {
-            let n = c
-                .iter()
-                .enumerate()
-                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
-            for i in 0..4 {
-                s.push(if i <= c.len() {
-                    char::from(A[(n >> (18 - 6 * i) & 63) as usize])
-                } else {
-                    '='
-                });
-            }
-        }
-        s
     }
 
     fn err(r: Result<impl std::fmt::Debug, MediaError>) -> MediaError {
@@ -1009,7 +1010,7 @@ mod tests {
     fn jpeg_and_its_jpg_alias_load() {
         let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F'];
         for mime in ["image/jpeg", "image/jpg"] {
-            let f = load(&data(mime, &encode(&jpeg))).unwrap();
+            let f = load(&data(mime, &encode_base64(&jpeg))).unwrap();
             assert_eq!(
                 (f.kind, f.bytes.as_slice()),
                 (FileKind::Jpeg, &jpeg[..]),
@@ -1077,10 +1078,11 @@ mod tests {
             ("foobar", "Zm9vYmFy"),
         ] {
             assert_eq!(super::base64(b64).unwrap(), plain.as_bytes(), "{b64}");
+            assert_eq!(encode_base64(plain.as_bytes()), b64, "{plain}");
         }
         let all: Vec<u8> = (0..=255).collect();
         for n in [254, 255, 256] {
-            assert_eq!(super::base64(&encode(&all[..n])).unwrap(), &all[..n]);
+            assert_eq!(super::base64(&encode_base64(&all[..n])).unwrap(), &all[..n]);
         }
         for (b64, want) in [
             ("Zm9v\nYmFy", "char 10 at 4"),
@@ -1117,7 +1119,7 @@ mod tests {
             }
             e => panic!("{e}"),
         }
-        match err(load(&data("image/png", &encode(&jpeg)))) {
+        match err(load(&data("image/png", &encode_base64(&jpeg)))) {
             MediaError::Magic { declared, found } => {
                 assert_eq!((declared, found), (FileKind::Png, FileKind::Jpeg));
             }
@@ -1127,12 +1129,12 @@ mod tests {
             (&b"RIFF\x24\0\0\0WEBPVP8 "[..], FileKind::Webp),
             (b"GIF89a\x01\0\x01\0", FileKind::Gif),
         ] {
-            match err(load(&data("image/png", &encode(bytes)))) {
+            match err(load(&data("image/png", &encode_base64(bytes)))) {
                 MediaError::Format(k) => assert_eq!(k, kind),
                 e => panic!("{kind:?}: {e}"),
             }
         }
-        match err(load(&data("image/png", &encode(b"BM\x3a\0\0\0")))) {
+        match err(load(&data("image/png", &encode_base64(b"BM\x3a\0\0\0")))) {
             MediaError::Unknown(head) => assert_eq!(head, "424d3a000000"),
             e => panic!("{e}"),
         }
@@ -1147,7 +1149,7 @@ mod tests {
         let patches = p.grid().unwrap();
         assert_eq!((patches.plan.best_w, patches.plan.best_h), (2, 1));
         let jpeg = [0xFF, 0xD8, 0xFF, 0xDB, 0, 4, 0, 0];
-        let broken = load(&data("image/jpeg", &encode(&jpeg))).unwrap();
+        let broken = load(&data("image/jpeg", &encode_base64(&jpeg))).unwrap();
         assert!(matches!(
             err(prepare(&broken, &PLAIN)),
             MediaError::Decode(VisionError::Decode(_))

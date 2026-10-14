@@ -24,6 +24,9 @@ use serde_json::{Value, json};
 use crate::record::{self, Kind, Log, Record};
 use crate::{GateError, die_with_parent, verdict};
 
+/// An image file's bytes as the base64 a `data:` URL carries.
+pub use serve::media::encode_base64 as base64;
+
 /// The longest gap between two reads of the server's stderr in
 /// [`Served::address`]: the `server` record's wall ends at the read that found
 /// the line, so a gate's own `poll` (seconds) must not set its resolution.
@@ -242,30 +245,6 @@ pub fn parse_ids(s: &str) -> Result<Vec<u32>, GateError> {
                 .map_err(|e| format!("id {t:?}: {e}").into())
         })
         .collect()
-}
-
-/// The bytes as standard base64 with padding, the alphabet `serve::media`'s strict decoder
-/// reads.
-pub fn base64(bytes: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for c in bytes.chunks(3) {
-        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
-        out.push(A[(n >> 18) as usize & 63] as char);
-        out.push(A[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 {
-            A[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if c.len() > 2 {
-            A[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// One clause's line, `check <name>: PASS|FAIL`, folded into `ok`.

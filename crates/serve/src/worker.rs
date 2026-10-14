@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::api::{Answers, End, EngineFailure, Stop, Waited, client_gone, relock};
+use crate::api::{Answers, End, EngineFailure, Stop, Waited, client_gone, panic_text, relock};
 use crate::engine::{
     Drafted, EngineError, Sampler, SamplerFactory, Saved, SlotPass, SlotRow, StateError,
 };
@@ -402,12 +402,7 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
     // and drops the engine it holds, which no stop waits for.
     sh.end_loop();
     if let Err(p) = ran {
-        let what = p
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_owned())
-            .or_else(|| p.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "a panic without a message".to_owned());
-        let error = format!("the engine thread panicked: {what}");
+        let error = format!("the engine thread panicked: {}", panic_text(&*p));
         *relock(&sh.fatal) = Some(error.clone());
         drop(relock(&sh.board).kill(&error));
         // The running requests' channels close: their HTTP threads answer

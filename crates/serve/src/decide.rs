@@ -38,11 +38,12 @@ use serde_json::{Value, json};
 
 use crate::api::{
     Answers, End, Ended, JSON, accept, cors_preflight, engine_object, error_body, exit_shutdown,
-    fatal_health, install_signals, keep_alive, key_denied, relock, stopping, stopping_message,
-    wait_end,
+    fatal_health, install_signals, keep_alive, key_denied, panic_text, relock, stopping,
+    stopping_message, wait_end,
 };
 use crate::flag::ApiKeys;
 use crate::http::{self, Request};
+use crate::models::Listed;
 use crate::{EngineFailure, EngineProps, FATAL_LINGER, ServeError};
 
 /// One answered request.
@@ -610,14 +611,7 @@ fn decide(s: &Shared, body: &str) -> Reply {
         Ok(Err(DecideError::Refused(m))) => Reply::error(400, "invalid_request_error", &m),
         Ok(Err(DecideError::NotSupported(m))) => Reply::error(501, "not_supported_error", &m),
         Ok(Err(DecideError::Engine(m))) => s.fail(m),
-        Err(p) => {
-            let what = p
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_owned())
-                .or_else(|| p.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "a panic without a message".to_owned());
-            s.fail(format!("the decider panicked: {what}"))
-        }
+        Err(p) => s.fail(format!("the decider panicked: {}", panic_text(&*p))),
     }
 }
 
@@ -660,10 +654,12 @@ impl DecideServer {
             routes: seated.routes,
             props: props_of(decider.props()).map_err(invalid)?,
             models: crate::models::listing(
-                &seated.name,
+                vec![Listed {
+                    id: &seated.name,
+                    meta: json!({ "n_ctx": seated.n_ctx }),
+                    max_model_len: Some(seated.n_ctx),
+                }],
                 created,
-                json!({ "n_ctx": seated.n_ctx }),
-                Some(seated.n_ctx),
             ),
         };
         let listener = TcpListener::bind(addr)?;
@@ -806,7 +802,14 @@ mod tests {
             fixed: Fixed {
                 routes: ROUTES,
                 props: json!({}),
-                models: crate::models::listing("m.gguf", 0, json!({}), None),
+                models: crate::models::listing(
+                    vec![Listed {
+                        id: "m.gguf",
+                        meta: json!({}),
+                        max_model_len: None,
+                    }],
+                    0,
+                ),
             },
             api_keys,
             engine: "the decider of m.gguf".to_owned(),
