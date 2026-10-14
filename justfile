@@ -33,7 +33,7 @@ default:
 # 빠른 루프: 타입 검사만, 커널은 안 만든다. 의존을 고친 뒤 cargo가 박스 쪽 Cargo.lock을 고쳐 쓰면 lock-back.sh가
 # 그것을 이 트리로 가져온다 — box.sh는 한 방향으로만 싣는다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/clef'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/clef'
     ./tools/lock-back.sh
 
 # check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
@@ -41,7 +41,7 @@ check:
 # V4.1 커널의 컴파일러 결함은 여기가 아니라 op 게이트 빌드에서 드러난다.
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/clef'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/clef'
 
 # The build without `vision` of the bins that refuse an image request by name — serve_seats/ds41.rs:444 and glm.rs:825 (--mmproj),
 # decide.rs:545 (the Qwen3.5 seat's encoder), gate_glm5next_e2e.rs:5146 (--only media-seat). One bin takes one feature set (tools/recipes.py's
@@ -1241,6 +1241,12 @@ gate-gpu-qwen35moe-attn:
 # V 반쪽 둘, 32키 타일)를 모델 없이 합성 입력(rope 4/1·8/2, flash 4/1·16/2 헤드×512, θ 1e6, 스케일 1)으로 호스트 규칙과 f64 정확 어텐션 band에 맞춘다.
 gate-gpu-gemma-embedding2-head512:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding2_head512 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_head512'
+
+# EmbeddingGemma 2's encoder (gpu-gemma-embedding2) end to end on the Q8_0 file (--model FILE, else
+# the path the sets were dumped from): every text case of mainline's card set through one pass, its
+# taps within the CPU twin's band, a rerun bit for bit, and the refusals by name.
+gate-gpu-gemma-embedding2-e2e *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e {{ARGS}}'
 
 # GLM-5.3-Flash MLA 층의 카드 부분 — 잠재 RMS + f16 추가, 인덱서 키 LayerNorm + [키; 게이트] 추가(`latent`),
 # 창 0·싱크 −∞·스케일 1/16으로 다시 쓰는 V4.1 어텐션 — 을 모델 없이 합성 입력으로 호스트 규칙에 맞춘다.

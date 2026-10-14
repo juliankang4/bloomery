@@ -172,6 +172,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-gpu",
  "bloomery-gpu-deepseek41",
+ "bloomery-gpu-gemma-embedding2",
  "bloomery-gpu-glm5next",
  "bloomery-gpu-mimo2",
  "bloomery-gpu-vision",
