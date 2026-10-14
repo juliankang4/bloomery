@@ -1,6 +1,7 @@
 //! P4: every kernel of a decode step that is not a matmul, attention or the
 //! router — the embedding row dequant, rms_norm, rope (the YaRN cos/sin cache
-//! is computed on the host and uploaded; the kernel applies it), swiglu, the
+//! is computed on the host and uploaded; the kernel applies it), swiglu and
+//! the tanh GELU-gated unit (`geglu_tanh`, [`crate::gelu`]'s rule), the
 //! residual add, the routed-expert weighted sum and argmax. One
 //! `#[cuda_module]` in its own file (docs/gpu-design.md decision 6); the
 //! arithmetic bodies are cores above the module so a later fused block kernel
@@ -21,12 +22,14 @@ use crate::GpuError;
 use crate::cores::{funnel16, half_to_f32, q3k_aux_scales, q3k_sub_scale, q4k_scale_min};
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
 use crate::flash::{f32_to_f16_bits, f32x2_to_f16x2_bits};
+use crate::gelu::gelu_tanh_dev;
 use crate::hybrid::HOST;
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use crate::view::{Apply, Elem, Elem2, RopePair};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+use cuda_device::float::mul_rn_f32;
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
@@ -1101,6 +1104,29 @@ mod elem_kernels {
         e.map(silu_mul);
     }
 
+    /// `y[i] = gelu_tanh(gate[i]) · up[i]`, elementwise over `n` values: the
+    /// rule of [`crate::gelu`] on the gate value, then one rounded multiply by
+    /// the up value (llama.cpp's `unary_gated_op_kernel` at `op_gelu`).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (gate.len() >= n, up.len() >= n, y.len() >= n)
+    )]
+    pub fn geglu_tanh(gate: &[f32], up: &[f32], n: u32, mut y: DisjointSlice<f32>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: the `requires` above were launcher-checked, `n` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
+        // guard, and the launch is `domain = 1` with the contract's exact 1-D
+        // block.
+        let e = unsafe { Elem2::new(gate, up, &mut y, i) };
+        e.map(|g, u| mul_rn_f32(gelu_tanh_dev(g), u));
+    }
+
     /// `y[i] = a[i] + b[i]`, elementwise over `n` values — exact; the body
     /// is one add, so nothing is extracted into a core.
     #[kernel]
@@ -2143,6 +2169,35 @@ impl ElemKernels {
             .module
             .prepare_swiglu(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.swiglu(stream, &prep, gate, up, n, y)?;
+        Ok(())
+    }
+
+    /// Enqueue `y = gelu_tanh(gate) · up` over `n` values (flat; token-major
+    /// spans of any width). Asynchronous, allocation-free, capturable.
+    pub fn enqueue_geglu(
+        &self,
+        stream: &CudaStream,
+        gate: &DeviceBuffer<f32>,
+        up: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        if n == 0 || gate.len() < n || up.len() < n || y.len() < n {
+            return Err(GpuError::shape(
+                "enqueue_geglu",
+                format!(
+                    "n={n}, gate.len() {}, up.len() {}, y.len() {}",
+                    gate.len(),
+                    up.len(),
+                    y.len()
+                ),
+            ));
+        }
+        let n = launch_u32("enqueue_geglu", "n", n)?;
+        let prep = self
+            .module
+            .prepare_geglu_tanh(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.geglu_tanh(stream, &prep, gate, up, n, y)?;
         Ok(())
     }
 
