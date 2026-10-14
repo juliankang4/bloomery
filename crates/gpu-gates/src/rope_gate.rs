@@ -1,0 +1,205 @@
+//! The NeoX gates' host inputs, expected outputs, device launch and readback.
+
+use crate::{GateError, bits_equal, verdict};
+use bloomery_gpu::fault::{Fault, FaultSink, FaultSite};
+use bloomery_gpu::rope_neox::PartialNeoxArgs;
+use bloomery_gpu::{Gpu, GpuError};
+use cuda_core::{CudaStream, DeviceBuffer};
+
+/// The bits an untouched f16 cache cell keeps.
+pub const SENTINEL: u16 = 0x5a5a;
+
+/// The rope launch's query, in-place key and cache planes read back.
+pub struct RopeOut {
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub ck: Vec<u16>,
+    pub cv: Vec<u16>,
+}
+
+/// Host rows, gains and position table of a rope launch.
+#[derive(Clone)]
+pub struct RopeIn {
+    pub qg: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub gq: Vec<f32>,
+    pub gk: Vec<f32>,
+    pub table: Vec<f32>,
+}
+
+/// The head and cache geometry the launch reads, and its norm epsilon.
+#[derive(Clone, Copy)]
+pub struct RopeShape {
+    pub head: usize,
+    pub n_head: usize,
+    pub n_kv: usize,
+    pub ctx: usize,
+    pub eps: f32,
+}
+
+/// Expected heads and cache planes under the host NeoX rule.
+#[must_use]
+pub fn expected<const H: usize, const R: usize, const Q: usize>(
+    inp: &RopeIn,
+    pos: &[u32],
+    s: RopeShape,
+) -> RopeOut {
+    assert_eq!(s.head, H);
+    let (nh, nk, ctx) = (s.n_head, s.n_kv, s.ctx);
+    let mut out = RopeOut {
+        q: vec![0.0; pos.len() * nh * H],
+        k: vec![0.0; pos.len() * nk * H],
+        ck: vec![SENTINEL; nk * ctx * H],
+        cv: vec![SENTINEL; nk * ctx * H],
+    };
+    for (t, &p) in pos.iter().enumerate() {
+        let cs = &inp.table[p as usize * R..(p as usize + 1) * R];
+        for h in 0..nh {
+            let src = (t * nh + h) * Q;
+            let dst = (t * nh + h) * H;
+            out.q[dst..dst + H].copy_from_slice(&crate::rounding::neox_head::<H, R>(
+                &inp.qg[src..src + H],
+                &inp.gq,
+                cs,
+                s.eps,
+            ));
+        }
+        for h in 0..nk {
+            let at = (t * nk + h) * H;
+            let y = crate::rounding::neox_head::<H, R>(&inp.k[at..at + H], &inp.gk, cs, s.eps);
+            out.k[at..at + H].copy_from_slice(&y);
+            let row = (h * ctx + p as usize) * H;
+            for d in 0..H {
+                out.ck[row + d] = gguf::quant::f32_to_f16_bits(y[d]);
+                out.cv[row + d] = gguf::quant::f32_to_f16_bits(inp.v[at + d]);
+            }
+        }
+    }
+    out
+}
+
+/// Check exact NeoX output, reruns and isolated cache-position faults.
+pub fn check<const H: usize, const R: usize, const Q: usize>(
+    gpu: &Gpu,
+    inp: &RopeIn,
+    pos: &[u32],
+    s: RopeShape,
+    layer: usize,
+    run_at: impl Fn(&[u32], FaultSink) -> Result<RopeOut, GateError>,
+) -> Result<bool, GateError> {
+    let (m, p0, ctx) = (pos.len(), pos[0], s.ctx);
+    let unl = gpu.unlabelled_sink();
+    let a = run_at(pos, unl)?;
+    let b = run_at(pos, unl)?;
+    let want = expected::<H, R, Q>(inp, pos, s);
+    let q_ok = bits_equal(&a.q, &want.q);
+    let k_ok = bits_equal(&a.k, &want.k);
+    let planes_ok = a.ck == want.ck && a.cv == want.cv;
+    let rerun = bits_equal(&a.q, &b.q) && bits_equal(&a.k, &b.k) && a.ck == b.ck && a.cv == b.cv;
+    let pass = q_ok && k_ok && planes_ok && rerun;
+    println!(
+        "rope m={m} positions {p0}.. ctx={ctx} head {H} rot {R}: q (read at \
+         head stride {Q}) bit_exact_host={q_ok} k in place bit_exact_host={k_ok} \
+         planes_exact={planes_ok} rerun={rerun} {}",
+        verdict(pass)
+    );
+
+    // The last token's position at the cache's height.
+    let bad_t = m - 1;
+    let mut bad = pos.to_vec();
+    bad[bad_t] = u32::try_from(ctx)?;
+    let before = gpu.fault()?;
+    let sink = gpu.layer_sink(layer)?;
+    let r = run_at(&bad, sink)?;
+    let raised = gpu.take_fault()?;
+    let want_fault = Some(Fault::at(u32::try_from(layer)?, FaultSite::CachePos));
+    let (qw, kw) = (s.n_head * H, s.n_kv * H);
+    let others = bits_equal(&r.q[..bad_t * qw], &a.q[..bad_t * qw])
+        && bits_equal(&r.k[..bad_t * kw], &a.k[..bad_t * kw]);
+    let nan = r.q[bad_t * qw..].iter().all(|v| v.is_nan())
+        && r.k[bad_t * kw..].iter().all(|v| v.is_nan());
+    // The clean run minus the bad token's rows: those keep the sentinel.
+    let mut ck_want = a.ck.clone();
+    let mut cv_want = a.cv.clone();
+    for j in 0..s.n_kv {
+        let row = (j * ctx + pos[bad_t] as usize) * H;
+        ck_want[row..row + H].fill(SENTINEL);
+        cv_want[row..row + H].fill(SENTINEL);
+    }
+    let not_appended = r.ck == ck_want && r.cv == cv_want;
+    let again = run_at(pos, unl)?;
+    let clean_after = gpu.fault()?.is_none() && bits_equal(&again.q, &a.q);
+    let fault_ok =
+        before.is_none() && raised == want_fault && others && nan && not_appended && clean_after;
+    println!(
+        "rope fault: token {bad_t} at position {ctx} (the cache's height), layer {layer}: \
+         word {raised:?} (want {want_fault:?}), its heads NaN {nan}, nothing appended \
+         {not_appended}, other tokens bit-identical {others}, clean rerun and word clean \
+         {clean_after} {}",
+        verdict(fault_ok)
+    );
+    Ok(pass && fault_ok)
+}
+
+/// Check distinct positions, enqueue the rope and read its outputs.
+pub fn run(
+    stream: &CudaStream,
+    inp: &RopeIn,
+    pos: &[u32],
+    shape: RopeShape,
+    fault: FaultSink,
+    enqueue: impl FnOnce(&CudaStream, PartialNeoxArgs<'_>) -> Result<(), GpuError>,
+) -> Result<RopeOut, GateError> {
+    assert!(
+        pos.iter().enumerate().all(|(i, p)| !pos[..i].contains(p)),
+        "rope gate: positions must be distinct"
+    );
+    let RopeShape {
+        head,
+        n_head,
+        n_kv,
+        ctx,
+        eps,
+    } = shape;
+    let m = pos.len();
+    let qg = DeviceBuffer::from_host(stream, &inp.qg)?;
+    let mut q = DeviceBuffer::from_host(stream, &vec![0.0f32; m * n_head * head])?;
+    let mut k = DeviceBuffer::from_host(stream, &inp.k)?;
+    let v = DeviceBuffer::from_host(stream, &inp.v)?;
+    let gq = DeviceBuffer::from_host(stream, &inp.gq)?;
+    let gk = DeviceBuffer::from_host(stream, &inp.gk)?;
+    let table = DeviceBuffer::from_host(stream, &inp.table)?;
+    let posd = DeviceBuffer::from_host(stream, pos)?;
+    let plane = vec![SENTINEL; n_kv * ctx * head];
+    let mut ck = DeviceBuffer::from_host(stream, &plane)?;
+    let mut cv = DeviceBuffer::from_host(stream, &plane)?;
+    enqueue(
+        stream,
+        PartialNeoxArgs {
+            qg: &qg,
+            q: &mut q,
+            k: &mut k,
+            v: &v,
+            gq: &gq,
+            gk: &gk,
+            table: &table,
+            pos: &posd,
+            eps,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+            cache_k: &mut ck,
+            cache_v: &mut cv,
+        },
+    )?;
+    stream.synchronize()?;
+    Ok(RopeOut {
+        q: q.to_host_vec(stream)?,
+        k: k.to_host_vec(stream)?,
+        ck: ck.to_host_vec(stream)?,
+        cv: cv.to_host_vec(stream)?,
+    })
+}

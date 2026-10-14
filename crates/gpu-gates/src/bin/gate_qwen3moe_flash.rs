@@ -154,6 +154,7 @@ mod gate {
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{Gpu, GpuError, window};
     use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn, prefill_bound};
+    use bloomery_gpu_gates::prefill_gate::{HostCache, WindowCase, cache, window_refusals};
     use bloomery_gpu_gates::qwen3moe::dev::{SENTINEL_Q8_CODE, SENTINEL_Q8_SCALE};
     use bloomery_gpu_gates::qwen3moe::{f16_logical_bits, step_sets};
     use bloomery_gpu_gates::rounding::{U, gamma};
@@ -845,6 +846,7 @@ mod gate {
         let hc = HostCache {
             kf: kf.to_vec(),
             vf: vf.to_vec(),
+            ctx: g.ctx,
         };
         let cu: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
         let (band, worst) = band_rows(&rows, &cu, &hc, g, &all);
@@ -957,12 +959,6 @@ mod gate {
         Ok(y.to_host_vec(stream)?)
     }
 
-    /// The host side of one cache: f32 values of its f16 planes.
-    struct HostCache {
-        kf: Vec<f32>,
-        vf: Vec<f32>,
-    }
-
     /// Every (row, head) of `y` against its exact value: `q` holds the rows'
     /// query heads token-major, `counts[t]` row `t`'s keys. Returns whether
     /// every value is within its prefill bound, and the largest measured
@@ -979,7 +975,7 @@ mod gate {
         let parts = par_map(counts.len() * n_head, |i| {
             let (t, h) = (i / n_head, i % n_head);
             let n = counts[t];
-            let plane = (h / GROUP) * g.ctx * HEAD;
+            let plane = (h / GROUP) * cache.ctx * HEAD;
             let row = i * HEAD;
             let ex = exact(
                 &q[row..row + HEAD],
@@ -1550,40 +1546,18 @@ mod gate {
                     .into_iter()
                     .map(|v| v * SEED_Q_SCALE)
                     .collect();
-                let to16 =
-                    |v: Vec<f32>| -> Vec<u16> { v.into_iter().map(f32_to_f16_bits).collect() };
-                let kb = to16(activations(HEAD, n_kv * ctx, seed + 1));
-                let vb = to16(activations(HEAD, n_kv * ctx, seed + 2));
-                let hc = HostCache {
-                    kf: kb.iter().map(|&h| half_to_f32(h)).collect(),
-                    vf: vb.iter().map(|&h| half_to_f32(h)).collect(),
-                };
-                let live = p0 + t;
-                let pad = |b: &[u16]| -> Vec<u16> {
-                    b.iter()
-                        .enumerate()
-                        .map(|(i, &h)| if (i / HEAD) % ctx >= live { NAN16 } else { h })
-                        .collect()
-                };
-                let (kc, vc) = (
-                    DeviceBuffer::from_host(stream, &kb)?,
-                    DeviceBuffer::from_host(stream, &vb)?,
-                );
-                let (kn, vn) = (
-                    DeviceBuffer::from_host(stream, &pad(&kb))?,
-                    DeviceBuffer::from_host(stream, &pad(&vb))?,
-                );
+                let c = cache(stream, HEAD, n_kv, ctx, p0 + t, seed + 1)?;
                 let qd = DeviceBuffer::from_host(stream, &q)?;
                 let counts: Vec<u32> = (0..t)
                     .map(|i| u32::try_from(p0 + i + 1))
                     .collect::<Result<_, _>>()?;
-                let y = run_pref(k, gpu, &qd, &counts, (&kc, &vc), &g)?;
-                let y2 = run_pref(k, gpu, &qd, &counts, (&kc, &vc), &g)?;
-                let y_nan = run_pref(k, gpu, &qd, &counts, (&kn, &vn), &g)?;
+                let y = run_pref(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g)?;
+                let y2 = run_pref(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g)?;
+                let y_nan = run_pref(k, gpu, &qd, &counts, (&c.kn, &c.vn), &g)?;
                 let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &y_nan));
                 let cu: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
-                let (band, worst) = band_rows(&q, &cu, &hc, &g, &y);
-                let differ = rows_alone(k, gpu, &q, &counts, (&kc, &vc), &g, &y)?;
+                let (band, worst) = band_rows(&q, &cu, &c.host, &g, &y);
+                let differ = rows_alone(k, gpu, &q, &counts, (&c.kc, &c.vc), &g, &y)?;
                 let pass = rerun && nan_same && band && differ == 0;
                 println!(
                     "prefill seeded T={t} p0={p0} ctx={ctx}: measured/bound {worst:.3e} band={band} \
@@ -1717,15 +1691,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// Windows the kernel's loads cannot take (module doc), on the fault
-    /// check's inputs `q`, `kb`/`vb` and counts `clean`, whose plain launch
-    /// wrote `y`: the same windows at aligned offsets first — `q` two f32
-    /// into its allocation, the planes eight f16 into theirs — accepted and
-    /// bit for bit `y`; then `q` one f32 in (the query staging reads u64
-    /// words) and `kc` or `vc` four f16 in (the tiles copy 16-byte pieces),
-    /// each refused by name before a launch. The last check of the gate: a
-    /// launch through a misaligned window is a sticky error that ends the
-    /// context. Returns whether every check held.
     fn misaligned_refusals(
         k: &FlashGqaPrefill,
         gpu: &Gpu,
@@ -1734,92 +1699,21 @@ mod gate {
         (clean, y): (&[u32], &[f32]),
         g: &Geom,
     ) -> Result<bool, GateError> {
-        let stream = gpu.stream();
-        let (n_head, t) = (g.n_kv * GROUP, clean.len());
-        let qd = DeviceBuffer::from_host(stream, q)?;
-        let (kc, vc) = (
-            DeviceBuffer::from_host(stream, kb)?,
-            DeviceBuffer::from_host(stream, vb)?,
-        );
-        let nk = DeviceBuffer::from_host(stream, clean)?;
-        let q_pad = DeviceBuffer::from_host(stream, &[&[0.0f32; 2][..], q].concat())?;
-        let k_pad = DeviceBuffer::from_host(stream, &[&[0u16; 8][..], kb].concat())?;
-        let v_pad = DeviceBuffer::from_host(stream, &[&[0u16; 8][..], vb].concat())?;
-        let ctx = gpu.context();
-        // SAFETY: each window is `q.len()` f32 starting one or two f32 into
-        // `q_pad`, or `kb.len()` (= `vb.len()`) f16 starting four or eight
-        // f16 into `k_pad` or `v_pad` — inside its own live allocation, which
-        // holds two f32 or eight f16 more than the span. The allocations
-        // outlive every call below, and the windows are given back after them.
-        let (q_al, q_mis, k_al, k_mis, v_al, v_mis) = unsafe {
-            (
-                window::<f32>(q_pad.cu_deviceptr() + 8, q.len(), ctx),
-                window::<f32>(q_pad.cu_deviceptr() + 4, q.len(), ctx),
-                window::<u16>(k_pad.cu_deviceptr() + 16, kb.len(), ctx),
-                window::<u16>(k_pad.cu_deviceptr() + 8, kb.len(), ctx),
-                window::<u16>(v_pad.cu_deviceptr() + 16, vb.len(), ctx),
-                window::<u16>(v_pad.cu_deviceptr() + 8, vb.len(), ctx),
-            )
-        };
-        let ya = run_pref(k, gpu, &q_al, clean, (&*k_al, &*v_al), g)?;
-        let aligned_ok = bits_equal(&ya, y);
-        println!(
-            "prefill windows at aligned offsets (q 8 bytes, kc and vc 16 bytes into their \
-             allocations): accepted, bit-identical to the plain launch {aligned_ok} {}",
-            verdict(aligned_ok)
-        );
-        let mut ok = aligned_ok;
-        let mut ym = DeviceBuffer::<f32>::zeroed(stream, t * n_head * HEAD)?;
-        let cases = [
-            ("q", "4 bytes past an 8-byte boundary", &*q_mis, &kc, &vc),
-            ("kc", "8 bytes past a 16-byte boundary", &qd, &*k_mis, &vc),
-            ("vc", "8 bytes past a 16-byte boundary", &qd, &kc, &*v_mis),
-        ];
-        for (name, off, q_in, kc_in, vc_in) in cases {
-            let r = k.enqueue(
-                stream,
-                GqaPrefillArgs {
-                    q: q_in,
-                    kc: kc_in,
-                    vc: vc_in,
-                    n_keys: &nk,
-                    scale: g.scale,
-                    n_head,
-                    n_kv: g.n_kv,
-                    ctx: g.ctx,
-                    t,
-                    fault: gpu.unlabelled_sink(),
-                    y: &mut ym,
-                },
-            );
-            let named = matches!(
-                r,
-                Err(GpuError::Shape {
-                    what: "flash_gqa_prefill::enqueue",
-                    ref detail,
-                }) if detail.starts_with(&format!("{name} at "))
-            );
-            let seen = match &r {
-                _ if named => "refused by name".to_string(),
-                Ok(()) => format!(
-                    "accepted; the stream then reads {:?}",
-                    stream.synchronize().err().map(|e| e.to_string())
-                ),
-                Err(e) => format!("refused without the name: {e}"),
-            };
-            println!(
-                "prefill refusal {name} window {off}: {seen} {}",
-                verdict(named)
-            );
-            ok &= named;
-        }
-        for w in [q_al, q_mis] {
-            drop(ManuallyDrop::into_inner(w).into_raw_parts());
-        }
-        for w in [k_al, k_mis, v_al, v_mis] {
-            drop(ManuallyDrop::into_inner(w).into_raw_parts());
-        }
-        Ok(ok)
+        window_refusals(
+            gpu,
+            "flash_gqa_prefill::enqueue",
+            "prefill",
+            WindowCase {
+                q,
+                planes: (kb, vb),
+                counts: clean,
+                y,
+                heads: (g.n_kv * GROUP, g.n_kv),
+                ctx: g.ctx,
+                scale: g.scale,
+            },
+            |s, args| k.enqueue(s, args),
+        )
     }
 
     /// One pass's measured-over-bound ratios over a set, and the plain

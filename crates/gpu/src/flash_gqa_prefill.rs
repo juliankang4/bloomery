@@ -189,27 +189,41 @@ const ROW_WORDS: usize = HEAD / 2;
 const TILE_WORDS: usize = KEY_TILE * ROW_WORDS;
 const KEY_TILE_U32: u32 = KEY_TILE as u32;
 
-/// The staged word of word `w` of tile row `row`: rows `ROW_WORDS` apart,
-/// 16-byte chunk `w / 4` stored at chunk `(w / 4) ^ (row & 7)`. The one owner
-/// of the tile layout: every staging store and `cp.async` destination goes
-/// through it, and every `ldmatrix` address is a lane base taken from it plus
-/// an offset [`staged_offsets_hold`] proves.
-#[inline(always)]
-const fn staged_word(row: usize, w: usize) -> usize {
-    row * ROW_WORDS + ((((w >> 2) ^ (row & 7)) << 2) | (w & 3))
+/// The tile permutation, expanded inside each width's address helper.
+macro_rules! staged {
+    (@offset $xor:expr, $w:expr) => {
+        ((($w >> 2) ^ $xor) << 2) | ($w & 3)
+    };
+    ($row:expr, $w:expr, $row_words:expr) => {
+        $row * $row_words + staged!(@offset $row & 7, $w)
+    };
 }
 
-/// The layout's sector facts, over the eight rows `row & 7` distinguishes:
-/// every logical 32-byte pair of chunks lands in one aligned 32-byte sector,
-/// and every chunk stays in its 128-byte half of the row.
-const fn staged_pairs_hold() -> bool {
+/// The staged word of word `w` of row `row` in a tile of `row_words`-word
+/// rows: `flash_gqa_prefill`'s permutation within each 128-byte line.
+#[inline(always)]
+pub(crate) const fn staged(row: usize, w: usize, row_words: usize) -> usize {
+    staged!(row, w, row_words)
+}
+
+/// The layout's facts over a tile of `rows` rows of `row_words` words: every
+/// chunk stays in its 128-byte line and every logical 32-byte pair of chunks
+/// in one aligned 32-byte sector; word `w` of row `row` is the same word of
+/// row `row % 8` in the first line plus whole rows and whole lines, so an
+/// address `8·i` rows or a line further on is a lane's address plus a
+/// constant.
+pub(crate) const fn layout_holds(rows: usize, row_words: usize) -> bool {
     let mut row = 0;
-    while row < 8 {
+    while row < rows {
         let mut w = 0;
-        while w < ROW_WORDS {
-            let at = staged_word(row, w) - row * ROW_WORDS;
-            let mate = staged_word(row, w ^ 4) - row * ROW_WORDS;
-            if at / 8 != mate / 8 || at / 32 != w / 32 {
+        while w < row_words {
+            let at = staged(row, w, row_words) - row * row_words;
+            let mate = staged(row, w ^ 4, row_words) - row * row_words;
+            let base = staged(row % 8, w % LINE, row_words);
+            if at / LINE != w / LINE
+                || at / 8 != mate / 8
+                || staged(row, w, row_words) != base + (row - row % 8) * row_words + (w - w % LINE)
+            {
                 return false;
             }
             w += 1;
@@ -217,32 +231,18 @@ const fn staged_pairs_hold() -> bool {
         row += 1;
     }
     true
+}
+
+/// The staged word in a row of `HEAD` values.
+#[inline(always)]
+const fn staged_word(row: usize, w: usize) -> usize {
+    staged!(row, w, ROW_WORDS)
 }
 
 /// u32 words of half a staged row: the XOR never crosses it. An `ldmatrix`
 /// step reads a pair of chunks (8 words), so a half-row is HALF_PAIRS steps.
 const HALF_ROW: usize = ROW_WORDS / 2;
 const HALF_PAIRS: usize = HALF_ROW / 8;
-
-/// The layout's offsets, over a whole tile: word `w` of row `row` is the same
-/// word of row `row % 8` in the first half-row plus whole rows and a whole
-/// half-row — so an address `8·i` rows or a half-row further on is the same
-/// lane's address plus a constant.
-const fn staged_offsets_hold() -> bool {
-    let mut row = 0;
-    while row < KEY_TILE {
-        let mut w = 0;
-        while w < ROW_WORDS {
-            let base = staged_word(row % 8, w % HALF_ROW);
-            if staged_word(row, w) != base + (row - row % 8) * ROW_WORDS + (w - w % HALF_ROW) {
-                return false;
-            }
-            w += 1;
-        }
-        row += 1;
-    }
-    true
-}
 
 const _: () = assert!(GROUP == 8 && Q_ROWS == WARPS * 16 && Q_ROWS <= KEY_TILE);
 const _: () = assert!(PASS_KEYS * ROW_CHUNKS == THREADS && PASS_KEYS * CHUNKS == KEY_TILE);
@@ -258,8 +258,7 @@ const _: () = assert!(KEY_TILE.is_multiple_of(8));
 // A thread's copies of a tile are PASS_KEYS rows apart and so share `row & 7`:
 // its destinations are one constant plus a pass stride.
 const _: () = assert!(PASS_KEYS.is_multiple_of(8));
-const _: () = assert!(staged_pairs_hold());
-const _: () = assert!(staged_offsets_hold());
+const _: () = assert!(layout_holds(KEY_TILE, ROW_WORDS));
 const _: () = assert!(CHUNKS * THREADS == KEY_TILE * ROW_CHUNKS);
 const _: () = assert!(Q_WORDS * THREADS == Q_ROWS * Q_PAIRS);
 // Pass `e` of a thread is row `Q_ROW_STEP·e + tid / Q_PAIRS`: position
@@ -285,7 +284,7 @@ fn blocks_for(t: usize, n_kv: usize) -> usize {
 /// weight reaches — is `dev_exp`'s bit for bit. Never for a rescale factor,
 /// which multiplies the accumulators unrounded.
 #[inline(always)]
-fn exp_weight(x: f32) -> f32 {
+pub(crate) fn exp_weight(x: f32) -> f32 {
     cuda_device::float::ex2_approx_ftz_f32(x * std::f32::consts::LOG2_E)
 }
 
@@ -297,7 +296,7 @@ fn exp_weight(x: f32) -> f32 {
 /// the two zeros as equal. The walk's running maxima start at −∞ and are
 /// never NaN, so the two-NaN case does not occur.
 #[inline(always)]
-fn fmax(a: f32, b: f32) -> f32 {
+pub(crate) fn fmax(a: f32, b: f32) -> f32 {
     let r: f32;
     // SAFETY: a register-only arithmetic instruction; no memory is touched.
     unsafe {
@@ -376,59 +375,17 @@ const _: () = assert!(DYN_BYTES_256 == 98_304);
 // The launch contract spells GROUP and HEAD_256 out as 8 and 256.
 const _: () = assert!(GROUP == 8 && HEAD_256 == 256);
 
-/// [`staged_word`] for rows of `HEAD_256` values: chunk `w / 4` of row `row`
-/// stored at chunk `(w / 4) ^ (row & 7)` — the XOR stays inside the chunk's
-/// 128-byte line.
+/// The staged word in a row of `HEAD_256` values.
 #[inline(always)]
 const fn staged_word_256(row: usize, w: usize) -> usize {
-    row * ROW_WORDS_256 + ((((w >> 2) ^ (row & 7)) << 2) | (w & 3))
-}
-
-/// The layout's sector facts over the eight rows `row & 7` distinguishes:
-/// every logical 32-byte pair of chunks lands in one aligned 32-byte sector,
-/// and every chunk stays in its 128-byte line.
-const fn staged_pairs_hold_256() -> bool {
-    let mut row = 0;
-    while row < 8 {
-        let mut w = 0;
-        while w < ROW_WORDS_256 {
-            let at = staged_word_256(row, w) - row * ROW_WORDS_256;
-            let mate = staged_word_256(row, w ^ 4) - row * ROW_WORDS_256;
-            if at / 8 != mate / 8 || at / LINE != w / LINE {
-                return false;
-            }
-            w += 1;
-        }
-        row += 1;
-    }
-    true
-}
-
-/// The layout's offsets over a tile: word `w` of row `row` is the same word
-/// of row `row % 8` in the first line plus whole rows and whole lines — so an
-/// address `8·i` rows or a line further on is the same lane's address plus a
-/// constant.
-const fn staged_offsets_hold_256() -> bool {
-    let mut row = 0;
-    while row < KEY_TILE {
-        let mut w = 0;
-        while w < ROW_WORDS_256 {
-            let base = staged_word_256(row % 8, w % LINE);
-            if staged_word_256(row, w) != base + (row - row % 8) * ROW_WORDS_256 + (w - w % LINE) {
-                return false;
-            }
-            w += 1;
-        }
-        row += 1;
-    }
-    true
+    staged!(row, w, ROW_WORDS_256)
 }
 
 const _: () = assert!(Q_ROWS_256 == SLICES_256 * 16 && Q_ROWS_256 <= KEY_TILE);
 const _: () = assert!(PASS_KEYS_256 * ROW_CHUNKS_256 == THREADS_256);
 const _: () = assert!(PASS_KEYS_256 * CHUNKS_256 == KEY_TILE && PASS_KEYS_256.is_multiple_of(8));
 const _: () = assert!((ROW_WORDS_256 * 4).is_multiple_of(128) && ROW_CHUNKS_256.is_multiple_of(8));
-const _: () = assert!(staged_pairs_hold_256() && staged_offsets_hold_256());
+const _: () = assert!(layout_holds(KEY_TILE, ROW_WORDS_256));
 const _: () = assert!(Q_WORDS_256 * THREADS_256 == Q_ROWS_256 * Q_PAIRS_256);
 const _: () = assert!(Q_ROW_STEP_256 * Q_PAIRS_256 == THREADS_256);
 const _: () = assert!(Q_POS_PASSES_256 * Q_ROW_STEP_256 == GROUP);
@@ -468,33 +425,29 @@ const fn q_oct_hold() -> bool {
 /// `g = lane / 4 < 8`: rows are `position·PACK + head`. A pack of eight is one
 /// position a row half, so the lane's index does not enter.
 #[inline(always)]
-const fn row_pos<const PACK: usize>(g: usize, h: usize) -> usize {
+pub(crate) const fn row_pos<const PACK: usize>(g: usize, h: usize) -> usize {
     if PACK >= 8 { h } else { (g + 8 * h) / PACK }
 }
 
 /// The head within the pack of fragment row `g + 8·h` (the same for both
 /// halves, as `PACK` divides eight).
 #[inline(always)]
-const fn row_head<const PACK: usize>(g: usize) -> usize {
+pub(crate) const fn row_head<const PACK: usize>(g: usize) -> usize {
     if PACK >= 8 { g } else { g % PACK }
 }
 
-/// The geometry of [`prefill_256_p`] at `PACK`: a block's `Q_ROWS_256` staged
-/// rows are its `Q_ROWS_256 / PACK` positions × `PACK` heads, position-major.
-/// Every fragment row `16·rs + g + 8·h` of every warp is the staged row of
-/// slice position `row_pos` and head `row_head` of its slice, each (position,
-/// head) once over the four slices; every query staging pass `e` of thread
-/// row `r0` writes staged row `Q_ROW_STEP_256·e + r0` from position `e / (PACK
-/// / Q_ROW_STEP_256)` and head `Q_ROW_STEP_256·(e % (PACK / Q_ROW_STEP_256)) +
-/// r0`, each staged row once.
-const fn pack_rows_hold<const PACK: usize>() -> bool {
-    if PACK == 0 || !8usize.is_multiple_of(PACK) || !PACK.is_multiple_of(Q_ROW_STEP_256) {
+/// The fragment row maps of a prefill block at `PACK`: every fragment row `16·rs +
+/// g + 8·h` of every warp is the staged row of slice position `row_pos` and
+/// head `row_head` of its slice, each staged row `lp·PACK + j` of the block
+/// once over `slices` slices.
+pub(crate) const fn pack_rows_hold<const PACK: usize>(slices: usize) -> bool {
+    if slices == 0 || slices > 4 || PACK == 0 || !8usize.is_multiple_of(PACK) {
         return false;
     }
     let pps = SLICE_ROWS / PACK;
     let mut seen = 0u64;
     let mut rs = 0;
-    while rs < SLICES_256 {
+    while rs < slices {
         let mut g = 0;
         while g < 8 {
             let mut h = 0;
@@ -511,7 +464,12 @@ const fn pack_rows_hold<const PACK: usize>() -> bool {
         }
         rs += 1;
     }
-    if seen != u64::MAX {
+    seen == u64::MAX >> (64 - SLICE_ROWS * slices)
+}
+
+/// Every query staging pass of the packed 256 body covers its row once.
+const fn pack_staging_holds<const PACK: usize>() -> bool {
+    if !pack_rows_hold::<PACK>(SLICES_256) || !PACK.is_multiple_of(Q_ROW_STEP_256) {
         return false;
     }
     let qpp = PACK / Q_ROW_STEP_256;
@@ -537,8 +495,11 @@ const _: () = assert!(Q_OCT_PASSES_256 * Q_ROW_STEP_256 == 8);
 const _: () = assert!(q_oct_hold());
 // The `_p4` and `_p2` layouts, and at `GROUP` the eight-head entry's staged
 // rows.
-const _: () =
-    assert!(pack_rows_hold::<GROUP>() && pack_rows_hold::<PACK_4>() && pack_rows_hold::<PACK_2>());
+const _: () = assert!(
+    pack_staging_holds::<GROUP>()
+        && pack_staging_holds::<PACK_4>()
+        && pack_staging_holds::<PACK_2>()
+);
 // The `_p4` instance of `prefill_256_p` (its generic const blocks run only
 // when the device build instantiates it, this one in every check).
 const _: () = assert!(
@@ -561,8 +522,8 @@ const _: () = assert!(
 /// [`staged_word`]/[`staged_word_256`]: the 16-byte chunk `w/4` stored at
 /// chunk `(w/4) ^ xor`, `xor` the row's `row & 7`.
 #[inline(always)]
-const fn staged_off(xor: usize, w: usize) -> usize {
-    (((w >> 2) ^ xor) << 2) | (w & 3)
+pub(crate) const fn staged_off(xor: usize, w: usize) -> usize {
+    staged!(@offset xor, w)
 }
 
 /// One staged row's in-place widening, as a macro: a pointer into the
@@ -737,6 +698,7 @@ macro_rules! prefill_softmax {
         }
     }};
 }
+pub(crate) use prefill_softmax;
 
 /// The row counts a PACK-generic body's walk uses, written once and expanded
 /// in each, as `dequant_row!` is: it binds the `out` names in the caller. Slice `s` is
@@ -822,6 +784,7 @@ macro_rules! prefill_pack_counts {
         }
     };
 }
+pub(crate) use prefill_pack_counts;
 
 /// The end of a PACK-generic body's walk, written once and expanded in each,
 /// as `dequant_row!` is: each row's sum over its four lanes `(l + l^1) +
@@ -879,6 +842,8 @@ macro_rules! prefill_pack_store {
         }
     };
 }
+pub(crate) use prefill_pack_store;
+
 /// One 256-value-head scales tile of the q8 staging: `KEY_TILE` rows of
 /// `HEAD_256/32` u16.
 const Q8_SCALE_TILE_256: usize = KEY_TILE * (HEAD_256 / 32);
@@ -899,11 +864,11 @@ const _: () = assert!(DYN_BYTES_256_Q8 == 100_352);
 /// `gqa_prefill_flash_256_p4` (`PACK = 4`), `gqa_prefill_flash_256_p2`
 /// (`PACK = 2`) and, over [`Q8Kv`], `gqa_prefill_flash_256_q8` (`PACK = 8`).
 /// `gqa_prefill_flash_256` keeps its own body; this PACK-generic one computes
-/// each row as that body does ([`pack_rows_hold`] at `GROUP` is its layout).
+/// each row as that body does ([`pack_staging_holds`] at `GROUP` is its layout).
 /// Block `b` is unit `r = b % (n_kv · packs)` — key head `r / packs`, query
 /// heads `head0 = r·PACK ..` — and query tile `n_tiles − 1 − b / (n_kv ·
 /// packs)`, rows `(Q_ROWS_256 / PACK)·tile ..` of `t_rows`; a row slice is
-/// `SLICE_ROWS / PACK` positions × `PACK` heads ([`pack_rows_hold`]). Row `t`'s query head `head0 + j` is read at `q[(t ·
+/// `SLICE_ROWS / PACK` positions × `PACK` heads ([`pack_staging_holds`]). Row `t`'s query head `head0 + j` is read at `q[(t ·
 /// n_head + head0 + j)·256 ..]` and its output written at the same index of
 /// `y`. The key tile, the value tile and the score exchange live in the
 /// block's dynamic shared memory, and a q8 cache's two scales tiles after
@@ -946,7 +911,7 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const LOWER: 
     fault: FaultSink,
     mut y: DisjointSlice<f32>,
 ) {
-    const { assert!(pack_rows_hold::<PACK>() && SLICE_POS * PACK == SLICE_ROWS) };
+    const { assert!(pack_staging_holds::<PACK>() && SLICE_POS * PACK == SLICE_ROWS) };
     const { assert!(SLICES_256 * SLICE_POS == Q_ROWS_256 / PACK) };
     // Positions a block covers, and a row slice's.
     let positions = Q_ROWS_256 / PACK;
@@ -1044,7 +1009,7 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const LOWER: 
         }
     }
     // The staged word of each pass of the first eight rows; a later pass's is
-    // it plus whole groups of eight rows (staged_offsets_hold_256).
+    // it plus whole groups of eight rows (layout_holds).
     let mut q_at = [0usize; Q_OCT_PASSES_256];
     for j in 0..Q_OCT_PASSES_256 {
         cuda_device::thread::__unroll_config::<0>();
@@ -1330,7 +1295,7 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const LOWER: 
                         + (4 * (16 * nj * ROW_WORDS_256 + LINE * (kk / LINE_PAIRS))) as u32;
                     // SAFETY: the row is below KEY_TILE and the chunk is
                     // whole inside KT (staged_word_256,
-                    // staged_offsets_hold_256), published by the barrier
+                    // layout_holds), published by the barrier
                     // above; every lane issues the load, then both
                     // `mma.sync` with its own fragments.
                     unsafe {
@@ -1587,7 +1552,7 @@ mod flash_gqa_prefill_kernels {
             }
         }
         // The staged word of each pass of the first position; a later
-        // position's is it plus whole groups of rows (staged_offsets_hold).
+        // position's is it plus whole groups of rows (layout_holds).
         let mut q_at = [0usize; Q_POS_PASSES];
         for j in 0..Q_POS_PASSES {
             cuda_device::thread::__unroll_config::<0>();
@@ -1687,7 +1652,7 @@ mod flash_gqa_prefill_kernels {
         // first half-row, one per chunk pair `j`: the scores' key row and
         // chunk `2·j + (lane/8) % 2`, the values' row and chunk `2·j +
         // lane/16`. Every other address of the walk is one of these plus a
-        // constant (`staged_offsets_hold`).
+        // constant (`layout_holds`).
         let k_row = lane % 8 + 8 * (lane / 16);
         let v_row = lane % 8 + 8 * ((lane / 8) % 2);
         let mut k_at = [0u32; HALF_PAIRS];
@@ -1744,7 +1709,7 @@ mod flash_gqa_prefill_kernels {
                         let at = k_at[kk % HALF_PAIRS]
                             + (4 * (16 * nj * ROW_WORDS + HALF_ROW * (kk / HALF_PAIRS))) as u32;
                         // SAFETY: the row is below KEY_TILE and the chunk is
-                        // whole inside KT (staged_word, staged_offsets_hold),
+                        // whole inside KT (staged_word, layout_holds),
                         // published by the barrier above; every lane issues
                         // the load, then both `mma.sync` with its own
                         // fragments.
@@ -1808,7 +1773,7 @@ mod flash_gqa_prefill_kernels {
                         let at = v_at[nd % HALF_PAIRS]
                             + (4 * (16 * kk2 * ROW_WORDS + HALF_ROW * (nd / HALF_PAIRS))) as u32;
                         // SAFETY: the row is below KEY_TILE and the chunk is
-                        // whole inside VT (staged_word, staged_offsets_hold),
+                        // whole inside VT (staged_word, layout_holds),
                         // published by the barrier above; every lane issues
                         // the load, then both `mma.sync` with its own
                         // fragments.
@@ -2154,7 +2119,7 @@ mod flash_gqa_prefill_kernels {
                             + (4 * (16 * nj * ROW_WORDS_256 + LINE * (kk / LINE_PAIRS))) as u32;
                         // SAFETY: the row is below KEY_TILE and the chunk is
                         // whole inside KT (staged_word_256,
-                        // staged_offsets_hold_256), published by the barrier
+                        // layout_holds), published by the barrier
                         // above; every lane issues the load, then both
                         // `mma.sync` with its own fragments.
                         unsafe {
@@ -2664,7 +2629,7 @@ mod flash_gqa_prefill_kernels {
             }
         }
         // The staged word of each pass of the first position; a later
-        // position's is it plus whole groups of rows (staged_offsets_hold).
+        // position's is it plus whole groups of rows (layout_holds).
         let mut q_at = [0usize; Q_POS_PASSES];
         for j in 0..Q_POS_PASSES {
             cuda_device::thread::__unroll_config::<0>();
@@ -2791,7 +2756,7 @@ mod flash_gqa_prefill_kernels {
         // first half-row, one per chunk pair `j`: the scores' key row and
         // chunk `2·j + (lane/8) % 2`, the values' row and chunk `2·j +
         // lane/16`. Every other address of the walk is one of these plus a
-        // constant (`staged_offsets_hold`).
+        // constant (`layout_holds`).
         let k_row = lane % 8 + 8 * (lane / 16);
         let v_row = lane % 8 + 8 * ((lane / 8) % 2);
         let mut k_at = [0u32; HALF_PAIRS];
@@ -2869,7 +2834,7 @@ mod flash_gqa_prefill_kernels {
                         let at = k_at[kk % HALF_PAIRS]
                             + (4 * (16 * nj * ROW_WORDS + HALF_ROW * (kk / HALF_PAIRS))) as u32;
                         // SAFETY: the row is below KEY_TILE and the chunk is
-                        // whole inside KT (staged_word, staged_offsets_hold),
+                        // whole inside KT (staged_word, layout_holds),
                         // published by the barrier above; every lane issues
                         // the load, then both `mma.sync` with its own
                         // fragments.
@@ -2947,7 +2912,7 @@ mod flash_gqa_prefill_kernels {
                         let at = v_at[nd % HALF_PAIRS]
                             + (4 * (16 * kk2 * ROW_WORDS + HALF_ROW * (nd / HALF_PAIRS))) as u32;
                         // SAFETY: the row is below KEY_TILE and the chunk is
-                        // whole inside VT (staged_word, staged_offsets_hold),
+                        // whole inside VT (staged_word, layout_holds),
                         // published by the barrier above; every lane issues
                         // the load, then both `mma.sync` with its own
                         // fragments.
@@ -3013,6 +2978,67 @@ pub struct GqaPrefillArgs<'a> {
     pub t: usize,
     pub fault: FaultSink,
     pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// Validate a packed f16 prefill launch and return packs per key head.
+pub(crate) fn checked_packed(
+    what: &'static str,
+    a: &GqaPrefillArgs<'_>,
+    (head, tile, pack): (usize, usize, usize),
+) -> Result<usize, GpuError> {
+    let (n_head, n_kv, ctx, t) = (a.n_head, a.n_kv, a.ctx, a.t);
+    if n_kv == 0 || ctx == 0 || t == 0 {
+        return Err(GpuError::shape(
+            what,
+            format!("need n_kv, ctx and t >= 1, got n_kv={n_kv} ctx={ctx} t={t}"),
+        ));
+    }
+    if n_head == 0 || !n_head.is_multiple_of(n_kv * pack) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the kernel packs {pack} query heads a block, so the group must be a \
+                 multiple of {pack}; got {n_head} heads over {n_kv}"
+            ),
+        ));
+    }
+    let packs = n_head / (n_kv * pack);
+    let lens = [
+        ("q", a.q.len(), t * n_head * head),
+        ("kc", a.kc.len(), n_kv * ctx * head),
+        ("vc", a.vc.len(), n_kv * ctx * head),
+        ("n_keys", a.n_keys.len(), t),
+        ("y", a.y.len(), t * n_head * head),
+    ];
+    if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+        return Err(GpuError::shape(
+            what,
+            format!("{name}.len() {got} < {need}"),
+        ));
+    }
+    // A window at another offset is a misaligned access on the card.
+    let starts = [
+        ("q", a.q.cu_deviceptr(), 8u64),
+        ("kc", a.kc.cu_deviceptr(), 16),
+        ("vc", a.vc.cu_deviceptr(), 16),
+    ];
+    if let Some((name, at, align)) = starts
+        .iter()
+        .find(|(_, at, align)| !at.is_multiple_of(*align))
+    {
+        return Err(GpuError::shape(
+            what,
+            format!("{name} at {at:#x} is not {align}-byte aligned"),
+        ));
+    }
+    // The walk counts keys in u32 up to one tile past the largest count.
+    if ctx > u32::MAX as usize - tile {
+        return Err(GpuError::shape(
+            what,
+            format!("ctx = {ctx}: the key walk counts to ctx + {tile} in u32"),
+        ));
+    }
+    Ok(packs)
 }
 
 /// [`GqaPrefillArgs`]' q8_0 form: the same query rows, counts and output,
@@ -3293,69 +3319,26 @@ impl FlashGqaPrefill {
         pack: usize,
         k_first: Option<&DeviceBuffer<u32>>,
     ) -> Result<(), GpuError> {
+        let packs = checked_packed(what, &args, (HEAD_256, KEY_TILE, pack))?;
         let GqaPrefillArgs {
             q,
             kc,
             vc,
             n_keys,
             scale,
-            n_head,
+            n_head: _,
             n_kv,
             ctx,
             t,
             fault,
             y,
         } = args;
-        if n_kv == 0 || ctx == 0 || t == 0 {
-            return Err(GpuError::shape(
-                what,
-                format!("need n_kv, ctx and t >= 1, got n_kv={n_kv} ctx={ctx} t={t}"),
-            ));
-        }
-        if n_head == 0 || !n_head.is_multiple_of(n_kv * pack) {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "the kernel packs {pack} query heads a block, so the group must be a \
-                     multiple of {pack}; got {n_head} heads over {n_kv}"
-                ),
-            ));
-        }
-        let packs = n_head / (n_kv * pack);
-        let lens = [
-            ("q", q.len(), t * n_head * HEAD_256),
-            ("kc", kc.len(), n_kv * ctx * HEAD_256),
-            ("vc", vc.len(), n_kv * ctx * HEAD_256),
-            ("n_keys", n_keys.len(), t),
-            ("k_first", k_first.map_or(t, DeviceBuffer::len), t),
-            ("y", y.len(), t * n_head * HEAD_256),
-        ];
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-            return Err(GpuError::shape(
-                what,
-                format!("{name}.len() {got} < {need}"),
-            ));
-        }
-        // A window at another offset is a misaligned access on the card.
-        let starts = [
-            ("q", q.cu_deviceptr(), 8u64),
-            ("kc", kc.cu_deviceptr(), 16),
-            ("vc", vc.cu_deviceptr(), 16),
-        ];
-        if let Some((name, at, align)) = starts
-            .iter()
-            .find(|(_, at, align)| !at.is_multiple_of(*align))
+        if let Some(first) = k_first
+            && first.len() < t
         {
             return Err(GpuError::shape(
                 what,
-                format!("{name} at {at:#x} is not {align}-byte aligned"),
-            ));
-        }
-        // The walk counts keys in u32 up to one tile past the largest count.
-        if ctx > u32::MAX as usize - KEY_TILE {
-            return Err(GpuError::shape(
-                what,
-                format!("ctx = {ctx}: the key walk counts to ctx + {KEY_TILE} in u32"),
+                format!("k_first.len() {} < {t}", first.len()),
             ));
         }
         let grid = launch_u32(what, "grid", t.div_ceil(Q_ROWS_256 / pack) * n_kv * packs)?;

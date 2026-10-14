@@ -38,6 +38,8 @@ pub mod model_file;
 #[cfg(feature = "gpu")]
 pub mod nodes;
 pub mod oracle;
+#[cfg(feature = "gpu")]
+pub mod prefill_gate;
 pub mod prompts;
 pub mod ptx;
 pub mod q36_fixture;
@@ -48,6 +50,8 @@ pub mod record;
 pub mod residency;
 #[cfg(feature = "gpu")]
 pub mod residency38;
+#[cfg(feature = "gpu")]
+pub mod rope_gate;
 pub mod rounding;
 #[cfg(feature = "deepseek41")]
 pub mod serve_client;

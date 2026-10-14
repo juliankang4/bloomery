@@ -213,16 +213,18 @@ mod gate {
         DIM as IDX_DIM, HEADS as IDX_HEADS, MAX_ROWS, POOL, PoolArgs, QsaKernels, QsaScratch,
         ROT as IDX_ROT, SelectArgs, list_width, pools_for,
     };
-    use bloomery_gpu::rope_neox::{
-        PartialNeoxArgs, ROT_256 as ROT, RopeNeoxKernels, owned_pair, q8_plane_lens,
-    };
+    use bloomery_gpu::rope_neox::{ROT_256 as ROT, RopeNeoxKernels, q8_plane_lens};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::route_core::sigmoid;
     use bloomery_gpu::weights::q8_0_planes;
-    use bloomery_gpu::{Gpu, GpuError, Q8Act, window};
+    use bloomery_gpu::{Gpu, GpuError, Q8Act};
     use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn, prefill_bound};
+    use bloomery_gpu_gates::prefill_gate::{
+        HostCache, WindowCase, Windows, cache, window_refusals,
+    };
     use bloomery_gpu_gates::qwen3moe::dev::{SENTINEL_Q8_CODE, SENTINEL_Q8_SCALE};
-    use bloomery_gpu_gates::rounding::{U, U_F32, butterfly, gamma};
+    use bloomery_gpu_gates::rope_gate::{self, RopeIn, RopeOut, RopeShape, SENTINEL};
+    use bloomery_gpu_gates::rounding::{U, U_F32, butterfly, gamma, neox_head};
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
         GateError, Layout, RefManifest, RowKind, activations, bits_equal, checks_failed, data_dir,
@@ -237,7 +239,6 @@ mod gate {
     use refset::arch::qwen35moe::fixture as fx;
     use refset::arch::qwen35moe::{BATCH, IK, MODEL};
     use runtime::qsa::{Qsa, select as qsa_select};
-    use std::mem::ManuallyDrop;
 
     /// The model's attention shape.
     const N_HEAD: usize = 16;
@@ -251,7 +252,6 @@ mod gate {
     /// An f16 NaN the padded rows are overwritten with; the plane sentinel
     /// the rope check starts from.
     const NAN16: u16 = 0x7e00;
-    const SENTINEL: u16 = 0x5a5a;
 
     /// The rope check's tokens and their first position, and the cache height.
     const ROPE_M: usize = 7;
@@ -416,54 +416,6 @@ mod gate {
 
     // ------------------------------------------------------------ rope
 
-    /// One head's norm and partial turn, the kernel's rule: `x` the head's 256
-    /// values, `cs` its position's 64 table values.
-    fn head_rule(x: &[f32], gain: &[f32], cs: &[f32]) -> Vec<f32> {
-        let lanes: Vec<f64> = (0..HEAD / 2)
-            .map(|t| {
-                let (i0, i1) = owned_pair(HEAD, ROT, t);
-                f64::from(x[i0] * x[i0]) + f64::from(x[i1] * x[i1])
-            })
-            .collect();
-        let warp = |w: usize| -> f64 {
-            let v: [f64; 32] = lanes[32 * w..32 * w + 32]
-                .try_into()
-                .expect("a warp is 32 lanes");
-            butterfly(v)
-        };
-        let sum = ((warp(0) + warp(1)) + warp(2)) + warp(3);
-        let mean = (sum / HEAD as f64) as f32;
-        let scale = 1.0 / (mean + EPS).sqrt();
-        let mut y: Vec<f32> = x.iter().zip(gain).map(|(&v, &g)| (scale * g) * v).collect();
-        for i in 0..ROT / 2 {
-            let (c, s) = (cs[2 * i], cs[2 * i + 1]);
-            let (x0, x1) = (y[i], y[i + ROT / 2]);
-            y[i] = x0.mul_add(c, -(x1 * s));
-            y[i + ROT / 2] = x0.mul_add(s, x1 * c);
-        }
-        y
-    }
-
-    /// The rope launch's outputs read back: the query rows, the key rows (in
-    /// place) and the two planes.
-    struct RopeOut {
-        q: Vec<f32>,
-        k: Vec<f32>,
-        ck: Vec<u16>,
-        cv: Vec<u16>,
-    }
-
-    /// The rope check's inputs on the host.
-    #[derive(Clone)]
-    struct RopeIn {
-        qg: Vec<f32>,
-        k: Vec<f32>,
-        v: Vec<f32>,
-        gq: Vec<f32>,
-        gk: Vec<f32>,
-        table: Vec<f32>,
-    }
-
     fn rope_run(
         kern: &RopeNeoxKernels,
         stream: &CudaStream,
@@ -471,73 +423,20 @@ mod gate {
         pos: &[u32],
         fault: FaultSink,
     ) -> Result<RopeOut, GateError> {
-        let m = pos.len();
-        let qg = DeviceBuffer::from_host(stream, &inp.qg)?;
-        let mut q = DeviceBuffer::from_host(stream, &vec![0.0f32; m * N_HEAD * HEAD])?;
-        let mut k = DeviceBuffer::from_host(stream, &inp.k)?;
-        let v = DeviceBuffer::from_host(stream, &inp.v)?;
-        let gq = DeviceBuffer::from_host(stream, &inp.gq)?;
-        let gk = DeviceBuffer::from_host(stream, &inp.gk)?;
-        let table = DeviceBuffer::from_host(stream, &inp.table)?;
-        let posd = DeviceBuffer::from_host(stream, pos)?;
-        let plane = vec![SENTINEL; N_KV * ROPE_CTX * HEAD];
-        let mut ck = DeviceBuffer::from_host(stream, &plane)?;
-        let mut cv = DeviceBuffer::from_host(stream, &plane)?;
-        kern.enqueue_head_norm_neox_append_256(
+        rope_gate::run(
             stream,
-            PartialNeoxArgs {
-                qg: &qg,
-                q: &mut q,
-                k: &mut k,
-                v: &v,
-                gq: &gq,
-                gk: &gk,
-                table: &table,
-                pos: &posd,
-                eps: EPS,
+            inp,
+            pos,
+            RopeShape {
+                head: HEAD,
                 n_head: N_HEAD,
                 n_kv: N_KV,
                 ctx: ROPE_CTX,
-                m,
-                fault,
-                cache_k: &mut ck,
-                cache_v: &mut cv,
+                eps: EPS,
             },
-        )?;
-        stream.synchronize()?;
-        Ok(RopeOut {
-            q: q.to_host_vec(stream)?,
-            k: k.to_host_vec(stream)?,
-            ck: ck.to_host_vec(stream)?,
-            cv: cv.to_host_vec(stream)?,
-        })
-    }
-
-    /// The host rule's outputs for `pos`: every token's heads, and the planes
-    /// from the sentinel with each token's rows written.
-    fn rope_host(inp: &RopeIn, pos: &[u32]) -> RopeOut {
-        let m = pos.len();
-        let mut q = vec![0.0f32; m * N_HEAD * HEAD];
-        let mut k = vec![0.0f32; m * N_KV * HEAD];
-        let mut ck = vec![SENTINEL; N_KV * ROPE_CTX * HEAD];
-        let mut cv = ck.clone();
-        for (t, &p) in pos.iter().enumerate() {
-            let p = p as usize;
-            let cs = &inp.table[p * ROT..(p + 1) * ROT];
-            for h in 0..N_HEAD {
-                let src = &inp.qg[t * QG_ROW + h * QG_HEAD..][..HEAD];
-                q[(t * N_HEAD + h) * HEAD..][..HEAD].copy_from_slice(&head_rule(src, &inp.gq, cs));
-            }
-            for j in 0..N_KV {
-                let at = (t * N_KV + j) * HEAD;
-                let y = head_rule(&inp.k[at..at + HEAD], &inp.gk, cs);
-                k[at..at + HEAD].copy_from_slice(&y);
-                let row = (j * ROPE_CTX + p) * HEAD;
-                ck[row..row + HEAD].copy_from_slice(&to16(&y));
-                cv[row..row + HEAD].copy_from_slice(&to16(&inp.v[at..at + HEAD]));
-            }
-        }
-        RopeOut { q, k, ck, cv }
+            fault,
+            |s, args| kern.enqueue_head_norm_neox_append_256(s, args),
+        )
     }
 
     /// The rope check's inputs ([`rope_check`]'s construction, shared with
@@ -582,64 +481,21 @@ mod gate {
     }
 
     fn rope_check(gpu: &Gpu, kern: &RopeNeoxKernels) -> Result<bool, GateError> {
-        let stream = gpu.stream();
         let (inp, pos) = rope_inputs()?;
-        let unl = gpu.unlabelled_sink();
-        let a = rope_run(kern, stream, &inp, &pos, unl)?;
-        let b = rope_run(kern, stream, &inp, &pos, unl)?;
-        let want = rope_host(&inp, &pos);
-        let q_ok = bits_equal(&a.q, &want.q);
-        let k_ok = bits_equal(&a.k, &want.k);
-        let planes_ok = a.ck == want.ck && a.cv == want.cv;
-        let rerun =
-            bits_equal(&a.q, &b.q) && bits_equal(&a.k, &b.k) && a.ck == b.ck && a.cv == b.cv;
-        let pass = q_ok && k_ok && planes_ok && rerun;
-        println!(
-            "rope m={ROPE_M} positions {ROPE_P0}.. ctx={ROPE_CTX} head {HEAD} rot {ROT}: q (read at \
-             head stride {QG_HEAD}) bit_exact_host={q_ok} k in place bit_exact_host={k_ok} \
-             planes_exact={planes_ok} rerun={rerun} {}",
-            verdict(pass)
-        );
-
-        // The last token's position at the cache's height.
-        let bad_t = ROPE_M - 1;
-        let mut bad = pos.clone();
-        bad[bad_t] = u32::try_from(ROPE_CTX)?;
-        let before = gpu.fault()?;
-        let sink = gpu.layer_sink(LAYER)?;
-        let r = rope_run(kern, stream, &inp, &bad, sink)?;
-        let raised = gpu.take_fault()?;
-        let want_fault = Some(Fault::at(u32::try_from(LAYER)?, FaultSite::CachePos));
-        let (qw, kw) = (N_HEAD * HEAD, N_KV * HEAD);
-        let others = bits_equal(&r.q[..bad_t * qw], &a.q[..bad_t * qw])
-            && bits_equal(&r.k[..bad_t * kw], &a.k[..bad_t * kw]);
-        let nan = r.q[bad_t * qw..].iter().all(|v| v.is_nan())
-            && r.k[bad_t * kw..].iter().all(|v| v.is_nan());
-        // The clean run minus the bad token's rows: those keep the sentinel.
-        let mut ck_want = a.ck.clone();
-        let mut cv_want = a.cv.clone();
-        for j in 0..N_KV {
-            let row = (j * ROPE_CTX + pos[bad_t] as usize) * HEAD;
-            ck_want[row..row + HEAD].fill(SENTINEL);
-            cv_want[row..row + HEAD].fill(SENTINEL);
-        }
-        let not_appended = r.ck == ck_want && r.cv == cv_want;
-        let again = rope_run(kern, stream, &inp, &pos, unl)?;
-        let clean_after = gpu.fault()?.is_none() && bits_equal(&again.q, &a.q);
-        let fault_ok = before.is_none()
-            && raised == want_fault
-            && others
-            && nan
-            && not_appended
-            && clean_after;
-        println!(
-            "rope fault: token {bad_t} at position {ROPE_CTX} (the cache's height), layer {LAYER}: \
-             word {raised:?} (want {want_fault:?}), its heads NaN {nan}, nothing appended \
-             {not_appended}, other tokens bit-identical {others}, clean rerun and word clean \
-             {clean_after} {}",
-            verdict(fault_ok)
-        );
-        Ok(pass && fault_ok)
+        rope_gate::check::<HEAD, ROT, { 2 * HEAD }>(
+            gpu,
+            &inp,
+            &pos,
+            RopeShape {
+                head: HEAD,
+                n_head: N_HEAD,
+                n_kv: N_KV,
+                ctx: ROPE_CTX,
+                eps: EPS,
+            },
+            LAYER,
+            |p, f| rope_run(kern, gpu.stream(), &inp, p, f),
+        )
     }
 
     /// The q8_0 append's launch (`head_norm_neox_append_256_q8`) read back:
@@ -711,7 +567,7 @@ mod gate {
         })
     }
 
-    /// The q8_0 append's expected planes ([`rope_host`]'s rows through
+    /// The q8_0 append's expected planes ([`rope_gate::expected`]'s rows through
     /// `quantize_q8_0` and `q8_0_planes`, every other slot the sentinel).
     fn rope_q8_host(inp: &RopeIn, pos: &[u32]) -> (Vec<u32>, Vec<u16>, Vec<u32>, Vec<u16>) {
         let (words, scales) = q8_plane_lens(HEAD, N_KV, ROPE_CTX);
@@ -730,7 +586,7 @@ mod gate {
             let cs = &inp.table[p * ROT..(p + 1) * ROT];
             for j in 0..N_KV {
                 let at = (t * N_KV + j) * HEAD;
-                let y = head_rule(&inp.k[at..at + HEAD], &inp.gk, cs);
+                let y = neox_head::<HEAD, ROT>(&inp.k[at..at + HEAD], &inp.gk, cs, EPS);
                 let row = j * ROPE_CTX + p;
                 pack(&y, &mut kq, &mut kd, row);
                 pack(&inp.v[at..at + HEAD], &mut vq, &mut vd, row);
@@ -872,13 +728,6 @@ mod gate {
         }
     }
 
-    /// The f32 values of one cache: two planes of `N_KV · ctx` rows.
-    struct HostCache {
-        kf: Vec<f32>,
-        vf: Vec<f32>,
-        ctx: usize,
-    }
-
     /// The exact attention of every (row, head) of a launch, in the order the
     /// launch writes them: `q` holds the rows' `sh.n_head` query heads
     /// token-major, head `h` reading key head `h / sh.group()`, `counts[t]`
@@ -916,43 +765,6 @@ mod gate {
             }
         }
         (ok, worst)
-    }
-
-    /// A seeded cache of `ctx` rows a key head, NaN (f16) in the rows at or
-    /// past `live` in the padded copy: the planes, their padded copies, and
-    /// the f32 values.
-    struct Cache {
-        kc: DeviceBuffer<u16>,
-        vc: DeviceBuffer<u16>,
-        kn: DeviceBuffer<u16>,
-        vn: DeviceBuffer<u16>,
-        host: HostCache,
-        kb: Vec<u16>,
-        vb: Vec<u16>,
-    }
-
-    fn cache(stream: &CudaStream, ctx: usize, live: usize, seed: u32) -> Result<Cache, GateError> {
-        let kb = to16(&activations(HEAD, N_KV * ctx, seed));
-        let vb = to16(&activations(HEAD, N_KV * ctx, seed + 1));
-        let pad = |b: &[u16]| -> Vec<u16> {
-            b.iter()
-                .enumerate()
-                .map(|(i, &h)| if (i / HEAD) % ctx >= live { NAN16 } else { h })
-                .collect()
-        };
-        Ok(Cache {
-            kc: DeviceBuffer::from_host(stream, &kb)?,
-            vc: DeviceBuffer::from_host(stream, &vb)?,
-            kn: DeviceBuffer::from_host(stream, &pad(&kb))?,
-            vn: DeviceBuffer::from_host(stream, &pad(&vb))?,
-            host: HostCache {
-                kf: from16(&kb),
-                vf: from16(&vb),
-                ctx,
-            },
-            kb,
-            vb,
-        })
     }
 
     // ---------------------------------------------------------- decode
@@ -1020,7 +832,7 @@ mod gate {
         for (i, &live) in keys.iter().enumerate() {
             let ctx = live + PAD;
             let seed = 100 + 10 * u32::try_from(i)?;
-            let c = cache(stream, ctx, live, seed)?;
+            let c = cache(stream, HEAD, N_KV, ctx, live, seed)?;
             let q: Vec<f32> = activations(HEAD, sh.n_head, seed + 5)
                 .iter()
                 .map(|v| v * SEED_Q_SCALE)
@@ -1052,7 +864,7 @@ mod gate {
         // row t the query with its heads rotated by t.
         let live = 1025usize;
         let ctx = live + PAD;
-        let c = cache(stream, ctx, live, 300)?;
+        let c = cache(stream, HEAD, N_KV, ctx, live, 300)?;
         let q1 = activations(HEAD, sh.n_head, 305);
         let rows: Vec<f32> = (0..ROWS)
             .flat_map(|t| {
@@ -1346,17 +1158,6 @@ mod gate {
         Ok(differ)
     }
 
-    /// What the window check of one layout reads: the fault launch's query
-    /// and cache bytes, its clean counts and output, and the cache height.
-    struct Windows {
-        q: Vec<f32>,
-        kb: Vec<u16>,
-        vb: Vec<u16>,
-        clean: Vec<u32>,
-        y: Vec<f32>,
-        ctx: usize,
-    }
-
     /// The prefill clause (module doc, 4) at `sh`: the seeded launches
     /// `SEED_P0 × SEED_T` and then `extra` (`(p0, T)` pairs), the fault, graph
     /// and head-count refusal checks. Returns the verdict and what
@@ -1380,7 +1181,7 @@ mod gate {
             seed += 7;
             let ctx = p0 + t + PAD;
             let live = p0 + t;
-            let c = cache(stream, ctx, live, seed)?;
+            let c = cache(stream, HEAD, N_KV, ctx, live, seed)?;
             let q: Vec<f32> = activations(HEAD, t * sh.n_head, seed + 3)
                 .iter()
                 .map(|v| v * SEED_Q_SCALE)
@@ -1408,7 +1209,7 @@ mod gate {
         // A count of zero and one past the cache, on a 17-row launch at 63.
         let (t, p0) = (17usize, 63usize);
         let ctx = p0 + t + PAD;
-        let c = cache(stream, ctx, p0 + t, 91)?;
+        let c = cache(stream, HEAD, N_KV, ctx, p0 + t, 91)?;
         let q = activations(HEAD, t * sh.n_head, 94);
         let clean: Vec<u32> = (0..t)
             .map(|i| u32::try_from(p0 + i + 1))
@@ -1556,7 +1357,7 @@ mod gate {
         let (live, seed) = (1025usize, 500u32);
         let short = live + PAD;
         let rows = (short, live, GRID_TALL_CTX);
-        let c = cache(stream, short, live, seed)?;
+        let c = cache(stream, HEAD, N_KV, short, live, seed)?;
         let c8 = cache_q8(stream, short, live, seed)?;
         let (kt, vt) = (
             DeviceBuffer::from_host(stream, &tall_planes(&c.kb, HEAD, rows, NAN16))?,
@@ -1708,7 +1509,7 @@ mod gate {
         for (i, &live) in [5usize, 64, 1025].iter().enumerate() {
             let ctx = live + PAD;
             let seed = 700 + 10 * u32::try_from(i)?;
-            let c = cache(stream, ctx, live, seed)?;
+            let c = cache(stream, HEAD, N_KV, ctx, live, seed)?;
             let q: Vec<f32> = activations(HEAD, N_HEAD, seed + 5)
                 .iter()
                 .map(|v| v * SEED_Q_SCALE)
@@ -1752,7 +1553,7 @@ mod gate {
         for (i, &(p0, t)) in SEED_CROSS.iter().enumerate() {
             let ctx = p0 + t + PAD;
             let seed = 800 + 10 * u32::try_from(i)?;
-            let c = cache(stream, ctx, p0 + t, seed)?;
+            let c = cache(stream, HEAD, N_KV, ctx, p0 + t, seed)?;
             let q: Vec<f32> = activations(HEAD, t * N_HEAD, seed + 3)
                 .iter()
                 .map(|v| v * SEED_Q_SCALE)
@@ -2279,115 +2080,27 @@ mod gate {
         Ok(ok)
     }
 
-    /// `gate_qwen3moe_flash`'s window check at a head of 256, through `sh`'s
-    /// entry: aligned windows accepted and bit for bit the plain launch, `q`
-    /// at 4 bytes past 8 and `kc`/`vc` at 8 bytes past 16 refused by name
-    /// before any launch. The gate's last device checks: a launch through a
-    /// misaligned window is a sticky error that ends the context.
     fn misaligned(
         kp: &FlashGqaPrefill,
         gpu: &Gpu,
         sh: Shape,
         win: &Windows,
     ) -> Result<bool, GateError> {
-        let Windows {
-            q,
-            kb,
-            vb,
-            clean,
-            y,
-            ctx,
-        } = win;
-        let (q, kb, vb, clean, y, ctx) = (&q[..], &kb[..], &vb[..], &clean[..], &y[..], *ctx);
-        let tag = sh.tag();
-        let stream = gpu.stream();
-        let t = clean.len();
-        let qd = DeviceBuffer::from_host(stream, q)?;
-        let (kc, vc) = (
-            DeviceBuffer::from_host(stream, kb)?,
-            DeviceBuffer::from_host(stream, vb)?,
-        );
-        let nk = DeviceBuffer::from_host(stream, clean)?;
-        let q_pad = DeviceBuffer::from_host(stream, &[&[0.0f32; 2][..], q].concat())?;
-        let k_pad = DeviceBuffer::from_host(stream, &[&[0u16; 8][..], kb].concat())?;
-        let v_pad = DeviceBuffer::from_host(stream, &[&[0u16; 8][..], vb].concat())?;
-        let cx = gpu.context();
-        // SAFETY: each window is `q.len()` f32 starting one or two f32 into
-        // `q_pad`, or `kb.len()` (= `vb.len()`) f16 starting four or eight f16
-        // into `k_pad` or `v_pad` — inside its own live allocation, which holds
-        // two f32 or eight f16 more than the span. The allocations outlive
-        // every call below, and the windows are given back after them.
-        let (q_al, q_mis, k_al, k_mis, v_al, v_mis) = unsafe {
-            (
-                window::<f32>(q_pad.cu_deviceptr() + 8, q.len(), cx),
-                window::<f32>(q_pad.cu_deviceptr() + 4, q.len(), cx),
-                window::<u16>(k_pad.cu_deviceptr() + 16, kb.len(), cx),
-                window::<u16>(k_pad.cu_deviceptr() + 8, kb.len(), cx),
-                window::<u16>(v_pad.cu_deviceptr() + 16, vb.len(), cx),
-                window::<u16>(v_pad.cu_deviceptr() + 8, vb.len(), cx),
-            )
-        };
-        let ya = run_pref_dev(kp, gpu, sh, &q_al, clean, (&*k_al, &*v_al), ctx)?;
-        let aligned_ok = bits_equal(&ya, y);
-        println!(
-            "prefill{tag} windows at aligned offsets: accepted, bit-identical to the plain \
-             launch {aligned_ok} {}",
-            verdict(aligned_ok)
-        );
-        let mut ok = aligned_ok;
-        let mut ym = DeviceBuffer::<f32>::zeroed(stream, t * sh.width())?;
-        let cases = [
-            ("q", "4 bytes past an 8-byte boundary", &*q_mis, &kc, &vc),
-            ("kc", "8 bytes past a 16-byte boundary", &qd, &*k_mis, &vc),
-            ("vc", "8 bytes past a 16-byte boundary", &qd, &kc, &*v_mis),
-        ];
-        for (name, off, q_in, kc_in, vc_in) in cases {
-            let r = enqueue_pref(
-                kp,
-                stream,
-                sh,
-                GqaPrefillArgs {
-                    q: q_in,
-                    kc: kc_in,
-                    vc: vc_in,
-                    n_keys: &nk,
-                    scale: scale(),
-                    n_head: sh.n_head,
-                    n_kv: N_KV,
-                    ctx,
-                    t,
-                    fault: gpu.unlabelled_sink(),
-                    y: &mut ym,
-                },
-            );
-            let named = matches!(
-                r,
-                Err(GpuError::Shape {
-                    what,
-                    ref detail,
-                }) if what == sh.pref_what() && detail.starts_with(&format!("{name} at "))
-            );
-            let seen = match &r {
-                _ if named => "refused by name".to_string(),
-                Ok(()) => format!(
-                    "accepted; the stream then reads {:?}",
-                    stream.synchronize().err().map(|e| e.to_string())
-                ),
-                Err(e) => format!("refused without the name: {e}"),
-            };
-            println!(
-                "prefill{tag} refusal {name} window {off}: {seen} {}",
-                verdict(named)
-            );
-            ok &= named;
-        }
-        for w in [q_al, q_mis] {
-            drop(ManuallyDrop::into_inner(w).into_raw_parts());
-        }
-        for w in [k_al, k_mis, v_al, v_mis] {
-            drop(ManuallyDrop::into_inner(w).into_raw_parts());
-        }
-        Ok(ok)
+        window_refusals(
+            gpu,
+            sh.pref_what(),
+            &format!("prefill{}", sh.tag()),
+            WindowCase {
+                q: &win.q,
+                planes: (&win.kb, &win.vb),
+                counts: &win.clean,
+                y: &win.y,
+                heads: (sh.n_head, N_KV),
+                ctx: win.ctx,
+                scale: scale(),
+            },
+            |s, args| enqueue_pref(kp, s, sh, args),
+        )
     }
 
     // ------------------------------------------------- gated quantizer
@@ -3523,7 +3236,7 @@ mod gate {
         let idx = idx_inputs(stream, SEL_CTX, 601, false)?;
         let (pooled, _) = pool_plane(qk, stream, &idx, SEL_N, SEL_N, unl)?;
         let mut scratch = QsaScratch::new(stream, MAX_ROWS, SEL_CTX, KEPT)?;
-        let c = cache(stream, SEL_CTX, SEL_N, 610)?;
+        let c = cache(stream, HEAD, N_KV, SEL_CTX, SEL_N, 610)?;
         let w = Q38.width();
         let mut ok = true;
 

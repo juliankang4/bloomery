@@ -1152,6 +1152,11 @@ gate-gpu-linear *ARGS:
 gate-gpu-qwen35moe-attn:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_attn'
 
+# EmbeddingGemma 2 global 층의 카드 커널 둘, rope-512(q/k 노름, 512차원 전체 NEOX, f16 추가)와 프리필 flash 512(p4,
+# V 반쪽 둘, 32키 타일)를 모델 없이 합성 입력(rope 4/1·8/2, flash 4/1·16/2 헤드×512, θ 1e6, 스케일 1)으로 호스트 규칙과 f64 정확 어텐션 band에 맞춘다.
+gate-gpu-gemma-embedding2-head512:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding2_head512 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_head512'
+
 # GLM-5.3-Flash MLA 층의 카드 부분 — 잠재 RMS + f16 추가, 인덱서 키 LayerNorm + [키; 게이트] 추가(`latent`),
 # 창 0·싱크 −∞·스케일 1/16으로 다시 쓰는 V4.1 어텐션 — 을 모델 없이 합성 입력으로 호스트 규칙에 맞춘다.
 # 추가는 캐시 비트, 어텐션은 오차 모형에서 끌어낸 밴드, 싱크 −∞는 분할 부분합의 무싱크 접기와 비트로 본다.

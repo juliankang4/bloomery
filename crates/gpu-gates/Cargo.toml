@@ -513,6 +513,10 @@ name = "gate_qwen35moe_attn"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_gemma_embedding2_head512"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_qwen3moe_router"
 required-features = ["gpu"]
 

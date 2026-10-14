@@ -37,6 +37,11 @@
 //! NEOX rope, pairs `(i, i + ROT_256/2)`), 128 threads a head, the four warps'
 //! sums added in warp order; it reads the query from the q+gate rows at head
 //! stride `2·HEAD_256` and writes it to its own rows.
+//! [`RopeNeoxKernels::enqueue_head_norm_neox_append_512`] is the same body
+//! for heads of [`HEAD_512`] values that turn whole (EmbeddingGemma 2's
+//! global layers: NEOX pairs `(i, i + 256)`), 256 threads a head, the eight
+//! warps' sums in warp order, the query read from plain query rows at head
+//! stride [`HEAD_512`] and written to its own rows.
 //!
 //! The `_q8` entries ([`RopeNeoxKernels::enqueue_head_norm_neox_append_q8`],
 //! [`RopeNeoxKernels::enqueue_head_norm_neox_append_256_q8`]) are the same two
@@ -123,6 +128,18 @@ const _: () = assert!(THREADS_256_U32 as usize == THREADS_256 && THREADS_256 == 
 // The entry's launch contract spells HEAD_256 and ROT_256 out as 256 and 64.
 const _: () = assert!(HEAD_256 == 256 && ROT_256 == 64);
 
+/// Values per head of the whole-turn instance (EmbeddingGemma 2's global
+/// layers): every value turns, NEOX pairs `(i, i + HEAD_512/2)`, and the rope
+/// table's row is `HEAD_512` f32.
+pub const HEAD_512: usize = 512;
+/// Threads of its block, two values each, and its warps.
+const THREADS_512: usize = HEAD_512 / 2;
+const THREADS_512_U32: u32 = THREADS_512 as u32;
+const WARPS_512: usize = THREADS_512 / 32;
+const _: () = assert!(THREADS_512_U32 as usize == THREADS_512 && THREADS_512 == 256);
+// The entry's launch contract spells HEAD_512 out as 512 and 256 threads.
+const _: () = assert!(HEAD_512 == 512);
+
 /// The values thread `t` owns in a head of `HEAD` values whose first `ROT`
 /// turn: NEOX pair `(t, t + ROT/2)` for `t < ROT/2`, else the pass-through
 /// pair `(t + ROT/2, t + HEAD/2)` — every value once over `HEAD/2` threads.
@@ -154,7 +171,8 @@ const _: () = assert!(V_HEAD_K192 / 2 <= THREADS_K192 && ROT_K192 / 2 <= THREADS
 /// The norm, partial turn and append of [`rope_neox_kernels::head_norm_neox_append_256`]
 /// over heads of `HEAD` values, the first `ROT` turned, `WARPS = HEAD/64`
 /// warps a block, into a cache in the format `S` (that entry's body over
-/// [`F16Sink`], `head_norm_neox_append_256_q8`'s over [`Q8Sink`]).
+/// [`F16Sink`], `head_norm_neox_append_256_q8`'s over [`Q8Sink`], and
+/// `head_norm_neox_append_512`'s, every value turned, over [`F16Sink`]).
 /// Block `b = t·(n_head + n_kv) + h`. The query head `h` of token `t` is
 /// read from its source rows at `qg[(t·n_head + h)·Q_SPAN ..]` (the q+gate
 /// rows at `Q_SPAN = 2·HEAD`, each head's query and then its gate, or plain
@@ -201,7 +219,10 @@ unsafe fn norm_partial_append<
     mut sink: S,
     wsum: *mut f64,
 ) {
-    const { assert!(WARPS * 64 == HEAD && ROT.is_multiple_of(2) && ROT <= HEAD && ROT / 2 <= 32) };
+    // ROT / 2 <= 32 keeps the turning threads inside warp 0; ROT == HEAD
+    // turns every thread.
+    const { assert!(WARPS * 64 == HEAD && ROT.is_multiple_of(2) && ROT <= HEAD) };
+    const { assert!(ROT / 2 <= 32 || ROT == HEAD) };
     const { assert!(Q_SPAN == HEAD || Q_SPAN == 2 * HEAD) };
     let heads = (n_head + n_kv) as usize;
     let b = thread::blockIdx_x() as usize;
@@ -1066,6 +1087,82 @@ mod rope_neox_kernels {
         };
     }
 
+    /// The norm, whole NEOX turn and append over heads of [`HEAD_512`]
+    /// values (`norm_partial_append` at `ROT = HEAD = 512`): the query heads
+    /// read from plain query rows `qs` (`512` values a head) and written to
+    /// `q`, the key heads normalized and turned in place in `k` and appended
+    /// with `v`. The rope table holds [`HEAD_512`] f32 per position.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            qs.len() >= m * n_head * 512,
+            q.len() >= m * n_head * 512,
+            k.len() >= m * n_kv * 512,
+            v.len() >= m * n_kv * 512,
+            gq.len() >= 512,
+            gk.len() >= 512,
+            table.len() >= ctx * 512,
+            pos.len() >= m,
+            cache_k.len() >= n_kv * ctx * 512,
+            cache_v.len() >= n_kv * ctx * 512
+        )
+    )]
+    pub fn head_norm_neox_append_512(
+        gq: &[f32],
+        gk: &[f32],
+        table: &[f32],
+        pos: &[u32],
+        qs: &[f32],
+        v: &[f32],
+        eps: f32,
+        n_head: u32,
+        n_kv: u32,
+        ctx: u32,
+        m: u32,
+        fault: FaultSink,
+        q: DisjointSlice<f32>,
+        k: DisjointSlice<f32>,
+        cache_k: DisjointSlice<u16>,
+        cache_v: DisjointSlice<u16>,
+    ) {
+        static mut WSUM8: SharedArray<f64, WARPS_512> = SharedArray::UNINIT;
+
+        // SAFETY: WSUM8 is this block's own shared allocation of WARPS_512
+        // slots; the raw form reaches it without a reference. The launch
+        // contract is `norm_partial_append`'s at (HEAD_512, HEAD_512) with
+        // plain query rows over the f16 planes.
+        unsafe {
+            norm_partial_append::<HEAD_512, HEAD_512, WARPS_512, HEAD_512, _>(
+                gq,
+                gk,
+                table,
+                pos,
+                qs,
+                v,
+                eps,
+                n_head,
+                n_kv,
+                ctx,
+                m,
+                fault,
+                q,
+                k,
+                F16Sink {
+                    k: cache_k,
+                    v: cache_v,
+                },
+                SharedArray::as_raw_mut_ptr(&raw mut WSUM8),
+            )
+        };
+    }
+
     /// [`head_norm_neox_append`] with the append quantized to Q8_0 (the
     /// module doc's `_q8` paragraph): the norm, the turn and the in-place
     /// query and key writes are that entry's bit for bit, and each key and
@@ -1568,13 +1665,16 @@ pub struct NeoxArgs<'a> {
     pub cache_v: &'a mut DeviceBuffer<u16>,
 }
 
-/// [`RopeNeoxKernels::enqueue_head_norm_neox_append_256`]'s arguments: `m`
-/// tokens' q+gate rows `qg` (`n_head` heads of `2·`[`HEAD_256`] values, the
-/// query first), the query output `q` (`n_head` heads of [`HEAD_256`]), the
-/// `n_kv` key heads in `k` (turned in place) and value heads in `v`, the
-/// gains, the rope table ([`ROT_256`] f32 per position, at least `ctx`
-/// rows), the positions, the sink, and the layer's two cache planes of
-/// `n_kv · ctx` rows of [`HEAD_256`] f16.
+/// The arguments of [`RopeNeoxKernels::enqueue_head_norm_neox_append_256`]
+/// and [`RopeNeoxKernels::enqueue_head_norm_neox_append_512`] at heads of
+/// `HEAD` values ([`HEAD_256`] or [`HEAD_512`]): `m` tokens' query source
+/// rows `qg` (`n_head` heads a token; at [`HEAD_256`] a head is its
+/// `2·HEAD` q+gate values, the query first, at [`HEAD_512`] its `HEAD` query
+/// values), the query output `q` (`n_head` heads of `HEAD`), the `n_kv` key
+/// heads in `k` (turned in place) and value heads in `v`, the gains, the rope
+/// table (at least `ctx` rows of [`ROT_256`] or [`HEAD_512`] f32), the
+/// positions, the sink, and the layer's two cache planes of `n_kv · ctx` rows
+/// of `HEAD` f16.
 pub struct PartialNeoxArgs<'a> {
     pub qg: &'a DeviceBuffer<f32>,
     pub q: &'a mut DeviceBuffer<f32>,
@@ -1906,6 +2006,75 @@ impl RopeNeoxKernels {
             .module
             .prepare_head_norm_neox_append_256(LaunchConfig1D::new(grid, THREADS_256_U32, 0))?;
         self.module.head_norm_neox_append_256(
+            stream, &prep, gq, gk, table, pos, qg, v, eps, n_head, n_kv, ctx, m, fault, q, k,
+            cache_k, cache_v,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the norm, whole turn and append of `args.m` tokens with heads
+    /// of [`HEAD_512`] values: one block per (token, head), `m·(n_head +
+    /// n_kv)` blocks of 256 threads. The query heads come from `args.qg`
+    /// (`m·n_head·512` f32, head `h` of token `t` at `(t·n_head + h)·512`) and
+    /// go to `args.q` (the same layout); `args.table` holds [`HEAD_512`] f32
+    /// for each of at least `ctx` positions (`RopeTable::push` over a
+    /// [`HEAD_512`]-wide spec). Positions as in
+    /// [`RopeNeoxKernels::enqueue_head_norm_neox_append`]: distinct, below
+    /// `ctx`; one at or past it raises [`FaultSite::CachePos`] on
+    /// `args.fault`, leaves the token's heads NaN and is not appended.
+    /// Asynchronous, allocation-free, capturable.
+    ///
+    /// # Safety
+    ///
+    /// The first `args.m` positions in `args.pos` are distinct.
+    pub unsafe fn enqueue_head_norm_neox_append_512(
+        &self,
+        stream: &CudaStream,
+        args: PartialNeoxArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_head_norm_neox_append_512";
+        let PartialNeoxArgs {
+            qg,
+            q,
+            k,
+            v,
+            gq,
+            gk,
+            table,
+            pos,
+            eps,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+            cache_k,
+            cache_v,
+        } = args;
+        let plane = n_kv * ctx * HEAD_512;
+        let [grid, n_head, n_kv, ctx, m] = partial_launch(
+            what,
+            (HEAD_512, HEAD_512, HEAD_512),
+            [n_head, n_kv, ctx, m],
+            [
+                qg.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                gq.len(),
+                gk.len(),
+                table.len(),
+                pos.len(),
+            ],
+            &[
+                ("cache_k", cache_k.len(), plane),
+                ("cache_v", cache_v.len(), plane),
+            ],
+        )?;
+        let prep = self
+            .module
+            .prepare_head_norm_neox_append_512(LaunchConfig1D::new(grid, THREADS_512_U32, 0))?;
+        self.module.head_norm_neox_append_512(
             stream, &prep, gq, gk, table, pos, qg, v, eps, n_head, n_kv, ctx, m, fault, q, k,
             cache_k, cache_v,
         )?;

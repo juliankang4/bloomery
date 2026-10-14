@@ -32,6 +32,37 @@ pub fn butterfly<T: Copy + std::ops::Add<Output = T>>(mut v: [T; 32]) -> T {
     v[0]
 }
 
+/// One head's norm and NeoX turn, in the device rule's sum order.
+#[cfg(feature = "gpu")]
+#[must_use]
+pub fn neox_head<const H: usize, const R: usize>(
+    x: &[f32],
+    gain: &[f32],
+    cs: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    const { assert!(H >= 64 && H.is_multiple_of(64) && R.is_multiple_of(2) && R <= H) };
+    assert_eq!(x.len(), H, "neox_head: input width");
+    assert_eq!(gain.len(), H, "neox_head: gain width");
+    assert_eq!(cs.len(), R, "neox_head: rope width");
+    let warp = |w| {
+        butterfly(std::array::from_fn(|l| {
+            let (a, b) = bloomery_gpu::rope_neox::owned_pair(H, R, 32 * w + l);
+            f64::from(x[a] * x[a]) + f64::from(x[b] * x[b])
+        }))
+    };
+    let sum = (1..H / 64).fold(warp(0), |s, w| s + warp(w));
+    let scale = 1.0 / ((sum / H as f64) as f32 + eps).sqrt();
+    let mut y: Vec<f32> = x.iter().zip(gain).map(|(&v, &g)| (scale * g) * v).collect();
+    for i in 0..R / 2 {
+        let (a, b) = (y[i], y[i + R / 2]);
+        let (c, s) = (cs[2 * i], cs[2 * i + 1]);
+        y[i] = a.mul_add(c, -(b * s));
+        y[i + R / 2] = a.mul_add(s, b * c);
+    }
+    y
+}
+
 /// A 32-value block's largest magnitude over its RMS, at most: a block of
 /// one nonzero value, √32 — the crest [`q8_32_rel`] takes.
 pub const CREST_MAX_32: f64 = 5.656_854_249_492_381;
