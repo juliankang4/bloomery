@@ -211,6 +211,10 @@ blk_archscan() { blk_scancheck arch; }
 # check-loads.sh scans crates/*/src for a generated module load outside the shared slot: a source file it cannot list
 # or read ends the check with 70. The family and load scans are tested here on fixed input and a missing file.
 blk_loadscan() { blk_scancheck loads; }
+# check-comments.sh lists crates/*/src and crates/*/tests and scans the files git sees for a retired word: a directory
+# or file it cannot list or read ends the check with no verdict. The listing, the comment reader and the scan are
+# tested here on fixed input and on input that cannot be read, no tree walk.
+blk_commentscan() { blk_scancheck comments; }
 # load-groups.sh decides which arms of a depth runner share one load, and their order: its grouping and
 # rotation are tested on fixed keys, and under bash 4.1 or later its idle bound on a stalled process.
 blk_loadgroups() {
@@ -994,7 +998,7 @@ proc_leg_gpu() {
 proc_leg
 unset CPU_GUARD_PROC_LEG
 
-BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
+BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
   refsetpublish orphan archowner wt)
 for b in "${BLOCKS[@]}"; do

@@ -15,55 +15,109 @@
 # A fourth rule reads every file git sees (tracked, or untracked and not ignored): no word of a deleted
 # feature (RETIRED_WORDS, a case-blind ERE spelled so this file cannot match it). An exception is a WORD_ALLOW entry: a whole file (`<path>||<reason>`) or one line
 # (`<path>|<fixed text on the line>|<reason>`); an entry that matches nothing is an error.
+# Exit: 0 clean, 1 a violation, 2 no verdict: a source listing, the comment reader or a retired-word scan that cannot
+# read a file or a directory, or a grep that fails. 64 a malformed allow entry or an unknown argument, 69 not a git
+# work tree. `--self-test` runs the listing, the comment reader and the retired-word scan on fixed input and on input
+# that cannot be read, and exits.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+# shellcheck source=tools/grep-answer.sh
+source "$ROOT/tools/grep-answer.sh"
 # The router-frequency card list and its lever are deleted: the placement ranks no card set.
 RETIRED_WORDS='h[o]t.?list|뜨[거]운 목록|핫 ?리[스]트'
 
-# rs_files CRATES : every .rs under CRATES/*/src and CRATES/*/tests, sorted, into files (global), the reproducer
-# oxide-ice-unroll left out.
+nov() { echo "check-comments: $*, no verdict" >&2; exit 2; }
+# The wrapped-word scan's file list (NUL-separated, so it is a file and not a variable).
+LIST=$(mktemp)
+trap 'rm -f "$LIST"' EXIT
+
+# rs_files CRATES : every .rs under CRATES/<crate>/src and CRATES/<crate>/tests, sorted, into files (global), the
+# reproducer oxide-ice-unroll left out. The whole CRATES directory is listed, so any directory under it that find cannot
+# enter ends the check, a crate directory included.
 rs_files() {
-  local dirs=() d f
-  for d in "$1"/*/src "$1"/*/tests; do
-    [ -d "$d" ] || continue
-    case "$(basename "$(dirname "$d")")" in
-      oxide-ice-unroll) ;;
-      *) dirs+=("$d") ;;
-    esac
-  done
+  local listing f
+  listing=$(find "$1" -path "$1/oxide-ice-unroll" -prune -o -name '*.rs' -print | LC_ALL=C sort) ||
+    nov "cannot list the .rs files under $1 (exit $?, above)"
   files=()
-  while IFS= read -r f; do files+=("$f"); done < <(find "${dirs[@]}" -name '*.rs' | LC_ALL=C sort)
+  while IFS= read -r f; do
+    case ${f#"$1"/*/} in src/* | tests/*) files+=("$f") ;; esac
+  done <<<"$listing"
 }
 
-# comment_lines FILE… : into comments (global), every comment line of FILE… as `path:line:text`.
+# comment_lines FILE… : into comments (global), every comment line of FILE… as `path:line:text`. A reader that fails
+# (it stops on a file it cannot open) ends the check.
 comment_lines() {
-  local rc=0
-  comments=$(python3 tools/check-comment-only.py --comments "$@") || rc=$?
-  if [ "$rc" != 0 ]; then
-    echo "check-comments: the comment reader failed (rc $rc, above) — no verdict" >&2
-    exit "$rc"
-  fi
+  comments=$(python3 tools/check-comment-only.py --comments "$@") || nov "the comment reader failed (rc $?, above)"
+}
+
+# gg ARGS… : the output of `git grep --untracked ARGS…`, and 0 on a match or none. git grep says only on stderr that
+# it cannot open a file or a directory, and exits 0 or 1 as if it had read it, so any message there, or another
+# status, ends the check.
+gg() {
+  local err rc=0
+  { err=$(git grep --untracked "$@" 2>&1 >&3); } 3>&1 || rc=$?
+  [ "$rc" -le 1 ] && [ -z "$err" ] && return 0
+  [ -z "$err" ] || printf '%s\n' "$err" >&2
+  nov "git grep cannot read every file of the tree (above)"
 }
 
 # retired : into words (global), every line of the files git sees that carries a retired word.
 retired() {
   local split
-  words=$(git grep --untracked -nIiE -- "$RETIRED_WORDS" || [ "$?" = 1 ])
+  words=$(gg -nIiE -- "$RETIRED_WORDS") || exit $?
   # The English word wrapped across a line break ("… a h""ot" / "// list …"), which a line grep cannot see; reported
-  # at the line the word starts on.
-  split=$(git grep --untracked -zIl -e . | xargs -0 awk '
+  # at the line the word starts on. A listed file awk cannot read ends the check.
+  gg -zIl -e . >"$LIST"
+  split=$(xargs -0 awk '
     FNR == 1 { prev = "" }
     { cur = tolower($0) }
     prev ~ /h[o]t[ -]?$/ && cur ~ /^[[:space:]]*[\/!#*-]*[[:space:]]*list/ { print FILENAME ":" FNR - 1 ":" last " / " $0 }
-    { prev = cur; last = $0 }')
+    { prev = cur; last = $0 }' <"$LIST") || nov "the wrapped-word scan cannot read a file git grep listed (above)"
   [ -z "$split" ] || words=$(printf '%s\n%s\n' "$words" "$split" | sed '/^$/d')
 }
 
+self_test() {
+  local fails=0 out rc d
+  expect() {
+    [ "$2" = "$3" ] || { echo "check-comments: self-test $1: got [$2], want [$3]" >&2; fails=$((fails + 1)); }
+  }
+  rc=0 out=$( (rs_files /nonexistent) 2>&1) || rc=$?
+  expect missing-dir "$rc ${out##*$'\n'}" \
+    "2 check-comments: cannot list the .rs files under /nonexistent (exit 1, above), no verdict"
+  d=$(mktemp -d)
+  mkdir -p "$d/x/src/m" "$d/x/tests" "$d/x/benches" "$d/oxide-ice-unroll/src"
+  touch "$d/x/src/m/a.rs" "$d/x/tests/t.rs" "$d/x/benches/b.rs" "$d/x/build.rs" "$d/oxide-ice-unroll/src/o.rs"
+  rc=0 out=$( (rs_files "$d" && printf '%s ' "${files[@]#"$d"/}") 2>&1) || rc=$?
+  expect listing "$rc $out" "0 x/src/m/a.rs x/tests/t.rs "
+  rm -rf "$d"
+  rc=0 out=$( (comment_lines /nonexistent/a.rs) 2>&1) || rc=$?
+  expect reader "$rc ${out##*$'\n'}" "2 check-comments: the comment reader failed (rc 1, above), no verdict"
+  # git stands in for each git grep of the scan: the line search, then the listing the wrapped-word awk reads.
+  local warn="warning: could not open directory 'a/': Permission denied"
+  rc=0 out=$( (git() { case $* in (*-nIiE*) echo "$warn" >&2 ;; esac; }; retired) 2>&1) || rc=$?
+  expect unreadable "$rc ${out##*$'\n'}" "2 check-comments: git grep cannot read every file of the tree (above), no verdict"
+  rc=0 out=$( (git() { case $* in (*-zIl*) echo "$warn" >&2 ;; esac; }; retired) 2>&1) || rc=$?
+  expect unreadable-listing "$rc ${out##*$'\n'}" "2 check-comments: git grep cannot read every file of the tree (above), no verdict"
+  rc=0 out=$( (git() { return 128; }; retired) 2>&1) || rc=$?
+  expect git-failed "$rc ${out##*$'\n'}" "2 check-comments: git grep cannot read every file of the tree (above), no verdict"
+  rc=0 out=$( (git() { case $* in (*-zIl*) printf '/nonexistent/a.rs\0' ;; esac; }; retired) 2>&1) || rc=$?
+  expect listed-unreadable "$rc ${out##*$'\n'}" \
+    "2 check-comments: the wrapped-word scan cannot read a file git grep listed (above), no verdict"
+  rc=0 out=$(bash "$ROOT/tools/check-comments.sh" '' extra 2>&1) || rc=$?
+  expect extra-argument "$rc $out" "64 check-comments: unknown argument ' extra' (none, --self-test)"
+  [ "$fails" = 0 ] || { echo "check-comments: self-test: $fails failed" >&2; return 1; }
+  echo "check-comments: self-test ok"
+}
+
+case "$*" in
+  --self-test) self_test; exit $? ;;
+  '') ;;
+  *) echo "check-comments: unknown argument '$*' (none, --self-test)" >&2; exit 64 ;;
+esac
+
 rs_files crates
 comment_lines "${files[@]}"
-# shellcheck source=tools/grep-answer.sh
-source "$ROOT/tools/grep-answer.sh"
 # Each line is `path:line:text`; a rule matches the text after the line number.
 text() { grep_answer check-comments -E "^[^:]+:[0-9]+:.*($1)" | grep_answer check-comments -v 'PIN('; }
 fail=0
