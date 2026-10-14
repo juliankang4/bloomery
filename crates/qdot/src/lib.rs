@@ -578,8 +578,9 @@ fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     }
 }
 
-/// Direct AVX2 kernel call, [`dot_row`]'s kernel but for Q4_K under
-/// [`q4k_avx512`]; panics if required features are missing.
+/// Calls the AVX2 kernel of `w` directly. [`dot_row`] runs the same kernel,
+/// except for Q4_K when [`q4k_avx512`] is true: then it runs the AVX-512 VNNI
+/// body. Panics if required features are missing.
 #[cfg(target_arch = "x86_64")]
 pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
     let nb = check_row(w, wrow.len(), acol.len(), k)?;
@@ -747,15 +748,25 @@ pub fn dot_row_cols(
             return Ok(());
         }
     };
-    match c {
-        2 => tile::<2>(kind, wrow, acols, nb, out),
-        3 => tile::<3>(kind, wrow, acols, nb, out),
-        4 => tile::<4>(kind, wrow, acols, nb, out),
-        5 => tile::<5>(kind, wrow, acols, nb, out),
-        6 => tile::<6>(kind, wrow, acols, nb, out),
-        7 => tile::<7>(kind, wrow, acols, nb, out),
-        _ => tile::<8>(kind, wrow, acols, nb, out),
+    // The column count picks `C` for either tile.
+    macro_rules! by_cols {
+        ($tile:ident $(, $kind:expr)?) => {
+            match c {
+                2 => $tile::<2>($($kind,)? wrow, acols, nb, out),
+                3 => $tile::<3>($($kind,)? wrow, acols, nb, out),
+                4 => $tile::<4>($($kind,)? wrow, acols, nb, out),
+                5 => $tile::<5>($($kind,)? wrow, acols, nb, out),
+                6 => $tile::<6>($($kind,)? wrow, acols, nb, out),
+                7 => $tile::<7>($($kind,)? wrow, acols, nb, out),
+                _ => $tile::<8>($($kind,)? wrow, acols, nb, out),
+            }
+        };
     }
+    if matches!(kind, TileKind::Q4K) && q4k_avx512() {
+        by_cols!(tile_q4k_avx512);
+        return Ok(());
+    }
+    by_cols!(tile, kind);
     Ok(())
 }
 
@@ -769,15 +780,12 @@ fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize,
         // SAFETY: tile_kind saw AVX2+F16C; check_row sized the row and every
         // column for nb super-blocks.
         TileKind::Q3K => unsafe { dot_q3k_q8k_tile_avx2::<C>(wrow, &cols, nb) },
-        // SAFETY: q4k_avx512 saw AVX-512 F+BW+VNNI and AVX2+FMA+F16C;
-        // check_row sized the row and every column for nb super-blocks.
-        TileKind::Q4K if q4k_avx512() => unsafe { dot_q4k_q82x4_tile_avx512::<C>(wrow, &cols, nb) },
         // SAFETY: tile_kind saw AVX2+FMA+F16C; check_row sized the row and
         // every column for nb blocks.
         TileKind::Q4K => unsafe { dot_q45k_q82x4_tile_avx2::<C, false>(wrow, &cols, nb) },
-        // SAFETY: as the AVX2 Q4_K arm.
+        // SAFETY: as the Q4_K arm.
         TileKind::Q5K => unsafe { dot_q45k_q82x4_tile_avx2::<C, true>(wrow, &cols, nb) },
-        // SAFETY: as the AVX2 Q4_K arm.
+        // SAFETY: as the Q4_K arm.
         TileKind::Q6K => unsafe { dot_q6k_q82x4_tile_avx2::<C>(wrow, &cols, nb) },
         // SAFETY: tile_kind saw AVX2+FMA+F16C; check_row sized the row for nb
         // blocks and every column for nb blocks' x4 groups and q8_2 tails.
@@ -802,6 +810,22 @@ fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize,
         TileKind::Mxfp4 => unsafe { dot_mxfp4_q82x4_tile_avx2::<C>(wrow, &cols, nb) },
     };
     out.copy_from_slice(&v);
+}
+
+/// [`tile`] for Q4_K on its AVX-512 VNNI body ([`q4k_avx512`]).
+#[cfg(target_arch = "x86_64")]
+fn tile_q4k_avx512<const C: usize>(wrow: &[u8], acols: &[&[u8]], nb: usize, out: &mut [f32]) {
+    let cols: [*const u8; C] = std::array::from_fn(|j| acols[j].as_ptr());
+    // SAFETY: q4k_avx512 saw AVX-512 F+BW+VNNI and AVX2+FMA+F16C; check_row
+    // sized the row and every column for nb super-blocks.
+    let v = unsafe { dot_q4k_q82x4_tile_avx512::<C>(wrow, &cols, nb) };
+    out.copy_from_slice(&v);
+}
+
+/// Off x86_64 [`q4k_avx512`] is false, so no call reaches it.
+#[cfg(not(target_arch = "x86_64"))]
+fn tile_q4k_avx512<const C: usize>(_: &[u8], _: &[&[u8]], _: usize, _: &mut [f32]) {
+    unreachable!("no qdot tile kernel off x86_64")
 }
 
 /// Off x86_64 [`tile_kind`] is `None` for every type, so no call reaches a tile.
@@ -1232,37 +1256,51 @@ pub fn dot_lanes_cols(
             k,
         });
     }
+    let kind = match w {
+        GgmlType::Q6_K => LaneKind::Q6K,
+        GgmlType::Q4_K if q4k_avx512() => LaneKind::Q4KAvx512,
+        _ => LaneKind::Q45K,
+    };
     for (cols, out) in acols.chunks(LANE_COLS).zip(out.chunks_mut(LANE_COLS)) {
         match cols.len() {
-            1 => lanes::<1>(w, packed, cols, nb, out),
-            2 => lanes::<2>(w, packed, cols, nb, out),
-            3 => lanes::<3>(w, packed, cols, nb, out),
-            _ => lanes::<4>(w, packed, cols, nb, out),
+            1 => lanes::<1>(kind, packed, cols, nb, out),
+            2 => lanes::<2>(kind, packed, cols, nb, out),
+            3 => lanes::<3>(kind, packed, cols, nb, out),
+            _ => lanes::<4>(kind, packed, cols, nb, out),
         }
     }
     Ok(())
 }
 
+/// The row-lane kernel [`dot_lanes_cols`] runs for a packed group.
+#[derive(Clone, Copy)]
+enum LaneKind {
+    Q45K,
+    Q4KAvx512,
+    Q6K,
+}
+
 /// The `C`-column row-lane kernel over validated inputs: `packed` holds `nb`
-/// packed super-blocks of `w` (a row-lane type), `acols` `C` columns of at
+/// packed super-blocks of the type `kind` runs, `acols` `C` columns of at
 /// least `nb` super-blocks' x4 groups, `out` `C` values.
 #[cfg(target_arch = "x86_64")]
 fn lanes<const C: usize>(
-    w: GgmlType,
+    kind: LaneKind,
     packed: &[u8],
     acols: &[&[u8]],
     nb: usize,
     out: &mut [[f32; LANE_ROWS]],
 ) {
     let cols: [*const u8; C] = std::array::from_fn(|j| acols[j].as_ptr());
-    // SAFETY: the caller saw AVX2+FMA+F16C (has_lanes), and q4k_avx512 sees
-    // AVX-512 F+BW+VNNI for its arm; the caller sized `packed` for nb packed
-    // super-blocks of the type and every column for nb super-blocks.
+    // SAFETY: the caller saw AVX2+FMA+F16C (has_lanes), and q4k_avx512 saw
+    // AVX-512 F+BW+VNNI for LaneKind::Q4KAvx512; the caller sized `packed`
+    // for nb packed super-blocks of the type and every column for nb
+    // super-blocks.
     let v = unsafe {
-        match w {
-            GgmlType::Q6_K => dot_lanes_q6k_avx2::<C>(packed, &cols, nb),
-            GgmlType::Q4_K if q4k_avx512() => dot_lanes_avx512::<C>(packed, &cols, nb),
-            _ => dot_lanes_avx2::<C>(packed, &cols, nb),
+        match kind {
+            LaneKind::Q6K => dot_lanes_q6k_avx2::<C>(packed, &cols, nb),
+            LaneKind::Q4KAvx512 => dot_lanes_avx512::<C>(packed, &cols, nb),
+            LaneKind::Q45K => dot_lanes_avx2::<C>(packed, &cols, nb),
         }
     };
     out.copy_from_slice(&v);
@@ -1270,7 +1308,7 @@ fn lanes<const C: usize>(
 
 /// Off x86_64 [`has_lanes`] is false for every type, so [`dot_lanes_cols`] refuses first.
 #[cfg(not(target_arch = "x86_64"))]
-fn lanes<const C: usize>(_: GgmlType, _: &[u8], _: &[&[u8]], _: usize, _: &mut [[f32; LANE_ROWS]]) {
+fn lanes<const C: usize>(_: LaneKind, _: &[u8], _: &[&[u8]], _: usize, _: &mut [[f32; LANE_ROWS]]) {
     unreachable!("no qdot row-lane kernel off x86_64")
 }
 
