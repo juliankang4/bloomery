@@ -342,7 +342,11 @@ gpu-mimo2 0 0 0
 # PIN(2026-10-13): gpu-vision 91 -> 97 blocks, new code, not old code relaxed: the MiniCPM-V merger's two new kernel entries read
 # and write their buffers through the same raw places as the others, each block with its SAFETY line — vis_attn_group 5 (its
 # loader, three word reads, one store), vis_mean_groups 1 (its loader).
-gpu-vision 97 0 0
+# PIN(2026-10-15): gpu-vision 97 -> 116 blocks: Gemma4 row/position entries and F32 residual, clamp, pool, norm and GEMM
+# keep Gemma4 post norms in their graph precision; every raw read and disjoint store carries its SAFETY invariant.
+# PIN(2026-10-16): gpu-vision 116 -> 127 blocks: the same Gemma4 clamp, add, pool and F32 norm memory operations
+# now have narrower unsafe scopes, each with its own SAFETY invariant.
+gpu-vision 127 0 0
 # PIN(2026-10-13): hf 0 -> 2 blocks, new code, not old code relaxed: the DSpark draft's 1.9 GB safetensors file is read
 # through a read-only mapping (Safetensors::open) instead of into memory, and a bf16 tensor's bytes are viewed as u16
 # (Safetensors::bf16, a misaligned file refused), each block with its SAFETY line.

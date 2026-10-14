@@ -2,6 +2,7 @@
 //! accumulation on `mma.sync.m16n8k16`, bf16 output, with the epilogues the encoder's linear
 //! layers need. `B` is a linear layer's weight as the file stores it (one row per output), so no
 //! operand is transposed on the host.
+//! The unbiased F32 store shares the same accumulator walk and keeps the result for a following F32 norm.
 //!
 //! Tiling: one block of [`THREADS`] threads computes a [`TILE_M`] × [`TILE_N`] tile of `C`; its four
 //! warps each own a 32 × 32 quarter (2 m16 × 4 n8 fragments, 32 f32 accumulators per lane). The K
@@ -90,7 +91,7 @@ pub(crate) fn gelu_erf_dev(x: f32) -> f32 {
     mul_rn_f32(mul_rn_f32(x, 0.5), add_rn_f32(1.0, e))
 }
 
-/// One tensor-core accumulator walk for the BF16 GEMM entry.
+/// One tensor-core accumulator walk for both output storage formats.
 macro_rules! bf16_accumulate {
     ($a:ident, $b:ident, $m:ident, $n:ident, $k:ident;
      $acc:ident, $rows:ident, $cols:ident, $tm:ident, $tn:ident, $lane:ident,
@@ -330,6 +331,44 @@ mod gemm_kernels {
             f += 1;
         }
     }
+    /// Unbiased BF16 operands with the same tensor-core accumulation, stored in F32.
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(domain = 1, block = (128, 1, 1),
+        requires = (a.len() >= m * k, b.len() >= n * k, c.len() >= m * n))]
+    pub fn vis_gemm_bf16_f32(
+        a: &[u16],
+        b: &[u16],
+        m: u32,
+        n: u32,
+        k: u32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        bf16_accumulate!(a, b, m, n, k; acc, rows, cols, tm, tn, lane, wm, wn, AS, BS);
+
+        let group = lane / 4;
+        let t4 = lane % 4;
+        let mut f = 0usize;
+        while f < 8 {
+            cuda_device::thread::__unroll_config::<0>();
+            let mi = f / 4;
+            let ni = f % 4;
+            let mut j = 0usize;
+            while j < 4 {
+                cuda_device::thread::__unroll_config::<0>();
+                let row = tm * TILE_M + wm * 32 + mi * 16 + group + 8 * (j / 2);
+                let col = tn * TILE_N + wn * 32 + ni * 8 + 2 * t4 + j % 2;
+                if row < rows {
+                    // SAFETY: the tile covers n columns exactly and each live cell has one owner lane.
+                    unsafe {
+                        *c.get_unchecked_mut(row * cols + col) = acc[f][j];
+                    }
+                }
+                j += 1;
+            }
+            f += 1;
+        }
+    }
 }
 
 // -------------------------------------------------------------- launchers
@@ -348,6 +387,16 @@ pub struct GemmArgs<'a> {
     pub c: &'a mut DeviceBuffer<u16>,
 }
 
+/// An unbiased BF16 GEMM whose accumulator is stored as F32.
+pub(crate) struct FloatGemmArgs<'a> {
+    pub a: &'a DeviceBuffer<u16>,
+    pub b: &'a DeviceBuffer<u16>,
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub c: &'a mut DeviceBuffer<f32>,
+}
+
 /// The loaded GEMM module. Owns no stream: each enqueue takes the caller's stream.
 pub struct GemmKernels {
     module: gemm_kernels::LoadedModule,
@@ -358,6 +407,10 @@ pub struct GemmKernels {
 }
 
 impl GemmKernels {
+    /// Bytes of the unused-operand stand-ins this module holds on the card.
+    pub(crate) fn scratch_bytes(&self) -> u64 {
+        4 * self.dummy_f32.len() as u64 + 2 * self.dummy_u16.len() as u64
+    }
     /// Load this file's device bundle into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>, stream: &CudaStream) -> Result<GemmKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the module above; the
@@ -368,6 +421,51 @@ impl GemmKernels {
             dummy_f32: DeviceBuffer::zeroed(stream, 1)?,
             dummy_u16: DeviceBuffer::zeroed(stream, 1)?,
         })
+    }
+
+    /// Enqueue an unbiased BF16 GEMM into F32 storage, asynchronously and without allocation.
+    pub(crate) fn enqueue_f32(
+        &self,
+        stream: &CudaStream,
+        a: FloatGemmArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "GemmKernels::enqueue_f32";
+        if a.m == 0 || a.n == 0 || !a.n.is_multiple_of(TILE_N) || a.k == 0 || !a.k.is_multiple_of(2)
+        {
+            return Err(GpuError::shape(
+                what,
+                "need positive m, n a TILE_N multiple and positive even k",
+            ));
+        }
+        let extent = |x: usize, y| {
+            x.checked_mul(y)
+                .ok_or_else(|| GpuError::shape(what, "extent overflows"))
+        };
+        let (mk, nk, mn) = (extent(a.m, a.k)?, extent(a.n, a.k)?, extent(a.m, a.n)?);
+        for count in [mk, nk, mn] {
+            launch_u32(what, "element count", count)?;
+        }
+        if a.a.len() < mk || a.b.len() < nk || a.c.len() < mn {
+            return Err(GpuError::shape(
+                what,
+                "operands do not hold the matrix extents",
+            ));
+        }
+        let grid = launch_u32(what, "grid", a.m.div_ceil(TILE_M) * (a.n / TILE_N))?;
+        let prep =
+            self.module
+                .prepare_vis_gemm_bf16_f32(LaunchConfig1D::new(grid, THREADS_U32, 0))?;
+        self.module.vis_gemm_bf16_f32(
+            stream,
+            &prep,
+            a.a,
+            a.b,
+            launch_u32(what, "m", a.m)?,
+            launch_u32(what, "n", a.n)?,
+            launch_u32(what, "k", a.k)?,
+            a.c,
+        )?;
+        Ok(())
     }
 
     /// Enqueue one GEMM ([`GemmArgs`]). `n` a multiple of [`TILE_N`], `k` even and non-zero, `m`
