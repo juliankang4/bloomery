@@ -1429,7 +1429,14 @@ mod tests {
                 open.block
             )
         );
-        for c in [Chain::Step, Chain::Pair, Chain::Quad, Chain::Cols(5)] {
+        for c in [
+            Chain::Step,
+            Chain::Pair,
+            Chain::Quad,
+            Chain::Cols(2),
+            Chain::Cols(5),
+            Chain::Cols(model::ops::DEFER_MAX_COLS),
+        ] {
             assert_eq!(chain_of(chain_word(c).expect("a word")), Ok(c));
         }
         assert!(chain_of(3).is_err());
