@@ -30,8 +30,12 @@ for a in "$@"; do
 done
 
 # 아키텍처 이름들: crates/*/src/arch/<name>/ 디렉터리.
-ARCHES=$(find crates -mindepth 4 -maxdepth 4 -type d -path 'crates/*/src/arch/*' 2>/dev/null \
-  | sed 's|.*/||' | sort -u | tr '\n' ' ')
+# arches <crates dir>: the names, space-separated, into ARCHES.
+arches() {
+  ARCHES=$(find "$1" -mindepth 4 -maxdepth 4 -type d -path "$1/*/src/arch/*" 2>/dev/null \
+    | sed 's|.*/||' | sort -u | tr '\n' ' ')
+}
+arches crates
 [ -n "$ARCHES" ] || { echo "check-arch: no crates/*/src/arch/<name>/ directory found" >&2; exit 2; }
 ALT=$(printf '%s' "$ARCHES" | sed 's/ *$//; s/ /|/g')         # deepseek2|deepseek41|…
 # 모듈 없이 다른 모듈이 읽는 아키텍처 문자열(원칙 3의 예외, docs/arch-split.md)은 규칙 ②의 키 접두에 들어간다.
@@ -52,20 +56,63 @@ report() { # report <번호> <설명> <위반 줄들>
   fi
 }
 
+# The scans of rules ① to ⑤ below: each reads only the paths it is given.
+cross_one() { # cross_one <crates dir> <this architecture> <the name it must not use>: rule ①'s hits into cross
+  local dirs
+  dirs=$(find "$1" -type d \( -path "*/src/arch/$2" -o -path "$1/gpu-$2/src" \) 2>/dev/null || true)
+  [ -n "$dirs" ] || return 0
+  # shellcheck disable=SC2086
+  cross_uses "$3" $dirs
+}
+cross_uses() { # cross_uses <name> <dir…>
+  local name=$1 hits
+  shift
+  hits=$(grep -rnE "^[[:space:]]*(pub )?use .*\b$name\b" "$@" --include='*.rs' || true)
+  [ -z "$hits" ] || cross="${cross:+$cross$'\n'}$hits"
+}
+scan_lits() { # scan_lits <path…>: rule ②'s hits into lits
+  lits=$(grep -rnE "\"blk\\.|(^|[^.a-z])blk\\.\\{|$KEYS" "$@" --include='*.rs' --include='*.sh' 2>/dev/null \
+    | grep -vE "$OWN" \
+    | grep -vE '^tools/ref/models/' \
+    | grep -vE '^crates/[^/]+/tests/' \
+    | grep -vE '^crates/gpu-gates/src/bin/' \
+    | grep -vE '^crates/engram/' \
+    | grep -vE '^crates/gguf/src/bin/' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
+    | awk -v keys="$KEYS" '{ body = $0; sub(/^[^:]*:[0-9]+:/, "", body); gsub(/"blk\."/, "", body)
+             if (body ~ /"blk\.|(^|[^.a-z])blk\.[{]/ || body ~ keys) print }' || true)
+}
+scan_archread() { # scan_archread <path…>: rule ③'s hits into archread
+  archread=$(grep -rn 'general\.architecture' "$@" --include='*.rs' 2>/dev/null \
+    | grep -vE '^crates/gguf/' \
+    | grep -vE '^crates/model/src/arch/mod\.rs:' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+}
+# 세 모양을 본다: 경로 안의 `deepseek2::…`, 모듈을 통째로 들여오거나 재수출하는 use 줄
+# (`use …::arch::deepseek2 as x;`, `pub use …::deepseek2;` — 뒤에 `::`가 없어 첫 모양에 안 걸린다),
+# 그리고 rustfmt가 여러 줄로 나눈 `use …::{`의 한 줄에 모듈 이름만 남은 것(`    deepseek2,`).
+scan_archpath() { # scan_archpath <path…>: rule ④'s hits into archpath
+  archpath=$({ grep -rnE "\\b($ALT)::" "$@" --include='*.rs' 2>/dev/null
+               grep -rnE "^[[:space:]]*(pub(\\([a-z]+\\))?[[:space:]]+)?use[[:space:]][^;]*\\b($ALT)\\b" \
+                 "$@" --include='*.rs' 2>/dev/null
+               grep -rnE "^[[:space:]]*($ALT)([[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*)?,?[[:space:]]*\$" \
+                 "$@" --include='*.rs' 2>/dev/null; } | sort -u \
+    | grep -vE "$OWN" \
+    | grep -vE '^crates/gpu-gates/src/bin/' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+}
+scan_spawns() { # scan_spawns <path…>: rule ⑤'s spawn count per file into spawned
+  spawned=$(grep -rnE 'thread::spawn\(|\.spawn\((move\b|\|)' "$@" --include='*.rs' 2>/dev/null \
+    | grep -vE '^crates/oxide-ice-unroll/' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' | cut -d: -f1 | sort | uniq -c || true)
+}
+
 # ① 두 아키텍처 디렉터리가 서로를 use 하지 않는다. 한쪽 디렉터리가 없으면 그쪽은 grep 대상이 없어
 #    통과하고, 생기는 순간부터 값을 한다.
 cross=
-cross_one() { # cross_one <이 아키텍처 디렉터리> <여기서 use 하면 안 되는 이름>
-  local dirs hits
-  dirs=$(find crates -type d \( -path "*/src/arch/$1" -o -path "crates/gpu-$1/src" \) 2>/dev/null || true)
-  [ -n "$dirs" ] || return 0
-  # shellcheck disable=SC2086
-  hits=$(grep -rnE "^[[:space:]]*(pub )?use .*\b$2\b" $dirs --include='*.rs' || true)
-  [ -z "$hits" ] || cross="${cross:+$cross$'\n'}$hits"
-}
 for a in $ARCHES; do
   for b in $ARCHES; do
-    [ "$a" = "$b" ] || cross_one "$a" "$b"
+    [ "$a" = "$b" ] || cross_one crates "$a" "$b"
   done
 done
 report 1 "arch dirs use each other" "$cross"
@@ -82,23 +129,11 @@ report 1 "arch dirs use each other" "$cross"
 # `"blk.{l}.ffn_up"`·`"blk.0.attn_q"`와, 맨 접두와 이름이 한 줄에 같이 있는 줄은 그대로 걸린다.
 # `blk.{` 앞에 `.`나 소문자가 붙은 이름(비전 탑의 `v.blk.{n}.…`)은 다른 탑의 이름공간이라 이 규칙의 대상이
 # 아니다 — 그 표는 어차피 그 크레이트의 arch/ 아래에 있다.
-lits=$(grep -rnE "\"blk\\.|(^|[^.a-z])blk\\.\\{|$KEYS" crates tools/ref --include='*.rs' --include='*.sh' 2>/dev/null \
-  | grep -vE "$OWN" \
-  | grep -vE '^tools/ref/models/' \
-  | grep -vE '^crates/[^/]+/tests/' \
-  | grep -vE '^crates/gpu-gates/src/bin/' \
-  | grep -vE '^crates/engram/' \
-  | grep -vE '^crates/gguf/src/bin/' \
-  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
-  | awk -v keys="$KEYS" '{ body = $0; sub(/^[^:]*:[0-9]+:/, "", body); gsub(/"blk\."/, "", body)
-           if (body ~ /"blk\.|(^|[^.a-z])blk\.[{]/ || body ~ keys) print }' || true)
+scan_lits crates tools/ref
 report 2 "model-aware string literals outside arch/" "$lits"
 
 # ③ general.architecture 는 한 곳에서만 읽는다.
-archread=$(grep -rn 'general\.architecture' crates --include='*.rs' 2>/dev/null \
-  | grep -vE '^crates/gguf/' \
-  | grep -vE '^crates/model/src/arch/mod\.rs:' \
-  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+scan_archread crates
 report 3 "general.architecture read outside crates/model/src/arch/mod.rs" "$archread"
 
 # ④ 공유 파일은 아키텍처 모듈 경로를 쓰지 않는다. 옛 크레이트 루트 경로(model::attn 등)는 지워져
@@ -180,17 +215,7 @@ allowed=$(for d in "${dispatch[@]}"; do
   [ -f "$file" ] || continue
   construct_lines "$file" "$kind" "$name" | sed "s|^|$file |"
 done)
-# 세 모양을 본다: 경로 안의 `deepseek2::…`, 모듈을 통째로 들여오거나 재수출하는 use 줄
-# (`use …::arch::deepseek2 as x;`, `pub use …::deepseek2;` — 뒤에 `::`가 없어 첫 모양에 안 걸린다),
-# 그리고 rustfmt가 여러 줄로 나눈 `use …::{`의 한 줄에 모듈 이름만 남은 것(`    deepseek2,`).
-archpath=$({ grep -rnE "\\b($ALT)::" crates/*/src --include='*.rs' 2>/dev/null
-             grep -rnE "^[[:space:]]*(pub(\\([a-z]+\\))?[[:space:]]+)?use[[:space:]][^;]*\\b($ALT)\\b" \
-               crates/*/src --include='*.rs' 2>/dev/null
-             grep -rnE "^[[:space:]]*($ALT)([[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*)?,?[[:space:]]*\$" \
-               crates/*/src --include='*.rs' 2>/dev/null; } | sort -u \
-  | grep -vE "$OWN" \
-  | grep -vE '^crates/gpu-gates/src/bin/' \
-  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+scan_archpath crates/*/src
 outside=
 while IFS= read -r hit; do
   [ -n "$hit" ] || continue
@@ -209,9 +234,7 @@ report 4 "architecture module path in a shared file, outside arch/ and the dispa
 #    (`<file> <count> <why>`); a file not listed, a file with more spawns than its entry, and an entry
 #    above its file's count (the list follows the tree down) each fail.
 ALLOW=tools/spawn-allow.txt
-spawned=$(grep -rnE 'thread::spawn\(|\.spawn\((move\b|\|)' crates/*/src --include='*.rs' 2>/dev/null \
-  | grep -vE '^crates/oxide-ice-unroll/' \
-  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' | cut -d: -f1 | sort | uniq -c || true)
+scan_spawns crates/*/src
 spawn_bad=
 while read -r n f; do
   [ -n "${f:-}" ] || continue
