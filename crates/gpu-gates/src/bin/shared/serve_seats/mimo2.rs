@@ -121,6 +121,7 @@ use app::arch::mimo2::Mimo2Cfg;
 use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     ChatSurface, Pass, Seat, SeatEngine, SeatFlags, SlotStep, Vocab, arm_screen, model_props,
     note_line, parallel_line, placement_of, slots_given,
@@ -128,6 +129,7 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{Lane, Place, choose_ctx, lane_at};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{residency_room, residency_set};
+use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, residency};
 use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode};
 use bloomery_levers::{ChurnHosting, HostCfg, ResidencyAt, ResidencyWhy};
@@ -223,6 +225,8 @@ struct OpenSeat {
     /// The batches a prompt group runs layer by layer
     /// (`BLOOMERY_PREFILL_GROUP`, the row's default when unset).
     group: usize,
+    /// The side model's reserve on the stage card, which the plan counted.
+    embedding: Option<u64>,
 }
 
 /// The open's records: the plan's expert counts are kept until the slots are
@@ -323,7 +327,13 @@ impl Mimo {
         };
         let args = OpenArgs {
             place: a.place.name(),
-            machine: a.place.machine_untiered()?,
+            machine: beside::with_reserve(
+                a.place.machine_untiered()?,
+                Beside {
+                    image: None,
+                    embedding: a.embedding,
+                },
+            ),
             ctx: a.ctx,
             mode: StepMode::Graph,
             cfg: Mimo2Cfg {
@@ -431,14 +441,15 @@ impl Seat for Mimo {
     }
 }
 
-/// Loads the model and serves until the listener or the engine fails;
-/// `Ok` carries why the server ended.
-pub fn run(args: &[String]) -> Result<ServeError, GateError> {
+/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
+/// or the engine fails; `Ok` carries why the server ended.
+pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
     record::at_main(NAME, record::BLOOMERY_SERVE_MIMO2);
     arm_screen(levers.screen());
     let Args { common: a, prefill } = parse_args(args)?;
+    let side = side.read()?;
     let path = ref_model_path()?;
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let first = split
@@ -471,6 +482,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let chosen = Place::choose_untiered(a.place, &census, "mimo2")?;
     chosen.record().eprint();
     let place = chosen.place;
+    // The side model's seat before the plan, which holds its bytes when it sits on the stage card.
+    let side_seat = side.as_ref().map(|s| s.seat(place)).transpose()?;
+    let embedding = side_seat.as_ref().and_then(|s| s.reserve);
     // The lane's rate, taken before the plan reads the room (`lane_of`).
     let lane = if a.plan_only {
         None
@@ -494,7 +508,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         )
         .into());
     }
-    let machine = place.machine_untiered()?(inputs.model.layers);
+    let machine = beside::with_reserve(
+        place.machine_untiered()?,
+        Beside {
+            image: None,
+            embedding,
+        },
+    )(inputs.model.layers);
     // The context, then the plan of every slot around it, each layer's
     // stores `slots` times at a slot's positions (`choose_ctx`, every seat's).
     // A tier card, a total the machine cannot hold and a budget that binds
@@ -558,9 +578,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         prefill,
         residency,
         group: levers.prefill_group(),
+        embedding,
     };
     let engine = SeatEngine::spawn(move || Mimo::open(open), slot_ctx, vocab, card, props, 0)?;
-    let server = a.bind(engine, chat, &path, slots)?;
+    let side = side_seat::Side::start(side.zip(side_seat))?;
+    let server = a.bind(engine, chat, &path, slots, side)?;
     Record::new(&record::LISTENING_MIMO2)
         .w("place", place.name())
         .u("ctx", slot_ctx)

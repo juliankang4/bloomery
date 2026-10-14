@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use super::ds41place;
 use super::{Adapter, Arm, Outcome, census, floor_or, outcome_of, refused_of, view_of};
+use bloomery_gpu_gates::beside::Beside;
 use bloomery_gpu_gates::generate::Place;
 use gguf::{GgmlType, Split};
 use model::arch::deepseek41::place::{PlaceError, PlanInputs};
@@ -84,7 +85,7 @@ fn arm(inputs: &Arc<PlanInputs>, name: &'static str, seat: Option<&Split>) -> Re
                     split,
                     inputs,
                     place,
-                    (None, tier_batch, None),
+                    (None, tier_batch, Beside::default()),
                     (None, n),
                     &PlanLevers::default(),
                 )

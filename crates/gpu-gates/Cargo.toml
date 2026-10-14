@@ -135,17 +135,17 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "bloomery-serve"
 path = "src/bin/bloomery_serve.rs"
-required-features = ["glm5next", "clef", "mimo2"]
+required-features = ["glm5next", "clef", "mimo2", "gemma-embedding2"]
 
 [[bin]]
 name = "bloomery-serve-ds41"
 path = "src/bin/bloomery_serve_ds41.rs"
-required-features = ["deepseek41"]
+required-features = ["deepseek41", "gemma-embedding2"]
 
 [[bin]]
 name = "bloomery-serve-qwen38"
 path = "src/bin/bloomery_serve_qwen38.rs"
-required-features = ["deepseek41"]
+required-features = ["deepseek41", "gemma-embedding2"]
 
 [[bin]]
 name = "gate_qwen38_serve"

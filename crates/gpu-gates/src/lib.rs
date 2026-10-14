@@ -58,6 +58,8 @@ pub mod rope_gate;
 pub mod rounding;
 #[cfg(feature = "deepseek41")]
 pub mod serve_client;
+#[cfg(feature = "deepseek41")]
+pub mod side_seat;
 #[cfg(feature = "gpu")]
 pub mod slots_gate;
 pub mod tier;

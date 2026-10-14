@@ -180,13 +180,14 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
-use bloomery_gpu_gates::beside;
+use bloomery_gpu_gates::beside::Beside;
 use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
     note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
+use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::Levers;
@@ -220,33 +221,31 @@ fn images_of(vision: Option<&Opened>) -> (bool, Option<u64>) {
 }
 
 /// What shapes the load beside its context and slots ([`q3place::ServeOpts`]),
-/// `--mmproj`'s part read by [`images_of`].
+/// `--mmproj`'s part read by [`images_of`], `embedding` the side model's reserve on the stage
+/// card.
 fn serve_opts<'a>(
     arch: Arch,
     (place, levers): (Option<Place>, &'a PlanLevers),
     kv: KvQ8,
-    vision: Option<&Opened>,
+    (vision, embedding): (Option<&Opened>, Option<u64>),
 ) -> q3place::ServeOpts<'a> {
-    let (media, encoder) = images_of(vision);
+    let (media, image) = images_of(vision);
     q3place::ServeOpts {
         arch,
         place,
         levers,
         kv,
         media,
-        encoder,
+        beside: Beside { image, embedding },
     }
 }
 
-/// What a plan's line says of the encoder's reserve: the reserve named, `""` when the tower sits
-/// off the plan or there is none, so a load without `--mmproj` prints its lines as it did.
-fn encoder_words(encoder: Option<u64>) -> String {
-    encoder.map_or_else(String::new, |bytes| {
-        format!(
-            ", the {} reserve of {bytes} B counted",
-            beside::IMAGE_ENCODER
-        )
-    })
+/// What a plan's line says of the reserves beside the model: each named, `""` when none sits on
+/// the plan, so a load with nothing beside it prints its lines as it did.
+fn beside_words(held: Beside) -> String {
+    held.named()
+        .map(|(name, bytes)| format!(", the {name} reserve of {bytes} B counted"))
+        .collect()
 }
 
 /// The `vision_seat` record of the encoder `--mmproj` seated, nothing without one, so a load
@@ -1309,9 +1308,9 @@ fn draft_of(arch: Arch, levers: &Levers, path: &Path) -> Result<Draft, GateError
     }
 }
 
-/// Loads the model and serves until the listener or the engine fails;
-/// `Ok` carries why the server ended.
-pub fn run(args: &[String]) -> Result<ServeError, GateError> {
+/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
+/// or the engine fails; `Ok` carries why the server ended.
+pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     // A placed load (`--place`) acts on the placement's levers; set beside
     // an unplaced one, they are refused by name.
     let placed = args.iter().any(|a| a == "--place");
@@ -1356,6 +1355,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         (ids.len() == 1).then(|| ids[0])
     };
     let vision = vision_of(&a, arch, (&path, &split), &token, &one)?;
+    // The side model is read and seated before the plans, each of which holds its bytes when it
+    // sits on the stage card; it takes the card the encoder's seat takes.
+    let side = side.read()?;
+    let side_seat = side
+        .as_ref()
+        .map(|s| s.seat(a.place.unwrap_or(Place::A)))
+        .transpose()?;
+    let embedding = side_seat.as_ref().and_then(|s| s.reserve);
     let ChatSurface {
         template,
         name: alias,
@@ -1384,7 +1391,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         let asked = ctx_and_load(
             &split,
             (a.ctx, slots),
-            serve_opts(arch, (a.place, &plan_levers), kv, v),
+            serve_opts(arch, (a.place, &plan_levers), kv, (v, embedding)),
         )?;
         let cost_ctx = asked.total;
         Ok(match asked.plan {
@@ -1409,10 +1416,19 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let asked = ctx_and_load(
         &split,
         (a.ctx, slots),
-        serve_opts(arch, (a.place, &plan_levers), kv, vision.as_ref()),
+        serve_opts(
+            arch,
+            (a.place, &plan_levers),
+            kv,
+            (vision.as_ref(), embedding),
+        ),
     )?;
-    let (_, encoder) = images_of(vision.as_ref());
-    eprintln!("{}{}", asked.line(), encoder_words(encoder));
+    let (_, image) = images_of(vision.as_ref());
+    eprintln!(
+        "{}{}",
+        asked.line(),
+        beside_words(Beside { image, embedding })
+    );
     let slot_ctx = slot_ctx(usize::try_from(asked.total)?, slots)?;
     let load = asked.plan;
     if matches!(arch, Arch::Qwen35moe) {
@@ -1493,6 +1509,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             0,
         )?,
     };
+    let side = side_seat::Side::start(side.zip(side_seat))?;
     // The seat's own slots are the engine's: the seat made them at its open,
     // and the server steps them together.
     let server = bind_server(
@@ -1507,6 +1524,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             api_keys: a.api_keys,
             parallel: slots,
             queue_depth: a.queue_depth,
+            side,
         },
     )?;
     Record::new(&record::LISTENING_QWEN3)

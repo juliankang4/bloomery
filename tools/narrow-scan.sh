@@ -520,14 +520,14 @@ self_test() {
     n=$((n + 1))
     if [ "$2" = 0 ]; then echo "ok $1"; else bad=$((bad + 1)); echo "FAIL $1"; fi
   }
-  printf '%s\t%s\t%s\n' bloomery-serve-ds41 deepseek41,vision 'lib a; lib b' gate_kquant gpu 'bin gate_kquant' gate_swap gpu 'bin gate_swap' > "$t/set.tsv"
+  printf '%s\t%s\t%s\n' bloomery-serve-ds41 deepseek41,vision,gemma-embedding2 'lib a; lib b' gate_kquant gpu 'bin gate_kquant' gate_swap gpu 'bin gate_swap' > "$t/set.tsv"
   printf '#!/usr/bin/env bash\necho "scan $*"\n' > "$t/ptx-scan.sh"
   # the runner: one build per distinct feature list, the bins grouped in the set's order, one extractor build, one scan
   # block per bin, the scanner embedded verbatim
   make_runner "$t/set.tsv" "$t/ptx-scan.sh" "$t/runner.sh"; ok "runner written" $?
   bash -n "$t/runner.sh"; ok "runner parses" $?
   [ "$(grep -c '^cargo oxide build' "$t/runner.sh")" = 2 ]; ok "runner: one cargo oxide build per feature list" $?
-  grep -qF "cargo oxide build --arch $ARCH -- -p $PKG --features deepseek41,vision --release --bin bloomery-serve-ds41 >&2" "$t/runner.sh"; ok "runner: the V4.1 group" $?
+  grep -qF "cargo oxide build --arch $ARCH -- -p $PKG --features deepseek41,vision,gemma-embedding2 --release --bin bloomery-serve-ds41 >&2" "$t/runner.sh"; ok "runner: the V4.1 group" $?
   grep -qF "cargo oxide build --arch $ARCH -- -p $PKG --features gpu --release --bin gate_kquant --bin gate_swap >&2" "$t/runner.sh"; ok "runner: the gpu group takes both bins" $?
   [ "$(grep -c "^cargo build --release -p $PKG --bin oxart_ptx" "$t/runner.sh")" = 1 ]; ok "runner: one extractor build" $?
   [ "$(grep -c -- '--no-jit' "$t/runner.sh")" = 3 ]; ok "runner: one --no-jit scan per bin" $?

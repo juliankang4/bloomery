@@ -75,6 +75,7 @@ use serve::{
 
 use crate::GateError;
 use crate::record::Record;
+use crate::side_seat::SideEngine;
 
 /// The file's vocabulary as the server reads it.
 pub struct Vocab {
@@ -299,11 +300,15 @@ pub struct Listen<'a> {
     /// The slots the engine made at its open, which the server steps together.
     pub parallel: usize,
     pub queue_depth: Option<usize>,
+    /// The embedding model the server holds beside the engine (`--embd-model`), which its
+    /// embeddings routes answer from; `None` answers them with a 501.
+    pub side: Option<SideEngine>,
 }
 
 /// The server over a seat's `engine`: the sampler crate's chain, the fatal
-/// linger every seat keeps, the seat's own slots as the server's. The seat
-/// prints its own `listening` record from the bound server and runs it.
+/// linger every seat keeps, the seat's own slots as the server's, and the side
+/// model beside it. The seat prints its own `listening` record from the bound
+/// server and runs it.
 pub fn bind_server(engine: SeatEngine, l: Listen<'_>) -> Result<Server, ServeError> {
     let config = ServerConfig {
         model_alias: l.alias,
@@ -319,7 +324,11 @@ pub fn bind_server(engine: SeatEngine, l: Listen<'_>) -> Result<Server, ServeErr
         queue_depth: l.queue_depth,
         ..SlotConfig::default()
     };
-    Server::bind_with((l.host, l.port), Box::new(engine), config, slots)
+    let server = Server::bind_with((l.host, l.port), Box::new(engine), config, slots)?;
+    Ok(match l.side {
+        Some(side) => server.with_side(Box::new(side)),
+        None => server,
+    })
 }
 
 /// What set a seat's slot count, the word its `parallel` line's `from=` names:
@@ -501,13 +510,14 @@ impl SeatFlags {
 
     /// [`bind_server`] over `engine` with these flags: the alias the flag
     /// gave or `chat`'s, `chat`'s template, no slot file path, `slots`
-    /// slots the seat made at its open.
+    /// slots the seat made at its open, and the side model beside it.
     pub fn bind(
         self,
         engine: SeatEngine,
         chat: ChatSurface,
         path: &Path,
         slots: usize,
+        side: Option<SideEngine>,
     ) -> Result<Server, ServeError> {
         let SeatFlags {
             host,
@@ -529,6 +539,7 @@ impl SeatFlags {
                 api_keys,
                 parallel: slots,
                 queue_depth,
+                side,
             },
         )
     }

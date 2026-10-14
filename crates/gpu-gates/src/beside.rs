@@ -1,9 +1,10 @@
 //! What a plan holds beside its own tensors: a model the process serves beside the planned one (the
-//! image encoder's tower) that sits on the stage card, as a named reserve of fixed bytes the plan's
-//! fit counts ([`model::placement::Card::reserves`]). One function enters it into a placed plan's
-//! machine and a whole-fit probe's ([`reserve_on`]), one reads it back ([`reserve_in`]), and a
-//! plan's refusal ([`refusal`]) and a verdict's line ([`note`]) name it. Free of the encoder crates,
-//! so a placement module every build includes can take it.
+//! image encoder's tower, the embedding model of a side seat) that sits on the stage card, as a
+//! named reserve of fixed bytes the plan's fit counts ([`model::placement::Card::reserves`]). One
+//! function enters it into a placed plan's machine and a whole-fit probe's ([`reserve_on`]), one
+//! reads it back ([`reserve_in`]), and a plan's refusal ([`refusal`]) and a verdict's line
+//! ([`note`]) name it. Free of the encoder crates, so a placement module every build includes can
+//! take it.
 
 use std::fmt::Display;
 
@@ -13,18 +14,23 @@ use model::placement::{Card, Machine};
 /// (beside `workstation`'s draft and tier-batch reserves).
 pub const IMAGE_ENCODER: &str = "image encoder";
 
+/// What the plan's reserve for a side seat's embedding model is called ([`crate::side_seat`]).
+pub const EMBEDDING: &str = "embedding model";
+
 /// The bytes a plan reserves on its stage card beside its own tensors, by what they are for;
 /// `None` for one that sits off the plan or is not served.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Beside {
     /// The image encoder's tower.
     pub image: Option<u64>,
+    /// The embedding model a side seat serves.
+    pub embedding: Option<u64>,
 }
 
 impl Beside {
     /// Each reserve by its name, in the order the stage card takes them.
-    fn named(self) -> impl Iterator<Item = (&'static str, u64)> {
-        [(IMAGE_ENCODER, self.image)]
+    pub fn named(self) -> impl Iterator<Item = (&'static str, u64)> {
+        [(IMAGE_ENCODER, self.image), (EMBEDDING, self.embedding)]
             .into_iter()
             .filter_map(|(name, bytes)| Some((name, bytes?)))
     }
@@ -53,6 +59,7 @@ pub fn reserve_in(machine: &Machine) -> Beside {
     };
     Beside {
         image: held(IMAGE_ENCODER),
+        embedding: held(EMBEDDING),
     }
 }
 
@@ -65,17 +72,17 @@ pub fn with_reserve(plain: impl Fn(usize) -> Machine, beside: Beside) -> impl Fn
     }
 }
 
-/// What a verdict's line adds when its card carries the image encoder's reserve: the reserve by
-/// name and bytes, beside the reserves term the verdict sums them in. Nothing for a card that
-/// carries none, so a load without `--mmproj` prints its line as it did.
+/// What a verdict's line adds when its card carries reserves [`reserve_on`] puts there: each by
+/// name and bytes, in [`Beside`]'s order, beside the reserves term the verdict sums them in.
+/// Nothing for a card that carries none, so a load with nothing beside it prints its line as it
+/// did.
 #[must_use]
 pub fn note(card: &Card) -> String {
-    card.reserves
+    [IMAGE_ENCODER, EMBEDDING]
         .iter()
-        .find(|(name, _)| name == IMAGE_ENCODER)
-        .map_or_else(String::new, |(name, bytes)| {
-            format!("; the reserves term holds the {name}'s {bytes} B")
-        })
+        .filter_map(|&want| card.reserves.iter().find(|(name, _)| name == want))
+        .map(|(name, bytes)| format!("; the reserves term holds the {name}'s {bytes} B"))
+        .collect()
 }
 
 /// A plan's refusal, beside the reserves that were in it: with none the refusal as it is.
@@ -102,7 +109,10 @@ mod tests {
     /// the same named bytes, the card sets aside exactly that much more, and none changes nothing.
     #[test]
     fn the_probe_and_the_placed_plan_see_the_same_reserve() {
-        let image = Beside { image: Some(BYTES) };
+        let image = Beside {
+            image: Some(BYTES),
+            embedding: None,
+        };
         let plain = plan_a(40);
         let mut probe = plan_a(40);
         reserve_on(&mut probe, image);
@@ -135,6 +145,39 @@ mod tests {
         assert_eq!(
             refusal(image, "no fit"),
             "the plan holds the image encoder's 1476000000 B as the stage card's image encoder \
+             reserve: no fit"
+        );
+    }
+
+    /// Both reserves enter the stage card in order and come back, and the note and the refusal
+    /// name each.
+    #[test]
+    fn the_embedding_model_is_a_second_reserve() {
+        let both = Beside {
+            image: Some(BYTES),
+            embedding: Some(7),
+        };
+        let mut machine = plan_a(40);
+        reserve_on(&mut machine, both);
+        assert_eq!(reserve_in(&machine), both);
+        assert_eq!(
+            machine.cards[0].reserve_bytes(),
+            plan_a(40).cards[0].reserve_bytes() + BYTES + 7
+        );
+        assert_eq!(
+            note(&machine.cards[0]),
+            "; the reserves term holds the image encoder's 1476000000 B; the reserves term holds \
+             the embedding model's 7 B"
+        );
+        assert_eq!(
+            refusal(
+                Beside {
+                    image: None,
+                    embedding: Some(7),
+                },
+                "no fit"
+            ),
+            "the plan holds the embedding model's 7 B as the stage card's embedding model \
              reserve: no fit"
         );
     }

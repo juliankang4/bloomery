@@ -345,7 +345,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         )?,
         _ => unreachable!("the arch check above refused every other architecture"),
     };
-    let server = a.bind(engine, chat, &path, slots)?;
+    let server = a.bind(engine, chat, &path, slots, None)?;
     Record::new(&record::LISTENING_NEMOTRON)
         .w("place", place.name())
         .u("ctx", slot_ctx)

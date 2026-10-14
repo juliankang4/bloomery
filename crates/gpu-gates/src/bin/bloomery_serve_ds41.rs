@@ -6,7 +6,8 @@
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match ds41::run(&args) {
+    let side = bloomery_gpu_gates::side_seat::Flags::take(&args);
+    match side.and_then(|(side, rest)| ds41::run(&rest, &side)) {
         // EX_SOFTWARE: the engine, not the listener or the load, ended the run.
         Ok(serve::ServeError::Engine(f)) => {
             eprintln!("bloomery-serve-ds41: {f}");

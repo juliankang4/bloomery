@@ -320,6 +320,7 @@ use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
     SlotStep, SlotsFrom, Vocab, arm_screen, begin, bind_server, eprint_noted, model_props,
@@ -331,7 +332,7 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{
     CARD38, Lever38, Seqs, check_reserve, checkpoints_reserved, reserve_checkpoints, residency38,
 };
-use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
+use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, side_seat, vision_seat};
 use bloomery_levers::{
     ChurnHosting, Draft38At, Draft38Off, Paged, Residency38At, ResidencyPick, ResidencyWhy,
     draft38_unset, residency38_unset,
@@ -458,12 +459,16 @@ enum Kind38 {
 struct Place38 {
     kind: Kind38,
     cards: Place,
+    /// The side model's reserve on the stage card, which every machine of the placement
+    /// carries ([`Place38::machine`]).
+    embedding: Option<u64>,
 }
 
 impl Place38 {
     const A: Place38 = Place38 {
         kind: Kind38::A,
         cards: Place::A,
+        embedding: None,
     };
 
     fn parse(v: &str) -> Result<Place38, GateError> {
@@ -479,7 +484,11 @@ impl Place38 {
                 .into());
             }
         };
-        Ok(Place38 { kind, cards })
+        Ok(Place38 {
+            kind,
+            cards,
+            embedding: None,
+        })
     }
 
     fn name(self) -> &'static str {
@@ -523,7 +532,7 @@ impl Place38 {
     /// ([`seqs38`] through [`reserve_checkpoints`], priced at `ctx` positions
     /// a slot) and, under the draft, every slot's checkpoint hidden rows
     /// ([`POINT_ROWS_RESERVE`]), which the plan's host need, the NVMe tier's
-    /// floor and its arena then count.
+    /// floor and its arena then count. The stage card carries the side model's reserve.
     fn machine(
         self,
         inputs: &PlanInputs,
@@ -547,6 +556,13 @@ impl Place38 {
                 )
             }
         };
+        beside::reserve_on(
+            &mut machine,
+            Beside {
+                image: None,
+                embedding: self.embedding,
+            },
+        );
         reserve_checkpoints(&mut machine, seqs38(inputs, slots), ctx)?;
         if mtp.is_some() {
             let bytes = point_row_budget38(gdn_layers(inputs), ctx)?;
@@ -1043,9 +1059,9 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     Ok(a)
 }
 
-/// Loads the model and serves until the listener or the engine fails;
-/// `Ok` carries why the server ended.
-pub fn run(args: &[String]) -> Result<ServeError, GateError> {
+/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
+/// or the engine fails; `Ok` carries why the server ended.
+pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
     record::at_main("bloomery-serve-qwen38", record::BLOOMERY_SERVE_QWEN38);
@@ -1066,6 +1082,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let feed = Feed38::of(&levers)?;
     let mut a = parse_args(args)?;
+    let side = side.read()?;
     // The placement the seat runs by: the flag's word, or unset the common
     // rule's (`Place::choose`) on the census, read once — chosen below, once
     // the plan's inputs are known, the rule asking the offer's plan for its
@@ -1212,6 +1229,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // a load that `--place a` serves.
     let chosen = q38place::choose(a.flag.map(|p| p.cards), &census, |offer| {
         let specs = offer.card_specs()?;
+        let seat = side
+            .as_ref()
+            .map(|s| vision_seat::encoder_seat(offer, s.bytes))
+            .transpose()?;
         q38place::tier_experts(
             &inputs,
             (specs[0], specs[1]),
@@ -1223,9 +1244,16 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             &plan_levers,
             mtp_inputs.as_ref(),
             seqs38(&inputs, slots),
+            Beside {
+                image: None,
+                embedding: seat.as_ref().and_then(|s| s.reserve),
+            },
         )
     })?;
     chosen.record().eprint();
+    // The side model's seat before the plans, each of which holds its bytes when it sits on the
+    // stage card.
+    let side_seat = side.as_ref().map(|s| s.seat(chosen.place)).transpose()?;
     a.place = Place38 {
         kind: match a.flag {
             Some(f) => f.kind,
@@ -1233,6 +1261,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             None => Kind38::Bp,
         },
         cards: chosen.place,
+        embedding: side_seat.as_ref().and_then(|s| s.reserve),
     };
     // Plan (b′)'s tier cards held too, and the room read again: every plan
     // below and the engine thread's take it.
@@ -1575,6 +1604,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         props,
         cache.ram,
     )?;
+    let side = side_seat::Side::start(side.zip(side_seat))?;
 
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together (the engine declares its
@@ -1591,6 +1621,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             api_keys: a.api_keys,
             parallel: slots,
             queue_depth: a.queue_depth,
+            side,
         },
     )?;
     Record::new(&record::LISTENING38)

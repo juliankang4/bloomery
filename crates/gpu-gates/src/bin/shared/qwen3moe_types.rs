@@ -51,7 +51,7 @@ pub fn serve_default(split: &Split) -> Result<String, String> {
         levers: &levers,
         kv: KvQ8::F16,
         media: false,
-        encoder: None,
+        beside: Default::default(),
     };
     let (chosen, _) = q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts)
         .map_err(|e| format!("the --ctx choice refused: {e}"))?;

@@ -3041,6 +3041,21 @@ pub static VISION: Kind = Kind {
     ],
 };
 
+/// The embedding side seat before its chat model's plan.
+pub static EMBEDDING_SEAT: Kind = Kind {
+    name: "embedding_seat",
+    head: "embedding_seat",
+    doc: "The embedding model as the plan seats it before loading: its architecture, card, total card bytes, context bound and stage-card reserve (zero off the plan).",
+    parts: &[
+        key("arch", Word, ""),
+        key("card", Word, ""),
+        key("seat", Word, ""),
+        key("bytes", U64, "B"),
+        key("reserve", U64, "B"),
+        key("ctx", U64, "positions"),
+    ],
+};
+
 /// A serve seat's image encoder as the plan seats it, before any load (`vision_seat::seat_record`).
 pub static VISION_SEAT: Kind = Kind {
     name: "vision_seat",
@@ -3269,6 +3284,14 @@ macro_rules! kinds {
 /// in the generate and chat lists by hand, which `tools/ref/cold-blocks.sh`
 /// and `tools/ref/depth-glm5next.sh` read as exact print sets.
 pub mod groups {
+    /// `side_seat.rs`.
+    pub mod side_seat {
+        use crate::record::{EMBEDDING_SEAT, Kind};
+
+        /// The side model's seat: `Side::seat`.
+        pub const SEAT: &[&Kind] = &[&EMBEDDING_SEAT];
+    }
+
     /// `vision_seat.rs`.
     pub mod vision_seat {
         use crate::record::{Kind, VISION, VISION_SEAT};
@@ -3465,6 +3488,7 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
 /// the seat registers, and its projector fetch ([`crate::model_file::hf_projector`]),
 /// which runs after.
 pub static BLOOMERY_SERVE_DS41: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
     groups::model_file::FETCH,
     groups::model_file::SET,
     &[
@@ -3505,6 +3529,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = kinds![
 /// What `bloomery-serve-qwen38` prints, all on stderr; the `hf` lines are a
 /// `--hf` repo's resolve, which the server runs before the seat registers.
 pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
     groups::model_file::FETCH,
     groups::model_file::SET,
     &[&PLAN38, &HOST_ONLY, &LISTENING38],
@@ -3539,6 +3564,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
 /// after them under `--mmproj`, the address and each request's note of the
 /// prefix it kept none of.
 pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
     &[&PLACE_UNSET],
     groups::qwen3moe_place::PLAN,
     groups::model_file::FETCH,
@@ -3557,6 +3583,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
 /// phases, the address and each request's note of the prefix it kept less of
 /// than it shared.
 pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
     &[&RESIDENCY_LEVER, &PLACE_UNSET, &PLAN],
     groups::residency38::HOST,
     groups::model_file::FETCH,
@@ -3588,6 +3615,7 @@ pub static BLOOMERY_SERVE_NEMOTRON: &[&Kind] = kinds![
 /// record under `--mmproj`. The `hf` lines are the `--hf` repo's resolve, which the server runs before
 /// the seat registers, and its projector fetch ([`crate::model_file::hf_projector`]), which runs after.
 pub static BLOOMERY_SERVE_GLM: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
     &[&RESIDENCY_LEVER, &DRAFT_UNSET_GLM, &DRAFT_YIELD],
     groups::model_file::FETCH,
     groups::model_file::SET,
@@ -4599,7 +4627,7 @@ mod tests {
     fn every_binary_registers_the_groups_its_entries_require() {
         use groups::{
             bind, drafted, ds41_draft, ds41_split, host_stats, model_file, qwen3moe_place,
-            residency38, vision_seat,
+            residency38, side_seat, vision_seat,
         };
         type Group = &'static [&'static Kind];
         let table: [(&str, Group, &[Group]); 12] = [
@@ -4607,6 +4635,7 @@ mod tests {
                 "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
                 BLOOMERY_SERVE_DS41,
                 &[
+                    side_seat::SEAT,
                     model_file::FETCH,
                     model_file::SET,
                     vision_seat::RECORDS,
@@ -4620,6 +4649,7 @@ mod tests {
                 "qwen38 seat: SlotDrafts::open, residency38, bind::spawn",
                 BLOOMERY_SERVE_QWEN38,
                 &[
+                    side_seat::SEAT,
                     model_file::FETCH,
                     model_file::SET,
                     drafted::PROMPT,
@@ -4634,6 +4664,7 @@ mod tests {
                 "qwen3 seat: Flags::encoder, q3place::serve_choice, bind::spawn",
                 BLOOMERY_SERVE_QWEN3,
                 &[
+                    side_seat::SEAT,
                     model_file::FETCH,
                     model_file::SET,
                     vision_seat::RECORDS,
@@ -4646,6 +4677,7 @@ mod tests {
                 "mimo2 seat: residency_set, bind::spawn",
                 BLOOMERY_SERVE_MIMO2,
                 &[
+                    side_seat::SEAT,
                     model_file::FETCH,
                     model_file::SET,
                     residency38::HOST,
@@ -4661,6 +4693,7 @@ mod tests {
                 "glm seat: Flags::encoder, residency_set, SlotDrafts::open, bind::spawn",
                 BLOOMERY_SERVE_GLM,
                 &[
+                    side_seat::SEAT,
                     model_file::FETCH,
                     model_file::SET,
                     vision_seat::RECORDS,

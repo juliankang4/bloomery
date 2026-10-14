@@ -81,7 +81,7 @@ pub fn with_cards(
 /// (`generate::choose_ctx`): the limit is the file's trained context within
 /// [`KERNEL_POSITIONS`], and a probe is the load's plan of every slot at
 /// a slot context on `place`'s machine with `reserve` (the DSpark draft's),
-/// `tier_batch` and `vision` (the encoder's stage-card reserve), its refusal
+/// `tier_batch` and `held` (the stage card's reserves), its refusal
 /// read for the memory it was short of. `set` is the total the slots split.
 #[allow(
     dead_code,
@@ -91,7 +91,7 @@ pub fn ctx_choice(
     split: &Split,
     inputs: &PlanInputs,
     place: Place,
-    (reserve, tier_batch, vision): (Option<u64>, Option<TierBatchBytes>, Option<u64>),
+    (reserve, tier_batch, held): (Option<u64>, Option<TierBatchBytes>, Beside),
     (set, slots): (Option<usize>, NonZeroUsize),
     levers: &PlanLevers,
 ) -> Result<Chosen<()>, GateError> {
@@ -105,7 +105,7 @@ pub fn ctx_choice(
         (Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")), None),
         |c| -> Result<Probe<()>, GateError> {
             let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
-            beside::reserve_on(&mut machine, Beside { image: vision });
+            beside::reserve_on(&mut machine, held);
             reserve_checkpoints(&mut machine, Seqs::none(slots.get()), c)?;
             match inputs.plan_with_slots(&machine, c, levers, slots) {
                 Ok(_) => Ok(Probe::Holds(())),

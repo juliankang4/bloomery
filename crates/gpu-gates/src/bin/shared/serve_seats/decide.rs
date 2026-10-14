@@ -213,6 +213,7 @@ fn open_qwen35(
 ) -> Result<(Box<dyn Hidden>, Split), GateError> {
     let reserve = Beside {
         image: image.and_then(|s| s.reserve),
+        embedding: None,
     };
     let o = crate::qwen35_open::open_shape(ctx, image.is_some());
     let (model, split) =
@@ -577,6 +578,7 @@ fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiv
         let card = Place::A.on(&census)?.card_specs()?[0];
         let reserve = Beside {
             image: image.as_ref().and_then(|o| o.seat.reserve),
+            embedding: None,
         };
         let media = image.is_some();
         let chosen = choose_ctx(

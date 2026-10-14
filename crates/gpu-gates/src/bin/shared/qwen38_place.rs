@@ -6,6 +6,7 @@
 //! them here.
 
 use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule, choose_ctx_of, short_in};
 use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
 use model::arch::qwen35moe::place::{
@@ -49,7 +50,8 @@ pub fn choose(
 /// `PlanInputs::plan_with_slots`/`plan_mtp_with_slots`); a plan that refuses
 /// (a host expert rule on a tier machine, an idle tier card, a context past
 /// the card's, a host room under the NVMe tier's floor) is the caller's
-/// error, which `Place::choose` answers with `a`.
+/// error, which `Place::choose` answers with `a`. The stage card takes `held`'s named
+/// reserves before the tier count is chosen, just as the serving plan does.
 pub fn tier_experts(
     inputs: &PlanInputs,
     cards: (CardSpec, CardSpec),
@@ -58,6 +60,7 @@ pub fn tier_experts(
     levers: &PlanLevers,
     mtp: Option<&MtpInputs>,
     seqs: Seqs,
+    held: Beside,
 ) -> Result<u64, GateError> {
     let slots = seqs.slots;
     let mut machine = machine_bp_on(
@@ -67,6 +70,7 @@ pub fn tier_experts(
         mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?,
         tier_batch(&inputs.hp, ub),
     );
+    beside::reserve_on(&mut machine, held);
     reserve_checkpoints(&mut machine, seqs, ctx)?;
     let plan = match mtp {
         None => inputs.plan_with_slots(&machine, ctx, levers, experts, slots)?,

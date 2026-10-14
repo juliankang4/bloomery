@@ -50,7 +50,7 @@ fn serve_arm(split: &Split) -> Result<Arm, Outcome> {
         levers: &levers,
         kv: KvQ8::F16,
         media: false,
-        encoder: None,
+        beside: Default::default(),
     };
     let total = floor_or(
         q3place::serve_choice(split, (None, DEFAULT_SLOTS), opts).map(|(chosen, _)| chosen.total),
@@ -78,7 +78,7 @@ fn open35(ctx: usize) -> Result<Open35, Outcome> {
 /// reading (`q3place::PlaceQ3::qwen35_on` rebuilds it).
 fn arm(split: &Split, name: &'static str, o: &Open35, seqs: q3place::Seqs) -> Result<Arm, Outcome> {
     let census = q3place::census().map_err(|e| outcome_of(e.as_ref()))?;
-    match q3place::unplaced_qwen35_slots(split, &census, o, seqs, None)
+    match q3place::unplaced_qwen35_slots(split, &census, o, seqs, Default::default())
         .map_err(|e| outcome_of(e.as_ref()))
     {
         Ok(q3place::Unplaced::Whole(_)) => {
@@ -88,7 +88,7 @@ fn arm(split: &Split, name: &'static str, o: &Open35, seqs: q3place::Seqs) -> Re
                 &census,
                 q3place::share(o, o.ctx, seqs.slots),
                 seqs,
-                None,
+                Default::default(),
             )
             .map_err(|e| outcome_of(e.as_ref()))?;
             let ctx = o.ctx;

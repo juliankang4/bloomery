@@ -24,7 +24,18 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   `input`, or `content`, as llama-server does: a string, a list of ids, a list of strings and ids, or a list of
   these, each one input; `embd_normalize` is `-1` (none), `0` (onto the int16 range), `1` (taxicab), `2`
   (euclidean, the default) or a higher p-norm. They answer from the embedding model the server holds beside its
-  chat model, and with none a 501 `not_supported_error`. An input past the model's context is a 400
+  chat model (`--embd-model FILE` or `--embd-hf <repo>[:<quant>]`), and with none a 501
+  `not_supported_error`. EmbeddingGemma 2 (Q8_0) runs its encoder, output projection and mean pooling
+  on its own thread and card stream, up to 8192 tokens per input. Its MRL widths are the 128, 256
+  and 512 cuts below the file's `embedding_length_out`, plus that full width, cut before normalization.
+  A file whose output width is below 128 is refused at open. Its seat is the smallest card outside the chat plan, else a
+  named `embedding model` reserve on the stage card, subtracted from the chat expert budget.
+  `--mmproj` and `--embd-model` on the same off-plan card do not count each other's bytes; the second open
+  fails by name if the card is short.
+  The response `model` is the embedding file name, also listed separately in `/v1/models` with
+  `meta.n_embd` and `meta.n_ctx`. On `/v1/embeddings`, a `model` of another type than a string or a name
+  other than the embedding model's is a 400 `invalid_request_error` and runs no pass; `null` is unset.
+  `/embedding` and `/embeddings` ignore `model`. An input past the model's context is a 400
   `exceed_context_size_error` naming both lengths. llama-server checks its physical batch first and answers an input
   past it with a 500; this server has no batch limit there. An object input (`prompt_string`, or a `content` array
   of parts) is a 400.

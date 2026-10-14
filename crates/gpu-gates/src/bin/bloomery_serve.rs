@@ -48,6 +48,13 @@
 //! it); a file whose architecture does not match an explicit
 //! `--model` is refused by name before any load.
 //! `--version` prints this crate's version and the build's commit and exits.
+//! `--embd-model FILE` or `--embd-hf <repo>[:<quant>]` names an embedding
+//! model the server holds beside a generative seat's model for its embeddings routes
+//! (`bloomery_gpu_gates::side_seat`): read and seated before the chat model's plan, which holds
+//! its bytes when it sits on the stage card, and loaded after the chat model. A file of an
+//! embedding architecture given as `-m` is refused by name, and so is an embedding model beside
+//! the decide and nemotron seats. EmbeddingGemma 2's row opens the encoder on the seat card;
+//! its pass owns the output projection and mean pooling, and the HTTP layer cuts and normalizes.
 //!
 //! Two checks run before anything is fetched or loaded, each a named refusal
 //! (`serve::preflight`): first of all, on a CPU that does not run the
@@ -117,6 +124,7 @@ mod place;
 mod drive {
     use std::process::ExitCode;
 
+    use bloomery_gpu_gates::side_seat;
     use bloomery_gpu_gates::{GateError, exit_with, model_file, ref_model_path};
     use cuda_core::sys;
     use gguf::Split;
@@ -131,7 +139,8 @@ mod drive {
 
     const USAGE: &str = "usage: bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|nemotron|decide] \
                          [-m PATH | --model-file PATH | --hf <repo>[:<quant>]] [--head <weights> \
-                         [--head-config <file>]] <the chosen seat's own flags, as \
+                         [--head-config <file>]] [--embd-model FILE | --embd-hf \
+                         <repo>[:<quant>]] <the chosen seat's own flags, as \
                          bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3, the \
                          mimo2, the nemotron or the decide seat takes them> | --version";
 
@@ -290,6 +299,14 @@ models (the --model word is optional with a model file: the file's architecture 
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let (seat, arch) = match split.architecture() {
+            Some(a) if side_seat::row(a).is_some() => {
+                return Err(format!(
+                    "{} is a {a} file, an embedding model: serve it beside a chat model with \
+                     --embd-model",
+                    path.display()
+                )
+                .into());
+            }
             Some(a) if decide::ROWS.iter().any(|r| r.backbones.contains(&a)) => {
                 return Err(format!(
                     "{}: {}",
@@ -442,7 +459,19 @@ models (the --model word is optional with a model file: the file's architecture 
             Ok(v) => v,
             Err(e) => return exit_with(NAME, Err(e)),
         };
+        // The side model's flags come out before the seat reads its own; its file is read in the
+        // seat, after the levers.
+        let (side, rest) = match side_seat::Flags::take(&rest) {
+            Ok(v) => v,
+            Err(e) => return exit_with(NAME, Err(e)),
+        };
         if let Some(from) = from {
+            if side.names() {
+                return exit_with(
+                    NAME,
+                    Err("--embd-model: the decide seat serves no embedding model".into()),
+                );
+            }
             return ended(decide::run(&rest, from, repo.as_deref()));
         }
         let (seat, arch) = match seat_of_file() {
@@ -463,12 +492,18 @@ models (the --model word is optional with a model file: the file's architecture 
             );
         }
         let r = match seat {
-            Model::Ds41 => ds41::run(&rest),
-            Model::Qwen38 => qwen38::run(&rest),
-            Model::Glm => glm::run(&rest),
-            Model::Qwen3 => qwen3::run(&rest),
-            Model::Mimo2 => mimo2::run(&rest),
-            Model::Nemotron => nemotron::run(&rest),
+            Model::Ds41 => ds41::run(&rest, &side),
+            Model::Qwen38 => qwen38::run(&rest, &side),
+            Model::Glm => glm::run(&rest, &side),
+            Model::Qwen3 => qwen3::run(&rest, &side),
+            Model::Mimo2 => mimo2::run(&rest, &side),
+            Model::Nemotron => {
+                if side.names() {
+                    Err("--embd-model: the nemotron seat serves no embedding model".into())
+                } else {
+                    nemotron::run(&rest)
+                }
+            }
         };
         ended(r)
     }

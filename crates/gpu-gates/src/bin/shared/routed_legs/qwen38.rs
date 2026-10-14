@@ -146,6 +146,7 @@ fn choose(inputs: &PlanInputs, ctx: u64, seqs: Seqs) -> Result<Place, Outcome> {
             // unset.
             None,
             seqs,
+            bloomery_gpu_gates::beside::Beside::default(),
         )
     })
     .map(|chosen| chosen.place)

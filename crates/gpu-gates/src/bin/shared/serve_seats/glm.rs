@@ -259,6 +259,7 @@ use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::residency38::{
     GLM_CARD, check_reserve, checkpoints_reserved, glm_machine, residency_room, residency_set,
 };
+use bloomery_gpu_gates::side_seat::{self, Side};
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 #[cfg(feature = "vision")]
@@ -471,7 +472,7 @@ impl Images<'_> {
 /// A placement as the seat plans it: the tier's prompt-batch bytes, the
 /// machine (carrying the image encoder's reserve when the tower sits on its
 /// stage card), the context rule over it, the experts its tier cards hold
-/// in the plan at the rule's context (0 with no tier card) and the encoder
+/// in the plan at the rule's context (0 with no tier card), the encoder
 /// it seats under `--mmproj`.
 struct Placed {
     place: Place,
@@ -486,21 +487,25 @@ struct Placed {
 
 impl Placed {
     /// `place` planned for `slots` sequences on the load `nextn` names, its
-    /// context `set` or the rule's ([`glm_place::serve_ctx`]), the encoder `images` seat
-    /// counted; every refusal of the plan's by name.
+    /// context `set` or the rule's ([`glm_place::serve_ctx`]), the encoder `images` seat and
+    /// the side model's seat counted; every refusal of the plan's by name.
     fn of(
         place: Place,
         inputs: &PlanInputs,
         levers: &PlanLevers,
         nextn: Option<&NextnInputs>,
         (set, slots): (Option<usize>, usize),
-        images: &Images<'_>,
+        (images, side): (&Images<'_>, Option<&Side>),
     ) -> Result<Placed, GateError> {
         let tier_batch = glm_place::tier_batch(place, &inputs.hp);
         // Every machine reserves its checkpoints at the slot context it is
         // laid for: the choice's probes each at their own, the load's at the
         // context it is granted; and the encoder's reserve, as the printed plan does.
         let price = checkpoint_price(inputs)?;
+        let side_seat = side
+            .map(|s| vision_seat::encoder_seat(place, s.bytes))
+            .transpose()?;
+        let embedding = side_seat.as_ref().and_then(|s| s.reserve);
         // A projector the `--hf` repo picked stays only where the plan gives the text model the
         // same experts and context with its reserve as without ([`vision_seat::kept`]).
         let cost = |v: Option<&Opened>| -> Result<vision_seat::Cost, GateError> {
@@ -508,7 +513,10 @@ impl Placed {
             let machine_at = |ctx: u64| -> Result<Machine, GateError> {
                 Ok(beside::with_reserve(
                     glm_machine(place, tier_batch, slots, price, ctx)?,
-                    Beside { image: reserve },
+                    Beside {
+                        image: reserve,
+                        embedding,
+                    },
                 )(inputs.model.layers))
             };
             let ctx = u64::try_from(
@@ -519,11 +527,14 @@ impl Placed {
             Ok(vision_seat::Cost::of(&plan, ctx))
         };
         let vision = vision_seat::kept(images.seat(place)?, images.flags, cost)?;
-        let reserve = vision.as_ref().and_then(|v| v.seat.reserve);
+        let held = Beside {
+            image: vision.as_ref().and_then(|v| v.seat.reserve),
+            embedding,
+        };
         let machine_at = |ctx: u64| -> Result<Machine, GateError> {
             Ok(beside::with_reserve(
                 glm_machine(place, tier_batch, slots, price, ctx)?,
-                Beside { image: reserve },
+                held,
             )(inputs.model.layers))
         };
         let (slot_ctx, line) =
@@ -532,15 +543,14 @@ impl Placed {
         let machine = machine_at(ctx)?;
         // `glm_place::tier_experts` plans on a machine of its own, which carries no reserve: a
         // stage-reserve seat counts its tier on the machine the plan runs by.
-        let tier_experts = match reserve {
-            None => {
-                glm_place::tier_experts(place, inputs, ctx, levers, nextn, KdaLanes::One, slots)?
-            }
-            Some(_) => plan_of(inputs, &machine, ctx, levers, nextn, slots)?
+        let tier_experts = if held == Beside::default() {
+            glm_place::tier_experts(place, inputs, ctx, levers, nextn, KdaLanes::One, slots)?
+        } else {
+            plan_of(inputs, &machine, ctx, levers, nextn, slots)?
                 .tier_n_l
                 .iter()
                 .flatten()
-                .sum(),
+                .sum()
         };
         Ok(Placed {
             place,
@@ -751,15 +761,18 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     Ok(a)
 }
 
-/// Loads the model and serves until the listener or the engine fails; `Ok`
-/// carries why the server ended.
-pub fn run(args: &[String]) -> Result<ServeError, GateError> {
+/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
+/// or the engine fails; `Ok` carries why the server ended.
+pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
     let width = WidthMode::of(levers.mtp_width())?;
     record::at_main(WHAT, record::BLOOMERY_SERVE_GLM);
     arm_screen(levers.screen());
     let a = parse_args(args)?;
+    // The side model is read before the plans, each of which holds its bytes when it sits on the
+    // placement's stage card.
+    let side = side.read()?;
     // The census the placement resolves against, read once: `--place` as
     // given, or unset the common rule's choice on the same reading.
     let census = gpu_census::census()?;
@@ -863,7 +876,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             &plan_levers,
             nextn.as_ref(),
             (set, slots),
-            &images,
+            (&images, side.as_ref()),
         )
     };
     // The placement the seat runs by (`Place::choose`, by the GLM family's
@@ -902,7 +915,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 &plan_levers,
                 None,
                 (a.ctx, slots),
-                &images,
+                (&images, side.as_ref()),
             )?;
             let with = drafted.as_ref().map_or(0, |d| d.ctx);
             let bytes = nextn
@@ -945,6 +958,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         vision,
         ..
     } = placed;
+    let side_seat = side.as_ref().map(|s| s.seat(place)).transpose()?;
     eprintln!("{line}");
     if draft_off.is_none() && slot_ctx < NEED {
         return Err(format!(
@@ -1034,6 +1048,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         cache_ram: cache.ram,
         stats: levers.step_stats(),
         width,
+        embedding: side_seat.as_ref().and_then(|s| s.reserve),
         vision,
     };
     let engine = SeatEngine::spawn(
@@ -1044,6 +1059,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         props,
         cache.ram,
     )?;
+    let side = side_seat::Side::start(side.zip(side_seat))?;
 
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together (the engine declares its
@@ -1060,6 +1076,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             api_keys: a.api_keys,
             parallel: slots,
             queue_depth: a.queue_depth,
+            side,
         },
     )?;
     Record::new(&record::LISTENING_GLM)
@@ -1111,6 +1128,8 @@ struct SeatArgs {
     /// reserve rides the load's machine, and its tower is loaded after the
     /// model (`open_encoder`).
     vision: Option<Opened>,
+    /// The side model's reserve on the stage card, which the plan counted.
+    embedding: Option<u64>,
 }
 
 /// The GLM session on the engine thread: the session over the model, the
@@ -1175,7 +1194,8 @@ impl Glm {
             lane: a.lane,
         };
         let prefill = a.cfg.prefill;
-        // The plan the open runs by counts the encoder's reserve, as the printed plan did.
+        // The plan the open runs by counts the encoder's and the side model's reserves, as the
+        // printed plan did.
         let reserve = a.vision.as_ref().and_then(|v| v.seat.reserve);
         let args = app::OpenArgs {
             place: a.place.name(),
@@ -1187,7 +1207,10 @@ impl Glm {
                     a.checkpoint_price,
                     u64::try_from(a.ctx)?,
                 )?,
-                Beside { image: reserve },
+                Beside {
+                    image: reserve,
+                    embedding: a.embedding,
+                },
             ),
             ctx: a.ctx,
             mode: StepMode::Graph,

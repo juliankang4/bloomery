@@ -306,6 +306,7 @@ mod gate {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
+    use bloomery_gpu_gates::beside::Beside;
     use bloomery_gpu_gates::bind::nvidia_smi_index;
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, rung_above};
     use bloomery_gpu_gates::generate::Place;
@@ -1924,11 +1925,15 @@ mod gate {
         let tier = crate::ds41_place::tier_batch(Place::Bp, &inputs.hp);
         let slots = NonZeroUsize::MIN;
         let ask = |vision: Option<u64>| {
+            let held = Beside {
+                image: vision,
+                embedding: None,
+            };
             crate::ds41_place::ctx_choice(
                 &split,
                 &inputs,
                 Place::Bp,
-                (None, tier, vision),
+                (None, tier, held),
                 (None, slots),
                 levers,
             )

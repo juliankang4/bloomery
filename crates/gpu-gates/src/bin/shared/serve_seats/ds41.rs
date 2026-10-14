@@ -223,6 +223,7 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
+use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::vision_seat;
 use bloomery_gpu_gates::{GateError, ref_model_path, residency};
 use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
@@ -469,9 +470,9 @@ fn vision_of(
     Ok(())
 }
 
-/// Loads the model and serves until the listener or the engine fails;
-/// `Ok` carries why the server ended.
-pub fn run(args: &[String]) -> Result<ServeError, GateError> {
+/// Loads the model, and the embedding model `side` names beside it, and serves until the listener
+/// or the engine fails; `Ok` carries why the server ended.
+pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
     record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
@@ -479,6 +480,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     arm_screen(levers.screen());
     let (a, placed) = parse_args(args)?;
     placed.record().eprint();
+    // The side model is read and seated before the plan, which holds its bytes when it sits on
+    // the stage card.
+    let side = side.read()?;
+    let side_seat = side.as_ref().map(|s| s.seat(a.place)).transpose()?;
+    let embedding = side_seat.as_ref().and_then(|s| s.reserve);
     // The lane's rate, taken before the plan reads the room (`lane_of`).
     // `--plan` returns before any card is opened, so it probes no lane.
     let lane = if a.plan_only {
@@ -544,15 +550,21 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let inputs = PlanInputs::read(&split)?;
     let model = model_props(&split, &inputs.model);
     let tier_batch = place::tier_batch(a.place, &inputs.hp);
-    // The context the load takes with the encoder's reserve `vision`
-    // (`place::ctx_choice`): asked once for a projector's cost, once for the
-    // load.
+    // The context the load takes with the encoder's reserve `vision` and the side model's
+    // (`place::ctx_choice`): asked once for a projector's cost, once for the load.
     let ctx_of = |vision: Option<u64>| {
         place::ctx_choice(
             &split,
             &inputs,
             a.place,
-            (reserve, tier_batch, vision),
+            (
+                reserve,
+                tier_batch,
+                Beside {
+                    image: vision,
+                    embedding,
+                },
+            ),
             (a.ctx, slots),
             &cfg.place,
         )
@@ -575,7 +587,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             let ctx = ctx_of(None)?.slot_ctx;
             let cost_with = |vision: Option<u64>| -> Result<_, GateError> {
                 let mut machine = a.place.machine(reserve, tier_batch)?(inputs.model.layers);
-                beside::reserve_on(&mut machine, Beside { image: vision });
+                beside::reserve_on(
+                    &mut machine,
+                    Beside {
+                        image: vision,
+                        embedding,
+                    },
+                );
                 reserve_checkpoints(&mut machine, Seqs::none(slots.get()), ctx)?;
                 let plan = inputs.plan_with_slots(&machine, ctx, &cfg.place, slots)?;
                 Ok(vision_seat::Cost::of(&plan, ctx))
@@ -627,7 +645,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let (card, placement, cache, residency) = print_plan(
         &inputs,
         a.place,
-        (reserve, tier_batch, seated),
+        (reserve, tier_batch, seated, embedding),
         (ctx, slots),
         &cfg.place,
         residency,
@@ -672,8 +690,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         n_embd: inputs.hp.n_embd,
         #[cfg(feature = "vision")]
         vision,
+        embedding,
     };
     let engine = SeatEngine::spawn(move || V41::open(open), ctx, vocab, card, props, cache.ram)?;
+    let side = side_seat::Side::start(side.zip(side_seat))?;
     // The seat's resident slots are the server's, one sequence each: the
     // server selects and steps them together, no turns and no park.
     let server = bind_server(
@@ -688,6 +708,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             api_keys: a.api_keys,
             parallel: slots.get(),
             queue_depth: a.queue_depth,
+            side,
         },
     )?;
     Record::new(&record::LISTENING)
@@ -789,15 +810,16 @@ fn route_trace(
 /// when a card's nvidia-smi index cannot be found), the prompt cache's
 /// budget of the real host's room
 /// ([`CacheRam::of`]) and the residency word the load runs by. A plan the
-/// vision reserve does not fit is the plan's own refusal with the reserve
-/// named before its terms.
+/// vision reserve or the side model's `embedding` reserve does not fit is the
+/// plan's own refusal with the reserves named before its terms.
 fn print_plan(
     inputs: &PlanInputs,
     place: Place,
-    (reserve, tier_batch, vision): (
+    (reserve, tier_batch, vision, embedding): (
         Option<u64>,
         Option<TierBatchBytes>,
         Option<&vision_seat::Opened>,
+        Option<u64>,
     ),
     (ctx, slots): (usize, NonZeroUsize),
     levers: &PlanLevers,
@@ -807,6 +829,7 @@ fn print_plan(
     let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
     let held = Beside {
         image: vision.and_then(|v| v.seat.reserve),
+        embedding,
     };
     beside::reserve_on(&mut machine, held);
     // V4.1's body makes no checkpoints: its slots pin none.
@@ -889,6 +912,8 @@ struct SeatArgs {
     /// pick); `None` without the flag.
     #[cfg(feature = "vision")]
     vision: Option<Opened>,
+    /// The side model's reserve on the stage card, which the plan counted.
+    embedding: Option<u64>,
 }
 
 /// The draft the seat serves, verified by the pair pass, behind the width
@@ -1062,7 +1087,8 @@ impl V41 {
         // The plan counts every resident sequence, which the session's own
         // open (one sequence) does not: the model is opened here by that
         // plan, then handed to the session. The encoder's reserve rides the
-        // same plan when it sits on the stage card ([`print_plan`]'s rule).
+        // same plan when it sits on the stage card, and so does the side model's ([`print_plan`]'s
+        // rule).
         #[cfg(feature = "vision")]
         let vision_reserve = a.vision.as_ref().and_then(|v| v.seat.reserve);
         #[cfg(not(feature = "vision"))]
@@ -1071,6 +1097,7 @@ impl V41 {
             a.place.machine(a.reserve, a.tier_batch)?,
             Beside {
                 image: vision_reserve,
+                embedding: a.embedding,
             },
         );
         let opened = t.elapsed();
