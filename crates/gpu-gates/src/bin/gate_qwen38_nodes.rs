@@ -839,8 +839,7 @@ mod gate {
             let (_n1, addr) = node1(Some(&copy))?;
             Ok(TierNode::open(addr, &open).map(drop))
         });
-        std::fs::remove_dir_all(&dir).map_err(|e| format!("remove {}: {e}", dir.display()))?;
-        let r = r?;
+        let r = remove_open_copy(&dir, r)?;
         let ok = matches!(&r, Err(e) if e.to_string().contains("hold other bytes")
             && e.to_string().contains(&row.name));
         println!(
@@ -848,6 +847,26 @@ mod gate {
             if ok { "ok" } else { "FAIL" }
         );
         Ok(ok)
+    }
+
+    /// Remove the copy and keep both failures when the open and cleanup fail.
+    fn remove_open_copy(
+        dir: &Path,
+        r: Result<Result<(), bloomery_gpu::GpuError>, GateError>,
+    ) -> Result<Result<(), bloomery_gpu::GpuError>, GateError> {
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            let open = match &r {
+                Err(e) => Some(e.to_string()),
+                Ok(open) => open.as_ref().err().map(ToString::to_string),
+            };
+            let cleanup = format!("remove {}: {e}", dir.display());
+            return Err(match open {
+                Some(open) => format!("open: {open}; {cleanup}"),
+                None => cleanup,
+            }
+            .into());
+        }
+        r
     }
 
     /// The address `BLOOMERY_TIER_NODES` names, the one a child reads.
@@ -1286,7 +1305,8 @@ mod gate {
 
     #[cfg(test)]
     mod tests {
-        use super::{NAME, PlaceError, PlacementError, plan_refusal, remove_run};
+        use super::{NAME, PlaceError, PlacementError, plan_refusal, remove_open_copy, remove_run};
+        use bloomery_gpu::GpuError;
 
         #[test]
         fn plan_refusals_retry_only_budget_candidates() {
@@ -1338,6 +1358,52 @@ mod gate {
             assert!(!out.exists());
             assert!(remove_run(&dir).is_err(), "a directory is not a run file");
             std::fs::remove_dir(&dir).expect("the cleanup directory removed");
+        }
+
+        #[test]
+        fn copy_cleanup_keeps_the_open_error() {
+            let path =
+                std::env::temp_dir().join(format!("{NAME}-copy-cleanup-{}", std::process::id()));
+            std::fs::write(&path, b"a file, not a directory").expect("the cleanup blocker");
+            for (r, open) in [
+                (Err("copy setup refused".into()), Some("copy setup refused")),
+                (
+                    Ok(Err(GpuError::Shape {
+                        what: "open",
+                        detail: "tier refused".into(),
+                    })),
+                    Some("tier refused"),
+                ),
+                (Ok(Ok(())), None),
+            ] {
+                let err = remove_open_copy(&path, r)
+                    .expect_err("a file cannot be removed as a directory")
+                    .to_string();
+                assert!(
+                    err.contains(&format!("remove {}:", path.display())),
+                    "{err}"
+                );
+                if let Some(open) = open {
+                    assert!(err.contains(open), "{err}");
+                }
+            }
+            std::fs::remove_file(&path).expect("the cleanup blocker removed");
+            std::fs::create_dir(&path).expect("the copied model directory");
+            let opened = remove_open_copy(
+                &path,
+                Ok(Err(GpuError::Shape {
+                    what: "open",
+                    detail: "tier refused".into(),
+                })),
+            )
+            .expect("the copy removed");
+            assert!(
+                opened
+                    .expect_err("the open refusal kept")
+                    .to_string()
+                    .contains("tier refused")
+            );
+            assert!(!path.exists());
         }
     }
 }
