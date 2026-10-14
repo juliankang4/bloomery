@@ -263,7 +263,10 @@ gguf 9 2 0
 # gpu/src/route_body.rs beside the bodies it instantiates; gpu-deepseek41 comes down by the same 4.
 # PIN(2026-10-16): gpu 1862 -> 1863 blocks, a new kernel entry, not old code relaxed: head_norm_neox_append_256_whole's
 # call into norm_partial_append, with its SAFETY line.
-gpu 1863 201 10
+# PIN(2026-10-16): gpu 201 -> 202 fns, new code, not old code relaxed: enqueue_head_norm_neox_append_256_whole is an
+# unsafe fn whose Safety section names the distinct positions its caller keeps (two tokens at one position write one
+# cache row from two blocks).
+gpu 1863 202 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -322,7 +325,9 @@ gpu-deepseek41 388 44 0
 gpu-gates 78 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
-gpu-gemma-embedding2 1 0 0
+# PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of
+# enqueue_head_norm_neox_append_256_whole, its positions 0..ctx distinct, with its SAFETY line.
+gpu-gemma-embedding2 2 0 0
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and

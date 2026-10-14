@@ -2169,9 +2169,15 @@ impl RopeNeoxKernels {
     /// head: `qg` (plain query rows) and `q` `m·n_head·256` f32, `k` and `v`
     /// `m·n_kv·256`, the gains 256, `table` [`HEAD_256`] f32 for each of at
     /// least `ctx` positions (`RopeTable::push` over a [`HEAD_256`]-wide
-    /// spec), the planes `n_kv·ctx·256` f16. Positions and their refusal as
-    /// there. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_head_norm_neox_append_256_whole(
+    /// spec), the planes `n_kv·ctx·256` f16. A position at or past `ctx`
+    /// raises [`FaultSite::CachePos`] as there. Asynchronous,
+    /// allocation-free, capturable.
+    ///
+    /// # Safety
+    ///
+    /// The `m` positions of `args.pos` are distinct: two tokens at one
+    /// position write the same cache rows from two blocks at once.
+    pub unsafe fn enqueue_head_norm_neox_append_256_whole(
         &self,
         stream: &CudaStream,
         args: PartialNeoxArgs<'_>,

@@ -1246,6 +1246,7 @@ gate-gpu-gemma-embedding2-head512:
 # the path the sets were dumped from): every text case of mainline's card set through one pass, its
 # taps within the CPU twin's band, a rerun bit for bit, and the refusals by name.
 gate-gpu-gemma-embedding2-e2e *ARGS:
+    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gemma-embedding2 --lib -- --include-ignored'
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e {{ARGS}}'
 
 # GLM-5.3-Flash MLA 층의 카드 부분 — 잠재 RMS + f16 추가, 인덱서 키 LayerNorm + [키; 게이트] 추가(`latent`),

@@ -12,7 +12,7 @@
 #   ⑤ crates/*/src 의 스레드 spawn 은 threads::helper::spawn_helper 를 거친다 — 고정된 스텝 스레드가
 #      띄운 스레드는 그 한 CPU 마스크를 물려받는다. 예외는 tools/spawn-allow.txt 의 파일별 개수와 이유다.
 #   아키텍처 자신의 크레이트(crates/gpu-<arch>/src/)는 ①②④에서 그 아키텍처의 arch/ 로 센다.
-#   The crate's name spells the directory's underscores as hyphens (arch/gemma_embedding2/ owns crates/gpu-gemma-embedding2/).
+#   크레이트 이름은 디렉터리 이름의 밑줄을 하이픈으로 쓴다(arch/gemma_embedding2/ 의 크레이트는 crates/gpu-gemma-embedding2/).
 #   아키텍처 목록은 손으로 적지 않는다: crates/*/src/arch/ 아래 디렉터리 이름이 목록이다. 새 아키텍처는
 #   디렉터리가 생기는 순간 넷 모두의 대상이 된다.
 #

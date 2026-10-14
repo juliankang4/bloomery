@@ -6,13 +6,18 @@ use std::collections::BTreeMap;
 use bloomery_gpu::flash_gqa_prefill::GqaPrefillArgs;
 use bloomery_gpu::gemm::{GemmAct32, GemmInput, GemmRoute};
 use bloomery_gpu::rope_neox::{HEAD_256, PartialNeoxArgs};
+use bloomery_gpu::rope_table::RopeRows;
 use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{FaultSink, Gpu, GpuError};
+use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
+use model::arch::gemma_embedding2::hparams::{Hparams, key_bounds};
 use model::arch::gemma_embedding2::names;
 
-use crate::{Encoder, Kernels, decode_rows};
+use crate::{Attn, Consts, Encoder, Kernels, Scratch, decode_rows, reaches};
+
+/// The refusal `what` of a pass.
+const PASS: &str = "Encoder::pass";
 
 /// One pass's rows read back: the `output` projection of every position
 /// (`result_embd`, `n · n_out` f32, token-major), their mean (`pooled`,
@@ -57,7 +62,7 @@ impl Cx<'_> {
         sink: FaultSink,
     ) -> Result<(), GpuError> {
         let act = acts.get_mut(&width).ok_or(GpuError::State {
-            what: "Encoder::pass",
+            what: PASS,
             missing: "a quantizer scratch of the projection's width",
         })?;
         self.k
@@ -76,7 +81,7 @@ impl Cx<'_> {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let act = acts.get(&width).ok_or(GpuError::State {
-            what: "Encoder::pass",
+            what: PASS,
             missing: "a quantizer scratch of the projection's width",
         })?;
         site::gemm(
@@ -100,7 +105,7 @@ impl Cx<'_> {
 }
 
 /// A reach's per-row key bounds on the card: row `t` attends keys
-/// `[first[t], count[t])`, `|t − j| ≤ reach` (every key with no reach).
+/// `[first[t], count[t])` ([`key_bounds`]).
 struct Keys {
     reach: Option<usize>,
     first: DeviceBuffer<u32>,
@@ -109,18 +114,257 @@ struct Keys {
 
 impl Keys {
     fn new(gpu: &Gpu, reach: Option<usize>, n: usize) -> Result<Keys, GpuError> {
-        let (first, count): (Vec<u32>, Vec<u32>) = (0..n)
-            .map(|t| match reach {
-                Some(r) => (t.saturating_sub(r), (t + r + 1).min(n)),
-                None => (0, n),
+        let narrow = |v: usize| {
+            u32::try_from(v).map_err(|_| GpuError::Shape {
+                what: PASS,
+                detail: format!("a key bound of {v} over {n} positions does not fit u32"),
             })
-            .map(|(f, c)| (f as u32, c as u32))
-            .unzip();
+        };
+        let mut first = Vec::with_capacity(n);
+        let mut count = Vec::with_capacity(n);
+        for t in 0..n {
+            let (f, c) = key_bounds(reach, t, n);
+            first.push(narrow(f)?);
+            count.push(narrow(c)?);
+        }
         Ok(Keys {
             reach,
             first: DeviceBuffer::from_host(gpu.stream(), &first)?,
             count: DeviceBuffer::from_host(gpu.stream(), &count)?,
         })
+    }
+}
+
+/// What every step of a pass reads unchanged: the card, the kernels, the
+/// weights, the header, the constant rows, and the pass's `n` positions in
+/// a load of `cap`.
+struct Step<'a> {
+    gpu: &'a Gpu,
+    k: &'a Kernels,
+    w: &'a Weights,
+    hp: &'a Hparams,
+    consts: &'a Consts,
+    n: usize,
+    cap: usize,
+}
+
+impl Step<'_> {
+    fn gain(&self, name: &str) -> Result<&DeviceBuffer<f32>, GpuError> {
+        self.w.f32_buf(PASS, name)
+    }
+
+    fn cx<'b>(&'b self, route: &'b GemmRoute) -> Cx<'b> {
+        Cx {
+            gpu: self.gpu,
+            k: self.k,
+            w: self.w,
+            route,
+        }
+    }
+
+    /// Layer `l`'s attention over `emb` at layer 0, else over `s.x`: `s.a`
+    /// is the input plus the post-normed attention of its norm, the turn by
+    /// `turn`'s rows and the flash over `keys`' bounds.
+    fn attention(
+        &self,
+        s: &mut Scratch,
+        (l, a): (usize, &Attn),
+        emb: Option<&DeviceBuffer<f32>>,
+        turn: &RopeRows,
+        keys: &Keys,
+    ) -> Result<(), GpuError> {
+        let (stream, elem, sink) = (self.gpu.stream(), self.gpu.elem(), self.gpu.layer_sink(l)?);
+        let (e, n, n_head, eps) = (self.hp.n_embd, self.n, self.hp.n_head, self.hp.rms_eps);
+        let (head, kv, qw) = (a.head, a.kv, n_head * a.head);
+        let blk = |stem: &str| format!("blk.{l}.{stem}");
+        let inp = match emb {
+            Some(emb) => emb,
+            None => &s.x,
+        };
+        let cx = self.cx(&s.route);
+        let acts = &mut s.acts;
+        elem.enqueue_rms_norm(
+            stream,
+            inp,
+            self.gain(&blk(names::ATTN_NORM))?,
+            eps,
+            e,
+            n,
+            &mut s.xn,
+        )?;
+        cx.quantize(acts, &s.xn, e, n, sink)?;
+        cx.proj(acts, &blk(names::ATTN_Q), (e, qw), n, &mut s.qs)?;
+        cx.proj(acts, &blk(names::ATTN_K), (e, kv * head), n, &mut s.kk)?;
+        cx.proj(acts, &blk(names::ATTN_V), (e, kv * head), n, &mut s.vv)?;
+        elem.enqueue_rms_norm(
+            stream,
+            &s.vv,
+            &self.consts.ones,
+            eps,
+            head,
+            n * kv,
+            &mut s.vn,
+        )?;
+        let rope = PartialNeoxArgs {
+            qg: &s.qs,
+            q: &mut s.q,
+            k: &mut s.kk,
+            v: &s.vn,
+            gq: self.gain(&blk(names::ATTN_Q_NORM))?,
+            gk: self.gain(&blk(names::ATTN_K_NORM))?,
+            table: &turn.table,
+            pos: &self.consts.pos,
+            eps,
+            n_head,
+            n_kv: kv,
+            ctx: self.cap,
+            m: n,
+            fault: sink,
+            cache_k: &mut s.cache_k,
+            cache_v: &mut s.cache_v,
+        };
+        if head == HEAD_256 {
+            // SAFETY: `pos` is `0..ctx` (`Consts::pos`) and a pass's `n` is at
+            // most `ctx`, so the `n` tokens hold distinct positions.
+            unsafe {
+                self.k
+                    .rope
+                    .enqueue_head_norm_neox_append_256_whole(stream, rope)?;
+            }
+        } else {
+            // SAFETY: `pos` is `0..ctx` (`Consts::pos`) and a pass's `n` is at
+            // most `ctx`, so the `n` tokens hold distinct positions.
+            unsafe {
+                self.k
+                    .rope
+                    .enqueue_head_norm_neox_append_512(stream, rope)?;
+            }
+        }
+        let args = GqaPrefillArgs {
+            q: &s.q,
+            kc: &s.cache_k,
+            vc: &s.cache_v,
+            n_keys: &keys.count,
+            scale: 1.0,
+            n_head,
+            n_kv: kv,
+            ctx: self.cap,
+            t: n,
+            fault: sink,
+            y: &mut s.att,
+        };
+        if head == HEAD_256 {
+            self.k
+                .flash
+                .enqueue_256_p2_lower(stream, args, &keys.first)?;
+        } else {
+            self.k.flash512.enqueue_p4(stream, args)?;
+        }
+        cx.quantize(acts, &s.att, qw, n, sink)?;
+        cx.proj(acts, &blk(names::ATTN_OUTPUT), (qw, e), n, &mut s.o)?;
+        elem.enqueue_rms_norm(
+            stream,
+            &s.o,
+            self.gain(&blk(names::POST_ATTENTION_NORM))?,
+            eps,
+            e,
+            n,
+            &mut s.on,
+        )?;
+        elem.enqueue_add(stream, &s.on, inp, e * n, &mut s.a)?;
+        Ok(())
+    }
+
+    /// Layer `l`'s GELU GLU: `s.c` is `s.a` plus the post-normed
+    /// feed-forward of its norm.
+    fn glu(&self, s: &mut Scratch, l: usize) -> Result<(), GpuError> {
+        let (stream, elem, sink) = (self.gpu.stream(), self.gpu.elem(), self.gpu.layer_sink(l)?);
+        let (e, n, ff, eps) = (self.hp.n_embd, self.n, self.hp.n_ff, self.hp.rms_eps);
+        let blk = |stem: &str| format!("blk.{l}.{stem}");
+        let cx = self.cx(&s.route);
+        let acts = &mut s.acts;
+        elem.enqueue_rms_norm(
+            stream,
+            &s.a,
+            self.gain(&blk(names::FFN_NORM))?,
+            eps,
+            e,
+            n,
+            &mut s.xn,
+        )?;
+        cx.quantize(acts, &s.xn, e, n, sink)?;
+        cx.proj(acts, &blk(names::FFN_GATE), (e, ff), n, &mut s.gate)?;
+        cx.proj(acts, &blk(names::FFN_UP), (e, ff), n, &mut s.up)?;
+        elem.enqueue_geglu(stream, &s.gate, &s.up, ff * n, &mut s.gu)?;
+        cx.quantize(acts, &s.gu, ff, n, sink)?;
+        cx.proj(acts, &blk(names::FFN_DOWN), (ff, e), n, &mut s.o)?;
+        elem.enqueue_rms_norm(
+            stream,
+            &s.o,
+            self.gain(&blk(names::POST_FFW_NORM))?,
+            eps,
+            e,
+            n,
+            &mut s.on,
+        )?;
+        elem.enqueue_add(stream, &s.on, &s.a, e * n, &mut s.c)?;
+        Ok(())
+    }
+
+    /// Layer `l`'s per-layer input and output scale: `s.x` is the layer's
+    /// scale times `s.c` plus the post-normed `proj` of `gelu(inp_gate ·
+    /// s.c) · ple_l`, where `ple_l` is `ple · emb` times `1/√hidden`,
+    /// RMS-normed, and copied into `taps` when asked.
+    fn per_layer(
+        &self,
+        s: &mut Scratch,
+        l: usize,
+        ple: &DeviceTensor<f32>,
+        emb: &DeviceBuffer<f32>,
+        taps: Option<&mut Taps>,
+    ) -> Result<(), GpuError> {
+        let (stream, elem, sink) = (self.gpu.stream(), self.gpu.elem(), self.gpu.layer_sink(l)?);
+        let (e, n, pl, eps) = (self.hp.n_embd, self.n, self.hp.per_layer, self.hp.rms_eps);
+        let blk = |stem: &str| format!("blk.{l}.{stem}");
+        let cx = self.cx(&s.route);
+        let acts = &mut s.acts;
+        cx.quantize(acts, &s.c, e, n, sink)?;
+        cx.proj(acts, &blk(names::INP_GATE), (e, pl), n, &mut s.p1)?;
+        self.k
+            .g32
+            .enqueue_f32_tile(stream, ple, emb, n, &mut s.p2)?;
+        elem.enqueue_weighted_sum(stream, &s.p2, &self.consts.inv, pl, 1, n, &mut s.p3)?;
+        elem.enqueue_rms_norm(
+            stream,
+            &s.p3,
+            self.gain(names::PER_LAYER_PROJ_NORM)?,
+            eps,
+            pl,
+            n,
+            &mut s.p2,
+        )?;
+        if let Some(t) = taps {
+            let rows = s.p2.to_host_vec(stream)?;
+            for (tok, row) in rows[..n * pl].chunks_exact(pl).enumerate() {
+                let at = (tok * self.hp.n_layer + l) * pl;
+                t.inp_per_layer[at..at + pl].copy_from_slice(row);
+            }
+        }
+        elem.enqueue_geglu(stream, &s.p1, &s.p2, pl * n, &mut s.p3)?;
+        cx.quantize(acts, &s.p3, pl, n, sink)?;
+        cx.proj(acts, &blk(names::PROJ), (pl, e), n, &mut s.o)?;
+        elem.enqueue_rms_norm(
+            stream,
+            &s.o,
+            self.gain(&blk(names::POST_NORM))?,
+            eps,
+            e,
+            n,
+            &mut s.on,
+        )?;
+        elem.enqueue_add(stream, &s.c, &s.on, e * n, &mut s.a)?;
+        elem.enqueue_weighted_sum(stream, &s.a, &self.consts.scale[l], e, 1, n, &mut s.x)?;
+        Ok(())
     }
 }
 
@@ -131,7 +375,7 @@ impl Encoder {
         let e = self.hp.n_embd;
         if let Some(&bad) = ids.iter().find(|&&id| id as usize >= self.hp.n_vocab) {
             return Err(GpuError::Shape {
-                what: "Encoder::pass",
+                what: PASS,
                 detail: format!("id {bad} is past the vocabulary of {}", self.hp.n_vocab),
             });
         }
@@ -151,12 +395,13 @@ impl Encoder {
     /// One pass over `ids` (1 to [`Encoder::ctx`] of them, else refused by
     /// name): every position's `output` row and their mean, and with `taps`
     /// the rows the reference names on the way. A fault any launch raised is
-    /// the error.
+    /// the error, and so is an output value that is not finite, by its
+    /// position.
     pub fn pass(&mut self, ids: &[u32], taps: bool) -> Result<Pass, GpuError> {
         let n = ids.len();
         if n == 0 || n > self.ctx {
             return Err(GpuError::Shape {
-                what: "Encoder::pass",
+                what: PASS,
                 detail: format!("{n} positions; a pass takes 1 to {}", self.ctx),
             });
         }
@@ -175,207 +420,83 @@ impl Encoder {
             ctx,
             ..
         } = self;
-        let (gpu, stream, elem, cap) = (&*gpu, gpu.stream(), gpu.elem(), *ctx);
-        let (e, pl, ff, n_head, eps) = (hp.n_embd, hp.per_layer, hp.n_ff, hp.n_head, hp.rms_eps);
+        let stream = gpu.stream();
+        let (e, n_out) = (hp.n_embd, hp.n_out);
         let emb = DeviceBuffer::from_host(stream, &inp_scaled)?;
-        let mut reaches: Vec<Option<usize>> = layers.iter().map(|a| a.reach).collect();
-        reaches.dedup();
-        let keys = reaches
+        let keys = reaches(layers)
             .into_iter()
             .map(|r| Keys::new(gpu, r, n))
             .collect::<Result<Vec<_>, _>>()?;
         k.gemm
             .enqueue_route_dense(stream, n, &mut s.route, gpu.unlabelled_sink())?;
-        let cx = Cx {
+        let st = Step {
             gpu,
             k,
             w,
-            route: &s.route,
+            hp,
+            consts,
+            n,
+            cap: *ctx,
         };
-        let acts = &mut s.acts;
-        let gain = |name: String| w.f32_buf("Encoder::pass", &name);
         let mut tapped = taps.then(|| Taps {
             inp_scaled: inp_scaled.clone(),
-            inp_per_layer: vec![0.0; n * hp.n_layer * pl],
+            inp_per_layer: vec![0.0; n * hp.n_layer * hp.per_layer],
             l_out: Vec::new(),
             result_norm: Vec::new(),
         });
         for (l, a) in layers.iter().enumerate() {
-            let sink = gpu.layer_sink(l)?;
-            let blk = |stem: &str| format!("blk.{l}.{stem}");
-            let (head, kv, qw) = (a.head, a.kv, n_head * a.head);
-            let inp = if l == 0 { &emb } else { &s.x };
-            // Attention.
-            elem.enqueue_rms_norm(
-                stream,
-                inp,
-                gain(blk(names::ATTN_NORM))?,
-                eps,
-                e,
-                n,
-                &mut s.xn,
-            )?;
-            cx.quantize(acts, &s.xn, e, n, sink)?;
-            cx.proj(acts, &blk(names::ATTN_Q), (e, qw), n, &mut s.qs)?;
-            cx.proj(acts, &blk(names::ATTN_K), (e, kv * head), n, &mut s.kk)?;
-            cx.proj(acts, &blk(names::ATTN_V), (e, kv * head), n, &mut s.vv)?;
-            elem.enqueue_rms_norm(stream, &s.vv, &consts.ones, eps, head, n * kv, &mut s.vn)?;
-            let rope = PartialNeoxArgs {
-                qg: &s.qs,
-                q: &mut s.q,
-                k: &mut s.kk,
-                v: &s.vn,
-                gq: gain(blk(names::ATTN_Q_NORM))?,
-                gk: gain(blk(names::ATTN_K_NORM))?,
-                table: if a.reach.is_some() {
-                    &rope_swa.table
-                } else {
-                    &rope_full.table
-                },
-                pos: &consts.pos,
-                eps,
-                n_head,
-                n_kv: kv,
-                ctx: cap,
-                m: n,
-                fault: sink,
-                cache_k: &mut s.cache_k,
-                cache_v: &mut s.cache_v,
-            };
-            if head == HEAD_256 {
-                k.rope
-                    .enqueue_head_norm_neox_append_256_whole(stream, rope)?;
+            let turn = if a.reach.is_some() {
+                &*rope_swa
             } else {
-                // SAFETY: `pos` is `0..ctx` (`Consts::pos`) and a pass's `n` is at
-                // most `ctx`, so the `n` tokens hold distinct positions.
-                unsafe {
-                    k.rope.enqueue_head_norm_neox_append_512(stream, rope)?;
-                }
-            }
-            let rows = keys
+                &*rope_full
+            };
+            let bounds = keys
                 .iter()
                 .find(|r| r.reach == a.reach)
                 .ok_or(GpuError::State {
-                    what: "Encoder::pass",
+                    what: PASS,
                     missing: "the key bounds of the layer's reach",
                 })?;
-            let args = GqaPrefillArgs {
-                q: &s.q,
-                kc: &s.cache_k,
-                vc: &s.cache_v,
-                n_keys: &rows.count,
-                scale: 1.0,
-                n_head,
-                n_kv: kv,
-                ctx: cap,
-                t: n,
-                fault: sink,
-                y: &mut s.att,
-            };
-            if head == HEAD_256 {
-                k.flash.enqueue_256_p2_lower(stream, args, &rows.first)?;
-            } else {
-                k.flash512.enqueue_p4(stream, args)?;
-            }
-            cx.quantize(acts, &s.att, qw, n, sink)?;
-            cx.proj(acts, &blk(names::ATTN_OUTPUT), (qw, e), n, &mut s.o)?;
-            elem.enqueue_rms_norm(
-                stream,
-                &s.o,
-                gain(blk(names::POST_ATTENTION_NORM))?,
-                eps,
-                e,
-                n,
-                &mut s.on,
-            )?;
-            elem.enqueue_add(stream, &s.on, inp, e * n, &mut s.a)?;
-            // GELU GLU.
-            elem.enqueue_rms_norm(
-                stream,
-                &s.a,
-                gain(blk(names::FFN_NORM))?,
-                eps,
-                e,
-                n,
-                &mut s.xn,
-            )?;
-            cx.quantize(acts, &s.xn, e, n, sink)?;
-            cx.proj(acts, &blk(names::FFN_GATE), (e, ff), n, &mut s.gate)?;
-            cx.proj(acts, &blk(names::FFN_UP), (e, ff), n, &mut s.up)?;
-            elem.enqueue_geglu(stream, &s.gate, &s.up, ff * n, &mut s.gu)?;
-            cx.quantize(acts, &s.gu, ff, n, sink)?;
-            cx.proj(acts, &blk(names::FFN_DOWN), (ff, e), n, &mut s.o)?;
-            elem.enqueue_rms_norm(
-                stream,
-                &s.o,
-                gain(blk(names::POST_FFW_NORM))?,
-                eps,
-                e,
-                n,
-                &mut s.on,
-            )?;
-            elem.enqueue_add(stream, &s.on, &s.a, e * n, &mut s.c)?;
-            // The per-layer input.
-            cx.quantize(acts, &s.c, e, n, sink)?;
-            cx.proj(acts, &blk(names::INP_GATE), (e, pl), n, &mut s.p1)?;
-            k.g32
-                .enqueue_f32_tile(stream, &ple[l], &emb, n, &mut s.p2)?;
-            elem.enqueue_weighted_sum(stream, &s.p2, &consts.inv, pl, 1, n, &mut s.p3)?;
-            elem.enqueue_rms_norm(
-                stream,
-                &s.p3,
-                gain(names::PER_LAYER_PROJ_NORM.to_string())?,
-                eps,
-                pl,
-                n,
-                &mut s.p2,
-            )?;
-            if let Some(t) = &mut tapped {
-                let rows = s.p2.to_host_vec(stream)?;
-                for (tok, row) in rows[..n * pl].chunks_exact(pl).enumerate() {
-                    let at = (tok * hp.n_layer + l) * pl;
-                    t.inp_per_layer[at..at + pl].copy_from_slice(row);
-                }
-            }
-            elem.enqueue_geglu(stream, &s.p1, &s.p2, pl * n, &mut s.p3)?;
-            cx.quantize(acts, &s.p3, pl, n, sink)?;
-            cx.proj(acts, &blk(names::PROJ), (pl, e), n, &mut s.o)?;
-            elem.enqueue_rms_norm(
-                stream,
-                &s.o,
-                gain(blk(names::POST_NORM))?,
-                eps,
-                e,
-                n,
-                &mut s.on,
-            )?;
-            elem.enqueue_add(stream, &s.c, &s.on, e * n, &mut s.a)?;
-            // The layer's output scale.
-            elem.enqueue_weighted_sum(stream, &s.a, &consts.scale[l], e, 1, n, &mut s.x)?;
+            st.attention(s, (l, a), (l == 0).then_some(&emb), turn, bounds)?;
+            st.glu(s, l)?;
+            st.per_layer(s, l, &ple[l], &emb, tapped.as_mut())?;
             if let Some(t) = &mut tapped {
                 t.l_out.push(s.x.to_host_vec(stream)?[..n * e].to_vec());
             }
         }
         let sink = gpu.unlabelled_sink();
-        elem.enqueue_rms_norm(
+        gpu.elem().enqueue_rms_norm(
             stream,
             &s.x,
-            gain(names::output_norm())?,
-            eps,
+            st.gain(&names::output_norm())?,
+            hp.rms_eps,
             e,
             n,
             &mut s.xn,
         )?;
-        cx.quantize(acts, &s.xn, e, n, sink)?;
-        cx.proj(acts, &names::output(), (e, hp.n_out), n, &mut s.out)?;
-        let rows = s.out.to_host_vec(stream)?[..n * hp.n_out].to_vec();
+        let cx = st.cx(&s.route);
+        cx.quantize(&mut s.acts, &s.xn, e, n, sink)?;
+        let mut out = DeviceBuffer::<f32>::zeroed(stream, n * n_out)?;
+        cx.proj(&s.acts, &names::output(), (e, n_out), n, &mut out)?;
+        let rows = out.to_host_vec(stream)?;
         if let Some(t) = &mut tapped {
             t.result_norm = s.xn.to_host_vec(stream)?[..n * e].to_vec();
         }
         if let Some(f) = gpu.take_fault()? {
-            return Err(GpuError::fault("Encoder::pass", f));
+            return Err(GpuError::fault(PASS, f));
         }
-        let pooled = mean(&rows, hp.n_out);
+        if let Some(i) = rows.iter().position(|v| !v.is_finite()) {
+            return Err(GpuError::Shape {
+                what: PASS,
+                detail: format!(
+                    "position {}'s output value {} is {}, not finite",
+                    i / n_out,
+                    i % n_out,
+                    rows[i]
+                ),
+            });
+        }
+        let pooled = mean(&rows, n_out);
         Ok(Pass {
             rows,
             pooled,

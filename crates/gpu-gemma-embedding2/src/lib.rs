@@ -77,14 +77,23 @@ pub(crate) struct Attn {
 }
 
 /// Each layer's layout; the program's coverage check owns which shapes run.
-pub(crate) fn layers(hp: &Hparams) -> Vec<Attn> {
+pub(crate) fn layers(hp: &Hparams, reach: &[Option<u32>]) -> Vec<Attn> {
     (0..hp.n_layer)
         .map(|l| Attn {
             head: hp.attn(l).head,
             kv: hp.kv[l],
-            reach: hp.sliding[l].then_some(hp.window / 2),
+            reach: reach[l].map(|r| r as usize),
         })
         .collect()
+}
+
+/// The distinct reaches of `layers`, each once: a pass uploads one pair of
+/// key bound rows a reach.
+pub(crate) fn reaches(layers: &[Attn]) -> Vec<Option<usize>> {
+    let mut r: Vec<Option<usize>> = layers.iter().map(|a| a.reach).collect();
+    r.sort_unstable();
+    r.dedup();
+    r
 }
 
 /// Whether `name` is resident on the card: every tensor but the token table
@@ -135,6 +144,8 @@ pub(crate) struct Sizes {
     pub(crate) head: usize,
     /// The widths a GEMM's input is quantized at.
     pub(crate) act: Vec<usize>,
+    /// The distinct reaches ([`reaches`]), one pair of key bound rows each.
+    pub(crate) reaches: usize,
 }
 
 impl Sizes {
@@ -159,24 +170,24 @@ impl Sizes {
             out: hp.n_out,
             head: max(|a, _| a.head),
             act,
+            reaches: reaches(layers).len(),
         }
     }
 
     /// The f32 scratch values a position: the pass's buffers, six rows of
     /// the hidden width and three of the query, key and feed-forward widths
-    /// and of the per-layer input, and the output row.
+    /// and of the per-layer input.
     pub(crate) fn f32_per_pos(&self) -> Result<usize, GpuError> {
         size_sum([
             size_product(&[6, self.hidden])?,
             size_product(&[3, size_sum([self.q, self.kv, self.ff, self.per_layer])?])?,
-            self.out,
         ])
     }
 
     /// The scratch bytes at [`Sizes::ctx`]: the f32 rows, the two f16 cache
     /// planes, the positions, the two scalar rows and the per-layer scale
     /// rows of `n_layer`, the ones, and the per-pass rows (the token rows,
-    /// the first keys and key counts); the
+    /// the first keys and key counts of each reach, the output rows); the
     /// quantizer scratch and the route table bounded above by two bytes a
     /// quantized value and sixteen a position.
     fn bytes(&self, n_layer: usize) -> Result<usize, GpuError> {
@@ -192,7 +203,7 @@ impl Sizes {
             size_product(&[
                 4,
                 ctx,
-                size_sum([self.hidden, 2])?,
+                size_sum([self.hidden, size_product(&[2, self.reaches])?, self.out])?,
             ])?,
             quant,
             size_product(&[16, ctx])?,
@@ -276,7 +287,11 @@ fn header(split: &Split, ctx: usize) -> Result<(Hparams, Vec<Attn>), GpuError> {
     let read = model::arch::spec(split).map_err(|e| GpuError::plan(OPEN, e.to_string()))?;
     check_program(&read)?;
     check_types(split)?;
-    let layers = layers(&hp);
+    let encoder = read.spec.encoder.as_ref().ok_or(GpuError::State {
+        what: OPEN,
+        missing: "the encoder description",
+    })?;
+    let layers = layers(&hp, &encoder.reach);
     Ok((hp, layers))
 }
 
@@ -312,7 +327,6 @@ pub(crate) struct Scratch {
     pub(crate) p1: DeviceBuffer<f32>,
     pub(crate) p2: DeviceBuffer<f32>,
     pub(crate) p3: DeviceBuffer<f32>,
-    pub(crate) out: DeviceBuffer<f32>,
     pub(crate) cache_k: DeviceBuffer<u16>,
     pub(crate) cache_v: DeviceBuffer<u16>,
 }
@@ -341,7 +355,6 @@ impl Scratch {
             p1,
             p2,
             p3,
-            out,
             cache_k: _,
             cache_v: _,
         } = self;
@@ -349,7 +362,7 @@ impl Scratch {
             4,
             size_sum(
                 [
-                    x, xn, a, c, o, on, qs, q, att, kk, vv, vn, gate, up, gu, p1, p2, p3, out,
+                    x, xn, a, c, o, on, qs, q, att, kk, vv, vn, gate, up, gu, p1, p2, p3,
                 ]
                 .map(DeviceBuffer::len),
             )?,
@@ -384,7 +397,6 @@ impl Scratch {
             p1: f(s.per_layer)?,
             p2: f(s.per_layer)?,
             p3: f(s.per_layer)?,
-            out: f(s.out)?,
             cache_k: DeviceBuffer::<u16>::zeroed(stream, s.kv * s.ctx)?,
             cache_v: DeviceBuffer::<u16>::zeroed(stream, s.kv * s.ctx)?,
         })
@@ -597,7 +609,7 @@ mod tests {
             per_layer: 32,
             n_out: 16,
         };
-        let s = Sizes::of(&hp, &layers(&hp), 2);
+        let s = Sizes::of(&hp, &layers(&hp, &[Some(2), None, Some(2)]), 2);
         (hp, s)
     }
 
@@ -766,7 +778,16 @@ mod tests {
             (32, 2048, Some("embedding_length")),
             (64, 4096, Some("dense GELU GLU layer: ff 4096")),
         ] {
-            let result = with_model(hidden, ff, |split, hp| card_bytes(&split, hp.n_ctx));
+            let result = with_model(hidden, ff, |split, hp| {
+                if refused.is_none() {
+                    let (_, layers) = header(&split, hp.n_ctx).unwrap();
+                    assert_eq!(
+                        layers.iter().map(|a| a.reach).collect::<Vec<_>>(),
+                        [Some(2), None, Some(2)]
+                    );
+                }
+                card_bytes(&split, hp.n_ctx)
+            });
             if let Some(what) = refused {
                 let err = result.unwrap_err().to_string();
                 assert!(err.contains(OPEN), "{err}");
@@ -777,4 +798,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn card_figure_counts_the_buffers_once() {
+        let (hp, s) = geometry();
+        assert_eq!(s.f32_per_pos().unwrap(), 2784);
+        assert_eq!(s.bytes(hp.n_layer).unwrap(), 28264);
+        assert_eq!(card_figure(0, &hp, &s).unwrap(), 44648);
+    }
+
+    #[test]
+    fn byte_counts_refuse_overflow_by_name() {
+        let (hp, s) = geometry();
+        let mut results = vec![
+            size_product(&[4, usize::MAX / 4 + 1]),
+            size_sum([usize::MAX, 1]),
+            card_figure(usize::MAX, &hp, &s).map(|n| n as usize),
+        ];
+        for change in [
+            |hp: &mut Hparams| hp.n_layer = usize::MAX,
+            |hp: &mut Hparams| hp.per_layer = usize::MAX,
+            |hp: &mut Hparams| hp.n_embd = usize::MAX,
+            |hp: &mut Hparams| hp.swa.head = usize::MAX,
+        ] {
+            let mut hp = hp.clone();
+            change(&mut hp);
+            results.push(card_figure(0, &hp, &s).map(|n| n as usize));
+        }
+        for change in [
+            |s: &mut Sizes| s.hidden = usize::MAX,
+            |s: &mut Sizes| s.q = usize::MAX,
+            |s: &mut Sizes| s.kv = usize::MAX,
+            |s: &mut Sizes| s.ff = usize::MAX,
+            |s: &mut Sizes| s.per_layer = usize::MAX,
+            |s: &mut Sizes| s.out = usize::MAX,
+            |s: &mut Sizes| s.head = usize::MAX,
+            |s: &mut Sizes| s.ctx = usize::MAX,
+            |s: &mut Sizes| s.act = vec![usize::MAX],
+        ] {
+            let (_, mut s) = geometry();
+            change(&mut s);
+            results.push(s.bytes(hp.n_layer));
+        }
+        for result in results {
+            assert!(matches!(
+                result,
+                Err(GpuError::Shape { what: "card_bytes", detail })
+                    if detail.contains("overflows")
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_scratch_census_reads_buffer_lengths() {
+        let gpu = Gpu::new().unwrap();
+        let (_, sizes) = geometry();
+        let mut scratch = Scratch::new(&gpu, &sizes).unwrap();
+        let bytes = scratch.f32_bytes().unwrap();
+        assert_eq!(bytes, 22272);
+        scratch.x = DeviceBuffer::zeroed(gpu.stream(), scratch.x.len() + 1).unwrap();
+        assert_eq!(scratch.f32_bytes().unwrap(), bytes + 4);
+    }
 }
