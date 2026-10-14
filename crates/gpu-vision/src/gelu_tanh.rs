@@ -6,9 +6,7 @@
 //! Not [`crate::gemm_bf16::Epilogue::Gelu`]: that epilogue is the erf GELU after a GEMM, in the
 //! GEMM's registers; the two kinds differ by up to 4.7e-4 in the range the network's rows take.
 //!
-//! Numeric rule, per value: `x` widened exactly, the expression of llama.cpp's CUDA `op_gelu` in
-//! f32 in its op order — the polynomial `1 + (0.044715·x)·x` contracted to one fused multiply-add
-//! as nvcc contracts it, every other op rounded on its own — with libdevice's `tanhf`, and the
+//! Numeric rule, per value: `x` widened exactly, [`bloomery_gpu::gelu`]'s f32 rule, and the
 //! result rounded once to bf16. [`gelu_tanh_ref`] is the rule on the host with the host's `tanh`,
 //! which differs from the device's by ulps; the gate pins the count of values that round apart.
 //! The erf rule is `gemm_bf16`'s `gelu_erf_dev`, the one device function of the crate that calls
@@ -17,19 +15,15 @@
 //! rounded on its own, once to bf16; [`gelu_erf_ref`] is it on the host with an f64 `erf`.
 
 use crate::gemm_bf16::gelu_erf_dev;
+use bloomery_gpu::gelu::{gelu_tanh_dev, gelu_tanh_f32};
 use bloomery_gpu::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::convert::{bf16_to_f32, f32_to_bf16_rne};
-use cuda_device::float::{add_rn_f32, fma_rn_f32, mul_rn_f32};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
 const BLOCK: u32 = 256;
-/// `√(2/π)` as the f32 llama.cpp's `SQRT_2_OVER_PI` rounds to.
-const SQRT_2_OVER_PI: f32 = 0.797_884_6;
-/// llama.cpp's `GELU_COEF_A`.
-const COEF_A: f32 = 0.044_715;
 
 /// Which GELU a launch applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,14 +32,6 @@ pub enum GeluKind {
     Tanh,
     /// The exact GELU, by `erf`.
     Erf,
-}
-
-/// The rule on one f32 on the host.
-#[must_use]
-pub fn gelu_tanh_f32(x: f32) -> f32 {
-    let poly = (COEF_A * x).mul_add(x, 1.0);
-    let t = (SQRT_2_OVER_PI * x * poly).tanh();
-    (0.5 * x) * (1.0 + t)
 }
 
 /// The host rule of one value, bf16 bits in and out.
@@ -75,10 +61,7 @@ mod gelu_tanh_kernels {
         }
         // SAFETY: i < n <= x.len() (contract); one thread per value.
         let p = unsafe { x.get_unchecked_mut(i) };
-        let v = bf16_to_f32(*p);
-        let poly = fma_rn_f32(mul_rn_f32(COEF_A, v), v, 1.0);
-        let t = mul_rn_f32(mul_rn_f32(SQRT_2_OVER_PI, v), poly).tanh();
-        *p = f32_to_bf16_rne(mul_rn_f32(mul_rn_f32(0.5, v), add_rn_f32(1.0, t)));
+        *p = f32_to_bf16_rne(gelu_tanh_dev(bf16_to_f32(*p)));
     }
 
     /// `x[i] = gelu_erf(x[i])` for `i < n`, the module rule, in place. One thread per value.

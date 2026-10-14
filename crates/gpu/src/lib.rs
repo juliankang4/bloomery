@@ -43,6 +43,7 @@ pub mod flash_gqa;
 pub mod flash_gqa_prefill;
 pub mod fused;
 pub mod gated_quant;
+pub mod gelu;
 pub mod gemm;
 pub(crate) mod graph;
 pub mod hc_gated;

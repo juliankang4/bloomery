@@ -3,8 +3,8 @@
 
 use super::GROUP;
 use crate::attn::{HEAD_DIM_72, QkvLayout, attn_72_ref};
-use crate::gelu_tanh::gelu_tanh_f32;
 use crate::gemm_bf16::gelu_erf;
+use bloomery_gpu::gelu::gelu_tanh_f32;
 
 /// One linear layer on the host: `y = x · Wᵀ + b`, `w` row-major `[out, inp]`.
 #[derive(Clone, Debug)]
