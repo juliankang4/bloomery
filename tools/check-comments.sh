@@ -34,14 +34,10 @@ if [ "$rc" != 0 ]; then
   echo "check-comments: the comment reader failed (rc $rc, above) — no verdict" >&2
   exit "$rc"
 fi
-# g: grep whose "no line" (1) is an answer and whose error (2) ends the check by name.
-g() {
-  local rc=0
-  grep "$@" || rc=$?
-  [ "$rc" -le 1 ] || { echo "check-comments: grep $* failed (rc $rc) — no verdict" >&2; return "$rc"; }
-}
+# shellcheck source=tools/grep-answer.sh
+source "$ROOT/tools/grep-answer.sh"
 # Each line is `path:line:text`; a rule matches the text after the line number.
-text() { g -E "^[^:]+:[0-9]+:.*($1)" | g -v 'PIN('; }
+text() { grep_answer check-comments -E "^[^:]+:[0-9]+:.*($1)" | grep_answer check-comments -v 'PIN('; }
 fail=0
 bad=$(printf '%s\n' "$comments" | text 'MUL-[0-9]+|20[0-9]{2}-[0-9]{2}-[0-9]{2}')
 if [ -n "$bad" ]; then
@@ -51,7 +47,7 @@ if [ -n "$bad" ]; then
   fail=1
 fi
 unit='(^|[^0-9A-Za-z_])[0-9][0-9,.]*[[:space:]]?(ms|µs|μs|us|ns|GB/s|GiB/s|tok/s|t/s|MB/s)([^0-9A-Za-z_]|$)'
-meas=$(printf '%s\n' "$comments" | g -E '^crates/[^/]+/src/' | text "$unit")
+meas=$(printf '%s\n' "$comments" | grep_answer check-comments -E '^crates/[^/]+/src/' | text "$unit")
 if [ -n "$meas" ]; then
   n=$(printf '%s\n' "$meas" | wc -l | tr -d ' ')
   printf '%s\n' "$meas" | head -40 >&2
@@ -61,17 +57,17 @@ fi
 # CITE_ALLOW: `<path>|<fixed text on the line>|<reason>`, one per allowed line; an entry that matches no
 # citation is an error, so a stale exception cannot linger.
 CITE_ALLOW=()
-cites=$(g -rnIE '[A-Za-z0-9_./-]+\.md:[0-9]+' tools)
+cites=$(grep_answer check-comments -rnIE '[A-Za-z0-9_./-]+\.md:[0-9]+' tools)
 unmatched=()
 allowed=0
 for a in ${CITE_ALLOW[@]+"${CITE_ALLOW[@]}"}; do
   p=${a%%|*}; rest=${a#*|}; t=${rest%%|*}
   [ -n "$p" ] && [ -n "$t" ] && [ "$rest" != "$t" ] && [ -n "${rest#*|}" ] \
     || { echo "check-comments: CITE_ALLOW entry '$a' is not <path>|<text>|<reason>" >&2; exit 64; }
-  hit=$(printf '%s\n' "$cites" | g -F -- "$t" | while IFS= read -r l; do case $l in ("$p:"*) printf '%s\n' "$l" ;; esac; done)
+  hit=$(printf '%s\n' "$cites" | grep_answer check-comments -F -- "$t" | while IFS= read -r l; do case $l in ("$p:"*) printf '%s\n' "$l" ;; esac; done)
   if [ -z "$hit" ]; then unmatched+=("$a"); continue; fi
   allowed=$((allowed + $(printf '%s\n' "$hit" | wc -l)))
-  cites=$(printf '%s\n' "$cites" | g -v -xF -- "$hit")
+  cites=$(printf '%s\n' "$cites" | grep_answer check-comments -v -xF -- "$hit")
 done
 if [ "${#unmatched[@]}" -gt 0 ]; then
   printf 'check-comments: CITE_ALLOW entry matches no citation: %s\n' "${unmatched[@]}" >&2
@@ -110,7 +106,7 @@ for a in "${WORD_ALLOW[@]}"; do
   done)
   if [ -z "$hit" ]; then wunmatched+=("$a"); continue; fi
   wallowed=$((wallowed + $(printf '%s\n' "$hit" | wc -l)))
-  words=$(printf '%s\n' "$words" | g -v -xF -- "$hit")
+  words=$(printf '%s\n' "$words" | grep_answer check-comments -v -xF -- "$hit")
 done
 if [ "${#wunmatched[@]}" -gt 0 ]; then
   printf 'check-comments: WORD_ALLOW entry matches no line: %s\n' "${wunmatched[@]}" >&2
