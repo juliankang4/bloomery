@@ -583,6 +583,66 @@ pub fn plan_nodes<'a>(
     workload: Workload,
 ) -> Result<NodePlan<'a>, NodesError> {
     let n = nodes.machine.nodes.len();
+    let id_bytes = checked_id_bytes(nodes, terms, budgets, workload)?;
+    let plan = |used: &[usize]| -> Result<NodePlan<'a>, NodesError> {
+        let mut p = NodePlan {
+            nodes,
+            terms,
+            budgets,
+            workload,
+            id_bytes,
+            owned: vec![0; n],
+            idle: Vec::new(),
+            bare: false,
+        };
+        p.spread(used)?;
+        Ok(p)
+    };
+    let mut used = vec![0];
+    let mut why: Vec<Option<IdleWhy>> = vec![None; n];
+    let mut now = plan(&used)?;
+    for j in 1..n {
+        let (fixed, pool) = (budgets[j].fixed, budgets[j].pool);
+        if fixed > pool {
+            why[j] = Some(IdleWhy::Pool { fixed, pool });
+            continue;
+        }
+        let with: Vec<usize> = used.iter().copied().chain([j]).collect();
+        let next = plan(&with)?;
+        why[j] = idle_why(&now, &used, &next, j)?;
+        if why[j].is_none() {
+            (used, now) = (with, next);
+        }
+    }
+    if let Some(&over) = now.over()?.first() {
+        return Err(NodesError::PoolOver(over));
+    }
+    let empty: Vec<usize> = (1..n).filter(|&j| now.owned[j] == 0).collect();
+    if empty.iter().any(|&j| why[j].is_none()) {
+        let step_ns = now.predict()?.step_ns;
+        for &j in &empty {
+            why[j].get_or_insert(IdleWhy::Gain {
+                without_ns: step_ns,
+                with_ns: step_ns,
+            });
+        }
+    }
+    now.idle = empty
+        .into_iter()
+        .filter_map(|node| why[node].map(|why| NodeIdle { node, why }))
+        .collect();
+    Ok(now)
+}
+
+/// One id's bytes over every routed layer, once [`plan_nodes`]'s inputs are
+/// defined: refused by name as it lists.
+fn checked_id_bytes(
+    nodes: &Nodes,
+    terms: &Terms,
+    budgets: &[NodeBudget],
+    workload: Workload,
+) -> Result<u64, NodesError> {
+    let n = nodes.machine.nodes.len();
     let joins = nodes.fabric.joins();
     if !joins.contains(&n) {
         return Err(NodesError::Fabric {
@@ -633,79 +693,45 @@ pub fn plan_nodes<'a>(
     ) else {
         return Err(overflow);
     };
-    let plan = |used: &[usize]| -> Result<NodePlan<'a>, NodesError> {
-        let mut p = NodePlan {
-            nodes,
-            terms,
-            budgets,
-            workload,
-            id_bytes,
-            owned: vec![0; n],
-            idle: Vec::new(),
-            bare: false,
-        };
-        p.spread(used)?;
-        Ok(p)
-    };
-    let mut used = vec![0];
-    let mut why: Vec<Option<IdleWhy>> = vec![None; n];
-    let mut now = plan(&used)?;
-    for j in 1..n {
-        let (fixed, pool) = (budgets[j].fixed, budgets[j].pool);
-        if fixed > pool {
-            why[j] = Some(IdleWhy::Pool { fixed, pool });
-            continue;
-        }
-        let with: Vec<usize> = used.iter().copied().chain([j]).collect();
-        let next = plan(&with)?;
-        if now.room(&used) < u128::from(terms.experts) && now.room_ids(j) > 0 {
-            (used, now) = (with, next);
-            continue;
-        }
-        let (a, b) = (now.step_ps()?, next.step_ps()?);
-        let link = next.exposed_ps(b)?;
-        let ns = |ps: Ps| ps.ns().ok_or_else(|| now.overflow());
-        let past = |x: Option<Ps>| x.ok_or_else(|| now.overflow());
-        let ruler = 2 * u128::from(nodes.ruler_permille);
-        why[j] = if past(link.times(10))? > b {
-            Some(IdleWhy::LinkShare {
-                link_ns: ns(link)?,
-                step_ns: ns(b)?,
-            })
-        } else if next.owned[j] == 0
-            || b >= a
-            || ruler >= 1000
-            || past(a.times(1000 - ruler))? < past(b.times(1000))?
-        {
-            Some(IdleWhy::Gain {
-                without_ns: ns(a)?,
-                with_ns: ns(b)?,
-            })
-        } else {
-            None
-        };
-        if why[j].is_none() {
-            (used, now) = (with, next);
-        }
+    Ok(id_bytes)
+}
+
+/// Why the plan leaves node `j` idle, or `None` where it takes `next`, the
+/// split over `used` and `j`, over `now`, the split over `used`: it takes it
+/// where the pools of `used` cannot hold every id and `j`'s has room, and
+/// otherwise where the link stays within a tenth of `next`'s step and `next`
+/// gives `j` an id and gains twice the ruler.
+fn idle_why(
+    now: &NodePlan<'_>,
+    used: &[usize],
+    next: &NodePlan<'_>,
+    j: usize,
+) -> Result<Option<IdleWhy>, NodesError> {
+    if now.room(used) < u128::from(now.terms.experts) && now.room_ids(j) > 0 {
+        return Ok(None);
     }
-    if let Some(&over) = now.over()?.first() {
-        return Err(NodesError::PoolOver(over));
-    }
-    let empty: Vec<usize> = (1..n).filter(|&j| now.owned[j] == 0).collect();
-    if empty.iter().any(|&j| why[j].is_none()) {
-        let step_ns = now.predict()?.step_ns;
-        for &j in &empty {
-            why[j].get_or_insert(IdleWhy::Gain {
-                without_ns: step_ns,
-                with_ns: step_ns,
-            });
-        }
-    }
-    now.idle = empty
-        .into_iter()
-        .filter_map(|node| why[node].map(|why| NodeIdle { node, why }))
-        .collect();
-    Ok(now)
+    let (a, b) = (now.step_ps()?, next.step_ps()?);
+    let link = next.exposed_ps(b)?;
+    let ns = |ps: Ps| ps.ns().ok_or_else(|| now.overflow());
+    let past = |x: Option<Ps>| x.ok_or_else(|| now.overflow());
+    let ruler = 2 * u128::from(now.nodes.ruler_permille);
+    Ok(if past(link.times(10))? > b {
+        Some(IdleWhy::LinkShare {
+            link_ns: ns(link)?,
+            step_ns: ns(b)?,
+        })
+    } else if next.owned[j] == 0
+        || b >= a
+        || ruler >= 1000
+        || past(a.times(1000 - ruler))? < past(b.times(1000))?
+    {
+        Some(IdleWhy::Gain {
+            without_ns: ns(a)?,
+            with_ns: ns(b)?,
+        })
+    } else {
+        None
+    })
 }
 
 /// A remote's link costs a layer: the round trip and a post in picoseconds,
