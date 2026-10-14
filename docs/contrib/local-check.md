@@ -242,10 +242,12 @@ one card `nvidia-smi` lists, picked by UUID, or among several cards the one `BLO
 - **The runners.** Two runners opt in. `tools/ref/depth-qwen3moe.sh` runs through `just depth-gpu-qwen3moe`,
   `depth-gpu-qwen35moe` and `depth-gpu-qwen4exp`. `tools/ref/depth-serve.sh` times any model's decode and prompt rate
   through `bloomery-serve`: `BLOOMERY_MODEL=<profile> just depth-serve <tree>:<D> ...`, each arm the `bloomery-serve`
-  of `~/repo/<tree>` on the first D ids of the profile's prose corpus (the runner's header has the arms). Any other
-  runner prints the reason and exits 64 before it takes the lease. These recipes time a real model file, the profile's
-  (`BLOOMERY_REF_MODEL` moves it, `tools/ref/ref-paths.sh`), not a fixture. The reference engine arms of
-  `depth-qwen3moe.sh` read the profile's `IK`, `LCPP` and `MRS` trees, which you build yourself; no recipe builds them.
+  of `~/repo/<tree>` on the first D ids of the profile's prose corpus (the runner's header has the arms). The recipe
+  builds the tree it runs in for an arm of that tree's name, so run it from `~/repo/<tree>`: from anywhere else the
+  runner refuses that arm with exit 64. Any other runner prints the reason and exits 64 before it takes the lease.
+  These recipes time a real model file, the profile's (`BLOOMERY_REF_MODEL` moves it, `tools/ref/ref-paths.sh`), not
+  a fixture. The reference engine arms of `depth-qwen3moe.sh` read the profile's `IK`, `LCPP` and `MRS` trees, which
+  you build yourself; no recipe builds them.
 - **The prediction card.** The lease starts a run only with a card file written before it: what the run measures, the
   band the derivation predicts and the next step for each outcome. Write it as `docs/cards/<slug>.card` in your tree
   (the format is the header of `tools/ref/card.py`; `docs/cards/example-*.card` show each kind and are refused as a

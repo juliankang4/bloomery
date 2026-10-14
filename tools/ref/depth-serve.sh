@@ -71,7 +71,9 @@
 # Local mode. Under tools/box.sh's local mode (BLOOMERY_BOX_CARD=local; timing-card.sh's header has its refusals) the
 # arms time this machine's one card. Before the lease a kernel journal that does not answer, or shows a user other than
 # root no line, refuses the run (69); after every arm's server has stopped, an Xid since the last arm's check or the card
-# lost fails the arm, and a failed arm's line names them beside its own reason.
+# lost fails the arm, and a failed arm's line names them beside its own reason. The recipe runs in the contributor's tree
+# and builds it for an arm of that tree's name, so such an arm whose ~/repo/<tree> is another directory, or none, is
+# refused before the lease (64).
 set -uo pipefail
 __d=${BASH_SOURCE[0]%/*}
 [ "$__d" != "${BASH_SOURCE[0]}" ] || __d=.
@@ -294,7 +296,7 @@ ds_ids() { head -n "$1" "$(ds_ids_file)" | paste -sd, -; }
 # ds_resolve_bins: A_BIN, A_SHA and A_MTIME per arm, each tree checked once. A run refuses (2 missing, 3 stale) before
 # the lease; a dry run prints the state and goes on.
 ds_resolve_bins() {
-  local i j dir rc
+  local i j dir rc why
   A_BIN=() A_SHA=() A_MTIME=()
   for ((i = 0; i < ${#A_LABEL[@]}; i++)); do
     dir=$HOME/repo/${A_TREE[i]}
@@ -304,6 +306,15 @@ ds_resolve_bins() {
     done
     if [ "$j" -lt "$i" ]; then
       A_SHA+=("${A_SHA[j]}") A_MTIME+=("${A_MTIME[j]}")
+      continue
+    fi
+    # Local mode runs the recipe in the contributor's tree, and the recipe builds that tree for an arm of its name.
+    if [ -n "$TIMING_LOCAL" ] && [ "${A_TREE[i]}" = "${ROOT##*/}" ] \
+      && [ "$(cd "$dir" 2> /dev/null && pwd -P)" != "$(cd "$ROOT" && pwd -P)" ]; then
+      why="$dir is not this runner's tree $ROOT, which has its name: under local mode the depth-serve recipe builds the tree it runs in, so run it from $dir"
+      [ -n "$DRY" ] || ds_refuse 64 "arm '${A_LABEL[i]}': $why"
+      echo "[dry] tree ${A_TREE[i]}: $why (a run refuses, rc 64)"
+      A_SHA+=(-) A_MTIME+=(-)
       continue
     fi
     if [ ! -d "$dir" ]; then
@@ -497,7 +508,7 @@ ds_main() {
 # stale-binary rule, the real servers' start, request and stop stay).
 ds_selftest() {
   # T is read by the EXIT trap, after this function has returned: not local.
-  local n=0 fails=0 k C RC lever knob gb10 stub=$HERE/stub-llama-server.py
+  local n=0 fails=0 k C RC lever knob gb10 own stub=$HERE/stub-llama-server.py
   command -v python3 > /dev/null || { echo "depth-serve.sh --self-test: python3 is not on PATH" >&2; exit 2; }
   T=$(mktemp -d "${TMPDIR:-/tmp}/depth-serve-self-test.XXXXXX") || exit 2
   st_cleanup() {
@@ -786,7 +797,7 @@ time.sleep(60)  # port-holder' "$ST_PORT" "$C/listener-pid" &
   # once every server the case started has stopped, and fails under STUB_JOURNAL=fail. The box
   # (/root/bloomery-cpu.lock) refuses local mode.
   if [ -e /root/bloomery-cpu.lock ]; then
-    echo "skip local, local-journal, local-cards, local-xid, local-xid-failed-arm, local-gone: /root/bloomery-cpu.lock exists (the box), where local mode is refused"
+    echo "skip local, local-journal, local-cards, local-xid, local-xid-failed-arm, local-gone, local-tree-elsewhere, local-tree-here: /root/bloomery-cpu.lock exists (the box), where local mode is refused"
   else
     gb10=GPU-22222222-2222-2222-2222-222222222222
     mkdir -p "$T/local"
@@ -854,6 +865,24 @@ JCTL
     st_run a:6
     st_check local-gone 1 "FAIL r1 a D=6: the timing card ($gb10) does not answer nvidia-smi (rc 15)"
     [ "$(grep -o 'does not answer nvidia-smi' "$C/out" | wc -l | tr -d ' ')" = 1 ] && ok local-gone-named-once || bad local-gone-named-once "the lost card is not named exactly once"
+    # An arm named as this tree: ~/repo/<name> another tree of that name is refused, ~/repo/<name> a link to this
+    # tree is not.
+    own=${ROOT##*/}
+    if [[ $own =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      st_case local-tree-elsewhere
+      st_tree "$own" 20
+      ST_ENV=(BLOOMERY_AB_ROUNDS=1)
+      st_run "$own:6"
+      st_check local-tree-elsewhere 64 "arm '$own': $C/home/repo/$own is not this runner's tree $ROOT"
+      st_case local-tree-here
+      ln -s "$ROOT" "$C/home/repo/$own"
+      ST_ENV=(BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1)
+      st_run "$own:6"
+      st_check local-tree-here 0 "[plan] arm 1: $own D=6:"
+      st_absent local-tree-here-not-refused "is not this runner's tree"
+    else
+      echo "skip local-tree-elsewhere, local-tree-here: this tree's name '$own' is no tree name"
+    fi
     ST_LOCAL=''
     ST_ENV=()
   fi
