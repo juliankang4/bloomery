@@ -215,6 +215,10 @@ blk_loadscan() { blk_scancheck loads; }
 # or file it cannot list or read ends the check with no verdict. The listing, the comment reader and the scan are
 # tested here on fixed input and on input that cannot be read, no tree walk.
 blk_commentscan() { blk_scancheck comments; }
+# check-levers.sh walks crates/*/src, crates/*/tests, tools/ and .cargo/ for reads and names: a directory the walk
+# cannot list or a file it cannot read ends the check with exit 2 and names it. That refusal is tested here on a
+# temporary tree, no tree walk.
+blk_leverscan() { blk_scancheck levers; }
 # load-groups.sh decides which arms of a depth runner share one load, and their order: its grouping and
 # rotation are tested on fixed keys, and under bash 4.1 or later its idle bound on a stalled process.
 blk_loadgroups() {
@@ -713,12 +717,14 @@ blk_fixturevariants() {
 # open. dspark_model refuses that with exit 66. A justfile expansion, a printf of the variable, or any
 # expansion in a shell script that sources ref-paths.sh fails here by file:line. A dspark_model call
 # does not exempt another expansion in the same file. A quoted source path still counts as sourcing.
+# A directory under tools/ that the walk cannot list ends the block with no verdict (2), never as one with no script.
 blk_dsparkread() {
-  local out
-  if ! out=$(python3 - "$JF" "$(dirname "$0")" << 'PY'
+  local out rc=0
+  out=$(python3 - "$JF" "$(dirname "$0")" << 'PY'
 import os
 import re
 import sys
+import tempfile
 
 # The bad printf is built from parts so this file does not contain that byte string (the tree grep
 # for it must stay empty, including on this checker).
@@ -811,7 +817,24 @@ def fixtures():
     bad += expect("the function's own file", script_hits("dspark_model() {\n  printf '%s' " + expand + "\n}\n", "ref-paths.sh"), 0)
     # timing-card.sh expands the variable and does not source ref-paths.sh; this rule does not own that file.
     bad += expect("a script that does not source ref-paths", script_hits("echo " + brace + "\n", "timing-card.sh"), 0)
+    # a mode does not bind root, so the unlistable directory is a case only for another user
+    if os.geteuid() != 0:
+        d = tempfile.mkdtemp()
+        os.mkdir(os.path.join(d, "hidden"), 0)
+        try:
+            scan(sys.argv[1], d)
+            bad.append("check-recipes: draft-read fixture 'a directory the walk cannot list': scanned as one with no "
+                       "script")
+        except PermissionError:
+            pass
+        finally:
+            os.rmdir(os.path.join(d, "hidden"))
+            os.rmdir(d)
     return bad
+
+
+def unlisted(e):
+    raise e
 
 
 def scan(justfile, tools):
@@ -819,7 +842,7 @@ def scan(justfile, tools):
     with open(justfile, encoding="utf-8") as fh:
         hits += justfile_hits(fh.read(), justfile)
     nsh = 0
-    for root, dirs, files in os.walk(tools):
+    for root, dirs, files in os.walk(tools, onerror=unlisted):
         dirs[:] = [d for d in dirs if d != ".git"]
         for name in files:
             if not name.endswith(".sh"):
@@ -835,17 +858,22 @@ errs = fixtures()
 if errs:
     print("\n".join(errs))
     sys.exit(1)
-hits, nsh = scan(sys.argv[1], sys.argv[2])
+try:
+    hits, nsh = scan(sys.argv[1], sys.argv[2])
+except OSError as e:
+    print(f"check-recipes: draft reads: cannot read {e.filename} ({e.strerror}), no verdict")
+    sys.exit(2)
 if hits:
     print("check-recipes: a fixture-tier command exports an empty draft path:")
     print("\n".join(hits))
     sys.exit(1)
 print(f"check-recipes: draft reads go through dspark_model ({nsh} shell files, the printf fixture is red)")
 PY
-  ); then
+  ) || rc=$?
+  if [ "$rc" != 0 ]; then
     printf '%s\n' "$out" >&2
-    echo "check-recipes: a fixture-tier command exports an empty draft path" >&2
-    return 1
+    [ "$rc" = 2 ] || echo "check-recipes: a fixture-tier command exports an empty draft path" >&2
+    return "$rc"
   fi
   printf '%s\n' "$out"
 }
@@ -998,7 +1026,7 @@ proc_leg_gpu() {
 proc_leg
 unset CPU_GUARD_PROC_LEG
 
-BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
+BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
   refsetpublish orphan archowner wt)
 for b in "${BLOCKS[@]}"; do

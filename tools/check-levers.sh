@@ -31,9 +31,15 @@
 #    file that is not there or a fn that file does not define is red, naming the row.
 # The registry's in-place rows and the list are held to each other by the levers crate's test
 # registry_and_allow_list_agree (just gate-levers), which reads this list at build time.
+# Exit: 0 every hold, 1 a problem (each named), 2 a directory the scans cannot list or a file they cannot read (no
+# verdict: a skipped one would hide its reads and names), 64 an unknown argument or more than one. `--self-test` runs
+# the check on a temporary tree with a directory it cannot list or a file it cannot read, and exits.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-python3 - "$ROOT" << 'PY'
+
+# levers ROOT: the five holds over the tree at ROOT.
+levers() {
+python3 - "$1" << 'PY'
 import os, re, sys
 
 root = sys.argv[1]
@@ -172,6 +178,29 @@ def scan(rel, text):
     return reads, problems
 
 
+def no_verdict(verb, path, e):
+    print(f'check-levers: cannot {verb} {os.path.relpath(path, root)} ({e.strerror}), no verdict', file=sys.stderr)
+    sys.exit(2)
+
+
+def walk(top):
+    """os.walk, where a top that is not there yields nothing and any other directory it cannot list ends the check
+    with no verdict."""
+    def unlisted(e):
+        if not (isinstance(e, FileNotFoundError) and e.filename == top):
+            no_verdict('list', e.filename, e)
+    return os.walk(top, onerror=unlisted)
+
+
+def read(path, mode='r'):
+    """The text (or, with mode 'rb', the bytes) of path; a file it cannot open or read ends the check with no verdict."""
+    try:
+        with open(path, mode, encoding=None if 'b' in mode else 'utf-8') as f:
+            return f.read()
+    except OSError as e:
+        no_verdict('read', path, e)
+
+
 def sources():
     crates = os.path.join(root, 'crates')
     for crate in sorted(os.listdir(crates)):
@@ -180,19 +209,19 @@ def sources():
             continue
         dirs = [d for d in ('src', 'tests') if not (crate == 'levers' and d == 'src')]
         for d in dirs:
-            for dirpath, _, files in os.walk(os.path.join(base, d)):
+            for dirpath, _, files in walk(os.path.join(base, d)):
                 for name in sorted(files):
                     if name.endswith('.rs'):
                         yield os.path.join(dirpath, name)
         build = os.path.join(base, 'build.rs')
-        if os.path.isfile(build):
+        if os.path.lexists(build):
             yield build
 
 
 reads = {}
 for path in sources():
     rel = os.path.relpath(path, root)
-    got, problems = scan(rel, open(path, encoding='utf-8').read())
+    got, problems = scan(rel, read(path))
     bad.extend(problems)
     if got:
         reads[rel] = got
@@ -231,13 +260,13 @@ FIXTURES = {('tools/recipes.py', FIXTURE), ('tools/ref/card-tests/run.sh', FIXTU
 NAME = re.compile(rb'BLOOMERY_[A-Z0-9_]+')
 given = [os.path.join(root, 'justfile')]
 for top in ('tools', '.cargo'):
-    for dirpath, dirs, files in os.walk(os.path.join(root, top)):
+    for dirpath, dirs, files in walk(os.path.join(root, top)):
         dirs[:] = [d for d in dirs if d != '__pycache__']  # Python's byte-code cache repeats the sources' names
         given += [os.path.join(dirpath, name) for name in sorted(files)]
 names = set()
 for path in given:
     rel = os.path.relpath(path, root)
-    data = open(path, 'rb').read()
+    data = read(path, 'rb')
     for m in NAME.finditer(data):
         name = m.group(0).decode()
         if name.endswith('_') or (rel, name) in FIXTURES:
@@ -476,3 +505,51 @@ print(f'check-levers: ok ({count} reads in place in {len(reads)} files, all list
       'reads in crates/*/src, each in a function something calls; '
       f'{runtime_rows} Phase::Runtime rows, each setter a fn in the tree)')
 PY
+}
+
+# The check on a temporary tree that it cannot read whole: a crates/c/src that is a file, (not as root, whom a mode does
+# not bind) a directory at mode 000 under it, a build.rs that is a link to nothing, and a .cargo that is a file. Each
+# ends the check with exit 2 and the line that names it.
+self_test() {
+  local fails=0 d out rc
+  expect() {
+    [ "$2" = "$3" ] || { echo "check-levers: self-test $1: got [$2], want [$3]" >&2; fails=$((fails + 1)); }
+  }
+  d=$(mktemp -d)
+  mkdir -p "$d/tools" "$d/crates/levers/src" "$d/crates/c"
+  : > "$d/tools/levers-direct.txt"
+  : > "$d/crates/levers/src/registry.rs"
+  : > "$d/justfile"
+  : > "$d/crates/c/src"
+  rc=0 out=$(levers "$d" 2>&1) || rc=$?
+  expect src-file "$rc $out" "2 check-levers: cannot list crates/c/src (Not a directory), no verdict"
+  if [ "$(id -u)" != 0 ]; then
+    rm "$d/crates/c/src"
+    mkdir -p "$d/crates/c/src/hidden"
+    chmod 000 "$d/crates/c/src/hidden"
+    rc=0 out=$(levers "$d" 2>&1) || rc=$?
+    chmod 755 "$d/crates/c/src/hidden"
+    expect mode-000 "$rc $out" "2 check-levers: cannot list crates/c/src/hidden (Permission denied), no verdict"
+  fi
+  rm -rf "$d/crates/c/src"
+  mkdir "$d/crates/c/src"
+  ln -s gone.rs "$d/crates/c/build.rs"
+  rc=0 out=$(levers "$d" 2>&1) || rc=$?
+  expect broken-build-link "$rc $out" "2 check-levers: cannot read crates/c/build.rs (No such file or directory), no verdict"
+  rm "$d/crates/c/build.rs"
+  : > "$d/.cargo"
+  rc=0 out=$(levers "$d" 2>&1) || rc=$?
+  expect cargo-file "$rc $out" "2 check-levers: cannot list .cargo (Not a directory), no verdict"
+  rm -rf "$d"
+  rc=0 out=$(bash "$ROOT/tools/check-levers.sh" '' extra 2>&1) || rc=$?
+  expect extra-argument "$rc $out" "64 check-levers: unknown argument ' extra' (none, --self-test)"
+  [ "$fails" = 0 ] || { echo "check-levers: self-test: $fails failed" >&2; return 1; }
+  echo "check-levers: self-test ok"
+}
+
+case "$*" in
+  --self-test) self_test; exit $? ;;
+  '') ;;
+  *) echo "check-levers: unknown argument '$*' (none, --self-test)" >&2; exit 64 ;;
+esac
+levers "$ROOT"

@@ -208,10 +208,13 @@ def invocations(lines, macro):
 def crate_kernels(root, crate):
     """name -> (file, line) of every entry the crate's src declares; macro-bound names resolved."""
     base = os.path.join(root, "crates", crate, "src")
-    if not os.path.isdir(base):
-        raise Refuse(f"crates/{crate}/src is not there (BIN_CRATES names it)")
+
+    def unlisted(e):  # a directory the walk cannot list is an unreadable input (main_check's exit 2), never skipped
+        if isinstance(e, FileNotFoundError) and e.filename == base:
+            raise Refuse(f"crates/{crate}/src is not there (BIN_CRATES names it)")
+        raise e
     files = []
-    for d, _, fs in os.walk(base):
+    for d, _, fs in os.walk(base, onerror=unlisted):
         files += [os.path.join(d, f) for f in fs if f.endswith(".rs")]
     found, macros, texts = {}, {}, {}
     for f in sorted(files):
@@ -587,6 +590,23 @@ def self_test():
             rc = main_check(empty)
         if rc != 2:
             fails.append(f"an empty root: rc {rc}, want 2")
+        # a directory under a crate's src that the walk cannot list is rc 2, not a pass (a mode does not bind root).
+        if os.geteuid() != 0:
+            root = tempfile.mkdtemp(dir=top)
+            write_fixture(root)
+            hidden = os.path.join(root, "crates", "gpu", "src", "hidden")
+            os.makedirs(hidden)
+            with open(os.path.join(hidden, "k.rs"), "w", encoding="utf-8") as fh:
+                fh.write("#[kernel]\npub fn k_hidden() {}\n")
+            os.chmod(hidden, 0)
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    rc = main_check(root)
+            finally:
+                os.chmod(hidden, 0o755)
+            if rc != 2:
+                fails.append(f"a directory it cannot list: rc {rc}, want 2\n{buf.getvalue()}")
     finally:
         shutil.rmtree(top, ignore_errors=True)
     if fails:

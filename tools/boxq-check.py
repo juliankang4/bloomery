@@ -21,7 +21,8 @@ and 85 (the job's dir lock not taken), tools/boxq.py produces 81 (lost) and 84 (
 codes and no other. A script that only tests a code, or names it in a comment, is no collision. The codes also stay
 clear of those tools/ and the justfile already name.
 
-Exit: 0 ok; 64 usage; 65 a fill row or a code collision, named; 69 an unreadable file.
+Exit: 0 ok; 64 usage; 65 a fill row or a code collision, named; 69 an unreadable file or a directory under tools/
+the walk cannot list.
 """
 
 import contextlib
@@ -131,7 +132,11 @@ def cmd_codes_check(a):
     base = a.root or os.path.join(here(), "..")
     bad = []
     files = [os.path.join(base, "justfile")]
-    for dp, _, fns in os.walk(os.path.join(base, "tools")):
+
+    def unlisted(e):
+        raise Refusal(ROOT_BAD, "unreadable", f"{e.filename}: {e}")
+
+    for dp, _, fns in os.walk(os.path.join(base, "tools"), onerror=unlisted):
         files += [os.path.join(dp, f) for f in fns if f.endswith((".sh", ".py")) or "." not in f]
     for p in sorted(files):
         if os.path.abspath(p) == os.path.abspath(__file__) or not os.path.isfile(p):
@@ -282,6 +287,27 @@ def case_codes(fx):
         f.write("exit 83\n")
     rc, out, err = fx.call("codes-check", "--root", d)
     check(rc == DATA and "tools/other.sh:1: produces 83" in err, f"another script producing 83 stays refused: {rc} {err!r}")
+    os.unlink(other)
+    # a directory under tools/ the walk cannot list is refused by name, never read as one with no script: a tools/ that
+    # is a file, and (not as root, whom a mode does not bind) a directory at mode 000 holding a script that produces 81
+    flat = os.path.join(fx.tmp, "flat")
+    os.makedirs(flat)
+    for n in ("justfile", "tools"):
+        open(os.path.join(flat, n), "w").close()
+    rc, out, err = fx.call("codes-check", "--root", flat)
+    check(rc == ROOT_BAD and "unreadable" in err and "tools" in err, f"a tools/ that is a file must be 69: {rc} {err!r}")
+    if os.geteuid() != 0:
+        hidden = os.path.join(d, "tools", "hidden")
+        os.mkdir(hidden)
+        with open(os.path.join(hidden, "x.sh"), "w") as f:
+            f.write("exit 81\n")
+        os.chmod(hidden, 0)
+        try:
+            rc, out, err = fx.call("codes-check", "--root", d)
+        finally:
+            os.chmod(hidden, 0o755)
+        check(rc == ROOT_BAD and "unreadable" in err and "tools/hidden" in err,
+              f"a directory at mode 000 under tools/ must be 69: {rc} {err!r}")
 
 
 CASES = [case_fill_list, case_codes]

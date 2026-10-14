@@ -62,7 +62,8 @@ those rows so the open gaps stay visible. Red (exit 1): a pin with no row, a
 row whose pin no longer exists, a twin whose path is not in the tree or whose
 needle occurs zero times or more than once in it, an undated `none`. Named
 error (exit 65): a registry row, a recipe or a TSV line the reader cannot
-parse, a lever the registry does not know, a gate file no recipe names.
+parse, a lever the registry does not know, a gate file no recipe names, a
+directory of the scanned paths the scanner cannot list.
 
 Blind spots, each named: lever values built in code as typed values the
 environment never carries (`Residency::Mid` consts, `set_hoststream`,
@@ -326,17 +327,26 @@ def scan_rust(rel, text, live, reg_consts):
     return pins
 
 
+def walk(root, *parts):
+    """os.walk of root/parts, where a top that is not there yields nothing and any other directory it cannot list is a
+    named error."""
+    top = os.path.join(root, *parts)
+
+    def unlisted(e):
+        if not (isinstance(e, FileNotFoundError) and e.filename == top):
+            raise InputError(f"{os.path.relpath(e.filename, root)}: cannot list the directory ({e.strerror})")
+    return os.walk(top, onerror=unlisted)
+
+
 def rust_files(root):
     out = []
-    base = os.path.join(root, "crates", "gpu-gates", "src")
-    for dirpath, _, files in os.walk(base):
+    for dirpath, _, files in walk(root, "crates", "gpu-gates", "src"):
         out += [os.path.join(dirpath, f) for f in sorted(files) if f.endswith(".rs")]
     crates = os.path.join(root, "crates")
     for crate in sorted(os.listdir(crates)):
-        tests = os.path.join(crates, crate, "tests")
-        if not os.path.isdir(tests):
+        if not os.path.isdir(os.path.join(crates, crate)):
             continue
-        for dirpath, _, files in os.walk(tests):
+        for dirpath, _, files in walk(root, "crates", crate, "tests"):
             out += [os.path.join(dirpath, f) for f in sorted(files) if f.endswith(".rs")]
     return out
 
@@ -681,6 +691,18 @@ def self_test():
         pass
     open(just, "w").write(saved_just)
     open(tsv, "w").write(saved_tsv)
+    # a directory the scanner cannot list, under gpu-gates/src or a crate's tests/, is refused, never skipped (a mode
+    # does not bind root)
+    if os.geteuid() != 0:
+        for hidden in ("crates/gpu-gates/src/bin", "crates/model/tests"):
+            os.chmod(os.path.join(root, hidden), 0)
+            try:
+                check(root)
+                fails.append(f"{hidden}, a directory the scanner cannot list, is not refused")
+            except InputError:
+                pass
+            finally:
+                os.chmod(os.path.join(root, hidden), 0o755)
 
     # the readers: a recipe header with a `:=` is no recipe; comments carry no pin
     live, reg_consts = live_levers(root)
