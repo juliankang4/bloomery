@@ -6,9 +6,9 @@
 //! them here.
 
 use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::generate::{Place, TierRule, choose_ctx_of};
 use bloomery_gpu_gates::residency38::glm_machine;
-use bloomery_gpu_gates::vision_seat;
 use bloomery_gpu_glm5next::checkpoint_price;
 use model::arch::glm5next::hparams::Hparams;
 use model::arch::glm5next::place::{
@@ -110,15 +110,15 @@ pub fn plan_of<'a>(
 }
 
 /// A plan refusal on `machine` as the seat names it: the image encoder's
-/// reserve named when the machine carries one ([`vision_seat::refusal`]).
+/// reserve named when the machine carries one ([`beside::refusal`]).
 #[allow(
     dead_code,
     reason = "the serve seat names its refusals; the CLI and the routed legs read them bare"
 )]
 pub fn named(machine: &Machine, e: PlaceError) -> GateError {
-    match vision_seat::reserve_in(machine) {
-        Some(bytes) => GateError::from(vision_seat::refusal(Some(bytes), e)),
-        None => GateError::from(e),
+    match beside::reserve_in(machine) {
+        held if held == Beside::default() => GateError::from(e),
+        held => GateError::from(beside::refusal(held, e)),
     }
 }
 

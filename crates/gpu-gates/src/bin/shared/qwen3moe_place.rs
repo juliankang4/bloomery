@@ -36,6 +36,7 @@ use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, choose_ctx, short_in};
 use bloomery_gpu_gates::image_plan;
 use bloomery_gpu_gates::record::{self, Record};
@@ -239,7 +240,12 @@ fn laid(
         ));
     }
     reserve_checkpoints(&mut machine, seqs, slot_ctx)?;
-    image_plan::reserve_on(&mut machine, media.encoder);
+    beside::reserve_on(
+        &mut machine,
+        Beside {
+            image: media.encoder,
+        },
+    );
     Ok(machine)
 }
 
@@ -251,7 +257,7 @@ fn slot_ctx(ctx: usize, slots: usize) -> usize {
 
 /// What a media load adds to the machines and verdicts of a load ([`laid`], [`whole_on`]): the
 /// image encoder's bytes when its tower sits on the stage card
-/// (`vision_seat::EncoderSeat::reserve`, entered by [`image_plan::reserve_on`]), and the width
+/// (`vision_seat::EncoderSeat::reserve`, entered by [`beside::reserve_on`]), and the width
 /// in f32 of the rotation table every sequence holds on a media load (`Open35::media`;
 /// [`image_plan::table_bytes_per_position`] a position). A text load adds neither.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -618,7 +624,7 @@ impl Whole {
     fn line(&self, ctx: usize) -> String {
         match self {
             Whole::Fits(n) | Whole::Short(n) => {
-                format!("whole fit at ctx {ctx}: {n}{}", image_plan::note(&n.card))
+                format!("whole fit at ctx {ctx}: {n}{}", beside::note(&n.card))
             }
             Whole::Refused(why) => format!("whole fit at ctx {ctx}: {why}"),
         }
@@ -640,7 +646,7 @@ impl Whole {
 /// out for the program ([`q3::machine`], its step arenas' scratch), on a
 /// unified machine with the checkpoints `seqs` pin at `slot_ctx` positions a
 /// slot ([`reserve_checkpoints`], `Machine::whole_card`) and the image
-/// `encoder`'s bytes when its tower sits on the card ([`image_plan::reserve_on`],
+/// `encoder`'s bytes when its tower sits on the card ([`beside::reserve_on`],
 /// the reserve a placed plan carries), and what the program holds past it
 /// (`load`, or
 /// the program's refusal), sized by `placement::whole_need`, the verdict's
@@ -663,7 +669,7 @@ fn whole_on(
     };
     let mut machine = q3::machine(spec, layers, 0);
     reserve_checkpoints(&mut machine, seqs, slot_ctx)?;
-    image_plan::reserve_on(&mut machine, encoder);
+    beside::reserve_on(&mut machine, Beside { image: encoder });
     let card = machine
         .whole_card()
         .ok_or_else(|| format!("the whole load on {}: a machine with no card", spec.name))?;

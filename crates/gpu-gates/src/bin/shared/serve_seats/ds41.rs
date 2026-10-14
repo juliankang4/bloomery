@@ -215,6 +215,7 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{Slots, StepMode};
 use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqSnapshot};
 use bloomery_gpu_deepseek41::swap;
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, arm_screen,
     bind_server, model_props, parallel_line, placement_of,
@@ -574,7 +575,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             let ctx = ctx_of(None)?.slot_ctx;
             let cost_with = |vision: Option<u64>| -> Result<_, GateError> {
                 let mut machine = a.place.machine(reserve, tier_batch)?(inputs.model.layers);
-                vision_seat::reserve_on(&mut machine, vision);
+                beside::reserve_on(&mut machine, Beside { image: vision });
                 reserve_checkpoints(&mut machine, Seqs::none(slots.get()), ctx)?;
                 let plan = inputs.plan_with_slots(&machine, ctx, &cfg.place, slots)?;
                 Ok(vision_seat::Cost::of(&plan, ctx))
@@ -804,13 +805,15 @@ fn print_plan(
     cache_ram: Option<u64>,
 ) -> Result<(String, Option<PlacementProps>, CacheRam, ResidencyPick), GateError> {
     let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
-    let vision_reserve = vision.and_then(|v| v.seat.reserve);
-    vision_seat::reserve_on(&mut machine, vision_reserve);
+    let held = Beside {
+        image: vision.and_then(|v| v.seat.reserve),
+    };
+    beside::reserve_on(&mut machine, held);
     // V4.1's body makes no checkpoints: its slots pin none.
     reserve_checkpoints(&mut machine, Seqs::none(slots.get()), u64::try_from(ctx)?)?;
     let plan = inputs
         .plan_with_slots(&machine, u64::try_from(ctx)?, levers, slots)
-        .map_err(|e| vision_seat::refusal(vision_reserve, e))?;
+        .map_err(|e| beside::refusal(held, e))?;
     let pick = residency::at_plan(
         <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
         &plan,
@@ -1064,8 +1067,12 @@ impl V41 {
         let vision_reserve = a.vision.as_ref().and_then(|v| v.seat.reserve);
         #[cfg(not(feature = "vision"))]
         let vision_reserve = None;
-        let machine =
-            vision_seat::with_reserve(a.place.machine(a.reserve, a.tier_batch)?, vision_reserve);
+        let machine = beside::with_reserve(
+            a.place.machine(a.reserve, a.tier_batch)?,
+            Beside {
+                image: vision_reserve,
+            },
+        );
         let opened = t.elapsed();
         let mut m = body::open_slots(file, machine, a.ctx, &a.cfg, a.slots)?;
         m.set_mode(StepMode::Graph);

@@ -71,6 +71,7 @@ use std::time::Instant;
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::{Body35, PrefillPath, Qwen35moeModel};
 use bloomery_gpu::media::{ImageSpan, MediaBody};
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::arm_screen;
 use bloomery_gpu_gates::generate::{Place, choose_ctx};
 use bloomery_gpu_gates::record::{self, Record};
@@ -210,11 +211,13 @@ fn open_qwen35(
     ctx: usize,
     image: Option<&EncoderSeat>,
 ) -> Result<(Box<dyn Hidden>, Split), GateError> {
-    let reserve = image.and_then(|s| s.reserve);
+    let reserve = Beside {
+        image: image.and_then(|s| s.reserve),
+    };
     let o = crate::qwen35_open::open_shape(ctx, image.is_some());
     let (model, split) =
         crate::qwen35_open::open_seated(path, o.ctx, o.ubatch, o.media, &|machine| {
-            vision_seat::reserve_on(machine, reserve)
+            beside::reserve_on(machine, reserve)
         })?;
     Ok((Box::new(model), split))
 }
@@ -572,7 +575,9 @@ fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiv
         let file = Split::open(&l.model).map_err(|e| format!("open {}: {e}", l.model.display()))?;
         let census = bloomery_gpu_gates::gpu_census::census()?;
         let card = Place::A.on(&census)?.card_specs()?[0];
-        let reserve = image.as_ref().and_then(|o| o.seat.reserve);
+        let reserve = Beside {
+            image: image.as_ref().and_then(|o| o.seat.reserve),
+        };
         let media = image.is_some();
         let chosen = choose_ctx(
             &file,
@@ -583,7 +588,7 @@ fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiv
                     usize::try_from(c).map_err(|e| format!("a context of {c} positions: {e}"))?;
                 let shape = crate::qwen35_open::open_shape(ctx, media);
                 let need = crate::qwen35_open::whole_verdict(&file, shape, card, &|machine| {
-                    vision_seat::reserve_on(machine, reserve);
+                    beside::reserve_on(machine, reserve);
                 })?;
                 Ok(if need.fits() {
                     Probe::Holds(())

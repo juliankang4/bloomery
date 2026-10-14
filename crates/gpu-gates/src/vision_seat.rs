@@ -18,12 +18,10 @@
 //! * [`open_seat`] — the flags to the opened encoder: the projector held against the text model and
 //!   seated for the plan ([`Opened`]); [`Resident::open`] loads its tower on that card.
 //! * [`EncoderSeat`] — where the tower sits: the smallest card outside the plan, else a reserve on
-//!   the stage card ([`reserve_on`] puts the same reserve into a placed plan and a whole-fit probe).
-//! * [`RESERVE`], [`reserve_on`], [`reserve_in`], [`with_reserve`], [`refusal`] and
-//!   [`table_bytes_per_position`] —
-//!   the plan's side of it, in [`crate::image_plan`] (a placement module of every build takes it):
-//!   the tower's reserve in a placed plan and a whole-fit probe, and what a plan adds per position
-//!   of a sequence for a media load.
+//!   the stage card ([`crate::beside::reserve_on`] puts the same reserve into a placed plan and a
+//!   whole-fit probe).
+//! * [`table_bytes_per_position`] — the plan's side of it, in [`crate::image_plan`] (a placement
+//!   module of every build takes it): what a plan adds per position of a sequence for a media load.
 //! * [`on_encoder_card`] — binds the tower's card for a tower call and the model's card back.
 //! * [`Resident`] — a serve seat's resident encoder: the tower on its card, its stream, the row
 //!   width and the model's image input; [`Resident::encode_with`] encodes a media call's images
@@ -65,9 +63,7 @@ use vision::{EncoderInput, MediaModel, Patches, Prepared, VisionError};
 
 use crate::GateError;
 use crate::generate::Place;
-pub use crate::image_plan::{
-    RESERVE, refusal, reserve_in, reserve_on, table_bytes_per_position, with_reserve,
-};
+pub use crate::image_plan::table_bytes_per_position;
 use crate::record::{self, Record};
 
 /// A [`MediaModel`] the server holds across its threads (`serve::media::SharedMediaModel`).

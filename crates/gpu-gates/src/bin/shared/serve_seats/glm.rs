@@ -247,6 +247,7 @@ use app::{OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{SlotRows, StepMode};
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
     SlotStep, Vocab, arm_screen, begin, bind_server, eprint_noted, model_props, note_line,
@@ -505,9 +506,9 @@ impl Placed {
         let cost = |v: Option<&Opened>| -> Result<vision_seat::Cost, GateError> {
             let reserve = v.and_then(|v| v.seat.reserve);
             let machine_at = |ctx: u64| -> Result<Machine, GateError> {
-                Ok(vision_seat::with_reserve(
+                Ok(beside::with_reserve(
                     glm_machine(place, tier_batch, slots, price, ctx)?,
-                    reserve,
+                    Beside { image: reserve },
                 )(inputs.model.layers))
             };
             let ctx = u64::try_from(
@@ -520,9 +521,9 @@ impl Placed {
         let vision = vision_seat::kept(images.seat(place)?, images.flags, cost)?;
         let reserve = vision.as_ref().and_then(|v| v.seat.reserve);
         let machine_at = |ctx: u64| -> Result<Machine, GateError> {
-            Ok(vision_seat::with_reserve(
+            Ok(beside::with_reserve(
                 glm_machine(place, tier_batch, slots, price, ctx)?,
-                reserve,
+                Beside { image: reserve },
             )(inputs.model.layers))
         };
         let (slot_ctx, line) =
@@ -1178,7 +1179,7 @@ impl Glm {
         let reserve = a.vision.as_ref().and_then(|v| v.seat.reserve);
         let args = app::OpenArgs {
             place: a.place.name(),
-            machine: vision_seat::with_reserve(
+            machine: beside::with_reserve(
                 glm_machine(
                     a.place,
                     a.tier_batch,
@@ -1186,7 +1187,7 @@ impl Glm {
                     a.checkpoint_price,
                     u64::try_from(a.ctx)?,
                 )?,
-                reserve,
+                Beside { image: reserve },
             ),
             ctx: a.ctx,
             mode: StepMode::Graph,

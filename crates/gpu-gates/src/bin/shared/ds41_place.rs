@@ -10,11 +10,11 @@ use std::num::NonZeroUsize;
 
 use bloomery_gpu_deepseek41::body::Deepseek41Model;
 use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::generate::{Place, PlaceWhy, TierRule, choose_ctx};
 use bloomery_gpu_gates::gpu_census;
 use bloomery_gpu_gates::record::Record;
 use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
-use bloomery_gpu_gates::vision_seat;
 use gguf::Split;
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::place::PlanInputs;
@@ -105,7 +105,7 @@ pub fn ctx_choice(
         (Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")), None),
         |c| -> Result<Probe<()>, GateError> {
             let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
-            vision_seat::reserve_on(&mut machine, vision);
+            beside::reserve_on(&mut machine, Beside { image: vision });
             reserve_checkpoints(&mut machine, Seqs::none(slots.get()), c)?;
             match inputs.plan_with_slots(&machine, c, levers, slots) {
                 Ok(_) => Ok(Probe::Holds(())),

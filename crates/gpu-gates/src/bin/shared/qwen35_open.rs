@@ -6,8 +6,8 @@
 use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::beside;
 use bloomery_gpu_gates::generate::Place;
-use bloomery_gpu_gates::image_plan;
 use gguf::Split;
 use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::place as q35;
@@ -77,7 +77,7 @@ pub fn open_with(
 
 /// [`open_with`] whose whole-fit machine goes through `seat` before the verdict: a seat that holds
 /// bytes of the card for something else (the image encoder on the stage card,
-/// `vision_seat::reserve_on`) puts them there, so the verdict counts them.
+/// `beside::reserve_on`) puts them there, so the verdict counts them.
 pub fn open_seated(
     path: &Path,
     ctx: usize,
@@ -168,7 +168,7 @@ fn refuse_unless_whole_fits(
     seat: &dyn Fn(&mut Machine),
 ) -> Result<(), GateError> {
     let need = whole_verdict(split, o, card, seat)?;
-    let held = image_plan::note(&need.card);
+    let held = beside::note(&need.card);
     eprintln!("whole fit at ctx {}: {need}{held}", o.ctx);
     if need.fits() {
         return Ok(());

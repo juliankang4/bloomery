@@ -13,6 +13,7 @@
 //! judged at the block layer, not here (docs/gpu-design.md decision 3).
 
 pub mod act_rule;
+pub mod beside;
 #[cfg(feature = "deepseek41")]
 pub mod bind;
 pub mod block;

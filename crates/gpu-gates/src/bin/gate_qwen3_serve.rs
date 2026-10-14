@@ -448,13 +448,14 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
+    use bloomery_gpu_gates::beside;
     use bloomery_gpu_gates::ctx_ladder::{
         ctx_line, default_line_held, field as field_u64, rung_above, rungs, target_of,
     };
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
-        self, Answer, PrefixTurns, Served, agree, beside, chat_is_those_ids, check, curl,
+        self, Answer, PrefixTurns, Served, agree, chat_is_those_ids, check, curl,
         edit_and_extension, ids_of, json_of, metric, parse_ids, rendered, serve_cmd, server_log,
         tokenized,
     };
@@ -3643,7 +3644,7 @@ mod gate {
         let seat = &img.seat;
         let named = format!(
             "; the reserves term holds the {}'s {} B",
-            vision_seat::RESERVE,
+            beside::IMAGE_ENCODER,
             seat.reserve.unwrap_or(0)
         );
         check(
@@ -3651,7 +3652,7 @@ mod gate {
             "mmproj_whole_fit_names_the_reserve",
             match seat.reserve {
                 Some(r) => r == img.bytes.total() && fit.ends_with(&named),
-                None => !fit.contains(vision_seat::RESERVE),
+                None => !fit.contains(beside::IMAGE_ENCODER),
             },
         );
         check(
@@ -3862,7 +3863,7 @@ mod gate {
         println!("{line}");
         let counted = format!(
             ", the {} reserve of {} B counted",
-            vision_seat::RESERVE,
+            beside::IMAGE_ENCODER,
             img.seat.reserve.unwrap_or(0)
         );
         check(
@@ -3870,7 +3871,7 @@ mod gate {
             "mmproj_ctx_default_names_the_reserve",
             match img.seat.reserve {
                 Some(_) => line.contains(&counted),
-                None => !line.contains(vision_seat::RESERVE),
+                None => !line.contains(beside::IMAGE_ENCODER),
             },
         );
         Ok(())

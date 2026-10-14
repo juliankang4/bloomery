@@ -180,6 +180,7 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
+use bloomery_gpu_gates::beside;
 use bloomery_gpu_gates::bind::{
     ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
     note_line, parallel_line, placement_of, slots_given,
@@ -243,7 +244,7 @@ fn encoder_words(encoder: Option<u64>) -> String {
     encoder.map_or_else(String::new, |bytes| {
         format!(
             ", the {} reserve of {bytes} B counted",
-            vision_seat::RESERVE
+            beside::IMAGE_ENCODER
         )
     })
 }
