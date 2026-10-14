@@ -167,6 +167,20 @@ fn attn(split: &Split, suffix: &str) -> Result<Attn, PlacementError> {
     crate::arch::gemma_encoder::attn(split, suffix, dims)
 }
 
+/// Row `t`'s keys among `n` positions at the encoder layer's `reach`:
+/// `first..end`, every key `j` with `|t - j| <= reach`, and `0..n` with no
+/// reach.
+#[must_use]
+pub fn key_bounds(reach: Option<usize>, t: usize, n: usize) -> (usize, usize) {
+    match reach {
+        Some(r) => (
+            t.saturating_sub(r),
+            t.saturating_add(r).saturating_add(1).min(n),
+        ),
+        None => (0, n),
+    }
+}
+
 /// `attention.sliding_window_pattern` as one bool per layer. A scalar, a
 /// length other than `n_layer` or a value that is no bool is refused by
 /// name: the file's own form is the per-layer array.

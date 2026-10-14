@@ -107,7 +107,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
 mod tests {
     use models::{Act, Ffn, Mixer, Need, RopeMode};
 
-    use super::super::hparams::Hparams;
+    use super::super::hparams::{Hparams, key_bounds};
     use super::super::names;
     use crate::arch::coverage;
     use crate::arch::synthetic::V;
@@ -358,6 +358,29 @@ mod tests {
                     .contains(&format!("{key}: has 5 values for 6 layers")),
                 "{err}"
             );
+        }
+    }
+
+    /// Every row's key bounds at each small length and reach are the keys
+    /// llama.cpp's symmetric mask keeps, `|i - j| <= reach`, and every key
+    /// with no reach. A bound one key short or long on either side fails
+    /// this.
+    #[test]
+    fn key_bounds_are_the_symmetric_mask() {
+        for n in 1..=12usize {
+            for reach in (0..=13usize).map(Some).chain([None]) {
+                for t in 0..n {
+                    let kept: Vec<usize> = (0..n)
+                        .filter(|&j| reach.is_none_or(|r| t.abs_diff(j) <= r))
+                        .collect();
+                    let (first, end) = key_bounds(reach, t, n);
+                    assert_eq!(
+                        (first..end).collect::<Vec<_>>(),
+                        kept,
+                        "{n} positions, reach {reach:?}, row {t}"
+                    );
+                }
+            }
         }
     }
 

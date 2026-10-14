@@ -14,8 +14,8 @@ use std::fs;
 
 use models::{Act, Ffn, Mixer, RopeMode};
 
-/// The box's path of the file.
-const FILE: &str = "/models/embeddinggemma-2-GGUF/embeddinggemma-2-Q8_0.gguf";
+/// The box's path of the file: the one the reference sets are dumped from.
+const FILE: &str = refset::arch::gemma_embedding2::MODEL;
 
 /// Its length, so a different file at the same path fails before the pins.
 const BYTES: u64 = 309_855_456;

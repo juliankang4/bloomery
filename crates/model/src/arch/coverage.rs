@@ -661,7 +661,7 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::GemmaEmbedding2Body],
-        at: "gpu/src/site.rs gemm (output); serve/src/embed.rs mean",
+        at: "gpu/src/site.rs gemm (output); gpu-gemma-embedding2/src/pass.rs mean",
         runs: |n| matches!(n, Need::Pooled { proj } if proj.as_slice() == [768]),
     },
 ];
@@ -1301,7 +1301,7 @@ fn glm5next_card_routed(ty: GgmlType) -> bool {
 /// which the encoder decodes on the host where it reads the per-layer
 /// input's other matrices as q8_0.
 fn per_layer_model_proj(name: &str) -> bool {
-    name == "per_layer_model_proj.weight"
+    name == crate::arch::gemma_embedding2::names::PER_LAYER_MODEL_PROJ
 }
 
 /// A qwen4exp selector's key or query projection, which `Body38` reads as

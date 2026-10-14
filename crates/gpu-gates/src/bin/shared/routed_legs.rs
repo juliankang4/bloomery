@@ -94,11 +94,12 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
 }
 
 /// Why a set the gate does not plan is skipped: the Qwen3.5 dense trunk
-/// routes nothing, and an architecture no adapter plans is never planned as
-/// a model.
+/// and the EmbeddingGemma 2 encoder route nothing, and an architecture no
+/// adapter plans is never planned as a model.
 fn skip_of(arch: Arch) -> &'static str {
     match arch {
         Arch::Qwen35 => "dense trunk",
+        Arch::GemmaEmbedding2 => "no routed expert",
         Arch::Qwen3Moe
         | Arch::Qwen35Moe
         | Arch::Qwen4Exp
@@ -108,8 +109,7 @@ fn skip_of(arch: Arch) -> &'static str {
         | Arch::Deepseek4
         | Arch::NemotronH
         | Arch::NemotronHMoe
-        | Arch::GemmaEmbedding
-        | Arch::GemmaEmbedding2 => "no program",
+        | Arch::GemmaEmbedding => "no program",
     }
 }
 
