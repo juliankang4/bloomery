@@ -2016,7 +2016,10 @@ fn record_rows(
     }
     for t in 0..tys.len() {
         let &(ty, rows, k_total, wb) = tys.get(t);
-        let share = |ns: u64| ((ns as u128 * wb as u128) / wb_total as u128) as u64;
+        let share = |ns: u64| {
+            u64::try_from((u128::from(ns) * u128::from(wb)) / u128::from(wb_total))
+                .expect("a byte share of ns is at most ns")
+        };
         profile::record(
             site,
             ty,

@@ -19,7 +19,8 @@
 //!
 //! Per-token active bytes use the metadata's `<arch>.expert_count` and
 //! `<arch>.expert_used_count` (top-k): routed/token = Σ over MoE blocks of
-//! (exps bytes × top-k / expert count), exact integer division.
+//! (exps bytes × top-k / expert count), exact integer division. A top-k above the expert
+//! count is refused.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
@@ -287,6 +288,17 @@ fn main() -> ExitCode {
         }
     };
 
+    // Top-k above the expert count selects more than every expert, and its per-token sum can
+    // pass u64.
+    if let (Some(ec), Some(k)) = (expert_count, top_k)
+        && k > ec
+    {
+        eprintln!(
+            "gguf-inventory: {arch}.expert_used_count {k} is greater than {arch}.expert_count {ec}"
+        );
+        return ExitCode::from(1);
+    }
+
     // Group sums, per-block exps sums, type census: each a part of `total_known`.
     let mut group_bytes: BTreeMap<Group, u64> = BTreeMap::new();
     let mut group_count: BTreeMap<Group, usize> = BTreeMap::new();
@@ -335,7 +347,9 @@ fn main() -> ExitCode {
         .and_then(|v| v.checked_sub(engram_total))
         .unwrap_or(0);
 
-    let routed_per_token: Option<u128> = match (expert_count, top_k) {
+    // With top-k at most the expert count, each block adds at most its exps bytes, so the sum is
+    // a part of `total_known`.
+    let routed_per_token: Option<u64> = match (expert_count, top_k) {
         (Some(ec), Some(k)) if ec > 0 => {
             let mut sum = 0u128;
             let mut exact = true;
@@ -347,7 +361,8 @@ fn main() -> ExitCode {
                     exact = false;
                 }
             }
-            if exact { Some(sum) } else { None }
+            let sum = u64::try_from(sum).expect("top-k is at most the expert count");
+            exact.then_some(sum)
         }
         _ => None,
     };
@@ -489,8 +504,8 @@ fn main() -> ExitCode {
     if let Some(r) = routed_per_token {
         out.push_str(&format!(
             "  routed experts/token = {} bytes = {} GiB\n",
-            commas(r as u64),
-            gib(r as u64),
+            commas(r),
+            gib(r),
         ));
     } else {
         out.push_str(
@@ -665,8 +680,8 @@ fn main() -> ExitCode {
         if let Some(r) = routed_per_token {
             m.push_str(&format!(
                 "| routed experts | {} | {} |\n",
-                commas(r as u64),
-                gib(r as u64),
+                commas(r),
+                gib(r),
             ));
         }
         m.push_str(&format!(

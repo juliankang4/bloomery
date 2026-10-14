@@ -3,7 +3,8 @@
 //! with `Gguf::open` on every field for types both accept, and refuses, as
 //! it does, metadata ggml does not read (an array of arrays, an alignment
 //! that is 0 or not a u32) and a tensor whose byte count passes u64. The
-//! same synthetic files hold `Gguf::data` to the mapping's bounds.
+//! same synthetic files hold `Gguf::data` to the mapping's bounds, and
+//! `gguf-inventory` to a top-k within the expert count.
 
 use std::path::PathBuf;
 
@@ -22,18 +23,25 @@ fn put_str(v: &mut Vec<u8>, s: &str) {
     v.extend_from_slice(s.as_bytes());
 }
 
-/// A minimal GGUF v3: magic, version, one `general.alignment` KV, the given
-/// tensor infos, then `data_len` zero bytes past the aligned data base —
+/// A minimal GGUF v3: magic, version, the given metadata pairs (key, value tag, value
+/// bytes), the given tensor infos, then `data_len` zero bytes past the aligned data base —
 /// enough for the strict reader to reach its own refusal or accept.
-fn write_gguf(path: &std::path::Path, tensors: &[(&str, &[u64], u32)], data_len: usize) {
+fn write_gguf_kvs(
+    path: &std::path::Path,
+    kvs: &[(&str, u32, Vec<u8>)],
+    tensors: &[(&str, &[u64], u32)],
+    data_len: usize,
+) {
     let mut b = Vec::new();
     b.extend_from_slice(b"GGUF");
     put_u32(&mut b, 3);
     put_u64(&mut b, tensors.len() as u64);
-    put_u64(&mut b, 1);
-    put_str(&mut b, "general.alignment");
-    put_u32(&mut b, 4); // u32
-    put_u32(&mut b, 32);
+    put_u64(&mut b, kvs.len() as u64);
+    for (key, tag, value) in kvs {
+        put_str(&mut b, key);
+        put_u32(&mut b, *tag);
+        b.extend_from_slice(value);
+    }
     for (name, dims, ty) in tensors {
         put_str(&mut b, name);
         put_u32(&mut b, dims.len() as u32);
@@ -48,6 +56,12 @@ fn write_gguf(path: &std::path::Path, tensors: &[(&str, &[u64], u32)], data_len:
     }
     b.resize(b.len() + data_len, 0);
     std::fs::write(path, b).expect("write synthetic gguf");
+}
+
+/// [`write_gguf_kvs`] with `general.alignment` 32 as the one metadata pair.
+fn write_gguf(path: &std::path::Path, tensors: &[(&str, &[u64], u32)], data_len: usize) {
+    let kvs = [("general.alignment", 4, 32u32.to_le_bytes().to_vec())];
+    write_gguf_kvs(path, &kvs, tensors, data_len);
 }
 
 fn tmp(name: &str) -> PathBuf {
@@ -234,4 +248,70 @@ fn data_refuses_an_offset_past_the_mapping() {
         other => panic!("an offset past the mapping must be refused, got {other:?}"),
     }
     std::fs::remove_file(&p).unwrap();
+}
+
+/// A header-only deepseek2 file with the given expert count and top-k and one routed
+/// tensor of 2^63 bytes (F32 dims [2^61, 1]) in block 0.
+fn moe_header(path: &std::path::Path, experts: u32, top_k: u32) {
+    let mut arch = Vec::new();
+    put_str(&mut arch, "deepseek2");
+    let kvs = [
+        ("general.architecture", 8, arch),
+        ("deepseek2.expert_count", 4, experts.to_le_bytes().to_vec()),
+        (
+            "deepseek2.expert_used_count",
+            4,
+            top_k.to_le_bytes().to_vec(),
+        ),
+    ];
+    write_gguf_kvs(
+        path,
+        &kvs,
+        &[("blk.0.ffn_up_exps.weight", &[1 << 61, 1], 0)],
+        0,
+    );
+}
+
+/// `gguf-inventory` refuses a top-k above the expert count by its keys, with exit 1, nothing
+/// on stdout and no Markdown file, before any per-token sum: 2^63 routed bytes times top-k 2
+/// over 1 expert is 2^64. An expert count of 0 allows only a top-k of 0. Top-k at most the
+/// expert count is reported: equal to it, all 2^63 bytes are routed; with 0 experts there is
+/// no routed figure.
+#[test]
+fn a_top_k_above_the_expert_count_is_refused_by_name() {
+    let p = tmp("top-k.gguf");
+    let md = tmp("top-k.md");
+    let run = |experts, top_k| {
+        moe_header(&p, experts, top_k);
+        std::process::Command::new(env!("CARGO_BIN_EXE_gguf-inventory"))
+            .args(["--markdown".as_ref(), md.as_os_str(), p.as_os_str()])
+            .output()
+            .expect("run gguf-inventory")
+    };
+    for (experts, top_k) in [(1, 2), (0, 1)] {
+        let out = run(experts, top_k);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(out.stdout.is_empty() && !md.exists(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!(
+                "gguf-inventory: deepseek2.expert_used_count {top_k} is greater than \
+                 deepseek2.expert_count {experts}\n"
+            )
+        );
+    }
+    let out = run(2, 2);
+    assert!(out.status.success(), "{out:?}");
+    let routed = "routed experts/token = 9,223,372,036,854,775,808 bytes";
+    assert!(String::from_utf8_lossy(&out.stdout).contains(routed));
+    assert!(
+        std::fs::read_to_string(&md)
+            .unwrap()
+            .contains("| routed experts | 9,223,372,036,854,775,808 |")
+    );
+    let out = run(0, 0);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("routed experts/token = n/a"));
+    std::fs::remove_file(&p).unwrap();
+    std::fs::remove_file(&md).unwrap();
 }
