@@ -14,8 +14,10 @@ pub const QK: usize = 32;
 /// ik's q8_2 activation blocks of `x`: per 32 values `d = amax/127` rounded
 /// to bf16 (nearest even, `ggml_compute_fp32_to_bf16`), `id = 1/d` (0 when
 /// `d` is 0), each code `x·id` rounded half to even and saturated to i8 by
-/// the two packs. Returns the codes and the scales.
+/// the two packs. Returns the codes and the scales. Panics on a non-finite
+/// value, which this form has no code for.
 pub fn quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    crate::act_rule::refuse_non_finite("ik_q8_2::quantize", x);
     let mut q = Vec::with_capacity(x.len());
     let mut d = Vec::with_capacity(x.len() / QK);
     for blk in x.as_chunks::<QK>().0 {

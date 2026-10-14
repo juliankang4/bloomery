@@ -483,7 +483,7 @@ pub fn q8_1_exact(x: &[f32]) -> Vec<f64> {
 
 /// Panics, naming quantizer `name`, on the first non-finite value of `x`.
 #[track_caller]
-fn refuse_non_finite(name: &str, x: &[f32]) {
+pub(crate) fn refuse_non_finite(name: &str, x: &[f32]) {
     if let Some(i) = x.iter().position(|v| !v.is_finite()) {
         panic!("{name}: non-finite value {} at offset {i}", x[i]);
     }
@@ -732,6 +732,8 @@ mod tests {
             assert!(r.is_err(), "q8_1_codes coded {bad}");
             let r = std::panic::catch_unwind(|| quantize_q8_k(&x));
             assert!(r.is_err(), "quantize_q8_k coded {bad}");
+            let r = std::panic::catch_unwind(|| crate::ik_q8_2::quantize(&x));
+            assert!(r.is_err(), "ik_q8_2::quantize coded {bad}");
         }
     }
 }
