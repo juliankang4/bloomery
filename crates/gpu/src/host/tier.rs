@@ -56,7 +56,6 @@
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D, sys};
@@ -562,13 +561,7 @@ impl TierPage {
             .ok_or_else(|| GpuError::shape("TierPage::new", "the page's size passes usize"))?;
         let link = Link::shared(ctx, bytes)?;
         for t in 0..layout.tiers {
-            // SAFETY: tier t's fault copy's two words lie in its flag lines,
-            // inside the page.
-            unsafe {
-                link.host_at(layout.word_off(t, TWord::Fault))
-                    .cast::<u32>()
-                    .write_volatile(FAULT_NONE);
-            }
+            link.store(layout.word_off(t, TWord::Fault), FAULT_NONE);
         }
         let img = layout.image;
         let end = link.stage_end();
@@ -748,15 +741,9 @@ impl TierPage {
         }
     }
 
-    /// Tier `tier`'s word `w` as the host reads and writes it.
-    fn word(&self, tier: usize, w: TWord) -> &AtomicU32 {
-        self.word_at(self.layout.word_off(tier, w))
-    }
-
-    fn word_at(&self, off: usize) -> &AtomicU32 {
-        self.link
-            .word(off)
-            .expect("every tier flag word lies in the page's flag lines")
+    /// Byte offset of tier `tier`'s word `w`.
+    fn off(&self, tier: usize, w: TWord) -> usize {
+        self.layout.word_off(tier, w)
     }
 }
 
@@ -1164,11 +1151,8 @@ impl TierCard {
     /// The tier's fault copy as `page` holds it: what the tier's last fault
     /// copy saw.
     pub(super) fn fault_copy(&self, page: &TierPage) -> Option<Fault> {
-        let (w, s) = (
-            page.word(self.index, TWord::Fault).load(Ordering::Acquire),
-            page.word_at(page.layout.word_off(self.index, TWord::Fault) + 4)
-                .load(Ordering::Acquire),
-        );
+        let at = page.off(self.index, TWord::Fault);
+        let (w, s) = (page.link.load(at), page.link.load(at + 4));
         Fault::from_words(w, s)
     }
 
@@ -1382,7 +1366,7 @@ impl TierCard {
     /// The layers the tier has served since load, as its progress word on
     /// `page` says.
     pub(super) fn progress(&self, page: &TierPage) -> u32 {
-        page.word(self.index, TWord::Prog).load(Ordering::Acquire)
+        page.link.load(page.off(self.index, TWord::Prog))
     }
 
     /// Layers the host asked of the tier since load.
@@ -1447,10 +1431,10 @@ impl TierCard {
     /// anything a step subtracts.
     pub(super) fn release(&self, page: &TierPage) {
         for r in 0..page.layout.rows {
-            page.word(self.index, TWord::Go(r))
-                .store(RELEASE, Ordering::Release);
-            page.word(self.index, TWord::Cnt(r))
-                .store(RELEASE, Ordering::Release);
+            page.link
+                .release(page.off(self.index, TWord::Go(r)), RELEASE);
+            page.link
+                .release(page.off(self.index, TWord::Cnt(r)), RELEASE);
         }
     }
 
@@ -1458,8 +1442,8 @@ impl TierCard {
     /// no signal pending, every layer asked of it served.
     pub(super) fn at_rest(&self, page: &TierPage) -> bool {
         (0..page.layout.rows).all(|r| {
-            page.word(self.index, TWord::Go(r)).load(Ordering::Acquire) == 0
-                && page.word(self.index, TWord::Cnt(r)).load(Ordering::Acquire) == 0
+            page.link.at_rest(page.off(self.index, TWord::Go(r)))
+                && page.link.at_rest(page.off(self.index, TWord::Cnt(r)))
         }) && !self.behind(page)
     }
 
@@ -1470,10 +1454,8 @@ impl TierCard {
     pub(super) fn reset(&mut self, page: &TierPage) -> Result<(), GpuError> {
         self.gpu.stream().synchronize()?;
         for r in 0..page.layout.rows {
-            page.word(self.index, TWord::Go(r))
-                .store(0, Ordering::Release);
-            page.word(self.index, TWord::Cnt(r))
-                .store(0, Ordering::Release);
+            page.link.reset(page.off(self.index, TWord::Go(r)));
+            page.link.reset(page.off(self.index, TWord::Cnt(r)));
         }
         self.issued = self.progress(page);
         self.clear_fault(page)
@@ -1483,10 +1465,9 @@ impl TierCard {
     pub(super) fn clear_fault(&mut self, page: &TierPage) -> Result<(), GpuError> {
         self.gpu.clear_fault()?;
         self.gpu.stream().synchronize()?;
-        page.word(self.index, TWord::Fault)
-            .store(FAULT_NONE, Ordering::Release);
-        page.word_at(page.layout.word_off(self.index, TWord::Fault) + 4)
-            .store(0, Ordering::Release);
+        let at = page.off(self.index, TWord::Fault);
+        page.link.store(at, FAULT_NONE);
+        page.link.store(at + 4, 0);
         self.rebind_stage()
     }
 

@@ -9,9 +9,14 @@
 //! reaches at the same device address, which a tier's end checks when it is
 //! made ([`Link::tier_end`]). Each word is then one location that both cards
 //! and the host read and write.
+//!
+//! The host touches the page's flag words through the link alone: it reads a
+//! word ([`Link::load`]), stores one ([`Link::store`]), and releases, checks
+//! at rest and resets a counter ([`Link::release`], [`Link::at_rest`],
+//! [`Link::reset`]).
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use cuda_core::{CudaContext, sys};
 
@@ -84,15 +89,39 @@ impl Link {
         Ok(LinkEnd { dev })
     }
 
-    /// The u32 at byte `off` as the host reads and writes it; `None` when
-    /// not 4-aligned or past the page.
-    pub(super) fn word(&self, off: usize) -> Option<&AtomicU32> {
-        self.page.atomic_u32(off)
+    /// The u32 at byte `off`, which the caller's layout keeps 4-aligned and
+    /// inside the page.
+    fn word(&self, off: usize) -> &AtomicU32 {
+        self.page
+            .atomic_u32(off)
+            .expect("the tier page's layout keeps every flag word 4-aligned inside the page")
     }
 
-    /// The host address of byte `off`. Computing it touches nothing; each
-    /// access proves its own span.
-    pub(super) fn host_at(&self, off: usize) -> *mut u8 {
-        self.page.host_at(off)
+    /// The word at byte `off` as the stage card's side holds it.
+    pub(super) fn load(&self, off: usize) -> u32 {
+        self.word(off).load(Ordering::Acquire)
+    }
+
+    /// Store `v` into the word at byte `off`.
+    pub(super) fn store(&self, off: usize, v: u32) {
+        self.word(off).store(v, Ordering::Release);
+    }
+
+    /// Release every wait on the counter at byte `off` for good: it goes to
+    /// `v`, far past anything a step subtracts.
+    pub(super) fn release(&self, off: usize, v: u32) {
+        self.store(off, v);
+    }
+
+    /// Whether the counter at byte `off` holds what a drained step leaves:
+    /// no go or signal pending.
+    pub(super) fn at_rest(&self, off: usize) -> bool {
+        self.load(off) == 0
+    }
+
+    /// The counter at byte `off` back to a fresh page's, once every stream
+    /// that reaches it has drained.
+    pub(super) fn reset(&self, off: usize) {
+        self.store(off, 0);
     }
 }
