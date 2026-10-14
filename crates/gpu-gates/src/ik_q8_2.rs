@@ -14,9 +14,11 @@ pub const QK: usize = 32;
 /// ik's q8_2 activation blocks of `x`: per 32 values `d = amax/127` rounded
 /// to bf16 (nearest even, `ggml_compute_fp32_to_bf16`), `id = 1/d` (0 when
 /// `d` is 0), each code `x·id` rounded half to even and saturated to i8 by
-/// the two packs. Returns the codes and the scales. Panics on a non-finite
-/// value, which this form has no code for.
+/// the two packs. Returns the codes and the scales. `x` is whole blocks.
+/// Panics on a partial block, and on a non-finite value, which this form has
+/// no code for.
 pub fn quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    assert!(x.len().is_multiple_of(QK), "q8_2 blocks are {QK} values");
     crate::act_rule::refuse_non_finite("ik_q8_2::quantize", x);
     let mut q = Vec::with_capacity(x.len());
     let mut d = Vec::with_capacity(x.len() / QK);
@@ -39,7 +41,6 @@ pub fn quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
 /// most eight bits times a bf16 scale. A zero code gives `+0.0`, never
 /// `-0.0`, since the codes are integers. `x` is whole blocks.
 pub fn reconstruct(x: &[f32]) -> Vec<f32> {
-    assert!(x.len().is_multiple_of(QK), "q8_2 blocks are {QK} values");
     let (q, d) = quantize(x);
     q.as_chunks::<QK>()
         .0
@@ -85,9 +86,13 @@ pub fn block_sum(w: &Q8Block, a: &[i8]) -> i32 {
 /// of four, values `16·(L/4) ..` of it, and fuses one multiply-add of that
 /// integer partial by the scales' product `d_w·d_x` (exact in f32) into its
 /// accumulator (`AccumT<MinusType0, _, true>` with `ScaleHelperQ8_2S`);
-/// `hsum_float_8` adds the halves lane-wise, then pairs. The row's block
-/// count must be a multiple of four.
+/// `hsum_float_8` adds the halves lane-wise, then pairs. Panics on a block
+/// count that is not a multiple of four.
 pub fn dot(blocks: &[Q8Block], xq: &[i8], xd: &[f32]) -> f32 {
+    assert!(
+        blocks.len().is_multiple_of(4),
+        "ik's q8_2 dot takes blocks in groups of 4"
+    );
     let mut acc = [0.0f32; 8];
     for i in 0..blocks.len() / 4 {
         for (l, a) in acc.iter_mut().enumerate() {
@@ -104,4 +109,52 @@ pub fn dot(blocks: &[Q8Block], xq: &[i8], xd: &[f32]) -> f32 {
         acc[3] + acc[7],
     ];
     (s[0] + s[2]) + (s[1] + s[3])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QK, dot, quantize};
+    use gguf::quant::Q8Block;
+
+    /// Whether `f` panicked. A panic without `msg` in its message fails the
+    /// test.
+    fn refused(f: impl FnOnce() + std::panic::UnwindSafe, msg: &str) -> bool {
+        match std::panic::catch_unwind(f) {
+            Ok(()) => false,
+            Err(e) => {
+                let text = e
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| e.downcast_ref::<&str>().copied());
+                assert!(
+                    text.is_some_and(|s| s.contains(msg)),
+                    "panicked with {text:?}, not {msg:?}"
+                );
+                true
+            }
+        }
+    }
+
+    /// A partial block stops `quantize`, and a block count off a multiple
+    /// of four stops `dot`, by name instead of dropping the tail.
+    #[test]
+    fn partial_blocks_stop_by_name() {
+        for n in 0..=2 * QK {
+            let x = crate::activations(n, 1, 7);
+            let stopped = refused(|| _ = quantize(&x), "q8_2 blocks are 32 values");
+            assert_eq!(stopped, !n.is_multiple_of(QK), "quantize of {n} values");
+        }
+        let blocks = [Q8Block {
+            d: 0x3c00,
+            q: [1; QK],
+        }; 8];
+        for n in 0..=8 {
+            let (xq, xd) = (vec![1i8; n * QK], vec![1.0f32; n]);
+            let stopped = refused(
+                || _ = dot(&blocks[..n], &xq, &xd),
+                "ik's q8_2 dot takes blocks in groups of 4",
+            );
+            assert_eq!(stopped, !n.is_multiple_of(4), "dot of {n} blocks");
+        }
+    }
 }

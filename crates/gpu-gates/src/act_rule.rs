@@ -765,7 +765,6 @@ pub struct Q82 {
 #[must_use]
 pub fn quantize_q8_2(x: &[f32]) -> Q82 {
     use crate::ik_q8_2::QK;
-    assert!(x.len().is_multiple_of(QK), "q8_2 blocks are {QK} values");
     let (q, d) = crate::ik_q8_2::quantize(x);
     let s = x
         .as_chunks::<QK>()
