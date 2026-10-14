@@ -861,7 +861,7 @@ pub struct NodeFamily {
 
 /// A family's tier computation over the stacks a node loaded for an open
 /// ([`NodeFamily::experts`]).
-pub type OpenExperts =
+pub(crate) type OpenExperts =
     fn(&Gpu, &ModelTensors, &Weights, &NodeOpen) -> Result<Box<dyn TierExperts>, GpuError>;
 
 /// How a connection ended.
