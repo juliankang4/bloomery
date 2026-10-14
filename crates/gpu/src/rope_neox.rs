@@ -154,11 +154,12 @@ const _: () = assert!(V_HEAD_K192 / 2 <= THREADS_K192 && ROT_K192 / 2 <= THREADS
 /// The norm, partial turn and append of [`rope_neox_kernels::head_norm_neox_append_256`]
 /// over heads of `HEAD` values, the first `ROT` turned, `WARPS = HEAD/64`
 /// warps a block, into a cache in the format `S` (that entry's body over
-/// [`F16Sink`], `head_norm_neox_append_256_q8`'s over [`Q8Sink`]). Block `b =
-/// t·(n_head + n_kv) + h`. The query head `h` of
-/// token `t` is read from the q+gate rows at `qg[t·n_head·2·HEAD + h·2·HEAD
-/// ..]` (each head's `2·HEAD` values are the query, then its gate) and
-/// written to `q[(t·n_head + h)·HEAD ..]`; key head `j = h − n_head` is
+/// [`F16Sink`], `head_norm_neox_append_256_q8`'s over [`Q8Sink`]).
+/// Block `b = t·(n_head + n_kv) + h`. The query head `h` of token `t` is
+/// read from its source rows at `qg[(t·n_head + h)·Q_SPAN ..]` (the q+gate
+/// rows at `Q_SPAN = 2·HEAD`, each head's query and then its gate, or plain
+/// query rows at `Q_SPAN = HEAD`) and written to `q[(t·n_head + h)·HEAD
+/// ..]`; key head `j = h − n_head` is
 /// read and written in place in `k[(t·n_kv + j)·HEAD ..]` and appended with
 /// value head `j` of `v` at plane row `j·ctx + pos[t]`. The numeric contract
 /// is the module doc's with the sum over `WARPS` warps in warp order, the
@@ -180,6 +181,7 @@ unsafe fn norm_partial_append<
     const HEAD: usize,
     const ROT: usize,
     const WARPS: usize,
+    const Q_SPAN: usize,
     S: KvSink,
 >(
     gq: &[f32],
@@ -200,6 +202,7 @@ unsafe fn norm_partial_append<
     wsum: *mut f64,
 ) {
     const { assert!(WARPS * 64 == HEAD && ROT.is_multiple_of(2) && ROT <= HEAD && ROT / 2 <= 32) };
+    const { assert!(Q_SPAN == HEAD || Q_SPAN == 2 * HEAD) };
     let heads = (n_head + n_kv) as usize;
     let b = thread::blockIdx_x() as usize;
     if b >= m as usize * heads {
@@ -214,7 +217,7 @@ unsafe fn norm_partial_append<
     // The head's first value in its source and in its output.
     let (src, dst) = if is_q {
         (
-            (t * n_head as usize + h) * 2 * HEAD,
+            (t * n_head as usize + h) * Q_SPAN,
             (t * n_head as usize + h) * HEAD,
         )
     } else {
@@ -224,8 +227,9 @@ unsafe fn norm_partial_append<
     // SAFETY: t < m <= pos.len() by the launch contract.
     let p = unsafe { *pos.get_unchecked(t) } as usize;
 
-    // SAFETY: i0, i1 < HEAD; a query source is inside q+gate row t (m·n_head
-    // ·2·HEAD values by the launch contract), a key inside k (m·n_kv·HEAD).
+    // SAFETY: i0, i1 < HEAD <= Q_SPAN; a query source is inside source row t
+    // (m·n_head·Q_SPAN values by the launch contract), a key inside k
+    // (m·n_kv·HEAD).
     let (x0, x1) = unsafe {
         if is_q {
             (*qg.get_unchecked(src + i0), *qg.get_unchecked(src + i1))
@@ -1038,7 +1042,7 @@ mod rope_neox_kernels {
         // contract is `norm_partial_append`'s at (HEAD_256, ROT_256) over
         // the f16 planes.
         unsafe {
-            norm_partial_append::<HEAD_256, ROT_256, WARPS_256, _>(
+            norm_partial_append::<HEAD_256, ROT_256, WARPS_256, { 2 * HEAD_256 }, _>(
                 gq,
                 gk,
                 table,
@@ -1305,7 +1309,7 @@ mod rope_neox_kernels {
         // contract is `norm_partial_append`'s at (HEAD_256, ROT_256) over
         // the four Q8_0 planes.
         unsafe {
-            norm_partial_append::<HEAD_256, ROT_256, WARPS_256, _>(
+            norm_partial_append::<HEAD_256, ROT_256, WARPS_256, { 2 * HEAD_256 }, _>(
                 gq,
                 gk,
                 table,
@@ -1701,6 +1705,61 @@ pub struct K192Args<'a> {
     pub cache_v: &'a mut DeviceBuffer<u16>,
 }
 
+/// The refusals and launch values the partial-turn launchers share, at heads
+/// of `head` values whose query source rows hold `q_span` values a head and
+/// a rope table of `rot` f32 a position: the shape `[n_head, n_kv, ctx, m]`
+/// (each at least 1, `m <= ctx`), then the first buffer shorter than the
+/// launch reads, the inputs `[qg, q, k, v, gq, gk, table, pos]` (`inputs`,
+/// their lengths) before the sink's `planes` (name, length, need), each by
+/// name. Returns `[grid, n_head, n_kv, ctx, m]` as the launch's u32s, the grid
+/// one block per (token, head).
+fn partial_launch(
+    what: &'static str,
+    (head, q_span, rot): (usize, usize, usize),
+    [n_head, n_kv, ctx, m]: [usize; 4],
+    inputs: [usize; 8],
+    planes: &[(&str, usize, usize)],
+) -> Result<[u32; 5], GpuError> {
+    if n_head == 0 || n_kv == 0 || m == 0 || ctx == 0 || m > ctx {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "need n_head, n_kv, ctx >= 1 and 1 <= m <= ctx, got n_head={n_head} \
+                 n_kv={n_kv} ctx={ctx} m={m}"
+            ),
+        ));
+    }
+    let needs = [
+        ("qg", m * n_head * q_span),
+        ("q", m * n_head * head),
+        ("k", m * n_kv * head),
+        ("v", m * n_kv * head),
+        ("gq", head),
+        ("gk", head),
+        ("table", ctx * rot),
+        ("pos", m),
+    ];
+    let short = needs
+        .iter()
+        .zip(inputs)
+        .map(|(&(name, need), got)| (name, got, need))
+        .chain(planes.iter().copied())
+        .find(|&(_, got, need)| got < need);
+    if let Some((name, got, need)) = short {
+        return Err(GpuError::shape(
+            what,
+            format!("{name}.len() {got} < {need}"),
+        ));
+    }
+    Ok([
+        launch_u32(what, "grid", m * (n_head + n_kv))?,
+        launch_u32(what, "n_head", n_head)?,
+        launch_u32(what, "n_kv", n_kv)?,
+        launch_u32(what, "ctx", ctx)?,
+        launch_u32(what, "m", m)?,
+    ])
+}
+
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct RopeNeoxKernels {
     module: rope_neox_kernels::LoadedModule,
@@ -1823,39 +1882,26 @@ impl RopeNeoxKernels {
             cache_k,
             cache_v,
         } = args;
-        if n_head == 0 || n_kv == 0 || m == 0 || ctx == 0 || m > ctx {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "need n_head, n_kv, ctx >= 1 and 1 <= m <= ctx, got n_head={n_head} \
-                     n_kv={n_kv} ctx={ctx} m={m}"
-                ),
-            ));
-        }
         let plane = n_kv * ctx * HEAD_256;
-        let lens = [
-            ("qg", qg.len(), m * n_head * 2 * HEAD_256),
-            ("q", q.len(), m * n_head * HEAD_256),
-            ("k", k.len(), m * n_kv * HEAD_256),
-            ("v", v.len(), m * n_kv * HEAD_256),
-            ("gq", gq.len(), HEAD_256),
-            ("gk", gk.len(), HEAD_256),
-            ("table", table.len(), ctx * ROT_256),
-            ("pos", pos.len(), m),
-            ("cache_k", cache_k.len(), plane),
-            ("cache_v", cache_v.len(), plane),
-        ];
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-            return Err(GpuError::shape(
-                what,
-                format!("{name}.len() {got} < {need}"),
-            ));
-        }
-        let grid = launch_u32(what, "grid", m * (n_head + n_kv))?;
-        let n_head = launch_u32(what, "n_head", n_head)?;
-        let n_kv = launch_u32(what, "n_kv", n_kv)?;
-        let ctx = launch_u32(what, "ctx", ctx)?;
-        let m = launch_u32(what, "m", m)?;
+        let [grid, n_head, n_kv, ctx, m] = partial_launch(
+            what,
+            (HEAD_256, 2 * HEAD_256, ROT_256),
+            [n_head, n_kv, ctx, m],
+            [
+                qg.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                gq.len(),
+                gk.len(),
+                table.len(),
+                pos.len(),
+            ],
+            &[
+                ("cache_k", cache_k.len(), plane),
+                ("cache_v", cache_v.len(), plane),
+            ],
+        )?;
         let prep = self
             .module
             .prepare_head_norm_neox_append_256(LaunchConfig1D::new(grid, THREADS_256_U32, 0))?;
@@ -1974,41 +2020,28 @@ impl RopeNeoxKernels {
             vq,
             vd,
         } = args;
-        if n_head == 0 || n_kv == 0 || m == 0 || ctx == 0 || m > ctx {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "need n_head, n_kv, ctx >= 1 and 1 <= m <= ctx, got n_head={n_head} \
-                     n_kv={n_kv} ctx={ctx} m={m}"
-                ),
-            ));
-        }
         let (words, scales) = q8_plane_lens(HEAD_256, n_kv, ctx);
-        let lens = [
-            ("qg", qg.len(), m * n_head * 2 * HEAD_256),
-            ("q", q.len(), m * n_head * HEAD_256),
-            ("k", k.len(), m * n_kv * HEAD_256),
-            ("v", v.len(), m * n_kv * HEAD_256),
-            ("gq", gq.len(), HEAD_256),
-            ("gk", gk.len(), HEAD_256),
-            ("table", table.len(), ctx * ROT_256),
-            ("pos", pos.len(), m),
-            ("kq", kq.len(), words),
-            ("kd", kd.len(), scales),
-            ("vq", vq.len(), words),
-            ("vd", vd.len(), scales),
-        ];
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-            return Err(GpuError::shape(
-                what,
-                format!("{name}.len() {got} < {need}"),
-            ));
-        }
-        let grid = launch_u32(what, "grid", m * (n_head + n_kv))?;
-        let n_head = launch_u32(what, "n_head", n_head)?;
-        let n_kv = launch_u32(what, "n_kv", n_kv)?;
-        let ctx = launch_u32(what, "ctx", ctx)?;
-        let m = launch_u32(what, "m", m)?;
+        let [grid, n_head, n_kv, ctx, m] = partial_launch(
+            what,
+            (HEAD_256, 2 * HEAD_256, ROT_256),
+            [n_head, n_kv, ctx, m],
+            [
+                qg.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                gq.len(),
+                gk.len(),
+                table.len(),
+                pos.len(),
+            ],
+            &[
+                ("kq", kq.len(), words),
+                ("kd", kd.len(), scales),
+                ("vq", vq.len(), words),
+                ("vd", vd.len(), scales),
+            ],
+        )?;
         let prep = self
             .module
             .prepare_head_norm_neox_append_256_q8(LaunchConfig1D::new(grid, THREADS_256_U32, 0))?;
