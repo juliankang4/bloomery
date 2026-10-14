@@ -63,6 +63,7 @@ mod kernels32;
 
 pub use act::GemmAct;
 pub use act32::GemmAct32;
+pub use f32tile::LINE as F32_TILE_LINE;
 pub use gemm32::{Gemm32Args, Gemm32Weight};
 pub use grouped::{GemmArgs, GemmInput, GemmWeight};
 pub use kernels::GemmKernels;

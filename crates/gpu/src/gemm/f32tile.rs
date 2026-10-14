@@ -38,7 +38,8 @@ const COL_GROUPS: usize = TILE_COLS / TILE;
 /// 32-value chunks one stage holds of every row and column, and the values
 /// of one such line: K must be a multiple of it.
 const STAGE_CHUNKS: usize = 2;
-pub(super) const LINE: usize = 32 * STAGE_CHUNKS;
+/// Values in a staged F32 tile line; K must be a positive multiple.
+pub const LINE: usize = 32 * STAGE_CHUNKS;
 /// Stages in shared memory: the one the warps read and two being copied in.
 pub(super) const STAGES: usize = 3;
 /// One stage: every row's line, then every column's.

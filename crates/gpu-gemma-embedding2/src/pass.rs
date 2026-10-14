@@ -1,0 +1,459 @@
+//! One pass of the encoder over an input's ids (the crate doc's order), its
+//! launches all on the [`Gpu`]'s stream, and the rows it reads back.
+
+use std::collections::BTreeMap;
+
+use bloomery_gpu::flash_gqa_prefill::GqaPrefillArgs;
+use bloomery_gpu::gemm::{GemmAct32, GemmInput, GemmRoute};
+use bloomery_gpu::rope_neox::{HEAD_256, PartialNeoxArgs};
+use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
+use bloomery_gpu::weights::Weights;
+use bloomery_gpu::{FaultSink, Gpu, GpuError};
+use cuda_core::DeviceBuffer;
+use model::arch::gemma_embedding2::names;
+
+use crate::{Encoder, Kernels, decode_rows};
+
+/// One pass's rows read back: the `output` projection of every position
+/// (`result_embd`, `n · n_out` f32, token-major), their mean (`pooled`,
+/// `n_out` f32), and the taps when asked.
+pub struct Pass {
+    pub rows: Vec<f32>,
+    pub pooled: Vec<f32>,
+    pub taps: Option<Taps>,
+}
+
+/// A pass's intermediate rows, each token-major in the reference's order.
+pub struct Taps {
+    /// The token rows times `√hidden`, `n · hidden`.
+    pub inp_scaled: Vec<f32>,
+    /// Every layer's normed input slice, `[per_layer, n_layer, n]`: position
+    /// `t`'s layer `l` at `(t·n_layer + l)·per_layer`.
+    pub inp_per_layer: Vec<f32>,
+    /// Each layer's output, `n · hidden`.
+    pub l_out: Vec<Vec<f32>>,
+    /// The output norm's rows, `n · hidden`.
+    pub result_norm: Vec<f32>,
+}
+
+/// What a projection reads besides its input: the card, the kernels, the
+/// weights and the one-expert table filled for the pass's columns.
+struct Cx<'a> {
+    gpu: &'a Gpu,
+    k: &'a Kernels,
+    w: &'a Weights,
+    route: &'a GemmRoute,
+}
+
+impl Cx<'_> {
+    /// `x`'s `n` columns of `width` values quantized into `acts`' scratch of
+    /// that width, which the next [`Cx::proj`]s at `width` read.
+    fn quantize(
+        &self,
+        acts: &mut BTreeMap<usize, GemmAct32>,
+        x: &DeviceBuffer<f32>,
+        width: usize,
+        n: usize,
+        sink: FaultSink,
+    ) -> Result<(), GpuError> {
+        let act = acts.get_mut(&width).ok_or(GpuError::State {
+            what: "Encoder::pass",
+            missing: "a quantizer scratch of the projection's width",
+        })?;
+        self.k
+            .g32
+            .enqueue_quantize_gemm32(self.gpu.stream(), x, n, act, sink)
+    }
+
+    /// `y = W·x` for the q8_0 weight `name` of `rows` rows over the `n`
+    /// columns [`Cx::quantize`] last wrote at `width`, token-major.
+    fn proj(
+        &self,
+        acts: &BTreeMap<usize, GemmAct32>,
+        name: &str,
+        (width, rows): (usize, usize),
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let act = acts.get(&width).ok_or(GpuError::State {
+            what: "Encoder::pass",
+            missing: "a quantizer scratch of the projection's width",
+        })?;
+        site::gemm(
+            self.gpu,
+            &WideKernels {
+                gemm: &self.k.gemm,
+                g32: Some(&self.k.g32),
+            },
+            (SiteTy::Q8_0, self.w, SiteWeight::Resident(name)),
+            rows,
+            &WideIn {
+                q128: None,
+                q32: Some(act),
+                f32: None,
+            },
+            (self.route, GemmInput::PerSlot),
+            n,
+            y,
+        )
+    }
+}
+
+/// A reach's per-row key bounds on the card: row `t` attends keys
+/// `[first[t], count[t])`, `|t − j| ≤ reach` (every key with no reach).
+struct Keys {
+    reach: Option<usize>,
+    first: DeviceBuffer<u32>,
+    count: DeviceBuffer<u32>,
+}
+
+impl Keys {
+    fn new(gpu: &Gpu, reach: Option<usize>, n: usize) -> Result<Keys, GpuError> {
+        let (first, count): (Vec<u32>, Vec<u32>) = (0..n)
+            .map(|t| match reach {
+                Some(r) => (t.saturating_sub(r), (t + r + 1).min(n)),
+                None => (0, n),
+            })
+            .map(|(f, c)| (f as u32, c as u32))
+            .unzip();
+        Ok(Keys {
+            reach,
+            first: DeviceBuffer::from_host(gpu.stream(), &first)?,
+            count: DeviceBuffer::from_host(gpu.stream(), &count)?,
+        })
+    }
+}
+
+impl Encoder {
+    /// The token rows of `ids` from the file's table, each times `√hidden`
+    /// in f32 (`inp_scaled`); an id past the vocabulary is refused by name.
+    fn token_rows(&self, ids: &[u32]) -> Result<Vec<f32>, GpuError> {
+        let e = self.hp.n_embd;
+        if let Some(&bad) = ids.iter().find(|&&id| id as usize >= self.hp.n_vocab) {
+            return Err(GpuError::Shape {
+                what: "Encoder::pass",
+                detail: format!("id {bad} is past the vocabulary of {}", self.hp.n_vocab),
+            });
+        }
+        let mut rows = Vec::with_capacity(ids.len() * e);
+        decode_rows(
+            &self.split,
+            &names::token_embd(),
+            e,
+            ids.iter().map(|&id| id as usize),
+            &mut rows,
+        )?;
+        let scale = (e as f32).sqrt();
+        rows.iter_mut().for_each(|v| *v *= scale);
+        Ok(rows)
+    }
+
+    /// One pass over `ids` (1 to [`Encoder::ctx`] of them, else refused by
+    /// name): every position's `output` row and their mean, and with `taps`
+    /// the rows the reference names on the way. A fault any launch raised is
+    /// the error.
+    pub fn pass(&mut self, ids: &[u32], taps: bool) -> Result<Pass, GpuError> {
+        let n = ids.len();
+        if n == 0 || n > self.ctx {
+            return Err(GpuError::Shape {
+                what: "Encoder::pass",
+                detail: format!("{n} positions; a pass takes 1 to {}", self.ctx),
+            });
+        }
+        let inp_scaled = self.token_rows(ids)?;
+        let Encoder {
+            gpu,
+            hp,
+            layers,
+            w,
+            ple,
+            k,
+            rope_swa,
+            rope_full,
+            consts,
+            s,
+            ctx,
+            ..
+        } = self;
+        let (gpu, stream, elem, cap) = (&*gpu, gpu.stream(), gpu.elem(), *ctx);
+        let (e, pl, ff, n_head, eps) = (hp.n_embd, hp.per_layer, hp.n_ff, hp.n_head, hp.rms_eps);
+        let emb = DeviceBuffer::from_host(stream, &inp_scaled)?;
+        let mut reaches: Vec<Option<usize>> = layers.iter().map(|a| a.reach).collect();
+        reaches.dedup();
+        let keys = reaches
+            .into_iter()
+            .map(|r| Keys::new(gpu, r, n))
+            .collect::<Result<Vec<_>, _>>()?;
+        k.gemm
+            .enqueue_route_dense(stream, n, &mut s.route, gpu.unlabelled_sink())?;
+        let cx = Cx {
+            gpu,
+            k,
+            w,
+            route: &s.route,
+        };
+        let acts = &mut s.acts;
+        let gain = |name: String| w.f32_buf("Encoder::pass", &name);
+        let mut tapped = taps.then(|| Taps {
+            inp_scaled: inp_scaled.clone(),
+            inp_per_layer: vec![0.0; n * hp.n_layer * pl],
+            l_out: Vec::new(),
+            result_norm: Vec::new(),
+        });
+        for (l, a) in layers.iter().enumerate() {
+            let sink = gpu.layer_sink(l)?;
+            let blk = |stem: &str| format!("blk.{l}.{stem}");
+            let (head, kv, qw) = (a.head, a.kv, n_head * a.head);
+            let inp = if l == 0 { &emb } else { &s.x };
+            // Attention.
+            elem.enqueue_rms_norm(
+                stream,
+                inp,
+                gain(blk(names::ATTN_NORM))?,
+                eps,
+                e,
+                n,
+                &mut s.xn,
+            )?;
+            cx.quantize(acts, &s.xn, e, n, sink)?;
+            cx.proj(acts, &blk(names::ATTN_Q), (e, qw), n, &mut s.qs)?;
+            cx.proj(acts, &blk(names::ATTN_K), (e, kv * head), n, &mut s.kk)?;
+            cx.proj(acts, &blk(names::ATTN_V), (e, kv * head), n, &mut s.vv)?;
+            elem.enqueue_rms_norm(stream, &s.vv, &consts.ones, eps, head, n * kv, &mut s.vn)?;
+            let rope = PartialNeoxArgs {
+                qg: &s.qs,
+                q: &mut s.q,
+                k: &mut s.kk,
+                v: &s.vn,
+                gq: gain(blk(names::ATTN_Q_NORM))?,
+                gk: gain(blk(names::ATTN_K_NORM))?,
+                table: if a.reach.is_some() {
+                    &rope_swa.table
+                } else {
+                    &rope_full.table
+                },
+                pos: &consts.pos,
+                eps,
+                n_head,
+                n_kv: kv,
+                ctx: cap,
+                m: n,
+                fault: sink,
+                cache_k: &mut s.cache_k,
+                cache_v: &mut s.cache_v,
+            };
+            if head == HEAD_256 {
+                k.rope
+                    .enqueue_head_norm_neox_append_256_whole(stream, rope)?;
+            } else {
+                // SAFETY: `pos` is `0..ctx` (`Consts::pos`) and a pass's `n` is at
+                // most `ctx`, so the `n` tokens hold distinct positions.
+                unsafe {
+                    k.rope.enqueue_head_norm_neox_append_512(stream, rope)?;
+                }
+            }
+            let rows = keys
+                .iter()
+                .find(|r| r.reach == a.reach)
+                .ok_or(GpuError::State {
+                    what: "Encoder::pass",
+                    missing: "the key bounds of the layer's reach",
+                })?;
+            let args = GqaPrefillArgs {
+                q: &s.q,
+                kc: &s.cache_k,
+                vc: &s.cache_v,
+                n_keys: &rows.count,
+                scale: 1.0,
+                n_head,
+                n_kv: kv,
+                ctx: cap,
+                t: n,
+                fault: sink,
+                y: &mut s.att,
+            };
+            if head == HEAD_256 {
+                k.flash.enqueue_256_p2_lower(stream, args, &rows.first)?;
+            } else {
+                k.flash512.enqueue_p4(stream, args)?;
+            }
+            cx.quantize(acts, &s.att, qw, n, sink)?;
+            cx.proj(acts, &blk(names::ATTN_OUTPUT), (qw, e), n, &mut s.o)?;
+            elem.enqueue_rms_norm(
+                stream,
+                &s.o,
+                gain(blk(names::POST_ATTENTION_NORM))?,
+                eps,
+                e,
+                n,
+                &mut s.on,
+            )?;
+            elem.enqueue_add(stream, &s.on, inp, e * n, &mut s.a)?;
+            // GELU GLU.
+            elem.enqueue_rms_norm(
+                stream,
+                &s.a,
+                gain(blk(names::FFN_NORM))?,
+                eps,
+                e,
+                n,
+                &mut s.xn,
+            )?;
+            cx.quantize(acts, &s.xn, e, n, sink)?;
+            cx.proj(acts, &blk(names::FFN_GATE), (e, ff), n, &mut s.gate)?;
+            cx.proj(acts, &blk(names::FFN_UP), (e, ff), n, &mut s.up)?;
+            elem.enqueue_geglu(stream, &s.gate, &s.up, ff * n, &mut s.gu)?;
+            cx.quantize(acts, &s.gu, ff, n, sink)?;
+            cx.proj(acts, &blk(names::FFN_DOWN), (ff, e), n, &mut s.o)?;
+            elem.enqueue_rms_norm(
+                stream,
+                &s.o,
+                gain(blk(names::POST_FFW_NORM))?,
+                eps,
+                e,
+                n,
+                &mut s.on,
+            )?;
+            elem.enqueue_add(stream, &s.on, &s.a, e * n, &mut s.c)?;
+            // The per-layer input.
+            cx.quantize(acts, &s.c, e, n, sink)?;
+            cx.proj(acts, &blk(names::INP_GATE), (e, pl), n, &mut s.p1)?;
+            k.g32
+                .enqueue_f32_tile(stream, &ple[l], &emb, n, &mut s.p2)?;
+            elem.enqueue_weighted_sum(stream, &s.p2, &consts.inv, pl, 1, n, &mut s.p3)?;
+            elem.enqueue_rms_norm(
+                stream,
+                &s.p3,
+                gain(names::PER_LAYER_PROJ_NORM.to_string())?,
+                eps,
+                pl,
+                n,
+                &mut s.p2,
+            )?;
+            if let Some(t) = &mut tapped {
+                let rows = s.p2.to_host_vec(stream)?;
+                for (tok, row) in rows[..n * pl].chunks_exact(pl).enumerate() {
+                    let at = (tok * hp.n_layer + l) * pl;
+                    t.inp_per_layer[at..at + pl].copy_from_slice(row);
+                }
+            }
+            elem.enqueue_geglu(stream, &s.p1, &s.p2, pl * n, &mut s.p3)?;
+            cx.quantize(acts, &s.p3, pl, n, sink)?;
+            cx.proj(acts, &blk(names::PROJ), (pl, e), n, &mut s.o)?;
+            elem.enqueue_rms_norm(
+                stream,
+                &s.o,
+                gain(blk(names::POST_NORM))?,
+                eps,
+                e,
+                n,
+                &mut s.on,
+            )?;
+            elem.enqueue_add(stream, &s.c, &s.on, e * n, &mut s.a)?;
+            // The layer's output scale.
+            elem.enqueue_weighted_sum(stream, &s.a, &consts.scale[l], e, 1, n, &mut s.x)?;
+            if let Some(t) = &mut tapped {
+                t.l_out.push(s.x.to_host_vec(stream)?[..n * e].to_vec());
+            }
+        }
+        let sink = gpu.unlabelled_sink();
+        elem.enqueue_rms_norm(
+            stream,
+            &s.x,
+            gain(names::output_norm())?,
+            eps,
+            e,
+            n,
+            &mut s.xn,
+        )?;
+        cx.quantize(acts, &s.xn, e, n, sink)?;
+        cx.proj(acts, &names::output(), (e, hp.n_out), n, &mut s.out)?;
+        let rows = s.out.to_host_vec(stream)?[..n * hp.n_out].to_vec();
+        if let Some(t) = &mut tapped {
+            t.result_norm = s.xn.to_host_vec(stream)?[..n * e].to_vec();
+        }
+        if let Some(f) = gpu.take_fault()? {
+            return Err(GpuError::fault("Encoder::pass", f));
+        }
+        let pooled = mean(&rows, hp.n_out);
+        Ok(Pass {
+            rows,
+            pooled,
+            taps: tapped,
+        })
+    }
+}
+
+/// The mean of `rows`, at least one whole row of `width` f32: each column
+/// summed in f64 in position order and divided by the row count.
+fn mean(rows: &[f32], width: usize) -> Vec<f32> {
+    let n = rows.len() / width;
+    let mut sum = vec![0.0f64; width];
+    for row in rows.chunks_exact(width) {
+        for (s, &x) in sum.iter_mut().zip(row) {
+            *s += f64::from(x);
+        }
+    }
+    sum.iter().map(|&s| (s / n as f64) as f32).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_per_layer_projection_scale_near_epsilon() {
+        let (hp, weights, gain, pass) =
+            crate::tests::with_model(64, 2048, |split, hp| -> Result<_, GpuError> {
+                let mut weights = Vec::new();
+                decode_rows(
+                    &split,
+                    names::PER_LAYER_MODEL_PROJ,
+                    hp.n_embd,
+                    0..hp.n_layer * hp.per_layer,
+                    &mut weights,
+                )?;
+                let mut enc = Encoder::open(split, hp.n_ctx, Gpu::new()?)?;
+                let gain = enc
+                    .w
+                    .f32_buf(PASS, names::PER_LAYER_PROJ_NORM)?
+                    .to_host_vec(enc.gpu.stream())?;
+                Ok((hp.clone(), weights, gain, enc.pass(&[0, 1], true)?))
+            })
+            .unwrap();
+        let taps = pass.taps.unwrap();
+        assert_eq!(taps.inp_scaled.len(), 2 * hp.n_embd);
+        assert_eq!(taps.inp_per_layer.len(), 2 * hp.n_layer * hp.per_layer);
+        let eps = f64::from(hp.rms_eps);
+        for (t, input) in taps.inp_scaled.chunks_exact(hp.n_embd).enumerate() {
+            for (l, layer) in weights.chunks_exact(hp.per_layer * hp.n_embd).enumerate() {
+                let projected: Vec<f64> = layer
+                    .chunks_exact(hp.n_embd)
+                    .map(|row| {
+                        row.iter()
+                            .zip(input)
+                            .map(|(&w, &x)| f64::from(w) * f64::from(x))
+                            .sum::<f64>()
+                            / (hp.n_embd as f64).sqrt()
+                    })
+                    .collect();
+                let mean_square =
+                    projected.iter().map(|x| x * x).sum::<f64>() / hp.per_layer as f64;
+                assert!(
+                    (eps / 2.0..eps * 2.0).contains(&mean_square),
+                    "{mean_square:e}"
+                );
+                let at = (t * hp.n_layer + l) * hp.per_layer;
+                for (i, (&x, &g)) in projected.iter().zip(&gain).enumerate() {
+                    let expected = x / (mean_square + eps).sqrt() * f64::from(g);
+                    let actual = f64::from(taps.inp_per_layer[at + i]);
+                    assert!(
+                        (actual - expected).abs() < 1.0e-5,
+                        "token {t} layer {l} row {i}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+}

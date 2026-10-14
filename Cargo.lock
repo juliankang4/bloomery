@@ -197,6 +197,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-gpu-gemma-embedding2"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "bloomery-model",
+ "cuda-core",
+]
+
+[[package]]
 name = "bloomery-gpu-glm5next"
 version = "0.1.0"
 dependencies = [

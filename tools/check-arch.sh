@@ -12,6 +12,7 @@
 #   ⑤ crates/*/src 의 스레드 spawn 은 threads::helper::spawn_helper 를 거친다 — 고정된 스텝 스레드가
 #      띄운 스레드는 그 한 CPU 마스크를 물려받는다. 예외는 tools/spawn-allow.txt 의 파일별 개수와 이유다.
 #   아키텍처 자신의 크레이트(crates/gpu-<arch>/src/)는 ①②④에서 그 아키텍처의 arch/ 로 센다.
+#   The crate's name spells the directory's underscores as hyphens (arch/gemma_embedding2/ owns crates/gpu-gemma-embedding2/).
 #   아키텍처 목록은 손으로 적지 않는다: crates/*/src/arch/ 아래 디렉터리 이름이 목록이다. 새 아키텍처는
 #   디렉터리가 생기는 순간 넷 모두의 대상이 된다.
 #
@@ -51,7 +52,7 @@ arches crates
 ALT=$(printf '%s' "$ARCHES" | sed 's/ *$//; s/ /|/g')         # deepseek2|deepseek41|…
 # 모듈 없이 다른 모듈이 읽는 아키텍처 문자열(원칙 3의 예외, docs/arch-split.md)은 규칙 ②의 키 접두에 들어간다.
 KEYS=$(printf '"%s\\.|' $ARCHES deepseek4 | sed 's/|$//')     # "deepseek2\.|"deepseek41\.|"deepseek4\.
-OWN="^crates/([^/]+/src/arch/|gpu-($ALT)/src/)"
+OWN="^crates/([^/]+/src/arch/|gpu-(${ALT//_/-})/src/)"
 
 fail=0
 report() { # report <번호> <설명> <위반 줄들>
@@ -72,7 +73,7 @@ report() { # report <번호> <설명> <위반 줄들>
 nov() { echo "check-arch: rule $*, no verdict" >&2; exit 2; }
 cross_one() { # cross_one <crates dir> <this architecture> <the name it must not use>: rule ①'s hits into cross
   local dirs
-  dirs=$(find "$1" -type d \( -path "*/src/arch/$2" -o -path "$1/gpu-$2/src" \)) ||
+  dirs=$(find "$1" -type d \( -path "*/src/arch/$2" -o -path "$1/gpu-${2//_/-}/src" \)) ||
     nov "1 cannot list the directories of $2 under $1 (find exit $?, above)"
   [ -n "$dirs" ] || return 0
   # shellcheck disable=SC2086

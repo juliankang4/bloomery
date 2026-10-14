@@ -490,8 +490,9 @@ pub mod step_order {
     /// still decodes; it is not a step this architecture runs.
     pub const NEMOTRON_H: &[FaultSite] = MIMO2;
 
-    /// No program runs either Gemma encoder. The order is [`MIMO2`]'s so a
-    /// fault word still decodes; it is not a step either architecture runs.
+    /// The Gemma encoders have no step order of their own. The order is
+    /// [`MIMO2`]'s so a fault word still decodes; it is not the order the
+    /// `gemma-embedding2` encoder's pass raises its sites in.
     pub const GEMMA_ENCODER: &[FaultSite] = MIMO2;
 
     /// No program runs `nemotron_h_moe`. The order is [`MIMO2`]'s so a fault

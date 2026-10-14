@@ -320,6 +320,9 @@ gpu-deepseek41 388 44 0
 # two copies with three blocks (prctl, getppid and pre_exec), and its before-registration test adds raise and
 # pre_exec, each with its SAFETY line.
 gpu-gates 78 5 1
+# PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
+# launcher call requires distinct Consts::pos positions, with its SAFETY line.
+gpu-gemma-embedding2 1 0 0
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and
