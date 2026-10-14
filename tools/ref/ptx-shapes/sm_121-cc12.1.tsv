@@ -188,6 +188,7 @@ generate_ds41   hc_pre_q8_0                              0           0
 generate_ds41   head_norm_neox_append                    0           0
 generate_ds41   head_norm_neox_append_256                0           0
 generate_ds41   head_norm_neox_append_256_q8             0           0
+generate_ds41   head_norm_neox_append_256_whole          0           0
 generate_ds41   head_norm_neox_append_512                0           0
 generate_ds41   head_norm_neox_append_q8                 0           0
 generate_ds41   head_norm_neox_append_rows               0           0
@@ -440,6 +441,7 @@ gate_e2e   hc_gated_up_mix_4x320                    0           0
 gate_e2e   head_norm_neox_append                    0           0
 gate_e2e   head_norm_neox_append_256                0           0
 gate_e2e   head_norm_neox_append_256_q8             0           0
+gate_e2e   head_norm_neox_append_256_whole          0           0
 gate_e2e   head_norm_neox_append_512                0           0
 gate_e2e   head_norm_neox_append_q8                 0           0
 gate_e2e   head_norm_neox_append_rows               0           0

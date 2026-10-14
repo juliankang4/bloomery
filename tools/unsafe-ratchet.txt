@@ -261,7 +261,9 @@ gguf 9 2 0
 # PIN(2026-10-16): gpu 1858 -> 1862 blocks, moved code, not new unsafe: the sigmoid_router_instance! macro (its
 # entries' body calls and the module load, each with its SAFETY line) moved from gpu-deepseek41/src/router.rs to
 # gpu/src/route_body.rs beside the bodies it instantiates; gpu-deepseek41 comes down by the same 4.
-gpu 1862 201 10
+# PIN(2026-10-16): gpu 1862 -> 1863 blocks, a new kernel entry, not old code relaxed: head_norm_neox_append_256_whole's
+# call into norm_partial_append, with its SAFETY line.
+gpu 1863 201 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
