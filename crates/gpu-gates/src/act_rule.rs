@@ -283,13 +283,15 @@ pub struct Q8K {
 /// `amax` is 0), each code `x·id` rounded half to even and saturated to i8
 /// by the two packs, `bsums[k]` the sum of codes `16k .. 16k + 16`. Not
 /// `quantize_row_q8_K_ref`'s rule (`-127/max`, `d = 1/iscale`), whose scale
-/// differs in the last bits. `x` is whole blocks.
+/// differs in the last bits. `x` is whole blocks. Panics on a non-finite
+/// value, which this form has no code for.
 #[must_use]
 pub fn quantize_q8_k(x: &[f32]) -> Q8K {
     assert!(
         x.len().is_multiple_of(QK_K),
         "q8_K blocks are {QK_K} values"
     );
+    refuse_non_finite("quantize_q8_k", x);
     let mut out = Q8K {
         q: Vec::with_capacity(x.len()),
         d: Vec::with_capacity(x.len() / QK_K),
@@ -719,14 +721,17 @@ mod tests {
         assert!((got - exact).abs() <= 1e-5 * abs, "{got} vs {exact}");
     }
 
-    /// A NaN or an infinity anywhere in the column panics instead of coding.
+    /// A NaN or an infinity anywhere in the column panics in each codes form
+    /// instead of coding.
     #[test]
-    fn q8_1_codes_refuses_a_non_finite_value() {
+    fn q8_codes_refuse_a_non_finite_value() {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut x = crate::activations(2 * QK_K, 1, 7);
             x[300] = bad;
             let r = std::panic::catch_unwind(|| q8_1_codes(&x));
-            assert!(r.is_err(), "{bad} was coded");
+            assert!(r.is_err(), "q8_1_codes coded {bad}");
+            let r = std::panic::catch_unwind(|| quantize_q8_k(&x));
+            assert!(r.is_err(), "quantize_q8_k coded {bad}");
         }
     }
 }
