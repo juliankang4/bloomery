@@ -63,6 +63,7 @@ fi
 source tools/ref/ref-paths.sh
 # shellcheck source=tools/ref/clefvis/profile.sh
 source tools/ref/clefvis/profile.sh
+[ "$FAMILY" != emb2 ] || { echo "clefvis.sh: EmbeddingGemma 2's sets are tools/ref/emb2/emb2.sh's (just dump-ref-emb2)" >&2; exit 64; }
 IMG=$HERE/tools/ref/clefvis/images
 OUT=${CLEFVIS_SETS_ROOT:-$DATA}
 PY=${CLEFVIS_PYTHON:-/home/user/clef-venv/bin/python}

@@ -53,6 +53,10 @@ pub enum Identity {
     /// identity, then the checks of [`crate::clefvis::ClefvisSet`] for the kind of set the variant names and the seat's
     /// profile (the `# clefvis` line, the mmproj file and its sha256, the rows the kind needs).
     Clefvis(crate::clefvis::Kind, &'static crate::clefvis::Profile),
+    /// `# model\t<path>` in a `tools/ref/emb2/` set's `MANIFEST.tsv`: the node dumps' identity, then the checks of
+    /// [`crate::emb2::Emb2Set`] for the kind of set the variant names and the profile's files (the `# emb2` and
+    /// `# device` lines, the model file's and the mmproj's path and sha256).
+    Emb2(crate::emb2::Kind, &'static crate::emb2::Profile),
     /// `# vocabulary\t<path>` in a tokenizer set's `MANIFEST.tsv`
     /// (`crates/tokenizer/tools/oracle.sh`), with `# tokenizer` and
     /// `# libllama` naming the reference executable and library by md5: the
@@ -364,6 +368,14 @@ impl Family {
             }
             Identity::Clefvis(..) => {
                 let set = crate::clefvis::ClefvisSet::open(path, self)?;
+                Ok(Provenance {
+                    dumped_from: stated(set.man.header.model()),
+                    draft: None,
+                    build: set.man.build.clone(),
+                })
+            }
+            Identity::Emb2(..) => {
+                let set = crate::emb2::Emb2Set::open(path, self)?;
                 Ok(Provenance {
                     dumped_from: stated(set.man.header.model()),
                     draft: None,

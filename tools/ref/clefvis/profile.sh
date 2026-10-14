@@ -3,13 +3,16 @@
 # The seat the image-input oracle runs for: what clefvis.sh and build-clefvis.sh need that is a property of the seat, not of
 # the machine. Sourced after tools/ref/ref-paths.sh, which has picked the model profile (BLOOMERY_MODEL); never executed,
 # and it exports nothing. A seat is a family of the Qwen3-VL tower (mtmd `qwen3vl_merger`) and its text model, of the GLM
-# tower (`glm5v`) and its, or of the MiniCPM-V 4.7 tower (`minicpmv4_7`) and its:
+# tower (`glm5v`) and its, of the MiniCPM-V 4.7 tower (`minicpmv4_7`) and its, or EmbeddingGemma 2 (`gemma4v` and the
+# encoder), which has a dumper of its own:
 #
 #   qwen35     Clef-Flash         sets ref_clefvis_*             mainline 53ed051ce (the model profile's LCPP)
 #   qwen35moe  Qwen3.6-35B-A3B    sets ref_qwen35moe_vis_*       mainline 36a73916e (QVIS_LCPP)
 #   qwen4exp   Qwen3.8-Flash-Next sets ref_qwen4exp_vis_*        mainline 36a73916e (QVIS_LCPP)
 #   glm5next   GLM-5.3-Flash      sets fx_ref_glm5next_vis_*     mainline 36a73916e (QVIS_LCPP), the fixture tier only
 #   minicpmv47 MiniCPM-V 4.7      sets ref_minicpmv47_vis_*      mainline 358a420ec (MC47_LCPP), the tower arm only
+#   gemma-embedding2  EmbeddingGemma 2  sets ref_gemma_embedding2_*  mainline 6868a52cb (the model profile's LCPP), dumped by
+#                                 tools/ref/emb2/emb2.sh; build-clefvis.sh builds its binary, clefvis.sh refuses the seat
 #
 # The row is picked by BLOOMERY_MODEL, the model profile's name: MiniCPM-V 4.7's text profile (models/minicpmv47.sh) is a
 # qwen35moe file and says MODEL_NAME=qwen35moe, which is Qwen3.6's row. The Qwen seats and the GLM seat share the mainline tree
@@ -18,7 +21,8 @@
 # (arch/qwen35/clefvis.rs, arch/qwen35moe/vis.rs, arch/qwen4exp/vis.rs): the family checks a set's `# model`, `# mmproj`,
 # `# build` lines against them.
 #
-#   FAMILY          clef | qvis | mcvis: which arms the seat has. clef: set A (preproc), the release's ids (clef_ref.py), set D;
+#   FAMILY          clef | qvis | mcvis | emb2: which arms the seat has. emb2: emb2.sh's steps, none of clefvis.sh's;
+#                   clef: set A (preproc), the release's ids (clef_ref.py), set D;
 #                   qvis: the chat ids (E) and the decode steps (F), the tower tapped to its output end; mcvis: sets A and B per
 #                   tile (dump_mtmd's canvas seat), the chat ids (E, kind canvas-chatids) and the hidden rows (C, canvas-hidden),
 #                   no prose, bf16 or decode arm
@@ -35,7 +39,8 @@
 #                   `# fixture` line is that file's, and dump_mtmd refuses a copy whose bloomery.respell.source names another
 #   SETPFX          the sets' common name
 #   ORACLE          the mainline tree the sets are dumped from, its build/bin holding libmtmd, libllama and libggml
-#   BIN             the dump_mtmd binary of that tree
+#   BIN             the dumper binary of that tree
+#   DUMPER          the dumper's source (default tools/ref/clefvis/dump_mtmd.cpp; EmbeddingGemma 2's tools/ref/emb2/dump_emb2.cpp)
 #   MMPROJ, MMPROJ_SHA256, TEXT, PROSE_IDS, PROSE_SHA256   the files the sets are dumped from and their digests
 #   CASES, REQUESTS the cases (case, images, decode steps) and the chat requests the ids come from (qvis)
 #   REF             where a case's ids file is
@@ -56,6 +61,7 @@ DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 BINDIR=${CLEFVIS_OUT:-$DATA/bin}
 NCMOE_A6000=0 NCMOE_3090=0 ROWS_FROM=embd THREADS=16 CASES=tools/ref/clefvis/cases.tsv REQUESTS=
 PREPROC=0 ARMS="hidden prose bf16rows" IMAGES_EXTRA="" IMAGE_PAD_ID="" RESPELL_SOURCE="" SEAT="" IMAGES_LIST=tools/ref/clefvis/images.tsv STAGE_NAME=""
+DUMPER=tools/ref/clefvis/dump_mtmd.cpp
 case ${BLOOMERY_MODEL:-} in
   qwen35)
     FAMILY=clef PREPROC=1 SETPFX=ref_clefvis ORACLE=$LCPP BIN=$BINDIR/dump_mtmd
@@ -124,8 +130,14 @@ case ${BLOOMERY_MODEL:-} in
     CASES=tools/ref/clefvis/cases-minicpmv47.tsv REQUESTS=tools/ref/clefvis/requests-minicpmv47.jsonl
     THREADS=16
     ;;
+  gemma-embedding2)
+    # the model profile (models/gemma-embedding2.sh) names the files, their digests and the tree; the sets and their steps are
+    # emb2.sh's
+    FAMILY=emb2 SETPFX=ref_gemma_embedding2 ORACLE=$LCPP BIN=$BINDIR/dump_emb2 DUMPER=tools/ref/emb2/dump_emb2.cpp
+    TEXT=$MODEL
+    ;;
   *)
-    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${BLOOMERY_MODEL:-}' (qwen35, qwen35moe, qwen4exp, glm5next or minicpmv47)" >&2
+    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${BLOOMERY_MODEL:-}' (qwen35, qwen35moe, qwen4exp, glm5next, minicpmv47 or gemma-embedding2)" >&2
     exit 2
     ;;
 esac

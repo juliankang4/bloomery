@@ -715,6 +715,18 @@ build-mc47-ref:
 dump-ref-mcvis *ARGS:
     case " {{ARGS}} " in *" --ids "*|*" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL=minicpmv47 ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
 
+# EmbeddingGemma 2 (gemma-embedding2, its tower gemma4v), the oracle's tree: llama.cpp mainline at 6868a52cb in /home/user/llama.cpp-6868a52c, the same script as the Qwen tree (tools/ref/qvis/build-lcpp-qvis.sh) with the pin, tree, sentinel directory and targets by environment (llama-server and llama-tokenize besides the libraries); detached, pid, log and rc under /root/lcpp-emb2.
+build-emb2-lcpp:
+    BLOOMERY_BOX_ENV='LCPP_BUILD_PIN=6868a52cb337450658006ad2f9281c2eb63f1666 LCPP_BUILD_TREE=/home/user/llama.cpp-6868a52c LCPP_BUILD_DIR=/root/lcpp-emb2 LCPP_BUILD_TARGETS=llama,mtmd,llama-common,llama-server,llama-tokenize' ./tools/box.sh '[ "$(id -u)" = 0 ] || { echo "build-emb2-lcpp: this recipe requires root on the box (/root/lcpp-emb2 and /home/user); run build-lcpp-qvis.sh directly with writable LCPP_BUILD_DIR and LCPP_BUILD_TREE on a local machine" >&2; exit 2; }; setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
+
+# EmbeddingGemma 2, the oracle's binary: dump_emb2 (tools/ref/emb2/dump_emb2.cpp) linked against that tree's libmtmd and libllama (tools/ref/clefvis/build-clefvis.sh, the gemma-embedding2 row of tools/ref/clefvis/profile.sh) into $BLOOMERY_DATA/bin/dump_emb2; CLEFVIS_OUT=<dir> (in BLOOMERY_BOX_ENV) builds into another directory for a test.
+build-emb2-ref:
+    BLOOMERY_MODEL=gemma-embedding2 ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
+
+# EmbeddingGemma 2, the oracle sets (tools/ref/emb2/emb2.sh; refset families in crates/refset/src/arch/gemma_embedding2) into $BLOOMERY_DATA: every text case's token rows, pooled vector and layer taps (ref_gemma_embedding2_text), the image cases' tower taps and rows (ref_gemma_embedding2_tower), llama-server's /v1/embeddings vectors of both (ref_gemma_embedding2_server), and the CPU twins of the first two (.cpu). The text cases and their ids are the tokenizer oracle's gemma4 set: `just dump-ref-tokenizer gemma4` first. STEPS names some of text, tower, server, text.cpu and tower.cpu (none: all five). The card steps go through the card's gate lock (EMB2_BOUND is the call's and each step's bound); no lease.
+dump-ref-emb2 *STEPS:
+    BLOOMERY_MODEL=gemma-embedding2 ./tools/box.sh 'bash tools/ref/emb2/emb2.sh {{STEPS}}'
+
 # GLM-5.3-Flash image input (mtmd `glm5v`), the oracle sets on the fixture tier (tools/ref/clefvis/clefvis.sh, the glm5next seat of profile.sh): the preprocess (fx_ref_glm5next_vis_preproc) and the tower's output nodes (…_taps), hidden states of three chat prompts (…_hidden_c*) and 32 greedy decode steps after two of them (…_decode_c*), the chat ids (…_chatids_*, with --ids), into $BLOOMERY_DATA. The text model is the fixture's copy in mainline's spelling, /models/fixtures-mainline/glm5next (tools/ref/gguf-respell.py); SETS names base sets, `--cpu-twin` writes the CPU twins and `--ids` the chat ids (both without a card). The card runs go through the card's gate lock; no lease.
 dump-ref-glmv *ARGS:
     case " {{ARGS}} " in *" --ids "*|*" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_TIER=fixture BLOOMERY_CARD=$card BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
@@ -1333,7 +1345,10 @@ gate-tokenizer:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
 # The tokenizer oracle's sets, once per change of the reference trees, the vocabulary files, cases.txt or the
 # docs/ the Korean text is gathered from: `llama-tokenize`'s ids per vocabulary into $BLOOMERY_DATA/ref-tokenizer-<v>/
-# (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron or all). No lease, no GPU.
+# (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron, gemma4 or all, every one but
+# gemma4). No lease, no GPU. gemma4 (EmbeddingGemma 2) is read by mainline 6868a52cb (`just build-emb2-lcpp`), with its
+# own cases after cases.txt (cases-gemma4.txt), and its set is the text cases the EmbeddingGemma 2 oracle sets are dumped
+# from.
 # A re-dump on a moved reference tree changes the md5 pins in crates/refset/src/arch/tokenizer.rs: the gate names which.
 # V4.1's reference is a side tree (/home/user/ik-tilde: ik main plus the one line that puts `~` in the S class,
 # ik#2528) and Qwen3-MoE, GLM-5.3-Flash and Qwen3.8 use /home/user/ik-tokref (the ik-idxkey commit plus the

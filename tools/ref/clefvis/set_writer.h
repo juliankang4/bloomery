@@ -1,4 +1,4 @@
-// The set writer of the mainline oracle dumpers (tools/ref/clefvis/dump_mtmd.cpp, tools/ref/emb2/dump_emb2.cpp): sha256,
+// The GGUF architecture reader and set writer of the mainline oracle dumpers (tools/ref/clefvis/dump_mtmd.cpp, tools/ref/emb2/dump_emb2.cpp): sha256,
 // the reader of the id files the dumpers take, the raw f32 and i32 rows of dump_ref's set format, and the manifest with its
 // `# complete` trailer, renamed into place last. The includer defines DUMP_TOOL, the name its messages open with, before
 // including this file; DIE prints one and exits 1.
@@ -25,6 +25,17 @@
 #endif
 
 #define DIE(...) do { fprintf(stderr, DUMP_TOOL ": " __VA_ARGS__); fputc('\n', stderr); exit(1); } while (0)
+
+static std::string gguf_arch(const std::string & path) {
+    gguf_init_params gp = { true, nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) DIE("cannot read the gguf header of %s", path.c_str());
+    const int64_t k = gguf_find_key(g, "general.architecture");
+    const std::string r = k >= 0 ? gguf_get_val_str(g, k) : "";
+    gguf_free(g);
+    if (r.empty()) DIE("%s has no general.architecture", path.c_str());
+    return r;
+}
 
 // ---- sha256 -----------------------------------------------------------------------------------------------------
 
@@ -87,6 +98,21 @@ struct sha256 {
 static std::string sha256_of(const uint8_t * p, size_t n) {
     sha256 s;
     s.update(p, n);
+    return s.hex();
+}
+
+// The sha256 of the file at `path`, read a block at a time (a model file does not fit a string); a file that cannot be read
+// is a DIE naming it.
+static std::string sha256_file(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) DIE("cannot read %s", path.c_str());
+    sha256 s;
+    std::vector<uint8_t> buf(1 << 20);
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) s.update(buf.data(), n);
+    const bool bad = ferror(f) != 0;
+    fclose(f);
+    if (bad) DIE("read error on %s", path.c_str());
     return s.hex();
 }
 

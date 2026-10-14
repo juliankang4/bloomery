@@ -465,7 +465,7 @@ fn opt_one<'a>(man: &'a RefManifest, key: &str) -> Result<Option<Vec<&'a str>>, 
 }
 
 /// The one line of the header that opens with `# <key>\t`.
-fn one<'a>(man: &'a RefManifest, key: &str) -> Result<Vec<&'a str>, RefError> {
+pub(crate) fn one<'a>(man: &'a RefManifest, key: &str) -> Result<Vec<&'a str>, RefError> {
     opt_one(man, key)?.ok_or_else(|| {
         RefError::missing(
             &man.dir,

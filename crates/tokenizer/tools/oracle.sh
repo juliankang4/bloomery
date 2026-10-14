@@ -36,15 +36,22 @@
 #   glm5next  GLM-5.3-Flash's first shard         ik-tokref                                            ref-tokenizer-glm5next
 #   qwen38    Qwen3.8-Flash-Next's first shard    ik-tokref                                            ref-tokenizer-qwen38
 #   nemotron  Nemotron 3 Nano 4B                  llama.cpp-mainline (pixtral; --no-bos, below)        ref-tokenizer-nemotron
+#   gemma4    EmbeddingGemma 2's Q8_0 file        mainline 6868a52cb (the gemma-embedding2 profile's  ref-tokenizer-gemma4
+#                                                 LCPP and MODEL, tools/ref/models/gemma-embedding2.sh)
+#
+# A vocabulary can have cases of its own after the shared ones (EXTRA, `# extra cases` in the manifest, rows numbered on
+# from the shared cases): gemma4's crates/tokenizer/tests/cases-gemma4.txt, the boundaries of its own vocabulary and the
+# texts the EmbeddingGemma 2 oracle sets are dumped from (tools/ref/emb2/emb2.sh reads their ids here).
 #
 # The sets' directories are `ref-tokenizer-*`, not the `tokenizer*` of the format this script wrote
 # before it wrote a trailer: a checkout that still runs that format's gate rewrites those and cannot
 # touch these.
 #
 # Every vocabulary reads the same texts: the default profile's ik tree and this tree's docs/. `all`
-# takes one snapshot of docs/ per vocabulary, in turn.
+# takes one snapshot of docs/ per vocabulary, in turn, all but gemma4, which runs by name on a machine with its
+# mainline tree.
 #
-# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|all
+# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|all
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -52,16 +59,16 @@ ROOT=$(cd "$HERE/../../.." && pwd)
 CASES=$ROOT/crates/tokenizer/tests/cases.txt
 
 case ${1:-} in
-  v41 | qwen3moe | glm5next | qwen38 | nemotron) [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|all" >&2; exit 64; } ;;
+  v41 | qwen3moe | glm5next | qwen38 | nemotron | gemma4) [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|all" >&2; exit 64; } ;;
   all)
-    [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|all" >&2; exit 64; }
+    [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|all" >&2; exit 64; }
     for v in v41 qwen3moe glm5next qwen38 nemotron; do
       echo "oracle: $v"
       bash "${BASH_SOURCE[0]}" "$v"
     done
     exit 0
     ;;
-  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|all" >&2; exit 64 ;;
+  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|all" >&2; exit 64 ;;
 esac
 VOCAB_NAME=$1
 
@@ -74,11 +81,12 @@ source "$ROOT/tools/ref/ref-paths.sh"
   exit 64
 }
 
-# profile <name>: TOKENIZE (the reference executable), SHARD (the vocabulary file) and SET (the
-# directory under $BLOOMERY_DATA) of one vocabulary. REF_FLAGS holds the flags that make a reference
-# tree's llama-tokenize read the text as ik's does: `--no-bos` where the file would prepend a BOS
-# (the gate compares the text's own ids), `--no-escape` where it would turn a `\n` in the text into
-# a newline.
+# profile <name>: TOKENIZE (the reference executable), SHARD (the vocabulary file), SET (the
+# directory under $BLOOMERY_DATA) and EXTRA (the vocabulary's own cases file, or none) of one
+# vocabulary. REF_FLAGS holds the flags that make a reference tree's llama-tokenize read the text as
+# ik's does: `--no-bos` where the file would prepend a BOS (the gate compares the text's own ids),
+# `--no-escape` where it would turn a `\n` in the text into a newline.
+EXTRA=
 profile() {
   REF_FLAGS=()
   case $1 in
@@ -120,6 +128,21 @@ profile() {
       # (tokenize.cpp `params.escape`), so a `\n` in the code corpus would
       # reach the tokenizer as a newline; --no-escape keeps the text's bytes.
       REF_FLAGS=(--no-bos --no-escape)
+      ;;
+    gemma4)
+      # The profile's own MODEL, not the file tools/box.sh resolved for the default profile.
+      local emb2
+      # shellcheck disable=SC2016 # the child shell expands them
+      emb2=$(env -u BLOOMERY_REF_MODEL bash -c 'source "$1" && printf "%s\t%s" "$LCPP" "$MODEL"' _ \
+        "$ROOT/tools/ref/models/gemma-embedding2.sh")
+      TOKENIZE=${emb2%%$'\t'*}/build/bin/llama-tokenize
+      SHARD=${emb2#*$'\t'}
+      SET=ref-tokenizer-gemma4
+      EXTRA=$ROOT/crates/tokenizer/tests/cases-gemma4.txt
+      # No --no-bos: the EmbeddingGemma 2 sets run these ids as the model's
+      # input, BOS and EOS included, as llama-server's /tokenize with
+      # add_special gives them (tools/ref/emb2/server_vectors.py).
+      REF_FLAGS=(--no-escape)
       ;;
   esac
 }
@@ -187,12 +210,15 @@ row() {
     "$(wc -l < "$OUT.new/$1.ids")" "$(wc -l < "$OUT.new/$1.nps.ids")"
 }
 
+extra_md5=
+[ -z "$EXTRA" ] || extra_md5=$(md5sum < "$EXTRA" | cut -d' ' -f1)
 {
   printf '# tokenizer\t%s\t%s\n' "$TOKENIZE" "$(md5sum < "$TOKENIZE" | cut -d' ' -f1)"
   printf '# libllama\t%s\t%s\n' "$LIBLLAMA" "$(md5sum < "$LIBLLAMA" | cut -d' ' -f1)"
   printf '# vocabulary\t%s\n' "$SHARD"
   printf '# text tree\t%s\n' "$IK"
   printf '# cases\t%s\t%s\n' "$CASES" "$(md5sum < "$CASES" | cut -d' ' -f1)"
+  [ -z "$EXTRA" ] || printf '# extra cases\t%s\t%s\n' "$EXTRA" "$extra_md5"
   printf 'set\tbytes\ttext_md5\tids\tnps_ids\n'
 } > "$OUT.new/MANIFEST.tsv"
 
@@ -203,14 +229,16 @@ for name in code prose prose-all threads korean; do
 done
 
 n=0
-while IFS= read -r line || [ -n "$line" ]; do
-  case $line in '#'*) continue ;; esac
-  n=$((n + 1))
-  name=$(printf 'cases/%02d' "$n")
-  printf '%b' "$line" > "$OUT.new/$name.txt"
-  ids "$OUT.new/$name.txt" "$OUT.new/$name"
-  row "$name" >> "$OUT.new/MANIFEST.tsv"
-done < "$CASES"
+for cases in "$CASES" ${EXTRA:+"$EXTRA"}; do
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in '#'*) continue ;; esac
+    n=$((n + 1))
+    name=$(printf 'cases/%02d' "$n")
+    printf '%b' "$line" > "$OUT.new/$name.txt"
+    ids "$OUT.new/$name.txt" "$OUT.new/$name"
+    row "$name" >> "$OUT.new/MANIFEST.tsv"
+  done < "$cases"
+done
 printf '# complete\t%s\n' "$n" >> "$OUT.new/MANIFEST.tsv"
 
 rm -rf "$OUT"

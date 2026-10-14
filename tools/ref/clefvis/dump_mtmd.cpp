@@ -201,16 +201,6 @@ static float bf16_round(float x) {
     return r;
 }
 
-static std::string gguf_arch(const std::string & path) {
-    gguf_init_params gp = {true, nullptr};
-    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
-    if (!g) DIE("cannot read the gguf header of %s", path.c_str());
-    const int64_t k = gguf_find_key(g, "general.architecture");
-    std::string r = k >= 0 ? gguf_get_val_str(g, k) : "unknown";
-    gguf_free(g);
-    return r;
-}
-
 static uint32_t gguf_u32(const std::string & path, const std::string & key) {
     gguf_init_params gp = {true, nullptr};
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);

@@ -25,6 +25,8 @@
 //! - [`visref`]: the V4.1 vision fork comparison (`tools/ref/vision/visref.sh`).
 //! - [`tokenizer`]: `llama-tokenize`'s ids per vocabulary
 //!   (`crates/tokenizer/tools/oracle.sh`).
+//! - [`emb2`]: llama.cpp mainline's EmbeddingGemma 2 dumps and server
+//!   vectors (`tools/ref/emb2/emb2.sh`).
 //! - [`dequant`]: ggml's dequantized rows (`tools/ref/dump-dequant.sh`).
 //! - [`nemotron`]: mainline's last-position logits of Nemotron 3 Nano
 //!   (`tools/ref/nemotron_ref.cpp`).
@@ -43,6 +45,7 @@ pub mod clefvis;
 mod columns;
 pub mod dequant;
 pub mod dsref;
+pub mod emb2;
 pub mod family;
 pub mod fixture;
 pub mod greedy;
