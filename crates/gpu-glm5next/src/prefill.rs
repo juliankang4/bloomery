@@ -1982,6 +1982,7 @@ impl Body {
             names,
             dims,
             k,
+            branch,
             s,
             stores,
             slots,
@@ -2063,7 +2064,7 @@ impl Body {
         let mut prog = PromptProgram {
             gpu,
             w,
-            p: Parts::of(k, dims, cfg, names, s, stores, slots, card, None),
+            p: Parts::of(k, branch, dims, cfg, names, s, stores, slots, card, None),
             b: bufs,
             u: &mut units[..g],
             t: &ts,

@@ -1037,7 +1037,7 @@ impl AttnChain {
             kernels,
             words,
             scratch,
-            branch: Branch::new(ctx)?,
+            branch: Branch::new(gpu.stream_handle())?,
             top_k: list_len,
             list_len,
             tokens: m,
@@ -1402,7 +1402,7 @@ impl AttnChain {
         let m = cx.m;
         let s = &mut self.scratch;
         let (d, k, stream, n) = (cx.d, cx.k, gpu.stream(), &lp.names);
-        let branch = &self.branch;
+        let branch = &mut self.branch;
 
         let params = HcParams {
             w: q3_k(w, &n.hc_fn)?,
@@ -1419,7 +1419,7 @@ impl AttnChain {
             fault: cx.fault,
         };
         // Only HC_POST reads what HC_PRE writes: it runs beside steps 2–8.
-        let fork = branch.fork(stream)?;
+        let fork = branch.fork()?;
         k.hc.enqueue_pre(fork.stream(), &pre, &mut s.hc_pre, &mut s.mixes, &mut s.hc)?;
 
         let qkv = Qkv::of(w, lp, d)?;

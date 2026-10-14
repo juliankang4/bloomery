@@ -841,7 +841,7 @@ impl AttnChain {
         // Step 1: only HC_POST reads what HC_PRE writes.
         let fork = if full < n {
             // The fork: an event record and the branch's wait on it.
-            let fork = ent.of(2, branch.fork(stream))?;
+            let fork = ent.of(2, branch.fork())?;
             let x = span(WHAT_BATCH, streams_in, t_full * s4, nb * s4)?;
             let mut mixes = span_mut(WHAT_BATCH, &mut b.mixes, t_full * HC_MIX, nb * HC_MIX)?;
             let mut hc = span_mut(WHAT_BATCH, &mut b.hc, t_full * HC_MIX, nb * HC_MIX)?;

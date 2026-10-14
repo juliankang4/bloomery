@@ -47,7 +47,7 @@ use bloomery_gpu::latent::{IndexKeyArgs, IndexPoolArgs, LATENT, LatentAppendArgs
 use bloomery_gpu::model::Q8_0GemvHeadsArgs;
 use bloomery_gpu::qsa::{TopkHighArgs, list_width};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError};
+use bloomery_gpu::{Branch, DeviceTensor, FaultSink, Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::{AttnArgs, SelectedRows};
 use cuda_core::{CudaStream, DeviceBuffer};
 
@@ -187,7 +187,7 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
         index,
         pooled,
     };
-    latent_row(gpu, w, p.k, p.d, n, store, p.s, fault)
+    latent_row(gpu, w, p.k, p.branch, p.d, n, store, p.s, fault)
 }
 
 /// A latent layer's store, lent apart from its layer's slot.
@@ -202,12 +202,13 @@ pub(crate) struct LatentStore<'a> {
 /// latent layer the body holds — a trunk layer's, or the next-token layer's.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the launches' card, weights, kernels and widths, the layer's names and store, the row's buffers and its fault sink (rust-quality R8)"
+    reason = "the launches' card, weights, kernels, branch and widths, the layer's names and store, the row's buffers and its fault sink (rust-quality R8)"
 )]
 pub(crate) fn latent_row(
     gpu: &Gpu,
     w: &Weights,
     k: &Kernels,
+    branch: &mut Branch,
     d: &Dims,
     n: &LatentNames,
     st: LatentStore<'_>,
@@ -276,7 +277,7 @@ pub(crate) fn latent_row(
             cache: index,
         },
     )?;
-    let fork = k.branch.fork(stream)?;
+    let fork = branch.fork()?;
     pool(fork.stream(), w, k, &n.sel, index, &s.cnt, 1, fault, pooled)?;
     select(
         gpu,

@@ -322,48 +322,101 @@ pub(crate) unsafe fn launch_exec(
     cu(unsafe { sys::cuGraphLaunch(exec, stream) }, "cuGraphLaunch")
 }
 
-/// A second stream that work can run on beside the stream it forks from,
-/// captured or eager alike: [`Branch::fork`] makes the branch wait for
-/// everything enqueued on the main stream so far, and [`Forked::join`] makes
-/// the main stream wait for everything enqueued on the branch since.
+/// A second stream that work can run on beside one main stream, captured or
+/// eager alike: [`Branch::fork`] makes the branch wait for everything
+/// enqueued on the main stream so far, and [`Forked::join`] makes the main
+/// stream wait for everything enqueued on the branch since.
 ///
 /// Inside a capture on the main stream the fork's wait pulls the branch into
-/// the same capture, so the branch's work becomes a parallel path of the
-/// graph — an edge from the fork point and one into the join point, no node
-/// of its own. Outside a capture the same two event waits order the eager
-/// run. The stream and both events are made once, at load: `fork` and `join`
-/// only record and wait, which are capturable and allocate nothing.
+/// the same capture, and the fork then sets the branch's capture
+/// dependencies to the main stream's, so each fork's work is a parallel path
+/// of the graph: an edge from the fork point and one into the join point, no
+/// node of its own, on every fork of one capture. Outside a capture the same
+/// two event waits order the eager run. The branch's stream and both events
+/// are made once, at load: `fork` and `join` only record, wait and set
+/// dependencies, which are capturable and allocate nothing. A branch forks
+/// only from the main stream it was made for, and one fork is open at a
+/// time: [`Forked`] borrows the branch until it is joined or dropped.
 pub struct Branch {
+    main: Arc<CudaStream>,
     stream: Arc<CudaStream>,
     forked: CudaEvent,
     joined: CudaEvent,
 }
 
 impl Branch {
-    /// A branch of streams of `ctx`. Load-time only.
-    pub fn new(ctx: &Arc<CudaContext>) -> Result<Branch, GpuError> {
+    /// A branch of `main`, on a stream of `main`'s context. Load-time only.
+    pub fn new(main: Arc<CudaStream>) -> Result<Branch, GpuError> {
+        let ctx = main.context();
         Ok(Branch {
             stream: crate::role_stream(ctx, crate::StreamRole::Engine)?,
             forked: ctx.new_event(None)?,
             joined: ctx.new_event(None)?,
+            main,
         })
     }
 
-    /// Start the branch after everything enqueued on `main` so far. The
-    /// branch's work goes on [`Forked::stream`]; the fork must be joined
-    /// before `main`'s next reader of that work is enqueued.
-    pub fn fork<'a>(&'a self, main: &'a CudaStream) -> Result<Forked<'a>, GpuError> {
-        self.forked.record(main)?;
+    /// Start the branch after everything enqueued on the main stream so far.
+    /// The branch's work goes on [`Forked::stream`]; the fork must be joined
+    /// before the main stream's next reader of that work is enqueued.
+    pub fn fork(&mut self) -> Result<Forked<'_>, GpuError> {
+        self.forked.record(&self.main)?;
         self.stream.wait(&self.forked)?;
+        // The wait adds the fork point to the branch's capture dependencies
+        // and keeps the branch's last node from an earlier fork of the same
+        // capture. That fork was joined into this main stream before this
+        // fork point (its `Forked` held the branch until its join or drop),
+        // so setting the branch's set to main's drops no ordering.
+        let mut status: sys::CUstreamCaptureStatus = 0;
+        let mut deps: *const sys::CUgraphNode = ptr::null();
+        let mut data: *const sys::CUgraphEdgeData = ptr::null();
+        let mut n = 0usize;
+        // SAFETY: `main` is a live stream and the four outputs are locals the
+        // call writes.
+        let rc = unsafe {
+            sys::cuStreamGetCaptureInfo_v3(
+                self.main.cu_stream(),
+                &mut status,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut deps,
+                &mut data,
+                &mut n,
+            )
+        };
+        cu(rc, "cuStreamGetCaptureInfo_v3")?;
+        match status {
+            sys::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE => {}
+            sys::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_ACTIVE => {
+                // SAFETY: `deps` and `data` are the driver's arrays of `n`
+                // entries for `main`, valid until the next call on `main`;
+                // this call is on the branch and only reads them.
+                let rc = unsafe {
+                    sys::cuStreamUpdateCaptureDependencies_v2(
+                        self.stream.cu_stream(),
+                        deps.cast_mut(),
+                        data,
+                        n,
+                        sys::CUstreamUpdateCaptureDependencies_flags_enum_CU_STREAM_SET_CAPTURE_DEPENDENCIES,
+                    )
+                };
+                cu(rc, "cuStreamUpdateCaptureDependencies_v2")?;
+            }
+            _ => {
+                return Err(GpuError::state(
+                    "Branch::fork",
+                    "the main stream's capture is invalidated",
+                ));
+            }
+        }
         Ok(Forked {
             branch: self,
-            main,
             open: true,
         })
     }
 }
 
-/// A [`Branch`] forked from a main stream and not joined yet.
+/// A [`Branch`] forked from its main stream and not joined yet.
 ///
 /// Dropped without [`Forked::join`] (an early error return between the two),
 /// it joins anyway and ignores the driver's answer: the error already on its
@@ -371,8 +424,7 @@ impl Branch {
 /// its end would refuse as unjoined.
 #[must_use = "a fork is joined before its work is read"]
 pub struct Forked<'a> {
-    branch: &'a Branch,
-    main: &'a CudaStream,
+    branch: &'a mut Branch,
     open: bool,
 }
 
@@ -387,7 +439,7 @@ impl Forked<'_> {
     pub fn join(mut self) -> Result<(), GpuError> {
         self.open = false;
         self.branch.joined.record(&self.branch.stream)?;
-        self.main.wait(&self.branch.joined)?;
+        self.branch.main.wait(&self.branch.joined)?;
         Ok(())
     }
 }
@@ -396,7 +448,7 @@ impl Drop for Forked<'_> {
     fn drop(&mut self) {
         if self.open {
             let _ = self.branch.joined.record(&self.branch.stream);
-            let _ = self.main.wait(&self.branch.joined);
+            let _ = self.branch.main.wait(&self.branch.joined);
         }
     }
 }
@@ -823,12 +875,12 @@ impl Drop for Graph {
 
 #[cfg(test)]
 mod tests {
-    use super::{FLAG_WAIT_OPS, Graph, HostFlags, capturing, cu, in_place_flags};
+    use super::{Branch, FLAG_WAIT_OPS, Graph, HostFlags, capturing, cu, in_place_flags};
     use crate::{DeviceTensor, Gpu, GpuError, Q8Act, capsync};
     use cuda_core::{DeviceBuffer, PinnedHostBuffer, sys};
     use std::ffi::c_void;
     use std::panic::AssertUnwindSafe;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
     /// Memory the card and the CPU both read is write-combined on an
@@ -948,6 +1000,108 @@ mod tests {
                 .any(|n| n.kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMSET),
             "{nodes:?}"
         );
+    }
+
+    /// A branch forked three times in one capture is three parallel paths:
+    /// each fork's work depends on its fork point alone, and it and main's
+    /// node beside it lead into one join point, the next round's fork point.
+    /// A branch that kept its node of the round before as a dependency would
+    /// carry one edge more on every fork after the first. The middle round
+    /// drops its fork instead of joining it, and the drop records the join.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_branch_forks_one_at_a_time_from_its_fork_point() {
+        const ROUNDS: usize = 3;
+        const CAP: usize = 64;
+        let (_ctx, stream) = capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let mut branch = Branch::new(Arc::clone(&stream)).expect("a branch");
+        let mut on_main = DeviceBuffer::<u32>::zeroed(&stream, 64).expect("a device buffer");
+        let mut beside = DeviceBuffer::<u32>::zeroed(&stream, 64).expect("a device buffer");
+        stream
+            .synchronize()
+            .expect("the allocations land before capture");
+        let graph = Graph::capture(&stream, |s| {
+            on_main.zero_async(s)?;
+            for r in 0..ROUNDS {
+                let fork = branch.fork()?;
+                beside.zero_async(fork.stream())?;
+                on_main.zero_async(s)?;
+                if r == 1 {
+                    drop(fork);
+                } else {
+                    fork.join()?;
+                }
+                on_main.zero_async(s)?;
+            }
+            Ok(())
+        })
+        .expect("the capture");
+        let mut from = [std::ptr::null_mut(); CAP];
+        let mut to = [std::ptr::null_mut(); CAP];
+        let mut n = CAP;
+        // SAFETY: `graph.graph` is the live template and both arrays hold
+        // `n` slots; the call writes at most `n` edges and their count.
+        let rc = unsafe {
+            sys::cuGraphGetEdges_v2(
+                graph.graph,
+                from.as_mut_ptr(),
+                to.as_mut_ptr(),
+                std::ptr::null_mut(),
+                &mut n,
+            )
+        };
+        cu(rc, "cuGraphGetEdges_v2").expect("the edges");
+        assert_eq!(graph.node_count(), 1 + 3 * ROUNDS, "the captured nodes");
+        assert_eq!(
+            n,
+            4 * ROUNDS,
+            "{n} edges for {ROUNDS} rounds, want 4 a round"
+        );
+        let edges: Vec<_> = from.into_iter().zip(to).take(n).collect();
+        let deps = |v| -> Vec<_> {
+            let mut d: Vec<_> = edges.iter().filter(|e| e.1 == v).map(|e| e.0).collect();
+            d.sort();
+            d
+        };
+        let dependents = |v| -> Vec<_> {
+            let mut d: Vec<_> = edges.iter().filter(|e| e.0 == v).map(|e| e.1).collect();
+            d.sort();
+            d
+        };
+        let mut point = edges
+            .iter()
+            .map(|e| e.0)
+            .find(|&v| deps(v).is_empty())
+            .expect("main's first node");
+        for r in 0..ROUNDS {
+            let paths = dependents(point);
+            assert_eq!(paths.len(), 2, "round {r}: the fork point starts two paths");
+            for &v in &paths {
+                assert_eq!(
+                    deps(v),
+                    [point],
+                    "round {r}: a path depends on its fork point alone"
+                );
+            }
+            let join = dependents(paths[0]);
+            assert_eq!(
+                join,
+                dependents(paths[1]),
+                "round {r}: both paths lead into one node"
+            );
+            let [join] = join[..] else {
+                panic!(
+                    "round {r}: the paths lead into {} nodes, want one",
+                    join.len()
+                );
+            };
+            assert_eq!(
+                deps(join),
+                paths,
+                "round {r}: the join point waits on the two paths alone"
+            );
+            point = join;
+        }
     }
 
     /// The step shape of the capture tests below: one [`ROWS`] × [`K`] Q4_K

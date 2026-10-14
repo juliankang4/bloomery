@@ -1010,6 +1010,7 @@ impl Body {
             hybrid,
             dims,
             k,
+            branch,
             s,
             prompt,
             embd,
@@ -1217,6 +1218,7 @@ impl Body {
             gpu,
             w,
             k,
+            branch,
             &d,
             ln,
             LatentStore {

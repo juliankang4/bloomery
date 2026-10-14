@@ -206,11 +206,9 @@ pub(crate) struct Kernels {
     pub ffn: FfnKernels,
     /// The K-quant blocks' kernels: `None` on a file whose blocks are all q8_0.
     pub block: Option<KBlockKernels>,
-    /// The k-pool selector's score and top-k passes, and the stream its
-    /// launches run on beside the latent mixer's query ([`crate::mla`]).
+    /// The k-pool selector's score and top-k passes ([`crate::mla`]).
     pub kpool: KpoolKernels,
     pub qsa: QsaKernels,
-    pub branch: Branch,
 }
 
 impl Kernels {
@@ -228,7 +226,6 @@ impl Kernels {
             block: k_blocks.then(|| KBlockKernels::load(gpu)).transpose()?,
             kpool: KpoolKernels::load(ctx)?,
             qsa: QsaKernels::load(ctx)?,
-            branch: Branch::new(ctx)?,
         })
     }
 
@@ -764,6 +761,9 @@ pub struct Body {
     names: Vec<LayerNames>,
     dims: Dims,
     k: Kernels,
+    /// The stream the k-pool selector's launches run on beside the latent
+    /// mixer's query ([`crate::mla`]).
+    branch: Branch,
     s: Scratch,
     stores: Vec<Store>,
     /// The slot map's card copy, the host run's rows. The host tier holds
@@ -877,6 +877,7 @@ fn held_at(lanes: &pair::Lanes, held: u32, pos: u32) -> Result<(), GpuError> {
 /// The parts of the body a walk writes, lent apart from its host tier.
 pub(crate) struct Parts<'s> {
     pub k: &'s Kernels,
+    pub branch: &'s mut Branch,
     pub d: &'s Dims,
     pub cfg: &'s [LayerCfg],
     pub names: &'s [LayerNames],
@@ -975,6 +976,7 @@ impl<'s> Parts<'s> {
     )]
     pub(crate) fn of(
         k: &'s Kernels,
+        branch: &'s mut Branch,
         d: &'s Dims,
         cfg: &'s [LayerCfg],
         names: &'s [LayerNames],
@@ -988,6 +990,7 @@ impl<'s> Parts<'s> {
         let [s, a, b, c] = rows;
         Parts {
             k,
+            branch,
             d,
             cfg,
             names,
@@ -1750,6 +1753,7 @@ impl Body {
             names,
             dims,
             k: Kernels::load(gpu, k_blocks)?,
+            branch: Branch::new(gpu.stream_handle())?,
             s,
             stores,
             slots,
@@ -1943,6 +1947,7 @@ impl Body {
         (
             Parts::of(
                 &self.k,
+                &mut self.branch,
                 &self.dims,
                 &self.cfg,
                 &self.names,

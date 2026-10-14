@@ -879,6 +879,7 @@ impl Body {
             names,
             dims,
             k,
+            branch,
             s,
             stores,
             slots,
@@ -912,6 +913,7 @@ impl Body {
         let [row0, a, b, c] = s_rows;
         let parts = Parts {
             k,
+            branch,
             d: dims,
             cfg,
             names,
