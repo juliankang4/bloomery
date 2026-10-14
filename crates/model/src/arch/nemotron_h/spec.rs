@@ -99,6 +99,7 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
         mtp: Vec::new(),
         hc: None,
         engram: None,
+        encoder: None,
         chat,
     })
 }
@@ -465,7 +466,7 @@ mod tests {
         );
     }
 
-    /// The conv bias is not required.
+    /// The conv bias is optional, but its dims are checked when present.
     #[test]
     fn the_conv_bias_may_be_absent() {
         let read = ok("nemotron-h-bias", &geo(), false);
@@ -476,6 +477,20 @@ mod tests {
                 .tensors
                 .iter()
                 .any(|t| t.name.contains("ssm_conv1d.bias"))
+        );
+        let g = geo();
+        let mut bad = tensors(&g, true);
+        let name = format!("blk.0.{}", names::SSM_CONV_BIAS);
+        let row = bad
+            .iter_mut()
+            .find(|(n, _)| *n == name)
+            .expect("the conv bias");
+        row.1 = vec![1];
+        let err = load("nemotron-h-bias-dims", "nemotron_h", keys(&g), &bad)
+            .expect_err("a present conv bias with other dims");
+        assert!(
+            err.contains(&name) && err.contains("has other dims than the keys give the tensor"),
+            "{err}"
         );
     }
 

@@ -190,6 +190,7 @@ pub fn spec_of(
         },
         hc,
         engram,
+        encoder: None,
         chat,
     })
 }

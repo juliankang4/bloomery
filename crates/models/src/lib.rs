@@ -14,11 +14,13 @@
 //! Counts are `u32`, the files' key type. A field with a `None` or an empty
 //! list names what it means in its own comment.
 
+mod encoder;
 pub mod headpick;
 mod need;
 mod role;
 pub mod shape;
 
+pub use encoder::EncoderSpec;
 pub use need::{Need, Unimplemented, needs};
 pub use role::Role;
 
@@ -47,6 +49,9 @@ pub struct ModelSpec {
     /// The n-gram embedding dimensions; `None`: no layer carries an
     /// [`Extra::Engram`] or [`Extra::Ple`] site.
     pub engram: Option<EngramSpec>,
+    /// What an encoder carries past its trunk; `None`: the model generates
+    /// tokens.
+    pub encoder: Option<EncoderSpec>,
     pub chat: ChatSpec,
 }
 
@@ -63,6 +68,7 @@ pub enum Arch {
     Glm5Next,
     MiMo2,
     NemotronH,
+    GemmaEmbedding2,
 }
 
 impl Arch {
@@ -81,6 +87,7 @@ impl Arch {
             Arch::Glm5Next => "glm5next",
             Arch::MiMo2 => "mimo2",
             Arch::NemotronH => "nemotron_h",
+            Arch::GemmaEmbedding2 => "gemma-embedding2",
         }
     }
 }
@@ -216,7 +223,8 @@ pub struct Gqa {
     pub out_gate: bool,
     /// `None`: every position is attended.
     pub select: Option<Selector>,
-    /// The raw positions attended; `None`: every position.
+    /// The raw positions attended; `None`: every position. An encoder's
+    /// layers keep `None` and carry the reach in [`crate::EncoderSpec::reach`].
     pub window: Option<u32>,
     /// A per-head softmax sink (`attn_sinks`).
     pub sinks: bool,
@@ -515,17 +523,29 @@ pub enum Act {
     SwiGlu { limit: Option<f32> },
     /// `relu(x)^2`, with no gate.
     ReluSqr,
+    /// `gelu(g)·u`, GELU in its tanh form.
+    GeGlu,
 }
 
 impl Act {
+    /// The activation as a refusal names it.
+    #[must_use]
+    pub fn what(self) -> &'static str {
+        match self {
+            Act::SwiGlu { .. } => "SwiGLU",
+            Act::ReluSqr => "squared ReLU",
+            Act::GeGlu => "GELU GLU",
+        }
+    }
+
     /// The clamp the combine kernels take: 0, the plain combine, when the
-    /// activation has no limit, else the limit. A squared ReLU has no clamp;
-    /// a caller matches on [`Act`] and refuses that arm by name.
+    /// activation has no limit, else the limit. Only SwiGLU has a clamp; a
+    /// caller matches on [`Act`] and refuses the other arms by name.
     #[must_use]
     pub fn swiglu_limit(self) -> f32 {
         match self {
             Act::SwiGlu { limit } => limit.unwrap_or(0.0),
-            Act::ReluSqr => panic!("squared ReLU has no SwiGLU clamp"),
+            other => panic!("{} has no SwiGLU clamp", other.what()),
         }
     }
 }

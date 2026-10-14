@@ -31,6 +31,7 @@ fn act(a: &Act) -> String {
     match a {
         Act::SwiGlu { limit } => format!("swiglu {limit:?}"),
         Act::ReluSqr => "relusqr".to_string(),
+        Act::GeGlu => "geglu".to_string(),
     }
 }
 

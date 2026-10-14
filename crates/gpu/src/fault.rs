@@ -490,6 +490,10 @@ pub mod step_order {
     /// still decodes; it is not a step this architecture runs.
     pub const NEMOTRON_H: &[FaultSite] = MIMO2;
 
+    /// No program runs `gemma-embedding2`. The order is [`MIMO2`]'s so a
+    /// fault word still decodes; it is not a step this architecture runs.
+    pub const GEMMA_EMBEDDING2: &[FaultSite] = MIMO2;
+
     /// MiMo-V2.6-Flash (`gpu-mimo2`): the token id checked on the host before
     /// the step; a layer's cache append (position) and its flash (visible
     /// key count); the router and the handoff's id check; the q8_0 head's
@@ -536,6 +540,7 @@ pub mod step_order {
             // No program runs nemotron_h. The listing is MiMo's so a fault
             // word still decodes; it is not a step this architecture runs.
             model::arch::Arch::NemotronH => NEMOTRON_H,
+            model::arch::Arch::GemmaEmbedding2 => GEMMA_EMBEDDING2,
         }
     }
 }
@@ -872,7 +877,7 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`step_order::of`] gives it a table).
-    fn every_arch() -> [Arch; 7] {
+    fn every_arch() -> [Arch; 8] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,
@@ -881,6 +886,7 @@ mod tests {
             Arch::Glm5next,
             Arch::Mimo2,
             Arch::NemotronH,
+            Arch::GemmaEmbedding2,
         ];
         for a in all {
             match a {
@@ -890,7 +896,8 @@ mod tests {
                 | Arch::Qwen35moe
                 | Arch::Glm5next
                 | Arch::Mimo2
-                | Arch::NemotronH => {}
+                | Arch::NemotronH
+                | Arch::GemmaEmbedding2 => {}
             }
         }
         all

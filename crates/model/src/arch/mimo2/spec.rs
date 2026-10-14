@@ -134,6 +134,7 @@ pub fn spec_of(
         mtp,
         hc: None,
         engram: None,
+        encoder: None,
         chat,
     })
 }

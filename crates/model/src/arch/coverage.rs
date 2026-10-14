@@ -1075,7 +1075,8 @@ pub fn check_with(
     if !tokenizer::runs_pre_tokenizer(&spec.chat.pre) {
         at(None, Need::PreTokenizer(spec.chat.pre.clone()));
     }
-    if spec.chat.template.is_some() && spec.chat.tools.is_none() {
+    // An encoder writes no tokens, so it calls no tool.
+    if spec.chat.template.is_some() && spec.chat.tools.is_none() && spec.encoder.is_none() {
         at(None, Need::ToolParser);
     }
     out
@@ -1710,6 +1711,7 @@ mod tests {
             mtp: Vec::new(),
             hc: None,
             engram: None,
+            encoder: None,
             chat: ChatSpec {
                 pre: String::new(),
                 template: None,

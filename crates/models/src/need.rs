@@ -41,6 +41,14 @@ pub enum Need {
         sinks: bool,
         scaled: bool,
     },
+    /// Grouped-query flash attention in both directions: `head` values per
+    /// key and value head, `group` query heads to a key head, `reach` keys on
+    /// each side of a row (`None`: every key).
+    Bidirectional {
+        head: u32,
+        group: u32,
+        reach: Option<u32>,
+    },
     /// The per-head q/k norm (when `qk_norm`) and rope of a GQA layer.
     QkRope {
         qk_norm: bool,
@@ -101,6 +109,8 @@ pub enum Need {
     DenseFfn { ff: u32 },
     /// A dense squared-ReLU layer of `ff` values, with no gate.
     ReluSqr { ff: u32 },
+    /// A dense GELU GLU layer of `ff` values.
+    GeGlu { ff: u32 },
     /// A Mamba-2 mixer. The fields are the widths a scan kernel is built for.
     Mamba2 {
         d_inner: u32,
@@ -170,6 +180,13 @@ impl fmt::Display for Need {
                 }
                 if *scaled {
                     f.write_str(", value scale")?;
+                }
+                Ok(())
+            }
+            Need::Bidirectional { head, group, reach } => {
+                write!(f, "bidirectional GQA flash, head {head}, group {group}")?;
+                if let Some(r) = reach {
+                    write!(f, ", {r} keys each side")?;
                 }
                 Ok(())
             }
@@ -273,6 +290,7 @@ impl fmt::Display for Need {
             }
             Need::DenseFfn { ff } => write!(f, "dense SwiGLU layer: ff {ff}"),
             Need::ReluSqr { ff } => write!(f, "squared-ReLU dense layer: ff {ff}"),
+            Need::GeGlu { ff } => write!(f, "dense GELU GLU layer: ff {ff}"),
             Need::Mamba2 {
                 d_inner,
                 d_state,
@@ -336,7 +354,8 @@ fn mode_name(mode: RopeMode) -> String {
 
 /// Every part of `spec`'s trunk a program has to run, layer by layer in
 /// layer order, then the model-wide ones (`None`). The next-token layers
-/// (`spec.mtp`) are carried and not run, so they need nothing.
+/// (`spec.mtp`) are carried and not run, so they need nothing. An encoder's
+/// attention is [`Need::Bidirectional`], never a causal [`Need::Gqa`].
 #[must_use]
 pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
     let mut out = Vec::new();
@@ -344,13 +363,23 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
         let mut at = |n: Need| out.push((n, Some(l)));
         match &layer.mixer {
             Mixer::Gqa(g) => {
-                at(Need::Gqa {
-                    head: g.head_dim,
-                    value: g.value_dim,
-                    group: g.group(),
-                    window: g.window,
-                    sinks: g.sinks,
-                    scaled: g.value_scale.is_some(),
+                at(match &spec.encoder {
+                    Some(e) => Need::Bidirectional {
+                        head: g.head_dim,
+                        group: g.group(),
+                        reach: *e
+                            .reach
+                            .get(l as usize)
+                            .expect("encoder readers build reach from one pattern entry per layer"),
+                    },
+                    None => Need::Gqa {
+                        head: g.head_dim,
+                        value: g.value_dim,
+                        group: g.group(),
+                        window: g.window,
+                        sinks: g.sinks,
+                        scaled: g.value_scale.is_some(),
+                    },
                 });
                 if g.rope.mode != RopeMode::None {
                     at(Need::QkRope {
@@ -426,6 +455,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 // ReLU of a positive width is the block.
                 crate::Act::ReluSqr if *ff > 0 => at(Need::ReluSqr { ff: *ff }),
                 crate::Act::ReluSqr => {}
+                crate::Act::GeGlu => at(Need::GeGlu { ff: *ff }),
             },
         }
         if layer.residual == Residual::Hc

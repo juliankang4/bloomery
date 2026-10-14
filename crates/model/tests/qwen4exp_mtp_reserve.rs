@@ -155,6 +155,7 @@ fn inputs() -> PlanInputs {
         mtp: Vec::new(),
         hc: None,
         engram: None,
+        encoder: None,
         chat: ChatSpec {
             pre: String::new(),
             template: None,

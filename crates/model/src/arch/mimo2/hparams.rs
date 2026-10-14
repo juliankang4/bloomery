@@ -14,8 +14,8 @@ use super::roles::{
     DENSE, MIXER, MOE, NEXTN, QKV_FUSED, QKV_SPLIT, SELECTION_BIAS, Stem, required,
 };
 use crate::arch::{
-    meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab, optional_usize, per_layer_count,
-    positive,
+    meta_f32, meta_u64, meta_usize, metadata, n_vocab, optional_usize, per_layer_count,
+    per_layer_items, positive,
 };
 use crate::placement::PlacementError;
 
@@ -477,15 +477,7 @@ fn nextn(
 /// `get_arr`).
 fn pattern(split: &Split, n_layer: usize) -> Result<Vec<Kind>, PlacementError> {
     let key = "attention.sliding_window_pattern";
-    let items = meta_arr(split, key)?;
-    if items.len() != n_layer {
-        return Err(metadata(
-            split,
-            key,
-            format!("has {} values for {n_layer} layers", items.len()),
-        ));
-    }
-    items
+    per_layer_items(split, key, n_layer)?
         .iter()
         .enumerate()
         .map(|(l, v)| match v.as_unsigned() {

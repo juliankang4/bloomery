@@ -103,6 +103,7 @@ pub fn spec_of(
         mtp: Vec::new(),
         hc: None,
         engram: None,
+        encoder: None,
         chat,
     })
 }

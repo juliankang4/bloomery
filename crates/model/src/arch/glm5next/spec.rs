@@ -159,6 +159,7 @@ pub fn spec_of(
             },
         }),
         engram: None,
+        encoder: None,
         chat,
     })
 }

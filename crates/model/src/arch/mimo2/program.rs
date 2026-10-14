@@ -182,9 +182,9 @@ pub fn block_args(l: usize, s: &LayerSpec, built: RouterBuilt) -> Result<BlockAr
                 ff: *ff as usize,
                 bias: false,
             }),
-            Act::ReluSqr => Err(refuse(
+            other => Err(refuse(
                 l,
-                "a squared ReLU; the dense block runs SwiGLU".to_string(),
+                format!("a {}; the dense block runs SwiGLU", other.what()),
             )),
         },
         Ffn::Moe(m) => {
@@ -220,12 +220,14 @@ pub fn block_args(l: usize, s: &LayerSpec, built: RouterBuilt) -> Result<BlockAr
             }
             let limit = match m.act {
                 Act::SwiGlu { limit } => limit.unwrap_or(0.0),
-                Act::ReluSqr => {
+                other => {
                     return Err(refuse(
                         l,
-                        "a squared ReLU on the routed experts; the host tier and the card experts \
-                         run SwiGLU"
-                            .to_string(),
+                        format!(
+                            "a {} on the routed experts; the host tier and the card experts run \
+                             SwiGLU",
+                            other.what()
+                        ),
                     ));
                 }
             };

@@ -13,7 +13,7 @@ use super::names::{self, ATTN_NORM};
 use super::roles;
 use crate::arch::stems::{Stem, required};
 use crate::arch::{
-    meta_f32, meta_usize, metadata, n_vocab, optional_usize, per_layer_count, positive,
+    meta_f32, meta_usize, metadata, mul, n_vocab, optional_usize, per_layer_count, positive,
 };
 use crate::placement::PlacementError;
 
@@ -203,38 +203,22 @@ impl Hparams {
     /// tensor the file does not carry is skipped: [`Self::tensors_agree`]
     /// already named it. The first tensor of other dims, by name.
     fn dims_agree(&self, split: &Split) -> Result<(), PlacementError> {
-        let mut off = Vec::new();
-        let check = |off: &mut Vec<(String, String)>, name: String, dims: Vec<u64>| {
-            if let Some((_, info)) = split.find(&name)
-                && info.dims != dims
-            {
-                off.push((name, format!("{:?} (want {dims:?})", info.dims)));
-            }
-        };
         let e = self.n_embd as u64;
         let vocab = self.n_vocab as u64;
-        check(&mut off, names::token_embd(), vec![e, vocab]);
-        check(&mut off, names::output(), vec![e, vocab]);
-        check(&mut off, names::output_norm(), vec![e]);
+        let mut want = vec![
+            (names::token_embd(), vec![e, vocab]),
+            (names::output(), vec![e, vocab]),
+            (names::output_norm(), vec![e]),
+        ];
         for (l, &kind) in self.kinds.iter().enumerate() {
-            for (stem, dims) in self.want(l, kind) {
-                check(&mut off, format!("blk.{l}.{stem}"), dims);
-            }
+            want.extend(
+                self.want(l, kind)
+                    .into_iter()
+                    .map(|(stem, dims)| (format!("blk.{l}.{stem}"), dims)),
+            );
         }
-        match off.first() {
-            None => Ok(()),
-            Some((name, _)) => Err(PlacementError::Tensor {
-                name: name.clone(),
-                detail: format!(
-                    "has other dims than the keys give the tensor ({} such: {})",
-                    off.len(),
-                    off.iter()
-                        .map(|(n, d)| format!("{n} {d}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            }),
-        }
+        want.retain(|(name, _)| split.find(name).is_some());
+        crate::arch::tensors_agree(split, want)
     }
 
     /// The dims the keys give layer `l` of `kind`, ggml order.
@@ -331,12 +315,6 @@ fn ssm(split: &Split) -> Result<Ssm, PlacementError> {
         d_in_proj,
         conv_dim,
     })
-}
-
-/// `a * b`, or the error that names `suffix`.
-fn mul(split: &Split, suffix: &str, a: usize, b: usize) -> Result<usize, PlacementError> {
-    a.checked_mul(b)
-        .ok_or_else(|| metadata(split, suffix, format!("{a} * {b} does not fit")))
 }
 
 /// `a + b`, or the error that names `suffix`.

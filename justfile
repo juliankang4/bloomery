@@ -2380,6 +2380,14 @@ gate-mimo2-meta:
 gate-nemotron-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::nemotron_h --nocapture && bash tools/gate.sh --release -p bloomery-model --test nemotron_meta -- --ignored --nocapture'
 
+# gemma-embedding2 (EmbeddingGemma 2) header gate: the reader's refusals on synthetic headers (a full
+# layer at the sliding head, a missing tensor, another pooling, causal attention, a key head count
+# that does not divide the heads, an odd rope, another tokenizer, a missing key) and the coverage
+# items of an encoder, then the reader's description of the Q8_0 file at the box's path
+# (BLOOMERY_BOX_ENV='BLOOMERY_MODEL=<path>' names another). Headers only, seconds.
+gate-gemma-embedding2-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding2 --nocapture && bash tools/gate.sh --release -p bloomery-model --test gemma_embedding2_meta -- --ignored --nocapture'
+
 # mimo2 (MiMo-V2.6-Flash) end-to-end: the program loaded once by the gate placement, the 3090's bytes on either card
 # (every routed expert on the host tier, the host set derived at about 161.5 GB), against ik's sets (refset `ik-mimo2`,
 # dumped from the MOPD file): (s) the step's node count and its memory operations, the layer kinds, each layer's

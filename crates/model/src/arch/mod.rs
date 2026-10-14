@@ -16,6 +16,7 @@ pub mod deepseek2;
 pub mod deepseek41;
 pub mod draft;
 pub mod dspark;
+pub mod gemma_embedding2;
 pub mod glm5next;
 pub mod mimo2;
 pub mod names;
@@ -41,6 +42,7 @@ pub fn spec(split: &Split) -> Result<Read, ModelError> {
         Some("glm5next" | GLM5_NEXT_LLAMA_CPP) => glm5next::spec::read(split)?,
         Some("mimo2") => mimo2::spec::read(split)?,
         Some("nemotron_h") => nemotron_h::spec::read(split)?,
+        Some(GEMMA_EMBEDDING2) => gemma_embedding2::spec::read(split)?,
         other => {
             return Err(ModelError::UnknownArchitecture(
                 other.unwrap_or("<missing>").to_string(),
@@ -61,6 +63,11 @@ pub struct Read {
 /// The architecture string of the DSpark draft file ([`dspark`]). It is not an
 /// [`Arch`]: the draft is read beside a V4.1 model, never run as a model.
 pub const DFLASH: &str = "dflash";
+
+/// EmbeddingGemma 2's architecture string, read by the [`gemma_embedding2`]
+/// module: [`spec`], [`Arch::from_name`] and [`Arch::name`] take this one
+/// spelling.
+pub const GEMMA_EMBEDDING2: &str = "gemma-embedding2";
 
 /// Whether `split` declares the draft's architecture.
 pub fn is_dflash(split: &Split) -> bool {
@@ -136,7 +143,8 @@ fn architecture_is(is: &str) -> PlacementError {
 }
 
 /// An architecture a file's `general.architecture` names, when this crate has
-/// a reader or a program for it. `nemotron_h` has a reader and no program.
+/// a reader or a program for it. `nemotron_h` and `gemma-embedding2` have a
+/// reader and no program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
     Deepseek2,
@@ -146,6 +154,7 @@ pub enum Arch {
     Glm5next,
     Mimo2,
     NemotronH,
+    GemmaEmbedding2,
 }
 
 impl Arch {
@@ -172,6 +181,7 @@ impl Arch {
             "glm5next" | GLM5_NEXT_LLAMA_CPP => Ok(Arch::Glm5next),
             "mimo2" => Ok(Arch::Mimo2),
             "nemotron_h" => Ok(Arch::NemotronH),
+            GEMMA_EMBEDDING2 => Ok(Arch::GemmaEmbedding2),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -192,6 +202,7 @@ impl Arch {
             Arch::Glm5next => "glm5next",
             Arch::Mimo2 => "mimo2",
             Arch::NemotronH => "nemotron_h",
+            Arch::GemmaEmbedding2 => GEMMA_EMBEDDING2,
         }
     }
 }
@@ -271,14 +282,13 @@ fn meta_arr<'a>(split: &'a Split, suffix: &str) -> Result<&'a [Value], Placement
         .ok_or_else(|| metadata(split, suffix, "is absent or not an array"))
 }
 
-/// `<architecture>.<suffix>` as a per-layer array of `n_layer` counts. Zero
-/// is a count; a family that refuses it checks that itself. A scalar is
-/// refused by name: the file's own form is the array.
-pub(crate) fn per_layer_count(
-    split: &Split,
+/// `<architecture>.<suffix>` as an array of exactly `n_layer` items. A
+/// scalar or another length is refused by name.
+fn per_layer_items<'a>(
+    split: &'a Split,
     suffix: &str,
     n_layer: usize,
-) -> Result<Vec<usize>, PlacementError> {
+) -> Result<&'a [Value], PlacementError> {
     let items = meta_arr(split, suffix)?;
     if items.len() != n_layer {
         return Err(metadata(
@@ -287,7 +297,18 @@ pub(crate) fn per_layer_count(
             format!("has {} values for {n_layer} layers", items.len()),
         ));
     }
-    items
+    Ok(items)
+}
+
+/// `<architecture>.<suffix>` as a per-layer array of `n_layer` counts. Zero
+/// is a count; a family that refuses it checks that itself. A scalar is
+/// refused by name: the file's own form is the array.
+pub(crate) fn per_layer_count(
+    split: &Split,
+    suffix: &str,
+    n_layer: usize,
+) -> Result<Vec<usize>, PlacementError> {
+    per_layer_items(split, suffix, n_layer)?
         .iter()
         .enumerate()
         .map(|(l, v)| {
@@ -296,6 +317,52 @@ pub(crate) fn per_layer_count(
                 .ok_or_else(|| metadata(split, suffix, format!("has no count at layer {l}")))
         })
         .collect()
+}
+
+/// Required tensors at their expected dimensions; missing names precede dimension errors.
+fn tensors_agree(split: &Split, want: Vec<(String, Vec<u64>)>) -> Result<(), PlacementError> {
+    let mut missing = Vec::new();
+    let mut off = Vec::new();
+    for (name, dims) in want {
+        match split.find(&name) {
+            None => missing.push(name),
+            Some((_, info)) if info.dims != dims => {
+                let detail = format!("{name} {:?} (want {dims:?})", info.dims);
+                off.push((name, detail));
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(name) = missing.first() {
+        return Err(PlacementError::Tensor {
+            name: name.clone(),
+            detail: format!(
+                "is not in the file ({} tensor(s) the model needs are missing: {})",
+                missing.len(),
+                missing.join(", ")
+            ),
+        });
+    }
+    if let Some((name, _)) = off.first() {
+        return Err(PlacementError::Tensor {
+            name: name.clone(),
+            detail: format!(
+                "has other dims than the keys give the tensor ({} such: {})",
+                off.len(),
+                off.iter()
+                    .map(|(_, d)| d.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// `a * b`, or the error that names `<architecture>.<suffix>`.
+fn mul(split: &Split, suffix: &str, a: usize, b: usize) -> Result<usize, PlacementError> {
+    a.checked_mul(b)
+        .ok_or_else(|| metadata(split, suffix, format!("{a} * {b} does not fit")))
 }
 
 /// What `nextn_predict_layers` settles about the blocks past the trunk.
@@ -458,19 +525,27 @@ fn chat_of(
             key: PRE.to_string(),
             detail: "is absent or not a string".to_string(),
         })?;
-    let template = match split.value(TEMPLATE) {
-        None => None,
-        Some(v) => Some(v.as_str().ok_or_else(|| PlacementError::Metadata {
-            key: TEMPLATE.to_string(),
-            detail: "is not a string".to_string(),
-        })?),
-    };
     Ok(ChatSpec {
         pre: pre.to_string(),
-        template: template.map(str::to_string),
+        template: template_of(split)?,
         tools,
         reasoning,
     })
+}
+
+/// `tokenizer.chat_template`; `None` when the file has none.
+fn template_of(split: &Split) -> Result<Option<String>, PlacementError> {
+    split
+        .value(TEMPLATE)
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| PlacementError::Metadata {
+                    key: TEMPLATE.to_string(),
+                    detail: "is not a string".to_string(),
+                })
+        })
+        .transpose()
 }
 
 /// `v`, a count a reader holds as `usize`, as the `u32` a [`ModelSpec`]
@@ -524,6 +599,8 @@ pub(crate) mod synthetic {
         F32s(Vec<f32>),
         /// An array of U64, the type a converter writes a hash constant in.
         U64s(Vec<u64>),
+        /// An array of bools, the type a converter writes a per-layer flag in.
+        Bools(Vec<bool>),
     }
 
     fn string(b: &mut Vec<u8>, x: &str) {
@@ -666,6 +743,12 @@ pub(crate) mod synthetic {
                     xs.iter()
                         .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
                 }
+                V::Bools(xs) => {
+                    b.extend_from_slice(&9u32.to_le_bytes());
+                    b.extend_from_slice(&7u32.to_le_bytes());
+                    b.extend_from_slice(&(xs.len() as u64).to_le_bytes());
+                    xs.iter().for_each(|x| b.push(u8::from(*x)));
+                }
             }
         }
         let mut offset = 0u64;
@@ -701,6 +784,7 @@ mod tests {
             Arch::Glm5next,
             Arch::Mimo2,
             Arch::NemotronH,
+            Arch::GemmaEmbedding2,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }

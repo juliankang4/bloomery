@@ -97,6 +97,7 @@ pub fn spec_of(
             }),
             None => None,
         },
+        encoder: None,
         chat,
     })
 }

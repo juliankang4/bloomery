@@ -210,10 +210,10 @@ impl CardExperts {
             };
             let limit = match m.act {
                 models::Act::SwiGlu { limit } => limit,
-                models::Act::ReluSqr => {
+                other => {
                     return Err(GpuError::Shape {
                         what: CARD,
-                        detail: format!("layer {l}: squared ReLU has no SwiGLU clamp"),
+                        detail: format!("layer {l}: {} has no SwiGLU clamp", other.what()),
                     });
                 }
             };

@@ -29,7 +29,9 @@ use models::{
 
 use super::place::PlanInputs;
 use crate::arch::draft::{EMBEDDING, HEAD, borrows, same, same_token_ids};
-use crate::arch::{architecture_is, meta_arr, meta_f32, meta_usize, metadata, n_vocab, spec_u32};
+use crate::arch::{
+    architecture_is, meta_f32, meta_usize, metadata, n_vocab, per_layer_items, spec_u32,
+};
 use crate::placement::PlacementError;
 
 /// The next-token layers the sidecar carries: three chained heads, of which
@@ -309,15 +311,7 @@ fn layer_item(
     n_layer: usize,
     at: usize,
 ) -> Result<usize, PlacementError> {
-    let items = meta_arr(draft, suffix)?;
-    if items.len() != n_layer {
-        return Err(metadata(
-            draft,
-            suffix,
-            format!("has {} values for {n_layer} layers", items.len()),
-        ));
-    }
-    items[at]
+    per_layer_items(draft, suffix, n_layer)?[at]
         .as_unsigned()
         .and_then(|x| usize::try_from(x).ok())
         .ok_or_else(|| metadata(draft, suffix, format!("has no count at layer {at}")))
