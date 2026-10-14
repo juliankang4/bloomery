@@ -158,8 +158,18 @@ explicit all-host expert choice emits no such diagnosis. These records use the
 plan's stream: stderr in the server and stdout in the generation CLI.
 
 **When the host cannot hold its experts either.** A Qwen3.8, GLM-5.3 or V4.1 plan whose host need passes the
-host's available RAM pages the overflow on the NVMe tier and serves it from a RAM arena filled from the file. The
-tokens equal the all-RAM load's. The load prints an `nvtier` record (the arena's budget, the paged bytes and its
+host's available RAM pages the overflow on the NVMe tier and serves it from a RAM arena filled from the file. Who
+computes the arena's experts decides whether the tokens equal the all-RAM load's:
+- On an anonymous arena (`BLOOMERY_NVTIER_MEM=anon`, the default on a card with its own memory) the host computes
+  them, and the tokens equal the all-RAM load's.
+- On a pinned arena (`pinned`, the default on an integrated GPU such as DGX Spark's GB10) GLM-5.3's decode steps
+  compute them on the card from the arena's slots and add their sum to the host's. The card quantizes the
+  activation as q8_1 (an f32 scale per 128 values, where the host's K-quant dots take Q8_2X4 with a bf16 scale per
+  32) and sums in its own order, so the tokens can part from the all-RAM load's after some steps. A prompt's batch,
+  a load whose residency machine runs, and the other families stay with the host. The `nvtier` record's `card_leg`
+  says `on` or why the card does not compute them.
+
+The load prints an `nvtier` record (the arena's budget, the paged bytes and its
 counters; a load that attached no tier prints none). Limits of a paged load, as the code has them:
 - Qwen3.8 steps one column on a paged plan. With no `--parallel` it serves one slot and the MTP draft stays off; a set
   `--parallel` is served as asked, and one the room's floor cannot hold is refused by name. A set `BLOOMERY_DRAFT=mtp`
