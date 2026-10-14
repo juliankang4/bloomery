@@ -74,7 +74,7 @@ mod gate {
         max_rel_err, open_split, ref_ints, ref_tensor_logical_in, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
-    use gguf::quant::{GgmlType, Q8Block, dequant_row, half_to_f32};
+    use gguf::quant::{GgmlType, dequant_row};
     use gguf::{Split, TensorInfo, Value};
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
@@ -233,7 +233,7 @@ mod gate {
     /// `engram_wkv` twice, in the file's type: resident as the loader packs
     /// it (`upload_file_tensor`) and on the host as both rules read it.
     enum Wkv<'a> {
-        /// The q8f32 planes, and the file's bytes for [`project`].
+        /// The q8f32 planes, and the file's bytes for [`ik_q8_2::project`].
         Q8 {
             qs: DeviceTensor<u32>,
             d: DeviceTensor<u16>,
@@ -964,9 +964,10 @@ mod gate {
     }
 
     /// Each token's `engram_kv` row (`width` values of `kv`) against ik's
-    /// projection of the token's rows: under Q8_0 within [`ik_gemv_rel`] of
-    /// the q8_2 dot's exact value, under Q3_K equal to [`dot_q3k`]'s value
-    /// bit for bit. The printed field and whether it holds.
+    /// projection of the token's rows: under Q8_0 within
+    /// [`ik_q8_2::ik_gemv_rel`] of the q8_2 dot's exact value, under Q3_K
+    /// equal to [`dot_q3k`]'s value bit for bit. The printed field and
+    /// whether it holds.
     ///
     /// [`dot_q3k`]: act_rule::dot_q3k
     fn ik_wkv(projs: &[TokProj], kv: &[f32], width: usize, k_in: usize) -> (String, bool) {
@@ -976,7 +977,7 @@ mod gate {
                 TokProj::Q8(p) => {
                     for ((&got, &sim), &mag) in dumped.iter().zip(&p.ik).zip(&p.abs_ik) {
                         let dist = (f64::from(got) - sim).abs();
-                        let bound = ik_gemv_rel(k_in) * mag;
+                        let bound = ik_q8_2::ik_gemv_rel(k_in) * mag;
                         let ratio = if dist == 0.0 {
                             0.0
                         } else if bound > 0.0 {
@@ -1310,73 +1311,11 @@ mod gate {
 
     // --------------------------------------------------- 3. the chain, m = 1
 
-    /// The projection of one token's gathered rows by `engram_wkv` (file
-    /// bytes), per output row: the f64 dot with the f32 activations (our
-    /// rule's exact value), with ik's q8_2 activations (the integer block
-    /// dots times both scales — ik's exact value), and the magnitudes
-    /// `Σ|w·x|` and `Σ_b|d_w·d_x·isum_b|` the accumulation bounds scale.
-    struct Proj {
-        ours: Vec<f64>,
-        ik: Vec<f64>,
-        abs_ours: Vec<f64>,
-        abs_ik: Vec<f64>,
-    }
-
-    /// [`Proj`] of `x` through the q8_0 weight `w` of `rows` rows, the rows
-    /// split across the host's threads.
-    fn project(w: &[u8], rows: usize, x: &[f32]) -> Proj {
-        let rb = x.len() / QK * 34;
-        let (qx, dx) = ik_q8_2::quantize(x);
-        let mut p = Proj {
-            ours: vec![0.0; rows],
-            ik: vec![0.0; rows],
-            abs_ours: vec![0.0; rows],
-            abs_ik: vec![0.0; rows],
-        };
-        let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-        let chunk = rows.div_ceil(threads);
-        std::thread::scope(|sc| {
-            let parts = p
-                .ours
-                .chunks_mut(chunk)
-                .zip(p.ik.chunks_mut(chunk))
-                .zip(p.abs_ours.chunks_mut(chunk))
-                .zip(p.abs_ik.chunks_mut(chunk))
-                .enumerate();
-            for (ci, (((ours, ik), ao), ai)) in parts {
-                let (qx, dx) = (&qx, &dx);
-                sc.spawn(move || {
-                    let outs = ours.iter_mut().zip(ik).zip(ao).zip(ai);
-                    for (j, (((o, i), a), b)) in outs.enumerate() {
-                        let row = &w[(ci * chunk + j) * rb..(ci * chunk + j + 1) * rb];
-                        let (mut so, mut si, mut sao, mut sai) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-                        let blocks = row.as_chunks::<34>().0.iter().zip(x.as_chunks::<QK>().0);
-                        for (bi, (blk, xb)) in blocks.enumerate() {
-                            let qb = Q8Block::from_bytes(blk);
-                            let dw = half_to_f32(qb.d);
-                            for (&qw, &xv) in qb.q.iter().zip(xb) {
-                                let t = f64::from(f32::from(qw) * dw) * f64::from(xv);
-                                so += t;
-                                sao += t.abs();
-                            }
-                            let isum = ik_q8_2::block_sum(&qb, &qx[bi * QK..(bi + 1) * QK]);
-                            let t = f64::from(dw) * f64::from(dx[bi]) * f64::from(isum);
-                            si += t;
-                            sai += t.abs();
-                        }
-                        (*o, *i, *a, *b) = (so, si, sao, sai);
-                    }
-                });
-            }
-        });
-        p
-    }
-
     /// One token's projection by `engram_wkv` on the host, by the weight's
     /// type.
     enum TokProj {
-        /// [`Proj`].
-        Q8(Proj),
+        /// [`ik_q8_2::Proj`].
+        Q8(ik_q8_2::Proj),
         /// Per row, both rules' exact values and ik's dot band
         /// (`act_rule::q3k_rows`), and ik's dot itself
         /// (`act_rule::ik_q3k_rows`).
@@ -1388,7 +1327,7 @@ mod gate {
         /// rows.
         fn of(w: &Wkv, rows: usize, x: &[f32]) -> TokProj {
             match w {
-                Wkv::Q8 { bytes, .. } => TokProj::Q8(project(bytes, rows, x)),
+                Wkv::Q8 { bytes, .. } => TokProj::Q8(ik_q8_2::project(bytes, rows, x)),
                 Wkv::Q3 { host, .. } => TokProj::Q3 {
                     rows: act_rule::q3k_rows(host, x, rows),
                     ik: act_rule::ik_q3k_rows(&host.bytes, host.k, host.rows, x, rows),
@@ -1406,41 +1345,15 @@ mod gate {
         }
 
         /// Per row, how far our kv may sit from ik's, `k_in` values a row.
-        /// Q8_0: the two exact values' distance plus both sides'
-        /// accumulation bounds and the f64 sums' own error. Q3_K:
+        /// Q8_0: [`ik_q8_2::Proj::gap_bound`]. Q3_K:
         /// `act_rule::q3k_shared_input_bound`, whose kernel term the gemv's
         /// `KERNEL_BAND` pin proves on the same run.
         fn gap_bound(&self, k_in: usize) -> Vec<f64> {
             match self {
-                TokProj::Q8(p) => {
-                    let f64_sum = k_in as f64 * U64;
-                    (0..p.ours.len())
-                        .map(|r| {
-                            (p.ours[r] - p.ik[r]).abs()
-                                + (ik_gemv_rel(k_in) + f64_sum) * p.abs_ik[r]
-                                + (our_gemv_rel(k_in) + f64_sum) * p.abs_ours[r]
-                        })
-                        .collect()
-                }
+                TokProj::Q8(p) => p.gap_bound(k_in),
                 TokProj::Q3 { rows, .. } => act_rule::q3k_shared_input_bound(rows, k_in),
             }
         }
-    }
-
-    /// How far ik's f32 projection sits from its exact value, relative to
-    /// `Σ_b|d_w·d_x·isum_b|`: each block term rounds at most twice (the
-    /// scales' product, then the integer sum's), and a sum of `k/32` terms in
-    /// any order rounds at most `k/32 − 1` times; two more for the margin.
-    fn ik_gemv_rel(k: usize) -> f64 {
-        (k / QK + 4) as f64 * U
-    }
-
-    /// How far our `q8_0_gemv` at m = 1 sits from its exact value, relative
-    /// to `Σ|w·x|`: each lane runs one fused multiply-add per value along
-    /// its `k/32` values (the weight `q·d` is exact in f32), then five
-    /// butterfly levels.
-    fn our_gemv_rel(k: usize) -> f64 {
-        (k / 32 + 5) as f64 * U
     }
 
     /// The chain for token `t` of the site at the decode shape: the dump's

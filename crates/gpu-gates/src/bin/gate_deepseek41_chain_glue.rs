@@ -62,6 +62,7 @@ mod gate {
     use bloomery_gpu_gates::ik_q8_2::{self, QK};
     use bloomery_gpu_gates::oracle;
     use bloomery_gpu_gates::oracle::deepseek41::{D1N, STEP4};
+    use bloomery_gpu_gates::rounding::{U, U64, gamma};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, Layout, RefManifest, RefRow, RowKind, bits_equal, checks_failed,
         max_rel_err, ref_ints, ref_model_path, ref_tensor_logical_in, ref_tensor_of_in, verdict,
@@ -69,7 +70,7 @@ mod gate {
     use bloomery_levers::ENGRAM_HELPER;
     use cuda_core::{CudaStream, DeviceBuffer, sys};
     use gguf::Split;
-    use gguf::quant::{GgmlType, Q8Block, dequant_row, half_to_f32};
+    use gguf::quant::{GgmlType, dequant_row};
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::names;
@@ -79,18 +80,6 @@ mod gate {
 
     /// The sets this gate reads: the decode steps without a selection.
     const SETS: [&str; 2] = [STEP4, D1N];
-
-    /// f32's unit roundoff, 2^-24.
-    const U: f64 = f32::EPSILON as f64 / 2.0;
-    /// f64's unit roundoff, 2^-53.
-    const U64: f64 = f64::EPSILON / 2.0;
-
-    /// `gamma_n = n u / (1 - n u)`: the relative bound on a result that went
-    /// through `n` f32 roundings in sequence.
-    fn gamma(n: usize) -> f64 {
-        let nu = n as f64 * U;
-        nu / (1.0 - nu)
-    }
 
     /// `max_rel_err`, with a non-finite value (or a length that does not
     /// match) read as an infinite distance: a pin then prints its line and
@@ -688,7 +677,7 @@ mod gate {
     /// `engram_wkv` on the host, by the file's type: each side's rule
     /// follows from it.
     enum Wkv {
-        /// The file's bytes, for [`project`].
+        /// The file's bytes, for [`ik_q8_2::project`].
         Q8(Vec<u8>),
         /// The host form of `act_rule`'s Q3_K walks.
         Q3(Q3kWeight),
@@ -761,23 +750,14 @@ mod gate {
         let rows_bit = bits_equal(&o.rows, &d.embd);
 
         // The band b4engram's chain check derives: how far our kv sits from
-        // ik's, carried through the gate. Q8_0: the two exact values' distance
-        // plus both sides' accumulation bounds and the f64 sums' own error.
+        // ik's, carried through the gate. Q8_0: ik_q8_2::Proj::gap_bound.
         // Q3_K: act_rule::q3k_shared_input_bound, whose kernel term the
         // `kv_vs_ours_rel` pin below proves on this run.
         let k_in = d.embd.len();
         let (bk, q3) = match &w.wkv {
             Wkv::Q8(bytes) => {
-                let p = project(bytes, (hc + 1) * n, &d.embd);
-                let f64_sum = k_in as f64 * U64;
-                let bk: Vec<f64> = (0..(hc + 1) * n)
-                    .map(|r| {
-                        (p.ours[r] - p.ik[r]).abs()
-                            + (ik_gemv_rel(k_in) + f64_sum) * p.abs_ik[r]
-                            + (our_gemv_rel(k_in) + f64_sum) * p.abs_ours[r]
-                    })
-                    .collect();
-                (bk, None)
+                let p = ik_q8_2::project(bytes, (hc + 1) * n, &d.embd);
+                (p.gap_bound(k_in), None)
             }
             Wkv::Q3(host) => {
                 let rows = act_rule::q3k_rows(host, &d.embd, host.rows);
@@ -926,80 +906,6 @@ mod gate {
             gate: max_gate / mag_gate,
             out: max_out / mag_out,
         }
-    }
-
-    /// The projection of one token's gathered rows by `engram_wkv` (file
-    /// bytes), per output row: the f64 dot with the f32 activations (our
-    /// rule's exact value), with ik's q8_2 activations (ik's exact value),
-    /// and the magnitudes the accumulation bounds scale
-    /// (`gate_deepseek41_engram`'s `Proj`).
-    struct Proj {
-        ours: Vec<f64>,
-        ik: Vec<f64>,
-        abs_ours: Vec<f64>,
-        abs_ik: Vec<f64>,
-    }
-
-    /// [`Proj`] of `x` through the q8_0 weight `w` of `rows` rows, the rows
-    /// split across the host's threads.
-    fn project(w: &[u8], rows: usize, x: &[f32]) -> Proj {
-        let rb = x.len() / QK * 34;
-        let (qx, dx) = ik_q8_2::quantize(x);
-        let mut p = Proj {
-            ours: vec![0.0; rows],
-            ik: vec![0.0; rows],
-            abs_ours: vec![0.0; rows],
-            abs_ik: vec![0.0; rows],
-        };
-        let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-        let chunk = rows.div_ceil(threads);
-        std::thread::scope(|sc| {
-            let parts = p
-                .ours
-                .chunks_mut(chunk)
-                .zip(p.ik.chunks_mut(chunk))
-                .zip(p.abs_ours.chunks_mut(chunk))
-                .zip(p.abs_ik.chunks_mut(chunk))
-                .enumerate();
-            for (ci, (((ours, ik), ao), ai)) in parts {
-                let (qx, dx) = (&qx, &dx);
-                sc.spawn(move || {
-                    let outs = ours.iter_mut().zip(ik).zip(ao).zip(ai);
-                    for (j, (((o, i), a), b)) in outs.enumerate() {
-                        let row = &w[(ci * chunk + j) * rb..(ci * chunk + j + 1) * rb];
-                        let (mut so, mut si, mut sao, mut sai) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-                        let blocks = row.as_chunks::<34>().0.iter().zip(x.as_chunks::<QK>().0);
-                        for (bi, (blk, xb)) in blocks.enumerate() {
-                            let qb = Q8Block::from_bytes(blk);
-                            let dw = half_to_f32(qb.d);
-                            for (&qw, &xv) in qb.q.iter().zip(xb) {
-                                let t = f64::from(f32::from(qw) * dw) * f64::from(xv);
-                                so += t;
-                                sao += t.abs();
-                            }
-                            let isum = ik_q8_2::block_sum(&qb, &qx[bi * QK..(bi + 1) * QK]);
-                            let t = f64::from(dw) * f64::from(dx[bi]) * f64::from(isum);
-                            si += t;
-                            sai += t.abs();
-                        }
-                        (*o, *i, *a, *b) = (so, si, sao, sai);
-                    }
-                });
-            }
-        });
-        p
-    }
-
-    /// ik's f32 projection's distance from its exact value, relative to
-    /// `Σ_b|d_w·d_x·isum_b|` (`gate_deepseek41_engram`'s).
-    fn ik_gemv_rel(k: usize) -> f64 {
-        (k / QK + 4) as f64 * U
-    }
-
-    /// Our `q8_0_gemv`'s at m = 1, relative to `Σ|w·x|`
-    /// (`gate_deepseek41_engram`'s).
-    fn our_gemv_rel(k: usize) -> f64 {
-        (k / 32 + 5) as f64 * U
     }
 
     // ------------------------------------------------------- (iii) the head

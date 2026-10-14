@@ -4,8 +4,11 @@
 //! (`mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, _, block_q8_2>`,
 //! `iqk_gemm_legacy_quants.cpp`). A gate that simulates ik on such a weight
 //! reads the rule here; it is transcribed from ik and calls no engine or
-//! device code.
+//! device code. [`project`] computes a weight's rows by this rule and by ours
+//! (f32 activations), both exactly, and [`Proj::gap_bound`] bounds the two
+//! apart, for the gates that check them.
 
+use crate::rounding::{U, U64};
 use gguf::quant::{Q8Block, half_to_f32};
 
 /// Values per Q8_0 and q8_2 block.
@@ -78,7 +81,7 @@ pub fn half_sum(w: &Q8Block, a: &[i8], h: usize) -> i32 {
 
 /// ik's integer dot of weight block `w` with activation codes `a`: its two
 /// [`half_sum`]s.
-pub fn block_sum(w: &Q8Block, a: &[i8]) -> i32 {
+fn block_sum(w: &Q8Block, a: &[i8]) -> i32 {
     half_sum(w, a, 0) + half_sum(w, a, 1)
 }
 
@@ -109,6 +112,102 @@ pub fn dot(blocks: &[Q8Block], xq: &[i8], xd: &[f32]) -> f32 {
         acc[3] + acc[7],
     ];
     (s[0] + s[2]) + (s[1] + s[3])
+}
+
+/// The projection of `x` by a Q8_0 weight, per output row: both rules'
+/// exact values and the magnitudes the accumulation bounds scale.
+pub struct Proj {
+    /// Our rule's exact value: the f64 dot with the f32 activations.
+    pub ours: Vec<f64>,
+    /// ik's exact value: the integer block dots with its q8_2 activations
+    /// times both scales.
+    pub ik: Vec<f64>,
+    /// `Σ|w·x|`.
+    abs_ours: Vec<f64>,
+    /// `Σ_b|d_w·d_x·isum_b|`.
+    pub abs_ik: Vec<f64>,
+}
+
+impl Proj {
+    /// Per row, how far our value may sit from ik's, `k` values a row: the
+    /// two exact values' distance plus both sides' accumulation bounds and
+    /// the f64 sums' own error.
+    pub fn gap_bound(&self, k: usize) -> Vec<f64> {
+        let f64_sum = k as f64 * U64;
+        (0..self.ours.len())
+            .map(|r| {
+                (self.ours[r] - self.ik[r]).abs()
+                    + (ik_gemv_rel(k) + f64_sum) * self.abs_ik[r]
+                    + (our_gemv_rel(k) + f64_sum) * self.abs_ours[r]
+            })
+            .collect()
+    }
+}
+
+/// How far ik's f32 projection sits from its exact value, relative to
+/// `Σ_b|d_w·d_x·isum_b|`: each block term rounds at most twice (the
+/// scales' product, then the integer sum's), and a sum of `k/32` terms in
+/// any order rounds at most `k/32 − 1` times; two more for the margin.
+pub fn ik_gemv_rel(k: usize) -> f64 {
+    (k / QK + 4) as f64 * U
+}
+
+/// How far our `q8_0_gemv` at m = 1 sits from its exact value, relative
+/// to `Σ|w·x|`: each lane runs one fused multiply-add per value along
+/// its `k/32` values (the weight `q·d` is exact in f32), then five
+/// butterfly levels.
+fn our_gemv_rel(k: usize) -> f64 {
+    (k / 32 + 5) as f64 * U
+}
+
+/// [`Proj`] of `x` through the Q8_0 weight `w` (file bytes) of `rows` rows,
+/// the rows split across the host's threads. `x` is whole blocks.
+pub fn project(w: &[u8], rows: usize, x: &[f32]) -> Proj {
+    let rb = x.len() / QK * 34;
+    let (qx, dx) = quantize(x);
+    let mut p = Proj {
+        ours: vec![0.0; rows],
+        ik: vec![0.0; rows],
+        abs_ours: vec![0.0; rows],
+        abs_ik: vec![0.0; rows],
+    };
+    let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let chunk = rows.div_ceil(threads);
+    std::thread::scope(|sc| {
+        let parts = p
+            .ours
+            .chunks_mut(chunk)
+            .zip(p.ik.chunks_mut(chunk))
+            .zip(p.abs_ours.chunks_mut(chunk))
+            .zip(p.abs_ik.chunks_mut(chunk))
+            .enumerate();
+        for (ci, (((ours, ik), ao), ai)) in parts {
+            let (qx, dx) = (&qx, &dx);
+            sc.spawn(move || {
+                let outs = ours.iter_mut().zip(ik).zip(ao).zip(ai);
+                for (j, (((o, i), a), b)) in outs.enumerate() {
+                    let row = &w[(ci * chunk + j) * rb..(ci * chunk + j + 1) * rb];
+                    let (mut so, mut si, mut sao, mut sai) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                    let blocks = row.as_chunks::<34>().0.iter().zip(x.as_chunks::<QK>().0);
+                    for (bi, (blk, xb)) in blocks.enumerate() {
+                        let qb = Q8Block::from_bytes(blk);
+                        let dw = half_to_f32(qb.d);
+                        for (&qw, &xv) in qb.q.iter().zip(xb) {
+                            let t = f64::from(f32::from(qw) * dw) * f64::from(xv);
+                            so += t;
+                            sao += t.abs();
+                        }
+                        let isum = block_sum(&qb, &qx[bi * QK..(bi + 1) * QK]);
+                        let t = f64::from(dw) * f64::from(dx[bi]) * f64::from(isum);
+                        si += t;
+                        sai += t.abs();
+                    }
+                    (*o, *i, *a, *b) = (so, si, sao, sai);
+                }
+            });
+        }
+    });
+    p
 }
 
 #[cfg(test)]
