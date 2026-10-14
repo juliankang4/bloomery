@@ -41,7 +41,8 @@
 #   (`just ptx-scan <binary>`; `--features deepseek41` for a V4.1 binary) builds all three first;
 #   with `--no-jit` it builds the binary and the extractor only.
 #   PTX_SCAN_PTXAS (default $CUDA_TOOLKIT_PATH/bin/ptxas, else /usr/local/cuda/bin/ptxas),
-#   PTX_SCAN_ARCH (default BLOOMERY_ARCH, else sm_86; sm_86 is the only arch accepted, see the blk/SM column),
+#   PTX_SCAN_ARCH (default BLOOMERY_ARCH, else sm_86; sm_86, sm_120 and sm_121, the last two with or without a or f,
+#   are the archs accepted, see the blk/SM column),
 #   PTX_SCAN_EXTRACT (default target/release/oxart_ptx) and
 #   PTX_SCAN_JIT (default oxart_jit, a target/release binary run through tools/gpu-gate.sh)
 #   override the tools.
@@ -100,7 +101,7 @@
 #   digest-unread=NAME   the extractor wrote no normalized body for these entries (`method`: it named
 #                        no digest method)
 # 2: a usage error (no binary, more than one entry substring, a flag other than --no-jit).
-# 64: an arch other than sm_86 (BLOOMERY_ARCH or PTX_SCAN_ARCH): the blk/SM column is sm_86's arithmetic.
+# 64: an arch the blk/SM column holds no limits for (BLOOMERY_ARCH or PTX_SCAN_ARCH; see the column below).
 #
 # The next four columns come from `ptxas -v` on the same PTX, not from the byte scan:
 #   regs   registers per thread ("Used N registers")
@@ -108,10 +109,14 @@
 #   spill  spill stores + spill loads, bytes, summed from the function-properties line
 #   blk/SM(static)  resident blocks per SM, derived from those three and .reqntid
 # blk/SM is `-` when the entry carries no .reqntid to size a block.
-# The occupancy arithmetic is the sm_86 column of the CUDA programming guide's technical
-# specifications: 65536 registers and 100 KB of shared memory per SM, 48 resident warps,
-# 16 resident blocks (8.0 allows 32, 8.6 does not), registers allocated 256 per warp, shared
-# memory 128 bytes per block plus a 1 KB per-block driver reservation. Static only: dynamic
+# The occupancy arithmetic takes the limits of the arch ptxas assembled for (the banner's arch=), not of
+# the card the JIT ran on: sm_86 takes compute capability 8.6's, sm_120 and sm_121 (a and f too) take
+# 12.x's. The CUDA Programming Guide's compute capability tables (v13.4.2, section 5.1, Tables 30 and
+# 31) give 65536 registers and 100 KB of shared memory per SM and 48 resident warps on both, and 16
+# resident blocks on 8.6 (8.0 allows 32), 24 on 12.x. The toolkit's cuda_occupancy.h gives the rest,
+# the same for 8.x and 12.x: registers allocated 256 per warp (cudaOccRegAllocationGranularity),
+# shared memory 128 bytes per block (cudaOccSMemAllocationGranularity), plus the driver's 1 KB
+# per-block reservation (reservedSharedMemPerBlock). Static only: dynamic
 # shared memory is a launch argument and is nowhere in the PTX, so an entry that asks for
 # some at launch is reported here as if it asked for none.
 # A spill in SASS is not a PTX local round-trip — an entry can show ld.local/st.local here and 0
@@ -178,12 +183,12 @@ case $module in
         printf "ptxas info : Compiling entry function 'q4k_gemv' for 'sm_86'\nptxas info : 4 bytes spill stores, 4 bytes spill loads\nptxas info : Used 32 registers, 256 bytes smem\n"
         printf "ptxas info : Compiling entry function 'zero_loads' for 'sm_86'\nptxas info : 0 bytes spill stores, 0 bytes spill loads\nptxas info : Used 12 registers\n" ;;
     mod2.ptx)
-        printf "ptxas info : Compiling entry function 'next_module' for 'sm_86'\nptxas info : 0 bytes spill stores, 0 bytes spill loads\nptxas info : Used 16 registers, 128 bytes smem\n" ;;
+        printf "ptxas info : Compiling entry function 'next_module' for 'sm_86'\nptxas info : 0 bytes spill stores, 0 bytes spill loads\nptxas info : Used ${PTX_FIX_REGS:-16} registers, ${PTX_FIX_SMEM:-128} bytes smem\n" ;;
 esac >&2
 ''')
     executable(tree / "tools/gpu-gate.sh", '''
 printf '# card=fixture cc=86 cuda_driver=13030\n'
-printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t0\t128\t64\n'
+printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t0\t128\t32\n'
 ''')
     (fixture / "mod1.ptx").write_text('''
 .version 8.0
@@ -229,7 +234,7 @@ printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t
 ''', encoding="utf-8")
     (fixture / "mod2.ptx").write_text('''
 .visible .entry next_module()
-.reqntid 64, 1, 1
+.reqntid 32, 1, 1
 {
     ld.global.v2.u32 {%r1, %r2}, [%rd1];
 }
@@ -274,7 +279,7 @@ printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t
     check("legacy counts, occupancy and no-jit cells preserved",
           rows["q4k_gemv"][:-3] == "128 YES 1 1 1 1 32 256 8 12 skipped(no-jit) skipped(no-jit)".split()
           and rows["zero_loads"][:-3] == "- no 0 0 0 0 12 0 0 - skipped(no-jit) skipped(no-jit)".split()
-          and rows["next_module"][:-3] == "64 no 0 0 0 0 16 128 0 16 skipped(no-jit) skipped(no-jit)".split())
+          and rows["next_module"][:-3] == "32 no 0 0 0 0 16 128 0 16 skipped(no-jit) skipped(no-jit)".split())
     check("depot-first row order and digest coverage", list(rows) == ["q4k_gemv", "next_module", "zero_loads"]
           and set(digests) == set(rows) and method == "fixture" and nojit)
     selected = scan(["gate_x", "q4k", "--no-jit"])
@@ -286,6 +291,23 @@ printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t
     check("full scan layout and JIT columns", assembled.returncode == 0 and ah == header and not an
           and ar["q4k_gemv"] == rows["q4k_gemv"][:10] + ["32", "0"] + ["7", "4", "3"]
           and ad == digests)
+    # blk/SM is column 10. next_module (one warp, 128 B) is held by the block cap alone at 16 registers, 16 on 8.6
+    # and 24 on 12.x, where the warp limit would allow 48; at 90 registers a warp takes 3072 of them in units of 256,
+    # and 65536 / 3072 holds it at 21; at 25000 B a block takes 25088 + 1024 of the 102400, and shared memory holds
+    # it at 3.
+    def occupancy(arch, regs=None, smem=None):
+        fix = {k: str(v) for k, v in (("PTX_FIX_REGS", regs), ("PTX_FIX_SMEM", smem)) if v}
+        r = scan(["--no-jit", "gate_x"], dict(PTX_SCAN_ARCH=arch, **fix))
+        if r.returncode:
+            return r.returncode, None
+        _, _, rr, _, _ = parsed(r)
+        return 0, [rr[e][9] for e in ("q4k_gemv", "next_module", "zero_loads")]
+    check("cc 12.x occupancy: the 24-block cap where 8.6 stops at 16",
+          occupancy("sm_86") == (0, ["12", "16", "-"]) and occupancy("sm_121") == (0, ["12", "24", "-"])
+          and occupancy("sm_120a") == (0, ["12", "24", "-"]) and "arch=sm_121 " in scan(["--no-jit", "gate_x"], {"PTX_SCAN_ARCH": "sm_121"}).stdout)
+    check("cc 12.x occupancy: the register allocation unit and the shared memory reservation bind",
+          occupancy("sm_121", regs=90) == (0, ["12", "21", "-"]) and occupancy("sm_121", smem=25000) == (0, ["12", "3", "-"]))
+    check("an arch with no occupancy limits is refused", occupancy("sm_90")[0] == 64 and occupancy("sm_121x")[0] == 64)
     missing = scan(["--no-jit", "gate_x", "absent"])
     check("empty filter remains a failed scan", missing.returncode == 1
           and "rows=0 scan=failed" in missing.stdout and "entry " not in missing.stdout)
@@ -343,16 +365,17 @@ if [ "${#WORDS[@]}" -gt 2 ]; then
   echo "usage: ptx-scan.sh [--no-jit] <gate_bin_name> [entry-substring]" >&2
   exit 2
 fi
-# The blk/SM column is the sm_86 limits (header) and the file holds no other arch's: a scan at another arch would print sm_86's
-# number as that arch's occupancy. Refused here and not through tools/arch.sh: tools/narrow-scan.sh ships this file alone to a
-# tree that may predate that helper.
+# The blk/SM column is one arch's limits (header): an arch with no row here would print another arch's number as its
+# occupancy. Refused here and not through tools/arch.sh: tools/narrow-scan.sh ships this file alone to a tree that may
+# predate that helper.
 # The limits, in the order the blk/SM arithmetic reads them: registers per SM, shared memory per SM (bytes), resident
 # warps per SM, resident blocks per SM, the register allocation unit per warp, the shared memory allocation unit and the
 # per-block shared memory reservation (bytes).
 case $ARCH in
   sm_86) OCC="65536 102400 48 16 256 128 1024" ;;
+  sm_120 | sm_120a | sm_120f | sm_121 | sm_121a | sm_121f) OCC="65536 102400 48 24 256 128 1024" ;;
   *)
-    echo "ptx-scan.sh: arch '$ARCH': the blk/SM column is sm_86's occupancy arithmetic and this scan holds no other arch's limits (BLOOMERY_ARCH, PTX_SCAN_ARCH)" >&2
+    echo "ptx-scan.sh: arch '$ARCH': the blk/SM column holds occupancy limits for sm_86 (cc 8.6) and sm_120/sm_121 (cc 12.x) only (BLOOMERY_ARCH, PTX_SCAN_ARCH)" >&2
     exit 64
     ;;
 esac
