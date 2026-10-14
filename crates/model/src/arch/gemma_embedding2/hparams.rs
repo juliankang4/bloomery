@@ -19,6 +19,11 @@ use crate::placement::PlacementError;
 pub use crate::arch::gemma_encoder::Attn;
 use crate::arch::gemma_encoder::encoder_keys;
 
+/// The most positions one input takes: the input length the model card
+/// names. The header's `context_length` is longer, so a consumer that
+/// bounds an input caps it here.
+pub const CARD_CTX: usize = 8192;
+
 /// The hyperparameters of one `gemma-embedding2` file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hparams {
