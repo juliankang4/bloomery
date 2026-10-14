@@ -730,7 +730,7 @@ mod gate {
             let (_n1, addr) = node1(Some(&copy))?;
             Ok(TierNode::open(addr, &open).map(drop))
         });
-        drop(std::fs::remove_dir_all(&dir));
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("remove {}: {e}", dir.display()))?;
         let r = r?;
         let ok = matches!(&r, Err(e) if e.to_string().contains("hold other bytes")
             && e.to_string().contains(&row.name));
@@ -1120,7 +1120,7 @@ mod gate {
                 pass = false;
             }
         }
-        drop(std::fs::remove_file(&out));
+        std::fs::remove_file(&out).map_err(|e| format!("remove {}: {e}", out.display()))?;
         let killed = n1.wait_within(Duration::from_secs(60))?;
         println!("node 1 ended {killed:?} (killed by node 0's lost node clause)");
 

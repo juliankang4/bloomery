@@ -490,13 +490,15 @@ fn chain_word(c: Chain) -> Result<u32, GpuError> {
 }
 
 fn chain_of(w: u32) -> Result<Chain, String> {
-    match w {
-        0 => Ok(Chain::Step),
-        1 => Ok(Chain::Pair),
-        2 => Ok(Chain::Quad),
-        COLS_WORD.. => Ok(Chain::Cols((w - COLS_WORD) as usize)),
-        _ => Err(format!("a chain word {w}")),
-    }
+    let chain = match w {
+        0 => Chain::Step,
+        1 => Chain::Pair,
+        2 => Chain::Quad,
+        COLS_WORD.. => Chain::Cols((w - COLS_WORD) as usize),
+        _ => return Err(format!("a chain word {w}")),
+    };
+    chain_slot(chain).map_err(|e| e.to_string())?;
+    Ok(chain)
 }
 
 // ---------------------------------------------------------------- errors
@@ -1431,6 +1433,13 @@ mod tests {
             assert_eq!(chain_of(chain_word(c).expect("a word")), Ok(c));
         }
         assert!(chain_of(3).is_err());
+        for c in [
+            Chain::Cols(0),
+            Chain::Cols(1),
+            Chain::Cols(model::ops::DEFER_MAX_COLS + 1),
+        ] {
+            assert!(chain_of(chain_word(c).expect("a word")).is_err());
+        }
         assert!(chain_word(Chain::Cols(usize::MAX)).is_err());
 
         let path = std::env::temp_dir().join(format!("bloomery-node-{}.gguf", std::process::id()));
