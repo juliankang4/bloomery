@@ -346,10 +346,16 @@ fi
 # The blk/SM column is the sm_86 limits (header) and the file holds no other arch's: a scan at another arch would print sm_86's
 # number as that arch's occupancy. Refused here and not through tools/arch.sh: tools/narrow-scan.sh ships this file alone to a
 # tree that may predate that helper.
-if [ "$ARCH" != sm_86 ]; then
-  echo "ptx-scan.sh: arch '$ARCH': the blk/SM column is sm_86's occupancy arithmetic and this scan holds no other arch's limits (BLOOMERY_ARCH, PTX_SCAN_ARCH)" >&2
-  exit 64
-fi
+# The limits, in the order the blk/SM arithmetic reads them: registers per SM, shared memory per SM (bytes), resident
+# warps per SM, resident blocks per SM, the register allocation unit per warp, the shared memory allocation unit and the
+# per-block shared memory reservation (bytes).
+case $ARCH in
+  sm_86) OCC="65536 102400 48 16 256 128 1024" ;;
+  *)
+    echo "ptx-scan.sh: arch '$ARCH': the blk/SM column is sm_86's occupancy arithmetic and this scan holds no other arch's limits (BLOOMERY_ARCH, PTX_SCAN_ARCH)" >&2
+    exit 64
+    ;;
+esac
 BIN=target/release/$NAME
 # A failed scan prints its banner and no rows: two failed scans must never diff as two equal tables.
 fail() { # fail <banner fields...>
@@ -461,8 +467,9 @@ UNREAD=$MODS/unread
 JITUNREAD=$MODS/jitunread
 CALLS=$MODS/calls
 if ! LC_ALL=C awk -v filter="$FILTER" -v tbl="$TBL" -v unread="$UNREAD" -v jit="$JITTBL" \
-  -v jitunread="$JITUNREAD" -v callsf="$CALLS" -v nojit="$NOJIT" '
+  -v jitunread="$JITUNREAD" -v callsf="$CALLS" -v nojit="$NOJIT" -v occ="$OCC" '
 BEGIN {
+  split(occ, L, " ")
   # A skipped cell is a word, not a number: the JIT columns widen to hold it.
   fmt = "%d\t%-28s %8s %6s %9d %9d %6d %8d %6s %6s %6s %14s " (nojit ? "%15s %15s" : "%8s %9s") " %16d %12d %12d\n"
   while ((getline line < tbl) > 0) {
@@ -475,21 +482,21 @@ BEGIN {
   }
   close(jit)
 }
-# Resident blocks per SM on sm_86 from the static resources alone; see the header comment
-# for the constants and for what "static" leaves out.
+# Resident blocks per SM from the static resources alone, under the limits L (OCC, by arch); see the header
+# comment for the constants and for what "static" leaves out.
 function blocks(ntid, regs, smem,   wpb, rpw, lr, lw, ls, b) {
   if (ntid == "" || regs == "") return "-"
   wpb = int((ntid + 31) / 32)
-  if (wpb < 1 || wpb > 48) return "-"
+  if (wpb < 1 || wpb > L[3]) return "-"
   if (regs < 1) regs = 1
-  rpw = int((regs * 32 + 255) / 256) * 256
-  lr = int(65536 / (rpw * wpb))
-  lw = int(48 / wpb)
-  ls = int(102400 / (int((smem + 127) / 128) * 128 + 1024))
+  rpw = int((regs * 32 + L[5] - 1) / L[5]) * L[5]
+  lr = int(L[1] / (rpw * wpb))
+  lw = int(L[3] / wpb)
+  ls = int(L[2] / (int((smem + L[6] - 1) / L[6]) * L[6] + L[7]))
   b = lr
   if (lw < b) b = lw
   if (ls < b) b = ls
-  if (16 < b) b = 16
+  if (L[4] < b) b = L[4]
   return b
 }
 function flush(   have, hj) {
