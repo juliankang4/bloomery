@@ -924,7 +924,15 @@ fn nic_of(shape: Shape, owned: &[u64], step_ns: u64, s1: u64) -> u128 {
 /// and node 0's prompt share is 4/7, past the line. The decode line reads
 /// the exact step: the same split of ids of 666,666,664 B read at 10¹⁰ B/s,
 /// a NIC of 16 B/s and λ 2,000 ps take a step of 333,333,333,333⅓ ps, twice
-/// node 0's NIC time of 166,666,666,666⅔ ps, so on the line.
+/// node 0's NIC time of 166,666,666,666⅔ ps, so on the line. Paged, each
+/// window's read and fill round down once, together: forty ids of
+/// 649,500,000 B at top-k 1 read at 10¹⁹ B/s on two nodes of one id's room
+/// each, at a hit rate of 999 ‰ and a miss's fill of 1,000 ps, split
+/// [20, 20], take a step of 325.7 ps that reads 324 ps (a read of 64.95 ps
+/// and a fill of 19/20 ps a window). A row of 647 values at 8 × 10¹² B/s
+/// gives node 0 a NIC time of 161.75 ps, half of 323.5 ps, 2.2 ps under the
+/// step and so past the 2 ps a one-layer step can read low: no node is
+/// named.
 #[test]
 fn nic_not_max() {
     for rate in PROMPT_RATES {
@@ -1033,6 +1041,28 @@ fn nic_not_max() {
             p.per_node[0].nic_permille
         ),
         (None, 500)
+    );
+    let id = 649_500_000;
+    let model = tiny(40, 1, id);
+    let link = LinkCost { round_trip_ns: 0 };
+    let mut nodes = spark_nodes(2, 1, Fabric::Pair { link });
+    (nodes.read, nodes.nic, nodes.ruler_permille) =
+        (10_000_000_000_000_000_000, 8_000_000_000_000, 1);
+    let machines = with_room(&model, id, &[1, 1]);
+    let budgets = budgets_on(&model, &mut nodes, &machines);
+    let terms = terms_of(&model, &machines[0], 647);
+    let paged = Workload {
+        prompt_rate: 1,
+        whole: false,
+        fills: Some(Fills {
+            hit_permille: 999,
+            fill_ns: 1,
+        }),
+    };
+    let plan = plan_nodes(&nodes, &terms, &budgets, paged).expect("two nodes");
+    assert_eq!(
+        (plan.owned(), plan.nic_bound().expect("a prediction")),
+        (&[20, 20][..], None)
     );
 }
 
