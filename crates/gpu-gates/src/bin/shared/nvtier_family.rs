@@ -483,6 +483,10 @@ impl Ran {
 
 /// The arm `arm` planned, loaded, run once (and, where its card leg is `on`, once more eagerly) and torn down.
 fn arm_run<F: Family>(f: &F, name: &str, arm: Arm, plan: PlanFacts) -> Result<Ran, GateError> {
+    record::require(
+        record::groups::nvtier_family::ARM_RUN,
+        "nvtier_family::arm_run",
+    );
     let mut s = f.load(arm, false)?;
     let tier = f.tier(&s)?;
     let before = tier.as_ref().map(|t| t.stats());
@@ -535,6 +539,10 @@ struct LegFacts {
 impl LegFacts {
     /// The facts as the child's reply record, [`LegFacts::parse`]'s input.
     fn print(&self) {
+        record::require(
+            record::groups::nvtier_family::ARM,
+            "nvtier_family::LegFacts::print",
+        );
         let mut r = record::Record::new(&record::NVTIER_ARM)
             .w("leg", self.leg.word())
             .u("claims", self.claims)
