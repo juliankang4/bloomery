@@ -143,6 +143,7 @@ dependencies = [
  "cuda-device",
  "cuda-host",
  "indexmap",
+ "memmap2",
 ]
 
 [[package]]
