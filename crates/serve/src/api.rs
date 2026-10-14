@@ -67,6 +67,7 @@ use jinja::{ChatTemplate, TemplateError};
 use serde_json::{Map, Value, json};
 
 use crate::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
+use crate::embed::Embed;
 use crate::engine::{
     DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps, SamplerFactory,
     SamplingParams, StateError, Tokenizer,
@@ -89,6 +90,10 @@ use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
 /// own steps.
 #[path = "anthropic.rs"]
 mod anthropic;
+/// The embeddings endpoints over the side model, a child of this module so
+/// they read a prompt as the completion path does.
+#[path = "embeddings.rs"]
+mod embeddings;
 /// Per-token log-probabilities, which the generation loop collects and the
 /// completion and chat answers render.
 #[path = "logprobs.rs"]
@@ -360,6 +365,7 @@ impl Server {
             engine_props,
             media,
             slot_save_path: config.slot_save_path,
+            side: None,
             api_keys: config.api_keys,
             info,
             start_unix: unix_now(),
@@ -375,6 +381,17 @@ impl Server {
     /// The bound address (the real port when bound to port 0).
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// The server with `embed` beside its engine: the embeddings routes'
+    /// model ([`crate::embed`]), listed second in `/v1/models`. Its facts are
+    /// read here, once.
+    #[must_use]
+    pub fn with_side(mut self, embed: Box<dyn Embed>) -> Server {
+        Arc::get_mut(&mut self.state)
+            .expect("the state is shared only once the server starts")
+            .side = Some(embeddings::Side::new(embed));
+        self
     }
 
     /// Starts the engine thread and the accept loop, which serves connections,
@@ -481,6 +498,9 @@ struct State {
     media: Option<SharedMediaModel>,
     /// Where slot files live; `None` refuses slot actions.
     slot_save_path: Option<PathBuf>,
+    /// The embedding model beside the engine ([`Server::with_side`]); `None`
+    /// answers the embeddings routes with a 501.
+    side: Option<embeddings::Side>,
     /// The API keys every request is checked against before it dispatches;
     /// an empty set checks nothing.
     api_keys: ApiKeys,
@@ -492,8 +512,9 @@ pub(crate) fn relock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A caught panic's message, as the failure it ends the server with names it.
-pub(crate) fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+/// A caught panic's message, as the failure it ends the server with names it (a model run beside
+/// the engine names its own the same way).
+pub fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
     p.downcast_ref::<&str>()
         .map(|s| (*s).to_owned())
         .or_else(|| p.downcast_ref::<String>().cloned())
@@ -1213,6 +1234,8 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         ("POST", "/v1/responses/input_tokens" | "/responses/input_tokens") => {
             return responses::input_tokens(state, req, w);
         }
+        ("POST", "/v1/embeddings") => return embeddings::post(state, req, w, true),
+        ("POST", "/embeddings" | "/embedding") => return embeddings::post(state, req, w, false),
         ("POST", "/tokenize") => body(req).and_then(|b| tokenize(state, &b)),
         ("POST", "/detokenize") => body(req).and_then(|b| detokenize(state, &b)),
         ("POST", "/apply-template") => body(req).and_then(|b| apply_template(state, &b)),
@@ -1786,15 +1809,21 @@ fn health(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     send_json(w, req, status, &v)
 }
 
+/// The engine's model, then the side model when the server holds one.
 fn models(state: &State) -> Value {
-    crate::models::listing(
-        vec![Listed {
-            id: &state.alias,
-            meta: json!({ "n_vocab": state.info.n_vocab, "n_ctx_train": state.info.ctx_max }),
-            max_model_len: Some(state.info.ctx_max),
-        }],
-        state.start_unix,
-    )
+    let mut models = vec![Listed {
+        id: &state.alias,
+        meta: json!({ "n_vocab": state.info.n_vocab, "n_ctx_train": state.info.ctx_max }),
+        max_model_len: Some(state.info.ctx_max),
+    }];
+    if let Some(side) = &state.side {
+        models.push(Listed {
+            id: &side.name,
+            meta: json!({ "n_ctx": side.ctx, "n_embd": side.width() }),
+            max_model_len: Some(side.ctx),
+        });
+    }
+    crate::models::listing(models, state.start_unix)
 }
 
 fn props(state: &State) -> Value {
@@ -2194,9 +2223,9 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
 // ---------------------------------------------------------------- tokenizer endpoints
 
 /// `/tokenize`. `content` is a string or an array of strings and token ids,
-/// read as a `/completion` prompt is ([`prompt_ids`]); `add_special` puts the
-/// tokenizer's BOS before it where the tokenizer adds one and it starts with
-/// text, as llama-server's `tokenize_mixed`. An absent `content` is a 400
+/// read as a `/completion` prompt is ([`prompt_ids`]); `add_special` gives it
+/// the tokenizer's special tokens where it starts with text, as llama-server's
+/// `tokenize_mixed`. An absent `content` is a 400
 /// naming it (llama-server answers no tokens; an undefined input is an error
 /// here), and so is any other type, `null` included.
 fn tokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
@@ -3164,8 +3193,9 @@ fn no_media() -> ApiError {
 
 /// The field `k`, a string or an array of strings and token ids, as `tok`'s token ids, as
 /// llama-server's `tokenize_mixed` reads it: each string encoded, each id checked against the
-/// vocabulary. `special` puts the vocabulary's BOS first ([`Tokenizer::add_bos`]) when the input
-/// starts with text. Any other type is a 400 naming `k` and the type it got.
+/// vocabulary. `special` gives the input's first element, when it is text, the vocabulary's
+/// special tokens: its BOS first ([`Tokenizer::add_bos`]) and its EOS after it
+/// ([`Tokenizer::add_eos`]). Any other type is a 400 naming `k` and the type it got.
 fn prompt_ids(
     tok: &dyn Tokenizer,
     k: &str,
@@ -3178,6 +3208,9 @@ fn prompt_ids(
             ids.push(tok.bos());
         }
         ids.extend(tok.encode(s));
+        if special && tok.add_eos() {
+            ids.push(tok.eos());
+        }
     };
     match v {
         Value::String(s) => text(&mut ids, s, special),

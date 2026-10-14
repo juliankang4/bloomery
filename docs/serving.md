@@ -19,6 +19,15 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **Chat token counts**: `POST /chat/completions/input_tokens` (and its `/v1/` spelling) answers
   `{"input_tokens": N}` with the same chat request's prompt ids — the chat template's render, an image as its span;
   `max_tokens` is not needed.
+- **Embeddings**: `POST /v1/embeddings` (OpenAI's shape: `encoding_format` `float` or `base64`, `dimensions`
+  for a width the model cuts its vectors to) and `/embedding` or `/embeddings` (llama-server's own array) read
+  `input`, or `content`, as llama-server does: a string, a list of ids, a list of strings and ids, or a list of
+  these, each one input; `embd_normalize` is `-1` (none), `0` (onto the int16 range), `1` (taxicab), `2`
+  (euclidean, the default) or a higher p-norm. They answer from the embedding model the server holds beside its
+  chat model, and with none a 501 `not_supported_error`. An input past the model's context is a 400
+  `exceed_context_size_error` naming both lengths. llama-server checks its physical batch first and answers an input
+  past it with a 500; this server has no batch limit there. An object input (`prompt_string`, or a `content` array
+  of parts) is a 400.
 - **Tool calls on every generative model**: DeepSeek-V4.1-Flash (DSML), GLM-5.3-Flash (its XML), Qwen3-30B
   (Hermes JSON), Qwen3.6-35B and Qwen3.8-Flash-Next (the `<function=…><parameter=…>` markup) parse into
   `tool_calls` and `tool_use` blocks, so agent clients work against each of them.

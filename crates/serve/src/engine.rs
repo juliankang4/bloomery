@@ -188,6 +188,11 @@ pub trait Tokenizer: Send + Sync {
     }
     /// Whether a text prompt on `/completion` gets a BOS prepended (GGUF `add_bos_token`).
     fn add_bos(&self) -> bool;
+    /// Whether text tokenized with the vocabulary's special tokens gets an EOS appended (GGUF
+    /// `add_eos_token`), beside the BOS [`Tokenizer::add_bos`] puts first.
+    fn add_eos(&self) -> bool {
+        false
+    }
     /// Vocabulary size, which is also the logit vector length.
     fn n_vocab(&self) -> usize;
     /// The ids that open a user (or tool) message in this vocabulary's chat

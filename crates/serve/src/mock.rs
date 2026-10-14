@@ -807,6 +807,116 @@ impl Tokenizer for BosTokenizer {
     }
 }
 
+/// [`MockTokenizer`] with a BOS and an EOS around text tokenized with its
+/// special tokens, as an embedding model's vocabulary puts them.
+#[cfg(test)]
+struct EmbedTokenizer;
+
+#[cfg(test)]
+impl Tokenizer for EmbedTokenizer {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        MockTokenizer.encode(text)
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        MockTokenizer.decode(ids)
+    }
+
+    fn decoder(&self) -> Box<dyn Decoder> {
+        MockTokenizer.decoder()
+    }
+
+    fn bos(&self) -> u32 {
+        MockTokenizer.bos()
+    }
+
+    fn eos(&self) -> u32 {
+        MockTokenizer.eos()
+    }
+
+    fn add_bos(&self) -> bool {
+        true
+    }
+
+    fn add_eos(&self) -> bool {
+        true
+    }
+
+    fn n_vocab(&self) -> usize {
+        MockTokenizer.n_vocab()
+    }
+}
+
+/// How [`MockEmbed`] fails a pass.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MockFail {
+    Error,
+    Panic,
+    Short,
+    Nan,
+}
+
+/// The ids of each pass a [`MockEmbed`] ran, in order.
+#[cfg(test)]
+pub(crate) type Passes = Arc<Mutex<Vec<Vec<u32>>>>;
+
+/// An embedding model for the embeddings routes' tests: [`EmbedTokenizer`]'s
+/// vocabulary and a four-value fixture (`[n_ids, 1, 0, -n_ids]`) cut to two
+/// or four. Each pass's ids are logged in `calls`; `fail` returns a defect
+/// on the pass whose ids hold its id.
+#[cfg(test)]
+pub(crate) struct MockEmbed {
+    pub(crate) ctx: usize,
+    pub(crate) fail: Option<(u32, MockFail)>,
+    pub(crate) calls: Passes,
+}
+
+#[cfg(test)]
+impl MockEmbed {
+    pub(crate) fn new(ctx: usize) -> MockEmbed {
+        MockEmbed {
+            ctx,
+            fail: None,
+            calls: Arc::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl crate::embed::Embed for MockEmbed {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        Arc::new(EmbedTokenizer)
+    }
+
+    fn name(&self) -> String {
+        "mock-embd".to_owned()
+    }
+
+    fn ctx(&self) -> usize {
+        self.ctx
+    }
+
+    fn dims(&self) -> Vec<usize> {
+        vec![2, 4]
+    }
+
+    fn embed(&mut self, ids: &[u32]) -> Result<Vec<f32>, crate::embed::EmbedError> {
+        self.calls.lock().expect("calls").push(ids.to_vec());
+        match self.fail {
+            Some((id, MockFail::Error)) if ids.contains(&id) => {
+                return Err(crate::embed::EmbedError("the mock failed".into()));
+            }
+            Some((id, MockFail::Panic)) if ids.contains(&id) => panic!("the mock panicked"),
+            Some((id, MockFail::Short)) if ids.contains(&id) => return Ok(vec![1.0; 3]),
+            Some((id, MockFail::Nan)) if ids.contains(&id) => return Ok(vec![f32::NAN; 4]),
+            _ => {}
+        }
+        let n = ids.len() as f32;
+        Ok(vec![n, 1.0, 0.0, -n])
+    }
+}
+
 /// The media mock's placeholder text: one more special of [`MediaTokenizer`].
 pub const IMAGE_SPECIAL: &str = "<｜image｜>";
 

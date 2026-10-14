@@ -6,7 +6,8 @@
 //! completion shape on the completion path), `POST /chat/completions/input_tokens`
 //! and `POST /v1/chat/completions/input_tokens` (the chat prompt's id count),
 //! `POST /tokenize`,
-//! `POST /detokenize`, `POST /apply-template`, `GET /v1/models`, `GET /health`,
+//! `POST /detokenize`, `POST /apply-template`, `POST /v1/embeddings`, `POST /embeddings` and
+//! `POST /embedding` (an [`embed::Embed`] beside the engine), `GET /v1/models`, `GET /health`,
 //! `GET /props`, `GET /slots`, `POST /slots/{id}?action=save|restore|erase`,
 //! `GET /metrics`, `POST /residency/reset` and `POST /shutdown` (bloomery's
 //! own; the shutdown is the orderly stop, accepted from a loopback peer
@@ -21,6 +22,7 @@
 mod api;
 pub mod decide;
 pub mod dsml;
+pub mod embed;
 pub mod engine;
 pub mod flag;
 mod genloop;
@@ -44,7 +46,7 @@ mod worker;
 
 pub use api::{
     COMMIT, EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE, MAX_CONNECTIONS, ServeError, Server,
-    ServerConfig, VERSION,
+    ServerConfig, VERSION, panic_text,
 };
 pub use engine::{
     CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine, EngineError, EngineProps, Flight,

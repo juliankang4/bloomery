@@ -153,6 +153,10 @@ impl Tokenizer for Vocab {
         self.tok.add_bos()
     }
 
+    fn add_eos(&self) -> bool {
+        self.tok.add_eos()
+    }
+
     fn n_vocab(&self) -> usize {
         self.tok.n_vocab()
     }
