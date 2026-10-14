@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Decode and prompt rate of any model through `bloomery-serve`, one server an arm and a round, under the timing
-# lease (runs on the box).
+# lease (runs on the box, or on a contributor's machine under tools/box.sh's local mode).
 #
 #   BLOOMERY_MODEL=mimo2 just depth-serve <tree>:<D> [<tree>:<D> | env=K=V[,K=V]:<tree>:<D>] ...
 #   BLOOMERY_MODEL=mimo2 BLOOMERY_BOX_ENV='BLOOMERY_DRY=1' just depth-serve bloomery-base:4032 bloomery-r5c:4032
@@ -67,6 +67,11 @@
 # another port or ctx, or a request that fails (no timings among them). Contention is the lease's and the guards'
 # (rc 75). BLOOMERY_DRY=1 prints the plan (arms, order, commands, predicted wall) and the binaries' state, takes no
 # lease and starts nothing; the recipe builds nothing under it.
+#
+# Local mode. Under tools/box.sh's local mode (BLOOMERY_BOX_CARD=local; timing-card.sh's header has its refusals) the
+# arms time this machine's one card. Before the lease a kernel journal that does not answer, or shows a user other than
+# root no line, refuses the run (69); after every arm's server has stopped, an Xid since the last arm's check or the card
+# lost fails the arm, and a failed arm's line names them beside its own reason.
 set -uo pipefail
 __d=${BASH_SOURCE[0]%/*}
 [ "$__d" != "${BASH_SOURCE[0]}" ] || __d=.
@@ -83,7 +88,8 @@ esac
 if [ "$MODE" = selftest ]; then
   # The stub profile on any host: no tier, no card, and none of the caller's runner variables.
   unset BLOOMERY_TIER BLOOMERY_FIXTURE_VARIANT BLOOMERY_REF_MODEL BLOOMERY_REF_MODEL_PROFILE BLOOMERY_TIMING_CARDS \
-    BLOOMERY_TIMING_GPU BLOOMERY_DRY BLOOMERY_AB_ROUNDS BLOOMERY_ARM_BOUND BLOOMERY_LEASE_CARD BLOOMERY_CPU_BUSY_COMMS
+    BLOOMERY_TIMING_GPU BLOOMERY_DRY BLOOMERY_AB_ROUNDS BLOOMERY_ARM_BOUND BLOOMERY_LEASE_CARD BLOOMERY_CPU_BUSY_COMMS \
+    BLOOMERY_BOX_CARD
   BLOOMERY_MODEL=mimo2
 elif [ "$MODE" = run ] && [ -z "${BLOOMERY_MODEL:-}${BLOOMERY_REF_MODEL_PROFILE:-}" ]; then
   echo "depth-serve.sh: no model: BLOOMERY_MODEL names the profile (tools/ref/models/<name>.sh), e.g. BLOOMERY_MODEL=mimo2" >&2
@@ -95,7 +101,9 @@ LEVER_REGISTRY=$ROOT/crates/levers/src/registry.rs
 if [ "$MODE" != summary ]; then
   # shellcheck source=tools/ref/ref-paths.sh
   source "$HERE/ref-paths.sh"
-  # The timing card, the stale-binary rule, the guards and, through it, the lease and the witness block.
+  # The timing card, the stale-binary rule, the guards and, through it, the lease and the witness block; this runner
+  # has local mode (the header's Local mode).
+  TIMING_LOCAL_RUNNER=1
   # shellcheck source=tools/ref/timing-card.sh
   source "$HERE/timing-card.sh"
   # The server arms' start, request and stop (the llama-server runners' functions; the server here is bloomery-serve).
@@ -354,14 +362,17 @@ ds_print_plan() {
   fi
 }
 
-# ds_fail <round> <index> <why>: the arm's FAIL line and the server's log tail, the server stopped, exit 1.
+# ds_fail <round> <index> <why>: the server stopped, the arm's FAIL line and the server's log tail, exit 1. In local
+# mode the line also names an Xid since the last arm's check or the card lost, unless that check is the <why>.
 ds_fail() {
-  echo "FAIL r$1 ${A_LABEL[$2]} D=${A_DEP[$2]}: $3${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}" >&2
+  local why=$3
+  lcpp_srv_stop
+  [ -n "$TWOCARD_WHY" ] || timing_cards_arm "" || why="$why; $TWOCARD_WHY"
+  echo "FAIL r$1 ${A_LABEL[$2]} D=${A_DEP[$2]}: $why${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}" >&2
   if [ -r "${SRV_LOG:-}" ]; then
     echo "--- the server's log ($SRV_LOG), last 20 lines" >&2
     tail -n 20 "$SRV_LOG" >&2
   fi
-  lcpp_srv_stop
   exit 1
 }
 
@@ -405,12 +416,16 @@ ds_run_arm() {
     ds_fail "$r" "$i" "timings.predicted_per_second is '$SRV_PRED_TPS', not a rate"
   fi
   lcpp_srv_stop
+  # Local mode: an Xid since the last arm's check, or the card lost, fails the arm (timing-card.sh).
+  timing_cards_arm "" || ds_fail "$r" "$i" "$TWOCARD_WHY"
   echo "ROW r$r $label D=$dep | tg_tok/s $tg | pp_tok/s $pp | load_s $load | majflt $maj${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}" | tee -a "$ROWS_FILE"
 }
 
 # ds_main <arm>...: the run (or, under BLOOMERY_DRY, the plan).
 ds_main() {
   local i r k n v maxd need
+  # Local mode refused (timing-card.sh printed why as this file sourced it) ends the run here, dry or not.
+  [ -z "$TIMING_LOCAL" ] || [ -z "$TIMING_CARDS_WHY" ] || exit 64
   for v in $(compgen -v BLOOMERY_SERVE_); do
     ds_refuse 64 "$v is set, and nothing reads it: this runner's knobs are DEPTH_SERVE_CTX, DEPTH_SERVE_N, DEPTH_SERVE_PORT, DEPTH_SERVE_REQ_BOUND, DEPTH_SERVE_IDS and DEPTH_SERVE_LOAD_EST (a BLOOMERY_ name would have to be a row of the lever registry)"
   done
@@ -451,8 +466,10 @@ ds_main() {
   trap lcpp_srv_stop EXIT
   trap 'exit 143' TERM
   trap 'exit 130' INT
+  timing_cards_before_lease
   # ROUNDS (global above) is what lease_take checks an ab card against.
   lease_take
+  timing_cards_start
   LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/depth-serve.XXXXXX") || exit 2
   ROWS_FILE=$LOGDIR/rows.txt
   : > "$ROWS_FILE"
@@ -472,14 +489,15 @@ ds_main() {
 }
 
 # ----------------------------------------------------------------------------------------------------------------
-# `bash tools/ref/depth-serve.sh --self-test`: arm parsing, rotation, the refusals, the server stopped after each arm
-# and the tables' math, on the stub server (python3, curl, 127.0.0.1), no lease, no card, no model. Each case runs in
-# its own directory under one temporary root with its own HOME, data and TMPDIR; the stub logs its pid there, and the
-# cleanup signals only those pids. ds_main runs in a subshell with the lease, the witness block and the guards
-# replaced by markers (the real stale-binary rule, the real servers' start, request and stop stay).
+# `bash tools/ref/depth-serve.sh --self-test`: arm parsing, rotation, the refusals, the server stopped after each arm,
+# local mode's checks and the tables' math, on the stub server (python3, curl, 127.0.0.1), no card, no model. Each case
+# runs in its own directory under one temporary root with its own HOME, data and TMPDIR; the stub logs its pid there,
+# and the cleanup signals only those pids. ds_main runs in a subshell with the lease (outside the local cases, which
+# take the real one in their own lock directory), the witness block and the guards replaced by markers (the real
+# stale-binary rule, the real servers' start, request and stop stay).
 ds_selftest() {
   # T is read by the EXIT trap, after this function has returned: not local.
-  local n=0 fails=0 k C RC lever knob stub=$HERE/stub-llama-server.py
+  local n=0 fails=0 k C RC lever knob gb10 stub=$HERE/stub-llama-server.py
   command -v python3 > /dev/null || { echo "depth-serve.sh --self-test: python3 is not on PATH" >&2; exit 2; }
   T=$(mktemp -d "${TMPDIR:-/tmp}/depth-serve-self-test.XXXXXX") || exit 2
   st_cleanup() {
@@ -532,15 +550,27 @@ ds_selftest() {
   }
   st_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
   # st_run <arg>...: ds_main in a subshell, its output in $C/out and its rc in RC. Extra variables go through ST_ENV.
-  ST_ENV=() ST_PORT='' ST_BOUND=''
+  # Under ST_LOCAL the subshell sources timing-card.sh again in local mode, with $T/local's stub nvidia-smi and kernel
+  # journal first on PATH, and the lease is the real lease_take in the case's lock directory, its card check left out.
+  ST_ENV=() ST_PORT='' ST_BOUND='' ST_LOCAL=''
   st_run() {
     ( export HOME=$C/home TMPDIR=$C BLOOMERY_REF_MODEL=$C/model.gguf PATH=$C/bin:$PATH
       MODEL=$C/model.gguf BLOOMERY_DATA=$C/data
       export DEPTH_SERVE_PORT=${ST_PORT:-$(st_port)}
       # shellcheck disable=SC2163 # kv is a NAME=VALUE string
       for kv in ${ST_ENV[@]+"${ST_ENV[@]}"}; do export "$kv"; done
+      if [ -n "$ST_LOCAL" ]; then
+        export BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR=$C/locks BLOOMERY_LEASE_TRACE=$C/trace PATH=$T/local:$PATH
+        unset BLOOMERY_LEASE_LOCK BLOOMERY_LEASE_HELD
+        command -v flock > /dev/null || PATH=$HERE/card-tests/bin:$PATH
+        mkdir -p "$C/locks"
+        # shellcheck source=tools/ref/timing-card.sh
+        source "$HERE/timing-card.sh"
+        lease_card() { :; }
+      else
+        lease_take() { echo "[lease-stub] taken"; }
+      fi
       [ -z "${ST_BOUND:-}" ] || LEASE_ARM_BOUND=$ST_BOUND
-      lease_take() { echo "[lease-stub] taken"; }
       witness() { echo "[witness-stub] $1"; }
       guard_other() { :; }
       ds_guard_timing() { :; }
@@ -750,6 +780,83 @@ time.sleep(60)  # port-holder' "$ST_PORT" "$C/listener-pid" &
   wait "$holder" 2> /dev/null
   ST_PORT=
   ST_ENV=()
+
+  # --- local mode (tools/box.sh's BLOOMERY_BOX_CARD=local): $T/local's nvidia-smi lists one made-up card and answers
+  # its name, and once STUB_GONE is set no longer does; its journalctl shows a kernel line, under STUB_XID an Xid line
+  # once every server the case started has stopped, and fails under STUB_JOURNAL=fail. The box
+  # (/root/bloomery-cpu.lock) refuses local mode.
+  if [ -e /root/bloomery-cpu.lock ]; then
+    echo "skip local, local-journal, local-cards, local-xid, local-xid-failed-arm, local-gone: /root/bloomery-cpu.lock exists (the box), where local mode is refused"
+  else
+    gb10=GPU-22222222-2222-2222-2222-222222222222
+    mkdir -p "$T/local"
+    cat > "$T/local/nvidia-smi" << SMI
+#!/bin/sh
+case "\$*" in
+  *--query-gpu=uuid\\ *) echo $gb10 ;;
+  *--query-gpu=name\\ *)
+    [ -z "\$STUB_GONE" ] || { echo 'GPU is lost (stub)' >&2; exit 15; }
+    echo 'NVIDIA GB10 (stub)'
+    ;;
+esac
+SMI
+    cat > "$T/local/journalctl" << 'JCTL'
+#!/bin/sh
+[ "$STUB_JOURNAL" != fail ] || { echo 'journalctl: the stub fails' >&2; exit 1; }
+echo '1790428800.000000 ws kernel: Linux version (stub)'
+[ -n "$STUB_XID" ] || exit 0
+if [ -r "$TMPDIR/stub-srv-pids" ]; then
+  while read -r p; do ! kill -0 "$p" 2> /dev/null || exit 0; done < "$TMPDIR/stub-srv-pids"
+fi
+echo '1790428806.570394 ws kernel: NVRM: Xid (PCI:000f:01:00): 13, pid=4242, name=bloomery-serve, Graphics Exception'
+JCTL
+    chmod +x "$T/local/nvidia-smi" "$T/local/journalctl"
+    ST_LOCAL=1
+    st_case local
+    st_tree a 20
+    ST_ENV=(BLOOMERY_AB_ROUNDS=1)
+    st_run a:6
+    st_check local 0 "[timing-card] Xid reader: journalctl -k" "[lease] held by pid" "[timing-card] Xid count from @" \
+      "timing_gpu=$gb10 other_gpu= CUDA_VISIBLE_DEVICES=$gb10 " "ROW r1 a D=6 | tg_tok/s 20.00"
+    st_absent local-refuses-nothing "refused"
+    st_case local-journal
+    st_tree a 20
+    ST_ENV=(BLOOMERY_AB_ROUNDS=1 STUB_JOURNAL=fail)
+    st_run a:6
+    st_check local-journal 69 "depth-serve.sh: refused before the lease: journalctl -k does not answer (rc 1)"
+    st_absent local-journal-takes-no-lease "[lease]"
+    st_case local-cards
+    st_tree a 20
+    ST_ENV=(BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_CARDS=a6000+3090 STUB_JOURNAL=fail)
+    st_run a:6
+    st_check local-cards 64 "[timing-card] refused: BLOOMERY_TIMING_CARDS=a6000+3090 and BLOOMERY_BOX_CARD=local"
+    st_absent local-cards-before-the-journal "journalctl" "[lease]"
+    ST_ENV=(BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_CARDS=a6000+3090 BLOOMERY_DRY=1)
+    st_run a:6
+    st_check local-cards-dry 64 "[timing-card] refused: BLOOMERY_TIMING_CARDS=a6000+3090 and BLOOMERY_BOX_CARD=local"
+    st_absent local-cards-dry-no-plan "[plan]"
+    st_case local-xid
+    st_tree a 20
+    ST_ENV=(BLOOMERY_AB_ROUNDS=1 STUB_XID=1)
+    st_run a:6
+    st_check local-xid 1 "FAIL r1 a D=6: 1 NVRM Xid line(s) since the last arm's check (1 since the lease was taken); last: 1790428806.570394 ws kernel: NVRM: Xid"
+    st_absent local-xid-no-row "ROW "
+    st_servers local-xid-server-stopped 1
+    st_case local-xid-failed-arm
+    st_tree nt 20 STUB_SRV_NOTIMINGS=1
+    ST_ENV=(BLOOMERY_AB_ROUNDS=1 STUB_XID=1)
+    st_run nt:6
+    st_check local-xid-failed-arm 1 "FAIL r1 nt D=6: no timings in the /completion response" \
+      "; 1 NVRM Xid line(s) since the last arm's check (1 since the lease was taken)"
+    st_case local-gone
+    st_tree a 20
+    ST_ENV=(BLOOMERY_AB_ROUNDS=1 STUB_GONE=1)
+    st_run a:6
+    st_check local-gone 1 "FAIL r1 a D=6: the timing card ($gb10) does not answer nvidia-smi (rc 15)"
+    [ "$(grep -o 'does not answer nvidia-smi' "$C/out" | wc -l | tr -d ' ')" = 1 ] && ok local-gone-named-once || bad local-gone-named-once "the lost card is not named exactly once"
+    ST_LOCAL=''
+    ST_ENV=()
+  fi
 
   # --- the tables' math, against card.py's half_width and by hand (a: 100 102 98 100, b: 101 103 99 101 over 4 rounds;
   # sd 1.633 each, so h = t(0.975, 6) 2.447 x 1.633 x sqrt(2/4) = 2.826 tok/s).

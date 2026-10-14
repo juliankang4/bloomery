@@ -234,16 +234,18 @@ A fixture-tier gate reads two inputs: the family's fixture and the `fx_` referen
 
 ## 5. Timing on your own card
 
-Local mode also times your card, with one runner. Under `BLOOMERY_BOX_CARD=local`, `tools/ref/timing-card.sh` times the
+Local mode also times your card, with two runners. Under `BLOOMERY_BOX_CARD=local`, `tools/ref/timing-card.sh` times the
 one card `nvidia-smi` lists, picked by UUID, or among several cards the one `BLOOMERY_TIMING_GPU` names
 ([#39](https://github.com/midagedev/bloomery/pull/39)). The lease and its trace, `bloomery-sittings.log`, sit in
 `BLOOMERY_LOCK_DIR`.
 
-- **The runner.** Only `tools/ref/depth-qwen3moe.sh` opts in, through `just depth-gpu-qwen3moe`, `depth-gpu-qwen35moe`
-  and `depth-gpu-qwen4exp`. Any other runner prints the reason and exits 64 before it takes the lease. These recipes
-  time a real model file, the profile's (`BLOOMERY_REF_MODEL` moves it, `tools/ref/ref-paths.sh`), not a fixture. The
-  reference engine arms read the profile's `IK`, `LCPP` and `MRS` trees, which you build yourself; no recipe builds
-  them.
+- **The runners.** Two runners opt in. `tools/ref/depth-qwen3moe.sh` runs through `just depth-gpu-qwen3moe`,
+  `depth-gpu-qwen35moe` and `depth-gpu-qwen4exp`. `tools/ref/depth-serve.sh` times any model's decode and prompt rate
+  through `bloomery-serve`: `BLOOMERY_MODEL=<profile> just depth-serve <tree>:<D> ...`, each arm the `bloomery-serve`
+  of `~/repo/<tree>` on the first D ids of the profile's prose corpus (the runner's header has the arms). Any other
+  runner prints the reason and exits 64 before it takes the lease. These recipes time a real model file, the profile's
+  (`BLOOMERY_REF_MODEL` moves it, `tools/ref/ref-paths.sh`), not a fixture. The reference engine arms of
+  `depth-qwen3moe.sh` read the profile's `IK`, `LCPP` and `MRS` trees, which you build yourself; no recipe builds them.
 - **The prediction card.** The lease starts a run only with a card file written before it: what the run measures, the
   band the derivation predicts and the next step for each outcome. Write it as `docs/cards/<slug>.card` in your tree
   (the format is the header of `tools/ref/card.py`; `docs/cards/example-*.card` show each kind and are refused as a
@@ -252,8 +254,8 @@ one card `nvidia-smi` lists, picked by UUID, or among several cards the one `BLO
       BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/<slug>.card' just depth-gpu-qwen3moe
 
   Without one, the lease refuses with exit 66.
-- **Placement.** Only placement `a` runs. `gate` is refused because its rows are the 3090's, and `bp` because it loads
-  two cards (`tools/ref/arm-place.sh`).
+- **Placement.** In `depth-qwen3moe.sh` (`BLOOMERY_GEN_PLACE`, an arm's `@place=`) only placement `a` runs. `gate` is
+  refused because its rows are the 3090's, and `bp` because it loads two cards (`tools/ref/arm-place.sh`).
 - **Xid.** Before the lease, the run checks that the kernel journal answers. A user outside the `adm` and
   `systemd-journal` groups gets an empty answer, and the run stops with exit 69. After each arm, an NVRM Xid or a card
   that stopped answering fails that arm.
@@ -264,7 +266,7 @@ one card `nvidia-smi` lists, picked by UUID, or among several cards the one `BLO
   box; your machine's spread is its own. An A/A arm, the same binary twice, shows it, and `AGENTS.md` asks for one
   under any claim below 1 %.
 
-A number from this runner is evidence for your pull request on your card when it carries what `CONTRIBUTING.md` lists
+A number from these runners is evidence for your pull request on your card when it carries what `CONTRIBUTING.md` lists
 under "Numbers carry their conditions". It can be published in a table of its own for that card; a table never mixes
 cards.
 

@@ -30,8 +30,8 @@
 # lease was taken.
 #
 # Local mode (tools/box.sh's BLOOMERY_BOX_LOCAL=1, which passes BLOOMERY_BOX_CARD=local): a contributor's
-# machine times its own card, under the lease in BLOOMERY_LOCK_DIR, in a runner that opts in
-# (TIMING_LOCAL_RUNNER=1 before it sources this file: depth-qwen3moe.sh). The timing card is the one card
+# machine times its own card, under the lease in BLOOMERY_LOCK_DIR, in a runner that opts in (TIMING_LOCAL_RUNNER=1
+# before it sources this file: depth-qwen3moe.sh, depth-serve.sh). The timing card is the one card
 # nvidia-smi lists by UUID, or among several the one BLOOMERY_TIMING_GPU names, and CUDA_VISIBLE_DEVICES is
 # that UUID, over the caller's that box.sh's local mode passes on; no other card is watched (OTHER_GPU
 # empty) and there is no two-card mode. The run is refused (TIMING_CARDS_WHY, so lease_take ends it at 64)

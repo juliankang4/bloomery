@@ -2048,8 +2048,9 @@ depth-gpu-qwen4exp *ARMS:
 depth-gpu-glm5next *ARMS:
     BLOOMERY_MODEL=glm5next ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision --release --bin generate_glm5next; fi; } && bash tools/ref/depth-glm5next.sh {{ARMS}}'
 
-# Any model's decode and prompt rate through `bloomery-serve`, one fresh server an arm and a round (A6000, one lease,
-# lead-only): `<tree>:<D>` is ~/repo/<tree>'s bloomery-serve on the first D ids of the model's prose corpus, `env=K=V,K=V:<tree>:<D>`
+# Any model's decode and prompt rate through `bloomery-serve`, one fresh server an arm and a round (A6000, or this
+# machine's card under tools/box.sh's local mode; one lease, lead-only): `<tree>:<D>` is ~/repo/<tree>'s bloomery-serve
+# on the first D ids of the model's prose corpus, `env=K=V,K=V:<tree>:<D>`
 # sets levers for that arm's server only, the arms rotate every round (BLOOMERY_AB_ROUNDS, default 4). Rows: tg and pp tok/s
 # from the server's own `timings`, the load seconds and the major faults; then per arm the mean and, against the first arm of
 # its D, the difference with its 95 % interval. BLOOMERY_MODEL names the profile (tools/ref/models/<name>.sh) and is required.

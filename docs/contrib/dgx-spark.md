@@ -177,12 +177,13 @@ shard 1 with the sha256 pinned as `FIXTURE_SHA256`. The generator copies the sou
 (`ref-paths.sh:33-35`), so the fixture gates run the **host tier**: `qdot`, the CPU attention, the card/host protocol. A
 Spark contributor therefore needs design S for `qdot` at P1 (scalar mirrors, correct bits, slow), not just design R.
 
-**Timing.** Only `tools/ref/depth-qwen3moe.sh` opts in to the timing mode today (`TIMING_LOCAL_RUNNER=1`,
-`tools/ref/timing-card.sh:34`); another runner refuses `BLOOMERY_BOX_CARD=local`. On GB10 the witness reads
-`power.limit` as `[N/A]` and `scaling_cur_freq` from `cppc_cpufreq` `[#13]`. The Spark's own ruler comes from an A/A of
-one binary against itself, six rounds a sitting: decode 0.9987 ± 0.0065 at depth 6 and 1.0026 ± 0.0063 at depth 512,
-prefill 0.9971 ± 0.0024 at P = 512 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)).
-A reference engine's arm in the same lease is a build the contributor makes for aarch64; no recipe makes it.
+**Timing.** Two runners opt in to the timing mode today, `tools/ref/depth-qwen3moe.sh` and `tools/ref/depth-serve.sh`
+(`TIMING_LOCAL_RUNNER=1`, `tools/ref/timing-card.sh:34`); another runner refuses `BLOOMERY_BOX_CARD=local`. On GB10 the
+witness reads `power.limit` as `[N/A]` and `scaling_cur_freq` from `cppc_cpufreq` `[#13]`. The Spark's own ruler comes
+from an A/A of one binary against itself, six rounds a sitting: decode 0.9987 ± 0.0065 at depth 6 and 1.0026 ± 0.0063 at
+depth 512, prefill 0.9971 ± 0.0024 at P = 512
+([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)). A reference engine's arm in the same
+lease is a build the contributor makes for aarch64; no recipe makes it.
 
 **Evidence.** A Spark number carries CONTRIBUTING.md's evidence list and `tok/s @ n=N, depth D, card` (`AGENTS.md`). It
 decides a pull request on the Spark, and it can be published in the Spark's own table with the machine named; a table
