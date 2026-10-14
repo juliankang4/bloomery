@@ -191,6 +191,20 @@ blk_boxtracks() {
   fi
   echo "${bt##*$'\n'}"
 }
+# blk_scancheck CHECKER: tools/check-CHECKER.sh --self-test; its last line, or its full output and a named error.
+blk_scancheck() {
+  local checker=$1 out
+  if ! out=$(bash "$(dirname "$0")/check-$checker.sh" --self-test 2>&1); then
+    printf '%s\n' "$out" >&2
+    echo "check-recipes: the check-$checker self-test failed" >&2
+    return 1
+  fi
+  printf '%s\n' "${out##*$'\n'}"
+}
+# check-unsafe.sh counts the crates' unsafe lines against their pins: a crate directory or source file it cannot list
+# or read ends the check with 70. That refusal is tested here on missing paths and on a crate in a temporary directory
+# (a build.rs that is a link, and a broken one), no tree walk.
+blk_unsafecount() { blk_scancheck unsafe; }
 # load-groups.sh decides which arms of a depth runner share one load, and their order: its grouping and
 # rotation are tested on fixed keys, and under bash 4.1 or later its idle bound on a stalled process.
 blk_loadgroups() {
@@ -974,7 +988,7 @@ proc_leg_gpu() {
 proc_leg
 unset CPU_GUARD_PROC_LEG
 
-BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
+BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount loadgroups lcppfit coldblocks leverarms slotsarm lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
   refsetpublish orphan archowner wt)
 for b in "${BLOCKS[@]}"; do
