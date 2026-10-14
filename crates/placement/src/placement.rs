@@ -3405,28 +3405,28 @@ const POOL_ROUNDS: u32 = 64;
 /// [`workstation::GRANULE`]. The card keeps each layer's id prefix, as under
 /// any budget.
 ///
-/// A plan under a given budget (`BLOOMERY_CARD_BUDGET`), a plan of a machine
-/// whose cards have memory of their own, and a shortfall past the card's
-/// whole budget are the first plan's result. A lowered budget the plan
-/// refuses for another reason, a budget that runs out, and a floor still
-/// unmet after [`POOL_ROUNDS`] rounds are refused by name
-/// ([`PlacementError::PoolBudget`]).
+/// A first plan that is not refused for the floor, a plan under a given
+/// budget (`BLOOMERY_CARD_BUDGET`), a plan of a machine whose cards have
+/// memory of their own, and a shortfall past the card's whole budget are the
+/// first plan's result. A lowered budget the plan refuses for another
+/// reason, a budget that runs out, and a floor still unmet after
+/// [`POOL_ROUNDS`] rounds are refused by name ([`PlacementError::PoolBudget`]).
 pub fn plan_in_pool<'a>(
     machine: &Machine,
     levers: &PlanLevers,
     mut make: impl FnMut(&PlanLevers) -> Result<Plan<'a>, PlacementError>,
 ) -> Result<Plan<'a>, PlacementError> {
     let first = make(levers);
+    let mut short = match &first {
+        Err(PlacementError::HostRoomFloor { room, floor, .. }) => floor.saturating_sub(*room),
+        _ => return first,
+    };
     let (Some(_), None, Some(card)) = (
         machine.unified(),
         levers.card_budget_bytes,
         machine.cards.first(),
     ) else {
         return first;
-    };
-    let mut short = match &first {
-        Err(PlacementError::HostRoomFloor { room, floor, .. }) => floor.saturating_sub(*room),
-        _ => return first,
     };
     let mut budget = capped(card, None);
     let mut last = None;
@@ -3997,8 +3997,9 @@ mod tests {
     /// `short(budget)` B: on a unified machine with no given budget each
     /// round lowers the budget by the shortfall the last refusal named, at
     /// least a granule, and the plan that fits is marked as the pool's, so
-    /// the host's refusal does not name a lever no one set. A discrete card,
-    /// a given budget and a shortfall past the card's whole budget are the
+    /// the host's refusal does not name a lever no one set. A refusal other
+    /// than the floor (on a machine with no node too), a discrete card, a
+    /// given budget and a shortfall past the card's whole budget are the
     /// first plan's result; a lowered budget refused for another reason, a
     /// budget that runs out and a floor unmet after [`POOL_ROUNDS`] rounds
     /// are refused by name, with the rounds, the budget and the last refusal.
@@ -4092,6 +4093,14 @@ mod tests {
             assert!(matches!(got, Err(PlacementError::HostRoomFloor { .. })));
             assert_eq!(calls.len(), 1);
         }
+        // A refusal before the floor is the first plan's result, even on a
+        // machine with no node to read.
+        let none = Machine {
+            nodes: Vec::new(),
+            ..pool(true)
+        };
+        let got = plan_in_pool(&none, &unset, |_| Err(PlacementError::Nodes { nodes: 0 }));
+        assert!(matches!(got, Err(PlacementError::Nodes { nodes: 0 })));
 
         // Refused by name: another refusal of a lowered budget, a budget
         // that runs out, a floor still unmet after the rounds.
