@@ -1,7 +1,8 @@
 # bloomery — prebuilt Linux release
 
 bloomery is an LLM inference engine for one workstation: a Rust host, CUDA kernels written in Rust, and AVX2 kernels
-for the experts that stay on the CPU. Source, measurements and the full README: https://github.com/midagedev/bloomery
+for the experts that stay on the CPU (Q4_K's switch to AVX-512 VNNI at run time on a CPU that has it). Source,
+measurements and the full README: https://github.com/midagedev/bloomery
 
 ## What is in this archive
 
@@ -11,7 +12,7 @@ for the experts that stay on the CPU. Source, measurements and the full README: 
 
 ## Requirements
 
-- Linux x86-64 with glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+). The CPU needs AVX2 and FMA (x86-64-v3).
+- Linux x86-64 with glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+). The CPU needs AVX2 and FMA (x86-64-v3); AVX-512 is optional.
 - An NVIDIA GPU of compute capability 8.6 or newer: the archive carries sm_86 PTX, which the driver compiles for the
   card on first start. Run on an RTX A6000 and an RTX 3090 (driver 615.71, Ubuntu 24.04) and, for Clef-Flash, on an
   RTX 3060 under WSL2 (Windows driver 591.86), where the answers equal the A6000's byte for byte. Other cards and

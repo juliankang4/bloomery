@@ -216,7 +216,8 @@ release's check:
 - **Qwen prompts as int8 tensor-core GEMMs**: P = 4096 from 357 to 2,615 tok/s, then a prefill flash kernel.
 - **MiMo's hot experts on the card**: decode after a 5,620-token prompt 19.1 → 34.0 tok/s (0.2.10 → 0.3.0 release
   checks, A6000).
-- **CPU experts at memory speed**: AVX2 kernels on the stored quantization, grouped dispatch on a pinned pool.
+- **CPU experts at memory speed**: AVX2 kernels on the stored quantization (Q4_K's switch to AVX-512 VNNI on a CPU
+  that has it), grouped dispatch on a pinned pool.
 - **One CUDA graph a decode step**, with the CPU experts inside it, and speculative decoding (MTP, DSpark).
 
 Output is checked layer by layer against ik_llama.cpp (V4.1: PPL 2.2401 against 2.2378, same top token 97.46 %),
