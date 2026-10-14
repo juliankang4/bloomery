@@ -132,7 +132,7 @@
 //! of the widened tiles said in their bands.
 
 use crate::fault::{FaultSink, FaultSite};
-use crate::flash::{dev_exp, f32x2_to_f16x2_bits, half_bits_to_f32};
+use crate::flash::{f32x2_to_f16x2_bits, half_bits_to_f32};
 use crate::flash_gqa::{F16Kv, GROUP, HEAD, KvSrc, PACK_2, PACK_4, Q8Kv, q8_word_values};
 use crate::rope_neox::q8_plane_lens;
 use crate::{GpuError, launch_u32};
@@ -140,7 +140,6 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::async_copy::{
     cp_async_ca_8, cp_async_cg_16, cp_async_commit_group, cp_async_wait_group,
 };
-use cuda_device::convert::{cvt_f16x2_f32, cvt_f32x2_f16x2};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
 use cuda_device::ptx_asm;
 use cuda_device::vector::U32x4;
@@ -280,9 +279,9 @@ fn blocks_for(t: usize, n_kv: usize) -> usize {
 
 /// `exp(x)` for a weight that is rounded to f16 next: `ex2.approx.ftz` on
 /// `x · log2 e`. It runs the same `MUFU.EX2` on the same argument as
-/// [`dev_exp`] wherever that argument is at least −126; below it `dev_exp`
-/// returns a value under 2^-126 and this returns 0, and both round to the f16
-/// +0 (anything under 2^-25 does). So the rounded weight — the only thing a
+/// [`dev_exp`](crate::flash::dev_exp) wherever that argument is at least
+/// −126; below it `dev_exp` returns a value under 2^-126 and this returns 0,
+/// and both round to the f16 +0 (anything under 2^-25 does). So the rounded weight — the only thing a
 /// weight reaches — is `dev_exp`'s bit for bit. Never for a rescale factor,
 /// which multiplies the accumulators unrounded.
 #[inline(always)]
@@ -629,6 +628,257 @@ macro_rules! zero_row {
     }};
 }
 
+/// The online softmax of the module doc's step 2 over one key tile's scores,
+/// written once for every prefill body and expanded in each, as
+/// `dequant_row!` is: the body's locals are the arguments. A warp whose tile
+/// is inside every row's bounds (`unmasked`) takes the expansion without
+/// the per-key mask, every other one the masked expansion; on such a
+/// tile both evaluate the same expressions. `key0` is the lane's first key
+/// (`KEY_TILE·kb + 2·t4`), `tiles` the tile's n8 tiles and k16 steps,
+/// `scores` the lane's `[[f32; 4]; n8 tiles]` raw scores (scaled in place),
+/// `counts` its two rows' counts, optional `lower` their first keys when
+/// enabled, `state` the rows' running max, lane sum and
+/// this tile's rescale factor (`f` starts at 1), `weights` the value
+/// product's A fragments.
+///
+/// Register `j` of n8 tile `nt` is row half `j / 2`, key
+/// `key0 + 8·nt + j % 2`. The weights go out rounded to f16 pairs as the A
+/// fragment of the value product: k16 step `kk2` is n8 tiles `2·kk2` and
+/// `2·kk2 + 1`, registers `(0, 1)` then `(2, 3)` of each, low key first, and
+/// the lane's sum takes the rounded values in that order. The mask is the
+/// key's position, not its score: a NaN score stays NaN.
+macro_rules! prefill_softmax {
+    (
+        unmasked: $unmasked:expr,
+        key0: $key0:expr,
+        tiles: ($key_nt:expr, $pv_steps:expr),
+        scores: $sc:ident,
+        counts: $cnt:ident,
+        $(lower: ($lower:expr, $first:ident),)?
+        scale: $scale:expr,
+        state: ($m:ident, $l:ident, $f:ident),
+        weights: $pa:ident $(,)?
+    ) => {
+        if $unmasked {
+            prefill_softmax!(
+                @tile false, $key0, $key_nt, $pv_steps, $sc, $cnt, $scale, $m, $l, $f, $pa $(, ($lower, $first))?
+            );
+        } else {
+            prefill_softmax!(
+                @tile true, $key0, $key_nt, $pv_steps, $sc, $cnt, $scale, $m, $l, $f, $pa $(, ($lower, $first))?
+            );
+        }
+    };
+    (
+        @tile $masked:literal, $key0:expr, $key_nt:expr, $pv_steps:expr, $sc:ident,
+        $cnt:ident, $scale:expr, $m:ident, $l:ident, $f:ident, $pa:ident
+        $(, ($lower:expr, $first:ident))?
+    ) => {{
+        let kb0 = $key0;
+        let mut tmax = [f32::NEG_INFINITY; 2];
+        for nt in 0..$key_nt {
+            cuda_device::thread::__unroll_config::<0>();
+            for j in 0usize..4 {
+                cuda_device::thread::__unroll_config::<0>();
+                let key = kb0 + (8 * nt + j % 2) as u32;
+                let v = if !$masked || (key < $cnt[j / 2] $(&& (!$lower || key >= $first[j / 2]))?) {
+                    cuda_device::float::mul_rn_f32($sc[nt][j], $scale)
+                } else {
+                    f32::NEG_INFINITY
+                };
+                $sc[nt][j] = v;
+                tmax[j / 2] = $crate::flash_gqa_prefill::fmax(tmax[j / 2], v);
+            }
+        }
+        let mut mn = [f32::NEG_INFINITY; 2];
+        for h in 0usize..2 {
+            cuda_device::thread::__unroll_config::<0>();
+            let mut x = tmax[h];
+            x = $crate::flash_gqa_prefill::fmax(x, cuda_device::warp::shuffle_xor_f32(x, 1));
+            x = $crate::flash_gqa_prefill::fmax(x, cuda_device::warp::shuffle_xor_f32(x, 2));
+            let m_new = $crate::flash_gqa_prefill::fmax($m[h], x);
+            if m_new > $m[h] {
+                $f[h] = if $m[h] > f32::NEG_INFINITY {
+                    $crate::flash::dev_exp($m[h] - m_new)
+                } else {
+                    0.0
+                };
+                $m[h] = m_new;
+            }
+            mn[h] = $m[h];
+            $l[h] = cuda_device::float::mul_rn_f32($l[h], $f[h]);
+        }
+        for kk2 in 0..$pv_steps {
+            cuda_device::thread::__unroll_config::<0>();
+            for e in 0usize..4 {
+                cuda_device::thread::__unroll_config::<0>();
+                let nt = 2 * kk2 + e / 2;
+                let j0 = 2 * (e % 2);
+                let h = e % 2;
+                let key = kb0 + (8 * nt) as u32;
+                let p0 = if !$masked || (key < $cnt[h] $(&& (!$lower || key >= $first[h]))?) {
+                    $crate::flash_gqa_prefill::exp_weight($sc[nt][j0] - mn[h])
+                } else {
+                    0.0
+                };
+                let p1 = if !$masked || (key + 1 < $cnt[h] $(&& (!$lower || key + 1 >= $first[h]))?) {
+                    $crate::flash_gqa_prefill::exp_weight($sc[nt][j0 + 1] - mn[h])
+                } else {
+                    0.0
+                };
+                let packed = cuda_device::convert::cvt_f16x2_f32(p0, p1);
+                let (r0, r1) = cuda_device::convert::cvt_f32x2_f16x2(packed);
+                $l[h] = cuda_device::float::add_rn_f32(
+                    cuda_device::float::add_rn_f32($l[h], r0),
+                    r1,
+                );
+                $pa[kk2][e] = packed;
+            }
+        }
+    }};
+}
+
+/// The row counts a PACK-generic body's walk uses, written once and expanded
+/// in each, as `dequant_row!` is: it binds the `out` names in the caller. Slice `s` is
+/// positions `t0 + s·slice_pos ..` of the block; both loop bounds are
+/// constants, so every copy's `s` and `i` are literals and no count is kept
+/// in an array indexed at run time. A row below `rows` reads its count from
+/// `n_keys`, refused (count 0, refused) when it is zero or past `ctx`; a row
+/// past `rows` is count 0, not refused. Bound: `hi`, the block's largest
+/// count; `warp_hi`, `warp_lo` and `any_bad`, the largest, smallest and any
+/// refusal of the warp's own slice `rs` (the walk's warp-uniform bounds);
+/// `cnt` and `bad`, the lane's two rows' own (`row_pos` of `g`). With `lower`,
+/// the first keys follow the same walk: `lo` is the block's smallest live
+/// first key, `warp_first_lo` and `warp_first_hi` the slice's bounds, and
+/// `first` the lane's two rows'. A first key at or past its count is refused.
+///
+/// SAFETY: `n_keys` holds at least `rows` counts, and with `lower`, `k_first`
+/// holds at least `rows` first keys (the caller's launch contract).
+macro_rules! prefill_pack_counts {
+    (
+        out: ($hi:ident, $warp_hi:ident, $warp_lo:ident, $any_bad:ident, $cnt:ident, $bad:ident),
+        shape: ($slices:expr, $slice_pos:ident, $pack:ident),
+        rows: ($t0:ident, $rows:ident, $rs:ident, $g:ident),
+        counts: ($n_keys:ident, $ctx:ident),
+        lower: ($lower:expr, $k_first:ident),
+        first: ($lo:ident, $warp_first_lo:ident, $warp_first_hi:ident, $first:ident) $(,)?
+    ) => {
+        let mut $hi = 0u32;
+        let mut $warp_hi = 0u32;
+        let mut $warp_lo = u32::MAX;
+        let mut $lo = u32::MAX;
+        let mut $warp_first_lo = u32::MAX;
+        let mut $warp_first_hi = 0u32;
+        let mut $first = [0u32; 2];
+        let mut $any_bad = false;
+        let mut $cnt = [0u32; 2];
+        let mut $bad = [false; 2];
+        for s in 0..$slices {
+            cuda_device::thread::__unroll_config::<0>();
+            for i in 0..$slice_pos {
+                cuda_device::thread::__unroll_config::<0>();
+                let t = $t0 + s * $slice_pos + i;
+                let (c, k0, refused) = if t < $rows {
+                    // SAFETY: t < t_rows <= n_keys_buf.len() (launch contract).
+                    let c = unsafe { *$n_keys.get_unchecked(t) };
+                    let k0 = if $lower {
+                        // SAFETY: t < rows <= k_first.len() (the LOWER launch contract).
+                        unsafe { *$k_first.get_unchecked(t) }
+                    } else {
+                        0
+                    };
+                    if c == 0 || c > $ctx || ($lower && k0 >= c) {
+                        (0, 0, true)
+                    } else {
+                        (c, k0, false)
+                    }
+                } else {
+                    (0, 0, false)
+                };
+                $hi = $hi.max(c);
+                if $lower && c > 0 {
+                    $lo = $lo.min(k0);
+                }
+                if s == $rs {
+                    $warp_hi = $warp_hi.max(c);
+                    $warp_lo = $warp_lo.min(c);
+                    if $lower && c > 0 {
+                        $warp_first_lo = $warp_first_lo.min(k0);
+                        $warp_first_hi = $warp_first_hi.max(k0);
+                    }
+                    $any_bad = $any_bad || refused;
+                    if i == $crate::flash_gqa_prefill::row_pos::<$pack>($g, 0) {
+                        $cnt[0] = c;
+                        $first[0] = k0;
+                        $bad[0] = refused;
+                    }
+                    if i == $crate::flash_gqa_prefill::row_pos::<$pack>($g, 1) {
+                        $cnt[1] = c;
+                        $first[1] = k0;
+                        $bad[1] = refused;
+                    }
+                }
+            }
+        }
+    };
+}
+
+/// The end of a PACK-generic body's walk, written once and expanded in each,
+/// as `dequant_row!` is: each row's sum over its four lanes `(l + l^1) +
+/// l^2`, then `o · (1/l)` into `y`, NaN for a refused row (`bad`). The lane's
+/// value `j` of n8 tile `nd` (`nd < dims`, the accumulator's tiles) is row
+/// half `j / 2`, position `row0 + row_pos(g, j / 2)` and head `head0 +
+/// row_head(g)`, dim `col0 + 8·nd + 2·t4 + j % 2` of a `head`-value row; a
+/// position at or past `rows` writes nothing.
+///
+/// SAFETY: every dim the expansion writes is below `head` and owned by this
+/// lane alone (the caller's `col0`), `head0 + PACK <= n_head`, and `y` holds
+/// `rows · n_head · head` values (the caller's launch contract).
+macro_rules! prefill_pack_store {
+    (
+        acc: ($o:ident, $l:ident, $bad:ident, $dims:expr),
+        rows: ($row0:expr, $rows:ident, $pack:ident, $g:ident, $t4:ident),
+        cols: ($col0:expr, $head:expr),
+        out: ($y:ident, $n_head:ident, $head0:ident) $(,)?
+    ) => {
+        let mut inv = [0.0f32; 2];
+        for h in 0usize..2 {
+            cuda_device::thread::__unroll_config::<0>();
+            let a =
+                cuda_device::float::add_rn_f32($l[h], cuda_device::warp::shuffle_xor_f32($l[h], 1));
+            let s = cuda_device::float::add_rn_f32(a, cuda_device::warp::shuffle_xor_f32(a, 2));
+            inv[h] = 1.0 / s;
+        }
+        for nd in 0..$dims {
+            cuda_device::thread::__unroll_config::<0>();
+            for j in 0usize..4 {
+                cuda_device::thread::__unroll_config::<0>();
+                let h = j / 2;
+                let t = $row0 + $crate::flash_gqa_prefill::row_pos::<$pack>($g, h);
+                if t < $rows {
+                    let d = $col0 + 8 * nd + 2 * $t4 + j % 2;
+                    let v = if $bad[h] {
+                        f32::NAN
+                    } else {
+                        cuda_device::float::mul_rn_f32($o[nd][j], inv[h])
+                    };
+                    // SAFETY: t < t_rows, head0 + row_head(g) < head0 + PACK
+                    // <= n_head and d < head: below t_rows·n_head·head <=
+                    // y.len() (launch contract); one owner lane per value.
+                    unsafe {
+                        *$y.get_unchecked_mut(
+                            (t * $n_head
+                                + $head0
+                                + $crate::flash_gqa_prefill::row_head::<$pack>($g))
+                                * $head
+                                + d,
+                        ) = v;
+                    }
+                }
+            }
+        }
+    };
+}
 /// One 256-value-head scales tile of the q8 staging: `KEY_TILE` rows of
 /// `HEAD_256/32` u16.
 const Q8_SCALE_TILE_256: usize = KEY_TILE * (HEAD_256 / 32);
@@ -756,70 +1006,14 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const LOWER: 
         2 * TILE_WORDS_256 * 4 + WARPS_256 * EXCH_WARP * 4 + Q8_SCALE_TILE_256 * 2,
     );
 
-    // Every row's count as the walk uses it (the 128 body's rule). Slice `s`
-    // is positions `s·SLICE_POS ..`; both loop bounds are constants, so every
-    // copy's `s` and `i` are literals and no count is kept in an array indexed
-    // at run time. The warp keeps its own slice's largest and smallest count
-    // (the walk's warp-uniform bounds) and refusal, and its two rows' own
-    // (`row_pos`). With `LOWER`, the first keys of the live rows likewise:
-    // the block's smallest, the slice's smallest and largest, the two rows'.
-    let mut hi = 0u32;
-    let mut warp_hi = 0u32;
-    let mut warp_lo = u32::MAX;
-    let mut lo = u32::MAX;
-    let mut warp_first_lo = u32::MAX;
-    let mut warp_first_hi = 0u32;
-    let mut any_bad = false;
-    let mut cnt = [0u32; 2];
-    let mut first = [0u32; 2];
-    let mut bad = [false; 2];
-    for s in 0..SLICES_256 {
-        cuda_device::thread::__unroll_config::<0>();
-        for i in 0..SLICE_POS {
-            cuda_device::thread::__unroll_config::<0>();
-            let t = t0 + s * SLICE_POS + i;
-            let (c, k0, refused) = if t < rows {
-                // SAFETY: t < t_rows <= n_keys_buf.len() (launch contract).
-                let c = unsafe { *n_keys_buf.get_unchecked(t) };
-                let k0 = if LOWER {
-                    // SAFETY: t < t_rows <= k_first_buf.len() (the LOWER
-                    // entry's launch contract); read only under LOWER.
-                    unsafe { *k_first_buf.get_unchecked(t) }
-                } else {
-                    0
-                };
-                if c == 0 || c > ctx || (LOWER && k0 >= c) {
-                    (0, 0, true)
-                } else {
-                    (c, k0, false)
-                }
-            } else {
-                (0, 0, false)
-            };
-            hi = hi.max(c);
-            if LOWER && c > 0 {
-                lo = lo.min(k0);
-            }
-            if s == rs {
-                warp_hi = warp_hi.max(c);
-                warp_lo = warp_lo.min(c);
-                if LOWER && c > 0 {
-                    warp_first_lo = warp_first_lo.min(k0);
-                    warp_first_hi = warp_first_hi.max(k0);
-                }
-                any_bad = any_bad || refused;
-                if i == row_pos::<PACK>(g, 0) {
-                    cnt[0] = c;
-                    first[0] = k0;
-                    bad[0] = refused;
-                }
-                if i == row_pos::<PACK>(g, 1) {
-                    cnt[1] = c;
-                    first[1] = k0;
-                    bad[1] = refused;
-                }
-            }
-        }
+    // Every row's count and, with LOWER, first key as the walk uses them.
+    prefill_pack_counts! {
+        out: (hi, warp_hi, warp_lo, any_bad, cnt, bad),
+        shape: (SLICES_256, SLICE_POS, PACK),
+        rows: (t0, rows, rs, g),
+        counts: (n_keys_buf, ctx),
+        lower: (LOWER, k_first_buf),
+        first: (lo, warp_first_lo, warp_first_hi, first),
     }
     if lane == 0 && dh == 0 && any_bad {
         fault.raise(FaultSite::KeyCount);
@@ -1176,77 +1370,16 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const LOWER: 
                 }
             }
 
-            // The softmax over the tile's scores, the 128 body's.
-            macro_rules! softmax {
-                ($masked:literal) => {{
-                    let kb0 = KEY_TILE_U32 * kb + t4k;
-                    let mut tmax = [f32::NEG_INFINITY; 2];
-                    for nt in 0..KEY_NT {
-                        cuda_device::thread::__unroll_config::<0>();
-                        for j in 0usize..4 {
-                            cuda_device::thread::__unroll_config::<0>();
-                            let key = kb0 + (8 * nt + j % 2) as u32;
-                            let v = if !$masked
-                                || (key < cnt[j / 2] && (!LOWER || key >= first[j / 2]))
-                            {
-                                mul_rn_f32(sc[nt][j], scale)
-                            } else {
-                                f32::NEG_INFINITY
-                            };
-                            sc[nt][j] = v;
-                            tmax[j / 2] = fmax(tmax[j / 2], v);
-                        }
-                    }
-                    let mut mn = [f32::NEG_INFINITY; 2];
-                    for h in 0usize..2 {
-                        cuda_device::thread::__unroll_config::<0>();
-                        let mut x = tmax[h];
-                        x = fmax(x, warp::shuffle_xor_f32(x, 1));
-                        x = fmax(x, warp::shuffle_xor_f32(x, 2));
-                        let m_new = fmax(m[h], x);
-                        if m_new > m[h] {
-                            f[h] = if m[h] > f32::NEG_INFINITY {
-                                dev_exp(m[h] - m_new)
-                            } else {
-                                0.0
-                            };
-                            m[h] = m_new;
-                        }
-                        mn[h] = m[h];
-                        l[h] = mul_rn_f32(l[h], f[h]);
-                    }
-                    for kk2 in 0..PV_STEPS {
-                        cuda_device::thread::__unroll_config::<0>();
-                        for e in 0usize..4 {
-                            cuda_device::thread::__unroll_config::<0>();
-                            let nt = 2 * kk2 + e / 2;
-                            let j0 = 2 * (e % 2);
-                            let h = e % 2;
-                            let key = kb0 + (8 * nt) as u32;
-                            let p0 = if !$masked || (key < cnt[h] && (!LOWER || key >= first[h])) {
-                                exp_weight(sc[nt][j0] - mn[h])
-                            } else {
-                                0.0
-                            };
-                            let p1 = if !$masked
-                                || (key + 1 < cnt[h] && (!LOWER || key + 1 >= first[h]))
-                            {
-                                exp_weight(sc[nt][j0 + 1] - mn[h])
-                            } else {
-                                0.0
-                            };
-                            let packed = cvt_f16x2_f32(p0, p1);
-                            let (r0, r1) = cvt_f32x2_f16x2(packed);
-                            l[h] = add_rn_f32(add_rn_f32(l[h], r0), r1);
-                            pa[kk2][e] = packed;
-                        }
-                    }
-                }};
-            }
-            if end <= warp_lo && (!LOWER || KEY_TILE_U32 * kb >= warp_first_hi) {
-                softmax!(false);
-            } else {
-                softmax!(true);
+            prefill_softmax! {
+                unmasked: end <= warp_lo && (!LOWER || KEY_TILE_U32 * kb >= warp_first_hi),
+                key0: KEY_TILE_U32 * kb + t4k,
+                tiles: (KEY_NT, PV_STEPS),
+                scores: sc,
+                counts: cnt,
+                lower: (LOWER, first),
+                scale: scale,
+                state: (m, l, f),
+                weights: pa,
             }
 
             if warp::any(f[0] != 1.0 || f[1] != 1.0) {
@@ -1306,36 +1439,11 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const LOWER: 
     }
 
     // ---- the row sums over the four lanes of a row, then o · (1/l).
-    let mut inv = [0.0f32; 2];
-    for h in 0usize..2 {
-        cuda_device::thread::__unroll_config::<0>();
-        let a = add_rn_f32(l[h], warp::shuffle_xor_f32(l[h], 1));
-        let s = add_rn_f32(a, warp::shuffle_xor_f32(a, 2));
-        inv[h] = 1.0 / s;
-    }
-    for nd in 0..2 * DIM_PAIRS_256 {
-        cuda_device::thread::__unroll_config::<0>();
-        for j in 0usize..4 {
-            cuda_device::thread::__unroll_config::<0>();
-            let h = j / 2;
-            let t = t0 + pps * rs + row_pos::<PACK>(g, h);
-            if t < rows {
-                let d = HALF_256 * dh + 8 * nd + 2 * t4 + j % 2;
-                let v = if bad[h] {
-                    f32::NAN
-                } else {
-                    mul_rn_f32(o[nd][j], inv[h])
-                };
-                // SAFETY: t < t_rows, head0 + row_head(g) < head0 + PACK <=
-                // n_head and d < HEAD_256: below t_rows·n_head·256 <= y.len()
-                // (launch contract); one owner lane per value.
-                unsafe {
-                    *y.get_unchecked_mut(
-                        (t * n_head + head0 + row_head::<PACK>(g)) * HEAD_256 + d,
-                    ) = v;
-                }
-            }
-        }
+    prefill_pack_store! {
+        acc: (o, l, bad, 2 * DIM_PAIRS_256),
+        rows: (t0 + pps * rs, rows, PACK, g, t4),
+        cols: (HALF_256 * dh, HEAD_256),
+        out: (y, n_head, head0),
     }
 }
 
@@ -1343,7 +1451,6 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const LOWER: 
 mod flash_gqa_prefill_kernels {
     use super::*;
     use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
-    use cuda_device::convert::{cvt_f16x2_f32, cvt_f32x2_f16x2};
     use cuda_device::float::{add_rn_f32, mul_rn_f32};
     use cuda_device::vector::U32x4;
 
@@ -1651,84 +1758,15 @@ mod flash_gqa_prefill_kernels {
                     }
                 }
 
-                // The softmax over the tile's scores. `masked` (a literal)
-                // tests each key against its row's count; a tile below both
-                // counts takes the copy without the tests.
-                macro_rules! softmax {
-                    ($masked:literal) => {{
-                        let kb0 = KEY_TILE_U32 * kb + t4k;
-                        // Register j of key tile nt is row half j / 2 (the
-                        // warp's position 2·w + j / 2, head g), key
-                        // 64·kb + 8·nt + 2·t4 + j % 2.
-                        let mut tmax = [f32::NEG_INFINITY; 2];
-                        for nt in 0..KEY_NT {
-                            cuda_device::thread::__unroll_config::<0>();
-                            for j in 0usize..4 {
-                                cuda_device::thread::__unroll_config::<0>();
-                                let key = kb0 + (8 * nt + j % 2) as u32;
-                                let v = if !$masked || key < cnt[j / 2] {
-                                    mul_rn_f32(sc[nt][j], scale)
-                                } else {
-                                    f32::NEG_INFINITY
-                                };
-                                sc[nt][j] = v;
-                                tmax[j / 2] = fmax(tmax[j / 2], v);
-                            }
-                        }
-                        let mut mn = [f32::NEG_INFINITY; 2];
-                        for h in 0usize..2 {
-                            cuda_device::thread::__unroll_config::<0>();
-                            let mut x = tmax[h];
-                            x = fmax(x, warp::shuffle_xor_f32(x, 1));
-                            x = fmax(x, warp::shuffle_xor_f32(x, 2));
-                            let m_new = fmax(m[h], x);
-                            if m_new > m[h] {
-                                f[h] = if m[h] > f32::NEG_INFINITY {
-                                    dev_exp(m[h] - m_new)
-                                } else {
-                                    0.0
-                                };
-                                m[h] = m_new;
-                            }
-                            mn[h] = m[h];
-                            l[h] = mul_rn_f32(l[h], f[h]);
-                        }
-                        // The weights, rounded to f16 pairs as the A fragment
-                        // of the value product: k16 step kk2 is key tiles
-                        // 2·kk2 and 2·kk2 + 1, registers (0, 1) then (2, 3) of
-                        // each, low key first. The lane's sum takes the
-                        // rounded values in that order. The mask is the key's
-                        // position, not its score: a NaN score stays NaN.
-                        for kk2 in 0..PV_STEPS {
-                            cuda_device::thread::__unroll_config::<0>();
-                            for e in 0usize..4 {
-                                cuda_device::thread::__unroll_config::<0>();
-                                let nt = 2 * kk2 + e / 2;
-                                let j0 = 2 * (e % 2);
-                                let h = e % 2;
-                                let key = kb0 + (8 * nt) as u32;
-                                let p0 = if !$masked || key < cnt[h] {
-                                    exp_weight(sc[nt][j0] - mn[h])
-                                } else {
-                                    0.0
-                                };
-                                let p1 = if !$masked || key + 1 < cnt[h] {
-                                    exp_weight(sc[nt][j0 + 1] - mn[h])
-                                } else {
-                                    0.0
-                                };
-                                let packed = cvt_f16x2_f32(p0, p1);
-                                let (r0, r1) = cvt_f32x2_f16x2(packed);
-                                l[h] = add_rn_f32(add_rn_f32(l[h], r0), r1);
-                                pa[kk2][e] = packed;
-                            }
-                        }
-                    }};
-                }
-                if end <= warp_lo {
-                    softmax!(false);
-                } else {
-                    softmax!(true);
+                prefill_softmax! {
+                    unmasked: end <= warp_lo,
+                    key0: KEY_TILE_U32 * kb + t4k,
+                    tiles: (KEY_NT, PV_STEPS),
+                    scores: sc,
+                    counts: cnt,
+                    scale: scale,
+                    state: (m, l, f),
+                    weights: pa,
                 }
 
                 // The accumulators times f, unless no lane of the warp has a
@@ -2157,73 +2195,15 @@ mod flash_gqa_prefill_kernels {
                     }
                 }
 
-                // The softmax over the tile's scores, the 128 body's.
-                macro_rules! softmax {
-                    ($masked:literal) => {{
-                        let kb0 = KEY_TILE_U32 * kb + t4k;
-                        let mut tmax = [f32::NEG_INFINITY; 2];
-                        for nt in 0..KEY_NT {
-                            cuda_device::thread::__unroll_config::<0>();
-                            for j in 0usize..4 {
-                                cuda_device::thread::__unroll_config::<0>();
-                                let key = kb0 + (8 * nt + j % 2) as u32;
-                                let v = if !$masked || key < cnt[j / 2] {
-                                    mul_rn_f32(sc[nt][j], scale)
-                                } else {
-                                    f32::NEG_INFINITY
-                                };
-                                sc[nt][j] = v;
-                                tmax[j / 2] = fmax(tmax[j / 2], v);
-                            }
-                        }
-                        let mut mn = [f32::NEG_INFINITY; 2];
-                        for h in 0usize..2 {
-                            cuda_device::thread::__unroll_config::<0>();
-                            let mut x = tmax[h];
-                            x = fmax(x, warp::shuffle_xor_f32(x, 1));
-                            x = fmax(x, warp::shuffle_xor_f32(x, 2));
-                            let m_new = fmax(m[h], x);
-                            if m_new > m[h] {
-                                f[h] = if m[h] > f32::NEG_INFINITY {
-                                    dev_exp(m[h] - m_new)
-                                } else {
-                                    0.0
-                                };
-                                m[h] = m_new;
-                            }
-                            mn[h] = m[h];
-                            l[h] = mul_rn_f32(l[h], f[h]);
-                        }
-                        for kk2 in 0..PV_STEPS {
-                            cuda_device::thread::__unroll_config::<0>();
-                            for e in 0usize..4 {
-                                cuda_device::thread::__unroll_config::<0>();
-                                let nt = 2 * kk2 + e / 2;
-                                let j0 = 2 * (e % 2);
-                                let h = e % 2;
-                                let key = kb0 + (8 * nt) as u32;
-                                let p0 = if !$masked || key < cnt[h] {
-                                    exp_weight(sc[nt][j0] - mn[h])
-                                } else {
-                                    0.0
-                                };
-                                let p1 = if !$masked || key + 1 < cnt[h] {
-                                    exp_weight(sc[nt][j0 + 1] - mn[h])
-                                } else {
-                                    0.0
-                                };
-                                let packed = cvt_f16x2_f32(p0, p1);
-                                let (r0, r1) = cvt_f32x2_f16x2(packed);
-                                l[h] = add_rn_f32(add_rn_f32(l[h], r0), r1);
-                                pa[kk2][e] = packed;
-                            }
-                        }
-                    }};
-                }
-                if end <= warp_lo {
-                    softmax!(false);
-                } else {
-                    softmax!(true);
+                prefill_softmax! {
+                    unmasked: end <= warp_lo,
+                    key0: KEY_TILE_U32 * kb + t4k,
+                    tiles: (KEY_NT, PV_STEPS),
+                    scores: sc,
+                    counts: cnt,
+                    scale: scale,
+                    state: (m, l, f),
+                    weights: pa,
                 }
 
                 if warp::any(f[0] != 1.0 || f[1] != 1.0) {
@@ -2903,84 +2883,15 @@ mod flash_gqa_prefill_kernels {
                     }
                 }
 
-                // The softmax over the tile's scores. `masked` (a literal)
-                // tests each key against its row's count; a tile below both
-                // counts takes the copy without the tests.
-                macro_rules! softmax {
-                    ($masked:literal) => {{
-                        let kb0 = KEY_TILE_U32 * kb + t4k;
-                        // Register j of key tile nt is row half j / 2 (the
-                        // warp's position 2·w + j / 2, head g), key
-                        // 64·kb + 8·nt + 2·t4 + j % 2.
-                        let mut tmax = [f32::NEG_INFINITY; 2];
-                        for nt in 0..KEY_NT {
-                            cuda_device::thread::__unroll_config::<0>();
-                            for j in 0usize..4 {
-                                cuda_device::thread::__unroll_config::<0>();
-                                let key = kb0 + (8 * nt + j % 2) as u32;
-                                let v = if !$masked || key < cnt[j / 2] {
-                                    mul_rn_f32(sc[nt][j], scale)
-                                } else {
-                                    f32::NEG_INFINITY
-                                };
-                                sc[nt][j] = v;
-                                tmax[j / 2] = fmax(tmax[j / 2], v);
-                            }
-                        }
-                        let mut mn = [f32::NEG_INFINITY; 2];
-                        for h in 0usize..2 {
-                            cuda_device::thread::__unroll_config::<0>();
-                            let mut x = tmax[h];
-                            x = fmax(x, warp::shuffle_xor_f32(x, 1));
-                            x = fmax(x, warp::shuffle_xor_f32(x, 2));
-                            let m_new = fmax(m[h], x);
-                            if m_new > m[h] {
-                                f[h] = if m[h] > f32::NEG_INFINITY {
-                                    dev_exp(m[h] - m_new)
-                                } else {
-                                    0.0
-                                };
-                                m[h] = m_new;
-                            }
-                            mn[h] = m[h];
-                            l[h] = mul_rn_f32(l[h], f[h]);
-                        }
-                        // The weights, rounded to f16 pairs as the A fragment
-                        // of the value product: k16 step kk2 is key tiles
-                        // 2·kk2 and 2·kk2 + 1, registers (0, 1) then (2, 3) of
-                        // each, low key first. The lane's sum takes the
-                        // rounded values in that order. The mask is the key's
-                        // position, not its score: a NaN score stays NaN.
-                        for kk2 in 0..PV_STEPS {
-                            cuda_device::thread::__unroll_config::<0>();
-                            for e in 0usize..4 {
-                                cuda_device::thread::__unroll_config::<0>();
-                                let nt = 2 * kk2 + e / 2;
-                                let j0 = 2 * (e % 2);
-                                let h = e % 2;
-                                let key = kb0 + (8 * nt) as u32;
-                                let p0 = if !$masked || key < cnt[h] {
-                                    exp_weight(sc[nt][j0] - mn[h])
-                                } else {
-                                    0.0
-                                };
-                                let p1 = if !$masked || key + 1 < cnt[h] {
-                                    exp_weight(sc[nt][j0 + 1] - mn[h])
-                                } else {
-                                    0.0
-                                };
-                                let packed = cvt_f16x2_f32(p0, p1);
-                                let (r0, r1) = cvt_f32x2_f16x2(packed);
-                                l[h] = add_rn_f32(add_rn_f32(l[h], r0), r1);
-                                pa[kk2][e] = packed;
-                            }
-                        }
-                    }};
-                }
-                if end <= warp_lo {
-                    softmax!(false);
-                } else {
-                    softmax!(true);
+                prefill_softmax! {
+                    unmasked: end <= warp_lo,
+                    key0: KEY_TILE_U32 * kb + t4k,
+                    tiles: (KEY_NT, PV_STEPS),
+                    scores: sc,
+                    counts: cnt,
+                    scale: scale,
+                    state: (m, l, f),
+                    weights: pa,
                 }
 
                 // The accumulators times f, unless no lane of the warp has a
