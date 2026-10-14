@@ -268,8 +268,10 @@ fn has_features(_: GgmlType) -> bool {
 /// beside the AVX2 kernels' ISA ([`has_features`]), and
 /// `BLOOMERY_QDOT_AVX512` is unset or `1`; `0` keeps the AVX2 bodies, the
 /// same-binary arm. Both bodies write the same bits. Read once a process; a
-/// value other than `0` or `1` is refused by name.
-#[cfg(target_arch = "x86_64")]
+/// value other than `0` or `1` is refused by name on every architecture,
+/// before the CPU is asked. Off x86_64 no AVX-512 body is compiled and the
+/// answer is false. The host tier's load asks it for every Q4_K stack
+/// (`model::ops::host_stack_runs`), so a refused value stops the load.
 #[must_use]
 pub fn q4k_avx512() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -280,19 +282,15 @@ pub fn q4k_avx512() -> bool {
             Some(v) if v == "0" => false,
             Some(v) => panic!("BLOOMERY_QDOT_AVX512={v:?}: takes 0 or 1"),
         };
-        wanted
-            && has_features(GgmlType::Q4_K)
+        #[cfg(target_arch = "x86_64")]
+        let isa = has_features(GgmlType::Q4_K)
             && std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vnni");
+        #[cfg(not(target_arch = "x86_64"))]
+        let isa = false;
+        wanted && isa
     })
-}
-
-/// Off x86_64 no AVX-512 body is compiled.
-#[cfg(not(target_arch = "x86_64"))]
-#[must_use]
-pub fn q4k_avx512() -> bool {
-    false
 }
 
 /// The `k` contract: `k` must be a multiple of the weight format's block size
@@ -538,14 +536,24 @@ pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, Q
             // SAFETY: AVX2+FMA+F16C were just detected; lengths validated above.
             Ok(unsafe { dot_q2f0_q8f0_avx2(wrow, acol, nb) })
         }
+        (GgmlType::Q4_K, false) => {
+            // A CPU without the AVX2 kernels' ISA still has q4k_avx512 read
+            // the lever, so a refused value stops here too.
+            let _ = q4k_avx512();
+            Ok(dot_row_scalar_ty(w, wrow, acol, nb))
+        }
         _ => Ok(dot_row_scalar_ty(w, wrow, acol, nb)),
     }
 }
 
 /// Off x86_64 no AVX2 kernel is compiled: every type runs its scalar mirror
-/// ([`dot_row_scalar`]).
+/// ([`dot_row_scalar`]). Q4_K asks [`q4k_avx512`] first, so a refused
+/// `BLOOMERY_QDOT_AVX512` value stops here as it does on x86_64.
 #[cfg(not(target_arch = "x86_64"))]
 pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
+    if w == GgmlType::Q4_K {
+        let _ = q4k_avx512();
+    }
     dot_row_scalar(w, wrow, acol, k)
 }
 

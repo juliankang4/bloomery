@@ -49,6 +49,7 @@ BLOOMERY_PREFILL_GROUP	weekly-gpu-ds41-flowcounts	1	justfile::--arm 512/2 --arm 
 BLOOMERY_PREFILL_GROUP	weekly-gpu-mimo2-serve	group	crates/gpu-gates/src/bin/gate_mimo2_serve.rs::fn served(	load_group_follows_the_lever's group-one server is the only one under the lever; `served`'s one-slot server runs the same load at the default group (the lever unset) and its `load` record's group is the row's default
 BLOOMERY_PROFILE	gate-profile	2	crates/model/tests/profile.rs::cmd.env_remove("BLOOMERY_PROFILE")	the same test's off child (env_remove) is the uninstrumented twin
 BLOOMERY_PROFILE	gate-profile	l	crates/model/tests/profile.rs::cmd.env_remove("BLOOMERY_PROFILE")	the same test's off child (env_remove) is the uninstrumented twin
+BLOOMERY_QDOT_AVX512	gate-qdot	2	none	2026-10-14: a refusal probe; dot_row refuses the value by name before it picks a body, so no path runs at any value
 BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	f16	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::check(ok, "default_load_names_f16", cache == "f16");	the pinned word is the default; the main server's load names the f16 cache with no flag
 BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	q6_0	none	2026-10-08: a refusal probe — the seat refuses the word by name before any load, so no path runs at any value
 BLOOMERY_QWEN3_KV	gate-gpu-qwen3-serve	q8_0	crates/gpu-gates/src/bin/gate_qwen3_serve.rs::check(ok, "default_load_names_f16", cache == "f16");	the main server runs the f16 cache (the unset default) and its load names it
