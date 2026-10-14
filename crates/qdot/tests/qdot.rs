@@ -4375,35 +4375,12 @@ fn hw_q3k_tile_matches_dot_row() {
 #[ignore = "hw: needs the box, the model file, the V4.1 shards and $BLOOMERY_DATA/ref"]
 fn hw_q4k_tile_matches_dot_row() {
     let ty = GgmlType::Q4_K;
-    // PIN(2026-10-14): synthetic tile fixtures consolidated here from
-    // hw_q4k_avx512_matches_avx2_synthetic; coverage retained.
+    // PIN(2026-10-14): the tile clause on q4k_synthetic_rows, which
+    // hw_q4k_avx512_matches_avx2_synthetic also reads.
     let (block, _) = lane_block(ty);
-    for (k, rows, seed) in [
-        (256usize, 16usize, 0x5a12_0001u64),
-        (512, 16, 0x5a12_0005),
-        (768, 16, 0x5a12_0006),
-        (2048, 16, 0x5a12_0002),
-        (2304, 16, 0x5a12_0003),
-        (4096, 24, 0x5a12_0004),
-    ] {
-        let bytes = lane_rows(ty, k, rows, seed);
-        assert_tile_matches(
-            ty,
-            &format!("seeded rows (k = {k})"),
-            k,
-            k / 256 * block,
-            &bytes,
-            &lane_columns(ty, k),
-        );
+    for (label, k, bytes) in q4k_synthetic_rows() {
+        assert_tile_matches(ty, &label, k, k / 256 * block, &bytes, &lane_columns(ty, k));
     }
-    assert_tile_matches(
-        ty,
-        "0xFF rows (k = 4096)",
-        4096,
-        16 * block,
-        &lane_fill(ty, 4096, 0xFF),
-        &lane_columns(ty, 4096),
-    );
     let g = gguf::Gguf::open(model_path()).unwrap();
     let w = g
         .iter_tensors()
@@ -5755,6 +5732,38 @@ fn q3k_r8_unpack_refuses_bad_shapes() {
 // sub-block, the same f32 products, the same fused adds per (row, column)
 // lane and the same lane sum — so any differing value is a bug.
 
+/// Q4_K's synthetic row sets, `(label, k, rows)`: seeded rows ([`lane_rows`])
+/// of one, two and three super-blocks, two and four whole chunks, and two
+/// chunks with a one-super-block tail, then all-0xFF rows ([`lane_fill`]) at
+/// k = 4096. The tile clause ([`hw_q4k_tile_matches_dot_row`]) and the
+/// AVX-512 clause ([`hw_q4k_avx512_matches_avx2_synthetic`]) both read them.
+fn q4k_synthetic_rows() -> Vec<(String, usize, Vec<u8>)> {
+    let ty = GgmlType::Q4_K;
+    let mut sets: Vec<(String, usize, Vec<u8>)> = [
+        (256usize, 16usize, 0x5a12_0001u64),
+        (512, 16, 0x5a12_0005),
+        (768, 16, 0x5a12_0006),
+        (2048, 16, 0x5a12_0002),
+        (2304, 16, 0x5a12_0003),
+        (4096, 24, 0x5a12_0004),
+    ]
+    .iter()
+    .map(|&(k, rows, seed)| {
+        (
+            format!("seeded rows (k = {k})"),
+            k,
+            lane_rows(ty, k, rows, seed),
+        )
+    })
+    .collect();
+    sets.push((
+        "0xFF rows (k = 4096)".into(),
+        4096,
+        lane_fill(ty, 4096, 0xFF),
+    ));
+    sets
+}
+
 /// Bytes of one super-block of a row-lane type, and where its f16 scales
 /// sit: Q4_K and Q5_K's `d` and `dmin` at 0 and 2, Q6_K's `d` at 208.
 fn lane_block(ty: GgmlType) -> (usize, &'static [usize]) {
@@ -6020,29 +6029,7 @@ fn hw_q4k_avx512_matches_avx2_synthetic() {
         "AVX2 (no AVX-512 VNNI body on this CPU or under BLOOMERY_QDOT_AVX512=0)"
     };
     let (block, _) = lane_block(ty);
-    let mut sets: Vec<(String, usize, Vec<u8>)> = [
-        (256usize, 16usize, 0x5a12_0001u64),
-        (512, 16, 0x5a12_0005),
-        (768, 16, 0x5a12_0006),
-        (2048, 16, 0x5a12_0002),
-        (2304, 16, 0x5a12_0003),
-        (4096, 24, 0x5a12_0004),
-    ]
-    .iter()
-    .map(|&(k, rows, seed)| {
-        (
-            format!("seeded rows (k = {k})"),
-            k,
-            lane_rows(ty, k, rows, seed),
-        )
-    })
-    .collect();
-    sets.push((
-        "0xFF rows (k = 4096)".into(),
-        4096,
-        lane_fill(ty, 4096, 0xFF),
-    ));
-    for (label, k, bytes) in &sets {
+    for (label, k, bytes) in &q4k_synthetic_rows() {
         let (k, row_bytes) = (*k, k / 256 * block);
         let acols = lane_columns(ty, k);
         for (r, src) in bytes.chunks_exact(row_bytes).enumerate() {
