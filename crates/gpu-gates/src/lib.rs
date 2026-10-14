@@ -67,7 +67,8 @@ pub mod vision_seat;
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
 use model::arch::Arch;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Kernel gate band against the quantized-input reference.
 /// PIN(2026-09-21): tightened 1e-2 -> 1e-5. Measured worst on the landed
@@ -134,6 +135,17 @@ pub fn exit_with(name: &str, r: Result<(), GateError>) -> std::process::ExitCode
 /// [`exit_with`]. One spelling for every gate, as [`verdict`] is for a check.
 pub fn checks_failed() -> GateError {
     "FAILED: one or more checks above did not pass".into()
+}
+
+/// The sha256 of the file at `path`, as `sha256sum` prints it; a failed `sha256sum` is an error
+/// naming the file.
+pub fn sha256(path: &Path) -> Result<String, GateError> {
+    let out = Command::new("sha256sum").arg(path).output()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    match text.split_whitespace().next() {
+        Some(h) if out.status.success() => Ok(h.to_owned()),
+        _ => Err(format!("sha256sum {}: {:?}", path.display(), text.trim()).into()),
+    }
 }
 
 /// The model file every gate and server opens: the one a server named on

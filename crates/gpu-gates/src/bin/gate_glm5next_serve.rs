@@ -306,10 +306,10 @@ mod gate {
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
         self, PrefixRestore, agree, base64, beside, check, completion, curl, ids_of, json_of,
-        metric, parse_ids, plan_run, prefix_restore, rendered, server_log, sha256, tokenized,
+        metric, parse_ids, plan_run, prefix_restore, rendered, server_log, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
+    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, sha256};
     use bloomery_gpu_glm5next::{CHECKPOINT_EVERY, checkpoint_price};
     use gguf::Split;
     use model::arch::glm5next::place::{

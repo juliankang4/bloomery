@@ -8,7 +8,7 @@
 //! record kinds ([`server_log`]), and the requests the seat gates share: the
 //! chat turn's ids ([`rendered`], [`tokenized`]), a greedy completion ([`greedy`]), the
 //! chat answer held to a completion's ids ([`chat_is_those_ids`]), an image
-//! file held to its digest and sent as base64 ([`sha256`], [`base64`]) and the
+//! file held to its digest and sent as base64 ([`crate::sha256`], [`base64`]) and the
 //! prefix clauses of a seat that keeps a shared prefix
 //! ([`edit_and_extension`]) and of one whose prompt cache holds a saved
 //! state's checkpoints ([`prefix_restore`]).
@@ -266,17 +266,6 @@ pub fn base64(bytes: &[u8]) -> String {
         });
     }
     out
-}
-
-/// The sha256 of the file at `path`, as `sha256sum` prints it; a failed `sha256sum` is an error
-/// naming the file.
-pub fn sha256(path: &Path) -> Result<String, GateError> {
-    let out = Command::new("sha256sum").arg(path).output()?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    match text.split_whitespace().next() {
-        Some(h) if out.status.success() => Ok(h.to_owned()),
-        _ => Err(format!("sha256sum {}: {:?}", path.display(), text.trim()).into()),
-    }
 }
 
 /// One clause's line, `check <name>: PASS|FAIL`, folded into `ok`.
