@@ -112,6 +112,21 @@ const EOG_NAMES: &[&str] = &[
 ];
 const ALWAYS_RENDERED: &[&str] = &["<|channel|>", "<|message|>", "<|start|>", "<|constrain|>"];
 
+/// A `tokenizer.ggml.model` this crate runs.
+#[derive(Clone, Copy)]
+pub(crate) enum Model {
+    /// `gpt2`: byte-level BPE, the pre-tokenizer named by the file.
+    Gpt2,
+    /// `gemma4`: BPE over metaspace text, always the `gemma4` pre-tokenizer.
+    Gemma4,
+}
+
+impl Model {
+    /// The names this crate runs, as `tokenizer.ggml.model` spells them.
+    pub(crate) const NAMES: [(&'static str, Model); 2] =
+        [("gpt2", Model::Gpt2), ("gemma4", Model::Gemma4)];
+}
+
 /// Special token ids; `None` is the reference's `LLAMA_TOKEN_NULL`.
 #[derive(Clone, Debug, Default)]
 pub struct Specials {
@@ -235,18 +250,21 @@ impl Vocab {
         let model = m
             .str("tokenizer.ggml.model")?
             .ok_or(Error::Missing("tokenizer.ggml.model"))?;
-        if model != "gpt2" {
-            return Err(Error::UnsupportedModel(model.to_string()));
-        }
-        // The names `Pre` runs share the rest of the reference's per-name
-        // flags that reach `encode` and `piece`: byte-level encoding, and no
-        // BOS unless the file asks for it. A pre may take a word that is
-        // itself a token whole (`Pre::ignore_merges`); the others always
-        // merge. (`glm4` keeps the reference's `clean_spaces`, which only its
-        // `llama_detokenize` reads; `llama_token_to_piece`, what this crate
-        // mirrors, does not.)
-        let pre = m.str("tokenizer.ggml.pre")?.unwrap_or("");
-        let Some(pretok) = Pre::of(pre) else {
+        let model = crate::named(&Model::NAMES, model)
+            .ok_or_else(|| Error::UnsupportedModel(model.to_string()))?;
+        // The reference's per-name flags that reach `encode` and `piece` are
+        // the pre-tokenizer's: its spelling (`Pre::spelling`), whether a word
+        // that is itself a token is taken whole (`Pre::ignore_merges`), and
+        // no BOS unless the file asks for it, except that `gemma4` always
+        // adds one. (`glm4` keeps the reference's `clean_spaces`, which only
+        // its `llama_detokenize` reads; `llama_token_to_piece`, what this
+        // crate mirrors, does not.) A gemma4 model names its pre-tokenizer
+        // itself and ignores the file's.
+        let pre = match model {
+            Model::Gpt2 => m.str("tokenizer.ggml.pre")?.unwrap_or(""),
+            Model::Gemma4 => "gemma4",
+        };
+        let Some(pretok) = crate::named(&Pre::NAMES, pre) else {
             return Err(Error::UnsupportedPre(pre.to_string()));
         };
         let merges = m
@@ -279,12 +297,15 @@ impl Vocab {
             attrs.push(types.as_ref().map_or(attr::NORMAL, |t| attr_of_type(t[i])));
         }
 
-        // Defaults for a gpt2 vocabulary, with the reference's per-name
-        // override (`glm4` names no BOS), then the file's ids where in range.
-        let mut sp = Specials {
-            bos: (pretok != Pre::Glm4).then_some(11),
-            eos: Some(11),
-            ..Specials::default()
+        // The model's defaults, with the reference's per-name override (`glm4`
+        // names no BOS), then the file's ids where in range.
+        let mut sp = match model {
+            Model::Gpt2 => Specials {
+                bos: (pretok != Pre::Glm4 && n > 11).then_some(11),
+                eos: (n > 11).then_some(11),
+                ..Specials::default()
+            },
+            Model::Gemma4 => Specials::default(),
         };
         {
             type Slot = fn(&mut Specials) -> &mut Option<u32>;
@@ -316,8 +337,17 @@ impl Vocab {
                 }
             }
         }
-        let add_bos = m.flag("tokenizer.ggml.add_bos_token")?.unwrap_or(false);
+        let add_bos =
+            m.flag("tokenizer.ggml.add_bos_token")?.unwrap_or(false) || pretok == Pre::Gemma4;
         let add_eos = m.flag("tokenizer.ggml.add_eos_token")?.unwrap_or(false);
+        // The reference asserts a BOS id wherever it adds a BOS, and an EOS
+        // id wherever it adds an EOS.
+        if add_bos && sp.bos.is_none() {
+            return Err(Error::Missing("tokenizer.ggml.bos_token_id"));
+        }
+        if add_eos && sp.eos.is_none() {
+            return Err(Error::Missing("tokenizer.ggml.eos_token_id"));
+        }
 
         let mut v = Vocab {
             texts,

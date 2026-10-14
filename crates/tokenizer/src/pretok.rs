@@ -1,7 +1,8 @@
 //! The pre-tokenizers of the vocabularies this crate runs, as the reference
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
 //! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`), [`Pre::Glm4`] (`glm4`),
-//! [`Pre::Qwen35`] (`qwen35`) and [`Pre::Pixtral`] (`pixtral`).
+//! [`Pre::Qwen35`] (`qwen35`), [`Pre::Pixtral`] (`pixtral`) and
+//! [`Pre::Gemma4`] (`gemma4`).
 //!
 //! ## deepseek-v3
 //!
@@ -83,7 +84,16 @@
 //! `glm4`: a pre-tokenizer word whose byte-encoded text is itself a vocabulary
 //! token is that token, and merges do not run on it. [`Pre::ignore_merges`]
 //! carries the flag for any pre, so the two names do not share a variant.
+//!
+//! ## gemma4
+//!
+//! One regex, `[^\n]+|[\n]+`, which the reference runs as the hand-written
+//! `unicode_regex_split_custom_newlines`: the fragment is cut into runs of
+//! U+000A and runs of everything else. `\r` is not a newline here. The words
+//! are not GPT-2 byte-level: the reference writes each space as U+2581 before
+//! the split and merges raw UTF-8 characters ([`Spelling::Metaspace`]).
 
+use crate::bpe::Spelling;
 use crate::unicode::collapse;
 
 const NUMBER: u8 = 0xD1;
@@ -331,11 +341,13 @@ pub(crate) enum Pre {
     /// `pixtral`: the llama3 regex [`Pre::Glm4`] runs, and a word that is
     /// itself a token is taken whole ([`Pre::ignore_merges`]).
     Pixtral,
+    /// `gemma4`: runs of newlines and runs of the rest, over metaspace text.
+    Gemma4,
 }
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 7] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 8] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -343,24 +355,23 @@ impl Pre {
         ("glm4", Pre::Glm4),
         ("qwen35", Pre::Qwen35),
         ("pixtral", Pre::Pixtral),
+        ("gemma4", Pre::Gemma4),
     ];
-
-    /// The pre-tokenizer `name` stands for; `None` for one this crate does
-    /// not run.
-    pub(crate) fn of(name: &str) -> Option<Pre> {
-        Pre::NAMES.iter().find(|(n, _)| *n == name).map(|&(_, p)| p)
-    }
-
-    /// [`Pre::NAMES`]' names, comma-separated.
-    pub(crate) fn names() -> String {
-        let names: Vec<&str> = Pre::NAMES.iter().map(|&(n, _)| n).collect();
-        names.join(", ")
-    }
 
     /// Whether a word that is itself a vocabulary token is taken whole,
     /// before merges. Any pre can carry it; `pixtral` does.
     pub(crate) fn ignore_merges(self) -> bool {
         matches!(self, Pre::Pixtral)
+    }
+
+    /// How this pre-tokenizer's words are spelled in the vocabulary.
+    pub(crate) fn spelling(self) -> Spelling {
+        match self {
+            Pre::Gemma4 => Spelling::Metaspace,
+            Pre::DeepseekV3 | Pre::Qwen2 | Pre::Glm4 | Pre::Qwen35 | Pre::Pixtral => {
+                Spelling::ByteLevel
+            }
+        }
     }
 }
 
@@ -380,6 +391,26 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
             &s.b
         }
         Pre::Qwen35 => split_qwen35(cpts, s),
+        Pre::Gemma4 => {
+            split_newlines(cpts, &mut s.b);
+            &s.b
+        }
+    }
+}
+
+/// `unicode_regex_split_custom_newlines` over one fragment: alternating runs
+/// of U+000A and of every other codepoint.
+fn split_newlines(cpts: &[u32], out: &mut Vec<usize>) {
+    out.clear();
+    let mut pos = 0;
+    while pos < cpts.len() {
+        let newline = cpts[pos] == u32::from(b'\n');
+        let n = cpts[pos..]
+            .iter()
+            .take_while(|&&c| (c == u32::from(b'\n')) == newline)
+            .count();
+        out.push(n);
+        pos += n;
     }
 }
 
@@ -647,6 +678,21 @@ mod tests {
         for &(text, want35, want2) in cases {
             assert_eq!(words(Pre::Qwen35, text), want35, "qwen35 {text:?}");
             assert_eq!(words(Pre::Qwen2, text), want2, "qwen2 {text:?}");
+        }
+    }
+
+    /// The gemma4 split cuts only between U+000A and the rest: spaces, tabs,
+    /// `\r` and punctuation stay inside their run.
+    #[test]
+    fn gemma4_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            ("a b, c", &["a b, c"]),
+            ("\n\n\n", &["\n\n\n"]),
+            ("a\n\nb\r\n", &["a", "\n\n", "b\r", "\n"]),
+            ("\n\tx \n", &["\n", "\tx ", "\n"]),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(words(Pre::Gemma4, text), want, "{text:?}");
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Ids back to text, `llama_token_to_piece` semantics.
 
 use crate::Tokenizer;
+use crate::bpe::Spelling;
 use crate::unicode::{byte_to_cpt_table, decode_lenient, encode_cpt};
 use crate::vocab::attr;
 
@@ -8,12 +9,13 @@ use crate::vocab::attr;
 /// `cache_token_to_piece`):
 ///
 /// * CONTROL, USER_DEFINED, UNKNOWN: the token text as written;
-/// * NORMAL: the text mapped back through the GPT-2 byte alphabet, where a
-///   character outside the alphabet becomes the reference's
-///   `[UNK_BYTE_0x<hex><text>]` marker;
+/// * NORMAL, byte-level: the text mapped back through the GPT-2 byte
+///   alphabet, where a character outside the alphabet becomes the
+///   reference's `[UNK_BYTE_0x<hex><text>]` marker;
+/// * NORMAL, metaspace: the text with each U+2581 written as a space;
 /// * BYTE: the byte its `<0xXX>` text names;
 /// * anything else: empty.
-pub(crate) fn pieces(texts: &[String], attrs: &[u32]) -> Vec<Box<[u8]>> {
+pub(crate) fn pieces(texts: &[String], attrs: &[u32], spelling: Spelling) -> Vec<Box<[u8]>> {
     let mut cpt_to_byte = [None::<u8>; 324];
     for (b, &cpt) in byte_to_cpt_table().iter().enumerate() {
         cpt_to_byte[cpt as usize] = Some(b as u8);
@@ -26,6 +28,9 @@ pub(crate) fn pieces(texts: &[String], attrs: &[u32]) -> Vec<Box<[u8]>> {
         .map(|(text, &a)| {
             if a & (attr::CONTROL | attr::USER_DEFINED | attr::UNKNOWN) != 0 {
                 return text.as_bytes().into();
+            }
+            if a & attr::NORMAL != 0 && spelling == Spelling::Metaspace {
+                return text.replace('\u{2581}', " ").into_bytes().into();
             }
             if a & attr::NORMAL != 0 {
                 let mut out = Vec::with_capacity(text.len());

@@ -42,7 +42,7 @@ dumps, real-file gates, timed runs).
 | # | Step | Owning files (new family) | Alone? |
 |---|---|---|---|
 | 1 | GGUF arch reading | `crates/model/src/arch/<arch>/{hparams,names,roles,spec,place}.rs`; arms in `arch/mod.rs` (`spec`), `crates/models/src/lib.rs` (`Arch`), `crates/placement/src/accepts.rs` (`program_of`, re-exported from `coverage`) | L; header meta test needs the real file's headers |
-| 2 | Tokenizer, chat template | `crates/tokenizer/src/pretok.rs:324`, `ChatSpec` `crates/models/src/lib.rs:589`, `chat_of` `arch/mod.rs:256`, tool parsers `crates/serve/src/{glmxml,qwenxml,dsml,hermes}.rs` | A for the code; the id oracle is B |
+| 2 | Tokenizer, chat template | `crates/tokenizer/src/pretok.rs:350`, `ChatSpec` `crates/models/src/lib.rs:589`, `chat_of` `arch/mod.rs:256`, tool parsers `crates/serve/src/{glmxml,qwenxml,dsml,hermes}.rs` | A for the code; the id oracle is B |
 | 3 | Refset family and its dump | `crates/refset/src/arch/<arch>/mod.rs` and the table `arch/mod.rs:17-28`; `tools/ref/models/<arch>.sh`, `tools/ref/build-ik-<arch>.sh`, `justfile:667` (`dump-ref-mimo2`) | A for the row's tests; the dump is B |
 | 4 | Fixture row | `crates/model/src/arch/<arch>/fixture.rs`, `crates/model/src/bin/fixture.rs:44`, `crates/refset/src/fixture.rs:33`, `tools/ref/ref-paths.sh:73-79` | generate L; its `fx_` oracle sets B |
 | 5 | Card body | `crates/gpu-<arch>/` (or `crates/gpu/src/arch/...` for a variant); root `Cargo.toml:3`, `crates/gpu-gates/Cargo.toml` | G to build and run |
@@ -79,11 +79,13 @@ KV-head loop). A float array with a scalar fallback (GLM's clamps) stays the fam
 
 ### 2. Tokenizer and template
 
-`tokenizer.ggml.pre` must be one of the pre-tokenizers the tokenizer runs (`pretok.rs:338`: `deepseek-v3`, `qwen2`,
-`glm4`, `qwen35`, `pixtral` and two aliases); `coverage` asks `runs_pre_tokenizer` (`crates/tokenizer/src/lib.rs:54`) at
-every plan, so an unknown one is a named refusal, not a wrong id. `ignore_merges` is a property of the pre
-(`Pre::ignore_merges`, `pretok.rs:362`): `pixtral` takes a word whose byte-encoded text is itself a vocabulary token,
-and the others merge. MiMo needed no new tokenizer code: its spec reads `qwen2`,
+`tokenizer.ggml.model` must be `gpt2` (GPT-2 byte-level BPE) or `gemma4` (BPE over metaspace text) (`vocab.rs:117`). For
+`gpt2`, `tokenizer.ggml.pre` must be one of the pre-tokenizers the tokenizer runs (`pretok.rs:350`: `deepseek-v3`,
+`qwen2`, `glm4`, `qwen35`, `pixtral`, `gemma4` and two aliases); a `gemma4` model always runs `gemma4`, as the reference
+does, whatever the file names. `coverage` asks `runs_pre_tokenizer` (`crates/tokenizer/src/lib.rs:56`) at every plan, so
+an unknown one is a named refusal, not a wrong id. `ignore_merges` is a property of the pre (`Pre::ignore_merges`,
+`pretok.rs:363`): `pixtral` takes a word whose byte-encoded text is itself a vocabulary token, and the others merge.
+MiMo needed no new tokenizer code: its spec reads `qwen2`,
 `ToolFormat::QwenXml` and the `<think>` span (`crates/model/src/arch/mimo2/spec.rs:25,31`). A new tool-call syntax is a
 new `ToolFormat` variant (`models/lib.rs:602`) with its parser in `crates/serve/src/`, tested with the mock engine.
 The oracle for ids is ik's `llama-tokenize` (`crates/tokenizer/tools/oracle.sh`, `tests/tokenizer.rs:243`): B. A
