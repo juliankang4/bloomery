@@ -784,15 +784,20 @@ impl TierPage {
         self.layout.word_off(tier, w)
     }
 
+    /// Byte offset of every counter of tier `tier`, each row's go and then
+    /// its done: what a release, a rest check and a reset of the tier take.
+    fn counters(&self, tier: usize) -> impl Iterator<Item = usize> + '_ {
+        (0..self.layout.rows)
+            .flat_map(|r| [TWord::Go(r), TWord::Cnt(r)])
+            .map(move |w| self.off(tier, w))
+    }
+
     /// Release every wait of both cards on tier `tier`'s words that is still
     /// pending, for good: the tier's counters and go counters go far past
     /// anything a step subtracts, every row's go and done in one link call
     /// ([`Link::release`]).
     pub(super) fn release(&self, tier: usize) {
-        let offs: Vec<usize> = (0..self.layout.rows)
-            .flat_map(|r| [TWord::Go(r), TWord::Cnt(r)])
-            .map(|w| self.off(tier, w))
-            .collect();
+        let offs: Vec<usize> = self.counters(tier).collect();
         self.link.release(&offs, RELEASE);
     }
 
@@ -1494,10 +1499,7 @@ impl TierCard {
     /// Whether the tier's words hold what a drained step leaves: no go and
     /// no signal pending, every layer asked of it served.
     pub(super) fn at_rest(&self, page: &TierPage) -> bool {
-        (0..page.layout.rows).all(|r| {
-            page.link.at_rest(page.off(self.index, TWord::Go(r)))
-                && page.link.at_rest(page.off(self.index, TWord::Cnt(r)))
-        }) && !self.behind(page)
+        page.counters(self.index).all(|off| page.link.at_rest(off)) && !self.behind(page)
     }
 
     /// Back to a fresh tier's words once the tier's stream has drained:
@@ -1506,9 +1508,8 @@ impl TierCard {
     /// reset calls it.
     pub(super) fn reset(&mut self, page: &TierPage) -> Result<(), GpuError> {
         self.gpu.stream().synchronize()?;
-        for r in 0..page.layout.rows {
-            page.link.reset(page.off(self.index, TWord::Go(r)));
-            page.link.reset(page.off(self.index, TWord::Cnt(r)));
+        for off in page.counters(self.index) {
+            page.link.reset(off);
         }
         self.issued = self.progress(page);
         self.clear_fault(page)
