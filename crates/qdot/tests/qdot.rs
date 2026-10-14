@@ -6002,6 +6002,45 @@ fn hw_lanes_match_dot_row_synthetic() {
     }
 }
 
+/// `dot_row` on a Q4_K row refuses a `BLOOMERY_QDOT_AVX512` value other than
+/// `0` or `1` by name on every architecture and CPU, before it picks a body:
+/// the test reruns itself in a fresh process with the lever at `2`, since
+/// [`qdot::q4k_avx512`] reads it once a process.
+#[test]
+fn dot_row_refuses_a_qdot_lever_value_by_name() {
+    // The fresh process's own argument: a filter no test's name is.
+    const FRESH: &str = "a-fresh-process-for-the-qdot-lever";
+    if !std::env::args().any(|a| a == FRESH) {
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "dot_row_refuses_a_qdot_lever_value_by_name",
+                FRESH,
+            ])
+            .env("BLOOMERY_QDOT_AVX512", "2")
+            .output()
+            .expect("the fresh process");
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "the fresh process: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let ty = GgmlType::Q4_K;
+    let row = lane_rows(ty, 256, 1, 0x5a12_0001);
+    let col = &lane_columns(ty, 256)[0];
+    let dot = std::panic::catch_unwind(|| qdot::dot_row(ty, &row, col, 256));
+    let e = dot.expect_err("a refused lever value must stop dot_row");
+    let e = e.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        e.contains("BLOOMERY_QDOT_AVX512=\"2\""),
+        "the refusal names the lever, got {e:?}"
+    );
+    println!("refusal: {e}");
+}
+
 /// Q4_K's selected one-column body equals its AVX2 body and scalar mirror
 /// bit for bit on seeded and full-code rows. Its row lanes equal dot_row.
 /// The printed line names the selected body.
