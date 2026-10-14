@@ -690,7 +690,7 @@ impl TierPage {
             link.store(layout.word_off(t, TWord::Fault), FAULT_NONE);
         }
         let img = layout.image;
-        let end = link.stage_end();
+        let end = link.own_end();
         let stage_rows = (0..layout.rows)
             .map(|r| {
                 // SAFETY: row r's image (`img.words()` words, every tier's
@@ -792,7 +792,7 @@ impl TierPage {
         self.check_row(row, what)?;
         let k = self.check_tiers(tiers, layer as usize, what)?;
         let (lyr, gen_, seq) = boundary.go_words(row, what)?;
-        let end = self.link.stage_end();
+        let end = self.link.own_end();
         let mut ops = [op_barrier_sys(); 5 + MAX_TIERS];
         ops[1] = crate::graph::op_write(lyr, layer);
         for (op, &t) in ops[2..].iter_mut().zip(tiers) {
@@ -832,7 +832,7 @@ impl TierPage {
         self.check_row(row, what)?;
         let k = self.check_tiers(tiers, layer, what)?;
         let host = boundary.cnt_word(row, what)?;
-        let end = self.link.stage_end();
+        let end = self.link.own_end();
         let mut ops = [op_wait_geq(host, 1); 2 + 2 * MAX_TIERS];
         ops[1 + k] = op_add(host, u32::MAX);
         for (i, &t) in tiers.iter().enumerate() {
@@ -1269,7 +1269,7 @@ impl TierWork {
         }
         let counters = layout.counters(index).collect();
         let link = Link::open_across(self.gpu.context(), path, bytes, counters)?;
-        self.bind(layout, index, link.stage_end());
+        self.bind(layout, index, link.own_end());
         self.link = Some(link);
         Ok(())
     }
