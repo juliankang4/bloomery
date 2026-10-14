@@ -2126,11 +2126,7 @@ if [ -n "$DRY" ]; then
 fi
 
 majflt_require depth-ds41.sh
-timing_cards_precheck || {
-  rc=$?
-  echo "depth-ds41.sh: two cards, refused before the lease: $TWOCARD_WHY" >&2
-  exit "$rc"
-}
+timing_cards_before_lease
 lease_take
 timing_cards_start
 [ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"

@@ -263,11 +263,7 @@ if [ -n "$DRY" ]; then
   exit 0
 fi
 majflt_require ik-draft.sh
-timing_cards_precheck || {
-  rc=$?
-  echo "ik-draft.sh: two cards, refused before the lease: $TWOCARD_WHY" >&2
-  exit "$rc"
-}
+timing_cards_before_lease
 
 lease_take
 timing_cards_start

@@ -1288,11 +1288,7 @@ means() { # means <unit>: `label|key|round|value[|N]` on stdin, one mean line pe
 }
 
 majflt_require depth-glm5next.sh
-timing_cards_precheck || {
-  rc=$?
-  echo "depth-glm5next.sh: two cards, refused before the lease: $TWOCARD_WHY" >&2
-  exit "$rc"
-}
+timing_cards_before_lease
 lease_take
 timing_cards_start
 [ -z "$TIMING_CARDS" ] || echo "[config] $(tc_config)"

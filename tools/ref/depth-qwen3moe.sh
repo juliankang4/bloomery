@@ -2814,11 +2814,7 @@ fi
 
 majflt_require depth-qwen3moe.sh
 DRIVE_DEV=$(drive_dev "$MODEL") || exit 2
-timing_cards_precheck || {
-  rc=$?
-  echo "depth-qwen3moe.sh: ${TIMING_CARDS:+two cards, }refused before the lease: $TWOCARD_WHY" >&2
-  exit "$rc"
-}
+timing_cards_before_lease
 lease_take
 timing_cards_start
 [ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"

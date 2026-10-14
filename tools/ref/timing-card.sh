@@ -448,6 +448,15 @@ timing_cards_precheck() {
   echo "${pre}[timing-cards] Xid reader: journalctl -k, NVRM Xid lines on PCI:$XID_BUS_A (A6000) and PCI:$XID_BUS_B (3090)"
 }
 
+# timing_cards_before_lease: timing_cards_precheck right before lease_take, its refusal the runner's end: the
+# reason under the runner's name (after `two cards, ` in the two-card mode) and the precheck's rc.
+timing_cards_before_lease() {
+  timing_cards_precheck && return 0
+  local rc=$?
+  echo "${0##*/}: ${TIMING_CARDS:+two cards, }refused before the lease: $TWOCARD_WHY" >&2
+  exit "$rc"
+}
+
 # timing_cards_start: right after lease_take, the lease's start instant, from which the witness counts
 # the kernel's Xid lines (XID_T0, whole seconds: a line in the second the lease was taken counts). The same
 # in local mode, its line `[timing-card]`.
