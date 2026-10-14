@@ -1,30 +1,30 @@
 //! GPU gate for EmbeddingGemma 2's encoder (`bloomery-gpu-gemma-embedding2`)
-//! end to end on the Q8_0 file (`--model FILE`, else [`MODEL`]: the path the
-//! sets' `# model` line must name), against llama.cpp mainline's text set dumped
-//! on the card ([`TEXT_SET`]) and its CPU twin ([`TEXT_CPU_SET`]): each case
-//! the set names, its ids read from the ids set and held to the set's count
+//! end to end on the Q8_0 file the sets are dumped from ([`MODEL`], held to
+//! its sha256), against llama.cpp mainline's text set dumped on the card
+//! ([`TEXT`]) and its CPU twin ([`TEXT_CPU`]), both read through
+//! [`Emb2Set::open`]: each case the set names, its ids read from the
+//! tokenizer oracle's gemma4 set ([`IDS_SET`]) and held to the set's count
 //! and digest, through one pass at the load's context with its taps read
 //! back.
 //!
 //! A row's band is [`TWIN`] times the CPU twin's own distance from the card
 //! set, and at least [`FLOOR`]: the twin is the floor any two realizations of
-//! the graph lie apart (the Qwen seats' rule, `shared/glm5next_media.rs`).
+//! the graph lie apart (the Qwen seats' rule, `shared/glm5next_media.rs`). A
+//! row is within its band only when its distance and the twin's are finite.
 //!
 //! 1. (t) Per case: `inp_scaled` bit for bit (the host's token rows times
 //!    `√hidden`, the one f32 multiply `ggml_scale` makes); `inp_per_layer`,
 //!    every layer's `l_out`, `result_norm`, the token rows against `embd`
 //!    and their mean ([`Pass::pooled`]) against `pooled`, each within its
-//!    band. A case over more positions than a sliding layer reaches on both
-//!    sides holds the window; every case holds the global layers.
+//!    band. A case longer than a sliding layer's reach plus one catches a
+//!    dropped window; a set with no such case fails by name. The host test
+//!    `key_bounds_are_the_symmetric_mask` holds the exact key edges; every
+//!    case holds the global layers.
 //! 2. (d) The longest case run again with no taps is bit for bit the first
 //!    run's rows.
 //! 3. (r) Refused by name, the load untouched after each: a pass of no ids,
 //!    of one id past the load's context and of an id past the vocabulary,
 //!    and a load at one position past [`CARD_CTX`].
-//!
-//! The sets' family is the refset branch's `text-gemma-embedding2` row, its
-//! names and pins mirrored here ([`text_family`]) until the gate reads it from
-//! `refset::arch`.
 
 #[cfg(feature = "gemma-embedding2")]
 fn main() -> std::process::ExitCode {
@@ -42,74 +42,47 @@ mod e2e;
 #[cfg(feature = "gemma-embedding2")]
 mod gate {
     use std::path::Path;
-    use std::process::Command;
-    use std::sync::OnceLock;
     use std::time::Instant;
 
     use crate::e2e::{clause, elapsed, refused_by, rel, same_bits, tap};
     use bloomery_gpu::Gpu;
-    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, sha256, verdict};
     use bloomery_gpu_gemma_embedding2::{Encoder, Pass, card_bytes};
     use gguf::Split;
     use model::arch::gemma_embedding2::hparams::{CARD_CTX, Hparams};
-    use refset::RefError;
-    use refset::family::{Build, Family, Identity};
-
-    /// The file every set is dumped from, unless `--model` names another.
-    const MODEL: &str = "/models/embeddinggemma-2/embeddinggemma-2-Q8_0.gguf";
-    /// The mainline commit every set names in its `# build` line.
-    const LCPP_BUILD: &str = "6868a52cb";
-    const ARCH: &str = "gemma-embedding2";
-    /// The text set dumped on the card, and its CPU twin.
-    const TEXT_SET: &str = "ref_gemma_embedding2_text";
-    const TEXT_CPU_SET: &str = "ref_gemma_embedding2_text.cpu";
-    /// The ids of every case, `<id>.ids`, one id a line.
-    const IDS_SET: &str = "ref_gemma_embedding2_ids";
-    const RECIPE: &str = "just dump-ref-gemma-embedding2";
-    const CONSUMERS: &[&str] = &["gate-gpu-gemma-embedding2-e2e"];
+    use refset::arch::gemma_embedding2::{IDS_SET, MODEL, MODEL_SHA256, TEXT, TEXT_CPU};
+    use refset::emb2::Emb2Set;
+    use refset::family::Family;
+    use refset::ik::RefHeader;
+    use refset::tokenizer::read_ids;
 
     /// A row's band: this many times the CPU twin's distance from the card
     /// set (`shared/glm5next_media.rs`'s `TWIN`, the Qwen seats' rule).
     const TWIN: f64 = 2.5;
 
-    /// The least band, derived: a q8_0 GEMM input is rounded to a step of
-    /// `amax / 127` a block of 32, an rms error of `step / √12`; a block
-    /// whose largest value is 2.5 of its rms rounds at
-    /// `2.5 / (127 · √12) ≈ 5.7e-3` of it, and the card set rounds its own
-    /// input apart from ours, `√2` that, `8e-3`, rounded up.
+    /// The least band.
+    // PIN(2026-10-15): 1e-2 over the distances whose twin band is smaller,
+    // measured on a DGX Spark: `inp_per_layer` 1.344e-3 to 1.594e-3 against
+    // twins of 1.066e-7 to 2.410e-7 in every case, and the shortest cases'
+    // `l_out` up to 9.046e-3 at layer 0.
     const FLOOR: f64 = 1.0e-2;
-
-    /// `--model`'s file, set once at the start of [`run`].
-    static RUNS: OnceLock<String> = OnceLock::new();
-
-    /// The text file the gate runs: `--model`'s, else [`MODEL`].
-    fn model() -> Result<String, RefError> {
-        Ok(RUNS.get().map_or_else(|| MODEL.to_string(), Clone::clone))
-    }
-
-    /// The family of the text sets, as the refset branch's row names it.
-    const fn text_family(name: &'static str, set: &'static [&'static str]) -> Family {
-        Family {
-            name,
-            sets: set,
-            resolve: None,
-            recipe: RECIPE,
-            identity: Identity::Manifest,
-            arch: Some(ARCH),
-            build: Some(Build::Is(LCPP_BUILD)),
-            runs: Some(model),
-            draft_runs: None,
-            consumers: CONSUMERS,
-        }
-    }
-
-    static TEXT: Family = text_family("text-gemma-embedding2", &[TEXT_SET]);
-    static TEXT_CPU: Family = text_family("text-gemma-embedding2-cpu", &[TEXT_CPU_SET]);
 
     /// One case of the set: its name and its ids.
     struct Case {
         id: String,
         ids: Vec<u32>,
+    }
+
+    fn check_case_identities(card: &RefHeader, cpu: &RefHeader) -> Result<(), GateError> {
+        if !card
+            .other
+            .iter()
+            .filter(|line| line.starts_with("# case\t"))
+            .eq(cpu.other.iter().filter(|line| line.starts_with("# case\t")))
+        {
+            return Err("CPU twin case identities differ from the card set".into());
+        }
+        Ok(())
     }
 
     /// The cases `man`'s `# case <id> <n> <path> <sha256>` lines name, each
@@ -124,20 +97,17 @@ mod gate {
             };
             let fields: Vec<&str> = rest.split('\t').collect();
             let [id, n, _, sha] = fields[..] else {
-                return Err(format!("{TEXT_SET}: a case line of another shape: {line:?}").into());
+                return Err(
+                    format!("{}: a case line of another shape: {line:?}", TEXT.name).into(),
+                );
             };
             let path = dir.join(format!("{id}.ids"));
-            let ids = std::fs::read_to_string(&path)
-                .map_err(|e| format!("{}: {e}", path.display()))?
-                .lines()
-                .map(|t| {
-                    t.trim()
-                        .parse::<u32>()
-                        .map_err(|e| format!("{}: id {t:?}: {e}", path.display()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let want = n
+                .parse::<usize>()
+                .map_err(|e| format!("{}: case {id}: token count {n:?}: {e}", TEXT.name))?;
+            let ids = read_ids(&path, want)?;
             let digest = sha256(&path)?;
-            if ids.len().to_string() != n || digest != sha {
+            if digest != sha {
                 return Err(format!(
                     "{}: {} ids of digest {digest}; the set's case line says {n} of {sha}",
                     path.display(),
@@ -151,30 +121,40 @@ mod gate {
             });
         }
         if out.is_empty() {
-            return Err(format!("{TEXT_SET}: no case line").into());
+            return Err(format!("{}: no case line", TEXT.name).into());
         }
         Ok(out)
     }
 
-    /// The sha256 of the file at `path`, as `sha256sum` prints it.
-    fn sha256(path: &Path) -> Result<String, GateError> {
-        let out = Command::new("sha256sum").arg(path).output()?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        match text.split_whitespace().next() {
-            Some(h) if out.status.success() => Ok(h.to_owned()),
-            _ => Err(format!("sha256sum {}: {:?}", path.display(), text.trim()).into()),
-        }
+    /// One row held to the card set: its distance, the twin's and the band.
+    struct Held {
+        r: f64,
+        twin: f64,
+        band: f64,
     }
 
-    /// One row held to the card set: ours, the card set's and the twin's.
-    /// Its line and whether it is within its band.
-    fn held(what: &str, ours: &[f32], card: &[f32], twin: &[f32]) -> (String, bool) {
-        let (r, floor) = (rel(ours, card), rel(twin, card));
-        let band = (TWIN * floor).max(FLOOR);
-        (
-            format!("{what} {r:.3e} (twin {floor:.3e}, band {band:.3e})"),
-            r <= band,
-        )
+    impl Held {
+        fn of(ours: &[f32], card: &[f32], twin: &[f32]) -> Held {
+            let (r, twin) = (rel(ours, card), rel(twin, card));
+            Held {
+                r,
+                twin,
+                band: (TWIN * twin).max(FLOOR),
+            }
+        }
+
+        /// Within the band, both distances finite: `rel` makes a NaN or a
+        /// length mismatch infinite, and an infinite twin an infinite band.
+        fn ok(&self) -> bool {
+            self.r.is_finite() && self.twin.is_finite() && self.r <= self.band
+        }
+
+        fn line(&self, what: &str) -> String {
+            format!(
+                "{what} {:.3e} (twin {:.3e}, band {:.3e})",
+                self.r, self.twin, self.band
+            )
+        }
     }
 
     /// Clause (t) for one case: its pass with taps, held tap by tap. The
@@ -189,54 +169,44 @@ mod gate {
         let pass = enc.pass(&c.ids, true)?;
         let taps = pass.taps.as_ref().ok_or("a pass with taps returned none")?;
         let row = |m: &RefManifest, name: &str| tap(m, &format!("{}/{name}", c.id));
-        let pair = |name: &str| -> Result<(Vec<f32>, Vec<f32>), GateError> {
-            Ok((row(man, name)?, row(cpu, name)?))
+        let held = |name: &str, ours: &[f32]| -> Result<Held, GateError> {
+            Ok(Held::of(ours, &row(man, name)?, &row(cpu, name)?))
         };
         let mut ok = true;
         let mut lines = Vec::new();
         let exact = same_bits(&taps.inp_scaled, &row(man, "inp_scaled")?);
         lines.push(format!("inp_scaled bits {}", verdict(exact)));
         ok &= exact;
-        let (card, twin) = pair("inp_per_layer")?;
-        let (line, pass_ok) = held("inp_per_layer", &taps.inp_per_layer, &card, &twin);
-        lines.push(line);
-        ok &= pass_ok;
+        let h = held("inp_per_layer", &taps.inp_per_layer)?;
+        lines.push(h.line("inp_per_layer"));
+        ok &= h.ok();
         // The worst layer by its distance over its band.
-        let mut worst = (0.0f64, 0usize, String::new());
+        let mut worst = (0.0f64, String::new());
         for (l, ours) in taps.l_out.iter().enumerate() {
-            let (card, twin) = pair(&format!("l_out-{l}"))?;
-            let (r, floor) = (rel(ours, &card), rel(&twin, &card));
-            let band = (TWIN * floor).max(FLOOR);
-            if r > band {
+            let h = held(&format!("l_out-{l}"), ours)?;
+            if !h.ok() {
                 println!(
-                    "(t) {}: layer {l} l_out {r:.3e} past its band {band:.3e} {}",
+                    "(t) {}: {} past its band {}",
                     c.id,
+                    h.line(&format!("layer {l} l_out")),
                     verdict(false)
                 );
                 ok = false;
             }
-            if r / band >= worst.0 {
-                worst = (
-                    r / band,
-                    l,
-                    format!("l_out worst layer {l} {r:.3e} (band {band:.3e})"),
-                );
+            if h.r / h.band >= worst.0 {
+                worst = (h.r / h.band, h.line(&format!("l_out worst layer {l}")));
             }
         }
-        lines.push(worst.2);
-        for (what, ours, name) in [
-            ("result_norm", &taps.result_norm, "result_norm"),
-            ("embd", &pass.rows, "embd"),
+        lines.push(worst.1);
+        for (what, ours) in [
+            ("result_norm", &taps.result_norm),
+            ("embd", &pass.rows),
+            ("pooled", &pass.pooled),
         ] {
-            let (card, twin) = pair(name)?;
-            let (line, pass_ok) = held(what, ours, &card, &twin);
-            lines.push(line);
-            ok &= pass_ok;
+            let h = held(what, ours)?;
+            lines.push(h.line(what));
+            ok &= h.ok();
         }
-        let (card, twin) = pair("pooled")?;
-        let (line, pass_ok) = held("pooled", &pass.pooled, &card, &twin);
-        lines.push(line);
-        ok &= pass_ok;
         println!(
             "(t) {}: {} ids, {}; {:.1} ms (runtime value) {}",
             c.id,
@@ -246,6 +216,23 @@ mod gate {
             verdict(ok)
         );
         Ok((ok, pass))
+    }
+
+    /// A case long enough for a dropped window to leave the tap bands:
+    /// some row's keys stop short of the input's ends. The host test holds
+    /// the exact edges. No sliding layer passes; a set with no such case fails.
+    fn window(hp: &Hparams, cases: &[Case]) -> bool {
+        let Some(reach) = (0..hp.n_layer).filter_map(|l| hp.reach(l)).max() else {
+            return true;
+        };
+        let longest = cases.iter().map(|c| c.ids.len()).max().unwrap_or(0);
+        let held = longest > reach + 1;
+        println!(
+            "(t) the window: the longest case holds {longest} ids, a sliding layer reaches {reach} \
+             on each side {}",
+            verdict(held)
+        );
+        held
     }
 
     /// Clause (r): each refusal by its words, and a pass after them the
@@ -290,34 +277,43 @@ mod gate {
         Ok(ok && same)
     }
 
+    /// `family`'s set, read through its reader.
+    fn open(family: &Family) -> Result<RefManifest, GateError> {
+        Ok(Emb2Set::open(&family.path(family.sets[0]), family)?.man)
+    }
+
     pub fn run() -> Result<(), GateError> {
+        bloomery_levers::at_main(&[])?;
         let args: Vec<String> = std::env::args().skip(1).collect();
-        match &args[..] {
-            [] => {}
-            [flag, file] if flag == "--model" => {
-                RUNS.set(file.clone()).map_err(|_| "--model is set once")?;
-            }
-            _ => return Err(format!("usage: [--model FILE]; got {args:?}").into()),
+        if !args.is_empty() {
+            return Err(format!("no arguments; got {args:?}").into());
         }
-        let path = model()?;
-        let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        let hp = Hparams::read(&split).map_err(|e| format!("{path}: {e}"))?;
+        let digest = sha256(Path::new(MODEL))?;
+        if digest != MODEL_SHA256 {
+            return Err(format!(
+                "{MODEL}: sha256 {digest}, the sets are dumped from {MODEL_SHA256}"
+            )
+            .into());
+        }
+        let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let hp = Hparams::read(&split).map_err(|e| format!("{MODEL}: {e}"))?;
         let ctx = CARD_CTX;
         let bytes = card_bytes(&split, ctx)?;
-        let man = RefManifest::open(&TEXT.path_in(&data_dir(), TEXT_SET), &TEXT)?;
-        let cpu = RefManifest::open(&TEXT_CPU.path_in(&data_dir(), TEXT_CPU_SET), &TEXT_CPU)?;
+        let man = open(&TEXT)?;
+        let cpu = open(&TEXT_CPU)?;
+        check_case_identities(&man.header, &cpu.header)?;
         let cases = cases(&man)?;
         let gpu = Gpu::new()?;
         println!(
-            "gate_gemma_embedding2_e2e: device {}: {path} at {ctx} positions, card figure {bytes} B; \
+            "gate_gemma_embedding2_e2e: device {}: {MODEL} at {ctx} positions, card figure {bytes} B; \
              {} cases; band {TWIN} x the CPU twin, at least {FLOOR:e}",
             gpu.device_name()?,
             cases.len()
         );
+        let mut ok = window(&hp, &cases);
         let t = Instant::now();
         let mut enc = Encoder::open(split, ctx, gpu)?;
         elapsed("(open)", &t);
-        let mut ok = true;
         let mut longest: Option<(usize, Pass)> = None;
         for (i, c) in cases.iter().enumerate() {
             let r = case(&mut enc, c, &man, &cpu).map(|(pass_ok, pass)| {
@@ -355,7 +351,7 @@ mod gate {
                 refusals(&mut enc, c, &first.rows, hp.n_vocab),
             );
         }
-        let past = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        let past = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         let refused = refused_by(
             &Encoder::open(past, ctx + 1, Gpu::new()?),
             "Encoder::open",
@@ -368,5 +364,26 @@ mod gate {
         );
         ok &= refused;
         if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{RefHeader, check_case_identities};
+
+        #[test]
+        fn a_cpu_case_of_another_digest_is_refused_by_name() {
+            let card = RefHeader {
+                other: vec![format!(
+                    "# case\tcases/01\t2\tcases/01.ids\t{}",
+                    "a".repeat(64)
+                )],
+                ..RefHeader::default()
+            };
+            let mut cpu = card.clone();
+            check_case_identities(&card, &cpu).unwrap();
+            cpu.other[0] = cpu.other[0].replace(&"a".repeat(64), &"b".repeat(64));
+            let err = check_case_identities(&card, &cpu).unwrap_err().to_string();
+            assert_eq!(err, "CPU twin case identities differ from the card set");
+        }
     }
 }

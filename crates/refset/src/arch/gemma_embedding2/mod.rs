@@ -47,6 +47,9 @@ pub const MMPROJ_BF16_SHA256: &str =
 /// The architecture the text and server sets name in their `# arch` line.
 pub const ARCH: &str = "gemma-embedding2";
 
+/// The tokenizer oracle set that supplies the text cases.
+pub const IDS_SET: &str = "ref-tokenizer-gemma4";
+
 /// The text sets.
 pub const TEXT_SET: &str = "ref_gemma_embedding2_text";
 pub const TEXT_CPU_SET: &str = "ref_gemma_embedding2_text.cpu";
@@ -77,26 +80,35 @@ fn mmproj() -> Result<String, RefError> {
     Ok(MMPROJ_BF16.to_string())
 }
 
+/// The gate that reads the text sets.
+const E2E: &[&str] = &["gate-gpu-gemma-embedding2-e2e"];
+
 /// The text cases' token rows, pooled vectors and layer taps on the card.
-pub static TEXT: Family = family(
-    "text-gemma-embedding2",
-    &[TEXT_SET],
-    Kind::Text,
-    &PROFILE,
-    ARCH,
-    model,
-    RECIPE,
-);
+pub static TEXT: Family = Family {
+    consumers: E2E,
+    ..family(
+        "text-gemma-embedding2",
+        &[TEXT_SET],
+        Kind::Text,
+        &PROFILE,
+        ARCH,
+        model,
+        RECIPE,
+    )
+};
 /// The same, with no card in view.
-pub static TEXT_CPU: Family = family(
-    "text-gemma-embedding2-cpu",
-    &[TEXT_CPU_SET],
-    Kind::TextCpu,
-    &PROFILE,
-    ARCH,
-    model,
-    RECIPE,
-);
+pub static TEXT_CPU: Family = Family {
+    consumers: E2E,
+    ..family(
+        "text-gemma-embedding2-cpu",
+        &[TEXT_CPU_SET],
+        Kind::TextCpu,
+        &PROFILE,
+        ARCH,
+        model,
+        RECIPE,
+    )
+};
 /// The image cases' tower taps and rows on the card.
 pub static TOWER: Family = family(
     "tower-gemma4v",

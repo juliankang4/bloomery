@@ -1242,12 +1242,14 @@ gate-gpu-qwen35moe-attn:
 gate-gpu-gemma-embedding2-head512:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding2_head512 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_head512'
 
-# EmbeddingGemma 2's encoder (gpu-gemma-embedding2) end to end on the Q8_0 file (--model FILE, else
-# the path the sets were dumped from): every text case of mainline's card set through one pass, its
-# taps within the CPU twin's band, a rerun bit for bit, and the refusals by name.
-gate-gpu-gemma-embedding2-e2e *ARGS:
+# EmbeddingGemma 2's encoder (gpu-gemma-embedding2) end to end on the Q8_0 file the sets are dumped from
+# (refset's gemma_embedding2::MODEL, held to its sha256; the sets' `# model` line names the same path): every
+# text case of mainline's card set (just dump-ref-emb2) through one pass, its taps within the CPU twin's band,
+# a rerun bit for bit, and the refusals by name.
+gate-gpu-gemma-embedding2-e2e:
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gemma-embedding2 --lib -- --include-ignored'
-    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e {{ARGS}}'
+    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gemma-embedding2 --bin gate_gemma_embedding2_e2e'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e'
 
 # GLM-5.3-Flash MLA 층의 카드 부분 — 잠재 RMS + f16 추가, 인덱서 키 LayerNorm + [키; 게이트] 추가(`latent`),
 # 창 0·싱크 −∞·스케일 1/16으로 다시 쓰는 V4.1 어텐션 — 을 모델 없이 합성 입력으로 호스트 규칙에 맞춘다.

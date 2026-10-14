@@ -76,22 +76,27 @@ impl Text {
             ("nps.ids", self.nps_ids)
         };
         let path = self.dir.join(format!("{}.{ext}", self.name));
-        let bytes = std::fs::read(&path)
-            .map_err(|e| RefError::missing(&path, format!("{}: {e}", path.display())))?;
-        let text = String::from_utf8(bytes)
-            .map_err(|e| RefError::malformed(path.display(), format!("not UTF-8: {e}")))?;
-        let mut ids = Vec::with_capacity(want);
-        for (i, line) in text.lines().enumerate() {
-            ids.push(parse_field(line, "id", &At(&path, i + 1))?);
-        }
-        if ids.len() != want {
-            return Err(RefError::malformed(
-                path.display(),
-                format!("{} ids, the manifest's row names {want}", ids.len()),
-            ));
-        }
-        Ok(ids)
+        read_ids(&path, want)
     }
+}
+
+/// Read one token id per line, refusing a malformed id or a count other than `want`.
+pub fn read_ids(path: &Path, want: usize) -> Result<Vec<u32>, RefError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| RefError::missing(path, format!("{}: {e}", path.display())))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|e| RefError::malformed(path.display(), format!("not UTF-8: {e}")))?;
+    let mut ids = Vec::with_capacity(want);
+    for (i, line) in text.lines().enumerate() {
+        ids.push(parse_field(line, "id", &At(path, i + 1))?);
+    }
+    if ids.len() != want {
+        return Err(RefError::malformed(
+            path.display(),
+            format!("{} ids, the manifest's row names {want}", ids.len()),
+        ));
+    }
+    Ok(ids)
 }
 
 /// A tokenizer set's manifest and, once opened, its texts' digests checked.
