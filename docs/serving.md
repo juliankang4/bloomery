@@ -37,8 +37,8 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   other than the embedding model's is a 400 `invalid_request_error` and runs no pass; `null` is unset.
   `/embedding` and `/embeddings` ignore `model`. An input past the model's context is a 400
   `exceed_context_size_error` naming both lengths. llama-server checks its physical batch first and answers an input
-  past it with a 500; this server has no batch limit there. An object input (`prompt_string`, or a `content` array
-  of parts) is a 400.
+  past it with a 500; this server has no batch limit there. An object with a `content` array takes text and image
+  parts as described below. An object with `prompt_string` is a 400.
 - **Tool calls on every generative model**: DeepSeek-V4.1-Flash (DSML), GLM-5.3-Flash (its XML), Qwen3-30B
   (Hermes JSON), Qwen3.6-35B and Qwen3.8-Flash-Next (the `<function=…><parameter=…>` markup) parse into
   `tool_calls` and `tool_use` blocks, so agent clients work against each of them.
@@ -256,3 +256,74 @@ binary's `--help`.
 - A pinned nightly with a pinned cuda-oxide revision from our fork ([`BUILD.md`](BUILD.md)).
 
 In progress: serving on N cards for every model; Clef from the IQ and Q2_K files; DeepSeek-V4-Flash-0731.
+
+## EmbeddingGemma 2 images
+
+A side seat serves the `gemma-embedding2` encoder beside a generative model. Build `bloomery-serve` with
+`--features glm5next,clef,mimo2,gemma-embedding2,vision` through `cargo oxide`, and add these flags to the chat
+model's command:
+
+```text
+--embd-model embeddinggemma-2-Q8_0.gguf
+--embd-mmproj mmproj-embeddinggemma-2-BF16.gguf
+--embd-ctx 8192
+```
+
+`--embd-hf <repo>[:<quant>]` selects the text file and the row's BF16 projector from that repository.
+`--embd-no-mmproj` disables that automatic projector. A local `--embd-model` loads images only with an explicit
+`--embd-mmproj`. The projector's vision matrices must be BF16; a Q8_0 projector is refused by tensor name.
+The F32 patch convolution and learned position tables retain their file precision. With no activation keys,
+the tower follows mainline's Quick GELU; `clip.use_gelu=true` selects its tanh GELU and SiLU is refused. Audio tensors of a combined
+vision/audio file stay on the host and are not counted in the card reserve.
+
+The encoder and tower share the embedding side seat's card and thread, with streams of their own. Before the chat placement
+is made, their weight and activation bytes are counted together. On a card outside the chat plan this costs the
+plan no bytes; otherwise the plan holds them in its named `embedding model` reserve, reducing the chat expert
+budget. The side context bounds the complete input, including image rows and delimiter text.
+
+Send one object per input inside OpenAI's `input` array:
+
+```json
+{
+  "input": [
+    {
+      "content": [
+        {"type": "text", "text": "A description of this picture:"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+      ]
+    }
+  ],
+  "dimensions": 256
+}
+```
+
+An image URL is a base64 `data:` URL for PNG or JPEG, as on the chat path; HTTP URLs are refused. Multiple image
+parts remain in input order. Each image is resized with mtmd's aspect-preserving dynamic canvas, bicubic filter
+and centered black padding. The default budget is 70 to 1120 pooled image tokens. Set
+`--embd-image-min-tokens` and `--embd-image-max-tokens` to change it independently of the chat model's image flags.
+A canvas exceeding the reserved token budget or learned position table is a request error before a tower call.
+
+`<|image>` and `<image|>` are tokenized around each image's rows with the server's vocabulary rule,
+included in the single bidirectional pass and included in mean pooling, as in the pinned mainline server.
+Only text embeddings receive the text encoder's `sqrt(hidden)` scale: image rows enter already projected.
+The entire input runs once; image chunks are not decoded separately. A request without a loaded image tower,
+with an unsupported image part or beyond the side context is refused with a 400.
+
+The reference families in `crates/refset/src/arch/gemma_embedding2` own the projector path, its digest and
+llama.cpp build pin. `just gate-gpu-gemma4v-tower` reads the mainline card and CPU tower sets and every required
+layer tensor, comparing the device to the card with each band derived from the CPU twin.
+`just gate-gpu-gemma-embedding2-e2e` also runs image-only and `mix_free-448x448` text-first inputs through
+`pass_media`, using `serve::embeddings::assemble` for the same part ordering and token spans as the HTTP route.
+It compares raw and normalized vectors with the server and its CPU twin (`just dump-ref-emb2 server.cpu`).
+
+To compare a running HTTP server directly with saved llama-server vectors:
+
+```sh
+python3 tools/ref/emb2/server_vectors.py compare --url http://127.0.0.1:8080 \
+  --set "$BLOOMERY_DATA/ref_gemma_embedding2_server" \
+  --image free-448x448=/path/to/free-448x448.png --mix-image free-448x448
+```
+
+Use the exact image bytes named by the reference set. Add `--ids-dir "$BLOOMERY_DATA/ref-tokenizer-gemma4"`
+and `--case NAME` for text cases. Each selected `raw` and `embd` row prints cosine and maximum absolute
+difference. Exit 0 means the comparison completed; it applies no numerical acceptance band.
