@@ -171,36 +171,26 @@ blk_cardtests() {
   fi
   echo "${cards##*$'\n'}"
 }
-# lease.sh's own self-test: lease_gpu_idle (the take's timing-card check) and the witness tag, on a
-# stub nvidia-smi in a temp dir, no card, no lock, no /proc.
-blk_lease() {
-  if ! lse=$(bash "$(dirname "$0")/ref/lease.sh" --self-test 2>&1); then
-    echo "$lse" >&2
-    echo "check-recipes: the lease self-test failed" >&2
-    return 1
-  fi
-  echo "${lse##*$'\n'}"
-}
-# box-tracks.sh deletes remote track directories: its selection (only the names given, never a new stale
-# the reader did not see, a bare --remove refused) is tested on fixed input, no ssh.
-blk_boxtracks() {
-  if ! bt=$(bash "$(dirname "$0")/box-tracks.sh" --self-test 2>&1); then
-    echo "$bt" >&2
-    echo "check-recipes: the box-tracks self-test failed" >&2
-    return 1
-  fi
-  echo "${bt##*$'\n'}"
-}
-# blk_scancheck CHECKER: tools/check-CHECKER.sh --self-test; its last line, or its full output and a named error.
-blk_scancheck() {
-  local checker=$1 out
-  if ! out=$(bash "$(dirname "$0")/check-$checker.sh" --self-test 2>&1); then
+# tool_selftest SCRIPT: bash tools/SCRIPT --self-test; its last line, or its full output and a named error.
+tool_selftest() {
+  local script=$1 out
+  if ! out=$(bash "$(dirname "$0")/$script" --self-test 2>&1); then
     printf '%s\n' "$out" >&2
-    echo "check-recipes: the check-$checker self-test failed" >&2
+    echo "check-recipes: the ${script%.sh} self-test failed" >&2
     return 1
   fi
   printf '%s\n' "${out##*$'\n'}"
 }
+# lease.sh's own self-test: lease_gpu_idle (the take's timing-card check) and the witness tag, on a
+# stub nvidia-smi in a temp dir, no card, no lock, no /proc.
+blk_lease() { tool_selftest ref/lease.sh; }
+# box-tracks.sh deletes remote track directories: its selection (only the names given, never a new stale
+# the reader did not see, a bare --remove refused) is tested on fixed input, no ssh.
+blk_boxtracks() { tool_selftest box-tracks.sh; }
+# blk_scancheck CHECKER: tool_selftest of tools/check-CHECKER.sh. The path is composed: a literal name would put the
+# checker in the scripts recipes.py reads check-recipes as running, and through check-levers' fixture strings a script
+# that reads a reference tree, so check-recipes would never skip.
+blk_scancheck() { tool_selftest "check-$1.sh"; }
 # check-unsafe.sh counts the crates' unsafe lines against their pins: a crate directory or source file it cannot list
 # or read ends the check with 70. That refusal is tested here on missing paths and on a crate in a temporary directory
 # (a build.rs that is a link, and a broken one), no tree walk.
@@ -221,96 +211,33 @@ blk_commentscan() { blk_scancheck comments; }
 blk_leverscan() { blk_scancheck levers; }
 # load-groups.sh decides which arms of a depth runner share one load, and their order: its grouping and
 # rotation are tested on fixed keys, and under bash 4.1 or later its idle bound on a stalled process.
-blk_loadgroups() {
-  if ! lg=$(bash "$(dirname "$0")/ref/load-groups.sh" --self-test 2>&1); then
-    echo "$lg" >&2
-    echo "check-recipes: the load-groups self-test failed" >&2
-    return 1
-  fi
-  echo "${lg##*$'\n'}"
-}
+blk_loadgroups() { tool_selftest ref/load-groups.sh; }
 # lcpp-fit.sh builds the depth runners' llama.cpp fit arms and reads what the fit chose: its flag
 # rewrite, its --help probe (stub binaries) and its column (fixture output) are tested here, no box.
-blk_lcppfit() {
-  if ! lf=$(bash "$(dirname "$0")/ref/lcpp-fit.sh" --self-test 2>&1); then
-    echo "$lf" >&2
-    echo "check-recipes: the lcpp-fit self-test failed" >&2
-    return 1
-  fi
-  echo "${lf##*$'\n'}"
-}
+blk_lcppfit() { tool_selftest ref/lcpp-fit.sh; }
 # cold-blocks.sh is the depth runners' cold tag and engine-block planner: its bound, its flag rewrite, its
 # order refusal and its block plan on fixed arms are tested here, no box.
-blk_coldblocks() {
-  if ! cb=$(bash "$(dirname "$0")/ref/cold-blocks.sh" --self-test 2>&1); then
-    echo "$cb" >&2
-    echo "check-recipes: the cold-blocks self-test failed" >&2
-    return 1
-  fi
-  echo "${cb##*$'\n'}"
-}
+blk_coldblocks() { tool_selftest ref/cold-blocks.sh; }
 # lever-arms.sh is the depth runners' lever-arm list check and their pre-lease `--levers` probe (lever_probe): its
 # words and its args after `--`, no box.
-blk_leverarms() {
-  if ! la=$(bash "$(dirname "$0")/ref/lever-arms.sh" --self-test 2>&1); then
-    echo "$la" >&2
-    echo "check-recipes: the lever-arms self-test failed" >&2
-    return 1
-  fi
-  echo "${la##*$'\n'}"
-}
+blk_leverarms() { tool_selftest ref/lever-arms.sh; }
 # slots-arm.sh is the depth runners' aggregate arm (<arm>@BLOOMERY_GEN_SLOTS=N): its N, its plain twin, the
 # environment's refusal, its time pass and residency clauses and the plain tables' labels, no box.
-blk_slotsarm() {
-  if ! sat=$(bash "$(dirname "$0")/ref/slots-arm.sh" --self-test 2>&1); then
-    echo "$sat" >&2
-    echo "check-recipes: the slots-arm self-test failed" >&2
-    return 1
-  fi
-  echo "${sat##*$'\n'}"
-}
+blk_slotsarm() { tool_selftest ref/slots-arm.sh; }
 # lcpp-warm.sh is the depth runners' llama-server arms: its flag translation (against V4.1's LCPP_CLI_FLAGS),
 # its refusals, the context, the --help probe and a stub server's start, requests, checks and stop (python3
 # and curl, 127.0.0.1) are tested here, no box.
-blk_lcppwarm() {
-  if ! lw=$(bash "$(dirname "$0")/ref/lcpp-warm.sh" --self-test 2>&1); then
-    echo "$lw" >&2
-    echo "check-recipes: the lcpp-warm self-test failed" >&2
-    return 1
-  fi
-  echo "${lw##*$'\n'}"
-}
+blk_lcppwarm() { tool_selftest ref/lcpp-warm.sh; }
 # q38-3090-server.sh is the lone-3090 Qwen3.8 server run (the discovery search's M4): its refusals (a set lever, a card that
 # is not the one 3090, a relative or existing out dir), the chats' records and the stop by the server's own pid, against a stub
 # gate runner and server (python3, curl, 127.0.0.1), are tested here, no box.
-blk_q38srv() {
-  if ! q38s=$(bash "$(dirname "$0")/ref/q38-3090-server.sh" --self-test 2>&1); then
-    echo "$q38s" >&2
-    echo "check-recipes: the q38-3090-server self-test failed" >&2
-    return 1
-  fi
-  echo "${q38s##*$'\n'}"
-}
+blk_q38srv() { tool_selftest ref/q38-3090-server.sh; }
 # mac-check.sh runs the check and lint recipes' box commands on the Mac: its derivation from those
 # recipes, its refusals, the ratchet and the prerequisite checks (a fake HOME) are tested here, no cargo.
-blk_maccheck() {
-  if ! mc=$(bash "$(dirname "$0")/mac-check.sh" --self-test 2>&1); then
-    echo "$mc" >&2
-    echo "check-recipes: the mac-check self-test failed" >&2
-    return 1
-  fi
-  echo "${mc##*$'\n'}"
-}
+blk_maccheck() { tool_selftest mac-check.sh; }
 # gate-batch.sh's placement rules (the v41-load lane, a batch or a solo recipe's arm as an item, a cold
 # build's times row) on a fixture justfile and fixture times rows, no box.
-blk_gatebatch() {
-  if ! gbt=$(bash "$(dirname "$0")/gate-batch.sh" --self-test 2>&1); then
-    echo "$gbt" >&2
-    echo "check-recipes: the gate-batch self-test failed" >&2
-    return 1
-  fi
-  echo "${gbt##*$'\n'}"
-}
+blk_gatebatch() { tool_selftest gate-batch.sh; }
 # gpu-gate.sh's card choice, its lease refusals and the V4.1 load lock, against lock files of its own and
 # a stub nvidia-smi (flock and timeout stand-ins where the host has none, as on the Mac), no card.
 blk_gpugate() {
@@ -328,130 +255,46 @@ blk_gpugate() {
 }
 # stack-watch.sh (gpu-gate.sh's BLOOMERY_GATE_STACKS): output passed through, a quiet stub dumped and ended by
 # its comm among the spawned command's descendants only, a quiet command with no such process left alone.
-blk_stackwatch() {
-  if ! swt=$(bash "$(dirname "$0")/ref/stack-watch.sh" --self-test 2>&1); then
-    echo "$swt" >&2
-    echo "check-recipes: the stack-watch self-test failed" >&2
-    return 1
-  fi
-  echo "${swt##*$'\n'}"
-}
+blk_stackwatch() { tool_selftest ref/stack-watch.sh; }
 # ptx-scan.sh's global load widths, legacy columns, entry boundaries and scan readers on synthetic PTX, no box.
-blk_ptxscan() {
-  if ! pts=$(bash "$(dirname "$0")/ptx-scan.sh" --self-test 2>&1); then
-    echo "$pts" >&2
-    echo "check-recipes: the ptx-scan self-test failed" >&2
-    return 1
-  fi
-  echo "${pts##*$'\n'}"
-}
+blk_ptxscan() { tool_selftest ptx-scan.sh; }
 # ptx-spill-check.sh's table reading (a process-substitution table read for every binary, a binary with no
 # pinned row) and its verdict lines, through a stub ptx-scan.sh on fixed scans, no build.
-blk_ptxspill() {
-  if ! psc=$(bash "$(dirname "$0")/ptx-spill-check.sh" --self-test 2>&1); then
-    echo "$psc" >&2
-    echo "check-recipes: the ptx-spill-check self-test failed" >&2
-    return 1
-  fi
-  echo "${psc##*$'\n'}"
-}
+blk_ptxspill() { tool_selftest ptx-spill-check.sh; }
 # scan-args.sh is the three scan recipes' refusal of a cargo feature given where the scan's own words go
 # (ptx-scan, sass-scan, lds-scan): its cases on a fixed feature list and the real crates/gpu-gates table.
-blk_scanargs() {
-  if ! sa=$(bash "$(dirname "$0")/scan-args.sh" --self-test 2>&1); then
-    echo "$sa" >&2
-    echo "check-recipes: the scan-args self-test failed" >&2
-    return 1
-  fi
-  echo "${sa##*$'\n'}"
-}
+blk_scanargs() { tool_selftest scan-args.sh; }
 # narrow-scan.sh is `just narrow`'s box orchestration: the runner it ships to each side (one build per feature list, the
 # scanner embedded verbatim), the cut of the box's output into per-bin scan logs, the one-run-at-a-time lock on the
 # persistent remote dirs, its usage refusals, and the drift check against the ptx-scan recipe's build lines. No box.
-blk_narrowscan() {
-  if ! nsc=$(bash "$(dirname "$0")/narrow-scan.sh" --self-test 2>&1); then
-    echo "$nsc" >&2
-    echo "check-recipes: the narrow-scan self-test failed" >&2
-    return 1
-  fi
-  echo "${nsc##*$'\n'}"
-}
+blk_narrowscan() { tool_selftest narrow-scan.sh; }
 # lds-scan.sh's rows (its PTX and SASS counts over a fixture binary, stub extractor, ptxas and cuobjdump),
 # its filter, its failed-scan banner and its usage refusal, no box.
-blk_ldsscan() {
-  if ! ls=$(bash "$(dirname "$0")/lds-scan.sh" --self-test 2>&1); then
-    echo "$ls" >&2
-    echo "check-recipes: the lds-scan self-test failed" >&2
-    return 1
-  fi
-  echo "${ls##*$'\n'}"
-}
+blk_ldsscan() { tool_selftest lds-scan.sh; }
 # mutant-run.sh's kill, survive, not-built and no-Compiling verdicts, its restore checks (a broken copy, an
 # edit during the run, a TERM) and its refusals, in a temp git repo with a fake gate, no box.
-blk_mutantrun() {
-  if ! mrt=$(bash "$(dirname "$0")/mutant-run.sh" --self-test 2>&1); then
-    echo "$mrt" >&2
-    echo "check-recipes: the mutant-run self-test failed" >&2
-    return 1
-  fi
-  echo "${mrt##*$'\n'}"
-}
+blk_mutantrun() { tool_selftest mutant-run.sh; }
 # mac-static.sh runs the round loop's lanes (fmt-check, lint, the scoped combos and the check scripts in
 # parallel): its lane orchestration, its rc/wall capture and its red-step naming are tested against
 # /bin/true, /bin/false and sleep stubs, no cargo, no check script.
-blk_macstatic() {
-  if ! mst=$(bash "$(dirname "$0")/mac-static.sh" --self-test 2>&1); then
-    echo "$mst" >&2
-    echo "check-recipes: the mac-static self-test failed" >&2
-    return 1
-  fi
-  echo "${mst##*$'\n'}"
-}
+blk_macstatic() { tool_selftest mac-static.sh; }
 # mac-remote.sh sends a tree to the second Mac and runs mac-static there: its argument, config-file, track-name,
 # dirty-tree, lock and ledger rules, and (on macOS) the whole flow against a stub ssh that runs the "remote" in a
 # fake home, are tested here, no remote and no cargo.
-blk_macremote() {
-  if ! mrm=$(bash "$(dirname "$0")/mac-remote.sh" --self-test 2>&1); then
-    echo "$mrm" >&2
-    echo "check-recipes: the mac-remote self-test failed" >&2
-    return 1
-  fi
-  echo "${mrm##*$'\n'}"
-}
+blk_macremote() { tool_selftest mac-remote.sh; }
 # box.sh's hold on this side (~/.cache/bloomery/box-hold/<owner>, the header): its refusal before any rsync or ssh, the owner's and a
 # read's pass, the `--hold up|down` rules and a looping caller stopping at its next call, on a scratch copy under a fake HOME with
 # ssh and rsync stubs, no box.
-blk_boxsh() {
-  if ! bxs=$(bash "$(dirname "$0")/box.sh" --self-test 2>&1); then
-    echo "$bxs" >&2
-    echo "check-recipes: the box.sh self-test failed" >&2
-    return 1
-  fi
-  echo "${bxs##*$'\n'}"
-}
+blk_boxsh() { tool_selftest box.sh; }
 # seed-target.sh clones a warm tree's target/ into a new worktree and restores the seed's mtime on the files that are equal:
 # its refusals (a DST with a target, a SRC without one, two volumes, a host that cannot clone) and the mtime pass (only
 # equal files) are tested on two scratch trees, no cargo.
-blk_seedtarget() {
-  if ! stt=$(bash "$(dirname "$0")/seed-target.sh" --self-test 2>&1); then
-    echo "$stt" >&2
-    echo "check-recipes: the seed-target self-test failed" >&2
-    return 1
-  fi
-  echo "${stt##*$'\n'}"
-}
+blk_seedtarget() { tool_selftest seed-target.sh; }
 # wt.sh adds a worktree and seeds it from the nearest warm tree, and retires one through mac-disk: the refusals of `new` (an
 # existing path, an existing branch, an add that fails or creates nothing, each with the repo unchanged and the next step
 # not run, and a mutant of each guard that does run it), the seed choice, the read-only seed, and the in-flight rule of
 # `retire`, on scratch git repos with stub seed-target and mac-disk, no cargo, no box.
-blk_wt() {
-  if ! wts=$(bash "$(dirname "$0")/wt.sh" --self-test 2>&1); then
-    echo "$wts" >&2
-    echo "check-recipes: the wt self-test failed" >&2
-    return 1
-  fi
-  echo "${wts##*$'\n'}"
-}
+blk_wt() { tool_selftest wt.sh; }
 # carry.sh is the release's carry check (tools/release/carry.tsv against the commit released): its carried, lacking,
 # pending, unknown-hash and malformed-row verdicts in a temp git repo, no box. The release-build recipe runs it before
 # its box command: a recipe that stops calling it ends the check silently, so the call is held here.
@@ -473,14 +316,7 @@ blk_carry() {
 }
 # build.sh's host-code scan (an instruction past x86-64-v3 outside a runtime-dispatched function) on fixture listings: the
 # release check runs only on the box, so its scan is held here.
-blk_releasebuild() {
-  if ! rb=$(bash "$(dirname "$0")/release/build.sh" --self-test 2>&1); then
-    echo "$rb" >&2
-    echo "check-recipes: the release build.sh self-test failed" >&2
-    return 1
-  fi
-  echo "${rb##*$'\n'}"
-}
+blk_releasebuild() { tool_selftest release/build.sh; }
 # Every Python tool's own tests, on the Mac and the Linux host nightly (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison below fails on one that is not. The tools run as
 # parallel jobs (they are independent processes on their own temp fixtures); their failures land in one
@@ -879,14 +715,7 @@ PY
 }
 # refset-publish.sh's assignment of the fx_ sets to a family (never by name), its named error on a set it cannot place, its
 # left-out block (variant, DSpark) and its --upload refusal, on a fake tree, no box.
-blk_refsetpublish() {
-  if ! rpt=$(bash "$(dirname "$0")/refset-publish.sh" --self-test 2>&1); then
-    echo "$rpt" >&2
-    echo "check-recipes: the refset-publish self-test failed" >&2
-    return 1
-  fi
-  echo "${rpt##*$'\n'}"
-}
+blk_refsetpublish() { tool_selftest refset-publish.sh; }
 # Every #[test] in the workspace is run by some gate-* or lab-* recipe's cargo test call on the box: its
 # target, the features its path's cfgs need, its name filter and its #[ignore] (tools/recipes.py
 # orphan-tests). A test no gate runs is neither a test nor a gate: without gate-ds41-bind, gpu-gates' bind
