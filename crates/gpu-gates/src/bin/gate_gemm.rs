@@ -190,6 +190,7 @@ mod gate {
     use bloomery_gpu::kquant::{Act, act::silu_ik};
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
+    use bloomery_gpu_gates::act_rule::q8_1_codes;
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, activations, bits_equal, bytes_to_words, checks_failed, data_dir,
@@ -492,24 +493,6 @@ mod gate {
             };
             ((a - m) - f64::from(want[v])).abs() <= gamma(4) * (a.abs() + m.abs()) + 1e-38
         }))
-    }
-
-    /// The host transcription of the q8_1 quantizer for one column: per 128
-    /// values `d8 = amax/127` (1 for an all-zero block) and codes
-    /// `round(x/d8)` clamped to ±127.
-    fn q8_column(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
-        let mut codes = Vec::with_capacity(x.len());
-        let mut d8 = Vec::with_capacity(x.len() / 128);
-        for blk in x.as_chunks::<128>().0 {
-            let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-            let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-            d8.push(d);
-            codes.extend(
-                blk.iter()
-                    .map(|&v| (v / d).round().clamp(-127.0, 127.0) as i8),
-            );
-        }
-        (codes, d8)
     }
 
     /// One output three ways, summed per 128-value block as the kernel groups
@@ -1106,7 +1089,7 @@ mod gate {
                 // The device's scales and sums against the host transcription:
                 // the codes the reference uses are the kernel's.
                 let (codes, d8): (Vec<Vec<i8>>, Vec<Vec<f32>>) = (0..n_cols)
-                    .map(|c| q8_column(&x[c * st.k..(c + 1) * st.k]))
+                    .map(|c| q8_1_codes(&x[c * st.k..(c + 1) * st.k]))
                     .unzip();
                 let dev_d8 = res.act.d8().to_host_vec(stream)?;
                 let dev_s8 = res.act.s8().to_host_vec(stream)?;
@@ -1616,7 +1599,7 @@ mod gate {
             got.truncate(t * rows);
             let unwritten = got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
             let (codes, d8): (Vec<Vec<i8>>, Vec<Vec<f32>>) =
-                (0..t).map(|c| q8_column(&x[c * k..(c + 1) * k])).unzip();
+                (0..t).map(|c| q8_1_codes(&x[c * k..(c + 1) * k])).unzip();
             let ids = vec![0u32; t];
             let refc = check_ref(&st, &ids, &codes, &d8, &got)?;
             let (cols, tiles) = route.read_back(stream)?;
@@ -1863,7 +1846,7 @@ mod gate {
                 );
                 let nb = k / 128;
                 let host_ok = (0..n).all(|c| {
-                    let (codes, d8) = q8_column(&hd[c * k..(c + 1) * k]);
+                    let (codes, d8) = q8_1_codes(&hd[c * k..(c + 1) * k]);
                     (0..nb).all(|b| dev_d8[c * nb + b].to_bits() == d8[b].to_bits())
                         && (0..k / 32).all(|j| {
                             let s: i32 = codes[32 * j..32 * j + 32]
@@ -2313,7 +2296,7 @@ mod gate {
         let y = dev.run(st, res, &xd, &ids)?;
         let rows = IqRows::upload(stream, fmt, &st.bytes, st.n_exp * st.rows, st.k)?;
         let total = st.n_exp * st.rows;
-        let (codes, d8) = q8_column(&x[..st.k]);
+        let (codes, d8) = q8_1_codes(&x[..st.k]);
         let col_words = 256 * (st.k / 256).div_ceil(4);
         let mut out = vec![0.0f32; n_slots * st.rows];
         let mut ybuf = DeviceBuffer::<f32>::zeroed(stream, 8 * total)?;

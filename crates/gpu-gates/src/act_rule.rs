@@ -440,13 +440,6 @@ impl Q3kWeight {
             fields,
         })
     }
-
-    /// Row `r`'s bytes.
-    #[must_use]
-    pub fn row(&self, r: usize) -> &[u8] {
-        let n = self.k / QK_K * Q3K_BYTES;
-        &self.bytes[r * n..(r + 1) * n]
-    }
 }
 
 /// Per value of Q3_K super-blocks, in value order: the sub-block's
@@ -484,6 +477,27 @@ pub fn q8_1_exact(x: &[f32]) -> Vec<f64> {
                 .map(move |&v| f64::from((v / d).round().clamp(-127.0, 127.0)) * f64::from(d))
         })
         .collect()
+}
+
+/// Our q8_1 activation of `x` as codes: per block of [`Q8_1_BLOCK`] (a short
+/// last block on its own) `d = amax/127` (1 for an all-zero block) and
+/// `q = round(x/d)` half away from zero, clamped to ±127; the codes in value
+/// order and the block scales. A NaN codes as 0 where the card's quantizer
+/// refuses its block, so a caller passes finite values or checks the card's
+/// scales against these.
+#[must_use]
+pub fn q8_1_codes(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    let (mut q, mut d8) = (Vec::with_capacity(x.len()), Vec::new());
+    for b in x.chunks(Q8_1_BLOCK) {
+        let amax = b.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        d8.push(d);
+        q.extend(
+            b.iter()
+                .map(|&v| (v / d).round().clamp(-127.0, 127.0) as i8),
+        );
+    }
+    (q, d8)
 }
 
 /// ik's q8_K activation of `x` ([`quantize_q8_k`]) — each value's `q·d`
@@ -568,21 +582,28 @@ pub fn q3k_rows(w: &Q3kWeight, x: &[f32], rows_per_window: usize) -> Vec<Q3kRow>
     rows
 }
 
-/// ik's output of every row of `w`, row `r` against window
-/// `r / rows_per_window` of `x` (`w.k` values each): the q8_K blocks of `x`
-/// ([`quantize_q8_k`]), then [`dot_q3k`] from the window's first block.
+/// ik's output of each of the `rows` rows of Q3_K data `bytes` (`k` values a
+/// row), row `r` against window `r / rows_per_window` of `x` (`k` values
+/// each): the q8_K blocks of `x` ([`quantize_q8_k`]), then [`dot_q3k`] from
+/// the window's first block.
 #[must_use]
-pub fn ik_q3k_rows(w: &Q3kWeight, x: &[f32], rows_per_window: usize) -> Vec<f32> {
+pub fn ik_q3k_rows(
+    bytes: &[u8],
+    k: usize,
+    rows: usize,
+    x: &[f32],
+    rows_per_window: usize,
+) -> Vec<f32> {
     let a = quantize_q8_k(x);
-    let (a, sb) = (&a, w.k / QK_K);
-    let mut out = vec![0.0f32; w.rows];
-    let chunk = w.rows.div_ceil(ROW_THREADS).max(1);
+    let (a, sb, rb) = (&a, k / QK_K, k / QK_K * Q3K_BYTES);
+    let mut out = vec![0.0f32; rows];
+    let chunk = rows.div_ceil(ROW_THREADS).max(1);
     std::thread::scope(|s| {
         for (c, part) in out.chunks_mut(chunk).enumerate() {
             s.spawn(move || {
                 for (i, o) in part.iter_mut().enumerate() {
                     let r = c * chunk + i;
-                    *o = dot_q3k(w.row(r), a, r / rows_per_window * sb);
+                    *o = dot_q3k(&bytes[r * rb..(r + 1) * rb], a, r / rows_per_window * sb);
                 }
             });
         }

@@ -45,6 +45,7 @@ mod gate {
     use bloomery_gpu::iq::{
         IqFormat, IqKernels, IqRows, SUB_VALUES, lane_partial_host, sub_sums_host,
     };
+    use bloomery_gpu_gates::act_rule::q8_1_codes;
     use bloomery_gpu_gates::rounding::{U, butterfly, gamma};
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, data_dir, verdict};
     use cuda_core::DeviceBuffer;
@@ -89,23 +90,6 @@ mod gate {
                 lo + ((s >> 8) as f32 / (1u32 << 24) as f32) * span
             })
             .collect()
-    }
-
-    /// The engine's q8_1 rule of one column on the host: per 128-value block
-    /// `d = amax/127` (1 for an all-zero block), `q = round(x/d)` half away
-    /// from zero, clamped to ±127.
-    fn q8_1_host(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
-        let (mut q, mut d8) = (Vec::with_capacity(x.len()), Vec::new());
-        for b in x.chunks(128) {
-            let amax = b.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-            let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-            d8.push(d);
-            q.extend(
-                b.iter()
-                    .map(|&v| (v / d).round().clamp(-127.0, 127.0) as i8),
-            );
-        }
-        (q, d8)
     }
 
     /// The q8_1 quantizer's Q4_K slot of value-order word `v`.
@@ -255,7 +239,7 @@ mod gate {
         let r = load_rows(fmt, cut)?;
         let s = gpu.stream();
         let x = seeded(M * r.k, 7001 + r.k as u32, -2.0, 4.0);
-        let cols: Vec<_> = x.chunks(r.k).map(q8_1_host).collect();
+        let cols: Vec<_> = x.chunks(r.k).map(q8_1_codes).collect();
         let (qw, d8w) = act_words(&cols, r.k);
         let (q, d8) = (
             DeviceBuffer::from_host(s, &qw)?,

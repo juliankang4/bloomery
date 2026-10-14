@@ -286,7 +286,7 @@ mod gate {
     /// (`act_rule::ik_q3k_rows`) and the exact rules and band of
     /// `act_rule::q3k_rows`, row r reading window `r / rows_per_window`.
     fn host_rows_q3k(w: &Q3kWeight, rows_per_window: usize, x: &[f32]) -> Vec<RowRef> {
-        let ik = act_rule::ik_q3k_rows(w, x, rows_per_window);
+        let ik = act_rule::ik_q3k_rows(&w.bytes, w.k, w.rows, x, rows_per_window);
         act_rule::q3k_rows(w, x, rows_per_window)
             .iter()
             .zip(ik)

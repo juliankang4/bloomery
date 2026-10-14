@@ -22,7 +22,7 @@ crates/qdot/src/bin/qdot-rate-mt.rs 2 a rate probe binary
 crates/gpu-gates/src/bin/exact_ref.rs 1 a referee binary, never pinned
 crates/gpu-gates/src/bin/h2d_probe.rs 3 a probe binary, never pinned
 crates/gpu-gates/src/bin/link_probe.rs 1 a probe binary, never pinned: the card thread beside the pump
-crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs 4 a gate binary, never pinned
+crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs 3 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_chain_ffn.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_qwen4exp_mtp.rs 1 a gate binary, never pinned: the host simulations' scoped workers
 crates/gpu-gates/src/bin/gate_glm5next_gemm.rs 1 a gate binary, never pinned: the host transcription's scoped workers

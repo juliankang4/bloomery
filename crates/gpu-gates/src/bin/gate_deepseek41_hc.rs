@@ -79,6 +79,7 @@ mod gate {
         HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs, HcPreScratch,
         HcQ8Params, HcQ8PreArgs,
     };
+    use bloomery_gpu_gates::act_rule;
     use bloomery_gpu_gates::hc_host::{
         self, exp_ik, exp_ours, hc_chain_q8_0, hc_pre_f32, lcg, q8_0_fixture,
     };
@@ -149,28 +150,6 @@ mod gate {
     }
 
     // ------------------------------------------------------------ ik's rules
-
-    /// ik's q8_K of `x` (`iqk_quantize_row_q8_K`, the AVX2 path the box
-    /// runs): per 256 values `d = amax/127` and the codes
-    /// `round_ties_even(v * (127/amax))`.
-    fn q8k_ik(x: &[f32]) -> (Vec<i32>, Vec<f32>) {
-        let mut q = vec![0i32; x.len()];
-        let mut d = Vec::with_capacity(x.len() / 256);
-        for (xb, qb) in x
-            .as_chunks::<256>()
-            .0
-            .iter()
-            .zip(q.as_chunks_mut::<256>().0)
-        {
-            let amax = xb.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-            let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-            for (qi, &v) in qb.iter_mut().zip(xb) {
-                *qi = (id * v).round_ties_even() as i32;
-            }
-            d.push(amax / 127.0);
-        }
-        (q, d)
-    }
 
     /// HC_PRE in f64 throughout: the reference the chain's bound is carried
     /// through.
@@ -334,18 +313,6 @@ mod gate {
         8 * (k / 128) + 2 * ((k % 128) / 32) + (k % 32) / 16
     }
 
-    /// q8_1 of one 128-value block by `q3k_quantize_q8_1`'s rule: the codes
-    /// and `d = amax/127` (1 for an all-zero block).
-    fn q8_block(x: &[f32]) -> ([i32; 128], f32) {
-        let amax = x.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-        let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-        let mut q = [0i32; 128];
-        for (qi, &v) in q.iter_mut().zip(x) {
-            *qi = (v / d).round().clamp(-127.0, 127.0) as i32;
-        }
-        (q, d)
-    }
-
     /// One site's chain by our rule for `t` tokens of raw streams: the
     /// unscaled split-K sums `[t][24]`, the scaled mixes `[t][24]`, and the
     /// q8_1 codes and block scales it quantized the streams to.
@@ -358,19 +325,8 @@ mod gate {
 
     fn chain_host(sbs: &[Q3Sb], x: &[f32], k: usize, t: usize, rms_eps: f32) -> Chain {
         let (n_sb, np) = (k / 256, k / HC_PIECE);
-        let mut q8 = vec![0i32; k * t];
-        let mut d8 = vec![0.0f32; k / 128 * t];
-        for ((xb, qb), db) in x
-            .as_chunks::<128>()
-            .0
-            .iter()
-            .zip(q8.as_chunks_mut::<128>().0)
-            .zip(d8.iter_mut())
-        {
-            let (q, d) = q8_block(xb);
-            qb.copy_from_slice(&q);
-            *db = d;
-        }
+        let (q8, d8) = act_rule::q8_1_codes(&x[..k * t]);
+        let q8: Vec<i32> = q8.into_iter().map(i32::from).collect();
         // Per (piece, token): the butterfly of the lanes' squares, and each
         // row's `piece_sum` — lane group `gi` (lanes 8gi..8gi + 7) holds the
         // 128-value block `gi & 1` of super-block `2p + (gi >> 1)`.
@@ -503,15 +459,10 @@ mod gate {
         let mut bound = vec![0.0f64; t * HC_MIX];
         for tt in 0..t {
             let s = f64::from(ik_norm::scale(&dump.x[tt * k..(tt + 1) * k], dump.rms_eps));
-            let (qk, dk) = q8k_ik(&dump.xn[tt * k..(tt + 1) * k]);
             let ours: Vec<f64> = (tt * k..(tt + 1) * k)
                 .map(|j| f64::from(ch.q8[j]) * f64::from(ch.d8[j / 128]))
                 .collect();
-            let theirs: Vec<f64> = qk
-                .iter()
-                .enumerate()
-                .map(|(i, &q)| f64::from(q) * f64::from(dk[i / 256]))
-                .collect();
+            let theirs = act_rule::q8k_exact(&dump.xn[tt * k..(tt + 1) * k]);
             for r in 0..HC_MIX {
                 let (w, w_ik) = (&p.w[r * k..(r + 1) * k], &p.w_ik[r * k..(r + 1) * k]);
                 let (mut a, mut abs_a, mut b, mut mag_b) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);

@@ -1391,7 +1391,7 @@ mod gate {
                 Wkv::Q8 { bytes, .. } => TokProj::Q8(project(bytes, rows, x)),
                 Wkv::Q3 { host, .. } => TokProj::Q3 {
                     rows: act_rule::q3k_rows(host, x, rows),
-                    ik: act_rule::ik_q3k_rows(host, x, rows),
+                    ik: act_rule::ik_q3k_rows(&host.bytes, host.k, host.rows, x, rows),
                 },
             }
         }

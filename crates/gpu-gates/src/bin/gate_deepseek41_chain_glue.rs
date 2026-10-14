@@ -782,7 +782,7 @@ mod gate {
             Wkv::Q3(host) => {
                 let rows = act_rule::q3k_rows(host, &d.embd, host.rows);
                 let ours: Vec<f32> = rows.iter().map(|r| r.ours as f32).collect();
-                let ik = act_rule::ik_q3k_rows(host, &d.embd, host.rows);
+                let ik = act_rule::ik_q3k_rows(&host.bytes, host.k, host.rows, &d.embd, host.rows);
                 let kv_ours = rel(&o.kv, &ours);
                 let same = ik
                     .iter()
@@ -1004,20 +1004,6 @@ mod gate {
 
     // ------------------------------------------------------- (iii) the head
 
-    /// q8_1 of one 128-value block by the crate quantizer's rule
-    /// (`gate_deepseek41_hc`'s transcription, pinned there against the
-    /// quantizer's bytes): the codes and `d = amax/127`, 1 for an all-zero
-    /// block.
-    fn q8_block(x: &[f32]) -> ([i32; 128], f32) {
-        let amax = x.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-        let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-        let mut q = [0i32; 128];
-        for (qi, &v) in q.iter_mut().zip(x) {
-            *qi = (v / d).round().clamp(-127.0, 127.0) as i32;
-        }
-        (q, d)
-    }
-
     /// Per logit, in exact arithmetic: our projection minus ik's (`pred`),
     /// the band that difference must sit in (`qband`), and each side's
     /// magnitude `Σ|w·x̂|`, the scale of its f32 rounding.
@@ -1149,19 +1135,12 @@ mod gate {
             return Err(format!("{name} is {ty}, want q6_K").into());
         }
         let k = o.normed.len();
-        let mut xo = vec![0.0f64; k];
-        for (xb, ob) in o
-            .normed
-            .as_chunks::<128>()
-            .0
+        let (qo, d8) = act_rule::q8_1_codes(&o.normed);
+        let xo: Vec<f64> = qo
             .iter()
-            .zip(xo.as_chunks_mut::<128>().0)
-        {
-            let (q, d) = q8_block(xb);
-            for (x, &qi) in ob.iter_mut().zip(&q) {
-                *x = f64::from(d) * f64::from(qi);
-            }
-        }
+            .enumerate()
+            .map(|(j, &q)| f64::from(d8[j / act_rule::Q8_1_BLOCK]) * f64::from(q))
+            .collect();
         let (qd, dd) = ik_q8_2::quantize(&norm);
         let xd: Vec<f64> = qd
             .iter()

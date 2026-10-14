@@ -59,6 +59,7 @@ mod gate {
     };
     use bloomery_gpu_deepseek41::index_key::{self, HT_SCALE, IndexKeyArgs, IndexKeyKernels};
     use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable, ggml_rope_cache};
+    use bloomery_gpu_gates::act_rule::{q3k_fields, q8_1_exact, q8k_exact};
     use bloomery_gpu_gates::ds41_meta::RopeMeta;
     use bloomery_gpu_gates::ik_norm;
     use bloomery_gpu_gates::oracle::{self, Set};
@@ -70,7 +71,7 @@ mod gate {
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
-    use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits, half_to_f32};
+    use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits};
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::plan::{Planner, StepPlan, StreamStep};
@@ -268,83 +269,6 @@ mod gate {
                     .collect(),
             })
             .collect())
-    }
-
-    /// Our q8_1 activation (`cores::q8_quad`) of `k`-value columns: per
-    /// 128-value block `d = amax/127` (1 for an all-zero block), `q =
-    /// round(x/d)` half away from zero, clamped to ±127 — each value's exact
-    /// `q·d`.
-    fn q8_1_exact(x: &[f32]) -> Vec<f64> {
-        x.chunks(128)
-            .flat_map(|b| {
-                let amax = b.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-                let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                b.iter()
-                    .map(move |&v| f64::from((v / d).round().clamp(-127.0, 127.0)) * f64::from(d))
-            })
-            .collect()
-    }
-
-    /// ik's q8_K activation as its AVX2 build quantizes it
-    /// (`iqk_quantize_row_q8_K`): per 256-value block `d = max|x| / 127`,
-    /// `q = rne(x · (127 / max|x|))` (the product rounded to f32 first), all
-    /// zero for an all-zero block — each value's exact `q·d`.
-    fn q8k_exact(x: &[f32]) -> Vec<f64> {
-        x.chunks(256)
-            .flat_map(|b| {
-                let amax = b.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-                let d = amax / 127.0;
-                let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-                b.iter().map(move |&v| {
-                    let q = (id * v).round_ties_even().clamp(-128.0, 127.0);
-                    f64::from(q) * f64::from(d)
-                })
-            })
-            .collect()
-    }
-
-    /// A q3_K row as ik's AVX2 dot sees it: per weight the sub-block's
-    /// `|d · (scale − 32)|` and its 3-bit value `q ∈ [−4, 3]`
-    /// (`gguf::quant`'s `dequant_q3_k` walk), so the weight is `±that · q`
-    /// and the dot adds `(q + 4)` and `−4` parts separately.
-    fn q3k_fields(row: &[u8]) -> Vec<(f32, i8)> {
-        const KMASK1: u32 = 0x0303_0303;
-        const KMASK2: u32 = 0x0f0f_0f0f;
-        let mut out = Vec::with_capacity(row.len() / 110 * 256);
-        for blk in row.as_chunks::<110>().0 {
-            let (hm, qs) = (&blk[0..32], &blk[32..96]);
-            let d_all = half_to_f32(u16::from_le_bytes([blk[108], blk[109]]));
-            let mut aux = [0u32; 4];
-            for (i, a) in aux.iter_mut().take(3).enumerate() {
-                let s = &blk[96 + 4 * i..100 + 4 * i];
-                *a = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-            }
-            let tmp = aux[2];
-            aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
-            aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
-            aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
-            aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
-            let scales: [i8; 16] = core::array::from_fn(|i| aux[i / 4].to_le_bytes()[i % 4] as i8);
-            let (mut is, mut m) = (0usize, 1u8);
-            for half in 0..2 {
-                let q = &qs[32 * half..32 * half + 32];
-                let mut shift = 0u32;
-                for _field in 0..4 {
-                    for half16 in 0..2 {
-                        let dl = (d_all * (i32::from(scales[is]) - 32) as f32).abs();
-                        is += 1;
-                        for l in 0..16 {
-                            let qv = ((q[16 * half16 + l] >> shift) & 3) as i8;
-                            let hv = if hm[16 * half16 + l] & m != 0 { 0 } else { 4 };
-                            out.push((dl, qv - hv));
-                        }
-                    }
-                    shift += 2;
-                    m <<= 1;
-                }
-            }
-        }
-        out
     }
 
     // -------------------------------------------------------- measures

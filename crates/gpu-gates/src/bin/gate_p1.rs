@@ -32,8 +32,8 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<(), GateError> {
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_gates::{
-        Fnv1a64, KERNEL_BAND, activations, bytes_to_words, max_rel_err, open_model, ref_gemv,
-        row_bytes, tensor_bytes_as,
+        Fnv1a64, KERNEL_BAND, activations, bytes_to_words, max_rel_err, open_model, q8_1_dequant,
+        ref_gemv, row_bytes, tensor_bytes_as,
     };
     use cuda_core::DeviceBuffer;
     use gguf::quant::GgmlType;
@@ -333,28 +333,4 @@ fn quant_faults(gpu: &bloomery_gpu::Gpu, gguf: &gguf::Gguf) -> Result<bool, Gate
     );
     ok &= pass;
     Ok(ok)
-}
-
-/// Host transcription of the device quantizer's activation treatment: per
-/// 128-value block, d = amax/127 and q = round(x/d) clamped to ±127; the
-/// reference dot runs on the reconstructed q·d values. The kernel keeps q
-/// as the integer the dp4a chains consume and factors d in once, so the
-/// two differ only by float rounding of that factoring — real gemv defects
-/// stay far above KERNEL_BAND, while the shared activation-quantization
-/// noise (the `exact_ref_err` column) cancels.
-#[cfg(feature = "gpu")]
-fn q8_1_dequant(x: &[f32], k: usize, m: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; k * m];
-    for c in 0..m {
-        for b in 0..k / 128 {
-            let blk = &x[c * k + b * 128..c * k + b * 128 + 128];
-            let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-            let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-            for (i, &v) in blk.iter().enumerate() {
-                let q = (v / d).round().clamp(-127.0, 127.0);
-                out[c * k + b * 128 + i] = q * d;
-            }
-        }
-    }
-    out
 }

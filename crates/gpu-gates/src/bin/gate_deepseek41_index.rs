@@ -1114,7 +1114,8 @@ mod gate {
         } else {
             let q3 = &cx.q3[&q_name];
             let rows = act_rule::q3k_rows(&q3.host, &x_q, q3.host.rows);
-            let ik = act_rule::ik_q3k_rows(&q3.host, &x_q, q3.host.rows);
+            let ik =
+                act_rule::ik_q3k_rows(&q3.host.bytes, q3.host.k, q3.host.rows, &x_q, q3.host.rows);
             let y = q3k_gemv(cx, q3, &x_q)?;
             let ours: Vec<f32> = rows.iter().map(|r| r.ours as f32).collect();
             let rel = max_rel_err(&y, &ours).unwrap_or(f32::INFINITY);

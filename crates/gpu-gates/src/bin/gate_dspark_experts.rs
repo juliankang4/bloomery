@@ -83,6 +83,7 @@ mod gate {
     use bloomery_gpu_deepseek41::experts_mxfp4::{
         DraftRouterKernels, DraftRouterOut, N_EXPERT, N_USED, RouterArgs, sqrt_softplus,
     };
+    use bloomery_gpu_gates::act_rule::q8_1_codes;
     use bloomery_gpu_gates::rounding::{U, butterfly, gamma};
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
     use cuda_core::DeviceBuffer;
@@ -225,23 +226,6 @@ mod gate {
                 .flat_map(|h| h.join().expect("a host worker panicked"))
                 .collect()
         })
-    }
-
-    /// Our q8_1 rule of one column on the host: per 128-value block `d =
-    /// amax/127` (1 for an all-zero block), `q = round(x/d)` half away from
-    /// zero, clamped to ±127. The codes in value order and the block scales.
-    fn q8_1_host(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
-        let (mut q, mut d8) = (Vec::with_capacity(x.len()), Vec::new());
-        for b in x.chunks(128) {
-            let amax = b.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-            let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-            d8.push(d);
-            q.extend(
-                b.iter()
-                    .map(|&v| (v / d).round().clamp(-127.0, 127.0) as i8),
-            );
-        }
-        (q, d8)
     }
 
     /// The q8_1 quantizer's Q4_K slot of value-order word `v` (the
@@ -426,10 +410,10 @@ mod gate {
         s.synchronize()?;
         let hv = h.to_host_vec(s)?;
         let qx: Vec<_> = (0..p.m)
-            .map(|c| q8_1_host(&x[c * k..(c + 1) * k]))
+            .map(|c| q8_1_codes(&x[c * k..(c + 1) * k]))
             .collect();
         let qh: Vec<_> = (0..n_slots * p.m)
-            .map(|c| q8_1_host(&hv[c * ff..(c + 1) * ff]))
+            .map(|c| q8_1_codes(&hv[c * ff..(c + 1) * ff]))
             .collect();
         Ok(Run {
             h: hv,
@@ -472,7 +456,7 @@ mod gate {
         let (k, ff, n) = (cx.gate.k, cx.gate.rows_per_expert, cx.down.rows_per_expert);
         let n_slots = p.sel.len();
         let qx: Vec<_> = (0..p.m)
-            .map(|c| q8_1_host(&x[c * k..(c + 1) * k]))
+            .map(|c| q8_1_codes(&x[c * k..(c + 1) * k]))
             .collect();
         let cols: Vec<(usize, usize)> = (0..n_slots)
             .flat_map(|j| (0..p.m).map(move |c| (j, c)))
@@ -496,7 +480,7 @@ mod gate {
         });
         let h: Vec<f32> = hcols.concat();
         let qh: Vec<_> = (0..n_slots * p.m)
-            .map(|c| q8_1_host(&h[c * ff..(c + 1) * ff]))
+            .map(|c| q8_1_codes(&h[c * ff..(c + 1) * ff]))
             .collect();
         let rows = par(n, |d| {
             let mut acc = vec![0.0f32; p.m];
@@ -524,7 +508,7 @@ mod gate {
     fn reference(cx: &Ctx<'_>, p: &Plan, x: &[f32], h: &[f32], out: &[f32]) -> (f64, f64, f64) {
         let (k, ff, n) = (cx.gate.k, cx.gate.rows_per_expert, cx.down.rows_per_expert);
         let qx: Vec<_> = (0..p.m)
-            .map(|c| q8_1_host(&x[c * k..(c + 1) * k]))
+            .map(|c| q8_1_codes(&x[c * k..(c + 1) * k]))
             .collect();
         let (mut gu_rel, mut ratio) = (0.0f64, 0.0f64);
         let nb_k = (k / BLOCK_VALUES).div_ceil(32);
@@ -552,7 +536,7 @@ mod gate {
         }
         let n_slots = p.sel.len();
         let qh: Vec<_> = (0..n_slots * p.m)
-            .map(|c| q8_1_host(&h[c * ff..(c + 1) * ff]))
+            .map(|c| q8_1_codes(&h[c * ff..(c + 1) * ff]))
             .collect();
         let per: Vec<Vec<(f64, f64)>> = par(n, |d| {
             let mut acc = vec![(0.0f64, 0.0f64); p.m];
@@ -901,7 +885,7 @@ mod gate {
         let sharp = !bits_equal(&base.h, &tight.h);
         let silu = gu(Act::SiluMul)?;
         let qx: Vec<_> = (0..p.m)
-            .map(|c| q8_1_host(&x[c * k..(c + 1) * k]))
+            .map(|c| q8_1_codes(&x[c * k..(c + 1) * k]))
             .collect();
         let (mut worst, mut silu_ok) = (0.0f64, true);
         let mut differs = false;
@@ -1037,7 +1021,7 @@ mod gate {
             // Gate·up: three columns, slot s reading column s.
             let (sel, m) = (vec![2u32, 0, 1], 3usize);
             let x = seeded(K * m, 7001 + ci as u32, -amp, 2.0 * amp);
-            let qx: Vec<_> = (0..m).map(|c| q8_1_host(&x[c * K..(c + 1) * K])).collect();
+            let qx: Vec<_> = (0..m).map(|c| q8_1_codes(&x[c * K..(c + 1) * K])).collect();
             let rule = Act::SwigluClamp { limit: PLANT_LIMIT };
             let gu = pair_gate_up(cx, (&g, &u), (RPE, K), &sel, 1, m, &x, rule)?;
             let want_h: Vec<f32> = sel
@@ -1057,7 +1041,7 @@ mod gate {
             let dsel = vec![0u32, 1, 2, 1, 0, 2];
             let xd = seeded(K * dsel.len(), 7101 + ci as u32, -amp, 2.0 * amp);
             let qd: Vec<_> = (0..dsel.len())
-                .map(|c| q8_1_host(&xd[c * K..(c + 1) * K]))
+                .map(|c| q8_1_codes(&xd[c * K..(c + 1) * K]))
                 .collect();
             let dn = pair_down(cx, &d, (RPE, K, EXPERTS), &dsel, &xd)?;
             let want_y: Vec<f32> = dsel

@@ -2566,7 +2566,7 @@ mod gate {
             let HostW::Q3k(w) = w else { continue };
             let want =
                 want.ok_or_else(|| format!("layer {l}: no {tag} node in set {}", set.label))?;
-            let got = ik_q3k_rows(w, x, rows_per_window);
+            let got = act_rule::ik_q3k_rows(&w.bytes, w.k, w.rows, x, rows_per_window);
             let same = got
                 .iter()
                 .zip(want)
@@ -2588,27 +2588,6 @@ mod gate {
         );
         tally.check(pass, format!("layer {l} {} ik rule", set.label));
         Ok(())
-    }
-
-    /// ik's output of every row of `w`, row `r` against window
-    /// `r / rows_per_window` of `x` (`w.k` values each): its q8_K blocks,
-    /// then [`act_rule::dot_q3k`].
-    fn ik_q3k_rows(w: &HostQ3k, x: &[f32], rows_per_window: usize) -> Vec<f32> {
-        let a = act_rule::quantize_q8_k(x);
-        let (a, sb) = (&a, w.k / QK_K);
-        let mut out = vec![0.0f32; w.rows];
-        let chunk = w.rows.div_ceil(THREADS);
-        std::thread::scope(|s| {
-            for (c, part) in out.chunks_mut(chunk).enumerate() {
-                s.spawn(move || {
-                    for (i, o) in part.iter_mut().enumerate() {
-                        let r = c * chunk + i;
-                        *o = act_rule::dot_q3k(w.row(r), a, r / rows_per_window * sb);
-                    }
-                });
-            }
-        });
-        out
     }
 
     /// The node-by-node distances and the output's predicted and measured
