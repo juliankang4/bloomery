@@ -154,7 +154,8 @@ pub(crate) struct Shared {
     /// thread.
     pub work: Condvar,
     pub stats: Mutex<Stats>,
-    /// Set by the engine error that ended the server; the reason `/health` gives.
+    /// The first failure that ended the server ([`Shared::record_fatal`]);
+    /// the reason `/health` gives.
     pub fatal: Mutex<Option<String>>,
     /// The orderly stop's cause, once it began ([`Shared::begin_stop`]): the
     /// reason every request that needs the engine is refused with.
@@ -204,6 +205,32 @@ impl Shared {
             end,
             sampler,
             ids: AtomicU64::new(0),
+        }
+    }
+
+    /// Adopts `f` as the failure that ends the server unless one already
+    /// was: the first is kept. `/health` and every later request see its
+    /// error, and the waiting requests' and actions' channels close on it,
+    /// so their HTTP threads answer with it. `Some(f)` when `f` was adopted,
+    /// which [`Shared::end_on`] then sends once the requests that met it have
+    /// their answers; `None` when an earlier failure was, whose own sender
+    /// ends the server.
+    #[must_use]
+    pub(crate) fn record_fatal(&self, f: EngineFailure) -> Option<EngineFailure> {
+        let mut fatal = relock(&self.fatal);
+        if fatal.is_some() {
+            return None;
+        }
+        *fatal = Some(f.error.clone());
+        drop(relock(&self.board).kill(&f.error));
+        Some(f)
+    }
+
+    /// Ends the server on the failure [`Shared::record_fatal`] adopted;
+    /// nothing for one it did not.
+    pub(crate) fn end_on(&self, adopted: Option<EngineFailure>) {
+        if let Some(f) = adopted {
+            let _ = self.end.send(End::Engine(f));
         }
     }
 
@@ -402,16 +429,14 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
     // and drops the engine it holds, which no stop waits for.
     sh.end_loop();
     if let Err(p) = ran {
-        let error = format!("the engine thread panicked: {}", panic_text(&*p));
-        *relock(&sh.fatal) = Some(error.clone());
-        drop(relock(&sh.board).kill(&error));
+        let adopted = sh.record_fatal(EngineFailure {
+            engine: "unknown: its thread panicked".to_owned(),
+            error: format!("the engine thread panicked: {}", panic_text(&*p)),
+        });
         // The running requests' channels close: their HTTP threads answer
         // with the reason.
         drop(w);
-        let _ = sh.end.send(End::Engine(EngineFailure {
-            engine: "unknown: its thread panicked".to_owned(),
-            error,
-        }));
+        sh.end_on(adopted);
     }
 }
 
@@ -510,24 +535,20 @@ impl Worker {
         Ok(())
     }
 
-    /// Records an engine failure: `/health` and every later request see it,
-    /// and what waits is refused.
-    fn fail(&mut self, e: &EngineError) -> EngineFailure {
-        let f = EngineFailure {
+    /// Records an engine failure ([`Shared::record_fatal`]): unless an
+    /// earlier failure ended the server, `/health` and every later request
+    /// see it, and what waits is refused with it.
+    fn fail(&mut self, e: &EngineError) -> Option<EngineFailure> {
+        self.sh.record_fatal(EngineFailure {
             engine: self.slot.engine.describe(),
             error: e.to_string(),
-        };
-        *relock(&self.sh.fatal) = Some(f.error.clone());
-        // The waiting requests' and actions' channels close: their HTTP
-        // threads answer with the reason.
-        drop(relock(&self.sh.board).kill(&f.error));
-        f
+        })
     }
 
     /// Ends the server once the requests that met the failure have their
     /// answers.
-    fn end(&self, f: EngineFailure) -> Dead {
-        let _ = self.sh.end.send(End::Engine(f));
+    fn end(&self, adopted: Option<EngineFailure>) -> Dead {
+        self.sh.end_on(adopted);
         Dead
     }
 
@@ -1412,11 +1433,49 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    use super::{Shared, serve};
-    use crate::api::relock;
+    use super::{Acted, Action, Shared, serve};
+    use crate::api::{End, EngineFailure, relock};
     use crate::genloop::Slot;
-    use crate::sched::{Board, FifoPicker};
+    use crate::sched::{Board, FifoPicker, Refusal, Reserve};
     use crate::{MockEngine, sampling};
+
+    /// The first failure ends the server, once: a later one, from the
+    /// engine thread or from a request's own thread, changes neither the
+    /// reason `/health` and the board give nor the failure the server ends
+    /// with.
+    #[test]
+    fn the_first_failure_is_the_one_that_ends_the_server() {
+        let (end, ended) = mpsc::channel();
+        let sh = Shared::new(
+            Board::new(1, 4, Box::new(FifoPicker)),
+            end,
+            sampling::reference_factory(),
+        );
+        let failure = |error: &str| EngineFailure {
+            engine: "mock".to_owned(),
+            error: error.to_owned(),
+        };
+        let first = sh.record_fatal(failure("first"));
+        assert!(sh.record_fatal(failure("second")).is_none());
+        sh.end_on(first);
+        assert_eq!(relock(&sh.fatal).as_deref(), Some("first"));
+        let action = Action {
+            run: Box::new(|_: &mut Slot| Acted {
+                failure: None,
+                reply: Box::new(|| {}),
+            }),
+            drops: false,
+        };
+        assert_eq!(
+            relock(&sh.board).reserve(Reserve::All, action).err(),
+            Some(Refusal::Dead("first".to_owned()))
+        );
+        match ended.try_recv() {
+            Ok(End::Engine(f)) => assert_eq!(f.error, "first"),
+            _ => panic!("no engine end"),
+        }
+        assert!(ended.try_recv().is_err(), "the server ends once");
+    }
 
     /// The halt reads the stop's cause, which [`Shared::begin_stop`] sets
     /// before it stores the stop flag: a stop flag with no cause is that
