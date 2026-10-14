@@ -125,17 +125,10 @@ fn hw_gemma_embedding2_header() {
         .into_iter()
         .map(|u| u.feature)
         .collect();
-    for want in [
-        "bidirectional GQA flash, head 256, group 2, 512 keys each side",
-        "bidirectional GQA flash, head 512, group 4",
-        "dense GELU GLU layer: ff 2048",
-        "a layer program for gemma-embedding2",
-    ] {
-        if !items.iter().any(|i| i == want) {
-            bad.push(format!("coverage has no {want:?}"));
-        }
-    }
     println!("gemma-embedding2 coverage: {items:?}");
+    if !items.is_empty() {
+        bad.push(format!("coverage lists {} item(s), want none", items.len()));
+    }
     if read.tensors.tensors.len() != 413 {
         bad.push(format!("tensors {}", read.tensors.tensors.len()));
     }

@@ -593,6 +593,77 @@ pub const AVAILABLE: &[Available] = &[
             )
         },
     },
+    Available {
+        programs: &[Program::GemmaEmbedding2Body],
+        at: "gpu/src/flash_gqa_prefill.rs enqueue_256_p2_lower (each row's first key from its \
+             reach; two query heads a block)",
+        runs: |n| matches!(n, Need::Bidirectional { head: 256, group, .. } if group.is_multiple_of(2)),
+    },
+    Available {
+        programs: &[Program::GemmaEmbedding2Body],
+        at: "gpu/src/flash_gqa_prefill_512.rs enqueue_p4 (every key; four query heads a block)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Bidirectional {
+                    head: 512,
+                    group,
+                    reach: None
+                } if group.is_multiple_of(4)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::GemmaEmbedding2Body],
+        at: "gpu/src/rope_neox.rs head_norm_neox_append_256_whole, head_norm_neox_append_512",
+        runs: |n| {
+            matches!(
+                n,
+                Need::QkRope {
+                    qk_norm: true,
+                    head: head @ (256 | 512),
+                    mode: RopeMode::Neox,
+                    dims,
+                } if dims == head
+            )
+        },
+    },
+    Available {
+        programs: &[Program::GemmaEmbedding2Body],
+        at: "gpu/src/elem.rs enqueue_geglu between gpu/src/site.rs gemm launches",
+        runs: |n| matches!(n, Need::GeGlu { ff: 2048 }),
+    },
+    Available {
+        programs: &[Program::GemmaEmbedding2Body],
+        at: "gpu/src/elem.rs enqueue_rms_norm (a gain of ones)",
+        runs: |n| matches!(n, Need::ValueNorm { .. }),
+    },
+    Available {
+        programs: &[Program::GemmaEmbedding2Body],
+        at: "gpu/src/elem.rs enqueue_rms_norm, enqueue_add (gemma-embedding2's pass)",
+        runs: |n| matches!(n, Need::PostNorms),
+    },
+    Available {
+        programs: &[Program::GemmaEmbedding2Body],
+        at: "gpu/src/elem.rs enqueue_weighted_sum (the layer's scalar)",
+        runs: |n| matches!(n, Need::LayerScale),
+    },
+    Available {
+        programs: &[Program::GemmaEmbedding2Body],
+        at: "gpu/src/gemm/f32tile.rs enqueue_f32_tile; gpu/src/elem.rs enqueue_rms_norm, \
+             enqueue_geglu (gemma-embedding2's pass)",
+        runs: |n| matches!(n, Need::PerLayerInput { width: 512 }),
+    },
+    Available {
+        programs: &[Program::GemmaEmbedding2Body],
+        at: "gpu-gemma-embedding2/src/pass.rs token_rows (the host's rows, scaled)",
+        runs: |n| matches!(n, Need::EmbedScale),
+    },
+    Available {
+        programs: &[Program::GemmaEmbedding2Body],
+        at: "gpu/src/site.rs gemm (output); serve/src/embed.rs mean",
+        runs: |n| matches!(n, Need::Pooled { proj } if proj.as_slice() == [768]),
+    },
 ];
 
 /// Whether the K192 flash row ([`gqa_row_v`] at head 192, value 128) takes
@@ -670,7 +741,8 @@ const NEMOTRON_SITES: &[GgmlType] = &[
 /// chain's attention gemvs, whose head-split sites in `chain/attn.rs` take
 /// q3_K or q8_0, the same head, and the hyper-connection fn `hc.rs` reads as
 /// q3_K words, `hc_f32.rs` as f32; the glm5next body's sites, each a q8_0 gemv or `hc_pre_q8_0`, the common
-/// head's q8_0, q6_K and q4_K arms).
+/// head's q8_0, q6_K and q4_K arms; the gemma-embedding2 encoder's GEMMs,
+/// each `site::gemm` on the 32-value path).
 const TYPE_PINS: &[TypePin] = &[
     TypePin {
         programs: &[Program::Qwen3moeBody],
@@ -1013,6 +1085,38 @@ const TYPE_PINS: &[TypePin] = &[
         what: "shared expert (the body's iq2_xxs_gemv_sel reads iq2_xxs)",
         reads: &[BOLT_LEG],
     },
+    TypePin {
+        programs: &[Program::GemmaEmbedding2Body],
+        role: Role::Attention,
+        matrices: true,
+        names: None,
+        what: "attention matrices (the encoder reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        programs: &[Program::GemmaEmbedding2Body],
+        role: Role::DenseFfn,
+        matrices: true,
+        names: None,
+        what: "feed-forward matrices (the encoder reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        programs: &[Program::GemmaEmbedding2Body],
+        role: Role::EngramDense,
+        matrices: true,
+        names: Some(|n| !per_layer_model_proj(n)),
+        what: "per-layer input gate and projection (the encoder reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        programs: &[Program::GemmaEmbedding2Body],
+        role: Role::Head,
+        matrices: true,
+        names: None,
+        what: "output projection (the encoder reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
 ];
 
 /// A tensor family whose type a program pins by the card kernel table's
@@ -1037,7 +1141,9 @@ struct RowPin {
 /// dispatch both bodies share), and `Body35`'s FFN ([`qwen35_gate_up`],
 /// [`qwen35_down`], [`qwen35_shared`]),
 /// and the glm5next and mimo2 bodies' token embedding (the host's rows,
-/// `GgmlType::has_dequant`), each `what` naming the types its row takes or the table row it follows.
+/// `GgmlType::has_dequant`), and the gemma-embedding2 encoder's token table
+/// and per-layer input projection (the host's rows), each `what` naming the
+/// types its row takes or the table row it follows.
 const ROW_PINS: &[RowPin] = &[
     RowPin {
         program: Program::Qwen3moeBody,
@@ -1077,6 +1183,22 @@ const ROW_PINS: &[RowPin] = &[
         matrices: true,
         names: None,
         what: "token embedding (the host's rows: the types dequant_row decodes)",
+        row: GgmlType::has_dequant,
+    },
+    RowPin {
+        program: Program::GemmaEmbedding2Body,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the host's rows: the types dequant_row decodes)",
+        row: GgmlType::has_dequant,
+    },
+    RowPin {
+        program: Program::GemmaEmbedding2Body,
+        role: Role::EngramDense,
+        matrices: true,
+        names: Some(per_layer_model_proj),
+        what: "per-layer input projection (the host's rows: the types dequant_row decodes)",
         row: GgmlType::has_dequant,
     },
     RowPin {
@@ -1173,6 +1295,13 @@ fn qwen38_card_routed(ty: GgmlType) -> bool {
 /// ([`card_routed`](crate::arch::glm5next::place::card_routed)).
 fn glm5next_card_routed(ty: GgmlType) -> bool {
     crate::arch::glm5next::place::card_routed(ty).is_some()
+}
+
+/// gemma-embedding2's projection of the token rows to the per-layer inputs,
+/// which the encoder decodes on the host where it reads the per-layer
+/// input's other matrices as q8_0.
+fn per_layer_model_proj(name: &str) -> bool {
+    name == "per_layer_model_proj.weight"
 }
 
 /// A qwen4exp selector's key or query projection, which `Body38` reads as
@@ -1338,8 +1467,10 @@ pub fn check_with(
                 // by name and part (the default expert rule's card formats
                 // would pass q3_K and q6_K gate·up to the load's refusal).
                 Some(Program::Qwen3moeBody | Program::Qwen35Body) => {}
-                // The nemotron_h body is dense: a routed stack is an item.
-                Some(Program::NemotronHBody) => at(t.layer, Need::RoutedFormat(t.ty)),
+                // These bodies are dense: a routed stack is an item.
+                Some(Program::NemotronHBody | Program::GemmaEmbedding2Body) => {
+                    at(t.layer, Need::RoutedFormat(t.ty));
+                }
                 // The latent MoE body's rule (`routed_rule`'s arm): its up
                 // and down launches read [`BOLT_LEG`] stacks, every part of
                 // another type is an item.
@@ -1679,11 +1810,12 @@ mod tests {
         ];
         for pin in ROW_PINS {
             // A name the pin takes: the pins scoped by name are the routed
-            // stacks' parts.
+            // stacks' parts and gemma-embedding2's per-layer input projection.
             let name = [
                 "blk.0.attn_q.weight",
                 "blk.0.ffn_gate_exps.weight",
                 "blk.0.ffn_down_exps.weight",
+                "per_layer_model_proj.weight",
             ]
             .into_iter()
             .find(|n| pin.names.is_none_or(|takes| takes(n)))
@@ -2324,8 +2456,8 @@ mod tests {
         }
     }
 
-    /// The glm5next and mimo2 embedding pins read the set the host row
-    /// reader decodes for the table (`GgmlType::has_dequant`, which
+    /// The glm5next, mimo2 and gemma-embedding2 embedding pins read the set
+    /// the host row reader decodes for the table (`GgmlType::has_dequant`, which
     /// `EmbedTable::new` checks too), pinned here by type name; a type
     /// outside it is an item naming the type.
     // PIN(2026-10-11): q4_K, q5_K, q6_K and the other types `dequant_row`
@@ -2344,7 +2476,11 @@ mod tests {
                 },
             )
         };
-        for program in [Program::Glm5nextBody, Program::Mimo2Body] {
+        for program in [
+            Program::Glm5nextBody,
+            Program::Mimo2Body,
+            Program::GemmaEmbedding2Body,
+        ] {
             for ty in [
                 GgmlType::Q8_0,
                 GgmlType::Q3_K,

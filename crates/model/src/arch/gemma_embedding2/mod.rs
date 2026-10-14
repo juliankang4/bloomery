@@ -5,8 +5,8 @@
 //! trained scalar on the layer's output; after the output norm one
 //! projection, then the mean of the rows. The file's keys (`hparams`), every
 //! tensor's role (`roles`), the tensor names (`names`) and the typed
-//! description (`spec`). No program runs it. The dialect's authority is
-//! llama.cpp's `src/models/gemma-embedding2.cpp`.
+//! description (`spec`). The card program is `crates/gpu-gemma-embedding2`.
+//! The dialect's authority is llama.cpp's `src/models/gemma-embedding2.cpp`.
 
 pub mod hparams;
 pub mod names;

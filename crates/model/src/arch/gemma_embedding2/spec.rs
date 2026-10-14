@@ -2,8 +2,10 @@
 //! query attention with a per-head q/k norm and NeoX rope of its kind's
 //! head, and a GELU GLU of `feed_forward_length`. The [`EncoderSpec`] holds
 //! what the trunk does not: the sliding layers' reach, the per-layer input's
-//! width and the output projection's. No tool parser and no reasoning span:
-//! the model writes no text.
+//! width and the output projection's, and the parts llama.cpp's graph runs
+//! past a decoder's layer (the token rows' scale, the values' norm, the
+//! norms after both blocks, the layer's scalar). No tool parser and no
+//! reasoning span: the model writes no text.
 
 use gguf::{Split, Value};
 use models::{Arch, ChatSpec, EncoderSpec, LayerSpec, ModelSpec};
@@ -92,6 +94,10 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
             reach,
             per_layer: Some(spec_u32("embedding_length_per_layer_input", hp.per_layer)?),
             proj: vec![spec_u32("embedding_length_out", hp.n_out)?],
+            embed_scale: true,
+            value_norm: true,
+            post_norms: true,
+            layer_scale: true,
         }),
         chat,
     })
@@ -99,7 +105,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
 
 #[cfg(test)]
 mod tests {
-    use models::{Act, Ffn, Mixer, RopeMode};
+    use models::{Act, Ffn, Mixer, Need, RopeMode};
 
     use super::super::hparams::Hparams;
     use super::super::names;
@@ -355,13 +361,36 @@ mod tests {
         }
     }
 
-    /// The coverage check names the bidirectional attention of both heads,
-    /// the GELU GLU and the program, and no causal flash, SwiGLU layer or
-    /// tool parser. A causal need on an encoder layer could be covered by a
-    /// decoder's row, and a SwiGLU would be.
+    /// The coverage check holds the file to the encoder program's shapes:
+    /// the bidirectional attention of both heads, the GELU GLU, the
+    /// per-layer input and the output projection at widths it does not run
+    /// are items, and no causal flash, SwiGLU layer, tool parser or missing
+    /// program is. The value norm, the post norms, the layer scalar and the
+    /// token rows' scale run at any width, so none is an item; a reader that
+    /// drops one of the encoder's parts, or a program row that covers a
+    /// causal need, fails this.
     #[test]
     fn coverage_names_the_encoder_parts() {
         let read = load("gemma-emb2-cover", keys(), &tensors()).expect("the header reads");
+        let encoder = read.spec.encoder.as_ref().expect("an encoder");
+        assert!(encoder.embed_scale);
+        assert!(encoder.value_norm);
+        assert!(encoder.post_norms);
+        assert!(encoder.layer_scale);
+        let needs = models::needs(&read.spec);
+        assert!(needs.contains(&(Need::EmbedScale, None)));
+        for (l, layer) in read.spec.layers.iter().enumerate() {
+            let Mixer::Gqa(gqa) = &layer.mixer else {
+                panic!("layer {l}: not GQA");
+            };
+            for need in [
+                Need::ValueNorm { head: gqa.head_dim },
+                Need::PostNorms,
+                Need::LayerScale,
+            ] {
+                assert!(needs.contains(&(need.clone(), Some(l as u32))), "{need:?}");
+            }
+        }
         let items: Vec<String> = coverage::check(&read.spec, &read.tensors)
             .into_iter()
             .map(|u| u.feature)
@@ -370,11 +399,21 @@ mod tests {
             "bidirectional GQA flash, head 8, group 2, 5 keys each side",
             "bidirectional GQA flash, head 16, group 4",
             "dense GELU GLU layer: ff 64",
-            "a layer program for gemma-embedding2",
+            "a per-layer input of 16 values from the token rows",
+            "the output projections [48], then the mean of the rows",
         ] {
             assert!(items.iter().any(|i| i == want), "{want}: {items:?}");
         }
-        for not in ["GQA flash, head", "dense SwiGLU", "tool-call parser"] {
+        for not in [
+            "GQA flash, head",
+            "dense SwiGLU",
+            "tool-call parser",
+            "a layer program",
+            "a gainless",
+            "RMS norms on",
+            "a trained scalar",
+            "token rows scaled",
+        ] {
             assert!(
                 !items.iter().any(|i| i.starts_with(not)),
                 "{not}: {items:?}"

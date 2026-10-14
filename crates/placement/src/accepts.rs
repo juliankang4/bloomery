@@ -42,6 +42,9 @@ pub enum Program {
     /// whose routed up and down stacks and shared expert are IQ2_XXS read by
     /// `iq2_xxs_gemv_sel` ([`BOLT_LEG`]).
     NemotronHMoeBody,
+    /// The gemma-embedding2 encoder (`crates/gpu-gemma-embedding2`): one
+    /// pass of a dense trunk on a card, no routed experts.
+    GemmaEmbedding2Body,
 }
 
 /// The program that runs `arch`'s layers; `None` when none does.
@@ -56,7 +59,8 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::MiMo2 => Some(Program::Mimo2Body),
         Arch::NemotronH => Some(Program::NemotronHBody),
         Arch::NemotronHMoe => Some(Program::NemotronHMoeBody),
-        Arch::GemmaEmbedding | Arch::GemmaEmbedding2 => None,
+        Arch::GemmaEmbedding => None,
+        Arch::GemmaEmbedding2 => Some(Program::GemmaEmbedding2Body),
     }
 }
 
@@ -180,8 +184,7 @@ pub struct LegArms {
 }
 
 /// Program `p`'s card leg arms, as its load checks each layer it gives card
-/// experts. Every program has a leg; the `Option` is for a program that
-/// runs no card expert.
+/// experts; `None` for a program that runs no routed expert.
 #[must_use]
 pub fn leg_arms(p: Program) -> Option<LegArms> {
     match p {
@@ -205,7 +208,7 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: |ty| ty == BOLT_LEG,
             down: |ty| ty == BOLT_LEG,
         }),
-        Program::NemotronHBody => None,
+        Program::NemotronHBody | Program::GemmaEmbedding2Body => None,
     }
 }
 
@@ -223,7 +226,8 @@ pub fn leg_runs(p: Program, [gate, up, down]: [GgmlType; 3]) -> Option<bool> {
 /// plan gives card experts is one the load runs. The common leg's plan
 /// carries a type on the card only where both its gate·up and its down
 /// launches read it ([`kernels::card_runs`]), in every part. V4.1's chain
-/// runs [`DS41_LEG`] alone.
+/// runs [`DS41_LEG`] alone. A program with no routed expert puts none on a
+/// card.
 #[must_use]
 pub fn routed_rule(p: Program) -> RoutedRule {
     match p {
@@ -248,7 +252,7 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             down: bolt_leg_card,
         },
         // No routed stack: every one is refused by name.
-        Program::NemotronHBody => RoutedRule::PerType(|_| None),
+        Program::NemotronHBody | Program::GemmaEmbedding2Body => RoutedRule::PerType(|_| None),
     }
 }
 

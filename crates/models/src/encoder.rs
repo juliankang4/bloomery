@@ -20,4 +20,14 @@ pub struct EncoderSpec {
     /// is the embedding's. With no activation between them they commute with
     /// the mean.
     pub proj: Vec<u32>,
+    /// The token rows multiplied by the square root of the hidden width before
+    /// the first layer.
+    pub embed_scale: bool,
+    /// Each attention layer's value rows RMS-normed per head with no gain.
+    pub value_norm: bool,
+    /// An RMS norm with a gain on the attention's and the feed-forward
+    /// block's outputs, before each residual add.
+    pub post_norms: bool,
+    /// Each layer's output multiplied by a trained scalar.
+    pub layer_scale: bool,
 }

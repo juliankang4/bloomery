@@ -77,6 +77,10 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
                 spec_u32("dense_2_feat_out", hp.n_dense)?,
                 spec_u32("dense_3_feat_out", hp.n_embd)?,
             ],
+            embed_scale: true,
+            value_norm: false,
+            post_norms: true,
+            layer_scale: false,
         }),
         mtp: Vec::new(),
         hc: None,
@@ -201,6 +205,8 @@ mod tests {
         assert_eq!(full, [5, 11, 17, 23]);
         assert_eq!(encoder.per_layer, None);
         assert_eq!(encoder.proj, [DENSE as u32, E as u32]);
+        assert!(encoder.embed_scale && encoder.post_norms);
+        assert!(!encoder.value_norm && !encoder.layer_scale);
         for (l, layer) in s.layers.iter().enumerate() {
             let Mixer::Gqa(g) = &layer.mixer else {
                 panic!("layer {l} is not GQA");

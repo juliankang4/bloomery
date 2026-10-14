@@ -120,6 +120,22 @@ pub enum Need {
     ReluSqr { ff: u32 },
     /// A dense GELU GLU layer of `ff` values.
     GeGlu { ff: u32 },
+    /// An encoder's value rows RMS-normed per head of `head` values, with no
+    /// gain.
+    ValueNorm { head: u32 },
+    /// An encoder layer's RMS norms on its attention's and its feed-forward
+    /// block's outputs, before each residual add.
+    PostNorms,
+    /// An encoder layer's output multiplied by its trained scalar.
+    LayerScale,
+    /// An encoder layer's own input of `width` values, projected from the
+    /// scaled token rows, gating a block of its own.
+    PerLayerInput { width: u32 },
+    /// An encoder's token rows scaled by the square root of the hidden width.
+    EmbedScale,
+    /// An encoder's output: the linear maps of `proj` widths after the output
+    /// norm, then the mean of the token rows.
+    Pooled { proj: Vec<u32> },
     /// A Mamba-2 mixer. The fields are the widths a scan kernel is built for.
     Mamba2 {
         d_inner: u32,
@@ -320,6 +336,21 @@ impl fmt::Display for Need {
             Need::DenseFfn { ff } => write!(f, "dense SwiGLU layer: ff {ff}"),
             Need::ReluSqr { ff } => write!(f, "squared-ReLU dense layer: ff {ff}"),
             Need::GeGlu { ff } => write!(f, "dense GELU GLU layer: ff {ff}"),
+            Need::ValueNorm { head } => {
+                write!(f, "a gainless per-head RMS norm on the values: head {head}")
+            }
+            Need::PostNorms => f.write_str("RMS norms on the attention and feed-forward outputs"),
+            Need::LayerScale => f.write_str("a trained scalar on the layer's output"),
+            Need::PerLayerInput { width } => {
+                write!(f, "a per-layer input of {width} values from the token rows")
+            }
+            Need::EmbedScale => f.write_str("token rows scaled by the root of the hidden width"),
+            Need::Pooled { proj } => {
+                write!(
+                    f,
+                    "the output projections {proj:?}, then the mean of the rows"
+                )
+            }
             Need::Mamba2 {
                 d_inner,
                 d_state,
@@ -384,7 +415,8 @@ fn mode_name(mode: RopeMode) -> String {
 /// Every part of `spec`'s trunk a program has to run, layer by layer in
 /// layer order, then the model-wide ones (`None`). The next-token layers
 /// (`spec.mtp`) are carried and not run, so they need nothing. An encoder's
-/// attention is [`Need::Bidirectional`], never a causal [`Need::Gqa`].
+/// attention is [`Need::Bidirectional`], never a causal [`Need::Gqa`], and
+/// what its [`crate::EncoderSpec`] carries past the trunk is a need too.
 #[must_use]
 pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
     let mut out = Vec::new();
@@ -420,6 +452,11 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 }
                 if g.out_gate {
                     at(Need::OutGate);
+                }
+                if let Some(e) = &spec.encoder
+                    && e.value_norm
+                {
+                    at(Need::ValueNorm { head: g.head_dim });
                 }
                 if let Some(s) = &g.select {
                     select_needs(s, &mut at);
@@ -515,6 +552,17 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 },
             });
         }
+        if let Some(e) = &spec.encoder {
+            if e.post_norms {
+                at(Need::PostNorms);
+            }
+            if let Some(width) = e.per_layer {
+                at(Need::PerLayerInput { width });
+            }
+            if e.layer_scale {
+                at(Need::LayerScale);
+            }
+        }
         if layer.extras.contains(&Extra::Engram) {
             at(Need::Engram { row: spec.hidden });
         }
@@ -578,6 +626,14 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
     }) = spec.engram
     {
         model(Need::ImageToken(token));
+    }
+    if let Some(e) = &spec.encoder {
+        if e.embed_scale {
+            model(Need::EmbedScale);
+        }
+        model(Need::Pooled {
+            proj: e.proj.clone(),
+        });
     }
     out
 }

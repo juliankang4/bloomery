@@ -1068,6 +1068,7 @@ fn family_name(program: Program) -> &'static str {
         Program::Deepseek41Chain => "deepseek41",
         Program::NemotronHBody => "nemotron_h",
         Program::NemotronHMoeBody => "nemotron_h_moe",
+        Program::GemmaEmbedding2Body => "gemma-embedding2",
     }
 }
 
