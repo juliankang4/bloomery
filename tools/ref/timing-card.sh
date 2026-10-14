@@ -457,6 +457,18 @@ timing_cards_before_lease() {
   exit "$rc"
 }
 
+# timing_cards_dry: a dry run's timing_cards_precheck, its lines under `[dry] ` and its verdict printed, a refusal
+# with its rc and reason, and the run going on. The runner calls it in the two-card mode only.
+timing_cards_dry() {
+  local rc=0
+  timing_cards_precheck '[dry] ' || rc=$?
+  if [ "$rc" = 0 ]; then
+    echo "[dry] two-card precheck: ok"
+  else
+    echo "[dry] two-card precheck: refused (rc $rc): $TWOCARD_WHY — a real run stops here, before the lease"
+  fi
+}
+
 # timing_cards_start: right after lease_take, the lease's start instant, from which the witness counts
 # the kernel's Xid lines (XID_T0, whole seconds: a line in the second the lease was taken counts). The same
 # in local mode, its line `[timing-card]`.

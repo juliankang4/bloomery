@@ -831,13 +831,7 @@ if [ -n "$DRY" ]; then
   [ -z "$PLACES_SET" ] || echo "[dry] placements: $(place_line "${PLACE_ARMS[@]}")"
   if [ -n "$TIMING_CARDS" ]; then
     echo "[dry] $(tc_config)"
-    tc_rc=0
-    timing_cards_precheck '[dry] ' || tc_rc=$?
-    if [ "$tc_rc" = 0 ]; then
-      echo "[dry] two-card precheck: ok"
-    else
-      echo "[dry] two-card precheck: refused (rc $tc_rc): $TWOCARD_WHY — a real run stops here, before the lease"
-    fi
+    timing_cards_dry
   fi
   [ "$ours_mtp" = 0 ] || echo "[dry] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; ${MTP_NOTE:-the schema of the mtp summary record was not read (the check lines)}"
   [ -z "$RS_NOTE" ] || echo "[dry] residency: $RS_NOTE"

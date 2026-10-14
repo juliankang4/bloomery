@@ -254,9 +254,7 @@ if [ -n "$DRY" ]; then
   echo "[dry] prompt check 1 ($LTOK): $PROMPT_N ids round-trip"
   ref_witness | sed 's/^   /[dry]/'
   if [ -n "$TIMING_CARDS" ]; then
-    tc_rc=0
-    timing_cards_precheck '[dry] ' || tc_rc=$?
-    if [ "$tc_rc" = 0 ]; then echo "[dry] two-card precheck: ok"; else echo "[dry] two-card precheck: refused (rc $tc_rc): $TWOCARD_WHY — a real run stops here, before the lease"; fi
+    timing_cards_dry
   fi
   echo "[dry] warm-up: the run line above once, discarded, then the same line timed"
   echo "[dry] stops before the lease"

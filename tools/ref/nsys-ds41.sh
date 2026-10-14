@@ -718,13 +718,7 @@ if [ -n "$DRY" ]; then
   echo "[dry] form=$FORM bin=$BIN n=$NGEN place=$PLACE residency=${BLOOMERY_RESIDENCY:-<unset>} args='${DEPTHS[*]}' out=$OUTDIR timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
   if [ -n "$TIMING_CARDS" ]; then
     echo "[dry] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
-    tc_rc=0
-    timing_cards_precheck '[dry] ' || tc_rc=$?
-    if [ "$tc_rc" = 0 ]; then
-      echo "[dry] two-card precheck: ok"
-    else
-      echo "[dry] two-card precheck: refused (rc $tc_rc): $TWOCARD_WHY — a real run stops here, before the lease"
-    fi
+    timing_cards_dry
   fi
   for i in "${!A_NAME[@]}"; do
     out="$OUTDIR/<name>"

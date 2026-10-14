@@ -2071,13 +2071,7 @@ if [ -n "$DRY" ]; then
   echo "[dry] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0} now: $(cpu_busy_reading)"
   if [ -n "$TIMING_CARDS" ]; then
     echo "[dry] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
-    tc_rc=0
-    timing_cards_precheck '[dry] ' || tc_rc=$?
-    if [ "$tc_rc" = 0 ]; then
-      echo "[dry] two-card precheck: ok"
-    else
-      echo "[dry] two-card precheck: refused (rc $tc_rc): $TWOCARD_WHY — a real run stops here, before the lease"
-    fi
+    timing_cards_dry
   fi
   ph_round=0
   for i in "${!ARMS[@]}"; do
