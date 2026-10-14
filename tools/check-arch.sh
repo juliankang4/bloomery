@@ -18,22 +18,33 @@
 # 계약: `just check-arch`는 넷 다 엄격하게 돈다. --allow-pending(또는 CHECK_ARCH_PENDING=1)은 ②·③을
 # 경고로 낮추는 문이다 — 이관 라운드가 한동안 둘을 빨강으로 두어야 할 때 그 라운드 안에서만 쓴다.
 # ①·④는 어느 모드에서도 엄격하다.
+# Exit: 0 clean, 1 a violation, 2 no verdict: an unknown argument, no architecture directory, or a listing or scan whose
+# grep or find fails (a file it cannot read never passes as a file with no hit). `--self-test` runs the architecture
+# listing and each scan on a missing path and exits.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=tools/grep-answer.sh
+source tools/grep-answer.sh
 
 PENDING=${CHECK_ARCH_PENDING:-0}
+SELFTEST=0
 for a in "$@"; do
   case $a in
     --allow-pending) PENDING=1 ;;
-    *) echo "check-arch: unknown argument '$a' (only --allow-pending)" >&2; exit 2 ;;
+    --self-test) SELFTEST=1 ;;
+    *) echo "check-arch: unknown argument '$a' (--allow-pending, --self-test)" >&2; exit 2 ;;
   esac
 done
 
 # 아키텍처 이름들: crates/*/src/arch/<name>/ 디렉터리.
-# arches <crates dir>: the names, space-separated, into ARCHES.
+# arches <crates dir>: the names, space-separated, into ARCHES. A find that fails ends the check with no verdict.
 arches() {
-  ARCHES=$(find "$1" -mindepth 4 -maxdepth 4 -type d -path "$1/*/src/arch/*" 2>/dev/null \
-    | sed 's|.*/||' | sort -u | tr '\n' ' ')
+  local dirs
+  dirs=$(find "$1" -mindepth 4 -maxdepth 4 -type d -path "$1/*/src/arch/*") || {
+    echo "check-arch: cannot list the architecture directories under $1 (find exit $?, above), no verdict" >&2
+    exit 2
+  }
+  ARCHES=$(printf '%s' "$dirs" | sed 's|.*/||' | sort -u | tr '\n' ' ')
 }
 arches crates
 [ -n "$ARCHES" ] || { echo "check-arch: no crates/*/src/arch/<name>/ directory found" >&2; exit 2; }
@@ -56,10 +67,13 @@ report() { # report <번호> <설명> <위반 줄들>
   fi
 }
 
-# The scans of rules ① to ⑤ below: each reads only the paths it is given.
+# The scans of rules ① to ⑤ below: each reads only the paths it is given, and a grep or find that fails ends the
+# check through nov.
+nov() { echo "check-arch: rule $*, no verdict" >&2; exit 2; }
 cross_one() { # cross_one <crates dir> <this architecture> <the name it must not use>: rule ①'s hits into cross
   local dirs
-  dirs=$(find "$1" -type d \( -path "*/src/arch/$2" -o -path "$1/gpu-$2/src" \) 2>/dev/null || true)
+  dirs=$(find "$1" -type d \( -path "*/src/arch/$2" -o -path "$1/gpu-$2/src" \)) ||
+    nov "1 cannot list the directories of $2 under $1 (find exit $?, above)"
   [ -n "$dirs" ] || return 0
   # shellcheck disable=SC2086
   cross_uses "$3" $dirs
@@ -67,45 +81,81 @@ cross_one() { # cross_one <crates dir> <this architecture> <the name it must not
 cross_uses() { # cross_uses <name> <dir…>
   local name=$1 hits
   shift
-  hits=$(grep -rnE "^[[:space:]]*(pub )?use .*\b$name\b" "$@" --include='*.rs' || true)
+  hits=$(grep_answer check-arch -rnE "^[[:space:]]*(pub )?use .*\b$name\b" "$@" --include='*.rs') ||
+    nov "1 cannot read $* (exit $?, above)"
   [ -z "$hits" ] || cross="${cross:+$cross$'\n'}$hits"
 }
 scan_lits() { # scan_lits <path…>: rule ②'s hits into lits
-  lits=$(grep -rnE "\"blk\\.|(^|[^.a-z])blk\\.\\{|$KEYS" "$@" --include='*.rs' --include='*.sh' 2>/dev/null \
-    | grep -vE "$OWN" \
-    | grep -vE '^tools/ref/models/' \
-    | grep -vE '^crates/[^/]+/tests/' \
-    | grep -vE '^crates/gpu-gates/src/bin/' \
-    | grep -vE '^crates/engram/' \
-    | grep -vE '^crates/gguf/src/bin/' \
-    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
-    | awk -v keys="$KEYS" '{ body = $0; sub(/^[^:]*:[0-9]+:/, "", body); gsub(/"blk\."/, "", body)
-             if (body ~ /"blk\.|(^|[^.a-z])blk\.[{]/ || body ~ keys) print }' || true)
+  lits=$(grep_answer check-arch -rnE "\"blk\\.|(^|[^.a-z])blk\\.\\{|$KEYS" "$@" --include='*.rs' --include='*.sh' \
+    | grep_answer check-arch -vE "$OWN" \
+    | grep_answer check-arch -vE '^tools/ref/models/' \
+    | grep_answer check-arch -vE '^crates/[^/]+/tests/' \
+    | grep_answer check-arch -vE '^crates/gpu-gates/src/bin/' \
+    | grep_answer check-arch -vE '^crates/engram/' \
+    | grep_answer check-arch -vE '^crates/gguf/src/bin/' \
+    | grep_answer check-arch -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
+    | KEYS=$KEYS awk '{ body = $0; sub(/^[^:]*:[0-9]+:/, "", body); gsub(/"blk\."/, "", body)
+             if (body ~ /"blk\.|(^|[^.a-z])blk\.[{]/ || body ~ ENVIRON["KEYS"]) print }') ||
+    nov "2 cannot read $* (exit $?, above)"
 }
 scan_archread() { # scan_archread <path…>: rule ③'s hits into archread
-  archread=$(grep -rn 'general\.architecture' "$@" --include='*.rs' 2>/dev/null \
-    | grep -vE '^crates/gguf/' \
-    | grep -vE '^crates/model/src/arch/mod\.rs:' \
-    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+  archread=$(grep_answer check-arch -rn 'general\.architecture' "$@" --include='*.rs' \
+    | grep_answer check-arch -vE '^crates/gguf/' \
+    | grep_answer check-arch -vE '^crates/model/src/arch/mod\.rs:' \
+    | grep_answer check-arch -vE '^[^:]+:[0-9]+:[[:space:]]*//') ||
+    nov "3 cannot read $* (exit $?, above)"
 }
 # 세 모양을 본다: 경로 안의 `deepseek2::…`, 모듈을 통째로 들여오거나 재수출하는 use 줄
 # (`use …::arch::deepseek2 as x;`, `pub use …::deepseek2;` — 뒤에 `::`가 없어 첫 모양에 안 걸린다),
 # 그리고 rustfmt가 여러 줄로 나눈 `use …::{`의 한 줄에 모듈 이름만 남은 것(`    deepseek2,`).
 scan_archpath() { # scan_archpath <path…>: rule ④'s hits into archpath
-  archpath=$({ grep -rnE "\\b($ALT)::" "$@" --include='*.rs' 2>/dev/null
-               grep -rnE "^[[:space:]]*(pub(\\([a-z]+\\))?[[:space:]]+)?use[[:space:]][^;]*\\b($ALT)\\b" \
-                 "$@" --include='*.rs' 2>/dev/null
-               grep -rnE "^[[:space:]]*($ALT)([[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*)?,?[[:space:]]*\$" \
-                 "$@" --include='*.rs' 2>/dev/null; } | sort -u \
-    | grep -vE "$OWN" \
-    | grep -vE '^crates/gpu-gates/src/bin/' \
-    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+  archpath=$(grep_answer check-arch -rnE -e "\\b($ALT)::" \
+               -e "^[[:space:]]*(pub(\\([a-z]+\\))?[[:space:]]+)?use[[:space:]][^;]*\\b($ALT)\\b" \
+               -e "^[[:space:]]*($ALT)([[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*)?,?[[:space:]]*\$" \
+               "$@" --include='*.rs' | sort -u \
+    | grep_answer check-arch -vE "$OWN" \
+    | grep_answer check-arch -vE '^crates/gpu-gates/src/bin/' \
+    | grep_answer check-arch -vE '^[^:]+:[0-9]+:[[:space:]]*//') ||
+    nov "4 cannot read $* (exit $?, above)"
 }
 scan_spawns() { # scan_spawns <path…>: rule ⑤'s spawn count per file into spawned
-  spawned=$(grep -rnE 'thread::spawn\(|\.spawn\((move\b|\|)' "$@" --include='*.rs' 2>/dev/null \
-    | grep -vE '^crates/oxide-ice-unroll/' \
-    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' | cut -d: -f1 | sort | uniq -c || true)
+  spawned=$(grep_answer check-arch -rnE 'thread::spawn\(|\.spawn\((move\b|\|)' "$@" --include='*.rs' \
+    | grep_answer check-arch -vE '^crates/oxide-ice-unroll/' \
+    | grep_answer check-arch -vE '^[^:]+:[0-9]+:[[:space:]]*//' | cut -d: -f1 | sort | uniq -c) ||
+    nov "5 cannot read $* (exit $?, above)"
 }
+
+# The listing and each scan on a missing path end with no verdict, and each scan on /dev/null (no hit) is clean.
+self_test() {
+  local fails=0 out rc n scan
+  expect() {
+    [ "$2" = "$3" ] || { echo "check-arch: self-test $1: got [$2], want [$3]" >&2; fails=$((fails + 1)); }
+  }
+  rc=0 out=$( (arches /nonexistent) 2>&1) || rc=$?
+  expect arches "$rc ${out##*$'\n'}" \
+    "2 check-arch: cannot list the architecture directories under /nonexistent (find exit 1, above), no verdict"
+  rc=0 out=$( (cross_one /nonexistent a b) 2>&1) || rc=$?
+  expect cross-find "$rc ${out##*$'\n'}" \
+    "2 check-arch: rule 1 cannot list the directories of a under /nonexistent (find exit 1, above), no verdict"
+  rc=0 out=$( (cross_uses b /nonexistent/a.rs) 2>&1) || rc=$?
+  expect cross-grep "$rc ${out##*$'\n'}" "2 check-arch: rule 1 cannot read /nonexistent/a.rs (exit 2, above), no verdict"
+  rc=0 out=$( (cross_one /dev/null a b && cross_uses b /dev/null && printf '%s' "${cross-}") 2>&1) || rc=$?
+  expect cross-clean "$rc $out" "0 "
+  n=1
+  for scan in lits archread archpath spawns; do
+    n=$((n + 1))
+    rc=0 out=$( ("scan_$scan" /nonexistent/a.rs) 2>&1) || rc=$?
+    expect "$scan" "$rc ${out##*$'\n'}" "2 check-arch: rule $n cannot read /nonexistent/a.rs (exit 2, above), no verdict"
+    rc=0 out=$( ("scan_$scan" /dev/null && printf '%s' "${lits-}${archread-}${archpath-}${spawned-}") 2>&1) || rc=$?
+    expect "$scan-clean" "$rc $out" "0 "
+  done
+  [ "$fails" = 0 ] || { echo "check-arch: self-test: $fails failed" >&2; return 1; }
+  echo "check-arch: self-test ok"
+}
+if [ "$SELFTEST" = 1 ]; then
+  self_test
+  exit $?
+fi
 
 # ① 두 아키텍처 디렉터리가 서로를 use 하지 않는다. 한쪽 디렉터리가 없으면 그쪽은 grep 대상이 없어
 #    통과하고, 생기는 순간부터 값을 한다.
