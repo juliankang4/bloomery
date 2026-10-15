@@ -121,6 +121,7 @@
 #include <sys/stat.h>
 #include <vector>
 
+#define DUMP_TOOL "dump_mtmd"
 #include "set_writer.h"
 
 // ---- the graph-node callback --------------------------------------------------------------------------------------

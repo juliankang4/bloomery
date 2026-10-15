@@ -1,4 +1,7 @@
-// Shared set output and id parsing for the mainline oracle dumpers.
+// The set writer of the mainline oracle dumpers (tools/ref/clefvis/dump_mtmd.cpp, tools/ref/emb2/dump_emb2.cpp): sha256,
+// the reader of the id files the dumpers take, the raw f32 and i32 rows of dump_ref's set format, and the manifest with its
+// `# complete` trailer, renamed into place last. The includer defines DUMP_TOOL, the name its messages open with, before
+// including this file; DIE prints one and exits 1.
 #pragma once
 
 #include <algorithm>
@@ -17,7 +20,11 @@
 #include <sys/stat.h>
 #include <vector>
 
-#define DIE(...) do { fprintf(stderr, "dump_mtmd: " __VA_ARGS__); fputc('\n', stderr); exit(1); } while (0)
+#ifndef DUMP_TOOL
+#error "define DUMP_TOOL, the name every message opens with, before including set_writer.h"
+#endif
+
+#define DIE(...) do { fprintf(stderr, DUMP_TOOL ": " __VA_ARGS__); fputc('\n', stderr); exit(1); } while (0)
 
 // ---- sha256 -----------------------------------------------------------------------------------------------------
 
@@ -90,6 +97,8 @@ static bool read_file(const std::string & path, std::vector<uint8_t> & out) {
     return true;
 }
 
+// The ids of an id file (clefvis.sh --ids, the prose ids, crates/tokenizer/tools/oracle.sh): one base-10 id from 0 to
+// INT32_MAX a line, digits only. Any other line, an empty one or one with a NUL byte included, is a DIE naming the file and the line.
 static std::vector<int32_t> parse_ids(const std::string & path, const std::vector<uint8_t> & raw) {
     std::vector<int32_t> ids;
     std::istringstream in(std::string(raw.begin(), raw.end()));
@@ -99,8 +108,10 @@ static std::vector<int32_t> parse_ids(const std::string & path, const std::vecto
         ++n;
         char * end = nullptr;
         errno = 0;
-        const long v = strtol(line.c_str(), &end, 10);
-        if (line.empty() || *end != '\0' || errno != 0 || v < 0 || v > INT32_MAX) DIE("%s:%ld is not a token id: '%s'", path.c_str(), n, line.c_str());
+        const long v = line.empty() || line[0] < '0' || line[0] > '9' ? -1 : strtol(line.c_str(), &end, 10);
+        if (v < 0 || end != line.c_str() + line.size() || errno != 0 || v > INT32_MAX) {
+            DIE("%s:%ld is not a token id: '%s'", path.c_str(), n, line.c_str());
+        }
         ids.push_back((int32_t) v);
     }
     return ids;
@@ -187,7 +198,6 @@ struct set_writer {
         fputs(rows.c_str(), m);
         fprintf(m, "# complete\t%d\t0\n", written);
         if (fclose(m) != 0 || rename(partial.c_str(), final_path.c_str()) != 0) DIE("cannot install %s", final_path.c_str());
-        fprintf(stderr, "dump_mtmd: %d rows into %s\n", written, dir.c_str());
+        fprintf(stderr, DUMP_TOOL ": %d rows into %s\n", written, dir.c_str());
     }
 };
-

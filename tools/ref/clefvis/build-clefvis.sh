@@ -11,8 +11,9 @@
 #
 # The tree is checked, not trusted: no tracked change (a hand edit there would reach the oracle under the commit's name). Its build
 # is the one the depth runners time; this links against it and builds nothing in it.
-# Output: the binary and a `.build` record beside it, naming the sha256 of the dump_mtmd.cpp it was built from, the mainline commit
-# and the sha256 of the mtmd.h and mtmd-helper.h it saw; clefvis.sh refuses a binary whose record does not match its own tree.
+# Output: the binary and a `.build` record beside it, naming the sha256 of the dump_mtmd.cpp it was built from and of the
+# set_writer.h it includes, the mainline commit and the sha256 of the mtmd.h and mtmd-helper.h it saw; clefvis.sh refuses a
+# binary whose record does not match its own tree.
 # The compile writes a temporary name and only a finished link replaces the installed binary (CLEFVIS_OUT moves the directory).
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
@@ -22,6 +23,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/profile.sh"
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 OUT=${CLEFVIS_OUT:-$DATA/bin}
 SRC=$HERE/tools/ref/clefvis/dump_mtmd.cpp
+HDR=$HERE/tools/ref/clefvis/set_writer.h
 LCPP=$ORACLE
 git_lcpp() { git -c safe.directory="$LCPP" -C "$LCPP" "$@"; }
 if [ -n "$(git_lcpp status --porcelain --untracked-files=no)" ]; then
@@ -40,6 +42,7 @@ NAME=$(basename "$BIN")
 TMP=$OUT/$NAME.tmp.$$
 trap 'rm -f "$TMP" "$TMP.build"' EXIT
 SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
+HDR_SHA=$(sha256sum "$HDR" | cut -d' ' -f1)
 H_SHA=$(cat "$LCPP/tools/mtmd/mtmd.h" "$LCPP/tools/mtmd/mtmd-helper.h" | sha256sum | cut -d' ' -f1)
 defs=()
 grep -q 'struct mtmd_helper_embd_batch' "$LCPP/tools/mtmd/mtmd-helper.h" && defs+=(-DDUMP_MTMD_EMBD_BATCH)
@@ -51,7 +54,8 @@ if [ "$FAMILY" = qvis ] || [ "$FAMILY" = mcvis ]; then
   links+=(-lllama-common)
 fi
 g++ -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function "${defs[@]}" -o "$TMP" "$SRC" "${incs[@]}" -L"$LIB" "${links[@]}" -Wl,-rpath,"$LIB"
-printf 'source_sha256 %s\nlcpp %s\nlcpp_commit %s\nmtmd_headers_sha256 %s\n' "$SRC_SHA" "$(readlink -f "$LCPP")" "$COMMIT" "$H_SHA" > "$TMP.build"
+printf 'source_sha256 %s\nset_writer_sha256 %s\nlcpp %s\nlcpp_commit %s\nmtmd_headers_sha256 %s\n' "$SRC_SHA" "$HDR_SHA" "$(readlink -f "$LCPP")" \
+  "$COMMIT" "$H_SHA" > "$TMP.build"
 mv -f "$TMP" "$OUT/$NAME"
 mv -f "$TMP.build" "$OUT/$NAME.build"
 echo "built $OUT/$NAME from dump_mtmd.cpp sha256 ${SRC_SHA:0:12} against $LCPP at $COMMIT (${defs[*]:-no defines})"

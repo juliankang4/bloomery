@@ -27,7 +27,7 @@
 #   clefvis.sh --ids                   the ids of every request (CPU only, no card lock)
 #   clefvis.sh --ref-d [--reps N]      set D: the release's answers to the requests on the A6000 (Clef only; BLOOMERY_CARD=a6000)
 #
-# The binary must be the one built from this tree's dump_mtmd.cpp (its .build record's source sha256) against the profile's
+# The binary must be the one built from this tree's dump_mtmd.cpp and set_writer.h (its .build record's two sha256) against the profile's
 # ORACLE at its current commit (build-clefvis.sh), the mmproj must have the sha256 the family pins and the prose ids the
 # profile's: either refused names what differs. Each set is written to <set>.staging and moved over the old set only when
 # dump_mtmd exits 0 (its manifest's `# complete` trailer is then written). The runs go through tools/gpu-gate.sh, as lev-dump.sh's
@@ -80,10 +80,12 @@ ref_d() {
 
 # The binary is this tree's source at the profile's tree, the projector, prose ids and text model are the ones pinned.
 check_inputs() {
-  local want_src want_commit got
+  local want_src want_hdr want_commit got
   want_src=$(sha256sum "$HERE/tools/ref/clefvis/dump_mtmd.cpp" | cut -d' ' -f1)
+  want_hdr=$(sha256sum "$HERE/tools/ref/clefvis/set_writer.h" | cut -d' ' -f1)
   want_commit=$(git -c safe.directory="$ORACLE" -C "$ORACLE" rev-parse --short=9 HEAD)
-  if ! grep -qx "source_sha256 $want_src" "$BIN.build" 2> /dev/null || ! grep -qx "lcpp_commit $want_commit" "$BIN.build" 2> /dev/null; then
+  if ! grep -qx "source_sha256 $want_src" "$BIN.build" 2> /dev/null || ! grep -qx "set_writer_sha256 $want_hdr" "$BIN.build" 2> /dev/null ||
+    ! grep -qx "lcpp_commit $want_commit" "$BIN.build" 2> /dev/null; then
     echo "clefvis.sh: $BIN is not this tree's dump_mtmd at $ORACLE $want_commit (rebuild: just build-clefvis-ref / build-qvis-ref)" >&2
     exit 2
   fi
