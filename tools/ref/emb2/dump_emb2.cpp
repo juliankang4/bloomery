@@ -76,7 +76,6 @@ struct taps {
 };
 
 static const char * const TEXT_TAPS[]  = { "inp_scaled", "inp_per_layer", "l_out-", "result_norm", "result_embd_pooled", nullptr };
-static const char * const TEXT_V1_TAPS[] = { "inp_scaled", "l_out-", "result_norm", "result_embd_pooled", nullptr };
 static const char * const TOWER_TAPS[] = { "inp_raw_scaled", "pos_embd", "layer_out-", "pooled", "std_scaled",
                                            "projected", nullptr };
 
@@ -224,7 +223,7 @@ static void run_text(llama_model * model, const std::string & ids_dir, const std
         out.tensor_f32(c + "/pooled", "MEAN", ne_pooled, p);
         llama_free(pooled);
 
-        taps t{ dense_head ? TEXT_V1_TAPS : TEXT_TAPS, {}, {}, dense_head };
+        taps t{ TEXT_TAPS, {}, {}, dense_head };
         llama_context * tapped = make_ctx(model, n, LLAMA_POOLING_TYPE_NONE, threads, &t);
         decode_ids(tapped, ids, c + ": the taps pass");
         llama_free(tapped);

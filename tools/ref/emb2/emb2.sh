@@ -48,7 +48,7 @@ ALL=("${EMBED_STEPS[@]}")
 steps=("$@")
 [ ${#steps[@]} -gt 0 ] || steps=("${ALL[@]}")
 for s in "${steps[@]}"; do
-  case " ${ALL[*]} " in *" $s "*) ;; *) echo "emb2: unknown step '$s' (${ALL[*]})" >&2; exit 64 ;; esac
+  [[ -n "$s" && "$s" != *[[:space:]]* && " ${ALL[*]} " == *" $s "* ]] || { echo "emb2: unknown step '$s' (${ALL[*]})" >&2; exit 64; }
 done
 selected() {
   local s

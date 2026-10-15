@@ -141,14 +141,16 @@ printf '%s:end\\n' "$FIXTURE_TAG" >> "$FIXTURE_EVENTS"
             time.sleep(0.02)
         self.fail("the first writer did not reach generation")
 
-    def test_text_only_profile_refuses_tower_before_the_runner(self):
+    def test_text_only_profile_refuses_tower_and_joined_steps_before_the_runner(self):
         env = os.environ.copy()
         env.pop("BLOOMERY_MODEL", None)
         env["BLOOMERY_REF_MODEL_PROFILE"] = "gemma-embedding"
-        result = subprocess.run(["bash", str(ROOT / "tools/ref/emb2/emb2.sh"), "tower"],
-                                env=env, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 64, result.stderr)
-        self.assertIn("unknown step 'tower'", result.stderr)
+        for step in ("tower", "text server"):
+            with self.subTest(step=step):
+                result = subprocess.run(["bash", str(ROOT / "tools/ref/emb2/emb2.sh"), step],
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn(f"unknown step '{step}'", result.stderr)
 
     def test_lock_precedes_recovery_and_staging(self):
         old = Path(str(self.final) + ".old")
