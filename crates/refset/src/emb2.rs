@@ -59,9 +59,6 @@ pub struct Profile {
 #[derive(Debug, Clone)]
 pub struct Emb2Set {
     pub man: RefManifest,
-    pub kind: Kind,
-    /// The card the dump ran on (`# device … card <name>`), `cpu` for a twin.
-    pub card: String,
 }
 
 impl Emb2Set {
@@ -98,7 +95,7 @@ impl Emb2Set {
             return Err(foreign("emb2", &line, kind.set_kind()));
         }
         let dev = one(&man, "device")?;
-        let [device, "threads", _, "card", card] = dev[..] else {
+        let [device, "threads", _, "card", _] = dev[..] else {
             return Err(RefError::malformed(
                 &at,
                 format!("{dev:?}: want cuda|cpu\tthreads\t<n>\tcard\t<name>"),
@@ -176,7 +173,6 @@ impl Emb2Set {
                 "the tower has no layer_out-0 block tap",
             ));
         }
-        let card = card.to_string();
-        Ok(Emb2Set { man, kind, card })
+        Ok(Emb2Set { man })
     }
 }

@@ -240,5 +240,48 @@ class Options(unittest.TestCase):
                 self.assertNotIn("-t requires", result.stderr)
 
 
+class Ids(unittest.TestCase):
+    """set_writer.h's parse_ids, built alone: an id file is digits only, one id from 0 to INT32_MAX a line."""
+
+    @classmethod
+    def setUpClass(cls):
+        cxx = shutil.which("c++") or shutil.which("g++")
+        if not cxx:
+            raise unittest.SkipTest("a C++ compiler is required for the id reader checks")
+        cls.tmp = Path(tempfile.mkdtemp(prefix="bloomery-emb2-ids-"))
+        # gguf_arch needs gguf.h's four calls; this build never calls it, so they are stubs and llama.cpp is not needed.
+        gguf = ("#include <cstdint>\nstruct gguf_context;\nstruct gguf_init_params { bool no_alloc; void * ctx; };\n"
+                "static gguf_context * gguf_init_from_file(const char *, gguf_init_params) { return nullptr; }\n"
+                "static int64_t gguf_find_key(const gguf_context *, const char *) { return -1; }\n"
+                'static const char * gguf_get_val_str(const gguf_context *, int64_t) { return ""; }\n'
+                "static void gguf_free(gguf_context *) {}\n")
+        write(cls.tmp / "ids.cpp", gguf + '#define DUMP_TOOL "ids"\n#include "' + str(ROOT / "tools/ref/clefvis/set_writer.h") + '"\n'
+              "int main(int, char ** argv) {\n    std::vector<uint8_t> raw;\n    if (!read_file(argv[1], raw)) return 2;\n"
+              '    for (int32_t id : parse_ids(argv[1], raw)) printf("%d\\n", id);\n}\n')
+        cls.bin = cls.tmp / "ids"
+        subprocess.run([cxx, "-std=c++17", "-o", str(cls.bin), str(cls.tmp / "ids.cpp")], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def read(self, data):
+        path = self.tmp / "case.ids"
+        path.write_bytes(data)
+        return path, subprocess.run([str(self.bin), str(path)], capture_output=True, timeout=5)
+
+    def test_malformed_lines_name_the_file_and_line(self):
+        for data in (b"7\n-1\n", b"7\n+1\n", b"7\n 1\n", b"7\n1 \n", b"7\n1\x002\n", b"7\n\n", b"7\n2147483648\n", b"7\n0x1\n"):
+            with self.subTest(data=data):
+                path, result = self.read(data)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"ids: {path}:2 is not a token id".encode(), result.stderr)
+                self.assertEqual(result.stdout, b"")
+
+    def test_digit_lines_are_read(self):
+        _, result = self.read(b"0\n42\n2147483647\n")
+        self.assertEqual((result.returncode, result.stdout), (0, b"0\n42\n2147483647\n"), result.stderr)
+
+
 unittest.main(argv=["check-emb2"], verbosity=2)
 PY
