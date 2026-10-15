@@ -12,6 +12,7 @@ pub mod deepseek41;
 pub mod deepseek41v;
 pub mod dequant;
 pub mod draft;
+pub mod gemma_embedding;
 pub mod gemma_embedding2;
 pub mod glm5next;
 pub mod mimo2;
@@ -35,6 +36,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (nemotron_h::ARCH, nemotron_h::FAMILIES),
     (tokenizer::ARCH, tokenizer::FAMILIES),
     (dequant::ARCH, dequant::FAMILIES),
+    (gemma_embedding::ARCH, gemma_embedding::FAMILIES),
     (gemma_embedding2::ARCH, gemma_embedding2::FAMILIES),
 ];
 

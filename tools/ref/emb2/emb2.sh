@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
-# The EmbeddingGemma 2 oracle sets (`just dump-ref-emb2 [STEP...]`), under the gemma-embedding2 profile
-# (tools/ref/models/gemma-embedding2.sh and its seat in tools/ref/clefvis/profile.sh), from the mainline tree LCPP at LCPP_PIN
-# (`just build-emb2-lcpp`) and the dump_emb2 binary linked against it (`just build-emb2-ref`). Each step writes one set under
-# $BLOOMERY_DATA; its refset family (crates/refset/src/arch/gemma_embedding2) is in parentheses. The text cases and their ids
-# are the tokenizer oracle's gemma4 set, ref-tokenizer-gemma4 (`just dump-ref-tokenizer gemma4`, crates/tokenizer/tools/oracle.sh:
-# the shared cases and crates/tokenizer/tests/cases-gemma4.txt, tokenized by the same tree's llama-tokenize):
+# The EmbeddingGemma oracle sets (`just dump-ref-embedding MODEL [STEP...]`), under the selected model profile
+# (tools/ref/models/ and its seat in tools/ref/clefvis/profile.sh), from the mainline tree LCPP at LCPP_PIN
+# (`just build-emb2-lcpp`) and the dump_emb2 binary linked against it (`just build-embedding-ref MODEL`). Each step writes
+# one set under $BLOOMERY_DATA with the profile's SETPFX. The text cases and their ids are the tokenizer oracle's
+# ref-tokenizer-$EMBED_VOCAB set (`just dump-ref-tokenizer $EMBED_VOCAB`, crates/tokenizer/tools/oracle.sh):
+# the shared cases and the profile's EMBED_CASES, tokenized by the same tree's llama-tokenize. EMBED_STEPS names the
+# available steps and their order; a text-only profile has no tower steps. See README.md:
 #
-#   text       ref_gemma_embedding2_text (text-gemma-embedding2): dump_emb2 text over every case on the card
-#   text.cpu   ref_gemma_embedding2_text.cpu (text-gemma-embedding2-cpu): the same with no card in view
-#   tower      ref_gemma_embedding2_tower (tower-gemma4v): dump_emb2 tower over IMAGES on the card
-#   tower.cpu  ref_gemma_embedding2_tower.cpu (tower-gemma4v-cpu): the same with no card in view
-#   server     ref_gemma_embedding2_server (server-gemma-embedding2): llama-server's /v1/embeddings vectors of every text
+#   text       ${SETPFX}_text: dump_emb2 text over every case on the card
+#   text.cpu   ${SETPFX}_text.cpu: the same with no card in view
+#   tower      ${SETPFX}_tower: dump_emb2 tower over IMAGES on the card
+#   tower.cpu  ${SETPFX}_tower.cpu: the same with no card in view
+#   server     ${SETPFX}_server: llama-server's /v1/embeddings vectors of every text
 #              case that is UTF-8 and every image (server_vectors.py), the server on 127.0.0.1:${EMB2_PORT:-8097} for the
 #              step's length
 #
-#   bash tools/ref/emb2/emb2.sh [STEP...]     (no step: all five; the card steps first, then the twins)
+#   bash tools/ref/emb2/emb2.sh [STEP...]     (no step: the profile's EMBED_STEPS)
 #
 # Before every step the tree is checked, not trusted: LCPP at LCPP_PIN with no tracked change, its llama-server built from that
 # commit, the binary's .build record (tools/ref/clefvis/build-clefvis.sh) naming this tree's dump_emb2.cpp and set_writer.h and
@@ -23,7 +24,7 @@
 # libllama.so it loads, and of the two cases files as they are now. Each set is written to <set>.staging and moved over the
 # old set only when its writer exits 0, so a failed step leaves the old set whole: the old set waits as <set>.old while the
 # new one takes its name, an exit or a caught signal in between moves it back, and a step that finds a <set>.old left by a
-# killed run restores it first (or drops it, when the new set had its name already). The card steps (text, tower, server)
+# killed run restores it first (or discards it when the replacement is already there). The card steps (text, tower, server)
 # go through tools/gpu-gate.sh, as clefvis.sh's do: the card's gate lock and the bound EMB2_BOUND (default 1500 s, parsed as
 # tools/gate-bound.sh parses BLOOMERY_GATE_BOUND), for the call and for each step; the script links itself as
 # target/release/emb2_dump and runs the card steps under that name inside the runner. The twins open no card
@@ -33,7 +34,17 @@ set -euo pipefail
 REAL=$(readlink -f "${BASH_SOURCE[0]}")
 HERE=$(cd "$(dirname "$REAL")/../../.." && pwd)
 cd "$HERE"
-ALL=(text tower server text.cpu tower.cpu)
+# shellcheck source=tools/ref/ref-paths.sh
+source tools/ref/ref-paths.sh
+# shellcheck source=tools/ref/clefvis/profile.sh
+source tools/ref/clefvis/profile.sh
+[ "$FAMILY" = emb2 ] ||
+  { echo "emb2: the sets need an EmbeddingGemma profile; this one is $MODEL_NAME" >&2; exit 2; }
+: "${EMBED_VOCAB:?the profile names EMBED_VOCAB}"
+: "${EMBED_CASES:?the profile names EMBED_CASES}"
+: "${EMBED_CONTEXT:?the profile names EMBED_CONTEXT}"
+: "${EMBED_STEPS[*]:?the profile names EMBED_STEPS}"
+ALL=("${EMBED_STEPS[@]}")
 steps=("$@")
 [ ${#steps[@]} -gt 0 ] || steps=("${ALL[@]}")
 for s in "${steps[@]}"; do
@@ -68,14 +79,8 @@ if [ "$(basename "${BASH_SOURCE[0]}")" != emb2_dump ] && [ ${#card_steps[@]} -gt
   exit 0
 fi
 
-# shellcheck source=tools/ref/ref-paths.sh
-source tools/ref/ref-paths.sh
-# shellcheck source=tools/ref/clefvis/profile.sh
-source tools/ref/clefvis/profile.sh
-[ "$FAMILY" = emb2 ] ||
-  { echo "emb2: the sets are dumped under the gemma-embedding2 profile (BLOOMERY_MODEL=gemma-embedding2); this one is $MODEL_NAME" >&2; exit 2; }
 export BLOOMERY_REF_BUILD=${LCPP_PIN:0:9}
-IDS=$DATA/ref-tokenizer-gemma4
+IDS=$DATA/ref-tokenizer-$EMBED_VOCAB
 TOKENIZE=$ORACLE/build/bin/llama-tokenize
 SERVER_BIN=$ORACLE/build/bin/llama-server
 
@@ -118,7 +123,9 @@ verify() {
     grep -Fqx "$want" "$BIN.build" 2> /dev/null || die "$BIN is not this tree's dump_emb2 at $BLOOMERY_REF_BUILD (no '$want' in $BIN.build; just build-emb2-ref)"
   done
   [ "$(sha "$MODEL")" = "$MODEL_SHA256" ] || die "$MODEL is not the file of sha256 $MODEL_SHA256 the profile pins"
-  [ "$(sha "$MMPROJ")" = "$MMPROJ_SHA256" ] || die "$MMPROJ is not the file of sha256 $MMPROJ_SHA256 the profile pins"
+  if [ -n "${MMPROJ:-}" ]; then
+    [ "$(sha "$MMPROJ")" = "$MMPROJ_SHA256" ] || die "$MMPROJ is not the file of sha256 $MMPROJ_SHA256 the profile pins"
+  fi
 }
 
 # The visible card, which the binary's CUDA architectures must cover; its name is the sets' `# device` card.
@@ -137,13 +144,13 @@ card() {
 # it), and of the two cases files as they are now.
 ids_current() {
   local key field want got libllama
-  [ -f "$IDS/MANIFEST.tsv" ] || die "no $IDS (just dump-ref-tokenizer gemma4)"
+  [ -f "$IDS/MANIFEST.tsv" ] || die "no $IDS (just dump-ref-tokenizer $EMBED_VOCAB)"
   libllama=$(ldd "$TOKENIZE" | awk '$1 == "libllama.so" || $1 == "libllama.so.0" { print $3; exit }') || die "ldd cannot read $TOKENIZE"
   [ -f "$libllama" ] || die "$TOKENIZE loads no libllama.so (ldd names '$libllama')"
-  grep -q $'^# complete\t' "$IDS/MANIFEST.tsv" || die "$IDS has no complete trailer (just dump-ref-tokenizer gemma4)"
+  grep -q $'^# complete\t' "$IDS/MANIFEST.tsv" || die "$IDS has no complete trailer (just dump-ref-tokenizer $EMBED_VOCAB)"
   while IFS=: read -r key field want; do
     got=$(awk -F'\t' -v k="# $key" -v f="$field" '$1 == k { print $f }' "$IDS/MANIFEST.tsv")
-    [ "$got" = "$want" ] || die "$IDS is not the ids this tree makes: its $key is '$got', want '$want' (just dump-ref-tokenizer gemma4)"
+    [ "$got" = "$want" ] || die "$IDS is not the ids this tree makes: its $key is '$got', want '$want' (just dump-ref-tokenizer $EMBED_VOCAB)"
   done << EOF
 vocabulary:2:$MODEL
 tokenizer:2:$TOKENIZE
@@ -151,7 +158,7 @@ tokenizer:3:$(md5sum < "$TOKENIZE" | cut -d' ' -f1)
 libllama:2:$libllama
 libllama:3:$(md5sum < "$libllama" | cut -d' ' -f1)
 cases:3:$(md5sum < crates/tokenizer/tests/cases.txt | cut -d' ' -f1)
-extra cases:3:$(md5sum < crates/tokenizer/tests/cases-gemma4.txt | cut -d' ' -f1)
+extra cases:3:$(md5sum < "crates/tokenizer/tests/$EMBED_CASES" | cut -d' ' -f1)
 EOF
 }
 
@@ -184,12 +191,17 @@ for name in "${IMAGES[@]}"; do
 done
 
 server_step() {
-  local stage=$1 card_name=$2 port=${EMB2_PORT:-8097} up='' log=$DATA/${SETPFX}_server.log flags
+  local stage=$1 card_name=$2 port=${EMB2_PORT:-8097} up='' log=$DATA/${SETPFX}_server.log flags media_args
   if (: < "/dev/tcp/127.0.0.1/$port") 2> /dev/null; then
     die "something already listens on 127.0.0.1:$port; stop it or set EMB2_PORT"
   fi
-  flags=(-m "$MODEL" --mmproj "$MMPROJ" --embeddings --pooling mean -c 8192 -b 8192 -ub 8192 -np 1 -ngl 99
+  flags=(-m "$MODEL" --embeddings --pooling mean -c "$EMBED_CONTEXT" -b "$EMBED_CONTEXT" -ub "$EMBED_CONTEXT" -np 1 -ngl 99
     --host 127.0.0.1 --port "$port" --no-webui)
+  media_args=()
+  if [ -n "${MMPROJ:-}" ]; then
+    flags+=(--mmproj "$MMPROJ")
+    media_args=(--mmproj "$MMPROJ" --mmproj-sha256 "$MMPROJ_SHA256" "${image_args[@]}" --mix-image free-448x448)
+  fi
   "$SERVER_BIN" "${flags[@]}" > "$log" 2>&1 &
   server_pid=$!
   for _ in $(seq 120); do
@@ -199,8 +211,8 @@ server_step() {
   done
   [ -n "$up" ] || die "llama-server did not come up (log: $log)" 1
   timeout --kill-after=10 "$BOUND" python3 tools/ref/emb2/server_vectors.py --url "http://127.0.0.1:$port" --pid "$server_pid" \
-    --model "$MODEL" --mmproj "$MMPROJ" --mmproj-sha256 "$MMPROJ_SHA256" --model-sha256 "$MODEL_SHA256" --card "$card_name" \
-    --build-record "$BIN.build" --ids-dir "$IDS" "${case_args[@]}" --out "$stage" "${image_args[@]}" --mix-image free-448x448 \
+    --model "$MODEL" --arch "$MODEL_NAME" --model-sha256 "$MODEL_SHA256" --card "$card_name" \
+    --build-record "$BIN.build" --ids-dir "$IDS" "${case_args[@]}" --out "$stage" "${media_args[@]}" \
     --server-flags "${flags[*]}"
   kill "$server_pid"
   wait "$server_pid" 2> /dev/null || true

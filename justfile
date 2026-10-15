@@ -720,12 +720,24 @@ build-emb2-lcpp:
     BLOOMERY_BOX_ENV='LCPP_BUILD_PIN=6868a52cb337450658006ad2f9281c2eb63f1666 LCPP_BUILD_TREE=/home/user/llama.cpp-6868a52c LCPP_BUILD_DIR=/root/lcpp-emb2 LCPP_BUILD_TARGETS=llama,mtmd,llama-common,llama-server,llama-tokenize' ./tools/box.sh '[ "$(id -u)" = 0 ] || { echo "build-emb2-lcpp: this recipe requires root on the box (/root/lcpp-emb2 and /home/user); run build-lcpp-qvis.sh directly with writable LCPP_BUILD_DIR and LCPP_BUILD_TREE on a local machine" >&2; exit 2; }; setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
 
 # EmbeddingGemma 2, the oracle's binary: dump_emb2 (tools/ref/emb2/dump_emb2.cpp) linked against that tree's libmtmd and libllama (tools/ref/clefvis/build-clefvis.sh, the gemma-embedding2 row of tools/ref/clefvis/profile.sh) into $BLOOMERY_DATA/bin/dump_emb2; CLEFVIS_OUT=<dir> (in BLOOMERY_BOX_ENV) builds into another directory for a test.
-build-emb2-ref:
-    BLOOMERY_MODEL=gemma-embedding2 ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
+build-emb2-ref: (build-embedding-ref "gemma-embedding2")
+
+# EmbeddingGemma v1 links the common dumper against the same mainline tree as v2.
+build-emb1-ref: (build-embedding-ref "gemma-embedding")
+
+# The model profile owns the files and oracle tree; both encoders share this build.
+build-embedding-ref MODEL:
+    BLOOMERY_MODEL={{MODEL}} ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
 
 # EmbeddingGemma 2, the oracle sets (tools/ref/emb2/emb2.sh; refset families in crates/refset/src/arch/gemma_embedding2) into $BLOOMERY_DATA: every text case's token rows, pooled vector and layer taps (ref_gemma_embedding2_text), the image cases' tower taps and rows (ref_gemma_embedding2_tower), llama-server's /v1/embeddings vectors of both (ref_gemma_embedding2_server), and the CPU twins of the first two (.cpu). The text cases and their ids are the tokenizer oracle's gemma4 set: `just dump-ref-tokenizer gemma4` first. STEPS names some of text, tower, server, text.cpu and tower.cpu (none: all five). The card steps go through the card's gate lock (EMB2_BOUND is the call's and each step's bound); no lease.
-dump-ref-emb2 *STEPS:
-    BLOOMERY_MODEL=gemma-embedding2 ./tools/box.sh 'bash tools/ref/emb2/emb2.sh {{STEPS}}'
+dump-ref-emb2 *STEPS: (dump-ref-embedding "gemma-embedding2" STEPS)
+
+# EmbeddingGemma v1: text, server and text.cpu sets; no image tower.
+dump-ref-emb1 *STEPS: (dump-ref-embedding "gemma-embedding" STEPS)
+
+# The common EmbeddingGemma writer, selected by model architecture.
+dump-ref-embedding MODEL *STEPS:
+    BLOOMERY_MODEL={{MODEL}} ./tools/box.sh 'bash tools/ref/emb2/emb2.sh {{STEPS}}'
 
 # GLM-5.3-Flash image input (mtmd `glm5v`), the oracle sets on the fixture tier (tools/ref/clefvis/clefvis.sh, the glm5next seat of profile.sh): the preprocess (fx_ref_glm5next_vis_preproc) and the tower's output nodes (…_taps), hidden states of three chat prompts (…_hidden_c*) and 32 greedy decode steps after two of them (…_decode_c*), the chat ids (…_chatids_*, with --ids), into $BLOOMERY_DATA. The text model is the fixture's copy in mainline's spelling, /models/fixtures-mainline/glm5next (tools/ref/gguf-respell.py); SETS names base sets, `--cpu-twin` writes the CPU twins and `--ids` the chat ids (both without a card). The card runs go through the card's gate lock; no lease.
 dump-ref-glmv *ARGS:

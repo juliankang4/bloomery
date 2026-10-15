@@ -1,6 +1,5 @@
-// dump_emb2: llama.cpp mainline's EmbeddingGemma 2 (`gemma-embedding2`, mmproj `gemma4v`) as oracle sets in dump_ref's
-// set format (tools/ref/clefvis/set_writer.h), so crates/refset reads them through the gemma_embedding2 families
-// (refset::arch::gemma_embedding2).
+// dump_emb2: llama.cpp mainline's EmbeddingGemma v1 and v2 oracle sets in dump_ref's format
+// (tools/ref/clefvis/set_writer.h). The architecture's refset families check them; v2 also has the gemma4v tower.
 //
 //   dump_emb2 text  -m <gguf> --ids-dir <dir> --case <id> ... --out <dir> --card <name> --build-record <file>
 //                   [--cpu] [-t <threads>]
@@ -8,15 +7,16 @@
 //                   [--cpu] [-t <threads>]
 //
 // text. Per case, the ids of <ids-dir>/<id>.ids (one id per line, as the tokenizer oracle writes them,
-//   crates/tokenizer/tools/oracle.sh gemma4: llama-tokenize's default, BOS and EOS included) go through one llama_decode, every position in one ubatch (the model is non-causal; llama-server
+//   crates/tokenizer/tools/oracle.sh with the profile's vocabulary: llama-tokenize's default, BOS and EOS included)
+//   go through one llama_decode, every position in one ubatch (the model is non-causal; llama-server
 //   refuses an input longer than its ubatch). Three contexts, each with embeddings on:
 //     clean   pooling none, no callback: llama_get_embeddings_ith of every position is `result_embd` (the output
-//             projection of `result_norm`, the graph's t_embd). Rows `<case>/embd` [768, n].
+//             projection of `result_norm` in v2, the dense head's per-token output in v1). Rows `<case>/embd` [768, n].
 //     pooled  pooling mean (the file's pooling_type and llama-server's): llama_get_embeddings_seq, before any
-//             normalization. Row `<case>/pooled` [768, 1].
+//             L2 normalization, after v1's learned dense head. Row `<case>/pooled` [768, 1].
 //     taps    pooling none, a cb_eval that asks for the nodes TEXT_TAPS names: `inp_scaled` (token rows times
 //             sqrt(n_embd)), `inp_per_layer` (the PLE input, [per_layer, layers, n]), `l_out-<il>` of every layer,
-//             `result_norm`, and the output projection, written as `result_embd`: with pooling none the graph's pooling
+//             `result_norm`, and the output projection, written as `result_embd` (v1 has no `inp_per_layer`): with pooling none the graph's pooling
 //             step passes t_embd through and renames that node `result_embd_pooled`. Asking for a node splits the
 //             scheduler's graph, so `# tap_effect` says whether the taps pass's `result_embd` equals the clean pass's
 //             bit for bit; the clean rows are the ones to compare against.
@@ -72,9 +72,11 @@ struct taps {
     const char * const *             names;  // exact names, or a prefix ending in '-' for a per-layer node
     std::map<std::string, node_rows> got;
     std::string                      error;
+    bool                             dense_head = false;
 };
 
 static const char * const TEXT_TAPS[]  = { "inp_scaled", "inp_per_layer", "l_out-", "result_norm", "result_embd_pooled", nullptr };
+static const char * const TEXT_V1_TAPS[] = { "inp_scaled", "l_out-", "result_norm", "result_embd_pooled", nullptr };
 static const char * const TOWER_TAPS[] = { "inp_raw_scaled", "pos_embd", "layer_out-", "pooled", "std_scaled",
                                            "projected", nullptr };
 
@@ -106,7 +108,10 @@ static bool on_node(struct ggml_tensor * t, bool ask, void * user) {
         s->error = std::string(t->name) + " is not a contiguous f32 tensor";
         return true;
     }
-    node_rows & r = s->got[t->name];
+    // Pooling NONE aliases the normalized rows; the dense head names its own output the same way.
+    const char * name = s->dense_head && strcmp(t->name, "result_embd_pooled") == 0 && t->op != GGML_OP_MUL_MAT
+        ? "result_norm" : t->name;
+    node_rows & r = s->got[name];
     if (!r.data.empty()) {
         s->error = std::string(t->name) + " ran twice in one pass";
         return true;
@@ -191,7 +196,7 @@ static void write_taps(set_writer & out, const taps & t, const std::vector<std::
 }
 
 static void run_text(llama_model * model, const std::string & ids_dir, const std::vector<std::string> & cases, int threads,
-                     set_writer & out) {
+                     set_writer & out, bool dense_head) {
     const int width = llama_model_n_embd_out(model);
     for (const auto & c : cases) {
         const std::string ids_path = ids_dir + "/" + c + ".ids";
@@ -219,12 +224,13 @@ static void run_text(llama_model * model, const std::string & ids_dir, const std
         out.tensor_f32(c + "/pooled", "MEAN", ne_pooled, p);
         llama_free(pooled);
 
-        taps t{ TEXT_TAPS, {}, {} };
+        taps t{ dense_head ? TEXT_V1_TAPS : TEXT_TAPS, {}, {}, dense_head };
         llama_context * tapped = make_ctx(model, n, LLAMA_POOLING_TYPE_NONE, threads, &t);
         decode_ids(tapped, ids, c + ": the taps pass");
         llama_free(tapped);
         if (!t.error.empty()) DIE("%s: the taps pass: %s", c.c_str(), t.error.c_str());
-        std::vector<std::string> order = { "inp_scaled", "inp_per_layer" };
+        std::vector<std::string> order = { "inp_scaled" };
+        if (!dense_head) order.push_back("inp_per_layer");
         for (int il = 0; il < llama_model_n_layer(model); ++il) order.push_back("l_out-" + std::to_string(il));
         order.push_back("result_norm");
         order.push_back("result_embd_pooled");
@@ -388,13 +394,15 @@ int main(int argc, char ** argv) {
     llama_model * model   = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) DIE("failed to load %s", model_path.c_str());
     const std::string arch = gguf_arch(model_path);
-    if (arch != "gemma-embedding2") DIE("%s is a %s file, not gemma-embedding2", model_path.c_str(), arch.c_str());
+    if (arch != "gemma-embedding2" && arch != "gemma-embedding")
+        DIE("%s is a %s file, not an EmbeddingGemma encoder", model_path.c_str(), arch.c_str());
+    if (!text_mode && arch != "gemma-embedding2") DIE("%s has no image tower", arch.c_str());
 
     set_writer out(out_dir);
     const char *      build = getenv("BLOOMERY_REF_BUILD");
     const std::string set_model = text_mode ? model_path : mmproj;
     const size_t      slash     = set_model.rfind('/');
-    out.line(std::string("# dump_emb2 ") + (text_mode ? "text" : "tower") + ": llama.cpp mainline EmbeddingGemma 2, raw f32, little-endian");
+    out.line(std::string("# dump_emb2 ") + (text_mode ? "text" : "tower") + ": llama.cpp mainline EmbeddingGemma, raw f32, little-endian");
     out.line("# model\t" + set_model);
     if (build && *build) out.line(std::string("# build\t") + build);
     out.line("# arch\t" + (text_mode ? arch : gguf_arch(mmproj)));
@@ -411,7 +419,7 @@ int main(int argc, char ** argv) {
     for (const auto & l : record_lines) out.line("# build_record\t" + l);
 
     if (text_mode) {
-        run_text(model, ids_dir, cases, threads, out);
+        run_text(model, ids_dir, cases, threads, out, arch == "gemma-embedding");
     } else {
         run_tower(model, mmproj, images, cpu, threads, out);
     }

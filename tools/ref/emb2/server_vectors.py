@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Collect llama-server's EmbeddingGemma 2 vectors into an oracle set in dump_ref's set format: the end-to-end answer
+"""Collect llama-server's EmbeddingGemma vectors into an oracle set in dump_ref's set format: the end-to-end answer
 bloomery's /v1/embeddings is compared against.
 
-  server_vectors.py --url <http://host:port> --pid <server pid> --model <gguf> --model-sha256 <hex> --mmproj <gguf>
-                    --mmproj-sha256 <hex> --card <name> --build-record <file> --ids-dir <dir> --case <name> ... --out <dir>
-                    [--image <name>=<png> ...] [--mix-image <name>] [--server-flags <text>]
+  server_vectors.py --url <http://host:port> --pid <server pid> --model <gguf> --model-sha256 <hex> --arch <architecture>
+                    --card <name> --build-record <file> --ids-dir <dir> --case <name> ... --out <dir>
+                    [--mmproj <gguf> --mmproj-sha256 <hex> --image <name>=<png> ...] [--mix-image <name>]
+                    [--server-flags <text>]
 
 The server is the caller's (tools/ref/emb2/emb2.sh starts it): llama-server --embeddings with the file's mean pooling
 and a ubatch that holds the longest case. Before any request and after the last, the pid the caller started (--pid) must
 be alive and the server at --url must answer /props with the model it was given and a build_info of the commit
 BLOOMERY_REF_BUILD names; whether that pid is the one answering is not checked here (emb2.sh refuses a port already
-taken). The two files' sha256 are computed here and must be the ones given.
-Per text case (<ids-dir>/<case>.txt and its ids, the tokenizer oracle's gemma4 set), two /v1/embeddings requests, both
+taken). The model and optional projector's sha256 are computed here and must be the ones given.
+Per text case (<ids-dir>/<case>.txt and its ids, the profile's tokenizer set), two /v1/embeddings requests, both
 encoding_format base64 so the f32 bytes are the server's own:
   <case>/embd    the default answer: the mean-pooled vector, L2 normalized (embd_normalize 2)          [768, 1]
   <case>/raw     the same request with embd_normalize -1: the pooled vector before normalization       [768, 1]
@@ -23,7 +24,8 @@ are checked against /tokenize (add_special, parse_special: what the embedding ha
 Per --image, the request is one {"content": [{"type": "image_url", ...}]} object (a data: URL), rows `img_<name>/embd`
 and `img_<name>/raw`; --mix-image adds one request with a text part before that image (`mix_<name>`).
 The header carries what the node-dump reader and the server family check: `# model`, `# arch`, `# build`
-(BLOOMERY_REF_BUILD), `# emb2 server`, `# device` (cuda and the card), `# model_sha256`, `# mmproj <path> sha256 <hex>`;
+(BLOOMERY_REF_BUILD), `# emb2 server`, `# device` (cuda and the card), `# model_sha256`, and, when a projector is used,
+`# mmproj <path> sha256 <hex>`;
 then the server's flags and build, the build record's lines, and the `# complete` trailer, written last through a .partial
 name. Python's standard library only.
 """
@@ -122,8 +124,9 @@ def main() -> None:
     ap.add_argument("--pid", required=True, type=int)
     ap.add_argument("--model", required=True)
     ap.add_argument("--model-sha256", required=True)
-    ap.add_argument("--mmproj", required=True)
-    ap.add_argument("--mmproj-sha256", required=True)
+    ap.add_argument("--mmproj")
+    ap.add_argument("--mmproj-sha256")
+    ap.add_argument("--arch", choices=("gemma-embedding", "gemma-embedding2"), required=True)
     ap.add_argument("--card", required=True)
     ap.add_argument("--build-record", required=True, type=Path)
     ap.add_argument("--ids-dir", required=True, type=Path)
@@ -137,7 +140,12 @@ def main() -> None:
     build = os.environ.get("BLOOMERY_REF_BUILD", "")
     if not build:
         raise SystemExit("server_vectors: BLOOMERY_REF_BUILD names no commit")
-    for path, want in ((a.model, a.model_sha256), (a.mmproj, a.mmproj_sha256)):
+    if bool(a.mmproj) != bool(a.mmproj_sha256) or (a.image and not a.mmproj):
+        raise SystemExit("server_vectors: images need a projector path and sha256")
+    files = [(a.model, a.model_sha256)]
+    if a.mmproj:
+        files.append((a.mmproj, a.mmproj_sha256))
+    for path, want in files:
         got = sha256(Path(path))
         if got != want:
             raise SystemExit(f"server_vectors: {path} has sha256 {got}, want {want}")
@@ -147,14 +155,15 @@ def main() -> None:
         "# server_vectors: llama.cpp mainline llama-server /v1/embeddings, raw f32, little-endian",
         f"# model\t{a.model}",
         f"# build\t{build}",
-        "# arch\tgemma-embedding2",
+        f"# arch\t{a.arch}",
         "# emb2\tserver",
         f"# device\tcuda\tthreads\t-\tcard\t{a.card}",
         f"# model_sha256\t{a.model_sha256}",
-        f"# mmproj\t{a.mmproj}\tsha256\t{a.mmproj_sha256}",
         f"# server_flags\t{a.server_flags}",
         f"# server_build\t{props['build_info']}",
     ]
+    if a.mmproj:
+        w.header.append(f"# mmproj\t{a.mmproj}\tsha256\t{a.mmproj_sha256}")
     w.header += [f"# build_record\t{line}" for line in a.build_record.read_text().splitlines() if line]
     for name in a.case:
         data = (a.ids_dir / f"{name}.txt").read_bytes()

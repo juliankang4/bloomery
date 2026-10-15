@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# EmbeddingGemma 2 writer contracts, with local shell fixtures and no model or card.
+# EmbeddingGemma writer contracts, with local shell fixtures and no model or card.
 # --dumper PATH also checks the linked dumper's thread option before it opens a model.
 # No argument: the shell contracts; a missing Linux utility is a named skip.
 set -euo pipefail
@@ -59,10 +59,11 @@ class Writer(unittest.TestCase):
             "LCPP_PIN": self.pin, "MODEL_NAME": "gemma-embedding2",
             "ORACLE": self.oracle, "BIN": self.root / "dump", "FAMILY": "emb2",
             "DUMPER": "tools/ref/emb2/dump_emb2.cpp", "SETPFX": "ref_fixture", "THREADS": "1",
+            "EMBED_VOCAB": "fixture", "EMBED_CASES": "cases-fixture.txt", "EMBED_CONTEXT": "8192",
         }
         write(self.root / "tools/ref/ref-paths.sh", "\n".join(
             f"{key}={shlex.quote(str(value))}" for key, value in variables.items()) + "\n")
-        write(self.root / "tools/ref/clefvis/profile.sh", "IMAGES=()\n")
+        write(self.root / "tools/ref/clefvis/profile.sh", "IMAGES=()\nEMBED_STEPS=(text tower server text.cpu tower.cpu)\n")
         write(self.oracle / "build/bin/llama-server", f"#!/bin/bash\necho 'version: fixture (commit {self.pin})'\n", True)
         self.flock = shutil.which("flock")
         write(self.root / "bin/flock", "#!/bin/bash\n"
@@ -139,6 +140,15 @@ printf '%s:end\\n' "$FIXTURE_TAG" >> "$FIXTURE_EVENTS"
                 return
             time.sleep(0.02)
         self.fail("the first writer did not reach generation")
+
+    def test_text_only_profile_refuses_tower_before_the_runner(self):
+        env = os.environ.copy()
+        env.pop("BLOOMERY_MODEL", None)
+        env["BLOOMERY_REF_MODEL_PROFILE"] = "gemma-embedding"
+        result = subprocess.run(["bash", str(ROOT / "tools/ref/emb2/emb2.sh"), "tower"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertIn("unknown step 'tower'", result.stderr)
 
     def test_lock_precedes_recovery_and_staging(self):
         old = Path(str(self.final) + ".old")

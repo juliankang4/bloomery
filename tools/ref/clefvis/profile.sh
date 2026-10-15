@@ -130,10 +130,9 @@ case ${BLOOMERY_MODEL:-} in
     CASES=tools/ref/clefvis/cases-minicpmv47.tsv REQUESTS=tools/ref/clefvis/requests-minicpmv47.jsonl
     THREADS=16
     ;;
-  gemma-embedding2)
-    # the model profile (models/gemma-embedding2.sh) names the files, their digests and the tree; the sets and their steps are
-    # emb2.sh's
-    FAMILY=emb2 SETPFX=ref_gemma_embedding2 ORACLE=$LCPP BIN=$BINDIR/dump_emb2 DUMPER=tools/ref/emb2/dump_emb2.cpp
+  gemma-embedding | gemma-embedding2)
+    # the model profile names the files, their digests, the tree and the steps; emb2.sh writes the sets
+    FAMILY=emb2 SETPFX=ref_${MODEL_NAME//-/_} ORACLE=$LCPP BIN=$BINDIR/dump_emb2 DUMPER=tools/ref/emb2/dump_emb2.cpp
     ;;
   *)
     echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${BLOOMERY_MODEL:-}' (qwen35, qwen35moe, qwen4exp, glm5next, minicpmv47 or gemma-embedding2)" >&2
