@@ -379,6 +379,7 @@ mod gate {
 
     impl Proc {
         fn spawn(mut cmd: Command, tag: &'static str) -> Result<Proc, GateError> {
+            bloomery_gpu_gates::die_with_parent(&mut cmd);
             let mut child = cmd
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1345,8 +1346,169 @@ mod gate {
 
     #[cfg(test)]
     mod tests {
-        use super::{NAME, PlaceError, PlacementError, plan_refusal, remove_open_copy, remove_run};
+        use super::{
+            Command, Duration, Instant, NAME, PlaceError, PlacementError, Proc, plan_refusal,
+            remove_open_copy, remove_run,
+        };
         use bloomery_gpu::GpuError;
+        use bloomery_gpu_gates::GateError;
+
+        #[test]
+        fn children_die_with_the_gate_parent() -> Result<(), GateError> {
+            // A nonmatching skip filter distinguishes the helper subprocess.
+            const CHILD_MODE: &str = "q38_gate_parent_child";
+            if std::env::args().any(|a| a == CHILD_MODE) {
+                let mut cmd = Command::new("sleep");
+                cmd.arg("120");
+                let running = Proc::spawn(cmd, "node 0")?;
+                let mut cmd = Command::new("sleep");
+                cmd.arg("120");
+                let stopped = Proc::spawn(cmd, "node 1")?;
+                stopped.signal("-STOP")?;
+                println!("children: {} {}", running.child.id(), stopped.child.id());
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+            let mut cmd = Command::new(std::env::current_exe()?);
+            cmd.args([
+                "--exact",
+                "gate::tests::children_die_with_the_gate_parent",
+                "--nocapture",
+                "--format=terse",
+                "--skip",
+                CHILD_MODE,
+            ]);
+            let mut parent = Proc::spawn(cmd, "gate parent")?;
+            let line = parent.wait_line("children: ", Duration::from_secs(10))?;
+            let pids = line["children: ".len()..]
+                .split_whitespace()
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(pids.len(), 2, "{line}");
+            parent.child.kill()?;
+            let ended = parent.wait_within(Duration::from_secs(10))?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut alive = pids;
+            while !alive.is_empty() && Instant::now() < deadline {
+                alive.retain(
+                    |pid| match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                        Ok(stat) => !stat
+                            .rsplit_once(") ")
+                            .is_some_and(|(_, tail)| tail.starts_with(['Z', 'X'])),
+                        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+                    },
+                );
+                if !alive.is_empty() {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+            for pid in &alive {
+                let status = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status()?;
+                assert!(status.success(), "cleanup child {pid}: {status}");
+            }
+            assert!(ended.is_some(), "the gate parent did not exit");
+            assert!(
+                alive.is_empty(),
+                "children outlived the gate parent: {alive:?}"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn child_never_executes_after_parent_dies_before_registration() -> Result<(), GateError> {
+            use std::os::unix::process::CommandExt;
+
+            const CHILD_MODE: &str = "q38_gate_before_registration";
+            if std::env::args().any(|a| a == CHILD_MODE) {
+                let task = std::fs::read_link("/proc/thread-self")?;
+                println!("children file: /proc/{}/children", task.display());
+                let mut cmd = Command::new("echo");
+                cmd.arg("server executed")
+                    .stderr(std::process::Stdio::null());
+                let stop = || {
+                    // SAFETY: raise stops only this child.
+                    if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                };
+                // SAFETY: stop calls only async-signal-safe raise and allocates nothing.
+                unsafe { cmd.pre_exec(stop) };
+                bloomery_gpu_gates::die_with_parent(&mut cmd);
+                return Err(format!("server executed: {}", cmd.status()?).into());
+            }
+            let mut cmd = Command::new(std::env::current_exe()?);
+            cmd.args([
+                "--exact",
+                "gate::tests::child_never_executes_after_parent_dies_before_registration",
+                "--nocapture",
+                "--format=terse",
+                "--skip",
+                CHILD_MODE,
+            ]);
+            let mut parent = Proc::spawn(cmd, "gate parent")?;
+            let mut child = None;
+            let result = (|| -> Result<(), GateError> {
+                let line = parent.wait_line("children file: ", Duration::from_secs(10))?;
+                let children = &line["children file: ".len()..];
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stopped = false;
+                while Instant::now() < deadline {
+                    let pids = std::fs::read_to_string(children)?;
+                    if let Some(pid) = pids.split_whitespace().next() {
+                        child = Some(pid.parse::<u32>()?);
+                        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+                        if stat
+                            .rsplit_once(") ")
+                            .is_some_and(|(_, tail)| tail.starts_with('T'))
+                        {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                if !stopped {
+                    return Err("the child did not stop before registration".into());
+                }
+                parent.child.kill()?;
+                if parent.wait_within(Duration::from_secs(10))?.is_none() {
+                    return Err("the gate parent did not exit".into());
+                }
+                let pid = child.ok_or("the gate parent did not fork")?;
+                let status = Command::new("kill")
+                    .args(["-CONT", &pid.to_string()])
+                    .status()?;
+                if !status.success() {
+                    return Err(format!("continue child {pid}: {status}").into());
+                }
+                let output = parent.lines.recv_timeout(Duration::from_secs(5));
+                if !matches!(output, Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) {
+                    return Err(
+                        format!("the server executed or kept stdout open: {output:?}").into(),
+                    );
+                }
+                Ok(())
+            })();
+            if let Some(pid) = child {
+                let alive = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    Ok(stat) => !stat
+                        .rsplit_once(") ")
+                        .is_some_and(|(_, tail)| tail.starts_with(['Z', 'X'])),
+                    Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+                };
+                if alive {
+                    let status = Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status()?;
+                    assert!(status.success(), "cleanup child {pid}: {status}");
+                }
+            }
+            result
+        }
 
         #[test]
         fn plan_refusals_retry_only_budget_candidates() {

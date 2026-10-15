@@ -308,7 +308,10 @@ gpu-deepseek41 392 44 0
 # for the distinct positions checked by the common rope runner (+1). Each block has its SAFETY line.
 # PIN(2026-10-14): gpu-gates 121 -> 75 blocks, 26 -> 5 fns, lowered to the tree's count: shared/verbs.rs moved to
 # its own crate (verbs) and link_probe posts through the engine's RDMA link ends, so its registration call goes.
-gpu-gates 75 5 1
+# PIN(2026-10-15): gpu-gates 75 -> 78 blocks, new code, not old code relaxed: one parent-death setup replaces
+# two copies with three blocks (prctl, getppid and pre_exec), and its before-registration test adds raise and
+# pre_exec, each with its SAFETY line.
+gpu-gates 78 5 1
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and

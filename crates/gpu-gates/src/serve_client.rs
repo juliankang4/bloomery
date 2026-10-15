@@ -15,7 +15,6 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -23,7 +22,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::record::{self, Kind, Log, Record};
-use crate::{GateError, verdict};
+use crate::{GateError, die_with_parent, verdict};
 
 /// The longest gap between two reads of the server's stderr in
 /// [`Served::address`]: the `server` record's wall ends at the read that found
@@ -57,17 +56,7 @@ impl Served {
             .stdin(Stdio::null())
             .stdout(File::create(dir.join("server.out"))?)
             .stderr(File::create(dir.join("server.err"))?);
-        // SAFETY: the closure runs in the child between fork and exec and calls
-        // only `prctl`, which is async-signal-safe and touches no memory of ours.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
+        die_with_parent(&mut cmd);
         let spawned = Instant::now();
         let child = cmd
             .spawn()

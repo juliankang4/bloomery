@@ -448,7 +448,6 @@ mod qwen38_levers;
 mod gate {
     use super::qwen38_levers::ACTS_ON;
     use std::fs::File;
-    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc;
@@ -663,18 +662,7 @@ mod gate {
                 .stdin(Stdio::null())
                 .stdout(File::create(dir.join("server.out"))?)
                 .stderr(File::create(dir.join("server.err"))?);
-            // SAFETY: the closure runs in the child between fork and exec and
-            // calls only `prctl`, which is async-signal-safe and touches no
-            // memory of ours.
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                });
-            }
+            bloomery_gpu_gates::die_with_parent(cmd);
             let child = cmd
                 .spawn()
                 .map_err(|e| format!("spawn {}: {e}", exe.display()))?;

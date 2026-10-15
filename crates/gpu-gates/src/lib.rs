@@ -82,6 +82,29 @@ pub const GREEDY_MARGIN: f32 = 1.5;
 
 pub type GateError = Box<dyn std::error::Error>;
 
+/// Kill the child when its spawning process dies, including while stopped.
+#[cfg(feature = "gpu")]
+pub fn die_with_parent(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    let parent = std::process::id();
+    let setup = move || {
+        // SAFETY: prctl changes only this child's parent-death signal.
+        let rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: getppid reads this child's parent PID.
+        let ppid = unsafe { libc::getppid() };
+        if u32::try_from(ppid) != Ok(parent) {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        Ok(())
+    };
+    // SAFETY: setup uses only async-signal-safe calls and no allocation.
+    unsafe { cmd.pre_exec(setup) };
+}
+
 /// The exit of every gate binary's `main`: `Ok` is success; an `Err` prints
 /// `<name>: <error>` (the Display, not the Debug a `Result` main prints) and
 /// each `source()` beneath it as `  caused by: ...` to stderr, then fails.
