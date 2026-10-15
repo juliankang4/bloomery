@@ -115,11 +115,12 @@ FROM_NAME = {
     "Mimo2": ("mimo2",),
     "NemotronH": ("nemotron_h",),
     "NemotronHMoe": ("nemotron_h_moe",),
+    "GemmaEmbedding": ("gemma-embedding",),
     "GemmaEmbedding2": ("gemma-embedding2",),
 }
 # crates/model/src/arch/mod.rs:spec — the architectures the model reader takes (QWEN35_BODY is `qwen35` and `clef`).
 SPEC = ("deepseek41", "deepseek4", "qwen3moe", "qwen35moe", "qwen4exp", "qwen35", "clef", "glm5next", "glm5-next",
-        "mimo2", "nemotron_h", "nemotron_h_moe", "gemma-embedding2")
+        "mimo2", "nemotron_h", "nemotron_h_moe", "gemma-embedding", "gemma-embedding2")
 # crates/gpu-gates/src/bin/shared/serve_seats/decide.rs:ROWS with the constants of
 # crates/decision/src/release/{clef,lev}.rs.
 DECIDE_ROWS = (

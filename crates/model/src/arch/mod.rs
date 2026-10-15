@@ -16,6 +16,7 @@ pub mod deepseek2;
 pub mod deepseek41;
 pub mod draft;
 pub mod dspark;
+pub mod gemma_embedding;
 pub mod gemma_embedding2;
 mod gemma_encoder;
 pub mod glm5next;
@@ -46,6 +47,7 @@ pub fn spec(split: &Split) -> Result<Read, ModelError> {
         Some("mimo2") => mimo2::spec::read(split)?,
         Some("nemotron_h") => nemotron_h::spec::read(split)?,
         Some("nemotron_h_moe") => nemotron_h_moe::spec::read(split)?,
+        Some(GEMMA_EMBEDDING) => gemma_embedding::spec::read(split)?,
         Some(GEMMA_EMBEDDING2) => gemma_embedding2::spec::read(split)?,
         other => {
             return Err(ModelError::UnknownArchitecture(
@@ -67,6 +69,9 @@ pub struct Read {
 /// The architecture string of the DSpark draft file ([`dspark`]). It is not an
 /// [`Arch`]: the draft is read beside a V4.1 model, never run as a model.
 pub const DFLASH: &str = "dflash";
+
+/// EmbeddingGemma's architecture string, read by [`gemma_embedding`].
+pub const GEMMA_EMBEDDING: &str = "gemma-embedding";
 
 /// EmbeddingGemma 2's architecture string, read by the [`gemma_embedding2`]
 /// module: [`spec`], [`Arch::from_name`] and [`Arch::name`] take this one
@@ -147,8 +152,8 @@ fn architecture_is(is: &str) -> PlacementError {
 }
 
 /// An architecture a file's `general.architecture` names, when this crate has
-/// a reader or a program for it. `nemotron_h_moe` and `gemma-embedding2` have
-/// a reader and no program.
+/// a reader or a program for it. `nemotron_h_moe` and both Gemma encoders
+/// have a reader and no program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
     Deepseek2,
@@ -159,6 +164,7 @@ pub enum Arch {
     Mimo2,
     NemotronH,
     NemotronHMoe,
+    GemmaEmbedding,
     GemmaEmbedding2,
 }
 
@@ -187,6 +193,7 @@ impl Arch {
             "mimo2" => Ok(Arch::Mimo2),
             "nemotron_h" => Ok(Arch::NemotronH),
             "nemotron_h_moe" => Ok(Arch::NemotronHMoe),
+            GEMMA_EMBEDDING => Ok(Arch::GemmaEmbedding),
             GEMMA_EMBEDDING2 => Ok(Arch::GemmaEmbedding2),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
@@ -209,6 +216,7 @@ impl Arch {
             Arch::Mimo2 => "mimo2",
             Arch::NemotronH => "nemotron_h",
             Arch::NemotronHMoe => "nemotron_h_moe",
+            Arch::GemmaEmbedding => GEMMA_EMBEDDING,
             Arch::GemmaEmbedding2 => GEMMA_EMBEDDING2,
         }
     }
@@ -937,6 +945,7 @@ mod tests {
             Arch::Mimo2,
             Arch::NemotronH,
             Arch::NemotronHMoe,
+            Arch::GemmaEmbedding,
             Arch::GemmaEmbedding2,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);

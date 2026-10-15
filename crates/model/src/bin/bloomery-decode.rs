@@ -113,6 +113,7 @@ fn main() {
                 | Arch::Mimo2
                 | Arch::NemotronH
                 | Arch::NemotronHMoe
+                | Arch::GemmaEmbedding
                 | Arch::GemmaEmbedding2),
             ) => {
                 eprintln!("bloomery-decode: unsupported architecture {:?}", a.name());

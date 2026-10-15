@@ -71,9 +71,11 @@ A next family calls the common readers instead of copying them. A count above ze
 count is `optional_usize`, both beside `meta_usize` in `arch/mod.rs`. The block spelling is `names::blk`, and the
 three model-level tensors are `names::token_embd`, `names::output_norm` and `names::output`. Already common, and
 still the ones to call: `classify_with`, `Stem` with `req` and `opt`, the `meta_*` key readers, `chat_of`,
-`n_vocab`, `spec_u32` and `nextn_layers`. A per-layer array of counts is `per_layer_count` (`arch/mod.rs`): the
-array, its length and each value as a count, zero included; a family that refuses zero checks it after the read (MiMo's
-KV-head loop). A float array with a scalar fallback (GLM's clamps) stays the family's own read. `program_of` is defined in `crates/placement/src/accepts.rs` and re-exported from
+`n_vocab`, `spec_u32` and `nextn_layers`. Shared or per-layer counts use `per_layer_count` (`arch/mod.rs`): a scalar
+expands to every layer; an array must have one count per layer, zero included. A family that refuses zero checks it
+after the read. Gemma and MiMo use `check_kv` to reject zero KV-head counts or counts that do not divide the query-head
+count. A float array with a scalar fallback (GLM's clamps) stays the family's own read.
+`program_of` is defined in `crates/placement/src/accepts.rs` and re-exported from
 `coverage`. An architecture with a reader and no program returns `None` from it; the coverage check then names
 `Need::Program`.
 

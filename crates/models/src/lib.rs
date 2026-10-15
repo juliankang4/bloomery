@@ -71,6 +71,7 @@ pub enum Arch {
     /// Nemotron-H with latent mixture-of-experts layers in place of the
     /// dense MLP ones.
     NemotronHMoe,
+    GemmaEmbedding,
     GemmaEmbedding2,
 }
 
@@ -91,6 +92,7 @@ impl Arch {
             Arch::MiMo2 => "mimo2",
             Arch::NemotronH => "nemotron_h",
             Arch::NemotronHMoe => "nemotron_h_moe",
+            Arch::GemmaEmbedding => "gemma-embedding",
             Arch::GemmaEmbedding2 => "gemma-embedding2",
         }
     }

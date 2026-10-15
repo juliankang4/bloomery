@@ -2491,8 +2491,8 @@ gate-deepseek4-meta:
 gate-glm5next-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::glm5next --nocapture && bash tools/gate.sh --release -p bloomery-model --test glm5next_meta -- --ignored --nocapture'
 
-# mimo2 (MiMo-V2.6-Flash) header gate: first the synthetic headers are refused by name (short or scalar per-layer
-# arrays, the two QKV forms, wrong dimensions); then the reader's description of the RL file's header is pinned: the
+# mimo2 (MiMo-V2.6-Flash) header gate: first a scalar KV-head count applies to every layer, and synthetic headers are
+# refused by name (short per-layer arrays, the two QKV forms, wrong dimensions); then the RL file's header is pinned: the
 # per-layer KV-head and window arrays, the two head widths (key 192, value 128), the window, sinks and value scale
 # per layer, the rope base per layer kind, the sigmoid noaux_tc router, the coverage list and the KV values per
 # layer. A doctored real shard 0 with one KV array entry cut is refused by name, and so is the MTP-only file. Its
@@ -2525,6 +2525,12 @@ gate-nemotron-h-moe-meta:
 # (BLOOMERY_BOX_ENV='BLOOMERY_MODEL=<path>' names another). Headers only, seconds.
 gate-gemma-embedding2-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding2 --nocapture && bash tools/gate.sh --release -p bloomery-model --test gemma_embedding2_meta -- --ignored --nocapture'
+
+# gemma-embedding (EmbeddingGemma) header gate: architecture-derived bidirectional
+# attention and the six-layer window pattern, the dense head and named refusals on
+# synthetic headers, then the Q8_0 header. BLOOMERY_BOX_ENV can override BLOOMERY_MODEL.
+gate-gemma-embedding-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding:: --nocapture && bash tools/gate.sh --release -p bloomery-model --test gemma_embedding_meta -- --ignored --nocapture'
 
 # mimo2 (MiMo-V2.6-Flash) end-to-end: the program loaded once by the gate placement, the 3090's bytes on either card
 # (every routed expert on the host tier, the host set derived at about 161.5 GB), against ik's sets (refset `ik-mimo2`,
