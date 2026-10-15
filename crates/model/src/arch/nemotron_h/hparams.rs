@@ -1,5 +1,5 @@
 //! Every `nemotron_h.*` key the description reads, and each layer's kind
-//! from the per-layer arrays. A layer is Mamba-2 where both
+//! from the shared or per-layer counts. A layer is Mamba-2 where both
 //! `attention.head_count_kv` and `feed_forward_length` are 0, attention
 //! where only the feed-forward length is 0, and a dense MLP otherwise
 //! (nemotron-h.cpp, the recurrent test then the feed-forward test). The
@@ -18,10 +18,10 @@ use crate::arch::hybrid::{Attn, attn, layer_kinds, layers_agree, mamba_dims, no_
 use crate::arch::{finite_positive, n_vocab, per_layer_count, positive};
 use crate::placement::PlacementError;
 
-/// What a layer is, from the two per-layer arrays.
+/// What a layer is, from the two resolved per-layer counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// Both arrays 0.
+    /// Both counts 0.
     Mamba,
     /// Feed-forward length 0, KV heads not.
     Attention,
@@ -51,9 +51,11 @@ pub struct Hparams {
     pub value_len: usize,
     /// The Mamba-2 widths. One set for every Mamba-2 layer.
     pub ssm: Ssm,
-    /// `attention.head_count_kv`, per layer. 0 on a Mamba-2 layer.
+    /// `attention.head_count_kv`, shared or per layer, resolved per layer.
+    /// 0 on a Mamba-2 layer.
     pub kv: Vec<usize>,
-    /// `feed_forward_length`, per layer. 0 on a Mamba-2 or attention layer.
+    /// `feed_forward_length`, shared or per layer, resolved per layer.
+    /// 0 on a Mamba-2 or attention layer.
     pub ff: Vec<usize>,
     /// Every layer's kind, in order.
     pub kinds: Vec<Kind>,
@@ -62,7 +64,7 @@ pub struct Hparams {
 impl Hparams {
     /// Every value from `split`'s headers. A missing required key, a state
     /// width other than 128, a per-layer array of the wrong length, or a
-    /// layer whose tensors disagree with the arrays is an error naming the
+    /// layer whose tensors disagree with the counts is an error naming the
     /// key or the tensor.
     pub fn read(split: &Split) -> Result<Hparams, PlacementError> {
         let n_layer = positive(split, "block_count")?;

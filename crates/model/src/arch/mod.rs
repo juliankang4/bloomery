@@ -301,8 +301,9 @@ fn meta_arr<'a>(split: &'a Split, suffix: &str) -> Result<&'a [Value], Placement
         .ok_or_else(|| metadata(split, suffix, "is absent or not an array"))
 }
 
-/// `<architecture>.<suffix>` as an array of exactly `n_layer` items. A
-/// scalar or another length is refused by name.
+/// `<architecture>.<suffix>` as an array of exactly `n_layer` items.
+/// Non-arrays and other lengths are refused by name; counts that also
+/// accept a shared scalar use [`per_layer_count`].
 fn per_layer_items<'a>(
     split: &'a Split,
     suffix: &str,
@@ -319,14 +320,26 @@ fn per_layer_items<'a>(
     Ok(items)
 }
 
-/// `<architecture>.<suffix>` as a per-layer array of `n_layer` counts. Zero
-/// is a count; a family that refuses it checks that itself. A scalar is
-/// refused by name: the file's own form is the array.
+/// `<architecture>.<suffix>` as one shared count expanded to every layer
+/// or an array of exactly `n_layer` counts. Other array lengths are refused
+/// by name. Zero is a count; a family that refuses it checks that itself.
 pub(crate) fn per_layer_count(
     split: &Split,
     suffix: &str,
     n_layer: usize,
 ) -> Result<Vec<usize>, PlacementError> {
+    // PIN(2026-10-15): llama.cpp's LLAMA_MAX_LAYERS bounds per-layer count allocations.
+    const MAX_LAYERS: usize = 512;
+    if n_layer > MAX_LAYERS {
+        return Err(metadata(
+            split,
+            "block_count",
+            format!("is {n_layer}, above the layer limit {MAX_LAYERS}"),
+        ));
+    }
+    if !matches!(split.value(&split.arch_key(suffix)), Some(Value::Array(_))) {
+        return Ok(vec![meta_usize(split, suffix)?; n_layer]);
+    }
     per_layer_items(split, suffix, n_layer)?
         .iter()
         .enumerate()
@@ -863,6 +876,37 @@ pub(crate) mod synthetic {
 mod tests {
     use super::synthetic::{V, header_shaped};
     use super::{Arch, NextnLayers};
+
+    #[test]
+    fn scalar_layer_count_refuses_more_than_llama_max_layers() {
+        for n_layer in [512_u64, 513, 1 << 61] {
+            let path = header_shaped(
+                "scalar-layer-limit",
+                "gemma-embedding2",
+                &[
+                    ("block_count", V::U64(n_layer)),
+                    ("attention.head_count_kv", V::U32(1)),
+                ],
+                &[],
+                &[],
+            );
+            let split = gguf::Split::open(&path).unwrap();
+            let n_layer = super::positive(&split, "block_count").unwrap();
+            let result = super::per_layer_count(&split, "attention.head_count_kv", n_layer);
+            drop(split);
+            std::fs::remove_file(&path).expect("remove the synthetic header");
+            if n_layer == 512 {
+                assert_eq!(result.expect("the layer limit is inclusive"), vec![1; 512]);
+            } else {
+                let error =
+                    result.expect_err("a scalar count cannot allocate more than 512 layers");
+                assert!(
+                    matches!(error, crate::placement::PlacementError::Metadata { key, detail }
+                    if key == "gemma-embedding2.block_count" && detail.contains("512"))
+                );
+            }
+        }
+    }
 
     #[test]
     fn known_names_round_trip() {

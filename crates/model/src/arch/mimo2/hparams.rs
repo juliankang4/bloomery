@@ -1,10 +1,10 @@
-//! Every `mimo2.*` key the description reads — the per-layer KV-head and
-//! window-pattern arrays as arrays, not scalars, because a full-attention
-//! layer and a sliding-window one carry different KV-head counts and rope
+//! Every `mimo2.*` key the description reads: KV-head counts shared across
+//! layers or given per layer, and a window-pattern array. Full-attention
+//! and sliding-window layers may carry different KV-head counts and rope
 //! bases in one file. A key the loader requires is required here; a key it
 //! reads with a fallback keeps that fallback, recorded in
 //! [`Hparams::defaults`] with the line that sets it. Each layer's tensors
-//! are held to the widths its arrays give it ([`Hparams::read`]). The
+//! are held to the widths its counts give it ([`Hparams::read`]). The
 //! dialect's authority is llama.cpp's `src/models/mimo2.cpp`; the line
 //! numbers cited are that file's unless another file is named.
 
@@ -40,8 +40,9 @@ pub struct Hparams {
     pub n_embd: usize,
     /// `attention.head_count`: query heads, every layer's.
     pub n_head: usize,
-    /// `attention.head_count_kv`, per layer: 4 on this file's full layers,
-    /// 8 on its window layers and next-token blocks.
+    /// `attention.head_count_kv`, shared or per layer, resolved per layer:
+    /// 4 on this file's full layers, 8 on its window layers and next-token
+    /// blocks.
     pub kv_heads: Vec<usize>,
     /// `attention.key_length`: key and score values per head.
     pub head_k: usize,
@@ -120,7 +121,7 @@ pub fn unread_keys(split: &Split) -> Vec<String> {
 impl Hparams {
     /// Every value from `split`'s headers; a missing required key, a value
     /// the description cannot hold, a wrong-length per-layer array, or a
-    /// layer whose tensors disagree with the arrays is an error naming the
+    /// layer whose tensors disagree with the counts is an error naming the
     /// key or the tensor.
     pub fn read(split: &Split) -> Result<Hparams, PlacementError> {
         let mut defaults = Vec::new();
@@ -132,9 +133,6 @@ impl Hparams {
         if n_head == 0 {
             return Err(metadata(split, "attention.head_count", "is 0"));
         }
-        // The KV-head count is a per-layer array: 4 on the full-attention
-        // layers of this release, 8 on the window ones (conversion/mimo.py:
-        // 151-157), so a scalar broadcast is not this file's fact.
         let kv_heads = per_layer_count(split, "attention.head_count_kv", n_layer)?;
         for (l, &kv) in kv_heads.iter().enumerate() {
             if kv == 0 || !n_head.is_multiple_of(kv) {
@@ -646,9 +644,7 @@ pub(super) mod tests {
         }
     }
 
-    /// A short per-layer array is refused by name — the KV-head count and
-    /// the window pattern are the file's per-layer facts, not a scalar a
-    /// reader may broadcast.
+    /// A KV-head or window-pattern array must have one item per layer.
     #[test]
     fn a_short_layer_array_is_refused() {
         for key in [
@@ -665,17 +661,18 @@ pub(super) mod tests {
         }
     }
 
-    /// A scalar where the file's form is the per-layer array is refused by
-    /// name.
+    /// PIN(2026-10-15): Per-layer tensor checks validate a broadcast KV count, so rejecting every scalar was too strict.
     #[test]
-    fn a_scalar_layer_array_is_refused() {
+    fn a_scalar_kv_count_applies_to_every_layer() {
         let kv = with("attention.head_count_kv", Some(V::U32(2)));
-        refused(
-            "mimo2-scalar",
-            &kv,
-            &tensors(),
-            "mimo2.attention.head_count_kv: is absent or not an array",
-        );
+        let mut tensors = tensors();
+        for (name, dims) in &mut tensors {
+            if name.ends_with(".attn_qkv.weight") {
+                *dims = vec![E, HEADS * K + 2 * (K + VD)];
+            }
+        }
+        let hp = read("mimo2-scalar", &kv, &tensors).expect("the shared KV-head count reads");
+        assert_eq!(hp.kv_heads, [2; KINDS.len()]);
     }
 
     #[test]

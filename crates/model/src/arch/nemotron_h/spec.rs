@@ -524,22 +524,51 @@ pub(super) mod tests {
         );
     }
 
+    /// Shared KV-head and feed-forward counts apply to every layer.
+    #[test]
+    fn scalar_counts_apply_to_every_layer() {
+        let g = geo();
+        for (kind, heads, ff) in [('m', 0, 0), ('a', KV, 0), ('p', 0, FF)] {
+            let mut kv = keys(&g);
+            set_key(&mut kv, "attention.head_count_kv", V::U32(heads as u32));
+            set_key(&mut kv, "feed_forward_length", V::U32(ff as u32));
+            let mut tensors = tensors(&g, true);
+            tensors.retain(|(name, _)| !name.starts_with("blk."));
+            for l in 0..N {
+                layer(l, kind, &g, true, &mut tensors);
+            }
+            let read = load("nemotron-h-scalar", "nemotron_h", kv, &tensors)
+                .expect("the shared counts read");
+            assert_eq!(read.spec.layers.len(), N);
+            for (l, layer) in read.spec.layers.iter().enumerate() {
+                match (&layer.mixer, &layer.ffn) {
+                    (Mixer::Mamba2(_), Ffn::Dense { ff, .. }) if kind == 'm' => {
+                        assert_eq!(*ff, 0);
+                    }
+                    (Mixer::Gqa(g), Ffn::Dense { ff, .. }) if kind == 'a' => {
+                        assert_eq!(g.kv_heads, KV as u32);
+                        assert_eq!(*ff, 0);
+                    }
+                    (Mixer::None, Ffn::Dense { ff, .. }) if kind == 'p' => {
+                        assert_eq!(*ff, FF as u32);
+                    }
+                    _ => panic!("layer {l}: {layer:?}"),
+                }
+            }
+        }
+    }
+
     /// A per-layer array shorter than `block_count` is refused by name.
     #[test]
     fn a_short_per_layer_array_is_named() {
         let g = geo();
-        let mut kv = keys(&g);
-        let row = kv
-            .iter_mut()
-            .find(|(k, _)| *k == "attention.head_count_kv")
-            .expect("the kv array");
-        *row = ("attention.head_count_kv", V::I32s(vec![0, 0, KV, 0, 0]));
-        let err = load("nemotron-h-short", "nemotron_h", kv, &tensors(&g, true))
-            .expect_err("short array");
-        assert!(
-            err.contains("attention.head_count_kv") && err.contains("5 values"),
-            "{err}"
-        );
+        for key in ["attention.head_count_kv", "feed_forward_length"] {
+            let mut kv = keys(&g);
+            set_key(&mut kv, key, V::I32s(vec![0, 0, KV, 0, 0]));
+            let err = load("nemotron-h-short", "nemotron_h", kv, &tensors(&g, true))
+                .expect_err("short array");
+            assert!(err.contains(key) && err.contains("5 values"), "{err}");
+        }
     }
 
     /// A tensor no table holds is refused by name.
