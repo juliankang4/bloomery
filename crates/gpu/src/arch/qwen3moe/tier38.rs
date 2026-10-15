@@ -101,6 +101,19 @@ fn node_experts(
     w: &Weights,
     open: &NodeOpen,
 ) -> Result<Box<dyn TierExperts>, GpuError> {
+    open.block
+        .0
+        .checked_mul(geo::N_USED)
+        .and_then(|slots| slots.checked_mul(size_of::<u32>()))
+        .ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!(
+                    "a block of {} columns overflows its route bytes",
+                    open.block.0
+                ),
+            )
+        })?;
     if open.set.n_expert() != geo::EXPERTS || open.shape != SHAPE {
         return Err(GpuError::shape(
             WHAT,

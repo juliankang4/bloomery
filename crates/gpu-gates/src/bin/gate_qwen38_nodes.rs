@@ -11,9 +11,10 @@
 //!   plan is plan (b′) on this card (stage) and node 1's (tier) under the
 //!   largest whole-GiB card budget up to [`TOP_GIB`] that puts a tier expert
 //!   on every layer and a host expert on a layer before the last.
-//! - Open: node 0's open of the plan's tier with one routed segment's
-//!   experts swapped for as many others is refused by node 1, naming the
-//!   tier's set, and node 1 serves the next connection. A second node 1
+//! - Open: invalid layer or column counts and an overflowing block route
+//!   are refused by name. Node 0's open of the plan's tier with one routed
+//!   segment's experts swapped for as many others is refused by node 1,
+//!   naming the tier's set, and node 1 serves the next connection. A second node 1
 //!   serving a copy of the model file whose headers are the file's and
 //!   whose one tier segment holds one other byte refuses the plan's tier,
 //!   naming the segment's other bytes. The copy is the shard that segment
@@ -74,6 +75,7 @@ mod gate {
     use std::time::{Duration, Instant};
 
     use app::Session;
+    use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::NODE_FAMILY;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model, SplitWalk};
@@ -633,10 +635,48 @@ mod gate {
     }
 
     /// The open clause: the plan's tier as node 0 opens it on the node at
-    /// `addr`, one routed segment's experts swapped for as many others not
-    /// in the set, is refused naming the set.
-    fn swapped_open(plan: &Plan<'_>, file: &Split, addr: SocketAddr) -> Result<bool, GateError> {
+    /// `addr`: invalid allocation bounds are refused, then one routed
+    /// segment's experts swapped for as many others not in the set is
+    /// refused naming the set. Each refusal leaves the server accepting.
+    fn swapped_open(
+        c: &Common,
+        plan: &Plan<'_>,
+        file: &Split,
+        addr: SocketAddr,
+    ) -> Result<bool, GateError> {
         let mut open = tier_open(plan, file)?;
+        open.shape.hidden = usize::try_from(c.inputs.spec.hidden)?;
+        open.shape.n_used = usize::try_from(plan.model.experts_used)?;
+        for (field, value) in [
+            ("layers", 0),
+            ("layers", usize::MAX),
+            ("columns", 0),
+            ("columns", model::ops::DEFER_MAX_COLS + 1),
+            ("block", usize::MAX),
+            (
+                "block",
+                usize::MAX / open.shape.n_used / size_of::<u32>() + 1,
+            ),
+        ] {
+            let mut bad = open.clone();
+            match field {
+                "layers" => bad.layers = value,
+                "columns" => bad.cols = value,
+                "block" => bad.block.0 = value,
+                _ => unreachable!(),
+            }
+            bad.rows.clear();
+            bad.set = TierSet::new(0..0, open.set.n_expert(), vec![])?;
+            let r = TierNode::open(addr, &bad).map(drop);
+            let ok = matches!(&r, Err(GpuError::Shape { detail, .. }) if detail.contains(field));
+            println!(
+                "{} open: node 1 refused {field}={value} with {r:?}",
+                if ok { "ok" } else { "FAIL" }
+            );
+            if !ok {
+                return Ok(false);
+            }
+        }
         let n_expert = u32::try_from(plan.model.experts)?;
         let row = open
             .rows
@@ -1212,7 +1252,7 @@ mod gate {
 
         let file = Split::open(&c.path).map_err(|e| format!("open {}: {e}", c.path.display()))?;
         tier::sc("open: node 1 refuses a segment of other experts than the tier's set")?;
-        pass &= swapped_open(&plan, &file, addr)?;
+        pass &= swapped_open(c, &plan, &file, addr)?;
         tier::sc("open: node 1 refuses a copy of the file whose tier segment holds other bytes")?;
         pass &= other_bytes_open(&plan, &file)?;
         tier::sc(

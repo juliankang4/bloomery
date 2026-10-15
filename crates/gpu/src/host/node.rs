@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use gguf::Split;
 use model::fileio::sha256_hex_of;
+use model::ops::DEFER_MAX_COLS;
 use model::placement::devices::{DeviceId, DeviceInfo, spec_of_device};
 use model::placement::workstation::CardSpec;
 use model::placement::{Device, ExpertList, Format, ModelTensor, ModelTensors, Plan, Row, Segment};
@@ -280,8 +281,26 @@ impl NodeOpen {
     /// holds it, else refused by name: the two processes read other files.
     /// Each segment is a routed stack's experts of its layer, exactly the
     /// ids the open's set gives that layer, in its order, else refused by
-    /// name: the stage side's slots name the set's experts.
+    /// name: the stage side's slots name the set's experts. The layer count
+    /// must match this file, the set must fit it, and columns must fit the
+    /// step port, before any card is opened.
     pub fn rows_on(&self, model: &ModelTensors) -> Result<Vec<Row>, GpuError> {
+        if self.layers != model.layers
+            || self.set.layers().end > model.layers
+            || !(1..=DEFER_MAX_COLS).contains(&self.cols)
+        {
+            return Err(GpuError::shape(
+                SERVER,
+                format!(
+                    "an open of {} layers (set {:?}), {} columns; this file has {} layers, \
+                     the step port serves 1..={DEFER_MAX_COLS} columns",
+                    self.layers,
+                    self.set.layers(),
+                    self.cols,
+                    model.layers
+                ),
+            ));
+        }
         let mut rows = Vec::with_capacity(self.rows.len());
         for r in &self.rows {
             let Some((i, t)) = model
@@ -1532,6 +1551,27 @@ mod tests {
             experts_used: 2,
         };
         assert!(open.rows_on(&model(r.dims.clone())).is_ok());
+        for layers in [0, 2, 4, usize::MAX] {
+            let mut bad = open.clone();
+            bad.layers = layers;
+            let e = bad.rows_on(&model(r.dims.clone())).unwrap_err();
+            assert!(e.to_string().contains("layers"), "{e}");
+        }
+        let mut bad = open.clone();
+        bad.set = TierSet::new(3..4, 8, vec![vec![]]).expect("a set past the file");
+        let e = bad.rows_on(&model(r.dims.clone())).unwrap_err();
+        assert!(e.to_string().contains("layers"), "{e}");
+        for cols in [0, model::ops::DEFER_MAX_COLS + 1, usize::MAX] {
+            let mut bad = open.clone();
+            bad.cols = cols;
+            let e = bad.rows_on(&model(r.dims.clone())).unwrap_err();
+            assert!(e.to_string().contains("columns"), "{e}");
+        }
+        for cols in [1, model::ops::DEFER_MAX_COLS] {
+            let mut valid = open.clone();
+            valid.cols = cols;
+            assert!(valid.rows_on(&model(r.dims.clone())).is_ok());
+        }
         let other = open.rows_on(&model(vec![512, 2560, 16])).unwrap_err();
         assert!(other.to_string().contains("other files"), "{other}");
         let mut swapped = open.clone();
