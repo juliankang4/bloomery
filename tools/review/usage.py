@@ -50,6 +50,10 @@ def summarize_codex(role, evs):
             if item["type"] == "command_execution" and item.get("exit_code") != 0 and re.search(
                     refused, item.get("aggregated_output") or ""):
                 denied += 1
+        elif kind == "item.completed" and item.get("type") == "error" and re.match(
+                r"Configured service tier `.*` is not advertised", item.get("message") or "", flags=re.DOTALL):
+            # Codex drops a tier the model does not offer and runs on at the default one (REVIEW_CODEX_TIER).
+            failed, error = True, item["message"]
         elif kind == "turn.completed":
             done, usage = True, ev.get("usage") or {}
         elif kind == "turn.failed":
@@ -201,6 +205,10 @@ def self_test():
     cf = summarize("reviewer", [json.dumps(e) for e in cx[:2] + [
         {"type": "turn.failed", "error": {"message": "You've hit your usage limit."}}]])
     assert cf["is_error"] and cf["subtype"] == "error" and "usage limit" in cf["error"], cf
+    tier = {"type": "error", "message": "Configured service tier `bo\ngus` is not advertised as supported for model "
+                                        "`m` and will be omitted from requests."}
+    ct = summarize("reviewer", [json.dumps(e) for e in cx[:2] + [{"type": "item.completed", "item": tier}] + cx[2:]])
+    assert ct["is_error"] and ct["subtype"] == "error" and "`bo\ngus`" in ct["error"], ct
     # A Codex run that died before its first event is still Codex's.
     assert summarize("reviewer", ["Reading additional input"], "codex")["engine"] == "codex"
     with tempfile.NamedTemporaryFile("w", suffix=".ndjson", delete=False) as f:

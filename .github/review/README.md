@@ -215,6 +215,7 @@ not the prose written. The knobs below act on that.
 | model, effort | `claude-sonnet-5-5`, high | `REVIEW_MODEL` in the workflow, `run-claude.sh` |
 | turns | reviewer 60, validator 30 | `run-claude.sh` |
 | Codex model, effort, CLI | `gpt-6.1-sol`, xhigh, 0.160.0 | `REVIEW_CODEX_MODEL`, `CODEX_VERSION` in the workflows, `run-codex.sh` |
+| Codex service tier | the account's default | `REVIEW_CODEX_TIER` (unset in the workflows; a tier the model does not offer fails the run), `run-codex.sh` |
 | minutes per engine run | reviewer 20, validator 10, learner 15 | `run.py` `MINUTES`, the jobs' `timeout-minutes` |
 | automatic reviews per PR | 5 | `REVIEW_CAP` |
 | non-blocking items | 5 | `reviewer.md` |

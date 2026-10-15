@@ -85,6 +85,7 @@ rc=0
     --json \
     --model "${REVIEW_CODEX_MODEL:-gpt-6.1-sol}" \
     -c model_reasoning_effort='"xhigh"' \
+    ${REVIEW_CODEX_TIER:+-c "service_tier=\"$REVIEW_CODEX_TIER\""} \
     --cd "$out" \
     --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules \
     -c approval_policy='"never"' \
