@@ -369,7 +369,7 @@ models (the --model word is optional with a model file: the file's architecture 
     fn file_facts() -> Result<(String, Option<String>), GateError> {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let decision = split.arch_get_str("decision.type").map(str::to_owned);
+        let decision = bloomery_gpu_gates::model_file::decision_type(&split)?.map(str::to_owned);
         Ok((
             split.architecture().unwrap_or("<missing>").to_owned(),
             decision,

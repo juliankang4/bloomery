@@ -391,9 +391,9 @@ mod cli {
     use bloomery_gpu::arch::nemotron_h::{Body as BodyNh, PASS_ROWS as NH_PASS_ROWS};
     use bloomery_gpu::arch::nemotron_h_moe::Body as BodyNhMoe;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
-    use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
+    use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for};
     use bloomery_gpu::arch::qwen3moe::{
-        Body, Body35, Body38, KvQ8, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
+        Body, Body35, Body38, KvQ8, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
         Qwen35moeModel, Qwen38Model, SplitWalk,
     };
     use bloomery_gpu::host::PassKind;
@@ -418,7 +418,6 @@ mod cli {
     use gguf::Split;
     use model::arch::Arch;
     use model::arch::qwen35moe::head_list::head_rows_of;
-    use model::arch::qwen35moe::hparams::Hparams;
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
     };
@@ -517,7 +516,7 @@ mod cli {
         let path = ref_model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         if file.architecture() == Some("qwen35") {
-            if file.value("qwen35.decision.type").is_some() {
+            if bloomery_gpu_gates::model_file::decision_type(&file)?.is_some() {
                 return Err(
                     "a qwen35 decision model belongs to the decide seat, not generation".into(),
                 );
@@ -2402,14 +2401,7 @@ mod cli {
         t: Instant,
     ) -> Result<Qwen35moeModel, GateError> {
         let arch = file.architecture().unwrap_or("<missing>").to_owned();
-        let hp = Hparams::read(&file)?;
-        let o = Open35 {
-            ctx,
-            mma: bloomery_gpu_gates::qwen_seat::decode_mma(hp.head_dim, hp.n_head / hp.n_head_kv)?,
-            ubatch: ubatch_size()?,
-            kv,
-            media: false,
-        };
+        let o = q3place::serve_open35(&file, ctx, kv, false)?;
         let dspark = levers.draft() == Some("dspark");
         let mut m = match place {
             None => {
