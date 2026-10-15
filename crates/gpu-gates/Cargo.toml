@@ -548,6 +548,10 @@ name = "gate_gemma_embedding2_serve"
 required-features = ["deepseek41", "gemma-embedding2"]
 
 [[bin]]
+name = "gate_gemma4v_tower"
+required-features = ["vision"]
+
+[[bin]]
 name = "gate_qwen3moe_router"
 required-features = ["gpu"]
 

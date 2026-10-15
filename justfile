@@ -785,7 +785,7 @@ build-emb1-ref: (build-embedding-ref "gemma-embedding")
 build-embedding-ref MODEL:
     BLOOMERY_MODEL={{MODEL}} ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
 
-# EmbeddingGemma 2, the oracle sets (tools/ref/emb2/emb2.sh; refset families in crates/refset/src/arch/gemma_embedding2) into $BLOOMERY_DATA: every text case's token rows, pooled vector and layer taps (ref_gemma_embedding2_text), the image cases' tower taps and rows (ref_gemma_embedding2_tower), llama-server's /v1/embeddings vectors of both (ref_gemma_embedding2_server), and the CPU twins of the first two (.cpu). The text cases and their ids are the tokenizer oracle's gemma4 set: `just dump-ref-tokenizer gemma4` first. STEPS names some of text, tower, server, text.cpu and tower.cpu (none: all five). The card steps go through the card's gate lock (EMB2_BOUND is the call's and each step's bound); no lease.
+# EmbeddingGemma 2, the oracle sets (tools/ref/emb2/emb2.sh; refset families in crates/refset/src/arch/gemma_embedding2) into $BLOOMERY_DATA: every text case's token rows, pooled vector and layer taps (ref_gemma_embedding2_text), the image cases' tower taps and rows (ref_gemma_embedding2_tower), llama-server's /v1/embeddings vectors of both (ref_gemma_embedding2_server), and the CPU twins of all three (.cpu). The text cases and their ids are the tokenizer oracle's gemma4 set: `just dump-ref-tokenizer gemma4` first. STEPS names some of text, tower, server, text.cpu, tower.cpu and server.cpu (none: all six). The card steps go through the card's gate lock (EMB2_BOUND is the call's and each step's bound); no lease.
 dump-ref-emb2 *STEPS: (dump-ref-embedding "gemma-embedding2" STEPS)
 
 # Gemma4a host mel from synthetic decoded PCM, using the existing pinned mainline tree.
@@ -1266,6 +1266,11 @@ gate-gpu-gemma-embedding2-e2e *ARGS:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding2::spec::tests::key_bounds_are_the_symmetric_mask --exact'
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --bin gate_gemma_embedding2_e2e'
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e {{ARGS}}'
+
+# Gemma4 vision's mainline card and CPU sets, including every block's rows.
+# Every layer and projected row is held to its CPU/card twin distance.
+gate-gpu-gemma4v-tower:
+    BLOOMERY_MODEL=gemma-embedding2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_gemma4v_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma4v_tower'
 
 # GLM-5.3-Flash MLA 층의 카드 부분 — 잠재 RMS + f16 추가, 인덱서 키 LayerNorm + [키; 게이트] 추가(`latent`),
 # 창 0·싱크 −∞·스케일 1/16으로 다시 쓰는 V4.1 어텐션 — 을 모델 없이 합성 입력으로 호스트 규칙에 맞춘다.
