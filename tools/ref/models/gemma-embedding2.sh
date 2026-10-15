@@ -17,8 +17,12 @@
 #                  the tower's minimum size and one a single row of pixels
 #   IK             no ik oracle exists for this profile; the default tree is set for the scripts that expand IKBIN beside every
 #                  profile
+#   EMBED_VOCAB    the tokenizer oracle's vocabulary and set suffix
+#   EMBED_CASES    the vocabulary's cases file under crates/tokenizer/tests
+#   EMBED_CONTEXT  the server context and batch size
+#   EMBED_STEPS    the oracle steps, card steps before CPU twins
 #
-# The text cases and their ids are the tokenizer oracle's gemma4 set (crates/tokenizer/tools/oracle.sh).
+# The text cases and their ids are the tokenizer oracle's EMBED_VOCAB set (crates/tokenizer/tools/oracle.sh).
 #
 # SC2034: every name here is read by the file that sources this one.
 # shellcheck disable=SC2034
@@ -31,3 +35,8 @@ MMPROJ_SHA256=d2033b3cd0223cfb2e7a2b50dc80a664c78c816d375f5b017ec3ef80ee0bc766
 : "${LCPP:=/home/user/llama.cpp-6868a52c}"
 LCPP_PIN=6868a52cb337450658006ad2f9281c2eb63f1666
 IMAGES=(small-200x200 min-96x64 free-448x448 free-640x480 pad-777x513 strip-1000x1 free-1024x768)
+
+EMBED_VOCAB=gemma4
+EMBED_CASES=cases-gemma4.txt
+EMBED_CONTEXT=8192
+EMBED_STEPS=(text tower server text.cpu tower.cpu)

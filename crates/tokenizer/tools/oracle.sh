@@ -38,6 +38,7 @@
 #   nemotron  Nemotron 3 Nano 4B                  llama.cpp-mainline (pixtral; --no-bos, below)        ref-tokenizer-nemotron
 #   gemma4    EmbeddingGemma 2's Q8_0 file        mainline 6868a52cb (the gemma-embedding2 profile's  ref-tokenizer-gemma4
 #                                                 LCPP and MODEL, tools/ref/models/gemma-embedding2.sh)
+#   llama     EmbeddingGemma v1's Q8_0 file      the same mainline pin, gemma-embedding profile       ref-tokenizer-llama
 #
 # A vocabulary can have cases of its own after the shared ones (EXTRA, `# extra cases` in the manifest, rows numbered on
 # from the shared cases): gemma4's crates/tokenizer/tests/cases-gemma4.txt, the boundaries of its own vocabulary and the
@@ -48,27 +49,28 @@
 # touch these.
 #
 # Every vocabulary reads the same texts: the default profile's ik tree and this tree's docs/. `all`
-# takes one snapshot of docs/ per vocabulary, in turn, all but gemma4, which runs by name on a machine with its
+# takes one snapshot of docs/ per vocabulary, in turn, all but gemma4 and llama, which run by name on a machine with their
 # mainline tree.
 #
-# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|all
+# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|llama|all
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 CASES=$ROOT/crates/tokenizer/tests/cases.txt
 
+[ $# = 1 ] || { echo "usage: oracle.sh VOCAB" >&2; exit 64; }
+
 case ${1:-} in
-  v41 | qwen3moe | glm5next | qwen38 | nemotron | gemma4) [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|all" >&2; exit 64; } ;;
+  v41 | qwen3moe | glm5next | qwen38 | nemotron | gemma4 | llama) ;;
   all)
-    [ $# = 1 ] || { echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|all" >&2; exit 64; }
     for v in v41 qwen3moe glm5next qwen38 nemotron; do
       echo "oracle: $v"
       bash "${BASH_SOURCE[0]}" "$v"
     done
     exit 0
     ;;
-  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|all" >&2; exit 64 ;;
+  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|llama|all" >&2; exit 64 ;;
 esac
 VOCAB_NAME=$1
 
@@ -129,17 +131,19 @@ profile() {
       # reach the tokenizer as a newline; --no-escape keeps the text's bytes.
       REF_FLAGS=(--no-bos --no-escape)
       ;;
-    gemma4)
+    gemma4 | llama)
       # The profile's own MODEL, not the file tools/box.sh resolved for the default profile.
-      local emb2
+      local emb2 model_profile=gemma-embedding2
+      [ "$1" != llama ] || model_profile=gemma-embedding
       # shellcheck disable=SC2016 # the child shell expands them
-      emb2=$(env -u BLOOMERY_REF_MODEL bash -c 'source "$1" && printf "%s\t%s" "$LCPP" "$MODEL"' _ \
-        "$ROOT/tools/ref/models/gemma-embedding2.sh")
+      emb2=$(env -u BLOOMERY_REF_MODEL bash -c 'source "$1" && printf "%s\t%s\t%s" "$LCPP" "$MODEL" "${EMBED_CASES:?the profile names EMBED_CASES}"' _ \
+        "$ROOT/tools/ref/models/$model_profile.sh")
       TOKENIZE=${emb2%%$'\t'*}/build/bin/llama-tokenize
-      SHARD=${emb2#*$'\t'}
-      SET=ref-tokenizer-gemma4
-      EXTRA=$ROOT/crates/tokenizer/tests/cases-gemma4.txt
-      # No --no-bos: the EmbeddingGemma 2 sets run these ids as the model's
+      emb2=${emb2#*$'\t'}
+      SHARD=${emb2%%$'\t'*}
+      SET=ref-tokenizer-$1
+      EXTRA=$ROOT/crates/tokenizer/tests/${emb2#*$'\t'}
+      # No --no-bos: the EmbeddingGemma sets run these ids as the model's
       # input, BOS and EOS included, as llama-server's /tokenize with
       # add_special gives them (tools/ref/emb2/server_vectors.py).
       REF_FLAGS=(--no-escape)

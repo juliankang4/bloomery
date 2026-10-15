@@ -1345,10 +1345,9 @@ gate-tokenizer:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
 # The tokenizer oracle's sets, once per change of the reference trees, the vocabulary files, cases.txt or the
 # docs/ the Korean text is gathered from: `llama-tokenize`'s ids per vocabulary into $BLOOMERY_DATA/ref-tokenizer-<v>/
-# (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron, gemma4 or all, every one but
-# gemma4). No lease, no GPU. gemma4 (EmbeddingGemma 2) is read by mainline 6868a52cb (`just build-emb2-lcpp`), with its
-# own cases after cases.txt (cases-gemma4.txt), and its set is the text cases the EmbeddingGemma 2 oracle sets are dumped
-# from.
+# (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron, gemma4, llama or all, every one but
+# gemma4 and llama). No lease, no GPU. gemma4 (EmbeddingGemma 2) and llama (v1) use mainline 6868a52cb
+# (`just build-emb2-lcpp`), with their profile's EMBED_CASES after cases.txt. The EmbeddingGemma oracle sets read those ids.
 # A re-dump on a moved reference tree changes the md5 pins in crates/refset/src/arch/tokenizer.rs: the gate names which.
 # V4.1's reference is a side tree (/home/user/ik-tilde: ik main plus the one line that puts `~` in the S class,
 # ik#2528) and Qwen3-MoE, GLM-5.3-Flash and Qwen3.8 use /home/user/ik-tokref (the ik-idxkey commit plus the
