@@ -17,6 +17,7 @@ pub mod deepseek41;
 pub mod draft;
 pub mod dspark;
 pub mod gemma_embedding2;
+mod gemma_encoder;
 pub mod glm5next;
 mod hybrid;
 pub mod mimo2;
@@ -277,6 +278,23 @@ pub(crate) fn finite_positive(split: &Split, suffix: &str) -> Result<f32, Placem
         ));
     }
     Ok(v)
+}
+
+/// Layer `l` has a positive key-head count that divides the query-head count.
+pub(crate) fn check_kv(
+    split: &Split,
+    n_head: usize,
+    l: usize,
+    heads: usize,
+) -> Result<(), PlacementError> {
+    if heads == 0 || !n_head.is_multiple_of(heads) {
+        return Err(metadata(
+            split,
+            "attention.head_count_kv",
+            format!("is {heads} at layer {l} for {n_head} query heads"),
+        ));
+    }
+    Ok(())
 }
 
 /// `<architecture>.<suffix>` as a string.

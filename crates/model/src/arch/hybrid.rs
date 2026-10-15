@@ -115,13 +115,7 @@ impl Attn {
         l: usize,
         heads: usize,
     ) -> Result<(), PlacementError> {
-        if heads == 0 || !self.n_head.is_multiple_of(heads) {
-            return Err(metadata(
-                split,
-                "attention.head_count_kv",
-                format!("is {heads} at layer {l} for {} query heads", self.n_head),
-            ));
-        }
+        super::check_kv(split, self.n_head, l, heads)?;
         mul(split, "attention.key_length", self.n_head, self.key_len)?;
         mul(split, "attention.value_length", self.n_head, self.value_len)?;
         Ok(())

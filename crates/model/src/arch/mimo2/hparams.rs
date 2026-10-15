@@ -134,26 +134,13 @@ impl Hparams {
             return Err(metadata(split, "attention.head_count", "is 0"));
         }
         let kv_heads = per_layer_count(split, "attention.head_count_kv", n_layer)?;
-        for (l, &kv) in kv_heads.iter().enumerate() {
-            if kv == 0 || !n_head.is_multiple_of(kv) {
-                return Err(metadata(
-                    split,
-                    "attention.head_count_kv",
-                    format!("is {kv} at layer {l} for {n_head} query heads"),
-                ));
-            }
+        for (l, &heads) in kv_heads.iter().enumerate() {
+            crate::arch::check_kv(split, n_head, l, heads)?;
         }
         let head_k = positive(split, "attention.key_length")?;
         let head_v = positive(split, "attention.value_length")?;
         // The file always carries it; a missing key is not a scale of 1.
-        let value_scale = meta_f32(split, "attention.value_scale")?;
-        if !value_scale.is_finite() || value_scale <= 0.0 {
-            return Err(metadata(
-                split,
-                "attention.value_scale",
-                format!("is {value_scale}, not a finite positive multiplier"),
-            ));
-        }
+        let value_scale = crate::arch::finite_positive(split, "attention.value_scale")?;
         let rms_eps = meta_f32(split, "attention.layer_norm_rms_epsilon")?;
         let window = positive(split, "attention.sliding_window")?;
         let kinds = pattern(split, n_layer)?;

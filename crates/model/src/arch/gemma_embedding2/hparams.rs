@@ -12,24 +12,12 @@ use gguf::Split;
 use super::names;
 use crate::arch::names::blk;
 use crate::arch::{
-    meta_bool, meta_f32, metadata, mul, n_vocab, optional_usize, per_layer_count, per_layer_items,
-    positive,
+    finite_positive, metadata, mul, n_vocab, per_layer_count, per_layer_items, positive,
 };
 use crate::placement::PlacementError;
 
-/// `pooling_type`'s mean (llama.h `LLAMA_POOLING_TYPE_MEAN`).
-const POOLING_MEAN: usize = 1;
-
-/// The head and rope of one kind of layer.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Attn {
-    /// `attention.key_length{,_swa}`, which `value_length{,_swa}` equals.
-    pub head: usize,
-    /// `rope.dimension_count{,_swa}`: the values rotated, NeoX halves.
-    pub rope_dims: usize,
-    /// `rope.freq_base{,_swa}`.
-    pub rope_base: f32,
-}
+pub use crate::arch::gemma_encoder::Attn;
+use crate::arch::gemma_encoder::encoder_keys;
 
 /// The hyperparameters of one `gemma-embedding2` file.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,7 +36,7 @@ pub struct Hparams {
     pub n_head: usize,
     /// `feed_forward_length`.
     pub n_ff: usize,
-    /// `attention.head_count_kv`, per layer.
+    /// `attention.head_count_kv`, shared or per layer, resolved per layer.
     pub kv: Vec<usize>,
     /// `attention.sliding_window_pattern`: whether each layer slides.
     pub sliding: Vec<bool>,
@@ -75,26 +63,13 @@ impl Hparams {
         let n_ctx = positive(split, "context_length")?;
         let n_head = positive(split, "attention.head_count")?;
         let n_ff = positive(split, "feed_forward_length")?;
-        let rms_eps = meta_f32(split, "attention.layer_norm_rms_epsilon")?;
-        if !rms_eps.is_finite() || rms_eps <= 0.0 {
-            return Err(metadata(
-                split,
-                "attention.layer_norm_rms_epsilon",
-                format!("is {rms_eps}, not a finite positive epsilon"),
-            ));
-        }
+        let rms_eps = finite_positive(split, "attention.layer_norm_rms_epsilon")?;
         encoder_keys(split)?;
         let full = attn(split, "")?;
         let swa = attn(split, "_swa")?;
         let kv = per_layer_count(split, "attention.head_count_kv", n_layer)?;
         for (l, &heads) in kv.iter().enumerate() {
-            if heads == 0 || !n_head.is_multiple_of(heads) {
-                return Err(metadata(
-                    split,
-                    "attention.head_count_kv",
-                    format!("is {heads} at layer {l} for {n_head} query heads"),
-                ));
-            }
+            crate::arch::check_kv(split, n_head, l, heads)?;
         }
         let sliding = sliding(split, n_layer)?;
         let hp = Hparams {
@@ -129,7 +104,6 @@ impl Hparams {
         let w = |n: usize| n as u64;
         let e = w(self.n_embd);
         let ple = w(self.per_layer);
-        let ff = w(self.n_ff);
         let mut out = vec![
             (names::token_embd(), vec![e, w(self.n_vocab)]),
             (
@@ -155,24 +129,21 @@ impl Hparams {
             } else {
                 "attention.key_length"
             };
-            let q = w(mul(split, key, self.n_head, a.head)?);
-            let k = w(mul(split, key, self.kv[l], a.head)?);
-            let d = w(a.head);
+            out.extend(
+                crate::arch::gemma_encoder::layer_tensors(
+                    split,
+                    self.n_embd,
+                    self.n_ff,
+                    self.n_head,
+                    self.kv[l],
+                    a,
+                    key,
+                )?
+                .into_iter()
+                .map(|(stem, dims)| (blk(l, stem), dims)),
+            );
             out.extend(
                 [
-                    (names::ATTN_NORM, vec![e]),
-                    (names::ATTN_Q, vec![e, q]),
-                    (names::ATTN_K, vec![e, k]),
-                    (names::ATTN_V, vec![e, k]),
-                    (names::ATTN_OUTPUT, vec![q, e]),
-                    (names::ATTN_Q_NORM, vec![d]),
-                    (names::ATTN_K_NORM, vec![d]),
-                    (names::POST_ATTENTION_NORM, vec![e]),
-                    (names::FFN_NORM, vec![e]),
-                    (names::FFN_GATE, vec![e, ff]),
-                    (names::FFN_UP, vec![e, ff]),
-                    (names::FFN_DOWN, vec![ff, e]),
-                    (names::POST_FFW_NORM, vec![e]),
                     (names::INP_GATE, vec![e, ple]),
                     (names::PROJ, vec![ple, e]),
                     (names::POST_NORM, vec![e]),
@@ -185,73 +156,10 @@ impl Hparams {
     }
 }
 
-/// The head and rope keys of one kind of layer, `suffix` `""` or `"_swa"`.
-/// The value head is the key head (llama.cpp throws otherwise), and the
-/// rope turns an even count of values within it.
+/// Each layer kind declares its rope width in the header.
 fn attn(split: &Split, suffix: &str) -> Result<Attn, PlacementError> {
-    let key = format!("attention.key_length{suffix}");
-    let value = format!("attention.value_length{suffix}");
-    let dims = format!("rope.dimension_count{suffix}");
-    let base = format!("rope.freq_base{suffix}");
-    let head = positive(split, &key)?;
-    let v = positive(split, &value)?;
-    if v != head {
-        return Err(metadata(split, &value, format!("is {v}, not {key} {head}")));
-    }
-    let rope_dims = positive(split, &dims)?;
-    if !rope_dims.is_multiple_of(2) || rope_dims > head {
-        return Err(metadata(
-            split,
-            &dims,
-            format!("is {rope_dims}, for a head of {head}"),
-        ));
-    }
-    let rope_base = meta_f32(split, &base)?;
-    if !rope_base.is_finite() || rope_base <= 0.0 {
-        return Err(metadata(
-            split,
-            &base,
-            format!("is {rope_base}, not a finite positive base"),
-        ));
-    }
-    Ok(Attn {
-        head,
-        rope_dims,
-        rope_base,
-    })
-}
-
-/// `pooling_type` is the mean, `attention.causal` is absent or false and
-/// `attention.shared_kv_layers` is absent or 0: the model this reader
-/// describes. Any other value is refused by name.
-fn encoder_keys(split: &Split) -> Result<(), PlacementError> {
-    let pooling = positive(split, "pooling_type")?;
-    if pooling != POOLING_MEAN {
-        return Err(metadata(
-            split,
-            "pooling_type",
-            format!("is {pooling}; this reader pools by the mean ({POOLING_MEAN})"),
-        ));
-    }
-    let causal = "attention.causal";
-    if split.value(&split.arch_key(causal)).is_some() && meta_bool(split, causal)? {
-        return Err(metadata(
-            split,
-            causal,
-            "is true; the encoder attends both ways",
-        ));
-    }
-    let shared = "attention.shared_kv_layers";
-    if let Some(n) = optional_usize(split, shared)?
-        && n != 0
-    {
-        return Err(metadata(
-            split,
-            shared,
-            format!("is {n}; every layer here projects its own keys and values"),
-        ));
-    }
-    Ok(())
+    let dims = positive(split, &format!("rope.dimension_count{suffix}"))?;
+    crate::arch::gemma_encoder::attn(split, suffix, dims)
 }
 
 /// `attention.sliding_window_pattern` as one bool per layer. A scalar, a

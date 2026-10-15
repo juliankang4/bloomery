@@ -6,10 +6,7 @@
 //! the model writes no text.
 
 use gguf::{Split, Value};
-use models::{
-    Act, Arch, ChatSpec, EncoderSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, Residual, Rope,
-    RopeMode,
-};
+use models::{Arch, ChatSpec, EncoderSpec, LayerSpec, ModelSpec};
 
 use super::hparams::Hparams;
 use super::roles;
@@ -71,18 +68,7 @@ fn chat(split: &Split, defaults: &mut Vec<String>) -> Result<ChatSpec, Placement
 /// The description of the file `hp` was read from. A per-layer list of
 /// another length than `n_layer` is an error naming its key.
 pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError> {
-    for (key, len) in [
-        ("attention.sliding_window_pattern", hp.sliding.len()),
-        ("attention.head_count_kv", hp.kv.len()),
-    ] {
-        if len != hp.n_layer {
-            return Err(PlacementError::Metadata {
-                key: key.to_string(),
-                detail: format!("has {len} values for {} layers", hp.n_layer),
-            });
-        }
-    }
-    let window = spec_u32("attention.sliding_window / 2", hp.window / 2)?;
+    let reach = crate::arch::gemma_encoder::reach(hp.n_layer, hp.kv.len(), &hp.sliding, hp.window)?;
     let layer = |l: usize| -> Result<LayerSpec, PlacementError> {
         let a = hp.attn(l);
         let (head_key, rope_key) = if hp.sliding[l] {
@@ -90,33 +76,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
         } else {
             ("attention.key_length", "rope.dimension_count")
         };
-        let head = spec_u32(head_key, a.head)?;
-        Ok(LayerSpec {
-            mixer: Mixer::Gqa(Gqa {
-                heads: spec_u32("attention.head_count", hp.n_head)?,
-                kv_heads: spec_u32("attention.head_count_kv", hp.kv[l])?,
-                head_dim: head,
-                value_dim: head,
-                rope: Rope {
-                    mode: RopeMode::Neox,
-                    dims: spec_u32(rope_key, a.rope_dims)?,
-                    base: a.rope_base,
-                    yarn: None,
-                },
-                qk_norm: true,
-                out_gate: false,
-                select: None,
-                window: None,
-                sinks: false,
-                value_scale: None,
-            }),
-            ffn: Ffn::Dense {
-                ff: spec_u32("feed_forward_length", hp.n_ff)?,
-                act: Act::GeGlu,
-            },
-            residual: Residual::Plain,
-            extras: Vec::new(),
-        })
+        crate::arch::gemma_encoder::layer_spec(hp.n_head, hp.kv[l], a, hp.n_ff, head_key, rope_key)
     };
     Ok(ModelSpec {
         arch: Arch::GemmaEmbedding2,
@@ -129,7 +89,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
         hc: None,
         engram: None,
         encoder: Some(EncoderSpec {
-            reach: hp.sliding.iter().map(|&s| s.then_some(window)).collect(),
+            reach,
             per_layer: Some(spec_u32("embedding_length_per_layer_input", hp.per_layer)?),
             proj: vec![spec_u32("embedding_length_out", hp.n_out)?],
         }),
@@ -319,6 +279,25 @@ mod tests {
             read.defaults,
             ["tokenizer.ggml.pre = gemma4 (tokenizer.ggml.model gemma4, as llama.cpp sets it)"]
         );
+        for value in [V::U32(2), V::I32s(vec![2; N])] {
+            let mut kv = keys();
+            set_key(&mut kv, "attention.head_count_kv", value);
+            let mut t = tensors();
+            for (l, &sliding) in SLIDING.iter().enumerate() {
+                let head = if sliding { HEAD_SWA } else { HEAD };
+                for stem in [names::ATTN_K, names::ATTN_V] {
+                    let name = crate::arch::names::blk(l, stem);
+                    t.iter_mut().find(|(n, _)| *n == name).unwrap().1 = vec![EMBD, 2 * head];
+                }
+            }
+            let read = load("gemma-emb2-shared-kv", kv, &t).expect("shared key-head counts");
+            for layer in &read.spec.layers {
+                let Mixer::Gqa(g) = &layer.mixer else {
+                    panic!("not GQA");
+                };
+                assert_eq!(g.kv_heads, 2);
+            }
+        }
         let path = crate::arch::synthetic::header_shaped(
             "gemma-emb2-hp",
             "gemma-embedding2",
@@ -327,8 +306,9 @@ mod tests {
             &tensors(),
         );
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
-        let mut hp = Hparams::read(&split).expect("the keys read");
-        let _ = std::fs::remove_file(&path);
+        let hp = Hparams::read(&split).expect("the keys read");
+        drop(split);
+        std::fs::remove_file(&path).expect("remove the synthetic header");
         for (sliding, rope, key) in [
             (false, false, "attention.key_length"),
             (true, false, "attention.key_length_swa"),
@@ -356,13 +336,23 @@ mod tests {
                 other => panic!("{key}: {other}"),
             }
         }
-        hp.sliding.pop();
-        let err = super::spec_of(&hp, s.chat.clone()).expect_err("a short pattern");
-        assert!(
-            err.to_string()
-                .contains("attention.sliding_window_pattern: has 5 values for 6 layers"),
-            "{err}"
-        );
+        for key in [
+            "attention.sliding_window_pattern",
+            "attention.head_count_kv",
+        ] {
+            let mut bad = hp.clone();
+            if key == "attention.sliding_window_pattern" {
+                bad.sliding.pop();
+            } else {
+                bad.kv.pop();
+            }
+            let err = super::spec_of(&bad, s.chat.clone()).expect_err(key);
+            assert!(
+                err.to_string()
+                    .contains(&format!("{key}: has 5 values for 6 layers")),
+                "{err}"
+            );
+        }
     }
 
     /// The coverage check names the bidirectional attention of both heads,
@@ -438,6 +428,18 @@ mod tests {
     /// pattern of another length or item type is refused by the key's name.
     #[test]
     fn a_key_of_another_model_is_named() {
+        for key in [
+            "rope.freq_base",
+            "rope.freq_base_swa",
+            "attention.layer_norm_rms_epsilon",
+        ] {
+            for value in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut kv = keys();
+                set_key(&mut kv, key, V::F32(value));
+                let err = load("gemma-emb2-float", kv, &tensors()).expect_err(key);
+                assert!(err.contains(key), "{key}: {err}");
+            }
+        }
         for (key, value, want) in [
             ("pooling_type", V::U32(2), "is 2"),
             ("attention.causal", V::Bool(true), "is true"),
@@ -534,10 +536,10 @@ mod tests {
         assert!(err.contains("per_layer_token_embd.weight"), "{err}");
     }
 
-    /// EmbeddingGemma 1 and other spellings have no reader here.
+    /// PIN(2026-10-15): gemma-embedding now has a reader; its header tests pin acceptance.
     #[test]
     fn other_gemma_embedding_strings_are_unknown() {
-        for arch in ["gemma-embedding", "gemma_embedding2", "gemma-embedding3"] {
+        for arch in ["gemma_embedding", "gemma_embedding2", "gemma-embedding3"] {
             assert!(Arch::from_name(arch).is_err(), "{arch} is known");
             let err = load_with(arch, arch, vec![], &[], &[]).expect_err(arch);
             assert_eq!(err, format!("unsupported architecture \"{arch}\""));

@@ -487,6 +487,29 @@ pub(super) mod tests {
         row.1 = value;
     }
 
+    #[test]
+    fn a_kv_count_that_does_not_divide_query_heads_is_named() {
+        let g = geo();
+        let mut kv = keys(&g);
+        set_key(
+            &mut kv,
+            "attention.head_count_kv",
+            V::I32s(vec![0, 0, KV, 0, 0, 3]),
+        );
+        let err = load(
+            "nemotron-h-kv-divisor",
+            "nemotron_h",
+            kv,
+            &tensors(&g, true),
+        )
+        .expect_err("KV heads must divide query heads");
+        assert!(
+            err.contains("nemotron_h.attention.head_count_kv")
+                && err.contains("is 3 at layer 5 for 4 query heads"),
+            "{err}"
+        );
+    }
+
     /// `n_head * key_length` overflows `usize` before any tensor is walked.
     /// The tensors stay the small valid set, so the file's byte size is not
     /// what refuses it.
