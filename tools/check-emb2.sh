@@ -253,6 +253,8 @@ class Builders(unittest.TestCase):
                 for compiler in ("g++", "cmake"):
                     write(root / "cuda/bin" / compiler,
                           '#!/bin/bash\n: > "$FIXTURE_COMPILED"\nexit 88\n', True)
+                # Exercise source integrity without qvis' root-only user switch.
+                write(root / "cuda/bin/id", "#!/bin/bash\necho 501\n", True)
                 env = dict(os.environ, PATH=str(root / "cuda/bin") + os.pathsep + os.environ["PATH"],
                            LCPP_BUILD_TREE=str(oracle), LCPP_BUILD_PIN=pin,
                            LCPP_BUILD_DIR=str(root / "run"), LCPP_BUILD_CUDA=str(root / "cuda"),
@@ -260,7 +262,7 @@ class Builders(unittest.TestCase):
                 result = subprocess.run(["bash", str(target)], cwd=root, env=env,
                                         capture_output=True, text=True, timeout=10)
                 output = result.stdout + result.stderr
-                if (root / "run/log").exists():
+                if script == "tools/ref/qvis/build-lcpp-qvis.sh":
                     output += (root / "run/log").read_text()
                     self.assertEqual((root / "run/rc").read_text().strip(), "2", output)
                 self.assertEqual(result.returncode, 2, output)
