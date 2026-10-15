@@ -7,6 +7,7 @@ crates/threads/src/helper.rs 1 the owner: spawn_helper itself
 crates/threads/src/lib.rs 1 the pool's workers: each pins itself, and pool() builds them before pin_caller pins its caller
 crates/gpu-gates/src/bind.rs 3 the engine thread, spawned by the serve main, which is never pinned (the engine thread pins itself); a test's echo thread; a test's file thread (the seat's state commands)
 crates/gpu-gates/src/side_seat.rs 1 the embedding model's thread, which owns its card, spawned by the serve main, never pinned
+crates/gpu-gates/src/bin/gate_gemma_embedding2_serve.rs 1 the gate's concurrent chat request, from the gate main, never pinned
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs 1 the decide seat's backbone worker thread, which owns the card, spawned by the serve main, never pinned
 crates/serve/src/api.rs 4 the HTTP server's threads and the signal handlers' reader thread, spawned by the serve main or its accept loop, never pinned
 crates/serve/src/embeddings.rs 1 a test's request that waits for the held model, from the test main, never pinned

@@ -3400,11 +3400,13 @@ pub mod groups {
         use crate::record::{Kind, SERVER_SPAWN};
 
         /// A gate's server spawn: the `server` record `Served::address` prints
-        /// on stdout when the server listens. The gates that start a server
-        /// register no list (`at_main`), so the record tests hold the group.
+        /// on stdout when the server listens.
         pub const SPAWN: &[&Kind] = &[&SERVER_SPAWN];
     }
 }
+
+/// The server spawn the EmbeddingGemma 2 serve gate prints on stdout.
+pub static GATE_GEMMA_EMBEDDING2_SERVE: &[&Kind] = kinds![groups::serve_client::SPAWN];
 
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
@@ -4627,10 +4629,10 @@ mod tests {
     fn every_binary_registers_the_groups_its_entries_require() {
         use groups::{
             bind, drafted, ds41_draft, ds41_split, host_stats, model_file, qwen3moe_place,
-            residency38, side_seat, vision_seat,
+            residency38, serve_client, side_seat, vision_seat,
         };
         type Group = &'static [&'static Kind];
-        let table: [(&str, Group, &[Group]); 12] = [
+        let table: [(&str, Group, &[Group]); 13] = [
             (
                 "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
                 BLOOMERY_SERVE_DS41,
@@ -4738,6 +4740,11 @@ mod tests {
                 "gate_deepseek41_prefill: ds41_split::split",
                 GATE_DEEPSEEK41_PREFILL,
                 &[ds41_split::SPLIT],
+            ),
+            (
+                "gate_gemma_embedding2_serve: Served::address",
+                GATE_GEMMA_EMBEDDING2_SERVE,
+                &[serve_client::SPAWN],
             ),
         ];
         for (entries, list, needs) in table {

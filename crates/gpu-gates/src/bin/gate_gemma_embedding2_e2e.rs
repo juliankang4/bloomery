@@ -50,22 +50,13 @@ mod gate {
     use bloomery_gpu_gemma_embedding2::{Encoder, Pass, card_bytes};
     use gguf::Split;
     use model::arch::gemma_embedding2::hparams::{CARD_CTX, Hparams};
-    use refset::arch::gemma_embedding2::{IDS_SET, MODEL, MODEL_SHA256, TEXT, TEXT_CPU};
+    use refset::arch::gemma_embedding2::{
+        IDS_SET, MODEL, MODEL_SHA256, REL_FLOOR as FLOOR, TEXT, TEXT_CPU, TWIN,
+    };
     use refset::emb2::Emb2Set;
     use refset::family::Family;
     use refset::ik::RefHeader;
     use refset::tokenizer::read_ids;
-
-    /// A row's band: this many times the CPU twin's distance from the card
-    /// set (`shared/glm5next_media.rs`'s `TWIN`, the Qwen seats' rule).
-    const TWIN: f64 = 2.5;
-
-    /// The least band.
-    // PIN(2026-10-15): 1e-2 over the distances whose twin band is smaller,
-    // measured on a DGX Spark: `inp_per_layer` 1.344e-3 to 1.594e-3 against
-    // twins of 1.066e-7 to 2.410e-7 in every case, and the shortest cases'
-    // `l_out` up to 9.046e-3 at layer 0.
-    const FLOOR: f64 = 1.0e-2;
 
     /// One case of the set: its name and its ids.
     struct Case {

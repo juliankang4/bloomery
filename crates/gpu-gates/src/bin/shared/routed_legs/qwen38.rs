@@ -145,8 +145,10 @@ fn choose(inputs: &PlanInputs, ctx: u64, seqs: Seqs) -> Result<Place, Outcome> {
             // The default runs carry no MTP draft: the draft levers
             // unset.
             None,
-            seqs,
-            bloomery_gpu_gates::beside::Beside::default(),
+            q38place::Residents {
+                seqs,
+                held: bloomery_gpu_gates::beside::Beside::default(),
+            },
         )
     })
     .map(|chosen| chosen.place)

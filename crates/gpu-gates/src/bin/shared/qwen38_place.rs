@@ -40,6 +40,12 @@ pub fn choose(
     Place::choose(flag, census, Q38_RULE, tier_of)
 }
 
+/// The resident sequences and the named reserves held beside a tier plan.
+pub(crate) struct Residents {
+    pub(crate) seqs: Seqs,
+    pub(crate) held: Beside,
+}
+
 /// The experts `cards`' plan (b′) holds on its tier card at `ctx` positions
 /// and ubatches of `ub` under `experts` and `levers` — the load `mtp` names
 /// planning the file's MTP draft beside the target, else the plain plan of
@@ -59,8 +65,7 @@ pub fn tier_experts(
     experts: Experts,
     levers: &PlanLevers,
     mtp: Option<&MtpInputs>,
-    seqs: Seqs,
-    held: Beside,
+    Residents { seqs, held }: Residents,
 ) -> Result<u64, GateError> {
     let slots = seqs.slots;
     let mut machine = machine_bp_on(

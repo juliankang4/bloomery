@@ -1243,10 +1243,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             experts,
             &plan_levers,
             mtp_inputs.as_ref(),
-            seqs38(&inputs, slots),
-            Beside {
-                image: None,
-                embedding: seat.as_ref().and_then(|s| s.reserve),
+            q38place::Residents {
+                seqs: seqs38(&inputs, slots),
+                held: Beside {
+                    image: None,
+                    embedding: seat.as_ref().and_then(|s| s.reserve),
+                },
             },
         )
     })?;

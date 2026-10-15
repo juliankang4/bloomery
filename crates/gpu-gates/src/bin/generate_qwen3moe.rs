@@ -1148,9 +1148,11 @@ mod cli {
                 experts,
                 &PlanLevers::from_levers(levers)?,
                 mtp.as_ref(),
-                // The CLI's load leaves checkpoints off (`set_checkpoints`).
-                Seqs::none(if mtp.is_some() { 1 } else { slots }),
-                bloomery_gpu_gates::beside::Beside::default(),
+                q38place::Residents {
+                    // The CLI's load leaves checkpoints off (`set_checkpoints`).
+                    seqs: Seqs::none(if mtp.is_some() { 1 } else { slots }),
+                    held: bloomery_gpu_gates::beside::Beside::default(),
+                },
             )
         })?;
         chosen.record().print();

@@ -71,7 +71,6 @@ use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
 use model::arch::Arch;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Kernel gate band against the quantized-input reference.
 /// PIN(2026-09-21): tightened 1e-2 -> 1e-5. Measured worst on the landed
@@ -140,15 +139,12 @@ pub fn checks_failed() -> GateError {
     "FAILED: one or more checks above did not pass".into()
 }
 
-/// The sha256 of the file at `path`, as `sha256sum` prints it; a failed `sha256sum` is an error
-/// naming the file.
+/// The SHA-256 of the file at `path`, lowercase hex; an error names the file.
 pub fn sha256(path: &Path) -> Result<String, GateError> {
-    let out = Command::new("sha256sum").arg(path).output()?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    match text.split_whitespace().next() {
-        Some(h) if out.status.success() => Ok(h.to_owned()),
-        _ => Err(format!("sha256sum {}: {:?}", path.display(), text.trim()).into()),
-    }
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len();
+    Ok(hf::fetch::digest(path, hf::Check::Sha256, size)?)
 }
 
 /// The model file every gate and server opens: the one a server named on

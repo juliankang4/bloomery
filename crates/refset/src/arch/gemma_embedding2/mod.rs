@@ -61,6 +61,18 @@ pub const TOWER_CPU_SET: &str = "ref_gemma_embedding2_tower.cpu";
 /// llama-server's vectors.
 pub const SERVER_SET: &str = "ref_gemma_embedding2_server";
 
+/// A row's band in the encoder and serving gates: this many times the CPU
+/// twin's distance from the card set (`shared/glm5next_media.rs`'s `TWIN`,
+/// the Qwen seats' rule).
+pub const TWIN: f64 = 2.5;
+
+/// The least relative band in the encoder and serving gates.
+// PIN(2026-10-15): 1e-2 over the distances whose twin band is smaller,
+// measured on a DGX Spark: `inp_per_layer` 1.344e-3 to 1.594e-3 against
+// twins of 1.066e-7 to 2.410e-7 in every case, and the shortest cases'
+// `l_out` up to 9.046e-3 at layer 0.
+pub const REL_FLOOR: f64 = 1.0e-2;
+
 const RECIPE: &str = "just dump-ref-emb2";
 
 /// The files every set is dumped from.
@@ -98,7 +110,10 @@ pub static TEXT: Family = Family {
 };
 /// The same, with no card in view.
 pub static TEXT_CPU: Family = Family {
-    consumers: E2E,
+    consumers: &[
+        "gate-gpu-gemma-embedding2-e2e",
+        "gate-gpu-gemma-embedding2-serve",
+    ],
     ..family(
         "text-gemma-embedding2-cpu",
         &[TEXT_CPU_SET],
@@ -130,15 +145,18 @@ pub static TOWER_CPU: Family = family(
     RECIPE,
 );
 /// llama-server's `/v1/embeddings` vectors.
-pub static SERVER: Family = family(
-    "server-gemma-embedding2",
-    &[SERVER_SET],
-    Kind::Server,
-    &PROFILE,
-    ARCH,
-    model,
-    RECIPE,
-);
+pub static SERVER: Family = Family {
+    consumers: &["gate-gpu-gemma-embedding2-serve"],
+    ..family(
+        "server-gemma-embedding2",
+        &[SERVER_SET],
+        Kind::Server,
+        &PROFILE,
+        ARCH,
+        model,
+        RECIPE,
+    )
+};
 
 /// The architecture's families, in the order `refset-check` lists them.
 pub static FAMILIES: &[&Family] = &[&TEXT, &TEXT_CPU, &TOWER, &TOWER_CPU, &SERVER];
