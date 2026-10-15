@@ -1306,6 +1306,33 @@ FP
       if call_alive "$p"; then kill -KILL "$p" 2> /dev/null || true; fi
     done < <(find "$t" "$h" -path '*/lane-*.box/*' -type f 2> /dev/null)
   }
+  stop_lanes() { # <case output dir>: no registered lane or item may write after this returns
+    local dir=$1 f p k live pids=''
+    for f in "$dir"/lane-*.pid "$dir"/lane-*.child; do
+      [ -f "$f" ] || continue
+      p=$(cat "$f")
+      # A completed case leaves pid files; never signal a pid reused outside this fixture.
+      case $(ps -o args= -p "$p" 2> /dev/null) in *"$t/"*) ;; *) continue ;; esac
+      pids="$pids $p"
+      kill -TERM "$p" 2> /dev/null || true
+    done
+    for ((k = 0; k <= 100; k++)); do
+      live=''
+      for p in $pids; do
+        if call_alive "$p"; then live="$live $p"; fi
+      done
+      [ -n "$live" ] || break
+      if [ "$k" = 100 ]; then
+        echo "gate-batch: self-test: fixture writers did not stop:$live ($dir)" >&2
+        return 70
+      fi
+      if [ "$k" = 50 ]; then
+        for p in $live; do kill -KILL "$p" 2> /dev/null || true; done
+      fi
+      sleep 0.1
+    done
+    reap_calls
+  }
   fresh_state() { # <paths…>: the last case's box calls ended, then fake-state and the paths removed
     reap_calls
     rm -rf "$t/fake-state" "$@"
@@ -1497,7 +1524,14 @@ FP
   want 'chain: its times row names lane B and the A6000' "$t/times-ch-laneb.tsv" "$(printf '^v41-any@FAKE_SLEEP=2\tB\ta6000\t')"
   want 'chain: the ledger records it under the A6000 key' "$t/rounds-ch-laneb.tsv" "$(printf '^stub-v41-any@FAKE_SLEEP=2,BLOOMERY_GATE_CARD=a6000\tv41-any\t')"
   want_row 'chain: its box call carries the A6000 card' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=a6000/ && $2 ~ /gen_x$/'
-  mutant_of ch-pina 's|^  local lane=\$1 i card cards$|  local lane=$1 i card cards; [ "$lane" = B ] \&\& return 1 # MUTANT ch-pina|' '# MUTANT ch-pina$'
+  cat > "$t/finish-lane.sh" << 'SH'
+trap '' TERM
+while [ ! -e "$OUT/finish-stop" ]; do sleep 0.1; done
+sleep 1
+: > "$OUT/lane-$lane.stopped"
+exit 0
+SH
+  mutant_of ch-pina 's|^  local lane=\$1 i card cards$|  local lane=$1 i card cards; [ "$lane" = B ] \&\& return 1; trap '"'"'. "$ROOT/finish-lane.sh"'"'"' TERM # MUTANT ch-pina|' '# MUTANT ch-pina$'
   fresh_state "$t/target/c-ch-lanebm"
   BLOOMERY_GATE_TIMES=$t/times-ch-laneb.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-lanebm.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-lanebm.tsv \
     bash "$t/tools/gate-batch-ch-pina.sh" --out "$t/target/c-ch-lanebm" --round-ledger 'steal-slow@FAKE_SLEEP=15' 'plain-any@FAKE_SLEEP=1' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=2' x-q > "$t/out-ch-lanebm.log" 2>&1 &
@@ -1508,11 +1542,16 @@ FP
     k=$((k + 1))
   done
   if kill -0 "$sp" 2> /dev/null; then hung=1; else hung=0; fi
+  ap=$(cat "$t/target/c-ch-lanebm/lane-A.pid")
   kill -TERM "$sp" 2> /dev/null || true
   wait "$sp" 2> /dev/null || true
-  for f in "$t"/target/c-ch-lanebm/lane-*.pid "$t"/target/c-ch-lanebm/lane-*.child; do
-    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
-  done
+  : > "$t/target/c-ch-lanebm/finish-stop"
+  stop_lanes "$t/target/c-ch-lanebm"
+  if ! call_alive "$ap" && [ -f "$t/target/c-ch-lanebm/lane-A.stopped" ]; then
+    pass 'chain: a stopped lane finishes its last write before fixture cleanup'
+  else
+    fail 'chain: a stopped lane finishes its last write before fixture cleanup' "lane $ap still writes or has not finished its TERM handler"
+  fi
   n=$((n + 1))
   if [ "$hung" = 1 ] && ! grep -q '^v41-any rc=' "$t/target/c-ch-lanebm/run.log" 2> /dev/null; then
     echo 'ok chain mutant: members pinned to lane A never reach lane B (the batch waits without end)'
@@ -1543,9 +1582,7 @@ FP
   done
   kill -TERM "$sp" 2> /dev/null || true
   wait "$sp" 2> /dev/null || true
-  for f in "$t"/target/c-ch-cardsm/lane-*.pid "$t"/target/c-ch-cardsm/lane-*.child; do
-    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
-  done
+  stop_lanes "$t/target/c-ch-cardsm"
   want_not 'chain mutant: every card reading 3090 lets a lane take a member it may not' "$t/target/c-ch-cardsm/run.log" '^v41-a rc=0 [0-9]+s try=1 lane=A( |$)'
   # (4) solo and both-cards members stay X, and a solo-real the pass list does not name stays X in
   # the real tier and balanced in the fixture tier — the tier cases below hold all of that.
@@ -1672,9 +1709,7 @@ FP
     else
       wait "$sp" || rc=$?
     fi
-    for f in "$t/target/c-$tag"/lane-*.pid "$t/target/c-$tag"/lane-*.child; do
-      if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
-    done
+    stop_lanes "$t/target/c-$tag"
     cnt=$(grep -c '^plain-any rc=skip ' "$t/target/c-$tag/run.log" 2> /dev/null || true)
     printf '%s %s' "$rc" "${cnt:-0}"
   }
@@ -1718,9 +1753,7 @@ FP
     wait "$sp" 2> /dev/null || true
     fail 'chain: a lane killed with the mutex ends the batch by name' "the batch was still running after ${k} s"
   fi
-  for f in "$t"/target/c-ch-kill/lane-*.pid "$t"/target/c-ch-kill/lane-*.child; do
-    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
-  done
+  stop_lanes "$t/target/c-ch-kill"
   mutant_of ch-deaf "s|^      \*) dead_now=\"\\\$dead_now \\\$lane\"; continue ;;\$|      *) continue ;; # MUTANT ch-deaf|" '# MUTANT ch-deaf$'
   fresh_state "$t/target/c-ch-killm"
   BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-ch-kill.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-ch-kill.tsv \
@@ -1742,9 +1775,7 @@ FP
   if kill -0 "$sp" 2> /dev/null; then hung=1; fi
   kill -TERM "$sp" 2> /dev/null || true
   wait "$sp" 2> /dev/null || true
-  for f in "$t"/target/c-ch-killm/lane-*.pid "$t"/target/c-ch-killm/lane-*.child; do
-    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
-  done
+  stop_lanes "$t/target/c-ch-killm"
   if [ "$hung" = 1 ]; then pass 'chain mutant: a deaf watch leaves the batch waiting without end'
   else fail 'chain mutant: a deaf watch leaves the batch waiting without end' "the mutant batch ended within ${k} s"; fi
   # (10b) both lanes killed at once: each lane's sighting is its own, so the batch still ends by
@@ -1783,9 +1814,7 @@ FP
     wait "$sp" 2> /dev/null || true
     fail 'chain: both lanes killed at once end the batch by name' "the batch was still running after ${k} s"
   fi
-  for f in "$t"/target/c-ch-kill2/lane-*.pid "$t"/target/c-ch-kill2/lane-*.child; do
-    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
-  done
+  stop_lanes "$t/target/c-ch-kill2"
   fi
   if gb_part 8; then
   # (11) the predicted line carries chain= and its phase-1 term.
@@ -3114,9 +3143,7 @@ EOS
     pass 'stop: a batch killed outright leaves its hold up, and its heartbeat ends within a beat'
   else fail 'stop: a batch killed outright leaves its hold up, and its heartbeat ends within a beat' "heartbeat pid $hp after ${k} s, hold file: $(ls "$t/fake-state/batch.gpuhold" 2>&1)"; fi
   want '  … and logs why' "$t/target/c-hold-kill/gpuhold.log" 'is gone: the heartbeat stops'
-  for f in "$t"/target/c-hold-kill/lane-*.pid "$t"/target/c-hold-kill/lane-*.child; do # the killed batch's lanes: the pids it wrote
-    if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
-  done
+  stop_lanes "$t/target/c-hold-kill"
   # A hold that vanishes (taken down by hand): the next beat finds it gone (3), logs it and the heartbeat stops — and no beat
   # creates the file again.
   fresh_state "$t/target/c-hold-gone"

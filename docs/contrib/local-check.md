@@ -77,6 +77,11 @@ every unit green, 1 a unit red, 64 usage, 69 a prerequisite is missing (named, w
 script reads is empty or `--only` matches no unit. `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, so the
 red path can be shown to fail first.
 
+The gate-batch self-test waits for stopped fixture lanes and their registered
+items to finish before a case can remove its tree. A delayed TERM-handler case
+checks that the lane's last write has completed; a teardown failure still fails
+the self-test rather than being hidden by its count summary.
+
 Exceptions:
 
 - **`just` is a T0 prerequisite.** Three T0 units call it: `recipes-self-test`, `check-recipes` and the self-test of
