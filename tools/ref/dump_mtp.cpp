@@ -64,11 +64,10 @@
 #include "ggml.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "ref_io.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <cinttypes>
-#include <climits>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -508,10 +507,8 @@ static bool read_token_file(const std::string & path, long long count, std::vect
     long long   lines = 0;
     while ((long long) ids.size() < count && std::getline(in, line)) {
         ++lines;
-        char * end = nullptr;
-        errno = 0;
-        const long v = strtol(line.c_str(), &end, 10);
-        if (line.empty() || *end != '\0' || errno != 0 || v < 0 || v > INT32_MAX) {
+        int32_t v;
+        if (!parse_token_id(line, v)) {
             fprintf(stderr, "dump_mtp: %s:%lld is not a token id: '%s'\n", path.c_str(), lines, line.c_str());
             return false;
         }

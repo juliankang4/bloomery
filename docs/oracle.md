@@ -43,6 +43,12 @@ raw f32로** 파일에 떨군다. 텐서당 `<이름>.<발생순번>.f32`, 그�
 토크나이저로 한 번 읽은 값). **계측기는 토큰화를 하지 않는다.** 하면 토크나이저 차이가
 하류 모든 텐서의 수치 차이로 나타나 커널 버그처럼 읽힌다. 토크나이저는 1단계가 재는 것이 아니다.
 
+Token-file readers check the whole record, not only its C-string prefix: an
+embedded NUL is malformed even after an otherwise valid id. The ik readers keep
+their existing prefix-count behavior, including `dump_ref`'s negative count for
+reading every line. Rebuild `dump_ref`, `dump_mtp` and `dump_draft` before using
+the changed readers to produce reference sets.
+
 ## v3 형식 (2026-09-23, B0c — `3a7e3f0`·`e3cf0dc`)
 
 V4.1을 받으려고 덤퍼를 넓혔다. V2-Lite에서 기존 `.f32` 1155개와 tensor 행 1–11열은 v1과 바이트까지 같고, 게이트 다섯(attn·ffn·moe·head·forward)이 두 세트에서 같은 값을 낸다. 달라진 것은 여섯 가지다.

@@ -1,5 +1,5 @@
 #pragma once
-// Token files and raw f32 rows for the mainline oracles (hidden_ref, nemotron_ref).
+// Token records and raw f32 rows for the reference oracles.
 // A token id is a non-negative 32-bit integer. The header does not include llama.h:
 // llama_token is that integer, so a vector of it is a vector of int32_t.
 
@@ -39,6 +39,19 @@ inline bool parse_i32(const char * who, const char * flag, const char * value, i
     return true;
 }
 
+// One whole token record, preserving strtol's leading whitespace and sign syntax.
+// An embedded NUL ends the C string, not the record; consume the string's full size.
+inline bool parse_token_id(const std::string & line, int32_t & out) {
+    char * end = nullptr;
+    errno = 0;
+    const long id = strtol(line.c_str(), &end, 10);
+    if (line.empty() || end != line.c_str() + line.size() || errno != 0 || id < 0 || id > INT32_MAX) {
+        return false;
+    }
+    out = (int32_t) id;
+    return true;
+}
+
 template <typename Token>
 bool read_token_file(const std::string & path, long long count, std::vector<Token> & ids) {
     std::ifstream in(path);
@@ -51,12 +64,8 @@ bool read_token_file(const std::string & path, long long count, std::vector<Toke
     while ((long long) ids.size() < count && std::getline(in, line)) {
         ++lines;
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        char * end = nullptr;
-        errno = 0;
-        const long id = strtol(line.c_str(), &end, 10);
-        // The whole record is the number: a NUL inside the line ends the C string but not the record.
-        if (line.empty() || line[0] < '0' || line[0] > '9' || end != line.c_str() + line.size() ||
-            errno != 0 || id < 0 || id > INT32_MAX) {
+        int32_t id;
+        if (line.empty() || line[0] < '0' || line[0] > '9' || !parse_token_id(line, id)) {
             fprintf(stderr, "%s:%lld: invalid token id '%s'\n", path.c_str(), lines, line.c_str());
             return false;
         }
