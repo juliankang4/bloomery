@@ -28,7 +28,9 @@ SRC=$HERE/$DUMPER
 HDR=$HERE/tools/ref/clefvis/set_writer.h
 LCPP=$ORACLE
 git_lcpp() { git -c safe.directory="$LCPP" -C "$LCPP" "$@"; }
-if [ -n "$(git_lcpp status --porcelain --untracked-files=no)" ]; then
+dirty=$(git_lcpp status --porcelain --untracked-files=no) ||
+  { echo "build-clefvis: cannot inspect tracked changes in $LCPP" >&2; exit 2; }
+if [ -n "$dirty" ]; then
   echo "build-clefvis: $LCPP has tracked changes; the oracle is the commit's build, not an edited tree" >&2
   exit 2
 fi

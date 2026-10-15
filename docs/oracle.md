@@ -6,6 +6,11 @@
 1-2부터 1-5까지 모든 라운드의 게이트가 여기서 읽는다. 라운드마다 자기 진실을 따로
 만들면 세 개의 다른 진실이 생긴다.
 
+The hidden, Nemotron and image-oracle builders refuse a failed `git status` query
+before compiling, not only a successful query that reports tracked changes.
+The oracle-tree builder uses the same rule and records failure in its `rc` sentinel.
+An unreadable index is not evidence of a clean source tree.
+
 ## 세트를 지키는 것 — 2026-09-19에 한 번 잃고 나서 넣은 것
 
 `dump_ref`의 **부작용이 곧 오라클이다.** 다른 이유로 그 바이너리를 실행하면 — 예를 들어 ik의

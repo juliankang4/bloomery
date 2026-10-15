@@ -221,6 +221,53 @@ printf '%s:end\\n' "$FIXTURE_TAG" >> "$FIXTURE_EVENTS"
         self.assertFalse((self.root / "events").exists())
 
 
+class Builders(unittest.TestCase):
+    def test_unreadable_index_stops_before_compilation(self):
+        scripts = (
+            ("tools/ref/build-hidden.sh", "qwen35"),
+            ("tools/ref/build-nemotron-ref.sh", "nemotron_h"),
+            ("tools/ref/clefvis/build-clefvis.sh", "qwen35"),
+            ("tools/ref/qvis/build-lcpp-qvis.sh", "qwen35"),
+        )
+        for script, profile in scripts:
+            with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="oracle-status-") as tmp:
+                root = Path(tmp).resolve()
+                target = root / script
+                target.parent.mkdir(parents=True)
+                shutil.copyfile(ROOT / script, target)
+                oracle = root / "oracle"
+                subprocess.run(["git", "init", "-q", str(oracle)], check=True)
+                subprocess.run(["git", "-C", str(oracle), "-c", "user.name=fixture",
+                                "-c", "user.email=fixture@example.invalid", "commit",
+                                "--allow-empty", "-qm", "fixture"], check=True)
+                pin = subprocess.check_output(["git", "-C", str(oracle), "rev-parse", "HEAD"],
+                                              text=True).strip()
+                (oracle / ".git/index").write_bytes(b"invalid index")
+                write(root / "tools/ref/ref-paths.sh",
+                      f"MODEL_NAME={profile}\nLCPP={shlex.quote(str(oracle))}\n"
+                      f"BLOOMERY_DATA={shlex.quote(str(root / 'data'))}\n")
+                write(root / "tools/ref/clefvis/profile.sh",
+                      'ORACLE=$LCPP\nDATA=$BLOOMERY_DATA\nDUMPER=fixture.cpp\n')
+                write(root / "tools/ref/lease.sh", 'lease_free() { return 0; }\nnow() { printf fixture; }\n')
+                marker = root / "compiled"
+                for compiler in ("g++", "cmake"):
+                    write(root / "cuda/bin" / compiler,
+                          '#!/bin/bash\n: > "$FIXTURE_COMPILED"\nexit 88\n', True)
+                env = dict(os.environ, PATH=str(root / "cuda/bin") + os.pathsep + os.environ["PATH"],
+                           LCPP_BUILD_TREE=str(oracle), LCPP_BUILD_PIN=pin,
+                           LCPP_BUILD_DIR=str(root / "run"), LCPP_BUILD_CUDA=str(root / "cuda"),
+                           FIXTURE_COMPILED=str(marker))
+                result = subprocess.run(["bash", str(target)], cwd=root, env=env,
+                                        capture_output=True, text=True, timeout=10)
+                output = result.stdout + result.stderr
+                if (root / "run/log").exists():
+                    output += (root / "run/log").read_text()
+                    self.assertEqual((root / "run/rc").read_text().strip(), "2", output)
+                self.assertEqual(result.returncode, 2, output)
+                self.assertIn("cannot inspect tracked changes", output)
+                self.assertFalse(marker.exists(), output)
+
+
 class Options(unittest.TestCase):
     def test_nonroot_build_recipe_names_the_failure_before_detaching(self):
         recipe = (ROOT / "justfile").read_text().split("\nbuild-emb2-lcpp:\n", 1)[1].split("\n\n", 1)[0]

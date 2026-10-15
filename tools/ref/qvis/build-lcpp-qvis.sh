@@ -66,7 +66,8 @@ esac
 if [ -d "$TREE/.git" ] || [ -f "$TREE/.git" ]; then
   have=$(ugit rev-parse HEAD) || fail "$TREE is not a git tree"
   [ "$have" = "$PIN" ] || fail "$TREE is at $have, the pin is $PIN: move it by hand, knowing which sets came from which" 65
-  [ -z "$(ugit status --porcelain --untracked-files=no)" ] || fail "$TREE has tracked changes; the oracle is the commit's build" 65
+  dirty=$(ugit status --porcelain --untracked-files=no) || fail "cannot inspect tracked changes in $TREE"
+  [ -z "$dirty" ] || fail "$TREE has tracked changes; the oracle is the commit's build" 65
 else
   as_user git clone --shared --no-checkout "$SRC" "$TREE" || fail "clone of $SRC failed"
   ugit fetch --no-tags https://github.com/ggml-org/llama.cpp "$PIN" || fail "fetch of $PIN failed"

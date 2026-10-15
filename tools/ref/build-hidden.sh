@@ -18,7 +18,9 @@ OUT=${HIDDEN_OUT:-$BLOOMERY_DATA/bin}
 SRC=$HERE/tools/ref/hidden_ref.cpp
 IO=$HERE/tools/ref/ref_io.h
 git_lcpp() { git -c safe.directory="$LCPP" -C "$LCPP" "$@"; }
-if [ -n "$(git_lcpp status --porcelain --untracked-files=no)" ]; then
+dirty=$(git_lcpp status --porcelain --untracked-files=no) ||
+  { echo "build-hidden: cannot inspect tracked changes in $LCPP" >&2; exit 2; }
+if [ -n "$dirty" ]; then
   echo "build-hidden: $LCPP has tracked changes; the oracle is the commit's build, not an edited tree" >&2
   exit 2
 fi
