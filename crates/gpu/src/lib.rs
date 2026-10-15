@@ -172,7 +172,9 @@ pub enum GpuError {
     /// A failed service, or a later call a poisoned tier refuses, while the
     /// last release left a tier link end's card waits standing. `source`
     /// keeps the service's error kind and driver code; `detail` names the end
-    /// that could not settle its posts.
+    /// that could not settle its posts. The model's drop frees card memory,
+    /// which waits for those waits, so a caller keeps the model alive or ends
+    /// the process.
     Unsettled {
         what: &'static str,
         source: Box<GpuError>,

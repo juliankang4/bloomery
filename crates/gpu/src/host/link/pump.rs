@@ -16,17 +16,17 @@
 //! An end ([`Half`]) holds one page: it posts the crossings whose reader is
 //! the other side and delivers the crossings it reads. It reaches the other
 //! page only through its [`Wire`], which carries a post's byte ranges in order:
-//! each span the counter publishes, then for a done the tier's progress, then
-//! the generation into the inbox. The progress the host reads is the writer's
-//! dones posted, so it does not run ahead of the bytes posted with them. An
-//! end delivers only while none of its posts is in flight, so a card a
-//! delivery releases, and the line's next staged words, rewrite no range a
+//! each span the counter publishes, then the generation into the inbox. The
+//! reader's end counts a done in the tier's progress when it delivers it, so
+//! the progress the host reads never runs ahead of a done the stage card can
+//! take. An end delivers only while none of its posts is in flight, so a card
+//! a delivery releases, and the line's next staged words, rewrite no range a
 //! post made before the delivery still reads, but for the tier's fault copy
 //! in a pass of two rows (`docs/contrib/dgx-spark.md` 9.5, item 2).
 //!
-//! The inbox and two staging words per crossing (the generation and the
-//! progress a post sends) are the link's tail, past the tier page's own
-//! bytes ([`TAIL_LINE`]).
+//! The inbox and two staging words per crossing (the generation a post sends
+//! and the progress a reset sends) are the link's tail, past the tier page's
+//! own bytes ([`TAIL_LINE`]).
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -86,8 +86,9 @@ pub struct Crossing {
     /// Byte spans the writing card fills before it adds to the counter,
     /// carried to the reader's page before each generation.
     pub spans: Vec<Range<usize>>,
-    /// The progress word on the reader's page that counts this counter's
-    /// generations with every other done of the same tier; `None` for a go.
+    /// The progress word on the reader's page that the reader's end adds one
+    /// to for each generation it delivers, with every other done of the same
+    /// tier; `None` for a go.
     pub prog: Option<usize>,
 }
 
@@ -132,8 +133,6 @@ struct Line {
     tail: usize,
     /// Whether this end holds the writer's page.
     writes: bool,
-    /// The index of the counter's progress word in [`Half::progs`].
-    prog: Option<usize>,
     /// The writer's side: the last generation posted.
     posted: u32,
     /// The reader's side.
@@ -156,18 +155,9 @@ impl Line {
     }
 }
 
-/// A tier's progress as the writer posts it: the writer's progress when the
-/// count started, and the dones posted since.
-struct Prog {
-    off: usize,
-    base: u32,
-    dones: u32,
-}
-
 /// One end's relay over its own page.
 pub(super) struct Half {
     lines: Vec<Line>,
-    progs: Vec<Prog>,
     /// One post's moves, with room at load for the longest post.
     moves: Vec<Move>,
     /// The first failure by name: a step that was neither 0 nor 1, or a
@@ -207,7 +197,6 @@ impl Half {
                 "the crossing {c:?} is not 4-aligned before the link's tail at byte {tail}"
             ));
         }
-        let mut progs: Vec<Prog> = Vec::new();
         let moves = Vec::with_capacity(
             crossings
                 .iter()
@@ -220,21 +209,10 @@ impl Half {
             .enumerate()
             .map(|(i, c)| {
                 let writes = c.reader != side;
-                let prog = c.prog.filter(|_| writes).map(|off| {
-                    progs.iter().position(|p| p.off == off).unwrap_or_else(|| {
-                        progs.push(Prog {
-                            off,
-                            base: 0,
-                            dones: 0,
-                        });
-                        progs.len() - 1
-                    })
-                });
                 Line {
                     c,
                     tail: tail + i * TAIL_LINE,
                     writes,
-                    prog,
                     posted: 0,
                     relay: Relay::at(0),
                     stopped: false,
@@ -243,7 +221,6 @@ impl Half {
             .collect();
         let mut h = Half {
             lines,
-            progs,
             moves,
             broken: None,
             unsettled: false,
@@ -252,9 +229,6 @@ impl Half {
             let l = &mut h.lines[i];
             if l.writes {
                 l.posted = page.word(l.c.counter).load(Ordering::Acquire);
-                if let Some(p) = l.prog {
-                    h.progs[p].base = page.word(h.progs[p].off).load(Ordering::Acquire);
-                }
             } else {
                 l.relay = Relay::at(page.word(l.inbox()).load(Ordering::Acquire));
             }
@@ -300,9 +274,8 @@ impl Half {
     }
 
     /// The writer's side of line `i`: a generation one past the last posted
-    /// goes to the reader's inbox after the bytes it publishes and, for a
-    /// done, after the progress that counts it. The step is checked before
-    /// any byte moves.
+    /// goes to the reader's inbox after the bytes it publishes. The step is
+    /// checked before any byte moves.
     fn post(&mut self, i: usize, page: &dyn Page, wire: &mut dyn Wire) -> bool {
         let line = &self.lines[i];
         let g = page.word(line.c.counter).load(Ordering::Acquire);
@@ -327,17 +300,6 @@ impl Half {
             len: s.len(),
         }));
         page.word(line.gen_slot()).store(g, Ordering::Relaxed);
-        if let Some(p) = line.prog {
-            let p = &mut self.progs[p];
-            p.dones = p.dones.wrapping_add(1);
-            page.word(line.prog_slot())
-                .store(p.base.wrapping_add(p.dones), Ordering::Relaxed);
-            moves.push(Move {
-                from: line.prog_slot(),
-                to: p.off,
-                len: 4,
-            });
-        }
         moves.push(Move {
             from: line.gen_slot(),
             to: line.inbox(),
@@ -352,7 +314,8 @@ impl Half {
     }
 
     /// The reader's side of line `i`: one more generation in the inbox adds
-    /// one to the counter; any other step breaks the end by name.
+    /// one to the counter and, for a done, to the tier's progress; any other
+    /// step breaks the end by name.
     fn deliver(&mut self, i: usize, page: &dyn Page) -> bool {
         let line = &mut self.lines[i];
         match line
@@ -361,6 +324,9 @@ impl Half {
         {
             Ok(false) => false,
             Ok(true) => {
+                if let Some(off) = line.c.prog {
+                    page.word(off).fetch_add(1, Ordering::Release);
+                }
                 page.word(line.c.counter).fetch_add(1, Ordering::Release);
                 true
             }
@@ -448,14 +414,13 @@ impl Half {
         line.posted = g;
         page.word(line.gen_slot()).store(g, Ordering::Relaxed);
         let mut moves = Vec::with_capacity(2);
-        if let Some(p) = line.prog {
-            let p = &mut self.progs[p];
-            p.base = page.word(p.off).load(Ordering::Acquire);
-            p.dones = 0;
-            page.word(line.prog_slot()).store(p.base, Ordering::Relaxed);
+        if let Some(prog) = line.c.prog {
+            let progress = page.word(prog).load(Ordering::Acquire);
+            page.word(line.prog_slot())
+                .store(progress, Ordering::Relaxed);
             moves.push(Move {
                 from: line.prog_slot(),
-                to: p.off,
+                to: prog,
                 len: 4,
             });
         }
@@ -1237,6 +1202,65 @@ mod tests {
         );
         assert_eq!(stage.word(CNT).load(Ordering::Acquire), RELEASE);
         assert_eq!(tier.word(GO).load(Ordering::Acquire), RELEASE);
+    }
+
+    /// A wire that lands every write of a post but its last, the inbox
+    /// word's, and refuses that one.
+    struct LoseInbox(Memory<Mem>);
+
+    impl Wire for LoseInbox {
+        fn post(&mut self, moves: &[Move]) -> Result<(), String> {
+            self.0.post(&moves[..moves.len() - 1])?;
+            Err("the test wire lost a post's inbox write".into())
+        }
+
+        fn reap(&mut self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn abort(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    // The host's progress counts a done when the reader's end delivers it, the
+    // moment the stage card can take it: a done posted before its reader
+    // passes leaves the progress where it was, and a done whose inbox write
+    // is lost leaves it behind although its rows, and every other write,
+    // landed, so the host never finds the progress caught up with a done the
+    // stage card does not get.
+    #[test]
+    fn the_progress_counts_a_done_when_it_is_delivered() {
+        let stage = page(&[]);
+        let tier = page(&[]);
+        let m = link(&stage, &tier, wire(&stage, &tier), wire(&tier, &stage));
+        tier.word(ROWS).store(7, Ordering::Relaxed);
+        tier.word(CNT).store(1, Ordering::Release);
+        tier.word(PROG).store(1, Ordering::Release);
+        m.tier.pass();
+        assert_eq!(stage.word(ROWS).load(Ordering::Acquire), 7);
+        assert_eq!(stage.word(TAIL + TAIL_LINE).load(Ordering::Acquire), 1);
+        assert_eq!(stage.word(PROG).load(Ordering::Acquire), 0);
+        m.stage.pass();
+        assert_eq!(stage.word(CNT).load(Ordering::Acquire), 1);
+        assert_eq!(stage.word(PROG).load(Ordering::Acquire), 1);
+
+        let stage = page(&[]);
+        let tier = page(&[]);
+        let m = link(
+            &stage,
+            &tier,
+            wire(&stage, &tier),
+            LoseInbox(wire(&tier, &stage)),
+        );
+        tier.word(ROWS).store(7, Ordering::Relaxed);
+        tier.word(CNT).store(1, Ordering::Release);
+        tier.word(PROG).store(1, Ordering::Release);
+        m.tier.pass();
+        assert!(m.broken().is_some_and(|b| b.contains("lost")));
+        assert_eq!(stage.word(ROWS).load(Ordering::Acquire), 7);
+        assert_eq!(stage.word(TAIL + TAIL_LINE).load(Ordering::Acquire), 0);
+        assert_eq!(stage.word(PROG).load(Ordering::Acquire), 0);
     }
 
     // A done whose generation steps by two publishes nothing, not the rows it

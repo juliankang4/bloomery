@@ -654,38 +654,42 @@ the other through RDMA writes, so a node holds one end of a link between two nod
 at run time with `dlopen`, so no build links it (9.6, item 5).
 
 What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
-1. **Two pages, one a node.** Every word keeps one writer node. A message is one chain of RDMA writes on one queue
-   pair: the bytes the counter publishes, then for a done the tier's progress, then the generation into an inbox word
-   on the reader's page. The inbox and the staged values a post sends sit in a tail past the tier page's own bytes, so
-   the shared page keeps its layout.
+1. **Two pages, one a node.** Every word but the host's progress word keeps one writer node (item 2 says why that word's
+   two writers never overlap). A message is one chain of RDMA writes on one queue pair: the bytes the counter publishes,
+   then the generation into an inbox word on the reader's page. The inbox, the staged generation a post sends and the
+   staged progress a reset sends sit in a tail past the tier page's own bytes, so the shared page keeps its layout.
 2. **The counters cross as generations; the cards keep their operations.** A row's go counter is added to by the stage
    and taken back by the tier, and its done counter the other way: two writers, at different times. A mirrored absolute
    write would erase the remote take back. A captured wait also keeps its value fixed on every replay
    (`crates/gpu/src/graph.rs`, `HostFlags`), so a wait for a target that rises each replay cannot be captured. So the
-   counter is split across the two pages. On the writer's page only the writing card adds one to it, and that value is
-   a generation. The writer's end posts each new generation to the reader's inbox, after the bytes it publishes. The
-   reader's end adds one to the counter on the reader's page for each new generation in its inbox, and the reading
-   card waits for at least one and takes it back, as on the shared page. Both ends hold the step rule: a step of 0
-   carries nothing, a step of 1 carries one, and any other step publishes nothing and stops that end by name, since a
-   row has at most one go or done in flight. The host's progress word on the stage's page counts the dones the
-   writer's end posted and goes after their bytes, so it does not run ahead of them. A release stops every counter of
-   the page on both ends, every tier's in one call, and an end raises its reader's counters only once its posts are
-   over, since a released card runs on, steps the counters it writes and rewrites the spans its end's posts still
-   read. A post is over when each of its writes' completions is polled (`ibv_post_send(3)`: a buffer is reused only
-   after its work completion is retrieved), and each write is signaled to have one. Writes that fail or do not complete
-   within the bound (`DRAIN`) are flushed by taking the queue pair to its error state, which completes every write
-   still posted (the flush `rdma_disconnect(3)` describes for that transition). An end whose writes still do not
-   complete leaves its counters where they are and is broken by name: its cards keep waiting, a synchronize of their
-   streams does not return, the host's error and every later refusal name the end, and the link's drop leaks both ends
-   and their pages rather than free them under the waits. A drop stops the pumps and settles every end through the
-   same bounded drain and abort before dropping its queue pair, region and page, with or without a release. If any
+   counter is split across the two pages. On the writer's page only the writing card adds one to it, and that value is a
+   generation. The writer's end posts each new generation to the reader's inbox, after the bytes it publishes. The
+   reader's end adds one to the counter on the reader's page for each new generation in its inbox, and the reading card
+   waits for at least one and takes it back, as on the shared page. Both ends hold the step rule: a step of 0 carries
+   nothing, a step of 1 carries one, and any other step publishes nothing and stops that end by name, since a row has at
+   most one go or done in flight. The host's progress word on the stage's page counts the dones the reader's end
+   delivered, so it does not run ahead of a done the stage card can take, and a done whose generation write fails leaves
+   it behind. A counter's reset runs once both cards' streams have drained, so no done is left to deliver, and sets the
+   progress word from the tier's page through the writer's end. A release stops every counter of the page on both ends,
+   every tier's in one call, and an end raises its reader's counters only once its posts are over, since a released card
+   runs on, steps the counters it writes and rewrites the spans its end's posts still read. A post is over when each of
+   its writes' completions is polled (`ibv_post_send(3)`: a buffer is reused only after its work completion is
+   retrieved), and each write is signaled to have one. Writes that fail or do not complete within the bound (`DRAIN`)
+   are flushed by taking the queue pair to its error state, which completes every write still posted (the flush
+   `rdma_disconnect(3)` describes for that transition). An end whose writes still do not complete leaves its counters
+   where they are and is broken by name: its cards keep waiting, a synchronize of their streams does not return, the
+   host's error and every later refusal name the end, and the link's drop leaks both ends and their pages rather than
+   free them under the waits. The model's drop also frees card memory, and a free waits for the work queued before it
+   (`GpuModel`'s `Drop`), so that drop does not return either `[derived, not run]`; a caller that gets
+   `GpuError::Unsettled` keeps the model alive or ends the process. A drop stops the pumps and settles every end through
+   the same bounded drain and abort before dropping its queue pair, region and page, with or without a release. If any
    end's writes cannot be shown over, or a release left its cards waiting, every end and its page stay alive and the
    drop names why.
    Outside a release an end delivers only while none of its posts is in flight: each pass of its pump posts, reaps
    its completions, and delivers what its inboxes hold only when every write it posted has completed; a failed
    completion stops the end by name. A card rewrites a span only after it takes a counter its end delivered (the stage
    card a row's image after every tier's done of that row, a tier card the row's rows after its next go), and the pump
-   rewrites a line's staged generation and progress only at the line's next post, which follows the reader's take of
+   rewrites a line's staged generation only at the line's next post, which follows the reader's take of
    the last one. So neither rewrites a range that a write posted before the delivery may still read, a resend
    included: if a request lands and its acknowledgement is lost, the requester sends again from the first
    unacknowledged write and reads each source range again, and those ranges still hold the bytes of the first send
@@ -694,24 +698,24 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    One range is rewritten while a write may read it: the tier's fault copy, which every done of the tier posts
    (`crates/gpu/src/host/tier.rs:528`). In a pass of two rows (`crates/gpu/src/host/mod.rs:40-43`) the tier's end can
    deliver both rows' gos in one pass. The tier card then signals one row's done and, on the other row's go it already
-   holds, runs a layer whose fault copy rewrites the word (`tier.rs:1762-1779`) while that done may still be in
-   flight. The later done posts the word again, later on the same queue pair, which a resend of the earlier done sends
-   again after it, and the host reads the copy only once the stage card's stream drained (`merged_fault`), after every
-   done, so it reads the last value `[derived, not run]`. Both arguments hold while every tier of a page posts through
-   one end, so one queue pair; ends on two nodes (item 5) need them made again.
+   holds, runs a layer whose fault copy rewrites the word (`tier.rs:1762-1779`) while that done may still be in flight.
+   The later done posts the word again, later on the same queue pair, which a resend of the earlier done sends again
+   after it, and the host reads the copy only once the tier's progress counts every done (`wait_caught_up`, then
+   `merged_fault`), which the reader's end adds only after a done's generation, the last write of its post, so it reads
+   the last value `[derived, not run]`. Both arguments hold while every tier of a page posts through one end, so one
+   queue pair; ends on two nodes (item 5) need them made again.
    The host tier serves one tier card today (`refuse_tier_count`, `crates/gpu/src/host/mod.rs:150`). With two, each
    tier's copy-out copies the tier's whole buffer, the other tiers' slots included, to the row's rows
    (`crates/gpu/src/host/tier.rs:1756-1761`), so a later tier's copy overwrites the slots an earlier tier wrote, on
    any link, the shared page included. No link argument for rows that two tiers write is made here.
    When no acknowledgement is lost or resent, and an end polls the completion of the post an answer is to before the
    answer arrives, the wait delays nothing `[derived, not run]`. A lost acknowledgement whose answer arrives first
-   delays that answer until the resend completes. In a pass of two rows a row's go can be posted while the other
-   row's done is on its way, and that done then also waits for the later go's completion, about one acknowledgement
-   `[derived, not run]`. Neither is measured. Each counter's reset takes its generations as carried
-   and resumes it alone, each end resetting only its own side of it, and a link stopped by name fails the reset, so
-   the host tier stays poisoned
-   (`crates/gpu/src/host/link/pump.rs`). On the shared page nothing changes: the same words, values, card operations
-   and graphs.
+   delays that answer, and the progress word with it, until the resend completes. In a pass of two rows a row's go can
+   be posted while the other row's done is on its way, and that done then also waits for the later go's completion,
+   about one acknowledgement `[derived, not run]`. Neither is measured. Each counter's reset takes its generations as
+   carried and resumes it alone, each end resetting only its own side of it, and a link stopped by name fails the reset,
+   so the host tier stays poisoned (`crates/gpu/src/host/link/pump.rs`). On the shared page nothing changes: the same
+   words, values, card operations and graphs.
 3. **A pump thread a node.** The card cannot post to the NIC. Each end's pump load-acquires the generation (Arm needs
    an explicit acquire: the memorder row) and checks its step before any byte of the message moves. The card's
    system-scope barrier before go (`crates/gpu/src/host/mod.rs:20-24`) orders the image before the word.
