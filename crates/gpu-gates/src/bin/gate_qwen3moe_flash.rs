@@ -153,13 +153,13 @@ mod gate {
     };
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{Gpu, GpuError, window};
-    use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn, prefill_bound};
+    use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn, judge_prefill, prefill_bound};
     use bloomery_gpu_gates::prefill_gate::{HostCache, WindowCase, cache, window_refusals};
     use bloomery_gpu_gates::qwen3moe::dev::{SENTINEL_Q8_CODE, SENTINEL_Q8_SCALE};
     use bloomery_gpu_gates::qwen3moe::{f16_logical_bits, step_sets};
     use bloomery_gpu_gates::rounding::{U, gamma};
     use bloomery_gpu_gates::{
-        GateError, activations, bits_equal, checks_failed, mask_bits_in, open_split, par_map,
+        GateError, activations, bits_equal, checks_failed, mask_bits_in, open_split,
         ref_tensor_logical_in, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -849,7 +849,14 @@ mod gate {
             ctx: g.ctx,
         };
         let cu: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
-        let (band, worst) = band_rows(&rows, &cu, &hc, g, &all);
+        let (band, worst) = judge_prefill::<HEAD, PREF_TILE>(
+            &rows,
+            &cu,
+            &hc,
+            &all,
+            g.scale,
+            (g.n_kv * GROUP, g.n_kv),
+        );
         let differ = rows_alone(k, gpu, &rows, &counts, cache, g, &all)?;
         let pass = band && differ == 0;
         println!(
@@ -957,44 +964,6 @@ mod gate {
         )?;
         stream.synchronize()?;
         Ok(y.to_host_vec(stream)?)
-    }
-
-    /// Every (row, head) of `y` against its exact value: `q` holds the rows'
-    /// query heads token-major, `counts[t]` row `t`'s keys. Returns whether
-    /// every value is within its prefill bound, and the largest measured
-    /// over bound. Rows are shared among worker threads; each (row, head) is
-    /// its own f64 computation.
-    fn band_rows(
-        q: &[f32],
-        counts: &[usize],
-        cache: &HostCache,
-        g: &Geom,
-        y: &[f32],
-    ) -> (bool, f64) {
-        let n_head = g.n_kv * GROUP;
-        let parts = par_map(counts.len() * n_head, |i| {
-            let (t, h) = (i / n_head, i % n_head);
-            let n = counts[t];
-            let plane = (h / GROUP) * cache.ctx * HEAD;
-            let row = i * HEAD;
-            let ex = exact(
-                &q[row..row + HEAD],
-                &cache.kf[plane..plane + n * HEAD],
-                &cache.vf[plane..plane + n * HEAD],
-                n,
-                g.scale,
-            );
-            let (mut ok, mut worst) = (true, 0.0f64);
-            for d in 0..HEAD {
-                let e = (f64::from(y[row + d]) - ex.o[d]).abs();
-                worst = worst.max(e / ex.bound_pref[d]);
-                ok &= e <= ex.bound_pref[d];
-            }
-            (ok, worst)
-        });
-        parts
-            .iter()
-            .fold((true, 0.0f64), |(o, w), &(ok, wr)| (o && ok, w.max(wr)))
     }
 
     /// Each row of `all` (one launch of `q`'s rows at `counts`) against the
@@ -1556,7 +1525,14 @@ mod gate {
                 let y_nan = run_pref(k, gpu, &qd, &counts, (&c.kn, &c.vn), &g)?;
                 let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &y_nan));
                 let cu: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
-                let (band, worst) = band_rows(&q, &cu, &c.host, &g, &y);
+                let (band, worst) = judge_prefill::<HEAD, PREF_TILE>(
+                    &q,
+                    &cu,
+                    &c.host,
+                    &y,
+                    g.scale,
+                    (g.n_kv * GROUP, g.n_kv),
+                );
                 let differ = rows_alone(k, gpu, &q, &counts, (&c.kc, &c.vc), &g, &y)?;
                 let pass = rerun && nan_same && band && differ == 0;
                 println!(

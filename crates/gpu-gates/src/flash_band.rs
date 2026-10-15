@@ -130,3 +130,49 @@ pub fn prefill_bound(ex: &ExactAttn, vh: &[f32], head: usize, tile: usize) -> Ve
         })
         .collect()
 }
+
+/// Every value of a prefill launch's `y` against its exact value and
+/// [`prefill_bound`] at a head of `H` values and a key tile of `TILE` keys:
+/// the (row, head) units in `y`'s order over `(n_head, n_kv)`, head `h`
+/// reading key head `h / (n_head / n_kv)` of `cache` and row `t` its first
+/// `counts[t]` keys. Returns whether every value is within its bound and the
+/// largest measured over bound.
+#[cfg(feature = "gpu")]
+#[must_use]
+pub fn judge_prefill<const H: usize, const TILE: usize>(
+    q: &[f32],
+    counts: &[usize],
+    cache: &crate::prefill_gate::HostCache,
+    y: &[f32],
+    scale: f32,
+    (n_head, n_kv): (usize, usize),
+) -> (bool, f64) {
+    crate::par_map(counts.len() * n_head, |i| {
+        let n = counts[i / n_head];
+        let plane = (i % n_head / (n_head / n_kv)) * cache.ctx * H;
+        let vh = &cache.vf[plane..plane + n * H];
+        let ex = exact_attn(
+            &q[i * H..(i + 1) * H],
+            &cache.kf[plane..plane + n * H],
+            vh,
+            H,
+            n,
+            scale,
+        );
+        let bound = prefill_bound(&ex, vh, H, TILE);
+        let (mut ok, mut worst) = (true, 0.0f64);
+        for d in 0..H {
+            let e = (f64::from(y[i * H + d]) - ex.o[d]).abs();
+            ok &= e <= bound[d];
+            // A NaN output is out of band and reads as an infinite ratio.
+            worst = worst.max(if e.is_nan() {
+                f64::INFINITY
+            } else {
+                e / bound[d]
+            });
+        }
+        (ok, worst)
+    })
+    .into_iter()
+    .fold((true, 0.0f64), |(ok, w), (o, x)| (ok && o, w.max(x)))
+}

@@ -52,12 +52,10 @@ mod gate {
     use bloomery_gpu::rope_neox::{HEAD_512 as HEAD, RopeNeoxKernels};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::{Gpu, GpuError};
-    use bloomery_gpu_gates::flash_band::{exact_attn, prefill_bound};
-    use bloomery_gpu_gates::prefill_gate::{
-        HostCache, WindowCase, Windows, cache, window_refusals,
-    };
+    use bloomery_gpu_gates::flash_band::judge_prefill;
+    use bloomery_gpu_gates::prefill_gate::{WindowCase, Windows, cache, window_refusals};
     use bloomery_gpu_gates::rope_gate::{self, RopeIn, RopeOut, RopeShape};
-    use bloomery_gpu_gates::{GateError, activations, bits_equal, checks_failed, par_map, verdict};
+    use bloomery_gpu_gates::{GateError, activations, bits_equal, checks_failed, verdict};
     use cuda_core::{CudaStream, DeviceBuffer};
 
     /// The model's global attention shape.
@@ -170,52 +168,6 @@ mod gate {
             LAYER,
             |p, f| rope_run(kern, gpu.stream(), &inp, p, f, heads),
         )
-    }
-
-    // ------------------------------------------------------- the band
-
-    /// Every value of `y` against its exact value and bound, the (row, head)
-    /// units in `y`'s order over `heads = (n_head, n_kv)`, head `h` reading key
-    /// head `h / (n_head / n_kv)` and row `t` its first `counts[t]` keys.
-    /// Returns whether every value is within its bound and the largest
-    /// measured over bound.
-    fn judge(
-        q: &[f32],
-        counts: &[usize],
-        cache: &HostCache,
-        y: &[f32],
-        scale: f32,
-        (n_head, n_kv): (usize, usize),
-    ) -> (bool, f64) {
-        let per = par_map(counts.len() * n_head, |i| {
-            let (t, h) = (i / n_head, i % n_head);
-            let n = counts[t];
-            let plane = (h / (n_head / n_kv)) * cache.ctx * HEAD;
-            let vh = &cache.vf[plane..plane + n * HEAD];
-            let ex = exact_attn(
-                &q[i * HEAD..(i + 1) * HEAD],
-                &cache.kf[plane..plane + n * HEAD],
-                vh,
-                HEAD,
-                n,
-                scale,
-            );
-            let bound = prefill_bound(&ex, vh, HEAD, KEY_TILE_512);
-            let (mut ok, mut worst) = (true, 0.0f64);
-            for d in 0..HEAD {
-                let e = (f64::from(y[i * HEAD + d]) - ex.o[d]).abs();
-                // A NaN output is out of band and reads as an infinite ratio.
-                worst = worst.max(if e.is_nan() {
-                    f64::INFINITY
-                } else {
-                    e / bound[d]
-                });
-                ok &= e <= bound[d];
-            }
-            (ok, worst)
-        });
-        per.into_iter()
-            .fold((true, 0.0f64), |(ok, w), (o, x)| (ok && o, w.max(x)))
     }
 
     // --------------------------------------------------------- prefill
@@ -349,7 +301,8 @@ mod gate {
             let y2 = run_pref(kp, gpu, &q, &counts, (&c.kc, &c.vc), ctx, scale, heads)?;
             let yn = run_pref(kp, gpu, &q, &counts, (&c.kn, &c.vn), ctx, scale, heads)?;
             let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
-            let (band, worst) = judge(&q, &cu, &c.host, &y, scale, heads);
+            let (band, worst) =
+                judge_prefill::<HEAD, KEY_TILE_512>(&q, &cu, &c.host, &y, scale, heads);
             let mut differ = 0usize;
             for (r, &n) in counts.iter().enumerate() {
                 let one = run_pref(
