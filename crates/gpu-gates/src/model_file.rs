@@ -293,16 +293,16 @@ mod tests {
             (Some(Value::String(String::new())), Ok(Some(""))),
             (
                 Some(Value::U32(1)),
-                Err("qwen35.decision.type: expected a string"),
+                Err("fixture.decision.type: expected a string"),
             ),
         ];
         for (index, (marker, expected)) in cases.into_iter().enumerate() {
             let mut keys = vec![(
                 gguf::GENERAL_ARCHITECTURE.to_owned(),
-                Value::String("qwen35".into()),
+                Value::String("fixture".into()),
             )];
             if let Some(marker) = marker {
-                keys.push(("qwen35.decision.type".into(), marker));
+                keys.push(("fixture.decision.type".into(), marker));
             }
             let path = std::env::temp_dir().join(format!(
                 "bloomery-decision-header-{}-{index}.gguf",
