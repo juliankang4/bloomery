@@ -1,4 +1,4 @@
-//! The sets `tools/ref/emb2/emb2.sh` writes ([`Emb2Set`]): `dump_emb2`'s text
+//! The EmbeddingGemma v1 and v2 sets `tools/ref/emb2/emb2.sh` writes ([`Emb2Set`]): `dump_emb2`'s text
 //! and tower dumps and their CPU twins, and `server_vectors.py`'s llama-server
 //! vectors. A family of these sets has [`Identity::Emb2`], which carries the
 //! [`Kind`] of set and the [`Profile`] (the files every set is dumped from and
@@ -6,7 +6,7 @@
 
 use crate::RefError;
 use crate::clefvis::one;
-use crate::family::{Family, Identity};
+use crate::family::{Build, Family, Identity};
 use crate::ik::RefManifest;
 use std::path::Path;
 
@@ -49,10 +49,8 @@ pub struct Profile {
     pub model: &'static str,
     /// The sha256 of [`Profile::model`].
     pub model_sha256: &'static str,
-    /// The projector file of the tower and server sets.
-    pub mmproj: &'static str,
-    /// The sha256 of [`Profile::mmproj`].
-    pub mmproj_sha256: &'static str,
+    /// The optional projector path and SHA256 for tower and multimodal server sets.
+    pub mmproj: Option<(&'static str, &'static str)>,
 }
 
 /// A set that passed its family's check.
@@ -144,7 +142,10 @@ impl Emb2Set {
                 profile.model_sha256,
             ));
         }
-        if kind != Kind::Text && kind != Kind::TextCpu {
+        if kind != Kind::Text
+            && kind != Kind::TextCpu
+            && let Some((want_path, want_digest)) = profile.mmproj
+        {
             let mm = one(&man, "mmproj")?;
             let [path, "sha256", digest] = mm[..] else {
                 return Err(RefError::malformed(
@@ -152,14 +153,8 @@ impl Emb2Set {
                     format!("{mm:?}: want <path>\tsha256\t<digest>"),
                 ));
             };
-            if path != profile.mmproj || digest != profile.mmproj_sha256 {
-                return Err(stale(
-                    "mmproj",
-                    path,
-                    digest,
-                    profile.mmproj,
-                    profile.mmproj_sha256,
-                ));
+            if path != want_path || digest != want_digest {
+                return Err(stale("mmproj", path, digest, want_path, want_digest));
             }
         }
         if matches!(kind, Kind::Tower | Kind::TowerCpu)
@@ -176,3 +171,35 @@ impl Emb2Set {
         Ok(Emb2Set { man })
     }
 }
+
+/// The mainline commit shared by the EmbeddingGemma oracle families.
+// PIN(2026-10-14): 6868a52cb337450658006ad2f9281c2eb63f1666, a pinned master
+// commit that contains the no-cache attention pad, the pooled-embedding
+// LM-head skip and the t_embd expand removal on this model's path.
+pub const LCPP_BUILD: &str = "6868a52cb";
+
+pub(crate) const fn family(
+    name: &'static str,
+    sets: &'static [&'static str],
+    kind: Kind,
+    profile: &'static Profile,
+    arch: &'static str,
+    runs: fn() -> Result<String, RefError>,
+    recipe: &'static str,
+) -> Family {
+    Family {
+        name,
+        sets,
+        resolve: None,
+        recipe,
+        identity: Identity::Emb2(kind, profile),
+        arch: Some(arch),
+        build: Some(Build::Is(LCPP_BUILD)),
+        runs: Some(runs),
+        draft_runs: None,
+        consumers: &[],
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

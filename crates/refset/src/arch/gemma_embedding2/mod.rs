@@ -1,5 +1,5 @@
 //! EmbeddingGemma 2 (`gemma-embedding2`, its image tower `gemma4v`). Every set
-//! is llama.cpp mainline's, dumped by the tree [`LCPP_BUILD`]
+//! is llama.cpp mainline's, dumped by the tree [`crate::emb2::LCPP_BUILD`]
 //! (`tools/ref/emb2/emb2.sh`, `just dump-ref-emb2`) from the Q8_0 file
 //! [`MODEL`] and the bf16 projector [`MMPROJ_BF16`]:
 //!
@@ -21,8 +21,8 @@
 //! `# build`), then the kind of set, the device and the files' sha256.
 
 use crate::RefError;
-use crate::emb2::{Kind, Profile};
-use crate::family::{Build, Family, Identity};
+use crate::emb2::{Kind, Profile, family};
+use crate::family::Family;
 
 /// The text file every set is dumped from: `ggml-org/embeddinggemma-2-GGUF`'s
 /// Q8_0 at revision bfcd2987 (309,855,456 bytes).
@@ -44,12 +44,6 @@ pub const MMPROJ_BF16: &str = "/models/embeddinggemma-2/mmproj-embeddinggemma-2-
 pub const MMPROJ_BF16_SHA256: &str =
     "d2033b3cd0223cfb2e7a2b50dc80a664c78c816d375f5b017ec3ef80ee0bc766";
 
-/// The mainline commit every set names in its `# build` line.
-// PIN(2026-10-14): 6868a52cb337450658006ad2f9281c2eb63f1666, a pinned master
-// commit that contains the no-cache attention pad, the pooled-embedding
-// LM-head skip and the t_embd expand removal on this model's path.
-pub const LCPP_BUILD: &str = "6868a52cb";
-
 /// The architecture the text and server sets name in their `# arch` line.
 pub const ARCH: &str = "gemma-embedding2";
 
@@ -70,8 +64,7 @@ const RECIPE: &str = "just dump-ref-emb2";
 pub static PROFILE: Profile = Profile {
     model: MODEL,
     model_sha256: MODEL_SHA256,
-    mmproj: MMPROJ_BF16,
-    mmproj_sha256: MMPROJ_BF16_SHA256,
+    mmproj: Some((MMPROJ_BF16, MMPROJ_BF16_SHA256)),
 };
 
 /// [`MODEL`], as a text or server family's `runs`.
@@ -84,66 +77,55 @@ fn mmproj() -> Result<String, RefError> {
     Ok(MMPROJ_BF16.to_string())
 }
 
-const fn family(
-    name: &'static str,
-    sets: &'static [&'static str],
-    kind: Kind,
-    arch: &'static str,
-    runs: fn() -> Result<String, RefError>,
-) -> Family {
-    Family {
-        name,
-        sets,
-        resolve: None,
-        recipe: RECIPE,
-        identity: Identity::Emb2(kind, &PROFILE),
-        arch: Some(arch),
-        build: Some(Build::Is(LCPP_BUILD)),
-        runs: Some(runs),
-        draft_runs: None,
-        consumers: &[],
-    }
-}
-
 /// The text cases' token rows, pooled vectors and layer taps on the card.
 pub static TEXT: Family = family(
     "text-gemma-embedding2",
     &[TEXT_SET],
     Kind::Text,
+    &PROFILE,
     ARCH,
     model,
+    RECIPE,
 );
 /// The same, with no card in view.
 pub static TEXT_CPU: Family = family(
     "text-gemma-embedding2-cpu",
     &[TEXT_CPU_SET],
     Kind::TextCpu,
+    &PROFILE,
     ARCH,
     model,
+    RECIPE,
 );
 /// The image cases' tower taps and rows on the card.
 pub static TOWER: Family = family(
     "tower-gemma4v",
     &[TOWER_SET],
     Kind::Tower,
+    &PROFILE,
     crate::clefvis::TOWER_ARCH,
     mmproj,
+    RECIPE,
 );
 /// The same, with no card in view.
 pub static TOWER_CPU: Family = family(
     "tower-gemma4v-cpu",
     &[TOWER_CPU_SET],
     Kind::TowerCpu,
+    &PROFILE,
     crate::clefvis::TOWER_ARCH,
     mmproj,
+    RECIPE,
 );
 /// llama-server's `/v1/embeddings` vectors.
 pub static SERVER: Family = family(
     "server-gemma-embedding2",
     &[SERVER_SET],
     Kind::Server,
+    &PROFILE,
     ARCH,
     model,
+    RECIPE,
 );
 
 /// The architecture's families, in the order `refset-check` lists them.
