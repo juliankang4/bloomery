@@ -9,9 +9,11 @@
 //! and [`table`] (the tensor table and the check of a file against it). The tower's bytes on its
 //! card take one shape ([`card::CardBytes`]), and the narrowing of a tensor to bf16 on upload one
 //! rule ([`narrow`]). [`open`] picks the module by projector type.
+//! [`gemma4a`] owns the host preprocessing of decoded audio; it opens no encoder file.
 
 pub mod card;
 pub mod deepseek41v;
+pub mod gemma4a;
 pub mod glm5v;
 pub(crate) mod header;
 pub mod minicpmv;

@@ -15,14 +15,17 @@
 //!   (`clip`). [`TOWER_CPU`] is its CPU twin.
 //! - [`SERVER`]: llama-server's `/v1/embeddings` vectors of every text case and
 //!   image, normalized and raw (`tools/ref/emb2/server_vectors.py`).
+//! - [`AUDIO_MEL`]: the pinned host preprocessor's mel from synthetic decoded
+//!   mono PCM (`tools/ref/emb2/mel.sh`), with no model or device opened.
 //!
-//! Each family opens its sets through [`crate::emb2::Emb2Set`] with
-//! [`PROFILE`]: the node dumps' checks (the trailer, `# model`, `# arch`,
-//! `# build`), then the kind of set, the device and the files' sha256.
+//! The text, tower and server families open through [`crate::emb2::Emb2Set`]
+//! with [`PROFILE`]: the node dumps' identity, then the kind, device and file
+//! digests. [`AUDIO_MEL`] uses [`crate::ik::RefManifest`] with its synthetic
+//! PCM identity, architecture, mainline build and completion trailer.
 
 use crate::RefError;
 use crate::emb2::{Kind, Profile, family};
-use crate::family::Family;
+use crate::family::{Build, Family, Identity};
 
 /// The text file every set is dumped from: `ggml-org/embeddinggemma-2-GGUF`'s
 /// Q8_0 at revision bfcd2987 (309,855,456 bytes).
@@ -158,8 +161,30 @@ pub static SERVER: Family = Family {
     )
 };
 
+/// The host audio preprocessing set, from synthetic decoded mono PCM.
+pub const AUDIO_MEL_SET: &str = "ref_gemma_embedding2_mel";
+pub const AUDIO_PCM: &str = "synthetic-gemma4a-pcm";
+
+fn audio_pcm() -> Result<String, RefError> {
+    Ok(AUDIO_PCM.to_string())
+}
+
+/// The pinned mainline host preprocessor, without a model or a device.
+pub static AUDIO_MEL: Family = Family {
+    name: "mel-gemma4a",
+    sets: &[AUDIO_MEL_SET],
+    resolve: None,
+    recipe: "just dump-ref-emb2-mel",
+    identity: Identity::Manifest,
+    arch: Some("gemma4a"),
+    build: Some(Build::Is(crate::emb2::LCPP_BUILD)),
+    runs: Some(audio_pcm),
+    draft_runs: None,
+    consumers: &["gate-emb2-mel"],
+};
+
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&TEXT, &TEXT_CPU, &TOWER, &TOWER_CPU, &SERVER];
+pub static FAMILIES: &[&Family] = &[&TEXT, &TEXT_CPU, &TOWER, &TOWER_CPU, &SERVER, &AUDIO_MEL];
 
 #[cfg(test)]
 mod tests;

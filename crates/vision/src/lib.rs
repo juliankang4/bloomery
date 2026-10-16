@@ -40,6 +40,9 @@ pub use preprocess::{GridPlan, PatchLayout, Patches, patchify};
 /// Everything this crate refuses, each naming what it refused.
 #[derive(Debug, thiserror::Error)]
 pub enum VisionError {
+    /// Decoded audio this preprocessor cannot turn into finite mel rows.
+    #[error("audio input: {0}")]
+    Audio(String),
     /// The image bytes did not decode.
     #[error("image decode: {0}")]
     Decode(String),

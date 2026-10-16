@@ -788,6 +788,14 @@ build-embedding-ref MODEL:
 # EmbeddingGemma 2, the oracle sets (tools/ref/emb2/emb2.sh; refset families in crates/refset/src/arch/gemma_embedding2) into $BLOOMERY_DATA: every text case's token rows, pooled vector and layer taps (ref_gemma_embedding2_text), the image cases' tower taps and rows (ref_gemma_embedding2_tower), llama-server's /v1/embeddings vectors of both (ref_gemma_embedding2_server), and the CPU twins of the first two (.cpu). The text cases and their ids are the tokenizer oracle's gemma4 set: `just dump-ref-tokenizer gemma4` first. STEPS names some of text, tower, server, text.cpu and tower.cpu (none: all five). The card steps go through the card's gate lock (EMB2_BOUND is the call's and each step's bound); no lease.
 dump-ref-emb2 *STEPS: (dump-ref-embedding "gemma-embedding2" STEPS)
 
+# Gemma4a host mel from synthetic decoded PCM, using the existing pinned mainline tree.
+dump-ref-emb2-mel:
+    ./tools/box.sh 'bash tools/ref/emb2/mel.sh'
+
+# Host-only audio preprocessing: mel bits, chunk boundaries and tower token counts.
+gate-emb2-mel:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-vision --lib --test gemma4a -- --include-ignored --nocapture'
+
 # EmbeddingGemma v1: text, server and text.cpu sets; no image tower.
 dump-ref-emb1 *STEPS: (dump-ref-embedding "gemma-embedding" STEPS)
 

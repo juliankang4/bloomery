@@ -7,6 +7,28 @@ use crate::emb2::tests::{check, header, remove, set_dir};
 use crate::emb2::{Kind, LCPP_BUILD};
 use crate::family::Family;
 
+#[test]
+fn audio_mel_requires_its_pcm_identity_architecture_build_and_trailer() -> Result<(), RefError> {
+    use super::{AUDIO_MEL, AUDIO_PCM};
+    let dir = set_dir("mel")?;
+    let own = vec![
+        ("model".into(), AUDIO_PCM.into()),
+        ("arch".into(), "gemma4a".into()),
+        ("build".into(), LCPP_BUILD.into()),
+    ];
+    assert_eq!(check(&dir, &AUDIO_MEL, &own, true)?, AUDIO_PCM);
+    for (i, value) in [(0, MODEL), (1, ARCH), (2, "other-build")] {
+        let mut other = own.clone();
+        other[i].1 = value.into();
+        assert!(check(&dir, &AUDIO_MEL, &other, true).is_err());
+    }
+    assert!(matches!(
+        check(&dir, &AUDIO_MEL, &own, false),
+        Err(RefError::Unfinished { .. })
+    ));
+    remove(&dir)
+}
+
 const Q8_MMPROJ: &str = "/models/embeddinggemma-2/mmproj-embeddinggemma-2-Q8_0.gguf";
 const Q8_MMPROJ_SHA256: &str = "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f";
 
