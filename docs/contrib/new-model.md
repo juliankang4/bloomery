@@ -81,12 +81,16 @@ count. A float array with a scalar fallback (GLM's clamps) stays the family's ow
 
 ### 2. Tokenizer and template
 
-`tokenizer.ggml.model` must be `gpt2` (GPT-2 byte-level BPE) or `gemma4` (BPE over metaspace text) (`vocab.rs:117`). For
-`gpt2`, `tokenizer.ggml.pre` must be one of the pre-tokenizers the tokenizer runs (`pretok.rs:350`: `deepseek-v3`,
-`qwen2`, `glm4`, `qwen35`, `pixtral`, `gemma4` and two aliases); a `gemma4` model always runs `gemma4`, as the reference
-does, whatever the file names. `coverage` asks `runs_pre_tokenizer` (`crates/tokenizer/src/lib.rs:56`) at every plan, so
-an unknown one is a named refusal, not a wrong id. `ignore_merges` is a property of the pre (`Pre::ignore_merges`,
-`pretok.rs:363`): `pixtral` takes a word whose byte-encoded text is itself a vocabulary token, and the others merge.
+`tokenizer.ggml.model` may be `gpt2` (GPT-2 byte-level BPE), `gemma4` (BPE over metaspace text), or `llama`
+(SentencePiece). The shared loader is `crates/tokenizer/src/vocab.rs`. For `gpt2`, `tokenizer.ggml.pre` must be one
+of the pre-tokenizers in `pretok.rs`: `deepseek-v3`, `qwen2`, `glm4`, `qwen35`, `pixtral`, `gemma4` and two aliases.
+A `gemma4` model always runs `gemma4`; SentencePiece uses no regex pre-tokenizer and reports `default`.
+Model `coverage` asks `runs_pre_tokenizer`: BPE specs use the pre-tokenizer's name, and a SentencePiece spec
+uses `llama`, its tokenizer model. `default` alone does not identify a supported BPE pre-tokenizer.
+`ignore_merges` is a property of the pre (`Pre::ignore_merges`): `pixtral` takes a word whose byte-encoded text is
+itself a vocabulary token. SentencePiece instead merges the highest `tokenizer.ggml.scores` first, with the
+leftmost pair winning ties. Its `add_space_prefix` flag defaults to true and follows the header when present.
+Both metaspace paths share whitespace spelling, byte fallback validation, special-token partition and decoding.
 MiMo needed no new tokenizer code: its spec reads `qwen2`,
 `ToolFormat::QwenXml` and the `<think>` span (`crates/model/src/arch/mimo2/spec.rs:25,31`). A new tool-call syntax is a
 new `ToolFormat` variant (`models/lib.rs:602`) with its parser in `crates/serve/src/`, tested with the mock engine.

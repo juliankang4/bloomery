@@ -1458,7 +1458,8 @@ gate-engram:
 # Qwen3.8-Flash-Next (qwen35) and Nemotron 3 Nano 4B (pixtral). It only reads the sets: each opens through its refset family
 # (crates/refset/src/arch/tokenizer.rs), which refuses by name a set written by another executable or library, from
 # another vocabulary file or other cases, with a text that is not the one dumped, or never finished.
-# `just dump-ref-tokenizer` writes them.
+# `just dump-ref-tokenizer` writes them. EmbeddingGemma v1's llama SentencePiece cases also compare with
+# BOS/EOS, in both parse modes, against the pinned mainline set and its extra cases.
 gate-tokenizer:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
 # The tokenizer oracle's sets, once per change of the reference trees, the vocabulary files, cases.txt or the
@@ -1471,8 +1472,9 @@ gate-tokenizer:
 # ik#2528) and Qwen3-MoE, GLM-5.3-Flash and Qwen3.8 use /home/user/ik-tokref (the ik-idxkey commit plus the
 # unicode_tolower fix, ik#2520). Nemotron uses /home/user/llama.cpp-mainline: ik-tokref has no nemotron_h
 # architecture, so it refuses the file, and that mainline binary loads it.
-dump-ref-tokenizer VOCAB='all':
-    ./tools/box.sh 'timeout --kill-after=10 900 bash crates/tokenizer/tools/oracle.sh {{VOCAB}}'
+# Pass --cases-only to dump the fixed texts without the large corpus snapshots.
+dump-ref-tokenizer VOCAB='all' *ARGS:
+    ./tools/box.sh 'timeout --kill-after=10 900 bash crates/tokenizer/tools/oracle.sh {{VOCAB}} {{ARGS}}'
 # Clef's request encoder, joint schema head and SystemOne answer (crates/decision, host only) against the
 # release's own Python (tools/ref/clef_ref.py's files under $BLOOMERY_DATA/clef/flash/ref): ids and spans
 # exact, f32 logits inside the derived band of the f64 referee, the body's shape and top options.

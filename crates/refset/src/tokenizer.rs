@@ -114,6 +114,8 @@ pub struct TokenizerSet {
     pub text_tree: Option<String>,
     /// `# cases`: the cases file the case texts came from and its md5.
     pub cases: Option<(String, String)>,
+    /// `# extra cases`: the vocabulary's additional case texts and their md5.
+    pub extra_cases: Option<(String, String)>,
     /// One row a text, in the manifest's order.
     pub texts: Vec<Text>,
     /// Whether the `# complete` trailer is there.
@@ -159,6 +161,7 @@ impl TokenizerSet {
             vocabulary: None,
             text_tree: None,
             cases: None,
+            extra_cases: None,
             texts: Vec::new(),
             complete: false,
         };
@@ -179,6 +182,7 @@ impl TokenizerSet {
                 "# tokenizer" => set.binary = Some(path_and_md5(&f, &at)?),
                 "# libllama" => set.library = Some(path_and_md5(&f, &at)?),
                 "# cases" => set.cases = Some(path_and_md5(&f, &at)?),
+                "# extra cases" => set.extra_cases = Some(path_and_md5(&f, &at)?),
                 "# vocabulary" => set.vocabulary = Some(one_value(&f, &at)?),
                 "# text tree" => set.text_tree = Some(one_value(&f, &at)?),
                 "# complete" => set.complete = true,
@@ -245,22 +249,25 @@ impl TokenizerSet {
         Ok(())
     }
 
-    /// The case texts' source, the hand-picked cases file the tree holds
-    /// (`cases`, its bytes), against the md5 the set names: a set dumped from
-    /// other cases is [`RefError::Stale`].
-    pub fn check_cases(&self, cases: &[u8]) -> Result<(), RefError> {
-        let md5 = hex_of(cases);
-        match &self.cases {
-            Some((_, stated)) if *stated == md5 => Ok(()),
-            stated => Err(RefError::Stale {
-                set: self.dir.display().to_string(),
-                dumped_from: stated.as_ref().map_or_else(
-                    || "an unstated cases file (the set has no # cases line)".to_string(),
-                    |(path, md5)| format!("{path} md5 {md5}"),
-                ),
-                runs: format!("the cases file the tree holds, md5 {md5}"),
-            }),
+    /// Hold the shared cases and, when supplied, the vocabulary's extra cases
+    /// to the source files' digests. Other or unstated cases are [`RefError::Stale`].
+    pub fn check_cases(&self, cases: &[u8], extra: Option<&[u8]>) -> Result<(), RefError> {
+        for (name, bytes, stated) in std::iter::once(("cases", cases, &self.cases))
+            .chain(extra.map(|bytes| ("extra cases", bytes, &self.extra_cases)))
+        {
+            let md5 = hex_of(bytes);
+            if !matches!(stated, Some((_, digest)) if *digest == md5) {
+                return Err(RefError::Stale {
+                    set: self.dir.display().to_string(),
+                    dumped_from: stated.as_ref().map_or_else(
+                        || format!("an unstated cases file (the set has no # {name} line)"),
+                        |(path, md5)| format!("{path} md5 {md5}"),
+                    ),
+                    runs: format!("the {name} file the tree holds, md5 {md5}"),
+                });
+            }
         }
+        Ok(())
     }
 
     /// The corpus texts, not the cases.

@@ -1,7 +1,7 @@
 //! Ids back to text, `llama_token_to_piece` semantics.
 
 use crate::Tokenizer;
-use crate::bpe::Spelling;
+use crate::spelling::Spelling;
 use crate::unicode::{byte_to_cpt_table, decode_lenient, encode_cpt};
 use crate::vocab::attr;
 

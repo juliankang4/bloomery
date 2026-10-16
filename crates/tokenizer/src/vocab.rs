@@ -119,12 +119,17 @@ pub(crate) enum Model {
     Gpt2,
     /// `gemma4`: BPE over metaspace text, always the `gemma4` pre-tokenizer.
     Gemma4,
+    /// `llama`: SentencePiece merges ordered by token score.
+    Spm,
 }
 
 impl Model {
     /// The names this crate runs, as `tokenizer.ggml.model` spells them.
-    pub(crate) const NAMES: [(&'static str, Model); 2] =
-        [("gpt2", Model::Gpt2), ("gemma4", Model::Gemma4)];
+    pub(crate) const NAMES: [(&'static str, Model); 3] = [
+        ("gpt2", Model::Gpt2),
+        ("gemma4", Model::Gemma4),
+        ("llama", Model::Spm),
+    ];
 }
 
 /// Special token ids; `None` is the reference's `LLAMA_TOKEN_NULL`.
@@ -146,14 +151,23 @@ pub struct Specials {
     pub fim_sep: Option<u32>,
 }
 
+/// The model's encoding tables, separate from the shared vocabulary.
+pub(crate) enum Encoding {
+    Bpe {
+        pre: Pre,
+        merges: Vec<String>,
+    },
+    Spm {
+        scores: Vec<f32>,
+        add_space_prefix: bool,
+    },
+}
+
 pub(crate) struct Vocab {
     pub(crate) texts: Vec<String>,
     pub(crate) attrs: Vec<u32>,
     pub(crate) token_to_id: HashMap<String, u32>,
-    pub(crate) merges: Vec<String>,
     pub(crate) pre: String,
-    /// The pre-tokenizer `pre` names.
-    pub(crate) pretok: Pre,
     pub(crate) specials: Specials,
     pub(crate) add_bos: bool,
     pub(crate) add_eos: bool,
@@ -223,6 +237,39 @@ impl<'a> Meta<'a> {
         }
     }
 
+    fn scores(&mut self, n_tokens: usize) -> Result<Vec<f32>, Error> {
+        const KEY: &str = "tokenizer.ggml.scores";
+        let mut scores = match self.get(KEY) {
+            None => return Ok(vec![0.0; n_tokens]),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|v| match *v {
+                    Value::F32(x) => Ok(x),
+                    Value::I32(x) => Ok(x as f32),
+                    _ => Err(Error::WrongType(KEY)),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err(Error::WrongType(KEY)),
+        };
+        if scores.len() < n_tokens {
+            return Err(Error::TokenScoresShort {
+                scores: scores.len(),
+                tokens: n_tokens,
+            });
+        }
+        scores.truncate(n_tokens);
+        for (id, score) in scores.iter_mut().enumerate() {
+            if !score.is_finite() {
+                return Err(Error::InvalidTokenScore { id, score: *score });
+            }
+            // The reference compares signed zeros as equal priorities.
+            if *score == 0.0 {
+                *score = 0.0;
+            }
+        }
+        Ok(scores)
+    }
+
     fn id(&mut self, key: &'static str) -> Result<Option<u64>, Error> {
         match self.get(key) {
             None => Ok(None),
@@ -239,7 +286,7 @@ impl<'a> Meta<'a> {
 }
 
 impl Vocab {
-    pub(crate) fn load(path: &Path) -> Result<Vocab, Error> {
+    pub(crate) fn load(path: &Path) -> Result<(Vocab, Encoding), Error> {
         let inv =
             gguf::inventory_of(path).map_err(|e| Error::Gguf(path.display().to_string(), e))?;
         let mut m = Meta {
@@ -252,24 +299,6 @@ impl Vocab {
             .ok_or(Error::Missing("tokenizer.ggml.model"))?;
         let model = crate::named(&Model::NAMES, model)
             .ok_or_else(|| Error::UnsupportedModel(model.to_string()))?;
-        // The reference's per-name flags that reach `encode` and `piece` are
-        // the pre-tokenizer's: its spelling (`Pre::spelling`), whether a word
-        // that is itself a token is taken whole (`Pre::ignore_merges`), and
-        // no BOS unless the file asks for it, except that `gemma4` always
-        // adds one. (`glm4` keeps the reference's `clean_spaces`, which only
-        // its `llama_detokenize` reads; `llama_token_to_piece`, what this
-        // crate mirrors, does not.) A gemma4 model names its pre-tokenizer
-        // itself and ignores the file's.
-        let pre = match model {
-            Model::Gpt2 => m.str("tokenizer.ggml.pre")?.unwrap_or(""),
-            Model::Gemma4 => "gemma4",
-        };
-        let Some(pretok) = crate::named(&Pre::NAMES, pre) else {
-            return Err(Error::UnsupportedPre(pre.to_string()));
-        };
-        let merges = m
-            .strings("tokenizer.ggml.merges")?
-            .ok_or(Error::Missing("tokenizer.ggml.merges"))?;
         let mut texts = m
             .strings("tokenizer.ggml.tokens")?
             .ok_or(Error::Missing("tokenizer.ggml.tokens"))?;
@@ -297,15 +326,44 @@ impl Vocab {
             attrs.push(types.as_ref().map_or(attr::NORMAL, |t| attr_of_type(t[i])));
         }
 
+        let (pre, encoding) = match model {
+            Model::Gpt2 | Model::Gemma4 => {
+                let name = match model {
+                    Model::Gemma4 => "gemma4",
+                    _ => m.str("tokenizer.ggml.pre")?.unwrap_or(""),
+                };
+                let pre = crate::named(&Pre::NAMES, name)
+                    .ok_or_else(|| Error::UnsupportedPre(name.to_string()))?;
+                let merges = m
+                    .strings("tokenizer.ggml.merges")?
+                    .ok_or(Error::Missing("tokenizer.ggml.merges"))?;
+                (name.to_string(), Encoding::Bpe { pre, merges })
+            }
+            Model::Spm => (
+                "default".to_string(),
+                Encoding::Spm {
+                    scores: m.scores(n)?,
+                    add_space_prefix: m.flag("tokenizer.ggml.add_space_prefix")?.unwrap_or(true),
+                },
+            ),
+        };
+
         // The model's defaults, with the reference's per-name override (`glm4`
         // names no BOS), then the file's ids where in range.
         let mut sp = match model {
             Model::Gpt2 => Specials {
-                bos: (pretok != Pre::Glm4 && n > 11).then_some(11),
+                bos: (n > 11 && !matches!(encoding, Encoding::Bpe { pre: Pre::Glm4, .. }))
+                    .then_some(11),
                 eos: (n > 11).then_some(11),
                 ..Specials::default()
             },
             Model::Gemma4 => Specials::default(),
+            Model::Spm => Specials {
+                bos: (n > 1).then_some(1),
+                eos: (n > 2).then_some(2),
+                unk: (n > 0).then_some(0),
+                ..Specials::default()
+            },
         };
         {
             type Slot = fn(&mut Specials) -> &mut Option<u32>;
@@ -328,6 +386,7 @@ impl Vocab {
                 ("tokenizer.ggml.suffix_token_id", |s| &mut s.fim_suf),
                 ("tokenizer.ggml.middle_token_id", |s| &mut s.fim_mid),
             ];
+            // An id outside the vocabulary keeps the default, as llama-vocab does.
             for (key, slot) in slots {
                 if let Some(id) = m.id(key)?
                     && let Ok(id) = u32::try_from(id)
@@ -337,8 +396,16 @@ impl Vocab {
                 }
             }
         }
-        let add_bos =
-            m.flag("tokenizer.ggml.add_bos_token")?.unwrap_or(false) || pretok == Pre::Gemma4;
+        let add_bos = m
+            .flag("tokenizer.ggml.add_bos_token")?
+            .unwrap_or(matches!(model, Model::Spm))
+            || matches!(
+                encoding,
+                Encoding::Bpe {
+                    pre: Pre::Gemma4,
+                    ..
+                }
+            );
         let add_eos = m.flag("tokenizer.ggml.add_eos_token")?.unwrap_or(false);
         // The reference asserts a BOS id wherever it adds a BOS, and an EOS
         // id wherever it adds an EOS.
@@ -353,9 +420,7 @@ impl Vocab {
             texts,
             attrs,
             token_to_id,
-            merges,
-            pre: pre.to_string(),
-            pretok,
+            pre,
             specials: sp,
             add_bos,
             add_eos,
@@ -364,7 +429,7 @@ impl Vocab {
             keys_read: std::mem::take(&mut m.read),
         };
         v.apply_overrides();
-        Ok(v)
+        Ok((v, encoding))
     }
 
     fn id_of(&self, text: &str) -> Option<u32> {

@@ -1,20 +1,21 @@
-//! Text to token ids and back for the BPE vocabularies this engine runs
-//! (GPT-2 byte-level, and gemma4's metaspace), bit-identical to the
-//! reference's `llama_tokenize` and `llama_token_to_piece`.
+//! Text to token ids and back for GPT-2 byte-level BPE, gemma4's metaspace
+//! BPE and llama SentencePiece vocabularies, following `llama_tokenize` and
+//! `llama_token_to_piece`.
 //!
-//! The vocabulary comes from the GGUF header (`tokenizer.ggml.*`). Encoding
-//! is the reference's pipeline: special tokens are cut out of the text as
-//! whole pieces first (longest text first), each remaining fragment is
-//! respelled for a metaspace vocabulary (each space becomes U+2581) and split
-//! by the pre-tokenizer ([`pretok`]), and each word is merged by BPE rank
-//! ([`bpe`]), unless the word is itself a token the pre-tokenizer takes
-//! whole. Decoding concatenates pieces as `llama_token_to_piece` renders
-//! them; neither spelling adds a space prefix, so decoding strips nothing.
+//! The GGUF header supplies the vocabulary, special tokens and encoding
+//! tables. Special tokens are partitioned first. BPE fragments pass through
+//! the vocabulary's pre-tokenizer; SentencePiece merges a whole fragment by
+//! token score. Both metaspace encoders spell U+0020 as U+2581. Decoding
+//! concatenates token pieces without stripping a SentencePiece space prefix.
 
 mod bpe;
 mod collapse_table;
 mod decode;
+mod encoder;
+mod merge;
 mod pretok;
+mod spelling;
+mod spm;
 mod unicode;
 mod vocab;
 
@@ -25,7 +26,7 @@ use memchr::memmem::Finder;
 pub use decode::Decoder;
 pub use vocab::{Specials, attr};
 
-use vocab::Vocab;
+use vocab::{Model, Vocab};
 
 /// Why a vocabulary could not be loaded.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +43,10 @@ pub enum Error {
     UnsupportedPre(String),
     #[error("tokenizer.ggml.token_type has {types} entries for {tokens} tokens")]
     TokenTypesShort { types: usize, tokens: usize },
+    #[error("tokenizer.ggml.scores has {scores} entries for {tokens} tokens")]
+    TokenScoresShort { scores: usize, tokens: usize },
+    #[error("tokenizer.ggml.scores[{id}] is not finite: {score}")]
+    InvalidTokenScore { id: usize, score: f32 },
     #[error("a vocabulary of {0} tokens does not fit u32 ids")]
     TooManyTokens(usize),
     #[error("token text {0:?} appears twice in the vocabulary")]
@@ -50,11 +55,12 @@ pub enum Error {
     MissingByteToken(u8),
 }
 
-/// Whether this crate runs the pre-tokenizer `tokenizer.ggml.pre` names
-/// `name`.
+/// Whether this crate runs the spec's tokenizer name: a BPE pre-tokenizer,
+/// or `llama` for SentencePiece, which has no regex pre-tokenizer.
 #[must_use]
 pub fn runs_pre_tokenizer(name: &str) -> bool {
     named(&pretok::Pre::NAMES, name).is_some()
+        || matches!(named(&Model::NAMES, name), Some(Model::Spm))
 }
 
 /// The value `name` stands for in a table of names this crate runs; `None`
@@ -72,7 +78,7 @@ fn names<T>(table: &[(&str, T)]) -> String {
 /// A loaded vocabulary with its encoder and decoder tables.
 pub struct Tokenizer {
     vocab: Vocab,
-    bpe: bpe::Bpe,
+    encoder: encoder::Encoder,
     /// Partition order: longest text first.
     specials: Vec<u32>,
     finders: Vec<Finder<'static>>,
@@ -90,15 +96,9 @@ impl Tokenizer {
     /// Load the vocabulary from a GGUF file's header; for a split set, the
     /// first shard (the one that carries `tokenizer.ggml.*`).
     pub fn from_gguf(path: impl AsRef<Path>) -> Result<Tokenizer, Error> {
-        let vocab = Vocab::load(path.as_ref())?;
-        let spelling = vocab.pretok.spelling();
-        let bpe = bpe::Bpe::new(
-            &vocab.texts,
-            &vocab.attrs,
-            &vocab.merges,
-            spelling,
-            vocab.pretok.ignore_merges(),
-        )?;
+        let (vocab, encoding) = Vocab::load(path.as_ref())?;
+        let encoder = encoder::Encoder::new(encoding, &vocab)?;
+        let spelling = encoder.spelling();
         let specials = vocab.special_order();
         let finders = specials
             .iter()
@@ -107,7 +107,7 @@ impl Tokenizer {
         let pieces = decode::pieces(&vocab.texts, &vocab.attrs, spelling);
         Ok(Tokenizer {
             vocab,
-            bpe,
+            encoder,
             specials,
             finders,
             pieces,
@@ -121,8 +121,9 @@ impl Tokenizer {
     ///
     /// # Panics
     ///
-    /// Panics if a four-byte UTF-8 sequence decodes above U+10FFFF. Other
-    /// malformed bytes follow the reference's lenient decoding.
+    /// BPE panics if a four-byte UTF-8 sequence decodes above U+10FFFF.
+    /// Other malformed bytes follow the reference's lenient decoding;
+    /// SentencePiece preserves malformed bytes through byte fallback.
     pub fn encode(
         &self,
         text: impl AsRef<[u8]>,
@@ -138,31 +139,17 @@ impl Tokenizer {
             out.push(bos);
         }
 
-        let mut cpts = Vec::new();
-        let mut word = Vec::new();
-        let mut pre = pretok::Scratch::default();
-        let mut bpe = bpe::Scratch::default();
-        let metaspace = self.vocab.pretok.spelling() == bpe::Spelling::Metaspace;
+        let mut scratch = encoder::Scratch::default();
         for frag in self.partition(text, parse_special) {
             match frag {
                 Frag::Token(id) => out.push(id),
                 Frag::Text { start, len } => {
-                    unicode::decode_lenient(&text[start..start + len], &mut cpts);
-                    if metaspace {
-                        for c in cpts.iter_mut().filter(|c| **c == u32::from(b' ')) {
-                            *c = 0x2581;
-                        }
-                    }
-                    let mut at = 0;
-                    for &n in pretok::split(self.vocab.pretok, &cpts, &mut pre) {
-                        word.clear();
-                        for &cpt in &cpts[at..at + n] {
-                            unicode::encode_cpt(cpt, &mut word);
-                        }
-                        at += n;
-                        self.bpe
-                            .word(&word, &mut bpe, &mut out, &self.vocab.token_to_id);
-                    }
+                    self.encoder.text(
+                        &text[start..start + len],
+                        &self.vocab.token_to_id,
+                        &mut scratch,
+                        &mut out,
+                    );
                 }
             }
         }
@@ -276,7 +263,8 @@ impl Tokenizer {
 
     /// Whether the vocabulary asks for a BOS / an EOS around encoded text:
     /// `tokenizer.ggml.add_bos_token` / `add_eos_token`, and a BOS always for
-    /// the `gemma4` pre-tokenizer, as the reference forces it.
+    /// the `gemma4` pre-tokenizer, as the reference forces it. SentencePiece
+    /// defaults to adding a BOS unless the header disables it.
     pub fn add_bos(&self) -> bool {
         self.vocab.add_bos
     }
@@ -292,7 +280,7 @@ impl Tokenizer {
     }
 
     /// The pre-tokenizer's name: `tokenizer.ggml.pre`, or `gemma4` for a
-    /// gemma4 model, which names its own.
+    /// gemma4 model, which names its own; SentencePiece uses `default`.
     pub fn pre(&self) -> &str {
         &self.vocab.pre
     }
@@ -309,7 +297,7 @@ impl Tokenizer {
 
     /// Merges whose sides or result are not vocabulary tokens.
     pub fn merges_off_vocab(&self) -> usize {
-        self.bpe.merges_off_vocab
+        self.encoder.merges_off_vocab()
     }
 
     /// Roles (eot, fim_pre, ...) filled by text where several candidate
@@ -361,7 +349,7 @@ mod tests {
     /// names no pre-tokenizer; unlike it, it sets `add_bos_token` false, so a
     /// BOS can come only from the gemma4 rule. `header` adds the special ids
     /// and `add_eos_token`.
-    fn gemma4_file(header: &[(&str, Value)], missing_byte: Option<u8>) -> std::path::PathBuf {
+    fn gemma4_header(header: &[(&str, Value)], missing_byte: Option<u8>) -> Vec<(String, Value)> {
         let control = ["<pad>", "<eos>", "<bos>", "<unk>", "<turn|>", "<|channel|>"];
         let normal = [
             "a",
@@ -396,7 +384,7 @@ mod tests {
             "\u{2581} \u{2581}",
             "\u{2581}\u{2581} \u{2581}\u{2581}",
         ];
-        let kvs: Vec<(String, Value)> = [
+        [
             ("tokenizer.ggml.model", Value::String("gemma4".into())),
             (
                 "tokenizer.ggml.tokens",
@@ -420,24 +408,31 @@ mod tests {
         .into_iter()
         .chain(header.iter().cloned())
         .map(|(k, v)| (k.to_string(), v))
-        .collect();
-        let path =
-            std::env::temp_dir().join(format!("tokenizer-gemma4-{}.gguf", std::process::id()));
-        let layout = Layout::new(&kvs, Vec::new()).unwrap();
-        let file = std::fs::File::create(&path).unwrap();
-        Writer::new(file, layout).and_then(Writer::finish).unwrap();
-        path
+        .collect()
     }
 
-    fn open(header: &[(&str, Value)], missing_byte: Option<u8>) -> Result<Tokenizer, Error> {
-        let path = gemma4_file(header, missing_byte);
+    pub(super) fn from_header(kvs: &[(String, Value)]) -> Result<Tokenizer, Error> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tokenizer-{}-{}.gguf",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let layout = Layout::new(kvs, Vec::new()).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        Writer::new(file, layout).and_then(Writer::finish).unwrap();
         let tok = Tokenizer::from_gguf(&path);
         std::fs::remove_file(&path).unwrap();
         tok
     }
 
+    fn open(header: &[(&str, Value)], missing_byte: Option<u8>) -> Result<Tokenizer, Error> {
+        from_header(&gemma4_header(header, missing_byte))
+    }
+
     /// The ids of the tokens whose texts are `texts`.
-    fn ids(tok: &Tokenizer, texts: &[&str]) -> Vec<u32> {
+    pub(super) fn ids(tok: &Tokenizer, texts: &[&str]) -> Vec<u32> {
         let id = |t: &str| {
             (0..tok.n_vocab() as u32)
                 .find(|&i| tok.text(i) == Some(t))
@@ -680,3 +675,6 @@ mod tests {
         assert_eq!(decode(text.as_bytes()), text);
     }
 }
+
+#[cfg(test)]
+mod spm_tests;

@@ -303,9 +303,10 @@ fn a_set_of_other_cases_is_stale() {
     let md5 = hex_of(cases);
     write_set(&dir, &RIGHT, &md5);
     let set = TokenizerSet::open(&dir, &FAMILY).unwrap_or_else(|e| panic!("{e}"));
-    set.check_cases(cases).unwrap_or_else(|e| panic!("{e}"));
+    set.check_cases(cases, None)
+        .unwrap_or_else(|e| panic!("{e}"));
     let other = b"one\ntwo\nthree\n";
-    match set.check_cases(other) {
+    match set.check_cases(other, None) {
         Err(RefError::Stale {
             dumped_from, runs, ..
         }) => {
@@ -314,6 +315,23 @@ fn a_set_of_other_cases_is_stale() {
         }
         r => panic!("a set of other cases: {r:?}"),
     }
+    assert!(matches!(
+        set.check_cases(cases, Some(other)),
+        Err(RefError::Stale { .. })
+    ));
+    let path = dir.join("MANIFEST.tsv");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!("{text}# extra cases\t/extra.txt\t{}\n", hex_of(other)),
+    )
+    .unwrap();
+    let set = TokenizerSet::open(&dir, &FAMILY).unwrap();
+    set.check_cases(cases, Some(other)).unwrap();
+    assert!(matches!(
+        set.check_cases(cases, Some(cases)),
+        Err(RefError::Stale { .. })
+    ));
     remove(&dir);
 }
 

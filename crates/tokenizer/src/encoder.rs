@@ -1,0 +1,118 @@
+//! Vocabulary-selected encoding, after the shared special-token partition.
+
+use std::collections::HashMap;
+
+use crate::spelling::{Spelling, escape_whitespace};
+use crate::vocab::{Encoding, Vocab};
+use crate::{Error, bpe, pretok, spm, unicode};
+
+pub(crate) enum Encoder {
+    Bpe {
+        pre: pretok::Pre,
+        bpe: bpe::Bpe,
+    },
+    Spm {
+        add_space_prefix: bool,
+        spm: spm::Spm,
+    },
+}
+
+#[derive(Default)]
+pub(crate) struct Scratch {
+    cpts: Vec<u32>,
+    word: Vec<u8>,
+    escaped: Vec<u8>,
+    pre: pretok::Scratch,
+    bpe: bpe::Scratch,
+    spm: spm::Scratch,
+}
+
+impl Encoder {
+    pub(crate) fn new(encoding: Encoding, vocab: &Vocab) -> Result<Self, Error> {
+        match encoding {
+            Encoding::Bpe { pre, merges } => Ok(Self::Bpe {
+                pre,
+                bpe: bpe::Bpe::new(
+                    &vocab.texts,
+                    &vocab.attrs,
+                    &merges,
+                    pre.spelling(),
+                    pre.ignore_merges(),
+                )?,
+            }),
+            Encoding::Spm {
+                scores,
+                add_space_prefix,
+            } => Ok(Self::Spm {
+                add_space_prefix,
+                spm: spm::Spm::new(scores, &vocab.token_to_id, &vocab.attrs)?,
+            }),
+        }
+    }
+
+    pub(crate) fn spelling(&self) -> Spelling {
+        match self {
+            Self::Bpe { pre, .. } => pre.spelling(),
+            Self::Spm { .. } => Spelling::Metaspace,
+        }
+    }
+
+    pub(crate) fn merges_off_vocab(&self) -> usize {
+        match self {
+            Self::Bpe { bpe, .. } => bpe.merges_off_vocab,
+            Self::Spm { .. } => 0,
+        }
+    }
+
+    pub(crate) fn text(
+        &self,
+        text: &[u8],
+        tokens: &HashMap<String, u32>,
+        scratch: &mut Scratch,
+        out: &mut Vec<u32>,
+    ) {
+        let Scratch {
+            cpts,
+            word,
+            escaped,
+            pre,
+            bpe,
+            spm,
+        } = scratch;
+        match self {
+            Self::Bpe {
+                pre: kind,
+                bpe: encoder,
+            } => {
+                unicode::decode_lenient(text, cpts);
+                let mut at = 0;
+                for &n in pretok::split(*kind, cpts, pre) {
+                    word.clear();
+                    for &cpt in &cpts[at..at + n] {
+                        unicode::encode_cpt(cpt, word);
+                    }
+                    at += n;
+                    let text = if kind.spelling() == Spelling::Metaspace {
+                        escape_whitespace(word, escaped);
+                        escaped.as_slice()
+                    } else {
+                        word.as_slice()
+                    };
+                    encoder.word(text, bpe, out, tokens);
+                }
+            }
+            Self::Spm {
+                add_space_prefix,
+                spm: encoder,
+            } => {
+                word.clear();
+                if *add_space_prefix {
+                    word.push(b' ');
+                }
+                word.extend_from_slice(text);
+                escape_whitespace(word, escaped);
+                encoder.word(escaped, tokens, spm, out);
+            }
+        }
+    }
+}

@@ -20,28 +20,12 @@
 //! merge result that is not a token. An interned id names one exact string,
 //! so comparing ids is comparing the reference's strings.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 
 use crate::Error;
+use crate::merge::{self, NONE, Sym};
+use crate::spelling::{Spelling, byte_tokens};
 use crate::unicode::{byte_to_cpt_table, encode_cpt};
-
-const NONE: u32 = u32::MAX;
-
-/// How a vocabulary spells a word's text: the reference's `byte_encode`
-/// and `escape_whitespaces` flags, which its pre-tokenizer names set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Spelling {
-    /// GPT-2 byte-level: each byte is written as its alphabet character, and
-    /// a symbol that is not a token falls back to the tokens whose text is
-    /// one byte of those characters.
-    ByteLevel,
-    /// Metaspace: each space is written as U+2581, symbols start as raw UTF-8
-    /// characters, a word of newlines that is a token is that token, and a
-    /// symbol that is not a token falls back to the `<0xXX>` token of each of
-    /// its bytes.
-    Metaspace,
-}
 
 /// Each spelling's starting symbols and byte fallback; the tables are boxed
 /// so the two variants are the same small size.
@@ -164,14 +148,10 @@ impl Bpe {
                     })
                     .map(|(s, &id)| (s.as_slice().into(), id))
                     .collect();
-                let mut hex_token = Box::new([NONE; 256]);
-                for b in 0..=u8::MAX {
-                    let t = token(format!("<0x{b:02X}>").as_bytes());
-                    if t == NONE || attrs[t as usize] & crate::vocab::attr::BYTE == 0 {
-                        return Err(Error::MissingByteToken(b));
-                    }
-                    hex_token[usize::from(b)] = t;
-                }
+                let hex_token = byte_tokens(|_, text| {
+                    let id = token(text.as_bytes());
+                    (id != NONE && attrs[id as usize] & crate::vocab::attr::BYTE != 0).then_some(id)
+                })?;
                 Units::Metaspace {
                     char_iid,
                     hex_token,
@@ -230,82 +210,22 @@ impl Bpe {
             out.push(id);
             return;
         }
-        let n = word.len();
-        assert!(
-            u32::try_from(n).is_ok(),
-            "a pre-tokenizer word of {n} bytes does not fit the u32 symbol links"
-        );
-        let at = |i: usize| u32::try_from(i).expect("at most the word length, checked above");
-        s.syms.clear();
         match &self.units {
             Units::ByteLevel { byte_iid, .. } => {
-                s.syms.extend(word.iter().enumerate().map(|(i, &b)| Sym {
-                    len: 1,
-                    iid: byte_iid[b as usize],
-                    prev: if i == 0 { NONE } else { at(i - 1) },
-                    next: if i + 1 == n { NONE } else { at(i + 1) },
-                }));
+                s.merge.symbols(word, Spelling::ByteLevel, |text| {
+                    byte_iid[usize::from(text[0])]
+                });
             }
             Units::Metaspace { char_iid, .. } => {
-                // One symbol per character, at its lead byte; the bytes after
-                // it start dead.
-                s.syms.resize(
-                    n,
-                    Sym {
-                        len: 0,
-                        iid: NONE,
-                        prev: NONE,
-                        next: NONE,
-                    },
-                );
-                let (mut i, mut prev) = (0, NONE);
-                while i < n {
-                    let len = utf8_len(word[i]).min(n - i);
-                    s.syms[i] = Sym {
-                        len: at(len),
-                        iid: char_iid.get(&word[i..i + len]).copied().unwrap_or(NONE),
-                        prev,
-                        next: if i + len == n { NONE } else { at(i + len) },
-                    };
-                    prev = at(i);
-                    i += len;
-                }
+                s.merge.symbols(word, Spelling::Metaspace, |text| {
+                    char_iid.get(text).copied().unwrap_or(NONE)
+                });
             }
         }
-        s.heap.clear();
-        for i in 0..n {
-            let next = s.syms[i].next;
-            if s.syms[i].len > 0 && next != NONE {
-                self.push(&s.syms, &mut s.heap, at(i), next);
-            }
-        }
-
-        while let Some(Reverse((_, left, right, size, merged))) = s.heap.pop() {
-            let (l, r) = (s.syms[left as usize], s.syms[right as usize]);
-            if l.len == 0 || r.len == 0 || l.len + r.len != size {
-                continue;
-            }
-            let next = r.next;
-            s.syms[left as usize] = Sym {
-                len: size,
-                iid: merged,
-                next,
-                ..l
-            };
-            s.syms[right as usize].len = 0;
-            if next != NONE {
-                s.syms[next as usize].prev = left;
-            }
-            if l.prev != NONE {
-                self.push(&s.syms, &mut s.heap, l.prev, left);
-            }
-            if next != NONE {
-                self.push(&s.syms, &mut s.heap, left, next);
-            }
-        }
+        s.merge.run(|_, l, r| self.pair(l, r));
 
         // A live symbol starts at the byte whose index it has.
-        for (start, sym) in s.syms.iter().enumerate() {
+        for (start, sym) in s.merge.syms.iter().enumerate() {
             let len = sym.len as usize;
             if len == 0 {
                 continue;
@@ -337,45 +257,18 @@ impl Bpe {
         }
     }
 
-    fn push(&self, syms: &[Sym], heap: &mut Heap, left: u32, right: u32) {
-        let (l, r) = (syms[left as usize], syms[right as usize]);
+    fn pair(&self, l: Sym, r: Sym) -> Option<(u32, u32)> {
         if l.iid == NONE || r.iid == NONE {
-            return;
+            return None;
         }
-        if let Some(&(rank, merged)) = self.merges.get(&(l.iid, r.iid)) {
-            heap.push(Reverse((rank, left, right, l.len + r.len, merged)));
-        }
+        self.merges.get(&(l.iid, r.iid)).copied()
     }
 }
-
-/// `unicode_len_utf8`: a character's length from its lead byte; a
-/// continuation byte counts as one.
-fn utf8_len(lead: u8) -> usize {
-    match lead >> 4 {
-        0xC | 0xD => 2,
-        0xE => 3,
-        0xF => 4,
-        _ => 1,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Sym {
-    /// Bytes this symbol covers; 0 once merged into its left neighbour.
-    len: u32,
-    iid: u32,
-    prev: u32,
-    next: u32,
-}
-
-/// `(rank, left, right, size at queueing, merged intern id)`, smallest first.
-type Heap = BinaryHeap<Reverse<(u32, u32, u32, u32, u32)>>;
 
 /// Reusable buffers for [`Bpe::word`].
 #[derive(Default)]
 pub(crate) struct Scratch {
-    syms: Vec<Sym>,
-    heap: Heap,
+    merge: merge::Scratch<u32>,
     /// The GPT-2 byte encoding of one word, for the whole-token lookup.
     encoded: Vec<u8>,
 }
@@ -405,5 +298,17 @@ mod tests {
         };
         assert_eq!(ids(true), [2]);
         assert_eq!(ids(false), [0, 1]);
+    }
+
+    /// Merge ranks keep their order when an overlapping queued pair becomes stale.
+    #[test]
+    fn ranks_skip_stale_pairs() {
+        let texts = ["a", "b", "c", "ab", "bc"].map(String::from);
+        let tokens = texts.iter().cloned().zip(0u32..).collect();
+        let merges = ["b c", "a b"].map(String::from);
+        let bpe = Bpe::new(&texts, &[], &merges, Spelling::ByteLevel, false).unwrap();
+        let (mut scratch, mut out) = (Scratch::default(), Vec::new());
+        bpe.word(b"ababc", &mut scratch, &mut out, &tokens);
+        assert_eq!(out, [3, 0, 4]);
     }
 }

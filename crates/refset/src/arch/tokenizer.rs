@@ -146,7 +146,14 @@ pub(crate) fn nemotron_model() -> Result<String, RefError> {
 }
 
 /// The families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&V41, &QWEN3MOE, &GLM5NEXT, &QWEN38, &NEMOTRON];
+pub static FAMILIES: &[&Family] = &[
+    &V41,
+    &QWEN3MOE,
+    &GLM5NEXT,
+    &QWEN38,
+    &NEMOTRON,
+    &super::gemma_embedding::TOKENIZER,
+];
 
 #[cfg(test)]
 mod tests {
@@ -195,7 +202,7 @@ mod tests {
     /// the reader's `build_id` spells.
     #[test]
     fn the_vocabularies_are_rows_of_the_table() {
-        assert_eq!(crate::arch::families(ARCH).len(), 5);
+        assert_eq!(crate::arch::families(ARCH).len(), 6);
         for f in FAMILIES {
             assert!(std::ptr::eq(crate::arch::named(f.name).unwrap_or(&V41), *f));
             assert!(
@@ -220,6 +227,10 @@ mod tests {
             (&GLM5NEXT, TOKREF_BUILD),
             (&QWEN38, TOKREF_BUILD),
             (&NEMOTRON, NEMOTRON_BUILD),
+            (
+                &super::super::gemma_embedding::TOKENIZER,
+                super::super::gemma_embedding::TOKENIZER_BUILD,
+            ),
         ] {
             assert!(
                 matches!(f.build, Some(crate::family::Build::Is(p)) if p == pin),
@@ -236,6 +247,7 @@ mod tests {
                 "ref-tokenizer-glm5next",
                 "ref-tokenizer-qwen38",
                 "ref-tokenizer-nemotron",
+                "ref-tokenizer-llama",
             ]
         );
     }

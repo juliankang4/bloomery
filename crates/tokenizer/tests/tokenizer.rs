@@ -23,6 +23,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use refset::arch::gemma_embedding::TOKENIZER as LLAMA;
 use refset::arch::tokenizer::{GLM5NEXT, NEMOTRON, QWEN3MOE, QWEN38, V41};
 use refset::family::Family;
 use refset::tokenizer::{Text, TokenizerSet};
@@ -98,24 +99,12 @@ fn nemotron() -> Vocabulary {
     }
 }
 
-impl Vocabulary {
-    /// The GGUF file the set was dumped from and this gate loads.
-    fn file(&self) -> PathBuf {
-        PathBuf::from(
-            self.family
-                .runs()
-                .unwrap_or_else(|e| panic!("{}: {e}", self.family.name)),
-        )
-    }
-}
-
 /// The vocabulary's set opened through its family and held to `cases.txt`;
 /// a refusal names the recipe that re-takes it.
-fn open(v: &Vocabulary) -> TokenizerSet {
-    let f = v.family;
+fn open(f: &Family) -> TokenizerSet {
     let set = TokenizerSet::open(&f.path(f.sets[0]), f).unwrap_or_else(|e| refuse(f, &e));
     // The hand-picked cases file the sets' case texts must come from.
-    set.check_cases(include_bytes!("cases.txt"))
+    set.check_cases(include_bytes!("cases.txt"), None)
         .unwrap_or_else(|e| refuse(f, &e));
     set
 }
@@ -124,8 +113,8 @@ fn refuse(f: &Family, e: &refset::RefError) -> ! {
     panic!("{e}\n  re-take the set: {}", f.recipe)
 }
 
-fn load(v: &Vocabulary) -> Tokenizer {
-    let file = v.file();
+fn load(f: &Family) -> Tokenizer {
+    let file = PathBuf::from(f.runs().unwrap_or_else(|e| panic!("{}: {e}", f.name)));
     Tokenizer::from_gguf(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()))
 }
 
@@ -219,8 +208,8 @@ fn check(tok: &Tokenizer, name: &str, text: &Text, failures: &mut Vec<String>) {
 
 /// Every engram corpus text: ids equal the reference's, both parse modes.
 fn corpus_ids_equal_reference(v: &Vocabulary) {
-    let tok = load(v);
-    let set = open(v);
+    let tok = load(v.family);
+    let set = open(v.family);
     let names: Vec<&str> = set.corpora().map(|t| t.name.as_str()).collect();
     assert_eq!(
         names,
@@ -263,7 +252,7 @@ fn hw_glm5next_corpus_ids_equal_reference() {
 /// equal-length special tokens cannot matter, and the roles picked from
 /// several candidate texts are the vocabulary's pinned list.
 fn cases_equal_reference(v: &Vocabulary) {
-    let tok = load(v);
+    let tok = load(v.family);
     assert_eq!(
         tok.special_overlap(),
         None,
@@ -283,7 +272,7 @@ fn cases_equal_reference(v: &Vocabulary) {
         );
     }
 
-    let set = open(v);
+    let set = open(v.family);
     let cases: Vec<&Text> = set.cases().collect();
     assert!(
         cases.len() >= 20,
@@ -307,6 +296,50 @@ fn cases_equal_reference(v: &Vocabulary) {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// SentencePiece's fixed cases include the model's BOS/EOS, unlike the BPE sets.
+#[test]
+#[ignore = "needs EmbeddingGemma v1 and its oracle set (just dump-ref-tokenizer llama)"]
+fn hw_llama_cases_equal_reference() {
+    let tok = load(&LLAMA);
+    let set = open(&LLAMA);
+    set.check_cases(
+        include_bytes!("cases.txt"),
+        Some(include_bytes!("cases-emb1.txt")),
+    )
+    .unwrap_or_else(|e| refuse(&LLAMA, &e));
+    assert!(tok.add_bos() && tok.add_eos());
+    assert_eq!(tok.special_overlap(), None);
+    assert!(tok.ambiguous_roles().is_empty());
+    let bos = tok.specials().bos.unwrap();
+    let eos = tok.specials().eos.unwrap();
+    let mut longest = 0;
+    let mut count = 0;
+    for text in set.cases() {
+        let bytes = text.read().unwrap();
+        longest = longest.max(bytes.len());
+        count += 1;
+        for parse in [false, true] {
+            let oracle = text.ids(parse).unwrap();
+            assert_eq!(oracle.first(), Some(&bos), "{} BOS", text.name);
+            assert_eq!(oracle.last(), Some(&eos), "{} EOS", text.name);
+            for add_special in [false, true] {
+                let expected = if add_special {
+                    &oracle[..]
+                } else {
+                    &oracle[1..oracle.len() - 1]
+                };
+                let ours = tok.encode(&bytes, add_special, parse);
+                compare(&tok, &ours, expected).unwrap_or_else(|e| {
+                    panic!("{} parse={parse} add_special={add_special}: {e}", text.name)
+                });
+            }
+        }
+    }
+    assert!(longest > 4096, "no long tokenizer input");
+    assert!(count > 40, "missing fixed tokenizer cases");
+    println!("llama: {count} cases, both parse and add_special modes equal mainline ids");
 }
 
 #[test]

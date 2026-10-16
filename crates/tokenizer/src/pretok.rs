@@ -93,7 +93,7 @@
 //! are not GPT-2 byte-level: the reference writes each space as U+2581 before
 //! the split and merges raw UTF-8 characters ([`Spelling::Metaspace`]).
 
-use crate::bpe::Spelling;
+use crate::spelling::Spelling;
 use crate::unicode::collapse;
 
 const NUMBER: u8 = 0xD1;

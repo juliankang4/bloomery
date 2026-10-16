@@ -52,21 +52,25 @@
 # takes one snapshot of docs/ per vocabulary, in turn, all but gemma4 and llama, which run by name on a machine with their
 # mainline tree.
 #
-# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|llama|all
+# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|llama|all [--cases-only]
+# --cases-only writes the fixed cases without reading the corpus trees.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 CASES=$ROOT/crates/tokenizer/tests/cases.txt
 
-[ $# = 1 ] || { echo "usage: oracle.sh VOCAB" >&2; exit 64; }
+case $#:${2:-} in
+  1: | 2:--cases-only) ;;
+  *) echo "usage: oracle.sh VOCAB [--cases-only]" >&2; exit 64 ;;
+esac
 
 case ${1:-} in
   v41 | qwen3moe | glm5next | qwen38 | nemotron | gemma4 | llama) ;;
   all)
     for v in v41 qwen3moe glm5next qwen38 nemotron; do
       echo "oracle: $v"
-      bash "${BASH_SOURCE[0]}" "$v"
+      bash "${BASH_SOURCE[0]}" "$v" "${@:2}"
     done
     exit 0
     ;;
@@ -226,11 +230,13 @@ extra_md5=
   printf 'set\tbytes\ttext_md5\tids\tnps_ids\n'
 } > "$OUT.new/MANIFEST.tsv"
 
-for name in code prose prose-all threads korean; do
-  gather "$name" > "$OUT.new/$name.txt"
-  ids "$OUT.new/$name.txt" "$OUT.new/$name"
-  row "$name" >> "$OUT.new/MANIFEST.tsv"
-done
+if [ "${2:-}" != --cases-only ]; then
+  for name in code prose prose-all threads korean; do
+    gather "$name" > "$OUT.new/$name.txt"
+    ids "$OUT.new/$name.txt" "$OUT.new/$name"
+    row "$name" >> "$OUT.new/MANIFEST.tsv"
+  done
+fi
 
 n=0
 for cases in "$CASES" ${EXTRA:+"$EXTRA"}; do
