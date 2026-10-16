@@ -1123,6 +1123,8 @@ EOF
   done
   r=0
   (
+    # With --self-test still in the arguments, sourcing the script by the path it runs from starts this self-test again.
+    set --
     source "$warm_tree/tools/ref/lcpp-warm.sh"
     lease_stop() { return 70; }
     SRV_PID=unused SRV_SIGNAL='' SRV_TRAPS=''
