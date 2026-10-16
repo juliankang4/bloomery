@@ -49,7 +49,7 @@ use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
     GemmRoute, GemmWeight,
 };
-use crate::host::node::{NodeFamily, NodeOpen, TierNode};
+use crate::host::node::{NodeCensus, NodeFamily, NodeOpen, TierNode};
 use crate::host::tier::{
     BlockRows, TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet,
     TierShape,
@@ -626,7 +626,7 @@ impl TierExperts for Tier38 {
 )]
 pub(super) fn open_tier(
     stage: &Gpu,
-    file: &Split,
+    file: &std::sync::Arc<Split>,
     plan: &Plan<'_>,
     (t, tier): (&TierOpen, usize),
     map: &SlotMap,
@@ -647,7 +647,7 @@ pub(super) fn open_tier(
         ));
     }
     let set = TierSet::of_map(map, tier)?;
-    if let Some(addr) = t.node {
+    {
         let mut open = NodeOpen {
             nvme: None,
             family: NODE_FAMILY.word.to_string(),
@@ -661,11 +661,24 @@ pub(super) fn open_tier(
             layers,
             block,
         };
-        let census = TierNode::census_of(addr)?;
+        let census = match t.node {
+            Some(addr) => TierNode::census_of(addr)?,
+            None => NodeCensus::here()?,
+        };
         open.project(plan, &census, tier + 1)?;
-        let node = TierNode::open(addr, &open)?;
-        stage.context().bind_to_thread()?;
-        return Ok(TierCard::on_node(node, t.name.clone(), set));
+        if let Some(addr) = t.node {
+            let node = TierNode::open(addr, &open)?;
+            stage.context().bind_to_thread()?;
+            return Ok(TierCard::on_node(node, t.name.clone(), set));
+        }
+        if open.nvme.is_some() {
+            let gpu = Gpu::open_card(&t.name, t.device)?;
+            let tensors = node_tensors(file)?;
+            let (w, experts) = open.load_host(&gpu, file, &tensors, &NODE_FAMILY)?;
+            let card = TierCard::open_cols(gpu, t.name.clone(), w, set, experts, SHAPE, step_cols)?;
+            stage.context().bind_to_thread()?;
+            return Ok(card);
+        }
     }
     let gpu = Gpu::open_card(&t.name, t.device)?;
     let w = Weights::load_placed(gpu.stream(), file, plan, t.card, card_dontneed)?;

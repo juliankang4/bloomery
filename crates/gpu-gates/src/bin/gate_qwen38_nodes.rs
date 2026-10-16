@@ -137,6 +137,10 @@ mod gate {
             out: PathBuf,
             server: u32,
         },
+        History {
+            gib: u64,
+            out: PathBuf,
+        },
         Decode {
             gib: u64,
             tokens: usize,
@@ -151,7 +155,7 @@ mod gate {
     fn parse_args() -> Result<Mode, GateError> {
         const USAGE: &str = "usage: gate_qwen38_nodes (node 0 modes, run by the gate: --node0 \
                              <gib> <out> <server pid> | --hold0 <gib>) or --measure \
-                             <local|node> <gib> or --decode0 <gib> <tokens> <out>";
+                             <local|node> <gib> or --decode0 <gib> <tokens> <out> or --history <gib> <out>";
         let args: Vec<String> = std::env::args().skip(1).collect();
         let gib = |s: &str, max: u64| -> Result<u64, GateError> {
             let n = s
@@ -171,6 +175,10 @@ mod gate {
                     server: server
                         .parse()
                         .map_err(|e| format!("{server:?}: {e}: {USAGE}"))?,
+                },
+                ["--history", g, out] => Mode::History {
+                    gib: gib(g, TOP_GIB)?,
+                    out: PathBuf::from(out),
                 },
                 ["--decode0", g, tokens, out] => {
                     let tokens: usize = tokens
@@ -389,7 +397,7 @@ mod gate {
     }
 
     /// The tier's structure after a history ([`tier_graphs_and_chains`]),
-    /// and the precondition that the tier holds its experts and every tier
+    /// and the precondition that the tier serves experts and every tier
     /// layer was sent a routed slot.
     fn tier_structure(s: &Session<Body38>, layers: &[usize]) -> Result<bool, GateError> {
         let body = s.model().body(NAME)?;
@@ -403,7 +411,7 @@ mod gate {
         let first = tier.set().layers().start;
         let hits = |l: usize| st.layer_hits.get(l - first).copied().unwrap_or(0);
         let missing: Vec<usize> = layers.iter().copied().filter(|&l| hits(l) == 0).collect();
-        let pre = missing.is_empty() && tier.set().experts() > 0 && tier.resident_bytes() > 0;
+        let pre = missing.is_empty() && tier.set().experts() > 0;
         println!(
             "precondition: the tier holds {} experts ({} B) and every tier layer was sent a \
              routed slot (missing {missing:?}): {}",
@@ -1021,13 +1029,29 @@ mod gate {
         }
     }
 
-    /// `--node0`: the history on node 0 with node 1's tier, written to
-    /// `out`; the tier's structure; then node 1 killed and the lost node
-    /// clause.
-    fn run_node0(c: &Common, gib: u64, out: &Path, server: u32) -> Result<bool, GateError> {
-        let addr = lever_addr()?;
+    /// Save the local or remote history, check its structure, and optionally
+    /// kill the loopback server for the lost-node clause.
+    fn run_history(
+        c: &Common,
+        gib: u64,
+        out: &Path,
+        server: Option<u32>,
+    ) -> Result<bool, GateError> {
+        let nodes = bloomery_levers::tier_nodes()?;
+        let addr = match nodes.as_slice() {
+            [] => None,
+            [addr] => Some(*addr),
+            _ => return Err("the history needs exactly one tier".into()),
+        };
         let mut machine = None;
-        let plan = child_plan(c, &mut machine, addr, gib)?;
+        let plan = if let Some(addr) = addr {
+            child_plan(c, &mut machine, addr, gib)?
+        } else {
+            let own = bloomery_gpu::census()?;
+            let card = own.first().ok_or("no local tier card")?;
+            let m = machine.insert(c.machine(spec_of_device(card))?);
+            plan_under(&c.inputs, m, gib)?.map_err(|why| format!("under {gib} GiB: {why}"))?
+        };
         let layers = tier_layers(&plan);
         let mut s = c.open(&plan)?;
         let on = s
@@ -1037,7 +1061,7 @@ mod gate {
             .tiers()
             .first()
             .and_then(TierCard::node);
-        let mut ok = on == Some(addr);
+        let mut ok = on == addr;
         println!(
             "node 0: the tier is served by the node at {on:?}: {}",
             verdict(ok)
@@ -1045,7 +1069,14 @@ mod gate {
         let run = q38_history::history(&mut s, &c.ids, |_| Ok(()))?;
         write_run(&run, out)?;
         ok &= tier_structure(&s, &layers)?;
-        ok &= lost_node1(s.model_mut(), &c.ids, addr, server)?;
+        if let Some(server) = server {
+            ok &= lost_node1(
+                s.model_mut(),
+                &c.ids,
+                addr.ok_or("no server address")?,
+                server,
+            )?;
+        }
         Ok(ok)
     }
 
@@ -1602,7 +1633,14 @@ mod gate {
                 gate(&c)
             }
             Mode::Node0 { gib, out, server } => {
-                if run_node0(&c, gib, &out, server)? {
+                if run_history(&c, gib, &out, Some(server))? {
+                    Ok(())
+                } else {
+                    Err(checks_failed())
+                }
+            }
+            Mode::History { gib, out } => {
+                if run_history(&c, gib, &out, None)? {
                     Ok(())
                 } else {
                     Err(checks_failed())

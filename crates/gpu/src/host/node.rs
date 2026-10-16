@@ -308,7 +308,8 @@ impl NodeOpen {
             .ok_or_else(|| {
                 GpuError::shape(WHAT, "the projected tier card is absent from the plan")
             })?
-            .set_aside_bytes();
+            .set_aside_bytes()
+            .ok_or_else(|| GpuError::shape(WHAT, "the projected tier reserve overflows"))?;
         let mut projected = model::placement::nodes::routed_host(
             plan.model,
             &plan.rows,
@@ -330,6 +331,50 @@ impl NodeOpen {
             reserve,
         });
         Ok(())
+    }
+
+    /// Load the projected host tier through the same executor locally or on a node.
+    pub(crate) fn load_host(
+        &self,
+        gpu: &Gpu,
+        file: &Arc<Split>,
+        tensors: &ModelTensors,
+        family: &NodeFamily,
+    ) -> Result<(Weights, Box<dyn TierExperts>), GpuError> {
+        let paging = self
+            .nvme
+            .as_ref()
+            .ok_or_else(|| GpuError::shape(SERVER, "no node NVMe plan"))?;
+        let census = NodeCensus::here()?;
+        let device = census
+            .devices
+            .iter()
+            .find(|d| self.device.is_some_and(|id| id.uuid == d.uuid))
+            .ok_or_else(|| {
+                GpuError::shape(SERVER, "the tier device disappeared from its census")
+            })?;
+        let machine = workstation::plan_on(spec_of_device(device), self.layers);
+        let plan = self.host_plan(tensors, &machine)?;
+        let least =
+            model::placement::ArenaFloor::of(&plan).map_err(|e| GpuError::plan(SERVER, e))?;
+        let mut arena = workstation::HostNeed::of(&plan, 0)
+            .grant(census.host_room.min(paging.room), least.bytes)
+            .map_err(|e| GpuError::plan(SERVER, e))?;
+        arena.granted = arena.granted.min(paging.arena.granted);
+        let tier = crate::model::nvme_tier(gpu.context(), &plan, file, false, arena)?;
+        let run = (family.host)(Arc::clone(file), self)?;
+        let tier =
+            tier.ok_or_else(|| GpuError::shape(SERVER, "the node's NVMe plan built no tier"))?;
+        let experts = super::tier_cpu::CpuExperts::new(
+            gpu,
+            run,
+            tier,
+            self.set.clone(),
+            self.shape,
+            self.cols,
+        )?;
+        let w = Weights::load_rows(gpu.stream(), file, tensors, &[], self.card)?;
+        Ok((w, Box::new(experts)))
     }
 
     pub(super) fn host_plan<'a>(
@@ -1621,37 +1666,8 @@ impl Session<'_> {
             }
         }
         let gpu = Gpu::open_card(&open.name, open.device)?;
-        let (w, experts) = if let Some(paging) = &open.nvme {
-            let census = NodeCensus::here()?;
-            let device = census
-                .devices
-                .iter()
-                .find(|d| open.device.is_some_and(|id| id.uuid == d.uuid))
-                .ok_or_else(|| {
-                    GpuError::shape(SERVER, "the tier device disappeared from its census")
-                })?;
-            let machine = workstation::plan_on(spec_of_device(device), open.layers);
-            let plan = open.host_plan(&tensors, &machine)?;
-            let least =
-                model::placement::ArenaFloor::of(&plan).map_err(|e| GpuError::plan(SERVER, e))?;
-            let mut arena = workstation::HostNeed::of(&plan, 0)
-                .grant(census.host_room.min(paging.room), least.bytes)
-                .map_err(|e| GpuError::plan(SERVER, e))?;
-            arena.granted = arena.granted.min(paging.arena.granted);
-            let tier = crate::model::nvme_tier(gpu.context(), &plan, self.file, false, arena)?;
-            let run = (family.host)(Arc::clone(self.file), open)?;
-            let tier =
-                tier.ok_or_else(|| GpuError::shape(SERVER, "the node's NVMe plan built no tier"))?;
-            let experts = super::tier_cpu::CpuExperts::new(
-                &gpu,
-                run,
-                tier,
-                open.set.clone(),
-                open.shape,
-                open.cols,
-            )?;
-            let w = Weights::load_rows(gpu.stream(), self.file, &tensors, &[], open.card)?;
-            (w, Box::new(experts) as Box<dyn TierExperts>)
+        let (w, experts) = if open.nvme.is_some() {
+            open.load_host(&gpu, self.file, &tensors, family)?
         } else {
             let w = Weights::load_rows(gpu.stream(), self.file, &tensors, &rows, open.card)?;
             let experts = (family.experts)(&gpu, &tensors, &w, open)?;

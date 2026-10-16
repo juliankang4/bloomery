@@ -156,12 +156,17 @@ pub fn tier_layers(plan: &Plan<'_>) -> Vec<usize> {
 }
 
 /// `tier`'s structure after the history over `layers` tier layers, one
-/// line a check: its graphs of the step and of each verify width hold
-/// [`TIER_LAYER_NODES`] a tier layer and the fault copy, and each of the
-/// history's chains was fed and captured once and replayed by its other
-/// passes.
+/// line a check: its graphs hold the resident card's four launches or
+/// the host tier's four copies and callback per layer, plus the protocol
+/// nodes and fault copy. Every history chain is fed and captured once.
 pub fn tier_graphs_and_chains(tier: &TierCard, layers: usize) -> bool {
-    let want = Some(TIER_LAYER_NODES * layers + 1);
+    let paged = tier.resident_bytes() == 0;
+    let per_layer = if paged {
+        TierCard::nodes_per_layer(TierAct::F32, 5)
+    } else {
+        TIER_LAYER_NODES
+    };
+    let want = Some(per_layer * layers + 1);
     let graphs: Vec<Option<usize>> = [Chain::Step, Chain::Cols(2), Chain::Cols(3), Chain::Cols(4)]
         .iter()
         .map(|&c| tier.graph_nodes(c))
@@ -169,7 +174,7 @@ pub fn tier_graphs_and_chains(tier: &TierCard, layers: usize) -> bool {
     let graphs_ok = graphs.iter().all(|&g| g == want);
     println!(
         "structure: the tier's graphs of the step and the 2, 3, 4-column verifies hold {graphs:?} \
-         nodes, {TIER_LAYER_NODES} a tier layer and the fault copy ({want:?}): {}",
+         nodes, {per_layer} a tier layer (CPU paging {paged}) and the fault copy ({want:?}): {}",
         verdict(graphs_ok)
     );
     let st = tier.stats();
