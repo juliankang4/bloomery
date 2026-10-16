@@ -1,10 +1,10 @@
-//! bloomery-gpu-gemma-embedding2: the EmbeddingGemma 2 encoder
-//! (`gemma-embedding2`, llama.cpp's `src/models/gemma-embedding2.cpp`): one
+//! bloomery-gpu-gemma-embedding2: the EmbeddingGemma v1 and v2 encoders
+//! (`gemma-embedding` and `gemma-embedding2`): one
 //! pass over an input's token ids, every position attending both ways, to
 //! the token rows of the output projection and their mean. It has no device
 //! code of its own: every launch is `bloomery-gpu`'s.
 //!
-//! The pass, in the graph's order:
+//! V2's pass, in the graph's order:
 //! - the token rows, decoded on the host from the file's table
 //!   (`gguf::quant::dequant_row`) and multiplied by `√hidden` (`inp_scaled`);
 //! - per layer: the attention (RMS norm, the q, k and v GEMMs, the per-head
@@ -20,12 +20,19 @@
 //! - the output norm (`result_norm`), the `output` GEMM of every position
 //!   (`result_embd`), and on the host their mean ([`Pass::pooled`]).
 //!
+//! V1 shares the trunk without the value norm or per-layer input. Its
+//! attention scales by `1/√head`; two linear maps follow the output norm
+//! for token rows, and follow mean pooling for the pooled vector.
+//!
 //! - [`Encoder`]: the load and the pass ([`Encoder::pass`]);
 //! - [`card_bytes`]: what a load at a context holds on its card.
 //!
 //! Built with `cargo oxide`, as the device crate it links is.
 
+mod config;
 mod pass;
+
+use config::Hparams;
 
 pub use pass::{Pass, Taps};
 
@@ -40,7 +47,7 @@ use bloomery_gpu::weights::{Weights, resident_size};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::{GgmlType, Split};
-use model::arch::gemma_embedding2::hparams::{CARD_CTX, Hparams};
+use model::arch::gemma_embedding2::hparams::CARD_CTX;
 use model::arch::gemma_embedding2::names;
 
 /// The refusal `what` of a load.
@@ -140,6 +147,7 @@ pub(crate) struct Sizes {
     pub(crate) ff: usize,
     pub(crate) per_layer: usize,
     pub(crate) out: usize,
+    pub(crate) dense: usize,
     /// The widest head: the ones the gainless v norm reads.
     pub(crate) head: usize,
     /// The widths a GEMM's input is quantized at.
@@ -153,10 +161,12 @@ impl Sizes {
         let max = |f: fn(&Attn, usize) -> usize| {
             layers.iter().map(|a| f(a, hp.n_head)).max().unwrap_or(0)
         };
+        let dense = hp.dense.map_or(0, |head| head.width);
         let mut act: Vec<usize> = layers
             .iter()
             .map(|a| hp.n_head * a.head)
-            .chain([hp.n_embd, hp.n_ff, hp.per_layer])
+            .chain([hp.n_embd, hp.n_ff, hp.per_layer, dense])
+            .filter(|&width| width != 0)
             .collect();
         act.sort_unstable();
         act.dedup();
@@ -168,6 +178,7 @@ impl Sizes {
             ff: hp.n_ff,
             per_layer: hp.per_layer,
             out: hp.n_out,
+            dense,
             head: max(|a, _| a.head),
             act,
             reaches: reaches(layers).len(),
@@ -181,6 +192,7 @@ impl Sizes {
         size_sum([
             size_product(&[6, self.hidden])?,
             size_product(&[3, size_sum([self.q, self.kv, self.ff, self.per_layer])?])?,
+            self.dense,
         ])
     }
 
@@ -203,7 +215,12 @@ impl Sizes {
             size_product(&[
                 4,
                 ctx,
-                size_sum([self.hidden, size_product(&[2, self.reaches])?, self.out])?,
+                size_sum([
+                    self.hidden,
+                    size_product(&[2, self.reaches])?,
+                    self.out,
+                    usize::from(self.dense != 0),
+                ])?,
             ])?,
             quant,
             size_product(&[16, ctx])?,
@@ -242,7 +259,8 @@ pub fn card_bytes(split: &Split, ctx: usize) -> Result<u64, GpuError> {
 fn card_figure(bytes: usize, hp: &Hparams, s: &Sizes) -> Result<u64, GpuError> {
     let ple = size_product(&[4, hp.n_layer, hp.per_layer, hp.n_embd])?;
     let rope = size_product(&[4, s.ctx, size_sum([hp.swa.head, hp.full.head])?])?;
-    u64::try_from(size_sum([bytes, ple, rope, s.bytes(hp.n_layer)?])?).map_err(|_| size_overflow())
+    let scales = if hp.per_layer == 0 { 0 } else { hp.n_layer };
+    u64::try_from(size_sum([bytes, ple, rope, s.bytes(scales)?])?).map_err(|_| size_overflow())
 }
 
 // A pass's GEMMs take every position as one column.
@@ -274,11 +292,16 @@ fn check_program(read: &model::arch::Read) -> Result<(), GpuError> {
 /// at most the model card's [`CARD_CTX`] and the file's `context_length`.
 fn header(split: &Split, ctx: usize) -> Result<(Hparams, Vec<Attn>), GpuError> {
     let hp = Hparams::read(split).map_err(|e| GpuError::plan(OPEN, e.to_string()))?;
-    if ctx == 0 || ctx > CARD_CTX || ctx > hp.n_ctx {
+    let bound = if hp.dense.is_some() {
+        model::arch::gemma_embedding::hparams::CARD_CTX
+    } else {
+        CARD_CTX
+    };
+    if ctx == 0 || ctx > bound || ctx > hp.n_ctx {
         return Err(GpuError::Shape {
             what: OPEN,
             detail: format!(
-                "a context of {ctx} positions: one pass takes 1 to the model card's {CARD_CTX}, \
+                "a context of {ctx} positions: one pass takes 1 to the model card's {bound}, \
                  within the file's {}",
                 hp.n_ctx
             ),
@@ -327,6 +350,7 @@ pub(crate) struct Scratch {
     pub(crate) p1: DeviceBuffer<f32>,
     pub(crate) p2: DeviceBuffer<f32>,
     pub(crate) p3: DeviceBuffer<f32>,
+    pub(crate) dense: DeviceBuffer<f32>,
     pub(crate) cache_k: DeviceBuffer<u16>,
     pub(crate) cache_v: DeviceBuffer<u16>,
 }
@@ -355,6 +379,7 @@ impl Scratch {
             p1,
             p2,
             p3,
+            dense,
             cache_k: _,
             cache_v: _,
         } = self;
@@ -362,7 +387,7 @@ impl Scratch {
             4,
             size_sum(
                 [
-                    x, xn, a, c, o, on, qs, q, att, kk, vv, vn, gate, up, gu, p1, p2, p3,
+                    x, xn, a, c, o, on, qs, q, att, kk, vv, vn, gate, up, gu, p1, p2, p3, dense,
                 ]
                 .map(DeviceBuffer::len),
             )?,
@@ -397,6 +422,7 @@ impl Scratch {
             p1: f(s.per_layer)?,
             p2: f(s.per_layer)?,
             p3: f(s.per_layer)?,
+            dense: f(s.dense)?,
             cache_k: DeviceBuffer::<u16>::zeroed(stream, s.kv * s.ctx)?,
             cache_v: DeviceBuffer::<u16>::zeroed(stream, s.kv * s.ctx)?,
         })
@@ -404,7 +430,7 @@ impl Scratch {
 }
 
 /// The rows every pass reads unchanged: the ones the v norm's gain is, the
-/// scalar `1/√hidden` and each layer's output scale, one a position (the
+/// inverse square-root row (v1's head, v2's hidden width) and each layer's output scale, one a position (the
 /// per-token weights `weighted_sum` takes), and the positions `0..ctx`.
 pub(crate) struct Consts {
     pub(crate) ones: DeviceBuffer<f32>,
@@ -413,7 +439,7 @@ pub(crate) struct Consts {
     pub(crate) pos: DeviceBuffer<u32>,
 }
 
-/// The encoder of one `gemma-embedding2` file on one card, sized for passes
+/// The encoder of one EmbeddingGemma file on one card, sized for passes
 /// of up to [`Encoder::ctx`] positions.
 pub struct Encoder {
     pub(crate) gpu: Gpu,
@@ -450,7 +476,7 @@ impl Encoder {
         let (rope_swa, rope_full) = (rope(hp.swa)?, rope(hp.full)?);
         let sizes = Sizes::of(&hp, &layers, ctx);
         let s = Scratch::new(&gpu, &sizes)?;
-        let scale = (0..hp.n_layer)
+        let scale = (0..if hp.per_layer == 0 { 0 } else { hp.n_layer })
             .map(|l| {
                 let v = output_scale(&split, l)?;
                 Ok(DeviceBuffer::from_host(stream, &vec![v; ctx])?)
@@ -461,9 +487,14 @@ impl Encoder {
             detail: format!("{ctx} positions do not fit u32"),
         })?)
             .collect();
+        let inv_width = if hp.dense.is_some() {
+            hp.full.head
+        } else {
+            hp.n_embd
+        };
         let consts = Consts {
             ones: DeviceBuffer::from_host(stream, &vec![1.0f32; sizes.head])?,
-            inv: DeviceBuffer::from_host(stream, &vec![1.0 / (hp.n_embd as f32).sqrt(); ctx])?,
+            inv: DeviceBuffer::from_host(stream, &vec![1.0 / (inv_width as f32).sqrt(); ctx])?,
             scale,
             pos: DeviceBuffer::from_host(stream, &pos)?,
         };
@@ -553,7 +584,7 @@ pub(crate) fn decode_rows(
 /// writes the layer's slice contiguous, each value the whole projection's.
 fn ple_rows(gpu: &Gpu, split: &Split, hp: &Hparams) -> Result<Vec<DeviceTensor<f32>>, GpuError> {
     let (e, pl) = (hp.n_embd, hp.per_layer);
-    (0..hp.n_layer)
+    (0..if pl == 0 { 0 } else { hp.n_layer })
         .map(|l| {
             let mut rows = Vec::with_capacity(pl * e);
             decode_rows(
@@ -610,9 +641,9 @@ mod tests {
             sliding: vec![true, false, true],
             full: a,
             swa: a,
-            window: 4,
             per_layer: 32,
             n_out: 16,
+            dense: None,
         };
         let s = Sizes::of(&hp, &layers(&hp, &[Some(2), None, Some(2)]), 2);
         (hp, s)
@@ -653,7 +684,7 @@ mod tests {
                 ("context_length", hp.n_ctx),
                 ("feed_forward_length", hp.n_ff),
                 ("attention.head_count", hp.n_head),
-                ("attention.sliding_window", hp.window),
+                ("attention.sliding_window", 4),
                 ("embedding_length_per_layer_input", hp.per_layer),
                 ("embedding_length_out", hp.n_out),
                 ("pooling_type", 1),

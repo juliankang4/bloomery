@@ -3,7 +3,7 @@
 
 use models::{Act, Ffn, Mixer, RopeMode};
 
-const FILE: &str = "/models/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const FILE: &str = refset::arch::gemma_embedding::MODEL;
 const BYTES: u64 = 333_590_944;
 const FULL: &[usize] = &[5, 11, 17, 23];
 
@@ -81,17 +81,7 @@ fn hw_gemma_embedding_header() {
         );
     }
     let items = model::arch::coverage::check(s, &read.tensors);
-    for want in [
-        "bidirectional GQA flash, head 256, group 3, 256 keys each side",
-        "bidirectional GQA flash, head 256, group 3",
-        "dense GELU GLU layer: ff 1152",
-        "a layer program for gemma-embedding",
-    ] {
-        assert!(
-            items.iter().any(|u| u.feature == want),
-            "missing {want}: {items:?}"
-        );
-    }
+    assert!(items.is_empty(), "unsupported parts: {items:?}");
     println!(
         "gemma-embedding bytes={BYTES} layers=24 full={FULL:?} hidden=768 out=768 dense=3072 ff=1152 window=512 head=256 query=3 kv=1 tensors={} defaults={:?}",
         read.tensors.tensors.len(),

@@ -25,9 +25,11 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   these, each one input; `embd_normalize` is `-1` (none), `0` (onto the int16 range), `1` (taxicab), `2`
   (euclidean, the default) or a higher p-norm. They answer from the embedding model the server holds beside its
   chat model (`--embd-model FILE` or `--embd-hf <repo>[:<quant>]`), and with none a 501
-  `not_supported_error`. EmbeddingGemma 2 (Q8_0) runs its encoder, output projection and mean pooling
-  on its own thread and card stream, up to 8192 tokens per input. Its MRL widths are the 128, 256
-  and 512 cuts below the file's `embedding_length_out`, plus that full width, cut before normalization.
+  `not_supported_error`. The `gemma-embedding2` feature serves both EmbeddingGemma versions (Q8_0)
+  on a separate thread and card stream. EmbeddingGemma v1 (`gemma-embedding`, 300M) takes up to
+  2048 tokens, uses SentencePiece, and applies its two dense projections after mean pooling.
+  EmbeddingGemma 2 takes up to 8192 tokens and projects each token before mean pooling.
+  Both serve 128, 256 and 512 MRL cuts and the full output width, cut before normalization.
   A file whose output width is below 128 is refused at open. Its seat is the smallest card outside the chat plan, else a
   named `embedding model` reserve on the stage card, subtracted from the chat expert budget.
   `--mmproj` and `--embd-model` on the same off-plan card do not count each other's bytes; the second open

@@ -9,6 +9,14 @@ use crate::side_seat::{no_encoder_bytes as bytes, no_encoder_open as open};
 
 /// The architectures a side seat serves.
 pub const ROWS: &[Row] = &[
+    Row {
+        arch: model::arch::GEMMA_EMBEDDING,
+        ctx: model::arch::gemma_embedding::hparams::CARD_CTX,
+        bytes,
+        open,
+        projector_file: None,
+        projector_types: &[],
+    },
     // The file's context_length is 262144; the model card names 8192 tokens.
     Row {
         arch: model::arch::GEMMA_EMBEDDING2,
@@ -21,9 +29,15 @@ pub const ROWS: &[Row] = &[
 ];
 
 #[cfg(feature = "gemma-embedding2")]
-pub(super) fn gemma_embedding2_dims(split: &gguf::Split) -> Result<Vec<usize>, crate::GateError> {
+pub(super) fn gemma_embedding_dims(split: &gguf::Split) -> Result<Vec<usize>, crate::GateError> {
     const MRL: [usize; 3] = [128, 256, 512];
-    let n_out = model::arch::gemma_embedding2::hparams::Hparams::read(split)?.n_out;
+    let read = model::arch::spec(split)?;
+    let n_out = *read
+        .spec
+        .encoder
+        .as_ref()
+        .and_then(|e| e.proj.last())
+        .ok_or("embedding model: no output projection")? as usize;
     if n_out < MRL[0] {
         return Err(format!(
             "embedding model: embedding_length_out {n_out} cannot serve the {}-wide MRL cut",

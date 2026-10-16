@@ -8,9 +8,9 @@ license = "MIT"
 [lints]
 workspace = true
 
-# The EmbeddingGemma 2 encoder: host code only, no `#[cuda_module]` of its own. It composes the
+# The EmbeddingGemma encoders: host code only, no `#[cuda_module]` of their own. They compose the
 # kernels of `bloomery-gpu` (the q8_0 GEMM, the f32 tile, the norms, the GELU GLU, the whole-turn
-# rope-and-append at heads 256 and 512, the bidirectional prefill flashes); it is built with
+# rope-and-append at heads 256 and 512, the bidirectional prefill flashes); they are built with
 # `cargo oxide` because that crate is.
 [dependencies]
 cuda-core.workspace = true

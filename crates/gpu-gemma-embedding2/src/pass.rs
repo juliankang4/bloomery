@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::config::{DenseHead, Hparams};
 use bloomery_gpu::flash_gqa_prefill::GqaPrefillArgs;
 use bloomery_gpu::gemm::{GemmAct32, GemmInput, GemmRoute};
 use bloomery_gpu::rope_neox::{HEAD_256, PartialNeoxArgs};
@@ -11,7 +12,7 @@ use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
-use model::arch::gemma_embedding2::hparams::{Hparams, key_bounds};
+use model::arch::gemma_embedding2::hparams::key_bounds;
 use model::arch::gemma_embedding2::names;
 
 use crate::{Attn, Consts, Encoder, Kernels, Scratch, decode_rows, reaches};
@@ -101,6 +102,19 @@ impl Cx<'_> {
             n,
             y,
         )
+    }
+
+    fn dense(
+        &self,
+        acts: &mut BTreeMap<usize, GemmAct32>,
+        scratch: &mut DeviceBuffer<f32>,
+        (e, head, out): (usize, DenseHead, usize),
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.proj(acts, head.up, (e, head.width), n, scratch)?;
+        self.quantize(acts, scratch, head.width, n, self.gpu.unlabelled_sink())?;
+        self.proj(acts, head.down, (head.width, out), n, y)
     }
 }
 
@@ -196,20 +210,25 @@ impl Step<'_> {
         cx.proj(acts, &blk(names::ATTN_Q), (e, qw), n, &mut s.qs)?;
         cx.proj(acts, &blk(names::ATTN_K), (e, kv * head), n, &mut s.kk)?;
         cx.proj(acts, &blk(names::ATTN_V), (e, kv * head), n, &mut s.vv)?;
-        elem.enqueue_rms_norm(
-            stream,
-            &s.vv,
-            &self.consts.ones,
-            eps,
-            head,
-            n * kv,
-            &mut s.vn,
-        )?;
+        let value = if self.hp.per_layer != 0 {
+            elem.enqueue_rms_norm(
+                stream,
+                &s.vv,
+                &self.consts.ones,
+                eps,
+                head,
+                n * kv,
+                &mut s.vn,
+            )?;
+            &s.vn
+        } else {
+            &s.vv
+        };
         let rope = PartialNeoxArgs {
             qg: &s.qs,
             q: &mut s.q,
             k: &mut s.kk,
-            v: &s.vn,
+            v: value,
             gq: self.gain(&blk(names::ATTN_Q_NORM))?,
             gk: self.gain(&blk(names::ATTN_K_NORM))?,
             table: &turn.table,
@@ -240,8 +259,12 @@ impl Step<'_> {
                     .enqueue_head_norm_neox_append_512(stream, rope)?;
             }
         }
+        if self.hp.dense.is_some() {
+            // Scale Q before the flash stages it as f16, as the reference does.
+            elem.enqueue_weighted_sum(stream, &s.q, &self.consts.inv, qw, 1, n, &mut s.qs)?;
+        }
         let args = GqaPrefillArgs {
-            q: &s.q,
+            q: if self.hp.dense.is_some() { &s.qs } else { &s.q },
             kc: &s.cache_k,
             vc: &s.cache_v,
             n_keys: &keys.count,
@@ -254,9 +277,15 @@ impl Step<'_> {
             y: &mut s.att,
         };
         if head == HEAD_256 {
-            self.k
-                .flash
-                .enqueue_256_p2_lower(stream, args, &keys.first)?;
+            if (n_head / kv).is_multiple_of(2) {
+                self.k
+                    .flash
+                    .enqueue_256_p2_lower(stream, args, &keys.first)?;
+            } else {
+                self.k
+                    .flash
+                    .enqueue_256_p1_lower(stream, args, &keys.first)?;
+            }
         } else {
             self.k.flash512.enqueue_p4(stream, args)?;
         }
@@ -409,12 +438,49 @@ impl Encoder {
         spans: &[bloomery_gpu::media::MediaSpan<'_>],
         taps: bool,
     ) -> Result<Pass, GpuError> {
+        self.pass_inner(ids, spans, taps, None)
+    }
+
+    /// Replay each layer from its supplied token-major residual (`n · hidden`
+    /// values per layer), returning diagnostic taps rather than an end-to-end pass.
+    pub fn replay_layers(&mut self, ids: &[u32], inputs: &[Vec<f32>]) -> Result<Taps, GpuError> {
+        self.pass_inner(ids, &[], true, Some(inputs))?
+            .taps
+            .ok_or(GpuError::State {
+                what: PASS,
+                missing: "the replay's requested taps",
+            })
+    }
+
+    fn pass_inner(
+        &mut self,
+        ids: &[u32],
+        spans: &[bloomery_gpu::media::MediaSpan<'_>],
+        taps: bool,
+        layer_inputs: Option<&[Vec<f32>]>,
+    ) -> Result<Pass, GpuError> {
         let n = ids.len();
         if n == 0 || n > self.ctx {
             return Err(GpuError::Shape {
                 what: PASS,
                 detail: format!("{n} positions; a pass takes 1 to {}", self.ctx),
             });
+        }
+        if let Some(inputs) = layer_inputs {
+            if inputs.len() != self.hp.n_layer {
+                return Err(GpuError::shape(PASS, "replay needs one input per layer"));
+            }
+            for (l, input) in inputs.iter().enumerate() {
+                if input.len() != n * self.hp.n_embd || input.iter().any(|v| !v.is_finite()) {
+                    return Err(GpuError::shape(
+                        PASS,
+                        format!(
+                            "replay layer {l} needs {n} finite rows of {}",
+                            self.hp.n_embd
+                        ),
+                    ));
+                }
+            }
         }
         bloomery_gpu::media::check_spans(PASS, spans, n, self.hp.n_embd)?;
         let mut inp_scaled = self.token_rows(ids)?;
@@ -466,7 +532,15 @@ impl Encoder {
             l_out: Vec::new(),
             result_norm: Vec::new(),
         });
+        let mut replay_input = Vec::new();
+        if layer_inputs.is_some() {
+            replay_input.resize(s.x.len(), 0.0);
+        }
         for (l, a) in layers.iter().enumerate() {
+            if let Some(inputs) = layer_inputs {
+                replay_input[..n * e].copy_from_slice(&inputs[l]);
+                s.x.copy_from_host(stream, &replay_input)?;
+            }
             let turn = if a.reach.is_some() {
                 &*rope_swa
             } else {
@@ -479,9 +553,19 @@ impl Encoder {
                     what: PASS,
                     missing: "the key bounds of the layer's reach",
                 })?;
-            st.attention(s, (l, a), (l == 0).then_some(&emb), turn, bounds)?;
+            st.attention(
+                s,
+                (l, a),
+                (l == 0 && layer_inputs.is_none()).then_some(&emb),
+                turn,
+                bounds,
+            )?;
             st.glu(s, l)?;
-            st.per_layer(s, l, &ple[l], &emb, tapped.as_mut())?;
+            if hp.per_layer != 0 {
+                st.per_layer(s, l, &ple[l], &emb, tapped.as_mut())?;
+            } else {
+                std::mem::swap(&mut s.x, &mut s.c);
+            }
             if let Some(t) = &mut tapped {
                 t.l_out.push(s.x.to_host_vec(stream)?[..n * e].to_vec());
             }
@@ -499,8 +583,26 @@ impl Encoder {
         let cx = st.cx(&s.route);
         cx.quantize(&mut s.acts, &s.xn, e, n, sink)?;
         let mut out = DeviceBuffer::<f32>::zeroed(stream, n * n_out)?;
-        cx.proj(&s.acts, &names::output(), (e, n_out), n, &mut out)?;
+        if let Some(head) = hp.dense {
+            cx.dense(&mut s.acts, &mut s.dense, (e, head, n_out), n, &mut out)?;
+        } else {
+            cx.proj(&s.acts, &names::output(), (e, n_out), n, &mut out)?;
+        }
         let rows = out.to_host_vec(stream)?;
+        let pooled = if let Some(head) = hp.dense {
+            let weights = DeviceBuffer::from_host(stream, &vec![1.0 / n as f32; n])?;
+            let count = u32::try_from(n)
+                .map_err(|_| GpuError::shape(PASS, "pooling count does not fit u32"))?;
+            gpu.elem()
+                .enqueue_weighted_sum(stream, &s.xn, &weights, e, count, 1, &mut s.a)?;
+            k.gemm.enqueue_route_dense(stream, 1, &mut s.route, sink)?;
+            let cx = st.cx(&s.route);
+            cx.quantize(&mut s.acts, &s.a, e, 1, sink)?;
+            cx.dense(&mut s.acts, &mut s.dense, (e, head, n_out), 1, &mut out)?;
+            out.to_host_vec(stream)?[..n_out].to_vec()
+        } else {
+            mean(&rows, n_out)
+        };
         if let Some(t) = &mut tapped {
             t.result_norm = s.xn.to_host_vec(stream)?[..n * e].to_vec();
         }
@@ -518,7 +620,12 @@ impl Encoder {
                 ),
             });
         }
-        let pooled = mean(&rows, n_out);
+        if pooled.iter().any(|v| !v.is_finite()) {
+            return Err(GpuError::shape(
+                PASS,
+                "pooled output contains a non-finite value",
+            ));
+        }
         Ok(Pass {
             rows,
             pooled,
@@ -546,7 +653,7 @@ mod tests {
 
     #[test]
     #[ignore = "needs a CUDA card"]
-    fn hw_media_spans_are_checked_before_the_pass() {
+    fn hw_pass_inputs_are_checked_before_the_pass() {
         use bloomery_gpu::media::MediaSpan;
 
         crate::tests::with_model(64, 2048, |split, hp| -> Result<(), GpuError> {
@@ -592,6 +699,58 @@ mod tests {
                 )
                 .is_ok()
             );
+            for scale in &mut enc.consts.scale {
+                scale.copy_from_host(enc.gpu.stream(), &vec![1.0; scale.len()])?;
+            }
+            for n in [1, hp.n_ctx] {
+                let ids = vec![0; n];
+                let taps = enc.pass(&ids, true)?.taps.unwrap();
+                let mut inputs = vec![taps.inp_scaled];
+                inputs.extend(taps.l_out[..hp.n_layer - 1].iter().cloned());
+                assert_eq!(enc.replay_layers(&ids, &inputs)?.l_out, taps.l_out);
+                for l in 0..hp.n_layer {
+                    for row in 0..n {
+                        let at = row * hp.n_embd;
+                        let original = inputs[l][at];
+                        inputs[l][at] += (l + row + 1) as f32;
+                        let replay = enc.replay_layers(&ids, &inputs)?;
+                        assert_ne!(replay.l_out[l], taps.l_out[l], "layer {l}, row {row}");
+                        for other in 0..hp.n_layer {
+                            if other != l {
+                                assert_eq!(replay.l_out[other], taps.l_out[other]);
+                            }
+                        }
+                        inputs[l][at] = original;
+                    }
+                    for len in [n * hp.n_embd - 1, n * hp.n_embd + 1] {
+                        let mut bad = inputs.clone();
+                        bad[l].resize(len, 0.0);
+                        assert!(matches!(
+                            enc.replay_layers(&ids, &bad),
+                            Err(GpuError::Shape { what: PASS, detail })
+                                if detail == format!("replay layer {l} needs {n} finite rows of {}", hp.n_embd)
+                        ));
+                    }
+                    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                        let mut bad = inputs.clone();
+                        bad[l][n * hp.n_embd - 1] = value;
+                        assert!(matches!(
+                            enc.replay_layers(&ids, &bad),
+                            Err(GpuError::Shape { what: PASS, detail })
+                                if detail == format!("replay layer {l} needs {n} finite rows of {}", hp.n_embd)
+                        ));
+                    }
+                }
+                for len in [0, hp.n_layer - 1, hp.n_layer + 1] {
+                    let mut bad = inputs.clone();
+                    bad.resize(len, inputs[0].clone());
+                    assert!(matches!(
+                        enc.replay_layers(&ids, &bad),
+                        Err(GpuError::Shape { what: PASS, detail })
+                            if detail == "replay needs one input per layer"
+                    ));
+                }
+            }
             Ok(())
         })
         .unwrap();

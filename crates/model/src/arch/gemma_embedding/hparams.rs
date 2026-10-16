@@ -12,6 +12,9 @@ use crate::placement::PlacementError;
 
 use super::names;
 
+/// The model card's maximum input length, in tokens.
+pub const CARD_CTX: usize = 2048;
+
 /// The hyperparameters of one `gemma-embedding` file with its dense head.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hparams {

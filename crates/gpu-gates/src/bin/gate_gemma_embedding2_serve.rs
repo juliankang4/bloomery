@@ -55,7 +55,7 @@ mod gate {
         tokens: u64,
     }
 
-    fn cases(man: &RefManifest) -> Result<Vec<Case>, GateError> {
+    fn cases(man: &RefManifest, ids_set: &str) -> Result<Vec<Case>, GateError> {
         let mut cases = Vec::new();
         for line in &man.header.other {
             let Some(rest) = line.strip_prefix("# tokenize\t") else {
@@ -72,7 +72,7 @@ mod gate {
             cases.push(Case {
                 name: name.to_owned(),
                 text: std::fs::read_to_string(
-                    data_dir().join(IDS_SET).join(format!("{name}.txt")),
+                    data_dir().join(ids_set).join(format!("{name}.txt")),
                 )?,
                 tokens,
             });
@@ -159,9 +159,10 @@ mod gate {
         cases: &[Case],
         server: &RefManifest,
         cpu: &RefManifest,
+        model: &str,
     ) -> Result<bool, GateError> {
         let mut ok = true;
-        let name = Path::new(MODEL)
+        let name = Path::new(model)
             .file_name()
             .ok_or("embedding file name")?
             .to_string_lossy();
@@ -208,7 +209,7 @@ mod gate {
         Ok(cmd)
     }
 
-    fn args(model: &str, side: bool) -> Vec<&str> {
+    fn args<'a>(model: &'a str, side: bool, embedding: &'a str) -> Vec<&'a str> {
         let mut args = vec![
             "-m",
             model,
@@ -222,7 +223,7 @@ mod gate {
             "1",
         ];
         if side {
-            args.extend(["--embd-model", MODEL]);
+            args.extend(["--embd-model", embedding]);
         }
         args
     }
@@ -236,10 +237,16 @@ mod gate {
         Ok((plan.u64("card_experts")?, plan.u64("host_experts")?))
     }
 
-    fn plan(model: &str, dir: &Path, side: bool, budget: u64) -> Result<Log, GateError> {
+    fn plan(
+        model: &str,
+        embedding: &str,
+        dir: &Path,
+        side: bool,
+        budget: u64,
+    ) -> Result<Log, GateError> {
         std::fs::create_dir_all(dir)?;
         let err = dir.join("plan.err");
-        let (status, _) = plan_run(cmd(budget)?, &args(model, side), &err)?;
+        let (status, _) = plan_run(cmd(budget)?, &args(model, side, embedding), &err)?;
         if !status.success() {
             return Err(format!("plan failed ({status}): {}", err.display()).into());
         }
@@ -381,12 +388,39 @@ mod gate {
         );
         let mut args_it = std::env::args().skip(1);
         let mut dir = PathBuf::from("target/embedding2-serve-gate");
+        let mut v1 = false;
         while let Some(a) = args_it.next() {
+            if a == "--v1" && !v1 {
+                v1 = true;
+                continue;
+            }
             if a != "--dir" {
-                return Err(format!("unknown argument {a}; takes --dir DIR").into());
+                return Err(format!("unknown argument {a}; takes --v1 and --dir DIR").into());
             }
             dir = args_it.next().ok_or("--dir needs DIR")?.into();
         }
+        use refset::arch::gemma_embedding as emb1;
+        let (embedding, digest, server_family, cpu_family, ids_set, arch, ctx) = if v1 {
+            (
+                emb1::MODEL,
+                emb1::MODEL_SHA256,
+                &emb1::SERVER,
+                &emb1::TEXT_CPU,
+                emb1::TOKENIZER.sets[0],
+                emb1::ARCH,
+                model::arch::gemma_embedding::hparams::CARD_CTX,
+            )
+        } else {
+            (
+                MODEL,
+                MODEL_SHA256,
+                &SERVER,
+                &TEXT_CPU,
+                IDS_SET,
+                "gemma-embedding2",
+                8192,
+            )
+        };
         std::fs::create_dir_all(&dir)?;
         if gpu_census::census()?.len() != 1 {
             return Err(
@@ -394,7 +428,7 @@ mod gate {
                     .into(),
             );
         }
-        if sha256(Path::new(MODEL))? != MODEL_SHA256 {
+        if sha256(Path::new(embedding))? != digest {
             return Err("embedding model sha256 differs from the server set".into());
         }
         let model_path = ref_model_path()?;
@@ -402,17 +436,23 @@ mod gate {
         if Split::open(model)?.architecture() != Some("qwen3moe") {
             return Err("serve gate needs Qwen3-30B-A3B-Instruct-2507 Q4_K_M".into());
         }
-        let server = Emb2Set::open(&SERVER.path(SERVER.sets[0]), &SERVER)?.man;
-        let cpu = Emb2Set::open(&TEXT_CPU.path(TEXT_CPU.sets[0]), &TEXT_CPU)?.man;
-        let cases = cases(&server)?;
+        let server = Emb2Set::open(&server_family.path(server_family.sets[0]), server_family)?.man;
+        let cpu = Emb2Set::open(&cpu_family.path(cpu_family.sets[0]), cpu_family)?.man;
+        let cases = cases(&server, ids_set)?;
         let longest = cases.last().ok_or("server set: no text cases")?;
-        let plain = plan(model, &dir.join("plan-plain"), false, BUDGET)?;
-        let reserved = plan(model, &dir.join("plan-reserved"), true, BUDGET)?;
+        let plain = plan(model, embedding, &dir.join("plan-plain"), false, BUDGET)?;
+        let reserved = plan(model, embedding, &dir.join("plan-reserved"), true, BUDGET)?;
         let seat = reserved
             .first(&record::EMBEDDING_SEAT)?
             .ok_or("no embedding_seat record")?;
         let reserve = seat.u64("reserve")?;
-        let compensated = plan(model, &dir.join("plan-compensated"), true, BUDGET + reserve)?;
+        let compensated = plan(
+            model,
+            embedding,
+            &dir.join("plan-compensated"),
+            true,
+            BUDGET + reserve,
+        )?;
         let (base_card, base_host) = split(&plain)?;
         let (less_card, more_host) = split(&reserved)?;
         println!(
@@ -436,11 +476,11 @@ mod gate {
         check(
             &mut ok,
             "reserve_record",
-            seat.word("arch")? == "gemma-embedding2"
+            seat.word("arch")? == arch
                 && reserve == seat.u64("bytes")?
-                && seat.u64("ctx")? == 8192
+                && seat.u64("ctx")? == ctx as u64
                 && reserve
-                    == bloomery_gpu_gemma_embedding2::card_bytes(&Split::open(MODEL)?, 8192)?,
+                    == bloomery_gpu_gemma_embedding2::card_bytes(&Split::open(embedding)?, ctx)?,
         );
         check(
             &mut ok,
@@ -453,7 +493,7 @@ mod gate {
             let work = dir.join(arm);
             std::fs::create_dir_all(&work)?;
             let err = work.join("server.err");
-            let mut served = Served::spawn_cmd(cmd(budget)?, &args(model, side), &work)?;
+            let mut served = Served::spawn_cmd(cmd(budget)?, &args(model, side, embedding), &work)?;
             let addr = served.address(&err, 600, Duration::from_secs(1))?;
             let url = |path: &str| format!("http://{addr}{path}");
             let ids = tokenized(&url, PROMPT)?;
@@ -478,7 +518,7 @@ mod gate {
                 );
             } else {
                 check(&mut ok, "idle_greedy_same", tokens == baseline);
-                ok &= vectors(&url, &cases, &server, &cpu)?;
+                ok &= vectors(&url, &cases, &server, &cpu, embedding)?;
                 let (status, text) = curl(&url("/v1/models"), None, false)?;
                 let models = json_of("/v1/models", status, &text)?;
                 let chat_name = models["data"][0]["id"].as_str().ok_or("no chat model id")?;
@@ -486,13 +526,13 @@ mod gate {
                     &mut ok,
                     "embedding_model_listed",
                     models["data"][1]["id"]
-                        == Path::new(MODEL)
+                        == Path::new(embedding)
                             .file_name()
                             .ok_or("embedding file name")?
                             .to_string_lossy()
                             .as_ref()
                         && models["data"][1]["meta"]["n_embd"] == 768
-                        && models["data"][1]["meta"]["n_ctx"] == 8192,
+                        && models["data"][1]["meta"]["n_ctx"] == ctx,
                 );
                 check(
                     &mut ok,
@@ -529,7 +569,7 @@ mod gate {
                     "context_refused",
                     refusal(
                         &url,
-                        json!({"input":vec![1;8193]}),
+                        json!({"input":vec![1;ctx + 1]}),
                         400,
                         "exceed_context_size_error",
                     )?,
@@ -543,7 +583,7 @@ mod gate {
             println!("{arm} server stopped {}", served.stop()?);
         }
         let err = dir.join("embedding-as-chat.err");
-        let (status, lines) = plan_run(cmd(BUDGET)?, &["-m", MODEL], &err)?;
+        let (status, lines) = plan_run(cmd(BUDGET)?, &["-m", embedding], &err)?;
         let text = lines.join("\n");
         check(
             &mut ok,

@@ -258,11 +258,34 @@ mod tests {
             }
         )));
         let items = coverage::check(s, &read.tensors);
-        assert!(
-            items
-                .iter()
-                .any(|u| u.feature == "a layer program for gemma-embedding")
-        );
+        assert!(items.iter().any(|u| u.feature.contains("bidirectional")));
+    }
+
+    #[test]
+    fn the_dense_head_and_three_head_trunk_have_one_program() {
+        let mut read = load(keys(), &tensors(), "llama").unwrap();
+        read.spec.hidden = 768;
+        for layer in &mut read.spec.layers {
+            let Mixer::Gqa(g) = &mut layer.mixer else {
+                panic!("not GQA")
+            };
+            g.head_dim = 256;
+            g.value_dim = 256;
+            g.rope.dims = 256;
+            layer.ffn = Ffn::Dense {
+                ff: 1152,
+                act: Act::GeGlu,
+            };
+        }
+        read.spec.encoder.as_mut().unwrap().proj = vec![3072, 768];
+        for t in &mut read.tensors.tensors {
+            if t.dims.len() >= 2 {
+                t.ty = gguf::GgmlType::Q8_0;
+            }
+        }
+        assert!(coverage::check(&read.spec, &read.tensors).is_empty());
+        read.spec.encoder.as_mut().unwrap().proj.reverse();
+        assert!(!coverage::check(&read.spec, &read.tensors).is_empty());
     }
 
     #[test]

@@ -10684,8 +10684,9 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-15): gate-gpu-nemotron-serve joins them; its recipe builds bloomery-serve beside its own bin
     # PIN(2026-10-16): gate-gpu-nemotron-h-moe-serve joins them; the same seat gate on the moe body
     # PIN(2026-10-16): the embedding serve gate also builds bloomery-serve, including its V4.1 seat.
+    # PIN(2026-10-17): the v1 embedding serve gate builds the same server and its V4.1 seat.
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
-                      "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
+                      "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding-serve", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
                       "gate-gpu-lev-serve", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
                       "gate-gpu-qwen3-serve", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-ptx-spill"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")

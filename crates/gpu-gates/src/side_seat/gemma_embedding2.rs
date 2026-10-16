@@ -1,4 +1,4 @@
-//! EmbeddingGemma 2's side-seat row; the encoder owns its projection and pooling.
+//! The EmbeddingGemma side seats; the encoder owns projection and pooling.
 
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ pub(super) fn bytes(split: &Split, ctx: usize) -> Result<u64, String> {
 pub(super) fn open(side: &Side, seat: &EncoderSeat) -> Result<Box<dyn Embed>, String> {
     let load = || -> Result<Box<dyn Embed>, crate::GateError> {
         let split = Split::open(&side.path)?;
-        let dims = architectures::gemma_embedding2_dims(&split)?;
+        let dims = architectures::gemma_embedding_dims(&split)?;
         let actual = card_bytes(&split, side.ctx)?
             .checked_add(side.projector.as_ref().map_or(0, |p| p.card.total()))
             .ok_or("embedding model and tower byte count overflows")?;

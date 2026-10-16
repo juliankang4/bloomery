@@ -1276,6 +1276,13 @@ gate-gpu-gemma-embedding2-serve:
 # text case of mainline's card set (just dump-ref-emb2) through one pass, its taps within the CPU twin's band,
 # a rerun bit for bit, and the refusals by name. The
 # key bounds first hold every key of the symmetric mask, independently of the tap bands.
+# Both text encoders use the same pass and serving gates, with their own pinned sets.
+gate-gpu-gemma-embedding-e2e:
+    BLOOMERY_MODEL=gemma-embedding ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e --v1'
+
+gate-gpu-gemma-embedding-serve:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2 --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --v1 --dir "$D"'
+
 gate-gpu-gemma-embedding2-e2e:
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gemma-embedding2 --lib -- --include-ignored'
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding2::spec::tests::key_bounds_are_the_symmetric_mask --exact'

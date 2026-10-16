@@ -42,7 +42,7 @@ pub enum Program {
     /// whose routed up and down stacks and shared expert are IQ2_XXS read by
     /// `iq2_xxs_gemv_sel` ([`BOLT_LEG`]).
     NemotronHMoeBody,
-    /// The gemma-embedding2 encoder (`crates/gpu-gemma-embedding2`): one
+    /// The EmbeddingGemma encoders (`crates/gpu-gemma-embedding2`): one
     /// pass of a dense trunk on a card, no routed experts.
     GemmaEmbedding2Body,
 }
@@ -59,8 +59,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::MiMo2 => Some(Program::Mimo2Body),
         Arch::NemotronH => Some(Program::NemotronHBody),
         Arch::NemotronHMoe => Some(Program::NemotronHMoeBody),
-        Arch::GemmaEmbedding => None,
-        Arch::GemmaEmbedding2 => Some(Program::GemmaEmbedding2Body),
+        Arch::GemmaEmbedding | Arch::GemmaEmbedding2 => Some(Program::GemmaEmbedding2Body),
     }
 }
 

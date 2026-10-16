@@ -595,9 +595,8 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::GemmaEmbedding2Body],
-        at: "gpu/src/flash_gqa_prefill.rs enqueue_256_p2_lower (each row's first key from its \
-             reach; two query heads a block)",
-        runs: |n| matches!(n, Need::Bidirectional { head: 256, group, .. } if group.is_multiple_of(2)),
+        at: "gpu/src/flash_gqa_prefill.rs enqueue_256_p1_lower, enqueue_256_p2_lower (each row's first key from its reach)",
+        runs: |n| matches!(n, Need::Bidirectional { head: 256, group, .. } if *group > 0),
     },
     Available {
         programs: &[Program::GemmaEmbedding2Body],
@@ -631,7 +630,7 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::GemmaEmbedding2Body],
         at: "gpu/src/elem.rs enqueue_geglu between gpu/src/site.rs gemm launches",
-        runs: |n| matches!(n, Need::GeGlu { ff: 2048 }),
+        runs: |n| matches!(n, Need::GeGlu { ff: 1152 | 2048 }),
     },
     Available {
         programs: &[Program::GemmaEmbedding2Body],
@@ -662,7 +661,7 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::GemmaEmbedding2Body],
         at: "gpu/src/site.rs gemm (output); gpu-gemma-embedding2/src/pass.rs mean",
-        runs: |n| matches!(n, Need::Pooled { proj } if proj.as_slice() == [768]),
+        runs: |n| matches!(n, Need::Pooled { proj } if matches!(proj.as_slice(), [768] | [3072, 768])),
     },
 ];
 

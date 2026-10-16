@@ -1,11 +1,8 @@
-//! GPU gate for EmbeddingGemma 2's encoder (`bloomery-gpu-gemma-embedding2`)
-//! end to end on the Q8_0 file the sets are dumped from ([`MODEL`], held to
-//! its sha256), against llama.cpp mainline's text set dumped on the card
-//! ([`TEXT`]) and its CPU twin ([`TEXT_CPU`]), both read through
-//! [`refset::emb2::Emb2Set::open`]: each case the set names, its ids read from the
-//! tokenizer oracle's gemma4 set ([`IDS_SET`]) and held to the set's count
-//! and digest, through one pass at the load's context with its taps read
-//! back.
+//! End-to-end GPU gate for both EmbeddingGemma encoders. With `--v1` it
+//! reads v1's text, CPU-twin and SentencePiece sets; without arguments it
+//! reads v2's sets. Each model is held to its pinned file digest. Every
+//! case's ids are checked against the tokenizer set's count and digest
+//! before a pass at the model's context, with taps read back.
 //!
 //! A row's band is [`TWIN`] times the CPU twin's own distance from the card
 //! set, and at least [`FLOOR`]: the twin is the floor any two realizations of
@@ -13,16 +10,19 @@
 //! row is within its band only when its distance and the twin's are finite.
 //!
 //! 1. (t) Per case: `inp_scaled` bit for bit (the host's token rows times
-//!    `√hidden`, the one f32 multiply `ggml_scale` makes); `inp_per_layer`,
+//!    `√hidden`, the one f32 multiply `ggml_scale` makes); v2's `inp_per_layer`,
 //!    every layer's `l_out`, `result_norm`, the token rows against `embd`
-//!    and their mean ([`Pass::pooled`]) against `pooled`, each within its
-//!    band. A case longer than a sliding layer's reach plus one catches a
-//!    dropped window; a set with no such case fails by name. The host test
+//!    and the pooled vector ([`Pass::pooled`]) against `pooled`, each within its
+//!    band. V1's layer outputs are replayed from the oracle's preceding residual
+//!    (layer 0 from `inp_scaled`); free-running layer errors are diagnostic rows.
+//!    Its `result_norm`, token rows and pooled vector remain free-running.
+//!    V2's layer outputs remain free-running. A case longer than a sliding
+//!    layer's reach plus one catches a dropped window; a set with no such case fails by name. The host test
 //!    `key_bounds_are_the_symmetric_mask` holds the exact key edges; every
 //!    case holds the global layers.
 //! 2. (d) The longest case run again with no taps is bit for bit the first
 //!    run's rows.
-//! 3. (i) Image-only and `mix_free-448x448` inputs assembled by the serving helper,
+//! 3. (i) V2's image-only and `mix_free-448x448` inputs assembled by the serving helper,
 //!    pooled and normalized against the server card set and its CPU twin.
 //! 4. (r) Refused by name, the load untouched after each: a pass of no ids,
 //!    of one id past the load's context and of an id past the vocabulary,
@@ -57,9 +57,9 @@ mod gate {
     };
     use bloomery_gpu_gemma_embedding2::{Encoder, Pass, card_bytes};
     use gguf::Split;
-    use model::arch::gemma_embedding2::hparams::{CARD_CTX, Hparams};
+    use model::arch::gemma_embedding2::hparams::CARD_CTX;
     use refset::arch::gemma_embedding2::{
-        IDS_SET, MODEL, MODEL_SHA256, REL_FLOOR as FLOOR, TEXT, TEXT_CPU, TWIN,
+        IDS_SET, MODEL_SHA256, REL_FLOOR as FLOOR, TEXT, TEXT_CPU, TWIN,
     };
     use refset::ik::RefHeader;
     use refset::tokenizer::read_ids;
@@ -85,8 +85,8 @@ mod gate {
     /// The cases `man`'s `# case <id> <n> <path> <sha256>` lines name, each
     /// one's ids read from [`IDS_SET`] and refused by name when their count
     /// or their file's digest is not the line's.
-    fn cases(man: &RefManifest) -> Result<Vec<Case>, GateError> {
-        let dir = data_dir().join(IDS_SET);
+    fn cases(man: &RefManifest, ids_set: &str) -> Result<Vec<Case>, GateError> {
+        let dir = data_dir().join(ids_set);
         let mut out = Vec::new();
         for line in &man.header.other {
             let Some(rest) = line.strip_prefix("# case\t") else {
@@ -161,12 +161,13 @@ mod gate {
         c: &Case,
         man: &RefManifest,
         cpu: &RefManifest,
-        hp: &Hparams,
+        n_layer: usize,
+        teacher_forced: bool,
     ) -> Result<(bool, Pass), GateError> {
         let t0 = Instant::now();
         let pass = enc.pass(&c.ids, true)?;
         let taps = pass.taps.as_ref().ok_or("a pass with taps returned none")?;
-        assert_eq!(taps.l_out.len(), hp.n_layer, "missing l_out taps");
+        assert_eq!(taps.l_out.len(), n_layer, "missing l_out taps");
         let row = |m: &RefManifest, name: &str| tap(m, &format!("{}/{name}", c.id));
         let held = |name: &str, ours: &[f32]| -> Result<Held, GateError> {
             Ok(Held::of(ours, &row(man, name)?, &row(cpu, name)?))
@@ -176,13 +177,35 @@ mod gate {
         let exact = same_bits(&taps.inp_scaled, &row(man, "inp_scaled")?);
         lines.push(format!("inp_scaled bits {}", verdict(exact)));
         ok &= exact;
-        let h = held("inp_per_layer", &taps.inp_per_layer)?;
-        lines.push(h.line("inp_per_layer"));
-        ok &= h.ok();
+        if !teacher_forced {
+            let h = held("inp_per_layer", &taps.inp_per_layer)?;
+            lines.push(h.line("inp_per_layer"));
+            ok &= h.ok();
+        }
+        // PIN(2026-10-16): v1 taps use oracle inputs to isolate accumulated FA rounding;
+        // final outputs stay free-running and all bands stay unchanged.
+        let replay = if teacher_forced {
+            let mut inputs = vec![row(man, "inp_scaled")?];
+            for l in 1..n_layer {
+                inputs.push(row(man, &format!("l_out-{}", l - 1))?);
+            }
+            Some(enc.replay_layers(&c.ids, &inputs)?)
+        } else {
+            None
+        };
+        let layer_taps = replay.as_ref().unwrap_or(taps);
+        assert_eq!(layer_taps.l_out.len(), n_layer, "missing replay l_out taps");
         // The worst layer by its distance over its band.
         let mut worst = (0.0f64, String::new());
-        for (l, ours) in taps.l_out.iter().enumerate() {
+        for (l, ours) in layer_taps.l_out.iter().enumerate() {
             let h = held(&format!("l_out-{l}"), ours)?;
+            if teacher_forced {
+                let free = held(&format!("l_out-{l}"), &taps.l_out[l])?;
+                println!(
+                    "(layers) {} {l}: free {:.9e}, teacher {:.9e}, twin {:.9e}, band {:.9e}",
+                    c.id, free.r, h.r, h.twin, h.band
+                );
+            }
             if !h.ok() {
                 println!(
                     "(t) {}: {} past its band {}",
@@ -569,33 +592,50 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let clip_manifest = match args.as_slice() {
-            [] => None,
-            [flag, path] if flag == "--video-clips" => Some(Path::new(path)),
+        let (v1, clip_manifest) = match args.as_slice() {
+            [] => (false, None),
+            [arg] if arg == "--v1" => (true, None),
+            [flag, path] if flag == "--video-clips" => (false, Some(Path::new(path))),
             _ => {
                 return Err(format!(
-                    "expected no arguments or --video-clips <manifest>; got {args:?}"
+                    "expected --v1, --video-clips <manifest>, or no arguments; got {args:?}"
                 )
                 .into());
             }
         };
+        use refset::arch::gemma_embedding as emb1;
+        let (text, text_cpu, ids_set, model_sha) = if v1 {
+            (
+                &emb1::TEXT,
+                &emb1::TEXT_CPU,
+                emb1::TOKENIZER.sets[0],
+                emb1::MODEL_SHA256,
+            )
+        } else {
+            (&TEXT, &TEXT_CPU, IDS_SET, MODEL_SHA256)
+        };
         let model = ref_model_path()?;
         let digest = sha256(&model)?;
-        if digest != MODEL_SHA256 {
+        if digest != model_sha {
             return Err(format!(
-                "{MODEL}: sha256 {digest}, the sets are dumped from {MODEL_SHA256}"
+                "{}: sha256 {digest}, the sets are dumped from {model_sha}",
+                model.display()
             )
             .into());
         }
         let split = Split::open(&model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let hp = Hparams::read(&split).map_err(|e| format!("{MODEL}: {e}"))?;
-        let read = model::arch::spec(&split).map_err(|e| format!("{MODEL}: {e}"))?;
+        let read = model::arch::spec(&split).map_err(|e| format!("{}: {e}", model.display()))?;
         let encoder = read
             .spec
             .encoder
             .as_ref()
             .ok_or("gemma-embedding2 has no encoder description")?;
-        let ctx = CARD_CTX;
+        let bound = if v1 {
+            model::arch::gemma_embedding::hparams::CARD_CTX
+        } else {
+            CARD_CTX
+        };
+        let ctx = bound.min(read.spec.ctx_train as usize);
         let bytes = card_bytes(&split, ctx)?;
         if let Some(manifest) = clip_manifest {
             let mut enc = Encoder::open(split, ctx, Gpu::new()?)?;
@@ -605,15 +645,16 @@ mod gate {
                 Err(checks_failed())
             };
         }
-        let man = open(&TEXT)?;
-        let cpu = open(&TEXT_CPU)?;
+        let man = open(text)?;
+        let cpu = open(text_cpu)?;
         check_case_identities(&man.header, &cpu.header)?;
-        let cases = cases(&man)?;
+        let cases = cases(&man, ids_set)?;
         let gpu = Gpu::new()?;
         println!(
-            "gate_gemma_embedding2_e2e: device {}: {MODEL} at {ctx} positions, card figure {bytes} B; \
+            "gate_gemma_embedding2_e2e: device {}: {} at {ctx} positions, card figure {bytes} B; \
              {} cases; band {TWIN} x the CPU twin, at least {FLOOR:e}",
             gpu.device_name()?,
+            model.display(),
             cases.len()
         );
         let mut ok = window(&encoder.reach, &cases);
@@ -622,15 +663,16 @@ mod gate {
         elapsed("(open)", &t);
         let mut longest: Option<(usize, Pass)> = None;
         for (i, c) in cases.iter().enumerate() {
-            let r = case(&mut enc, c, &man, &cpu, &hp).map(|(pass_ok, pass)| {
-                if longest
-                    .as_ref()
-                    .is_none_or(|(j, _)| c.ids.len() > cases[*j].ids.len())
-                {
-                    longest = Some((i, pass));
-                }
-                pass_ok
-            });
+            let r =
+                case(&mut enc, c, &man, &cpu, read.spec.layers.len(), v1).map(|(pass_ok, pass)| {
+                    if longest
+                        .as_ref()
+                        .is_none_or(|(j, _)| c.ids.len() > cases[*j].ids.len())
+                    {
+                        longest = Some((i, pass));
+                    }
+                    pass_ok
+                });
             ok &= clause("(t)", &c.id, r);
         }
         if let Some((i, first)) = longest {
@@ -654,10 +696,12 @@ mod gate {
             ok &= clause(
                 "(r)",
                 "refusals",
-                refusals(&mut enc, c, &first.rows, hp.n_vocab),
+                refusals(&mut enc, c, &first.rows, read.spec.vocab as usize),
             );
         }
-        ok &= clause("(i)", "image inputs", images(&mut enc, &model));
+        if !v1 {
+            ok &= clause("(i)", "image inputs", images(&mut enc, &model));
+        }
         let past = Split::open(&model).map_err(|e| format!("open {}: {e}", model.display()))?;
         let refused = refused_by(
             &Encoder::open(past, ctx + 1, Gpu::new()?),
