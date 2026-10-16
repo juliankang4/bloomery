@@ -1218,9 +1218,10 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   (`BLOOMERY_CARD_BUDGET=70G BLOOMERY_NVTIER_BYTES=23G`), GLM plans a 38-slot arena (24,696,061,952 B), loads and
   answers (on `905e7ac5`; under a given card budget this change plans as before).
 - The card leg: the contributor (answer 19).
-- `probe_nvread`'s per-part drop (`evict_rows`) leaves some pages of a part resident on ext4, so a run redraws batches.
-  The cause is not proven; one guess is large folios that straddle two experts
-  ([#71](https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679)).
+- `probe_nvread` checks each per-part eviction with `mincore`. If pages remain, it retries over the whole shard
+  and prints the retry outside the timed arms. This covers large page-cache folios that cross an expert or tensor
+  boundary ([#137](https://github.com/midagedev/bloomery/issues/137)). A batch must still have no resident pages
+  before the cache arm; pages held by another process can still force a redraw.
 
 **P5.**
 - The `[derived]` bands and criteria of 9.7 and 9.8 still use their first inputs. `nodes_scale`'s derivation script, in
