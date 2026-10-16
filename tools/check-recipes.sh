@@ -466,7 +466,7 @@ blk_fixturevariants() {
     case $tag in '' | *[!a-z0-9]*) echo "check-recipes: $tsv: '$tag' is not lower-case letters and digits" >&2; return 1 ;; esac
     case " $tags " in *" $tag "*) echo "check-recipes: $tsv names the tag $tag twice" >&2; return 1 ;; esac
     tags="$tags $tag"
-    grep -E "__fixture_dir=[a-z0-9]+ ;;" "$rp" | grep -vE "=(self|none) ;;" | grep -qE "(^|[ (|])$family([ )|]|\$)" ||
+    grep -E "__fixture_dir=[a-z0-9]+ ;;" "$rp" | grep -vE "=(self|none) ;;" | grep -E "(^|[ (|])$family([ )|]|\$)" > /dev/null ||
       { echo "check-recipes: $tsv: family $family has no fixture directory row in $rp" >&2; return 1; }
     for r in $recipes; do
       grep -qE "^$r:" "$jf" || { echo "check-recipes: $tsv: $r is no recipe of the justfile" >&2; return 1; }

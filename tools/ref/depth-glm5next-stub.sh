@@ -779,7 +779,7 @@ refuse_case() {
   stub_run "$log" BLOOMERY_AB_ROUNDS=1 "$@" -- 512 "$arm"
   if [ "$RC" != 64 ]; then
     fail "lever-refuse $name" "rc $RC, want 64" "$log"
-  elif ! grep -F -- "depth-glm5next.sh: arm '$arm' is " "$log" | grep -qF -- " — $why"; then
+  elif ! grep -F -- "depth-glm5next.sh: arm '$arm' is " "$log" | grep -F -- " — $why" > /dev/null; then
     fail "lever-refuse $name" "no usage line of '$arm' ending in: $why" "$log"
   elif want "lever-refuse $name" "$log" 0 '^(ROW|WARMUP|FAIL|\[config\]|\[stub\] no lease)' &&
     want "lever-refuse $name" "$tmp/tmp/stub-gen-env" 0 '.'; then
