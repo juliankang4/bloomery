@@ -85,10 +85,10 @@ mod gate {
     use bloomery_gpu::host::slots::SlotMap;
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::host::tier::{TierAct, TierCard, TierOpen, TierSet, TierShape};
-    use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{
         GateError, beside, checks_failed, data_dir, prose_ids, ref_model_path, verdict,
     };
+    use bloomery_gpu_gates::{record, tier};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg, Levers, TIER_NODES,
     };
@@ -123,6 +123,13 @@ mod gate {
 
     enum Mode {
         Gate,
+        Measure {
+            arm: String,
+            gib: u64,
+        },
+        MeasureNode0 {
+            gib: u64,
+        },
         /// Node 0 of the bits and lost node 1 clauses: the plan under `gib`,
         /// its run written to `out`, node 1's process `server` killed after.
         Node0 {
@@ -138,9 +145,18 @@ mod gate {
 
     fn parse_args() -> Result<Mode, GateError> {
         const USAGE: &str = "usage: gate_qwen38_nodes (node 0 modes, run by the gate: --node0 \
-                             <gib> <out> <server pid> | --hold0 <gib>)";
+                             <gib> <out> <server pid> | --hold0 <gib>) or --measure \
+                             <local|node> <gib>";
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let gib = |s: &str| s.parse::<u64>().map_err(|e| format!("{s:?}: {e}: {USAGE}"));
+        let gib = |s: &str| -> Result<u64, GateError> {
+            let n = s
+                .parse::<u64>()
+                .map_err(|e| format!("{s:?}: {e}: {USAGE}"))?;
+            if n == 0 || n > TOP_GIB {
+                return Err(format!("budget must be in 1..={TOP_GIB} GiB").into());
+            }
+            Ok(n)
+        };
         Ok(
             match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
                 [] => Mode::Gate,
@@ -152,6 +168,11 @@ mod gate {
                         .map_err(|e| format!("{server:?}: {e}: {USAGE}"))?,
                 },
                 ["--hold0", g] => Mode::Hold0 { gib: gib(g)? },
+                ["--measure", arm @ ("local" | "node"), g] => Mode::Measure {
+                    arm: arm.to_string(),
+                    gib: gib(g)?,
+                },
+                ["--measure-node0", g] => Mode::MeasureNode0 { gib: gib(g)? },
                 _ => return Err(USAGE.into()),
             },
         )
@@ -1375,11 +1396,92 @@ mod gate {
         Ok(())
     }
 
+    fn measure(c: &Common, gib: u64) -> Result<(), GateError> {
+        let nodes = bloomery_levers::tier_nodes()?;
+        let (arm, card, at) = match nodes.as_slice() {
+            [] => {
+                let own = bloomery_gpu::census()?;
+                let card = own.first().ok_or("no local tier card")?;
+                ("local", spec_of_device(card), None)
+            }
+            [addr] => ("node", node_card(*addr)?.0, Some(*addr)),
+            _ => return Err("tier cost needs exactly one tier".into()),
+        };
+        let machine = c.machine(card)?;
+        let plan = plan_under(&c.inputs, &machine, gib)?
+            .map_err(|why| format!("under {gib} GiB: {why}"))?;
+        let identity = format!(
+            "ctx={CTX} ub={} stage={:?} tier={:?} host={} host_bytes={}",
+            c.ub, plan.n_l, plan.tier_n_l, plan.host.experts, plan.host.expert_bytes
+        );
+        let mut s = c.open(&plan)?;
+        let loaded_at = s
+            .model()
+            .body(NAME)?
+            .hybrid()
+            .tiers()
+            .first()
+            .ok_or("no loaded tier")?
+            .node();
+        if loaded_at != at {
+            return Err(format!("{arm} loaded tier at {loaded_at:?}").into());
+        }
+        let warm = q38_history::history(&mut s, &c.ids, |_| Ok(()))?;
+        if !tier_structure(&s, &tier_layers(&plan))? {
+            return Err("tier structure or routing precondition failed".into());
+        }
+        let apps = Command::new("nvidia-smi")
+            .args(["--query-compute-apps=pid", "--format=csv,noheader,nounits"])
+            .output()?;
+        if !apps.status.success() {
+            return Err(format!("nvidia-smi: {}", String::from_utf8_lossy(&apps.stderr)).into());
+        }
+        let gpu_processes = std::str::from_utf8(&apps.stdout)?
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()?
+            .len();
+        let expected = if at.is_some() { 2 } else { 1 };
+        if gpu_processes != expected {
+            return Err(
+                format!("{arm} needs {expected} GPU processes, saw {gpu_processes}").into(),
+            );
+        }
+        s.clear()?;
+        let mut timed = Run::default();
+        let mut next = 0;
+        for &id in &c.ids[..PROMPT] {
+            next = q38_history::step(&mut s, &mut timed, id)?;
+        }
+        const N: usize = 96;
+        let start = Instant::now();
+        for _ in 0..N {
+            next = q38_history::step(&mut s, &mut timed, next)?;
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        record::Record::new(&record::TIER_COST)
+            .w("arm", arm)
+            .w("plan", identity)
+            .list("history", &warm.tokens)
+            .list("tokens", &timed.tokens)
+            .u("prompt", PROMPT)
+            .u("decode", N)
+            .f("tg_tps", N as f64 * 1000.0 / ms)
+            .f("step_ms", ms / N as f64)
+            .u("gpu_processes", gpu_processes)
+            .print();
+        Ok(())
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
+        record::at_main(NAME, record::GATE_QWEN38_NODES);
+        let mode = parse_args()?;
         let c = Common::new(&levers)?;
-        match parse_args()? {
+        match mode {
             Mode::Gate => {
                 if !bloomery_levers::tier_nodes()?.is_empty() {
                     return Err(
@@ -1396,6 +1498,32 @@ mod gate {
                 }
             }
             Mode::Hold0 { gib } => run_hold0(&c, gib),
+            Mode::Measure { arm, gib } => {
+                if !bloomery_levers::tier_nodes()?.is_empty() {
+                    return Err(
+                        format!("unset {TIER_NODES}: the harness owns its loopback node").into(),
+                    );
+                }
+                if arm == "local" {
+                    measure(&c, gib)
+                } else {
+                    let (_server, addr) = node1(None)?;
+                    let mut child = node0(&["--measure-node0".into(), gib.to_string()], addr)?;
+                    let line = child.wait_line("tier cost ", Duration::from_secs(900))?;
+                    if !child
+                        .wait_within(Duration::from_secs_f64(LOST_BOUND_S))?
+                        .is_some_and(|s| s.success())
+                    {
+                        return Err("tier cost child did not exit successfully".into());
+                    }
+                    println!("{line}");
+                    Ok(())
+                }
+            }
+            Mode::MeasureNode0 { gib } => {
+                lever_addr()?;
+                measure(&c, gib)
+            }
         }
     }
 

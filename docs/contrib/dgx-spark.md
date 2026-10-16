@@ -771,6 +771,34 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    by name. A stale image, bytes their generation overtook, is what item 4's order prevents, and `link_probe` counts it
    on the link's own ends: every 64-byte line carries its generation, and each card counts the lines that do not.
 
+**Reproduce the local-versus-node tier cost on one machine.** `tools/ref/tier-cost.sh` runs Qwen3.8's
+plan (b′) with the tier in the stage process, then with `tier_server` on the same card. It reuses the
+node gate's placement, warm history and child cleanup, the timing lease and witness, and the depth
+runners' alternating arm order. Build both binaries in the configured Spark environment:
+
+```sh
+cargo oxide build --arch sm_121 -- -p bloomery-gpu-gates --features gpu --release \
+  --bin gate_qwen38_nodes --bin tier_server
+bash tools/ref/tier-cost.sh --self-test
+bash tools/ref/tier-cost.sh --dry-run 16 6
+BLOOMERY_BOX_LOCAL=1 BLOOMERY_MODEL=qwen4exp \
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/<prediction>.card' \
+  ./tools/box.sh 'bash tools/ref/tier-cost.sh 16 6'
+```
+
+The arguments are the per-card budget in GiB (1 to 16, default 16) and paired rounds (2 to 100,
+default 6). The qwen4exp profile supplies the model and `corpus-prose.ids`. Each arm warms the same
+history, clears, feeds 32 prompt ids as steps, then times 96 greedy steps with full logits retained.
+`tg_tps` is 96 divided by that span; `step_ms` is the same span divided by 96, not a second clock.
+Each pair must have identical placement, history tokens and timed tokens, including across rounds.
+The output starts with `one machine, loopback: not a two-machine timing`. Its `PAIR` lines name
+`same_plan`, `same_history`, `same_tokens`, `local_gpu_processes=1` and `node_gpu_processes=2`.
+The `ratio tg_tps` and `ratio step_ms` lines report node/local and a paired Student t 95% interval
+over the round ratios, marked `[derived]`; raw arm logs and the binary's record schema stay in the
+printed `logs=` directory. A dry run prints commands only and labels them as not timing evidence.
+The node arm's two CUDA contexts share one GPU, so this measures the loopback setup, not a network
+transport cost. Two-machine timing waits for the off-host transport open item in section 10.
+
 ### 9.6 First step, and what it measured
 
 **Before two nodes run the engine.**

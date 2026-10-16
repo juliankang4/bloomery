@@ -1105,6 +1105,27 @@ impl Fields {
 
 use Ty::{Bool, Csv, F64, I64, List, Text, U64, Word};
 
+/// The node gate's optional timing record.
+pub static GATE_QWEN38_NODES: &[&Kind] = &[&TIER_COST];
+
+/// One warmed local or node tier sample on a fixed plan.
+pub static TIER_COST: Kind = Kind {
+    name: "tier_cost",
+    head: "tier cost",
+    parts: &[
+        key("arm", Ty::Word, ""),
+        key("plan", Ty::Text, ""),
+        key("history", Ty::List, "token ids"),
+        key("tokens", Ty::List, "token ids"),
+        key("prompt", Ty::U64, "tokens"),
+        key("decode", Ty::U64, "tokens"),
+        key("tg_tps", Ty::F64(6), "tok/s"),
+        key("step_ms", Ty::F64(6), "ms"),
+        key("gpu_processes", Ty::U64, ""),
+    ],
+    doc: "Plan (b') decode with a local or node tier after the same warm history.",
+};
+
 /// Where the placement puts the experts, before the load.
 pub static PLAN: Kind = Kind {
     name: "plan",
@@ -5132,6 +5153,14 @@ mod tests {
                 "tools/bloomery/schema/{bin}.jsonl is not {bin}'s schema: run just records-refresh"
             );
         }
+    }
+
+    #[test]
+    fn tier_cost_parser_fixture_is_current() {
+        assert_eq!(
+            schema("gate_qwen38_nodes", GATE_QWEN38_NODES),
+            include_str!("../../../tools/ref/data/tier-cost.schema.jsonl"),
+        );
     }
 
     /// A serve gate's `server` record names the binary, its process and the

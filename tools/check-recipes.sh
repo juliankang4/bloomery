@@ -342,6 +342,7 @@ blk_pytools() {
   selftests=(
     "tools/bloomery/manifest.py --self-test"
     "tools/bloomery/records.py --self-test"
+    "tools/ref/tier-cost.py --self-test"
     "tools/bloomery/rows.py --self-test"
     "tools/bloomery/route_trace.py --self-test"
     "tools/bloomery/selftest.py --self-test"
