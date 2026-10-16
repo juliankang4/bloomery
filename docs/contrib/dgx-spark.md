@@ -1147,16 +1147,14 @@ Where the gate holds a clause differently from its words below, the clause says 
   only. This rate must be positive when a table is read from NVMe; zero is allowed when none is. Unread rows and
   tables moved to the host add no fill. The row width is an input, the model's embedding length. The routed ids'
   arena misses remain the separate `Workload::fills` term.
-- **Expected sets.** The table of 9.8, pinned from a derivation script that moves into `tools/` beside the gate with its
-  own self-test, so the pins have one derivation. ~~The script is not in the tree yet. Until it is, the gate pins the
-  predictor's own cells, which match 9.8's table in criteria 2 and 7 and differ in criterion 5 (clause 5).~~ The script
-  is `tools/flow/nodes_scale.py`, with no code or method shared with the planner: node 0's share in real numbers by
-  9.2's rule, found by bisection, and each window an expectation over the count tuples of a token's slots, built one
-  slot at a time. It reads `crates/placement/tests/nodes_scale_inputs.tsv`, one row per input with its kind (measured,
+- **Expected sets.** `tools/flow/nodes_scale.py` derives the gate's cells with no code or method shared with the
+  planner: node 0's share in real numbers by 9.2's rule, found by bisection, and each window an expectation over the
+  count tuples of a token's slots, built one slot at a time. It reads `crates/placement/tests/nodes_scale_inputs.tsv`, one row per input with its kind (measured,
   derived or assumed) and source, and writes the 144 cells (a model, N, λ and A, at the gate's `RULER` and S₁ 1,000 and
   3,000 and at a 4 % ruler and S₁ 3,000) to `nodes_scale_cells.tsv` beside it; `--table` prints 9.8's table at the
-  gate's inputs and 9.7's (a) rows, and `--check` holds the file and both doc tables to them. Each value carries the
-  largest change one id moved between two used nodes makes, because the planner splits whole ids. Where that band holds
+  gate's inputs, 9.7's (a) rows and the N = 2 paging table below. `--check` holds the file and all three doc tables to
+  the derivation. Each value carries the largest change one id moved between two used nodes makes, because the
+  planner splits whole ids. Where that band holds
   a line (the NIC's half, the link share's tenth, twice the ruler), the cell names an edge, the gate pins its side by
   hand, and the planner's value is held to the band besides. `--self-test` runs hand-worked cases, the refusals and
   `--check`; `just check-recipes` runs it.
@@ -1199,6 +1197,27 @@ Where the gate holds a clause differently from its words below, the clause says 
   - M6: charge a node term at N = 1 → clause 1 red.
   - M7: `ruler` fixed at 2 % instead of read from the machine → clause 7 red on a synthetic machine whose ruler is 4 %
     (Qwen3.8 at N = 2 then gains under 8 % and must name node 1 idle).
+
+The N = 2 paging table is `[derived]` from the synthetic shapes and pool budgets above, printed by
+`python3 tools/flow/nodes_scale.py --table`. The rows use the gate's 10 ‰ ruler and S₁ 3,000 tok/s; paging is unchanged
+at its other ruler and prompt-rate inputs. Each node's count rounds the real-number split to the nearest id.
+`expected_sets` holds the planner to the total exactly and to each node within one id. These are not plans of the
+model files or measured NVMe reads. At A high, V4.1's derived paging is on node 1 only.
+
+| N = 2 at the gate's inputs | A | λ (µs) | Paged ids, total | Paged ids on node 0 | Paged ids on node 1 |
+|---|---|---|---|---|---|
+| V4.1 | low | 25 | 62 | 11 | 51 |
+| V4.1 | low | 70 | 62 | 28 | 34 |
+| V4.1 | high | 25 | 67 | 0 | 67 |
+| V4.1 | high | 70 | 67 | 0 | 67 |
+| GLM | low | 25 | 0 | 0 | 0 |
+| GLM | low | 70 | 0 | 0 | 0 |
+| GLM | high | 25 | 0 | 0 | 0 |
+| GLM | high | 70 | 0 | 0 | 0 |
+| Qwen3.8 | low | 25 | 0 | 0 | 0 |
+| Qwen3.8 | low | 70 | 0 | 0 | 0 |
+| Qwen3.8 | high | 25 | 0 | 0 | 0 |
+| Qwen3.8 | high | 70 | 0 | 0 | 0 |
 
 ## 10. Still open
 
