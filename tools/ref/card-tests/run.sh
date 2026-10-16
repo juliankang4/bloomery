@@ -26,7 +26,6 @@ tmp=${TMPDIR:-/tmp}
 tmp=$(mktemp -d "${tmp%/}/card-tests.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 n=0 failed=0
-
 # The copy: the lease code, the t table and gpu-ab.py, the tree's cards, and fixtures as the run cards
 # docs/cards/hcpre-ab.card (ab, rounds 5) and docs/cards/exclusive.card. tools/box.sh only has to
 # exist and name BLOOMERY_BOX_ENV (gpu-ab.py reads it); nothing runs it.
@@ -34,7 +33,7 @@ T=$tmp/tree
 mkdir -p "$T/tools/ref" "$T/docs/cards" "$tmp/old/tools" "$tmp/nocard/tools/ref"
 cp "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease-hold.sh" "$ROOT/tools/ref/card.py" "$ROOT/tools/ref/tdist.py" \
   "$ROOT/tools/ref/card-precheck.sh" "$T/tools/ref/"
-cp "$ROOT/tools/gpu-ab.py" "$T/tools/"
+cp "$ROOT/tools/gpu-ab.py" "$ROOT/tools/gate-bound.sh" "$T/tools/"
 cp "$ROOT"/docs/cards/*.card "$HERE/hcpre-ab.card" "$HERE/exclusive.card" "$T/docs/cards/"
 echo 'BLOOMERY_BOX_ENV' > "$T/tools/box.sh"
 cp "$T/tools/box.sh" "$tmp/old/tools/box.sh"
@@ -1186,7 +1185,8 @@ else
 fi
 
 # tools/gate.sh --oxide builds for the arch tools/arch.sh reads (BLOOMERY_ARCH, sm_86 unset) and refuses a value that is no arch by
-# name before cargo runs; a call without --oxide never reads it. The stub timeout drops its two words and the stub cargo prints its.
+# name before cargo runs; a call without --oxide never reads it. A call with a test filter passes cargo's output through and ends 78
+# when no test passed. The stub timeout drops its two words and the stub cargo prints its.
 GS=$tmp/gateshtree
 mkdir -p "$GS/tools" "$GS/stub"
 cp "$ROOT/tools/gate.sh" "$ROOT/tools/gate-bound.sh" "$ROOT/tools/arch.sh" "$GS/tools/"
@@ -1200,6 +1200,66 @@ run 'gate.sh: --oxide builds for BLOOMERY_ARCH' 0 '^cargo oxide test --arch sm_1
 run 'gate.sh: --oxide refuses a BLOOMERY_ARCH that is no arch, by name' 64 "gate.sh: BLOOMERY_ARCH is a CUDA arch.*got 'sm121'" gs BLOOMERY_ARCH=sm121
 GS_ARGS=(-p x --release --lib)
 run 'gate.sh: a plain cargo test never reads BLOOMERY_ARCH' 0 '^cargo test -p x --release --lib$' gs BLOOMERY_ARCH=sm121
+GS_ARGS=(-p x --release --lib -- f)
+run "gate.sh: a filter's call passes cargo's output through" 78 '^cargo test -p x --release --lib -- f$' gs
+has '  … and ends 78 when no test passed, by name' 'the filter f matched no test'
+# A filter's call whose FIFO cannot be made (here a link already holds its path) ends 70 before cargo runs, and the path it
+# found is never opened for writing.
+mkdir -p "$GS/fifo"
+printf '#!/bin/sh\necho %s\n' "$GS/log" > "$GS/fifo/mktemp"
+chmod +x "$GS/fifo/mktemp"
+echo keep > "$GS/target"
+ln -sf "$GS/target" "$GS/log.out"
+run "gate.sh: a FIFO it cannot make ends 70" 70 'mkfifo.*File exists' gs PATH="$GS/fifo:$GS/stub:$PATH"
+if [ "$(cat "$GS/target")" = keep ] && ! grep -q '^cargo ' "$tmp/out"; then pass '  … before cargo runs, and the linked file stays as it was'
+else fail '  … before cargo runs, and the linked file stays as it was' "cargo ran or the target changed" "$tmp/out"; fi
+
+# A log reader that fails turns a passing call red with its own code; cargo's failure, when there is one, is kept.
+mkdir -p "$GS/teefail"
+printf '%s\n' '#!/bin/sh' 'while IFS= read -r l; do printf "%s\n" "$l"; printf "%s\n" "$l" >> "$1"; done' 'exit 9' > "$GS/teefail/tee"
+printf '%s\n' '#!/bin/sh' 'echo "test result: ok. 1 passed; 0 failed"' 'exit "${GS_CARGO_RC:-0}"' > "$GS/teefail/cargo"
+chmod +x "$GS/teefail/tee" "$GS/teefail/cargo"
+run "gate.sh: a log reader that fails after a passing summary ends with its code" 9 'GATE RED \(exit 9\)' \
+  gs PATH="$GS/teefail:$GS/stub:$PATH"
+run "gate.sh: cargo's failure wins over the reader's" 3 'GATE RED \(exit 3\)' gs PATH="$GS/teefail:$GS/stub:$PATH" GS_CARGO_RC=3
+
+# A signal just after tee starts, on either side of publishing its pid, ends the runner before
+# cargo starts and leaves no tee waiting to open the FIFO.
+for gs_window in before-pid after-pid; do
+  for gs_signal in TERM:143 HUP:129; do
+    awk -v window="$gs_window" '
+      function stop() { print "  echo startup-signal-$GS_START_SIGNAL"; print "  kill -s \"$GS_START_SIGNAL\" \"$$\"" }
+      $0 == "  tee \"$LOG\" < \"$LOG.out\" &" {
+        print
+        print "  echo \"$!\" > \"$GS_TEE_PID\""
+        if (window == "before-pid") stop()
+        next
+      }
+      $0 == "  TEE_PID=$!" && window == "after-pid" { print; stop(); next }
+      { print }
+    ' "$ROOT/tools/gate.sh" > "$GS/tools/gate.sh"
+    gs_pidfile=$GS/tee-$gs_window-${gs_signal%:*}.pid
+    run "gate.sh: ${gs_signal%:*} just after tee starts ($gs_window)" "${gs_signal#*:}" "^startup-signal-${gs_signal%:*}$" \
+      gs GS_START_SIGNAL="${gs_signal%:*}" GS_TEE_PID="$gs_pidfile"
+    if grep -q '^cargo ' "$tmp/out"; then fail '  cargo never starts after the signal' 'cargo ran' "$tmp/out"
+    else pass '  cargo never starts after the signal'; fi
+    gs_gone=no gs_tee=''
+    if [ -s "$gs_pidfile" ]; then
+      read -r gs_tee < "$gs_pidfile"
+      for ((gs_wait = 0; gs_wait < 50; gs_wait++)); do
+        gs_state=$(ps -o stat= -p "$gs_tee" 2> /dev/null) || { if kill -0 "$gs_tee" 2> /dev/null; then gs_state=unknown; else gs_state=''; fi; }
+        case $gs_state in '' | *Z*) gs_gone=yes; break ;; esac
+        sleep 0.1
+      done
+    fi
+    if [ "$gs_gone" = yes ]; then pass '  tee ended without a FIFO writer'
+    else
+      fail '  tee ended without a FIFO writer' 'tee pid missing or still alive' "$tmp/out"
+      [ -z "$gs_tee" ] || kill -TERM "$gs_tee" 2> /dev/null || :
+    fi
+  done
+done
+cp "$ROOT/tools/gate.sh" "$GS/tools/gate.sh"
 
 # card-precheck.sh: lease_card before the build, with the recipe's own card or the environment's.
 pre() {

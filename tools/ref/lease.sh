@@ -66,6 +66,9 @@ LEASE_TREE=$(cd "$__lease_dir/../.." 2> /dev/null && pwd) || LEASE_TREE=
 # The lease's file, its probe, the holds, box.sh's guard, lease_holders and now: lease-probe.sh.
 # shellcheck source=tools/ref/lease-probe.sh
 source "$__lease_dir/lease-probe.sh"
+# run_bounded and lease_stop, the shared bounded-command cleanup: tools/gate-bound.sh.
+# shellcheck source=tools/gate-bound.sh
+source "$__lease_dir/../gate-bound.sh"
 unset __lease_dir
 
 # The lease is descriptor 9 on LEASE_LOCK, held until the runner exits or calls lease_release — and
@@ -442,7 +445,12 @@ lease_take() {
 # code returned. Every process a runner starts under the lease goes through it or its own `timeout`:
 # the lease stays held while any process that inherited descriptor 9 lives, so a hung child must end
 # at a bound instead of holding the machine. A command cut off there prints `[bound]` on stderr: a
-# child that hangs is a failed run, not a slow one. The command is an executable, not a shell
+# child that hangs is a failed run, not a slow one. The command runs through run_bounded
+# (tools/gate-bound.sh), so a TERM, INT or HUP to the runner ends the command first; the runner then
+# stops on that signal as it would have (by its own trap, if it set one), not at its next arm. Where
+# lease_bounded runs in a subshell (`out=$(lease_bounded …)`, a pipeline), a signal to the runner's
+# pid alone does not reach it: the runner ends and the command runs on to its bound. A signal to the
+# runner's group ends both. The command is an executable, not a shell
 # function or an assignment: `lease_bounded "$LEASE_ARM_BOUND" env K=V "$BIN" …`. LEASE_ARM_BOUND is
 # BLOOMERY_ARM_BOUND, default 900 s — the arm bound the depth, nsys and ncu runners read too; a
 # runner whose children run longer names its own. A bound that is not a positive integer is refused
@@ -458,11 +466,12 @@ lease_bounded() {
       ;;
   esac
   shift
-  timeout --kill-after=10 "$bound" "$@" || rc=$?
+  run_bounded timeout --kill-after=10 "$bound" "$@" || rc=$?
   case $rc in
     124) echo "[bound] $1 cut off at its ${bound} s bound (rc 124)" >&2 ;;
     137) echo "[bound] $1 killed (rc 137: the bound's KILL ${bound} s + 10 s in, or another SIGKILL)" >&2 ;;
   esac
+  [ -z "$BIN_SIGNAL" ] || kill -s "$BIN_SIGNAL" $$ 2> /dev/null
   return "$rc"
 }
 

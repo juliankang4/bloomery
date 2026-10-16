@@ -345,8 +345,10 @@ pace() {
 
 # The runner's own tests: each case runs this script with --test-locks <tmp> (the three locks under <tmp>,
 # the V4.1 load lock's bound 6 s, the card locks' 4 s, the polls 1 s), BLOOMERY_LEASE_LOCK at a file the test holds or not, a stub
-# nvidia-smi on PATH (two cards, no compute process) and a stub target/release/ok that, when asked (STUB_READY, STUB_ORDER, STUB_HOLD), says it is
-# running, appends its STUB_ID to a marker file and holds until the test releases it. Concurrent runs are started with & and waited for by their $!. One line per case;
+# nvidia-smi on PATH (two cards, no compute process) and a stub target/release/ok that, when asked (STUB_PID, STUB_TERM, STUB_READY,
+# STUB_ORDER, STUB_HOLD), writes its pid and its parent's (the binary's timeout), ends with code STUB_TERM a second after a TERM, says it
+# is running, appends its STUB_ID to a marker file and holds until the test releases it. Concurrent runs are started with & and waited
+# for by their $!. One line per case;
 # exit 0 iff none failed.
 # The cases wait on real bounds and events, so they run as SELFTEST_PARTS processes at once: each part is the cases between its
 # `if gg_part K; then … fi` guards (contiguous in the file; the helpers and locals between them run in every part). `--self-test`
@@ -369,7 +371,9 @@ self_test() {
     '  *query-gpu=name,uuid*) printf "NVIDIA GeForce RTX 3090, GPU-11111111-1111-1111-1111-111111111111\nNVIDIA RTX A6000, GPU-00000000-0000-0000-0000-000000000000\n" ;;' \
     '  *query-gpu=*) printf "GPU-11111111-1111-1111-1111-111111111111, NVIDIA GeForce RTX 3090\nGPU-00000000-0000-0000-0000-000000000000, NVIDIA RTX A6000\n" ;;' \
     'esac' > "$t/bin/nvidia-smi"
-  printf '%s\n' '#!/bin/sh' '[ -z "${STUB_READY:-}" ] || echo up > "$STUB_READY"' '[ -z "${STUB_ORDER:-}" ] || echo "${STUB_ID:-?}" >> "$STUB_ORDER"' \
+  printf '%s\n' '#!/bin/sh' '[ -z "${STUB_PID:-}" ] || echo "$$ $PPID" > "$STUB_PID"' \
+    '[ -z "${STUB_TERM:-}" ] || trap "sleep 1; exit $STUB_TERM" TERM' \
+    '[ -z "${STUB_READY:-}" ] || echo up > "$STUB_READY"' '[ -z "${STUB_ORDER:-}" ] || echo "${STUB_ID:-?}" >> "$STUB_ORDER"' \
     '[ -z "${STUB_HOLD:-}" ] || read -r _ < "$STUB_HOLD"' \
     'echo "ran on $CUDA_VISIBLE_DEVICES"' > "$t/tree/target/release/ok"
   chmod +x "$t/bin/nvidia-smi" "$t/tree/target/release/ok"
@@ -416,16 +420,17 @@ PY
     echo "FAIL: the self-test's stub cards did not resolve (CARDS_ERROR: ${CARDS_ERROR:-none})"
     return 1
   }
+  local gate_env=(env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES
+    -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S
+    -u GATE_TEST_PACE -u STUB_ORDER -u STUB_ID PATH="$t/bin:$PATH")
   # gate <out file> <BLOOMERY_GATE_CARD> <lease file> [K=V…]: one run of the runner, its rc (TL=<dir>: the dir its locks and its
-  # batch hold live in, default the test's own)
+  # batch hold live in, default the test's own; GB=<s>: its own bound, default 60)
   gate() {
     local o=$1 c=$2 l=$3
     shift 3
     # Under a bound of its own: a runner that hangs ends the case red (124), it does not hang the check.
-    (cd "$t/tree" && timeout --kill-after=5 60 env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES \
-      -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S \
-      -u GATE_TEST_PACE -u STUB_ORDER -u STUB_ID \
-      PATH="$t/bin:$PATH" BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
+    (cd "$t/tree" && timeout --kill-after=5 "${GB:-60}" "${gate_env[@]}" \
+      BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
       bash "$self" --test-locks "${TL:-$t}" "${GATE_BIN:-ok}") > "$o" 2>&1
   }
   # judge <name> <rc> <want rc> <ERE that must match> [ERE that must not]. The output is matched as a here-string, never piped into
@@ -624,6 +629,176 @@ PY
   flock -u 6
   exec 6>&-
   judge 'a run that is not a V4.1 load does not wait for one' "$rc" 0 'ok on the 3090 \(asked 3090\)' 'V4\.1'
+  # A run gate()'s own bound ends goes with its binary, under the watch too: when the bound returns 124 the stub and its timeout are
+  # gone and the card lock is free, then the run's output reaches its end, and the runner's code is the stub's (it ends 7 a second after
+  # the TERM). The bound leaves the run room to start on a loaded host (a stub that never ran is a red by name); the stub then holds on
+  # STUB_HOLD, the runner's own bound (900 s) far off. A stub still there once the checks are made is let go.
+  local w ended left sp ip lk
+  for w in '' BLOOMERY_GATE_STACKS=30; do
+    fifos
+    streams "$t/s1"
+    rm -f "$t/stub.pid"
+    rc=0
+    # shellcheck disable=SC2086 # w is a K=V word or none
+    GB=10 gate "$t/s1" 3090 "$t/lease" STUB_PID="$t/stub.pid" STUB_TERM=7 STUB_HOLD="$t/hold" $w &
+    p1=$!
+    { cat "$t/s1" > "$t/first"; echo end >&3; } &
+    r1=$!
+    wait "$p1" || rc=$?
+    left=
+    if [ -s "$t/stub.pid" ]; then
+      read -r sp ip < "$t/stub.pid"
+      if kill -0 "$sp" 2> /dev/null; then left="$left stub"; fi
+      if kill -0 "$ip" 2> /dev/null; then left="$left timeout"; fi
+    fi
+    lk=free
+    flock -n "$t/gate.lock" true || lk=held
+    ended=no
+    if read -t 5 -r _ <&3; then ended=yes; fi
+    echo go >&4
+    wait "$r1" || true
+    echo "stub ran: $([ -s "$t/stub.pid" ] && echo yes || echo no), left:${left:- none}, output ended: $ended, gate lock: $lk" > "$t/out"
+    sed 's/^/run: /' "$t/first" >> "$t/out"
+    judge_all "gate()'s bound ends a held run${w:+ under the watch} with its binary, output and lock, the binary's code kept" "$rc" 124 \
+      'stub ran: yes, left: none, output ended: yes, gate lock: free$' '^run: gpu-gate\.sh: ok ran [0-9]+ s \(exit 7\)$'
+  done
+  # A PID-only TERM while the watch sleeps must wait for a TERM-ignoring command's KILL.
+  # The sleep fixture holds that foreground wait until the TERM, then delays its trap by two seconds.
+  # Descriptor 5 keeps the output FIFO inherited even while the watch redirects its command's output.
+  # shellcheck source=tools/ref/cancel-stubs.sh
+  source "${self%/*}/ref/cancel-stubs.sh"
+  # shellcheck source=tools/gate-bound.sh
+  source "${self%/*}/gate-bound.sh"
+  local ready signalled before state child lock bpath child_status want
+  mkdir "$t/stack-bin" || return 70
+  cancel_timeout "$t/stack-bin/timeout" || return 70
+  cat > "$t/stack-bin/sleep" << 'SH' || return 70
+#!/bin/sh
+if [ "$#" = 1 ] && [ "$1" = 1 ] && [ -s "$SW_CMD" ]; then
+  echo "$$ $PPID" > "$SW_SLEEP" || exit 70
+  read -r _ < "$SW_HOLD" || exit 70
+  exec /bin/sleep 2
+fi
+exec /bin/sleep "$@"
+SH
+  printf '%s\n' '#!/bin/sh' 'trap "" TERM INT HUP' 'echo "$$ $PPID" > "$SW_CMD" || exit 70' \
+    'exec /bin/sleep 120' > "$t/tree/target/release/held" || return 70
+  chmod +x "$t/stack-bin/timeout" "$t/stack-bin/sleep" "$t/tree/target/release/held" || return 70
+  fifos || return 70
+  streams "$t/stack-output" || return 70
+  { cat "$t/stack-output" > "$t/first" && echo end >&3; } &
+  r1=$!
+  (
+    cd "$t/tree" || exit 70
+    exec 5>&1 || exit 70
+    exec "${gate_env[@]}" PATH="$t/stack-bin:$t/bin:$PATH" \
+      BLOOMERY_GATE_CARD=3090 BLOOMERY_LEASE_LOCK="$t/lease" BLOOMERY_LEASE_PROC="$t/proc" \
+      BLOOMERY_GATE_STACKS=60 BLOOMERY_GATE_BOUND=30 BLOOMERY_GATE_V41_LOAD=1 \
+      SW_CMD="$t/stack-command.pid" SW_SLEEP="$t/stack-sleep.pid" SW_HOLD="$t/hold" \
+      bash "$self" --test-locks "$t" held
+  ) > "$t/stack-output" 2>&1 &
+  p1=$! ready=no
+  for ((child = 0; child < 100; child++)); do
+    if cancel_ready "$t/stack-command.pid" && cancel_ready "$t/stack-sleep.pid"; then ready=yes; break; fi
+    sleep 0.1
+  done
+  before=''
+  for lock in gate v41-load; do
+    if flock -n "$t/$lock.lock" true; then before="$before $lock=free"; else before="$before $lock=held"; fi
+  done
+  signalled=yes
+  kill -TERM "$p1" 2> /dev/null || signalled=no
+  echo go >&4 || return 70
+  rc=0; wait "$p1" || rc=$?
+  left='' sp='' ip=''
+  if [ -s "$t/stack-command.pid" ]; then
+    read -r sp ip < "$t/stack-command.pid" || return 70
+    for child in "$sp" "$ip"; do
+      if state=$(ps -o stat= -p "$child"); then
+        [[ $state =~ ^[[:space:]]*Z ]] || left="$left $child"
+      else
+        [ "$?" = 1 ] || return 70
+      fi
+    done
+  fi
+  lk=''
+  for lock in gate v41-load; do
+    if flock -n "$t/$lock.lock" true; then lk="$lk $lock=free"; else lk="$lk $lock=held"; fi
+  done
+  ended=no
+  if read -t 1 -r _ <&3; then ended=yes; fi
+  echo "ready: $ready, TERM sent: $signalled, locks before:$before" > "$t/out" || return 70
+  echo "left:${left:- none}, output ended: $ended, locks after:$lk" >> "$t/out" || return 70
+  sed 's/^/run: /' "$t/first" >> "$t/out" || return 70
+  judge_all 'a TERM to the sleeping watch runner waits for KILL, output EOF and both locks' "$rc" 143 \
+    '^ready: yes, TERM sent: yes, locks before: gate=held v41-load=held$' \
+    '^left: none, output ended: yes, locks after: gate=free v41-load=free$'
+  # Observe before cleanup, so an orphaned group cannot turn a failure green.
+  [ -z "$ip" ] || lease_stop "$ip" || return 70
+  wait "$r1" || return 70
+  # One cancellation lets a command drain on its first TERM; a second TERM aborts that drain.
+  for w in forwarding nonforwarding; do
+    rc=0 want=0
+    bpath=$PATH
+    if [ "$w" = nonforwarding ]; then bpath=$t/stack-bin:$PATH; want=143; fi
+    PATH="$bpath" bash -c '
+      source "$1"
+      export STOP_RUNNER=$$
+      run_bounded timeout --kill-after=10 30 python3 -
+    ' _ "${self%/*}/gate-bound.sh" > "$t/out" 2>&1 << 'PY' || rc=$?
+import os
+import signal
+import sys
+import time
+
+def abort(*_):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    os.write(1, b"second TERM: abort\n")
+    os._exit(1)
+
+def drain(*_):
+    signal.signal(signal.SIGTERM, abort)
+    time.sleep(0.3)
+    print("drained: exit 0", flush=True)
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, drain)
+os.kill(int(os.environ["STOP_RUNNER"]), signal.SIGTERM)
+while True:
+    signal.pause()
+PY
+    judge_all "one cancellation drains a command under a $w monitor" "$rc" "$want" \
+      '^drained: exit 0$' '!second TERM: abort'
+  done
+  # A failed process read during cancellation stays an error even if the child ends successfully;
+  # a nonzero child status still wins over the cleanup error.
+  for child_status in 0 7; do
+    rc=0 want=70
+    [ "$child_status" = 0 ] || want=$child_status
+    (
+      # shellcheck source=tools/gate-bound.sh
+      source "${self%/*}/gate-bound.sh"
+      ps() { sleep 0.1; return 1; }
+      run_bounded python3 - "$child_status" << 'PY'
+import os
+import signal
+import sys
+
+def stop(*_):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    sys.exit(int(sys.argv[1]))
+
+os.setpgid(0, 0)
+signal.signal(signal.SIGTERM, stop)
+signal.alarm(5)
+os.kill(os.getppid(), signal.SIGTERM)
+while True:
+    signal.pause()
+PY
+    ) > "$t/out" 2>&1 || rc=$?
+    judge "a failed process read after TERM keeps cleanup failure (child $child_status)" "$rc" "$want" \
+      'cannot read processes while stopping'
+  done
   # The two waits, counted apart: the test holds the load lock and the 3090's gate lock. A loader (the head of a queue of one) waits for
   # the load lock, takes it once the test lets it go and then, holding it, waits for its card: each wait is one `waited` line of its own
   # (the load lock's seconds end where the card's begin), and the card wait says it holds the load lock.
@@ -1776,7 +1951,13 @@ echo "gpu-gate.sh: $NAME on $ON (asked $([ "$CARD" = local ] && echo "$ASK" || e
 # binaries, or one binary several times, is read per run.
 RUN_T0=$SECONDS
 if [ -n "$STACKS" ]; then
-  bash "${BASH_SOURCE[0]%/*}/ref/stack-watch.sh" "$STACKS" "$NAME" -- timeout --kill-after=10 "$BOUND" "$EXE" "$@"
+  watch_traps=$(trap -p TERM INT HUP)
+  # shellcheck source=tools/ref/stack-watch.sh
+  source "${BASH_SOURCE[0]%/*}/ref/stack-watch.sh" "$STACKS" "$NAME" -- timeout --kill-after=10 "$BOUND" "$EXE" "$@"
+  watch_rc=$?
+  trap - TERM INT HUP
+  eval "$watch_traps"
+  (exit "$watch_rc")
 elif [ "$GDB" = 1 ]; then
   GDB_CMDS=$(mktemp)
   cat > "$GDB_CMDS" <<'G'
@@ -1791,12 +1972,12 @@ if $_isvoid($_exitcode)
 end
 quit $_exitcode
 G
-  timeout --kill-after=10 "$BOUND" gdb -q -batch -x "$GDB_CMDS" --args "$EXE" "$@"
+  run_bounded timeout --kill-after=10 "$BOUND" gdb -q -batch -x "$GDB_CMDS" --args "$EXE" "$@"
   rc=$?
   rm -f "$GDB_CMDS"
   (exit "$rc")
 else
-  timeout --kill-after=10 "$BOUND" "$EXE" "$@"
+  run_bounded timeout --kill-after=10 "$BOUND" "$EXE" "$@"
 fi
 rc=$?
 echo "gpu-gate.sh: $NAME ran $((SECONDS - RUN_T0)) s (exit $rc)" >&2
