@@ -49,7 +49,9 @@ want_id=$(ugit "$IK" show "$PICK" | as_user git patch-id --stable | cut -d' ' -f
 got_id=$(ugit "$IK" show HEAD | as_user git patch-id --stable | cut -d' ' -f1)
 [ "$got_id" = "$want_id" ] ||
   { echo "build-ik-cand: $IK HEAD's patch (patch-id $got_id) is not $PICK's ($want_id)" >&2; exit 1; }
-dirty=$(ugit "$IK" status --porcelain --untracked-files=all | grep -v '^?? build/' || true)
+dirty=$(ugit "$IK" status --porcelain --untracked-files=all) ||
+  { echo "build-ik-cand: cannot inspect tracked changes in $IK" >&2; exit 2; }
+dirty=$(printf '%s\n' "$dirty" | grep -v '^?? build/' || true)
 [ -z "$dirty" ] || { echo "build-ik-cand: $IK has changes outside its commits:" >&2; echo "$dirty" >&2; exit 1; }
 BUILD=$(ugit "$IK" rev-parse --short=8 HEAD)
 echo "build-ik-cand: $IK = $PIN + $PICK as $BUILD"

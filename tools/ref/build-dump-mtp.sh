@@ -39,7 +39,9 @@ head=$(ugit rev-parse --short=8 HEAD)
   { echo "build-dump-mtp: $IK is at $head, not $GLM_MTP_SHA" >&2; exit 1; }
 ugit diff --quiet HEAD ||
   { echo "build-dump-mtp: $IK has tracked changes against $GLM_MTP_SHA:" >&2; ugit diff --stat HEAD >&2; exit 1; }
-untracked=$(ugit status --porcelain --untracked-files=all | grep '^??' || true)
+dirty=$(ugit status --porcelain --untracked-files=all) ||
+  { echo "build-dump-mtp: cannot inspect tracked changes in $IK" >&2; exit 2; }
+untracked=$(printf '%s\n' "$dirty" | grep '^??' || true)
 [ -z "$untracked" ] || { echo "build-dump-mtp: untracked files in $IK:" >&2; echo "$untracked" >&2; exit 1; }
 [ -f "$IK/build/CMakeCache.txt" ] ||
   { echo "build-dump-mtp: $IK/build is not configured; this script builds in place, it does not configure" >&2; exit 1; }

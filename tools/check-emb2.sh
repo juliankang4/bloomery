@@ -13,6 +13,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -228,6 +229,11 @@ class Builders(unittest.TestCase):
             ("tools/ref/build-nemotron-ref.sh", "nemotron_h"),
             ("tools/ref/clefvis/build-clefvis.sh", "qwen35"),
             ("tools/ref/qvis/build-lcpp-qvis.sh", "qwen35"),
+            ("tools/ref/vision/build-fork.sh", "deepseek41"),
+            ("tools/ref/build-ik-cand.sh", "deepseek41"),
+            ("tools/ref/build-ik-mimo2.sh", "mimo2"),
+            ("tools/ref/build-dump-draft.sh", "deepseek41"),
+            ("tools/ref/build-dump-mtp.sh", "glm5next"),
         )
         for script, profile in scripts:
             with self.subTest(script=script), tempfile.TemporaryDirectory(prefix="oracle-status-") as tmp:
@@ -237,28 +243,71 @@ class Builders(unittest.TestCase):
                 shutil.copyfile(ROOT / script, target)
                 oracle = root / "oracle"
                 subprocess.run(["git", "init", "-q", str(oracle)], check=True)
+                if script == "tools/ref/build-dump-draft.sh":
+                    if not shutil.which("sha256sum"):
+                        self.skipTest("sha256sum is required for the draft builder fixture")
+                    write(oracle / "src/fixture", "original\n")
+                    subprocess.run(["git", "-C", str(oracle), "add", "src/fixture"], check=True)
                 subprocess.run(["git", "-C", str(oracle), "-c", "user.name=fixture",
                                 "-c", "user.email=fixture@example.invalid", "commit",
                                 "--allow-empty", "-qm", "fixture"], check=True)
                 pin = subprocess.check_output(["git", "-C", str(oracle), "rev-parse", "HEAD"],
                                               text=True).strip()
-                (oracle / ".git/index").write_bytes(b"invalid index")
+                if script in ("tools/ref/build-dump-draft.sh", "tools/ref/build-dump-mtp.sh"):
+                    subprocess.run(["git", "-C", str(oracle), "config", "status.relativePaths", "invalid"],
+                                   check=True)
+                    write(root / "tools/ref/ref-build-common.sh",
+                          f'REF_BIN={shlex.quote(str(root / "bin"))}\nHERE={shlex.quote(str(root))}\n')
+                    write(oracle / "build/CMakeCache.txt", "")
+                    if script == "tools/ref/build-dump-draft.sh":
+                        patch = root / "patch.py"
+                        write(patch, 'ROOT = ""\nfrom pathlib import Path\nPath(ROOT + "fixture").write_text("patched\\n")\n')
+                        source = target.read_text().replace("BASE=/home/user/ik-idxkey", f"BASE={shlex.quote(str(oracle))}")
+                        source = source.replace("BASE_SHA=db517b69", f"BASE_SHA={pin}")
+                        source = source.replace("PATCH=/home/user/ik-dsv41-draft.py", f"PATCH={shlex.quote(str(patch))}")
+                        source = source.replace("PATCH_SHA256=4eeb56aa1d75b470b556bab87ab90a467c8e4942b3269c9c15a3c78db0b1bc60",
+                                                "PATCH_SHA256=" + hashlib.sha256(patch.read_bytes()).hexdigest())
+                        source = source.replace("PATCHED=(src/llama-hparams.h src/llama-hparams.cpp src/llama-load-tensors.cpp src/graphs/build_deepseek4.cpp)",
+                                                "PATCHED=(src/fixture)")
+                        target.write_text(source)
+                else:
+                    (oracle / ".git/index").write_bytes(b"invalid index")
                 write(root / "tools/ref/ref-paths.sh",
                       f"MODEL_NAME={profile}\nLCPP={shlex.quote(str(oracle))}\n"
+                      f"IK=$LCPP\nCAND_IK=$LCPP\nGLM_MTP_IK=$LCPP\nGLM_MTP_SHA={pin[:8]}\nREF_BIN_NAME=bin-fixture\n"
                       f"BLOOMERY_DATA={shlex.quote(str(root / 'data'))}\n")
                 write(root / "tools/ref/clefvis/profile.sh",
                       'ORACLE=$LCPP\nDATA=$BLOOMERY_DATA\nDUMPER=fixture.cpp\n')
-                write(root / "tools/ref/lease.sh", 'lease_free() { return 0; }\nnow() { printf fixture; }\n')
+                write(root / "tools/ref/lease.sh", 'lease_free() { return 0; }\nnow() { printf fixture; }\n'
+                      'lease_take() { return 0; }\nlease_bounded() { shift; "$@"; }\n')
                 marker = root / "compiled"
                 for compiler in ("g++", "cmake"):
                     write(root / "cuda/bin" / compiler,
                           '#!/bin/bash\n: > "$FIXTURE_COMPILED"\nexit 88\n', True)
                 # Exercise source integrity without qvis' root-only user switch.
                 write(root / "cuda/bin/id", "#!/bin/bash\necho 501\n", True)
+                write(root / "cuda/bin/sudo", '#!/bin/bash\nshift 5\nexec "$@"\n', True)
+                if script in ("tools/ref/vision/build-fork.sh", "tools/ref/build-ik-cand.sh",
+                              "tools/ref/build-ik-mimo2.sh"):
+                    write(root / "tools/ref/lease-probe.sh", 'lease_free() { return 0; }\nnow() { printf fixture; }\n')
+                    source = root / "vision/src"
+                    source.mkdir(parents=True)
+                    (source / ".git").mkdir()
+                    # Commit pins and the root-only user switch are fixture boundaries; status uses real Git.
+                    write(root / "cuda/bin/git", f'#!{sys.executable}\n'
+                          'import subprocess, sys\n'
+                          'args = sys.argv[1:]\n'
+                          'if args[:1] == ["-C"]: args = args[2:]\n'
+                          f'if args[:1] == ["status"]: sys.exit(subprocess.call([{shutil.which("git")!r}, "-C", {str(oracle)!r}] + args))\n'
+                          'if args[:1] == ["rev-parse"]: print("cfd8adcf6fb86ca523ad72fe21e8d2ac3860cd8e")\n', True)
+                    write(root / "cuda/bin/find", '#!/bin/bash\nexit 0\n', True)
+                    write(root / "shell-env", 'cd() { if [ "$1" = /home/user ]; then builtin cd "$FIXTURE_HOME"; else builtin cd "$@"; fi; }\n')
                 env = dict(os.environ, PATH=str(root / "cuda/bin") + os.pathsep + os.environ["PATH"],
                            LCPP_BUILD_TREE=str(oracle), LCPP_BUILD_PIN=pin,
                            LCPP_BUILD_DIR=str(root / "run"), LCPP_BUILD_CUDA=str(root / "cuda"),
-                           FIXTURE_COMPILED=str(marker))
+                           FIXTURE_COMPILED=str(marker), FIXTURE_HOME=str(root),
+                           BASH_ENV=str(root / "shell-env"), VISREF_FORK_ROOT=str(root / "vision"),
+                           DRAFT_IK=str(oracle))
                 result = subprocess.run(["bash", str(target)], cwd=root, env=env,
                                         capture_output=True, text=True, timeout=10)
                 output = result.stdout + result.stderr

@@ -65,7 +65,9 @@ for i in "${!PICKS[@]}"; do
   [ "$got" = "$want" ] ||
     { echo "build-ik-mimo2: $IK $at's patch (patch-id $got) is not $c's ($want)" >&2; exit 1; }
 done
-dirty=$(ugit "$IK" status --porcelain --untracked-files=all | grep -v -e '^?? build/' -e '^?? PROVENANCE$' || true)
+dirty=$(ugit "$IK" status --porcelain --untracked-files=all) ||
+  { echo "build-ik-mimo2: cannot inspect tracked changes in $IK" >&2; exit 2; }
+dirty=$(printf '%s\n' "$dirty" | grep -v -e '^?? build/' -e '^?? PROVENANCE$' || true)
 [ -z "$dirty" ] || { echo "build-ik-mimo2: $IK has changes outside its commits:" >&2; echo "$dirty" >&2; exit 1; }
 BUILD=$(ugit "$IK" rev-parse --short=8 HEAD)
 echo "build-ik-mimo2: $IK = $PIN + ${PICKS[*]} as $BUILD"

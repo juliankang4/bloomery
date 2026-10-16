@@ -79,7 +79,9 @@ fi
 changed=$(ugit "$IK" diff --name-only "$BASE_SHA" | sort | tr '\n' ' ')
 want=$(printf '%s\n' "${PATCHED[@]}" | sort | tr '\n' ' ')
 [ "$changed" = "$want" ] || { echo "build-dump-draft: $IK differs from $BASE_SHA in [$changed], want [$want]" >&2; exit 1; }
-untracked=$(ugit "$IK" status --porcelain --untracked-files=all | grep -v '^?? build/' | grep '^??' || true)
+dirty=$(ugit "$IK" status --porcelain --untracked-files=all) ||
+  { echo "build-dump-draft: cannot inspect tracked changes in $IK" >&2; exit 2; }
+untracked=$(printf '%s\n' "$dirty" | grep -v '^?? build/' | grep '^??' || true)
 [ -z "$untracked" ] || { echo "build-dump-draft: untracked files in $IK:" >&2; echo "$untracked" >&2; exit 1; }
 echo "build-dump-draft: $IK = $BASE_SHA + $PATCH (sha256 ${PATCH_SHA256:0:12})"
 ugit "$IK" diff --stat "$BASE_SHA"

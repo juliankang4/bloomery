@@ -44,7 +44,9 @@ echo "build-fork.sh: start $(now) fork $FORK_URL@$FORK_SHA into $ROOT"
 if [ -d "$SRC/.git" ]; then
   have=$(git -C "$SRC" rev-parse HEAD) || fail "$SRC is not a git tree"
   [ "$have" = "$FORK_SHA" ] || fail "$SRC is at $have, not $FORK_SHA: remove it by hand, knowing which sets came from it" 65
-  [ -z "$(git -C "$SRC" status --porcelain --untracked-files=no)" ] || fail "$SRC has local edits: the fork is the pin, not a copy of it" 65
+  dirty=$(git -C "$SRC" status --porcelain --untracked-files=no) ||
+    fail "cannot inspect tracked changes in $SRC"
+  [ -z "$dirty" ] || fail "$SRC has local edits: the fork is the pin, not a copy of it" 65
 else
   rm -rf "$SRC"
   git init -q "$SRC" || fail "git init $SRC failed"
