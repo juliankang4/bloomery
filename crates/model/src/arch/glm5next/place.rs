@@ -605,6 +605,30 @@ impl PlanInputs {
         lanes: KdaLanes,
         slots: usize,
     ) -> Result<Plan<'a>, PlaceError> {
+        self.plan_slots_nodes(machine, ctx_max, levers, lanes, slots, None)
+    }
+
+    /// Lower explicit node-owned expert ranges through the common placement owner.
+    pub fn plan_nodes<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        lanes: KdaLanes,
+        owned: &[u64],
+    ) -> Result<Plan<'a>, PlaceError> {
+        self.plan_slots_nodes(machine, ctx_max, levers, lanes, 1, Some(owned))
+    }
+
+    fn plan_slots_nodes<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        lanes: KdaLanes,
+        slots: usize,
+        owned: Option<&[u64]>,
+    ) -> Result<Plan<'a>, PlaceError> {
         if ctx_max > ORACLE_POSITIONS {
             return Err(PlaceError::PastOracle {
                 ctx_max,
@@ -620,7 +644,7 @@ impl PlanInputs {
         let beside = terms.plan_beside(n);
         let front = prompt_reserve_bytes(self, ctx_max, !machine.tiers.is_empty());
         let plan = placement::plan_in_pool(machine, levers, |levers| {
-            let mut plan = placement::plan_routed_reserving(
+            let mut plan = placement::nodes::loaded_routed(
                 &self.model,
                 machine,
                 ctx_max,
@@ -628,6 +652,7 @@ impl PlanInputs {
                 levers,
                 routed_rule(Program::Glm5nextBody),
                 front.saturating_add(beside),
+                owned,
             )?;
             // The bytes beside the stores ride the stage card's KV term, out
             // of the budget reserved above, so the card's bound holds them.
@@ -1846,6 +1871,37 @@ mod tests {
             }
             i.room = (room, HostRead::Given);
             i
+        }
+
+        #[test]
+        fn node_ranges_use_the_common_loaded_assignment() {
+            let inputs = routed(64 << 30);
+            let mut machine = unified(64 << 30);
+            let mut tier = machine.cards[0].clone();
+            tier.name = "remote".into();
+            tier.head = false;
+            tier.layers = 0..0;
+            machine.tiers.push(tier);
+            let half = inputs.model.experts / 2;
+            let owned = [half, inputs.model.experts - half];
+            let plan = inputs
+                .plan_nodes(&machine, CTX, &PlanLevers::default(), KdaLanes::Two, &owned)
+                .unwrap();
+            assert!(plan.violations().is_empty());
+            assert_eq!(plan.tier_n_l, vec![vec![owned[1]; LAYERS]]);
+            assert!(plan.n_l.iter().all(|&n| n <= owned[0]));
+            assert_eq!(plan.cards[1].expert_bytes, 0);
+            assert!(
+                inputs
+                    .plan_nodes(
+                        &machine,
+                        CTX,
+                        &PlanLevers::default(),
+                        KdaLanes::Two,
+                        &[inputs.model.experts, 0]
+                    )
+                    .is_err()
+            );
         }
 
         /// The load hosts the next-token layer's routed experts beside the

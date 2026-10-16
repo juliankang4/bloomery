@@ -15,7 +15,9 @@ use model::placement::{
 #[test]
 #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
 fn hw_held_node_nvme_host_run_keeps_eager_and_captured_rows() {
-    node_nvme_host_run(crate::census().unwrap(), true);
+    for act in [TierAct::F32, TierAct::Q8] {
+        node_nvme_host_run(crate::census().unwrap(), true, act);
+    }
 }
 
 #[test]
@@ -33,13 +35,19 @@ fn node_nvme_host_budget_keeps_the_os_reserve() {
             held_by: None,
         }],
         false,
+        TierAct::F32,
     );
 }
 
-fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardware: bool) {
-    const WIDTH: usize = 32;
+fn node_nvme_host_run(
+    census: Vec<model::placement::devices::DeviceInfo>,
+    hardware: bool,
+    act: TierAct,
+) {
+    const WIDTH: usize = 256;
+    const ROW_BYTES: usize = 34 * WIDTH / 32;
     const LAYERS: usize = 8;
-    const EXPERTS: usize = 2048;
+    const EXPERTS: usize = 128;
     let dir = std::env::temp_dir().join(format!(
         "bloomery-node-nvme-{}-{hardware}",
         std::process::id()
@@ -59,7 +67,7 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
                     role: Role::RoutedExperts,
                     ty: gguf::GgmlType::Q8_0,
                     dims: vec![WIDTH as u64, WIDTH as u64, EXPERTS as u64],
-                    file_bytes: (34 * WIDTH * EXPERTS) as u64,
+                    file_bytes: (ROW_BYTES * WIDTH * EXPERTS) as u64,
                     gathered_rows: None,
                 })
             })
@@ -80,9 +88,9 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
         let mut writer = Writer::new(std::fs::File::create_new(&path).unwrap(), layout).unwrap();
         let mut bytes = Vec::new();
         for expert in 0..EXPERTS {
-            for _ in 0..WIDTH {
+            for _ in 0..WIDTH * (WIDTH / 32) {
                 bytes.extend_from_slice(&[0x00, 0x24]);
-                bytes.extend(std::iter::repeat_n((1 + expert % 7) as u8, WIDTH));
+                bytes.extend((0..32).map(|i| (1 + (expert + i) % 7) as u8));
             }
         }
         for tensor in &tensors {
@@ -131,8 +139,8 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
         let shape = TierShape {
             hidden: WIDTH,
             n_used: 2,
-            rows: 1,
-            act: TierAct::F32,
+            rows: 2,
+            act,
         };
         let mut open = NodeOpen {
             nvme: None,
@@ -153,7 +161,7 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
         let mut node = NodeCensus {
             devices: census,
             host_room: 0,
-            arena_given: Some(12 << 20),
+            arena_given: Some(72 << 20),
         };
         let mut resident = open.clone();
         for row in &mut resident.rows {
@@ -170,7 +178,7 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
         });
         let reconstructed = reconstructed.host_plan(&model, &machine).unwrap();
         let need = workstation::HostNeed::of(&reconstructed, 0);
-        let assigned_bytes = (LAYERS * 3 * (EXPERTS - 1) * 34 * WIDTH) as u64;
+        let assigned_bytes = (LAYERS * 3 * (EXPERTS - 1) * ROW_BYTES * WIDTH) as u64;
         println!(
             "node host budget: assigned={assigned_bytes} os={} zero-room-refused={refused} reconstructed={}",
             need.os,
@@ -180,13 +188,13 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
         node.host_room = u64::MAX;
         open.project(&source, &node).unwrap();
         assert_eq!(open.nvme.as_ref().unwrap().arena.planned, 0);
-        node.host_room = 40 << 20;
+        node.host_room = 160 << 20;
         open.project(&source, &node).unwrap();
         resident.nvme = open.nvme.clone();
         node.host_room = 0;
         resident.project(&source, &node).unwrap();
         assert!(resident.nvme.is_none());
-        node.host_room = 40 << 20;
+        node.host_room = 160 << 20;
         let paging = open
             .nvme
             .as_ref()
@@ -261,7 +269,16 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
             .unwrap()
         };
         let mut baseline = make_run();
-        let input: Vec<f32> = (0..2 * WIDTH).map(|i| (i % 13) as f32 / 128.0).collect();
+        let input: Vec<f32> = (0..2 * WIDTH)
+            .map(|i| {
+                (if i % 128 == 0 {
+                    127.0
+                } else {
+                    (i % 127) as f32 - 63.0
+                }) / 256.0
+                    * (1u32 << (i / 128)) as f32
+            })
+            .collect();
         let selected = [0, 1, (EXPERTS - 2) as u32, super::super::slots::HOST];
         let mut expected = vec![123.0f32; 4 * WIDTH];
         for col in 0..2 {
@@ -295,6 +312,15 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
         .unwrap();
         let weights = Weights::load_rows(gpu.stream(), &file, &model, &[], 0).unwrap();
         let x = DeviceBuffer::from_host(gpu.stream(), &input).unwrap();
+        let mut q8 = crate::Q8Act::with_k(gpu.stream(), 2, WIDTH).unwrap();
+        gpu.enqueue_quantize_q8_1(&x, &mut q8).unwrap();
+        if act == TierAct::Q8 {
+            q8.q4 = DeviceBuffer::zeroed(gpu.stream(), q8.q4.len()).unwrap();
+        }
+        let input_view = match act {
+            TierAct::F32 => TierInput::F32(&x),
+            TierAct::Q8 => TierInput::Q8(&q8),
+        };
         let sel = DeviceBuffer::from_host(gpu.stream(), &selected).unwrap();
         let mut out =
             DeviceBuffer::from_host(gpu.stream(), &vec![123.0f32; expected.len()]).unwrap();
@@ -304,7 +330,7 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
                 &weights,
                 0,
                 TierIo {
-                    act: TierInput::F32(&x),
+                    act: input_view,
                     sel: &sel,
                     rows: &mut out,
                     cols: 2,
@@ -350,7 +376,7 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
                 &weights,
                 0,
                 TierIo {
-                    act: TierInput::F32(&x),
+                    act: input_view,
                     sel: &sel,
                     rows: &mut out,
                     cols: 2,
@@ -378,7 +404,7 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
                 &weights,
                 0,
                 TierIo {
-                    act: TierInput::F32(&x),
+                    act: input_view,
                     sel: &sel,
                     rows: &mut out,
                     cols: 2,
@@ -400,7 +426,7 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
                 &weights,
                 0,
                 TierIo {
-                    act: TierInput::F32(&x),
+                    act: input_view,
                     sel: &bad,
                     rows: &mut out,
                     cols: 2,

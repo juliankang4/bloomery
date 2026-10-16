@@ -75,6 +75,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::node::{NodeFamily, NodeOpen};
 use bloomery_gpu::host::nvtier::NvTier;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
@@ -98,7 +99,7 @@ use model::arch::deepseek41::names;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::moe::UNION_MAX_COLS;
-use model::placement::{Machine, Plan, PlanLevers};
+use model::placement::{Machine, ModelTensors, Plan, PlanLevers};
 
 use crate::chain::attn::{
     AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
@@ -2607,18 +2608,66 @@ struct LoadOn {
     slots: NonZeroUsize,
 }
 
-/// The tier card `t` of `plan`, tier `tier` of the map, for the stage card
-/// `stage`'s load: its card found by name, its routed segments uploaded, its
-/// set the map's rows of that tier, V4.1's tier computation over them;
-/// `card_dontneed` as for the stage card's segments. The stage card's context
-/// is current again on return. Load-time only.
+/// V4.1's architecture facts for the common tier node service.
+pub const NODE_FAMILY: NodeFamily = NodeFamily {
+    word: "deepseek41",
+    tensors: node_tensors,
+    experts: node_experts,
+    host: node_host,
+};
+
+fn node_tensors(file: &Split) -> Result<ModelTensors, GpuError> {
+    PlanInputs::describe(file)
+        .map(|i| i.model)
+        .map_err(|e| GpuError::plan("deepseek41 tier", e))
+}
+
+fn node_hparams(file: &Split, open: &NodeOpen) -> Result<Hparams, GpuError> {
+    let hp = Hparams::read(file).map_err(|e| GpuError::plan("deepseek41 tier", e))?;
+    if open.shape
+        != (TierShape {
+            hidden: hp.n_embd,
+            n_used: hp.experts.n_used,
+            rows: PAIR_ROWS,
+            act: TierAct::Q8,
+        })
+        || open.set.n_expert() != hp.experts.n_expert
+        || open.layers != hp.n_layer
+        || open.cols != 1
+    {
+        return Err(GpuError::shape(
+            "deepseek41 tier",
+            "the node tier's shape is not this V4.1 file's",
+        ));
+    }
+    Ok(hp)
+}
+
+fn node_experts(
+    gpu: &Gpu,
+    file: &Split,
+    _: &ModelTensors,
+    w: &Weights,
+    open: &NodeOpen,
+) -> Result<Box<dyn bloomery_gpu::host::tier::TierExperts>, GpuError> {
+    let hp = node_hparams(file, open)?;
+    Ok(Box::new(Ds41Tier::new(gpu, &hp, &open.set, w)?))
+}
+
+fn node_host(file: Arc<Split>, open: &NodeOpen) -> Result<HostRun, GpuError> {
+    let hp = node_hparams(&file, open)?;
+    crate::chain::ffn::host_run(file, &hp, open.set.layers(), false)
+}
+
+/// Open the tier's assigned rows through the common node owner. The stage
+/// card's context is current again on return.
 #[allow(
     clippy::too_many_arguments,
     reason = "the stage card, the file, the plan, the tier and its index, the hparams, the map and the page lever (rust-quality R8)"
 )]
 fn open_tier(
     stage: &Gpu,
-    file: &Split,
+    file: &Arc<Split>,
     plan: &Plan<'_>,
     t: &TierOpen,
     tier: usize,
@@ -2626,25 +2675,25 @@ fn open_tier(
     map: &SlotMap,
     card_dontneed: bool,
 ) -> Result<TierCard, GpuError> {
-    let gpu = t.open_here("deepseek41 open_tier")?;
-    let w = Weights::load_placed(gpu.stream(), file, plan, t.card, card_dontneed)?;
-    let set = TierSet::of_map(map, tier)?;
-    let experts = Ds41Tier::new(&gpu, hp, &set, &w)?;
-    let card = TierCard::open(
-        gpu,
-        t.name.clone(),
-        w,
-        set,
-        Box::new(experts),
-        TierShape {
+    NodeOpen {
+        nvme: None,
+        family: NODE_FAMILY.word.to_string(),
+        name: t.name.clone(),
+        device: t.device,
+        card: t.card,
+        rows: NodeOpen::rows_of(plan, file, t.card)?,
+        set: TierSet::of_map(map, tier)?,
+        shape: TierShape {
             hidden: hp.n_embd,
             n_used: hp.experts.n_used,
             rows: PAIR_ROWS,
             act: TierAct::Q8,
         },
-    )?;
-    stage.context().bind_to_thread()?;
-    Ok(card)
+        cols: 1,
+        layers: hp.n_layer,
+        block: (0, 0),
+    }
+    .open_tier(stage, file, plan, t.node, &NODE_FAMILY, card_dontneed)
 }
 
 impl ChainBody for Body {

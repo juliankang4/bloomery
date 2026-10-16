@@ -49,7 +49,7 @@ use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
     GemmRoute, GemmWeight,
 };
-use crate::host::node::{NodeCensus, NodeFamily, NodeOpen, TierNode};
+use crate::host::node::{NodeFamily, NodeOpen};
 use crate::host::tier::{
     BlockRows, TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet,
     TierShape,
@@ -123,6 +123,7 @@ fn node_host(
 
 fn node_experts(
     gpu: &Gpu,
+    _: &Split,
     model: &ModelTensors,
     w: &Weights,
     open: &NodeOpen,
@@ -611,18 +612,17 @@ impl TierExperts for Tier38 {
 }
 
 /// The tier card `t` of `plan`, tier `tier` of `map`, for the stage card
-/// `stage`'s load: its card found by name, its routed segments uploaded, its
-/// set the map's rows of that tier, Qwen3.8's tier computation over them
-/// (each layer's types as `stacks` lists them, `layers` layers, the plan's
-/// block route's columns and the plan's block scratch `block`), its page rows
-/// one of `step_cols` columns, the step port's;
-/// `card_dontneed` as for the stage card's segments. A tier on a node is
-/// opened there instead ([`TierNode::open`], [`NODE_FAMILY`]), from the
-/// plan's segments of its card. The stage card's context is current again on
-/// return. Load-time only.
+/// `stage`'s load, opened in this process or on its node through the common
+/// node owner ([`NodeOpen::open_tier`], [`NODE_FAMILY`]) from the plan's
+/// segments of its card: its set the map's rows of that tier, Qwen3.8's tier
+/// computation over them (each layer's types as the set's stacks list them,
+/// `layers` layers, the plan's block route's columns and the plan's block
+/// scratch `block`), its page rows one of `step_cols` columns, the step
+/// port's; `card_dontneed` as for the stage card's segments. The stage
+/// card's context is current again on return. Load-time only.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the stage card, the file, the plan, the tier and its index, the map, the stacks' types, the layers, the step port's columns, the block scratch and the page lever (rust-quality R8)"
+    reason = "the stage card, the file, the plan, the tier and its index, the map, the layers, the step port's columns, the block scratch and the page lever (rust-quality R8)"
 )]
 pub(super) fn open_tier(
     stage: &Gpu,
@@ -630,7 +630,6 @@ pub(super) fn open_tier(
     plan: &Plan<'_>,
     (t, tier): (&TierOpen, usize),
     map: &SlotMap,
-    stacks: &Qwen38Stacks,
     layers: usize,
     step_cols: usize,
     block: (usize, usize),
@@ -647,51 +646,18 @@ pub(super) fn open_tier(
         ));
     }
     let set = TierSet::of_map(map, tier)?;
-    {
-        let mut open = NodeOpen {
-            nvme: None,
-            family: NODE_FAMILY.word.to_string(),
-            name: t.name.clone(),
-            device: t.device,
-            card: t.card,
-            rows: NodeOpen::rows_of(plan, file, t.card)?,
-            set: set.clone(),
-            shape: SHAPE,
-            cols: step_cols,
-            layers,
-            block,
-        };
-        let census = match t.node {
-            Some(addr) => TierNode::census_of(addr)?,
-            None => NodeCensus::here()?,
-        };
-        open.project(plan, &census)?;
-        if let Some(addr) = t.node {
-            let node = TierNode::open(addr, &open)?;
-            stage.context().bind_to_thread()?;
-            return Ok(TierCard::on_node(node, t.name.clone(), set));
-        }
-        if open.nvme.is_some() {
-            let gpu = Gpu::open_card(&t.name, t.device)?;
-            let tensors = node_tensors(file)?;
-            let (w, experts) = open.load_host(&gpu, file, &tensors, &NODE_FAMILY)?;
-            let card = TierCard::open_cols(gpu, t.name.clone(), w, set, experts, SHAPE, step_cols)?;
-            stage.context().bind_to_thread()?;
-            return Ok(card);
-        }
-    }
-    let gpu = Gpu::open_card(&t.name, t.device)?;
-    let w = Weights::load_placed(gpu.stream(), file, plan, t.card, card_dontneed)?;
-    let experts = Tier38::new(&gpu, &w, stacks, &set, layers, step_cols, block)?;
-    let card = TierCard::open_cols(
-        gpu,
-        t.name.clone(),
-        w,
+    NodeOpen {
+        nvme: None,
+        family: NODE_FAMILY.word.to_string(),
+        name: t.name.clone(),
+        device: t.device,
+        card: t.card,
+        rows: NodeOpen::rows_of(plan, file, t.card)?,
         set,
-        Box::new(experts),
-        SHAPE,
-        step_cols,
-    )?;
-    stage.context().bind_to_thread()?;
-    Ok(card)
+        shape: SHAPE,
+        cols: step_cols,
+        layers,
+        block,
+    }
+    .open_tier(stage, file, plan, t.node, &NODE_FAMILY, card_dontneed)
 }

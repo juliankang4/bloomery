@@ -20,8 +20,11 @@
 //! sum over their union.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
+use bloomery_gpu::host::node::{NodeFamily, NodeOpen};
+use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::tier::{
     TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet, TierShape,
 };
@@ -33,8 +36,9 @@ use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
 use gguf::Split;
+use model::arch::glm5next::place::PlanInputs;
 use model::arch::names::routed_stacks;
-use model::placement::Plan;
+use model::placement::{ModelTensors, Plan};
 use models::{Ffn, LayerSpec};
 
 use crate::body::prefill::CHUNK;
@@ -42,6 +46,76 @@ use crate::ffn::CardStacks;
 
 /// What the tier's errors name.
 const WHAT: &str = "glm5next tier";
+
+/// GLM's architecture facts for the common tier node service.
+pub const NODE_FAMILY: NodeFamily = NodeFamily {
+    word: "glm5next",
+    tensors: node_tensors,
+    experts: node_experts,
+    host: node_host,
+};
+
+fn node_tensors(file: &Split) -> Result<ModelTensors, GpuError> {
+    PlanInputs::describe(file)
+        .map(|i| i.model)
+        .map_err(|e| GpuError::plan(WHAT, e))
+}
+
+fn node_inputs(file: &Split, open: &NodeOpen) -> Result<PlanInputs, GpuError> {
+    let inputs = PlanInputs::describe(file).map_err(|e| GpuError::plan(WHAT, e))?;
+    if open.shape
+        != (TierShape {
+            hidden: inputs.hp.n_embd,
+            n_used: inputs.hp.n_used,
+            rows: crate::LOAD_ROWS,
+            act: TierAct::F32,
+        })
+        || open.set.n_expert() != inputs.hp.n_expert
+        || open.layers != inputs.spec.layers.len()
+        || open.cols != 1
+    {
+        return Err(GpuError::shape(
+            WHAT,
+            "the node tier's shape is not this GLM file's",
+        ));
+    }
+    Ok(inputs)
+}
+
+fn node_experts(
+    gpu: &Gpu,
+    file: &Split,
+    _: &ModelTensors,
+    w: &Weights,
+    open: &NodeOpen,
+) -> Result<Box<dyn TierExperts>, GpuError> {
+    let inputs = node_inputs(file, open)?;
+    Ok(Box::new(GlmTier::new(
+        gpu,
+        &inputs.spec.layers,
+        &open.set,
+        w,
+        inputs.hp.n_embd,
+        inputs.hp.expert_ff,
+    )?))
+}
+
+fn node_host(file: Arc<Split>, open: &NodeOpen) -> Result<HostRun, GpuError> {
+    let inputs = node_inputs(&file, open)?;
+    let run = runtime::layer::hosted(&inputs.spec.layers)
+        .map_err(|e| GpuError::shape(WHAT, format!("the node host run: {e}")))?;
+    HostRun::build(
+        file,
+        run.start,
+        false,
+        HostWidths {
+            embd: inputs.hp.n_embd,
+            ff: inputs.hp.expert_ff,
+            n_used: inputs.hp.n_used,
+        },
+        |src| crate::host::routed_layers(src, &inputs.hp, run),
+    )
+}
 
 // The plan reserves the tier's chunk scratch at the body's chunk.
 const _: () = assert!(model::arch::glm5next::place::TIER_CHUNK as usize == CHUNK);
@@ -330,24 +404,25 @@ impl TierExperts for GlmTier {
 }
 
 /// The tier card `t` of `plan`, tier `tier` of `map`, for the stage card
-/// `stage`'s load: its card found by name, its routed segments uploaded, its
-/// set the map's rows of that tier, GLM's tier computation over them (the
-/// description `layers`, `n_embd` wide, experts `ff` wide), its page rows
-/// `rows`; `card_dontneed` as for the stage card's segments. The stage
-/// card's context is current again on return. Load-time only.
+/// `stage`'s load, opened in this process or on its node through the common
+/// node owner ([`NodeOpen::open_tier`]): its set the map's rows of that
+/// tier, GLM's tier computation over them ([`NODE_FAMILY`], the description
+/// `layers`, `n_embd` wide), its page rows `rows`; `card_dontneed` as for
+/// the stage card's segments. The stage card's context is current again on
+/// return. Load-time only.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the stage card, the file, the plan, the tier and its index, the description, the map, the widths, the rows and the page lever (rust-quality R8)"
+    reason = "the stage card, the file, the plan, the tier and its index, the description, the map, the width and rows, and the page lever (rust-quality R8)"
 )]
 pub(crate) fn open_tier(
     stage: &Gpu,
-    file: &Split,
+    file: &Arc<Split>,
     plan: &Plan<'_>,
     t: &TierOpen,
     tier: usize,
     layers: &[LayerSpec],
     map: &SlotMap,
-    [n_embd, ff, rows]: [usize; 3],
+    [n_embd, rows]: [usize; 2],
     card_dontneed: bool,
 ) -> Result<TierCard, GpuError> {
     if map.n_expert() != N_EXPERT {
@@ -359,23 +434,23 @@ pub(crate) fn open_tier(
             ),
         });
     }
-    let gpu = t.open_here(WHAT)?;
-    let w = Weights::load_placed(gpu.stream(), file, plan, t.card, card_dontneed)?;
-    let set = TierSet::of_map(map, tier)?;
-    let experts = GlmTier::new(&gpu, layers, &set, &w, n_embd, ff)?;
-    let card = TierCard::open(
-        gpu,
-        t.name.clone(),
-        w,
-        set,
-        Box::new(experts),
-        TierShape {
+    NodeOpen {
+        nvme: None,
+        family: NODE_FAMILY.word.to_string(),
+        name: t.name.clone(),
+        device: t.device,
+        card: t.card,
+        rows: NodeOpen::rows_of(plan, file, t.card)?,
+        set: TierSet::of_map(map, tier)?,
+        shape: TierShape {
             hidden: n_embd,
             n_used: N_USED,
             rows,
             act: TierAct::F32,
         },
-    )?;
-    stage.context().bind_to_thread()?;
-    Ok(card)
+        cols: 1,
+        layers: layers.len(),
+        block: (0, 0),
+    }
+    .open_tier(stage, file, plan, t.node, &NODE_FAMILY, card_dontneed)
 }

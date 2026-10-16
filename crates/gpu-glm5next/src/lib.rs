@@ -66,3 +66,4 @@ pub use body::{
 pub use model::arch::glm5next::place::KdaLanes;
 pub use program::{layer_launches, step_launches};
 pub use swap::{DEADLINE, LIVE_DELAY};
+pub use tier::NODE_FAMILY;

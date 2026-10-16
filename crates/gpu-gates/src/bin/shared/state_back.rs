@@ -17,8 +17,9 @@
 //! finite-probe paths run one arm by their own refusal.
 //!
 //! The cards read: the stage card through [`GpuModel::gpu`] and every expert
-//! tier card the load holds through [`Body::hybrid`]'s tiers, each its free
-//! device bytes as `Gpu::mem_info` reports them. The stores' contents are
+//! tier card of this process through [`Body::hybrid`]'s tiers, each its free
+//! device bytes as `Gpu::mem_info` reports them; a tier on a node holds no
+//! device memory here and is not read. The stores' contents are
 //! not read: hashing them is the expensive half of a state check, which
 //! this module does not do.
 
@@ -44,14 +45,16 @@ pub struct StateBack {
 }
 
 impl StateBack {
-    /// `m`'s state: its position, its poison word and every card's free
-    /// device bytes.
+    /// `m`'s state: its position, its poison word and the free device bytes
+    /// of every card in this process.
     pub fn read(m: &GpuModel<Body>) -> Result<StateBack, GateError> {
         let body = m.body("state_back")?;
         let mut cards = Vec::with_capacity(1 + body.hybrid().tiers().len());
         cards.push(card("stage", m.gpu())?);
         for (t, tier) in body.hybrid().tiers().iter().enumerate() {
-            cards.push(card(&format!("tier {t}"), tier.gpu()?)?);
+            if tier.node().is_none() {
+                cards.push(card(&format!("tier {t}"), tier.gpu()?)?);
+            }
         }
         // A tier's read bound its own context; the stage card's is current
         // again.

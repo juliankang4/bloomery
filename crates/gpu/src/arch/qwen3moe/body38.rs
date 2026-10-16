@@ -1572,7 +1572,6 @@ impl Body38 {
                     plan,
                     (t, i),
                     &map,
-                    &stacks,
                     n,
                     cols,
                     block,

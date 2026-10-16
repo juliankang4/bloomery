@@ -21,6 +21,9 @@ struct State {
     x: Tensor2,
     output: Vec<f32>,
     hidden: usize,
+    act: super::tier::TierAct,
+    q3_words: usize,
+    scale_at: usize,
     used: usize,
     sel_at: usize,
     out_at: usize,
@@ -41,15 +44,26 @@ impl State {
         };
         self.output[..len].copy_from_slice(previous);
         for col in 0..cols {
-            // SAFETY: the page holds this column's hidden f32 values. The
-            // preceding stream copy completed before this host callback.
-            let x = unsafe {
-                std::slice::from_raw_parts(
-                    self.page.host_at(4 * col * self.hidden).cast::<f32>(),
-                    self.hidden,
-                )
-            };
-            self.x.data.copy_from_slice(x);
+            // SAFETY: sel_at follows the complete activation span. The
+            // preceding stream copies completed before this host callback.
+            let input = unsafe { std::slice::from_raw_parts(self.page.host_at(0), self.sel_at) };
+            for (i, value) in self.x.data.iter_mut().enumerate() {
+                *value = match self.act {
+                    super::tier::TierAct::F32 => {
+                        let at = 4 * (col * self.hidden + i);
+                        f32::from_ne_bytes(input[at..at + 4].try_into().unwrap())
+                    }
+                    super::tier::TierAct::Q8 => {
+                        let v4 = u32::try_from(i / 4).expect("Q8Act bounds its width");
+                        let word =
+                            2 * crate::cores::q3_slot(v4) as usize + ((v4 >> 3) & 1) as usize;
+                        let code = input[4 * (col * self.q3_words + word) + i % 4] as i8;
+                        let at = self.scale_at + 4 * (col * (self.hidden / 128) + i / 128);
+                        let scale = f32::from_ne_bytes(input[at..at + 4].try_into().unwrap());
+                        f32::from(code) * scale
+                    }
+                };
+            }
             for slot in 0..self.used {
                 let index = col * self.used + slot;
                 // SAFETY: the page holds cols * used selection words at
@@ -138,18 +152,23 @@ impl CpuExperts {
         shape: TierShape,
         cols: usize,
     ) -> Result<CpuExperts, GpuError> {
-        if shape.act != super::tier::TierAct::F32
+        if (shape.act == super::tier::TierAct::Q8 && !shape.hidden.is_multiple_of(256))
             || cols == 0
             || shape.hidden == 0
             || shape.n_used == 0
-            || shape.rows != 1
+            || shape.rows == 0
         {
             return Err(GpuError::shape(
                 WHAT,
-                "the host tier requires f32 activation columns",
+                "the host tier requires nonempty columns and whole Q8 super-blocks",
             ));
         }
-        let x = cols.checked_mul(shape.hidden);
+        let q3_words = 128 * (shape.hidden / 256).div_ceil(2);
+        let input_words = match shape.act {
+            super::tier::TierAct::F32 => shape.hidden,
+            super::tier::TierAct::Q8 => q3_words + shape.hidden / 128,
+        };
+        let x = cols.checked_mul(input_words);
         let sel = cols.checked_mul(shape.n_used);
         let out = sel.and_then(|s| s.checked_mul(shape.hidden));
         let bytes = x
@@ -174,6 +193,9 @@ impl CpuExperts {
             },
             output: vec![0.0; out],
             hidden: shape.hidden,
+            act: shape.act,
+            q3_words,
+            scale_at: 4 * cols * q3_words,
             used: shape.n_used,
             sel_at: 4 * x,
             out_at: 4 * (x + sel),
@@ -250,12 +272,6 @@ impl TierExperts for CpuExperts {
                 "the host expert tier belongs to another stream",
             ));
         }
-        let TierInput::F32(x) = io.act else {
-            return Err(GpuError::shape(
-                WHAT,
-                "a quantized activation on the f32 host tier",
-            ));
-        };
         let state = self
             .state
             .lock()
@@ -264,8 +280,22 @@ impl TierExperts for CpuExperts {
             .cols
             .checked_mul(self.shape.n_used)
             .ok_or_else(|| GpuError::shape(WHAT, "selection size overflow"))?;
+        let input_ok = match io.act {
+            TierInput::F32(x) if self.shape.act == super::tier::TierAct::F32 => {
+                x.len() >= io.cols * self.shape.hidden
+            }
+            TierInput::Q8(x) if self.shape.act == super::tier::TierAct::Q8 => {
+                x.k() == self.shape.hidden && x.m() >= io.cols
+            }
+            _ => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    "the activation format differs from the host tier",
+                ));
+            }
+        };
         if !(1..=self.cols).contains(&io.cols)
-            || x.len() < io.cols * self.shape.hidden
+            || !input_ok
             || io.sel.len() < n
             || io.rows.len() < n * self.shape.hidden
         {
@@ -277,19 +307,36 @@ impl TierExperts for CpuExperts {
             .and_then(|l| l.checked_add(io.cols - 1))
             .filter(|&i| i < self.calls.len())
             .ok_or_else(|| GpuError::shape(WHAT, "a layer outside the host tier"))?;
-        let (input, selected, out) = (
+        let (input, scales, selected, out) = (
             state.page.dev_at(0),
+            state.page.dev_at(state.scale_at),
             state.page.dev_at(state.sel_at),
             state.page.dev_at(state.out_at),
         );
         drop(state);
         let stream = gpu.stream();
-        copy_page(
-            stream,
-            input,
-            x.cu_deviceptr(),
-            4 * io.cols * self.shape.hidden,
-        )?;
+        match io.act {
+            TierInput::F32(x) => copy_page(
+                stream,
+                input,
+                x.cu_deviceptr(),
+                4 * io.cols * self.shape.hidden,
+            )?,
+            TierInput::Q8(x) => {
+                copy_page(
+                    stream,
+                    input,
+                    x.q3.cu_deviceptr(),
+                    x.q3.num_bytes() / x.m() * io.cols,
+                )?;
+                copy_page(
+                    stream,
+                    scales,
+                    x.d8.cu_deviceptr(),
+                    4 * io.cols * 2 * x.n_sb(),
+                )?;
+            }
+        }
         copy_page(stream, selected, io.sel.cu_deviceptr(), 4 * n)?;
         copy_page(
             stream,

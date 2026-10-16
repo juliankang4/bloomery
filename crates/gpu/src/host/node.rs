@@ -13,7 +13,7 @@
 //! the tier on the device it names ([`node_cards`]). The open
 //! carries the tier's rows of node 0's plan ([`NodeOpen`]); the server loads
 //! them from its own copy of the model file, which must match the tier's
-//! set, each row's tensor and the sha256 of each row's bytes, and builds the
+//! set, each row's tensor and the sha256 of its header and bytes, and builds the
 //! family's tier computation over them ([`NodeFamily`]).
 //!
 //! Every read and write of the channel is bounded: a request and its reply
@@ -50,8 +50,8 @@ use model::placement::{
 use super::DRAIN_DEADLINE;
 use super::step::{Chain, GO_DEADLINE};
 use super::tier::{
-    TIER_CHAINS, TIER_GRACE, TierAct, TierExperts, TierLayout, TierSet, TierShape, TierWork,
-    chain_slot,
+    TIER_CHAINS, TIER_GRACE, TierAct, TierCard, TierExperts, TierLayout, TierSet, TierShape,
+    TierWork, chain_slot,
 };
 use crate::fault::{FAULT_NONE, Fault};
 use crate::weights::{SegmentFile, Weights};
@@ -240,9 +240,9 @@ pub fn node_cards(addrs: &[SocketAddr]) -> Result<Vec<(NodeCensus, CardSpec)>, G
 /// One tier segment of node 0's plan as the open carries it: the tensor it
 /// is a piece of, by name and by what node 0's file holds (its shard, type,
 /// dims and file bytes, which the node's file must match), the segment's
-/// card format, experts and resident bytes, and the sha256 of the file bytes
-/// the segment holds in node 0's file ([`segment_sha256`]), which the bytes
-/// the node loads must match.
+/// card format, experts and resident bytes, and the sha256 of the header
+/// identity and segment bytes in node 0's file ([`segment_sha256`]), which
+/// the node's file must match.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeRow {
     pub name: String,
@@ -256,9 +256,9 @@ pub struct NodeRow {
     pub sha256: String,
 }
 
-/// The sha256 of the file bytes segment `seg` of `t`, a stack of `experts`
-/// when it is one, holds in `file`: its spans' bytes in slot order, the
-/// bytes its upload reads ([`SegmentFile::of`]).
+/// The sha256 of the header identity followed by the bytes segment `seg`
+/// of `t`, a stack of `experts` when it is one, holds in `file`: its spans'
+/// bytes in slot order, the bytes its upload reads ([`SegmentFile::of`]).
 fn segment_sha256(
     file: &Split,
     experts: u64,
@@ -266,7 +266,10 @@ fn segment_sha256(
     seg: &Segment,
 ) -> Result<String, GpuError> {
     let f = SegmentFile::of(file, experts, t, seg)?;
-    Ok(sha256_hex_of(f.bytes))
+    let header = model::fixture::header_sha256(file);
+    Ok(sha256_hex_of(
+        std::iter::once(header.as_bytes()).chain(f.bytes),
+    ))
 }
 
 /// What a tier node opens its tier from ([`TierNode::open`]): the family
@@ -345,6 +348,39 @@ impl NodeOpen {
             reserve,
         });
         Ok(())
+    }
+
+    /// Open the assigned tier locally or on its node, with the same paging projection.
+    pub fn open_tier(
+        mut self,
+        stage: &Gpu,
+        file: &Arc<Split>,
+        plan: &Plan<'_>,
+        node: Option<SocketAddr>,
+        family: &NodeFamily,
+        card_dontneed: bool,
+    ) -> Result<TierCard, GpuError> {
+        let census = match node {
+            Some(addr) => TierNode::census_of(addr)?,
+            None => NodeCensus::here()?,
+        };
+        self.project(plan, &census)?;
+        let card = if let Some(addr) = node {
+            TierCard::on_node(TierNode::open(addr, &self)?, self.name, self.set)
+        } else {
+            let gpu = Gpu::open_card(&self.name, self.device)?;
+            let tensors = (family.tensors)(file)?;
+            let (w, experts) = if self.nvme.is_some() {
+                self.load_host(&gpu, file, &tensors, family)?
+            } else {
+                let w = Weights::load_placed(gpu.stream(), file, plan, self.card, card_dontneed)?;
+                let experts = (family.experts)(&gpu, file, &tensors, &w, &self)?;
+                (w, experts)
+            };
+            TierCard::open_cols(gpu, self.name, w, self.set, experts, self.shape, self.cols)?
+        };
+        stage.context().bind_to_thread()?;
+        Ok(card)
     }
 
     /// Load the projected host tier through the same executor locally or on a node.
@@ -433,7 +469,7 @@ impl NodeOpen {
     }
 
     /// The segments `plan` puts on its card `card`, each with its tensor's
-    /// name and file identity and the sha256 of its bytes in `file`, the
+    /// name and file identity and the sha256 of its header and bytes in `file`, the
     /// model file the plan was made from.
     pub fn rows_of(plan: &Plan<'_>, file: &Split, card: usize) -> Result<Vec<NodeRow>, GpuError> {
         let mut rows = Vec::new();
@@ -1221,7 +1257,7 @@ pub struct NodeFamily {
 /// A family's tier computation over the stacks a node loaded for an open
 /// ([`NodeFamily::experts`]).
 pub(crate) type OpenExperts =
-    fn(&Gpu, &ModelTensors, &Weights, &NodeOpen) -> Result<Box<dyn TierExperts>, GpuError>;
+    fn(&Gpu, &Split, &ModelTensors, &Weights, &NodeOpen) -> Result<Box<dyn TierExperts>, GpuError>;
 
 /// How a connection ended.
 enum Ended {
@@ -1689,7 +1725,7 @@ impl Session<'_> {
             open.load_host(&gpu, self.file, &tensors, family)?
         } else {
             let w = Weights::load_rows(gpu.stream(), self.file, &tensors, &rows, open.card)?;
-            let experts = (family.experts)(&gpu, &tensors, &w, open)?;
+            let experts = (family.experts)(&gpu, self.file, &tensors, &w, open)?;
             (w, experts)
         };
         TierWork::open(gpu, w, experts, open.shape, open.cols)
@@ -1765,6 +1801,149 @@ pub(super) mod tests {
             .expect("the model header");
         let file = Split::open(&path).expect("the model file");
         (path, std::sync::Arc::new(file))
+    }
+
+    #[test]
+    fn a_node_refuses_other_expert_metadata_with_identical_tensor_bytes() {
+        use gguf::Value;
+        use gguf::write::TensorDecl;
+        use model::arch::{Arch, names};
+        use model::placement::{Device, Segment};
+
+        let tensor = ModelTensor {
+            name: names::routed_stacks(0)[1].clone(),
+            shard: 0,
+            layer: Some(0),
+            role: Role::RoutedExperts,
+            ty: GgmlType::F32,
+            dims: vec![2, 2, 2],
+            file_bytes: 32,
+            gathered_rows: None,
+        };
+        let tensors = ModelTensors {
+            tensors: vec![tensor.clone()],
+            layers: 1,
+            experts: 2,
+            experts_used: 1,
+        };
+        let segment = Segment {
+            device: Device::Card(1),
+            format: Format::Card(model::placement::CardFormat::F32),
+            experts: Some(model::placement::ExpertList::range(1..2).unwrap()),
+            resident_bytes: 16,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("bloomery-node-metadata-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let files: Vec<_> = [10.0, 1.0]
+            .into_iter()
+            .map(|clamp| {
+                let path = dir.join(format!("clamp-{clamp}.gguf"));
+                let layout = Layout::new(
+                    &[(
+                        format!("{}.swiglu_clamp_exp", Arch::Glm5next.name()),
+                        Value::F32(clamp),
+                    )],
+                    vec![TensorDecl {
+                        name: tensor.name.clone(),
+                        dims: tensor.dims.clone(),
+                        type_id: 0,
+                        nbytes: 32,
+                    }],
+                )
+                .unwrap();
+                let mut writer =
+                    Writer::new(std::fs::File::create_new(&path).unwrap(), layout).unwrap();
+                writer.tensor(&tensor.name, &[7; 32]).unwrap();
+                writer.finish().unwrap();
+                std::sync::Arc::new(Split::open(&path).unwrap())
+            })
+            .collect();
+        let bytes = |file: &Split| {
+            crate::weights::SegmentFile::of(file, 2, &tensor, &segment)
+                .unwrap()
+                .bytes
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bytes(&files[0]), bytes(&files[1]));
+        let open = NodeOpen {
+            nvme: None,
+            family: "metadata-test".into(),
+            name: "unused".into(),
+            device: None,
+            card: 1,
+            rows: vec![NodeRow {
+                name: tensor.name.clone(),
+                shard: 0,
+                ty: tensor.ty.to_string(),
+                dims: tensor.dims.clone(),
+                file_bytes: 32,
+                format: segment.format.to_string(),
+                experts: Some(vec![1]),
+                resident_bytes: 16,
+                sha256: super::segment_sha256(&files[0], 2, &tensor, &segment).unwrap(),
+            }],
+            set: TierSet::new(0..1, 2, vec![vec![1]]).unwrap(),
+            shape: TierShape {
+                hidden: 2,
+                n_used: 1,
+                rows: 1,
+                act: TierAct::F32,
+            },
+            cols: 1,
+            layers: 1,
+            block: (0, 0),
+        };
+        let family = super::NodeFamily {
+            word: "metadata-test",
+            tensors: |_| {
+                Ok(ModelTensors {
+                    tensors: vec![ModelTensor {
+                        name: names::routed_stacks(0)[1].clone(),
+                        shard: 0,
+                        layer: Some(0),
+                        role: Role::RoutedExperts,
+                        ty: GgmlType::F32,
+                        dims: vec![2, 2, 2],
+                        file_bytes: 32,
+                        gathered_rows: None,
+                    }],
+                    layers: 1,
+                    experts: 2,
+                    experts_used: 1,
+                })
+            },
+            experts: |_, _, _, _, _| panic!("metadata must be checked before loading experts"),
+            host: |_, _| panic!("metadata must be checked before opening host experts"),
+        };
+        assert!(open.rows_on(&tensors).is_ok());
+        let session = Session {
+            local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            reset_phase: 0,
+            file: &files[1],
+            families: &[family],
+            opened: None,
+            asked: 0,
+            seen: (0, Instant::now()),
+            listed: Vec::new(),
+            reply: Out::default(),
+        };
+        let error = session
+            .open(&open)
+            .err()
+            .expect("different expert metadata must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("the two processes read other files"),
+            "{error}"
+        );
+        drop(session);
+        drop(files);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

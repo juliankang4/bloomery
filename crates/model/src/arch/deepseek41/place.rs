@@ -189,11 +189,41 @@ impl PlanInputs {
         levers: &PlanLevers,
         slots: NonZeroUsize,
     ) -> Result<Plan<'a>, PlaceError> {
+        self.plan_slots_nodes(machine, ctx_max, levers, slots, None)
+    }
+
+    /// Lower explicit node-owned expert ranges through the common placement owner.
+    pub fn plan_nodes<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        owned: &[u64],
+    ) -> Result<Plan<'a>, PlaceError> {
+        self.plan_slots_nodes(machine, ctx_max, levers, NonZeroUsize::MIN, Some(owned))
+    }
+
+    fn plan_slots_nodes<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        slots: NonZeroUsize,
+        owned: Option<&[u64]>,
+    ) -> Result<Plan<'a>, PlaceError> {
         let kv = self.seq_terms().slots_of(slots.get() as u64);
         let rule = routed_rule(Program::Deepseek41Chain);
         let plan = placement::plan_in_pool(machine, levers, |levers| {
-            let mut plan =
-                placement::plan_routed(&self.model, machine, ctx_max, &kv, levers, rule)?;
+            let mut plan = placement::nodes::loaded_routed(
+                &self.model,
+                machine,
+                ctx_max,
+                &kv,
+                levers,
+                rule,
+                0,
+                owned,
+            )?;
             let room = plan.plan_at(&self.room);
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             Ok(plan)

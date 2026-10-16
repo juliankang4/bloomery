@@ -266,24 +266,6 @@ impl TierOpen {
             })
             .collect())
     }
-
-    /// The tier's card, opened in this process ([`Gpu::open_card`]), for a
-    /// family whose tier opens only on a card of the loading process: a tier
-    /// that runs on a node is refused by name, as `what`, before any card
-    /// opens.
-    pub fn open_here(&self, what: &'static str) -> Result<Gpu, GpuError> {
-        if let Some(addr) = self.node {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "the expert tier {} on the node at {addr}: this family's tier opens on a \
-                     card of the loading process only",
-                    self.name
-                ),
-            ));
-        }
-        Gpu::open_card(&self.name, self.device)
-    }
 }
 
 // ------------------------------------------------------------------ page
@@ -1587,24 +1569,12 @@ pub struct TierCard {
 impl TierCard {
     /// The tier on `gpu` (the card named `name`), with `weights` its
     /// resident routed stacks for `set`, `experts` the architecture's
-    /// computation, cut for `shape`, one column a row. Load-time only. Its
-    /// windows over the page are made when the host tier takes it
+    /// computation, cut for `shape`, rows of `cols` columns
+    /// ([`TierWork::open`]): the card serves [`Chain::Cols`] up to `cols`
+    /// wide beside the step and the pair. Load-time only. Its windows over
+    /// the page are made when the host tier takes it
     /// ([`super::HostTier::attach_tiers`]).
-    pub fn open(
-        gpu: Gpu,
-        name: String,
-        weights: Weights,
-        set: TierSet,
-        experts: Box<dyn TierExperts>,
-        shape: TierShape,
-    ) -> Result<TierCard, GpuError> {
-        TierCard::open_cols(gpu, name, weights, set, experts, shape, 1)
-    }
-
-    /// [`TierCard::open`] of rows of `cols` columns ([`TierWork::open`]):
-    /// the card serves [`Chain::Cols`] up to `cols` wide beside the step and
-    /// the pair.
-    pub fn open_cols(
+    pub(crate) fn open_cols(
         gpu: Gpu,
         name: String,
         weights: Weights,
@@ -2457,8 +2427,8 @@ pub(super) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::{
-        TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierOpen, TierPage, TierSet,
-        TierShape, chain_slot,
+        TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierPage, TierSet, TierShape,
+        chain_slot,
     };
     use crate::Gpu;
     use crate::host::slots::{HOST, Slot, SlotMap, TIER};
@@ -2542,30 +2512,7 @@ pub(super) mod tests {
         std::fs::remove_file(path).expect("remove the fixture");
     }
 
-    /// A family whose tier opens only in the loading process refuses a
-    /// tier on a node by name, in one sentence, before it opens a card.
-    #[test]
-    fn a_tier_on_a_node_is_refused_by_name() {
-        let t = TierOpen {
-            card: 1,
-            name: "GB10".into(),
-            device: None,
-            node: Some("127.0.0.1:7340".parse().expect("an address")),
-        };
-        let e = t
-            .open_here("deepseek41 open_tier")
-            .err()
-            .expect("a refusal")
-            .to_string();
-        assert!(
-            e.contains(
-                "the expert tier GB10 on the node at 127.0.0.1:7340: this family's tier opens on \
-                 a card of the loading process only"
-            ),
-            "{e}"
-        );
-    }
-
+    // PIN(2026-10-17): remove the local-only tier refusal test; GLM and V4.1 now open node tiers through NodeOpen::open_tier.
     /// A set's rows are ascending ids below the stack, each once; a map's
     /// set of a tier is that tier's entries in its slot order, and a layer
     /// outside it is refused.

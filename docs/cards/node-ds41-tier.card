@@ -1,0 +1,20 @@
+kind: profile
+question: does the V4.1 node NVMe tier preserve the same-build local CPU tier history?
+term: differing bytes in the serialized next-token IDs and every logits row;
+  accompanying decode observations compare pinned current-main and head attempts without claiming a speedup
+unit: bytes
+predict: 0..0 bytes
+condition: DeepSeek-V4.1-Flash Q3_K_M, vcruz305 revision c4a085541cb53f67ee5e57b63d255e80cef286e7,
+  all nine shard SHA256 values checked on both nodes; graph target, context 64, inputs 1,2,3
+  followed by 16 greedy steps, equal half-range expert ownership, card budget 32 GiB,
+  host room 96 GiB, anonymous 24 GiB NVMe arena, buffered reads and eight host threads;
+  retain the pinned same-build local CPU oracle and compare the remote history before timing;
+  accompanying TP2 decode uses a 16 GiB card budget, the same host room and arena,
+  inputs 1,2,3, context 256, 24 generated IDs, EOS ignored, step-fed prompts,
+  four warm steps and two alternating current-main/head attempts;
+  hold both claims, node locks and leases, no unrelated CUDA or CPU task, load below one
+  for 30 seconds, default clocks, clock/power/temperature/memory and page-cache witnesses;
+  plain-read ceilings on both cards before and after, and link byte and latency ceilings in the sitting
+decide-in: retain the exact history comparison and the accompanying named baseline result or decode observations
+decide-below: a negative byte count is a harness defect
+decide-above: stop the comparison and locate the first differing history row before claiming support

@@ -790,7 +790,7 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    port. Each end carries its tier's crossings and holds its own page, queue pair and pump. Reset stops both ends,
    resets both writers, then both readers, with a control reply between phases. The launch message remains one
    control round trip per replay. `BLOOMERY_TIER_LINK=loopback` still needs both pages in one process and is refused
-   with a node tier. For file-backed routed assignments, the Qwen3.8 open projects its assigned stacks onto
+   with a node tier. For file-backed routed assignments, the common open projects its assigned stacks onto
    node 1's host room through the common NVMe split. Resident GPU assignments keep their device executor without
    a host split. The request scopes the host projection and its arena grant to the node; `Device::Nvme` in the
    projected plan names that node's local drive, not node 0's. A paged tier uses the existing `HostRun` and `NvTier`
@@ -799,8 +799,9 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    lowers an explicit node assignment into the loaded rows before splitting node 0's host room: remote routed
    ranges are file-backed, with no stage allocation or charge against node 0's pool. Each node opens its own
    host/NVMe split against its own grant.
-   A remote tier serves no prompt batch (the batch call refuses it by name);
-   only Qwen3.8 opens a tier on a node, and GLM and V4.1 refuse it by name. `just gate-gpu-qwen38-nodes` holds the
+   A remote tier serves no prompt batch (the batch call refuses it by name).
+   Qwen3.8, GLM and V4.1 open their tiers through that common open; `tier_server` serves GLM's and V4.1's
+   families when it is built with the `glm5next` or `deepseek41` feature. `just gate-gpu-qwen38-nodes` holds the
    census, the refused opens (a row of other experts, and a copy of the file whose tier row holds other bytes), the bits
    (node 0 with node 1's tier against the same plan in one process) and the losses below. Its `--host` mode lowers
    equal routed ranges onto two nodes and compares the paged node with the same build's local CPU tier. It requires

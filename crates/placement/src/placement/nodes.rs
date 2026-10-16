@@ -38,6 +38,45 @@ use super::{
     row_bytes,
 };
 
+/// Seed a routed plan and lower any explicit node ownership.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the routed planner's inputs and the explicit node ownership (rust-quality R8)"
+)]
+pub fn loaded_routed<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    ctx_max: u64,
+    kv: &dyn super::KvBytes,
+    levers: &PlanLevers,
+    routed: RoutedRule,
+    reserve: u64,
+    owned: Option<&[u64]>,
+) -> Result<Plan<'a>, PlacementError> {
+    let stage = Machine {
+        tiers: Vec::new(),
+        ..machine.clone()
+    };
+    let seed = super::plan_routed_reserving(
+        model,
+        if owned.is_some() { &stage } else { machine },
+        ctx_max,
+        kv,
+        levers,
+        routed,
+        reserve,
+    )?;
+    let mut plan = Plan {
+        model,
+        machine,
+        ..seed
+    };
+    if let Some(owned) = owned {
+        lower_routed(&mut plan, owned)?;
+    }
+    Ok(plan)
+}
+
 /// Lower a node assignment into the stage's loaded row map. Remote host
 /// segments name their tier endpoint but allocate no stage-device buffers.
 /// Each node's host/NVMe split is reconstructed against its own room at open.

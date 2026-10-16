@@ -465,24 +465,16 @@ impl PlanInputs {
         }
         check_draft_reserve(machine, None)?;
         let plan = placement::plan_in_pool(machine, levers, |levers| {
-            let stage = Machine {
-                tiers: Vec::new(),
-                ..machine.clone()
-            };
-            let seed = placement::plan_routed(
+            let mut plan = placement::nodes::loaded_routed(
                 &self.model,
-                &stage,
+                machine,
                 ctx_max,
                 &self.kv,
                 levers,
                 routed_rule(PROGRAM),
+                0,
+                Some(owned),
             )?;
-            let mut plan = Plan {
-                model: &self.model,
-                machine,
-                ..seed
-            };
-            placement::nodes::lower_routed(&mut plan, owned)?;
             let room = plan.plan_at(&self.room);
             let floor = 2 * self.seq_state_bytes(ctx_max, None);
             placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;

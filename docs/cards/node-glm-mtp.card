@@ -1,0 +1,16 @@
+kind: profile
+question: how many target tokens does a GLM MTP verification keep on one and two DGX Sparks?
+term: kept target positions divided by completed verification windows, with lossless greedy IDs;
+  accompanying decode times compare MTP off and on in the same build and sitting
+unit: tokens/verify
+predict: 1..2
+condition: GLM-5.3-Flash UD-Q4_K_XL, short and 4096-token prompts, one request, graph target;
+  two is the GLM verification window's row capacity, not a measured acceptance claim; alternate off/on twice
+  on one Spark and two Sparks, with the same prompt, context and target placement in each pair;
+  record current-main and head TP2 attempts in the same lease, including named refusals;
+  builds and copies finish before the lease, no unrelated CUDA or test process, load average
+  below one for 30 seconds, default clock policy; clock, power, temperature, memory and page-cache
+  witnesses bracket the sitting, with plain-read and link-byte/latency ceilings in that sitting
+decide-in: record the acceptance row and compare the accompanying off/on decode time without claiming a main speedup
+decide-below: diagnose a verification that kept no target token before accepting its rate
+decide-above: diagnose a counter exceeding the verification window's two-row capacity before publishing the row

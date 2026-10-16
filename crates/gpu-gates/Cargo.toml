@@ -255,6 +255,10 @@ name = "gate_ds41_nvtier"
 required-features = ["deepseek41"]
 
 [[bin]]
+name = "gate_ds41_nodes"
+required-features = ["deepseek41"]
+
+[[bin]]
 name = "gate_deepseek41_step"
 required-features = ["deepseek41"]
 
@@ -332,6 +336,10 @@ required-features = ["glm5next"]
 
 [[bin]]
 name = "gate_glm5next_nvtier"
+required-features = ["glm5next"]
+
+[[bin]]
+name = "gate_glm5next_nodes"
 required-features = ["glm5next"]
 
 [[bin]]

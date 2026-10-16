@@ -1698,7 +1698,7 @@ impl Body {
                     i,
                     &spec.layers,
                     &map,
-                    [dims.embd, hp.expert_ff, LOAD_ROWS],
+                    [dims.embd, LOAD_ROWS],
                     host.card_dontneed,
                 )
             })
