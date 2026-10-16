@@ -315,6 +315,9 @@ pub struct Terms {
     /// head and the rows gathered from tables in the pool, and a layer's
     /// FFN with no routed stack: read on node 0 outside any window (A).
     pub serial: u64,
+    /// File bytes filled from the NVMe tier on node 0 before those pool
+    /// reads. Every gathered row is charged a fill, without cache hits.
+    pub(super) serial_nvme: u64,
     /// Per routed layer, in layer order.
     pub layers: Vec<LayerTerms>,
     /// Experts in each routed stack, and experts one token uses.
@@ -333,8 +336,8 @@ impl Terms {
     /// the node plans split it at. Refused by name: a plan of no unified
     /// pool, a routed stack that does not split into the model's experts,
     /// routed ids held in other bytes than the file's, a tensor in other than
-    /// one segment, rows other than routed ids read from the NVMe tier (a
-    /// row table the plan left there), and sums past u64.
+    /// one segment, and sums past u64. Rows read from the NVMe tier count
+    /// both their pool read and their serial fill.
     pub fn of(plan: &Plan<'_>, n_embd: u64) -> Result<Terms, NodesError> {
         if plan.machine.unified().is_none() {
             return Err(NodesError::NotUnified(0));
@@ -361,6 +364,7 @@ impl Terms {
             layer.expert = layer.expert.checked_add(bytes).ok_or_else(|| past(t))?;
         }
         let mut serial = 0u64;
+        let mut serial_nvme = 0u64;
         for r in &plan.rows {
             let Some(t) = model.tensors.get(r.tensor) else {
                 continue;
@@ -377,9 +381,15 @@ impl Terms {
                 _ => &mut serial,
             };
             *sum = sum.checked_add(pool_read(t, r)?).ok_or_else(|| past(t))?;
+            if r.segments.iter().any(|s| s.device == Device::Nvme) {
+                serial_nvme = serial_nvme
+                    .checked_add(r.read_bytes)
+                    .ok_or_else(|| past(t))?;
+            }
         }
         Ok(Terms {
             serial,
+            serial_nvme,
             layers: layers.into_iter().flatten().collect(),
             experts: model.experts,
             experts_used: model.experts_used,
@@ -414,8 +424,8 @@ impl Terms {
 
 /// The bytes a token reads of `t` from a node's pool as `r` places it: the
 /// rows the plan reads a token, in the card's format on a card and in the
-/// file's on the host; none of an unread tensor. Rows read from the NVMe
-/// tier are refused by name: the predictor takes no fill term for them.
+/// file's on the host or after a fill from the NVMe tier; none of an unread
+/// tensor. The fill is counted separately in [`Terms::serial_nvme`].
 fn pool_read(t: &ModelTensor, r: &Row) -> Result<u64, PlacementError> {
     if r.read_bytes == 0 {
         return Ok(0);
@@ -438,10 +448,10 @@ fn pool_read(t: &ModelTensor, r: &Row) -> Result<u64, PlacementError> {
     }
     match (s.device, s.format) {
         (Device::Card(_), Format::Card(format)) => card_bytes(t, format, r.read_bytes / row),
-        (Device::Host, _) => Ok(r.read_bytes),
-        (Device::Nvme, _) => Err(PlacementError::tensor(
+        (Device::Host, _) | (Device::Nvme, Format::NvmeFile) => Ok(r.read_bytes),
+        (Device::Nvme, format) => Err(PlacementError::tensor(
             t,
-            "rows read a token from the NVMe tier, which the node plans take no fill term for",
+            format!("an NVMe segment as {format}"),
         )),
         (Device::Unused, _) => Ok(0),
         (Device::Card(_), format) => Err(PlacementError::tensor(
@@ -468,9 +478,12 @@ pub struct Workload {
     /// One node's in-pool prompt rate at the prompt's length, tokens a second
     /// (S₁): a rate of a card and model pair, measured, so at least 1.
     pub prompt_rate: u64,
+    /// Node 0's NVMe fill rate in file bytes a second. At least 1 when
+    /// the plan reads rows from NVMe; 0 may mark an unused drive.
+    pub nvme_read: u64,
     /// Every routed id held in a pool: a plan that would page one is refused.
     pub whole: bool,
-    /// The paged ids' misses; `None` predicts the pool's reads only.
+    /// The paged routed ids' misses; `None` predicts their pool reads only.
     pub fills: Option<Fills>,
 }
 
@@ -697,6 +710,8 @@ fn checked_id_bytes(
         Some("a ruler outside 1..=1000 permille")
     } else if workload.prompt_rate == 0 {
         Some("a prompt rate of 0")
+    } else if terms.serial_nvme != 0 && workload.nvme_read == 0 {
+        Some("an NVMe fill rate of 0 for rows read from the NVMe tier")
     } else if terms.n_embd == 0 {
         Some("a row width of 0")
     } else if terms.experts_used == 0 || terms.experts_used > terms.experts {
@@ -1250,9 +1265,9 @@ impl<'a> NodePlan<'a> {
     }
 
     /// The plan's decode step for one token: the serial bytes over the read
-    /// rate, rounded down to whole picoseconds, and each routed layer's
-    /// expected window ([`NodePlan::layer_ps`]), exact over the slot
-    /// outcomes.
+    /// rate, the row tables' serial fill over the NVMe read rate, rounded
+    /// down to whole picoseconds, and each routed layer's expected window
+    /// ([`NodePlan::layer_ps`]), exact over the slot outcomes.
     pub(super) fn step_ps(&self) -> Result<Ps, NodesError> {
         let t = self.terms;
         let used = self.used();
@@ -1261,8 +1276,13 @@ impl<'a> NodePlan<'a> {
             .checked_mul(PS)
             .ok_or_else(|| self.overflow())?
             / u128::from(self.nodes.read);
+        let fill = if t.serial_nvme == 0 {
+            0
+        } else {
+            u128::from(t.serial_nvme) * PS / u128::from(self.workload.nvme_read)
+        };
         let mut step = Ps {
-            whole: serial,
+            whole: serial.checked_add(fill).ok_or_else(|| self.overflow())?,
             part: 0,
             of,
         };

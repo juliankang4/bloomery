@@ -879,7 +879,10 @@ now written beside them are not fed back into the tables.
 - **U**, the usable pool a node for model, KV and scratch: about 115 GB `[assumed]`. Section 3 reads 116.6–116.9 GiB
   (125 GB) of idle `MemAvailable` on a Spark `[#13]` and #16 reads it at plan time, so U is a cautious planning figure.
 - **NVMe**: 6.77 GB/s, our box's drive at queue depth 16 (`docs/cards/qdsweep.card`). ~~A Spark's drive rate is
-  `[unverified]`.~~ A Spark's drive rate depends on the drive (section 8).
+  `[unverified]`.~~ A Spark's drive rate depends on the drive (section 8). The node planner takes the row-table fill
+  rate as `Workload::nvme_read`, in file bytes a second. It charges
+  all gathered rows as misses on node 0, serial with its pool reads. This byte-rate term does not model page-read
+  amplification, per-read latency or cache hits.
 - N = 4 adds a 1.5 µs switch hop and 1 µs for a further post `[assumed]`.
 - The non-byte "rest" of a step (~~launch chain and latency, 2.6–4.4 ms a token~~; measured inside the gemv kernels,
   section 5) is not in the bands. It lowers
@@ -1139,8 +1142,11 @@ Where the gate holds a clause differently from its words below, the clause says 
   plans the Qwen3.8 file's tensor table for its first two layers, by its program's routed rule. No model file is read.
 - **Terms.** `Terms::of` reads node 0's card plan: each tensor's rows the plan reads a token, in the card's format on
   a card (a BF16 tensor counts its f32 bytes) and in the file's on the host. Routed experts count their file bytes, the
-  bytes the split holds them at. A row table left on the NVMe tier is refused by name, since the predictor has no fill
-  term for it. The row width is an input, the model's embedding length.
+  bytes the split holds them at. A row table left on the NVMe tier counts its gathered file bytes in both the pool
+  read and `serial_nvme`. The step adds `serial_nvme / Workload::nvme_read` outside the routed windows, on node 0
+  only. This rate must be positive when a table is read from NVMe; zero is allowed when none is. Unread rows and
+  tables moved to the host add no fill. The row width is an input, the model's embedding length. The routed ids'
+  arena misses remain the separate `Workload::fills` term.
 - **Expected sets.** The table of 9.8, pinned from a derivation script that moves into `tools/` beside the gate with its
   own self-test, so the pins have one derivation. ~~The script is not in the tree yet. Until it is, the gate pins the
   predictor's own cells, which match 9.8's table in criteria 2 and 7 and differ in criterion 5 (clause 5).~~ The script
@@ -1158,7 +1164,10 @@ Where the gate holds a clause differently from its words below, the clause says 
   1. `n1_is_today`: every N = 1 plan equals today's plan byte for byte. The gate holds it where node 0 holds every id:
      node 0's bytes are today's pool need, or both plans refuse the model by the same bytes. Paged, it holds node 0 to
      today's terms before their NVMe split and every id its pool has room for, because the node plans do not plan one
-     Spark's paged model as today's plan does (section 10). The step and node 0's window are the shape's bytes over BW.
+     Spark's paged model as today's plan does (section 10). The step and node 0's window are the shape's bytes over BW,
+     plus the serial table fill in the step. A synthetic V4.1 shape with an NVMe row table holds that fill to its
+     gathered bytes over the given rate, including a doubled rate and a host-resident table. The Qwen3.8 tensor
+     table pins its gathered-byte term; its unread NVMe table adds no fill.
   2. `pool_per_node`: criterion 1 refuses V4.1 whole at N = 2 and places it whole at N = 4. No other machine is refused.
      A node is used while the pools before it cannot hold every id. A node whose own budget passes its pool, or that
      the final split gives no id, is named idle.
@@ -1219,8 +1228,6 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   answer 20). `tools/flow/nodes_scale.py` (9.9) recomputes 9.8's "where each fires" table and 9.7's (a) rows at the
   gate's inputs. 9.7's one-node and NVMe rows, (b), (c) and N requests in flight still use their first inputs: they need
   ρ, the NVMe rate, a pipeline model, the union R(2) and a batched step, none of which is an input of the script.
-- A fill term in the node plans for rows read from the NVMe tier, so that they can plan the V4.1 file (9.7, 9.9
-  Terms).
 - Where `nodes_scale` ([#95](https://github.com/midagedev/bloomery/pull/95)) holds a clause of 9.9 differently from its
   words, for the maintainers to accept or change: it pins the cells `tools/flow/nodes_scale.py` derives, which differ from
   9.8's table as first written in criterion 5 (clause 5); clause 1 is byte for byte only where node 0 holds every id,
@@ -1245,6 +1252,9 @@ Each open item; the owner is named where one is agreed. An item that a measureme
 - Whether to take tensor parallel first instead of (a) is the maintainers' decision (9.4).
 
 **Closed.**
+- ~~A fill term in the node plans for rows read from the NVMe tier~~: `Terms::of` accepts row tables on that tier,
+  and the node step charges their gathered file bytes over an explicit fill rate (9.7, 9.9 Terms). This is a serial
+  byte-rate model with no table-cache hits, not a measured prediction for the V4.1 file.
 - ~~`glm5next/corpus-prose.ids`, `engram/corpus-prose.ids` and `fx_ref_glm5next_vis_taps` unpublished~~ on the refset
   dataset since 2026-10-14 ([#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6168041480), section 1).
 - ~~Which gate carries the first bit-gate pass on cc 12.1~~ (asked in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).

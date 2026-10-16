@@ -18,7 +18,7 @@ use super::workstation::{
     GB10_NIC, GB10_POOL, GB10_READ, TierBatchBytes, gb10, plan_node_tiers, plan_on, spark_nodes,
 };
 use super::{
-    CardFormat, Device, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan,
+    CardFormat, Device, Format, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan,
     PlanLevers, PoolNeed, Role, RoutedRule, Violation, plan_routed, plan_with, row_table_tier,
 };
 use crate::accepts::{Program, routed_rule};
@@ -208,6 +208,7 @@ fn fabric(n: usize, lambda_ns: u64) -> Fabric {
 fn workload(prompt_rate: u64) -> Workload {
     Workload {
         prompt_rate,
+        nvme_read: 1_000_000_000,
         whole: false,
         fills: None,
     }
@@ -940,17 +941,21 @@ fn n1_is_today() {
             ns(window)
         );
     }
-    let step_of = |plan: &Plan<'_>, n_embd| {
+    let step_of = |plan: &Plan<'_>, n_embd, nvme_read| {
         let nodes = spark_nodes(1, plan.model.layers, Fabric::Alone);
         let terms = Terms::of(plan, n_embd).expect("the terms");
         let budgets = [NodeBudget::of(plan).expect("a budget")];
-        let step = plan_nodes(&nodes, &terms, &budgets, workload(3_000))
+        let w = Workload {
+            nvme_read,
+            ..workload(3_000)
+        };
+        let step = plan_nodes(&nodes, &terms, &budgets, w)
             .and_then(|p| p.predict())
             .expect("one Spark")
             .step_ns;
         (terms, step)
     };
-    let (shape, n) = (QWEN38, QWEN38.n_embd);
+    let (shape, n) = (V41, V41.n_embd);
     let row = shape.row();
     let (attn, sh, _) = shape.rows(false);
     let mut model = shape.model(false);
@@ -975,18 +980,20 @@ fn n1_is_today() {
     let machine = spark(GB10_POOL, shape.layers);
     let mut plan = today(&model, &machine, true);
     assert_eq!(plan.row_tier().expect("one tier"), Some(Device::Nvme));
-    let nvme = |plan: &Plan<'_>, n_embd| match Terms::of(plan, n_embd) {
-        Err(NodesError::Model(PlacementError::Tensor { name, .. })) => name,
-        terms => panic!("a table on the NVMe tier: {terms:?}"),
-    };
-    assert_eq!(nvme(&plan, n), "engram 0");
+    let (nvme, filled_step) = step_of(&plan, n, 1_000_000_000);
+    assert_eq!(nvme.serial_nvme, 4 * row);
+    let (_, faster_step) = step_of(&plan, n, 2_000_000_000);
+    assert_eq!(filled_step - faster_step, 2 * row);
     row_table_tier(&mut plan, u64::MAX, 0, 1).expect("the table's tier");
     assert_eq!(plan.row_tier().expect("one tier"), Some(Device::Host));
-    let (t, step) = step_of(&plan, n);
+    let (t, step) = step_of(&plan, n, 0);
     let serial = (attn * shape.layers as u64 + 1) * row + VOCAB * n * 4;
     let shared = sh * row * (shape.layers as u64 - 1) + sh * n * 4;
     let shared_of = |t: &Terms| t.layers.iter().map(|l| l.shared).sum::<u64>();
     assert_eq!((t.serial, shared_of(&t)), (serial + 4 * row, shared));
+    assert_eq!((nvme.serial, shared_of(&nvme)), (t.serial, shared));
+    assert_eq!(t.serial_nvme, 0);
+    assert_eq!(filled_step - step, 4 * row);
     let bytes = t.serial + shared + shape.used * shape.layers as u64 * t.layers[0].expert;
     let ns = u128::from(bytes) * 1_000_000_000 / u128::from(GB10_READ);
     assert!(
@@ -1014,20 +1021,32 @@ fn n1_is_today() {
         .enumerate()
         .find(|(_, t)| t.role == Role::EngramTable)
         .expect("the PLE table");
-    assert_eq!(nvme(&plan, 2560), ple.name);
-    row_table_tier(&mut plan, u64::MAX, 0, 1).expect("the PLE table's tier");
-    let on_host = Terms::of(&plan, 2560).expect("the file's terms");
+    let on_nvme = Terms::of(&plan, 2560).expect("the file's NVMe terms");
     let mut unread = plan.clone();
-    for r in unread.rows.iter_mut().filter(|r| r.tensor == i) {
-        r.read_bytes = 0;
-    }
-    let unread = Terms::of(&unread, 2560).expect("the file's terms");
+    let table = unread
+        .rows
+        .iter()
+        .position(|r| r.tensor == i)
+        .expect("the table");
+    unread.rows[table].segments[0].format = Format::HostFile;
+    assert!(matches!(
+        Terms::of(&unread, 2560),
+        Err(NodesError::Model(PlacementError::Tensor { .. }))
+    ));
+    unread.rows[table].segments[0].format = Format::NvmeFile;
+    unread.rows[table].read_bytes = 0;
+    let unread = Terms::of(&unread, 2560).expect("the file's unread table");
+    row_table_tier(&mut plan, u64::MAX, 0, 1).expect("the PLE table's tier");
+    let on_host = Terms::of(&plan, 2560).expect("the file's host terms");
     let gathered = ple.gathered_rows.expect("its rows") * ple.file_bytes
         / ple.dims[1..].iter().product::<u64>();
     assert_eq!(
         (on_host.n_embd, on_host.serial - unread.serial),
         (2560, gathered)
     );
+    assert_eq!(on_nvme.serial, on_host.serial);
+    assert_eq!(on_nvme.serial_nvme, gathered);
+    assert_eq!((on_host.serial_nvme, unread.serial_nvme), (0, 0));
     let model = QWEN38.model(false);
     let reserve = 4 << 30;
     let mut machine = spark(GB10_POOL, QWEN38.layers);
@@ -1438,9 +1457,8 @@ fn nic_not_max() {
     let terms = terms_of(&model, &machines[0], shape.n_embd);
     let s1 = 6_000;
     let whole = Workload {
-        prompt_rate: s1,
         whole: true,
-        fills: None,
+        ..workload(s1)
     };
     let plan = plan_nodes(&nodes, &terms, &budgets, whole).expect("two Sparks");
     assert_eq!(plan.owned(), [0, 2]);
@@ -1482,9 +1500,8 @@ fn nic_not_max() {
     let budgets = budgets_on(&model, &mut nodes, &machines);
     let terms = terms_of(&model, &machines[0], 1);
     let whole = Workload {
-        prompt_rate: 1,
         whole: true,
-        fills: None,
+        ..workload(1)
     };
     let plan = plan_nodes(&nodes, &terms, &budgets, whole).expect("two nodes");
     assert_eq!(plan.owned(), [1, 2]);
@@ -1530,12 +1547,11 @@ fn nic_not_max() {
     let budgets = budgets_on(&model, &mut nodes, &machines);
     let terms = terms_of(&model, &machines[0], 647);
     let paged = Workload {
-        prompt_rate: 1,
-        whole: false,
         fills: Some(Fills {
             hit_permille: 999,
             fill_ns: 1,
         }),
+        ..workload(1)
     };
     let plan = plan_nodes(&nodes, &terms, &budgets, paged).expect("two nodes");
     assert_eq!(
@@ -1814,6 +1830,28 @@ fn named_refusals() {
         case.plan(&nodes, &budgets, workload(0)),
         Err(NodesError::Undefined("a prompt rate of 0"))
     ));
+    let no_drive = Workload {
+        nvme_read: 0,
+        ..workload(3_000)
+    };
+    case.plan(&nodes, &budgets, no_drive)
+        .expect("no NVMe rows need no drive rate");
+    let filled = Terms {
+        serial_nvme: 1,
+        ..case.terms.clone()
+    };
+    assert!(matches!(
+        plan_nodes(&nodes, &filled, &budgets, no_drive),
+        Err(NodesError::Undefined(
+            "an NVMe fill rate of 0 for rows read from the NVMe tier"
+        ))
+    ));
+    let slow_drive = Workload {
+        nvme_read: 1,
+        ..workload(3_000)
+    };
+    plan_nodes(&nodes, &filled, &budgets, slow_drive)
+        .expect("NVMe rows with a positive drive rate");
     for ruler in [0, 1001, u64::MAX] {
         nodes.ruler_permille = ruler;
         assert!(
