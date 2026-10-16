@@ -142,6 +142,7 @@ lg_process() {
   shift
   local -a arms=("$@")
   local n=${#arms[@]} k=-1 line rc=0 st out='' prev_out='' header='' shown t0=0 f0=0 fed='' bound pid dir rfd wfd i
+  local lg_traps lg_sig='' s
   LG_LEFT=()
   lg_cmd "${arms[@]}"
   bound=$((BOUND * (n + 1)))
@@ -149,8 +150,23 @@ lg_process() {
   dir=$(mktemp -d "${TMPDIR:-/tmp}/load-groups.XXXXXX") || exit 2
   mkfifo "$dir/go" "$dir/out" || exit 2
   echo "[load] r$r ${n} arm(s): $(for i in "${arms[@]}"; do printf '%s ' "${ARMS[$i]}"; done)- one process, one load"
+  pid=''
+  lg_traps=$(trap -p TERM INT HUP)
+  # Stop and reap the load before restoring the caller's traps and raising its signal again.
+  lg_stop() {
+    trap '' TERM INT HUP
+    lease_stop "$pid" || rc=$?
+    trap - TERM INT HUP
+    eval "$lg_traps"
+    kill -s "$lg_sig" $$
+  }
+  for s in TERM INT HUP; do
+    # shellcheck disable=SC2064 # the signal now, the pid when the trap runs
+    trap "lg_sig=$s; [ -z \"\$pid\" ] || lg_stop" "$s"
+  done
   env "${LG_ENV[@]}" timeout --kill-after=10 "$bound" "${LG_CMD[@]}" < "$dir/go" > "$dir/out" 2>&1 &
   pid=$!
+  [ -z "$lg_sig" ] || lg_stop
   # Read-write, so this open does not wait for the process's; the process's stdin sees EOF only when
   # this end closes.
   exec {wfd}<> "$dir/go"
@@ -172,7 +188,7 @@ lg_process() {
     if [ "$st" != 0 ]; then
       if [ "$st" -gt 128 ]; then
         echo "[load] r$r: no line for ${BOUND} s; killing the process (pid $pid)" >&2
-        kill "$pid" 2> /dev/null
+        lease_stop "$pid" || rc=$?
       fi
       break
     fi
@@ -192,7 +208,7 @@ lg_process() {
       k=$((k + 1))
       if [ "$k" -ge "$n" ]; then
         out="the process printed arm line $k of a list of $n: $line"$'\n'
-        kill "$pid" 2> /dev/null
+        lease_stop "$pid" || rc=$?
         break
       fi
       lg_pre "${arms[$k]}" "$r"
@@ -209,8 +225,11 @@ lg_process() {
       if [ -z "$fed" ] && [[ $line =~ $LG_FED_RE ]]; then fed=$(lg_majflt); fi
     fi
   done
-  wait "$pid"
-  rc=$?
+  wait "$pid" || rc=$?
+  pid=''
+  trap - TERM INT HUP
+  eval "$lg_traps"
+  [ -z "$lg_sig" ] || kill -s "$lg_sig" $$
   exec {wfd}>&- {rfd}<&-
   rm -rf "$dir"
   if [ "$k" -lt 0 ]; then
@@ -267,7 +286,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   # and the arms behind it are left for a fresh load. The outer bound, BOUND x (arms + 1), would end it with 124.
   # A host with no timeout takes tools/ref/stub-timeout.py, which ends the same two ways.
   stall_case() {
-    local sd
+    local sd child_status want s errexit st
+    # shellcheck source=tools/ref/lease.sh
+    source "${BASH_SOURCE[0]%/*}/lease.sh"
     sd=$(mktemp -d "${TMPDIR:-/tmp}/load-groups-selftest.XXXXXX")
     command -v timeout > /dev/null || cp "${BASH_SOURCE[0]%/*}/stub-timeout.py" "$sd/timeout"
     lg_majflt() { echo 0; }
@@ -280,6 +301,59 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
     check stall-killed "$(grep -c "no line for $BOUND s; killing the process" "$sd/err.log")" 1
     check stall-term "$(grep '^post 0 ' "$sd/post.log")" "post 0 rc=143"
     check stall-left "$(grep '^left=' "$sd/post.log")" "left=1 2"
+    for child_status in 0 7; do
+      want=70
+      [ "$child_status" = 0 ] || want=$child_status
+      lg_cmd() { LG_CMD=(sh -c 'echo "arm s0"; read -r go; read -r go; exit "$1"' _ "$child_status"); LG_ENV=(); }
+      : > "$sd/post.log"
+      (
+        lease_stop() { echo stop >&"$wfd"; return 70; }
+        PATH="$sd:$PATH"
+        lg_process 1 0
+      ) > /dev/null 2> "$sd/err.log"
+      check "stall-cleanup-$child_status-idle" "$(grep -c "no line for $BOUND s; killing the process" "$sd/err.log")" 1
+      check "stall-cleanup-$child_status-rc" "$(grep '^post 0 ' "$sd/post.log")" "post 0 rc=$want"
+    done
+    for child_status in 0 7; do
+      want=71
+      [ "$child_status" = 0 ] || want=$child_status
+      lg_cmd() { LG_CMD=(sh -c 'echo "arm s0"; read -r go; echo "arm extra"; read -r go; exit "$1"' _ "$child_status"); LG_ENV=(); }
+      : > "$sd/post.log"
+      (
+        lease_stop() { echo stop >&"$wfd"; return 71; }
+        PATH="$sd:$PATH"
+        lg_process 1 0
+      ) > /dev/null 2> "$sd/err.log"
+      check "extra-arm-cleanup-$child_status-rc" "$(tail -n 1 "$sd/post.log")" "post 0 rc=$want"
+    done
+    for s in TERM HUP; do
+      case $s in TERM) want=143 ;; HUP) want=129 ;; esac
+      for errexit in off on; do
+        st=0
+        TMPDIR="$sd" bash -c '
+          source "$1"
+          [ "$3" = off ] || set -e
+          reaped_signal=$2
+          ARMS=(s0 s1) BOUND=5
+          lg_majflt() { echo 0; }
+          lg_pre() { :; }
+          lg_post() { :; }
+          lg_cmd() {
+            [ "$#" != 1 ] || echo NEXT_ARM_STARTED
+            LG_CMD=(sh -c '\''echo "arm s0"; read -r go'\''); LG_ENV=()
+          }
+          set -T
+          trap '\''if [ "${FUNCNAME[0]:-}" = lg_process ] &&
+            [ "$BASH_COMMAND" = "trap - TERM INT HUP" ] && [ -z "$pid" ]; then
+              trap - DEBUG
+              kill -s "$reaped_signal" $$
+            fi'\'' DEBUG
+          lg_run_unit 1 0 1
+        ' _ "${BASH_SOURCE[0]}" "$s" "$errexit" > "$sd/reaped.log" 2>&1 || st=$?
+        check "reaped-$s-$errexit-rc" "$st" "$want"
+        check "reaped-$s-$errexit-no-next-arm" "$(grep -c NEXT_ARM_STARTED "$sd/reaped.log")" 0
+      done
+    done
     rm -rf "$sd"
   }
   # lg_process opens its descriptors with `exec {fd}<>`, which needs bash 4.1: the macOS bash 3.2 skips the case.

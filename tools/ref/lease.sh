@@ -1320,7 +1320,14 @@ EOF
     # form: the runner calls lease_bounded in its own shell (direct), or takes its output through the
     # capture helper (capture). A runner that captured it with `out=$(lease_bounded …)` is the form this
     # case was made to refuse: the stub and its timeout stay and hold the lease to their bound.
-    for form in direct capture startup fork ds41-ours ds41-ref ds41-pp ds41-preheat glm5next-preheat cstate qwen3moe-ours qwen3moe-ref qwen3moe-mem; do
+    for form in direct capture startup fork ds41-load ds41-load-fork ds41-ours ds41-ref ds41-pp ds41-preheat glm5next-preheat cstate qwen3moe-ours qwen3moe-ref qwen3moe-mem; do
+      case $form in ds41-load*)
+        if ! bash -c '[ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -ge 1 ]; }'; then
+          echo "skip bounded-$form: the runner's bash has no exec {fd}<>"
+          continue
+        fi
+        ;;
+      esac
       for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
         n=$((n + 1))
         funcs=''
@@ -1328,6 +1335,7 @@ EOF
           direct | fork) call='lease_bounded "$BOUND" "$3" "$4"' ;;
           capture) call='lease_out_init; echo "capture dir $LEASE_OUT_DIR"; lease_capture "$BOUND" "$3" "$4"' ;;
           startup) call='source "$7"; lease_bounded "$BOUND" "$3" "$4"' ;;
+          ds41-load*) call='source "$6"; source "$LEASE_TREE/tools/ref/load-groups.sh"; lg_cmd() { LG_CMD=("$TEST_BIN" "$TEST_PID"); LG_ENV=(); }; ARMS=(stub); lg_process 1 0' ;;
           ds41-ours | qwen3moe-ours) call='source "$5"; source "$6"; ours_arm 0 1' ;;
           ds41-ref | qwen3moe-ref) call='source "$5"; source "$6"; ref_arm stub 6 1' ;;
           ds41-pp) call='source "$5"; source "$6"; ref_arm pp 6 1' ;;
@@ -1386,6 +1394,22 @@ EOF
         fi
       done
     done
+    # The real memory scope must wait through a second TERM and return its late child's code.
+    source "$t/qwen3moe-arm-functions"
+    HELD_PID="$t/scope.pid" bash -c "$MEM_SCOPE_SCRIPT" -- "$t/held" > "$t/scope.log" 2>&1 &
+    rp=$!
+    i=0 ready=no
+    until { cancel_ready "$t/scope.pid" && ready=yes; } || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
+    check bounded-mem-scope-ready "$ready" yes
+    kill -TERM "$rp"
+    sleep 0.1
+    kill -TERM "$rp" 2> /dev/null || :
+    RC=0
+    wait "$rp" || RC=$?
+    check bounded-mem-scope-rc "$RC" 7
+    read -r sp ip < "$t/scope.pid"
+    check bounded-mem-scope-child-gone "$(kill -0 "$sp" 2> /dev/null && echo no || echo yes)" yes
+    if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
     RC=0
     lease_capture 10 sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-capture-rc "$RC" 3
