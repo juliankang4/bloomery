@@ -999,6 +999,11 @@ pub enum TierInput<'a> {
 /// holds no expert of is refused by name. The protocol around the call —
 /// the go, the staging, the fault copy, the signal — is [`TierCard`]'s.
 pub trait TierExperts {
+    /// NVMe slots filled and their file bytes since load.
+    fn host_fills(&self) -> Result<(u64, u64), GpuError> {
+        Ok((0, 0))
+    }
+
     /// A failure raised by host computation after its stream work settled.
     fn check(&self) -> Result<(), GpuError> {
         Ok(())
@@ -1224,6 +1229,10 @@ impl TierWork {
     }
 
     /// The tier's resident stacks.
+    pub(super) fn host_fills(&self) -> Result<(u64, u64), GpuError> {
+        self.experts.host_fills()
+    }
+
     pub(super) fn weights(&self) -> &Weights {
         &self.weights
     }
@@ -1956,13 +1965,35 @@ impl TierCard {
         self.rebind_stage()
     }
 
+    pub(super) fn supports_blocks(&self) -> bool {
+        match &self.side {
+            TierSide::Here(work) => work.experts.block_bytes() != 0,
+            TierSide::Node(_) => false,
+        }
+    }
+
+    /// Settled host-tier fills, read locally or through the node's drain reply.
+    pub fn host_fills(&mut self) -> Result<(u64, u64), GpuError> {
+        let fills = match &mut self.side {
+            TierSide::Here(w) => {
+                w.drain(super::DRAIN_DEADLINE, "the host tier's statistics")?;
+                w.host_fills()
+            }
+            TierSide::Node(n) => n.drain(super::DRAIN_DEADLINE),
+        }?;
+        self.rebind_stage()?;
+        Ok(fills)
+    }
+
     /// Wait, polling, until the tier's stream has drained, at most
     /// `deadline`; past it the wait fails by name as `what`. The stage
     /// card's context is current on return.
     pub(super) fn drain(&mut self, deadline: Duration, what: &'static str) -> Result<(), GpuError> {
         match &mut self.side {
             TierSide::Here(w) => w.drain(deadline, what)?,
-            TierSide::Node(n) => n.drain(deadline)?,
+            TierSide::Node(n) => {
+                n.drain(deadline)?;
+            }
         }
         self.rebind_stage()
     }
@@ -2112,7 +2143,9 @@ impl TierCard {
         } else {
             match &mut self.side {
                 TierSide::Here(w) => w.sync()?,
-                TierSide::Node(n) => n.drain(super::DRAIN_DEADLINE)?,
+                TierSide::Node(n) => {
+                    n.drain(super::DRAIN_DEADLINE)?;
+                }
             }
             for off in page.counters(self.index) {
                 page.link.reset(off).map_err(|b| {

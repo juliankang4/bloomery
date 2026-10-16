@@ -2167,8 +2167,8 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k --slots':
 # processes on one card: on the box the A6000 by box.sh's pick (`BLOOMERY_CARD=a6000`), as two 16 GiB budgets pass the
 # 3090's 24 GB. The binary's cleanup unit tests run through tools/gate.sh before the card gate.
 [group('v41-load')]
-gate-gpu-qwen38-nodes:
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_nodes --bin tier_server && bash tools/gpu-gate.sh gate_qwen38_nodes'
+gate-gpu-qwen38-nodes *ARGS='':
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_nodes --bin tier_server && bash tools/gpu-gate.sh gate_qwen38_nodes {{ARGS}}'
 
 # A refused replay on a separate tier node resets to its fresh history. Requires BLOOMERY_TIER_NODES
 # and BLOOMERY_TIER_LINK=rdma, with tier_server already serving the same model on that node.

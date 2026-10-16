@@ -174,7 +174,7 @@ pub fn tier_graphs_and_chains(tier: &TierCard, layers: usize) -> bool {
     let graphs_ok = graphs.iter().all(|&g| g == want);
     println!(
         "structure: the tier's graphs of the step and the 2, 3, 4-column verifies hold {graphs:?} \
-         nodes, {per_layer} a tier layer (CPU paging {paged}) and the fault copy ({want:?}): {}",
+         nodes, {per_layer} a tier layer (host execution {paged}) and the fault copy ({want:?}): {}",
         verdict(graphs_ok)
     );
     let st = tier.stats();

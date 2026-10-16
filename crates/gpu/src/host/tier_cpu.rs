@@ -157,7 +157,10 @@ impl CpuExperts {
             .zip(out)
             .and_then(|((x, sel), out)| x.checked_add(sel)?.checked_add(out)?.checked_mul(4))
             .ok_or_else(|| GpuError::shape(WHAT, "the host tier's staging bytes overflow"))?;
-        let (x, sel, out) = (x.unwrap(), sel.unwrap(), out.unwrap());
+        let ((x, sel), out) = x
+            .zip(sel)
+            .zip(out)
+            .expect("byte check proved all sizes fit");
         run.attach_tier(tier)?;
         run.prepare_union(1)?;
         let state = Arc::new(Mutex::new(State {
@@ -218,6 +221,20 @@ impl Drop for CpuExperts {
 }
 
 impl TierExperts for CpuExperts {
+    fn host_fills(&self) -> Result<(u64, u64), GpuError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| GpuError::shape(WHAT, "the host expert state was poisoned"))?;
+        Ok(match state.run.tier() {
+            Some(tier) => {
+                let stats = tier.stats();
+                (stats.fills, stats.fill_bytes)
+            }
+            None => (0, 0),
+        })
+    }
+
     fn enqueue_layer(
         &mut self,
         gpu: &Gpu,

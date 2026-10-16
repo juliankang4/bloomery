@@ -334,6 +334,10 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
             tier.stats().fills >= 3,
             "the paged expert must refill after each release"
         );
+        assert_eq!(
+            experts.host_fills().unwrap(),
+            (tier.stats().fills, tier.stats().fill_bytes)
+        );
         assert!(
             tier.stats().step_fills > 0,
             "HostRun must use the NVMe step claims"
@@ -355,6 +359,7 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
             .unwrap();
         gpu.stream().synchronize().unwrap();
         resident.check().unwrap();
+        assert_eq!(resident.host_fills().unwrap(), (0, 0));
         assert_eq!(
             out.to_host_vec(gpu.stream())
                 .unwrap()

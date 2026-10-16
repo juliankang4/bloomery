@@ -282,7 +282,7 @@ pub struct NodeNvme {
 impl NodeOpen {
     /// Project the assigned routed stacks onto this node's own host room.
     /// Row tables and attention are not part of an expert tier's request.
-    pub(crate) fn project(
+    pub fn project(
         &mut self,
         plan: &Plan<'_>,
         census: &NodeCensus,
@@ -1103,11 +1103,18 @@ impl TierNode {
 
     /// [`TierWork::drain`] on the node, under `deadline` (the server's
     /// drain deadline at most).
-    pub(super) fn drain(&mut self, deadline: Duration) -> Result<(), GpuError> {
+    pub(super) fn drain(&mut self, deadline: Duration) -> Result<(u64, u64), GpuError> {
         let deadline = deadline.min(DRAIN_DEADLINE);
         let ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
         self.req.clear().u64(ms);
-        self.ask(Tag::Drain, deadline + REPLY, "drain")
+        self.call(Tag::Drain, deadline + REPLY, "drain")?;
+        let mut i = In::new(self.ch.body());
+        let fills = (|| {
+            let fills = (i.u64("host fills")?, i.u64("host fill bytes")?);
+            i.end()?;
+            Ok::<_, String>(fills)
+        })();
+        fills.map_err(|e| self.lose_now("drain", e))
     }
 
     /// [`TierWork::clear_fault_within`] on the node, refused while work
@@ -1536,9 +1543,10 @@ impl Session<'_> {
                 let ms = i.u64("deadline").map_err(bad)?;
                 i.end().map_err(bad)?;
                 let deadline = Duration::from_millis(ms).min(DRAIN_DEADLINE);
-                self.opened()?
-                    .work
-                    .drain(deadline, "tier_server: the tier's stream")?;
+                let work = &self.opened()?.work;
+                work.drain(deadline, "tier_server: the tier's stream")?;
+                let (fills, bytes) = work.host_fills()?;
+                self.reply.u64(fills).u64(bytes);
             }
             Tag::ClearFault => {
                 i.end().map_err(bad)?;

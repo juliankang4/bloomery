@@ -27,8 +27,8 @@
 //!   process, the tier a card of that process. Structure: node 0's stage
 //!   graphs hold the
 //!   one-process load's nodes; the tier's graphs of the step and of each
-//!   verify width, captured on node 1, hold [`TIER_LAYER_NODES`] a tier layer
-//!   and the fault copy; each chain fed and captured once and replayed by
+//!   verify width, captured on node 1, hold the resident or host executor's
+//!   nodes per layer and the fault copy; each chain fed and captured once and replayed by
 //!   every later pass. Precondition: node 1 holds the tier's experts and
 //!   every tier layer was sent a routed slot.
 //! - Lost node 1: node 1 killed after the history, node 0's next step fails
@@ -50,6 +50,12 @@
 //!   naming the loss within [`LOST_BOUND_S`]. A stopped node 0 is then
 //!   continued: its held step fails, naming the node's release and the lost
 //!   card, and returns no token from the rows node 1 served after it.
+//!
+//! `--host` lowers an equal partition of expert ids into the loaded map.
+//! Its loopback server has 20 GiB of host room through the existing room
+//! lever. The same plan's local CPU tier is the byte oracle; the node must
+//! have no resident device weights and must report nonzero NVMe fills.
+//! `--history <gib> <out>` saves a history for an off-host comparison.
 //!
 //! Node 0 runs as a child of this binary (`--node0`, `--hold0`) with the
 //! lever set; this process holds no load while a child does.
@@ -152,11 +158,13 @@ mod gate {
         },
     }
 
-    fn parse_args() -> Result<Mode, GateError> {
-        const USAGE: &str = "usage: gate_qwen38_nodes (node 0 modes, run by the gate: --node0 \
+    fn parse_args() -> Result<(Mode, bool), GateError> {
+        const USAGE: &str = "usage: gate_qwen38_nodes [--host] (node 0 modes, run by the gate: --node0 \
                              <gib> <out> <server pid> | --hold0 <gib>) or --measure \
                              <local|node> <gib> or --decode0 <gib> <tokens> <out> or --history <gib> <out>";
         let args: Vec<String> = std::env::args().skip(1).collect();
+        let host = args.first().is_some_and(|a| a == "--host");
+        let args = if host { &args[1..] } else { &args[..] };
         let gib = |s: &str, max: u64| -> Result<u64, GateError> {
             let n = s
                 .parse::<u64>()
@@ -166,7 +174,7 @@ mod gate {
             }
             Ok(n)
         };
-        Ok(
+        Ok((
             match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
                 [] => Mode::Gate,
                 ["--node0", g, out, server] => Mode::Node0 {
@@ -209,7 +217,8 @@ mod gate {
                 },
                 _ => return Err(USAGE.into()),
             },
-        )
+            host,
+        ))
     }
 
     /// What every mode reads: the file, its plan inputs, the ubatch and the
@@ -220,6 +229,7 @@ mod gate {
         host: HostCfg,
         ub: usize,
         ids: Vec<u32>,
+        node_host: bool,
     }
 
     impl Common {
@@ -240,6 +250,7 @@ mod gate {
                 host: levers.host(),
                 ub,
                 ids,
+                node_host: false,
             })
         }
 
@@ -307,14 +318,26 @@ mod gate {
     /// last layer (a stopped node 0 strands its card only at a host leg, so
     /// the stopped clause needs one ahead of a tier layer).
     fn plan_under<'a>(
-        inputs: &'a PlanInputs,
+        c: &'a Common,
         machine: &'a Machine,
         gib: u64,
     ) -> Result<Result<Plan<'a>, String>, GateError> {
         let levers = PlanLevers {
             card_budget_bytes: Some(gib << 30),
         };
-        match inputs.plan_with(machine, CTX as u64, &levers, Experts::Card) {
+        let inputs = &c.inputs;
+        let planned = if c.node_host {
+            let half = inputs.model.experts / 2;
+            inputs.plan_nodes(
+                machine,
+                CTX as u64,
+                &levers,
+                &[half, inputs.model.experts - half],
+            )
+        } else {
+            inputs.plan_with(machine, CTX as u64, &levers, Experts::Card)
+        };
+        match planned {
             Ok(plan) => {
                 let tier = plan.tier_n_l.first().ok_or("plan (b′) holds no tier")?;
                 if let Some(l) = tier.iter().position(|&n| n == 0) {
@@ -399,18 +422,26 @@ mod gate {
     /// The tier's structure after a history ([`tier_graphs_and_chains`]),
     /// and the precondition that the tier serves experts and every tier
     /// layer was sent a routed slot.
-    fn tier_structure(s: &Session<Body38>, layers: &[usize]) -> Result<bool, GateError> {
-        let body = s.model().body(NAME)?;
+    fn tier_structure(s: &mut Session<Body38>, layers: &[usize]) -> Result<bool, GateError> {
+        let body = s.model_mut().body_parts(NAME)?.2;
         let tier = body
-            .hybrid()
-            .tiers()
-            .first()
+            .hybrid_mut()
+            .tiers_mut()
+            .first_mut()
             .ok_or("the load holds no tier")?;
-        let ok = tier_graphs_and_chains(tier, layers.len());
+        let (fills, bytes) = tier.host_fills()?;
+        let host = tier.resident_bytes() == 0;
+        let paging = !host || tier.node().is_none() || (fills > 0 && bytes > 0);
+        println!(
+            "paging: host tier {host}, NVMe fills {fills}, file bytes {bytes}: {}",
+            verdict(paging)
+        );
+        let ok = tier_graphs_and_chains(tier, layers.len()) && paging;
         let st = tier.stats();
         let first = tier.set().layers().start;
         let hits = |l: usize| st.layer_hits.get(l - first).copied().unwrap_or(0);
         let missing: Vec<usize> = layers.iter().copied().filter(|&l| hits(l) == 0).collect();
+        // PIN(2026-10-17): host tiers hold no device weights; graph and paging checks cover their execution.
         let pre = missing.is_empty() && tier.set().experts() > 0;
         println!(
             "precondition: the tier holds {} experts ({} B) and every tier layer was sent a \
@@ -551,7 +582,7 @@ mod gate {
 
     /// Node 1: a tier server on a free loopback port, serving `model` when
     /// one is given, and its address.
-    fn node1(model: Option<&Path>) -> Result<(Proc, SocketAddr), GateError> {
+    fn node1(model: Option<&Path>, host: bool) -> Result<(Proc, SocketAddr), GateError> {
         let mut cmd = Command::new(beside("tier_server")?);
         cmd.args(["--listen", "127.0.0.1:0"])
             .env_remove(TIER_NODES)
@@ -559,6 +590,9 @@ mod gate {
             .env_remove(HOST_POPULATE)
             .env_remove(HOST_LOCK)
             .env_remove(CARD_DONTNEED);
+        if host {
+            cmd.env(bloomery_levers::HOST_ROOM, "20G");
+        }
         if let Some(m) = model {
             cmd.arg("-m").arg(m);
         }
@@ -570,8 +604,11 @@ mod gate {
 
     /// Node 0 as a child of this binary in `mode`'s arguments, with the
     /// lever naming `addr`.
-    fn node0(args: &[String], addr: SocketAddr) -> Result<Proc, GateError> {
+    fn node0(args: &[String], addr: SocketAddr, host: bool) -> Result<Proc, GateError> {
         let mut cmd = Command::new(std::env::current_exe()?);
+        if host {
+            cmd.arg("--host");
+        }
         cmd.args(args).env(TIER_NODES, addr.to_string());
         Proc::spawn(cmd, "node 0")
     }
@@ -668,7 +705,7 @@ mod gate {
             verdict(ok)
         );
         for gib in (1..=TOP_GIB).rev() {
-            match plan_under(&c.inputs, m, gib)? {
+            match plan_under(c, m, gib)? {
                 Err(why) => println!("budget {gib} GiB: {why}; next"),
                 Ok(plan) => {
                     let held = |v: &[u64]| {
@@ -713,7 +750,7 @@ mod gate {
             return Err("the placement did not select node 1's device".into());
         }
         let m: &'a Machine = machine.insert(c.machine(*tier)?);
-        plan_under(&c.inputs, m, gib)?.map_err(|why| format!("under {gib} GiB: {why}").into())
+        plan_under(c, m, gib)?.map_err(|why| format!("under {gib} GiB: {why}").into())
     }
 
     /// The plan's tier as node 0 opens it on a node, its rows from `file`
@@ -845,7 +882,8 @@ mod gate {
             1,
             usize::try_from(model::arch::qwen35moe::place::tier_route_scratch_bytes(1))?,
         );
-        let (mut n1, addr) = node1(None)?;
+        let (mut n1, addr) = node1(None, c.node_host)?;
+        open.project(plan, &TierNode::census_of(addr)?, 1)?;
         let target = std::env::temp_dir().join(format!("{NAME}-{}.target", std::process::id()));
         let alias =
             Path::new("/dev/shm").join(format!("bloomery-tier-{}-symlink", std::process::id()));
@@ -922,7 +960,7 @@ mod gate {
     /// `$BLOOMERY_DATA` whose one tier segment's first byte is flipped, its
     /// headers `file`'s, served by a second node 1; the plan's tier opened
     /// on it is refused naming the segment's other bytes.
-    fn other_bytes_open(plan: &Plan<'_>, file: &Split) -> Result<bool, GateError> {
+    fn other_bytes_open(plan: &Plan<'_>, file: &Split, host: bool) -> Result<bool, GateError> {
         let open = tier_open(plan, file)?;
         let hashed = open.rows.iter().try_fold(0u64, |sum, r| {
             let held = match &r.experts {
@@ -988,7 +1026,7 @@ mod gate {
                 .ok_or_else(|| "a file of no shard".into())
         })();
         let r = made.and_then(|copy| {
-            let (_n1, addr) = node1(Some(&copy))?;
+            let (_n1, addr) = node1(Some(&copy), host)?;
             Ok(TierNode::open(addr, &open).map(drop))
         });
         let r = remove_open_copy(&dir, r)?;
@@ -1050,7 +1088,31 @@ mod gate {
             let own = bloomery_gpu::census()?;
             let card = own.first().ok_or("no local tier card")?;
             let m = machine.insert(c.machine(spec_of_device(card))?);
-            plan_under(&c.inputs, m, gib)?.map_err(|why| format!("under {gib} GiB: {why}"))?
+            plan_under(c, m, gib)?.map_err(|why| format!("under {gib} GiB: {why}"))?
+        };
+        let capacity = if c.node_host {
+            let resident = c.inputs.plan_with(
+                plan.machine,
+                CTX as u64,
+                &PlanLevers {
+                    card_budget_bytes: Some(gib << 30),
+                },
+                Experts::Card,
+            )?;
+            let tier = &plan.cards[1];
+            let before = &resident.cards[1];
+            let ok = tier.experts > before.experts && tier.expert_bytes == 0;
+            println!(
+                "capacity: the node owns {} experts against the resident tier's {}, with {} B \
+                 charged as resident tier weights: {}",
+                tier.experts,
+                before.experts,
+                tier.expert_bytes,
+                verdict(ok)
+            );
+            ok
+        } else {
+            true
         };
         let layers = tier_layers(&plan);
         let mut s = c.open(&plan)?;
@@ -1061,14 +1123,14 @@ mod gate {
             .tiers()
             .first()
             .and_then(TierCard::node);
-        let mut ok = on == addr;
+        let mut ok = capacity && on == addr;
         println!(
             "node 0: the tier is served by the node at {on:?}: {}",
             verdict(ok)
         );
         let run = q38_history::history(&mut s, &c.ids, |_| Ok(()))?;
         write_run(&run, out)?;
-        ok &= tier_structure(&s, &layers)?;
+        ok &= tier_structure(&mut s, &layers)?;
         if let Some(server) = server {
             ok &= lost_node1(
                 s.model_mut(),
@@ -1270,10 +1332,10 @@ mod gate {
     /// step's launch; node 0 is then ended by `sig` and the launch
     /// forwarded: node 1 exits within the bound, naming the loss, its go
     /// words released and its stream drained.
-    fn lost_node0(gib: u64, sig: &str, what: &str) -> Result<bool, GateError> {
-        let (mut n1, addr) = node1(None)?;
+    fn lost_node0(gib: u64, sig: &str, what: &str, host: bool) -> Result<bool, GateError> {
+        let (mut n1, addr) = node1(None, host)?;
         let relay = Relay::start(addr)?;
-        let mut n0 = node0(&["--hold0".to_string(), gib.to_string()], relay.addr)?;
+        let mut n0 = node0(&["--hold0".to_string(), gib.to_string()], relay.addr, host)?;
         n0.wait_line(ARMED, Duration::from_secs(600))?;
         relay.armed.store(true, Ordering::SeqCst);
         n0.say("step\n")?;
@@ -1330,9 +1392,9 @@ mod gate {
     /// card, node 0 keeping its failed load. Node 1 is then continued: it
     /// exits within the bound, naming the loss, its words released and its
     /// stream drained.
-    fn stopped_node1(gib: u64) -> Result<bool, GateError> {
-        let (mut n1, addr) = node1(None)?;
-        let mut n0 = node0(&["--hold0".to_string(), gib.to_string()], addr)?;
+    fn stopped_node1(gib: u64, host: bool) -> Result<bool, GateError> {
+        let (mut n1, addr) = node1(None, host)?;
+        let mut n0 = node0(&["--hold0".to_string(), gib.to_string()], addr, host)?;
         n0.wait_line(ARMED, Duration::from_secs(600))?;
         n1.signal("-STOP")?;
         n0.say("step\n")?;
@@ -1379,7 +1441,7 @@ mod gate {
     fn gate(c: &Common) -> Result<(), GateError> {
         let mut pass = true;
         tier::sc("census: node 1's census over the channel is the plan's tier card")?;
-        let (mut n1, addr) = node1(None)?;
+        let (mut n1, addr) = node1(None, c.node_host)?;
         let mut machine = None;
         let (plan, gib, census_ok) = census_plan(c, &mut machine, addr)?;
         pass &= census_ok;
@@ -1389,7 +1451,7 @@ mod gate {
         tier::sc("open: node 1 refuses a segment of other experts than the tier's set")?;
         pass &= swapped_open(c, &plan, &file, addr)?;
         tier::sc("open: node 1 refuses a copy of the file whose tier segment holds other bytes")?;
-        pass &= other_bytes_open(&plan, &file)?;
+        pass &= other_bytes_open(&plan, &file, c.node_host)?;
         tier::sc(
             "bind: node 1 refuses a symlink and leaves its target unchanged after disconnect",
         )?;
@@ -1399,7 +1461,7 @@ mod gate {
         tier::sc("bits: node 0 with the tier on node 1 = one process, bit for bit")?;
         let mut one = c.open(&plan)?;
         let want = q38_history::history(&mut one, &c.ids, |_| Ok(()))?;
-        pass &= tier_structure(&one, &layers)?;
+        pass &= tier_structure(&mut one, &layers)?;
         drop(one);
         let out = std::env::temp_dir().join(format!("{NAME}-{}.run", std::process::id()));
         let args = [
@@ -1408,7 +1470,7 @@ mod gate {
             out.display().to_string(),
             n1.child.id().to_string(),
         ];
-        let mut n0 = node0(&args, addr)?;
+        let mut n0 = node0(&args, addr, c.node_host)?;
         let status = n0
             .wait_within(Duration::from_secs(1800))?
             .ok_or("node 0 did not end within 1800 s")?;
@@ -1437,11 +1499,11 @@ mod gate {
         println!("node 1 ended {killed:?} (killed by node 0's lost node clause)");
 
         tier::sc("stopped node 1: node 0's step fails; continued, node 1 ends")?;
-        pass &= stopped_node1(gib)?;
+        pass &= stopped_node1(gib, c.node_host)?;
         tier::sc("lost node 0: killed, node 1 releases its words and drains")?;
-        pass &= lost_node0(gib, "-KILL", "killed")?;
+        pass &= lost_node0(gib, "-KILL", "killed", c.node_host)?;
         tier::sc("lost node 0: stopped, node 1 releases its words; continued, its step fails")?;
-        pass &= lost_node0(gib, "-STOP", "stopped")?;
+        pass &= lost_node0(gib, "-STOP", "stopped", c.node_host)?;
 
         let (ran, deferred) = tier::tally();
         println!(
@@ -1476,8 +1538,7 @@ mod gate {
                 Experts::Card,
             )?
         } else {
-            plan_under(&c.inputs, &machine, gib)?
-                .map_err(|why| format!("under {gib} GiB: {why}"))?
+            plan_under(c, &machine, gib)?.map_err(|why| format!("under {gib} GiB: {why}"))?
         };
         let identity = format!(
             "ctx={CTX} ub={} stage={:?} tier={:?} host={} host_bytes={}",
@@ -1496,7 +1557,7 @@ mod gate {
             return Err(format!("{arm} loaded tier at {loaded_at:?}").into());
         }
         let warm = q38_history::history(&mut s, &c.ids, |_| Ok(()))?;
-        if !tier_structure(&s, &tier_layers(&plan))? {
+        if !tier_structure(&mut s, &tier_layers(&plan))? {
             return Err("tier structure or routing precondition failed".into());
         }
         let apps = Command::new("nvidia-smi")
@@ -1621,8 +1682,9 @@ mod gate {
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
         record::at_main(NAME, record::GATE_QWEN38_NODES);
-        let mode = parse_args()?;
-        let c = Common::new(&levers)?;
+        let (mode, host) = parse_args()?;
+        let mut c = Common::new(&levers)?;
+        c.node_host = host;
         match mode {
             Mode::Gate => {
                 if !bloomery_levers::tier_nodes()?.is_empty() {
@@ -1657,8 +1719,12 @@ mod gate {
                 if arm == "local" {
                     measure(&c, gib, None)
                 } else {
-                    let (_server, addr) = node1(None)?;
-                    let mut child = node0(&["--measure-node0".into(), gib.to_string()], addr)?;
+                    let (_server, addr) = node1(None, c.node_host)?;
+                    let mut child = node0(
+                        &["--measure-node0".into(), gib.to_string()],
+                        addr,
+                        c.node_host,
+                    )?;
                     let line = child.wait_line("tier cost ", Duration::from_secs(900))?;
                     if !child
                         .wait_within(Duration::from_secs_f64(LOST_BOUND_S))?
@@ -1706,7 +1772,7 @@ mod gate {
             assert!(independent, "the node budgets must use their own census");
             let mut s = c.open(&plan)?;
             let mut fresh = super::q38_history::history(&mut s, &c.ids, |_| Ok(()))?;
-            assert!(super::tier_structure(&s, &super::tier_layers(&plan))?);
+            assert!(super::tier_structure(&mut s, &super::tier_layers(&plan))?);
             let ready = s.model().body(NAME)?.hybrid().tiers()[0]
                 .stats()
                 .control_round_trips;

@@ -802,7 +802,10 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    A remote tier serves no prompt batch (the batch call refuses it by name);
    only Qwen3.8 opens a tier on a node, and GLM and V4.1 refuse it by name. `just gate-gpu-qwen38-nodes` holds the
    census, the refused opens (a row of other experts, and a copy of the file whose tier row holds other bytes), the bits
-   (node 0 with node 1's tier against the same plan in one process) and the losses below.
+   (node 0 with node 1's tier against the same plan in one process) and the losses below. Its `--host` mode lowers
+   equal routed ranges onto two nodes and compares the paged node with the same build's local CPU tier. It requires
+   nonzero NVMe fills and file bytes on the remote tier, checks the callback/copy graph shape and the history's
+   capture/replay counts, and applies the same loss and drain clauses.
 6. **Loss.** Node 0 names a lost node as a lost card: a request that fails or passes its deadline marks the node lost
    and ends its channel, and the step fails with the tier `CardLost`. The go deadline still covers a node that answers
    but stops computing. Node 1 has two ends of its own: the channel closing without a close, and work asked of it with

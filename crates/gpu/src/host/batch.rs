@@ -1071,7 +1071,7 @@ impl<H: HostExperts> HostTier<H> {
         };
         if self.tiers.is_empty()
             || !port.tiers.is_empty()
-            || self.tiers.iter().any(|t| t.node().is_some())
+            || self.tiers.iter().any(|t| !t.supports_blocks())
         {
             return Ok(());
         }
@@ -1092,11 +1092,11 @@ impl<H: HostExperts> HostTier<H> {
     /// places against the host's [`TIER_BATCH_HOST_RESERVE`] row. A card list
     /// that is not one card a tier, a missing row, a row named twice, or a
     /// difference is refused by name, naming the reserve. Load-time only, once
-    /// [`HostTier::prepare_batch`] has made the legs. With a tier on a node no
-    /// leg is made ([`HostTier::prepare_tier_batch`]) and none is checked.
+    /// [`HostTier::prepare_batch`] has made the legs. Step-only tiers make
+    /// no batch leg ([`HostTier::prepare_tier_batch`]) and none is checked.
     pub fn check_tier_reserves(&self, machine: &Machine, cards: &[usize]) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::check_tier_reserves";
-        if self.tiers.iter().any(|t| t.node().is_some()) {
+        if self.tiers.iter().any(|t| !t.supports_blocks()) {
             return Ok(());
         }
         if self.tiers.is_empty() || cards.len() != self.tiers.len() {
