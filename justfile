@@ -2137,6 +2137,12 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k --slots':
 gate-gpu-qwen38-nodes:
     BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_nodes --bin tier_server && bash tools/gpu-gate.sh gate_qwen38_nodes'
 
+# A refused replay on a separate tier node resets to its fresh history. Requires BLOOMERY_TIER_NODES
+# and BLOOMERY_TIER_LINK=rdma, with tier_server already serving the same model on that node.
+[group('v41-load')]
+gate-gpu-qwen38-nodes-remote:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes -- --ignored hw_a_refused_remote_replay_resets_to_its_fresh_history --nocapture'
+
 # The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
 # ("The capital of France is") and its ids the profile's REF_TOKENS — ik's llama-tokenize on this model's
 # vocabulary, never our own tokenizer (the derivation command is the profile comment's) — and five is at most the

@@ -504,6 +504,15 @@ impl TierLayout {
         })
     }
 
+    /// Bytes in one row's go and done posts, including their generation words.
+    #[must_use]
+    pub fn wire_bytes(&self) -> [usize; 2] {
+        let crossings = self.crossings();
+        std::array::from_fn(|i| {
+            crossings[i].spans.iter().map(|s| s.len()).sum::<usize>() + std::mem::size_of::<u32>()
+        })
+    }
+
     /// Tiers the page carries.
     #[must_use]
     pub fn tiers(&self) -> usize {
@@ -1698,7 +1707,7 @@ impl TierCard {
     }
 
     /// The layout of a page of `tiers` tiers this card's staging reads.
-    pub(super) fn page_layout(&self, tiers: usize) -> Result<TierLayout, GpuError> {
+    pub fn page_layout(&self, tiers: usize) -> Result<TierLayout, GpuError> {
         match &self.side {
             TierSide::Here(w) => w.page_layout(tiers),
             TierSide::Node(n) => n.page_layout(tiers),
@@ -2714,6 +2723,7 @@ pub(super) mod tests {
             (0, 64, 4096, 0, 0)
         );
         assert_eq!(i.words(), 64 + 4096);
+        assert_eq!(l.wire_bytes(), [16_644, 131_084]);
         assert!(l.rows_off(0) >= l.image_off(1) + 4 * i.words());
         assert!(l.bytes().unwrap() >= l.rows_off(1) + 4 * 8 * 4096);
         assert!(TierLayout::new(glm, 512, 0, 1).is_err());
@@ -2743,6 +2753,7 @@ pub(super) mod tests {
             (0, 64, 4 * 2560, 4, 10)
         );
         assert!(i.sel + 4 * i.n_used <= i.x);
+        assert_eq!(l.wire_bytes(), [41_220, 409_612]);
         assert!(l.rows_off(0) >= l.image_off(0) + 4 * i.words());
         assert!(l.bytes().unwrap() >= l.rows_off(0) + 4 * 40 * 2560);
         assert_eq!(
