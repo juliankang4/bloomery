@@ -168,6 +168,7 @@ generate_ds41   gqa_prefill_flash_256                    0           0
 generate_ds41   gqa_prefill_flash_256_p2                 0           0
 # jit_local is ptxas 13.3.73's sm_86 stack frame, not read on a cc 8.6 card; the two agree on every row of this table and of both cc 12.1 tables.
 generate_ds41   gqa_prefill_flash_256_p2_lower           0           0
+generate_ds41   gqa_prefill_flash_256_p1_lower           0           0
 generate_ds41   gqa_prefill_flash_256_p4                 0           0
 generate_ds41   gqa_prefill_flash_256_q8                 0           0
 generate_ds41   gqa_prefill_flash_512_p4                 0           0
@@ -444,6 +445,7 @@ gate_e2e   gqa_prefill_flash_256                    0           0
 gate_e2e   gqa_prefill_flash_256_p2                 0           0
 # jit_local is ptxas 13.3.73's sm_86 stack frame, not read on a cc 8.6 card; the two agree on every row of this table and of both cc 12.1 tables.
 gate_e2e   gqa_prefill_flash_256_p2_lower           0           0
+gate_e2e   gqa_prefill_flash_256_p1_lower           0           0
 gate_e2e   gqa_prefill_flash_256_p4                 0           0
 gate_e2e   gqa_prefill_flash_256_q8                 0           0
 gate_e2e   gqa_prefill_flash_512_p4                 0           0

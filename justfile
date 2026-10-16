@@ -1250,6 +1250,10 @@ gate-gpu-qwen35moe-attn:
 gate-gpu-gemma-embedding2-head512:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding2_head512 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_head512'
 
+# Head-256 pack-one prefill, whole inputs and symmetric windows, against the f64 attention band.
+gate-gpu-gemma-embedding-head256:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding_head256 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding_head256'
+
 # EmbeddingGemma 2 beside Qwen3-30B-A3B Q4_K_M: server vectors, placement cost, pool reserve,
 # greedy tokens with embedding calls in flight, and named refusals; the runner holds one card.
 [group('pool')]
