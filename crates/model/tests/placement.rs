@@ -858,7 +858,7 @@ fn hw_placement_bp() {
         "tier prompt batch: staging {}  tile scratch {}  card {}  host {}",
         n(batch.staging),
         n(batch.scratch),
-        n(batch.card()),
+        n(batch.card().expect("card reserve")),
         n(batch.host)
     );
     println!(

@@ -1312,6 +1312,11 @@ pub enum PlacementError {
         tiers: u64,
         experts: u64,
     },
+    /// A tier card's prompt-batch staging and scratch summed past u64.
+    #[error(
+        "the tier card's prompt-batch staging of {staging} B and scratch of {scratch} B pass u64 bytes"
+    )]
+    TierBatchCard { staging: u64, scratch: u64 },
     /// The tiers' prompt-batch host rows, one set a tier, summed past u64.
     #[error("{tiers} tier cards' prompt-batch host rows of {bytes} B each pass u64 bytes")]
     TierBatchHost { tiers: usize, bytes: u64 },

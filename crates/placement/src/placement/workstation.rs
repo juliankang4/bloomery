@@ -184,8 +184,12 @@ pub fn tier_card(spec: CardSpec, draft_bytes: Option<u64>, batch: TierBatchBytes
     let mut tier = card(spec, 0..0, false);
     tier.reserves
         .extend(draft_bytes.map(|bytes| (DRAFT_RESERVE.to_string(), bytes)));
-    tier.reserves
-        .push((TIER_BATCH_RESERVE.to_string(), batch.card()));
+    tier.reserves.push((
+        TIER_BATCH_RESERVE.to_string(),
+        batch
+            .card()
+            .unwrap_or_else(|error| panic!("tier batch card reserve: {error}")),
+    ));
     tier
 }
 
@@ -332,10 +336,14 @@ pub struct TierBatchBytes {
 }
 
 impl TierBatchBytes {
-    /// The tier card's part.
-    #[must_use]
-    pub const fn card(&self) -> u64 {
-        self.staging + self.scratch
+    /// The tier card's part; refuses a sum past u64.
+    pub fn card(&self) -> Result<u64, PlacementError> {
+        self.staging
+            .checked_add(self.scratch)
+            .ok_or(PlacementError::TierBatchCard {
+                staging: self.staging,
+                scratch: self.scratch,
+            })
     }
 }
 
@@ -547,6 +555,9 @@ fn tier_service(
 ) -> Result<u64, PlacementError> {
     if let Some(d) = draft.filter(|d| d.on >= tiers) {
         return Err(PlacementError::DraftOffPlan { on: d.on, tiers });
+    }
+    if tiers != 0 {
+        batch.card()?;
     }
     u64::try_from(tiers)
         .ok()
@@ -1240,8 +1251,10 @@ mod tests {
         let mut t = card(RTX_3090, 0..0, false);
         t.reserves
             .extend(draft_bytes.map(|b| (DRAFT_RESERVE.to_string(), b)));
-        t.reserves
-            .push((TIER_BATCH_RESERVE.to_string(), batch.card()));
+        t.reserves.push((
+            TIER_BATCH_RESERVE.to_string(),
+            batch.card().expect("card reserve"),
+        ));
         let mut h = host();
         h.reserves
             .push((TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
@@ -1357,11 +1370,40 @@ mod tests {
             plan_tiers(43, A6000, &[], draft(0), batch),
             Err(PlacementError::DraftOffPlan { on: 0, tiers: 0 })
         ));
+        let huge = TierBatchBytes {
+            staging: u64::MAX,
+            scratch: 1,
+            host: 0,
+        };
+        for result in [
+            plan_tiers(4, A6000, &[RTX_3090], None, huge).map(|_| ()),
+            plan_node_tiers(4, A6000, &[RTX_3090], huge).map(|_| ()),
+        ] {
+            let error = result.expect_err("the card reserve passes u64 bytes");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "the tier card's prompt-batch staging of {} B and scratch of 1 B pass u64 bytes",
+                    u64::MAX
+                )
+            );
+        }
+        assert_eq!(
+            plan_tiers(4, A6000, &[], None, huge).expect("no tier"),
+            plan_on(A6000, 4)
+        );
+        assert_eq!(
+            plan_node_tiers(4, A6000, &[], huge).expect("no remote"),
+            vec![plan_on(A6000, 4)]
+        );
         let swapped = plan_tiers(43, RTX_3090, &[A6000], draft(0), batch).expect("3090+a6000");
         assert_eq!(swapped.cards[0].name, RTX_3090.name);
         assert_eq!(swapped.tiers.len(), 1);
         assert_eq!(swapped.tiers[0].name, A6000.name);
-        assert_eq!(swapped.tiers[0].reserve_bytes(), 7 + batch.card());
+        assert_eq!(
+            swapped.tiers[0].reserve_bytes(),
+            7 + batch.card().expect("card reserve")
+        );
     }
 
     #[test]
@@ -1576,6 +1618,20 @@ mod tests {
         });
     }
 
+    #[test]
+    #[should_panic(expected = "tier batch card reserve: the tier card's prompt-batch staging")]
+    fn tier_card_refuses_an_overflowing_batch() {
+        let _ = super::tier_card(
+            A6000,
+            None,
+            TierBatchBytes {
+                staging: u64::MAX,
+                scratch: 1,
+                host: 0,
+            },
+        );
+    }
+
     /// V4.1's tier batch at the host union's 512 columns: the allocation
     /// sizes of the tier's staging and tile scratch, summed by hand.
     #[test]
@@ -1586,7 +1642,24 @@ mod tests {
             b.scratch,
             12_288 + 4_100 + 5_124 + 15_728_640 + 491_520 + 28_311_552 + 26_271_744
         );
-        assert_eq!(b.card(), 152_511_496);
+        assert_eq!(b.card().expect("card reserve"), 152_511_496);
+        let edge = TierBatchBytes {
+            staging: u64::MAX - 1,
+            scratch: 1,
+            host: 0,
+        };
+        assert_eq!(edge.card().expect("the sum fits u64"), u64::MAX);
+        assert!(matches!(
+            TierBatchBytes {
+                staging: u64::MAX,
+                ..edge
+            }
+            .card(),
+            Err(PlacementError::TierBatchCard {
+                staging: u64::MAX,
+                scratch: 1
+            })
+        ));
         assert_eq!(b.host, 2 * (62_914_560 + 12_288));
     }
 
