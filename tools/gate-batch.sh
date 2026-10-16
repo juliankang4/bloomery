@@ -1709,7 +1709,7 @@ SH
     else
       wait "$sp" || rc=$?
     fi
-    stop_lanes "$t/target/c-$tag"
+    stop_lanes "$t/target/c-$tag" || return $?
     cnt=$(grep -c '^plain-any rc=skip ' "$t/target/c-$tag/run.log" 2> /dev/null || true)
     printf '%s %s' "$rc" "${cnt:-0}"
   }
