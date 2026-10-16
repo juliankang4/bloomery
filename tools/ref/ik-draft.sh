@@ -282,7 +282,7 @@ run_once() {
   ref_witness
   t0=$(date +%s) f0=$(majflt_now)
   # shellcheck disable=SC2086
-  timeout --kill-after=10 "$BOUND" env $RUN_ENV "$CLI" "${args[@]}" < /dev/null > "$out" 2>&1
+  lease_bounded "$BOUND" env $RUN_ENV "$CLI" "${args[@]}" < /dev/null > "$out" 2>&1
   RUN_RC=$?
   RUN_FAULTS=$(($(majflt_now) - f0)) RUN_WALL=$(($(date +%s) - t0))
   witness "post $label $ENGINE $ARM $CORPUS n=$N"

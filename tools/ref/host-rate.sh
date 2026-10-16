@@ -79,7 +79,7 @@ rc=0
 for t in $THREADS; do
   echo "--- threads $t $(date -u +%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2)"
   t0=$(date +%s)
-  if ! BLOOMERY_THREADS=$t BLOOMERY_HOST_LEASE=1 timeout --kill-after=10 "$BOUND" "$BIN" --time "${BENCH_ARGS[@]}"; then
+  if ! BLOOMERY_THREADS=$t BLOOMERY_HOST_LEASE=1 lease_bounded "$BOUND" "$BIN" --time "${BENCH_ARGS[@]}"; then
     rc=1
     echo "[threads $t] bench_v41_host failed or passed the ${BOUND} s bound — stopping the sweep" >&2
     break

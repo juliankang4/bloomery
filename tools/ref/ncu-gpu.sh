@@ -282,7 +282,7 @@ if [ "$FORM" = gemm ]; then
   echo "[config] sections='$GEMM_SECTIONS' out=$out"
   witness pre
   guard_other
-  "${CMD[@]}" > "$out.txt" 2>&1
+  lease_bounded "$BOUND" "${CMD[@]:3}" > "$out.txt" 2>&1
   rc=$?
   witness post
   echo "[rc] $rc"
@@ -438,7 +438,7 @@ if [ "$FORM" = ds41pp ]; then
   witness pre
   guard_other
   t0=$(date +%s)
-  "${CMD[@]}" > "$out.txt" 2>&1
+  lease_bounded "$BOUND" "${CMD[@]:3}" > "$out.txt" 2>&1
   rc=$?
   witness post
   echo "[rc] $rc wall $(($(date +%s) - t0))s"
@@ -566,7 +566,7 @@ if [ "$FORM" = q3pp ]; then
   witness pre
   guard_other
   t0=$(date +%s)
-  "${CMD[@]}" > "$out.txt" 2>&1
+  lease_bounded "$BOUND" "${CMD[@]:3}" > "$out.txt" 2>&1
   rc=$?
   witness post
   echo "[rc] $rc wall $(($(date +%s) - t0))s"

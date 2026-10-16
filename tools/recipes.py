@@ -9153,7 +9153,9 @@ def key_self_test(expect, real: Side) -> None:
         expect(c3.parts(items["cpu"])[2] is None, "the data directory itself made an item never-skip")
         expect(c.parts("gate-1-1")[2] is not None, "an ik-reading gate was skippable")
         expect(c.parts("gate-tokenizer")[2] is None, f"gate-tokenizer reads its sets, no reference tree, and was never-skip: {c.parts('gate-tokenizer')[2]}")
-        expect(c.parts("smoke")[2] is not None and c.parts("check-recipes")[2] is None, "smoke (a batch in a batch) or check-recipes has the wrong never-skip")
+        expect(c.parts("smoke")[2] is not None, "smoke (a batch in a batch) was skippable")
+        # The cancellation fixtures name Clefvis, so its reference tree is in the conservative closure.
+        expect("tools/ref/clefvis/clefvis.sh:" in (c.parts("check-recipes")[2] or ""), "check-recipes did not name its Clefvis reference-tree closure")
         expect(c.parts("gate-gpu-e2e")[2] is not None, "an `any`-card recipe with no card forced was skippable")
         expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in /root/x.bin")[2] is not None, "an absolute path in ARGS was skippable")
         argpath = "gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in docs/HARDWARE.md"

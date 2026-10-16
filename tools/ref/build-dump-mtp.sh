@@ -47,9 +47,9 @@ echo "build-dump-mtp: $IK = $GLM_MTP_SHA, clean"
 
 lease_take
 t0=$(date +%s)
-# Bounded (BLOOMERY_BUILD_BOUND, default 1800 s): a hung build must end rather than hold the lease. The
-# bound runs as the tree's user, inside as_user, so it signals the build it started.
-as_user timeout --kill-after=10 "${BLOOMERY_BUILD_BOUND:-1800}" cmake --build "$IK/build" -j "$(nproc)" --target llama common
+# The runner supervises the build group; as_user keeps the build under the tree's user.
+export -f as_user
+lease_bounded "${BLOOMERY_BUILD_BOUND:-1800}" bash -c 'as_user "$@"' _ cmake --build "$IK/build" -j "$(nproc)" --target llama common
 echo "build-dump-mtp: ik libraries current in $(($(date +%s) - t0)) s"
 mkdir -p "$OUT"
 TMP=$OUT/dump_mtp.tmp.$$
@@ -58,7 +58,8 @@ SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
 # -rdynamic exports dump_mtp's ggml_backend_sched_graph_compute_async and llama_set_mtp_op_type so
 # libllama's calls bind to them (its header says why); -ldl for the dlsym(RTLD_NEXT) that forwards to
 # the libraries' own.
-ref_cxx -rdynamic -o "$TMP" "$SRC" "${REF_LLAMA_INC[@]}" "${REF_LLAMA_LINK[@]}" -ldl
+export -f ref_cxx
+lease_bounded "${BLOOMERY_BUILD_BOUND:-1800}" bash -c 'ref_cxx "$@"' _ -rdynamic -o "$TMP" "$SRC" "${REF_LLAMA_INC[@]}" "${REF_LLAMA_LINK[@]}" -ldl
 lease_release
 printf 'source_sha256 %s\nik %s\nbuild %s\n' "$SRC_SHA" "$(readlink -f "$IK")" "$GLM_MTP_SHA" > "$TMP.build"
 mv -f "$TMP" "$OUT/dump_mtp"

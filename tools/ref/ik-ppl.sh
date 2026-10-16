@@ -260,14 +260,11 @@ elif [ -n "$KLD_OF" ]; then
 fi
 t0=$(date +%s)
 rc=0
-CUDA_VISIBLE_DEVICES="" timeout --kill-after=10 "$BOUND" \
+say "ik-ppl.sh: llama-perplexity supervisor PID will be recorded in $PIDFILE"
+LEASE_BOUNDED_PIDFILE=$PIDFILE CUDA_VISIBLE_DEVICES="" lease_bounded "$BOUND" \
   "$BIN" -m "$MODEL" -f "$TEXT" -c "$CTX" -b "$BATCH" --chunks "$CHUNKS" -ngl 0 -t 32 --defer-experts \
   ${MODE_ARGS[@]+"${MODE_ARGS[@]}"} \
-  > "$OUT" 2>> "$LOG" &
-pid=$!
-echo "$pid" > "$PIDFILE"
-say "ik-ppl.sh: llama-perplexity under pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null || echo gone)), recorded in $PIDFILE"
-wait "$pid" || rc=$?
+  > "$OUT" 2>> "$LOG" || rc=$?
 t1=$(date +%s)
 rm -f "$PIDFILE"
 ppl_witness post-ppl

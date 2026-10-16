@@ -59,6 +59,8 @@ if [ "$(basename "${BASH_SOURCE[0]}")" != clefvis_dump ] && [ "${1:-}" != --ids 
   esac
   exit $?
 fi
+# shellcheck source=tools/ref/lease.sh
+source "$HERE/tools/ref/lease.sh"
 # shellcheck source=tools/ref/ref-paths.sh
 source tools/ref/ref-paths.sh
 # shellcheck source=tools/ref/clefvis/profile.sh
@@ -143,7 +145,7 @@ write_ids() {
   mkdir -p "$OUT/qvis" "$REF"
   set_images "$(all_images)"
   SECONDS=0
-  if env CUDA_VISIBLE_DEVICES= timeout --kill-after=10 "$BOUND" "$BIN" chat --mmproj "$MMPROJ" -m "$TEXT" --mmproj-sha256 "$MMPROJ_SHA256" \
+  if lease_bounded "$BOUND" env CUDA_VISIBLE_DEVICES= "$BIN" chat --mmproj "$MMPROJ" -m "$TEXT" --mmproj-sha256 "$MMPROJ_SHA256" \
       --card cpu --requests "$REQUESTS" "${img_args[@]}" "${seat_args[@]}" --out "$stage" -t "$THREADS"; then
     while read -r case_; do
       set_=${SETPFX}_chatids_$case_
@@ -224,7 +226,7 @@ if [ "$tower" = 1 ]; then
   [ "$twin" = 1 ] || [ "$PREPROC" != 1 ] || pre_args=(--out-preproc "$pre.staging")
   [ "$FAMILY" != qvis ] || tap_args=(--taps final) # mcvis: every tile's full taps
   SECONDS=0
-  if "${run[@]}" timeout --kill-after=10 "$BOUND" "$BIN" tower --mmproj "$MMPROJ" -m "$TEXT" --mmproj-sha256 "$MMPROJ_SHA256" \
+  if lease_bounded "$BOUND" "${run[@]}" "$BIN" tower --mmproj "$MMPROJ" -m "$TEXT" --mmproj-sha256 "$MMPROJ_SHA256" \
       --card "$device" "${img_args[@]}" "${pre_args[@]}" "${tap_args[@]}" "${tower_seat_args[@]}" --out-taps "$taps.staging" "${where[@]}"; then
     [ "${#pre_args[@]}" -eq 0 ] || publish "$pre.staging" "$pre"
     publish "$taps.staging" "$taps"
@@ -267,7 +269,7 @@ while IFS=$'\t' read -r c imgs steps _; do
     [ "$dec" -le 0 ] || extra+=(--decode "$dec" --out-decode "$ddir.staging")
     [ "$FAMILY" != qvis ] || extra+=(--rows-from "$ROWS_FROM")
     SECONDS=0
-    if "${run[@]}" timeout --kill-after=10 "$BOUND" "$BIN" hidden --mmproj "$MMPROJ" -m "$TEXT" --mmproj-sha256 "$MMPROJ_SHA256" \
+    if lease_bounded "$BOUND" "${run[@]}" "$BIN" hidden --mmproj "$MMPROJ" -m "$TEXT" --mmproj-sha256 "$MMPROJ_SHA256" \
         --card "$device" --ids "$ids" "${img_args[@]}" --rows "$rows" "${extra[@]}" --out "$dir.staging" \
         -c "$CTX" -ub "$UBATCH" "${where[@]}"; then
       publish "$dir.staging" "$dir"

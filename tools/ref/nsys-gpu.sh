@@ -98,7 +98,9 @@ TOP=${BLOOMERY_NSYS_TOP:-24}
 
 # The tables: sqlite, depth, n, top, form, the run's own output, the seed form's marker.
 analyze() {
-  timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 - "$@" <<'PY'
+  local runner=(timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}")
+  if declare -F lease_bounded > /dev/null; then runner=(lease_bounded "$BOUND"); fi
+  "${runner[@]}" python3 - "$@" <<'PY'
 import re, sqlite3, sys
 db, depth, ngen, top = sqlite3.connect(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 form, runlog = sys.argv[5], sys.argv[6]
@@ -428,7 +430,7 @@ for i in "${!DEPTH_LIST[@]}"; do
     echo "=== 깊이 $d (ctx $CTX, mode $MODE, 재생 $((d + NGEN - 1))개 기대) → $out.nsys-rep"
   fi
   witness "pre d=$d"
-  "${CMD[@]}" > "$out.txt" 2>&1
+  lease_bounded "$BOUND" "${CMD[@]:0:2}" "${CMD[@]:5}" > "$out.txt" 2>&1
   rc=$?
   witness "post d=$d"
   echo "[rc] $rc"

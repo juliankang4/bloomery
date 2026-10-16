@@ -101,27 +101,38 @@ echo "[p2] out=$OUT threads=$THREADS copy-cpus=$COPY_CPUS arms=$ARMS rounds=$ROU
 
 CPID=
 STOP=
-# On any exit a copy still running is asked to stop by its file, then its timeout wrapper is signalled.
+copy_starting=
+copy_exit=
+# On any exit a copy still running is asked to stop by its file, then its group is stopped and reaped.
 # shellcheck disable=SC2329 # the EXIT trap below runs it
 cleanup() {
-  if [ -n "$CPID" ] && kill -0 "$CPID" 2> /dev/null; then
-    touch "$STOP"
-    sleep 3
-    kill -0 "$CPID" 2> /dev/null && kill "$CPID" 2> /dev/null
-    wait "$CPID" 2> /dev/null || true
+  local rc=$?
+  trap '' TERM INT HUP
+  if [ -n "$CPID" ]; then
+    touch "$STOP" || rc=$?
+    lease_stop "$CPID" || rc=$?
   fi
+  lease_out_clean
+  exit "$rc"
 }
 trap cleanup EXIT
+for s in TERM:143 INT:130 HUP:129; do
+  # shellcheck disable=SC2064 # the signal's status now, the startup flag when the trap runs
+  trap "copy_exit=${s#*:}; [ -n \"\$copy_starting\" ] || exit ${s#*:}" "${s%:*}"
+done
 
 # start_copy <arm> <log>: the copy under timeout and taskset, its pid recorded, back once its first
 # interval line is out (the loop at its rate).
 start_copy() {
   local arm=$1 log=$2 i
   STOP=$OUT/stop.$arm.$RANDOM
+  copy_starting=1
   CUDA_VISIBLE_DEVICES=$TIMING_GPU timeout --kill-after=10 $((BOUND + 60)) taskset -c "$COPY_CPUS" \
     "$PROBE" --arm "$arm" --seconds "$BOUND" --stop-file "$STOP" --chunk "$CHUNK" --ring "$RING" \
     --fill-threads "$FILL" > "$log" 2>&1 &
   CPID=$!
+  copy_starting=
+  [ -z "$copy_exit" ] || exit "$copy_exit"
   echo "$CPID $(cat "/proc/$CPID/comm" 2> /dev/null || echo '?') $arm $(now)" >> "$PIDS"
   for ((i = 0; i < 240; i++)); do
     grep -q '^h2d loop .* interval_ms=' "$log" && return 0

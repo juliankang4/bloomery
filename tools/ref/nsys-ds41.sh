@@ -160,7 +160,9 @@ corpus_check() {
 # timeout, and there --analyze and --self-test read a saved sqlite with no bound — the box's
 # contract is unchanged.
 py_bounded() {
-  if command -v timeout >/dev/null 2>&1; then
+  if declare -F lease_bounded > /dev/null; then
+    lease_bounded "$BOUND" python3 "$@"
+  elif command -v timeout >/dev/null 2>&1; then
     timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 "$@"
   else
     python3 "$@"
@@ -785,7 +787,7 @@ for i in "${!A_NAME[@]}"; do
   guard_other
   witness "pre ${A_NAME[$i]}"
   t0=$(date +%s)
-  "${CMD[@]}" > "$out.txt" 2>&1
+  lease_bounded "$BOUND" "${CMD[@]:3}" > "$out.txt" 2>&1
   rc=$?
   t1=$(date +%s)
   witness "post ${A_NAME[$i]}"

@@ -128,12 +128,10 @@ echo "[lease] held by pid $$ at $(now), card $BLOOMERY_LEASE_CARD sha256=$(sha25
 greedy_witness pre-greedy
 t0=$(date +%s)
 rc=0
-CUDA_VISIBLE_DEVICES="" timeout --kill-after=10 "$BOUND" \
+say "ik-greedy.sh: argmax_ref supervised by runner $$"
+CUDA_VISIBLE_DEVICES="" lease_bounded "$BOUND" \
   "$BIN" -m "$MODEL" --prompts "$PROMPTS.partial" --gen "$GEN" --step-prefill -ngl 0 -c "$REF_CTX" -t 32 \
-  "${REF_DUMP_ARGS[@]}" > "$OUT.partial" 2>> "$LOG" &
-pid=$!
-say "ik-greedy.sh: argmax_ref under pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null || echo gone))"
-wait "$pid" || rc=$?
+  "${REF_DUMP_ARGS[@]}" > "$OUT.partial" 2>> "$LOG" || rc=$?
 t1=$(date +%s)
 greedy_witness post-greedy
 lease_release

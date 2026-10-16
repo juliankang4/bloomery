@@ -69,7 +69,7 @@ dev_sectors pre
 t0=$(date +%s)
 rc=0
 if [ "$STEP" = convert ]; then
-  timeout --kill-after=10 "$BOUND" "$BIN" convert "$SRC" "$OUT" || rc=$?
+  lease_bounded "$BOUND" "$BIN" convert "$SRC" "$OUT" || rc=$?
   echo "[r8-sidecar] convert rc=$rc secs=$(($(date +%s) - t0))"
 fi
 if [ "$rc" -eq 0 ]; then
@@ -79,7 +79,7 @@ if [ "$rc" -eq 0 ]; then
     rc=124
   else
     t1=$(date +%s)
-    timeout --kill-after=10 "$left" "$BIN" verify "$SRC" "$OUT" || rc=$?
+    lease_bounded "$left" "$BIN" verify "$SRC" "$OUT" || rc=$?
     echo "[r8-sidecar] verify rc=$rc secs=$(($(date +%s) - t1))"
   fi
 fi

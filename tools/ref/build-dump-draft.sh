@@ -95,17 +95,17 @@ fi
 
 lease_take
 t0=$(date +%s)
-# Bounded (BLOOMERY_BUILD_BOUND, default 1800 s, two gate bounds): the build holds every core under
-# the lease, and a hung one must end rather than hold the machine. The bound runs as the tree's user,
-# inside as_user, so it signals the build it started.
-as_user timeout --kill-after=10 "${BLOOMERY_BUILD_BOUND:-1800}" cmake --build "$IK/build" -j "$(nproc)" --target llama common llama-spec-bench
+# The runner supervises the build group; as_user keeps the build under the tree's user.
+export -f as_user
+lease_bounded "${BLOOMERY_BUILD_BOUND:-1800}" bash -c 'as_user "$@"' _ cmake --build "$IK/build" -j "$(nproc)" --target llama common llama-spec-bench
 echo "build-dump-draft: ik build in $(($(date +%s) - t0)) s"
 mkdir -p "$OUT"
 # A failed compile must not leave the previous binary for dump-draft.sh to run under this build's name.
 rm -f "$OUT/dump_draft" "$OUT/dump_draft.build"
 # -rdynamic exports dump_draft's ggml_backend_sched_graph_compute_async so libllama's calls bind to it
 # (its header says why); -ldl for the dlsym(RTLD_NEXT) that forwards to libggml's.
-ref_cxx -rdynamic -o "$OUT/dump_draft" "$HERE/tools/ref/dump_draft.cpp" "${REF_LLAMA_INC[@]}" "${REF_LLAMA_LINK[@]}" -ldl
+export -f ref_cxx
+lease_bounded "${BLOOMERY_BUILD_BOUND:-1800}" bash -c 'ref_cxx "$@"' _ -rdynamic -o "$OUT/dump_draft" "$HERE/tools/ref/dump_draft.cpp" "${REF_LLAMA_INC[@]}" "${REF_LLAMA_LINK[@]}" -ldl
 lease_release
 printf '%s\n' "$DRAFT_BUILD" > "$OUT/dump_draft.build"
 echo "built $OUT/dump_draft against $IK ($DRAFT_BUILD)"

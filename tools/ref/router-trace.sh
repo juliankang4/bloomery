@@ -140,14 +140,10 @@ witness pre-trace
 export CUDA_VISIBLE_DEVICES=""
 PIDFILE=$ROUTER/$NAME.pid
 rc=0
-BLOOMERY_ROUTER_WRITE=1 BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_ROUTER_IDS_MD5="$MD5" \
-  timeout --kill-after=10 "$BOUND" \
-  "$BIN" -m "$MODEL" --expect-arch "$MODEL_NAME" --ids "$IDS" --out "$ROUTER/$NAME" --chunk "$CHUNK" \
-    -ngl 0 -c "$CTX" -t 32 --defer-experts "${ROUTER_TRACE_ARGS[@]}" "${ARGS[@]}" &
-pid=$!
-echo "$pid" > "$PIDFILE"
-echo "router-trace.sh: harness under pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null || echo gone)), recorded in $PIDFILE"
-wait "$pid" || rc=$?
+echo "router-trace.sh: harness supervisor PID will be recorded in $PIDFILE"
+LEASE_BOUNDED_PIDFILE=$PIDFILE BLOOMERY_ROUTER_WRITE=1 BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_ROUTER_IDS_MD5="$MD5" \
+  lease_bounded "$BOUND" "$BIN" -m "$MODEL" --expect-arch "$MODEL_NAME" --ids "$IDS" --out "$ROUTER/$NAME" --chunk "$CHUNK" \
+    -ngl 0 -c "$CTX" -t 32 --defer-experts "${ROUTER_TRACE_ARGS[@]}" "${ARGS[@]}" || rc=$?
 rm -f "$PIDFILE"
 witness post-trace
 lease_release

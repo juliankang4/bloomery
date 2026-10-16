@@ -90,13 +90,12 @@ fi
 
 lease_take
 t0=$(date +%s)
-# Bounded (BLOOMERY_BUILD_BOUND, default 1800 s): the build holds every core under the lease, and a
-# hung one must end rather than hold the machine. The bound runs as the tree's user, inside as_user,
-# so it signals the build it started.
-as_user timeout --kill-after=10 "${BLOOMERY_BUILD_BOUND:-1800}" cmake --build "$IK/build" -j "$(nproc)" \
+# The runner supervises the build group; as_user keeps the build under the tree's user.
+export -f as_user
+lease_bounded "${BLOOMERY_BUILD_BOUND:-1800}" bash -c 'as_user "$@"' _ cmake --build "$IK/build" -j "$(nproc)" \
   --target llama common llama-tokenize
 echo "build-ik-mimo2: ik build in $(($(date +%s) - t0)) s"
-bash "$(dirname "${BASH_SOURCE[0]}")/build-dump.sh"
+lease_bounded "${BLOOMERY_BUILD_BOUND:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/build-dump.sh"
 lease_release
 f=$(foreign)
 [ -z "$f" ] || { echo "build-ik-mimo2: $SRC_TREE/.git now holds an entry not owned by user: $f" >&2; exit 1; }

@@ -77,7 +77,8 @@ echo "[lease-hold] command: $*"
 witness pre
 t0=$(date +%s)
 rc=0
-BLOOMERY_LEASE_HELD=$$ "$@" || rc=$?
+# No duration limit: timeout supplies the child group for run_bounded's cancellation.
+BLOOMERY_LEASE_HELD=$$ run_bounded timeout --kill-after=10 0 "$@" || rc=$?
 witness post
 echo "[lease-hold] rc=$rc held=$(($(date +%s) - t0)) s"
 exit "$rc"

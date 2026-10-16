@@ -26,6 +26,12 @@ tmp=${TMPDIR:-/tmp}
 tmp=$(mktemp -d "${tmp%/}/card-tests.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 n=0 failed=0
+# lease-hold.sh runs its command under timeout; a host with none (the Mac) takes tools/ref/stub-timeout.py.
+if ! command -v timeout > /dev/null; then
+  mkdir -p "$tmp/tbin" && cp "$ROOT/tools/ref/stub-timeout.py" "$tmp/tbin/timeout" && chmod +x "$tmp/tbin/timeout" || exit 70
+  PATH=$tmp/tbin:$PATH
+fi
+
 # The copy: the lease code, the t table and gpu-ab.py, the tree's cards, and fixtures as the run cards
 # docs/cards/hcpre-ab.card (ab, rounds 5) and docs/cards/exclusive.card. tools/box.sh only has to
 # exist and name BLOOMERY_BOX_ENV (gpu-ab.py reads it); nothing runs it.
