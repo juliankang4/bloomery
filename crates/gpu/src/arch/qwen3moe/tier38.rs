@@ -87,12 +87,38 @@ pub const NODE_FAMILY: NodeFamily = NodeFamily {
     word: "qwen4exp",
     tensors: node_tensors,
     experts: node_experts,
+    host: node_host,
 };
 
 fn node_tensors(file: &Split) -> Result<ModelTensors, GpuError> {
     model::arch::qwen35moe::place::PlanInputs::describe(file)
         .map(|i| i.model)
         .map_err(|e| GpuError::plan(WHAT, e))
+}
+
+fn node_host(
+    file: std::sync::Arc<Split>,
+    open: &NodeOpen,
+) -> Result<crate::host::run::HostRun, GpuError> {
+    if open.shape != SHAPE || open.set.n_expert() != geo::EXPERTS {
+        return Err(GpuError::shape(
+            WHAT,
+            "the host tier's shape is not Qwen3.8's",
+        ));
+    }
+    let inputs = model::arch::qwen35moe::place::PlanInputs::describe(&file)
+        .map_err(|e| GpuError::plan(WHAT, e))?;
+    crate::host::run::HostRun::build(
+        file,
+        0,
+        false,
+        crate::host::run::HostWidths {
+            embd: geo::HIDDEN,
+            ff: geo::FF,
+            n_used: geo::N_USED,
+        },
+        |src| model::arch::qwen35moe::host::layers(src, &inputs.hp, 0..open.layers),
+    )
 }
 
 fn node_experts(
@@ -622,7 +648,7 @@ pub(super) fn open_tier(
     }
     let set = TierSet::of_map(map, tier)?;
     if let Some(addr) = t.node {
-        let open = NodeOpen {
+        let mut open = NodeOpen {
             nvme: None,
             family: NODE_FAMILY.word.to_string(),
             name: t.name.clone(),
@@ -635,6 +661,8 @@ pub(super) fn open_tier(
             layers,
             block,
         };
+        let census = TierNode::census_of(addr)?;
+        open.project(plan, &census, tier + 1)?;
         let node = TierNode::open(addr, &open)?;
         stage.context().bind_to_thread()?;
         return Ok(TierCard::on_node(node, t.name.clone(), set));

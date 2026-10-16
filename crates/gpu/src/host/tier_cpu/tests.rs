@@ -1,0 +1,410 @@
+use super::*;
+use crate::graph::Graph;
+use crate::host::node::{NodeCensus, NodeOpen};
+use crate::host::nvtier::{ArenaKind, NvTier};
+use crate::host::run::HostWidths;
+use crate::host::tier::{TierAct, TierWork};
+use crate::weights::Weights;
+use cuda_core::DeviceBuffer;
+use gguf::write::{Layout, TensorDecl, Writer};
+use model::moe::{HostLayer, HostLayerSpec};
+use model::placement::{
+    Device, ExpertList, Format, ModelTensor, ModelTensors, Role, Row, Segment, nodes, workstation,
+};
+
+#[test]
+#[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+fn hw_held_node_nvme_host_run_keeps_eager_and_captured_rows() {
+    node_nvme_host_run(crate::census().unwrap(), true);
+}
+
+#[test]
+fn node_nvme_host_budget_keeps_the_os_reserve() {
+    let card = workstation::A6000;
+    node_nvme_host_run(
+        vec![model::placement::devices::DeviceInfo {
+            ordinal: 0,
+            name: card.name.into(),
+            total_bytes: card.total_bytes,
+            free_bytes: card.usable_bytes(),
+            integrated: false,
+            uuid: [1; 16],
+            pci_bus: "0000:01:00.0".into(),
+            held_by: None,
+        }],
+        false,
+    );
+}
+
+fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardware: bool) {
+    const WIDTH: usize = 32;
+    const LAYERS: usize = 8;
+    const EXPERTS: usize = 2048;
+    let dir =
+        std::env::temp_dir().join(format!("bloomery-node-nvme-{}-{hardware}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("model.gguf");
+    let result = std::panic::catch_unwind(|| {
+        let names: Vec<[String; 3]> = (0..LAYERS).map(model::arch::names::routed_stacks).collect();
+        let tensors: Vec<ModelTensor> = names
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, names)| {
+                names.iter().map(move |name| ModelTensor {
+                    name: name.clone(),
+                    shard: 0,
+                    layer: Some(layer),
+                    role: Role::RoutedExperts,
+                    ty: gguf::GgmlType::Q8_0,
+                    dims: vec![WIDTH as u64, WIDTH as u64, EXPERTS as u64],
+                    file_bytes: (34 * WIDTH * EXPERTS) as u64,
+                    gathered_rows: None,
+                })
+            })
+            .collect();
+        let layout = Layout::new(
+            &[],
+            tensors
+                .iter()
+                .map(|t| TensorDecl {
+                    name: t.name.clone(),
+                    dims: t.dims.clone(),
+                    type_id: 8,
+                    nbytes: t.file_bytes,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut writer = Writer::new(std::fs::File::create_new(&path).unwrap(), layout).unwrap();
+        let mut bytes = Vec::new();
+        for expert in 0..EXPERTS {
+            for _ in 0..WIDTH {
+                bytes.extend_from_slice(&[0x00, 0x24]);
+                bytes.extend(std::iter::repeat_n((1 + expert % 7) as u8, WIDTH));
+            }
+        }
+        for tensor in &tensors {
+            writer.tensor(&tensor.name, &bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let file = Arc::new(gguf::Split::open(&path).unwrap());
+        let model = ModelTensors {
+            tensors,
+            layers: LAYERS,
+            experts: EXPERTS as u64,
+            experts_used: 2,
+        };
+        // Leave expert 0 off the tier so its places are not global ids.
+        let assigned: Vec<Row> = model
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(tensor, _)| Row {
+                tensor,
+                segments: vec![Segment {
+                    device: Device::Card(0),
+                    format: Format::HostFile,
+                    experts: Some(ExpertList::range(1..EXPERTS as u64).unwrap()),
+                    resident_bytes: 0,
+                }],
+                read_bytes: 0,
+                stage: 0,
+            })
+            .collect();
+        let mut machine = workstation::plan_on(
+            model::placement::devices::spec_of_device(&census[0]),
+            LAYERS,
+        );
+        machine.cards[0].context_bytes = 0;
+        machine.cards[0].scratch_bytes = 0;
+        machine.cards[0].reserves.clear();
+        let mut source = nodes::routed_host(&model, &assigned, 0, &machine, 2).unwrap();
+        source.rows = assigned;
+        let set = TierSet::new(
+            0..LAYERS,
+            EXPERTS,
+            vec![(1..EXPERTS as u32).collect(); LAYERS],
+        )
+        .unwrap();
+        let shape = TierShape {
+            hidden: WIDTH,
+            n_used: 2,
+            rows: 1,
+            act: TierAct::F32,
+        };
+        let mut open = NodeOpen {
+            nvme: None,
+            family: "synthetic".into(),
+            name: "synthetic".into(),
+            device: Some(model::placement::devices::DeviceId {
+                ordinal: census[0].ordinal,
+                uuid: census[0].uuid,
+            }),
+            card: 0,
+            rows: NodeOpen::rows_of(&source, &file, 0).unwrap(),
+            set: set.clone(),
+            shape,
+            cols: 2,
+            layers: LAYERS,
+            block: (0, 0),
+        };
+        let mut node = NodeCensus {
+            devices: census,
+            host_room: 0,
+            arena_given: Some(12 << 20),
+        };
+        let mut resident = open.clone();
+        for row in &mut resident.rows {
+            row.format = Format::Card(model::placement::CardFormat::Q8_0Planes).to_string();
+        }
+        resident.project(&source, &node, 1).unwrap();
+        assert!(resident.nvme.is_none());
+        let refused = open.project(&source, &node, 1).is_err();
+        let mut reconstructed = open.clone();
+        reconstructed.nvme = Some(super::super::node::NodeNvme {
+            node: 1,
+            room: u64::MAX,
+            arena: workstation::ArenaGrant::whole(0),
+            reserve: 0,
+        });
+        let reconstructed = reconstructed.host_plan(&model, &machine).unwrap();
+        let need = workstation::HostNeed::of(&reconstructed, 0);
+        let assigned_bytes = (LAYERS * 3 * (EXPERTS - 1) * 34 * WIDTH) as u64;
+        println!(
+            "node host budget: assigned={assigned_bytes} os={} zero-room-refused={refused} reconstructed={}",
+            need.os,
+            need.bytes()
+        );
+        assert_eq!((refused, need.bytes()), (true, assigned_bytes));
+        node.host_room = u64::MAX;
+        open.project(&source, &node, 1).unwrap();
+        assert_eq!(open.nvme.as_ref().unwrap().arena.planned, 0);
+        node.host_room = 40 << 20;
+        open.project(&source, &node, 1).unwrap();
+        resident.nvme = open.nvme.clone();
+        node.host_room = 0;
+        resident.project(&source, &node, 1).unwrap();
+        assert!(resident.nvme.is_none());
+        node.host_room = 40 << 20;
+        let paging = open
+            .nvme
+            .as_ref()
+            .expect("the constrained remote node must page");
+        assert_eq!(paging.node, 1);
+        let projected = open.host_plan(&model, &machine).unwrap();
+        let mut missing = open.clone();
+        missing.rows.pop();
+        assert!(
+            missing
+                .host_plan(&model, &machine)
+                .unwrap_err()
+                .to_string()
+                .contains("missing routed stack")
+        );
+        let mut duplicate = open.clone();
+        duplicate.rows.push(open.rows[0].clone());
+        assert!(
+            duplicate
+                .host_plan(&model, &machine)
+                .unwrap_err()
+                .to_string()
+                .contains("more than once")
+        );
+        assert!(
+            projected
+                .rows
+                .iter()
+                .all(|r| model.tensors[r.tensor].role == Role::RoutedExperts)
+        );
+        if !hardware {
+            return;
+        }
+        let gpu = Gpu::new().unwrap();
+        let make_tier = || {
+            Arc::new(
+                NvTier::of_paged(&projected, &file, false, paging.arena, ArenaKind::Anon)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        let tier = make_tier();
+        let make_run = || {
+            HostRun::build(
+                Arc::clone(&file),
+                0,
+                false,
+                HostWidths {
+                    embd: WIDTH,
+                    ff: WIDTH,
+                    n_used: 2,
+                },
+                |src| {
+                    names
+                        .iter()
+                        .map(|n| {
+                            HostLayer::build(
+                                src,
+                                &HostLayerSpec {
+                                    gate: &n[0],
+                                    up: &n[1],
+                                    down: &n[2],
+                                    n_expert: EXPERTS,
+                                    embd: WIDTH,
+                                    ff: WIDTH,
+                                    swiglu_limit: 0.0,
+                                },
+                            )
+                        })
+                        .collect::<Result<Vec<_>, model::ModelError>>()
+                },
+            )
+            .unwrap()
+        };
+        let mut baseline = make_run();
+        let input: Vec<f32> = (0..2 * WIDTH).map(|i| (i % 13) as f32 / 128.0).collect();
+        let selected = [0, 1, (EXPERTS - 2) as u32, super::super::slots::HOST];
+        let mut expected = vec![123.0f32; 4 * WIDTH];
+        for col in 0..2 {
+            let x = Tensor2 {
+                ne0: WIDTH,
+                ne1: 1,
+                data: input[col * WIDTH..(col + 1) * WIDTH].to_vec(),
+            };
+            for slot in 0..2 {
+                let at = 2 * col + slot;
+                if selected[at] != super::super::slots::HOST {
+                    baseline
+                        .experts_into(
+                            0,
+                            &x,
+                            &[(selected[at] + 1, 1.0)],
+                            &mut expected[at * WIDTH..(at + 1) * WIDTH],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        let mut experts =
+            CpuExperts::new(&gpu, make_run(), Arc::clone(&tier), set.clone(), shape, 2).unwrap();
+        let weights = Weights::load_rows(gpu.stream(), &file, &model, &[], 0).unwrap();
+        let x = DeviceBuffer::from_host(gpu.stream(), &input).unwrap();
+        let sel = DeviceBuffer::from_host(gpu.stream(), &selected).unwrap();
+        let mut out =
+            DeviceBuffer::from_host(gpu.stream(), &vec![123.0f32; expected.len()]).unwrap();
+        let mut enqueue = || {
+            experts.enqueue_layer(
+                &gpu,
+                &weights,
+                0,
+                TierIo {
+                    act: TierInput::F32(&x),
+                    sel: &sel,
+                    rows: &mut out,
+                    cols: 2,
+                },
+            )
+        };
+        for _ in 0..64 {
+            enqueue().unwrap();
+        }
+        gpu.stream().synchronize().unwrap();
+        let graph = Graph::capture(gpu.stream(), |_| enqueue()).unwrap();
+        drop(enqueue);
+        for round in 0..3 {
+            if round != 0 {
+                assert!(tier.release(0, (EXPERTS - 1) as u32).unwrap() > 0);
+                graph.launch(gpu.stream()).unwrap();
+            }
+            gpu.stream().synchronize().unwrap();
+            experts.check().unwrap();
+            let actual = out.to_host_vec(gpu.stream()).unwrap();
+            assert_eq!(
+                actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            tier.stats().fills >= 3,
+            "the paged expert must refill after each release"
+        );
+        assert!(
+            tier.stats().step_fills > 0,
+            "HostRun must use the NVMe step claims"
+        );
+        drop(graph);
+        let mut pending =
+            CpuExperts::new(&gpu, make_run(), make_tier(), set.clone(), shape, 2).unwrap();
+        let alive = Arc::downgrade(&pending.state);
+        let held = crate::checkpoint::hold::Hold::on(gpu.stream()).unwrap();
+        pending
+            .enqueue_layer(
+                &gpu,
+                &weights,
+                0,
+                TierIo {
+                    act: TierInput::F32(&x),
+                    sel: &sel,
+                    rows: &mut out,
+                    cols: 2,
+                },
+            )
+            .unwrap();
+        drop(pending);
+        assert!(
+            alive.upgrade().is_some(),
+            "a queued callback must retain its state"
+        );
+        held.open();
+        gpu.stream().synchronize().unwrap();
+        assert_eq!(out.to_host_vec(gpu.stream()).unwrap(), expected);
+        let bad = DeviceBuffer::from_host(gpu.stream(), &[(EXPERTS - 1) as u32, 0, 0, 0]).unwrap();
+        experts
+            .enqueue_layer(
+                &gpu,
+                &weights,
+                0,
+                TierIo {
+                    act: TierInput::F32(&x),
+                    sel: &bad,
+                    rows: &mut out,
+                    cols: 2,
+                },
+            )
+            .unwrap();
+        gpu.stream().synchronize().unwrap();
+        let work = TierWork::open(gpu, weights, Box::new(experts), shape, 2).unwrap();
+        assert!(
+            work.fault()
+                .unwrap_err()
+                .to_string()
+                .contains("outside its set")
+        );
+        let resets = [
+            work.clear_fault(),
+            work.clear_fault_within(std::time::Duration::from_secs(5), "the callback reset"),
+        ];
+        println!("failed-callback resets: {resets:?}");
+        for reset in resets {
+            assert!(reset.unwrap_err().to_string().contains("outside its set"));
+        }
+        let scoped_gpu = Gpu::new().unwrap();
+        let stream = Arc::downgrade(&scoped_gpu.stream_handle());
+        let scoped = CpuExperts::new(&scoped_gpu, make_run(), make_tier(), set, shape, 2).unwrap();
+        scoped_gpu.stream().synchronize().unwrap();
+        drop(scoped_gpu);
+        if stream.upgrade().is_none() {
+            // The stream is gone; do not query its handle while unwinding.
+            std::mem::forget(scoped);
+            panic!("the host executor must own its stream");
+        }
+        drop(scoped);
+        assert!(
+            stream.upgrade().is_none(),
+            "a settled executor must release its stream"
+        );
+    });
+    std::fs::remove_dir_all(&dir).unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

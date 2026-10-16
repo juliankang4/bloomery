@@ -777,7 +777,7 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    (`crates/gpu/src/host/node.rs`): TCP, one connection a load, one reply a request, then it exits.
    `BLOOMERY_TIER_NODES` names the node of each tier; it takes loopback or private IPv4 addresses. An off-host node
    requires `BLOOMERY_TIER_LINK=rdma`. The unauthenticated control channel belongs on a trusted network.
-   On connect node 1 sends its census: each device's census row.
+   On connect node 1 sends its census: each device's census row, its own available host room and its arena override.
    The load (`Place::on`) and the gate read it with one function (`node_cards`) and plan (b′) with node 1's card as
    the tier card (`spec_of_device` of the row node 1 sent) before anything loads. Node 1 refuses an open whose rows are
    not the tier's set, then loads the rows of node 0's plan from its own copy of the file, each tensor checked against
@@ -790,9 +790,13 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    port. Each end carries its tier's crossings and holds its own page, queue pair and pump. Reset stops both ends,
    resets both writers, then both readers, with a control reply between phases. The launch message remains one
    control round trip per replay. `BLOOMERY_TIER_LINK=loopback` still needs both pages in one process and is refused
-   with a node tier. Not yet: the census carries no host room, which
-   joins it with the plan term that reads it once each node has a pool of its own in the plan (9.2); a remote tier
-   serves no prompt batch (the batch call refuses it by name);
+   with a node tier. The Qwen3.8 open projects its assigned routed stacks onto node 1's host room through the
+   common NVMe split. The request scopes that projection and its arena grant to the node; `Device::Nvme` in the
+   projected plan names that node's local drive, not node 0's. A paged tier uses the existing `HostRun` and `NvTier`
+   behind `TierWork`'s stream protocol. The CPU callback reads the node's own file and its arena slots, and its
+   failure is returned by the tier's fault query. Attention and row tables stay on node 0. The stage plan still
+   charges the tier's assignment as resident; lowering an N-node assignment into this path remains to be wired.
+   A remote tier serves no prompt batch (the batch call refuses it by name);
    only Qwen3.8 opens a tier on a node, and GLM and V4.1 refuse it by name. `just gate-gpu-qwen38-nodes` holds the
    census, the refused opens (a row of other experts, and a copy of the file whose tier row holds other bytes), the bits
    (node 0 with node 1's tier against the same plan in one process) and the losses below.
@@ -1298,8 +1302,9 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   host through a shared file, or private IPv4 nodes through independent RDMA ends (no authentication). The node
   gate constructs independent census-backed machines and their `NodeBudget` and `Terms` inputs (9.2); the load
   retains the conservative single-pool bound. Left: the adapter from routed assignment to loaded rows and
-  independent capacity in the load, node 1's host room in the census with the plan
-  term that reads it, the router's counts in the split (9.2), and decode at n = N in the predictor (9.8). The node
+  independent capacity in the load, the router's counts in the split (9.2), and decode at n = N in the predictor
+  (9.8). The Qwen3.8 tier open carries node 1's host room and projects its assigned rows through the common NVMe
+  split; this does not yet lower the N-node planner's assignment. The node
   plans' card terms use the generic workstation card constants, not the program's `machine_for_experts` constants.
 - GLM's hit rates are assumptions; V4.1's come from a replay (9.7).
 - S₁ has a first reading on one Spark (9.7), at `v0.3.0` serving defaults with the MTP draft on.

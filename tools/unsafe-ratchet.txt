@@ -283,7 +283,10 @@ gguf 9 2 0
 # the card slots' family (bolt-b1 r2): weighted_sum_card and the weighted_expert_sum_keep split
 # deleted (the plain sum's body back), ds41_ffn_card_acc_9's call into card_acc_at and its write
 # added, each block with its SAFETY line; the fn was the deleted keep.
-gpu 1899 206 10
+# PIN(2026-10-17): gpu 1899 -> 1905 blocks, 206 -> 207 fns, new code: the node's host
+# expert callback reads its stream-ordered mapped inputs and outputs, writes its mapped result,
+# and enqueues the callback. Each access has its own SAFETY invariant.
+gpu 1905 207 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

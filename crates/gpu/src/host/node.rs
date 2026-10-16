@@ -35,6 +35,7 @@ pub mod wire;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gguf::Split;
@@ -42,7 +43,9 @@ use model::fileio::sha256_hex_of;
 use model::ops::DEFER_MAX_COLS;
 use model::placement::devices::{DeviceId, DeviceInfo, spec_of_device};
 use model::placement::workstation::{self, ArenaGrant, CardSpec};
-use model::placement::{Device, ExpertList, Format, ModelTensor, ModelTensors, Plan, Row, Segment};
+use model::placement::{
+    Device, ExpertList, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment,
+};
 
 use super::DRAIN_DEADLINE;
 use super::step::{Chain, GO_DEADLINE};
@@ -407,7 +410,8 @@ impl NodeOpen {
     /// ids the open's set gives that layer, in its order, else refused by
     /// name: the stage side's slots name the set's experts. The layer count
     /// must match this file, the set must fit it, and columns must fit the
-    /// step port, before any card is opened.
+    /// step port, before any card is opened. Every routed stack on a layer
+    /// with assigned ids appears once; empty layers need no row.
     pub fn rows_on(&self, model: &ModelTensors) -> Result<Vec<Row>, GpuError> {
         if self.layers != model.layers
             || self.set.layers().end > model.layers
@@ -426,6 +430,7 @@ impl NodeOpen {
             ));
         }
         let mut rows = Vec::with_capacity(self.rows.len());
+        let mut seen = vec![false; model.tensors.len()];
         for r in &self.rows {
             let Some((i, t)) = model
                 .tensors
@@ -438,6 +443,12 @@ impl NodeOpen {
                     format!("{}: node 0's plan names a tensor this file lacks", r.name),
                 ));
             };
+            if std::mem::replace(&mut seen[i], true) {
+                return Err(GpuError::shape(
+                    SERVER,
+                    format!("{}: a routed stack assigned more than once", r.name),
+                ));
+            }
             if t.shard != r.shard
                 || t.ty.to_string() != r.ty
                 || t.dims != r.dims
@@ -491,6 +502,18 @@ impl NodeOpen {
                 read_bytes: 0,
                 stage: 0,
             });
+        }
+        if let Some((_, t)) = model.tensors.iter().enumerate().find(|(i, t)| {
+            t.role == Role::RoutedExperts
+                && t.layer
+                    .and_then(|l| self.set.ids(l))
+                    .is_some_and(|ids| !ids.is_empty())
+                && !seen[*i]
+        }) {
+            return Err(GpuError::shape(
+                SERVER,
+                format!("{}: missing routed stack for its set", t.name),
+            ));
         }
         Ok(rows)
     }
@@ -1129,6 +1152,7 @@ pub struct NodeFamily {
     pub word: &'static str,
     pub tensors: fn(&Split) -> Result<ModelTensors, GpuError>,
     pub experts: OpenExperts,
+    pub host: fn(Arc<Split>, &NodeOpen) -> Result<super::run::HostRun, GpuError>,
 }
 
 /// A family's tier computation over the stacks a node loaded for an open
@@ -1197,7 +1221,7 @@ impl Opened {
 struct Session<'a> {
     local_ip: std::net::IpAddr,
     reset_phase: u8,
-    file: &'a Split,
+    file: &'a Arc<Split>,
     families: &'a [NodeFamily],
     opened: Option<Opened>,
     asked: u32,
@@ -1217,7 +1241,7 @@ struct Session<'a> {
 /// returned by name.
 pub fn serve(
     listener: &TcpListener,
-    file: &Split,
+    file: &Arc<Split>,
     families: &[NodeFamily],
 ) -> Result<(), GpuError> {
     loop {
@@ -1597,8 +1621,42 @@ impl Session<'_> {
             }
         }
         let gpu = Gpu::open_card(&open.name, open.device)?;
-        let w = Weights::load_rows(gpu.stream(), self.file, &tensors, &rows, open.card)?;
-        let experts = (family.experts)(&gpu, &tensors, &w, open)?;
+        let (w, experts) = if let Some(paging) = &open.nvme {
+            let census = NodeCensus::here()?;
+            let device = census
+                .devices
+                .iter()
+                .find(|d| open.device.is_some_and(|id| id.uuid == d.uuid))
+                .ok_or_else(|| {
+                    GpuError::shape(SERVER, "the tier device disappeared from its census")
+                })?;
+            let machine = workstation::plan_on(spec_of_device(device), open.layers);
+            let plan = open.host_plan(&tensors, &machine)?;
+            let least =
+                model::placement::ArenaFloor::of(&plan).map_err(|e| GpuError::plan(SERVER, e))?;
+            let mut arena = workstation::HostNeed::of(&plan, 0)
+                .grant(census.host_room.min(paging.room), least.bytes)
+                .map_err(|e| GpuError::plan(SERVER, e))?;
+            arena.granted = arena.granted.min(paging.arena.granted);
+            let tier = crate::model::nvme_tier(gpu.context(), &plan, self.file, false, arena)?;
+            let run = (family.host)(Arc::clone(self.file), open)?;
+            let tier =
+                tier.ok_or_else(|| GpuError::shape(SERVER, "the node's NVMe plan built no tier"))?;
+            let experts = super::tier_cpu::CpuExperts::new(
+                &gpu,
+                run,
+                tier,
+                open.set.clone(),
+                open.shape,
+                open.cols,
+            )?;
+            let w = Weights::load_rows(gpu.stream(), self.file, &tensors, &[], open.card)?;
+            (w, Box::new(experts) as Box<dyn TierExperts>)
+        } else {
+            let w = Weights::load_rows(gpu.stream(), self.file, &tensors, &rows, open.card)?;
+            let experts = (family.experts)(&gpu, &tensors, &w, open)?;
+            (w, experts)
+        };
         TierWork::open(gpu, w, experts, open.shape, open.cols)
     }
 
@@ -1662,7 +1720,7 @@ pub(super) mod tests {
     use model::placement::devices::{DeviceId, DeviceInfo};
     use model::placement::{ModelTensor, ModelTensors, Role};
 
-    pub(in crate::host) fn empty_file(tag: &str) -> (std::path::PathBuf, Split) {
+    pub(in crate::host) fn empty_file(tag: &str) -> (std::path::PathBuf, std::sync::Arc<Split>) {
         let path = std::env::temp_dir().join(format!("bloomery-{tag}-{}.gguf", std::process::id()));
         let file = std::fs::File::create_new(&path).expect("a new model file");
         Writer::new(file, Layout::new(&[], vec![]).expect("an empty layout"))
@@ -1670,13 +1728,14 @@ pub(super) mod tests {
             .finish()
             .expect("the model header");
         let file = Split::open(&path).expect("the model file");
-        (path, file)
+        (path, std::sync::Arc::new(file))
     }
 
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_an_unsettled_lost_node_keeps_its_work_without_unwinding() {
-                use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         let (path, file) = empty_file("unsettled-node");
         let dropped = Arc::new(AtomicBool::new(false));
         let work = super::super::tier::tests::remote_work(&file, Arc::clone(&dropped), true);
@@ -1979,6 +2038,41 @@ pub(super) mod tests {
             );
         }
 
+        for arena in [
+            model::placement::workstation::ArenaGrant {
+                planned: 4096,
+                granted: 4096,
+            },
+            model::placement::workstation::ArenaGrant {
+                planned: 8192,
+                granted: 4096,
+            },
+        ] {
+            let mut paged = open.clone();
+            paged.nvme = Some(super::NodeNvme {
+                node: 1,
+                room: 1 << 30,
+                arena,
+                reserve: 65536,
+            });
+            let mut out = Out::default();
+            paged.write(&mut out).unwrap();
+            let mut input = In::new(out.done());
+            let back = NodeOpen::read(&mut input).unwrap();
+            assert_eq!(back.nvme, paged.nvme);
+            assert!(input.end().is_ok());
+            for (node, granted) in [(0, 4096), (1, 0), (1, arena.planned + 1)] {
+                paged.nvme.as_mut().unwrap().node = node;
+                paged.nvme.as_mut().unwrap().arena.granted = granted;
+                out.clear();
+                paged.write(&mut out).unwrap();
+                assert!(
+                    NodeOpen::read(&mut In::new(out.done()))
+                        .unwrap_err()
+                        .contains("arena grant")
+                );
+            }
+        }
         rows_on_refuses_another_file_and_other_experts(&open);
     }
 
@@ -2003,6 +2097,67 @@ pub(super) mod tests {
             experts_used: 2,
         };
         assert!(open.rows_on(&model(r.dims.clone())).is_ok());
+        let mut absent = open.clone();
+        absent.rows.clear();
+        let missing = absent.rows_on(&model(r.dims.clone())).unwrap_err();
+        assert!(
+            missing.to_string().contains("missing routed stack"),
+            "{missing}"
+        );
+        let mut repeated = open.clone();
+        repeated.rows.push(r.clone());
+        let duplicate = repeated.rows_on(&model(r.dims.clone())).unwrap_err();
+        assert!(
+            duplicate.to_string().contains("more than once"),
+            "{duplicate}"
+        );
+
+        let mut wide = model(r.dims.clone());
+        let template = wide.tensors[0].clone();
+        wide.layers = 48;
+        wide.tensors = (0..wide.layers)
+            .map(|layer| ModelTensor {
+                name: format!("t.{layer}.up"),
+                layer: Some(layer),
+                ..template.clone()
+            })
+            .collect();
+        let mut trimmed = open.clone();
+        trimmed.layers = wide.layers;
+        trimmed.set = TierSet::new(
+            3..46,
+            8,
+            (3..46)
+                .map(|l| if l == 24 { vec![] } else { vec![2, 5] })
+                .collect(),
+        )
+        .unwrap();
+        trimmed.rows = (3..46)
+            .filter(|&l| l != 24)
+            .map(|layer| NodeRow {
+                name: format!("t.{layer}.up"),
+                ..r.clone()
+            })
+            .collect();
+        assert_eq!(trimmed.rows_on(&wide).unwrap().len(), trimmed.rows.len());
+        let mut missing = trimmed.clone();
+        missing.rows.pop();
+        assert!(
+            missing
+                .rows_on(&wide)
+                .unwrap_err()
+                .to_string()
+                .contains("missing routed stack")
+        );
+        let mut duplicate = trimmed.clone();
+        duplicate.rows.push(trimmed.rows[0].clone());
+        assert!(
+            duplicate
+                .rows_on(&wide)
+                .unwrap_err()
+                .to_string()
+                .contains("more than once")
+        );
         for layers in [0, 2, 4, usize::MAX] {
             let mut bad = open.clone();
             bad.layers = layers;

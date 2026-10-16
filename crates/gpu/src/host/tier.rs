@@ -999,6 +999,11 @@ pub enum TierInput<'a> {
 /// holds no expert of is refused by name. The protocol around the call —
 /// the go, the staging, the fault copy, the signal — is [`TierCard`]'s.
 pub trait TierExperts {
+    /// A failure raised by host computation after its stream work settled.
+    fn check(&self) -> Result<(), GpuError> {
+        Ok(())
+    }
+
     fn enqueue_layer(
         &mut self,
         gpu: &Gpu,
@@ -1433,6 +1438,7 @@ impl TierWork {
 
     /// The tier card's fault word back to clean, once its stream drained.
     pub(super) fn clear_fault(&self) -> Result<(), GpuError> {
+        self.experts.check()?;
         self.gpu.clear_fault()?;
         self.gpu.stream().synchronize()?;
         Ok(())
@@ -1448,6 +1454,7 @@ impl TierWork {
         what: &'static str,
     ) -> Result<(), GpuError> {
         self.drain(deadline, what)?;
+        self.experts.check()?;
         self.gpu.clear_fault()?;
         self.drain(deadline, what)
     }
@@ -1460,6 +1467,7 @@ impl TierWork {
 
     /// The tier card's fault word, once its stream drained ([`Gpu::fault`]).
     pub(super) fn fault(&self) -> Result<Option<Fault>, GpuError> {
+        self.experts.check()?;
         self.gpu.fault()
     }
 
@@ -2397,7 +2405,7 @@ impl Parts<'_> {
 /// Copy `bytes` from `src` to `dst` on `stream`, one span a device buffer of
 /// the tier's context and the other a span of the tier page (a field of a
 /// row's image in, a row's routed rows out): one copy node when captured.
-fn copy_page(
+pub(super) fn copy_page(
     stream: &CudaStream,
     dst: sys::CUdeviceptr,
     src: sys::CUdeviceptr,

@@ -120,6 +120,7 @@ pub mod step;
 pub mod swap;
 pub mod swap_source;
 pub mod tier;
+mod tier_cpu;
 pub mod xstream;
 
 pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};

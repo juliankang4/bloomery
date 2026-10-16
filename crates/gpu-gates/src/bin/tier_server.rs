@@ -65,7 +65,9 @@ mod server {
             .into());
         }
         let path = ref_model_path()?;
-        let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let file = std::sync::Arc::new(
+            Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
+        );
         let listener = TcpListener::bind(listen).map_err(|e| format!("bind {listen}: {e}"))?;
         let at = listener.local_addr()?;
         println!("listening on {at}");
