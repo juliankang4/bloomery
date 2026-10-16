@@ -1381,8 +1381,15 @@ EOF
           exec 9> "$2/lock"
           flock -n 9 || exit 75
           trap "echo outer-trap; exit 143" TERM
-          # Leave a scheduling gap between deciding to escalate and delivering KILL.
-          kill() { case "$*" in "-s KILL -- "*) sleep 1.1 ;; esac; builtin kill "$@"; }
+          # Leave a scheduling gap before delivering KILL to the surviving group.
+          kill() {
+            case "$*" in
+              "-s KILL -- -"*)
+                [ "$SECONDS" -lt "$deadline" ] || { echo "cleanup budget exhausted before group KILL" >&2; return 70; }
+                sleep 1.1 ;;
+            esac
+            builtin kill "$@"
+          }
           echo "grace=${LEASE_STOP_GRACE:-unset}"
           [ "$4" != owned ] || PATH="$2/../fork-bin:$PATH"
           HELD_PID="$2/child" LEASE_BOUNDED_PIDFILE="$2/monitor" lease_bounded 60 "$3"
@@ -1400,6 +1407,7 @@ EOF
       until [ -s "$t/nested-$enclosing-eof" ] || [ "$i" = 10 ]; do sleep 0.1; i=$((i + 1)); done
       check "bounded-nested-$enclosing-eof" "$([ -s "$t/nested-$enclosing-eof" ] && echo yes || echo no)" yes
       check "bounded-nested-$enclosing-trap" "$(grep -E '^(outer-trap|next-arm)$' "$t/nested-$enclosing-out")" outer-trap
+      check "bounded-nested-$enclosing-cleanup" "$(grep '^\[bound\].*cleanup budget' "$t/nested-$enclosing-out")" ''
       want_grace=unset
       [ "$enclosing" != owned ] || want_grace=4
       check "bounded-nested-$enclosing-grace" "$(grep '^grace=' "$t/nested-$enclosing-out")" "grace=$want_grace"
