@@ -1585,7 +1585,8 @@ ARM_FAIL_STEM=depth-ds41
 # arm bound) and its `preheat` line; non-zero with FAIL_WHY on a failure.
 preheat_arm() {
   local out rc=0
-  out=$(timeout --kill-after=10 "$BOUND" python3 "$GGUF_RANGES" preheat "$PH_DIR/k$PHK.tsv" 2>&1) || rc=$?
+  lease_capture "$BOUND" python3 "$GGUF_RANGES" preheat "$PH_DIR/k$PHK.tsv" || rc=$?
+  out=$LEASE_OUT
   if [ "$rc" -ne 0 ]; then
     FAIL_WHY="its preheat failed (rc $rc): ${out##*$'\n'}"
     return "$rc"
@@ -1612,14 +1613,17 @@ ref_arm() {
   ref_witness
   t0=$(date +%s)
   f0=$(majflt_now)
+  lease_out_init || exit 70
   if pp_eng "$eng"; then
-    # The json goes to stdout alone (fd 3 out of the pipe); the loader's log, through majflt_mark,
-    # goes to a file, shown on a failure. One pipeline, so both are whole when `raw` is.
+    # The json stays on stdout; the loader's stderr passes through the live fault marker.
     errf=${TMPDIR:-/tmp}/depth-ds41-$eng-d$dep-r$r.err
-    raw=$({ timeout --kill-after=10 "$BOUND" env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" 2>&1 1>&3 3>&- | majflt_mark "$markf" "$REF_MARK" > "$errf"; exit "${PIPESTATUS[0]}"; } 3>&1) || rc=$?
+    lease_filter "$BOUND" stderr "$errf" majflt_mark "$markf" "$REF_MARK" -- \
+      env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" || rc=$?
   else
-    raw=$(timeout --kill-after=10 "$BOUND" env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" 2>&1 | majflt_mark "$markf" "$REF_MARK"; exit "${PIPESTATUS[0]}") || rc=$?
+    lease_filter "$BOUND" stdout "$LEASE_OUT_FILE" majflt_mark "$markf" "$REF_MARK" -- \
+      env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" || rc=$?
   fi
+  raw=$(< "$LEASE_OUT_FILE")
   f1=$(majflt_now)
   t1=$(date +%s)
   mark=$(cat "$markf")
@@ -1726,12 +1730,11 @@ ours_arm() {
   ours_pre "$i" "$r"
   t0=$(date +%s)
   f0=$(majflt_now)
-  if [ ${#envs[@]} -eq 0 ]; then
-    out=$(timeout --kill-after=10 "$BOUND" "$bin" "${feed[@]}" -n "$N" --place "${A_PLACE[$i]}" --time ${WARM:+--warm "$WARM"} 2>&1 | majflt_mark "$fedf" '^fed '; exit "${PIPESTATUS[0]}")
-  else
-    out=$(timeout --kill-after=10 "$BOUND" env "${envs[@]}" "$bin" "${feed[@]}" -n "$N" --place "${A_PLACE[$i]}" --time ${WARM:+--warm "$WARM"} 2>&1 | majflt_mark "$fedf" '^fed '; exit "${PIPESTATUS[0]}")
-  fi
-  rc=$?
+  lease_out_init || exit 70
+  rc=0
+  lease_filter "$BOUND" stdout "$LEASE_OUT_FILE" majflt_mark "$fedf" '^fed ' -- \
+    env ${envs[@]+"${envs[@]}"} "$bin" "${feed[@]}" -n "$N" --place "${A_PLACE[$i]}" --time ${WARM:+--warm "$WARM"} || rc=$?
+  out=$(< "$LEASE_OUT_FILE")
   f1=$(majflt_now)
   t1=$(date +%s)
   fed=$(cat "$fedf")

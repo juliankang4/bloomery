@@ -817,7 +817,8 @@ ph_bytes() {
 preheat_arm() {
   local k=${A_PHK[$1]:-} out rc=0
   [ -n "$PH_DIR" ] && [ -n "$k" ] || return 0
-  out=$(timeout --kill-after=10 "$BOUND" python3 "$GGUF_RANGES" preheat "$PH_DIR/k$k.tsv" 2>&1) || rc=$?
+  lease_capture "$BOUND" python3 "$GGUF_RANGES" preheat "$PH_DIR/k$k.tsv" || rc=$?
+  out=$LEASE_OUT
   if [ "$rc" -ne 0 ]; then
     FAIL_WHY="its preheat failed (rc $rc): ${out##*$'\n'}"
     return "$rc"
@@ -979,14 +980,17 @@ run_arm() {
     ours | oursmtp)
       # Through majflt_mark: the fault count at the `fed` line, where the feed's timer starts.
       markf=$(mktemp "${TMPDIR:-/tmp}/depth-glm5next-fed.XXXXXX") || exit 2
-      out=$(lease_bounded "$BOUND" "${CMD[@]}" 2>&1 | majflt_mark "$markf" '^fed '; exit "${PIPESTATUS[0]}")
-      rc=$?
+      rc=0
+      lease_out_init || exit 70
+      lease_filter "$BOUND" stdout "$LEASE_OUT_FILE" majflt_mark "$markf" '^fed ' -- "${CMD[@]}" || rc=$?
+      out=$(< "$LEASE_OUT_FILE")
       mark=$(cat "$markf")
       rm -f "$markf"
       ;;
     *)
-      out=$(lease_bounded "$BOUND" "${CMD[@]}" 2>&1)
-      rc=$?
+      rc=0
+      lease_capture "$BOUND" "${CMD[@]}" || rc=$?
+      out=$LEASE_OUT
       ;;
   esac
   t1=$(date +%s) m1=$(majflt_now)

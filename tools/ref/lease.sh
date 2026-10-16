@@ -441,37 +441,138 @@ lease_take() {
   lease_netdata
 }
 
-# lease_bounded <seconds> <command…>: the command under `timeout --kill-after=10 <seconds>`, its exit
+# lease_bounded <seconds> <command…>: (with LEASE_BOUNDED_OUT=<file> set for the call, the command's stdout
+# and stderr go to that file, stderr to LEASE_BOUNDED_ERR when that is set too, and the runner's own
+# trap output stays on the runner's stdout) the command under `timeout --kill-after=10 <seconds>`, its exit
 # code returned. Every process a runner starts under the lease goes through it or its own `timeout`:
 # the lease stays held while any process that inherited descriptor 9 lives, so a hung child must end
 # at a bound instead of holding the machine. A command cut off there prints `[bound]` on stderr: a
 # child that hangs is a failed run, not a slow one. The command runs through run_bounded
-# (tools/gate-bound.sh), so a TERM, INT or HUP to the runner ends the command first; the runner then
-# stops on that signal as it would have (by its own trap, if it set one), not at its next arm. Where
+# (tools/gate-bound.sh): a TERM, INT or HUP to the runner stops timeout and its process group through
+# lease_stop, then the runner stops on that signal as it would have (by its own trap, if it set one),
+# not at its next arm. Where
 # lease_bounded runs in a subshell (`out=$(lease_bounded …)`, a pipeline), a signal to the runner's
-# pid alone does not reach it: the runner ends and the command runs on to its bound. A signal to the
-# runner's group ends both. The command is an executable, not a shell
+# pid alone does not reach it: the runner ends and the command runs on to its bound, holding the
+# lease. So a runner calls it in its own shell and takes the output from a file: lease_capture, or a
+# LEASE_BOUNDED_OUT=$LEASE_OUT_FILE after lease_out_init, or $LEASE_OUT_FIFO for a filter that must see each
+# line as it is printed. The command is an executable, not a shell
 # function or an assignment: `lease_bounded "$LEASE_ARM_BOUND" env K=V "$BIN" …`. LEASE_ARM_BOUND is
 # BLOOMERY_ARM_BOUND, default 900 s — the arm bound the depth, nsys and ncu runners read too; a
 # runner whose children run longer names its own. A bound that is not a positive integer is refused
 # (rc 64) before anything runs.
 # shellcheck disable=SC2034 # read by the runners that source this file
 LEASE_ARM_BOUND=${BLOOMERY_ARM_BOUND:-900}
-lease_bounded() {
-  local bound=${1:-} rc=0
+lease_bound() {
+  local bound=${1:-}
   case $bound in
     '' | *[!0-9]* | 0*)
       echo "[bound] lease_bounded: the bound is a positive number of seconds, got '$bound' (BLOOMERY_ARM_BOUND?)" >&2
       return 64
       ;;
   esac
+}
+lease_bounded() {
+  local bound=${1:-} rc=0
+  lease_bound "$bound" || return $?
   shift
-  run_bounded timeout --kill-after=10 "$bound" "$@" || rc=$?
+  if [ -n "${LEASE_BOUNDED_OUT:-}" ] && [ -n "${LEASE_BOUNDED_ERR:-}" ]; then
+    run_bounded timeout --kill-after=10 "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2> "$LEASE_BOUNDED_ERR" || rc=$?
+  elif [ -n "${LEASE_BOUNDED_OUT:-}" ]; then
+    run_bounded timeout --kill-after=10 "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2>&1 || rc=$?
+  else
+    run_bounded timeout --kill-after=10 "$bound" "$@" || rc=$?
+  fi
   case $rc in
     124) echo "[bound] $1 cut off at its ${bound} s bound (rc 124)" >&2 ;;
     137) echo "[bound] $1 killed (rc 137: the bound's KILL ${bound} s + 10 s in, or another SIGKILL)" >&2 ;;
   esac
   [ -z "$BIN_SIGNAL" ] || kill -s "$BIN_SIGNAL" $$ 2> /dev/null
+  return "$rc"
+}
+
+# lease_out_init: a temp dir for the runner's own shell to capture a lease_bounded command's output in
+# (LEASE_OUT_FILE, and LEASE_OUT_FIFO for a live filter; pass either as LEASE_BOUNDED_OUT), removed by lease_out_clean, which it adds to
+# the runner's EXIT trap without replacing it (call it again after a later `trap … EXIT`).
+LEASE_OUT_DIR='' LEASE_OUT_FILE='' LEASE_OUT_FIFO='' LEASE_OUT=''
+lease_out_clean() {
+  [ -z "$LEASE_OUT_DIR" ] || { rm -f "$LEASE_OUT_FILE" "$LEASE_OUT_FIFO"; rmdir "$LEASE_OUT_DIR" 2> /dev/null; }
+  return 0
+}
+lease_out_init() {
+  local cur exit_trap
+  if [ -z "$LEASE_OUT_DIR" ]; then
+    LEASE_OUT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lease-out.XXXXXX") || return 70
+    LEASE_OUT_FILE=$LEASE_OUT_DIR/out LEASE_OUT_FIFO=$LEASE_OUT_DIR/fifo
+    mkfifo "$LEASE_OUT_FIFO" || return 70
+  fi
+  trap -p EXIT > "$LEASE_OUT_FILE"
+  cur=$(< "$LEASE_OUT_FILE")
+  case $cur in
+    *lease_out_clean*) ;;
+    *)
+      eval "exit_trap=(${cur#trap -- })"
+      # shellcheck disable=SC2064 # the runner's trap text now, to run again at exit
+      trap "${exit_trap[0]:+${exit_trap[0]}$'\n'}lease_out_clean" EXIT
+      ;;
+  esac
+}
+
+# lease_capture <seconds> <command…>: lease_bounded with stdout and stderr in LEASE_OUT (as `$(…) 2>&1`
+# gives them, the last newlines cut), its rc returned. Call it in the runner's shell, never in a
+# substitution or a pipeline.
+lease_capture() {
+  local rc=0
+  lease_out_init || return 70
+  LEASE_BOUNDED_OUT=$LEASE_OUT_FILE lease_bounded "$@" || rc=$?
+  LEASE_OUT=$(< "$LEASE_OUT_FILE")
+  return "$rc"
+}
+
+# lease_filter <seconds> <stdout|stderr> <file> <filter command...> -- <command...>:
+# a live filter in the output file, with the bounded command owned by the runner's shell.
+# stdout filters the combined output; stderr leaves stdout in LEASE_OUT_FILE.
+lease_filter() {
+  local bound=$1 stream=$2 output=$3 rc=0 reader='' filter_rc=0
+  local -a filter=()
+  shift 3
+  lease_bound "$bound" || return $?
+  case $stream in stdout | stderr) ;; *) echo "lease_filter: stream is stdout or stderr, got '$stream'" >&2; return 64 ;; esac
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do filter+=("$1"); shift; done
+  [ "$#" -gt 1 ] && [ "${#filter[@]}" -gt 0 ] || { echo 'lease_filter: a filter and -- command are required' >&2; return 64; }
+  shift
+  lease_out_init || return 70
+  local filter_traps pending='' s signal_rc
+  filter_traps=$(trap -p TERM INT HUP)
+  # Hold early signals until the reader PID is known; restore the caller before forwarding them.
+  for s in TERM INT HUP; do
+    case $s in TERM) signal_rc=143 ;; INT) signal_rc=130 ;; HUP) signal_rc=129 ;; esac
+    # shellcheck disable=SC2064 # the signal and its status now, the reader when the trap runs
+    trap "pending=$s; [ -z \"\$reader\" ] || {
+      trap '' TERM INT HUP
+      kill -TERM \"\$reader\" 2> /dev/null || :
+      wait \"\$reader\" 2> /dev/null || :
+      reader=''
+      trap - TERM INT HUP
+      eval \"\$filter_traps\"
+      kill -s $s \$\$
+      return $signal_rc
+    }" "$s"
+  done
+  "${filter[@]}" 9>&- < "$LEASE_OUT_FIFO" > "$output" &
+  reader=$!
+  [ -z "$pending" ] || kill -s "$pending" $$
+  case $stream in
+    stdout) LEASE_BOUNDED_OUT=$LEASE_OUT_FIFO LEASE_BOUNDED_ERR= lease_bounded "$bound" "$@" || rc=$? ;;
+    stderr) LEASE_BOUNDED_OUT=$LEASE_OUT_FILE LEASE_BOUNDED_ERR=$LEASE_OUT_FIFO lease_bounded "$bound" "$@" || rc=$? ;;
+  esac
+  if [ -n "$reader" ]; then
+    wait "$reader" || filter_rc=$?
+    reader=''
+  fi
+  trap - TERM INT HUP
+  eval "$filter_traps"
+  [ -z "$pending" ] || kill -s "$pending" $$
+  [ "$rc" -ne 0 ] || rc=$filter_rc
   return "$rc"
 }
 
@@ -883,10 +984,13 @@ decode_bin() { echo "$HOME/repo/$1/$DECODE_BIN"; }
 # first on PATH in a temp dir (the made-up UUIDs the stub tests use, never the box's), with no
 # card, no lock and no /proc — the holder lines name a pid that does not resolve. The waits scale
 # to seconds (LEASE_GPU_POLL/REPORT/WAIT of 1/1/2), and the four lease_gpu_idle cases sleep 4 s
-# between them; the trace cases (a temp lease and trace, no /root) follow. just check-recipes runs this
+# between them; the trace cases (a temp lease and trace, no /root) follow, then lease_bounded's under
+# a TERM (a temp lease; the stand-in timeout where there is no timeout). just check-recipes runs this
 # on the Mac.
 # Trace-write checks name the failed path and preserve continuation, not the OS's localized wording.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
+  # shellcheck source=tools/ref/cancel-stubs.sh
+  source "$LEASE_TREE/tools/ref/cancel-stubs.sh"
   fails=0
   check() {
     if [ "$2" = "$3" ]; then echo "ok $1"; else echo "FAIL $1: got [$2], want [$3]"; fails=$((fails + 1)); fi
@@ -1140,6 +1244,373 @@ EOF
     unset BLOOMERY_LEASE_TRACE BLOOMERY_LEASE_CARD
   fi
   # ---- end the trace ----
+  # ---- lease_bounded ----
+  # A runner that holds a lease (a temp file) runs a stub under lease_bounded and then its next arm; the
+  # stub sets a trap that ends it 7 one second after TERM, writes its pid and its parent's (its timeout) and holds.
+  # A TERM to the runner's pid, sent after that PID file exists and its timeout sleeps, ends the stub, its timeout and
+  # then the runner, by the runner's own TERM trap when it set one, within seconds: the lease is free once
+  # the runner is gone and the next arm never starts. A stub still there once the checks are made is let
+  # go. Of the output only the runner's own two lines are read: the stub's /bin/sh may report its sleep
+  # ended by the group's TERM. The command reads the runner's stdin.
+  if command -v flock > /dev/null 2>&1; then
+    command -v timeout > /dev/null || cp "$LEASE_TREE/tools/ref/stub-timeout.py" "$t/tbin/timeout"
+    printf '%s\n' '#!/bin/sh' 'trap '\''trap "" TERM INT HUP; sleep 1; exit 7'\'' TERM' 'echo "$$ $PPID" > "${HELD_PID:-$1}"' 'while :; do sleep 1; done' > "$t/held"
+    chmod +x "$t/held"
+    awk '
+      { print }
+      $0 == "  \"$@\" <&0 &" {
+        print "  echo gap > \"$START_READY\""
+        print "  while [ ! -e \"$START_RELEASE\" ]; do sleep 0.01 9>&-; done"
+      }
+    ' "$LEASE_TREE/tools/gate-bound.sh" > "$t/startup-gate-bound.sh"
+    for model in ds41 qwen3moe glm5next; do
+      sed -n '/^ref_arm() {/,/^}/p; /^ours_arm() {/,/^}/p; /^preheat_arm() {/,/^}/p' \
+        "$LEASE_TREE/tools/ref/depth-$model.sh" > "$t/$model-arm-functions"
+    done
+    qwen3moe=depth-qwen3moe
+    sed -n "/^MEM_SCOPE_SCRIPT='/,/^'$/p" "$LEASE_TREE/tools/ref/$qwen3moe.sh" >> "$t/qwen3moe-arm-functions"
+    cstate='cstate-ab'
+    sed -n '/^for ((r = 1;/,$p' "$LEASE_TREE/tools/ref/$cstate.sh" > "$t/cstate-arms"
+    cat > "$t/depth-arm-harness" << 'EOF'
+TEST_BIN=$3 TEST_PID=$4
+N=1 WARM='' PH_DIR=''
+A_DEP=(6) A_BIN=("$TEST_BIN") A_PLACE=(a) A_MEM=('') A_PREFILL=('')
+arm_envs() { ARM_ENVS=(); }
+arm_feed() { ARM_FEED=("$TEST_PID"); }
+arm_prompt() { echo 0; }
+arm_ctx() { echo 64; }
+ph_k() { PHK=1; }
+set_disable() { :; }
+evict_arm() { :; }
+majflt_now() { echo 0; }
+majflt_mark() { cat; }
+witness() { :; }
+ref_witness() { :; }
+ours_pre() { :; }
+ref_cmd() { REF_BIN=$TEST_BIN; REF_ARGS=("$TEST_PID"); REF_ENV=(); REF_MARK=''; }
+pp_eng() { [ "$1" = pp ]; }
+EOF
+    cat > "$t/held-preheat.py" << 'EOF'
+import os
+import signal
+import sys
+import time
+
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(7))
+assert sys.argv[1:] == ['preheat', os.environ['HELD_PID'] + '.ranges/k1.tsv']
+with open(os.environ['HELD_PID'], 'w') as f:
+    f.write(f'{os.getpid()} {os.getppid()}\n')
+while True:
+    time.sleep(1)
+EOF
+    cat > "$t/tbin/systemd-run" << 'EOF'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case $1 in -p) shift 2 ;; --scope | --quiet) shift ;; *) break ;; esac
+done
+exec "$@"
+EOF
+    chmod +x "$t/tbin/systemd-run"
+    # A timeout that has made its group and child but exits on TERM without forwarding it, as GNU
+    # timeout can before fork returns. The held command keeps descriptor 9 in that orphaned group.
+    mkdir "$t/fork-bin"
+    cancel_timeout "$t/fork-bin/timeout"
+    chmod +x "$t/fork-bin/timeout"
+    n=0 BOUND=20
+    # form: the runner calls lease_bounded in its own shell (direct), or takes its output through the
+    # capture helper (capture). A runner that captured it with `out=$(lease_bounded …)` is the form this
+    # case was made to refuse: the stub and its timeout stay and hold the lease to their bound.
+    for form in direct capture startup fork ds41-ours ds41-ref ds41-pp ds41-preheat glm5next-preheat cstate qwen3moe-ours qwen3moe-ref qwen3moe-mem; do
+      for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
+        n=$((n + 1))
+        funcs=''
+        case $form in
+          direct | fork) call='lease_bounded "$BOUND" "$3" "$4"' ;;
+          capture) call='lease_out_init; echo "capture dir $LEASE_OUT_DIR"; lease_capture "$BOUND" "$3" "$4"' ;;
+          startup) call='source "$7"; lease_bounded "$BOUND" "$3" "$4"' ;;
+          ds41-ours | qwen3moe-ours) call='source "$5"; source "$6"; ours_arm 0 1' ;;
+          ds41-ref | qwen3moe-ref) call='source "$5"; source "$6"; ref_arm stub 6 1' ;;
+          ds41-pp) call='source "$5"; source "$6"; ref_arm pp 6 1' ;;
+          ds41-preheat) call='source "$5"; source "$6"; PH_DIR=$TEST_PID.ranges GGUF_RANGES=$8; ref_arm stub 6 1' ;;
+          glm5next-preheat) call='source "$5"; source "$6"; PH_DIR=$TEST_PID.ranges GGUF_RANGES=$8; A_PHK=(1); A_LABEL=(stub); preheat_arm 0' ;;
+          cstate) call='source "$6"; ROUNDS=1 STATE=stub KEEP="."; source "$5" "$TEST_BIN" "$TEST_PID"' ;;
+          qwen3moe-mem) call='source "$5"; source "$6"; A_MEM=(1); ours_arm 0 1' ;;
+        esac
+        case $form in ds41-*) funcs=$t/ds41-arm-functions ;; qwen3moe-*) funcs=$t/qwen3moe-arm-functions ;; glm5next-*) funcs=$t/glm5next-arm-functions ;; cstate) funcs=$t/cstate-arms ;; esac
+        bpath=$t/tbin:$PATH
+        case $form in *fork) bpath=$t/fork-bin:$bpath ;; esac
+        BOUND=$BOUND HELD_PID="$t/held$n.pid" START_READY="$t/gap$n" START_RELEASE="$t/go$n" PATH="$bpath" \
+          bash -c "source \"\$1\" && exec 9> \"\$2\" && flock -n 9 && { $trp $call; echo next arm; }" \
+          _ "$LEASE_TREE/tools/ref/lease.sh" "$t/blease$n" "$t/held" "$t/held$n.pid" \
+          "$funcs" "$t/depth-arm-harness" "$t/startup-gate-bound.sh" "$t/held-preheat.py" > "$t/bout$n" 2>&1 &
+        rp=$!
+        # Sleeping is a readiness observation, not a permanent process state.
+        i=0 ready=no
+        until { cancel_ready "$t/held$n.pid" && { [ "$form" != startup ] || [ -s "$t/gap$n" ]; } && ready=yes; } || [ "$i" = 100 ]; do
+          sleep 0.1
+          i=$((i + 1))
+        done
+        check "bounded-$form-ready${trp:+-trap}" "$ready" yes
+        s0=$SECONDS
+        kill -TERM "$rp" 2> /dev/null
+        [ "$form" != startup ] || { check "bounded-startup-gap${trp:+-trap}" "$(cat "$t/gap$n")" gap; touch "$t/go$n"; }
+        RC=0
+        wait "$rp" || RC=$?
+        ended=before
+        [ "$((SECONDS - s0))" -lt "$BOUND" ] || ended='at or after'
+        left='' sp=''
+        if [ -s "$t/held$n.pid" ]; then
+          read -r sp ip < "$t/held$n.pid"
+          if kill -0 "$sp" 2> /dev/null; then
+            case $form in
+              *fork)
+                state=$(ps -o stat= -p "$sp" 2> /dev/null) || state=''
+                case $state in '' | *Z*) ;; *) left="$left stub" ;; esac
+                ;;
+              *) left="$left stub" ;;
+            esac
+          fi
+          if kill -0 "$ip" 2> /dev/null; then left="$left timeout"; fi
+        fi
+        lk=free
+        lease_free "$t/blease$n" 2> /dev/null || lk=held
+        cdir=$(sed -n 's/^capture dir //p' "$t/bout$n")
+        OUT="stub ran: $([ -n "$sp" ] && echo yes || echo no), left:${left:- none}, lease: $lk, ended $ended the $BOUND s bound, out: [$(grep -E '^(trap ran|next arm)$' "$t/bout$n" | tr '\n' ' ')]"
+        cfix=''
+        [ "$form" != capture ] || { cfix=', capture dir: removed'; [ -n "$cdir" ] && [ ! -e "$cdir" ] && OUT="$OUT, capture dir: removed" || OUT="$OUT, capture dir: left"; }
+        check "bounded-$form-term${trp:+-trap}-rc" "$RC" 143
+        matches "bounded-$form-term${trp:+-trap}" "^stub ran: yes, left: none, lease: free, ended before the $BOUND s bound, out: \[${trp:+trap ran }\]${cfix}\$" "$OUT"
+        if [ -n "$left" ]; then
+          if kill -0 "$ip" 2> /dev/null; then lease_stop "$ip" || :; fi
+          if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
+        fi
+      done
+    done
+    RC=0
+    lease_capture 10 sh -c 'echo out; echo err >&2; exit 3' || RC=$?
+    check bounded-capture-rc "$RC" 3
+    check bounded-capture-out "$LEASE_OUT" "$(printf 'out\nerr')"
+    check bounded-capture-exit-trap "$(trap -p EXIT)" $'trap -- \'rm -rf "$t"\nlease_out_clean\' EXIT'
+    cat > "$t/exit-trap-runner" << 'EOF'
+source "$1"
+TRAP_READS=$3.reads
+trap() {
+  if [ "$*" = '-p EXIT' ]; then printf "%s\n" "$BASH_SUBSHELL" >> "$TRAP_READS"; fi
+  builtin trap "$@"
+}
+trap 'printf "%s\n" "runner'\''s trap" > "$2"
+printf "%s\n" kept >> "$2"' EXIT
+RETURN_ARGS=$3.args
+set -T
+trap 'if [ "${FUNCNAME[0]}" = lease_out_init ]; then printf "%s\n" "$#" >> "$RETURN_ARGS"; fi' RETURN
+lease_capture 10 true
+lease_out_init
+echo "$LEASE_OUT_DIR" > "$3"
+EOF
+    RC=0
+    lease_bounded 10 bash "$t/exit-trap-runner" "$LEASE_TREE/tools/ref/lease.sh" \
+      "$t/exit-marker" "$t/exit-dir" > "$t/exit-log" 2>&1 || RC=$?
+    check bounded-capture-quoted-exit-rc "$RC" 0
+    check bounded-capture-quoted-exit-ran "$(cat "$t/exit-marker")" "$(printf "runner's trap\nkept")"
+    check bounded-capture-exit-trap-shell "$(cat "$t/exit-dir.reads")" "$(printf '0\n0')"
+    check bounded-capture-exit-positional "$(cat "$t/exit-dir.args")" "$(printf '0\n0')"
+    cdir=$(cat "$t/exit-dir")
+    check bounded-capture-quoted-exit-clean "$([ -n "$cdir" ] && [ ! -e "$cdir" ] && echo removed || echo left)" removed
+    cat > "$t/comment-exit-runner" << 'EOF'
+source "$1"
+trap 'echo runner > "$2" # trailing comment' EXIT
+lease_capture 10 true
+echo "$LEASE_OUT_DIR" > "$3"
+EOF
+    RC=0
+    lease_bounded 10 bash "$t/comment-exit-runner" "$LEASE_TREE/tools/ref/lease.sh" \
+      "$t/comment-marker" "$t/comment-dir" > "$t/comment-log" 2>&1 || RC=$?
+    check bounded-capture-comment-exit-rc "$RC" 0
+    check bounded-capture-comment-exit-ran "$(cat "$t/comment-marker")" runner
+    cdir=$(cat "$t/comment-dir")
+    check bounded-capture-comment-exit-clean "$([ -n "$cdir" ] && [ ! -e "$cdir" ] && echo removed || echo left)" removed
+    RC=0
+    lease_capture 5 bash -c '
+      set -u
+      source "$1"
+      mktemp() { return 1; }
+      rc=0
+      lease_capture 10 true || rc=$?
+      printf "rc=%s out=[%s]\n" "$rc" "$LEASE_OUT"
+    ' _ "$LEASE_TREE/tools/ref/lease.sh" || RC=$?
+    check bounded-capture-init-failure-rc "$RC" 0
+    check bounded-capture-init-failure-output "$LEASE_OUT" 'rc=70 out=[]'
+    RC=0
+    lease_filter 10 stdout "$t/filter-both" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
+    check bounded-filter-command-rc "$RC" 3
+    check bounded-filter-combined-output "$(cat "$t/filter-both")" "$(printf 'out\nerr')"
+    RC=0
+    lease_filter 10 stderr "$t/filter-stderr" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
+    check bounded-filter-stderr-rc "$RC" 3
+    check bounded-filter-stdout "$(cat "$LEASE_OUT_FILE")" out
+    check bounded-filter-stderr "$(cat "$t/filter-stderr")" err
+    RC=0
+    lease_filter 10 stdout "$t/filter-failed" sh -c 'cat; exit 4' -- echo out || RC=$?
+    check bounded-filter-reader-rc "$RC" 4
+    RC=0
+    lease_bounded 5 bash -c 'source "$1"; lease_filter 0600 stdout "$2" cat -- true' \
+      _ "$LEASE_TREE/tools/ref/lease.sh" "$t/refused-filter" > "$t/refused-filter-log" 2>&1 || RC=$?
+    check bounded-filter-refused-rc "$RC" 64
+    check bounded-filter-refused-no-reader "$([ -e "$t/refused-filter" ] && echo created || echo absent)" absent
+    RC=0
+    dma='dma-dram-share'
+    env BLOOMERY_HOST_BOUND=0600 bash "$LEASE_TREE/tools/ref/$dma.sh" --parse-only \
+      > "$t/refused-dma-log" 2>&1 || RC=$?
+    check dma-leading-zero-bound-rc "$RC" 64
+    cat > "$t/filter-open-runner" << 'EOF'
+source "$1"
+eval "$(sed -n '/^lease_filter() {/,/^}/p' "$1" | awk '
+  { print }
+  $0 == "  \"${filter[@]}\" 9>&- < \"$LEASE_OUT_FIFO\" > \"$output\" &" {
+    print "  echo \"$! $LEASE_OUT_FIFO\" > \"$TEST_READY\""
+    print "  while [ ! -e \"$TEST_RELEASE\" ]; do sleep 0.01 9>&-; done"
+  }
+')"
+exec 9> "$2"
+flock -n 9 || exit 75
+case $TEST_TRAP in
+  exit) trap 'echo trap ran; exit 143' TERM ;;
+  return) trap 'echo trap ran' TERM ;;
+esac
+saved=$(trap -p TERM)
+rc=0
+lease_filter 10 stdout "$3" cat -- true || rc=$?
+echo "filter=$rc"
+[ "$(trap -p TERM)" != "$saved" ] || echo restored
+EOF
+    for trp in none exit return; do
+      RC=0
+      OUT=$(python3 - "$LEASE_TREE/tools/ref/lease.sh" "$t" "$trp" << 'PY'
+import errno
+import os
+from pathlib import Path
+import select
+import signal
+import subprocess
+import sys
+import time
+
+source, root, mode = sys.argv[1:]
+prefix = Path(root) / ("filter-" + mode)
+ready, release = Path(str(prefix) + ".ready"), Path(str(prefix) + ".release")
+fifo_link = str(prefix) + ".fifo"
+env = dict(os.environ, TEST_READY=str(ready), TEST_RELEASE=str(release), TEST_TRAP=mode)
+with open(str(prefix) + ".out", "w") as output:
+    runner = subprocess.Popen(["bash", str(Path(root) / "filter-open-runner"), source,
+                               str(prefix) + ".lock", str(prefix) + ".filtered"],
+                              stdout=output, stderr=subprocess.PIPE, env=env)
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() or not ready.read_text().strip():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("filter reader did not reach its startup gap")
+            time.sleep(0.01)
+        reader, fifo = ready.read_text().split()
+        # Keep a FIFO name for cleanup after the assertions: opening its writer lets an orphan
+        # finish normally, without the test sending the reader a signal.
+        os.link(fifo, fifo_link)
+        runner.send_signal(signal.SIGTERM)
+        time.sleep(0.1)
+        release.touch()
+        rc = runner.wait(timeout=5)
+        rc = 128 - rc if rc < 0 else rc
+        try:
+            os.kill(int(reader), 0)
+            state = "alive"
+        except ProcessLookupError:
+            state = "gone"
+        eof = False
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if select.select([runner.stderr], [], [], max(0, deadline - time.monotonic()))[0]:
+                if not os.read(runner.stderr.fileno(), 4096):
+                    eof = True
+                    break
+        text = Path(str(prefix) + ".out").read_text()
+        expected = {"none": "", "exit": "trap ran\n",
+                    "return": "trap ran\nfilter=143\nrestored\n"}[mode]
+        print(f"runner={rc} reader={state} stderr={'eof' if eof else 'open'} "
+              f"caller={'kept' if text == expected else repr(text)}")
+        sys.exit(0 if rc == (0 if mode == "return" else 143) and state == "gone"
+                 and eof and text == expected else 1)
+    finally:
+        release.touch()
+        if runner.poll() is None:
+            runner.terminate()
+            runner.wait(timeout=5)
+        try:
+            os.close(os.open(fifo_link, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError as error:
+            if error.errno not in (errno.ENXIO, errno.ENOENT):
+                raise
+        runner.stderr.close()
+PY
+      ) || RC=$?
+      check "bounded-filter-open-term-$trp-rc" "$RC" 0
+      check "bounded-filter-open-term-$trp-reader" "$OUT" \
+        "runner=$([ "$trp" = return ] && echo 0 || echo 143) reader=gone stderr=eof caller=kept"
+      state=free
+      lease_free "$t/filter-$trp.lock" 2> /dev/null || state=held
+      check "bounded-filter-open-term-$trp-lease" "$state" free
+    done
+    for s in TERM HUP; do
+      case $s in TERM) want=143 ;; HUP) want=129 ;; esac
+      for errexit in off on; do
+        RC=0
+        bash -c '
+          source "$1"
+          [ "$4" = off ] || set -e
+          reaped_signal=$3
+          set -T
+          trap '\''if [ "${FUNCNAME[0]:-}" = lease_filter ] &&
+            [ "$BASH_COMMAND" = "trap - TERM INT HUP" ] && [ -z "$reader" ]; then
+              trap - DEBUG
+              kill -s "$reaped_signal" $$
+            fi'\'' DEBUG
+          lease_filter 5 stdout "$2" cat -- true
+          echo NEXT_ARM_STARTED
+        ' _ "$LEASE_TREE/tools/ref/lease.sh" "$t/reaped-filter" "$s" "$errexit" \
+          > "$t/reaped-filter.log" 2>&1 || RC=$?
+        check "bounded-filter-reaped-$s-$errexit-rc" "$RC" "$want"
+        check "bounded-filter-reaped-$s-$errexit-no-next-arm" "$(grep -c NEXT_ARM_STARTED "$t/reaped-filter.log")" 0
+      done
+    done
+    mkdir -p "$t/expert-tree/tools/ref"
+    expert='expert-union-dump'
+    cp "$LEASE_TREE/tools/ref/$expert.sh" "$t/expert-tree/tools/ref/"
+    printf '%s\n' 'MODEL=unused' 'REF_PROMPTS=$STUB_EXPERT_PROMPTS' > "$t/expert-tree/tools/ref/ref-paths.sh"
+    printf '%s\n' 'DECODE_BIN=$STUB_EXPERT_BIN' 'LEASE_ARM_BOUND=10' \
+      'lease_take() { :; }' 'lease_bounded() { shift; "$@"; }' > "$t/expert-tree/tools/ref/lease.sh"
+    cat > "$t/expert-bin" << 'EOF'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --tokens ]; then tokens=$2; break; fi
+  shift
+done
+echo "$tokens" >> "$STUB_EXPERT_CALLS"
+[ "$tokens" != 2 ] || exit 3
+echo 'generated 7'
+EOF
+    chmod +x "$t/expert-bin"
+    printf 'first\tstub\t1\nsecond\tstub\t2\nthird\tstub\t3\n' > "$t/expert-prompts"
+    RC=0
+    lease_bounded 10 env STUB_EXPERT_BIN="$t/expert-bin" STUB_EXPERT_PROMPTS="$t/expert-prompts" \
+      STUB_EXPERT_CALLS="$t/expert-calls" bash "$t/expert-tree/tools/ref/$expert.sh" \
+      "$t/expert-out" > "$t/expert-log" 2>&1 || RC=$?
+    check expert-dump-failed-prompt-rc "$RC" 1
+    check expert-dump-stops-at-failure "$(cat "$t/expert-calls")" "$(printf '1\n2')"
+    check expert-dump-first-collected "$(cat "$t/expert-out/first.gen")" 'generated 7'
+    matches expert-dump-names-failure '^prompt second failed$' "$(cat "$t/expert-log")"
+    check bounded-stdin "$(printf 'stdin reaches it\n' | lease_bounded 10 cat 2>&1)" 'stdin reaches it'
+  else
+    echo "skip lease_bounded: no flock(1) and no tools/ref/card-tests/bin/flock stand-in"
+  fi
+  # ---- end lease_bounded ----
   # ---- the witness fields' variables ----
   # witness refuses by name, before any line, a field whose variable the runner did not set.
   OUT=$(WITNESS=(head table); DIR=/d; DEV=sda; unset SRC; witness pre 2>&1); RC=$?

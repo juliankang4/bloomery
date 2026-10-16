@@ -31,8 +31,8 @@
 #   lcpp_srv_start <bound> <log> [NAME=VALUE...]  empties <log>, starts (lcpp_srv_spawn) `timeout --kill-after=10
 #                                  <bound> env <NAME=VALUE...> SRV_CMD` with its stdout and stderr in <log>, and waits (at most <bound> s)
 #                                  for its `listening on http://127.0.0.1:<port>` line — printed after the
-#                                  model loaded — and a 200 from /health. SRV_PID (the timeout's pid, the only
-#                                  one signalled), SRV_PORT; 1 with SRV_WHY and SRV_RC when it exited first
+#                                  model loaded — and a 200 from /health. SRV_PID (the timeout's pid),
+#                                  SRV_PORT; 1 with SRV_WHY and SRV_RC when it exited first
 #                                  (its rc) or never listened (124)
 #   lcpp_srv_request <ids> <n_predict> <bound>  one POST /completion: the comma-separated ids as the prompt,
 #                                  greedy (temperature 0, top_k 1), ignore_eos, cache_prompt off,
@@ -52,8 +52,8 @@
 #                                  lcpp_srv_request, and the caller stops it
 #   lcpp_srv_same <a> <b>          `same` for two equal comma lists of ids, else `differs at <i>`: greedy
 #                                  decoding repeats its continuation, so the warm-up read the timed rows
-#   lcpp_srv_stop                  TERM to SRV_PID, which passes it to the server; KILL to its children and
-#                                  to it 30 s later if it is still up; SRV_EXIT its status
+#   lcpp_srv_stop                  lease_stop ends SRV_PID and its group, then restores the caller's signal
+#                                  traps; SRV_EXIT the child's status or a cleanup failure
 #   lcpp_srv_build <log>, lcpp_srv_device <log>  the server's `build:` line and the card it opened
 #   lcpp_srv_nctx <log>            the n_ctx the server's context was made with (its `llama_context: n_ctx =`
 #                                  line, the first: an MTP draft's context prints its own after it)
@@ -148,8 +148,8 @@
 # estimate for the bench's -v.
 #
 # Stopping. The server runs under `timeout <bound>`, one bound for its load, the warm-up, the timed request
-# and a retry; SRV_PID is the timeout's pid, started here. TERM goes to it (timeout passes it on); a server
-# still up 30 s later gets KILL through its parent's pid and then the parent. Never by name.
+# and a retry; SRV_PID is the timeout's pid, started here. The runner's TERM, INT and HUP stop that
+# process and its group through lease_stop before the runner resumes its own signal handler.
 : "${LCPP_SRV_FIXED:=-np 1 -ctxcp 0 --cache-ram 0}"
 
 lcpp_srv_bin() { echo "${LCPPSRV:-${LCPPBIN%/*}/llama-server}"; }
@@ -301,10 +301,29 @@ lcpp_srv_majflt() { awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat; }
 # lcpp_srv_spawn <bound> <log> [NAME=VALUE...]: the background launch, SRV_PID the timeout's pid. The child
 # appends to <log>; lcpp_srv_start has emptied it first (the self-test's seam).
 lcpp_srv_spawn() {
-  local bound=$1 log=$2
+  local bound=$1 log=$2 s
   shift 2
+  # shellcheck source=tools/gate-bound.sh
+  source "${BASH_SOURCE[0]%/*}/../gate-bound.sh" || return $?
+  SRV_TRAPS=$(trap -p TERM INT HUP)
+  SRV_PID='' SRV_SIGNAL='' SRV_STOPPING=''
+  for s in TERM:143 INT:130 HUP:129; do
+    # shellcheck disable=SC2064 # signal now, server state when the trap runs
+    trap "SRV_SIGNAL=${s%:*}
+      if [ -n \"\$SRV_STOPPING\" ]; then
+        trap '' TERM INT HUP
+      elif [ -n \"\$SRV_PID\" ]; then
+        lcpp_srv_stop
+        return ${s#*:}
+      fi" "${s%:*}"
+  done
   timeout --kill-after=10 "$bound" env "$@" "${SRV_CMD[@]}" >> "$log" 2>&1 &
   SRV_PID=$!
+  if [ -n "$SRV_SIGNAL" ]; then
+    case $SRV_SIGNAL in TERM) s=143 ;; INT) s=130 ;; HUP) s=129 ;; esac
+    lcpp_srv_stop
+    return "$s"
+  fi
 }
 
 lcpp_srv_start() {
@@ -314,7 +333,7 @@ lcpp_srv_start() {
   # The log is the parent's to empty, before the fork: the child's own truncation would run after the fork,
   # and the read loop below could meet the previous run's bytes at the same path.
   : > "$log"
-  lcpp_srv_spawn "$bound" "$log" "$@"
+  lcpp_srv_spawn "$bound" "$log" "$@" || { SRV_RC=$?; SRV_WHY="llama-server launch failed ($SRV_RC)"; return 1; }
   for ((k = 0; k < 2 * bound; k++)); do
     [ -n "$SRV_PORT" ] || SRV_PORT=$(sed -n 's|.*listening on http://127\.0\.0\.1:\([0-9][0-9]*\)$|\1|p' "$log" | head -n 1)
     if [ "$SRV_PORT" = 0 ]; then
@@ -344,19 +363,28 @@ lcpp_srv_start() {
 }
 
 lcpp_srv_request() {
-  local ids=$1 np=$2 bound=$3 body resp code rc=0 t
+  local ids=$1 np=$2 bound=$3 body resp status code rc=0 t
   SRV_WHY='' SRV_PROMPT_N='' SRV_PROMPT_MS='' SRV_PROMPT_TPS='' SRV_PRED_N='' SRV_PRED_MS='' SRV_PRED_TPS=''
   SRV_CACHE_N='' SRV_TOKENS='' SRV_DRAFT_N='' SRV_DRAFT_ACC=''
   body=$(mktemp "${TMPDIR:-/tmp}/lcpp-warm-body.XXXXXX") || return 2
   resp=$(mktemp "${TMPDIR:-/tmp}/lcpp-warm-resp.XXXXXX") || { rm -f "$body"; return 2; }
+  status=$(mktemp "${TMPDIR:-/tmp}/lcpp-warm-status.XXXXXX") || { rm -f "$body" "$resp"; return 2; }
   python3 -c '
 import json, sys
 ids = [int(t) for t in sys.stdin.read().split(",") if t.strip()]
 print(json.dumps({"prompt": ids, "n_predict": int(sys.argv[1]), "temperature": 0, "top_k": 1,
                   "ignore_eos": True, "cache_prompt": False, "return_tokens": True, "stream": False}))' "$np" <<< "$ids" > "$body"
   SRV_F0=$(lcpp_srv_majflt)
-  code=$(curl -sS --max-time "$bound" -o "$resp" -w '%{http_code}' -H 'Content-Type: application/json' \
-    --data-binary @"$body" "http://127.0.0.1:$SRV_PORT/completion" 2>&1) || rc=$?
+  # A command substitution would defer the runner's signal trap until the request ended.
+  run_bounded timeout --kill-after=10 "$bound" curl -sS -o "$resp" -w '%{http_code}' -H 'Content-Type: application/json' \
+    --data-binary @"$body" "http://127.0.0.1:$SRV_PORT/completion" > "$status" 2>&1 || rc=$?
+  code=$(< "$status")
+  rm -f "$status"
+  if [ -n "$BIN_SIGNAL" ]; then
+    rm -f "$body" "$resp"
+    kill -s "$BIN_SIGNAL" $$
+    return "$rc"
+  fi
   SRV_F1=$(lcpp_srv_majflt)
   if [ "$rc" != 0 ] || [ "$code" != 200 ]; then
     SRV_WHY="POST /completion: curl rc $rc, HTTP ${code:0:200}: $(head -c 300 "$resp" 2> /dev/null)"
@@ -408,18 +436,21 @@ lcpp_srv_same() {
 }
 
 lcpp_srv_stop() {
-  local k
+  local cleanup_rc=0
   [ -n "${SRV_PID:-}" ] || return 0
-  kill "$SRV_PID" 2> /dev/null
-  for ((k = 0; k < 150; k++)); do kill -0 "$SRV_PID" 2> /dev/null || break; sleep 0.2; done
-  if kill -0 "$SRV_PID" 2> /dev/null; then
-    echo "[server] still up 30 s after TERM; KILL to the children of $SRV_PID, then $SRV_PID" >&2
-    pkill -KILL -P "$SRV_PID"
-    kill -KILL "$SRV_PID" 2> /dev/null
-  fi
-  wait "$SRV_PID" 2> /dev/null
-  SRV_EXIT=$?
+  SRV_STOPPING=1
+  [ -z "$SRV_SIGNAL" ] || trap '' TERM INT HUP
+  lease_stop "$SRV_PID" || cleanup_rc=$?
+  SRV_EXIT=0
+  wait "$SRV_PID" || true
+  wait "$SRV_PID" || SRV_EXIT=$?
+  [ "$cleanup_rc" = 0 ] || SRV_EXIT=$cleanup_rc
   SRV_PID=''
+  trap - TERM INT HUP
+  eval "$SRV_TRAPS"
+  [ "$cleanup_rc" = 0 ] || exit "$cleanup_rc"
+  [ -z "$SRV_SIGNAL" ] || kill -s "$SRV_SIGNAL" $$
+  return 0
 }
 
 lcpp_srv_build() { sed -n 's/^build: //p' "$1" | head -n 1; }
@@ -742,7 +773,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check() {
     if [ "$2" = "$3" ]; then echo "ok $1"; else echo "FAIL $1: got [$2], want [$3]"; fails=$((fails + 1)); fi
   }
-  command -v timeout > /dev/null || timeout() { shift 2; exec "$@"; }
   # shellcheck source=tools/ref/lcpp-fit.sh
   source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh"
   lcpp_srv_flags '-ngl 999 --n-cpu-moe 33 -fa on -t 32 -nopo 1'
@@ -817,6 +847,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check bin "$(lcpp_srv_bin)" /t/build/bin/llama-server
   check bin-own "$(LCPPSRV=/s/llama-server lcpp_srv_bin)" /s/llama-server
   t=$(mktemp -d "${TMPDIR:-/tmp}/lcpp-warm-self-test.XXXXXX")
+  warm_tree=$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)
+  mkdir "$t/bin"
+  command -v timeout > /dev/null || cp "$warm_tree/tools/ref/stub-timeout.py" "$t/bin/timeout"
+  command -v flock > /dev/null || cp "$warm_tree/tools/ref/card-tests/bin/flock" "$t/bin/flock"
+  PATH=$t/bin:$PATH
   # Every stub server this self-test starts is kept by the pid lcpp_srv_spawn captured (never found by
   # pattern), in STUB_PIDS until lcpp_srv_stop has stopped it, and in $t/stubs.pid for the leftover check.
   # The EXIT trap stops each kept one that is still a running job of this shell (so a pid the system
@@ -862,8 +897,14 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   # STUB_SRV_EXIT exits 5 before it listens after an allocation failure line, STUB_SRV_PORT0 logs port 0.
   cat > "$t/llama-server" << 'EOF'
 #!/usr/bin/env python3
-import http.server, json, os, signal, sys
+import http.server, json, os, signal, sys, time
 signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))  # llama-server's own handler: a clean exit
+if os.environ.get("STUB_SRV_HOLD"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(os.environ["STUB_SRV_PIDFILE"], "w") as f:
+        f.write(f"{os.getpid()} {os.getppid()}\n")
+    if os.environ["STUB_SRV_HOLD"] == "load":
+        while True: time.sleep(1)
 if "--help" in sys.argv:
     for f in ("-m", "-ngl", "-fa", "-t", "-fit", "-np", "-ctxcp", "--cache-ram", "-c", "--host", "--port", "--no-op-offload"):
         print(f"{f}, --x   stub")
@@ -883,6 +924,10 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.reply(200 if self.path == "/health" else 404, {"status": "ok"})
     def do_POST(self):
+        if os.environ.get("STUB_SRV_HOLD") == "request":
+            with open(os.environ["STUB_SRV_PIDFILE"] + ".request", "w") as f:
+                f.write("ready\n")
+            while True: time.sleep(1)
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         n, p = len(req["prompt"]), req["n_predict"]
         if os.environ.get("STUB_SRV_BADN"): p -= 1
@@ -906,6 +951,7 @@ EOF
   check probe-missing "$r|${SRV_WHY#"$t/llama-server "}" "1|--help lists no -lzm"
   lcpp_srv_cmd "$t/llama-server" /m.gguf 256 -ngl 99 -fit off
   lcpp_srv_majflt() { echo 7; }
+  saved_traps=$(trap -p TERM INT HUP)
   if lcpp_srv_start 20 "$t/log"; then
     lcpp_srv_ctx_check "$t/log" 256 && r=0 || r=1
     check nctx "$r|$(lcpp_srv_nctx "$t/log")" "0|256"
@@ -920,6 +966,7 @@ EOF
     stopped_pid=$SRV_PID
     lcpp_srv_stop
     check stopped "$(kill -0 "$stopped_pid" 2> /dev/null && echo up || echo down)" down
+    check stopped-traps "$(trap -p TERM INT HUP)" "$saved_traps"
     check stopped-dropped "$(printf ' %s ' "${STUB_PIDS[@]}" | grep -c " $stopped_pid ")" 0
   else
     check start "$SRV_WHY" ""
@@ -1006,6 +1053,84 @@ EOF
   check xc-drop "$(printf 'lcppsrv+k34@prose|512|1|9\nlcppsrv+k34@prose|4096|1|9\nlcppsrv+t16@prose|512|3|9\nlcppsrv|512|1|9\n' | xc_drop | paste -sd';' -)" "lcppsrv+k34@prose|4096|1|9;lcppsrv+t16@prose|512|3|9"
   XC_SRV=()
   check xc-none "$(xc_table)" ""
+  # Cancellation owns the server before its PID is assigned, during load and during a request.
+  # The server ignores TERM, so the shared stop must escalate and release its inherited lease.
+  source "$warm_tree/tools/gate-bound.sh"
+  source "$warm_tree/tools/ref/lease-probe.sh"
+  source "$warm_tree/tools/ref/cancel-stubs.sh"
+  mkdir -p "$t/tree/tools/ref"
+  cp "$warm_tree/tools/gate-bound.sh" "$t/tree/tools/"
+  awk '
+    $0 == "  SRV_PID=$!" {
+      print "  echo gap > \"$START_READY\""
+      print "  while [ ! -e \"$START_RELEASE\" ]; do sleep 0.01 9>&-; done"
+    }
+    { print }
+  ' "$warm_tree/tools/ref/lcpp-warm.sh" > "$t/tree/tools/ref/lcpp-warm.sh"
+  for phase in startup load request; do
+    for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
+      tag=$phase${trp:+-trap}
+      mkdir "$t/$tag"
+      owner=$warm_tree/tools/ref/lcpp-warm.sh hold=$phase
+      [ "$phase" != startup ] || { owner=$t/tree/tools/ref/lcpp-warm.sh; hold=load; }
+      START_READY=$t/$tag.gap START_RELEASE=$t/$tag.go "$BASH" -c '
+        source "$1"; exec 9> "$2"; flock -n 9 || exit $?
+        eval "$3"
+        SRV_CMD=("$4")
+        lcpp_srv_start 40 "$5/log" STUB_SRV_HOLD="$6" STUB_SRV_PIDFILE="$5/pid" || exit $?
+        lcpp_srv_request 1,2,3 4 40
+        lcpp_srv_stop
+        echo next arm
+      ' _ "$owner" "$t/$tag.lease" "$trp" "$t/llama-server" "$t/$tag" "$hold" > "$t/$tag.out" 2>&1 &
+      rp=$!
+      ready=no
+      for ((i = 0; i < 100; i++)); do
+        if cancel_ready "$t/$tag/pid" &&
+          { [ "$phase" != startup ] || [ -s "$t/$tag.gap" ]; } &&
+          { [ "$phase" != request ] || [ -s "$t/$tag/pid.request" ]; }; then ready=yes; break; fi
+        sleep 0.1
+      done
+      check cancel-$tag-ready "$ready" yes
+      lk=free
+      lease_free "$t/$tag.lease" 2> /dev/null || lk=held
+      check cancel-$tag-lease-before "$lk" held
+      s0=$SECONDS
+      kill -TERM "$rp" 2> /dev/null
+      [ "$phase" != startup ] || touch "$t/$tag.go"
+      r=0
+      wait "$rp" || r=$?
+      check cancel-$tag-rc "$r" 143
+      ended=before
+      [ "$((SECONDS - s0))" -lt 30 ] || ended=late
+      check cancel-$tag-bound "$ended" before
+      left=''
+      if read -r sp ip < "$t/$tag/pid"; then
+        for p in "$sp" "$ip"; do
+          state=$(ps -o stat= -p "$p" 2> /dev/null) || state=''
+          case $state in '' | *Z*) ;; *) left="$left $p" ;; esac
+        done
+      else
+        left='missing PIDs'
+      fi
+      check cancel-$tag-children "$left" ''
+      lk=free
+      lease_free "$t/$tag.lease" 2> /dev/null || lk=held
+      check cancel-$tag-lease-after "$lk" free
+      check cancel-$tag-next "$(grep -c '^next arm$' "$t/$tag.out")" 0
+      check cancel-$tag-trap "$(grep -c '^trap ran$' "$t/$tag.out")" "$([ -n "$trp" ] && echo 1 || echo 0)"
+      [ -z "$left" ] || { lease_stop "$ip"; lease_stop "$sp"; }
+    done
+  done
+  r=0
+  (
+    source "$warm_tree/tools/ref/lcpp-warm.sh"
+    lease_stop() { return 70; }
+    SRV_PID=unused SRV_SIGNAL='' SRV_TRAPS=''
+    lcpp_srv_stop
+    echo next arm
+  ) > "$t/cleanup.out" 2>&1 || r=$?
+  check stop-cleanup-rc "$r" 70
+  check stop-cleanup-next "$(grep -c '^next arm$' "$t/cleanup.out")" 0
   # leftover: a subshell under the same guard starts a stub and exits without lcpp_srv_stop, as a failed
   # check or an interrupt would. Then no stub of the whole run may still be up.
   lcpp_srv_cmd "$t/llama-server" /m.gguf 256 -ngl 99 -fit off

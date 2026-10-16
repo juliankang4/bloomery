@@ -71,7 +71,7 @@ while [ $# -gt 0 ]; do
 done
 BOUND=${BLOOMERY_HOST_BOUND:-600}
 for v in "$ROUNDS" "$SECS" "$WARMUP" "$CHUNK" "$RING" "$FILL" "$ALONE_S" "$BOUND" ${THREADS:+"$THREADS"}; do
-  case $v in '' | *[!0-9]* | 0) echo "dma-dram-share.sh: counts, seconds and bytes are positive integers, got '$v'" >&2; exit 64 ;; esac
+  case $v in '' | *[!0-9]* | 0*) echo "dma-dram-share.sh: counts, seconds and bytes are positive integers, got '$v'" >&2; exit 64 ;; esac
 done
 case $COPY_CPUS in '' | [0-9]*) ;; *) echo "dma-dram-share.sh: --copy-cpus is a cpu list like 7,15,23,31" >&2; exit 64 ;; esac
 
@@ -155,13 +155,8 @@ stamp() {
 
 # bench <log>: one bench run, its lines stamped; its rc.
 bench() {
-  local r
-  set +e
-  BLOOMERY_THREADS=$THREADS BLOOMERY_HOST_LEASE=1 lease_bounded "$BOUND" "$BENCH" --time --rounds 1 \
-    --seconds "$SECS" --warmup "$WARMUP" --arms "$ARMS" 2>&1 | stamp > "$1"
-  r=${PIPESTATUS[0]}
-  set -e
-  return "$r"
+  BLOOMERY_THREADS=$THREADS BLOOMERY_HOST_LEASE=1 lease_filter "$BOUND" stdout "$1" stamp -- \
+    "$BENCH" --time --rounds 1 --seconds "$SECS" --warmup "$WARMUP" --arms "$ARMS"
 }
 
 WITNESS=(head loadavg pressure-cpu pressure-io card gpus gpu-apps busiest lock-holder cpu-freq meminfo model)
