@@ -97,7 +97,8 @@ mod gate {
         Experts, PlaceError, PlanInputs, machine_bp_on, tier_batch,
     };
     use model::placement::devices::spec_of_device;
-    use model::placement::workstation::CardSpec;
+    use model::placement::nodes::{NodeBudget, NodesError, Terms};
+    use model::placement::workstation::{self, CardSpec};
     use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 
     use crate::q38_history::{self, PROMPT, Run, same, tier_graphs_and_chains, tier_layers};
@@ -535,6 +536,13 @@ mod gate {
         Ok((*spec, free))
     }
 
+    fn census_specs(addr: SocketAddr) -> Result<(CardSpec, CardSpec, u64), GateError> {
+        let (spec, free) = node_card(addr)?;
+        let own = bloomery_gpu::census()?;
+        let stage = spec_of_device(own.first().ok_or("this process sees no card")?);
+        Ok((stage, spec, free))
+    }
+
     /// The census clause: node 1's census over the channel, and the plan of
     /// its card; the plan and its budget.
     fn census_plan<'a>(
@@ -542,14 +550,61 @@ mod gate {
         machine: &'a mut Option<Machine>,
         addr: SocketAddr,
     ) -> Result<(Plan<'a>, u64, bool), GateError> {
-        let (spec, free) = node_card(addr)?;
+        let (stage, spec, free) = census_specs(addr)?;
+        let machines = workstation::plan_node_tiers(
+            c.inputs.model.layers,
+            stage,
+            &[spec],
+            tier_batch(&c.inputs.hp, c.ub as u64),
+        )?;
+        if machines.len() != 2 {
+            return Err("the census plan omitted a node".into());
+        }
+        let stage_plan = c.inputs.plan_with(
+            &machines[0],
+            CTX as u64,
+            &PlanLevers::default(),
+            Experts::Card,
+        )?;
+        let terms = Terms::of(&stage_plan, c.inputs.hp.n_embd as u64);
+        let mut budgets = vec![NodeBudget::of(&stage_plan)];
+        for remote in &machines[1..] {
+            budgets.push(NodeBudget::routed(
+                &c.inputs.model,
+                remote,
+                model::placement::accepts::routed_rule(model::arch::qwen35moe::place::PROGRAM),
+            ));
+        }
+        let mut independent = match (machines[0].unified(), &terms) {
+            (Some(_), Ok(terms)) => terms.experts == c.inputs.model.experts,
+            (None, Err(NodesError::NotUnified(0))) => true,
+            (_, Err(e)) => return Err(format!("the census terms: {e}").into()),
+            (None, Ok(_)) => return Err("a discrete node acquired unified terms".into()),
+        };
+        for ((m, budget), spec) in machines.iter().zip(&budgets).zip([stage, spec]) {
+            independent &= m.nodes.len() == 1
+                && m.tiers.is_empty()
+                && m.cards[0].device == spec.device
+                && m.cards[0].free_bytes == spec.free_bytes
+                && m.unified() == workstation::unified_of(&spec);
+            match (m.unified(), budget) {
+                (Some(_), Ok(budget)) => independent &= budget.node() == &m.nodes[0],
+                (None, Err(NodesError::NotUnified(0))) => {}
+                (_, Err(e)) => return Err(format!("the census budget: {e}").into()),
+                (None, Ok(_)) => return Err("a discrete node acquired a unified budget".into()),
+            }
+        }
+        println!(
+            "census: independent node budgets {budgets:?}, terms {terms:?}: {}",
+            verdict(independent)
+        );
         let m = machine.insert(c.machine(spec)?);
         let m: &'a Machine = m;
         let tier = m
             .tiers
             .first()
             .ok_or("plan (b′)'s machine holds no tier card")?;
-        let mut ok = tier.free_bytes == Some(free);
+        let mut ok = independent && tier.free_bytes == Some(free);
         println!(
             "census: the plan's tier card {:?} takes the free bytes node 1 sent ({:?} = {free} B): \
              {}",
@@ -1347,11 +1402,22 @@ mod gate {
     #[cfg(test)]
     mod tests {
         use super::{
-            Command, Duration, Instant, NAME, PlaceError, PlacementError, Proc, plan_refusal,
-            remove_open_copy, remove_run,
+            Command, Duration, Instant, NAME, PlaceError, PlacementError, Proc, census_specs,
+            plan_refusal, remove_open_copy, remove_run,
         };
         use bloomery_gpu::GpuError;
         use bloomery_gpu_gates::GateError;
+
+        #[test]
+        fn census_clause_requires_the_remote_census() {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an address");
+            let addr = listener.local_addr().expect("the address");
+            drop(listener);
+            assert!(
+                census_specs(addr).is_err(),
+                "no local census replaces the remote"
+            );
+        }
 
         #[test]
         fn children_die_with_the_gate_parent() -> Result<(), GateError> {

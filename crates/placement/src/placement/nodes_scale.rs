@@ -18,8 +18,8 @@ use super::workstation::{
     GB10_NIC, GB10_POOL, GB10_READ, TierBatchBytes, gb10, plan_node_tiers, plan_on, spark_nodes,
 };
 use super::{
-    Device, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers,
-    PoolNeed, Role, Violation, plan_routed, plan_with, row_table_tier,
+    CardFormat, Device, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan,
+    PlanLevers, PoolNeed, Role, RoutedRule, Violation, plan_routed, plan_with, row_table_tier,
 };
 use crate::accepts::{Program, routed_rule};
 
@@ -234,20 +234,23 @@ fn spark(free: u64, layers: usize) -> Machine {
     plan_on(gb10(free), layers)
 }
 
+fn budget_on(model: &ModelTensors, machine: &Machine, node: usize) -> NodeBudget {
+    if node == 0 {
+        NodeBudget::of(&today(model, machine, true))
+    } else {
+        NodeBudget::routed(model, machine, RoutedRule::PerType(CardFormat::of_routed))
+    }
+    .expect("a budget")
+}
+
 /// `model`'s node budgets: node 0's on `machines[0]`, each other node's of
 /// its routed stacks on its own machine; the nodes of `nodes` take the
 /// machines' nodes.
 fn budgets_on(model: &ModelTensors, nodes: &mut Nodes, machines: &[Machine]) -> Vec<NodeBudget> {
-    let remote = routed_only(model);
     let mut budgets = Vec::new();
     for (j, m) in machines.iter().enumerate() {
         nodes.machine.nodes[j] = m.nodes[0].clone();
-        let plan = if j == 0 {
-            today(model, m, true)
-        } else {
-            today(&remote, m, false)
-        };
-        budgets.push(NodeBudget::of(&plan).expect("a budget"));
+        budgets.push(budget_on(model, m, j));
     }
     budgets
 }
@@ -255,6 +258,58 @@ fn budgets_on(model: &ModelTensors, nodes: &mut Nodes, machines: &[Machine]) -> 
 /// The terms of `model` on `machine` as node 0's plan reads them.
 fn terms_of(model: &ModelTensors, machine: &Machine, n_embd: u64) -> Terms {
     Terms::of(&today(model, machine, true), n_embd).expect("the terms")
+}
+
+#[test]
+fn census_budgets_keep_each_node_and_stage_terms() {
+    let model = QWEN38.model(false);
+    let mut specs = [
+        gb10(80_000_000_000),
+        gb10(60_000_000_000),
+        gb10(90_000_000_000),
+    ];
+    for (j, spec) in specs.iter_mut().enumerate() {
+        spec.device.as_mut().expect("a census identity").uuid = [j as u8; 16];
+    }
+    let machines = plan_node_tiers(
+        model.layers,
+        specs[0],
+        &specs[1..],
+        TierBatchBytes {
+            staging: 123,
+            scratch: 456,
+            host: 789,
+        },
+    )
+    .expect("three independent nodes");
+    assert_eq!(machines.len(), specs.len(), "no remote omitted");
+    let remote = routed_only(&model);
+    let mut budgets = Vec::new();
+    for (j, (machine, spec)) in machines.iter().zip(specs).enumerate() {
+        assert_eq!(machine.nodes.len(), 1);
+        assert!(machine.tiers.is_empty());
+        assert_eq!(machine.cards[0].device, spec.device);
+        assert_eq!(machine.cards[0].free_bytes, spec.free_bytes);
+        assert_eq!(machine.unified(), super::workstation::unified_of(&spec));
+        let oracle = if j == 0 {
+            today(&model, machine, true)
+        } else {
+            today(&remote, machine, false)
+        };
+        let budget = budget_on(&model, machine, j);
+        assert_eq!(budget, NodeBudget::of(&oracle).expect("the oracle"));
+        assert_eq!(budget.pool(), oracle.pool_need().expect("one pool").pool);
+        assert_eq!(budget.node(), &machine.nodes[0]);
+        budgets.push(budget);
+    }
+    assert_ne!(budgets[0].pool(), budgets[1].pool());
+    assert_ne!(budgets[1].pool(), budgets[2].pool());
+    assert!(budgets[0].fixed() > budgets[1].fixed());
+    let stage = today(&model, &machines[0], true);
+    let terms = Terms::of(&stage, QWEN38.n_embd).expect("stage terms");
+    assert_eq!(terms.n_embd, QWEN38.n_embd);
+    assert_eq!(terms.layers.len(), QWEN38.layers);
+    assert!(terms.serial > 0, "the full model supplies the serial bytes");
 }
 
 /// A shape's terms and its budgets: node 0's, a remote GB10's.
@@ -285,14 +340,15 @@ fn cases() -> &'static [Case] {
             .expect("two nodes with no batch bytes");
             for high in [false, true] {
                 let model = shape.model(high);
-                let remote = routed_only(&model);
                 let plan = today(&model, &machines[0], true);
-                let budget = |p: &Plan<'_>| NodeBudget::of(p).expect("a budget");
                 cases.push(Case {
                     shape,
                     high,
                     terms: Terms::of(&plan, shape.n_embd).expect("the terms"),
-                    budgets: [budget(&plan), budget(&today(&remote, &machines[1], false))],
+                    budgets: [
+                        budget_on(&model, &machines[0], 0),
+                        budget_on(&model, &machines[1], 1),
+                    ],
                 });
             }
         }
@@ -393,25 +449,16 @@ fn tiny(experts: u64, used: u64, bytes: u64) -> ModelTensors {
 /// pool's own budget is smaller.
 fn with_room(model: &ModelTensors, id: u64, rooms: &[u64]) -> Vec<Machine> {
     let wide = spark(GB10_POOL, 1);
-    let remote = routed_only(model);
     let machines: Vec<Machine> = rooms
         .iter()
         .enumerate()
         .map(|(j, &room)| {
-            let (model, kv) = if j == 0 {
-                (model, true)
-            } else {
-                (&remote, false)
-            };
-            let fixed = NodeBudget::of(&today(model, &wide, kv))
-                .expect("a budget")
-                .fixed();
+            let fixed = budget_on(model, &wide, j).fixed();
             spark(fixed + room * id + id / 2, 1)
         })
         .collect();
     for (j, (m, &room)) in machines.iter().zip(rooms).enumerate() {
-        let model = if j == 0 { model } else { &remote };
-        let b = NodeBudget::of(&today(model, m, j == 0)).expect("a budget");
+        let b = budget_on(model, m, j);
         assert_eq!((b.pool() - b.fixed()) / id, room, "node {j}");
     }
     machines
@@ -1675,7 +1722,7 @@ fn never_slower() {
 #[test]
 fn fills_balance() {
     let case = &cases()[0];
-    let remote = routed_only(&V41.model(false));
+    let model = V41.model(false);
     let w = Workload {
         fills: Some(Fills {
             hit_permille: 750,
@@ -1689,7 +1736,7 @@ fn fills_balance() {
         for (j, free) in [1, 2].into_iter().zip(pools) {
             let machine = spark(free, V41.layers);
             nodes.machine.nodes[j] = machine.nodes[0].clone();
-            budgets[j] = NodeBudget::of(&today(&remote, &machine, false)).expect("a budget");
+            budgets[j] = budget_on(&model, &machine, j);
         }
         let plan = case
             .plan(&nodes, &budgets, w)

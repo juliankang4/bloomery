@@ -724,6 +724,8 @@ impl Place {
         let mut tier_specs = [stage; MAX_TIERS];
         tier_specs[..tiers.len()].copy_from_slice(tiers);
         let k = tiers.len();
+        // Tier-node addresses are loopback-only and share this host's pool when unified.
+        // `workstation::plan_node_tiers` alone creates separate pools.
         Ok(move |layers| match batch {
             None => workstation::plan_on(stage, layers),
             Some(b) => workstation::plan_tiers(layers, stage, &tier_specs[..k], draft, b)
@@ -1905,6 +1907,107 @@ mod tests {
         assert_eq!(bp.cards(), vec!["3090", "3090"]);
         let m = bp.machine(None, Some(BATCH)).expect("stage + tier")(43);
         assert_eq!(m.tiers[0].device.map(|d| d.ordinal), Some(1));
+    }
+
+    #[test]
+    fn loopback_census_is_required_without_adding_a_pool() {
+        use bloomery_gpu::host::node::wire::{Out, Tag};
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let mut own = census(&["NVIDIA GB10"]);
+        own[0].integrated = true;
+        own[0].free_bytes = 90 << 30;
+        own[0].total_bytes = 128 << 30;
+        let mut remote = own[0].clone();
+        remote.uuid = [7; 16];
+        remote.free_bytes = 60 << 30;
+        let remote_spec = workstation::spec_of_device(&remote);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an address");
+        let addr = listener.local_addr().expect("the address");
+        drop(listener);
+        assert!(
+            Place::parse("0+1")
+                .expect("a place")
+                .on_nodes(&own, &[addr])
+                .is_err()
+        );
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a census server");
+        let addr = listener.local_addr().expect("the server address");
+        listener.set_nonblocking(true).expect("bounded accept");
+        let (served, exchange) = std::sync::mpsc::channel();
+        let (server, _) = threads::helper::spawn_helper(
+            "census-fixture",
+            threads::helper::Placement::Float,
+            move || {
+                let _ = served.send((|| -> std::io::Result<()> {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                if Instant::now() >= deadline {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "no remote census requested",
+                                    ));
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    };
+                    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                    let mut payload = Out::default();
+                    bloomery_gpu::host::node::NodeCensus {
+                        devices: vec![remote],
+                    }
+                    .write(&mut payload);
+                    stream.write_all(
+                        &u32::try_from(1 + payload.done().len())
+                            .expect("a frame")
+                            .to_le_bytes(),
+                    )?;
+                    stream.write_all(&[Tag::Census as u8])?;
+                    stream.write_all(payload.done())?;
+                    let mut close = [0; 5];
+                    stream.read_exact(&mut close)?;
+                    assert_eq!(close, [1, 0, 0, 0, Tag::Close as u8]);
+                    stream.write_all(&[1, 0, 0, 0, Tag::Ok as u8])
+                })());
+            },
+        )
+        .expect("a census server thread");
+        let place = Place::parse("0+1")
+            .expect("a place")
+            .on_nodes(&own, &[addr]);
+        server.join().expect("the census server");
+        exchange
+            .recv()
+            .expect("the census server")
+            .expect("the census exchange");
+        let place = place.expect("resolved against the remote census");
+        let specs = place.card_specs().expect("the census specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0], workstation::spec_of_device(&own[0]));
+        assert_eq!(specs[1], remote_spec);
+        let machine = place.machine(None, Some(BATCH)).expect("loopback tiers")(3);
+        assert_eq!(machine.nodes.len(), 1, "loopback shares this host's pool");
+        assert_eq!(
+            machine.unified(),
+            workstation::unified_of(&workstation::spec_of_device(&own[0]))
+        );
+        assert_eq!(machine.tiers[0].device, remote_spec.device);
+        assert_eq!(machine.tiers[0].free_bytes, remote_spec.free_bytes);
+        let single = Place::parse("0")
+            .expect("a place")
+            .on(&own)
+            .expect("resolved");
+        assert_eq!(
+            single.machine(None, None).expect("one node")(3).nodes.len(),
+            1
+        );
     }
 
     /// The unset rule ([`Place::choose`]) at a GLM-like [`TierRule`]: one

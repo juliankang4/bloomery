@@ -490,8 +490,7 @@ pub fn plan_tiers(
 /// head stage; a remote's routed-only model has no head tensors to place there.
 /// A host-row sum past u64 is refused, as in [`check_tiers`]. With no remote
 /// it is [`plan_on`].
-#[cfg(test)]
-pub(crate) fn plan_node_tiers(
+pub fn plan_node_tiers(
     layers: usize,
     stage: CardSpec,
     remotes: &[CardSpec],

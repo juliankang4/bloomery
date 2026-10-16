@@ -400,6 +400,14 @@ pub trait KvBytes {
     }
 }
 
+struct NoKv;
+
+impl KvBytes for NoKv {
+    fn layer_bytes(&self, _layer: usize, _ctx_max: u64) -> u64 {
+        0
+    }
+}
+
 /// Where a segment lives.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Device {
@@ -4440,14 +4448,6 @@ mod tests {
             layers,
             experts: 8,
             experts_used: 2,
-        }
-    }
-
-    struct NoKv;
-
-    impl KvBytes for NoKv {
-        fn layer_bytes(&self, _layer: usize, _ctx_max: u64) -> u64 {
-            0
         }
     }
 

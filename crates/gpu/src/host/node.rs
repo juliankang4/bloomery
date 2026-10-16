@@ -100,7 +100,8 @@ impl NodeCensus {
         })
     }
 
-    fn write(&self, o: &mut Out) {
+    /// Append this census to the node protocol payload.
+    pub fn write(&self, o: &mut Out) {
         o.u32(wire::VERSION).len(self.devices.len());
         for d in &self.devices {
             o.u32(d.ordinal)

@@ -33,8 +33,8 @@ use std::cmp::Ordering;
 use std::ops::RangeInclusive;
 
 use super::{
-    Device, Format, Machine, ModelTensor, ModelTensors, Node, PlacementError, Plan, PoolNeed, Role,
-    Row, card_bytes, per_expert, row_bytes,
+    Device, Format, Machine, ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers,
+    PoolNeed, Role, RoutedRule, Row, card_bytes, per_expert, plan_routed, row_bytes,
 };
 
 /// The posts node 0's pump makes to reach a further remote node: each costs
@@ -192,6 +192,12 @@ pub struct NodeBudget {
 }
 
 impl NodeBudget {
+    /// The node whose card plan supplied this budget.
+    #[must_use]
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
     /// The plan's pool need less the routed ids it holds in the pool.
     #[must_use]
     pub fn fixed(&self) -> u64 {
@@ -202,6 +208,26 @@ impl NodeBudget {
     #[must_use]
     pub fn pool(&self) -> u64 {
         self.pool
+    }
+
+    /// The budget of `model`'s routed stacks on one remote machine, with no
+    /// cache or caller-given card budget. The remote keeps its own free reading
+    /// and service reserves; no host-room term is read from the stage node.
+    pub fn routed(
+        model: &ModelTensors,
+        machine: &Machine,
+        routed: RoutedRule,
+    ) -> Result<NodeBudget, NodesError> {
+        let model = routed_only(model);
+        let plan = plan_routed(
+            &model,
+            machine,
+            0,
+            &super::NoKv,
+            &PlanLevers::default(),
+            routed,
+        )?;
+        Self::of(&plan)
     }
 
     /// The budget `plan` gives its one node: node 0's from the plan of the
@@ -655,7 +681,7 @@ fn checked_id_bytes(
         return Err(NodesError::NotUnified(i));
     }
     if let Some(j) = (0..budgets.len().max(n))
-        .find(|&j| budgets.get(j).map(|b| &b.node) != nodes.machine.nodes.get(j))
+        .find(|&j| budgets.get(j).map(NodeBudget::node) != nodes.machine.nodes.get(j))
     {
         return Err(NodesError::Budget(j));
     }

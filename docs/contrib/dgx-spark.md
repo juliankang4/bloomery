@@ -39,7 +39,7 @@ budget solver.
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
 | **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6) | nothing |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8) | the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
-| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words. Node 1's tier server, the load's plan from node 1's census, and both ends of a lost node run as two processes on one Spark over the loopback interface (9.5, items 5 and 6) | the placement half's engine side: the load's use of `workstation::plan_node_tiers` for each node's card plan, the router's counts in the split, and decode at n = N (contributor, answer 20; section 10); the protocol half, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828) (contributor): the `Link` seam, the counter relay (section 9.5, item 2) and the RDMA link on one machine (items 1, 3, 4 and 7) are in; a tier node off this host (the lever takes loopback addresses only, and the channel has no authentication) and the N = 2 run are left |
+| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words. Node 1's tier server, the load's plan from node 1's census, and both ends of a lost node run as two processes on one Spark over the loopback interface (9.5, items 5 and 6) | the placement half's engine side (contributor, answer 20): section 10 lists what is left; the protocol half, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828) (contributor): the `Link` seam, the counter relay (section 9.5, item 2) and the RDMA link on one machine (items 1, 3, 4 and 7) are in; a tier node off this host (the lever takes loopback addresses only, and the channel has no authentication) and the N = 2 run are left |
 
 Files the open work touches: P1, the unpublished V4.1 DSpark draft fixture; P4, the card's gather kernels that read the arena in
 `crates/gpu/src/host/nvtier.rs` (the card leg); P5, `crates/placement` (`Machine`, `nodes_scale`),
@@ -574,11 +574,14 @@ pub struct Link { pub rail: u64 /* bytes/s, one message */, pub round_trip_ns: u
 - `CardOver` stays per card. The node plans hold `PoolOver` once per node: each node's budget is the card plan of that
   node alone, and its routed ids are the node plan's split (9.9). `HostNeed` gains no field and is evaluated per node.
   `workstation::plan_node_tiers` builds those separate card machines from the stage and remote census specs, node 0
-  first; until the engine load calls it, it is crate-internal and only `nodes_scale` and the unit tests use it. Node 0 plans the full model; each remote plans `routed_only` with zero KV. Each machine has one head stage,
-  but a remote's routed-only model has no head tensors. The batch's returned rows are reserved on node 0's host once
-  per remote, and its staging and scratch on each remote card.
+  first. The node gate's census clause builds them from the census and derives node 0's `NodeBudget` and `Terms`
+  from its full-model plan. `NodeBudget::routed` derives each remote's budget from `routed_only` with zero KV.
+  Each machine has one head stage, but a remote's routed-only model has no head tensors. The batch's returned rows
+  are reserved on node 0's host once per remote, and its staging and scratch on each remote card.
   Each integrated spec keeps its own free reading as its own pool. The `nodes_scale` fixtures
-  use this entry point; the engine load still uses the single-node `plan_tiers` path.
+  use this entry point. The engine load still uses the single-node `plan_tiers` path: tier-node addresses are
+  loopback-only and share this host's physical pool, not extra independent capacity. On one Spark, the loopback
+  clause checks the plan inputs but cannot prove the remote census's origin.
 - **Node 1's figures come from a remote census.** The census reads only this process's CUDA devices. Node 1's census row
   reaches node 0 over the control channel before `plan_tiers` runs, and node 0 makes node 1's `CardSpec` from it (9.5
   item 5). Node 1's `MemAvailable` reading must reach node 0 the same way once a plan term reads it.
@@ -1198,9 +1201,11 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   with the N − 1 plan on the same link, which the planner can choose, not on the N − 1 plan's own fabric.
 - The placement half's engine side: the contributor (answer 20). A remote node's census reaches node 0 over the
   control channel before the plan, and the load plans with node 1's card from it (9.5 item 5); a tier node is on this
-  host only (loopback addresses, no authentication). Left: node 1's host room in the census with the plan term that
-  reads it, the engine load's use of `workstation::plan_node_tiers` (9.2) to build the card plans node 0's and each
-  remote's budget come from, the router's counts in the split (9.2), and decode at n = N in the predictor (9.8).
+  host only (loopback addresses, no authentication). The node gate constructs independent census-backed machines
+  and their `NodeBudget` and `Terms` inputs (9.2); the loopback load retains one physical pool. Left: remote load
+  selection and the adapter from routed assignment to loaded rows, node 1's host room in the census with the plan
+  term that reads it, the router's counts in the split (9.2), and decode at n = N in the predictor (9.8). The node
+  plans' card terms use the generic workstation card constants, not the program's `machine_for_experts` constants.
 - GLM's hit rates are assumptions; V4.1's come from a replay (9.7).
 - S₁ has a first reading on one Spark (9.7), at `v0.3.0` serving defaults with the MTP draft on.
 - The switch hop: no switched Spark was measured (9.6).
