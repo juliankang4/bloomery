@@ -177,10 +177,16 @@ fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
     }
 }
 
-/// `spec` as an expert tier card: no stage, this machine's context, scratch
-/// and margin.
-fn tier(spec: CardSpec) -> Card {
-    card(spec, 0..0, false)
+/// `spec` as an expert tier card with no stage or head: the context,
+/// scratch, margin, batch service and optional draft resident bytes.
+#[must_use]
+pub fn tier_card(spec: CardSpec, draft_bytes: Option<u64>, batch: TierBatchBytes) -> Card {
+    let mut tier = card(spec, 0..0, false);
+    tier.reserves
+        .extend(draft_bytes.map(|bytes| (DRAFT_RESERVE.to_string(), bytes)));
+    tier.reserves
+        .push((TIER_BATCH_RESERVE.to_string(), batch.card()));
+    tier
 }
 
 /// The host tier with its reserves: the OS's alone. What a plan's own
@@ -474,6 +480,35 @@ pub fn plan_tiers(
     Ok(tiered(layers, stage, tiers, draft, batch, host_rows))
 }
 
+/// One card machine per node, node 0 first: `stage` runs the full model;
+/// each remote spec runs [`super::nodes::routed_only`] with zero KV. Device
+/// names and ordinals are local to each node, so they may repeat across
+/// nodes. Each spec keeps its own free reading and unified pool.
+///
+/// Node 0's host holds the returned batch rows once per remote; each remote
+/// card holds the batch staging and scratch. Each independent machine has one
+/// head stage; a remote's routed-only model has no head tensors to place there.
+/// A host-row sum past u64 is refused, as in [`check_tiers`]. With no remote
+/// it is [`plan_on`].
+#[cfg(test)]
+pub(crate) fn plan_node_tiers(
+    layers: usize,
+    stage: CardSpec,
+    remotes: &[CardSpec],
+    batch: TierBatchBytes,
+) -> Result<Vec<Machine>, PlacementError> {
+    let host_rows = tier_service(remotes.len(), None, batch)?;
+    let mut machines = vec![tiered(layers, stage, &[], None, batch, host_rows)];
+    for &spec in remotes {
+        let mut remote = plan_on(spec, layers);
+        remote.cards[0]
+            .reserves
+            .extend(tier_card(spec, None, batch).reserves);
+        machines.push(remote);
+    }
+    Ok(machines)
+}
+
 /// What [`plan_tiers`] refuses of its cards, before any layer count: a card
 /// listed twice — one device ([`CardSpec::same_device`]), whose usable bytes
 /// the plan would count once a listing — and a draft on a tier past the list. Returns the host's
@@ -502,23 +537,29 @@ pub fn check_tiers(
             });
         }
     }
-    if let Some(d) = draft.filter(|d| d.on >= tiers.len()) {
-        return Err(PlacementError::DraftOffPlan {
-            on: d.on,
-            tiers: tiers.len(),
-        });
+    tier_service(tiers.len(), draft, batch)
+}
+
+/// The draft's tier and the host's batch-row sum for local or remote tiers.
+fn tier_service(
+    tiers: usize,
+    draft: Option<TierDraft>,
+    batch: TierBatchBytes,
+) -> Result<u64, PlacementError> {
+    if let Some(d) = draft.filter(|d| d.on >= tiers) {
+        return Err(PlacementError::DraftOffPlan { on: d.on, tiers });
     }
-    u64::try_from(tiers.len())
+    u64::try_from(tiers)
         .ok()
         .and_then(|k| batch.host.checked_mul(k))
         .ok_or(PlacementError::TierBatchHost {
-            tiers: tiers.len(),
+            tiers,
             bytes: batch.host,
         })
 }
 
-/// [`plan_tiers`]'s machine once [`check_tiers`] passed, `host_rows` its
-/// sum.
+/// The stage machine, its local expert tiers and the returned batch rows
+/// from all local or remote tiers (`host_rows`).
 fn tiered(
     layers: usize,
     stage: CardSpec,
@@ -530,20 +571,10 @@ fn tiered(
     let tiers: Vec<Card> = tiers
         .iter()
         .enumerate()
-        .map(|(i, &spec)| {
-            let mut t = tier(spec);
-            t.reserves.extend(
-                draft
-                    .filter(|d| d.on == i)
-                    .map(|d| (DRAFT_RESERVE.to_string(), d.bytes)),
-            );
-            t.reserves
-                .push((TIER_BATCH_RESERVE.to_string(), batch.card()));
-            t
-        })
+        .map(|(i, &spec)| tier_card(spec, draft.filter(|d| d.on == i).map(|d| d.bytes), batch))
         .collect();
     let mut h = host_of(&stage);
-    if !tiers.is_empty() {
+    if !tiers.is_empty() || host_rows != 0 {
         h.reserves
             .push((TIER_BATCH_HOST_RESERVE.to_string(), host_rows));
     }
@@ -616,11 +647,17 @@ pub(crate) fn gb10(free: u64) -> CardSpec {
 pub(crate) fn spark_nodes(n: usize, layers: usize, fabric: Fabric) -> Nodes {
     assert!(n > 0, "spark_nodes(0): a machine has this process's node");
     let spec = gb10(GB10_POOL);
-    let mut machine = plan_on(spec, layers);
-    machine.nodes.extend((1..n).map(|_| Node {
-        host: host_of(&spec),
-        unified: unified_of(&spec),
-    }));
+    let batch = TierBatchBytes {
+        staging: 0,
+        scratch: 0,
+        host: 0,
+    };
+    let mut machines = plan_node_tiers(layers, spec, &vec![spec; n - 1], batch)
+        .expect("synthetic nodes with no batch bytes");
+    let mut machine = machines.remove(0);
+    machine
+        .nodes
+        .extend(machines.into_iter().map(|m| m.nodes[0].clone()));
     Nodes {
         machine,
         fabric,
@@ -1152,12 +1189,13 @@ pub fn host_room(meminfo: &str, levels: &[CgroupLevel<'_>]) -> Result<(u64, Host
 #[cfg(test)]
 mod tests {
     use super::{
-        A6000, ArenaGrant, CONTEXT, Card, CardSpec, CgroupLevel, DRAFT_RESERVE, DeviceInfo,
-        GRANULE, HOST_DRIFT, Host, HostNeed, HostRead, MARGIN, Machine, Node, PLAN_ROOM,
-        PlacementError, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
-        TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room, cgroup_v2_path, host, host_of,
-        host_room, mem_available, placed_on, plan_a, plan_a_draft, plan_bp, plan_gate, plan_on,
-        plan_room, plan_tiers, spec_of_device, tier, tier_batch_bytes, unified_of,
+        A6000, ArenaGrant, CONTEXT, Card, CardSpec, CgroupLevel, DRAFT_RESERVE, DeviceId,
+        DeviceInfo, GRANULE, HOST_DRIFT, Host, HostNeed, HostRead, MARGIN, Machine, Node,
+        PLAN_ROOM, PlacementError, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
+        TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room, cgroup_v2_path, gb10, host,
+        host_of, host_room, mem_available, placed_on, plan_a, plan_a_draft, plan_bp, plan_gate,
+        plan_node_tiers, plan_on, plan_room, plan_tiers, spec_of_device, tier_batch_bytes,
+        unified_of,
     };
 
     /// One plan room: `tools/ref/plan-room.sh --room`, the room
@@ -1200,7 +1238,7 @@ mod tests {
     }
 
     fn base_bp(layers: usize, draft_bytes: Option<u64>, batch: TierBatchBytes) -> Machine {
-        let mut t = tier(RTX_3090);
+        let mut t = card(RTX_3090, 0..0, false);
         t.reserves
             .extend(draft_bytes.map(|b| (DRAFT_RESERVE.to_string(), b)));
         t.reserves
@@ -1325,6 +1363,86 @@ mod tests {
         assert_eq!(swapped.tiers.len(), 1);
         assert_eq!(swapped.tiers[0].name, A6000.name);
         assert_eq!(swapped.tiers[0].reserve_bytes(), 7 + batch.card());
+    }
+
+    #[test]
+    fn plan_node_tiers_keeps_each_census_and_service_on_its_node() {
+        let mut specs = [
+            gb10(100 << 30),
+            gb10(80 << 30),
+            gb10(60 << 30),
+            gb10(40 << 30),
+        ];
+        for (i, spec) in specs.iter_mut().enumerate() {
+            spec.device = Some(DeviceId {
+                ordinal: 0,
+                uuid: [u8::try_from(i).expect("four nodes"); 16],
+            });
+        }
+        let batch = TierBatchBytes {
+            staging: 10,
+            scratch: 5,
+            host: 100,
+        };
+        let machines = plan_node_tiers(4, specs[0], &specs[1..], batch)
+            .expect("four nodes of the same card name and ordinal");
+        assert_eq!(machines.len(), 4);
+        for (i, (m, spec)) in machines.iter().zip(specs).enumerate() {
+            assert_eq!(m.nodes.len(), 1);
+            assert!(m.tiers.is_empty());
+            let [card] = m.cards.as_slice() else {
+                panic!("one card per node: {m:?}");
+            };
+            assert_eq!(card.device, spec.device);
+            assert_eq!(card.free_bytes, spec.free_bytes);
+            assert_eq!(card.usable_bytes, spec.usable_bytes());
+            assert_eq!(card.layers, 0..4);
+            super::super::Stages::new(4, &m.cards).expect("each node has a complete card stage");
+            let free = spec.free_bytes.expect("the census read the pool");
+            assert_eq!(m.unified(), Some(UnifiedPool { bytes: free }));
+            assert_eq!(m.host().usable_bytes, free);
+            if i == 0 {
+                assert!(card.reserves.is_empty());
+                assert_eq!(
+                    m.host().reserves,
+                    vec![(TIER_BATCH_HOST_RESERVE.to_string(), 300)]
+                );
+            } else {
+                assert!(m.host().reserves.is_empty());
+                assert_eq!(card.reserves, vec![(TIER_BATCH_RESERVE.to_string(), 15)]);
+            }
+        }
+        for stage in [A6000, specs[0]] {
+            assert_eq!(
+                plan_node_tiers(4, stage, &[], batch).expect("one node"),
+                vec![plan_on(stage, 4)]
+            );
+        }
+        assert!(plan_node_tiers(4, specs[0], &[specs[0]], batch).is_ok());
+    }
+
+    #[test]
+    fn plan_node_tiers_refuses_service_off_plan() {
+        let batch = TierBatchBytes {
+            staging: 0,
+            scratch: 0,
+            host: u64::MAX / 2,
+        };
+        let remotes = [gb10(80 << 30), gb10(60 << 30)];
+        let machines =
+            plan_node_tiers(4, gb10(100 << 30), &remotes, batch).expect("the host-row sum fits");
+        assert_eq!(
+            machines[0].host().reserves,
+            vec![(TIER_BATCH_HOST_RESERVE.to_string(), u64::MAX - 1)]
+        );
+        let huge = TierBatchBytes {
+            host: batch.host + 1,
+            ..batch
+        };
+        assert!(matches!(
+            plan_node_tiers(4, gb10(100 << 30), &remotes, huge),
+            Err(PlacementError::TierBatchHost { tiers: 2, .. })
+        ));
     }
 
     /// The host reserves the prompt batch's rows once per tier, in one row.

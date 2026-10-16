@@ -14,7 +14,9 @@ use super::nodes::{
     Fabric, Fills, FillsApart, IdleWhy, LinkCost, NicBound, NodeBudget, NodeIdle, NodePlan, Nodes,
     NodesError, POST_NS, PoolOver, Terms, Workload, plan_nodes, routed_only,
 };
-use super::workstation::{GB10_NIC, GB10_POOL, GB10_READ, gb10, plan_on, spark_nodes};
+use super::workstation::{
+    GB10_NIC, GB10_POOL, GB10_READ, TierBatchBytes, gb10, plan_node_tiers, plan_on, spark_nodes,
+};
 use super::{
     Device, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers,
     PoolNeed, Role, Violation, plan_routed, plan_with, row_table_tier,
@@ -269,17 +271,28 @@ fn cases() -> &'static [Case] {
     CASES.get_or_init(|| {
         let mut cases = Vec::new();
         for shape in SHAPES {
-            let machine = spark(GB10_POOL, shape.layers);
+            let spec = gb10(GB10_POOL);
+            let machines = plan_node_tiers(
+                shape.layers,
+                spec,
+                &[spec],
+                TierBatchBytes {
+                    staging: 0,
+                    scratch: 0,
+                    host: 0,
+                },
+            )
+            .expect("two nodes with no batch bytes");
             for high in [false, true] {
                 let model = shape.model(high);
                 let remote = routed_only(&model);
-                let plan = today(&model, &machine, true);
+                let plan = today(&model, &machines[0], true);
                 let budget = |p: &Plan<'_>| NodeBudget::of(p).expect("a budget");
                 cases.push(Case {
                     shape,
                     high,
                     terms: Terms::of(&plan, shape.n_embd).expect("the terms"),
-                    budgets: [budget(&plan), budget(&today(&remote, &machine, false))],
+                    budgets: [budget(&plan), budget(&today(&remote, &machines[1], false))],
                 });
             }
         }

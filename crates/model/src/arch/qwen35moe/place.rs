@@ -55,7 +55,7 @@ use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
 use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{
     self, A6000, CONTEXT, CardSpec, GRANULE, HostRead, MARGIN, RTX_3090, SCRATCH,
-    TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, host_of, tier_batch_host_bytes,
+    TIER_BATCH_HOST_RESERVE, TierBatchBytes, host_of, tier_batch_host_bytes,
     tier_batch_staging_bytes, unified_of,
 };
 use crate::placement::{
@@ -1325,21 +1325,7 @@ pub fn machine_bp_on(
     m.cards[0]
         .reserves
         .extend(draft.map(|b| (MTP_RESERVE.to_string(), b)));
-    m.tiers.push(Card {
-        name: tier.name.to_string(),
-        device: tier.device,
-        usable_bytes: tier.usable_bytes(),
-        context_bytes: CONTEXT,
-        scratch_bytes: SCRATCH,
-        margin_bytes: MARGIN,
-        granule_bytes: GRANULE,
-        free_bytes: tier.free_bytes,
-        held_by: tier.held_by,
-        layers: 0..0,
-        head: false,
-        token_embedding: false,
-        reserves: vec![(TIER_BATCH_RESERVE.to_string(), batch.card())],
-    });
+    m.tiers.push(workstation::tier_card(tier, None, batch));
     m.host_mut()
         .reserves
         .push((TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
