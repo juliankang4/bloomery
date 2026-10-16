@@ -309,6 +309,32 @@ card unknown-key.card 65 "unknown key 'owner'"
 card unknown-kind.card 65 "unknown kind 'benchmark'"
 card bad-band.card 65 'is not a band lo\.\.hi'
 card reversed-band.card 65 'lo 1\.3 is above hi 0\.9'
+for bounds in '1e999..1e999' '-1e999..1' '1..1e999' '-1e999..-1e999'; do
+  sed "s/^predict:.*/predict: $bounds/" "$HERE/valid-ab.card" > "$T/docs/cards/band.card"
+  run "check non-finite band $bounds" 65 'refused CARD_MALFORMED' \
+    python3 "$T/tools/ref/card.py" check "$T/docs/cards/band.card"
+  has "non-finite band diagnostic $bounds" 'bounds must be finite'
+  run "lease non-finite band $bounds" 65 'refused CARD_MALFORMED' \
+    python3 "$T/tools/ref/card.py" lease docs/cards/band.card
+done
+for bounds in '1e308..1e308' '-1e308..-1e308'; do
+  sed "s/^predict:.*/predict: $bounds/" "$HERE/valid-ab.card" > "$T/docs/cards/band.card"
+  run "check finite band $bounds" 0 'ok kind=ab' \
+    python3 "$T/tools/ref/card.py" check "$T/docs/cards/band.card"
+done
+for minutes in '1e999' '1..1e999' '1e999..1e999'; do
+  sed "s/^minutes:.*/minutes: $minutes/" "$HERE/exclusive.card" > "$T/docs/cards/minutes.card"
+  run "check non-finite minutes $minutes" 65 'refused CARD_MALFORMED' \
+    python3 "$T/tools/ref/card.py" check "$T/docs/cards/minutes.card"
+  run "lease non-finite minutes $minutes" 65 'refused CARD_MALFORMED' \
+    python3 "$T/tools/ref/card.py" lease docs/cards/minutes.card
+done
+margin=$(printf '1%0309d' 0)
+sed "s/^margin:.*/margin: $margin % overflow fixture/" "$HERE/noninf-valid.card" > "$T/docs/cards/margin.card"
+run 'check non-finite margin' 65 'refused CARD_MALFORMED' \
+  python3 "$T/tools/ref/card.py" check "$T/docs/cards/margin.card"
+run 'verdict non-finite margin' 65 'refused CARD_MALFORMED' \
+  python3 "$T/tools/ref/card.py" verdict "$T/docs/cards/margin.card" 0.01 0.01 0.01 0.01 0.01 0.01
 card dup-key.card 65 "line 8: 'predict' again \(first on line 6\)"
 card ab-unit.card 65 'an ab card predicts its effect in percent'
 card continuation.card 0 'ok kind=ab'

@@ -205,6 +205,8 @@ def band(value, unit):
     if not m:
         return None, f'`predict: {value}` is not a band lo..hi of decimal numbers'
     lo, hi, named = float(m.group(1)), float(m.group(2)), m.group(3)
+    if not math.isfinite(lo) or not math.isfinite(hi):
+        return None, f'`predict: {value}`: bounds must be finite'
     if named is not None and named != unit:
         return None, f'`predict: {value}` names the unit {named!r}; the card says `unit: {unit}`'
     if lo > hi:
@@ -248,7 +250,7 @@ def validate(fields):
         card['sd'] = SD_DEFAULT
         if 'sd' in value:
             m = SD.fullmatch(value['sd'])
-            if not m or float(m.group(1)) <= 0:
+            if not m or not math.isfinite(float(m.group(1))) or float(m.group(1)) <= 0:
                 errors.append(f'line {fields["sd"][0]}: `sd: {value["sd"]}` is not a positive percentage and its source')
             elif not m.group(3).strip():
                 errors.append(f'line {fields["sd"][0]}: `sd: {value["sd"]}` names no source (an override says where it comes from)')
@@ -258,7 +260,7 @@ def validate(fields):
         card['margin'] = MARGIN_DEFAULT
         if 'margin' in value:
             m = SD.fullmatch(value['margin'])
-            if not m or float(m.group(1)) <= 0:
+            if not m or not math.isfinite(float(m.group(1))) or float(m.group(1)) <= 0:
                 errors.append(f'line {fields["margin"][0]}: `margin: {value["margin"]}` is not a positive '
                               'percentage and its reason')
             elif not m.group(3).strip():
@@ -270,7 +272,7 @@ def validate(fields):
         m = MINUTES.fullmatch(value['minutes'])
         lo = float(m.group(1)) if m else 0.0
         hi = float(m.group(2)) if m and m.group(2) else lo
-        if not m or lo <= 0 or lo > hi:
+        if not m or not math.isfinite(lo) or not math.isfinite(hi) or lo <= 0 or lo > hi:
             errors.append(f'line {fields["minutes"][0]}: `minutes: {value["minutes"]}` is not a positive '
                           'number of minutes or a band lo..hi of them')
         else:
