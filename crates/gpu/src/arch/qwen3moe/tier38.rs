@@ -623,6 +623,7 @@ pub(super) fn open_tier(
     let set = TierSet::of_map(map, tier)?;
     if let Some(addr) = t.node {
         let open = NodeOpen {
+            nvme: None,
             family: NODE_FAMILY.word.to_string(),
             name: t.name.clone(),
             device: t.device,

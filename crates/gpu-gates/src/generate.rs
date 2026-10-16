@@ -1961,6 +1961,8 @@ mod tests {
                     let mut payload = Out::default();
                     bloomery_gpu::host::node::NodeCensus {
                         devices: vec![remote],
+                        host_room: u64::MAX,
+                        arena_given: None,
                     }
                     .write(&mut payload);
                     stream.write_all(

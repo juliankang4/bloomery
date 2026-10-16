@@ -33,9 +33,116 @@ use std::cmp::Ordering;
 use std::ops::RangeInclusive;
 
 use super::{
-    Device, Format, Machine, ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers,
-    PoolNeed, Role, RoutedRule, Row, card_bytes, per_expert, plan_routed, row_bytes,
+    Device, Format, HostTotals, Machine, ModelTensor, ModelTensors, Node, PlacementError, Plan,
+    PlanLevers, PoolNeed, Role, RoutedRule, Row, Segment, card_bytes, per_expert, plan_routed,
+    row_bytes,
 };
+
+/// The routed stacks assigned to `card`, as a host plan on `machine`'s own
+/// node. Non-routed tensors stay with the stage. The existing NVMe split can
+/// then divide this node's host rows without charging another node's pool.
+pub fn routed_host<'a>(
+    model: &'a ModelTensors,
+    assigned: &[Row],
+    card: usize,
+    machine: &'a Machine,
+    columns: u64,
+) -> Result<Plan<'a>, PlacementError> {
+    let mut bytes = 0u64;
+    let mut counts = vec![0; model.layers];
+    let mut ids_of = vec![None; model.layers];
+    let mut rows: Vec<Row> = model
+        .tensors
+        .iter()
+        .enumerate()
+        .map(|(tensor, _)| Row {
+            tensor,
+            segments: vec![Segment {
+                device: Device::Unused,
+                format: Format::Unused,
+                experts: None,
+                resident_bytes: 0,
+            }],
+            read_bytes: 0,
+            stage: 0,
+        })
+        .collect();
+    for r in assigned {
+        let t = model
+            .tensors
+            .get(r.tensor)
+            .ok_or_else(|| PlacementError::Metadata {
+                key: "routed host projection".into(),
+                detail: format!("tensor {} is outside the model", r.tensor),
+            })?;
+        if t.role != Role::RoutedExperts {
+            continue;
+        }
+        let Some(s) = r.segments.iter().find(|s| s.device == Device::Card(card)) else {
+            continue;
+        };
+        let ids = s.experts.as_ref().ok_or_else(|| {
+            PlacementError::tensor(t, "a routed card segment with no expert list")
+        })?;
+        let layer = t.layer.filter(|&l| l < model.layers).ok_or_else(|| {
+            PlacementError::tensor(t, "a routed segment outside the model's layers")
+        })?;
+        if ids_of[layer]
+            .replace(ids)
+            .is_some_and(|previous| previous != ids)
+        {
+            return Err(PlacementError::tensor(
+                t,
+                "the layer's routed stacks hold different expert lists",
+            ));
+        }
+        counts[layer] = ids.len();
+        let (_, per) = per_expert(t, model.experts_of(t))?;
+        let held = per
+            .checked_mul(ids.len())
+            .ok_or_else(|| PlacementError::tensor(t, "the routed host segment's bytes pass u64"))?;
+        bytes = bytes
+            .checked_add(held)
+            .ok_or_else(|| PlacementError::tensor(t, "the routed host plan's bytes pass u64"))?;
+        rows[r.tensor] = Row {
+            tensor: r.tensor,
+            segments: vec![Segment {
+                device: Device::Host,
+                format: Format::HostFile,
+                experts: Some(ids.clone()),
+                resident_bytes: held,
+            }],
+            read_bytes: 0,
+            stage: 0,
+        };
+    }
+    Ok(Plan {
+        model,
+        machine,
+        ctx_max: 0,
+        rows,
+        cards: Vec::new(),
+        host: HostTotals {
+            expert_bytes: bytes,
+            experts: counts.iter().sum(),
+            nvme_expert_bytes: 0,
+            nvme_arena_bytes: 0,
+            arena_columns: columns,
+            table_bytes: 0,
+            shadow_bytes: 0,
+            reserve_bytes: 0,
+            row_reserve_bytes: 0,
+            pool_card_bytes: 0,
+            headroom_bytes: 0,
+            room: None,
+        },
+        nvme_bytes: 0,
+        n_l: vec![0; model.layers],
+        tier_n_l: Vec::new(),
+        card_budget: None,
+        budget_from_pool: false,
+    })
+}
 
 /// The posts node 0's pump makes to reach a further remote node: each costs
 /// this [assumed, `docs/contrib/dgx-spark.md` §9.8 criterion 6].

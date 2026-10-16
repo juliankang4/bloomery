@@ -719,6 +719,7 @@ mod gate {
         let n_expert = usize::try_from(plan.model.experts)?;
         let map = SlotMap::of_plan_tiers(plan, 0, &[t.card], 0..plan.model.layers, n_expert)?;
         Ok(NodeOpen {
+            nvme: None,
             family: NODE_FAMILY.word.to_string(),
             name: t.name,
             device: t.device,

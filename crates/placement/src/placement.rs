@@ -4718,6 +4718,96 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_node_host_projection_keeps_non_routed_rows_on_node_zero() {
+        let model = layered(3);
+        let machine = Machine {
+            cards: vec![bytes_card("stage", HEAD + 5 * EXPERT, 0..3)],
+            tiers: vec![bytes_card("tier", 4 * EXPERT, 0..0)],
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
+        };
+        let plan = plan_with(&model, &machine, 4096, &NoKv, None).expect("a tier with work");
+        let remote = Machine {
+            cards: Vec::new(),
+            tiers: Vec::new(),
+            nodes: machine.nodes.clone(),
+        };
+        let projected = nodes::routed_host(&model, &plan.rows, 1, &remote, 4)
+            .expect("the routed tier's host projection");
+        assert!(std::ptr::eq(projected.machine, &remote));
+        assert_eq!(projected.host.arena_columns, 4);
+        assert_eq!(projected.host.experts, plan.tier_n_l[0].iter().sum::<u64>());
+        assert!(projected.host.experts > 0);
+        assert_eq!(projected.host.table_bytes, 0);
+        assert_eq!(projected.host.pool_card_bytes, 0);
+        let mut bytes = 0;
+        assert_eq!(projected.rows.len(), model.tensors.len());
+        for (index, row) in projected.rows.iter().enumerate() {
+            assert_eq!(row.tensor, index);
+            let t = &model.tensors[row.tensor];
+            if row.segments[0].device == Device::Unused {
+                continue;
+            }
+            assert_eq!(t.role, Role::RoutedExperts);
+            let source = plan.rows.iter().find(|r| r.tensor == row.tensor).unwrap();
+            let assigned = source
+                .segments
+                .iter()
+                .find(|s| s.device == Device::Card(1))
+                .unwrap();
+            assert_eq!(row.segments.len(), 1);
+            let held = &row.segments[0];
+            assert_eq!((held.device, held.format), (Device::Host, Format::HostFile));
+            assert_eq!(held.experts, assigned.experts);
+            bytes += held.resident_bytes;
+        }
+        assert_eq!(projected.host.expert_bytes, bytes);
+        let stage = nodes::routed_host(&model, &plan.rows, 0, &remote, 1).unwrap();
+        assert!(
+            stage
+                .rows
+                .iter()
+                .filter(|r| r.segments[0].device != Device::Unused)
+                .all(|r| model.tensors[r.tensor].role == Role::RoutedExperts)
+        );
+        assert_eq!(stage.host.experts, plan.n_l.iter().sum::<u64>());
+        let mut changed = plan.rows.clone();
+        let mut extra = changed
+            .iter()
+            .find(|r| r.segments.iter().any(|s| s.device == Device::Card(1)))
+            .unwrap()
+            .clone();
+        let segment = extra
+            .segments
+            .iter_mut()
+            .find(|s| s.device == Device::Card(1))
+            .unwrap();
+        let ids = segment.experts.as_ref().unwrap();
+        let others = (0..model.experts as u32)
+            .filter(|id| !ids.ids().contains(id))
+            .take(ids.len() as usize)
+            .collect();
+        segment.experts = Some(ExpertList::new(others, model.experts).unwrap());
+        changed.push(extra);
+        assert!(
+            nodes::routed_host(&model, &changed, 1, &remote, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("different expert lists")
+        );
+        let empty = nodes::routed_host(&model, &plan.rows, 2, &remote, 1).unwrap();
+        assert!(
+            empty
+                .rows
+                .iter()
+                .all(|r| r.segments[0].device == Device::Unused)
+        );
+        assert_eq!(empty.host.expert_bytes, 0);
+    }
+
     /// [`layered`]'s embedding and head over one layer of routed stacks a
     /// row of `types` (gate, up, down), each named by the tail a file gives it
     /// (the part is read from that tail, the layer from `layer`).

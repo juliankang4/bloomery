@@ -41,7 +41,7 @@ use gguf::Split;
 use model::fileio::sha256_hex_of;
 use model::ops::DEFER_MAX_COLS;
 use model::placement::devices::{DeviceId, DeviceInfo, spec_of_device};
-use model::placement::workstation::CardSpec;
+use model::placement::workstation::{self, ArenaGrant, CardSpec};
 use model::placement::{Device, ExpertList, Format, ModelTensor, ModelTensors, Plan, Row, Segment};
 
 use super::DRAIN_DEADLINE;
@@ -89,6 +89,8 @@ fn open_bound(open: &NodeOpen) -> Duration {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeCensus {
     pub devices: Vec<DeviceInfo>,
+    pub host_room: u64,
+    pub arena_given: Option<u64>,
 }
 
 impl NodeCensus {
@@ -96,12 +98,20 @@ impl NodeCensus {
     pub fn here() -> Result<NodeCensus, GpuError> {
         Ok(NodeCensus {
             devices: crate::census()?,
+            host_room: workstation::host_available().map_err(|e| GpuError::plan(SERVER, e))?,
+            arena_given: workstation::nvtier_arena_given()
+                .map_err(|e| GpuError::plan(SERVER, e))?,
         })
     }
 
     /// Append this census to the node protocol payload.
     pub fn write(&self, o: &mut Out) {
-        o.u32(wire::VERSION).len(self.devices.len());
+        o.u32(wire::VERSION).u64(self.host_room);
+        match self.arena_given {
+            Some(bytes) => o.u8(1).u64(bytes),
+            None => o.u8(0),
+        };
+        o.len(self.devices.len());
         for d in &self.devices {
             o.u32(d.ordinal)
                 .str(&d.name)
@@ -125,6 +135,12 @@ impl NodeCensus {
                 wire::VERSION
             ));
         }
+        let host_room = i.u64("host room")?;
+        let arena_given = if i.flag("arena given")? {
+            Some(i.u64("arena bytes")?)
+        } else {
+            None
+        };
         let n = i.len("device count")?;
         if n == 0 {
             return Err("a census of no device".to_string());
@@ -159,7 +175,11 @@ impl NodeCensus {
                 held_by: (!held.is_empty()).then_some(held),
             });
         }
-        Ok(NodeCensus { devices })
+        Ok(NodeCensus {
+            devices,
+            host_room,
+            arena_given,
+        })
     }
 }
 
@@ -233,6 +253,7 @@ fn segment_sha256(
 /// columns with the plan's reserve for it.
 #[derive(Clone, Debug)]
 pub struct NodeOpen {
+    pub nvme: Option<NodeNvme>,
     pub family: String,
     pub name: String,
     pub device: Option<DeviceId>,
@@ -245,7 +266,110 @@ pub struct NodeOpen {
     pub block: (usize, usize),
 }
 
+/// A routed host plan scoped to one node. Its row assignment is the open's
+/// set; the common split derives the resident and paged rows from this room.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeNvme {
+    pub node: usize,
+    pub room: u64,
+    pub arena: ArenaGrant,
+    pub reserve: u64,
+}
+
 impl NodeOpen {
+    /// Project the assigned routed stacks onto this node's own host room.
+    /// Row tables and attention are not part of an expert tier's request.
+    pub(crate) fn project(
+        &mut self,
+        plan: &Plan<'_>,
+        census: &NodeCensus,
+        node: usize,
+    ) -> Result<(), GpuError> {
+        self.nvme = None;
+        if self
+            .rows
+            .iter()
+            .all(|r| r.format != Format::HostFile.to_string())
+        {
+            return Ok(());
+        }
+        let device = census
+            .devices
+            .iter()
+            .find(|d| self.device.is_some_and(|id| id.uuid == d.uuid))
+            .ok_or_else(|| GpuError::shape(WHAT, "the projected tier is absent from the census"))?;
+        let machine = workstation::plan_on(spec_of_device(device), self.layers);
+        let reserve = plan
+            .machine
+            .card(self.card)
+            .ok_or_else(|| {
+                GpuError::shape(WHAT, "the projected tier card is absent from the plan")
+            })?
+            .set_aside_bytes();
+        let mut projected = model::placement::nodes::routed_host(
+            plan.model,
+            &plan.rows,
+            self.card,
+            &machine,
+            self.cols as u64,
+        )
+        .map_err(|e| GpuError::plan(WHAT, e))?;
+        projected.host.reserve_bytes = workstation::HostNeed::of(&projected, 0)
+            .os
+            .checked_add(reserve)
+            .ok_or_else(|| GpuError::shape(WHAT, "the projected host reserve overflows"))?;
+        model::placement::expert_nvme_tier(&mut projected, census.host_room, census.arena_given)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        self.nvme = Some(NodeNvme {
+            node,
+            room: census.host_room,
+            arena: ArenaGrant::whole(projected.host.nvme_arena_bytes),
+            reserve,
+        });
+        Ok(())
+    }
+
+    pub(super) fn host_plan<'a>(
+        &self,
+        model: &'a ModelTensors,
+        machine: &'a model::placement::Machine,
+    ) -> Result<Plan<'a>, GpuError> {
+        let paging = self
+            .nvme
+            .as_ref()
+            .ok_or_else(|| GpuError::shape(SERVER, "no node NVMe plan"))?;
+        if paging.node == 0
+            || paging.arena.granted == 0
+            || paging.arena.granted > paging.arena.planned
+        {
+            return Err(GpuError::shape(SERVER, "invalid node NVMe arena grant"));
+        }
+        let rows = self.rows_on(model)?;
+        let mut projected = model::placement::nodes::routed_host(
+            model,
+            &rows,
+            self.card,
+            machine,
+            self.cols as u64,
+        )
+        .map_err(|e| GpuError::plan(SERVER, e))?;
+        projected.host.reserve_bytes = workstation::HostNeed::of(&projected, 0)
+            .os
+            .checked_add(paging.reserve)
+            .ok_or_else(|| GpuError::shape(SERVER, "the projected host reserve overflows"))?;
+        model::placement::expert_nvme_tier(&mut projected, paging.room, Some(paging.arena.planned))
+            .map_err(|e| GpuError::plan(SERVER, e))?;
+        if projected.host.nvme_arena_bytes != paging.arena.planned
+            || projected.host.nvme_expert_bytes == 0
+        {
+            return Err(GpuError::shape(
+                SERVER,
+                "the node's routed split disagrees with its arena grant",
+            ));
+        }
+        Ok(projected)
+    }
+
     /// The segments `plan` puts on its card `card`, each with its tensor's
     /// name and file identity and the sha256 of its bytes in `file`, the
     /// model file the plan was made from.
@@ -374,6 +498,19 @@ impl NodeOpen {
     /// The open as its request carries it; a layer of the set's range with
     /// no row is refused by name.
     pub fn write(&self, o: &mut Out) -> Result<(), GpuError> {
+        match &self.nvme {
+            Some(p) => {
+                o.u8(1)
+                    .len(p.node)
+                    .u64(p.room)
+                    .u64(p.arena.planned)
+                    .u64(p.arena.granted)
+                    .u64(p.reserve);
+            }
+            None => {
+                o.u8(0);
+            }
+        }
         o.str(&self.family).str(&self.name);
         match self.device {
             Some(d) => o.u8(1).u32(d.ordinal).bytes(&d.uuid),
@@ -417,6 +554,26 @@ impl NodeOpen {
     }
 
     fn read(i: &mut In<'_>) -> Result<NodeOpen, String> {
+        let nvme = if i.flag("node NVMe")? {
+            let node = i.len("NVMe node")?;
+            let room = i.u64("node room")?;
+            let arena = ArenaGrant {
+                planned: i.u64("planned arena")?,
+                granted: i.u64("granted arena")?,
+            };
+            let reserve = i.u64("node reserve")?;
+            if node == 0 || arena.granted == 0 || arena.granted > arena.planned {
+                return Err("invalid node NVMe arena grant".into());
+            }
+            Some(NodeNvme {
+                node,
+                room,
+                arena,
+                reserve,
+            })
+        } else {
+            None
+        };
         let family = i.str("family")?;
         let name = i.str("card name")?;
         let device = if i.flag("device")? {
@@ -471,6 +628,7 @@ impl NodeOpen {
             a => return Err(format!("an activation form {a}")),
         };
         Ok(NodeOpen {
+            nvme,
             family,
             name,
             device,
@@ -1518,8 +1676,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_an_unsettled_lost_node_keeps_its_work_without_unwinding() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+                use std::sync::atomic::{AtomicBool, Ordering};
         let (path, file) = empty_file("unsettled-node");
         let dropped = Arc::new(AtomicBool::new(false));
         let work = super::super::tier::tests::remote_work(&file, Arc::clone(&dropped), true);
@@ -1649,6 +1806,8 @@ pub(super) mod tests {
     #[test]
     fn messages_read_back_as_written() {
         let census = NodeCensus {
+            host_room: u64::MAX,
+            arena_given: None,
             devices: vec![gb10(7)],
         };
         let mut o = Out::default();
@@ -1659,7 +1818,10 @@ pub(super) mod tests {
         let mut full = gb10(8);
         full.free_bytes = full.total_bytes + 1;
         for bad in [Vec::new(), vec![full], vec![gb10(7), gb10(7)]] {
-            let bad = NodeCensus { devices: bad };
+            let bad = NodeCensus {
+                devices: bad,
+                ..census.clone()
+            };
             let mut o = Out::default();
             bad.write(&mut o);
             assert!(NodeCensus::read(&mut In::new(o.done())).is_err());
@@ -1673,6 +1835,7 @@ pub(super) mod tests {
 
         let set = TierSet::new(1..3, 8, vec![vec![2, 5], vec![]]).expect("a set");
         let open = NodeOpen {
+            nvme: None,
             family: "qwen4exp".into(),
             name: "GB10".into(),
             device: Some(DeviceId {
