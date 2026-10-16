@@ -124,7 +124,7 @@ mod gate {
     use bloomery_gpu_gates::act_rule::{Act, Rule};
     use bloomery_gpu_gates::oracle;
     use bloomery_gpu_gates::oracle::deepseek41::{D1N, STEP4};
-    use bloomery_gpu_gates::rounding::{U, gamma};
+    use bloomery_gpu_gates::rounding::{U, U64, gamma};
     use bloomery_gpu_gates::{
         GateError, RefManifest, RefRow, activations, bits_equal, bytes_to_words, checks_failed,
         no_local_depot, q8_1_dequant, ref_model_path, ref_tensor_of_in, row_bytes,
@@ -171,10 +171,6 @@ mod gate {
     /// times scale) against the kernel's exact use of both: one rounding a
     /// value.
     const Q8_IMAGE: f64 = 1.0;
-
-    /// f64's unit roundoff, 2^-53: the gate's own sums round too, and each
-    /// bound keeps what they can add.
-    const U64: f64 = f64::EPSILON / 2.0;
 
     /// CUDA's `expf` (fused with the `1 +`) and `logf`, the host's (glibc's),
     /// in ulps — the MoE gate's constants.
