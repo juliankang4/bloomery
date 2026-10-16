@@ -361,6 +361,12 @@ mod taps;
 #[path = "shared/qwen3moe_place.rs"]
 mod q3place;
 
+#[cfg(all(test, feature = "gpu"))]
+#[test]
+fn dense_shortage_halves_the_default_context() {
+    q3place::tests::dense_shortage_halves_the_default_context();
+}
+
 #[cfg(feature = "gpu")]
 #[path = "shared/qwen38_place.rs"]
 mod q38place;
@@ -535,7 +541,7 @@ mod cli {
             Arch::NemotronH => Ok((file, Family::NemotronH)),
             Arch::NemotronHMoe => Ok((file, Family::NemotronHMoe)),
             other => Err(format!(
-                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen35, qwen4exp, \\
+                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen35, qwen4exp, \
                  nemotron_h and nemotron_h_moe files",
                 path.display(),
                 file.architecture().unwrap_or(other.name())

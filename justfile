@@ -1448,6 +1448,11 @@ gate-models:
 gate-app:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-app --release --lib'
 
+# The Qwen planner's host-only default-context refusal and halving contract. Opens no card.
+[group('host')]
+gate-qwen3-plan:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe'
+
 # 2단계 qdot 게이트: Q3_K×Q8_K 융합 커널이 현재 경로(dequant+roundtrip+f32)와
 # 1e-5 안팎에서 일치하고, 정확해(f64)에 더 가깝고, 스칼라 폴백과 비트 동일인가.
 # 순수 게이트(rejects_unaligned_k)는 #[ignore]가 아니라 --include-ignored로 같이 돈다.

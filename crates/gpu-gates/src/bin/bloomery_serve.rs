@@ -305,7 +305,7 @@ models (the --model word is optional with a model file: the file's architecture 
         let (seat, arch) = match split.architecture() {
             Some(a) if side_seat::row(a).is_some() => {
                 return Err(format!(
-                    "{} is a {a} file, an embedding model: serve it beside a chat model with \\
+                    "{} is a {a} file, an embedding model: serve it beside a chat model with \
                      --embd-model",
                     path.display()
                 )

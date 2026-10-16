@@ -365,8 +365,15 @@ impl PlaceQ3 {
             beside,
             tables: o.media.then_some(inputs.hp.rope_dims),
         };
+        let arena = if inputs.hp.n_expert == 0 {
+            match Qwen35moeModel::whole_load(file, o)? {
+                WholeLoad::Checked { arena, .. } => arena,
+                WholeLoad::Unchecked => 0,
+            }
+        } else {
+            Qwen35moeModel::placed_arena_bytes(file, o)?
+        };
         let inputs = Inputs::Qwen35(Box::new(inputs));
-        let arena = Qwen35moeModel::placed_arena_bytes(file, o)?;
         let machine = laid(
             place.card_specs()?[0],
             &inputs,
@@ -637,6 +644,25 @@ impl Whole {
     /// The refusal of a whole load this verdict does not take, of a model
     /// with no routed expert to move to the host tier.
     fn dense_refusal(&self, ctx: usize) -> GateError {
+        if let Whole::Short(n) = self {
+            let (margin, beside) = match n.load {
+                WholeLoad::Checked { arena, reserve } => (reserve, arena),
+                WholeLoad::Unchecked => (n.card.margin_bytes, 0),
+            };
+            return PlacementError::CardBudgetFloor {
+                card: n.card.name.clone(),
+                budget: n.budget,
+                floor: n.need,
+                dense: n.weights,
+                kv: n.kv,
+                context: n.card.context_bytes,
+                scratch: n.card.scratch_bytes,
+                reserves: n.card.reserve_bytes(),
+                margin,
+                beside,
+            }
+            .into();
+        }
         format!(
             "{}: a dense backbone has no routed experts to move to the host tier",
             self.line(ctx)
@@ -1262,4 +1288,98 @@ pub fn open_qwen35(
     host: HostCfg,
 ) -> Result<Qwen35moeModel, GateError> {
     Ok(GpuModel::<Body35>::open_placed(file, plan, o, host)?)
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use bloomery_gpu_gates::generate::choose_ctx_of;
+    use model::placement::ModelTensor;
+
+    pub(crate) fn dense_shortage_halves_the_default_context() {
+        const TARGET: u64 = 16_384;
+        let model = ModelTensors {
+            tensors: vec![ModelTensor {
+                name: "blk.0.ffn_up.weight".into(),
+                shard: 0,
+                layer: Some(0),
+                role: Role::DenseFfn,
+                ty: gguf::GgmlType::Q8_0,
+                dims: vec![256, 16],
+                file_bytes: 0,
+                gathered_rows: None,
+            }],
+            layers: 1,
+            experts: 0,
+            experts_used: 0,
+        };
+        let machine = q3::machine(workstation::A6000, 1, 0);
+        let mut card = machine.whole_card().expect("one card");
+        for load in [
+            WholeLoad::Checked {
+                arena: 8192,
+                reserve: 4096,
+            },
+            WholeLoad::Unchecked,
+        ] {
+            card.free_bytes = None;
+            let need = |ctx| placement::whole_need(&model, &card, ctx * 1024, load).unwrap();
+            let lower = need(TARGET / 2);
+            let upper = need(TARGET);
+            assert!(lower.fits() && upper.fits());
+            assert!(lower.need < upper.need);
+            card.free_bytes = Some(lower.need);
+            let mut probes = Vec::new();
+            let chosen = choose_ctx_of(TARGET, (None, 1), (None, None), |ctx| {
+                probes.push(ctx);
+                let need = placement::whole_need(&model, &card, ctx * 1024, load)?;
+                if need.fits() {
+                    return Ok(Probe::Holds(ServeLoad::Whole(workstation::A6000)));
+                }
+                let error = Whole::Short(need.clone()).dense_refusal(ctx as usize);
+                let Some(PlacementError::CardBudgetFloor {
+                    budget,
+                    floor,
+                    dense,
+                    kv,
+                    context,
+                    scratch,
+                    reserves,
+                    margin,
+                    beside,
+                    ..
+                }) = error.downcast_ref::<PlacementError>()
+                else {
+                    panic!("expected typed CardBudgetFloor, got {error}");
+                };
+                let past = match load {
+                    WholeLoad::Checked { arena, reserve } => (reserve, arena),
+                    WholeLoad::Unchecked => (card.margin_bytes, 0),
+                };
+                assert_eq!(
+                    (
+                        *budget, *floor, *dense, *kv, *context, *scratch, *reserves, *margin,
+                        *beside
+                    ),
+                    (
+                        lower.need,
+                        upper.need,
+                        need.weights,
+                        need.kv,
+                        card.context_bytes,
+                        card.scratch_bytes,
+                        card.reserve_bytes(),
+                        past.0,
+                        past.1
+                    )
+                );
+                short_or(error)
+            })
+            .unwrap_or_else(|e| panic!("dense default context must halve: {e}"));
+            assert_eq!(chosen.total, TARGET / 2);
+            assert_eq!(probes, [TARGET, TARGET / 2]);
+        }
+        let refused = Whole::Refused("unsupported tensor".into()).dense_refusal(TARGET as usize);
+        assert!(short_or(refused).is_err());
+    }
 }
