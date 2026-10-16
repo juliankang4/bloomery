@@ -19,6 +19,7 @@ crates/gpu-gates/src/ik_q8_2.rs 1 a host reference the gate binaries run; those 
 crates/gpu-gates/src/lib.rs 1 par_map's workers, for the host references the gate binaries run; those never pin
 crates/gpu/src/graph.rs 2 the capture-race tests' second threads, from a libtest thread that is never pinned
 crates/gpu/src/host/link/pump.rs 1 the relay tests' model tier card, from a libtest thread that is never pinned
+crates/gpu/src/host/step.rs 1 the scalar go-wait test's host tier thread, from a libtest thread that is never pinned
 crates/gpu/src/linear/delta.rs 1 a host reference, called from tests only
 crates/model/src/fixture/plan.rs 1 the gate fixture's builder, a gate-side tool
 crates/model/src/placement/host_lock.rs 1 PENDING (triage): the host set's walk at load, spawned by the step thread after pin_caller — every chunk on one cpu

@@ -1867,6 +1867,9 @@ impl<H: HostExperts> HostTier<H> {
         page.unlink()?;
         self.tier_goes = tiers.iter().map(|t| t.progress(&page)).collect();
         self.tier_lists = tiers.iter().map(|_| Vec::new()).collect();
+        self.step.parallel_wait = !tiers
+            .iter()
+            .any(|t| t.node().is_none() && t.resident_bytes() == 0);
         self.tiers = tiers;
         self.tier_page = Some(page);
         Ok(())

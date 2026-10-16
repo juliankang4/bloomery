@@ -790,12 +790,15 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    port. Each end carries its tier's crossings and holds its own page, queue pair and pump. Reset stops both ends,
    resets both writers, then both readers, with a control reply between phases. The launch message remains one
    control round trip per replay. `BLOOMERY_TIER_LINK=loopback` still needs both pages in one process and is refused
-   with a node tier. The Qwen3.8 open projects its assigned routed stacks onto node 1's host room through the
-   common NVMe split. The request scopes that projection and its arena grant to the node; `Device::Nvme` in the
+   with a node tier. For file-backed routed assignments, the Qwen3.8 open projects its assigned stacks onto
+   node 1's host room through the common NVMe split. Resident GPU assignments keep their device executor without
+   a host split. The request scopes the host projection and its arena grant to the node; `Device::Nvme` in the
    projected plan names that node's local drive, not node 0's. A paged tier uses the existing `HostRun` and `NvTier`
    behind `TierWork`'s stream protocol. The CPU callback reads the node's own file and its arena slots, and its
-   failure is returned by the tier's fault query. Attention and row tables stay on node 0. The stage plan still
-   charges the tier's assignment as resident; lowering an N-node assignment into this path remains to be wired.
+   failure is returned by the tier's fault query. Attention and row tables stay on node 0. `PlanInputs::plan_nodes`
+   lowers an explicit node assignment into the loaded rows before splitting node 0's host room: remote routed
+   ranges are file-backed, with no stage allocation or charge against node 0's pool. Each node opens its own
+   host/NVMe split against its own grant.
    A remote tier serves no prompt batch (the batch call refuses it by name);
    only Qwen3.8 opens a tier on a node, and GLM and V4.1 refuse it by name. `just gate-gpu-qwen38-nodes` holds the
    census, the refused opens (a row of other experts, and a copy of the file whose tier row holds other bytes), the bits

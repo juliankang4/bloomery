@@ -284,8 +284,15 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
                 }
             }
         }
-        let mut experts =
-            CpuExperts::new(&gpu, make_run(), Arc::clone(&tier), set.clone(), shape, 2).unwrap();
+        let mut experts = CpuExperts::new(
+            &gpu,
+            make_run(),
+            Some(Arc::clone(&tier)),
+            set.clone(),
+            shape,
+            2,
+        )
+        .unwrap();
         let weights = Weights::load_rows(gpu.stream(), &file, &model, &[], 0).unwrap();
         let x = DeviceBuffer::from_host(gpu.stream(), &input).unwrap();
         let sel = DeviceBuffer::from_host(gpu.stream(), &selected).unwrap();
@@ -332,8 +339,32 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
             "HostRun must use the NVMe step claims"
         );
         drop(graph);
+        let mut resident = CpuExperts::new(&gpu, make_run(), None, set.clone(), shape, 2).unwrap();
+        resident
+            .enqueue_layer(
+                &gpu,
+                &weights,
+                0,
+                TierIo {
+                    act: TierInput::F32(&x),
+                    sel: &sel,
+                    rows: &mut out,
+                    cols: 2,
+                },
+            )
+            .unwrap();
+        gpu.stream().synchronize().unwrap();
+        resident.check().unwrap();
+        assert_eq!(
+            out.to_host_vec(gpu.stream())
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
         let mut pending =
-            CpuExperts::new(&gpu, make_run(), make_tier(), set.clone(), shape, 2).unwrap();
+            CpuExperts::new(&gpu, make_run(), Some(make_tier()), set.clone(), shape, 2).unwrap();
         let alive = Arc::downgrade(&pending.state);
         let held = crate::checkpoint::hold::Hold::on(gpu.stream()).unwrap();
         pending
@@ -389,7 +420,8 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
         }
         let scoped_gpu = Gpu::new().unwrap();
         let stream = Arc::downgrade(&scoped_gpu.stream_handle());
-        let scoped = CpuExperts::new(&scoped_gpu, make_run(), make_tier(), set, shape, 2).unwrap();
+        let scoped =
+            CpuExperts::new(&scoped_gpu, make_run(), Some(make_tier()), set, shape, 2).unwrap();
         scoped_gpu.stream().synchronize().unwrap();
         drop(scoped_gpu);
         if stream.upgrade().is_none() {

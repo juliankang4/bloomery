@@ -133,7 +133,7 @@ impl CpuExperts {
     pub(super) fn new(
         gpu: &Gpu,
         mut run: HostRun,
-        tier: Arc<super::nvtier::NvTier>,
+        tier: Option<Arc<super::nvtier::NvTier>>,
         set: TierSet,
         shape: TierShape,
         cols: usize,
@@ -158,7 +158,7 @@ impl CpuExperts {
             .and_then(|((x, sel), out)| x.checked_add(sel)?.checked_add(out)?.checked_mul(4))
             .ok_or_else(|| GpuError::shape(WHAT, "the host tier's staging bytes overflow"))?;
         let (x, sel, out) = (x.unwrap(), sel.unwrap(), out.unwrap());
-        run.attach_tier(Some(tier))?;
+        run.attach_tier(tier)?;
         run.prepare_union(1)?;
         let state = Arc::new(Mutex::new(State {
             run,

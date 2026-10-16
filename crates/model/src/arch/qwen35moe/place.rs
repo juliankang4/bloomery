@@ -450,6 +450,50 @@ impl PlanInputs {
         checked(plan).map_err(PlaceError::Broken)
     }
 
+    /// A node assignment lowered into the loaded map. Counts are global id
+    /// ranges in node order; node zero's card keeps only its assigned prefix.
+    /// Each tier opens its file-backed range against its own host room.
+    pub fn plan_nodes<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        owned: &[u64],
+    ) -> Result<Plan<'a>, PlaceError> {
+        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
+            return Err(PlaceError::Positions { ctx_max });
+        }
+        check_draft_reserve(machine, None)?;
+        let plan = placement::plan_in_pool(machine, levers, |levers| {
+            let stage = Machine {
+                tiers: Vec::new(),
+                ..machine.clone()
+            };
+            let seed = placement::plan_routed(
+                &self.model,
+                &stage,
+                ctx_max,
+                &self.kv,
+                levers,
+                routed_rule(PROGRAM),
+            )?;
+            let mut plan = Plan {
+                model: &self.model,
+                machine,
+                ..seed
+            };
+            placement::nodes::lower_routed(&mut plan, owned)?;
+            let room = plan.plan_at(&self.room);
+            let floor = 2 * self.seq_state_bytes(ctx_max, None);
+            placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
+            plan.host.step_slots(1, placement::STEP_PORT_COLUMNS)?;
+            placement::expert_nvme_tier(&mut plan, room, self.arena)?;
+            Ok(plan)
+        })
+        .map_err(tier_host)?;
+        checked(plan).map_err(PlaceError::Broken)
+    }
+
     /// [`PlanInputs::plan_with`] for a load that serves `slots` resident
     /// sequences ([`GpuModel::add_slots`](bloomery_gpu::model::Slots)): every
     /// per-load sequence term ([`PlanInputs::seq_terms`]) — the positional
@@ -3317,6 +3361,128 @@ mod tests {
                     other.err()
                 ),
             }
+        }
+
+        #[test]
+        fn node_assignments_precede_resident_and_shared_room_checks() {
+            let mut inputs = routed(inputs());
+            inputs.model.tensors.push(ModelTensor {
+                name: "blk.1.ple.table.weight".into(),
+                shard: 0,
+                layer: Some(1),
+                role: Role::EngramTable,
+                ty: GgmlType::F32,
+                dims: vec![256, 1 << 30],
+                file_bytes: 1 << 40,
+                gathered_rows: Some(3),
+            });
+            let mut machine = machine();
+            let mut tier = machine.cards[0].clone();
+            tier.name = "remote".into();
+            tier.head = false;
+            tier.layers = 0..0;
+            tier.scratch_bytes = 1 << 40;
+            machine.tiers.push(tier);
+            let pool = 64 << 30;
+            machine.cards[0].usable_bytes = pool;
+            machine.cards[0].free_bytes = Some(pool);
+            machine.nodes[0].unified = Some(UnifiedPool { bytes: pool });
+            inputs.room = (pool, HostRead::Given);
+            let mut roomy = machine.clone();
+            roomy.cards[0].usable_bytes = 1 << 40;
+            roomy.cards[0].free_bytes = None;
+            roomy.nodes[0].unified = None;
+            let plan = inputs
+                .plan_nodes(&roomy, CTX, &PlanLevers::default(), &[256, 256])
+                .unwrap();
+            assert_eq!(plan.n_l, vec![256; LAYERS]);
+            assert_eq!(plan.tier_n_l, vec![vec![256; LAYERS]]);
+            for budget in [None, Some(64 << 20), Some(u64::MAX)] {
+                let levers = PlanLevers {
+                    card_budget_bytes: budget,
+                };
+                for owned in [[0, 512], [256, 256], [511, 1]] {
+                    let result = inputs.plan_nodes(&machine, CTX, &levers, &owned);
+                    if budget == Some(u64::MAX) && owned[0] == 511 {
+                        assert!(matches!(
+                            result,
+                            Err(PlaceError::Placement(PlacementError::HostRoomFloor { .. }))
+                        ));
+                        continue;
+                    }
+                    let plan = result.unwrap_or_else(|e| panic!("{budget:?}, {owned:?}: {e}"));
+                    assert!(plan.violations().is_empty());
+                    assert_eq!(plan.row_tier().unwrap(), Some(placement::Device::Nvme));
+                    assert_eq!(
+                        plan.host.row_reserve_bytes,
+                        placement::row_room(&inputs.model, super::super::UBATCH_PLANNED).unwrap()
+                    );
+                    assert_eq!(plan.tier_n_l, vec![vec![owned[1]; LAYERS]]);
+                    assert!(plan.n_l.iter().all(|&n| n <= owned[0]));
+                    if budget == Some(64 << 20) {
+                        assert_eq!(plan.n_l, vec![0; LAYERS]);
+                    }
+                    assert_eq!(plan.cards[1].kv_bytes, 0);
+                    assert_eq!(plan.cards[1].expert_bytes, 0);
+                    let stage = &plan.cards[0];
+                    let need = stage.dense_bytes
+                        + stage.expert_bytes
+                        + stage.rounding_bytes
+                        + stage.kv_bytes
+                        + stage.stage_rows_bytes
+                        + stage.scratch_bytes
+                        + stage.context_bytes
+                        + stage.reserve_bytes;
+                    assert_eq!(plan.pool_need().unwrap().cards, need);
+                    assert_eq!(plan.host.pool_card_bytes, need);
+                }
+            }
+            assert!(
+                inputs
+                    .plan_nodes(
+                        &machine,
+                        CTX,
+                        &PlanLevers {
+                            card_budget_bytes: Some(0),
+                        },
+                        &[256, 256],
+                    )
+                    .is_err()
+            );
+            let levers = PlanLevers::default();
+            for owned in [&[512, 0][..], &[256, 257], &[512], &[u64::MAX, 513]] {
+                assert!(inputs.plan_nodes(&machine, CTX, &levers, owned).is_err());
+            }
+            for ctx in [0, super::super::KERNEL_POSITIONS + 1] {
+                assert!(matches!(
+                    inputs.plan_nodes(&machine, ctx, &levers, &[256, 256]),
+                    Err(PlaceError::Positions { .. })
+                ));
+            }
+            machine.tiers[0].head = true;
+            assert!(matches!(
+                inputs.plan_nodes(&machine, CTX, &levers, &[256, 256]),
+                Err(PlaceError::Placement(PlacementError::Tier { .. }))
+            ));
+            machine.tiers[0].head = false;
+            machine.tiers[0].name = machine.cards[0].name.clone();
+            assert!(matches!(
+                inputs.plan_nodes(&machine, CTX, &levers, &[256, 256]),
+                Err(PlaceError::Placement(PlacementError::DeviceTwice { .. }))
+            ));
+            machine.tiers[0].name = "remote".into();
+            inputs.room = (1, HostRead::Given);
+            assert!(matches!(
+                inputs.plan_nodes(
+                    &machine,
+                    CTX,
+                    &PlanLevers {
+                        card_budget_bytes: Some(u64::MAX),
+                    },
+                    &[0, 512],
+                ),
+                Err(PlaceError::Placement(PlacementError::HostRoomFloor { .. }))
+            ));
         }
 
         /// The target's `token_embd` and `output`, which an MTP draft file

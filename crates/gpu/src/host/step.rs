@@ -649,6 +649,8 @@ pub(super) struct StepStats {
 /// ([`StepPort::serve_cols`]); the step's and the pair's read one.
 pub struct StepPort {
     pub(crate) boundary: Boundary,
+    /// A local host tier needs the process-wide pool while this port waits.
+    pub(super) parallel_wait: bool,
     /// The host's copy of a handoff's activation — one column, allocated at
     /// load.
     x: Tensor2,
@@ -777,6 +779,7 @@ impl StepPort {
         let cols = boundary.layout.cols();
         StepPort {
             boundary,
+            parallel_wait: true,
             x: Tensor2::zeros(h.hidden, 1),
             list: Vec::with_capacity(h.n_used),
             xs: if cols > 1 {
@@ -950,7 +953,7 @@ impl StepPort {
         let generation = word(&self.boundary.page, Word::Gen);
         let early = !before(generation.load(Ordering::Acquire), want);
         let parks = threads::pool().stats().worker_parks;
-        let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE);
+        let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE, self.parallel_wait);
         let gap = nanos(entered.elapsed());
         let closed = Closed::close(self.window.as_ref());
         self.gaps[(self.stats.gaps % GAP_RING as u64) as usize] = gap;
@@ -1386,17 +1389,17 @@ fn reuse_slices<'a, 'b, T>(mut v: Vec<&'a [T]>) -> Vec<&'b [T]> {
 }
 
 /// Wait until the generation word has reached `want` or `deadline` has
-/// passed, with every pool thread spinning on it — a pool job, so no worker
+/// passed. A port with no local CPU tier uses a pool job, so no worker
 /// is parked when the go lands and the dispatch that follows starts inside
 /// the spin window this job leaves them in. Returns the word as last read,
 /// and the nanoseconds from the calling thread seeing it to the job's end
 /// (the calling thread runs the last chunk and alone writes that stamp).
-fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
+fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant, parallel: bool) -> (u32, u64) {
     let pool = threads::pool();
     let caller = pool.threads() - 1;
     let base = Instant::now();
     let seen_at = AtomicU64::new(0);
-    pool.for_each_chunk(pool.threads(), |chunk| {
+    let wait = |chunk: std::ops::Range<usize>| {
         let mut spins = 0u32;
         while before(generation.load(Ordering::Acquire), want) {
             spins = spins.wrapping_add(1);
@@ -1409,7 +1412,12 @@ fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
             let ns = nanos(base.elapsed());
             seen_at.store(ns, Ordering::Relaxed);
         }
-    });
+    };
+    if parallel {
+        pool.for_each_chunk(pool.threads(), wait);
+    } else {
+        wait(caller..caller + 1);
+    }
     let end = nanos(base.elapsed());
     (
         generation.load(Ordering::Acquire),
@@ -1423,6 +1431,24 @@ mod tests {
     use model::ops::DEFER_MAX_COLS;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn a_scalar_go_wait_leaves_the_pool_for_the_host_tier() {
+        let pool = threads::pool();
+        let go = AtomicU32::new(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                pool.for_each_chunk(1, |_| {
+                    assert!(std::time::Instant::now() < deadline);
+                    go.store(1, Ordering::Release);
+                });
+            });
+            let (seen, _) = super::wait_go(&go, 1, deadline, false);
+            assert_eq!(seen, 1);
+        });
+    }
 
     /// The staging window is closed while a service's guard lives and open
     /// again however the service ends — its signal's drop, an error return,

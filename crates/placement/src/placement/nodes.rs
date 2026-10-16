@@ -38,6 +38,105 @@ use super::{
     row_bytes,
 };
 
+/// Lower a node assignment into the stage's loaded row map. Remote host
+/// segments name their tier endpoint but allocate no stage-device buffers.
+/// Each node's host/NVMe split is reconstructed against its own room at open.
+pub fn lower_routed(plan: &mut Plan<'_>, owned: &[u64]) -> Result<(), PlacementError> {
+    let bad = |detail: &str| PlacementError::Metadata {
+        key: "node routed assignment".into(),
+        detail: detail.into(),
+    };
+    if plan.machine.cards.len() != 1
+        || owned.len() != plan.machine.tiers.len() + 1
+        || owned.iter().try_fold(0u64, |s, &n| s.checked_add(n)) != Some(plan.model.experts)
+        || owned[1..].contains(&0)
+    {
+        return Err(bad(
+            "expected one stage and a nonempty partition for each loaded tier",
+        ));
+    }
+    super::check_tiers(&plan.machine.tiers)?;
+    super::check_devices(plan.machine, plan.card_budget)?;
+    let mut n_l = vec![0; plan.model.layers];
+    let mut tier_n_l = vec![vec![0; plan.model.layers]; owned.len() - 1];
+    let mut rows = plan.rows.clone();
+    for row in &mut rows {
+        let t = &plan.model.tensors[row.tensor];
+        if t.role != Role::RoutedExperts {
+            continue;
+        }
+        if plan.model.experts_of(t) != plan.model.experts {
+            return Err(PlacementError::tensor(
+                t,
+                "a node assignment over unequal expert stacks",
+            ));
+        }
+        let layer = t.layer.filter(|&l| l < n_l.len()).ok_or_else(|| {
+            PlacementError::tensor(t, "a routed stack outside the node assignment")
+        })?;
+        let kept = plan.n_l[layer].min(owned[0]);
+        n_l[layer] = kept;
+        let (rows_per_expert, file_per_expert) = super::per_expert(t, plan.model.experts)?;
+        let mut segments = Vec::with_capacity(owned.len() + 1);
+        if kept != 0 {
+            let format = row.segments.iter().find_map(|s| match s.format {
+                Format::Card(format) => Some(format),
+                _ => None,
+            });
+            segments.push(super::card_segment_as(
+                t,
+                0,
+                kept * rows_per_expert,
+                Some(super::ExpertList::range(0..kept)?),
+                format,
+            )?);
+        }
+        let mut first = owned[0];
+        for (j, &n) in owned.iter().enumerate().skip(1) {
+            segments.push(super::in_place(
+                Device::Card(j),
+                Format::HostFile,
+                Some(super::ExpertList::range(first..first + n)?),
+                0,
+            ));
+            tier_n_l[j - 1][layer] = n;
+            first += n;
+        }
+        if kept < owned[0] {
+            segments.push(super::in_place(
+                Device::Host,
+                Format::HostFile,
+                Some(super::ExpertList::range(kept..owned[0])?),
+                (owned[0] - kept) * file_per_expert,
+            ));
+        }
+        row.segments = segments;
+    }
+    let mut kv: Vec<_> = plan
+        .cards
+        .iter()
+        .map(|c| (c.kv_bytes, 0, c.stage_rows_bytes))
+        .collect();
+    kv.resize(
+        plan.machine.cards.len() + plan.machine.tiers.len(),
+        (0, 0, 0),
+    );
+    kv[0].1 = plan.host.shadow_bytes;
+    let mut lowered = super::totals(
+        plan.model,
+        plan.machine,
+        plan.ctx_max,
+        rows,
+        &kv,
+        (n_l, tier_n_l),
+        plan.card_budget,
+    )?;
+    lowered.host.arena_columns = plan.host.arena_columns;
+    lowered.budget_from_pool = plan.budget_from_pool;
+    *plan = lowered;
+    Ok(())
+}
+
 /// The routed stacks assigned to `card`, as a host plan on `machine`'s own
 /// node. Non-routed tensors stay with the stage. The existing NVMe split can
 /// then divide this node's host rows without charging another node's pool.

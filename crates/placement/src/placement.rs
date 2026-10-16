@@ -1665,8 +1665,15 @@ fn refused(t: &ModelTensor, format: CardFormat, k: u64, rows: u64) -> PlacementE
 /// be derived or do not sum to its resident bytes. Such a segment still
 /// counts, as one allocation of its resident bytes, so a heap never holds
 /// less than its card's resident bytes.
-fn card_heaps(model: &ModelTensors, cards: &[&Card], rows: &[Row]) -> (Vec<Heap>, Vec<Violation>) {
-    let mut heaps: Vec<Heap> = cards.iter().map(|c| Heap::new(c.granule_bytes)).collect();
+fn card_heaps(
+    model: &ModelTensors,
+    machine: &Machine,
+    rows: &[Row],
+) -> (Vec<Heap>, Vec<Violation>) {
+    let mut heaps: Vec<Heap> = machine
+        .all_cards()
+        .map(|c| Heap::new(c.granule_bytes))
+        .collect();
     let mut bad = Vec::new();
     for r in rows {
         let Some(t) = model.tensors.get(r.tensor) else {
@@ -1676,6 +1683,14 @@ fn card_heaps(model: &ModelTensors, cards: &[&Card], rows: &[Row]) -> (Vec<Heap>
             let Device::Card(c) = s.device else {
                 continue;
             };
+            if c >= machine.cards.len()
+                && c < heaps.len()
+                && t.role == Role::RoutedExperts
+                && s.format == Format::HostFile
+                && s.resident_bytes == 0
+            {
+                continue;
+            }
             let (bufs, detail) = match s.buffer_bytes(t, model.experts) {
                 Ok(bufs) if bufs.iter().sum::<u64>() == s.resident_bytes => (bufs, None),
                 Ok(bufs) => (
@@ -3673,6 +3688,15 @@ pub fn plan_in_pool<'a>(
     }
 }
 
+fn host_tier(machine: &Machine, rows: &[Row], card: usize) -> bool {
+    card >= machine.cards.len()
+        && rows.iter().any(|r| {
+            r.segments
+                .iter()
+                .any(|s| s.device == Device::Card(card) && s.format == Format::HostFile)
+        })
+}
+
 /// The per-device sums of a finished set of rows; `kv_bytes` is, per card of
 /// [`Machine::all_cards`], its layers' cache, their ring shadows, which the
 /// host holds, and the stage's rows beside the cache; `counts` the stage
@@ -3722,7 +3746,7 @@ fn totals<'a>(
     }
     // Rows from `card_segment` carry their buffers' sum, so no card segment
     // here is one `violations` would report.
-    let (heaps, _) = card_heaps(model, &cards, &rows);
+    let (heaps, _) = card_heaps(model, machine, &rows);
     let held = |c: usize, card: &Card| -> u64 {
         match c.checked_sub(machine.cards.len()) {
             None => card.layers.clone().map(|l| n_l[l]).sum(),
@@ -3740,7 +3764,7 @@ fn totals<'a>(
             let used = card
                 .floor_bytes(heap.taken, kv, stage_rows)
                 .ok_or_else(|| card.bytes_past_u64())?;
-            if machine.unified().is_some() {
+            if machine.unified().is_some() && !host_tier(machine, &rows, c) {
                 pool_cards = pool_cards
                     .checked_add(used - card.context_in_free())
                     .and_then(|bytes| bytes.checked_add(card.margin_bytes))
@@ -3961,9 +3985,12 @@ impl Plan<'_> {
                 });
             }
         }
-        let (heaps, unsized_segments) = card_heaps(model, &cards, &self.rows);
+        let (heaps, unsized_segments) = card_heaps(model, self.machine, &self.rows);
         out.extend(unsized_segments);
-        for ((card, totals), heap) in cards.iter().zip(&self.cards).zip(&heaps) {
+        for (c, ((card, totals), heap)) in cards.iter().zip(&self.cards).zip(&heaps).enumerate() {
+            if host_tier(self.machine, &self.rows, c) {
+                continue;
+            }
             let total = card_total(card, totals, heap);
             let limit = self.usable_bytes(card).saturating_sub(card.margin_bytes);
             if total > limit {
@@ -4032,12 +4059,14 @@ impl Plan<'_> {
             .pool_bytes()
             .expect("the plan was made on a pool that fits u64")?;
         let cards: Vec<&Card> = self.machine.all_cards().collect();
-        let (heaps, _) = card_heaps(self.model, &cards, &self.rows);
+        let (heaps, _) = card_heaps(self.model, self.machine, &self.rows);
         let cards_bytes = cards
             .iter()
             .zip(&self.cards)
             .zip(&heaps)
-            .map(|((card, totals), heap)| card_total(card, totals, heap) + card.margin_bytes)
+            .enumerate()
+            .filter(|(i, _)| !host_tier(self.machine, &self.rows, *i))
+            .map(|(_, ((card, totals), heap))| card_total(card, totals, heap) + card.margin_bytes)
             .sum();
         let host = workstation::HostNeed {
             experts: self.host_resident(),
@@ -4806,6 +4835,158 @@ mod tests {
                 .all(|r| r.segments[0].device == Device::Unused)
         );
         assert_eq!(empty.host.expert_bytes, 0);
+
+        let mut pool_machine = machine.clone();
+        pool_machine.nodes[0].unified = Some(UnifiedPool { bytes: 1 << 30 });
+        pool_machine.tiers[0].scratch_bytes = EXPERT;
+        let mut lowered = plan;
+        lowered.machine = &pool_machine;
+        let half = model.experts / 2;
+        nodes::lower_routed(&mut lowered, &[half, model.experts - half]).unwrap();
+        assert_eq!(
+            lowered.tier_n_l,
+            vec![vec![model.experts - half; model.layers]]
+        );
+        assert!(lowered.n_l.iter().all(|&n| n <= half));
+        assert_eq!(lowered.cards[1].expert_bytes, 0);
+        assert!(
+            lowered.violations().is_empty(),
+            "{:?}",
+            lowered.violations()
+        );
+        let stage = &lowered.cards[0];
+        assert_eq!(
+            lowered.pool_need().unwrap().cards,
+            stage.dense_bytes + stage.expert_bytes + stage.rounding_bytes
+        );
+        assert_eq!(
+            lowered.host.pool_card_bytes,
+            stage.dense_bytes + stage.expert_bytes + stage.rounding_bytes
+        );
+        let projected = nodes::routed_host(&model, &lowered.rows, 1, &remote, 4).unwrap();
+        assert!(
+            projected.host.experts
+                > plan_with(&model, &machine, 4096, &NoKv, None)
+                    .unwrap()
+                    .cards[1]
+                    .experts
+        );
+        for row in &lowered.rows {
+            let t = &model.tensors[row.tensor];
+            if t.role == Role::RoutedExperts {
+                let assigned = row
+                    .segments
+                    .iter()
+                    .find(|s| s.device == Device::Card(1))
+                    .unwrap();
+                assert_eq!(
+                    assigned.experts.as_ref().unwrap().ids(),
+                    (half as u32..model.experts as u32).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    (assigned.format, assigned.resident_bytes),
+                    (Format::HostFile, 0)
+                );
+            }
+        }
+        assert!(nodes::lower_routed(&mut lowered, &[model.experts, 0]).is_err());
+        assert!(nodes::lower_routed(&mut lowered, &[half, half + 1]).is_err());
+
+        for ty in [
+            GgmlType::Q5_1,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ4_XS,
+            GgmlType::IQ4_NL,
+        ] {
+            let mut blocks = model.clone();
+            for t in blocks
+                .tensors
+                .iter_mut()
+                .filter(|t| t.role == Role::RoutedExperts)
+            {
+                t.ty = ty;
+                t.file_bytes = t.dims.iter().product::<u64>() / ty.blck_size().unwrap()
+                    * ty.type_size().unwrap();
+            }
+            let mut seed = machine.clone();
+            seed.tiers.clear();
+            for budget in [None, Some(HEAD)] {
+                let mut plan = plan_routed(
+                    &blocks,
+                    &seed,
+                    4096,
+                    &NoKv,
+                    &PlanLevers {
+                        card_budget_bytes: budget,
+                    },
+                    RoutedRule::PerType(|_| Some(CardFormat::KQuant)),
+                )
+                .unwrap();
+                if budget.is_some() {
+                    assert_eq!(plan.n_l, vec![0; blocks.layers]);
+                }
+                plan.machine = &machine;
+                for owned in [[0, model.experts], [half, half]] {
+                    let mut lowered = plan.clone();
+                    nodes::lower_routed(&mut lowered, &owned)
+                        .unwrap_or_else(|e| panic!("{ty}, {budget:?}, {owned:?}: {e}"));
+                    assert!(lowered.violations().is_empty());
+                    for row in &lowered.rows {
+                        let t = &blocks.tensors[row.tensor];
+                        if t.role != Role::RoutedExperts {
+                            let original = &plan.rows[row.tensor];
+                            assert_eq!(
+                                (row.tensor, row.stage, row.read_bytes),
+                                (original.tensor, original.stage, original.read_bytes)
+                            );
+                            assert_eq!(row.segments.len(), original.segments.len());
+                            for (a, b) in row.segments.iter().zip(&original.segments) {
+                                assert_eq!(
+                                    (a.device, a.format, &a.experts, a.resident_bytes),
+                                    (b.device, b.format, &b.experts, b.resident_bytes)
+                                );
+                            }
+                            continue;
+                        }
+                        assert_eq!(row.read_bytes, plan.rows[row.tensor].read_bytes);
+                        assert_eq!(row.stage, plan.rows[row.tensor].stage);
+                        let kept = lowered.n_l[t.layer.unwrap()];
+                        let remote = row
+                            .segments
+                            .iter()
+                            .find(|s| s.device == Device::Card(1))
+                            .unwrap();
+                        assert_eq!(
+                            (remote.format, remote.resident_bytes),
+                            (Format::HostFile, 0)
+                        );
+                        assert_eq!(
+                            remote.experts,
+                            Some(ExpertList::range(owned[0]..model.experts).unwrap())
+                        );
+                        let card = row.segments.iter().find(|s| s.device == Device::Card(0));
+                        assert_eq!(card.is_some(), kept != 0);
+                        if let Some(card) = card {
+                            assert_eq!(card.format, Format::Card(CardFormat::KQuant));
+                        }
+                        let host = row.segments.iter().find(|s| s.device == Device::Host);
+                        assert_eq!(host.is_some(), kept < owned[0]);
+                        if let Some(host) = host {
+                            assert_eq!(
+                                host.experts,
+                                Some(ExpertList::range(kept..owned[0]).unwrap())
+                            );
+                            assert_eq!(host.format, Format::HostFile);
+                            assert_eq!(
+                                host.resident_bytes,
+                                (owned[0] - kept) * t.file_bytes / model.experts
+                            );
+                        }
+                    }
+                    assert_eq!(lowered.cards[1].expert_bytes, 0);
+                }
+            }
+        }
     }
 
     /// [`layered`]'s embedding and head over one layer of routed stacks a

@@ -355,16 +355,19 @@ impl NodeOpen {
             })?;
         let machine = workstation::plan_on(spec_of_device(device), self.layers);
         let plan = self.host_plan(tensors, &machine)?;
-        let least =
-            model::placement::ArenaFloor::of(&plan).map_err(|e| GpuError::plan(SERVER, e))?;
+        let floor = if plan.host.nvme_expert_bytes == 0 {
+            0
+        } else {
+            model::placement::ArenaFloor::of(&plan)
+                .map_err(|e| GpuError::plan(SERVER, e))?
+                .bytes
+        };
         let mut arena = workstation::HostNeed::of(&plan, 0)
-            .grant(census.host_room.min(paging.room), least.bytes)
+            .grant(census.host_room.min(paging.room), floor)
             .map_err(|e| GpuError::plan(SERVER, e))?;
         arena.granted = arena.granted.min(paging.arena.granted);
         let tier = crate::model::nvme_tier(gpu.context(), &plan, file, false, arena)?;
         let run = (family.host)(Arc::clone(file), self)?;
-        let tier =
-            tier.ok_or_else(|| GpuError::shape(SERVER, "the node's NVMe plan built no tier"))?;
         let experts = super::tier_cpu::CpuExperts::new(
             gpu,
             run,
@@ -387,7 +390,7 @@ impl NodeOpen {
             .as_ref()
             .ok_or_else(|| GpuError::shape(SERVER, "no node NVMe plan"))?;
         if paging.node == 0
-            || paging.arena.granted == 0
+            || (paging.arena.granted == 0) != (paging.arena.planned == 0)
             || paging.arena.granted > paging.arena.planned
         {
             return Err(GpuError::shape(SERVER, "invalid node NVMe arena grant"));
@@ -407,9 +410,7 @@ impl NodeOpen {
             .ok_or_else(|| GpuError::shape(SERVER, "the projected host reserve overflows"))?;
         model::placement::expert_nvme_tier(&mut projected, paging.room, Some(paging.arena.planned))
             .map_err(|e| GpuError::plan(SERVER, e))?;
-        if projected.host.nvme_arena_bytes != paging.arena.planned
-            || projected.host.nvme_expert_bytes == 0
-        {
+        if projected.host.nvme_arena_bytes != paging.arena.planned {
             return Err(GpuError::shape(
                 SERVER,
                 "the node's routed split disagrees with its arena grant",
@@ -630,7 +631,10 @@ impl NodeOpen {
                 granted: i.u64("granted arena")?,
             };
             let reserve = i.u64("node reserve")?;
-            if node == 0 || arena.granted == 0 || arena.granted > arena.planned {
+            if node == 0
+                || (arena.granted == 0) != (arena.planned == 0)
+                || arena.granted > arena.planned
+            {
                 return Err("invalid node NVMe arena grant".into());
             }
             Some(NodeNvme {
