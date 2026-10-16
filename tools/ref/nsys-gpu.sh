@@ -363,9 +363,11 @@ profile_cmd() {
          "$BIN" --tokens "$ids" -n "$NGEN" --ctx "$CTX" --mode "$MODE")
   fi
 }
-# 카드 핀·증인 줄·바이너리 신선도는 러너 넷이 같은 파일에서 읽는다.
+# The shared owner pins the local card and checks the journal around every profile.
+TIMING_LOCAL_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
+timing_cards_mode || exit $?
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
@@ -399,7 +401,9 @@ mkdir -p "$OUTDIR"
 
 WITNESS=(head-open indent card model)
 
+timing_cards_before_lease
 lease_take
+timing_cards_start
 echo "[config] nsys=$($NSYS --version) mode=$MODE n=$NGEN depths='$DEPTHS' out=$OUTDIR"
 [ "$FORM" != seed ] || echo "[config] form=seed bin=$BIN boundary=${BLOOMERY_NSYS_MARKER:-by token_embd type} ctx=${GEN_CTX:-D+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
 [ "$FORM" != prefill ] || echo "[config] form=prefill bin=$BIN boundary=${BLOOMERY_NSYS_MARKER:-by token_embd type} ctx=${GEN_CTX:-P+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
@@ -430,9 +434,17 @@ for i in "${!DEPTH_LIST[@]}"; do
     echo "=== 깊이 $d (ctx $CTX, mode $MODE, 재생 $((d + NGEN - 1))개 기대) → $out.nsys-rep"
   fi
   witness "pre d=$d"
+  if ! timing_cards_arm '' none; then
+    echo "nsys-gpu.sh: invalid witness before depth $d: $TWOCARD_WHY" >&2
+    exit 1
+  fi
   lease_bounded "$BOUND" "${CMD[@]:0:2}" "${CMD[@]:5}" > "$out.txt" 2>&1
   rc=$?
   witness "post d=$d"
+  if ! timing_cards_arm '' none; then
+    echo "nsys-gpu.sh: invalid witness after depth $d: $TWOCARD_WHY" >&2
+    exit 1
+  fi
   echo "[rc] $rc"
   [ $rc -eq 0 ] || { rc_all=$rc; echo "--- 마지막 20줄"; tail -n 20 "$out.txt"; continue; }
   lease_bounded "$BOUND" "$NSYS" export --type sqlite --force-overwrite true -o "$out.sqlite" "$out.nsys-rep" > "$out.export.txt" 2>&1 \

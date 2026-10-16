@@ -1298,6 +1298,7 @@ evict_arm() { :; }
 majflt_now() { echo 0; }
 majflt_mark() { cat; }
 witness() { :; }
+timing_cards_arm() { :; }
 ref_witness() { :; }
 ours_pre() { :; }
 ref_cmd() { REF_BIN=$TEST_BIN; REF_ARGS=("$TEST_PID"); REF_ENV=(); REF_MARK=''; }

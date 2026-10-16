@@ -1388,7 +1388,10 @@ case "$*" in
     exit 0
     ;;
 esac
-[ -z "$STUB_GONE" ] || { echo 'GPU is lost (stub)' >&2; exit 15; }
+if [ -n "$STUB_GONE" ] || { [ -n "$STUB_GONE_AFTER" ] && [ -e "$STUB_AFTER" ]; }; then
+  echo 'GPU is lost (stub)' >&2
+  exit 15
+fi
 echo 'NVIDIA GB10'
 SMI
 cat > "$C/local/journalctl" << 'JCTL'
@@ -1397,6 +1400,7 @@ case $STUB_JOURNAL in
   fail) echo 'journalctl: the stub fails' >&2; exit 1 ;;
   empty) exit 0 ;;
   warn) echo 'No journal files were opened due to insufficient permissions (stub).' >&2; exit 0 ;;
+  xid) if [ -e "$STUB_AFTER" ]; then echo '1790428801.000000 ws kernel: NVRM: Xid (PCI:0000:01:00): 79, stub'; exit 0; fi ;;
 esac
 echo '1790428800.000000 ws kernel: Linux version (stub)'
 JCTL
@@ -1453,6 +1457,76 @@ else
   locx 'timing-card.sh local: arm-place.sh refuses bp (64)' 64 \
     "^r: BLOOMERY_GEN_PLACE=bp: local mode times this machine's one card, at a \\(gate's rows are the 3090's, bp two cards by size rank\\)\$" \
     'source "${1%/*}/arm-place.sh"; PLACE_RUNNER=r PLACE_BIN=b PLACE_WORDS="a gate bp"; place_check "" bp'
+fi
+
+# The profiler keeps the timing-card checks around each arm and refuses broken trace boundaries.
+# Only the lease, freshness and profiler are stubs; the runner, card checks and analyzer are real.
+if [ ! -e /root/bloomery-cpu.lock ]; then
+  P=$tmp/profile
+  mkdir -p "$P"
+  cp "$ROOT/tools/ref/nsys-gpu.sh" "$P/"
+  printf 'MODEL_NAME=qwen35moe MODEL=/stub/model.gguf BLOOMERY_DATA=/stub\n' > "$P/ref-paths.sh"
+  printf 'source %q\nassert_fresh_binary() { :; }\n' "$ROOT/tools/ref/timing-card.sh" > "$P/timing-card.sh"
+  cat > "$P/lease.sh" << 'LEASE'
+lease_take() {
+  echo '[stub] lease taken'
+  [ -z "${STUB_BEFORE:-}" ] || touch "$STUB_AFTER"
+}
+witness() { :; }
+lease_bounded() { shift; "$@"; }
+LEASE
+  cat > "$P/nsys" << 'NSYS'
+#!/usr/bin/env bash
+set -euo pipefail
+kind=$1; shift
+while [ $# -gt 0 ]; do
+  if [ "$1" = -o ]; then out=$2; break; fi
+  shift
+done
+case $kind in
+  profile) touch "$STUB_AFTER"; echo 'time prompt n=9 ms=1.000 tok/s=9000 passes=1 kind=stub' ;;
+  export) cp "$STUB_DB" "$out" ;;
+  --version) echo 'stub nsys' ;;
+esac
+NSYS
+  chmod +x "$P/nsys"
+  python3 - "$P" << 'PY'
+import sqlite3, sys
+from pathlib import Path
+for name, marker, count in [("good", "embed_rows_q4k", 4), ("missing", "other", 4), ("count", "embed_rows_q4k", 3)]:
+    with sqlite3.connect(Path(sys.argv[1]) / (name + ".sqlite")) as db:
+        db.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
+        db.executemany("INSERT INTO StringIds VALUES (?, ?)", [(1, marker), (2, "gemv_q4k")])
+        db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER, end INTEGER, shortName INTEGER, gridX INTEGER, gridY INTEGER, gridZ INTEGER)")
+        db.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, ?, 1, 1, 1)",
+                       [(i * 1000 + j * 100, i * 1000 + j * 100 + 50, j + 1) for i in range(count) for j in range(2)])
+PY
+  prof() { # <name> <rc> <pattern> [NAME=value...]
+    local name=$1 want=$2 pat=$3
+    shift 3
+    run "nsys local: $name" "$want" "$pat" env -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_DRAFT \
+      -u STUB_GONE -u STUB_GONE_AFTER -u STUB_UUID_RC -u STUB_UUID_WARN -u STUB_JOURNAL -u STUB_BEFORE -u BLOOMERY_DRY \
+      PATH="$C/local:$PATH" BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/ld" STUB_UUIDS="$FAKE_GB10" \
+      BLOOMERY_NSYS_DEPTHS=9 BLOOMERY_NSYS_N=4 BLOOMERY_NSYS_MARKER=embed_rows_q4k BLOOMERY_NSYS_FORM= \
+      BLOOMERY_NSYS_OUT="$P/$n-out" NSYS="$P/nsys" STUB_AFTER="$P/$n-after" STUB_DB="$P/good.sqlite" \
+      "$@" bash "$P/nsys-gpu.sh"
+  }
+  prof 'healthy seed arm produces a table' 0 '\[boundary\].* -> OK'
+  has 'nsys local: healthy seed prefill window contains only its kernels' '\[window 0 = depth 8 \(the seeded prompt.s one id, eager prefill pass\)\] 커널 2개 '
+  has 'nsys local: healthy seed replay window contains only its kernels' '\[window 2 = depth 10 \(replay\)\] 커널 2개 '
+  has 'nsys local: healthy seed last window contains only its kernels' '\[window 3 = depth 11 \(last decode replay\)\] 커널 2개 '
+  prof 'healthy prefill window closes at the first replay' 0 '\[prefill window: P = 9, 1 unit\(s\) and the head\] kernels 2 ' BLOOMERY_NSYS_FORM=prefill
+  has 'nsys local: healthy prefill control window contains only its kernels' '\[control: replay 3 of 3, the last decode step\] kernels 2 '
+  prof 'wrong GPU refuses before profiling' 64 'is not a card nvidia-smi lists' BLOOMERY_TIMING_GPU="$FAKE_3090"
+  prof 'unreadable journal refuses before the lease' 69 'refused before the lease: journalctl -k does not answer' STUB_JOURNAL=fail
+  prof 'Xid before an arm refuses the profile' 1 'invalid witness before.*NVRM Xid' STUB_JOURNAL=xid STUB_BEFORE=1
+  prof 'Xid after an arm refuses the table' 1 'invalid witness after.*NVRM Xid' STUB_JOURNAL=xid
+  prof 'lost card before an arm refuses the profile' 1 'invalid witness before.*does not answer nvidia-smi' STUB_GONE=1
+  prof 'lost card after an arm refuses the table' 1 'invalid witness after.*does not answer nvidia-smi' STUB_GONE_AFTER=1
+  prof 'missing seed marker refuses the table' 3 'MISMATCH' STUB_DB="$P/missing.sqlite"
+  prof 'wrong seed step count refuses the table' 3 'MISMATCH' STUB_DB="$P/count.sqlite"
+  prof 'missing prefill marker refuses the table' 3 'MISMATCH' STUB_DB="$P/missing.sqlite" BLOOMERY_NSYS_FORM=prefill
+  prof 'wrong prefill step count refuses the table' 3 'MISMATCH' STUB_DB="$P/count.sqlite" BLOOMERY_NSYS_FORM=prefill
 fi
 
 # The t table: the four readers print the same t for df 1..40 (tdump.sh), and it is tdist.py's.
