@@ -365,10 +365,7 @@ fn hash_in_background(files: Vec<PathBuf>) -> Hashed {
 }
 
 fn sha256(p: &Path) -> Result<String, String> {
-    let size = std::fs::metadata(p)
-        .map_err(|e| format!("{}: {e}", p.display()))?
-        .len();
-    hf::fetch::digest(p, hf::Check::Sha256, size).map_err(|e| format!("{}: {e}", p.display()))
+    bloomery_gpu_gates::sha256(p).map_err(|e| e.to_string())
 }
 
 /// `messages` of the text chat.

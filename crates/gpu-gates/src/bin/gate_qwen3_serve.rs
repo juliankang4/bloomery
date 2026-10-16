@@ -460,7 +460,7 @@ mod gate {
         tokenized,
     };
     use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
-    use bloomery_gpu_gates::{GateError, checks_failed};
+    use bloomery_gpu_gates::{GateError, checks_failed, sha256};
     use gguf::{Gguf, Split};
     use model::placement::WholeLoad;
     use model::placement::workstation::{A6000, DeviceInfo, GRANULE, RTX_3090};
@@ -3076,16 +3076,6 @@ mod gate {
     struct Decoded {
         ids: Vec<u32>,
         agree: usize,
-    }
-
-    /// The sha256 of the file at `path`, as `sha256sum` prints it.
-    fn sha256(path: &Path) -> Result<String, GateError> {
-        let out = Command::new("sha256sum").arg(path).output()?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        match text.split_whitespace().next() {
-            Some(h) if out.status.success() => Ok(h.to_owned()),
-            _ => Err(format!("sha256sum {}: {:?}", path.display(), text.trim()).into()),
-        }
     }
 
     /// The set of `family` whose name ends in `suffix`, opened as a set of that family.

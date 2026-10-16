@@ -60,7 +60,8 @@ mod gate {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, PrefillPath, Qwen35moeModel};
     use bloomery_gpu_gates::{
-        GateError, RefManifest, checks_failed, data_dir, load_ref_in, ref_model_path, verdict,
+        GateError, RefManifest, checks_failed, data_dir, load_ref_in, ref_model_path, sha256,
+        verdict,
     };
     use gguf::Split;
     use refset::arch::qwen35::{
@@ -233,16 +234,6 @@ mod gate {
 
     fn median(v: &[f64]) -> f64 {
         quantile(v, 0.5)
-    }
-
-    /// The sha256 of `path`, by `sha256sum`.
-    fn sha256(path: &Path) -> Result<String, GateError> {
-        let out = std::process::Command::new("sha256sum").arg(path).output()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        match text.split_whitespace().next() {
-            Some(d) if out.status.success() && d.len() == 64 => Ok(d.to_string()),
-            _ => Err(format!("sha256sum {}: {:?}", path.display(), text.trim()).into()),
-        }
     }
 
     /// One set: its ids, read from the tokens file its header names and held

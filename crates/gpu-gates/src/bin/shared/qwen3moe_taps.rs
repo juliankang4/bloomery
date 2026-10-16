@@ -71,15 +71,7 @@ pub fn read_ids(path: &Path) -> Result<Vec<u32>, GateError> {
         .collect()
 }
 
-/// The sha256 of `path`, by `sha256sum`.
-pub fn sha256(path: &Path) -> Result<String, GateError> {
-    let out = std::process::Command::new("sha256sum").arg(path).output()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    match text.split_whitespace().next() {
-        Some(d) if out.status.success() && d.len() == 64 => Ok(d.to_string()),
-        _ => Err(format!("sha256sum {}: {:?}", path.display(), text.trim()).into()),
-    }
-}
+pub use bloomery_gpu_gates::sha256;
 
 /// `count` prompts of `len` ids from the ids file `path`, window `k` starting
 /// at `k · ⌊n / count⌋` of its `n` ids: spread over the whole file and never

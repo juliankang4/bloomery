@@ -82,7 +82,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu::{Gpu, GpuError, capture_template};
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, sha256, verdict};
     use bloomery_gpu_vision::f32_bf16;
     use gguf::Split;
     use refset::arch::qwen35::MODEL_FLASH_Q8;
@@ -281,15 +281,6 @@ mod gate {
         cuda: Vec<f32>,
         twin: Vec<f32>,
         c2p: Vec<f32>,
-    }
-
-    fn sha256(path: &Path) -> Result<String, GateError> {
-        let out = std::process::Command::new("sha256sum").arg(path).output()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        match text.split_whitespace().next() {
-            Some(d) if out.status.success() && d.len() == 64 => Ok(d.to_string()),
-            _ => Err(format!("sha256sum {}: {:?}", path.display(), text.trim()).into()),
-        }
     }
 
     impl Case {
