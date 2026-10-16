@@ -54,6 +54,7 @@
 #include "llama.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ref_io.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -240,10 +241,8 @@ static bool read_ids(const std::string & path, long long max_tokens, std::vector
     while (std::getline(in, line)) {
         ++lines;
         if (max_tokens >= 0 && (long long) ids.size() >= max_tokens) continue;  // count the rest
-        char * end = nullptr;
-        errno = 0;
-        const long v = strtol(line.c_str(), &end, 10);
-        if (line.empty() || *end != '\0' || errno != 0 || v < 0 || v > INT32_MAX) {
+        int32_t v;
+        if (!parse_token_id(line, v)) {
             fprintf(stderr, "router_trace: %s:%lld is not a token id: '%s'\n", path.c_str(), lines, line.c_str());
             return false;
         }
