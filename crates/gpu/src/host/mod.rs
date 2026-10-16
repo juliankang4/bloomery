@@ -1793,10 +1793,8 @@ impl<H: HostExperts> HostTier<H> {
         let mut page = match (tiers.iter().find_map(TierCard::node), kind) {
             (None, _) => TierPage::new(stage, tiers[0].gpu()?, layout, kind)?,
             (Some(_), bloomery_levers::TierLink::Shared) => TierPage::across(stage, layout)?,
-            (
-                Some(addr),
-                kind @ (bloomery_levers::TierLink::Loopback | bloomery_levers::TierLink::Rdma),
-            ) => {
+            (Some(_), bloomery_levers::TierLink::Rdma) => TierPage::remote(stage, layout)?,
+            (Some(addr), kind @ bloomery_levers::TierLink::Loopback) => {
                 return Err(GpuError::shape(
                     WHAT,
                     format!(
@@ -1808,7 +1806,7 @@ impl<H: HostExperts> HostTier<H> {
             }
         };
         for (t, tier) in tiers.iter_mut().enumerate() {
-            tier.bind(&page, t, stage)?;
+            tier.bind(&mut page, t, stage)?;
         }
         page.unlink()?;
         self.tier_goes = tiers.iter().map(|t| t.progress(&page)).collect();
@@ -2902,6 +2900,14 @@ impl<H: HostExperts> HostTier<H> {
         self.step.boundary.release();
         if let Some(page) = self.tier_page.as_ref() {
             self.health.held = page.release().err();
+            if self.health.held.is_none() {
+                for tier in &mut self.tiers {
+                    if let Err(e) = tier.release_remote(page) {
+                        self.health.held = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
         }
     }
 

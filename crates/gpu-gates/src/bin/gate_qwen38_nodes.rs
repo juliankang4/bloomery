@@ -840,11 +840,11 @@ mod gate {
             if opened[0] != Tag::Ok as u8 {
                 return Err(format!("bind: node 1 refused the valid open: {opened:?}").into());
             }
-            let path = alias.to_str().ok_or("a symlink path not UTF-8")?;
-            payload.clear().str(path).len(before.len()).len(1).len(0);
+            payload.clear();
+            bloomery_gpu::host::node::write_file_bind(&alias, before.len(), 1, 0, &mut payload)?;
             let reply = node_reply(&mut s, Tag::Bind, payload.done())?;
-            let refused =
-                reply[0] == Tag::Err as u8 && String::from_utf8_lossy(&reply[1..]).contains(path);
+            let refused = reply[0] == Tag::Err as u8
+                && String::from_utf8_lossy(&reply[1..]).contains(alias.to_string_lossy().as_ref());
             s.shutdown(Shutdown::Both)?;
             drop(s);
             let ended = n1.wait_within(Duration::from_secs(60))?;
