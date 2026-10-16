@@ -1410,6 +1410,173 @@ EOF
     read -r sp ip < "$t/scope.pid"
     check bounded-mem-scope-child-gone "$(kill -0 "$sp" 2> /dev/null && echo no || echo yes)" yes
     if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
+    # Cancel profiling during record, before the decoder PID is assigned and during annotate/callers;
+    # failed decoders report their code and the last 20 log lines.
+    perf='perf-decode'
+    awk '/^trap .* EXIT$/ { print; found++ } END { if (found != 1) exit 1 }' \
+      "$LEASE_TREE/tools/ref/$perf.sh" > "$t/perf-exit" || exit 70
+    for child_status in 0 23; do
+      for cleanup_rc in 0 70; do
+        RC=0
+        bash -c '
+          source "$1"
+          bound_pid=unused cleanup_rc=$2
+          lease_stop() { return "$cleanup_rc"; }
+          lease_out_clean() { echo clean; }
+          exit "$3"
+        ' _ "$t/perf-exit" "$cleanup_rc" "$child_status" > "$t/perf-exit.log" 2>&1 || RC=$?
+        want=$child_status
+        [ "$cleanup_rc" = 0 ] || want=$cleanup_rc
+        check "bounded-perf-exit-$child_status-cleanup-$cleanup_rc-rc" "$RC" "$want"
+        check "bounded-perf-exit-$child_status-cleanup-$cleanup_rc-clean" "$(cat "$t/perf-exit.log")" clean
+      done
+    done
+    mkdir -p "$t/perf-tree/tools/ref" "$t/perf-bin"
+    cp "$LEASE_TREE/tools/ref/$perf.sh" "$t/perf-tree/tools/ref/"
+    printf '%s\n' 'MODEL=unused REF_TOKENS=0' > "$t/perf-tree/tools/ref/ref-paths.sh"
+    cat > "$t/perf-tree/tools/ref/lease.sh" << 'EOF'
+source "$STUB_PERF_LEASE"
+lease_take() { exec 9> "$STUB_PERF_LOCK"; flock -n 9; }
+witness() { :; }
+EOF
+    cat > "$t/perf-bin/decoder" << 'EOF'
+#!/bin/sh
+echo 'step '
+case $STUB_PERF_PHASE in
+  record | fork | startup) exec "$STUB_PERF_HELD" "$STUB_PERF_PID" ;;
+esac
+echo "$$ $PPID" > "$STUB_PERF_PID"
+while [ ! -e "$STUB_PERF_GO" ]; do sleep 0.01; done
+if [ "${STUB_DECODE_RC:-0}" != 0 ]; then
+  i=1
+  while [ "$i" -le 24 ]; do echo "decode line $i"; i=$((i + 1)); done
+fi
+echo ' 0 0 1.0 '
+echo 'decode steps in 1 s, per step mean 1.0 ms'
+exit "${STUB_DECODE_RC:-0}"
+EOF
+    cat > "$t/perf-bin/perf" << 'EOF'
+#!/bin/sh
+echo "$1" >> "$STUB_PERF_CALLS"
+case $1 in
+  record)
+    case $STUB_PERF_PHASE in record | fork | startup) exec "$STUB_PERF_HELD" "$STUB_PERF_RECORD" ;; esac
+    touch "$STUB_PERF_GO"
+    ;;
+  script) echo '0 stub' ;;
+  annotate | report)
+    case $* in *next*) exit 0 ;; esac
+    exec "$STUB_PERF_HELD" "$STUB_PERF_RECORD"
+    ;;
+  *) exit 64 ;;
+esac
+EOF
+    # The PID file supplies the timeout-child lookup on every host, so the test needs no /proc.
+    cat > "$t/perf-bin/awk" << 'EOF'
+#!/bin/sh
+case ${2:-} in
+  /proc/*/task/*/children)
+    read -r child parent < "$STUB_PERF_PID" || exit 1
+    [ "$2" = "/proc/$parent/task/$parent/children" ] || exit 1
+    echo "$child"
+    ;;
+  *) exec /usr/bin/awk "$@" ;;
+esac
+EOF
+    cat > "$t/perf-bin/mktemp" << 'EOF'
+#!/bin/sh
+if [ "$*" = '-d /tmp/perf-decode.XXXXXX' ]; then
+  exec /usr/bin/mktemp -d "$STUB_PERF_DIR/out.XXXXXX"
+fi
+exec /usr/bin/mktemp "$@"
+EOF
+    chmod +x "$t/perf-bin/"*
+    for phase in record fork startup annotate callers fail bound; do
+      pdir=$t/perf-$phase
+      mkdir "$pdir"
+      bpath=$t/perf-bin:$PATH
+      [ "$phase" != fork ] || bpath=$t/fork-bin:$bpath
+      annotate='' callers='' decode_rc=0
+      case $phase in
+        annotate) annotate='stub next' ;;
+        callers) callers='stub next' ;;
+        fail) decode_rc=23 ;;
+        bound) decode_rc=124 ;;
+      esac
+      # Deliver TERM with the trap set but before the decoder PID is assigned.
+      awk -v phase="$phase" '
+        phase == "startup" && /^timeout --kill-after=10 / { print "kill -TERM $$" }
+        { print }
+      ' "$LEASE_TREE/tools/ref/$perf.sh" > "$t/perf-tree/tools/ref/$perf.sh"
+      STUB_PERF_LEASE="$LEASE_TREE/tools/ref/lease.sh" STUB_PERF_LOCK="$pdir/lease" \
+        STUB_PERF_HELD="$t/held" STUB_PERF_PID="$pdir/decoder.pid" STUB_PERF_RECORD="$pdir/record.pid" \
+        STUB_PERF_PHASE=$phase STUB_PERF_CALLS="$pdir/calls" STUB_DECODE_RC=$decode_rc \
+        STUB_PERF_GO="$pdir/go" \
+        BLOOMERY_DECODE_BIN="$t/perf-bin/decoder" STUB_PERF_DIR="$pdir" BLOOMERY_ARM_BOUND=$BOUND \
+        PERF_ANNOTATE=$annotate PERF_CALLERS=$callers PERF_KEEP=1 \
+        PATH="$bpath" bash "$t/perf-tree/tools/ref/$perf.sh" > "$pdir/log" 2> "$pdir/err" &
+      rp=$!
+      if [ "$phase" != startup ] && [ "$decode_rc" = 0 ]; then
+        i=0 ready=no decoder_ready=yes
+        case $phase in record | fork) decoder_ready=no ;; esac
+        until {
+          [ "$ready" = yes ] || { cancel_ready "$pdir/record.pid" && ready=yes; }
+          [ "$decoder_ready" = yes ] || { cancel_ready "$pdir/decoder.pid" && decoder_ready=yes; }
+          [ "$ready" = yes ] && [ "$decoder_ready" = yes ];
+        } || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
+        check "bounded-perf-$phase-ready" "$ready" yes
+        [ "$ready" = yes ] || sed 's/^/  err: /' "$pdir/err" >&2
+        case $phase in record | fork)
+          check "bounded-perf-$phase-decoder-ready" "$decoder_ready" yes
+          ;;
+        esac
+        lk=free
+        lease_free "$pdir/lease" 2> /dev/null || lk=held
+        check "bounded-perf-$phase-lease-held" "$lk" held
+        kill -TERM "$rp" 2> /dev/null
+      fi
+      s0=$SECONDS
+      RC=0
+      wait "$rp" || RC=$?
+      if [ "$decode_rc" != 0 ]; then
+        check "bounded-perf-$phase-rc" "$RC" "$decode_rc"
+        matches "bounded-perf-$phase-reason" "^decode exited $decode_rc: " "$(cat "$pdir/err")"
+        matches "bounded-perf-$phase-tail" '^decode steps in 1 s, per step mean 1.0 ms$' "$(cat "$pdir/err")"
+        matches "bounded-perf-$phase-tail-first" '^decode line 7$' "$(cat "$pdir/err")"
+        check "bounded-perf-$phase-tail-lines" "$(grep -cE '^decode line |^ 0 |^decode steps in ' "$pdir/err")" 20
+        continue
+      fi
+      check "bounded-perf-$phase-term-rc" "$RC" 143
+      ended=before
+      [ "$((SECONDS - s0))" -lt "$BOUND" ] || ended='at or after'
+      left=''
+      for child in decoder record; do
+        if [ -s "$pdir/$child.pid" ]; then
+          read -r sp ip < "$pdir/$child.pid"
+          if kill -0 "$sp" 2> /dev/null; then
+            state=$(ps -o stat= -p "$sp" 2> /dev/null) || state=''
+            if [ "$phase" != fork ] || [[ $state != *Z* && -n $state ]]; then left="$left $child"; fi
+          fi
+          if kill -0 "$ip" 2> /dev/null; then left="$left $child-timeout"; fi
+        fi
+      done
+      lk=free
+      lease_free "$pdir/lease" 2> /dev/null || lk=held
+      check "bounded-perf-$phase-term" "left:${left:- none}, lease: $lk, ended $ended the $BOUND s bound" \
+        "left: none, lease: free, ended before the $BOUND s bound"
+      check "bounded-perf-$phase-stopped" "$(grep -c '^\[perf\] kept ' "$pdir/log")" 0
+      [ "$phase" != startup ] || check bounded-perf-startup-no-perf "$([ -s "$pdir/calls" ] && echo called || echo none)" none
+      # Signal only a survivor, after the assertions, including on an unfixed runner.
+      if [ -n "$left" ]; then
+        for child in decoder record; do
+          if [ -s "$pdir/$child.pid" ]; then
+            read -r sp ip < "$pdir/$child.pid"
+            if kill -0 "$ip" 2> /dev/null; then lease_stop "$ip" || :; fi
+            if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
+          fi
+        done
+      fi
+    done
     RC=0
     lease_capture 10 sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-capture-rc "$RC" 3

@@ -28,17 +28,45 @@ lease_take
 witness pre
 # Bounded like every child under the lease (lease_bounded's bound); perf attaches to the decode binary
 # itself, the bound's child, whose pid is the main thread's tid in the tables below.
+bound_pid='' decode_exit=''
+trap 'rc=$?; trap "" TERM INT HUP; [ -z "$bound_pid" ] || lease_stop "$bound_pid" || rc=$?; lease_out_clean; exit "$rc"' EXIT
+decode_failed() {
+  local rc=$1 why=${2:-failed}
+  case $rc in
+    124) why="cut off at its $LEASE_ARM_BOUND s bound" ;;
+    137) why="killed by SIGKILL (the bound's KILL or another SIGKILL)" ;;
+    *) [ "$rc" -le 128 ] || why="ended by signal $((rc - 128))" ;;
+  esac
+  echo "decode exited $rc: $why" >&2
+  tail -n 20 "$OUT/decode.log" >&2
+  exit "$rc"
+}
+for s in TERM:143 INT:130 HUP:129; do
+  # shellcheck disable=SC2064 # the signal's status now, the decoder PID when the trap runs
+  trap "decode_exit=${s#*:}; [ -z \"\$bound_pid\" ] || exit ${s#*:}" "${s%:*}"
+done
 timeout --kill-after=10 "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" > "$OUT/decode.log" 2>&1 &
 bound_pid=$!
+[ -z "$decode_exit" ] || exit "$decode_exit"
 pid=
 while [ -z "$pid" ]; do
-  kill -0 "$bound_pid" 2> /dev/null || { echo "decode exited before perf could attach" >&2; cat "$OUT/decode.log" >&2; exit 1; }
+  if ! kill -0 "$bound_pid" 2> /dev/null; then
+    decode_rc=0
+    wait "$bound_pid" || decode_rc=$?
+    [ "$decode_rc" != 0 ] || decode_rc=1
+    decode_failed "$decode_rc" 'ended before perf could attach'
+  fi
   pid=$(awk '{ print $1 }' "/proc/$bound_pid/task/$bound_pid/children" 2> /dev/null || true)
   [ -n "$pid" ] || sleep 0.01
 done
 # The step table's header is printed after the prefill returns; stdout is line-buffered.
 until grep -q '^step ' "$OUT/decode.log" 2> /dev/null; do
-  kill -0 "$pid" 2> /dev/null || { echo "decode exited before its step table" >&2; cat "$OUT/decode.log" >&2; exit 1; }
+  if ! kill -0 "$pid" 2> /dev/null; then
+    decode_rc=0
+    wait "$bound_pid" || decode_rc=$?
+    [ "$decode_rc" != 0 ] || decode_rc=1
+    decode_failed "$decode_rc" 'ended before its step table'
+  fi
   sleep 0.01
 done
 # PERF_CALLERS="<symbol>...": record the main thread alone with DWARF call chains instead, and print
@@ -50,7 +78,13 @@ else
 fi
 lease_bounded "$LEASE_ARM_BOUND" perf record -q -e cpu-clock -F 10000 "${target[@]}" -o "$OUT/perf.data" -- sleep "$SECS" 2> "$OUT/perf.err" || echo "[perf] record rc=$?: $(tr '\n' ' ' < "$OUT/perf.err")"
 if kill -0 "$pid" 2> /dev/null; then inside=yes; else inside=no; fi
-wait "$bound_pid"
+decode_rc=0
+wait "$bound_pid" || decode_rc=$?
+bound_pid=''
+# Later profiling commands keep their normal signal handling once the decoder has been reaped.
+trap - TERM INT HUP
+[ -z "$decode_exit" ] || exit "$decode_exit"
+[ "$decode_rc" -eq 0 ] || decode_failed "$decode_rc"
 witness post
 steps_done=$(grep -cE '^ +[0-9]+ +[0-9]+ +[0-9.]+ ' "$OUT/decode.log")
 grep -E 'decode steps in|per step' "$OUT/decode.log"
@@ -59,7 +93,8 @@ echo "[perf] window ${SECS}s after the prefill; decode still running when the wi
 # a `-p` record dropped every qdot kernel from the main thread and showed it as 73 % barrier spin, while
 # its own samples, listed one by one, were 68 % dot kernels.
 ms_step=$(grep -E 'decode steps in' "$OUT/decode.log" | sed 's/.*mean \([0-9.]*\) ms.*/\1/')
-lease_bounded "$LEASE_ARM_BOUND" perf script -i "$OUT/perf.data" -F tid,sym 2> /dev/null | awk -v main="$pid" '{print ($1 == main ? "main" : "workers"), $2}' \
+LEASE_BOUNDED_OUT=$OUT/script.txt LEASE_BOUNDED_ERR=/dev/null lease_bounded "$LEASE_ARM_BOUND" perf script -i "$OUT/perf.data" -F tid,sym
+awk -v main="$pid" '{print ($1 == main ? "main" : "workers"), $2}' "$OUT/script.txt" \
   | sed 's/\.llvm\.[0-9]*$//' > "$OUT/samples.txt"
 for who in main workers; do
   echo
@@ -67,7 +102,7 @@ for who in main workers; do
   awk -v who="$who" -v ms="$ms_step" -v top="$TOP" '
     $1 == who { n[$2]++; t++ }
     END {
-      for (s in n) printf "%7.2f%% %7.3f  %s\n", 100 * n[s] / t, ms * n[s] / t, s | "sort -rn | head -n " top
+      for (s in n) printf "%7.2f%% %7.3f  %s\n", 100 * n[s] / t, ms * n[s] / t, s | ("sort -rn | head -n " top)
       close("sort -rn | head -n " top)
       printf "  (%d samples)\n", t
     }' "$OUT/samples.txt"
@@ -78,14 +113,14 @@ done
 for sym in ${PERF_ANNOTATE:-}; do
   echo
   echo "=== hottest instructions of $sym ==="
-  lease_bounded "$LEASE_ARM_BOUND" perf annotate -i "$OUT/perf.data" --stdio -s "$sym" 2> /dev/null \
-    | grep -E '^ +[0-9]+\.[0-9]+ +:' | sort -rn | head -n 12 || true
+  LEASE_BOUNDED_OUT=$OUT/annotate.txt LEASE_BOUNDED_ERR=/dev/null lease_bounded "$LEASE_ARM_BOUND" perf annotate -i "$OUT/perf.data" --stdio -s "$sym" || true
+  grep -E '^ +[0-9]+\.[0-9]+ +:' "$OUT/annotate.txt" | sort -rn | head -n 12 || true
 done
 for sym in ${PERF_CALLERS:-}; do
   echo
   echo "=== main thread, callers of $sym ==="
-  lease_bounded "$LEASE_ARM_BOUND" perf report -i "$OUT/perf.data" --stdio --no-children --percentage relative -S "$sym" -G 2> /dev/null \
-    | grep -vE '^#|^$' | head -n 60 || true
+  LEASE_BOUNDED_OUT=$OUT/report.txt LEASE_BOUNDED_ERR=/dev/null lease_bounded "$LEASE_ARM_BOUND" perf report -i "$OUT/perf.data" --stdio --no-children --percentage relative -S "$sym" -G || true
+  grep -vE '^#|^$' "$OUT/report.txt" | head -n 60 || true
 done
 # PERF_KEEP=1 leaves the record for reading afterwards (reading is not measuring; recording is).
 if [ "${PERF_KEEP:-0}" = 1 ]; then echo "[perf] kept $OUT (main tid $pid)"; else rm -rf "$OUT"; fi
