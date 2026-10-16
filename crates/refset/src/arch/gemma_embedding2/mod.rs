@@ -171,7 +171,10 @@ pub static TOWER_CPU: Family = Family {
 };
 /// llama-server's `/v1/embeddings` vectors.
 pub static SERVER: Family = Family {
-    consumers: &["gate-gpu-gemma-embedding2-e2e", "gate-gpu-gemma-embedding2-serve"],
+    consumers: &[
+        "gate-gpu-gemma-embedding2-e2e",
+        "gate-gpu-gemma-embedding2-serve",
+    ],
     ..family(
         "server-gemma-embedding2",
         &[SERVER_SET],
