@@ -560,7 +560,7 @@ required-features = ["gemma-embedding2", "vision", "deepseek41"]
 
 [[bin]]
 name = "gate_gemma_embedding2_serve"
-required-features = ["deepseek41", "gemma-embedding2"]
+required-features = ["deepseek41", "gemma-embedding2", "vision"]
 
 [[bin]]
 name = "gate_gemma4v_tower"

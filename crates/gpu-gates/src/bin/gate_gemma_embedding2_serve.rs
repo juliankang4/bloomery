@@ -210,6 +210,120 @@ mod gate {
         Ok(ok)
     }
 
+    fn cache_images(embedding: &str) -> Result<bool, GateError> {
+        use bloomery_gpu_gates::side_seat::{Flags, Side};
+        use serve::embed::Embed;
+        use serve::embed_cache::{Value as Cached, image_key};
+
+        let flags: Vec<String> = [
+            "--embd-model",
+            embedding,
+            "--embd-mmproj",
+            MMPROJ_BF16,
+            "--embd-image-min-tokens",
+            "1",
+            "--embd-image-max-tokens",
+            "70",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let flags = Flags::take(&flags)?.0;
+        let side = flags.read()?.ok_or("no image side seat")?;
+        let seat = side.seat(Place::A)?;
+        let mut model = Side::start(Some((side, seat.clone())))?.ok_or("no encoder")?;
+        let media = model.media().ok_or("no image media model")?;
+        let tokenizer = model.tokenizer();
+        let file = serve::media::load(
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGM4kWIERAAKxQK9KV6Y1QAAAABJRU5ErkJggg==",
+        )?;
+        let prepared = std::sync::Arc::new(serve::media::prepare(&file, media.as_ref())?);
+        let (begin, end) = media
+            .embedding_delimiters()
+            .ok_or("no embedding image delimiters")?;
+        use serve::embeddings::InputPart;
+        let image = || InputPart::Media {
+            begin,
+            end,
+            positions: prepared.span_len,
+            kind: "image",
+        };
+        let mut prompts = Vec::new();
+        let mut baseline = Vec::new();
+        for parts in [
+            vec![InputPart::Text("Describe the coastal map."), image()],
+            vec![
+                image(),
+                InputPart::Text("Retrieve a photograph of the harbor."),
+            ],
+        ] {
+            let assembled = serve::embeddings::assemble(
+                parts.into_iter().map(Ok),
+                tokenizer.as_ref(),
+                model.ctx(),
+            )?;
+            let at = assembled.spans[0].start;
+            let prompt = serve::media::Prompt {
+                held: assembled.ids.into(),
+                feeds: vec![serve::media::MediaFeed {
+                    at,
+                    key: file.key,
+                    prepared: prepared.clone(),
+                }],
+            };
+            baseline.push(model.embed_media(&prompt.held.ids, &prompt.feeds, &[])?);
+            prompts.push(prompt);
+        }
+        drop(model);
+        let mut side = flags.read()?.ok_or("no image side seat")?;
+        side.cache_bytes = 64 * 1024 * 1024;
+        let mut model = Side::start(Some((side, seat)))?.ok_or("no cached encoder")?;
+        let cache = model.cache().ok_or("image cache is disabled")?;
+        let mut ok = true;
+        check(
+            &mut ok,
+            "cache_image_position_changed",
+            prompts[0].feeds[0].at != prompts[1].feeds[0].at
+                && image_key(&prompts[0].feeds[0]) == image_key(&prompts[1].feeds[0]),
+        );
+        for (index, prompt) in prompts.iter().enumerate() {
+            let ours = model.embed_media(&prompt.held.ids, &prompt.feeds, &[])?;
+            check(
+                &mut ok,
+                &format!("cache_image_{index}_bits"),
+                bloomery_gpu_gates::bits_equal(&ours, &baseline[index]),
+            );
+        }
+        let prompt = &prompts[1];
+        let key = image_key(&prompt.feeds[0]).ok_or("image has no cache key")?;
+        let Some(Cached::Image(rows)) = cache.lock().map_err(|_| "cache lock poisoned")?.get(&key)
+        else {
+            return Err("image tower rows were not cached".into());
+        };
+        // Direct side calls bypass pooled vectors, so only a tower hit can consume these rows.
+        cache
+            .lock()
+            .map_err(|_| "cache lock poisoned")?
+            .insert(key, Cached::Image(vec![0; rows.len()]));
+        let changed = model.embed_media(&prompt.held.ids, &prompt.feeds, &[])?;
+        check(
+            &mut ok,
+            "cache_image_rows_consumed",
+            !bloomery_gpu_gates::bits_equal(&changed, &baseline[1]),
+        );
+        cache
+            .lock()
+            .map_err(|_| "cache lock poisoned")?
+            .insert(key, Cached::Image(rows));
+        let restored = model.embed_media(&prompt.held.ids, &prompt.feeds, &[])?;
+        check(
+            &mut ok,
+            "cache_image_restored_bits",
+            bloomery_gpu_gates::bits_equal(&restored, &baseline[1]),
+        );
+        Ok(ok)
+    }
+
     fn videos(url: &dyn Fn(&str) -> String, manifest: &Path) -> Result<bool, GateError> {
         let root = manifest.parent().ok_or("video manifest needs a parent")?;
         let clips: Value = serde_json::from_str(&std::fs::read_to_string(manifest)?)?;
@@ -656,19 +770,28 @@ mod gate {
         let mut v1 = false;
         let mut clips = None;
         let mut audio = false;
+        let mut images = false;
         while let Some(a) = args_it.next() {
             match a.as_str() {
                 "--v1" if !v1 => v1 = true,
                 "--audio" if !audio => audio = true,
+                "--cache-images" if !images => images = true,
                 "--dir" => dir = args_it.next().ok_or("--dir needs DIR")?.into(),
                 "--video-clips" if clips.is_none() => {
                     clips = Some(PathBuf::from(args_it.next().ok_or("--video-clips needs clips.json")?));
                 }
-                _ => return Err(format!("unknown or duplicate argument {a}; takes --v1, --audio, --dir DIR and --video-clips clips.json").into()),
+                _ => return Err(format!("unknown or duplicate argument {a}; takes --v1, --audio, --cache-images, --dir DIR and --video-clips clips.json").into()),
             }
         }
-        if (v1 && (clips.is_some() || audio)) || (audio && clips.is_some()) {
-            return Err("--v1, --audio and --video-clips are mutually exclusive".into());
+        if [v1, clips.is_some(), audio, images]
+            .into_iter()
+            .filter(|v| *v)
+            .count()
+            > 1
+        {
+            return Err(
+                "--v1, --audio, --cache-images and --video-clips are mutually exclusive".into(),
+            );
         }
         use refset::arch::gemma_embedding as emb1;
         let (embedding, digest, server_family, cpu_family, ids_set, arch, ctx) = if v1 {
@@ -701,6 +824,16 @@ mod gate {
         }
         if sha256(Path::new(embedding))? != digest {
             return Err("embedding model sha256 differs from the server set".into());
+        }
+        if images {
+            if sha256(Path::new(MMPROJ_BF16))? != MMPROJ_BF16_SHA256 {
+                return Err("embedding projector sha256 differs from the oracle".into());
+            }
+            return if cache_images(embedding)? {
+                Ok(())
+            } else {
+                Err(checks_failed())
+            };
         }
         let model_path = ref_model_path()?;
         let model = model_path.to_str().ok_or("chat model path is not UTF-8")?;
@@ -868,6 +1001,9 @@ mod gate {
                 );
             }
             println!("{arm} server stopped {}", served.stop()?);
+        }
+        if !v1 {
+            ok &= cache_images(embedding)?;
         }
         let err = dir.join("embedding-as-chat.err");
         let (status, lines) = plan_run(cmd(BUDGET)?, &["-m", embedding], &err)?;

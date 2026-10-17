@@ -34,6 +34,7 @@ pub struct Flags {
     model: source::Flags,
     image: vision_seat::Flags,
     ctx: Option<usize>,
+    cache_bytes: Option<usize>,
 }
 
 impl Flags {
@@ -61,6 +62,16 @@ impl Flags {
                 f.image
                     .take(image_flag, &mut it.by_ref().map(String::as_str))
                     .map_err(|e| format!("{flag}: {e}"))?;
+                continue;
+            }
+            if flag == "--embd-cache-bytes" {
+                let v = it.next().ok_or("--embd-cache-bytes needs a value")?;
+                let bytes = v
+                    .parse::<usize>()
+                    .map_err(|e| format!("--embd-cache-bytes {v:?}: {e}"))?;
+                if f.cache_bytes.replace(bytes).is_some() {
+                    return Err("--embd-cache-bytes is given twice".into());
+                }
                 continue;
             }
             if flag == "--embd-ctx" {
@@ -91,7 +102,7 @@ impl Flags {
         let (model, _) = source::take(&selected, &["--embd-model"])
             .map_err(|e| format!("embedding flags (--embd-model/--embd-hf): {e}"))?;
         f.model = model;
-        if !f.names() && (!image_seen.is_empty() || f.ctx.is_some()) {
+        if !f.names() && (!image_seen.is_empty() || f.ctx.is_some() || f.cache_bytes.is_some()) {
             return Err("embedding image/context flags need --embd-model or --embd-hf".into());
         }
         Ok((f, rest))
@@ -198,6 +209,7 @@ impl Flags {
             bytes,
             projector,
             audio_bytes,
+            cache_bytes: self.cache_bytes.unwrap_or(0),
         }))
     }
 }
@@ -263,6 +275,8 @@ pub struct Side {
     pub projector: Option<vision_seat::Projector>,
     /// Audio buffers included beside the image buffers in this seat's named reserve.
     pub audio_bytes: u64,
+    /// Host bytes shared by pooled vectors and image tower outputs; zero disables it.
+    pub cache_bytes: usize,
 }
 
 impl Side {
@@ -318,6 +332,7 @@ pub struct SideEngine {
     dims: Vec<usize>,
     media: Option<serve::media::SharedMediaModel>,
     audio: Option<serve::media::SharedMediaModel>,
+    cache: Option<serve::embed_cache::Shared>,
 }
 
 impl SideEngine {
@@ -351,6 +366,7 @@ impl SideEngine {
                     model.dims(),
                     model.media(),
                     model.audio(),
+                    model.cache(),
                 );
                 if opened_tx.send(Ok(facts)).is_err() {
                     return;
@@ -376,7 +392,7 @@ impl SideEngine {
                 }
             })
             .map_err(|e| format!("starting the embedding model's thread: {e}"))?;
-        let (tokenizer, name, path, ctx, dims, media, audio) = match opened.recv() {
+        let (tokenizer, name, path, ctx, dims, media, audio, cache) = match opened.recv() {
             Ok(Ok(facts)) => facts,
             refused => {
                 // The thread ended with its open; nothing is left on its card.
@@ -398,6 +414,7 @@ impl SideEngine {
             dims,
             media,
             audio,
+            cache,
         })
     }
 }
@@ -422,6 +439,9 @@ impl Embed for SideEngine {
         self.prompts.clone()
     }
 
+    fn cache(&self) -> Option<serve::embed_cache::Shared> {
+        self.cache.clone()
+    }
     fn media(&self) -> Option<serve::media::SharedMediaModel> {
         self.media.clone()
     }
@@ -507,6 +527,28 @@ mod tests {
         let (none, _) = Flags::take(&args(&["--port", "1"])).expect("none");
         assert_eq!(none, Flags::default());
         assert!(!none.names());
+        assert_eq!(f.cache_bytes, None);
+        for bytes in ["0", "1048576"] {
+            let (cached, rest) =
+                Flags::take(&args(&["--embd-model", "/a", "--embd-cache-bytes", bytes])).unwrap();
+            assert_eq!(cached.cache_bytes, Some(bytes.parse().unwrap()));
+            assert!(rest.is_empty());
+        }
+        for bad in [
+            args(&["--embd-cache-bytes", "1"]),
+            args(&["--embd-model", "/a", "--embd-cache-bytes"]),
+            args(&["--embd-model", "/a", "--embd-cache-bytes", "-1"]),
+            args(&[
+                "--embd-model",
+                "/a",
+                "--embd-cache-bytes",
+                "0",
+                "--embd-cache-bytes",
+                "1",
+            ]),
+        ] {
+            assert!(Flags::take(&bad).is_err(), "{bad:?}");
+        }
         let (image, rest) = Flags::take(&args(&[
             "--embd-model",
             "/e.gguf",
@@ -624,9 +666,13 @@ mod tests {
     struct Stub {
         dropped: Arc<AtomicBool>,
         thread: thread::ThreadId,
+        cache: Option<serve::embed_cache::Shared>,
     }
 
     impl Embed for Stub {
+        fn cache(&self) -> Option<serve::embed_cache::Shared> {
+            self.cache.clone()
+        }
         fn tokenizer(&self) -> Arc<dyn Tokenizer> {
             Arc::new(MockTokenizer)
         }
@@ -664,15 +710,19 @@ mod tests {
         let caller = thread::current().id();
         let dropped = Arc::new(AtomicBool::new(false));
         let d = Arc::clone(&dropped);
+        let cache = serve::embed_cache::Cache::shared(4096).unwrap();
+        let expected_cache = cache.clone();
         let mut engine = SideEngine::spawn(move || {
             let owner = thread::current().id();
             assert_ne!(owner, caller, "the model opens on a worker");
             Ok(Box::new(Stub {
                 dropped: d,
                 thread: owner,
+                cache: Some(cache),
             }) as Box<dyn Embed>)
         })
         .expect("open");
+        assert!(Arc::ptr_eq(&engine.cache().unwrap(), &expected_cache));
         assert_eq!(
             (engine.name(), engine.path(), engine.ctx(), engine.dims()),
             (
@@ -702,6 +752,7 @@ mod tests {
                 Ok(Box::new(Stub {
                     dropped: d,
                     thread: owner,
+                    cache: None,
                 }) as Box<dyn Embed>)
             })
             .expect("open"),

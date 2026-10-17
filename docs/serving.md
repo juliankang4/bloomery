@@ -293,6 +293,12 @@ model's command:
 --embd-ctx 8192
 ```
 
+`--embd-cache-bytes N` enables an in-memory LRU cache with a shared byte budget for full-width pooled vectors
+and image tower outputs. It is off by default (`0`). Entries include their retained values and metadata, excluding
+container spare capacity and allocator overhead. Oversized results are not retained. A vector hit skips the encoder; an image with different
+surrounding text can reuse its tower rows. Cuts and normalization are applied after the vector lookup.
+Audio inputs do not use the pooled-vector cache.
+
 `--embd-hf <repo>[:<quant>]` selects the text file and the row's BF16 projector from that repository.
 `--embd-no-mmproj` disables that automatic projector. A local `--embd-model` loads images only with an explicit
 `--embd-mmproj`. The projector's vision matrices must be BF16; a Q8_0 projector is refused by tensor name.

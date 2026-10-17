@@ -46,6 +46,7 @@ pub(super) const NOT_SERVED: &str =
 /// The side model and the facts the server reads of it once, when it takes it.
 pub(super) struct Side {
     embed: Mutex<Box<dyn Embed>>,
+    cache: Option<crate::embed_cache::Shared>,
     tok: Arc<dyn Tokenizer>,
     pub(super) name: String,
     pub(super) path: String,
@@ -67,6 +68,7 @@ impl Side {
         );
         Side {
             prompts: embed.prompts(),
+            cache: embed.cache(),
             media: embed.media(),
             audio: embed.audio(),
             tok: embed.tokenizer(),
@@ -464,16 +466,33 @@ fn inputs(side: &Side, key: &str, v: &Value) -> Result<Vec<Input>, ApiError> {
 /// [`open`] holds. A model failure, a panic in it, its lock poisoned, and a vector that is not its
 /// width or not finite are fatal ([`fail`]).
 fn run(state: &State, side: &Side, inputs: &[Input]) -> Result<Vec<Vec<f32>>, ApiError> {
-    let Ok(mut model) = side.embed.lock() else {
-        return Err(fail(
-            state,
-            side,
-            "the embedding model's lock is poisoned: a request panicked while it held it".into(),
-        ));
-    };
     let width = side.width();
     let mut pooled = Vec::with_capacity(inputs.len());
     for input in inputs {
+        open(state)?;
+        let key = side
+            .cache
+            .as_ref()
+            .filter(|_| input.audio.is_empty())
+            .and_then(|_| crate::embed_cache::vector_key(&input.ids, &input.images));
+        if let (Some(cache), Some(key)) = (&side.cache, &key) {
+            let mut cache = cache
+                .lock()
+                .map_err(|_| fail(state, side, "the embedding cache's lock is poisoned".into()))?;
+            if let Some(crate::embed_cache::Value::Vector(v)) = cache.get(key) {
+                open(state)?;
+                pooled.push(v);
+                continue;
+            }
+        }
+        let Ok(mut model) = side.embed.lock() else {
+            return Err(fail(
+                state,
+                side,
+                "the embedding model's lock is poisoned: a request panicked while it held it"
+                    .into(),
+            ));
+        };
         open(state)?;
         let v = match panic::catch_unwind(AssertUnwindSafe(|| {
             if input.images.is_empty() && input.audio.is_empty() {
@@ -507,6 +526,12 @@ fn run(state: &State, side: &Side, inputs: &[Input]) -> Result<Vec<Vec<f32>>, Ap
                 side,
                 "the embedding model gave a value that is not finite".into(),
             ));
+        }
+        if let (Some(cache), Some(key)) = (&side.cache, key) {
+            cache
+                .lock()
+                .map_err(|_| fail(state, side, "the embedding cache's lock is poisoned".into()))?
+                .insert(key, crate::embed_cache::Value::Vector(v.clone()));
         }
         pooled.push(v);
     }
@@ -588,6 +613,111 @@ mod tests {
             .iter()
             .map(|x| x.as_f64().expect("a number") as f32)
             .collect()
+    }
+
+    #[test]
+    fn pooled_cache_is_opt_in_and_preserves_every_cut_and_norm() {
+        let (_, state, _, _) = serve(None);
+        let model = MockEmbed::new(32);
+        let calls = model.calls.clone();
+        let mut side = Side::new(Box::new(model));
+        assert!(side.cache.is_none());
+        let input = Input {
+            ids: vec![1, 2, 3],
+            images: vec![],
+            audio: vec![],
+        };
+        let get = |side: &Side, input: &Input| {
+            run(&state, side, std::slice::from_ref(input))
+                .unwrap_or_else(|e| panic!("{}", e.message))
+        };
+        let first = get(&side, &input);
+        assert_eq!(first, get(&side, &input));
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "disabled cache runs every pass"
+        );
+        side.cache = crate::embed_cache::Cache::shared(4096);
+        let miss = get(&side, &input);
+        let hit = get(&side, &input);
+        assert_eq!(calls.lock().unwrap().len(), 3, "the hit skips the pass");
+        for width in [2, 4] {
+            for norm in [-1, 0, 1, 2, 3] {
+                let bits = |v: &[f32]| {
+                    normalize(&v[..width], Norm::of(norm).unwrap())
+                        .unwrap()
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&first[0]), bits(&miss[0]));
+                assert_eq!(bits(&miss[0]), bits(&hit[0]));
+            }
+        }
+        get(
+            &side,
+            &Input {
+                ids: vec![3, 2, 1],
+                images: vec![],
+                audio: vec![],
+            },
+        );
+        assert_eq!(calls.lock().unwrap().len(), 4, "different ids miss");
+        fail(&state, &side, "the model ended".into());
+        assert!(
+            run(&state, &side, &[input]).is_err(),
+            "a cached hit cannot bypass a fatal model error"
+        );
+    }
+
+    #[test]
+    fn a_cached_request_waiting_for_the_cache_observes_the_server_end() {
+        let mut codes = Vec::new();
+        for failed in [true, false] {
+            let (_, state, _, _) = serve(None);
+            let mut side = Side::new(Box::new(MockEmbed::new(32)));
+            side.cache = crate::embed_cache::Cache::shared(4096);
+            let input = Input {
+                ids: vec![1, 2, 3],
+                images: vec![],
+                audio: vec![],
+            };
+            assert!(run(&state, &side, std::slice::from_ref(&input)).is_ok());
+            let held = side.cache.as_ref().unwrap().lock().unwrap();
+            thread::scope(|scope| {
+                let (entered, ready) = mpsc::channel();
+                let (finished, done) = mpsc::channel();
+                let waiting_state = &state;
+                let waiting_side = &side;
+                let waiting = scope.spawn(move || {
+                    assert!(open(waiting_state).is_ok());
+                    entered.send(()).unwrap();
+                    let result = run(waiting_state, waiting_side, &[input]);
+                    finished.send(()).unwrap();
+                    result.map_or_else(|e| e.code, |_| 200)
+                });
+                ready.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(
+                    done.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout),
+                    "the request must wait behind the cache lock"
+                );
+                if failed {
+                    state
+                        .shared
+                        .end_on(state.shared.record_fatal(EngineFailure {
+                            engine: "mock".to_owned(),
+                            error: "the engine failed".to_owned(),
+                        }));
+                } else {
+                    *relock(&state.shared.stopping) = Some("a signal".to_owned());
+                }
+                drop(held);
+                codes.push(waiting.join().unwrap());
+            });
+        }
+        assert_eq!(codes, [503, 503], "fatal and stopping cache hits");
     }
 
     #[test]

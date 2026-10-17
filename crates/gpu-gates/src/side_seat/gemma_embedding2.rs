@@ -97,6 +97,7 @@ pub(super) fn open(side: &Side, seat: &EncoderSeat) -> Result<Box<dyn Embed>, St
             name,
             path: side.path.display().to_string(),
             dims,
+            cache: serve::embed_cache::Cache::shared(side.cache_bytes),
         }))
     };
     load().map_err(|e| e.to_string())
@@ -112,6 +113,59 @@ struct Model {
     name: String,
     path: String,
     dims: Vec<usize>,
+    cache: Option<serve::embed_cache::Shared>,
+}
+
+#[cfg(feature = "vision")]
+impl Model {
+    fn encode_images(
+        &mut self,
+        images: &[serve::media::MediaFeed],
+    ) -> Result<crate::vision_seat::Encoded, crate::GateError> {
+        use crate::vision_seat::{Encoded, merged_cells, span_rows_of};
+        use serve::embed_cache::{Value, image_key};
+
+        let tower = self
+            .vision
+            .as_mut()
+            .ok_or("image input needs --embd-mmproj")?;
+        let Some(cache) = &self.cache else {
+            return tower.encode_with(
+                self.encoder.context(),
+                images.iter().map(|i| Image::of(i.at, &i.prepared)),
+                merged_cells,
+            );
+        };
+        let mut feeds = images.iter();
+        let rows = span_rows_of(
+            images.iter().map(|i| Image::of(i.at, &i.prepared)),
+            tower.n_embd(),
+            |_| -> Result<Vec<u16>, crate::GateError> {
+                let image = feeds.next().expect("one encode call per image");
+                let key = image_key(image).ok_or("embedding image cache needs a prepared grid")?;
+                if let Some(Value::Image(values)) = cache
+                    .lock()
+                    .map_err(|_| "the embedding cache's lock is poisoned")?
+                    .get(&key)
+                {
+                    return Ok(values);
+                }
+                let encoded = tower.encode_with(
+                    self.encoder.context(),
+                    [Image::of(image.at, &image.prepared)],
+                    merged_cells,
+                )?;
+                let values = encoded.rows().rows.clone();
+                cache
+                    .lock()
+                    .map_err(|_| "the embedding cache's lock is poisoned")?
+                    .insert(key, Value::Image(values.clone()));
+                Ok(values)
+            },
+            merged_cells,
+        )?;
+        Ok(Encoded::from_rows(rows))
+    }
 }
 
 impl Embed for Model {
@@ -119,6 +173,9 @@ impl Embed for Model {
         self.audio_media.clone()
     }
 
+    fn cache(&self) -> Option<serve::embed_cache::Shared> {
+        self.cache.clone()
+    }
     fn media(&self) -> Option<serve::media::SharedMediaModel> {
         #[cfg(feature = "vision")]
         {
@@ -168,15 +225,7 @@ impl Embed for Model {
             let encoded = if images.is_empty() {
                 None
             } else {
-                let tower = self
-                    .vision
-                    .as_mut()
-                    .ok_or("image input needs --embd-mmproj")?;
-                Some(tower.encode_with(
-                    self.encoder.context(),
-                    images.iter().map(|i| Image::of(i.at, &i.prepared)),
-                    crate::vision_seat::merged_cells,
-                )?)
+                Some(self.encode_images(images)?)
             };
             if audio.is_empty() {
                 let spans = encoded

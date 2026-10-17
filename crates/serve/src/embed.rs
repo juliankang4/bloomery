@@ -26,6 +26,10 @@ pub struct AudioFeed {
 /// An embedding model: one input's ids in, its pooled vector out. The server calls it one
 /// request at a time, behind a mutex, and reads the facts below once, when it takes the model.
 pub trait Embed: Send {
+    /// Optional pooled-vector and tower-row cache, shared with the server.
+    fn cache(&self) -> Option<crate::embed_cache::Shared> {
+        None
+    }
     /// The model's vocabulary, which the server tokenizes the inputs' text with.
     fn tokenizer(&self) -> Arc<dyn Tokenizer>;
     /// The model's name: its `/v1/models` id and the `model` every OpenAI answer carries.

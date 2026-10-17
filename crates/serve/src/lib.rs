@@ -24,6 +24,7 @@ pub use api::embeddings;
 pub mod decide;
 pub mod dsml;
 pub mod embed;
+pub mod embed_cache;
 pub mod engine;
 pub mod flag;
 mod genloop;

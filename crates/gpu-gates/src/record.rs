@@ -3469,8 +3469,14 @@ pub mod groups {
     }
 }
 
-/// The server spawn the EmbeddingGemma 2 serve gate prints on stdout.
-pub static GATE_GEMMA_EMBEDDING2_SERVE: &[&Kind] = kinds![groups::serve_client::SPAWN];
+/// The server spawn and direct side-seat image checks in the EmbeddingGemma 2 serve gate.
+pub static GATE_GEMMA_EMBEDDING2_SERVE: &[&Kind] = kinds![
+    groups::serve_client::SPAWN,
+    groups::model_file::FETCH,
+    groups::model_file::SET,
+    groups::side_seat::SEAT,
+    groups::vision_seat::RECORDS,
+];
 
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
@@ -4849,9 +4855,15 @@ mod tests {
                 &[ds41_split::SPLIT],
             ),
             (
-                "gate_gemma_embedding2_serve: Served::address",
+                "gate_gemma_embedding2_serve: Served::address, Side::seat and Flags::read",
                 GATE_GEMMA_EMBEDDING2_SERVE,
-                &[serve_client::SPAWN],
+                &[
+                    serve_client::SPAWN,
+                    model_file::FETCH,
+                    model_file::SET,
+                    side_seat::SEAT,
+                    vision_seat::RECORDS,
+                ],
             ),
         ];
         for (entries, list, needs) in table {
