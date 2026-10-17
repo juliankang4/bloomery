@@ -1523,6 +1523,11 @@ gate-tokenizer:
 # Pass --cases-only to dump the fixed texts without the large corpus snapshots.
 dump-ref-tokenizer VOCAB='all' *ARGS:
     ./tools/box.sh 'timeout --kill-after=10 900 bash crates/tokenizer/tools/oracle.sh {{VOCAB}} {{ARGS}}'
+# Embedding pooling, request parsing and response bytes against the pinned llama.cpp fixtures, no card.
+[group('canary')]
+gate-embed:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-embed --lib --test request --test oracle -- --nocapture'
+
 # Clef's request encoder, joint schema head and SystemOne answer (crates/decision, host only) against the
 # release's own Python (tools/ref/clef_ref.py's files under $BLOOMERY_DATA/clef/flash/ref): ids and spans
 # exact, f32 logits inside the derived band of the f64 referee, the body's shape and top options.

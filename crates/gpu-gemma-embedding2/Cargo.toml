@@ -13,6 +13,7 @@ workspace = true
 # rope-and-append at heads 256 and 512, the bidirectional prefill flashes); they are built with
 # `cargo oxide` because that crate is.
 [dependencies]
+bloomery-embed = { path = "../embed" }
 cuda-core.workspace = true
 bloomery-gpu = { path = "../gpu" }
 # Host only: the header read and the token rows.

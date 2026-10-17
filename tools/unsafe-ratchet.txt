@@ -10,6 +10,7 @@ app 0 0 0
 # (bounds asserted before it) and pool.rs's lifetime erasure of a task the caller joins before returning, each with
 # its SAFETY line.
 decision 2 0 0
+embed 0 0 0
 # PIN(2026-10-07): engram 6 -> 7 blocks, new code, not old code relaxed: the row reads over a table's bytes in a
 # mapping the reader does not own (TableBytes, which a split's table, Qwen3.8's PLE, and a site share) advise its
 # pages with libc's madvise, one block with its SAFETY line; a site's advice went through memmap2's safe call on its

@@ -685,27 +685,8 @@ pub(crate) fn base64(text: &str) -> Result<Vec<u8>, MediaError> {
 }
 
 /// `bytes` as standard base64 with padding (RFC 4648 §4), the text [`base64`] reads back.
-#[must_use]
-pub fn encode_base64(bytes: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for c in bytes.chunks(3) {
-        let n = c
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
-        for i in 0..4 {
-            out.push(if i <= c.len() {
-                char::from(A[(n >> (18 - 6 * i) & 63) as usize])
-            } else {
-                '='
-            });
-        }
-    }
-    out
-}
+pub use ::embed::encode_base64;
 
-/// At most the first 64 characters of a value an error names, so a refusal never echoes a payload.
 fn short(s: &str) -> String {
     match s.char_indices().nth(64) {
         Some((at, _)) => format!("{}…", &s[..at]),

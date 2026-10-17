@@ -97,6 +97,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-embed"
+version = "0.1.0"
+dependencies = [
+ "bloomery-refset",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "bloomery-engram"
 version = "0.1.0"
 dependencies = [
@@ -202,6 +211,7 @@ dependencies = [
 name = "bloomery-gpu-gemma-embedding2"
 version = "0.1.0"
 dependencies = [
+ "bloomery-embed",
  "bloomery-gguf",
  "bloomery-gpu",
  "bloomery-model",
@@ -356,6 +366,7 @@ version = "0.1.0"
 name = "bloomery-serve"
 version = "0.3.4"
 dependencies = [
+ "bloomery-embed",
  "bloomery-gguf",
  "bloomery-jinja",
  "bloomery-vision",

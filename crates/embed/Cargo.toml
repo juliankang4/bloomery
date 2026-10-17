@@ -1,0 +1,20 @@
+[package]
+name = "bloomery-embed"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "GPU-free embedding pooling, request parsing, normalization and responses"
+
+[lib]
+name = "embed"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+bloomery-refset = { path = "../refset" }

@@ -17,6 +17,7 @@ path = "src/bin/bloomery-serve.rs"
 workspace = true
 
 [dependencies]
+bloomery-embed = { path = "../embed" }
 # The HTTP layer is std::net on purpose: one slot, one engine mutex, and SSE needs a flush per
 # event. JSON is its only third-party need.
 bloomery-gguf = { path = "../gguf" }

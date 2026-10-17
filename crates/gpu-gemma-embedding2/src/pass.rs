@@ -620,7 +620,7 @@ impl Encoder {
             cx.dense(&mut s.acts, &mut s.dense, (e, head, n_out), 1, &mut out)?;
             out.to_host_vec(stream)?[..n_out].to_vec()
         } else {
-            mean(&rows, n_out)
+            embed::mean(&rows, n_out)
         };
         if let Some(t) = &mut tapped {
             t.result_norm = s.xn.to_host_vec(stream)?[..n * e].to_vec();
@@ -651,19 +651,6 @@ impl Encoder {
             taps: tapped,
         })
     }
-}
-
-/// The mean of `rows`, at least one whole row of `width` f32: each column
-/// summed in f64 in position order and divided by the row count.
-fn mean(rows: &[f32], width: usize) -> Vec<f32> {
-    let n = rows.len() / width;
-    let mut sum = vec![0.0f64; width];
-    for row in rows.chunks_exact(width) {
-        for (s, &x) in sum.iter_mut().zip(row) {
-            *s += f64::from(x);
-        }
-    }
-    sum.iter().map(|&s| (s / n as f64) as f32).collect()
 }
 
 #[cfg(test)]

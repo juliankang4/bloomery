@@ -1129,6 +1129,21 @@ struct ApiError {
     retry_after: bool,
 }
 
+impl From<::embed::request::Error> for ApiError {
+    fn from(error: ::embed::request::Error) -> Self {
+        let kind = match &error {
+            ::embed::request::Error::Context { .. } => "exceed_context_size_error",
+            ::embed::request::Error::Invalid(_) => "invalid_request_error",
+        };
+        ApiError {
+            retry_after: false,
+            code: 400,
+            kind,
+            message: error.to_string(),
+        }
+    }
+}
+
 fn invalid(message: impl Into<String>) -> ApiError {
     ApiError {
         retry_after: false,
@@ -1269,7 +1284,7 @@ fn body(req: &Request) -> Result<Map<String, Value>, ApiError> {
 /// A field of another type than it takes: a 400 naming the field, the type it
 /// takes and the type it got.
 fn wrong_type(k: &str, takes: &str, v: &Value) -> ApiError {
-    invalid(format!("{k} must be {takes}, not {}", json_type(v)))
+    ::embed::request::wrong_type(k, takes, v).into()
 }
 
 /// A real field as `f32`. Absent or `null` is `None`, any other type than a
@@ -1294,21 +1309,7 @@ fn get_f32(o: &Map<String, Value>, k: &str) -> Result<Option<f32>, ApiError> {
 /// naming the field, where llama-server would truncate it. An integer-valued
 /// float (`2.0`) passes.
 fn get_i(o: &Map<String, Value>, k: &str) -> Result<Option<i64>, ApiError> {
-    let Some(v) = o.get(k).filter(|v| !v.is_null()) else {
-        return Ok(None);
-    };
-    if !v.is_number() {
-        return Err(wrong_type(k, "an integer", v));
-    }
-    if let Some(i) = v.as_i64() {
-        return Ok(Some(i));
-    }
-    match v.as_f64() {
-        Some(f) if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 => {
-            Ok(Some(f as i64))
-        }
-        _ => Err(invalid(format!("{k} must be an integer, not {v}"))),
-    }
+    ::embed::request::integer(o, k).map_err(ApiError::from)
 }
 
 /// An integer field within llama-server's hard limits `lo..=i32::MAX` (its
@@ -1688,16 +1689,7 @@ fn reasoning_budget(o: &Map<String, Value>) -> Result<Option<usize>, ApiError> {
 }
 
 /// A JSON value's type, for a field's refusal naming what it got.
-fn json_type(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
-}
+use ::embed::request::json_type;
 
 /// The think-span budget lives only where a span can open: a prompt that
 /// ends with the start tag starts the model inside it, one that ends with
@@ -2261,17 +2253,7 @@ fn detokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> 
 }
 
 fn token_ids(tok: &dyn Tokenizer, v: &Value) -> Result<Vec<u32>, ApiError> {
-    let Value::Array(a) = v else {
-        return Err(invalid("tokens must be an array of token ids"));
-    };
-    a.iter()
-        .map(|x| {
-            x.as_u64()
-                .and_then(|id| u32::try_from(id).ok())
-                .filter(|&id| (id as usize) < tok.n_vocab())
-                .ok_or_else(|| invalid(format!("invalid token id {x}")))
-        })
-        .collect()
+    ::embed::input::token_ids(tok.n_vocab(), v).map_err(ApiError::from)
 }
 
 fn apply_template(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
@@ -3192,7 +3174,7 @@ fn completion_ids(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiError
 }
 
 fn no_media() -> ApiError {
-    invalid("Multimodal data provided, but model does not support multimodal requests.")
+    ::embed::input::no_media().into()
 }
 
 /// The field `k`, a string or an array of strings and token ids, as `tok`'s token ids, as
@@ -3206,49 +3188,20 @@ fn prompt_ids(
     v: &Value,
     special: bool,
 ) -> Result<Vec<u32>, ApiError> {
-    let mut ids = Vec::new();
-    let text = |ids: &mut Vec<u32>, s: &str, special: bool| {
-        if special && tok.add_bos() {
-            ids.push(tok.bos());
-        }
-        ids.extend(tok.encode(s));
-        if special && tok.add_eos() {
-            ids.push(tok.eos());
-        }
-    };
-    match v {
-        Value::String(s) => text(&mut ids, s, special),
-        Value::Array(a) => {
-            for (i, x) in a.iter().enumerate() {
-                match x {
-                    Value::String(s) => text(&mut ids, s, special && i == 0),
-                    o if carries_media(o) => return Err(no_media()),
-                    other => ids.extend(token_ids(tok, &Value::Array(vec![other.clone()]))?),
-                }
-            }
-        }
-        other => {
-            return Err(wrong_type(
-                k,
-                "a string or an array of strings and token ids",
-                other,
-            ));
-        }
-    }
-    Ok(ids)
+    ::embed::input::prompt_ids(
+        k,
+        v,
+        |text| tok.encode(text),
+        (special && tok.add_bos()).then(|| tok.bos()),
+        (special && tok.add_eos()).then(|| tok.eos()),
+        tok.n_vocab(),
+    )
+    .map_err(ApiError::from)
 }
 
 /// Whether a prompt object carries media: a `multimodal_data` that holds
 /// anything (`null` or an empty array, string or object holds nothing).
-fn carries_media(v: &Value) -> bool {
-    match v.get("multimodal_data") {
-        None | Some(Value::Null) => false,
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Object(o)) => !o.is_empty(),
-        Some(_) => true,
-    }
-}
+use ::embed::input::carries_media;
 
 /// The last `/completion` object. `tokens` (the generated ids, the
 /// end-of-generation one included) is llama.cpp's `return_tokens` field. A

@@ -24,17 +24,21 @@
 
 use std::io;
 use std::net::TcpStream;
-use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
-use serde_json::{Map, Value, json};
+use ::embed::request;
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
 use super::{
-    ApiError, EngineFailure, State, body, dead_engine, get_i, invalid, panic_text, prompt_ids,
-    send_error, send_json, stopping_gate, wrong_type,
+    ApiError, EngineFailure, State, body, dead_engine, invalid, panic_text, prompt_ids, send_error,
+    send_json, stopping_gate,
 };
-use crate::embed::{Embed, Norm, normalize};
+use crate::embed::Embed;
+#[cfg(test)]
+use crate::embed::{Norm, normalize};
 use crate::engine::Tokenizer;
 use crate::http::Request;
 use crate::media;
@@ -105,96 +109,12 @@ fn answer(state: &State, req: &Request, oai: bool) -> Result<Value, ApiError> {
     };
     open(state)?;
     let b = body(req)?;
-    if oai && let Some(model) = b.get("model").filter(|v| !v.is_null()) {
-        let model = model
-            .as_str()
-            .ok_or_else(|| invalid("model must be a string"))?;
-        if model != side.name {
-            return Err(invalid(format!(
-                "model {model:?}: embeddings are served by {:?}",
-                side.name
-            )));
-        }
-    }
-    let (key, prompt, oai) = match (b.get("input"), b.get("content")) {
-        (Some(v), _) => ("input", v, oai),
-        (None, Some(v)) => ("content", v, false),
-        (None, None) => return Err(invalid("\"input\" or \"content\" must be provided")),
-    };
-    let base64 = encoding(&b)?;
-    let norm = match get_i(&b, "embd_normalize")? {
-        None => Norm::default(),
-        Some(p) => i32::try_from(p)
-            .map_err(|e| e.to_string())
-            .and_then(Norm::of)
-            .map_err(|e| invalid(format!("embd_normalize {p}: {e}")))?,
-    };
-    let width = cut(side, &b)?;
-    let prefixed;
-    let prompt = if let Some(name) = b.get("prompt_name") {
-        let name = name
-            .as_str()
-            .ok_or_else(|| invalid("prompt_name must be a string"))?;
-        let prefix = side.prompts.get(name).ok_or_else(|| {
-            invalid(format!(
-                "unknown prompt_name {name:?}; available names: {:?}",
-                side.prompts.keys().collect::<Vec<_>>()
-            ))
-        })?;
-        let add = |v: &Value| {
-            v.as_str()
-                .map(|text| Value::String(format!("{prefix}{text}")))
-                .ok_or_else(|| {
-                    invalid("prompt_name requires text input (a string or an array of strings)")
-                })
-        };
-        prefixed = match prompt {
-            Value::Array(a) => Value::Array(a.iter().map(add).collect::<Result<Vec<_>, _>>()?),
-            v => add(v)?,
-        };
-        &prefixed
-    } else {
-        prompt
-    };
-    let inputs = inputs(side, key, prompt)?;
+    let request =
+        request::Request::parse(&b, &side.name, &side.dims, oai).map_err(ApiError::from)?;
+    let inputs = prepare(side, &request)?;
     let pooled = run(state, side, &inputs)?;
-    let vectors = pooled
-        .iter()
-        .map(|v| normalize(&v[..width], norm).map_err(invalid))
-        .collect::<Result<Vec<_>, _>>()?;
-    if !oai {
-        return Ok(Value::Array(
-            vectors
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| json!({ "embedding": [v], "index": i }))
-                .collect(),
-        ));
-    }
-    let n_tokens: usize = inputs.iter().map(|i| i.ids.len()).sum();
-    let data: Vec<Value> = vectors
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            if base64 {
-                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                json!({
-                    "embedding": media::encode_base64(&bytes),
-                    "encoding_format": "base64",
-                    "index": i,
-                    "object": "embedding",
-                })
-            } else {
-                json!({ "embedding": v, "index": i, "object": "embedding" })
-            }
-        })
-        .collect();
-    Ok(json!({
-        "data": data,
-        "model": side.name,
-        "object": "list",
-        "usage": { "prompt_tokens": n_tokens, "total_tokens": n_tokens },
-    }))
+    let n_tokens = inputs.iter().map(|i| i.ids.len()).sum();
+    request.answer(&pooled, n_tokens).map_err(ApiError::from)
 }
 
 /// The server still takes a pass: no failure ended it and no orderly stop began, else the 503
@@ -209,39 +129,6 @@ fn open(state: &State) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// `encoding_format`: `float` (or unset) or `base64`, which only the OpenAI shape applies.
-fn encoding(b: &Map<String, Value>) -> Result<bool, ApiError> {
-    match b.get("encoding_format") {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::String(f)) if f == "float" => Ok(false),
-        Some(Value::String(f)) if f == "base64" => Ok(true),
-        Some(Value::String(_)) => Err(invalid(
-            "The format to return the embeddings in. Can be either float or base64",
-        )),
-        Some(v) => Err(wrong_type("encoding_format", "a string", v)),
-    }
-}
-
-/// The width `dimensions` cuts the pooled vector to: one of the model's widths, the full width
-/// when unset.
-fn cut(side: &Side, b: &Map<String, Value>) -> Result<usize, ApiError> {
-    let Some(k) = get_i(b, "dimensions")? else {
-        return Ok(side.width());
-    };
-    side.dims
-        .iter()
-        .copied()
-        .find(|&d| i64::try_from(d).is_ok_and(|d| d == k))
-        .ok_or_else(|| {
-            let widths: Vec<String> = side.dims.iter().map(ToString::to_string).collect();
-            invalid(format!(
-                "dimensions {k}: {} cuts its vectors to {}",
-                side.name,
-                widths.join(", ")
-            ))
-        })
-}
-
 /// The request's ids and prepared media: an array with no id at its top level is one input an element,
 /// anything else one input, each read as a `/completion` prompt with the special tokens on. No
 /// input, an input of no id and one of more ids than the model's context are refused by name.
@@ -251,73 +138,22 @@ struct Input {
     audio: Vec<crate::embed::AudioFeed>,
 }
 
-/// One ordered embedding input part, after its media has been prepared and sized.
-pub enum InputPart<'a> {
-    Text(&'a str),
-    /// Caller-selected delimiters around prepared media rows.
-    Media {
-        begin: &'a str,
-        end: &'a str,
-        positions: usize,
-        kind: &'a str,
-    },
-}
+pub use ::embed::input::{Assembled, InputPart};
 
-/// Token ids and the image spans that replace their filler rows, in part order.
-pub struct Assembled {
-    pub ids: Vec<u32>,
-    pub spans: Vec<Range<usize>>,
-}
-
-/// Tokenize each part separately, with BOS and EOS around the whole input. Media spans are
-/// bounded by `ctx` before allocation; the caller checks the total length, including text and EOS.
+/// Tokenize ordered parts with the side model's special tokens.
 pub fn assemble<'a>(
     parts: impl Iterator<Item = Result<InputPart<'a>, String>>,
     tok: &dyn Tokenizer,
     ctx: usize,
 ) -> Result<Assembled, String> {
-    let mut parts = parts.peekable();
-    if parts.peek().is_none() {
-        return Err("Input content cannot be empty".into());
-    }
-    let mut ids = Vec::new();
-    let mut spans = Vec::new();
-    if tok.add_bos() {
-        ids.push(tok.bos());
-    }
-    for part in parts {
-        let (begin, end, positions, kind) = match part? {
-            InputPart::Text(text) => {
-                ids.extend(tok.encode(text));
-                continue;
-            }
-            InputPart::Media {
-                begin,
-                end,
-                positions,
-                kind,
-            } => (begin, end, positions, kind),
-        };
-        if positions == 0 {
-            return Err(format!("an embedding {kind} has an empty span"));
-        }
-        ids.extend(tok.encode(begin));
-        let at = ids.len();
-        let last = at
-            .checked_add(positions)
-            .filter(|&n| n <= ctx)
-            .ok_or_else(|| format!("{kind} input exceeds the embedding context"))?;
-        ids.resize(last, tok.bos());
-        spans.push(at..last);
-        ids.extend(tok.encode(end));
-    }
-    if tok.add_eos() {
-        ids.push(tok.eos());
-    }
-    if ids.is_empty() {
-        return Err("Input content cannot be empty".into());
-    }
-    Ok(Assembled { ids, spans })
+    ::embed::input::assemble(
+        parts,
+        |text| tok.encode(text),
+        tok.add_bos().then(|| tok.bos()),
+        tok.add_eos().then(|| tok.eos()),
+        tok.bos(),
+        ctx,
+    )
 }
 
 fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
@@ -429,37 +265,44 @@ fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
     }
 }
 
-fn inputs(side: &Side, key: &str, v: &Value) -> Result<Vec<Input>, ApiError> {
-    let is_id = |x: &Value| x.is_u64() || x.is_i64();
-    let inputs = match v {
-        Value::Array(a) if !a.iter().any(is_id) => a
-            .iter()
-            .map(|x| input(side, key, x))
-            .collect::<Result<Vec<_>, _>>()?,
-        v => vec![input(side, key, v)?],
-    };
-    if inputs.is_empty() {
-        return Err(invalid("\"input\" must not be empty"));
-    }
+fn prepare(side: &Side, request: &request::Request<'_>) -> Result<Vec<Input>, ApiError> {
+    let prefix = request
+        .prompt_name
+        .map(|name| {
+            side.prompts.get(name).ok_or_else(|| {
+                invalid(format!(
+                    "unknown prompt_name {name:?}; available names: {:?}",
+                    side.prompts.keys().collect::<Vec<_>>()
+                ))
+            })
+        })
+        .transpose()?;
+    let inputs = request
+        .inputs
+        .iter()
+        .map(|v| {
+            if let Some(prefix) = prefix {
+                let text = v.as_str().ok_or_else(|| {
+                    invalid("prompt_name requires text input (a string or an array of strings)")
+                })?;
+                input(side, request.key, &Value::String(format!("{prefix}{text}")))
+            } else {
+                input(side, request.key, v)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     for input in &inputs {
-        let ids = &input.ids;
-        if ids.is_empty() {
-            return Err(invalid("Input content cannot be empty"));
-        }
-        if ids.len() > side.ctx {
-            return Err(ApiError {
-                retry_after: false,
-                code: 400,
-                kind: "exceed_context_size_error",
-                message: format!(
-                    "input ({} tokens) is larger than the max context size ({} tokens)",
-                    ids.len(),
-                    side.ctx
-                ),
-            });
-        }
+        request::check_tokens(input.ids.len(), side.ctx).map_err(ApiError::from)?;
     }
     Ok(inputs)
+}
+
+#[cfg(test)]
+fn inputs(side: &Side, key: &str, value: &Value) -> Result<Vec<Input>, ApiError> {
+    let body = serde_json::Map::from_iter([(key.to_owned(), value.clone())]);
+    let request =
+        request::Request::parse(&body, &side.name, &side.dims, true).map_err(ApiError::from)?;
+    prepare(side, &request)
 }
 
 /// Every input's pooled vector, through the side model under its lock, each pass after
