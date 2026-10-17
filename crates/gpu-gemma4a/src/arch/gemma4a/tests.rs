@@ -68,7 +68,7 @@ fn hw_arithmetic_overflow() -> Result<(), GpuError> {
     ] {
         let x = DeviceBuffer::from_host(stream, &values)?;
         ops.module
-            .channel_norm(stream, &prep, &x, &gain, 1, 2, 1e-6, ops.sink, &mut out)?;
+            .channel_norm(stream, &prep, &x, &gain, 1, 2, 1e-6, ops.sink(), &mut out)?;
         stream.synchronize()?;
         refused.push((boundary, fault::read(gpu.fault_word())?));
         gpu.clear_fault()?;
@@ -78,7 +78,7 @@ fn hw_arithmetic_overflow() -> Result<(), GpuError> {
     for gate in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
         let x = DeviceBuffer::from_host(stream, &[0.0, gate])?;
         ops.module
-            .glu(stream, &prep, &x, 1, 1, ops.sink, &mut out)?;
+            .glu(stream, &prep, &x, 1, 1, ops.sink(), &mut out)?;
         stream.synchronize()?;
         refused.push(("GLU gate", fault::read(gpu.fault_word())?));
         gpu.clear_fault()?;
@@ -91,7 +91,19 @@ fn hw_arithmetic_overflow() -> Result<(), GpuError> {
     let gain = DeviceBuffer::from_host(stream, &vec![1.0; WIDTH / HEADS])?;
     let prep = attention.prepare_local_attention(config(HEADS))?;
     attention.local_attention(
-        stream, &prep, &q, &k, &v, &pos, &gain, &gain, 1, 1.0, 1.0, ops.sink, &mut out,
+        stream,
+        &prep,
+        &q,
+        &k,
+        &v,
+        &pos,
+        &gain,
+        &gain,
+        1,
+        1.0,
+        1.0,
+        ops.sink(),
+        &mut out,
     )?;
     stream.synchronize()?;
     refused.push(("attention score", fault::read(gpu.fault_word())?));

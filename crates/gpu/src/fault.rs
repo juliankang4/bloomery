@@ -700,10 +700,9 @@ impl std::fmt::Display for Fault {
 }
 
 /// A kernel's handle on the fault: the allocation's device address and the
-/// layer of the launch. `Copy`, one by-value launch parameter; made only by
-/// [`crate::Gpu::fault_sink`] from the allocation that `Gpu` owns, which
-/// outlives every launch on its stream and every graph captured there (a
-/// graph drops before the buffers it addresses).
+/// layer of the launch. `Copy`, one by-value launch parameter. The allocation
+/// must outlive every launch and captured graph that carries the sink.
+/// [`crate::Gpu::fault_sink`] uses the allocation that `Gpu` owns.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FaultSink {
@@ -721,7 +720,7 @@ impl FaultSink {
     /// the sink's launches run in, `layer <= LAYER_NONE`, and the
     /// allocation stays alive while any launch or captured graph that
     /// carries the sink can run.
-    pub(crate) unsafe fn new(word: *mut u32, layer: u32) -> FaultSink {
+    pub unsafe fn new(word: *mut u32, layer: u32) -> FaultSink {
         FaultSink { word, layer }
     }
 

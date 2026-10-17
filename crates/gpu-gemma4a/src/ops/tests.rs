@@ -59,7 +59,7 @@ fn hw_convolution_and_element_rules() -> Result<(), GpuError> {
     let gain = up(&[2.0, 1.0])?;
     let prep = ops.module.prepare_channel_norm(config(2))?;
     ops.module
-        .channel_norm(stream, &prep, &x, &gain, 2, 2, 1e-6, ops.sink, &mut out)?;
+        .channel_norm(stream, &prep, &x, &gain, 2, 2, 1e-6, ops.sink(), &mut out)?;
     let got = out.to_host_vec(stream)?;
     assert_eq!(got[0], 0.0, "channel ReLU");
     assert!(
@@ -76,7 +76,7 @@ fn hw_convolution_and_element_rules() -> Result<(), GpuError> {
     let x = up(&[2.0, 3.0, 0.0, 3.0_f32.ln()])?;
     let prep = ops.module.prepare_glu(config(2))?;
     ops.module
-        .glu(stream, &prep, &x, 1, 2, ops.sink, &mut out)?;
+        .glu(stream, &prep, &x, 1, 2, ops.sink(), &mut out)?;
     let got = out.to_host_vec(stream)?;
     assert!(
         (got[0] - 1.0).abs() < 1e-7 && (got[1] - 2.25).abs() < 1e-6,

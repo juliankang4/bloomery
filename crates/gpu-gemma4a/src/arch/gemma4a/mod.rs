@@ -235,7 +235,7 @@ impl Encoder {
             (t1 * f1) as u32,
             128,
             EPS,
-            p.ops.sink,
+            p.ops.sink(),
             &mut s.b,
         )?;
         let prep = p.ops.module.prepare_conv2d(config(n * 32 * 32))?;
@@ -252,7 +252,7 @@ impl Encoder {
             (n * 32) as u32,
             32,
             EPS,
-            p.ops.sink,
+            p.ops.sink(),
             &mut s.b,
         )?;
         p.mm(stream, &w.input, &s.b, n, &mut s.a, &mut s.x)?;
@@ -279,7 +279,7 @@ impl Encoder {
                 n as u32,
                 (1.0 / (HEAD as f32).sqrt()) / 2.0_f32.ln(),
                 (1.0 + 1.0_f32.exp()).ln() / 2.0_f32.ln(),
-                p.ops.sink,
+                p.ops.sink(),
                 &mut s.b,
             )?;
             p.mm(stream, &b.o, &s.b, n, &mut s.a, &mut s.c)?;
@@ -296,7 +296,7 @@ impl Encoder {
                 &s.c,
                 n as u32,
                 WIDTH as u32,
-                p.ops.sink,
+                p.ops.sink(),
                 &mut s.b,
             )?;
             let prep = p.ops.module.prepare_depthwise(config(n * WIDTH))?;

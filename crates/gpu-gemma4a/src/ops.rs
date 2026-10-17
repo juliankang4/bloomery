@@ -229,10 +229,20 @@ pub(crate) mod kernels {
 pub(crate) struct Ops {
     pub(crate) module: kernels::LoadedModule,
     pub(crate) fault: Arc<cuda_core::DeviceBuffer<u32>>,
-    pub(crate) sink: bloomery_gpu::FaultSink,
 }
 
 impl Ops {
+    pub(crate) fn sink(&self) -> bloomery_gpu::FaultSink {
+        // SAFETY: load clones Gpu's full fault allocation. Ops retains it through
+        // launches on that context; LAYER_NONE is in range.
+        unsafe {
+            bloomery_gpu::FaultSink::new(
+                self.fault.cu_deviceptr() as *mut u32,
+                bloomery_gpu::LAYER_NONE,
+            )
+        }
+    }
+
     pub(crate) fn load(gpu: &bloomery_gpu::Gpu) -> Result<Self, GpuError> {
         let ctx = gpu.context();
         // SAFETY: this crate owns the embedded bundle and checks launch spans.
@@ -240,7 +250,6 @@ impl Ops {
         Ok(Self {
             module,
             fault: Arc::clone(gpu.fault_word()),
-            sink: gpu.unlabelled_sink(),
         })
     }
 }
