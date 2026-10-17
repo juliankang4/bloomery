@@ -2133,6 +2133,12 @@ pub(super) mod tests {
             });
             let mut out = Out::default();
             paged.write(&mut out).unwrap();
+            let mut header = Out::default();
+            header.u64(1 << 30).u64(arena.planned).u64(arena.granted).u64(65536);
+            assert_eq!(&out.done()[1..33], header.done(), "only the NVMe budget is on the wire");
+            let mut resident = Out::default();
+            open.write(&mut resident).unwrap();
+            assert_eq!(out.done().len(), resident.done().len() + 32);
             let mut input = In::new(out.done());
             let back = NodeOpen::read(&mut input).unwrap();
             assert_eq!(back.nvme, paged.nvme);

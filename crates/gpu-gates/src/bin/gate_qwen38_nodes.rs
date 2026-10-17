@@ -158,11 +158,10 @@ mod gate {
         },
     }
 
-    fn parse_args() -> Result<(Mode, bool), GateError> {
+    fn parse_args(args: &[String]) -> Result<(Mode, bool), GateError> {
         const USAGE: &str = "usage: gate_qwen38_nodes [--host] (node 0 modes, run by the gate: --node0 \
                              <gib> <out> <server pid> | --hold0 <gib>) or --measure \
                              <local|node> <gib> or --decode0 <gib> <tokens> <out> or --history <gib> <out>";
-        let args: Vec<String> = std::env::args().skip(1).collect();
         let host = args.first().is_some_and(|a| a == "--host");
         let args = if host { &args[1..] } else { &args[..] };
         let gib = |s: &str, max: u64| -> Result<u64, GateError> {
@@ -1682,7 +1681,7 @@ mod gate {
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
         record::at_main(NAME, record::GATE_QWEN38_NODES);
-        let (mode, host) = parse_args()?;
+        let (mode, host) = parse_args(&std::env::args().skip(1).collect::<Vec<_>>())?;
         let mut c = Common::new(&levers)?;
         c.node_host = host;
         match mode {
@@ -1745,6 +1744,38 @@ mod gate {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn host_modes_never_ignore_the_requested_tier() {
+            for args in [
+                vec![],
+                vec!["--node0", "1", "out", "1"],
+                vec!["--hold0", "1"],
+                vec!["--history", "1", "out"],
+                vec!["--measure", "local", "1"],
+                vec!["--measure", "node", "1"],
+                vec!["--measure-node0", "1"],
+                vec!["--decode0", "1", "1", "out"],
+            ] {
+                let args: Vec<String> = args.into_iter().map(String::from).collect();
+                let (resident, host) = super::parse_args(&args).unwrap();
+                assert!(!host);
+                let mut hosted = vec!["--host".to_string()];
+                hosted.extend(args);
+                let parsed = super::parse_args(&hosted);
+                if matches!(resident, super::Mode::Decode { .. }) {
+                    let error = parsed.err().expect("--host --decode0 must be refused");
+                    assert_eq!(
+                        error.to_string(),
+                        "--host is not supported with --decode0; use --history"
+                    );
+                } else {
+                    let (mode, host) = parsed.unwrap();
+                    assert!(host);
+                    assert_eq!(std::mem::discriminant(&mode), std::mem::discriminant(&resident));
+                }
+            }
+        }
+
         use super::{
             Command, Duration, Instant, NAME, PlaceError, PlacementError, Proc, census_specs,
             plan_refusal, remove_open_copy, remove_run,
