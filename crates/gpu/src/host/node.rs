@@ -78,11 +78,32 @@ const OPEN_BASE: Duration = Duration::from_secs(120);
 /// node. Derived, not measured.
 const OPEN_RATE: u64 = 100 << 20;
 
-/// How long node 0 waits for the open of `open`: [`OPEN_BASE`] and its
-/// rows' resident bytes at [`OPEN_RATE`].
-fn open_bound(open: &NodeOpen) -> Duration {
-    let bytes: u64 = open.rows.iter().map(|r| r.resident_bytes).sum();
-    OPEN_BASE + Duration::from_secs(bytes / OPEN_RATE)
+/// How long node 0 waits for the open of `open`: [`OPEN_BASE`] and each
+/// row's larger file-read or resident-upload span at [`OPEN_RATE`].
+fn open_bound(open: &NodeOpen) -> Result<Duration, GpuError> {
+    let bad = || GpuError::shape(WHAT, "the assigned open bytes are invalid or overflow");
+    let bytes = open.rows.iter().try_fold(0u64, |sum, row| {
+        let file = match &row.experts {
+            None => row.file_bytes,
+            Some(ids) => {
+                let n = row
+                    .dims
+                    .last()
+                    .copied()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(bad)?;
+                if !row.file_bytes.is_multiple_of(n) {
+                    return Err(bad());
+                }
+                (row.file_bytes / n)
+                    .checked_mul(ids.len() as u64)
+                    .ok_or_else(bad)?
+            }
+        };
+        sum.checked_add(file.max(row.resident_bytes))
+            .ok_or_else(bad)
+    })?;
+    Ok(OPEN_BASE + Duration::from_secs(bytes / OPEN_RATE))
 }
 
 // ---------------------------------------------------------------- census
@@ -938,7 +959,7 @@ impl TierNode {
             lost: None,
         };
         open.write(node.req.clear())?;
-        node.call(Tag::Open, open_bound(open), "open")?;
+        node.call(Tag::Open, open_bound(open)?, "open")?;
         let mut i = In::new(node.ch.body());
         let r = (|| {
             let planes = (i.len("codes")?, i.len("scales")?);
@@ -1733,11 +1754,12 @@ impl Session<'_> {
 #[cfg(test)]
 pub(super) mod tests {
     use std::net::SocketAddr;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use super::wire::{In, Out, Tag};
     use super::{
-        Failed, NodeCensus, NodeOpen, NodeRow, Session, chain_of, chain_word, read_err, write_err,
+        Failed, NodeCensus, NodeOpen, NodeRow, OPEN_BASE, OPEN_RATE, Session, chain_of, chain_word,
+        open_bound, read_err, write_err,
     };
     use crate::GpuError;
     use crate::fault::{Fault, FaultSite};
@@ -1746,7 +1768,7 @@ pub(super) mod tests {
     use gguf::write::{Layout, Writer};
     use gguf::{GgmlType, Split};
     use model::placement::devices::{DeviceId, DeviceInfo};
-    use model::placement::{ModelTensor, ModelTensors, Role};
+    use model::placement::{Format, ModelTensor, ModelTensors, Role};
 
     pub(in crate::host) fn empty_file(tag: &str) -> (std::path::PathBuf, std::sync::Arc<Split>) {
         let path = std::env::temp_dir().join(format!("bloomery-{tag}-{}.gguf", std::process::id()));
@@ -1952,6 +1974,32 @@ pub(super) mod tests {
             layers: 3,
             block: (512, 1 << 20),
         };
+        let mut timed = open.clone();
+        timed.rows[0].format = Format::HostFile.to_string();
+        timed.rows[0].file_bytes = 32 * OPEN_RATE;
+        timed.rows[0].resident_bytes = 0;
+        assert_eq!(
+            open_bound(&timed).unwrap(),
+            OPEN_BASE + Duration::from_secs(8)
+        );
+        timed.rows[0].experts = None;
+        assert_eq!(
+            open_bound(&timed).unwrap(),
+            OPEN_BASE + Duration::from_secs(32)
+        );
+        timed.rows[0].resident_bytes = 64 * OPEN_RATE;
+        assert_eq!(
+            open_bound(&timed).unwrap(),
+            OPEN_BASE + Duration::from_secs(64)
+        );
+        timed.rows[0].resident_bytes = u64::MAX;
+        timed.rows.push(timed.rows[0].clone());
+        assert!(open_bound(&timed).is_err());
+        timed.rows.truncate(1);
+        timed.rows[0].experts = Some(vec![1]);
+        *timed.rows[0].dims.last_mut().unwrap() = 0;
+        assert!(open_bound(&timed).is_err());
+
         let mut o = Out::default();
         open.write(&mut o).expect("the open");
         let mut i = In::new(o.done());
