@@ -12,7 +12,8 @@ pub use bloomery_placement::placement::workstation::*;
 /// still shows the whole machine, and the limit's room is the reading that
 /// binds. `BLOOMERY_HOST_ROOM` set (bytes, `M` and `G` binary units, a
 /// parsed lever) replaces both, read [`HostRead::Given`]; a value that is
-/// not bytes is refused by name.
+/// not bytes is refused by name. A base page size other than [`ROW_PAGE`]
+/// is refused even when the room is supplied by the caller.
 pub fn host_available() -> Result<u64, String> {
     host_available_read().map(|(bytes, _)| bytes)
 }
@@ -20,6 +21,12 @@ pub fn host_available() -> Result<u64, String> {
 /// [`host_available`] with the reading that decided ([`HostRead`]), for
 /// every refusal and line that prints the bytes to name.
 pub fn host_available_read() -> Result<(u64, HostRead), String> {
+    let page = super::host_lock::page_bytes().map_err(|e| e.to_string())?;
+    if page != ROW_PAGE {
+        return Err(format!(
+            "sysconf(_SC_PAGESIZE) is {page} B; row room requires {ROW_PAGE} B pages"
+        ));
+    }
     let levers = bloomery_levers::nvtier_levers().map_err(|e| e.to_string())?;
     if let Some(room) = levers.host_room {
         return Ok((room, HostRead::Given));
@@ -106,5 +113,27 @@ fn cgroup_levels() -> Result<Vec<(String, String, String, String)>, String> {
             Some((head, _)) if !head.is_empty() => head.to_owned(),
             _ => "/".to_owned(),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ROW_PAGE, host_available_read};
+
+    #[test]
+    fn host_room_refuses_another_row_page() {
+        let page = crate::placement::host_lock::page_bytes().expect("host page size");
+        let reading = host_available_read();
+        if page == ROW_PAGE {
+            assert!(reading.is_ok(), "{reading:?}");
+        } else {
+            let why = reading
+                .as_ref()
+                .expect_err("a row page other than the planner's must be refused");
+            assert!(why.contains("sysconf(_SC_PAGESIZE)"), "{why}");
+            assert!(why.contains(&page.to_string()), "{why}");
+            assert!(why.contains(&ROW_PAGE.to_string()), "{why}");
+        }
+        eprintln!("host page {page} B, row room: {reading:?}");
     }
 }

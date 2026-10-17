@@ -135,8 +135,8 @@ const _: () = assert!(PLAN_ROOM == HOST_USABLE - OS_OTHER);
 /// ([`super::row_table_tier`] replaces it with [`super::row_room`]).
 pub const ROW_CACHE: u64 = 4_294_967_296;
 
-/// The page the row room counts in ([`super::row_room`]): the host's base
-/// page, 4 KiB on x86_64, the unit a fault and an advise read.
+/// The page the row room counts in ([`super::row_room`]). The host-room
+/// read refuses a host whose base page size differs.
 pub const ROW_PAGE: u64 = 4096;
 
 /// What the machine's [`OS_OTHER`] is called: what the OS and every other
