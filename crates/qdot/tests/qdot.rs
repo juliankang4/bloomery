@@ -1794,6 +1794,62 @@ fn hw_iq4xs_kernel_matches_mirror() {
     generated_gate_a(GgmlType::IQ4_XS, 136, 256, &[2560, 512, 768]);
 }
 
+#[test]
+fn iq4xs_signed_dot_extremes() {
+    let ty = GgmlType::IQ4_XS;
+    let columns: Vec<Vec<u8>> = [127i8, -127, -128]
+        .into_iter()
+        .map(|q| {
+            let mut col = vec![0; col_bytes(ty, 256)];
+            col[..4].copy_from_slice(&1.0f32.to_le_bytes());
+            col[8..264].fill(q as u8);
+            for sum in col[264..].chunks_exact_mut(2) {
+                sum.copy_from_slice(&(16 * i16::from(q)).to_le_bytes());
+            }
+            col
+        })
+        .collect();
+    for (nibble, want) in [
+        (0xff, [3_673_856.0f32, -3_673_856.0, -3_702_784.0]),
+        (0x00, [-4_129_024.0f32, 4_129_024.0, -4_161_536.0]),
+    ] {
+        for scale in [-32i16, 0, 1, 31] {
+            let code = (scale + 32) as u16;
+            let row = iq4xs_block(
+                0x3c00,
+                (code >> 4) * 0x5555,
+                [((code & 15) * 17) as u8; 4],
+                |_| nibble,
+            );
+            let expected = want.map(|v| {
+                if scale == 0 {
+                    0.0
+                } else {
+                    v * f32::from(scale)
+                }
+            });
+            for (col, want) in columns.iter().zip(expected) {
+                assert_eq!(
+                    dot_row_scalar(ty, &row, col, 256).unwrap().to_bits(),
+                    want.to_bits()
+                );
+                assert_eq!(
+                    dot_row(ty, &row, col, 256).unwrap().to_bits(),
+                    want.to_bits()
+                );
+            }
+            for c in 1..=qdot::TILE_COLS {
+                let acols: Vec<&[u8]> = (0..c).map(|i| columns[i % 3].as_slice()).collect();
+                let mut out = vec![0.0; c];
+                qdot::dot_row_cols(ty, &row, &acols, 256, &mut out).unwrap();
+                for (i, got) in out.iter().enumerate() {
+                    assert_eq!(got.to_bits(), expected[i % 3].to_bits());
+                }
+            }
+        }
+    }
+}
+
 /// IQ4_XS gate B: every dumped row within 1 ULP of ik's
 /// `mul_mat_qX_K_q8_K_T<DequantizerIQ4XS, 1>` (the IQ3_XXS band).
 #[test]

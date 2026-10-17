@@ -27,7 +27,7 @@
 //! - IQ4_NL x Q8_2_X4: port of ik's `mul_mat_qX_0_q8_0_T<IQ4_NL_UnpackerS, _, block_q8_2>`
 //!   (iqk_gemm_legacy_quants.cpp:407, :2596), the body its AVX2 (non-AVX512) build runs.
 //! - IQ4_XS x Q8_K: port of ik's `mul_mat_qX_K_q8_K_T<DequantizerIQ4XS>`
-//!   (iqk_gemm_kquants.cpp:644, :3174), the body its AVX2 (non-AVX512) build runs.
+//!   with its signed table and `multiply_add_avx2`, the body its AVX2 build runs.
 //! - Q8_0 x Q8_2_X4: port of ik's `mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, 1, block_q8_2>`
 //!   (iqk_gemm_legacy_quants.cpp:404, :753), the body its AVX2 (no AVX512-VNNI) build runs.
 //! - Q2_0 x Q8_0: port of mainline's `ggml_vec_dot_q2_0_q8_0_generic` (llama.cpp `f2cc7282c`
@@ -9029,142 +9029,23 @@ fn dot_iq4nl_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// scales_h, minus 32.
 const IQ4XS_BLOCK: usize = 136;
 
-/// ik's `load_iq4nl_values_256` (iqk_common.h:281): the signed kvalues plus maddubs'
-/// +128 offset, 1..241 unsigned; the offset comes back out through the column's
-/// 16-value sums.
-static KVALUES_IQ4NL_U: [u8; 16] = {
-    let mut t = [0u8; 16];
-    let mut i = 0;
-    while i < 16 {
-        t[i] = KVALUES_IQ4NL[i].wrapping_add(8 << 4) as u8;
-        i += 1;
-    }
-    t
-};
-
-/// ik's `DequantizerIQ4XS::minv` equivalent: the bsums fold's offset, `−128·d` per
-/// block.
-const IQ4XS_MIN: f32 = -128.0;
-
 /// AVX2+FMA+F16C row dot: IQ4_XS weights against a Q8_K column.
-///
-/// TWIN of [`dot_iq3xxs_q8k_avx2`] — ik runs both through `mul_mat_qX_K_q8_K_T`, and
-/// they differ in four places only: block width (136 vs 98), the block scale (ik's
-/// `ScaleIQ4XS::make_scales` over the 6-bit scale split vs the sign-word bits), the
-/// codes (the kvalues table through [`lut4_codes`] vs grid bytes + signs), and the
-/// bsums offset (−128 vs +64, and `d` undivided). Every edit outside those four must
-/// be made in both. i16: a maddubs pair peaks at 2·241·128 = 61696, ABOVE i16 — a pair
-/// of 241-weighted ±127 codes saturates, in ik's kernel and here alike, and the mirror
-/// reproduces the saturation (`emul_maddubs`). i32: a lane sums 8 sub-blocks of
-/// madd pairs, <= 8·31·2·32767 < 2^31, exact; its f32 conversion may round past 2^24,
-/// identically in kernel and mirror. Also TWIN of [`dot_iq4xs_q8k_tile_avx2`], its
-/// column tile.
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA+F16C are available and buffers match `nb` blocks.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dot_iq4xs_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
-    // SAFETY: AVX2+FMA+F16C present and both slices hold nb blocks per contract.
-    unsafe {
-        let m4 = _mm256_set1_epi8(0xF);
-        // SAFETY: 16 readable bytes of the static table.
-        let t128 = _mm_loadu_si128(KVALUES_IQ4NL_U.as_ptr() as *const __m128i);
-        let values = _mm256_set_m128i(t128, t128);
-        // Scales8KBase::shuffle: scale b onto the two 16-value sums of sub-block b.
-        let mins_lo = _mm_set_epi32(0x0706_0706, 0x0504_0504, 0x0302_0302, 0x0100_0100);
-        let mins_hi = _mm_set_epi32(0x0f0e_0f0e, 0x0d0c_0d0c, 0x0b0a_0b0a, 0x0908_0908);
-        // ScaleIQ4XS::make_scales: the 6-bit split's shifts, masks and nibble shuffle.
-        let hshift = _mm_set_epi32(12, 8, 4, 0);
-        let lshift = _mm_set_epi32(4, 0, 4, 0);
-        let hmask = _mm_set1_epi16(0x03);
-        let lmask = _mm_set1_epi8(0xf);
-        let lshuffle = _mm_set_epi32(0x0703_0602, 0x0501_0400, 0x0703_0602, 0x0501_0400);
-        let m32 = _mm_set1_epi16(-32);
-        let mut accd = _mm256_setzero_ps();
-
-        for i in 0..nb {
-            let blk = wrow.as_ptr().add(IQ4XS_BLOCK * i);
-            // SAFETY: one unaligned u16, u16 and u32 read inside the block.
-            let d = f16c_to_f32((blk as *const u16).read_unaligned());
-            let scales_h = u32::from((blk.add(2) as *const u16).read_unaligned());
-            let scales_l = (blk.add(4) as *const u32).read_unaligned();
-            // make_scales: ls[j] - 32 on the eight i16 lanes.
-            let tmp32 = scales_h | (scales_h << 14);
-            let sh = _mm_slli_epi16::<4>(_mm_and_si128(
-                _mm_srlv_epi32(_mm_set1_epi32(tmp32 as i32), hshift),
-                hmask,
-            ));
-            let sl = _mm_and_si128(
-                _mm_srlv_epi32(_mm_set1_epi32(scales_l as i32), lshift),
-                lmask,
-            );
-            let scales128 = _mm_add_epi16(
-                _mm_or_si128(sh, _mm_cvtepi8_epi16(_mm_shuffle_epi8(sl, lshuffle))),
-                m32,
-            );
-            let mins = _mm256_set_m128i(
-                _mm_shuffle_epi8(scales128, mins_hi),
-                _mm_shuffle_epi8(scales128, mins_lo),
-            );
-            let all_scales = _mm256_set_m128i(scales128, scales128);
-            let dmin = IQ4XS_MIN * d;
-
-            let col = acol.as_ptr().add(Q8K_STRIDE * i);
-            // SAFETY: the column block's f32 d @0 and its i16 bsums[16] @264.
-            let dy = (col as *const f32).read_unaligned();
-            let bsums = _mm256_loadu_si256(col.add(264) as *const __m256i);
-            accd = _mm256_fmadd_ps(
-                _mm256_set1_ps(dmin * dy),
-                _mm256_cvtepi32_ps(_mm256_madd_epi16(mins, bsums)),
-                accd,
-            );
-
-            let qs = blk.add(8);
-            let mut sumi = _mm256_setzero_si256();
-            for j in 0..2 {
-                let mut p = [_mm256_setzero_si256(); 4];
-                for (k, pk) in p.iter_mut().enumerate() {
-                    let b = 4 * j + k;
-                    // SAFETY: 16 code bytes of sub-block b inside the block.
-                    let codes = lut4_codes(qs.add(16 * b), m4, values);
-                    // set_scales_8: sub-block b's scale on every i16 lane.
-                    let sc = _mm256_shuffle_epi8(
-                        all_scales,
-                        _mm256_set1_epi16(((2 * b) | ((2 * b + 1) << 8)) as i16),
-                    );
-                    // SAFETY: 32 codes of sub-block b inside the column block.
-                    let q8 = _mm256_loadu_si256(col.add(8 + 32 * b) as *const __m256i);
-                    *pk = _mm256_madd_epi16(sc, _mm256_maddubs_epi16(codes, q8));
-                }
-                // multiply_add: exact i32 sums, so the order is free; ik's is kept.
-                if j == 0 {
-                    sumi = _mm256_add_epi32(
-                        _mm256_add_epi32(p[0], p[2]),
-                        _mm256_add_epi32(p[1], p[3]),
-                    );
-                } else {
-                    sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p[0], p[2]));
-                    sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p[1], p[3]));
-                }
-            }
-            accd = _mm256_fmadd_ps(_mm256_set1_ps(d * dy), _mm256_cvtepi32_ps(sumi), accd);
-        }
-
-        hsum_float_8(accd)
-    }
+    // SAFETY: the caller validates the ISA and both buffers for nb blocks.
+    unsafe { dot_iq4xs_q8k_tile_avx2(wrow, &[acol.as_ptr()], nb)[0] }
 }
 
-/// The IQ4_XS tile: one row's blocks against up to [`TILE_COLS`] Q8_K
-/// columns. Per block the weight side once — the six-bit scales, the kvalues
-/// codes of the eight sub-blocks, `mins`, `d` — then per column
-/// [`q8k_block_step`], the one-column kernel's steps (shared with the IQ3_XXS
-/// and IQ3_S tiles). Each column keeps its own `accd` and ends in `hsum_float_8`. The
-/// maddubs saturation of 241-weighted codes happens inside the per-column
-/// step, on the column's own bytes, as in the one-column kernel.
-///
-/// TWIN of [`dot_iq4xs_q8k_avx2`]: any edit to the float or integer steps of
-/// one is made in both.
+/// The IQ4_XS tile: unpack each weight block once for up to [`TILE_COLS`] Q8_K
+/// columns. Signed table values put their magnitude on maddubs' unsigned side and
+/// fold their sign into the activation. A pair is bounded by 2 * 127 * 128 = 32512,
+/// so no i16 saturation occurs. Each i32 lane is bounded by
+/// 8 * 32 * 4 * 127 * 128 = 16646144; the f32 conversion and one fmadd per block
+/// follow ik's `mul_mat_qX_K_q8_K_T<DequantizerIQ4XS>`.
 ///
 /// # Safety
 /// CPU must support AVX2+FMA+F16C; `wrow` must hold `nb` IQ4_XS blocks and
@@ -9182,11 +9063,8 @@ unsafe fn dot_iq4xs_q8k_tile_avx2<const C: usize>(
     unsafe {
         let m4 = _mm256_set1_epi8(0xF);
         // SAFETY: 16 readable bytes of the static table.
-        let t128 = _mm_loadu_si128(KVALUES_IQ4NL_U.as_ptr() as *const __m128i);
+        let t128 = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
         let table = _mm256_set_m128i(t128, t128);
-        // Scales8KBase::shuffle: scale b onto the two 16-value sums of sub-block b.
-        let mins_lo = _mm_set_epi32(0x0706_0706, 0x0504_0504, 0x0302_0302, 0x0100_0100);
-        let mins_hi = _mm_set_epi32(0x0f0e_0f0e, 0x0d0c_0d0c, 0x0b0a_0b0a, 0x0908_0908);
         // ScaleIQ4XS::make_scales: the 6-bit split's shifts, masks and nibble shuffle.
         let hshift = _mm_set_epi32(12, 8, 4, 0);
         let lshift = _mm_set_epi32(4, 0, 4, 0);
@@ -9216,12 +9094,7 @@ unsafe fn dot_iq4xs_q8k_tile_avx2<const C: usize>(
                 _mm_or_si128(sh, _mm_cvtepi8_epi16(_mm_shuffle_epi8(sl, lshuffle))),
                 m32,
             );
-            let mins = _mm256_set_m128i(
-                _mm_shuffle_epi8(scales128, mins_hi),
-                _mm_shuffle_epi8(scales128, mins_lo),
-            );
             let all_scales = _mm256_set_m128i(scales128, scales128);
-            let dmin = IQ4XS_MIN * d;
 
             let qs = blk.add(8);
             let mut values = [_mm256_setzero_si256(); 8];
@@ -9237,8 +9110,19 @@ unsafe fn dot_iq4xs_q8k_tile_avx2<const C: usize>(
             }
 
             for (col, a) in acols.iter().zip(accd.iter_mut()) {
-                // SAFETY: the column's block i, inside the validated column.
-                *a = q8k_block_step(&values, &scales, mins, d, dmin, col.add(Q8K_STRIDE * i), *a);
+                // SAFETY: the column's block i holds d @0 and 256 codes @8.
+                let col = col.add(Q8K_STRIDE * i);
+                let dy = (col as *const f32).read_unaligned();
+                let mut sumi = _mm256_setzero_si256();
+                for (b, (&value, &scale)) in values.iter().zip(&scales).enumerate() {
+                    let q8 = _mm256_loadu_si256(col.add(8 + 32 * b) as *const __m256i);
+                    let pair = _mm256_maddubs_epi16(
+                        _mm256_sign_epi8(value, value),
+                        _mm256_sign_epi8(q8, value),
+                    );
+                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(scale, pair));
+                }
+                *a = _mm256_fmadd_ps(_mm256_set1_ps(d * dy), _mm256_cvtepi32_ps(sumi), *a);
             }
         }
 
@@ -9251,9 +9135,8 @@ unsafe fn dot_iq4xs_q8k_tile_avx2<const C: usize>(
     }
 }
 
-/// Mirror of `dot_iq4xs_q8k_avx2`, bit-identical: the maddubs lanes take the
-/// instruction's saturation (`emul_maddubs`), the madd and i32 sums are exact within
-/// bounds, and the two fmadds per block and the final reduction are the kernel's.
+/// Mirror of the IQ4_XS tile's signed dot: sign_epi8 wraps a -128 activation
+/// under negation. The integer lanes, per-block fmadd and final reduction match AVX2.
 fn dot_iq4xs_q8k_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     let mut accd = [0.0f32; 8];
     for i in 0..nb {
@@ -9261,40 +9144,21 @@ fn dot_iq4xs_q8k_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
         let scales_l = &blk[4..8];
-        let sc: [i32; 8] = std::array::from_fn(|b| {
-            let lo = i32::from((scales_l[b / 2] >> (4 * (b % 2))) & 0x0f);
-            let hi = i32::from((scales_h >> (2 * b)) & 3);
-            (lo | (hi << 4)) - 32
-        });
-        let dmin = IQ4XS_MIN * d;
-
         let col = &acol[Q8K_STRIDE * i..Q8K_STRIDE * (i + 1)];
         let dy = f32::from_le_bytes(col[0..4].try_into().unwrap());
-        let bsum = |t: usize| i32::from(i16::from_le_bytes([col[264 + 2 * t], col[265 + 2 * t]]));
-        for (l, a) in accd.iter_mut().enumerate() {
-            let m = sc[l] * bsum(2 * l) + sc[l] * bsum(2 * l + 1);
-            *a = (dmin * dy).mul_add(m as f32, *a);
-        }
-
-        // Sub-block b's value n: the low nibble of qs[n] (n < 16) or the high nibble
-        // of qs[n - 16], through the offset table.
-        let mut u = [0u8; 32];
-        let mut q = [0u8; 32];
         let mut sumi = [0i32; 8];
-        for (b, &s) in sc.iter().enumerate() {
-            for n in 0..32 {
-                let byte = blk[8 + 16 * b + (n % 16)];
-                u[n] = if n < 16 {
-                    KVALUES_IQ4NL_U[usize::from(byte & 0x0f)]
-                } else {
-                    KVALUES_IQ4NL_U[usize::from(byte >> 4)]
-                };
-                q[n] = col[8 + 32 * b + n];
-            }
-            let mb = emul_maddubs(u, q);
-            // madd: a lane pairs two maddubs lanes under the one scale; exact in i32.
-            for l in 0..8 {
-                sumi[l] += s * (i32::from(mb[2 * l]) + i32::from(mb[2 * l + 1]));
+        for b in 0..8 {
+            let lo = i32::from((scales_l[b / 2] >> (4 * (b % 2))) & 0x0f);
+            let hi = i32::from((scales_h >> (2 * b)) & 3);
+            let scale = (lo | (hi << 4)) - 32;
+            for (l, sum) in sumi.iter_mut().enumerate() {
+                for n in 4 * l..4 * l + 4 {
+                    let byte = blk[8 + 16 * b + (n % 16)];
+                    let nib = if n < 16 { byte & 0xf } else { byte >> 4 };
+                    let w = KVALUES_IQ4NL[usize::from(nib)];
+                    let q = emul_sign_epi8(col[8 + 32 * b + n], w) as i8;
+                    *sum += scale * i32::from(w.wrapping_abs() as u8) * i32::from(q);
+                }
             }
         }
         for (a, &si) in accd.iter_mut().zip(&sumi) {

@@ -3,12 +3,10 @@
 // gate quantizes. Same dump format as iq4nl_ref.cpp: tensor header, ik's activation bytes
 // hex, `w R <hex>` weight rows, `row R <bits>` results.
 //
-// The pairing: ggml.c:1302 — [GGML_TYPE_IQ4_XS].vec_dot_type = GGML_TYPE_Q8_K;
-// iqk_gemm_kquants.cpp:3143-3145 — the entry requires ne00 % QK_K == 0 and typeB = Q8_K,
-// and case IQ4_XS (:3174-3175) picks set_functions<DequantizerIQ4XS>, which on a build
-// without HAVE_FANCY_SIMD (:1835-1839) is mul_mat_qX_K_q8_K_T<DequantizerIQ4XS, nrc_y>
-// (:644) with Q8<nrc_y, block_q8_K>: make_scales over the 6-bit scale split, the +128
-// kvalues table, the -128 bsums fold.
+// The IQ4_XS x Q8_K pairing selects DequantizerIQ4XS. Its AVX2
+// mul_mat_qX_K_q8_K_T path uses the signed iq4k_values table, make_scales over
+// the 6-bit scale split, and multiply_add_avx2's sign fold. Each block has one
+// float multiply-add and no bsums offset.
 //
 // The GGUF is argv[1]: build-qdot-ref.sh passes the Qwen3.8 UD-Q3_K_XL second shard
 // (BLOOMERY_QWEN_Q3_MODEL), whose IQ4_XS tensors are the one layer's ffn_gate/up_exps.
