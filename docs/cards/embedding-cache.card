@@ -1,0 +1,20 @@
+# Repeated requests avoid the entire encoder pass. Image-only reuse still pays tokenization,
+# image decoding and preparation, the text encoder, response formatting and HTTP transport.
+# The remaining host work bounds a hit; this is result reuse, not increased GPU bandwidth.
+kind: baseline
+question: does bounded embedding result reuse reduce serial request latency without a measurable miss penalty?
+term: end-to-end HTTP p50 latency reduction for repeated text or image inputs on the recorded NVIDIA card
+unit: %
+predict: 50..99
+condition: EmbeddingGemma 2 Q8_0 with its BF16 projector beside Qwen3-30B-A3B-Instruct-2507 Q4_K_M;
+  RTX 5090 host with performance CPU governor, or GB10 CUDA 13.3.1 container with unchanged clock policy;
+  five rotated main/main/head rounds in one lease, 32 warm requests per workload and arm;
+  one server at a time, 64 MiB shared cache enabled only on head; identical server flags otherwise;
+  same text, same image, same image with different text, and all-new image/text inputs;
+  bit-identical unnormalized vectors; first-load rows excluded; criterion and script frozen by SHA256
+reason: a pooled hit removes every encoder and tower launch; an image-row hit removes only tower launches
+  and readback. A/A pairs measure the HTTP and machine noise instead of assuming a fixed floor.
+decide-in: retain only if a hit workload improves beyond twice its A/A noise and all-new inputs have no
+  p50 or p95 slowdown or throughput loss beyond twice their A/A noise
+decide-below: discard the optimization and retain the measurements; inspect image preparation and JSON cost
+decide-above: confirm the request arrived and every returned vector equals the uncached full-width vector
