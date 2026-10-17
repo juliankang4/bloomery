@@ -1,6 +1,6 @@
 use super::{
-    ARCH, MMPROJ_BF16, MMPROJ_BF16_SHA256, MODEL, MODEL_SHA256, PROFILE, SERVER, SERVER_CPU, TEXT,
-    TEXT_CPU, TOWER, TOWER_CPU, VIDEO, VIDEO_CPU,
+    ARCH, HF, HF_CHECKPOINT, MMPROJ_BF16, MMPROJ_BF16_SHA256, MODEL, MODEL_SHA256, PROFILE, SERVER,
+    SERVER_CPU, TEXT, TEXT_CPU, TOWER, TOWER_CPU, VIDEO, VIDEO_CPU,
 };
 use crate::RefError;
 use crate::emb2::tests::{check, header, remove, set_dir};
@@ -41,6 +41,45 @@ fn audio_families_require_identity_architecture_build_and_trailer() -> Result<()
 
 const Q8_MMPROJ: &str = "/models/embeddinggemma-2/mmproj-embeddinggemma-2-Q8_0.gguf";
 const Q8_MMPROJ_SHA256: &str = "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f";
+
+#[test]
+fn hf_identity_build_digest_and_window_are_held_without_a_gpu() -> Result<(), RefError> {
+    use crate::emb2::HF_BUILD;
+    assert!(crate::arch::named(HF.name).is_some());
+    let dir = set_dir("hf")?;
+    let crate::family::Identity::Emb2(kind, profile) = HF.identity else {
+        panic!("HF is an Emb2 family");
+    };
+    let make = |with: &[(&str, &str)]| {
+        let mut fields = vec![("build", HF_BUILD), ("sliding_window", "512")];
+        fields.extend_from_slice(with);
+        header(profile, ARCH, kind, &fields)
+    };
+    assert_eq!(check(&dir, &HF, &make(&[]), true)?, HF_CHECKPOINT);
+    for (field, value) in [
+        ("model", MODEL),
+        ("arch", "gemma-embedding"),
+        ("model_sha256", MODEL_SHA256),
+        ("build", LCPP_BUILD),
+        ("emb2", "server"),
+        ("device", "cpu\tthreads\t1\tcard\tcpu"),
+        ("sliding_window", ""),
+        ("sliding_window", "0"),
+        ("sliding_window", "-1"),
+        ("sliding_window", "NaN"),
+        ("sliding_window", "512\t512"),
+    ] {
+        let error = check(&dir, &HF, &make(&[(field, value)]), true).expect_err("refused");
+        let named = if field == "model_sha256" {
+            "sha256"
+        } else {
+            field
+        };
+        assert!(error.to_string().contains(named), "{field}: {error}");
+    }
+    check(&dir, &HF, &make(&[]), false).expect_err("incomplete HF set");
+    remove(&dir)
+}
 
 /// A kind of set, the family checking it, the header lines replaced and the
 /// text the stale error names.

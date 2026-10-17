@@ -29,6 +29,25 @@ pub fn rel(a: &[f32], b: &[f32]) -> f64 {
     if r.is_nan() { f64::INFINITY } else { r }
 }
 
+/// The maximum absolute difference of two f32 vectors in f64.
+pub(crate) fn max_delta(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs())
+        .fold(0.0, f64::max)
+}
+
+/// The cosine similarity of two f32 vectors in f64.
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    dot / (norm(a) * norm(b))
+}
+
 /// The first index of the largest value, as the head's argmax breaks ties.
 pub fn argmax(v: &[f32]) -> u32 {
     let best = v

@@ -1284,11 +1284,11 @@ gate-gpu-gemma-embedding-e2e:
 gate-gpu-gemma-embedding-serve:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2 --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --v1 --dir "$D"'
 
-gate-gpu-gemma-embedding2-e2e:
+gate-gpu-gemma-embedding2-e2e *ARGS:
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gemma-embedding2 --lib -- --include-ignored'
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding2::spec::tests::key_bounds_are_the_symmetric_mask --exact'
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --bin gate_gemma_embedding2_e2e'
-    BLOOMERY_MODEL=gemma-embedding2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e'
+    BLOOMERY_MODEL=gemma-embedding2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e {{ARGS}}'
 
 # Gemma4 vision's mainline card and CPU sets, including every block's rows.
 # Every layer and projected row is held to its CPU/card twin distance.

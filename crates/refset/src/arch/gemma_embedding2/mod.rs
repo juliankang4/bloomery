@@ -1,5 +1,5 @@
 //! EmbeddingGemma 2 (`gemma-embedding2`, its image tower `gemma4v`). Every set
-//! is llama.cpp mainline's, dumped by the tree [`crate::emb2::LCPP_BUILD`]
+//! except [`HF`] is llama.cpp mainline's, dumped by the tree [`crate::emb2::LCPP_BUILD`]
 //! (`tools/ref/emb2/emb2.sh`, `just dump-ref-emb2`) from the Q8_0 file
 //! [`MODEL`] and the bf16 projector [`MMPROJ_BF16`]:
 //!
@@ -308,8 +308,31 @@ pub static AUDIO_TOWER_CPU: Family = Family {
     ..AUDIO_TOWER
 };
 
+/// The original HF checkpoint, pinned independently of the GGUF conversion.
+pub const HF_CHECKPOINT: &str = include_str!("hf-checkpoint.txt");
+
+/// Official sentence-transformers vectors of the UTF-8 E3 text cases.
+pub static HF: Family = Family {
+    build: Some(Build::Is(crate::emb2::HF_BUILD)),
+    consumers: E2E,
+    ..family(
+        "hf-gemma-embedding2",
+        &["ref_gemma_embedding2_hf"],
+        Kind::Hf,
+        &Profile {
+            model: HF_CHECKPOINT,
+            model_sha256: "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79",
+            mmproj: None,
+        },
+        ARCH,
+        || Ok(HF_CHECKPOINT.to_string()),
+        "python tools/ref/emb2/hf_vectors.py --help",
+    )
+};
+
 /// The architecture's families, in the order `refset-check` lists them.
 pub static FAMILIES: &[&Family] = &[
+    &HF,
     &TEXT,
     &TEXT_CPU,
     &TOWER,

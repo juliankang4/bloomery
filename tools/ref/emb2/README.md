@@ -1,6 +1,8 @@
 # EmbeddingGemma reference sets
 
 Both encoder versions use mainline llama.cpp at `6868a52cb337450658006ad2f9281c2eb63f1666`.
+V2 also has an [official HF sentence-transformers reference](HF.md), with pinned
+Python packages and original checkpoint weights, and an exact sliding-window check.
 `build-embedding-ref <architecture>` and `dump-ref-embedding <architecture> [steps...]`
 share the linker, dumper and set writer. Model profiles own the vocabulary, context,
 files, digests, available steps and optional image projector.

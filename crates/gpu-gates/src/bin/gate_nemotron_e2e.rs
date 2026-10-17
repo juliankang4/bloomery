@@ -82,7 +82,9 @@ mod e2e;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use crate::e2e::{Run, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
+    use crate::e2e::{
+        Run, cosine, feed, finite, fresh, histogram, max_delta, or_fault, same, top_ids, walk,
+    };
     use bloomery_gpu::arch::nemotron_h::PASS_ROWS;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Gpu, GpuError, NemotronHModel};
@@ -449,24 +451,6 @@ mod gate {
     }
 
     // ------------------------------------------------- the prompt path
-
-    /// The largest |a − b| over two logits rows.
-    fn max_delta(a: &[f32], b: &[f32]) -> f64 {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs())
-            .fold(0.0, f64::max)
-    }
-
-    fn cosine(a: &[f32], b: &[f32]) -> f64 {
-        let dot: f64 = a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| f64::from(*x) * f64::from(*y))
-            .sum();
-        let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-        dot / (norm(a) * norm(b))
-    }
 
     /// `v`'s largest value less its second.
     fn margin(v: &[f32]) -> f64 {

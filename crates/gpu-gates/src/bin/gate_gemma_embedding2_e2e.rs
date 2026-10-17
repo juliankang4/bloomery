@@ -27,6 +27,9 @@
 //! 4. (r) Refused by name, the load untouched after each: a pass of no ids,
 //!    of one id past the load's context and of an id past the vocabulary,
 //!    and a load at one position past [`CARD_CTX`].
+//! 5. (h) V2's normalized vectors against official sentence-transformers,
+//!    with a frozen mainline-to-HF precision budget and independent ceiling.
+//!    `--hf` runs only this clause, including the exact one-sided window check.
 
 #[cfg(feature = "gemma-embedding2")]
 fn main() -> std::process::ExitCode {
@@ -59,7 +62,7 @@ mod gate {
     use gguf::Split;
     use model::arch::gemma_embedding2::hparams::CARD_CTX;
     use refset::arch::gemma_embedding2::{
-        IDS_SET, MODEL_SHA256, REL_FLOOR as FLOOR, TEXT, TEXT_CPU, TWIN,
+        HF, IDS_SET, MODEL_SHA256, REL_FLOOR as FLOOR, TEXT, TEXT_CPU, TWIN,
     };
     use refset::ik::RefHeader;
     use refset::tokenizer::read_ids;
@@ -132,7 +135,10 @@ mod gate {
 
     impl Held {
         fn of(ours: &[f32], card: &[f32], twin: &[f32]) -> Held {
-            let (r, twin) = (rel(ours, card), rel(twin, card));
+            Self::distances(rel(ours, card), rel(twin, card))
+        }
+
+        fn distances(r: f64, twin: f64) -> Held {
             Held {
                 r,
                 twin,
@@ -591,16 +597,68 @@ mod gate {
         Ok(ok)
     }
 
+    fn hf(enc: &mut Encoder, reach: &[Option<u32>]) -> Result<bool, GateError> {
+        let man = open(&HF)?;
+        let window = refset::emb2::hf_window(&man)?;
+        if !reach.iter().any(Option::is_some) || reach.iter().flatten().any(|&r| r != window) {
+            return Err(format!("HF one-sided reach {window}, encoder reaches {reach:?}").into());
+        }
+        println!("(h) HF sliding_window {window}: one-sided inclusive; GGUF reaches {reach:?}");
+        let llama = open(&TEXT)?;
+        let cases = cases(&man, HF.sets[0])?;
+        if !cases.iter().any(|c| c.ids.len() > 2 * window as usize + 1) {
+            return Err("HF cases do not cross both window edges".into());
+        }
+        let mut ok = true;
+        for c in cases {
+            let expected = crate::image::row(&man, &format!("{}/embd", c.id), [768, 1, 1, 1])?;
+            let pass = enc.pass(&c.ids, false)?;
+            let ours = serve::embed::normalize(&pass.pooled, serve::embed::Norm::default())?;
+            let text_id = c.id.strip_suffix("_hf").unwrap_or(&c.id);
+            // PIN(2026-10-17): frozen unit-vector L2 budget derived from the minimum
+            // Q8_0/HF cosine over 84 E3 cases on DGX Spark and RTX 5090.
+            let twin = (2.0 * (1.0 - 0.999_129_044_1_f64)).sqrt();
+            let mut arms = vec![("bloomery", ours)];
+            if text_id == c.id {
+                let reference = serve::embed::normalize(
+                    &tap(&llama, &format!("{text_id}/pooled"))?,
+                    serve::embed::Norm::default(),
+                )?;
+                arms.push(("llama.cpp", reference));
+            }
+            for (arm, vector) in &arms {
+                let distance = rel(vector, &expected);
+                // PIN(2026-10-17): 5e-2 rounds up the derived 0.04174 maximum
+                // normalized Q8_0/HF distance on DGX Spark and RTX 5090.
+                if !distance.is_finite() || distance > 5e-2 {
+                    return Err(format!("{} {arm}/HF: rel {distance} exceeds 5e-2", c.id).into());
+                }
+                let cosine = crate::e2e::cosine(vector, &expected);
+                let maximum = crate::e2e::max_delta(vector, &expected);
+                let held = Held::distances(distance, twin);
+                println!(
+                    "(h) {} {arm}/HF: cosine {cosine:.9e} max_abs_diff {maximum:.9e} {}; {}",
+                    c.id,
+                    held.line("rel"),
+                    verdict(held.ok())
+                );
+                ok &= held.ok();
+            }
+        }
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let (v1, clip_manifest) = match args.as_slice() {
-            [] => (false, None),
-            [arg] if arg == "--v1" => (true, None),
-            [flag, path] if flag == "--video-clips" => (false, Some(Path::new(path))),
+        let (v1, hf_only, clip_manifest) = match args.as_slice() {
+            [] => (false, false, None),
+            [arg] if arg == "--v1" => (true, false, None),
+            [arg] if arg == "--hf" => (false, true, None),
+            [flag, path] if flag == "--video-clips" => (false, false, Some(Path::new(path))),
             _ => {
                 return Err(format!(
-                    "expected --v1, --video-clips <manifest>, or no arguments; got {args:?}"
+                    "expected --v1, --hf, --video-clips <manifest>, or no arguments; got {args:?}"
                 )
                 .into());
             }
@@ -642,6 +700,14 @@ mod gate {
         if let Some(manifest) = clip_manifest {
             let mut enc = Encoder::open(split, ctx, Gpu::new()?)?;
             return if clips(&mut enc, &model, manifest)? {
+                Ok(())
+            } else {
+                Err(checks_failed())
+            };
+        }
+        if hf_only {
+            let mut enc = Encoder::open(split, ctx, Gpu::new()?)?;
+            return if hf(&mut enc, &encoder.reach)? {
                 Ok(())
             } else {
                 Err(checks_failed())
@@ -702,6 +768,11 @@ mod gate {
             );
         }
         if !v1 {
+            ok &= clause(
+                "(h)",
+                "HF sentence-transformers",
+                hf(&mut enc, &encoder.reach),
+            );
             ok &= clause("(i)", "image inputs", images(&mut enc, &model));
         }
         let past = Split::open(&model).map_err(|e| format!("open {}: {e}", model.display()))?;

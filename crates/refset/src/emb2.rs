@@ -13,6 +13,7 @@ use std::path::Path;
 /// The kind of set, which its `# emb2` and `# device` lines state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    Hf,
     Text,
     TextCpu,
     Tower,
@@ -26,6 +27,7 @@ impl Kind {
     #[must_use]
     pub const fn set_kind(self) -> &'static str {
         match self {
+            Kind::Hf => "hf",
             Kind::Text | Kind::TextCpu => "text",
             Kind::Tower | Kind::TowerCpu => "tower",
             Kind::Server | Kind::ServerCpu => "server",
@@ -37,7 +39,7 @@ impl Kind {
     pub const fn device(self) -> &'static str {
         match self {
             Kind::TextCpu | Kind::TowerCpu | Kind::ServerCpu => "cpu",
-            Kind::Text | Kind::Tower | Kind::Server => "cuda",
+            Kind::Hf | Kind::Text | Kind::Tower | Kind::Server => "cuda",
         }
     }
 }
@@ -115,7 +117,7 @@ impl Emb2Set {
                     ));
                 }
             },
-            Kind::Text | Kind::TextCpu | Kind::Server | Kind::ServerCpu => {
+            Kind::Hf | Kind::Text | Kind::TextCpu | Kind::Server | Kind::ServerCpu => {
                 let model = one(&man, "model")?;
                 let [path] = model[..] else {
                     return Err(RefError::malformed(
@@ -143,7 +145,8 @@ impl Emb2Set {
                 profile.model_sha256,
             ));
         }
-        if kind != Kind::Text
+        if kind != Kind::Hf
+            && kind != Kind::Text
             && kind != Kind::TextCpu
             && let Some((want_path, want_digest)) = profile.mmproj
         {
@@ -169,8 +172,32 @@ impl Emb2Set {
                 "the tower has no layer_out-0 block tap",
             ));
         }
+        if kind == Kind::Hf {
+            hf_window(&man)?;
+        }
         Ok(Emb2Set { man })
     }
+}
+
+/// The HF configuration's inclusive, one-sided attention reach.
+pub fn hf_window(man: &RefManifest) -> Result<u32, RefError> {
+    let fields = one(man, "sliding_window")?;
+    let [value] = fields[..] else {
+        return Err(RefError::malformed(
+            "hf sliding_window",
+            "expected one positive integer",
+        ));
+    };
+    let window = value
+        .parse::<u32>()
+        .map_err(|e| RefError::malformed("hf sliding_window", format!("{value:?}: {e}")))?;
+    if window == 0 {
+        return Err(RefError::malformed(
+            "hf sliding_window",
+            "expected a positive integer",
+        ));
+    }
+    Ok(window)
 }
 
 /// The mainline commit shared by the EmbeddingGemma oracle families.
@@ -178,6 +205,9 @@ impl Emb2Set {
 // commit that contains the no-cache attention pad, the pooled-embedding
 // LM-head skip and the t_embd expand removal on this model's path.
 pub const LCPP_BUILD: &str = "6868a52cb";
+
+/// The Python package versions used by the official HF reference generator.
+pub const HF_BUILD: &str = include_str!("emb2/hf-build.txt");
 
 pub(crate) const fn family(
     name: &'static str,
