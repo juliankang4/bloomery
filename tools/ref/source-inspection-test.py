@@ -184,11 +184,12 @@ exec "$@"
         index.write_bytes(good_index)
 
         # box.sh's no-Git provenance belongs only to DS41's own synced tree.
+        # The same-tree dry arm declares A/A without invoking a measured engine.
         own_bin = work / "target/release/generate"
         put(own_bin, engine, True)
         for commit, expected in (("abc123-dirty", "abc123-dirty(box.sh)"), ("", "?")):
             result = runner("depth-ds41.sh", "deepseek41", f"bin:{own_bin}:6",
-                            extra={"BLOOMERY_GIT_COMMIT": commit})
+                            extra={"BLOOMERY_GIT_COMMIT": commit, "BLOOMERY_AB_AA": "1"})
             expect(f"ds41-no-git-{commit or 'unknown'}", result, 0,
                    f"head={expected} dirty_files=?")
         other = tmp / "other/target/release/generate"
