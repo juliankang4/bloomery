@@ -6,7 +6,9 @@ unit: tokens/verify
 predict: 1..2
 condition: GLM-5.3-Flash UD-Q4_K_XL, short and 4096-token prompts, one request, graph target;
   two is the GLM verification window's row capacity, not a measured acceptance claim; alternate off/on twice
-  on one Spark and two Sparks, with the same prompt, context and target placement in each pair;
+  on one Spark and two Sparks, with the same prompt, context and NextN target load in each pair;
+  the plain control advances that target without drafting, as gate_glm5next_mtp does;
+  ordinary off can place different experts and is not this ID oracle;
   record current-main and head TP2 attempts in the same lease, including named refusals;
   builds and copies finish before the lease, no unrelated CUDA or test process, load average
   below one for 30 seconds, default clock policy; clock, power, temperature, memory and page-cache

@@ -85,9 +85,10 @@
 //! tokens run through the shared MTP window (`app::mtp::MtpDraft<Body>`,
 //! `runtime::Speculative` of two rows): each window verifies the target's
 //! next token and the draft's one proposal, the target's step mode as
-//! `--mode` says, the draft's walks eager; the greedy ids are the plain
-//! run's. In graph mode the verify of two rows is captured before the
-//! prompt (a `capture` line of its nodes). Each kept token prints its `step`
+//! `--mode` says, the draft's walks eager. The greedy-ID check uses plain
+//! advancement on the same NextN target plan. In graph mode the verify of
+//! two rows is captured before the prompt (a `capture` line of its nodes).
+//! Each kept token prints its `step`
 //! line and, under `--time`, a `time step` line (its window's wall over the
 //! window's kept rows, the row a plain step's wall compares with; `--warm W`
 //! marks the first W), and each window a `time pass` line (its wall from the

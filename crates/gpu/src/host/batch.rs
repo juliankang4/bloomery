@@ -1060,9 +1060,10 @@ impl<H: HostExperts> HostTier<H> {
     /// ([`HostTier::prepare_batch`]) and its expert tiers: per tier and set
     /// the places, the rows and the tier's event, and the tier card's staging
     /// ([`BatchPort::attach_tier`]). Nothing without a tier, and nothing
-    /// with a tier on a node, whose prompt batch [`HostTier::begin_group`]
-    /// refuses; made once. Load-time or first-prompt only; what it holds is
-    /// checked against the plan by [`HostTier::check_tier_reserves`].
+    /// with a tier on a node, whose routed batch download is refused by
+    /// [`HostTier::enqueue_download_tiered_pitched`]; made once. Load-time or
+    /// first-prompt only; what it holds is checked against the plan by
+    /// [`HostTier::check_tier_reserves`].
     pub fn prepare_tier_batch(&mut self) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::prepare_tier_batch";
         let stage = Arc::clone(self.step.boundary.region.context());
@@ -1201,6 +1202,21 @@ impl<H: HostExperts> HostTier<H> {
     ) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::enqueue_download_tiered";
         let mask = self.tier_mask(key.layer)?;
+        if let Some(tier) = self
+            .tiers
+            .iter()
+            .enumerate()
+            .find_map(|(t, tier)| (mask >> t & 1 == 1 && tier.node().is_some()).then_some(tier))
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a prompt batch with the expert tier {} on a node: the batch port's tier \
+                     legs run on a card of this process; feed the prompt as steps",
+                    tier.name()
+                ),
+            ));
+        }
         if mask == 0 {
             return Err(GpuError::shape(
                 WHAT,

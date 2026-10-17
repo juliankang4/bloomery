@@ -155,7 +155,8 @@ impl TierSet {
     /// Tier `tier`'s set as `map` holds it: per layer of the map, the ids of
     /// that tier's entries in its slot order. The map is the one owner of
     /// where an expert runs; the set is a copy of one tier's rows the tier
-    /// card keeps. A tier the map does not name is refused by name.
+    /// card keeps. Host-only edges are omitted; empty interior rows keep
+    /// their layer index. A tier the map does not name is refused by name.
     pub fn of_map(map: &SlotMap, tier: usize) -> Result<TierSet, GpuError> {
         const WHAT: &str = "TierSet::of_map";
         let layers = map.layers();
@@ -177,7 +178,25 @@ impl TierSet {
             }
             rows.push(ids);
         }
-        TierSet::new(layers, map.n_expert(), rows)
+        let first = rows.iter().position(|row| !row.is_empty()).unwrap_or(0);
+        let end = rows
+            .iter()
+            .rposition(|row| !row.is_empty())
+            .map_or(first, |i| i + 1);
+        let kept = layers.start + first..layers.start + end;
+        TierSet::new(kept, map.n_expert(), rows.drain(first..end).collect())
+    }
+
+    pub(super) fn check_map(&self, map: &SlotMap, tier: usize, name: &str) -> Result<(), GpuError> {
+        if *self != Self::of_map(map, tier)? {
+            return Err(GpuError::shape(
+                "HostTier::attach_tiers",
+                format!(
+                    "the tier {name} holds another set than the slot map's rows of tier {tier}"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// The layers the set has rows for.
@@ -2527,6 +2546,50 @@ pub(super) mod tests {
         assert_eq!(set.on_tier(4).expect("layer 4"), 2);
         assert!(set.on_tier(5).is_err());
         assert_eq!(set.experts(), 3);
+        let padded = SlotMap::from_rows(
+            2..7,
+            4,
+            vec![
+                HOST,
+                HOST,
+                HOST,
+                HOST,
+                0,
+                HOST,
+                TIER,
+                HOST,
+                HOST,
+                HOST,
+                HOST,
+                HOST,
+                HOST,
+                TIER,
+                0,
+                TIER | 1,
+                HOST,
+                HOST,
+                HOST,
+                HOST,
+            ],
+        )
+        .expect("host-only edges and an empty middle tier row");
+        let compact = TierSet::of_map(&padded, 0).expect("the padded map's set");
+        assert_eq!(compact.layers(), 3..6);
+        assert_eq!(compact.ids(3), Some(&[2][..]));
+        assert_eq!(compact.ids(4), Some(&[][..]));
+        assert_eq!(compact.ids(5), Some(&[1, 3][..]));
+        assert_eq!(compact.experts(), 3);
+        compact
+            .check_map(&padded, 0, "tier")
+            .expect("the map's set");
+        set.check_map(&map, 0, "tier").expect("an unchanged set");
+        for wrong in [
+            TierSet::new(2..4, 4, vec![vec![2], vec![1, 3]]).expect("shifted"),
+            TierSet::new(3..6, 4, vec![vec![2], vec![1, 3], vec![]]).expect("longer"),
+            TierSet::new(3..5, 5, vec![vec![2], vec![1, 3]]).expect("other experts"),
+        ] {
+            assert!(wrong.check_map(&map, 0, "tier").is_err());
+        }
         assert!(
             TierSet::of_map(&map, 1).is_err(),
             "a tier the map does not name"

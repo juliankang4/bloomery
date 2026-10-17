@@ -1820,29 +1820,8 @@ impl<H: HostExperts> HostTier<H> {
             ));
         }
         for (t, tier) in tiers.iter().enumerate() {
-            let set = tier.set();
-            if set.layers() != self.slots.layers() || set.n_expert() != self.slots.n_expert() {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!(
-                        "the tier's set covers layers {:?} of {} experts, the slot map {:?} of {}",
-                        set.layers(),
-                        set.n_expert(),
-                        self.slots.layers(),
-                        self.slots.n_expert()
-                    ),
-                ));
-            }
             // An expert on two devices is the slot map's refusal (`SlotMap::from_rows`).
-            if *set != tier::TierSet::of_map(&self.slots, t)? {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!(
-                        "the tier {} holds another set than the slot map's rows of tier {t}",
-                        tier.name()
-                    ),
-                ));
-            }
+            tier.set().check_map(&self.slots, t, tier.name())?;
         }
         let kind = bloomery_levers::tier_link().map_err(|e| GpuError::plan(WHAT, e))?;
         let layout = tiers[0].page_layout(tiers.len())?;
@@ -2160,20 +2139,10 @@ impl<H: HostExperts> HostTier<H> {
     /// Both batch sets free, at a group's start ([`BatchPort::begin`]); a
     /// poisoned tier is refused first, as [`BEGIN_GROUP`], so a call after a
     /// failed service — a lost tier card among them — enqueues nothing. A
-    /// load with a tier on a node is refused by name: the port makes no tier
-    /// leg for it ([`HostTier::prepare_tier_batch`]).
+    /// route to a tier on a node is refused before its download: the port
+    /// makes no leg for it ([`HostTier::enqueue_download_tiered_pitched`]).
     pub fn begin_group(&mut self) -> Result<(), GpuError> {
         self.health.refuse_if_poisoned(BEGIN_GROUP)?;
-        if let Some(t) = self.tiers.iter().find(|t| t.node().is_some()) {
-            return Err(GpuError::shape(
-                BEGIN_GROUP,
-                format!(
-                    "a prompt batch with the expert tier {} on a node: the batch port's tier \
-                     legs run on a card of this process; feed the prompt as steps",
-                    t.name()
-                ),
-            ));
-        }
         self.port_mut(BEGIN_GROUP)?.begin();
         Ok(())
     }
