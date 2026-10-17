@@ -32,6 +32,7 @@ pub mod card;
 pub mod dspark;
 pub mod fetch;
 pub mod safetensors;
+pub mod sentence_transformers;
 pub mod source;
 
 use std::ffi::OsString;

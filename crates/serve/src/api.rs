@@ -1819,7 +1819,7 @@ fn models(state: &State) -> Value {
     if let Some(side) = &state.side {
         models.push(Listed {
             id: &side.name,
-            meta: json!({ "n_ctx": side.ctx, "n_embd": side.width() }),
+            meta: json!({ "n_ctx": side.ctx, "n_embd": side.width(), "prompt_names": side.prompts.keys().collect::<Vec<_>>() }),
             max_model_len: Some(side.ctx),
         });
     }

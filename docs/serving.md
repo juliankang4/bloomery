@@ -35,11 +35,21 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   `--mmproj` and `--embd-model` on the same off-plan card do not count each other's bytes; the second open
   fails by name if the card is short.
   The response `model` is the embedding file name, also listed separately in `/v1/models` with
-  `meta.n_embd` and `meta.n_ctx`. `/props` adds `embedding_model` with the side model's `alias` and
+  `meta.n_embd`, `meta.n_ctx` and `meta.prompt_names`. `/props` adds `embedding_model` with the side model's `alias` and
   `path` when one is loaded; `model_alias` and `model_path` still name the chat model.
   On `/v1/embeddings`, a `model` of another type than a string or a name
   other than the embedding model's is a 400 `invalid_request_error` and runs no pass; `null` is unset.
-  `/embedding` and `/embeddings` ignore `model`. An input past the model's context is a 400
+  `/embedding` and `/embeddings` ignore `model`.
+  `prompt_name` selects an exact, case-sensitive name from the embedding model's
+  `config_sentence_transformers.json` `prompts` map, such as `query` or `document`.
+  The server reads this file at startup beside `--embd-model`, or from the `--embd-hf` repository
+  (falling back to its model card's single `base_model`). It prepends the configured bytes to each
+  text input before tokenization. No space or separator is added. Without `prompt_name`, input is
+  unchanged, even if the config sets `default_prompt_name`. A missing config provides no names;
+  a malformed config refuses startup. Unknown names, non-string names (including `null`) and
+  token-ID or media inputs with `prompt_name` return a 400 `invalid_request_error`.
+  For example, `{"input":"Where is Paris?","prompt_name":"query"}` uses the model's query prefix.
+  An input past the model's context is a 400
   `exceed_context_size_error` naming both lengths. llama-server checks its physical batch first and answers an input
   past it with a 500; this server has no batch limit there. An object with a `content` array takes text and image
   parts as described below. An object with `prompt_string` is a 400.

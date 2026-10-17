@@ -7,6 +7,16 @@
 /// quantization of that model. A card with no front matter, another
 /// relation, or other than one base model gives `None`.
 pub fn quantizes(text: &str) -> Option<String> {
+    let (base, relation) = facts(text)?;
+    (relation.as_deref() == Some("quantized")).then_some(base)
+}
+
+/// The card's single base model, including cards that omit `base_model_relation`.
+pub fn base_model(text: &str) -> Option<String> {
+    facts(text).map(|(base, _)| base)
+}
+
+fn facts(text: &str) -> Option<(String, Option<String>)> {
     let mut lines = text.trim_start_matches('\u{feff}').lines();
     if lines.next()?.trim_end() != "---" {
         return None;
@@ -40,8 +50,8 @@ pub fn quantizes(text: &str) -> Option<String> {
             _ => {}
         }
     }
-    match (relation.as_deref(), base.as_slice()) {
-        (Some("quantized"), [one]) if !one.is_empty() => Some(one.clone()),
+    match base.as_slice() {
+        [one] if !one.is_empty() => Some((one.clone(), relation)),
         _ => None,
     }
 }
@@ -58,13 +68,19 @@ fn unquote(v: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::quantizes;
+    use super::{base_model, quantizes};
 
     #[test]
     fn a_card_names_the_model_its_repo_quantizes() {
         // bartowski's Clef card, as published (front matter's first lines).
         let card = "---\nquantized_by: bartowski\nlicense: apache-2.0\nbase_model: Cloudflare/clef-flash\ntags:\n- clef\n- qwen3.5\nbase_model_relation: quantized\n---\n\n## Llamacpp\nbase_model: Other/x\n";
         assert_eq!(quantizes(card).as_deref(), Some("Cloudflare/clef-flash"));
+        assert_eq!(base_model(card).as_deref(), Some("Cloudflare/clef-flash"));
+        assert_eq!(
+            base_model("---\nbase_model:\n- google/embeddinggemma-2\n---\n").as_deref(),
+            Some("google/embeddinggemma-2")
+        );
+        assert!(base_model("---\nbase_model: [Org/a, Org/b]\n---\n").is_none());
         for (text, why) in [
             (
                 "---\nbase_model:\n  - 'Org/a'\nbase_model_relation: \"quantized\"\n---\n",

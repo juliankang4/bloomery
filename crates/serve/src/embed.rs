@@ -37,6 +37,10 @@ pub trait Embed: Send {
     /// The widths a request's `dimensions` may cut the pooled vector to, ascending; the last is
     /// the pooled vector's own width.
     fn dims(&self) -> Vec<usize>;
+    /// Named input prefixes from the model's sentence-transformers configuration.
+    fn prompts(&self) -> std::collections::BTreeMap<String, String> {
+        Default::default()
+    }
     /// The side model's image preparer, present when a projector is loaded.
     fn media(&self) -> Option<crate::media::SharedMediaModel> {
         None

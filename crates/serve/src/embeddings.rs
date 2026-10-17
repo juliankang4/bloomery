@@ -50,6 +50,7 @@ pub(super) struct Side {
     pub(super) name: String,
     pub(super) path: String,
     pub(super) ctx: usize,
+    pub(super) prompts: std::collections::BTreeMap<String, String>,
     dims: Vec<usize>,
     media: Option<media::SharedMediaModel>,
     audio: Option<media::SharedMediaModel>,
@@ -65,6 +66,7 @@ impl Side {
             "an embedding model names its width, the last of its dims: {dims:?}"
         );
         Side {
+            prompts: embed.prompts(),
             media: embed.media(),
             audio: embed.audio(),
             tok: embed.tokenizer(),
@@ -126,6 +128,32 @@ fn answer(state: &State, req: &Request, oai: bool) -> Result<Value, ApiError> {
             .map_err(|e| invalid(format!("embd_normalize {p}: {e}")))?,
     };
     let width = cut(side, &b)?;
+    let prefixed;
+    let prompt = if let Some(name) = b.get("prompt_name") {
+        let name = name
+            .as_str()
+            .ok_or_else(|| invalid("prompt_name must be a string"))?;
+        let prefix = side.prompts.get(name).ok_or_else(|| {
+            invalid(format!(
+                "unknown prompt_name {name:?}; available names: {:?}",
+                side.prompts.keys().collect::<Vec<_>>()
+            ))
+        })?;
+        let add = |v: &Value| {
+            v.as_str()
+                .map(|text| Value::String(format!("{prefix}{text}")))
+                .ok_or_else(|| {
+                    invalid("prompt_name requires text input (a string or an array of strings)")
+                })
+        };
+        prefixed = match prompt {
+            Value::Array(a) => Value::Array(a.iter().map(add).collect::<Result<Vec<_>, _>>()?),
+            v => add(v)?,
+        };
+        &prefixed
+    } else {
+        prompt
+    };
     let inputs = inputs(side, key, prompt)?;
     let pooled = run(state, side, &inputs)?;
     let vectors = pooled
@@ -658,7 +686,7 @@ mod tests {
                     "object": "model",
                     "created": state.start_unix,
                     "owned_by": "bloomery",
-                    "meta": { "n_ctx": 32, "n_embd": 4 },
+                    "meta": { "n_ctx": 32, "n_embd": 4, "prompt_names": [] },
                     "max_model_len": 32,
                 }));
                 names.push(json!({ "name": "mock-embd", "model": "mock-embd" }));
@@ -739,6 +767,87 @@ mod tests {
 
     /// `embd_normalize` picks the normalization, `dimensions` cuts before it, and a value of
     /// either that names nothing, or a norm f32 cannot scale by, is a 400.
+    #[test]
+    fn prompt_name_is_validated_on_both_routes() {
+        let mut side = MockEmbed::new(128);
+        side.prompts = [
+            ("query".into(), "task: search result | query: ".into()),
+            ("document".into(), "title: none | text: ".into()),
+            ("empty".into(), String::new()),
+        ]
+        .into();
+        let prefixes = side.prompts.clone();
+        let (addr, _, calls, _) = serve(Some(side));
+        for path in ["/v1/embeddings", "/embedding", "/embeddings"] {
+            for (name, prefix) in &prefixes {
+                for key in ["input", "content"] {
+                    calls.lock().expect("calls").clear();
+                    let (status, v) = post(
+                        addr,
+                        path,
+                        &json!({
+                            key: ["a", "검색"], "prompt_name": name
+                        }),
+                    );
+                    assert_eq!(status, 200, "{path}: {v}");
+                    let want: Vec<_> = ["a", "검색"]
+                        .iter()
+                        .map(|text| {
+                            let mut ids = vec![MockTokenizer.bos()];
+                            ids.extend(MockTokenizer.encode(&format!("{prefix}{text}")));
+                            ids.push(MockTokenizer.eos());
+                            ids
+                        })
+                        .collect();
+                    assert_eq!(*calls.lock().expect("calls"), want);
+                }
+            }
+            calls.lock().expect("calls").clear();
+            let (status, v) = post(addr, path, &json!({"input": "a"}));
+            assert_eq!(status, 200, "{v}");
+            assert_eq!(
+                *calls.lock().expect("calls"),
+                vec![vec![MockTokenizer.bos(), id("a"), MockTokenizer.eos()]]
+            );
+            calls.lock().expect("calls").clear();
+            for name in [json!("missing"), json!("Query"), json!(7), Value::Null] {
+                let (status, v) = post(
+                    addr,
+                    path,
+                    &json!({
+                        "input": "a", "prompt_name": name
+                    }),
+                );
+                assert_eq!(status, 400, "{path}: {v}");
+                assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+                assert!(
+                    v["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("prompt_name"),
+                    "{v}"
+                );
+            }
+            for input in [
+                json!([1, 2]),
+                json!(["a", 7]),
+                json!({"content": []}),
+                json!("a".repeat(100)),
+            ] {
+                let (status, v) =
+                    post(addr, path, &json!({"input": input, "prompt_name": "query"}));
+                assert_eq!(status, 400, "{path}: {v}");
+            }
+            assert!(calls.lock().expect("calls").is_empty());
+        }
+        let (_, body) = roundtrip(addr, "GET", "/v1/models", &[], "");
+        let v: Value = serde_json::from_str(&body).expect("models JSON");
+        assert_eq!(
+            v["data"][1]["meta"]["prompt_names"],
+            json!(["document", "empty", "query"])
+        );
+    }
+
     #[test]
     fn normalization_and_the_cut() {
         let (addr, ..) = serve(Some(MockEmbed::new(32)));

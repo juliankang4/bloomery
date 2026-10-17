@@ -867,6 +867,7 @@ pub(crate) type Passes = Arc<Mutex<Vec<Vec<u32>>>>;
 /// on the pass whose ids hold its id.
 #[cfg(test)]
 pub(crate) struct MockEmbed {
+    pub(crate) prompts: std::collections::BTreeMap<String, String>,
     pub(crate) ctx: usize,
     pub(crate) fail: Option<(u32, MockFail)>,
     pub(crate) calls: Passes,
@@ -876,6 +877,7 @@ pub(crate) struct MockEmbed {
 impl MockEmbed {
     pub(crate) fn new(ctx: usize) -> MockEmbed {
         MockEmbed {
+            prompts: Default::default(),
             ctx,
             fail: None,
             calls: Arc::default(),
@@ -885,6 +887,10 @@ impl MockEmbed {
 
 #[cfg(test)]
 impl crate::embed::Embed for MockEmbed {
+    fn prompts(&self) -> std::collections::BTreeMap<String, String> {
+        self.prompts.clone()
+    }
+
     fn tokenizer(&self) -> Arc<dyn Tokenizer> {
         Arc::new(EmbedTokenizer)
     }

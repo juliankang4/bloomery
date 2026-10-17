@@ -189,7 +189,9 @@ impl Flags {
         bytes = bytes
             .checked_add(audio_bytes)
             .ok_or("embedding model and audio byte count overflows")?;
+        let prompts = model_file::sentence_prompts(&self.model, &path)?;
         Ok(Some(Side {
+            prompts,
             row,
             path,
             ctx,
@@ -247,6 +249,8 @@ fn no_encoder_open(side: &Side, _: &EncoderSeat) -> Result<Box<dyn Embed>, Strin
 
 /// The side model the flags named, read and sized.
 pub struct Side {
+    /// Named prefixes read from the model's sentence-transformers config.
+    prompts: std::collections::BTreeMap<String, String>,
     /// Its architecture's row.
     pub row: &'static Row,
     /// Its file, a set's first shard.
@@ -282,7 +286,12 @@ impl Side {
     /// Opens an optional model on the seat used by its plan, after the chat model loads.
     pub fn start(seated: Option<(Self, EncoderSeat)>) -> Result<Option<SideEngine>, GateError> {
         seated
-            .map(|(side, seat)| SideEngine::spawn(move || (side.row.open)(&side, &seat)))
+            .map(|(mut side, seat)| {
+                let prompts = std::mem::take(&mut side.prompts);
+                let mut engine = SideEngine::spawn(move || (side.row.open)(&side, &seat))?;
+                engine.prompts = prompts;
+                Ok(engine)
+            })
             .transpose()
     }
 }
@@ -299,6 +308,7 @@ type Job = (
 /// once at its open, and the channel each pass goes through. Dropping it closes the channel and
 /// joins the thread, so the model is released when the drop returns.
 pub struct SideEngine {
+    prompts: std::collections::BTreeMap<String, String>,
     jobs: Option<mpsc::Sender<Job>>,
     thread: Option<JoinHandle<()>>,
     tokenizer: Arc<dyn Tokenizer>,
@@ -378,6 +388,7 @@ impl SideEngine {
             }
         };
         Ok(SideEngine {
+            prompts: Default::default(),
             jobs: Some(jobs),
             thread: Some(thread),
             tokenizer,
@@ -407,6 +418,10 @@ impl Drop for SideEngine {
 }
 
 impl Embed for SideEngine {
+    fn prompts(&self) -> std::collections::BTreeMap<String, String> {
+        self.prompts.clone()
+    }
+
     fn media(&self) -> Option<serve::media::SharedMediaModel> {
         self.media.clone()
     }
