@@ -111,6 +111,17 @@ fn run() -> Result<(), GateError> {
         ok &= exact;
         let mut taps = Taps::default();
         enc.encode_tapped(&p, &mut taps)?;
+        let mut repeated = Taps::default();
+        enc.encode_tapped(&p, &mut repeated)?;
+        let repeat_ok = taps.0.len() == repeated.0.len()
+            && taps.0.iter().all(|(node, rows)| {
+                repeated
+                    .0
+                    .get(node)
+                    .is_some_and(|v| e2e::same_bits(rows, v))
+            });
+        println!("(c) {name}: repeated grid tap bits {}", verdict(repeat_ok));
+        ok &= repeat_ok;
         let pool_ok = pooling(&p, &taps, &hp)?;
         println!(
             "(o) {name}: 3x3 raster pooling and scale bits {}",

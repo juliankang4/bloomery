@@ -88,6 +88,7 @@ struct Scratch {
     pooled_norm: DeviceBuffer<u16>,
     rows: DeviceBuffer<u16>,
     cs: DeviceBuffer<f32>,
+    cs_grid: Option<(usize, usize)>,
 }
 
 impl Scratch {
@@ -114,6 +115,7 @@ impl Scratch {
             pooled_norm: b(l.pooled)?,
             rows: b(l.rows)?,
             cs: DeviceBuffer::zeroed(stream, 64 * l.patches)?,
+            cs_grid: None,
         })
     }
     fn bytes(&self) -> u64 {
@@ -375,8 +377,13 @@ impl Encoder {
             },
         )?;
         tap_f32(stream, taps, "pos_embd", &s.x, n, d)?;
-        let table = RopeTable::neox_halves(p.n_vit_h, p.n_vit_w, 100.0);
-        WindowMut::of_mut(&mut s.cs, 0, table.cs.len())?.copy_from_host(stream, &table.cs)?;
+        let grid = (p.n_vit_h, p.n_vit_w);
+        if s.cs_grid != Some(grid) {
+            s.cs_grid = None;
+            let table = RopeTable::neox_halves(p.n_vit_h, p.n_vit_w, 100.0);
+            WindowMut::of_mut(&mut s.cs, 0, table.cs.len())?.copy_from_host(stream, &table.cs)?;
+            s.cs_grid = Some(grid);
+        }
         let c = Chain {
             hp,
             norm: &self.norm,

@@ -122,8 +122,8 @@ mod tests {
                 (2.0 * (byte as f32 / 255.0) - 1.0).to_bits()
             );
         }
-        for invalid in [0, 0x7fc0, 0x7f80, 0xff80] {
-            assert!(conv_pixels(&[invalid]).is_err());
+        for bits in 0..=u16::MAX {
+            assert_eq!(conv_pixels(&[bits]).is_ok(), encoded.contains(&bits));
         }
     }
 }

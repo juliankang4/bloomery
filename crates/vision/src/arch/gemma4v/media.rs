@@ -37,20 +37,26 @@ pub fn preprocess(image: &Rgb8, rule: &SizeRule) -> Result<Patches, VisionError>
 
 /// Restore the original normalized bytes for the F32 convolution: their bf16 encodings are distinct.
 pub fn conv_pixels(encoded: &[u16]) -> Result<Vec<f32>, VisionError> {
+    // Every frame shares the same inverse of the fixed RGB byte normalization.
+    static PIXELS: std::sync::LazyLock<Vec<f32>> = std::sync::LazyLock::new(|| {
+        let mut values = vec![f32::NAN; usize::from(u16::MAX) + 1];
+        for byte in 0..=255u8 {
+            values[usize::from(crate::preprocess::normalize(byte))] =
+                (f32::from(byte) / 255.0) * 2.0 - 1.0;
+        }
+        values
+    });
+    let pixels = &*PIXELS;
     encoded
         .iter()
         .map(|&bits| {
-            let value = f32::from_bits(u32::from(bits) << 16);
-            let byte = ((value + 1.0) * 127.5).round();
-            if !value.is_finite()
-                || !(0.0..=255.0).contains(&byte)
-                || crate::preprocess::normalize(byte as u8) != bits
-            {
+            let value = pixels[usize::from(bits)];
+            if !value.is_finite() {
                 return Err(VisionError::Format(
                     "gemma4v convolution input is not a normalized RGB byte".into(),
                 ));
             }
-            Ok((byte / 255.0) * 2.0 - 1.0)
+            Ok(value)
         })
         .collect()
 }
