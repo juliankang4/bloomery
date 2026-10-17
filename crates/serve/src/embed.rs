@@ -16,6 +16,13 @@ use crate::engine::Tokenizer;
 #[error("{0}")]
 pub struct EmbedError(pub String);
 
+/// Prepared audio chunks and their first position in the embedding input.
+#[derive(Clone)]
+pub struct AudioFeed {
+    pub at: usize,
+    pub chunks: Arc<Vec<vision::media::AudioChunk>>,
+}
+
 /// An embedding model: one input's ids in, its pooled vector out. The server calls it one
 /// request at a time, behind a mutex, and reads the facts below once, when it takes the model.
 pub trait Embed: Send {
@@ -34,17 +41,22 @@ pub trait Embed: Send {
     fn media(&self) -> Option<crate::media::SharedMediaModel> {
         None
     }
+    /// The seated projector's audio input rule, if it accepts decoded mono PCM.
+    fn audio(&self) -> Option<crate::media::SharedMediaModel> {
+        None
+    }
     /// One pass over one input: at least one id and at most [`Embed::ctx`], each below the
     /// vocabulary's size. The pooled vector, the full width (the last of [`Embed::dims`]).
     fn embed(&mut self, ids: &[u32]) -> Result<Vec<f32>, EmbedError>;
-    /// One pass with prepared images replacing the positions they occupy.
+    /// One pass with prepared images and audio chunks replacing the positions they occupy.
     fn embed_media(
         &mut self,
         _ids: &[u32],
         _images: &[crate::media::MediaFeed],
+        _audio: &[AudioFeed],
     ) -> Result<Vec<f32>, EmbedError> {
         Err(EmbedError(
-            "the embedding model has no image encoder (--embd-mmproj)".into(),
+            "the embedding model has no media encoder (--embd-mmproj)".into(),
         ))
     }
 }

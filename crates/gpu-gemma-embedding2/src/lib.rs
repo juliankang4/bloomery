@@ -544,6 +544,11 @@ impl Encoder {
         self.ctx
     }
 
+    /// The runtime shared with an audio tower, including its stream and fault word.
+    pub fn runtime(&self) -> &Gpu {
+        &self.gpu
+    }
+
     /// The context the encoder's pass owns; a tower call binds it back after its encode.
     pub fn context(&self) -> &std::sync::Arc<cuda_core::CudaContext> {
         self.gpu.context()

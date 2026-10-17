@@ -2,8 +2,12 @@
 //! llama.cpp's `tools/mtmd/mtmd-audio.cpp`: semicausal padding per
 //! 30-second chunk, a periodic Hann, magnitude FFT, HTK filters and log floor.
 
-use crate::VisionError;
+use crate::{MediaModel, Prepared, Rgb8, VisionError};
 
+pub use crate::media::AudioChunk as Mel;
+
+pub const BEGIN: &str = "<|audio>";
+pub const END: &str = "<audio|>";
 pub const SAMPLE_RATE: usize = 16_000;
 pub const CHUNK_SAMPLES: usize = 30 * SAMPLE_RATE;
 pub const MEL_BINS: usize = 128;
@@ -11,21 +15,6 @@ const FFT: usize = 512;
 const WINDOW: usize = 320;
 const HOP: usize = 160;
 const BINS: usize = FFT / 2 + 1;
-
-/// One chunk's f32 mel tensor, with time contiguous: `[frames, MEL_BINS]`
-/// in ggml order. Its two stride-2 convolutions round each length up.
-#[derive(Debug)]
-pub struct Mel {
-    pub frames: usize,
-    pub data: Vec<f32>,
-}
-
-impl Mel {
-    #[must_use]
-    pub fn tokens(&self) -> usize {
-        self.frames.div_ceil(4)
-    }
-}
 
 /// The fixed window, FFT twiddles and HTK filterbank, built once per encoder.
 pub struct Preprocessor {
@@ -72,6 +61,34 @@ impl Default for Preprocessor {
             cos,
             filters,
         }
+    }
+}
+
+impl MediaModel for Preprocessor {
+    fn embedding_audio(&self) -> Option<(&str, &str, usize)> {
+        Some((BEGIN, END, SAMPLE_RATE))
+    }
+
+    fn prepare_audio(&self, pcm: &[f32]) -> Result<Vec<Mel>, VisionError> {
+        self.prepare(pcm)
+    }
+
+    fn image_placeholder(&self, _index: usize) -> std::borrow::Cow<'_, str> {
+        panic!("the audio projector has no image placeholder")
+    }
+
+    fn image_marker(&self) -> &str {
+        panic!("the audio projector has no image marker")
+    }
+
+    fn image_token(&self) -> Option<u32> {
+        None
+    }
+
+    fn prepare(&self, _image: &Rgb8) -> Result<Prepared, VisionError> {
+        Err(VisionError::Audio(
+            "the audio projector does not support images".into(),
+        ))
     }
 }
 
@@ -128,7 +145,11 @@ impl Preprocessor {
                     data[m * frames + frame] = sum.max(0.001_f32 as f64).ln() as f32;
                 }
             }
-            chunks.push(Mel { frames, data });
+            chunks.push(Mel {
+                frames,
+                data,
+                span_len: frames.div_ceil(4),
+            });
         }
         Ok(chunks)
     }

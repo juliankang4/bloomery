@@ -11,6 +11,19 @@ pub(super) const FF: usize = 4096;
 pub(super) const OUT: usize = 1536;
 pub(super) const TEXT: usize = 512;
 
+/// Expanded buffers for the fixed geometry supported by this loader, including absent biases.
+pub(super) const BYTES: u64 = 4
+    * (3 * 3 * 128
+        + 3 * 3 * 128 * 32
+        + 160
+        + 160
+        + WIDTH * WIDTH
+        + WIDTH
+        + LAYERS * (8 * WIDTH * WIDTH + 15 * WIDTH + 4 * WIDTH * FF + 256)
+        + WIDTH * OUT
+        + 2 * OUT
+        + OUT * TEXT) as u64;
+
 pub(super) struct Linear {
     pub w: DeviceTensor<f32>,
     pub clamp: [f32; 4],
@@ -230,6 +243,12 @@ impl Weights {
         let out_bias = l.optional("a.pre_encode.out.bias", OUT, 0.0)?;
         let soft_norm = l.optional("mm.a.soft_emb_norm.weight", OUT, 1.0)?;
         let soft = l.linear("mm.a.input_projection.weight", OUT, TEXT)?;
+        if l.bytes != BYTES {
+            return Err(GpuError::Shape {
+                what: "gemma4a weight bytes",
+                detail: format!("loaded {} B, planned {BYTES} B", l.bytes),
+            });
+        }
         Ok(Self {
             conv,
             bias,

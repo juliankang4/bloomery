@@ -15,6 +15,8 @@
 //!   (`clip`). [`TOWER_CPU`] is its CPU twin.
 //! - [`SERVER`]: llama-server's `/v1/embeddings` vectors of every text case and
 //!   image, normalized and raw (`tools/ref/emb2/server_vectors.py`). [`SERVER_CPU`] is its CPU twin.
+//! - [`AUDIO_SERVER`] and [`AUDIO_SERVER_CPU`]: llama-server vectors of stored f32 PCM,
+//!   transported to mainline in float WAV (`tools/ref/emb2/server_vectors.py --audio`).
 //! - [`AUDIO_MEL`]: the pinned host preprocessor's mel from synthetic decoded
 //!   mono PCM (`tools/ref/emb2/mel.sh`), with no model or device opened.
 //!
@@ -194,6 +196,34 @@ pub static SERVER: Family = Family {
     )
 };
 
+/// llama-server vectors from decoded PCM, with a CPU twin.
+pub const AUDIO_SERVER_SET: &str = "ref_gemma_embedding2_audio_server";
+pub const AUDIO_SERVER_CPU_SET: &str = "ref_gemma_embedding2_audio_server.cpu";
+pub static AUDIO_SERVER: Family = Family {
+    consumers: &["gate-gpu-gemma-embedding2-serve"],
+    ..family(
+        "server-gemma4a",
+        &[AUDIO_SERVER_SET],
+        Kind::Server,
+        &PROFILE,
+        ARCH,
+        model,
+        "tools/ref/emb2/server_vectors.py --audio NAME=PCM",
+    )
+};
+pub static AUDIO_SERVER_CPU: Family = Family {
+    consumers: &["gate-gpu-gemma-embedding2-serve"],
+    ..family(
+        "server-gemma4a-cpu",
+        &[AUDIO_SERVER_CPU_SET],
+        Kind::ServerCpu,
+        &PROFILE,
+        ARCH,
+        model,
+        "tools/ref/emb2/server_vectors.py --cpu --audio NAME=PCM",
+    )
+};
+
 /// The host audio preprocessing set, from synthetic decoded mono PCM.
 pub const AUDIO_MEL_SET: &str = "ref_gemma_embedding2_mel";
 pub const AUDIO_PCM: &str = "synthetic-gemma4a-pcm";
@@ -291,6 +321,8 @@ pub static FAMILIES: &[&Family] = &[
     &VIDEO_CPU,
     &AUDIO_TOWER,
     &AUDIO_TOWER_CPU,
+    &AUDIO_SERVER,
+    &AUDIO_SERVER_CPU,
 ];
 
 #[cfg(test)]

@@ -631,7 +631,7 @@ const INVALID: u8 = 0xFF;
 /// Strict standard base64 (RFC 4648 §4): every byte from the alphabet or a final `=`, a length
 /// that is a multiple of four, at most two `=` and only at the end, and no bits set past the data
 /// in the last symbol.
-fn base64(text: &str) -> Result<Vec<u8>, MediaError> {
+pub(crate) fn base64(text: &str) -> Result<Vec<u8>, MediaError> {
     let s = text.as_bytes();
     if s.is_empty() {
         return Err(MediaError::Empty);

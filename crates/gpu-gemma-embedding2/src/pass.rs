@@ -438,26 +438,45 @@ impl Encoder {
         spans: &[bloomery_gpu::media::MediaSpan<'_>],
         taps: bool,
     ) -> Result<Pass, GpuError> {
-        self.pass_inner(ids, spans, taps, None)
+        self.pass_inner(ids, spans, taps, None, bloomery_gpu::media::widen_bf16)
     }
 
     /// Replay each layer from its supplied token-major residual (`n · hidden`
     /// values per layer), returning diagnostic taps rather than an end-to-end pass.
     pub fn replay_layers(&mut self, ids: &[u32], inputs: &[Vec<f32>]) -> Result<Taps, GpuError> {
-        self.pass_inner(ids, &[], true, Some(inputs))?
-            .taps
-            .ok_or(GpuError::State {
-                what: PASS,
-                missing: "the replay's requested taps",
-            })
+        self.pass_inner(
+            ids,
+            &[],
+            true,
+            Some(inputs),
+            bloomery_gpu::media::widen_bf16,
+        )?
+        .taps
+        .ok_or(GpuError::State {
+            what: PASS,
+            missing: "the replay's requested taps",
+        })
     }
 
-    fn pass_inner(
+    /// One pass with already-scaled f32 media rows, without narrowing audio to bf16.
+    pub fn pass_media_f32(
         &mut self,
         ids: &[u32],
-        spans: &[bloomery_gpu::media::MediaSpan<'_>],
+        spans: &[bloomery_gpu::media::MediaSpan<'_, f32>],
+        taps: bool,
+    ) -> Result<Pass, GpuError> {
+        self.pass_inner(ids, spans, taps, None, |rows, dst| {
+            dst.copy_from_slice(rows)
+        })
+    }
+
+    fn pass_inner<T>(
+        &mut self,
+        ids: &[u32],
+        spans: &[bloomery_gpu::media::MediaSpan<'_, T>],
         taps: bool,
         layer_inputs: Option<&[Vec<f32>]>,
+        copy: fn(&[T], &mut [f32]),
     ) -> Result<Pass, GpuError> {
         let n = ids.len();
         if n == 0 || n > self.ctx {
@@ -486,11 +505,11 @@ impl Encoder {
         let mut inp_scaled = self.token_rows(ids)?;
         for span in spans {
             let dst = &mut inp_scaled[span.at.start * self.hp.n_embd..span.at.end * self.hp.n_embd];
-            bloomery_gpu::media::widen_bf16(span.rows, dst);
+            copy(span.rows, dst);
             if dst.iter().any(|v| !v.is_finite()) {
                 return Err(GpuError::shape(
                     PASS,
-                    "image row contains a non-finite value",
+                    "media row contains a non-finite value",
                 ));
             }
         }
@@ -658,6 +677,31 @@ mod tests {
 
         crate::tests::with_model(64, 2048, |split, hp| -> Result<(), GpuError> {
             let mut enc = Encoder::open(split, hp.n_ctx, Gpu::new()?)?;
+            let rows = vec![0.12345679_f32; hp.n_embd];
+            let span = MediaSpan {
+                at: 0..1,
+                rows: rows.as_slice(),
+            };
+            let pass = enc.pass_media_f32(&[0], &[span], true)?;
+            assert_eq!(pass.taps.unwrap().inp_scaled, rows, "f32 media precision");
+            for values in [
+                vec![0.0; hp.n_embd - 1],
+                vec![f32::NAN; hp.n_embd],
+                vec![f32::INFINITY; hp.n_embd],
+            ] {
+                let error = enc
+                    .pass_media_f32(
+                        &[0],
+                        &[MediaSpan {
+                            at: 0..1,
+                            rows: &values,
+                        }],
+                        false,
+                    )
+                    .err()
+                    .expect("invalid f32 rows accepted");
+                assert!(matches!(error, GpuError::Shape { .. }), "{error}");
+            }
             let rows = vec![0; hp.n_embd];
             for spans in [
                 vec![MediaSpan {

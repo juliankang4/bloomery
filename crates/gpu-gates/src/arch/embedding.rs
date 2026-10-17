@@ -16,6 +16,7 @@ pub const ROWS: &[Row] = &[
         open,
         projector_file: None,
         projector_types: &[],
+        audio_bytes: |_| Ok(0),
     },
     // The file's context_length is 262144; the model card names 8192 tokens.
     Row {
@@ -25,8 +26,35 @@ pub const ROWS: &[Row] = &[
         open,
         projector_file: Some("mmproj-embeddinggemma-2-BF16.gguf"),
         projector_types: &[vision::arch::gemma4v::PROJECTOR_TYPE],
+        audio_bytes,
     },
 ];
+
+fn audio_bytes(file: &gguf::Gguf) -> Result<u64, crate::GateError> {
+    #[cfg(feature = "gemma-embedding2")]
+    {
+        Ok(if vision::arch::open_audio(file)?.is_some() {
+            bloomery_gpu_gemma4a::arch::gemma4a::card_bytes()
+        } else {
+            0
+        })
+    }
+    #[cfg(not(feature = "gemma-embedding2"))]
+    {
+        let _ = file;
+        Ok(0)
+    }
+}
+
+#[cfg(feature = "gemma-embedding2")]
+pub(super) fn open_audio(
+    gpu: &bloomery_gpu::Gpu,
+    file: &gguf::Gguf,
+) -> Result<Box<dyn bloomery_gpu_vision::Tower>, bloomery_gpu::GpuError> {
+    Ok(Box::new(
+        bloomery_gpu_gemma4a::arch::gemma4a::Encoder::load(gpu, file)?,
+    ))
+}
 
 #[cfg(feature = "gemma-embedding2")]
 pub(super) fn gemma_embedding_dims(split: &gguf::Split) -> Result<Vec<usize>, crate::GateError> {

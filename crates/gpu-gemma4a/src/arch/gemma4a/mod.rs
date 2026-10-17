@@ -22,11 +22,7 @@ const EPS: f32 = 1e-6;
 /// The per-stage activation observer a tapped run reports to.
 type Tap<'a> = Option<&'a mut dyn FnMut(&str, usize, &[f32])>;
 
-/// One chunk's text-width soft rows, in token-major order.
-pub struct Encoded {
-    pub tokens: usize,
-    pub values: Vec<f32>,
-}
+pub use bloomery_gpu_vision::AudioRows as Encoded;
 
 /// Loaded audio tower and bounded scratch, independent of the text encoder.
 pub struct Encoder {
@@ -56,6 +52,55 @@ struct Scratch {
     relative: DeviceBuffer<f32>,
 }
 
+fn scratch_sizes() -> [usize; 10] {
+    [
+        MAX_FRAMES * MEL_BINS,
+        MAX_TOKENS * WIDTH,
+        MAX_FRAMES.div_ceil(2) * 64 * 128,
+        MAX_FRAMES.div_ceil(2) * 64 * 128,
+        MAX_TOKENS * FF,
+        MAX_TOKENS * WIDTH,
+        MAX_TOKENS * WIDTH,
+        MAX_TOKENS * WIDTH,
+        WIDTH * RPE,
+        WIDTH * RPE,
+    ]
+}
+
+/// The fixed supported tower's device buffers, excluding the caller's runtime fault word.
+#[must_use]
+pub fn card_bytes() -> u64 {
+    weights::BYTES + 4 * scratch_sizes().into_iter().map(|n| n as u64).sum::<u64>()
+}
+
+impl bloomery_gpu_vision::Tower for Encoder {
+    fn encode_audio(&mut self, chunk: &vision::media::AudioChunk) -> Result<Encoded, GpuError> {
+        self.encode(chunk)
+    }
+
+    fn encode(
+        &mut self,
+        _patches: &vision::Patches,
+    ) -> Result<bloomery_gpu_vision::chain::Encoded<'_>, GpuError> {
+        Err(GpuError::Shape {
+            what: "gemma4a image input",
+            detail: "the audio tower does not support images".into(),
+        })
+    }
+
+    fn out_dim(&self) -> usize {
+        TEXT
+    }
+
+    fn weight_bytes(&self) -> u64 {
+        self.weight_bytes()
+    }
+
+    fn scratch_bytes(&self) -> u64 {
+        self.scratch_bytes()
+    }
+}
+
 impl Encoder {
     /// Open the audio projector using the runtime's stream and device fault owner.
     pub fn load(gpu: &Gpu, file: &Gguf) -> Result<Self, GpuError> {
@@ -63,17 +108,19 @@ impl Encoder {
         let weights = Weights::load(file, &stream)?;
         let pass = Pass::load(gpu)?;
         let (position, _) = attention::inputs(MAX_TOKENS);
+        let [mel, x, a, b, c, q, k, v, pos, relative] = scratch_sizes();
+        assert_eq!(position.len(), pos, "audio position geometry");
         let scratch = Scratch {
-            mel: DeviceBuffer::zeroed(&stream, MAX_FRAMES * MEL_BINS)?,
-            x: DeviceBuffer::zeroed(&stream, MAX_TOKENS * WIDTH)?,
-            a: DeviceBuffer::zeroed(&stream, MAX_FRAMES.div_ceil(2) * 64 * 128)?,
-            b: DeviceBuffer::zeroed(&stream, MAX_FRAMES.div_ceil(2) * 64 * 128)?,
-            c: DeviceBuffer::zeroed(&stream, MAX_TOKENS * FF)?,
-            q: DeviceBuffer::zeroed(&stream, MAX_TOKENS * WIDTH)?,
-            k: DeviceBuffer::zeroed(&stream, MAX_TOKENS * WIDTH)?,
-            v: DeviceBuffer::zeroed(&stream, MAX_TOKENS * WIDTH)?,
+            mel: DeviceBuffer::zeroed(&stream, mel)?,
+            x: DeviceBuffer::zeroed(&stream, x)?,
+            a: DeviceBuffer::zeroed(&stream, a)?,
+            b: DeviceBuffer::zeroed(&stream, b)?,
+            c: DeviceBuffer::zeroed(&stream, c)?,
+            q: DeviceBuffer::zeroed(&stream, q)?,
+            k: DeviceBuffer::zeroed(&stream, k)?,
+            v: DeviceBuffer::zeroed(&stream, v)?,
             position: DeviceBuffer::from_host(&stream, &position)?,
-            relative: DeviceBuffer::zeroed(&stream, WIDTH * RPE)?,
+            relative: DeviceBuffer::zeroed(&stream, relative)?,
         };
         Ok(Self {
             stream,
@@ -145,7 +192,13 @@ impl Encoder {
                 ),
             });
         }
-        let n = mel.tokens();
+        let n = mel.frames.div_ceil(4);
+        if mel.span_len != n {
+            return Err(GpuError::Shape {
+                what: "gemma4a mel",
+                detail: "audio chunk span differs from its frame count".into(),
+            });
+        }
         let stream = &self.stream;
         let w = &self.weights;
         let p = &self.pass;

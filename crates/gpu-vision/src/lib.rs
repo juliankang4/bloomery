@@ -96,10 +96,17 @@ use vision::arch::{
     deepseek41v, glm5v as glm5v_host, minicpmv as minicpmv_host, qwen3vl as qwen3vl_host,
 };
 
-/// One image tower on the card, whichever projector type its file declares. A call takes
-/// `&mut self`: one image at a time owns the tower's activations, which are allocated at load, and
-/// the rows it returns borrow them until the next call.
+/// One media tower on the card, whichever projector type its file declares. A call takes
+/// `&mut self`: one input owns the tower's activations, which are allocated at load. Image rows
+/// borrow them until the next call; audio rows are returned as owned f32 values.
 pub trait Tower: Send {
+    /// Encode one prepared audio chunk into text-width f32 rows.
+    fn encode_audio(&mut self, _chunk: &vision::media::AudioChunk) -> Result<AudioRows, GpuError> {
+        Err(GpuError::Shape {
+            what: "Tower::encode_audio",
+            detail: "the tower does not support audio".into(),
+        })
+    }
     /// Encode one image's patches into the rows of its tokens, without waiting for the card;
     /// read them on the stream the tower was opened with.
     fn encode(&mut self, patches: &Patches) -> Result<chain::Encoded<'_>, GpuError>;
@@ -114,6 +121,12 @@ pub trait Tower: Send {
     fn separators(&self) -> Option<&[f32]> {
         None
     }
+}
+
+/// One chunk's text-width soft rows, in token-major order.
+pub struct AudioRows {
+    pub tokens: usize,
+    pub values: Vec<f32>,
 }
 
 impl Tower for encoder::Encoder {

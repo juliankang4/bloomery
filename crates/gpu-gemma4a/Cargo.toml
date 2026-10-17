@@ -13,5 +13,6 @@ cuda-device.workspace = true
 cuda-host.workspace = true
 cuda-core.workspace = true
 bloomery-gpu = { path = "../gpu" }
+bloomery-gpu-vision = { path = "../gpu-vision" }
 bloomery-gguf = { path = "../gguf" }
 bloomery-vision = { path = "../vision" }

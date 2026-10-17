@@ -13,8 +13,9 @@
 //! array of token ids, an array of strings and token ids, or an array of these with no id at its
 //! top level, one vector each. Text is tokenized with the side model's vocabulary, the first text
 //! element of each input with its special tokens, as llama-server's `tokenize_mixed` puts them.
-//! An object with a `content` array prepares image parts through the side model's media rule.
-//! Delimiter text and every image span share one pass, with BOS and EOS around the whole input.
+//! An object with a `content` array prepares image parts through the side model's media rule
+//! and decoded f32 PCM through Gemma4a's preprocessor. Text and all media spans share one pass,
+//! with BOS and EOS around the whole input.
 //!
 //! The side model runs one request at a time. A failure in it ends the server as an engine's does:
 //! the request gets a 500, `/health` and every later request a 503, and the server exits after its
@@ -51,6 +52,7 @@ pub(super) struct Side {
     pub(super) ctx: usize,
     dims: Vec<usize>,
     media: Option<media::SharedMediaModel>,
+    audio: Option<media::SharedMediaModel>,
 }
 
 impl Side {
@@ -64,6 +66,7 @@ impl Side {
         );
         Side {
             media: embed.media(),
+            audio: embed.audio(),
             tok: embed.tokenizer(),
             name: embed.name(),
             path: embed.path(),
@@ -209,22 +212,24 @@ fn cut(side: &Side, b: &Map<String, Value>) -> Result<usize, ApiError> {
         })
 }
 
-/// The request's inputs as ids and prepared images: an array with no id at its top level is one input an element,
+/// The request's ids and prepared media: an array with no id at its top level is one input an element,
 /// anything else one input, each read as a `/completion` prompt with the special tokens on. No
 /// input, an input of no id and one of more ids than the model's context are refused by name.
 struct Input {
     ids: Vec<u32>,
     images: Vec<media::MediaFeed>,
+    audio: Vec<crate::embed::AudioFeed>,
 }
 
-/// One ordered embedding input part, after an image has been prepared and sized.
+/// One ordered embedding input part, after its media has been prepared and sized.
 pub enum InputPart<'a> {
     Text(&'a str),
-    /// Tokenized delimiters around `positions` image rows.
-    Image {
+    /// Caller-selected delimiters around prepared media rows.
+    Media {
         begin: &'a str,
         end: &'a str,
         positions: usize,
+        kind: &'a str,
     },
 }
 
@@ -234,7 +239,7 @@ pub struct Assembled {
     pub spans: Vec<Range<usize>>,
 }
 
-/// Tokenize each part separately, with BOS and EOS around the whole input. Image spans are
+/// Tokenize each part separately, with BOS and EOS around the whole input. Media spans are
 /// bounded by `ctx` before allocation; the caller checks the total length, including text and EOS.
 pub fn assemble<'a>(
     parts: impl Iterator<Item = Result<InputPart<'a>, String>>,
@@ -251,27 +256,30 @@ pub fn assemble<'a>(
         ids.push(tok.bos());
     }
     for part in parts {
-        match part? {
-            InputPart::Text(text) => ids.extend(tok.encode(text)),
-            InputPart::Image {
+        let (begin, end, positions, kind) = match part? {
+            InputPart::Text(text) => {
+                ids.extend(tok.encode(text));
+                continue;
+            }
+            InputPart::Media {
                 begin,
                 end,
                 positions,
-            } => {
-                if positions == 0 {
-                    return Err("an embedding image has an empty span".into());
-                }
-                ids.extend(tok.encode(begin));
-                let at = ids.len();
-                let last = at
-                    .checked_add(positions)
-                    .filter(|&n| n <= ctx)
-                    .ok_or("image input exceeds the embedding context")?;
-                ids.resize(last, tok.bos());
-                spans.push(at..last);
-                ids.extend(tok.encode(end));
-            }
+                kind,
+            } => (begin, end, positions, kind),
+        };
+        if positions == 0 {
+            return Err(format!("an embedding {kind} has an empty span"));
         }
+        ids.extend(tok.encode(begin));
+        let at = ids.len();
+        let last = at
+            .checked_add(positions)
+            .filter(|&n| n <= ctx)
+            .ok_or_else(|| format!("{kind} input exceeds the embedding context"))?;
+        ids.resize(last, tok.bos());
+        spans.push(at..last);
+        ids.extend(tok.encode(end));
     }
     if tok.add_eos() {
         ids.push(tok.eos());
@@ -302,7 +310,41 @@ fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
             _ => None,
         };
         let mut images = Vec::new();
+        let mut audio = Vec::new();
+        let mut order = Vec::new();
         let ordered = parts.iter().map(|part| -> Result<InputPart<'_>, String> {
+            if part.get("type").and_then(Value::as_str) == Some("input_audio") {
+                let a = part.get("input_audio").ok_or("input_audio needs an input_audio object")?;
+                if a.get("format").and_then(Value::as_str) != Some("f32") {
+                    return Err("encoded audio is not supported; send base64 little-endian f32 PCM with format=f32, sample_rate=16000 and channels=1".into());
+                }
+                let model = side.audio.as_ref().ok_or("audio input needs a gemma4a --embd-mmproj")?;
+                let (begin, end, sample_rate) = model.embedding_audio().ok_or("the side projector has no audio delimiters")?;
+                if a.get("sample_rate").and_then(Value::as_u64) != Some(sample_rate as u64)
+                    || a.get("channels").and_then(Value::as_u64) != Some(1)
+                {
+                    return Err("f32 PCM needs sample_rate=16000 and channels=1".into());
+                }
+                let data = a.get("data").and_then(Value::as_str).ok_or("f32 PCM needs base64 data")?;
+                if data.is_empty() {
+                    return Err("f32 PCM needs at least two samples".into());
+                }
+                let bytes = media::base64(data).map_err(|e| e.to_string())?;
+                if bytes.len() % 4 != 0 {
+                    return Err("f32 PCM byte count must be a multiple of four".into());
+                }
+                let pcm: Vec<_> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+                let chunks = model.prepare_audio(&pcm).map_err(|e| e.to_string())?;
+                let positions = chunks.iter().map(|c| c.span_len).sum();
+                order.push((true, audio.len()));
+                audio.push(crate::embed::AudioFeed { at: 0, chunks: Arc::new(chunks) });
+                return Ok(InputPart::Media {
+                    begin,
+                    end,
+                    positions,
+                    kind: "audio",
+                });
+            }
             match media::parse_part(part).map_err(|e| e.to_string())? {
                 media::Part::Text(text) => Ok(InputPart::Text(text)),
                 media::Part::Image(url) => {
@@ -328,24 +370,31 @@ fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
                         }
                     };
                     let positions = feed.prepared.span_len;
+                    order.push((false, images.len()));
                     images.push(feed);
-                    Ok(InputPart::Image {
+                    Ok(InputPart::Media {
                         begin,
                         end,
                         positions,
+                        kind: "image",
                     })
                 }
             }
         });
         let Assembled { ids, spans } = assemble(ordered, &*side.tok, side.ctx).map_err(invalid)?;
-        for (image, span) in images.iter_mut().zip(spans) {
-            image.at = span.start;
+        for ((is_audio, index), span) in order.into_iter().zip(spans) {
+            if is_audio {
+                audio[index].at = span.start;
+            } else {
+                images[index].at = span.start;
+            }
         }
-        Ok(Input { ids, images })
+        Ok(Input { ids, images, audio })
     } else {
         Ok(Input {
             ids: prompt_ids(&*side.tok, key, v, true)?,
             images: Vec::new(),
+            audio: Vec::new(),
         })
     }
 }
@@ -399,10 +448,10 @@ fn run(state: &State, side: &Side, inputs: &[Input]) -> Result<Vec<Vec<f32>>, Ap
     for input in inputs {
         open(state)?;
         let v = match panic::catch_unwind(AssertUnwindSafe(|| {
-            if input.images.is_empty() {
+            if input.images.is_empty() && input.audio.is_empty() {
                 model.embed(&input.ids)
             } else {
-                model.embed_media(&input.ids, &input.images)
+                model.embed_media(&input.ids, &input.images, &input.audio)
             }
         })) {
             Ok(Ok(v)) => v,
@@ -453,6 +502,9 @@ fn fail(state: &State, side: &Side, error: String) -> ApiError {
     }
 }
 
+#[cfg(test)]
+#[path = "arch/gemma4a.rs"]
+mod audio_tests;
 #[cfg(test)]
 #[path = "arch/gemma4v.rs"]
 mod image_tests;
@@ -790,6 +842,7 @@ mod tests {
                     &[Input {
                         ids: vec![id("a")],
                         images: Vec::new(),
+                        audio: Vec::new(),
                     }],
                 )
             });

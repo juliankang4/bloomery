@@ -95,6 +95,19 @@ pub fn open(file: &Gguf, limits: TokenLimits) -> Result<Opened, VisionError> {
     }
 }
 
+/// Open the audio input rule of a multimodal projector, if its header carries one.
+pub fn open_audio(file: &Gguf) -> Result<Option<Arc<dyn MediaModel + Send + Sync>>, VisionError> {
+    match file.value("clip.audio.projector_type") {
+        Some(kind) if kind.as_str() == Some("gemma4a") => {
+            Ok(Some(Arc::new(gemma4a::Preprocessor::default())))
+        }
+        Some(_) => Err(VisionError::Audio(
+            "the embedding projector's audio tower must be gemma4a".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
 /// The projector types this crate runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Projector {
@@ -267,6 +280,42 @@ mod tests {
         let (card, media) = open_table(&crate::arch::deepseek41v::hparams::tests::v41(), "clip")
             .expect("V4.1 opens");
         assert_eq!(card.total(), 970_924_032 + 339_878_648);
+        assert!(media.embedding_audio().is_none());
+        assert!(
+            media
+                .prepare_audio(&[0.0, 0.0])
+                .unwrap_err()
+                .to_string()
+                .contains("does not support decoded audio")
+        );
+        let audio = |table: Table| {
+            let file = table.write("clip");
+            super::open_audio(&Gguf::open(&file.0).unwrap())
+        };
+        assert!(audio(clef()).unwrap().is_none());
+        let model =
+            audio(clef().with("clip.audio.projector_type", Value::String("gemma4a".into())))
+                .unwrap()
+                .expect("audio input rule");
+        assert_eq!(
+            model.embedding_audio(),
+            Some(("<|audio>", "<audio|>", 16000))
+        );
+        let chunks = model.prepare_audio(&[0.0, 0.0]).unwrap();
+        assert_eq!(
+            (chunks[0].frames, chunks[0].span_len, chunks[0].data.len()),
+            (1, 1, 128)
+        );
+        assert!(model.prepare(&crate::Rgb8::filled(1, 1, [0; 3])).is_err());
+        for kind in [Value::String("unknown".into()), Value::U32(1)] {
+            assert!(
+                audio(clef().with("clip.audio.projector_type", kind))
+                    .err()
+                    .expect("invalid audio projector")
+                    .to_string()
+                    .contains("must be gemma4a")
+            );
+        }
         assert_eq!(media.part_join(), PartJoin::Uniform("\n\n"));
         let refused =
             |t: &Table, arch: &str| open_table(t, arch).err().expect("refused").to_string();

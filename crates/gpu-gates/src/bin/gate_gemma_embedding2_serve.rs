@@ -473,6 +473,178 @@ mod gate {
         })
     }
 
+    fn audio_run(dir: &Path, model: &str) -> Result<(), GateError> {
+        use refset::arch::gemma_embedding2::{AUDIO_SERVER, AUDIO_SERVER_CPU};
+        let server = Emb2Set::open(&AUDIO_SERVER.path(AUDIO_SERVER.sets[0]), &AUDIO_SERVER)?.man;
+        let cpu = Emb2Set::open(
+            &AUDIO_SERVER_CPU.path(AUDIO_SERVER_CPU.sets[0]),
+            &AUDIO_SERVER_CPU,
+        )?
+        .man;
+        let mut argv = args(model, true, MODEL);
+        argv.extend(["--embd-mmproj", MMPROJ_BF16]);
+        let image = bloomery_gpu_gates::vision_seat::Projector::open(
+            Path::new(MMPROJ_BF16),
+            &bloomery_gpu_gates::vision_seat::Flags::default(),
+            &["gemma4v"],
+        )?
+        .card
+        .total();
+        let text = bloomery_gpu_gemma_embedding2::card_bytes(&Split::open(MODEL)?, 8192)?;
+        let audio = bloomery_gpu_gemma4a::arch::gemma4a::card_bytes();
+        let reserve = text + image + audio;
+        let mut ok = true;
+        check(&mut ok, "audio_reserve_bytes", audio == 1_347_032_320);
+        let err = dir.join("audio-plan.err");
+        let (status, _) = plan_run(cmd(BUDGET)?, &argv, &err)?;
+        if !status.success() {
+            return Err(format!("audio plan failed: {status}").into());
+        }
+        let planned = log(&err)?;
+        let seat = planned
+            .first(&record::EMBEDDING_SEAT)?
+            .ok_or("no embedding seat record")?;
+        check(
+            &mut ok,
+            "audio_named_reserve",
+            seat.u64("reserve")? == reserve
+                && seat.u64("bytes")? == reserve
+                && pool(Path::new(model), reserve)?,
+        );
+        println!("audio reserve {reserve} B = text {text} + image {image} + audio {audio}");
+        let mut served = Served::spawn_cmd(cmd(BUDGET + reserve)?, &argv, dir)?;
+        let addr = served.address(&dir.join("server.err"), 600, Duration::from_secs(1))?;
+        let url = |path: &str| format!("http://{addr}{path}");
+        let mut count = 0;
+        let mut mixed = false;
+        for line in &server.header.other {
+            let Some(rest) = line.strip_prefix("# audio\t") else {
+                continue;
+            };
+            if !cpu.header.other.contains(line) {
+                return Err("audio CPU twin input identity differs".into());
+            }
+            let fields: Vec<_> = rest.split('\t').collect();
+            let [name, path, digest, tokens, prefix] = fields[..] else {
+                return Err("malformed audio identity".into());
+            };
+            if sha256(Path::new(path))? != digest {
+                return Err(format!("{name}: PCM sha256 differs").into());
+            }
+            let bytes = std::fs::read(path)?;
+            let audio = json!({"type":"input_audio","input_audio":{"format":"f32","sample_rate":16000,"channels":1,"data":serve::media::encode_base64(&bytes)}});
+            let mut parts = Vec::new();
+            let prefix: Value = serde_json::from_str(prefix)?;
+            if !prefix.is_null() {
+                let text = prefix
+                    .as_str()
+                    .ok_or("audio prefix must be a string or null")?;
+                parts.push(json!({"type":"text","text":text}));
+            }
+            parts.push(audio);
+            if name == "aud_sine" {
+                mixed = true;
+                let image = json!({"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGM4kWIERAAKxQK9KV6Y1QAAAABJRU5ErkJggg=="}});
+                let changed_image = json!({"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAC0lEQVR4nGP4DwYAFPIF+6QNfF4AAAAASUVORK5CYII="}});
+                let audio = parts.last().ok_or("no audio part")?;
+                let changed_pcm = vec![0; bytes.len()];
+                let changed_audio = json!({"type":"input_audio","input_audio":{"format":"f32","sample_rate":16000,"channels":1,"data":serve::media::encode_base64(&changed_pcm)}});
+                let image_only = embedding(&url, json!({"input":{"content":[image]}}))?;
+                let audio_only = embedding(&url, json!({"input":{"content":[audio]}}))?;
+                let empty = embedding(&url, json!({"input":""}))?;
+                let count_of = |v: &Value| {
+                    v["usage"]["prompt_tokens"]
+                        .as_u64()
+                        .ok_or("no prompt count")
+                };
+                let positions = count_of(&image_only)? + count_of(&audio_only)? - count_of(&empty)?;
+                for (order, content, changed, changed_audio) in [
+                    (
+                        "image_audio",
+                        json!([image, audio]),
+                        json!([changed_image, audio]),
+                        json!([image, changed_audio]),
+                    ),
+                    (
+                        "audio_image",
+                        json!([audio, image]),
+                        json!([audio, changed_image]),
+                        json!([changed_audio, image]),
+                    ),
+                ] {
+                    let body = json!({"input":{"content":content}});
+                    let first = embedding(&url, body.clone())?;
+                    let again = embedding(&url, body)?;
+                    let rows = vector(&first)?;
+                    check(
+                        &mut ok,
+                        &format!("mixed_{order}_vector_and_count"),
+                        rows.len() == 768
+                            && norm(&rows) > 0.0
+                            && rows == vector(&again)?
+                            && count_of(&first)? == positions
+                            && count_of(&again)? == positions,
+                    );
+                    let changed = embedding(&url, json!({"input":{"content":changed}}))?;
+                    check(
+                        &mut ok,
+                        &format!("mixed_{order}_image_content"),
+                        vector(&changed)? != rows && count_of(&changed)? == positions,
+                    );
+                    let changed = embedding(&url, json!({"input":{"content":changed_audio}}))?;
+                    check(
+                        &mut ok,
+                        &format!("mixed_{order}_audio_content"),
+                        vector(&changed)? != rows && count_of(&changed)? == positions,
+                    );
+                }
+            }
+            let raw = tap(&server, &format!("{name}/raw"))?;
+            let twin = tap(&cpu, &format!("{name}/raw"))?;
+            if raw.len() != 768 || twin.len() != 768 {
+                return Err(format!("{name}: audio reference width is not 768").into());
+            }
+            for (row, normalized) in [("raw", false), ("embd", true)] {
+                let v = embedding(
+                    &url,
+                    json!({"input":[{"content":parts}],"embd_normalize":if normalized {2} else {-1}}),
+                )?;
+                let ours = vector(&v)?;
+                let want = tap(&server, &format!("{name}/{row}"))?;
+                if want.len() != 768 {
+                    return Err(format!("{name}: {row} width is not 768").into());
+                }
+                let n: u64 = tokens
+                    .strip_prefix("prompt_tokens ")
+                    .ok_or("no audio prompt count")?
+                    .parse()?;
+                check(
+                    &mut ok,
+                    &format!("audio_{name}_{row}"),
+                    ours.len() == 768
+                        && v["usage"]["prompt_tokens"] == n
+                        && within(&ours, &want, &raw, &twin, normalized),
+                );
+                count += 1;
+            }
+        }
+        check(&mut ok, "audio_cases_present", count >= 4 && mixed);
+        let (status, text) = curl(
+            &url("/v1/embeddings"),
+            Some(
+                &json!({"input":[{"content":[{"type":"input_audio","input_audio":{"format":"wav","data":"encoded"}}]}]}),
+            ),
+            false,
+        )?;
+        check(
+            &mut ok,
+            "encoded_audio_refused",
+            status == 400 && text.contains("encoded audio is not supported"),
+        );
+        println!("audio server stopped {}", served.stop()?);
+        if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         record::at_main(
@@ -483,18 +655,20 @@ mod gate {
         let mut dir = PathBuf::from("target/embedding2-serve-gate");
         let mut v1 = false;
         let mut clips = None;
+        let mut audio = false;
         while let Some(a) = args_it.next() {
             match a.as_str() {
                 "--v1" if !v1 => v1 = true,
+                "--audio" if !audio => audio = true,
                 "--dir" => dir = args_it.next().ok_or("--dir needs DIR")?.into(),
                 "--video-clips" if clips.is_none() => {
                     clips = Some(PathBuf::from(args_it.next().ok_or("--video-clips needs clips.json")?));
                 }
-                _ => return Err(format!("unknown or duplicate argument {a}; takes --v1, --dir DIR and --video-clips clips.json").into()),
+                _ => return Err(format!("unknown or duplicate argument {a}; takes --v1, --audio, --dir DIR and --video-clips clips.json").into()),
             }
         }
-        if v1 && clips.is_some() {
-            return Err("--video-clips needs EmbeddingGemma 2, not --v1".into());
+        if (v1 && (clips.is_some() || audio)) || (audio && clips.is_some()) {
+            return Err("--v1, --audio and --video-clips are mutually exclusive".into());
         }
         use refset::arch::gemma_embedding as emb1;
         let (embedding, digest, server_family, cpu_family, ids_set, arch, ctx) = if v1 {
@@ -533,10 +707,10 @@ mod gate {
         if Split::open(model)?.architecture() != Some("qwen3moe") {
             return Err("serve gate needs Qwen3-30B-A3B-Instruct-2507 Q4_K_M".into());
         }
+        if (audio || clips.is_some()) && sha256(Path::new(MMPROJ_BF16))? != MMPROJ_BF16_SHA256 {
+            return Err("embedding projector sha256 differs from the oracle".into());
+        }
         if let Some(manifest) = clips {
-            if sha256(Path::new(MMPROJ_BF16))? != MMPROJ_BF16_SHA256 {
-                return Err("video projector sha256 differs from the oracle".into());
-            }
             let mut launch = args(model, true, embedding);
             launch.extend(["--embd-mmproj", MMPROJ_BF16, "--embd-image-min-tokens", "1"]);
             let mut served = Served::spawn_cmd(cmd(BUDGET)?, &launch, &dir)?;
@@ -545,6 +719,9 @@ mod gate {
             let ok = videos(&url, &manifest)?;
             println!("video server stopped {}", served.stop()?);
             return if ok { Ok(()) } else { Err(checks_failed()) };
+        }
+        if audio {
+            return audio_run(&dir, model);
         }
         let server = Emb2Set::open(&server_family.path(server_family.sets[0]), server_family)?.man;
         let cpu = Emb2Set::open(&cpu_family.path(cpu_family.sets[0]), cpu_family)?.man;

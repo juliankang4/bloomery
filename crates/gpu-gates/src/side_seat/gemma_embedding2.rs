@@ -24,6 +24,7 @@ pub(super) fn open(side: &Side, seat: &EncoderSeat) -> Result<Box<dyn Embed>, St
         let dims = architectures::gemma_embedding_dims(&split)?;
         let actual = card_bytes(&split, side.ctx)?
             .checked_add(side.projector.as_ref().map_or(0, |p| p.card.total()))
+            .and_then(|n| n.checked_add(side.audio_bytes))
             .ok_or("embedding model and tower byte count overflows")?;
         if actual != side.bytes || seat.reserve.is_some_and(|b| b != actual) {
             return Err(format!(
@@ -61,6 +62,25 @@ pub(super) fn open(side: &Side, seat: &EncoderSeat) -> Result<Box<dyn Embed>, St
                 Resident::open(encoder.context(), &at)
             })
             .transpose()?;
+        let (audio, audio_media) = if side.audio_bytes != 0 {
+            let projector = side
+                .projector
+                .as_ref()
+                .ok_or("audio tower has no projector file")?;
+            let file = gguf::Gguf::open(&projector.path)?;
+            let tower = architectures::open_audio(encoder.runtime(), &file)?;
+            if tower.weight_bytes() + tower.scratch_bytes() != side.audio_bytes {
+                return Err(format!(
+                    "audio tower loaded {} B, reserved {} B",
+                    tower.weight_bytes() + tower.scratch_bytes(),
+                    side.audio_bytes
+                )
+                .into());
+            }
+            (Some(tower), vision::arch::open_audio(&file)?)
+        } else {
+            (None, None)
+        };
         let name = side
             .path
             .file_name()
@@ -69,6 +89,8 @@ pub(super) fn open(side: &Side, seat: &EncoderSeat) -> Result<Box<dyn Embed>, St
             .into_owned();
         Ok(Box::new(Model {
             encoder,
+            audio,
+            audio_media,
             #[cfg(feature = "vision")]
             vision,
             tok,
@@ -82,6 +104,8 @@ pub(super) fn open(side: &Side, seat: &EncoderSeat) -> Result<Box<dyn Embed>, St
 
 struct Model {
     encoder: Encoder,
+    audio: Option<Box<dyn bloomery_gpu_vision::Tower>>,
+    audio_media: Option<serve::media::SharedMediaModel>,
     #[cfg(feature = "vision")]
     vision: Option<Resident>,
     tok: Arc<Vocab>,
@@ -91,6 +115,10 @@ struct Model {
 }
 
 impl Embed for Model {
+    fn audio(&self) -> Option<serve::media::SharedMediaModel> {
+        self.audio_media.clone()
+    }
+
     fn media(&self) -> Option<serve::media::SharedMediaModel> {
         #[cfg(feature = "vision")]
         {
@@ -134,21 +162,59 @@ impl Embed for Model {
         &mut self,
         ids: &[u32],
         images: &[serve::media::MediaFeed],
+        audio: &[serve::embed::AudioFeed],
     ) -> Result<Vec<f32>, EmbedError> {
-        let tower = self
-            .vision
-            .as_mut()
-            .ok_or_else(|| EmbedError("image input needs --embd-mmproj".into()))?;
-        let encoded = tower
-            .encode_with(
-                self.encoder.context(),
-                images.iter().map(|i| Image::of(i.at, &i.prepared)),
-                crate::vision_seat::merged_cells,
-            )
-            .map_err(|e| EmbedError(e.to_string()))?;
-        self.encoder
-            .pass_media(ids, &encoded.rows().media_spans(), false)
-            .map(|p| p.pooled)
-            .map_err(|e| EmbedError(e.to_string()))
+        let mut run = || -> Result<Vec<f32>, crate::GateError> {
+            let encoded = if images.is_empty() {
+                None
+            } else {
+                let tower = self
+                    .vision
+                    .as_mut()
+                    .ok_or("image input needs --embd-mmproj")?;
+                Some(tower.encode_with(
+                    self.encoder.context(),
+                    images.iter().map(|i| Image::of(i.at, &i.prepared)),
+                    crate::vision_seat::merged_cells,
+                )?)
+            };
+            if audio.is_empty() {
+                let spans = encoded
+                    .as_ref()
+                    .map(|e| e.rows().media_spans())
+                    .unwrap_or_default();
+                return Ok(self.encoder.pass_media(ids, &spans, false)?.pooled);
+            }
+            let tower = self
+                .audio
+                .as_mut()
+                .ok_or("audio input needs a gemma4a --embd-mmproj")?;
+            let mut rows = Vec::new();
+            for feed in audio {
+                let mut at = feed.at;
+                for mel in &*feed.chunks {
+                    let chunk = tower.encode_audio(mel)?;
+                    rows.push((at..at + chunk.tokens, chunk.values));
+                    at += chunk.tokens;
+                }
+            }
+            if let Some(encoded) = &encoded {
+                for span in encoded.rows().media_spans() {
+                    let mut values = vec![0.0; span.rows.len()];
+                    bloomery_gpu::media::widen_bf16(span.rows, &mut values);
+                    rows.push((span.at, values));
+                }
+            }
+            rows.sort_by_key(|(at, _)| at.start);
+            let spans: Vec<_> = rows
+                .iter()
+                .map(|(at, values)| bloomery_gpu::media::MediaSpan {
+                    at: at.clone(),
+                    rows: values.as_slice(),
+                })
+                .collect();
+            Ok(self.encoder.pass_media_f32(ids, &spans, false)?.pooled)
+        };
+        run().map_err(|e| EmbedError(e.to_string()))
     }
 }

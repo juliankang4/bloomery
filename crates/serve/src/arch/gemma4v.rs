@@ -29,6 +29,44 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
         want.push(side.tok.eos());
     }
     assert_eq!(got.ids, want);
+    side.audio = Some(Arc::new(vision::arch::gemma4a::Preprocessor::default()));
+    let audio = json!({"type":"input_audio","input_audio":{
+        "format":"f32","sample_rate":16000,"channels":1,"data":media::encode_base64(&[0; 8])
+    }});
+    for audio_first in [false, true] {
+        let parts = if audio_first {
+            [audio.clone(), image.clone()]
+        } else {
+            [image.clone(), audio.clone()]
+        };
+        let mixed = input(&side, "input", &json!({"content":parts}))
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(mixed.images.len(), 1);
+        assert_eq!(mixed.audio.len(), 1);
+        let mut want = vec![side.tok.bos()];
+        for is_audio in [audio_first, !audio_first] {
+            let (begin, end, at) = if is_audio {
+                assert_eq!(mixed.audio[0].chunks.len(), 1);
+                assert_eq!(mixed.audio[0].chunks[0].tokens(), 1);
+                (
+                    vision::arch::gemma4a::BEGIN,
+                    vision::arch::gemma4a::END,
+                    mixed.audio[0].at,
+                )
+            } else {
+                assert_eq!(mixed.images[0].prepared.span_len, 1);
+                ("<|image>", "<image|>", mixed.images[0].at)
+            };
+            want.extend(side.tok.encode(begin));
+            assert_eq!(at, want.len());
+            want.push(side.tok.bos());
+            want.extend(side.tok.encode(end));
+        }
+        if side.tok.add_eos() {
+            want.push(side.tok.eos());
+        }
+        assert_eq!(mixed.ids, want);
+    }
     let model = side.media.as_ref().expect("image preparer");
     assert_eq!(model.image_token(), None);
     assert!(matches!(

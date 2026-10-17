@@ -98,31 +98,43 @@ fn main() -> Result<(), GateError> {
     );
     for bad in [
         Mel {
+            frames: 1,
+            span_len: 2,
+            data: vec![0.0; 128],
+        },
+        Mel {
             frames: 0,
+            span_len: 0,
             data: vec![],
         },
         Mel {
             frames: 3000,
+            span_len: 750,
             data: vec![0.0; 3000 * 128],
         },
         Mel {
             frames: 1,
+            span_len: 1,
             data: vec![0.0; 127],
         },
         Mel {
             frames: 1,
+            span_len: 1,
             data: vec![0.0; 129],
         },
         Mel {
             frames: 1,
+            span_len: 1,
             data: vec![f32::NAN; 128],
         },
         Mel {
             frames: 1,
+            span_len: 1,
             data: vec![f32::INFINITY; 128],
         },
         Mel {
             frames: 1,
+            span_len: 1,
             data: vec![f32::NEG_INFINITY; 128],
         },
     ] {
@@ -134,6 +146,7 @@ fn main() -> Result<(), GateError> {
     }
     let overflow = Mel {
         frames: 1,
+        span_len: 1,
         data: vec![f32::MAX; 128],
     };
     let error = encoder
@@ -191,6 +204,7 @@ fn main() -> Result<(), GateError> {
         row.expect(name, "f32", [frames as u64, 128, 1, 1], "NONE")?;
         let mel = Mel {
             frames,
+            span_len: frames.div_ceil(4),
             data: ref_tensor_of_in(&dir, row)?,
         };
         assert!(

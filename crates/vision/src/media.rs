@@ -76,8 +76,35 @@ impl EncoderInput {
     }
 }
 
-/// A model's image input, as data plus one prepare.
+/// One prepared audio chunk: time-contiguous features and the positions its encoder emits.
+#[derive(Debug)]
+pub struct AudioChunk {
+    pub frames: usize,
+    pub data: Vec<f32>,
+    pub span_len: usize,
+}
+
+impl AudioChunk {
+    #[must_use]
+    pub fn tokens(&self) -> usize {
+        self.span_len
+    }
+}
+
+/// A model's media input, as data plus its prepares.
 pub trait MediaModel {
+    /// The audio delimiters and decoded mono PCM sample rate, if this projector accepts audio.
+    fn embedding_audio(&self) -> Option<(&str, &str, usize)> {
+        None
+    }
+
+    /// Prepare decoded mono PCM for this projector's audio encoder.
+    fn prepare_audio(&self, _pcm: &[f32]) -> Result<Vec<AudioChunk>, VisionError> {
+        Err(VisionError::Audio(
+            "the projector does not support decoded audio".into(),
+        ))
+    }
+
     /// Ordinary text around image rows in an embedding input; no placeholder token is needed.
     fn embedding_delimiters(&self) -> Option<(&str, &str)> {
         None

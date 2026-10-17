@@ -350,10 +350,11 @@ mod gate {
                 if mixed {
                     parts.push(InputPart::Text("A picture of coloured rings and ramps: "));
                 }
-                parts.push(InputPart::Image {
+                parts.push(InputPart::Media {
                     begin: gemma4v::IMAGE_BEGIN,
                     end: gemma4v::IMAGE_END,
                     positions: tokens,
+                    kind: "image",
                 });
                 let assembled = assemble(parts.into_iter().map(Ok), &tok, CARD_CTX)?;
                 let ids = &assembled.ids;
@@ -443,10 +444,11 @@ mod gate {
         use vision::arch::gemma4v;
 
         let mut parts = vec![InputPart::Text(VIDEO_PREFIX)];
-        parts.extend(prepared.iter().map(|p| InputPart::Image {
+        parts.extend(prepared.iter().map(|p| InputPart::Media {
             begin: gemma4v::IMAGE_BEGIN,
             end: gemma4v::IMAGE_END,
             positions: p.span_len,
+            kind: "image",
         }));
         let assembled = assemble(parts.into_iter().map(Ok), tok, CARD_CTX)?;
         let expected = format!(

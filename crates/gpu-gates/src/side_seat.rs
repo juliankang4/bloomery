@@ -181,12 +181,21 @@ impl Flags {
             }
             None => None,
         };
+        let audio_bytes = if let Some(p) = &projector {
+            (row.audio_bytes)(&gguf::Gguf::open(&p.path)?)?
+        } else {
+            0
+        };
+        bytes = bytes
+            .checked_add(audio_bytes)
+            .ok_or("embedding model and audio byte count overflows")?;
         Ok(Some(Side {
             row,
             path,
             ctx,
             bytes,
             projector,
+            audio_bytes,
         }))
     }
 }
@@ -207,6 +216,8 @@ pub struct Row {
     pub projector_file: Option<&'static str>,
     /// The projector types this embedding architecture accepts.
     pub projector_types: &'static [&'static str],
+    /// The optional audio tower's bytes in the same projector file.
+    pub audio_bytes: fn(&gguf::Gguf) -> Result<u64, GateError>,
 }
 
 /// A row's open: the model of `side`'s file on `seat`'s card.
@@ -246,6 +257,8 @@ pub struct Side {
     pub bytes: u64,
     /// The image tower sized before the chat plan; its bytes share this side seat's reserve.
     pub projector: Option<vision_seat::Projector>,
+    /// Audio buffers included beside the image buffers in this seat's named reserve.
+    pub audio_bytes: u64,
 }
 
 impl Side {
@@ -278,6 +291,7 @@ impl Side {
 type Job = (
     Vec<u32>,
     Vec<serve::media::MediaFeed>,
+    Vec<serve::embed::AudioFeed>,
     mpsc::Sender<Result<Vec<f32>, EmbedError>>,
 );
 
@@ -293,6 +307,7 @@ pub struct SideEngine {
     ctx: usize,
     dims: Vec<usize>,
     media: Option<serve::media::SharedMediaModel>,
+    audio: Option<serve::media::SharedMediaModel>,
 }
 
 impl SideEngine {
@@ -325,16 +340,17 @@ impl SideEngine {
                     model.ctx(),
                     model.dims(),
                     model.media(),
+                    model.audio(),
                 );
                 if opened_tx.send(Ok(facts)).is_err() {
                     return;
                 }
-                for (ids, images, answer) in rx {
+                for (ids, images, audio, answer) in rx {
                     match catch_unwind(|| {
-                        if images.is_empty() {
+                        if images.is_empty() && audio.is_empty() {
                             model.embed(&ids)
                         } else {
-                            model.embed_media(&ids, &images)
+                            model.embed_media(&ids, &images, &audio)
                         }
                     }) {
                         Ok(v) => {
@@ -350,7 +366,7 @@ impl SideEngine {
                 }
             })
             .map_err(|e| format!("starting the embedding model's thread: {e}"))?;
-        let (tokenizer, name, path, ctx, dims, media) = match opened.recv() {
+        let (tokenizer, name, path, ctx, dims, media, audio) = match opened.recv() {
             Ok(Ok(facts)) => facts,
             refused => {
                 // The thread ended with its open; nothing is left on its card.
@@ -370,6 +386,7 @@ impl SideEngine {
             ctx,
             dims,
             media,
+            audio,
         })
     }
 }
@@ -393,6 +410,9 @@ impl Embed for SideEngine {
     fn media(&self) -> Option<serve::media::SharedMediaModel> {
         self.media.clone()
     }
+    fn audio(&self) -> Option<serve::media::SharedMediaModel> {
+        self.audio.clone()
+    }
     fn tokenizer(&self) -> Arc<dyn Tokenizer> {
         Arc::clone(&self.tokenizer)
     }
@@ -414,18 +434,19 @@ impl Embed for SideEngine {
     }
 
     fn embed(&mut self, ids: &[u32]) -> Result<Vec<f32>, EmbedError> {
-        self.embed_media(ids, &[])
+        self.embed_media(ids, &[], &[])
     }
 
     fn embed_media(
         &mut self,
         ids: &[u32],
         images: &[serve::media::MediaFeed],
+        audio: &[serve::embed::AudioFeed],
     ) -> Result<Vec<f32>, EmbedError> {
         let ended = || EmbedError("the embedding model's thread ended".to_owned());
         let jobs = self.jobs.as_ref().ok_or_else(ended)?;
         let (answer, answered) = mpsc::channel();
-        jobs.send((ids.to_vec(), images.to_vec(), answer))
+        jobs.send((ids.to_vec(), images.to_vec(), audio.to_vec(), answer))
             .map_err(|_| ended())?;
         answered.recv().map_err(|_| ended())?
     }

@@ -45,6 +45,54 @@ Its default profile's `IK` tree must contain `src/`, `docs/`, `README.md` and
 `github-data/`, as for the v2 tokenizer set. `LCPP` selects the tokenizer executable;
 `IK` selects those corpus texts.
 
+## Decoded audio (EmbeddingGemma 2)
+
+The embeddings endpoints accept `input_audio` parts containing decoded mono PCM
+at 16 kHz. Start the side seat with `--embd-model` and the BF16 `--embd-mmproj`.
+The request's `data` is standard base64 over little-endian f32 samples:
+
+```json
+{"input":[{"content":[{"type":"input_audio","input_audio":{"format":"f32","sample_rate":16000,"channels":1,"data":"AAAAAAAAAAA="}}]}]}
+```
+
+That example contains two silent samples. Empty audio, non-finite samples,
+other sample rates or channel counts are refused with HTTP 400. Encoded WAV,
+MP3 and other formats get an explicit decoder-not-supported error. No audio
+decoder is linked or launched by bloomery.
+
+Gemma4a's host preprocessor splits PCM into independent 30-second chunks. One
+`<|audio>` and `<audio|>` pair surrounds all chunks of each audio part. Text,
+images and audio remain ordered in one encoder pass. The audio tower's f32
+rows reach the text encoder without a BF16 conversion. The encoder pools the
+combined sequence. The server owns normalization and dimension cuts as for
+image and text inputs.
+
+The audio weight and scratch buffers are added to the same `embedding model`
+named reserve as the side seat's vision tower. The audio byte count comes from
+`bloomery_gpu_gemma4a::arch::gemma4a::card_bytes`; the load checks it against the
+actual buffers. One tower is reused across chunks and requests.
+
+To collect reference vectors, run the pinned mainline llama-server with the same
+Q8_0 text model, BF16 projector, mean pooling and context/batch sizes of 8192.
+Add `--audio NAME=PATH` to `server_vectors.py` for each saved f32 PCM file, using
+the identity and build arguments shown in that script. It wraps those exact
+samples in float WAV for mainline's decoder. Each input yields audio-only and
+text-plus-audio vectors, both raw and normalized. The manifest records the PCM
+path, SHA256 and prompt count. Collect the CPU twin with `--cpu`,
+`CUDA_VISIBLE_DEVICES=''`, `-ngl 0` and `--no-mmproj-offload`.
+Store the sets as `ref_gemma_embedding2_audio_server` and
+`ref_gemma_embedding2_audio_server.cpu` under `BLOOMERY_DATA`.
+
+With both sets and their PCM files present:
+
+```sh
+just gate-gpu-gemma-embedding2-serve --audio
+```
+
+This mode checks the served vectors against mainline and its CPU twin using
+the existing serving bands. It checks prompt counts, encoded-audio refusal,
+and the combined named reserve through the placement and unified-pool owners.
+
 ## Decoded video frames (EmbeddingGemma 2)
 
 `just dump-ref-emb2 video video.cpu` writes `ref_gemma_embedding2_video`
@@ -65,8 +113,9 @@ fixture `strip-1000x1` exercises that refusal in the pure test and remains in th
 image gate at its larger image budget.
 The encoder gate feeds those frames through one reused tower and one
 `Encoder::pass_media` call, checking identities, positions and both vectors.
-The existing `embedding model` named reserve remains
-`bloomery_gpu_gemma_embedding2::card_bytes(text, ctx) + projector.card.total()` bytes.
+The `embedding model` named reserve includes
+`bloomery_gpu_gemma_embedding2::card_bytes(text, ctx) + projector.card.total()` bytes,
+plus the audio buffers described under Decoded audio when that tower is loaded.
 The projector term counts one tower's weights and activation buffers at the
 configured image limit, not one tower per frame. The encoder term counts the
 combined sequence at `ctx`, including the input rows and pass buffers. Video

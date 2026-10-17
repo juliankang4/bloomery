@@ -123,7 +123,7 @@ vision = ["gpu", "dep:bloomery-gpu-vision", "dep:bloomery-vision"]
 clef = ["gpu", "dep:bloomery-decision", "dep:bloomery-serve", "dep:serde_json"]
 glm5next = ["deepseek41", "dep:bloomery-gpu-glm5next", "bloomery-app/glm5next"]
 mimo2 = ["gpu", "dep:bloomery-gpu-mimo2", "bloomery-app/mimo2"]
-gemma-embedding2 = ["gpu", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
+gemma-embedding2 = ["gpu", "gemma4a", "dep:bloomery-gpu-vision", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
 gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
 
 [[bin]]

@@ -69,6 +69,22 @@ def image_entries(images: list[str], mix: str | None):
         raise SystemExit(f"server_vectors: --mix-image {mix} names no --image")
 
 
+def audio_entries(inputs: list[str]):
+    """Wrap stored mono 16 kHz f32 PCM in a lossless float WAV for mainline's decoder."""
+    for item in inputs:
+        name, path = item.split("=", 1)
+        pcm = Path(path)
+        data = pcm.read_bytes()
+        if not name or len(data) % 4 or len(data) < 8:
+            raise SystemExit(f"server_vectors: {item}: expected named f32 PCM")
+        header = struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", len(data) + 36, b"WAVE",
+                             b"fmt ", 16, 3, 1, 16000, 64000, 4, 32, b"data", len(data))
+        audio = {"type": "input_audio", "input_audio": {
+            "format": "wav", "data": "data:audio/wav;base64," + base64.b64encode(header + data).decode()}}
+        yield f"aud_{name}", {"content": [audio]}, pcm, data
+        yield f"mix_aud_{name}", {"content": [{"type": "text", "text": MIX_TEXT}, audio]}, pcm, data
+
+
 def metrics(ours: list[float], reference: list[float]) -> tuple[float, float]:
     """Cosine and maximum absolute difference, refusing empty, non-finite or unequal vectors."""
     if not ours or len(ours) != len(reference) or not all(math.isfinite(x) for x in ours + reference):
@@ -227,12 +243,15 @@ def main() -> None:
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--image", action="append", default=[])
     ap.add_argument("--mix-image")
+    ap.add_argument("--audio", action="append", default=[], help="NAME=PATH to stored mono 16 kHz little-endian f32 PCM")
     ap.add_argument("--frames", action="store_true", help="one ordered decoded-frame input from --image")
     ap.add_argument("--server-flags", default="")
     a = ap.parse_args()
 
-    if not a.case and not a.image:
-        ap.error("at least one --case or --image is required")
+    if not a.case and not a.image and not a.audio:
+        ap.error("at least one --case, --image or --audio is required")
+    if a.frames and a.audio:
+        ap.error("--frames and --audio are separate inputs")
     if a.frames and (not a.image or a.mix_image or a.case):
         ap.error("--frames takes only ordered --image inputs")
     if a.frames and (a.arch != "gemma-embedding2" or len(a.image) > 32):
@@ -242,7 +261,7 @@ def main() -> None:
     build = os.environ.get("BLOOMERY_REF_BUILD", "")
     if not build:
         raise SystemExit("server_vectors: BLOOMERY_REF_BUILD names no commit")
-    if bool(a.mmproj) != bool(a.mmproj_sha256) or (a.image and not a.mmproj):
+    if bool(a.mmproj) != bool(a.mmproj_sha256) or ((a.image or a.audio) and not a.mmproj):
         raise SystemExit("server_vectors: images need a projector path and sha256")
     files = [(a.model, a.model_sha256)]
     if a.mmproj:
@@ -300,6 +319,10 @@ def main() -> None:
             n = pooled_rows(w, a.url, name, entry, False)
             suffix = "\ttext first" if name.startswith("mix_") else ""
             w.header.append(f"# image\t{name}\t{png}\t{hashlib.sha256(data).hexdigest()}\tprompt_tokens {n}{suffix}")
+    for name, entry, pcm, data in audio_entries(a.audio):
+        n = pooled_rows(w, a.url, name, entry, False)
+        text = entry["content"][0].get("text")
+        w.header.append(f"# audio\t{name}\t{pcm}\t{hashlib.sha256(data).hexdigest()}\tprompt_tokens {n}\t{json.dumps(text)}")
     check_server(a, build)
     w.finish()
     print(f"server_vectors: {len(w.rows)} row(s) into {a.out}")

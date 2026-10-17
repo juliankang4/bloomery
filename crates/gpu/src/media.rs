@@ -20,17 +20,17 @@ use std::ops::Range;
 use std::sync::Arc;
 use vision::mrope::{Canvas, MropeSeq, RowRewrite, SectionOrder, SeqRows};
 
-/// One media span of a prompt call: its positions `at` in the call's ids and the bf16 row of each
-/// of them (`n_embd` values).
+/// One media span of a prompt call: its positions `at` in the call's ids and one row per
+/// position (`n_embd` values). Existing image callers use bf16; audio may keep f32 rows.
 #[derive(Clone)]
-pub struct MediaSpan<'a> {
+pub struct MediaSpan<'a, T = u16> {
     /// The span's positions in the call's ids, non-empty.
     pub at: Range<usize>,
-    /// The span's rows, `at.len()` rows of `n_embd` bf16 values.
-    pub rows: &'a [u16],
+    /// The span's rows, `at.len()` rows of `n_embd` values.
+    pub rows: &'a [T],
 }
 
-impl std::fmt::Debug for MediaSpan<'_> {
+impl<T> std::fmt::Debug for MediaSpan<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MediaSpan")
             .field("at", &self.at)
@@ -39,10 +39,10 @@ impl std::fmt::Debug for MediaSpan<'_> {
     }
 }
 
-impl<'a> MediaSpan<'a> {
-    /// The row of position `p` (`n_embd` bf16 values); `None` off the span.
+impl<'a, T> MediaSpan<'a, T> {
+    /// The row of position `p` (`n_embd` values); `None` off the span.
     #[must_use]
-    pub fn row(&self, p: usize, n_embd: usize) -> Option<&'a [u16]> {
+    pub fn row(&self, p: usize, n_embd: usize) -> Option<&'a [T]> {
         if !self.at.contains(&p) {
             return None;
         }
@@ -188,9 +188,9 @@ pub fn widen_bf16(row: &[u16], out: &mut [f32]) {
 /// inside a call of `n_ids` ids, whole (`rows.len() = at.len() · n_embd`), and the spans ascending
 /// and disjoint. A span the call's end cuts is refused: a span's rows come with its call or not at
 /// all.
-pub fn check_spans(
+pub fn check_spans<T>(
     what: &'static str,
-    spans: &[MediaSpan<'_>],
+    spans: &[MediaSpan<'_, T>],
     n_ids: usize,
     n_embd: usize,
 ) -> Result<(), GpuError> {

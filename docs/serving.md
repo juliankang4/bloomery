@@ -287,8 +287,9 @@ model's command:
 `--embd-no-mmproj` disables that automatic projector. A local `--embd-model` loads images only with an explicit
 `--embd-mmproj`. The projector's vision matrices must be BF16; a Q8_0 projector is refused by tensor name.
 The F32 patch convolution and learned position tables retain their file precision. With no activation keys,
-the tower follows mainline's Quick GELU; `clip.use_gelu=true` selects its tanh GELU and SiLU is refused. Audio tensors of a combined
-vision/audio file stay on the host and are not counted in the card reserve.
+the tower follows mainline's Quick GELU; `clip.use_gelu=true` selects its tanh GELU and SiLU is refused.
+With `clip.audio.projector_type=gemma4a`, the EmbeddingGemma 2 side seat also loads the audio tower on its card
+and adds its weight and scratch bytes to the side seat's byte count.
 
 The encoder and tower share the embedding side seat's card and thread, with streams of their own. Before the chat placement
 is made, their weight and activation bytes are counted together. On a card outside the chat plan this costs the
