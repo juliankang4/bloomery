@@ -173,51 +173,50 @@ mod gate {
             }
             Ok(n)
         };
-        Ok((
-            match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-                [] => Mode::Gate,
-                ["--node0", g, out, server] => Mode::Node0 {
-                    gib: gib(g, TOP_GIB)?,
-                    out: PathBuf::from(out),
-                    server: server
-                        .parse()
-                        .map_err(|e| format!("{server:?}: {e}: {USAGE}"))?,
-                },
-                ["--history", g, out] => Mode::History {
-                    gib: gib(g, TOP_GIB)?,
-                    out: PathBuf::from(out),
-                },
-                ["--decode0", g, tokens, out] => {
-                    let tokens: usize = tokens
-                        .parse()
-                        .map_err(|e| format!("{tokens:?}: {e}: {USAGE}"))?;
-                    if tokens == 0 || tokens > CTX - PROMPT {
-                        return Err(format!(
-                            "decode tokens must be in 1..={}: {USAGE}",
-                            CTX - PROMPT
-                        )
-                        .into());
-                    }
-                    Mode::Decode {
-                        gib: gib(g, u64::MAX >> 30)?,
-                        tokens,
-                        out: PathBuf::from(out),
-                    }
-                }
-                ["--hold0", g] => Mode::Hold0 {
-                    gib: gib(g, TOP_GIB)?,
-                },
-                ["--measure", arm @ ("local" | "node"), g] => Mode::Measure {
-                    arm: arm.to_string(),
-                    gib: gib(g, TOP_GIB)?,
-                },
-                ["--measure-node0", g] => Mode::MeasureNode0 {
-                    gib: gib(g, TOP_GIB)?,
-                },
-                _ => return Err(USAGE.into()),
+        let mode = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            [] => Mode::Gate,
+            ["--node0", g, out, server] => Mode::Node0 {
+                gib: gib(g, TOP_GIB)?,
+                out: PathBuf::from(out),
+                server: server
+                    .parse()
+                    .map_err(|e| format!("{server:?}: {e}: {USAGE}"))?,
             },
-            host,
-        ))
+            ["--history", g, out] => Mode::History {
+                gib: gib(g, TOP_GIB)?,
+                out: PathBuf::from(out),
+            },
+            ["--decode0", g, tokens, out] => {
+                let tokens: usize = tokens
+                    .parse()
+                    .map_err(|e| format!("{tokens:?}: {e}: {USAGE}"))?;
+                if tokens == 0 || tokens > CTX - PROMPT {
+                    return Err(
+                        format!("decode tokens must be in 1..={}: {USAGE}", CTX - PROMPT).into(),
+                    );
+                }
+                Mode::Decode {
+                    gib: gib(g, u64::MAX >> 30)?,
+                    tokens,
+                    out: PathBuf::from(out),
+                }
+            }
+            ["--hold0", g] => Mode::Hold0 {
+                gib: gib(g, TOP_GIB)?,
+            },
+            ["--measure", arm @ ("local" | "node"), g] => Mode::Measure {
+                arm: arm.to_string(),
+                gib: gib(g, TOP_GIB)?,
+            },
+            ["--measure-node0", g] => Mode::MeasureNode0 {
+                gib: gib(g, TOP_GIB)?,
+            },
+            _ => return Err(USAGE.into()),
+        };
+        if host && matches!(mode, Mode::Decode { .. }) {
+            return Err("--host is not supported with --decode0; use --history".into());
+        }
+        Ok((mode, host))
     }
 
     /// What every mode reads: the file, its plan inputs, the ubatch and the
@@ -882,7 +881,7 @@ mod gate {
             usize::try_from(model::arch::qwen35moe::place::tier_route_scratch_bytes(1))?,
         );
         let (mut n1, addr) = node1(None, c.node_host)?;
-        open.project(plan, &TierNode::census_of(addr)?, 1)?;
+        open.project(plan, &TierNode::census_of(addr)?)?;
         let target = std::env::temp_dir().join(format!("{NAME}-{}.target", std::process::id()));
         let alias =
             Path::new("/dev/shm").join(format!("bloomery-tier-{}-symlink", std::process::id()));
@@ -1771,7 +1770,10 @@ mod gate {
                 } else {
                     let (mode, host) = parsed.unwrap();
                     assert!(host);
-                    assert_eq!(std::mem::discriminant(&mode), std::mem::discriminant(&resident));
+                    assert_eq!(
+                        std::mem::discriminant(&mode),
+                        std::mem::discriminant(&resident)
+                    );
                 }
             }
         }

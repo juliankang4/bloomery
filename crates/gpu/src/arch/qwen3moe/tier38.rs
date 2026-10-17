@@ -665,7 +665,7 @@ pub(super) fn open_tier(
             Some(addr) => TierNode::census_of(addr)?,
             None => NodeCensus::here()?,
         };
-        open.project(plan, &census, tier + 1)?;
+        open.project(plan, &census)?;
         if let Some(addr) = t.node {
             let node = TierNode::open(addr, &open)?;
             stage.context().bind_to_thread()?;

@@ -40,8 +40,10 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
     const WIDTH: usize = 32;
     const LAYERS: usize = 8;
     const EXPERTS: usize = 2048;
-    let dir =
-        std::env::temp_dir().join(format!("bloomery-node-nvme-{}-{hardware}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "bloomery-node-nvme-{}-{hardware}",
+        std::process::id()
+    ));
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("model.gguf");
     let result = std::panic::catch_unwind(|| {
@@ -157,12 +159,11 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
         for row in &mut resident.rows {
             row.format = Format::Card(model::placement::CardFormat::Q8_0Planes).to_string();
         }
-        resident.project(&source, &node, 1).unwrap();
+        resident.project(&source, &node).unwrap();
         assert!(resident.nvme.is_none());
-        let refused = open.project(&source, &node, 1).is_err();
+        let refused = open.project(&source, &node).is_err();
         let mut reconstructed = open.clone();
         reconstructed.nvme = Some(super::super::node::NodeNvme {
-            node: 1,
             room: u64::MAX,
             arena: workstation::ArenaGrant::whole(0),
             reserve: 0,
@@ -177,20 +178,19 @@ fn node_nvme_host_run(census: Vec<model::placement::devices::DeviceInfo>, hardwa
         );
         assert_eq!((refused, need.bytes()), (true, assigned_bytes));
         node.host_room = u64::MAX;
-        open.project(&source, &node, 1).unwrap();
+        open.project(&source, &node).unwrap();
         assert_eq!(open.nvme.as_ref().unwrap().arena.planned, 0);
         node.host_room = 40 << 20;
-        open.project(&source, &node, 1).unwrap();
+        open.project(&source, &node).unwrap();
         resident.nvme = open.nvme.clone();
         node.host_room = 0;
-        resident.project(&source, &node, 1).unwrap();
+        resident.project(&source, &node).unwrap();
         assert!(resident.nvme.is_none());
         node.host_room = 40 << 20;
         let paging = open
             .nvme
             .as_ref()
             .expect("the constrained remote node must page");
-        assert_eq!(paging.node, 1);
         let projected = open.host_plan(&model, &machine).unwrap();
         let mut missing = open.clone();
         missing.rows.pop();

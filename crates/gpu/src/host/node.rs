@@ -294,7 +294,6 @@ pub struct NodeOpen {
 /// set; the common split derives the resident and paged rows from this room.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeNvme {
-    pub node: usize,
     pub room: u64,
     pub arena: ArenaGrant,
     pub reserve: u64,
@@ -303,12 +302,7 @@ pub struct NodeNvme {
 impl NodeOpen {
     /// Project the assigned routed stacks onto this node's own host room.
     /// Row tables and attention are not part of an expert tier's request.
-    pub fn project(
-        &mut self,
-        plan: &Plan<'_>,
-        census: &NodeCensus,
-        node: usize,
-    ) -> Result<(), GpuError> {
+    pub fn project(&mut self, plan: &Plan<'_>, census: &NodeCensus) -> Result<(), GpuError> {
         self.nvme = None;
         if self
             .rows
@@ -346,7 +340,6 @@ impl NodeOpen {
         model::placement::expert_nvme_tier(&mut projected, census.host_room, census.arena_given)
             .map_err(|e| GpuError::plan(WHAT, e))?;
         self.nvme = Some(NodeNvme {
-            node,
             room: census.host_room,
             arena: ArenaGrant::whole(projected.host.nvme_arena_bytes),
             reserve,
@@ -410,8 +403,7 @@ impl NodeOpen {
             .nvme
             .as_ref()
             .ok_or_else(|| GpuError::shape(SERVER, "no node NVMe plan"))?;
-        if paging.node == 0
-            || (paging.arena.granted == 0) != (paging.arena.planned == 0)
+        if (paging.arena.granted == 0) != (paging.arena.planned == 0)
             || paging.arena.granted > paging.arena.planned
         {
             return Err(GpuError::shape(SERVER, "invalid node NVMe arena grant"));
@@ -591,7 +583,6 @@ impl NodeOpen {
         match &self.nvme {
             Some(p) => {
                 o.u8(1)
-                    .len(p.node)
                     .u64(p.room)
                     .u64(p.arena.planned)
                     .u64(p.arena.granted)
@@ -645,21 +636,16 @@ impl NodeOpen {
 
     fn read(i: &mut In<'_>) -> Result<NodeOpen, String> {
         let nvme = if i.flag("node NVMe")? {
-            let node = i.len("NVMe node")?;
             let room = i.u64("node room")?;
             let arena = ArenaGrant {
                 planned: i.u64("planned arena")?,
                 granted: i.u64("granted arena")?,
             };
             let reserve = i.u64("node reserve")?;
-            if node == 0
-                || (arena.granted == 0) != (arena.planned == 0)
-                || arena.granted > arena.planned
-            {
+            if (arena.granted == 0) != (arena.planned == 0) || arena.granted > arena.planned {
                 return Err("invalid node NVMe arena grant".into());
             }
             Some(NodeNvme {
-                node,
                 room,
                 arena,
                 reserve,
@@ -2126,7 +2112,6 @@ pub(super) mod tests {
         ] {
             let mut paged = open.clone();
             paged.nvme = Some(super::NodeNvme {
-                node: 1,
                 room: 1 << 30,
                 arena,
                 reserve: 65536,
@@ -2134,8 +2119,16 @@ pub(super) mod tests {
             let mut out = Out::default();
             paged.write(&mut out).unwrap();
             let mut header = Out::default();
-            header.u64(1 << 30).u64(arena.planned).u64(arena.granted).u64(65536);
-            assert_eq!(&out.done()[1..33], header.done(), "only the NVMe budget is on the wire");
+            header
+                .u64(1 << 30)
+                .u64(arena.planned)
+                .u64(arena.granted)
+                .u64(65536);
+            assert_eq!(
+                &out.done()[1..33],
+                header.done(),
+                "only the NVMe budget is on the wire"
+            );
             let mut resident = Out::default();
             open.write(&mut resident).unwrap();
             assert_eq!(out.done().len(), resident.done().len() + 32);
@@ -2143,8 +2136,8 @@ pub(super) mod tests {
             let back = NodeOpen::read(&mut input).unwrap();
             assert_eq!(back.nvme, paged.nvme);
             assert!(input.end().is_ok());
-            for (node, granted) in [(0, 4096), (1, 0), (1, arena.planned + 1)] {
-                paged.nvme.as_mut().unwrap().node = node;
+            // PIN(2026-10-17): node-zero is retired with the unused ordinal; arena bounds remain.
+            for granted in [0, arena.planned + 1] {
                 paged.nvme.as_mut().unwrap().arena.granted = granted;
                 out.clear();
                 paged.write(&mut out).unwrap();
