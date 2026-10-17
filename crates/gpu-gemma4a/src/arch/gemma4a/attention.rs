@@ -1,6 +1,6 @@
 //! Gemma4a's blocked Transformer-XL shift and strictly bounded causal window.
 
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
+use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
 
 pub const WIDTH: usize = 1024;
@@ -45,7 +45,7 @@ pub fn inputs(tokens: usize) -> (Vec<f32>, Vec<f32>) {
 pub(crate) mod kernels {
     use super::*;
 
-    /// One valid query/head per thread, equivalent to blocking, shifting and trimming.
+    /// One query/head per warp; key dots and value channels keep their serial sum order.
     #[allow(clippy::too_many_arguments, reason = "kernel entry: flat device ABI")]
     #[kernel]
     #[launch_bounds(256)]
@@ -63,18 +63,18 @@ pub(crate) mod kernels {
         fault: bloomery_gpu::FaultSink,
         mut y: DisjointSlice<f32>,
     ) {
-        let i = thread::index_1d().get();
+        let i = thread::index_1d().get() / 32;
         if i >= n as usize * HEADS {
             return;
         }
+        let lane = warp::lane_id() as usize;
         let t = i / HEADS;
         let h = i % HEADS;
         let first = (t + 1).saturating_sub(CONTEXT);
         let count = t - first + 1;
-        let mut scores = [0.0f32; CONTEXT];
-        let mut max = f32::NEG_INFINITY;
-        for j in 0..count {
-            let key = first + j;
+        let mut score = f32::NEG_INFINITY;
+        if lane < count {
+            let key = first + lane;
             let rel = CONTEXT - (t - key);
             let mut ac = 0.0f32;
             let mut bd = 0.0f32;
@@ -85,26 +85,29 @@ pub(crate) mod kernels {
                 bd = a.mul_add(pos[rel * WIDTH + h * HEAD + d], bd);
             }
             let raw = ac + bd;
-            let s = if raw.is_finite() {
+            score = if raw.is_finite() {
                 (raw * (1.0 / 50.0)).tanh() * 50.0
             } else {
                 fault.raise(bloomery_gpu::FaultSite::F32Product);
                 f32::NAN
             };
-            scores[j] = s;
-            max = max.max(s);
         }
+        let mut max = f32::NEG_INFINITY;
+        for j in 0..count {
+            max = max.max(warp::shuffle_f32(score, j as u32));
+        }
+        let weight = (score - max).exp();
         let mut sum = 0.0f32;
         for j in 0..count {
-            scores[j] = (scores[j] - max).exp();
-            sum += scores[j];
+            sum += warp::shuffle_f32(weight, j as u32);
         }
-        for d in 0..HEAD {
+        for d in (lane..HEAD).step_by(32) {
             let mut out = 0.0f32;
             for j in 0..count {
-                out = (scores[j] / sum).mul_add(v[(first + j) * WIDTH + h * HEAD + d], out);
+                let p = warp::shuffle_f32(weight, j as u32) / sum;
+                out = p.mul_add(v[(first + j) * WIDTH + h * HEAD + d], out);
             }
-            // SAFETY: one thread owns each query/head, and d traverses that head only.
+            // SAFETY: one warp owns this query/head; each lane owns distinct channels in it.
             unsafe {
                 *y.get_unchecked_mut(t * WIDTH + h * HEAD + d) = out;
             }

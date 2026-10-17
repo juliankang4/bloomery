@@ -266,7 +266,9 @@ impl Encoder {
             p.mm(stream, &b.k, &s.b, n, &mut s.a, &mut s.k)?;
             p.mm(stream, &b.v, &s.b, n, &mut s.a, &mut s.v)?;
             p.mm(stream, &b.rel, &s.position, RPE, &mut s.a, &mut s.relative)?;
-            let prep = p.attention.prepare_local_attention(config(n * HEADS))?;
+            let prep = p
+                .attention
+                .prepare_local_attention(config(n * HEADS * 32))?;
             p.attention.local_attention(
                 stream,
                 &prep,

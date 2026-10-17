@@ -89,7 +89,7 @@ fn hw_arithmetic_overflow() -> Result<(), GpuError> {
     let v = DeviceBuffer::zeroed(stream, WIDTH)?;
     let pos = DeviceBuffer::zeroed(stream, RPE * WIDTH)?;
     let gain = DeviceBuffer::from_host(stream, &vec![1.0; WIDTH / HEADS])?;
-    let prep = attention.prepare_local_attention(config(HEADS))?;
+    let prep = attention.prepare_local_attention(config(HEADS * 32))?;
     attention.local_attention(
         stream,
         &prep,

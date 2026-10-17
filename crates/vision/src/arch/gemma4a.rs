@@ -12,6 +12,7 @@ pub const SAMPLE_RATE: usize = 16_000;
 pub const CHUNK_SAMPLES: usize = 30 * SAMPLE_RATE;
 pub const MEL_BINS: usize = 128;
 const FFT: usize = 512;
+const _: () = assert!(FFT.is_power_of_two());
 const WINDOW: usize = 320;
 const HOP: usize = 160;
 const BINS: usize = FFT / 2 + 1;
@@ -21,7 +22,13 @@ pub struct Preprocessor {
     hann: [f32; FFT],
     sin: [f32; FFT],
     cos: [f32; FFT],
-    filters: Vec<f32>,
+    bitrev: [usize; FFT],
+    filters: Vec<Filter>,
+}
+
+struct Filter {
+    groups: Vec<(usize, [f32; 4])>,
+    last: f32,
 }
 
 impl Default for Preprocessor {
@@ -59,7 +66,24 @@ impl Default for Preprocessor {
             hann,
             sin,
             cos,
-            filters,
+            bitrev: std::array::from_fn(|i| i.reverse_bits() >> (usize::BITS - FFT.ilog2())),
+            filters: filters
+                .as_chunks::<BINS>()
+                .0
+                .iter()
+                .map(|row| Filter {
+                    groups: row[..BINS - 1]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|(_, weights)| weights.iter().any(|&w| w != 0.0))
+                        .map(|(i, weights)| (4 * i, weights))
+                        .collect(),
+                    last: row[BINS - 1],
+                })
+                .collect(),
         }
     }
 }
@@ -108,14 +132,14 @@ impl Preprocessor {
             )));
         }
         let mut chunks = Vec::with_capacity(pcm.len().div_ceil(CHUNK_SAMPLES));
-        let mut input = [0.0; FFT * 2];
-        let mut output = [0.0; FFT * 8];
+        let mut input = [0.0; FFT];
+        let mut output = [0.0; FFT * 2];
         for pcm in pcm.chunks(CHUNK_SAMPLES) {
             // C++ truncates the signed (samples - 161) / hop toward zero.
             let frames = pcm.len().saturating_sub(WINDOW / 2 + 1) / HOP + 1;
             let mut data = vec![0.0; frames * MEL_BINS];
             for frame in 0..frames {
-                for (j, x) in input[..FFT].iter_mut().enumerate() {
+                for (j, x) in input.iter_mut().enumerate() {
                     let at = frame * HOP + j;
                     *x = if at >= WINDOW / 2 && at - WINDOW / 2 < pcm.len() {
                         self.hann[j] * pcm[at - WINDOW / 2]
@@ -123,7 +147,7 @@ impl Preprocessor {
                         0.0
                     };
                 }
-                self.fft(&mut input, &mut output, FFT);
+                self.fft(&input, &mut output);
                 for k in 0..BINS {
                     let power =
                         output[2 * k] * output[2 * k] + output[2 * k + 1] * output[2 * k + 1];
@@ -132,16 +156,16 @@ impl Preprocessor {
                     }
                     output[k] = power.sqrt();
                 }
-                for (m, filter) in self.filters.as_chunks::<BINS>().0.iter().enumerate() {
-                    // The reference groups four f32 products, then accumulates in f64.
+                for (m, filter) in self.filters.iter().enumerate() {
+                    // Keep the reference's four-product groups and f64 accumulation order.
                     let mut sum = 0.0_f64;
-                    for k in (0..BINS - 3).step_by(4) {
-                        sum += (output[k] * filter[k]
-                            + output[k + 1] * filter[k + 1]
-                            + output[k + 2] * filter[k + 2]
-                            + output[k + 3] * filter[k + 3]) as f64;
+                    for &(k, weights) in &filter.groups {
+                        sum += (output[k] * weights[0]
+                            + output[k + 1] * weights[1]
+                            + output[k + 2] * weights[2]
+                            + output[k + 3] * weights[3]) as f64;
                     }
-                    sum += (output[BINS - 1] * filter[BINS - 1]) as f64;
+                    sum += (output[BINS - 1] * filter.last) as f64;
                     data[m * frames + frame] = sum.max(0.001_f32 as f64).ln() as f32;
                 }
             }
@@ -154,32 +178,29 @@ impl Preprocessor {
         Ok(chunks)
     }
 
-    fn fft(&self, input: &mut [f32], output: &mut [f32], n: usize) {
-        if n == 1 {
-            output[0] = input[0];
-            output[1] = 0.0;
-            return;
+    fn fft(&self, input: &[f32; FFT], output: &mut [f32; FFT * 2]) {
+        for (i, &at) in self.bitrev.iter().enumerate() {
+            output[2 * i] = input[at];
+            output[2 * i + 1] = 0.0;
         }
-        let half = n / 2;
-        for i in 0..half {
-            input[n + i] = input[2 * i];
-        }
-        self.fft(&mut input[n..], &mut output[2 * n..], half);
-        for i in 0..half {
-            input[n + i] = input[2 * i + 1];
-        }
-        self.fft(&mut input[n..], &mut output[3 * n..], half);
-        for k in 0..half {
-            let re = self.cos[k * (FFT / n)];
-            let im = -self.sin[k * (FFT / n)];
-            let re_even = output[2 * n + 2 * k];
-            let im_even = output[2 * n + 2 * k + 1];
-            let re_odd = output[3 * n + 2 * k];
-            let im_odd = output[3 * n + 2 * k + 1];
-            output[2 * k] = re_even + re * re_odd - im * im_odd;
-            output[2 * k + 1] = im_even + re * im_odd + im * re_odd;
-            output[2 * (k + half)] = re_even - re * re_odd + im * im_odd;
-            output[2 * (k + half) + 1] = im_even - re * im_odd - im * re_odd;
+        let mut n = 2;
+        while n <= FFT {
+            let half = n / 2;
+            for chunk in output.chunks_exact_mut(2 * n) {
+                for k in 0..half {
+                    let re = self.cos[k * (FFT / n)];
+                    let im = -self.sin[k * (FFT / n)];
+                    let re_even = chunk[2 * k];
+                    let im_even = chunk[2 * k + 1];
+                    let re_odd = chunk[2 * (k + half)];
+                    let im_odd = chunk[2 * (k + half) + 1];
+                    chunk[2 * k] = re_even + re * re_odd - im * im_odd;
+                    chunk[2 * k + 1] = im_even + re * im_odd + im * re_odd;
+                    chunk[2 * (k + half)] = re_even - re * re_odd + im * im_odd;
+                    chunk[2 * (k + half) + 1] = im_even - re * im_odd - im * re_odd;
+                }
+            }
+            n *= 2;
         }
     }
 }
