@@ -266,6 +266,29 @@ A fixture-tier gate reads two inputs: the family's fixture and the `fx_` referen
    `just refset-publish-dry` is the maintainers' dry run of the dataset (`tools/refset-publish.sh`): it lists every
    file with its sha256 and says which sets are left out (the fixture variants and the DSpark draft sets) and why.
 
+### When a recorded fixture budget is stale
+
+Run `BLOOMERY_BOX_LOCAL=1 just gate-fixture-budget` after updating the planner. It re-plans the fixtures under their
+recorded `bloomery.fixture.card_budget` and requires half the routed experts on every card-eligible layer. A planner
+that counts a new allocation can leave an older fixture one expert short without changing its tensor data. For example,
+the Qwen stage rope table is now counted in the card plan; a qwen38 fixture made before that accounting change can fail
+this check and the qwen4exp e2e and MTP gates.
+
+Regenerate the affected family with the current checkout's `fixture fetch` command from step 2. Use a new output
+directory, since `fetch` refuses an existing one, and keep the old fixture until the replacement passes. For qwen38:
+
+```sh
+mkdir -p /models/fixtures-refresh
+cargo run --release -p bloomery-model --bin fixture -- fetch qwen38 /models/fixtures-refresh/qwen38
+BLOOMERY_FIXTURE_ROOT=/models/fixtures-refresh BLOOMERY_BOX_LOCAL=1 just gate-fixture-budget
+```
+
+`fetch` verifies the generated fixture against the source headers before it returns. Do not patch the recorded budget
+by hand or relax the expert-count check. A changed budget alone does not require new `fx_` sets: the reference-set
+identity excludes the budget, and the fixture's tensor generation is unchanged. A changed seed, source header or
+fixture spec still needs matching reference sets. After checking the replacement, put it at the original
+`/models/fixtures/qwen38` path before running the card gates, so their sets' model paths still match step 1.
+
 ## 5. Timing on your own card
 
 Local mode also times your card, with two runners. Under `BLOOMERY_BOX_CARD=local`, `tools/ref/timing-card.sh` times the
