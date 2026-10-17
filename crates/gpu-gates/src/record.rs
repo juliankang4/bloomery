@@ -2150,7 +2150,11 @@ pub static RESIDENCY_HOST: Kind = Kind {
           unhosted: the set only knows it, a victim is read back from the file), the seed experts \
           a layer kept on the stage card, the churn pool (the stage card's experts past them) and \
           its bytes, and the plan's host headroom before and after a hosted pool and any bytes \
-          the load hosts beside the plan.",
+          the load hosts beside the plan. Headroom is plan arithmetic, not free RAM. host_figure \
+          names the host figure's source: nominal-A6000-workstation is the reference \
+          workstation's declared host, machine is the plan machine's own figure; host_usable \
+          is that figure before reserves. A read room binds the load separately. Older records \
+          omit the figure fields.",
     parts: &[
         key("residency", Word, ""),
         key("hosted", Word, ""),
@@ -2159,6 +2163,8 @@ pub static RESIDENCY_HOST: Kind = Kind {
         key("churn_bytes", U64, "B"),
         key("headroom", I64, "B"),
         key("headroom_after", I64, "B"),
+        opt("host_figure", Word, ""),
+        opt("host_usable", U64, "B"),
     ],
 };
 
@@ -4287,6 +4293,13 @@ pub fn residency_host_beside(
     plan: &Plan<'_>,
     beside: u64,
 ) -> Record {
+    use model::placement::workstation::{HOST_USABLE, OS_OTHER, OS_RESERVE};
+    let host = plan.machine.host();
+    let nominal = host.usable_bytes == HOST_USABLE
+        && host
+            .reserves
+            .iter()
+            .any(|(name, bytes)| name == OS_RESERVE && *bytes == OS_OTHER);
     let (hosted, after) = match hosting {
         ChurnHosting::Hosted => ("hosted", pool.headroom_after(plan)),
         ChurnHosting::Unhosted => ("unhosted", plan.host.headroom_bytes),
@@ -4299,6 +4312,15 @@ pub fn residency_host_beside(
         .u("churn_bytes", pool.bytes)
         .u("headroom", plan.host.headroom_bytes)
         .u("headroom_after", after - i128::from(beside))
+        .w(
+            "host_figure",
+            if nominal {
+                "nominal-A6000-workstation"
+            } else {
+                "machine"
+            },
+        )
+        .u("host_usable", host.usable_bytes)
 }
 
 /// A residency boundary's record, of a machine driven directly
@@ -5716,6 +5738,68 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn residency_host_names_the_plans_host_figure() {
+        use model::placement::{Host, KvBytes, ModelTensors, UnifiedPool, plan_with, workstation};
+        struct NoKv;
+        impl KvBytes for NoKv {
+            fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+                0
+            }
+        }
+        let model = ModelTensors {
+            tensors: Vec::new(),
+            layers: 1,
+            experts: 8,
+            experts_used: 2,
+        };
+        let pool = model::placement::churn::ChurnPool {
+            pinned: 0,
+            runs: Vec::new(),
+            experts: 0,
+            bytes: 0,
+        };
+        let mut reserved = workstation::host();
+        reserved.reserves.push(("pins".to_string(), 1 << 30));
+        for (host, unified, source) in [
+            (workstation::host(), None, "nominal-A6000-workstation"),
+            (reserved, None, "nominal-A6000-workstation"),
+            (
+                Host {
+                    usable_bytes: 64 << 30,
+                    reserves: Vec::new(),
+                },
+                None,
+                "machine",
+            ),
+            (
+                Host {
+                    usable_bytes: 128 << 30,
+                    reserves: Vec::new(),
+                },
+                Some(UnifiedPool { bytes: 128 << 30 }),
+                "machine",
+            ),
+        ] {
+            let mut machine = workstation::plan_on(workstation::A6000, 1);
+            *machine.host_mut() = host;
+            *machine.unified_mut() = unified;
+            let mut plan = plan_with(&model, &machine, 1, &NoKv, None).unwrap();
+            let before = plan.host.headroom_bytes;
+            plan.plan_at(&(16 << 30, workstation::HostRead::MemAvailable));
+            assert_eq!(plan.host.headroom_bytes, before);
+            for hosting in [ChurnHosting::Hosted, ChurnHosting::Unhosted] {
+                let line = residency_host_beside("mid-p0-s1", hosting, &pool, &plan, 0).line();
+                let fields = Log::of(&line, &[&RESIDENCY_HOST])
+                    .one(&RESIDENCY_HOST)
+                    .unwrap();
+                assert_eq!(fields.word("host_figure"), Ok(source));
+                assert_eq!(fields.u64("host_usable"), Ok(machine.host().usable_bytes));
+                assert_eq!(fields.i64("headroom"), Ok(i64::try_from(before).unwrap()));
+            }
+        }
     }
 
     /// A field read is refused by name when the kind has no such field, when
