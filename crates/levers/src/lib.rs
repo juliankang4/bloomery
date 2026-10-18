@@ -212,7 +212,7 @@ impl Kind {
                     let a: SocketAddr = a.parse().map_err(|_| refused(None))?;
                     if !tier_ip(a.ip()) {
                         return Err(refused(Some(
-                            "a tier node needs a loopback or private IPv4 address",
+                            "a tier node needs a loopback, private or 198.18.0.0/15 IPv4 address",
                         )));
                     }
                     if addrs.contains(&a) {
@@ -258,7 +258,7 @@ impl Kind {
             ),
             Kind::Text => "what its owner takes".to_string(),
             Kind::Addrs => {
-                "loopback or private IPv4 IP:port socket addresses, comma-separated, at least one, none twice"
+                "loopback, private or 198.18.0.0/15 IPv4 IP:port socket addresses, comma-separated, at least one, none twice"
                     .to_string()
             }
             Kind::Residency => {
@@ -2598,10 +2598,14 @@ pub fn tier_link() -> Result<TierLink, LeverError> {
     }
 }
 
-/// Whether a tier's explicit listen or connect address is on a trusted local network.
+/// Whether a tier's explicit listen or connect address is on a trusted local network:
+/// loopback, private IPv4 (RFC 1918), or the benchmarking range 198.18.0.0/15
+/// (RFC 2544), which fabric tools give back-to-back links between machines.
 #[must_use]
 pub fn tier_ip(ip: std::net::IpAddr) -> bool {
-    ip.is_loopback() || matches!(ip, std::net::IpAddr::V4(v) if v.is_private())
+    ip.is_loopback()
+        || matches!(ip, std::net::IpAddr::V4(v)
+            if v.is_private() || (v.octets()[0] == 198 && v.octets()[1] & 0xfe == 18))
 }
 
 /// `BLOOMERY_TIER_NODES` from the process environment ([`TIER_NODES`]),

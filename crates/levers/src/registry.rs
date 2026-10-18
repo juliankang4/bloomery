@@ -376,7 +376,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Where a placed load's expert tiers run: the address of each tier's node, in the \
               plan's tier order, one a tier, where a `tier_server` process serves that tier's \
               card over its control channel. A loopback node can map the stage's file under \
-              `/dev/shm`. A private IPv4 node off this host requires `BLOOMERY_TIER_LINK=rdma`: \
+              `/dev/shm`. A private or 198.18.0.0/15 IPv4 node off this host requires `BLOOMERY_TIER_LINK=rdma`: \
               each process holds its own page and exchanges its endpoint on the channel. The \
               channel has no authentication and belongs on a trusted network. The plan takes \
               each tier card from its node's census. \

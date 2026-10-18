@@ -13,7 +13,7 @@
 //! headers and bytes (each row's sha256). It serves Qwen3.8's tier family,
 //! and V4.1's and GLM's when built with the `deepseek41` or `glm5next`
 //! feature; an open of another family is refused by name. The explicit
-//! listen address is loopback or private IPv4. Off-host nodes bind their
+//! listen address is loopback, private or 198.18.0.0/15 IPv4. Off-host nodes bind their
 //! own RDMA pages over this control channel, which has no authentication and belongs on a trusted network.
 //! A port of 0 takes a free
 //! one. The server prints `listening on <ip:port>` once bound, serves one
@@ -61,7 +61,7 @@ mod server {
         let listen = listen.ok_or(USAGE)?;
         if !bloomery_levers::tier_ip(listen.ip()) {
             return Err(format!(
-                "--listen {listen}: a tier server needs a loopback or private IPv4 address; \
+                "--listen {listen}: a tier server needs a loopback, private or 198.18.0.0/15 IPv4 address; \
                  the control channel has no authentication"
             )
             .into());

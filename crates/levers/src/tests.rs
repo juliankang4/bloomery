@@ -1886,8 +1886,25 @@ fn remote_nodes_require_private_addresses_and_rdma() {
     for address in ["127.0.0.1:7340", "[::1]:7340"] {
         assert!(read(&env(&[(TIER_NODES, address)]), Scope::TierNodes).is_ok());
     }
-    for ip in ["0.0.0.0", "8.8.8.8", "224.0.0.1", "::", "fe80::1"] {
+    for ip in [
+        "0.0.0.0",
+        "8.8.8.8",
+        "224.0.0.1",
+        "::",
+        "fe80::1",
+        "198.17.255.255",
+        "198.20.0.1",
+    ] {
         assert!(!tier_ip(ip.parse().expect("an IP address")), "{ip}");
+    }
+    for ip in [
+        "10.200.23.1",
+        "172.16.0.1",
+        "192.168.1.2",
+        "198.18.4.1",
+        "198.19.255.254",
+    ] {
+        assert!(tier_ip(ip.parse().expect("an IP address")), "{ip}");
     }
 }
 

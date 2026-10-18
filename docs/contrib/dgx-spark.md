@@ -777,7 +777,7 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
 5. **The remote is another process.** Built and proved as two processes on one Spark, over the loopback interface.
    Node 1 runs `tier_server`, which serves the expert tier of one load over a control channel
    (`crates/gpu/src/host/node.rs`): TCP, one connection a load, one reply a request, then it exits.
-   `BLOOMERY_TIER_NODES` names the node of each tier; it takes loopback or private IPv4 addresses. An off-host node
+   `BLOOMERY_TIER_NODES` names the node of each tier; it takes loopback, private or 198.18.0.0/15 (benchmarking range) IPv4 addresses. An off-host node
    requires `BLOOMERY_TIER_LINK=rdma`. The unauthenticated control channel belongs on a trusted network.
    On connect node 1 sends its census: each device's census row, its own available host room and its arena override.
    The load (`Place::on`) and the gate read it with one function (`node_cards`) and plan (b′) with node 1's card as
@@ -1308,7 +1308,7 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   with the N − 1 plan on the same link, which the planner can choose, not on the N − 1 plan's own fabric.
 - The placement half's engine side: the contributor (answer 20). A remote node's census reaches node 0 over the
   control channel before the plan, and the load plans with node 1's card from it (9.5 item 5); a tier node is on this
-  host through a shared file, or private IPv4 nodes through independent RDMA ends (no authentication). The node
+  host through a shared file, or off-host IPv4 nodes through independent RDMA ends (no authentication). The node
   gate constructs independent census-backed machines and their `NodeBudget` and `Terms` inputs (9.2); the load
   retains the conservative single-pool bound. Left: the adapter from routed assignment to loaded rows and
   independent capacity in the load, the router's counts in the split (9.2), and decode at n = N in the predictor
