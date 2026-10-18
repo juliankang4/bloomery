@@ -385,8 +385,8 @@ pub fn half_to_f32(bits: u16) -> f32 {
 
 /// f32 → f16 bits, round-to-nearest-even — `vcvtps2ph $0x0` on the reference build (AVX2 +
 /// F16C, not AVX-512). Subnormals, ties and infinities follow IEEE; a NaN stays a NaN of
-/// its sign (quiet, payload dropped), so a cache row or query staged from a refused value
-/// is never a plausible number.
+/// its sign (quiet, payload dropped: `sign | 0x7e00`), so a cache row or query staged from
+/// a refused value is never a plausible number.
 ///
 /// The inverse of [`half_to_f32`]: every f16 but NaN comes back as its own bits. The
 /// engine's one f32 → f16 rounding: the CPU and GPU KV caches, the GPU tensor-core query

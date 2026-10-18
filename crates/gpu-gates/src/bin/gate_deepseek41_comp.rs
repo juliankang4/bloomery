@@ -83,9 +83,10 @@ mod gate {
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
 
-    /// What the gate fills a cache with before a launch: an f16 NaN, which
-    /// `f32_to_f16_bits` never writes (it rounds a NaN to infinity), so a
-    /// row still holding it was not written.
+    /// What the gate fills a cache with before a launch: an f16 NaN that
+    /// `f32_to_f16_bits` never writes (it turns every NaN into the canonical
+    /// `sign | 0x7e00`, whose payload differs), so a row still holding it was
+    /// not written.
     const SENTINEL: u16 = 0xffff;
 
     /// What the gate fills an f32 buffer with that a kernel must not read: a

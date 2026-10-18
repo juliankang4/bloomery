@@ -1,10 +1,12 @@
 //! The engine's one f32 → f16 rounding, `gguf::quant::f32_to_f16_bits`, against
 //! the CPU's own IEEE converter (F16C `vcvtps2ph`, round to nearest even) over
 //! every f32 bit pattern: every input that is not a NaN rounds to the
-//! converter's bits, and every NaN comes out a NaN of its own sign. The first
-//! half is what every KV-cache write and tensor-core query row depends on, on
-//! the host and on the card, so this enumeration is its proof; the second is
-//! the refusal contract — a NaN is never turned into an infinity or a number.
+//! converter's bits, and every NaN comes out the canonical quiet NaN of its own
+//! sign, `sign | 0x7e00`. The first half is what every KV-cache write and
+//! tensor-core query row depends on, on the host and on the card, so this
+//! enumeration is its proof; the second is the refusal contract — a NaN is
+//! never turned into an infinity or a number, nor into the all-ones 0xffff the
+//! gates fill a cache with to mark a row unwritten.
 
 #[cfg(target_arch = "x86_64")]
 use gguf::quant::f32_to_f16_bits;
@@ -43,7 +45,8 @@ struct Tally {
     /// Non-NaN inputs whose bits differ from the converter's, and the first.
     finite_bad: u64,
     first_finite_bad: Option<u32>,
-    /// NaN inputs whose output is not a NaN of the input's sign, and the first.
+    /// NaN inputs whose output is not the canonical NaN of the input's sign,
+    /// and the first.
     nan_bad: u64,
     first_nan_bad: Option<u32>,
 }
@@ -84,9 +87,8 @@ unsafe fn scan(lo: u64, hi: u64) -> Tally {
         t.checked += 1;
         if x.is_nan() {
             t.nans += 1;
-            let is_nan = got & 0x7c00 == 0x7c00 && got & 0x03ff != 0;
-            let same_sign = u32::from(got >> 15) == bits >> 31;
-            if !(is_nan && same_sign) {
+            let canonical = ((bits >> 16) & 0x8000) as u16 | 0x7e00;
+            if got != canonical {
                 t.nan_bad += 1;
                 t.first_nan_bad = min_some(t.first_nan_bad, Some(bits));
             }
@@ -144,8 +146,8 @@ fn hw_f32_to_f16_bits_is_ieee_rne_on_every_input() {
         };
         println!(
             "f32_to_f16_bits: {} inputs on {threads} threads in {:.1} s, {} NaN; non-NaN inputs off \
-             F16C's round-to-nearest-even bits {} (first {}); NaN inputs not a NaN of their sign {} \
-             (first {})",
+             F16C's round-to-nearest-even bits {} (first {}); NaN inputs not the canonical NaN of \
+             their sign {} (first {})",
             all.checked,
             t0.elapsed().as_secs_f64(),
             all.nans,
@@ -162,7 +164,7 @@ fn hw_f32_to_f16_bits_is_ieee_rne_on_every_input() {
         );
         assert_eq!(
             all.nan_bad, 0,
-            "a NaN input came out as something other than a NaN of its sign"
+            "a NaN input came out as something other than the canonical NaN of its sign"
         );
     }
 }

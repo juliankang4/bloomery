@@ -86,9 +86,10 @@ mod gate {
     /// from another libm would move — layer 2 prints whether ours does.
     const ROPE_ULP_BAND: u32 = 1;
 
-    /// What the gate fills the ring with before an append: an f16 NaN, which
-    /// `f32_to_f16_bits` never writes (it rounds a NaN to infinity), so a
-    /// slot still holding it was not written.
+    /// What the gate fills the ring with before an append: an f16 NaN that
+    /// `f32_to_f16_bits` never writes (it turns every NaN into the canonical
+    /// `sign | 0x7e00`, whose payload differs), so a slot still holding it was
+    /// not written.
     const SENTINEL: u16 = 0xffff;
 
     /// What a rope row is, from its op and name. A head site carries its
