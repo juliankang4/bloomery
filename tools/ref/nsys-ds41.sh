@@ -112,7 +112,8 @@
 # $BLOOMERY_DATA/nsys), BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_GEN_PLACE
 # and BLOOMERY_TIMING_CARDS (Placement above), BLOOMERY_ARM_BOUND (seconds one profile may run,
 # default 900), BLOOMERY_DRY=1 (the command lines, then exit before the binary check and the
-# lease; the decode recipe builds nothing under it either, like the prefill one).
+# lease; the decode recipe builds nothing under it either, like the prefill one), NSYS (default the
+# profiler of the toolkit CUDA_TOOLKIT_PATH names, as nsys-gpu.sh's, else /usr/local/cuda/bin/nsys).
 set -uo pipefail
 # The bounded child's owner (bounded): --analyze and --self-test run before the lease is sourced.
 # shellcheck source=tools/gate-bound.sh
@@ -664,7 +665,7 @@ else
   done
 fi
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate_ds41}
-NSYS=${NSYS:-/usr/local/cuda/bin/nsys}
+NSYS=${NSYS:-${CUDA_TOOLKIT_PATH:-/usr/local/cuda}/bin/nsys}
 OUTDIR=${BLOOMERY_NSYS_OUT:-$BLOOMERY_DATA/nsys}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness; this

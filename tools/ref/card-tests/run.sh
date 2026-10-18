@@ -1464,10 +1464,11 @@ fi
 if [ ! -e /root/bloomery-cpu.lock ]; then
   P=$tmp/profile
   mkdir -p "$P"
-  cp "$ROOT/tools/ref/nsys-gpu.sh" "$P/"
+  cp "$ROOT/tools/ref/nsys-gpu.sh" "$ROOT/tools/ref/gguf-ranges.py" "$P/"
   # The runner reads the owner one directory up, as tools/ref/ reads tools/gate-bound.sh.
   cp "$ROOT/tools/gate-bound.sh" "$P/../"
-  printf 'MODEL_NAME=qwen35moe MODEL=/stub/model.gguf BLOOMERY_DATA=/stub\n' > "$P/ref-paths.sh"
+  # The profile is qwen35moe unless a case names another (STUB_MODEL_NAME).
+  echo "MODEL_NAME=\${STUB_MODEL_NAME:-qwen35moe} MODEL=/stub/model.gguf BLOOMERY_DATA=/stub" > "$P/ref-paths.sh"
   printf 'source %q\nassert_fresh_binary() { :; }\n' "$ROOT/tools/ref/timing-card.sh" > "$P/timing-card.sh"
   cat > "$P/lease.sh" << 'LEASE'
 lease_take() {
@@ -1485,7 +1486,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 case $kind in
-  profile) touch "$STUB_AFTER"; echo 'time prompt n=9 ms=1.000 tok/s=9000 passes=1 kind=stub' ;;
+  profile)
+    # A qwen4exp child sees the runner's BLOOMERY_DRAFT=off, or the stub fails the arm.
+    [ "${STUB_MODEL_NAME:-}" != qwen4exp ] || [ "${BLOOMERY_DRAFT:-}" = off ]
+    touch "$STUB_AFTER"; echo "time prompt n=9 ms=1.000 tok/s=9000 passes=${STUB_PASSES:-1} kind=stub"; printf 'time step %d ms=0.5%d0\n' 1 1 2 2 3 3
+    ;;
   export) cp "$STUB_DB" "$out" ;;
   --version) echo 'stub nsys' ;;
 esac
@@ -1494,24 +1499,51 @@ NSYS
   python3 - "$P" << 'PY'
 import sqlite3, sys
 from pathlib import Path
-for name, marker, count in [("good", "embed_rows_q4k", 4), ("missing", "other", 4), ("count", "embed_rows_q4k", 3)]:
+dbs = [(name, marker, [(i * 1000 + j * 100, i * 1000 + j * 100 + 50, j + 1) for i in range(count) for j in range(2)])
+       for name, marker, count in [("good", "embed_rows_q4k", 4), ("missing", "other", 4), ("count", "embed_rows_q4k", 3)]]
+# Two prompt units, then three replays: window i opens at i * 100 us and is 15 + 5 i us wide, so each row names its window.
+dbs.append(("k2", "embed_rows_q4k",
+            [r for i in range(5) for r in ((i * 100000, i * 100000 + 5000, 1), (i * 100000 + 10000, i * 100000 + 15000 + 5000 * i, 2))]))
+for name, marker, rows in dbs:
     with sqlite3.connect(Path(sys.argv[1]) / (name + ".sqlite")) as db:
         db.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
         db.executemany("INSERT INTO StringIds VALUES (?, ?)", [(1, marker), (2, "gemv_q4k")])
         db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER, end INTEGER, shortName INTEGER, gridX INTEGER, gridY INTEGER, gridZ INTEGER)")
-        db.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, ?, 1, 1, 1)",
-                       [(i * 1000 + j * 100, i * 1000 + j * 100 + 50, j + 1) for i in range(count) for j in range(2)])
+        db.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, ?, 1, 1, 1)", rows)
 PY
   prof() { # <name> <rc> <pattern> [NAME=value...]
     local name=$1 want=$2 pat=$3
     shift 3
     run "nsys local: $name" "$want" "$pat" env -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_DRAFT \
       -u STUB_GONE -u STUB_GONE_AFTER -u STUB_UUID_RC -u STUB_UUID_WARN -u STUB_JOURNAL -u STUB_BEFORE -u BLOOMERY_DRY \
+      -u STUB_MODEL_NAME -u STUB_PASSES -u CUDA_TOOLKIT_PATH \
       PATH="$C/local:$PATH" BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/ld" STUB_UUIDS="$FAKE_GB10" \
       BLOOMERY_NSYS_DEPTHS=9 BLOOMERY_NSYS_N=4 BLOOMERY_NSYS_MARKER=embed_rows_q4k BLOOMERY_NSYS_FORM= \
       BLOOMERY_NSYS_OUT="$P/$n-out" NSYS="$P/nsys" STUB_AFTER="$P/$n-after" STUB_DB="$P/good.sqlite" \
       "$@" bash "$P/nsys-gpu.sh"
   }
+  # The boundary entry of a split set whose table is in its second shard (the first holds metadata only), a set
+  # with no table at all, and one file without the -NNNNN-of-MMMMM suffix whose header says split.count 1.
+  python3 - "$P" << 'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("g", sys.argv[1] + "/gguf-ranges.py")
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+for name, second in [("split", [("token_embd.weight", 8, [32, 2], bytes(68))]), ("bare", [("output.weight", 0, [8, 2], bytes(64))])]:
+    first = f"{sys.argv[1]}/{name}-00001-of-00002.gguf"
+    base = [g._kv_string("general.architecture", "qwen4exp"), g._kv_scalar("split.count", 2, 2)]
+    g.write_gguf(first, base + [g._kv_scalar("split.no", 2, 0)], [])
+    g.write_gguf(first.replace("-00001-", "-00002-"), base + [g._kv_scalar("split.no", 2, 1)], second)
+g.write_gguf(f"{sys.argv[1]}/model.gguf", [g._kv_string("general.architecture", "qwen4exp"), g._kv_scalar("split.count", 2, 1),
+             g._kv_scalar("split.no", 2, 0), g._kv_scalar("split.tensors.count", 5, 1)],
+             [("token_embd.weight", 8, [32, 2], bytes(68))])
+PY
+  run 'nsys marker: a split set finds token_embd in its second shard' 0 '^embed_rows_q8_0 \(Q8_0\)$' \
+    bash "$P/nsys-gpu.sh" --marker "$P/split-00001-of-00002.gguf"
+  run 'nsys marker: a set without token_embd is refused by name' 65 'no token_embd.weight in the header of any of its 2 shard\(s\)' \
+    bash "$P/nsys-gpu.sh" --marker "$P/bare-00001-of-00002.gguf"
+  run 'nsys marker: one file with split.count 1 and no shard suffix reads its own table' 0 '^embed_rows_q8_0 \(Q8_0\)$' \
+    bash "$P/nsys-gpu.sh" --marker "$P/model.gguf"
   prof 'healthy seed arm produces a table' 0 '\[boundary\].* -> OK'
   has 'nsys local: healthy seed prefill window contains only its kernels' '\[window 0 = depth 8 \(the seeded prompt.s one id, eager prefill pass\)\] 커널 2개 '
   has 'nsys local: healthy seed replay window contains only its kernels' '\[window 2 = depth 10 \(replay\)\] 커널 2개 '
@@ -1528,6 +1560,33 @@ PY
   prof 'wrong seed step count refuses the table' 3 'MISMATCH' STUB_DB="$P/count.sqlite"
   prof 'missing prefill marker refuses the table' 3 'MISMATCH' STUB_DB="$P/missing.sqlite" BLOOMERY_NSYS_FORM=prefill
   prof 'wrong prefill step count refuses the table' 3 'MISMATCH' STUB_DB="$P/count.sqlite" BLOOMERY_NSYS_FORM=prefill
+  # qwen4exp has no seed form: its decode form profiles a real prompt of D ids and the replays after it.
+  prof 'qwen4exp decode form counts the prompt unit and the replays' 0 \
+    '\[boundary\] kernel embed_rows_q4k: 4 launches, expected 1 prompt unit\(s\) \+ n - 1 replays = 4 -> OK' STUB_MODEL_NAME=qwen4exp
+  has 'nsys local: qwen4exp decode prompt row holds its unit and the head' '^ +prompt +0-8 +prefill +1\.0000 .* 2$'
+  has 'nsys local: qwen4exp decode first replay row is depth 9 and time step 1' '^ +1 +9 +replay +0\.5100 .* 2$'
+  has 'nsys local: qwen4exp decode replay window contains only its kernels' '\[replay 2 = depth 10 \(replay\)\] 커널 2개 '
+  has 'nsys local: qwen4exp decode last window contains only its kernels' '\[replay 3 = depth 11 \(last decode replay\)\] 커널 2개 '
+  # Two prompt units: the replays start at the third window, and each row keeps its own `time step`.
+  prof 'qwen4exp decode form counts two prompt units' 0 \
+    '\[boundary\] kernel embed_rows_q4k: 5 launches, expected 2 prompt unit\(s\) \+ n - 1 replays = 5 -> OK' \
+    STUB_MODEL_NAME=qwen4exp STUB_PASSES=2 STUB_DB="$P/k2.sqlite"
+  has 'nsys local: qwen4exp decode prompt row spans both units' '^ +prompt +0-8 +prefill +1\.0000 +200\.0 +120\.0 .* 4$'
+  has 'nsys local: qwen4exp decode replay 1 is the window after both units' '^ +1 +9 +replay +0\.5100 +100\.0 +25\.0 .* 2$'
+  has 'nsys local: qwen4exp decode replay 2 is its own window and step' '^ +2 +10 +replay +0\.5200 +100\.0 +30\.0 .* 2$'
+  has 'nsys local: qwen4exp decode replay 3 is the last window and step' '^ +3 +11 +replay +0\.5300 +nan +35\.0 .* 2$'
+  prof 'qwen4exp decode form refuses a wrong step count' 3 'MISMATCH' STUB_DB="$P/count.sqlite" STUB_MODEL_NAME=qwen4exp
+  prof 'qwen4exp prefill form profiles generate_qwen3moe' 0 '\[prefill window: P = 9, 1 unit\(s\) and the head\] kernels 2 ' \
+    STUB_MODEL_NAME=qwen4exp BLOOMERY_NSYS_FORM=prefill
+  prof 'qwen4exp dry run plans the plain prompt on generate_qwen3moe' 0 \
+    "^\\[dry\\] depth 9: env BLOOMERY_REF_MODEL=/stub/model.gguf timeout --kill-after=10 900 $P/nsys profile .* target/release/generate_qwen3moe --tokens <lcg_prompt 9> -n 4 --ctx 256 --mode graph --time\$" \
+    STUB_MODEL_NAME=qwen4exp BLOOMERY_DRY=1
+  has 'nsys local: qwen4exp dry run names the plain path' '^\[dry\] depth 9: file /stub/model.gguf, token_embd by-hand, BLOOMERY_DRAFT=off$'
+  prof 'qwen4exp refuses a drafted profile' 64 'BLOOMERY_DRAFT=mtp: a qwen4exp profile runs the plain path' STUB_MODEL_NAME=qwen4exp BLOOMERY_DRAFT=mtp
+  # NSYS empty or unset: the profiler of CUDA_TOOLKIT_PATH's toolkit, else /usr/local/cuda's.
+  prof 'an empty NSYS takes the toolkit of CUDA_TOOLKIT_PATH' 0 ' /stub/cuda-13\.3/bin/nsys profile ' \
+    BLOOMERY_DRY=1 NSYS= CUDA_TOOLKIT_PATH=/stub/cuda-13.3
+  prof 'an empty NSYS without CUDA_TOOLKIT_PATH takes /usr/local/cuda' 0 ' /usr/local/cuda/bin/nsys profile ' BLOOMERY_DRY=1 NSYS=
 fi
 
 # A runner that sources the bounded-child owner (tools/gate-bound.sh) and finds it missing stops by name, 70 and the shell's own

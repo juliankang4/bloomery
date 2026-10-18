@@ -193,9 +193,10 @@ def nbytes(path, name, ty, dims):
 
 
 def shard_paths(first, meta):
-    """Every shard of the set the first shard opens, in order."""
+    """Every shard of the set the first shard opens, in order. No split.count, or a count of 1, is the one file
+    under any name (crates/gguf Split::open)."""
     count = meta.get("split.count")
-    if count is None:
+    if count is None or count == 1:
         return [first]
     m = SPLIT.search(first)
     if not m or int(m.group(1)) != 1 or int(m.group(2)) != count:
@@ -507,6 +508,18 @@ def self_test():
               and blob[p0[1][1]:p0[1][1] + 660] == b"\3" * 660, p0)
         _, _, sel0, _, _ = host_set(first, 0, None)
         check("K=0 is token_embd alone", [n for _, n, _, _ in sel0] == ["token_embd.weight"], sel0)
+        # One file whose header says split.count 1 opens without the -NNNNN-of-MMMMM suffix, as crates/gguf's
+        # Split::open opens it.
+        one = os.path.join(d, "one.gguf")
+        write_gguf(one, [_kv_string("general.architecture", "tst"), _kv_scalar("tst.block_count", 4, 1),
+                         _kv_scalar("split.count", 2, 1), _kv_scalar("split.no", 2, 0)],
+                   [("token_embd.weight", 0, [8, 3], b"\1" * 96)])
+        try:
+            _, shards1, sel1, _, _ = host_set(one, 0, None)
+            check("split.count 1 without a shard suffix is the one file",
+                  shards1 == 1 and [n for _, n, _, _ in sel1] == ["token_embd.weight"], (shards1, sel1))
+        except Refusal as e:
+            check("split.count 1 without a shard suffix is the one file", False, (e.code, str(e)))
         for args, code, what in (((first, 3, None), 64, "K past block_count"),
                                  ((first, 1, 2), 64, "-ngl below block_count + 1")):
             try:

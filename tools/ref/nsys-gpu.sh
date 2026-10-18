@@ -61,6 +61,18 @@
 # window's wall and the binary's `time prompt ms=` (that wall also holds the host work before the first
 # launch and the token's readback). N >= 2, so that a replay closes the window.
 #
+# qwen4exp (BLOOMERY_MODEL=qwen4exp): generate_qwen3moe refuses --seed-depth on it (no synthetic depth for its delta
+# states), so its decode steps follow a real prompt. Unset BLOOMERY_NSYS_FORM is the decode form: each entry is a
+# depth D, the profiled command is the prefill form's at P = D, and the boundary count is the same K + N - 1. The
+# table has one row for the prompt (its K units and the head) and one for each replay i = 1 .. N - 1, at depth
+# D + i - 1 and the run's `time step i`, then the kernel tables of the last two replays. N >= 3, as in the seed form.
+# BLOOMERY_NSYS_FORM=prefill takes the prefill form above. Both run the plain path (BLOOMERY_DRAFT=off): a draft's
+# passes launch the embedding gather too, so a drafted run would not keep the count. The boundary is the file's
+# token_embd gather, as above: embed_rows_q8_0 on the Q8_0 table the qwen4exp program reads.
+#
+# NSYS defaults to the profiler of the toolkit CUDA_TOOLKIT_PATH names, $CUDA_TOOLKIT_PATH/bin/nsys (as
+# tools/ptx-scan.sh takes its ptxas), else /usr/local/cuda/bin/nsys.
+#
 #   bash tools/ref/nsys-gpu.sh --analyze <out>.sqlite <depth> <n> [<out>.txt]   # tables again, no profile
 #   bash tools/ref/nsys-gpu.sh --marker <file>                                  # the boundary entry of a file
 #   BLOOMERY_DRY=1 ...                                                          # command lines, no lease
@@ -74,24 +86,31 @@ source "${BASH_SOURCE[0]%/*}/../gate-bound.sh" || exit 70
 HERE=${BASH_SOURCE[0]%/*}
 # shellcheck source=tools/ref/ref-paths.sh
 source "$HERE/ref-paths.sh"
-# The profiles generate_qwen3moe opens: the seed and prefill forms are its, the prompt form is `generate`'s.
-case $MODEL_NAME in qwen3moe | qwen35moe) GEN_QWEN3MOE=1 ;; *) GEN_QWEN3MOE= ;; esac
+# The profiles generate_qwen3moe opens: the seed, decode and prefill forms are its, the prompt form is `generate`'s.
+case $MODEL_NAME in qwen3moe | qwen35moe | qwen4exp) GEN_QWEN3MOE=1 ;; *) GEN_QWEN3MOE= ;; esac
 FORM=prompt
 [ -z "$GEN_QWEN3MOE" ] || FORM=seed
+[ "$MODEL_NAME" != qwen4exp ] || FORM=decode
 case ${BLOOMERY_NSYS_FORM:-} in
   '') ;;
   prefill)
-    [ -n "$GEN_QWEN3MOE" ] || { echo "nsys-gpu.sh: BLOOMERY_NSYS_FORM=prefill profiles generate_qwen3moe (BLOOMERY_MODEL=qwen3moe or qwen35moe); the profile is '$MODEL_NAME'" >&2; exit 64; }
+    [ -n "$GEN_QWEN3MOE" ] || { echo "nsys-gpu.sh: BLOOMERY_NSYS_FORM=prefill profiles generate_qwen3moe (BLOOMERY_MODEL=qwen3moe, qwen35moe or qwen4exp); the profile is '$MODEL_NAME'" >&2; exit 64; }
     FORM=prefill
     ;;
   *) echo "nsys-gpu.sh: BLOOMERY_NSYS_FORM is prefill or unset, got '$BLOOMERY_NSYS_FORM'" >&2; exit 64 ;;
 esac
+if [ "$MODEL_NAME" = qwen4exp ]; then
+  case ${BLOOMERY_DRAFT:-off} in
+    off) export BLOOMERY_DRAFT=off ;;
+    *) echo "nsys-gpu.sh: BLOOMERY_DRAFT=$BLOOMERY_DRAFT: a qwen4exp profile runs the plain path (its boundary count is the plain decode's)" >&2; exit 64 ;;
+  esac
+fi
 if [ "$FORM" != prompt ]; then BIN=${BLOOMERY_GEN_BIN:-target/release/generate_qwen3moe}; else BIN=${BLOOMERY_GEN_BIN:-target/release/generate}; fi
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 DEPTH_N=${BLOOMERY_DECODE_N:-96}
 GEN_CTX=${BLOOMERY_GEN_CTX:-}
 DRY=${BLOOMERY_DRY:-}
-NSYS=${NSYS:-/usr/local/cuda/bin/nsys}
+NSYS=${NSYS:-${CUDA_TOOLKIT_PATH:-/usr/local/cuda}/bin/nsys}
 if [ "$FORM" = prefill ]; then DEPTHS=${BLOOMERY_NSYS_DEPTHS:-4096}; else DEPTHS=${BLOOMERY_NSYS_DEPTHS:-6 4096}; fi
 MODE=${BLOOMERY_NSYS_MODE:-graph}
 # 디코드 스텝 수. 마지막 재생을 표로 내고, 그 앞 재생을 대조로 낸다.
@@ -113,21 +132,31 @@ ks = [(s, e, names.get(n, str(n)).split("(")[0], (gx, gy, gz)) for s, e, n, gx, 
 print(f"    커널 런치 전체 {len(ks)}개")
 from collections import Counter
 cnt = Counter(k[2] for k in ks)
-if form == "prefill":
+if form in ("seed", "prefill", "decode"):
+    # The run's own lines: `time step i` is replay i's time, `time prompt` the prompt's (not in the seed form);
+    # those and the load lines are echoed with the tables.
+    units = p_n = p_ms = None
+    timed, echo = {}, []
+    keep = ("load ", "capture ", "step 0 ") + (("seed ", "SMOKE ") if form == "seed" else ())
+    try:
+        for line in open(runlog):
+            st = re.match(r"time step (\d+)( warm)? ms=([0-9.]+)", line)
+            m = form != "seed" and re.match(r"time prompt n=(\d+) ms=([0-9.]+) tok/s=\S+ passes=(\d+) kind=(\w+)", line)
+            if st:
+                timed[int(st.group(1))] = float(st.group(3))
+            elif m:
+                p_n, p_ms, units = int(m.group(1)), float(m.group(2)), int(m.group(3))
+                echo.append(line.rstrip())
+            elif line.startswith(keep):
+                echo.append(line.rstrip())
+    except OSError:
+        pass
+if form in ("prefill", "decode"):
     # The prompt's K units (ubatches, a tail pass), each opening with one marker launch, then n - 1
     # graph replays, each opening with one. K is the run's own `time prompt ... passes=K`.
     marker = sys.argv[7]
-    units = p_n = p_ms = None
-    try:
-        for line in open(runlog):
-            m = re.match(r"time prompt n=(\d+) ms=([0-9.]+) tok/s=\S+ passes=(\d+) kind=(\w+)", line)
-            if m:
-                p_n, p_ms, units = int(m.group(1)), float(m.group(2)), int(m.group(3))
-                print("    " + line.rstrip())
-            elif line.startswith(("load ", "capture ", "step 0 ")):
-                print("    " + line.rstrip())
-    except OSError:
-        pass
+    for line in echo:
+        print("    " + line)
     if units is None:
         print(f"[boundary] no `time prompt n= ms= tok/s= passes= kind=` row in {runlog}: the unit count is unknown, no table")
         raise SystemExit(3)
@@ -210,18 +239,24 @@ if form == "prefill":
     last = window(r)
     print(f"  [control: replay {r - units + 1} of {ngen - 1}, the last decode step] kernels {len(last)}  "
           f"first-to-last {(last[-1][1] - last[0][0]) / 1e3:.1f} µs  kernel sum {sum(e - s for s, e, _, _ in last) / 1e3:.1f} µs")
+elif form == "decode":
+    # The prompt as one row (its units and the head), then replay i at depth P + i - 1, `time step i` of the run.
+    print(f"  {'window':>6s} {'depth':>6s} {'kind':>8s} {'time ms':>12s} {'period µs':>10s} {'wall µs':>10s} {'kern sum':>10s} {'gap':>8s} {'kernels':>7s}")
+    rows = [("prompt", f"0-{depth - 1}", "prefill", f"{p_ms:.4f}", ks[bounds[0]:bounds[units]],
+             (ks[bounds[units]][0] - ks[bounds[0]][0]) / 1e3)]
+    for i in range(1, ngen):
+        r = units + i - 1
+        rows.append((str(i), str(depth + i - 1), "replay", f"{timed[i]:.4f}" if i in timed else "-", window(r), period(r)))
+    for label, at, kind, ts, w, per in rows:
+        wall = (w[-1][1] - w[0][0]) / 1e3
+        tot = sum(e - s for s, e, _, _ in w) / 1e3
+        print(f"  {label:>6s} {at:>6s} {kind:>8s} {ts:>12s} {per:10.1f} {wall:10.1f} {tot:10.1f} {wall - tot:8.1f} {len(w):7d}")
+    report(f"replay {ngen - 2} = depth {depth + ngen - 3} (replay)", window(replays - 2), period(replays - 2))
+    report(f"replay {ngen - 1} = depth {depth + ngen - 2} (last decode replay)", window(replays - 1), period(replays - 1))
 elif form == "seed":
-    # The run's own lines: `time step i` is window i; window 0 is the prefill pass.
-    timed = {}
-    try:
-        for line in open(runlog):
-            m = re.match(r"time step (\d+)( warm)? ms=([0-9.]+)", line)
-            if m:
-                timed[int(m.group(1))] = float(m.group(3))
-            elif line.startswith(("load ", "capture ", "seed ", "step 0 ", "SMOKE ")):
-                print("    " + line.rstrip())
-    except OSError:
-        pass
+    # `time step i` is window i; window 0 is the prefill pass.
+    for line in echo:
+        print("    " + line)
     print(f"  {'window':>6s} {'depth':>6s} {'kind':>8s} {'time step ms':>12s} {'period µs':>10s} {'wall µs':>10s} {'kern sum':>10s} {'gap':>8s} {'kernels':>7s}")
     for r in range(replays):
         w = window(r)
@@ -241,10 +276,11 @@ PY
 }
 
 # embed_marker <file>: the entry that gathers the embedding rows of <file>'s token_embd.weight, the launch
-# the seed and prefill forms cut the trace at, into MARKER and its type name into EMBD_TYPE. It follows the
+# the seed, decode and prefill forms cut the trace at, into MARKER and its type name into EMBD_TYPE. It follows the
 # type, as the plan's launch does (arch/qwen3moe/dispatch.rs `embed_rows`: Q8_0 planes run q38's gather,
-# K-quant rows ElemKernels::enqueue_embed_rows_kquant). The header is read by tools/ref/gguf-ranges.py. A file
-# the reader refuses keeps its code (2 unreadable, 65 malformed); a type with no gather is 65.
+# K-quant rows ElemKernels::enqueue_embed_rows_kquant). tools/ref/gguf-ranges.py reads the header of <file> and of
+# every shard its split.count names, since a split set may hold the table in any shard. A file the reader refuses
+# keeps its code (2 unreadable, 65 malformed); a type with no gather is 65.
 # BLOOMERY_NSYS_MARKER wins over the file.
 embed_marker() {
   local out tmp rc=0
@@ -264,9 +300,10 @@ GATHER = {8: ("Q8_0", "embed_rows_q8_0"), 11: ("Q3_K", "embed_rows_q3k"), 12: ("
 NAMES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 10: "Q2_K", 15: "Q8_K", 30: "BF16"}
 path = sys.argv[2]
 try:
-    ids = [t[1] for t in g.header(path)[1] if t[0] == "token_embd.weight"]
+    shards = g.shard_paths(path, g.header(path)[0])
+    ids = [t[1] for p in shards for t in g.header(p)[1] if t[0] == "token_embd.weight"]
     if not ids:
-        raise g.Refusal(65, f"{path}: no token_embd.weight in the header (a split set's first shard holds it)")
+        raise g.Refusal(65, f"{path}: no token_embd.weight in the header of any of its {len(shards)} shard(s)")
     if ids[0] not in GATHER:
         raise g.Refusal(65, f"{path}: token_embd.weight is {NAMES.get(ids[0], 'type id %d' % ids[0])} (GGML type id "
                             f"{ids[0]}), which has no embedding gather (Q3_K, Q4_K, Q5_K, Q6_K and Q8_0 do); "
@@ -311,14 +348,14 @@ for item in $DEPTHS; do
   DEPTH_LIST+=("$d") DEPTH_FILE+=("$f")
 done
 [ "${#DEPTH_LIST[@]}" -gt 0 ] || { echo "nsys-gpu.sh: BLOOMERY_NSYS_DEPTHS names no depth" >&2; exit 64; }
-if [ "$FORM" = seed ]; then
+if [ "$FORM" = seed ] || [ "$FORM" = decode ]; then
   for d in "${DEPTH_LIST[@]}"; do
     case $d in
-      '' | *[!0-9]* | 0) echo "nsys-gpu.sh: depth '$d' is a positive integer (the seed form feeds one id at D - 1)" >&2; exit 64 ;;
+      '' | *[!0-9]* | 0) echo "nsys-gpu.sh: depth '$d' is a positive integer in the $FORM form" >&2; exit 64 ;;
     esac
   done
   case $NGEN in
-    '' | *[!0-9]* | [012]) echo "nsys-gpu.sh: BLOOMERY_NSYS_N is at least 3 in the seed form, got '$NGEN'" >&2; exit 64 ;;
+    '' | *[!0-9]* | [012]) echo "nsys-gpu.sh: BLOOMERY_NSYS_N is at least 3 in the $FORM form, got '$NGEN'" >&2; exit 64 ;;
   esac
   case $GEN_CTX in
     *[!0-9]* | 0) echo "nsys-gpu.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
@@ -337,7 +374,7 @@ if [ "$FORM" = prefill ]; then
     *[!0-9]* | 0) echo "nsys-gpu.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
   esac
 fi
-# Each entry's file and, in the seed and prefill forms, its boundary entry and the type behind it, before the
+# Each entry's file and, in the seed, decode and prefill forms, its boundary entry and the type behind it, before the
 # lease and the card. A file an entry names must be there; the profile's own is read by embed_marker.
 DEPTH_MARKER=() DEPTH_TYPE=()
 for i in "${!DEPTH_LIST[@]}"; do
@@ -349,7 +386,7 @@ for i in "${!DEPTH_LIST[@]}"; do
   [ "$FORM" = prompt ] || embed_marker "${DEPTH_FILE[i]:-$MODEL}" || exit $?
   DEPTH_MARKER+=("$MARKER") DEPTH_TYPE+=("$EMBD_TYPE")
 done
-# The profiled command for depth $1 (the prompt and prefill forms' ids: $2) over the model file $3, into CMD and CTX.
+# The profiled command for depth $1 (the prompt, decode and prefill forms' ids: $2) over the model file $3, into CMD and CTX.
 profile_cmd() {
   local d=$1 ids=${2:-} f=${3:-$MODEL}
   if [ "$FORM" = seed ]; then
@@ -357,7 +394,7 @@ profile_cmd() {
     CMD=(env "BLOOMERY_REF_MODEL=$f" timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
          --sample=none --cpuctxsw=none -o "$out" --force-overwrite true
          "$BIN" --seed-depth "$d" -n "$NGEN" --ctx "$CTX" --mode "$MODE" --time)
-  elif [ "$FORM" = prefill ]; then
+  elif [ "$FORM" = prefill ] || [ "$FORM" = decode ]; then
     CTX=${GEN_CTX:-$(((d + DEPTH_N + 255) / 256 * 256))}
     CMD=(env "BLOOMERY_REF_MODEL=$f" timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
          --sample=none --cpuctxsw=none -o "$out" --force-overwrite true
@@ -388,10 +425,12 @@ if [ -n "$DRY" ]; then
       echo "[dry] depth $d: file $f, token_embd ${DEPTH_TYPE[i]}"
       echo "[dry] depth $d: ctx $CTX, windows expected $NGEN (1 prefill pass + $((NGEN - 1)) replays), boundary $MARKER"
       echo "[dry] depth $d: ${CMD[*]}"
-    elif [ "$FORM" = prefill ]; then
-      echo "[dry] prompt $d: file $f, token_embd ${DEPTH_TYPE[i]}"
-      echo "[dry] prompt $d: ctx $CTX, boundaries expected K + $((NGEN - 1)) (K = the run's time prompt passes=), boundary $MARKER"
-      echo "[dry] prompt $d: ${CMD[*]}"
+    elif [ "$FORM" = prefill ] || [ "$FORM" = decode ]; then
+      at=prompt draft='' replays=''
+      [ "$FORM" = prefill ] || at=depth draft=", BLOOMERY_DRAFT=$BLOOMERY_DRAFT" replays=", then replays at depth $d to $((d + NGEN - 2))"
+      echo "[dry] $at $d: file $f, token_embd ${DEPTH_TYPE[i]}$draft"
+      echo "[dry] $at $d: ctx $CTX, boundaries expected K + $((NGEN - 1)) (K = the run's time prompt passes=$replays), boundary $MARKER"
+      echo "[dry] $at $d: ${CMD[*]}"
     else
       echo "[dry] depth $d: file $f"
       echo "[dry] depth $d: ctx $CTX, replays expected $((d + NGEN - 1))"
@@ -411,8 +450,11 @@ timing_cards_before_lease
 lease_take
 timing_cards_start
 echo "[config] nsys=$($NSYS --version) mode=$MODE n=$NGEN depths='$DEPTHS' out=$OUTDIR"
-[ "$FORM" != seed ] || echo "[config] form=seed bin=$BIN boundary=${BLOOMERY_NSYS_MARKER:-by token_embd type} ctx=${GEN_CTX:-D+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
-[ "$FORM" != prefill ] || echo "[config] form=prefill bin=$BIN boundary=${BLOOMERY_NSYS_MARKER:-by token_embd type} ctx=${GEN_CTX:-P+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
+if [ "$FORM" != prompt ]; then
+  at=D
+  [ "$FORM" != prefill ] || at=P
+  echo "[config] form=$FORM bin=$BIN boundary=${BLOOMERY_NSYS_MARKER:-by token_embd type} ctx=${GEN_CTX:-$at+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
+fi
 witness pre
 
 rc_all=0
@@ -427,11 +469,13 @@ for i in "${!DEPTH_LIST[@]}"; do
     echo
     echo "=== depth $d (ctx $CTX, mode $MODE, 1 prefill pass + $((NGEN - 1)) replays expected) file $f, token_embd ${DEPTH_TYPE[i]}, boundary $MARKER -> $out.nsys-rep"
     guard_other
-  elif [ "$FORM" = prefill ]; then
-    out="$OUTDIR/nsys-${MODEL_NAME}${tag}-pp${d}-n${NGEN}-${MODE}-$(date -u +%H%M%S)"
+  elif [ "$FORM" = prefill ] || [ "$FORM" = decode ]; then
+    at=prompt short=pp
+    [ "$FORM" = prefill ] || at=depth short=d
+    out="$OUTDIR/nsys-${MODEL_NAME}${tag}-${short}${d}-n${NGEN}-${MODE}-$(date -u +%H%M%S)"
     profile_cmd "$d" "$(lcg_prompt "$d")" "$f"
     echo
-    echo "=== prompt $d (ctx $CTX, mode $MODE, the prompt's units + $((NGEN - 1)) replays expected) file $f, token_embd ${DEPTH_TYPE[i]}, boundary $MARKER -> $out.nsys-rep"
+    echo "=== $at $d (ctx $CTX, mode $MODE, the prompt's units + $((NGEN - 1)) replays expected) file $f, token_embd ${DEPTH_TYPE[i]}, boundary $MARKER -> $out.nsys-rep"
     guard_other
   else
     out="$OUTDIR/nsys${tag}-d${d}-${MODE}-$(date -u +%H%M%S)"
