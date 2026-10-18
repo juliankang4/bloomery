@@ -317,6 +317,10 @@ blk_wt() { tool_selftest wt.sh; }
 blk_boundedscan() { local c=bounded; bash "$(dirname "$0")/check-$c.sh" > /dev/null && blk_scancheck "$c"; }
 # gate-bound.sh's own self-test: the owner's cancellation table on stub timeouts (no card, no lock).
 blk_gatebound() { tool_selftest gate-bound.sh; }
+# The reference-set manifest writers, dump-dequant.sh and the tokenizer's oracle.sh: a failed md5 or size read ends the writer
+# before its line, on stand-in files with md5sum and wc stand-ins (tools/ref/read-stubs.sh), no box.
+blk_dumpdequant() { tool_selftest ref/dump-dequant.sh; }
+blk_tokoracle() { tool_selftest ../crates/tokenizer/tools/oracle.sh; }
 # carry.sh is the release's carry check (tools/release/carry.tsv against the commit released): its carried, lacking,
 # pending, unknown-hash and malformed-row verdicts in a temp git repo, no box. The release-build recipe runs it before
 # its box command: a recipe that stops calling it ends the check silently, so the call is held here.
@@ -999,7 +1003,7 @@ unset CPU_GUARD_PROC_LEG
 
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
-  refsetpublish orphan archowner treecommit archivepipe fnowner wt boundedscan gatebound)
+  refsetpublish orphan archowner treecommit archivepipe fnowner wt boundedscan gatebound dumpdequant tokoracle)
 for b in "${BLOCKS[@]}"; do
   ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done

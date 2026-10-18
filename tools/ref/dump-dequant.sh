@@ -29,6 +29,75 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # shellcheck source=tools/ref/ref-paths.sh
 source "$HERE/tools/ref/ref-paths.sh"
+
+# dump <dir> <model> <dequant_ref argument>… — the harness into <dir>, then <dir>/DEQUANT.tsv. Every digest and size is
+# read into a variable before anything is written, so a failed read ends the script with no DEQUANT.tsv.
+dump() {
+  local dir=$1 model=$2 types f n=0 bin_md5 lib_md5 bytes sum rows=''
+  shift 2
+  rm -f "$dir/DEQUANT.tsv"
+  "$BIN" "$@"
+  types=$(awk '{ print $2 }' "$dir/manifest.txt")
+  bin_md5=$(file_md5 "$BIN")
+  lib_md5=$(file_md5 "$LIBGGML")
+  for f in manifest.txt $(for t in $types; do for x in raw meta blocks; do [ -f "$dir/$t.$x" ] && echo "$t.$x"; done; done); do
+    bytes=$(wc -c < "$dir/$f")
+    sum=$(file_md5 "$dir/$f")
+    rows+=$f$'\t'$bytes$'\t'$sum$'\n'
+    n=$((n + 1))
+  done
+  {
+    printf '# dequant_ref\t%s\t%s\n' "$BIN" "$bin_md5"
+    printf '# libggml\t%s\t%s\n' "$LIBGGML" "$lib_md5"
+    printf '# model\t%s\n' "$model"
+    printf 'file\tbytes\tmd5\n'
+    printf '%s' "$rows"
+    printf '# complete\t%s\n' "$n"
+  } > "$dir/DEQUANT.tsv.tmp.$$"
+  mv "$dir/DEQUANT.tsv.tmp.$$" "$dir/DEQUANT.tsv"
+  head -4 "$dir/DEQUANT.tsv"
+}
+
+# `bash tools/ref/dump-dequant.sh --self-test`: dump() on a stand-in harness, with md5sum and wc stand-ins first on PATH
+# (tools/ref/read-stubs.sh). A whole set gets its rows and trailer; a digest or size read that fails, in the header or
+# in a row, ends dump() with no DEQUANT.tsv and no temporary file. No box, no ggml.
+if [ "${1:-}" = --self-test ]; then
+  set +e
+  t=$(mktemp -d "${TMPDIR:-/tmp}/dump-dequant-test.XXXXXX") || exit 70
+  trap 'rm -rf "$t"' EXIT
+  # shellcheck source=tools/ref/read-stubs.sh
+  source "$HERE/tools/ref/read-stubs.sh"
+  mkdir "$t/bin"
+  read_stubs "$t/bin"
+  PATH=$t/bin:$PATH
+  BIN=$t/dequant_ref LIBGGML=$t/libggml.so bad=0 tab=$'\t'
+  # The harness: one type, q4, whose raw file holds $RAW.
+  printf '#!/bin/sh\necho "0 q4" > "$1/manifest.txt"\nprintf %%s "$RAW" > "$1/q4.raw"\necho m > "$1/q4.meta"\n' > "$BIN"
+  chmod +x "$BIN"
+  # run <name> <libggml text> <raw text>: dump into $t/<name>; RC and LEFT (the set's files after it).
+  run() {
+    mkdir "$t/$1"
+    printf %s "$2" > "$LIBGGML"
+    (set -e; export RAW=$3; dump "$t/$1" model "$t/$1") > "$t/$1.out" 2>&1
+    RC=$?
+    LEFT=$(cd "$t/$1" && ls | tr '\n' ' ')
+  }
+  run whole lib r
+  check whole-rc "$RC" 0
+  check whole-trailer "$(tail -n 1 "$t/whole/DEQUANT.tsv")" "# complete${tab}3"
+  check whole-row "$(grep '^q4.raw' "$t/whole/DEQUANT.tsv")" "q4.raw${tab}7${tab}0123456789abcdef0123456789abcdef"
+  check whole-lib "$(grep '^# libggml' "$t/whole/DEQUANT.tsv")" "# libggml${tab}$LIBGGML${tab}0123456789abcdef0123456789abcdef"
+  for c in "header-md5 fail-md5 r" "row-md5 lib fail-md5" "row-wc lib fail-wc"; do
+    read -r name lib raw <<< "$c"
+    run "$name" "$lib" "$raw"
+    check "$name-rc" "$([ "$RC" != 0 ] && echo failed || echo "0: $(tail -n 1 "$t/$name/DEQUANT.tsv" 2> /dev/null)")" failed
+    check "$name-no-manifest" "$LEFT" "manifest.txt q4.meta q4.raw "
+  done
+  echo "dump-dequant self-test: $([ "$bad" = 0 ] && echo ok || echo FAIL) ($bad failures)"
+  [ "$bad" = 0 ]
+  exit
+fi
+
 [ "$BLOOMERY_MODEL" = deepseek2 ] || {
   echo "dump-dequant: the V2-Lite set is the default profile's (deepseek2); BLOOMERY_MODEL=$BLOOMERY_MODEL would dump another file as it" >&2
   exit 64
@@ -40,30 +109,6 @@ bash "$HERE/tools/ref/build-dequant.sh"
 BIN=$BLOOMERY_DATA/bin/dequant_ref
 LIBGGML=$(ldd "$BIN" | awk '$1 == "libggml.so" { print $3 }')
 [ -f "$LIBGGML" ] || { echo "dump-dequant: $BIN loads no libggml.so (ldd names '$LIBGGML')" >&2; exit 66; }
-
-md5() { md5sum < "$1" | cut -d' ' -f1; }
-
-# dump <dir> <model> <dequant_ref argument>… — the harness into <dir>, then <dir>/DEQUANT.tsv.
-dump() {
-  local dir=$1 model=$2 types f n=0
-  shift 2
-  rm -f "$dir/DEQUANT.tsv"
-  "$BIN" "$@"
-  types=$(awk '{ print $2 }' "$dir/manifest.txt")
-  {
-    printf '# dequant_ref\t%s\t%s\n' "$BIN" "$(md5 "$BIN")"
-    printf '# libggml\t%s\t%s\n' "$LIBGGML" "$(md5 "$LIBGGML")"
-    printf '# model\t%s\n' "$model"
-    printf 'file\tbytes\tmd5\n'
-    for f in manifest.txt $(for t in $types; do for x in raw meta blocks; do [ -f "$dir/$t.$x" ] && echo "$t.$x"; done; done); do
-      printf '%s\t%s\t%s\n' "$f" "$(wc -c < "$dir/$f")" "$(md5 "$dir/$f")"
-      n=$((n + 1))
-    done
-    printf '# complete\t%s\n' "$n"
-  } > "$dir/DEQUANT.tsv.tmp.$$"
-  mv "$dir/DEQUANT.tsv.tmp.$$" "$dir/DEQUANT.tsv"
-  head -4 "$dir/DEQUANT.tsv"
-}
 
 dump "$BLOOMERY_DATA/ref-dequant-v2lite" "$MODEL" "$MODEL" "$BLOOMERY_DATA/ref-dequant-v2lite"
 dump "$BLOOMERY_DATA/ref-dequant-v41$SUFFIX" "$V41" "$V41" "$BLOOMERY_DATA/ref-dequant-v41$SUFFIX"

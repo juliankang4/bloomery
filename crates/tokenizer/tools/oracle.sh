@@ -74,6 +74,75 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 CASES=$ROOT/crates/tokenizer/tests/cases.txt
 
+# manifest_head — MANIFEST.tsv's lines before the rows: the executable, the library, the build, the vocabulary, the text
+# tree and the cases files. Each md5 is read into a variable first (file_md5), so a failed read ends the script.
+manifest_head() {
+  local tok_md5 lib_md5 cases_md5 extra_md5=
+  tok_md5=$(file_md5 "$TOKENIZE")
+  lib_md5=$(file_md5 "$LIBLLAMA")
+  cases_md5=$(file_md5 "$CASES")
+  [ -z "$EXTRA" ] || extra_md5=$(file_md5 "$EXTRA")
+  printf '# tokenizer\t%s\t%s\n' "$TOKENIZE" "$tok_md5"
+  printf '# libllama\t%s\t%s\n' "$LIBLLAMA" "$lib_md5"
+  [ -z "$BUILD_PIN" ] || printf '# build\t%s\n' "${BUILD_PIN:0:9}"
+  printf '# vocabulary\t%s\n' "$SHARD"
+  printf '# text tree\t%s\n' "$IK"
+  printf '# cases\t%s\t%s\n' "$CASES" "$cases_md5"
+  [ -z "$EXTRA" ] || printf '# extra cases\t%s\t%s\n' "$EXTRA" "$extra_md5"
+  printf 'set\tbytes\ttext_md5\tids\tnps_ids\n'
+}
+
+# row <name> — the text <name>'s manifest row: bytes, text md5 and the two id counts, each read into a variable first.
+row() {
+  local bytes sum ids nps
+  bytes=$(wc -c < "$OUT.new/$1.txt")
+  sum=$(file_md5 "$OUT.new/$1.txt")
+  ids=$(wc -l < "$OUT.new/$1.ids")
+  nps=$(wc -l < "$OUT.new/$1.nps.ids")
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$bytes" "$sum" "$ids" "$nps"
+}
+
+# `bash crates/tokenizer/tools/oracle.sh --self-test`: manifest_head and row on stand-in files, with md5sum and wc
+# stand-ins first on PATH (tools/ref/read-stubs.sh). Whole files give their lines; a digest or count read that fails ends
+# the function, under the script's set -e, before it prints the line. No box, no llama-tokenize, no corpus.
+if [ "${1:-}" = --self-test ]; then
+  set +e
+  t=$(mktemp -d "${TMPDIR:-/tmp}/oracle-test.XXXXXX") || exit 70
+  trap 'rm -rf "$t"' EXIT
+  # shellcheck source=tools/ref/ref-paths.sh
+  source "$ROOT/tools/ref/ref-paths.sh"
+  # shellcheck source=tools/ref/read-stubs.sh
+  source "$ROOT/tools/ref/read-stubs.sh"
+  mkdir "$t/bin" "$t/set.new"
+  read_stubs "$t/bin"
+  PATH=$t/bin:$PATH
+  TOKENIZE=$t/llama-tokenize LIBLLAMA=$t/libllama.so CASES=$t/cases.txt EXTRA= SHARD=$t/vocab.gguf IK=$t/ik BUILD_PIN=
+  OUT=$t/set bad=0 d=0123456789abcdef0123456789abcdef tab=$'\t'
+  # case_run <function> <file> <text>: <file> holds <text>, then the function (row's name x) under set -e; its status and output.
+  case_run() {
+    printf %s "$3" > "$2"
+    got=$(set -e; "$1" x)
+    echo "$?|$got"
+  }
+  echo t > "$TOKENIZE"
+  echo l > "$LIBLLAMA"
+  echo c > "$CASES"
+  echo x > "$OUT.new/x.ids"
+  echo x > "$OUT.new/x.nps.ids"
+  r=$(case_run manifest_head "$OUT.new/x.txt" x)
+  check head "${r%%$'\n'*}" "0|# tokenizer${tab}$TOKENIZE${tab}$d"
+  check row "$(case_run row "$OUT.new/x.txt" x)" "0|x${tab}7${tab}$d${tab}7${tab}7"
+  r=$(case_run manifest_head "$LIBLLAMA" fail-md5)
+  check head-md5 "$r" "1|"
+  echo l > "$LIBLLAMA"
+  check row-md5 "$(case_run row "$OUT.new/x.txt" fail-md5)" "1|"
+  printf %s x > "$OUT.new/x.txt"
+  check row-wc "$(case_run row "$OUT.new/x.ids" fail-wc)" "1|"
+  echo "oracle self-test: $([ "$bad" = 0 ] && echo ok || echo FAIL) ($bad failures)"
+  [ "$bad" = 0 ]
+  exit
+fi
+
 case $#:${2:-} in
   1: | 2:--cases-only) ;;
   *) echo "usage: oracle.sh VOCAB [--cases-only]" >&2; exit 64 ;;
@@ -240,25 +309,7 @@ one() {
   rm -f "$2.raw"
 }
 
-# row <name> — the text <name>'s manifest row: bytes, text md5 and the two id counts.
-row() {
-  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$(wc -c < "$OUT.new/$1.txt")" \
-    "$(md5sum < "$OUT.new/$1.txt" | cut -d' ' -f1)" \
-    "$(wc -l < "$OUT.new/$1.ids")" "$(wc -l < "$OUT.new/$1.nps.ids")"
-}
-
-extra_md5=
-[ -z "$EXTRA" ] || extra_md5=$(md5sum < "$EXTRA" | cut -d' ' -f1)
-{
-  printf '# tokenizer\t%s\t%s\n' "$TOKENIZE" "$(md5sum < "$TOKENIZE" | cut -d' ' -f1)"
-  printf '# libllama\t%s\t%s\n' "$LIBLLAMA" "$(md5sum < "$LIBLLAMA" | cut -d' ' -f1)"
-  [ -z "$BUILD_PIN" ] || printf '# build\t%s\n' "${BUILD_PIN:0:9}"
-  printf '# vocabulary\t%s\n' "$SHARD"
-  printf '# text tree\t%s\n' "$IK"
-  printf '# cases\t%s\t%s\n' "$CASES" "$(md5sum < "$CASES" | cut -d' ' -f1)"
-  [ -z "$EXTRA" ] || printf '# extra cases\t%s\t%s\n' "$EXTRA" "$extra_md5"
-  printf 'set\tbytes\ttext_md5\tids\tnps_ids\n'
-} > "$OUT.new/MANIFEST.tsv"
+manifest_head > "$OUT.new/MANIFEST.tsv"
 
 if [ "${2:-}" != --cases-only ]; then
   for name in code prose prose-all threads korean; do

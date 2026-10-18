@@ -37,8 +37,6 @@ die() {
   exit "${2:-2}"
 }
 
-md5() { md5sum < "$1" | cut -d' ' -f1; }
-
 git_lcpp() { git -c safe.directory="$LCPP" -C "$LCPP" "$@"; }
 
 tree_check() {
@@ -63,7 +61,7 @@ build() {
   g++ -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -o "$tmp" "$SRC" -I"$LCPP/ggml/include" -I"$LCPP/ggml/src" \
     -L"$LIB" -lggml-cpu -lggml-base -Wl,-rpath,"$LIB"
   # Each fact is its own assignment: inside a printf's arguments a failed md5 or readlink would not end the script.
-  source_md5=$(md5 "$SRC")
+  source_md5=$(file_md5 "$SRC")
   lcpp_path=$(readlink -f "$LCPP")
   {
     printf 'source_md5 %s\nlcpp %s\nlcpp_commit %s\n' "$source_md5" "$lcpp_path" "$PIN"
@@ -80,7 +78,7 @@ build() {
 compose() {
   local f n=0 tmp=$SET/QUANT.tsv.tmp.$$ source_md5 cpu bytes digest
   trap 'rm -f "$SET/QUANT.tsv.tmp.$$"' EXIT
-  source_md5=$(md5 "$SRC")
+  source_md5=$(file_md5 "$SRC")
   cpu=$(sed -n 's/^cpu\t//p' "$SET/info.tsv")
   {
     printf '# harness\t%s\n# build\t%s\n' "$source_md5" "${PIN:0:9}"
@@ -89,7 +87,7 @@ compose() {
     printf '# file\tname\tbytes\tmd5\n'
     while read -r f; do
       bytes=$(wc -c < "$SET/$f" | tr -d ' ')
-      digest=$(md5 "$SET/$f")
+      digest=$(file_md5 "$SET/$f")
       printf 'file\t%s\t%s\t%s\n' "$f" "$bytes" "$digest"
       n=$((n + 1))
     done < "$SET/files.txt"

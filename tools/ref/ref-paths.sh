@@ -272,3 +272,12 @@ drop_incomplete_stage() {
   rm -rf "$STAGE"
   echo "[staging] removed the incomplete $STAGE" >&2
 }
+
+# file_md5 <file>: the file's md5 (md5sum, the box's), or md5sum's failure as the status with nothing printed. A manifest
+# writer takes it into a variable before the line that prints it: inside a printf's arguments a failed read would print an
+# empty field, and set -e would let the writer go on to its `# complete` trailer.
+file_md5() {
+  local sum
+  sum=$(md5sum < "$1") || return
+  printf '%s\n' "${sum%% *}"
+}
