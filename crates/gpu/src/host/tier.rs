@@ -74,7 +74,7 @@ use cuda_host::cuda_module;
 use model::placement::Machine;
 use model::placement::devices::DeviceInfo;
 
-use super::link::{Crossing, Link, LinkEnd, Reader};
+use super::link::{Crossing, Link, LinkEnd, PostCols, Reader, Span};
 use super::node::TierNode;
 use super::page::MAX_ROWS;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
@@ -505,12 +505,18 @@ impl TierLayout {
         })
     }
 
-    /// Bytes in one row's go and done posts, including their generation words.
+    /// Bytes in one row's go and done posts of a chain of `cols` columns,
+    /// including their generation words.
     #[must_use]
-    pub fn wire_bytes(&self) -> [usize; 2] {
+    pub fn wire_bytes(&self, cols: usize) -> [usize; 2] {
         let crossings = self.crossings();
         std::array::from_fn(|i| {
-            crossings[i].spans.iter().map(|s| s.len()).sum::<usize>() + std::mem::size_of::<u32>()
+            crossings[i]
+                .spans
+                .iter()
+                .map(|s| s.bytes_at(cols))
+                .sum::<usize>()
+                + std::mem::size_of::<u32>()
         })
     }
 
@@ -567,8 +573,9 @@ impl TierLayout {
 
     /// Every counter of the page and the bytes it publishes, as a link that
     /// mirrors the page carries them: per tier and row the go, which
-    /// publishes the row's image, and the done, which publishes the row's
-    /// routed rows and the tier's fault copy and counts in its progress word.
+    /// publishes the row's image, and the done, which publishes the columns
+    /// of the row's routed rows its chain uses and the tier's fault copy and
+    /// counts in its progress word.
     fn crossings(&self) -> Vec<Crossing> {
         let image = 4 * self.image.words();
         let rows = 4 * self.image.n_used * self.image.cols * self.image.hidden;
@@ -581,13 +588,19 @@ impl TierLayout {
                     Crossing {
                         counter: self.word_off(t, TWord::Go(r)),
                         reader: Reader::Tier,
-                        spans: vec![go],
+                        spans: vec![Span::whole(go)],
                         prog: None,
                     },
                     Crossing {
                         counter: self.word_off(t, TWord::Cnt(r)),
                         reader: Reader::Stage,
-                        spans: vec![self.rows_off(r)..self.rows_off(r) + rows, fault..fault + 8],
+                        spans: vec![
+                            Span {
+                                bytes: self.rows_off(r)..self.rows_off(r) + rows,
+                                cols: self.image.cols,
+                            },
+                            Span::whole(fault..fault + 8),
+                        ],
                         prog: Some(self.word_off(t, TWord::Prog)),
                     },
                 ]
@@ -1160,6 +1173,9 @@ pub(crate) struct TierWork {
     /// The card's end of the page's link, in this card's context, and the
     /// page's layout: set when the work is bound to the page.
     end: Option<(LinkEnd, TierLayout)>,
+    /// The columns the link's ends post of each done, set for each chain
+    /// the work runs: the page's once it is bound.
+    post_cols: PostCols,
     /// The card's tier on the page: its index in the host tier's tiers.
     index: usize,
     shape: TierShape,
@@ -1215,6 +1231,7 @@ impl TierWork {
             act,
             rows: Vec::new(),
             end: None,
+            post_cols: PostCols::default(),
             index: 0,
             shape,
             cols,
@@ -1261,9 +1278,16 @@ impl TierWork {
     }
 
     /// Bind the work to a page laid out by `layout` as tier `index`, `end`
-    /// its end of the page's link in its card's context: its windows over
-    /// the page's routed rows, in that context.
-    pub(super) fn bind(&mut self, layout: TierLayout, index: usize, end: LinkEnd) {
+    /// its end of the page's link in its card's context and `post_cols` the
+    /// columns the link posts: its windows over the page's routed rows, in
+    /// that context.
+    pub(super) fn bind(
+        &mut self,
+        layout: TierLayout,
+        index: usize,
+        end: LinkEnd,
+        post_cols: PostCols,
+    ) {
         let ctx = self.gpu.context();
         let img = layout.image;
         self.rows = (0..layout.rows)
@@ -1283,6 +1307,7 @@ impl TierWork {
             })
             .collect();
         self.end = Some((end, layout));
+        self.post_cols = post_cols;
         self.index = index;
     }
 
@@ -1314,7 +1339,7 @@ impl TierWork {
         }
         let counters = layout.counters(index).collect();
         let link = Link::open_across(self.gpu.context(), path, bytes, counters)?;
-        self.bind(layout, index, link.own_end());
+        self.bind(layout, index, link.own_end(), link.post_cols());
         self.link = Some(link);
         Ok(())
     }
@@ -1348,7 +1373,7 @@ impl TierWork {
         let endpoint = end.endpoint(0x200);
         end.connect(endpoint.psn, peer)?;
         link.keep_remote(end);
-        self.bind(layout, index, link.own_end());
+        self.bind(layout, index, link.own_end(), link.post_cols());
         self.link = Some(link);
         Ok(endpoint)
     }
@@ -1375,8 +1400,9 @@ impl TierWork {
         self.end.map(|(_, l)| l.rows)
     }
 
-    /// Launch the graph held in `chain`'s slot on the tier's stream; a chain
-    /// with no graph held is refused by name.
+    /// Launch the graph held in `chain`'s slot on the tier's stream, its
+    /// dones posting the chain's columns; a chain with no graph held is
+    /// refused by name.
     pub(super) fn launch(&mut self, chain: Chain) -> Result<(), GpuError> {
         let i = chain_slot(chain)?;
         let graph = self.graphs[i].as_ref().ok_or(GpuError::State {
@@ -1384,6 +1410,7 @@ impl TierWork {
             missing: "a tier graph of the chain (TierWork::capture)",
         })?;
         self.gpu.context().bind_to_thread()?;
+        self.post_cols.set(chain.cols());
         graph.launch(self.gpu.stream())
     }
 
@@ -1416,7 +1443,8 @@ impl TierWork {
     }
 
     /// Enqueue layer `layer` of row `row` on the tier's stream now, over the
-    /// image's first `cols` columns, its fault copy with it.
+    /// image's first `cols` columns, its fault copy with it and its done
+    /// posting those columns.
     pub(super) fn enqueue(
         &mut self,
         layer: usize,
@@ -1424,6 +1452,7 @@ impl TierWork {
         cols: usize,
     ) -> Result<(), GpuError> {
         self.gpu.context().bind_to_thread()?;
+        self.post_cols.set(cols);
         self.parts()?.enqueue_layer(layer, row, cols, true)
     }
 
@@ -1846,7 +1875,7 @@ impl TierCard {
         match &mut self.side {
             TierSide::Here(w) => {
                 let end = page.link.tier_end(w.gpu().context(), BIND, &self.name)?;
-                w.bind(layout, index, end);
+                w.bind(layout, index, end, page.link.post_cols());
             }
             TierSide::Node(n) if page.link.is_remote() => {
                 let mut end = layout.remote_end(&page.link, index, Reader::Stage, n.local_ip()?)?;
@@ -2507,7 +2536,7 @@ pub(super) mod tests {
             layout.crossings(),
             stalled,
         );
-        work.bind(layout, 0, link.own_end());
+        work.bind(layout, 0, link.own_end(), link.post_cols());
         work.link = Some(link);
         work
     }
@@ -2526,6 +2555,34 @@ pub(super) mod tests {
             .expect("release for cleanup");
         work.sync().expect("drained for cleanup");
         assert!(result.is_ok(), "{result:?}");
+        drop(work);
+        drop(file);
+        std::fs::remove_file(path).expect("remove the fixture");
+    }
+
+    /// A launched chain and an enqueued layer each set the columns the
+    /// page's link posts of their dones, before the tier's stream runs them.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_chain_sets_the_columns_its_dones_post() {
+        let (path, file) = super::super::node::tests::empty_file("post-cols");
+        let mut work = remote_work(&file, Arc::new(AtomicBool::new(false)), false);
+        let posted = work.link.as_ref().expect("a page").post_cols();
+        work.capture(Chain::Step, 1, &[(0, 0)])
+            .expect("a step graph");
+        posted.set(usize::MAX);
+        work.launch(Chain::Step).expect("a launch");
+        let launched = posted.get();
+        posted.set(usize::MAX);
+        work.enqueue(0, 0, 1).expect("a go wait");
+        let enqueued = posted.get();
+        work.link
+            .as_ref()
+            .expect("a page")
+            .release(RELEASE)
+            .expect("release for cleanup");
+        work.sync().expect("drained for cleanup");
+        assert_eq!((launched, enqueued), (1, 1));
         drop(work);
         drop(file);
         std::fs::remove_file(path).expect("remove the fixture");
@@ -2774,7 +2831,7 @@ pub(super) mod tests {
             (0, 64, 4096, 0, 0)
         );
         assert_eq!(i.words(), 64 + 4096);
-        assert_eq!(l.wire_bytes(), [16_644, 131_084]);
+        assert_eq!(l.wire_bytes(1), [16_644, 131_084]);
         assert!(l.rows_off(0) >= l.image_off(1) + 4 * i.words());
         assert!(l.bytes().unwrap() >= l.rows_off(1) + 4 * 8 * 4096);
         assert!(TierLayout::new(glm, 512, 0, 1).is_err());
@@ -2786,9 +2843,10 @@ pub(super) mod tests {
     /// slots over 2,560 f32 — the places 40 words from 0, the activation's
     /// four columns from the first 256-byte boundary past them, the routed
     /// rows forty slots — and at one column every offset the one-column
-    /// page's; a width of 0 or past the host's columns is refused; the
-    /// graph slots are the step's, the pair's, the quad's and one per width
-    /// 2..=8, the existing slots where they were.
+    /// page's; a done of a chain of `m` columns posts `m` columns' rows, the
+    /// go the whole image; a width of 0 or past the host's columns is
+    /// refused; the graph slots are the step's, the pair's, the quad's and
+    /// one per width 2..=8, the existing slots where they were.
     #[test]
     fn a_tier_page_of_four_columns_keeps_its_fields_apart() {
         let q38 = TierShape {
@@ -2804,7 +2862,9 @@ pub(super) mod tests {
             (0, 64, 4 * 2560, 4, 10)
         );
         assert!(i.sel + 4 * i.n_used <= i.x);
-        assert_eq!(l.wire_bytes(), [41_220, 409_612]);
+        assert_eq!(l.wire_bytes(4), [41_220, 409_612]);
+        assert_eq!(l.wire_bytes(2), [41_220, 204_812]);
+        assert_eq!(l.wire_bytes(1), [41_220, 102_412]);
         assert!(l.rows_off(0) >= l.image_off(0) + 4 * i.words());
         assert!(l.bytes().unwrap() >= l.rows_off(0) + 4 * 40 * 2560);
         assert_eq!(

@@ -57,7 +57,7 @@ use threads::helper::{HelperError, Placement, spawn_helper};
 
 use crate::GpuError;
 use crate::graph::{MappedHost, SHARED_PAGE, cu};
-pub use pump::{Crossing, Reader};
+pub use pump::{Crossing, PostCols, Reader, Span};
 use pump::{Half, Move, Page, TAIL_LINE, Wire};
 pub use rdma::RdmaEnd;
 
@@ -86,6 +86,8 @@ pub(super) struct Link {
     /// node's process to open ([`Link::unlink`]); `None` for a page of this
     /// process alone and on the side that opened it.
     path: Option<PathBuf>,
+    /// The columns every end over this page posts ([`PostCols`]).
+    post_cols: PostCols,
 }
 
 /// The two ends of mirrored pages and the pump threads that drive them.
@@ -427,6 +429,7 @@ impl Link {
             page: Arc::new(MappedHost::new(ctx, bytes, "cuMemHostAlloc (tier page)")?),
             counters,
             path: None,
+            post_cols: PostCols::default(),
         })
     }
 
@@ -453,6 +456,7 @@ impl Link {
             page: Arc::new(page),
             counters,
             path: Some(path),
+            post_cols: PostCols::default(),
         })
     }
 
@@ -484,6 +488,7 @@ impl Link {
             page: Arc::new(page),
             counters,
             path: None,
+            post_cols: PostCols::default(),
         })
     }
 
@@ -537,8 +542,9 @@ impl Link {
         what: &'static str,
     ) -> Result<Link, GpuError> {
         let (tail, page, tier) = Link::pages(stage, tier, bytes, crossings.len())?;
+        let post_cols = PostCols::default();
         let end = |side, own: &Arc<MappedHost>, other: &Arc<MappedHost>| {
-            let half = Half::new(crossings.clone(), side, tail, &**own)
+            let half = Half::new(crossings.clone(), side, tail, &**own, post_cols.clone())
                 .map_err(|e| GpuError::shape(what, e))?;
             let wire = Memory {
                 from: Arc::clone(own),
@@ -562,6 +568,7 @@ impl Link {
             page,
             counters: Vec::new(),
             path: None,
+            post_cols,
         })
     }
 
@@ -580,8 +587,17 @@ impl Link {
         let (tail, page, tier) = Link::pages(stage, tier, bytes, crossings.len())?;
         let (dev, gid) = bloomery_verbs::first_roce_v2()
             .map_err(|e| GpuError::shape(what, format!("the RDMA link: {e}")))?;
+        let post_cols = PostCols::default();
         let open = |side, page: &Arc<MappedHost>| {
-            RdmaEnd::new(Arc::clone(page), tail, crossings.clone(), side, &dev, gid)
+            RdmaEnd::new(
+                Arc::clone(page),
+                tail,
+                crossings.clone(),
+                side,
+                &dev,
+                gid,
+                post_cols.clone(),
+            )
         };
         let (mut s, mut t) = (open(Reader::Stage, &page)?, open(Reader::Tier, &tier)?);
         let (s_psn, t_psn) = (0x100, 0x200);
@@ -602,6 +618,7 @@ impl Link {
             page,
             counters: Vec::new(),
             path: None,
+            post_cols,
         })
     }
 
@@ -633,7 +650,21 @@ impl Link {
         };
         let (dev, gid) = bloomery_verbs::roce_v2_at(ip)
             .map_err(|e| GpuError::link("the remote tier link", e.to_string()))?;
-        RdmaEnd::new(Arc::clone(&self.page), tail, crossings, side, &dev, gid)
+        RdmaEnd::new(
+            Arc::clone(&self.page),
+            tail,
+            crossings,
+            side,
+            &dev,
+            gid,
+            self.post_cols.clone(),
+        )
+    }
+
+    /// The columns every end over this page posts, which the tier's work sets
+    /// for each chain it runs.
+    pub(super) fn post_cols(&self) -> PostCols {
+        self.post_cols.clone()
     }
 
     /// Keep a connected end and its pump until this page drops.
@@ -938,8 +969,14 @@ pub(super) mod tests {
         }
         let mut link = Link::remote(ctx, bytes, crossings.len()).expect("a remote page");
         let (tail, _) = link_tail(bytes, crossings.len());
-        let half =
-            Half::new(crossings.clone(), Reader::Tier, tail, &*link.page).expect("the crossings");
+        let half = Half::new(
+            crossings.clone(),
+            Reader::Tier,
+            tail,
+            &*link.page,
+            link.post_cols(),
+        )
+        .expect("the crossings");
         let end: Arc<dyn Side> = Arc::new(End::new(
             half,
             Held {

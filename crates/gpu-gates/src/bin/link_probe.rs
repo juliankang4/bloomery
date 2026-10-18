@@ -61,7 +61,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod probe {
     use bloomery_gpu::host::step::RELEASE;
-    use bloomery_gpu::host::{Crossing, RdmaEnd, Reader, link_tail};
+    use bloomery_gpu::host::{Crossing, PostCols, RdmaEnd, Reader, Span, link_tail};
     use bloomery_gpu::{Gpu, MappedHost, mem_batch, op_add, op_barrier_sys, op_wait_geq, window};
     use bloomery_gpu_gates::{GateError, verdict};
     use bloomery_verbs::{Endpoint, Gid};
@@ -297,13 +297,13 @@ mod probe {
                 Crossing {
                     counter: self.go(j),
                     reader: Reader::Tier,
-                    spans: vec![image],
+                    spans: vec![Span::whole(image)],
                     prog: None,
                 },
                 Crossing {
                     counter: self.done(j),
                     reader: Reader::Stage,
-                    spans: vec![rows],
+                    spans: vec![Span::whole(rows)],
                     prog: None,
                 },
             ]
@@ -352,6 +352,7 @@ mod probe {
                     side,
                     &o.dev,
                     o.gid,
+                    PostCols::default(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;

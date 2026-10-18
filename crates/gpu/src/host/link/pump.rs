@@ -24,12 +24,16 @@
 //! post made before the delivery still reads, but for the tier's fault copy
 //! in a pass of two rows (`docs/contrib/dgx-spark.md` 9.5, item 2).
 //!
+//! A span may hold a row's columns one after another ([`Span`]): a post
+//! carries only the columns the chain in flight uses ([`PostCols`]).
+//!
 //! The inbox and two staging words per crossing (the generation a post sends
 //! and the progress a reset sends) are the link's tail, past the tier page's
 //! own bytes ([`TAIL_LINE`]).
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// A page of 4-byte words an end reads and writes by byte offset.
@@ -85,11 +89,59 @@ pub struct Crossing {
     pub reader: Reader,
     /// Byte spans the writing card fills before it adds to the counter,
     /// carried to the reader's page before each generation.
-    pub spans: Vec<Range<usize>>,
+    pub spans: Vec<Span>,
     /// The progress word on the reader's page that the reader's end adds one
     /// to for each generation it delivers, with every other done of the same
     /// tier; `None` for a go.
     pub prog: Option<usize>,
+}
+
+/// A byte range a crossing publishes, laid out as `cols` equal columns one
+/// after another: a post carries its first columns, as many as the end's
+/// [`PostCols`] holds when it posts, and all of a span of one column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub bytes: Range<usize>,
+    pub cols: usize,
+}
+
+impl Span {
+    /// The span carried whole: one column.
+    #[must_use]
+    pub fn whole(bytes: Range<usize>) -> Span {
+        Span { bytes, cols: 1 }
+    }
+
+    /// Bytes a post carries when its chain uses `cols` columns.
+    #[must_use]
+    pub fn bytes_at(&self, cols: usize) -> usize {
+        self.bytes.len() / self.cols * cols.min(self.cols)
+    }
+}
+
+/// The columns of a row the chain in flight uses, which every end over one
+/// page reads when it posts ([`Span::bytes_at`]); every column until a chain
+/// sets it. The tier's host sets it before it launches or enqueues a chain,
+/// so each done that chain writes is posted after the set, and every done of
+/// a pass is delivered before the host starts the next.
+#[derive(Clone, Debug)]
+pub struct PostCols(Arc<AtomicUsize>);
+
+impl Default for PostCols {
+    fn default() -> PostCols {
+        PostCols(Arc::new(AtomicUsize::new(usize::MAX)))
+    }
+}
+
+impl PostCols {
+    /// The chain about to run uses `cols` columns of a row.
+    pub fn set(&self, cols: usize) {
+        self.0.store(cols, Ordering::Release);
+    }
+
+    pub(crate) fn get(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// One side's last generation of a counter: delivered on the reader,
@@ -168,19 +220,22 @@ pub(super) struct Half {
     /// that asked for it left this end's counters where they were: a later
     /// settle does not wait for them again ([`Half::settle`]).
     unsettled: bool,
+    cols: PostCols,
 }
 
 impl Half {
     /// The end on the side `side` over `crossings`, whose tail lines start at
     /// byte `tail` of both pages, in crossing order. Every generation and
     /// inbox is taken as `page` holds it now, so nothing already there is
-    /// delivered again. A crossing whose counter, progress word or span is
-    /// not 4-aligned before the tail is refused by name.
+    /// delivered again. A crossing whose counter, progress word or span's
+    /// columns are not 4-aligned before the tail is refused by name. Each
+    /// post carries the columns `cols` holds.
     pub(super) fn new(
         crossings: Vec<Crossing>,
         side: Reader,
         tail: usize,
         page: &dyn Page,
+        cols: PostCols,
     ) -> Result<Half, String> {
         let fits = |r: &Range<usize>| {
             r.start.is_multiple_of(4)
@@ -191,10 +246,15 @@ impl Half {
         if let Some(c) = crossings.iter().find(|c| {
             !fits(&(c.counter..c.counter + 4))
                 || c.prog.is_some_and(|p| !fits(&(p..p + 4)))
-                || !c.spans.iter().all(fits)
+                || !c.spans.iter().all(|s| {
+                    fits(&s.bytes)
+                        && s.cols > 0
+                        && s.bytes.len().is_multiple_of(s.cols)
+                        && (s.bytes.len() / s.cols).is_multiple_of(4)
+                })
         }) {
             return Err(format!(
-                "the crossing {c:?} is not 4-aligned before the link's tail at byte {tail}"
+                "the crossing {c:?} is not 4-aligned columns before the link's tail at byte {tail}"
             ));
         }
         let moves = Vec::with_capacity(
@@ -224,6 +284,7 @@ impl Half {
             moves,
             broken: None,
             unsettled: false,
+            cols,
         };
         for i in 0..h.lines.len() {
             let l = &mut h.lines[i];
@@ -292,12 +353,13 @@ impl Half {
                 return false;
             }
         }
+        let cols = self.cols.get();
         let moves = &mut self.moves;
         moves.clear();
         moves.extend(line.c.spans.iter().map(|s| Move {
-            from: s.start,
-            to: s.start,
-            len: s.len(),
+            from: s.bytes.start,
+            to: s.bytes.start,
+            len: s.bytes_at(cols),
         }));
         page.word(line.gen_slot()).store(g, Ordering::Relaxed);
         moves.push(Move {
@@ -531,7 +593,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::super::{DRAIN, End, Memory, Mirror, Pump, Side};
-    use super::{Crossing, Half, Move, Page, Reader, Relay, TAIL_LINE, Wire};
+    use super::{Crossing, Half, Move, Page, PostCols, Reader, Relay, Span, TAIL_LINE, Wire};
     use crate::host::step::RELEASE;
 
     struct Mem(Vec<AtomicU32>);
@@ -725,13 +787,13 @@ mod tests {
             Crossing {
                 counter: GO,
                 reader: Reader::Tier,
-                spans: vec![image],
+                spans: vec![Span::whole(image)],
                 prog: None,
             },
             Crossing {
                 counter: CNT,
                 reader: Reader::Stage,
-                spans: vec![rows],
+                spans: vec![Span::whole(rows)],
                 prog: Some(PROG),
             },
         ]
@@ -767,7 +829,8 @@ mod tests {
         tier_wire: impl Wire + 'static,
     ) -> Mirror<Mem> {
         let half = |side, page: &Arc<Mem>| {
-            Half::new(row(), side, TAIL, &**page).expect("the model row fits before the tail")
+            Half::new(row(), side, TAIL, &**page, PostCols::default())
+                .expect("the model row fits before the tail")
         };
         Mirror {
             pumps: Vec::new(),
@@ -1075,7 +1138,8 @@ mod tests {
         let stage = page(&[]);
         let tier = page(&[]);
         let tier_end = Arc::new(End::new(
-            Half::new(two_tiers(), Reader::Tier, TAIL, &*tier).expect("the tier's crossings"),
+            Half::new(two_tiers(), Reader::Tier, TAIL, &*tier, PostCols::default())
+                .expect("the tier's crossings"),
             StepOnReap {
                 wire: wire(&tier, &stage),
                 step: None,
@@ -1084,7 +1148,14 @@ mod tests {
             Arc::clone(&tier),
         ));
         let stage_end = Arc::new(End::new(
-            Half::new(two_tiers(), Reader::Stage, TAIL, &*stage).expect("the stage's crossings"),
+            Half::new(
+                two_tiers(),
+                Reader::Stage,
+                TAIL,
+                &*stage,
+                PostCols::default(),
+            )
+            .expect("the stage's crossings"),
             StepOnReap {
                 wire: wire(&stage, &tier),
                 step: Some(Box::new({
@@ -1289,5 +1360,38 @@ mod tests {
                 .broken()
                 .is_some_and(|b| b.contains("the test wire failed"))
         );
+    }
+
+    // A done whose rows hold four columns carries the columns its chain
+    // uses: a chain of one column leaves the other three as the stage's page
+    // held them, and a chain of all four carries every one.
+    #[test]
+    fn a_done_carries_the_columns_its_chain_uses() {
+        let stage = page(&[]);
+        let tier = page(&[]);
+        let mut crossings = row();
+        crossings[1].spans = vec![Span {
+            bytes: ROWS..ROWS + 64,
+            cols: 4,
+        }];
+        let cols = PostCols::default();
+        let mut end = Half::new(crossings, Reader::Tier, TAIL, &*tier, cols.clone())
+            .expect("the model row fits before the tail");
+        let mut done = wire(&tier, &stage);
+        for (generation, used) in [(1u32, 1usize), (2, 4)] {
+            let value = |w: usize| generation << 8 | w as u32;
+            for w in 0..16 {
+                tier.word(ROWS + 4 * w).store(value(w), Ordering::Relaxed);
+            }
+            cols.set(used);
+            tier.word(CNT).store(generation, Ordering::Release);
+            assert!(end.pass(&*tier, &mut done));
+            for w in 0..16 {
+                let want = if w < 4 * used { value(w) } else { 0 };
+                let got = stage.word(ROWS + 4 * w).load(Ordering::Acquire);
+                assert_eq!(got, want, "word {w} of the rows at {used} columns");
+            }
+        }
+        assert_eq!(end.broken(), None);
     }
 }

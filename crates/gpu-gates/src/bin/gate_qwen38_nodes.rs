@@ -89,6 +89,7 @@ mod gate {
     use bloomery_gpu::host::node::wire::{In, MAX_FRAME, Out as Payload, Tag};
     use bloomery_gpu::host::node::{NodeOpen, TierNode, node_cards};
     use bloomery_gpu::host::slots::SlotMap;
+    use bloomery_gpu::host::step::Chain;
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::host::tier::{TierAct, TierCard, TierOpen, TierSet, TierShape};
     use bloomery_gpu_gates::{
@@ -1647,7 +1648,8 @@ mod gate {
             read_terms = Some(Terms::of(&plan, u64::try_from(c.inputs.hp.n_embd)?)?);
             let tiers = s.model().body(NAME)?.hybrid().tiers();
             for tier in tiers {
-                wire.push((tier.cols(), tier.page_layout(tiers.len())?.wire_bytes()));
+                let layout = tier.page_layout(tiers.len())?;
+                wire.push((tier.cols(), layout.wire_bytes(Chain::Step.cols())));
             }
         }
         record::Record::new(&record::TIER_COST)

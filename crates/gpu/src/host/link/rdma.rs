@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use bloomery_verbs::{Endpoint, MAX_CHAIN, Nic, Qp, Region, WC_RDMA_WRITE, Wc, Write};
 
-use super::pump::{Crossing, Half, Move, Reader, Wire};
+use super::pump::{Crossing, Half, Move, PostCols, Reader, Wire};
 use super::{End, Pump, Side};
 use crate::GpuError;
 use crate::graph::MappedHost;
@@ -109,9 +109,10 @@ pub struct RdmaEnd {
 impl RdmaEnd {
     /// The end on side `side` over `page`, carrying `crossings` with their
     /// tail lines from byte `tail` ([`super::link_tail`]), on port 1 of the
-    /// RoCE device `dev` with GID index `gid`. The relay takes every word as
-    /// `page` holds it now. A crossing whose counter, progress word or span
-    /// is not 4-aligned before the tail is refused by name. Load-time only.
+    /// RoCE device `dev` with GID index `gid`, each post carrying the columns
+    /// `cols` holds. The relay takes every word as `page` holds it now. A
+    /// crossing whose counter, progress word or span's columns are not
+    /// 4-aligned before the tail is refused by name. Load-time only.
     pub fn new(
         page: Arc<MappedHost>,
         tail: usize,
@@ -119,11 +120,12 @@ impl RdmaEnd {
         side: Reader,
         dev: &str,
         gid: u8,
+        cols: PostCols,
     ) -> Result<RdmaEnd, GpuError> {
         let what = "the link's RDMA end";
         let depth: usize = crossings.iter().map(|c| c.spans.len() + 2).sum();
         let half =
-            Half::new(crossings, side, tail, &*page).map_err(|e| GpuError::shape(what, e))?;
+            Half::new(crossings, side, tail, &*page, cols).map_err(|e| GpuError::shape(what, e))?;
         let nic = Nic::open(dev, gid).map_err(|e| GpuError::shape(what, e.to_string()))?;
         // SAFETY: the end holds `page` after its wire, so the page drops after
         // the region: the range stays allocated while it is registered.
