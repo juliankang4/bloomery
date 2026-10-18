@@ -95,6 +95,7 @@
 # on stdout ends in `scan=failed`, names what failed, and no rows follow; the detail is on stderr:
 #   missing              no target/release/<binary>
 #   section=none         the binary carries no .oxart section (a host-only binary?)
+#   section=unread       wc could not read the section's size
 #   extract=failed       the extractor rejected the section or a declaration, met a generated symbol
 #                        its module does not declare, or is not there
 #   modules=0            the section carries no PTX payload
@@ -108,7 +109,7 @@
 #   bytescan=failed      the byte scan itself failed
 #   rows=0               no entry, or none the entry substring matches
 #   digest-unread=NAME   the extractor wrote no normalized body for these entries (`method`: it named
-#                        no digest method)
+#                        no digest method), or md5sum or wc could not read the body of this one
 #   keep=failed          PTX_SCAN_KEEP names a directory the modules could not be copied into
 # 2: a usage error (no binary, more than one entry substring, a flag other than --no-jit).
 # 64: an arch the blk/SM column holds no limits for (BLOOMERY_ARCH or PTX_SCAN_ARCH; see the column below).
@@ -174,7 +175,7 @@ with tempfile.TemporaryDirectory(prefix="ptx-scan-test.") as tmp:
         path.chmod(0o755)
 
     executable(tree / "target/release/gate_x", "exit 0\n")
-    executable(binaries / "objcopy", 'for arg; do out=$arg; done\nprintf section > "$out"\n')
+    executable(binaries / "objcopy", 'for arg; do out=$arg; done\nprintf %s "${PTX_FIX_SECTION:-section}" > "$out"\n')
     executable(binaries / "extract", '''
 mkdir -p "$3/norm"
 cp "$PTX_FIXTURE"/mod*.ptx "$3/"
@@ -182,6 +183,7 @@ printf 'fixture\n' > "$3/norm-method"
 for entry in q4k_gemv zero_loads next_module; do
     printf '%s\n' "$entry" > "$3/norm/$entry"
 done
+[ -z "${PTX_FIX_NORM:-}" ] || printf '%s\n' "$PTX_FIX_NORM" > "$3/norm/next_module"
 printf 'mod1 bundle=fixture bytes=1\nmod2 bundle=fixture bytes=1\n'
 ''')
     executable(binaries / "ptxas", '''
@@ -344,6 +346,24 @@ printf 'q4k_gemv\t32\t0\t256\t128\nzero_loads\t12\t0\t0\t1024\nnext_module\t16\t
     missing = scan(["--no-jit", "gate_x", "absent"])
     check("empty filter remains a failed scan", missing.returncode == 1
           and "rows=0 scan=failed" in missing.stdout and "entry " not in missing.stdout)
+    # md5sum and wc stand-ins first on PATH (tools/ref/read-stubs.sh): a read that fails, of a normalized body's digest or
+    # line count or of the section's size, fails the scan by name with no rows and no digest block.
+    stubs = root / "read-stubs"
+    stubs.mkdir()
+    subprocess.run(["bash", "-c", 'source "$1" && read_stubs "$2"', "read-stubs",
+                    str(scanner.parent / "ref/read-stubs.sh"), str(stubs)], check=True)
+    stubbed = {"PATH": str(stubs) + os.pathsep + env["PATH"]}
+    whole = scan(["--no-jit", "gate_x"], stubbed)
+    check("read stand-ins: a scan whose reads succeed keeps its digest line", whole.returncode == 0
+          and "next_module 0123456789abcdef0123456789abcdef 7" in whole.stdout.splitlines())
+    for text in ("fail-md5", "fail-wc"):
+        unread = scan(["--no-jit", "gate_x"], dict(stubbed, PTX_FIX_NORM=text))
+        check(f"a normalized body whose read fails ({text}) fails the scan by name, no rows, no digest block",
+              unread.returncode == 1 and "digest-unread=next_module scan=failed" in unread.stdout
+              and "entry " not in unread.stdout and "ptx-scan-md5" not in unread.stdout)
+    unsized = scan(["--no-jit", "gate_x"], dict(stubbed, PTX_FIX_SECTION="fail-wc"))
+    check("a section whose size read fails fails the scan by name, no rows", unsized.returncode == 1
+          and "section=unread scan=failed" in unsized.stdout and "entry " not in unsized.stdout)
     rejected = scan(["--no-jit", "gate_x"], {"PTX_FIX_FAIL": "1"})
     check("assembler failure prints no rows", rejected.returncode == 1
           and "ptxas-failed=mod1,mod2 scan=failed" in rejected.stdout and "entry " not in rejected.stdout)
@@ -456,7 +476,11 @@ if ! objcopy -O binary --only-section=.oxart "$BIN" "$PTX" 2>/dev/null || [ ! -s
   echo "ptx-scan: $BIN carries no .oxart section (host-only binary?)" >&2
   fail section=none
 fi
-SEC="section=.oxart bytes=$(wc -c <"$PTX" | tr -d ' ')"
+if ! BYTES=$(wc -c <"$PTX" | tr -d ' '); then
+  echo "ptx-scan: wc could not read the size of $BIN's .oxart section" >&2
+  fail section=unread
+fi
+SEC="section=.oxart bytes=$BYTES"
 # The container is cut by its own parser, never here: one file per bundle that carries PTX.
 if [ ! -x "$EXTRACT" ]; then
   echo "ptx-scan: no extractor $EXTRACT — cargo build --release -p bloomery-gpu-gates --bin oxart_ptx" >&2
@@ -699,7 +723,11 @@ for E in $(awk '{print $1}' "$ROWS" | LC_ALL=C sort); do
     NODIGEST=${NODIGEST:+$NODIGEST,}$E
     continue
   fi
-  printf '%s %s %s\n' "$E" "$(md5sum <"$MODS/norm/$E" | cut -d' ' -f1)" "$(wc -l <"$MODS/norm/$E" | tr -d ' ')" >>"$DIGESTS"
+  if ! SUM=$(md5sum <"$MODS/norm/$E" | cut -d' ' -f1) || ! LINES=$(wc -l <"$MODS/norm/$E" | tr -d ' '); then
+    echo "ptx-scan: md5sum or wc could not read the normalized body of $E ($MODS/norm/$E)" >&2
+    fail "$SEC $TOOLS modules=$NMOD $JITS digest-unread=$E"
+  fi
+  printf '%s %s %s\n' "$E" "$SUM" "$LINES" >>"$DIGESTS"
 done
 METHOD=$(cat "$MODS/norm-method" 2>/dev/null)
 if [ -z "$METHOD" ]; then
