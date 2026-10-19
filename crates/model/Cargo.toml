@@ -29,10 +29,14 @@ bloomery-runtime = { path = "../runtime" }
 # The coverage check asks the tokenizer which pre-tokenizers it runs.
 bloomery-tokenizer = { path = "../tokenizer" }
 libc = { workspace = true }
+# The GLM name map reads a Hugging Face checkpoint's config.json.
+serde_json = "=1.0.151"
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# The GLM name map's tests read the hf crate's gzipped checkpoint fixtures.
+flate2 = "1.1.10"
 # The gates read the oracle sets through the reference-set reader, which checks each set's
 # provenance. It depends on the GGUF reader only, so the edge makes no cycle.
 bloomery-refset = { path = "../refset" }

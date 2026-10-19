@@ -14,6 +14,7 @@
 //! `src/llama-hparams.cpp` unless another file is named.
 
 pub mod fixture;
+pub mod hf;
 pub mod host;
 pub mod hparams;
 pub mod names;
