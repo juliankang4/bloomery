@@ -1,19 +1,22 @@
-//! One row per ggml tensor type: the facts a type owns, in one table.
+//! One row per tensor type: the facts a type owns, in one table for ggml's types and one for
+//! bloomery's own.
 //!
-//! [`QROWS`] holds a literal for every type [`GgmlType`] names, with no `Default`, so a new
-//! type is decided field by field here. [`GgmlType::row`] finds a type's row by its tag. The
+//! [`QROWS`] holds a literal for every ggml type [`GgmlType`] names, and `OWN_ROWS` one for
+//! each of bloomery's own value types, with no `Default`, so a new type is decided field by
+//! field here. [`GgmlType::row`] finds a type's row by its tag. The
 //! size, name, decode and activation questions `quant.rs` answers ([`GgmlType::blck_size`],
 //! [`GgmlType::type_size`], [`GgmlType::name`], [`GgmlType::has_dequant`],
 //! [`crate::activation_format`]) and [`crate::ggml_type_info`] are reads of a row, not lists of
 //! their own. A tag with no row (every [`GgmlType::Unknown`]) answers `None` or a named
 //! refusal from each of them, never a default row.
 //!
-//! The numbers are ggml's. `blck` and `bytes` are `blck_size` and `type_size` of the type_traits
+//! The numbers of [`QROWS`] are ggml's. `blck` and `bytes` are `blck_size` and `type_size` of the type_traits
 //! table (ik_llama.cpp ggml.c:620, mainline's for the types ik lacks), `bytes` as the block
 //! struct's `static_assert` in ggml-common.h gives it; the comment above each row names the
 //! lines. `name` is `ggml_type_name`, which also names the oracle dumps
 //! `$BLOOMERY_DATA/ref/<name>.raw`. The tests in `quant.rs` hold every row to the table
-//! compiled from ggml and to the dispatchers a row describes.
+//! compiled from ggml and to the dispatchers a row describes. `OWN_ROWS` cite the decode
+//! that defines each block.
 
 use crate::quant::GgmlType;
 
@@ -115,6 +118,38 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::Q2_0, name: "q2_0", blck: 64, bytes: 18, dequant: true, host_act: H::Q8_0 },
 ];
 
+/// bloomery's own value types, ids 2000 up, which no ggml table holds: a file holding them
+/// opens in bloomery's readers alone.
+#[rustfmt::skip]
+pub(crate) const OWN_ROWS: &[QRow] = &[
+    // f8e4m3_rows: one F8_E4M3 byte a value times its tensor's one f32 `<stem>.scale`
+    // (`quant::E4m3Rows`), so `dequant_row`, which has no tensor scale, does not decode it.
+    QRow { ty: T::F8E4M3_ROWS, name: "f8e4m3_rows", blck: 1, bytes: 1, dequant: false, host_act: H::None },
+    // mxfp8: OCP MX with F8_E4M3 elements, the block's E8M0 scale byte then its 32 F8_E4M3 bytes
+    // (`quant::check_mxfp8`, `dequant_mxfp8`); no CPU matmul here.
+    QRow { ty: T::MXFP8, name: "mxfp8", blck: 32, bytes: 33, dequant: true, host_act: H::None },
+];
+
+/// The build refuses an own row whose type `from_u32` does not name, whose tag ggml's table
+/// could hold (below 2000), or whose tag another own row has.
+const _: () = {
+    let mut i = 0;
+    while i < OWN_ROWS.len() {
+        let tag = OWN_ROWS[i].ty.as_u32();
+        assert!(tag >= 2000, "an own row's tag is in ggml's range");
+        assert!(
+            !matches!(GgmlType::from_u32(tag), GgmlType::Unknown(_)),
+            "an own row's type is not named by GgmlType::from_u32"
+        );
+        let mut j = 0;
+        while j < i {
+            assert!(OWN_ROWS[j].ty.as_u32() != tag, "two own rows share one tag");
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
 /// The slot a tag has in [`QROWS`], or `NO_ROW`.
 const NO_ROW: u8 = u8::MAX;
 
@@ -153,7 +188,8 @@ const SLOT: [u8; TAG_SPAN] = {
 };
 
 impl GgmlType {
-    /// The row of a type this enum names; `None` for [`GgmlType::Unknown`], whatever tag it holds.
+    /// The row of a type this enum names, ggml's or bloomery's own; `None` for
+    /// [`GgmlType::Unknown`], whatever tag it holds.
     #[must_use]
     #[inline]
     pub const fn row(self) -> Option<&'static QRow> {
@@ -161,9 +197,16 @@ impl GgmlType {
             return None;
         }
         let tag = self.as_u32() as usize;
-        if tag >= TAG_SPAN || SLOT[tag] == NO_ROW {
-            return None;
+        if tag < TAG_SPAN && SLOT[tag] != NO_ROW {
+            return Some(&QROWS[SLOT[tag] as usize]);
         }
-        Some(&QROWS[SLOT[tag] as usize])
+        let mut i = 0;
+        while i < OWN_ROWS.len() {
+            if OWN_ROWS[i].ty.as_u32() as usize == tag {
+                return Some(&OWN_ROWS[i]);
+            }
+            i += 1;
+        }
+        None
     }
 }

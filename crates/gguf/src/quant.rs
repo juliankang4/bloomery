@@ -71,6 +71,10 @@ use crate::qtype::HostAct;
 /// Q8_1=9 and Q8_K=15 are ggml's activation forms (ggml.h:399, :405): named so the table of
 /// ggml's types is whole, sized, and decoded by nothing here.
 ///
+/// F8E4M3_ROWS=2000 and MXFP8=2001 are bloomery's own value types, in its range of ids no
+/// ggml table holds (2000 up; 1000 up holds its re-layouts of ggml types): their rows are
+/// `qtype::OWN_ROWS`, beside ggml's.
+///
 /// A named type is one this build can size ([`GgmlType::blck_size`],
 /// [`GgmlType::type_size`]): it has a row in [`crate::QROWS`], the one owner
 /// of the facts a type has. Whether it can decode is a separate question
@@ -119,6 +123,8 @@ pub enum GgmlType {
     Q1_0,
     Q8_1,
     Q8_K,
+    F8E4M3_ROWS,
+    MXFP8,
     Unknown(u32),
 }
 
@@ -161,6 +167,8 @@ impl GgmlType {
             40 => GgmlType::NVFP4,
             41 => GgmlType::Q1_0,
             42 => GgmlType::Q2_0,
+            2000 => GgmlType::F8E4M3_ROWS,
+            2001 => GgmlType::MXFP8,
             other => GgmlType::Unknown(other),
         }
     }
@@ -202,6 +210,8 @@ impl GgmlType {
             GgmlType::NVFP4 => 40,
             GgmlType::Q1_0 => 41,
             GgmlType::Q2_0 => 42,
+            GgmlType::F8E4M3_ROWS => 2000,
+            GgmlType::MXFP8 => 2001,
             GgmlType::Unknown(v) => v,
         }
     }
@@ -269,8 +279,8 @@ pub enum QuantError {
         need: usize,
         n: usize,
     },
-    /// A block scale byte the format leaves undefined: no value is written
-    /// for it.
+    /// A block scale byte the format leaves undefined, or one a value of its
+    /// block leaves f32's range at: no value is written for it.
     #[error("dequant {ty}: block {block} sub-block {sub} holds scale byte {byte:#04x}, {why}")]
     UndefinedScale {
         ty: GgmlType,
@@ -346,6 +356,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::IQ4_NL => dequant_iq4_nl(&src[..need], dst),
         GgmlType::IQ4_XS => dequant_iq4_xs(&src[..need], dst),
         GgmlType::Q2_0 => dequant_q2_0(&src[..need], dst),
+        GgmlType::MXFP8 => dequant_mxfp8(&src[..need], dst)?,
         GgmlType::Q4_0
         | GgmlType::Q4_1
         | GgmlType::IQ1_S
@@ -361,6 +372,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         | GgmlType::Q1_0
         | GgmlType::Q8_1
         | GgmlType::Q8_K
+        | GgmlType::F8E4M3_ROWS
         | GgmlType::Unknown(_) => return Err(QuantError::Unsupported(ty)),
     }
     Ok(())
@@ -893,7 +905,7 @@ fn ue4m3(byte: u8) -> Result<f32, &'static str> {
     Ok(raw * 0.5)
 }
 
-/// Rows of bloomery's F8 type ([`crate::F8E4M3_ROWS`]) decoded: each byte an
+/// Rows of bloomery's F8 type ([`GgmlType::F8E4M3_ROWS`], one byte a value) decoded: each byte an
 /// F8_E4M3 value (OCP E4M3FN: a sign bit, four exponent bits of bias 7, three
 /// mantissa bits, `m · 2^-9` at exponent 0) times the tensor's scale, the one
 /// rounding of the exact value's product with the scale. 0x7F and 0xFF,
@@ -928,7 +940,7 @@ impl E4m3Rows {
     /// value of the span is written.
     pub fn decode(&self, src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
         let src = src.get(..dst.len()).ok_or(QuantError::ShortSrc {
-            ty: GgmlType::Unknown(crate::F8E4M3_ROWS.id),
+            ty: GgmlType::F8E4M3_ROWS,
             src: src.len(),
             need: dst.len(),
             n: dst.len(),
@@ -941,6 +953,87 @@ impl E4m3Rows {
         }
         Ok(())
     }
+}
+
+// ------------------------------------------------------------------- MXFP8
+
+/// Whether bloomery's MXFP8 blocks `src` ([`GgmlType::MXFP8`], whole 33-byte
+/// blocks: the block's E8M0 scale byte, then its 32 F8_E4M3 bytes) hold only values: a scale byte 0xFF (E8M0's NaN) is
+/// [`QuantError::UndefinedScale`] naming its block, a value byte 0x7F or
+/// 0xFF (E4M3's NaN) [`QuantError::E4m3Nan`] naming its index in the span,
+/// a scale a value of its block leaves f32's range at (a product of
+/// 2^128 or more) [`QuantError::UndefinedScale`] naming its block, and a
+/// partial last block [`QuantError::ShortSrc`].
+///
+/// # Errors
+///
+/// The first such byte, or the partial block.
+pub fn check_mxfp8(src: &[u8]) -> Result<(), QuantError> {
+    let ty = GgmlType::MXFP8;
+    let (blocks, tail) = src.as_chunks::<33>();
+    if !tail.is_empty() {
+        return Err(QuantError::ShortSrc {
+            ty,
+            src: src.len(),
+            need: src.len().next_multiple_of(33),
+            n: 32 * (blocks.len() + 1),
+        });
+    }
+    for (block, blk) in blocks.iter().enumerate() {
+        if blk[0] == 0xFF {
+            return Err(QuantError::UndefinedScale {
+                ty,
+                block,
+                sub: 0,
+                byte: 0xFF,
+                why: "E8M0's NaN",
+            });
+        }
+        if let Some(j) = blk[1..].iter().position(|&b| b & 0x7F == 0x7F) {
+            return Err(QuantError::E4m3Nan {
+                at: 32 * block + j,
+                byte: blk[1 + j],
+            });
+        }
+        // A value of exponent field F >= 1 lies in [2^(F - 7), 2^(F - 6)) and
+        // one of field 0 below 2^-6, so times 2^(E - 127) a value reaches
+        // 2^128 exactly when E + F >= 262. A quantizer of f32 weights writes
+        // E <= 246, which no field reaches.
+        let top = blk[1..].iter().map(|&b| (b & 0x7F) >> 3).max().unwrap_or(0);
+        if u16::from(blk[0]) + u16::from(top) >= 262 {
+            return Err(QuantError::UndefinedScale {
+                ty,
+                block,
+                sub: 0,
+                byte: blk[0],
+                why: "a value times it leaves f32's range",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// bloomery's MXFP8 blocks decoded (OCP MX with F8_E4M3 elements): value `j`
+/// of a block is its byte `1 + j` as F8_E4M3 ([`E4m3Rows`] at scale 1, exact)
+/// times the block's scale `2^(E − 127)` (twice [`e8m0_to_f32_half`]), `E`
+/// its byte 0 — one rounding, none at all for a normal product.
+/// [`check_mxfp8`]'s refusals come before any value is written; `src` holds
+/// `dst`'s blocks exactly ([`dequant_row`]).
+fn dequant_mxfp8(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
+    check_mxfp8(src)?;
+    let e4m3 = E4m3Rows::new(1.0);
+    for (blk, out) in src
+        .as_chunks::<33>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<32>().0)
+    {
+        let d = 2.0 * e8m0_to_f32_half(blk[0]);
+        for (o, &b) in out.iter_mut().zip(&blk[1..]) {
+            *o = e4m3.table[usize::from(b)] * d;
+        }
+    }
+    Ok(())
 }
 
 /// Port of `dequantize_row_nvfp4` (llama.cpp-mainline ggml-quants.c:589-612).
@@ -1403,7 +1496,7 @@ impl Q8Block {
 
 #[cfg(test)]
 mod tests {
-    use super::{GgmlType, QuantError, activation_format, dequant_row};
+    use super::{GgmlType, QuantError, activation_format, check_mxfp8, dequant_row};
     use crate::qtype::{HostAct, QROWS};
 
     /// `(id, ggml_type_name, ggml_blck_size, ggml_type_size)` for every id
@@ -2102,7 +2195,12 @@ mod tests {
             &[],
             &[
                 (
-                    decl("t.weight", vec![160, 2], crate::F8E4M3_ROWS.id, 320),
+                    decl(
+                        "t.weight",
+                        vec![160, 2],
+                        GgmlType::F8E4M3_ROWS.as_u32(),
+                        320,
+                    ),
                     table,
                 ),
                 (decl("t.scale", vec![1], 0, 4), SCALE.to_le_bytes().to_vec()),
@@ -2125,6 +2223,148 @@ mod tests {
                 assert_eq!(g.to_bits(), bits, "row {r} value {i} byte {b:#04x}");
             }
         }
+    }
+
+    /// bloomery's MXFP8 blocks read through a split (its row sizes the type
+    /// at 33 bytes a 32 values) decode to the f64 reference, the E4M3
+    /// value times `2^(E − 127)` rounded once to f32, for every scale byte
+    /// below 0xFF (the subnormal `2^-127` at 0 and the subnormal products
+    /// among them) and every value byte that holds a value: bit for bit, the
+    /// sign of zero included, up to the largest finite product (1.875 · 2^127).
+    /// A NaN scale byte, a NaN value byte, a scale a value of its block
+    /// leaves f32's range at, a partial block and a short source are refused
+    /// by name, and a refusal writes no value. The host tier's matmul has no
+    /// MXFP8 kernel and refuses the type by name.
+    #[test]
+    fn mxfp8_blocks_decode_to_the_reference() {
+        use crate::write::{TensorDecl, write_file};
+        let ty = GgmlType::MXFP8;
+        let values: Vec<u8> = (0..=u8::MAX).filter(|b| b & 0x7F != 0x7F).collect();
+        // One block a scale byte 0..=254: 255 blocks, 15 a row, 17 rows. A
+        // block holds the values whose product with its scale is a finite f32.
+        let mut blocks = Vec::new();
+        for e in 0..=254u8 {
+            let scale = 2f64.powi(i32::from(e) - 127);
+            let held: Vec<u8> = values
+                .iter()
+                .copied()
+                .filter(|b| ue4m3(b & 0x7F) * scale <= f64::from(f32::MAX))
+                .collect();
+            blocks.push(e);
+            for j in 0..32 {
+                blocks.push(held[(32 * usize::from(e) + j) % held.len()]);
+            }
+        }
+        let path = std::env::temp_dir().join(format!("gguf-mxfp8-{}.gguf", std::process::id()));
+        let decl = TensorDecl {
+            name: "t.weight".to_string(),
+            dims: vec![480, 17],
+            type_id: GgmlType::MXFP8.as_u32(),
+            nbytes: blocks.len() as u64,
+        };
+        write_file(&path, &[], &[(decl, blocks.clone())]);
+        let split = crate::Split::open(&path);
+        std::fs::remove_file(&path).unwrap();
+        let split = split.unwrap();
+        let (s, t) = split.find("t.weight").unwrap();
+        assert_eq!((t.ty, t.nbytes), (ty, 255 * 33));
+        assert_eq!((ty.blck_size(), ty.type_size()), (Some(32), Some(33)));
+        let data = split.shard(s).unwrap().data(t).unwrap();
+        let mut got = vec![0.0f32; 255 * 32];
+        dequant_row(ty, data, &mut got).unwrap();
+        for (e, (blk, out)) in blocks
+            .as_chunks::<33>()
+            .0
+            .iter()
+            .zip(got.chunks(32))
+            .enumerate()
+        {
+            let scale = 2f64.powi(e as i32 - 127);
+            for (j, (&b, g)) in blk[1..].iter().zip(out).enumerate() {
+                let sign = if b & 0x80 == 0 { 1.0 } else { -1.0 };
+                let want = (sign * ue4m3(b & 0x7F) * scale) as f32;
+                assert_eq!(g.to_bits(), want.to_bits(), "E {e} value {j} byte {b:#04x}");
+            }
+        }
+        let refused = |src: &[u8], n: usize| {
+            let mut dst = vec![0.0f32; n];
+            let e = dequant_row(ty, src, &mut dst).expect_err("refused");
+            assert!(dst.iter().all(|v| *v == 0.0), "{e}: a value was written");
+            e
+        };
+        let mut nan_scale = blocks[..66].to_vec();
+        nan_scale[33] = 0xFF;
+        let e = refused(&nan_scale, 64);
+        assert_eq!(
+            e,
+            QuantError::UndefinedScale {
+                ty,
+                block: 1,
+                sub: 0,
+                byte: 0xFF,
+                why: "E8M0's NaN"
+            }
+        );
+        assert!(e.to_string().contains("block 1"), "{e}");
+        for byte in [0x7Fu8, 0xFF] {
+            let mut nan_value = blocks[..66].to_vec();
+            nan_value[33 + 1 + 5] = byte;
+            assert_eq!(
+                refused(&nan_value, 64),
+                QuantError::E4m3Nan { at: 37, byte }
+            );
+        }
+        // At E = 254 byte 0x3F (1.875) is the largest finite value and 0x40
+        // (2) reaches 2^128; at E = 247 byte 0xF8 (-256) does.
+        let mut edge = vec![254u8];
+        edge.extend([0x3F, 0xBF].repeat(16));
+        let mut out = [0.0f32; 32];
+        dequant_row(ty, &edge, &mut out).unwrap();
+        assert!(out.iter().all(|v| v.abs() == 1.875 * 2f32.powi(127)));
+        for (scale, byte) in [(254u8, 0x40u8), (247, 0xF8)] {
+            let mut big = blocks[..66].to_vec();
+            big[33] = scale;
+            big[33 + 1 + 9] = byte;
+            assert_eq!(
+                refused(&big, 64),
+                QuantError::UndefinedScale {
+                    ty,
+                    block: 1,
+                    sub: 0,
+                    byte: scale,
+                    why: "a value times it leaves f32's range"
+                }
+            );
+        }
+        assert!(matches!(
+            check_mxfp8(&blocks[..40]),
+            Err(QuantError::ShortSrc {
+                src: 40,
+                need: 66,
+                n: 64,
+                ..
+            })
+        ));
+        assert!(matches!(
+            refused(&blocks[..40], 64),
+            QuantError::ShortSrc {
+                src: 40,
+                need: 66,
+                ..
+            }
+        ));
+        assert!(matches!(
+            refused(&blocks[..66], 48),
+            QuantError::UnalignedDst {
+                dst: 48,
+                blck: 32,
+                ..
+            }
+        ));
+        assert_eq!(
+            activation_format(ty),
+            Err(QuantError::NoActivationFormat(ty))
+        );
     }
 
     /// IQ2_XXS against a block ggml made: `quantize_iq2_xxs` over 256

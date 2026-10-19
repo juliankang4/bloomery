@@ -1,5 +1,5 @@
-//! gate_qwen3moe_types — every routed type a qwen3moe file may carry plans
-//! under the `--place`-unset defaults, before any load.
+//! Qwen3moe routed types plan under the `--place`-unset defaults; MXFP8
+//! attention projections load whole and placed.
 //!
 //! For each GGML type the host's routed kernels run here (`qdot::supports`:
 //! the types a host expert of any file runs, the card kernel table's among
@@ -7,9 +7,9 @@
 //! that type ([`routed_header`]: the chain's smallest whole super-block widths,
 //! every other tensor a Q4_K or F32 one of its chain shape, so nothing but the
 //! routed type moves the answer), written to a temp directory and read by the
-//! planner's own header reads on this card's census. No weight is uploaded and
-//! no model file is opened, so the fixture tier runs it as the real tier does
-//! (tools/ref/ref-paths.sh's qwen3moe row is `self`).
+//! planner's own header reads on this card's census. These planning clauses
+//! upload no weights. The load clause opens the same synthetic layout with
+//! MXFP8 attention projections; no external model file is needed.
 //!
 //! - (a) the CLI's default (`q3types::cli_default`: `q3place::unplaced_qwen3`
 //!   at the CLI's 4096) answers, and holds to what the card runs: the whole
@@ -21,6 +21,8 @@
 //!   slots) answers and holds as (a).
 //! - (c) the whole load's refusal of a Q8_0 gate·up is the load's own text
 //!   ([`REFUSED_TEXT`]).
+//! - (d) a file with MXFP8 attention projections opens whole and placed,
+//!   resolving its uploaded weights through the body's dense sites.
 //!
 //! The header is written over a sparse file of its full length. Every type
 //! prints one line per arm; a refusal or a break of the rule is red by name
@@ -41,8 +43,10 @@ mod q3types;
 #[cfg(feature = "gpu")]
 mod gate {
     use super::q3types;
-    use bloomery_gpu::Qwen3moeModel;
+    use bloomery_gpu::arch::qwen3moe::KvQ8;
+    use bloomery_gpu::{Gpu, Qwen3moeModel};
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
+    use bloomery_levers::HostCfg;
     use gguf::quant::GgmlType;
     use std::path::PathBuf;
 
@@ -53,7 +57,7 @@ mod gate {
                                 gate·up, which the card kernel table names no entry for here";
 
     pub fn run() -> Result<(), GateError> {
-        bloomery_levers::at_main(&[])?;
+        let host = bloomery_levers::at_main(&[])?.host();
         let types: Vec<GgmlType> = (0..64)
             .map(GgmlType::from_u32)
             .filter(|&t| !matches!(t, GgmlType::Unknown(_)) && qdot::supports(t))
@@ -67,6 +71,7 @@ mod gate {
             ok &= one_type(ty)?;
         }
         ok &= refused_text()?;
+        ok &= dense_load(host)?;
         println!("gate_qwen3moe_types: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());
@@ -77,7 +82,7 @@ mod gate {
     /// (a) and (b) for routed stacks of `ty`, one line each; a refusal is
     /// printed with the planner's text and counts red.
     fn one_type(ty: GgmlType) -> Result<bool, GateError> {
-        let path = routed_header(ty)?;
+        let path = routed_header(ty, GgmlType::Q4_K)?;
         let split = gguf::Split::open(&path)?;
         let arms = [
             ("cli", q3types::cli_default(&split)),
@@ -99,7 +104,7 @@ mod gate {
 
     /// (c): the whole load's refusal of a Q8_0 gate·up is the load's own text.
     fn refused_text() -> Result<bool, GateError> {
-        let path = routed_header(GgmlType::Q8_0)?;
+        let path = routed_header(GgmlType::Q8_0, GgmlType::Q4_K)?;
         let split = gguf::Split::open(&path)?;
         let text = match Qwen3moeModel::whole_load(&split) {
             Ok(_) => "the whole load read it".to_owned(),
@@ -114,6 +119,49 @@ mod gate {
         Ok(ok)
     }
 
+    fn dense_load(host: HostCfg) -> Result<bool, GateError> {
+        let path = routed_header(GgmlType::Q4_K, GgmlType::MXFP8)?;
+        let mut ok = true;
+        for arm in ["whole", "placed"] {
+            let file = gguf::Split::open(&path)?;
+            let opts = Qwen3moeModel::lever_opts(128, KvQ8::F16)?;
+            let loaded = if arm == "whole" {
+                Qwen3moeModel::whole_load(&file)?;
+                Qwen3moeModel::open(Gpu::new()?, file, opts)
+            } else {
+                use bloomery_gpu_gates::generate::Place;
+                use model::placement::PlanLevers;
+                let q = q3types::q3place::PlaceQ3::qwen3(
+                    &file,
+                    Place::parse("cuda0")?,
+                    opts.ctx,
+                    opts.kv,
+                )?;
+                let plan = q.plan(opts.ctx, &PlanLevers::default())?;
+                Qwen3moeModel::open_placed(file, &plan, opts, host)
+            };
+            match loaded {
+                Ok(model) => {
+                    let resident = matches!(
+                        model.weights().get("blk.0.attn_q.weight"),
+                        Some(bloomery_gpu::weights::DevWeight::Mxfp8 { .. })
+                    );
+                    println!(
+                        "types: MXFP8 {arm} load resident={resident} {}",
+                        verdict(resident)
+                    );
+                    ok &= resident;
+                }
+                Err(e) => {
+                    println!("types: MXFP8 {arm} load: {e} {}", verdict(false));
+                    ok = false;
+                }
+            }
+        }
+        std::fs::remove_file(path)?;
+        Ok(ok)
+    }
+
     /// A qwen3moe header whose every layer's routed stacks are of `ty`,
     /// written to a fresh temp directory: two layers of the chain's smallest
     /// whole super-block widths (hidden 256, expert width 256), the flash's
@@ -121,11 +169,13 @@ mod gate {
     /// router's own shape of 128 experts of eight used as an F32 router
     /// weight, each routed stack one expert's matrix by 128 (the expert count
     /// its last dim, as the planner reads a stack), and every other tensor of
-    /// the same names a Q4_K or F32 one of its chain shape. A type with no
-    /// block info is refused by name.
-    fn routed_header(ty: GgmlType) -> Result<PathBuf, GateError> {
+    /// the same names a Q4_K or F32 one of its chain shape, except the
+    /// attention projections of type `dense`. A type with no block info is
+    /// refused by name.
+    fn routed_header(ty: GgmlType, dense: GgmlType) -> Result<PathBuf, GateError> {
         const LAYERS: usize = 2;
         let (q4_k, routed, f32_id) = (GgmlType::Q4_K.as_u32(), ty.as_u32(), GgmlType::F32.as_u32());
+        let dense = dense.as_u32();
         let u32v = |k: &str, v: u32| (format!("qwen3moe.{k}"), gguf::Value::U32(v));
         let kvs = vec![
             (
@@ -154,8 +204,10 @@ mod gate {
         ];
         let tensor =
             |name: &str, dims: &[u64], ty: u32| -> Result<gguf::write::TensorDecl, GateError> {
-                let (_, blck, tsz) = gguf::ggml_type_info(ty)
-                    .ok_or_else(|| format!("tensor {name}: ggml type {ty} has no block info"))?;
+                let t = GgmlType::from_u32(ty);
+                let (Some(blck), Some(tsz)) = (t.blck_size(), t.type_size()) else {
+                    return Err(format!("tensor {name}: type {ty} has no block info").into());
+                };
                 let bytes = gguf::tensor_bytes(blck, tsz, dims)
                     .ok_or_else(|| format!("tensor {name}: its bytes overflow u64"))?;
                 Ok(gguf::write::TensorDecl {
@@ -174,12 +226,16 @@ mod gate {
         for l in 0..LAYERS {
             let per_layer = [
                 (format!("blk.{l}.attn_norm.weight"), vec![256, 1], f32_id),
-                (format!("blk.{l}.attn_q.weight"), vec![256, 1024], q4_k),
-                (format!("blk.{l}.attn_k.weight"), vec![256, 128], q4_k),
-                (format!("blk.{l}.attn_v.weight"), vec![256, 128], q4_k),
+                (format!("blk.{l}.attn_q.weight"), vec![256, 1024], dense),
+                (format!("blk.{l}.attn_k.weight"), vec![256, 128], dense),
+                (format!("blk.{l}.attn_v.weight"), vec![256, 128], dense),
                 (format!("blk.{l}.attn_q_norm.weight"), vec![128, 1], f32_id),
                 (format!("blk.{l}.attn_k_norm.weight"), vec![128, 1], f32_id),
-                (format!("blk.{l}.attn_output.weight"), vec![1024, 256], q4_k),
+                (
+                    format!("blk.{l}.attn_output.weight"),
+                    vec![1024, 256],
+                    dense,
+                ),
                 (format!("blk.{l}.ffn_norm.weight"), vec![256, 1], f32_id),
                 (
                     format!("blk.{l}.ffn_gate_inp.weight"),
@@ -197,7 +253,7 @@ mod gate {
         let layout = gguf::write::Layout::new(&kvs, tensors).map_err(|e| e.to_string())?;
         let dir = std::env::temp_dir().join(format!("bloomery-q3types-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("routed-{ty:?}.gguf"));
+        let path = dir.join(format!("routed-{ty:?}-dense-{dense}.gguf"));
         // The header, then the file's full length as a sparse run of zeros:
         // the bytes a written zero data section holds, none of them stored.
         let len = layout.file_len();

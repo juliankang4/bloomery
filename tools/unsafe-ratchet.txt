@@ -338,7 +338,14 @@ gguf 9 2 0
 # its SAFETY line. The F32 test checks every walk, the 32-chunk one included, against a scalar fma walk.
 # PIN(2026-10-20): gpu 1958 -> 1960 blocks: IQ and MXFP4 hardware refusal tests
 # construct u32-aligned vector-plane windows, each with its SAFETY contract.
-gpu 1960 214 10
+# PIN(2026-10-19): gpu 1960 -> 1974 blocks, 214 -> 222 fns, new code, not old code relaxed: MXFP8 adds 14 blocks
+# and 8 fns, counted on its own diff. q8f32.rs: the ByteBlocks trait's unchecked scale read (an unsafe fn declared and
+# implemented for Q8_0 and MXFP8, one block in each impl), the Q8_0 walk made the generic block walk with the two
+# Q8_0 names kept as wrapper fns (one call each), mxfp8_gemv and mxfp8_gemv_mcol (each its walk call and its lane 0
+# store) and the planes test's scale read, 9 blocks; f32tile.rs's TileRows::stage (an unsafe fn declared and
+# implemented for F32 and MXFP8: the F32 cp.async, the MXFP8 decode's load and its stores), 3 blocks; mxfp8_tile_gemm
+# (gemm/kernels32.rs) its shared-memory view and its body call, 2 blocks. Each block has its SAFETY line.
+gpu 1974 222 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

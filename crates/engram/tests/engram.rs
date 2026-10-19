@@ -675,7 +675,7 @@ fn hw_engram_f8_rows_table_reads_rows_of_its_width() {
     let decl = TensorDecl {
         name: TABLE.to_string(),
         dims: vec![160, 9],
-        type_id: gguf::F8E4M3_ROWS.id,
+        type_id: gguf::GgmlType::F8E4M3_ROWS.as_u32(),
         nbytes: 160 * 9,
     };
     let mut w = Writer::new(

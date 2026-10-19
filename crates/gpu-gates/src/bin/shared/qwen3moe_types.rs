@@ -25,7 +25,7 @@ use model::placement::ctx_ask::DEFAULT_SLOTS;
     dead_code,
     reason = "the decisions plan a qwen3moe file only; the other half serves the CLI and the seat"
 )]
-mod q3place;
+pub(super) mod q3place;
 
 /// The CLI's default context for a qwen3moe run (`generate_qwen3moe`'s
 /// `--ctx` unset).

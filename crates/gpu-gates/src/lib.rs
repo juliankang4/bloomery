@@ -142,6 +142,25 @@ pub fn checks_failed() -> GateError {
     "FAILED: one or more checks above did not pass".into()
 }
 
+/// The optional `--bench-arm` prefix, refused unless it selects an arm.
+/// Call before opening the card; `ops` names every arm the bench can run.
+pub fn bench_arm(
+    args: impl Iterator<Item = String>,
+    mut ops: impl Iterator<Item = String>,
+) -> Result<Option<String>, GateError> {
+    let mut args = args.skip_while(|a| a != "--bench-arm");
+    if args.next().is_none() {
+        return Ok(None);
+    }
+    let arm = args
+        .next()
+        .ok_or("--bench-arm wants an arm name (a `bench op=` prefix)")?;
+    if !ops.any(|op| op.starts_with(&arm)) {
+        return Err(format!("--bench-arm {arm:?} names no arm").into());
+    }
+    Ok(Some(arm))
+}
+
 /// The SHA-256 of the file at `path`, lowercase hex; an error names the file.
 pub fn sha256(path: &Path) -> Result<String, GateError> {
     let size = std::fs::metadata(path)
@@ -305,6 +324,32 @@ pub fn row_bytes(ty: GgmlType, k: usize) -> Result<usize, GateError> {
         return Err(format!("row_bytes: k = {k} is not a multiple of block {blck}").into());
     }
     Ok(k / blck * tsz)
+}
+
+/// Write `decls` (each tensor's name, dims, type and bytes) as a GGUF at
+/// `path`, with the metadata `kvs`.
+pub fn write_gguf(
+    path: &Path,
+    kvs: &[(String, gguf::Value)],
+    decls: &[(String, Vec<u64>, GgmlType, Vec<u8>)],
+) -> Result<(), GateError> {
+    let tensors = decls
+        .iter()
+        .map(|(name, dims, ty, bytes)| gguf::write::TensorDecl {
+            name: name.clone(),
+            dims: dims.clone(),
+            type_id: ty.as_u32(),
+            nbytes: bytes.len() as u64,
+        })
+        .collect();
+    let layout = gguf::write::Layout::new(kvs, tensors)?;
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut writer = gguf::write::Writer::new(file, layout)?;
+    for (name, _, _, bytes) in decls {
+        writer.tensor(name, bytes)?;
+    }
+    writer.finish()?;
+    Ok(())
 }
 
 /// A quiet f16 NaN, as the gates write it into f16 rows, rings and scales a
@@ -899,8 +944,33 @@ pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        GateError, GgmlType, NAN_F16, dequant_row, first_ids, kquant_d_at, max_rel_err, quantile,
+        GateError, GgmlType, NAN_F16, bench_arm, dequant_row, first_ids, kquant_d_at, max_rel_err,
+        quantile,
     };
+
+    #[test]
+    fn a_bench_arm_must_select_an_existing_op() {
+        let parse = |args: &[&str]| {
+            bench_arm(
+                args.iter().map(|s| (*s).to_owned()),
+                ["mxfp8_4096", "q8_0_4096"].into_iter().map(str::to_owned),
+            )
+        };
+        assert_eq!(parse(&[]).expect("all arms"), None);
+        for prefix in ["mxfp8", "q8_0_4096", ""] {
+            assert_eq!(
+                parse(&["gate", "--bench-kernels", "--bench-arm", prefix]).expect("existing arm"),
+                Some(prefix.to_owned())
+            );
+        }
+        for (args, detail) in [
+            (vec!["--bench-arm"], "wants an arm name"),
+            (vec!["--bench-arm", "absent"], "names no arm"),
+        ] {
+            let err = parse(&args).expect_err("invalid arm").to_string();
+            assert!(err.contains("--bench-arm") && err.contains(detail), "{err}");
+        }
+    }
 
     /// The corpus reader takes the first `n` ids and refuses a short file and a word that is no id
     /// by name. Mutant: a short file read as the ids it holds, or a bad word skipped.

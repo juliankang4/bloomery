@@ -13,8 +13,10 @@
 //!   q8f32 gemv (`q8_0_gemv` at one column, `q8_0_gemv_mcol` token-major
 //!   past it, the two bit for bit equal on a column), F32 `f32_gemv` at one
 //!   column and the F32 tile past it (`f32_tile_gemm`, token-major, bit for
-//!   bit `f32_gemv` on every row and column). A K-quant site's gemv is
-//!   [`kgemv`]. A Q5_0 site's is [`blocks32_gemv`].
+//!   bit `f32_gemv` on every row and column), MXFP8 (`GgmlType::MXFP8`) the
+//!   q8f32 MXFP8 gemv (`mxfp8_gemv` at one column, `mxfp8_gemv_mcol`
+//!   token-major past it, bit for bit equal on a column). A K-quant site's
+//!   gemv is [`kgemv`]. A Q5_0 site's is [`blocks32_gemv`].
 //! - [`kgemv`], a site at most eight columns over the q8_1 rows: Q3_K, Q4_K
 //!   and Q6_K their gemvs, row-major (`m` outputs a row; a Q6_K row of an odd
 //!   super-block count the down `_sel` over one expert, one column); Q5_K
@@ -33,7 +35,8 @@
 //!   q8f32 planes, Q5_0 the same GEMM on the packed weight the gemv reads
 //!   (`gemm_q5_0p`, on the unit's one-expert table only), F32 the F32 tile
 //!   over the f32 rows (one column a slot, on the unit's one-expert table
-//!   only). A site's weight is the resident tensor of its name, or — a
+//!   only), MXFP8 the same tile over its planes (`mxfp8_tile_gemm`, the
+//!   values decoded as they are staged). A site's weight is the resident tensor of its name, or — a
 //!   K-quant's — the words a caller holds ([`SiteWeight`]). NVFP4 has no
 //!   wide GEMM and is refused here by name.
 //! - [`gated`], a wide gate·up·down block over one table: the gate and up
@@ -52,7 +55,7 @@ use crate::kquant::{Act, SelDown};
 use crate::mxfp4::Nvfp4Kernels;
 use crate::q5::Q8Blocks32;
 use crate::q6k_sel::Q6kSelKernels;
-use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
+use crate::q8f32::{GemvOut, Mxfp8GemvArgs, Mxfp8Weight, Q8_0GemvMcolArgs};
 use crate::quant_sel::QuantSelKernels;
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
@@ -78,6 +81,9 @@ pub enum SiteTy {
     /// NVFP4 in its two planes and the tensor's scale (`DevWeight::Nvfp4`),
     /// launched by [`kgemv`]; no wide GEMM.
     Nvfp4,
+    /// bloomery's MXFP8 in its two planes (`DevWeight::Mxfp8`), launched by
+    /// [`gemv`] and, wide, by [`gemm`] on the f32 rows.
+    Mxfp8,
 }
 
 /// The activation form a site's launch reads: the kernel table's fact.
@@ -103,6 +109,7 @@ impl SiteTy {
         SiteTy::Q8_0,
         SiteTy::F32,
         SiteTy::Nvfp4,
+        SiteTy::Mxfp8,
     ];
 
     /// The family of a file tensor of type `ty`; `None` for a type no launch
@@ -118,6 +125,7 @@ impl SiteTy {
             GgmlType::Q8_0 => Some(SiteTy::Q8_0),
             GgmlType::F32 => Some(SiteTy::F32),
             GgmlType::NVFP4 => Some(SiteTy::Nvfp4),
+            GgmlType::MXFP8 => Some(SiteTy::Mxfp8),
             _ => None,
         }
     }
@@ -128,9 +136,9 @@ impl SiteTy {
         self.gemm_weight().is_some()
     }
 
-    /// The grouped GEMM's type of a K-quant; `None` for Q5_0, Q8_0 and F32,
-    /// whose wide GEMM is the 32-value family's ([`gemm`]), and NVFP4, which
-    /// has none.
+    /// The grouped GEMM's type of a K-quant; `None` for Q5_0, Q8_0, F32 and
+    /// MXFP8, whose wide GEMM is the 32-value family's ([`gemm`]), and NVFP4,
+    /// which has none.
     #[must_use]
     pub fn gemm_weight(self) -> Option<GemmWeight> {
         match self {
@@ -138,20 +146,20 @@ impl SiteTy {
             SiteTy::Q4K => Some(GemmWeight::Q4K),
             SiteTy::Q5K => Some(GemmWeight::Q5K),
             SiteTy::Q6K => Some(GemmWeight::Q6K),
-            SiteTy::Q5_0 | SiteTy::Q8_0 | SiteTy::F32 | SiteTy::Nvfp4 => None,
+            SiteTy::Q5_0 | SiteTy::Q8_0 | SiteTy::F32 | SiteTy::Nvfp4 | SiteTy::Mxfp8 => None,
         }
     }
 
     /// How [`kgemv`] lays a site's columns out: Q3_K, Q4_K and Q6_K
     /// row-major, Q5_K and NVFP4 token-major. `None` for a type [`kgemv`] does not run:
-    /// Q8_0 and F32 ([`gemv`]), and Q5_0 ([`blocks32_gemv`], whose row-major
+    /// Q8_0, F32 and MXFP8 ([`gemv`]), and Q5_0 ([`blocks32_gemv`], whose row-major
     /// layout `y[r · m + c]` is that function's own).
     #[must_use]
     pub fn kgemv_order(self) -> Option<Order> {
         match self {
             SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q6K => Some(Order::RowMajor),
             SiteTy::Q5K | SiteTy::Nvfp4 => Some(Order::TokenMajor),
-            SiteTy::Q5_0 | SiteTy::Q8_0 | SiteTy::F32 => None,
+            SiteTy::Q5_0 | SiteTy::Q8_0 | SiteTy::F32 | SiteTy::Mxfp8 => None,
         }
     }
 
@@ -167,6 +175,7 @@ impl SiteTy {
             SiteTy::Q8_0 => SiteEntry::Q8_0,
             SiteTy::F32 => SiteEntry::F32,
             SiteTy::Nvfp4 => SiteEntry::Nvfp4,
+            SiteTy::Mxfp8 => SiteEntry::Mxfp8,
         })
         .reads()
     }
@@ -183,6 +192,7 @@ impl fmt::Display for SiteTy {
             SiteTy::Q8_0 => "Q8_0",
             SiteTy::F32 => "F32",
             SiteTy::Nvfp4 => "NVFP4",
+            SiteTy::Mxfp8 => "MXFP8",
         })
     }
 }
@@ -244,6 +254,7 @@ pub fn site(
         Some(DevWeight::Q5_0 { w: p, k: wk }) => Some((SiteTy::Q5_0, p.rows(), *wk)),
         Some(DevWeight::F32 { w: p, k: wk }) => Some((SiteTy::F32, p.rows(), *wk)),
         Some(DevWeight::Nvfp4 { qs, k: wk, .. }) => Some((SiteTy::Nvfp4, qs.rows(), *wk)),
+        Some(DevWeight::Mxfp8 { qs, k: wk, .. }) => Some((SiteTy::Mxfp8, qs.rows(), *wk)),
         Some(_) => None,
     };
     match got {
@@ -284,7 +295,8 @@ fn kq<'w>(
 }
 
 /// `y = W · x` for site `name` of type `ty` over the first `m` (1..=8)
-/// columns of the f32 rows `x`, token-major (module doc). A K-quant site is
+/// columns of the f32 rows `x`, token-major (module doc): Q8_0, F32 and
+/// MXFP8. A K-quant site is
 /// [`kgemv`] and a Q5_0 site is [`blocks32_gemv`]; each is refused here by
 /// name.
 pub fn gemv(
@@ -295,11 +307,38 @@ pub fn gemv(
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
+    let weight = w.resident("site::gemv", name)?;
+    launch(gpu, Some(g32), (Some(ty), weight, name), x, m, y)
+}
+
+/// `y = W · x` at one column for the resident weight `name`, by the site
+/// type of its resident form ([`gemv`] at `m` = 1): the one-column gemv of a
+/// model that names a projection and leaves its format to the file.
+pub fn resident_gemv(
+    gpu: &Gpu,
+    w: &Weights,
+    name: &str,
+    x: &DeviceBuffer<f32>,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let weight = w.resident("site::resident_gemv", name)?;
+    launch(gpu, None, (None, weight, name), x, 1, y)
+}
+
+/// [`gemv`]'s launch; `g32` is read only by an F32 site past one column.
+/// `ty` checks a declared site type, or `None` dispatches by the resident form.
+fn launch(
+    gpu: &Gpu,
+    g32: Option<&Gemm32Kernels>,
+    (ty, w, name): (Option<SiteTy>, &DevWeight, &str),
+    x: &DeviceBuffer<f32>,
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
     const WHAT: &str = "site::gemv";
     let stream = gpu.stream();
-    match ty {
-        SiteTy::Q8_0 => {
-            let (qs, d) = w.q8_planes(WHAT, name)?;
+    match (ty, w) {
+        (None | Some(SiteTy::Q8_0), DevWeight::Q8_0 { qs, d, .. }) => {
             let q = gpu.q8f32();
             if m == 1 {
                 q.enqueue_q8_0_gemv(stream, qs, d, x, 1, y)
@@ -319,20 +358,41 @@ pub fn gemv(
         }
         // One column runs `f32_gemv`, a warp a row: the tile gives the same bits in one block
         // for a site of 32 rows or fewer.
-        SiteTy::F32 if m == 1 => {
-            gpu.q8f32()
-                .enqueue_f32_gemv(stream, w.f32_tensor(WHAT, name)?, x, 1, y)
+        (None | Some(SiteTy::F32), DevWeight::F32 { w, .. }) => {
+            if m == 1 {
+                gpu.q8f32().enqueue_f32_gemv(stream, w, x, 1, y)
+            } else {
+                g32.ok_or(GpuError::state(WHAT, "the F32 tile's kernels"))?
+                    .enqueue_f32_tile(stream, w, x, m, y)
+            }
         }
-        SiteTy::F32 => g32.enqueue_f32_tile(stream, w.f32_tensor(WHAT, name)?, x, m, y),
-        SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Nvfp4 => {
+        (None | Some(SiteTy::Mxfp8), DevWeight::Mxfp8 { qs, e, .. }) => {
+            gpu.q8f32().enqueue_mxfp8_gemv(
+                stream,
+                Mxfp8GemvArgs {
+                    w: Mxfp8Weight { qs, e },
+                    x,
+                    m,
+                    y,
+                },
+            )
+        }
+        (Some(ty @ (SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Nvfp4)), _) => {
             Err(GpuError::shape(
                 WHAT,
                 format!("{name} is {ty}: its gemv is `site::kgemv`, on the q8_1 rows"),
             ))
         }
-        SiteTy::Q5_0 => Err(GpuError::shape(
+        (Some(SiteTy::Q5_0), _) => Err(GpuError::shape(
             WHAT,
-            format!("{name} is {ty}: its gemv is `site::blocks32_gemv`, on the Q8Blocks32 rows"),
+            format!("{name} is Q5_0: its gemv is `site::blocks32_gemv`, on the Q8Blocks32 rows"),
+        )),
+        (Some(SiteTy::Q8_0), _) => Err(GpuError::tensor(WHAT, name, "a q8_0 weight")),
+        (Some(SiteTy::F32), _) => Err(GpuError::tensor(WHAT, name, "an f32 tensor")),
+        (Some(SiteTy::Mxfp8), _) => Err(GpuError::tensor(WHAT, name, "an mxfp8 weight")),
+        (None, _) => Err(GpuError::shape(
+            "site::resident_gemv",
+            format!("{name} is resident in a form no site launch reads"),
         )),
     }
 }
@@ -375,8 +435,8 @@ impl KGemvKernels {
 /// the q8_1 rows `act`, laid out as [`SiteTy::kgemv_order`] says: Q4_K, Q6_K
 /// and Q3_K their gemvs, row-major; Q5_K the down `_sel` over the site as
 /// one expert, token-major, an id past it raising on `fault`; NVFP4 its gemv
-/// times the tensor's scale, token-major. Q8_0 and F32 are [`gemv`]; Q5_0 is
-/// [`blocks32_gemv`]. Each is refused here by name.
+/// times the tensor's scale, token-major. Q8_0, F32 and MXFP8 are [`gemv`];
+/// Q5_0 is [`blocks32_gemv`]. Each is refused here by name.
 pub fn kgemv(
     gpu: &Gpu,
     kk: &KGemvKernels,
@@ -427,7 +487,7 @@ pub fn kgemv(
         SiteTy::Nvfp4 => kk
             .nv
             .enqueue_gemv(gpu.stream(), w.nvfp4(WHAT, name)?, act, y),
-        SiteTy::Q8_0 | SiteTy::F32 => Err(GpuError::shape(
+        SiteTy::Q8_0 | SiteTy::F32 | SiteTy::Mxfp8 => Err(GpuError::shape(
             WHAT,
             format!("{name} is {ty}: its gemv is `site::gemv`, on the f32 rows"),
         )),
@@ -785,6 +845,21 @@ pub fn gemm(
                 y,
             )
         }
+        SiteTy::Mxfp8 => {
+            dense()?;
+            let rows = x.f32.ok_or_else(|| missing("f32 rows"))?;
+            k.g32(
+                WHAT,
+                "the 32-value kernels an MXFP8 site runs on (this load holds none)",
+            )?
+            .enqueue_mxfp8_tile(
+                stream,
+                w.mxfp8(WHAT, src.resident(WHAT, ty)?)?,
+                rows,
+                m,
+                y,
+            )
+        }
         SiteTy::Q5_0 => {
             dense()?;
             let site = src.resident(WHAT, ty)?;
@@ -1038,8 +1113,8 @@ mod tests {
 
     /// A site's type is read from the file's header alone: a Q8_0 matrix of
     /// two rows of 64 is read as Q8_0 where Q8_0 is launched, and refused by
-    /// name where only K-quants are; a Q3_K, a Q5_K and a Q5_0 one are read
-    /// as theirs; an IQ4_XS one (a type no site launch reads) and a matrix of
+    /// name where only K-quants are; a Q3_K, a Q5_K, a Q5_0 and an MXFP8 one
+    /// (bloomery's id, sized by the split) are read as theirs; an IQ4_XS one (a type no site launch reads) and a matrix of
     /// another shape are refused by name.
     #[test]
     fn a_site_type_comes_from_the_header_and_a_type_with_no_launch_is_refused() {
@@ -1052,6 +1127,7 @@ mod tests {
             ("q3", vec![256, 2], 11, 2 * 110),
             ("q5", vec![256, 2], 13, 2 * 176),
             ("q50", vec![64, 2], 6, 2 * 2 * 22),
+            ("mx", vec![128, 2], GgmlType::MXFP8.as_u32(), 2 * 4 * 33),
         ];
         let tensors = decls
             .iter()
@@ -1080,12 +1156,14 @@ mod tests {
             SiteTy::Q8_0,
             SiteTy::F32,
             SiteTy::Nvfp4,
+            SiteTy::Mxfp8,
         ];
         for (name, k, want) in [
             ("q8", 64, SiteTy::Q8_0),
             ("q3", 256, SiteTy::Q3K),
             ("q5", 256, SiteTy::Q5K),
             ("q50", 64, SiteTy::Q5_0),
+            ("mx", 128, SiteTy::Mxfp8),
         ] {
             let got = file_site(&split, "test", name, (2, k), &all);
             assert_eq!(got.ok(), Some(want), "{name}");
@@ -1182,5 +1260,20 @@ mod tests {
         assert_eq!(SiteTy::Nvfp4.kgemv_order(), Some(super::Order::TokenMajor));
         assert!(!SiteTy::Nvfp4.kquant());
         assert_eq!(SiteTy::Nvfp4.to_string(), "NVFP4");
+    }
+
+    /// MXFP8 is a `gemv` site on the f32 rows, narrow and wide: no K-quant
+    /// GEMM type, not a `kgemv`; bloomery's private id maps to it and the F8
+    /// rows' id does not.
+    #[test]
+    fn an_mxfp8_site_reads_the_f32_rows_and_is_a_gemv() {
+        let ty = GgmlType::MXFP8;
+        assert_eq!(SiteTy::of_ggml(ty), Some(SiteTy::Mxfp8));
+        assert_eq!(SiteTy::of_ggml(GgmlType::F8E4M3_ROWS), None);
+        assert!(SiteTy::ALL.contains(&SiteTy::Mxfp8));
+        assert_eq!(SiteTy::Mxfp8.reads(), Form::F32);
+        assert_eq!(SiteTy::Mxfp8.kgemv_order(), None);
+        assert_eq!(SiteTy::Mxfp8.gemm_weight(), None);
+        assert_eq!(SiteTy::Mxfp8.to_string(), "MXFP8");
     }
 }

@@ -16,6 +16,16 @@
 //!   exact, so the kernels multiply by the value the reference dequantizes
 //!   with and do no f16 arithmetic.
 //!
+//! MXFP8 (`GgmlType::MXFP8`: OCP MX blocks of 32 F8_E4M3 values and one E8M0
+//! scale) is read by the same walk ([`ByteBlocks`]) from two planes fixed at
+//! load ([`mxfp8_planes`]): `qs` the value bytes laid out as Q8_0's codes,
+//! and `e` the blocks' scale bytes in row order, four to a u32 word, `k/128`
+//! words per row (so `k` is a multiple of 128). A byte's value is its E4M3
+//! value and a block's scale `2^(E − 127)`, each exact in f32, so each term
+//! is the reference's product. `mxfp8_gemv` and `mxfp8_gemv_mcol` are
+//! `q8_0_gemv` and `q8_0_gemv_mcol` over those planes, under the same
+//! numeric contract.
+//!
 //! Numeric contract, every kernel here: one warp owns one output row, each lane
 //! accumulates its share of the row sequentially, one f32 multiply-add per
 //! term, and the 32 lane sums are then combined by the fixed five-step
@@ -67,6 +77,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::vector::{F32x4, as_vectors};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
+use gguf::quant::check_mxfp8;
 use std::sync::Arc;
 
 // --------------------------------------------------------------- cores
@@ -627,59 +638,191 @@ const Q8_STEP: usize = 128;
 pub const Q8_STEP_UNROLL: usize = 4;
 const _: () = assert!(Q8_STEP_UNROLL == 4);
 
+/// A weight of 32-value blocks, one byte a value in the `qs` words and one
+/// scale a block in a plane of its own, as the f32-activation walk reads it
+/// ([`blocks_lane_partial_1col`], [`blocks_lane_partials_mcol`]): Q8_0
+/// ([`Q8_0Bytes`]) and MXFP8 ([`Mxfp8Bytes`]).
+pub(crate) trait ByteBlocks {
+    /// One element of the scale plane.
+    type Scale: Copy;
+
+    /// The value of the byte in the low eight bits of `q`, exact in f32.
+    fn value(q: u32) -> f32;
+
+    /// The element of the scale plane `d` that holds block `b`'s scale, its
+    /// blocks counted from the plane's first, the rows back to back: a plain
+    /// load, widened by [`ByteBlocks::scale`] once the step's loads are out.
+    ///
+    /// # Safety
+    ///
+    /// Block `b`'s scale lies inside `d`.
+    unsafe fn scale_at(d: &[Self::Scale], b: usize) -> Self::Scale;
+
+    /// Block `b`'s scale from the element [`ByteBlocks::scale_at`] loaded.
+    fn scale(at: Self::Scale, b: usize) -> f32;
+}
+
+/// Q8_0 in the q8f32 planes (module doc): a byte is a signed code, a block's
+/// scale its f16 bits, widened by the hardware convert.
+pub(crate) struct Q8_0Bytes;
+
+impl ByteBlocks for Q8_0Bytes {
+    type Scale = u16;
+
+    #[inline(always)]
+    fn value(q: u32) -> f32 {
+        q as u8 as i8 as f32
+    }
+
+    #[inline(always)]
+    unsafe fn scale_at(d: &[u16], b: usize) -> u16 {
+        // SAFETY: block b's scale is inside d by this fn's contract.
+        unsafe { *d.get_unchecked(b) }
+    }
+
+    #[inline(always)]
+    fn scale(bits: u16, _: usize) -> f32 {
+        half_bits_to_f32(bits)
+    }
+}
+
+/// MXFP8 in its two planes (module doc, [`mxfp8_planes`]): a byte is an
+/// F8_E4M3 value, a block's scale its E8M0 byte, four to a word of the `e`
+/// plane.
+pub(crate) struct Mxfp8Bytes;
+
+impl ByteBlocks for Mxfp8Bytes {
+    type Scale = u32;
+
+    /// F8_E4M3 (OCP E4M3FN): its magnitude twice the UE4M3 half
+    /// ([`crate::mxfp4::ue4m3_half`], exact), its sign bit 7. The repack
+    /// takes no NaN byte (0x7F, 0xFF).
+    #[inline(always)]
+    fn value(q: u32) -> f32 {
+        let v = 2.0 * crate::mxfp4::ue4m3_half(q & 0x7F);
+        f32::from_bits(v.to_bits() | ((q & 0x80) << 24))
+    }
+
+    /// Word `b / 4`, which holds block `b`'s scale byte.
+    #[inline(always)]
+    unsafe fn scale_at(d: &[u32], b: usize) -> u32 {
+        // SAFETY: word b / 4 holds block b's scale, inside d by this fn's
+        // contract.
+        unsafe { *d.get_unchecked(b >> 2) }
+    }
+
+    /// `2^(E − 127)` for the scale byte `E` of block `b`, byte `b % 4` of
+    /// its word: the f32 whose exponent field is `E`, and at `E = 0` the
+    /// subnormal `2^-127`. The repack takes no `E = 255` (E8M0's NaN).
+    #[inline(always)]
+    fn scale(word: u32, b: usize) -> f32 {
+        let e = (word >> (8 * (b & 3))) & 0xFF;
+        f32::from_bits(if e == 0 { 0x0040_0000 } else { e << 23 })
+    }
+}
+
+/// [`blocks_lane_partial_1col`] for a Q8_0 row in the q8f32 planes.
+///
+/// # Safety
+///
+/// As [`blocks_lane_partial_1col`] under [`Q8_0Bytes`]: `d.len() >= (row +
+/// 1) * k/32`.
+#[inline(always)]
+pub unsafe fn q8_0_lane_partial_1col(
+    qs: &[u32],
+    d: &[u16],
+    x: &[f32],
+    k: u32,
+    row: usize,
+    x0: usize,
+    lane: usize,
+) -> f32 {
+    // SAFETY: this fn's contract is the body's under Q8_0Bytes.
+    unsafe { blocks_lane_partial_1col::<Q8_0Bytes>(qs, d, x, k, row, x0, lane) }
+}
+
+/// [`blocks_lane_partials_mcol`] for a Q8_0 row in the q8f32 planes.
+///
+/// # Safety
+///
+/// As [`blocks_lane_partials_mcol`] under [`Q8_0Bytes`]: `d.len() >= (row +
+/// 1) * k/32`.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+pub unsafe fn q8_0_lane_partials_mcol<const M: usize>(
+    qs: &[u32],
+    d: &[u16],
+    x: &[f32],
+    k: u32,
+    row: usize,
+    x0: usize,
+    x_col: usize,
+    lane: usize,
+) -> [f32; 8] {
+    // SAFETY: this fn's contract is the body's under Q8_0Bytes.
+    unsafe { blocks_lane_partials_mcol::<Q8_0Bytes, M>(qs, d, x, k, row, x0, x_col, lane) }
+}
+
 /// Step `s` of lane `lane`'s walk: the lane's code word `qs[wq + 32s]`, the
-/// scale `d[wd + 4s]` of the block that word sits in, widened from its f16
-/// bits, and the word's four activations, quad `lane + 32s` of `xq`.
+/// scale of block `wd + 4s`, the block that word sits in
+/// ([`ByteBlocks::scale`]), and the word's four activations, quad `lane +
+/// 32s` of `xq`.
 ///
 /// # Safety
 ///
 /// Word `w = 32s + lane` of the row must exist, `w < k/4`, with `wq`, `wd`
-/// and `xq` built as [`q8_0_lane_partial_1col`] builds them under its caller
-/// contract.
+/// and `xq` built as [`blocks_lane_partial_1col`] builds them under its
+/// caller contract.
 #[inline(always)]
-unsafe fn q8_0_step(
+unsafe fn block_step<F: ByteBlocks>(
     qs: &[u32],
-    d: &[u16],
+    d: &[F::Scale],
     xq: &[F32x4],
     wq: usize,
     wd: usize,
     lane: usize,
     s: usize,
 ) -> (u32, f32, F32x4) {
+    let b = wd + 4 * s;
     // SAFETY: w = 32s + lane < k/4 by this function's contract, so the code
-    // word wq + 32s is below row*k/4 + k/4 <= qs.len(), its block wd + 4s =
-    // row*k/32 + w/8 below row*k/32 + k/32 <= d.len(), and quad w below k/4
-    // = xq.len().
-    let (q, bits, v) = unsafe {
+    // word wq + 32s is below row*k/4 + k/4 <= qs.len(), its block b = wd + 4s
+    // = row*k/32 + w/8 below row*k/32 + k/32, whose scales d holds, and quad
+    // w below k/4 = xq.len().
+    let (q, at, v) = unsafe {
         (
             *qs.get_unchecked(wq + 32 * s),
-            *d.get_unchecked(wd + 4 * s),
+            F::scale_at(d, b),
             *xq.get_unchecked(lane + 32 * s),
         )
     };
-    (q, half_bits_to_f32(bits), v)
+    (q, F::scale(at, b), v)
 }
 
-/// `f` plus one word's four terms, in byte order: `fma(q_j·d, x_j, f)` with
-/// `q_j` the signed code in byte `j` of `q` and `x_j` lane `j` of `x`. The
-/// product `q_j·d` is exact in f32, so each term rounds once.
+/// `f` plus one word's four terms, in byte order: `fma(v_j·d, x_j, f)` with
+/// `v_j` the value of byte `j` of `q` ([`ByteBlocks::value`]) and `x_j` lane
+/// `j` of `x`. The product `v_j·d` is exact in f32 for a Q8_0 block, and for
+/// an MXFP8 one whose product is a normal f32, so each term rounds once.
 #[inline(always)]
-fn q8_0_word_dot(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
+fn word_dot<F: ByteBlocks>(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
     let [x0, x1, x2, x3] = x.to_array();
-    let f = f32::mul_add(q as u8 as i8 as f32 * d, x0, f);
-    let f = f32::mul_add((q >> 8) as u8 as i8 as f32 * d, x1, f);
-    let f = f32::mul_add((q >> 16) as u8 as i8 as f32 * d, x2, f);
-    f32::mul_add((q >> 24) as u8 as i8 as f32 * d, x3, f)
+    let f = f32::mul_add(d * F::value(q), x0, f);
+    let f = f32::mul_add(d * F::value(q >> 8), x1, f);
+    let f = f32::mul_add(d * F::value(q >> 16), x2, f);
+    f32::mul_add(d * F::value(q >> 24), x3, f)
 }
 
-/// Lane `lane`'s partial sum for one Q8_0 row against a single activation
-/// column. The weight at value `kk` of `row` is `q·d`, with `q` the signed
-/// code in word `qs[row·k/4 + kk/4]`, byte `kk%4`, and `d` the block scale
-/// `d[row·k/32 + kk/32]` widened from its f16 bits — the same bits the
-/// reference's dequantizer produces. `x` is read from base `x0`, so a caller
-/// can dot against a slice of a wider buffer without subslicing it. Lane L
-/// owns whole code words — words `L, L + 32, L + 64,
-/// …` below `k/4`, word `w` holding values `4w .. 4w + 3` — and accumulates
+/// Lane `lane`'s partial sum for one row of 32-value byte blocks of format
+/// `F` against a single activation column. The weight at value `kk` of `row`
+/// is `v·d`, with `v` the value of the byte in word `qs[row·k/4 + kk/4]`,
+/// byte `kk%4` ([`ByteBlocks::value`]), and `d` the scale of block
+/// `row·k/32 + kk/32` ([`ByteBlocks::scale`]): the values the reference's
+/// dequantizer produces. `x` is read from base `x0`, so a caller can dot
+/// against a slice of a wider buffer without subslicing it. Lane L owns
+/// whole code words — words `L, L + 32, L + 64, …` below `k/4`, word `w`
+/// holding values `4w .. 4w + 3` — and accumulates
 /// them in increasing order, each word's four values in byte order, one f32
 /// multiply-add per term. [`Q8_STEP_UNROLL`] steps' loads are hoisted above
 /// the multiply-adds that consume them; up to three leftover steps run as a
@@ -693,14 +836,14 @@ fn q8_0_word_dot(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
 ///
 /// # Safety
 ///
-/// `qs.len() >= (row + 1) * k/4`, `d.len() >= (row + 1) * k/32`, `x.len() >=
-/// x0 + k`,
-/// `k` a positive multiple of 32, `lane < 32`. The body reads `qs`, `d` and
-/// `x` unchecked within those bounds.
+/// `qs.len() >= (row + 1) * k/4`, `d` holds the scales of blocks below
+/// `(row + 1) * k/32`, `x.len() >= x0 + k`, `k` a positive multiple of 32,
+/// `lane < 32`. The body reads `qs`, `d` and `x` unchecked within those
+/// bounds.
 #[inline(always)]
-pub unsafe fn q8_0_lane_partial_1col(
+pub(crate) unsafe fn blocks_lane_partial_1col<F: ByteBlocks>(
     qs: &[u32],
-    d: &[u16],
+    d: &[F::Scale],
     x: &[f32],
     k: u32,
     row: usize,
@@ -722,13 +865,14 @@ pub unsafe fn q8_0_lane_partial_1col(
         // time, through scalar reads.
         let mut w = lane;
         while w < words {
+            let b = wd - (lane >> 3) + (w >> 3);
             // SAFETY: w < k/4 by the loop guard, so word row*k/4 + w, its
             // block row*k/32 + w/8 and values 4w .. 4w + 3 of xr are inside
             // qs, d and xr by the caller contract.
-            let (q, bits, xv) = unsafe {
+            let (q, at, xv) = unsafe {
                 (
                     *qs.get_unchecked(wq - lane + w),
-                    *d.get_unchecked(wd - (lane >> 3) + (w >> 3)),
+                    F::scale_at(d, b),
                     F32x4::new([
                         *xr.get_unchecked(4 * w),
                         *xr.get_unchecked(4 * w + 1),
@@ -737,7 +881,7 @@ pub unsafe fn q8_0_lane_partial_1col(
                     ]),
                 )
             };
-            f = q8_0_word_dot(f, q, half_bits_to_f32(bits), xv);
+            f = word_dot::<F>(f, q, F::scale(at, b), xv);
             w += 32;
         }
         return f;
@@ -748,8 +892,8 @@ pub unsafe fn q8_0_lane_partial_1col(
     if words <= 32 {
         if lane < words {
             // SAFETY: lane < k/4 is the step helper's bound for step 0.
-            let (q0, d0, v0) = unsafe { q8_0_step(qs, d, xq, wq, wd, lane, 0) };
-            f = q8_0_word_dot(f, q0, d0, v0);
+            let (q0, d0, v0) = unsafe { block_step::<F>(qs, d, xq, wq, wd, lane, 0) };
+            f = word_dot::<F>(f, q0, d0, v0);
         }
         return f;
     }
@@ -759,64 +903,71 @@ pub unsafe fn q8_0_lane_partial_1col(
         // whole: each lane's word in them is below 32 * steps <= k/4.
         let ((q0, d0, v0), (q1, d1, v1), (q2, d2, v2), (q3, d3, v3)) = unsafe {
             (
-                q8_0_step(qs, d, xq, wq, wd, lane, s),
-                q8_0_step(qs, d, xq, wq, wd, lane, s + 1),
-                q8_0_step(qs, d, xq, wq, wd, lane, s + 2),
-                q8_0_step(qs, d, xq, wq, wd, lane, s + 3),
+                block_step::<F>(qs, d, xq, wq, wd, lane, s),
+                block_step::<F>(qs, d, xq, wq, wd, lane, s + 1),
+                block_step::<F>(qs, d, xq, wq, wd, lane, s + 2),
+                block_step::<F>(qs, d, xq, wq, wd, lane, s + 3),
             )
         };
-        f = q8_0_word_dot(f, q0, d0, v0);
-        f = q8_0_word_dot(f, q1, d1, v1);
-        f = q8_0_word_dot(f, q2, d2, v2);
-        f = q8_0_word_dot(f, q3, d3, v3);
+        f = word_dot::<F>(f, q0, d0, v0);
+        f = word_dot::<F>(f, q1, d1, v1);
+        f = word_dot::<F>(f, q2, d2, v2);
+        f = word_dot::<F>(f, q3, d3, v3);
         s += Q8_STEP_UNROLL;
     }
     if s + 2 <= steps {
         // SAFETY: s + 2 <= steps by the guard: both steps are whole.
         let ((q0, d0, v0), (q1, d1, v1)) = unsafe {
             (
-                q8_0_step(qs, d, xq, wq, wd, lane, s),
-                q8_0_step(qs, d, xq, wq, wd, lane, s + 1),
+                block_step::<F>(qs, d, xq, wq, wd, lane, s),
+                block_step::<F>(qs, d, xq, wq, wd, lane, s + 1),
             )
         };
-        f = q8_0_word_dot(f, q0, d0, v0);
-        f = q8_0_word_dot(f, q1, d1, v1);
+        f = word_dot::<F>(f, q0, d0, v0);
+        f = word_dot::<F>(f, q1, d1, v1);
         s += 2;
     }
     if s < steps {
         // SAFETY: s < steps by the guard: the step is whole.
-        let (q0, d0, v0) = unsafe { q8_0_step(qs, d, xq, wq, wd, lane, s) };
-        f = q8_0_word_dot(f, q0, d0, v0);
+        let (q0, d0, v0) = unsafe { block_step::<F>(qs, d, xq, wq, wd, lane, s) };
+        f = word_dot::<F>(f, q0, d0, v0);
     }
     if 32 * steps + lane < words {
         // SAFETY: the guard is the step helper's bound for step `steps`.
-        let (q0, d0, v0) = unsafe { q8_0_step(qs, d, xq, wq, wd, lane, steps) };
-        f = q8_0_word_dot(f, q0, d0, v0);
+        let (q0, d0, v0) = unsafe { block_step::<F>(qs, d, xq, wq, wd, lane, steps) };
+        f = word_dot::<F>(f, q0, d0, v0);
     }
     f
 }
 
-/// Step `s`'s code word and scale of lane `lane`'s walk — [`q8_0_step`]
+/// Step `s`'s code word and scale of lane `lane`'s walk — [`block_step`]
 /// without the activations, for a body that reads several columns against
 /// one word.
 ///
 /// # Safety
 ///
-/// As [`q8_0_step`]: word `32s + lane` of the row exists, with `wq` and `wd`
-/// built as [`q8_0_lane_partials_mcol`] builds them.
+/// As [`block_step`]: word `32s + lane` of the row exists, with `wq` and `wd`
+/// built as [`blocks_lane_partials_mcol`] builds them.
 #[inline(always)]
-unsafe fn q8_0_code(qs: &[u32], d: &[u16], wq: usize, wd: usize, s: usize) -> (u32, f32) {
+unsafe fn block_code<F: ByteBlocks>(
+    qs: &[u32],
+    d: &[F::Scale],
+    wq: usize,
+    wd: usize,
+    s: usize,
+) -> (u32, f32) {
+    let b = wd + 4 * s;
     // SAFETY: word 32s + lane < k/4 by this function's contract, so the code
     // word wq + 32s is inside the row's k/4 words and its block wd + 4s
     // inside the row's k/32 scales, both inside qs and d by the caller
     // contract.
-    let (q, bits) = unsafe { (*qs.get_unchecked(wq + 32 * s), *d.get_unchecked(wd + 4 * s)) };
-    (q, half_bits_to_f32(bits))
+    let (q, at) = unsafe { (*qs.get_unchecked(wq + 32 * s), F::scale_at(d, b)) };
+    (q, F::scale(at, b))
 }
 
-/// Lane `lane`'s partial sums for one Q8_0 row against `M` activation
-/// columns, column c read from base `x0 + c·x_col`. The lane's share of the
-/// row is [`q8_0_lane_partial_1col`]'s — whole code words `L, L + 32, …` in
+/// Lane `lane`'s partial sums for one row of format `F` against `M`
+/// activation columns, column c read from base `x0 + c·x_col`. The lane's
+/// share of the row is [`blocks_lane_partial_1col`]'s — whole code words `L, L + 32, …` in
 /// increasing order, each word's four values in byte order — and each word is
 /// loaded once and dotted against every column, one sum per column. Column
 /// c's multiply-adds are therefore the single-column body's on column c's
@@ -835,18 +986,18 @@ unsafe fn q8_0_code(qs: &[u32], d: &[u16], wq: usize, wd: usize, s: usize) -> (u
 ///
 /// # Safety
 ///
-/// `qs.len() >= (row + 1) * k/4`, `d.len() >= (row + 1) * k/32`, `x.len() >=
-/// x0 + (M - 1) * x_col + k`, `k` a positive multiple of 32, `M` in 1..=8,
-/// `lane < 32`. The body reads `qs`, `d` and `x` unchecked within those
-/// bounds.
+/// `qs.len() >= (row + 1) * k/4`, `d` holds the scales of blocks below
+/// `(row + 1) * k/32`, `x.len() >= x0 + (M - 1) * x_col + k`, `k` a positive
+/// multiple of 32, `M` in 1..=8, `lane < 32`. The body reads `qs`, `d` and
+/// `x` unchecked within those bounds.
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
-pub unsafe fn q8_0_lane_partials_mcol<const M: usize>(
+pub(crate) unsafe fn blocks_lane_partials_mcol<F: ByteBlocks, const M: usize>(
     qs: &[u32],
-    d: &[u16],
+    d: &[F::Scale],
     x: &[f32],
     k: u32,
     row: usize,
@@ -876,7 +1027,7 @@ pub unsafe fn q8_0_lane_partials_mcol<const M: usize>(
             // SAFETY: w < k/4 by the loop guard: the code word row*k/4 + w
             // and its block row*k/32 + w/8 are inside qs and d.
             let (q, dv) =
-                unsafe { q8_0_code(qs, d, wq - lane + w, wd - (lane >> 3) + (w >> 3), 0) };
+                unsafe { block_code::<F>(qs, d, wq - lane + w, wd - (lane >> 3) + (w >> 3), 0) };
             macro_rules! col_scalar {
                 ($f:ident, $c:literal) => {
                     if M > $c {
@@ -891,7 +1042,7 @@ pub unsafe fn q8_0_lane_partials_mcol<const M: usize>(
                                 *xr.get_unchecked(b + 3),
                             ])
                         };
-                        $f = q8_0_word_dot($f, q, dv, v);
+                        $f = word_dot::<F>($f, q, dv, v);
                     }
                 };
             }
@@ -915,10 +1066,10 @@ pub unsafe fn q8_0_lane_partials_mcol<const M: usize>(
         // whole: each lane's word in them is below 32 * steps <= k/4.
         let ((q0, d0), (q1, d1), (q2, d2), (q3, d3)) = unsafe {
             (
-                q8_0_code(qs, d, wq, wd, s),
-                q8_0_code(qs, d, wq, wd, s + 1),
-                q8_0_code(qs, d, wq, wd, s + 2),
-                q8_0_code(qs, d, wq, wd, s + 3),
+                block_code::<F>(qs, d, wq, wd, s),
+                block_code::<F>(qs, d, wq, wd, s + 1),
+                block_code::<F>(qs, d, wq, wd, s + 2),
+                block_code::<F>(qs, d, wq, wd, s + 3),
             )
         };
         let a = lane + 32 * s;
@@ -937,10 +1088,10 @@ pub unsafe fn q8_0_lane_partials_mcol<const M: usize>(
                             *xq.get_unchecked(b + 96),
                         )
                     };
-                    $f = q8_0_word_dot($f, q0, d0, v0);
-                    $f = q8_0_word_dot($f, q1, d1, v1);
-                    $f = q8_0_word_dot($f, q2, d2, v2);
-                    $f = q8_0_word_dot($f, q3, d3, v3);
+                    $f = word_dot::<F>($f, q0, d0, v0);
+                    $f = word_dot::<F>($f, q1, d1, v1);
+                    $f = word_dot::<F>($f, q2, d2, v2);
+                    $f = word_dot::<F>($f, q3, d3, v3);
                 }
             };
         }
@@ -962,7 +1113,7 @@ pub unsafe fn q8_0_lane_partials_mcol<const M: usize>(
         }
         // SAFETY: either s < steps (a whole step) or the guard above put
         // this lane's word of step `steps` below k/4.
-        let (q0, d0) = unsafe { q8_0_code(qs, d, wq, wd, s) };
+        let (q0, d0) = unsafe { block_code::<F>(qs, d, wq, wd, s) };
         let a = lane + 32 * s;
         macro_rules! col_one {
             ($f:ident, $c:literal) => {
@@ -970,7 +1121,7 @@ pub unsafe fn q8_0_lane_partials_mcol<const M: usize>(
                     // SAFETY: quad a = word 32s + lane < k/4 of column $c <=
                     // M-1, inside xq as in the trip above.
                     let v0 = unsafe { *xq.get_unchecked($c * cq + a) };
-                    $f = q8_0_word_dot($f, q0, d0, v0);
+                    $f = word_dot::<F>($f, q0, d0, v0);
                 }
             };
         }
@@ -987,21 +1138,21 @@ pub unsafe fn q8_0_lane_partials_mcol<const M: usize>(
     [f0, f1, f2, f3, f4, f5, f6, f7]
 }
 
-/// [`q8_0_lane_partials_mcol`] for a launch-uniform `m_cols`: the body
+/// [`blocks_lane_partials_mcol`] for a launch-uniform `m_cols`: the body
 /// instantiated for that column count. `None` for an `m_cols` outside 1..=8,
 /// which the launchers never send.
 ///
 /// # Safety
 ///
-/// As [`q8_0_lane_partials_mcol`] with `M = m_cols`.
+/// As [`blocks_lane_partials_mcol`] with `M = m_cols`.
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
-unsafe fn q8_0_lane_partials_m(
+unsafe fn blocks_lane_partials_m<F: ByteBlocks>(
     qs: &[u32],
-    d: &[u16],
+    d: &[F::Scale],
     x: &[f32],
     k: u32,
     row: usize,
@@ -1013,35 +1164,35 @@ unsafe fn q8_0_lane_partials_m(
     Some(match m_cols {
         1 => {
             // SAFETY: M = m_cols, so this fn's contract is the body's.
-            unsafe { q8_0_lane_partials_mcol::<1>(qs, d, x, k, row, x0, x_col, lane) }
+            unsafe { blocks_lane_partials_mcol::<F, 1>(qs, d, x, k, row, x0, x_col, lane) }
         }
         2 => {
             // SAFETY: M = m_cols, so this fn's contract is the body's.
-            unsafe { q8_0_lane_partials_mcol::<2>(qs, d, x, k, row, x0, x_col, lane) }
+            unsafe { blocks_lane_partials_mcol::<F, 2>(qs, d, x, k, row, x0, x_col, lane) }
         }
         3 => {
             // SAFETY: M = m_cols, so this fn's contract is the body's.
-            unsafe { q8_0_lane_partials_mcol::<3>(qs, d, x, k, row, x0, x_col, lane) }
+            unsafe { blocks_lane_partials_mcol::<F, 3>(qs, d, x, k, row, x0, x_col, lane) }
         }
         4 => {
             // SAFETY: M = m_cols, so this fn's contract is the body's.
-            unsafe { q8_0_lane_partials_mcol::<4>(qs, d, x, k, row, x0, x_col, lane) }
+            unsafe { blocks_lane_partials_mcol::<F, 4>(qs, d, x, k, row, x0, x_col, lane) }
         }
         5 => {
             // SAFETY: M = m_cols, so this fn's contract is the body's.
-            unsafe { q8_0_lane_partials_mcol::<5>(qs, d, x, k, row, x0, x_col, lane) }
+            unsafe { blocks_lane_partials_mcol::<F, 5>(qs, d, x, k, row, x0, x_col, lane) }
         }
         6 => {
             // SAFETY: M = m_cols, so this fn's contract is the body's.
-            unsafe { q8_0_lane_partials_mcol::<6>(qs, d, x, k, row, x0, x_col, lane) }
+            unsafe { blocks_lane_partials_mcol::<F, 6>(qs, d, x, k, row, x0, x_col, lane) }
         }
         7 => {
             // SAFETY: M = m_cols, so this fn's contract is the body's.
-            unsafe { q8_0_lane_partials_mcol::<7>(qs, d, x, k, row, x0, x_col, lane) }
+            unsafe { blocks_lane_partials_mcol::<F, 7>(qs, d, x, k, row, x0, x_col, lane) }
         }
         8 => {
             // SAFETY: M = m_cols, so this fn's contract is the body's.
-            unsafe { q8_0_lane_partials_mcol::<8>(qs, d, x, k, row, x0, x_col, lane) }
+            unsafe { blocks_lane_partials_mcol::<F, 8>(qs, d, x, k, row, x0, x_col, lane) }
         }
         _ => return None,
     })
@@ -1276,9 +1427,9 @@ mod q8f32_kernels {
         // SAFETY: row < n_rows puts the row's words and scales inside qs and
         // d (the contract's 4·qs.len() and 32·d.len() bounds), and column c
         // at c*k with x.len() >= m_cols*k = (m_cols-1)*k + k.
-        let Some(f) =
-            (unsafe { q8_0_lane_partials_m(qs, d, x, k, row, 0, k as usize, m_cols, lane) })
-        else {
+        let Some(f) = (unsafe {
+            blocks_lane_partials_m::<Q8_0Bytes>(qs, d, x, k, row, 0, k as usize, m_cols, lane)
+        }) else {
             return;
         };
         let sums = gemv_lane_sums(f, m_cols);
@@ -1294,6 +1445,96 @@ mod q8f32_kernels {
                     m_cols as usize,
                     &sums,
                 );
+            }
+        }
+    }
+
+    /// `q8_0_gemv` for an MXFP8 weight in its two planes (module doc): the
+    /// same skeleton and lane walk under [`Mxfp8Bytes`], one f32 activation
+    /// column. `k` a multiple of 128 (host-validated, so a row's scales are
+    /// whole `e` words).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_rows * k,
+            128 * e.len() >= n_rows * k,
+            x.len() >= k,
+            y.len() >= n_rows
+        )
+    )]
+    pub fn mxfp8_gemv(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        n_rows: u32,
+        k: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY: row < n_rows puts the row's words and its blocks' scales
+        // inside qs and e (the contract's 4·qs.len() and 128·e.len() bounds:
+        // block b's scale is in word b/4), and x.len() >= k is the one column
+        // the body reads from x0 = 0.
+        let f = unsafe { blocks_lane_partial_1col::<Mxfp8Bytes>(qs, e, x, k, row, 0, lane) };
+        let s = warp::reduce_sum_f32(f);
+        if lane == 0 {
+            // SAFETY: row < n_rows <= y.len() by the launch contract, and only
+            // lane 0 of the row's warp writes slot row.
+            unsafe { *y.get_unchecked_mut(row) = s };
+        }
+    }
+
+    /// `q8_0_gemv_mcol` for an MXFP8 weight in its two planes: column c of
+    /// `y` is bit for bit `mxfp8_gemv`'s `m = 1` output on column c, row r's
+    /// column c at `y[c*n_rows+r]`. `k` a multiple of 128.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_rows * k,
+            128 * e.len() >= n_rows * k,
+            x.len() >= m_cols * k,
+            y.len() >= n_rows * m_cols
+        )
+    )]
+    pub fn mxfp8_gemv_mcol(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        n_rows: u32,
+        k: u32,
+        m_cols: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY: row < n_rows puts this row's words and scales inside
+        // qs and e; x.len() >= m_cols*k covers every input column.
+        let Some(f) = (unsafe {
+            blocks_lane_partials_m::<Mxfp8Bytes>(qs, e, x, k, row, 0, k as usize, m_cols, lane)
+        }) else {
+            return;
+        };
+        let sums = gemv_lane_sums(f, m_cols);
+        if lane == 0 {
+            // SAFETY: row + c*n_rows < n_rows*m_cols <= y.len();
+            // this row's lane 0 alone writes these slots.
+            unsafe {
+                store_sums(&mut y, row, n_rows as usize, m_cols as usize, &sums);
             }
         }
     }
@@ -1357,7 +1598,7 @@ mod q8f32_kernels {
         // x0 + c*x_col_stride + k <= (m_cols-1)*x_col_stride +
         // (n_heads-1)*x_head_stride + k <= x.len().
         let Some(f) = (unsafe {
-            q8_0_lane_partials_m(
+            blocks_lane_partials_m::<Q8_0Bytes>(
                 qs,
                 d,
                 x,
@@ -1595,7 +1836,17 @@ mod q8f32_kernels {
         // column c at c*k with x.len() >= m_cols*k = (m_cols-1)*k + k; the
         // host passes k a positive multiple of 32.
         let Some(f) = (unsafe {
-            q8_0_lane_partials_m(qs, d, x, k, id as usize, 0, k as usize, m_cols, lane)
+            blocks_lane_partials_m::<Q8_0Bytes>(
+                qs,
+                d,
+                x,
+                k,
+                id as usize,
+                0,
+                k as usize,
+                m_cols,
+                lane,
+            )
         }) else {
             return;
         };
@@ -1733,6 +1984,39 @@ impl Q8F32Kernels {
             y_col,
             y,
         )?;
+        Ok(())
+    }
+
+    /// Enqueue `y = W · x` for an MXFP8 weight in its two planes (module doc,
+    /// [`Mxfp8Weight`]) against `m` (1..=8) f32 activation columns of `k =
+    /// 4 · qs.cols()` values each, token-major (row r's column c at
+    /// `y[c · n_rows + r]`): `m = 1` runs `mxfp8_gemv`, `m > 1`
+    /// `mxfp8_gemv_mcol`, whose column c is the `m = 1` launch of column c
+    /// bit for bit. `k` must be a multiple of 128
+    /// and `e` `k / 128` words a row over the same rows; another geometry is
+    /// a named error. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_mxfp8_gemv(
+        &self,
+        stream: &CudaStream,
+        a: Mxfp8GemvArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let Mxfp8GemvArgs { w, x, m, y } = a;
+        let what = "enqueue_mxfp8_gemv";
+        let (n_rows, k) = w.dimensions(what)?;
+        check_gemv_geometry(what, n_rows, k, x.len(), m, y.len())?;
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let k = launch_u32(what, "k", k)?;
+        let cfg = LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0);
+        if m == 1 {
+            let prep = self.module.prepare_mxfp8_gemv(cfg)?;
+            self.module
+                .mxfp8_gemv(stream, &prep, w.qs.buf(), w.e.buf(), x, n_rows, k, y)?;
+            return Ok(());
+        }
+        let m = launch_u32(what, "m", m)?;
+        let prep = self.module.prepare_mxfp8_gemv_mcol(cfg)?;
+        self.module
+            .mxfp8_gemv_mcol(stream, &prep, w.qs.buf(), w.e.buf(), x, n_rows, k, m, y)?;
         Ok(())
     }
 
@@ -2067,6 +2351,93 @@ pub struct Q8_0GemvMcolArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
+/// An MXFP8 weight resident in its two planes ([`mxfp8_planes`]): `qs` rows
+/// × `k / 4` words of value bytes, `e` rows × `k / 128` words of scale
+/// bytes.
+#[derive(Clone, Copy)]
+pub struct Mxfp8Weight<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub e: &'a DeviceTensor<u32>,
+}
+
+impl Mxfp8Weight<'_> {
+    /// Check plane alignment and matching shapes; return rows and k.
+    pub(crate) fn dimensions(self, what: &'static str) -> Result<(usize, usize), GpuError> {
+        let (rows, k) = (self.qs.rows(), 4 * self.qs.cols());
+        if !k.is_multiple_of(128) || self.e.rows() != rows || self.e.cols() != k / 128 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "MXFP8 planes: k={k} must be a multiple of 128 and e {rows}x{}; got {}x{}",
+                    k / 128,
+                    self.e.rows(),
+                    self.e.cols()
+                ),
+            ));
+        }
+        Ok((rows, k))
+    }
+}
+
+/// [`Q8F32Kernels::enqueue_mxfp8_gemv`]'s arguments: the weight, `m`
+/// activation columns (1..=8) of `x`, and the token-major output.
+pub struct Mxfp8GemvArgs<'a> {
+    pub w: Mxfp8Weight<'a>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub m: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// The two planes of `rows` MXFP8 rows of `k` values from their file blocks
+/// (`GgmlType::MXFP8`, `bytes` exactly the rows'): `qs` the value bytes in row
+/// order as little-endian words, `k / 4` a row, and `e` the blocks' scale
+/// bytes in the same order four to a word, `k / 128` a row. `k` must be a
+/// positive multiple of 128; a byte that holds no value
+/// (`gguf::quant::check_mxfp8`) is refused by name with its row.
+pub fn mxfp8_planes(bytes: &[u8], rows: usize, k: usize) -> Result<(Vec<u32>, Vec<u32>), GpuError> {
+    let what = "q8f32::mxfp8_planes";
+    if k == 0 || !k.is_multiple_of(128) {
+        return Err(GpuError::shape(
+            what,
+            format!("k {k} is not a positive multiple of 128"),
+        ));
+    }
+    let row_bytes = (k / 32)
+        .checked_mul(33)
+        .ok_or_else(|| GpuError::shape(what, "MXFP8 row byte count overflows"))?;
+    let Some(want) = rows.checked_mul(row_bytes) else {
+        return Err(GpuError::shape(
+            what,
+            format!("{rows} rows of {k} MXFP8 values: the byte count overflows"),
+        ));
+    };
+    if bytes.len() != want {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{} bytes for {rows} rows of {k} MXFP8 values, want {want}",
+                bytes.len()
+            ),
+        ));
+    }
+    let mut qs = Vec::with_capacity(rows * k / 4);
+    let mut e = Vec::with_capacity(rows * k / 128);
+    for (r, row) in bytes.chunks_exact(row_bytes).enumerate() {
+        check_mxfp8(row).map_err(|why| GpuError::shape(what, format!("row {r}: {why}")))?;
+        for four in row.as_chunks::<132>().0 {
+            let mut word = 0u32;
+            for (i, blk) in four.as_chunks::<33>().0.iter().enumerate() {
+                word |= u32::from(blk[0]) << (8 * i);
+                for c in blk[1..].as_chunks::<4>().0 {
+                    qs.push(u32::from_le_bytes(*c));
+                }
+            }
+            e.push(word);
+        }
+    }
+    Ok((qs, e))
+}
+
 /// [`Q8F32Kernels::enqueue_q8_0_gemv_heads_mcol`]'s arguments. The strides
 /// and the offset count f32 elements, `rows_per_head` weight rows; `m` is
 /// the column count, 1..=8.
@@ -2158,9 +2529,81 @@ fn check_gemv_geometry(
 #[cfg(test)]
 mod tests {
     use super::{
-        f32_lane_partial_1col_w32, f32_lane_partials, q8_0_lane_partial_1col,
-        q8_0_lane_partials_mcol,
+        ByteBlocks, Mxfp8Bytes, f32_lane_partial_1col_w32, f32_lane_partials, mxfp8_planes,
+        q8_0_lane_partial_1col, q8_0_lane_partials_mcol,
     };
+    use gguf::quant::{GgmlType, dequant_row};
+
+    /// The card's MXFP8 decode is the host's: blocks of every scale byte
+    /// below 0xFF and every value byte that holds a value, through
+    /// [`mxfp8_planes`] and the walk's two reads (`Mxfp8Bytes::value` on a
+    /// `qs` word, `Mxfp8Bytes::scale` on the `e` plane), give
+    /// `gguf::quant::dequant_row`'s values bit for bit, subnormal products
+    /// and the sign of zero included. The planes refuse a NaN byte, and a
+    /// scale a value of its block leaves f32's range at, naming the row.
+    #[test]
+    fn mxfp8_card_decode_is_the_hosts() {
+        let ty = GgmlType::MXFP8;
+        let values: Vec<u8> = (0..=u8::MAX).filter(|b| b & 0x7F != 0x7F).collect();
+        let (rows, k) = (16, 512);
+        let mut bytes = Vec::new();
+        for b in 0..rows * k / 32 {
+            let scale = u8::try_from(b).unwrap_or(127).min(254);
+            // The values whose product with the scale is a finite f32.
+            let held: Vec<u8> = values
+                .iter()
+                .copied()
+                .filter(|&v| {
+                    (Mxfp8Bytes::value(u32::from(v)) * Mxfp8Bytes::scale(u32::from(scale), 0))
+                        .is_finite()
+                })
+                .collect();
+            bytes.push(scale);
+            for j in 0..32 {
+                bytes.push(held[(32 * b + j) % held.len()]);
+            }
+        }
+        let (qs, e) = mxfp8_planes(&bytes, rows, k).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((qs.len(), e.len()), (rows * k / 4, rows * k / 128));
+        let mut want = vec![0.0f32; rows * k];
+        dequant_row(ty, &bytes, &mut want).unwrap_or_else(|e| panic!("{e}"));
+        for (v, w) in want.iter().enumerate() {
+            // SAFETY: block v / 32 < rows * k / 32, whose scales e holds.
+            let d = Mxfp8Bytes::scale(unsafe { Mxfp8Bytes::scale_at(&e, v / 32) }, v / 32);
+            let got = Mxfp8Bytes::value(qs[v / 4] >> (8 * (v % 4))) * d;
+            assert_eq!(got.to_bits(), w.to_bits(), "value {v}");
+        }
+        bytes[528 + 33 + 3] = 0xFF;
+        match mxfp8_planes(&bytes, rows, k) {
+            Err(err) => {
+                let err = err.to_string();
+                assert!(err.contains("row 1") && err.contains("value 34"), "{err}");
+            }
+            Ok(_) => panic!("a NaN value byte repacked"),
+        }
+        bytes[528 + 33 + 3] = 0x01;
+        bytes[528 + 33] = 254;
+        bytes[528 + 33 + 4] = 0x40;
+        match mxfp8_planes(&bytes, rows, k) {
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains("row 1") && err.contains("f32's range"),
+                    "{err}"
+                );
+            }
+            Ok(_) => panic!("2 · 2^127 repacked"),
+        }
+        // 2^62 rows of 132 bytes are 2^64 · 33 bytes: a product that wraps
+        // to the empty input's length.
+        match mxfp8_planes(&[], 1 << 62, 128) {
+            Err(err) => assert!(err.to_string().contains("overflows"), "{err}"),
+            Ok(_) => panic!("2^62 rows sized from an empty input"),
+        }
+        let err = mxfp8_planes(&[0; 116], 1, 17_887_751_829_051_686_528)
+            .expect_err("an overflowing MXFP8 row width");
+        assert!(err.to_string().contains("overflows"), "{err}");
+    }
 
     /// The single-column Q8_0 body sums every value of the row exactly once,
     /// for every k the launchers accept (a positive multiple of 32) up to two

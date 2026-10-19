@@ -1,6 +1,6 @@
 //! The one device module of the 32-value-block family: the Q8_0, IQ4_NL,
 //! Q5_1, packed Q5_0 and NVFP4-plane GEMMs, their activations' quantizers,
-//! the remapped route and the wide F32 product — every `#[kernel]` entry of
+//! the remapped route and the wide F32 and MXFP8 products — every `#[kernel]` entry of
 //! the family,
 //! so one bundle load serves them all. It is a module of its own, beside
 //! `kernels.rs`, so no entry of the K-quant family's module changes with it.
@@ -9,7 +9,7 @@
 //! `f32tile.rs`) or are written out here.
 
 use super::act32::quant32_group;
-use super::f32tile::{STAGE_FLOATS, STAGES, f32_tile_body};
+use super::f32tile::{F32Rows, Mxfp8Rows, STAGE_FLOATS, STAGES, f32_tile_body};
 use super::gemm32::{
     B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, IQ4_NL_BLOCK_BYTES, Q5_1_BLOCK_WORDS,
     Q8_0_BLOCK_BYTES, W32_ROW, W32_STAGE_W, iq4_nl_file_block, mma_m16n8k16_s32_s8_zero,
@@ -1024,7 +1024,46 @@ mod gemm32_kernels {
         // SAFETY: every thread of the 512-wide block calls it converged; the
         // host sized the grid, checked k and the alignments; the lengths are
         // the launch contract's.
-        unsafe { f32_tile_body(w, x, rows, k, n, &mut y, sh) };
+        unsafe { f32_tile_body(F32Rows(w), x, rows, k, n, &mut y, sh) };
+    }
+
+    /// `f32_tile_gemm` over an MXFP8 weight's two planes (`f32tile.rs`,
+    /// [`Mxfp8Rows`]): its values decoded as they are staged, so each output
+    /// is bit for bit `q8f32::f32_gemv`'s over the dequantized rows. `k` a
+    /// positive multiple of 128 and `x` 16-byte aligned (host-checked).
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            rows >= 1,
+            n >= 1,
+            4 * qs.len() >= rows * k,
+            128 * e.len() >= rows * k,
+            x.len() >= n * k,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn mxfp8_tile_gemm(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: STAGE is this block's own shared allocation of STAGES ·
+        // STAGE_FLOATS values, 16-byte aligned; the raw form reaches the
+        // `static mut` without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        // SAFETY: every thread of the 512-wide block calls it converged; the
+        // host sized the grid, checked k and x's alignment; the planes hold
+        // rows · k values by the launch contract (4 a qs word, 128 an e
+        // word), the other lengths are the contract's.
+        unsafe { f32_tile_body(Mxfp8Rows { qs, e }, x, rows, k, n, &mut y, sh) };
     }
 
     /// [`swiglu_quant32`] under a gate·up rule of the K-quant family

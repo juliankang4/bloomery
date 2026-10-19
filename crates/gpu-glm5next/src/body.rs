@@ -94,6 +94,7 @@ use bloomery_gpu::model::{
     ChainBody, HostServed, Rollback, SlotRange, Slots, StepKernels, StepMode, refuse_scratch_past,
 };
 use bloomery_gpu::qsa::{QsaKernels, list_width};
+pub(crate) use bloomery_gpu::site::resident_gemv as gemv;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer};
 use bloomery_gpu_deepseek41::attn::{self, AttnKernels};
@@ -1099,18 +1100,6 @@ pub(crate) fn f32t<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<f3
 /// The resident f32 vector `name`, as the buffer a kernel reads.
 pub(crate) fn f32v<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceBuffer<f32>, GpuError> {
     f32t(w, name).map(DeviceTensor::buf)
-}
-
-/// `y = W · x` for the q8_0 weight `name` at one column.
-pub(crate) fn gemv(
-    gpu: &Gpu,
-    w: &Weights,
-    name: &str,
-    x: &DeviceBuffer<f32>,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let (qs, d) = q8(w, name)?;
-    gpu.q8f32().enqueue_q8_0_gemv(gpu.stream(), qs, d, x, 1, y)
 }
 
 /// A shape the kernels have no geometry for, by name.

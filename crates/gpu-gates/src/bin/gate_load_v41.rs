@@ -633,7 +633,11 @@ mod gate {
                     .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
                     .collect(),
             ),
-            CardFormat::Q5_0 | CardFormat::Q5_1 | CardFormat::Bf16Raw | CardFormat::Nvfp4Planes => {
+            CardFormat::Q5_0
+            | CardFormat::Q5_1
+            | CardFormat::Bf16Raw
+            | CardFormat::Nvfp4Planes
+            | CardFormat::Mxfp8Planes => {
                 return Err(format!("no host packing of {format:?} here: V4.1 has none").into());
             }
         })
@@ -654,6 +658,9 @@ mod gate {
             }
             DevWeight::Nvfp4 { .. } => {
                 return Err("an nvfp4 weight: V4.1 has none".into());
+            }
+            DevWeight::Mxfp8 { .. } => {
+                return Err("an mxfp8 weight: V4.1 has none".into());
             }
         })
     }

@@ -8,14 +8,16 @@
 //!
 //! Two entry points share one header parser: `Gguf::open*` (strict — every
 //! tensor must be sized by this engine's `GgmlType`, or by the caller's
-//! [`PrivateType`] table in [`Gguf::open_private`], and sit inside the file)
+//! [`PrivateType`] table in [`Gguf::open_private`], and sit inside the file;
+//! bloomery's own value types open through a [`Split`] alone)
 //! and [`inventory_of`] (header-only — unknown type ids are carried as
 //! numbers with ggml's size table, so files with types the engine cannot
 //! dequantize still inventory). A model split across shards opens as a
 //! [`Split`]: one strict reader per shard, validated as one model. The
 //! [`write`] module writes the files this reader opens. The [`qtype`] module
-//! holds one row of facts per ggml type (sizes, name, decode, activation),
-//! which `quant`, [`ggml_type_info`] and the other crates read.
+//! holds one row of facts per type, ggml's and bloomery's own (sizes, name,
+//! decode, activation), which `quant`, [`ggml_type_info`] and the other
+//! crates read.
 //!
 //! Format facts mirrored from the vendored ik_llama.cpp reader
 //! (`gguf_init_from_file`, ggml.c:31219-31475):
@@ -37,6 +39,7 @@ pub mod quant;
 pub mod v41;
 pub mod write;
 
+use qtype::OWN_ROWS;
 pub use qtype::{HostAct, QROWS, QRow};
 pub use quant::{
     ActivationFormat, GgmlType, QuantError, activation_format, dequant_row, quantize_activations,
@@ -120,20 +123,6 @@ pub struct PrivateType {
     pub size: u64,
 }
 
-/// bloomery's F8 row type: one F8_E4M3 byte a value, its tensor's values that
-/// byte's value times the one f32 of `<stem>.scale` beside `<stem>.weight`
-/// ([`quant::E4m3Rows`]). Its id is bloomery's own value types' range (2000
-/// up; 1000 up holds its re-layouts of ggml types), outside every ggml table.
-pub const F8E4M3_ROWS: PrivateType = PrivateType {
-    id: 2000,
-    blck: 1,
-    size: 1,
-};
-
-/// The private types a [`Split`] opens with: bloomery's own value types a
-/// model file may carry.
-const SPLIT_PRIVATE: [PrivateType; 1] = [F8E4M3_ROWS];
-
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     #[error("io error: {0}")]
@@ -199,7 +188,7 @@ pub enum LoadError {
     },
     /// A [`PrivateType`] entry whose id this build already sizes: a file
     /// tagged with it would open everywhere as that ggml type.
-    #[error("private type id {id} is ggml's {name}: a private id must be unknown to this build")]
+    #[error("private type id {id} is {name}: a private id must be unknown to this build")]
     KnownPrivateType { id: u32, name: &'static str },
     /// A [`PrivateType`] entry that cannot size a tensor, or one listed twice.
     #[error("private type id {id}: {detail}")]
@@ -265,7 +254,7 @@ impl Gguf {
     /// that is refused costs its header's pages; only then is the mapping
     /// populated or copied.
     pub fn open_backed(path: impl AsRef<Path>, weights: Weights) -> Result<Gguf, LoadError> {
-        Self::open_sized(path.as_ref(), weights, &[])
+        Self::open_sized(path.as_ref(), weights, &[], false)
     }
 
     /// `open_backed`, with the tensors whose type id `private` lists sized by
@@ -280,15 +269,17 @@ impl Gguf {
         private: &[PrivateType],
     ) -> Result<Gguf, LoadError> {
         check_private(private)?;
-        Self::open_sized(path.as_ref(), weights, private)
+        Self::open_sized(path.as_ref(), weights, private, false)
     }
 
     /// The open every entry point shares: `private` is empty except in
-    /// [`Gguf::open_private`].
+    /// [`Gguf::open_private`], and `own` (bloomery's own value types,
+    /// [`OWN_ROWS`]) holds only for a [`Split`]'s shards.
     fn open_sized(
         path: &Path,
         weights: Weights,
         private: &[PrivateType],
+        own: bool,
     ) -> Result<Gguf, LoadError> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
@@ -297,7 +288,7 @@ impl Gguf {
         // ik_llama.cpp's own mmap loader accepts.
         let file_map = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let h = parse_header(&file_map, len)?;
-        let tensors = strict_tensors(h.tensors, h.data_base, len, private)?;
+        let tensors = strict_tensors(h.tensors, h.data_base, len, private, own)?;
         let map = match weights {
             Weights::Mapped { populate } => {
                 #[cfg(target_os = "linux")]
@@ -526,8 +517,8 @@ const SPLIT_TENSORS: &str = "split.tensors.count";
 /// read.
 ///
 /// Every shard opens with the strict reader and lazily, so opening touches
-/// the headers only, sizing bloomery's own value types too
-/// ([`Split::block`]). Metadata is the first shard's: the splitter writes the
+/// the headers only, sizing bloomery's own value types too (`qtype::OWN_ROWS`).
+/// Metadata is the first shard's: the splitter writes the
 /// model's keys there alone (gguf-split.cpp:242).
 pub struct Split {
     shards: Vec<Gguf>,
@@ -606,19 +597,6 @@ impl Split {
     /// Number of shards (1 for a single file).
     pub fn shard_count(&self) -> usize {
         self.shards.len()
-    }
-
-    /// A block of `ty` as a split sizes it, its values and its bytes: ggml's
-    /// types by their table, bloomery's own value types by theirs; `None` for
-    /// a type neither sizes.
-    #[must_use]
-    pub fn block(ty: GgmlType) -> Option<(u64, u64)> {
-        ty.blck_size().zip(ty.type_size()).or_else(|| {
-            SPLIT_PRIVATE
-                .iter()
-                .find(|p| GgmlType::Unknown(p.id) == ty)
-                .map(|p| (p.blck, p.size))
-        })
     }
 
     /// Shard `i`'s reader — the one whose [`Gguf::data`] holds its tensors.
@@ -700,7 +678,7 @@ fn shard_suffix(i: u64, count: u64) -> String {
 /// The strict open of one shard, its error naming the file.
 fn open_shard(path: &Path) -> Result<Gguf, LoadError> {
     let lazy = Weights::Mapped { populate: false };
-    Gguf::open_private(path, lazy, &SPLIT_PRIVATE).map_err(|e| match e {
+    Gguf::open_sized(path, lazy, &[], true).map_err(|e| match e {
         LoadError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => LoadError::MissingShard {
             path: path.display().to_string(),
         },
@@ -787,7 +765,7 @@ pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
 }
 
 /// ggml's `(type_name, blck_size, type_size)` for a type id: the row of every id [`GgmlType`]
-/// names ([`QROWS`], which cite their block structs). Every other id returns `None` and
+/// names ([`QROWS`], which cite their block structs, and bloomery's own `OWN_ROWS`). Every other id returns `None` and
 /// inventories with unknown size.
 pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
     GgmlType::from_u32(id)
@@ -883,8 +861,8 @@ fn alignment_of(meta: &[(String, Value)]) -> Result<u64, LoadError> {
     }
 }
 
-/// A [`PrivateType`] table's own refusals: an id this build sizes (by
-/// [`GgmlType`] or ggml's table in [`ggml_type_info`]), a block of no values
+/// A [`PrivateType`] table's own refusals: an id this build sizes (by a row,
+/// [`ggml_type_info`]), a block of no values
 /// or no bytes, an id listed twice.
 fn check_private(private: &[PrivateType]) -> Result<(), LoadError> {
     for (i, p) in private.iter().enumerate() {
@@ -904,7 +882,8 @@ fn check_private(private: &[PrivateType]) -> Result<(), LoadError> {
 }
 
 /// The strict pass over a parsed header's tensors: every tensor must be sized
-/// by this engine's `GgmlType` or by its entry in `private`, its first dim must be
+/// by this engine's `GgmlType` (bloomery's own value types only when `own`)
+/// or by its entry in `private`, its first dim must be
 /// block-aligned and its bytes must fit a u64; then every tensor must sit
 /// inside the `len`-byte file — the placement invariant the coverage gate
 /// re-checks per tensor. A q8_1 or q8_K tensor is refused: they are ggml's
@@ -914,11 +893,13 @@ fn strict_tensors(
     data_base: u64,
     len: u64,
     private: &[PrivateType],
+    own: bool,
 ) -> Result<Vec<TensorInfo>, LoadError> {
     let mut strict = Vec::with_capacity(raw.len());
     for t in raw {
         let ty = GgmlType::from_u32(t.type_id);
-        if matches!(ty, GgmlType::Q8_1 | GgmlType::Q8_K) {
+        let own_type = OWN_ROWS.iter().any(|r| r.ty == ty);
+        if matches!(ty, GgmlType::Q8_1 | GgmlType::Q8_K) || (own_type && !own) {
             return Err(LoadError::UnsupportedType { name: t.name, ty });
         }
         let own = private.iter().find(|p| p.id == t.type_id);
@@ -1563,37 +1544,84 @@ mod private_tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
-    /// bloomery's F8 rows open through a split and nowhere else: the strict
-    /// open refuses the type by the tensor's name, `Split::open` sizes it one
-    /// byte a value from its own table and keeps the id, and `Split::block`
-    /// answers for it beside ggml's types; another private id is sized by
-    /// neither.
+    /// bloomery's own value types open as they did before their rows named
+    /// them: through a split and nowhere else. The strict open refuses each
+    /// by the tensor's name; `Split::open` sizes F8 rows one byte a
+    /// value and MXFP8 33 bytes a 32 values, keeps each id and hands back
+    /// the bytes as written; an id past them is refused by both. A private
+    /// table cannot claim their ids.
     #[test]
-    fn bloomerys_f8_rows_open_through_a_split() {
-        let d = set_dir("f8");
-        let p = d.join("f8.gguf");
-        let rows: Vec<u8> = (0..320u32).map(|i| (i * 7) as u8).collect();
-        let t = TensorDecl {
-            name: "t".to_string(),
-            dims: vec![160, 2],
-            type_id: crate::F8E4M3_ROWS.id,
-            nbytes: 320,
+    fn bloomerys_own_types_open_through_a_split() {
+        let d = set_dir("own");
+        let p = d.join("own.gguf");
+        let f8: Vec<u8> = (0..320u32).map(|i| (i * 7) as u8).collect();
+        let mx: Vec<u8> = (0..132u32).map(|i| (i * 5 + 1) as u8).collect();
+        let decl = |name: &str, dims: Vec<u64>, ty: GgmlType, nbytes| TensorDecl {
+            name: name.to_string(),
+            dims,
+            type_id: ty.as_u32(),
+            nbytes,
         };
-        write_file(&p, &[], &[(t, rows.clone())]);
-        let ty = GgmlType::Unknown(crate::F8E4M3_ROWS.id);
+        let (f8_ty, mx_ty) = (GgmlType::F8E4M3_ROWS, GgmlType::MXFP8);
+        write_file(
+            &p,
+            &[],
+            &[
+                (decl("f8", vec![160, 2], f8_ty, 320), f8.clone()),
+                (decl("mx", vec![64, 2], mx_ty, 132), mx.clone()),
+            ],
+        );
         assert!(
-            matches!(Gguf::open(&p), Err(LoadError::UnsupportedType { ref name, ty: got }) if name == "t" && got == ty)
+            matches!(Gguf::open(&p), Err(LoadError::UnsupportedType { ref name, ty }) if name == "f8" && ty == f8_ty)
+        );
+        let mx_only = d.join("mx-only.gguf");
+        write_file(
+            &mx_only,
+            &[],
+            &[(decl("mx", vec![64, 2], mx_ty, 132), mx.clone())],
+        );
+        assert!(
+            matches!(Gguf::open(&mx_only), Err(LoadError::UnsupportedType { ref name, ty }) if name == "mx" && ty == mx_ty)
         );
         let split = Split::open(&p).unwrap();
-        let (s, t) = split.find("t").unwrap();
-        assert_eq!(
-            (t.ty, t.nbytes, t.dims.as_slice()),
-            (ty, 320, &[160u64, 2][..])
+        for (name, ty, id, dims, bytes) in [
+            ("f8", f8_ty, 2000, [160u64, 2], &f8),
+            ("mx", mx_ty, 2001, [64, 2], &mx),
+        ] {
+            let (s, t) = split.find(name).unwrap();
+            assert_eq!(
+                (t.ty, t.ty.as_u32(), t.nbytes, t.dims.as_slice()),
+                (ty, id, bytes.len() as u64, &dims[..])
+            );
+            assert_eq!(split.shard(s).unwrap().data(t).unwrap(), bytes.as_slice());
+        }
+        assert_eq!((f8_ty.blck_size(), f8_ty.type_size()), (Some(1), Some(1)));
+        assert_eq!((mx_ty.blck_size(), mx_ty.type_size()), (Some(32), Some(33)));
+        let other = d.join("other.gguf");
+        write_file(
+            &other,
+            &[],
+            &[(
+                decl("o", vec![32, 2], GgmlType::Unknown(2002), 66),
+                vec![0; 66],
+            )],
         );
-        assert_eq!(split.shard(s).unwrap().data(t).unwrap(), rows.as_slice());
-        assert_eq!(Split::block(ty), Some((1, 1)));
-        assert_eq!(Split::block(GgmlType::Q4_0), Some((32, 18)));
-        assert_eq!(Split::block(GgmlType::Unknown(TAG)), None);
+        assert!(matches!(
+            Split::open(&other),
+            Err(LoadError::Shard { ref source, .. })
+                if matches!(**source, LoadError::UnsupportedType { ty: GgmlType::Unknown(2002), .. })
+        ));
+        for id in [2000, 2001] {
+            let table = [PrivateType {
+                id,
+                blck: 1,
+                size: 1,
+            }];
+            assert!(matches!(
+                Gguf::open_private(&p, LAZY, &table),
+                Err(LoadError::KnownPrivateType { id: got, .. }) if got == id
+            ));
+        }
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

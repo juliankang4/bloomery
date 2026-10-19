@@ -296,6 +296,13 @@ gate-gpu-mamba2-ssd:
 gate-gpu-nvfp4:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvfp4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nvfp4'
 
+# MXFP8 dense gemv and wide tile (bloomery_gpu::q8f32, Gemm32Kernels) at attn_q_b / attn_output / ssm_f_b shapes of a 4,096-wide model,
+# synthetic tensors loaded through Weights::load_where: every output written, within the derived band of the host dequant, bit for
+# bit the host walk; the Q8_0 site gemv and the F32 tile bit for bit their rules; the load's refusals by name.
+# `gate_mxfp8 --bench-kernels` prices the gemv beside Q8_0.
+gate-gpu-mxfp8:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_mxfp8 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mxfp8'
+
 # nemotron_h (Nemotron 3 Nano 4B Q4_K_M) end-to-end gate, one card: the captured step's entries against the layer kinds the header derives
 # (the scans, the squared ReLUs, the group-5 flash passes, the appends, the Q5_0 embedding row; no group-8 flash entry, no host node), eager =
 # captured replay bit for bit over 16 tokens, reset rewinds the ids and the logits bits, the scan state carries (layer 0 nonzero, the last
@@ -1406,8 +1413,9 @@ gate-gpu-qwen3moe-e2e:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
 
 # qwen3moe routed types under the --place-unset defaults: for every type the host's routed kernels run, a crafted
-# two-layer header planned by the CLI's and the serve seat's defaults (plan only: no weight loaded, no model file opened,
-# so the fixture tier runs it). A refusal, or card experts of a type the card table does not run, fails by name.
+# two-layer header planned by the CLI's and the serve seat's defaults. A refusal, or card experts of a type the card
+# table does not run, fails by name. The synthetic layout with MXFP8 attention also loads whole and placed;
+# no external model file is needed, so the fixture tier runs it.
 gate-gpu-qwen3moe-types:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_types && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_types'
 

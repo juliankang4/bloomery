@@ -1692,6 +1692,74 @@ mod tests {
             assert_eq!(widths.forms, forms);
         }
 
+        /// An attention projection in bloomery's MXFP8 (`GgmlType::MXFP8`, as an
+        /// FP4-Local checkpoint ships its attention) is placed on the stage
+        /// card in its own two planes at the bytes the card loader allocates,
+        /// beside a Q8_0 projection of the same shape in Q8_0's planes; one
+        /// whose row is no whole number of scale words (49 blocks) is refused
+        /// by the plan naming it.
+        #[test]
+        fn an_mxfp8_attention_projection_is_placed_in_its_planes() {
+            use crate::placement::{CardFormat, Device, Format};
+            let mxfp8 = GgmlType::MXFP8;
+            let projection = |name: &str, ty: GgmlType, k: u64| {
+                let rows = 16_384u64;
+                let (blck, size) = (ty.blck_size().unwrap(), ty.type_size().unwrap());
+                ModelTensor {
+                    name: name.to_string(),
+                    shard: 0,
+                    layer: Some(3),
+                    role: Role::Attention,
+                    ty,
+                    dims: vec![k, rows],
+                    file_bytes: rows * k / blck * size,
+                    gathered_rows: None,
+                }
+            };
+            let mut i = inputs();
+            i.model.tensors.extend([
+                projection("blk.3.attn_q_b.weight", mxfp8, 1536),
+                projection("blk.3.indexer.attn_q_b.weight", GgmlType::Q8_0, 1536),
+            ]);
+            let machine = machine(LAYERS);
+            let plan = i
+                .plan(&machine, CTX, &PlanLevers::default())
+                .expect("the plan");
+            for (name, ty, format) in [
+                ("blk.3.attn_q_b.weight", mxfp8, CardFormat::Mxfp8Planes),
+                (
+                    "blk.3.indexer.attn_q_b.weight",
+                    GgmlType::Q8_0,
+                    CardFormat::Q8_0Planes,
+                ),
+            ] {
+                let row = plan
+                    .rows
+                    .iter()
+                    .find(|r| i.model.tensors[r.tensor].name == name)
+                    .expect("its row");
+                let want = 16_384 * (1536 / 32) * if ty == mxfp8 { 33 } else { 34 };
+                let got: Vec<_> = row
+                    .segments
+                    .iter()
+                    .map(|s| (s.device, s.format, s.resident_bytes))
+                    .collect();
+                assert_eq!(
+                    got,
+                    [(Device::Card(0), Format::Card(format), want)],
+                    "{name}"
+                );
+            }
+            let mut i = inputs();
+            i.model
+                .tensors
+                .push(projection("blk.3.attn_q_b.weight", mxfp8, 1568));
+            match i.plan(&machine, CTX, &PlanLevers::default()) {
+                Err(e) => assert!(e.to_string().contains("blk.3.attn_q_b.weight"), "{e}"),
+                Ok(_) => panic!("49 blocks a row placed in whole scale words"),
+            }
+        }
+
         /// The card experts read every type the common card leg runs, and
         /// only those; a file whose routed stacks are all Q4_K or Q5_K (or
         /// host-only, as a Q6_K down) reserves the prompt batch's bytes it

@@ -59,10 +59,9 @@ mod gate {
     use bloomery_gpu::{Gpu, Q8Act};
     use bloomery_gpu_gates::act_rule::{Q8_1_BLOCK, q8_1_codes};
     use bloomery_gpu_gates::rounding::{U64, butterfly, gamma};
-    use bloomery_gpu_gates::{GateError, GateRng, checks_failed, par_map, verdict};
+    use bloomery_gpu_gates::{GateError, GateRng, checks_failed, par_map, verdict, write_gguf};
     use cuda_core::DeviceBuffer;
     use gguf::quant::{GgmlType, dequant_row};
-    use gguf::write::{Layout, TensorDecl, Writer};
     use gguf::{Split, Value};
     use std::path::Path;
 
@@ -119,28 +118,6 @@ mod gate {
     /// One tensor of a synthetic file: name, dims, type, bytes.
     type Decl = (String, Vec<u64>, GgmlType, Vec<u8>);
 
-    /// Write `decls` as a GGUF at `path`, with the metadata `kvs`.
-    fn write_gguf(path: &Path, kvs: &[(String, Value)], decls: &[Decl]) -> Result<(), GateError> {
-        let tensors = decls
-            .iter()
-            .map(|(name, dims, ty, bytes)| TensorDecl {
-                name: name.clone(),
-                dims: dims.clone(),
-                type_id: ty.as_u32(),
-                nbytes: bytes.len() as u64,
-            })
-            .collect();
-        let layout = Layout::new(kvs, tensors).map_err(|e| format!("nvfp4 gguf: {e}"))?;
-        let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-        let mut w = Writer::new(file, layout).map_err(|e| format!("nvfp4 gguf: {e}"))?;
-        for (name, _, _, bytes) in decls {
-            w.tensor(name, bytes)
-                .map_err(|e| format!("nvfp4 gguf: {e}"))?;
-        }
-        w.finish().map_err(|e| format!("nvfp4 gguf: {e}"))?;
-        Ok(())
-    }
-
     /// An NVFP4 weight and its scale as two tensors of a file.
     fn weight_decls(stem: &str, rows: usize, k: usize, bytes: Vec<u8>, scale: f32) -> [Decl; 2] {
         [
@@ -160,9 +137,19 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        bloomery_levers::at_main(&[])?;
+        let bench = std::env::args().any(|a| a == "--bench-kernels");
+        let only = if bench {
+            bloomery_gpu_gates::bench_arm(
+                std::env::args(),
+                SHAPES.iter().map(|s| format!("nvfp4_{}", s.rows)),
+            )?
+        } else {
+            None
+        };
         let gpu = Gpu::new()?;
-        if std::env::args().any(|a| a == "--bench-kernels") {
-            return bench::run(&gpu);
+        if bench {
+            return bench::run(&gpu, only.as_deref());
         }
         println!("nvfp4 device={}", gpu.device_name()?);
         let dir = std::env::temp_dir().join(format!("bloomery-nvfp4-{}", std::process::id()));
@@ -376,26 +363,15 @@ mod gate {
         use bloomery_gpu_gates::GateError;
         use cuda_core::{CudaStream, DeviceBuffer};
 
-        pub fn run(gpu: &Gpu) -> Result<(), GateError> {
+        pub fn run(gpu: &Gpu, only: Option<&str>) -> Result<(), GateError> {
             println!("bench n_per_burst={N} rounds={ROUNDS} graph_launches_per_round={GREPS}");
-            let only = {
-                let mut args = std::env::args().skip_while(|a| a != "--bench-arm");
-                match args.next() {
-                    None => None,
-                    Some(_) => Some(args.next().ok_or(
-                        "gate_nvfp4: --bench-arm wants an arm name (a `bench op=` prefix)",
-                    )?),
-                }
-            };
             let stream = gpu.stream();
             let nv = Nvfp4Kernels::load(gpu.context())?;
-            let mut ran = false;
             for s in &SHAPES {
                 let op = format!("nvfp4_{}", s.rows);
-                if only.as_deref().is_some_and(|o| !op.starts_with(o)) {
+                if only.is_some_and(|o| !op.starts_with(o)) {
                     continue;
                 }
-                ran = true;
                 let (rows, k) = (s.rows, s.k);
                 let Planes { qs, e } = repack::<Nvfp4>(&nvfp4_bytes(rows, k, s.seed), rows, k)?;
                 let qs = DeviceTensor::upload(stream, &qs, rows, k / 8)?;
@@ -420,11 +396,7 @@ mod gate {
                         as u64;
                 print_arm(&op, rows, bytes, g.node_count(), eager, graph);
             }
-            if ran {
-                Ok(())
-            } else {
-                Err(format!("gate_nvfp4: --bench-arm {only:?} names no arm").into())
-            }
+            Ok(())
         }
     }
 }

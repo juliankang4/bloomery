@@ -17,9 +17,17 @@
 //! is staged as the last row and a column past the last as the last column;
 //! their sums are not stored. The output is column-major, `y[c · rows + r]`
 //! — the GEMM families' `y[s][n]`, not `f32_gemv`'s `y[r · m + c]`.
+//!
+//! The rows come from a [`TileRows`]: an F32 weight's values are copied into
+//! the stage as they are ([`F32Rows`], `cp.async`), and an MXFP8 weight's
+//! planes (`q8f32::mxfp8_planes`) are decoded into it ([`Mxfp8Rows`]: each
+//! piece's value word and its block's scale loaded, the four values formed
+//! as `Mxfp8Bytes` gives them, exactly the host's dequant, and stored) —
+//! `mxfp8_tile_gemm`. Either way the warps read f32 values from the stage, so
+//! an MXFP8 tile is bit for bit `f32_gemv` over the host's dequantized rows.
 
 use super::kernels32::Gemm32Kernels;
-use crate::q8f32::{TILE, f32_tile_chunk, gemv_lane_sums};
+use crate::q8f32::{ByteBlocks, Mxfp8Bytes, Mxfp8Weight, TILE, f32_tile_chunk, gemv_lane_sums};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -52,6 +60,70 @@ const _: () = assert!(ROW_GROUPS * COL_GROUPS * 32 == F32T_THREADS && F32T_THREA
 // Every thread copies one piece of one row line and of one column line.
 const _: () = assert!(TILE_ROWS * LINE_COPIES == F32T_THREADS && TILE_COLS == TILE_ROWS);
 const _: () = assert!(4 * STAGES * STAGE_FLOATS <= 48 * 1024);
+
+/// A tile's weight rows: how one thread's piece of a row line reaches the
+/// stage.
+pub(super) trait TileRows: Copy {
+    /// Values `at .. at + 4` of the weight (its rows back to back, `at` a
+    /// multiple of 4) into the stage's 16 bytes at `dst`, readable by every
+    /// warp of the block after the next `cp_async_wait_group` that completes
+    /// this thread's last committed group and the barrier after it.
+    ///
+    /// # Safety
+    ///
+    /// The four values lie inside the weight's rows; `dst` is 16 bytes of
+    /// shared memory, 16-byte aligned, that this thread alone writes and no
+    /// warp reads before that barrier.
+    unsafe fn stage(self, dst: *mut f32, at: usize);
+}
+
+/// An F32 weight's values, copied as they are.
+#[derive(Clone, Copy)]
+pub(super) struct F32Rows<'a>(pub &'a [f32]);
+
+impl TileRows for F32Rows<'_> {
+    #[inline(always)]
+    unsafe fn stage(self, dst: *mut f32, at: usize) {
+        // SAFETY: the 16 source bytes are values at .. at + 4 of the weight,
+        // 16-byte aligned (at a multiple of 4, the base 16-byte aligned: the
+        // body's contract), and dst is this thread's own 16 bytes, by this
+        // fn's contract; the copy completes at the wait that the contract
+        // names.
+        unsafe { cp_async_cg_16(dst.cast::<u32>(), self.0.as_ptr().add(at).cast::<u32>()) };
+    }
+}
+
+/// An MXFP8 weight's two planes, decoded as they are staged.
+#[derive(Clone, Copy)]
+pub(super) struct Mxfp8Rows<'a> {
+    pub qs: &'a [u32],
+    pub e: &'a [u32],
+}
+
+impl TileRows for Mxfp8Rows<'_> {
+    #[inline(always)]
+    unsafe fn stage(self, dst: *mut f32, at: usize) {
+        // SAFETY: values at .. at + 4 are the bytes of word at / 4, and their
+        // block at / 32 has its scale in the `e` plane: both inside the
+        // planes because the values lie inside the weight's rows (this fn's
+        // contract).
+        let (q, e) = unsafe {
+            (
+                *self.qs.get_unchecked(at >> 2),
+                Mxfp8Bytes::scale_at(self.e, at >> 5),
+            )
+        };
+        let d = Mxfp8Bytes::scale(e, at >> 5);
+        // SAFETY: dst is this thread's own 16 bytes of the stage (this fn's
+        // contract); the stores are plain, published by the barrier.
+        unsafe {
+            *dst = Mxfp8Bytes::value(q) * d;
+            *dst.add(1) = Mxfp8Bytes::value(q >> 8) * d;
+            *dst.add(2) = Mxfp8Bytes::value(q >> 16) * d;
+            *dst.add(3) = Mxfp8Bytes::value(q >> 24) * d;
+        }
+    }
+}
 
 /// Lane 0's stores of the first `live` of one column's [`TILE`] row sums,
 /// `y[base + i] = sums[i]`, each store guarded by a constant index.
@@ -102,11 +174,12 @@ unsafe fn store_live(y: &mut DisjointSlice<f32>, base: usize, sums: &[f32; TILE]
 /// Every thread of the block calls it, converged; the block is
 /// [`F32T_THREADS`] wide and the grid `⌈n / 32⌉ · B` blocks; `sh` is the
 /// block's own `STAGES · STAGE_FLOATS` shared values, 16-byte aligned;
-/// `rows >= 1`, `n >= 1`, `k` a positive multiple of [`LINE`], `w.len() >=
-/// rows·k`, `x.len() >= n·k`, both 16-byte aligned, `y.len() >= rows·n`.
+/// `rows >= 1`, `n >= 1`, `k` a positive multiple of [`LINE`], `w` holding
+/// `rows` rows of `k` values ([`TileRows::stage`]'s bound; an F32 weight
+/// 16-byte aligned), `x.len() >= n·k`, 16-byte aligned, `y.len() >= rows·n`.
 #[inline(always)]
-pub(super) unsafe fn f32_tile_body(
-    w: &[f32],
+pub(super) unsafe fn f32_tile_body<W: TileRows>(
+    w: W,
     x: &[f32],
     rows: u32,
     k: u32,
@@ -141,18 +214,16 @@ pub(super) unsafe fn f32_tile_body(
     macro_rules! stage_copy {
         ($s:expr, $buf:expr) => {{
             let (s, buf): (usize, usize) = ($s, $buf);
-            // SAFETY: s < stages, so s·LINE + piece + 4 <= k: the 16 source
-            // bytes lie in a row below `rows` of w and a column below `n` of
-            // x, 16-byte aligned (k a multiple of 64, both bases 16-byte
-            // aligned: this fn's contract). The destination is this thread's
-            // own 16 bytes of stage buf < STAGES, 16-byte aligned, read by no
-            // warp until the barrier after the wait that completes this copy.
+            // SAFETY: s < stages, so s·LINE + piece + 4 <= k: the four values
+            // lie in a row below `rows` of w and the 16 source bytes in a
+            // column below `n` of x, 16-byte aligned (k a multiple of 64, x's
+            // base 16-byte aligned: this fn's contract). Each destination is
+            // this thread's own 16 bytes of stage buf < STAGES, 16-byte
+            // aligned, read by no warp until the barrier after the wait that
+            // completes this stage.
             unsafe {
                 let dst = sh.add(buf * STAGE_FLOATS);
-                cp_async_cg_16(
-                    dst.add(w_dst).cast::<u32>(),
-                    w.as_ptr().add(w_off + s * LINE).cast::<u32>(),
-                );
+                w.stage(dst.add(w_dst), w_off + s * LINE);
                 cp_async_cg_16(
                     dst.add(x_dst).cast::<u32>(),
                     x.as_ptr().add(x_off + s * LINE).cast::<u32>(),
@@ -251,47 +322,126 @@ impl Gemm32Kernels {
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_f32_tile";
         let (rows, k) = (w.rows(), w.cols());
-        if k == 0 || !k.is_multiple_of(LINE) {
+        if w.buf().len() < rows * k {
             return Err(GpuError::shape(
                 what,
-                format!("k must be a positive multiple of {LINE} (the staged line), got {k}"),
+                format!("w.len() {} >= rows*k = {rows}*{k}", w.buf().len()),
             ));
         }
-        if rows == 0 || n == 0 {
+        let w_at = w.buf().cu_deviceptr();
+        if !w_at.is_multiple_of(16) {
             return Err(GpuError::shape(
                 what,
-                format!("rows and n must be positive, got {rows} and {n}"),
+                format!("w at {w_at:#x} must be 16-byte aligned"),
             ));
         }
-        if w.buf().len() < rows * k || x.len() < n * k || y.len() < rows * n {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "w.len() {} >= rows*k = {rows}*{k}, x.len() {} >= n*k = {n}*{k}, y.len() {} \
-                     >= rows*n = {rows}*{n}",
-                    w.buf().len(),
-                    x.len(),
-                    y.len()
-                ),
-            ));
-        }
-        let (w_at, x_at) = (w.buf().cu_deviceptr(), x.cu_deviceptr());
-        if !w_at.is_multiple_of(16) || !x_at.is_multiple_of(16) {
-            return Err(GpuError::shape(
-                what,
-                format!("w at {w_at:#x}, x at {x_at:#x}: both must be 16-byte aligned"),
-            ));
-        }
-        let grid = n.div_ceil(TILE_COLS) * rows.div_ceil(TILE_ROWS);
-        let grid = launch_u32(what, "grid", grid)?;
-        let rows = launch_u32(what, "rows", rows)?;
-        let k = launch_u32(what, "k", k)?;
-        let n = launch_u32(what, "n", n)?;
+        let t = tile_launch(what, rows, k, x, n, y)?;
         let prep =
             self.module
-                .prepare_f32_tile_gemm(LaunchConfig1D::new(grid, F32T_THREADS_U32, 0))?;
+                .prepare_f32_tile_gemm(LaunchConfig1D::new(t.grid, F32T_THREADS_U32, 0))?;
         self.module
-            .f32_tile_gemm(stream, &prep, w.buf(), x, rows, k, n, y)?;
+            .f32_tile_gemm(stream, &prep, w.buf(), x, t.rows, t.k, t.n, y)?;
         Ok(())
     }
+
+    /// Enqueue [`Self::enqueue_f32_tile`]'s product for an MXFP8 weight in
+    /// its two planes (`rows × k` values, `k = 4 · w.qs.cols()`), its values
+    /// decoded as they are staged (module doc): every output bit for bit
+    /// `Q8F32Kernels::enqueue_f32_gemv`'s over the host's dequantized rows.
+    /// `k` must be a positive multiple of 128 with `e` `k / 128` words a row
+    /// over the same rows, and `x` 16-byte aligned; another is a named
+    /// `Shape` error. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_mxfp8_tile(
+        &self,
+        stream: &CudaStream,
+        w: Mxfp8Weight<'_>,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_mxfp8_tile";
+        let (rows, k) = w.dimensions(what)?;
+        let t = tile_launch(what, rows, k, x, n, y)?;
+        let prep = self.module.prepare_mxfp8_tile_gemm(LaunchConfig1D::new(
+            t.grid,
+            F32T_THREADS_U32,
+            0,
+        ))?;
+        self.module.mxfp8_tile_gemm(
+            stream,
+            &prep,
+            w.qs.buf(),
+            w.e.buf(),
+            x,
+            t.rows,
+            t.k,
+            t.n,
+            y,
+        )?;
+        Ok(())
+    }
+}
+
+/// A tile launch's grid and its `u32` arguments.
+struct TileLaunch {
+    grid: u32,
+    rows: u32,
+    k: u32,
+    n: u32,
+}
+
+/// The checks both tile launchers share, beyond the weight's own: `k` a
+/// positive multiple of [`LINE`], `rows` and `n` positive, `x` holding `n`
+/// columns of `k` values 16-byte aligned and `y` `rows · n` outputs; each
+/// failure a named `Shape` error as `what`'s.
+fn tile_launch(
+    what: &'static str,
+    rows: usize,
+    k: usize,
+    x: &DeviceBuffer<f32>,
+    n: usize,
+    y: &DeviceBuffer<f32>,
+) -> Result<TileLaunch, GpuError> {
+    if k == 0 || !k.is_multiple_of(LINE) {
+        return Err(GpuError::shape(
+            what,
+            format!("k must be a positive multiple of {LINE} (the staged line), got {k}"),
+        ));
+    }
+    if rows == 0 || n == 0 {
+        return Err(GpuError::shape(
+            what,
+            format!("rows and n must be positive, got {rows} and {n}"),
+        ));
+    }
+    let (Some(x_len), Some(y_len)) = (n.checked_mul(k), rows.checked_mul(n)) else {
+        return Err(GpuError::shape(
+            what,
+            format!("n*k = {n}*{k} or rows*n = {rows}*{n} overflows"),
+        ));
+    };
+    if x.len() < x_len || y.len() < y_len {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "x.len() {} >= n*k = {n}*{k}, y.len() {} >= rows*n = {rows}*{n}",
+                x.len(),
+                y.len()
+            ),
+        ));
+    }
+    let x_at = x.cu_deviceptr();
+    if !x_at.is_multiple_of(16) {
+        return Err(GpuError::shape(
+            what,
+            format!("x at {x_at:#x} must be 16-byte aligned"),
+        ));
+    }
+    let grid = n.div_ceil(TILE_COLS) * rows.div_ceil(TILE_ROWS);
+    Ok(TileLaunch {
+        grid: launch_u32(what, "grid", grid)?,
+        rows: launch_u32(what, "rows", rows)?,
+        k: launch_u32(what, "k", k)?,
+        n: launch_u32(what, "n", n)?,
+    })
 }

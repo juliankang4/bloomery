@@ -42,8 +42,8 @@ fn kq_row_bytes(ty: GgmlType, k: usize) -> Option<usize> {
 /// `qh`, the f16 scale), plus two bytes per odd-block row because the scale
 /// reader loads whole words; a Q5_1 row is eight code words plus the block's scale
 /// and min per 32 values — the `q_stride` window padding past the last block
-/// is allocated but never addressed. The q8_0 and nvfp4 planes are addressed
-/// whole, so theirs are the card format's own bytes.
+/// is allocated but never addressed. The q8_0, nvfp4 and mxfp8 planes are
+/// addressed whole, so theirs are the card format's own bytes.
 #[must_use]
 pub fn weight_bytes(w: &DevWeight, rows: usize) -> Option<usize> {
     let k = w.k();
@@ -56,6 +56,7 @@ pub fn weight_bytes(w: &DevWeight, rows: usize) -> Option<usize> {
         }
         DevWeight::F32 { .. } => rows * k * 4,
         DevWeight::Nvfp4 { .. } => resident_size(GgmlType::NVFP4, k, rows)?,
+        DevWeight::Mxfp8 { .. } => resident_size(GgmlType::MXFP8, k, rows)?,
     })
 }
 

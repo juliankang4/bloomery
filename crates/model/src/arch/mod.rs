@@ -811,7 +811,7 @@ pub(crate) mod synthetic {
                     );
                     (16, n / 256 * 66)
                 }
-                Ty::F8Rows => (gguf::F8E4M3_ROWS.id, n),
+                Ty::F8Rows => (gguf::GgmlType::F8E4M3_ROWS.as_u32(), n),
             }
         }
     }

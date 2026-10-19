@@ -221,6 +221,11 @@ pub enum SiteEntry {
     /// over the NVFP4 planes and the q8_1 rows, times the tensor's scale,
     /// through `site::kgemv`. No wide GEMM.
     Nvfp4,
+    /// `Q8F32Kernels::enqueue_mxfp8_gemv` (`mxfp8_gemv`, `mxfp8_gemv_mcol`,
+    /// `crates/gpu/src/q8f32.rs`) over bloomery's MXFP8 planes
+    /// (`GgmlType::MXFP8`) and the f32 rows; wide, `Gemm32Kernels::enqueue_mxfp8_tile`
+    /// over the f32 rows.
+    Mxfp8,
 }
 
 /// The activation a dense site's launch reads; `crates/gpu/src/site.rs`
@@ -252,6 +257,7 @@ impl SiteEntry {
             SiteEntry::F32 => SiteAct::F32,
             SiteEntry::Q5_0 => SiteAct::Q8Blocks32,
             SiteEntry::Nvfp4 => SiteAct::Q8x128,
+            SiteEntry::Mxfp8 => SiteAct::F32,
         }
     }
 }
@@ -329,6 +335,8 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GgmlType::Q8_1
         | GgmlType::Q8_K
         | GgmlType::NVFP4
+        | GgmlType::F8E4M3_ROWS
+        | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -373,6 +381,8 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         | GgmlType::Q8_1
         | GgmlType::Q8_K
         | GgmlType::NVFP4
+        | GgmlType::F8E4M3_ROWS
+        | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -430,6 +440,8 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
         | GgmlType::Q8_1
         | GgmlType::Q8_K
         | GgmlType::NVFP4
+        | GgmlType::F8E4M3_ROWS
+        | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -446,6 +458,7 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         GgmlType::Q5_0 => Some(SiteEntry::Q5_0),
         GgmlType::F32 => Some(SiteEntry::F32),
         GgmlType::NVFP4 => Some(SiteEntry::Nvfp4),
+        GgmlType::MXFP8 => Some(SiteEntry::Mxfp8),
         GgmlType::F16
         | GgmlType::Q4_0
         | GgmlType::Q4_1
@@ -473,6 +486,7 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         | GgmlType::Q1_0
         | GgmlType::Q8_1
         | GgmlType::Q8_K
+        | GgmlType::F8E4M3_ROWS
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -516,6 +530,8 @@ pub const fn head(ty: GgmlType) -> Option<HeadEntry> {
         | GgmlType::Q8_1
         | GgmlType::Q8_K
         | GgmlType::NVFP4
+        | GgmlType::F8E4M3_ROWS
+        | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -559,6 +575,8 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
         | GgmlType::Q8_1
         | GgmlType::Q8_K
         | GgmlType::NVFP4
+        | GgmlType::F8E4M3_ROWS
+        | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -642,7 +660,7 @@ mod tests {
 
     /// Every `GgmlType` variant in declaration order, then one id the enum
     /// does not name.
-    const ALL: [GgmlType; 36] = [
+    const ALL: [GgmlType; 38] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::Q5_0,
@@ -678,6 +696,8 @@ mod tests {
         GgmlType::Q1_0,
         GgmlType::Q8_1,
         GgmlType::Q8_K,
+        GgmlType::F8E4M3_ROWS,
+        GgmlType::MXFP8,
         GgmlType::Unknown(99),
     ];
 
@@ -720,7 +740,9 @@ mod tests {
             GgmlType::Q1_0 => 32,
             GgmlType::Q8_1 => 33,
             GgmlType::Q8_K => 34,
-            GgmlType::Unknown(_) => 35,
+            GgmlType::F8E4M3_ROWS => 35,
+            GgmlType::MXFP8 => 36,
+            GgmlType::Unknown(_) => 37,
         }
     }
 
@@ -873,6 +895,8 @@ mod tests {
 
     // PIN(2026-10-16): the dense pairs gain NVFP4 (`nvfp4_gemv` through
     // `site::kgemv`); every other pair is unchanged.
+    // PIN(2026-10-19): and bloomery's own MXFP8 (`mxfp8_gemv` through
+    // `site::gemv`); every other pair is unchanged.
     #[test]
     fn dense_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -886,6 +910,7 @@ mod tests {
                 (GgmlType::Q5_K, SiteEntry::Q5k),
                 (GgmlType::Q6_K, SiteEntry::Q6k),
                 (GgmlType::NVFP4, SiteEntry::Nvfp4),
+                (GgmlType::MXFP8, SiteEntry::Mxfp8),
             ]
         );
     }

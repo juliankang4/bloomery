@@ -496,6 +496,11 @@ pub enum CardFormat {
     /// word, `k / 64` words — the file's 36 bytes a 64-value block, moved.
     /// The tensor's f32 `.scale` is its own F32 row.
     Nvfp4Planes,
+    /// bloomery's mxfp8 (`GgmlType::MXFP8`) in two planes
+    /// (`crates/gpu/src/q8f32.rs`, `mxfp8_planes`): a row's value bytes as
+    /// `k / 4` words, then its E8M0 scale bytes four to a word, `k / 128`
+    /// words — the file's 33 bytes a 32-value block, moved.
+    Mxfp8Planes,
     /// f32: the file's values.
     F32,
     /// Decoded to f32 at load (`dequant_row`): bf16 by its type, and a
@@ -533,6 +538,7 @@ impl CardFormat {
             GgmlType::NVFP4 => Some(CardFormat::Nvfp4Planes),
             GgmlType::F32 => Some(CardFormat::F32),
             GgmlType::BF16 => Some(CardFormat::Bf16AsF32),
+            GgmlType::MXFP8 => Some(CardFormat::Mxfp8Planes),
             GgmlType::F16
             | GgmlType::Q4_0
             | GgmlType::Q4_1
@@ -557,6 +563,7 @@ impl CardFormat {
             | GgmlType::Q1_0
             | GgmlType::Q8_1
             | GgmlType::Q8_K
+            | GgmlType::F8E4M3_ROWS
             | GgmlType::Unknown(_) => None,
         }
     }
@@ -606,6 +613,13 @@ impl CardFormat {
                     rows.checked_mul(blocks.checked_mul(4)?)?,
                 ]
             }
+            CardFormat::Mxfp8Planes => {
+                // Whole scale words a row: a row's four blocks a word.
+                if !blocks.is_multiple_of(4) {
+                    return None;
+                }
+                vec![rows.checked_mul(k)?, rows.checked_mul(blocks)?]
+            }
             CardFormat::F32 | CardFormat::Bf16AsF32 => vec![rows.checked_mul(k.checked_mul(4)?)?],
             CardFormat::Bf16Raw => {
                 // Whole words per row: a row never shares a word with the next.
@@ -630,14 +644,15 @@ impl CardFormat {
 
     /// The format an expert stack of type `ty` loads in on a card under the
     /// default expert rule ([`plan_with`]): [`CardFormat::of`] less q5_K,
-    /// which this rule does not admit, and less nvfp4, which no card expert
-    /// kernel reads (its planes are a dense site's). A card expert kernel does read q5_K
+    /// which this rule does not admit, and less nvfp4 and mxfp8, which no card
+    /// expert kernel reads (their planes are a dense site's). A card expert kernel does read q5_K
     /// (`kq_gate_up_act_q5k`, `q5k_gemv_sel`), and the program that runs
     /// them names q5_K in its own [`RoutedFormat`] (glm5next's
     /// `card_routed`). A stack of a type with none stays on the host.
     #[must_use]
     pub fn of_routed(ty: GgmlType) -> Option<CardFormat> {
-        CardFormat::of(ty).filter(|_| !matches!(ty, GgmlType::Q5_K | GgmlType::NVFP4))
+        CardFormat::of(ty)
+            .filter(|_| !matches!(ty, GgmlType::Q5_K | GgmlType::NVFP4 | GgmlType::MXFP8))
     }
 
     /// A file tensor of type `ty` can be laid out in this format: the
@@ -675,6 +690,7 @@ impl CardFormat {
             CardFormat::Q5_1 => "q5_1",
             CardFormat::Q8_0Planes => "q8_0_planes",
             CardFormat::Nvfp4Planes => "nvfp4_planes",
+            CardFormat::Mxfp8Planes => "mxfp8_planes",
             CardFormat::F32 => "f32",
             CardFormat::Bf16AsF32 => "bf16_as_f32",
             CardFormat::Bf16Raw => "bf16_raw",
@@ -760,7 +776,7 @@ pub enum Format {
 
 impl Format {
     /// Every format, at its rank ([`Format::rank`]).
-    const ALL: [Format; 11] = [
+    const ALL: [Format; 12] = [
         Format::Card(CardFormat::KQuant),
         Format::Card(CardFormat::Q5_0),
         Format::Card(CardFormat::Q5_1),
@@ -769,6 +785,7 @@ impl Format {
         Format::Card(CardFormat::Bf16AsF32),
         Format::Card(CardFormat::Bf16Raw),
         Format::Card(CardFormat::Nvfp4Planes),
+        Format::Card(CardFormat::Mxfp8Planes),
         Format::HostFile,
         Format::NvmeFile,
         Format::Unused,
@@ -787,9 +804,10 @@ impl Format {
             Format::Card(CardFormat::Bf16AsF32) => 5,
             Format::Card(CardFormat::Bf16Raw) => 6,
             Format::Card(CardFormat::Nvfp4Planes) => 7,
-            Format::HostFile => 8,
-            Format::NvmeFile => 9,
-            Format::Unused => 10,
+            Format::Card(CardFormat::Mxfp8Planes) => 8,
+            Format::HostFile => 9,
+            Format::NvmeFile => 10,
+            Format::Unused => 11,
         }
     }
 
@@ -4246,6 +4264,7 @@ mod tests {
             ("f32", Format::Card(CardFormat::F32)),
             ("bf16_as_f32", Format::Card(CardFormat::Bf16AsF32)),
             ("bf16_raw", Format::Card(CardFormat::Bf16Raw)),
+            ("mxfp8_planes", Format::Card(CardFormat::Mxfp8Planes)),
             ("host_file", Format::HostFile),
             ("nvme_file", Format::NvmeFile),
             ("unused", Format::Unused),

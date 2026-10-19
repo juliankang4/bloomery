@@ -599,7 +599,7 @@ impl PleHost {
         let per_token = (geo::HIDDEN).checked_div(width).unwrap_or(0);
         let decode = if info.ty == GgmlType::IQ4_NL {
             PleRows::Iq4Nl
-        } else if info.ty == GgmlType::Unknown(gguf::F8E4M3_ROWS.id) {
+        } else if info.ty == GgmlType::F8E4M3_ROWS {
             let scale = tensor_scale(WHAT, &info, |n| {
                 let (s, t) = file.find(n)?;
                 Some((file.shard(s)?, t))
@@ -609,7 +609,9 @@ impl PleHost {
         } else {
             return Err(refuse("IQ4_NL or F8 rows"));
         };
-        let (blck, size) = Split::block(info.ty).ok_or_else(|| refuse("a sized type"))?;
+        let (Some(blck), Some(size)) = (info.ty.blck_size(), info.ty.type_size()) else {
+            return Err(refuse("a sized type"));
+        };
         let (blck, size) = (blck as usize, size as usize);
         if width == 0 || !width.is_multiple_of(blck) || per_token * width != geo::HIDDEN {
             return Err(refuse("rows of a whole part of the model width"));
@@ -5348,7 +5350,7 @@ mod tests {
             .collect();
         let tokens = [7u32, 3, 9, 2];
         for (ty, table, row_bytes) in [
-            (gguf::F8E4M3_ROWS.id, &f8, 160),
+            (GgmlType::F8E4M3_ROWS.as_u32(), &f8, 160),
             (GgmlType::IQ4_NL.as_u32(), &iq4, 90),
         ] {
             let mut host = ple_host(ty, table, Some(0.375), tokens.len()).unwrap();
@@ -5371,7 +5373,7 @@ mod tests {
                 );
             }
         }
-        let e = ple_host(gguf::F8E4M3_ROWS.id, &f8, None, 1)
+        let e = ple_host(GgmlType::F8E4M3_ROWS.as_u32(), &f8, None, 1)
             .err()
             .expect("an F8 table without its scale");
         assert!(

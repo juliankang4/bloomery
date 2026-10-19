@@ -80,8 +80,7 @@ impl SplitTable {
 
     /// The table `name` of `split`: a 2-D table, its rows the second dim, or
     /// a 3-D stack of experts, its rows the third (one `[ne0, ne1]` slab
-    /// each); whole blocks a row (a block as the split sizes it,
-    /// [`Split::block`]) and rows tiling the bytes the header states,
+    /// each); whole blocks a row and rows tiling the bytes the header states,
     /// each refused by name otherwise, and any other rank refused as
     /// [`EngramError::NotATable`]. Then `advice` over its pages in the
     /// split's mapping. Load-time only, and only for a table the plan left on
@@ -111,7 +110,7 @@ impl SplitTable {
                 });
             }
         };
-        let Some((block, block_bytes)) = Split::block(info.ty) else {
+        let (Some(block), Some(block_bytes)) = (info.ty.blck_size(), info.ty.type_size()) else {
             return Err(EngramError::UnsizedType {
                 name: name.to_owned(),
                 ty: info.ty.as_u32(),
