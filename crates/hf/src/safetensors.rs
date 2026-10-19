@@ -5,7 +5,8 @@
 //! data. The header is validated whole on open: every entry's dtype is known, its byte range
 //! matches its shape and lies in the data section, and no two ranges overlap. A tensor is read
 //! three ways: widened to f32 ([`Safetensors::tensor`], BF16, F16 and F32), as its stored bits
-//! ([`Safetensors::raw`], [`Safetensors::bf16`]), or as integers ([`Safetensors::i64s`]).
+//! ([`Safetensors::raw`], [`Safetensors::bf16`]), or as integers ([`Safetensors::i64s`]). U8 and
+//! F8_E4M3 (a ModelOpt checkpoint's packed weights and block scales) are read as stored bytes only.
 
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -47,6 +48,8 @@ pub enum Dtype {
     F32,
     I64,
     Bool,
+    U8,
+    F8E4M3,
 }
 
 impl Dtype {
@@ -57,6 +60,8 @@ impl Dtype {
             "F32" => Some(Dtype::F32),
             "I64" => Some(Dtype::I64),
             "BOOL" => Some(Dtype::Bool),
+            "U8" => Some(Dtype::U8),
+            "F8_E4M3" => Some(Dtype::F8E4M3),
             _ => None,
         }
     }
@@ -70,6 +75,8 @@ impl Dtype {
             Dtype::F32 => "F32",
             Dtype::I64 => "I64",
             Dtype::Bool => "BOOL",
+            Dtype::U8 => "U8",
+            Dtype::F8E4M3 => "F8_E4M3",
         }
     }
 
@@ -77,7 +84,7 @@ impl Dtype {
     #[must_use]
     pub fn size(self) -> usize {
         match self {
-            Dtype::Bool => 1,
+            Dtype::Bool | Dtype::U8 | Dtype::F8E4M3 => 1,
             Dtype::Bf16 | Dtype::F16 => 2,
             Dtype::F32 => 4,
             Dtype::I64 => 8,
@@ -292,7 +299,7 @@ impl Safetensors {
                 .iter()
                 .map(|b| f32::from_le_bytes(*b))
                 .collect(),
-            Dtype::I64 | Dtype::Bool => {
+            Dtype::I64 | Dtype::Bool | Dtype::U8 | Dtype::F8E4M3 => {
                 return Err(Error::Dtype {
                     name: name.to_string(),
                     dtype: raw.dtype.name().to_string(),
@@ -485,6 +492,35 @@ mod tests {
         ));
         assert!(matches!(st.tensor("ids"), Err(Error::Dtype { ref dtype, .. }) if dtype == "I64"));
         assert!(matches!(st.raw("none"), Err(Error::Missing(n)) if n == "none"));
+    }
+
+    /// Rows of a ModelOpt NVFP4 shard under their own header entries: a U8 weight and
+    /// an F8_E4M3 scale read as stored bytes; the f32 read refuses both by name.
+    #[test]
+    fn a_modelopt_shard_slice_opens_with_u8_and_f8_e4m3_held_raw() {
+        let st = Safetensors::parse(
+            include_bytes!("../tests/fixtures/modelopt-nvfp4.safetensors").to_vec(),
+        )
+        .unwrap();
+        let stem = "model.language_model.layers.0.mlp.experts.0.gate_proj";
+        let w = st.raw(&format!("{stem}.weight")).unwrap();
+        let s = st.raw(&format!("{stem}.weight_scale")).unwrap();
+        assert_eq!(
+            (w.dtype, w.shape, w.bytes.len()),
+            (Dtype::U8, [4, 1280].as_slice(), 4 * 1280)
+        );
+        assert_eq!(
+            (s.dtype, s.shape, s.bytes.len()),
+            (Dtype::F8E4M3, [4, 160].as_slice(), 4 * 160)
+        );
+        assert_eq!((Dtype::U8.name(), Dtype::F8E4M3.name()), ("U8", "F8_E4M3"));
+        for (name, want) in [("weight", "U8"), ("weight_scale", "F8_E4M3")] {
+            let r = st.tensor(&format!("{stem}.{name}"));
+            assert!(
+                matches!(r, Err(Error::Dtype { ref dtype, .. }) if dtype == want),
+                "{r:?}"
+            );
+        }
     }
 
     #[test]
