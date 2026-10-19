@@ -277,6 +277,7 @@ version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-runtime",
+ "flate2",
  "memmap2",
  "serde_json",
  "sha1",

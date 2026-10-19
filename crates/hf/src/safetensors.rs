@@ -5,8 +5,12 @@
 //! data. The header is validated whole on open: every entry's dtype is known, its byte range
 //! matches its shape and lies in the data section, and no two ranges overlap. A tensor is read
 //! three ways: widened to f32 ([`Safetensors::tensor`], BF16, F16 and F32), as its stored bits
-//! ([`Safetensors::raw`], [`Safetensors::bf16`]), or as integers ([`Safetensors::i64s`]). U8 and
-//! F8_E4M3 (a ModelOpt checkpoint's packed weights and block scales) are read as stored bytes only.
+//! ([`Safetensors::raw`], [`Safetensors::bf16`]), or as integers ([`Safetensors::i64s`]). The
+//! packed and 8-bit dtypes quantized checkpoints store (U8, I8, U16, U32, I32, F8_E4M3, F8_E5M2,
+//! F8_E8M0) are read as stored bytes only.
+//!
+//! A model folder ([`Folder`]) is `model.safetensors.index.json` and the shards it names, opened as
+//! one table of tensors, each read whole as stored.
 
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -49,7 +53,13 @@ pub enum Dtype {
     I64,
     Bool,
     U8,
+    I8,
+    U16,
+    U32,
+    I32,
     F8E4M3,
+    F8E5M2,
+    F8E8M0,
 }
 
 impl Dtype {
@@ -61,7 +71,13 @@ impl Dtype {
             "I64" => Some(Dtype::I64),
             "BOOL" => Some(Dtype::Bool),
             "U8" => Some(Dtype::U8),
+            "I8" => Some(Dtype::I8),
+            "U16" => Some(Dtype::U16),
+            "U32" => Some(Dtype::U32),
+            "I32" => Some(Dtype::I32),
             "F8_E4M3" => Some(Dtype::F8E4M3),
+            "F8_E5M2" => Some(Dtype::F8E5M2),
+            "F8_E8M0" => Some(Dtype::F8E8M0),
             _ => None,
         }
     }
@@ -76,7 +92,13 @@ impl Dtype {
             Dtype::I64 => "I64",
             Dtype::Bool => "BOOL",
             Dtype::U8 => "U8",
+            Dtype::I8 => "I8",
+            Dtype::U16 => "U16",
+            Dtype::U32 => "U32",
+            Dtype::I32 => "I32",
             Dtype::F8E4M3 => "F8_E4M3",
+            Dtype::F8E5M2 => "F8_E5M2",
+            Dtype::F8E8M0 => "F8_E8M0",
         }
     }
 
@@ -84,9 +106,11 @@ impl Dtype {
     #[must_use]
     pub fn size(self) -> usize {
         match self {
-            Dtype::Bool | Dtype::U8 | Dtype::F8E4M3 => 1,
-            Dtype::Bf16 | Dtype::F16 => 2,
-            Dtype::F32 => 4,
+            Dtype::Bool | Dtype::U8 | Dtype::I8 | Dtype::F8E4M3 | Dtype::F8E5M2 | Dtype::F8E8M0 => {
+                1
+            }
+            Dtype::Bf16 | Dtype::F16 | Dtype::U16 => 2,
+            Dtype::F32 | Dtype::U32 | Dtype::I32 => 4,
             Dtype::I64 => 8,
         }
     }
@@ -299,7 +323,16 @@ impl Safetensors {
                 .iter()
                 .map(|b| f32::from_le_bytes(*b))
                 .collect(),
-            Dtype::I64 | Dtype::Bool | Dtype::U8 | Dtype::F8E4M3 => {
+            Dtype::I64
+            | Dtype::Bool
+            | Dtype::U8
+            | Dtype::I8
+            | Dtype::U16
+            | Dtype::U32
+            | Dtype::I32
+            | Dtype::F8E4M3
+            | Dtype::F8E5M2
+            | Dtype::F8E8M0 => {
                 return Err(Error::Dtype {
                     name: name.to_string(),
                     dtype: raw.dtype.name().to_string(),
@@ -310,6 +343,103 @@ impl Safetensors {
             shape: raw.shape.to_vec(),
             data,
         })
+    }
+}
+
+/// A Hugging Face model folder: `model.safetensors.index.json`'s `weight_map` (a tensor's name to
+/// its shard's file name) and every shard it names, each mapped and its header validated as
+/// [`Safetensors::open`] does. Opening reads the index and the headers, no tensor's bytes. Every
+/// name of the index is in the shard it names, and every tensor of a shard is in the index under
+/// that shard; a shard named by anything but a relative path inside the folder (`/`-separated file
+/// and folder names with no `\` or `:`, as `tensors/native-QB.safetensors`), and either mismatch,
+/// are refused by name.
+pub struct Folder {
+    /// Each shard's file name and file, in the order the index first names them.
+    shards: Vec<(String, Safetensors)>,
+    /// A tensor's name to its shard.
+    by_name: BTreeMap<String, usize>,
+}
+
+impl Folder {
+    /// The index file's name in the folder.
+    pub const INDEX: &str = "model.safetensors.index.json";
+
+    /// The model folder `dir`.
+    pub fn open(dir: &Path) -> Result<Folder, Error> {
+        let path = dir.join(Folder::INDEX);
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| Error::Io(path.display().to_string(), e))?;
+        let index: Value = serde_json::from_str(&text)
+            .map_err(|e| bad(format!("{}: not JSON: {e}", path.display())))?;
+        let Some(Value::Object(map)) = index.get("weight_map") else {
+            return Err(bad(format!("{}: no weight_map object", path.display())));
+        };
+        if map.is_empty() {
+            return Err(bad(format!(
+                "{}: weight_map holds no tensors",
+                path.display()
+            )));
+        }
+        let mut files: Vec<String> = Vec::new();
+        let mut by_name = BTreeMap::new();
+        for (name, file) in map {
+            let file = file
+                .as_str()
+                .filter(|f| {
+                    !f.contains(['\\', ':'])
+                        && f.split('/')
+                            .all(|part| !part.is_empty() && part != "." && part != "..")
+                })
+                .ok_or_else(|| {
+                    bad(format!(
+                        "{}: {name}'s shard {file} is not a path inside the folder",
+                        Folder::INDEX
+                    ))
+                })?;
+            let at = files.iter().position(|f| f == file).unwrap_or_else(|| {
+                files.push(file.to_string());
+                files.len() - 1
+            });
+            by_name.insert(name.clone(), at);
+        }
+        let shards = files
+            .into_iter()
+            .map(|f| match Safetensors::open(&dir.join(&f)) {
+                Ok(st) => Ok((f, st)),
+                Err(Error::Format(what)) => Err(bad(format!("{f}: {what}"))),
+                Err(e) => Err(e),
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        for (name, &at) in &by_name {
+            if shards[at].1.entry(name).is_none() {
+                return Err(bad(format!(
+                    "{name}: the index puts it in {}, which does not hold it",
+                    shards[at].0
+                )));
+            }
+        }
+        for (at, (file, st)) in shards.iter().enumerate() {
+            if let Some(name) = st.names().find(|n| by_name.get(*n) != Some(&at)) {
+                return Err(bad(format!(
+                    "{name}: in {file}, which the index does not name for it"
+                )));
+            }
+        }
+        Ok(Folder { shards, by_name })
+    }
+
+    /// Every tensor name, sorted.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.by_name.keys().map(String::as_str)
+    }
+
+    /// `name` as stored, from its shard.
+    pub fn raw(&self, name: &str) -> Result<Raw<'_>, Error> {
+        let &at = self
+            .by_name
+            .get(name)
+            .ok_or_else(|| Error::Missing(name.to_string()))?;
+        self.shards[at].1.raw(name)
     }
 }
 
@@ -543,9 +673,9 @@ mod tests {
     #[test]
     fn refuses_unknown_dtypes_and_bad_ranges() {
         let four = [0u8; 4];
-        let r = Safetensors::parse(write(&[("x", "I8", &[4], &four)]));
+        let r = Safetensors::parse(write(&[("x", "C64", &[4], &four)]));
         assert!(
-            matches!(r, Err(Error::Dtype { ref name, ref dtype }) if name == "x" && dtype == "I8"),
+            matches!(r, Err(Error::Dtype { ref name, ref dtype }) if name == "x" && dtype == "C64"),
             "{:?}",
             r.err()
         );
@@ -574,6 +704,262 @@ mod tests {
         file.extend_from_slice(&[0; 4]);
         assert!(
             matches!(Safetensors::parse(file), Err(Error::Format(e)) if e.contains("share bytes"))
+        );
+    }
+
+    /// A scratch folder under the system temp directory, removed on drop.
+    struct Dir(std::path::PathBuf);
+
+    impl Dir {
+        fn new(tag: &str) -> Dir {
+            let d = std::env::temp_dir().join(format!("hf-folder-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            Dir(d)
+        }
+
+        /// `name` in the folder holding `bytes`.
+        fn file(&self, name: &str, bytes: &[u8]) {
+            std::fs::write(self.0.join(name), bytes).unwrap();
+        }
+
+        /// An index whose `weight_map` is `pairs`.
+        fn index(&self, pairs: &[(&str, &str)]) {
+            let map: serde_json::Map<String, Value> = pairs
+                .iter()
+                .map(|(n, f)| (n.to_string(), Value::from(*f)))
+                .collect();
+            let text = serde_json::json!({ "metadata": {}, "weight_map": map }).to_string();
+            self.file(Folder::INDEX, text.as_bytes());
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    /// Every dtype a quantized checkpoint stores opens and is read as its stored bytes with its
+    /// element size; the f32 read refuses each one that is not BF16, F16 or F32 by name.
+    #[test]
+    fn every_stored_dtype_is_held_raw() {
+        let bytes: Vec<u8> = (0..16u8).collect();
+        for (name, size) in [
+            ("U8", 1),
+            ("I8", 1),
+            ("U16", 2),
+            ("U32", 4),
+            ("I32", 4),
+            ("I64", 8),
+            ("BOOL", 1),
+            ("F8_E4M3", 1),
+            ("F8_E5M2", 1),
+            ("F8_E8M0", 1),
+            ("BF16", 2),
+            ("F16", 2),
+            ("F32", 4),
+        ] {
+            let st = Safetensors::parse(write(&[("t", name, &[2, 8 / size], &bytes)]))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let raw = st.raw("t").unwrap();
+            assert_eq!((raw.dtype.name(), raw.dtype.size()), (name, size));
+            assert_eq!(raw.bytes, &bytes[..16]);
+            let widened = matches!(name, "BF16" | "F16" | "F32");
+            assert_eq!(st.tensor("t").is_ok(), widened, "{name}");
+        }
+    }
+
+    /// A folder of two shards opens as one table: each name reads from its own shard, a range of
+    /// rows is that range of the stored bytes, and a range of columns is each row's piece in order.
+    #[test]
+    fn a_folder_reads_tensors_rows_and_columns_from_its_shards() {
+        let d = Dir::new("read");
+        let a: Vec<u8> = (0..24u8).collect();
+        let b: Vec<u8> = (100..112u8).collect();
+        d.file("one.safetensors", &write(&[("a", "U16", &[3, 4], &a)]));
+        d.file(
+            "two.safetensors",
+            &write(&[("b", "U8", &[12], &b), ("c", "F32", &[], &[0; 4])]),
+        );
+        d.index(&[
+            ("a", "one.safetensors"),
+            ("b", "two.safetensors"),
+            ("c", "two.safetensors"),
+        ]);
+        let f = Folder::open(&d.0).unwrap();
+        // A shard in a folder of the folder, as FP4-Local's `tensors/native-QB.safetensors`.
+        std::fs::create_dir(d.0.join("sub")).unwrap();
+        d.file("sub/one.safetensors", &write(&[("a", "U16", &[3, 4], &a)]));
+        d.index(&[
+            ("a", "sub/one.safetensors"),
+            ("b", "two.safetensors"),
+            ("c", "two.safetensors"),
+        ]);
+        assert_eq!(
+            Folder::open(&d.0).unwrap().raw("a").unwrap().bytes,
+            a.as_slice()
+        );
+        d.index(&[
+            ("a", "one.safetensors"),
+            ("b", "two.safetensors"),
+            ("c", "two.safetensors"),
+        ]);
+        assert_eq!(f.names().collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(f.raw("b").unwrap().bytes, b.as_slice());
+        assert!(matches!(f.raw("d"), Err(Error::Missing(n)) if n == "d"));
+    }
+
+    /// An index that disagrees with its shards, a shard named by a path, a shard whose ranges
+    /// overlap, a dtype outside the list and an index with no tensors are each refused by name.
+    #[test]
+    fn a_folder_refuses_what_its_index_and_shards_disagree_on() {
+        let refused = |d: &Dir, want: &str| match Folder::open(&d.0) {
+            Err(e) => assert!(e.to_string().contains(want), "want {want:?}: {e}"),
+            Ok(_) => panic!("want {want:?}: opened"),
+        };
+        let d = Dir::new("refuse");
+        d.file(
+            "s.safetensors",
+            &write(&[("a", "F32", &[1], &[0; 4]), ("b", "F32", &[1], &[0; 4])]),
+        );
+        d.index(&[
+            ("a", "s.safetensors"),
+            ("b", "s.safetensors"),
+            ("z", "s.safetensors"),
+        ]);
+        refused(
+            &d,
+            "z: the index puts it in s.safetensors, which does not hold it",
+        );
+        d.index(&[("a", "s.safetensors")]);
+        refused(
+            &d,
+            "b: in s.safetensors, which the index does not name for it",
+        );
+        for outside in [
+            "../s.safetensors",
+            "/s.safetensors",
+            "sub//s.safetensors",
+            "sub/./s.safetensors",
+            "C:/s.safetensors",
+        ] {
+            d.index(&[("a", outside)]);
+            refused(
+                &d,
+                &format!("a's shard \"{}\" is not a path inside the folder", outside),
+            );
+        }
+        let text = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut overlap = (text.len() as u64).to_le_bytes().to_vec();
+        overlap.extend_from_slice(text.as_bytes());
+        overlap.extend_from_slice(&[0; 4]);
+        d.file("s.safetensors", &overlap);
+        d.index(&[("a", "s.safetensors"), ("b", "s.safetensors")]);
+        refused(&d, "s.safetensors: a and b share bytes");
+        d.file("s.safetensors", &write(&[("a", "F4", &[2], &[0])]));
+        d.index(&[("a", "s.safetensors")]);
+        refused(&d, "a is F4, a type this reader does not hold");
+        d.index(&[]);
+        refused(&d, "weight_map holds no tensors");
+        std::fs::remove_file(d.0.join(Folder::INDEX)).unwrap();
+        refused(&d, Folder::INDEX);
+    }
+
+    /// `name`, a real checkpoint's shard header kept gzipped in the fixtures, written as that
+    /// shard in `d`: its length, the header, then its data section as a hole of the size its
+    /// entries end at, so the file has the real layout and no tensor bytes.
+    fn header_shard(d: &Dir, file: &str, gz: &[u8]) {
+        use std::io::Read;
+        let mut header = Vec::new();
+        flate2::read::GzDecoder::new(gz)
+            .read_to_end(&mut header)
+            .unwrap();
+        let entries: serde_json::Map<String, Value> = serde_json::from_slice(&header).unwrap();
+        let data = entries
+            .values()
+            .filter_map(|e| e.get("data_offsets")?.get(1)?.as_u64())
+            .max()
+            .unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&header);
+        d.file(file, &bytes);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.0.join(file))
+            .unwrap();
+        f.set_len(8 + header.len() as u64 + data).unwrap();
+    }
+
+    /// Two shards of nvidia/GLM-5.3-Flash-NVFP4 (their real headers, data absent) and the
+    /// index's entries for them open as a folder, the ModelOpt triple and the BF16 tensors held
+    /// with the index's names; a shard of deepseek-ai/DeepSeek-V4.1-Flash holds I8 and F8_E8M0.
+    #[test]
+    fn real_checkpoint_headers_open_without_their_data() {
+        use std::io::Read;
+        let d = Dir::new("real");
+        let fixture = |name: &str| {
+            std::fs::read(format!(
+                "{}/tests/fixtures/checkpoint-headers/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        for n in [1, 2] {
+            header_shard(
+                &d,
+                &format!("model-0000{n}-of-00033.safetensors"),
+                &fixture(&format!(
+                    "glm-5.3-flash-nvfp4-model-0000{n}-of-00033.header.json.gz"
+                )),
+            );
+        }
+        let mut index = Vec::new();
+        flate2::read::GzDecoder::new(
+            fixture("glm-5.3-flash-nvfp4-index-00001-00002.json.gz").as_slice(),
+        )
+        .read_to_end(&mut index)
+        .unwrap();
+        d.file(Folder::INDEX, &index);
+        let f = Folder::open(&d.0).unwrap();
+        assert_eq!(f.names().count(), 3855 + 1826);
+        let mut count = BTreeMap::new();
+        for name in f.names() {
+            *count.entry(f.raw(name).unwrap().dtype.name()).or_insert(0) += 1;
+        }
+        assert_eq!(
+            count.into_iter().collect::<Vec<_>>(),
+            [
+                ("BF16", 565),
+                ("F32", 2092),
+                ("F8_E4M3", 1513),
+                ("U8", 1511)
+            ]
+        );
+        let stem = "model.language_model.layers.3.mlp.experts.0.gate_proj";
+        let w = f.raw(&format!("{stem}.weight")).unwrap();
+        assert_eq!((w.dtype, w.shape), (Dtype::U8, [2048, 2048].as_slice()));
+
+        header_shard(
+            &d,
+            "v41.safetensors",
+            &fixture("deepseek-v4.1-flash-model-00024-of-00048.header.json.gz"),
+        );
+        let st = Safetensors::open(&d.0.join("v41.safetensors")).unwrap();
+        let mut count = BTreeMap::new();
+        for name in st.names() {
+            *count
+                .entry(st.entry(name).unwrap().dtype.name())
+                .or_insert(0) += 1;
+        }
+        assert_eq!(
+            count.into_iter().collect::<Vec<_>>(),
+            [
+                ("BF16", 5),
+                ("F32", 9),
+                ("F8_E4M3", 8),
+                ("F8_E8M0", 1160),
+                ("I8", 1152)
+            ]
         );
     }
 }
