@@ -1126,16 +1126,17 @@ fn upload_file_tensor_with<'g>(
 /// `<stem>.scale` beside `<stem>.weight`, found through `find` (the file's
 /// tensors by name: its shard and entry), one for a tensor and one an
 /// expert, in expert order, for a routed stack (three dims, mainline's
-/// `.scale` `[n_expert]`). An NVFP4 tensor and one in bloomery's F8 rows
-/// ([`gguf::GgmlType::F8E4M3_ROWS`]) carry them; `None` for any other type. A name
-/// without the `.weight` suffix, a missing scale, one of another type or
-/// count, and a value that is not finite are refused by name as `what`'s.
+/// `.scale` `[n_expert]`). A type that reads them
+/// ([`GgmlType::reads_scale`]: NVFP4 and bloomery's F8 and NVFP4 rows)
+/// carries them; `None` for any other type. A name without the `.weight`
+/// suffix, a missing scale, one of another type or count, and a value that
+/// is not finite are refused by name as `what`'s.
 pub(crate) fn tensor_scales<'g>(
     what: &'static str,
     t: &TensorInfo,
     find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
 ) -> Result<Option<Vec<f32>>, GpuError> {
-    if t.ty != GgmlType::NVFP4 && t.ty != GgmlType::F8E4M3_ROWS {
+    if !t.ty.reads_scale() {
         return Ok(None);
     }
     let refuse = |detail: String| GpuError::shape(what, format!("tensor {}: {detail}", t.name));

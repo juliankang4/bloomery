@@ -1264,12 +1264,13 @@ mod tests {
 
     /// MXFP8 is a `gemv` site on the f32 rows, narrow and wide: no K-quant
     /// GEMM type, not a `kgemv`; bloomery's private id maps to it and the F8
-    /// rows' id does not.
+    /// and NVFP4 rows' ids do not.
     #[test]
     fn an_mxfp8_site_reads_the_f32_rows_and_is_a_gemv() {
         let ty = GgmlType::MXFP8;
         assert_eq!(SiteTy::of_ggml(ty), Some(SiteTy::Mxfp8));
         assert_eq!(SiteTy::of_ggml(GgmlType::F8E4M3_ROWS), None);
+        assert_eq!(SiteTy::of_ggml(GgmlType::NVFP4_ROWS), None);
         assert!(SiteTy::ALL.contains(&SiteTy::Mxfp8));
         assert_eq!(SiteTy::Mxfp8.reads(), Form::F32);
         assert_eq!(SiteTy::Mxfp8.kgemv_order(), None);

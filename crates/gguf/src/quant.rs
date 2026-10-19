@@ -71,7 +71,7 @@ use crate::qtype::HostAct;
 /// Q8_1=9 and Q8_K=15 are ggml's activation forms (ggml.h:399, :405): named so the table of
 /// ggml's types is whole, sized, and decoded by nothing here.
 ///
-/// F8E4M3_ROWS=2000 and MXFP8=2001 are bloomery's own value types, in its range of ids no
+/// F8E4M3_ROWS=2000, MXFP8=2001 and NVFP4_ROWS=2002 are bloomery's own value types, in its range of ids no
 /// ggml table holds (2000 up; 1000 up holds its re-layouts of ggml types): their rows are
 /// `qtype::OWN_ROWS`, beside ggml's.
 ///
@@ -125,6 +125,7 @@ pub enum GgmlType {
     Q8_K,
     F8E4M3_ROWS,
     MXFP8,
+    NVFP4_ROWS,
     Unknown(u32),
 }
 
@@ -169,6 +170,7 @@ impl GgmlType {
             42 => GgmlType::Q2_0,
             2000 => GgmlType::F8E4M3_ROWS,
             2001 => GgmlType::MXFP8,
+            2002 => GgmlType::NVFP4_ROWS,
             other => GgmlType::Unknown(other),
         }
     }
@@ -212,6 +214,7 @@ impl GgmlType {
             GgmlType::Q2_0 => 42,
             GgmlType::F8E4M3_ROWS => 2000,
             GgmlType::MXFP8 => 2001,
+            GgmlType::NVFP4_ROWS => 2002,
             GgmlType::Unknown(v) => v,
         }
     }
@@ -244,6 +247,18 @@ impl GgmlType {
     #[must_use]
     pub fn has_dequant(self) -> bool {
         self.row().is_some_and(|r| r.dequant)
+    }
+
+    /// Whether a tensor of this type is read with the f32 values of `<stem>.scale` beside
+    /// `<stem>.weight`: NVFP4 (one a tensor, or one an expert of a stack) and bloomery's F8
+    /// and NVFP4 rows (one a tensor). The writer that stores the scale and the loader that
+    /// reads it both ask here.
+    #[must_use]
+    pub const fn reads_scale(self) -> bool {
+        matches!(
+            self,
+            GgmlType::NVFP4 | GgmlType::F8E4M3_ROWS | GgmlType::NVFP4_ROWS
+        )
     }
 }
 
@@ -373,6 +388,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         | GgmlType::Q8_1
         | GgmlType::Q8_K
         | GgmlType::F8E4M3_ROWS
+        | GgmlType::NVFP4_ROWS
         | GgmlType::Unknown(_) => return Err(QuantError::Unsupported(ty)),
     }
     Ok(())
@@ -950,6 +966,91 @@ impl E4m3Rows {
         }
         for (o, &b) in dst.iter_mut().zip(src) {
             *o = self.table[usize::from(b)];
+        }
+        Ok(())
+    }
+}
+
+/// Rows of bloomery's NVFP4 row type ([`GgmlType::NVFP4_ROWS`], 9 bytes a 16 values) decoded: each
+/// 16-value group a UE4M3 scale byte then 8 code bytes, value `2i` the low
+/// nibble of code byte `i` and `2i + 1` its high nibble, each value
+/// `e2m1 · scale` (exact: a 2-bit by a 4-bit significand) times the tensor's
+/// scale, that product's one rounding. A scale byte with bit 7 set or 0x7F
+/// is no scale: a span holding one or a non-finite scaled value is refused by name.
+pub struct Nvfp4Rows {
+    /// Each scale byte's half value (the doubled code table puts the half
+    /// back); a byte that is no scale is refused before its entry is read.
+    halves: [f32; 256],
+    scale: f32,
+}
+
+impl Nvfp4Rows {
+    /// The decode of a tensor whose scale is `scale`. Load-time: the scale
+    /// table is built here, once.
+    #[must_use]
+    pub fn new(scale: f32) -> Nvfp4Rows {
+        let mut halves = [f32::NAN; 256];
+        for (byte, h) in (0..=255u8).zip(&mut halves) {
+            if let Ok(half) = ue4m3(byte) {
+                *h = half;
+            }
+        }
+        Nvfp4Rows { halves, scale }
+    }
+
+    /// `src`'s groups decoded into `dst`, 16 values a group.
+    ///
+    /// # Errors
+    ///
+    /// [`QuantError::UnalignedDst`] when `dst` is not whole groups,
+    /// [`QuantError::ShortSrc`] when `src` holds fewer groups, and
+    /// [`QuantError::UndefinedScale`] for the first group whose scale byte is
+    /// no UE4M3 scale or whose scaled value is not finite (its index the block,
+    /// sub-block 0), before any value of the span is written.
+    pub fn decode(&self, src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
+        let ty = GgmlType::NVFP4_ROWS;
+        if !dst.len().is_multiple_of(16) {
+            return Err(QuantError::UnalignedDst {
+                ty,
+                dst: dst.len(),
+                blck: 16,
+            });
+        }
+        let need = dst.len() / 16 * 9;
+        let src = src.get(..need).ok_or(QuantError::ShortSrc {
+            ty,
+            src: src.len(),
+            need,
+            n: dst.len(),
+        })?;
+        let (groups, _) = src.as_chunks::<9>();
+        let undefined = groups.iter().enumerate().find_map(|(block, g)| {
+            let why = match ue4m3(g[0]) {
+                Err(why) => Some(why),
+                Ok(half) => g[1..]
+                    .iter()
+                    .flat_map(|&q| fp4_pair(q))
+                    .any(|v| !(half * f32::from(v) * self.scale).is_finite())
+                    .then_some("a value times the tensor scale leaves f32's range"),
+            };
+            why.map(|why| (block, g[0], why))
+        });
+        if let Some((block, byte, why)) = undefined {
+            return Err(QuantError::UndefinedScale {
+                ty,
+                block,
+                sub: 0,
+                byte,
+                why,
+            });
+        }
+        for (g, out) in groups.iter().zip(dst.as_chunks_mut::<16>().0) {
+            let half = self.halves[usize::from(g[0])];
+            for (pair, &q) in out.as_chunks_mut::<2>().0.iter_mut().zip(&g[1..]) {
+                let [l, h] = fp4_pair(q);
+                pair[0] = half * f32::from(l) * self.scale;
+                pair[1] = half * f32::from(h) * self.scale;
+            }
         }
         Ok(())
     }
@@ -2401,6 +2502,152 @@ mod tests {
         assert_eq!(
             activation_format(ty),
             Err(QuantError::NoActivationFormat(ty))
+        );
+    }
+
+    /// ModelOpt's NVFP4 value of a row stored as ModelOpt stores it, from the
+    /// definitions: value `i` is `e2m1` of nibble `i` of the code bytes (value
+    /// `2i` low, `2i + 1` high) times the E4M3 scale byte of its 16-value
+    /// group times `scale`, the exact product rounded once to f32.
+    fn modelopt_row(codes: &[u8], scales: &[u8], scale: f32) -> Vec<u32> {
+        (0..codes.len() * 2)
+            .map(|i| {
+                let code = (codes[i / 2] >> (4 * (i % 2))) & 15;
+                let v = e2m1(code) * ue4m3(scales[i / 16]) * f64::from(scale);
+                (v as f32).to_bits()
+            })
+            .collect()
+    }
+
+    /// A ModelOpt row (`codes`, a byte two values, and `scales`, a byte a 16
+    /// values) in bloomery's NVFP4 rows: each group's scale byte, then its 8
+    /// code bytes as stored.
+    fn nvfp4_rows(codes: &[u8], scales: &[u8]) -> Vec<u8> {
+        codes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(scales)
+            .flat_map(|(c, &s)| std::iter::once(s).chain(c.iter().copied()))
+            .collect()
+    }
+
+    /// bloomery's NVFP4 rows against the ModelOpt rule computed from the
+    /// checkpoint's own layout: every scale byte that is a scale, each with
+    /// every code at every place of its group, at scale 1 and at the PLE
+    /// table's `weight_scale_2` (0x380B6DB7); and the first four rows of PLE
+    /// parts 0 and 101 of nvidia/Qwen3.8-Flash-Next-FP4-Local b9ce18a6
+    /// (`model.language_model.layers.1.ple.ple_embedding.ngram_embedding.
+    /// shard_{0,101}.weight` U8 [2500012, 80] and `.weight_scale` F8_E4M3
+    /// [2500012, 10], range-read from tensors/model-00015-of-00021 and
+    /// -00017-of-00021; the fixture holds each part's 320 code bytes then its
+    /// 40 scale bytes). Swapped nibbles, a scale from the wrong group, a
+    /// scale not halved against the doubled code table or the tensor scale
+    /// applied before the group's fails it.
+    #[test]
+    fn nvfp4_rows_decode_to_the_modelopt_rule() {
+        let defined: Vec<u8> = (0..0x7Fu8).collect();
+        let codes: Vec<u8> = defined
+            .iter()
+            .flat_map(|&b| {
+                (0..8u8).map(move |i| ((2 * i + b) & 15) | (((2 * i + 1 + b) & 15) << 4))
+            })
+            .collect();
+        let mut rows = vec![(codes, defined)];
+        let fixture = include_bytes!("../tests/fixtures/qwen38-fp4l-ple-rows.bin");
+        for part in fixture.as_chunks::<360>().0 {
+            let (c, s) = part.split_at(320);
+            rows.extend(
+                c.as_chunks::<80>()
+                    .0
+                    .iter()
+                    .zip(s.as_chunks::<10>().0)
+                    .map(|(c, s)| (c.to_vec(), s.to_vec())),
+            );
+        }
+        assert_eq!(rows.len(), 9);
+        for scale in [1.0f32, f32::from_bits(0x380B_6DB7)] {
+            let decode = super::Nvfp4Rows::new(scale);
+            for (r, (codes, scales)) in rows.iter().enumerate() {
+                let want = modelopt_row(codes, scales, scale);
+                let mut got = vec![0.0f32; want.len()];
+                decode.decode(&nvfp4_rows(codes, scales), &mut got).unwrap();
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        *w,
+                        "scale {scale:e} row {r} value {i}: got {g:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A scale byte that is no UE4M3 scale (0x7F, or bit 7 set) is refused
+    /// naming its group and the byte, before a value is written; so is a span
+    /// that is not whole groups, or one `src` is too short for.
+    #[test]
+    fn nvfp4_rows_refuse_by_name() {
+        let ty = GgmlType::NVFP4_ROWS;
+        let decode = super::Nvfp4Rows::new(1.0);
+        for byte in [0x7Fu8, 0x80, 0xB8, 0xFF] {
+            let mut src = [0x38u8; 45];
+            src[27] = byte;
+            let mut dst = [0.0f32; 80];
+            let e = decode.decode(&src, &mut dst).expect_err("undefined");
+            assert_eq!(
+                e,
+                QuantError::UndefinedScale {
+                    ty,
+                    block: 3,
+                    sub: 0,
+                    byte,
+                    why: super::ue4m3(byte).unwrap_err(),
+                }
+            );
+            assert!(e.to_string().contains("block 3 sub-block 0"), "{e}");
+            assert_eq!(dst, [0.0; 80], "a refusal must leave dst unchanged");
+        }
+        for (code, byte, divisor) in [(0x77, 0x38, 8.0), (0x22, 0x40, 2.0)] {
+            for scale in [f32::MAX, -f32::MAX] {
+                let mut src = [0x11; 45];
+                for g in src.as_chunks_mut::<9>().0 {
+                    g[0] = 0x38;
+                }
+                src[27] = byte;
+                src[28..36].fill(code);
+                let mut dst = [0.0; 80];
+                super::Nvfp4Rows::new(scale / divisor)
+                    .decode(&src, &mut dst)
+                    .unwrap();
+                dst.fill(0.0);
+                let e = super::Nvfp4Rows::new(scale)
+                    .decode(&src, &mut dst)
+                    .unwrap_err();
+                assert!(
+                    matches!(e, QuantError::UndefinedScale { block: 3, .. }),
+                    "{e}"
+                );
+                assert!(e.to_string().contains("leaves f32's range"), "{e}");
+                assert_eq!(dst, [0.0; 80], "a refusal must leave dst unchanged");
+            }
+        }
+        assert_eq!(
+            decode.decode(&[0x38; 9], &mut [0.0; 8]),
+            Err(QuantError::UnalignedDst {
+                ty,
+                dst: 8,
+                blck: 16
+            })
+        );
+        assert_eq!(
+            decode.decode(&[0x38; 9], &mut [0.0; 32]),
+            Err(QuantError::ShortSrc {
+                ty,
+                src: 9,
+                need: 18,
+                n: 32
+            })
         );
     }
 

@@ -80,7 +80,8 @@
 //! The PLE rows are the host's: each position's n-gram hash
 //! (`engram::Hash::ple_rows_into`) names 16 rows of the table, which stays in
 //! the file; they are decoded (IQ4_NL rows by `gguf::quant::dequant_row`,
-//! bloomery's F8 rows by `gguf::quant::E4m3Rows` at the table's scale) into
+//! bloomery's F8 and NVFP4 rows by `gguf::quant::E4m3Rows` and
+//! `gguf::quant::Nvfp4Rows` at the table's scale) into
 //! the position's 2,560 values and copied to the arena ahead of the step. The
 //! hash's history is the sequence's: a step at any position other than the
 //! next is refused by name, and `reset` starts a new one.
@@ -151,7 +152,7 @@ use engram::Hash;
 use engram::hash::{History, Window};
 use engram::prefetch::{FillMode, HelperOptions, Prefetcher, caller_sibling};
 use engram::rows::SplitTable;
-use gguf::quant::{E4m3Rows, dequant_row};
+use gguf::quant::{E4m3Rows, Nvfp4Rows, dequant_row};
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
 use model::placement::{Device, Plan};
@@ -536,11 +537,12 @@ impl PleRead {
     }
 }
 
-/// How the PLE table's rows decode: IQ4_NL blocks, or bloomery's F8 rows at
-/// the table's scale.
+/// How the PLE table's rows decode: IQ4_NL blocks, or bloomery's F8 or NVFP4
+/// rows at the table's scale.
 enum PleRows {
     Iq4Nl,
     F8(Box<E4m3Rows>),
+    Nvfp4(Box<Nvfp4Rows>),
 }
 
 /// `rows`, rows of `width` values each, decoded into `e` in order.
@@ -554,6 +556,7 @@ fn ple_decode<'r>(
         match decode {
             PleRows::Iq4Nl => dequant_row(GgmlType::IQ4_NL, src, out),
             PleRows::F8(f8) => f8.decode(src, out),
+            PleRows::Nvfp4(fp4) => fp4.decode(src, out),
         }
         .map_err(model::ModelError::from)?;
     }
@@ -562,7 +565,7 @@ fn ple_decode<'r>(
 
 impl PleHost {
     /// The table `per_layer_token_embd` of `file`, IQ4_NL rows or bloomery's
-    /// F8 rows with the table's scale (`per_layer_token_embd.scale`, read by
+    /// F8 or NVFP4 rows with the table's scale (`per_layer_token_embd.scale`, read by
     /// [`tensor_scales`]) of the hash's width, and the hash from the first
     /// shard's keys, for calls of up to
     /// `cap` positions, read from `tier` — the plan's
@@ -598,18 +601,19 @@ impl PleHost {
         let width = info.dims.first().copied().unwrap_or(0) as usize;
         let rows = info.dims.get(1).copied().unwrap_or(0) as usize;
         let per_token = (geo::HIDDEN).checked_div(width).unwrap_or(0);
-        let decode = if info.ty == GgmlType::IQ4_NL {
-            PleRows::Iq4Nl
-        } else if info.ty == GgmlType::F8E4M3_ROWS {
-            let scale = tensor_scales(WHAT, &info, |n| {
+        let scale = || {
+            tensor_scales(WHAT, &info, |n| {
                 let (s, t) = file.find(n)?;
                 Some((file.shard(s)?, t))
             })?
             .and_then(|s| s.first().copied())
-            .ok_or_else(|| refuse("a scale beside its F8 rows"))?;
-            PleRows::F8(Box::new(E4m3Rows::new(scale)))
-        } else {
-            return Err(refuse("IQ4_NL or F8 rows"));
+            .ok_or_else(|| refuse("a scale beside its rows"))
+        };
+        let decode = match info.ty {
+            GgmlType::IQ4_NL => PleRows::Iq4Nl,
+            GgmlType::F8E4M3_ROWS => PleRows::F8(Box::new(E4m3Rows::new(scale()?))),
+            GgmlType::NVFP4_ROWS => PleRows::Nvfp4(Box::new(Nvfp4Rows::new(scale()?))),
+            _ => return Err(refuse("IQ4_NL, F8 or NVFP4 rows")),
         };
         let (Some(blck), Some(size)) = (info.ty.blck_size(), info.ty.type_size()) else {
             return Err(refuse("a sized type"));
@@ -5228,7 +5232,7 @@ const _: () = assert!(VERIFY_ROWS <= PASS_ROWS);
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, Device, E4m3Rows, GgmlType, GpuError, PleHost, Split, checkpoint_budget38,
+        Arc, Device, E4m3Rows, GgmlType, GpuError, Nvfp4Rows, PleHost, Split, checkpoint_budget38,
         checkpoint_bytes, checkpoint_lens, checkpoint_price38, dequant_row, ple_takes,
     };
     use engram::hash::{EosWindow, Window};
@@ -5335,9 +5339,10 @@ mod tests {
     }
 
     /// The PLE host decodes the rows the hash names by the table's type: an
-    /// IQ4_NL table as `dequant_row` does, a table in bloomery's F8 rows as
-    /// `E4m3Rows` at the scale beside it, each row at its place in the
-    /// position's values. An F8 table without its scale is refused by name.
+    /// IQ4_NL table as `dequant_row` does, tables in bloomery's F8 and NVFP4
+    /// rows as `E4m3Rows` and `Nvfp4Rows` at the scale beside them, each row
+    /// at its place in the position's values. An F8 or NVFP4 table without
+    /// its scale is refused by name.
     #[test]
     fn ple_rows_decode_by_the_tables_type() {
         let f8: Vec<u8> = (0..80 * 160u32)
@@ -5350,9 +5355,16 @@ mod tests {
                 [0x00, 0x3c].into_iter().chain(qs)
             })
             .collect();
+        let fp4: Vec<u8> = (0..80 * 10u32)
+            .flat_map(|g| {
+                let qs = (0..8u32).map(move |j| ((g * 29 + j * 11) % 256) as u8);
+                [0x30 + (g % 16) as u8].into_iter().chain(qs)
+            })
+            .collect();
         let tokens = [7u32, 3, 9, 2];
         for (ty, table, row_bytes) in [
             (GgmlType::F8E4M3_ROWS.as_u32(), &f8, 160),
+            (GgmlType::NVFP4_ROWS.as_u32(), &fp4, 90),
             (GgmlType::IQ4_NL.as_u32(), &iq4, 90),
         ] {
             let mut host = ple_host(ty, table, Some(0.375), tokens.len()).unwrap();
@@ -5363,6 +5375,8 @@ mod tests {
                 let mut want = [0.0f32; 160];
                 if ty == GgmlType::IQ4_NL.as_u32() {
                     dequant_row(GgmlType::IQ4_NL, src, &mut want).unwrap();
+                } else if ty == GgmlType::NVFP4_ROWS.as_u32() {
+                    Nvfp4Rows::new(0.375).decode(src, &mut want).unwrap();
                 } else {
                     E4m3Rows::new(0.375).decode(src, &mut want).unwrap();
                 }
@@ -5375,13 +5389,18 @@ mod tests {
                 );
             }
         }
-        let e = ple_host(GgmlType::F8E4M3_ROWS.as_u32(), &f8, None, 1)
-            .err()
-            .expect("an F8 table without its scale");
-        assert!(
-            e.to_string()
-                .contains("per_layer_token_embd.scale is not in the file"),
-            "{e}"
-        );
+        for (ty, table) in [
+            (GgmlType::F8E4M3_ROWS.as_u32(), &f8),
+            (GgmlType::NVFP4_ROWS.as_u32(), &fp4),
+        ] {
+            let e = ple_host(ty, table, None, 1)
+                .err()
+                .expect("a scaled table without its scale");
+            assert!(
+                e.to_string()
+                    .contains("per_layer_token_embd.scale is not in the file"),
+                "{e}"
+            );
+        }
     }
 }

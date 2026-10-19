@@ -128,6 +128,12 @@ pub(crate) const OWN_ROWS: &[QRow] = &[
     // mxfp8: OCP MX with F8_E4M3 elements, the block's E8M0 scale byte then its 32 F8_E4M3 bytes
     // (`quant::check_mxfp8`, `dequant_mxfp8`); no CPU matmul here.
     QRow { ty: T::MXFP8, name: "mxfp8", blck: 32, bytes: 33, dequant: true, host_act: H::None },
+    // nvfp4_rows: ModelOpt's NVFP4 groups of 16 values, the group's UE4M3 scale byte then its 8
+    // code bytes in ModelOpt's order (value 2i in the low nibble of byte i, 2i + 1 in the high),
+    // each value e2m1 x scale times its tensor's one f32 `<stem>.scale` (`quant::Nvfp4Rows`), so
+    // `dequant_row` does not decode it. A row of any multiple of 16 values is whole groups, where
+    // GGUF's NVFP4 block needs 64.
+    QRow { ty: T::NVFP4_ROWS, name: "nvfp4_rows", blck: 16, bytes: 9, dequant: false, host_act: H::None },
 ];
 
 /// The build refuses an own row whose type `from_u32` does not name, whose tag ggml's table

@@ -566,6 +566,7 @@ impl CardFormat {
             | GgmlType::Q8_1
             | GgmlType::Q8_K
             | GgmlType::F8E4M3_ROWS
+            | GgmlType::NVFP4_ROWS
             | GgmlType::Unknown(_) => None,
         }
     }
