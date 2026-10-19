@@ -198,6 +198,10 @@ pub enum GemmEntry {
     /// `Gemm32Weight::Iq4NlFile` (`gemm_iq4nl`) in
     /// `crates/gpu/src/gemm/kernels32.rs`.
     Iq4nl,
+    /// `Gemm32Weight::Nvfp4Planes` (`gemm_nvfp4p`, the two planes and a
+    /// tensor scale an expert of the route's stack) in
+    /// `crates/gpu/src/gemm/kernels32.rs`.
+    Nvfp4,
 }
 
 /// A dense gemv site's launch family (`SiteTy` in `crates/gpu/src/site.rs`):
@@ -422,6 +426,7 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
         GgmlType::Q8_0 => Some(GemmEntry::Q8_0),
         GgmlType::Q5_1 => Some(GemmEntry::Q5_1),
         GgmlType::IQ4_NL => Some(GemmEntry::Iq4nl),
+        GgmlType::NVFP4 => Some(GemmEntry::Nvfp4),
         GgmlType::F32
         | GgmlType::F16
         | GgmlType::Q4_0
@@ -447,7 +452,6 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
         | GgmlType::Q1_0
         | GgmlType::Q8_1
         | GgmlType::Q8_K
-        | GgmlType::NVFP4
         | GgmlType::F8E4M3_ROWS
         | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
@@ -915,6 +919,8 @@ mod tests {
         assert!(!card_runs(GgmlType::NVFP4) && !card_sel32_runs(GgmlType::NVFP4));
     }
 
+    // PIN(2026-10-20): the GEMM pairs gain NVFP4 (`gemm_nvfp4p` over its
+    // planes); every other pair is unchanged.
     #[test]
     fn gemm_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -926,6 +932,7 @@ mod tests {
                 (GgmlType::Q4_K, GemmEntry::Q4k),
                 (GgmlType::Q5_K, GemmEntry::Q5k),
                 (GgmlType::Q6_K, GemmEntry::Q6k),
+                (GgmlType::NVFP4, GemmEntry::Nvfp4),
                 (GgmlType::IQ3_XXS, GemmEntry::Iq3xxs),
                 (GgmlType::IQ4_NL, GemmEntry::Iq4nl),
                 (GgmlType::IQ4_XS, GemmEntry::Iq4xs),

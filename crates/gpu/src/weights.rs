@@ -107,13 +107,15 @@ pub enum DevWeight {
     /// NVFP4 file tensor in the two planes of `mxfp4::repack::<Nvfp4>`
     /// (`CardFormat::Nvfp4Planes`): `qs` rows × k/8 code words, `e` rows ×
     /// k/64 scale words (a block's four UE4M3 bytes), and the tensor's scale,
-    /// the f32 of its `<stem>.scale` tensor, read from the file at load. `k`
-    /// is a multiple of 64.
+    /// the f32 of its `<stem>.scale` tensor, read from the file at load: on
+    /// the host for the gemv's argument and in `scales` (one value) for the
+    /// GEMM's store. `k` is a multiple of 64.
     Nvfp4 {
         qs: DeviceTensor<u32>,
         e: DeviceTensor<u32>,
         k: usize,
         scale: f32,
+        scales: DeviceTensor<f32>,
     },
     /// bloomery's MXFP8 file tensor (`GgmlType::MXFP8`) in the two planes of
     /// `q8f32::mxfp8_planes` (`CardFormat::Mxfp8Planes`): `qs` rows × k/4
@@ -183,10 +185,11 @@ impl DevWeight {
                 vec![held(qs), held(d)]
             }
             DevWeight::F32 { w, .. } => vec![held(w)],
-            DevWeight::Nvfp4 { qs, e, .. } | DevWeight::Mxfp8 { qs, e, .. } => {
-                vec![held(qs), held(e)]
+            DevWeight::Nvfp4 { qs, e, scales, .. }
+            | DevWeight::Nvfp4Stack { qs, e, scales, .. } => {
+                vec![held(qs), held(e), held(scales)]
             }
-            DevWeight::Nvfp4Stack { qs, e, scales, .. } => vec![held(qs), held(e), held(scales)],
+            DevWeight::Mxfp8 { qs, e, .. } => vec![held(qs), held(e)],
         }
     }
 
@@ -1330,19 +1333,16 @@ fn upload_rows(
             let Planes { qs, e } = repack::<Nvfp4>(&flat_of(src, take)?, rows, k)?;
             let qs = upload_packed(stream, ring, what, name, &qs, rows, k / 8)?;
             let e = upload_packed(stream, ring, what, name, &e, rows, k / 64)?;
+            let scales = upload_packed(stream, ring, what, name, &scale, scale.len(), 1)?;
             if stack {
-                DevWeight::Nvfp4Stack {
-                    qs,
-                    e,
-                    scales: upload_packed(stream, ring, what, name, &scale, scale.len(), 1)?,
-                    k,
-                }
+                DevWeight::Nvfp4Stack { qs, e, scales, k }
             } else {
                 DevWeight::Nvfp4 {
                     qs,
                     e,
                     k,
                     scale: scale[0],
+                    scales,
                 }
             }
         }
@@ -1372,10 +1372,12 @@ fn upload_rows(
             }
         }
     };
-    // A stack's scales sit beside its planes, one f32 an expert: the
-    // planner's third buffer of it.
+    // An nvfp4 tensor's scales sit beside its planes, one f32 an expert (a
+    // dense tensor's one): the planner's third buffer of it.
     let size = match &dw {
-        DevWeight::Nvfp4Stack { scales, .. } => size + 4 * scales.rows() as u64,
+        DevWeight::Nvfp4 { scales, .. } | DevWeight::Nvfp4Stack { scales, .. } => {
+            size + 4 * scales.rows() as u64
+        }
         _ => size,
     };
     if u64::try_from(dw.resident_bytes()).ok() != Some(size) {

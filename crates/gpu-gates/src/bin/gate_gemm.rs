@@ -183,8 +183,9 @@
 //!   bit-identical, a captured table and GEMM replayed.
 //! - `g32_nvfp4_routed`: the same planes under routed tables — a 16-expert
 //!   stack of 272 rows at K 4096 each slot its own column, an 8-expert stack
-//!   at K 8192 whose two slots a token share the token's column, uniform and
-//!   same-expert routings at 1, 9, 64 and 448 slots; an id past the stack
+//!   at K 8192 whose two slots a token share the token's column, each expert
+//!   its own tensor scale, uniform and same-expert routings at 1, 9, 64 and
+//!   448 slots, a rerun bit-identical; an id past the stack
 //!   raises `ExpertId`, its slots refused and NaN, the rest the clean run's
 //!   bits.
 //! - `q5_0p_is_the_gemv`: the resident packed Q5_0 (`pack_q5_0`, the tensor
@@ -223,7 +224,7 @@
 //!   rows not a multiple of 16, a layout or planes of another shape, an
 //!   activation of fewer columns than the slots or quantized for fewer, packed
 //!   Q5_0 rows of another K, NVFP4 planes at a K not a multiple of 64, a
-//!   short `qs` or `e`, a non-finite tensor scale, a
+//!   short `qs` or `e`, a tensor scale count other than the table's experts, a
 //!   short `y`, a clamp limit that is not finite and a short input for the
 //!   rule-taking SwiGLU, an empty map and slots past the table for the remap, and the
 //!   F32 tile's K, short `x` and an `x` off a 16-byte boundary.
@@ -3069,6 +3070,7 @@ mod gate {
         use bloomery_gpu::hybrid::HOST;
         use bloomery_gpu::kquant::{Act, act::silu_ik};
         use bloomery_gpu::mxfp4::{Nvfp4, repack, ue4m3_half};
+        use bloomery_gpu::mxfp4_sel::Nvfp4Stack;
         use bloomery_gpu::q5::{Q8Blocks32, pack_q5_0};
         use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
         use bloomery_gpu_gates::gemm32::{HostAct, Planes32, dot32, dot32_nv, host_act};
@@ -3657,14 +3659,13 @@ mod gate {
             Ok(out)
         }
 
-        /// One NVFP4 GEMM over the planes of a [`WtsNv`] stack, `y` set to
-        /// [`SENT`] first; `y`'s first `n_slots·rows` values back.
+        /// One NVFP4 GEMM over the planes and the experts' scales of a
+        /// [`WtsNv`] stack, `y` set to [`SENT`] first; `y`'s first
+        /// `n_slots·rows` values back.
         #[allow(clippy::too_many_arguments, reason = "a gate helper's operands, named")]
         fn gemm_nv(
             dev: &Dev<'_>,
-            w: &WtsNv,
-            qs: &DeviceTensor<u32>,
-            e: &DeviceTensor<u32>,
+            planes: Nvfp4Stack<'_>,
             rows: usize,
             act: &GemmAct32,
             route: &GemmRoute,
@@ -3677,11 +3678,7 @@ mod gate {
             dev.g32.enqueue_gemm32(
                 stream,
                 Gemm32Args {
-                    w: Gemm32Weight::Nvfp4Planes {
-                        qs,
-                        e,
-                        scale: w.scale,
-                    },
+                    w: Gemm32Weight::Nvfp4Planes(planes),
                     rows_per_expert: rows,
                     act,
                     route,
@@ -4555,6 +4552,12 @@ mod gate {
                 let planes = repack::<Nvfp4>(&w.bytes, rows, k)?;
                 let qs = DeviceTensor::upload(stream, &planes.qs, rows, k / 8)?;
                 let e = DeviceTensor::upload(stream, &planes.e, rows, k / 64)?;
+                let scales = DeviceTensor::upload(stream, &[w.scale], 1, 1)?;
+                let nv = Nvfp4Stack {
+                    qs: &qs,
+                    e: &e,
+                    scales: &scales,
+                };
                 let mut route = GemmRoute::new(stream, max, 1)?;
                 let mut act = GemmAct32::new(stream, max, k)?;
                 let mut y = DeviceBuffer::<f32>::zeroed(stream, max * rows)?;
@@ -4565,32 +4568,10 @@ mod gate {
                     dev.g32
                         .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
                     dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
-                    let got = gemm_nv(
-                        dev,
-                        &w,
-                        &qs,
-                        &e,
-                        rows,
-                        &act,
-                        &route,
-                        GemmInput::PerSlot,
-                        &mut y,
-                        m,
-                    )?;
+                    let got = gemm_nv(dev, nv, rows, &act, &route, GemmInput::PerSlot, &mut y, m)?;
                     let rerun = bits_equal(
                         &got,
-                        &gemm_nv(
-                            dev,
-                            &w,
-                            &qs,
-                            &e,
-                            rows,
-                            &act,
-                            &route,
-                            GemmInput::PerSlot,
-                            &mut y2,
-                            m,
-                        )?,
+                        &gemm_nv(dev, nv, rows, &act, &route, GemmInput::PerSlot, &mut y2, m)?,
                     );
                     let (ha, want) = host_act(&x, k, m);
                     let act_ok = planes_equal(&act, m, &want, stream)?;
@@ -4649,6 +4630,12 @@ mod gate {
             let planes = repack::<Nvfp4>(&w.bytes, rows, k)?;
             let qs = DeviceTensor::upload(stream, &planes.qs, rows, k / 8)?;
             let e = DeviceTensor::upload(stream, &planes.e, rows, k / 64)?;
+            let scales = DeviceTensor::upload(stream, &[w.scale], 1, 1)?;
+            let wgt = Nvfp4Stack {
+                qs: &qs,
+                e: &e,
+                scales: &scales,
+            };
             let mut act = GemmAct32::new(stream, m, k)?;
             let mut route = GemmRoute::new(stream, m, 1)?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, m * rows)?;
@@ -4656,31 +4643,15 @@ mod gate {
             dev.g32
                 .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
             dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
-            let eager = gemm_nv(
-                dev,
-                &w,
-                &qs,
-                &e,
-                rows,
-                &act,
-                &route,
-                GemmInput::PerSlot,
-                &mut y,
-                m,
-            )?;
+            let eager = gemm_nv(dev, wgt, rows, &act, &route, GemmInput::PerSlot, &mut y, m)?;
             y.copy_from_host(stream, &vec![SENT; y.len()])?;
-            let wgt = Gemm32Weight::Nvfp4Planes {
-                qs: &qs,
-                e: &e,
-                scale: w.scale,
-            };
             let (gk, g32, route_r, act_r, y_r) = (dev.gk, &dev.g32, &mut route, &act, &mut y);
             let graph = gpu.capture(|s| {
                 gk.enqueue_route_dense(s, m, route_r, sink)?;
                 g32.enqueue_gemm32(
                     s,
                     Gemm32Args {
-                        w: wgt,
+                        w: Gemm32Weight::Nvfp4Planes(wgt),
                         rows_per_expert: rows,
                         act: act_r,
                         route: route_r,
@@ -4705,8 +4676,10 @@ mod gate {
 
         /// The NVFP4 planes under routed tables: a 16-expert stack of 272
         /// rows at K 4096, each slot its own column, and an 8-expert stack at
-        /// K 8192 whose two slots a token share the token's column; uniform
-        /// and same-expert routings; then an id past the stack raises
+        /// K 8192 whose two slots a token share the token's column, each
+        /// expert its own tensor scale; uniform and
+        /// same-expert routings, each slot's rows its expert's contract bits
+        /// and a rerun bit-identical; then an id past the stack raises
         /// `ExpertId`, its slots refused and NaN, the rest the clean run's
         /// bits.
         fn nvfp4_routed_case(dev: &Dev<'_>) -> Result<bool, GateError> {
@@ -4727,11 +4700,21 @@ mod gate {
                 let planes = repack::<Nvfp4>(&w.bytes, n_rows, k)?;
                 let qs = DeviceTensor::upload(stream, &planes.qs, n_rows, k / 8)?;
                 let e = DeviceTensor::upload(stream, &planes.e, n_rows, k / 64)?;
+                let es: Vec<f32> = (0..n_exp)
+                    .map(|x| w.scale * (1.0 + x as f32 / 16.0))
+                    .collect();
+                let scales = DeviceTensor::upload(stream, &es, n_exp, 1)?;
+                let nv = Nvfp4Stack {
+                    qs: &qs,
+                    e: &e,
+                    scales: &scales,
+                };
                 let max_slots = tokens[tokens.len() - 1] * top_k;
                 let mut route = GemmRoute::new(stream, max_slots, n_exp)?;
                 let mut ids_d = DeviceBuffer::<u32>::zeroed(stream, max_slots)?;
                 let mut act = GemmAct32::new(stream, max_slots, k)?;
                 let mut y = DeviceBuffer::<f32>::zeroed(stream, max_slots * rows)?;
+                let mut y2 = DeviceBuffer::<f32>::zeroed(stream, max_slots * rows)?;
                 for &t in tokens {
                     for r in [Routing::Uniform, Routing::SameTopk] {
                         let ids = route_ids(r, t, top_k, n_exp, 0x79 ^ (t + k) as u64);
@@ -4749,8 +4732,11 @@ mod gate {
                         } else {
                             GemmInput::Shared { top_k }
                         };
-                        let got =
-                            gemm_nv(dev, &w, &qs, &e, rows, &act, &route, input, &mut y, n_slots)?;
+                        let got = gemm_nv(dev, nv, rows, &act, &route, input, &mut y, n_slots)?;
+                        let rerun = bits_equal(
+                            &got,
+                            &gemm_nv(dev, nv, rows, &act, &route, input, &mut y2, n_slots)?,
+                        );
                         let (ha, _) = host_act(&x, k, n_cols);
                         let unwritten =
                             got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
@@ -4770,7 +4756,7 @@ mod gate {
                                 dot32_nv(
                                     &w.q[row * k..(row + 1) * k],
                                     &w.ds[row * k / 16..(row + 1) * k / 16],
-                                    w.scale,
+                                    es[row / rows],
                                     &ha,
                                     col,
                                 )
@@ -4780,6 +4766,7 @@ mod gate {
                         )?;
                         let fault = gpu.take_fault()?;
                         let pass = dec
+                            && rerun
                             && unwritten == 0
                             && band_off == 0
                             && bits_off == 0
@@ -4788,7 +4775,7 @@ mod gate {
                             "gemm32 case=g32_nvfp4_routed {name} T={t} routing={r:?} slots={n_slots} \
                              decode_vs_ggml={dec} unwritten={unwritten} checked={checked} \
                              worst_err_over_band={worst:.3} band_off={band_off} \
-                             contract_bits_differ={bits_off} y_fnv={:016x} {}",
+                             contract_bits_differ={bits_off} rerun_eq={rerun} y_fnv={:016x} {}",
                             Fnv1a64::default().f32s(&got).value(),
                             verdict(pass)
                         );
@@ -4808,34 +4795,13 @@ mod gate {
                     let mut ids = route_ids(Routing::Uniform, t, 1, n_exp, 0x69);
                     ids_d.copy_from_host(stream, &pad(&ids, ids_d.len()))?;
                     dev.gk.enqueue_route(stream, &ids_d, t, &mut route, sink)?;
-                    let clean = gemm_nv(
-                        dev,
-                        &w,
-                        &qs,
-                        &e,
-                        rows,
-                        &act,
-                        &route,
-                        GemmInput::PerSlot,
-                        &mut y,
-                        t,
-                    )?;
+                    let clean =
+                        gemm_nv(dev, nv, rows, &act, &route, GemmInput::PerSlot, &mut y, t)?;
                     ids[5] = n_exp as u32;
                     ids[9] = u32::MAX;
                     ids_d.copy_from_host(stream, &pad(&ids, ids_d.len()))?;
                     dev.gk.enqueue_route(stream, &ids_d, t, &mut route, sink)?;
-                    let got = gemm_nv(
-                        dev,
-                        &w,
-                        &qs,
-                        &e,
-                        rows,
-                        &act,
-                        &route,
-                        GemmInput::PerSlot,
-                        &mut y,
-                        t,
-                    )?;
+                    let got = gemm_nv(dev, nv, rows, &act, &route, GemmInput::PerSlot, &mut y, t)?;
                     let err = gpu
                         .take_fault()?
                         .map(|fault| GpuError::fault("gate_gemm", fault));
@@ -5722,11 +5688,14 @@ mod gate {
             let q50_96 = DeviceTensor::upload(stream, &p50, rows, p50.len() / rows)?;
             // NVFP4 planes at K 384, and an act at K 96 (a multiple of 32 but
             // not of 64): K 96 against them refuses on K, K 384 with a short
-            // `qs`, a short `e` or a NaN `scale` on the planes themselves.
+            // `qs`, a short `e` or two scales for the one-expert table on the
+            // planes themselves.
             let (wnv, _) = weights_nvfp4(rows, 384, 0x36f0)?;
             let pnv = repack::<Nvfp4>(&wnv.bytes, rows, 384)?;
             let nvq = DeviceTensor::upload(stream, &pnv.qs, rows, 384 / 8)?;
             let nve = DeviceTensor::upload(stream, &pnv.e, rows, 384 / 64)?;
+            let nvs = DeviceTensor::upload(stream, &[0.5f32], 1, 1)?;
+            let nvs2 = DeviceTensor::upload(stream, &[0.5f32; 2], 2, 1)?;
             // The short planes upload their leading columns only, so the
             // refusal the clause tests is the gemm's, not `upload`'s length
             // check.
@@ -5915,62 +5884,63 @@ mod gate {
                 (
                     "nvfp4_k_not_64",
                     gemm(
-                        Gemm32Weight::Nvfp4Planes {
+                        Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
                             qs: &nvq,
                             e: &nve,
-                            scale: 0.5,
-                        },
+                            scales: &nvs,
+                        }),
                         rows,
                         &act96,
                         &route,
                         &mut y,
                     ),
-                    "NVFP4 planes need K a multiple of 64",
+                    "NVFP4 stack at K=96",
                 ),
                 (
                     "nvfp4_qs_short",
                     gemm(
-                        Gemm32Weight::Nvfp4Planes {
+                        Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
                             qs: &nvq_short,
                             e: &nve,
-                            scale: 0.5,
-                        },
+                            scales: &nvs,
+                        }),
                         rows,
                         &act384,
                         &route,
                         &mut y,
                     ),
-                    "NVFP4 planes at K = 384",
+                    "NVFP4 stack at K=384",
                 ),
                 (
                     "nvfp4_e_short",
                     gemm(
-                        Gemm32Weight::Nvfp4Planes {
+                        Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
                             qs: &nvq,
                             e: &nve_short,
-                            scale: 0.5,
-                        },
+                            scales: &nvs,
+                        }),
                         rows,
                         &act384,
                         &route,
                         &mut y,
                     ),
-                    "NVFP4 planes at K = 384",
+                    "NVFP4 stack at K=384",
                 ),
                 (
-                    "nvfp4_scale_nan",
+                    // PIN(2026-10-20): retire the GEMM NaN-scale clause; gate_nvfp4 covers tensor_scales' finite-scale refusal.
+                    "nvfp4_scales_count",
                     gemm(
-                        Gemm32Weight::Nvfp4Planes {
+                        Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
                             qs: &nvq,
                             e: &nve,
-                            scale: f32::NAN,
-                        },
+                            scales: &nvs2,
+                        }),
                         rows,
                         &act384,
                         &route,
                         &mut y,
                     ),
-                    "the tensor scale must be finite",
+                    "and 2 scales",
                 ),
             ];
             let all = cases

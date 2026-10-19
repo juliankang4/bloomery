@@ -349,7 +349,10 @@ gguf 9 2 0
 # (mxfp4_sel.rs) adds 12: nvfp4_gate_up_sel's id read, NaN row write, gate and up lane_partials calls, gate and
 # up scale reads and row write, nvfp4_gemv_sel32's id read, lane_partials call, scale read and row write, and the
 # module load, one memory operation a block, each with its SAFETY line.
-gpu 1979 221 10
+# PIN(2026-10-20): gpu 1979 -> 1981 blocks: w32!(@stage_scale) copies the NVFP4 tile's expert scale into a
+# shared word and w32!(@expert_scale) reads it back for the stores. The route bounds the expert id; the launch
+# checks one scale per expert, and each access has its SAFETY line.
+gpu 1981 221 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

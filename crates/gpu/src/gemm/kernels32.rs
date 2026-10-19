@@ -646,10 +646,11 @@ mod gemm32_kernels {
     /// `qs` is `n_experts · rows` rows of `4 · blocks` words (one 16-byte
     /// vector a 32-value unit), `e` their `blocks / 2` scale words — one a
     /// 64-value block, its four UE4M3 bytes, every one the repack checked —
-    /// and `scale` the tensor's F32 scale. Each staged row's eight code
-    /// words are the unit's nibbles decoded through the E2M1 table in value
-    /// order and words 16 and 18 its two sub-block scales as f32; the store
-    /// multiplies by `scale`. No min term (`s` is not read), and K is a
+    /// and `scales` the experts' F32 tensor scales, one an expert. Each
+    /// staged row's eight code words are the unit's nibbles decoded through
+    /// the E2M1 table in value order and words 16 and 18 its two sub-block
+    /// scales as f32; the store multiplies by the tile's expert's scale. No
+    /// min term (`s` is not read), and K is a
     /// multiple of 64 (the host refuses it otherwise, so a unit's stream
     /// index carries its half of the block).
     #[allow(
@@ -664,6 +665,7 @@ mod gemm32_kernels {
         requires = (
             qs.len() >= n_experts * rows * 4 * blocks,
             2 * e.len() >= n_experts * rows * blocks,
+            scales.len() >= n_experts,
             2 * steps >= blocks,
             q.len() >= act_cols * 16 * steps,
             d.len() >= act_cols * 2 * steps,
@@ -676,7 +678,7 @@ mod gemm32_kernels {
     pub fn gemm_nvfp4p(
         qs: &[u32],
         e: &[u32],
-        scale: f32,
+        scales: &[f32],
         q: &[u32],
         d: &[f32],
         s: &[i32],
@@ -695,7 +697,7 @@ mod gemm32_kernels {
         mut y: DisjointSlice<f32>,
     ) {
         gemm32_block!(
-            wt: nvfp4p(qs, e, scale),
+            wt: nvfp4p(qs, e, scales),
             mins: false,
             epi: nvfp4p,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,

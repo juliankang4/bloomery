@@ -1420,7 +1420,7 @@ impl Nvfp4Stack<'_> {
     /// The stack's experts, its planes holding `k` values a row in whole
     /// experts of `rows_per_expert` rows with one scale each, or the shape
     /// error naming `what`.
-    fn experts(
+    pub(crate) fn experts(
         &self,
         what: &'static str,
         k: usize,

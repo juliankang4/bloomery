@@ -1701,9 +1701,10 @@ fn card_bytes(t: &ModelTensor, format: CardFormat, rows: u64) -> Result<u64, Pla
 }
 
 /// The device buffers of `rows` rows of `t` in `format`, in upload order —
-/// [`CardFormat::buffer_bytes`], and for an nvfp4 stack (three dims) one f32
-/// scale an expert the rows hold, the scales its upload gathers from its
-/// `.scale` — or the refusal [`card_bytes`] gives.
+/// [`CardFormat::buffer_bytes`], and for an nvfp4 tensor one f32 scale an
+/// expert the rows hold (a stack, three dims) or its one (any other), the
+/// scales its upload gathers from its `.scale` — or the refusal
+/// [`card_bytes`] gives.
 fn card_buffers(
     t: &ModelTensor,
     format: CardFormat,
@@ -1713,11 +1714,15 @@ fn card_buffers(
     let mut bufs = format
         .buffer_bytes(t.ty, k, rows)
         .ok_or_else(|| refused(t, format, k, rows))?;
-    if let (CardFormat::Nvfp4Planes, &[_, per, _]) = (format, t.dims.as_slice()) {
-        if per == 0 || !rows.is_multiple_of(per) {
-            return Err(refused(t, format, k, rows));
+    match (format, t.dims.as_slice()) {
+        (CardFormat::Nvfp4Planes, &[_, per, _]) => {
+            if per == 0 || !rows.is_multiple_of(per) {
+                return Err(refused(t, format, k, rows));
+            }
+            bufs.push(rows / per * 4);
         }
-        bufs.push(rows / per * 4);
+        (CardFormat::Nvfp4Planes, _) => bufs.push(4),
+        _ => {}
     }
     Ok(bufs)
 }
@@ -5395,7 +5400,7 @@ mod tests {
 
     /// An nvfp4 stack loads in its planes under the default expert rule, and
     /// its card segment counts one f32 scale an expert it holds after the
-    /// planes, where a dense nvfp4 tensor's segment is the planes alone. A
+    /// planes, where a dense nvfp4 tensor's segment holds its one scale. A
     /// split that leaves an expert of it on the host is refused by name: the
     /// host has no nvfp4 kernel.
     #[test]
@@ -5430,9 +5435,10 @@ mod tests {
             role: Role::Attention,
             ..t.clone()
         };
+        // PIN(2026-10-20): a dense nvfp4 tensor now holds its one scale for the GEMM's store; it was the planes alone.
         assert_eq!(
             card_buffers(&dense, CardFormat::Nvfp4Planes, 4).expect("buffers"),
-            [4 * 128, 4 * 16]
+            [4 * 128, 4 * 16, 4]
         );
         let err = routed_row(i, t, 0, list(&[0, 1]), &model)
             .expect_err("experts on the host")

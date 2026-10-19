@@ -21,9 +21,10 @@
 //!   and no second copy;
 //! - `gemm_nvfp4p`: NVFP4 in the resident planes (`mxfp4.rs`'s `repack`:
 //!   `qs` u32 words, four a 32-value unit, `e` one word a 64-value block)
-//!   with the tensor's F32 `scale` — each unit's nibbles decoded to the E2M1
-//!   table's int8 values, its two sub-block scales staged as f32, the store
-//!   one `mul_rn` by `scale` — no Q8_0 twin derived beside them.
+//!   with one F32 tensor scale an expert of the stack — each unit's nibbles
+//!   decoded to the E2M1 table's int8 values, its two sub-block scales
+//!   staged as f32, the store one `mul_rn` by the tile's expert's scale — no
+//!   Q8_0 twin derived beside them.
 //!
 //! Numeric contract, every entry. Per 32-value block `b` of an output
 //! `(slot, row)`: `isum` the exact i32 dot of the weight codes (Q8_0 int8;
@@ -48,7 +49,8 @@
 //! the sub-blocks' staged scales (`ue4m3_half`, the halving of the doubled
 //! codes) and `d_a` the column's 32-block scale:
 //! `acc = fma(d_a, fma(d1, f32(i1), d0·f32(i0)), acc)` from `acc = 0`, the
-//! stored value `scale·acc`, one `mul_rn` at the store. Each `d_s·f32(i_s)`
+//! stored value `scale_e·acc`, one `mul_rn` at the store by the scale of the
+//! slot's expert `e`. Each `d_s·f32(i_s)`
 //! is exact in f32 — a 4-bit significand times a 15-bit integer — so a unit
 //! rounds twice and the store once; the same K-only order rule holds.
 //!
@@ -74,6 +76,7 @@ use super::route::gemm_max_tiles;
 use super::{GEMM_BN, GEMM32_STEP, GemmInput, GemmRoute};
 use crate::iq::iq4_word;
 use crate::mxfp4::NV_BLOCK_VALUES;
+use crate::mxfp4_sel::Nvfp4Stack;
 use crate::q5::q5_0_row_words;
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
@@ -204,9 +207,10 @@ pub(super) unsafe fn mma_m16n8k16_s32_s8_zero(a: [u32; 2], b: u32) -> [i32; 4] {
 /// register part one step ahead, `@store` it decoded into the stage after
 /// the step's compute; `@prep` binds `$pv`, once per thread, to what a
 /// layout that addresses a row rather than the block stream needs of the
-/// pair's row (packed Q5_0 only; nothing for the others), and `@scale` folds
-/// the entry's tensor-level scale into a stored value (NVFP4 only). `$live`
-/// is whether
+/// pair's row (packed Q5_0 only; nothing for the others), `@stage_scale`
+/// stages the tile's expert's tensor scale in shared memory before the K
+/// walk, `@expert_scale` reads it back for the stores and `@scale` folds it
+/// into a stored value (NVFP4 only). `$live` is whether
 /// the pair exists (its row inside the slab's live rows, its block below
 /// K/32); `$n` is its block's index in the stack's block stream (`row · K/32
 /// + block`), `$dst` its staged row's first word.
@@ -460,12 +464,32 @@ macro_rules! w32 {
             }
         }
     }};
-    (@scale nvfp4p($qs:ident, $e:ident, $scale:ident), $v:expr) => {
-        mul_rn_f32($scale, $v)
+    (@stage_scale nvfp4p($qs:ident, $e:ident, $scales:ident), $ex:expr, $xs:expr) => {{
+        // SAFETY: the tile's expert is below the route table's experts, the
+        // stack's, and `scales` holds one an expert (launch contract); `xs`
+        // is the block's one shared scale word, written by one thread before
+        // the barrier that publishes the tile's slots.
+        unsafe { *$xs = *$scales.get_unchecked($ex) }
+    }};
+    (@stage_scale $kind:ident($($w:ident),+), $ex:expr, $xs:expr) => {{
+        let _ = ($ex, $xs);
+    }};
+    (@expert_scale nvfp4p($qs:ident, $e:ident, $scales:ident), $xs:expr) => {{
+        // SAFETY: the shared scale word `@stage_scale` wrote, published by
+        // the barriers since and not written again.
+        unsafe { *$xs }
+    }};
+    (@expert_scale $kind:ident($($w:ident),+), $xs:expr) => {{
+        let _ = $xs;
+        1.0f32
+    }};
+    (@scale nvfp4p($qs:ident, $e:ident, $scales:ident), $s:expr, $v:expr) => {
+        mul_rn_f32($s, $v)
     };
-    (@scale $kind:ident($($w:ident),+), $v:expr) => {
+    (@scale $kind:ident($($w:ident),+), $s:expr, $v:expr) => {{
+        let _ = $s;
         $v
-    };
+    }};
 }
 
 /// Stage step `h`'s activations into stage `st`: thread `tid`'s 16-byte
@@ -696,16 +720,20 @@ macro_rules! gemm32_block {
         static mut DT: SharedArray<u32, { 2 * D32_STAGE_W }, 16> = SharedArray::UNINIT;
         static mut SLOT: SharedArray<u32, GEMM_BN> = SharedArray::UNINIT;
         static mut ACOL: SharedArray<u32, GEMM_BN> = SharedArray::UNINIT;
+        // The tile's expert's tensor scale (NVFP4), staged here so no register
+        // holds the expert across the K walk.
+        static mut XSCALE: SharedArray<f32, 1> = SharedArray::UNINIT;
         // SAFETY: each `static mut` is this block's own shared allocation,
         // reached raw; the block walk bounds every index and orders every
         // cross-thread read behind a barrier.
-        let (wt, bt, dt, slot_sh, acol_sh) = unsafe {
+        let (wt, bt, dt, slot_sh, acol_sh, xs) = unsafe {
             (
                 SharedArray::as_raw_mut_ptr(&raw mut WT),
                 SharedArray::as_raw_mut_ptr(&raw mut BT),
                 SharedArray::as_raw_mut_ptr(&raw mut DT),
                 SharedArray::as_raw_mut_ptr(&raw mut SLOT),
                 SharedArray::as_raw_mut_ptr(&raw mut ACOL),
+                SharedArray::as_raw_mut_ptr(&raw mut XSCALE),
             )
         };
         // Read by the launch contract only.
@@ -774,6 +802,11 @@ macro_rules! gemm32_block {
                 *slot_sh.add(tid) = slot;
                 *acol_sh.add(tid) = slot / $slot_div;
             }
+        }
+        // The first thread past the slot stagers (GEMM_THREADS is 4 · GEMM_BN),
+        // so its scale load overlaps their column loads.
+        if tid == GEMM_BN {
+            w32!(@stage_scale $kind($($w),+), e, xs);
         }
         thread::sync_threads();
 
@@ -895,6 +928,7 @@ macro_rules! gemm32_block {
         }
 
         if active {
+            let ws = w32!(@expert_scale $kind($($w),+), xs);
             for nt in 0..GEMM_NT {
                 ::cuda_device::thread::__unroll_config::<0>();
                 if nt < nt_live {
@@ -910,7 +944,7 @@ macro_rules! gemm32_block {
                             unsafe {
                                 let slot = *slot_sh.add(n) as usize;
                                 *$y.get_unchecked_mut(slot * rows_n + r) =
-                                    w32!(@scale $kind($($w),+), acc[4 * nt + i]);
+                                    w32!(@scale $kind($($w),+), ws, acc[4 * nt + i]);
                             }
                         }
                     }
@@ -946,15 +980,12 @@ pub enum Gemm32Weight<'a> {
     /// `enqueue_gemv_q5_0` reads): per row `q5_0_row_words(K/32)` words, the
     /// file's `qs` and `qh` in planes and its f16 `d` two to a word.
     Q5_0Packed(&'a DeviceTensor<u32>),
-    /// NVFP4 in the resident planes of `mxfp4.rs`'s `repack` (the tensor the
-    /// dense gemv `Nvfp4Kernels::enqueue_gemv` reads): `qs` rows × K/8
-    /// words, `e` rows × K/64, and the tensor's F32 `scale`, applied once at
-    /// the store. K must be a multiple of 64.
-    Nvfp4Planes {
-        qs: &'a DeviceTensor<u32>,
-        e: &'a DeviceTensor<u32>,
-        scale: f32,
-    },
+    /// NVFP4 in the resident planes of `mxfp4.rs`'s `repack` (the planes
+    /// the dense gemv and the routed `_sel` pair read): `qs` rows × K/8
+    /// words, `e` rows × K/64, and one F32 tensor scale an expert of the
+    /// route's stack (a dense tensor through a one-expert table holds one),
+    /// applied once at the store. K must be a multiple of 64.
+    Nvfp4Planes(Nvfp4Stack<'a>),
 }
 
 /// [`Gemm32Kernels::enqueue_gemm32`]'s arguments: `w` the stack, `route`
@@ -1018,7 +1049,7 @@ impl Gemm32Launch {
             | Gemm32Weight::Q5_1File(qs)
             | Gemm32Weight::Iq4NlFile(qs)
             | Gemm32Weight::Q5_0Packed(qs)
-            | Gemm32Weight::Nvfp4Planes { qs, .. } => qs.rows(),
+            | Gemm32Weight::Nvfp4Planes(Nvfp4Stack { qs, .. }) => qs.rows(),
         };
         if stack_rows != n_rows {
             return Err(GpuError::shape(
@@ -1109,42 +1140,8 @@ impl Gemm32Launch {
                     ));
                 }
             }
-            Gemm32Weight::Nvfp4Planes { qs, e, scale } => {
-                if !k.is_multiple_of(NV_BLOCK_VALUES) {
-                    return Err(GpuError::shape(
-                        what,
-                        format!(
-                            "NVFP4 planes need K a multiple of 64, got {k} (the 64-value block's \
-                             two 32-value units)"
-                        ),
-                    ));
-                }
-                if e.rows() != n_rows
-                    || qs.cols() != k / 8
-                    || e.cols() != k / NV_BLOCK_VALUES
-                    || qs.buf().len() < n_rows * k / 8
-                    || e.buf().len() < n_rows * k / NV_BLOCK_VALUES
-                {
-                    return Err(GpuError::shape(
-                        what,
-                        format!(
-                            "NVFP4 planes at K = {k}: qs {n_rows} × {} words and e {n_rows} × {} \
-                             words, got qs {} × {} and e {} × {}",
-                            k / 8,
-                            k / NV_BLOCK_VALUES,
-                            qs.rows(),
-                            qs.cols(),
-                            e.rows(),
-                            e.cols()
-                        ),
-                    ));
-                }
-                if !scale.is_finite() {
-                    return Err(GpuError::shape(
-                        what,
-                        format!("the tensor scale must be finite, got {scale}"),
-                    ));
-                }
+            Gemm32Weight::Nvfp4Planes(planes) => {
+                planes.experts(what, k, rows)?;
             }
         }
         let slot_div = match a.input {
@@ -1260,8 +1257,14 @@ impl Gemm32Kernels {
                 )?;
                 launch!(prepare_gemm_q5_0p, gemm_q5_0p, w.buf(), s_words);
             }
-            Gemm32Weight::Nvfp4Planes { qs, e, scale } => {
-                launch!(prepare_gemm_nvfp4p, gemm_nvfp4p, qs.buf(), e.buf(), scale);
+            Gemm32Weight::Nvfp4Planes(Nvfp4Stack { qs, e, scales }) => {
+                launch!(
+                    prepare_gemm_nvfp4p,
+                    gemm_nvfp4p,
+                    qs.buf(),
+                    e.buf(),
+                    scales.buf()
+                );
             }
         }
         Ok(())

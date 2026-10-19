@@ -52,6 +52,7 @@ use crate::kquant::SelDown;
 use crate::mamba2::{Mamba2PassScratch, PassScan};
 use crate::model::GpuModel;
 use crate::model::fit::{FIT_RESERVE, act_col_bytes, act32_col_bytes, largest_fit, route_bytes};
+use crate::mxfp4_sel::Nvfp4Stack;
 use crate::q38::EmbedQ8Args;
 use crate::quant_sel::QuantSelKernels;
 use crate::site::{self, SiteTy};
@@ -593,14 +594,14 @@ fn project_rows(
             cx.m,
             &[SiteTy::Q8_0],
         )?;
-        let (qs, e, scale) = match cx.w.resident(WHAT, &s.name)? {
-            DevWeight::Nvfp4 { qs, e, scale, .. } => (qs, e, *scale),
+        let planes = match cx.w.resident(WHAT, &s.name)? {
+            DevWeight::Nvfp4 { qs, e, scales, .. } => Nvfp4Stack { qs, e, scales },
             _ => return Err(GpuError::tensor(WHAT, &s.name, "an NVFP4 weight")),
         };
         return cx.g32.enqueue_gemm32(
             gpu.stream(),
             Gemm32Args {
-                w: Gemm32Weight::Nvfp4Planes { qs, e, scale },
+                w: Gemm32Weight::Nvfp4Planes(planes),
                 rows_per_expert: rows,
                 act: a
                     .1
