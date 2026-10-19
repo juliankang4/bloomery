@@ -21,6 +21,9 @@ bloomery-gguf = { path = "../gguf" }
 # reference does; memmem keeps that scan at memory speed.
 memchr = "=2.8.3"
 thiserror.workspace = true
+# Hugging Face's tokenizers normalizes with this crate, whose tables are Unicode 9.0's; NFC runs
+# only for a header that declares it (an imported tokenizer.json), so its codepoints are HF's.
+unicode-normalization-alignments = "=0.1.12"
 
 [dev-dependencies]
 # The oracle sets the tests compare with open through their refset family.

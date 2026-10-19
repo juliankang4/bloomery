@@ -156,6 +156,7 @@ pub(crate) enum Encoding {
     Bpe {
         pre: Pre,
         merges: Vec<String>,
+        nfc: bool,
     },
     Spm {
         scores: Vec<f32>,
@@ -299,6 +300,11 @@ impl Vocab {
             .ok_or(Error::Missing("tokenizer.ggml.model"))?;
         let model = crate::named(&Model::NAMES, model)
             .ok_or_else(|| Error::UnsupportedModel(model.to_string()))?;
+        let nfc = match m.str("tokenizer.ggml.normalizer")? {
+            None => false,
+            Some("NFC") if !matches!(model, Model::Spm) => true,
+            Some(name) => return Err(Error::UnsupportedNormalizer(name.to_string())),
+        };
         let mut texts = m
             .strings("tokenizer.ggml.tokens")?
             .ok_or(Error::Missing("tokenizer.ggml.tokens"))?;
@@ -337,7 +343,7 @@ impl Vocab {
                 let merges = m
                     .strings("tokenizer.ggml.merges")?
                     .ok_or(Error::Missing("tokenizer.ggml.merges"))?;
-                (name.to_string(), Encoding::Bpe { pre, merges })
+                (name.to_string(), Encoding::Bpe { pre, merges, nfc })
             }
             Model::Spm => (
                 "default".to_string(),

@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use unicode_normalization_alignments::UnicodeNormalization;
+
 use crate::spelling::{Spelling, escape_whitespace};
 use crate::vocab::{Encoding, Vocab};
 use crate::{Error, bpe, pretok, spm, unicode};
@@ -10,6 +12,7 @@ pub(crate) enum Encoder {
     Bpe {
         pre: pretok::Pre,
         bpe: bpe::Bpe,
+        nfc: bool,
     },
     Spm {
         add_space_prefix: bool,
@@ -30,8 +33,9 @@ pub(crate) struct Scratch {
 impl Encoder {
     pub(crate) fn new(encoding: Encoding, vocab: &Vocab) -> Result<Self, Error> {
         match encoding {
-            Encoding::Bpe { pre, merges } => Ok(Self::Bpe {
+            Encoding::Bpe { pre, merges, nfc } => Ok(Self::Bpe {
                 pre,
+                nfc,
                 bpe: bpe::Bpe::new(
                     &vocab.texts,
                     &vocab.attrs,
@@ -83,8 +87,14 @@ impl Encoder {
             Self::Bpe {
                 pre: kind,
                 bpe: encoder,
+                nfc,
             } => {
-                unicode::decode_lenient(text, cpts);
+                if *nfc && let Ok(text) = std::str::from_utf8(text) {
+                    cpts.clear();
+                    cpts.extend(text.nfc().map(|(c, _)| u32::from(c)));
+                } else {
+                    unicode::decode_lenient(text, cpts);
+                }
                 let mut at = 0;
                 for &n in pretok::split(*kind, cpts, pre) {
                     word.clear();

@@ -41,6 +41,8 @@ pub enum Error {
     UnsupportedModel(String),
     #[error("pre-tokenizer {0:?} is not supported ({known})", known = names(&pretok::Pre::NAMES))]
     UnsupportedPre(String),
+    #[error("tokenizer.ggml.normalizer {0:?} is not supported for this tokenizer model")]
+    UnsupportedNormalizer(String),
     #[error("tokenizer.ggml.token_type has {types} entries for {tokens} tokens")]
     TokenTypesShort { types: usize, tokens: usize },
     #[error("tokenizer.ggml.scores has {scores} entries for {tokens} tokens")]
@@ -439,6 +441,89 @@ mod tests {
                 .unwrap()
         };
         texts.iter().map(|t| id(t)).collect()
+    }
+
+    #[test]
+    fn qwen35_nfc_matches_hf() {
+        // Hugging Face tokenizers 0.22.2 and 0.21.0: NFC, ByteLevel, byte ids and an unused a+b merge.
+        let cases: &[(&str, &[u32])] = &[
+            (
+                "\u{1112}\u{1161}\u{11ab}\u{1100}\u{116e}\u{11a8}",
+                &[237, 149, 156, 234, 181, 173],
+            ),
+            ("e\u{301}", &[195, 169]),
+            ("A\u{30a}\u{301}", &[199, 186]),
+            (
+                "한국 é Ǻ",
+                &[237, 149, 156, 234, 181, 173, 32, 195, 169, 32, 199, 186],
+            ),
+            // HF's tables are Unicode 9.0's: no Dives Akuru composition (13.0), and U+0EBA
+            // (12.0) is a starter, not a mark of class 9 to reorder before U+0305.
+            (
+                "\u{11935}\u{11930}",
+                &[240, 145, 164, 181, 240, 145, 164, 176],
+            ),
+            ("a\u{305}\u{eba}", &[97, 204, 133, 224, 186, 186]),
+        ];
+        let mut failures = Vec::new();
+        for pre in ["qwen35", "qwen2", "glm4", "pixtral", "deepseek-v3"] {
+            let mut header = vec![
+                ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+                ("tokenizer.ggml.pre".into(), Value::String(pre.into())),
+                (
+                    "tokenizer.ggml.tokens".into(),
+                    Value::Array(
+                        crate::unicode::byte_to_cpt_table()
+                            .into_iter()
+                            .map(|cp| Value::String(char::from_u32(cp).unwrap().to_string()))
+                            .chain([Value::String("ab".into())])
+                            .collect(),
+                    ),
+                ),
+                (
+                    "tokenizer.ggml.merges".into(),
+                    Value::Array(vec![Value::String("a b".into())]),
+                ),
+            ];
+            for normalizer in [None, Some("NFC")] {
+                if let Some(name) = normalizer {
+                    header.push((
+                        "tokenizer.ggml.normalizer".into(),
+                        Value::String(name.into()),
+                    ));
+                }
+                let tok = from_header(&header).unwrap();
+                for &(text, nfc) in cases {
+                    let raw: Vec<u32> = text.bytes().map(u32::from).collect();
+                    let want = if normalizer.is_some() { nfc } else { &raw };
+                    let actual = tok.encode(text, false, false);
+                    if actual != want {
+                        failures.push(format!(
+                            "{pre} {normalizer:?} {text:?}: {actual:?} != {want:?}"
+                        ));
+                    }
+                }
+            }
+            for value in [Value::String("NFD".into()), Value::U32(1)] {
+                header.last_mut().unwrap().1 = value.clone();
+                match from_header(&header) {
+                    Err(e)
+                        if e.to_string().contains("tokenizer.ggml.normalizer")
+                            && match &value {
+                                Value::String(name) => e.to_string().contains(name),
+                                _ => true,
+                            } => {}
+                    Err(e) => failures.push(format!("{pre} {value:?}: wrong error {e}")),
+                    Ok(_) => failures.push(format!("{pre} {value:?}: accepted unknown normalizer")),
+                }
+            }
+            header[0].1 = Value::String("llama".into());
+            header.last_mut().unwrap().1 = Value::String("NFC".into());
+            assert!(
+                matches!(from_header(&header), Err(Error::UnsupportedNormalizer(name)) if name == "NFC")
+            );
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

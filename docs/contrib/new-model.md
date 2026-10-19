@@ -85,6 +85,7 @@ count. A float array with a scalar fallback (GLM's clamps) stays the family's ow
 (SentencePiece). The shared loader is `crates/tokenizer/src/vocab.rs`. For `gpt2`, `tokenizer.ggml.pre` must be one
 of the pre-tokenizers in `pretok.rs`: `deepseek-v3`, `qwen2`, `glm4`, `qwen35`, `pixtral`, `gemma4` and two aliases.
 A `gemma4` model always runs `gemma4`; SentencePiece uses no regex pre-tokenizer and reports `default`.
+Bloomery's optional string key `tokenizer.ggml.normalizer = "NFC"` normalizes BPE fragments after raw special-token matching, with the Unicode 9.0 tables Hugging Face's tokenizers normalizes with; omission preserves unnormalized encoding, and other values are refused.
 Model `coverage` asks `runs_pre_tokenizer`: BPE specs use the pre-tokenizer's name, and a SentencePiece spec
 uses `llama`, its tokenizer model. `default` alone does not identify a supported BPE pre-tokenizer.
 `ignore_merges` is a property of the pre (`Pre::ignore_merges`): `pixtral` takes a word whose byte-encoded text is
