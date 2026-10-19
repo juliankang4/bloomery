@@ -44,6 +44,14 @@ fn bad(what: impl Into<String>) -> Error {
 pub enum Format {
     /// U8 E2M1 pairs, F8_E4M3 `weight_scale` a 16 values, F32 `weight_scale_2` a tensor.
     Nvfp4,
+    /// [`Format::Nvfp4`] with its `weight_scale` stored compressed as `csf`: a `nvfp4_csf_fixed`
+    /// U8 slab a 16 rows and `nvfp4_csf_exceptions` U32.
+    Nvfp4Csf,
+    /// [`Format::Nvfp4`] with its `weight_scale` stored compressed as `csf_32x2_v1`: the
+    /// `csf32_bases`, `_codes`, `_page_bases`, `_offsets` and `_exceptions` parts.
+    Nvfp4Csf32,
+    /// OCP MXFP8: F8_E4M3 values, one E8M0 scale (U8 or F8_E8M0) a 32 values.
+    Mxfp8,
     /// F8_E4M3 with one scale a `rows` by `cols` block.
     Fp8Block {
         rows: usize,
@@ -67,6 +75,9 @@ impl fmt::Display for Format {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Format::Nvfp4 => f.write_str("NVFP4-ModelOpt"),
+            Format::Nvfp4Csf => f.write_str("NVFP4-csf"),
+            Format::Nvfp4Csf32 => f.write_str("NVFP4-csf32"),
+            Format::Mxfp8 => f.write_str("MXFP8"),
             Format::Fp8Block { rows, cols } => write!(f, "FP8-block {rows}x{cols}"),
             Format::Fp8Channel => f.write_str("FP8-channel"),
             Format::Fp8Tensor => f.write_str("FP8-tensor"),
@@ -263,7 +274,13 @@ impl Modelopt {
                 let value = Value::Object(entry.clone());
                 let format = modelopt_format(module, str_of(&value, "quant_algo")?, &value)?;
                 if let Some(key) = entry.keys().find(|k| {
-                    !["quant_algo", "group_size", "weight_block_size"].contains(&k.as_str())
+                    ![
+                        "quant_algo",
+                        "group_size",
+                        "weight_block_size",
+                        "weight_scale_encoding",
+                    ]
+                    .contains(&k.as_str())
                 }) {
                     return Err(bad(format!(
                         "modelopt quantized_layers {module}: {key} is not a key this reader knows"
@@ -289,7 +306,9 @@ impl Modelopt {
     }
 }
 
-/// The format of ModelOpt's `algo` for `module`, with `entry`'s group or block size.
+/// The format of ModelOpt's `algo` for `module`, with `entry`'s group or block size and NVFP4's
+/// `weight_scale_encoding`. W4A16_NVFP4 stores its weights as NVFP4 does; only its activations
+/// stay 16-bit, which no stored tensor shows.
 fn modelopt_format(module: &str, algo: &str, entry: &Value) -> Result<Format, Error> {
     let group = match entry.get("group_size") {
         None | Some(Value::Null) => None,
@@ -304,8 +323,31 @@ fn modelopt_format(module: &str, algo: &str, entry: &Value) -> Result<Format, Er
             "modelopt quant_algo {algo} for {module} is not a format this reader places"
         ))
     };
+    let encoding = entry.get("weight_scale_encoding");
+    if encoding.is_some() && algo != "NVFP4" {
+        return Err(bad(format!(
+            "modelopt quant_algo {algo} for {module}: weight_scale_encoding is NVFP4's alone"
+        )));
+    }
     match algo {
-        "NVFP4" | "W4A16_NVFP4" if group.is_none_or(|g| g == 16) => Ok(Format::Nvfp4),
+        "NVFP4" if group.is_none_or(|g| g == 16) => match encoding {
+            None => Ok(Format::Nvfp4),
+            Some(e) => match e.as_str() {
+                Some("csf") => Ok(Format::Nvfp4Csf),
+                Some("csf_32x2_v1") => Ok(Format::Nvfp4Csf32),
+                _ => Err(bad(format!(
+                    "modelopt weight_scale_encoding {e} for {module} is not one this reader knows"
+                ))),
+            },
+        },
+        "W4A16_NVFP4" if group.is_none_or(|g| g == 16) => Ok(Format::Nvfp4),
+        "MXFP8"
+            if group == Some(32)
+                || block_of(entry.get("weight_block_size"))
+                    == Some(Format::Fp8Block { rows: 1, cols: 32 }) =>
+        {
+            Ok(Format::Mxfp8)
+        }
         "FP8" => Ok(Format::Fp8Tensor),
         "FP8_BLOCK_SCALES" if group.is_none_or(|g| g == 128) => Ok(Format::Fp8Block {
             rows: 128,
@@ -600,15 +642,67 @@ fn layout(
     };
     let mut out = Vec::new();
     match format {
-        Format::Nvfp4 => {
+        Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 => {
             let k = cols.checked_mul(2)?;
             if dtype != Dtype::U8 || k % 16 != 0 {
                 return None;
             }
-            out.push(find(module, &["weight_scale"], &[Dtype::F8E4M3], &|s| {
-                s == [rows, k / 16]
-            })?);
-            out.push(find(module, &["weight_scale_2"], &[Dtype::F32], &scalar)?);
+            let c = k / 16;
+            let line = |s: &[usize]| s.len() == 1;
+            match format {
+                Format::Nvfp4 => {
+                    out.push(find(module, &["weight_scale"], &[Dtype::F8E4M3], &|s| {
+                        s == [rows, c]
+                    })?)
+                }
+                Format::Nvfp4Csf => {
+                    if rows % 16 != 0 || c % 2 != 0 {
+                        return None;
+                    }
+                    let fixed = [rows / 16, 16 * (1 + c / 2)];
+                    out.push(find(
+                        module,
+                        &["weight_scale.nvfp4_csf_fixed"],
+                        &[Dtype::U8],
+                        &|s| s == fixed,
+                    )?);
+                    out.push(find(
+                        module,
+                        &["weight_scale.nvfp4_csf_exceptions"],
+                        &[Dtype::U32],
+                        &line,
+                    )?);
+                }
+                _ => {
+                    let codes = rows.checked_mul(c)?.div_ceil(2);
+                    for (part, dtype, want) in [
+                        ("bases", Dtype::U8, Some(rows)),
+                        ("codes", Dtype::U8, Some(codes)),
+                        ("page_bases", Dtype::U32, None),
+                        ("offsets", Dtype::U16, None),
+                        ("exceptions", Dtype::U16, None),
+                    ] {
+                        let suffix = format!("weight_scale.csf32_{part}");
+                        out.push(find(module, &[suffix.as_str()], &[dtype], &|s| {
+                            line(s) && want.is_none_or(|n| s == [n])
+                        })?);
+                    }
+                }
+            }
+            let own = find(module, &["weight_scale_2"], &[Dtype::F32], &scalar);
+            out.push(own.or_else(|| find(owner?, &["weight_scale_2"], &[Dtype::F32], &scalar))?);
+            input(&mut out);
+        }
+        Format::Mxfp8 => {
+            if dtype != Dtype::F8E4M3 || cols % 32 != 0 {
+                return None;
+            }
+            out.push(find(
+                module,
+                &["weight_scale"],
+                &[Dtype::U8, Dtype::F8E8M0],
+                &|s| s == [rows, cols / 32],
+            )?);
             input(&mut out);
         }
         Format::Mxfp4 => {
@@ -624,13 +718,14 @@ fn layout(
             )?);
         }
         Format::Fp8Block { rows: a, cols: b } if dtype == Dtype::F8E4M3 => {
-            let want = [rows.div_ceil(a), cols.div_ceil(b)];
+            let (r, c) = (rows.div_ceil(a), cols.div_ceil(b));
             let dtypes = [Dtype::F32, Dtype::Bf16, Dtype::F8E8M0];
+            // ModelOpt's FP8_PB_WO keeps the block grid's unit axes: [r, 1, c, 1].
             out.push(find(
                 module,
                 &["weight_scale_inv", "weight_scale", "scale"],
                 &dtypes,
-                &|s| s == want,
+                &|s| s == [r, c] || s == [r, 1, c, 1],
             )?);
             input(&mut out);
         }
@@ -800,6 +895,42 @@ mod tests {
                 ],
             ),
             (
+                "nvidia__GLM-5.3-Flash-FP4-Local",
+                &[
+                    (
+                        &format!("{lm}.3.mlp.experts.0.gate_proj"),
+                        &[Format::Nvfp4Csf32],
+                    ),
+                    (
+                        &format!("{lm}.45.mlp.experts.0.gate_proj"),
+                        &[Format::Nvfp4],
+                    ),
+                    (&format!("{lm}.0.self_attn.q_proj"), &[Format::Mxfp8]),
+                    (&format!("{lm}.3.self_attn.q_a_proj"), &[B128]),
+                    (&format!("{lm}.3.mlp.shared_experts.up_proj"), &[B128]),
+                    (&format!("{lm}.3.self_attn.kv_b_proj"), &[]),
+                    ("model.visual.blocks.0.attn.qkv", &[Format::Mxfp8]),
+                    ("model.visual.blocks.0.mlp.down_proj", &[Format::Nvfp4]),
+                    ("lm_head", &[Format::Mxfp8]),
+                ],
+            ),
+            (
+                "nvidia__Qwen3.8-Flash-Next-FP4-Local",
+                &[
+                    (
+                        &format!("{lm}.0.mlp.experts.7.up_proj"),
+                        &[Format::Nvfp4Csf],
+                    ),
+                    (
+                        &format!("{lm}.1.ple.ple_embedding.ngram_embedding.shard_0"),
+                        &[Format::Nvfp4],
+                    ),
+                    (&format!("{lm}.0.linear_attn.in_proj_qkv"), &[Format::Mxfp8]),
+                    ("mtp.layers.0.mlp.experts.0.gate_proj", &[Format::Nvfp4]),
+                    ("lm_head", &[]),
+                ],
+            ),
+            (
                 "nvidia__NVIDIA-Nemotron-3-Nano-4B-FP8",
                 &[
                     ("backbone.layers.0.mixer.in_proj", &[Format::Fp8Tensor]),
@@ -859,18 +990,32 @@ mod tests {
                 assert_eq!(c.declared(module).0, *want, "{tag}: {module}");
             }
         }
-        for (tag, want) in [
+        let e = config("nvidia__NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB").unwrap_err();
+        assert!(
+            e.to_string().contains(
+                "quant_algo IQ2_XXS for language_model.backbone.layers.1.mixer.experts.0.up_proj \
+                 is not a format"
+            ),
+            "{e}"
+        );
+        for (entry, want) in [
             (
-                "nvidia__GLM-5.3-Flash-FP4-Local",
-                "quant_algo MXFP8 for lm_head is not a format",
+                serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16, "weight_scale_encoding": "csf_64" }),
+                "weight_scale_encoding \"csf_64\" for m is not one this reader knows",
             ),
             (
-                "nvidia__NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB",
-                "quant_algo IQ2_XXS for language_model.backbone.layers.1.mixer.experts.0.up_proj is not a format",
+                serde_json::json!({ "quant_algo": "MXFP8", "group_size": 32, "weight_scale_encoding": "csf" }),
+                "quant_algo MXFP8 for m: weight_scale_encoding is NVFP4's alone",
+            ),
+            (
+                serde_json::json!({ "quant_algo": "MXFP8", "group_size": 16 }),
+                "quant_algo MXFP8 for m is not a format",
             ),
         ] {
-            let e = config(tag).err().unwrap_or_else(|| panic!("{tag}: read"));
-            assert!(e.to_string().contains(want), "{tag}: {e}");
+            let q = serde_json::json!({ "quantization": {
+                "quant_algo": "MIXED_PRECISION", "quantized_layers": { "m": entry } } });
+            let e = Config::parse(&serde_json::json!({}), Some(&q)).unwrap_err();
+            assert!(e.to_string().contains(want), "{e}");
         }
         let int4 = |group: Value| {
             serde_json::json!({ "quantization_config": {
@@ -1027,18 +1172,15 @@ mod tests {
         assert!(p.refused["l.mlp.gate.weight_packed"].contains("leaves l.mlp.gate unquantized"));
         assert!(p.refused["y.weight_packed"].contains("fits none of"));
         let wide: &[usize] = &[0, usize::MAX / 2 + 1];
-        assert_eq!(
-            layout(
-                Format::Mxfp4,
-                "m.weight",
-                "m",
-                None,
-                U8,
-                wide,
-                &BTreeMap::new()
-            ),
-            None
-        );
+        for (format, shape) in [
+            (Format::Mxfp4, wide),
+            (Format::Nvfp4Csf32, &[usize::MAX / 2 + 1, 16]),
+        ] {
+            assert_eq!(
+                layout(format, "m.weight", "m", None, U8, shape, &BTreeMap::new()),
+                None
+            );
+        }
     }
 
     /// Real headers: every tensor of nvidia/GLM-5.3-Flash-NVFP4's layers 0 (dense) and 3 (288
@@ -1099,6 +1241,40 @@ mod tests {
         assert_eq!(count, want.map(|(f, n)| (f.to_string(), n)));
         assert!(p.refused.is_empty(), "{:?}", p.refused);
         assert_eq!(p.input_scales.len(), 867);
+        // Layers 0 (linear attention, dense MLP), 3 (latent attention, experts) and 4 (linear
+        // attention, experts): each expert's five csf32 parts and its two tensor scales are its
+        // companions.
+        let (count, p) = place(
+            "nvidia__GLM-5.3-Flash-FP4-Local",
+            &["glm-5.3-flash-fp4-local-layers-0-3-4.tensors.json.gz"],
+        );
+        let want = [
+            ("BF16", 40),
+            ("F32", 22),
+            ("FP8-block 128x128", 10),
+            ("MXFP8", 12),
+            ("NVFP4-csf32", 1728),
+        ];
+        assert_eq!(count, want.map(|(f, n)| (f.to_string(), n)));
+        assert!(p.refused.is_empty(), "{:?}", p.refused);
+        assert_eq!(p.input_scales.len(), 1728);
+        let expert = &p.placed["model.language_model.layers.3.mlp.experts.0.down_proj.weight"];
+        assert_eq!(expert.companions.len(), 6, "{:?}", expert.companions);
+        // One of Qwen3.8's 128 PLE parts: its tensor scale is the one the declared table holds.
+        let (count, p) = place(
+            "nvidia__Qwen3.8-Flash-Next-FP4-Local",
+            &["qwen3.8-flash-next-fp4-local-ple-part-0.tensors.json.gz"],
+        );
+        assert!(p.refused.is_empty(), "{:?}", p.refused);
+        assert_eq!(count, [("NVFP4-ModelOpt".to_string(), 1)]);
+        let ple = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
+        assert_eq!(
+            p.placed[&format!("{ple}.shard_0.weight")].companions,
+            [
+                format!("{ple}.shard_0.weight_scale"),
+                format!("{ple}.weight_scale_2")
+            ]
+        );
         let (count, p) = place(
             "deepseek-ai__DeepSeek-V4.1-Flash",
             &["deepseek-v4.1-flash-model-00024-of-00048.header.json.gz"],
