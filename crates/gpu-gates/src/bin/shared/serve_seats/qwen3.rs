@@ -1385,7 +1385,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         slot_ctx(total, slots)?;
     }
     // A projector the `--hf` repo picked stays only where the load gives the text model the same
-    // experts and context with its reserve as without ([`vision_seat::kept`]).
+    // experts and context with the encoder as without ([`vision_seat::kept`]).
     let vision = vision_seat::kept(vision, &a.vision, |v| {
         let plan_levers = PlanLevers::from_levers(&levers)?;
         let asked = ctx_and_load(

@@ -263,7 +263,7 @@ by name. `timings.cache_ms` and `/metrics`'
 llama-server's flag, naming the model's encoder GGUF. On V4.1 the file is `mmproj-DeepSeek-V4.1-Flash-BF16.gguf`.
 Under `--hf` with no `--mmproj`, every image seat takes the repo's own projector beside the model, unless `--no-mmproj`
 says none. The V4.1, Qwen3.6 and GLM-5.3 seats load it only when the text model keeps the same card experts and
-context with the encoder's reserve; otherwise one vision line gives the projector's bytes and cost, and the seat serves text. Qwen3-30B-A3B has no encoder, and `--mmproj` there is refused by name. A file of
+context with the encoder as without it, also when the encoder sits on a card off the plan; otherwise one vision line gives the projector's bytes and cost, and the seat serves text. Qwen3-30B-A3B has no encoder, and `--mmproj` there is refused by name. A file of
 another encoder is refused by name. Images travel inside the request as PNG or JPEG bytes: an OpenAI `image_url`
 part holding a `data:` URL, or an Anthropic `image` block with a base64 source; any other URL is refused, not
 fetched. The encoder loads once at start and stays resident: on a card the load's plan leaves off it, or, when every

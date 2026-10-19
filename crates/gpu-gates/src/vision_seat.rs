@@ -539,13 +539,13 @@ impl Cost {
 }
 
 /// `vision` as the seat's plan keeps it. A projector the `--hf` repo picked ([`Flags::encoder`])
-/// that sits as a stage-card reserve stays only when it is free: `cost`, the seat's plan with
-/// that encoder and without one, gives the text model the same experts and context. Otherwise it
-/// is dropped by a `vision_seat` record (`seat=not-loaded`) giving its bytes and what it would
-/// cost, and the seat serves text.
-/// An `--mmproj` file, a limit given (both ask for images) and a seat off the plan stay as they
-/// are. A plan that refuses the reserve is a cost; one that refuses without it is the seat's
-/// own refusal.
+/// stays only when it is free: `cost`, the seat's plan with that encoder and without one, gives
+/// the text model the same experts and context. That holds for a tower off the plan too, whose
+/// media load can still take stage-card bytes (a Qwen3 seat's rotation tables). Otherwise it is
+/// dropped by a `vision_seat` record (`seat=not-loaded`) giving its bytes and what it would cost,
+/// and the seat serves text.
+/// An `--mmproj` file and a limit given (both ask for images) stay as they are. A plan that
+/// refuses the encoder is a cost; one that refuses without it is the seat's own refusal.
 pub fn kept(
     vision: Option<Opened>,
     flags: &Flags,
@@ -554,7 +554,7 @@ pub fn kept(
     let Some(v) = vision else {
         return Ok(None);
     };
-    if v.seat.reserve.is_none() || flags.mmproj()?.is_some() || flags.sets_limits() {
+    if flags.mmproj()?.is_some() || flags.sets_limits() {
         return Ok(Some(v));
     }
     let without = cost(None)?;
@@ -1600,6 +1600,35 @@ mod tests {
             said(cost_of(placed(940, 4096), Err("no room".to_owned()))),
             format!("{head} cost_experts=0 cost_ctx=0 why=plan-refused refusal=no room")
         );
+    }
+
+    /// An `--hf` projector off the plan is held to the same rule as a stage reserve: a media plan
+    /// that costs context drops it, a free one keeps it, and `--mmproj` or a limit keeps it at any
+    /// cost.
+    #[test]
+    fn an_off_plan_projector_stays_only_when_its_media_plan_is_free() {
+        let census = [
+            device(0, "NVIDIA RTX A6000", 48, 1),
+            device(1, "NVIDIA GeForce RTX 3090", 24, 2),
+        ];
+        let off = || {
+            Some(opened(
+                seat_of(&census, &[on(A6000, 0, 1)], "a", BYTES).unwrap(),
+            ))
+        };
+        let placed = |ctx| Cost {
+            whole: false,
+            card_experts: 940,
+            ctx,
+        };
+        let tables = |v: Option<&Opened>| Ok(placed(if v.is_some() { 4096 } else { 8192 }));
+        let free = |_: Option<&Opened>| Ok(placed(8192));
+        assert!(kept(off(), &flags(&[]).unwrap(), tables).unwrap().is_none());
+        assert!(kept(off(), &flags(&[]).unwrap(), free).unwrap().is_some());
+        let mmproj = flags(&["--mmproj", "/m/mmproj.gguf"]).unwrap();
+        assert!(kept(off(), &mmproj, tables).unwrap().is_some());
+        let limit = flags(&["--image-max-tokens", "1024"]).unwrap();
+        assert!(kept(off(), &limit, tables).unwrap().is_some());
     }
 
     /// The projector-to-text checks of the qwen3vl type, each refused by name; the Qwen3.8 text
