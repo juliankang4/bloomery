@@ -53,8 +53,8 @@ use crate::placement::accepts::{Program, qwen38_down, qwen38_gate_up, routed_rul
 use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
 use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{
-    self, A6000, CONTEXT, CardSpec, GRANULE, HostRead, MARGIN, RTX_3090, SCRATCH,
-    TIER_BATCH_HOST_RESERVE, TierBatchBytes, tier_batch_host_bytes, tier_batch_staging_bytes,
+    self, A6000, CardSpec, GRANULE, HostRead, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+    TierBatchBytes, tier_batch_host_bytes, tier_batch_staging_bytes,
 };
 use crate::placement::{
     self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Node,
@@ -1210,8 +1210,8 @@ pub const fn counted_ubatch_bytes(card: &Card) -> u64 {
 
 /// The machine a qwen4exp plan runs on: `card` runs every one of `layers`,
 /// the head and the token embedding table whole (the file's q8_0 rows, which
-/// the card gathers), with this workstation's context and margin, the host
-/// its card's machine has ([`workstation::node_of`]: the pool on a unified
+/// the card gathers), with this workstation's context and margin and the host
+/// its card's machine has ([`workstation::placed_on`]: the pool on a unified
 /// machine)
 /// and the scratch of a load that runs ubatches of up to `ubatch` positions
 /// ([`card_scratch_bytes`]): the size the load itself takes, read once by
@@ -1238,25 +1238,7 @@ pub fn machine_for_experts(
         Experts::Host => 0,
         Experts::Card => card_route_scratch_bytes(ubatch),
     };
-    Machine {
-        cards: vec![Card {
-            name: card.name.to_string(),
-            device: card.device,
-            usable_bytes: card.usable_bytes(),
-            context_bytes: CONTEXT,
-            scratch_bytes: card_scratch_bytes(ubatch) + route,
-            margin_bytes: MARGIN,
-            granule_bytes: GRANULE,
-            free_bytes: card.free_bytes,
-            held_by: card.held_by,
-            layers: 0..layers,
-            head: true,
-            token_embedding: true,
-            reserves: Vec::new(),
-        }],
-        tiers: Vec::new(),
-        nodes: vec![workstation::node_of(&card)],
-    }
+    workstation::placed_on(card, layers, card_scratch_bytes(ubatch) + route)
 }
 
 /// What the MTP draft's reserve on the stage card of a plan (b′) machine is
