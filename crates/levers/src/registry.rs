@@ -1622,6 +1622,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The file q5_K's qdot harness and gate read, the V4.1 first shard when unset.",
     ),
     path(
+        "BLOOMERY_QWEN38_HF",
+        None,
+        "The checkpoint folder whose tokenizer files the prepare corpus test reads.",
+    ),
+    path(
         "BLOOMERY_QWEN_Q4_MODEL",
         Some("ref/build-qdot-ref.sh"),
         "The Qwen3.8 UD-Q4_K_XL shard IQ4_NL's qdot harness and gate read, the second shard when unset.",

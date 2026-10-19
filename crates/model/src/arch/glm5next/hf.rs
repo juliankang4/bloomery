@@ -180,41 +180,16 @@ pub fn map<'a>(
         }
     }
     for ((l, proj), by_id) in experts {
-        let (first, shape) = by_id[by_id.keys().next().expect("an entry holds an expert")];
-        if by_id.len() != g.experts || by_id.keys().next_back() != Some(&(g.experts - 1)) {
-            return Err(refuse(
-                first,
-                format!(
-                    "layer {l} {proj} has {} of {} experts",
-                    by_id.len(),
-                    g.experts
-                ),
-            ));
-        }
-        if let Some((name, _)) = by_id.values().find(|(_, s)| *s != shape) {
-            return Err(refuse(
-                name,
-                format!("shape differs from {first}'s {shape:?}"),
-            ));
-        }
-        if shape.len() != 2 {
-            return Err(refuse(
-                first,
-                format!("expert projection {shape:?} is not 2-D"),
-            ));
-        }
+        let (sources, dims) = ::hf::safetensors::expert_stack(&by_id, g.experts)?;
         let glm = match proj {
             "gate_proj" => names::ffn_gate_exps(l),
             "up_proj" => names::ffn_up_exps(l),
             _ => names::ffn_down_exps(l),
         };
-        let mut dims: Vec<usize> = shape.iter().rev().copied().collect();
-        dims.push(g.experts);
-        let sources = by_id.values().map(|(n, _)| n.to_string()).collect();
         put(
             glm,
             Mapped {
-                source: first.to_string(),
+                source: sources[0].clone(),
                 layout: Layout::Stack(sources),
                 dims,
             },
@@ -636,7 +611,7 @@ mod tests {
 
     /// Layers 0 (KDA, dense) and 3 (latent attention, 288 experts) and the unlayered tensors of
     /// nvidia/GLM-5.3-Flash-NVFP4 map to exactly the names and ggml dims of unsloth's
-    /// GLM-5.3-Flash UD-Q4_K_XL for the same layers.
+    /// GLM-5.3-Flash UD-Q4_K_XL for the same layers, and a routed stack's expert `e` is HF's.
     #[test]
     fn layers_0_and_3_map_to_the_unsloth_gguf_names_and_dims() {
         let hf = concat!(env!("CARGO_MANIFEST_DIR"), "/../hf/tests/fixtures");
@@ -654,6 +629,16 @@ mod tests {
         )));
         let tensors = logical(&config, &table);
         let got = map(GLM, tensors.iter().map(|(n, s)| (n.as_str(), s.as_slice()))).unwrap();
+        let Layout::Stack(stack) = &got["blk.3.ffn_down_exps.weight"].layout else {
+            panic!("blk.3.ffn_down_exps.weight is no stack");
+        };
+        assert_eq!(stack.len(), GLM.experts);
+        for (e, source) in stack.iter().enumerate() {
+            assert!(
+                source.ends_with(&format!("layers.3.mlp.experts.{e}.down_proj.weight")),
+                "expert {e}: {source}"
+            );
+        }
         let got: BTreeMap<String, Vec<usize>> = got.into_iter().map(|(n, m)| (n, m.dims)).collect();
         let want = gguf_table(
             include_str!("../../../../hf/tests/fixtures/glm-5.3-flash-ud-q4_k_xl-layers-0-3.tsv"),
@@ -716,7 +701,7 @@ mod tests {
         )];
         let e = map(g, lone).unwrap_err().to_string();
         assert!(
-            e.contains("experts.0.up_proj.weight: layer 0 up_proj has 1 of 2 experts"),
+            e.contains("experts.0.up_proj.weight: the stack's 1 expert ids are not 0..2"),
             "{e}"
         );
         let twice = [

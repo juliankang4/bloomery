@@ -303,49 +303,54 @@ impl Safetensors {
     /// name.
     pub fn tensor(&self, name: &str) -> Result<Tensor, Error> {
         let raw = self.raw(name)?;
-        let data = match raw.dtype {
-            Dtype::Bf16 => raw
-                .bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
-                .collect(),
-            Dtype::F16 => raw
-                .bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| gguf::quant::half_to_f32(u16::from_le_bytes(*b)))
-                .collect(),
-            Dtype::F32 => raw
-                .bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| f32::from_le_bytes(*b))
-                .collect(),
-            Dtype::I64
-            | Dtype::Bool
-            | Dtype::U8
-            | Dtype::I8
-            | Dtype::U16
-            | Dtype::U32
-            | Dtype::I32
-            | Dtype::F8E4M3
-            | Dtype::F8E5M2
-            | Dtype::F8E8M0 => {
-                return Err(Error::Dtype {
-                    name: name.to_string(),
-                    dtype: raw.dtype.name().to_string(),
-                });
-            }
-        };
         Ok(Tensor {
             shape: raw.shape.to_vec(),
-            data,
+            data: f32_values(name, &raw)?,
         })
     }
+}
+
+/// The values of the tensor `name` stored as `raw`, converted to f32. BF16, F16 and F32 convert
+/// exactly; any other dtype is refused by name.
+pub(crate) fn f32_values(name: &str, raw: &Raw<'_>) -> Result<Vec<f32>, Error> {
+    Ok(match raw.dtype {
+        Dtype::Bf16 => raw
+            .bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
+            .collect(),
+        Dtype::F16 => raw
+            .bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| gguf::quant::half_to_f32(u16::from_le_bytes(*b)))
+            .collect(),
+        Dtype::F32 => raw
+            .bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect(),
+        Dtype::I64
+        | Dtype::Bool
+        | Dtype::U8
+        | Dtype::I8
+        | Dtype::U16
+        | Dtype::U32
+        | Dtype::I32
+        | Dtype::F8E4M3
+        | Dtype::F8E5M2
+        | Dtype::F8E8M0 => {
+            return Err(Error::Dtype {
+                name: name.to_string(),
+                dtype: raw.dtype.name().to_string(),
+            });
+        }
+    })
 }
 
 /// A Hugging Face model folder: `model.safetensors.index.json`'s `weight_map` (a tensor's name to
@@ -443,6 +448,37 @@ impl Folder {
             .ok_or_else(|| Error::Missing(name.to_string()))?;
         self.shards[at].1.raw(name)
     }
+}
+
+/// A routed expert stack from one tensor (name, row-major shape) an expert id: the tensor names
+/// in expert order, so the stack's expert `e` is HF's expert `e`, and its ggml dims
+/// `[cols, rows, count]`. Ids other than exactly `0..count`, a tensor that is not 2-D and a shape
+/// that differs from expert 0's are refused by name.
+pub fn expert_stack(
+    by_id: &BTreeMap<usize, (&str, &[usize])>,
+    count: usize,
+) -> Result<(Vec<String>, Vec<usize>), Error> {
+    let Some((_, &(first, shape))) = by_id.first_key_value() else {
+        return Err(bad("an expert stack with no expert".into()));
+    };
+    if by_id.keys().copied().ne(0..count) {
+        return Err(bad(format!(
+            "{first}: the stack's {} expert ids are not 0..{count}",
+            by_id.len()
+        )));
+    }
+    let &[rows, cols] = shape else {
+        return Err(bad(format!(
+            "{first}: expert projection {shape:?} is not 2-D"
+        )));
+    };
+    if let Some((name, _)) = by_id.values().find(|(_, s)| *s != shape) {
+        return Err(bad(format!(
+            "{name}: shape differs from {first}'s {shape:?}"
+        )));
+    }
+    let sources = by_id.values().map(|(n, _)| n.to_string()).collect();
+    Ok((sources, vec![cols, rows, count]))
 }
 
 fn entry(name: &str, v: &Value, data_len: usize) -> Result<Entry, Error> {
@@ -964,5 +1000,46 @@ mod tests {
                 ("I8", 1152)
             ]
         );
+    }
+
+    /// A stack holds HF's expert `e` at `e` whatever order the tensors arrive in, with ggml dims;
+    /// ids other than `0..count`, a tensor that is not 2-D and a shape unlike expert 0's are
+    /// refused by name.
+    #[test]
+    fn an_expert_stack_holds_expert_e_at_e() {
+        type ById<'a> = BTreeMap<usize, (&'a str, &'a [usize])>;
+        let m = [4usize, 8];
+        let by_id = ById::from([(2, ("e2", &m[..])), (0, ("e0", &m)), (1, ("e1", &m))]);
+        assert_eq!(
+            expert_stack(&by_id, 3).unwrap(),
+            (vec!["e0".into(), "e1".into(), "e2".into()], vec![8, 4, 3])
+        );
+        for (by_id, count, want) in [
+            (
+                by_id.clone(),
+                4,
+                "e0: the stack's 3 expert ids are not 0..4",
+            ),
+            (by_id, 2, "e0: the stack's 3 expert ids are not 0..2"),
+            (
+                ById::from([(0, ("e0", &m[..])), (2, ("e2", &m))]),
+                2,
+                "e0: the stack's 2 expert ids are not 0..2",
+            ),
+            (
+                ById::from([(0, ("e0", &[4][..]))]),
+                1,
+                "e0: expert projection [4] is not 2-D",
+            ),
+            (
+                ById::from([(0, ("e0", &m[..])), (1, ("e1", &[8, 4]))]),
+                2,
+                "e1: shape differs from e0's [4, 8]",
+            ),
+            (ById::new(), 0, "an expert stack with no expert"),
+        ] {
+            let e = expert_stack(&by_id, count).unwrap_err().to_string();
+            assert!(e.contains(want), "{e}");
+        }
     }
 }

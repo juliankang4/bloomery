@@ -74,6 +74,14 @@
 //! [`match_qwen35`] is that regex under ECMAScript semantics, written out by
 //! hand, and [`split_qwen35`] its one pass over the fragment.
 //!
+//! A Hugging Face `tokenizer.json` runs the same regex with Oniguruma, where
+//! `(?i:...)` folds case by Unicode: `'s` also matches `'ſ` (U+017F, whose
+//! case fold is `s`), and no other codepoint folds to a contraction's letter.
+//! Its classes are Unicode 14.0's, so a letter, mark or number Unicode 15.0 or
+//! 15.1 added is of no class there ([`crate::unicode::collapse_hf`]).
+//! [`Pre::Qwen35Hf`] is that reading, for a vocabulary that declares itself
+//! a Hugging Face one.
+//!
 //! ## pixtral
 //!
 //! The reference maps `pixtral` to its LLAMA3 type. That type's one regex is
@@ -94,7 +102,7 @@
 //! the split and merges raw UTF-8 characters ([`Spelling::Metaspace`]).
 
 use crate::spelling::Spelling;
-use crate::unicode::collapse;
+use crate::unicode::{collapse, collapse_hf};
 
 const NUMBER: u8 = 0xD1;
 const LETTER: u8 = 0xD2;
@@ -164,19 +172,20 @@ fn is_other_qwen35(c: u8) -> bool {
 /// under ECMAScript semantics (alternatives in order, greedy quantifiers that
 /// back off). None of them can match the empty string, and a mark is a plain
 /// codepoint of its own class here: the regex runs on the collapsed bytes.
-fn match_qwen35(c: &[u8], i: usize, hi: usize) -> usize {
+/// `fold(k)` is the lowercase ASCII letter the codepoint at `k` matches in a
+/// contraction.
+fn match_qwen35(c: &[u8], i: usize, hi: usize, fold: impl Fn(usize) -> u8) -> usize {
     let at = |k: usize| c[k];
 
     // `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])` — each
-    // letter a literal two-member class, so only its ASCII cases match.
+    // letter a literal two-member class, so only its ASCII cases match
+    // (and, under Hugging Face's Unicode folding, `ſ` as `s`).
     if at(i) == b'\'' && i + 1 < hi {
-        let one = |x: u8| at(i + 1).eq_ignore_ascii_case(&x);
+        let one = |x: u8| fold(i + 1) == x;
         if one(b's') || one(b't') || one(b'm') || one(b'd') {
             return 2;
         }
-        let two = |a: u8, b: u8| {
-            i + 2 < hi && at(i + 1).eq_ignore_ascii_case(&a) && at(i + 2).eq_ignore_ascii_case(&b)
-        };
+        let two = |a: u8, b: u8| i + 2 < hi && fold(i + 1) == a && fold(i + 2) == b;
         if two(b'r', b'e') || two(b'v', b'e') || two(b'l', b'l') {
             return 3;
         }
@@ -338,6 +347,11 @@ pub(crate) enum Pre {
     /// `qwen35`: qwen2's regex with `\p{M}` joined to the letter classes,
     /// run as a regex, not a hand-written splitter.
     Qwen35,
+    /// `qwen35` as a Hugging Face `tokenizer.json` runs it: contractions fold
+    /// case by Unicode, classes are Unicode 14.0's, and BPE skips a byte its
+    /// vocabulary lacks. Never named
+    /// in a header; a vocabulary with `tokenizer.bloomery.eog_token_ids` gets it.
+    Qwen35Hf,
     /// `pixtral`: the llama3 regex [`Pre::Glm4`] runs, and a word that is
     /// itself a token is taken whole ([`Pre::ignore_merges`]).
     Pixtral,
@@ -364,13 +378,21 @@ impl Pre {
         matches!(self, Pre::Pixtral)
     }
 
+    /// Whether BPE runs as Hugging Face's does ([`crate::bpe::Bpe::new`]).
+    pub(crate) fn hf(self) -> bool {
+        matches!(self, Pre::Qwen35Hf)
+    }
+
     /// How this pre-tokenizer's words are spelled in the vocabulary.
     pub(crate) fn spelling(self) -> Spelling {
         match self {
             Pre::Gemma4 => Spelling::Metaspace,
-            Pre::DeepseekV3 | Pre::Qwen2 | Pre::Glm4 | Pre::Qwen35 | Pre::Pixtral => {
-                Spelling::ByteLevel
-            }
+            Pre::DeepseekV3
+            | Pre::Qwen2
+            | Pre::Glm4
+            | Pre::Qwen35
+            | Pre::Qwen35Hf
+            | Pre::Pixtral => Spelling::ByteLevel,
         }
     }
 }
@@ -379,7 +401,8 @@ impl Pre {
 /// under `pre`; returns each word's length in codepoints, in order.
 pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     s.collapsed.clear();
-    s.collapsed.extend(cpts.iter().map(|&cp| collapse(cp)));
+    let class = if pre.hf() { collapse_hf } else { collapse };
+    s.collapsed.extend(cpts.iter().map(|&cp| class(cp)));
     match pre {
         Pre::DeepseekV3 => split_deepseek_v3(cpts, s),
         Pre::Qwen2 => {
@@ -390,7 +413,8 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
             split_custom(cpts, &s.collapsed, 3, &mut s.b);
             &s.b
         }
-        Pre::Qwen35 => split_qwen35(cpts, s),
+        Pre::Qwen35 => split_qwen35(cpts, s, false),
+        Pre::Qwen35Hf => split_qwen35(cpts, s, true),
         Pre::Gemma4 => {
             split_newlines(cpts, &mut s.b);
             &s.b
@@ -414,15 +438,24 @@ fn split_newlines(cpts: &[u32], out: &mut Vec<usize>) {
     }
 }
 
-/// [`split`] for [`Pre::Qwen35`]: its one regex over the collapsed bytes, the
-/// whole fragment one piece, as the reference's fallback runs it.
-fn split_qwen35<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+/// [`split`] for [`Pre::Qwen35`], and with `hf` for [`Pre::Qwen35Hf`]: its one
+/// regex over the collapsed bytes, the whole fragment one piece, as the
+/// reference's fallback runs it.
+fn split_qwen35<'s>(cpts: &[u32], s: &'s mut Scratch, hf: bool) -> &'s [usize] {
     let c = &s.collapsed;
     s.a.clear();
     if !cpts.is_empty() {
         s.a.push(cpts.len());
     }
-    resplit(&s.a, &mut s.b, |i, hi| match_qwen35(c, i, hi));
+    // The lowercase ASCII letter a contraction compares the codepoint at `k` with.
+    let fold = |k: usize| {
+        if hf && cpts[k] == 0x17F {
+            b's'
+        } else {
+            c[k].to_ascii_lowercase()
+        }
+    };
+    resplit(&s.a, &mut s.b, |i, hi| match_qwen35(c, i, hi, fold));
     &s.b
 }
 
@@ -678,6 +711,42 @@ mod tests {
         for &(text, want35, want2) in cases {
             assert_eq!(words(Pre::Qwen35, text), want35, "qwen35 {text:?}");
             assert_eq!(words(Pre::Qwen2, text), want2, "qwen2 {text:?}");
+        }
+    }
+
+    /// Hugging Face's qwen35 folds a contraction's case by Unicode: `ſ`
+    /// (U+017F) is `s` there, so `'ſ` is a word of its own where qwen35 keeps
+    /// it in the letter run; the Kelvin sign folds to `k`, no contraction's
+    /// letter, and splits as qwen35's does. A Kaktovik numeral and a Kawi
+    /// letter (Unicode 15.0) are of no class there, so the numeral joins the
+    /// space before it and the letter leaves the word.
+    ///
+    /// FAIL-first: with the ASCII fold for both, the first three rows fail;
+    /// with the reference's classes for both, the last two.
+    #[test]
+    fn qwen35_hf_cases() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            //                              hf                        qwen35
+            ("x'\u{17f}y", &["x", "'\u{17f}", "y"], &["x", "'\u{17f}y"]),
+            (
+                "'\u{17f}\u{17f}",
+                &["'\u{17f}", "\u{17f}"],
+                &["'\u{17f}\u{17f}"],
+            ),
+            (
+                "we'\u{17f}e",
+                &["we", "'\u{17f}", "e"],
+                &["we", "'\u{17f}e"],
+            ),
+            ("'\u{17f}", &["'\u{17f}"], &["'\u{17f}"]),
+            ("'\u{212a}x", &["'\u{212a}x"], &["'\u{212a}x"]),
+            ("IT'S", &["IT", "'S"], &["IT", "'S"]),
+            (" \u{1d2c0}", &[" \u{1d2c0}"], &[" ", "\u{1d2c0}"]),
+            ("x\u{11f04}", &["x", "\u{11f04}"], &["x\u{11f04}"]),
+        ];
+        for &(text, hf, legacy) in cases {
+            assert_eq!(words(Pre::Qwen35Hf, text), hf, "hf {text:?}");
+            assert_eq!(words(Pre::Qwen35, text), legacy, "qwen35 {text:?}");
         }
     }
 

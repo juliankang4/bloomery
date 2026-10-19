@@ -11,6 +11,12 @@
 //! token is dropped, as in the reference; a metaspace vocabulary without all
 //! 256 `<0xXX>` tokens carrying BYTE is refused ([`Bpe::new`]).
 //!
+//! Hugging Face's BPE (`hf`) differs where a byte-level vocabulary lacks a
+//! byte's character: that symbol is skipped before any merge, so its
+//! neighbours become adjacent and merge as if it were not there. Its model
+//! holds only the vocabulary's own tokens, so every merge names tokens, and a
+//! byte's character is a unit only as a normal token ([`Bpe::new`]).
+//!
 //! A pre-tokenizer may ask that a word whose spelled text is itself a
 //! vocabulary token be that token, with no merges ([`Bpe::new`]'s
 //! `ignore_merges`). The flag is the pre-tokenizer's, not this module's.
@@ -51,11 +57,12 @@ pub(crate) struct Bpe {
     n_tokens: u32,
     units: Units,
     /// `(left, right)` intern ids -> `(rank, merged intern id)`; the first
-    /// listing of a pair keeps its rank.
+    /// listing of a pair keeps its rank, under `hf` the last.
     merges: HashMap<(u32, u32), (u32, u32)>,
     /// Merges whose sides or result are not tokens (reported, not needed).
     pub(crate) merges_off_vocab: usize,
     ignore_merges: bool,
+    hf: bool,
 }
 
 struct Interner {
@@ -78,13 +85,18 @@ impl Bpe {
     /// ([`Bpe::word`]), found in the vocabulary's own lookup. A metaspace
     /// vocabulary must have the `<0xXX>` token of every byte carrying BYTE
     /// ([`Error::MissingByteToken`]), so a symbol that is no token never
-    /// loses a byte.
+    /// loses a byte. `hf`: Hugging Face's BPE, whose merges all name tokens
+    /// ([`Error::InvalidHfMerge`]), a pair listed twice ranks at its last
+    /// place, and whose byte units are normal tokens
+    /// ([`Error::AmbiguousHfByte`]): an added token is in its model only when
+    /// the model vocabulary also lists it, which the header does not say.
     pub(crate) fn new(
         texts: &[String],
         attrs: &[u32],
         merges: &[String],
         spelling: Spelling,
         ignore_merges: bool,
+        hf: bool,
     ) -> Result<Bpe, Error> {
         let n_tokens = u32::try_from(texts.len()).expect("the vocabulary loader bounds the count");
         let mut interner = Interner {
@@ -111,10 +123,20 @@ impl Bpe {
                 interner.get_or_add(&merged),
             );
             if l >= n_tokens || r >= n_tokens || j >= n_tokens {
+                if hf {
+                    return Err(Error::InvalidHfMerge {
+                        rank,
+                        merge: String::from_utf8_lossy(m).into_owned(),
+                    });
+                }
                 off_vocab += 1;
             }
             let rank = u32::try_from(rank).expect("fewer than 2^32 merges");
-            table.entry((l, r)).or_insert((rank, j));
+            if hf {
+                table.insert((l, r), (rank, j));
+            } else {
+                table.entry((l, r)).or_insert((rank, j));
+            }
         }
 
         let token = |s: &[u8]| {
@@ -129,9 +151,19 @@ impl Bpe {
                     encode_cpt(cpts[b], &mut s);
                     s
                 }));
-                let byte_iid = Box::new(std::array::from_fn(|b| {
+                let byte_iid: Box<[u32; 256]> = Box::new(std::array::from_fn(|b| {
                     interner.ids.get(&byte_text[b]).copied().unwrap_or(NONE)
                 }));
+                if hf
+                    && let Some(&id) = byte_iid.iter().find(|&&id| {
+                        id < n_tokens && attrs[id as usize] & crate::vocab::attr::NORMAL == 0
+                    })
+                {
+                    return Err(Error::AmbiguousHfByte {
+                        id: id as usize,
+                        text: texts[id as usize].clone(),
+                    });
+                }
                 let one_byte_token = Box::new(std::array::from_fn(|b| token(&[b as u8])));
                 Units::ByteLevel {
                     byte_iid,
@@ -164,6 +196,7 @@ impl Bpe {
             merges: table,
             merges_off_vocab: off_vocab,
             ignore_merges,
+            hf,
         })
     }
 
@@ -191,7 +224,8 @@ impl Bpe {
 
     /// Append the tokens of one word (raw bytes, before the vocabulary's
     /// spelling) to `out`. Under `ignore_merges`, and for a metaspace word of
-    /// newlines, a word whose spelled text is a token is that token.
+    /// newlines, a word whose spelled text is a token is that token. Under
+    /// `hf`, a byte whose character is no token is skipped before merging.
     ///
     /// Panics on a word of more than `u32::MAX` bytes, which the `u32`
     /// symbol links cannot index.
@@ -215,6 +249,9 @@ impl Bpe {
                 s.merge.symbols(word, Spelling::ByteLevel, |text| {
                     byte_iid[usize::from(text[0])]
                 });
+                if self.hf {
+                    s.merge.drop_unknown();
+                }
             }
             Units::Metaspace { char_iid, .. } => {
                 s.merge.symbols(word, Spelling::Metaspace, |text| {
@@ -290,6 +327,7 @@ mod tests {
                 &[],
                 Spelling::ByteLevel,
                 ignore_merges,
+                false,
             )
             .unwrap();
             let (mut s, mut out) = (Scratch::default(), Vec::new());
@@ -306,7 +344,7 @@ mod tests {
         let texts = ["a", "b", "c", "ab", "bc"].map(String::from);
         let tokens = texts.iter().cloned().zip(0u32..).collect();
         let merges = ["b c", "a b"].map(String::from);
-        let bpe = Bpe::new(&texts, &[], &merges, Spelling::ByteLevel, false).unwrap();
+        let bpe = Bpe::new(&texts, &[], &merges, Spelling::ByteLevel, false, false).unwrap();
         let (mut scratch, mut out) = (Scratch::default(), Vec::new());
         bpe.word(b"ababc", &mut scratch, &mut out, &tokens);
         assert_eq!(out, [3, 0, 4]);

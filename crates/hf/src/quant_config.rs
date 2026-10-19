@@ -24,6 +24,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::safetensors::Dtype;
+use crate::schema::{self, Fields, Rule::Read};
 
 /// Why a config or a tensor was refused.
 #[derive(Debug, thiserror::Error)]
@@ -251,17 +252,7 @@ impl Config {
     /// The config of the model folder `dir`: `config.json`, and `hf_quant_config.json` when the
     /// folder has one.
     pub fn read(dir: &Path) -> Result<Config, Error> {
-        let json = |name: &str| -> Result<Option<Value>, Error> {
-            let path = dir.join(name);
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(Error::Io(path.display().to_string(), e)),
-            };
-            serde_json::from_str(&text)
-                .map(Some)
-                .map_err(|e| Error::Json(path.display().to_string(), e))
-        };
+        let json = |name: &str| crate::read_json(dir, name, Error::Io, Error::Json);
         let config = json("config.json")?.ok_or_else(|| bad("the folder has no config.json"))?;
         Config::parse(&config, json("hf_quant_config.json")?.as_ref())
     }
@@ -352,6 +343,14 @@ impl Config {
     }
 }
 
+/// A `quantized_layers` entry's keys, each read by [`modelopt_format`].
+const LAYER: &Fields = &[
+    ("quant_algo", Read),
+    ("group_size", Read),
+    ("weight_block_size", Read),
+    ("weight_scale_encoding", Read),
+];
+
 impl Modelopt {
     fn parse(q: &Value) -> Result<Modelopt, Error> {
         let algo = str_of(q, "quant_algo")?;
@@ -370,19 +369,12 @@ impl Modelopt {
                 })?;
                 let value = Value::Object(entry.clone());
                 let format = modelopt_format(module, str_of(&value, "quant_algo")?, &value)?;
-                if let Some(key) = entry.keys().find(|k| {
-                    ![
-                        "quant_algo",
-                        "group_size",
-                        "weight_block_size",
-                        "weight_scale_encoding",
-                    ]
-                    .contains(&k.as_str())
-                }) {
-                    return Err(bad(format!(
-                        "modelopt quantized_layers {module}: {key} is not a key this reader knows"
-                    )));
-                }
+                schema::check(
+                    &value,
+                    &format!("modelopt quantized_layers {module}"),
+                    &[LAYER],
+                )
+                .map_err(bad)?;
                 layers.push((module.clone(), format));
             }
         }
@@ -1107,6 +1099,10 @@ mod tests {
             (
                 serde_json::json!({ "quant_algo": "MXFP8", "group_size": 16 }),
                 "quant_algo MXFP8 for m is not a format",
+            ),
+            (
+                serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16, "zzz": 1 }),
+                "modelopt quantized_layers m.zzz is not a key this converter reads",
             ),
         ] {
             let q = serde_json::json!({ "quantization": {

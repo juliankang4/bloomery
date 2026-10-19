@@ -146,7 +146,7 @@ impl Tokenizer for Vocab {
     }
 
     fn stops(&self) -> Vec<u32> {
-        // The reference's end-of-generation set: the header's eos, eot and eom.
+        // The tokenizer owns the complete end-of-generation set, including explicit HF stops.
         self.tok.eog().to_vec()
     }
 

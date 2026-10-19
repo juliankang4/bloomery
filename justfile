@@ -1843,6 +1843,14 @@ gate-ds41-oracle:
 gate-hf:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-hf --lib -- --nocapture'
 
+# The shared checkpoint preparer's shard and tokenizer checks, without model files.
+gate-prepare:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --bin prepare -- --nocapture'
+
+# The served tokenizer against the pinned HF corpus; BLOOMERY_QWEN38_HF names its checkpoint folder.
+gate-prepare-corpus:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --bin prepare hw_the_served_tokenizer_encodes_the_corpus_as_hf -- --ignored --nocapture'
+
 # Reference sets (crates/refset, host only): the readers' unit tests, then every family's sets in place
 # against the family table — each complete, dumped from the file the tree runs, of the family's ik build.
 # The draft set's family needs the profile's DSPARK_MODEL, exported as the dspark recipes do.

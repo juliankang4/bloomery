@@ -42,6 +42,7 @@ impl Encoder {
                     &merges,
                     pre.spelling(),
                     pre.ignore_merges(),
+                    pre.hf(),
                 )?,
             }),
             Encoding::Spm {

@@ -74,6 +74,31 @@ impl<P: Ord> Scratch<P> {
         }
     }
 
+    /// Unlink every symbol with no id, as Hugging Face's BPE leaves out a
+    /// character its vocabulary lacks: the symbols on either side become
+    /// neighbours.
+    pub(crate) fn drop_unknown(&mut self) {
+        let mut prev = NONE;
+        for i in 0..self.syms.len() {
+            if self.syms[i].len == 0 {
+                continue;
+            }
+            if self.syms[i].iid == NONE {
+                self.syms[i].len = 0;
+                continue;
+            }
+            let at = u32::try_from(i).expect("symbols bounds the word length");
+            self.syms[i].prev = prev;
+            if prev != NONE {
+                self.syms[prev as usize].next = at;
+            }
+            prev = at;
+        }
+        if prev != NONE {
+            self.syms[prev as usize].next = NONE;
+        }
+    }
+
     /// Merge eligible pairs in priority order, breaking ties at the leftmost pair.
     pub(crate) fn run(&mut self, mut pair: impl FnMut(u32, Sym, Sym) -> Option<(P, u32)>) {
         self.heap.clear();

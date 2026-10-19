@@ -287,7 +287,7 @@ impl<'a> Meta<'a> {
 }
 
 impl Vocab {
-    pub(crate) fn load(path: &Path) -> Result<(Vocab, Encoding), Error> {
+    pub(crate) fn load(path: &Path) -> Result<(Vocab, Encoding, Option<Vec<String>>), Error> {
         let inv =
             gguf::inventory_of(path).map_err(|e| Error::Gguf(path.display().to_string(), e))?;
         let mut m = Meta {
@@ -319,6 +319,31 @@ impl Vocab {
         }
 
         let n = texts.len();
+        let explicit_stops = m
+            .ints("tokenizer.bloomery.eog_token_ids")?
+            .map(|ids| {
+                if ids.is_empty() {
+                    return Err(Error::InvalidStops("is empty".into()));
+                }
+                let mut stops = ids
+                    .into_iter()
+                    .map(|id| {
+                        u32::try_from(id)
+                            .ok()
+                            .filter(|&id| (id as usize) < n)
+                            .ok_or_else(|| {
+                                Error::InvalidStops(format!(
+                                    "contains id {id} outside the vocabulary of {n}"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                stops.sort_unstable();
+                stops.dedup();
+                Ok(stops)
+            })
+            .transpose()?;
+        let hf_texts = explicit_stops.as_ref().map(|_| texts.clone());
         let mut token_to_id = HashMap::with_capacity(n);
         let mut attrs = Vec::with_capacity(n);
         for (i, text) in texts.iter_mut().enumerate() {
@@ -340,10 +365,26 @@ impl Vocab {
                 };
                 let pre = crate::named(&Pre::NAMES, name)
                     .ok_or_else(|| Error::UnsupportedPre(name.to_string()))?;
+                // The explicit stop list marks a Hugging Face tokenizer, whose qwen35 runs as
+                // its tokenizer.json does.
+                let pre = match (pre, explicit_stops.is_some()) {
+                    (Pre::Qwen35, true) => Pre::Qwen35Hf,
+                    (pre, false) => pre,
+                    (_, true) => {
+                        return Err(Error::InvalidStops(format!(
+                            "marks a Hugging Face qwen35 tokenizer, not pre-tokenizer {name:?}"
+                        )));
+                    }
+                };
                 let merges = m
                     .strings("tokenizer.ggml.merges")?
                     .ok_or(Error::Missing("tokenizer.ggml.merges"))?;
                 (name.to_string(), Encoding::Bpe { pre, merges, nfc })
+            }
+            Model::Spm if explicit_stops.is_some() => {
+                return Err(Error::InvalidStops(
+                    "marks a Hugging Face qwen35 tokenizer, not SentencePiece".into(),
+                ));
             }
             Model::Spm => (
                 "default".to_string(),
@@ -356,20 +397,24 @@ impl Vocab {
 
         // The model's defaults, with the reference's per-name override (`glm4`
         // names no BOS), then the file's ids where in range.
-        let mut sp = match model {
-            Model::Gpt2 => Specials {
-                bos: (n > 11 && !matches!(encoding, Encoding::Bpe { pre: Pre::Glm4, .. }))
-                    .then_some(11),
-                eos: (n > 11).then_some(11),
-                ..Specials::default()
-            },
-            Model::Gemma4 => Specials::default(),
-            Model::Spm => Specials {
-                bos: (n > 1).then_some(1),
-                eos: (n > 2).then_some(2),
-                unk: (n > 0).then_some(0),
-                ..Specials::default()
-            },
+        let mut sp = if explicit_stops.is_some() {
+            Specials::default()
+        } else {
+            match model {
+                Model::Gpt2 => Specials {
+                    bos: (n > 11 && !matches!(encoding, Encoding::Bpe { pre: Pre::Glm4, .. }))
+                        .then_some(11),
+                    eos: (n > 11).then_some(11),
+                    ..Specials::default()
+                },
+                Model::Gemma4 => Specials::default(),
+                Model::Spm => Specials {
+                    bos: (n > 1).then_some(1),
+                    eos: (n > 2).then_some(2),
+                    unk: (n > 0).then_some(0),
+                    ..Specials::default()
+                },
+            }
         };
         {
             type Slot = fn(&mut Specials) -> &mut Option<u32>;
@@ -434,8 +479,13 @@ impl Vocab {
             ambiguous_roles: Vec::new(),
             keys_read: std::mem::take(&mut m.read),
         };
-        v.apply_overrides();
-        Ok((v, encoding))
+        if let Some(stops) = explicit_stops {
+            // An explicit HF contract keeps its ids and token types, without name-based guesses.
+            v.eog = stops;
+        } else {
+            v.apply_overrides();
+        }
+        Ok((v, encoding, hf_texts))
     }
 
     fn id_of(&self, text: &str) -> Option<u32> {

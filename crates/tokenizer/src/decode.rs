@@ -1,9 +1,46 @@
 //! Ids back to text, `llama_token_to_piece` semantics.
 
-use crate::Tokenizer;
 use crate::spelling::Spelling;
 use crate::unicode::{byte_to_cpt_table, decode_lenient, encode_cpt};
 use crate::vocab::attr;
+use crate::{Error, Tokenizer};
+
+fn byte_decoder() -> [Option<u8>; 324] {
+    let mut table = [None; 324];
+    for (b, &cpt) in byte_to_cpt_table().iter().enumerate() {
+        table[cpt as usize] = Some(b as u8);
+    }
+    table
+}
+
+/// HF ByteLevel maps the whole spelling through its byte alphabet, or preserves the whole
+/// spelling when any character is outside it. Unused ids are fillers with no HF spelling.
+pub(crate) fn check_hf(texts: &[String], attrs: &[u32], pieces: &[Box<[u8]>]) -> Result<(), Error> {
+    let table = byte_decoder();
+    let mut bytes = Vec::new();
+    for (id, text) in texts.iter().enumerate() {
+        if attrs[id] & attr::UNUSED != 0 {
+            continue;
+        }
+        bytes.clear();
+        let all_bytes = text.chars().all(|c| {
+            if let Some(b) = table.get(c as usize).copied().flatten() {
+                bytes.push(b);
+                true
+            } else {
+                false
+            }
+        });
+        let expected = if all_bytes { &bytes } else { text.as_bytes() };
+        if pieces[id].as_ref() != expected {
+            return Err(Error::InvalidHfToken {
+                id,
+                text: text.clone(),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Each token's piece with special tokens rendered (the reference's
 /// `cache_token_to_piece`):
@@ -16,10 +53,7 @@ use crate::vocab::attr;
 /// * BYTE: the byte its `<0xXX>` text names;
 /// * anything else: empty.
 pub(crate) fn pieces(texts: &[String], attrs: &[u32], spelling: Spelling) -> Vec<Box<[u8]>> {
-    let mut cpt_to_byte = [None::<u8>; 324];
-    for (b, &cpt) in byte_to_cpt_table().iter().enumerate() {
-        cpt_to_byte[cpt as usize] = Some(b as u8);
-    }
+    let cpt_to_byte = byte_decoder();
     let mut cpts = Vec::new();
     let mut utf8 = Vec::new();
     texts

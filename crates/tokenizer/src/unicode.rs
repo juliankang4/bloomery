@@ -96,6 +96,43 @@ pub(crate) fn collapse(cpt: u32) -> u8 {
     }
 }
 
+/// The codepoints Unicode 15.0 and 15.1 added that the reference's table
+/// classes as letters, marks or numbers. Hugging Face's tokenizers matches its
+/// regex with Oniguruma 6.9.8, whose tables are Unicode 14.0's, so there they
+/// are none of `\p{L}`, `\p{M}`, `\p{N}` or `\s`.
+const AFTER_UNICODE_14: [(u32, u32); 20] = [
+    (0x0CF3, 0x0CF3),
+    (0x0ECE, 0x0ECE),
+    (0x10EFD, 0x10EFF),
+    (0x1123F, 0x11241),
+    (0x11F00, 0x11F10),
+    (0x11F12, 0x11F3A),
+    (0x11F3E, 0x11F42),
+    (0x11F50, 0x11F59),
+    (0x1342F, 0x1342F),
+    (0x13440, 0x13455),
+    (0x1B132, 0x1B132),
+    (0x1B155, 0x1B155),
+    (0x1D2C0, 0x1D2D3),
+    (0x1DF25, 0x1DF2A),
+    (0x1E030, 0x1E06D),
+    (0x1E08F, 0x1E08F),
+    (0x1E4D0, 0x1E4F9),
+    (0x2B739, 0x2B739),
+    (0x2EBF0, 0x2EE5D),
+    (0x31350, 0x323AF),
+];
+
+/// [`collapse`] as Hugging Face's regex classes the codepoint: a codepoint of
+/// [`AFTER_UNICODE_14`] is 0xD0, the byte of an unassigned codepoint.
+pub(crate) fn collapse_hf(cpt: u32) -> u8 {
+    let i = AFTER_UNICODE_14.partition_point(|&(_, last)| last < cpt);
+    match AFTER_UNICODE_14.get(i) {
+        Some(&(first, _)) if first <= cpt => 0xD0,
+        _ => collapse(cpt),
+    }
+}
+
 /// GPT-2's byte-level alphabet: the codepoint each byte is written as inside
 /// a vocabulary string (`unicode_byte_to_utf8_map`).
 pub(crate) fn byte_to_cpt_table() -> [u32; 256] {

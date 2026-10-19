@@ -27,8 +27,10 @@
 //!
 //! The other files of a repo are read by [`safetensors`] (a draft's weights, Clef's head, a model
 //! folder), [`quant_config`] (a checkpoint's quantization config, one format a tensor),
-//! [`modelopt`] (a ModelOpt checkpoint's NVFP4 weights into GGUF's NVFP4 block) and [`dspark`] (a
-//! DSpark draft's `config.json` read into the runtime's shape).
+//! [`modelopt`] (a ModelOpt checkpoint's tensors in GGUF's types, one table from a tensor's format),
+//! [`vocab`] (a byte-level BPE tokenizer as GGUF's tokenizer keys) and [`dspark`] (a DSpark draft's
+//! `config.json` read into the runtime's shape); [`schema`] holds the keys and values a checkpoint
+//! reader accepts.
 
 pub mod card;
 pub mod dspark;
@@ -36,14 +38,34 @@ pub mod fetch;
 pub mod modelopt;
 pub mod quant_config;
 pub mod safetensors;
+pub mod schema;
 pub mod sentence_transformers;
 pub mod source;
+pub mod vocab;
 
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+
+/// The JSON file `name` of the folder `dir`, or `None` when the folder has none; a file that
+/// cannot be read is `io` of its path and one that is not JSON `json` of it.
+pub(crate) fn read_json<E>(
+    dir: &Path,
+    name: &str,
+    io: fn(String, std::io::Error) -> E,
+    json: fn(String, serde_json::Error) -> E,
+) -> Result<Option<Value>, E> {
+    let path = dir.join(name);
+    match std::fs::read(&path) {
+        Ok(b) => serde_json::from_slice(&b)
+            .map(Some)
+            .map_err(|e| json(path.display().to_string(), e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io(path.display().to_string(), e)),
+    }
+}
 
 /// Why a repo, a listing, a pick, a fetch or a model source was refused.
 #[derive(Debug, thiserror::Error)]

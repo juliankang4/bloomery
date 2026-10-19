@@ -43,6 +43,8 @@ pub enum Error {
     UnsupportedPre(String),
     #[error("tokenizer.ggml.normalizer {0:?} is not supported for this tokenizer model")]
     UnsupportedNormalizer(String),
+    #[error("tokenizer.bloomery.eog_token_ids {0}")]
+    InvalidStops(String),
     #[error("tokenizer.ggml.token_type has {types} entries for {tokens} tokens")]
     TokenTypesShort { types: usize, tokens: usize },
     #[error("tokenizer.ggml.scores has {scores} entries for {tokens} tokens")]
@@ -53,6 +55,16 @@ pub enum Error {
     TooManyTokens(usize),
     #[error("token text {0:?} appears twice in the vocabulary")]
     DuplicateToken(String),
+    #[error("tokenizer.ggml.tokens[{id}] {text:?} cannot preserve HF ByteLevel decoding")]
+    InvalidHfToken { id: usize, text: String },
+    #[error(
+        "tokenizer.ggml.merges[{rank}] {merge:?} names a string that is no token, which a Hugging Face BPE cannot"
+    )]
+    InvalidHfMerge { rank: usize, merge: String },
+    #[error(
+        "tokenizer.ggml.tokens[{id}] {text:?} is an added token spelling a byte, which a Hugging Face BPE reads only if its model vocabulary lists it, and the header does not say"
+    )]
+    AmbiguousHfByte { id: usize, text: String },
     #[error("the vocabulary has no byte token <0x{0:02X}>")]
     MissingByteToken(u8),
 }
@@ -98,7 +110,7 @@ impl Tokenizer {
     /// Load the vocabulary from a GGUF file's header; for a split set, the
     /// first shard (the one that carries `tokenizer.ggml.*`).
     pub fn from_gguf(path: impl AsRef<Path>) -> Result<Tokenizer, Error> {
-        let (vocab, encoding) = Vocab::load(path.as_ref())?;
+        let (vocab, encoding, hf_texts) = Vocab::load(path.as_ref())?;
         let encoder = encoder::Encoder::new(encoding, &vocab)?;
         let spelling = encoder.spelling();
         let specials = vocab.special_order();
@@ -107,6 +119,9 @@ impl Tokenizer {
             .map(|&id| Finder::new(vocab.texts[id as usize].as_bytes()).into_owned())
             .collect();
         let pieces = decode::pieces(&vocab.texts, &vocab.attrs, spelling);
+        if let Some(texts) = hf_texts {
+            decode::check_hf(&texts, &vocab.attrs, &pieces)?;
+        }
         Ok(Tokenizer {
             vocab,
             encoder,
@@ -343,7 +358,7 @@ mod tests {
     use gguf::Value;
     use gguf::write::{Layout, Writer};
 
-    use super::{Error, Tokenizer};
+    use super::{Error, Tokenizer, attr};
 
     /// A gemma4 vocabulary of a few tokens: six CONTROL tokens, one
     /// USER_DEFINED token, the 256 `<0xXX>` byte tokens but `missing_byte`,
@@ -421,9 +436,29 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let layout = Layout::new(kvs, Vec::new()).unwrap();
-        let file = std::fs::File::create(&path).unwrap();
-        Writer::new(file, layout).and_then(Writer::finish).unwrap();
+        // The writer needs an element type; empty-array reader fixtures use a typed placeholder.
+        let mut typed = kvs.to_vec();
+        for (_, value) in &mut typed {
+            if matches!(value, Value::Array(a) if a.is_empty()) {
+                *value = Value::Array(vec![Value::U32(0)]);
+            }
+        }
+        let layout = Layout::new(&typed, Vec::new()).unwrap();
+        let mut bytes = Writer::new(Vec::new(), layout)
+            .and_then(Writer::finish)
+            .unwrap();
+        for (key, value) in kvs.iter().rev() {
+            if matches!(value, Value::Array(a) if a.is_empty()) {
+                let at = bytes
+                    .windows(key.len())
+                    .position(|s| s == key.as_bytes())
+                    .unwrap()
+                    + key.len();
+                bytes[at + 8..at + 16].copy_from_slice(&0u64.to_le_bytes());
+                bytes.drain(at + 16..at + 20);
+            }
+        }
+        std::fs::write(&path, bytes).unwrap();
         let tok = Tokenizer::from_gguf(&path);
         std::fs::remove_file(&path).unwrap();
         tok
@@ -524,6 +559,245 @@ mod tests {
             );
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn explicit_stops_preserve_hf_ids_and_attributes() {
+        let texts = [
+            "a",
+            "<|endoftext|>",
+            "<|im_end|>",
+            "<|fim_pad|>",
+            "<|repo_name|>",
+            "<|file_sep|>",
+            "<|channel|>",
+            "<|message|>",
+            "<|start|>",
+            "<|constrain|>",
+            "<|end|>",
+            "<|call|>",
+            "<|return|>",
+            "<unused0>",
+        ];
+        let mut header = vec![
+            ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+            ("tokenizer.ggml.pre".into(), Value::String("qwen35".into())),
+            (
+                "tokenizer.ggml.tokens".into(),
+                Value::Array(texts.map(|s| Value::String(s.into())).to_vec()),
+            ),
+            (
+                "tokenizer.ggml.token_type".into(),
+                Value::Array(
+                    [1, 4, 3, 4, 4, 4, 3, 3, 3, 3, 4, 4, 4, 3]
+                        .map(Value::I32)
+                        .to_vec(),
+                ),
+            ),
+            ("tokenizer.ggml.merges".into(), Value::Array(vec![])),
+            ("tokenizer.ggml.eos_token_id".into(), Value::U32(1)),
+        ];
+        let legacy = from_header(&header).unwrap();
+        assert_eq!(legacy.eog(), &[1, 2, 3, 4, 5, 11, 12]);
+        assert_eq!(legacy.specials().bos, Some(11));
+        assert_eq!(legacy.attr(6), Some(attr::USER_DEFINED));
+        assert_eq!(legacy.attr(3), Some(attr::CONTROL | attr::USER_DEFINED));
+        header.push((
+            "tokenizer.bloomery.eog_token_ids".into(),
+            Value::Array(vec![Value::U32(2)]),
+        ));
+        for ids in [vec![2], vec![12, 10, 2, 2]] {
+            header.last_mut().unwrap().1 =
+                Value::Array(ids.iter().copied().map(Value::U32).collect());
+            let tok = from_header(&header).unwrap();
+            let mut want = ids;
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(tok.eog(), want);
+            assert_eq!(tok.specials().bos, None);
+            assert_eq!(tok.specials().eos, Some(1));
+            assert_eq!(tok.specials().eot, None);
+            assert_eq!(tok.specials().fim_pad, None);
+            for (id, ty) in [1, 4, 3, 4, 4, 4, 3, 3, 3, 3, 4, 4, 4, 3]
+                .into_iter()
+                .enumerate()
+            {
+                let expected = match ty {
+                    1 => attr::NORMAL,
+                    3 => attr::CONTROL,
+                    _ => attr::USER_DEFINED,
+                };
+                assert_eq!(tok.attr(id as u32), Some(expected), "{}", texts[id]);
+                assert_eq!(tok.piece(id as u32, false).is_empty(), ty == 3);
+            }
+        }
+        let mut mismatches = Vec::new();
+        for (text, ty, decoded) in [
+            ("", 1, None),
+            ("▁", 1, None),
+            ("▁x", 1, None),
+            ("Ġx", 4, None),
+            ("Ġx", 3, None),
+            ("é", 4, None),
+            ("Ġx", 1, Some(b" x".as_slice())),
+            ("é", 1, Some(b"\xe9".as_slice())),
+            ("▁x", 4, Some("▁x".as_bytes())),
+            ("Ġ▁x", 4, Some("Ġ▁x".as_bytes())),
+        ] {
+            let mut changed = header.clone();
+            changed.last_mut().unwrap().1 = Value::Array(vec![Value::U32(2)]);
+            let Value::Array(tokens) = &mut changed[2].1 else {
+                panic!();
+            };
+            tokens[0] = Value::String(text.into());
+            let Value::Array(types) = &mut changed[3].1 else {
+                panic!();
+            };
+            types[0] = Value::I32(ty);
+            match (from_header(&changed), decoded) {
+                (Ok(tok), Some(bytes)) => assert_eq!(tok.piece(0, true), bytes, "{text:?}"),
+                (Err(error), None) => {
+                    let error = error.to_string();
+                    assert!(error.contains("tokens[0]"), "{error}");
+                    assert!(error.contains(&format!("{text:?}")), "{error}");
+                }
+                (Ok(tok), None) => mismatches.push(format!(
+                    "{text:?} type {ty}: accepted, piece {:?}",
+                    tok.piece(0, true)
+                )),
+                (Err(error), Some(_)) => {
+                    mismatches.push(format!("{text:?} type {ty}: {error}"));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        for value in [
+            Value::Array(vec![]),
+            Value::Array(vec![Value::I32(-1)]),
+            Value::Array(vec![Value::U32(texts.len() as u32)]),
+            Value::Array(vec![Value::U64(u64::MAX)]),
+            Value::Array(vec![Value::String("2".into())]),
+            Value::U32(2),
+        ] {
+            header.last_mut().unwrap().1 = value.clone();
+            let error = from_header(&header)
+                .err()
+                .expect("invalid stop key accepted");
+            assert!(
+                error
+                    .to_string()
+                    .contains("tokenizer.bloomery.eog_token_ids"),
+                "{value:?}: {error}"
+            );
+        }
+    }
+
+    /// The explicit stop list selects Hugging Face's encoding, and only for a qwen35 BPE: its
+    /// regex folds `ſ` to `s` in a contraction ("'ſx" is `'ſ` and `x`, ids 257 and 120 under
+    /// the merges below, where qwen35 merges the one word to 258), and its BPE skips a byte its
+    /// vocabulary lacks and merges across it ("acb" is `ab`), and a pair listed twice ranks at its
+    /// last place ("abc" is `ab c`). Native `tokenizers` 0.21.0 gives the HF ids. A merge naming no
+    /// token, or an added token spelling a byte, has no HF reading.
+    ///
+    /// FAIL-first: without the fold, the skip or the last rank, the HF row of its case fails.
+    #[test]
+    fn the_hf_marker_encodes_as_hugging_face() {
+        let stop = (
+            "tokenizer.bloomery.eog_token_ids".to_string(),
+            Value::Array(vec![Value::U32(0)]),
+        );
+        let header = |tokens: Vec<String>, merges: &[&str], types: Option<Vec<i32>>| {
+            let mut kvs = vec![
+                (
+                    "tokenizer.ggml.model".to_string(),
+                    Value::String("gpt2".into()),
+                ),
+                (
+                    "tokenizer.ggml.pre".to_string(),
+                    Value::String("qwen35".into()),
+                ),
+                (
+                    "tokenizer.ggml.tokens".to_string(),
+                    Value::Array(tokens.into_iter().map(Value::String).collect()),
+                ),
+                (
+                    "tokenizer.ggml.merges".to_string(),
+                    Value::Array(
+                        merges
+                            .iter()
+                            .map(|m| Value::String(m.to_string()))
+                            .collect(),
+                    ),
+                ),
+            ];
+            if let Some(types) = types {
+                kvs.push((
+                    "tokenizer.ggml.token_type".to_string(),
+                    Value::Array(types.into_iter().map(Value::I32).collect()),
+                ));
+            }
+            kvs
+        };
+        let bytes: Vec<String> = crate::unicode::byte_to_cpt_table()
+            .into_iter()
+            .map(|cp| char::from_u32(cp).unwrap().to_string())
+            .collect();
+        let contraction = header(
+            bytes
+                .iter()
+                .cloned()
+                .chain(["Å¿", "'Å¿", "'Å¿x"].map(String::from))
+                .collect(),
+            &["Å ¿", "' Å¿", "'Å¿ x"],
+            None,
+        );
+        let sparse = header(["a", "b", "ab"].map(String::from).to_vec(), &["a b"], None);
+        let twice = header(
+            ["a", "b", "c", "ab", "bc"].map(String::from).to_vec(),
+            &["b c", "a b", "b c"],
+            None,
+        );
+        for (kvs, text, hf, legacy) in [
+            (&contraction, "'ſx", &[257u32, 120][..], &[258][..]),
+            (
+                &contraction,
+                "it's",
+                &[105, 116, 39, 115],
+                &[105, 116, 39, 115],
+            ),
+            (&sparse, "acb", &[2], &[0, 1]),
+            (&sparse, "ab", &[2], &[2]),
+            (&twice, "abc", &[3, 2], &[0, 4]),
+        ] {
+            let mut marked = kvs.clone();
+            marked.push(stop.clone());
+            for (kvs, want) in [(kvs, legacy), (&marked, hf)] {
+                let tok = from_header(kvs).unwrap();
+                assert_eq!(tok.encode(text, false, false), want, "{text:?}");
+            }
+        }
+        let mut off_vocab = header(["a", "b"].map(String::from).to_vec(), &["a b"], None);
+        let mut added_byte = header(
+            ["a", "b", "ab"].map(String::from).to_vec(),
+            &["a b"],
+            Some(vec![1, 4, 1]),
+        );
+        let mut qwen2 = sparse.clone();
+        qwen2[1].1 = Value::String("qwen2".into());
+        let mut llama = sparse.clone();
+        llama[0].1 = Value::String("llama".into());
+        for (kvs, want, unmarked) in [
+            (&mut off_vocab, "tokenizer.ggml.merges[0] \"a b\"", true),
+            (&mut added_byte, "tokenizer.ggml.tokens[1] \"b\"", true),
+            (&mut qwen2, "not pre-tokenizer \"qwen2\"", true),
+            (&mut llama, "not SentencePiece", false),
+        ] {
+            // Without the marker the first three load; a SentencePiece one here has no byte tokens.
+            assert!(!unmarked || from_header(kvs).is_ok(), "{want}: unmarked");
+            kvs.push(stop.clone());
+            let error = from_header(kvs).err().expect(want).to_string();
+            assert!(error.contains(want), "{error}");
+        }
     }
 
     #[test]
