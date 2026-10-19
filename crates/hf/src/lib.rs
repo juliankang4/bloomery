@@ -28,11 +28,12 @@
 //! The other files of a repo are read by [`safetensors`] (a draft's weights, Clef's head, a model
 //! folder), [`quant_config`] (a checkpoint's quantization config, one format a tensor),
 //! [`modelopt`] (a ModelOpt checkpoint's tensors in GGUF's types, one table from a tensor's format),
-//! [`vocab`] (a byte-level BPE tokenizer as GGUF's tokenizer keys) and [`dspark`] (a DSpark draft's
-//! `config.json` read into the runtime's shape); [`schema`] holds the keys and values a checkpoint
-//! reader accepts.
+//! [`csf`] (its compressed block scales read back as stored bytes), [`vocab`] (a byte-level BPE
+//! tokenizer as GGUF's tokenizer keys) and [`dspark`] (a DSpark draft's `config.json` read into the
+//! runtime's shape); [`schema`] holds the keys and values a checkpoint reader accepts.
 
 pub mod card;
+pub mod csf;
 pub mod dspark;
 pub mod fetch;
 pub mod modelopt;
