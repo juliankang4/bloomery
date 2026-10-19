@@ -509,6 +509,38 @@ impl LayerScratch {
             Some(m) => Some(MoeScratch::new(stream, m, hidden)?),
             None => None,
         };
+        #[cfg(test)]
+        crate::tensor::allocation_failure("LayerScratch::x")?;
+        let x = f32n(hidden)?;
+        let normed = f32n(hidden)?;
+        let act_q = Q8Act::with_k(stream, 1, hidden)?;
+        let q = f32n(q_rows)?;
+        let q_rope_all = f32n(q_rows)?;
+        let kv_a = f32n(kv_width)?;
+        let kv_s = f32n(kv_width)?;
+        let kvr = f32n(kv_width)?;
+        let f_rows = f32n(mla.n_head * kv_width)?;
+        let kqvc = f32n(mla.n_head * latent)?;
+        let act_kv_lo = Q8Act::with_k(stream, 8, latent)?;
+        let act_kv_hi = Q8Act::with_k(stream, 8, latent)?;
+        let kqv_2d = f32n(mla.n_head * mla.v_head)?;
+        let act_ao = Q8Act::with_k(stream, 1, hidden)?;
+        let attn_out = f32n(hidden)?;
+        let ffn_inp = f32n(hidden)?;
+        let act_ffn = Q8Act::with_k(stream, 1, hidden)?;
+        let l_out = f32n(hidden)?;
+        let g_f_rope_lo = rope_gather(stream, mla, kv_width, 0..half, "Gather::new f_rope_lo")?;
+        let g_f_rope_hi = rope_gather(
+            stream,
+            mla,
+            kv_width,
+            half..mla.n_head,
+            "Gather::new f_rope_hi",
+        )?;
+        let part_v = f32n(crate::flash::partials_v_len(mla.n_head, ctx_max))?;
+        let part_ms = f32n(crate::flash::partials_ms_len(mla.n_head, ctx_max))?;
+        let probe = crate::probe::Probe::load(ctx)?;
+        let probe_buf = f32n(32)?;
         let ParamImage {
             step_params,
             params_host,
@@ -518,36 +550,30 @@ impl LayerScratch {
             cs_buf,
         } = ParamImage::new(stream, rope)?;
         Ok(LayerScratch {
-            x: f32n(hidden)?,
-            normed: f32n(hidden)?,
-            act_q: Q8Act::with_k(stream, 1, hidden)?,
-            q: f32n(q_rows)?,
-            q_rope_all: f32n(q_rows)?,
-            kv_a: f32n(kv_width)?,
-            kv_s: f32n(kv_width)?,
-            kvr: f32n(kv_width)?,
-            f_rows: f32n(mla.n_head * kv_width)?,
-            kqvc: f32n(mla.n_head * latent)?,
-            act_kv_lo: Q8Act::with_k(stream, 8, latent)?,
-            act_kv_hi: Q8Act::with_k(stream, 8, latent)?,
-            kqv_2d: f32n(mla.n_head * mla.v_head)?,
-            act_ao: Q8Act::with_k(stream, 1, hidden)?,
-            attn_out: f32n(hidden)?,
-            ffn_inp: f32n(hidden)?,
-            act_ffn: Q8Act::with_k(stream, 1, hidden)?,
+            x,
+            normed,
+            act_q,
+            q,
+            q_rope_all,
+            kv_a,
+            kv_s,
+            kvr,
+            f_rows,
+            kqvc,
+            act_kv_lo,
+            act_kv_hi,
+            kqv_2d,
+            act_ao,
+            attn_out,
+            ffn_inp,
+            act_ffn,
             dense,
             moe,
-            l_out: f32n(hidden)?,
-            g_f_rope_lo: rope_gather(stream, mla, kv_width, 0..half, "Gather::new f_rope_lo")?,
-            g_f_rope_hi: rope_gather(
-                stream,
-                mla,
-                kv_width,
-                half..mla.n_head,
-                "Gather::new f_rope_hi",
-            )?,
-            part_v: f32n(crate::flash::partials_v_len(mla.n_head, ctx_max))?,
-            part_ms: f32n(crate::flash::partials_ms_len(mla.n_head, ctx_max))?,
+            l_out,
+            g_f_rope_lo,
+            g_f_rope_hi,
+            part_v,
+            part_ms,
             step_params,
             params_host,
             pos_buf,
@@ -555,8 +581,8 @@ impl LayerScratch {
             token_buf,
             cs_buf,
             pos_host: 0,
-            probe: crate::probe::Probe::load(ctx)?,
-            probe_buf: f32n(32)?,
+            probe,
+            probe_buf,
             probe_cfg: StepProbe::default(),
             dims,
         })
@@ -721,6 +747,96 @@ impl ParamImage {
             token_buf,
             cs_buf,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::DeviceTensor;
+    use model::arch::deepseek2::attn::RopeParams;
+
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_scratch_gives_back_its_context_handles_on_allocation_failure() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let mut w = Weights::default();
+        let mut names = LayerNames::new(&w, 0);
+        for name in [
+            &mut names.attn_norm,
+            &mut names.attn_q,
+            &mut names.attn_kv_a_mqa,
+            &mut names.attn_kv_b,
+            &mut names.ffn_gate,
+        ] {
+            *name = format!("derived.{name}");
+        }
+        w.insert_derived(
+            names.attn_norm.clone(),
+            DevWeight::F32 {
+                w: DeviceTensor::zeroed(&stream, 1, 256).expect("norm"),
+                k: 256,
+            },
+        )
+        .expect("norm name");
+        for (name, rows) in [
+            (&names.attn_q, 128),
+            (&names.attn_kv_a_mqa, 288),
+            (&names.attn_kv_b, 128),
+            (&names.ffn_gate, 256),
+        ] {
+            w.insert_derived(
+                name.clone(),
+                DevWeight::KQuant {
+                    ty: GgmlType::Q3_K,
+                    w: DeviceTensor::zeroed(&stream, rows, 28).expect("weight"),
+                    k: 256,
+                },
+            )
+            .expect("weight name");
+        }
+        w.insert_derived(
+            names.derived.clone(),
+            DevWeight::Q8_0Derived {
+                qs: DeviceTensor::zeroed(&stream, 512, 8).expect("derived codes"),
+                d: DeviceTensor::zeroed(&stream, 512, 1).expect("derived scales"),
+                k: 32,
+            },
+        )
+        .expect("derived name");
+        let mla = MlaParams {
+            n_head: 2,
+            kq_head: 64,
+            nope: 32,
+            rope_dims: 32,
+            v_head: 32,
+            latent: 256,
+            eps: 1e-6,
+            rope: RopeParams {
+                n_dims: 32,
+                freq_base: 10_000.0,
+                freq_scale: 1.0,
+                ext_factor: 1.0,
+                mscale_param: 1.0,
+                corr_dims: [0.0, 1.0],
+                theta_scale: 10_000.0f32.powf(-2.0 / 32.0),
+            },
+            kq_scale: 0.125,
+        };
+        let before = Arc::strong_count(&ctx);
+        crate::tensor::FAIL_ALLOCATION.set(Some("LayerScratch::x"));
+        let result = LayerScratch::new(&ctx, &stream, &w, &mla, &[names], None, 256);
+        assert!(crate::tensor::FAIL_ALLOCATION.get().is_none(), "x reached");
+        assert!(matches!(
+            result,
+            Err(GpuError::State {
+                what: "LayerScratch::x",
+                ..
+            })
+        ));
+        let after = Arc::strong_count(&ctx);
+        eprintln!("scratch allocation failure context handles: before {before} after {after}");
+        assert_eq!(after, before, "a refused scratch leaves no context handle");
     }
 }
 

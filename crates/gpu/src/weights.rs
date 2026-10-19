@@ -191,6 +191,7 @@ fn held<T: cuda_core::DeviceCopy>(t: &DeviceTensor<T>) -> usize {
 /// `layers`, what the architecture derives for those blocks, and — when
 /// loaded with globals — the non-block tensors. Load-time only; per-step
 /// code reads through `get` and never allocates.
+#[cfg_attr(test, derive(Default))]
 pub struct Weights {
     by_name: BTreeMap<String, DevWeight>,
     /// The file ties its head to the token embedding ([`head_tensor`]): `output.weight` is the

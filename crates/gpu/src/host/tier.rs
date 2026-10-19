@@ -81,7 +81,7 @@ use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::step::{Boundary, Chain, RELEASE};
 use crate::fault::{FAULT_NONE, Fault};
 use crate::graph::{Graph, cu, mem_batch, op_add, op_barrier_sys, op_wait_geq};
-use crate::tensor::window;
+use crate::tensor::{WindowMut, window};
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError, Q8Act};
 use bloomery_levers::TierLink;
@@ -2421,20 +2421,16 @@ impl Parts<'_> {
         if copy_fault {
             let ctx = self.gpu.context();
             // SAFETY: the fault copy's two words lie in this tier's flag
-            // lines; the window is used for this launch only and never
-            // dropped as a buffer (its raw parts are, below).
-            let mut out =
-                unsafe { window::<u32>(end.dev(layout.word_off(t, TWord::Fault)), 2, ctx) };
+            // lines, which outlive the window; it is used for this launch
+            // only, and its drop frees nothing.
+            let mut out = unsafe {
+                WindowMut::<u32>::from_raw(end.dev(layout.word_off(t, TWord::Fault)), 2, ctx)
+            };
             let prep = self
                 .module
                 .prepare_tier_fault_copy(LaunchConfig1D::new(1, 32, 0))?;
-            let r =
-                self.module
-                    .tier_fault_copy(stream, &prep, self.gpu.unlabelled_sink(), &mut out);
-            // SAFETY: the window is taken once, here; its raw parts are
-            // dropped and nothing is freed.
-            unsafe { drop(ManuallyDrop::take(&mut out).into_raw_parts()) };
-            r?;
+            self.module
+                .tier_fault_copy(stream, &prep, self.gpu.unlabelled_sink(), &mut out)?;
         }
         // SAFETY: this tier's counter of row `row` and its progress word lie
         // in the page (row checked above), which the host tier drops after

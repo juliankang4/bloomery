@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::host::swap_source::{Convert, FileStacks};
-use bloomery_gpu::{GpuError, launch_u32, window};
+use bloomery_gpu::{GpuError, WindowMut, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D, sys};
 use cuda_device::vector::U32x4;
 use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread};
@@ -540,7 +540,7 @@ impl R8Kernels {
         // holds `words` words and stays allocated until the copy stream has
         // drained, of this context; only this stream touches it while the
         // unpack runs.
-        let mut part = unsafe { window::<u32>(at, words, &self.ctx) };
+        let mut part = unsafe { WindowMut::<u32>::from_raw(at, words, &self.ctx) };
         let grid = launch_u32(WHAT, "grid", groups.min(GROUP_BLOCKS))?;
         let (groups32, nb32) = (
             launch_u32(WHAT, "groups", groups)?,

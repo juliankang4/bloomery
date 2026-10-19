@@ -2,9 +2,8 @@
 
 use crate::{GateError, bits_equal, verdict};
 use bloomery_gpu::flash_gqa_prefill::GqaPrefillArgs;
-use bloomery_gpu::{Gpu, GpuError, window};
+use bloomery_gpu::{Gpu, GpuError, Window};
 use cuda_core::{CudaStream, DeviceBuffer};
-use std::mem::ManuallyDrop;
 
 /// Host values of the f16 cache planes.
 pub struct HostCache {
@@ -117,19 +116,12 @@ pub fn window_refusals(
     let q_pad = DeviceBuffer::from_host(stream, &[&[0.0f32; 2][..], q].concat())?;
     let k_pad = DeviceBuffer::from_host(stream, &[&[0u16; 8][..], kb].concat())?;
     let v_pad = DeviceBuffer::from_host(stream, &[&[0u16; 8][..], vb].concat())?;
-    let cx = gpu.context();
-    // SAFETY: two f32 of padding cover the offset and q.len(); q_pad outlives the window.
-    let q_al = unsafe { window::<f32>(q_pad.cu_deviceptr() + 8, q.len(), cx) };
-    // SAFETY: one f32 offset plus q.len() is inside q_pad, which outlives the window.
-    let q_mis = unsafe { window::<f32>(q_pad.cu_deviceptr() + 4, q.len(), cx) };
-    // SAFETY: eight f16 of padding cover the offset and kb.len(); k_pad outlives the window.
-    let k_al = unsafe { window::<u16>(k_pad.cu_deviceptr() + 16, kb.len(), cx) };
-    // SAFETY: four f16 offset plus kb.len() is inside k_pad, which outlives the window.
-    let k_mis = unsafe { window::<u16>(k_pad.cu_deviceptr() + 8, kb.len(), cx) };
-    // SAFETY: eight f16 of padding cover the offset and vb.len(); v_pad outlives the window.
-    let v_al = unsafe { window::<u16>(v_pad.cu_deviceptr() + 16, vb.len(), cx) };
-    // SAFETY: four f16 offset plus vb.len() is inside v_pad, which outlives the window.
-    let v_mis = unsafe { window::<u16>(v_pad.cu_deviceptr() + 8, vb.len(), cx) };
+    let q_al = Window::<f32>::of(&q_pad, 8, q.len())?;
+    let q_mis = Window::<f32>::of(&q_pad, 4, q.len())?;
+    let k_al = Window::<u16>::of(&k_pad, 16, kb.len())?;
+    let k_mis = Window::<u16>::of(&k_pad, 8, kb.len())?;
+    let v_al = Window::<u16>::of(&v_pad, 16, vb.len())?;
+    let v_mis = Window::<u16>::of(&v_pad, 8, vb.len())?;
     let mut ya = DeviceBuffer::from_host(stream, &vec![f32::NAN; y.len()])?;
     enqueue(
         stream,
@@ -192,12 +184,6 @@ pub fn window_refusals(
             verdict(named)
         );
         ok &= named;
-    }
-    for w in [q_al, q_mis] {
-        drop(ManuallyDrop::into_inner(w).into_raw_parts());
-    }
-    for w in [k_al, k_mis, v_al, v_mis] {
-        drop(ManuallyDrop::into_inner(w).into_raw_parts());
     }
     Ok(ok)
 }

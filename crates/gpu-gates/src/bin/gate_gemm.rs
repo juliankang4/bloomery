@@ -5754,11 +5754,7 @@ mod gate {
             let d_wide =
                 DeviceTensor::upload(stream, &vec![0u16; rows * (k / 32 + 1)], rows, k / 32 + 1)?;
             // `x` from its second value: 4 bytes past a 16-byte boundary.
-            // SAFETY: values 1 .. 1 + 4·k of `x` (8·k values) lie inside it,
-            // f32-aligned; `x` stays in place while the window lives (the
-            // refused call reads nothing).
-            let x_off =
-                unsafe { bloomery_gpu::window::<f32>(x.cu_deviceptr() + 4, 4 * k, x.context()) };
+            let x_off = bloomery_gpu::Window::<f32>::of(&x, 4, 4 * k)?;
             let gemm = |w: Gemm32Weight<'_>,
                         rows_per_expert: usize,
                         act: &GemmAct32,

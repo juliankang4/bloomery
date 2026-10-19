@@ -32,7 +32,7 @@ use bloomery_gpu::host::swap::{
     CardTable, PassReport, ResetReport, Residency, SlotState, SwapMachine, SwapSource,
 };
 use bloomery_gpu::host::swap_source::FileSwap;
-use bloomery_gpu::{Gpu, window};
+use bloomery_gpu::{Gpu, WindowMut};
 use bloomery_gpu_gates::generate::{Residence, ServeFeed, slot_table};
 use bloomery_gpu_gates::{GateError, verdict};
 use model::placement::Machine;
@@ -164,7 +164,7 @@ pub fn transform_check(
                 // SAFETY: `at` is slot `slot` of layer `l`'s stack `part`,
                 // which holds `want.len()` bytes there and stays allocated
                 // while the model lives.
-                let view = unsafe { window::<u32>(at, want.len() / 4, gpu.context()) };
+                let view = unsafe { WindowMut::<u32>::from_raw(at, want.len() / 4, gpu.context()) };
                 let mut got = vec![0u32; want.len() / 4];
                 view.copy_to_host(stream, &mut got)?;
                 let got: Vec<u8> = got.iter().flat_map(|w| w.to_le_bytes()).collect();

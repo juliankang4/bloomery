@@ -17,11 +17,10 @@ use crate::graph::{
     MappedHost, capturing, mem_batch, op_add, op_barrier_sys, op_wait_geq, op_write,
 };
 use crate::kquant::sel::ARENA_PARTS;
-use crate::tensor::window;
+use crate::tensor::WindowMut;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
 use model::ops::DEFER_MAX_COLS;
 use model::{Tensor2, Tensor2View};
-use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -119,10 +118,10 @@ pub(crate) struct RowPage {
     /// Byte offsets of the image and of the sum in the page.
     image_off: usize,
     hsum_off: usize,
-    image: ManuallyDrop<DeviceBuffer<u32>>,
+    image: WindowMut<'static, u32>,
     /// The row's host experts' weighted sum, read in place through the
     /// mapping.
-    pub(crate) hsum: ManuallyDrop<DeviceBuffer<f32>>,
+    pub(crate) hsum: WindowMut<'static, f32>,
 }
 
 /// The card side of the boundary, allocated once at load (decision 4 of
@@ -143,12 +142,12 @@ pub struct Boundary {
     pub(crate) arena: Option<ArenaLeg>,
     /// Windows into `region` — what the norm and the router write in place
     /// of the MoE arena's own buffers on a hybrid layer.
-    pub(crate) normed: ManuallyDrop<DeviceBuffer<f32>>,
-    pub(crate) ids: ManuallyDrop<DeviceBuffer<u32>>,
-    pub(crate) weights: ManuallyDrop<DeviceBuffer<f32>>,
+    pub(crate) normed: WindowMut<'static, f32>,
+    pub(crate) ids: WindowMut<'static, u32>,
+    pub(crate) weights: WindowMut<'static, f32>,
     /// The region's sequence word: what a chain's own launch copies into a
     /// row's image in place of the copy node ([`Boundary::handoff_target`]).
-    seq: ManuallyDrop<DeviceBuffer<u32>>,
+    seq: WindowMut<'static, u32>,
     /// Per row, its image and sum in the page; never empty. A one-row
     /// chain reads row 0's sum as `pages[0].hsum`.
     pub(crate) pages: Vec<RowPage>,
@@ -171,32 +170,6 @@ pub struct HandoffTarget<'a> {
     /// words; the launch writes every field of it.
     pub image: &'a mut DeviceBuffer<u32>,
     pub layout: HandoffLayout,
-}
-
-impl Drop for RowPage {
-    fn drop(&mut self) {
-        // SAFETY: each window is taken once, here, and never read again; its
-        // raw parts are dropped (the context handle with them) and no memory
-        // is freed — the boundary's page frees its allocation after the rows.
-        unsafe {
-            drop(ManuallyDrop::take(&mut self.image).into_raw_parts());
-            drop(ManuallyDrop::take(&mut self.hsum).into_raw_parts());
-        }
-    }
-}
-
-impl Drop for Boundary {
-    fn drop(&mut self) {
-        // SAFETY: each window is taken once, here, and never read again; its
-        // raw parts are dropped (the context handle with them) and no memory
-        // is freed — `region` frees the allocation after this.
-        unsafe {
-            drop(ManuallyDrop::take(&mut self.normed).into_raw_parts());
-            drop(ManuallyDrop::take(&mut self.ids).into_raw_parts());
-            drop(ManuallyDrop::take(&mut self.weights).into_raw_parts());
-            drop(ManuallyDrop::take(&mut self.seq).into_raw_parts());
-        }
-    }
 }
 
 impl Boundary {
@@ -252,14 +225,16 @@ impl Boundary {
         // activation); `region` moves into the boundary beside the window (a
         // move of the handle, not of the allocation), where it outlives it
         // and is never reallocated.
-        let ids = unsafe { window::<u32>(base + 4 * h.ids as u64, h.n_used, ctx) };
+        let ids = unsafe { WindowMut::<u32>::from_raw(base + 4 * h.ids as u64, h.n_used, ctx) };
         // SAFETY: as above, for the weights' n_used words at `h.weights`.
-        let weights = unsafe { window::<f32>(base + 4 * h.weights as u64, h.n_used, ctx) };
+        let weights =
+            unsafe { WindowMut::<f32>::from_raw(base + 4 * h.weights as u64, h.n_used, ctx) };
         // SAFETY: as above, for the activation's `cols · hidden` words at
         // `h.x`, the region's tail.
-        let normed = unsafe { window::<f32>(base + 4 * h.x as u64, layout.hsum_len(), ctx) };
+        let normed =
+            unsafe { WindowMut::<f32>::from_raw(base + 4 * h.x as u64, layout.hsum_len(), ctx) };
         // SAFETY: as for the ids, for the sequence's one word at `h.seq`.
-        let seq = unsafe { window::<u32>(base + 4 * h.seq as u64, 1, ctx) };
+        let seq = unsafe { WindowMut::<u32>::from_raw(base + 4 * h.seq as u64, 1, ctx) };
         let pages = (0..rows)
             .map(|r| {
                 let (image_off, hsum_off) = layout
@@ -274,8 +249,8 @@ impl Boundary {
                 // and is freed only when the boundary drops.
                 let (image, hsum) = unsafe {
                     (
-                        window::<u32>(page.dev_at(image_off), words, ctx),
-                        window::<f32>(page.dev_at(hsum_off), layout.hsum_len(), ctx),
+                        WindowMut::<u32>::from_raw(page.dev_at(image_off), words, ctx),
+                        WindowMut::<f32>::from_raw(page.dev_at(hsum_off), layout.hsum_len(), ctx),
                     )
                 };
                 Ok(RowPage {
@@ -293,7 +268,11 @@ impl Boundary {
             weights,
             seq,
             pages,
-            sum: DeviceBuffer::<f32>::zeroed(stream, h.hidden)?,
+            sum: {
+                #[cfg(test)]
+                crate::tensor::allocation_failure("Boundary::sum")?;
+                DeviceBuffer::<f32>::zeroed(stream, h.hidden)?
+            },
             region,
             page,
             layout,
@@ -1595,5 +1574,27 @@ mod tests {
         eprintln!("boundary context handles: before {before} held {held} after {after}");
         assert!(held > before, "the boundary's buffers hold the context");
         assert_eq!(after, before, "a dropped boundary leaves no context handle");
+
+        crate::tensor::FAIL_ALLOCATION.set(Some("Boundary::sum"));
+        let result = Boundary::with_rows(&ctx, &stream, shape, 2);
+        assert!(
+            crate::tensor::FAIL_ALLOCATION.get().is_none(),
+            "sum reached"
+        );
+        assert!(matches!(
+            result,
+            Err(crate::GpuError::State {
+                what: "Boundary::sum",
+                ..
+            })
+        ));
+        let after_error = Arc::strong_count(&ctx);
+        eprintln!(
+            "boundary allocation failure context handles: before {before} after {after_error}"
+        );
+        assert_eq!(
+            after_error, before,
+            "a refused boundary leaves no context handle"
+        );
     }
 }

@@ -12,6 +12,7 @@
 //!   V4.1's part (2304 rows of 20 super-blocks: more groups than the unpack's
 //!   blocks, so each block walks several) and small ones with odd row widths
 //!   (a Q3_K block at two bytes past a word) and fewer groups than blocks.
+//!   The in-place unpack gives back the context handle its window took.
 //! - `refusal`: a part off a 16-byte boundary, rows wider than the unpack's
 //!   shared group and a part that is not a whole number of groups are each a
 //!   named error, and the part is unchanged.
@@ -27,6 +28,7 @@ mod gate {
     use bloomery_gpu_deepseek41::swap::R8Kernels;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use cuda_core::DeviceBuffer;
+    use std::sync::Arc;
 
     /// `sizeof(block_q3_K)`, and the words of one 8-row group super-block.
     const Q3K_BLOCK: usize = 110;
@@ -88,7 +90,9 @@ mod gate {
         let s = gpu.stream();
 
         let part = DeviceBuffer::from_host(s, &padded)?;
+        let handles = Arc::strong_count(gpu.context());
         k.enqueue_in_place(s, part.cu_deviceptr() + 4 * GUARD as u64, n, nb)?;
+        let released = Arc::strong_count(gpu.context()) == handles;
         let src = DeviceBuffer::from_host(s, &r8)?;
         let mut dst = DeviceBuffer::<u32>::zeroed(s, n)?;
         k.enqueue_reference(s, &src, &mut dst, nb)?;
@@ -103,15 +107,16 @@ mod gate {
 
         let vs_ref = first_diff(&group, &reference, nb);
         let vs_host = first_diff(&group, &host, nb);
-        let ok = vs_ref.is_none() && vs_host.is_none() && guards;
+        let ok = vs_ref.is_none() && vs_host.is_none() && guards && released;
         println!(
             "equal: {rows} rows x {nb} super-blocks ({} groups, {} B): group unpack vs \
-             ds41_r8_q3k {}, vs qdot::unpack_q3k_r8 {}, guard words {} {}",
+             ds41_r8_q3k {}, vs qdot::unpack_q3k_r8 {}, guard words {}, context handle {} {}",
             rows / 8,
             4 * n,
             vs_ref.as_deref().unwrap_or("equal"),
             vs_host.as_deref().unwrap_or("equal"),
             if guards { "untouched" } else { "WRITTEN" },
+            if released { "released" } else { "HELD" },
             verdict(ok)
         );
         Ok(ok)

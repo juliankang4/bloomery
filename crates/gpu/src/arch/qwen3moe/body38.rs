@@ -107,10 +107,11 @@ use super::program38::{
     Ctx38, Kernels38, Parts38, Pass38, RowsCopy, STEP_MEMOPS, Seqs38, SlotSeq38, Step38, Verify38,
     seq_launches, step_launches, verify_launches,
 };
-use super::scratch::{Io, LANE, LaneWord, RecStore, RopeRows, StepParams, f32_view, stamps_at};
+use super::scratch::{
+    Io, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, f32_view, stamps_at,
+};
 use super::scratch38::{
-    Arena38, LANES, PASS_ROWS, PassRecord, Store38, Taps38, VERIFY_ROWS, WideRecord, dims,
-    store_rule_bytes,
+    Arena38, LANES, PASS_ROWS, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, store_rule_bytes,
 };
 use super::slot_pass::SlotIn;
 use super::swap38::{self, DEADLINE, LIVE_DELAY};
@@ -999,7 +1000,7 @@ pub struct Body38 {
     s: Arena38,
     sp: StepParams,
     a: Arena38,
-    rp: PassRecord,
+    rp: PassRecord<PASS_ROWS>,
     pass_hsum: DeviceBuffer<f32>,
     k: Kernels38,
     /// The slot map's card copy, and the card leg over its card experts. The

@@ -92,8 +92,8 @@ use super::plan::{
 use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 use super::program::{Program, Tail};
 use super::scratch::{
-    ApartForms, Arena, Dims, Forms, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, LaneWord,
-    LayerStore, RecStore, RopeRows, StepParams, Wants, param_view, put_input,
+    ApartForms, Arena, Dims, Forms, KvPlanes, LANE, LaneWord, LayerStore, PassRecord, RecStore,
+    RopeRows, StepParams, Wants,
 };
 use super::slot_pass::SlotIn;
 use super::swap35;
@@ -118,7 +118,7 @@ use crate::model::{
 };
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, Order, file_site};
-use crate::tensor::{WindowMut, window};
+use crate::tensor::WindowMut;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
 use bloomery_levers::{ChurnHosting, HostCfg};
@@ -130,7 +130,6 @@ use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft, RopeMode};
 use model::placement::{Plan, WholeLoad, accepts};
 use runtime::seqstate::{Kept, Price, Why};
-use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
@@ -331,94 +330,6 @@ pub enum LayerKind35 {
     Delta,
 }
 
-/// A pass's input record — its first position, up to [`MAX_PASS_ROWS`] ids
-/// and the lane word — and the windows a captured pass of `m` rows reads.
-pub(super) struct RowsParams {
-    /// Ids `0..m` at `m − 1`.
-    ids: Vec<ManuallyDrop<DeviceBuffer<u32>>>,
-    pos0: ManuallyDrop<DeviceBuffer<u32>>,
-    lane: ManuallyDrop<DeviceBuffer<u32>>,
-    /// The rows the last write planned.
-    planned: Option<usize>,
-    inbox: Inbox,
-}
-
-/// The lane word's offset in a pass's record, after its ids.
-const RP_LANE: usize = IN_IDS + MAX_PASS_ROWS;
-/// Words of a pass's record.
-const RP_WORDS: usize = RP_LANE + 1;
-
-impl RowsParams {
-    fn new(stream: &CudaStream) -> Result<RowsParams, GpuError> {
-        let inbox = Inbox::new(stream, RP_WORDS)?;
-        // SAFETY: every window lies inside the inbox's `RP_WORDS` device
-        // words (`IN_IDS + m <= RP_LANE < RP_WORDS`, `IN_POS0 < RP_WORDS`),
-        // and the inbox moves into the struct beside them (a move of the
-        // handle, not of the allocation), where it outlives them.
-        let (ids, pos0, lane) = unsafe {
-            (
-                (1..=MAX_PASS_ROWS)
-                    .map(|m| param_view::<u32>(inbox.dev(), IN_IDS, m))
-                    .collect(),
-                param_view::<u32>(inbox.dev(), IN_POS0, 1),
-                param_view::<u32>(inbox.dev(), RP_LANE, 1),
-            )
-        };
-        Ok(RowsParams {
-            ids,
-            pos0,
-            lane,
-            planned: None,
-            inbox,
-        })
-    }
-
-    /// Write `tokens` from position `pos` and the lane word, and enqueue the
-    /// record's copy. Asynchronous: the pass behind it reads it.
-    pub(super) fn write(
-        &mut self,
-        stream: &CudaStream,
-        tokens: &[u32],
-        pos: u32,
-    ) -> Result<(), GpuError> {
-        if !(1..=MAX_PASS_ROWS).contains(&tokens.len()) {
-            return Err(GpuError::shape(
-                "qwen35moe::RowsParams::write",
-                format!("{} rows; a pass takes 1..={MAX_PASS_ROWS}", tokens.len()),
-            ));
-        }
-        let host = self.inbox.host_mut()?;
-        put_input(host, tokens, pos)?;
-        host[RP_LANE] = LANE;
-        self.inbox.upload(stream, RP_WORDS)?;
-        self.planned = Some(tokens.len());
-        Ok(())
-    }
-
-    /// The input of a pass of `m` rows, as its first launch reads it.
-    pub(super) fn io(&self, m: usize) -> Result<Io<'_>, GpuError> {
-        let ids = m
-            .checked_sub(1)
-            .and_then(|i| self.ids.get(i))
-            .ok_or_else(|| {
-                GpuError::shape(
-                    "qwen35moe::RowsParams::io",
-                    format!("a pass of {m} rows (1..={MAX_PASS_ROWS})"),
-                )
-            })?;
-        Ok(Io {
-            ids,
-            pos0: &self.pos0,
-            first: 0,
-            lane: Some(&self.lane),
-        })
-    }
-
-    fn bytes(&self) -> usize {
-        self.inbox.bytes()
-    }
-}
-
 /// Everything Qwen3.6's chain owns on the device.
 pub struct Body35 {
     pub(super) vocab: usize,
@@ -439,7 +350,7 @@ pub struct Body35 {
     pub(super) sp: StepParams,
     /// A pass's arena of [`MAX_PASS_ROWS`] rows and its input record.
     pub(super) a: Arena,
-    pub(super) rp: RowsParams,
+    pub(super) rp: PassRecord<MAX_PASS_ROWS>,
     /// A pass of several slots' input records ([`SlotIn`]: each busy slot's
     /// first position and ids), the lane word every slot's rows read
     /// ([`LANE`], the one lane of each slot's own store), and the ranges the
@@ -1735,7 +1646,7 @@ impl Body35 {
         let mut s = Arena::with(stream, d, 1, forms)?;
         let sp = StepParams::new(stream, true)?;
         let mut a = Arena::with(stream, d, MAX_PASS_ROWS, forms)?;
-        let rp = RowsParams::new(stream)?;
+        let rp = PassRecord::new(stream)?;
         let slot_in = SlotIn::new(stream)?;
         let mut slot_lane = DeviceBuffer::<u32>::zeroed(stream, 1)?;
         slot_lane.copy_from_host(stream, &[LANE])?;
@@ -2258,27 +2169,6 @@ impl Body35 {
         std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
         std::mem::swap(&mut self.seq_rope, &mut seq.rope);
     }
-
-    /// Keep a copy of every layer's output residual after each layer of the
-    /// decode chain (`on`), or stop. Load-time allocation.
-    pub(super) fn set_taps(&mut self, stream: &CudaStream, on: bool) -> Result<(), GpuError> {
-        self.taps = None;
-        if on {
-            let hidden = self.s.dims.hidden;
-            let buf = DeviceBuffer::<f32>::zeroed(stream, self.plans.len() * hidden)?;
-            let rows = (0..self.plans.len())
-                .map(|l| {
-                    let ptr = buf.cu_deviceptr() + (l * hidden * size_of::<f32>()) as u64;
-                    // SAFETY: row `l` spans elements `l·hidden ..
-                    // (l+1)·hidden` of `buf`, which moves into the same
-                    // `TapRows` beside its windows and outlives them.
-                    unsafe { window(ptr, hidden, buf.context()) }
-                })
-                .collect();
-            self.taps = Some(TapRows { buf, rows });
-        }
-        Ok(())
-    }
 }
 
 /// Enqueue the decode chain at one row: layer 0 with the step's embedding,
@@ -2368,7 +2258,7 @@ fn enqueue_rows(
     let m = heads.len();
     // A capture records the launches only; the replay reads the record the
     // plan before it wrote, so only an eager pass needs one planned now.
-    if b.rp.planned != Some(m) && !crate::capturing(gpu.stream())? {
+    if b.rp.planned() != Some(m) && !crate::capturing(gpu.stream())? {
         return Err(GpuError::state(
             WHAT_ROWS,
             "a record planned for this pass's rows (plan_rows before the pass)",

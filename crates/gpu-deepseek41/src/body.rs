@@ -510,22 +510,29 @@ impl Shadows {
         } else {
             host_address(&host)?
         };
-        let windows = (0..layers)
+        // Every offset is checked before the first window is made, so no
+        // refusal leaves a window owing its release.
+        let starts = (0..layers)
             .map(|i| {
-                let at = u64::try_from(i * rows * width * size_of::<u16>()).map_err(|_| {
-                    GpuError::Shape {
+                (i * rows * width)
+                    .checked_mul(size_of::<u16>())
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .ok_or_else(|| GpuError::Shape {
                         what: WHAT,
                         detail: format!("ring shadow {i} starts past u64 bytes"),
-                    }
-                })?;
-                // SAFETY: the window spans rows i·rows .. (i + 1)·rows of the
-                // allocation's layers·rows (i < layers), which the card reaches
-                // from `base` on; the allocation lives in the same value as the
-                // window, and the drop gives the window back before it frees
-                // the allocation.
-                Ok(unsafe { DeviceTensor::window(base + at, rows, width, ctx) })
+                    })
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
+        let windows = starts
+            .into_iter()
+            // SAFETY: the window from shadow i's start `at` spans rows
+            // i·rows .. (i + 1)·rows of the allocation's layers·rows
+            // (i < layers, `i · rows · width` below `len`), which the card reaches
+            // from `base` on; the allocation lives in the same value as the
+            // window, and the drop gives the window back before it frees
+            // the allocation.
+            .map(|at| unsafe { DeviceTensor::window(base + at, rows, width, ctx) })
+            .collect();
         Ok(Shadows {
             windows,
             host,

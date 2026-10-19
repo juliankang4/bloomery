@@ -38,7 +38,7 @@ use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, KGemvKernels};
-use crate::tensor::window;
+use crate::tensor::WindowMut;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, Graph};
 use bloomery_levers::HostCfg;
@@ -52,7 +52,6 @@ use model::arch::qwen3moe::names::{self, token_embd};
 use model::placement::accepts::qwen3moe_dense;
 use model::placement::kernels::{self, SiteEntry};
 use model::placement::{Plan, WholeLoad};
-use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -181,7 +180,7 @@ pub struct Body {
     /// the scalar one after `GpuModel::set_flash_mma(false)`.
     pub(super) mma: bool,
     /// The per-layer output copies an instrument asked for
-    /// ([`Body::set_taps`]).
+    /// ([`TapRows::set`]).
     pub(super) taps: Option<TapRows>,
     /// A placed load's placed side ([`Placed`]); `None` on a whole-card
     /// load.
@@ -192,7 +191,34 @@ pub struct Body {
 /// that layer's output residual.
 pub(super) struct TapRows {
     pub(super) buf: DeviceBuffer<f32>,
-    pub(super) rows: Vec<ManuallyDrop<DeviceBuffer<f32>>>,
+    pub(super) rows: Vec<WindowMut<'static, f32>>,
+}
+
+impl TapRows {
+    /// Keep a copy of every layer's output residual after each layer of the
+    /// chain (`on`), or stop: `layers` rows of `hidden`. The copies are one
+    /// memcpy node per layer in a capture; the gates read them in eager
+    /// mode. Load-time allocation.
+    pub(super) fn set(
+        taps: &mut Option<Self>,
+        stream: &CudaStream,
+        layers: usize,
+        hidden: usize,
+        on: bool,
+    ) -> Result<(), GpuError> {
+        *taps = None;
+        if on {
+            let buf = DeviceBuffer::<f32>::zeroed(stream, layers * hidden)?;
+            let rows = (0..layers)
+                // SAFETY: row `l` spans elements `l·hidden .. (l+1)·hidden` of
+                // `buf`, which moves into the same `TapRows` beside its windows
+                // and outlives them.
+                .map(|l| unsafe { f32_view(&buf, l * hidden, hidden) })
+                .collect();
+            *taps = Some(Self { buf, rows });
+        }
+        Ok(())
+    }
 }
 
 /// One qwen3moe sequence's own state ([`Slots`]): its per-layer K/V planes,
@@ -616,28 +642,6 @@ fn needs_site_kernels(w: &Weights, plans: &[LayerPlan], placed: bool) -> bool {
 }
 
 impl Body {
-    /// Keep a copy of every layer's output residual after each layer of the
-    /// chain (`on`), or stop. The copies are one memcpy node per layer in a
-    /// capture; the gates read them in eager mode. Load-time allocation.
-    pub(super) fn set_taps(&mut self, stream: &CudaStream, on: bool) -> Result<(), GpuError> {
-        self.taps = None;
-        if on {
-            let hidden = self.s.dims.hidden;
-            let buf = DeviceBuffer::<f32>::zeroed(stream, self.plans.len() * hidden)?;
-            let rows = (0..self.plans.len())
-                .map(|l| {
-                    let ptr = buf.cu_deviceptr() + (l * hidden * size_of::<f32>()) as u64;
-                    // SAFETY: row `l` spans elements `l·hidden ..
-                    // (l+1)·hidden` of `buf`, which moves into the same
-                    // `TapRows` beside its windows and outlives them.
-                    unsafe { window(ptr, hidden, buf.context()) }
-                })
-                .collect();
-            self.taps = Some(TapRows { buf, rows });
-        }
-        Ok(())
-    }
-
     /// The flash pass this body runs: `true` for the tensor-core pass.
     #[must_use]
     pub fn flash_mma(&self) -> bool {

@@ -819,6 +819,22 @@ impl Q8Act {
 }
 
 #[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_ALLOCATION: std::cell::Cell<Option<&'static str>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn allocation_failure(what: &'static str) -> Result<(), GpuError> {
+    if FAIL_ALLOCATION.get() == Some(what) {
+        FAIL_ALLOCATION.set(None);
+        return Err(GpuError::state(what, "injected allocation failure"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -2032,7 +2032,8 @@ weekly-gpu-ds41-lost:
 
 # 상주 교체의 r8 → Q3_K 풀기(`ds41_r8_q3k_groups`, 그룹 하나를 블록 하나가 제자리에서): 무작위 r8 워드를 V4.1 파트
 # 모양(2304행 × 20 슈퍼블록)과 홀수 폭 작은 모양으로 풀어 참조 커널 `ds41_r8_q3k`와 `qdot::unpack_q3k_r8`의 바이트와
-# 같고 파트 밖 보호 워드를 건드리지 않는지, 잘못된 파트(16바이트 경계 밖, 21 슈퍼블록, 반 그룹)는 이름 붙은 오류인지 본다.
+# 같고 파트 밖 보호 워드를 건드리지 않으며 창이 잡은 컨텍스트 핸들을 돌려주는지, 잘못된 파트(16바이트 경계 밖, 21 슈퍼블록,
+# 반 그룹)는 이름 붙은 오류인지 본다.
 # 모델 파일 없음.
 gate-gpu-ds41-unpack:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_unpack && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_unpack'

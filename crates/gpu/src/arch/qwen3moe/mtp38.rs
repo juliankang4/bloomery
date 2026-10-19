@@ -111,7 +111,7 @@ use crate::q6k_ids::{Q6kIdsArgs, Q6kIdsKernels};
 use crate::q8f32::{GemvOut, Q8_0GemvIdsArgs, Q8_0GemvMcolArgs, Q8_0SelArgs};
 use crate::q38::{EmbedQ8Args, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
 use crate::rope_neox::PartialNeoxArgs;
-use crate::tensor::Q8Act;
+use crate::tensor::{Q8Act, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -121,7 +121,6 @@ use model::arch::models::MtpSource;
 use model::arch::models::headpick::HeadSet;
 use model::placement::Plan;
 use runtime::hc_gated::Geometry;
-use std::mem::ManuallyDrop;
 
 const WHAT: &str = "qwen4exp Mtp38";
 
@@ -1100,7 +1099,7 @@ impl StoreArena {
 struct MtpArena {
     /// The walk's record — `pos0`, then the rows' tokens — and its windows.
     inbox: Inbox,
-    pos0: ManuallyDrop<DeviceBuffer<u32>>,
+    pos0: WindowMut<'static, u32>,
     /// The hidden rows a [`MtpFeed::Rows`] walk reads, and the last row's
     /// token and streams a [`MtpFeed::Own`] walk reads.
     h_in: DeviceBuffer<f32>,

@@ -23,10 +23,10 @@ use crate::hc_gated::HcScratch;
 use crate::linear::{self, LinearShape};
 use crate::ple;
 use crate::qsa::{self, QsaScratch};
+use crate::tensor::WindowMut;
 use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::hc_gated::Geometry;
 use runtime::stores;
-use std::mem::ManuallyDrop;
 
 /// The most tokens an eager pass walks: the m-column kernels' width.
 pub(super) const PASS_ROWS: usize = 8;
@@ -459,97 +459,13 @@ impl Taps38 {
     }
 }
 
-/// An eager pass's input record — its first position, up to [`PASS_ROWS`]
-/// ids and the lane word — and the windows a pass of `m` rows reads.
-pub(super) struct PassRecord {
-    ids: Vec<ManuallyDrop<DeviceBuffer<u32>>>,
-    pos0: ManuallyDrop<DeviceBuffer<u32>>,
-    lane: ManuallyDrop<DeviceBuffer<u32>>,
-    inbox: Inbox,
-}
-
-/// The lane word's offset in a pass's record, after its ids.
-const PR_LANE: usize = IN_IDS + PASS_ROWS;
-/// Words of a pass's record.
-const PR_WORDS: usize = PR_LANE + 1;
-
-impl PassRecord {
-    /// A zeroed record. Load-time only.
-    pub(super) fn new(stream: &CudaStream) -> Result<PassRecord, GpuError> {
-        let inbox = Inbox::new(stream, PR_WORDS)?;
-        // SAFETY: every window lies inside the inbox's `PR_WORDS` device words
-        // (`IN_IDS + m <= PR_LANE < PR_WORDS`, `IN_POS0 < PR_WORDS`), and the
-        // inbox moves into the struct beside them (a move of the handle, not
-        // of the allocation), where it outlives them.
-        let (ids, pos0, lane) = unsafe {
-            (
-                (1..=PASS_ROWS)
-                    .map(|m| param_view::<u32>(inbox.dev(), IN_IDS, m))
-                    .collect(),
-                param_view::<u32>(inbox.dev(), IN_POS0, 1),
-                param_view::<u32>(inbox.dev(), PR_LANE, 1),
-            )
-        };
-        Ok(PassRecord {
-            ids,
-            pos0,
-            lane,
-            inbox,
-        })
-    }
-
-    /// Write `tokens` from position `pos` and the lane word, and enqueue the
-    /// record's copy. Asynchronous: the pass behind it reads it.
-    pub(super) fn write(
-        &mut self,
-        stream: &CudaStream,
-        tokens: &[u32],
-        pos: u32,
-    ) -> Result<(), GpuError> {
-        if !(1..=PASS_ROWS).contains(&tokens.len()) {
-            return Err(GpuError::shape(
-                "qwen4exp::PassRecord::write",
-                format!("{} rows; a pass takes 1..={PASS_ROWS}", tokens.len()),
-            ));
-        }
-        let host = self.inbox.host_mut()?;
-        put_input(host, tokens, pos)?;
-        host[PR_LANE] = LANE;
-        self.inbox.upload(stream, PR_WORDS)
-    }
-
-    /// The input of a pass of `m` rows, as its first launch reads it.
-    pub(super) fn io(&self, m: usize) -> Result<Io<'_>, GpuError> {
-        let ids = m
-            .checked_sub(1)
-            .and_then(|i| self.ids.get(i))
-            .ok_or_else(|| {
-                GpuError::shape(
-                    "qwen4exp::PassRecord::io",
-                    format!("a pass of {m} rows (1..={PASS_ROWS})"),
-                )
-            })?;
-        Ok(Io {
-            ids,
-            pos0: &self.pos0,
-            first: 0,
-            lane: Some(&self.lane),
-        })
-    }
-
-    /// Device bytes.
-    pub(super) fn bytes(&self) -> usize {
-        self.inbox.bytes()
-    }
-}
-
 /// A ubatch walk's input record — its first position, up to `rows` ids and
 /// the lane word — and the window of the ids its last write holds.
 pub(super) struct WideRecord {
     rows: usize,
-    ids: ManuallyDrop<DeviceBuffer<u32>>,
-    pos0: ManuallyDrop<DeviceBuffer<u32>>,
-    lane: ManuallyDrop<DeviceBuffer<u32>>,
+    ids: WindowMut<'static, u32>,
+    pos0: WindowMut<'static, u32>,
+    lane: WindowMut<'static, u32>,
     inbox: Inbox,
 }
 
@@ -605,9 +521,7 @@ impl WideRecord {
         // SAFETY: `IN_IDS + n <= IN_IDS + rows`, inside the inbox's device
         // words, which outlive the window (it lives in the struct beside
         // them).
-        let ids = unsafe { param_view::<u32>(self.inbox.dev(), IN_IDS, n) };
-        let old = std::mem::replace(&mut self.ids, ids);
-        drop(ManuallyDrop::into_inner(old).into_raw_parts());
+        self.ids = unsafe { param_view::<u32>(self.inbox.dev(), IN_IDS, n) };
         Ok(())
     }
 

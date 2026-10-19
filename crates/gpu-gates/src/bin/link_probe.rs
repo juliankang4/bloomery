@@ -83,7 +83,7 @@ mod probe {
         Crossing, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, link_tail,
     };
     use bloomery_gpu::{
-        Gpu, MappedHost, WindowMut, mem_batch, op_add, op_barrier_sys, op_wait_geq, window,
+        Gpu, MappedHost, WindowMut, mem_batch, op_add, op_barrier_sys, op_wait_geq,
     };
     use bloomery_gpu_gates::record::{LINK_GATHER, Record};
     use bloomery_gpu_gates::{Fnv1a64, GateError, verdict};
@@ -960,13 +960,14 @@ mod probe {
     }
 
     impl Stream<'_> {
-        /// A `u32` window of `bytes` bytes from byte `off` of the page.
-        fn span(&self, off: usize, bytes: usize) -> std::mem::ManuallyDrop<DeviceBuffer<u32>> {
+        /// A `u32` window of `bytes` bytes from byte `off` of the page; dropping it releases its
+        /// context handle.
+        fn span(&self, off: usize, bytes: usize) -> WindowMut<'_, u32> {
             // SAFETY: the span lies inside the page (the layout's own
             // regions), which is mapped into this context and outlives every
             // launch: the run drains the stream before the page drops, or
             // ends the process without dropping it.
-            unsafe { window::<u32>(self.dev + off as u64, bytes / 4, self.gpu.context()) }
+            unsafe { WindowMut::from_raw(self.dev + off as u64, bytes / 4, self.gpu.context()) }
         }
 
         /// One launch of [`link_kernels::lines`] for this rank: the stage

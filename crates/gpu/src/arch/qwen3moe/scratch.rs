@@ -35,12 +35,11 @@ use crate::rope_neox::{
     NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels,
     q8_plane_lens,
 };
-use crate::tensor::{Q8Act, window};
+use crate::tensor::{Q8Act, WindowMut};
 use crate::weights::q8_0_planes;
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
 use gguf::quant::f32_to_f16_bits;
 use model::quant::quantize_q8_0;
-use std::mem::ManuallyDrop;
 use std::ops::Range;
 
 pub(super) use crate::rope_table::RopeRows;
@@ -1172,7 +1171,7 @@ pub(super) struct Arena {
     /// output: the combine writes the next layer's input here.
     pub(super) x: DeviceBuffer<f32>,
     /// Row `t` of `x`, for `t` below `min(rows, GEMV_COLS)`.
-    pub(super) x_rows: Vec<ManuallyDrop<DeviceBuffer<f32>>>,
+    pub(super) x_rows: Vec<WindowMut<'static, f32>>,
     /// Row `t`'s position and live key count, which the embedding launch
     /// writes: the rope turns by the table's row `pos[t]` and appends there,
     /// the flash attends over `n_keys[t]` keys.
@@ -1186,9 +1185,9 @@ pub(super) struct Arena {
     /// launch — and a non-owning window onto each block of `rows` tokens.
     /// With an output gate the query block holds each head's `[q | gate]`.
     pub(super) qkv: DeviceBuffer<f32>,
-    pub(super) q: ManuallyDrop<DeviceBuffer<f32>>,
-    pub(super) k: ManuallyDrop<DeviceBuffer<f32>>,
-    pub(super) v: ManuallyDrop<DeviceBuffer<f32>>,
+    pub(super) q: WindowMut<'static, f32>,
+    pub(super) k: WindowMut<'static, f32>,
+    pub(super) v: WindowMut<'static, f32>,
     /// The normed and turned queries, `[rows][n_head][head]`, when the query
     /// block holds gates beside them (the rope writes them out of place);
     /// `None` when the rope turns `q` in place.
@@ -1330,12 +1329,12 @@ pub(super) struct GdnArena {
     pub(super) proj: DeviceBuffer<f32>,
     /// The four blocks, and the tails from `z` and from `b` a three- or
     /// two-matrix launch writes.
-    pub(super) x: ManuallyDrop<DeviceBuffer<f32>>,
-    pub(super) z: ManuallyDrop<DeviceBuffer<f32>>,
-    pub(super) b: ManuallyDrop<DeviceBuffer<f32>>,
-    pub(super) a: ManuallyDrop<DeviceBuffer<f32>>,
-    pub(super) from_z: ManuallyDrop<DeviceBuffer<f32>>,
-    pub(super) from_b: ManuallyDrop<DeviceBuffer<f32>>,
+    pub(super) x: WindowMut<'static, f32>,
+    pub(super) z: WindowMut<'static, f32>,
+    pub(super) b: WindowMut<'static, f32>,
+    pub(super) a: WindowMut<'static, f32>,
+    pub(super) from_z: WindowMut<'static, f32>,
+    pub(super) from_b: WindowMut<'static, f32>,
     /// A Q6_K q·k·v projection's output at more than one token, row-major
     /// as `q6k_gemv` writes it, for at most [`GEMV_COLS`] tokens; a copy
     /// puts it into `x` token-major. `None` on a one-row arena.
@@ -1358,7 +1357,7 @@ pub(super) struct GdnArena {
 /// a verify, whose row `j` writes lane `(c + j) mod lanes` (`each`), or one
 /// that writes the state after its last row back into lane `c`.
 pub(super) struct LaneRun {
-    pub(super) word: ManuallyDrop<DeviceBuffer<u32>>,
+    pub(super) word: WindowMut<'static, u32>,
     pub(super) each: bool,
 }
 
@@ -1420,7 +1419,7 @@ impl GdnArena {
 }
 
 /// Non-owning views of a [`LaneWord`]'s device word ([`LaneWord::with_views`]).
-pub(super) type LaneViews = Vec<ManuallyDrop<DeviceBuffer<u32>>>;
+pub(super) type LaneViews = Vec<WindowMut<'static, u32>>;
 
 /// The lane word every delta launch of a verifying load's walks reads: the
 /// lane that holds the committed state, which only a verify's commit moves
@@ -1428,7 +1427,7 @@ pub(super) type LaneViews = Vec<ManuallyDrop<DeviceBuffer<u32>>>;
 /// written by an asynchronous copy ahead of the launches that read it, over
 /// `lanes` lanes.
 pub(super) struct LaneWord {
-    word: ManuallyDrop<DeviceBuffer<u32>>,
+    word: WindowMut<'static, u32>,
     inbox: Inbox,
     lane: u32,
     lanes: usize,
@@ -1566,9 +1565,9 @@ pub(super) const LANE: u32 = 0;
 pub(super) struct StepParams {
     /// Non-owning windows into the inbox's device words: the token (the
     /// embedding's one id), the position word and the lane word.
-    token: ManuallyDrop<DeviceBuffer<u32>>,
-    pos0: ManuallyDrop<DeviceBuffer<u32>>,
-    lane: Option<ManuallyDrop<DeviceBuffer<u32>>>,
+    token: WindowMut<'static, u32>,
+    pos0: WindowMut<'static, u32>,
+    lane: Option<WindowMut<'static, u32>>,
     words: usize,
     inbox: Inbox,
 }
@@ -1650,8 +1649,106 @@ impl StepParams {
     }
 }
 
+/// A pass's input record — its first position, up to `ROWS` ids and the
+/// lane word after them — and the windows a pass of `m` rows reads, cut once
+/// at load so a captured pass of each width reads fixed addresses.
+pub(super) struct PassRecord<const ROWS: usize> {
+    /// Ids `0..m` at `m − 1`.
+    ids: Vec<WindowMut<'static, u32>>,
+    pos0: WindowMut<'static, u32>,
+    lane: WindowMut<'static, u32>,
+    /// The rows the last write planned.
+    planned: Option<usize>,
+    inbox: Inbox,
+}
+
+impl<const ROWS: usize> PassRecord<ROWS> {
+    /// The lane word's offset in the record, after its ids.
+    const LANE_AT: usize = IN_IDS + ROWS;
+    /// Words of the record.
+    const WORDS: usize = Self::LANE_AT + 1;
+
+    /// A zeroed record. Load-time only.
+    pub(super) fn new(stream: &CudaStream) -> Result<Self, GpuError> {
+        const { assert!(ROWS > 0, "a pass record holds at least one row") };
+        let inbox = Inbox::new(stream, Self::WORDS)?;
+        // SAFETY: every window lies inside the inbox's `WORDS` device words
+        // (`IN_IDS + m <= LANE_AT < WORDS`, `IN_POS0 < WORDS`), and the inbox
+        // moves into the struct beside them (a move of the handle, not of the
+        // allocation), where it outlives them.
+        let (ids, pos0, lane) = unsafe {
+            (
+                (1..=ROWS)
+                    .map(|m| param_view::<u32>(inbox.dev(), IN_IDS, m))
+                    .collect(),
+                param_view::<u32>(inbox.dev(), IN_POS0, 1),
+                param_view::<u32>(inbox.dev(), Self::LANE_AT, 1),
+            )
+        };
+        Ok(PassRecord {
+            ids,
+            pos0,
+            lane,
+            planned: None,
+            inbox,
+        })
+    }
+
+    /// Write `tokens` from position `pos` and the lane word, and enqueue the
+    /// record's copy. Asynchronous: the pass behind it reads it.
+    pub(super) fn write(
+        &mut self,
+        stream: &CudaStream,
+        tokens: &[u32],
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        if !(1..=ROWS).contains(&tokens.len()) {
+            return Err(GpuError::shape(
+                "qwen3moe::PassRecord::write",
+                format!("{} rows; a pass takes 1..={ROWS}", tokens.len()),
+            ));
+        }
+        let host = self.inbox.host_mut()?;
+        put_input(host, tokens, pos)?;
+        host[Self::LANE_AT] = LANE;
+        self.inbox.upload(stream, Self::WORDS)?;
+        self.planned = Some(tokens.len());
+        Ok(())
+    }
+
+    /// The rows the last write planned; `None` before the first.
+    pub(super) fn planned(&self) -> Option<usize> {
+        self.planned
+    }
+
+    /// The input of a pass of `m` rows, as its first launch reads it.
+    pub(super) fn io(&self, m: usize) -> Result<Io<'_>, GpuError> {
+        let ids = m
+            .checked_sub(1)
+            .and_then(|i| self.ids.get(i))
+            .ok_or_else(|| {
+                GpuError::shape(
+                    "qwen3moe::PassRecord::io",
+                    format!("a pass of {m} rows (1..={ROWS})"),
+                )
+            })?;
+        Ok(Io {
+            ids,
+            pos0: &self.pos0,
+            first: 0,
+            lane: Some(&self.lane),
+        })
+    }
+
+    /// Device bytes.
+    pub(super) fn bytes(&self) -> usize {
+        self.inbox.bytes()
+    }
+}
+
 /// A non-owning window of `len` `T` over `parent`, from element `off` of the
-/// parent's u32 grid.
+/// parent's u32 grid. Dropping it releases its context handle and frees
+/// nothing.
 ///
 /// # Safety
 ///
@@ -1662,13 +1759,14 @@ pub(super) unsafe fn param_view<T>(
     parent: &DeviceBuffer<u32>,
     off: usize,
     len: usize,
-) -> ManuallyDrop<DeviceBuffer<T>> {
+) -> WindowMut<'static, T> {
     let ptr = parent.cu_deviceptr() + (off * size_of::<u32>()) as u64;
     // SAFETY: the range is the caller's contract above, inside `parent`.
-    unsafe { window(ptr, len, parent.context()) }
+    unsafe { WindowMut::from_raw(ptr, len, parent.context()) }
 }
 
-/// A non-owning window of `len` f32 over `parent` from element `off`.
+/// A non-owning window of `len` f32 over `parent` from element `off`,
+/// released as [`param_view`]'s.
 ///
 /// # Safety
 ///
@@ -1678,10 +1776,10 @@ pub(super) unsafe fn f32_view(
     parent: &DeviceBuffer<f32>,
     off: usize,
     len: usize,
-) -> ManuallyDrop<DeviceBuffer<f32>> {
+) -> WindowMut<'static, f32> {
     let ptr = parent.cu_deviceptr() + (off * size_of::<f32>()) as u64;
     // SAFETY: the range is the caller's contract above, inside `parent`.
-    unsafe { window(ptr, len, parent.context()) }
+    unsafe { WindowMut::from_raw(ptr, len, parent.context()) }
 }
 
 impl Arena {
@@ -1817,7 +1915,7 @@ impl Arena {
     /// intermediates. Load-time only.
     pub(super) fn run_lanes(
         &mut self,
-        word: ManuallyDrop<DeviceBuffer<u32>>,
+        word: WindowMut<'static, u32>,
         each: bool,
     ) -> Result<(), GpuError> {
         let g = self.gdn.as_mut().ok_or(GpuError::state(
@@ -1890,4 +1988,40 @@ impl Arena {
 /// Device bytes of one quantized activation's planes.
 fn act_bytes(a: &Q8Act) -> usize {
     a.q3.num_bytes() + a.q4.num_bytes() + a.q6.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::body::TapRows;
+    use super::{Inbox, LaneWord, PassRecord, f32_view};
+    use cuda_core::DeviceBuffer;
+    use std::sync::Arc;
+
+    /// The views over the input words and the arena rows give back the
+    /// context handles they take: an upload, a lane word with its views, a
+    /// pass record, the layer taps and a row view leave the context's count
+    /// where it was.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_views_give_back_their_context_handles() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let mut inbox = Inbox::new(&stream, 4).expect("an inbox");
+        let rows = DeviceBuffer::<f32>::zeroed(&stream, 8).expect("the rows");
+        let before = Arc::strong_count(&ctx);
+        inbox.upload(&stream, 4).expect("an upload");
+        {
+            let _lane = LaneWord::with_views(&stream, 2, 3).expect("a lane word with three views");
+            let _record = PassRecord::<3>::new(&stream).expect("a pass record");
+            let mut taps = None;
+            TapRows::set(&mut taps, &stream, 3, 4, true).expect("three layer taps");
+            assert_eq!(taps.as_ref().map(|t| t.rows.len()), Some(3));
+            TapRows::set(&mut taps, &stream, 3, 4, true).expect("the taps again");
+            // SAFETY: values 4 .. 8 of `rows`, which outlives the view.
+            let _row = unsafe { f32_view(&rows, 4, 4) };
+        }
+        stream.synchronize().expect("the upload");
+        let after = Arc::strong_count(&ctx);
+        eprintln!("view context handles: before {before} after {after}");
+        assert_eq!(after, before, "the views leave no context handle");
+    }
 }

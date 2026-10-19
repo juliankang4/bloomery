@@ -29,11 +29,9 @@
 //! 4-byte words and a slot for each id a pass's rows can hold at once, or
 //! the leg is off for the load, by name ([`LegOff`]).
 
-use std::mem::ManuallyDrop;
-use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
+use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
 use model::moe::HostLayer;
 use model::ops::RowLayout;
@@ -51,7 +49,7 @@ use crate::kquant::sel::{ARENA_PARTS, ARENA_SKIP, GateUpAt, SelDownAt};
 use crate::q4k_sel::{Q4kSelKernels, QuantSel};
 use crate::q6k_sel::Q6kSelKernels;
 use crate::quant_sel::QuantSelKernels;
-use crate::tensor::window;
+use crate::tensor::WindowMut;
 use crate::{Gpu, GpuError, Q8Act};
 
 /// What the leg's errors name.
@@ -165,45 +163,6 @@ impl LegLayer {
     }
 }
 
-/// A window into memory another owner frees ([`window`]): the tier's arena,
-/// the leg's tables or the boundary's page. Its drop frees nothing.
-struct LegWindow<T>(ManuallyDrop<DeviceBuffer<T>>);
-
-impl<T> LegWindow<T> {
-    /// The window of the `len` `T` at `ptr`.
-    ///
-    /// # Safety
-    ///
-    /// [`window`]'s contract for that span.
-    unsafe fn new(ptr: sys::CUdeviceptr, len: usize, ctx: &Arc<CudaContext>) -> LegWindow<T> {
-        // SAFETY: the span is the caller's, under `window`'s contract.
-        LegWindow(unsafe { window::<T>(ptr, len, ctx) })
-    }
-}
-
-impl<T> Deref for LegWindow<T> {
-    type Target = DeviceBuffer<T>;
-
-    fn deref(&self) -> &DeviceBuffer<T> {
-        &self.0
-    }
-}
-
-impl<T> DerefMut for LegWindow<T> {
-    fn deref_mut(&mut self) -> &mut DeviceBuffer<T> {
-        &mut self.0
-    }
-}
-
-impl<T> Drop for LegWindow<T> {
-    fn drop(&mut self) {
-        // SAFETY: the window is taken once, here, and never read again; its
-        // raw parts are dropped and no memory is freed: the tier owns the
-        // arena, the leg the tables, the boundary its page.
-        drop(unsafe { ManuallyDrop::take(&mut self.0) }.into_raw_parts());
-    }
-}
-
 /// Byte offsets of a row's tables in the leg's mapped page: the offsets
 /// (`ARENA_PARTS` u64 a slot) then the places (one u32 a slot), each row at a
 /// 256-byte boundary.
@@ -217,11 +176,11 @@ struct TableAt {
 /// page its image's activation and routing weights and its sum.
 struct RowWindows {
     at: TableAt,
-    offs: LegWindow<u64>,
-    places: LegWindow<u32>,
-    x: LegWindow<f32>,
-    w: LegWindow<f32>,
-    hsum: LegWindow<f32>,
+    offs: WindowMut<'static, u64>,
+    places: WindowMut<'static, u32>,
+    x: WindowMut<'static, f32>,
+    w: WindowMut<'static, f32>,
+    hsum: WindowMut<'static, f32>,
 }
 
 /// The buffers the launches write, and per row a second window of its sum,
@@ -232,7 +191,7 @@ struct Scratch {
     act_h: Q8Act,
     down: DeviceBuffer<f32>,
     acc: DeviceBuffer<f32>,
-    sums: Vec<LegWindow<f32>>,
+    sums: Vec<WindowMut<'static, f32>>,
 }
 
 /// The card leg over the arena (module doc). Made at load
@@ -247,7 +206,7 @@ struct Scratch {
 pub struct ArenaLeg {
     /// Field order is drop order: the windows go before the tier and the
     /// tables whose memory they view.
-    arena: LegWindow<u32>,
+    arena: WindowMut<'static, u32>,
     rows: Vec<RowWindows>,
     /// The x's place, 0: the activation is quantized as the arena's column.
     x_place: DeviceBuffer<u32>,
@@ -351,24 +310,25 @@ impl ArenaLeg {
             // made at load and lives as long as the load (`ArenaLeg`'s doc),
             // so they outlive it and every graph that captured a launch over
             // it.
-            let offs = unsafe { LegWindow::new(tables.dev_at(at.offs), ARENA_PARTS * n_used, ctx) };
+            let offs =
+                unsafe { WindowMut::from_raw(tables.dev_at(at.offs), ARENA_PARTS * n_used, ctx) };
             // SAFETY: as for the offsets, for the row's `n_used` u32 places.
-            let places = unsafe { LegWindow::new(tables.dev_at(at.places), n_used, ctx) };
+            let places = unsafe { WindowMut::from_raw(tables.dev_at(at.places), n_used, ctx) };
             // SAFETY: the image's activation, `hidden` f32 at word `h.x`,
             // lies inside the boundary's page (its layout places it); the leg
             // sits in the boundary, so the page outlives the window and every
             // graph that captured a launch over it.
-            let x = unsafe { LegWindow::new(page.dev_at(image + 4 * h.x), hidden, ctx) };
+            let x = unsafe { WindowMut::from_raw(page.dev_at(image + 4 * h.x), hidden, ctx) };
             // SAFETY: as for the activation, for the image's `n_used` routing
             // weights at word `h.weights`.
-            let w = unsafe { LegWindow::new(page.dev_at(image + 4 * h.weights), n_used, ctx) };
+            let w = unsafe { WindowMut::from_raw(page.dev_at(image + 4 * h.weights), n_used, ctx) };
             // SAFETY: as for the activation, for the row's sum, `hidden` f32
             // at `hsum`.
-            let hsum_w = unsafe { LegWindow::new(page.dev_at(hsum), hidden, ctx) };
+            let hsum_w = unsafe { WindowMut::from_raw(page.dev_at(hsum), hidden, ctx) };
             // SAFETY: as for the sum, a second window of the same span: the
             // add reads value `i` and writes value `i` back, one thread a
             // value.
-            let sum = unsafe { LegWindow::new(page.dev_at(hsum), hidden, ctx) };
+            let sum = unsafe { WindowMut::from_raw(page.dev_at(hsum), hidden, ctx) };
             rows.push(RowWindows {
                 at,
                 offs,
@@ -383,7 +343,7 @@ impl ArenaLeg {
         // allocation the card maps; the leg holds the tier and is made at
         // load and lives as long as the load, so the memory outlives the
         // window and every graph that captured a launch over it.
-        let arena = unsafe { LegWindow::new(dev0, words, ctx) };
+        let arena = unsafe { WindowMut::from_raw(dev0, words, ctx) };
         let stream = gpu.stream();
         let word = gpu.fault_word();
         let mut leg = ArenaLeg {

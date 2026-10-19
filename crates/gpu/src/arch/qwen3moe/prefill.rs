@@ -57,10 +57,10 @@ use super::wide::GEMV_COLS;
 use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::model::{GpuModel, StepMode};
+use crate::tensor::WindowMut;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
-use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 
@@ -99,8 +99,8 @@ pub(super) struct Prefill {
 /// One pass's windows onto a block, owned so that the arena can be borrowed
 /// beside them.
 pub(super) struct Windows {
-    ids: ManuallyDrop<DeviceBuffer<u32>>,
-    pos0: ManuallyDrop<DeviceBuffer<u32>>,
+    ids: WindowMut<'static, u32>,
+    pos0: WindowMut<'static, u32>,
 }
 
 impl Windows {

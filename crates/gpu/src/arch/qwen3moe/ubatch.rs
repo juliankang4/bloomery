@@ -66,10 +66,10 @@ use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmW
 use crate::model::GpuModel;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::site::WideActsMut;
+use crate::tensor::WindowMut;
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
-use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::time::Duration;
@@ -487,7 +487,7 @@ impl Ubatch {
 
     /// Row `t − 1` of the arena's residual: the last token's output after
     /// the last layer, the head's input.
-    pub(super) fn last_row(&self, t: usize) -> Result<ManuallyDrop<DeviceBuffer<f32>>, GpuError> {
+    pub(super) fn last_row(&self, t: usize) -> Result<WindowMut<'static, f32>, GpuError> {
         let (x, rows, h) = match &self.a {
             UbRows::Whole(a) => (&a.x, a.rows, a.dims.hidden),
             UbRows::Placed(a) => (&a.x, a.rows, a.dims.hidden),

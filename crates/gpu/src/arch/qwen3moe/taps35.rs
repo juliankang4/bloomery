@@ -328,7 +328,13 @@ impl GpuModel<Body35> {
     pub fn set_layer_taps(&mut self, on: bool) -> Result<(), GpuError> {
         self.set_mode(StepMode::Eager);
         let (gpu, _, body) = self.body_parts("qwen35moe::set_layer_taps")?;
-        body.set_taps(gpu.stream(), on)
+        super::body::TapRows::set(
+            &mut body.taps,
+            gpu.stream(),
+            body.plans.len(),
+            body.s.dims.hidden,
+            on,
+        )
     }
 
     /// Every layer's output residual from the last step, layer by layer.

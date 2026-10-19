@@ -180,7 +180,7 @@ mod gate {
         FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, KEY_TILE as PREF_TILE, SplitScratch,
     };
     use bloomery_gpu::weights::q8_0_planes;
-    use bloomery_gpu::{Gpu, GpuError, window};
+    use bloomery_gpu::{Gpu, GpuError, Window};
     use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn, judge_prefill, prefill_bound};
     use bloomery_gpu_gates::prefill_gate::{HostCache, WindowCase, cache, window_refusals};
     use bloomery_gpu_gates::qwen3moe::dev::{SENTINEL_Q8_CODE, SENTINEL_Q8_SCALE};
@@ -195,7 +195,6 @@ mod gate {
     use model::arch::Arch;
     use model::arch::deepseek2::attn::quantize_q8_0;
     use model::arch::qwen3moe::hparams::Hparams;
-    use std::mem::ManuallyDrop;
 
     /// An f16 NaN the padded rows are overwritten with.
     const NAN16: u16 = 0x7e00;
@@ -1502,11 +1501,7 @@ mod gate {
             stream,
             &[&[0u32; 2][..], &c.kq.to_host_vec(stream)?].concat(),
         )?;
-        let cu = gpu.context();
-        // SAFETY: the window is `kq.len()` u32 starting 8 bytes into `pad`,
-        // inside its own live allocation, which holds two u32 more than the
-        // span; the window is given back after the refusal it checks.
-        let k_mis = unsafe { window::<u32>(pad.cu_deviceptr() + 8, c.kq.len(), cu) };
+        let k_mis = Window::<u32>::of(&pad, 8, c.kq.len())?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
         let r = kp.enqueue_q8(
             stream,
@@ -1538,7 +1533,6 @@ mod gate {
             r.err().map_or("accepted".to_string(), |e| e.to_string()),
             verdict(named)
         );
-        drop(ManuallyDrop::into_inner(k_mis).into_raw_parts());
         Ok(named)
     }
 

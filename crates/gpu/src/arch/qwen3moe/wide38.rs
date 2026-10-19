@@ -175,13 +175,12 @@ use crate::q38::{
 };
 use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
-use crate::tensor::{DeviceTensor, Window};
+use crate::tensor::{DeviceTensor, Window, WindowMut};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use runtime::hc_gated::Geometry;
 use runtime::sched::{self, At, BatchOrder, LayerProgram, Overlap, PortKind};
 use runtime::splitwalk::{self, LoadKind, SplitCosts};
-use std::mem::ManuallyDrop;
 
 /// What the walk's errors name.
 const WHAT: &str = "qwen4exp ubatch walk";
@@ -242,8 +241,8 @@ pub(super) fn dense_rows(pos0: usize, m: usize, ctx: usize) -> Result<usize, Gpu
 }
 
 /// A non-owning window over a buffer, every one of [`UnitRows38`]'s: it frees
-/// nothing and dies with the unit.
-type Win<T> = ManuallyDrop<DeviceBuffer<T>>;
+/// nothing and dies with the unit, giving back its context handle.
+type Win<T> = WindowMut<'static, T>;
 
 /// The rows `r0 .. r0 + m` of a buffer of `stride` words a row, as the offset
 /// and the length in words of the window over them.
@@ -400,7 +399,7 @@ fn rows_of<T>(name: &str, parent: &DeviceBuffer<T>, at: Span) -> Result<Win<T>, 
     let ptr = parent.cu_deviceptr() + (at.off * size_of::<T>()) as u64;
     // SAFETY: the window's words lie inside `parent` (checked above), which
     // the walk that holds the window keeps alive and in place.
-    Ok(unsafe { crate::tensor::window(ptr, at.len, parent.context()) })
+    Ok(unsafe { WindowMut::from_raw(ptr, at.len, parent.context()) })
 }
 
 /// One unit of a walk: its `m` rows from the walk's row `r0`, as windows of
@@ -512,25 +511,27 @@ impl UnitRows38 {
 /// weights again.
 struct UnitHc<'s> {
     hc: &'s mut HcWideScratch,
-    own: Option<DeviceBuffer<f32>>,
+    /// The unit's window with the scratch's own buffer swapped into it, the
+    /// window's buffer standing in `hc` meanwhile; the drop swaps them back.
+    own: Option<Win<f32>>,
 }
 
 impl<'s> UnitHc<'s> {
     /// `hc` with the unit's rows `wgt` of its combine weights in place of
     /// the whole buffer; refused by name past the buffer's rows.
     fn on(hc: &'s mut HcWideScratch, wgt: Span) -> Result<UnitHc<'s>, GpuError> {
-        let w = rows_of("the mixes' combine weights", &hc.wgt, wgt)?;
-        let own = std::mem::replace(&mut hc.wgt, ManuallyDrop::into_inner(w));
+        let mut own = rows_of("the mixes' combine weights", &hc.wgt, wgt)?;
+        std::mem::swap(&mut hc.wgt, &mut *own);
         Ok(UnitHc { hc, own: Some(own) })
     }
 }
 
 impl Drop for UnitHc<'_> {
     fn drop(&mut self) {
-        if let Some(own) = self.own.take() {
-            // The window frees nothing: its parts are given back, the words
-            // stay the scratch's own buffer's.
-            drop(std::mem::replace(&mut self.hc.wgt, own).into_raw_parts());
+        if let Some(mut own) = self.own.take() {
+            // The scratch takes its own buffer back; the window, its own
+            // buffer again, frees nothing as it drops.
+            std::mem::swap(&mut self.hc.wgt, &mut *own);
         }
     }
 }
@@ -2806,5 +2807,20 @@ mod tests {
         assert_eq!(at(4096, SplitWalk::Rule, 512).unwrap(), [2048, 2048]);
         assert_eq!(at(512, SplitWalk::Rule, 512).unwrap(), [512]);
         assert_eq!(at(4096, SplitWalk::Rule, 0).unwrap(), [4096]);
+    }
+
+    /// A unit's window gives back the context handle it takes when it drops.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_unit_window_gives_back_its_context_handle() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let buf = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 8).expect("a buffer");
+        let before = std::sync::Arc::strong_count(&ctx);
+        {
+            let _rows = super::rows_of("rows", &buf, Span { off: 4, len: 4 }).expect("rows 4 .. 8");
+        }
+        let after = std::sync::Arc::strong_count(&ctx);
+        eprintln!("unit window context handles: before {before} after {after}");
+        assert_eq!(after, before, "the window leaves no context handle");
     }
 }

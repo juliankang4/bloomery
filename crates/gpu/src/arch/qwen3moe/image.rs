@@ -22,7 +22,6 @@ use crate::media::ImageSpan;
 use crate::tensor::{Window, WindowMut};
 use crate::{GpuError, capturing};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
-use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -71,9 +70,9 @@ pub(super) struct PromptImage {
 /// the lane word when the image has one, and the ids' offset in the prompt.
 /// Owned, so that the arena can be borrowed beside them.
 pub(super) struct ImageWindows {
-    ids: ManuallyDrop<DeviceBuffer<u32>>,
-    pos0: ManuallyDrop<DeviceBuffer<u32>>,
-    lane: Option<ManuallyDrop<DeviceBuffer<u32>>>,
+    ids: WindowMut<'static, u32>,
+    pos0: WindowMut<'static, u32>,
+    lane: Option<WindowMut<'static, u32>>,
     first: usize,
 }
 

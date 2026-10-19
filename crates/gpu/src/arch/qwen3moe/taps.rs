@@ -101,7 +101,13 @@ impl GpuModel<Body> {
     pub fn set_layer_taps(&mut self, on: bool) -> Result<(), GpuError> {
         self.set_mode(StepMode::Eager);
         let (gpu, _, body) = self.body_parts("qwen3moe::set_layer_taps")?;
-        body.set_taps(gpu.stream(), on)
+        super::body::TapRows::set(
+            &mut body.taps,
+            gpu.stream(),
+            body.plans.len(),
+            body.s.dims.hidden,
+            on,
+        )
     }
 
     /// Run the chain's attention on the tensor-core flash pass (`mma`, the

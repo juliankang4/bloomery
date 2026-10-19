@@ -26,13 +26,13 @@ use super::tier::{BlockRows, TierBlock, TierCard};
 use super::{Health, HostExperts, HostTier, Refusal, name_refusal, nanos, non_finite, unknown_id};
 use crate::fault::Fault;
 use crate::graph::{MappedHost, cu};
-use crate::tensor::window;
+use crate::tensor::WindowMut;
 use crate::{Gpu, GpuError, Q8Act};
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer, sys};
 use model::placement::Machine;
 use model::placement::workstation::{TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE};
 use model::{Tensor2, Tensor2View};
-use std::mem::{ManuallyDrop, size_of};
+use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -130,20 +130,11 @@ enum Leg {
 ///
 /// Field order is drop order: the window before the allocation it views.
 struct TierLeg {
-    rows_stage: ManuallyDrop<DeviceBuffer<f32>>,
+    rows_stage: WindowMut<'static, f32>,
     rows: MappedHost,
     tsel: PinnedHostBuffer<u32>,
     done: CudaEvent,
     leg: Leg,
-}
-
-impl Drop for TierLeg {
-    fn drop(&mut self) {
-        // SAFETY: the window is taken once, here, and never read again; its
-        // raw parts are dropped and nothing is freed — `rows` frees the
-        // allocation after it.
-        unsafe { drop(ManuallyDrop::take(&mut self.rows_stage).into_raw_parts()) };
-    }
 }
 
 /// One tier's side of the port: its two legs, one a set, and its staging on
@@ -274,7 +265,10 @@ impl BatchPort {
             // SAFETY: the window spans the `row_values` f32 of `rows`'s
             // allocation, which the leg keeps and frees only after the window
             // (field order).
-            let rows_stage = unsafe { window::<f32>(rows.dev_at(0), row_values, stage) };
+            let rows_stage =
+                unsafe { WindowMut::<f32>::from_raw(rows.dev_at(0), row_values, stage) };
+            #[cfg(test)]
+            crate::tensor::allocation_failure("BatchPort::tsel")?;
             let tsel = PinnedHostBuffer::<u32>::zeroed(stage, slots).map_err(|source| {
                 GpuError::Driver {
                     op: Some("cuMemAllocHost (the batch's tier places)"),
@@ -1745,4 +1739,34 @@ fn check_exclude(exclude: &[u32], slots: &SlotMap, layer: usize) -> Result<(), G
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_batch_gives_back_its_context_handle_on_allocation_failure() {
+        let gpu = Gpu::with_device(0).expect("CUDA device 0");
+        let ctx = gpu.context();
+        let mut port = BatchPort::new(ctx, 256, 2, 1).expect("a batch port");
+        let before = Arc::strong_count(ctx);
+        crate::tensor::FAIL_ALLOCATION.set(Some("BatchPort::tsel"));
+        let result = port.attach_tier(ctx, &gpu);
+        assert!(
+            crate::tensor::FAIL_ALLOCATION.get().is_none(),
+            "tsel reached"
+        );
+        assert!(matches!(
+            result,
+            Err(GpuError::State {
+                what: "BatchPort::tsel",
+                ..
+            })
+        ));
+        let after = Arc::strong_count(ctx);
+        eprintln!("batch allocation failure context handles: before {before} after {after}");
+        assert_eq!(after, before, "a refused tier leg leaves no context handle");
+    }
 }
