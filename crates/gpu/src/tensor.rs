@@ -136,6 +136,25 @@ impl<T> WindowMut<'_, T> {
             },
         })
     }
+
+    /// A window over `len` `T` at device address `ptr` in `ctx`, memory the
+    /// caller owns (a mapped page, a buffer it also writes through): the
+    /// launches read and write it as [`window`]'s, and dropping it releases
+    /// the context handle and frees nothing.
+    ///
+    /// # Safety
+    ///
+    /// [`window`]'s contract, and the caller orders every access to the
+    /// memory through this window against its other handles to it.
+    pub unsafe fn from_raw(ptr: sys::CUdeviceptr, len: usize, ctx: &Arc<CudaContext>) -> Self {
+        WindowMut {
+            window: Window {
+                // SAFETY: the range is the caller's contract.
+                buf: unsafe { window(ptr, len, ctx) },
+                _parent: PhantomData,
+            },
+        }
+    }
 }
 
 /// The checked cut the window constructors share: `len` `T` at `byte_off`,
@@ -813,6 +832,27 @@ mod tests {
                 && msg.contains("cols 2"),
             "the panic names the constructor and both values: {msg}"
         );
+    }
+
+    /// A window over raw memory releases the context handle it holds when it
+    /// drops and frees nothing: the buffer under it still reads back.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_raw_window_releases_its_context_handle() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let buf = DeviceBuffer::from_host(&stream, &[7u32; 4]).expect("a buffer");
+        let held = Arc::strong_count(&ctx);
+        // SAFETY: the window covers `buf`'s four values in `ctx`, which
+        // outlive it, and nothing is enqueued through it.
+        let w = unsafe { WindowMut::<u32>::from_raw(buf.cu_deviceptr(), 4, &ctx) };
+        assert_eq!(Arc::strong_count(&ctx), held + 1);
+        drop(w);
+        assert_eq!(
+            Arc::strong_count(&ctx),
+            held,
+            "the window's context handle released"
+        );
+        assert_eq!(buf.to_host_vec(&stream).expect("the buffer"), [7; 4]);
     }
 
     /// Four planes of 64 `u16` (a stride of 128 bytes) with the first 20 of

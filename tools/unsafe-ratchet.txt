@@ -324,7 +324,14 @@ gguf 9 2 0
 # q5_quantize_q8_rep and q5_quantize_q8_sel_relu_sqr (q5.rs) add their entries' call blocks, the shared per-slot
 # core q5_quant_slot (the one unsafe fn) its place read and its group call, and relu_sqr_quant32 (gemm/kernels32.rs)
 # its column load and its group call, each with its SAFETY line.
-gpu 1938 210 10
+# PIN(2026-10-19): gpu 1938 -> 1943 blocks, 210 -> 212 fns, new code, not old code relaxed: the link's all-gather
+# (host/link/gather.rs) adds 7 blocks over the tree's 1934: the rank-order sum's two windows over the page and the
+# sum's own output, and its card test's part window, post and wait batch and sum call, and the window over a part
+# and the sum into it that the test expects refused; the sum is an unsafe fn,
+# since it reads the caller's page. WindowMut::from_raw (tensor.rs), the windows' constructor that releases the
+# context handle on drop, is the other unsafe fn, with its one window block and its card test's window. Each block
+# has its SAFETY line.
+gpu 1943 212 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

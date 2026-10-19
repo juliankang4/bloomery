@@ -586,7 +586,7 @@ impl Half {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::thread::JoinHandle;
@@ -596,7 +596,7 @@ mod tests {
     use super::{Crossing, Half, Move, Page, PostCols, Reader, Relay, Span, TAIL_LINE, Wire};
     use crate::host::step::RELEASE;
 
-    struct Mem(Vec<AtomicU32>);
+    pub(in crate::host::link) struct Mem(pub(in crate::host::link) Vec<AtomicU32>);
 
     impl Page for Mem {
         fn word(&self, off: usize) -> &AtomicU32 {

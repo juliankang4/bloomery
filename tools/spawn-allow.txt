@@ -18,6 +18,7 @@ crates/gpu-gates/src/act_rule.rs 2 host references the gate binaries run; those 
 crates/gpu-gates/src/ik_q8_2.rs 1 a host reference the gate binaries run; those never pin
 crates/gpu-gates/src/lib.rs 1 par_map's workers, for the host references the gate binaries run; those never pin
 crates/gpu/src/graph.rs 2 the capture-race tests' second threads, from a libtest thread that is never pinned
+crates/gpu/src/host/link/gather.rs 1 the gather tests' model rank cards, from a libtest thread that is never pinned
 crates/gpu/src/host/link/pump.rs 1 the relay tests' model tier card, from a libtest thread that is never pinned
 crates/gpu/src/host/step.rs 1 the scalar go-wait test's host tier thread, from a libtest thread that is never pinned
 crates/gpu/src/linear/delta.rs 1 a host reference, called from tests only
