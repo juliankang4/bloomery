@@ -42,6 +42,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 69
 # shellcheck source=tools/nightly/units.sh
 source "$ROOT/tools/nightly/units.sh"
+# shellcheck source=tools/gate-bound.sh
+source "$ROOT/tools/gate-bound.sh" || exit 70 # run_unit's run_bounded
 
 say() { printf '%s\n' "$*" >&2; }
 

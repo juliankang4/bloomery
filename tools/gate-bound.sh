@@ -81,8 +81,39 @@ lease_stop() {
   return "$failed"
 }
 
-# run_bounded <command…>: the bounded command (`timeout … <binary>`) as a child the runner waits for,
-# returning a nonzero child status or, when the child succeeds, any cleanup failure.
+# group_clear <pgid>: KILL what is left of a process group whose leader has ended and wait, up to 2 s, until none of
+# it lives (zombies hold no descriptors). An empty group costs one kill. Returns 70 with a message when the KILL is
+# refused (as lease_stop, any error but a missing group), something outlives it, or the processes cannot be read. A
+# process that left the group (setsid) is not touched.
+group_clear() {
+  local i=0 live err
+  if ! err=$(LC_ALL=C kill -KILL -- "-$1" 2>&1); then
+    case $err in
+      *'No such process'*) return 0 ;;
+      *) printf '[bound] cannot clear process group %s: %s\n' "$1" "$err" >&2; return 70 ;;
+    esac
+  fi
+  while live=$(
+    set -o pipefail
+    ps -eo pgid=,stat= | awk -v g="$1" '$1 == g && $2 !~ /^Z/'
+  ); do
+    [ -n "$live" ] || return 0
+    if [ "$i" = 20 ]; then
+      echo "[bound] process group $1 still alive after its KILL" >&2
+      return 70
+    fi
+    sleep 0.1 9>&-
+    i=$((i + 1))
+  done
+  echo "[bound] cannot read processes while clearing process group $1" >&2
+  return 70
+}
+
+# run_bounded [--clear] <command…>: the bounded command (`timeout … <binary>`) as a child the runner waits for,
+# returning a nonzero child status or, when the child succeeds, any cleanup failure. With --clear, nothing of the
+# child's process group lives when it returns, by any path: group_clear KILLs what the command left there, while
+# this trap still holds a signal for the caller (tools/nightly/units.sh's run_unit). Without it, a process the
+# command leaves in its group lives on (tools/ref/lease-hold.sh reports one that keeps the lease).
 # The status contract is GNU coreutils timeout's: after a TERM from outside it returns the child's code.
 # uutils coreutils timeout 0.8.0 returns 143 there instead, so under it a cancelled run reports 143.
 # timeout runs the binary in a process group of its own, which a signal to the runner's group never
@@ -102,8 +133,12 @@ lease_stop() {
 # The caller's own traps on the three signals are back when it returns, and BIN_SIGNAL names the
 # signal that was passed on (empty: none), for a caller that stops on it.
 run_bounded() {
-  local traps='' saved s rc=0 BIN_PID='' BIN_SENT=''
+  local traps='' saved s rc=0 BIN_PID='' BIN_SENT='' clear='' group
   local LEASE_STOP_GRACE=${LEASE_STOP_GRACE:-9}
+  if [ "${1:-}" = --clear ]; then
+    clear=1
+    shift
+  fi
   # shellcheck disable=SC2034 # the caller reads it
   BIN_SIGNAL=
   case $LEASE_STOP_GRACE in
@@ -126,7 +161,9 @@ run_bounded() {
   fi
   wait "$BIN_PID" || true
   wait "$BIN_PID" || rc=$?
+  group=$BIN_PID
   BIN_PID=''
+  [ -z "$clear" ] || group_clear "$group" || [ "$rc" != 0 ] || rc=70
   eval "$traps"
   return "$rc"
 }
@@ -325,10 +362,13 @@ bounded_bg_wait() {
 #   output-filter      lease.sh --self-test, bounded-filter-open-term-*: the filter's guard stands before it starts
 #   no-group           a child that leads no process group of its own is stopped, and no other group is signalled
 #   nested-grace       two supervisors, one inside the other, finish inside the outer's budget (the inner's is half)
+#   natural-end        --clear: a command that ends by itself and leaves a process in its group: gone when
+#                      run_bounded returns (70 when the process table cannot be read then, or the KILL is refused);
+#                      an empty group is no error
 #   exit-handler       lease.sh --self-test, bounded-capture-exit-trap and bounded-out-clean: a runner's EXIT handler
 #                      that exits still runs the capture directory's cleanup
 gb_self_test() {
-  local self t bad=0 s0 form mode trp tag n left p
+  local self t bad=0 s0 form mode trp tag n left p path
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   # shellcheck source=tools/ref/cancel-stubs.sh
   source "${self%/*}/ref/cancel-stubs.sh"
@@ -364,16 +404,14 @@ case $FORM in
 esac
 echo after
 EOF
-  # alive <pid>: running, not a zombie.
-  alive() { local st; st=$(ps -o stat= -p "$1" 2> /dev/null) || return 1; case $st in '' | *Z*) return 1 ;; esac; }
   # leftover <pid file>: the names of the child, its monitor and its grandchild that still run.
   leftover() {
     local f=$1 sp ip gc left=''
     if [ -s "$f" ]; then
       read -r sp ip < "$f"
-      alive "$sp" && left="$left child"
-      alive "$ip" && left="$left monitor"
-      gc=$(cat "$f.gc" 2> /dev/null) && [ -n "$gc" ] && alive "$gc" && left="$left grandchild"
+      cancel_alive "$sp" && left="$left child"
+      cancel_alive "$ip" && left="$left monitor"
+      gc=$(cat "$f.gc" 2> /dev/null) && [ -n "$gc" ] && cancel_alive "$gc" && left="$left grandchild"
     else
       left=' no-pid-file'
     fi
@@ -385,7 +423,7 @@ EOF
     [ -s "$1" ] || return 0
     read -r sp ip < "$1"
     gc=$(cat "$1.gc" 2> /dev/null) || gc=''
-    for p in $gc "$ip" "$sp"; do [ -z "$p" ] || ! alive "$p" || kill -KILL "$p" 2> /dev/null || :; done
+    for p in $gc "$ip" "$sp"; do [ -z "$p" ] || ! cancel_alive "$p" || kill -KILL "$p" 2> /dev/null || :; done
   }
   # run_case <tag> <form> <held mode> <forward 1|0> <caller trap> [<owner file> [<runner file>]]: the runner on its own
   # until the child is ready, then TERM; RC, OUT and LEFT, ELAPSED.
@@ -593,7 +631,7 @@ EOF
   RC=0
   { wait "$rp" || RC=$?; } 2> /dev/null # the shell's "Terminated" notice for the killed runner
   p=$(cat "$t/sentinel.pid" 2> /dev/null) || p=''
-  check nogroup-sentinel "$({ [ -n "$p" ] && alive "$p"; } && echo alive || echo dead)" alive
+  check nogroup-sentinel "$({ [ -n "$p" ] && cancel_alive "$p"; } && echo alive || echo dead)" alive
   check nogroup-child "$(leftover "$t/$tag.pid" | sed 's/ grandchild//; s/^grandchild$//')" ''
   [ -z "$p" ] || kill -KILL "$p" 2> /dev/null || :
   reap "$t/$tag.pid"
@@ -609,6 +647,30 @@ EOF
   check "$tag-left" "${LEFT:-none}" none
   check "$tag-budget" "$([ "$ELAPSED" -le 8 ] && echo inside || echo "$ELAPSED s")" inside
   reap "$t/$tag.pid"
+  # natural-end: the command ends by itself and leaves a process in its group.
+  mkdir "$t/nops"
+  printf '#!/bin/sh\nexit 1\n' > "$t/nops/ps"
+  chmod +x "$t/nops/ps"
+  # The refused KILL is a kill that answers as one to another user's process does.
+  for tag in natural-end natural-end-nops natural-end-empty natural-end-eperm; do
+    path=$t/bin:$PATH unit='sleep 1000 & echo $! > "$PIDF"' pre='' want='0|dead|0'
+    case $tag in
+      *-nops) path=$t/nops:$path want='70|dead|1' ;;
+      *-empty) unit=true want='0|no-pid|0' ;;
+      *-eperm)
+        pre='kill() { if [ "$1" = -KILL ]; then echo "kill: ($3) - Operation not permitted" >&2; return 1; fi; builtin kill "$@"; }'
+        want='70|alive|1'
+        ;;
+    esac
+    RC=$(env GB="$self" PIDF="$t/$tag.pid" PATH="$path" UNIT="$unit" PRE="$pre" ERR="$t/$tag.err" bash -c 'source "$GB"
+      eval "$PRE"
+      run_bounded --clear timeout 60 bash -c "$UNIT" > /dev/null 2> "$ERR"; echo $?')
+    p=$(cat "$t/$tag.pid" 2> /dev/null) || p=''
+    left=dead
+    [ -n "$p" ] || left=no-pid
+    [ -z "$p" ] || ! cancel_alive "$p" || { left=alive; kill -KILL "$p"; }
+    check "$tag" "$RC|$left|$(grep -c '^\[bound\] cannot' "$t/$tag.err")" "$want"
+  done
   echo "gate-bound self-test: $([ "$bad" = 0 ] && echo ok || echo FAIL) ($bad failures)"
   [ "$bad" = 0 ]
 }

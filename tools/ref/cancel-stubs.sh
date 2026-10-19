@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fixtures shared by the lease and stack-watch cancellation self-tests. Sourced, never executed.
+# Fixtures shared by the cancellation self-tests. Sourced, never executed.
 
 # CANCEL_TIMEOUT_FORWARD=1 forwards TERM once; unset, the monitor exits and leaves its child's group.
 cancel_timeout() {
@@ -49,3 +49,6 @@ cancel_ready() {
   case $state in *S*) return 0 ;; esac
   return 1
 }
+
+# cancel_alive <pid>: running, not a zombie; a pid ps cannot read is gone.
+cancel_alive() { local st; st=$(ps -o stat= -p "$1" 2> /dev/null) || return 1; case $st in '' | *Z*) return 1 ;; esac; }

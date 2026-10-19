@@ -980,6 +980,8 @@ decode_bin() { echo "$HOME/repo/$1/$DECODE_BIN"; }
 # on the Mac.
 # Trace-write checks name the failed path and preserve continuation, not the OS's localized wording.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
+  # The cases are written for the root cleanup budget; a runner above this one (run_unit) hands down half of its own.
+  unset LEASE_STOP_GRACE
   # shellcheck source=tools/ref/cancel-stubs.sh
   source "$LEASE_TREE/tools/ref/cancel-stubs.sh"
   fails=0

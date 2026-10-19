@@ -358,6 +358,8 @@ self_test() {
 }
 
 if [ "${1:-}" = --self-test ]; then
+  # The cases are written for the root cleanup budget; a runner above this one (run_unit) hands down half of its own.
+  unset LEASE_STOP_GRACE
   self_test
   exit
 fi

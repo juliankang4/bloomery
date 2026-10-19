@@ -1086,8 +1086,7 @@ EOF
       left=''
       if read -r sp ip < "$t/$tag/pid"; then
         for p in "$sp" "$ip"; do
-          state=$(ps -o stat= -p "$p" 2> /dev/null) || state=''
-          case $state in '' | *Z*) ;; *) left="$left $p" ;; esac
+          ! cancel_alive "$p" || left="$left $p"
         done
       else
         left='missing PIDs'
