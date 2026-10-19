@@ -518,17 +518,18 @@ mod tests {
             .collect()
     }
 
-    /// ggml's `quantize_row_q8_0_ref`: per 32 values `d = amax / 127` in f16, `q = round(x / d)`.
+    /// ggml's `quantize_row_q8_0_ref` ([`gguf::quant::Q8Block::quantize_ref`]), 32 values a block.
     fn q8_0_bytes(v: &[f32]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for blk in v.chunks(32) {
-            let amax = blk.iter().fold(0f32, |m, x| m.max(x.abs()));
-            let d = amax / 127.0;
-            let id = if d == 0.0 { 0.0 } else { 1.0 / d };
-            out.extend(gguf::quant::f32_to_f16_bits(d).to_le_bytes());
-            out.extend(blk.iter().map(|x| (x * id).round() as i8 as u8));
-        }
-        out
+        let (blocks, rest) = v.as_chunks::<32>();
+        assert!(rest.is_empty());
+        blocks
+            .iter()
+            .flat_map(|b| {
+                gguf::quant::Q8Block::quantize_ref(b)
+                    .expect("finite fixture values")
+                    .to_bytes()
+            })
+            .collect()
     }
 
     /// How the test stores one head tensor.

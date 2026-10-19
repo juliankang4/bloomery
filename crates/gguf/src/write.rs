@@ -130,8 +130,8 @@ pub struct Layout {
     alignment: u64,
     /// Each tensor with its offset from the data base, in declaration order.
     tensors: Vec<(TensorDecl, u64)>,
-    /// From the data base to the end of the last tensor's padding.
-    data_len: u64,
+    /// Header and data through the last tensor's padding.
+    file_len: u64,
 }
 
 impl Layout {
@@ -186,20 +186,23 @@ impl Layout {
             header.extend_from_slice(&t.type_id.to_le_bytes());
             header.extend_from_slice(&off.to_le_bytes());
         }
-        let data_base = (header.len() as u64).next_multiple_of(alignment);
-        header.resize(
-            usize::try_from(data_base).expect("the padded header is in memory already"),
-            0,
-        );
-        if data_base.checked_add(end).is_none() {
-            let last = tensors.last().map(|t| t.name.clone()).unwrap_or_default();
-            return Err(WriteError::TooLarge { name: last });
-        }
+        let data_base = (header.len() as u64)
+            .checked_next_multiple_of(alignment)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| WriteError::TooLarge {
+                name: "header".into(),
+            })?;
+        let file_len = (data_base as u64)
+            .checked_add(end)
+            .ok_or_else(|| WriteError::TooLarge {
+                name: tensors.last().map(|t| t.name.clone()).unwrap_or_default(),
+            })?;
+        header.resize(data_base, 0);
         Ok(Layout {
             header,
             alignment,
             tensors: tensors.into_iter().zip(offsets).collect(),
-            data_len: end,
+            file_len,
         })
     }
 
@@ -215,7 +218,7 @@ impl Layout {
 
     /// The bytes the finished file holds.
     pub fn file_len(&self) -> u64 {
-        self.data_base() + self.data_len
+        self.file_len
     }
 }
 
@@ -370,6 +373,28 @@ impl<W: Write> Writer<W> {
     /// The next declared tensor's bytes, then its padding. Returns the file
     /// range the bytes occupy, padding excluded.
     pub fn tensor(&mut self, name: &str, bytes: &[u8]) -> Result<Range<u64>, WriteError> {
+        if let Some((decl, _)) = self.layout.tensors.get(self.next)
+            && !self.broken
+            && decl.name == name
+            && decl.nbytes != bytes.len() as u64
+        {
+            return Err(WriteError::Length {
+                name: name.to_string(),
+                got: bytes.len() as u64,
+                want: decl.nbytes,
+            });
+        }
+        self.tensor_parts(name, [bytes])
+    }
+
+    /// [`Writer::tensor`] with the bytes in `parts`, one after another, so a tensor larger
+    /// than memory goes out a part at a time. Parts that do not add up to the declared byte
+    /// count are refused after the fact, and the file is then broken.
+    pub fn tensor_parts<P: AsRef<[u8]>>(
+        &mut self,
+        name: &str,
+        parts: impl IntoIterator<Item = P>,
+    ) -> Result<Range<u64>, WriteError> {
         if self.broken {
             return Err(WriteError::Broken);
         }
@@ -385,26 +410,43 @@ impl<W: Write> Writer<W> {
                 next: Some(decl.name.clone()),
             });
         }
-        let got = bytes.len() as u64;
-        if got != decl.nbytes {
+        let want = decl.nbytes;
+        let start = self
+            .layout
+            .data_base()
+            .checked_add(*offset)
+            .expect("Layout checked the file length");
+        self.broken = true;
+        let mut got = 0u64;
+        for part in parts {
+            let part = part.as_ref();
+            got = got
+                .checked_add(part.len() as u64)
+                .ok_or_else(|| WriteError::TooLarge {
+                    name: name.to_string(),
+                })?;
+            if got > want {
+                break;
+            }
+            self.out.write_all(part)?;
+        }
+        if got != want {
             return Err(WriteError::Length {
                 name: name.to_string(),
                 got,
-                want: decl.nbytes,
+                want,
             });
         }
-        let start = self.layout.data_base() + offset;
-        let pad = got.next_multiple_of(self.layout.alignment) - got;
-        let written = self
-            .out
-            .write_all(bytes)
-            .and_then(|()| write_zeros(&mut self.out, pad));
-        if let Err(e) = written {
-            self.broken = true;
-            return Err(e.into());
-        }
+        let padded = got
+            .checked_next_multiple_of(self.layout.alignment)
+            .expect("Layout checked the tensor's padding");
+        write_zeros(&mut self.out, padded - got)?;
+        self.broken = false;
         self.next += 1;
-        Ok(start..start + got)
+        let end = start
+            .checked_add(got)
+            .expect("Layout checked the file length");
+        Ok(start..end)
     }
 
     /// Every declared tensor must be written; flushes and hands `out` back.
@@ -716,6 +758,17 @@ mod tests {
             Err(WriteError::OutOfOrder { got, next: None }) => assert_eq!(got, "a"),
             other => panic!("wrong refusal: {other:?}"),
         }
+        let mut w = Writer::new(Vec::new(), two()).unwrap();
+        w.tensor_parts("a", [&[1u8; 10][..], &[2; 6]]).unwrap();
+        let start = w.layout.data_base() as usize;
+        assert_eq!(w.out[start..start + 16], [&[1u8; 10][..], &[2; 6]].concat());
+        match w.tensor_parts("b", [[0u8; 8]; 3]) {
+            Err(WriteError::Length { name, got, want }) => {
+                assert_eq!((name.as_str(), got, want), ("b", 24, 16));
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        assert!(matches!(w.finish(), Err(WriteError::Broken)));
         let header = two().data_base() as usize;
         let mut w = Writer::new(Full(header + 8), two()).unwrap();
         assert!(matches!(w.tensor("a", &[0; 16]), Err(WriteError::Io(_))));

@@ -1492,6 +1492,43 @@ impl Q8Block {
             q,
         }
     }
+
+    /// The block's 34 file bytes, as [`Q8Block::from_bytes`] reads them.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 34] {
+        let mut b = [0u8; 34];
+        b[..2].copy_from_slice(&self.d.to_le_bytes());
+        for (byte, &code) in b[2..].iter_mut().zip(&self.q) {
+            *byte = code.to_le_bytes()[0];
+        }
+        b
+    }
+
+    /// ggml's reference weight rule, the one `llama-quantize` and the converters write Q8_0
+    /// weights with (`quantize_row_q8_0_ref`, ggml-quants.c): `d = amax / 127`, stored as
+    /// f16, and each code `roundf(x · id)` with `id = 1 / d` of the f32 `d`. The activation
+    /// rule ([`quantize_row_q8_0_roundtrip`]) and the engine's requant
+    /// (`model::quant::quantize_q8_0`) code with `127 / amax` and round half to even, and
+    /// differ from it on about one code in a thousand. `None` when a value is not finite, which
+    /// the rule would write as a code of 0, or when the scale is past f16's range, which would
+    /// store an infinite `d`.
+    #[must_use]
+    pub fn quantize_ref(x: &[f32; 32]) -> Option<Q8Block> {
+        if !x.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let amax = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+        let stored_d = f32_to_f16_bits(d);
+        if !id.is_finite() || !half_to_f32(stored_d).is_finite() {
+            return None;
+        }
+        Some(Q8Block {
+            d: stored_d,
+            q: x.map(|v| (v * id).round() as i8),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2483,5 +2520,47 @@ mod tests {
                 n: 256
             })
         );
+    }
+
+    /// Eight blocks of Qwen3.8's layer-0 shared-expert gate: the checkpoint's BF16 values
+    /// (`model.language_model.layers.0.mlp.shared_expert.gate_proj.weight` of
+    /// nvidia/Qwen3.8-Flash-Next-NVFP4 at `fc694b54`) and the Q8_0 block unsloth's
+    /// `UD-Q4_K_XL` (`766911a6`) holds for them in `blk.0.ffn_gate_shexp.weight`, 64 + 34
+    /// bytes a block. In the first six the `127 / amax` rule codes some value differently.
+    #[test]
+    fn the_reference_rule_writes_ggml_s_weight_blocks() {
+        let fixture = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/qwen38-shexp-q8_0-blocks.bin"
+        ))
+        .unwrap();
+        let (blocks, rest) = fixture.as_chunks::<98>();
+        assert!(rest.is_empty() && blocks.len() == 8);
+        for (i, b) in blocks.iter().enumerate() {
+            let x: [f32; 32] = std::array::from_fn(|j| {
+                f32::from_bits(u32::from(u16::from_le_bytes([b[2 * j], b[2 * j + 1]])) << 16)
+            });
+            let want: &[u8; 34] = b[64..].try_into().unwrap();
+            let got = super::Q8Block::quantize_ref(&x).unwrap();
+            assert_eq!(&got.to_bytes(), want, "block {i}");
+            assert_eq!(super::Q8Block::from_bytes(want), got);
+            let other = crate::quant::quantize_row_q8_0_roundtrip;
+            let mut rt = [0.0f32; 32];
+            other(&x, &mut rt);
+            let d = super::half_to_f32(got.d);
+            let differs = rt.iter().zip(&got.q).any(|(&r, &q)| r != d * f32::from(q));
+            assert_eq!(differs, i < 6, "block {i}: the two rules");
+        }
+        assert_eq!(
+            super::Q8Block::quantize_ref(&[0.0; 32]).unwrap().to_bytes(),
+            [0; 34]
+        );
+        for bad in [f32::NAN, f32::INFINITY] {
+            let mut x = [1.0; 32];
+            x[7] = bad;
+            assert_eq!(super::Q8Block::quantize_ref(&x), None, "{bad}");
+        }
+        // Finite values whose scale `amax / 127` is past f16's range.
+        assert_eq!(super::Q8Block::quantize_ref(&[1e10; 32]), None);
     }
 }
