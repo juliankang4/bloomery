@@ -41,23 +41,11 @@ pub enum Error {
     Rule { name: String, what: String },
 }
 
-/// A scale encoding `weight_scale_encoding` names.
+/// A scale encoding `weight_scale_encoding` names: `csf` or `csf_32x2_v1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Encoding {
     Csf,
     Csf32,
-}
-
-impl Encoding {
-    /// The encoding of a `weight_scale_encoding` value; `None` for one this module does not read.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Encoding> {
-        match name {
-            "csf" => Some(Encoding::Csf),
-            "csf_32x2_v1" => Some(Encoding::Csf32),
-            _ => None,
-        }
-    }
 }
 
 /// The logical scale `scale` (`<stem>.weight_scale`) of a weight of `rows` by `cols` scale
@@ -382,6 +370,7 @@ mod tests {
         for (stem, encoding, rows, cols) in [
             ("syn_csf", Encoding::Csf, 48, 20),
             ("syn_csf32", Encoding::Csf32, 384, 43),
+            ("syn_csf32k", Encoding::Csf32, 64, 8),
         ] {
             let scale = format!("{stem}.weight_scale");
             let got = weight_scale(get, &scale, encoding, rows, cols).unwrap();
@@ -397,9 +386,34 @@ mod tests {
     /// Each structural rule refuses by name: a base above 240, a part of the wrong size, a page
     /// base that does not count the records before it, a falling prefix, a record outside its
     /// block or out of order, records left over, and an exception position out of range or
-    /// repeated; an encoding name this module does not read is `None`.
+    /// repeated.
     #[test]
     fn a_compressed_scale_breaking_a_rule_is_refused_by_name() {
+        for (encoding, rows, cols) in [
+            (Encoding::Csf, 16, usize::MAX - 1),
+            (Encoding::Csf, usize::MAX / 16 * 16, 2),
+            (Encoding::Csf32, 32, usize::MAX),
+            (Encoding::Csf32, usize::MAX / 32 * 32, 2),
+        ] {
+            let get = |n: &str| {
+                use crate::safetensors::Dtype;
+                let dtype = if n.ends_with("offsets") || n.ends_with("csf32_exceptions") {
+                    Dtype::U16
+                } else if n.ends_with("exceptions") || n.ends_with("page_bases") {
+                    Dtype::U32
+                } else {
+                    Dtype::U8
+                };
+                Ok(crate::safetensors::Raw {
+                    dtype,
+                    shape: &[],
+                    bytes: &[],
+                })
+            };
+            let e = weight_scale(get, "huge.weight_scale", encoding, rows, cols).unwrap_err();
+            assert!(e.to_string().contains("huge.weight_scale"), "{e}");
+            assert!(e.to_string().contains("size overflow"), "{e}");
+        }
         let st = fixture();
         let parts: Vec<(String, &str, Vec<usize>, Vec<u8>)> = st
             .names()
@@ -475,8 +489,5 @@ mod tests {
             },
             "positions are increasing",
         );
-        assert_eq!(Encoding::from_name("csf"), Some(Encoding::Csf));
-        assert_eq!(Encoding::from_name("csf_32x2_v1"), Some(Encoding::Csf32));
-        assert_eq!(Encoding::from_name("csf_64"), None);
     }
 }

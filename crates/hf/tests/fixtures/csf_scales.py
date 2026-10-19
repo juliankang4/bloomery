@@ -13,7 +13,8 @@ usage (Python 3, standard library only):
   wide, and 33 tiles, so two pages), seeded scale bytes around a row centre with a few far ones, encoded
   here by the encoders' rules (a row's base the start of the 16-wide window covering most of its bytes, the
   lowest on a tie, at most 240; a byte the window misses an exception), beside the bytes they encode as
-  `<stem>.weight_scale` F8_E4M3.
+  `<stem>.weight_scale` F8_E4M3; and `syn_csf32k` (64 by 8), the scales of a 128-value weight row, whole
+  GGUF NVFP4 blocks.
 
 `plain` prints the sha256 of the same gate_proj's plain `weight_scale` in
 local-inference-lab/Qwen3.8-Flash-Next-NVFP4 at PLAIN_REV, the uncompressed copy of the same weights, which
@@ -135,11 +136,12 @@ def fixture(path):
         ("syn_csf.weight_scale.nvfp4_csf_fixed", "U8", [3, 16 * 11], fixed),
         ("syn_csf.weight_scale.nvfp4_csf_exceptions", "U32", [len(exc) // 4], exc),
     ]
-    m = scales(rng, 384, 43)
-    parts = csf32(m)
-    tensors.append(("syn_csf32.weight_scale", "F8_E4M3", [384, 43], bytes(v for r in m for v in r)))
-    for part, dtype, size, raw in zip(("bases", "codes", "page_bases", "offsets", "exceptions"), ("U8", "U8", "U32", "U16", "U16"), (1, 1, 4, 2, 2), parts):
-        tensors.append((f"syn_csf32.weight_scale.csf32_{part}", dtype, [len(raw) // size], raw))
+    for stem, rows, cols in (("syn_csf32", 384, 43), ("syn_csf32k", 64, 8)):
+        m = scales(rng, rows, cols)
+        parts = csf32(m)
+        tensors.append((f"{stem}.weight_scale", "F8_E4M3", [rows, cols], bytes(v for r in m for v in r)))
+        for part, dtype, size, raw in zip(("bases", "codes", "page_bases", "offsets", "exceptions"), ("U8", "U8", "U32", "U16", "U16"), (1, 1, 4, 2, 2), parts):
+            tensors.append((f"{stem}.weight_scale.csf32_{part}", dtype, [len(raw) // size], raw))
     write(path, tensors, f"nvidia/Qwen3.8-Flash-Next-FP4-Local {REV} {SHARD} {STEM}; syn_* seeded 20261019")
 
 

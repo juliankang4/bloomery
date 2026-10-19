@@ -4,16 +4,16 @@
 //! the program's layout (`model_hf::arch::qwen35moe::Checkpoint`, qwen4exp's reader), and one table writes each
 //! format as its GGUF type (`hf::modelopt::normalize`).
 //!
-//!     prepare <folder> <out prefix> [--shard-gib <n>]
+//!     prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]
 //!
 //! writes `<out prefix>-00001-of-0000N.gguf` and on, each shard at most `n` GiB (48 by default)
 //! unless one tensor with its scale and file layout is larger, the metadata in the first.
-//! Each shard is written as
-//! `<name>.part` and renamed when whole. The disk must hold the split and a tenth more. The
-//! written split is opened and its hyperparameters read as the server reads them. One line per
-//! tensor, a summary line, and exit status 1 with the error on any failure. Before any shard is
-//! written, the tokenizer serving builds from the header is checked to split text and stop
-//! generation where Hugging Face's does.
+//! `--keep-bf16` writes a BF16 matrix the map would make Q8_0 as it is stored. Each shard is
+//! written as `<name>.part` and renamed when whole. The disk must hold the split and a tenth
+//! more. The written split is opened and its hyperparameters read as the server reads them.
+//! One line per tensor, a summary line, and exit status 1 with the error on any failure. Before
+//! any shard is written, the tokenizer serving builds from the header is checked to split text
+//! and stop generation where Hugging Face's does.
 
 use std::error::Error;
 use std::fs::File;
@@ -24,12 +24,12 @@ use std::time::Instant;
 
 use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GgmlType, Value};
-use hf::modelopt::{self, Normal, Use};
+use hf::modelopt::{self, Normal, Plain, Use};
 use hf::quant_config::{self, Config, Format};
 use hf::safetensors::{Dtype, Folder};
 use model_hf::arch::qwen35moe::{Checkpoint, Mapped};
 
-const USAGE: &str = "usage: prepare <folder> <out prefix> [--shard-gib <n>]";
+const USAGE: &str = "usage: prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]";
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
@@ -58,10 +58,17 @@ enum Make {
 }
 
 fn run(args: &[String]) -> Res<()> {
-    let (dir, prefix, shard_gib) = match args {
-        [dir, prefix] => (dir, prefix, 48),
-        [dir, prefix, flag, n] if flag == "--shard-gib" => (dir, prefix, n.parse()?),
-        _ => return Err(USAGE.into()),
+    let (mut shard_gib, mut keep_bf16, mut paths) = (48u64, false, vec![]);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--shard-gib" => shard_gib = it.next().ok_or(USAGE)?.parse()?,
+            "--keep-bf16" => keep_bf16 = true,
+            _ => paths.push(a),
+        }
+    }
+    let [dir, prefix] = paths[..] else {
+        return Err(USAGE.into());
     };
     let limit = u64::checked_mul(shard_gib, 1 << 30)
         .filter(|&l| l > 0)
@@ -100,9 +107,12 @@ fn run(args: &[String]) -> Res<()> {
     let mapped = checkpoint.map(logical.iter().map(|(n, s)| (*n, s.as_slice())))?;
 
     let mut planned = Vec::new();
-    for (name, m) in mapped {
+    for (name, mut m) in mapped {
         let source = &m.sources[0];
         let format = modelopt::format_of(&m.placed(&plan)?)?;
+        if keep_bf16 && format == Format::Bf16 && m.role == Use::Matrix(Plain::Q8_0) {
+            m.role = Use::Matrix(Plain::Bf16);
+        }
         let type_id = modelopt::type_of(format, m.role).ok_or_else(|| {
             format!(
                 "{source}: {format} read as {:?} has no GGUF type here",
@@ -115,15 +125,13 @@ fn run(args: &[String]) -> Res<()> {
                 m.dims
             )
         })?;
-        let scales = match (format, m.role) {
-            (Format::Nvfp4, _) => Some(if m.sources.len() > 1 {
-                m.sources.len()
-            } else {
-                1
-            }),
-            (_, Use::Rows) => Some(1),
-            _ => None,
-        };
+        // One tensor scale an expert of a stack; one for a row table, whatever its parts.
+        let scales = GgmlType::from_u32(type_id)
+            .reads_scale()
+            .then_some(match m.role {
+                Use::Rows => 1,
+                Use::Matrix(_) => m.sources.len(),
+            });
         let decl = TensorDecl {
             name: name.clone(),
             dims: m.dims.clone(),

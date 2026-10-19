@@ -21,8 +21,11 @@
 //! block's decode refuses it, rather than stripped of bit 7. `<stem>.input_scale`, the activation
 //! scale ModelOpt calibrates for 4-bit activations, has no place in the block; the reader leaves it.
 
-use gguf::quant::{E4m3Rows, GgmlType, Q8Block, QuantError, fp4_pair, ue4m3_to_f32_half};
+use std::collections::HashMap;
 
+use gguf::quant::{E4m3Rows, GgmlType, Nvfp4Rows, Q8Block, QuantError, fp4_pair, ue4m3_to_f32_half};
+
+use crate::csf;
 use crate::quant_config::{Format, Placed};
 use crate::safetensors::{self, Dtype, Raw};
 
@@ -33,6 +36,8 @@ pub enum Error {
     Safetensors(#[from] safetensors::Error),
     #[error("modelopt nvfp4: {name}: {what}")]
     Shape { name: String, what: String },
+    #[error(transparent)]
+    Csf(#[from] csf::Error),
     #[error("{name}: {format} {what}")]
     Format {
         name: String,
@@ -97,7 +102,8 @@ pub struct Normal {
 ///
 /// | format | [`Use::Matrix`] | [`Use::Rows`] |
 /// |---|---|---|
-/// | NVFP4 (ModelOpt) | NVFP4 (40), `.scale` a tensor or an expert (`linear`, `experts`) | none |
+/// | NVFP4 (ModelOpt) | NVFP4 (40), `.scale` a tensor or an expert (`linear`, `experts`) | [`GgmlType::NVFP4_ROWS`], `.scale` the table's |
+/// | NVFP4 with `csf` or `csf_32x2_v1` scales | as NVFP4, the scales decoded first ([`csf`]) | none |
 /// | BF16, F32 | Q8_0, F32 or BF16 as [`Plain`] says | none |
 /// | FP8 with one tensor scale (its companion) | none | [`GgmlType::F8E4M3_ROWS`], bytes as stored |
 ///
@@ -105,7 +111,10 @@ pub struct Normal {
 #[must_use]
 pub fn type_of(format: Format, role: Use) -> Option<u32> {
     match (format, role) {
-        (Format::Nvfp4, Use::Matrix(_)) => Some(GgmlType::NVFP4.as_u32()),
+        (Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32, Use::Matrix(_)) => {
+            Some(GgmlType::NVFP4.as_u32())
+        }
+        (Format::Nvfp4, Use::Rows) => Some(GgmlType::NVFP4_ROWS.as_u32()),
         (Format::Bf16 | Format::F32, Use::Matrix(Plain::Q8_0)) => Some(GgmlType::Q8_0.as_u32()),
         (Format::Bf16 | Format::F32, Use::Matrix(Plain::F32)) => Some(GgmlType::F32.as_u32()),
         (Format::Bf16, Use::Matrix(Plain::Bf16)) => Some(GgmlType::BF16.as_u32()),
@@ -192,28 +201,211 @@ pub fn normalize<'a>(
     };
     let type_id = type_of(format, role)
         .ok_or_else(|| refuse(format!("read as {role:?} has no GGUF type here")))?;
-    if sources.len() != 1 && format != Format::Nvfp4 {
-        return Err(refuse(format!(
-            "in a stack of {}: only NVFP4 experts stack here",
-            sources.len()
-        )));
-    }
-    if format == Format::Nvfp4 {
-        let n = if let [one] = sources {
-            linear(get, *one)?
-        } else {
-            experts(get, sources)?
+    let encoding = match format {
+        Format::Nvfp4 => None,
+        Format::Nvfp4Csf => Some(csf::Encoding::Csf),
+        Format::Nvfp4Csf32 => Some(csf::Encoding::Csf32),
+        _ if sources.len() != 1 => {
+            return Err(refuse(format!(
+                "in a stack of {}: only NVFP4 experts stack here",
+                sources.len()
+            )));
+        }
+        _ => return plain(get, name, placed, role, type_id),
+    };
+    if role == Use::Rows {
+        let [source] = sources else {
+            return Err(refuse("row tables need exactly one source".into()));
         };
-        return Ok(Normal {
-            type_id,
-            dims: n.dims,
-            bytes: n.blocks,
-            scale: n.scale,
-        });
+        return nvfp4_rows(get, *source, type_id);
     }
+    let Some(encoding) = encoding else {
+        return nvfp4(get, sources, type_id);
+    };
+    // Each compressed block scale decoded to the bytes a plain checkpoint stores, and its weight
+    // placed as plain NVFP4 reading those bytes and the tensor scale its own place names.
+    let mut decoded: HashMap<String, ([usize; 2], Vec<u8>)> = HashMap::new();
+    let mut plain_places = Vec::with_capacity(sources.len());
+    for &(weight, placed) in sources {
+        let (Some((scale, _)), [_, .., tensor_scale]) = (
+            placed.companions.first().and_then(|c| c.rsplit_once('.')),
+            placed.companions.as_slice(),
+        ) else {
+            return Err(refuse(format!(
+                "{weight}: its place names {:?}, not a compressed block scale and a tensor scale",
+                placed.companions
+            )));
+        };
+        let w = get(weight)?;
+        let &[rows, half] = w.shape else {
+            return Err(refuse(format!("{weight} {:?} is not [rows, k/2]", w.shape)));
+        };
+        if !half.is_multiple_of(8) {
+            return Err(refuse(format!(
+                "{weight}: k/2 = {half} is not whole 16-value groups"
+            )));
+        }
+        let bytes = csf::weight_scale(&get, scale, encoding, rows, half / 8)?;
+        decoded.insert(scale.to_string(), ([rows, half / 8], bytes));
+        plain_places.push((
+            weight,
+            Placed {
+                format: Format::Nvfp4,
+                companions: vec![scale.to_string(), tensor_scale.clone()],
+            },
+        ));
+    }
+    let get = |n: &str| match decoded.get(n) {
+        Some((shape, bytes)) => Ok(Raw {
+            dtype: Dtype::F8E4M3,
+            shape: shape.as_slice(),
+            bytes,
+        }),
+        None => get(n),
+    };
+    let sources: Vec<_> = plain_places.iter().map(|(w, p)| (*w, p)).collect();
+    nvfp4(get, &sources, type_id)
+}
+
+/// The NVFP4 `sources` (one linear, or a routed stack's experts) in GGUF's NVFP4 block.
+fn nvfp4<'a>(
+    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    sources: &[(&str, &Placed)],
+    type_id: u32,
+) -> Result<Normal, Error> {
+    let n = if let [one] = sources {
+        linear(get, *one)?
+    } else {
+        experts(get, sources)?
+    };
+    Ok(Normal {
+        type_id,
+        dims: n.dims,
+        bytes: n.blocks,
+        scale: n.scale,
+    })
+}
+
+/// The NVFP4 weight `source` as [`GgmlType::NVFP4_ROWS`]: each 16-value group its scale byte
+/// then its 8 code bytes as stored, the tensor scale the one its place names.
+fn nvfp4_rows<'a>(
+    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    (weight, placed): (&str, &Placed),
+    type_id: u32,
+) -> Result<Normal, Error> {
+    let shape = |name: String, what: String| Error::Shape { name, what };
+    let wname = weight.to_string();
+    let [sname, tname] = placed.companions.as_slice() else {
+        return Err(shape(
+            wname,
+            format!(
+                "its place names {:?}, not a block scale and a tensor scale",
+                placed.companions
+            ),
+        ));
+    };
+    let (w, s) = (get(&wname)?, get(sname)?);
+    let &[rows, half] = w.shape else {
+        return Err(shape(
+            wname,
+            format!("shape {:?}, not [rows, k/2]", w.shape),
+        ));
+    };
+    if w.dtype != Dtype::U8 || rows == 0 || half == 0 || !half.is_multiple_of(8) {
+        return Err(shape(
+            wname,
+            format!(
+                "{} {:?}, not U8 rows of whole 16-value groups",
+                w.dtype.name(),
+                w.shape
+            ),
+        ));
+    }
+    let k = (half as u64)
+        .checked_mul(2)
+        .ok_or_else(|| shape(wname.clone(), "row size overflow".into()))?;
+    let size = rows
+        .checked_mul(half)
+        .ok_or_else(|| shape(wname.clone(), "weight size overflow".into()))?;
+    let capacity = (size / 8)
+        .checked_mul(9)
+        .ok_or_else(|| shape(wname.clone(), "row bytes size overflow".into()))?;
+    if w.bytes.len() != size {
+        return Err(shape(wname, format!("{} bytes, not {size}", w.bytes.len())));
+    }
+    if s.dtype != Dtype::F8E4M3 || s.shape != [rows, half / 8] || s.bytes.len() != size / 8 {
+        return Err(shape(
+            sname.clone(),
+            format!(
+                "{} {:?}; the groups are F8_E4M3 [{rows}, {}]",
+                s.dtype.name(),
+                s.shape,
+                half / 8
+            ),
+        ));
+    }
+    let t = get(tname)?;
+    let scale = match (t.dtype, t.bytes) {
+        (Dtype::F32, &[a, b, c, d]) => f32::from_le_bytes([a, b, c, d]),
+        _ => {
+            return Err(shape(
+                tname.clone(),
+                format!("{} {:?}, not one F32", t.dtype.name(), t.shape),
+            ));
+        }
+    };
+    if !scale.is_finite() {
+        return Err(shape(
+            tname.clone(),
+            format!("tensor scale {scale} is not finite"),
+        ));
+    }
+    let decoder = Nvfp4Rows::new(scale);
+    let mut values = [0.0; 16];
+    let mut bytes = Vec::with_capacity(capacity);
+    for (row, (codes, scales)) in w
+        .bytes
+        .chunks_exact(half)
+        .zip(s.bytes.chunks_exact(half / 8))
+        .enumerate()
+    {
+        for (group, (codes, &byte)) in codes.as_chunks::<8>().0.iter().zip(scales).enumerate() {
+            bytes.push(byte);
+            bytes.extend_from_slice(codes);
+            decoder
+                .decode(&bytes[bytes.len() - 9..], &mut values)
+                .map_err(|source| Error::Scale {
+                    name: sname.clone(),
+                    row,
+                    group,
+                    source,
+                })?;
+        }
+    }
+    Ok(Normal {
+        type_id,
+        dims: vec![k, rows as u64],
+        bytes,
+        scale: vec![scale],
+    })
+}
+
+/// A tensor of a format that is neither NVFP4 nor stacked: FP8 rows, or BF16 and F32.
+fn plain<'a>(
+    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    name: &str,
+    placed: &Placed,
+    role: Use,
+    type_id: u32,
+) -> Result<Normal, Error> {
+    let refuse = |what: String| Error::Format {
+        name: name.to_string(),
+        format: placed.format,
+        what,
+    };
     let raw = get(name)?;
     let dims: Vec<u64> = raw.shape.iter().rev().map(|&d| d as u64).collect();
-    if format == Format::Fp8Tensor {
+    if placed.format == Format::Fp8Tensor {
         if raw.dtype != Dtype::F8E4M3 || raw.shape.len() != 2 {
             return Err(refuse(format!(
                 "is {} {:?}, not F8_E4M3 rows",
@@ -785,9 +977,9 @@ mod tests {
         );
         refused(
             &["t.weight"],
-            placed(Format::Nvfp4, &[]),
+            placed(Format::Nvfp4Csf, &[]),
             Use::Rows,
-            "NVFP4-ModelOpt read as Rows",
+            "NVFP4-csf read as Rows",
         );
         refused(
             &["b.weight", "b.weight"],
@@ -892,6 +1084,310 @@ mod tests {
             }
         }
         assert!(missed.is_empty(), "accepted: {missed:?}");
+    }
+
+    /// The compressed-scale lines and the row line. A `csf` and a `csf_32x2_v1` weight, a
+    /// linear and a two-expert stack, normalize to the bytes and scales of the same weight
+    /// with its plain `weight_scale` (the fixture's encoded scales beside the bytes they encode).
+    /// An NVFP4 row table keeps each group's scale byte then its 8 code bytes, its tensor scale
+    /// the companion's; a scale byte that is no UE4M3 scale is refused naming its row and group.
+    #[test]
+    fn compressed_scales_and_row_tables_take_their_lines() {
+        let csf =
+            Safetensors::parse(include_bytes!("../tests/fixtures/csf-scales.safetensors").to_vec())
+                .unwrap();
+        let m = Use::Matrix(Plain::Q8_0);
+        for (stem, format, rows, groups) in [
+            ("syn_csf", Format::Nvfp4Csf, 48, 20),
+            ("syn_csf32k", Format::Nvfp4Csf32, 64, 8),
+        ] {
+            let half = groups * 8;
+            let codes: Vec<u8> = (0..rows * half).map(|i| (i * 37 % 251) as u8).collect();
+            let two = 2.0f32.to_le_bytes();
+            let plain_scale = csf
+                .raw(&format!("{stem}.weight_scale"))
+                .unwrap()
+                .bytes
+                .to_vec();
+            let mut list: Vec<(String, &str, Vec<usize>, Vec<u8>)> = vec![
+                ("c.weight".into(), "U8", vec![rows, half], codes.clone()),
+                ("c.weight_scale_2".into(), "F32", vec![], two.to_vec()),
+                ("p.weight".into(), "U8", vec![rows, half], codes),
+                (
+                    "p.weight_scale".into(),
+                    "F8_E4M3",
+                    vec![rows, groups],
+                    plain_scale,
+                ),
+                ("p.weight_scale_2".into(), "F32", vec![], two.to_vec()),
+            ];
+            for n in csf
+                .names()
+                .filter(|n| n.starts_with(&format!("{stem}.weight_scale.")))
+            {
+                let raw = csf.raw(n).unwrap();
+                let part = n.strip_prefix(stem).unwrap();
+                list.push((
+                    format!("c{part}"),
+                    raw.dtype.name(),
+                    raw.shape.to_vec(),
+                    raw.bytes.to_vec(),
+                ));
+            }
+            let refs: Vec<(&str, &str, &[usize], &[u8])> = list
+                .iter()
+                .map(|(n, d, s, b)| (n.as_str(), *d, s.as_slice(), b.as_slice()))
+                .collect();
+            let st = Safetensors::parse(write(&refs)).unwrap();
+            let get = |n: &str| st.raw(n);
+            let c = Placed {
+                format,
+                companions: list
+                    .iter()
+                    .map(|(n, ..)| n)
+                    .filter(|n| n.starts_with("c.weight_scale."))
+                    .chain(["c.weight_scale_2".to_string()].iter())
+                    .cloned()
+                    .collect(),
+            };
+            let (pw, p) = own("p");
+            let packed = |sources: &[(&str, &Placed)]| normalize(get, sources, m).unwrap();
+            let ours = packed(&[("c.weight", &c)]);
+            assert_eq!(ours, packed(&[(&pw, &p)]), "{stem}");
+            assert_eq!(ours.dims, [2 * half as u64, rows as u64]);
+            let stack = packed(&[("c.weight", &c), ("c.weight", &c)]);
+            assert_eq!(stack, packed(&[(&pw, &p), (&pw, &p)]), "{stem}");
+            let alone = Placed {
+                format,
+                companions: vec!["c.weight_scale_2".into()],
+            };
+            let e = normalize(get, &[("c.weight", &alone)], m).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("not a compressed block scale and a tensor scale"),
+                "{e}"
+            );
+        }
+
+        let codes: Vec<u8> = (0..2 * 16).map(|i| i as u8).collect();
+        let mut scales = vec![0x38u8, 0x30, 0x40, 0x31];
+        let file = |scales: &[u8]| {
+            write(&[
+                ("t.weight", "U8", &[2, 16][..], &codes[..]),
+                ("t.weight_scale", "F8_E4M3", &[2, 2], scales),
+                ("s.weight_scale_2", "F32", &[1], &0.5f32.to_le_bytes()),
+            ])
+        };
+        let st = Safetensors::parse(file(&scales)).unwrap();
+        let rows_of = |st: &Safetensors| {
+            let p = Placed {
+                format: Format::Nvfp4,
+                companions: vec!["t.weight_scale".into(), "s.weight_scale_2".into()],
+            };
+            normalize(|n| st.raw(n), &[("t.weight", &p)], Use::Rows)
+        };
+        let n = rows_of(&st).unwrap();
+        let mut want = Vec::new();
+        for (row, group) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            want.push(scales[2 * row + group]);
+            want.extend_from_slice(&codes[16 * row + 8 * group..][..8]);
+        }
+        assert_eq!(
+            (n.type_id, &n.dims, &n.bytes, &n.scale),
+            (
+                GgmlType::NVFP4_ROWS.as_u32(),
+                &vec![32, 2],
+                &want,
+                &vec![0.5]
+            )
+        );
+        scales[3] = 0x80;
+        let st = Safetensors::parse(file(&scales)).unwrap();
+        let e = rows_of(&st).unwrap_err();
+        assert!(
+            matches!(&e, Error::Scale { name, row: 1, group: 1, .. } if name == "t.weight_scale"),
+            "{e:?}"
+        );
+        let inf = Safetensors::parse(write(&[
+            ("t.weight", "U8", &[2, 16][..], &codes[..]),
+            ("t.weight_scale", "F8_E4M3", &[2, 2], &scales),
+            (
+                "s.weight_scale_2",
+                "F32",
+                &[1],
+                &f32::INFINITY.to_le_bytes(),
+            ),
+        ]))
+        .unwrap();
+        let e = rows_of(&inf).unwrap_err().to_string();
+        assert!(e.contains("tensor scale inf is not finite"), "{e}");
+        for (code, group_scale, divisor) in [(0x77, 0x38, 8.0), (0x22, 0x40, 2.0)] {
+            for tensor_scale in [f32::MAX, -f32::MAX] {
+                let mut codes = [0x11; 160];
+                let mut scales = [0x38; 20];
+                codes[152..].fill(code);
+                scales[19] = group_scale;
+                let file = |scale: f32| {
+                    Safetensors::parse(write(&[
+                        ("t.weight", "U8", &[2, 80][..], &codes[..]),
+                        ("t.weight_scale", "F8_E4M3", &[2, 10], &scales),
+                        ("s.weight_scale_2", "F32", &[1], &scale.to_le_bytes()),
+                    ]))
+                    .unwrap()
+                };
+                rows_of(&file(tensor_scale / divisor)).unwrap();
+                let e = rows_of(&file(tensor_scale)).unwrap_err().to_string();
+                assert!(
+                    e.contains("t.weight_scale: row 1 group 9") && e.contains("leaves f32's range"),
+                    "{e}"
+                );
+            }
+        }
+        let empty = Safetensors::parse(write(&[
+            ("t.weight", "U8", &[2, 0][..], &[][..]),
+            ("t.weight_scale", "F8_E4M3", &[2, 0], &[]),
+            ("s.weight_scale_2", "F32", &[1], &0.5f32.to_le_bytes()),
+        ]))
+        .unwrap();
+        let e = rows_of(&empty).unwrap_err().to_string();
+        assert!(
+            e.contains("U8 [2, 0], not U8 rows of whole 16-value groups"),
+            "{e}"
+        );
+        for (dims, weight_bytes, scale_bytes, want) in [
+            ([1, usize::MAX - 7], &[][..], &[][..], "row size overflow"),
+            (
+                [4, usize::MAX / 2 / 8 * 8],
+                &[],
+                &[],
+                "weight size overflow",
+            ),
+            (
+                [16, usize::MAX / 16 / 8 * 8],
+                &[],
+                &[],
+                "row bytes size overflow",
+            ),
+            ([0, 16], &[], &[], "not U8 rows"),
+            ([2, 16], &codes[..31], &scales[..], "31 bytes, not 32"),
+            ([2, 16], &codes[..], &scales[..3], "the groups are F8_E4M3"),
+        ] {
+            let p = Placed {
+                format: Format::Nvfp4,
+                companions: vec!["t.weight_scale".into(), "s.weight_scale_2".into()],
+            };
+            let get = |n: &str| {
+                let mut raw = st.raw(n)?;
+                if n == "t.weight" {
+                    raw.shape = &dims;
+                    raw.bytes = weight_bytes;
+                } else if n == "t.weight_scale" {
+                    raw.bytes = scale_bytes;
+                }
+                Ok(raw)
+            };
+            let e = normalize(get, &[("t.weight", &p)], Use::Rows)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(want), "{dims:?}: {e}");
+        }
+        let one = Placed {
+            format: Format::Nvfp4,
+            companions: vec!["t.weight_scale".into()],
+        };
+        let e = normalize(|n| st.raw(n), &[("t.weight", &one)], Use::Rows).unwrap_err();
+        assert!(
+            e.to_string().contains(
+                r#"its place names ["t.weight_scale"], not a block scale and a tensor scale"#
+            ),
+            "{e}"
+        );
+    }
+
+    /// A row table is one source; a second source, found or missing, is refused, not dropped.
+    #[test]
+    fn a_row_table_of_two_sources_is_refused() {
+        let st = fixture();
+        let owned = STEMS.map(own);
+        let (first, second) = (own(STEMS[0]), own("missing.stem"));
+        for both in [
+            sources(&owned),
+            vec![(first.0.as_str(), &first.1), (second.0.as_str(), &second.1)],
+        ] {
+            let e = normalize(|n| st.raw(n), &both, Use::Rows).unwrap_err();
+            assert!(e.to_string().contains("exactly one source"), "{e}");
+        }
+    }
+
+    /// The existing GGUF path: a routed stack of the fixture's two real experts, normalized by the
+    /// table and written as a one-shard split with its `.scale`, opens through `Split::open` and
+    /// decodes by `dequant_row` times each expert's scale to the reference rows of
+    /// `modelopt_nvfp4.py ref`, the ModelOpt rule.
+    #[test]
+    fn a_normalized_stack_reads_back_through_a_split_as_the_modelopt_rule() {
+        use gguf::write::{Layout, TensorDecl, Writer};
+        let st = fixture();
+        let owned = STEMS.map(own);
+        let n = normalize(|x| st.raw(x), &sources(&owned), Use::Matrix(Plain::Q8_0)).unwrap();
+        let scale: Vec<u8> = n.scale.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let decls = vec![
+            TensorDecl {
+                name: "stack.weight".into(),
+                dims: n.dims.clone(),
+                type_id: n.type_id,
+                nbytes: n.bytes.len() as u64,
+            },
+            TensorDecl {
+                name: "stack.scale".into(),
+                dims: vec![2],
+                type_id: 0,
+                nbytes: 8,
+            },
+        ];
+        let kvs = vec![
+            (
+                gguf::GENERAL_ARCHITECTURE.to_string(),
+                gguf::Value::String("qwen4exp".into()),
+            ),
+            ("split.no".to_string(), gguf::Value::U16(0)),
+            ("split.count".to_string(), gguf::Value::U16(1)),
+            ("split.tensors.count".to_string(), gguf::Value::I32(2)),
+        ];
+        let dir = std::env::temp_dir().join(format!("hf-modelopt-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stack-00001-of-00001.gguf");
+        let mut w = Writer::new(
+            std::fs::File::create(&path).unwrap(),
+            Layout::new(&kvs, decls).unwrap(),
+        )
+        .unwrap();
+        w.tensor("stack.weight", &n.bytes).unwrap();
+        w.tensor("stack.scale", &scale).unwrap();
+        w.finish().unwrap();
+        let split = gguf::Split::open(&path).unwrap();
+        let read = |name: &str| {
+            let (i, t) = split.find(name).unwrap();
+            split.shard(i).unwrap().data(t).unwrap().to_vec()
+        };
+        let blocks = read("stack.weight");
+        let scales: Vec<f32> = read("stack.scale")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let per = blocks.len() / 2;
+        for (e, stem) in STEMS.iter().enumerate() {
+            let (rows, scale) = reference(stem);
+            assert_eq!(scales[e], scale as f32, "{stem}");
+            assert_eq!(
+                decoded(&blocks[e * per..][..per], 2560, scales[e]),
+                rows,
+                "{stem}"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     /// A one-row triple of `k` values: the scale bytes, codes 1 (0.5) throughout, a tensor scale
