@@ -55,6 +55,7 @@ pub fn loaded_routed<'a>(
 ) -> Result<Plan<'a>, PlacementError> {
     let stage = Machine {
         tiers: Vec::new(),
+        nodes: machine.nodes.iter().take(1).cloned().collect(),
         ..machine.clone()
     };
     let seed = super::plan_routed_reserving(

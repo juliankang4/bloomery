@@ -616,8 +616,10 @@ pub struct Link { pub rail: u64 /* bytes/s, one message */, pub round_trip_ns: u
   Each machine has one head stage, but a remote's routed-only model has no head tensors. The batch's returned rows
   are reserved on node 0's host once per remote, and its staging and scratch on each remote card.
   Each integrated spec keeps its own free reading as its own pool. The `nodes_scale` fixtures
-  use this entry point. The engine load still uses the single-node `plan_tiers` path: remote card bytes are
-  conservatively charged to node 0's physical pool, not credited as extra independent capacity. Private IPv4
+  use this entry point. Every engine load, Qwen3.8's plan (b′) included, plans one machine whose tier cards on other
+  hosts each sit on a node of their own (`Place::machine_with`, tier `t` on node `t + 1`): node 0's pool holds the
+  stage card and the host, and each remote card only its own census reading. A tier node on this host (a loopback address, or a
+  device of node 0's census) shares node 0's pool. Private IPv4
   tier-node addresses require RDMA, with each process holding its own page. On one Spark, the loopback clause
   checks the plan inputs but cannot prove the remote census's origin.
 - **Node 1's figures come from a remote census.** The census reads only this process's CUDA devices. Node 1's census row
@@ -1310,8 +1312,8 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   control channel before the plan, and the load plans with node 1's card from it (9.5 item 5); a tier node is on this
   host through a shared file, or off-host IPv4 nodes through independent RDMA ends (no authentication). The node
   gate constructs independent census-backed machines and their `NodeBudget` and `Terms` inputs (9.2); the load
-  retains the conservative single-pool bound. Left: the adapter from routed assignment to loaded rows and
-  independent capacity in the load, the router's counts in the split (9.2), and decode at n = N in the predictor
+  plans each off-host tier card in its own node's pool. Left: the adapter from routed assignment to loaded rows,
+  the router's counts in the split (9.2), and decode at n = N in the predictor
   (9.8). The Qwen3.8 tier open carries node 1's host room and projects its assigned rows through the common NVMe
   split; this does not yet lower the N-node planner's assignment. The node
   plans' card terms use the generic workstation card constants, not the program's `machine_for_experts` constants.

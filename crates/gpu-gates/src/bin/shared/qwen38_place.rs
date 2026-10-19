@@ -12,9 +12,9 @@ use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
 use model::arch::qwen35moe::place::{
     Experts, KERNEL_POSITIONS, MtpInputs, PlaceError, PlanInputs, machine_bp_on, tier_batch,
 };
-use model::placement::PlanLevers;
 use model::placement::ctx_ask::{Chosen, Probe};
-use model::placement::workstation::{CardSpec, DeviceInfo};
+use model::placement::workstation::{DeviceInfo, TierBatchBytes};
+use model::placement::{Machine, PlanLevers};
 
 /// The Qwen3.8 family's input to the common unset rule (`Place::choose`):
 /// one expert tier card served, the tier count a measured sitting has shown
@@ -46,13 +46,37 @@ pub(crate) struct Residents {
     pub(crate) held: Beside,
 }
 
-/// The experts `cards`' plan (b′) holds on its tier card at `ctx` positions
+/// Plan (b′)'s machine over `place`'s stage and tier card for `layers`
+/// layers at ubatches of `ub` positions (`machine_bp_on`, `draft` the MTP
+/// draft's card bytes on the stage card, `batch` the tier's prompt-batch
+/// bytes), the tier card on the node the placement plans it on
+/// (`Place::machine_with`): the machine every qwen4exp load, seat and probe
+/// with a tier card plans over. A placement of other than two cards is
+/// refused by name.
+pub fn machine_bp38(
+    place: Place,
+    layers: usize,
+    ub: u64,
+    draft: Option<u64>,
+    batch: TierBatchBytes,
+) -> Result<Machine, GateError> {
+    place.machine_with(|stage, tiers| match tiers {
+        &[tier] => Ok(machine_bp_on((stage, tier), layers, ub, draft, batch)),
+        _ => Err(format!(
+            "--place {}: plan (b′) takes a stage card and one tier card",
+            place.name()
+        )
+        .into()),
+    })
+}
+
+/// The experts `place`'s plan (b′) holds on its tier card at `ctx` positions
 /// and ubatches of `ub` under `experts` and `levers` — the load `mtp` names
 /// planning the file's MTP draft beside the target, else the plain plan of
 /// `seqs`' resident sequences, the machine's host reserving the checkpoints
 /// the load declares (`residency38::reserve_checkpoints` at `ctx`, as the
-/// load's own machine does) — the unset rule's `tier_of`. The plan is the model crate's
-/// one owner of both (`machine_bp_on`,
+/// load's own machine does) — the unset rule's `tier_of`. The machine and
+/// the plan are the loads' own ([`machine_bp38`],
 /// `PlanInputs::plan_with_slots`/`plan_mtp_with_slots`); a plan that refuses
 /// (a host expert rule on a tier machine, an idle tier card, a context past
 /// the card's, a host room under the NVMe tier's floor) is the caller's
@@ -60,7 +84,7 @@ pub(crate) struct Residents {
 /// reserves before the tier count is chosen, just as the serving plan does.
 pub fn tier_experts(
     inputs: &PlanInputs,
-    cards: (CardSpec, CardSpec),
+    place: Place,
     (ctx, ub): (u64, u64),
     experts: Experts,
     levers: &PlanLevers,
@@ -68,13 +92,13 @@ pub fn tier_experts(
     Residents { seqs, held }: Residents,
 ) -> Result<u64, GateError> {
     let slots = seqs.slots;
-    let mut machine = machine_bp_on(
-        cards,
+    let mut machine = machine_bp38(
+        place,
         inputs.spec.layers.len(),
         ub,
         mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?,
         tier_batch(&inputs.hp, ub),
-    );
+    )?;
     beside::reserve_on(&mut machine, held);
     reserve_checkpoints(&mut machine, seqs, ctx)?;
     let plan = match mtp {

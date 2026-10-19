@@ -342,8 +342,7 @@ use gguf::Split;
 use model::arch::models::Mixer;
 use model::arch::qwen35moe::head_list::{HeadPick, head_rows_of};
 use model::arch::qwen35moe::place::{
-    Experts, MtpInputs, PlaceError, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx,
-    tier_batch,
+    Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx, tier_batch,
 };
 use model::placement::churn::ChurnPool;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
@@ -448,7 +447,7 @@ enum Kind38 {
     /// The 3090, the gate card.
     Gate,
     /// Plan (b′): the stage as under `a`, the next-largest card its expert
-    /// tier (`place::machine_bp_on`).
+    /// tier (`q38place::machine_bp38`).
     Bp,
 }
 
@@ -527,7 +526,7 @@ impl Place38 {
     /// the target, for `slots` resident sequences: plan (b′) reserves the
     /// draft's card bytes at `ctx` for every slot on its stage card
     /// (`MtpInputs::card_bytes_of`, the reserve `plan_mtp_with_slots`
-    /// checks; `place::machine_bp_on`), the one-card plans count them in
+    /// checks; `q38place::machine_bp38`), the one-card plans count them in
     /// `plan_mtp_with_slots`. The host reserves every slot's checkpoints
     /// ([`seqs38`] through [`reserve_checkpoints`], priced at `ctx` positions
     /// a slot) and, under the draft, every slot's checkpoint hidden rows
@@ -545,15 +544,8 @@ impl Place38 {
         let mut machine = match self.kind {
             Kind38::A | Kind38::Gate => machine_for_experts(self.spec()?, layers, ub, experts),
             Kind38::Bp => {
-                let cards = self.cards.card_specs()?;
                 let draft = mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?;
-                machine_bp_on(
-                    (cards[0], cards[1]),
-                    layers,
-                    ub,
-                    draft,
-                    tier_batch(&inputs.hp, ub),
-                )
+                q38place::machine_bp38(self.cards, layers, ub, draft, tier_batch(&inputs.hp, ub))?
             }
         };
         beside::reserve_on(
@@ -1228,14 +1220,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // runs `a`, the refusal named on stderr, and an unset flag never refuses
     // a load that `--place a` serves.
     let chosen = q38place::choose(a.flag.map(|p| p.cards), &census, |offer| {
-        let specs = offer.card_specs()?;
         let seat = side
             .as_ref()
             .map(|s| vision_seat::encoder_seat(offer, s.bytes))
             .transpose()?;
         q38place::tier_experts(
             &inputs,
-            (specs[0], specs[1]),
+            offer,
             (
                 u64::try_from(a.ctx.unwrap_or(CTX))?,
                 u64::try_from(ubatch_for(a.ctx.unwrap_or(CTX))?)?,

@@ -54,8 +54,7 @@ use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
 use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{
     self, A6000, CONTEXT, CardSpec, GRANULE, HostRead, MARGIN, RTX_3090, SCRATCH,
-    TIER_BATCH_HOST_RESERVE, TierBatchBytes, host_of, tier_batch_host_bytes,
-    tier_batch_staging_bytes, unified_of,
+    TIER_BATCH_HOST_RESERVE, TierBatchBytes, tier_batch_host_bytes, tier_batch_staging_bytes,
 };
 use crate::placement::{
     self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Node,
@@ -1212,7 +1211,8 @@ pub const fn counted_ubatch_bytes(card: &Card) -> u64 {
 /// The machine a qwen4exp plan runs on: `card` runs every one of `layers`,
 /// the head and the token embedding table whole (the file's q8_0 rows, which
 /// the card gathers), with this workstation's context and margin, the host
-/// its card's machine has ([`host_of`]: the pool on a unified machine)
+/// its card's machine has ([`workstation::node_of`]: the pool on a unified
+/// machine)
 /// and the scratch of a load that runs ubatches of up to `ubatch` positions
 /// ([`card_scratch_bytes`]): the size the load itself takes, read once by
 /// the caller that builds this machine and opens the load. A host-routed
@@ -1255,10 +1255,7 @@ pub fn machine_for_experts(
             reserves: Vec::new(),
         }],
         tiers: Vec::new(),
-        nodes: vec![Node {
-            host: host_of(&card),
-            unified: unified_of(&card),
-        }],
+        nodes: vec![workstation::node_of(&card)],
     }
 }
 

@@ -439,7 +439,7 @@ mod cli {
     use model::arch::Arch;
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
+        Experts, MtpInputs, PlanInputs, machine_for_experts, serve_ctx, tier_batch,
     };
     use model::placement::workstation::HostRead;
     use model::placement::{Device, Machine, Plan, PlanLevers};
@@ -1193,10 +1193,9 @@ mod cli {
                 Draft38::Off => None,
                 Draft38::Mtp => Some(mtp_inputs38(levers, file, &inputs)?),
             };
-            let specs = offer.card_specs()?;
             q38place::tier_experts(
                 &inputs,
-                (specs[0], specs[1]),
+                offer,
                 (u64::try_from(ctx)?, u64::try_from(ubatch_for(ctx)?)?),
                 experts,
                 &PlanLevers::from_levers(levers)?,
@@ -1319,7 +1318,7 @@ mod cli {
     /// The machine a plan of `inputs` at ubatches of `ub` positions under
     /// `experts` runs on, over `place`'s cards; `draft` the MTP draft's card
     /// bytes when the draft runs beside the target, which plan (b′) reserves on
-    /// its stage card (`place::machine_bp_on`) and the one-card plans count in
+    /// its stage card (`q38place::machine_bp38`) and the one-card plans count in
     /// `plan_mtp_with` instead.
     fn machine38(
         place: Place,
@@ -1330,8 +1329,8 @@ mod cli {
     ) -> Result<Machine, GateError> {
         let layers = inputs.spec.layers.len();
         Ok(match place.card_specs()?.as_slice() {
-            &[stage, tier] => {
-                machine_bp_on((stage, tier), layers, ub, draft, tier_batch(&inputs.hp, ub))
+            &[_, _] => {
+                q38place::machine_bp38(place, layers, ub, draft, tier_batch(&inputs.hp, ub))?
             }
             &[stage] => machine_for_experts(stage, layers, ub, experts),
             cards => {

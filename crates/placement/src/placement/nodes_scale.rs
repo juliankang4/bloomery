@@ -1868,7 +1868,7 @@ fn named_refusals() {
     let model = QWEN38.model(false);
     assert!(matches!(
         plan_with(&model, &nodes.machine, CTX, &Kv(0), None),
-        Err(super::PlacementError::Nodes { nodes: 2 })
+        Err(super::PlacementError::Nodes { nodes: 2, tiers: 0 })
     ));
     assert!(matches!(
         plan_with(&model, &spark(u64::MAX, QWEN38.layers), CTX, &Kv(0), None),

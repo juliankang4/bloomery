@@ -29,9 +29,7 @@ use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
 use gguf::Split;
 use model::arch::models::Mixer;
-use model::arch::qwen35moe::place::{
-    Experts, PlanInputs, machine_bp_on, machine_for_experts, tier_batch,
-};
+use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts, tier_batch};
 use model::placement::ctx_ask::DEFAULT_SLOTS;
 use model::placement::{Machine, Plan, PlanLevers};
 
@@ -135,10 +133,9 @@ fn choose(inputs: &PlanInputs, ctx: u64, seqs: Seqs) -> Result<Place, Outcome> {
     let at = usize::try_from(ctx).expect("the run's context is a usize");
     let ub = ub_of(at)?;
     q38place::choose(None, census()?, |offer| {
-        let specs = offer.card_specs()?;
         q38place::tier_experts(
             inputs,
-            (specs[0], specs[1]),
+            offer,
             (ctx, ub),
             Experts::Card,
             &PlanLevers::default(),
@@ -172,7 +169,7 @@ fn ub_of(ctx: usize) -> Result<u64, Outcome> {
 /// The machine a qwen4exp plan runs on over `place`'s cards
 /// (`generate_qwen3moe`'s `machine38` and the seat's `Place38::machine`):
 /// the one-card plan (a)'s `machine_for_experts` under card experts, plan
-/// (b′)'s `machine_bp_on`, the host reserving what `seqs` pin
+/// (b′)'s `q38place::machine_bp38`, the host reserving what `seqs` pin
 /// (`reserve_checkpoints` at the context).
 fn machine(
     place: Place,
@@ -188,9 +185,8 @@ fn machine(
         .as_slice()
     {
         &[stage] => machine_for_experts(stage, layers, ub, Experts::Card),
-        &[stage, tier] => {
-            machine_bp_on((stage, tier), layers, ub, None, tier_batch(&inputs.hp, ub))
-        }
+        &[_, _] => q38place::machine_bp38(place, layers, ub, None, tier_batch(&inputs.hp, ub))
+            .map_err(|e| outcome_of(e.as_ref()))?,
         cards => {
             return Err(Outcome::Red(format!(
                 "the placement {} names {} cards; a qwen4exp plan takes a stage and at most \

@@ -307,7 +307,9 @@ pub struct Machine {
     /// stage card in this order.
     pub tiers: Vec<Card>,
     /// The nodes, this process's first: the plan reads [`Machine::host`] and
-    /// [`Machine::unified`], both of `nodes[0]`.
+    /// [`Machine::unified`], both of `nodes[0]`. A card plan holds one node,
+    /// or one more a tier card, tier `t` on node `t + 1`, whose card the pool
+    /// of `nodes[0]` does not hold.
     pub nodes: Vec<Node>,
 }
 
@@ -358,7 +360,12 @@ impl Machine {
         let Some(unified) = self.unified() else {
             return Ok(None);
         };
-        let context = self.all_cards().map(Card::context_in_free).sum();
+        let context = self
+            .all_cards()
+            .enumerate()
+            .filter(|&(i, _)| self.on_this_node(i))
+            .map(|(_, c)| c.context_in_free())
+            .sum();
         unified
             .bytes
             .checked_add(context)
@@ -373,6 +380,16 @@ impl Machine {
     /// [`Device::Card`] and of [`Plan::cards`].
     pub fn all_cards(&self) -> impl Iterator<Item = &Card> {
         self.cards.iter().chain(&self.tiers)
+    }
+
+    /// Whether card `i` of [`Machine::all_cards`] takes its bytes from this
+    /// process's node, whose pool and host the plan holds: every stage card,
+    /// and a tier card unless the machine lists a node of its own for each
+    /// tier, tier `t` on node `t + 1`, whose bound is that card's
+    /// ([`workstation::node_of`]).
+    #[must_use]
+    pub(crate) fn on_this_node(&self, i: usize) -> bool {
+        i < self.cards.len() || self.nodes.len() == 1
     }
 
     /// The card at index `i` of [`Machine::all_cards`].
@@ -1298,13 +1315,14 @@ pub enum PlacementError {
          expert of the layers whose stacks a card can hold; plan without it"
     )]
     IdleTier { card: String, tier: usize },
-    /// A machine of several nodes: this plan holds one node's pool and host,
+    /// A machine of several nodes other than one a tier card: this plan
+    /// holds one node's pool and host and each tier's card on its own node,
     /// and [`nodes::plan_nodes`] plans the others.
     #[error(
-        "a machine of {nodes} nodes: the card plan plans one node; plan the others with \
-         placement::nodes"
+        "a machine of {nodes} nodes for {tiers} tier cards: the card plan plans one node, or one \
+         more a tier card; plan the others with placement::nodes"
     )]
-    Nodes { nodes: usize },
+    Nodes { nodes: usize, tiers: usize },
     /// A unified pool whose bytes and its cards' context self cost
     /// ([`PoolNeed::pool`]) pass u64.
     #[error("a unified pool of {bytes} B and its cards' context of {context} B pass u64 bytes")]
@@ -2427,10 +2445,10 @@ fn plan_rule<'a>(
     routed: Option<RoutedRule>,
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
-    if machine.nodes.len() != 1 {
-        return Err(PlacementError::Nodes {
-            nodes: machine.nodes.len(),
-        });
+    let tiers = machine.tiers.len();
+    let nodes = machine.nodes.len();
+    if nodes != 1 && (tiers == 0 || nodes != 1 + tiers) {
+        return Err(PlacementError::Nodes { nodes, tiers });
     }
     machine.pool_bytes()?;
     let stages = Stages::new(model.layers, &machine.cards)?;
@@ -2550,7 +2568,8 @@ fn plan_rule<'a>(
     // What the caller plans beside this plan on each card comes out of a
     // unified pool too.
     if machine.unified().is_some() {
-        let beside = reserve * machine.all_cards().count() as u64;
+        let here = (0..machine.all_cards().count()).filter(|&c| machine.on_this_node(c));
+        let beside = reserve * here.count() as u64;
         plan.host.pool_card_bytes += beside;
         plan.host.headroom_bytes -= i128::from(beside);
     }
@@ -3803,7 +3822,10 @@ fn totals<'a>(
             let used = card
                 .floor_bytes(heap.taken, kv, stage_rows)
                 .ok_or_else(|| card.bytes_past_u64())?;
-            if machine.unified().is_some() && !host_tier(machine, &rows, c) {
+            if machine.unified().is_some()
+                && machine.on_this_node(c)
+                && !host_tier(machine, &rows, c)
+            {
                 pool_cards = pool_cards
                     .checked_add(used - card.context_in_free())
                     .and_then(|bytes| bytes.checked_add(card.margin_bytes))
@@ -4109,7 +4131,9 @@ impl Plan<'_> {
             .zip(&self.cards)
             .zip(&heaps)
             .enumerate()
-            .filter(|(i, _)| !host_tier(self.machine, &self.rows, *i))
+            .filter(|&(i, _)| {
+                self.machine.on_this_node(i) && !host_tier(self.machine, &self.rows, i)
+            })
             .map(|(_, ((card, totals), heap))| card_total(card, totals, heap) + card.margin_bytes)
             .sum();
         let host = workstation::HostNeed {
@@ -4416,8 +4440,10 @@ mod tests {
             nodes: Vec::new(),
             ..pool(true)
         };
-        let got = plan_in_pool(&none, &unset, |_| Err(PlacementError::Nodes { nodes: 0 }));
-        assert!(matches!(got, Err(PlacementError::Nodes { nodes: 0 })));
+        let got = plan_in_pool(&none, &unset, |_| {
+            Err(PlacementError::Nodes { nodes: 0, tiers: 0 })
+        });
+        assert!(matches!(got, Err(PlacementError::Nodes { nodes: 0, .. })));
 
         // Refused by name: another refusal of a lowered budget, a budget
         // that runs out, a floor still unmet after the rounds.
@@ -4894,6 +4920,97 @@ mod tests {
         }
     }
 
+    /// A tier card on a node of its own ([`workstation::node_of`])
+    /// takes nothing from this node's pool: the same plan's pool need is the
+    /// stage card's and the host's alone, so a pool of exactly that plans clean
+    /// while the tier on this node's pool passes it by the tier card's bytes.
+    /// A machine of other than one node, or one more a tier card, is refused
+    /// by name.
+    #[test]
+    fn a_tier_on_its_own_node_takes_nothing_of_this_nodes_pool() {
+        let model = layered(3);
+        let tier = 4 * EXPERT;
+        let node = |bytes: u64| Node {
+            host: Host {
+                usable_bytes: bytes,
+                reserves: Vec::new(),
+            },
+            unified: Some(UnifiedPool { bytes }),
+        };
+        let machine = |pool: u64, own: bool| Machine {
+            cards: vec![bytes_card("stage", HEAD + 5 * EXPERT, 0..3)],
+            tiers: vec![bytes_card("tier", tier, 0..0)],
+            nodes: if own {
+                vec![node(pool), node(tier)]
+            } else {
+                vec![node(pool)]
+            },
+        };
+        let planned = |pool: u64, own: bool| {
+            let m = machine(pool, own);
+            let plan = plan_with(&model, &m, 4096, &NoKv, None).expect("plans");
+            assert_eq!(plan.tier_n_l, vec![vec![1, 1, 2]], "own node {own}");
+            let need = plan.pool_need().expect("a unified pool");
+            (plan.host.pool_card_bytes, need, plan.violations())
+        };
+        let (shared_cards, shared, _) = planned(1 << 40, false);
+        let (own_cards, own, _) = planned(1 << 40, true);
+        assert_eq!(shared_cards - own_cards, tier);
+        assert_eq!(shared.cards - own.cards, tier);
+        assert_eq!(shared.host, own.host);
+        let (_, _, v) = planned(own.cards + own.host, true);
+        assert!(v.is_empty(), "{v:?}");
+        match planned(own.cards + own.host, false).2.as_slice() {
+            [Violation::PoolOver { cards, .. }] => assert_eq!(*cards, shared.cards),
+            v => panic!("{v:?}, not one PoolOver"),
+        }
+        // A census tier card's context comes out of its own node's pool.
+        for (own, pool) in [(true, 1 << 40), (false, (1 << 40) + 1)] {
+            let mut m = machine(1 << 40, own);
+            m.tiers[0].context_bytes = 1;
+            m.tiers[0].free_bytes = Some(tier);
+            assert_eq!(
+                m.pool_bytes().expect("a pool"),
+                Some(pool),
+                "own node {own}"
+            );
+        }
+        // What the caller plans beside each card comes out of the pool of
+        // that card's node.
+        for (own, cards) in [(true, 1), (false, 2)] {
+            let m = machine(1 << 40, own);
+            let plan = plan_routed_reserving(
+                &model,
+                &m,
+                4096,
+                &NoKv,
+                &PlanLevers::default(),
+                RoutedRule::PerType(CardFormat::of_routed),
+                1,
+            )
+            .expect("plans");
+            let need = plan.pool_need().expect("a unified pool");
+            assert_eq!(
+                plan.host.pool_card_bytes - need.cards,
+                cards,
+                "own node {own}"
+            );
+        }
+        let two = Machine {
+            tiers: vec![bytes_card("tier", tier, 0..0); 2],
+            ..machine(1 << 40, true)
+        };
+        match plan_with(&model, &two, 4096, &NoKv, None) {
+            Err(e @ PlacementError::Nodes { nodes: 2, tiers: 2 }) => assert_eq!(
+                e.to_string(),
+                "a machine of 2 nodes for 2 tier cards: the card plan plans one node, or one more \
+                 a tier card; plan the others with placement::nodes"
+            ),
+            Err(e) => panic!("{e}, not Nodes"),
+            Ok(_) => panic!("two tiers on one remote node planned"),
+        }
+    }
+
     /// A layer's host experts are the model's less the stage card's and the
     /// tier's, they sum to the plan's host experts, a layer the two cards
     /// hold whole hosts none, and a layer past the plan's counts or cards
@@ -5089,6 +5206,30 @@ mod tests {
         }
         assert!(nodes::lower_routed(&mut lowered, &[model.experts, 0]).is_err());
         assert!(nodes::lower_routed(&mut lowered, &[half, half + 1]).is_err());
+        // An explicit ownership seeds the stage alone on node 0, whether
+        // the tier shares its pool or sits on a node of its own.
+        let mut apart = pool_machine.clone();
+        apart.nodes.push(Node {
+            host: Host {
+                usable_bytes: 1 << 30,
+                reserves: Vec::new(),
+            },
+            unified: Some(UnifiedPool { bytes: 1 << 30 }),
+        });
+        for m in [&pool_machine, &apart] {
+            let owned = nodes::loaded_routed(
+                &model,
+                m,
+                4096,
+                &NoKv,
+                &PlanLevers::default(),
+                RoutedRule::PerType(CardFormat::of_routed),
+                0,
+                Some(&[half, model.experts - half]),
+            )
+            .unwrap_or_else(|e| panic!("{} nodes: {e}", m.nodes.len()));
+            assert_eq!(owned.tier_n_l, lowered.tier_n_l, "{} nodes", m.nodes.len());
+        }
 
         for ty in [
             GgmlType::Q5_1,

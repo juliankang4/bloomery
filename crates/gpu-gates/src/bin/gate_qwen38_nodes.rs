@@ -70,6 +70,14 @@ fn main() -> std::process::ExitCode {
 mod q38_history;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/qwen38_place.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate builds plan (b′)'s machine; the module's other half serves the CLI and the seat"
+)]
+mod q38place;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -92,6 +100,7 @@ mod gate {
     use bloomery_gpu::host::step::Chain;
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::host::tier::{TierAct, TierCard, TierOpen, TierSet, TierShape};
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{
         GateError, beside, checks_failed, data_dir, prose_ids, ref_model_path, verdict,
     };
@@ -109,6 +118,7 @@ mod gate {
     use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 
     use crate::q38_history::{self, PROMPT, Run, same, tier_graphs_and_chains, tier_layers};
+    use crate::q38place;
 
     const NAME: &str = "gate_qwen38_nodes";
     /// The stores' positions, `gate_qwen38_twocard`'s.
@@ -267,6 +277,21 @@ mod gate {
                 None,
                 tier_batch(&self.inputs.hp, ub),
             ))
+        }
+
+        /// Plan (b′)'s machine as a node 0 load lays it out: the placement
+        /// `Place::on_host` resolves with `BLOOMERY_TIER_NODES` set, its tier
+        /// card on the node the placement plans it on
+        /// (`q38place::machine_bp38`).
+        fn machine_placed(&self) -> Result<Machine, GateError> {
+            let ub = self.ub as u64;
+            q38place::machine_bp38(
+                Place::parse("0+1")?.on_host()?,
+                self.inputs.spec.layers.len(),
+                ub,
+                None,
+                tier_batch(&self.inputs.hp, ub),
+            )
         }
 
         /// A load of `plan`, its session over [`CTX`] positions.
@@ -741,14 +766,11 @@ mod gate {
         gib: u64,
     ) -> Result<Plan<'a>, GateError> {
         let (spec, _) = node_card(addr)?;
-        let cards = bloomery_gpu_gates::generate::Place::parse("0+1")?
-            .on_host()?
-            .card_specs()?;
-        let tier = cards.get(1).ok_or("the placement holds no tier")?;
+        let m: &'a Machine = machine.insert(c.machine_placed()?);
+        let tier = m.tiers.first().ok_or("the placement holds no tier")?;
         if tier.device.map(|d| d.uuid) != spec.device.map(|d| d.uuid) {
             return Err("the placement did not select node 1's device".into());
         }
-        let m: &'a Machine = machine.insert(c.machine(*tier)?);
         plan_under(c, m, gib)?.map_err(|why| format!("under {gib} GiB: {why}").into())
     }
 
@@ -1517,16 +1539,15 @@ mod gate {
 
     fn measure(c: &Common, gib: u64, decode: Option<(usize, &Path)>) -> Result<(), GateError> {
         let nodes = bloomery_levers::tier_nodes()?;
-        let (arm, card, at) = match nodes.as_slice() {
+        let (arm, machine, at) = match nodes.as_slice() {
             [] => {
                 let own = bloomery_gpu::census()?;
                 let card = own.first().ok_or("no local tier card")?;
-                ("local", spec_of_device(card), None)
+                ("local", c.machine(spec_of_device(card))?, None)
             }
-            [addr] => ("node", node_card(*addr)?.0, Some(*addr)),
+            [addr] => ("node", c.machine_placed()?, Some(*addr)),
             _ => return Err("tier cost needs exactly one tier".into()),
         };
-        let machine = c.machine(card)?;
         let plan = if decode.is_some() {
             c.inputs.plan_with(
                 &machine,

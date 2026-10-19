@@ -92,6 +92,9 @@ pub struct Place {
     /// census), the device's after.
     specs: [Option<CardSpec>; 1 + MAX_TIERS],
     resolved: bool,
+    /// Each tier card is on a host of its own, so the plan holds it in its
+    /// node's pool and not this process's ([`Place::on_nodes`]).
+    own_pools: bool,
 }
 
 /// Two placements are one when they print the same word: the word is what
@@ -122,6 +125,7 @@ const fn alias(i: usize) -> Place {
         n: list.len() as u8,
         specs,
         resolved: false,
+        own_pools: false,
     }
 }
 
@@ -418,6 +422,7 @@ impl Place {
             n: u8::try_from(list.len())?,
             specs,
             resolved: false,
+            own_pools: false,
         })
     }
 
@@ -472,7 +477,9 @@ impl Place {
     /// card in tier order: the stage card resolved against this process's
     /// `census`, each tier card the one device its node's census lists
     /// ([`node_cards`]). Another count of nodes than the placement's tier
-    /// cards is refused by name.
+    /// cards is refused by name. The tiers plan in their own nodes' pools
+    /// when every node is off this host ([`off_host`]); else every card
+    /// plans in this process's pool.
     fn on_nodes(self, census: &[DeviceInfo], nodes: &[SocketAddr]) -> Result<Place, GateError> {
         let tiers = usize::from(self.n) - 1;
         if nodes.len() != tiers {
@@ -484,16 +491,36 @@ impl Place {
             )
             .into());
         }
+        let cards = node_cards(nodes)?;
+        self.at_nodes(
+            census,
+            nodes
+                .iter()
+                .zip(cards)
+                .map(|(&addr, (_, spec))| (addr, spec)),
+        )
+    }
+
+    /// [`Place::on_nodes`] once each tier node's card is read: `tiers` holds
+    /// each node's address and card, in tier order.
+    fn at_nodes(
+        self,
+        census: &[DeviceInfo],
+        tiers: impl Iterator<Item = (SocketAddr, CardSpec)>,
+    ) -> Result<Place, GateError> {
         let stage = workstation::resolve(&self.picks()[..1], census)
             .map_err(|e| format!("--place {}: {e}", self.spelled()))?;
         let mut specs = [None; 1 + MAX_TIERS];
         specs[0] = stage.first().copied();
-        for (s, (_, spec)) in specs[1..].iter_mut().zip(node_cards(nodes)?) {
+        let mut own_pools = true;
+        for (s, (addr, spec)) in specs[1..].iter_mut().zip(tiers) {
+            own_pools &= off_host(census, addr, &spec);
             *s = Some(spec);
         }
         Ok(Place {
             specs,
             resolved: true,
+            own_pools,
             ..self
         })
     }
@@ -721,16 +748,34 @@ impl Place {
             }
             None => {}
         }
-        let mut tier_specs = [stage; MAX_TIERS];
-        tier_specs[..tiers.len()].copy_from_slice(tiers);
-        let k = tiers.len();
-        // Node loads keep the single-pool bound: remote bytes still come out of this pool.
-        // `workstation::plan_node_tiers` alone creates separate pools.
         Ok(move |layers| match batch {
             None => workstation::plan_on(stage, layers),
-            Some(b) => workstation::plan_tiers(layers, stage, &tier_specs[..k], draft, b)
+            Some(b) => self
+                .machine_with(|stage, tiers| {
+                    Ok(workstation::plan_tiers(layers, stage, tiers, draft, b)?)
+                })
                 .expect("Place::machine checked the placement's cards before planning"),
         })
+    }
+
+    /// The machine `layout` lays out over this placement's stage card and
+    /// tier cards, holding the nodes the placement plans the tiers on: tier
+    /// card `t` on node `t + 1` ([`workstation::node_of`]) when the tiers plan
+    /// in their own nodes' pools ([`Place::on_nodes`]), else none, every card
+    /// then in this process's pool. [`Place::machine`] lays out the common
+    /// plan with it, and a family with a layout of its own lays out that.
+    pub fn machine_with(
+        self,
+        layout: impl FnOnce(CardSpec, &[CardSpec]) -> Result<Machine, GateError>,
+    ) -> Result<Machine, GateError> {
+        let specs = self.card_specs()?;
+        let mut machine = layout(specs[0], &specs[1..])?;
+        if self.own_pools {
+            machine
+                .nodes
+                .extend(specs[1..].iter().map(workstation::node_of));
+        }
+        Ok(machine)
     }
 
     /// The flag value, as the `plan` and `load` lines print it.
@@ -773,6 +818,16 @@ impl Place {
             .flatten()
             .and_then(|s| s.device)
     }
+}
+
+/// Whether the tier node at `addr`, whose census gave `spec`, is another
+/// host: an address other than loopback, and a device that is none of this
+/// process's `census`. Such a node's card takes its bytes from its own pool.
+fn off_host(census: &[DeviceInfo], addr: SocketAddr, spec: &CardSpec) -> bool {
+    !addr.ip().is_loopback()
+        && spec
+            .device
+            .is_some_and(|d| census.iter().all(|c| c.uuid != d.uuid))
 }
 
 /// `cuda<o>` as a `'static` word, spelled once per ordinal.
@@ -1763,9 +1818,12 @@ pub fn card_table(loaded: &CardTable, file: &CardTable, path: &Path) -> Result<R
 mod tests {
     use model::placement::Machine;
     use model::placement::devices::census_usable;
-    use model::placement::workstation::{self, A6000, DeviceInfo, RTX_3090, TierBatchBytes};
+    use model::placement::workstation::{
+        self, A6000, CardSpec, DeviceInfo, RTX_3090, TierBatchBytes,
+    };
 
-    use super::{BreakEven, GateError, Place, TierRule};
+    use super::{BreakEven, GateError, Place, TierRule, off_host};
+    use std::net::SocketAddr;
 
     const BATCH: TierBatchBytes = workstation::tier_batch_bytes(5120, 2304, 6, 512);
 
@@ -1908,6 +1966,8 @@ mod tests {
         assert_eq!(m.tiers[0].device.map(|d| d.ordinal), Some(1));
     }
 
+    /// A tier node's census is read before the plan; a loopback node shares this
+    /// host's pool, and a node on another host plans its card in its own.
     #[test]
     fn loopback_census_is_required_without_adding_a_pool() {
         use bloomery_gpu::host::node::wire::{Out, Tag};
@@ -2001,6 +2061,39 @@ mod tests {
         );
         assert_eq!(machine.tiers[0].device, remote_spec.device);
         assert_eq!(machine.tiers[0].free_bytes, remote_spec.free_bytes);
+        // A node on another host plans its card in its own pool; a loopback
+        // address or a device of this process's census is this host. Every
+        // machine over the placement holds that topology, the common plan's
+        // and a family's own layout, whose cards and node 0 stay its own.
+        let lan: SocketAddr = "198.18.4.1:19882".parse().expect("an address");
+        assert!(off_host(&own, lan, &remote_spec));
+        assert!(!off_host(&own, addr, &remote_spec));
+        assert!(!off_host(&own, lan, &workstation::spec_of_device(&own[0])));
+        let layout = |stage: CardSpec, tiers: &[CardSpec]| -> Result<Machine, GateError> {
+            let mut m = workstation::plan_tiers(3, stage, tiers, None, BATCH)?;
+            m.cards[0].scratch_bytes += 1;
+            m.host_mut().reserves.push(("family".to_string(), 1));
+            Ok(m)
+        };
+        let laid = layout(specs[0], &specs[1..]).expect("a layout");
+        let apart = vec![workstation::node_of(&remote_spec)];
+        for (at, tier_nodes) in [(addr, Vec::new()), (lan, apart)] {
+            let place = Place::parse("0+1")
+                .expect("a place")
+                .at_nodes(&own, std::iter::once((at, remote_spec)))
+                .expect("resolved");
+            let common = place.machine(None, Some(BATCH)).expect("the tier plan")(3);
+            assert_eq!(common.nodes[0], machine.nodes[0], "{at}");
+            assert_eq!(common.nodes[1..], tier_nodes, "{at}");
+            let own_layout = place.machine_with(layout).expect("the family's layout");
+            assert_eq!(own_layout.nodes[0], laid.nodes[0], "{at}");
+            assert_eq!(own_layout.nodes[1..], tier_nodes, "{at}");
+            assert_eq!(
+                (&own_layout.cards, &own_layout.tiers),
+                (&laid.cards, &laid.tiers),
+                "{at}"
+            );
+        }
         let single = Place::parse("0")
             .expect("a place")
             .on(&own)

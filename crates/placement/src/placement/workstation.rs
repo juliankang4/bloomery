@@ -250,10 +250,7 @@ pub fn plan_on(spec: CardSpec, layers: usize) -> Machine {
     Machine {
         cards: vec![card(spec, 0..layers, true)],
         tiers: Vec::new(),
-        nodes: vec![Node {
-            host: host_of(&spec),
-            unified: unified_of(&spec),
-        }],
+        nodes: vec![node_of(&spec)],
     }
 }
 
@@ -486,6 +483,17 @@ pub fn plan_tiers(
 ) -> Result<Machine, PlacementError> {
     let host_rows = check_tiers(stage, tiers, draft, batch)?;
     Ok(tiered(layers, stage, tiers, draft, batch, host_rows))
+}
+
+/// The node a machine of `spec` alone plans on: its host and unified pool
+/// ([`host_of`], [`unified_of`]). A tier card on a host of its own sits on
+/// such a node, tier `t` on node `t + 1` ([`super::Machine::nodes`]).
+#[must_use]
+pub fn node_of(spec: &CardSpec) -> Node {
+    Node {
+        host: host_of(spec),
+        unified: unified_of(spec),
+    }
 }
 
 /// One card machine per node, node 0 first: `stage` runs the full model;
