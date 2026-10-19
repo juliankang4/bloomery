@@ -150,7 +150,7 @@ fn decision_head(name: &str) -> bool {
 /// A tensor's role and layer by its name; `None` when the table does not
 /// hold it, its layer is past `n_layer`, or a trunk layer carries a
 /// next-token stem. The PLE table has no layer in its name and belongs to the
-/// site's.
+/// site's; so does an F8 table's scale, which the load reads by name.
 fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
     let exp = hp.variant == Variant::Qwen4Exp;
     if hp.variant == Variant::Qwen35 && decision_head(name) {
@@ -166,6 +166,10 @@ fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
         "per_layer_token_embd.weight" => {
             let site = hp.exp.as_ref()?.ple?.layer;
             return Some((Role::EngramTable, Some(site)));
+        }
+        "per_layer_token_embd.scale" => {
+            let site = hp.exp.as_ref()?.ple?.layer;
+            return Some((Role::Unread, Some(site)));
         }
         _ => {}
     }

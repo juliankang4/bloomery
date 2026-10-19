@@ -1045,23 +1045,24 @@ fn upload_file_tensor_with<'g>(
     )
 }
 
-/// The per-tensor scale an NVFP4 tensor's products are multiplied by: the
-/// one f32 of `<stem>.scale` beside `<stem>.weight`, found through `find`
-/// (the file's tensors by name: its shard and entry). `None` for any other
+/// The per-tensor scale a tensor's values are multiplied by: the one f32 of
+/// `<stem>.scale` beside `<stem>.weight`, found through `find` (the file's
+/// tensors by name: its shard and entry). An NVFP4 tensor and one in
+/// bloomery's F8 rows ([`gguf::F8E4M3_ROWS`]) carry one; `None` for any other
 /// type. A name without the `.weight` suffix, a missing scale, one of another
 /// type or more than one value (a per-expert scale has no layout here), and
 /// a value that is not finite are refused by name as `what`'s.
-fn tensor_scale<'g>(
+pub(crate) fn tensor_scale<'g>(
     what: &'static str,
     t: &TensorInfo,
     find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
 ) -> Result<Option<f32>, GpuError> {
-    if t.ty != GgmlType::NVFP4 {
+    if t.ty != GgmlType::NVFP4 && t.ty != GgmlType::Unknown(gguf::F8E4M3_ROWS.id) {
         return Ok(None);
     }
     let refuse = |detail: String| GpuError::shape(what, format!("tensor {}: {detail}", t.name));
     let stem = t.name.strip_suffix(".weight").ok_or_else(|| {
-        refuse("an nvfp4 tensor's name ends in .weight, its scale's in .scale".into())
+        refuse("a scaled tensor's name ends in .weight, its scale's in .scale".into())
     })?;
     let name = format!("{stem}.scale");
     let (g, s) =

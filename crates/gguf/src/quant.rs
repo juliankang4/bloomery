@@ -282,6 +282,10 @@ pub enum QuantError {
     /// A byte that is no UE4M3 scale, outside a block ([`ue4m3_to_f32_half`]).
     #[error("{byte:#04x} is no UE4M3 scale: {why}")]
     NotUe4m3 { byte: u8, why: &'static str },
+    /// An F8_E4M3 byte that holds no value ([`E4m3Rows`]), at its index in
+    /// the span.
+    #[error("f8_e4m3 value {at} is byte {byte:#04x}, E4M3's NaN")]
+    E4m3Nan { at: usize, byte: u8 },
 }
 
 /// Dequantize `n = dst.len()` values of one contiguous span of type `ty`.
@@ -887,6 +891,56 @@ fn ue4m3(byte: u8) -> Result<f32, &'static str> {
         (1.0 + man / 8.0) * 2f32.powi(exp - 7)
     };
     Ok(raw * 0.5)
+}
+
+/// Rows of bloomery's F8 type ([`crate::F8E4M3_ROWS`]) decoded: each byte an
+/// F8_E4M3 value (OCP E4M3FN: a sign bit, four exponent bits of bias 7, three
+/// mantissa bits, `m · 2^-9` at exponent 0) times the tensor's scale, the one
+/// rounding of the exact value's product with the scale. 0x7F and 0xFF,
+/// E4M3's NaNs, hold no value: a span holding one is refused by name.
+pub struct E4m3Rows {
+    /// Each byte's value times the scale; a NaN byte's entry is never read.
+    table: [f32; 256],
+}
+
+impl E4m3Rows {
+    /// The decode of a tensor whose scale is `scale`. Load-time: the table
+    /// is built here, once.
+    #[must_use]
+    pub fn new(scale: f32) -> E4m3Rows {
+        let mut table = [f32::NAN; 256];
+        for (byte, v) in (0..=255u8).zip(&mut table) {
+            // UE4M3 is E4M3 without its sign, at half the value.
+            if let Ok(half) = ue4m3(byte & 0x7F) {
+                let twice = if byte & 0x80 == 0 { 2.0 } else { -2.0 };
+                *v = twice * half * scale;
+            }
+        }
+        E4m3Rows { table }
+    }
+
+    /// `src`'s bytes decoded into `dst`, one value a byte.
+    ///
+    /// # Errors
+    ///
+    /// [`QuantError::ShortSrc`] when `src` holds fewer bytes than `dst`
+    /// values, and [`QuantError::E4m3Nan`] for the first NaN byte, before any
+    /// value of the span is written.
+    pub fn decode(&self, src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
+        let src = src.get(..dst.len()).ok_or(QuantError::ShortSrc {
+            ty: GgmlType::Unknown(crate::F8E4M3_ROWS.id),
+            src: src.len(),
+            need: dst.len(),
+            n: dst.len(),
+        })?;
+        if let Some(at) = src.iter().position(|&b| b & 0x7F == 0x7F) {
+            return Err(QuantError::E4m3Nan { at, byte: src[at] });
+        }
+        for (o, &b) in dst.iter_mut().zip(src) {
+            *o = self.table[usize::from(b)];
+        }
+        Ok(())
+    }
 }
 
 /// Port of `dequantize_row_nvfp4` (llama.cpp-mainline ggml-quants.c:589-612).
@@ -1963,6 +2017,113 @@ mod tests {
                     && text.contains(why),
                 "{text}"
             );
+        }
+    }
+
+    /// Signed E4M3 reference bits from the existing f64 oracle, grouped by scale.
+    fn e4m3_reference() -> Vec<(u32, u8, Option<u32>)> {
+        [0x3F80_0000u32, 0x3951_0000]
+            .into_iter()
+            .flat_map(|scale| {
+                let factor = f64::from(f32::from_bits(scale));
+                (0..=u8::MAX).map(move |byte| {
+                    let magnitude = byte & 0x7F;
+                    let value = (magnitude != 0x7F).then(|| {
+                        let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
+                        ((sign * ue4m3(magnitude) * factor) as f32).to_bits()
+                    });
+                    (scale, byte, value)
+                })
+            })
+            .collect()
+    }
+
+    /// bloomery's F8 rows against the reference over all 256 bytes at scale
+    /// 1 and at the checkpoint's PLE scale: every byte that holds a value
+    /// decodes to the reference's bits (the sign of zero included); 0x7F and
+    /// 0xFF are refused naming the byte and its index, and a short span by
+    /// its lengths. A wrong exponent bias, a subnormal read as normal, a
+    /// dropped sign or a scale applied twice fails it.
+    #[test]
+    fn e4m3_rows_decode_every_byte_to_the_reference() {
+        let reference = e4m3_reference();
+        assert_eq!(reference.len(), 512);
+        for scale in [0x3F80_0000u32, 0x3951_0000] {
+            let rows = super::E4m3Rows::new(f32::from_bits(scale));
+            for &(_, byte, want) in reference.iter().filter(|r| r.0 == scale) {
+                let mut two = [0.0f32; 2];
+                match (want, rows.decode(&[0x38, byte], &mut two)) {
+                    (Some(bits), Ok(())) => assert_eq!(
+                        two[1].to_bits(),
+                        bits,
+                        "scale {scale:08x} byte {byte:#04x}: got {:e}",
+                        two[1]
+                    ),
+                    (None, Err(e)) => {
+                        assert_eq!(e, QuantError::E4m3Nan { at: 1, byte });
+                        assert!(e.to_string().contains("value 1 is byte"), "{e}");
+                        assert_eq!(two, [0.0; 2], "NaN refusal must leave dst unchanged");
+                    }
+                    (want, got) => panic!("byte {byte:#04x}: want {want:?}, got {got:?}"),
+                }
+            }
+        }
+        assert!(matches!(
+            super::E4m3Rows::new(1.0).decode(&[0x38], &mut [0.0; 2]),
+            Err(QuantError::ShortSrc {
+                src: 1,
+                need: 2,
+                ..
+            })
+        ));
+    }
+
+    /// A split holding a PLE table in bloomery's F8 rows and its `.scale`,
+    /// opened through `Split::open`: each row, decoded at the scale read from
+    /// the file, is the reference's (every byte that holds a value appears).
+    #[test]
+    fn a_split_in_f8_rows_decodes_to_the_reference() {
+        use crate::write::{TensorDecl, write_file};
+        const SCALE: u32 = 0x3951_0000;
+        let want: Vec<(u8, u32)> = e4m3_reference()
+            .into_iter()
+            .filter_map(|(s, b, v)| Some((b, v?)).filter(|_| s == SCALE))
+            .collect();
+        let table: Vec<u8> = want.iter().map(|w| w.0).cycle().take(2 * 160).collect();
+        let decl = |name: &str, dims: Vec<u64>, type_id, nbytes| TensorDecl {
+            name: name.to_string(),
+            dims,
+            type_id,
+            nbytes,
+        };
+        let path = std::env::temp_dir().join(format!("gguf-f8-rows-{}.gguf", std::process::id()));
+        write_file(
+            &path,
+            &[],
+            &[
+                (
+                    decl("t.weight", vec![160, 2], crate::F8E4M3_ROWS.id, 320),
+                    table,
+                ),
+                (decl("t.scale", vec![1], 0, 4), SCALE.to_le_bytes().to_vec()),
+            ],
+        );
+        let split = crate::Split::open(&path);
+        std::fs::remove_file(&path).unwrap();
+        let split = split.unwrap();
+        let data = |name: &str| {
+            let (s, t) = split.find(name).unwrap();
+            split.shard(s).unwrap().data(t).unwrap()
+        };
+        let scale = f32::from_le_bytes(data("t.scale").try_into().unwrap());
+        let rows = super::E4m3Rows::new(scale);
+        for (r, src) in data("t.weight").chunks_exact(160).enumerate() {
+            let mut got = [0.0f32; 160];
+            rows.decode(src, &mut got).unwrap();
+            for (i, (g, &b)) in got.iter().zip(src).enumerate() {
+                let bits = want.iter().find(|w| w.0 == b).unwrap().1;
+                assert_eq!(g.to_bits(), bits, "row {r} value {i} byte {b:#04x}");
+            }
         }
     }
 

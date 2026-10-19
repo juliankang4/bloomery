@@ -120,6 +120,20 @@ pub struct PrivateType {
     pub size: u64,
 }
 
+/// bloomery's F8 row type: one F8_E4M3 byte a value, its tensor's values that
+/// byte's value times the one f32 of `<stem>.scale` beside `<stem>.weight`
+/// ([`quant::E4m3Rows`]). Its id is bloomery's own value types' range (2000
+/// up; 1000 up holds its re-layouts of ggml types), outside every ggml table.
+pub const F8E4M3_ROWS: PrivateType = PrivateType {
+    id: 2000,
+    blck: 1,
+    size: 1,
+};
+
+/// The private types a [`Split`] opens with: bloomery's own value types a
+/// model file may carry.
+const SPLIT_PRIVATE: [PrivateType; 1] = [F8E4M3_ROWS];
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     #[error("io error: {0}")]
@@ -512,7 +526,8 @@ const SPLIT_TENSORS: &str = "split.tensors.count";
 /// read.
 ///
 /// Every shard opens with the strict reader and lazily, so opening touches
-/// the headers only. Metadata is the first shard's: the splitter writes the
+/// the headers only, sizing bloomery's own value types too
+/// ([`Split::block`]). Metadata is the first shard's: the splitter writes the
 /// model's keys there alone (gguf-split.cpp:242).
 pub struct Split {
     shards: Vec<Gguf>,
@@ -593,6 +608,19 @@ impl Split {
         self.shards.len()
     }
 
+    /// A block of `ty` as a split sizes it, its values and its bytes: ggml's
+    /// types by their table, bloomery's own value types by theirs; `None` for
+    /// a type neither sizes.
+    #[must_use]
+    pub fn block(ty: GgmlType) -> Option<(u64, u64)> {
+        ty.blck_size().zip(ty.type_size()).or_else(|| {
+            SPLIT_PRIVATE
+                .iter()
+                .find(|p| GgmlType::Unknown(p.id) == ty)
+                .map(|p| (p.blck, p.size))
+        })
+    }
+
     /// Shard `i`'s reader — the one whose [`Gguf::data`] holds its tensors.
     pub fn shard(&self, i: usize) -> Option<&Gguf> {
         self.shards.get(i)
@@ -671,7 +699,8 @@ fn shard_suffix(i: u64, count: u64) -> String {
 
 /// The strict open of one shard, its error naming the file.
 fn open_shard(path: &Path) -> Result<Gguf, LoadError> {
-    Gguf::open(path).map_err(|e| match e {
+    let lazy = Weights::Mapped { populate: false };
+    Gguf::open_private(path, lazy, &SPLIT_PRIVATE).map_err(|e| match e {
         LoadError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => LoadError::MissingShard {
             path: path.display().to_string(),
         },
@@ -1531,6 +1560,40 @@ mod private_tests {
                 other => panic!("{table:?} must be refused, got {:?}", other.map(|_| ())),
             }
         }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// bloomery's F8 rows open through a split and nowhere else: the strict
+    /// open refuses the type by the tensor's name, `Split::open` sizes it one
+    /// byte a value from its own table and keeps the id, and `Split::block`
+    /// answers for it beside ggml's types; another private id is sized by
+    /// neither.
+    #[test]
+    fn bloomerys_f8_rows_open_through_a_split() {
+        let d = set_dir("f8");
+        let p = d.join("f8.gguf");
+        let rows: Vec<u8> = (0..320u32).map(|i| (i * 7) as u8).collect();
+        let t = TensorDecl {
+            name: "t".to_string(),
+            dims: vec![160, 2],
+            type_id: crate::F8E4M3_ROWS.id,
+            nbytes: 320,
+        };
+        write_file(&p, &[], &[(t, rows.clone())]);
+        let ty = GgmlType::Unknown(crate::F8E4M3_ROWS.id);
+        assert!(
+            matches!(Gguf::open(&p), Err(LoadError::UnsupportedType { ref name, ty: got }) if name == "t" && got == ty)
+        );
+        let split = Split::open(&p).unwrap();
+        let (s, t) = split.find("t").unwrap();
+        assert_eq!(
+            (t.ty, t.nbytes, t.dims.as_slice()),
+            (ty, 320, &[160u64, 2][..])
+        );
+        assert_eq!(split.shard(s).unwrap().data(t).unwrap(), rows.as_slice());
+        assert_eq!(Split::block(ty), Some((1, 1)));
+        assert_eq!(Split::block(GgmlType::Q4_0), Some((32, 18)));
+        assert_eq!(Split::block(GgmlType::Unknown(TAG)), None);
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

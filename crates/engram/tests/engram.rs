@@ -663,6 +663,39 @@ fn hw_engram_two_d_table_rows_are_unchanged() {
     }
 }
 
+/// A table in bloomery's F8 rows (a private type the split sizes, one byte a
+/// value) opens with rows of its width in bytes, each the file's bytes.
+#[test]
+#[ignore = "hw: the box's disk-backed target directory"]
+fn hw_engram_f8_rows_table_reads_rows_of_its_width() {
+    use gguf::write::{Layout, TensorDecl, Writer};
+    let scratch = Scratch::new("f8");
+    let path = scratch.0.join("f8.gguf");
+    let source = random_bytes(6, 160 * 9);
+    let decl = TensorDecl {
+        name: TABLE.to_string(),
+        dims: vec![160, 9],
+        type_id: gguf::F8E4M3_ROWS.id,
+        nbytes: 160 * 9,
+    };
+    let mut w = Writer::new(
+        File::create(&path).unwrap(),
+        Layout::new(&[], vec![decl]).unwrap(),
+    )
+    .unwrap();
+    w.tensor(TABLE, &source).unwrap();
+    w.finish().unwrap().sync_all().unwrap();
+    let split = Arc::new(Split::open(&path).unwrap());
+    let table = open_table(&split, TABLE).expect("an F8 rows table opens");
+    assert_eq!(table.row_bytes(), 160);
+    let ids = [8u32, 0, 3];
+    let mut copied = vec![0u8; ids.len() * 160];
+    table.copy_rows(&ids, &mut copied).unwrap();
+    for (got, &r) in copied.chunks_exact(160).zip(&ids) {
+        assert_eq!(got, &source[r as usize * 160..][..160], "row {r}");
+    }
+}
+
 /// A tensor that is neither a 2-D table nor a 3-D stack is refused, and the
 /// refusal names the tensor and its dims.
 #[test]

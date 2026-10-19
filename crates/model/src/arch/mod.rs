@@ -781,6 +781,8 @@ pub(crate) mod synthetic {
         /// IQ2_XXS: blocks of 256 values in 66 bytes; the first dim a multiple of
         /// 256.
         Iq2Xxs,
+        /// bloomery's F8_E4M3 rows: one byte a value, scaled by `<stem>.scale`.
+        F8Rows,
     }
 
     impl Ty {
@@ -809,6 +811,7 @@ pub(crate) mod synthetic {
                     );
                     (16, n / 256 * 66)
                 }
+                Ty::F8Rows => (gguf::F8E4M3_ROWS.id, n),
             }
         }
     }

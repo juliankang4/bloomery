@@ -2143,6 +2143,51 @@ mod tests {
         assert_eq!(kv.layer_bytes(3, 4096), 0);
     }
 
+    /// A qwen4exp file whose PLE table is F8 rows describes with the table's
+    /// scale beside it: both on the PLE site, the scale left in the file for
+    /// the load to read by name.
+    #[test]
+    fn an_f8_ple_table_and_its_scale_describe() {
+        use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
+        use crate::arch::synthetic::{Ty, V, header_typed};
+        use crate::placement::Role;
+        use crate::placement::workstation::HostRead;
+
+        let table = "per_layer_token_embd.weight";
+        let scale = "per_layer_token_embd.scale";
+        let typed: Vec<_> = tensors()
+            .into_iter()
+            .map(|(n, d)| {
+                if n == table {
+                    (n, d, Ty::F8Rows)
+                } else if n.ends_with(".attn_q.weight") {
+                    // The query projection writes each of the 4 heads' 16
+                    // values and its gate beside them.
+                    (n, vec![64, 128], Ty::F32)
+                } else {
+                    (n, d, Ty::F32)
+                }
+            })
+            .chain([(scale.to_string(), vec![1], Ty::F32)])
+            .collect();
+        let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
+        let path = header_typed("q4x-f8-ple", "qwen4exp", &keys(), &pre, &typed);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given));
+        let _ = std::fs::remove_file(&path);
+        let inputs = inputs.expect("the file describes");
+        let role = |name: &str| {
+            inputs
+                .model
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| (t.role, t.layer))
+        };
+        assert_eq!(role(table), Some((Role::EngramTable, Some(1))));
+        assert_eq!(role(scale), Some((Role::Unread, Some(1))));
+    }
+
     /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth
     /// one attention, the PLE ring on layer 1) at a context of whole pools
     /// [derived]: twelve attention layers' 2,304 B a position and 256 B a
