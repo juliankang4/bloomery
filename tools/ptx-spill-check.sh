@@ -43,6 +43,7 @@
 #   ptx-spill bin=<bin> scan is no-jit (jit_local not read) FAIL   (a scan that skipped the JIT)
 #   ptx-spill bin=<bin> no table for <arch> on cc <M.m> FAIL       (no table of the scan's arch and capability)
 #   ptx-spill bin=<bin> scan rc=75 CONTENTION                      (the scan's JIT could not take a lock: no reading, no verdict)
+#   ptx-spill bin=<bin> comparison=unread|entries=unread|pinned=unread FAIL   (the comparison or a count could not be read)
 # Before its verdict each binary names the table it read: `ptx-spill bin=<bin> table=<path> arch=<arch> jit-cc=<M.m>`.
 # Exit status: 0 when every binary's scan read and matched its pins; 1 on a violation or a scan
 # that failed (ptx-scan's own nonzero exit but 75, or a table it printed without rows); 75 when at least one scan
@@ -193,6 +194,20 @@ self_test() {
   fi
   BLOOMERY_ARCH=sm_86 check "the table's own arch is read against the table" 0 "ptx-spill bin=a entries=2 pinned=2 nonzero=k2(spill=8,jit_local=0) violations=0 PASS" "$t/table" a
   BLOOMERY_ARCH=sm86 check "a BLOOMERY_ARCH that is no arch" 64 "ptx-spill-check.sh: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: sm_86), got 'sm86'" "$t/table" a
+  # A failed read is no verdict. The md5sum and wc stand-ins of tools/ref/read-stubs.sh fail on a text that holds the word
+  # fail-wc: rn's scan rows and pins both hold it (no violation, so a lost count read as PASS), rp's pins alone; a sort that
+  # fails loses the comparison itself.
+  mkdir "$t/stubs" "$t/nosort"
+  # shellcheck disable=SC2016 # the inner shell expands them; a subshell, so the file's own check does not replace this one
+  bash -c 'source "$1" && read_stubs "$2"' read-stubs "${BASH_SOURCE[0]%/*}/ref/read-stubs.sh" "$t/stubs"
+  printf '#!/bin/sh\nexit 1\n' > "$t/nosort/sort"
+  chmod +x "$t/nosort/sort"
+  scan rn "fail-wc 0 0"
+  scan rp "k1 0 0"
+  printf '%s\n' '# fixture' '# arch: sm_86' '# jit-cc: 8.6' 'rn fail-wc 0 0' 'rp k1 0 0' 'rp k2 0 fail-wc' > "$t/reads"
+  PATH=$t/stubs:$PATH check "an entry count that fails to read" 1 "ptx-spill bin=rn entries=unread FAIL" "$t/reads" rn
+  PATH=$t/stubs:$PATH check "a pin count that fails to read" 1 "ptx-spill bin=rp pinned=unread FAIL" "$t/reads" rp
+  PATH=$t/nosort:$PATH check "a comparison that fails to read" 1 "ptx-spill bin=a comparison=unread FAIL" "$t/table" a
   rm -rf "$t"
   [ "$fails" = 0 ] && echo "ptx-spill-check: self-test ok" || { echo "ptx-spill-check: self-test $fails failed" >&2; return 1; }
 }
@@ -312,13 +327,13 @@ for ARG in "$@"; do
       if ($3 != wj[$1]) printf "%s %s jit_local=%s pinned=%s %s\n", b, $1, $3, wj[$1], ($3 + 0 > wj[$1] + 0 ? "ABOVE" : "BELOW")
     }
     END { for (e in ws) if (!(e in seen)) printf "%s %s stale\n", b, e }
-  ' "$TMP/$BIN.want" "$TMP/$BIN.got" | sort)
-  n=$(wc -l < "$TMP/$BIN.got" | tr -d ' ')
-  p=$(wc -l < "$TMP/$BIN.want" | tr -d ' ')
+  ' "$TMP/$BIN.want" "$TMP/$BIN.got" | sort) || { echo "ptx-spill bin=$BIN comparison=unread FAIL"; rc=1; continue; }
+  n=$(wc -l < "$TMP/$BIN.got" | tr -d ' ') || { echo "ptx-spill bin=$BIN entries=unread FAIL"; rc=1; continue; }
+  p=$(wc -l < "$TMP/$BIN.want" | tr -d ' ') || { echo "ptx-spill bin=$BIN pinned=unread FAIL"; rc=1; continue; }
   nz=$(awk '$2 != 0 || $3 != 0 { printf "%s%s(spill=%s,jit_local=%s)", c, $1, $2, $3; c = "," }' "$TMP/$BIN.got")
   if [ -n "$out" ]; then
     echo "$out"
-    v=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
+    v=$(printf '%s\n' "$out" | wc -l | tr -d ' ') || v=unread
     echo "ptx-spill bin=$BIN entries=$n pinned=$p nonzero=${nz:-none} violations=$v FAIL"
     rc=1
   else
