@@ -136,6 +136,26 @@ mod gate {
         w
     }
 
+    /// The set's images in run order, each with whether it is [`FULL`]: that image first, then
+    /// the rest by name. A set without it is refused by name, since the host rules and the reuse
+    /// clause run on it.
+    fn cases<'a>(
+        images: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<(String, bool)>, GateError> {
+        let mut names: Vec<(String, bool)> = images
+            .into_iter()
+            .map(|n| (n.to_string(), n == FULL))
+            .collect();
+        if !names.iter().any(|(_, full)| *full) {
+            return Err(format!(
+                "the set has no image {FULL}: the host rules and the reuse clause run on it"
+            )
+            .into());
+        }
+        names.sort_by_key(|(n, full)| (!*full, n.clone()));
+        Ok(names)
+    }
+
     // ------------------------------------------------------------ independent host rules
 
     /// V4.1's table builder as it was before the patch order became a parameter, frozen.
@@ -542,6 +562,7 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let set = ClefvisSet::open(&TAPS.path(TAPS_SET), &TAPS)?;
+        let names = cases(set.images.iter().map(|i| i.name.as_str()))?;
         let twin = ClefvisSet::open(&TAPS.path(TAPS_CPU_SET), &TAPS)?;
         let file = Gguf::open(MMPROJ_BF16)?;
         let (ctx, stream) = bloomery_gpu::capsync::fresh_stream(0)?;
@@ -579,12 +600,6 @@ mod gate {
         ok &= pos_identity(&ctx, &stream, &hw, hp.dim)?;
         ok &= v41_table_bytes();
 
-        let mut names: Vec<(String, bool)> = set
-            .images
-            .iter()
-            .map(|i| (i.name.clone(), i.name == FULL))
-            .collect();
-        names.sort_by_key(|(n, full)| (!*full, n.clone()));
         let oracle = oracle_taps();
         let mut full_state: Option<(Img, Vec<u16>)> = None;
 
@@ -790,5 +805,25 @@ mod gate {
             n += 1;
         }
         n
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{FULL, LARGEST, cases};
+
+        #[test]
+        fn a_set_without_the_full_tap_image_is_refused_by_name() {
+            let err = cases([LARGEST, "crop-200x200"]).expect_err("no full-tap image");
+            assert!(err.to_string().contains(FULL), "{err}");
+            let order = cases([LARGEST, FULL, "crop-200x200"]).expect("the full-tap image");
+            assert_eq!(
+                order,
+                [
+                    (FULL.to_string(), true),
+                    ("crop-200x200".to_string(), false),
+                    (LARGEST.to_string(), false),
+                ]
+            );
+        }
     }
 }

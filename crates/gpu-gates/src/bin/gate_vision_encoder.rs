@@ -392,6 +392,15 @@ mod gate {
         sensitivity: HashMap<String, f64>,
     }
 
+    /// Refuses a set without [`FULL`] by name: the block-0 host rules run on that image.
+    fn has_full<'a>(mut stems: impl Iterator<Item = &'a str>) -> Result<(), GateError> {
+        if stems.any(|stem| stem == FULL) {
+            Ok(())
+        } else {
+            Err(format!("the set has no image {FULL}: the host rules run on it").into())
+        }
+    }
+
     /// The vision family's set (`refset::vision`), or the one under
     /// `ref-vision` that `$BLOOMERY_VISION_SET` names: complete, of the
     /// family's checkpoint revision.
@@ -401,6 +410,7 @@ mod gate {
             Err(_) => VISION.path(VISION_SET),
         };
         let set = VisionSet::open(&dir, &VISION)?;
+        has_full(set.images.iter().map(Image::stem))?;
         let files = set
             .files
             .iter()
@@ -1203,6 +1213,18 @@ mod gate {
             Ok(())
         } else {
             Err(checks_failed())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{FULL, SMALL, has_full};
+
+        #[test]
+        fn a_set_without_the_full_tap_image_is_refused_by_name() {
+            let err = has_full([SMALL].into_iter()).expect_err("no full-tap image");
+            assert!(err.to_string().contains(FULL), "{err}");
+            has_full([SMALL, FULL].into_iter()).expect("the full-tap image");
         }
     }
 }

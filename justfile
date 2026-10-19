@@ -2664,8 +2664,9 @@ gate-vision:
 # V4.1 이미지 인코더 카드 게이트(V2): 전체 사슬(ViT 32블록 + aligner, bf16 텐서코어 GEMM, 비인과 어텐션, 2D RoPE)을
 # 비전 오라클 세트의 모든 이미지에 돌려 공식 vision.py와 탭별로 대조한다 — embed·blk0·forced 탭은 절대 핀, 자유 실행 탭은
 # 참조의 자기 민감도 행(MANIFEST `# sensitivity`)의 K배 안; 블록 0은 crates/gpu-vision의 호스트 규칙과 연산별로 대조. 3090, 게이트 락.
+# grad-448 이미지가 없는 세트는 이름을 대고 거부한다; 그 단위 시험이 tools/gate.sh로 먼저 돈다.
 gate-gpu-vision:
-    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_vision_encoder && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_vision_encoder'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features vision --bin gate_vision_encoder && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_vision_encoder && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_vision_encoder'
 
 # The Qwen3-VL image tower on the card (the `qwen3vl_merger` mmproj of Clef-Flash, Qwen3.6 and Qwen3.8): 27 blocks (heads of 72,
 # LayerNorm, tanh GELU, the learned position table resized to the grid, 2D RoPE) and the 2x2 merger against every tap of the Clef
@@ -2675,9 +2676,10 @@ gate-gpu-vision:
 # accumulation-order bound, attention inside its f32 bound, the tanh GELU at a pinned count). Also the card bytes (weights
 # 924,123,136 B, scratch 570,949,632 B at 4096 tokens), 249 launches an image, and reuse after the largest image bit for bit. The
 # Qwen3.6 and Qwen3.8 arms end in a named deferred line while their family's set is not in the tree (a deferral is not a pass).
+# A set without the full-tap image is refused by name; the binary's unit test of that runs through tools/gate.sh first.
 # Real file only; the gate lock.
 gate-gpu-qwen3vl-tower:
-    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3vl-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3vl_tower'
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3vl-tower && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features vision --bin gate_qwen3vl_tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen3vl_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3vl_tower'
 
 # The MiniCPM-V image tower on the card (the mmproj of MiniCPM-V 4.7: the Qwen3-VL block set plus a vit_merger of windowed attention and a
 # 2x2 mean-residual down-sample, and a 2x2 MLP merger). The two kernels it adds, each against its host rule on seeded synthetic inputs:
