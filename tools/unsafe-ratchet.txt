@@ -390,7 +390,11 @@ gpu-deepseek41 385 44 0
 # PIN(2026-10-15): gpu-gates 75 -> 78 blocks, new code, not old code relaxed: one parent-death setup replaces
 # two copies with three blocks (prctl, getppid and pre_exec), and its before-registration test adds raise and
 # pre_exec, each with its SAFETY line.
-gpu-gates 78 5 1
+# PIN(2026-10-19): gpu-gates 78 -> 89 blocks, new code, not old code relaxed: link_probe --gather, its kernels' six
+# reads and stamp writes (the replay word in part, mark and check, the stamp in mark, a part's value in check, a sum
+# in digest) and its run's five (the module load, the part and parts windows over the page, the post and wait
+# batch, the rank-order sum), each with its SAFETY line.
+gpu-gates 89 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of

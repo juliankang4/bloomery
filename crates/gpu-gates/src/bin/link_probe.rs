@@ -37,6 +37,23 @@
 //! link's posts. A failed run prints why and releases every counter; a
 //! release that leaves an end standing ends the process without teardown.
 //!
+//! `--gather ROWS` runs the all-gather of `bloomery_gpu::host::Gathers`
+//! among the N nodes instead, each node holding an end to every other (the
+//! stage passes the peers' endpoints between them): one replay is a captured
+//! chain of a token's 91 gathers, two a layer for 45 layers (`ROWS` rows of
+//! 4096 f32, the layer gathers taking the slot's two sets in turn) and the
+//! head's (`ROWS` rows of two words). For each gather the card writes this
+//! rank's part, every value a function of the replay, the gather, the rank
+//! and its index read from device memory, posts it, waits for every other
+//! rank's part, counts their values that are not the ones their replay
+//! wrote (stale words), adds all parts in rank order
+//! (`Gathers::enqueue_sum`) and folds the sum into a per-value digest. Each
+//! node prints the gather latency lambda_g, from a stamp after its part is
+//! written to a stamp once its wait released (one kernel launch included),
+//! per gather and summed over a replay's chain, and checks its last replay's
+//! sums against the host's rank-order sum; the stage fails on a stale word,
+//! a sum the host disagrees with or a digest that differs between nodes.
+//!
 //! Both ends run this binary on a host with rdma-core (`libibverbs.so.1`):
 //!
 //! ```text
@@ -44,9 +61,9 @@
 //! link_probe --nodes 2 --rank 1 --dev <ibdev> --gid <index> --stage <ip:port>
 //! ```
 //!
-//! Optional: `--iters` (timed generations), `--warmup`, `--size`,
-//! `--deadline-ms`. Every node runs the same `--size`: setup refuses a
-//! mismatch. The stage prints one `link` line (the round trip's percentiles
+//! Optional: `--iters` (timed generations, or replays under `--gather`),
+//! `--warmup`, `--size`, `--gather`, `--deadline-ms`. Every node runs the
+//! same `--size` and `--gather`: setup refuses a mismatch. The stage prints one `link` line (the round trip's percentiles
 //! and the stale lines of both directions, or under `--size` the one-way
 //! time) and fails when a line was stale.
 //!
@@ -55,17 +72,23 @@
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::record::at_main("link_probe", bloomery_gpu_gates::record::LINK_PROBE);
     bloomery_gpu_gates::exit_with("link_probe", probe::run())
 }
 
 #[cfg(feature = "gpu")]
 mod probe {
     use bloomery_gpu::host::step::RELEASE;
-    use bloomery_gpu::host::{Crossing, PostCols, RdmaEnd, Reader, Span, link_tail};
-    use bloomery_gpu::{Gpu, MappedHost, mem_batch, op_add, op_barrier_sys, op_wait_geq, window};
-    use bloomery_gpu_gates::{GateError, verdict};
+    use bloomery_gpu::host::{
+        Crossing, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, link_tail,
+    };
+    use bloomery_gpu::{
+        Gpu, MappedHost, WindowMut, mem_batch, op_add, op_barrier_sys, op_wait_geq, window,
+    };
+    use bloomery_gpu_gates::record::{LINK_GATHER, Record};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, verdict};
     use bloomery_verbs::{Endpoint, Gid};
-    use cuda_core::{CudaEvent, DeviceBuffer, LaunchConfig1D, sys};
+    use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, LaunchConfig1D, sys};
     use cuda_device::{DisjointSlice, debug, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
     use std::io::{Read, Write};
@@ -163,6 +186,151 @@ mod probe {
         }
     }
 
+    /// Gathers a replay runs: a token's two a layer for 45 layers, then the
+    /// head's.
+    const GATHERS: usize = 91;
+    /// Values a row of a layer's gather holds (GLM-5.3-Flash's hidden
+    /// width) and of the head's (an argmax's value and id).
+    const BODY_WIDTH: usize = 4096;
+    const HEAD_WIDTH: usize = 2;
+
+    /// Value `i` of `rank`'s part of gather `gather` in replay `seq`: finite
+    /// and normal, of either sign, of an exponent that differs by rank, so a
+    /// sum of the parts in another order rounds differently, and a part of
+    /// another replay or gather holds other bits.
+    #[inline(always)]
+    fn value(seq: u32, gather: u32, rank: u32, i: u32) -> f32 {
+        let mut h = seq.wrapping_mul(0x9e37_79b1)
+            ^ gather.wrapping_mul(0x85eb_ca6b)
+            ^ rank.wrapping_mul(0xc2b2_ae35)
+            ^ i.wrapping_mul(0x27d4_eb2f);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2c1b_3c6d);
+        h ^= h >> 12;
+        let exp = 110 + 9 * (rank & 7) + (h >> 28);
+        f32::from_bits((h & 0x8000_0000) | (exp << 23) | (h & 0x007f_ffff))
+    }
+
+    #[cuda_module]
+    mod gather_kernels {
+        use super::*;
+
+        /// The one word of `seq`, the replay's number, goes up by one.
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(domain = 1, block = (256, 1, 1))]
+        pub fn begin(mut seq: DisjointSlice<u32>) {
+            if let Some(s) = seq.get_mut(thread::index_1d()) {
+                *s = s.wrapping_add(1);
+            }
+        }
+
+        /// Thread i below `n` writes value i of `rank`'s part of gather
+        /// `gather` in replay `seq[0]` into `part`.
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(domain = 1, block = (256, 1, 1), requires = (seq.len() >= 1))]
+        pub fn part(seq: &[u32], gather: u32, rank: u32, n: u32, mut part: DisjointSlice<f32>) {
+            let i = thread::index_1d().get();
+            if i >= n as usize {
+                return;
+            }
+            // SAFETY: seq.len() >= 1 by the launch contract.
+            let s = unsafe { *seq.get_unchecked(0) };
+            if let Some(v) = part.get_mut(thread::index_1d()) {
+                *v = value(s, gather, rank, i as u32);
+            }
+        }
+
+        /// Thread 0 stamps `%globaltimer` into stamp `half` of gather `gather`
+        /// in replay `seq[0]`, `stamps[2 (gathers (seq[0] - 1) + gather) +
+        /// half]`, when that lies in `stamps`.
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(domain = 1, block = (256, 1, 1), requires = (seq.len() >= 1))]
+        pub fn mark(
+            seq: &[u32],
+            gather: u32,
+            gathers: u32,
+            half: u32,
+            mut stamps: DisjointSlice<u64>,
+        ) {
+            if thread::index_1d().get() != 0 {
+                return;
+            }
+            // SAFETY: seq.len() >= 1 by the launch contract.
+            let s = unsafe { *seq.get_unchecked(0) } as usize;
+            let at = 2 * (gathers as usize * s.wrapping_sub(1) + gather as usize) + half as usize;
+            if s >= 1 && at < stamps.len() {
+                // SAFETY: only thread 0 writes, and at < stamps.len() (checked above).
+                unsafe { *stamps.get_unchecked_mut(at) = debug::globaltimer() };
+            }
+        }
+
+        /// Thread i below `n` adds to `stale[i]` the other ranks whose value
+        /// i of gather `gather` in replay `seq[0]` their part does not hold;
+        /// rank r's part starts at value r `stride` of `parts`.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+        )]
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(
+            domain = 1,
+            block = (256, 1, 1),
+            requires = (seq.len() >= 1, ranks >= 1, parts.len() >= stride * (ranks - 1) + n)
+        )]
+        pub fn check(
+            seq: &[u32],
+            gather: u32,
+            rank: u32,
+            ranks: u32,
+            parts: &[f32],
+            stride: u32,
+            n: u32,
+            mut stale: DisjointSlice<u32>,
+        ) {
+            let i = thread::index_1d().get();
+            if i >= n as usize {
+                return;
+            }
+            // SAFETY: seq.len() >= 1 by the launch contract.
+            let s = unsafe { *seq.get_unchecked(0) };
+            let mut bad = 0u32;
+            let mut p = 0u32;
+            while p < ranks {
+                if p != rank {
+                    // SAFETY: p <= ranks - 1 and i < n, so p stride + i <
+                    // stride (ranks - 1) + n <= parts.len() by the contract.
+                    let got = unsafe { *parts.get_unchecked(p as usize * stride as usize + i) };
+                    bad += u32::from(got.to_bits() != value(s, gather, p, i as u32).to_bits());
+                }
+                p += 1;
+            }
+            if let Some(c) = stale.get_mut(thread::index_1d()) {
+                *c += bad;
+            }
+        }
+
+        /// Thread i below `n` folds the bits of `y[i]` into `digest[i]`.
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(domain = 1, block = (256, 1, 1), requires = (y.len() >= n))]
+        pub fn digest(y: &[f32], n: u32, mut digest: DisjointSlice<u32>) {
+            let i = thread::index_1d().get();
+            if i >= n as usize {
+                return;
+            }
+            // SAFETY: i < n <= y.len() by the launch contract.
+            let bits = unsafe { *y.get_unchecked(i) }.to_bits();
+            if let Some(d) = digest.get_mut(thread::index_1d()) {
+                let m = (*d ^ bits).wrapping_mul(0x9e37_79b1);
+                *d = (m << 13) | (m >> 19);
+            }
+        }
+    }
+
     // ------------------------------------------------------------ the run
 
     struct Opts {
@@ -180,13 +348,15 @@ mod probe {
         /// `--size`: the host plays the card over regions this long; 0 runs
         /// the card.
         size: usize,
+        /// `--gather`: rows of each gather; 0 runs no gather.
+        gather: usize,
         deadline: Duration,
     }
 
     fn opts() -> Result<Opts, GateError> {
         const USAGE: &str = "link_probe --nodes N --rank R --dev IBDEV --gid INDEX \
              (--listen IP:PORT | --stage IP:PORT) [--iters N] [--warmup N] [--size BYTES] \
-             [--deadline-ms MS]";
+             [--gather ROWS] [--deadline-ms MS]";
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut o = Opts {
             nodes: 0,
@@ -198,6 +368,7 @@ mod probe {
             warmup: 1_000,
             total: 0,
             size: 0,
+            gather: 0,
             deadline: Duration::from_secs(10),
         };
         let (mut listen, mut stage, mut gid) = (None, None, None);
@@ -217,6 +388,7 @@ mod probe {
                 "--iters" => o.iters = v.parse().map_err(bad)?,
                 "--warmup" => o.warmup = v.parse().map_err(bad)?,
                 "--size" => o.size = v.parse().map_err(bad)?,
+                "--gather" => o.gather = v.parse().map_err(bad)?,
                 "--deadline-ms" => o.deadline = Duration::from_millis(v.parse().map_err(bad)?),
                 _ => return Err(format!("unknown argument {k}; usage: {USAGE}").into()),
             }
@@ -229,6 +401,9 @@ mod probe {
         }
         if !o.size.is_multiple_of(LINE) {
             return Err(format!("--size {}: want a multiple of {LINE} bytes", o.size).into());
+        }
+        if o.gather != 0 && o.size != 0 {
+            return Err("--gather and --size are two runs: give one".into());
         }
         o.gid = gid.ok_or_else(|| format!("--gid is required; usage: {USAGE}"))?;
         o.control = match (o.rank, listen, stage) {
@@ -312,6 +487,16 @@ mod probe {
 
     pub fn run() -> Result<(), GateError> {
         let o = opts()?;
+        let gpu = Gpu::new()?;
+        let ctx = gpu.context();
+        if o.gather != 0 {
+            return gather_run(&o, &gpu);
+        }
+        let peers: Vec<usize> = if o.rank == 0 {
+            (1..o.nodes).collect()
+        } else {
+            vec![o.rank]
+        };
         let layout = if o.size == 0 {
             Layout {
                 nodes: o.nodes,
@@ -325,67 +510,43 @@ mod probe {
                 rows: o.size,
             }
         };
-        let gpu = Gpu::new()?;
-        let ctx = gpu.context();
         let page = Arc::new(MappedHost::new(
             ctx,
             layout.bytes(),
             "cuMemHostAlloc (the probe's page)",
         )?);
-        let peers: Vec<usize> = if o.rank == 0 {
-            (1..o.nodes).collect()
-        } else {
-            vec![o.rank]
-        };
         let side = if o.rank == 0 {
             Reader::Stage
         } else {
             Reader::Tier
         };
-        let mut ends = peers
+        let (ends, mut control) = open_ends(
+            &o,
+            &page,
+            &peers,
+            |j| (layout.tail(j), layout.crossings(j), side),
+            &PostCols::default(),
+        )?;
+        let watch = peers
             .iter()
-            .map(|&j| {
-                RdmaEnd::new(
-                    Arc::clone(&page),
-                    layout.tail(j),
-                    layout.crossings(j),
-                    side,
-                    &o.dev,
-                    o.gid,
-                    PostCols::default(),
-                )
+            .flat_map(|&j| {
+                [
+                    (format!("go[{j}]"), layout.go(j)),
+                    (format!("done[{j}]"), layout.done(j)),
+                ]
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut control = Control::open(&o)?;
-        let local: Vec<Endpoint> = ends
-            .iter()
-            .enumerate()
-            .map(|(i, e)| e.endpoint(psn(o.rank, i)))
             .collect();
-        let remote = control.exchange(&local, o.rank, o.size)?;
-        for ((e, l), r) in ends.iter_mut().zip(&local).zip(&remote) {
-            e.connect(l.psn, r)?;
-        }
-        println!(
-            "link setup rank={} nodes={} dev={} gid_index={} page_bytes={} \
-             access=local_write,remote_write size={} iters={} warmup={}",
-            o.rank,
-            o.nodes,
-            o.dev,
-            o.gid,
-            layout.bytes(),
-            o.size,
-            o.iters,
-            o.warmup
-        );
         let card = Card {
+            node: Node {
+                rank: o.rank,
+                page: &page,
+                ends: &ends,
+                watch,
+                deadline: o.deadline,
+            },
             layout,
-            rank: o.rank,
             peers: &peers,
-            page: &page,
-            ends: &ends,
             total: o.total,
-            deadline: o.deadline,
         };
         if o.size != 0 {
             return host_run(&o, &card, &mut control);
@@ -421,6 +582,63 @@ mod probe {
         let reports = control.collect()?;
         control.ready()?;
         report(&o, &stamps, stale_here, &reports, &kernel_ns)
+    }
+
+    /// This node's ends over `page`, one for each of `peers`, its tail line,
+    /// crossings and side from `of`, each posting the rows `cols` holds,
+    /// connected to the other nodes' through the control channel, which is
+    /// returned with them. A peer equal to this node's rank is the layout's
+    /// own block on a star's peer, whose end reaches the stage.
+    fn open_ends(
+        o: &Opts,
+        page: &Arc<MappedHost>,
+        peers: &[usize],
+        of: impl Fn(usize) -> (usize, Vec<Crossing>, Reader),
+        cols: &PostCols,
+    ) -> Result<(Vec<RdmaEnd>, Control), GateError> {
+        let mut ends = peers
+            .iter()
+            .map(|&j| {
+                let (tail, crossings, side) = of(j);
+                RdmaEnd::new(
+                    Arc::clone(page),
+                    tail,
+                    crossings,
+                    side,
+                    &o.dev,
+                    o.gid,
+                    cols.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut control = Control::open(o)?;
+        let local: Vec<(usize, Endpoint)> = ends
+            .iter()
+            .zip(peers)
+            .enumerate()
+            .map(|(i, (e, &j))| {
+                let to = if j == o.rank { 0 } else { j };
+                (to, e.endpoint(psn(o.rank, i)))
+            })
+            .collect();
+        let remote = control.exchange(&local, o.rank, [o.size, o.gather])?;
+        for ((e, (_, l)), r) in ends.iter_mut().zip(&local).zip(&remote) {
+            e.connect(l.psn, r)?;
+        }
+        println!(
+            "link setup rank={} nodes={} dev={} gid_index={} page_bytes={} \
+             access=local_write,remote_write size={} gather={} iters={} warmup={}",
+            o.rank,
+            o.nodes,
+            o.dev,
+            o.gid,
+            page.bytes(),
+            o.size,
+            o.gather,
+            o.iters,
+            o.warmup
+        );
+        Ok((ends, control))
     }
 
     /// The first packet sequence number of this rank's `i`th queue pair.
@@ -496,21 +714,18 @@ mod probe {
 
     // ------------------------------------------------------------ the card
 
-    /// One node's side of the protocol, whoever plays it: the page, the
-    /// counters this rank adds to and waits on, and the ends that carry them.
-    struct Card<'a> {
-        layout: Layout,
+    /// What one node holds of the link: its page, its ends, the counters a
+    /// stall report names and the deadline every wait is bounded by.
+    struct Node<'a> {
         rank: usize,
-        /// The peers this rank's ends reach: every peer on the stage, itself
-        /// on a peer.
-        peers: &'a [usize],
         page: &'a MappedHost,
         ends: &'a [RdmaEnd],
-        total: u32,
+        /// Each counter a stall report prints, by name and byte.
+        watch: Vec<(String, usize)>,
         deadline: Duration,
     }
 
-    impl Card<'_> {
+    impl Node<'_> {
         fn word(&self, off: usize) -> &AtomicU32 {
             self.page
                 .atomic_u32(off)
@@ -522,20 +737,13 @@ mod probe {
             self.ends.iter().find_map(RdmaEnd::broken)
         }
 
-        /// The stall's report at generation `g`: every counter of this
-        /// rank's peers as the host reads it, and any end's failure.
+        /// The stall's report at generation `g`: every watched counter as the
+        /// host reads it, and any end's failure.
         fn stalled(&self, g: usize, why: &str) -> GateError {
-            let l = self.layout;
             let words: Vec<String> = self
-                .peers
+                .watch
                 .iter()
-                .map(|&j| {
-                    format!(
-                        "go[{j}]={} done[{j}]={}",
-                        self.word(l.go(j)).load(Ordering::Acquire),
-                        self.word(l.done(j)).load(Ordering::Acquire)
-                    )
-                })
+                .map(|(name, off)| format!("{name}={}", self.word(*off).load(Ordering::Acquire)))
                 .collect();
             format!(
                 "rank {}: {why} at generation {g}: {} (host reads); link: {}",
@@ -553,6 +761,94 @@ mod probe {
         fn release(&self) -> Result<(), String> {
             RdmaEnd::release(self.ends, RELEASE).map_err(|e| e.to_string())
         }
+
+        /// Wait for `event`, generation `g`'s, until `since` is a deadline
+        /// old or an end broke.
+        fn settle(&self, event: &CudaEvent, since: Instant, g: usize) -> Result<(), GateError> {
+            let mut spins = 0u32;
+            while !event.query()? {
+                spins = spins.wrapping_add(1);
+                if spins.is_multiple_of(1024) {
+                    if self.broken().is_some() {
+                        return Err(self.stalled(g, "the link broke"));
+                    }
+                    if since.elapsed() > self.deadline {
+                        return Err(self.stalled(g, "no progress"));
+                    }
+                }
+                std::hint::spin_loop();
+            }
+            Ok(())
+        }
+
+        /// Run `body`, which enqueues this node's card work on `gpu`'s stream
+        /// and waits for it to drain. A failure on the way (a stall, a broken
+        /// end, a driver error or a panic) releases the counters the stream
+        /// waits on; a stream not seen to drain after that ends the process
+        /// here, leaving the page and the device buffers it may still reach to
+        /// the OS.
+        fn drive(
+            &self,
+            gpu: &Gpu,
+            body: impl FnOnce() -> Result<(), GateError>,
+        ) -> Result<(), GateError> {
+            let why = match std::panic::catch_unwind(AssertUnwindSafe(body)) {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "the card thread panicked".to_string(),
+            };
+            // The release and the drain each wait on the link; why the run
+            // failed is out first. `eprintln!` panics when stderr fails.
+            let _ = writeln!(std::io::stderr(), "link_probe: {why}; releasing the link");
+            match self.drain_released(gpu) {
+                Ok(()) => Err(format!("{why}; stream drained after release: true").into()),
+                Err(e) => {
+                    // `eprintln!` panics when stderr fails, and the unwind
+                    // would drop the buffers this exit leaves alone.
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "link_probe: stream drained after release: false ({e}); exiting without \
+                         teardown"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        /// The end of a failed run: release every counter the stream waits
+        /// on, then `Ok` once the stream drained, else why it is not known
+        /// to have.
+        fn drain_released(&self, gpu: &Gpu) -> Result<(), String> {
+            self.release()?;
+            let end = gpu
+                .context()
+                .new_event(None)
+                .map_err(|e| format!("no end event: {e}"))?;
+            end.record(gpu.stream())
+                .map_err(|e| format!("end event not recorded: {e}"))?;
+            let start = Instant::now();
+            loop {
+                match end.query() {
+                    Ok(true) => return Ok(()),
+                    Ok(false) if start.elapsed() <= self.deadline => std::hint::spin_loop(),
+                    Ok(false) => {
+                        return Err(format!("not drained within {:?}", self.deadline));
+                    }
+                    Err(e) => return Err(format!("end event query: {e}")),
+                }
+            }
+        }
+    }
+
+    /// One node's side of the protocol, whoever plays it: its hold on the
+    /// link, the layout and the peers its ends reach.
+    struct Card<'a> {
+        node: Node<'a>,
+        layout: Layout,
+        /// The peers this rank's ends reach: every peer on the stage, itself
+        /// on a peer.
+        peers: &'a [usize],
+        total: u32,
     }
 
     /// The host as the card: `--size`'s run on this node.
@@ -564,28 +860,30 @@ mod probe {
         let played = (1..=card.total).try_for_each(|g| {
             let start = Instant::now();
             if o.rank == 0 {
-                card.word(l.image - 4).store(g, Ordering::Relaxed);
+                card.node.word(l.image - 4).store(g, Ordering::Relaxed);
                 for &j in card.peers {
-                    card.word(l.go(j)).fetch_add(1, Ordering::Release);
+                    card.node.word(l.go(j)).fetch_add(1, Ordering::Release);
                 }
                 for &j in card.peers {
                     host_wait(card, l.done(j), g)?;
                     let last = l.rows_off(j) + l.rows - 4;
-                    stale += u64::from(card.word(last).load(Ordering::Relaxed) != g);
-                    card.word(l.done(j)).fetch_sub(1, Ordering::AcqRel);
+                    stale += u64::from(card.node.word(last).load(Ordering::Relaxed) != g);
+                    card.node.word(l.done(j)).fetch_sub(1, Ordering::AcqRel);
                 }
                 one_way.push(start.elapsed().as_nanos() as u64 / 2);
             } else {
                 host_wait(card, l.go(o.rank), g)?;
-                stale += u64::from(card.word(l.image - 4).load(Ordering::Relaxed) != g);
-                card.word(l.go(o.rank)).fetch_sub(1, Ordering::AcqRel);
+                stale += u64::from(card.node.word(l.image - 4).load(Ordering::Relaxed) != g);
+                card.node.word(l.go(o.rank)).fetch_sub(1, Ordering::AcqRel);
                 let last = l.rows_off(o.rank) + l.rows - 4;
-                card.word(last).store(g, Ordering::Relaxed);
-                card.word(l.done(o.rank)).fetch_add(1, Ordering::Release);
+                card.node.word(last).store(g, Ordering::Relaxed);
+                card.node
+                    .word(l.done(o.rank))
+                    .fetch_add(1, Ordering::Release);
             }
             Ok::<(), GateError>(())
         });
-        let played = played.and_then(|()| match card.broken() {
+        let played = played.and_then(|()| match card.node.broken() {
             Some(b) => Err(format!("the link broke: {b}").into()),
             None => Ok(()),
         });
@@ -593,7 +891,7 @@ mod probe {
             // The release waits on the link; why the run failed is out first.
             // `eprintln!` panics when stderr fails.
             let _ = writeln!(std::io::stderr(), "link_probe: {e}; releasing the link");
-            if let Err(held) = card.release() {
+            if let Err(held) = card.node.release() {
                 // The NIC may still read the page: exit before the ends and
                 // the page drop.
                 let _ = writeln!(
@@ -636,14 +934,14 @@ mod probe {
     fn host_wait(card: &Card<'_>, off: usize, g: u32) -> Result<(), GateError> {
         let start = Instant::now();
         let mut spins = 0u32;
-        while card.word(off).load(Ordering::Acquire) < 1 {
+        while card.node.word(off).load(Ordering::Acquire) < 1 {
             spins = spins.wrapping_add(1);
             if spins.is_multiple_of(1024) {
-                if card.broken().is_some() {
-                    return Err(card.stalled(g as usize, "the link broke"));
+                if card.node.broken().is_some() {
+                    return Err(card.node.stalled(g as usize, "the link broke"));
                 }
-                if start.elapsed() > card.deadline {
-                    return Err(card.stalled(g as usize, "no progress"));
+                if start.elapsed() > card.node.deadline {
+                    return Err(card.node.stalled(g as usize, "no progress"));
                 }
             }
             std::hint::spin_loop();
@@ -684,7 +982,7 @@ mod probe {
             slot: usize,
         ) -> Result<(), GateError> {
             let l = self.card.layout;
-            let (seen_off, seen_bytes, put_off, put_bytes) = if self.card.rank == 0 {
+            let (seen_off, seen_bytes, put_off, put_bytes) = if self.card.node.rank == 0 {
                 (
                     l.rows_off(1),
                     l.rows_off(l.nodes) - l.rows_off(1),
@@ -692,7 +990,7 @@ mod probe {
                     l.image,
                 )
             } else {
-                let r = self.card.rank;
+                let r = self.card.node.rank;
                 (0, l.image, l.rows_off(r), l.rows)
             };
             let seen = self.span(seen_off, seen_bytes);
@@ -716,39 +1014,15 @@ mod probe {
             Ok(())
         }
 
-        /// Every generation, then a drained stream. A failure on the way (a
-        /// stall, a broken end, a driver error or a panic) releases the
-        /// counters the stream waits on; a stream not seen to drain after
-        /// that ends the process here, leaving the page and the device
-        /// buffers it may still reach to the OS.
+        /// Every generation, then a drained stream ([`Node::drive`]).
         fn drive(
             &self,
             stale: &mut DeviceBuffer<u64>,
             stamps: &mut DeviceBuffer<u64>,
         ) -> Result<(), GateError> {
-            let run =
-                std::panic::catch_unwind(AssertUnwindSafe(|| self.generations(stale, stamps)));
-            let why = match run {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(e)) => e.to_string(),
-                Err(_) => "the card thread panicked".to_string(),
-            };
-            // The release and the drain each wait on the link; why the run
-            // failed is out first. `eprintln!` panics when stderr fails.
-            let _ = writeln!(std::io::stderr(), "link_probe: {why}; releasing the link");
-            match self.drain_released() {
-                Ok(()) => Err(format!("{why}; stream drained after release: true").into()),
-                Err(e) => {
-                    // `eprintln!` panics when stderr fails, and the unwind
-                    // would drop the buffers this exit leaves alone.
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "link_probe: stream drained after release: false ({e}); exiting without \
-                         teardown"
-                    );
-                    std::process::exit(1);
-                }
-            }
+            self.card
+                .node
+                .drive(self.gpu, || self.generations(stale, stamps))
         }
 
         /// Enqueue generations 1..=total, at most [`AHEAD`] ahead of the
@@ -759,120 +1033,359 @@ mod probe {
             stamps: &mut DeviceBuffer<u64>,
         ) -> Result<(), GateError> {
             let ctx = self.gpu.context();
-            ctx.bind_to_thread()?;
             let stream = self.gpu.stream();
             let (l, card) = (self.card.layout, self.card);
             let at = |off: usize| self.dev + off as u64;
-            let events = (0..AHEAD)
-                .map(|_| ctx.new_event(None))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut progress = Instant::now();
             let total = card.total as usize;
-            for g in 1..=total {
-                if g > AHEAD {
-                    self.settle(&events[g % AHEAD], progress, g - AHEAD)?;
-                    progress = Instant::now();
-                }
-                let seq = u32::try_from(g)?;
-                if card.rank == 0 {
-                    self.launch(stale, stamps, seq - 1, seq, l.image / LINE, g - 1)?;
-                    let mut ops = vec![op_barrier_sys()];
-                    ops.extend(card.peers.iter().map(|&j| op_add(at(l.go(j)), 1)));
-                    for &j in card.peers {
-                        ops.push(op_wait_geq(at(l.done(j)), 1));
-                        ops.push(op_add(at(l.done(j)), u32::MAX));
+            replays(
+                |g| {
+                    let seq = u32::try_from(g)?;
+                    if card.node.rank == 0 {
+                        self.launch(stale, stamps, seq - 1, seq, l.image / LINE, g - 1)?;
+                        let mut ops = vec![op_barrier_sys()];
+                        ops.extend(card.peers.iter().map(|&j| op_add(at(l.go(j)), 1)));
+                        for &j in card.peers {
+                            ops.push(op_wait_geq(at(l.done(j)), 1));
+                            ops.push(op_add(at(l.done(j)), u32::MAX));
+                        }
+                        // SAFETY: every counter lies in the page (the layout's
+                        // own words), which outlives every batch as in `span`.
+                        unsafe {
+                            mem_batch(stream, &mut ops, "link_probe: the gos and the dones")?
+                        };
+                    } else {
+                        let r = card.node.rank;
+                        // SAFETY: the go counter lies in the page, which outlives
+                        // every batch as in `span`.
+                        unsafe {
+                            mem_batch(
+                                stream,
+                                &mut [op_wait_geq(at(l.go(r)), 1), op_add(at(l.go(r)), u32::MAX)],
+                                "link_probe: the go",
+                            )?;
+                        }
+                        self.launch(stale, stamps, seq, seq, l.rows / LINE, g - 1)?;
+                        // SAFETY: the done counter lies in the page, which
+                        // outlives every batch as in `span`.
+                        unsafe {
+                            mem_batch(
+                                stream,
+                                &mut [op_barrier_sys(), op_add(at(l.done(r)), 1)],
+                                "link_probe: the done",
+                            )?;
+                        }
                     }
-                    // SAFETY: every counter lies in the page (the layout's
-                    // own words), which outlives every batch as in `span`.
-                    unsafe { mem_batch(stream, &mut ops, "link_probe: the gos and the dones")? };
-                } else {
-                    let r = card.rank;
-                    // SAFETY: the go counter lies in the page, which outlives
-                    // every batch as in `span`.
-                    unsafe {
-                        mem_batch(
-                            stream,
-                            &mut [op_wait_geq(at(l.go(r)), 1), op_add(at(l.go(r)), u32::MAX)],
-                            "link_probe: the go",
-                        )?;
-                    }
-                    self.launch(stale, stamps, seq, seq, l.rows / LINE, g - 1)?;
-                    // SAFETY: the done counter lies in the page, which
-                    // outlives every batch as in `span`.
-                    unsafe {
-                        mem_batch(
-                            stream,
-                            &mut [op_barrier_sys(), op_add(at(l.done(r)), 1)],
-                            "link_probe: the done",
-                        )?;
-                    }
-                }
-                events[g % AHEAD].record(stream)?;
-            }
-            if card.rank == 0 {
+                    Ok(())
+                },
+                self.gpu,
+                &card.node,
+                total,
+            )?;
+            if card.node.rank == 0 {
                 self.launch(stale, stamps, card.total, 0, 0, total)?;
             }
             let end = ctx.new_event(None)?;
             end.record(stream)?;
-            self.settle(&end, Instant::now(), total)
+            card.node.settle(&end, Instant::now(), total)
         }
+    }
 
-        /// Wait for `event`, generation `g`'s, until `since` is a deadline
-        /// old or an end broke.
-        fn settle(&self, event: &CudaEvent, since: Instant, g: usize) -> Result<(), GateError> {
-            let mut spins = 0u32;
-            while !event.query()? {
-                spins = spins.wrapping_add(1);
-                if spins.is_multiple_of(1024) {
-                    if self.card.broken().is_some() {
-                        return Err(self.card.stalled(g, "the link broke"));
-                    }
-                    if since.elapsed() > self.card.deadline {
-                        return Err(self.card.stalled(g, "no progress"));
-                    }
+    // ------------------------------------------------------------ the gather
+
+    /// Gather `g`'s slot and set: a layer's gathers take the body slot's
+    /// sets in turn, and the head's, between two replays' layer gathers,
+    /// keeps the head slot's first set.
+    fn slot_set(g: usize) -> (usize, usize) {
+        if g + 1 < GATHERS {
+            (0, g % Gathers::SETS)
+        } else {
+            (1, 0)
+        }
+    }
+
+    /// `--gather`'s run on this node: the page of a body and a head slot of
+    /// `rows` rows, an end to every other node, the chain captured, `warmup +
+    /// iters` replays, then this node's line and, on the stage, the verdict
+    /// over every node.
+    fn gather_run(o: &Opts, gpu: &Gpu) -> Result<(), GateError> {
+        let rows = o.gather;
+        let shapes = [BODY_WIDTH, HEAD_WIDTH].map(|width| GatherShape { rows, width });
+        let g = Gathers::new(0, o.nodes, o.rank, &shapes)?;
+        let ctx = gpu.context();
+        let page = Arc::new(MappedHost::new(
+            ctx,
+            g.page_bytes(),
+            "cuMemHostAlloc (the probe's gather page)",
+        )?);
+        let cols = PostCols::default();
+        cols.set(rows);
+        let peers: Vec<usize> = (0..o.nodes).filter(|&j| j != o.rank).collect();
+        let (ends, mut control) = open_ends(
+            o,
+            &page,
+            &peers,
+            |j| (g.tail(j), g.crossings(j), g.side(j)),
+            &cols,
+        )?;
+        let mut watch = Vec::new();
+        for slot in 0..shapes.len() {
+            for set in 0..Gathers::SETS {
+                for r in 0..o.nodes {
+                    watch.push((format!("gather[{slot}.{set}.{r}]"), g.counter(slot, set, r)));
                 }
-                std::hint::spin_loop();
+            }
+        }
+        let node = Node {
+            rank: o.rank,
+            page: &page,
+            ends: &ends,
+            watch,
+            deadline: o.deadline,
+        };
+        // SAFETY: this package owns the embedded device bundle produced for
+        // the module above; the launcher checks its launch contract.
+        let kernels = unsafe { bloomery_gpu::shared_module!(gather_kernels, ctx)? };
+        let stream = gpu.stream();
+        let total = o.total as usize;
+        let n = rows * BODY_WIDTH;
+        let mut seq = DeviceBuffer::<u32>::zeroed(stream, 1)?;
+        let mut stamps = DeviceBuffer::<u64>::zeroed(stream, 2 * GATHERS * total)?;
+        let mut stale = DeviceBuffer::<u32>::zeroed(stream, n)?;
+        let mut digest = DeviceBuffer::<u32>::zeroed(stream, n)?;
+        let mut sums = [
+            DeviceBuffer::<f32>::zeroed(stream, rows * BODY_WIDTH)?,
+            DeviceBuffer::<f32>::zeroed(stream, rows * HEAD_WIDTH)?,
+        ];
+        let dev = page.dev_at(0);
+        let steps = (0..GATHERS)
+            .map(|gi| step(&g, gi, rows, (o.rank, o.nodes), dev))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (rank, nodes) = (u32::try_from(o.rank)?, u32::try_from(o.nodes)?);
+        let gathers = u32::try_from(GATHERS)?;
+        let graph = gpu.capture(|s| {
+            let one = LaunchConfig1D::new(1, THREADS, 0);
+            kernels.begin(s, &kernels.prepare_begin(one)?, &mut seq)?;
+            let mark = kernels.prepare_mark(one)?;
+            for st in &steps {
+                let cfg = LaunchConfig1D::new(st.values.div_ceil(THREADS), THREADS, 0);
+                // SAFETY: this rank's part of the gather lies in the page,
+                // which is mapped into this context and outlives every replay:
+                // the run drains the stream before the page drops, or ends the
+                // process without dropping it.
+                let mut part =
+                    unsafe { WindowMut::<f32>::from_raw(st.own, st.values as usize, ctx) };
+                let prep = kernels.prepare_part(cfg)?;
+                kernels.part(s, &prep, &seq, st.gather, rank, st.values, &mut part)?;
+                kernels.mark(s, &mark, &seq, st.gather, gathers, 0, &mut stamps)?;
+                let mut ops = g.post(dev, st.slot, st.set).to_vec();
+                ops.extend(g.wait(dev, st.slot, st.set));
+                // SAFETY: every counter lies in the page, which outlives every
+                // replay as the part does.
+                unsafe { mem_batch(s, &mut ops, "link_probe: a gather's post and wait")? };
+                kernels.mark(s, &mark, &seq, st.gather, gathers, 1, &mut stamps)?;
+                // SAFETY: every rank's part of the set lies in the page, which
+                // outlives every replay as the part does.
+                let parts = unsafe { WindowMut::<f32>::from_raw(st.parts, st.span, ctx) };
+                kernels.check(
+                    s,
+                    &kernels.prepare_check(cfg)?,
+                    &seq,
+                    st.gather,
+                    rank,
+                    nodes,
+                    &parts,
+                    st.stride,
+                    st.values,
+                    &mut stale,
+                )?;
+                let sum = &mut sums[st.slot];
+                // SAFETY: `dev` is the page of this layout, mapped into this
+                // context and outliving every replay as the part does.
+                unsafe { g.enqueue_sum(gpu.elem(), s, dev, st.slot, st.set, rows, sum)? };
+                let prep = kernels.prepare_digest(cfg)?;
+                kernels.digest(s, &prep, &*sum, st.values, &mut digest)?;
             }
             Ok(())
+        })?;
+        control.ready()?;
+        node.drive(gpu, || {
+            replays(|_| Ok(graph.launch(gpu.stream())?), gpu, &node, total)
+        })?;
+        let stale_here: u64 = stale
+            .to_host_vec(stream)?
+            .iter()
+            .map(|&c| u64::from(c))
+            .sum();
+        let digest_here = Fnv1a64::default()
+            .u32s(&digest.to_host_vec(stream)?)
+            .value();
+        let wrong = host_wrong(&sums, stream, rows, o.nodes, o.total)?;
+        let stamps = stamps.to_host_vec(stream)?;
+        let lambda = |k: usize, gi: usize| {
+            let at = 2 * (GATHERS * k + gi);
+            stamps[at + 1] - stamps[at]
+        };
+        let mut per_gather: Vec<u64> = (o.warmup..total)
+            .flat_map(|k| (0..GATHERS).map(move |gi| (k, gi)))
+            .map(|(k, gi)| lambda(k, gi))
+            .collect();
+        let mut per_chain: Vec<u64> = (o.warmup..total)
+            .map(|k| (0..GATHERS).map(|gi| lambda(k, gi)).sum())
+            .collect();
+        let us = |ns: u64| ns as f64 / 1e3;
+        let [g50, g90, g99] = [50.0, 90.0, 99.0].map(|p| us(pct(&mut per_gather, p)));
+        let [c50, c90, c99] = [50.0, 90.0, 99.0].map(|p| us(pct(&mut per_chain, p)));
+        Record::new(&LINK_GATHER)
+            .u("rank", o.rank)
+            .u("nodes", o.nodes)
+            .u("rows", rows)
+            .u("gathers", GATHERS)
+            .u("iters", o.iters)
+            .f("lambda_us_p50", g50)
+            .f("lambda_us_p90", g90)
+            .f("lambda_us_p99", g99)
+            .f("lambda_us_max", us(per_gather[per_gather.len() - 1]))
+            .f("chain_us_p50", c50)
+            .f("chain_us_p90", c90)
+            .f("chain_us_p99", c99)
+            .u("stale_words", stale_here)
+            .u("host_wrong", wrong)
+            .w("digest", format!("{digest_here:#018x}"))
+            .print();
+        if o.rank != 0 {
+            control.report(stale_here + wrong, digest_here)?;
+            control.ready()?;
+            return Ok(());
         }
+        let reports = control.collect()?;
+        control.ready()?;
+        let bad = stale_here + wrong + reports.iter().map(|r| r.0).sum::<u64>();
+        let same = reports.iter().all(|r| r.1 == digest_here);
+        let pass = bad == 0 && same;
+        println!(
+            "{}: link_probe gather stale words and host disagreements {bad}, digests equal on \
+             every node {same}",
+            verdict(pass)
+        );
+        if pass {
+            Ok(())
+        } else {
+            Err("a stale word, a sum the host disagrees with, or digests that differ".into())
+        }
+    }
 
-        /// The end of a failed run: release every counter the stream waits
-        /// on, then `Ok` once the stream drained, else why it is not known
-        /// to have.
-        fn drain_released(&self) -> Result<(), String> {
-            self.card.release()?;
-            let end = self
-                .gpu
-                .context()
-                .new_event(None)
-                .map_err(|e| format!("no end event: {e}"))?;
-            end.record(self.gpu.stream())
-                .map_err(|e| format!("end event not recorded: {e}"))?;
-            let start = Instant::now();
-            loop {
-                match end.query() {
-                    Ok(true) => return Ok(()),
-                    Ok(false) if start.elapsed() <= self.card.deadline => std::hint::spin_loop(),
-                    Ok(false) => {
-                        return Err(format!("not drained within {:?}", self.card.deadline));
-                    }
-                    Err(e) => return Err(format!("end event query: {e}")),
-                }
+    /// One gather of the chain as this rank enqueues it.
+    struct Step {
+        gather: u32,
+        slot: usize,
+        set: usize,
+        /// Values of a part the gather carries.
+        values: u32,
+        /// Device addresses of this rank's part and of rank 0's, the first
+        /// of the set's parts, which span `span` values, rank r's from value
+        /// r `stride`.
+        own: sys::CUdeviceptr,
+        parts: sys::CUdeviceptr,
+        span: usize,
+        stride: u32,
+    }
+
+    /// Gather `gi` of the chain, `rows` rows, as rank `rank` of `ranks`
+    /// enqueues it over its page at `dev`.
+    fn step(
+        g: &Gathers,
+        gi: usize,
+        rows: usize,
+        (rank, ranks): (usize, usize),
+        dev: sys::CUdeviceptr,
+    ) -> Result<Step, GateError> {
+        let (slot, set) = slot_set(gi);
+        let values = rows * [BODY_WIDTH, HEAD_WIDTH][slot];
+        let first = g.part(slot, set, 0).start;
+        let stride = (g.part(slot, set, 1).start - first) / 4;
+        Ok(Step {
+            gather: u32::try_from(gi)?,
+            slot,
+            set,
+            values: u32::try_from(values)?,
+            own: dev + g.part(slot, set, rank).start as u64,
+            parts: dev + first as u64,
+            span: stride * (ranks - 1) + values,
+            stride: u32::try_from(stride)?,
+        })
+    }
+
+    /// Enqueue 1..=total through `enqueue`, at most [`AHEAD`] ahead of the
+    /// host, and wait for the stream to drain.
+    fn replays(
+        mut enqueue: impl FnMut(usize) -> Result<(), GateError>,
+        gpu: &Gpu,
+        node: &Node<'_>,
+        total: usize,
+    ) -> Result<(), GateError> {
+        let ctx = gpu.context();
+        ctx.bind_to_thread()?;
+        let stream = gpu.stream();
+        let events = (0..AHEAD)
+            .map(|_| ctx.new_event(None))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut progress = Instant::now();
+        for k in 1..=total {
+            if k > AHEAD {
+                node.settle(&events[k % AHEAD], progress, k - AHEAD)?;
+                progress = Instant::now();
+            }
+            enqueue(k)?;
+            events[k % AHEAD].record(stream)?;
+        }
+        let end = ctx.new_event(None)?;
+        end.record(stream)?;
+        node.settle(&end, Instant::now(), total)
+    }
+
+    /// The values of the last replay's sums, the layer gathers' last and the
+    /// head's, that are not the host's rank-order sum of the parts.
+    fn host_wrong(
+        sums: &[DeviceBuffer<f32>; 2],
+        stream: &CudaStream,
+        rows: usize,
+        ranks: usize,
+        replay: u32,
+    ) -> Result<u64, GateError> {
+        let mut wrong = 0u64;
+        for (gi, sum) in [GATHERS - 2, GATHERS - 1].into_iter().zip(sums) {
+            let got = sum.to_host_vec(stream)?;
+            let (gu, n) = (
+                u32::try_from(gi)?,
+                rows * [BODY_WIDTH, HEAD_WIDTH][slot_set(gi).0],
+            );
+            for (i, v) in got[..n].iter().enumerate() {
+                let i = u32::try_from(i)?;
+                let want = (1..ranks).fold(value(replay, gu, 0, i), |acc, r| {
+                    acc + value(replay, gu, r as u32, i)
+                });
+                wrong += u64::from(v.to_bits() != want.to_bits());
             }
         }
+        Ok(wrong)
     }
 
     // ------------------------------------------------------ control channel
 
     /// The stage's TCP connections to its peers (one, to the stage, on a
-    /// peer): the endpoints and `--size`, the start, and the peers' counts
-    /// at the end.
+    /// peer): the endpoints, `--size` and `--gather`, the start, and the
+    /// peers' counts at the end.
     struct Control {
         socks: Vec<TcpStream>,
+        /// Whether this node is the stage, the one end of every connection.
+        stage: bool,
         deadline: Duration,
     }
 
-    const ENDPOINT_BYTES: usize = 44;
+    /// One endpoint as the control channel carries it: the rank whose end it
+    /// is, the rank whose end connects to it, the endpoint, and the sender's
+    /// `--size` and `--gather`.
+    const FRAME_BYTES: usize = 60;
 
     impl Control {
         fn open(o: &Opts) -> Result<Control, GateError> {
@@ -928,79 +1441,86 @@ mod probe {
             }
             Ok(Control {
                 socks: socks.into_iter().flatten().collect(),
+                stage: o.rank == 0,
                 deadline,
             })
         }
 
-        /// Send each connection its local endpoint and this node's `--size`,
-        /// and read the remote ones. Both ends write before they read, so each
-        /// end of a mismatch refuses it by name before any generation.
+        /// Trade endpoints: `local` holds this node's end to each peer (its
+        /// rank and endpoint), and the result holds, in the same order, each
+        /// peer's end to this node. A peer sends the stage its count and its
+        /// frames; the stage sends each peer every frame that names it, its
+        /// own included, so two peers learn each other's ends through it.
+        /// Every frame carries its sender's `--size` and `--gather`, and a
+        /// node that reads another value refuses it by name before any
+        /// generation.
         fn exchange(
             &mut self,
-            local: &[Endpoint],
+            local: &[(usize, Endpoint)],
             rank: usize,
-            size: usize,
+            shape: [usize; 2],
         ) -> Result<Vec<Endpoint>, GateError> {
-            let mut remote = Vec::with_capacity(local.len());
-            for (s, l) in self.socks.iter_mut().zip(local) {
-                let mut b = [0u8; ENDPOINT_BYTES];
-                b[0..4].copy_from_slice(&l.qpn.to_le_bytes());
-                b[4..8].copy_from_slice(&l.psn.to_le_bytes());
-                b[8..24].copy_from_slice(&l.gid.raw);
-                b[24..32].copy_from_slice(&l.addr.to_le_bytes());
-                b[32..36].copy_from_slice(&l.rkey.to_le_bytes());
-                b[36..44].copy_from_slice(&(size as u64).to_le_bytes());
-                s.write_all(&b)?;
-            }
-            for (i, s) in self.socks.iter_mut().enumerate() {
-                let other = if rank == 0 { i + 1 } else { 0 };
-                let mut b = [0u8; ENDPOINT_BYTES];
-                s.read_exact(&mut b)
-                    .map_err(|e| format!("rank {other}'s endpoint: {e}"))?;
-                let word =
-                    |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"));
-                let theirs = u64::from_le_bytes(b[36..44].try_into().expect("8 bytes"));
-                if theirs != size as u64 {
-                    let (stage, peer, r) = if rank == 0 {
-                        (size as u64, theirs, other)
-                    } else {
-                        (theirs, size as u64, rank)
-                    };
-                    return Err(format!("--size differs: rank 0 {stage}, rank {r} {peer}").into());
+            let shape = shape.map(|v| v as u64);
+            let own: Vec<Frame> = local
+                .iter()
+                .map(|&(to, e)| Frame {
+                    from: rank,
+                    to,
+                    e,
+                    shape,
+                })
+                .collect();
+            let mut mine = Vec::new();
+            if self.stage {
+                let mut all = own;
+                for s in &mut self.socks {
+                    all.extend(read_frames(s, shape)?);
                 }
-                let mut gid = Gid::default();
-                gid.raw.copy_from_slice(&b[8..24]);
-                remote.push(Endpoint {
-                    qpn: word(0),
-                    psn: word(4),
-                    gid,
-                    addr: u64::from_le_bytes(b[24..32].try_into().expect("8 bytes")),
-                    rkey: word(32),
-                });
+                for (i, s) in self.socks.iter_mut().enumerate() {
+                    write_frames(s, all.iter().filter(|f| f.to == i + 1))?;
+                }
+                mine.extend(all.into_iter().filter(|f| f.to == 0));
+            } else {
+                let s = &mut self.socks[0];
+                write_frames(s, own.iter())?;
+                mine = read_frames(s, shape)?;
             }
-            Ok(remote)
+            local
+                .iter()
+                .map(|&(peer, _)| {
+                    let mut of = mine.iter().filter(|f| f.from == peer && f.to == rank);
+                    match (of.next(), of.next()) {
+                        (Some(f), None) => Ok(f.e),
+                        _ => Err(format!("rank {rank}: not one end of rank {peer} to it").into()),
+                    }
+                })
+                .collect()
         }
 
-        /// A byte each way: before the first generation, every node's queue
-        /// pairs are ready; after the last, the stage has every peer's done,
+        /// A barrier, a byte each way: a peer writes, then reads; the stage
+        /// reads every peer's byte before it writes any. Before the first
+        /// generation, every node's queue pairs are ready, those between two
+        /// peers included; after the last, the stage has every peer's done,
         /// so no peer drops its end (its pump and queue pair) with a done
         /// still to post.
         fn ready(&mut self) -> Result<(), GateError> {
-            for s in &mut self.socks {
-                s.write_all(b"R")?;
-            }
-            for s in &mut self.socks {
-                let mut b = [0u8; 1];
-                s.read_exact(&mut b)?;
+            let read = |s: &mut TcpStream| s.read_exact(&mut [0u8; 1]);
+            if self.stage {
+                self.socks.iter_mut().try_for_each(read)?;
+                self.socks.iter_mut().try_for_each(|s| s.write_all(b"R"))?;
+            } else {
+                self.socks.iter_mut().try_for_each(|s| s.write_all(b"R"))?;
+                self.socks.iter_mut().try_for_each(read)?;
             }
             Ok(())
         }
 
-        /// A peer's stale lines and its kernel's median time, to the stage.
-        fn report(&mut self, stale: u64, kernel_ns: u64) -> Result<(), GateError> {
+        /// A peer's stale count and, by mode, its kernel's median time or its
+        /// sums' digest, to the stage.
+        fn report(&mut self, stale: u64, second: u64) -> Result<(), GateError> {
             let mut b = [0u8; 16];
             b[0..8].copy_from_slice(&stale.to_le_bytes());
-            b[8..16].copy_from_slice(&kernel_ns.to_le_bytes());
+            b[8..16].copy_from_slice(&second.to_le_bytes());
             self.socks[0].write_all(&b)?;
             Ok(())
         }
@@ -1022,5 +1542,76 @@ mod probe {
                 })
                 .collect()
         }
+    }
+
+    /// An endpoint on the control channel ([`FRAME_BYTES`]).
+    struct Frame {
+        from: usize,
+        to: usize,
+        e: Endpoint,
+        shape: [u64; 2],
+    }
+
+    /// Write the count of `frames`, then each.
+    fn write_frames<'a>(
+        s: &mut TcpStream,
+        frames: impl Iterator<Item = &'a Frame> + Clone,
+    ) -> Result<(), GateError> {
+        s.write_all(&u32::try_from(frames.clone().count())?.to_le_bytes())?;
+        for f in frames {
+            let mut b = [0u8; FRAME_BYTES];
+            b[0..4].copy_from_slice(&u32::try_from(f.from)?.to_le_bytes());
+            b[4..8].copy_from_slice(&u32::try_from(f.to)?.to_le_bytes());
+            b[8..12].copy_from_slice(&f.e.qpn.to_le_bytes());
+            b[12..16].copy_from_slice(&f.e.psn.to_le_bytes());
+            b[16..32].copy_from_slice(&f.e.gid.raw);
+            b[32..40].copy_from_slice(&f.e.addr.to_le_bytes());
+            b[40..44].copy_from_slice(&f.e.rkey.to_le_bytes());
+            b[44..52].copy_from_slice(&f.shape[0].to_le_bytes());
+            b[52..60].copy_from_slice(&f.shape[1].to_le_bytes());
+            s.write_all(&b)?;
+        }
+        Ok(())
+    }
+
+    /// Read a count of frames, then each; a frame whose `--size` and
+    /// `--gather` are not `shape` is refused by name.
+    fn read_frames(s: &mut TcpStream, shape: [u64; 2]) -> Result<Vec<Frame>, GateError> {
+        let mut n = [0u8; 4];
+        s.read_exact(&mut n)
+            .map_err(|e| format!("the endpoint count: {e}"))?;
+        (0..u32::from_le_bytes(n))
+            .map(|_| {
+                let mut b = [0u8; FRAME_BYTES];
+                s.read_exact(&mut b)
+                    .map_err(|e| format!("an endpoint: {e}"))?;
+                let w32 =
+                    |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"));
+                let w64 =
+                    |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"));
+                let from = w32(0) as usize;
+                let theirs = [w64(44), w64(52)];
+                if theirs != shape {
+                    return Err(format!(
+                        "--size and --gather differ: here {shape:?}, rank {from} {theirs:?}"
+                    )
+                    .into());
+                }
+                let mut gid = Gid::default();
+                gid.raw.copy_from_slice(&b[16..32]);
+                Ok(Frame {
+                    from,
+                    to: w32(4) as usize,
+                    e: Endpoint {
+                        qpn: w32(8),
+                        psn: w32(12),
+                        gid,
+                        addr: w64(32),
+                        rkey: w32(40),
+                    },
+                    shape: theirs,
+                })
+            })
+            .collect()
     }
 }

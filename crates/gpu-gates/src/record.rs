@@ -1937,6 +1937,30 @@ pub static NVREAD: Kind = Kind {
     ],
 };
 
+/// One rank's line of `link_probe --gather`: its gather latency and checks.
+pub static LINK_GATHER: Kind = Kind {
+    name: "link_gather",
+    head: "link gather",
+    doc: "One rank's line of link_probe --gather: the nodes, the rows a part carries, the gathers of a replay's chain and the timed replays; the gather latency's median, 90th and 99th percentile and maximum, and a chain's median, 90th and 99th percentile; the stale words its card counted, the last replay's values the host's rank-order sum disagrees with, and the digest of its sums.",
+    parts: &[
+        key("rank", U64, ""),
+        key("nodes", U64, ""),
+        key("rows", U64, ""),
+        key("gathers", U64, ""),
+        key("iters", U64, ""),
+        key("lambda_us_p50", F64(2), "us"),
+        key("lambda_us_p90", F64(2), "us"),
+        key("lambda_us_p99", F64(2), "us"),
+        key("lambda_us_max", F64(2), "us"),
+        key("chain_us_p50", F64(2), "us"),
+        key("chain_us_p90", F64(2), "us"),
+        key("chain_us_p99", F64(2), "us"),
+        key("stale_words", U64, ""),
+        key("host_wrong", U64, ""),
+        key("digest", Word, ""),
+    ],
+};
+
 pub static TIME_PROMPT: Kind = Kind {
     name: "time_prompt",
     head: "time prompt",
@@ -3823,6 +3847,9 @@ pub static GATE_DEEPSEEK41_PREFILL: &[&Kind] = &[&STAT_PREFILL_SPLIT];
 /// The records `probe_nvread` prints: one row an arm and case.
 pub static PROBE_NVREAD: &[&Kind] = &[&NVREAD];
 
+/// The record `link_probe` prints under `--gather`: one line a rank.
+pub static LINK_PROBE: &[&Kind] = &[&LINK_GATHER];
+
 /// The width chooser's state on `r`, a `draft summary` or an `mtp width`
 /// record: the gate's width, each width's cost median in ms (`-` while
 /// unread), the mean acceptance profile, and `closed`, its own passes it
@@ -4949,6 +4976,7 @@ mod tests {
             GENERATE_QWEN3MOE,
             GATE_DEEPSEEK41_PREFILL,
             PROBE_NVREAD,
+            LINK_PROBE,
             GATE_NVTIER,
             groups::serve_client::SPAWN,
         ] {
@@ -5374,6 +5402,7 @@ mod tests {
             CLEF_HIDDEN_BIN,
             GATE_DEEPSEEK41_PREFILL,
             PROBE_NVREAD,
+            LINK_PROBE,
             GATE_NVTIER,
             groups::serve_client::SPAWN,
         ] {
