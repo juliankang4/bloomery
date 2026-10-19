@@ -1,4 +1,4 @@
-use super::{ARCH, IK, IK_BUILD, IK_DSA, MODEL, MTP, MTP_BUILD, MTP_SET};
+use super::{ARCH, HF_MAP_HARNESS, IK, IK_BUILD, IK_DSA, MODEL, MTP, MTP_BUILD, MTP_SET};
 use crate::RefError;
 use std::path::{Path, PathBuf};
 
@@ -197,4 +197,17 @@ fn the_dsa_family_takes_a_set_and_the_node_dumps_stay_ik() -> Result<(), RefErro
     assert_eq!(p.build.as_deref(), Some(IK_BUILD));
     assert_eq!(crate::arch::node_dumps(ARCH).map(|f| f.name), Some(IK.name));
     remove(&dir)
+}
+
+/// The map oracle's writer pin is the source in the tree: an edit of the writer without a new set
+/// and a new pin is red.
+#[test]
+fn the_map_writer_pin_is_the_source_in_the_tree() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/glm5next-hf-map.py");
+    let source = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(
+        crate::md5::hex_of(&source),
+        HF_MAP_HARNESS,
+        "tools/ref/glm5next-hf-map.py changed: write the set again (just dump-ref-glm5next-hf-map) and pin the new md5"
+    );
 }

@@ -30,6 +30,8 @@
 //! - [`dequant`]: ggml's dequantized rows (`tools/ref/dump-dequant.sh`).
 //! - [`quant`]: mainline's quantization, activation conversion and dot products per weight
 //!   type (`tools/ref/quant-oracle.sh`).
+//! - [`hfmap`]: a Hugging Face checkpoint's name map oracle, its shard headers and small
+//!   tensors beside the reference GGUF's table and tensors (`tools/ref/glm5next-hf-map.py`).
 //! - [`nemotron`]: mainline's last-position logits of Nemotron 3 Nano and
 //!   3.5 Bolt (`tools/ref/nemotron_ref.cpp`).
 //! - [`census`]: the census stubs — header-only copies of many users' model
@@ -55,6 +57,7 @@ pub mod emb2;
 pub mod family;
 pub mod fixture;
 pub mod greedy;
+pub mod hfmap;
 pub mod ik;
 pub mod kld;
 mod md5;

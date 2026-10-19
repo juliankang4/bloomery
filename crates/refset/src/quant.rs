@@ -576,7 +576,7 @@ impl QuantSet {
 }
 
 /// The value of a header line `# key\tvalue`; another width is `Malformed` at `at`.
-fn value<'a>(f: &[&'a str], at: &dyn fmt::Display) -> Result<&'a str, RefError> {
+pub(crate) fn value<'a>(f: &[&'a str], at: &dyn fmt::Display) -> Result<&'a str, RefError> {
     match f {
         [_, v] => Ok(v),
         _ => Err(RefError::malformed(

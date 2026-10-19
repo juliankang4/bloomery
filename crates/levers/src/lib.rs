@@ -37,7 +37,7 @@ pub use registry::{
     LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS,
     NVTIER_BYTES, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
     PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN,
-    STEP_STATS, THREADS, TIER_LINK, TIER_NODES,
+    STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
 };
 pub use registry::{SPLIT_WALK, XSTREAM};
 
@@ -727,20 +727,44 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
             Site::Direct { .. } | Site::Env { .. } => {}
         }
     }
-    if let Some(entry) = entries.iter().find(|e| e.row.name == TIER_NODES)
-        && let Some(Value::Addrs(addrs)) = &entry.value
-        && addrs.iter().any(|a| !a.ip().is_loopback())
-        && !entries
+    let rdma = entries
+        .iter()
+        .any(|e| e.row.name == TIER_LINK && e.value == Some(Value::Word("rdma")));
+    let nodes_of = |name: &str| {
+        entries
             .iter()
-            .any(|e| e.row.name == TIER_LINK && e.value == Some(Value::Word("rdma")))
-    {
+            .find(|e| e.row.name == name)
+            .and_then(|e| match &e.value {
+                Some(Value::Addrs(addrs)) => Some((e, addrs)),
+                _ => None,
+            })
+    };
+    for name in [TIER_NODES, TP_NODES] {
+        if let Some((entry, addrs)) = nodes_of(name)
+            && addrs.iter().any(|a| !a.ip().is_loopback())
+            && !rdma
+        {
+            refused.push(Refusal {
+                name: name.to_string(),
+                value: entry
+                    .set
+                    .clone()
+                    .expect("node addresses came from a set lever"),
+                why: Why::Value(format!("a node off this host requires {TIER_LINK}=rdma")),
+            });
+        }
+    }
+    if let (Some(_), Some((tp, _))) = (nodes_of(TIER_NODES), nodes_of(TP_NODES)) {
         refused.push(Refusal {
-            name: TIER_NODES.to_string(),
-            value: entry
+            name: TP_NODES.to_string(),
+            value: tp
                 .set
                 .clone()
                 .expect("node addresses came from a set lever"),
-            why: Why::Value(format!("a node off this host requires {TIER_LINK}=rdma")),
+            why: Why::Value(format!(
+                "a tensor-parallel run's nodes are its ranks; {TIER_NODES} names expert tier \
+                 nodes, and the two are not set together"
+            )),
         });
     }
     if let Scope::Main { .. } = scope {
@@ -1081,6 +1105,17 @@ impl Levers {
             Some("anon") => NvTierMem::Anon,
             Some("pinned") => NvTierMem::Pinned,
             w => panic!("{NVTIER_MEM} holds {w:?}, not auto, anon or pinned"),
+        }
+    }
+
+    /// `BLOOMERY_TP_NODES`: the node of each rank past rank 0, in rank order;
+    /// empty when unset.
+    #[must_use]
+    pub fn tp_nodes(&self) -> &[SocketAddr] {
+        match &self.entry(TP_NODES).value {
+            None => &[],
+            Some(Value::Addrs(a)) => a,
+            v => panic!("{TP_NODES} holds {v:?}, not socket addresses"),
         }
     }
 

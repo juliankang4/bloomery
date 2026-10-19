@@ -46,6 +46,7 @@ pub const NVTIER_READ: &str = "BLOOMERY_NVTIER_READ";
 pub const NVTIER_MEM: &str = "BLOOMERY_NVTIER_MEM";
 pub const TIER_LINK: &str = "BLOOMERY_TIER_LINK";
 pub const TIER_NODES: &str = "BLOOMERY_TIER_NODES";
+pub const TP_NODES: &str = "BLOOMERY_TP_NODES";
 pub const SCREEN: &str = "BLOOMERY_SCREEN";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
@@ -382,6 +383,23 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               each tier card from its node's census. \
               Qwen3.8's load opens a tier on a node; the other families refuse one by name. \
               Read where a load takes its tier cards.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: TP_NODES,
+        class: Class::C,
+        kind: Kind::Addrs,
+        default: Unset::Means("a `--place tp` run is refused: it has no other rank"),
+        doc: "The nodes of a tensor-parallel run (`--place tp`) past this process, which is rank 0: \
+              the address of each other rank's node, in rank order, where a `tier_server` \
+              process answers that node's census over its control channel. Each rank plans \
+              against its own node's pool. A private or 198.18.0.0/15 IPv4 node off this host \
+              requires `BLOOMERY_TIER_LINK=rdma`, and `BLOOMERY_TIER_NODES` is not set beside \
+              it. GLM-5.3-Flash's `--place tp --plan` reads it. Read where a load takes its \
+              placement.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

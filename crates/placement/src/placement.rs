@@ -40,6 +40,7 @@ pub mod ctx_ask;
 pub mod devices;
 pub mod nodes;
 pub mod paged_drop;
+pub mod tp;
 pub mod workstation;
 
 #[cfg(test)]

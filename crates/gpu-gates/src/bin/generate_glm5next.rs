@@ -5,7 +5,7 @@
 //! (`app::Loaded`), the prompt fed as `--prefill` says, then `-n` greedy
 //! steps.
 //!
-//! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate|bp|<stage>[+<tier>…]]
+//! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate|bp|tp|<stage>[+<tier>…]]
 //! [--mode graph|eager] [--prefill batch|steps] [--last-step]
 //! [--time [--warm W]] [--pair] [--logits] [--plan]
 //! [--top2 K [--rows FILE]] [--repeat R] [--table] [--ignore-eos] [--serve-feed]
@@ -22,6 +22,13 @@
 //!   under the host tier, its prompt-batch bytes `place::tier_batch`'s), also
 //!   spelled `a6000+3090`. A list of more tier cards than the GLM body serves
 //!   and a stage other than the A6000 are refused by name before the plan.
+//!   `tp` is tensor parallel: `BLOOMERY_REF_MODEL` names a Hugging Face
+//!   checkpoint folder, this process's one card is rank 0 and
+//!   `BLOOMERY_TP_NODES` names the other ranks' nodes, each running a
+//!   `tier_server` that answers its census. `--plan` prints one `tp rank=`
+//!   line a rank, each rank's split and whole bytes against its own node's
+//!   pool (`model::arch::glm5next::hf::read_tp`); the load is refused by name, as
+//!   is `BLOOMERY_DRAFT=mtp`.
 //!   Unset, the common rule every serving seat takes (`generate::Place::choose`,
 //!   by the GLM family's `glm_place::TIER_RULE`): the cards' offer, `bp` on
 //!   two cards, kept when its plan puts at least the rule's break-even
@@ -212,6 +219,7 @@ mod cli {
     use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident, open_resident_slots};
     use app::mtp::MtpDraft;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
+    use bloomery_gpu::host::node::node_cards;
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
@@ -228,10 +236,12 @@ mod cli {
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, DRAFT, GEN_SLOTS, HOST_LOCK, HOST_POPULATE, LANE_PREFETCH,
         MTP_WIDTH, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, ResidencyPick, ResidencyWhy,
-        STEP_STATS,
+        STEP_STATS, TP_NODES,
     };
     use gguf::Split;
     use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
+    use model::placement::tp::{RankPool, plan_tp};
+    use model::placement::workstation::spec_of_device;
     use model::placement::{Machine, Plan, PlanLevers};
     use runtime::layer::hosted;
     use runtime::width::{Choosing, Chosen as _, Mode as WidthMode};
@@ -251,6 +261,7 @@ mod cli {
         PREFILL_GROUP,
         LANE_PREFETCH,
         GEN_SLOTS,
+        TP_NODES,
     ];
 
     /// The drafted window's verify: the target's next token and the draft's
@@ -408,6 +419,55 @@ mod cli {
         }
     }
 
+    /// `--place tp`: the plan of each rank of the checkpoint folder `BLOOMERY_REF_MODEL` names,
+    /// one line a rank (`model::arch::glm5next::hf::read_tp`, `placement::tp::plan_tp`): rank 0 this
+    /// process's one card, the others the nodes of `BLOOMERY_TP_NODES` in order, each against its
+    /// own node's pool as its census reads it. The tensor-parallel load is not built, so a run
+    /// without `--plan` is refused after the plan.
+    fn tp_plan(
+        levers: &bloomery_levers::Levers,
+        drafted: bool,
+        plan: bool,
+    ) -> Result<(), GateError> {
+        if drafted {
+            return Err(
+                "--place tp: BLOOMERY_DRAFT=mtp drafts with the NextN layer, which the \
+                 tensor-parallel plan does not place"
+                    .into(),
+            );
+        }
+        let nodes = levers.tp_nodes();
+        if nodes.is_empty() {
+            return Err("--place tp: BLOOMERY_TP_NODES names no other rank's node".into());
+        }
+        let census = gpu_census::census()?;
+        let [here] = census.as_slice() else {
+            return Err(format!(
+                "--place tp: this process sees {} devices, and rank 0 is one card",
+                census.len()
+            )
+            .into());
+        };
+        let mut pools = vec![RankPool::of("local".into(), &spec_of_device(here))];
+        for (addr, (_, spec)) in nodes.iter().zip(node_cards(nodes)?) {
+            pools.push(RankPool::of(addr.to_string(), &spec));
+        }
+        let ranks = plan_tp(
+            &pools,
+            &model::arch::glm5next::hf::read_tp(&ref_model_path()?)?,
+        )?;
+        for r in &ranks {
+            record::tp_rank(r, ranks.len()).print();
+        }
+        if plan {
+            return Ok(());
+        }
+        Err(
+            "--place tp: the tensor-parallel load is not built; --plan prints each rank's plan"
+                .into(),
+        )
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         model::ops::set_lane_prefetch(levers.lane_prefetch());
@@ -536,6 +596,9 @@ mod cli {
             Some(v) => Some(glm_place::parse(&v)?),
             None => None,
         };
+        if place_flag.is_some_and(Place::tp) {
+            return tp_plan(&levers, drafted, has("--plan"));
+        }
         let mode = match flag("--mode")?.as_deref() {
             None | Some("graph") => StepMode::Graph,
             Some("eager") => StepMode::Eager,

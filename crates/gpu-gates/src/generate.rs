@@ -79,6 +79,11 @@ pub fn lane_at(place: Place) -> Result<Lane, GateError> {
 /// opened by its name — the gates' machines. A binary resolves it against
 /// this process's devices ([`Place::on_host`]) before it plans: then each
 /// card is the spec of the device it picked and opens on that device.
+///
+/// `tp` is tensor parallel: this process's one card is rank 0 and
+/// `BLOOMERY_TP_NODES` names the others. It is no card list and resolves
+/// against no census here ([`Place::on`] refuses it): a family that plans
+/// it does so before [`Place::choose`] ([`Place::tp`]).
 #[derive(Debug, Clone, Copy)]
 pub struct Place {
     /// The flag value as the records print it.
@@ -391,13 +396,19 @@ impl Place {
             "a" => return Ok(Place::A),
             "gate" => return Ok(Place::Gate),
             "bp" => return Ok(Place::Bp),
+            "tp" => {
+                return Ok(Place {
+                    word: "tp",
+                    ..alias(0)
+                });
+            }
             _ => {}
         }
         let list = workstation::word_picks(v, MAX_TIERS).map_err(|e| {
             format!(
                 "--place is a, gate, bp (plan (b′): the next-largest card as the largest's \
-                 expert tier) or a card list <stage>[+<tier>…] of card names and device \
-                 ordinals: {e}"
+                 expert tier), tp (tensor parallel over BLOOMERY_TP_NODES) or a card list \
+                 <stage>[+<tier>…] of card names and device ordinals: {e}"
             )
         })?;
         let mut picks = [Pick::Rank(0); 1 + MAX_TIERS];
@@ -441,6 +452,13 @@ impl Place {
     /// `BLOOMERY_TIER_NODES` set, the tier cards are its nodes'
     /// ([`Place::on_nodes`]).
     pub fn on(self, census: &[DeviceInfo]) -> Result<Place, GateError> {
+        if self.tp() {
+            return Err(
+                "--place tp: a tensor-parallel run is planned by its family's own path; this one \
+                 has none"
+                    .into(),
+            );
+        }
         let nodes = bloomery_levers::tier_nodes()?;
         if !nodes.is_empty() {
             return self.on_nodes(census, &nodes);
@@ -776,6 +794,11 @@ impl Place {
                 .extend(specs[1..].iter().map(workstation::node_of));
         }
         Ok(machine)
+    }
+
+    /// Whether the placement is `tp`, tensor parallel over `BLOOMERY_TP_NODES`.
+    pub fn tp(self) -> bool {
+        self.word == "tp"
     }
 
     /// The flag value, as the `plan` and `load` lines print it.
@@ -1864,6 +1887,20 @@ mod tests {
                 assert_eq!(bp(layers), workstation::plan_bp(layers, draft, BATCH));
             }
         }
+    }
+
+    /// `tp` is its own word: every other word parses as before and is not `tp`, and `tp`
+    /// resolves against no census.
+    #[test]
+    fn tp_is_a_word_of_its_own() {
+        for w in ["a", "gate", "bp", "a6000", "3090+a6000", "cuda1+0"] {
+            assert!(!Place::parse(w).unwrap().tp(), "{w}");
+        }
+        let tp = Place::parse("tp").unwrap();
+        assert!(tp.tp() && tp.name() == "tp" && tp.tier_cards().is_empty());
+        assert_ne!(tp, Place::A);
+        let e = tp.on(&census(&["A6000"])).unwrap_err().to_string();
+        assert!(e.starts_with("--place tp: "), "{e}");
     }
 
     /// Any card may be the stage: a list word of this workstation's names

@@ -75,6 +75,10 @@ pub enum Identity {
     /// `MANIFEST.tsv` (`tools/ref/nemotron_ref.cpp`). A prompt row is read by
     /// the `# prompt columns` line; `logits` is that prompt's last position.
     NemotronLogits,
+    /// `# model\t<repo>@<revision>/<quant>` (the reference GGUF), `# checkpoint\t<repo>@<revision>`
+    /// (the Hugging Face checkpoint, which the family pins) and `# harness\t<md5>` (the writer's
+    /// source, the family's `build`) in a map oracle's `MANIFEST.tsv` ([`crate::hfmap`]).
+    HfMap { checkpoint: &'static str },
     /// [`Identity::NemotronLogits`] of a set dumped on a fixture file: `# model`
     /// names [`crate::fixture::first_shard`], and `# fixture` equals
     /// [`crate::fixture::line`] of that file.
@@ -426,6 +430,14 @@ impl Family {
                     dumped_from: stated(set.model.as_deref()),
                     draft: None,
                     build: set.build,
+                })
+            }
+            Identity::HfMap { .. } => {
+                let set = crate::hfmap::HfMapSet::open(path, self)?;
+                Ok(Provenance {
+                    dumped_from: stated(set.model.as_deref()),
+                    draft: None,
+                    build: set.harness,
                 })
             }
             Identity::NemotronLogits | Identity::FixtureNemotronLogits => {

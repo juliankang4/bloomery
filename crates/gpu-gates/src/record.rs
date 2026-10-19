@@ -1169,6 +1169,30 @@ pub static PLAN: Kind = Kind {
     ],
 };
 
+/// One rank of a tensor-parallel plan.
+pub static TP_RANK: Kind = Kind {
+    name: "tp_rank",
+    head: "tp",
+    doc: "One rank of a tensor-parallel plan (--place tp --plan), in rank order: its rank among the ranks, its node (local for this process's card, else the address BLOOMERY_TP_NODES names), the weight bytes it holds, of them its parts of the split tensors and the whole tensors with the tensor scales of the split ones, each with its tensor count, its node's pool and what the weights leave of it.",
+    parts: &[
+        key("rank", U64, ""),
+        lit("/"),
+        pos("ranks", U64, "ranks"),
+        key("node", Word, ""),
+        key("weights", U64, "B"),
+        key("split", U64, "B"),
+        lit(" ("),
+        pos("split_tensors", U64, "tensors"),
+        lit(" tensors)"),
+        key("whole", U64, "B"),
+        lit(" ("),
+        pos("whole_tensors", U64, "tensors"),
+        lit(" tensors)"),
+        key("pool", U64, "B"),
+        key("left", U64, "B"),
+    ],
+};
+
 /// Where a qwen3moe-family placement puts the routed experts, before the
 /// load.
 pub static PLAN38: Kind = Kind {
@@ -3755,6 +3779,7 @@ pub static BLOOMERY_SERVE_DECIDE: &[&Kind] = kinds![
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &PLACE_UNSET,
+    &TP_RANK,
     &PLAN,
     &RESIDENCY_HOST,
     &LANE,
@@ -3931,6 +3956,21 @@ pub fn with_room(r: Record, room: Option<(u64, u64)>) -> Record {
         Some((read, planned)) => r.u("room", read).u("plan_room", planned),
         None => r,
     }
+}
+
+/// The `tp` record of rank `r` of a plan of `ranks` ranks.
+pub fn tp_rank(r: &model::placement::tp::Rank, ranks: usize) -> Record {
+    Record::new(&TP_RANK)
+        .u("rank", r.rank)
+        .u("ranks", ranks)
+        .w("node", &r.node)
+        .u("weights", r.bytes())
+        .u("split", r.split_bytes)
+        .u("split_tensors", r.split_tensors)
+        .u("whole", r.whole_bytes)
+        .u("whole_tensors", r.whole_tensors)
+        .u("pool", r.pool_bytes)
+        .u("left", r.pool_bytes - r.bytes())
 }
 
 /// The `plan` record of `plan`, made over `machine` by the placement named
@@ -5284,6 +5324,25 @@ mod tests {
                 "tools/bloomery/schema/{bin}.jsonl is not {bin}'s schema: run just records-refresh"
             );
         }
+    }
+
+    /// A tensor-parallel rank's record reads as its line.
+    #[test]
+    fn a_tp_rank_renders_its_line() {
+        let r = model::placement::tp::Rank {
+            rank: 1,
+            node: "198.18.4.1:47420".into(),
+            pool_bytes: 1000,
+            split_bytes: 600,
+            whole_bytes: 100,
+            split_tensors: 7,
+            whole_tensors: 3,
+        };
+        assert_eq!(
+            tp_rank(&r, 2).line(),
+            "tp rank=1/2 node=198.18.4.1:47420 weights=700 split=600 (7 tensors) whole=100 \
+             (3 tensors) pool=1000 left=300"
+        );
     }
 
     #[test]

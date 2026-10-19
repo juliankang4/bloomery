@@ -116,11 +116,53 @@ pub static IK_DSA: Family = Family {
     consumers: &["gate-gpu-glm-sel", "weekly-gpu-glm5next-e2e-long"],
 };
 
+/// The Hugging Face checkpoint the map oracle's headers and small tensors come from
+/// (`nvidia/GLM-5.3-Flash-NVFP4`), at the revision the family pins.
+pub const HF_MAP_CHECKPOINT: &str =
+    "nvidia/GLM-5.3-Flash-NVFP4@da920bb0b9f4a06727223a349e55468e38352348";
+
+/// The GGUF the map oracle's table and tensors come from: unsloth's UD-Q4_K_XL, [`MODEL`]'s
+/// quant, at the revision the family pins.
+pub const HF_MAP_GGUF: &str =
+    "unsloth/GLM-5.3-Flash-GGUF@a38483c8cd5df544f53d70fb281afe97369d5ab6/UD-Q4_K_XL";
+
+/// The md5 of `tools/ref/glm5next-hf-map.py`, the writer of the map oracle.
+// PIN(2026-10-20): the writer that range-reads the shard headers, the small tensors and the GGUF's
+// table and tensors; `the_map_writer_pin_is_the_source_in_the_tree` holds it to the tree.
+pub const HF_MAP_HARNESS: &str = "6e60cb4336779a1e25c93750019960b5";
+
+/// The map oracle's set.
+pub const HF_MAP_SET: &str = "ref-glm5next-hf-map";
+
+/// [`HF_MAP_GGUF`], as a family's `runs`.
+fn hf_map_gguf() -> Result<String, RefError> {
+    Ok(HF_MAP_GGUF.to_string())
+}
+
+/// The map oracle: [`HF_MAP_CHECKPOINT`]'s shard headers and small F32 and BF16 tensors, and
+/// [`HF_MAP_GGUF`]'s tensor table and the same tensors as its converter wrote them
+/// ([`crate::hfmap`]), which the Hugging Face name map gate reads.
+pub static HF_MAP: Family = Family {
+    name: "hf-map-glm5next",
+    sets: &[HF_MAP_SET],
+    resolve: None,
+    recipe: "just dump-ref-glm5next-hf-map",
+    identity: Identity::HfMap {
+        checkpoint: HF_MAP_CHECKPOINT,
+    },
+    arch: Some(ARCH),
+    build: Some(Build::Is(HF_MAP_HARNESS)),
+    runs: Some(hf_map_gguf),
+    draft_runs: None,
+    consumers: &["gate-glm5next-hf-map"],
+};
+
 /// The architecture's families, in the order `refset-check` lists them.
 pub static FAMILIES: &[&Family] = &[
     &IK,
     &MTP,
     &IK_DSA,
+    &HF_MAP,
     &fixture::IK,
     &fixture::MTP,
     &fixture::IK_DSA,

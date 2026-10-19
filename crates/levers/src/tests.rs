@@ -517,6 +517,7 @@ fn accessors_read_their_rows() {
             NVTIER_MEM,
             TIER_LINK,
             TIER_NODES,
+            TP_NODES,
             PIN_MAIN,
             DRAFT,
             MTP_HEAD_ROWS,
@@ -1906,6 +1907,48 @@ fn remote_nodes_require_private_addresses_and_rdma() {
     ] {
         assert!(tier_ip(ip.parse().expect("an IP address")), "{ip}");
     }
+}
+
+/// A tensor-parallel run's nodes read in rank order; an off-host node needs RDMA, as a tier
+/// node does, and the run's nodes are not set beside expert tier nodes.
+#[test]
+fn tp_nodes_take_the_tier_rules_and_never_sit_beside_tier_nodes() {
+    let main = Scope::Main {
+        bin: "generate_glm5next",
+        acts_on: &[TP_NODES],
+    };
+    let set = read(
+        &env(&[
+            (TP_NODES, "198.18.4.1:7340,198.18.5.1:7340"),
+            (TIER_LINK, "rdma"),
+        ]),
+        main,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let want: Vec<SocketAddr> = vec![
+        "198.18.4.1:7340".parse().unwrap(),
+        "198.18.5.1:7340".parse().unwrap(),
+    ];
+    assert_eq!(set.tp_nodes(), want.as_slice());
+    assert!(read(&env::<&str>(&[]), main).unwrap().tp_nodes().is_empty());
+    for (pairs, want) in [
+        (
+            vec![(TP_NODES, "198.18.4.1:7340")],
+            "a node off this host requires BLOOMERY_TIER_LINK=rdma",
+        ),
+        (
+            vec![(TP_NODES, "127.0.0.1:7340"), (TIER_NODES, "127.0.0.1:7341")],
+            "BLOOMERY_TIER_NODES names expert tier nodes, and the two are not set together",
+        ),
+    ] {
+        let e = read(&env(&pairs), main).unwrap_err().to_string();
+        assert!(e.contains(TP_NODES) && e.contains(want), "{e}");
+    }
+    let other = Scope::Main {
+        bin: "generate_qwen3moe",
+        acts_on: &[],
+    };
+    assert!(read(&env(&[(TP_NODES, "127.0.0.1:7340")]), other).is_err());
 }
 
 #[test]

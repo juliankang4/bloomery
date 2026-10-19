@@ -879,6 +879,13 @@ dump-ref-glm5next *VARIANT:
 dump-ref-glm5next-cuda:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/real-only.sh dump-ref-glm5next-cuda && NVIDIA_TF32_OVERRIDE=0 BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
+# The GLM HF map oracle (tools/ref/glm5next-hf-map.py) into $BLOOMERY_DATA/ref-glm5next-hf-map, by HTTP range reads of
+# nvidia/GLM-5.3-Flash-NVFP4 and unsloth's GLM-5.3-Flash UD-Q4_K_XL at the revisions the family pins: the checkpoint's shard
+# headers and small F32/BF16 tensors, the GGUF's tensor table and the same tensors. About 30 MB; no lease, no card.
+# `just gate-glm5next-hf-map` reads it. The writer refuses an existing set directory.
+dump-ref-glm5next-hf-map:
+    ./tools/box.sh 'bash tools/ref/real-only.sh dump-ref-glm5next-hf-map && python3 tools/ref/glm5next-hf-map.py "$BLOOMERY_DATA/ref-glm5next-hf-map"'
+
 # ik's node dump of a family's fixture file (glm5next, qwen4exp, qwen35moe, deepseek41), into $BLOOMERY_DATA/fx_<the real twin's set>
 # (refset's fixture families): the same dumper and profile as the family's real recipe, the fixture first shard as the model,
 # the fixture file's `# fixture` line in the header (refset-check --fixture-line), and in the long variants (d1k, d3k, d3kdsa,
@@ -1107,6 +1114,13 @@ gate-placement:
 # 대조한다. 헤더와 매니페스트만 읽으므로 몇 초면 끝난다.
 gate-ds41-meta:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-ds41-meta && bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41 arch::tests --nocapture && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test ds41_meta -- --ignored --nocapture'
+
+# GLM HF names/dims and converted F32/BF16 values against the map oracle $BLOOMERY_DATA/ref-glm5next-hf-map
+# (`just dump-ref-glm5next-hf-map`). The set opens through its refset family (crates/refset/src/arch/glm5next), which
+# refuses by name a set of another checkpoint, GGUF or writer, with a file that is not the one written, or never finished.
+# No fixture-tier conversion.
+gate-glm5next-hf-map:
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-glm5next-hf-map && bash tools/gate.sh -p bloomery-model --test glm5next_meta -- --ignored hw_glm_map_matches_the_unsloth_gguf --nocapture'
 
 # qwen3moe 메타 게이트: 하이퍼파라미터 거부 단위 시험(합성 헤더) 뒤, arch/qwen3moe가 파일에서 읽은 값을 ik 그래프
 # (ref_qwen3moe 매니페스트의 노드 형상·op)와 헤더에 대조하고, 텐서 전부가 역할과 허용 타입을 갖는지 본다. 헤더만, 초 단위.

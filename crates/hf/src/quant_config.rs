@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
+use gguf::GgmlType;
 use regex::Regex;
 use serde_json::Value;
 
@@ -86,6 +87,102 @@ impl fmt::Display for Format {
             Format::Bf16 => f.write_str("BF16"),
             Format::F32 => f.write_str("F32"),
         }
+    }
+}
+
+/// A tensor of one format as a card holds it, its block scales decoded to plain ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// The values and their block scales: the bytes a cut splits.
+    pub bytes: u64,
+    /// One tensor scale a matrix, which every rank holds whole.
+    pub whole_bytes: u64,
+    /// The values a cut keeps whole along dims 0 and 1 (ggml's order).
+    pub block: [u64; 2],
+}
+
+impl Format {
+    /// The card type the format is held in, whose row ([`GgmlType::row`]) gives its bytes and
+    /// cut units: NVFP4 in GGUF's NVFP4 block whichever encoding its scales were stored in.
+    fn card_type(self) -> Option<GgmlType> {
+        match self {
+            Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 => Some(GgmlType::NVFP4),
+            Format::Mxfp4 => Some(GgmlType::MXFP4),
+            Format::Bf16 => Some(GgmlType::BF16),
+            Format::F32 => Some(GgmlType::F32),
+            _ => None,
+        }
+    }
+
+    /// A format with no card type row: the values a block spans along dims 0 and 1 and the
+    /// bytes of its one scale, beside one byte a value. MXFP8's scale is one E8M0 byte a 32
+    /// values; an FP8 block format's one F32 a block.
+    fn scaled_bytes(self) -> Option<([u64; 2], u64)> {
+        match self {
+            Format::Mxfp8 => Some(([32, 1], 1)),
+            Format::Fp8Block { rows, cols } => Some(([cols as u64, rows as u64], 4)),
+            _ => None,
+        }
+    }
+
+    /// The held form of a tensor of the format and logical `dims` (ggml's order: dim 0 the values
+    /// a row holds, dim 1 the rows, the dims past them whole matrices); `None` for a format no
+    /// card holds, a zero dimension, a byte count past `u64`, or a row that is not whole blocks of
+    /// its card type. A format with a card type reads its row; NVFP4 adds its one F32 tensor scale
+    /// a matrix.
+    #[must_use]
+    pub fn held(self, dims: &[u64]) -> Option<Held> {
+        let k = *dims.first().filter(|_| !dims.contains(&0))?;
+        let rows = dims.get(1).copied().unwrap_or(1);
+        let matrices = dims
+            .iter()
+            .skip(2)
+            .try_fold(1u64, |a, &d| a.checked_mul(d))?;
+        let (bytes, block) = match self.card_type() {
+            Some(ty) => {
+                let row = ty.row()?;
+                let block = [row.blck, 1];
+                if k % block[0] != 0 {
+                    return None;
+                }
+                (gguf::tensor_bytes(row.blck, row.bytes, dims)?, block)
+            }
+            None => {
+                let (block, scale) = self.scaled_bytes()?;
+                let values = k.checked_mul(rows)?.checked_mul(matrices)?;
+                let scales = k
+                    .div_ceil(block[0])
+                    .checked_mul(rows.div_ceil(block[1]))?
+                    .checked_mul(matrices)?;
+                (values.checked_add(scale.checked_mul(scales)?)?, block)
+            }
+        };
+        let whole_bytes = match self {
+            Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 => matrices.checked_mul(4)?,
+            _ => 0,
+        };
+        Some(Held {
+            bytes,
+            whole_bytes,
+            block,
+        })
+    }
+
+    /// The logical shape of a tensor of the format with `stored` shape (row-major): two E2M1
+    /// values a stored byte for NVFP4 and MXFP4, eight int4 an I32 for the packed format. `stored`
+    /// is a weight [`plan`] placed in the format, whose unpacked count it checked fits.
+    #[must_use]
+    pub fn logical(self, stored: &[usize]) -> Vec<usize> {
+        let mut s = stored.to_vec();
+        let per = match self {
+            Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 | Format::Mxfp4 => 2,
+            Format::Int4Pack { .. } => 8,
+            _ => 1,
+        };
+        if let Some(last) = s.last_mut() {
+            *last *= per;
+        }
+        s
     }
 }
 
@@ -1287,5 +1384,55 @@ mod tests {
         ];
         assert_eq!(count, want.map(|(f, n)| (f.to_string(), n)));
         assert!(p.refused.is_empty(), "{:?}", p.refused);
+    }
+
+    /// Each format's held bytes and blocks, the stored values plus plain scales: NVFP4 in every
+    /// encoding is GGUF's 36 bytes a 64 values and one tensor scale a matrix.
+    #[test]
+    fn each_format_holds_its_values_and_plain_scales() {
+        let expert = [2048, 4096, 288];
+        for f in [Format::Nvfp4, Format::Nvfp4Csf, Format::Nvfp4Csf32] {
+            assert_eq!(
+                f.held(&expert),
+                Some(Held {
+                    bytes: 2048 * 4096 * 288 / 2 + 2048 * 4096 * 288 / 16,
+                    whole_bytes: 4 * 288,
+                    block: [64, 1],
+                })
+            );
+        }
+        assert_eq!(Format::Nvfp4.held(&[48, 16]), None);
+        assert_eq!(
+            Format::Mxfp8.held(&[4096, 8192]),
+            Some(Held {
+                bytes: 4096 * 8192 + 4096 * 8192 / 32,
+                whole_bytes: 0,
+                block: [32, 1],
+            })
+        );
+        let fp8 = Format::Fp8Block {
+            rows: 128,
+            cols: 128,
+        };
+        assert_eq!(
+            fp8.held(&[16384, 4096]),
+            Some(Held {
+                bytes: 16384 * 4096 + 4 * 32 * 128,
+                whole_bytes: 0,
+                block: [128, 128],
+            })
+        );
+        assert_eq!(
+            Format::Bf16.held(&[512, 256, 64]).unwrap().bytes,
+            2 * 512 * 256 * 64
+        );
+        assert_eq!(Format::F32.held(&[64]).unwrap().bytes, 256);
+        assert_eq!(Format::Fp8Tensor.held(&[64, 64]), None);
+        assert_eq!(Format::Bf16.held(&[0, 8192]), None);
+        assert_eq!(Format::Bf16.held(&[64, 0]), None);
+        assert_eq!(Format::Bf16.held(&[u64::MAX / 2, 4]), None);
+        assert_eq!(Format::Mxfp8.held(&[1 << 40, 1 << 40]), None);
+        assert_eq!(Format::Nvfp4Csf32.logical(&[2048, 1024]), [2048, 2048]);
+        assert_eq!(Format::Mxfp8.logical(&[2048, 1024]), [2048, 1024]);
     }
 }
