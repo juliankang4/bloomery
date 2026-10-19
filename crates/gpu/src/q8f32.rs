@@ -94,10 +94,8 @@ pub(crate) unsafe fn f32_lane_partials(
     m_cols: u32,
     lane: usize,
 ) -> [f32; 8] {
-    // One column is the decode shape, and it gets a body of its own: the
-    // guards below are runtime tests, so in the general loop each chunk's
-    // multiply-add sits behind its own branch and the lane can have only
-    // that chunk's load in flight. See `f32_lane_partial_1col`.
+    // One column is the decode shape, and it gets a body of its own. See
+    // `f32_lane_partial_1col`.
     if m_cols == 1 {
         // SAFETY: with m_cols 1 this function's safety contract is the
         // callee's.
@@ -106,6 +104,7 @@ pub(crate) unsafe fn f32_lane_partials(
     }
     let k = k as usize;
     let w_row = row * k;
+    let iters = k >> 5;
     let mut f0 = 0.0f32;
     let mut f1 = 0.0f32;
     let mut f2 = 0.0f32;
@@ -115,7 +114,50 @@ pub(crate) unsafe fn f32_lane_partials(
     let mut f6 = 0.0f32;
     let mut f7 = 0.0f32;
     let mut it = 0usize;
-    while it < k >> 5 {
+    // The column guards are runtime tests, so a multiply-add sits behind
+    // its column's branch, and one chunk a trip would leave one load in
+    // flight. A trip takes [`LANE_UNROLL`] chunks instead: the row's words
+    // once for every column, then each live column's chunks loaded before
+    // its first multiply-add. Each column still adds its chunks in
+    // increasing `it`; the guarded walk below is the tail.
+    while it + LANE_UNROLL <= iters {
+        let kk = it * 32 + lane;
+        // SAFETY: w_row + kk + 224 < w_row + k <= w.len(): kk + 224 < k by
+        // the loop guard (LANE_UNROLL = 8) and the safety contract.
+        let wv = unsafe { f32_load_chunks(w, w_row + kk) };
+        // SAFETY: kk + 224 < k <= x.len(), since m_cols >= 1.
+        f0 = unsafe { f32_fold_chunks(f0, &wv, x, kk) };
+        if m_cols > 1 {
+            // SAFETY: k + kk + 224 < 2*k <= x.len(), since m_cols > 1.
+            f1 = unsafe { f32_fold_chunks(f1, &wv, x, k + kk) };
+        }
+        if m_cols > 2 {
+            // SAFETY: 2*k + kk + 224 < 3*k <= x.len(), since m_cols > 2.
+            f2 = unsafe { f32_fold_chunks(f2, &wv, x, 2 * k + kk) };
+        }
+        if m_cols > 3 {
+            // SAFETY: 3*k + kk + 224 < 4*k <= x.len(), since m_cols > 3.
+            f3 = unsafe { f32_fold_chunks(f3, &wv, x, 3 * k + kk) };
+        }
+        if m_cols > 4 {
+            // SAFETY: 4*k + kk + 224 < 5*k <= x.len(), since m_cols > 4.
+            f4 = unsafe { f32_fold_chunks(f4, &wv, x, 4 * k + kk) };
+        }
+        if m_cols > 5 {
+            // SAFETY: 5*k + kk + 224 < 6*k <= x.len(), since m_cols > 5.
+            f5 = unsafe { f32_fold_chunks(f5, &wv, x, 5 * k + kk) };
+        }
+        if m_cols > 6 {
+            // SAFETY: 6*k + kk + 224 < 7*k <= x.len(), since m_cols > 6.
+            f6 = unsafe { f32_fold_chunks(f6, &wv, x, 6 * k + kk) };
+        }
+        if m_cols > 7 {
+            // SAFETY: 7*k + kk + 224 < 8*k <= x.len(), since m_cols > 7.
+            f7 = unsafe { f32_fold_chunks(f7, &wv, x, 7 * k + kk) };
+        }
+        it += LANE_UNROLL;
+    }
+    while it < iters {
         let kk = it * 32 + lane;
         // SAFETY: kk < k <= w.len() - w_row by the safety contract.
         let wv = unsafe { *w.get_unchecked(w_row + kk) };
@@ -157,6 +199,50 @@ pub(crate) unsafe fn f32_lane_partials(
     [f0, f1, f2, f3, f4, f5, f6, f7]
 }
 
+/// The [`LANE_UNROLL`] chunk values a lane reads at `at`:
+/// `v[at + 32·i]` for i = 0..8.
+///
+/// # Safety
+///
+/// `at + 224 < v.len()`.
+#[inline(always)]
+unsafe fn f32_load_chunks(v: &[f32], at: usize) -> [f32; LANE_UNROLL] {
+    // SAFETY: at + 32·i <= at + 224 < v.len() by this fn's contract.
+    unsafe {
+        [
+            *v.get_unchecked(at),
+            *v.get_unchecked(at + 32),
+            *v.get_unchecked(at + 64),
+            *v.get_unchecked(at + 96),
+            *v.get_unchecked(at + 128),
+            *v.get_unchecked(at + 160),
+            *v.get_unchecked(at + 192),
+            *v.get_unchecked(at + 224),
+        ]
+    }
+}
+
+/// `f` with the [`LANE_UNROLL`] chunks of one column added in order:
+/// `fma(w[i], x[at + 32·i], ·)` for i = 0..8, the column's loads issued
+/// before the first multiply-add.
+///
+/// # Safety
+///
+/// `at + 224 < x.len()`.
+#[inline(always)]
+unsafe fn f32_fold_chunks(f: f32, w: &[f32; LANE_UNROLL], x: &[f32], at: usize) -> f32 {
+    // SAFETY: at + 224 < x.len() by this fn's contract.
+    let [x0, x1, x2, x3, x4, x5, x6, x7] = unsafe { f32_load_chunks(x, at) };
+    let f = f32::mul_add(w[0], x0, f);
+    let f = f32::mul_add(w[1], x1, f);
+    let f = f32::mul_add(w[2], x2, f);
+    let f = f32::mul_add(w[3], x3, f);
+    let f = f32::mul_add(w[4], x4, f);
+    let f = f32::mul_add(w[5], x5, f);
+    let f = f32::mul_add(w[6], x6, f);
+    f32::mul_add(w[7], x7, f)
+}
+
 /// Chunks whose loads the F32 single-column body issues before its first
 /// multiply-add. The row walk is a dependent chain — each chunk's address is
 /// known in advance but its multiply-add feeds the next — so with one chunk
@@ -164,7 +250,7 @@ pub(crate) unsafe fn f32_lane_partials(
 /// is the chunk count times that latency, whatever the grid geometry is.
 /// Issuing this many loads first is what turns the walk into a bandwidth
 /// problem; it does not touch the accumulation order. The body spells the
-/// chunks out as named scalars, so the value is pinned to the width it is
+/// chunks out one by one, so the value is pinned to the width it is
 /// written for. The Q8_0 single-column body walks whole words instead and
 /// carries its own width, [`Q8_STEP_UNROLL`].
 pub const LANE_UNROLL: usize = 8;
@@ -188,42 +274,18 @@ pub unsafe fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, la
     let iters = k >> 5;
     let mut f = 0.0f32;
     let mut it = 0usize;
-    // Named scalars, not an array: an array whose element a loop selects is
-    // served from a local depot whatever the loop unrolls to, and the round
-    // trip that costs is the thing this body exists to avoid.
+    // Every chunk is picked by a constant index, never by a loop: an array
+    // whose element a loop selects is served from a local depot whatever the
+    // loop unrolls to, and the round trip that costs is the thing this body
+    // exists to avoid. [`f32_fold_chunks`] owns the chunk order.
     while it + LANE_UNROLL <= iters {
         let kk = it * 32 + lane;
-        // SAFETY: kk + 224 < k by the loop guard (LANE_UNROLL = 8), so every
-        // read is inside w[w_row .. w_row + k] and x[0 .. k], both covered by
-        // the caller contract (w.len() >= (row+1)*k, x.len() >= k).
-        let (w0, w1, w2, w3, w4, w5, w6, w7, x0, x1, x2, x3, x4, x5, x6, x7) = unsafe {
-            (
-                *w.get_unchecked(w_row + kk),
-                *w.get_unchecked(w_row + kk + 32),
-                *w.get_unchecked(w_row + kk + 64),
-                *w.get_unchecked(w_row + kk + 96),
-                *w.get_unchecked(w_row + kk + 128),
-                *w.get_unchecked(w_row + kk + 160),
-                *w.get_unchecked(w_row + kk + 192),
-                *w.get_unchecked(w_row + kk + 224),
-                *x.get_unchecked(kk),
-                *x.get_unchecked(kk + 32),
-                *x.get_unchecked(kk + 64),
-                *x.get_unchecked(kk + 96),
-                *x.get_unchecked(kk + 128),
-                *x.get_unchecked(kk + 160),
-                *x.get_unchecked(kk + 192),
-                *x.get_unchecked(kk + 224),
-            )
-        };
-        f = f32::mul_add(w0, x0, f);
-        f = f32::mul_add(w1, x1, f);
-        f = f32::mul_add(w2, x2, f);
-        f = f32::mul_add(w3, x3, f);
-        f = f32::mul_add(w4, x4, f);
-        f = f32::mul_add(w5, x5, f);
-        f = f32::mul_add(w6, x6, f);
-        f = f32::mul_add(w7, x7, f);
+        // SAFETY: w_row + kk + 224 < w_row + k <= w.len(): kk + 224 < k by
+        // the loop guard (LANE_UNROLL = 8) and the caller contract.
+        let wv = unsafe { f32_load_chunks(w, w_row + kk) };
+        // SAFETY: kk + 224 < k <= x.len() by the loop guard and the caller
+        // contract.
+        f = unsafe { f32_fold_chunks(f, &wv, x, kk) };
         it += LANE_UNROLL;
     }
     while it < iters {
@@ -447,37 +509,12 @@ pub unsafe fn f32_lane_partial_1col_w32(
     }
     while it + LANE_UNROLL <= iters {
         let kk = it * 32 + lane;
-        // SAFETY: kk + 224 < k by the loop guard (LANE_UNROLL = 8), so every
-        // read is inside w[w_row .. w_row + k] and x[0 .. k] by the caller
+        // SAFETY: w_row + kk + 224 < w_row + k <= w.len(): kk + 224 < k by
+        // the loop guard (LANE_UNROLL = 8) and the caller contract.
+        let wv = unsafe { f32_load_chunks(w, w_row + kk) };
+        // SAFETY: kk + 224 < k <= x.len() by the loop guard and the caller
         // contract.
-        let (w0, w1, w2, w3, w4, w5, w6, w7, x0, x1, x2, x3, x4, x5, x6, x7) = unsafe {
-            (
-                *w.get_unchecked(w_row + kk),
-                *w.get_unchecked(w_row + kk + 32),
-                *w.get_unchecked(w_row + kk + 64),
-                *w.get_unchecked(w_row + kk + 96),
-                *w.get_unchecked(w_row + kk + 128),
-                *w.get_unchecked(w_row + kk + 160),
-                *w.get_unchecked(w_row + kk + 192),
-                *w.get_unchecked(w_row + kk + 224),
-                *x.get_unchecked(kk),
-                *x.get_unchecked(kk + 32),
-                *x.get_unchecked(kk + 64),
-                *x.get_unchecked(kk + 96),
-                *x.get_unchecked(kk + 128),
-                *x.get_unchecked(kk + 160),
-                *x.get_unchecked(kk + 192),
-                *x.get_unchecked(kk + 224),
-            )
-        };
-        f = f32::mul_add(w0, x0, f);
-        f = f32::mul_add(w1, x1, f);
-        f = f32::mul_add(w2, x2, f);
-        f = f32::mul_add(w3, x3, f);
-        f = f32::mul_add(w4, x4, f);
-        f = f32::mul_add(w5, x5, f);
-        f = f32::mul_add(w6, x6, f);
-        f = f32::mul_add(w7, x7, f);
+        f = unsafe { f32_fold_chunks(f, &wv, x, kk) };
         it += LANE_UNROLL;
     }
     while it < iters {
@@ -2120,7 +2157,10 @@ fn check_gemv_geometry(
 
 #[cfg(test)]
 mod tests {
-    use super::{q8_0_lane_partial_1col, q8_0_lane_partials_mcol};
+    use super::{
+        f32_lane_partial_1col_w32, f32_lane_partials, q8_0_lane_partial_1col,
+        q8_0_lane_partials_mcol,
+    };
 
     /// The single-column Q8_0 body sums every value of the row exactly once,
     /// for every k the launchers accept (a positive multiple of 32) up to two
@@ -2264,6 +2304,65 @@ mod tests {
                                     );
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Column c of the F32 body is a scalar walk of `fma` over column c's
+    /// chunks in increasing order, bit for bit, lane by lane: for every
+    /// column count 1..=8 (1 is the single-column body, which the 32-chunk
+    /// single-column body matches too) and every k up to 1536 (each width's
+    /// unrolled trips and each tail the walks can end in). The values round,
+    /// so a chunk added out of order shows as other bits.
+    #[test]
+    fn f32_walks_are_the_scalar_walk() {
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+        };
+        for k in (32..=1536).step_by(32) {
+            let rows = 2;
+            let w: Vec<f32> = (0..rows * k).map(|_| next()).collect();
+            let x: Vec<f32> = (0..8 * k).map(|_| next()).collect();
+            for m in 1..=8u32 {
+                for r in 0..rows {
+                    for lane in 0..32 {
+                        // SAFETY: w holds `rows` rows of k values, x holds
+                        // 8·k >= m·k, k is a multiple of 32, m <= 8 and
+                        // lane < 32.
+                        let got = unsafe { f32_lane_partials(&w, &x, k as u32, r, m, lane) };
+                        for (c, &v) in got.iter().enumerate() {
+                            let want = if c < m as usize {
+                                (0..k / 32).fold(0.0f32, |acc, it| {
+                                    f32::mul_add(
+                                        w[r * k + 32 * it + lane],
+                                        x[c * k + 32 * it + lane],
+                                        acc,
+                                    )
+                                })
+                            } else {
+                                0.0
+                            };
+                            assert_eq!(
+                                v.to_bits(),
+                                want.to_bits(),
+                                "k={k} m={m} row={r} lane={lane} col={c}"
+                            );
+                        }
+                        if m == 1 {
+                            // SAFETY: w covers row r and x covers k values;
+                            // k is a positive multiple of 32 and lane < 32.
+                            let w32 =
+                                unsafe { f32_lane_partial_1col_w32(&w, &x, k as u32, r, lane) };
+                            assert_eq!(
+                                w32.to_bits(),
+                                got[0].to_bits(),
+                                "w32 k={k} row={r} lane={lane}"
+                            );
                         }
                     }
                 }
