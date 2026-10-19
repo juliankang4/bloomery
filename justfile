@@ -292,7 +292,9 @@ gate-gpu-mamba2-ssd:
 
 # NVFP4 dense gemv (bloomery_gpu::mxfp4, Nvfp4Kernels) at Bolt's ssm_in / ssm_out shapes, synthetic tensors loaded through
 # Weights::load_where and run through site::kgemv: every output written, within the derived band of the host dequant
-# times the tensor's scale, bit for bit the host rule; the load's refusals by name. `gate_nvfp4 --bench-kernels` prices it.
+# times the tensor's scale, bit for bit the host rule; the load's refusals by name. The routed pair (bloomery_gpu::mxfp4_sel)
+# at Qwen3.8's widths on stacks with a scale an expert, loaded on a plan row's card experts: the same clauses, ids past the
+# stack raised by name. `gate_nvfp4 --bench-kernels` prices the dense gemv and the routed pair.
 gate-gpu-nvfp4:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nvfp4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nvfp4'
 
@@ -1883,12 +1885,11 @@ gate-gpu-ds41-comp:
 gate-gpu-ds41-index:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-index && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_index && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_index'
 
-# V4.1 디바이스 크레이트의 호스트 단위 시험(카드·게이트 락 없음): 오라클 세트가 닿지 않는 큰 위치에서도 rope 표가 ggml 레시피와 같다.
-# 락이 없어도 되는 까닭: 이 크레이트의 시험 모듈은 카드를 열지 않는다(Gpu·스트림·디바이스 버퍼를 쓰는 시험이 없다). cargo oxide는 빌드 때문이다.
+# V4.1 디바이스 크레이트의 lib 시험(게이트 락 없음): 오라클 세트가 닿지 않는 큰 위치에서도 rope 표가 ggml 레시피와 같다.
+# hw_ 시험(experts.rs의 gate·up 합 오류가 활성화 앞에서 난다)은 #[ignore]라 --include-ignored로 같이 돌고 카드 0번을 연다.
 [group('canary')]
-[group('host')]
 gate-gpu-ds41-lib:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-deepseek41 --release --lib'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-deepseek41 --release --lib -- --include-ignored'
 
 # V4.1 서버 엔진 결합(gpu-gates의 bind, deepseek41 기능 뒤에 있어 gate-gpu-gates-lib가 빌드하지 않는다)과 모든 서버 좌석이 나눠 쓰는
 # 비전 좌석(vision_seat: 플래그, 투영기↔텍스트 검사, 인코더 자리와 reserve, 표의 위치당 바이트, `vision` 레코드)과 임베딩 모델의

@@ -3150,6 +3150,37 @@ fn swiglu_matches_scalar_and_is_position_independent() {
     assert_eq!(ends, [-0.0, 200.0]);
 }
 
+/// The clamped combine reports a NaN or an infinity in `gate` or `up` at every position (each
+/// lane of both vectors and the padded tail), which it writes as a finite value, and reports
+/// finite inputs as finite. Below the limit nothing is clamped: `true`, the value non-finite in
+/// `out`.
+#[test]
+fn swiglu_clamp_flags_a_non_finite_input_at_every_position() {
+    let n = 19;
+    let mut out = vec![0.0f32; n];
+    let base = vec![f32::MAX; n];
+    assert!(qdot::swiglu_clamp(&base, &base, 7.0, &mut out));
+    for i in 0..n {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut v = base.clone();
+            v[i] = bad;
+            assert!(
+                !qdot::swiglu_clamp(&v, &base, 7.0, &mut out),
+                "gate[{i}] = {bad}"
+            );
+            assert!(
+                !qdot::swiglu_clamp(&base, &v, 7.0, &mut out),
+                "up[{i}] = {bad}"
+            );
+            assert!(
+                out[i].is_finite(),
+                "up[{i}] = {bad}: the clamp writes a finite value"
+            );
+            assert!(qdot::swiglu_clamp(&base, &v, 0.0, &mut out) && !out[i].is_finite());
+        }
+    }
+}
+
 // ------------------------------------------------- clamped SwiGLU (V4.1)
 // The reference below is ik's rule written out again in scalar f32 from ik's
 // source, not a call into qdot: a clamp deleted from `swiglu_clamp` cannot be

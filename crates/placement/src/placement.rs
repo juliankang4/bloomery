@@ -494,7 +494,9 @@ pub enum CardFormat {
     /// nvfp4 in two planes (`crates/gpu/src/mxfp4.rs`, `repack`): a row's
     /// code bytes as `k / 8` words, then its UE4M3 scale bytes four to a
     /// word, `k / 64` words — the file's 36 bytes a 64-value block, moved.
-    /// The tensor's f32 `.scale` is its own F32 row.
+    /// A tensor's f32 `.scale` is its own F32 row; a routed stack (three
+    /// dims) adds a third buffer, one f32 scale an expert it holds
+    /// ([`card_buffers`]).
     Nvfp4Planes,
     /// bloomery's mxfp8 (`GgmlType::MXFP8`) in two planes
     /// (`crates/gpu/src/q8f32.rs`, `mxfp8_planes`): a row's value bytes as
@@ -644,15 +646,16 @@ impl CardFormat {
 
     /// The format an expert stack of type `ty` loads in on a card under the
     /// default expert rule ([`plan_with`]): [`CardFormat::of`] less q5_K,
-    /// which this rule does not admit, and less nvfp4 and mxfp8, which no card
-    /// expert kernel reads (their planes are a dense site's). A card expert kernel does read q5_K
+    /// which this rule does not admit, and less mxfp8, whose planes have no
+    /// card expert entry. A card expert kernel does read q5_K
     /// (`kq_gate_up_act_q5k`, `q5k_gemv_sel`), and the program that runs
     /// them names q5_K in its own [`RoutedFormat`] (glm5next's
-    /// `card_routed`). A stack of a type with none stays on the host.
+    /// `card_routed`). An nvfp4 stack loads in its planes, which the card
+    /// leg's nvfp4 pair reads (`crate::kernels::card_planes_runs`). A stack
+    /// of a type with none stays on the host.
     #[must_use]
     pub fn of_routed(ty: GgmlType) -> Option<CardFormat> {
-        CardFormat::of(ty)
-            .filter(|_| !matches!(ty, GgmlType::Q5_K | GgmlType::NVFP4 | GgmlType::MXFP8))
+        CardFormat::of(ty).filter(|_| !matches!(ty, GgmlType::Q5_K | GgmlType::MXFP8))
     }
 
     /// A file tensor of type `ty` can be laid out in this format: the
@@ -1691,23 +1694,32 @@ fn layer_of(t: &ModelTensor, layers: usize) -> Result<usize, PlacementError> {
 /// Device bytes of `rows` rows of `t` in `format`, or the refusal that names
 /// it: rows the upload refuses are refused, not given another formula.
 fn card_bytes(t: &ModelTensor, format: CardFormat, rows: u64) -> Result<u64, PlacementError> {
-    let k = t.dims.first().copied().unwrap_or(0);
-    format
-        .resident_bytes(t.ty, k, rows)
-        .ok_or_else(|| refused(t, format, k, rows))
+    card_buffers(t, format, rows)?
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(|| PlacementError::tensor(t, format!("{rows} rows pass u64 bytes")))
 }
 
-/// The device buffers of `rows` rows of `t` in `format`, in upload order, or
-/// the refusal [`card_bytes`] gives.
+/// The device buffers of `rows` rows of `t` in `format`, in upload order —
+/// [`CardFormat::buffer_bytes`], and for an nvfp4 stack (three dims) one f32
+/// scale an expert the rows hold, the scales its upload gathers from its
+/// `.scale` — or the refusal [`card_bytes`] gives.
 fn card_buffers(
     t: &ModelTensor,
     format: CardFormat,
     rows: u64,
 ) -> Result<Vec<u64>, PlacementError> {
     let k = t.dims.first().copied().unwrap_or(0);
-    format
+    let mut bufs = format
         .buffer_bytes(t.ty, k, rows)
-        .ok_or_else(|| refused(t, format, k, rows))
+        .ok_or_else(|| refused(t, format, k, rows))?;
+    if let (CardFormat::Nvfp4Planes, &[_, per, _]) = (format, t.dims.as_slice()) {
+        if per == 0 || !rows.is_multiple_of(per) {
+            return Err(refused(t, format, k, rows));
+        }
+        bufs.push(rows / per * 4);
+    }
+    Ok(bufs)
 }
 
 fn refused(t: &ModelTensor, format: CardFormat, k: u64, rows: u64) -> PlacementError {
@@ -1986,6 +1998,15 @@ fn routed_row_on_as(
         }
     }
     if !host.is_empty() {
+        if t.ty == GgmlType::NVFP4 {
+            return Err(PlacementError::tensor(
+                t,
+                format!(
+                    "an nvfp4 stack with experts {host} on the host, which has no nvfp4 kernel: \
+                     every expert of it must be on a card"
+                ),
+            ));
+        }
         let bytes = host.len() * file_per_expert;
         segments.push(in_place(Device::Host, Format::HostFile, Some(host), bytes));
     }
@@ -5370,6 +5391,56 @@ mod tests {
             }
         }
         model
+    }
+
+    /// An nvfp4 stack loads in its planes under the default expert rule, and
+    /// its card segment counts one f32 scale an expert it holds after the
+    /// planes, where a dense nvfp4 tensor's segment is the planes alone. A
+    /// split that leaves an expert of it on the host is refused by name: the
+    /// host has no nvfp4 kernel.
+    #[test]
+    fn an_nvfp4_stack_holds_a_scale_an_expert_and_no_host_expert() {
+        use GgmlType::NVFP4;
+        assert_eq!(CardFormat::of_routed(NVFP4), Some(CardFormat::Nvfp4Planes));
+        assert_eq!(CardFormat::of_routed(GgmlType::Q5_K), None);
+        let model = legged(&[[NVFP4; 3]]);
+        let i = model
+            .tensors
+            .iter()
+            .position(|t| t.role == Role::RoutedExperts)
+            .expect("a stack");
+        let t = &model.tensors[i];
+        let list = |ids: &[u32]| ExpertList::new(ids.to_vec(), 8).expect("a list");
+        let row = routed_row_on(
+            i,
+            t,
+            0,
+            vec![(0, list(&[6, 1, 4])), (1, list(&[0, 2, 3, 5, 7]))],
+            &model,
+        )
+        .expect("every expert on a card");
+        // Three experts of four rows of 256 values: 32 code words and 4 scale
+        // words a row, then three scales.
+        let held = [12 * 128, 12 * 16, 3 * 4];
+        let seg = &row.segments[0];
+        assert_eq!(seg.buffer_bytes(t, model.experts).expect("buffers"), held);
+        assert_eq!(seg.resident_bytes, held.iter().sum::<u64>());
+        let dense = ModelTensor {
+            dims: vec![256, 4],
+            role: Role::Attention,
+            ..t.clone()
+        };
+        assert_eq!(
+            card_buffers(&dense, CardFormat::Nvfp4Planes, 4).expect("buffers"),
+            [4 * 128, 4 * 16]
+        );
+        let err = routed_row(i, t, 0, list(&[0, 1]), &model)
+            .expect_err("experts on the host")
+            .to_string();
+        assert!(
+            err.contains("ffn_gate_exps.weight") && err.contains("no nvfp4 kernel"),
+            "{err}"
+        );
     }
 
     /// A card leg judges a layer by its parts: Qwen3-30B's leg (a Q4_K or

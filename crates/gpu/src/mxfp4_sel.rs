@@ -1,4 +1,5 @@
-//! The MXFP4 routed-expert kernels, two forms of one rule ([`crate::mxfp4`]).
+//! The FP4 routed-expert kernels: MXFP4's, two forms of one rule
+//! ([`crate::mxfp4`]), and NVFP4's pair.
 //!
 //! The draft's route-plan kernels ([`MxExpertKernels`]), for up to eight
 //! tokens per launch: the experts of a model whose stacks hold MXFP4 in the
@@ -11,8 +12,11 @@
 //! `mxfp4_gate_up_sel` / `mxfp4_gemv_sel` run all slots in one launch each.
 //! Their ids, activation rule, fault sink and geometry are the family's, and
 //! the block rule is the route-plan kernels', so a (slot, column) of the pair
-//! equals the route kernel's value for that (slot, token) bit for bit; the
-//! scale byte follows ggml's half rule for every value.
+//! equals the route kernel's value for that (slot, token) bit for bit while
+//! both sums are finite; the scale byte follows ggml's half rule for every
+//! value. A gate or up sum that is not finite raises
+//! [`FaultSite::F32Product`] in both gate-up paths and writes NaN into its
+//! row of `h`: the SwiGLU clamp would map a NaN to a finite value.
 //!
 //! The route-plan kernels, in the order a layer runs them:
 //! - `dflash_quantize_q8_1`: the engine's q8_1 activation rule
@@ -21,7 +25,8 @@
 //! - `dflash_expert_gate_up`: gate·up·SwiGLU over the MXFP4 stacks. A warp
 //!   per (slot, row) reads weight row `sel[slot] · rows_per_expert + r` of
 //!   both stacks once and dots it with every token column that routes to
-//!   the slot ([`crate::mxfp4::lane_partials`]), then [`swiglu_clamp`].
+//!   the slot ([`crate::mxfp4::lane_partials`]), then the checked SwiGLU
+//!   ([`act::apply_checked`]).
 //! - `dflash_expert_down`: the down projection and the weighted combine in
 //!   one pass. A warp per output row `d` walks the slots in order; slot `j`'s
 //!   row of expert `sel[j]` is read once and dotted with column `(j, c)` of
@@ -38,8 +43,8 @@
 //! expert once and route the tokens that share it to one slot, which reads
 //! its rows once for all of them.
 //!
-//! Numeric contract (the gate holds each kernel to its host transcription
-//! bit for bit):
+//! Numeric contract for finite sums (each kernel matches its host
+//! transcription bit for bit):
 //! - a dot: the MXFP4 × q8_1 rule of [`crate::mxfp4`], then the warp
 //!   butterfly;
 //! - `h[(slot · m + c) · rows_per_expert + r] = swiglu_clamp(g, u, limit)`,
@@ -47,12 +52,39 @@
 //!   `swiglu_clamp_exp`;
 //! - `out[c · rows + d]`: from 0, for each slot `j` in order that token `c`
 //!   routes to, `acc = fma(dot_j, w, acc)`.
+//!
+//! The NVFP4 routed pair ([`Nvfp4SelKernels`]): a gate·up and a down
+//! `_sel` over stacks in the two-plane card layout
+//! (`CardFormat::Nvfp4Planes`, [`crate::mxfp4`]'s
+//! [`repack`](crate::mxfp4::repack) under [`Nvfp4`]) with one tensor scale an
+//! expert, shaped like every other `_sel` pair ([`crate::kquant::sel`]).
+//!
+//! - `nvfp4_gate_up_sel`: slot `s` dots the rows of expert `sel[s]` of the
+//!   gate and up stacks with column `s / slots_per_col` of a [`Q8Act`]
+//!   ([`lane_partials`]), multiplies each reduced dot by its stack's scale of
+//!   expert `sel[s]` and writes `act::apply_checked` of the two.
+//! - `nvfp4_gemv_sel32`: slot `s` dots the rows of expert `sel[s]` of the
+//!   down stack with column `s` of a [`Q8Blocks32`] ([`lane_partials`],
+//!   one scale a 32-value unit), times the stack's scale of expert `sel[s]`.
+//!   The 32-value form takes any row width the format does (a multiple of
+//!   64), where a `Q8Act` takes whole 256-value super-blocks only.
+//!
+//! The rule of a dot is the FP4 owner's under [`Nvfp4`], then the warp
+//! butterfly, then one multiply by the expert's scale: the dense gemv's
+//! (`nvfp4_gemv`) with the scale read by id. Ids: [`HOST`] returns before any
+//! load and writes nothing; any other id at or past the stack's experts
+//! raises [`FaultSite::ExpertId`] on the launch's sink, and the gate·up
+//! writes NaN into its row of `h` (warp-uniform, before the first weight
+//! load); the down leaves its rows of `y` as they were. A scaled gate or up
+//! sum that is not finite raises [`FaultSite::F32Product`] and writes NaN
+//! into its row of `h`: the SwiGLU clamp would map a NaN to a finite value.
 
 use crate::hybrid::HOST;
-use crate::kquant::act::{self, swiglu_clamp};
+use crate::kquant::act::{self, Act};
 use crate::kquant::{GateUpAct, SelDown};
-use crate::mxfp4::{self, Mxfp4, Planes, lane_partial_file, lane_partials};
-use crate::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32, q8_1_quant_block};
+use crate::mxfp4::{self, Mxfp4, NV_BLOCK_VALUES, Nvfp4, Planes, lane_partial_file, lane_partials};
+use crate::q5::Q8Blocks32;
+use crate::{DeviceTensor, FaultSink, FaultSite, GpuError, Q8Act, launch_u32, q8_1_quant_block};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::vector::{U32x4, as_vectors};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
@@ -250,6 +282,7 @@ mod mxfp4_sel_kernels {
         n_blk: u32,
         n_grp: u32,
         limit: f32,
+        fault: FaultSink,
         mut h: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -280,13 +313,13 @@ mod mxfp4_sel_kernels {
         // and n_blk/4 scales at c·d_col (the q, d8 and n_grp bounds); the
         // host passes n_blk a multiple of 4 and scales repacked in range.
         let fg = unsafe {
-            lane_partials::<8, Mxfp4>(
+            lane_partials::<8, Mxfp4, 2>(
                 gv, ge, row_abs, n_blk, q, d8, 0, q_col, 0, d_col, mask, lane,
             )
         };
         // SAFETY: the same bounds for the up stack.
         let fu = unsafe {
-            lane_partials::<8, Mxfp4>(
+            lane_partials::<8, Mxfp4, 2>(
                 uv, ue, row_abs, n_blk, q, d8, 0, q_col, 0, d_col, mask, lane,
             )
         };
@@ -300,7 +333,7 @@ mod mxfp4_sel_kernels {
                         (0.0, 0.0)
                     };
                     if lane == 0 {
-                        let v = swiglu_clamp(g, u, limit);
+                        let v = act::apply_checked(act::ACT_SWIGLU_CLAMP, limit, g, u, fault);
                         // SAFETY: (slot·m + c)·rpe + r < n_slots·m_cols·rpe
                         // <= h.len() by the launch contract; lane 0 of the
                         // row's warp is the slot's only writer.
@@ -392,7 +425,7 @@ mod mxfp4_sel_kernels {
                 // q, d8 and n_grp bounds); n_blk a multiple of 4 and scales
                 // in range by the host.
                 let f = unsafe {
-                    lane_partials::<8, Mxfp4>(
+                    lane_partials::<8, Mxfp4, 2>(
                         wv,
                         we,
                         id * rpe + d,
@@ -461,11 +494,14 @@ mod mxfp4_pair_kernels {
     /// `sel[slot] · rows_per_expert + r` of the gate stack and of the up stack
     /// ([`lane_partial_file`], the file's blocks) with activation column `slot
     /// / slots_per_col`, reduces each with the warp tree and stores `h[n] =
-    /// act::apply(act, limit, g, u)` from lane 0. [`HOST`] returns before any
+    /// act::apply_checked(act, limit, g, u, fault)` from lane 0.
+    /// [`HOST`] returns before any
     /// load, writing and raising nothing; any other id at or past
     /// `n_experts` raises [`FaultSite::ExpertId`] and writes NaN into its row
-    /// of `h` (warp-uniform, before the first weight load). `m_cols` only
-    /// bounds the activation in the launch contract.
+    /// of `h` (warp-uniform, before the first weight load). A gate or up sum
+    /// that is not finite raises [`FaultSite::F32Product`] and writes NaN
+    /// into its row of `h`: the SwiGLU clamp would map a NaN to a finite
+    /// value. `m_cols` only bounds the activation in the launch contract.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -543,9 +579,10 @@ mod mxfp4_pair_kernels {
         let g = warp::reduce_sum_f32(fg);
         let u = warp::reduce_sum_f32(fu);
         if lane == 0 {
+            let v = act::apply_checked(act, limit, g, u, fault);
             // SAFETY: row < n_slots · rows_per_expert <= h.len() by the
             // launch contract; only lane 0 of the warp writes h[row].
-            unsafe { *h.get_unchecked_mut(row) = act::apply(act, limit, g, u) };
+            unsafe { *h.get_unchecked_mut(row) = v };
         }
     }
 
@@ -763,6 +800,7 @@ pub struct GateUpArgs<'a> {
     pub n_slots: usize,
     /// The layer's `swiglu_clamp_exp` value.
     pub limit: f32,
+    pub fault: FaultSink,
 }
 
 /// One down-and-combine launch ([`MxExpertKernels::enqueue_down`]).
@@ -904,6 +942,7 @@ impl MxExpertKernels {
             launch_u32(what, "n_blk", n_blk)?,
             launch_u32(what, "n_grp", n_blk.div_ceil(32))?,
             a.limit,
+            a.fault,
             h,
         )?;
         Ok(())
@@ -1038,8 +1077,9 @@ impl Mxfp4SelKernels {
     /// ..][..rows_per_expert]` as `a.rule` over the rows of expert `sel[s]` of
     /// both stacks (the file's 17-byte blocks as the KQuant word stream, `34 ·
     /// n_sb` words a row) dotted with column `s / slots_per_col` of `a.act`
-    /// (module doc for [`HOST`] and ids past the stack, which raise on
-    /// `fault` and write NaN). Asynchronous, allocation-free, capturable.
+    /// (module doc for [`HOST`], ids past the stack and sums that are not
+    /// finite, which raise on `fault` and write NaN). Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_gate_up(
         &self,
         stream: &CudaStream,
@@ -1063,24 +1103,16 @@ impl Mxfp4SelKernels {
                 ),
             ));
         }
-        if n_slots == 0
-            || spc == 0
-            || n_slots > m * spc
-            || a.sel.len() < n_slots
-            || h.len() < n_slots * rpe
-        {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{n_slots} slots (at least one) at {spc} a column (at least one) over {m} \
-                     columns, sel.len() {}, h.len() {} >= n_slots*rows_per_expert = {}",
-                    a.sel.len(),
-                    h.len(),
-                    n_slots * rpe
-                ),
-            ));
-        }
-        let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
+        let slot_rows = crate::kquant::sel::check_gate_up_slots(
+            what,
+            n_slots,
+            rpe,
+            m,
+            spc,
+            a.sel.len(),
+            h.len(),
+        )?;
+        let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
         let prep = self
             .module
             .prepare_mxfp4_gate_up_sel(LaunchConfig1D::new(grid, BLOCK, 0))?;
@@ -1126,20 +1158,15 @@ impl Mxfp4SelKernels {
         let n_sb = a.act.n_sb();
         let n_experts = stack_experts(what, a.w, n_sb, a.rows_per_expert)?;
         let (n_slots, rpe) = (a.n_slots, a.rows_per_expert);
-        if n_slots == 0 || a.act.m() < n_slots || a.sel.len() < n_slots || y.len() < n_slots * rpe {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{n_slots} slots (at least one): an activation column a slot (act.m() {} >= \
-                     n_slots), an id a slot (sel.len() {}), y.len() {} >= n_slots*rows_per_expert = {}",
-                    a.act.m(),
-                    a.sel.len(),
-                    y.len(),
-                    n_slots * rpe
-                ),
-            ));
-        }
-        let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
+        let slot_rows = crate::kquant::sel::check_down_slots(
+            what,
+            n_slots,
+            rpe,
+            a.act.m(),
+            a.sel.len(),
+            y.len(),
+        )?;
+        let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
         let prep = self
             .module
             .prepare_mxfp4_gemv_sel(LaunchConfig1D::new(grid, BLOCK, 0))?;
@@ -1162,24 +1189,470 @@ impl Mxfp4SelKernels {
     }
 }
 
+#[cuda_module]
+mod nvfp4_sel_kernels {
+    use super::*;
+
+    /// The NVFP4 gate·up: thread row `n = slot · rows_per_expert + r` (one
+    /// warp a row) dots row `sel[slot] · rows_per_expert + r` of both stacks
+    /// with activation column `slot / slots_per_col`, reduces each by the warp
+    /// tree, scales each by its stack's `sel[slot]` scale and stores `h[n] =
+    /// act::apply_checked(act, limit, g, u, fault)` from lane 0. Ids: module doc.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            gq.len() >= n_experts * rows_per_expert * 32 * n_sb,
+            ge.len() >= n_experts * rows_per_expert * 4 * n_sb,
+            gs.len() >= n_experts,
+            uq.len() >= n_experts * rows_per_expert * 32 * n_sb,
+            ue.len() >= n_experts * rows_per_expert * 4 * n_sb,
+            us.len() >= n_experts,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            4 * iters >= n_sb,
+            q.len() >= m_cols * 256 * iters,
+            d8.len() >= m_cols * 2 * n_sb,
+            sel.len() >= n_slots,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn nvfp4_gate_up_sel(
+        gq: &[u32],
+        ge: &[u32],
+        gs: &[f32],
+        uq: &[u32],
+        ue: &[u32],
+        us: &[f32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        iters: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        let _ = m_cols;
+        let t = thread::index_1d().get() % BLOCK as usize;
+        let row = (thread::index_1d().get() / BLOCK as usize) * ROWS_PER_BLOCK + t / 32;
+        let rpe = rows_per_expert as usize;
+        if row >= n_slots as usize * rpe {
+            return;
+        }
+        let slot = row / rpe;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform (the warp's lanes share `row`, hence `slot`),
+        // so the returns below never diverge a warp.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+                // SAFETY: row < n_slots · rows_per_expert <= h.len() by the
+                // launch contract; only lane 0 of the warp writes h[row].
+                unsafe { *h.get_unchecked_mut(row) = f32::NAN };
+            }
+            return;
+        }
+        // The launcher checks 16-byte bases and whole vectors (`k / 8`
+        // words a row, a multiple of 32), so the views exist.
+        let (Some(gv), Some(uv)) = (as_vectors::<U32x4>(gq), as_vectors::<U32x4>(uq)) else {
+            return;
+        };
+        let row_abs = id as usize * rpe + row % rpe;
+        let col = slot / slots_per_col as usize;
+        let n_sb = n_sb as usize;
+        let (q0, d0) = (col * 256 * iters as usize, col * 2 * n_sb);
+        // SAFETY: n_units = 8·n_sb is a multiple of 4; row_abs < n_experts ·
+        // rows_per_expert, so the row's 8·n_sb vectors and 4·n_sb scale words
+        // are inside both stacks' planes (the stack bounds); column col <
+        // m_cols because slot < n_slots <= m_cols · slots_per_col, its
+        // 256·iters >= 256·ceil(n_units/32) q words at q0 and 2·n_sb scales
+        // at d0 inside q and d8 (the q, d8 and iters bounds); lane < 32; the
+        // repack took every scale byte.
+        let fg = unsafe {
+            lane_partials::<1, Nvfp4, 2>(gv, ge, row_abs, 8 * n_sb, q, d8, q0, 0, d0, 0, 1, lane)
+        }[0];
+        // SAFETY: row_abs < n_experts*rpe bounds the up row's 8*n_sb vectors and 4*n_sb scale words by the launch contract.
+        // col < m_cols and 4*iters >= n_sb bound q/d8; lane < 32; 8*n_sb is divisible by 4; repack checked every scale byte.
+        let fu = unsafe {
+            lane_partials::<1, Nvfp4, 2>(uv, ue, row_abs, 8 * n_sb, q, d8, q0, 0, d0, 0, 1, lane)
+        }[0];
+        let g = warp::reduce_sum_f32(fg);
+        let u = warp::reduce_sum_f32(fu);
+        if lane == 0 {
+            // SAFETY: id < n_experts <= gs.len() by the launch contract.
+            let sg = unsafe { *gs.get_unchecked(id as usize) };
+            // SAFETY: id < n_experts <= us.len() by the launch contract.
+            let su = unsafe { *us.get_unchecked(id as usize) };
+            let (g, u) = (g * sg, u * su);
+            let v = act::apply_checked(act, limit, g, u, fault);
+            // SAFETY: row < n_slots · rows_per_expert <= h.len() by the
+            // launch contract; only lane 0 of the warp writes h[row].
+            unsafe { *h.get_unchecked_mut(row) = v };
+        }
+    }
+
+    /// The NVFP4 down `_sel` over the 32-value q8_1 form: thread row `n =
+    /// slot · rows_per_expert + r` stores `y[n]`, the dot of row `sel[slot] ·
+    /// rows_per_expert + r` of the stack ([`lane_partials`], a scale a unit) with
+    /// activation column `slot`, reduced by the warp tree, times the stack's
+    /// `sel[slot]` scale. `n_blk` is a row's 64-value blocks. Ids: module doc.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            qs.len() >= n_experts * rows_per_expert * 8 * n_blk,
+            e.len() >= n_experts * rows_per_expert * n_blk,
+            s.len() >= n_experts,
+            16 * iters >= n_blk,
+            q_stride >= 256 * iters,
+            q.len() >= n_slots * q_stride,
+            d8.len() >= n_slots * 2 * n_blk,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn nvfp4_gemv_sel32(
+        qs: &[u32],
+        e: &[u32],
+        s: &[f32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_blk: u32,
+        iters: u32,
+        q_stride: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let _ = iters;
+        let t = thread::index_1d().get() % BLOCK as usize;
+        let row = (thread::index_1d().get() / BLOCK as usize) * ROWS_PER_BLOCK + t / 32;
+        let rpe = rows_per_expert as usize;
+        if row >= n_slots as usize * rpe {
+            return;
+        }
+        let slot = row / rpe;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform, so the returns below never diverge a warp.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        }
+        // The launcher checks a 16-byte base and whole vectors.
+        let Some(qv) = as_vectors::<U32x4>(qs) else {
+            return;
+        };
+        let row_abs = id as usize * rpe + row % rpe;
+        let n_units = 2 * n_blk as usize;
+        // SAFETY: n_units is even, the units an NVFP4 scale word covers;
+        // row_abs < n_experts · rows_per_expert, so the row's n_units vectors
+        // and n_blk scale words are inside qs and e; column slot < n_slots
+        // starts at slot · q_stride with q_stride >= 256 · iters >= 256 ·
+        // ceil(n_units/32) words inside q, and its n_units scales at slot ·
+        // n_units inside d8 (the q, d8, iters and q_stride bounds); lane < 32;
+        // the repack took every scale byte.
+        let f = unsafe {
+            lane_partials::<1, Nvfp4, 0>(
+                qv,
+                e,
+                row_abs,
+                n_units,
+                q,
+                d8,
+                slot * q_stride as usize,
+                0,
+                slot * n_units,
+                0,
+                1,
+                lane,
+            )
+        }[0];
+        let sum = warp::reduce_sum_f32(f);
+        if lane == 0 {
+            // SAFETY: id < n_experts <= s.len() by the launch contract.
+            let scale = unsafe { *s.get_unchecked(id as usize) };
+            // SAFETY: row < n_slots · rows_per_expert <= y.len() by the
+            // launch contract; lane 0 of the row's warp is its only writer.
+            unsafe { *y.get_unchecked_mut(row) = sum * scale };
+        }
+    }
+}
+
+/// A resident routed NVFP4 stack: the planes of its `n_experts ·
+/// rows_per_expert` rows (`qs` `k / 8` words a row, `e` `k / 64`) and its
+/// experts' tensor scales, one a row of `scales` in the stack's expert order.
+#[derive(Clone, Copy)]
+pub struct Nvfp4Stack<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub e: &'a DeviceTensor<u32>,
+    pub scales: &'a DeviceTensor<f32>,
+}
+
+impl Nvfp4Stack<'_> {
+    /// The stack's experts, its planes holding `k` values a row in whole
+    /// experts of `rows_per_expert` rows with one scale each, or the shape
+    /// error naming `what`.
+    fn experts(
+        &self,
+        what: &'static str,
+        k: usize,
+        rows_per_expert: usize,
+    ) -> Result<usize, GpuError> {
+        crate::tensor::check_alignment::<U32x4, _>(what, "NVFP4 code plane", self.qs.buf())?;
+        let rows = self.qs.rows();
+        let n = rows.checked_div(rows_per_expert).unwrap_or(0);
+        if k == 0
+            || !k.is_multiple_of(NV_BLOCK_VALUES)
+            || self.qs.cols() != k / 8
+            || self.e.cols() != k / NV_BLOCK_VALUES
+            || self.e.rows() != rows
+            || n == 0
+            || n * rows_per_expert != rows
+            || self.scales.buf().len() != n
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "NVFP4 stack at K={k}: planes of {} and {} words a row in whole experts of \
+                     {rows_per_expert} rows, one scale an expert; got {rows} x {}, {} x {} and \
+                     {} scales",
+                    k / 8,
+                    k / NV_BLOCK_VALUES,
+                    self.qs.cols(),
+                    self.e.rows(),
+                    self.e.cols(),
+                    self.scales.buf().len()
+                ),
+            ));
+        }
+        Ok(n)
+    }
+}
+
+/// An NVFP4 gate·up launch ([`Nvfp4SelKernels::enqueue_gate_up`]).
+pub struct Nvfp4GateUp<'a> {
+    pub gate: Nvfp4Stack<'a>,
+    /// The up stack, the gate's shape.
+    pub up: Nvfp4Stack<'a>,
+    /// `act.m()` q8_1 columns; slot `s` reads column `s / slots_per_col`.
+    pub act: &'a Q8Act,
+    /// At least `n_slots` ids, read on the device at each launch.
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n_slots: usize,
+    pub rows_per_expert: usize,
+    /// Slots a column: a token's run of slots.
+    pub slots_per_col: usize,
+    pub rule: Act,
+}
+
+/// An NVFP4 down launch ([`Nvfp4SelKernels::enqueue_down`]).
+pub struct Nvfp4Down<'a> {
+    pub w: Nvfp4Stack<'a>,
+    /// At least `n_slots` 32-value q8_1 columns: column `s` is read for `s <
+    /// n_slots` and the rest are not touched, so a cap-sized activation
+    /// serves a smaller batch.
+    pub act: &'a Q8Blocks32,
+    /// At least `n_slots` ids, read on the device at each launch.
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n_slots: usize,
+    pub rows_per_expert: usize,
+}
+
+/// The loaded NVFP4 pair and its launchers. Owns no stream: every enqueue
+/// takes the engine stream, so launches order with the step and are
+/// capturable.
+pub struct Nvfp4SelKernels {
+    module: nvfp4_sel_kernels::LoadedModule,
+    /// The fault word of the `Gpu` that owns the context: the launches'
+    /// sinks point into it, and the module keeps it alive.
+    _fault: Arc<DeviceBuffer<u32>>,
+}
+
+impl Nvfp4SelKernels {
+    /// Load this module's device bundle into `ctx`, whose launches raise into
+    /// `word`, the fault word of the `Gpu` that owns `ctx`
+    /// ([`crate::Gpu::fault_word`]); a word of another context is refused.
+    /// Load-time only.
+    pub fn load(
+        ctx: &Arc<CudaContext>,
+        word: &Arc<DeviceBuffer<u32>>,
+    ) -> Result<Nvfp4SelKernels, GpuError> {
+        let fault = crate::module_fault_word(ctx, word, "Nvfp4SelKernels::load")?;
+        // SAFETY: this package owns the embedded device bundle produced for
+        // the module above; every launcher checks its launch contract.
+        let module = unsafe { crate::shared_module!(nvfp4_sel_kernels, ctx)? };
+        Ok(Nvfp4SelKernels {
+            module,
+            _fault: fault,
+        })
+    }
+
+    /// Enqueue the NVFP4 gate·up: slot `s` writes `h[s · rows_per_expert
+    /// ..][..rows_per_expert]` (module doc). Stacks of another shape than
+    /// the activation's width, an up unlike the gate, or slots the buffers
+    /// cannot hold are named errors. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_gate_up(
+        &self,
+        stream: &CudaStream,
+        a: &Nvfp4GateUp<'_>,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        use crate::kquant::sel::{Fmt, GateUpAct, gate_up_dims};
+
+        let what = "Nvfp4SelKernels::enqueue_gate_up";
+        a.gate.experts(what, a.act.k(), a.rows_per_expert)?;
+        a.up.experts(what, a.act.k(), a.rows_per_expert)?;
+        let common = GateUpAct {
+            wg: a.gate.qs,
+            wu: a.up.qs,
+            act: a.act,
+            sel: a.sel,
+            n_slots: a.n_slots,
+            rows_per_expert: a.rows_per_expert,
+            slots_per_col: a.slots_per_col,
+            rule: a.rule,
+        };
+        let d = gate_up_dims(
+            what,
+            Fmt {
+                name: "NVFP4 code planes",
+                words: 256 / 8,
+            },
+            &common,
+            h.len(),
+        )?;
+        let prep = self
+            .module
+            .prepare_nvfp4_gate_up_sel(LaunchConfig1D::new(d.grid, BLOCK, 0))?;
+        self.module.nvfp4_gate_up_sel(
+            stream,
+            &prep,
+            a.gate.qs.buf(),
+            a.gate.e.buf(),
+            a.gate.scales.buf(),
+            a.up.qs.buf(),
+            a.up.e.buf(),
+            a.up.scales.buf(),
+            &a.act.q4,
+            &a.act.d8,
+            a.sel,
+            d.n_experts,
+            d.rows_per_expert,
+            d.n_slots,
+            d.m_cols,
+            d.slots_per_col,
+            d.n_sb,
+            d.iters,
+            d.act,
+            d.limit,
+            fault,
+            h,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the NVFP4 down `_sel`: slot `s` writes `y[s · rows_per_expert
+    /// ..][..rows_per_expert]` (module doc). A stack of another width than
+    /// the activation's, fewer activation columns or ids than slots, or a
+    /// short `y` are named errors. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_down(
+        &self,
+        stream: &CudaStream,
+        a: &Nvfp4Down<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "Nvfp4SelKernels::enqueue_down";
+        let (n_slots, rpe, k) = (a.n_slots, a.rows_per_expert, a.act.k());
+        let n_experts = a.w.experts(what, k, rpe)?;
+        let slot_rows = crate::kquant::sel::check_down_slots(
+            what,
+            n_slots,
+            rpe,
+            a.act.m(),
+            a.sel.len(),
+            y.len(),
+        )?;
+        let n_blk = k / NV_BLOCK_VALUES;
+        let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
+        let prep = self
+            .module
+            .prepare_nvfp4_gemv_sel32(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.nvfp4_gemv_sel32(
+            stream,
+            &prep,
+            a.w.qs.buf(),
+            a.w.e.buf(),
+            a.w.scales.buf(),
+            &a.act.q,
+            &a.act.d8,
+            a.sel,
+            launch_u32(what, "n_experts", n_experts)?,
+            launch_u32(what, "rows_per_expert", rpe)?,
+            launch_u32(what, "n_slots", n_slots)?,
+            launch_u32(what, "n_blk", n_blk)?,
+            launch_u32(what, "iters", n_blk.div_ceil(16))?,
+            launch_u32(what, "q_stride", a.act.q_stride())?,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Gpu;
+    use crate::fault::{Fault, LAYER_NONE};
+    use crate::kquant::Act;
 
     #[test]
     #[ignore = "needs a CUDA device"]
     fn hw_mxfp4_refuses_unaligned_vector_planes() {
-        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA stream");
-        let kernels = MxExpertKernels::load(&ctx).expect("MXFP4 kernels");
-        let act = MxAct::new(&stream, 1, 256).expect("activation");
-        let sel = DeviceBuffer::from_host(&stream, &[0u32]).expect("selection");
-        let route = DeviceBuffer::from_host(&stream, &[0u32; N_USED]).expect("route");
-        let wts = DeviceBuffer::from_host(&stream, &[1.0f32; N_USED]).expect("weights");
-        let parent = DeviceBuffer::<u32>::zeroed(&stream, 33).expect("codes");
-        let e = DeviceTensor::zeroed(&stream, 1, 2).expect("scales");
+        let gpu = Gpu::new().expect("card");
+        let ctx = gpu.context();
+        let stream = gpu.stream();
+        let kernels = MxExpertKernels::load(ctx).expect("MXFP4 kernels");
+        let act = MxAct::new(stream, 1, 256).expect("activation");
+        let sel = DeviceBuffer::from_host(stream, &[0u32]).expect("selection");
+        let route = DeviceBuffer::from_host(stream, &[0u32; N_USED]).expect("route");
+        let wts = DeviceBuffer::from_host(stream, &[1.0f32; N_USED]).expect("weights");
+        let parent = DeviceBuffer::<u32>::zeroed(stream, 33).expect("codes");
+        let e = DeviceTensor::zeroed(stream, 1, 2).expect("scales");
         // SAFETY: the window covers 32 u32-aligned words of parent, which
         // lives through the launches; release below prevents its free.
-        let qs = unsafe { DeviceTensor::window(parent.cu_deviceptr() + 4, 1, 32, &ctx) };
+        let qs = unsafe { DeviceTensor::window(parent.cu_deviceptr() + 4, 1, 32, ctx) };
         let w = std::mem::ManuallyDrop::new(MxStack {
             qs: std::mem::ManuallyDrop::into_inner(qs),
             e,
@@ -1190,10 +1663,10 @@ mod tests {
         for block in bytes.chunks_exact_mut(mxfp4::BLOCK_BYTES) {
             block[0] = 127;
         }
-        let aligned = MxStack::upload(&stream, &bytes, 1, 1, 256).expect("aligned stack");
-        let mut y = DeviceBuffer::zeroed(&stream, 1).expect("output");
+        let aligned = MxStack::upload(stream, &bytes, 1, 1, 256).expect("aligned stack");
+        let mut y = DeviceBuffer::zeroed(stream, 1).expect("output");
         let gate = kernels.enqueue_gate_up(
-            &stream,
+            stream,
             &GateUpArgs {
                 gate: &w,
                 up: &aligned,
@@ -1202,11 +1675,12 @@ mod tests {
                 route: &route,
                 n_slots: 1,
                 limit: 0.0,
+                fault: gpu.unlabelled_sink(),
             },
             &mut y,
         );
         let up = kernels.enqueue_gate_up(
-            &stream,
+            stream,
             &GateUpArgs {
                 gate: &aligned,
                 up: &w,
@@ -1215,11 +1689,12 @@ mod tests {
                 route: &route,
                 n_slots: 1,
                 limit: 0.0,
+                fault: gpu.unlabelled_sink(),
             },
             &mut y,
         );
         let down = kernels.enqueue_down(
-            &stream,
+            stream,
             &DownArgs {
                 down: &w,
                 act: &act,
@@ -1246,7 +1721,7 @@ mod tests {
         }
         kernels
             .enqueue_gate_up(
-                &stream,
+                stream,
                 &GateUpArgs {
                     gate: &aligned,
                     up: &aligned,
@@ -1255,14 +1730,15 @@ mod tests {
                     route: &route,
                     n_slots: 1,
                     limit: 0.0,
+                    fault: gpu.unlabelled_sink(),
                 },
                 &mut y,
             )
             .expect("aligned gate/up");
-        assert_eq!(y.to_host_vec(&stream).expect("gate/up output"), [0.0]);
+        assert_eq!(y.to_host_vec(stream).expect("gate/up output"), [0.0]);
         kernels
             .enqueue_down(
-                &stream,
+                stream,
                 &DownArgs {
                     down: &aligned,
                     act: &act,
@@ -1275,7 +1751,160 @@ mod tests {
                 &mut y,
             )
             .expect("aligned down");
-        assert_eq!(y.to_host_vec(&stream).expect("down output"), [0.0]);
+        assert_eq!(y.to_host_vec(stream).expect("down output"), [0.0]);
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// An MXFP4 gate·up whose up sum overflows on a finite column of 1e38:
+    /// K = 256, scale byte 128 in both stacks, gate codes 0, up codes 0x77
+    /// (+12) over the first four blocks and 0xff (−12) over the last four.
+    /// The up blocks reach +inf and −inf and the warp sum NaN, which the
+    /// clamp at 7 alone maps to a finite 0.
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_mxfp4_gate_up_sel_faults_a_non_finite_sum() {
+        const K: usize = 256;
+        const ROWS: usize = 256;
+        const EXPERTS: usize = 3;
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let pair = Mxfp4SelKernels::load(gpu.context(), gpu.fault_word()).expect("pair");
+        let route = MxExpertKernels::load(gpu.context()).expect("route");
+        let bytes = |head: u8, tail: u8| {
+            let block = |codes| {
+                let mut b = vec![128u8];
+                b.resize(mxfp4::BLOCK_BYTES, codes);
+                b.repeat(4)
+            };
+            [block(head), block(tail)].concat().repeat(EXPERTS * ROWS)
+        };
+        let (gb, ub) = (bytes(0, 0), bytes(0x77, 0xff));
+        let words = |b: &[u8]| {
+            let w = crate::card_leg::tests::words_of(b, EXPERTS * ROWS);
+            DeviceTensor::upload(stream, &w, EXPERTS * ROWS, w.len() / (EXPERTS * ROWS))
+                .expect("words")
+        };
+        let (wg, wu) = (words(&gb), words(&ub));
+        let gate = MxStack::upload(stream, &gb, EXPERTS, ROWS, K).expect("gate");
+        let up = MxStack::upload(stream, &ub, EXPERTS, ROWS, K).expect("up");
+        let x = DeviceBuffer::from_host(stream, &[1.0e38f32; K]).expect("column");
+        let mut act = Q8Act::with_k(stream, 1, K).expect("activation");
+        let mut mx = MxAct::new(stream, 1, K).expect("route activation");
+        gpu.enqueue_quantize_q8_1(&x, &mut act).expect("quantize");
+        route
+            .enqueue_quantize(stream, &x, &mut mx, gpu.unlabelled_sink())
+            .expect("route quantize");
+        assert_eq!(gpu.take_fault().expect("quantizer fault"), None);
+        let sel = DeviceBuffer::from_host(stream, &[0u32, 1, 2]).expect("route");
+        let mut failures = Vec::new();
+        for routed in [false, true] {
+            let mut h = DeviceBuffer::zeroed(stream, EXPERTS * ROWS).expect("rows");
+            if routed {
+                route
+                    .enqueue_gate_up(
+                        stream,
+                        &GateUpArgs {
+                            gate: &gate,
+                            up: &up,
+                            act: &mx,
+                            sel: &sel,
+                            route: &sel,
+                            n_slots: EXPERTS,
+                            limit: 7.0,
+                            fault: gpu.unlabelled_sink(),
+                        },
+                        &mut h,
+                    )
+                    .expect("route launch");
+            } else {
+                pair.enqueue_gate_up(
+                    stream,
+                    &GateUpAct {
+                        wg: &wg,
+                        wu: &wu,
+                        act: &act,
+                        sel: &sel,
+                        n_slots: EXPERTS,
+                        rows_per_expert: ROWS,
+                        slots_per_col: EXPERTS,
+                        rule: Act::SwigluClamp { limit: 7.0 },
+                    },
+                    gpu.unlabelled_sink(),
+                    &mut h,
+                )
+                .expect("pair launch");
+            }
+            let fault = gpu.take_fault().expect("fault word");
+            let rows = h.to_host_vec(stream).expect("rows");
+            if fault != Some(Fault::at(LAYER_NONE, FaultSite::F32Product))
+                || !rows.iter().all(|v| v.is_nan())
+            {
+                failures.push(format!(
+                    "routed={routed}: fault {fault:?}, first row {}",
+                    rows[0]
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_nvfp4_sel_refuses_unaligned_code_planes() {
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let kernels = Nvfp4SelKernels::load(gpu.context(), gpu.fault_word()).expect("kernels");
+        let parent = DeviceBuffer::from_host(stream, &[0u32; 33]).expect("parent");
+        let bad = DeviceTensor::<u32>::window_of(&parent, 4, 1, 32).expect("offset window");
+        let qs = DeviceTensor::zeroed(stream, 1, 32).expect("codes");
+        let e = DeviceTensor::zeroed(stream, 1, 4).expect("block scales");
+        let scales = DeviceTensor::upload(stream, &[1.0f32], 1, 1).expect("expert scale");
+        let stack = |qs| Nvfp4Stack {
+            qs,
+            e: &e,
+            scales: &scales,
+        };
+        let act = Q8Act::with_slots(stream, 1, 256).expect("gate activation");
+        let down = Q8Blocks32::new(stream, 256, 1).expect("down activation");
+        let sel = DeviceBuffer::from_host(stream, &[0u32]).expect("id");
+        let mut out = DeviceBuffer::from_host(stream, &[f32::NAN]).expect("output");
+        let fault = gpu.layer_sink(0).expect("fault sink");
+        let mut refusals = Vec::new();
+        for (gate, up) in [(&*bad, &qs), (&qs, &*bad)] {
+            refusals.push(kernels.enqueue_gate_up(
+                stream,
+                &Nvfp4GateUp {
+                    gate: stack(gate),
+                    up: stack(up),
+                    act: &act,
+                    sel: &sel,
+                    n_slots: 1,
+                    rows_per_expert: 1,
+                    slots_per_col: 1,
+                    rule: Act::SiluMul,
+                },
+                fault,
+                &mut out,
+            ));
+        }
+        refusals.push(kernels.enqueue_down(
+            stream,
+            &Nvfp4Down {
+                w: stack(&bad),
+                act: &down,
+                sel: &sel,
+                n_slots: 1,
+                rows_per_expert: 1,
+            },
+            fault,
+            &mut out,
+        ));
+        stream.synchronize().expect("launches");
+        assert!(
+            refusals.iter().all(|r| matches!(r,
+                Err(GpuError::Shape { detail, .. }) if detail.contains("16-byte aligned")
+            )),
+            "gate, up and down refusals: {refusals:?}"
+        );
     }
 }

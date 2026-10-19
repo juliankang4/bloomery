@@ -55,7 +55,9 @@ pub fn weight_bytes(w: &DevWeight, rows: usize) -> Option<usize> {
             resident_size(GgmlType::Q8_0, k, rows)?
         }
         DevWeight::F32 { .. } => rows * k * 4,
-        DevWeight::Nvfp4 { .. } => resident_size(GgmlType::NVFP4, k, rows)?,
+        DevWeight::Nvfp4 { .. } | DevWeight::Nvfp4Stack { .. } => {
+            resident_size(GgmlType::NVFP4, k, rows)?
+        }
         DevWeight::Mxfp8 { .. } => resident_size(GgmlType::MXFP8, k, rows)?,
     })
 }

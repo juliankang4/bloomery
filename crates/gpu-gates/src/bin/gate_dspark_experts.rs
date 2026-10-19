@@ -259,7 +259,7 @@ mod gate {
     /// butterfly.
     fn dot_host(row: &[u8], q: &(Vec<i8>, Vec<f32>)) -> f32 {
         butterfly(std::array::from_fn(|lane| {
-            lane_partial_host::<Mxfp4>(row, &q.0, &q.1, lane)
+            lane_partial_host::<Mxfp4, 2>(row, &q.0, &q.1, lane)
         }))
     }
 
@@ -391,6 +391,7 @@ mod gate {
             route: &route,
             n_slots,
             limit,
+            fault: cx.gpu.unlabelled_sink(),
         };
         cx.dk.enqueue_gate_up(s, &a, &mut h)?;
         let mut act_h = MxAct::new(s, n_slots * p.m, ff)?;

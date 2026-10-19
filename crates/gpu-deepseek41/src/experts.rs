@@ -1,6 +1,9 @@
 //! Expert FFNs: SwiGLU with its ±10 clamp, for the routed experts and for
 //! the shared expert, whose weights are q8_0.
 //!
+//! Every gate-up checks both dot sums through `act::apply_checked` before
+//! activation, raising `F32Product` and writing NaN on non-finite sums.
+//!
 //! Two kernels, the decode shape (one token per launch):
 //! - `ds41_expert_gate_up`: the routed experts' gate·up·SwiGLU in one launch
 //!   — the addressing of `moe_fused`'s `expert_gate_up_swiglu_q3k` (a warp
@@ -35,7 +38,9 @@
 //! q8_2 — the gate derives its band against ik's dump from that difference.
 
 use bloomery_gpu::cores::q3k_row_dot;
-use bloomery_gpu::linear::expf_ik;
+use bloomery_gpu::fault::FaultSink;
+use bloomery_gpu::kquant::act::{self, ACT_SWIGLU_CLAMP};
+pub use bloomery_gpu::kquant::act::{silu_ik, swiglu_clamp};
 use bloomery_gpu::q8f32::{q8_0_lane_partial_1col, q8_0_lane_partials_mcol};
 use bloomery_gpu::weights::DevWeight;
 use bloomery_gpu::{DeviceTensor, GpuError, Q8Act, col_sums, launch_u32, store_cols};
@@ -46,28 +51,6 @@ use std::sync::Arc;
 
 /// Threads per block of every kernel here: eight warps.
 const BLOCK: u32 = 256;
-
-/// ik's AVX2 `v_silu`: `x / (1 + expf_ik(0 - x))`.
-#[inline(always)]
-pub fn silu_ik(x: f32) -> f32 {
-    x / (1.0 + expf_ik(0.0 - x))
-}
-
-/// ik's clamped SwiGLU for one row: `min(silu(g), limit) · max(-limit,
-/// min(limit, u))`, or `silu(g) · u` when `limit <= 1e-6`, each `min`/`max`
-/// spelled as the `std::min`/`std::max` comparison it compiles from (a NaN
-/// `silu(g)` passes the first; a NaN `u` becomes `limit`).
-#[inline(always)]
-pub fn swiglu_clamp(g: f32, u: f32, limit: f32) -> f32 {
-    let mut s = silu_ik(g);
-    let mut uc = u;
-    if limit > 1e-6 {
-        s = if limit < s { limit } else { s };
-        uc = if u < limit { u } else { limit };
-        uc = if -limit < uc { uc } else { -limit };
-    }
-    uc * s
-}
 
 /// Lane `lane`'s partials of gate row `row` and up row `row` against `M`
 /// token columns of `x`, `k` values a column from 0: each
@@ -111,7 +94,7 @@ mod experts_kernels {
     /// rows_per_expert + r` (one warp per row, 8 rows per block) reads weight
     /// row `sel[slot] · rows_per_expert + r` of `wg` and `wu`, dots both
     /// against the one q8_1 column (`q`, `d8`), reduces each with the warp
-    /// tree and stores `h[n] = swiglu_clamp(g, u, limit)` from lane 0. `h`
+    /// tree and stores the checked SwiGLU from lane 0. `h`
     /// is slot-major, the `n_slots` columns of `rows_per_expert` values the
     /// down projection's q8_1 quantization reads. An id `>= n_experts` (an
     /// expert not resident on this card) returns before any load — the test
@@ -146,6 +129,7 @@ mod experts_kernels {
         n_sb: u32,
         iters: u32,
         limit: f32,
+        fault: FaultSink,
         mut h: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -168,7 +152,7 @@ mod experts_kernels {
         let g = warp::reduce_sum_f32(fg[0]);
         let u = warp::reduce_sum_f32(fu[0]);
         if lane == 0 {
-            let v = swiglu_clamp(g, u, limit);
+            let v = act::apply_checked(ACT_SWIGLU_CLAMP, limit, g, u, fault);
             // SAFETY: row < n_slots * rows_per_expert <= h.len() by the
             // launch contract; lane 0 of the row's warp is its only writer.
             unsafe { *h.get_unchecked_mut(row) = v };
@@ -179,7 +163,7 @@ mod experts_kernels {
     /// per row, 8 rows per block) dots gate row `r` and up row `r` — q8_0 in
     /// the q8f32 two-plane layout, `k` values each — against the `k` f32
     /// activations `x`, reduces each with the warp tree and stores `h[r] =
-    /// swiglu_clamp(g, u, limit)` from lane 0.
+    /// swiglu_clamp(g, u, limit)` from lane 0 after checking both sums.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -207,6 +191,7 @@ mod experts_kernels {
         n_rows: u32,
         k: u32,
         limit: f32,
+        fault: FaultSink,
         mut h: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -225,7 +210,7 @@ mod experts_kernels {
         let fu = unsafe { q8_0_lane_partial_1col(qs_u, d_u, x, k, row, 0, lane) };
         let u = warp::reduce_sum_f32(fu);
         if lane == 0 {
-            let v = swiglu_clamp(g, u, limit);
+            let v = act::apply_checked(ACT_SWIGLU_CLAMP, limit, g, u, fault);
             // SAFETY: row < n_rows <= h.len() by the launch contract; lane 0
             // of the row's warp is its only writer.
             unsafe { *h.get_unchecked_mut(row) = v };
@@ -269,6 +254,7 @@ mod experts_kernels {
         k: u32,
         m_cols: u32,
         limit: f32,
+        fault: FaultSink,
         mut h: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -299,14 +285,14 @@ mod experts_kernels {
         let u = col_sums(fu, m);
         if lane == 0 {
             let v = [
-                swiglu_clamp(g[0], u[0], limit),
-                swiglu_clamp(g[1], u[1], limit),
-                swiglu_clamp(g[2], u[2], limit),
-                swiglu_clamp(g[3], u[3], limit),
-                swiglu_clamp(g[4], u[4], limit),
-                swiglu_clamp(g[5], u[5], limit),
-                swiglu_clamp(g[6], u[6], limit),
-                swiglu_clamp(g[7], u[7], limit),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[0], u[0], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[1], u[1], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[2], u[2], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[3], u[3], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[4], u[4], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[5], u[5], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[6], u[6], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[7], u[7], fault),
             ];
             // SAFETY: slots c·n_rows + row for c < m are inside h (h.len() >=
             // m·n_rows) and belong to this row's warp alone.
@@ -333,6 +319,7 @@ pub struct ExpertGateUp<'a> {
     pub rows_per_expert: usize,
     /// The layer's `swiglu_clamp_exp` value.
     pub limit: f32,
+    pub fault: FaultSink,
 }
 
 /// The loaded expert module. Owns no context and no stream — every enqueue
@@ -417,6 +404,7 @@ impl ExpertKernels {
             n_sb,
             n_sb.div_ceil(2),
             a.limit,
+            a.fault,
             h,
         )?;
         Ok(())
@@ -427,6 +415,10 @@ impl ExpertKernels {
     /// token's `k` f32 activations, `limit` the layer's `swiglu_clamp_shexp`
     /// value; `h` takes one f32 per row. Asynchronous, allocation-free,
     /// capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared gate-up launch inputs and its fault sink (rust-quality R8)"
+    )]
     pub fn enqueue_shexp_gate_up(
         &self,
         stream: &CudaStream,
@@ -434,6 +426,7 @@ impl ExpertKernels {
         up: &DevWeight,
         x: &DeviceBuffer<f32>,
         limit: f32,
+        fault: FaultSink,
         h: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "enqueue_shexp_gate_up";
@@ -466,6 +459,7 @@ impl ExpertKernels {
             n_rows,
             k,
             limit,
+            fault,
             h,
         )?;
         Ok(())
@@ -488,6 +482,7 @@ impl ExpertKernels {
         x: &DeviceBuffer<f32>,
         m: usize,
         limit: f32,
+        fault: FaultSink,
         h: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "enqueue_shexp_gate_up_mcol";
@@ -525,9 +520,137 @@ impl ExpertKernels {
             k,
             m,
             limit,
+            fault,
             h,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::ffn::{FfnBatchKernels, TiledGateUp};
+    use crate::dense::DenseKernels;
+    use bloomery_gpu::{Fault, FaultSite, Gpu, LAYER_NONE};
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_gate_up_sums_fault_before_activation() {
+        const K: usize = 512;
+        const ROWS: usize = 8;
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
+        let experts = ExpertKernels::load(gpu.context()).expect("experts");
+        let dense = DenseKernels::load(gpu.context()).expect("dense");
+        let batch = FfnBatchKernels::load(gpu.context()).expect("batch");
+        // Q3_K: zero hmask, codes and packed scales decode to +128*d.
+        let mut block = [0u8; 110];
+        block[108..].copy_from_slice(&0x7bffu16.to_le_bytes());
+        let bytes = block.repeat(ROWS * K / 256);
+        let up: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect();
+        let wu = DeviceTensor::upload(stream, &up, ROWS, up.len() / ROWS).expect("up");
+        let wg = DeviceTensor::zeroed(stream, ROWS, up.len() / ROWS).expect("gate");
+        let q8 = |scale| DevWeight::Q8_0 {
+            qs: DeviceTensor::upload(stream, &vec![0x7f7f7f7fu32; ROWS * K / 4], ROWS, K / 4)
+                .expect("codes"),
+            d: DeviceTensor::upload(stream, &vec![scale; ROWS * K / 32], ROWS, K / 32)
+                .expect("scales"),
+            k: K,
+        };
+        let (gate, up) = (q8(0u16), q8(0x7bff));
+        let x = DeviceBuffer::from_host(stream, &vec![1e38f32; 8 * K]).expect("x");
+        let mut act1 = Q8Act::with_k(stream, 1, K).expect("act1");
+        let mut act8 = Q8Act::with_k(stream, 8, K).expect("act8");
+        gpu.enqueue_quantize_q8_1(&x, &mut act1).expect("quantize1");
+        gpu.enqueue_quantize_q8_1(&x, &mut act8).expect("quantize8");
+        let sel = DeviceBuffer::from_host(stream, &[0u32]).expect("sel");
+        let start = DeviceBuffer::from_host(stream, &[0u32, 8]).expect("start");
+        let mut tiles =
+            DeviceBuffer::zeroed(stream, bloomery_gpu::q4k_sel::tile_cap(8, 1) + 1).expect("tiles");
+        gpu.q4k_sel()
+            .enqueue_grouped_tiles(stream, &start, 1, 8, sink, &mut tiles)
+            .expect("tile table");
+        assert_eq!(gpu.take_fault().expect("input fault"), None);
+        let mut failures = Vec::new();
+        for (case, m) in [
+            ("expert", 1),
+            ("q3", 1),
+            ("q3", 8),
+            ("q8", 1),
+            ("q8", 8),
+            ("tiles", 8),
+        ] {
+            let mut h = DeviceBuffer::zeroed(stream, m * ROWS).expect("h");
+            match case {
+                "expert" => experts.enqueue_expert_gate_up(
+                    stream,
+                    &ExpertGateUp {
+                        wg: &wg,
+                        wu: &wu,
+                        act: &act1,
+                        sel: &sel,
+                        n_slots: 1,
+                        rows_per_expert: ROWS,
+                        limit: 7.0,
+                        fault: sink,
+                    },
+                    &mut h,
+                ),
+                "q3" => dense.enqueue_shexp_gate_up_q3k(
+                    stream,
+                    &wg,
+                    &wu,
+                    if m == 1 { &act1 } else { &act8 },
+                    7.0,
+                    sink,
+                    &mut h,
+                ),
+                "q8" if m == 1 => {
+                    experts.enqueue_shexp_gate_up(stream, &gate, &up, &x, 7.0, sink, &mut h)
+                }
+                "q8" => {
+                    experts.enqueue_shexp_gate_up_mcol(stream, &gate, &up, &x, m, 7.0, sink, &mut h)
+                }
+                _ => batch.enqueue_gate_up_tiles(
+                    stream,
+                    &TiledGateUp {
+                        wg: wg.buf(),
+                        wu: wu.buf(),
+                        q3: act8.q3(),
+                        d8: act8.d8(),
+                        start: &start,
+                        tiles: &tiles,
+                        n_experts: 1,
+                        rows_per_expert: ROWS,
+                        n_slots: 8,
+                        n_sb: K / 256,
+                        limit: 7.0,
+                    },
+                    sink,
+                    &mut h,
+                ),
+            }
+            .expect("launch");
+            let fault = gpu.take_fault().expect("fault");
+            let rows = h.to_host_vec(stream).expect("rows");
+            let ok = fault == Some(Fault::at(LAYER_NONE, FaultSite::F32Product))
+                && rows.iter().all(|v| v.is_nan());
+            println!(
+                "{case} m={m}: fault={fault:?} nan={} {ok}",
+                rows.iter().filter(|v| v.is_nan()).count()
+            );
+            if !ok {
+                failures.push(format!("{case} m={m}: {fault:?} {rows:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
 

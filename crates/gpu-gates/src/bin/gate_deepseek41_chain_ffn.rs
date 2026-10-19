@@ -1071,6 +1071,7 @@ mod gate {
                 n_slots: N_USED,
                 rows_per_expert: ff,
                 limit: kind.swiglu_limit,
+                fault: gpu.unlabelled_sink(),
             };
             op.experts
                 .enqueue_expert_gate_up(stream, &args, &mut op.h)?;
@@ -1104,13 +1105,24 @@ mod gate {
                     w: u,
                     ..
                 },
-            ) => {
-                op.dense
-                    .enqueue_shexp_gate_up_q3k(stream, g, u, &op.act_x, limit, &mut op.sh_h)?
-            }
-            (g, u) => op
-                .experts
-                .enqueue_shexp_gate_up(stream, g, u, &op.x, limit, &mut op.sh_h)?,
+            ) => op.dense.enqueue_shexp_gate_up_q3k(
+                stream,
+                g,
+                u,
+                &op.act_x,
+                limit,
+                gpu.unlabelled_sink(),
+                &mut op.sh_h,
+            )?,
+            (g, u) => op.experts.enqueue_shexp_gate_up(
+                stream,
+                g,
+                u,
+                &op.x,
+                limit,
+                gpu.unlabelled_sink(),
+                &mut op.sh_h,
+            )?,
         }
         let sh_down = Dense::of(w, &names::ffn_down_shexp(l), ff, n)?;
         let act = if sh_down.reads_q8_1() {

@@ -1945,3 +1945,104 @@ fn hw_union_relu2_matches_transcription() {
          arms and in their dispatches; the widths' refusals by name, and an overflowing up row refused by name"
     );
 }
+
+/// A gated layer's non-finite sum is refused by name, never written as the clamp's finite
+/// value: a column of 1e38 against Q3_K gate rows of zeros and up rows of 3 (`d` 1, every scale
+/// 1, every code 3) gives gate sums of 0 and up sums the f32 dot overflows to an infinity, where
+/// the clamp at 7 would write 0. The one-column leg, the union call and the allocating group
+/// entry (the caller's combine past one column, the claimant's at one) each refuse it: the
+/// combine by name at limit 7, the quantizer at limit 0, where `silu(0) · inf` stays NaN.
+#[test]
+#[ignore = "hw: the box's CPU (qdot's fused kernels run on AVX2); reads no model file"]
+fn hw_union_gated_refuses_a_non_finite_sum() {
+    let (embd, ff, n_expert) = (256, 256, 2);
+    let rows = ff * n_expert;
+    let mut three = [0u8; 110];
+    three[..96].fill(0xff); // every high bit set and every 2-bit code 3: the code is 3
+    three[96..104].fill(0x11); // every 6-bit scale 33 (low nibbles 1 ...
+    three[104..108].fill(0xaa); // ... high bits 2), so a scale of 1
+    three[108..110].copy_from_slice(&0x3c00u16.to_le_bytes()); // d = 1
+    let up = three.repeat(rows);
+    let zeros = vec![0u8; 110 * rows];
+    let file = StackFile::write(
+        "gated-overflow",
+        &[
+            (Q8_GATE, GgmlType::Q3_K, [embd, ff, n_expert], &zeros),
+            (Q8_UP, GgmlType::Q3_K, [embd, ff, n_expert], &up),
+            (Q8_DOWN, GgmlType::Q3_K, [ff, embd, n_expert], &zeros),
+        ],
+    );
+    let x = |k: usize| Tensor2::from_vec(embd, k, vec![1e38; embd * k]);
+    let mut xq = vec![0u8; qdot::col_bytes(GgmlType::Q3_K, embd)];
+    qdot::quantize_col(GgmlType::Q3_K, x(1).col(0), &mut xq);
+    let sums = [&zeros, &up].map(|w| qdot::dot_row(GgmlType::Q3_K, &w[..110], &xq, embd).unwrap());
+    assert_eq!(
+        sums,
+        [0.0, f32::INFINITY],
+        "the host dot's gate and up sums"
+    );
+
+    let split = Split::open(&file.source).unwrap();
+    let src = R8Source::rows(&split);
+    let g = gguf::Gguf::open(&file.source).unwrap();
+    let view = |name: &str| model::moe::expert_view(g.find(name).unwrap(), 0, n_expert).unwrap();
+    let (gate_w, up_w, down_w) = (view(Q8_GATE), view(Q8_UP), view(Q8_DOWN));
+    let one = [(0u32, 1.0f32)];
+    for (limit, refusal) in [
+        (7.0f32, "swiglu: non-finite gate or up sum"),
+        (0.0, "qdot: non-finite activation value"),
+    ] {
+        let refused = |what: &str, call: &mut dyn FnMut()| {
+            let text = panic_text(call);
+            assert!(
+                text.as_deref().is_some_and(|t| t.contains(refusal)),
+                "limit {limit} {what}: the sum must be refused by name, got {text:?}"
+            );
+            println!(
+                "gated refusal (limit {limit}, {what}): {}",
+                text.unwrap_or_default()
+            );
+        };
+        let spec = HostLayerSpec {
+            gate: Q8_GATE,
+            up: Q8_UP,
+            down: Q8_DOWN,
+            n_expert,
+            embd,
+            ff,
+            swiglu_limit: limit,
+        };
+        let layer = HostLayer::build(src, &spec).unwrap();
+        let mut host = HostScratch::new(embd, ff, 1).unwrap();
+        refused("experts_into", &mut || {
+            let mut out = vec![0.0f32; embd];
+            let _ = layer.experts_into(src, &x(1), &one, &mut out, &mut host);
+        });
+        for k in [1, SMALL_COLS] {
+            let xk = x(k);
+            let lists: Vec<&[(u32, f32)]> = vec![&one[..]; k];
+            let mut us = UnionScratch::new_routed(embd, ff, SMALL_COLS, 1).unwrap();
+            refused(&format!("experts_union_into k={k}"), &mut || {
+                let mut out = vec![0.0f32; embd * k];
+                let _ = layer.experts_union_into(src, &xk, &lists, &mut out, &mut us);
+            });
+        }
+        for k in [1, 3] {
+            let xk = x(k);
+            let gu = ops::matmul_q_group(&g, &[&gate_w, &up_w], &[&xk, &xk]).unwrap();
+            let input = if limit > 0.0 {
+                ops::GroupInput::SwigluClamp(&gu[0], &gu[1], limit)
+            } else {
+                ops::GroupInput::Swiglu(&gu[0], &gu[1])
+            };
+            refused(&format!("matmul_q_group_swiglu k={k}"), &mut || {
+                let _ = ops::matmul_q_group_swiglu(&g, &[&down_w], &[input]);
+            });
+        }
+    }
+    println!(
+        "PASSED: union gated overflow — a zero gate sum and an infinite up sum are refused by \
+         name through experts_into, the union call at k = 1 and 9 and the allocating group entry \
+         at k = 1 and 3: by the combine clamped at 7, by the quantizer plain"
+    );
+}

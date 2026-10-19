@@ -345,7 +345,11 @@ gguf 9 2 0
 # store) and the planes test's scale read, 9 blocks; f32tile.rs's TileRows::stage (an unsafe fn declared and
 # implemented for F32 and MXFP8: the F32 cp.async, the MXFP8 decode's load and its stores), 3 blocks; mxfp8_tile_gemm
 # (gemm/kernels32.rs) its shared-memory view and its body call, 2 blocks. Each block has its SAFETY line.
-gpu 1967 221 10
+# PIN(2026-10-20): gpu 1967 -> 1979 blocks, new kernel entries, not old code relaxed: the NVFP4 routed pair
+# (mxfp4_sel.rs) adds 12: nvfp4_gate_up_sel's id read, NaN row write, gate and up lane_partials calls, gate and
+# up scale reads and row write, nvfp4_gemv_sel32's id read, lane_partials call, scale read and row write, and the
+# module load, one memory operation a block, each with its SAFETY line.
+gpu 1979 221 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -511,7 +515,10 @@ placement 0 0 0
 # dot_q8k_avx2 and dot_q82x4_avx2, the decoders' codes_avx2 for Q2_K, IQ4_XS and IQ4_NL, and the loads those share,
 # 19 blocks and 11 unsafe fns), the two dispatch arms in lib.rs that call it (2 blocks), and the tests' register-only
 # calls (tests/generic.rs, 6 blocks and 1 fn), each block with its SAFETY line.
-qdot 205 95 0
+# PIN(2026-10-20): qdot 205 -> 217 blocks, new code, not old code relaxed: swiglu_clamp_avx2 separates
+# its expf and checked clamp passes. Full vectors and the padded tail each have three expf blocks (load,
+# v_silu, store) and four clamp blocks (three loads, one store): 14 in place of 2, each with its SAFETY line.
+qdot 217 95 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1

@@ -9516,7 +9516,12 @@ pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
 /// when `limit <= 1e-6` — then this is [`swiglu`]. The `min`/`max` are ik's
 /// `std::min`/`std::max` operand orders: a NaN silu passes its clamp, a NaN up
 /// becomes `limit`. Silu is [`swiglu`]'s `v_silu` lanes, tail included.
-pub fn swiglu_clamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
+///
+/// Returns `false` when the clamp met a `gate` or `up` value that is not
+/// finite, which it would write as a finite value. Below the clamp's limit
+/// every such value stays non-finite in `out`, as in [`swiglu`], and the
+/// result is `true`.
+pub fn swiglu_clamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) -> bool {
     assert!(gate.len() == up.len() && gate.len() == out.len());
     // ik's own test, so a NaN limit clamps nothing either.
     if limit > 1e-6 {
@@ -9524,56 +9529,106 @@ pub fn swiglu_clamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
             // SAFETY: the features were just detected; the slices are equal length.
-            unsafe { swiglu_clamp_avx2(gate, up, limit, out) };
-            return;
+            return unsafe { swiglu_clamp_avx2(gate, up, limit, out) };
         }
+        // Absolute f32 encodings put every finite value below infinity and NaN.
+        let mut max_bits = 0u32;
         for (o, (&g, &u)) in out.iter_mut().zip(gate.iter().zip(up)) {
+            max_bits = max_bits
+                .max(g.to_bits() & 0x7fff_ffff)
+                .max(u.to_bits() & 0x7fff_ffff);
             let s = g / (1.0 + expf_ik_scalar(0.0 - g));
             let s = if limit < s { limit } else { s };
             let c = if u < limit { u } else { limit };
             let c = if -limit < c { c } else { -limit };
             *o = c * s;
         }
+        max_bits < f32::INFINITY.to_bits()
     } else {
         swiglu(gate, up, out);
+        true
     }
 }
 
+/// Each lane's largest absolute f32 encoding after another `g` and `u`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn max_abs_bits(acc: __m256i, g: __m256, u: __m256) -> __m256i {
+    let mask = _mm256_set1_epi32(i32::MAX);
+    let g = _mm256_and_si256(_mm256_castps_si256(g), mask);
+    let u = _mm256_and_si256(_mm256_castps_si256(u), mask);
+    _mm256_max_epi32(acc, _mm256_max_epi32(g, u))
+}
+
+/// [`swiglu_clamp`]'s vector body, with its flag.
+///
 /// # Safety
 /// The CPU must support AVX2 and FMA, and `gate`, `up` and `out` must all be
 /// the same length — the loads and the store share one index.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn swiglu_clamp_avx2(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
+unsafe fn swiglu_clamp_avx2(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) -> bool {
     let n = gate.len();
     let full = n / 8 * 8;
-    // `min_ps(a, b)` is `a < b ? a : b` and `max_ps(a, b)` is `a > b ? a : b`,
-    // so `min_ps(hi, s)` is `std::min(s, limit)`, `min_ps(u, hi)` is
-    // `std::min(limit, u)` and `max_ps(c, lo)` is `std::max(-limit, c)`.
+    let mut i = 0;
+    // Keep the finite accumulator and clamp constants out of the expf pass.
+    while i < full {
+        // SAFETY: i + 8 <= full <= gate.len().
+        let g = unsafe { _mm256_loadu_ps(gate.as_ptr().add(i)) };
+        // SAFETY: the caller provides AVX2 and FMA.
+        let s = unsafe { v_silu(g) };
+        // SAFETY: i + 8 <= full <= out.len().
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(i), s) };
+        i += 8;
+    }
+    let (mut gp, mut upad, mut spad, mut op) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
+    if full < n {
+        gp[..n - full].copy_from_slice(&gate[full..]);
+        // SAFETY: gp holds eight f32 values.
+        let g = unsafe { _mm256_loadu_ps(gp.as_ptr()) };
+        // SAFETY: the caller provides AVX2 and FMA.
+        let s = unsafe { v_silu(g) };
+        // SAFETY: spad holds eight f32 values.
+        unsafe { _mm256_storeu_ps(spad.as_mut_ptr(), s) };
+    }
+
+    // The min/max operand orders are ik's std::min/std::max orders.
     let hi = _mm256_set1_ps(limit);
     let lo = _mm256_set1_ps(-limit);
-    let mut i = 0;
+    let mut acc = _mm256_setzero_si256();
+    i = 0;
     while i < full {
-        // SAFETY: `i + 8 <= full <= n` for all three slices.
-        unsafe {
-            let s = _mm256_min_ps(hi, v_silu(_mm256_loadu_ps(gate.as_ptr().add(i))));
-            let c = _mm256_max_ps(_mm256_min_ps(_mm256_loadu_ps(up.as_ptr().add(i)), hi), lo);
-            _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_mul_ps(c, s));
-        }
+        // SAFETY: i + 8 <= full <= gate.len().
+        let g = unsafe { _mm256_loadu_ps(gate.as_ptr().add(i)) };
+        // SAFETY: i + 8 <= full <= up.len().
+        let u = unsafe { _mm256_loadu_ps(up.as_ptr().add(i)) };
+        // SAFETY: the first pass wrote these eight values, all inside out.
+        let s = unsafe { _mm256_loadu_ps(out.as_ptr().add(i)) };
+        acc = max_abs_bits(acc, g, u);
+        let s = _mm256_min_ps(hi, s);
+        let c = _mm256_max_ps(_mm256_min_ps(u, hi), lo);
+        // SAFETY: i + 8 <= full <= out.len().
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_mul_ps(c, s)) };
         i += 8;
     }
     if full < n {
-        let (mut gp, mut upad, mut op) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
-        gp[..n - full].copy_from_slice(&gate[full..]);
         upad[..n - full].copy_from_slice(&up[full..]);
-        // SAFETY: the three arrays are eight f32 each.
-        unsafe {
-            let s = _mm256_min_ps(hi, v_silu(_mm256_loadu_ps(gp.as_ptr())));
-            let c = _mm256_max_ps(_mm256_min_ps(_mm256_loadu_ps(upad.as_ptr()), hi), lo);
-            _mm256_storeu_ps(op.as_mut_ptr(), _mm256_mul_ps(c, s));
-        }
+        // SAFETY: gp holds eight f32 values.
+        let g = unsafe { _mm256_loadu_ps(gp.as_ptr()) };
+        // SAFETY: upad holds eight f32 values.
+        let u = unsafe { _mm256_loadu_ps(upad.as_ptr()) };
+        // SAFETY: the first pass wrote all eight values of spad.
+        let s = unsafe { _mm256_loadu_ps(spad.as_ptr()) };
+        acc = max_abs_bits(acc, g, u);
+        let s = _mm256_min_ps(hi, s);
+        let c = _mm256_max_ps(_mm256_min_ps(u, hi), lo);
+        // SAFETY: op holds eight f32 values.
+        unsafe { _mm256_storeu_ps(op.as_mut_ptr(), _mm256_mul_ps(c, s)) };
         out[full..].copy_from_slice(&op[..n - full]);
     }
+    let finite = _mm256_cmpgt_epi32(_mm256_castps_si256(_mm256_set1_ps(f32::INFINITY)), acc);
+    _mm256_movemask_epi8(finite) == -1
 }
 
 /// # Safety

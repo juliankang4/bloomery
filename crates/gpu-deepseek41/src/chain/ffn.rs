@@ -1574,6 +1574,7 @@ impl FfnPiece {
                 n_slots: N_USED,
                 rows_per_expert: ff,
                 limit: c.limit,
+                fault: gpu.layer_sink(layer)?,
             };
             self.experts
                 .enqueue_expert_gate_up(stream, &args, &mut r.h)?;
@@ -1613,6 +1614,7 @@ impl FfnPiece {
                 u,
                 &r.act_x,
                 c.limit_shared,
+                gpu.layer_sink(layer)?,
                 &mut r.sh_h,
             )?,
             (gate, up) => self.experts.enqueue_shexp_gate_up(
@@ -1621,6 +1623,7 @@ impl FfnPiece {
                 up,
                 boundary.normed(),
                 c.limit_shared,
+                gpu.layer_sink(layer)?,
                 &mut r.sh_h,
             )?,
         }

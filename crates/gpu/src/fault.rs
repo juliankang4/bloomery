@@ -130,7 +130,8 @@ pub enum FaultSite {
     /// not finite; an f32 product kernel of Qwen3.8's layer (`q38`: the
     /// attention output under its sigmoid gate, the shared expert's gated sum)
     /// or Gemma4a's audio channel normalization, attention score or GLU met
-    /// non-finite arithmetic.
+    /// non-finite arithmetic; a gate-up's gate or up dot sum was not finite
+    /// before its activation (including an NVFP4 expert's tensor scale).
     F32Product = 21,
     /// A head whose logits no quantizer checked before them (a Q8_0 lm_head
     /// over f32 rows) met a logit that is not finite in its argmax.

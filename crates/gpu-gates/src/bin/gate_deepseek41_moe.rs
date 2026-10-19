@@ -928,11 +928,25 @@ mod gate {
         let stream = cx.gpu.stream();
         if ly.sh_gate.ty == GgmlType::Q3_K {
             let (g, u) = (ly.sh_gate.q3k()?, ly.sh_up.q3k()?);
-            cx.dense
-                .enqueue_shexp_gate_up_q3k(stream, g, u, act, limit, h)
+            cx.dense.enqueue_shexp_gate_up_q3k(
+                stream,
+                g,
+                u,
+                act,
+                limit,
+                cx.gpu.unlabelled_sink(),
+                h,
+            )
         } else {
-            cx.experts
-                .enqueue_shexp_gate_up(stream, &ly.sh_gate.dev, &ly.sh_up.dev, x, limit, h)
+            cx.experts.enqueue_shexp_gate_up(
+                stream,
+                &ly.sh_gate.dev,
+                &ly.sh_up.dev,
+                x,
+                limit,
+                cx.gpu.unlabelled_sink(),
+                h,
+            )
         }
     }
 
@@ -1771,6 +1785,7 @@ mod gate {
                 n_slots: N_USED,
                 rows_per_expert: ff,
                 limit,
+                fault: cx.gpu.unlabelled_sink(),
             };
             cx.experts
                 .enqueue_expert_gate_up(stream, &args, &mut dv.h6)?;
@@ -1970,6 +1985,7 @@ mod gate {
                 n_slots: N_USED,
                 rows_per_expert: ff,
                 limit,
+                fault: cx.gpu.unlabelled_sink(),
             };
             cx.experts
                 .enqueue_expert_gate_up(stream, &args, &mut dv.h6)?;
@@ -2368,6 +2384,7 @@ mod gate {
                 n_slots: N_USED,
                 rows_per_expert: ff,
                 limit: lim,
+                fault: cx.gpu.unlabelled_sink(),
             };
             cx.experts
                 .enqueue_expert_gate_up(stream, &args, &mut dv.h6)?;
@@ -2463,6 +2480,7 @@ mod gate {
                 n_slots: N_USED,
                 rows_per_expert: ff,
                 limit,
+                fault: cx.gpu.unlabelled_sink(),
             };
             cx.experts
                 .enqueue_expert_gate_up(stream, &args, &mut dv.h6)?;
@@ -2522,6 +2540,7 @@ mod gate {
             n_slots: N_USED,
             rows_per_expert: ff,
             limit: cx.meta.clamp_exp[ly.l],
+            fault: cx.gpu.unlabelled_sink(),
         };
         cx.experts
             .enqueue_expert_gate_up(stream, &args, &mut dv.h6)?;

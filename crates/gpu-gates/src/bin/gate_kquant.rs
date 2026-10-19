@@ -1438,7 +1438,8 @@ mod gate {
             Act::SwigluClamp { limit: 10.0 },
         )?;
         let all_nan = h.iter().chain(&hc).all(|v| v.is_nan());
-        let pass = qf == quant_column && fg.is_none() && fc.is_none() && all_nan;
+        let product = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+        let pass = qf == quant_column && fg == product && fc == product && all_nan;
         ok &= pass;
         println!(
             "{label}[gate_up:nan_column] quantizer_fault=\"{}\" want=\"{}\" gate_up_faults=\"{}\",\"{}\" \
@@ -1666,20 +1667,10 @@ mod gate {
             .enqueue_quantize_q8(stream, &xd, &mut act, c.gpu.unlabelled_sink())?;
         stream.synchronize()?;
         let h = act.readback(stream)?;
-        let kb = k / 32;
-        let q_stride = h.q.len() / cols;
-        let mut xq = vec![0.0f32; cols * k];
+        let mut xq = Vec::with_capacity(cols * k);
         for col in 0..cols {
-            for b in 0..kb {
-                let e = h.d8[col * kb + b];
-                for i in 0..8 {
-                    let w = h.q[col * q_stride + 256 * (b >> 5) + 32 * i + (b & 31)];
-                    for v in 0..4 {
-                        let code = f32::from((w >> (8 * v)) as u8 as i8);
-                        xq[col * k + 32 * b + 4 * i + v] = e * code;
-                    }
-                }
-            }
+            let (q, d) = h.column(col, k, cols);
+            xq.extend(q.iter().enumerate().map(|(j, &c)| d[j / 32] * f32::from(c)));
         }
         Ok((act, xq))
     }

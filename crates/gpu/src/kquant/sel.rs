@@ -111,7 +111,7 @@ pub unsafe fn gemv_sel_body<D: SbDecode>(
 /// `n = slot · rows_per_expert + r` dots weight row `sel[slot] ·
 /// rows_per_expert + r` of `wg` and of `wu` with activation column `slot /
 /// slots_per_col`, reduces each with the warp tree and stores `h[n] =
-/// act::apply(act, limit, g, u)` from lane 0.
+/// act::apply_checked(act, limit, g, u, fault)` from lane 0.
 ///
 /// # Safety
 ///
@@ -175,7 +175,7 @@ pub unsafe fn gate_up_act_body<D: SbDecode>(
     if lane == 0 {
         // SAFETY: row < n_slots · rows_per_expert <= h.len() by this fn's
         // contract; only lane 0 of the warp writes h[row].
-        unsafe { *h.get_unchecked_mut(row) = act::apply(act, limit, g, u) };
+        unsafe { *h.get_unchecked_mut(row) = act::apply_checked(act, limit, g, u, fault) };
     }
 }
 
@@ -334,7 +334,7 @@ pub unsafe fn gate_up_act_at_body<D: SbDecode>(
     if lane == 0 {
         // SAFETY: row < n_slots · rows_per_expert <= h.len() by this fn's
         // contract; only lane 0 of the warp writes h[row].
-        unsafe { *h.get_unchecked_mut(row) = act::apply(act, limit, g, u) };
+        unsafe { *h.get_unchecked_mut(row) = act::apply_checked(act, limit, g, u, fault) };
     }
 }
 
@@ -457,6 +457,34 @@ pub(crate) struct DownDims {
     pub(crate) iters: u32,
 }
 
+/// Validate the activation, id and output capacities of a down-slot launch.
+pub(crate) fn check_down_slots(
+    what: &'static str,
+    n_slots: usize,
+    rows_per_expert: usize,
+    cols: usize,
+    ids_len: usize,
+    y_len: usize,
+) -> Result<usize, GpuError> {
+    let rows = n_slots.checked_mul(rows_per_expert).ok_or_else(|| {
+        GpuError::shape(
+            what,
+            format!("{n_slots} slots * {rows_per_expert} rows pass usize"),
+        )
+    })?;
+    if n_slots == 0 || cols < n_slots || ids_len < n_slots || y_len < rows {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{n_slots} slots (at least one): an activation column a slot (act.m() {cols} >= \
+                 n_slots), an id a slot (sel.len() {ids_len}), y.len() {y_len} >= \
+                 n_slots*rows_per_expert = {rows}"
+            ),
+        ));
+    }
+    Ok(rows)
+}
+
 /// [`SelDown`] checked against `fmt` and an output of `y_len` values.
 pub(crate) fn down_dims(
     what: &'static str,
@@ -467,20 +495,9 @@ pub(crate) fn down_dims(
     let n_sb = a.act.n_sb();
     let n_experts = stack_experts(what, fmt, a.w, n_sb, a.rows_per_expert)?;
     let (n_slots, rpe) = (a.n_slots, a.rows_per_expert);
-    if n_slots == 0 || a.act.m() < n_slots || a.sel.len() < n_slots || y_len < n_slots * rpe {
-        return Err(GpuError::shape(
-            what,
-            format!(
-                "{n_slots} slots (at least one): an activation column a slot (act.m() {} >= \
-                 n_slots), an id a slot (sel.len() {}), y.len() {y_len} >= n_slots*rows_per_expert = {}",
-                a.act.m(),
-                a.sel.len(),
-                n_slots * rpe
-            ),
-        ));
-    }
+    let slot_rows = check_down_slots(what, n_slots, rpe, a.act.m(), a.sel.len(), y_len)?;
     Ok(DownDims {
-        grid: launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?,
+        grid: launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?,
         n_experts: launch_u32(what, "n_experts", n_experts)?,
         rows_per_expert: launch_u32(what, "rows_per_expert", rpe)?,
         n_slots: launch_u32(what, "n_slots", n_slots)?,
@@ -501,6 +518,40 @@ pub(crate) struct GateUpDims {
     pub(crate) iters: u32,
     pub(crate) act: u32,
     pub(crate) limit: f32,
+}
+
+/// Validate the activation, id and output capacities of a gate-up slot launch.
+pub(crate) fn check_gate_up_slots(
+    what: &'static str,
+    n_slots: usize,
+    rows_per_expert: usize,
+    cols: usize,
+    slots_per_col: usize,
+    ids_len: usize,
+    h_len: usize,
+) -> Result<usize, GpuError> {
+    let rows = n_slots.checked_mul(rows_per_expert).ok_or_else(|| {
+        GpuError::shape(
+            what,
+            format!("{n_slots} slots * {rows_per_expert} rows pass usize"),
+        )
+    })?;
+    if n_slots == 0
+        || slots_per_col == 0
+        || n_slots.div_ceil(slots_per_col) > cols
+        || ids_len < n_slots
+        || h_len < rows
+    {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{n_slots} slots (at least one) at {slots_per_col} a column (at least one) over \
+             {cols} columns, sel.len() {ids_len}, h.len() {h_len} >= \
+             n_slots*rows_per_expert = {rows}"
+            ),
+        ));
+    }
+    Ok(rows)
 }
 
 /// [`GateUpAct`] checked against `fmt` and an output of `h_len` values.
@@ -525,25 +576,10 @@ pub(crate) fn gate_up_dims(
             ),
         ));
     }
-    if n_slots == 0
-        || spc == 0
-        || n_slots > m * spc
-        || a.sel.len() < n_slots
-        || h_len < n_slots * rpe
-    {
-        return Err(GpuError::shape(
-            what,
-            format!(
-                "{n_slots} slots (at least one) at {spc} a column (at least one) over {m} \
-                 columns, sel.len() {}, h.len() {h_len} >= n_slots*rows_per_expert = {}",
-                a.sel.len(),
-                n_slots * rpe
-            ),
-        ));
-    }
+    let slot_rows = check_gate_up_slots(what, n_slots, rpe, m, spc, a.sel.len(), h_len)?;
     let (act, limit) = a.rule.code();
     Ok(GateUpDims {
-        grid: launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?,
+        grid: launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?,
         n_experts: launch_u32(what, "n_experts", n_experts)?,
         rows_per_expert: launch_u32(what, "rows_per_expert", rpe)?,
         n_slots: launch_u32(what, "n_slots", n_slots)?,
@@ -675,4 +711,57 @@ pub(crate) fn gate_up_at_dims(
         act,
         limit,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_down_slots, check_gate_up_slots};
+    use crate::GpuError;
+
+    #[test]
+    fn down_slots_refuse_short_capacities_and_row_overflow() {
+        for (slots, rpe, cols, ids, out) in [
+            (0, 1, 1, 1, 1),
+            (2, 3, 1, 2, 6),
+            (2, 3, 2, 1, 6),
+            (2, 3, 2, 2, 5),
+            (usize::MAX / 2 + 1, 2, usize::MAX, usize::MAX, usize::MAX),
+        ] {
+            assert!(
+                matches!(
+                    check_down_slots("down", slots, rpe, cols, ids, out),
+                    Err(GpuError::Shape { what: "down", .. })
+                ),
+                "{slots} slots of {rpe} rows, capacities {cols}/{ids}/{out}"
+            );
+        }
+        assert_eq!(
+            check_down_slots("down", 2, 3, 4, 4, 12).expect("capacity"),
+            6
+        );
+    }
+
+    #[test]
+    fn gate_up_slots_refuse_short_capacities_and_row_overflow() {
+        for (slots, rpe, cols, spc, ids, out) in [
+            (0, 1, 1, 1, 1, 1),
+            (1, 1, 1, 0, 1, 1),
+            (3, 2, 1, 2, 3, 6),
+            (2, 3, 1, 2, 1, 6),
+            (2, 3, 1, 2, 2, 5),
+            (usize::MAX / 2 + 1, 2, usize::MAX, 1, usize::MAX, usize::MAX),
+        ] {
+            assert!(
+                matches!(
+                    check_gate_up_slots("gate", slots, rpe, cols, spc, ids, out),
+                    Err(GpuError::Shape { what: "gate", .. })
+                ),
+                "{slots} slots of {rpe} rows at {spc}, capacities {cols}/{ids}/{out}"
+            );
+        }
+        assert_eq!(
+            check_gate_up_slots("gate", 2, 3, 2, 2, 4, 12).expect("capacity"),
+            6
+        );
+    }
 }

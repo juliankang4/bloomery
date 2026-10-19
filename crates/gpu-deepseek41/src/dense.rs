@@ -56,7 +56,8 @@ use cuda_host::cuda_module;
 use gguf::quant::GgmlType;
 use std::sync::Arc;
 
-use crate::experts::swiglu_clamp;
+use bloomery_gpu::fault::FaultSink;
+use bloomery_gpu::kquant::act::{self, ACT_SWIGLU_CLAMP};
 
 const WHAT: &str = "deepseek41 dense";
 
@@ -600,7 +601,8 @@ mod dense_kernels {
     /// The shared expert's gate·up·SwiGLU for one token, Q3_K weights: row
     /// `r` (a warp per row) dots gate row `r` and up row `r` against the one
     /// q8_1 column, reduces each with the warp tree and stores
-    /// `h[r] = swiglu_clamp(g, u, limit)` from lane 0.
+    /// the checked SwiGLU into `h[r]` from lane 0, raising `F32Product` and
+    /// writing NaN if either sum is not finite.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -627,6 +629,7 @@ mod dense_kernels {
         n_sb: u32,
         iters: u32,
         limit: f32,
+        fault: FaultSink,
         mut h: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -640,7 +643,7 @@ mod dense_kernels {
         let g = warp::reduce_sum_f32(fg[0]);
         let u = warp::reduce_sum_f32(fu[0]);
         if lane == 0 {
-            let v = swiglu_clamp(g, u, limit);
+            let v = act::apply_checked(ACT_SWIGLU_CLAMP, limit, g, u, fault);
             // SAFETY: row < n_rows <= h.len(); lane 0 of the row's warp is
             // its only writer.
             unsafe { *h.get_unchecked_mut(row) = v };
@@ -680,6 +683,7 @@ mod dense_kernels {
         n_sb: u32,
         iters: u32,
         limit: f32,
+        fault: FaultSink,
         mut h: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -695,14 +699,14 @@ mod dense_kernels {
         let u = col_sums(fu, m);
         if lane == 0 {
             let v = [
-                swiglu_clamp(g[0], u[0], limit),
-                swiglu_clamp(g[1], u[1], limit),
-                swiglu_clamp(g[2], u[2], limit),
-                swiglu_clamp(g[3], u[3], limit),
-                swiglu_clamp(g[4], u[4], limit),
-                swiglu_clamp(g[5], u[5], limit),
-                swiglu_clamp(g[6], u[6], limit),
-                swiglu_clamp(g[7], u[7], limit),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[0], u[0], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[1], u[1], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[2], u[2], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[3], u[3], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[4], u[4], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[5], u[5], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[6], u[6], fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[7], u[7], fault),
             ];
             // SAFETY: slots t·n_rows + row for t < m are inside h (h.len()
             // >= m·n_rows) and belong to this row's warp alone.
@@ -1152,6 +1156,10 @@ impl DenseKernels {
     /// is the one-token kernel; at more, its m-column twin, token t bit for
     /// bit the one-token launch on its column. Asynchronous,
     /// allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared gate-up launch inputs and its fault sink (rust-quality R8)"
+    )]
     pub fn enqueue_shexp_gate_up_q3k(
         &self,
         stream: &CudaStream,
@@ -1159,6 +1167,7 @@ impl DenseKernels {
         up: &DeviceTensor<u32>,
         act: &Q8Act,
         limit: f32,
+        fault: FaultSink,
         h: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "DenseKernels::enqueue_shexp_gate_up_q3k";
@@ -1193,6 +1202,7 @@ impl DenseKernels {
                 n_sb,
                 n_sb.div_ceil(2),
                 limit,
+                fault,
                 h,
             )?;
         } else {
@@ -1210,6 +1220,7 @@ impl DenseKernels {
                 n_sb,
                 n_sb.div_ceil(2),
                 limit,
+                fault,
                 h,
             )?;
         }

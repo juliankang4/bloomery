@@ -656,7 +656,7 @@ mod gate {
             DevWeight::Q8_0Derived { .. } => {
                 return Err("a derived weight under a file tensor's name".into());
             }
-            DevWeight::Nvfp4 { .. } => {
+            DevWeight::Nvfp4 { .. } | DevWeight::Nvfp4Stack { .. } => {
                 return Err("an nvfp4 weight: V4.1 has none".into());
             }
             DevWeight::Mxfp8 { .. } => {

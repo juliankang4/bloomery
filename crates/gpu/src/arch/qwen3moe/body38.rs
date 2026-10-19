@@ -143,7 +143,7 @@ use crate::model::{
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::tensor::WindowMut;
-use crate::weights::{Weights, tensor_scale};
+use crate::weights::{Weights, tensor_scales};
 use crate::{DeviceTensor, Gpu, GpuError, launch_u32, ple};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -563,7 +563,7 @@ fn ple_decode<'r>(
 impl PleHost {
     /// The table `per_layer_token_embd` of `file`, IQ4_NL rows or bloomery's
     /// F8 rows with the table's scale (`per_layer_token_embd.scale`, read by
-    /// [`tensor_scale`]) of the hash's width, and the hash from the first
+    /// [`tensor_scales`]) of the hash's width, and the hash from the first
     /// shard's keys, for calls of up to
     /// `cap` positions, read from `tier` — the plan's
     /// ([`Plan::row_tier`]): the host, or the NVMe tier through its reader
@@ -601,10 +601,11 @@ impl PleHost {
         let decode = if info.ty == GgmlType::IQ4_NL {
             PleRows::Iq4Nl
         } else if info.ty == GgmlType::F8E4M3_ROWS {
-            let scale = tensor_scale(WHAT, &info, |n| {
+            let scale = tensor_scales(WHAT, &info, |n| {
                 let (s, t) = file.find(n)?;
                 Some((file.shard(s)?, t))
             })?
+            .and_then(|s| s.first().copied())
             .ok_or_else(|| refuse("a scale beside its F8 rows"))?;
             PleRows::F8(Box::new(E4m3Rows::new(scale)))
         } else {

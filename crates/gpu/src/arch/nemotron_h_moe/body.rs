@@ -119,7 +119,7 @@ impl Body {
     ) -> Result<Body, GpuError> {
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
         // A companion `.scale` is read for NVFP4 projections only
-        // (weights::tensor_scale); a scaled Q8_0 ssm_in/ssm_out would enter
+        // (weights::tensor_scales); a scaled Q8_0 ssm_in/ssm_out would enter
         // the scan unscaled, so the load refuses it by name.
         for (l, kind) in hp.kinds.iter().enumerate() {
             if *kind != Kind::Mamba {

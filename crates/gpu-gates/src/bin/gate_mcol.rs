@@ -667,8 +667,15 @@ mod gate {
             let mut a = Q8Act::with_k(stream, m, k)?;
             cx.gpu.enqueue_quantize_q8_1(&x_dev, &mut a)?;
             let mut h = DeviceBuffer::from_host(stream, &vec![f32::NAN; rows * m])?;
-            cx.dense
-                .enqueue_shexp_gate_up_q3k(stream, gate, up, &a, limit, &mut h)?;
+            cx.dense.enqueue_shexp_gate_up_q3k(
+                stream,
+                gate,
+                up,
+                &a,
+                limit,
+                cx.gpu.unlabelled_sink(),
+                &mut h,
+            )?;
             Ok(h.to_host_vec(stream)?)
         };
         let y1 = (0..8)

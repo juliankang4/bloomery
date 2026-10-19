@@ -69,8 +69,8 @@ pub fn program_of(arch: Arch) -> Option<Program> {
 /// the entries the family's FFN dispatch launches
 /// (`gpu/src/arch/qwen3moe/dispatch.rs`): the K-quant family's Q4_K and
 /// Q5_K. The table's Q8_0 row reads a stack in the file's block stream, its
-/// i-quant rows are `iq_sel.rs`'s and its MXFP4 row is `mxfp4_sel.rs`'s; the
-/// dispatch launches none of them, so
+/// i-quant rows are `iq_sel.rs`'s, its MXFP4 row is `mxfp4_sel.rs`'s and its
+/// NVFP4 row `mxfp4_sel.rs`'s; the dispatch launches none of them, so
 /// such a stack is refused by name.
 #[must_use]
 pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
@@ -84,7 +84,8 @@ pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GateUpEntry::Iq3xxs
         | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
-        | GateUpEntry::Mxfp4 => None,
+        | GateUpEntry::Mxfp4
+        | GateUpEntry::Nvfp4 => None,
     }
 }
 
@@ -92,7 +93,7 @@ pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
 /// table's row ([`kernels::down`]) when it names the type's prompt GEMM too
 /// ([`kernels::gemm`]), among the entries the FFN dispatch launches: the
 /// downs over `Q8Act`, Q4_K, Q5_K and Q6_K. The downs over `Q8Blocks32`
-/// (Q5_0, Q5_1, Q8_0, IQ4_NL) read an activation form the dispatch does not
+/// (Q5_0, Q5_1, Q8_0, IQ4_NL, NVFP4) read an activation form the dispatch does not
 /// quantize, so such a stack is refused by name.
 #[must_use]
 pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
@@ -109,7 +110,8 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
         | DownEntry::Iq3s
         | DownEntry::Iq4nl
         | DownEntry::Iq4xs
-        | DownEntry::Mxfp4 => None,
+        | DownEntry::Mxfp4
+        | DownEntry::Nvfp4 => None,
     }
 }
 

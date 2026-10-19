@@ -609,6 +609,7 @@ fn enqueue_ffn(
             route: cx.route,
             n_slots,
             limit,
+            fault: cx.gpu.unlabelled_sink(),
         },
         &mut b.h,
     )?;
@@ -652,8 +653,15 @@ fn enqueue_ffn(
     for t in 0..m {
         let x = Window::<f32>::of(&b.normed_f, t * d.n_embd * size_of::<f32>(), d.n_embd)?;
         let mut h = span_mut(WHAT, &mut b.sh_h, t * d.ff_shared, d.ff_shared)?;
-        cx.k.experts
-            .enqueue_shexp_gate_up(s, gate, up, &x, limit_sh, &mut h)?;
+        cx.k.experts.enqueue_shexp_gate_up(
+            s,
+            gate,
+            up,
+            &x,
+            limit_sh,
+            cx.gpu.unlabelled_sink(),
+            &mut h,
+        )?;
     }
     cx.gemv(
         &names::ffn_down_shexp(l),

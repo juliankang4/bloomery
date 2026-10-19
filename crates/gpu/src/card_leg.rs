@@ -58,7 +58,7 @@ use crate::card_slots::{CardAcc, CardSlotKernels, CardSlots};
 use crate::fault::FaultSink;
 use crate::iq_sel::{IqDown, IqGateUp};
 use crate::kquant::{Act, GateUpAct, SelDown};
-use crate::mxfp4_sel::Mxfp4SelKernels;
+use crate::mxfp4_sel::{Mxfp4SelKernels, Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels, Nvfp4Stack};
 use crate::q4k_sel::QuantSel;
 use crate::q5::Q8Blocks32;
 use crate::q5_1_sel::{Q51SelDown, Q51SelKernels};
@@ -220,28 +220,45 @@ const fn q8_act_bytes(cols: usize, k: usize) -> usize {
         + 4 * 2 * n_sb)
 }
 
-/// One resident routed stack: its name, file type, words and row width.
+/// A resident routed stack's device form: the file's blocks as words
+/// (`DevWeight::KQuant`), or NVFP4's planes and its experts' scales
+/// (`DevWeight::Nvfp4Stack`).
+#[derive(Clone, Copy)]
+enum StackW<'a> {
+    Words(&'a DeviceTensor<u32>),
+    Nvfp4(Nvfp4Stack<'a>),
+}
+
+/// One resident routed stack: its name, file type, device form and row width.
 struct LegStack<'a> {
     name: &'a str,
     ty: GgmlType,
-    w: &'a DeviceTensor<u32>,
+    w: StackW<'a>,
     k: usize,
 }
 
 impl<'a> LegStack<'a> {
-    /// The resident `KQuant` stack `name`, of a type `runs` admits in the
-    /// stack's role (`role`, for the refusal's words).
+    /// The resident stack `name`: a `KQuant` stack of a type `runs` admits in
+    /// the stack's role, or an NVFP4 stack in its planes where `planes`
+    /// admits NVFP4; `role` is the refusal's words.
     fn of(
         w: &'a Weights,
         name: &'a str,
         runs: fn(GgmlType) -> bool,
+        planes: fn(GgmlType) -> bool,
         role: &'static str,
     ) -> Result<LegStack<'a>, GpuError> {
         match w.get(name) {
             Some(DevWeight::KQuant { ty, w, k }) if runs(*ty) => Ok(LegStack {
                 name,
                 ty: *ty,
-                w,
+                w: StackW::Words(w),
+                k: *k,
+            }),
+            Some(DevWeight::Nvfp4Stack { k, .. }) if planes(GgmlType::NVFP4) => Ok(LegStack {
+                name,
+                ty: GgmlType::NVFP4,
+                w: StackW::Nvfp4(w.nvfp4_stack(WHAT, name)?),
                 k: *k,
             }),
             _ => Err(GpuError::Tensor {
@@ -249,6 +266,30 @@ impl<'a> LegStack<'a> {
                 name: name.to_owned(),
                 need: role,
             }),
+        }
+    }
+
+    /// Rows the stack holds, every expert's.
+    fn rows(&self) -> usize {
+        match self.w {
+            StackW::Words(w) => w.rows(),
+            StackW::Nvfp4(s) => s.qs.rows(),
+        }
+    }
+
+    /// The stack's words, for an entry over the file's blocks.
+    fn words(&self) -> Result<&'a DeviceTensor<u32>, GpuError> {
+        match self.w {
+            StackW::Words(w) => Ok(w),
+            StackW::Nvfp4(_) => Err(self.unrun()),
+        }
+    }
+
+    /// The stack's planes and scales, for an NVFP4 entry.
+    fn planes(&self) -> Result<Nvfp4Stack<'a>, GpuError> {
+        match self.w {
+            StackW::Nvfp4(s) => Ok(s),
+            StackW::Words(_) => Err(self.unrun()),
         }
     }
 
@@ -272,19 +313,38 @@ pub struct LegStacks<'a> {
 
 impl<'a> LegStacks<'a> {
     /// The stacks named `[gate, up, down]` in `w`, each a resident
-    /// `DevWeight::KQuant`: the gate and up of one type [`kernels::
-    /// card_gate_up_runs`] admits, the down of a type [`kernels::
-    /// card_down_runs`] admits (not necessarily the same one). Allocation-free
-    /// on success.
+    /// `DevWeight::KQuant` or an NVFP4 stack in its planes: the gate and up of
+    /// one type [`kernels::card_gate_up_runs`] or [`kernels::card_planes_runs`]
+    /// admits, the down of a type [`kernels::card_down_runs`] or
+    /// [`kernels::card_planes_runs`] admits (not necessarily the same one).
+    /// Allocation-free on success.
     pub fn of(w: &'a Weights, names: [&'a str; 3]) -> Result<LegStacks<'a>, GpuError> {
         const GATE_UP: &str = "a resident routed gate or up stack of a type the card leg runs (`kernels::card_gate_up_runs`)";
         const DOWN: &str =
             "a resident routed down stack of a type the card leg runs (`kernels::card_down_runs`)";
         let [gate, up, down] = names;
         let (gate, up, down) = (
-            LegStack::of(w, gate, kernels::card_gate_up_runs, GATE_UP)?,
-            LegStack::of(w, up, kernels::card_gate_up_runs, GATE_UP)?,
-            LegStack::of(w, down, kernels::card_down_runs, DOWN)?,
+            LegStack::of(
+                w,
+                gate,
+                kernels::card_gate_up_runs,
+                kernels::card_planes_runs,
+                GATE_UP,
+            )?,
+            LegStack::of(
+                w,
+                up,
+                kernels::card_gate_up_runs,
+                kernels::card_planes_runs,
+                GATE_UP,
+            )?,
+            LegStack::of(
+                w,
+                down,
+                kernels::card_down_runs,
+                kernels::card_planes_runs,
+                DOWN,
+            )?,
         );
         if up.ty != gate.ty {
             return Err(GpuError::Tensor {
@@ -301,7 +361,7 @@ impl<'a> LegStacks<'a> {
     pub fn check(&self, n_card: usize, shape: LegShape) -> Result<(), GpuError> {
         let LegShape { n, ff, .. } = shape;
         for (st, rows, k) in [(&self.gate, ff, n), (&self.up, ff, n), (&self.down, n, ff)] {
-            if st.w.rows() != n_card * rows || st.k != k {
+            if st.rows() != n_card * rows || st.k != k {
                 return Err(GpuError::Tensor {
                     what: WHAT,
                     name: st.name.to_owned(),
@@ -341,6 +401,7 @@ pub struct LegSum<'a> {
 pub struct CardLeg {
     quant: QuantSelKernels,
     mxfp4: Mxfp4SelKernels,
+    nvfp4: Nvfp4SelKernels,
     q51: Q51SelKernels,
     q80: Q80SelKernels,
     slots: CardSlotKernels,
@@ -361,6 +422,7 @@ impl CardLeg {
         Ok(CardLeg {
             quant: QuantSelKernels::load(ctx, word)?,
             mxfp4: Mxfp4SelKernels::load(ctx, word)?,
+            nvfp4: Nvfp4SelKernels::load(ctx, word)?,
             q51: Q51SelKernels::load(ctx, word)?,
             q80: Q80SelKernels::load(ctx, word)?,
             slots: CardSlotKernels::load(ctx)?,
@@ -492,23 +554,45 @@ impl CardLeg {
         let fault = gpu.layer_sink(run.layer)?;
         let slots = run.m * slots_per_col;
         gpu.enqueue_quantize_q8_1_cols(run.normed, act_x, run.m, run.layer)?;
-        let a = GateUpAct {
-            wg: st.gate.w,
-            wu: st.up.w,
-            act: act_x,
-            sel: run.sel,
-            n_slots: slots,
-            rows_per_expert: ff,
-            slots_per_col,
-            rule: run.rule,
+        let words = || -> Result<GateUpAct<'_>, GpuError> {
+            Ok(GateUpAct {
+                wg: st.gate.words()?,
+                wu: st.up.words()?,
+                act: act_x,
+                sel: run.sel,
+                n_slots: slots,
+                rows_per_expert: ff,
+                slots_per_col,
+                rule: run.rule,
+            })
         };
         match kernels::gate_up(st.gate.ty) {
-            Some(GateUpEntry::Q4k) => self.quant.enqueue_gate_up_q4k(stream, &a, fault, h)?,
-            Some(GateUpEntry::Q5k) => self.quant.enqueue_gate_up_q5k(stream, &a, fault, h)?,
-            Some(GateUpEntry::Mxfp4) => self.mxfp4.enqueue_gate_up(stream, &a, fault, h)?,
+            Some(GateUpEntry::Q4k) => {
+                self.quant
+                    .enqueue_gate_up_q4k(stream, &words()?, fault, h)?
+            }
+            Some(GateUpEntry::Q5k) => {
+                self.quant
+                    .enqueue_gate_up_q5k(stream, &words()?, fault, h)?
+            }
+            Some(GateUpEntry::Mxfp4) => self.mxfp4.enqueue_gate_up(stream, &words()?, fault, h)?,
+            Some(GateUpEntry::Nvfp4) => {
+                let a = Nvfp4GateUp {
+                    gate: st.gate.planes()?,
+                    up: st.up.planes()?,
+                    act: act_x,
+                    sel: run.sel,
+                    n_slots: slots,
+                    rows_per_expert: ff,
+                    slots_per_col,
+                    rule: run.rule,
+                };
+                self.nvfp4.enqueue_gate_up(stream, &a, fault, h)?;
+            }
             Some(
                 GateUpEntry::Iq2xs | GateUpEntry::Iq3xxs | GateUpEntry::Iq3s | GateUpEntry::Iq4xs,
             ) => {
+                let a = words()?;
                 let iq = IqGateUp {
                     ty: st.gate.ty,
                     wg: a.wg,
@@ -534,13 +618,12 @@ impl CardLeg {
             ActH::Q8Act(act) => gpu.q4k_sel().enqueue_quantize_sel(stream, &q, fault, act)?,
             ActH::Blocks32(act) => gpu.q5().enqueue_quantize_q8_sel(stream, &q, act, fault)?,
         }
-        let w = st.down.w;
         let (sel, rows_per_expert) = (run.sel, n);
         match (kernels::down(st.down.ty), &*act_h) {
             (Some((DownEntry::Q4k, DownAct::Q8Act)), ActH::Q8Act(act)) => {
                 gpu.q4k_sel().enqueue_gemv_q4k_sel(
                     stream,
-                    w,
+                    st.down.words()?,
                     act,
                     sel,
                     slots,
@@ -550,7 +633,7 @@ impl CardLeg {
             }
             (Some((DownEntry::Q5k, DownAct::Q8Act)), ActH::Q8Act(act)) => {
                 let d = SelDown {
-                    w,
+                    w: st.down.words()?,
                     act,
                     sel,
                     n_slots: slots,
@@ -560,13 +643,23 @@ impl CardLeg {
             }
             (Some((DownEntry::Mxfp4, DownAct::Q8Act)), ActH::Q8Act(act)) => {
                 let d = SelDown {
-                    w,
+                    w: st.down.words()?,
                     act,
                     sel,
                     n_slots: slots,
                     rows_per_expert,
                 };
                 self.mxfp4.enqueue_down(stream, &d, fault, down)?;
+            }
+            (Some((DownEntry::Nvfp4, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
+                let d = Nvfp4Down {
+                    w: st.down.planes()?,
+                    act,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert,
+                };
+                self.nvfp4.enqueue_down(stream, &d, fault, down)?;
             }
             (Some((entry, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
                 let run = Sel32Run {
@@ -587,7 +680,7 @@ impl CardLeg {
                 ActH::Q8Act(act),
             ) => {
                 let d = SelDown {
-                    w,
+                    w: st.down.words()?,
                     act,
                     sel,
                     n_slots: slots,
@@ -685,11 +778,10 @@ impl Sel32<'_> {
             n_slots,
             rows_per_expert,
         } = *run;
-        let w = stack.w;
         match entry {
             DownEntry::Q5_1 => {
                 let d = Q51SelDown {
-                    w,
+                    w: stack.words()?,
                     act,
                     sel,
                     n_slots,
@@ -699,7 +791,7 @@ impl Sel32<'_> {
             }
             DownEntry::Q8_0 => {
                 let d = Q80SelDown {
-                    w,
+                    w: stack.words()?,
                     act,
                     sel,
                     n_slots,
@@ -709,7 +801,7 @@ impl Sel32<'_> {
             }
             DownEntry::Iq4nl => {
                 let d = IqDown {
-                    w,
+                    w: stack.words()?,
                     act,
                     sel,
                     n_slots,
@@ -739,8 +831,8 @@ impl<'a> Relu2Stacks<'a> {
         const DOWN: &str = "a resident routed down stack of a 32-value-block type the card leg runs (`kernels::card_sel32_runs`)";
         let [up, down] = names;
         Ok(Relu2Stacks {
-            up: LegStack::of(w, up, kernels::card_sel32_runs, UP)?,
-            down: LegStack::of(w, down, kernels::card_sel32_runs, DOWN)?,
+            up: LegStack::of(w, up, kernels::card_sel32_runs, |_| false, UP)?,
+            down: LegStack::of(w, down, kernels::card_sel32_runs, |_| false, DOWN)?,
         })
     }
 
@@ -749,7 +841,7 @@ impl<'a> Relu2Stacks<'a> {
     pub fn check(&self, n_card: usize, shape: LegShape) -> Result<(), GpuError> {
         let LegShape { n, ff, .. } = shape;
         for (st, rows, k) in [(&self.up, ff, n), (&self.down, n, ff)] {
-            if st.w.rows() != n_card * rows || st.k != k {
+            if st.rows() != n_card * rows || st.k != k {
                 return Err(GpuError::Tensor {
                     what: WHAT,
                     name: st.name.to_owned(),
@@ -1252,38 +1344,295 @@ pub(crate) mod tests {
                     gpu.take_fault().expect("the fault word").is_none(),
                     "{case}"
                 );
-                for (s, &place) in SEL[..slots].iter().enumerate() {
-                    let rows = s * N..(s + 1) * N;
-                    if place == HOST {
-                        assert!(
-                            got[rows.clone()].iter().all(|v| *v == SENT),
-                            "{case}: slot {s} (HOST) was written"
-                        );
-                    } else {
-                        assert!(
-                            got[rows.clone()]
-                                .iter()
-                                .all(|v| v.is_finite() && *v != SENT),
-                            "{case}: slot {s} (expert {place}) holds no finite row the run wrote"
-                        );
-                    }
-                    if let Some(r) = rows
-                        .clone()
-                        .find(|&r| got[r].to_bits() != want[r].to_bits())
-                    {
-                        panic!(
-                            "{case}: slot {s} row {}: leg {:#010x}, hand {:#010x}",
-                            r - rows.start,
-                            got[r].to_bits(),
-                            want[r].to_bits()
-                        );
-                    }
-                }
-                assert!(
-                    got[slots * N..].iter().all(|v| *v == SENT),
-                    "{case}: the leg wrote past its run's slots"
-                );
+                assert_hand_rows(&case, &got, &want);
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_gate_up_sums_fault_before_activation() {
+        use crate::fault::{Fault, FaultSite, LAYER_NONE};
+        use crate::iq_sel::IqGateUp;
+        use crate::kquant::{
+            EntryPlanes, GateUpAt, KquantTileKernels, TileGather, TileTable, TiledGateUpAct,
+        };
+        const K: usize = 256;
+        const ROWS: usize = 8;
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
+        let kernels = QuantSelKernels::load(gpu.context(), gpu.fault_word()).expect("kernels");
+        let tiles = KquantTileKernels::load(gpu.context(), gpu.fault_word()).expect("tiles");
+        let x = DeviceBuffer::from_host(stream, &[1e38f32; K]).expect("x");
+        let mut act = Q8Act::with_k(stream, 1, K).expect("act");
+        gpu.enqueue_quantize_q8_1(&x, &mut act).expect("quantize");
+        let sel = DeviceBuffer::from_host(stream, &[0u32]).expect("sel");
+        let start = DeviceBuffer::from_host(stream, &[0u32, 1]).expect("start");
+        let mut table_tiles =
+            DeviceBuffer::zeroed(stream, crate::q4k_sel::tile_cap(1, 1) + 1).expect("tiles");
+        gpu.q4k_sel()
+            .enqueue_grouped_tiles(stream, &start, 1, 1, sink, &mut table_tiles)
+            .expect("tile table");
+        let table = || TileTable {
+            order: &sel,
+            start: &start,
+            tiles: &table_tiles,
+            n_experts: 1,
+            n_slots: 1,
+        };
+        let mut planes = EntryPlanes::new(stream, 1, K).expect("planes");
+        tiles
+            .enqueue_card_gather(
+                stream,
+                &TileGather {
+                    x: &act,
+                    cols: 1,
+                    slots_per_col: 1,
+                    table: table(),
+                },
+                sink,
+                &mut planes,
+            )
+            .expect("gather");
+        assert_eq!(gpu.take_fault().expect("input fault"), None);
+        let mut failures = Vec::new();
+        for ty in [
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q8_0,
+            GgmlType::IQ2_XS,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ3_S,
+            GgmlType::IQ4_XS,
+        ] {
+            let mut bytes = stack_bytes(ty, ROWS, K, 42);
+            let bb = ty.type_size().expect("block bytes") as usize;
+            for block in bytes.chunks_exact_mut(bb) {
+                block[..2].copy_from_slice(&0x7bffu16.to_le_bytes());
+            }
+            let up = words_of(&bytes, ROWS);
+            let gate = vec![0u32; up.len()];
+            let wg = DeviceTensor::upload(stream, &gate, ROWS, gate.len() / ROWS).expect("gate");
+            let wu = DeviceTensor::upload(stream, &up, ROWS, up.len() / ROWS).expect("up");
+            let arena = DeviceBuffer::from_host(stream, &[gate, up].concat()).expect("arena");
+            let offs = DeviceBuffer::from_host(stream, &[0u64, (bytes.len() / 4) as u64, 0])
+                .expect("offsets");
+            let modes: &[&str] = match ty {
+                GgmlType::Q4_K => &["sel", "sel_gate", "arena", "tiles"],
+                GgmlType::Q5_K => &["sel", "arena", "tiles"],
+                _ => &["sel"],
+            };
+            for &mode in modes {
+                let (gate, up) = if mode == "sel_gate" {
+                    (&wu, &wg)
+                } else {
+                    (&wg, &wu)
+                };
+                let mut h = DeviceBuffer::zeroed(stream, ROWS).expect("h");
+                let rule = Act::SwigluClamp { limit: 7.0 };
+                let a = GateUpAct {
+                    wg: gate,
+                    wu: up,
+                    act: &act,
+                    sel: &sel,
+                    n_slots: 1,
+                    rows_per_expert: ROWS,
+                    slots_per_col: 1,
+                    rule,
+                };
+                match mode {
+                    "arena" => {
+                        let a = GateUpAt {
+                            arena: &arena,
+                            offs: &offs,
+                            act: &act,
+                            n_slots: 1,
+                            rows_per_expert: ROWS,
+                            slots_per_col: 1,
+                            rule,
+                        };
+                        match ty {
+                            GgmlType::Q4_K => {
+                                kernels.enqueue_gate_up_q4k_at(stream, &a, sink, &mut h)
+                            }
+                            _ => kernels.enqueue_gate_up_q5k_at(stream, &a, sink, &mut h),
+                        }
+                    }
+                    "tiles" => tiles.enqueue_gate_up_tiles(
+                        stream,
+                        ty,
+                        &TiledGateUpAct {
+                            wg: &wg,
+                            wu: &wu,
+                            act: &planes,
+                            table: table(),
+                            rows_per_expert: ROWS,
+                            rule,
+                        },
+                        sink,
+                        &mut h,
+                    ),
+                    _ => match ty {
+                        GgmlType::Q4_K => kernels.enqueue_gate_up_q4k(stream, &a, sink, &mut h),
+                        GgmlType::Q5_K => kernels.enqueue_gate_up_q5k(stream, &a, sink, &mut h),
+                        GgmlType::Q8_0 => kernels.enqueue_gate_up_q8_0(stream, &a, sink, &mut h),
+                        _ => kernels.enqueue_gate_up(
+                            stream,
+                            &IqGateUp {
+                                ty,
+                                wg: &wg,
+                                wu: &wu,
+                                act: &act,
+                                sel: &sel,
+                                n_slots: 1,
+                                rows_per_expert: ROWS,
+                                slots_per_col: 1,
+                                rule,
+                            },
+                            sink,
+                            &mut h,
+                        ),
+                    },
+                }
+                .expect("gate up");
+                let fault = gpu.take_fault().expect("fault");
+                let rows = h.to_host_vec(stream).expect("rows");
+                let ok = fault == Some(Fault::at(LAYER_NONE, FaultSite::F32Product))
+                    && rows.iter().all(|v| v.is_nan());
+                println!(
+                    "{ty:?} {mode}: fault={fault:?} nan={} {ok}",
+                    rows.iter().filter(|v| v.is_nan()).count()
+                );
+                if !ok {
+                    failures.push(format!("{ty:?} {mode}: {fault:?} {rows:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// An NVFP4 stack of `N_CARD` experts of `rows` rows of `k` values in its
+    /// planes, random codes under small UE4M3 scale bytes, and a scale an
+    /// expert that differs between experts, filed as derived weight `name`.
+    fn nvfp4_stack(gpu: &Gpu, w: &mut Weights, name: &str, rows: usize, k: usize, seed: u64) {
+        let mut state = seed;
+        let mut bytes = vec![0u8; N_CARD * rows * k / 64 * 36];
+        for b in bytes.chunks_exact_mut(36) {
+            for (i, v) in b.iter_mut().enumerate() {
+                let r = u8::try_from(next(&mut state) & 0xff).expect("a byte");
+                *v = if i < 4 { 0x30 | (r & 0x0f) } else { r };
+            }
+        }
+        let p = crate::mxfp4::repack::<crate::mxfp4::Nvfp4>(&bytes, N_CARD * rows, k)
+            .expect("the planes");
+        let scales: Vec<f32> = (0..N_CARD).map(|e| 0.75 + 0.125 * e as f32).collect();
+        let stream = gpu.stream();
+        let stack = DevWeight::Nvfp4Stack {
+            qs: DeviceTensor::upload(stream, &p.qs, N_CARD * rows, k / 8).expect("qs"),
+            e: DeviceTensor::upload(stream, &p.e, N_CARD * rows, k / 64).expect("e"),
+            scales: DeviceTensor::upload(stream, &scales, N_CARD, 1).expect("the scales"),
+            k,
+        };
+        w.insert_derived(name.to_owned(), stack)
+            .expect("a free derived name");
+    }
+
+    /// The leg's NVFP4 arms against the launches the table names, run by hand
+    /// on buffers of exactly the run's slots: the gate·up over a `Q8Act`, the
+    /// down over the 32-value form the buffers hold for it, for a run of every
+    /// token the buffers hold and of fewer. A slot the card serves holds a
+    /// finite value the run wrote, a host slot what it held, and the rows are
+    /// the hand launches' bit for bit; a stack the leg holds in planes is
+    /// refused by the relu² form by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_leg_runs_the_nvfp4_arms_as_their_sel_launches() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let leg = CardLeg::load(&gpu).expect("the leg");
+        let nv = Nvfp4SelKernels::load(gpu.context(), gpu.fault_word()).expect("the nvfp4 module");
+        let mut w = weights(&gpu, SHAPE, &[]);
+        let names = ["derived.gate_nv", "derived.up_nv", "derived.down_nv"];
+        nvfp4_stack(&gpu, &mut w, names[0], FF, N, 0x11);
+        nvfp4_stack(&gpu, &mut w, names[1], FF, N, 0x22);
+        nvfp4_stack(&gpu, &mut w, names[2], N, FF, 0x33);
+        let stacks = LegStacks::of(&w, names).expect("the stacks");
+        stacks.check(N_CARD, SHAPE).expect("the stacks' shape");
+        assert!(Relu2Stacks::of(&w, [names[1], names[2]]).is_err());
+        let host_normed: Vec<f32> = (0..CAP * N)
+            .map(|i| ((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
+        let sel = DeviceBuffer::from_host(stream, &SEL).expect("the places");
+        let rule = Act::SwigluClamp { limit: 7.0 };
+        let mut bufs =
+            LegBufs::for_down(stream, SHAPE, DownAct::Q8Blocks32).expect("the leg's buffers");
+        let plane = |name: &str| w.nvfp4_stack(WHAT, name).expect("a resident stack");
+        for m in [CAP, CAP - 1] {
+            let case = format!("NVFP4, {m} tokens");
+            let slots = m * SPC;
+            bufs.down
+                .copy_from_host(stream, &vec![SENT; CAP * SPC * N])
+                .expect("the sentinel");
+            let run = LegRun {
+                layer: 0,
+                stacks: &stacks,
+                normed: &normed,
+                m,
+                sel: &sel,
+                n_card: N_CARD,
+                rule,
+            };
+            leg.enqueue(&gpu, &mut bufs, &run, None)
+                .unwrap_or_else(|e| panic!("{case}: the leg: {e}"));
+
+            let mut act_x = Q8Act::with_tier_cols(stream, m, N).expect("act_x");
+            let mut h = DeviceBuffer::<f32>::zeroed(stream, slots * FF).expect("h");
+            let mut act_h = Q8Blocks32::with_slots(stream, FF, slots).expect("act_h");
+            let mut want =
+                DeviceBuffer::from_host(stream, &vec![SENT; slots * N]).expect("the rows");
+            let sink = gpu.layer_sink(0).expect("a sink");
+            gpu.enqueue_quantize_q8_1_cols(&normed, &mut act_x, m, 0)
+                .expect("q8_1");
+            let a = Nvfp4GateUp {
+                gate: plane(names[0]),
+                up: plane(names[1]),
+                act: &act_x,
+                sel: &sel,
+                n_slots: slots,
+                rows_per_expert: FF,
+                slots_per_col: SPC,
+                rule,
+            };
+            nv.enqueue_gate_up(stream, &a, sink, &mut h)
+                .unwrap_or_else(|e| panic!("{case}: the gate·up: {e}"));
+            let q = QuantSel {
+                x: &h,
+                cols: 0..slots,
+                sel: &sel,
+                n_card: N_CARD,
+            };
+            gpu.q5()
+                .enqueue_quantize_q8_sel(stream, &q, &mut act_h, sink)
+                .unwrap_or_else(|e| panic!("{case}: the quantizer: {e}"));
+            let d = Nvfp4Down {
+                w: plane(names[2]),
+                act: &act_h,
+                sel: &sel,
+                n_slots: slots,
+                rows_per_expert: N,
+            };
+            nv.enqueue_down(stream, &d, sink, &mut want)
+                .unwrap_or_else(|e| panic!("{case}: the down: {e}"));
+
+            let want = want.to_host_vec(stream).expect("the hand rows");
+            let got = bufs.down.to_host_vec(stream).expect("the leg's rows");
+            assert!(
+                gpu.take_fault().expect("the fault word").is_none(),
+                "{case}"
+            );
+            assert_hand_rows(&case, &got, &want);
         }
     }
 
@@ -1383,6 +1732,29 @@ pub(crate) mod tests {
             return Err("a card slot's rows are all zero");
         }
         Ok(())
+    }
+
+    fn assert_hand_rows(case: &str, got: &[f32], want: &[f32]) {
+        for (s, &place) in SEL[..want.len() / N].iter().enumerate() {
+            let rows = s * N..(s + 1) * N;
+            slot_state(&got[rows.clone()], place)
+                .unwrap_or_else(|why| panic!("{case}: slot {s} (place {place}): {why}"));
+            if let Some(r) = rows
+                .clone()
+                .find(|&r| got[r].to_bits() != want[r].to_bits())
+            {
+                panic!(
+                    "{case}: slot {s} row {}: leg {:#010x}, hand {:#010x}",
+                    r - rows.start,
+                    got[r].to_bits(),
+                    want[r].to_bits()
+                );
+            }
+        }
+        assert!(
+            got[want.len()..].iter().all(|v| *v == SENT),
+            "{case}: the leg wrote past its run's slots"
+        );
     }
 
     /// The down rows of a run of the first `m` tokens of `normed` against

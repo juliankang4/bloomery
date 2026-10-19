@@ -61,9 +61,9 @@ use bloomery_gpu::{FaultSink, FaultSite, col_sums, store_cols};
 use cuda_core::{CudaContext, IntoResult, sys};
 
 use super::*;
-use crate::experts::swiglu_clamp;
 use crate::hc::hc_mean_elem;
 use crate::span::{span, span_mut};
+use bloomery_gpu::kquant::act::{self, ACT_SWIGLU_CLAMP};
 
 const WHAT: &str = "FfnBatch";
 
@@ -241,7 +241,7 @@ mod ffn_batch_kernels {
     /// planes — the table's entries ([`ds41_card_gather`]) — through the
     /// m-column core `cores::q3k_row_dot`, whose column c is the one-column
     /// call on that column bit for bit, then the warp tree and
-    /// `swiglu_clamp` into `h[(j + c) · rows_per_expert + r]`: entry `j +
+    /// the checked SwiGLU into `h[(j + c) * rows_per_expert + r]`: entry `j +
     /// c`'s value, the step's gate·up value (`ds41_expert_gate_up`) for its
     /// slot and row. The blocks of one row tile are consecutive, so an
     /// expert's tiles run side by side on the same weight rows, each read
@@ -297,6 +297,7 @@ mod ffn_batch_kernels {
             n_sb,
             iters,
             limit,
+            fault,
             h,
         };
         // SAFETY: the launch contract is the work's and `tile_block`'s; the
@@ -657,8 +658,8 @@ mod ffn_batch_kernels {
 /// ([`ffn_batch_kernels::ds41_expert_gate_up_tiles`] under `tile_block`):
 /// warp `w`'s weight row `r` of the tile's expert in both stacks, dotted with
 /// columns `j .. j + m` of the gathered planes through the m-column core
-/// `cores::q3k_row_dot` and reduced with the warp tree; lane 0 stores
-/// `h[(j + c) · rows_per_expert + r] = swiglu_clamp(g, u, limit)`.
+/// `cores::q3k_row_dot` and reduced with the warp tree; lane 0 stores the
+/// checked SwiGLU ([`act::apply_checked`]) in `h[(j + c) * rows_per_expert + r]`.
 struct Q3GateUpTiles<'a> {
     wg: &'a [u32],
     wu: &'a [u32],
@@ -668,6 +669,7 @@ struct Q3GateUpTiles<'a> {
     n_sb: u32,
     iters: u32,
     limit: f32,
+    fault: FaultSink,
     h: DisjointSlice<'a, f32>,
 }
 
@@ -691,14 +693,14 @@ impl TileWork for Q3GateUpTiles<'_> {
         if lane == 0 {
             let limit = self.limit;
             let v = [
-                swiglu_clamp(g[0], u[0], limit),
-                swiglu_clamp(g[1], u[1], limit),
-                swiglu_clamp(g[2], u[2], limit),
-                swiglu_clamp(g[3], u[3], limit),
-                swiglu_clamp(g[4], u[4], limit),
-                swiglu_clamp(g[5], u[5], limit),
-                swiglu_clamp(g[6], u[6], limit),
-                swiglu_clamp(g[7], u[7], limit),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[0], u[0], self.fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[1], u[1], self.fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[2], u[2], self.fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[3], u[3], self.fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[4], u[4], self.fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[5], u[5], self.fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[6], u[6], self.fault),
+                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[7], u[7], self.fault),
             ];
             // SAFETY: values (j + c)·rpe + r for c < m are below n_slots·rpe
             // <= h.len(); a table entry sits in one tile, so lane 0 of this
@@ -2415,6 +2417,7 @@ impl FfnPiece {
                 u,
                 &b.act_x[m - 1],
                 c.limit_shared,
+                gpu.layer_sink(layer)?,
                 &mut b.sh_h,
             )?,
             (gate, up) => {
@@ -2427,6 +2430,7 @@ impl FfnPiece {
                         up,
                         &x,
                         c.limit_shared,
+                        gpu.layer_sink(layer)?,
                         &mut h,
                     )?;
                 }

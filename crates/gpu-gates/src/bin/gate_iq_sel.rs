@@ -66,7 +66,8 @@
 //! 6. **NaN `d`.** A NaN `d` block and an inf-`d` row (two super-blocks of
 //!    one row with identical bytes and opposite `d` signs: the row's inf
 //!    terms cancel into NaN) make exactly their rows NaN in both entries,
-//!    every other row bit-equal to the clean stack's, no fault.
+//!    every other row bit-equal to the clean stack's. Gate-ups raise
+//!    `F32Product`; the down leaves the fault word clear.
 //! 7. **Capture.** The three entries captured in one graph replay as three
 //!    nodes, bit-identical to the eager launches; a second eager launch
 //!    equals the first.
@@ -179,7 +180,7 @@ mod bench_arm;
 mod gate {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::GpuError;
-    use bloomery_gpu::fault::Fault;
+    use bloomery_gpu::fault::{Fault, FaultSite, LAYER_NONE};
     use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
     use bloomery_gpu::iq_sel::{IQ4_NL_BLOCK_BYTES, IqDown, IqGateUp, iq4_nl_row_dot32_host};
     use bloomery_gpu::kquant::act::{self, Act};
@@ -450,21 +451,7 @@ mod gate {
             .enqueue_quantize_q8(s, &xd, &mut act, gpu.unlabelled_sink())?;
         s.synchronize()?;
         let h = act.readback(s)?;
-        let kb = k / 32;
-        let q_stride = h.q.len() / cols;
-        let mut out = Vec::with_capacity(cols);
-        for c in 0..cols {
-            let mut xq = vec![0i8; k];
-            for b in 0..kb {
-                for i in 0..8 {
-                    let b8 = h.q[c * q_stride + 256 * (b >> 5) + 32 * i + (b & 31)].to_le_bytes();
-                    for v in 0..4 {
-                        xq[32 * b + 4 * i + v] = b8[v] as i8;
-                    }
-                }
-            }
-            out.push((xq, h.d8[c * kb..(c + 1) * kb].to_vec()));
-        }
+        let out = (0..cols).map(|c| h.column(c, k, cols)).collect();
         Ok((act, out))
     }
 
@@ -1529,7 +1516,9 @@ mod gate {
                 let (si, r) = (i / st.rpe, i % st.rpe);
                 poisoned(sel[si], r) || a.to_bits() == b.to_bits()
             });
-            let pass = nan_ok && others_same && fault.is_none();
+            let pass = nan_ok
+                && others_same
+                && fault == Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
             ok &= pass;
             println!(
                 "nan_gu[{}] exactly_poisoned_rows_nan={} others_are_clean={} fault=\"{}\" {}",

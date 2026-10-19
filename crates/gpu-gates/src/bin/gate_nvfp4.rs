@@ -21,11 +21,35 @@
 //!   (`act_rule::q8_1_codes`; the card's block scales are checked equal to
 //!   its bits first);
 //! - `bits`: equal bit for bit to the host transcription of the rule
-//!   (`lane_partial_host::<Nvfp4>` per lane, the warp butterfly, the multiply
+//!   (`lane_partial_host::<Nvfp4, 2>` per lane, the warp butterfly, the multiply
 //!   by the scale).
 //!
 //! A weight whose `.scale` sits in another shard of a split loads with that scale
 //! (`two_shards`).
+//!
+//! The routed pair (`bloomery_gpu::mxfp4_sel`: `Nvfp4SelKernels`) at
+//! Qwen3.8's widths, the gate and up stacks 640 rows of 2,560 an expert and
+//! the down 2,560 rows of 640, six experts in the file, each with a scale of
+//! its own in the stack's `.scale` `[6]`. The stacks load through
+//! `Weights::load_rows` on a plan row that puts experts 1, 3 and 4 on the
+//! card and the rest on another card, so the planes and the scales hold
+//! those three in that order:
+//! - `routed_load`: the resident scales are the file's of experts 1, 3, 4;
+//! - `routed_gate_up` over a `Q8Act` of two tokens, three slots each (one a
+//!   `HOST` slot): `bits`, `h` equal to the host rule's
+//!   (`lane_partial_host::<Nvfp4, 2>`, the butterfly, the expert's scale, then
+//!   `swiglu_clamp`) bit for bit; `band`, each host gate and up dot within
+//!   the band above of `scale · Σ w_j q_j d_j` in f64 (`dequant_row`); the
+//!   `HOST` slot's rows at the sentinel;
+//! - `routed_down` over the 32-value form (`Q8Blocks32`, its codes read
+//!   back) of six slots: the same `bits` (`lane_partial_host::<Nvfp4, 0>`)
+//!   and `band` (one `d` a 32-value block), the `HOST` slot at the sentinel;
+//! - `routed_ids`: an id past the card's three experts raises `ExpertId` in
+//!   each launch; the gate·up writes its rows NaN and the next clean launch
+//!   raises nothing, the down leaves its rows at the sentinel and writes the
+//!   other slots';
+//! - `routed_overflow`: a gate·up whose up sum overflows to NaN on finite
+//!   input raises `F32Product` and writes its rows NaN.
 //!
 //! And the load's refusals, each by name: a scale that is NaN, a tensor with
 //! no `.scale` beside it, and a scale byte UE4M3 does not define (0x7F).
@@ -40,10 +64,15 @@
 //! of the same sum. The bound is the worst case, every error aligned.
 //!
 //! `--bench-kernels` runs no case: it prices the gemv's launch at both shapes
-//! (`bench op=nvfp4_18560`, `bench op=nvfp4_4096`, one column) through
+//! (`bench op=nvfp4_18560`, `bench op=nvfp4_4096`, one column) and the routed
+//! pair at Qwen3.8's widths, one token of eight distinct experts a launch of
+//! a stack of 128, each launch of a burst the next eight: a launch's experts
+//! were last read 15 launches before, with 110 MB or more of other experts
+//! read since, more than a 96 MB L2 holds
+//! (`bench op=nvfp4_sel_gate_up`, `bench op=nvfp4_sel_down`), through
 //! `shared/bench.rs`'s burst and replay, timed by `tools/ref/time-gate.sh`
 //! under the lease; `--bench-arm <op>` keeps the arms whose name starts with
-//! `<op>` (`nvfp4` is both). Nothing there asserts on a result.
+//! `<op>` (`nvfp4` is all four). Nothing there asserts on a result.
 
 #[path = "shared/bench.rs"]
 mod bench_arm;
@@ -118,22 +147,101 @@ mod gate {
     /// One tensor of a synthetic file: name, dims, type, bytes.
     type Decl = (String, Vec<u64>, GgmlType, Vec<u8>);
 
-    /// An NVFP4 weight and its scale as two tensors of a file.
-    fn weight_decls(stem: &str, rows: usize, k: usize, bytes: Vec<u8>, scale: f32) -> [Decl; 2] {
+    /// An NVFP4 weight of `dims` and its scales (one, or one an expert of a
+    /// stack) as two tensors of a file.
+    fn weight_decls(stem: &str, dims: &[usize], bytes: Vec<u8>, scales: &[f32]) -> [Decl; 2] {
         [
             (
                 format!("{stem}.weight"),
-                vec![k as u64, rows as u64],
+                dims.iter().map(|&d| d as u64).collect(),
                 GgmlType::NVFP4,
                 bytes,
             ),
             (
                 format!("{stem}.scale"),
-                vec![1],
+                vec![scales.len() as u64],
                 GgmlType::F32,
-                scale.to_le_bytes().to_vec(),
+                scales.iter().flat_map(|v| v.to_le_bytes()).collect(),
             ),
         ]
+    }
+
+    /// Rows `rows` of `k` values of the NVFP4 `bytes`, each dequantized by
+    /// the host's port: the reference's weights.
+    fn dequant_rows(bytes: &[u8], rows: std::ops::Range<usize>, k: usize) -> Vec<Vec<f32>> {
+        let row_bytes = k / NV_BLOCK_VALUES * NV_BLOCK_BYTES;
+        par_map(rows.len(), |i| {
+            let r = rows.start + i;
+            let mut v = vec![0.0f32; k];
+            dequant_row(
+                GgmlType::NVFP4,
+                &bytes[r * row_bytes..][..row_bytes],
+                &mut v,
+            )
+            .unwrap_or_else(|e| panic!("row {r}: {e}"));
+            v
+        })
+    }
+
+    /// The host rule of one row against one column (codes `q`, a scale `d`
+    /// each `block` values: 128 for the q8_1 columns, 32 for the 32-value
+    /// form), times the tensor's `scale` (module doc): its value, the f64
+    /// reference `scale · Σ w_j q_j d` over the row's dequant `w`, and the
+    /// derived band about it.
+    fn host_rule(
+        row: &[u8],
+        w: &[f32],
+        (q, d): (&[i8], &[f32]),
+        block: usize,
+        scale: f32,
+    ) -> (f32, f64, f64) {
+        let lanes: [f32; 32] = std::array::from_fn(|lane| {
+            if block == 32 {
+                lane_partial_host::<Nvfp4, 0>(row, q, d, lane)
+            } else {
+                lane_partial_host::<Nvfp4, 2>(row, q, d, lane)
+            }
+        });
+        let host = butterfly(lanes) * scale;
+        let (mut sum, mut mag) = (0.0f64, 0.0f64);
+        for (sub, wv) in w.as_chunks::<16>().0.iter().enumerate() {
+            let t: f64 = wv
+                .iter()
+                .zip(&q[16 * sub..])
+                .map(|(&wj, &qj)| f64::from(wj) * f64::from(qj))
+                .sum::<f64>()
+                * f64::from(d[16 * sub / block]);
+            sum += t;
+            mag += t.abs();
+        }
+        let k = w.len();
+        let s = f64::from(scale);
+        let band = (gamma(2 * (k / 32).div_ceil(32) + 6) + (k / 16) as f64 * U64) * s.abs() * mag;
+        (host, s * sum, band)
+    }
+
+    /// One output against [`host_rule`]'s `(host, reference, band)`: whether
+    /// its bits are the host's, and its distance from the reference with the
+    /// band.
+    fn judge(got: f32, (host, reference, band): (f32, f64, f64)) -> (bool, f64, f64) {
+        (
+            got.to_bits() == host.to_bits(),
+            (f64::from(got) - reference).abs(),
+            band,
+        )
+    }
+
+    /// The `bits` and `band` clauses over each output's [`judge`]: how many
+    /// match the host's bits, whether all lie in their band, and the worst
+    /// distance over the band.
+    fn tally(per: &[(bool, f64, f64)]) -> (usize, bool, f64) {
+        let bits = per.iter().filter(|p| p.0).count();
+        let band = per.iter().all(|p| p.1 <= p.2);
+        let worst = per
+            .iter()
+            .map(|p| if p.2 > 0.0 { p.1 / p.2 } else { p.1 })
+            .fold(0.0f64, f64::max);
+        (bits, band, worst)
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -142,7 +250,10 @@ mod gate {
         let only = if bench {
             bloomery_gpu_gates::bench_arm(
                 std::env::args(),
-                SHAPES.iter().map(|s| format!("nvfp4_{}", s.rows)),
+                SHAPES
+                    .iter()
+                    .map(|s| format!("nvfp4_{}", s.rows))
+                    .chain(bench::ROUTED_ARMS.into_iter().map(str::to_owned)),
             )?
         } else {
             None
@@ -168,15 +279,33 @@ mod gate {
         for s in &SHAPES {
             let bytes = nvfp4_bytes(s.rows, s.k, s.seed);
             raw.push(bytes.clone());
-            decls.extend(weight_decls(s.stem, s.rows, s.k, bytes, s.scale));
+            decls.extend(weight_decls(s.stem, &[s.k, s.rows], bytes, &[s.scale]));
         }
         // The refusals' tensors: 8 rows of 256, scale 1 unless named.
         let small = |seed| nvfp4_bytes(8, 256, seed);
-        decls.extend(weight_decls("nan", 8, 256, small(7), f32::NAN));
-        decls.push(weight_decls("lone", 8, 256, small(8), 1.0)[0].clone());
+        decls.extend(weight_decls("nan", &[256, 8], small(7), &[f32::NAN]));
+        decls.push(weight_decls("lone", &[256, 8], small(8), &[1.0])[0].clone());
         let mut undefined = small(9);
         undefined[5 * NV_BLOCK_BYTES + 1] = 0x7F;
-        decls.extend(weight_decls("undef", 8, 256, undefined, 1.0));
+        decls.extend(weight_decls("undef", &[256, 8], undefined, &[1.0]));
+        for i in 0..6 {
+            let mut scales = [1.0; 6];
+            scales[i] = f32::NAN;
+            decls.extend(weight_decls(
+                &format!("expert_nan_{i}"),
+                &[256, 1, 6],
+                nvfp4_bytes(6, 256, 10),
+                &scales,
+            ));
+        }
+        for count in [5, 7] {
+            decls.extend(weight_decls(
+                &format!("expert_count_{count}"),
+                &[256, 1, 6],
+                nvfp4_bytes(6, 256, 10),
+                &vec![1.0; count],
+            ));
+        }
         write_gguf(&path, &[], &decls)?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let stream = gpu.stream();
@@ -192,13 +321,27 @@ mod gate {
                 "undef",
                 "row 1 block 1 sub-block 1: scale byte 0x7f is no UE4M3 scale",
             ),
-        ] {
+        ]
+        .map(|(stem, want)| (stem.to_string(), want.to_string()))
+        .into_iter()
+        .chain((0..6).map(|i| {
+            (
+                format!("expert_nan_{i}"),
+                format!("[{i}] is NaN, not a finite value"),
+            )
+        }))
+        .chain([5, 7].map(|n| {
+            (
+                format!("expert_count_{n}"),
+                "one f32 value an expert".into(),
+            )
+        })) {
             let name = format!("{stem}.weight");
             let got = match Weights::load_where(stream, &split, |n| n == name) {
                 Ok(_) => "loaded".to_string(),
                 Err(e) => e.to_string(),
             };
-            let pass = got.contains(want);
+            let pass = got.contains(&want);
             println!(
                 "nvfp4 clause=refusal tensor={name} want={want:?} got={got:?} {}",
                 verdict(pass)
@@ -206,6 +349,7 @@ mod gate {
             ok &= pass;
         }
         ok &= two_shards(gpu, dir)?;
+        ok &= routed::run(gpu, dir)?;
         Ok(ok)
     }
 
@@ -213,7 +357,7 @@ mod gate {
     /// the scale is found across the split, not in the weight's own shard.
     fn two_shards(gpu: &Gpu, dir: &Path) -> Result<bool, GateError> {
         const SCALE: f32 = 0.625;
-        let [weight, scale] = weight_decls("x2", 8, 256, nvfp4_bytes(8, 256, 11), SCALE);
+        let [weight, scale] = weight_decls("x2", &[256, 8], nvfp4_bytes(8, 256, 11), &[SCALE]);
         let keys = |no: u16| {
             vec![
                 ("split.no".to_string(), Value::U16(no)),
@@ -256,18 +400,7 @@ mod gate {
         let w = Weights::load_where(stream, split, |n| n == name)?;
         site::site(&w, "gate_nvfp4", &name, (rows, k), ty)?;
         let row_bytes = k / NV_BLOCK_VALUES * NV_BLOCK_BYTES;
-        // Each row dequantized by the host's port: the reference's weights.
-        let wf: Vec<Vec<f32>> = par_map(rows, |r| {
-            let mut v = vec![0.0f32; k];
-            dequant_row(
-                GgmlType::NVFP4,
-                &bytes[r * row_bytes..][..row_bytes],
-                &mut v,
-            )
-            .unwrap_or_else(|e| panic!("row {r}: {e}"));
-            v
-        });
-        let lane_terms = 2 * (k / 32).div_ceil(32);
+        let wf = dequant_rows(bytes, 0..rows, k);
         let mut ok = true;
         for (i, &m) in s.ms.iter().enumerate() {
             let mut rng = GateRng(s.seed ^ (0x1000 + i as u64));
@@ -300,37 +433,10 @@ mod gate {
                 let (c, r) = (at / rows, at % rows);
                 let (q, d) = &cols[c];
                 let row = &bytes[r * row_bytes..][..row_bytes];
-                let lanes: [f32; 32] =
-                    std::array::from_fn(|lane| lane_partial_host::<Nvfp4>(row, q, d, lane));
-                let host = butterfly(lanes) * s.scale;
-                let (mut sum, mut mag) = (0.0f64, 0.0f64);
-                for (sub, wv) in wf[r].as_chunks::<16>().0.iter().enumerate() {
-                    let t: f64 = wv
-                        .iter()
-                        .zip(&q[16 * sub..])
-                        .map(|(&wj, &qj)| f64::from(wj) * f64::from(qj))
-                        .sum::<f64>()
-                        * f64::from(d[16 * sub / Q8_1_BLOCK]);
-                    sum += t;
-                    mag += t.abs();
-                }
-                let scale = f64::from(s.scale);
-                let reference = scale * sum;
-                let band = (gamma(lane_terms + 6) + (k / 16) as f64 * U64) * scale.abs() * mag;
-                let got = y[at];
-                (
-                    got.to_bits() == host.to_bits(),
-                    (f64::from(got) - reference).abs(),
-                    band,
-                )
+                judge(y[at], host_rule(row, &wf[r], (q, d), Q8_1_BLOCK, s.scale))
             });
-            let bits = per.iter().all(|p| p.0);
-            let bits_n = per.iter().filter(|p| p.0).count();
-            let band_ok = per.iter().all(|p| p.1 <= p.2);
-            let worst = per
-                .iter()
-                .map(|p| if p.2 > 0.0 { p.1 / p.2 } else { p.1 })
-                .fold(0.0f64, f64::max);
+            let (bits_n, band_ok, worst) = tally(&per);
+            let bits = bits_n == per.len();
             let tag = format!("shape={} rows={rows} k={k} m={m}", s.stem);
             println!("nvfp4 clause=written {tag} {}", verdict(written));
             println!(
@@ -351,17 +457,568 @@ mod gate {
         Ok(ok)
     }
 
+    /// Qwen3.8's hidden width and routed width: the routed clauses' and the
+    /// routed bench arms' stacks.
+    const ROUTED_N: usize = 2560;
+    const ROUTED_FF: usize = 640;
+
+    /// The routed pair's clauses (module doc).
+    mod routed {
+        use super::{
+            ROUTED_FF, ROUTED_N, dequant_rows, host_rule, judge, nvfp4_bytes, tally, weight_decls,
+            write_gguf,
+        };
+        use bloomery_gpu::hybrid::HOST;
+        use bloomery_gpu::kquant::act::{Act, swiglu_clamp};
+        use bloomery_gpu::mxfp4::{NV_BLOCK_BYTES, NV_BLOCK_VALUES, Nvfp4, Planes, repack};
+        use bloomery_gpu::mxfp4_sel::{Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels, Nvfp4Stack};
+        use bloomery_gpu::q5::Q8Blocks32;
+        use bloomery_gpu::weights::Weights;
+        use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
+        use bloomery_gpu_gates::act_rule::{Q8_1_BLOCK, q8_1_codes};
+        use bloomery_gpu_gates::{GateError, GateRng, par_map, verdict};
+        use cuda_core::DeviceBuffer;
+        use gguf::Split;
+        use model::placement::{self, ExpertList, ModelTensor, ModelTensors, Role};
+        use std::path::Path;
+
+        /// Experts in the file.
+        const EXPERTS: usize = 6;
+        /// The experts the card holds, in its order; the rest are another card's.
+        const CARD: [u32; 3] = [1, 3, 4];
+        /// Slots a token.
+        const SPC: usize = 3;
+        /// Two tokens' places: every card expert, a duplicate and a host slot.
+        const SEL: [u32; 6] = [0, 2, HOST, 1, 0, 2];
+        /// The SwiGLU clamp, whose `expf` the host and the card round alike.
+        const LIMIT: f32 = 7.0;
+        /// What a slot the launch leaves alone still holds.
+        const SENT: f32 = 1.0e30;
+
+        /// A stack's part, rows and row width an expert, and seed.
+        const PARTS: [(&str, usize, usize, u64); 3] = [
+            ("gate", ROUTED_FF, ROUTED_N, 0x5eed_0101),
+            ("up", ROUTED_FF, ROUTED_N, 0x5eed_0102),
+            ("down", ROUTED_N, ROUTED_FF, 0x5eed_0103),
+        ];
+
+        /// A stack as the file holds it, and each card expert's rows
+        /// dequantized, by card place.
+        struct Stack {
+            bytes: Vec<u8>,
+            rows: usize,
+            k: usize,
+            scales: Vec<f32>,
+            w: Vec<Vec<Vec<f32>>>,
+        }
+
+        impl Stack {
+            /// Row `r` of the expert at card place `p` against one column,
+            /// by [`host_rule`] with the expert's scale.
+            fn rule(
+                &self,
+                p: u32,
+                r: usize,
+                col: (&[i8], &[f32]),
+                block: usize,
+            ) -> (f32, f64, f64) {
+                let e = CARD[p as usize] as usize;
+                let row_bytes = self.k / NV_BLOCK_VALUES * NV_BLOCK_BYTES;
+                let row = &self.bytes[(e * self.rows + r) * row_bytes..][..row_bytes];
+                host_rule(row, &self.w[p as usize][r], col, block, self.scales[e])
+            }
+        }
+
+        pub(super) fn run(gpu: &Gpu, dir: &Path) -> Result<bool, GateError> {
+            let stream = gpu.stream();
+            let mut decls = Vec::new();
+            let mut stacks = Vec::new();
+            for (i, &(part, rows, k, seed)) in PARTS.iter().enumerate() {
+                let bytes = nvfp4_bytes(EXPERTS * rows, k, seed);
+                let mut rng = GateRng(seed ^ 0x5ca1e);
+                let scales: Vec<f32> = (0..EXPERTS)
+                    .map(|_| rng.uni(0.004, 0.02) * (1 + i) as f32)
+                    .collect();
+                let stem = format!("blk.0.ffn_{part}_exps");
+                decls.extend(weight_decls(
+                    &stem,
+                    &[k, rows, EXPERTS],
+                    bytes.clone(),
+                    &scales,
+                ));
+                let w = CARD
+                    .iter()
+                    .map(|&e| dequant_rows(&bytes, e as usize * rows..(e as usize + 1) * rows, k))
+                    .collect();
+                stacks.push(Stack {
+                    bytes,
+                    rows,
+                    k,
+                    scales,
+                    w,
+                });
+            }
+            let path = dir.join("routed.gguf");
+            write_gguf(&path, &[], &decls)?;
+            let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+            let names: Vec<String> = PARTS
+                .iter()
+                .map(|(part, ..)| format!("blk.0.ffn_{part}_exps.weight"))
+                .collect();
+            let model = ModelTensors {
+                tensors: names
+                    .iter()
+                    .map(|name| {
+                        let (_, t) = split.find(name).ok_or(format!("{name} not in the file"))?;
+                        Ok(ModelTensor {
+                            name: name.clone(),
+                            shard: 0,
+                            layer: Some(0),
+                            role: Role::RoutedExperts,
+                            ty: t.ty,
+                            dims: t.dims.clone(),
+                            file_bytes: t.nbytes,
+                            gathered_rows: None,
+                        })
+                    })
+                    .collect::<Result<_, GateError>>()?,
+                layers: 1,
+                experts: EXPERTS as u64,
+                experts_used: 2,
+            };
+            let list = |ids: &[u32]| ExpertList::new(ids.to_vec(), EXPERTS as u64);
+            let rows = model
+                .tensors
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    placement::routed_row_on(
+                        i,
+                        t,
+                        0,
+                        vec![(0, list(&CARD)?), (1, list(&[0, 2, 5])?)],
+                        &model,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("routed rows: {e}"))?;
+            let w = Weights::load_rows(stream, &split, &model, &rows, 0)?;
+            let planes: Vec<_> = names
+                .iter()
+                .map(|n| w.nvfp4_stack("gate_nvfp4", n))
+                .collect::<Result<_, GpuError>>()?;
+            let mut ok = true;
+            for (n, (st, pl)) in names.iter().zip(stacks.iter().zip(&planes)) {
+                let got = pl.scales.buf().to_host_vec(stream)?;
+                let want: Vec<f32> = CARD.iter().map(|&e| st.scales[e as usize]).collect();
+                let pass = got.len() == want.len()
+                    && got
+                        .iter()
+                        .zip(&want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                println!(
+                    "nvfp4 clause=routed_load tensor={n} scales={got:?} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            let nv = Nvfp4SelKernels::load(gpu.context(), gpu.fault_word())?;
+            let sel = DeviceBuffer::from_host(stream, &SEL)?;
+            let rule = Act::SwigluClamp { limit: LIMIT };
+
+            // The gate·up over two tokens.
+            let m = SEL.len() / SPC;
+            let mut rng = GateRng(0x5eed_0201);
+            let x: Vec<f32> = (0..m * ROUTED_N).map(|_| rng.uni(-2.0, 2.0)).collect();
+            let x_dev = DeviceBuffer::from_host(stream, &x)?;
+            let mut act = Q8Act::with_k(stream, m, ROUTED_N)?;
+            gpu.enqueue_quantize_q8_1_layer(&x_dev, &mut act, 0)?;
+            let gate_up = |sel: &DeviceBuffer<u32>, n_slots: usize| {
+                let a = Nvfp4GateUp {
+                    gate: planes[0],
+                    up: planes[1],
+                    act: &act,
+                    sel,
+                    n_slots,
+                    rows_per_expert: ROUTED_FF,
+                    slots_per_col: SPC,
+                    rule,
+                };
+                let mut h = DeviceBuffer::from_host(stream, &vec![SENT; n_slots * ROUTED_FF])?;
+                nv.enqueue_gate_up(stream, &a, gpu.unlabelled_sink(), &mut h)?;
+                Ok::<_, GateError>((h.to_host_vec(stream)?, gpu.take_fault()?))
+            };
+            let (h, fault) = gate_up(&sel, SEL.len())?;
+            let cols: Vec<(Vec<i8>, Vec<f32>)> = (0..m)
+                .map(|c| q8_1_codes(&x[c * ROUTED_N..][..ROUTED_N]))
+                .collect();
+            let d8_card = act.d8().to_host_vec(stream)?;
+            let d8_same = cols.iter().enumerate().all(|(c, (_, d))| {
+                d.iter()
+                    .zip(&d8_card[c * 2 * (ROUTED_N / 256)..])
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            });
+            // The bits of the rule over the gate's and the up's host values,
+            // and of those two sums the one farther into its band.
+            let per: Vec<(bool, f64, f64)> = par_map(SEL.len() * ROUTED_FF, |at| {
+                let (s, r) = (at / ROUTED_FF, at % ROUTED_FF);
+                if SEL[s] == HOST {
+                    return (true, 0.0, 0.0);
+                }
+                let (q, d) = &cols[s / SPC];
+                let g = stacks[0].rule(SEL[s], r, (q, d), Q8_1_BLOCK);
+                let u = stacks[1].rule(SEL[s], r, (q, d), Q8_1_BLOCK);
+                let want = swiglu_clamp(g.0, u.0, LIMIT);
+                let (_, ge, gb) = judge(g.0, g);
+                let (_, ue, ub) = judge(u.0, u);
+                let (e, b) = if ge * ub >= ue * gb {
+                    (ge, gb)
+                } else {
+                    (ue, ub)
+                };
+                (h[at].to_bits() == want.to_bits(), e, b)
+            });
+            ok &= report(
+                "routed_gate_up",
+                d8_same && fault.is_none(),
+                &per,
+                &h,
+                ROUTED_FF,
+            );
+
+            // The down over six slots of the 32-value form.
+            let n_slots = SEL.len();
+            let hx: Vec<f32> = (0..n_slots * ROUTED_FF)
+                .map(|_| rng.uni(-3.0, 3.0))
+                .collect();
+            let hx_dev = DeviceBuffer::from_host(stream, &hx)?;
+            let mut act32 = Q8Blocks32::new(stream, ROUTED_FF, n_slots)?;
+            gpu.q5()
+                .enqueue_quantize_q8(stream, &hx_dev, &mut act32, gpu.unlabelled_sink())?;
+            let back = act32.readback(stream)?;
+            let cols32: Vec<_> = (0..n_slots)
+                .map(|c| back.column(c, ROUTED_FF, n_slots))
+                .collect();
+            let mut y_dev = DeviceBuffer::from_host(stream, &vec![SENT; n_slots * ROUTED_N])?;
+            let d = Nvfp4Down {
+                w: planes[2],
+                act: &act32,
+                sel: &sel,
+                n_slots,
+                rows_per_expert: ROUTED_N,
+            };
+            nv.enqueue_down(stream, &d, gpu.unlabelled_sink(), &mut y_dev)?;
+            let y = y_dev.to_host_vec(stream)?;
+            let fault = gpu.take_fault()?;
+            let per: Vec<(bool, f64, f64)> = par_map(n_slots * ROUTED_N, |at| {
+                let (s, r) = (at / ROUTED_N, at % ROUTED_N);
+                if SEL[s] == HOST {
+                    return (true, 0.0, 0.0);
+                }
+                let (q, d) = &cols32[s];
+                judge(y[at], stacks[2].rule(SEL[s], r, (q, d), 32))
+            });
+            ok &= report("routed_down", fault.is_none(), &per, &y, ROUTED_N);
+
+            // An id past the card's experts, one token.
+            let bad = DeviceBuffer::from_host(stream, &[0u32, CARD.len() as u32, 1])?;
+            let (h_bad, fault) = gate_up(&bad, SPC)?;
+            let named = fault.is_some_and(|f| {
+                GpuError::fault("gate_nvfp4", f)
+                    .to_string()
+                    .contains("expert_id")
+            });
+            let nan_rows = h_bad[ROUTED_FF..2 * ROUTED_FF].iter().all(|v| v.is_nan());
+            let (_, next) = gate_up(&bad, 1)?;
+            let pass = named && nan_rows && next.is_none();
+            println!(
+                "nvfp4 clause=routed_ids launch=gate_up fault_names_expert_id={named} \
+                 rows_nan={nan_rows} next_clean={} {}",
+                next.is_none(),
+                verdict(pass)
+            );
+            // The same places through the down: the bad slot's rows stay at
+            // the sentinel, the others are written.
+            let mut y_bad = DeviceBuffer::from_host(stream, &vec![SENT; SPC * ROUTED_N])?;
+            let d = Nvfp4Down {
+                w: planes[2],
+                act: &act32,
+                sel: &bad,
+                n_slots: SPC,
+                rows_per_expert: ROUTED_N,
+            };
+            nv.enqueue_down(stream, &d, gpu.unlabelled_sink(), &mut y_bad)?;
+            let y_bad = y_bad.to_host_vec(stream)?;
+            let fault = gpu.take_fault()?;
+            let down_named = fault.is_some_and(|f| {
+                GpuError::fault("gate_nvfp4", f)
+                    .to_string()
+                    .contains("expert_id")
+            });
+            let held = y_bad
+                .chunks(ROUTED_N)
+                .enumerate()
+                .all(|(s, rows)| (s == 1) == rows.iter().all(|v| *v == SENT));
+            let down_pass = down_named && held;
+            println!(
+                "nvfp4 clause=routed_ids launch=down fault_names_expert_id={down_named} \
+                 bad_slot_at_sentinel_others_written={held} {}",
+                verdict(down_pass)
+            );
+            let over = overflow(gpu, &nv)?;
+            Ok(ok && pass && down_pass && over)
+        }
+
+        /// The `routed_overflow` clause (module doc): one expert of eight rows
+        /// of 256 values against a column of 1e38. The gate rows are small
+        /// codes under scale byte 0x01; the up rows are +6 over their first
+        /// two blocks and −6 over the last two under scale byte 0x7e (448),
+        /// so lanes 0..4 sum to +inf, lanes 4..8 to −inf and the butterfly to
+        /// NaN, which the clamp alone would map to a finite value.
+        fn overflow(gpu: &Gpu, nv: &Nvfp4SelKernels) -> Result<bool, GateError> {
+            const K: usize = 256;
+            const ROWS: usize = 8;
+            let stream = gpu.stream();
+            let block = |scale: u8, codes: u8| {
+                let mut b = vec![scale; 4];
+                b.extend([codes; 32]);
+                b
+            };
+            let planes = |head: Vec<u8>, tail: Vec<u8>, scale: f32| {
+                let row = [head.as_slice(), &head, &tail, &tail].concat();
+                let Planes { qs, e } = repack::<Nvfp4>(&row.repeat(ROWS), ROWS, K)?;
+                Ok::<_, GateError>((
+                    DeviceTensor::upload(stream, &qs, ROWS, K / 8)?,
+                    DeviceTensor::upload(stream, &e, ROWS, K / NV_BLOCK_VALUES)?,
+                    DeviceTensor::upload(stream, &[scale], 1, 1)?,
+                ))
+            };
+            let (gq, ge, gs) = planes(block(0x01, 0x11), block(0x01, 0x11), 1.0e-37)?;
+            let (uq, ue, us) = planes(block(0x7e, 0x77), block(0x7e, 0xff), 1.0)?;
+            let x = DeviceBuffer::from_host(stream, &[1.0e38f32; K])?;
+            let mut act = Q8Act::with_k(stream, 1, K)?;
+            gpu.enqueue_quantize_q8_1_layer(&x, &mut act, 0)?;
+            let sel = DeviceBuffer::from_host(stream, &[0u32])?;
+            let a = Nvfp4GateUp {
+                gate: Nvfp4Stack {
+                    qs: &gq,
+                    e: &ge,
+                    scales: &gs,
+                },
+                up: Nvfp4Stack {
+                    qs: &uq,
+                    e: &ue,
+                    scales: &us,
+                },
+                act: &act,
+                sel: &sel,
+                n_slots: 1,
+                rows_per_expert: ROWS,
+                slots_per_col: 1,
+                rule: Act::SwigluClamp { limit: LIMIT },
+            };
+            let mut h = DeviceBuffer::from_host(stream, &[SENT; ROWS])?;
+            nv.enqueue_gate_up(stream, &a, gpu.unlabelled_sink(), &mut h)?;
+            let h = h.to_host_vec(stream)?;
+            let named = gpu.take_fault()?.is_some_and(|f| {
+                GpuError::fault("gate_nvfp4", f)
+                    .to_string()
+                    .contains("f32_product")
+            });
+            let nan = h.iter().all(|v| v.is_nan());
+            println!(
+                "nvfp4 clause=routed_overflow fault_names_f32_product={named} rows_nan={nan} {}",
+                verdict(named && nan)
+            );
+            Ok(named && nan)
+        }
+
+        /// Print one launch's clauses over its outputs `out`, `rows` a slot:
+        /// `clean` (no fault, and for the gate·up the card's block scales the
+        /// host's), each `HOST` slot's rows at the sentinel, and `bits` and
+        /// `band` over every card slot's [`judge`] in `per`.
+        fn report(
+            name: &str,
+            clean: bool,
+            per: &[(bool, f64, f64)],
+            out: &[f32],
+            rows: usize,
+        ) -> bool {
+            let host = |s: &usize| SEL[*s] == HOST;
+            let sentinel = (0..SEL.len())
+                .filter(host)
+                .all(|s| out[s * rows..][..rows].iter().all(|v| *v == SENT));
+            let card: Vec<_> = (0..SEL.len())
+                .filter(|s| !host(s))
+                .flat_map(|s| per[s * rows..][..rows].iter().copied())
+                .collect();
+            let (bits, band, worst) = tally(&card);
+            println!(
+                "nvfp4 clause={name} clean={clean} host_slots_sentinel={sentinel} {}",
+                verdict(clean && sentinel)
+            );
+            println!(
+                "nvfp4 clause={name} bits equal={bits}/{} {}",
+                card.len(),
+                verdict(bits == card.len())
+            );
+            println!(
+                "nvfp4 clause={name} band worst_err_over_band={worst:.3e} {}",
+                verdict(band)
+            );
+            clean && sentinel && bits == card.len() && band
+        }
+    }
+
     /// `--bench-kernels` (module doc): one column at each shape, the planes
     /// of [`nvfp4_bytes`] (every scale byte defined, so the repack takes them),
     /// the activation from `fill_pattern_f32`.
     mod bench {
-        use super::{SHAPES, nvfp4_bytes};
+        use super::{ROUTED_FF, ROUTED_N, SHAPES, nvfp4_bytes};
         use crate::bench_arm::{GREPS, N, ROUNDS, burst, fill_pattern_f32, print_arm, replay};
+        use bloomery_gpu::kquant::Act;
         use bloomery_gpu::mxfp4::{NV_BLOCK_BYTES, NV_BLOCK_VALUES, Nvfp4, Nvfp4Kernels};
         use bloomery_gpu::mxfp4::{Nvfp4Weight, Planes, repack};
+        use bloomery_gpu::mxfp4_sel::{Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels, Nvfp4Stack};
+        use bloomery_gpu::q5::Q8Blocks32;
         use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
         use bloomery_gpu_gates::GateError;
         use cuda_core::{CudaStream, DeviceBuffer};
+
+        pub(super) const ROUTED_ARMS: [&str; 2] = ["nvfp4_sel_gate_up", "nvfp4_sel_down"];
+
+        /// The experts in the stack, and the slots of a launch's one token.
+        const EXPERTS: usize = 128;
+        const SLOTS: usize = 8;
+
+        /// The planes and scales of a stack of [`EXPERTS`] of `rows` rows of
+        /// `k` values.
+        /// An expert stack's code plane, block-scale plane and per-expert scales.
+        type Stack = (DeviceTensor<u32>, DeviceTensor<u32>, DeviceTensor<f32>);
+
+        fn stack(
+            stream: &CudaStream,
+            rows: usize,
+            k: usize,
+            seed: u64,
+        ) -> Result<Stack, GateError> {
+            let all = EXPERTS * rows;
+            let Planes { qs, e } = repack::<Nvfp4>(&nvfp4_bytes(all, k, seed), all, k)?;
+            Ok((
+                DeviceTensor::upload(stream, &qs, all, k / 8)?,
+                DeviceTensor::upload(stream, &e, all, k / NV_BLOCK_VALUES)?,
+                DeviceTensor::upload(stream, &[0.01f32; EXPERTS], EXPERTS, 1)?,
+            ))
+        }
+
+        /// The routed arms (module doc). The bytes are a
+        /// launch's eight experts' planes, the activation's codes and scales,
+        /// and the outputs.
+        fn routed(gpu: &Gpu, only: Option<&str>) -> Result<(), GateError> {
+            let keep = |op: &str| only.is_none_or(|o| op.starts_with(o));
+            let [up_op, down_op] = ROUTED_ARMS;
+            if !keep(up_op) && !keep(down_op) {
+                return Ok(());
+            }
+            let stream = gpu.stream();
+            let nv = Nvfp4SelKernels::load(gpu.context(), gpu.fault_word())?;
+            // Launch `i` of a burst reads experts `8(i mod 16)..`.
+            let sels = (0..EXPERTS / SLOTS)
+                .map(|j| {
+                    let ids: Vec<u32> = (0..SLOTS).map(|s| (j * SLOTS + s) as u32).collect();
+                    DeviceBuffer::from_host(stream, &ids)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let plane_bytes =
+                |rows: usize, k: usize| SLOTS * rows * k / NV_BLOCK_VALUES * NV_BLOCK_BYTES;
+            if keep(up_op) {
+                let (gq, ge, gs) = stack(stream, ROUTED_FF, ROUTED_N, 0x5eed_0301)?;
+                let (uq, ue, us) = stack(stream, ROUTED_FF, ROUTED_N, 0x5eed_0302)?;
+                let x = DeviceBuffer::from_host(stream, &fill_pattern_f32(ROUTED_N))?;
+                let mut act = Q8Act::with_k(stream, 1, ROUTED_N)?;
+                gpu.enqueue_quantize_q8_1_layer(&x, &mut act, 0)?;
+                let mut h = DeviceBuffer::<f32>::zeroed(stream, SLOTS * ROUTED_FF)?;
+                let sink = gpu.unlabelled_sink();
+                let mut i = 0;
+                let mut enq = |st: &CudaStream| {
+                    let a = Nvfp4GateUp {
+                        gate: Nvfp4Stack {
+                            qs: &gq,
+                            e: &ge,
+                            scales: &gs,
+                        },
+                        up: Nvfp4Stack {
+                            qs: &uq,
+                            e: &ue,
+                            scales: &us,
+                        },
+                        act: &act,
+                        sel: &sels[i % sels.len()],
+                        n_slots: SLOTS,
+                        rows_per_expert: ROUTED_FF,
+                        slots_per_col: SLOTS,
+                        rule: Act::SiluMul,
+                    };
+                    i += 1;
+                    nv.enqueue_gate_up(st, &a, sink, &mut h)
+                };
+                let eager = burst(stream, &mut enq)?;
+                let g = gpu.capture(|st| (0..N).try_for_each(|_| enq(st)))?;
+                let graph = replay(stream, &g)?;
+                let bytes = (2 * plane_bytes(ROUTED_FF, ROUTED_N)
+                    + ROUTED_N
+                    + 4 * (ROUTED_N / 128)
+                    + 4 * SLOTS * ROUTED_FF) as u64;
+                print_arm(
+                    up_op,
+                    SLOTS * ROUTED_FF,
+                    bytes,
+                    g.node_count(),
+                    eager,
+                    graph,
+                );
+            }
+            if keep(down_op) {
+                let (dq, de, ds) = stack(stream, ROUTED_N, ROUTED_FF, 0x5eed_0303)?;
+                let hx = DeviceBuffer::from_host(stream, &fill_pattern_f32(SLOTS * ROUTED_FF))?;
+                let mut act = Q8Blocks32::new(stream, ROUTED_FF, SLOTS)?;
+                gpu.q5()
+                    .enqueue_quantize_q8(stream, &hx, &mut act, gpu.unlabelled_sink())?;
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, SLOTS * ROUTED_N)?;
+                let sink = gpu.unlabelled_sink();
+                let mut i = 0;
+                let mut enq = |st: &CudaStream| {
+                    let d = Nvfp4Down {
+                        w: Nvfp4Stack {
+                            qs: &dq,
+                            e: &de,
+                            scales: &ds,
+                        },
+                        act: &act,
+                        sel: &sels[i % sels.len()],
+                        n_slots: SLOTS,
+                        rows_per_expert: ROUTED_N,
+                    };
+                    i += 1;
+                    nv.enqueue_down(st, &d, sink, &mut y)
+                };
+                let eager = burst(stream, &mut enq)?;
+                let g = gpu.capture(|st| (0..N).try_for_each(|_| enq(st)))?;
+                let graph = replay(stream, &g)?;
+                let bytes = (plane_bytes(ROUTED_N, ROUTED_FF)
+                    + SLOTS * (ROUTED_FF + 4 * (ROUTED_FF / 32))
+                    + 4 * SLOTS * ROUTED_N) as u64;
+                print_arm(
+                    down_op,
+                    SLOTS * ROUTED_N,
+                    bytes,
+                    g.node_count(),
+                    eager,
+                    graph,
+                );
+            }
+            Ok(())
+        }
 
         pub fn run(gpu: &Gpu, only: Option<&str>) -> Result<(), GateError> {
             println!("bench n_per_burst={N} rounds={ROUNDS} graph_launches_per_round={GREPS}");
@@ -396,7 +1053,7 @@ mod gate {
                         as u64;
                 print_arm(&op, rows, bytes, g.node_count(), eager, graph);
             }
-            Ok(())
+            routed(gpu, only)
         }
     }
 }

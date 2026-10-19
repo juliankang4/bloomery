@@ -311,20 +311,15 @@ impl Q80SelKernels {
                 ),
             ));
         }
-        if n_slots == 0 || a.act.m() < n_slots || a.sel.len() < n_slots || y.len() < n_slots * rpe {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{n_slots} slots (at least one): an activation column a slot (act.m() {} >= \
-                     n_slots), an id a slot (sel.len() {}), y.len() {} >= n_slots*rows_per_expert = {}",
-                    a.act.m(),
-                    a.sel.len(),
-                    y.len(),
-                    n_slots * rpe
-                ),
-            ));
-        }
-        let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
+        let slot_rows = crate::kquant::sel::check_down_slots(
+            what,
+            n_slots,
+            rpe,
+            a.act.m(),
+            a.sel.len(),
+            y.len(),
+        )?;
+        let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
         let prep = self
             .module
             .prepare_q8_0_gemv_sel32(LaunchConfig1D::new(grid, THREADS, 0))?;

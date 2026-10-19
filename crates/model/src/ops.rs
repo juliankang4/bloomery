@@ -1627,11 +1627,19 @@ enum Dest<'o> {
 }
 
 /// `silu(gate) · up` into `out`, clamped when the pair carries a limit — the
-/// one call every gated combine makes, on a claimant or on the caller.
+/// one call every gated combine makes, on a claimant or on the caller. A NaN
+/// or an infinity in `gate` or `up` that the clamp would write as a finite
+/// value is refused by name after the combine, which reads it in the same pass;
+/// without the clamp it stays non-finite and the quantizer refuses it.
 fn swiglu_into(gate: &[f32], up: &[f32], limit: Option<f32>, out: &mut [f32]) {
     match limit {
         None => qdot::swiglu(gate, up, out),
-        Some(limit) => qdot::swiglu_clamp(gate, up, limit, out),
+        Some(limit) => {
+            if !qdot::swiglu_clamp(gate, up, limit, out) {
+                let bad = gate.iter().chain(up).find(|v| !v.is_finite());
+                panic!("swiglu: non-finite gate or up sum {bad:?}");
+            }
+        }
     }
 }
 

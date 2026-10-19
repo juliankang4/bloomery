@@ -406,6 +406,7 @@ pub fn enqueue_block(
             w.resident(BLOCK, up)?,
             x,
             blk.limit,
+            gpu.layer_sink(blk.layer)?,
             h,
         )?;
         if !blk.plan.down.kquant() {
@@ -497,6 +498,7 @@ pub fn enqueue_block_cols(
                 x,
                 cols,
                 blk.limit,
+                gpu.layer_sink(blk.layer)?,
                 h,
             )?;
             w.q8_gemv_mcol(gpu, BLOCK, down, h, cols, y)

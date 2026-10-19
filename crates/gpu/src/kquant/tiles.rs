@@ -58,7 +58,7 @@ const _: () = assert!(TILE_COLS == 8);
 /// [`tile_block`]): warp `w`'s weight row `r` of the tile's expert in both
 /// stacks, dotted with columns `j .. j + m` of the gathered planes through
 /// [`row_dot`] and reduced with the warp tree; lane 0 stores `h[(j + c) ·
-/// rows_per_expert + r] = act::apply(act, limit, g, u)`. Its launch
+/// rows_per_expert + r]` through [`super::act::apply_checked`]. Its launch
 /// contract: both stacks hold `n_experts · rows_per_expert` rows of
 /// `D::WORDS · n_sb` words, the planes hold `n_slots` columns, `h.len() >=
 /// n_slots · rows_per_expert`; `iters = ceil(n_sb / 4)`.
@@ -73,6 +73,7 @@ struct GateUpTiles<'a, D> {
     iters: u32,
     act: u32,
     limit: f32,
+    fault: FaultSink,
     h: DisjointSlice<'a, f32>,
     format: PhantomData<D>,
 }
@@ -100,14 +101,14 @@ impl<D: SbDecode> TileWork for GateUpTiles<'_, D> {
         if lane == 0 {
             let (act, limit) = (self.act, self.limit);
             let v = [
-                super::act::apply(act, limit, g[0], u[0]),
-                super::act::apply(act, limit, g[1], u[1]),
-                super::act::apply(act, limit, g[2], u[2]),
-                super::act::apply(act, limit, g[3], u[3]),
-                super::act::apply(act, limit, g[4], u[4]),
-                super::act::apply(act, limit, g[5], u[5]),
-                super::act::apply(act, limit, g[6], u[6]),
-                super::act::apply(act, limit, g[7], u[7]),
+                super::act::apply_checked(act, limit, g[0], u[0], self.fault),
+                super::act::apply_checked(act, limit, g[1], u[1], self.fault),
+                super::act::apply_checked(act, limit, g[2], u[2], self.fault),
+                super::act::apply_checked(act, limit, g[3], u[3], self.fault),
+                super::act::apply_checked(act, limit, g[4], u[4], self.fault),
+                super::act::apply_checked(act, limit, g[5], u[5], self.fault),
+                super::act::apply_checked(act, limit, g[6], u[6], self.fault),
+                super::act::apply_checked(act, limit, g[7], u[7], self.fault),
             ];
             // SAFETY: values (j + c)·rpe + r for c < m are below n_slots·rpe
             // <= h.len(); a table entry sits in one tile, so lane 0 of this
@@ -445,6 +446,7 @@ mod kquant_tile_kernels {
             iters,
             act,
             limit,
+            fault,
             h,
             format: PhantomData,
         };
@@ -513,6 +515,7 @@ mod kquant_tile_kernels {
             iters,
             act,
             limit,
+            fault,
             h,
             format: PhantomData,
         };

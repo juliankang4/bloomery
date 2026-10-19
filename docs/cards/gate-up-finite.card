@@ -1,0 +1,18 @@
+# Prediction: two finite checks follow each gate/up dot reduction. Qwen3's
+# affected kernels keep their register and spill counts, with no added launch
+# or finite-path memory access. The small throughput band is a hypothesis.
+# Quiet-machine evidence: vmstat samples show 96-100% idle, no blocked tasks
+# or swap I/O, and I/O PSI is zero despite a persistent load average near 1.6.
+kind: noninf
+question: Does the shared finite-sum guard preserve Qwen3 Q4_K_M decode throughput?
+term: whole-model Qwen3-30B-A3B Q4_K_M tok/s, N=32, warm=8, initial depth 6, ctx 256, GB10
+unit: %
+predict: -0.5..0.1 %
+rounds: 14
+condition: One exclusive GB10 lease, seven ABBA cycles (main/head/head/main), identical model and prompt,
+  default levers, 32 generated tokens and eight warm steps per arm. Before the lease, 30 seconds
+  have CPU idle at least 95%, blocked tasks zero and swap I/O zero. Real card and Xid witnesses
+  bracket each arm. Finish within ten minutes.
+decide-in: Keep the guard only if the non-inferiority verdict passes and no slowdown is resolved beyond noise.
+decide-below: Trace the slower path, fix its cause and measure again before keeping the change.
+decide-above: Check arm identity, clocks and the critical path before attributing the result to the guard.

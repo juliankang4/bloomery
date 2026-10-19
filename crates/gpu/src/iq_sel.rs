@@ -15,8 +15,8 @@
 //!   thread row, eight rows a 256-thread block; thread row `n = slot ·
 //!   rows_per_expert + r` dots weight row `sel[slot] · rows_per_expert + r`
 //!   of the gate stack and of the up stack with activation column `slot /
-//!   slots_per_col` of a [`Q8Act`] and stores `h[n] = act::apply(act, limit,
-//!   g, u)` from lane 0. Each row's dot is `iq.rs`'s rule exactly — the same
+//!   slots_per_col` of a [`Q8Act`] and stores the checked activation
+//!   ([`act::apply_checked`]) in `h[n]` from lane 0. Each row's dot is `iq.rs`'s rule exactly — the same
 //!   lane split, grid words, integer factors and fused multiply-adds as the
 //!   plane kernels — so a row's `g` equals `iq3_xxs_rows` /
 //!   `iq4_xs_rows` over `IqFormat::repack` of the same row, bit for bit;
@@ -382,7 +382,8 @@ impl RawSb for Iq4Xs {
 /// `n = slot · rows_per_expert + r` dots weight row `sel[slot] ·
 /// rows_per_expert + r` of both stacks with activation column `slot /
 /// slots_per_col` — each dot `iq.rs`'s lane rule over the raw blocks — and
-/// stores `h[n] = act::apply(act, limit, g, u)` from lane 0.
+/// stores the checked activation ([`act::apply_checked`]) in `h[n]` from
+/// lane 0.
 ///
 /// The caller keeps the entry's launch contract over its `n_slots` slots:
 /// both stacks hold `D::BB`-byte super-block streams of `n_experts ·
@@ -474,7 +475,7 @@ pub(crate) fn gate_up_sel_body<D: RawSb<Tab = ()>>(
     if lane == 0 {
         // SAFETY: row < n_slots · rows_per_expert <= h.len() by this fn's
         // contract; only lane 0 of the warp writes h[row].
-        unsafe { *h.get_unchecked_mut(row) = act::apply(act, limit, g, u) };
+        unsafe { *h.get_unchecked_mut(row) = act::apply_checked(act, limit, g, u, fault) };
     }
 }
 
@@ -956,27 +957,19 @@ impl QuantSelKernels {
                 ),
             ));
         }
-        if n_slots == 0
-            || spc == 0
-            || n_slots > m * spc
-            || a.sel.len() < n_slots
-            || h.len() < n_slots * rpe
-        {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{n_slots} slots (at least one) at {spc} a column (at least one) over {m} \
-                     columns, sel.len() {}, h.len() {} >= n_slots*rows_per_expert = {}",
-                    a.sel.len(),
-                    h.len(),
-                    n_slots * rpe
-                ),
-            ));
-        }
+        let slot_rows = crate::kquant::sel::check_gate_up_slots(
+            what,
+            n_slots,
+            rpe,
+            m,
+            spc,
+            a.sel.len(),
+            h.len(),
+        )?;
         let n_grp = n_sb.div_ceil(4);
         // The bodies divide thread rows in u32.
-        launch_u32(what, "n_slots · rows_per_expert", n_slots * rpe)?;
-        let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
+        launch_u32(what, "n_slots * rows_per_expert", slot_rows)?;
+        let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
         let (act, limit) = a.rule.code();
         let launch = RawGateUpLaunch {
             wg: a.wg.buf(),
@@ -1167,22 +1160,17 @@ impl QuantSelKernels {
                 ),
             ));
         }
-        if n_slots == 0 || a.act.m() < n_slots || a.sel.len() < n_slots || y.len() < n_slots * rpe {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{n_slots} slots (at least one): an activation column a slot (act.m() {} >= \
-                     n_slots), an id a slot (sel.len() {}), y.len() {} >= n_slots*rows_per_expert = {}",
-                    a.act.m(),
-                    a.sel.len(),
-                    y.len(),
-                    n_slots * rpe
-                ),
-            ));
-        }
-        // The bodies divide thread rows in u32.
-        launch_u32(what, "n_slots · rows_per_expert", n_slots * rpe)?;
-        let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
+        let slot_rows = crate::kquant::sel::check_down_slots(
+            what,
+            n_slots,
+            rpe,
+            a.act.m(),
+            a.sel.len(),
+            y.len(),
+        )?;
+        // The body divides thread rows in u32.
+        launch_u32(what, "n_slots * rows_per_expert", slot_rows)?;
+        let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
         let prep = self
             .hand
             .prepare_iq4_nl_gemv_sel32(LaunchConfig1D::new(grid, THREADS, 0))?;

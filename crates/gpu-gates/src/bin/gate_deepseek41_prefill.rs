@@ -1850,6 +1850,7 @@ mod gate {
                 n_slots: N_USED,
                 rows_per_expert: ff,
                 limit: 0.0,
+                fault: gpu.unlabelled_sink(),
             };
             experts.enqueue_expert_gate_up(stream, &a, &mut ht)?;
             by_slot.extend(ht.to_host_vec(stream)?);

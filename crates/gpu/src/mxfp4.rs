@@ -56,7 +56,8 @@
 //!   f)` with `d_s = ue4m3(d[s]) / 2` — a 4-bit significand times a 15-bit
 //!   integer, so `d_s · s_s` is exact and each sub-block rounds once;
 //! - `f` starts at 0, `d_x` is the scale of the 128-value block holding the
-//!   unit, and the caller sums the 32 lane values with the warp butterfly
+//!   unit (of the unit's own 32 values in the 32-value form,
+//!   `crate::q5::Q8Blocks32`), and the caller sums the 32 lane values with the warp butterfly
 //!   (`warp::reduce_sum_f32`); NVFP4's gemv then multiplies by the tensor's
 //!   scale.
 //!
@@ -449,26 +450,30 @@ pub(crate) fn lane_partial_file(
 }
 
 /// Lane `lane`'s partial sums of one row of format `F` in the card layout
-/// against `M` q8_1 columns, the module doc's rule: each unit's codes and
+/// against `M` q8 columns, the module doc's rule: each unit's codes and
 /// scales are loaded and decoded once and dotted with every column whose bit
-/// is set in `mask`. Column `c` reads its q8_1 words from `q0 + c · q_col`
-/// and its scales from `d0 + c · d_col`; columns `M..8` and columns outside
-/// `mask` stay 0.0.
+/// is set in `mask`. Column `c` reads its q8 words from `q0 + c · q_col`
+/// and its scales from `d0 + c · d_col`, unit `u`'s at `u >> D_SHIFT`: 2 for
+/// a `Q8Act` column (one scale a 128-value block), 0 for a
+/// `crate::q5::Q8Blocks32` column (one a unit); both lay a unit's eight
+/// words at `256 · (u >> 5) + 32 · i + (u & 31)`. Columns `M..8` and columns
+/// outside `mask` stay 0.0.
 ///
 /// # Safety
 ///
-/// `n_units` is the row's 32-value units, a multiple of 4; `qs` holds at
-/// least `(row + 1) · n_units` vectors and `e` at least the word
-/// `F::scale_word((row + 1) · n_units − 1)`; for every column `c < M`,
-/// `q.len() >= q0 + c · q_col + 256 · ceil(n_units / 32)` and `d8.len() >=
-/// d0 + c · d_col + n_units / 4`; `lane < 32`; every scale byte of the row
-/// passes `F::scale_ok` (the repack's check).
+/// `n_units` is the row's 32-value units, a multiple of `1 << D_SHIFT` and of
+/// the units an `e` word covers; `qs` holds at least `(row + 1) · n_units`
+/// vectors and `e` at least the word `F::scale_word((row + 1) · n_units −
+/// 1)`; for every column `c < M`, `q.len() >= q0 + c · q_col + 256 ·
+/// ceil(n_units / 32)` and `d8.len() >= d0 + c · d_col + (n_units >>
+/// D_SHIFT)`; `lane < 32`; every scale byte of the row passes `F::scale_ok`
+/// (the repack's check).
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub unsafe fn lane_partials<const M: usize, F: Fp4>(
+pub unsafe fn lane_partials<const M: usize, F: Fp4, const D_SHIFT: usize>(
     qs: &[U32x4],
     e: &[u32],
     row: usize,
@@ -485,6 +490,7 @@ pub unsafe fn lane_partials<const M: usize, F: Fp4>(
     const {
         assert!(M > 0);
         assert!(M <= 8);
+        assert!(D_SHIFT == 0 || D_SHIFT == 2);
     };
     let mut f = [0.0f32; 8];
     let blk0 = row * n_units;
@@ -506,8 +512,9 @@ pub unsafe fn lane_partials<const M: usize, F: Fp4>(
                     let qb = q0 + $c * q_col + slot;
                     // SAFETY: slot + 224 < 256·ceil(n_units/32) for b <
                     // n_units, so the eight words qb + 32i are inside column
-                    // $c's words, and scale d0 + $c·d_col + b/4 inside its
-                    // scales, both inside q and d8 by this fn's contract.
+                    // $c's words, and scale d0 + $c·d_col + (b >> D_SHIFT)
+                    // inside its scales, both inside q and d8 by this fn's
+                    // contract.
                     let (x, dx) = unsafe {
                         (
                             [
@@ -520,7 +527,7 @@ pub unsafe fn lane_partials<const M: usize, F: Fp4>(
                                 *q.get_unchecked(qb + 192),
                                 *q.get_unchecked(qb + 224),
                             ],
-                            *d8.get_unchecked(d0 + $c * d_col + (b >> 2)),
+                            *d8.get_unchecked(d0 + $c * d_col + (b >> D_SHIFT)),
                         )
                     };
                     f[$c] = F::fma(&dec, &x, dx, f[$c]);
@@ -556,16 +563,21 @@ pub fn block_sum_host(blk: &[u8; BLOCK_BYTES], xq: &[i8; BLOCK_VALUES]) -> i32 {
 }
 
 /// Lane `lane`'s partial of one row of format `F` on the host, the module
-/// doc's rule ([`Fp4::unit_host`] per unit): `row` the row's file bytes, `xq`
-/// the column's int8 codes in value order (the row's values), `d8` its
-/// 128-value block scales.
+/// doc's rule ([`Fp4::unit_host`] per unit) and [`lane_partials`]' column:
+/// `row` the row's file bytes, `xq` the column's int8 codes in value order
+/// (the row's values), `d8` its scales, unit `u`'s at `u >> D_SHIFT`.
 #[must_use]
-pub fn lane_partial_host<F: Fp4>(row: &[u8], xq: &[i8], d8: &[f32], lane: usize) -> f32 {
+pub fn lane_partial_host<F: Fp4, const D_SHIFT: usize>(
+    row: &[u8],
+    xq: &[i8],
+    d8: &[f32],
+    lane: usize,
+) -> f32 {
     let n_units = row.len() / F::BLOCK_BYTES * (F::BLOCK_VALUES / UNIT_VALUES);
     let mut f = 0.0f32;
     let mut u = lane;
     while u < n_units {
-        f = F::unit_host(row, u, &xq[UNIT_VALUES * u..], d8[u / 4], f);
+        f = F::unit_host(row, u, &xq[UNIT_VALUES * u..], d8[u >> D_SHIFT], f);
         u += 32;
     }
     f
@@ -707,7 +719,7 @@ mod nvfp4_kernels {
         // c·256·iters and 2·n_sb = n_units/4 scales at c·2·n_sb (the q, d8
         // and iters bounds); lane < 32; the repack took every scale byte.
         let f = unsafe {
-            lane_partials::<8, Nvfp4>(
+            lane_partials::<8, Nvfp4, 2>(
                 qv,
                 e,
                 row,

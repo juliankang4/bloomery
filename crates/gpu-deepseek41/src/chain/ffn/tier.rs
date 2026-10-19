@@ -877,6 +877,7 @@ impl TierExperts for Ds41Tier {
             n_slots: N_USED,
             rows_per_expert: self.ff,
             limit,
+            fault: gpu.layer_sink(layer)?,
         };
         self.experts
             .enqueue_expert_gate_up(stream, &args, &mut self.h)?;

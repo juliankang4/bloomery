@@ -1407,6 +1407,25 @@ pub struct Q8Blocks32Host {
     pub d8: Vec<f32>,
 }
 
+impl Q8Blocks32Host {
+    /// Column `c` of a form of `cols` columns of `k` values: its codes in
+    /// value order and its scale a 32-value block.
+    pub fn column(&self, c: usize, k: usize, cols: usize) -> (Vec<i8>, Vec<f32>) {
+        let kb = k / 32;
+        let q_stride = self.q.len() / cols;
+        let mut q = vec![0i8; k];
+        for b in 0..kb {
+            for i in 0..8 {
+                let word = self.q[c * q_stride + 256 * (b >> 5) + 32 * i + (b & 31)];
+                for (v, byte) in word.to_le_bytes().into_iter().enumerate() {
+                    q[32 * b + 4 * i + v] = byte as i8;
+                }
+            }
+        }
+        (q, self.d8[c * kb..(c + 1) * kb].to_vec())
+    }
+}
+
 /// The bytes of one gguf Q5_0 block: f16 `d`, the high-bit word `qh` at
 /// byte 2, the 16 nibble bytes `qs` at byte 6.
 const Q5_0_BLOCK_BYTES: usize = 22;

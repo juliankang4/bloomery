@@ -30,8 +30,10 @@
 //! stack as the file's blocks in the [`crate::placement::CardFormat::KQuant`]
 //! word stream; `q5_0_gemv_sel` and the Q5_0 dense site
 //! ([`SiteEntry::Q5_0`]) read the packed
-//! [`crate::placement::CardFormat::Q5_0`] layout, and the Q8_0 dense, head
-//! and embedding entries read [`crate::placement::CardFormat::Q8_0Planes`].
+//! [`crate::placement::CardFormat::Q5_0`] layout, the Q8_0 dense, head
+//! and embedding entries read [`crate::placement::CardFormat::Q8_0Planes`],
+//! and the NVFP4 entries read [`crate::placement::CardFormat::Nvfp4Planes`]
+//! (a routed stack's with one tensor scale an expert).
 //! Every type a row names has a card layout:
 //! [`crate::placement::CardFormat::of`] gives one, or
 //! [`crate::placement::CardFormat::holds`] names the type for `KQuant`.
@@ -102,6 +104,9 @@ pub enum GateUpEntry {
     /// `Mxfp4SelKernels::enqueue_gate_up` (`mxfp4_gate_up_sel`, the file's
     /// 17-byte `block_mxfp4` stream) in `crates/gpu/src/mxfp4_sel.rs`.
     Mxfp4,
+    /// `Nvfp4SelKernels::enqueue_gate_up` (`nvfp4_gate_up_sel`, the two
+    /// planes and a tensor scale an expert) in `crates/gpu/src/mxfp4_sel.rs`.
+    Nvfp4,
 }
 
 /// A common card down `_sel` entry: slot `s` writes the rows of expert
@@ -147,6 +152,9 @@ pub enum DownEntry {
     /// `Mxfp4SelKernels::enqueue_down` (`mxfp4_gemv_sel`, the file's 17-byte
     /// `block_mxfp4` stream) in `crates/gpu/src/mxfp4_sel.rs`.
     Mxfp4,
+    /// `Nvfp4SelKernels::enqueue_down` (`nvfp4_gemv_sel32`, the two planes
+    /// and a tensor scale an expert) in `crates/gpu/src/mxfp4_sel.rs`.
+    Nvfp4,
 }
 
 /// The activation form a down `_sel` reads.
@@ -308,6 +316,7 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         GgmlType::IQ3_S => Some(GateUpEntry::Iq3s),
         GgmlType::IQ4_XS => Some(GateUpEntry::Iq4xs),
         GgmlType::MXFP4 => Some(GateUpEntry::Mxfp4),
+        GgmlType::NVFP4 => Some(GateUpEntry::Nvfp4),
         GgmlType::F32
         | GgmlType::F16
         | GgmlType::Q4_0
@@ -334,7 +343,6 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GgmlType::Q1_0
         | GgmlType::Q8_1
         | GgmlType::Q8_K
-        | GgmlType::NVFP4
         | GgmlType::F8E4M3_ROWS
         | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
@@ -354,6 +362,7 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         GgmlType::Q8_0 => Some((DownEntry::Q8_0, DownAct::Q8Blocks32)),
         GgmlType::IQ4_NL => Some((DownEntry::Iq4nl, DownAct::Q8Blocks32)),
         GgmlType::MXFP4 => Some((DownEntry::Mxfp4, DownAct::Q8Act)),
+        GgmlType::NVFP4 => Some((DownEntry::Nvfp4, DownAct::Q8Blocks32)),
         GgmlType::IQ2_XS => Some((DownEntry::Iq2xs, DownAct::Q8Act)),
         GgmlType::IQ3_XXS => Some((DownEntry::Iq3xxs, DownAct::Q8Act)),
         GgmlType::IQ3_S => Some((DownEntry::Iq3s, DownAct::Q8Act)),
@@ -380,7 +389,6 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         | GgmlType::Q1_0
         | GgmlType::Q8_1
         | GgmlType::Q8_K
-        | GgmlType::NVFP4
         | GgmlType::F8E4M3_ROWS
         | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
@@ -582,10 +590,11 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
 }
 
 /// Whether the common card leg (`crates/gpu/src/card_leg.rs`) launches the
-/// gate·up entry of a routed gate or up stack of type `ty`: the table's
-/// [`gate_up`] row, for the entries whose launchers read a `Q8Act` of more
-/// columns than a run uses. The Q8_0 row has a launcher of that shape and no
-/// arm in the leg yet.
+/// gate·up entry of a routed gate or up stack of type `ty` in the file's
+/// blocks ([`crate::placement::CardFormat::KQuant`]): the table's [`gate_up`]
+/// row, for the entries whose launchers read a `Q8Act` of more columns than a
+/// run uses. The Q8_0 row has a launcher of that shape and no arm in the leg
+/// yet. A stack in its planes is [`card_planes_runs`]'.
 #[must_use]
 pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
     matches!(
@@ -603,7 +612,7 @@ pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
 }
 
 /// Whether the common card leg launches the down entry of a routed down stack
-/// of type `ty`: the table's [`down`] row, for the entries whose launchers take
+/// of type `ty` in the file's blocks: the table's [`down`] row, for the entries whose launchers take
 /// an activation of more columns than a run uses, with the form the leg
 /// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, MXFP4,
 /// IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS) or the 32-value [`DownAct::Q8Blocks32`] (Q5_1,
@@ -651,6 +660,17 @@ pub const fn card_sel32_runs(ty: GgmlType) -> bool {
 #[must_use]
 pub const fn card_runs(ty: GgmlType) -> bool {
     card_gate_up_runs(ty) && card_down_runs(ty)
+}
+
+/// Whether the common card leg runs a routed stack of `ty` in its planes
+/// ([`crate::placement::CardFormat::Nvfp4Planes`], a tensor scale an expert)
+/// in every role: NVFP4, whose gate·up reads a `Q8Act` and whose down reads
+/// the 32-value [`DownAct::Q8Blocks32`]. Its own rule beside [`card_runs`],
+/// whose stacks are the file's blocks.
+#[must_use]
+pub const fn card_planes_runs(ty: GgmlType) -> bool {
+    matches!(gate_up(ty), Some(GateUpEntry::Nvfp4))
+        && matches!(down(ty), Some((DownEntry::Nvfp4, DownAct::Q8Blocks32)))
 }
 
 #[cfg(test)]
@@ -778,6 +798,9 @@ mod tests {
     // PIN(2026-10-12): the gate·up, down and activation-form pairs and the leg's
     // run sets gain IQ3_S (`iq3_s_gate_up_sel`, `iq3_s_gemv_sel`); every other
     // pair is unchanged.
+    // PIN(2026-10-19): the gate·up, down, activation-form and up pairs gain
+    // NVFP4 (`nvfp4_gate_up_sel`, `nvfp4_gemv_sel32` over its planes); the
+    // file-block run sets (`card_runs` and its parts) are unchanged.
     #[test]
     fn gate_up_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -787,6 +810,7 @@ mod tests {
                 (GgmlType::Q4_K, GateUpEntry::Q4k),
                 (GgmlType::Q5_K, GateUpEntry::Q5k),
                 (GgmlType::MXFP4, GateUpEntry::Mxfp4),
+                (GgmlType::NVFP4, GateUpEntry::Nvfp4),
                 (GgmlType::IQ2_XS, GateUpEntry::Iq2xs),
                 (GgmlType::IQ3_XXS, GateUpEntry::Iq3xxs),
                 (GgmlType::IQ3_S, GateUpEntry::Iq3s),
@@ -811,6 +835,7 @@ mod tests {
                 (GgmlType::Q5_K, DownEntry::Q5k),
                 (GgmlType::Q6_K, DownEntry::Q6k),
                 (GgmlType::MXFP4, DownEntry::Mxfp4),
+                (GgmlType::NVFP4, DownEntry::Nvfp4),
                 (GgmlType::IQ2_XS, DownEntry::Iq2xs),
                 (GgmlType::IQ3_XXS, DownEntry::Iq3xxs),
                 (GgmlType::IQ4_NL, DownEntry::Iq4nl),
@@ -838,6 +863,7 @@ mod tests {
                 (GgmlType::Q5_K, DownAct::Q8Act),
                 (GgmlType::Q6_K, DownAct::Q8Act),
                 (GgmlType::MXFP4, DownAct::Q8Act),
+                (GgmlType::NVFP4, DownAct::Q8Blocks32),
                 (GgmlType::IQ2_XS, DownAct::Q8Act),
                 (GgmlType::IQ3_XXS, DownAct::Q8Act),
                 (GgmlType::IQ4_NL, DownAct::Q8Blocks32),
@@ -857,6 +883,7 @@ mod tests {
                 (GgmlType::Q5_0, DownEntry::Q5_0),
                 (GgmlType::Q5_1, DownEntry::Q5_1),
                 (GgmlType::Q8_0, DownEntry::Q8_0),
+                (GgmlType::NVFP4, DownEntry::Nvfp4),
                 (GgmlType::IQ4_NL, DownEntry::Iq4nl),
             ]
         );
@@ -873,6 +900,19 @@ mod tests {
             assert!(card_down_runs(ty), "{ty:?}");
         }
         assert!(up(GgmlType::Q5_0).is_some() && !card_sel32_runs(GgmlType::Q5_0));
+    }
+
+    /// The leg runs NVFP4 from its planes and no other type; no type runs
+    /// both from the file's blocks and from planes.
+    #[test]
+    fn card_planes_runs_admits_exactly_nvfp4() {
+        let runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_planes_runs(ty)).collect();
+        assert_eq!(runs, [GgmlType::NVFP4]);
+        assert_eq!(
+            CardFormat::of(GgmlType::NVFP4),
+            Some(CardFormat::Nvfp4Planes)
+        );
+        assert!(!card_runs(GgmlType::NVFP4) && !card_sel32_runs(GgmlType::NVFP4));
     }
 
     #[test]
