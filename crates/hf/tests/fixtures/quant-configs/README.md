@@ -1,0 +1,20 @@
+# Quantization configs
+
+`config.json` and, for ModelOpt exports, `hf_quant_config.json` of ten quantized checkpoints, gzipped, for `crates/hf/src/quant_config.rs`. Each file is named `<owner>__<repo>__<file>.gz` and is the file at the revision below, unchanged except where noted.
+
+| checkpoint | revision | producer, scheme |
+|---|---|---|
+| `nvidia/GLM-5.3-Flash-NVFP4` | `da920bb0b9f4a06727223a349e55468e38352348` | ModelOpt NVFP4 |
+| `nvidia/Qwen3.8-Flash-Next-NVFP4` | `fc694b54fb0174e0913e6adf86691ef85a4ead47` | ModelOpt MIXED_PRECISION: NVFP4, FP8, FP8_BLOCK_SCALES |
+| `nvidia/GLM-5.3-Flash-FP4-Local` | `76348ddb2be2e35e39ecfc00e75dc07703f4f3d5` | ModelOpt MIXED_PRECISION with MXFP8 (refused) |
+| `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB` | `c6cc2e8ffa353403213d6b9b18aaf8eb684d705a` | ModelOpt MIXED_PRECISION with Q8_0 and IQ2_XXS (refused); cut, see below |
+| `nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8` | `3fe6dab75665a93884214ad4b1b95cf02717d081` | ModelOpt FP8 |
+| `zai-org/GLM-5.3-Flash` | `46a050bec13002ad29ee795c16e61cf4fa3c4a9c` | fp8, 128x128 blocks |
+| `Qwen/Qwen3.8-Flash-Next-FP8` | `236dfdf285828023ca3bcd3f37366c58a3469b13` | fp8, 128x128 blocks |
+| `deepseek-ai/DeepSeek-V4.1-Flash` | `314113f8a7dadb388215396ba5fbee2c610a04d6` | fp8, 32x32 blocks, MXFP4 experts |
+| `openbmb/MiniCPM-V-4.7-35B-A3B-FP8` | `25f6715c91b8e528d45532d4a3cbcb206c59fb47` | compressed-tensors FP8 per channel |
+| `openbmb/MiniCPM-V-4.7-35B-A3B-int4` | `1fe0fee8ba1e05a3180fb306b05ccc4a75cc4c86` | compressed-tensors pack-quantized int4, group 128 |
+
+Bolt's two files list 27,921 modules (15 MB); they are cut to the first module of each algorithm (`quantized_layers`) and the first group (`config_groups`), the rest unchanged.
+
+`../checkpoint-headers/glm-5.3-flash-nvfp4-layers-0-3.tensors.json.gz` is the dtype and shape of every tensor of `nvidia/GLM-5.3-Flash-NVFP4` layers 0 and 3 and every unlayered `model.language_model.` tensor and `lm_head.weight`, gathered from all 33 shard headers.

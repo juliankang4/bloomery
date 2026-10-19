@@ -25,12 +25,14 @@
 //! from, when the caller's predicate says the set can run it
 //! ([`fetch::Draft`]); a repo holding no file of the name is fetched as it is.
 //!
-//! The other files of a repo are read by [`safetensors`] (a draft's weights, Clef's head) and
+//! The other files of a repo are read by [`safetensors`] (a draft's weights, Clef's head, a model
+//! folder), [`quant_config`] (a checkpoint's quantization config, one format a tensor) and
 //! [`dspark`] (a DSpark draft's `config.json` read into the runtime's shape).
 
 pub mod card;
 pub mod dspark;
 pub mod fetch;
+pub mod quant_config;
 pub mod safetensors;
 pub mod sentence_transformers;
 pub mod source;

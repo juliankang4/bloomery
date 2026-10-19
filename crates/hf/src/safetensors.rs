@@ -63,7 +63,9 @@ pub enum Dtype {
 }
 
 impl Dtype {
-    fn of(name: &str) -> Option<Dtype> {
+    /// The dtype a safetensors header spells `name`, or `None` for one this reader does not know.
+    #[must_use]
+    pub fn of(name: &str) -> Option<Dtype> {
         match name {
             "BF16" => Some(Dtype::Bf16),
             "F16" => Some(Dtype::F16),
