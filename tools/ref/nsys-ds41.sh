@@ -532,6 +532,7 @@ FIX
   mkdir -p "$T/tools/ref" "$T/crates/stub" "$T/target/release" "$T/bin" || return $?
   cp "$ref/nsys-ds41.sh" "$ref/timing-card.sh" "$ref/lease.sh" \
     "$ref/lease-probe.sh" "$ref/dspark-path.sh" "$T/tools/ref/" || return $?
+  cp "$ref/../gate-bound.sh" "$T/tools/" || return $?
   # shellcheck source=tools/ref/depth-stub-cards.sh
   ( trap - RETURN; STUB_CARDS_FILE_ONLY=; . "$ref/depth-stub-cards.sh" ) || return $?
   echo 'lease_take() { echo "[stub] lease taken"; exit 42; }' >> "$T/tools/ref/lease.sh" || return 1
