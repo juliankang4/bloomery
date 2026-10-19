@@ -35,7 +35,9 @@ set -uo pipefail
 # `bash tools/lds-scan.sh --self-test` (check-recipes runs it, on the Mac): the scan over a fixture binary
 # whose extractor, objcopy, ptxas and cuobjdump are stubs on PATH — two modules, an entry with a device
 # function after it, a SASS listing with every counted width and an LDSM that is no LDS — against rows
-# counted by hand; then a filter that matches nothing, a cuobjdump that fails and a third argument.
+# counted by hand; then a filter that matches nothing, a cuobjdump that fails and a third argument; then with
+# the md5sum and wc stand-ins of tools/ref/read-stubs.sh first on PATH, an entry's PTX or SASS line count that
+# fails to read fails the scan by name with no row.
 self_test() {
   local t n=0 bad=0 out rc self
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -94,7 +96,7 @@ PTX
         /*0080*/                   LDSM.16.M88.4 R12, [R0] ;
 SASS
   printf '%s\n' '		Function : up_down' '        /*0010*/                   LDG.E R2, [R2.64] ;' > "$t/fix/up_down.sass"
-  scan() { (cd "$t/tree" && env -u BLOOMERY_ARCH ${SCAN_ARCH:+"BLOOMERY_ARCH=$SCAN_ARCH"} PATH="$t/bin:$PATH" FIX="$t/fix" LDS_SCAN_PTXAS="$t/bin/ptxas" LDS_SCAN_CUOBJDUMP="$t/bin/cuobjdump" \
+  scan() { (cd "$t/tree" && env -u BLOOMERY_ARCH ${SCAN_ARCH:+"BLOOMERY_ARCH=$SCAN_ARCH"} PATH="${SCAN_STUBS:+$t/stubs:}$t/bin:$PATH" FIX="${SCAN_FIX:-$t/fix}" LDS_SCAN_PTXAS="$t/bin/ptxas" LDS_SCAN_CUOBJDUMP="$t/bin/cuobjdump" \
     LDS_SCAN_EXTRACT="$t/bin/oxart_ptx" bash "$self" "$@") > "$t/out" 2>&1; }
   # case_ <name> <want rc> <want output, whole>
   case_() {
@@ -135,6 +137,26 @@ $mix"
   rc=0; SCAN_ARCH=sm121 scan gate_x mix || rc=$?
   case_ arch-refused 64 "lds-scan.sh: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: sm_86), got 'sm121'"
   SCAN_ARCH=
+  # The stand-in wc counts 7 for every read and fails on a text holding the word `fail-wc`: in fix-wc, a line of it
+  # closes mod1 (inside up_down's body) and up_mix_4x320's SASS listing.
+  mkdir "$t/stubs"
+  # shellcheck source=tools/ref/read-stubs.sh
+  source "${self%/*}/ref/read-stubs.sh"
+  read_stubs "$t/stubs"
+  cp -R "$t/fix" "$t/fix-wc"
+  echo fail-wc >> "$t/fix-wc/mod1.ptx"
+  echo fail-wc >> "$t/fix-wc/up_mix_4x320.sass"
+  local seven=${mix/lines=15/lines=7}
+  rc=0; SCAN_STUBS=1 scan gate_x mix || rc=$?
+  case_ read-stubs-pass 0 "$banner entries=7 filter=mix
+${seven/sass lines=9/sass lines=7}"
+  rc=0; SCAN_STUBS=1 SCAN_FIX=$t/fix-wc scan gate_x mix || rc=$?
+  case_ sass-count-unread 1 "$banner entries=7 filter=mix
+lds-scan bin=target/release/gate_x sass-lines-unread=up_mix_4x320 scan=failed"
+  rc=0; SCAN_STUBS=1 SCAN_FIX=$t/fix-wc scan gate_x down || rc=$?
+  case_ ptx-count-unread 1 "$banner entries=7 filter=down
+lds-scan bin=target/release/gate_x lines-unread=up_down scan=failed"
+  SCAN_STUBS= SCAN_FIX=
   echo "lds-scan: self-test $([ "$bad" = 0 ] && echo ok || echo FAIL) ($n cases, $bad failed)"
   [ "$bad" = 0 ]
 }
@@ -193,7 +215,7 @@ if [ -n "$FILTER" ]; then
 else
   cp "$TMP/entries" "$TMP/match"
 fi
-NENT=$(wc -l < "$TMP/match" | tr -d ' ')
+NENT=$(wc -l < "$TMP/match" | tr -d ' ') || fail entries=unread
 VER=$("$PTXAS" --version 2> /dev/null | sed -n 's/.*, V\([0-9][0-9.]*\)$/\1/p')
 echo "lds-scan bin=$BIN ptxas=$PTXAS ptxas-version=${VER:-unknown} arch=$ARCH modules=$NMOD entries=$NENT${FILTER:+ filter=$FILTER}"
 if [ "$NENT" = 0 ]; then
@@ -206,14 +228,14 @@ while read -r mod entry; do
     $0 ~ "\\.entry[ \t]+" e "[ \t(]" || $0 ~ "\\.entry[ \t]+" e "$" { p = 1; print; next }
     p && /\.(entry|func)[ \t]/ { p = 0 }
     p' "$TMP/mod$mod.ptx" > "$TMP/e.ptx"
-  lines=$(wc -l < "$TMP/e.ptx" | tr -d ' ')
+  lines=$(wc -l < "$TMP/e.ptx" | tr -d ' ') || fail "lines-unread=$entry"
   [ "$lines" -gt 0 ] || fail "body=none($entry)"
   if [ ! -f "$TMP/mod$mod.cubin" ]; then
     "$PTXAS" -arch="$ARCH" "$TMP/mod$mod.ptx" -o "$TMP/mod$mod.cubin" 2> "$TMP/mod$mod.err" ||
       { echo "lds-scan: ptxas failed on mod$mod: $(head -1 "$TMP/mod$mod.err")" >&2; fail "ptxas-failed=mod$mod"; }
   fi
   "$CUOBJDUMP" -sass -fun "$entry" "$TMP/mod$mod.cubin" > "$TMP/e.sass" || fail "cuobjdump-failed=$entry"
-  slines=$(wc -l < "$TMP/e.sass" | tr -d ' ')
+  slines=$(wc -l < "$TMP/e.sass" | tr -d ' ') || fail "sass-lines-unread=$entry"
   grep -qE -- "Function : $entry\$" "$TMP/e.sass" || fail "sass=none($entry)"
   ROW="lds $entry lines=$lines"
   add ld.shared '\bld\.shared\.' "$TMP/e.ptx"
