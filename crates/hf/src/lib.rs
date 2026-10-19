@@ -26,12 +26,14 @@
 //! ([`fetch::Draft`]); a repo holding no file of the name is fetched as it is.
 //!
 //! The other files of a repo are read by [`safetensors`] (a draft's weights, Clef's head, a model
-//! folder), [`quant_config`] (a checkpoint's quantization config, one format a tensor) and
-//! [`dspark`] (a DSpark draft's `config.json` read into the runtime's shape).
+//! folder), [`quant_config`] (a checkpoint's quantization config, one format a tensor),
+//! [`modelopt`] (a ModelOpt checkpoint's NVFP4 weights into GGUF's NVFP4 block) and [`dspark`] (a
+//! DSpark draft's `config.json` read into the runtime's shape).
 
 pub mod card;
 pub mod dspark;
 pub mod fetch;
+pub mod modelopt;
 pub mod quant_config;
 pub mod safetensors;
 pub mod sentence_transformers;

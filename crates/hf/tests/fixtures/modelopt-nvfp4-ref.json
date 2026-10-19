@@ -1,0 +1,32 @@
+{
+ "source": "nvidia/Qwen3.8-Flash-Next-NVFP4@fc694b54fb0174e0913e6adf86691ef85a4ead47 model-00001-of-00010.safetensors rows 0..4; synthetic",
+ "tensors": {
+  "model.language_model.layers.0.mlp.experts.0.gate_proj": {
+   "scale": 6.612142169615254e-05,
+   "rows": [
+    "74df0ecc8348b8d557d2da83e2f147a3fd250c83d857b835a5a301fa39b54ec8",
+    "4e42049aad15e3048eb5df1de478a2ffd98bceff80f7e02fa3129dd5ef2fa5be",
+    "8a85251197136880a053cc11cc9ba940a0f95e69ac127f1db8247a2ac0ea59a1",
+    "f83c830690871900777b49c5693728ad55036467020afd68f6a86bf46e611e39"
+   ]
+  },
+  "model.language_model.layers.0.mlp.experts.1.gate_proj": {
+   "scale": 0.00010172526526730508,
+   "rows": [
+    "d9094de4db3cd77725ed2d492c23d132cbeab98195a59ff6e522202fc8ac311c",
+    "e5c82b41b235852f9230d97c4e918cf32fd25152cca9ac34eaab9de240ecd9f8",
+    "754c010c405570b2a6b7d5f70206e700d90b96519afd0d5f64daca0b91f36591",
+    "858794cca363a6fca2fd45d5703222b0fffe2e24273ae34352e18337f449977b"
+   ]
+  },
+  "synthetic": {
+   "scale": 0.37119999527931213,
+   "rows": [
+    "044ca4fe22e98b7460b986ea98ac90bae2ef566ca3be84fdb65a4a7a7e2b0697",
+    "af2de85b0004edb5cd47878b6d25dfc55321022dadc49033b523d64c1a0acdd3",
+    "d9c648f54d24f215ece9eb7d88f3efca28c84f8e762f71163371ee8cfb500284",
+    "c188c57caeba0e2c71a4c4b0ec13f3656da2a3e88838e61b68d183ac4677254b"
+   ]
+  }
+ }
+}

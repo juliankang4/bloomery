@@ -626,8 +626,9 @@ mod tests {
         assert!(matches!(st.raw("none"), Err(Error::Missing(n)) if n == "none"));
     }
 
-    /// Rows of a ModelOpt NVFP4 shard under their own header entries: a U8 weight and
-    /// an F8_E4M3 scale read as stored bytes; the f32 read refuses both by name.
+    /// Rows of a ModelOpt NVFP4 shard under their own header entries (the fixture's
+    /// `modelopt_nvfp4.py slice`): a U8 weight and an F8_E4M3 scale open and read as their
+    /// stored bytes, and the f32 read refuses both by name.
     #[test]
     fn a_modelopt_shard_slice_opens_with_u8_and_f8_e4m3_held_raw() {
         let st = Safetensors::parse(
