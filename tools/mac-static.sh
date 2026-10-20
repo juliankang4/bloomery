@@ -46,7 +46,7 @@
 # Exit: the first red step's rc, or 0. 64: an argument this script does not take. 69: no cpu count (getconf, sysctl and
 # nproc all fail), or results that cannot be cleared, created or removed (named; a run that already ended red keeps its rc). A step
 # whose rc file is missing or empty (killed before its wrapper ran, or a result that could not be written) is red, named `no rc`,
-# never 0. Steps' full output and their rc/wall land in target/mac-static/<step>.{log,rc,wall} (--checks: a run directory under
+# never 0. Steps' full output and their rc/wall land in target/mac-static/run.XXXXXX/<step>.{log,rc,wall} (--checks: a run directory under
 # target/mac-static/checks/, whose red logs come back whole on stderr); the cargo lane's steps also write the mac-check logs
 # (target/mac-check-*.log) as they always did.
 #
@@ -417,33 +417,38 @@ self_test() {
   unset CHECK_MEET CHECK_LIVE CHECK_SEEN
   rm -rf "$cd_"
 
-  # a --checks run's results are its own. The fixture tree holds a copy of this script beside fixture checks (HERE is where the script
-  # lies), so the real entry runs: its mktemp and its trap. Run 1's model-tax is red and ends at once, its second check holds on a
-  # release file; run 2 (--no-base: model-tax green) runs whole while run 1 holds, then the release lets run 1 read its results. One
-  # directory for both lets run 2 clear run 1's red rc and write its own 0 over it: run 1 ends green.
-  local fx p1 rc1 rc2
-  fx=$(mktemp -d)
-  mkdir "$fx/tools" "$fx/sync"
-  cp "$HERE/tools/mac-static.sh" "$fx/tools/mac-static.sh"
-  printf '#!/usr/bin/env bash\n[ "$#" = 1 ] || exit 7\n' > "$fx/tools/check-model-tax.sh"
-  # shellcheck disable=SC2016 # the check's own shell expands them
-  printf '#!/usr/bin/env bash\n[ "$CHECK_ROLE" != slow ] || { n=0; until [ -e "$CHECK_SYNC/release" ]; do n=$((n + 1)); [ "$n" -le 600 ] || exit 9; sleep 0.1; done; }\n' > "$fx/tools/check-zlate.sh"
-  rc1=0; rc2=0
-  CHECK_SYNC=$fx/sync CHECK_ROLE=slow bash "$fx/tools/mac-static.sh" --checks > "$fx/out1" 2>&1 & p1=$!
-  k=0
-  until [ "$(cat "$fx"/target/mac-static/checks/check-model-tax.rc "$fx"/target/mac-static/checks/run.*/check-model-tax.rc 2> /dev/null)" = 7 ]; do
-    k=$((k + 1))
-    [ "$k" -le 600 ] || { fail "the first run's model-tax result did not land within 60 s"; break; }
-    sleep 0.1
+  # Each entry reads its own results. Run 1's model-tax ends red while zlate waits for a release file; run 2 finishes green before
+  # run 1 resumes. Sharing a result directory would let run 1 read run 2's zero for model-tax and end green.
+  local fx p1 rc1 rc2 mode
+  for mode in --checks --full; do
+    fx=$(mktemp -d)
+    mkdir "$fx/tools" "$fx/sync"
+    cp "$HERE/tools/mac-static.sh" "$fx/tools/mac-static.sh"
+    printf '#!/usr/bin/env bash\n[ "${CHECK_ROLE:-}" != slow ] || exit 7\n' > "$fx/tools/check-model-tax.sh"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$fx/tools/mac-check.sh"
+    chmod +x "$fx/tools/mac-check.sh"
+    # shellcheck disable=SC2016 # the check's own shell expands them
+    printf '#!/usr/bin/env bash\n[ "$CHECK_ROLE" != slow ] || { n=0; until [ -e "$CHECK_SYNC/release" ]; do n=$((n + 1)); [ "$n" -le 600 ] || exit 9; sleep 0.1; done; }\n' > "$fx/tools/check-zlate.sh"
+    rc1=0; rc2=0
+    CHECK_SYNC=$fx/sync CHECK_ROLE=slow bash "$fx/tools/mac-static.sh" "$mode" > "$fx/out1" 2>&1 & p1=$!
+    k=0
+    until [ "$(cat "$fx"/target/mac-static/check-model-tax.rc "$fx"/target/mac-static/run.*/check-model-tax.rc "$fx"/target/mac-static/checks/check-model-tax.rc "$fx"/target/mac-static/checks/run.*/check-model-tax.rc 2> /dev/null)" = 7 ]; do
+      k=$((k + 1))
+      [ "$k" -le 600 ] || { fail "the first run's model-tax result did not land within 60 s"; break; }
+      sleep 0.1
+    done
+    out=$(CHECK_SYNC=$fx/sync CHECK_ROLE=green bash "$fx/tools/mac-static.sh" "$mode" 2>&1) || rc2=$?
+    touch "$fx/sync/release"
+    wait "$p1" || rc1=$?
+    [ "$rc2" = 0 ] || fail "$mode: the overlapping green run ends rc $rc2: $out"
+    [ "$rc1" = 7 ] || fail "$mode: the red run ends rc $rc1 when a green run overlaps it, not its model-tax's 7: $(cat "$fx/out1")"
+    case $(cat "$fx/out1") in *"check-model-tax (rc 7)"*) ;; *) fail "$mode: the red run does not name model-tax: $(cat "$fx/out1")" ;; esac
+    if [ "$mode" = --checks ]; then
+      [ -z "$(ls -A "$fx/target/mac-static/checks" 2> /dev/null)" ] || fail "a --checks run left its results behind: $(ls -A "$fx/target/mac-static/checks")"
+    fi
+    rm -rf "$fx"
   done
-  out=$(CHECK_SYNC=$fx/sync bash "$fx/tools/mac-static.sh" --checks --no-base 2>&1) || rc2=$?
-  touch "$fx/sync/release"
-  wait "$p1" || rc1=$?
-  [ "$rc2" = 0 ] || fail "the overlapping green run ends rc $rc2: $out"
-  [ "$rc1" = 7 ] || fail "the red run ends rc $rc1 when a green run overlaps it, not its model-tax's 7: $(cat "$fx/out1")"
-  case $(cat "$fx/out1") in *"red checks: check-model-tax (rc 7)"*) ;; *) fail "the red run does not name model-tax: $(cat "$fx/out1")" ;; esac
-  [ -z "$(ls -A "$fx/target/mac-static/checks" 2> /dev/null)" ] || fail "a --checks run left its results behind: $(ls -A "$fx/target/mac-static/checks")"
-  rm -rf "$fx"
+  echo "mac-static: overlap result cases 2 exercised (--checks and --full)"
 
   # earlier results that cannot be cleared are never this run's. Prior green results in a directory of mode 555 (a user who writes
   # through a mode, root, skips this case by name): the run ends 69 naming the clearing and runs no check, where it read the old zeros.
@@ -596,8 +601,9 @@ case ${1:-} in
 esac
 
 D=$HERE/target/mac-static
-mkdir -p "$D"
-clear_results "$D" || exit $?
+mkdir -p "$D" || { say "mac-static.sh: cannot create $D"; exit 69; }
+D=$(mktemp -d "$D/run.XXXXXX") || { say "mac-static.sh: cannot create a run directory in $D"; exit 69; }
+echo "mac-static: results ${D#"$HERE/"}"
 CARGO=()
 while IFS= read -r w; do CARGO+=("$w"); done < <(combos_argv "$BASE" "$LEDGER")
 run_steps "$D" "$BASE" "${CARGO[@]}"

@@ -783,6 +783,59 @@ CARGO
   else
     echo "mac-check: self-test: the seed-record lint cases need macOS and just (skipped on $(uname -s))"
   fi
+  # The full-run overlap also exercises the real cargo lane: warnings must stay red and must not seed.
+  # Reuse the fake toolchain above; only platform probes, cargo and recipe commands are stubbed.
+  write_env
+  sc=$t/overlap
+  mkdir -p "$sc/tools" "$sc/sync"
+  cp "$HERE/tools/mac-check.sh" "$HERE/tools/mac-static.sh" "$HERE/tools/lint-ratchet.txt" "$sc/tools/"
+  printf '#!/bin/sh\nexit 0\n' > "$sc/tools/check-overlap.sh"
+  cp "$HERE/rust-toolchain.toml" "$HERE/Cargo.lock" "$sc/"
+  git -C "$sc" init -q
+  git -C "$sc" add -A
+  git -C "$sc" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m overlap
+  case $host in aarch64-*) a=arm64 ;; *) a=x86_64 ;; esac
+  printf '#!/bin/sh\ncase $1 in -s) echo Darwin ;; -m) echo %s ;; esac\n' "$a" > "$fake/brew/bin/uname"
+  printf '#!/bin/sh\ncksum "$2"\n' > "$fake/brew/bin/md5"
+  cat > "$fake/brew/bin/python3" << 'RECIPES'
+#!/bin/sh
+case $2 in
+  box-command)
+    case $3 in lint) echo cargo clippy --all-targets ;; fmt-check) echo cargo fmt --all -- --check ;; esac ;;
+  combos) printf 'combo\toverlap\tcargo check --all-targets\ntotal\t1\n' ;;
+  *) exit 64 ;;
+esac
+RECIPES
+  cat > "$tc/cargo" << 'CARGO'
+#!/bin/sh
+if [ "$CHECK_ROLE" = slow ] && [ "$1" = clippy ]; then
+  echo 'warning: overlap warning'
+  touch "$CHECK_SYNC/warned"
+  n=0
+  until [ -e "$CHECK_SYNC/release" ]; do
+    n=$((n + 1)); [ "$n" -le 600 ] || exit 9
+    sleep 0.1
+  done
+fi
+CARGO
+  chmod +x "$tc/cargo" "$fake/brew/bin/uname" "$fake/brew/bin/md5" "$fake/brew/bin/python3"
+  echo 0 > "$sc/tools/lint-ratchet.txt"
+  local p1 rc1=0 rc2=0 k=0
+  (HOME=$fake PATH=$fake/brew/bin:$PATH WT_SEED_TSV=$sc/seed.tsv CHECK_ROLE=slow CHECK_SYNC=$sc/sync \
+    bash "$sc/tools/mac-static.sh" --full > "$sc/slow.out" 2>&1) & p1=$!
+  until [ -e "$sc/sync/warned" ]; do
+    k=$((k + 1)); [ "$k" -le 600 ] || { fail "the overlapping lint did not emit its warning within 60 s: $(cat "$sc/slow.out")"; break; }
+    sleep 0.1
+  done
+  HOME=$fake PATH=$fake/brew/bin:$PATH WT_SEED_TSV=$sc/seed.tsv CHECK_ROLE=green CHECK_SYNC=$sc/sync \
+    bash "$sc/tools/mac-static.sh" --full > "$sc/green.out" 2>&1 || rc2=$?
+  touch "$sc/sync/release"
+  wait "$p1" || rc1=$?
+  [ "$rc2" = 0 ] || fail "the overlapping green lint ends rc $rc2: $(cat "$sc/green.out")"
+  [ "$rc1" = 1 ] || fail "the lint with a warning ends rc $rc1 after the green lint, not 1: $(cat "$sc/slow.out")"
+  grep -q 'lint \^warning: 1, above the ratchet 0' "$sc/slow.out" || fail "the overlapping lint lost its warning verdict"
+  [ "$(wc -l < "$sc/seed.tsv" | tr -d ' ')" = 1 ] || fail "the overlapping red lint wrote a green seed record: $(cat "$sc/seed.tsv")"
+  echo "mac-check: overlap warning case: red rc $rc1, green rc $rc2, seed lines $(wc -l < "$sc/seed.tsv" | tr -d ' ')"
   rm -rf "$t"
   rm -rf "$fake"
 
@@ -834,7 +887,7 @@ if [ "$MODE" = test ]; then
   fi
   setup test "$TC" "$HERE" || exit $?
   mkdir -p "$HERE/target"
-  LOG=$HERE/target/mac-check-test.log
+  LOG=$HERE/target/mac-check-test.$$.log
   LOCK0=$(md5 -q "$HERE/Cargo.lock")
   HEAD="mac-check: cargo test -p <crate>, natively on $HOST, for the pure crates of tools/recipes.py pure-crates ($("$TC/rustc" --version 2> /dev/null || echo "$TC/rustc"); CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
   say "$HEAD; log $LOG"
@@ -864,7 +917,7 @@ if [ "$MODE" = combos ]; then
   combo_lines $([ -n "$BASE" ] && echo 3) <<< "$LIST" || exit $?
   setup combos "$TC" "$HERE" || exit $?
   mkdir -p "$HERE/target"
-  LOG=$HERE/target/mac-check-combos.log
+  LOG=$HERE/target/mac-check-combos.$$.log
   LOCK0=$(md5 -q "$HERE/Cargo.lock")
   HEAD="mac-check: cargo check --target $TARGET for each build shape of tools/recipes.py combos${BASE:+ scoped to --base $BASE}${LEDGER:+, ledger $LEDGER} ($("$TC/rustc" --version 2> /dev/null || echo "$TC/rustc"); CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
   say "$HEAD; log $LOG"
@@ -919,7 +972,7 @@ while IFS= read -r w; do ARGV+=("$w"); done <<< "$DERIVED"
 setup "$MODE" "$TC" "$HERE" || exit $?
 
 mkdir -p "$HERE/target"
-LOG=$HERE/target/mac-check-$MODE.log
+LOG=$HERE/target/mac-check-$MODE.$$.log
 LOCK0=$(md5 -q "$HERE/Cargo.lock")
 SEED_SHA=$(git -C "$HERE" rev-parse HEAD 2> /dev/null || true) # the tree the lint reads, for the seed record
 ORIGIN="the $RECIPE recipe's box command"

@@ -44,10 +44,10 @@
 # every file under its target/ are identical before and after `new`.
 #
 # retire. The tree is refused (1) while a run is in flight in it. The sentinels, by tool:
-#   mac-static   <tree>/target/mac-static/pids is the start mark, <step>.rc the end of a step (fmt-check, check-*, lint,
+#   mac-static   <tree>/target/mac-static/{run.*,checks/run.*}/pids is the start mark, <step>.rc the end of a step (fmt-check, check-*, lint,
 #                combos; the pids line `cargo-lane` stands for lint and combos). A step with a start mark and no .rc is
 #                in flight when a pid recorded in pids is alive, or when no pid is on record; a run whose recorded pids
-#                are all dead was killed: it is named and does not block (mac-static clears the marks at its next start).
+#                are all dead was killed: it is named and does not block. Older results directly under mac-static/ or checks/ are read too.
 #   gate-batch   no .rc: the batch dir is ~/.cache/bloomery/batches/<tree dir name>/<stamp>/ (--out under the tree's
 #                target/ is read too), run.log is the start mark and its `^DONE ` line the end. Without it the batch is in
 #                flight when a pid in lane-*.pid, lane-*.child or gpuhold.pid is alive, or when none is on record.
@@ -143,23 +143,26 @@ add_word() {
   case "$1 " in *" $2 "*) printf '%s' "$1" ;; *) printf '%s %s' "$1" "$2" ;; esac
 }
 
-# static_run TREE: the mac-static run of TREE, per the header; RUNS_BLOCK and RUNS_NOTE gain a line when it has no end.
+# static_run TREE: every mac-static run of TREE, per the header; RUNS_BLOCK and RUNS_NOTE gain a line when a run has no end.
 static_run() {
-  local d=$1/target/mac-static name f missing= names
-  [ -d "$d" ] || return 0
-  names=$([ ! -f "$d/pids" ] || awk 'NF { print $1 }' "$d/pids")
-  for f in "$d"/*.log; do
-    [ -e "$f" ] && names="$names"$'\n'"$(basename "$f" .log)"
+  local root=$1/target/mac-static d name f missing names
+  for d in "$root" "$root"/run.* "$root/checks" "$root/checks"/run.*; do
+    missing=
+    [ -d "$d" ] || continue
+    names=$([ ! -f "$d/pids" ] || awk 'NF { print $1 }' "$d/pids")
+    for f in "$d"/*.log; do
+      [ -e "$f" ] && names="$names"$'\n'"$(basename "$f" .log)"
+    done
+    for name in $names; do
+      case $name in
+        cargo-lane) for f in lint combos; do [ -f "$d/$f.rc" ] || missing=$(add_word "$missing" "$f"); done ;;
+        *) [ -f "$d/$name.rc" ] || missing=$(add_word "$missing" "$name") ;;
+      esac
+    done
+    [ -n "$missing" ] || continue
+    pid_scan "$d/pids"
+    classify "mac-static run" "$d" "no .rc for${missing% }"
   done
-  for name in $names; do
-    case $name in
-      cargo-lane) for f in lint combos; do [ -f "$d/$f.rc" ] || missing=$(add_word "$missing" "$f"); done ;;
-      *) [ -f "$d/$name.rc" ] || missing=$(add_word "$missing" "$name") ;;
-    esac
-  done
-  [ -n "$missing" ] || return 0
-  pid_scan "$d/pids"
-  classify "mac-static run" "$d" "no .rc for${missing% }"
 }
 
 # batch_dir DIR: one gate-batch dir; a run.log with no DONE line is a run with no end.
@@ -572,13 +575,13 @@ SHIM
   git -C "$main" worktree add -q -b p "$t/bloomery-p" "$c2"
   git -C "$main" worktree add -q -b q "$t/bloomery-q" "$c3"
   mkdir -p "$t/bloomery-p/target" "$t/bloomery-q/target"
-  mkdir -p "$t/seedBUSY/target/mac-static"
+  mkdir -p "$t/seedBUSY/target/mac-static/run.busy"
   # the busy seed's "live" pid must outlive every pick below, however slow the host: a `sleep 60` died before the picks on
   # the second Mac (the wt block took 711 s under check-recipes' parallel parts, 2026-10-13), so BUSY counted as a dead run
   # and won every pick. It lives until this test kills it (below, or the EXIT trap's `jobs -p`).
   sleep 3600 & pid=$!
-  printf 'fmt-check %s\ncargo-lane %s\n' "$pid" "$pid" > "$t/seedBUSY/target/mac-static/pids"
-  : > "$t/seedBUSY/target/mac-static/fmt-check.log"
+  printf 'fmt-check %s\ncargo-lane %s\n' "$pid" "$pid" > "$t/seedBUSY/target/mac-static/run.busy/pids"
+  : > "$t/seedBUSY/target/mac-static/run.busy/fmt-check.log"
   write_rec "$t/seedB" "$c1" 100        # B: an older line, c1 (3 behind) ...
   write_rec "$t/seedB" "$c3" 200        # ... its last line c3 (1 behind) wins
   write_rec "$t/bloomery-p" "$c4" 300   # P: 0 behind, but its HEAD sits at c2: drifted by 2, cost 2
@@ -678,7 +681,7 @@ SHIM
   retire_fixture rt
   rm -f "$STUB_DISK_LOG"
   sleep 3600 & pid=$! # killed below; see the busy seed above for why not a short sleep
-  d=$t/bloomery-rt/target/mac-static
+  d=$t/bloomery-rt/target/mac-static/run.retire
   mkdir -p "$d"
   printf 'fmt-check %s\ncargo-lane %s\n' "$pid" "$pid" > "$d/pids"
   : > "$d/fmt-check.log"
@@ -707,6 +710,15 @@ SHIM
   expect "retire with every .rc present (a live pid in pids)" "$RC" 0 "$OUT" "dry run: nothing removed"
   [ "$(cut -f2 "$STUB_DISK_LOG")" = "retire --dry-run $t/bloomery-rt" ] || fail "mac-disk did not get 'retire --dry-run <abs path>': $(cat "$STUB_DISK_LOG")"
   [ "$(cut -f1 "$STUB_DISK_LOG")" = "$main" ] || fail "mac-disk was not run from the main tree: $(cat "$STUB_DISK_LOG")"
+  # A completed full run cannot hide a check-only run that is still in flight.
+  local checks_run=$t/bloomery-rt/target/mac-static/checks/run.retire
+  mkdir -p "$checks_run"
+  printf 'check-overlap %s\n' "$pid" > "$checks_run/pids"
+  : > "$checks_run/check-overlap.log"
+  run_wt "$SELF" "$main" retire --dry-run rt
+  expect "retire with a check-only run in flight" "$RC" 1 "$OUT" "refused retire rt: mac-static run in flight: $checks_run"
+  echo 0 > "$checks_run/check-overlap.rc"
+  echo "wt: check-only in-flight case exercised"
   # a gate-batch run: run.log with no DONE and a live lane pid blocks; with DONE it does not; no pid on record blocks
   rm -rf "$d"
   b=$t/batches/bloomery-rt/20260101-000000

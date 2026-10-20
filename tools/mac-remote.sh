@@ -486,17 +486,16 @@ git checkout -q -f --detach "$2"
 exit $?
 }'
 
-# The red steps of the last run, for the caller to read: mac-static prints one summary line a step and keeps each step's
-# output in target/mac-static/<step>.log, which stays on the remote with the tree's target/.
+# The red steps of this run: mac-static prints its result directory, which stays on the remote with the tree's target/.
 RED='{
 exec < /dev/null
-d=$HOME/'"$RBASE"'/$1/target/mac-static
+d=$HOME/'"$RBASE"'/$1/${2:-target/mac-static}
 for f in "$d"/*.rc; do
   [ -f "$f" ] || continue
   n=$(basename "$f" .rc)
   r=$(cat "$f")
   [ "$r" != 0 ] || continue
-  echo "mac-remote: red step $n (rc $r): the last 40 lines of target/mac-static/$n.log on the remote"
+  echo "mac-remote: red step $n (rc $r): the last 40 lines of ${2:-target/mac-static}/$n.log on the remote"
   tail -40 "$d/$n.log" 2> /dev/null
 done
 exit 0
@@ -654,7 +653,7 @@ sync_tree() {
 
 # remote_main TREE BASE: the run; its return is the exit code.
 remote_main() {
-  local tree=$1 basearg=$2 r base_list n_pushed om channel just_v owner ssh_rc t0=$SECONDS t_setup t_run
+  local tree=$1 basearg=$2 r base_list n_pushed om channel just_v owner ssh_rc results t0=$SECONDS t_setup t_run
   local steal=0 tries=0 held running total appended tw0=$SECONDS twlast=-60
   local -a pushes=()
   TREE=$(cd "$tree" 2> /dev/null && pwd -P) || { say "mac-remote: --tree '$tree' is not a directory"; return 64; }
@@ -770,7 +769,7 @@ remote_main() {
   # the run, its output scrubbed on the way back; the pids are ours, taken at spawn
   printf '%s\n' "$RUN" > "$TMP/run.sh"
   mkfifo "$TMP/out"
-  scrub "$RHOME" "$RUSER" "$RHOST" < "$TMP/out" &
+  capture_run < "$TMP/out" &
   SCPID=$!
   RUN_ACTIVE=1
   ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs "$track" "$BASE_ARG" "$channel" "$SLOTS" "$SLOT_SAY" "$SLOT_POLL")" < "$TMP/run.sh" > "$TMP/out" 2>&1 &
@@ -787,7 +786,8 @@ remote_main() {
   t_run=$((SECONDS - t0 - t_setup))
   if [ "$ssh_rc" != 0 ]; then
     printf '%s\n' "$RED" > "$TMP/red.sh"
-    ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs "$track")" < "$TMP/red.sh" 2> /dev/null | scrub "$RHOME" "$RUSER" "$RHOST" || true
+    results=$(sed -n 's/^mac-static: results //p' "$TMP/run.log" | tail -1)
+    ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs "$track" "$results")" < "$TMP/red.sh" 2> /dev/null | scrub "$RHOME" "$RUSER" "$RHOST" || true
   fi
 
   # the ledger lines this track's run appended
@@ -804,6 +804,10 @@ remote_main() {
   fi
   say "mac-remote: wall $((SECONDS - t0)) s (setup $t_setup s, run $t_run s), remote rc $ssh_rc"
   return "$ssh_rc"
+}
+
+capture_run() {
+  tee "$TMP/run.log" | scrub "$RHOME" "$RUSER" "$RHOST"
 }
 
 # fake_remote HOME CHANNEL: a remote home that passes the preflight, its tools stubs: uname answers Darwin and the Mac
@@ -838,11 +842,12 @@ git rev-parse --verify -q 'origin/main^{commit}' > "$HOME/just.originmain" 2> /d
 echo "stub just in $(basename "$PWD")"
 basename "$PWD" >> "$HOME/just.order"
 if [ "${STUB_JUST_RC:-0}" != 0 ]; then
-  mkdir -p target/mac-static
-  echo "${STUB_JUST_RC}" > target/mac-static/fake-step.rc
-  echo "fake-step output line" > target/mac-static/fake-step.log
-  echo 0 > target/mac-static/ok-step.rc
-  echo "ok-step output line" > target/mac-static/ok-step.log
+  mkdir -p target/mac-static/run.stub
+  echo "mac-static: results target/mac-static/run.stub"
+  echo "${STUB_JUST_RC}" > target/mac-static/run.stub/fake-step.rc
+  echo "fake-step output line" > target/mac-static/run.stub/fake-step.log
+  echo 0 > target/mac-static/run.stub/ok-step.rc
+  echo "ok-step output line" > target/mac-static/run.stub/ok-step.log
 fi
 mkdir -p "$HOME/.cache/bloomery"
 printf '%064d\tgreen\td\t%s\n' "${STUB_KEY:-1}" "$(basename "$PWD")" | tr 0 a >> "$HOME/.cache/bloomery/mac-static-ledger.tsv"
@@ -876,6 +881,25 @@ self_test() {
   fake=$d/home
   mkdir -p "$fake/.config/bloomery"
   me=$(hostname -s | tr -c 'A-Za-z0-9.\n-' _)
+
+  # The returned result path selects this run's red logs, not an older run's.
+  rt=$fake/$RBASE/red-test/target/mac-static
+  mkdir -p "$rt/run.old" "$rt/run.current"
+  echo 7 > "$rt/run.old/old.rc"; echo 'old output' > "$rt/run.old/old.log"
+  echo 3 > "$rt/run.current/red.rc"; echo 'current output' > "$rt/run.current/red.log"
+  echo 0 > "$rt/run.current/green.rc"; echo 'green output' > "$rt/run.current/green.log"
+  local user results shown
+  for user in st-user mac run; do
+    shown=$(printf 'mac-static: results target/mac-static/run.current\n/home/%s on st-host\n' "$user" |
+      TMP=$d RHOME=/home/$user RUSER=$user RHOST=st-host capture_run)
+    results=$(sed -n 's/^mac-static: results //p' "$d/run.log" | tail -1)
+    [ "$results" = target/mac-static/run.current ] || fail "account $user lost the raw result path: $results"
+    case $shown in *"/home/$user"*|*st-host*) fail "account $user leaked in the displayed stream: $shown" ;; esac
+    out=$(printf '%s\n' "$RED" | HOME=$fake bash -s -- red-test "$results")
+    case $out in *"red step red (rc 3)"*"current output"*) ;; *) fail "account $user: the selected run's red log did not come back: $out" ;; esac
+    case $out in *"old output"*|*"green output"*) fail "account $user: a log outside the selected run's red steps came back: $out" ;; esac
+    echo "mac-remote: result capture account $user: path $results"
+  done
 
   # the push: a dropped first push is tried once more; two failures end 75 with git's lines
   mkdir -p "$d/gitbin"
