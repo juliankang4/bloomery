@@ -2766,7 +2766,10 @@ mod gate {
                     }
                 };
             if let Some(arm) = only.as_deref() {
-                return if gemm_arms(gpu, Some(arm))? || iq_gemm_arms(gpu, Some(arm))? {
+                return if gemm_arms(gpu, Some(arm))?
+                    || iq_gemm_arms(gpu, Some(arm))?
+                    || q8p_gemm_arms(gpu, Some(arm))?
+                {
                     Ok(())
                 } else {
                     Err(format!("gate_gemm: --bench-arm {arm} names no grouped-GEMM arm").into())
@@ -2774,6 +2777,7 @@ mod gate {
             }
             gemm_arms(gpu, None)?;
             iq_gemm_arms(gpu, None)?;
+            q8p_gemm_arms(gpu, None)?;
             Ok(())
         }
 
@@ -3018,6 +3022,112 @@ mod gate {
                     + n_slots * (4 * 16 * act.steps() + 4 * 2 * act.steps())
                     + 4 * n_slots * rows) as u64;
                 print_arm(op, rows, bytes, g.node_count(), e, r);
+            }
+            Ok(ran)
+        }
+
+        /// The dense Q8_0-plane GEMM (`gemm_q8_0p`) at Qwen3.8's dense prompt
+        /// projections, `rows × K` over the one-expert table: a linear-attention
+        /// layer's `qkv` (10240 × 2560), `z` (6144 × 2560) and `out` (2560 ×
+        /// 6144, the attention output's shape too); an attention layer's `q`
+        /// (12288 × 2560) and `kv` (512 × 2560); the shared expert's gate·up
+        /// `shgu` (640 × 2560) and down `shdown` (2560 × 640); a hyper-connection
+        /// mix's down `hcdown` (320 × 10240) and up `hcup` (10240 × 320). Each at
+        /// T ∈ {16, 512, 2048} columns: a unit just past the gemv's eight
+        /// columns and the prompt's two ubatch sizes. Then K 2560 stacks around
+        /// one wave of the card, its SMs times the two blocks an SM the
+        /// entries' `launch_bounds(256, 2)` holds, a block per 128-row slab and
+        /// tile: at T 16 (one tile) one block under (`wavem1`), one wave
+        /// (`wave`) and one block over (`wavep1`); at T 65 (two tiles, an even
+        /// grid) two blocks under (`wave2m`), one wave (`wave2`) and two over
+        /// (`wave2p`). Beside the usual row, the rate `2 · T · rows · K` over
+        /// the graph minimum. `only` keeps the one arm of that name; the return
+        /// says whether any arm ran.
+        fn q8p_gemm_arms(gpu: &bloomery_gpu::Gpu, only: Option<&str>) -> Result<bool, GateError> {
+            use bloomery_gpu::gemm::{
+                Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmKernels,
+                GemmRoute,
+            };
+            let stream = gpu.stream();
+            let mut ran = false;
+            let sink = gpu.unlabelled_sink();
+            let (gk, g32) = (
+                GemmKernels::load(gpu.context())?,
+                Gemm32Kernels::load(gpu.context())?,
+            );
+            let sms = gpu.context().multiprocessor_count()? as usize;
+            let wave = 2 * sms;
+            for (label, rows, k, ts) in [
+                ("qkv", 10240usize, 2560usize, &[16usize, 512, 2048][..]),
+                ("z", 6144, 2560, &[16, 512, 2048]),
+                ("out", 2560, 6144, &[16, 512, 2048]),
+                ("q", 12288, 2560, &[16, 512, 2048]),
+                ("kv", 512, 2560, &[16, 512, 2048]),
+                ("shgu", 640, 2560, &[16, 512, 2048]),
+                ("shdown", 2560, 640, &[16, 512, 2048]),
+                ("hcdown", 320, 10240, &[16, 512, 2048]),
+                ("hcup", 10240, 320, &[16, 512, 2048]),
+                ("wavem1", 128 * (wave - 1), 2560, &[16]),
+                ("wave", 128 * wave, 2560, &[16]),
+                ("wavep1", 128 * (wave + 1), 2560, &[16]),
+                ("wave2m", 128 * (sms - 1), 2560, &[65]),
+                ("wave2", 128 * sms, 2560, &[65]),
+                ("wave2p", 128 * (sms + 1), 2560, &[65]),
+            ] {
+                let prefix = format!("gemm_q8_0p_{label}_t");
+                if only.is_some_and(|o| !o.starts_with(&prefix)) {
+                    continue;
+                }
+                let kb = k / 32;
+                let qs =
+                    DeviceTensor::<u32>::upload(stream, &fill_pattern(rows * k / 4), rows, k / 4)?;
+                // Finite f16 scales in [2^-7, 2^-6): the pattern's low bits as the
+                // mantissa.
+                let d_bits: Vec<u16> = fill_pattern(rows * kb)
+                    .into_iter()
+                    .map(|w| 0x2000 | (w & 0x03ff) as u16)
+                    .collect();
+                let d = DeviceTensor::<u16>::upload(stream, &d_bits, rows, kb)?;
+                for &t in ts {
+                    let op = format!("{prefix}{t}");
+                    if only.is_some_and(|o| o != op) {
+                        continue;
+                    }
+                    ran = true;
+                    let xs = DeviceBuffer::<f32>::from_host(stream, &fill_pattern_f32(t * k))?;
+                    let mut act = GemmAct32::new(stream, t, k)?;
+                    g32.enqueue_quantize_gemm32(stream, &xs, t, &mut act, sink)?;
+                    let mut route = GemmRoute::new(stream, t, 1)?;
+                    gk.enqueue_route_dense(stream, t, &mut route, sink)?;
+                    let mut y = DeviceBuffer::<f32>::zeroed(stream, t * rows)?;
+                    let mut enq = |s: &CudaStream| {
+                        g32.enqueue_gemm32(
+                            s,
+                            Gemm32Args {
+                                w: Gemm32Weight::Q8_0Plane { qs: &qs, d: &d },
+                                rows_per_expert: rows,
+                                act: &act,
+                                route: &route,
+                                input: GemmInput::PerSlot,
+                                y: &mut y,
+                            },
+                        )
+                    };
+                    let e = burst(stream, &mut enq)?;
+                    let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+                    let r = replay(stream, &g)?;
+                    // The planes, the activation planes the launch reads, and the
+                    // outputs it writes.
+                    let bytes = (rows * (k + 2 * kb)
+                        + t * (4 * 16 * act.steps() + 4 * 2 * act.steps())
+                        + 4 * t * rows) as u64;
+                    print_arm(&op, rows, bytes, g.node_count(), e, r);
+                    let ops = 2.0 * (t * rows * k) as f64;
+                    println!(
+                        "bench op={op} slots={t} k={k} ops={ops:.0} tops_graph_min={:.2}",
+                        ops / r.0 / 1e6
+                    );
+                }
             }
             Ok(ran)
         }
