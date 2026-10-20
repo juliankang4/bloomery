@@ -807,12 +807,18 @@ mod tests {
 
     /// Each rank's bytes at N = 1, 2 and 4 on the three layers, and on the whole trunk by the
     /// layers of each kind the config lists: the sums an independent count of the checkpoint's
-    /// 42 headers gives (91,600,737,016 B a rank at N = 2, 46,684,372,088 at N = 4, the
-    /// checkpoint's text weights with block scales decoded and BF16 as shipped).
+    /// 42 headers gives (91,635,719,928 B a rank at N = 2, 46,703,294,072 at N = 4, the
+    /// checkpoint's text weights with block scales decoded and BF16 as shipped), its FP8 weights
+    /// of one scale a 128 by 128 block held as FP8_B128, an f32 scale a 128 values of a row.
     #[test]
     fn fp4_local_ranks_hold_the_header_tables_split_bytes() {
         let (g, quant, config, table) = fp4_local();
         let ts = tp_tensors(g, &quant, &table).unwrap();
+        let q_b = ts
+            .iter()
+            .find(|t| t.name == "blk.3.attn_q_b.weight")
+            .unwrap();
+        assert_eq!(q_b.bytes, 16_384 * 1536 / 128 * 132);
         let mut no_bias = table.clone();
         no_bias.retain(|(n, _, _)| !n.ends_with(".mlp.gate.e_score_correction_bias"));
         assert_eq!(table.len() - no_bias.len(), 2);
@@ -845,9 +851,9 @@ mod tests {
         }
         assert_eq!(copies.values().sum::<u64>(), 1 + g.layers as u64);
         for (n, fixture, trunk) in [
-            (1, 10_732_417_160, 181_433_466_872),
-            (2, 6_019_132_296, 91_600_737_016),
-            (4, 3_662_489_864, 46_684_372_088),
+            (1, 10_737_098_888, 181_500_571_640),
+            (2, 6_021_603_208, 91_635_719_928),
+            (4, 3_663_855_368, 46_703_294_072),
         ] {
             let plan = plan_tp(&pools(n), &ts).unwrap();
             assert!(
@@ -1151,7 +1157,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (q.dims.as_slice(), q.cut.unwrap().unit, q.block),
-            (&[1536, 16384][..], 256, [128, 128])
+            (&[1536, 16384][..], 256, [128, 1])
         );
         assert!(matches!(
             tp_cut("blk.3.attn_sinks.weight", &[64], 64),

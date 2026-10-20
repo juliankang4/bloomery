@@ -104,10 +104,16 @@ pub struct Held {
 
 impl Format {
     /// The card type the format is held in, whose row ([`GgmlType::row`]) gives its bytes and
-    /// cut units: NVFP4 in GGUF's NVFP4 block whichever encoding its scales were stored in.
+    /// cut units: NVFP4 in GGUF's NVFP4 block whichever encoding its scales were stored in; FP8
+    /// with one scale a 128 by 128 block in bloomery's FP8_B128, the square's scale on each of
+    /// its rows (`hf::modelopt`'s reader).
     fn card_type(self) -> Option<GgmlType> {
         match self {
             Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 => Some(GgmlType::NVFP4),
+            Format::Fp8Block {
+                rows: 128,
+                cols: 128,
+            } => Some(GgmlType::FP8_B128),
             Format::Mxfp4 => Some(GgmlType::MXFP4),
             Format::Bf16 => Some(GgmlType::BF16),
             Format::F32 => Some(GgmlType::F32),
@@ -117,7 +123,7 @@ impl Format {
 
     /// A format with no card type row: the values a block spans along dims 0 and 1 and the
     /// bytes of its one scale, beside one byte a value. MXFP8's scale is one E8M0 byte a 32
-    /// values; an FP8 block format's one F32 a block.
+    /// values; an FP8 block format of another block size, one F32 a block.
     fn scaled_bytes(self) -> Option<([u64; 2], u64)> {
         match self {
             Format::Mxfp8 => Some(([32, 1], 1)),
@@ -1406,16 +1412,22 @@ mod tests {
                 block: [32, 1],
             })
         );
-        let fp8 = Format::Fp8Block {
-            rows: 128,
-            cols: 128,
-        };
+        assert_eq!(
+            B128.held(&[16384, 4096]),
+            Some(Held {
+                bytes: 16384 * 4096 + 4 * 4096 * 128,
+                whole_bytes: 0,
+                block: [128, 1],
+            })
+        );
+        assert_eq!(B128.held(&[96, 4096]), None);
+        let fp8 = Format::Fp8Block { rows: 32, cols: 32 };
         assert_eq!(
             fp8.held(&[16384, 4096]),
             Some(Held {
-                bytes: 16384 * 4096 + 4 * 32 * 128,
+                bytes: 16384 * 4096 + 4 * 512 * 128,
                 whole_bytes: 0,
-                block: [128, 128],
+                block: [32, 32],
             })
         );
         assert_eq!(
