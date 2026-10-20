@@ -240,7 +240,15 @@ mod tests {
     /// An executable shell script in `dir` with `body`.
     fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("the stub is written");
+        // Only the writer child opens the script for writing, so concurrent spawns cannot
+        // inherit a writable descriptor and make the hook's exec fail with ETXTBSY.
+        let written = Command::new("/bin/sh")
+            .args(["-c", "printf '%s\\n' \"$2\" > \"$1\"", "stub"])
+            .arg(&path)
+            .arg(format!("#!/bin/sh\n{body}\n"))
+            .status()
+            .expect("the stub writer runs");
+        assert!(written.success(), "the stub is written: {written}");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("the stub is executable");
         path

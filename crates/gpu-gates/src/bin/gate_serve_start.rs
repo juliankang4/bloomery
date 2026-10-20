@@ -330,13 +330,19 @@ fn hook_script(
 ) -> Result<(PathBuf, PathBuf), GateError> {
     let saw = dir.join(format!("{name}.saw"));
     let script = dir.join(format!("{name}.sh"));
-    std::fs::write(
-        &script,
-        format!(
+    // Only the writer child opens the script for writing, so concurrent spawns cannot
+    // inherit a writable descriptor and make the hook's exec fail with ETXTBSY.
+    let written = Command::new("/bin/sh")
+        .args(["-c", "printf '%s\\n' \"$2\" > \"$1\"", "hook-script"])
+        .arg(&script)
+        .arg(format!(
             "#!/bin/sh\ncat > '{}'\necho '{line}'\nexit {rc}\n",
             saw.display()
-        ),
-    )?;
+        ))
+        .status()?;
+    if !written.success() {
+        return Err(format!("hook script writer ended {written}").into());
+    }
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
     Ok((script, saw))
 }

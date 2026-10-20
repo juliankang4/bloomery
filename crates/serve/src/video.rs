@@ -1322,36 +1322,35 @@ mod tests {
     /// not count it.
     #[cfg(unix)]
     fn fake_tool(name: &str, body: &str) -> TempFile {
-        use std::os::unix::fs::PermissionsExt;
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "bloomery-serve-fake-{name}-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
+        use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+        let template = std::env::temp_dir().join(format!(
+            "bloomery-serve-fake-{name}-{}.XXXXXX",
+            std::process::id()
         ));
-        let mut file = create_private(&path).expect("the script's file");
-        let script = TempFile(path);
-        let text = format!("#!/bin/sh\n[ \"$1\" = warm-up ] && exit 0\n{body}\n");
-        std::io::Write::write_all(&mut file, text.as_bytes()).expect("the script's text");
-        drop(file);
+        // Only the writer child opens the script for writing, so concurrent spawns cannot
+        // inherit a writable descriptor and make the script's exec fail with ETXTBSY.
+        let written = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "script=$(mktemp \"$1\") || exit; printf '%s\\n' \"$2\" > \"$script\" || exit; printf '%s' \"$script\"",
+                "fake-tool",
+            ])
+            .arg(&template)
+            .arg(format!("#!/bin/sh\n[ \"$1\" = warm-up ] && exit 0\n{body}\n"))
+            .output()
+            .expect("the script writer runs");
+        assert!(
+            written.status.success(),
+            "the script is written: {written:?}"
+        );
+        let script = TempFile(std::ffi::OsString::from_vec(written.stdout).into());
         std::fs::set_permissions(&script.0, std::fs::Permissions::from_mode(0o700))
             .expect("the script's mode");
-        // A process another test thread forked while the file was open for writing holds it open
-        // until it execs, and the kernel refuses to run the file meanwhile ("text file busy").
-        let mut busy = 0;
-        let warmed = loop {
-            match Command::new(&script.0).arg("warm-up").status() {
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && busy < 500 => {
-                    busy += 1;
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                other => break other,
-            }
-        };
-        assert!(
-            warmed.as_ref().is_ok_and(|s| s.success()),
-            "the script's first run: {warmed:?}"
-        );
+        let warmed = Command::new(&script.0)
+            .arg("warm-up")
+            .status()
+            .expect("the script's first run");
+        assert!(warmed.success(), "the script's first run: {warmed}");
         script
     }
 
