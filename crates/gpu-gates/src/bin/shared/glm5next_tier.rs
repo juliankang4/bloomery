@@ -4,7 +4,8 @@
 //! from the oracle sets (which a fixture has no set for), the open of an oracle set itself, which
 //! the fixture tier refuses by name, and the open of the fixture's own sets of ik's
 //! ([`fx_set`], [`fx_mtp_set`]) with the error bands their clauses hold ([`SiteTerm`]: one
-//! projection of the file, counted by what both engines do to its activation). The card the gate
+//! projection of the file, counted by what both engines do to its activation; [`FxBands`]: every
+//! layer's and the head's, over the file's sites), and ik's routing of a set ([`IkRoute`]). The card the gate
 //! plan is made on is `crate::gate_card`'s.
 //!
 //! Every number here is read from the header (`Hparams`, the tensors' types) or from a plan, and
@@ -19,9 +20,14 @@
 
 use std::sync::OnceLock;
 
+use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_gates::act_rule::{Arm, SiteRel, site_rel};
+use bloomery_gpu_gates::flip;
 use bloomery_gpu_gates::tier::{self, Tier};
-use bloomery_gpu_gates::{GateError, RefManifest, data_dir, prose_ids, ref_model_path};
+use bloomery_gpu_gates::{
+    GateError, RefManifest, data_dir, prose_ids, ref_model_path, ref_tensor_logical_in,
+    topk_ids_logical_within,
+};
 use gguf::{GgmlType, Split};
 use model::arch::glm5next::hparams::{Hparams, Kind};
 use model::arch::glm5next::names;
@@ -31,7 +37,7 @@ use refset::arch::glm5next::fixture as fx;
 use refset::arch::glm5next::{BATCH, D1K, IK, MODEL, MTP, MTP_SET};
 use refset::family::Family;
 use refset::mtpref::MtpSet;
-use runtime::layer::{FfnKind, MixerKind};
+use runtime::layer::{FfnKind, Layer, MixerKind};
 
 /// The tokens of the batch set (`REF_TOKENS` of `tools/ref/models/glm5next.sh`): the ids the
 /// fixture tier runs where the real tier reads them from ik's set.
@@ -675,5 +681,135 @@ pub fn block_terms(
                 dense,
             )?,
         }),
+    }
+}
+
+/// The fixture's error bands, counted as `gate_glm5next_e2e`'s `gemm_bands` counts, over every projection site of
+/// the file, with each site's rounding the two engines' own (`act_rule::site_rel` at the worst
+/// crest of each side's block, the two as independent errors): the mixer's sites and the
+/// block's ([`mixer_terms`], [`block_terms`]) add as variances,
+/// layers adding independently, where ik rounds a projection's activation to its weight
+/// type's format and we read the form each launch reads. `router[l]` is the band of layer
+/// `l`'s router input (the layers before it and its own mixer), `stream[l]` of the streams
+/// after the layer, and `head` of the logits: the last stream and the head's own input,
+/// which ik rounds and we read as f32.
+pub struct FxBands {
+    pub router: Vec<f64>,
+    pub stream: Vec<f64>,
+    pub head: f64,
+    /// The head's own input's rounding.
+    pub q_head: f64,
+    /// Each layer's sites and bands, as printed.
+    lines: Vec<String>,
+}
+
+/// The bands of the file `split` whose layers are `kinds`, its dense projections read on `dense`
+/// (`Arm::Gemv` below `bloomery_gpu_glm5next::GEMM_FROM` columns, `Arm::Gemm` from it).
+pub fn ik_bands(split: &Split, kinds: &[Layer], dense: Arm) -> Result<FxBands, GateError> {
+    let (mut acc, mut router, mut stream, mut lines) = (0.0f64, Vec::new(), Vec::new(), Vec::new());
+    for (l, k) in kinds.iter().enumerate() {
+        let mixer = mixer_terms(split, l, k.mixer, dense)?;
+        let block = block_terms(split, l, k.ffn, dense)?;
+        let mix = var(&mixer);
+        router.push((acc + mix).sqrt());
+        acc += mix + block.var();
+        stream.push(acc.sqrt());
+        lines.push(format!(
+            "layer={l} {:?}/{:?}: mixer var {mix:.4e} [{}]; block var {:.4e} [{} | shared {}]; \
+             router band {:.4e} stream band {:.4e}",
+            k.mixer,
+            k.ffn,
+            terms_text(&mixer),
+            block.var(),
+            terms_text(&block.main),
+            terms_text(&block.shared),
+            router[l],
+            stream[l]
+        ));
+    }
+    let head = site(split, &names::output(), Arm::Gemv, 1.0)?;
+    let q_head = head.rel.joint();
+    lines.push(format!(
+        "head: input rounding [{}] var {:.4e}",
+        head.text(),
+        head.var()
+    ));
+    Ok(FxBands {
+        router,
+        stream,
+        head: (acc + head.var()).sqrt(),
+        q_head,
+        lines,
+    })
+}
+
+impl FxBands {
+    /// Every layer's terms and the head's band.
+    pub fn print(&self, clause: &str) {
+        for line in &self.lines {
+            println!("{clause} ik_bands {line}");
+        }
+        println!(
+            "{clause} ik_bands head band {:.4e} (the {} layers' variances and the head's own \
+             input {:.4e}, in quadrature)",
+            self.head,
+            self.stream.len(),
+            self.q_head
+        );
+    }
+}
+
+/// The most error two ranked values may carry at an excused flip, `route_cap`'s form on ik's
+/// router logits `z` at the cell: each ranked value (a sigmoid score plus the bias) moves by at
+/// most 1/4 of its logit's move, which is `band` times the logits' RMS; two values, three
+/// deviations each.
+pub fn fx_route_cap(band: f64, z: &[f32]) -> f64 {
+    flip::flip_cap(band / 4.0, z)
+}
+
+/// ik's routing of one routed layer over the set's tokens: its ranked
+/// values (`ffn_moe_probs_biased`, `N_EXPERT` a token) and its chosen
+/// ids (`N_USED` a token).
+pub struct IkRoute {
+    pub biased: Vec<f32>,
+    pub ids: Vec<i32>,
+}
+
+impl IkRoute {
+    pub fn read(man: &RefManifest, l: usize) -> Result<IkRoute, GateError> {
+        let biased = ref_tensor_logical_in(
+            &man.dir,
+            man.tensor(&format!("ffn_moe_probs_biased-{l}"), 0)?,
+        )?;
+        let row = man.tensor(&format!("ffn_moe_topk-{l}"), 0)?;
+        let ids = topk_ids_logical_within(man, row, N_EXPERT as u32)?;
+        if biased.len() % N_EXPERT != 0 || ids.len() * N_EXPERT != biased.len() * N_USED {
+            return Err(format!(
+                "layer {l}: {} ranked values and {} ids",
+                biased.len(),
+                ids.len()
+            )
+            .into());
+        }
+        Ok(IkRoute { biased, ids })
+    }
+
+    pub fn tokens(&self) -> usize {
+        self.ids.len() / N_USED
+    }
+
+    /// Token `t`'s ranked values and ids.
+    pub fn at(&self, t: usize) -> (&[f32], &[i32]) {
+        (
+            &self.biased[t * N_EXPERT..(t + 1) * N_EXPERT],
+            &self.ids[t * N_USED..(t + 1) * N_USED],
+        )
+    }
+
+    /// ik's own margin at token `t`: its eighth pick's ranked value less
+    /// the best it left.
+    pub fn margin(&self, t: usize) -> f64 {
+        let (v, ids) = self.at(t);
+        flip::margin(v, ids)
     }
 }

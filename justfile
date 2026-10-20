@@ -3096,6 +3096,16 @@ gate-gpu-glm5next-stagger:
 gate-gpu-glm5next-media:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-glm5next-media && bash tools/gate.sh --oxide -p bloomery-gpu-glm5next --release --lib && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,vision --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only media'
 
+# The tensor-parallel GLM-5.3-Flash body (`gpu-glm5next/src/tp`): the crate's host tests (each rank's part of a tensor,
+# the head's merge), then gate_glm5next_tp, one, two and four ranks on the one visible card, each a context of its own,
+# their parts carried by a loopback: one rank against the one-card body, every rank alike and within the fixture's bands
+# of one rank, a rerun bit for bit, and each run against ik's batch set (the bin's doc lists the clauses). The fixture's
+# card budget is unset: the one-card body (n1) compares against holds every expert its plan admits on the card, and the
+# bin refuses the lever. Fixture-only (tools/ref/fixture-only.sh): the real file's ranks are loaded across nodes, not on
+# one card.
+gate-gpu-glm5next-tp:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-glm5next-tp && bash tools/gate.sh --oxide -p bloomery-gpu-glm5next --release --lib -- tp:: && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_tp && unset BLOOMERY_CARD_BUDGET && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_tp'
+
 # The serve seat's media call of the same fixture (`bloomery-serve --mmproj` on a GLM file), gate_glm5next_e2e's `--only media-seat`
 # ((sm), `shared/glm5next_media.rs`'s `seat`, built with the `vision` feature the other recipes leave out): the encoder file of
 # the fixture's image sets, seated as the seat seats it and loaded as its resident tower; two procedural images of known grids

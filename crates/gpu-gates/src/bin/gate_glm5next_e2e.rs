@@ -463,7 +463,7 @@ mod gate {
         refused_by, refused_saying, rel, same_bits, second, set_open, tap, tap_at, tie_numbers,
         word_after, worst_off_path,
     };
-    use crate::glm5next_tier;
+    use crate::glm5next_tier::{self, FxBands, IkRoute, fx_route_cap, ik_bands};
     use crate::quiet::Quiet;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -912,50 +912,6 @@ mod gate {
     }
 
     // ------------------------------------------------ routing and flips
-
-    /// ik's routing of one routed layer over the set's tokens: its ranked
-    /// values (`ffn_moe_probs_biased`, [`N_EXPERT`] a token) and its chosen
-    /// ids ([`N_USED`] a token).
-    struct IkRoute {
-        biased: Vec<f32>,
-        ids: Vec<i32>,
-    }
-
-    impl IkRoute {
-        fn read(man: &RefManifest, l: usize) -> Result<IkRoute, GateError> {
-            let biased = tap(man, &format!("ffn_moe_probs_biased-{l}"))?;
-            let row = man.tensor(&format!("ffn_moe_topk-{l}"), 0)?;
-            let ids = topk_ids_logical_within(man, row, N_EXPERT as u32)?;
-            if biased.len() % N_EXPERT != 0 || ids.len() * N_EXPERT != biased.len() * N_USED {
-                return Err(format!(
-                    "layer {l}: {} ranked values and {} ids",
-                    biased.len(),
-                    ids.len()
-                )
-                .into());
-            }
-            Ok(IkRoute { biased, ids })
-        }
-
-        fn tokens(&self) -> usize {
-            self.ids.len() / N_USED
-        }
-
-        /// Token `t`'s ranked values and ids.
-        fn at(&self, t: usize) -> (&[f32], &[i32]) {
-            (
-                &self.biased[t * N_EXPERT..(t + 1) * N_EXPERT],
-                &self.ids[t * N_USED..(t + 1) * N_USED],
-            )
-        }
-
-        /// ik's own margin at token `t`: its eighth pick's ranked value less
-        /// the best it left.
-        fn margin(&self, t: usize) -> f64 {
-            let (v, ids) = self.at(t);
-            flip::margin(v, ids)
-        }
-    }
 
     /// Our ranked values: the scores plus the selection bias, the f32 add
     /// the router's pick makes.
@@ -1418,90 +1374,6 @@ mod gate {
                 .iter()
                 .filter(|row| sets.takes(row.0.0))
                 .count()
-    }
-
-    /// The fixture's error bands, counted as [`gemm_bands`] counts, over every projection site of
-    /// the file, with each site's rounding the two engines' own (`act_rule::site_rel` at the worst
-    /// crest of each side's block, the two as independent errors): the mixer's sites and the
-    /// block's ([`glm5next_tier::mixer_terms`], [`glm5next_tier::block_terms`]) add as variances,
-    /// layers adding independently, where ik rounds a projection's activation to its weight
-    /// type's format and we read the form each launch reads. `router[l]` is the band of layer
-    /// `l`'s router input (the layers before it and its own mixer), `stream[l]` of the streams
-    /// after the layer, and `head` of the logits: the last stream and the head's own input,
-    /// which ik rounds and we read as f32.
-    struct FxBands {
-        router: Vec<f64>,
-        stream: Vec<f64>,
-        head: f64,
-        /// The head's own input's rounding.
-        q_head: f64,
-        /// Each layer's sites and bands, as printed.
-        lines: Vec<String>,
-    }
-
-    /// The bands of the file `split` whose layers are `kinds`, its dense projections read on `dense`
-    /// (`Arm::Gemv` below [`GEMM_FROM`] columns, `Arm::Gemm` from it).
-    fn ik_bands(split: &Split, kinds: &[Layer], dense: Arm) -> Result<FxBands, GateError> {
-        let (mut acc, mut router, mut stream, mut lines) =
-            (0.0f64, Vec::new(), Vec::new(), Vec::new());
-        for (l, k) in kinds.iter().enumerate() {
-            let mixer = glm5next_tier::mixer_terms(split, l, k.mixer, dense)?;
-            let block = glm5next_tier::block_terms(split, l, k.ffn, dense)?;
-            let mix = glm5next_tier::var(&mixer);
-            router.push((acc + mix).sqrt());
-            acc += mix + block.var();
-            stream.push(acc.sqrt());
-            lines.push(format!(
-                "layer={l} {:?}/{:?}: mixer var {mix:.4e} [{}]; block var {:.4e} [{} | shared {}]; \
-                 router band {:.4e} stream band {:.4e}",
-                k.mixer,
-                k.ffn,
-                glm5next_tier::terms_text(&mixer),
-                block.var(),
-                glm5next_tier::terms_text(&block.main),
-                glm5next_tier::terms_text(&block.shared),
-                router[l],
-                stream[l]
-            ));
-        }
-        let head = glm5next_tier::site(split, &names::output(), Arm::Gemv, 1.0)?;
-        let q_head = head.rel.joint();
-        lines.push(format!(
-            "head: input rounding [{}] var {:.4e}",
-            head.text(),
-            head.var()
-        ));
-        Ok(FxBands {
-            router,
-            stream,
-            head: (acc + head.var()).sqrt(),
-            q_head,
-            lines,
-        })
-    }
-
-    impl FxBands {
-        /// Every layer's terms and the head's band.
-        fn print(&self, clause: &str) {
-            for line in &self.lines {
-                println!("{clause} ik_bands {line}");
-            }
-            println!(
-                "{clause} ik_bands head band {:.4e} (the {} layers' variances and the head's own \
-                 input {:.4e}, in quadrature)",
-                self.head,
-                self.stream.len(),
-                self.q_head
-            );
-        }
-    }
-
-    /// The most error two ranked values may carry at an excused flip, `route_cap`'s form on ik's
-    /// router logits `z` at the cell: each ranked value (a sigmoid score plus the bias) moves by at
-    /// most 1/4 of its logit's move, which is `band` times the logits' RMS; two values, three
-    /// deviations each.
-    fn fx_route_cap(band: f64, z: &[f32]) -> f64 {
-        flip::flip_cap(band / 4.0, z)
     }
 
     /// The error a fixture-oracle clause ended in, printed as its FAIL, never the gate's end: a set
