@@ -58,7 +58,7 @@ pub struct GatherSet {
 }
 
 /// One slot's place on the page.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Slot {
     shape: GatherShape,
     /// Byte of the first set's part of rank 0.
@@ -366,8 +366,9 @@ struct Ring<P: Page + 'static> {
 
 impl<P: Page + 'static> Ring<P> {
     /// Rank `r` of `layouts` on `pages[r]`, a link for every pair of ranks.
-    /// Pages of another count than the layouts, or crossings that do not fit
-    /// before a page's tail, are refused by name.
+    /// Pages of another count than the layouts, a layout that is not rank
+    /// `r` of them or whose slots and tail lie unlike rank 0's, and crossings
+    /// that do not fit before a page's tail are refused by name.
     fn new(layouts: &[Gathers], pages: &[Arc<P>], cols: &PostCols) -> Result<Ring<P>, GpuError> {
         const WHAT: &str = "the gather loopback";
         if pages.len() != layouts.len() {
@@ -375,6 +376,24 @@ impl<P: Page + 'static> Ring<P> {
                 WHAT,
                 format!("{} pages for {} ranks", pages.len(), layouts.len()),
             ));
+        }
+        let first = layouts
+            .first()
+            .ok_or_else(|| GpuError::shape(WHAT, "no ranks"))?;
+        for (rank, l) in layouts.iter().enumerate() {
+            if l.ranks != layouts.len()
+                || l.rank != rank
+                || l.end != first.end
+                || l.slots != first.slots
+            {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "place {rank}: rank {} of {} unlike rank 0's layout",
+                        l.rank, l.ranks
+                    ),
+                ));
+            }
         }
         let mut ends: Vec<Arc<dyn Side<P>>> = Vec::new();
         for (a, la) in layouts.iter().enumerate() {
@@ -410,10 +429,10 @@ impl<P: Page + 'static> Ring<P> {
             .or_else(|| self.pumps.iter().find_map(Pump::ended))
     }
 
-    /// Release every counter the ends read to `v` ([`release_settled`]).
-    fn release(&self, v: u32) -> Result<(), String> {
+    /// Release every counter the ends read ([`release_settled`]).
+    fn release(&self) -> Result<(), String> {
         let ends: Vec<&dyn Side<P>> = self.ends.iter().map(|e| &**e).collect();
-        release_settled(&ends, v)
+        release_settled(&ends, RELEASE)
     }
 }
 
@@ -433,8 +452,9 @@ pub struct GatherLoop(Ring<MappedHost>);
 impl GatherLoop {
     /// Rank `r` of `layouts` (one [`Gathers`] a rank, alike) on `pages[r]`,
     /// every end posting the rows `cols` holds. Pages of another count than
-    /// the layouts, or a layout whose crossings do not fit before its tail,
-    /// are refused by name.
+    /// the layouts, layouts that are not ranks 0..N of N laid out alike, and
+    /// a layout whose crossings do not fit before its tail are refused by
+    /// name.
     pub fn new(
         layouts: &[Gathers],
         pages: &[Arc<MappedHost>],
@@ -454,7 +474,7 @@ impl GatherLoop {
     /// waiting. `Err` names the ends that could not settle.
     pub fn release(&self) -> Result<(), GpuError> {
         self.0
-            .release(RELEASE)
+            .release()
             .map_err(|detail| GpuError::shape("GatherLoop::release", detail))
     }
 }
@@ -471,7 +491,6 @@ mod tests {
     use super::{GatherSet, GatherShape, Gathers, Ring};
     use crate::Gpu;
     use crate::graph::{MappedHost, mem_batch};
-    use crate::host::step::RELEASE;
     use crate::tensor::WindowMut;
     use cuda_core::DeviceBuffer;
 
@@ -497,14 +516,6 @@ mod tests {
         (1..ranks).fold(value(g, 0, i), |acc, r| acc + value(g, r, i))
     }
 
-    impl<P: Page + 'static> Ring<P> {
-        /// Release every counter the ends read, for a test that failed with
-        /// cards still waiting.
-        fn release_all(&self) {
-            self.release(RELEASE).expect("the loopback's ends settle");
-        }
-    }
-
     const SHAPE: GatherShape = GatherShape { rows: 4, width: 24 };
     /// Rows a gather carries: fewer than the slot holds.
     const ROWS: usize = 3;
@@ -527,16 +538,50 @@ mod tests {
         (layouts, pages, ring)
     }
 
-    // The loopback refuses by name, before any pump starts, pages of another count than the
-    // ranks' layouts.
+    // The loopback refuses by name, before any pump starts and without a panic, pages of another
+    // count than the ranks' layouts, and layouts that are not ranks 0..N of N laid out alike:
+    // one-row slots of widths 1 and 2 share a part stride, counters and tail, and still do not
+    // join.
     #[test]
     fn a_loopback_of_other_pages_than_its_ranks_is_refused() {
         let (layouts, pages, ring) = mem_ring(2);
         drop(ring);
-        let e = Ring::new(&layouts, &pages[..1], &PostCols::default())
-            .map(|_| ())
-            .unwrap_err();
-        assert!(e.to_string().contains("1 pages for 2 ranks"), "{e}");
+        let width = |rank, width| {
+            Gathers::new(40, 2, rank, &[GatherShape { rows: 1, width }]).expect("a gather page")
+        };
+        let (narrow, wide) = (width(0, 1), width(1, 2));
+        assert_eq!(narrow.page_bytes(), wide.page_bytes());
+        let three = Gathers::new(40, 3, 1, &[SHAPE]).expect("a gather page");
+        let swapped = vec![layouts[1].clone(), layouts[0].clone()];
+        let mut accepted = Vec::new();
+        for (what, bad, n, says) in [
+            ("one page", layouts.clone(), 1, "1 pages for 2 ranks"),
+            ("no ranks", Vec::new(), 0, "no ranks"),
+            (
+                "widths 1 and 2",
+                vec![narrow, wide],
+                2,
+                "place 1: rank 1 of 2 unlike",
+            ),
+            ("ranks swapped", swapped, 2, "place 0: rank 1 of 2 unlike"),
+            (
+                "ranks of 2 and 3",
+                vec![layouts[0].clone(), three],
+                2,
+                "place 1: rank 1 of 3 unlike",
+            ),
+        ] {
+            let got = std::panic::catch_unwind(|| {
+                Ring::new(&bad, &pages[..n], &PostCols::default()).map(|_| ())
+            });
+            if !got
+                .as_ref()
+                .is_ok_and(|r| r.as_ref().is_err_and(|e| e.to_string().contains(says)))
+            {
+                accepted.push((what, got.map(|r| r.map_err(|e| e.to_string()))));
+            }
+        }
+        assert!(accepted.is_empty(), "not refused by name: {accepted:?}");
     }
 
     /// Wait until the counter at `off` holds at least one, then take one
@@ -611,7 +656,7 @@ mod tests {
                 .collect()
         });
         if let Some(b) = ring.broken() {
-            ring.release_all();
+            ring.release().expect("the loopback's ends settle");
             panic!("the loopback broke: {b}");
         }
         got
@@ -774,7 +819,7 @@ mod tests {
             let until = Instant::now() + Duration::from_secs(60);
             while !ends.iter().all(|e| e.query().expect("an event query")) {
                 if Instant::now() > until || ring.broken().is_some() {
-                    ring.release_all();
+                    ring.release().expect("the loopback's ends settle");
                     gpus.iter()
                         .for_each(|g| g.stream().synchronize().expect("drained"));
                     panic!("{ranks} ranks: the chains stalled: {:?}", ring.broken());

@@ -434,11 +434,16 @@ impl Rank {
 /// `ranks[r]`: the ranks' launches a sub-layer at a time (module doc), every head, then the
 /// merge of the ranks' picks, the step's token. The ranks' links are joined before the first
 /// step. Blocking. Refused by name before any launch: ranks out of rank order or of another
-/// count than their own, a position past a rank's stores or other than the one its stores stand
-/// at ([`at_pos`]), and a token past the vocabulary. A step that fails once its launches go out
-/// leaves every rank refusing the next (`Rank`).
+/// count than their own, ranks of unlike trunks ([`alike`]), a position past a rank's stores or
+/// other than the one its stores stand at ([`at_pos`]), and a token past the vocabulary. A step
+/// that fails once its launches go out leaves every rank refusing the next (`Rank`).
 pub fn step(ranks: &mut [(&Gpu, &mut Rank)], token: u32, pos: u32) -> Result<u32, GpuError> {
     let n = ranks.len();
+    let layers = alike(
+        ranks
+            .iter()
+            .map(|(_, r)| (r.cfg.len(), r.dims.embd, r.head.n_vocab())),
+    )?;
     for (i, (_, r)) in ranks.iter().enumerate() {
         if r.at.rank() != i || r.at.ranks() != n {
             return Err(shape(format!(
@@ -449,7 +454,6 @@ pub fn step(ranks: &mut [(&Gpu, &mut Rank)], token: u32, pos: u32) -> Result<u32
         }
         at_pos(r.next_pos, r.ctx, pos)?;
     }
-    let layers = ranks.iter().map(|(_, r)| r.cfg.len()).max().unwrap_or(0);
     for (gpu, r) in ranks.iter_mut() {
         r.begin(gpu, token, pos)?;
     }
@@ -475,6 +479,24 @@ pub fn step(ranks: &mut [(&Gpu, &mut Rank)], token: u32, pos: u32) -> Result<u32
         r.next_pos = Some(pos + 1);
     }
     Ok(token)
+}
+
+/// The layer count of ranks whose trunks are `(layers, embedding width, head rows)` each, which
+/// one step joins: refused by name for no rank, or a rank whose trunk is unlike rank 0's.
+fn alike(trunks: impl IntoIterator<Item = (usize, usize, usize)>) -> Result<usize, GpuError> {
+    let mut trunks = trunks.into_iter();
+    let first = trunks
+        .next()
+        .ok_or_else(|| shape("a step over no ranks".into()))?;
+    for (r, t) in trunks.enumerate() {
+        if t != first {
+            return Err(shape(format!(
+                "rank {}'s (layers, width, head rows) {t:?} unlike rank 0's {first:?}",
+                r + 1
+            )));
+        }
+    }
+    Ok(first.0)
 }
 
 /// Refused by name unless stores of `ctx` positions that stand at `next` (a rank's
@@ -588,7 +610,7 @@ fn shape(detail: String) -> GpuError {
 
 #[cfg(test)]
 mod tests {
-    use super::{arm_at, at_pos, check_ctx};
+    use super::{alike, arm_at, at_pos, check_ctx};
     use model::arch::glm5next::place::ORACLE_POSITIONS;
 
     /// A load of no positions or past the reference sets' positions is refused.
@@ -613,6 +635,32 @@ mod tests {
         ] {
             assert!(at_pos(next, 4, pos).is_err(), "{next:?} at {pos}");
         }
+    }
+
+    /// A step joins ranks of one trunk, at N = 1, 2 and 4; no rank, and a rank of another layer
+    /// count, width or head part, are refused.
+    #[test]
+    fn a_step_joins_only_ranks_of_one_trunk() {
+        let t = (3, 64, 8);
+        for n in [1, 2, 4] {
+            assert_eq!(alike(vec![t; n]).unwrap(), 3, "{n} ranks");
+        }
+        let mut accepted = Vec::new();
+        if alike([]).is_ok() {
+            accepted.push(("no ranks", 0, t));
+        }
+        for other in [(2, 64, 8), (4, 64, 8), (3, 32, 8), (3, 64, 16)] {
+            for n in [2, 4] {
+                let mut trunks = vec![t; n];
+                trunks[n - 1] = other;
+                let refused = alike(trunks)
+                    .is_err_and(|e| e.to_string().contains(&format!("rank {}'s", n - 1)));
+                if !refused {
+                    accepted.push(("last rank unlike", n, other));
+                }
+            }
+        }
+        assert!(accepted.is_empty(), "not refused by name: {accepted:?}");
     }
 
     /// Taps arm only on stores that have taken no step; after a step or a failed one, arming is
