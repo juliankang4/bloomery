@@ -50,7 +50,6 @@ use crate::program::{hc_in, hc_out};
 use crate::tensors::LayerNames;
 use crate::{ffn, kda, mla};
 
-use source::GgufSource;
 pub use source::RankOf;
 
 /// What the errors name.
@@ -147,8 +146,7 @@ impl Rank {
             .collect::<Result<Vec<_>, _>>()?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
-        let src = GgufSource::new(&file, inputs.hp.n_head);
-        let mut w = load(gpu, &file, &src, at, spec.layers.len())?;
+        let mut w = load(gpu, &file, at, spec.layers.len(), inputs.hp.n_head)?;
         let kinds: Vec<_> = cfg.iter().map(|c| c.kind).collect();
         Body::derive(stream, &kinds, 0..kinds.len(), &mut w)?;
         for (c, n) in cfg.iter().zip(&names) {
@@ -165,7 +163,7 @@ impl Rank {
             .collect::<Result<Vec<_>, _>>()?;
         let slots = DeviceTensor::upload(stream, &map.stage_view(), run.len(), N_EXPERT)?;
         let card = CardExperts::rank(gpu, &w, &spec.layers, dims.embd, ff)?;
-        let embd = Embedding::new(file, dims.embd)?;
+        let embd = Embedding::new(file, dims.embd, inputs.hp.n_vocab)?;
         let head = Head::new(gpu, &w, dims.rms_eps)?;
         if head.n_vocab() != at.part("the vocabulary", inputs.hp.n_vocab)? {
             return Err(shape(format!(
@@ -548,20 +546,31 @@ impl Drop for Rank {
 fn load(
     gpu: &Gpu,
     file: &Split,
-    src: &GgufSource<'_>,
     at: RankOf,
     layers: usize,
+    heads: usize,
 ) -> Result<Weights, GpuError> {
     let embd = names::token_embd();
-    let mut parts: Vec<TensorPart<'_>> = Vec::new();
-    for (_, t) in file.iter_tensors() {
+    let mut parts = Vec::new();
+    for (shard, t) in file.iter_tensors() {
         let keep = match block_index(&t.name)? {
             Some(l) => l < layers,
             None => t.name != embd,
         };
-        if keep {
-            parts.push(src.part(&t.name, at)?);
+        if !keep {
+            continue;
         }
+        let bytes = file
+            .shard(shard)
+            .ok_or_else(|| shape(format!("{} names shard {shard}", t.name)))?
+            .data(t)?;
+        let cut = model::arch::glm5next::tp::cut(&t.name, &t.dims, heads as u64)
+            .map_err(|e| shape(format!("{}: {e}", t.name)))?;
+        let (info, spans) = source::part_of(t, cut, at)?;
+        parts.push(TensorPart {
+            info,
+            spans: spans.into_iter().map(|r| &bytes[r]).collect(),
+        });
     }
     Weights::load_parts(gpu.stream(), &parts)
 }

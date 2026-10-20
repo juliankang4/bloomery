@@ -701,19 +701,27 @@ impl RowScratch {
 /// times, one copy a stream.
 pub(crate) struct Embedding {
     file: Arc<Split>,
-    n_vocab: usize,
     row: Vec<f32>,
     pub(crate) streams: Vec<f32>,
     table: EmbedTable,
 }
 
 impl Embedding {
-    pub(crate) fn new(file: Arc<Split>, n_embd: usize) -> Result<Embedding, GpuError> {
+    pub(crate) fn new(
+        file: Arc<Split>,
+        n_embd: usize,
+        n_vocab: usize,
+    ) -> Result<Embedding, GpuError> {
         let name = names::token_embd();
-        let table = EmbedTable::new(file.clone(), &name, n_embd)?;
+        let table = EmbedTable::new(Arc::clone(&file), &name, n_embd)?;
+        if table.n_vocab() != n_vocab {
+            return Err(shape(format!(
+                "the embedding has {} rows, the file's vocabulary {n_vocab}",
+                table.n_vocab()
+            )));
+        }
         Ok(Embedding {
             file,
-            n_vocab: table.n_vocab(),
             row: vec![0.0; n_embd],
             streams: vec![0.0; HC_STREAMS * n_embd],
             table,
@@ -1724,13 +1732,7 @@ impl Body {
         // The residency machine frees arena slots between passes, which a
         // card hold keeps: a load that starts one keeps the host leg.
         hybrid.attach_arena_leg(gpu, glue.source().is_some())?;
-        let embd = Embedding::new(file, dims.embd)?;
-        if embd.n_vocab != hp.n_vocab {
-            return Err(shape(format!(
-                "the embedding has {} rows, the file's vocabulary {}",
-                embd.n_vocab, hp.n_vocab
-            )));
-        }
+        let embd = Embedding::new(file, dims.embd, hp.n_vocab)?;
         let ckpt = Checkpoints::sequence(
             gpu.context(),
             checkpoint_lens(inputs)?,
@@ -2590,4 +2592,49 @@ pub(crate) fn refuse_steps_under_residency(m: &Glm5nextModel) -> Result<(), GpuE
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gguf::write::{Layout, TensorDecl, Writer};
+
+    #[test]
+    fn the_embedding_rows_must_match_the_declared_vocabulary() {
+        let dir = std::env::temp_dir().join(format!("glm5next-embedding-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut refused = Vec::new();
+        for rows in [3, 4, 5] {
+            let name = names::token_embd();
+            let path = dir.join(format!("{rows}.gguf"));
+            let layout = Layout::new(
+                &[],
+                vec![TensorDecl {
+                    name: name.clone(),
+                    dims: vec![32, rows],
+                    type_id: 0,
+                    nbytes: 4 * 32 * rows,
+                }],
+            )
+            .unwrap();
+            let mut writer = Writer::new(std::fs::File::create(&path).unwrap(), layout).unwrap();
+            writer
+                .tensor(&name, &vec![0; 4 * 32 * rows as usize])
+                .unwrap();
+            writer.finish().unwrap();
+            let file = Arc::new(Split::open(&path).unwrap());
+            let embedding = Embedding::new(file, 32, 4);
+            if rows == 4 {
+                let mut embedding = embedding.unwrap();
+                embedding.fill(3).unwrap();
+                assert!(embedding.fill(4).is_err());
+            } else {
+                refused.push(matches!(embedding, Err(GpuError::Shape { detail, .. })
+                    if detail.contains(&format!("the embedding has {rows} rows"))
+                        && detail.contains("vocabulary 4")));
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(refused, [true, true], "V-1 and V+1 rows must be refused");
+    }
 }

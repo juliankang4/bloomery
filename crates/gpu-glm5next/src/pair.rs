@@ -214,10 +214,13 @@ impl Body {
                 "a verify with the taps armed: a tap holds one row's streams".to_string(),
             ));
         }
-        if let Some(&t) = tokens.iter().find(|&&t| t as usize >= self.embd.n_vocab) {
+        if let Some(&t) = tokens
+            .iter()
+            .find(|&&t| t as usize >= self.embd.table.n_vocab())
+        {
             return Err(shape(format!(
                 "token {t} is past the {} embedding rows",
-                self.embd.n_vocab
+                self.embd.table.n_vocab()
             )));
         }
         let carried = self.shell.hybrid.boundary().rows();
@@ -671,10 +674,10 @@ impl Body {
                 )))
             })?;
             for (o, &t) in own.iter().enumerate() {
-                if t as usize >= self.embd.n_vocab {
+                if t as usize >= self.embd.table.n_vocab() {
                     return Err(named(shape(format!(
                         "token {t} is past the {} embedding rows",
-                        self.embd.n_vocab
+                        self.embd.table.n_vocab()
                     ))));
                 }
                 if r.pos0 as usize + o >= self.ctx {

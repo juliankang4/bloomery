@@ -1,4 +1,4 @@
-//! Where a rank's tensors come from ([`GgufSource`]): each tensor's part for one rank of N, cut
+//! A tensor's part for one rank of N ([`part_of`]), cut
 //! by the family's rule (`model::arch::glm5next::tp::cut`) from the GGUF file's mapped bytes, as
 //! the header entry of the part and its rows' bytes, which
 //! [`Weights::load_parts`](bloomery_gpu::weights::Weights::load_parts) uploads.
@@ -12,9 +12,8 @@
 use std::ops::Range;
 
 use bloomery_gpu::GpuError;
-use bloomery_gpu::weights::{TensorPart, check_part_bytes};
-use gguf::{Split, TensorInfo};
-use model::arch::glm5next::tp;
+use bloomery_gpu::weights::check_part_bytes;
+use gguf::TensorInfo;
 use model::placement::tp::{Cut, card_blocks};
 
 /// What the errors name.
@@ -60,55 +59,12 @@ impl RankOf {
     }
 }
 
-/// The GGUF file's parts: each cut from the tensor's mapped bytes, every slice borrowed.
-pub(super) struct GgufSource<'f> {
-    file: &'f Split,
-    /// The heads the attention splits by.
-    heads: u64,
-}
-
-impl<'f> GgufSource<'f> {
-    /// The parts of `file`, whose attention has `heads` heads.
-    #[must_use]
-    pub(super) fn new(file: &'f Split, heads: usize) -> GgufSource<'f> {
-        GgufSource {
-            file,
-            heads: heads as u64,
-        }
-    }
-}
-
-impl GgufSource<'_> {
-    /// Rank `at`'s part of tensor `name`, cut by the family's rule, or the whole tensor where the
-    /// rule keeps it whole. A tensor the file lacks, a stem with no rule and a cut that does not
-    /// fall on whole units and format blocks are refused by name.
-    pub(super) fn part(&self, name: &str, at: RankOf) -> Result<TensorPart<'_>, GpuError> {
-        let (shard, t) = self.file.find(name).ok_or_else(|| GpuError::Tensor {
-            what: WHAT,
-            name: name.to_string(),
-            need: "a tensor of the file",
-        })?;
-        let bytes = self
-            .file
-            .shard(shard)
-            .ok_or_else(|| GpuError::shape(WHAT, format!("{name} names shard {shard}")))?
-            .data(t)?;
-        let cut = tp::cut(name, &t.dims, self.heads)
-            .map_err(|why| GpuError::shape(WHAT, format!("{name}: {why}")))?;
-        let (info, spans) = part_of(t, cut, at)?;
-        Ok(TensorPart {
-            info,
-            spans: spans.into_iter().map(|r| &bytes[r]).collect(),
-        })
-    }
-}
-
 /// Rank `at`'s part of tensor `t` cut by `cut` (module doc): the part's header entry (its dims,
 /// its bytes) and the byte ranges of its rows in the tensor's bytes, in row order. A tensor whose
 /// dims and bytes disagree, a cut the plan's rule refuses (`Cut::part`, along dim 0 the type's
 /// block and its role's kernel unit, `card_blocks`) and byte counts past u64 or usize are refused
 /// by name.
-fn part_of(
+pub(super) fn part_of(
     t: &TensorInfo,
     cut: Option<Cut>,
     at: RankOf,

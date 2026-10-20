@@ -1016,10 +1016,14 @@ impl Body {
                 nx.held
             )));
         }
-        if let Some(&t) = feed.tokens.iter().find(|&&t| t as usize >= embd.n_vocab) {
+        if let Some(&t) = feed
+            .tokens
+            .iter()
+            .find(|&&t| t as usize >= embd.table.n_vocab())
+        {
             return Err(shape(format!(
                 "token {t} is past the {} embedding rows",
-                embd.n_vocab
+                embd.table.n_vocab()
             )));
         }
         if let Some(rows) = feed.media
