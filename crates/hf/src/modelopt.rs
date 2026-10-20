@@ -107,10 +107,9 @@ pub struct Normal {
 /// |---|---|---|
 /// | NVFP4 (ModelOpt) | NVFP4 (40), `.scale` a tensor or an expert (`linear`, `experts`) | [`GgmlType::NVFP4_ROWS`], `.scale` the table's |
 /// | NVFP4 with `csf` or `csf_32x2_v1` scales | as NVFP4, the scales decoded first ([`csf`]) | none |
-/// | MXFP8 (E8M0 `weight_scale` a 32 values) | [`GgmlType::MXFP8`], bytes as stored (`mxfp8`) | none |
-/// | FP8 with one scale a 128 by 128 block | [`GgmlType::FP8_B128`], values as stored, each row's block its square's scale (`fp8_b128`) | none |
+/// | F8_E4M3 with one scale a block (MXFP8's E8M0 a 32 values, an FP8 block format's), a row or the tensor | the card type the format is held in ([`Format::card_type`]): [`GgmlType::FP8_B128`] or [`GgmlType::MXFP8`], values as stored, each row block the scale of the checkpoint's block it lies in (`fp8`) | none |
 /// | BF16, F32 | Q8_0, F32 or BF16 as [`Plain`] says | none |
-/// | FP8 with one tensor scale (its companion) | none | [`GgmlType::F8E4M3_ROWS`], bytes as stored |
+/// | FP8 with one tensor scale (its companion) | as above | [`GgmlType::F8E4M3_ROWS`], bytes as stored |
 ///
 /// Every other pair has no GGUF type here yet.
 #[must_use]
@@ -120,14 +119,10 @@ pub fn type_of(format: Format, role: Use) -> Option<u32> {
             Some(GgmlType::NVFP4.as_u32())
         }
         (Format::Nvfp4, Use::Rows) => Some(GgmlType::NVFP4_ROWS.as_u32()),
-        (Format::Mxfp8, Use::Matrix(_)) => Some(GgmlType::MXFP8.as_u32()),
         (
-            Format::Fp8Block {
-                rows: 128,
-                cols: 128,
-            },
+            Format::Mxfp8 | Format::Fp8Block { .. } | Format::Fp8Channel | Format::Fp8Tensor,
             Use::Matrix(_),
-        ) => Some(GgmlType::FP8_B128.as_u32()),
+        ) => format.card_type().map(GgmlType::as_u32),
         (Format::Bf16 | Format::F32, Use::Matrix(Plain::Q8_0)) => Some(GgmlType::Q8_0.as_u32()),
         (Format::Bf16 | Format::F32, Use::Matrix(Plain::F32)) => Some(GgmlType::F32.as_u32()),
         (Format::Bf16, Use::Matrix(Plain::Bf16)) => Some(GgmlType::BF16.as_u32()),
@@ -197,9 +192,9 @@ pub fn format_of(sources: &[(&str, &Placed)]) -> Result<Format, Error> {
 /// # Errors
 ///
 /// A refusal of [`format_of`]; a pair [`type_of`] has no type for; a tensor `get` refuses or
-/// lacks; a refusal of `linear`, `experts` or `fp8_b128`; a stack of a format that is neither
-/// NVFP4 nor FP8 block; a shape or dtype the format does not hold; a non-finite value or scaled
-/// value; and a row a [`Plain::Q8_0`] block does not divide, each by name.
+/// lacks; a refusal of `linear`, `experts` or `fp8`; a stack of a type other than NVFP4 and
+/// FP8_B128; a shape or dtype the format does not hold; a non-finite value or scaled value; and
+/// a row a [`Plain::Q8_0`] block does not divide, each by name.
 pub fn normalize<'a>(
     get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     sources: &[(&str, &Placed)],
@@ -218,14 +213,17 @@ pub fn normalize<'a>(
         Format::Nvfp4 => None,
         Format::Nvfp4Csf => Some(csf::Encoding::Csf),
         Format::Nvfp4Csf32 => Some(csf::Encoding::Csf32),
-        Format::Fp8Block { .. } => return fp8_b128(get, sources, type_id),
-        _ if sources.len() != 1 => {
+        _ if sources.len() != 1 && type_id != GgmlType::FP8_B128.as_u32() => {
             return Err(refuse(format!(
-                "in a stack of {}: only NVFP4 and FP8 block experts stack here",
+                "in a stack of {}: only NVFP4 and FP8_B128 experts stack here",
                 sources.len()
             )));
         }
-        Format::Mxfp8 => return mxfp8(get, sources[0], type_id),
+        Format::Mxfp8 | Format::Fp8Block { .. } | Format::Fp8Channel | Format::Fp8Tensor
+            if role != Use::Rows =>
+        {
+            return fp8(get, sources, type_id);
+        }
         _ => return plain(get, name, placed, role, type_id),
     };
     if role == Use::Rows {
@@ -405,89 +403,25 @@ fn nvfp4_rows<'a>(
     })
 }
 
-/// The MXFP8 weight `source` as [`GgmlType::MXFP8`], moved without a change of value: each
-/// row's 32-value blocks in order, each its E8M0 `weight_scale` byte then its 32 F8_E4M3 value
-/// bytes as stored. A block [`check_mxfp8`] refuses (an E8M0 or E4M3 NaN, a product past f32) is
-/// refused naming its row.
-fn mxfp8<'a>(
-    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
-    (weight, placed): (&str, &Placed),
-    type_id: u32,
-) -> Result<Normal, Error> {
-    let refuse = |what: String| Error::Format {
-        name: weight.to_string(),
-        format: Format::Mxfp8,
-        what,
-    };
-    let [sname] = placed.companions.as_slice() else {
-        return Err(refuse(format!(
-            "its place names {:?}, not one E8M0 scale",
-            placed.companions
-        )));
-    };
-    let (w, s) = (get(weight)?, get(sname)?);
-    let &[rows, k] = w.shape else {
-        return Err(refuse(format!("shape {:?}, not [rows, k]", w.shape)));
-    };
-    if w.dtype != Dtype::F8E4M3 || rows == 0 || k == 0 || !k.is_multiple_of(32) {
-        return Err(refuse(format!(
-            "{} {:?}, not F8_E4M3 rows of whole 32-value blocks",
-            w.dtype.name(),
-            w.shape
-        )));
-    }
-    let blocks = rows.checked_mul(k / 32);
-    if !matches!(s.dtype, Dtype::U8 | Dtype::F8E8M0)
-        || s.shape != [rows, k / 32]
-        || Some(s.bytes.len()) != blocks
-        || Some(w.bytes.len()) != rows.checked_mul(k)
-    {
-        return Err(refuse(format!(
-            "{sname} {} {:?} ({} bytes), {} bytes of values: not one E8M0 byte a 32 values",
-            s.dtype.name(),
-            s.shape,
-            s.bytes.len(),
-            w.bytes.len()
-        )));
-    }
-    let capacity = w
-        .bytes
-        .len()
-        .checked_add(s.bytes.len())
-        .ok_or_else(|| refuse("block bytes size overflow".into()))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    for (values, &e) in w.bytes.as_chunks::<32>().0.iter().zip(s.bytes) {
-        bytes.push(e);
-        bytes.extend_from_slice(values);
-    }
-    for (row, blocks) in bytes.chunks_exact(bytes.len() / rows).enumerate() {
-        check_mxfp8(blocks).map_err(|e| refuse(format!("row {row}: {e}")))?;
-    }
-    Ok(Normal {
-        type_id,
-        dims: vec![k as u64, rows as u64],
-        bytes,
-        scale: vec![],
-    })
-}
-
-/// The FP8 weight with one scale a 128 by 128 block ([`Format::Fp8Block`]) `sources` (one
-/// weight, or a routed stack's experts in expert order) as [`GgmlType::FP8_B128`], its values
-/// unchanged: each row's 128-value blocks in order, each the f32 scale of the square it lies in,
-/// then its 128 F8_E4M3 value bytes as stored; a stack's experts one after another, as
-/// `[k, rows, n_expert]`. The scale grid is `[rows/128, k/128]` (rounded up), or ModelOpt's
-/// `[rows/128, 1, k/128, 1]`, in F32, BF16 or E8M0, each widened to the f32 of the same value.
-/// A block [`check_fp8_b128`] refuses (a scale that is not finite, an E4M3 NaN, a product past
-/// f32) is refused naming its row; an expert whose shape differs from the first's, by name.
-fn fp8_b128<'a>(
+/// The F8_E4M3 weight `sources` (one weight, or a routed stack's experts in expert order) in
+/// `type_id`, the card type its format is held in ([`Format::card_type`]: MXFP8, else FP8_B128),
+/// its values unchanged: each row's blocks of the type in order, each the scale of the
+/// checkpoint's block it lies in ([`Format::fp8_scale_block`]: a block, a row or the tensor),
+/// then its value bytes as stored; a stack's experts one after another, as `[k, rows, n_expert]`.
+/// FP8_B128 writes the scale as an f32, widened from F32, BF16 or E8M0 (U8 or F8_E8M0); MXFP8 as
+/// its E8M0 byte. A block the type's check refuses ([`check_fp8_b128`], [`check_mxfp8`]: a scale
+/// that is not finite, an E4M3 NaN, a product past f32) is refused naming its row; an expert
+/// whose shape differs from the first's, by name.
+fn fp8<'a>(
     get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     sources: &[(&str, &Placed)],
     type_id: u32,
 ) -> Result<Normal, Error> {
+    let ty = GgmlType::from_u32(type_id);
     let mut bytes = Vec::new();
     let mut shape = None;
     for &source in sources {
-        let have = fp8_b128_append(&get, source, &mut bytes)?;
+        let have = fp8_append(&get, source, ty, &mut bytes)?;
         let first = *shape.get_or_insert(have);
         if first != have {
             return Err(Error::Format {
@@ -518,11 +452,11 @@ fn fp8_b128<'a>(
     })
 }
 
-/// Appends the FP8_B128 blocks of the weight `source` ([`fp8_b128`]) to `out`; returns its
-/// `[rows, k]`.
-fn fp8_b128_append<'a>(
+/// Appends the `ty` blocks of the weight `source` ([`fp8`]) to `out`; returns its `[rows, k]`.
+fn fp8_append<'a>(
     get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     (weight, placed): (&str, &Placed),
+    ty: GgmlType,
     out: &mut Vec<u8>,
 ) -> Result<[usize; 2], Error> {
     let refuse = |what: String| Error::Format {
@@ -530,10 +464,17 @@ fn fp8_b128_append<'a>(
         format: placed.format,
         what,
     };
-    // A weight-only place names the block scale alone; an input scale after it is left, since
-    // the activations stay f32.
+    // The type's values a block, its scale's bytes and its check. Its block divides the width
+    // of the checkpoint's: `card_type` picks it so, and a row or tensor scale spans `k`.
+    type Check = fn(&[u8]) -> Result<(), QuantError>;
+    let (blck, unit, check): (usize, usize, Check) = match ty {
+        GgmlType::MXFP8 => (32, 1, check_mxfp8),
+        _ => (128, 4, check_fp8_b128),
+    };
+    // A weight-only place names the scale alone; an input scale after it is left, since the
+    // activations stay f32.
     let Some(sname) = placed.companions.first() else {
-        return Err(refuse("its place names no block scale".into()));
+        return Err(refuse("its place names no scale".into()));
     };
     let (w, s) = (get(weight)?, get(sname)?);
     let &[rows, k] = w.shape else {
@@ -542,50 +483,66 @@ fn fp8_b128_append<'a>(
     if w.dtype != Dtype::F8E4M3
         || rows == 0
         || k == 0
-        || !k.is_multiple_of(128)
+        || !k.is_multiple_of(blck)
         || Some(w.bytes.len()) != rows.checked_mul(k)
     {
         return Err(refuse(format!(
-            "{} {:?} ({} bytes), not F8_E4M3 rows of whole 128-value blocks",
+            "{} {:?} ({} bytes), not F8_E4M3 rows of whole {blck}-value blocks",
             w.dtype.name(),
             w.shape,
             w.bytes.len()
         )));
     }
-    let (r, c) = (rows.div_ceil(128), k / 128);
-    let scales: Vec<f32> = match s.dtype {
-        Dtype::F32 | Dtype::Bf16 => safetensors::f32_values(sname, &s)?,
-        Dtype::F8E8M0 => s.bytes.iter().map(|&e| 2.0 * e8m0_to_f32_half(e)).collect(),
+    let scales: Vec<u8> = match (unit, s.dtype) {
+        (4, Dtype::F32 | Dtype::Bf16) => safetensors::f32_values(sname, &s)?
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        (4, Dtype::U8 | Dtype::F8E8M0) => s
+            .bytes
+            .iter()
+            .flat_map(|&e| (2.0 * e8m0_to_f32_half(e)).to_le_bytes())
+            .collect(),
+        (1, Dtype::U8 | Dtype::F8E8M0) => s.bytes.to_vec(),
         _ => vec![],
     };
-    let unit = match s.dtype {
-        Dtype::F32 => 4,
-        Dtype::Bf16 => 2,
-        _ => 1,
-    };
-    if !(s.shape == [r, c] || s.shape == [r, 1, c, 1])
-        || scales.len() != r * c
-        || s.bytes.len() != unit * scales.len()
-    {
+    // The block one scale covers, when the grid's shape, dtype and bytes are the format's.
+    let block = placed
+        .format
+        .fp8_scale_block(rows, k, s.shape)
+        .filter(|&[a, b]| {
+            let n = rows.div_ceil(a) * k.div_ceil(b);
+            unit.checked_mul(n) == Some(scales.len())
+                && s.dtype.size().checked_mul(n) == Some(s.bytes.len())
+        });
+    let Some([a, b]) = block else {
+        let what = if unit == 4 {
+            "F32, BF16 or E8M0"
+        } else {
+            "E8M0"
+        };
         return Err(refuse(format!(
-            "{sname} {} {:?} ({} bytes): not one F32, BF16 or E8M0 scale a 128 by 128 block, [{r}, {c}]",
+            "{sname} {} {:?} ({} bytes): not the {} grid of one {what} scale a block, as {ty:?} holds it",
             s.dtype.name(),
             s.shape,
-            s.bytes.len()
+            s.bytes.len(),
+            placed.format
         )));
-    }
-    let more = (rows * c)
-        .checked_mul(132)
+    };
+    let c = k.div_ceil(b);
+    let more = (rows * (k / blck))
+        .checked_mul(blck + unit)
         .ok_or_else(|| refuse("block bytes size overflow".into()))?;
     out.try_reserve(more)
         .map_err(|e| refuse(format!("{more} block bytes: {e}")))?;
     for (row, values) in w.bytes.chunks_exact(k).enumerate() {
         let at = out.len();
-        for (col, block) in values.as_chunks::<128>().0.iter().enumerate() {
-            out.extend(scales[row / 128 * c + col].to_le_bytes());
+        for (j, block) in values.chunks_exact(blck).enumerate() {
+            let i = (row / a * c + j * blck / b) * unit;
+            out.extend_from_slice(&scales[i..i + unit]);
             out.extend_from_slice(block);
         }
-        check_fp8_b128(&out[at..]).map_err(|e| refuse(format!("row {row}: {e}")))?;
+        check(&out[at..]).map_err(|e| refuse(format!("row {row}: {e}")))?;
     }
     Ok([rows, k])
 }
@@ -1188,7 +1145,7 @@ mod tests {
             &["b.weight", "b.weight"],
             b,
             m,
-            "in a stack of 2: only NVFP4 and FP8 block experts stack here",
+            "in a stack of 2: only NVFP4 and FP8_B128 experts stack here",
         );
         refused(
             &["f.weight"],
@@ -1356,7 +1313,7 @@ mod tests {
         refused(
             &st,
             &two,
-            "in a stack of 2: only NVFP4 and FP8 block experts stack here",
+            "in a stack of 2: only NVFP4 and FP8_B128 experts stack here",
         );
         let mut nan = scales;
         nan[3] = 0xFF;
@@ -1371,17 +1328,13 @@ mod tests {
         refused(
             &file(&values, &scales, &[rows * 2]),
             &two[..1],
-            "m.weight_scale U8 [6] (6 bytes), 192 bytes of values: not one E8M0 byte a 32 values",
+            "m.weight_scale U8 [6] (6 bytes): not the MXFP8 grid of one E8M0 scale a block, as MXFP8 holds it",
         );
         let bare = Placed {
             format: Format::Mxfp8,
             companions: vec![],
         };
-        refused(
-            &st,
-            &[("m.weight", &bare)],
-            "its place names [], not one E8M0 scale",
-        );
+        refused(&st, &[("m.weight", &bare)], "its place names no scale");
         let odd = Safetensors::parse(write(&[
             ("m.weight", "F8_E4M3", &[4, 48][..], &values),
             ("m.weight_scale", "U8", &[4, 1], &scales[..4]),
@@ -1390,34 +1343,48 @@ mod tests {
         refused(
             &odd,
             &two[..1],
-            "F8_E4M3 [4, 48], not F8_E4M3 rows of whole 32-value blocks",
+            "F8_E4M3 [4, 48] (192 bytes), not F8_E4M3 rows of whole 32-value blocks",
         );
     }
 
-    /// An FP8 weight with one scale a 128 by 128 block moves into [`GgmlType::FP8_B128`] with
-    /// its values unchanged, whatever its role's plain type and whether its grid is F32 `[r, c]`,
-    /// BF16 ModelOpt `[r, 1, c, 1]` or E8M0: block `(row, b)` is the scale of square
-    /// `(row / 128, b)` as an f32 then value bytes `[row, 128 b ..][..128]`, over 130 rows, so
-    /// the last two rows read the second row of squares. `dequant_row` gives each value as its
-    /// E4M3 byte times that scale (decoded here from the bits). A stack of two is the two
-    /// experts' blocks one after another, `[k, rows, 2]`. An expert of another shape than the
-    /// first's, a block `check_fp8_b128` refuses, a row that is not whole 128-value blocks, a
-    /// grid of another shape or dtype, a place with no scale and another block size are refused
-    /// by name.
+    /// An F8_E4M3 weight moves into its format's card type with its values unchanged, whatever
+    /// its role's plain type, each row block the scale of the checkpoint's block it lies in, over
+    /// 130 rows of 256 values: one scale a 128 by 128 block (an F32 `[r, c]`, BF16 ModelOpt
+    /// `[r, 1, c, 1]` or E8M0 grid, so the last two rows read the second row of squares), a row
+    /// (F32 `[rows]`, BF16 `[rows, 1]`) or the tensor (F32 `[]`, BF16 `[1]`) in FP8_B128, and one
+    /// E8M0 a 32 by 32 block in MXFP8 (five rows of squares). Block `(row, b)` is that scale (an
+    /// f32, or the E8M0 byte) then the row's value bytes `[w b ..][..w]`, and `dequant_row` gives
+    /// each value as its E4M3 byte times that scale, both decoded here from the bits. A stack of
+    /// two is the two experts' blocks one after another, `[k, rows, 2]`. An expert of another
+    /// shape than the first's, a block the type's check refuses, a row that is not whole blocks
+    /// of the type, a grid of another shape or dtype, an MXFP8 stack, a place with no scale and
+    /// a block no card type holds are refused by name.
     #[test]
-    fn fp8_block_weights_take_their_square_s_scale_a_row_block() {
+    fn fp8_weights_take_their_block_s_scale_a_row_block() {
         let (rows, k) = (130, 256);
         let values: Vec<u8> = (0..rows * k)
             .map(|i| (i * 37 % 256) as u8)
             .map(|b| if b & 0x7F == 0x7F { b ^ 1 } else { b })
             .collect();
+        // Bytes of `v` as F32 or BF16 (whose values here are BF16's).
+        let enc = |dtype: &str, v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|x| match dtype {
+                    "F32" => x.to_le_bytes().to_vec(),
+                    _ => ((x.to_bits() >> 16) as u16).to_le_bytes().to_vec(),
+                })
+                .collect()
+        };
+        let e8m0 =
+            |e: &[u8]| -> Vec<f32> { e.iter().map(|&e| 2f32.powi(i32::from(e) - 127)).collect() };
         let grid = [0.5f32, f32::from_bits(0x3951 << 16), -3.0, 2f32.powi(-20)];
-        let f32s: Vec<u8> = grid.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let bf16s: Vec<u8> = grid
-            .iter()
-            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
-            .collect();
+        let (f32s, bf16s) = (enc("F32", &grid), enc("BF16", &grid));
         let e8m0s = [126u8, 127, 128, 107];
+        let row_scales: Vec<f32> = (0..rows as u32)
+            .map(|r| f32::from_bits((0x3800 + 0x93 * r % 0x1000) << 16))
+            .collect();
+        let tensor_scale = [f32::from_bits(0x3e45 << 16)];
+        let e32: Vec<u8> = (0..40).map(|i| 112 + (i * 7 % 29) as u8).collect();
         let file = |values: &[u8], dtype: &str, scales: &[u8], scale_shape: &[usize]| {
             Safetensors::parse(write(&[
                 ("f.weight", "F8_E4M3", &[rows, k][..], values),
@@ -1425,40 +1392,108 @@ mod tests {
             ]))
             .unwrap()
         };
-        let p = Placed {
-            format: Format::Fp8Block {
-                rows: 128,
-                cols: 128,
-            },
+        let placed = |format| Placed {
+            format,
             companions: vec!["f.weight_scale_inv".into()],
         };
-        let e8m0_grid = e8m0s.map(|e| 2f32.powi(i32::from(e) - 127));
-        for (dtype, scales, shape, want_grid) in [
-            ("F32", &f32s[..], &[2, 2][..], grid),
-            ("BF16", &bf16s[..], &[2, 1, 2, 1][..], grid),
-            ("F8_E8M0", &e8m0s[..], &[2, 2][..], e8m0_grid),
-        ] {
+        let b128 = Format::Fp8Block {
+            rows: 128,
+            cols: 128,
+        };
+        let b32 = Format::Fp8Block { rows: 32, cols: 32 };
+        let p = placed(b128);
+        let (channel, tensor) = (Format::Fp8Channel, Format::Fp8Tensor);
+        let cases: [(Format, &str, Vec<u8>, &[usize], Vec<f32>, [usize; 2]); 8] = [
+            (
+                b128,
+                "F32",
+                f32s.clone(),
+                &[2, 2],
+                grid.to_vec(),
+                [128, 128],
+            ),
+            (
+                b128,
+                "BF16",
+                bf16s.clone(),
+                &[2, 1, 2, 1],
+                grid.to_vec(),
+                [128, 128],
+            ),
+            (
+                b128,
+                "F8_E8M0",
+                e8m0s.to_vec(),
+                &[2, 2],
+                e8m0(&e8m0s),
+                [128, 128],
+            ),
+            (
+                channel,
+                "F32",
+                enc("F32", &row_scales),
+                &[rows],
+                row_scales.clone(),
+                [1, k],
+            ),
+            (
+                channel,
+                "BF16",
+                enc("BF16", &row_scales),
+                &[rows, 1],
+                row_scales.clone(),
+                [1, k],
+            ),
+            (
+                tensor,
+                "F32",
+                enc("F32", &tensor_scale),
+                &[],
+                tensor_scale.to_vec(),
+                [rows, k],
+            ),
+            (
+                tensor,
+                "BF16",
+                enc("BF16", &tensor_scale),
+                &[1],
+                tensor_scale.to_vec(),
+                [rows, k],
+            ),
+            (b32, "F8_E8M0", e32.clone(), &[5, 8], e8m0(&e32), [32, 32]),
+        ];
+        for (format, dtype, scales, shape, want_grid, [a, b]) in &cases {
             let st = file(&values, dtype, scales, shape);
+            let (ty, w, unit) = match format {
+                Format::Fp8Block { cols: 32, .. } => (GgmlType::MXFP8, 32, 1),
+                _ => (GgmlType::FP8_B128, 128, 4),
+            };
+            // The scale of value `i`: its block's in the grid, `k / b` (rounded up) a grid row.
+            let scale_of = |i: usize| want_grid[i / k / a * k.div_ceil(*b) + i % k / b];
             for plain in [Plain::Q8_0, Plain::F32, Plain::Bf16] {
+                let p = placed(*format);
                 let n = normalize(|n| st.raw(n), &[("f.weight", &p)], Use::Matrix(plain)).unwrap();
                 assert_eq!(
                     (n.type_id, &n.dims, n.bytes.len(), n.scale.len()),
-                    (GgmlType::FP8_B128.as_u32(), &vec![256, 130], 260 * 132, 0)
+                    (ty.as_u32(), &vec![256, 130], rows * k / w * (w + unit), 0),
+                    "{format} {dtype}"
                 );
                 let mut back_values = vec![];
-                for (b, block) in n.bytes.as_chunks::<132>().0.iter().enumerate() {
-                    let (row, col) = (b / 2, b % 2);
-                    let d = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+                for (blk, block) in n.bytes.chunks_exact(w + unit).enumerate() {
+                    let d = match unit {
+                        4 => f32::from_le_bytes([block[0], block[1], block[2], block[3]]),
+                        _ => 2f32.powi(i32::from(block[0]) - 127),
+                    };
                     assert_eq!(
                         d.to_bits(),
-                        want_grid[row / 128 * 2 + col].to_bits(),
-                        "{dtype} block {b}"
+                        scale_of(blk * w).to_bits(),
+                        "{format} {dtype} block {blk}"
                     );
-                    back_values.extend_from_slice(&block[4..]);
+                    back_values.extend_from_slice(&block[unit..]);
                 }
-                assert_eq!(back_values, values, "{dtype}");
+                assert_eq!(back_values, values, "{format} {dtype}");
                 let mut got = vec![0f32; rows * k];
-                dequant_row(GgmlType::FP8_B128, &n.bytes, &mut got).unwrap();
+                dequant_row(ty, &n.bytes, &mut got).unwrap();
                 for (i, (&g, &v)) in got.iter().zip(&values).enumerate() {
                     let (exp, man) = (i32::from((v >> 3) & 0xF), f64::from(v & 7));
                     let mag = if exp == 0 {
@@ -1467,12 +1502,11 @@ mod tests {
                         (1.0 + man / 8.0) * 2f64.powi(exp - 7)
                     };
                     let sign = if v & 0x80 == 0 { 1.0 } else { -1.0 };
-                    let d = f64::from(want_grid[i / k / 128 * 2 + i % k / 128]);
-                    let want = (sign * mag * d) as f32;
+                    let want = (sign * mag * f64::from(scale_of(i))) as f32;
                     assert_eq!(
                         g.to_bits(),
                         want.to_bits(),
-                        "{dtype} value {i} byte {v:#04x}"
+                        "{format} {dtype} value {i} byte {v:#04x}"
                     );
                 }
             }
@@ -1578,7 +1612,7 @@ mod tests {
         refused(
             &file(&values, "F32", &f32s, &[4]),
             &two[..1],
-            "f.weight_scale_inv F32 [4] (16 bytes): not one F32, BF16 or E8M0 scale a 128 by 128 block, [2, 2]",
+            "f.weight_scale_inv F32 [4] (16 bytes): not the FP8-block 128x128 grid of one F32, BF16 or E8M0 scale a block, as FP8_B128 holds it",
         );
         refused(
             &file(&values, "F16", &bf16s, &[2, 2]),
@@ -1589,11 +1623,7 @@ mod tests {
             format: p.format,
             companions: vec![],
         };
-        refused(
-            &st,
-            &[("f.weight", &bare)],
-            "its place names no block scale",
-        );
+        refused(&st, &[("f.weight", &bare)], "its place names no scale");
         let odd = Safetensors::parse(write(&[
             ("f.weight", "F8_E4M3", &[2, 192][..], &values[..384]),
             ("f.weight_scale_inv", "F32", &[1, 2], &f32s[..8]),
@@ -1604,14 +1634,72 @@ mod tests {
             &two[..1],
             "F8_E4M3 [2, 192] (384 bytes), not F8_E4M3 rows of whole 128-value blocks",
         );
-        let small = Placed {
-            format: Format::Fp8Block { rows: 32, cols: 32 },
-            companions: p.companions.clone(),
-        };
+        for format in [channel, tensor] {
+            refused(
+                &odd,
+                &[("f.weight", &placed(format))],
+                &format!(
+                    "f.weight: {format} F8_E4M3 [2, 192] (384 bytes), not F8_E4M3 rows of whole 128-value blocks"
+                ),
+            );
+        }
+        refused(
+            &file(&values, "F32", &enc("F32", &[1.0; 131]), &[131]),
+            &[("f.weight", &placed(channel))],
+            "f.weight_scale_inv F32 [131] (524 bytes): not the FP8-channel grid",
+        );
+        refused(
+            &file(&values, "F32", &enc("F32", &row_scales), &[1, rows]),
+            &[("f.weight", &placed(channel))],
+            "f.weight_scale_inv F32 [1, 130] (520 bytes): not the FP8-channel grid",
+        );
+        refused(
+            &file(&values, "F32", &f32s[..8], &[2]),
+            &[("f.weight", &placed(tensor))],
+            "f.weight_scale_inv F32 [2] (8 bytes): not the FP8-tensor grid",
+        );
+        let st32 = file(&values, "F8_E8M0", &e32, &[5, 8]);
+        let p32 = placed(b32);
+        refused(
+            &file(&values, "F32", &enc("F32", &e8m0(&e32)), &[5, 8]),
+            &[("f.weight", &p32)],
+            "not the FP8-block 32x32 grid of one E8M0 scale a block, as MXFP8 holds it",
+        );
+        refused(
+            &st32,
+            &[("f.weight", &p32), ("f.weight", &p32)],
+            "in a stack of 2: only NVFP4 and FP8_B128 experts stack here",
+        );
+        let pc = placed(channel);
+        let stc = file(&values, "F32", &enc("F32", &row_scales), &[rows]);
+        let stack = normalize(
+            |n| stc.raw(n),
+            &[("f.weight", &pc); 2],
+            Use::Matrix(Plain::Q8_0),
+        )
+        .unwrap();
+        let one = normalize(
+            |n| stc.raw(n),
+            &[("f.weight", &pc)],
+            Use::Matrix(Plain::Q8_0),
+        )
+        .unwrap();
+        assert_eq!(
+            (&stack.dims, stack.bytes.len()),
+            (&vec![256, 130, 2], 2 * one.bytes.len())
+        );
+        assert!(
+            stack
+                .bytes
+                .chunks_exact(one.bytes.len())
+                .all(|e| e == one.bytes)
+        );
+        // PIN(2026-10-21): FP8 block 32x32 read as a matrix is MXFP8 now (the case above); a
+        // block of 48 values a row lies in no card type's blocks.
         refused(
             &st,
-            &[("f.weight", &small)],
-            "FP8-block 32x32 read as Matrix(Q8_0) has no GGUF type here",
+            &[("f.weight", &placed(Format::Fp8Block { rows: 32, cols: 48 }))],
+            "FP8-block 32x48 read as Matrix(Q8_0) has no GGUF type here",
         );
     }
 
