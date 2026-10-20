@@ -151,20 +151,6 @@ pub enum IqFormat {
 }
 
 impl IqFormat {
-    /// The format of a file tensor type, `None` for every other type.
-    #[must_use]
-    pub fn of(ty: GgmlType) -> Option<IqFormat> {
-        match ty {
-            GgmlType::IQ2_XXS => Some(IqFormat::Iq2Xxs),
-            GgmlType::IQ2_XS => Some(IqFormat::Iq2Xs),
-            GgmlType::IQ3_XXS => Some(IqFormat::Iq3Xxs),
-            GgmlType::IQ3_S => Some(IqFormat::Iq3S),
-            GgmlType::IQ4_XS => Some(IqFormat::Iq4Xs),
-            GgmlType::Q2_K => Some(IqFormat::Q2K),
-            _ => None,
-        }
-    }
-
     /// The file type.
     #[must_use]
     pub fn ggml(self) -> GgmlType {

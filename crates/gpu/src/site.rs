@@ -66,7 +66,7 @@ use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use gguf::Split;
 use gguf::quant::GgmlType;
-use model::placement::kernels::SiteEntry;
+use model::placement::kernels::{self, SiteEntry};
 use std::fmt;
 
 /// The launch family a site's file type selects.
@@ -119,23 +119,43 @@ impl SiteTy {
         SiteTy::Fp8B128,
     ];
 
-    /// The family of a file tensor of type `ty`; `None` for a type no launch
-    /// here reads.
+    /// The family of a file tensor of type `ty`, the one that launches the
+    /// kernel table's dense entry for it (`kernels::dense`); `None` for a type
+    /// no launch here reads.
     #[must_use]
     pub fn of_ggml(ty: GgmlType) -> Option<SiteTy> {
-        match ty {
-            GgmlType::Q3_K => Some(SiteTy::Q3K),
-            GgmlType::Q4_K => Some(SiteTy::Q4K),
-            GgmlType::Q5_K => Some(SiteTy::Q5K),
-            GgmlType::Q6_K => Some(SiteTy::Q6K),
-            GgmlType::Q5_0 => Some(SiteTy::Q5_0),
-            GgmlType::Q8_0 => Some(SiteTy::Q8_0),
-            GgmlType::F32 => Some(SiteTy::F32),
-            GgmlType::NVFP4 => Some(SiteTy::Nvfp4),
-            GgmlType::MXFP8 => Some(SiteTy::Mxfp8),
-            GgmlType::FP8_B128 => Some(SiteTy::Fp8B128),
-            _ => None,
+        kernels::dense(ty).and_then(SiteTy::of_entry)
+    }
+
+    /// The family that launches the kernel table's dense entry `entry`;
+    /// `None` for an entry no family here launches.
+    #[must_use]
+    pub(crate) fn of_entry(entry: SiteEntry) -> Option<SiteTy> {
+        SiteTy::ALL.iter().copied().find(|s| s.entry() == entry)
+    }
+
+    /// The kernel table's dense entry this family launches: the one map
+    /// between the two names.
+    const fn entry(self) -> SiteEntry {
+        match self {
+            SiteTy::Q3K => SiteEntry::Q3k,
+            SiteTy::Q4K => SiteEntry::Q4k,
+            SiteTy::Q5K => SiteEntry::Q5k,
+            SiteTy::Q6K => SiteEntry::Q6k,
+            SiteTy::Q5_0 => SiteEntry::Q5_0,
+            SiteTy::Q8_0 => SiteEntry::Q8_0,
+            SiteTy::F32 => SiteEntry::F32,
+            SiteTy::Nvfp4 => SiteEntry::Nvfp4,
+            SiteTy::Mxfp8 => SiteEntry::Mxfp8,
+            SiteTy::Fp8B128 => SiteEntry::Fp8B128,
         }
+    }
+
+    /// The file type a site of this family holds: the type whose row names
+    /// its entry (`SiteEntry::ty`).
+    #[must_use]
+    pub(crate) fn ggml(self) -> GgmlType {
+        self.entry().ty()
     }
 
     /// Whether the type is one of the four K-quants.
@@ -144,23 +164,13 @@ impl SiteTy {
         self.gemm_weight().is_some()
     }
 
-    /// The grouped GEMM's type of a K-quant; `None` for Q5_0, Q8_0, F32,
-    /// MXFP8 and FP8_B128, whose wide GEMM is the 32-value family's
+    /// The grouped GEMM's type of a K-quant, the one the kernel table's GEMM
+    /// entry for the file type names (`kernels::gemm`); `None` for Q5_0, Q8_0,
+    /// F32, MXFP8 and FP8_B128, whose wide GEMM is the 32-value family's
     /// ([`gemm`]), and NVFP4, which has none.
     #[must_use]
     pub fn gemm_weight(self) -> Option<GemmWeight> {
-        match self {
-            SiteTy::Q3K => Some(GemmWeight::Q3K),
-            SiteTy::Q4K => Some(GemmWeight::Q4K),
-            SiteTy::Q5K => Some(GemmWeight::Q5K),
-            SiteTy::Q6K => Some(GemmWeight::Q6K),
-            SiteTy::Q5_0
-            | SiteTy::Q8_0
-            | SiteTy::F32
-            | SiteTy::Nvfp4
-            | SiteTy::Mxfp8
-            | SiteTy::Fp8B128 => None,
-        }
+        kernels::gemm(self.ggml()).and_then(GemmWeight::of_entry)
     }
 
     /// How [`kgemv`] lays a site's columns out: Q3_K, Q4_K and Q6_K
@@ -179,36 +189,14 @@ impl SiteTy {
     /// The activation form the site's launch reads (`SiteEntry::reads`).
     #[must_use]
     pub const fn reads(self) -> Form {
-        (match self {
-            SiteTy::Q3K => SiteEntry::Q3k,
-            SiteTy::Q4K => SiteEntry::Q4k,
-            SiteTy::Q5K => SiteEntry::Q5k,
-            SiteTy::Q6K => SiteEntry::Q6k,
-            SiteTy::Q5_0 => SiteEntry::Q5_0,
-            SiteTy::Q8_0 => SiteEntry::Q8_0,
-            SiteTy::F32 => SiteEntry::F32,
-            SiteTy::Nvfp4 => SiteEntry::Nvfp4,
-            SiteTy::Mxfp8 => SiteEntry::Mxfp8,
-            SiteTy::Fp8B128 => SiteEntry::Fp8B128,
-        })
-        .reads()
+        self.entry().reads()
     }
 }
 
+/// The family's file type, its ggml name in upper case (`Q4_K`, `NVFP4`).
 impl fmt::Display for SiteTy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            SiteTy::Q3K => "Q3_K",
-            SiteTy::Q4K => "Q4_K",
-            SiteTy::Q5K => "Q5_K",
-            SiteTy::Q6K => "Q6_K",
-            SiteTy::Q5_0 => "Q5_0",
-            SiteTy::Q8_0 => "Q8_0",
-            SiteTy::F32 => "F32",
-            SiteTy::Nvfp4 => "NVFP4",
-            SiteTy::Mxfp8 => "MXFP8",
-            SiteTy::Fp8B128 => "FP8_B128",
-        })
+        f.write_str(&self.ggml().to_string().to_ascii_uppercase())
     }
 }
 
@@ -1157,10 +1145,12 @@ fn swiglu(
 #[cfg(test)]
 mod tests {
     use super::{Form, SiteTy, SwigluLaunch, file_site, swiglu_launch};
+    use crate::gemm::GemmWeight;
     use crate::kquant::Act;
     use gguf::Split;
     use gguf::quant::GgmlType;
     use gguf::write::{Layout, TensorDecl, Writer};
+    use model::placement::kernels;
     use std::fs::File;
     use std::io::BufWriter;
 
@@ -1329,5 +1319,62 @@ mod tests {
         assert_eq!(SiteTy::Mxfp8.kgemv_order(), None);
         assert_eq!(SiteTy::Mxfp8.gemm_weight(), None);
         assert_eq!(SiteTy::Mxfp8.to_string(), "MXFP8");
+    }
+
+    /// Every family is the kernel table's dense row of one file type: a type
+    /// has a family exactly where the table names a dense entry for it, the
+    /// family maps back to that type and is named by it in upper case, its
+    /// K-quant GEMM is the one the table names for the type, and it is a
+    /// `kgemv` exactly where it reads the q8_1 rows of 128 values.
+    #[test]
+    fn every_family_is_the_tables_dense_row_of_one_type() {
+        let own = [
+            GgmlType::F8E4M3_ROWS,
+            GgmlType::MXFP8,
+            GgmlType::NVFP4_ROWS,
+            GgmlType::FP8_B128,
+        ];
+        for ty in gguf::QROWS.iter().map(|r| r.ty).chain(own) {
+            let family = SiteTy::of_ggml(ty);
+            assert_eq!(family.is_some(), kernels::dense(ty).is_some(), "{ty}");
+            if let Some(s) = family {
+                assert_eq!(s.ggml(), ty, "{s}");
+            }
+        }
+        let types: Vec<_> = SiteTy::ALL
+            .iter()
+            .map(|&s| (s.to_string(), s.ggml()))
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ("Q3_K".to_string(), GgmlType::Q3_K),
+                ("Q4_K".to_string(), GgmlType::Q4_K),
+                ("Q5_K".to_string(), GgmlType::Q5_K),
+                ("Q6_K".to_string(), GgmlType::Q6_K),
+                ("Q5_0".to_string(), GgmlType::Q5_0),
+                ("Q8_0".to_string(), GgmlType::Q8_0),
+                ("F32".to_string(), GgmlType::F32),
+                ("NVFP4".to_string(), GgmlType::NVFP4),
+                ("MXFP8".to_string(), GgmlType::MXFP8),
+                ("FP8_B128".to_string(), GgmlType::FP8_B128),
+            ]
+        );
+        let grouped: Vec<_> = SiteTy::ALL
+            .iter()
+            .filter_map(|&s| s.gemm_weight().map(|g| (s, g)))
+            .collect();
+        assert_eq!(
+            grouped,
+            [
+                (SiteTy::Q3K, GemmWeight::Q3K),
+                (SiteTy::Q4K, GemmWeight::Q4K),
+                (SiteTy::Q5K, GemmWeight::Q5K),
+                (SiteTy::Q6K, GemmWeight::Q6K),
+            ]
+        );
+        for &s in SiteTy::ALL {
+            assert_eq!(s.kgemv_order().is_some(), s.reads() == Form::Q8x128, "{s}");
+        }
     }
 }

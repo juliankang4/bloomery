@@ -18,7 +18,6 @@
 //! cross-checked with its interval key by the reader — never from the
 //! layer's number.
 
-use super::body::ggml_ty as ggml_of;
 use super::router::RouterDims;
 use crate::GpuError;
 use crate::linear::{self, LinearShape};
@@ -324,7 +323,7 @@ pub(super) fn gate_up_entry(
             format!("a {gate} gate beside a {up} up; one gate·up launch reads one type"),
         ));
     }
-    qwen35_gate_up(ggml_of(gate)).ok_or_else(|| {
+    qwen35_gate_up(gate.ggml()).ok_or_else(|| {
         GpuError::shape(
             what,
             format!("a {gate} gate·up, which the card kernel table names no entry for here"),
@@ -335,7 +334,7 @@ pub(super) fn gate_up_entry(
 /// The routed down entry the family's FFN dispatch launches a stack of `ty`
 /// with ([`qwen35_down`]), or a named refusal.
 pub(super) fn down_entry(ty: SiteTy, what: &'static str) -> Result<DownEntry, GpuError> {
-    qwen35_down(ggml_of(ty)).ok_or_else(|| {
+    qwen35_down(ty.ggml()).ok_or_else(|| {
         GpuError::shape(
             what,
             format!("a {ty} down `_sel`, which the card kernel table names no entry for here"),
@@ -346,7 +345,7 @@ pub(super) fn down_entry(ty: SiteTy, what: &'static str) -> Result<DownEntry, Gp
 /// The dense site a shared expert's part of `ty` kept apart from its stack
 /// runs at ([`qwen35_shared`]), or a named refusal.
 pub(super) fn shared_entry(ty: SiteTy, what: &'static str) -> Result<SiteEntry, GpuError> {
-    qwen35_shared(ggml_of(ty)).ok_or_else(|| {
+    qwen35_shared(ty.ggml()).ok_or_else(|| {
         GpuError::shape(
             what,
             format!(

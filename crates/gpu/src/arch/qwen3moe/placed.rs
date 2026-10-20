@@ -57,7 +57,7 @@
 //! family's — the same Walk A arithmetic as the whole-card launches — so a
 //! placed load agrees with the whole-card one to the error of those sums.
 
-use super::body::{Kernels, ggml_ty, stack_tys};
+use super::body::{Kernels, stack_tys};
 use super::dispatch::{self, Ctx, PassCtx, SharedDenseBufs};
 use super::hostleg::{HostCombineArgs, HostLegKernels, PlacesArgs};
 use super::plan::{
@@ -1445,7 +1445,7 @@ fn down_sel(
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
-    match down_arm(ggml_ty(ty))? {
+    match down_arm(ty.ggml())? {
         DownArm::Q4k => gpu
             .q4k_sel()
             .enqueue_gemv_q4k_sel(stream, wd, act, sel, n_slots, hidden, y),

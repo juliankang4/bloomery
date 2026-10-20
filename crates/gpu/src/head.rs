@@ -38,8 +38,8 @@ use crate::fault::{Fault, FaultSink, LAYER_HEAD};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use cuda_core::DeviceBuffer;
-use gguf::quant::GgmlType;
 use model::arch::names::output_norm;
+use model::placement::kernels::{self, HeadEntry};
 
 /// The lm_head weight (`output.weight`) in a format a gemv here reads: a
 /// Q6_K or Q4_K word plane over q8_1 rows, or Q8_0's two planes over the
@@ -73,25 +73,23 @@ fn held(act: &mut Option<Q8Act>) -> Result<&mut Q8Act, GpuError> {
 
 /// The lm_head weight (`output.weight`) and its row width. The type is
 /// checked, not assumed — a file whose lm_head is another format needs a
-/// different gemv, and a silent plane reuse would misread its bytes.
+/// different gemv, and a silent plane reuse would misread its bytes: a word
+/// plane runs by the kernel table's head entry for its type (`kernels::head`).
 fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
     match w.get(HEAD_TENSOR) {
-        Some(DevWeight::KQuant { ty, w, k }) => match ty {
-            GgmlType::Q6_K => Ok((OutW::Q6K(w), *k)),
-            GgmlType::Q4_K => Ok((OutW::Q4K(w), *k)),
-            _ => Err(GpuError::shape(
+        Some(DevWeight::KQuant { ty, w, k }) => match kernels::head(*ty) {
+            Some(HeadEntry::Q6k) => Ok((OutW::Q6K(w), *k)),
+            Some(HeadEntry::Q4k) => Ok((OutW::Q4K(w), *k)),
+            Some(HeadEntry::Q8_0) | None => Err(GpuError::shape(
                 "head_out_w",
-                format!(
-                    "{HEAD_TENSOR} is {ty}, want Q6_K, Q4_K or Q8_0 (the gemvs \
-                 this head launches read those rows)"
-                ),
+                format!("{HEAD_TENSOR} is {ty} words, which no head entry reads (kernels::head)"),
             )),
         },
         Some(DevWeight::Q8_0 { qs, d, k }) => Ok((OutW::Q8_0 { qs, d }, *k)),
         Some(_) => Err(GpuError::tensor(
             "head_out_w",
             HEAD_TENSOR,
-            "a Q6_K word plane or Q8_0 planes",
+            "a K-quant word plane or Q8_0 planes",
         )),
         None => Err(GpuError::tensor(
             "head_out_w",

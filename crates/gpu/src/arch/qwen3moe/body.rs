@@ -50,7 +50,7 @@ use model::arch::models::shape::{MoeShape, rules};
 use model::arch::qwen3moe::hparams::Hparams;
 use model::arch::qwen3moe::names::{self, token_embd};
 use model::placement::accepts::qwen3moe_dense;
-use model::placement::kernels::{self, SiteEntry};
+use model::placement::kernels;
 use model::placement::{Plan, WholeLoad};
 use std::ops::Range;
 use std::sync::Arc;
@@ -334,42 +334,6 @@ fn stack_entries([gate, up, down]: [SiteTy; 3], l: usize) -> Result<(), GpuError
     Ok(())
 }
 
-/// The launch family of the table's dense entry `entry`: `site.rs`'s name
-/// for it. Every arm names its entry, so an entry the table gains does not
-/// compile here until it is placed.
-pub(super) const fn site_ty(entry: SiteEntry) -> SiteTy {
-    match entry {
-        SiteEntry::Q3k => SiteTy::Q3K,
-        SiteEntry::Q4k => SiteTy::Q4K,
-        SiteEntry::Q5k => SiteTy::Q5K,
-        SiteEntry::Q6k => SiteTy::Q6K,
-        SiteEntry::Q5_0 => SiteTy::Q5_0,
-        SiteEntry::Q8_0 => SiteTy::Q8_0,
-        SiteEntry::F32 => SiteTy::F32,
-        SiteEntry::Nvfp4 => SiteTy::Nvfp4,
-        SiteEntry::Mxfp8 => SiteTy::Mxfp8,
-        SiteEntry::Fp8B128 => SiteTy::Fp8B128,
-    }
-}
-
-/// The file type a launch family reads: `SiteTy::of_ggml`'s inverse, so a
-/// site's type can be asked of the table's rows (`kernels::*`), which are
-/// keyed by file type. Every arm names its family.
-pub(super) const fn ggml_ty(site: SiteTy) -> GgmlType {
-    match site {
-        SiteTy::Q3K => GgmlType::Q3_K,
-        SiteTy::Q4K => GgmlType::Q4_K,
-        SiteTy::Q5K => GgmlType::Q5_K,
-        SiteTy::Q6K => GgmlType::Q6_K,
-        SiteTy::Q5_0 => GgmlType::Q5_0,
-        SiteTy::Q8_0 => GgmlType::Q8_0,
-        SiteTy::F32 => GgmlType::F32,
-        SiteTy::Nvfp4 => GgmlType::NVFP4,
-        SiteTy::Mxfp8 => GgmlType::MXFP8,
-        SiteTy::Fp8B128 => GgmlType::FP8_B128,
-    }
-}
-
 /// Weight `name` as a dense site of `rows` rows of `k` values and the launch
 /// family the qwen3moe body's dense owner ([`qwen3moe_dense`]) picks for the
 /// type it is resident as (a K-quant word plane, Q8_0, MXFP8 or FP8_B128
@@ -406,8 +370,8 @@ pub(super) fn dense_site(
 
 /// The body's dense family, or a named refusal identifying the missing arena form.
 fn admit_dense(what: &'static str, name: &str, ty: GgmlType) -> Result<SiteTy, GpuError> {
-    if let Some(entry) = qwen3moe_dense(ty) {
-        return Ok(site_ty(entry));
+    if let Some(site) = qwen3moe_dense(ty).and_then(SiteTy::of_entry) {
+        return Ok(site);
     }
     let msg = match kernels::dense(ty) {
         Some(entry) => format!(
@@ -574,7 +538,7 @@ fn header_plan(file: &Split, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuErr
     );
     let site = |name: &str, shape| -> Result<SiteTy, GpuError> {
         let got = site::file_site(file, WHAT_H, name, shape, SiteTy::ALL)?;
-        admit_dense(WHAT_H, name, ggml_ty(got))
+        admit_dense(WHAT_H, name, got.ggml())
     };
     let (mut g, mut f) = parts_of(l);
     g.q_ty = site(&g.attn_q, (q, h))?;
@@ -1308,17 +1272,16 @@ impl GpuModel<Body> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ggml_ty, site_ty};
     use crate::site::SiteTy;
     use gguf::quant::GgmlType;
     use model::placement::accepts::qwen3moe_dense;
     use model::placement::kernels;
 
     /// A dense entry the qwen3moe body runs is the launch family of its file
-    /// type: [`qwen3moe_dense`] maps the type to the entry, `site_ty` to the
-    /// family `site.rs` names, and `ggml_ty` back. A type the owner does not
-    /// return has no site launch, unless the table row reads an activation
-    /// the arena does not carry (Q5_0).
+    /// type: [`qwen3moe_dense`] maps the type to the entry,
+    /// `SiteTy::of_entry` to the family `site.rs` names, and `SiteTy::ggml`
+    /// back. A type the owner does not return has no site launch, unless the
+    /// table row reads an activation the arena does not carry (Q5_0).
     #[test]
     fn a_dense_entry_is_the_launch_family_of_its_file_type() {
         let mut named = 0;
@@ -1351,8 +1314,9 @@ mod tests {
                 continue;
             };
             named += 1;
-            assert_eq!(ggml_ty(site_ty(entry)), ty, "{ty}");
-            assert_eq!(SiteTy::of_ggml(ty), Some(site_ty(entry)), "{ty}");
+            let site = SiteTy::of_entry(entry).expect("a family launches the entry");
+            assert_eq!(site.ggml(), ty, "{ty}");
+            assert_eq!(SiteTy::of_ggml(ty), Some(site), "{ty}");
         }
         assert!(named >= 6, "the body runs {named} of the listed types");
     }

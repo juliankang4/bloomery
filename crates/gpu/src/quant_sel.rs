@@ -38,8 +38,11 @@
 //! and in super-block words for Walk A; `bb` and `words` are literals, and a
 //! `const` assert per line holds each to its decoder's constant.
 //!
-//! The type list is this file's own until `placement`'s `card_types!` owns
-//! it: the invocation is then derived from that table.
+//! The types are the card columns of each type's `gguf::QRow`, read through
+//! `kernels::gate_up` and `kernels::down`: a const assert per line refuses a
+//! line that has a gate·up or down entry where the row names none, or lacks
+//! one where the row names one. The lines stay here because they name this
+//! module's PTX entries, which the pure row cannot.
 
 use crate::GpuError;
 use crate::fault::FaultSink;
@@ -59,6 +62,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 use gguf::quant::GgmlType;
+use model::placement::kernels;
 use std::sync::Arc;
 
 /// Threads per block of every entry, one warp per output row.
@@ -128,6 +132,26 @@ macro_rules! quant_sel_module {
     ) => {
         $( const _: () = assert!(<$RTy as RawSb>::BB == $bb); )*
         $( const _: () = assert!(<$WTy as SbDecode>::WORDS == $ww); )*
+        // A raw line has a `gate_up` entry exactly where `kernels::gate_up` has
+        // a row for its type and a `down` entry exactly where `kernels::down`
+        // has one; a Walk A line has a `walk_gate_up` entry exactly where
+        // `kernels::gate_up` has a row.
+        $(
+            const _: () = assert!(
+                kernels::gate_up(GgmlType::$rggml).is_some()
+                    == (<[&str]>::len(&[$( stringify!($gu) ),*]) == 1)
+            );
+            const _: () = assert!(
+                kernels::down(GgmlType::$rggml).is_some()
+                    == (<[&str]>::len(&[$( stringify!($dn) ),*]) == 1)
+            );
+        )*
+        $(
+            const _: () = assert!(
+                kernels::gate_up(GgmlType::$wggml).is_some()
+                    == (<[&str]>::len(&[$( stringify!($wgu) ),*]) == 1)
+            );
+        )*
 
         #[allow(
             dead_code,

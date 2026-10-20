@@ -59,6 +59,7 @@ use crate::iq::{GRID3, iq2xxs_grid_half, sign_mask4, signed4, signs_of};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
+use model::placement::kernels::{self, GemmEntry};
 
 /// Rows one GEMM block covers: eight warps of sixteen.
 pub(super) const GEMM_BM: usize = 128;
@@ -174,25 +175,35 @@ pub enum GemmWeight {
 }
 
 impl GemmWeight {
-    /// The GEMM's type for a file tensor of type `ty`; any other type is a
-    /// `Shape` error that names it.
+    /// The GEMM's type for a file tensor of type `ty`: the kernel table's GEMM
+    /// entry for it (`kernels::gemm`), where that entry is this GEMM's; any
+    /// other type is a `Shape` error that names it.
     pub fn from_ggml(ty: gguf::quant::GgmlType) -> Result<GemmWeight, GpuError> {
-        use gguf::quant::GgmlType;
-        match ty {
-            GgmlType::Q3_K => Ok(GemmWeight::Q3K),
-            GgmlType::Q4_K => Ok(GemmWeight::Q4K),
-            GgmlType::Q5_K => Ok(GemmWeight::Q5K),
-            GgmlType::Q6_K => Ok(GemmWeight::Q6K),
-            GgmlType::IQ2_XXS => Ok(GemmWeight::Iq2Xxs),
-            GgmlType::IQ3_XXS => Ok(GemmWeight::Iq3Xxs),
-            GgmlType::IQ4_XS => Ok(GemmWeight::Iq4Xs),
-            other => Err(GpuError::shape(
-                "GemmWeight::from_ggml",
-                format!(
-                    "{other:?} is not a type the grouped GEMM decodes (Q3_K, Q4_K, Q5_K, Q6_K, \
-                     IQ2_XXS, IQ3_XXS, IQ4_XS)"
-                ),
-            )),
+        kernels::gemm(ty)
+            .and_then(GemmWeight::of_entry)
+            .ok_or_else(|| {
+                GpuError::shape(
+                    "GemmWeight::from_ggml",
+                    format!(
+                        "{ty:?} is not a type the grouped GEMM decodes (the kernel table's \
+                         grouped GEMM entries)"
+                    ),
+                )
+            })
+    }
+
+    /// The type of the kernel table's GEMM entry `entry` when it is this
+    /// GEMM's; `None` for the 32-value GEMM's entries (`Gemm32Weight`).
+    pub(crate) const fn of_entry(entry: GemmEntry) -> Option<GemmWeight> {
+        match entry {
+            GemmEntry::Q3k => Some(GemmWeight::Q3K),
+            GemmEntry::Q4k => Some(GemmWeight::Q4K),
+            GemmEntry::Q5k => Some(GemmWeight::Q5K),
+            GemmEntry::Q6k => Some(GemmWeight::Q6K),
+            GemmEntry::Iq2xxs => Some(GemmWeight::Iq2Xxs),
+            GemmEntry::Iq3xxs => Some(GemmWeight::Iq3Xxs),
+            GemmEntry::Iq4xs => Some(GemmWeight::Iq4Xs),
+            GemmEntry::Q8_0 | GemmEntry::Q5_1 | GemmEntry::Iq4nl | GemmEntry::Nvfp4 => None,
         }
     }
 

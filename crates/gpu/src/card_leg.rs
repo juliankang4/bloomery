@@ -248,12 +248,7 @@ impl<'a> StackW<'a> {
             (GemmEntry::Q5_1, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q5_1File(w)),
             (GemmEntry::Iq4nl, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Iq4NlFile(w)),
             (GemmEntry::Nvfp4, StackW::Nvfp4(s)) => RouteW::Blocks32(Gemm32Weight::Nvfp4Planes(s)),
-            (_, StackW::Words(w)) => {
-                let Ok(t) = GemmWeight::from_ggml(ty) else {
-                    return None;
-                };
-                RouteW::Grouped(t, w)
-            }
+            (entry, StackW::Words(w)) => RouteW::Grouped(GemmWeight::of_entry(entry)?, w),
             (_, StackW::Nvfp4(_)) => return None,
         })
     }
