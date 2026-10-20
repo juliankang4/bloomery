@@ -518,9 +518,10 @@ bounded_bg_get() {
 #   output-setup       fifo-fail: a stdin or output file that cannot be opened ends the command, not the runner, and
 #                      starts nothing that outlives the call
 #   output-filter      lease.sh --self-test, bounded-filter-open-term-*: the filter's guard stands before it starts
-#   fifo-eintr         a signal the runner handles ends the blocking open of a FIFO's write end (EINTR): bounded tries
-#                      again and the command runs once the reader is there; after LEASE_FIFO_TRIES tries it gives up by
-#                      name (74) with the command not started; a count that is no positive number is refused (64)
+#   fifo-eintr         a failed FIFO open leaves BOUNDED_RAN unset: bounded tries again and the command runs once the
+#                      open succeeds; after LEASE_FIFO_TRIES tries it gives up by name (74) with the command not started.
+#                      A trapped signal during a real FIFO open still lets the command pair with its reader; a count
+#                      that is no positive number is refused (64)
 #   no-group           a child that leads no process group of its own is stopped, and no other group is signalled
 #   nested-grace       two supervisors, one inside the other, finish inside the outer's budget (the inner's is half)
 #   natural-end        --clear: a command that ends by itself and leaves a process in its group: gone when
@@ -925,12 +926,22 @@ EOF
     'source "$1"; LEASE_BOUNDED_OUT=$NOPE/out bounded 5 "$HELD" "$PIDF"' _ "$self" > "$t/fifo3.out" 2>&1 || RC=$?
   check fifo-fg-rc "$([ "$RC" != 0 ] && echo nonzero || echo 0)" nonzero
   check fifo-fg-nothing-started "$([ -e "$t/fifo3.pid" ] && echo started || echo none)" none
-  # fifo-eintr: the runner handles USR1, so a USR1 while its write-end open waits for a reader ends the open with EINTR (the
-  # injection; bash takes a trapped signal there, as it takes a child's exit). The reader comes only after the signals, so
-  # the open is what waits. A hang is the case's own bound (10 s), never the self-test's.
+  # PIN(2026-10-21): a trapped USR1 need not fail the open on every bash/OS. Keep the real signal/reader case, and
+  # inject the failed-open result (no BOUNDED_RAN mark) separately to hold the retry and give-up contracts everywhere.
+  # A hang is the case's own bound (10 s), never the self-test's.
   cat > "$t/eintr-runner" << 'EOF'
 source "$GB"
-trap : USR1
+trap ': > "$SIGNALLED"' USR1
+if [ -n "$OPEN_FAILURES" ]; then
+  eval "$(declare -f __bounded_run | sed '1s/__bounded_run/__real_bounded_run/')"
+  __bounded_run() {
+    if [ "$OPEN_FAILURES" -gt 0 ]; then
+      OPEN_FAILURES=$((OPEN_FAILURES - 1))
+      return 1
+    fi
+    __real_bounded_run "$@"
+  }
+fi
 : > "$READY"
 rc=0
 LEASE_BOUNDED_OUT=$FIFO bounded 20 sh -c 'echo fifo-ok; : > "$1"' _ "$STARTED" || rc=$?
@@ -949,22 +960,22 @@ EOF
       i=$((i + 1))
     done
   }
-  # eintr_case <name> <tries> <line that ends the signals> <reader: yes|no>: one runner on a fresh FIFO; a USR1 goes to it
-  # while it sleeps, until its stderr has the line (at most 40, one every 0.2 s); then the reader, when asked for. Its
-  # status is EINTR_RC; the case's check says whether the runner and the reader ended within their bounds.
+  # eintr_case <name> <tries> <failed opens, empty: real USR1> <reader: yes|no>: one runner on a fresh FIFO. The
+  # injected cases hold both ends open so that the shell reaches the stub without waiting for a reader. The real case
+  # sends USR1 while the open sleeps, then starts its reader. Both the runner and the reader must end within their bounds.
   eintr_case() {
-    local name=$1 tries=$2 stop=$3 reader=$4 rp rd='' sent=0 st w=0 run=yes rdr=yes
+    local name=$1 tries=$2 failures=$3 reader=$4 rp rd='' sent=0 st w=0 run=yes rdr=yes
     EINTR_RC=0
     mkfifo "$t/$name.fifo" || return 70
-    rm -f "$t/$name.ready" "$t/$name.started"
-    env GB="$self" FIFO="$t/$name.fifo" READY="$t/$name.ready" STARTED="$t/$name.started" PATH="$t/bin:$PATH" \
-      LEASE_FIFO_TRIES="$tries" bash "$t/eintr-runner" > "$t/$name.out" 2> "$t/$name.err" &
+    if [ -n "$failures" ]; then exec 8<> "$t/$name.fifo" || return 70; fi
+    env GB="$self" FIFO="$t/$name.fifo" READY="$t/$name.ready" STARTED="$t/$name.started" SIGNALLED="$t/$name.signal" PATH="$t/bin:$PATH" \
+      OPEN_FAILURES="$failures" LEASE_FIFO_TRIES="$tries" bash "$t/eintr-runner" 8>&- > "$t/$name.out" 2> "$t/$name.err" &
     rp=$!
     until [ -e "$t/$name.ready" ] || [ "$w" = 100 ]; do
       sleep 0.1
       w=$((w + 1))
     done
-    while [ "$sent" -lt 40 ] && kill -0 "$rp" 2> /dev/null && ! grep -q -- "$stop" "$t/$name.err"; do
+    while [ -z "$failures" ] && [ "$sent" -lt 1 ] && kill -0 "$rp" 2> /dev/null; do
       st=$(ps -o stat= -p "$rp" 2> /dev/null) || break
       case $st in
         *S*)
@@ -976,7 +987,7 @@ EOF
       esac
     done
     if [ "$reader" = yes ]; then
-      cat "$t/$name.fifo" > "$t/$name.got" &
+      (IFS= read -r line < "$t/$name.fifo" && printf '%s\n' "$line" > "$t/$name.got") 8>&- &
       rd=$!
     fi
     ended "$rp" 10 || run=hang
@@ -985,14 +996,20 @@ EOF
       ended "$rd" 3 || rdr=never-paired
       wait "$rd" 2> /dev/null || :
     fi
+    if [ -n "$failures" ]; then exec 8>&-; fi
     check "$name-no-hang" "$run/$rdr" yes/yes
   }
-  eintr_case fifo-eintr 5 'trying again' yes
+  eintr_case fifo-signal 5 '' yes
+  check fifo-signal-rc "$EINTR_RC" 0
+  check fifo-signal-handled "$([ -e "$t/fifo-signal.signal" ] && echo handled || echo none)" handled
+  check fifo-signal-reader-got-output "$(cat "$t/fifo-signal.got" 2> /dev/null)" fifo-ok
+  check fifo-signal-command-ran "$([ -e "$t/fifo-signal.started" ] && echo ran || echo none)" ran
+  eintr_case fifo-eintr 5 1 yes
   check fifo-eintr-rc "$EINTR_RC" 0
   check fifo-eintr-retried "$(grep -c 'the open of .* for writing failed (try 1 of 5), trying again' "$t/fifo-eintr.err")" 1
   check fifo-eintr-reader-got-output "$(cat "$t/fifo-eintr.got" 2> /dev/null)" fifo-ok
   check fifo-eintr-command-ran "$([ -e "$t/fifo-eintr.started" ] && echo ran || echo none)" ran
-  eintr_case fifo-giveup 2 'rc 74' no
+  eintr_case fifo-giveup 2 2 no
   check fifo-giveup-rc "$EINTR_RC" 74
   check fifo-giveup-named "$(grep -c 'no write end of .*fifo-giveup.fifo after 2 tries, the command not started (rc 74)' "$t/fifo-giveup.err")" 1
   check fifo-giveup-nothing-started "$([ -e "$t/fifo-giveup.started" ] && echo started || echo none)" none
