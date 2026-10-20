@@ -974,7 +974,11 @@ self_test() {
     [ "$rc" = 75 ] || fail "a lock with a fresh heartbeat was taken (rc $rc): $out"
     [ "$(cat "$lb/.lock-tlive/owner")" = here/1 ] || fail "a live lock was overwritten"
     mkdir -p "$lb/tdead"
-    HOME=$lr setsid bash -c 'bash -s -- tdead "" nightly-x 2 300 1 < "$0" > /dev/null 2>&1' <(printf '%s\n' "$RUN") &
+    # A nohup-launched test runner inherits HUP ignored; restore the ssh session's signal defaults before bash starts.
+    HOME=$lr setsid python3 -c 'import os, signal
+for s in signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGPIPE:
+    signal.signal(s, signal.SIG_DFL)
+os.execvp("bash", ["bash", "-s", "--", "tdead", "", "nightly-x", "2", "300", "1"])' <<< "$RUN" > /dev/null 2>&1 &
     for _ in $(seq 100); do [ -s "$lr/just.pid" ] && break; sleep 0.1; done
     [ -s "$lr/just.pid" ] || fail "the stubbed run did not start"
     [ -s "$lb/.lock-tdead/heartbeat" ] || fail "the run wrote no heartbeat"
