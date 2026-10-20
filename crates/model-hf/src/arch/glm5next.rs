@@ -21,7 +21,7 @@ use std::path::Path;
 use hf::quant_config::{self, Config, Format};
 use hf::safetensors::{Dtype, Folder};
 use model::arch::glm5next::names::{self, Sub};
-use model::arch::glm5next::tp;
+use model::arch::glm5next::{roles, tp};
 use model::placement::tp::{TpTensor, card_blocks};
 use serde_json::Value;
 
@@ -397,13 +397,18 @@ pub fn tp_tensors(
             let h = f
                 .held(&dims)
                 .ok_or_else(|| refuse(&name, format!("no held form for {f} {dims:?}")))?;
-            let block = match f.card_type() {
-                Some(ty) => card_blocks(ty, h.block).map_err(|e| refuse(&name, e.to_string()))?,
-                None => h.block,
+            let cut = tp::cut(&name, &dims, g.heads as u64)
+                .map_err(|why| refuse(&name, why.to_string()))?;
+            let block = match (f.card_type(), cut) {
+                (Some(ty), Some(_)) => {
+                    let role =
+                        roles::tensor_role(&name).ok_or_else(|| refuse(&name, "no tensor role"))?;
+                    card_blocks(ty, h.block, role).map_err(|e| refuse(&name, e.to_string()))?
+                }
+                _ => h.block,
             };
             Ok(TpTensor {
-                cut: tp::cut(&name, &dims, g.heads as u64)
-                    .map_err(|why| refuse(&name, why.to_string()))?,
+                cut,
                 name,
                 dims,
                 bytes: h.bytes,
@@ -816,6 +821,47 @@ mod tests {
             }
             assert_eq!(sum, trunk, "N = {n}");
         }
+    }
+
+    #[test]
+    fn nvfp4_dense_cuts_keep_the_sites_activation_unit() {
+        let (g, _, _, _) = fp4_local();
+        let quant = Config::parse(
+            &serde_json::json!({}),
+            Some(&serde_json::json!({"quantization": {
+                "quant_algo": "NVFP4", "group_size": 16
+            }})),
+        )
+        .unwrap();
+        let mut table = vec![(
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            Dtype::Bf16,
+            vec![256],
+        )];
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let name = format!("model.layers.0.mlp.{proj}");
+            for (suffix, dtype, dims) in [
+                ("weight", Dtype::U8, vec![256, 512]),
+                ("weight_scale", Dtype::F8E4M3, vec![256, 64]),
+                ("weight_scale_2", Dtype::F32, vec![]),
+            ] {
+                table.push((format!("{name}.{suffix}"), dtype, dims));
+            }
+        }
+        let ts = tp_tensors(g, &quant, &table).unwrap();
+        for n in [1, 2, 4] {
+            assert!(plan_tp(&pools(n), &ts).is_ok(), "N = {n}");
+        }
+        assert_eq!(
+            plan_tp(&pools(8), &ts).unwrap_err(),
+            TpError::Block {
+                name: "blk.0.ffn_down.weight".into(),
+                dim: 0,
+                extent: 1024,
+                ranks: 8,
+                block: 256,
+            }
+        );
     }
 
     #[test]

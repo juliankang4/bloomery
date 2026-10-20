@@ -9,7 +9,7 @@
 use gguf::Split;
 
 use super::hparams::Hparams;
-use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role};
+use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role, role_in};
 use crate::arch::kda;
 use crate::arch::stems::{opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
@@ -123,13 +123,11 @@ pub fn nextn_role(stem: &str) -> Option<Role> {
         .map(|s| s.role)
 }
 
-/// The role of a trunk layer's stem.
-fn layer_role(stem: &str) -> Option<Role> {
-    TRUNK
-        .iter()
-        .flat_map(|g| g.iter())
-        .find(|s| s.name == stem)
-        .map(|s| s.role)
+/// The role of a model-level or trunk tensor by its GGUF name, without a layer-count bound.
+/// A name outside the role table has no role.
+#[must_use]
+pub fn tensor_role(name: &str) -> Option<Role> {
+    role_in(&TRUNK, name, usize::MAX).map(|(role, _)| role)
 }
 
 /// A next-token layer's own stems, beside the trunk's.
@@ -146,10 +144,10 @@ fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
     }
     let (layer, stem) = block_stem(name, hp.n_layer)?;
     if layer >= hp.n_trunk {
-        return (layer_role(stem).is_some() || nextn_stem(stem))
+        return (tensor_role(name).is_some() || nextn_stem(stem))
             .then_some((Role::Unused, Some(layer)));
     }
-    layer_role(stem).map(|r| (r, Some(layer)))
+    tensor_role(name).map(|r| (r, Some(layer)))
 }
 
 /// Every tensor of `split` with its role and header facts.
@@ -167,7 +165,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
 
 #[cfg(test)]
 mod tests {
-    use super::{KDA, LATENT, NEXTN, Stem, TRUNK, layer_role, nextn_role};
+    use super::{KDA, LATENT, NEXTN, Stem, TRUNK, nextn_role, tensor_role};
     use crate::placement::Role;
 
     /// A stem in two groups (the norm and output every mixer carries, the
@@ -176,14 +174,23 @@ mod tests {
     fn a_stem_has_one_role() {
         let all: Vec<&Stem> = TRUNK.iter().flat_map(|g| g.iter()).collect();
         for s in &all {
-            assert_eq!(layer_role(s.name), Some(s.role), "{}", s.name);
+            assert_eq!(
+                tensor_role(&format!("blk.0.{}", s.name)),
+                Some(s.role),
+                "{}",
+                s.name
+            );
         }
         for g in TRUNK.iter().chain([&NEXTN]) {
             for (i, s) in g.iter().enumerate() {
                 assert!(!g[..i].iter().any(|t| t.name == s.name), "{} twice", s.name);
             }
         }
-        assert!(NEXTN.iter().all(|s| layer_role(s.name).is_none()));
+        assert!(
+            NEXTN
+                .iter()
+                .all(|s| tensor_role(&format!("blk.0.{}", s.name)).is_none())
+        );
         // The header check refuses the other mixer's stems by name: each is
         // one the file must carry where its kind is.
         assert!(KDA.iter().chain(LATENT).all(|s| s.required));
