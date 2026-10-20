@@ -108,8 +108,10 @@ pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
 /// an activation of more columns than a run uses, with the form the leg
 /// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, MXFP4,
 /// IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS) or the 32-value [`DownAct::Q8Blocks32`] (Q5_1,
-/// Q8_0, IQ4_NL). The Q6_K launcher takes such an activation and has no arm in
-/// the leg yet; the Q5_0 row reads the packed layout, not the file's blocks.
+/// Q8_0, IQ4_NL). The Q6_K launcher takes such an activation; the leg's arm for
+/// it runs on a tensor-parallel rank alone ([`rank_down_runs`]), so a plan that
+/// reads this keeps a Q6_K down's experts off the card. The Q5_0 row reads the
+/// packed layout, not the file's blocks.
 #[must_use]
 pub const fn card_down_runs(ty: GgmlType) -> bool {
     matches!(
@@ -128,6 +130,15 @@ pub const fn card_down_runs(ty: GgmlType) -> bool {
             DownAct::Q8Blocks32
         ))
     )
+}
+
+/// Whether a tensor-parallel rank's card leg launches the down entry of a routed
+/// down stack of type `ty`: [`card_down_runs`]' entries and the Q6_K one over a
+/// [`DownAct::Q8Act`]. A rank holds every expert of its layers on its card and
+/// has no host tier to leave a Q6_K down to.
+#[must_use]
+pub const fn rank_down_runs(ty: GgmlType) -> bool {
+    card_down_runs(ty) || matches!(down(ty), Some((DownEntry::Q6k, DownAct::Q8Act)))
 }
 
 /// Whether the common card leg's relu² form launches the 32-value-block `_sel`
@@ -617,7 +628,8 @@ mod tests {
 
     /// The leg checks each role by its own rule: the gate·up and down sets
     /// differ (Q5_1, Q8_0 and IQ4_NL run only as downs; Q8_0's gate·up row has
-    /// no arm), and the Q6_K and Q5_0 down rows have no arm.
+    /// no arm), the Q5_0 down row has no arm, and a tensor-parallel rank's
+    /// downs are the planner's and Q6_K, which the planner's set leaves out.
     #[test]
     fn the_leg_admits_each_role_by_its_own_rule() {
         let gate_up_runs: Vec<GgmlType> = ALL
@@ -656,6 +668,12 @@ mod tests {
         for ty in [GgmlType::Q6_K, GgmlType::Q5_0] {
             assert!(down(ty).is_some() && !card_down_runs(ty), "{ty:?}");
         }
+        let rank_extra: Vec<GgmlType> = ALL
+            .into_iter()
+            .filter(|&ty| rank_down_runs(ty) != card_down_runs(ty))
+            .collect();
+        assert_eq!(rank_extra, [GgmlType::Q6_K]);
+        assert!(rank_down_runs(GgmlType::Q6_K));
     }
 
     /// A type id the enum does not name has no row in any operation.

@@ -25,14 +25,16 @@
 //! added yet.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use cuda_core::{CudaStream, DeviceBuffer, sys};
 
-use super::link_tail;
-use super::pump::{Crossing, Reader, Span, TAIL_LINE};
+use super::pump::{Crossing, Half, Page, PostCols, Reader, Span, TAIL_LINE};
+use super::{End, Memory, Pump, Side, drop_settled, link_tail, release_settled};
 use crate::GpuError;
 use crate::elem::ElemKernels;
-use crate::graph::{op_add, op_barrier_sys, op_wait_geq};
+use crate::graph::{MappedHost, op_add, op_barrier_sys, op_wait_geq};
+use crate::host::step::RELEASE;
 use crate::tensor::WindowMut;
 
 /// Bytes a part's stride and the counters align to: one cache line.
@@ -353,16 +355,118 @@ impl Gathers {
     }
 }
 
+/// N ranks' pages joined pairwise by the loopback's wire, every end on one
+/// pump thread, each end posting the rows `cols` holds.
+///
+/// The pump stops before the ends settle and drop ([`drop_settled`]).
+struct Ring<P: Page + 'static> {
+    pumps: Vec<Pump>,
+    ends: Vec<Arc<dyn Side<P>>>,
+}
+
+impl<P: Page + 'static> Ring<P> {
+    /// Rank `r` of `layouts` on `pages[r]`, a link for every pair of ranks.
+    /// Pages of another count than the layouts, or crossings that do not fit
+    /// before a page's tail, are refused by name.
+    fn new(layouts: &[Gathers], pages: &[Arc<P>], cols: &PostCols) -> Result<Ring<P>, GpuError> {
+        const WHAT: &str = "the gather loopback";
+        if pages.len() != layouts.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{} pages for {} ranks", pages.len(), layouts.len()),
+            ));
+        }
+        let mut ends: Vec<Arc<dyn Side<P>>> = Vec::new();
+        for (a, la) in layouts.iter().enumerate() {
+            for b in (0..layouts.len()).filter(|&b| b != a) {
+                let half = Half::new(
+                    la.crossings(b),
+                    la.side(b),
+                    la.tail(b),
+                    &*pages[a],
+                    cols.clone(),
+                )
+                .map_err(|e| GpuError::shape(WHAT, format!("ranks {a} and {b}: {e}")))?;
+                let wire = Memory {
+                    from: Arc::clone(&pages[a]),
+                    to: Arc::clone(&pages[b]),
+                };
+                ends.push(Arc::new(End::new(half, wire, Arc::clone(&pages[a]))));
+            }
+        }
+        let pump = Pump::start(ends.clone())
+            .map_err(|e| GpuError::shape(WHAT, format!("the pump thread: {e}")))?;
+        Ok(Ring {
+            pumps: vec![pump],
+            ends,
+        })
+    }
+
+    /// Why an end stopped carrying, if one did.
+    fn broken(&self) -> Option<String> {
+        self.ends
+            .iter()
+            .find_map(|e| e.broken())
+            .or_else(|| self.pumps.iter().find_map(Pump::ended))
+    }
+
+    /// Release every counter the ends read to `v` ([`release_settled`]).
+    fn release(&self, v: u32) -> Result<(), String> {
+        let ends: Vec<&dyn Side<P>> = self.ends.iter().map(|e| &**e).collect();
+        release_settled(&ends, v)
+    }
+}
+
+impl<P: Page + 'static> Drop for Ring<P> {
+    fn drop(&mut self) {
+        self.pumps.clear();
+        drop_settled(&self.ends);
+    }
+}
+
+/// The gathers of N ranks in one process, each rank's page a mapped host
+/// page of its own card context, the parts carried by the loopback: what a
+/// gate runs every rank of a tensor-parallel load on, the wire a copy in
+/// process, as the tier link's loopback carries a tier page's.
+pub struct GatherLoop(Ring<MappedHost>);
+
+impl GatherLoop {
+    /// Rank `r` of `layouts` (one [`Gathers`] a rank, alike) on `pages[r]`,
+    /// every end posting the rows `cols` holds. Pages of another count than
+    /// the layouts, or a layout whose crossings do not fit before its tail,
+    /// are refused by name.
+    pub fn new(
+        layouts: &[Gathers],
+        pages: &[Arc<MappedHost>],
+        cols: &PostCols,
+    ) -> Result<GatherLoop, GpuError> {
+        Ring::new(layouts, pages, cols).map(GatherLoop)
+    }
+
+    /// Why the loopback stopped carrying, if it did.
+    #[must_use]
+    pub fn broken(&self) -> Option<String> {
+        self.0.broken()
+    }
+
+    /// Release every counter a rank's card waits on, so that a card stuck on
+    /// a part that will not come runs on: for a run that failed with a rank
+    /// waiting. `Err` names the ends that could not settle.
+    pub fn release(&self) -> Result<(), String> {
+        self.0.release(RELEASE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
+    use super::super::link_tail;
     use super::super::pump::tests::Mem;
-    use super::super::pump::{Half, Page, PostCols};
-    use super::super::{End, Memory, Pump, Side, link_tail};
-    use super::{GatherSet, GatherShape, Gathers};
+    use super::super::pump::{Page, PostCols};
+    use super::{GatherSet, GatherShape, Gathers, Ring};
     use crate::Gpu;
     use crate::graph::{MappedHost, mem_batch};
     use crate::host::step::RELEASE;
@@ -391,46 +495,11 @@ mod tests {
         (1..ranks).fold(value(g, 0, i), |acc, r| acc + value(g, r, i))
     }
 
-    /// N ranks' pages joined pairwise by the loopback's wire, every end on
-    /// one pump thread, each end posting the rows `cols` holds.
-    struct Ring<P: Page + 'static> {
-        _pump: Pump,
-        ends: Vec<Arc<dyn Side<P>>>,
-    }
-
     impl<P: Page + 'static> Ring<P> {
-        fn new(layouts: &[Gathers], pages: &[Arc<P>], cols: &PostCols) -> Ring<P> {
-            let mut ends: Vec<Arc<dyn Side<P>>> = Vec::new();
-            for (a, la) in layouts.iter().enumerate() {
-                for b in (0..layouts.len()).filter(|&b| b != a) {
-                    let half = Half::new(
-                        la.crossings(b),
-                        la.side(b),
-                        la.tail(b),
-                        &*pages[a],
-                        cols.clone(),
-                    )
-                    .expect("the gather's crossings fit before the tail");
-                    let wire = Memory {
-                        from: Arc::clone(&pages[a]),
-                        to: Arc::clone(&pages[b]),
-                    };
-                    ends.push(Arc::new(End::new(half, wire, Arc::clone(&pages[a]))));
-                }
-            }
-            let pump = Pump::start(ends.clone()).expect("a pump thread");
-            Ring { _pump: pump, ends }
-        }
-
-        fn broken(&self) -> Option<String> {
-            self.ends.iter().find_map(|e| e.broken())
-        }
-
         /// Release every counter the ends read, for a test that failed with
         /// cards still waiting.
-        fn release(&self) {
-            let ends: Vec<&dyn Side<P>> = self.ends.iter().map(|e| &**e).collect();
-            super::super::release_settled(&ends, RELEASE).expect("the loopback's ends settle");
+        fn release_all(&self) {
+            self.release(RELEASE).expect("the loopback's ends settle");
         }
     }
 
@@ -452,8 +521,20 @@ mod tests {
             .collect();
         let cols = PostCols::default();
         cols.set(ROWS);
-        let ring = Ring::new(&layouts, &pages, &cols);
+        let ring = Ring::new(&layouts, &pages, &cols).expect("the loopback");
         (layouts, pages, ring)
+    }
+
+    // The loopback refuses by name, before any pump starts, pages of another count than the
+    // ranks' layouts.
+    #[test]
+    fn a_loopback_of_other_pages_than_its_ranks_is_refused() {
+        let (layouts, pages, ring) = mem_ring(2);
+        drop(ring);
+        let e = Ring::new(&layouts, &pages[..1], &PostCols::default())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(e.to_string().contains("1 pages for 2 ranks"), "{e}");
     }
 
     /// Wait until the counter at `off` holds at least one, then take one
@@ -528,7 +609,7 @@ mod tests {
                 .collect()
         });
         if let Some(b) = ring.broken() {
-            ring.release();
+            ring.release_all();
             panic!("the loopback broke: {b}");
         }
         got
@@ -606,7 +687,7 @@ mod tests {
                 .collect();
             let cols = PostCols::default();
             cols.set(ROWS);
-            let ring = Ring::new(&layouts, &pages, &cols);
+            let ring = Ring::new(&layouts, &pages, &cols).expect("the loopback");
             let dev = pages[0].dev_at(0);
             let over = dev + layouts[0].part(0, 0, ranks - 1).start as u64;
             // SAFETY: the window names rank 0's own page, which outlives it,
@@ -691,7 +772,7 @@ mod tests {
             let until = Instant::now() + Duration::from_secs(60);
             while !ends.iter().all(|e| e.query().expect("an event query")) {
                 if Instant::now() > until || ring.broken().is_some() {
-                    ring.release();
+                    ring.release_all();
                     gpus.iter()
                         .for_each(|g| g.stream().synchronize().expect("drained"));
                     panic!("{ranks} ranks: the chains stalled: {:?}", ring.broken());

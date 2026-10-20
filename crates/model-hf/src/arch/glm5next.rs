@@ -11,16 +11,9 @@
 //! Shapes are logical element counts in ggml's order, the fastest axis first; a packed
 //! weight's caller gives its unpacked shape.
 //!
-//! Tensor parallel splits each mapped tensor ([`tp_cut`]) along the dim and by the unit a rank's
-//! part holds whole there, or keeps it whole on every rank; the bytes and the blocks a cut keeps
-//! are its format's ([`Format::held`]), and the plan is
-//! [`plan_tp`](model::placement::tp::plan_tp)'s. KDA and latent attention
-//! split by head: their q, k, v, gate and beta rows, the conv channels, the decay and the latent
-//! heads' `q_b`, `k_b` and `v_b`, and the output projection along its input. Dense blocks, the
-//! shared expert and every routed expert split by inner width: gate and up by row, down along
-//! its input. The head splits by vocabulary row. The norms, the low-rank inputs every head shares
-//! (`ssm_f_a`, `ssm_g_a`, `attn_q_a`, `attn_kv_a_mqa`), the indexer, the router and its bias, the
-//! hyper-connection mixes and the embedding stay whole on every rank.
+//! Tensor parallel splits each mapped tensor by the family's rule ([`tp::cut`]); the bytes and the
+//! blocks a cut keeps are its format's ([`Format::held`]), and the plan is
+//! [`plan_tp`](model::placement::tp::plan_tp)'s.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -28,7 +21,8 @@ use std::path::Path;
 use hf::quant_config::{self, Config, Format};
 use hf::safetensors::{Dtype, Folder};
 use model::arch::glm5next::names::{self, Sub};
-use model::placement::tp::{Cut, TpTensor};
+use model::arch::glm5next::tp;
+use model::placement::tp::TpTensor;
 use serde_json::Value;
 
 /// Why the checkpoint was refused.
@@ -351,73 +345,6 @@ fn layer(
     }
 }
 
-/// Where the glm5next tensor `name` of logical `dims` splits among ranks, `None` for whole on
-/// every rank. A head's part along a dim is that dim over `heads`; a stem with no rule, and a
-/// split tensor of other dims than its stem has, are refused by name.
-pub fn tp_cut(name: &str, dims: &[u64], heads: u64) -> Result<Option<Cut>, Error> {
-    let stem = name
-        .strip_prefix("blk.")
-        .and_then(|r| r.split_once('.'))
-        .map_or(name, |(_, stem)| stem);
-    // The dims the tensor has, the dim it splits along, and whether by head or by one value.
-    let (rank, dim, by_head) = match stem {
-        "token_embd.weight"
-        | "output_norm.weight"
-        | "attn_norm.weight"
-        | "ffn_norm.weight"
-        | "ssm_f_a.weight"
-        | "ssm_g_a.weight"
-        | "ssm_norm.weight"
-        | "attn_q_a.weight"
-        | "attn_q_a_norm.weight"
-        | "attn_kv_a_mqa.weight"
-        | "attn_kv_a_norm.weight"
-        | "ffn_gate_inp.weight"
-        | "exp_probs_b.bias" => return Ok(None),
-        _ if stem.starts_with("indexer")
-            || stem.starts_with("hc_")
-            || stem.starts_with("nextn.") =>
-        {
-            return Ok(None);
-        }
-        "attn_q.weight" | "attn_k.weight" | "attn_v.weight" | "ssm_f_b.weight"
-        | "ssm_g_b.weight" | "ssm_beta.weight" | "attn_q_b.weight" => (2, 1, true),
-        "attn_output.weight" => (2, 0, true),
-        "ssm_a" | "ssm_dt.bias" => (1, 0, true),
-        "ssm_conv1d_q.weight"
-        | "ssm_conv1d_k.weight"
-        | "ssm_conv1d_v.weight"
-        | "attn_k_b.weight"
-        | "attn_v_b.weight" => (3, 2, true),
-        "ffn_gate.weight"
-        | "ffn_up.weight"
-        | "ffn_gate_shexp.weight"
-        | "ffn_up_shexp.weight"
-        | "output.weight" => (2, 1, false),
-        "ffn_gate_exps.weight" | "ffn_up_exps.weight" => (3, 1, false),
-        "ffn_down.weight" | "ffn_down_shexp.weight" => (2, 0, false),
-        "ffn_down_exps.weight" => (3, 0, false),
-        _ => return Err(refuse(name, "no tensor-parallel split rule")),
-    };
-    if dims.len() != rank {
-        return Err(refuse(name, format!("{dims:?} is not {rank}-D")));
-    }
-    let extent = dims[dim];
-    if !by_head {
-        return Ok(Some(Cut { dim, unit: 1 }));
-    }
-    if heads == 0 || !extent.is_multiple_of(heads) {
-        return Err(refuse(
-            name,
-            format!("dim {dim} of {extent} is not {heads} heads"),
-        ));
-    }
-    Ok(Some(Cut {
-        dim,
-        unit: extent / heads,
-    }))
-}
-
 /// The tensor-parallel tensors of the checkpoint whose tensors are `table` (name, dtype, stored shape)
 /// under `config` and geometry `g`, as the plan takes them: each placed by its format, mapped to
 /// its glm5next name and dims, held and cut. A tensor the config refuses, a format with no held
@@ -471,7 +398,7 @@ pub fn tp_tensors(
                 .held(&dims)
                 .ok_or_else(|| refuse(&name, format!("no held form for {f} {dims:?}")))?;
             Ok(TpTensor {
-                cut: tp_cut(&name, &dims, g.heads as u64)?,
+                cut: tp::cut(&name, &dims, g.heads as u64).map_err(|why| refuse(&name, why))?,
                 name,
                 dims,
                 bytes: h.bytes,
@@ -1101,10 +1028,13 @@ mod tests {
         );
     }
 
-    /// A table with no text tensors, 64 heads into 3 ranks, a routed down's 2,048 inputs into 64
-    /// ranks (32 a rank, off the 64-value NVFP4 block) and a stem with no rule are refused by name.
+    // PIN(2026-10-20): was cuts_off_a_head_or_a_block_and_unknown_stems_are_refused; its per-tensor
+    // refusals (a stem with no rule, a split tensor of other dims) moved with the rule to
+    // model::arch::glm5next::tp::cut, whose test holds them.
+    /// A table with no text tensors, 64 heads into 3 ranks and a routed down's 2,048 inputs into 64
+    /// ranks (32 a rank, off the 64-value NVFP4 block) are refused by name.
     #[test]
-    fn cuts_off_a_head_or_a_block_and_unknown_stems_are_refused() {
+    fn a_table_without_text_and_cuts_off_a_head_or_a_block_are_refused() {
         let (g, quant, _, table) = fp4_local();
         let visual = vec![(
             "model.visual.blocks.0.attn.qkv.weight".to_string(),
@@ -1159,19 +1089,5 @@ mod tests {
             (q.dims.as_slice(), q.cut.unwrap().unit, q.block),
             (&[1536, 16384][..], 256, [128, 1])
         );
-        assert!(matches!(
-            tp_cut("blk.3.attn_sinks.weight", &[64], 64),
-            Err(Error::Tensor { what, .. }) if what == "no tensor-parallel split rule"
-        ));
-        for (name, dims) in [
-            ("blk.3.ffn_up_exps.weight", &[4096u64, 288][..]),
-            ("blk.0.ffn_down.weight", &[4096, 2048, 2]),
-            ("blk.0.ssm_a", &[64, 1]),
-        ] {
-            assert!(matches!(
-                tp_cut(name, dims, 64),
-                Err(Error::Tensor { what, .. }) if what.ends_with("-D")
-            ));
-        }
     }
 }

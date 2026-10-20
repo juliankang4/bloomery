@@ -3,8 +3,8 @@
 //! under the file's own string. The file's keys (`hparams`), every tensor's
 //! role (`roles`), the typed description (`spec`), the tensor names the
 //! program reads (`names`), the host tier's view of a routed layer (`host`),
-//! the plan from the headers (`place`); the program is `gpu-glm5next`. The Hugging
-//! Face checkpoint's names and how tensor parallel splits its tensors are
+//! the plan from the headers (`place`), how tensor parallel splits each tensor
+//! (`tp`); the program is `gpu-glm5next`. The Hugging Face checkpoint's names are
 //! `model_hf::arch::glm5next`.
 //!
 //! The trunk interleaves KDA delta-rule layers with absorbed, rope-free
@@ -22,3 +22,4 @@ pub mod names;
 pub mod place;
 pub mod roles;
 pub mod spec;
+pub mod tp;

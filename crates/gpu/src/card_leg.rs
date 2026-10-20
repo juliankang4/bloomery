@@ -53,7 +53,9 @@
 //! first launch.
 //! A stack of any other type is refused by name when the stacks are read
 //! ([`LegStacks::of`]), and an entry the table names but the run has no arm
-//! for is refused by name at the launch.
+//! for is refused by name at the launch. A tensor-parallel rank's stacks may
+//! also hold a Q6_K down ([`LegStacks::of_rank`], [`kernels::rank_down_runs`]),
+//! which the Q6_K `_sel` runs over the 128-value columns.
 //!
 //! A prompt walk that runs a unit's card slots through a route table reads
 //! each resident stack by the GEMM entry [`kernels::gemm`] names for its type
@@ -69,6 +71,7 @@ use crate::mxfp4_sel::{Mxfp4SelKernels, Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels,
 use crate::q4k_sel::QuantSel;
 use crate::q5::Q8Blocks32;
 use crate::q5_1_sel::{Q51SelDown, Q51SelKernels};
+use crate::q6k_sel::Q6kSelKernels;
 use crate::q8_0_sel32::{Q80SelDown, Q80SelKernels};
 use crate::quant_sel::QuantSelKernels;
 use crate::weights::{DevWeight, Weights};
@@ -353,9 +356,26 @@ impl<'a> LegStacks<'a> {
     /// [`kernels::card_planes_runs`] admits (not necessarily the same one).
     /// Allocation-free on success.
     pub fn of(w: &'a Weights, names: [&'a str; 3]) -> Result<LegStacks<'a>, GpuError> {
-        const GATE_UP: &str = "a resident routed gate or up stack of a type the card leg runs (`kernels::card_gate_up_runs`)";
         const DOWN: &str =
             "a resident routed down stack of a type the card leg runs (`kernels::card_down_runs`)";
+        LegStacks::with_downs(w, names, (kernels::card_down_runs, DOWN))
+    }
+
+    /// [`LegStacks::of`] for a tensor-parallel rank, whose downs may also be
+    /// Q6_K ([`kernels::rank_down_runs`]). Allocation-free on success.
+    pub fn of_rank(w: &'a Weights, names: [&'a str; 3]) -> Result<LegStacks<'a>, GpuError> {
+        const DOWN: &str = "a resident routed down stack of a type a rank's card leg runs \
+                            (`kernels::rank_down_runs`)";
+        LegStacks::with_downs(w, names, (kernels::rank_down_runs, DOWN))
+    }
+
+    /// The stacks with the down admitted by `downs.0`, refused as `downs.1`.
+    fn with_downs(
+        w: &'a Weights,
+        names: [&'a str; 3],
+        downs: (fn(GgmlType) -> bool, &'static str),
+    ) -> Result<LegStacks<'a>, GpuError> {
+        const GATE_UP: &str = "a resident routed gate or up stack of a type the card leg runs (`kernels::card_gate_up_runs`)";
         let [gate, up, down] = names;
         let (gate, up, down) = (
             LegStack::of(
@@ -372,13 +392,7 @@ impl<'a> LegStacks<'a> {
                 kernels::card_planes_runs,
                 GATE_UP,
             )?,
-            LegStack::of(
-                w,
-                down,
-                kernels::card_down_runs,
-                kernels::card_planes_runs,
-                DOWN,
-            )?,
+            LegStack::of(w, down, downs.0, kernels::card_planes_runs, downs.1)?,
         );
         if up.ty != gate.ty {
             return Err(GpuError::Tensor {
@@ -434,6 +448,7 @@ pub struct LegSum<'a> {
 /// The modules the leg's launches run on.
 pub struct CardLeg {
     quant: QuantSelKernels,
+    q6k: Q6kSelKernels,
     mxfp4: Mxfp4SelKernels,
     nvfp4: Nvfp4SelKernels,
     q51: Q51SelKernels,
@@ -455,6 +470,7 @@ impl CardLeg {
         let (ctx, word) = (gpu.context(), gpu.fault_word());
         Ok(CardLeg {
             quant: QuantSelKernels::load(ctx, word)?,
+            q6k: Q6kSelKernels::load(ctx, word)?,
             mxfp4: Mxfp4SelKernels::load(ctx, word)?,
             nvfp4: Nvfp4SelKernels::load(ctx, word)?,
             q51: Q51SelKernels::load(ctx, word)?,
@@ -674,6 +690,17 @@ impl CardLeg {
                     rows_per_expert,
                 };
                 self.quant.enqueue_gemv_q5k_sel(stream, &d, fault, down)?;
+            }
+            (Some((DownEntry::Q6k, DownAct::Q8Act)), ActH::Q8Act(act)) => {
+                self.q6k.enqueue_gemv_q6k_sel(
+                    stream,
+                    st.down.words()?,
+                    act,
+                    sel,
+                    slots,
+                    rows_per_expert,
+                    down,
+                )?;
             }
             (Some((DownEntry::Mxfp4, DownAct::Q8Act)), ActH::Q8Act(act)) => {
                 let d = SelDown {

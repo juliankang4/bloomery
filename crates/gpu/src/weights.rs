@@ -217,6 +217,50 @@ fn held<T: cuda_core::DeviceCopy>(t: &DeviceTensor<T>) -> usize {
     t.buf().len() * std::mem::size_of::<T>()
 }
 
+/// One tensor, or one part of a tensor, to upload ([`Weights::load_parts`]): its header entry as
+/// the part's (name, type, dims and bytes; the offset is not read) and its rows' file bytes, one
+/// slice a run of rows, in row order.
+pub struct TensorPart<'a> {
+    pub info: TensorInfo,
+    pub spans: Vec<&'a [u8]>,
+}
+
+/// What [`Weights::load_parts`]' errors name.
+const PARTS: &str = "Weights::load_parts";
+
+/// Each part's card format and the staging bytes of them all, checked before anything moves: a
+/// name given twice or one a derived weight would take, a type with no device format or one whose
+/// values a tensor scale multiplies (a scale is not cut here), and staging bytes past usize are
+/// refused by name.
+fn part_formats(parts: &[TensorPart<'_>]) -> Result<(Vec<CardFormat>, usize), GpuError> {
+    let mut seen = BTreeSet::new();
+    let mut budget = 0usize;
+    let mut formats = Vec::with_capacity(parts.len());
+    for p in parts {
+        let t = &p.info;
+        file_slot(&t.name)?;
+        if !seen.insert(t.name.as_str()) {
+            return Err(GpuError::shape(PARTS, format!("{} given twice", t.name)));
+        }
+        match CardFormat::of(t.ty) {
+            Some(f) if t.ty != GgmlType::NVFP4 && t.ty != GgmlType::F8E4M3_ROWS => formats.push(f),
+            _ => {
+                return Err(GpuError::shape(
+                    PARTS,
+                    format!(
+                        "tensor {} has type {}, which no part upload takes",
+                        t.name, t.ty
+                    ),
+                ));
+            }
+        }
+        budget = budget
+            .checked_add(upload_budget(t))
+            .ok_or_else(|| GpuError::shape(PARTS, "the parts' staging bytes pass usize"))?;
+    }
+    Ok((formats, budget))
+}
+
 /// The resident weights of a layer range: every `blk.L.*` tensor with L in
 /// `layers`, what the architecture derives for those blocks, and — when
 /// loaded with globals — the non-block tensors. Load-time only; per-step
@@ -333,6 +377,39 @@ impl Weights {
         keep: impl FnMut(&str) -> bool,
     ) -> Result<Weights, GpuError> {
         Weights::load_named(stream, split, keep, false)
+    }
+
+    /// Upload `parts`, each a tensor or a part of one that a caller cut from its file, in the
+    /// device format its kernel consumes, as [`Weights::load_where`] uploads a whole tensor:
+    /// [`TensorPart::info`] states the part's name, type and dims, and [`TensorPart::spans`]
+    /// holds its rows' file bytes in row order. A name given twice or one a derived weight would
+    /// take, a type with no device format or one whose values a tensor scale multiplies (a scale
+    /// is not cut here), and spans short of the part's bytes are refused by name. One staging ring
+    /// carries every copy, and one synchronize ends them.
+    pub fn load_parts(stream: &CudaStream, parts: &[TensorPart<'_>]) -> Result<Weights, GpuError> {
+        let (formats, budget) = part_formats(parts)?;
+        stream.context().bind_to_thread()?;
+        let mut by_name = BTreeMap::new();
+        let mut ring = UploadRing::new(stream, budget)?;
+        for (p, format) in parts.iter().zip(formats) {
+            let t = &p.info;
+            let dw = upload_rows(
+                stream,
+                &mut ring,
+                PARTS,
+                format,
+                t,
+                tensor_rows(t),
+                &p.spans,
+                None,
+            )?;
+            by_name.insert(t.name.clone(), dw);
+        }
+        ring.finish(stream)?;
+        Ok(Weights {
+            by_name,
+            tied: false,
+        })
     }
 
     /// [`Weights::load_where`], and with `tied` the token embedding is also the head
@@ -870,7 +947,7 @@ fn file_slot(name: &str) -> Result<(), GpuError> {
 
 /// `Some(L)` for a `blk.L.*` tensor name, `None` for a non-block name; a
 /// `blk.` name whose layer does not parse is an error naming the tensor.
-fn block_index(name: &str) -> Result<Option<usize>, GpuError> {
+pub fn block_index(name: &str) -> Result<Option<usize>, GpuError> {
     let Some(rest) = name.strip_prefix("blk.") else {
         return Ok(None);
     };
@@ -1507,9 +1584,10 @@ pub fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEAD_TENSOR, derived_slot_free, file_slot, head_tensor};
+    use super::{HEAD_TENSOR, TensorPart, derived_slot_free, file_slot, head_tensor, part_formats};
     use gguf::Split;
     use gguf::write::{Layout, TensorDecl, Writer};
+    use gguf::{GgmlType, TensorInfo};
     use std::collections::BTreeMap;
 
     /// A GGUF of F32 tensors of two rows of four named `names`, at `path`.
@@ -1578,5 +1656,38 @@ mod tests {
             .to_string();
         assert!(err.contains("derived.nemotron_h.zero_conv_bias"), "{err}");
         assert!(file_slot("output.weight").is_ok());
+    }
+
+    /// A part list is checked whole before any upload: a name given twice, a derived name, and a
+    /// type whose values a tensor scale multiplies are refused by name; distinct parts of types
+    /// with a card format pass, their staging bytes summed.
+    #[test]
+    fn a_part_list_is_refused_before_any_upload() {
+        let part = |name: &str, ty: GgmlType| TensorPart {
+            info: TensorInfo {
+                name: name.to_string(),
+                dims: vec![32, 2],
+                ty,
+                offset: 0,
+                nbytes: 0,
+            },
+            spans: Vec::new(),
+        };
+        let ok = [part("a", GgmlType::Q8_0), part("b", GgmlType::F32)];
+        let (formats, budget) = part_formats(&ok).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(formats.len(), 2);
+        // Q8_0 [32, 2] stages 68 plane bytes, F32 [32, 2] 256.
+        assert_eq!(budget, 68 + 256);
+        for (bad, says) in [
+            (
+                vec![part("a", GgmlType::Q8_0), part("a", GgmlType::F32)],
+                "given twice",
+            ),
+            (vec![part("derived.x", GgmlType::F32)], "derived"),
+            (vec![part("a", GgmlType::NVFP4)], "no part upload takes"),
+        ] {
+            let e = part_formats(&bad).map(|_| ()).unwrap_err().to_string();
+            assert!(e.contains(says), "{e}");
+        }
     }
 }

@@ -127,7 +127,8 @@ pub mod xstream;
 
 pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};
 pub use link::{
-    Crossing, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, link_tail,
+    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span,
+    link_tail,
 };
 
 use crate::GpuError;
