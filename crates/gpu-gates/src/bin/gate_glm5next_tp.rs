@@ -74,7 +74,7 @@ mod gate {
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::tier::Tier;
     use bloomery_gpu_gates::{GateError, verdict};
-    use bloomery_gpu_glm5next::tp::{self, GgufSource, Rank, RankOf, RoutePick};
+    use bloomery_gpu_glm5next::tp::{self, Rank, RankOf, RoutePick};
     use bloomery_gpu_glm5next::{Body, set_taps};
     use gguf::{GgmlType, Split};
     use model::arch::glm5next::names;
@@ -129,20 +129,20 @@ mod gate {
         let embd = inputs.hp.n_embd;
         let (one, host_from) = one_card(&levers, &inputs, &toks)?;
         let mut ok = true;
-        let n1 = ranks_run(&file, &inputs, 1, &toks)?.remove(0);
+        let n1 = ranks_run(&file, 1, &toks)?.remove(0);
         ok &= merge_clause(1, &n1);
         ok &= n1_clause(&one, &n1, host_from, &bands, embd);
         ok &= q6_clause(&file, &one, &n1, host_from, embd)?;
         let first = *toks.first().ok_or("no batch tokens")?;
-        ok &= state_clause(&file, &inputs, first)?;
+        ok &= state_clause(&file, first)?;
         let mut loaded = vec![(1, n1)];
         for &n in RANKS.iter().filter(|&&n| n > 1) {
-            match ranks_run(&file, &inputs, n, &toks) {
+            match ranks_run(&file, n, &toks) {
                 Ok(runs) => {
                     ok &= merge_clause(n, &runs[0]);
                     ok &= ranks_clause(n, &runs, &loaded[0].1, &bands, embd);
                     if loaded.len() == 1 {
-                        let again = ranks_run(&file, &inputs, n, &toks)?;
+                        let again = ranks_run(&file, n, &toks)?;
                         let same = runs.iter().zip(&again).all(|(a, b)| same_run(a, b));
                         println!(
                             "(rr) {n} ranks twice from fresh opens: every rank's tokens, logits, \
@@ -214,23 +214,11 @@ mod gate {
 
     /// `n` ranks' runs of `toks` from fresh opens, rank 0's first; the ranks' loopback released
     /// and every card drained on a failed step before the error returns.
-    fn ranks_run(
-        file: &Arc<Split>,
-        inputs: &PlanInputs,
-        n: usize,
-        toks: &[u32],
-    ) -> Result<Vec<Run>, GateError> {
+    fn ranks_run(file: &Arc<Split>, n: usize, toks: &[u32]) -> Result<Vec<Run>, GateError> {
         let gpus = (0..n).map(|_| Gpu::new()).collect::<Result<Vec<_>, _>>()?;
-        let src = GgufSource::new(file, inputs.hp.n_head);
         let mut ranks = Vec::with_capacity(n);
         for (r, gpu) in gpus.iter().enumerate() {
-            ranks.push(Rank::open(
-                gpu,
-                Arc::clone(file),
-                &src,
-                RankOf::new(r, n)?,
-                CTX,
-            )?);
+            ranks.push(Rank::open(gpu, Arc::clone(file), RankOf::new(r, n)?, CTX)?);
         }
         let ring = join(&ranks)?;
         for (gpu, r) in gpus.iter().zip(ranks.iter_mut()) {
@@ -476,7 +464,7 @@ mod gate {
     }
 
     /// (st) (module doc), stepping `token`: each refusal names what it refuses.
-    fn state_clause(file: &Arc<Split>, inputs: &PlanInputs, token: u32) -> Result<bool, GateError> {
+    fn state_clause(file: &Arc<Split>, token: u32) -> Result<bool, GateError> {
         let says = |r: Result<(), GpuError>, want: &str| match r {
             Err(e) => {
                 let e = e.to_string();
@@ -489,9 +477,8 @@ mod gate {
             Err(e) => (false, e.to_string()),
         };
         let gpu = Gpu::new()?;
-        let src = GgufSource::new(file, inputs.hp.n_head);
         let at = RankOf::new(0, 1)?;
-        let open = |ctx| Rank::open(&gpu, Arc::clone(file), &src, at, ctx);
+        let open = |ctx| Rank::open(&gpu, Arc::clone(file), at, ctx);
         let over = usize::try_from(ORACLE_POSITIONS)? + 1;
         let mut held = vec![
             (

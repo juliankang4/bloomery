@@ -61,7 +61,7 @@ impl RankOf {
 }
 
 /// The GGUF file's parts: each cut from the tensor's mapped bytes, every slice borrowed.
-pub struct GgufSource<'f> {
+pub(super) struct GgufSource<'f> {
     file: &'f Split,
     /// The heads the attention splits by.
     heads: u64,
@@ -70,7 +70,7 @@ pub struct GgufSource<'f> {
 impl<'f> GgufSource<'f> {
     /// The parts of `file`, whose attention has `heads` heads.
     #[must_use]
-    pub fn new(file: &'f Split, heads: usize) -> GgufSource<'f> {
+    pub(super) fn new(file: &'f Split, heads: usize) -> GgufSource<'f> {
         GgufSource {
             file,
             heads: heads as u64,

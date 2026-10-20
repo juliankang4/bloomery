@@ -7,7 +7,7 @@
 //! the rank's part of their inner width; the head projects the rank's part of the vocabulary.
 //! The router, the hyper-connection glue, the latent cache and its index, the norms, the
 //! low-rank inputs and the embedding run whole on every rank. The cut is the family's rule
-//! (`model::arch::glm5next::tp::cut`), and a rank's tensors are the file's parts ([`GgufSource`]).
+//! (`model::arch::glm5next::tp::cut`), applied to the file's mapped tensor bytes.
 //!
 //! A step is the one-card step's launches at the rank's widths, the mixers' and blocks' own
 //! functions ([`crate::kda`], [`crate::mla`], [`crate::ffn`]), with every expert on the card at
@@ -50,7 +50,8 @@ use crate::program::{hc_in, hc_out};
 use crate::tensors::LayerNames;
 use crate::{ffn, kda, mla};
 
-pub use source::{GgufSource, RankOf};
+use source::GgufSource;
+pub use source::RankOf;
 
 /// What the errors name.
 const WHAT: &str = "glm5next tp rank";
@@ -113,19 +114,13 @@ pub struct RoutePick {
 }
 
 impl Rank {
-    /// Rank `at` of the trunk of `file` at `ctx` positions on `gpu`: its parts from `src`, its
-    /// widths the file's over the ranks, every routed expert on the card. With more than one
+    /// Rank `at` of the trunk of `file` at `ctx` positions on `gpu`, with every routed expert
+    /// on the card and widths and tensor parts derived from the file. With more than one
     /// rank the rank makes its gather page in `gpu`'s context ([`Rank::link`]), which the caller
     /// joins to the other ranks' before a step. A context of no positions or past the positions a
     /// reference set checks the selector at, a width the ranks do not divide and a part the
     /// source refuses are refused by name.
-    pub fn open(
-        gpu: &Gpu,
-        file: Arc<Split>,
-        src: &GgufSource<'_>,
-        at: RankOf,
-        ctx: usize,
-    ) -> Result<Rank, GpuError> {
+    pub fn open(gpu: &Gpu, file: Arc<Split>, at: RankOf, ctx: usize) -> Result<Rank, GpuError> {
         check_ctx(ctx)?;
         let inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
         let spec = &inputs.spec;
@@ -152,7 +147,8 @@ impl Rank {
             .collect::<Result<Vec<_>, _>>()?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
-        let mut w = load(gpu, &file, src, at, spec.layers.len())?;
+        let src = GgufSource::new(&file, inputs.hp.n_head);
+        let mut w = load(gpu, &file, &src, at, spec.layers.len())?;
         let kinds: Vec<_> = cfg.iter().map(|c| c.kind).collect();
         Body::derive(stream, &kinds, 0..kinds.len(), &mut w)?;
         for (c, n) in cfg.iter().zip(&names) {
