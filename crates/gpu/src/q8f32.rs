@@ -2726,12 +2726,23 @@ pub struct E4m3Weight<'a> {
 impl E4m3Weight<'_> {
     /// Check plane alignment and matching shapes; return rows and k.
     pub(crate) fn dimensions(self, what: &'static str) -> Result<(usize, usize), GpuError> {
-        let (rows, k) = (self.qs.rows(), 4 * self.qs.cols());
-        if !k.is_multiple_of(128) || self.e.rows() != rows || self.e.cols() != k / 128 {
+        let rows = self.qs.rows();
+        let k = self.qs.cols().checked_mul(4).ok_or_else(|| {
+            GpuError::shape(
+                what,
+                format!("E4M3 planes: 4 * {} words overflows k", self.qs.cols()),
+            )
+        })?;
+        if rows == 0
+            || k == 0
+            || !k.is_multiple_of(128)
+            || self.e.rows() != rows
+            || self.e.cols() != k / 128
+        {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "E4M3 planes: k={k} must be a multiple of 128 and e {rows}x{}; got {}x{}",
+                    "E4M3 planes: rows={rows} must be positive, k={k} a positive multiple of 128 and e {rows}x{}; got {}x{}",
                     k / 128,
                     self.e.rows(),
                     self.e.cols()
@@ -2767,10 +2778,10 @@ pub fn e4m3_planes(
 ) -> Result<(Vec<u32>, Vec<u32>), GpuError> {
     let what = "q8f32::e4m3_planes";
     let ty = scales.ggml();
-    if k == 0 || !k.is_multiple_of(128) {
+    if rows == 0 || k == 0 || !k.is_multiple_of(128) {
         return Err(GpuError::shape(
             what,
-            format!("k {k} is not a positive multiple of 128"),
+            format!("rows {rows} must be positive and k {k} a positive multiple of 128"),
         ));
     }
     let row_bytes = (k / 128)
@@ -2905,16 +2916,22 @@ fn check_gemv_geometry(
             format!("need 1 <= m <= 8, got m={m}"),
         ));
     }
-    if x_len < m * k {
+    let (Some(x_need), Some(y_need)) = (m.checked_mul(k), n_rows.checked_mul(m)) else {
         return Err(GpuError::shape(
             what,
-            format!("x.len() {x_len} < m*k = {}", m * k),
+            format!("m*k = {m}*{k} or n_rows*m = {n_rows}*{m} overflows"),
+        ));
+    };
+    if x_len < x_need {
+        return Err(GpuError::shape(
+            what,
+            format!("x.len() {x_len} < m*k = {x_need}"),
         ));
     }
-    if y_len < n_rows * m {
+    if y_len < y_need {
         return Err(GpuError::shape(
             what,
-            format!("y.len() {y_len} < n_rows*m = {}", n_rows * m),
+            format!("y.len() {y_len} < n_rows*m = {y_need}"),
         ));
     }
     Ok(())
@@ -2923,10 +2940,24 @@ fn check_gemv_geometry(
 #[cfg(test)]
 mod tests {
     use super::{
-        ByteBlocks, E4m3Scales, Fp8B128Bytes, Mxfp8Bytes, e4m3_planes, f32_lane_partial_1col_w32,
-        f32_lane_partials, q8_0_lane_partial_1col, q8_0_lane_partials_mcol,
+        ByteBlocks, E4m3Scales, Fp8B128Bytes, Mxfp8Bytes, check_gemv_geometry, e4m3_planes,
+        f32_lane_partial_1col_w32, f32_lane_partials, q8_0_lane_partial_1col,
+        q8_0_lane_partials_mcol,
     };
     use gguf::quant::{GgmlType, dequant_row};
+
+    #[test]
+    fn gemv_geometry_refuses_wrapped_buffer_spans() {
+        for (rows, k, x, m, y) in [
+            (1, usize::MAX / 2 + 1, 0, 2, 2),
+            (usize::MAX / 2 + 1, 32, 64, 2, 0),
+        ] {
+            let e = check_gemv_geometry("gemv-span", rows, k, x, m, y)
+                .expect_err("wrapped buffer spans")
+                .to_string();
+            assert!(e.contains("gemv-span") && e.contains("overflows"), "{e}");
+        }
+    }
 
     /// The card's MXFP8 decode is the host's: blocks of every scale byte
     /// below 0xFF and every value byte that holds a value, through

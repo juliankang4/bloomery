@@ -156,6 +156,9 @@ impl Format {
             }
             None => {
                 let (block, scale) = self.scaled_bytes()?;
+                if block.contains(&0) {
+                    return None;
+                }
                 let values = k.checked_mul(rows)?.checked_mul(matrices)?;
                 let scales = k
                     .div_ceil(block[0])
@@ -1420,7 +1423,23 @@ mod tests {
                 block: [128, 1],
             })
         );
-        assert_eq!(B128.held(&[96, 4096]), None);
+        for dims in [
+            &[][..],
+            &[0, 1],
+            &[128, 0],
+            &[128, 1, 0],
+            &[96, 4096],
+            &[128, u64::MAX],
+            &[128, 1, u64::MAX, 2],
+        ] {
+            assert_eq!(B128.held(dims), None, "{dims:?}");
+        }
+        for ranks in [1, 2, 4] {
+            assert_eq!(B128.held(&[128, 1, ranks]).unwrap().bytes, 132 * ranks);
+        }
+        for (rows, cols) in [(0, 128), (128, 0), (0, 0)] {
+            assert_eq!(Format::Fp8Block { rows, cols }.held(&[128, 1]), None);
+        }
         let fp8 = Format::Fp8Block { rows: 32, cols: 32 };
         assert_eq!(
             fp8.held(&[16384, 4096]),

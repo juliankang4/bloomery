@@ -426,7 +426,10 @@ gpu-deepseek41 385 44 0
 # reads and stamp writes (the replay word in part, mark and check, the stamp in mark, a part's value in check, a sum
 # in digest) and its run's five (the module load, the part and parts windows over the page, the post and wait
 # batch, the rank-order sum), each with its SAFETY line.
-gpu-gates 81 5 1
+# PIN(2026-10-20): gpu-gates 81 -> 83 blocks, new refusal cases, not old code relaxed:
+# gate_mxfp8's plane_shapes makes two tensor windows over live allocations to test empty and
+# overflowing E4M3 shapes before launch. Each constructor has its own SAFETY line.
+gpu-gates 83 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of

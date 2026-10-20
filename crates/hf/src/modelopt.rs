@@ -1485,6 +1485,54 @@ mod tests {
                 .to_string();
             assert!(e.contains(want), "{e}");
         };
+        for shape in [[0, 128], [1, 0], [1, 96], [usize::MAX, 128]] {
+            let e = normalize(
+                |name| {
+                    if name == "f.weight" {
+                        Ok(Raw {
+                            dtype: Dtype::F8E4M3,
+                            shape: &shape,
+                            bytes: &[],
+                        })
+                    } else {
+                        st.raw(name)
+                    }
+                },
+                &[("f.weight", &p)],
+                Use::Matrix(Plain::Q8_0),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                e.contains("f.weight: FP8-block 128x128") && e.contains("whole 128-value blocks"),
+                "{e}"
+            );
+        }
+        for (dtype, bytes) in [
+            ("F32", &f32s[..]),
+            ("BF16", &bf16s[..]),
+            ("F8_E8M0", &e8m0s[..]),
+        ] {
+            for shape in [&[0, 2][..], &[1, 2], &[2, 0], &[2, 1]] {
+                let len = shape.iter().product::<usize>() * (bytes.len() / 4);
+                refused(
+                    &file(&values, dtype, &bytes[..len], shape),
+                    &[("f.weight", &p)],
+                    "f.weight_scale_inv",
+                );
+            }
+            let mut nan = bytes.to_vec();
+            match dtype {
+                "F32" => nan[..4].copy_from_slice(&f32::NAN.to_le_bytes()),
+                "BF16" => nan[..2].copy_from_slice(&0x7fc0u16.to_le_bytes()),
+                _ => nan[0] = 255,
+            }
+            refused(
+                &file(&values, dtype, &nan, &[2, 2]),
+                &[("f.weight", &p)],
+                "not finite",
+            );
+        }
         let two = [("f.weight", &p), ("f.weight", &p)];
         let stack = normalize(|n| st.raw(n), &two, Use::Matrix(Plain::Q8_0)).unwrap();
         let one = normalize(|n| st.raw(n), &two[..1], Use::Matrix(Plain::Q8_0)).unwrap();

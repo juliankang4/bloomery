@@ -101,7 +101,7 @@ fn main() -> std::process::ExitCode {
 
 mod gate {
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
-    use bloomery_gpu::q8f32::{E4m3GemvArgs, E4m3Scales, E4m3Weight, SelArgs};
+    use bloomery_gpu::q8f32::{E4m3GemvArgs, E4m3Scales, E4m3Weight, SelArgs, e4m3_planes};
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
@@ -549,13 +549,48 @@ mod gate {
         let x = DeviceBuffer::<f32>::zeroed(gpu.stream(), 256)?;
         let mut y = DeviceBuffer::<f32>::zeroed(gpu.stream(), 8)?;
         let mut ok = true;
-        for (case, words, scale_rows, scale_cols) in [
-            ("k-alignment", 40, 8, 1),
-            ("scale-rows", 32, 9, 1),
-            ("scale-width", 32, 8, 2),
+        for (rows, k) in [(0, 128), (1, 0), (1, 96), (1 << 62, 128)] {
+            let got = e4m3_planes(scales, &[], rows, k);
+            let pass = got
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("q8f32::e4m3_planes"));
+            println!(
+                "{tag} clause=reader-shape rows={rows} k={k} got={got:?} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        let qs_live = DeviceTensor::<u32>::zeroed(gpu.stream(), 8, 40)?;
+        let e_live = DeviceTensor::<u32>::zeroed(gpu.stream(), 9, 2)?;
+        let sel = DeviceBuffer::from_host(gpu.stream(), &[0u32])?;
+        for (case, rows, words, scale_rows, scale_cols) in [
+            ("k-zero", 1, 0, 1, 0),
+            ("rows-zero", 0, 32, 0, 1),
+            ("k-overflow", 0, usize::MAX / 4 + 1, 0, 0),
+            ("k-alignment", 8, 40, 8, 1),
+            ("scale-rows", 8, 32, 9, 1),
+            ("scale-width", 8, 32, 8, 2),
         ] {
-            let qs = DeviceTensor::<u32>::zeroed(gpu.stream(), 8, words)?;
-            let e = DeviceTensor::<u32>::zeroed(gpu.stream(), scale_rows, scale_cols)?;
+            // SAFETY: each window's rows * words is at most qs_live's 320
+            // words, including the empty windows, and the allocation stays live.
+            let qs = unsafe {
+                DeviceTensor::<u32>::window(
+                    qs_live.buf().cu_deviceptr(),
+                    rows,
+                    words,
+                    gpu.stream().context(),
+                )
+            };
+            // SAFETY: each window holds at most e_live's 18 words. The
+            // allocation stays live until the window is released below.
+            let e = unsafe {
+                DeviceTensor::<u32>::window(
+                    e_live.buf().cu_deviceptr(),
+                    scale_rows,
+                    scale_cols,
+                    gpu.stream().context(),
+                )
+            };
             let w = E4m3Weight {
                 qs: &qs,
                 e: &e,
@@ -571,19 +606,33 @@ mod gate {
                 },
             );
             let tile = g32.enqueue_e4m3_tile(gpu.stream(), w, &x, 1, &mut y);
-            let errors = [gemv, tile].map(|r| match r {
+            let routed = gpu.q8f32().enqueue_e4m3_gemv_sel_f32(
+                gpu.stream(),
+                w,
+                &SelArgs {
+                    x: &x,
+                    sel: &sel,
+                    n_slots: 1,
+                    rows_per_expert: 1,
+                    slots_per_col: 1,
+                },
+                gpu.unlabelled_sink(),
+                &mut y,
+            );
+            let errors = [gemv, tile, routed].map(|r| match r {
                 Ok(()) => "launched".to_owned(),
                 Err(e) => e.to_string(),
             });
             let detail = |s: &str| s.split_once(": E4M3 planes: ").map(|(_, d)| d.to_owned());
-            let pass = detail(&errors[0]).is_some() && detail(&errors[0]) == detail(&errors[1]);
+            let pass = detail(&errors[0]).is_some()
+                && errors.iter().all(|e| detail(e) == detail(&errors[0]));
             println!(
-                "{tag} clause=plane-shape case={case} gemv={:?} tile={:?} {}",
-                errors[0],
-                errors[1],
+                "{tag} clause=plane-shape case={case} errors={errors:?} {}",
                 verdict(pass)
             );
             ok &= pass;
+            DeviceTensor::release(qs);
+            DeviceTensor::release(e);
         }
         // 2^61 + 1 columns of 128 values over 8 rows: n·k and rows·n wrap to
         // 128 and 8 in 64 bits, which these buffers hold.
