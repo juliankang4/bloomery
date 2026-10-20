@@ -139,6 +139,7 @@ generate_ds41   gemm_q5k                                 0           0
 generate_ds41   gemm_q6k                               132          32
 generate_ds41   gemm_q8_0f                               0           0
 generate_ds41   gemm_q8_0p                               0           0
+generate_ds41   gemm_q8_0p_slab                          0           0
 generate_ds41   gemm_route                               0           0
 generate_ds41   gemm_route_remap                         0           0
 generate_ds41   gemm_swiglu_quant                        0           0
@@ -402,6 +403,7 @@ gate_e2e   gemm_q5k                                 0           0
 gate_e2e   gemm_q6k                               132          32
 gate_e2e   gemm_q8_0f                               0           0
 gate_e2e   gemm_q8_0p                               0           0
+gate_e2e   gemm_q8_0p_slab                          0           0
 gate_e2e   gemm_route                               0           0
 gate_e2e   gemm_route_remap                         0           0
 gate_e2e   gemm_swiglu_quant                        0           0

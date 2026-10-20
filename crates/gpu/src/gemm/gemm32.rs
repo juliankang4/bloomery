@@ -1,11 +1,15 @@
 //! The 32-value-block GEMM: Q8_0, IQ4_NL, Q5_1 and Q5_0 weights times
 //! [`GemmAct32`] activations over a route table — one block per (tile,
 //! [`GEMM_BM`]-row slab), as the K-quant family runs, for the weights whose
-//! scales come per 32 values. Six entries, declared in `kernels32.rs`,
+//! scales come per 32 values. Seven entries, declared in `kernels32.rs`,
 //! differ only in how the weight bytes reach shared memory:
 //! - `gemm_q8_0p`: Q8_0 in the q8f32 planes (`qs` u32 words, eight per
 //!   block, and `d` the blocks' f16 bits, `q8f32.rs`'s layout) — the dense
-//!   projections, through a one-expert table;
+//!   projections, through a one-expert table; `gemm_q8_0p_slab` reads the
+//!   same planes for a launch of a wave or more whose tiles share its slabs
+//!   ([`Gemm32Kernels::q8_0p_slab`]):
+//!   a slab row's step in one request, its scales eight at a time, and the
+//!   blocks of a large stack in groups of tiles ([`raster32`]);
 //! - `gemm_q8_0f`: the file's 34-byte `block_q8_0` stream (f16 `d`, then 32
 //!   int8 codes) as u32 words;
 //! - `gemm_iq4nl`: the file's 18-byte `block_iq4_nl` stream (f16 `d`, then
@@ -100,7 +104,41 @@ pub(super) const D32_ROW: usize = 4;
 /// u32 words of one scale stage.
 pub(super) const D32_STAGE_W: usize = GEMM_BN * D32_ROW;
 /// [`GEMM_THREADS`] as the block width a launch takes.
-const GEMM32_THREADS_U32: u32 = GEMM_THREADS as u32;
+pub(super) const GEMM32_THREADS_U32: u32 = GEMM_THREADS as u32;
+/// Tiles one group of the Q8_0 planes' block raster takes ([`raster32`]):
+/// at K 6144 a group's activation columns are 6.3 MB, a quarter of a 24 MiB
+/// L2.
+pub(super) const GEMM32_GROUP: usize = 16;
+/// An expert's Q8_0 plane bytes from which its blocks go in groups of
+/// [`GEMM32_GROUP`] tiles; a smaller stack stays in L2 across tiles, and its
+/// blocks go tile by tile, the order whose stores land together.
+pub(super) const GEMM32_RASTER_BYTES: usize = 8 << 20;
+
+/// Block `b`'s `(tile, slab)` over `tiles` tiles of `row_tiles` slabs each,
+/// or `None` past them. The tiles go in groups of `group`, a group's blocks
+/// slab by slab with its tiles in order inside each slab, so the blocks
+/// resident at once share the weight slabs they read (one fetch from memory
+/// for the whole group, however large the stack) while the group's
+/// activation columns stay in L2 across its slabs. A group of one is tile
+/// by tile, slab `b % row_tiles` of tile `b / row_tiles`.
+#[inline(always)]
+pub(super) fn raster32(
+    b: usize,
+    row_tiles: usize,
+    tiles: usize,
+    group: usize,
+) -> Option<(usize, usize)> {
+    let first = b / (group * row_tiles) * group;
+    if first >= tiles {
+        return None;
+    }
+    let n = (tiles - first).min(group);
+    let r = b - first * row_tiles;
+    if r >= n * row_tiles {
+        return None;
+    }
+    Some((first + r % n, r / n))
+}
 
 // Byte sizes of one 32-value block as the file stores it (ggml's
 // `block_q8_0`, `block_iq4_nl` and `block_q5_1`), and a Q5_1 block in words.
@@ -213,6 +251,13 @@ pub(super) unsafe fn mma_m16n8k16_s32_s8_zero(a: [u32; 2], b: u32) -> [i32; 4] {
 /// the pair exists (its row inside the slab's live rows, its block below
 /// K/32); `$n` is its block's index in the stack's block stream (`row · K/32
 /// + block`), `$dst` its staged row's first word.
+///
+/// The `slab` entry's codes come by `@stage` instead, for the whole slab:
+/// step `$h`'s codes into stage `$st`, thread `tid` the 16-byte chunk
+/// `tid % 4` of slab rows `tid / 4` and `tid / 4 + 64`, so each of a warp's
+/// eight rows is one 64-byte read. Its `@prep` binds the pair's window of
+/// eight scales (`@window`, one 16-byte read every four steps), and `@group`
+/// is its block raster's group ([`raster32`]; 1 for every other entry).
 macro_rules! w32 {
     (@copy plane($qs:ident, $wd:ident), $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
         if $live {
@@ -231,11 +276,70 @@ macro_rules! w32 {
     (@copy $kind:ident($($w:ident),+), $live:expr, $n:expr, $dst:expr, $pj:expr) => {{
         let _ = ($live, $n, $dst, $pj);
     }};
+    (
+        @stage slab($qs:ident, $wd:ident), $wt:expr, $st:expr, $slab_n:expr, $kb:expr, $h:expr,
+        $live_rows:expr, $tid:expr
+    ) => {{
+        // SAFETY: stage `st` of WT.
+        let stage = unsafe { $wt.add($st * W32_STAGE_W) };
+        let (r0, c): (usize, usize) = ($tid / 4, $tid % 4);
+        if 2 * $h + c / 2 < $kb {
+            for i in 0..2usize {
+                ::cuda_device::thread::__unroll_config::<0>();
+                let r = r0 + GEMM_BM / 2 * i;
+                if r < $live_rows {
+                    // SAFETY: block `2h + c/2` of slab row `r` is inside the
+                    // stack (the launch contract holds `8 · n_experts · rows ·
+                    // K/32` words); its chunk `c % 2` starts at a 16-byte
+                    // aligned word, as does chunk `c` of the row's staged
+                    // codes in this stage.
+                    unsafe {
+                        cp_async_cg_16(
+                            stage.add(r * W32_ROW + 4 * c),
+                            $qs.as_ptr().add(8 * ($slab_n + r * $kb + 2 * $h) + 4 * c),
+                        );
+                    }
+                }
+            }
+        }
+    }};
+    (
+        @stage $kind:ident($($w:ident),+), $wt:expr, $st:expr, $slab_n:expr, $kb:expr, $h:expr,
+        $live_rows:expr, $tid:expr
+    ) => {{
+        let _ = ($wt, $st, $slab_n, $kb, $h, $live_rows, $tid);
+    }};
     (@prep q50p($w:ident, $sw:ident), $pv:ident, $row:expr, $first:expr, $kb:expr) => {
         // The pair's row as the packed layout addresses it: its first word
         // (rows `5 · kb + s_words` words apart), its first block's index in
         // the stack's block stream, and its block count.
         let $pv = ($row * (5 * $kb + $sw as usize), $first, $kb);
+    };
+    (@group slab($qs:ident, $wd:ident), $blocks:expr) => {
+        if $blocks * Q8_0_BLOCK_BYTES >= GEMM32_RASTER_BYTES {
+            GEMM32_GROUP
+        } else {
+            1
+        }
+    };
+    (@group $kind:ident($($w:ident),+), $blocks:expr) => {
+        1
+    };
+    (@window slab($qs:ident, $wd:ident), $n:expr) => {{
+        // Block `n`'s group of eight scales, one 16-byte read.
+        let n: usize = $n;
+        // SAFETY: @prep admits full windows; each live @load index belongs
+        // to a stack of 16-row multiples. The host checks 16-byte alignment.
+        unsafe { (*($wd.as_ptr().add(n / 8 * 8) as *const U32x4)).0 }
+    }};
+    (@prep slab($qs:ident, $wd:ident), $pv:ident, $row:expr, $first:expr, $kb:expr) => {
+        // The thread's window of the scale plane, from its row's first block
+        // (zeros for a window past the plane: that pair is never live).
+        let mut $pv = if 8 * ($first / 8) + 8 <= $wd.len() {
+            w32!(@window slab($qs, $wd), $first)
+        } else {
+            [0u32; 4]
+        };
     };
     (@prep $kind:ident($($w:ident),+), $pv:ident, $row:expr, $first:expr, $kb:expr) => {};
     (@load plane($qs:ident, $wd:ident), $live:expr, $n:expr, $pv:ident) => {{
@@ -246,6 +350,22 @@ macro_rules! w32 {
         } else {
             0u16
         }
+    }};
+    (@load slab($qs:ident, $wd:ident), $live:expr, $n:expr, $pv:ident) => {{
+        // `n` grows by two a step, so it enters a new group of eight when
+        // `n % 8 < 2`; the window moves there. The window is the relayed
+        // value: the store reads the scale out of it, so the load's latency
+        // hides behind the step's compute.
+        if $live {
+            // A live pair's block `n` is below the plane's `n_experts · rows ·
+            // K/32` entries (launch contract), a multiple of eight, so its
+            // group of eight lies inside the plane.
+            let n: usize = $n;
+            if n % 8 < 2 {
+                $pv = w32!(@window slab($qs, $wd), n);
+            }
+        }
+        $pv
     }};
     (@load q8f($w:ident), $live:expr, $n:expr, $pv:ident) => {{
         if $live {
@@ -347,6 +467,21 @@ macro_rules! w32 {
             // SAFETY: word 16 + pj of the pair's staged row, which no warp
             // reads before the next barrier.
             unsafe { *$dst.add(16 + $pj) = half_bits_to_f32($raw).to_bits() };
+        }
+    }};
+    (@store slab($qs:ident, $wd:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr, $pv:ident) => {{
+        if $live {
+            let (n, v): (usize, [u32; 4]) = ($n, $raw);
+            let p = if n & 4 == 0 {
+                [v[0], v[1]]
+            } else {
+                [v[2], v[3]]
+            };
+            let word = if n & 2 == 0 { p[0] } else { p[1] };
+            let d = half_bits_to_f32((word >> (16 * (n & 1))) as u16);
+            // SAFETY: word 16 + pj of the pair's staged row, which no warp
+            // reads before the next barrier.
+            unsafe { *$dst.add(16 + $pj) = d.to_bits() };
         }
     }};
     (@store q8f($w:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr, $pv:ident) => {{
@@ -740,8 +875,22 @@ macro_rules! gemm32_block {
 
         let b = thread::blockIdx_x() as usize;
         let rt_n = $row_tiles as usize;
-        let tile = b / rt_n;
-        let rt = b - tile * rt_n;
+        let (tile, rt) = match w32!(@group $kind($($w),+), $rows as usize * $kb as usize) {
+            1 => {
+                let tile = b / rt_n;
+                (tile, b - tile * rt_n)
+            }
+            group => {
+                // SAFETY: n_tiles.len() >= 2 by the launch contract.
+                let live = unsafe { *$n_tiles.get_unchecked(0) } as usize;
+                // Block-uniform: a block past the live tiles' (tile 0's when
+                // the table holds none) returns at once.
+                let Some(p) = raster32(b, rt_n, live.max(1), group) else {
+                    return;
+                };
+                p
+            }
+        };
         if tile == 0 {
             // SAFETY: n_tiles.len() >= 2 by the launch contract.
             let refused = unsafe { *$n_tiles.get_unchecked(1) } as usize;
@@ -828,6 +977,8 @@ macro_rules! gemm32_block {
         let (pr, pj) = (tid / 2, tid % 2);
         let prow_live = pr < live_rows;
         let pn0 = (e * rows_n + slab0 + pr) * kb + pj;
+        // The slab's first block in the stack's block stream.
+        let slab_n = (e * rows_n + slab0) * kb;
         w32!(@prep $kind($($w),+), prow, e * rows_n + slab0 + pr, pn0 - pj, kb);
         // Each lane's `ldmatrix` rows: A row `lane % 16` of the warp's slab
         // rows at 16-byte half `lane / 16`; B column `lane % 8` of an n-tile
@@ -843,6 +994,7 @@ macro_rules! gemm32_block {
             // SAFETY: the pair's staged row of stage 0, inside WT.
             let dst = unsafe { wt.add(pr * W32_ROW) };
             w32!(@copy $kind($($w),+), live, pn0, dst, pj);
+            w32!(@stage $kind($($w),+), wt, 0usize, slab_n, kb, 0usize, live_rows, tid);
             let raw = w32!(@load $kind($($w),+), live, pn0, prow);
             w32!(@store $kind($($w),+), raw, live, pn0, dst, pj, prow);
         }
@@ -870,6 +1022,7 @@ macro_rules! gemm32_block {
                 stage32_act!(h + 1, st ^ 1, $mins, tid, ncols, col_q, col_d, $q, $d, $s, bt, dt,
                     acol_sh);
                 w32!(@copy $kind($($w),+), nlive, nn, ndst, pj);
+                w32!(@stage $kind($($w),+), wt, st ^ 1, slab_n, kb, h + 1, live_rows, tid);
             }
             // SAFETY: one group per step, empty on the last.
             unsafe { cp_async_commit_group() };
@@ -1203,6 +1356,22 @@ impl Gemm32Launch {
 }
 
 impl Gemm32Kernels {
+    /// The slab entry's resident-block wave on this card, read at load.
+    pub fn q8_0p_wave(&self) -> u32 {
+        self.q8_0p_wave
+    }
+
+    /// Whether a Q8_0-plane launch of `grid` blocks over `n_slots` slots of
+    /// `n_experts` experts takes `gemm_q8_0p_slab`: a grid of one wave of it
+    /// on this card or more (read at load) whose slots pass one tile an
+    /// expert. Its reads cost a few instructions a step, which pay where
+    /// several tiles share each weight slab across a full card; a grid
+    /// inside one wave, or one tile an expert (each slab read once, from
+    /// memory), takes `gemm_q8_0p`.
+    pub fn q8_0p_slab(&self, grid: u32, n_slots: u32, n_experts: u32) -> bool {
+        grid >= self.q8_0p_wave() && u64::from(n_slots) > GEMM_BN as u64 * u64::from(n_experts)
+    }
+
     /// Enqueue `y[s][r] = Σ_k w[e(s)][r][k] · x[c(s)][k]` for every slot of
     /// the last fill of the route table, in the module doc's numeric
     /// contract ([`Gemm32Args`] names each operand). Asynchronous,
@@ -1243,7 +1412,16 @@ impl Gemm32Kernels {
         }
         match w {
             Gemm32Weight::Q8_0Plane { qs, d } => {
-                launch!(prepare_gemm_q8_0p, gemm_q8_0p, qs.buf(), d.buf());
+                if self.q8_0p_slab(g.grid, g.n_slots, g.n_experts) {
+                    crate::tensor::check_alignment::<cuda_device::vector::U32x4, _>(
+                        "Gemm32Kernels::enqueue_gemm32",
+                        "Q8_0 scale plane",
+                        d.buf(),
+                    )?;
+                    launch!(prepare_gemm_q8_0p_slab, gemm_q8_0p_slab, qs.buf(), d.buf());
+                } else {
+                    launch!(prepare_gemm_q8_0p, gemm_q8_0p, qs.buf(), d.buf());
+                }
             }
             Gemm32Weight::Q8_0File(w) => launch!(prepare_gemm_q8_0f, gemm_q8_0f, w.buf()),
             Gemm32Weight::Q5_1File(w) => launch!(prepare_gemm_q5_1, gemm_q5_1, w.buf()),

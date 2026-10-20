@@ -11,9 +11,9 @@
 use super::act32::quant32_group;
 use super::f32tile::{F32Rows, Mxfp8Rows, STAGE_FLOATS, STAGES, f32_tile_body};
 use super::gemm32::{
-    B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, IQ4_NL_BLOCK_BYTES, Q5_1_BLOCK_WORDS,
-    Q8_0_BLOCK_BYTES, W32_ROW, W32_STAGE_W, iq4_nl_file_block, mma_m16n8k16_s32_s8_zero,
-    q8_0_file_block,
+    B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, GEMM32_GROUP, GEMM32_RASTER_BYTES,
+    GEMM32_THREADS_U32, IQ4_NL_BLOCK_BYTES, Q5_1_BLOCK_WORDS, Q8_0_BLOCK_BYTES, W32_ROW,
+    W32_STAGE_W, iq4_nl_file_block, mma_m16n8k16_s32_s8_zero, q8_0_file_block, raster32,
 };
 use super::grouped::{GEMM_BM, GEMM_NT, GEMM_THREADS};
 use super::remap::remap_id;
@@ -23,7 +23,7 @@ use super::route::{
 use super::{GEMM_BN, GEMM_MAX_SLOTS};
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
-use cuda_core::CudaContext;
+use cuda_core::{CudaContext, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
@@ -424,6 +424,62 @@ mod gemm32_kernels {
     ) {
         gemm32_block!(
             wt: plane(qs, wd),
+            mins: false,
+            epi: plain,
+            params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
+                n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
+    /// [`gemm_q8_0p`] for a launch of a wave or more
+    /// (`Gemm32Kernels::q8_0p_slab`): the same operands, outputs and bits,
+    /// each step reading a slab row's codes in one request and the pair's
+    /// scales eight blocks at a time; block `b` is the `(tile, row slab)`
+    /// [`raster32`] gives it, in groups of `GEMM32_GROUP` tiles for an
+    /// expert of `GEMM32_RASTER_BYTES` or more, else tile by tile.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            qs.len() >= n_experts * rows * 8 * blocks,
+            wd.len() >= n_experts * rows * blocks,
+            2 * steps >= blocks,
+            q.len() >= act_cols * 16 * steps,
+            d.len() >= act_cols * 2 * steps,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            y.len() >= n_slots * rows
+        )
+    )]
+    pub fn gemm_q8_0p_slab(
+        qs: &[u32],
+        wd: &[u16],
+        q: &[u32],
+        d: &[f32],
+        s: &[i32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        blocks: u32,
+        steps: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        gemm32_block!(
+            wt: slab(qs, wd),
             mins: false,
             epi: plain,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
@@ -1176,6 +1232,8 @@ mod gemm32_kernels {
 /// launches order with the rest of the step and are capturable.
 pub struct Gemm32Kernels {
     pub(super) module: gemm32_kernels::LoadedModule,
+    /// One wave of `gemm_q8_0p_slab` on the card ([`q8_0p_wave`]).
+    pub(super) q8_0p_wave: u32,
 }
 
 impl Gemm32Kernels {
@@ -1184,6 +1242,26 @@ impl Gemm32Kernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(gemm32_kernels, ctx)? };
-        Ok(Gemm32Kernels { module })
+        let q8_0p_wave = q8_0p_wave(ctx, &module)?;
+        Ok(Gemm32Kernels { module, q8_0p_wave })
     }
+}
+
+/// One wave of `gemm_q8_0p_slab` on `ctx`'s card: its SMs times the blocks
+/// of the entry one SM holds at a launch's 256 threads, both read from the
+/// card. Load-time only.
+fn q8_0p_wave(ctx: &CudaContext, module: &gemm32_kernels::LoadedModule) -> Result<u32, GpuError> {
+    let cfg = LaunchConfig1D::new(1, GEMM32_THREADS_U32, 0);
+    let per_sm = module
+        .prepare_gemm_q8_0p_slab(cfg)?
+        .function()
+        .max_active_blocks_per_multiprocessor(GEMM32_THREADS_U32, 0)?;
+    ctx.multiprocessor_count()?
+        .checked_mul(per_sm)
+        .ok_or_else(|| {
+            GpuError::shape(
+                "Gemm32Kernels::load",
+                "one wave of gemm_q8_0p_slab overflows u32",
+            )
+        })
 }

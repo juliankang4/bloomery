@@ -173,6 +173,13 @@
 //!   column; a Q8_0 plane stack of 8 experts at K 2560 whose two slots a
 //!   token share its column; a Q5_1 stack of 8 × 2560 rows at K 640 (the
 //!   routed down's shape) up to 4096 slots.
+//! - `g32_slab`: both Q8_0-plane entries on one stack past the raster's
+//!   bytes, 4112 rows (32 full slabs and one of 16) at K 2560, through the
+//!   dense table — 16 columns (one tile, 33 blocks: `gemm_q8_0p`), 65 (two
+//!   tiles, 66 blocks, under one wave of the card: `gemm_q8_0p`) and 1100
+//!   (18 tiles, 594 blocks: `gemm_q8_0p_slab`, one full raster group of 16
+//!   tiles and one of 2): the entry `q8_0p_slab` names for each, every
+//!   output inside its band and bit for bit the contract's transcription.
 //! - `g32_nvfp4_dense`: the resident NVFP4 planes (`mxfp4`'s `repack`, the
 //!   stack the dense gemv reads) in `gemm_nvfp4p` at Bolt's two NVFP4
 //!   projections' shapes — `ssm_in` 18560 × 4096, `ssm_out` 4096 × 8192 —
@@ -3035,12 +3042,12 @@ mod gate {
         /// mix's down `hcdown` (320 × 10240) and up `hcup` (10240 × 320). Each at
         /// T ∈ {16, 512, 2048} columns: a unit just past the gemv's eight
         /// columns and the prompt's two ubatch sizes. Then K 2560 stacks around
-        /// one wave of the card, its SMs times the two blocks an SM the
-        /// entries' `launch_bounds(256, 2)` holds, a block per 128-row slab and
-        /// tile: at T 16 (one tile) one block under (`wavem1`), one wave
-        /// (`wave`) and one block over (`wavep1`); at T 65 (two tiles, an even
-        /// grid) two blocks under (`wave2m`), one wave (`wave2`) and two over
-        /// (`wave2p`). Beside the usual row, the rate `2 · T · rows · K` over
+        /// one resident-block wave read from the loaded slab entry, a block per
+        /// 128-row slab and tile: at T 16 (one tile) one block under (`wavem1`),
+        /// one wave (`wave`) and one block over (`wavep1`); at T 65 (two tiles,
+        /// an even grid) the last grid below the wave (`wave2m`), the first at
+        /// or above it (`wave2`) and two blocks over (`wave2p`). Beside the
+        /// usual row, the rate `2 * T * rows * K` over
         /// the graph minimum. `only` keeps the one arm of that name; the return
         /// says whether any arm ran.
         fn q8p_gemm_arms(gpu: &bloomery_gpu::Gpu, only: Option<&str>) -> Result<bool, GateError> {
@@ -3055,8 +3062,8 @@ mod gate {
                 GemmKernels::load(gpu.context())?,
                 Gemm32Kernels::load(gpu.context())?,
             );
-            let sms = gpu.context().multiprocessor_count()? as usize;
-            let wave = 2 * sms;
+            let wave = usize::try_from(g32.q8_0p_wave())?;
+            let wave2 = wave.div_ceil(2);
             for (label, rows, k, ts) in [
                 ("qkv", 10240usize, 2560usize, &[16usize, 512, 2048][..]),
                 ("z", 6144, 2560, &[16, 512, 2048]),
@@ -3070,9 +3077,9 @@ mod gate {
                 ("wavem1", 128 * (wave - 1), 2560, &[16]),
                 ("wave", 128 * wave, 2560, &[16]),
                 ("wavep1", 128 * (wave + 1), 2560, &[16]),
-                ("wave2m", 128 * (sms - 1), 2560, &[65]),
-                ("wave2", 128 * sms, 2560, &[65]),
-                ("wave2p", 128 * (sms + 1), 2560, &[65]),
+                ("wave2m", 128 * (wave2 - 1), 2560, &[65]),
+                ("wave2", 128 * wave2, 2560, &[65]),
+                ("wave2p", 128 * (wave2 + 1), 2560, &[65]),
             ] {
                 let prefix = format!("gemm_q8_0p_{label}_t");
                 if only.is_some_and(|o| !o.starts_with(&prefix)) {
@@ -4499,6 +4506,129 @@ mod gate {
             let pass = same && nodes == 2;
             println!(
                 "gemm32 case=g32_dense graph K={k} m={m} graph_nodes={nodes} replay_eq_eager={same} {}",
+                verdict(pass)
+            );
+            Ok(ok && pass)
+        }
+
+        /// Both Q8_0-plane entries over the dense table on one stack of
+        /// 4112 rows at K 2560 (11.2 MB of planes, past
+        /// `GEMM32_RASTER_BYTES`): 16, 65 and 1100 columns, each against the
+        /// reference and the contract's transcription. The expected entry uses
+        /// the loaded slab wave; a separate grid below it checks the selector.
+        fn slab_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g32_slab") {
+                return Ok(true);
+            }
+            /// Rows of the stack: 32 full 128-row slabs and one of 16.
+            const SLAB_ROWS: usize = 4112;
+            let (k, ms) = (2560usize, [16usize, 65, 1100]);
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let max = ms[ms.len() - 1];
+            let mut route = GemmRoute::new(stream, max, 1)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, max * SLAB_ROWS)?;
+            let (w, dec) = weights(false, SLAB_ROWS, k, 0x3510)?;
+            let res = Res::new(dev, &w, false, SLAB_ROWS)?;
+            let mut act = GemmAct32::new(stream, max, k)?;
+            let wave = dev.g32.q8_0p_wave();
+            let selector_ok = !dev.g32.q8_0p_slab(wave - 1, 65, 1)
+                && !dev.g32.q8_0p_slab(u32::MAX, 64, 1)
+                && dev.g32.q8_0p_slab(wave, 65, 1);
+            println!(
+                "gemm32 case=g32_slab_selector wave={wave} {}",
+                verdict(selector_ok)
+            );
+            let mut ok = selector_ok;
+            for m in ms {
+                let x = activations(k, m, 9700 + m as u32);
+                let xd = DeviceBuffer::from_host(stream, &x)?;
+                dev.g32
+                    .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
+                dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
+                stream.synchronize()?;
+                let (ha, want) = host_act(&x, k, m);
+                let act_ok = planes_equal(&act, m, &want, stream)?;
+                let got = gemm(
+                    dev,
+                    &res,
+                    Lay::Q8Plane,
+                    SLAB_ROWS,
+                    &act,
+                    &route,
+                    GemmInput::PerSlot,
+                    &mut y,
+                    m,
+                )?;
+                // The launch's grid: 128-row slabs times the dense table's
+                // `m / 64 + 1` tiles (`gemm_max_tiles`).
+                let grid = u32::try_from(SLAB_ROWS.div_ceil(128) * (m / 64 + 1))?;
+                let slab = dev.g32.q8_0p_slab(grid, u32::try_from(m)?, 1);
+                let unwritten = got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
+                let Checked {
+                    checked,
+                    band_off,
+                    bits_off,
+                    worst,
+                    first,
+                    ..
+                } = check(&w, false, SLAB_ROWS, &ha, &|_| Some(0), &|s| s, &got, m)?;
+                let fault = gpu.take_fault()?;
+                let pass = act_ok
+                    && dec
+                    // PIN(2026-10-20): the loaded wave replaces the fixed 1100-column entry expectation.
+                    && slab == (m > 64 && grid >= wave)
+                    && unwritten == 0
+                    && band_off == 0
+                    && bits_off == 0
+                    && fault.is_none();
+                println!(
+                    "gemm32 case=g32_slab K={k} m={m} rows={SLAB_ROWS} grid={grid} slab={slab} \
+                     act_eq_host={act_ok} decode_vs_ggml={dec} unwritten={unwritten} \
+                     checked={checked} worst_err_over_band={worst:.3} band_off={band_off} \
+                     contract_bits_differ={bits_off} y_fnv={:016x} {}",
+                    Fnv1a64::default().f32s(&got).value(),
+                    verdict(pass)
+                );
+                if let Some(f) = first {
+                    println!("gemm32 case=g32_slab K={k} m={m} first_failure: {f}");
+                }
+                ok &= pass;
+            }
+            let (qs, d) = res.plane.as_ref().ok_or("a Q8_0 stack with no planes")?;
+            let mut scales = d.buf().to_host_vec(stream)?;
+            scales.insert(0, 0);
+            let parent = DeviceBuffer::from_host(stream, &scales)?;
+            let d_off = DeviceTensor::<u16>::window_of(&parent, 2, SLAB_ROWS, k / 32)?;
+            y.copy_from_host(stream, &vec![SENT; y.len()])?;
+            let got = dev.g32.enqueue_gemm32(
+                stream,
+                Gemm32Args {
+                    w: Gemm32Weight::Q8_0Plane { qs, d: &d_off },
+                    rows_per_expert: SLAB_ROWS,
+                    act: &act,
+                    route: &route,
+                    input: GemmInput::PerSlot,
+                    y: &mut y,
+                },
+            );
+            let refused = matches!(
+                &got,
+                Err(bloomery_gpu::GpuError::Shape { what, detail })
+                    if *what == "Gemm32Kernels::enqueue_gemm32"
+                        && detail.contains("Q8_0 scale plane")
+                        && detail.contains("is not 16-byte aligned")
+            );
+            let untouched = refused
+                && y.to_host_vec(stream)?
+                    .iter()
+                    .all(|v| v.to_bits() == SENT.to_bits());
+            let grid = u32::try_from(SLAB_ROWS.div_ceil(128) * (max / 64 + 1))?;
+            let pass = dev.g32.q8_0p_slab(grid, u32::try_from(max)?, 1) && refused && untouched;
+            println!(
+                "gemm32 case=g32_slab_scale_unaligned byte_offset=2 named_shape={refused} \
+                 output_untouched={untouched} result={got:?} {}",
                 verdict(pass)
             );
             Ok(ok && pass)
@@ -6084,6 +6214,7 @@ mod gate {
             ok &= swiglu_act_case(&dev)?;
             ok &= relu_sqr_case(&dev)?;
             ok &= dense_case(&dev)?;
+            ok &= slab_case(&dev)?;
             ok &= routed_case(&dev)?;
             ok &= nvfp4_dense_case(&dev)?;
             ok &= nvfp4_routed_case(&dev)?;
