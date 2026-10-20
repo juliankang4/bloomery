@@ -602,20 +602,9 @@ pub fn refuse(
     }
     // The kernel reads conv by f32 quads and y and the state by pairs: a
     // buffer at another offset is a misaligned access on the card.
-    let starts = [
-        ("conv", conv.cu_deviceptr(), 16u64),
-        ("y", y.cu_deviceptr(), 8),
-        ("state", state.cu_deviceptr(), 8),
-    ];
-    if let Some((name, at, align)) = starts
-        .iter()
-        .find(|(_, at, align)| !at.is_multiple_of(*align))
-    {
-        return Err(GpuError::shape(
-            what,
-            format!("{name} at {at:#x} is not {align}-byte aligned"),
-        ));
-    }
+    crate::tensor::check_alignment::<F32x4, _>(what, "conv", conv)?;
+    crate::tensor::check_alignment::<F32x2, _>(what, "y", y)?;
+    crate::tensor::check_alignment::<F32x2, _>(what, "state", state)?;
     Ok(shape)
 }
 
@@ -709,5 +698,45 @@ impl Mamba2Ssd {
             state,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn hw_ssd_refuses_unaligned_vector_planes() {
+        let (_, stream) = crate::capsync::fresh_stream(0).expect("CUDA stream");
+        let shape = crate::mamba2::check(
+            "ssd test",
+            model::mamba2::Geom {
+                d_inner: 64,
+                n_heads: 1,
+                n_groups: 1,
+                d_state: STATE,
+                d_conv: 4,
+            },
+        )
+        .expect("SSD shape");
+        let parent = DeviceBuffer::<f32>::zeroed(&stream, 8).expect("parent");
+        let aligned = crate::tensor::Window::<f32>::of(&parent, 0, 4).expect("aligned");
+        let unaligned = crate::tensor::Window::<f32>::of(&parent, 4, 4).expect("unaligned");
+        for (name, conv, y, state, align) in [
+            ("conv", &unaligned, &aligned, &aligned, 16),
+            ("y", &aligned, &unaligned, &aligned, 8),
+            ("state", &aligned, &aligned, &unaligned, 8),
+        ] {
+            let err = refuse("ssd test", shape, conv, y, state)
+                .expect_err("unaligned vector buffer")
+                .to_string();
+            assert!(
+                err.contains(name) && err.contains(&align.to_string()),
+                "{err}"
+            );
+            println!("SSD {name}: {err}");
+        }
+        refuse("ssd test", shape, &aligned, &aligned, &aligned).expect("aligned buffers");
     }
 }

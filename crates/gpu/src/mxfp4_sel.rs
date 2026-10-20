@@ -847,6 +847,8 @@ impl MxExpertKernels {
         h: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "MxExpertKernels::enqueue_gate_up";
+        crate::tensor::check_alignment::<U32x4, _>(what, "gate.qs", a.gate.qs.buf())?;
+        crate::tensor::check_alignment::<U32x4, _>(what, "up.qs", a.up.qs.buf())?;
         let shape = |detail: String| GpuError::Shape { what, detail };
         let (g, u, m, n_slots) = (a.gate, a.up, a.act.n_cols, a.n_slots);
         let rpe = g.rows_per_expert;
@@ -917,6 +919,7 @@ impl MxExpertKernels {
         out: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "MxExpertKernels::enqueue_down";
+        crate::tensor::check_alignment::<U32x4, _>(what, "down.qs", a.down.qs.buf())?;
         let (w, m, n_slots) = (a.down, a.m, a.n_slots);
         let rpe = w.rows_per_expert;
         if !(1..=MAX_TOKENS).contains(&m)
@@ -1156,5 +1159,123 @@ impl Mxfp4SelKernels {
             y,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn hw_mxfp4_refuses_unaligned_vector_planes() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA stream");
+        let kernels = MxExpertKernels::load(&ctx).expect("MXFP4 kernels");
+        let act = MxAct::new(&stream, 1, 256).expect("activation");
+        let sel = DeviceBuffer::from_host(&stream, &[0u32]).expect("selection");
+        let route = DeviceBuffer::from_host(&stream, &[0u32; N_USED]).expect("route");
+        let wts = DeviceBuffer::from_host(&stream, &[1.0f32; N_USED]).expect("weights");
+        let parent = DeviceBuffer::<u32>::zeroed(&stream, 33).expect("codes");
+        let e = DeviceTensor::zeroed(&stream, 1, 2).expect("scales");
+        // SAFETY: the window covers 32 u32-aligned words of parent, which
+        // lives through the launches; release below prevents its free.
+        let qs = unsafe { DeviceTensor::window(parent.cu_deviceptr() + 4, 1, 32, &ctx) };
+        let w = std::mem::ManuallyDrop::new(MxStack {
+            qs: std::mem::ManuallyDrop::into_inner(qs),
+            e,
+            rows_per_expert: 1,
+            k: 256,
+        });
+        let mut bytes = [0; 8 * mxfp4::BLOCK_BYTES];
+        for block in bytes.chunks_exact_mut(mxfp4::BLOCK_BYTES) {
+            block[0] = 127;
+        }
+        let aligned = MxStack::upload(&stream, &bytes, 1, 1, 256).expect("aligned stack");
+        let mut y = DeviceBuffer::zeroed(&stream, 1).expect("output");
+        let gate = kernels.enqueue_gate_up(
+            &stream,
+            &GateUpArgs {
+                gate: &w,
+                up: &aligned,
+                act: &act,
+                sel: &sel,
+                route: &route,
+                n_slots: 1,
+                limit: 0.0,
+            },
+            &mut y,
+        );
+        let up = kernels.enqueue_gate_up(
+            &stream,
+            &GateUpArgs {
+                gate: &aligned,
+                up: &w,
+                act: &act,
+                sel: &sel,
+                route: &route,
+                n_slots: 1,
+                limit: 0.0,
+            },
+            &mut y,
+        );
+        let down = kernels.enqueue_down(
+            &stream,
+            &DownArgs {
+                down: &w,
+                act: &act,
+                sel: &sel,
+                route: &route,
+                wts: &wts,
+                n_slots: 1,
+                m: 1,
+            },
+            &mut y,
+        );
+        stream.synchronize().expect("launches finished");
+        let w = std::mem::ManuallyDrop::into_inner(w);
+        DeviceTensor::release(std::mem::ManuallyDrop::new(w.qs));
+        drop(w.e);
+        let mut failures = Vec::new();
+        for (name, result) in [("gate.qs", gate), ("up.qs", up), ("down.qs", down)] {
+            println!("MXFP4 {name}: {result:?}");
+            if !matches!(&result, Err(err) if err.to_string().contains(name)
+                && err.to_string().contains("16"))
+            {
+                failures.push(format!("{name}: {result:?}"));
+            }
+        }
+        kernels
+            .enqueue_gate_up(
+                &stream,
+                &GateUpArgs {
+                    gate: &aligned,
+                    up: &aligned,
+                    act: &act,
+                    sel: &sel,
+                    route: &route,
+                    n_slots: 1,
+                    limit: 0.0,
+                },
+                &mut y,
+            )
+            .expect("aligned gate/up");
+        assert_eq!(y.to_host_vec(&stream).expect("gate/up output"), [0.0]);
+        kernels
+            .enqueue_down(
+                &stream,
+                &DownArgs {
+                    down: &aligned,
+                    act: &act,
+                    sel: &sel,
+                    route: &route,
+                    wts: &wts,
+                    n_slots: 1,
+                    m: 1,
+                },
+                &mut y,
+            )
+            .expect("aligned down");
+        assert_eq!(y.to_host_vec(&stream).expect("down output"), [0.0]);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

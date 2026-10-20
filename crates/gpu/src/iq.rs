@@ -1507,6 +1507,19 @@ impl IqKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "iq::enqueue_rows";
+        match w.fmt {
+            IqFormat::Iq2Xs | IqFormat::Iq2Xxs | IqFormat::Iq3Xxs => {
+                crate::tensor::check_alignment::<U32x2, _>(what, "qs", &w.planes[0])?;
+            }
+            IqFormat::Iq4Xs => {
+                crate::tensor::check_alignment::<U32x4, _>(what, "qs", &w.planes[0])?;
+                crate::tensor::check_alignment::<U32x2, _>(what, "meta", &w.planes[1])?;
+            }
+            IqFormat::Q2K => {
+                crate::tensor::check_alignment::<U32x4, _>(what, "qs", &w.planes[0])?;
+            }
+            IqFormat::Iq3S => {}
+        }
         if !(1..=8).contains(&m) {
             return Err(GpuError::shape(what, format!("1 <= m <= 8, got {m}")));
         }
@@ -1576,8 +1589,9 @@ impl IqKernels {
 mod tests {
     use super::{
         GRID2XXS_SEL, IQ2XS_GRID, IQ2XXS_GRID, IQ2XXS_NEG, IQ2XXS_POS, IQ3S_GRID, IQ3XXS_GRID,
-        KSIGNS_IQ2XS, sign_mask4, sign_sel, signed4, signs_of,
+        IqFormat, IqKernels, IqRows, KSIGNS_IQ2XS, sign_mask4, sign_sel, signed4, signs_of,
     };
+    use cuda_core::DeviceBuffer;
 
     /// `prmt`'s generic mode on the host: byte `k` of the result is byte
     /// `sel` nibble `k` of `b:a` (bytes 0..4 `a`, 4..8 `b`). The decode never
@@ -1592,6 +1606,54 @@ mod tests {
             );
             w | u32::from(bytes[n as usize]) << (8 * k)
         })
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn hw_iq_refuses_unaligned_vector_planes() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA stream");
+        let kernels = IqKernels::load(&ctx).expect("IQ kernels");
+        let q = DeviceBuffer::zeroed(&stream, 256).expect("activation codes");
+        let d8 = DeviceBuffer::zeroed(&stream, 2).expect("activation scales");
+        let mut y = DeviceBuffer::zeroed(&stream, 1).expect("output");
+        let mut failures = Vec::new();
+        for (fmt, plane, align) in [
+            (IqFormat::Iq2Xs, 0, 8),
+            (IqFormat::Iq2Xxs, 0, 8),
+            (IqFormat::Iq3Xxs, 0, 8),
+            (IqFormat::Iq4Xs, 0, 16),
+            (IqFormat::Iq4Xs, 1, 8),
+            (IqFormat::Q2K, 0, 16),
+        ] {
+            let mut w = std::mem::ManuallyDrop::new(
+                IqRows::upload(&stream, fmt, &vec![0; fmt.block_bytes()], 1, 256).expect("IQ rows"),
+            );
+            let len = w.planes[plane].len();
+            let parent = DeviceBuffer::<u32>::zeroed(&stream, len + 1).expect("parent");
+            // SAFETY: the u32-aligned window covers len words of parent, which
+            // lives through the launch and read; into_raw_parts prevents its free.
+            let view = unsafe {
+                DeviceBuffer::from_raw_parts(parent.cu_deviceptr() + 4, len, ctx.clone())
+            };
+            let owned = std::mem::replace(&mut w.planes[plane], view);
+            let result = kernels.enqueue_rows(&stream, &w, &q, &d8, 1, &mut y);
+            let view = std::mem::replace(&mut w.planes[plane], owned);
+            let _parts = view.into_raw_parts();
+            let w = std::mem::ManuallyDrop::into_inner(w);
+            stream.synchronize().expect("launch finished");
+            let name = if plane == 0 { "qs" } else { "meta" };
+            println!("{fmt:?} {name}: {result:?}");
+            if !matches!(&result, Err(err) if err.to_string().contains(name)
+                && err.to_string().contains(&align.to_string()))
+            {
+                failures.push(format!("{fmt:?} {name}: {result:?}"));
+            }
+            kernels
+                .enqueue_rows(&stream, &w, &q, &d8, 1, &mut y)
+                .expect("aligned launch");
+            assert_eq!(y.to_host_vec(&stream).expect("output"), [0.0]);
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// The IQ2_XXS table decode gives the computed decode's value words: for

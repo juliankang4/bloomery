@@ -785,6 +785,7 @@ impl Nvfp4Kernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "Nvfp4Kernels::enqueue_gemv";
+        crate::tensor::check_alignment::<U32x4, _>(what, "qs", w.qs.buf())?;
         let (k, m, rows) = (act.k(), act.m(), w.qs.rows());
         if w.qs.cols() != k / 8 || w.e.cols() != k / NV_BLOCK_VALUES || w.e.rows() != rows {
             return Err(GpuError::shape(
@@ -835,8 +836,53 @@ impl Nvfp4Kernels {
 
 #[cfg(test)]
 mod tests {
-    use super::{Fp4, Mxfp4, Nvfp4, repack, ue4m3_half};
+    use super::{Fp4, Mxfp4, Nvfp4, Nvfp4Kernels, Nvfp4Weight, repack, ue4m3_half};
+    use crate::tensor::{DeviceTensor, Q8Act};
+    use cuda_core::DeviceBuffer;
     use gguf::quant::ue4m3_to_f32_half;
+
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn hw_nvfp4_refuses_an_unaligned_code_plane() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA stream");
+        let kernels = Nvfp4Kernels::load(&ctx).expect("NVFP4 kernels");
+        let parent = DeviceBuffer::from_host(&stream, &[0u32; 33]).expect("code parent");
+        let qs = DeviceTensor::window_of(&parent, 4, 1, 32).expect("u32 window");
+        let e = DeviceTensor::upload(&stream, &[0u32; 4], 1, 4).expect("scales");
+        let act = Q8Act::with_k(&stream, 1, 256).expect("activation");
+        let mut y = DeviceBuffer::from_host(&stream, &[123.0f32]).expect("output");
+        let result = kernels.enqueue_gemv(
+            &stream,
+            Nvfp4Weight {
+                qs: &qs,
+                e: &e,
+                scale: 1.0,
+            },
+            &act,
+            &mut y,
+        );
+        let output = y.to_host_vec(&stream).expect("output read");
+        println!("unaligned NVFP4: {result:?}, y={output:?}");
+        let err = result
+            .expect_err("unaligned codes must be refused")
+            .to_string();
+        assert!(err.contains("qs") && err.contains("16"), "{err}");
+        assert_eq!(output, [123.0]);
+        let qs = DeviceTensor::window_of(&parent, 0, 1, 32).expect("aligned window");
+        kernels
+            .enqueue_gemv(
+                &stream,
+                Nvfp4Weight {
+                    qs: &qs,
+                    e: &e,
+                    scale: 1.0,
+                },
+                &act,
+                &mut y,
+            )
+            .expect("aligned launch");
+        assert_eq!(y.to_host_vec(&stream).expect("aligned output"), [0.0]);
+    }
 
     /// The card's UE4M3 decode is the host's on every byte the repack takes,
     /// bit for bit, and the repack takes exactly the bytes the host defines.

@@ -11,6 +11,23 @@ use std::mem::{ManuallyDrop, align_of, size_of};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
+/// Check the base alignment of a buffer read or written as vectors of `V`.
+pub(crate) fn check_alignment<V, T>(
+    what: &'static str,
+    name: &'static str,
+    buf: &DeviceBuffer<T>,
+) -> Result<(), GpuError> {
+    let align = align_of::<V>() as u64;
+    let at = buf.cu_deviceptr();
+    if !at.is_multiple_of(align) {
+        return Err(GpuError::shape(
+            what,
+            format!("{name} at {at:#x} is not {align}-byte aligned"),
+        ));
+    }
+    Ok(())
+}
+
 /// A non-owning window of `len` `T` at device address `ptr` in `ctx`. The
 /// launches read it exactly as they read a buffer of their own;
 /// `ManuallyDrop` keeps it from ever freeing memory it does not own.
