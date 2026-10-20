@@ -145,7 +145,7 @@ use super::body::ATTN_SCALE_256;
 use super::card38::Card38;
 use super::image::MediaRows;
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
-use super::program38::{Ctx38, q8};
+use super::program38::Ctx38;
 use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
 use super::scratch38::{Arena38, ROUTE_ROWS, SELECT_ROWS, Store38};
 use super::tier38::TierSide38;
@@ -159,7 +159,7 @@ use crate::flash_gqa_prefill::GqaPrefillArgs;
 use crate::gemm::{
     Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute, GemmWeight,
 };
-use crate::hc_gated::{Before, HcWideScratch, SiteWeights, WideMixArgs};
+use crate::hc_gated::{Before, HcMatrix, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::host::handoff::Places;
@@ -173,12 +173,14 @@ use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs};
 use crate::prompt_timing::Mark;
 use crate::q38::{
-    CardSharedAddArgs, CardTierAccArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs, SLOTS,
+    CardSharedAddArgs, CardTierAccArgs, EmbedArgs, EmbedRows, KeyAppendArgs, OutGateArgs, SLOTS,
     SharedAddArgs, W_PITCH,
 };
 use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
+use crate::site::{self, WideIn, WideKernels};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
+use crate::weights::DevWeight;
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use runtime::hc_gated::Geometry;
@@ -1519,38 +1521,69 @@ pub(super) struct WideParts<'a> {
     pub(super) media: Option<&'a mut MediaRows>,
 }
 
-/// `y = W · act` for the Q8_0 weight `name` over the first `m` columns of
-/// `act`, token-major, through the walk's one-expert table `dense`, which
-/// must be filled for exactly those `m` slots (else refused by name: a table
-/// of fewer would leave the rest of `y` as another call left it).
-fn gemm_q8(
+/// The kernels of the walk's dense sites ([`site::resident_gemm`]).
+fn dense_kernels<'a>(c: &Ctx38<'a>) -> WideKernels<'a> {
+    WideKernels {
+        gemm: &c.k.gemm,
+        g32: Some(&c.k.g32),
+    }
+}
+
+/// The q8 of the first `m` columns of the f32 rows `rows` into `act` when
+/// any of `names` is resident in Q8_0 planes ([`site::resident_quantize`]).
+fn quantize_for(
+    c: &Ctx38<'_>,
+    names: &[&str],
+    rows: (&DeviceBuffer<f32>, usize),
+    act: &mut GemmAct32,
+    sink: FaultSink,
+) -> Result<(), GpuError> {
+    site::resident_quantize(c.gpu, &dense_kernels(c), (c.w, names), rows, act, sink)
+}
+
+/// `y = W · rows` for the dense weight `name` over the first `m` columns by
+/// its resident form, token-major, on the walk's one-expert table `dense`
+/// ([`site::resident_gemm`]): Q8_0 over `act`, the q8 of `rows`
+/// ([`quantize_for`]).
+fn dense_gemm(
     c: &Ctx38<'_>,
     name: &str,
-    (act, m): (&GemmAct32, usize),
+    (rows, act, m): (&DeviceBuffer<f32>, &GemmAct32, usize),
     dense: &GemmRoute,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    if dense.filled() != Some(m) {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "{name}: the one-expert table is filled for {:?} slots, the unit has {m}",
-                dense.filled()
-            ),
-        ));
+    let x = WideIn {
+        q128: None,
+        q32: Some(act),
+        f32: Some(rows),
+    };
+    site::resident_gemm(c.gpu, &dense_kernels(c), (c.w, name), &x, dense, m, y)
+}
+
+/// The wide tile over rows `at .. at + n` of the F32 or BF16 weight `name`
+/// against the first `m` columns of `x`, token-major: the F32 tile, or the
+/// BF16 tile bit for bit it over the widened values.
+fn rows_tile(
+    c: &Ctx38<'_>,
+    name: &str,
+    (at, n): (usize, usize),
+    (x, m): (&DeviceBuffer<f32>, usize),
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let stream = c.gpu.stream();
+    match c.w.get(name) {
+        Some(DevWeight::Bf16 { w, k }) => {
+            let words = k / 2;
+            let part = DeviceTensor::<u32>::window_of(w.buf(), at * words * 4, n, words)?;
+            c.gpu.q8f32().enqueue_bf16_tile(stream, &part, x, m, y)
+        }
+        _ => {
+            let w = f32_tensor(c.w, name)?;
+            let k = w.cols();
+            let part = DeviceTensor::<f32>::window_of(w.buf(), at * k * 4, n, k)?;
+            c.k.g32.enqueue_f32_tile(stream, &part, x, m, y)
+        }
     }
-    let (qs, d) = q8(c.w, name)?;
-    c.k.g32.enqueue_gemm32(
-        c.gpu.stream(),
-        Gemm32Args {
-            w: Gemm32Weight::Q8_0Plane { qs, d },
-            rows_per_expert: qs.rows(),
-            act,
-            route: dense,
-            input: GemmInput::PerSlot,
-            y,
-        },
-    )
 }
 
 /// The wide mix of `site` over `m` columns of `res`, after `before`, into
@@ -1572,8 +1605,6 @@ fn mix(
 ) -> Result<(), GpuError> {
     let hc = UnitHc::on(scratch, wgt)?;
     let w = c.w;
-    let (down_qs, down_d) = q8(w, &site.down)?;
-    let (up_qs, up_d) = q8(w, &site.up)?;
     let inject = match &site.inject {
         Some(n) => Some(f32_tensor(w, n)?),
         None => None,
@@ -1585,10 +1616,8 @@ fn mix(
             before,
             w: SiteWeights {
                 gamma: f32_gain(w, &site.norm)?,
-                down_qs,
-                down_d,
-                up_qs,
-                up_d,
+                down: HcMatrix::of(w, WHAT, &site.down)?,
+                up: HcMatrix::of(w, WHAT, &site.up)?,
                 inject,
             },
             eps: c.eps,
@@ -1596,6 +1625,7 @@ fn mix(
             fault,
             scratch: &mut *hc.hc,
             gemm: &c.k.g32,
+            q8f32: c.gpu.q8f32(),
             dense,
             mixed,
         },
@@ -1616,12 +1646,15 @@ impl WideParts<'_> {
         let s = &mut *self.s;
         let x = &mut *self.x;
         if l == 0 {
-            let (qs, d) = q8(c.w, &model::arch::qwen35moe::names::token_embd())?;
+            let table = EmbedRows::of(
+                c.w,
+                "qwen3moe::wide38::front",
+                &model::arch::qwen35moe::names::token_embd(),
+            )?;
             c.k.q38.enqueue_embed_rows(
                 stream,
-                EmbedQ8Args {
-                    qs,
-                    d,
+                EmbedArgs {
+                    table,
                     ids: &u.tok,
                     pos0: self.io.pos0,
                     first: u.first,
@@ -1654,11 +1687,12 @@ impl WideParts<'_> {
             }
             let w = c.w;
             let pl = &mut s.ple;
-            c.k.g32
-                .enqueue_quantize_gemm32(stream, &u.ple_e, m, &mut x.act_hid, sink)?;
+            let e = (&*u.ple_e, m);
+            quantize_for(c, &[&pp.key, &pp.value], e, &mut x.act_hid, sink)?;
             let dense = &x.dense[u.route];
-            gemm_q8(c, &pp.key, (&x.act_hid, m), dense, &mut pl.key)?;
-            gemm_q8(c, &pp.value, (&x.act_hid, m), dense, &mut pl.value)?;
+            let act = (&*u.ple_e, &x.act_hid, m);
+            dense_gemm(c, &pp.key, act, dense, &mut pl.key)?;
+            dense_gemm(c, &pp.value, act, dense, &mut pl.value)?;
             let [res0, res1] = &mut u.res;
             let (xs, out) = if u.cur == 0 {
                 (&*res0, res1)
@@ -1871,14 +1905,28 @@ impl WideParts<'_> {
         let (c, m) = (&self.c, u.m);
         let stream = c.gpu.stream();
         let (s, x) = (&mut *self.s, &mut *self.x);
-        c.k.g32
-            .enqueue_quantize_gemm32(stream, &u.ffn_x, m, &mut x.act_hid, sink)?;
+        let f = &p.ffn;
+        quantize_for(
+            c,
+            &[&f.gate_sh, &f.up_sh],
+            (&*u.ffn_x, m),
+            &mut x.act_hid,
+            sink,
+        )?;
         let dense = &x.dense[u.route];
-        gemm_q8(c, &p.ffn.gate_sh, (&x.act_hid, m), dense, &mut s.sh_g)?;
-        gemm_q8(c, &p.ffn.up_sh, (&x.act_hid, m), dense, &mut s.sh_u)?;
-        c.k.g32
-            .enqueue_swiglu_quant32(stream, &s.sh_g, &s.sh_u, m, &mut x.act_ff, sink)?;
-        gemm_q8(c, &p.ffn.down_sh, (&x.act_ff, m), dense, &mut u.sh_y)
+        let act = (&*u.ffn_x, &x.act_hid, m);
+        dense_gemm(c, &f.gate_sh, act, dense, &mut s.sh_g)?;
+        dense_gemm(c, &f.up_sh, act, dense, &mut s.sh_u)?;
+        // A Q8_0 down reads the SwiGLU's q8, a BF16 one its f32 rows.
+        if let Some(DevWeight::Bf16 { .. }) = c.w.get(&f.down_sh) {
+            c.gpu
+                .elem()
+                .enqueue_swiglu(stream, &s.sh_g, &s.sh_u, geo::FF * m, &mut s.sh_h)?;
+        } else {
+            c.k.g32
+                .enqueue_swiglu_quant32(stream, &s.sh_g, &s.sh_u, m, &mut x.act_ff, sink)?;
+        }
+        dense_gemm(c, &f.down_sh, (&s.sh_h, &x.act_ff, m), dense, &mut u.sh_y)
     }
 
     /// Layer `l`'s card route over unit `u`'s `ffn_x`, when it has card
@@ -2075,35 +2123,15 @@ fn gdn(
         attn,
         ..
     } = s;
-    c.k.g32
-        .enqueue_quantize_gemm32(stream, mixed, m, &mut x.act_hid, sink)?;
+    quantize_for(c, &[&gp.qkv, &gp.z], (mixed, m), &mut x.act_hid, sink)?;
     let dense = &x.dense[u.route];
-    gemm_q8(c, &gp.qkv, (&x.act_hid, m), dense, &mut g.x)?;
-    gemm_q8(c, &gp.z, (&x.act_hid, m), dense, &mut g.z)?;
-    let ba = f32_tensor(w, &gp.beta_alpha)?;
-    let k = ba.cols();
-    // SAFETY: the joined stack is `2·nv` rows of `k` (`plan38::plans`
-    // refuses another shape at load), β's rows its first `nv · k` values and
-    // α's the next; the stack stays resident while the windows live (the two
-    // launches), which are given back below.
-    let (wb, wa) = unsafe {
-        let at = ba.buf().cu_deviceptr();
-        (
-            DeviceTensor::<f32>::window(at, nv, k, ba.buf().context()),
-            DeviceTensor::<f32>::window(
-                at + (nv * k * size_of::<f32>()) as u64,
-                nv,
-                k,
-                ba.buf().context(),
-            ),
-        )
-    };
-    let r1 = c.k.g32.enqueue_f32_tile(stream, &wb, mixed, m, &mut g.b);
-    let r2 = c.k.g32.enqueue_f32_tile(stream, &wa, mixed, m, &mut g.a);
-    DeviceTensor::release(wb);
-    DeviceTensor::release(wa);
-    r1?;
-    r2?;
+    let act = (&*mixed, &x.act_hid, m);
+    dense_gemm(c, &gp.qkv, act, dense, &mut g.x)?;
+    dense_gemm(c, &gp.z, act, dense, &mut g.z)?;
+    // The joined stack is `2·nv` rows (`plan38::plans` refuses another shape
+    // at load), β's rows first and α's next.
+    rows_tile(c, &gp.beta_alpha, (0, nv), (mixed, m), &mut g.b)?;
+    rows_tile(c, &gp.beta_alpha, (nv, nv), (mixed, m), &mut g.a)?;
     let lin = &c.k.linear;
     lin.conv.enqueue_conv_prep(
         stream,
@@ -2159,9 +2187,8 @@ fn gdn(
             y: &mut *attn,
         },
     )?;
-    c.k.g32
-        .enqueue_quantize_gemm32(stream, attn, m, &mut x.act_attn, sink)?;
-    gemm_q8(c, &gp.ssm_out, (&x.act_attn, m), dense, &mut u.y)
+    quantize_for(c, &[&gp.ssm_out], (attn, m), &mut x.act_attn, sink)?;
+    dense_gemm(c, &gp.ssm_out, (attn, &x.act_attn, m), dense, &mut u.y)
 }
 
 /// A selecting attention layer's mixer over unit `u`'s rows and its store
@@ -2190,14 +2217,13 @@ fn qsa(
         attn,
         ..
     } = s;
-    c.k.g32
-        .enqueue_quantize_gemm32(stream, mixed, m, &mut x.act_hid, sink)?;
+    quantize_for(c, &[&qp.q, &qp.k, &qp.v], (mixed, m), &mut x.act_hid, sink)?;
     let table = &x.dense[u.route];
-    gemm_q8(c, &qp.q, (&x.act_hid, m), table, &mut q.qg)?;
-    gemm_q8(c, &qp.k, (&x.act_hid, m), table, &mut q.k)?;
-    gemm_q8(c, &qp.v, (&x.act_hid, m), table, &mut q.v)?;
-    c.k.g32
-        .enqueue_f32_tile(stream, f32_tensor(w, &qp.idx_k)?, mixed, m, &mut x.kr)?;
+    let act = (&*mixed, &x.act_hid, m);
+    dense_gemm(c, &qp.q, act, table, &mut q.qg)?;
+    dense_gemm(c, &qp.k, act, table, &mut q.k)?;
+    dense_gemm(c, &qp.v, act, table, &mut q.v)?;
+    rows_tile(c, &qp.idx_k, (0, geo::IDX_DIM), (mixed, m), &mut x.kr)?;
     // The append reads the keys row-major (`[IDX_DIM][m]`, the gemv's
     // layout): the tile's `[m][IDX_DIM]` turned.
     c.k.proj
@@ -2227,8 +2253,8 @@ fn qsa(
             pooled: &mut *pooled,
         },
     )?;
-    c.k.g32
-        .enqueue_f32_tile(stream, f32_tensor(w, &qp.idx_q)?, mixed, m, &mut q.qi)?;
+    let idx_q_rows = geo::IDX_HEADS * geo::IDX_DIM;
+    rows_tile(c, &qp.idx_q, (0, idx_q_rows), (mixed, m), &mut q.qi)?;
     // The selecting store is f16 (the qwen38 family's stores carry no q8_0
     // form), so the family's shared append runs its f16 arm.
     let (kcache, vcache) = kv.f16_mut("qwen38::wide")?;
@@ -2347,9 +2373,8 @@ fn qsa(
             y: &mut *attn,
         },
     )?;
-    c.k.g32
-        .enqueue_quantize_gemm32(stream, attn, m, &mut x.act_attn, sink)?;
-    gemm_q8(c, &qp.out, (&x.act_attn, m), table, &mut u.y)?;
+    quantize_for(c, &[&qp.out], (attn, m), &mut x.act_attn, sink)?;
+    dense_gemm(c, &qp.out, (attn, &x.act_attn, m), table, &mut u.y)?;
     Ok((dense, m - dense))
 }
 

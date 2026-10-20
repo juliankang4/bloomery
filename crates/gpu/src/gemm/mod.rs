@@ -64,6 +64,9 @@ mod kernels32;
 pub use act::GemmAct;
 pub use act32::GemmAct32;
 pub use f32tile::LINE as F32_TILE_LINE;
+pub(crate) use f32tile::{
+    Bf16Rows, F32T_THREADS_U32, STAGE_FLOATS, STAGES, f32_tile_body, tile_launch,
+};
 pub use gemm32::{Gemm32Args, Gemm32Weight};
 pub use grouped::{GemmArgs, GemmInput, GemmWeight};
 pub use kernels::GemmKernels;

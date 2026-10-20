@@ -25,6 +25,13 @@
 //!   four up rows of that value against the bottleneck in the q8f32 lane
 //!   order, and lane 0 writes `(xn_0·σ(g_0), fma for the rest)·(1/4)`.
 //!
+//! A BF16 down or up (in its words, [`HcMatrix::Bf16`]) runs its own entry
+//! of the same blocks, `hc_gated_down_bf16_4x320` and
+//! `hc_gated_up_mix_bf16_4x320`: each row through the F32 core's lane walk
+//! over the widened values (lane `L` values `32i + L` in increasing `i`, one
+//! fused multiply-add each, then the butterfly), the down's partials and the
+//! up's mix as above. Down and up pick their entry each by its own type.
+//!
 //! [`hc_kernels::hc_gated_combine_4`] is the combine alone, for a site whose
 //! next reader is not a mix (the PLE site's layer).
 //!
@@ -47,7 +54,9 @@
 //! (`hc_gated_norm_4w`, `hc_gated_combine_4w`, the same bodies); the down
 //! and the up are the 32-value GEMM (`crate::gemm`'s `gemm_q8_0p` over a
 //! one-expert table) on `xn` and on the bottleneck quantized per 32 values;
-//! the inject rows are the wide F32 tile; two glue entries finish the rule —
+//! the inject rows are the wide F32 tile, and a BF16 down or up the BF16
+//! tile (`Q8F32Kernels::enqueue_bf16_tile`) on `xn` or the bottleneck in f32,
+//! with no quantize; two glue entries finish the rule —
 //! `hc_gated_lo_4x320` (`silu(·/4)` of each down row, `2·σ(·/4)` of each
 //! inject row) and `hc_gated_mix_4` (`(xn_0·σ(g_0), fma for the rest)·¼`,
 //! the up's order). A column's values are a function of that column alone;
@@ -59,9 +68,13 @@ use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmRoute};
 use crate::linear::{sigmoid, silu};
-use crate::q8f32::{f32_lane_partial_1col, gemv_lane_sums, q8_0_lane_partials_mcol};
+use crate::q8f32::{
+    Bf16Words, Q8F32Kernels, RowValues, f32_lane_partial_1col, f32_lane_partials_view,
+    gemv_lane_sums, q8_0_lane_partials_mcol,
+};
 use crate::tensor::DeviceTensor;
 use crate::view::{Elem, StreamFma};
+use crate::weights::{DevWeight, Weights};
 use crate::{GpuError, launch_u32, store_cols};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
@@ -111,6 +124,9 @@ const UP_LANE_WORDS: usize = 3;
 /// Scale blocks of an up row.
 const UP_BLOCKS: usize = RANK / 32;
 const _: () = assert!(UP_WORDS == 80 && UP_LANE_WORDS * 32 >= UP_WORDS && UP_WORDS > 64);
+/// Values of a BF16 up row one lane takes.
+const UP_LANE_VALUES: usize = RANK / 32;
+const _: () = assert!(UP_LANE_VALUES * 32 == RANK);
 const _: () = assert!((runtime::hc_gated::HIDDEN_ALIGN as usize).is_multiple_of(UP_WARPS));
 
 /// Threads of a combine block, a value each.
@@ -169,10 +185,6 @@ unsafe fn block_sum(v: f32, tid: usize, ws: *mut f32) -> f32 {
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
-#[allow(
-    clippy::needless_range_loop,
-    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
-)]
 unsafe fn down_row<const M: usize>(
     qs: &[u32],
     d: &[u16],
@@ -199,6 +211,29 @@ unsafe fn down_row<const M: usize>(
             lane,
         )
     };
+    // SAFETY: down_row_end's contract is this fn's: the warp's (row, s)
+    // and its M·RANK·STREAMS slots.
+    unsafe { down_row_end::<M>(f, (row, s, lane), fault, part) };
+}
+
+/// Lane 0's end of a down row: the warp's `M` column sums of the lane
+/// partials `f`, a non-finite one raised as the site's fault, column c's sum
+/// stored at `part[(c·rank + row)·streams + s]`.
+///
+/// # Safety
+/// `part` holds `M·RANK·STREAMS` slots, `row < RANK`, `s < STREAMS`, and
+/// this warp's (row, s) owns them.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn down_row_end<const M: usize>(
+    f: [f32; 8],
+    (row, s, lane): (usize, usize, usize),
+    fault: FaultSink,
+    part: &mut DisjointSlice<f32>,
+) {
     let sums = gemv_lane_sums(f, M as u32);
     if lane == 0 {
         let mut finite = true;
@@ -291,9 +326,31 @@ unsafe fn up_mix_value<const M: usize>(
             g[s][c] = warp::reduce_sum_f32(f[s]);
         }
     }
-    if lane != 0 {
-        return;
+    if lane == 0 {
+        // SAFETY: this fn's contract is mix_out's.
+        unsafe { mix_out::<M>(&g, xn, hidden, h, fault, mixed) };
     }
+}
+
+/// Lane 0's mixed value of each of `M` columns for hidden value `h` from its
+/// four up rows' sums `g[s][c]` (module doc).
+///
+/// # Safety
+/// `xn` holds `M` columns of `STREAMS·hidden`, `mixed` `M·hidden` slots, `h <
+/// hidden`; the calling warp owns `h`.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn mix_out<const M: usize>(
+    g: &[[f32; MAX_COLS]; STREAMS],
+    xn: &[f32],
+    hidden: usize,
+    h: usize,
+    fault: FaultSink,
+    mixed: &mut DisjointSlice<f32>,
+) {
     for c in 0..M {
         thread::__unroll_config::<0>();
         let mut acc = 0.0f32;
@@ -314,6 +371,212 @@ unsafe fn up_mix_value<const M: usize>(
         }
         // SAFETY: c·hidden + h < M·hidden <= mixed.len(); this warp owns h.
         unsafe { *mixed.get_unchecked_mut(c * hidden + h) = out };
+    }
+}
+
+/// Inject block `ib` (row `ib / 4`, stream `ib % 4`) of the down kernels:
+/// warp `w` its chunk `w` of `hidden/8` values through the F32 core, the
+/// block's eight in order into `ipart[(c·4 + o)·4 + s]` (module doc).
+///
+/// # Safety
+/// The calling kernel's launch contract holds with `inject` 1 (`inj` 16 rows
+/// of `4·hidden`, `xn` `m` columns, `ipart` `m·16` slots), `hidden` a
+/// positive multiple of 256, `ib < DOWN_INJ_BLOCKS`, every thread of the
+/// block calls it, and `ip` is [`DOWN_WARPS`]` · `[`MAX_COLS`] f32 of the
+/// block's shared memory nothing else uses.
+#[inline(always)]
+unsafe fn down_inject(
+    inj: &[f32],
+    xn: &[f32],
+    (hid, m, ib): (usize, u32, usize),
+    fault: FaultSink,
+    ipart: &mut DisjointSlice<f32>,
+    ip: *mut f32,
+) {
+    let tid = thread::threadIdx_x() as usize;
+    let wp = tid / 32;
+    let lane = warp::lane_id() as usize;
+    let (o, s) = (ib / STREAMS, ib % STREAMS);
+    let chunk = hid / DOWN_WARPS;
+    let at = s * hid + wp * chunk;
+    // The inject weight as rows of `chunk`: row o's chunk at `at`.
+    let wrow = (o * STREAMS * hid + at) / chunk;
+    let cols = m as usize;
+    let mut c = 0usize;
+    while c < cols {
+        let x0 = c * STREAMS * hid + at;
+        // SAFETY: x0 + chunk <= m·4·hidden <= xn.len(); wrow·chunk +
+        // chunk <= 16·hidden <= inj.len() with inject 1; chunk a positive
+        // multiple of 32 (hidden % 256 == 0).
+        let v = unsafe {
+            let xs = xn.get_unchecked(x0..x0 + chunk);
+            warp::reduce_sum_f32(f32_lane_partial_1col(inj, xs, chunk as u32, wrow, lane))
+        };
+        if lane == 0 {
+            // SAFETY: wp < DOWN_WARPS and c < MAX_COLS.
+            unsafe { *ip.add(wp * MAX_COLS + c) = v };
+        }
+        c += 1;
+    }
+    thread::sync_threads();
+    if tid < cols {
+        // SAFETY: slots tid, tid + 8, … written before the barrier.
+        let mut v = unsafe { *ip.add(tid) };
+        for w in 1..DOWN_WARPS {
+            thread::__unroll_config::<0>();
+            // SAFETY: w < DOWN_WARPS and tid < MAX_COLS.
+            v += unsafe { *ip.add(w * MAX_COLS + tid) };
+        }
+        if !v.is_finite() {
+            fault.raise(SITE);
+        }
+        // SAFETY: (tid·4 + o)·4 + s < m·16 <= ipart.len(); this block
+        // owns (o, s) and this thread column tid.
+        unsafe { *ipart.get_unchecked_mut((tid * STREAMS + o) * STREAMS + s) = v };
+    }
+}
+
+/// The up kernels' first stage: every block adds each down row's four
+/// partials in stream order into `silu(·/4)` in shared memory `lo_s` (block 0
+/// also into `lo`, and with `inject` 1 the weights `2·σ(·/4)` of the inject
+/// partials into `wgt`), then the barrier.
+///
+/// # Safety
+/// The calling kernel's launch contract holds (`dpart` `m·1280`, `ipart`
+/// `m·16`, `lo` `m·320`, `wgt` `m·4`, `m <= 8`), every thread of its
+/// [`UP_THREADS`] block calls it, and `lo_s` is `MAX_COLS·RANK` f32 of the
+/// block's shared memory.
+#[inline(always)]
+unsafe fn up_stage(
+    dpart: &[f32],
+    ipart: &[f32],
+    (m, inject): (u32, u32),
+    fault: FaultSink,
+    (lo, wgt): (&mut DisjointSlice<f32>, &mut DisjointSlice<f32>),
+    lo_s: *mut f32,
+) {
+    let b = thread::blockIdx_x() as usize;
+    let tid = thread::threadIdx_x() as usize;
+    let cols = m as usize;
+    let mut e = tid;
+    while e < cols * RANK {
+        // SAFETY: e·4 + 3 < m·1280 <= dpart.len().
+        let v = unsafe {
+            let p = dpart.as_ptr().add(e * STREAMS);
+            ((*p + *p.add(1)) + *p.add(2)) + *p.add(3)
+        };
+        let l = silu(v * INV);
+        // SAFETY: e < m·RANK <= MAX_COLS·RANK, this thread's slot.
+        unsafe { *lo_s.add(e) = l };
+        if b == 0 {
+            if !l.is_finite() {
+                fault.raise(SITE);
+            }
+            // SAFETY: e < m·320 <= lo.len(); block 0 alone writes lo.
+            unsafe { *lo.get_unchecked_mut(e) = l };
+        }
+        e += UP_THREADS as usize;
+    }
+    if b == 0 && inject == 1 && tid < cols * STREAMS {
+        // SAFETY: tid·4 + 3 < m·16 <= ipart.len().
+        let v = unsafe {
+            let p = ipart.as_ptr().add(tid * STREAMS);
+            ((*p + *p.add(1)) + *p.add(2)) + *p.add(3)
+        };
+        let w = 2.0 * sigmoid(v * INV);
+        if !w.is_finite() {
+            fault.raise(SITE);
+        }
+        // SAFETY: tid < m·4 <= wgt.len(); block 0 alone writes wgt.
+        unsafe { *wgt.get_unchecked_mut(tid) = w };
+    }
+    thread::sync_threads();
+}
+
+/// [`down_row`] for a BF16 down in its words: the F32 core's lane walk over
+/// the widened values of the view row (module doc).
+///
+/// # Safety
+/// `w` holds the down's `RANK` rows of `STREAMS·hidden` values two a word,
+/// otherwise [`down_row`]'s contract.
+#[inline(always)]
+unsafe fn down_row_bf16<const M: usize>(
+    w: &[u32],
+    xn: &[f32],
+    (hidden, row, s, lane): (usize, usize, usize, usize),
+    fault: FaultSink,
+    part: &mut DisjointSlice<f32>,
+) {
+    // SAFETY: view row row·STREAMS + s of hidden values is the down row's
+    // stream-s span, inside the words; column c of xn at s·hidden +
+    // c·STREAMS·hidden spans hidden values inside xn.
+    let f = unsafe {
+        f32_lane_partials_view::<_, M>(
+            Bf16Words(w),
+            xn,
+            (hidden, row * STREAMS + s),
+            (s * hidden, STREAMS * hidden),
+            lane,
+        )
+    };
+    // SAFETY: down_row_end's contract is this fn's: the warp's (row, s)
+    // and its M·RANK·STREAMS slots.
+    unsafe { down_row_end::<M>(f, (row, s, lane), fault, part) };
+}
+
+/// [`up_mix_value`] for a BF16 up in its words: each of the four up rows
+/// against each column of the bottleneck by the F32 core's lane walk over
+/// the widened values (lane `L` values `32t + L`, `t` up to `RANK/32`), then
+/// the butterfly and [`mix_out`].
+///
+/// # Safety
+/// `w` holds the up's `STREAMS·hidden` rows of `RANK` values two a word,
+/// otherwise [`up_mix_value`]'s contract.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn up_mix_value_bf16<const M: usize>(
+    w: &[u32],
+    lo_s: *const f32,
+    xn: &[f32],
+    (hidden, h, lane): (usize, usize, usize),
+    fault: FaultSink,
+    mixed: &mut DisjointSlice<f32>,
+) {
+    let mut v = [[0.0f32; UP_LANE_VALUES]; STREAMS];
+    for s in 0..STREAMS {
+        thread::__unroll_config::<0>();
+        let row = s * hidden + h;
+        for t in 0..UP_LANE_VALUES {
+            thread::__unroll_config::<0>();
+            // SAFETY: row < STREAMS·hidden and 32t + lane < RANK: inside the
+            // words.
+            v[s][t] = unsafe { Bf16Words(w).at(row * RANK + 32 * t + lane) };
+        }
+    }
+    let mut g = [[0.0f32; MAX_COLS]; STREAMS];
+    for c in 0..M {
+        thread::__unroll_config::<0>();
+        let mut f = [0.0f32; STREAMS];
+        for t in 0..UP_LANE_VALUES {
+            thread::__unroll_config::<0>();
+            // SAFETY: c < M and 32t + lane < RANK: inside lo_s.
+            let x = unsafe { *lo_s.add(c * RANK + 32 * t + lane) };
+            for s in 0..STREAMS {
+                thread::__unroll_config::<0>();
+                f[s] = f32::mul_add(v[s][t], x, f[s]);
+            }
+        }
+        for s in 0..STREAMS {
+            thread::__unroll_config::<0>();
+            g[s][c] = warp::reduce_sum_f32(f[s]);
+        }
+    }
+    if lane == 0 {
+        // SAFETY: this fn's contract is mix_out's.
+        unsafe { mix_out::<M>(&g, xn, hidden, h, fault, mixed) };
     }
 }
 
@@ -565,51 +828,83 @@ mod hc_kernels {
             }
             return;
         }
-        let ib = b - DOWN_Q8_BLOCKS;
-        if inject == 0 || ib >= DOWN_INJ_BLOCKS {
-            return; // block-uniform
+        if inject == 1 && b - DOWN_Q8_BLOCKS < DOWN_INJ_BLOCKS {
+            // SAFETY: this block's own shared allocation, reached without a
+            // reference, which `down_inject` alone uses; the launch contract
+            // above holds and the block is an inject block (block-uniform).
+            unsafe {
+                let ip = SharedArray::as_raw_mut_ptr(&raw mut IP);
+                down_inject(inj, xn, (hid, m, b - DOWN_Q8_BLOCKS), fault, &mut ipart, ip);
+            }
         }
-        let (o, s) = (ib / STREAMS, ib % STREAMS);
-        let chunk = hid / DOWN_WARPS;
-        let at = s * hid + wp * chunk;
-        // The inject weight as rows of `chunk`: row o's chunk at `at`.
-        let wrow = (o * STREAMS * hid + at) / chunk;
-        // SAFETY: this block's own shared allocation, reached without a
-        // reference; every slot is written before the barrier that precedes
-        // its reads.
-        let ip = unsafe { SharedArray::as_raw_mut_ptr(&raw mut IP) };
-        let cols = m as usize;
-        let mut c = 0usize;
-        while c < cols {
-            let x0 = c * STREAMS * hid + at;
-            // SAFETY: x0 + chunk <= m·4·hidden <= xn.len(); wrow·chunk +
-            // chunk <= 16·hidden <= inj.len() with inject 1; chunk a positive
-            // multiple of 32 (hidden % 256 == 0).
-            let v = unsafe {
-                let xs = xn.get_unchecked(x0..x0 + chunk);
-                warp::reduce_sum_f32(f32_lane_partial_1col(inj, xs, chunk as u32, wrow, lane))
-            };
-            if lane == 0 {
-                // SAFETY: wp < DOWN_WARPS and c < MAX_COLS.
-                unsafe { *ip.add(wp * MAX_COLS + c) = v };
+    }
+
+    /// `hc_gated_down_4x320` over a BF16 down in its words: the same blocks,
+    /// each warp's row through the F32 core's lane walk over the widened
+    /// values (`down_row_bf16`), the inject blocks unchanged.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            m <= 8,
+            inject <= 1,
+            2 * w.len() >= 1280 * hidden,
+            inj.len() >= inject * 16 * hidden,
+            xn.len() >= m * 4 * hidden,
+            dpart.len() >= m * 1280,
+            ipart.len() >= m * 16
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn hc_gated_down_bf16_4x320(
+        w: &[u32],
+        inj: &[f32],
+        xn: &[f32],
+        hidden: u32,
+        m: u32,
+        inject: u32,
+        fault: FaultSink,
+        mut dpart: DisjointSlice<f32>,
+        mut ipart: DisjointSlice<f32>,
+    ) {
+        static mut IP: SharedArray<f32, { DOWN_WARPS * MAX_COLS }> = SharedArray::UNINIT;
+        let b = thread::blockIdx_x() as usize;
+        let wp = thread::threadIdx_x() as usize / 32;
+        let lane = warp::lane_id() as usize;
+        let hid = hidden as usize;
+        if b < DOWN_Q8_BLOCKS {
+            let (s, row) = (b % STREAMS, (b / STREAMS) * DOWN_WARPS + wp);
+            let at = (hid, row, s, lane);
+            // SAFETY: row < RANK (160 blocks of 8 rows over 4 streams), the
+            // words cover RANK rows of 4·hidden values and xn m columns by
+            // the launch contract; hidden is a positive multiple of 256
+            // (host-validated).
+            unsafe {
+                match m {
+                    1 => down_row_bf16::<1>(w, xn, at, fault, &mut dpart),
+                    2 => down_row_bf16::<2>(w, xn, at, fault, &mut dpart),
+                    3 => down_row_bf16::<3>(w, xn, at, fault, &mut dpart),
+                    4 => down_row_bf16::<4>(w, xn, at, fault, &mut dpart),
+                    5 => down_row_bf16::<5>(w, xn, at, fault, &mut dpart),
+                    6 => down_row_bf16::<6>(w, xn, at, fault, &mut dpart),
+                    7 => down_row_bf16::<7>(w, xn, at, fault, &mut dpart),
+                    8 => down_row_bf16::<8>(w, xn, at, fault, &mut dpart),
+                    _ => {}
+                }
             }
-            c += 1;
+            return;
         }
-        thread::sync_threads();
-        if tid < cols {
-            // SAFETY: slots tid, tid + 8, … written before the barrier.
-            let mut v = unsafe { *ip.add(tid) };
-            for w in 1..DOWN_WARPS {
-                thread::__unroll_config::<0>();
-                // SAFETY: w < DOWN_WARPS and tid < MAX_COLS.
-                v += unsafe { *ip.add(w * MAX_COLS + tid) };
+        if inject == 1 && b - DOWN_Q8_BLOCKS < DOWN_INJ_BLOCKS {
+            // SAFETY: as in `hc_gated_down_4x320`.
+            unsafe {
+                let ip = SharedArray::as_raw_mut_ptr(&raw mut IP);
+                down_inject(inj, xn, (hid, m, b - DOWN_Q8_BLOCKS), fault, &mut ipart, ip);
             }
-            if !v.is_finite() {
-                fault.raise(SITE);
-            }
-            // SAFETY: (tid·4 + o)·4 + s < m·16 <= ipart.len(); this block
-            // owns (o, s) and this thread column tid.
-            unsafe { *ipart.get_unchecked_mut((tid * STREAMS + o) * STREAMS + s) = v };
         }
     }
 
@@ -659,43 +954,12 @@ mod hc_kernels {
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
         let hid = hidden as usize;
-        let cols = m as usize;
         // SAFETY: this block's own shared allocation, reached without a
-        // reference; written below, read after the barrier.
+        // reference; `up_stage` writes it, read after its barrier.
         let lo_s = unsafe { SharedArray::as_raw_mut_ptr(&raw mut LO) };
-        let mut e = tid;
-        while e < cols * RANK {
-            // SAFETY: e·4 + 3 < m·1280 <= dpart.len().
-            let v = unsafe {
-                let p = dpart.as_ptr().add(e * STREAMS);
-                ((*p + *p.add(1)) + *p.add(2)) + *p.add(3)
-            };
-            let l = silu(v * INV);
-            // SAFETY: e < m·RANK <= MAX_COLS·RANK, this thread's slot.
-            unsafe { *lo_s.add(e) = l };
-            if b == 0 {
-                if !l.is_finite() {
-                    fault.raise(SITE);
-                }
-                // SAFETY: e < m·320 <= lo.len(); block 0 alone writes lo.
-                unsafe { *lo.get_unchecked_mut(e) = l };
-            }
-            e += UP_THREADS as usize;
-        }
-        if b == 0 && inject == 1 && tid < cols * STREAMS {
-            // SAFETY: tid·4 + 3 < m·16 <= ipart.len().
-            let v = unsafe {
-                let p = ipart.as_ptr().add(tid * STREAMS);
-                ((*p + *p.add(1)) + *p.add(2)) + *p.add(3)
-            };
-            let w = 2.0 * sigmoid(v * INV);
-            if !w.is_finite() {
-                fault.raise(SITE);
-            }
-            // SAFETY: tid < m·4 <= wgt.len(); block 0 alone writes wgt.
-            unsafe { *wgt.get_unchecked_mut(tid) = w };
-        }
-        thread::sync_threads();
+        // SAFETY: the launch contract above holds; every thread of the
+        // block calls it.
+        unsafe { up_stage(dpart, ipart, (m, inject), fault, (&mut lo, &mut wgt), lo_s) };
         let h = b * UP_WARPS + tid / 32;
         if h >= hid {
             return; // warp-uniform; no barrier follows
@@ -713,6 +977,75 @@ mod hc_kernels {
                 6 => up_mix_value::<6>(qs, d, lo_s, xn, hid, h, lane, fault, &mut mixed),
                 7 => up_mix_value::<7>(qs, d, lo_s, xn, hid, h, lane, fault, &mut mixed),
                 8 => up_mix_value::<8>(qs, d, lo_s, xn, hid, h, lane, fault, &mut mixed),
+                _ => {}
+            }
+        }
+    }
+
+    /// `hc_gated_up_mix_4x320` over a BF16 up in its words: the same stage,
+    /// then each warp's four up rows through `up_mix_value_bf16`.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            m <= 8,
+            inject <= 1,
+            2 * w.len() >= 1280 * hidden,
+            dpart.len() >= m * 1280,
+            ipart.len() >= m * 16,
+            xn.len() >= m * 4 * hidden,
+            lo.len() >= m * 320,
+            wgt.len() >= m * 4,
+            mixed.len() >= m * hidden
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn hc_gated_up_mix_bf16_4x320(
+        w: &[u32],
+        dpart: &[f32],
+        ipart: &[f32],
+        xn: &[f32],
+        hidden: u32,
+        m: u32,
+        inject: u32,
+        fault: FaultSink,
+        mut lo: DisjointSlice<f32>,
+        mut wgt: DisjointSlice<f32>,
+        mut mixed: DisjointSlice<f32>,
+    ) {
+        static mut LO: SharedArray<f32, { MAX_COLS * RANK }> = SharedArray::UNINIT;
+        let b = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let hid = hidden as usize;
+        // SAFETY: as in `hc_gated_up_mix_4x320`.
+        let lo_s = unsafe { SharedArray::as_raw_mut_ptr(&raw mut LO) };
+        // SAFETY: the launch contract above holds; every thread of the
+        // block calls it.
+        unsafe { up_stage(dpart, ipart, (m, inject), fault, (&mut lo, &mut wgt), lo_s) };
+        let h = b * UP_WARPS + tid / 32;
+        if h >= hid {
+            return; // warp-uniform; no barrier follows
+        }
+        let at = (hid, h, lane);
+        // SAFETY: the words hold 4·hidden rows of RANK values by the launch
+        // contract, lo_s m·RANK values written before the barrier, xn m
+        // columns and mixed m·hidden slots; h < hidden.
+        unsafe {
+            match m {
+                1 => up_mix_value_bf16::<1>(w, lo_s, xn, at, fault, &mut mixed),
+                2 => up_mix_value_bf16::<2>(w, lo_s, xn, at, fault, &mut mixed),
+                3 => up_mix_value_bf16::<3>(w, lo_s, xn, at, fault, &mut mixed),
+                4 => up_mix_value_bf16::<4>(w, lo_s, xn, at, fault, &mut mixed),
+                5 => up_mix_value_bf16::<5>(w, lo_s, xn, at, fault, &mut mixed),
+                6 => up_mix_value_bf16::<6>(w, lo_s, xn, at, fault, &mut mixed),
+                7 => up_mix_value_bf16::<7>(w, lo_s, xn, at, fault, &mut mixed),
+                8 => up_mix_value_bf16::<8>(w, lo_s, xn, at, fault, &mut mixed),
                 _ => {}
             }
         }
@@ -775,16 +1108,56 @@ pub enum Before<'a> {
 
 /// One site's weights on the card: `γ` `[streams][hidden]` F32 with the
 /// `+1` folded in, the down (`RANK` rows of `streams·hidden`) and up
-/// (`streams·hidden` rows of `RANK`) in the q8f32 Q8_0 planes
-/// (`crate::weights::q8_0_planes`), and the F32 inject (`streams` rows of
+/// (`streams·hidden` rows of `RANK`), each in the q8f32 Q8_0 planes or BF16
+/// words ([`HcMatrix`]), and the F32 inject (`streams` rows of
 /// `streams·hidden`), `None` for the head.
 pub struct SiteWeights<'a> {
     pub gamma: &'a DeviceBuffer<f32>,
-    pub down_qs: &'a DeviceTensor<u32>,
-    pub down_d: &'a DeviceTensor<u16>,
-    pub up_qs: &'a DeviceTensor<u32>,
-    pub up_d: &'a DeviceTensor<u16>,
+    pub down: HcMatrix<'a>,
+    pub up: HcMatrix<'a>,
     pub inject: Option<&'a DeviceTensor<f32>>,
+}
+
+/// A site's down or up as its kernels read it: the q8f32 Q8_0 planes
+/// (`crate::weights::q8_0_planes`), or a BF16 weight's words, each value
+/// widened as it is read (the F32 core's lane walk, module doc).
+#[derive(Clone, Copy)]
+pub enum HcMatrix<'a> {
+    Q8_0 {
+        qs: &'a DeviceTensor<u32>,
+        d: &'a DeviceTensor<u16>,
+    },
+    Bf16(&'a DeviceTensor<u32>),
+}
+
+impl<'a> HcMatrix<'a> {
+    /// The resident weight `name` of `w` as a site matrix; another form is
+    /// refused by name as `what`'s.
+    pub fn of(w: &'a Weights, what: &'static str, name: &str) -> Result<Self, GpuError> {
+        match w.get(name) {
+            Some(DevWeight::Q8_0 { qs, d, .. }) => Ok(HcMatrix::Q8_0 { qs, d }),
+            Some(DevWeight::Bf16 { w, .. }) => Ok(HcMatrix::Bf16(w)),
+            Some(_) => Err(GpuError::tensor(what, name, "Q8_0 planes or BF16 words")),
+            None => Err(GpuError::tensor(what, name, "resident")),
+        }
+    }
+
+    /// Its rows and row width, or what is wrong with its planes.
+    fn shape(&self) -> Result<(usize, usize), String> {
+        match *self {
+            HcMatrix::Q8_0 { qs, d } if qs.rows() == d.rows() && qs.cols() == 8 * d.cols() => {
+                Ok((d.rows(), 32 * d.cols()))
+            }
+            HcMatrix::Q8_0 { qs, d } => Err(format!(
+                "Q8_0 planes qs {}x{} and d {}x{}: equal rows, 8 words a scale",
+                qs.rows(),
+                qs.cols(),
+                d.rows(),
+                d.cols()
+            )),
+            HcMatrix::Bf16(w) => Ok((w.rows(), 2 * w.cols())),
+        }
+    }
 }
 
 /// The intermediates of a mix, allocated once for `MAX_COLS` columns and
@@ -841,8 +1214,8 @@ pub struct MixArgs<'a> {
 }
 
 /// The file's ggml types for one site's tensors, as the reader classifies
-/// them: `γ` and the inject F32, the down and the up Q8_0. Any other type is
-/// refused by name — the kernels read no other.
+/// them: `γ` and the inject F32, the down and the up Q8_0 or BF16. Any other
+/// type is refused by name — the kernels read no other.
 ///
 /// # Errors
 /// [`GpuError::Shape`] naming the tensor and its type.
@@ -852,19 +1225,21 @@ pub fn check_types(
     up: GgmlType,
     inject: Option<GgmlType>,
 ) -> Result<(), GpuError> {
+    const F32: &[GgmlType] = &[GgmlType::F32];
+    const MATRIX: &[GgmlType] = &[GgmlType::Q8_0, GgmlType::BF16];
     let want = [
-        ("hc norm (γ)", gamma, GgmlType::F32),
-        ("hc down", down, GgmlType::Q8_0),
-        ("hc up", up, GgmlType::Q8_0),
+        ("hc norm (γ)", gamma, F32),
+        ("hc down", down, MATRIX),
+        ("hc up", up, MATRIX),
     ];
-    for (name, got, ty) in want
+    for (name, got, types) in want
         .into_iter()
-        .chain(inject.map(|t| ("hc inject", t, GgmlType::F32)))
+        .chain(inject.map(|t| ("hc inject", t, F32)))
     {
-        if got != ty {
+        if !types.contains(&got) {
             return Err(GpuError::shape(
                 "hc_gated::check_types",
-                format!("{name} is {got:?}; the gated-residual kernels read {ty:?} only"),
+                format!("{name} is {got:?}; the gated-residual kernels read {types:?} only"),
             ));
         }
     }
@@ -880,7 +1255,7 @@ fn refused(what: &'static str, e: HcRefused) -> GpuError {
 /// the streams, the sub-layer's input `y` (when `before` reads one) and the
 /// mixed output hold the `z` of their columns, and the site's weights are
 /// `geo`'s — `γ` its `streams·hidden` values, the down `RANK` rows and the
-/// up `streams·hidden` rows of Q8_0 planes at the other's width, the inject
+/// up `streams·hidden` rows, each at the other's width, the inject
 /// (when there is one) `streams` rows of `streams·hidden`.
 fn check_mix(
     what: &'static str,
@@ -909,25 +1284,19 @@ fn check_mix(
             format!("{name}.len() {got} < {need}"),
         ));
     }
-    let planes = [
-        ("down", w.down_qs, w.down_d, r, wide),
-        ("up", w.up_qs, w.up_d, wide, r),
-    ];
-    for (name, qs, d, rows, k) in planes {
-        if qs.rows() != rows || qs.cols() != k / 4 || d.rows() != rows || d.cols() != k / 32 {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{name} planes are qs {}x{} and d {}x{}, want {rows}x{} and {rows}x{} \
-                     ({rows} rows of {k} Q8_0 values)",
-                    qs.rows(),
-                    qs.cols(),
-                    d.rows(),
-                    d.cols(),
-                    k / 4,
-                    k / 32
-                ),
-            ));
+    for (name, matrix, rows, k) in [("down", w.down, r, wide), ("up", w.up, wide, r)] {
+        match matrix.shape() {
+            Ok(got) if got == (rows, k) => {}
+            Ok((got_rows, got_k)) => {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "{name} planes are {got_rows} rows of {got_k} values, want {rows} rows \
+                         of {k}"
+                    ),
+                ));
+            }
+            Err(e) => return Err(GpuError::shape(what, format!("{name} planes: {e}"))),
         }
     }
     if let Some(inj) = w.inject
@@ -1003,54 +1372,90 @@ impl HcGatedKernels {
             &mut s.xn,
         )?;
         let grid = DOWN_Q8_BLOCKS + if inject == 1 { DOWN_INJ_BLOCKS } else { 0 };
-        let prep = self
-            .module
-            .prepare_hc_gated_down_4x320(LaunchConfig1D::new(
-                launch_u32(what, "down grid", grid)?,
-                DOWN_THREADS,
-                0,
-            ))?;
+        let cfg = LaunchConfig1D::new(launch_u32(what, "down grid", grid)?, DOWN_THREADS, 0);
         let inj_buf = match a.w.inject {
             Some(t) => t.buf(),
             None => &s.wgt,
         };
-        self.module.hc_gated_down_4x320(
-            stream,
-            &prep,
-            a.w.down_qs.buf(),
-            a.w.down_d.buf(),
-            inj_buf,
-            &s.xn,
-            hidden,
-            mu,
-            inject,
-            a.fault,
-            &mut s.dpart,
-            &mut s.ipart,
-        )?;
-        let prep = self
-            .module
-            .prepare_hc_gated_up_mix_4x320(LaunchConfig1D::new(
-                launch_u32(what, "up grid", geo.d() / UP_WARPS)?,
-                UP_THREADS,
-                0,
-            ))?;
-        self.module.hc_gated_up_mix_4x320(
-            stream,
-            &prep,
-            a.w.up_qs.buf(),
-            a.w.up_d.buf(),
-            &s.dpart,
-            &s.ipart,
-            &s.xn,
-            hidden,
-            mu,
-            inject,
-            a.fault,
-            &mut s.lo,
-            &mut s.wgt,
-            a.mixed,
-        )?;
+        match a.w.down {
+            HcMatrix::Q8_0 { qs, d } => {
+                let prep = self.module.prepare_hc_gated_down_4x320(cfg)?;
+                self.module.hc_gated_down_4x320(
+                    stream,
+                    &prep,
+                    qs.buf(),
+                    d.buf(),
+                    inj_buf,
+                    &s.xn,
+                    hidden,
+                    mu,
+                    inject,
+                    a.fault,
+                    &mut s.dpart,
+                    &mut s.ipart,
+                )?;
+            }
+            HcMatrix::Bf16(w) => {
+                let prep = self.module.prepare_hc_gated_down_bf16_4x320(cfg)?;
+                self.module.hc_gated_down_bf16_4x320(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    inj_buf,
+                    &s.xn,
+                    hidden,
+                    mu,
+                    inject,
+                    a.fault,
+                    &mut s.dpart,
+                    &mut s.ipart,
+                )?;
+            }
+        }
+        let cfg = LaunchConfig1D::new(
+            launch_u32(what, "up grid", geo.d() / UP_WARPS)?,
+            UP_THREADS,
+            0,
+        );
+        match a.w.up {
+            HcMatrix::Q8_0 { qs, d } => {
+                let prep = self.module.prepare_hc_gated_up_mix_4x320(cfg)?;
+                self.module.hc_gated_up_mix_4x320(
+                    stream,
+                    &prep,
+                    qs.buf(),
+                    d.buf(),
+                    &s.dpart,
+                    &s.ipart,
+                    &s.xn,
+                    hidden,
+                    mu,
+                    inject,
+                    a.fault,
+                    &mut s.lo,
+                    &mut s.wgt,
+                    a.mixed,
+                )?;
+            }
+            HcMatrix::Bf16(w) => {
+                let prep = self.module.prepare_hc_gated_up_mix_bf16_4x320(cfg)?;
+                self.module.hc_gated_up_mix_bf16_4x320(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    &s.dpart,
+                    &s.ipart,
+                    &s.xn,
+                    hidden,
+                    mu,
+                    inject,
+                    a.fault,
+                    &mut s.lo,
+                    &mut s.wgt,
+                    a.mixed,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1394,6 +1799,8 @@ pub struct WideMixArgs<'a> {
     pub fault: FaultSink,
     pub scratch: &'a mut HcWideScratch,
     pub gemm: &'a Gemm32Kernels,
+    /// The BF16 tile, for a site whose down or up is BF16.
+    pub q8f32: &'a Q8F32Kernels,
     pub dense: &'a GemmRoute,
     pub mixed: &'a mut DeviceBuffer<f32>,
 }
@@ -1476,22 +1883,26 @@ impl HcWideKernels {
             a.res,
             &mut s.xn,
         )?;
-        a.gemm
-            .enqueue_quantize_gemm32(stream, &s.xn, m, &mut s.xq, a.fault)?;
-        a.gemm.enqueue_gemm32(
-            stream,
-            Gemm32Args {
-                w: Gemm32Weight::Q8_0Plane {
-                    qs: a.w.down_qs,
-                    d: a.w.down_d,
-                },
-                rows_per_expert: r,
-                act: &s.xq,
-                route: a.dense,
-                input: GemmInput::PerSlot,
-                y: &mut s.down,
-            },
-        )?;
+        match a.w.down {
+            HcMatrix::Q8_0 { qs, d } => {
+                a.gemm
+                    .enqueue_quantize_gemm32(stream, &s.xn, m, &mut s.xq, a.fault)?;
+                a.gemm.enqueue_gemm32(
+                    stream,
+                    Gemm32Args {
+                        w: Gemm32Weight::Q8_0Plane { qs, d },
+                        rows_per_expert: r,
+                        act: &s.xq,
+                        route: a.dense,
+                        input: GemmInput::PerSlot,
+                        y: &mut s.down,
+                    },
+                )?;
+            }
+            HcMatrix::Bf16(w) => a
+                .q8f32
+                .enqueue_bf16_tile(stream, w, &s.xn, m, &mut s.down)?,
+        }
         if let Some(inj) = a.w.inject {
             a.gemm.enqueue_f32_tile(stream, inj, &s.xn, m, &mut s.inj)?;
         }
@@ -1506,22 +1917,24 @@ impl HcWideKernels {
         self.module.hc_gated_lo_4x320(
             stream, &prep, &s.down, &s.inj, mu, inject, a.fault, &mut s.lo, &mut s.wgt,
         )?;
-        a.gemm
-            .enqueue_quantize_gemm32(stream, &s.lo, m, &mut s.loq, a.fault)?;
-        a.gemm.enqueue_gemm32(
-            stream,
-            Gemm32Args {
-                w: Gemm32Weight::Q8_0Plane {
-                    qs: a.w.up_qs,
-                    d: a.w.up_d,
-                },
-                rows_per_expert: wide,
-                act: &s.loq,
-                route: a.dense,
-                input: GemmInput::PerSlot,
-                y: &mut s.g,
-            },
-        )?;
+        match a.w.up {
+            HcMatrix::Q8_0 { qs, d } => {
+                a.gemm
+                    .enqueue_quantize_gemm32(stream, &s.lo, m, &mut s.loq, a.fault)?;
+                a.gemm.enqueue_gemm32(
+                    stream,
+                    Gemm32Args {
+                        w: Gemm32Weight::Q8_0Plane { qs, d },
+                        rows_per_expert: wide,
+                        act: &s.loq,
+                        route: a.dense,
+                        input: GemmInput::PerSlot,
+                        y: &mut s.g,
+                    },
+                )?;
+            }
+            HcMatrix::Bf16(w) => a.q8f32.enqueue_bf16_tile(stream, w, &s.lo, m, &mut s.g)?,
+        }
         let prep = self.module.prepare_hc_gated_mix_4(LaunchConfig1D::new(
             launch_u32(what, "mix grid", z.mixed.div_ceil(GLUE_THREADS as usize))?,
             GLUE_THREADS,

@@ -209,6 +209,7 @@ mod tests {
             layers: 1,
             experts: 8,
             experts_used: 2,
+            bf16_words: |_| false,
         };
         let machine = Machine {
             cards: Vec::new(),
@@ -259,6 +260,7 @@ mod tests {
             layers: 1,
             experts: 8,
             experts_used: 2,
+            bf16_words: |_| false,
         };
         // The machine's figure is 1000 B and the plan's host terms 300 B:
         // 700 B of headroom with no room named.

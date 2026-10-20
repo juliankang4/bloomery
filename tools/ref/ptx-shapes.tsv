@@ -26,6 +26,9 @@ generate_ds41   argmax_p_rows_fault                      0           0
 generate_ds41   argmax_rows_fault                        0           0
 generate_ds41   argmax_rows_finite_fault                 0           0
 generate_ds41   attn_out_gate_sigmoid                    0           0
+generate_ds41   bf16_gemv                                0           0
+generate_ds41   bf16_gemv_ids                            0           0
+generate_ds41   bf16_tile_gemm                           0           0
 generate_ds41   cand_block_max                           0           0
 generate_ds41   cand_compact                             0           0
 generate_ds41   cand_remap                               0           0
@@ -108,6 +111,7 @@ generate_ds41   ds41_shexp_gate_up_q3k_mcol              0           0
 generate_ds41   ds41_shexp_gate_up_q8_0_mcol             0           0
 generate_ds41   ds41_tap_means                           0           0
 generate_ds41   embed_rows                               0           0
+generate_ds41   embed_rows_bf16                          0           0
 generate_ds41   embed_rows_q3k                           0           0
 generate_ds41   embed_rows_q4k                           0           0
 generate_ds41   embed_rows_q5_0                          0           0
@@ -193,11 +197,13 @@ generate_ds41   half_encode_check                        0           0
 generate_ds41   hc_gated_combine_4                       0           0
 generate_ds41   hc_gated_combine_4w                      0           0
 generate_ds41   hc_gated_down_4x320                      0           0
+generate_ds41   hc_gated_down_bf16_4x320                 0           0
 generate_ds41   hc_gated_lo_4x320                        0           0
 generate_ds41   hc_gated_mix_4                           0           0
 generate_ds41   hc_gated_norm_4                          0           0
 generate_ds41   hc_gated_norm_4w                         0           0
 generate_ds41   hc_gated_up_mix_4x320                    0           0
+generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
 generate_ds41   head_norm_neox_append                    0           0
 generate_ds41   head_norm_neox_append_256                0           0

@@ -14,7 +14,7 @@ use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::head::Head;
 use crate::host::StepLeg;
 use crate::model::{ChainBody, GpuModel, block_count, refuse_scratch_past};
-use crate::q38::{EmbedQ8Args, Q38Kernels};
+use crate::q38::{EmbedArgs, EmbedRows, Q38Kernels};
 use crate::quant_sel::QuantSelKernels;
 use crate::site::SiteTy;
 use crate::weights::Weights;
@@ -436,9 +436,8 @@ impl Body {
             let first = if in_head { &mut *hin } else { &mut self.r };
             self.q38.enqueue_embed_rows(
                 gpu.stream(),
-                EmbedQ8Args {
-                    qs,
-                    d,
+                EmbedArgs {
+                    table: EmbedRows::Q8_0 { qs, d },
                     ids: &ids,
                     pos0: &pos0,
                     first: 0,

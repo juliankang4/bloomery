@@ -305,6 +305,12 @@ gate-gpu-nvfp4:
 gate-gpu-mxfp8:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_mxfp8 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mxfp8'
 
+# BF16 weights in their words (bloomery_gpu::q8f32's bf16 gemv, row list and tile, the head, q38's embedding lookup) on
+# synthetic tensors loaded through the placed path: every output written, within the derived band, bit for bit the F32
+# rule over the widened values and the F32 site's outputs; the Q8_0 head and embedding bit for bit their rules.
+gate-gpu-bf16:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_bf16 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_bf16'
+
 # nemotron_h (Nemotron 3 Nano 4B Q4_K_M) end-to-end gate, one card: the captured step's entries against the layer kinds the header derives
 # (the scans, the squared ReLUs, the group-5 flash passes, the appends, the Q5_0 embedding row; no group-8 flash entry, no host node), eager =
 # captured replay bit for bit over 16 tokens, reset rewinds the ids and the logits bits, the scan state carries (layer 0 nonzero, the last

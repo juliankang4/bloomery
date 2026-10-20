@@ -440,7 +440,7 @@ mod tests {
     // PIN(2026-10-19): and bloomery's own MXFP8 (`mxfp8_gemv` through
     // `site::gemv`); every other pair is unchanged.
     // PIN(2026-10-20): and bloomery's own FP8_B128 (`fp8_b128_gemv` through
-    // `site::gemv`); every other pair is unchanged.
+    // `site::gemv`); BF16 also uses `bf16_gemv` and `bf16_tile_gemm` over its words.
     #[test]
     fn dense_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -453,6 +453,7 @@ mod tests {
                 (GgmlType::Q4_K, SiteEntry::Q4k),
                 (GgmlType::Q5_K, SiteEntry::Q5k),
                 (GgmlType::Q6_K, SiteEntry::Q6k),
+                (GgmlType::BF16, SiteEntry::Bf16),
                 (GgmlType::NVFP4, SiteEntry::Nvfp4),
                 (GgmlType::MXFP8, SiteEntry::Mxfp8),
                 (GgmlType::FP8_B128, SiteEntry::Fp8B128),
@@ -469,6 +470,8 @@ mod tests {
         }
     }
 
+    // PIN(2026-10-20): the head and embedding pairs gain BF16 (`bf16_gemv`
+    // over the head's words, `embed_rows_bf16`); every other pair is unchanged.
     #[test]
     fn head_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -477,6 +480,7 @@ mod tests {
                 (GgmlType::Q8_0, HeadEntry::Q8_0),
                 (GgmlType::Q4_K, HeadEntry::Q4k),
                 (GgmlType::Q6_K, HeadEntry::Q6k),
+                (GgmlType::BF16, HeadEntry::Bf16),
             ]
         );
     }
@@ -491,6 +495,7 @@ mod tests {
                 (GgmlType::Q4_K, EmbedEntry::Q4k),
                 (GgmlType::Q5_K, EmbedEntry::Q5k),
                 (GgmlType::Q6_K, EmbedEntry::Q6k),
+                (GgmlType::BF16, EmbedEntry::Bf16),
             ]
         );
     }

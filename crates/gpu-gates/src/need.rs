@@ -119,6 +119,7 @@ mod tests {
                 layers: 1,
                 experts: 8,
                 experts_used: 2,
+                bf16_words: |_| false,
             },
             workstation::A6000,
         )

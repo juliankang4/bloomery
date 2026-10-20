@@ -63,7 +63,7 @@
 //! The expert select (`sel`, through `site::resident_sel_f32`, the MTP
 //! draft's routed launch): a stack of 4 experts of 64 rows of 256 values in
 //! FP8_B128, and the same stack's shape in Q8_0 (the shared entry), at six
-//! slots over three columns, two slots a column: every slot's rows bit for
+//! slots over six or three columns, one or two slots a column: every slot's rows bit for
 //! bit the byte-order rule over its expert's host rows, and within the band.
 //! An id past the stack writes its slot NaN and raises `ExpertId`, the other
 //! slot keeping its bits; an MXFP8 stack is refused by name.
@@ -95,11 +95,15 @@
 #[path = "shared/bench.rs"]
 mod bench_arm;
 
+#[path = "shared/dense_file.rs"]
+mod dense_file;
+
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_mxfp8", gate::run())
 }
 
 mod gate {
+    use crate::dense_file::{columns, decl, host_rows, q8_0_bytes};
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::q8f32::{E4m3GemvArgs, E4m3Scales, E4m3Weight, SelArgs, e4m3_planes};
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
@@ -109,7 +113,7 @@ mod gate {
     use bloomery_gpu_gates::{GateError, GateRng, checks_failed, par_map, verdict, write_gguf};
     use cuda_core::DeviceBuffer;
     use gguf::Split;
-    use gguf::quant::{GgmlType, dequant_row};
+    use gguf::quant::GgmlType;
     use runtime::hc_gated::card::{f32_dot as tile_rule, q8_dot as byte_rule};
     use std::path::Path;
 
@@ -204,14 +208,6 @@ mod gate {
         }
     }
 
-    /// One tensor of a synthetic file: name, dims, type, bytes.
-    type Decl = (String, Vec<u64>, GgmlType, Vec<u8>);
-
-    /// A weight of type `ty` of `rows` rows of `k` as a tensor of a file.
-    fn decl(name: &str, ty: GgmlType, (rows, k): (usize, usize), bytes: Vec<u8>) -> Decl {
-        (name.to_string(), vec![k as u64, rows as u64], ty, bytes)
-    }
-
     /// The two E4M3 types and the tag their clause lines carry.
     const TYPES: [(GgmlType, &str); 2] =
         [(GgmlType::MXFP8, "mxfp8"), (GgmlType::FP8_B128, "fp8_b128")];
@@ -262,19 +258,6 @@ mod gate {
     const Q8_0_NAME: &str = "blk.3.indexer.attn_q_b.weight";
     const F32_NAME: &str = "blk.3.f32.weight";
     const F32_ROWS: usize = 256;
-
-    /// `rows` Q8_0 rows of `k` values drawn from `seed`: f16 scales of
-    /// `2^-8` to `2^1`, codes uniform over all 256 bytes.
-    fn q8_0_bytes(rows: usize, k: usize, seed: u64) -> Vec<u8> {
-        let mut rng = GateRng(seed);
-        let mut out = Vec::with_capacity(rows * k / 32 * 34);
-        for _ in 0..rows * k / 32 {
-            let bits = ((7 + rng.below(9)) << 10 | rng.below(1024)) as u16;
-            out.extend(bits.to_le_bytes());
-            out.extend((0..32).map(|_| rng.below(256) as u8));
-        }
-        out
-    }
 
     /// The expert-select stacks' experts, rows an expert, row width and
     /// slots a column, and the slots' ids.
@@ -460,7 +443,7 @@ mod gate {
         bytes: &[u8],
     ) -> Result<bool, GateError> {
         let stream = gpu.stream();
-        let (n_exp, rpe, k, spc) = SEL;
+        let (n_exp, rpe, k, _) = SEL;
         let w = Weights::load_where(stream, split, |n| n == name)?;
         let wf = host_rows(ty, bytes, n_exp * rpe, k);
         let tag = if ty == GgmlType::Q8_0 {
@@ -469,47 +452,49 @@ mod gate {
             "fp8_b128"
         };
         let mut ok = true;
-        for (ids, fault) in [
-            (&SEL_IDS[..], None),
-            (&[1, n_exp as u32][..], Some(FaultSite::ExpertId)),
-        ] {
-            let n_slots = ids.len();
-            let m = n_slots.div_ceil(spc);
-            let (x, x_dev, mut y_dev) = columns(gpu, (m, k, n_slots * rpe), 0x5eed_0852, 1.0)?;
-            let sel = DeviceBuffer::from_host(stream, ids)?;
-            let a = SelArgs {
-                x: &x_dev,
-                sel: &sel,
-                n_slots,
-                rows_per_expert: rpe,
-                slots_per_col: spc,
-            };
-            gpu.clear_fault()?;
-            site::resident_sel_f32(gpu, &w, name, &a, gpu.unlabelled_sink(), &mut y_dev)?;
-            let got = gpu.take_fault()?;
-            let y = y_dev.to_host_vec(stream)?;
-            let want = fault.map(|f| Fault::at(LAYER_NONE, f));
-            let shown = format!("ids={ids:?} rows_per_expert={rpe} k={k} slots_per_col={spc}");
-            let pass = got == want;
-            println!(
-                "{tag} clause=sel.fault {shown} fault={got:?} want={want:?} {}",
-                verdict(pass)
-            );
-            ok &= pass;
-            for (slot, &id) in ids.iter().enumerate() {
-                let y = &y[slot * rpe..][..rpe];
-                let x = &x[slot / spc * k..][..k];
-                let shown = format!("{shown} slot={slot} id={id}");
-                let at = id as usize * rpe;
-                let Some(w) = wf.get(at..at + rpe) else {
-                    let nan = y.iter().all(|v| v.is_nan());
-                    println!("{tag} clause=sel.bad_id {shown} nan={nan} {}", verdict(nan));
-                    ok &= nan;
-                    continue;
+        for spc in [1, SEL.3] {
+            for (ids, fault) in [
+                (&SEL_IDS[..], None),
+                (&[1, n_exp as u32][..], Some(FaultSite::ExpertId)),
+            ] {
+                let n_slots = ids.len();
+                let m = n_slots.div_ceil(spc);
+                let (x, x_dev, mut y_dev) = columns(gpu, (m, k, n_slots * rpe), 0x5eed_0852, 1.0)?;
+                let sel = DeviceBuffer::from_host(stream, ids)?;
+                let a = SelArgs {
+                    x: &x_dev,
+                    sel: &sel,
+                    n_slots,
+                    rows_per_expert: rpe,
+                    slots_per_col: spc,
                 };
-                ok &= check((tag, "sel"), &shown, (y, x, k), w, &|r, _| {
-                    byte_rule(&w[r], x)
-                });
+                gpu.clear_fault()?;
+                site::resident_sel_f32(gpu, &w, name, &a, gpu.unlabelled_sink(), &mut y_dev)?;
+                let got = gpu.take_fault()?;
+                let y = y_dev.to_host_vec(stream)?;
+                let want = fault.map(|f| Fault::at(LAYER_NONE, f));
+                let shown = format!("ids={ids:?} rows_per_expert={rpe} k={k} slots_per_col={spc}");
+                let pass = got == want;
+                println!(
+                    "{tag} clause=sel.fault {shown} fault={got:?} want={want:?} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+                for (slot, &id) in ids.iter().enumerate() {
+                    let y = &y[slot * rpe..][..rpe];
+                    let x = &x[slot / spc * k..][..k];
+                    let shown = format!("{shown} slot={slot} id={id}");
+                    let at = id as usize * rpe;
+                    let Some(w) = wf.get(at..at + rpe) else {
+                        let nan = y.iter().all(|v| v.is_nan());
+                        println!("{tag} clause=sel.bad_id {shown} nan={nan} {}", verdict(nan));
+                        ok &= nan;
+                        continue;
+                    };
+                    ok &= check((tag, "sel"), &shown, (y, x, k), w, &|r, _| {
+                        byte_rule(&w[r], x)
+                    });
+                }
             }
         }
         Ok(ok)
@@ -682,18 +667,6 @@ mod gate {
         Ok(check((tag, "join"), &shown, (&y, &x, k), &wf, &walk))
     }
 
-    /// The host rows of a file tensor's `bytes`: `rows` rows of `k` values
-    /// of type `ty`.
-    fn host_rows(ty: GgmlType, bytes: &[u8], rows: usize, k: usize) -> Vec<Vec<f32>> {
-        let row_bytes = bytes.len() / rows;
-        par_map(rows, |r| {
-            let mut v = vec![0.0f32; k];
-            dequant_row(ty, &bytes[r * row_bytes..][..row_bytes], &mut v)
-                .unwrap_or_else(|e| panic!("row {r}: {e}"));
-            v
-        })
-    }
-
     /// One launch's outputs (token-major, `rows` a column) against the host:
     /// `rule(r, c)` the bits the kernel must give for row `r` of column
     /// `c`, `w` the host rows for the band. Prints the clauses `written`,
@@ -739,24 +712,6 @@ mod gate {
             verdict(bits_n == per.len())
         );
         written && band_ok && bits_n == per.len()
-    }
-
-    /// A launch's activations on the host and on the card, and its output.
-    type Columns = (Vec<f32>, DeviceBuffer<f32>, DeviceBuffer<f32>);
-
-    /// `m` columns of `k` activations uniform on ±2 from `seed`, multiplied
-    /// by `scale`, on the card, and an output of `m * rows` NaN sentinels.
-    fn columns(
-        gpu: &Gpu,
-        (m, k, rows): (usize, usize, usize),
-        seed: u64,
-        scale: f32,
-    ) -> Result<Columns, GateError> {
-        let mut rng = GateRng(seed);
-        let x: Vec<f32> = (0..m * k).map(|_| rng.uni(-2.0, 2.0) * scale).collect();
-        let x_dev = DeviceBuffer::from_host(gpu.stream(), &x)?;
-        let y_dev = DeviceBuffer::from_host(gpu.stream(), &vec![f32::NAN; m * rows])?;
-        Ok((x, x_dev, y_dev))
     }
 
     /// One shape of the E4M3 type `ty` at each of its column counts through `site::gemv`

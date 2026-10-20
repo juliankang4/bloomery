@@ -94,8 +94,8 @@ pub struct Mtp35 {
 }
 
 /// A weight's device addresses as a [`BorrowedPlanes`] holds them: a Q8_0
-/// weight's two planes ([`super::mtp38::planes`]), a K-quant weight's one
-/// plane and a zero.
+/// weight's two planes or a BF16 weight's words and a zero
+/// ([`super::mtp38::planes`]), a K-quant weight's one plane and a zero.
 pub fn addresses(dw: &DevWeight) -> Option<[u64; 2]> {
     match dw {
         DevWeight::KQuant { w, .. } => Some([w.buf().cu_deviceptr(), 0]),

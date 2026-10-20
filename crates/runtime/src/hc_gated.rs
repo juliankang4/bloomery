@@ -461,11 +461,24 @@ pub mod card {
     /// q8f32 gemv of the `[rank·streams × hidden]` view, row `j·streams + s`.
     #[must_use]
     pub fn down_parts(geo: Geometry, down: &[f32], xn: &[f32]) -> Vec<f32> {
+        down_parts_by(geo, q8_dot, down, xn)
+    }
+
+    /// [`down_parts`] with each row's dot by `dot`: [`q8_dot`] for a Q8_0
+    /// down, [`f32_dot`] for a BF16 one (`hc_gated_down_bf16`, the widened
+    /// values).
+    #[must_use]
+    pub fn down_parts_by(
+        geo: Geometry,
+        dot: fn(&[f32], &[f32]) -> f32,
+        down: &[f32],
+        xn: &[f32],
+    ) -> Vec<f32> {
         let (s, d, wide) = (geo.s(), geo.d(), geo.wide());
         (0..geo.r() * s)
             .map(|e| {
                 let (j, st) = (e / s, e % s);
-                q8_dot(
+                dot(
                     &down[j * wide + st * d..j * wide + (st + 1) * d],
                     &xn[st * d..(st + 1) * d],
                 )
@@ -531,6 +544,20 @@ pub mod card {
     /// s = 1, …) · (1/streams)`.
     #[must_use]
     pub fn up_mix(geo: Geometry, up: &[f32], lo: &[f32], xn: &[f32], act: Act) -> Vec<f32> {
+        up_mix_by(geo, q8_dot, (up, lo), xn, act)
+    }
+
+    /// [`up_mix`] with each up row's dot by `dot`: [`q8_dot`] for a Q8_0 up,
+    /// [`f32_dot`] for a BF16 one (`hc_gated_up_mix_bf16`, the widened
+    /// values).
+    #[must_use]
+    pub fn up_mix_by(
+        geo: Geometry,
+        dot: fn(&[f32], &[f32]) -> f32,
+        (up, lo): (&[f32], &[f32]),
+        xn: &[f32],
+        act: Act,
+    ) -> Vec<f32> {
         let (s, r, d) = (geo.s(), geo.r(), geo.d());
         let inv = 1.0 / s as f32;
         (0..d)
@@ -538,7 +565,7 @@ pub mod card {
                 let mut acc = 0.0f32;
                 for st in 0..s {
                     let row = st * d + i;
-                    let sg = (act.sigmoid)(q8_dot(&up[row * r..(row + 1) * r], lo));
+                    let sg = (act.sigmoid)(dot(&up[row * r..(row + 1) * r], lo));
                     acc = if st == 0 {
                         xn[row] * sg
                     } else {

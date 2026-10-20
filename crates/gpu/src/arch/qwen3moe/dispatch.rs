@@ -35,7 +35,7 @@ use crate::head::Head;
 use crate::kquant::{Act, GateUpAct, SelDown};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q4k_sel::QuantSel;
-use crate::q38::{EmbedQ8Args, OutGateArgs};
+use crate::q38::{EmbedArgs, EmbedRows, OutGateArgs};
 use crate::quant_sel::QuantSelKernels;
 use crate::site::{self, Order};
 use crate::tensor::Q8Act;
@@ -504,9 +504,8 @@ pub(super) fn embed_into(
     if let Some(DevWeight::Q8_0 { qs, d, .. }) = w.get(&name) {
         return k.q35(WHAT)?.q38.enqueue_embed_rows(
             gpu.stream(),
-            EmbedQ8Args {
-                qs,
-                d,
+            EmbedArgs {
+                table: EmbedRows::Q8_0 { qs, d },
                 ids: io.ids,
                 pos0: io.pos0,
                 first: io.first,

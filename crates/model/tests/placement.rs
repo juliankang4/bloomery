@@ -1176,6 +1176,7 @@ fn synthetic_model(mut layer: Vec<ModelTensor>) -> ModelTensors {
         layers: 1,
         experts: 8,
         experts_used: 2,
+        bf16_words: |_| false,
     }
 }
 
@@ -1358,6 +1359,7 @@ fn layered_model(layers: usize) -> ModelTensors {
         layers,
         experts: 8,
         experts_used: 2,
+        bf16_words: |_| false,
     }
 }
 

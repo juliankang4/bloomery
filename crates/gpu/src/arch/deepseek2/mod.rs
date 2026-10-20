@@ -675,6 +675,7 @@ fn hybrid_tensors(file: &Split, layers: &Range<usize>) -> Result<ModelTensors, G
         layers: hp.n_layer,
         experts,
         experts_used,
+        bf16_words: |_| false,
     })
 }
 
@@ -685,7 +686,7 @@ fn hybrid_tensors(file: &Split, layers: &Range<usize>) -> Result<ModelTensors, G
 fn hybrid_row(i: usize, t: &ModelTensor, model: &ModelTensors, n_l: u64) -> Result<Row, GpuError> {
     let what = "Body::hybrid_weights";
     if t.role != Role::RoutedExperts {
-        return placement::whole_on_card(i, t, 0).map_err(|e| GpuError::plan(what, e));
+        return placement::whole_on_card(i, t, 0, model).map_err(|e| GpuError::plan(what, e));
     }
     if t.dims.len() != 3 || n_l > model.experts {
         return Err(GpuError::shape(

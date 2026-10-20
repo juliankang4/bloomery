@@ -116,6 +116,7 @@ pub(crate) fn classify_with(
         layers: counts.layers,
         experts: counts.experts,
         experts_used: counts.experts_used,
+        bf16_words: |_| false,
     })
 }
 

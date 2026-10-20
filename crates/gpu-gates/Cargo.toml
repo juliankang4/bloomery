@@ -468,6 +468,10 @@ name = "gate_mxfp8"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_bf16"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_nemotron_e2e"
 required-features = ["gpu"]
 

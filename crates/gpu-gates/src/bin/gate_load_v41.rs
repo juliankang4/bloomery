@@ -666,6 +666,9 @@ mod gate {
             DevWeight::Fp8B128 { .. } => {
                 return Err("an fp8_b128 weight: V4.1 has none".into());
             }
+            DevWeight::Bf16 { .. } => {
+                return Err("a bf16 weight: V4.1 has none".into());
+            }
         })
     }
 

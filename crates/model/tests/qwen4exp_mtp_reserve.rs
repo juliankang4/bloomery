@@ -171,6 +171,7 @@ fn inputs() -> PlanInputs {
             layers: LAYERS,
             experts: EXPERTS,
             experts_used: 10,
+            bf16_words: |_| false,
         },
         spec,
         kv,

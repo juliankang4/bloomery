@@ -134,6 +134,11 @@ pub enum DevWeight {
         e: DeviceTensor<u32>,
         k: usize,
     },
+    /// A BF16 file tensor as the file stores it (`CardFormat::Bf16Raw`):
+    /// rows × k/2 u32 words, value `2j` of a row in the low half of its word
+    /// `j`, the high half value `2j + 1`; the kernels widen a value to f32 as
+    /// they read it (`crate::q8f32::Bf16Words`). `k` is even.
+    Bf16 { w: DeviceTensor<u32>, k: usize },
     /// An NVFP4 routed stack (three dims) in the same two planes over the
     /// experts it holds, and their tensor scales: one f32 a row of `scales`,
     /// in the order the planes hold the experts, from the stack's
@@ -156,6 +161,7 @@ impl DevWeight {
             }
             DevWeight::Q8_0 { d, .. } | DevWeight::Q8_0Derived { d, .. } => d.rows(),
             DevWeight::F32 { w, .. } => w.rows(),
+            DevWeight::Bf16 { w, .. } => w.rows(),
             DevWeight::Nvfp4 { qs, .. }
             | DevWeight::Nvfp4Stack { qs, .. }
             | DevWeight::Mxfp8 { qs, .. }
@@ -173,6 +179,7 @@ impl DevWeight {
             | DevWeight::Q8_0 { k, .. }
             | DevWeight::Q8_0Derived { k, .. }
             | DevWeight::F32 { k, .. }
+            | DevWeight::Bf16 { k, .. }
             | DevWeight::Nvfp4 { k, .. }
             | DevWeight::Nvfp4Stack { k, .. }
             | DevWeight::Mxfp8 { k, .. }
@@ -195,6 +202,7 @@ impl DevWeight {
                 vec![held(qs), held(d)]
             }
             DevWeight::F32 { w, .. } => vec![held(w)],
+            DevWeight::Bf16 { w, .. } => vec![held(w)],
             DevWeight::Nvfp4 { qs, e, scales, .. }
             | DevWeight::Nvfp4Stack { qs, e, scales, .. } => {
                 vec![held(qs), held(e), held(scales)]
@@ -228,6 +236,10 @@ pub struct Weights {
     /// resident `token_embd.weight`.
     tied: bool,
 }
+
+/// A weight's one plane and width in a format [`Weights::join_rows`] joins
+/// by rows, `None` for another format.
+type PlaneOf<T> = for<'a> fn(&'a DevWeight) -> Option<(&'a DeviceTensor<T>, usize)>;
 
 impl Weights {
     /// Upload the tensors of `layers` (and the non-block tensors when
@@ -394,10 +406,10 @@ impl Weights {
     /// so nothing is resident twice and the resident bytes are unchanged.
     /// Refused unless every part is resident as a K-quant of the first
     /// part's type and width, and every part but the last ends on a word
-    /// boundary (its rows' bytes a multiple of 4). F32 parts join the same
-    /// way ([`Weights::join_f32_rows`]) when the first part is F32, and Q8_0,
-    /// MXFP8 or FP8_B128 parts plane by plane ([`Weights::join_byte_rows`])
-    /// when it is one of those.
+    /// boundary (its rows' bytes a multiple of 4). F32 and BF16 parts join
+    /// the same way ([`Weights::join_plane_rows`]) when the first part is one
+    /// of those, and Q8_0, MXFP8 or FP8_B128 parts plane by plane
+    /// ([`Weights::join_byte_rows`]) when it is one of those.
     /// Load-time only: the copies are synchronized before the parts are
     /// freed.
     pub fn join_rows(
@@ -409,7 +421,30 @@ impl Weights {
         const WHAT: &str = "Weights::join_rows";
         derived_slot_free(&self.by_name, &joint)?;
         match parts.first().and_then(|&n| self.by_name.get(n)) {
-            Some(DevWeight::F32 { .. }) => return self.join_f32_rows(stream, parts, joint),
+            Some(DevWeight::F32 { .. }) => {
+                return self.join_plane_rows(
+                    stream,
+                    (parts, joint),
+                    1,
+                    |w| match w {
+                        DevWeight::F32 { w, k } => Some((w, *k)),
+                        _ => None,
+                    },
+                    |w, k| DevWeight::F32 { w, k },
+                );
+            }
+            Some(DevWeight::Bf16 { .. }) => {
+                return self.join_plane_rows(
+                    stream,
+                    (parts, joint),
+                    2,
+                    |w| match w {
+                        DevWeight::Bf16 { w, k } => Some((w, *k)),
+                        _ => None,
+                    },
+                    |w, k| DevWeight::Bf16 { w, k },
+                );
+            }
             Some(DevWeight::Q8_0 { .. }) => {
                 return self.join_byte_rows(
                     stream,
@@ -524,59 +559,63 @@ impl Weights {
         Ok(())
     }
 
-    /// [`Weights::join_rows`] over F32 parts: every part resident as an F32
-    /// weight of the first part's width `k`, their rows one after another in
-    /// one `rows × k` tensor filed as the derived F32 weight `joint` (a
-    /// router's expert rows with a shared expert's gate row below them). The
-    /// parts leave the map and their buffers are freed. Refused unless every
-    /// part is F32 of that width.
-    fn join_f32_rows(
+    /// [`Weights::join_rows`] over parts in one plane of `per` values an
+    /// element (F32 one, BF16's words two): every part resident in the first
+    /// part's format at its width `k`, their rows one after another in one
+    /// `rows × k / per` tensor filed as `joint` in that format (a router's
+    /// expert rows with a shared expert's gate row below them). `plane` reads
+    /// a part's plane and width, `None` for another format; `wrap` files the
+    /// joined plane. The parts leave the map and their buffers are freed.
+    /// Refused unless every part is of that format and width.
+    fn join_plane_rows<T: DeviceCopy>(
         &mut self,
         stream: &CudaStream,
-        parts: &[&str],
-        joint: String,
+        (parts, joint): (&[&str], String),
+        per: usize,
+        plane: PlaneOf<T>,
+        wrap: fn(DeviceTensor<T>, usize) -> DevWeight,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Weights::join_rows";
         let mut width: Option<usize> = None;
         let mut rows = 0usize;
+        let mut found = Vec::with_capacity(parts.len());
         for &name in parts {
-            let Some(DevWeight::F32 { w, k }) = self.by_name.get(name) else {
+            let Some((w, k)) = self.by_name.get(name).and_then(plane) else {
                 return Err(GpuError::shape(
                     WHAT,
-                    format!("{name} is not resident as F32 beside F32 {}", parts[0]),
+                    format!("{name} is not resident in the format of {}", parts[0]),
                 ));
             };
-            let want = *width.get_or_insert(*k);
-            if *k != want || w.cols() != want {
+            let want = *width.get_or_insert(k);
+            if k != want || w.cols() * per != want {
                 return Err(GpuError::shape(
                     WHAT,
-                    format!("{name} is F32 K={k}; {} is K={want}", parts[0]),
+                    format!("{name} is K={k}; {} is K={want}", parts[0]),
                 ));
             }
             rows += w.rows();
+            found.push(w);
         }
         let Some(k) = width else {
             return Err(GpuError::shape(WHAT, "no parts to join"));
         };
-        let w = DeviceTensor::<f32>::zeroed(stream, rows, k)?;
+        let cols = k / per;
+        let w = DeviceTensor::<T>::zeroed(stream, rows, cols)?;
         let base = w.buf().cu_deviceptr();
         let mut at = 0usize;
-        for &name in parts {
-            let Some(DevWeight::F32 { w: part, .. }) = self.by_name.get(name) else {
-                return Err(GpuError::shape(WHAT, format!("{name} left the map")));
-            };
-            let len = part.rows() * k;
-            let off = u64::try_from(at * size_of::<f32>())
-                .map_err(|_| GpuError::shape(WHAT, format!("value {at} passes u64")))?;
-            // SAFETY: the values `at .. at + len` lie inside the joint's
-            // `rows · k` (the parts' rows sum to `rows`), and the part's
-            // `len` values are its whole buffer; both are `cuMemAlloc`
+        for part in found {
+            let len = part.rows() * cols;
+            let off = u64::try_from(at * size_of::<T>())
+                .map_err(|_| GpuError::shape(WHAT, format!("element {at} passes u64")))?;
+            // SAFETY: the elements `at .. at + len` lie inside the joint's
+            // `rows · cols` (the parts' rows sum to `rows`), and the part's
+            // `len` elements are its whole buffer; both are `cuMemAlloc`
             // allocations that outlive the windows, which are released below
             // and free nothing.
             let (mut dst, src) = unsafe {
                 (
-                    window::<f32>(base + off, len, stream.context()),
-                    window::<f32>(part.buf().cu_deviceptr(), len, stream.context()),
+                    window::<T>(base + off, len, stream.context()),
+                    window::<T>(part.buf().cu_deviceptr(), len, stream.context()),
                 )
             };
             let copied = dst.copy_from_device_async(&src, stream);
@@ -589,7 +628,7 @@ impl Weights {
         for name in parts {
             self.by_name.remove(*name);
         }
-        self.by_name.insert(joint, DevWeight::F32 { w, k });
+        self.by_name.insert(joint, wrap(w, k));
         Ok(())
     }
 
@@ -748,6 +787,15 @@ impl Weights {
             _ => return Err(GpuError::tensor(what, name, "an mxfp8 or fp8_b128 weight")),
         };
         Ok(E4m3Weight { qs, e, scales })
+    }
+
+    /// The words of the resident BF16 weight `name` (rows × k/2); any other
+    /// variant is refused by name as `what`'s.
+    pub fn bf16(&self, what: &'static str, name: &str) -> Result<&DeviceTensor<u32>, GpuError> {
+        match self.resident(what, name)? {
+            DevWeight::Bf16 { w, .. } => Ok(w),
+            _ => Err(GpuError::tensor(what, name, "a bf16 weight")),
+        }
     }
 
     /// The planes and the experts' scales of the resident NVFP4 stack
@@ -1394,11 +1442,25 @@ fn upload_rows(
             }
         }
         CardFormat::Bf16Raw => {
-            let detail = format!(
-                "tensor {name}: {format:?} has no resident weight here; the reader that picks it \
-                 uploads its words itself"
-            );
-            return Err(GpuError::shape(what, detail));
+            // The file's bf16 bytes are the words' bytes on this host, two
+            // values a word, so the rows stream as they are; a run that is not
+            // the rows' whole values, or a row that ends inside a word, is
+            // refused.
+            if !k.is_multiple_of(2) || take != rows * k * 2 {
+                let detail = format!(
+                    "tensor {name}: {take} bytes are not its {rows} rows of {k} bf16 values in whole words"
+                );
+                return Err(GpuError::shape(what, detail));
+            }
+            let w = DeviceTensor::<u32>::zeroed(stream, rows, k / 2)?;
+            let stage = Stage {
+                what,
+                name,
+                dst: w.buf().cu_deviceptr(),
+                dst_bytes: w.buf().num_bytes(),
+            };
+            ring.copy_bytes(stream, &stage, src, take)?;
+            DevWeight::Bf16 { w, k }
         }
         CardFormat::Bf16AsF32 => {
             let mut vals = vec![0.0f32; rows * k];

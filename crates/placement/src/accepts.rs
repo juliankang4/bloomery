@@ -7,7 +7,9 @@
 use gguf::GgmlType;
 use models::Arch;
 
-use crate::kernels::{self, DownAct, DownEntry, GateUpEntry, SiteAct, SiteEntry};
+use crate::kernels::{
+    self, DownAct, DownEntry, EmbedEntry, GateUpEntry, HeadEntry, SiteAct, SiteEntry,
+};
 use crate::placement::{CardFormat, RoutedRule};
 
 /// A layer program: the chain that runs a family's layers.
@@ -148,20 +150,44 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
 /// [`SiteAct::F32`] — `Form::Q8x128`, `Form::Q8x32`, `Form::F32`). A Q5_0
 /// site reads [`SiteAct::Q8Blocks32`], which the arena does not carry, and
 /// is `None`. An NVFP4 site has a gemv and no wide GEMM, which the body's
-/// prompt units run every dense site through, and is `None`. The body's load
-/// and the coverage census both read this, so a site the arena cannot feed is
+/// prompt units run every dense site through, and is `None`. A BF16 site
+/// reads the words only a load under `ModelTensors::bf16_words` keeps, which
+/// the qwen3moe files do not set, and is `None`. The body's load and the
+/// coverage census both read this, so a site the arena cannot feed is
 /// refused at load and listed together.
 #[must_use]
 pub const fn qwen3moe_dense(ty: GgmlType) -> Option<SiteEntry> {
     let Some(entry) = kernels::dense(ty) else {
         return None;
     };
-    if let SiteEntry::Nvfp4 = entry {
+    if let SiteEntry::Nvfp4 | SiteEntry::Bf16 = entry {
         return None;
     }
     match entry.reads() {
         SiteAct::Q8x128 | SiteAct::Q8x32 | SiteAct::F32 => Some(entry),
         SiteAct::Q8Blocks32 => None,
+    }
+}
+
+/// The head a body whose load widens BF16 to f32 (`ModelTensors::bf16_words`
+/// naming none, as the qwen3moe body's files) runs an `output` of `ty` with: the
+/// table's [`kernels::head`] row but BF16, whose words that load does not keep.
+#[must_use]
+pub const fn head_of_widened(ty: GgmlType) -> Option<HeadEntry> {
+    match kernels::head(ty) {
+        Some(HeadEntry::Bf16) | None => None,
+        Some(e) => Some(e),
+    }
+}
+
+/// The embedding rows a body whose load widens BF16 to f32 reads a
+/// `token_embd` of `ty` with: the table's [`kernels::embed`] row but BF16, as
+/// [`head_of_widened`].
+#[must_use]
+pub const fn embed_of_widened(ty: GgmlType) -> Option<EmbedEntry> {
+    match kernels::embed(ty) {
+        Some(EmbedEntry::Bf16) | None => None,
+        Some(e) => Some(e),
     }
 }
 
@@ -368,6 +394,7 @@ mod tests {
             layers: layers.len(),
             experts: 8,
             experts_used: 2,
+            bf16_words: |_| false,
         };
         (model, layers)
     }
@@ -462,12 +489,18 @@ mod tests {
     /// The qwen3moe body's dense owner is the table row kept to the forms
     /// its arena carries and to a wide GEMM: `None` for Q5_0 (it reads
     /// `Q8Blocks32`) and NVFP4 (no wide GEMM), `Some` for Q3_K, Q4_K, Q5_K,
-    /// Q6_K, Q8_0 and F32.
+    /// Q6_K, Q8_0 and F32. Nor its head and embedding rows BF16: its load
+    /// keeps no BF16 words.
     #[test]
     fn the_qwen3moe_body_dense_owner_refuses_q5_0() {
         use crate::kernels::SiteEntry;
         assert_eq!(qwen3moe_dense(GgmlType::Q5_0), None);
         assert_eq!(qwen3moe_dense(GgmlType::NVFP4), None);
+        assert_eq!(qwen3moe_dense(GgmlType::BF16), None);
+        assert_eq!(head_of_widened(GgmlType::BF16), None);
+        assert_eq!(embed_of_widened(GgmlType::BF16), None);
+        assert!(head_of_widened(GgmlType::Q8_0).is_some());
+        assert!(embed_of_widened(GgmlType::Q8_0).is_some());
         assert_eq!(qwen3moe_dense(GgmlType::Q3_K), Some(SiteEntry::Q3k));
         assert_eq!(qwen3moe_dense(GgmlType::Q4_K), Some(SiteEntry::Q4k));
         assert_eq!(qwen3moe_dense(GgmlType::Q5_K), Some(SiteEntry::Q5k));

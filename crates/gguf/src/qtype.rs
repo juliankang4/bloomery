@@ -123,7 +123,7 @@ pub const QROWS: &[QRow] = &[
     // activations to bf16, a form this engine does not encode.
     QRow { ty: T::IQ1_M, name: "iq1_m", blck: 256, bytes: 56, dequant: false, host_act: H::None, card: Card::NONE },
     QRow { ty: T::BF16, name: "bf16", blck: 1, bytes: 2, dequant: true, host_act: H::None,
-           card: card!(Bf16AsF32     Bf16AsF32     -       -                   -      -       -    -) },
+           card: card!(Bf16AsF32     Bf16AsF32     -       -                   -      Bf16    Bf16 Bf16) },
     // Mainline's alone (llama.cpp 930e2fa59): block_tq1_0 ggml-common.h:281, block_tq2_0 :288, ggml.c:912/920.
     QRow { ty: T::TQ1_0, name: "tq1_0", blck: 256, bytes: 54, dequant: false, host_act: H::None, card: Card::NONE },
     QRow { ty: T::TQ2_0, name: "tq2_0", blck: 256, bytes: 66, dequant: false, host_act: H::None, card: Card::NONE },

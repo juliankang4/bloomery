@@ -1075,6 +1075,7 @@ mod tests {
             layers: 2,
             experts: EXPERTS,
             experts_used: 2,
+            bf16_words: |_| false,
         }
     }
 

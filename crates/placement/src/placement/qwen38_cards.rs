@@ -183,6 +183,7 @@ pub(super) fn model(q3: bool) -> ModelTensors {
         layers: LAYERS,
         experts: EXPERTS,
         experts_used: 10,
+        bf16_words: |_| false,
     }
 }
 

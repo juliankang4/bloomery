@@ -398,16 +398,18 @@ fn gqa_fits(g: &Gqa) -> bool {
 }
 
 /// Every layer's plan from its kind, `ple` the PLE site's layer, each weight
-/// checked against the geometry: type (the q8f32 planes for Q8_0, F32 for
-/// the gains, the joined stacks and the indexer's widened projections) and
-/// shape.
+/// checked against the geometry: type and shape. A dense projection is Q8_0
+/// (the q8f32 planes) or BF16 (its words), each tensor's own: the walks pick
+/// its site by the resident form. The gains, the conv, the injects, the
+/// router and the joined β·α stack are F32 (the load widens a BF16 one,
+/// `ModelTensors::bf16_words`); the indexer's projections F32 or BF16.
 pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Layer38>, GpuError> {
     use geo::{ATTN, EXPERTS, FF, HEAD, HIDDEN, IDX_DIM, IDX_HEADS, KV, Q_ROWS, RANK, STREAMS};
     let wide = STREAMS * HIDDEN;
     let check_site = |s: &HcSite| -> Result<(), GpuError> {
         f32_len(w, &s.norm, wide)?;
-        q8_shape(w, &s.down, RANK, wide)?;
-        q8_shape(w, &s.up, wide, RANK)?;
+        dense_shape(w, &s.down, RANK, wide)?;
+        dense_shape(w, &s.up, wide, RANK)?;
         if let Some(inj) = &s.inject {
             f32_shape(w, inj, STREAMS, wide)?;
         }
@@ -431,14 +433,14 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                         ssm_out: model::arch::qwen35moe::names::ssm_out(l),
                     };
                     let (c, nv) = (GDN.channels(), GDN.n_v);
-                    q8_shape(w, &p.qkv, c, HIDDEN)?;
-                    q8_shape(w, &p.z, nv * linear::HEAD, HIDDEN)?;
+                    dense_shape(w, &p.qkv, c, HIDDEN)?;
+                    dense_shape(w, &p.z, nv * linear::HEAD, HIDDEN)?;
                     f32_shape(w, &p.beta_alpha, 2 * nv, HIDDEN)?;
                     f32_len(w, &p.conv, c * linear::CONV_TAPS)?;
                     f32_len(w, &p.dt_bias, nv)?;
                     f32_len(w, &p.ssm_a, nv)?;
                     f32_len(w, &p.ssm_norm, linear::HEAD)?;
-                    q8_shape(w, &p.ssm_out, HIDDEN, nv * linear::HEAD)?;
+                    dense_shape(w, &p.ssm_out, HIDDEN, nv * linear::HEAD)?;
                     Mixer38::Gdn(p)
                 }
                 Kind38::Qsa => {
@@ -454,14 +456,14 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                         idx_k_norm: model::arch::qwen35moe::names::indexer_k_norm(l),
                         idx_q_norm: model::arch::qwen35moe::names::indexer_q_norm(l),
                     };
-                    q8_shape(w, &p.q, Q_ROWS, HIDDEN)?;
-                    q8_shape(w, &p.k, KV, HIDDEN)?;
-                    q8_shape(w, &p.v, KV, HIDDEN)?;
+                    dense_shape(w, &p.q, Q_ROWS, HIDDEN)?;
+                    dense_shape(w, &p.k, KV, HIDDEN)?;
+                    dense_shape(w, &p.v, KV, HIDDEN)?;
                     f32_len(w, &p.q_norm, HEAD)?;
                     f32_len(w, &p.k_norm, HEAD)?;
-                    q8_shape(w, &p.out, HIDDEN, ATTN)?;
-                    f32_shape(w, &p.idx_k, IDX_DIM, HIDDEN)?;
-                    f32_shape(w, &p.idx_q, IDX_HEADS * IDX_DIM, HIDDEN)?;
+                    dense_shape(w, &p.out, HIDDEN, ATTN)?;
+                    f32_rows_shape(w, &p.idx_k, IDX_DIM, HIDDEN)?;
+                    f32_rows_shape(w, &p.idx_q, IDX_HEADS * IDX_DIM, HIDDEN)?;
                     f32_len(w, &p.idx_k_norm, IDX_DIM)?;
                     f32_len(w, &p.idx_q_norm, IDX_DIM)?;
                     Mixer38::Qsa(p)
@@ -474,9 +476,9 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                 down_sh: model::arch::qwen35moe::names::ffn_down_shexp(l),
             };
             f32_shape(w, &ffn.router, EXPERTS + 1, HIDDEN)?;
-            q8_shape(w, &ffn.gate_sh, FF, HIDDEN)?;
-            q8_shape(w, &ffn.up_sh, FF, HIDDEN)?;
-            q8_shape(w, &ffn.down_sh, HIDDEN, FF)?;
+            dense_shape(w, &ffn.gate_sh, FF, HIDDEN)?;
+            dense_shape(w, &ffn.up_sh, FF, HIDDEN)?;
+            dense_shape(w, &ffn.down_sh, HIDDEN, FF)?;
             let ple = if l == ple {
                 let p = PlePlan {
                     key: model::arch::qwen35moe::names::ple_key(l),
@@ -486,8 +488,8 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                     norm_conv: model::arch::qwen35moe::names::ple_norm_conv(l),
                     conv: model::arch::qwen35moe::names::ple_conv1d(l),
                 };
-                q8_shape(w, &p.key, wide, HIDDEN)?;
-                q8_shape(w, &p.value, HIDDEN, HIDDEN)?;
+                dense_shape(w, &p.key, wide, HIDDEN)?;
+                dense_shape(w, &p.value, HIDDEN, HIDDEN)?;
                 for g in [&p.norm_key, &p.norm_query, &p.norm_conv] {
                     f32_len(w, g, wide)?;
                 }
@@ -513,38 +515,64 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
         .collect()
 }
 
-/// The resident Q8_0 planes of `name`, `rows` rows of `k` values; any other
-/// variant or shape is refused by name.
-pub(super) fn q8_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
+/// The resident weight `name` in one of `forms` (by [`DevWeight`]'s
+/// variant), `rows` rows of `k` values; another form or shape is refused by
+/// name, `want` naming the forms.
+fn shape_in(
+    w: &Weights,
+    name: &str,
+    (rows, k): (usize, usize),
+    forms: fn(&DevWeight) -> bool,
+    want: &'static str,
+) -> Result<(), GpuError> {
     match w.get(name) {
-        Some(DevWeight::Q8_0 { d, k: got, .. }) if d.rows() == rows && *got == k => Ok(()),
-        Some(DevWeight::Q8_0 { d, k: got, .. }) => Err(GpuError::shape(
-            WHAT,
-            format!(
-                "{name} is {} rows of {got}, the kernels read {rows} of {k}",
-                d.rows()
-            ),
-        )),
-        Some(_) => Err(GpuError::tensor(WHAT, name, "Q8_0 (the q8f32 planes)")),
-        None => Err(GpuError::tensor(WHAT, name, "resident")),
-    }
-}
-
-/// The resident F32 plane of `name`, `rows` rows of `k`; refused otherwise.
-fn f32_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
-    match w.get(name) {
-        Some(DevWeight::F32 { w: t, .. }) if t.rows() == rows && t.cols() == k => Ok(()),
-        Some(DevWeight::F32 { w: t, .. }) => Err(GpuError::shape(
+        Some(t) if forms(t) && t.rows() == rows && t.k() == k => Ok(()),
+        Some(t) if forms(t) => Err(GpuError::shape(
             WHAT,
             format!(
                 "{name} is {} rows of {}, the kernels read {rows} of {k}",
                 t.rows(),
-                t.cols()
+                t.k()
             ),
         )),
-        Some(_) => Err(GpuError::tensor(WHAT, name, "F32")),
+        Some(_) => Err(GpuError::tensor(WHAT, name, want)),
         None => Err(GpuError::tensor(WHAT, name, "resident")),
     }
+}
+
+/// The resident Q8_0 planes or BF16 words of `name`, `rows` rows of `k`
+/// values: a dense projection the common site reads.
+pub(super) fn dense_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
+    shape_in(
+        w,
+        name,
+        (rows, k),
+        |t| matches!(t, DevWeight::Q8_0 { .. } | DevWeight::Bf16 { .. }),
+        "Q8_0 (the q8f32 planes) or BF16 (its words)",
+    )
+}
+
+/// The resident F32 plane or BF16 words of `name`, `rows` rows of `k`: a
+/// projection the F32 gemv and tile read, or their BF16 pair.
+fn f32_rows_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
+    shape_in(
+        w,
+        name,
+        (rows, k),
+        |t| matches!(t, DevWeight::F32 { .. } | DevWeight::Bf16 { .. }),
+        "F32 or BF16",
+    )
+}
+
+/// The resident F32 plane of `name`, `rows` rows of `k`; refused otherwise.
+fn f32_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
+    shape_in(
+        w,
+        name,
+        (rows, k),
+        |t| matches!(t, DevWeight::F32 { .. }),
+        "F32",
+    )
 }
 
 /// The resident F32 plane of `name`, `len` values in all; refused otherwise.

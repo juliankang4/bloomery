@@ -23,12 +23,15 @@
 //! planes (`q8f32::e4m3_planes`) are decoded into it ([`ByteRows`]: each
 //! piece's value word and its block's scale loaded, the four values formed
 //! as the planes' `ByteBlocks` gives them, exactly the host's dequant, and
-//! stored) — `mxfp8_tile_gemm` and `fp8_b128_tile_gemm`. Either way the warps
+//! stored): `mxfp8_tile_gemm` and `fp8_b128_tile_gemm`. Either way the warps
 //! read f32 values from the stage, so an E4M3 tile is bit for bit `f32_gemv`
-//! over the host's dequantized rows.
+//! over the host's dequantized rows. BF16 words are widened into the same stage
+//! ([`Bf16Rows`], `q8f32`'s `bf16_tile_gemm`), bit for bit the F32 tile over those values.
 
 use super::kernels32::Gemm32Kernels;
-use crate::q8f32::{ByteBlocks, E4m3Scales, E4m3Weight, TILE, f32_tile_chunk, gemv_lane_sums};
+use crate::q8f32::{
+    Bf16Words, ByteBlocks, E4m3Scales, E4m3Weight, TILE, f32_tile_chunk, gemv_lane_sums,
+};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use core::marker::PhantomData;
@@ -42,7 +45,7 @@ pub(super) const TILE_ROWS: usize = 32;
 /// Threads of a block: sixteen warps, [`TILE_ROWS`]` / 8` row groups by
 /// [`TILE_COLS`]` / 8` column groups.
 pub(super) const F32T_THREADS: usize = 512;
-const F32T_THREADS_U32: u32 = F32T_THREADS as u32;
+pub(crate) const F32T_THREADS_U32: u32 = F32T_THREADS as u32;
 const ROW_GROUPS: usize = TILE_ROWS / TILE;
 const COL_GROUPS: usize = TILE_COLS / TILE;
 /// 32-value chunks one stage holds of every row and column, and the values
@@ -51,9 +54,9 @@ const STAGE_CHUNKS: usize = 2;
 /// Values in a staged F32 tile line; K must be a positive multiple.
 pub const LINE: usize = 32 * STAGE_CHUNKS;
 /// Stages in shared memory: the one the warps read and two being copied in.
-pub(super) const STAGES: usize = 3;
+pub(crate) const STAGES: usize = 3;
 /// One stage: every row's line, then every column's.
-pub(super) const STAGE_FLOATS: usize = (TILE_ROWS + TILE_COLS) * LINE;
+pub(crate) const STAGE_FLOATS: usize = (TILE_ROWS + TILE_COLS) * LINE;
 /// 16-byte copies per line.
 const LINE_COPIES: usize = LINE / 4;
 
@@ -65,7 +68,7 @@ const _: () = assert!(4 * STAGES * STAGE_FLOATS <= 48 * 1024);
 
 /// A tile's weight rows: how one thread's piece of a row line reaches the
 /// stage.
-pub(super) trait TileRows: Copy {
+pub(crate) trait TileRows: Copy {
     /// Values `at .. at + 4` of the weight (its rows back to back, `at` a
     /// multiple of 4) into the stage's 16 bytes at `dst`, readable by every
     /// warp of the block after the next `cp_async_wait_group` that completes
@@ -147,6 +150,33 @@ impl<F: ByteBlocks<Scale = u32>> TileRows for ByteRows<'_, F> {
     }
 }
 
+/// A BF16 weight's words (`DevWeight::Bf16`), widened as they are staged.
+#[derive(Clone, Copy)]
+pub(crate) struct Bf16Rows<'a>(pub &'a [u32]);
+
+impl TileRows for Bf16Rows<'_> {
+    #[inline(always)]
+    unsafe fn stage(self, dst: *mut f32, at: usize) {
+        // SAFETY: values at .. at + 4 are the halves of words at / 2 and
+        // at / 2 + 1 (at a multiple of 4), inside the words because the
+        // values lie inside the weight's rows (this fn's contract).
+        let (lo, hi) = unsafe {
+            (
+                *self.0.get_unchecked(at >> 1),
+                *self.0.get_unchecked((at >> 1) + 1),
+            )
+        };
+        // SAFETY: dst is this thread's own 16 bytes of the stage (this fn's
+        // contract); the stores are plain, published by the barrier.
+        unsafe {
+            *dst = Bf16Words::widen(lo, false);
+            *dst.add(1) = Bf16Words::widen(lo, true);
+            *dst.add(2) = Bf16Words::widen(hi, false);
+            *dst.add(3) = Bf16Words::widen(hi, true);
+        }
+    }
+}
+
 /// Lane 0's stores of the first `live` of one column's [`TILE`] row sums,
 /// `y[base + i] = sums[i]`, each store guarded by a constant index.
 ///
@@ -200,7 +230,7 @@ unsafe fn store_live(y: &mut DisjointSlice<f32>, base: usize, sums: &[f32; TILE]
 /// `rows` rows of `k` values ([`TileRows::stage`]'s bound; an F32 weight
 /// 16-byte aligned), `x.len() >= n·k`, 16-byte aligned, `y.len() >= rows·n`.
 #[inline(always)]
-pub(super) unsafe fn f32_tile_body<W: TileRows>(
+pub(crate) unsafe fn f32_tile_body<W: TileRows>(
     w: W,
     x: &[f32],
     rows: u32,
@@ -402,18 +432,18 @@ impl Gemm32Kernels {
 }
 
 /// A tile launch's grid and its `u32` arguments.
-struct TileLaunch {
-    grid: u32,
-    rows: u32,
-    k: u32,
-    n: u32,
+pub(crate) struct TileLaunch {
+    pub(crate) grid: u32,
+    pub(crate) rows: u32,
+    pub(crate) k: u32,
+    pub(crate) n: u32,
 }
 
-/// The checks both tile launchers share, beyond the weight's own: `k` a
+/// The checks every tile launcher shares, beyond the weight's own: `k` a
 /// positive multiple of [`LINE`], `rows` and `n` positive, `x` holding `n`
 /// columns of `k` values 16-byte aligned and `y` `rows · n` outputs; each
 /// failure a named `Shape` error as `what`'s.
-fn tile_launch(
+pub(crate) fn tile_launch(
     what: &'static str,
     rows: usize,
     k: usize,

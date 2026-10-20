@@ -1,5 +1,5 @@
 //! Qwen3.8's own element kernels, the ones no other body launches: the Q8_0
-//! embedding row, the attention output under its sigmoid gate in f32, the
+//! and BF16 embedding rows, the attention output under its sigmoid gate in f32, the
 //! selector's raw key append, and the shared expert's gated sum, alone or
 //! with the card's routed slots' sum.
 //!
@@ -8,6 +8,8 @@
 //!   each value `f32(code) · f32(d)` as ggml's `dequantize_row_q8_0` makes it
 //!   (one product of an 8-bit and an 11-bit significand: exact), and row
 //!   `t`'s position `pos0[0] + first + t` and live key count one more.
+//! - [`q38_kernels::embed_rows_bf16`] — the same over a BF16 table in its
+//!   words (`DevWeight::Bf16`), each value widened to f32 (exact).
 //! - [`q38_kernels::gqa_out_gate_f32`] — one thread per value: `attn ·
 //!   σ(gate)`, the gate at `[q | gate]`'s head stride, `σ` the Qwen3.6 gated
 //!   quantizer's (`route_core::sigmoid`); the output projection reads the f32
@@ -74,6 +76,7 @@ use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
 use crate::hybrid::HOST;
 use crate::route_core::sigmoid;
 use crate::tensor::DeviceTensor;
+use crate::weights::{DevWeight, Weights};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
@@ -101,6 +104,114 @@ pub const SLOTS: usize = 10;
 /// Router weights a token: the routed slots, then the shared expert's gate.
 pub const W_PITCH: usize = SLOTS + 1;
 const _: () = assert!(SLOTS == 10 && W_PITCH == 11);
+
+/// An embedding table's values as the lookup reads them.
+trait EmbedTable: Copy {
+    /// Value `v` of row `row`, as f32.
+    ///
+    /// # Safety
+    ///
+    /// `row` is a row of the table and `v` below its width.
+    unsafe fn value(self, row: usize, v: usize) -> f32;
+}
+
+/// A Q8_0 table's planes (`k32` blocks a row).
+#[derive(Clone, Copy)]
+struct Q8Table<'a> {
+    qs: &'a [u32],
+    d: &'a [u16],
+    k32: usize,
+}
+
+impl EmbedTable for Q8Table<'_> {
+    #[inline(always)]
+    unsafe fn value(self, row: usize, v: usize) -> f32 {
+        // SAFETY: word row·8·k32 + v/4 and scale row·k32 + v/32 lie inside
+        // qs and d for a row of the table and v below its 32·k32 values
+        // (this fn's contract, the kernel's launch contract).
+        let (word, bits) = unsafe {
+            (
+                *self.qs.get_unchecked(row * 8 * self.k32 + v / 4),
+                *self.d.get_unchecked(row * self.k32 + v / 32),
+            )
+        };
+        let code = (word >> (8 * (v % 4))) as u8 as i8;
+        code as f32 * half_bits_to_f32(bits)
+    }
+}
+
+/// A BF16 table's words (`k2` words, `2·k2` values, a row).
+#[derive(Clone, Copy)]
+struct Bf16Table<'a> {
+    w: &'a [u32],
+    k2: usize,
+}
+
+impl EmbedTable for Bf16Table<'_> {
+    #[inline(always)]
+    unsafe fn value(self, row: usize, v: usize) -> f32 {
+        // SAFETY: word row·k2 + v/2 lies inside w for a row of the table and
+        // v below its 2·k2 values (this fn's contract, the kernel's launch
+        // contract).
+        let word = unsafe { *self.w.get_unchecked(row * self.k2 + v / 2) };
+        crate::q8f32::Bf16Words::widen(word, v % 2 == 1)
+    }
+}
+
+/// Thread `i`'s share of an embedding lookup (module doc): it writes
+/// row `i`'s position and live key count when `i` is a row, and value
+/// `i % width` of row `i / width` from row `ids[i / width]` of `table`; an id
+/// past the table's `n_rows` rows raises [`FaultSite::TokenId`] once a row,
+/// reads nothing and writes NaN.
+///
+/// # Safety
+///
+/// `pos0` holds a word, `pos` and `n_keys` hold `ids.len()` and `y`
+/// `ids.len() · width`; `table` has `n_rows` rows of `width` values.
+#[inline(always)]
+unsafe fn embed_rows_body<T: EmbedTable>(
+    i: usize,
+    table: T,
+    (n_rows, width): (u32, usize),
+    (ids, pos0, first): (&[u32], &[u32], u32),
+    fault: FaultSink,
+    (y, pos, n_keys): (
+        &mut DisjointSlice<f32>,
+        &mut DisjointSlice<u32>,
+        &mut DisjointSlice<u32>,
+    ),
+) {
+    if i < ids.len() {
+        // SAFETY: pos0 holds a word by this fn's contract.
+        let p = unsafe { *pos0.get_unchecked(0) } as usize + first as usize + i;
+        // SAFETY: i < ids.len() <= pos.len(), n_keys.len() by this fn's
+        // contract; thread i owns entry i of both.
+        unsafe {
+            *pos.get_unchecked_mut(i) = position_word(p);
+            *n_keys.get_unchecked_mut(i) = position_word(p + 1);
+        }
+    }
+    if i >= ids.len() * width {
+        return;
+    }
+    let t = i / width;
+    let v = i % width;
+    // SAFETY: t < ids.len() by the guard.
+    let id = unsafe { *ids.get_unchecked(t) };
+    let val = if id < n_rows {
+        // SAFETY: id < n_rows is a row of the table, v < width.
+        unsafe { table.value(id as usize, v) }
+    } else {
+        if v == 0 {
+            fault.raise(FaultSite::TokenId);
+        }
+        f32::NAN
+    };
+    // SAFETY: i < ids.len()·width <= y.len() by this fn's contract.
+    unsafe {
+        *y.get_unchecked_mut(i) = val;
+    }
+}
 
 /// `v` as a position or live key count word: `v` while it fits a u32, else
 /// `u32::MAX` — a value past every cache, which the rope and the flash
@@ -155,46 +266,65 @@ mod q38_kernels {
         mut pos: DisjointSlice<u32>,
         mut n_keys: DisjointSlice<u32>,
     ) {
-        let i = thread::index_1d().get();
-        if i < ids.len() {
-            // SAFETY: pos0 holds a word by the launch contract.
-            let p = unsafe { *pos0.get_unchecked(0) } as usize + first as usize + i;
-            // SAFETY: i < ids.len() <= pos.len(), n_keys.len() by the launch
-            // contract; thread i owns entry i of both.
-            unsafe {
-                *pos.get_unchecked_mut(i) = position_word(p);
-                *n_keys.get_unchecked_mut(i) = position_word(p + 1);
-            }
-        }
-        let width = 32 * k32 as usize;
-        if i >= ids.len() * width {
-            return;
-        }
-        let t = i / width;
-        let v = i % width;
-        // SAFETY: t < ids.len() by the guard.
-        let id = unsafe { *ids.get_unchecked(t) };
-        let val = if id < n_rows {
-            let row = id as usize;
-            // SAFETY: id < n_rows, so word row·8·k32 + v/4 and scale
-            // row·k32 + v/32 lie inside qs and d by the launch contract.
-            let (word, bits) = unsafe {
-                (
-                    *qs.get_unchecked(row * 8 * k32 as usize + v / 4),
-                    *d.get_unchecked(row * k32 as usize + v / 32),
-                )
-            };
-            let code = (word >> (8 * (v % 4))) as u8 as i8;
-            code as f32 * half_bits_to_f32(bits)
-        } else {
-            if v == 0 {
-                fault.raise(FaultSite::TokenId);
-            }
-            f32::NAN
-        };
-        // SAFETY: i < ids.len()·width <= y.len() by the launch contract.
+        let k32 = k32 as usize;
+        // SAFETY: by the launch contract pos0 holds a word, pos and n_keys
+        // `ids.len()`, y `32·k32·ids.len()`, and the planes `n_rows` rows of
+        // `8·k32` words and `k32` scales.
         unsafe {
-            *y.get_unchecked_mut(i) = val;
+            embed_rows_body(
+                thread::index_1d().get(),
+                Q8Table { qs, d, k32 },
+                (n_rows, 32 * k32),
+                (ids, pos0, first),
+                fault,
+                (&mut y, &mut pos, &mut n_keys),
+            );
+        }
+    }
+
+    /// [`embed_rows_q8_0`] over a BF16 table in its words: `w` `k2` words
+    /// (`2·k2` values) a row, each value widened to f32.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= k2 * n_rows,
+            y.len() >= 2 * k2 * ids.len(),
+            pos0.len() >= 1,
+            pos.len() >= ids.len(),
+            n_keys.len() >= ids.len()
+        )
+    )]
+    pub fn embed_rows_bf16(
+        w: &[u32],
+        ids: &[u32],
+        pos0: &[u32],
+        first: u32,
+        n_rows: u32,
+        k2: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        mut pos: DisjointSlice<u32>,
+        mut n_keys: DisjointSlice<u32>,
+    ) {
+        let k2 = k2 as usize;
+        // SAFETY: by the launch contract pos0 holds a word, pos and n_keys
+        // `ids.len()`, y `2·k2·ids.len()`, and w `n_rows` rows of `k2` words.
+        unsafe {
+            embed_rows_body(
+                thread::index_1d().get(),
+                Bf16Table { w, k2 },
+                (n_rows, 2 * k2),
+                (ids, pos0, first),
+                fault,
+                (&mut y, &mut pos, &mut n_keys),
+            );
         }
     }
 
@@ -774,13 +904,45 @@ mod q38_kernels {
     }
 }
 
-/// [`Q38Kernels::enqueue_embed_rows`]'s arguments: the Q8_0 table's planes,
-/// one unit's ids, the word holding the first position of the input the ids
-/// are a window of and the window's offset in it, and the three outputs —
-/// the rows, each row's position and its live key count.
-pub struct EmbedQ8Args<'a> {
-    pub qs: &'a DeviceTensor<u32>,
-    pub d: &'a DeviceTensor<u16>,
+/// The token embedding as [`Q38Kernels::enqueue_embed_rows`] reads it: a
+/// Q8_0 table's planes or a BF16 table's words.
+#[derive(Clone, Copy)]
+pub enum EmbedRows<'a> {
+    Q8_0 {
+        qs: &'a DeviceTensor<u32>,
+        d: &'a DeviceTensor<u16>,
+    },
+    Bf16(&'a DeviceTensor<u32>),
+}
+
+impl<'a> EmbedRows<'a> {
+    /// The resident table `name` of `w` as the lookup reads it; another
+    /// format is refused by name as `what`'s.
+    pub fn of(w: &'a Weights, what: &'static str, name: &str) -> Result<Self, GpuError> {
+        let dw = w
+            .get(name)
+            .ok_or_else(|| GpuError::tensor(what, name, "resident"))?;
+        Self::of_weight(dw).ok_or_else(|| GpuError::tensor(what, name, "Q8_0 planes or BF16 words"))
+    }
+
+    /// The resident table `dw` as the lookup reads it; `None` for another
+    /// format.
+    #[must_use]
+    pub fn of_weight(dw: &'a DevWeight) -> Option<Self> {
+        match dw {
+            DevWeight::Q8_0 { qs, d, .. } => Some(EmbedRows::Q8_0 { qs, d }),
+            DevWeight::Bf16 { w, .. } => Some(EmbedRows::Bf16(w)),
+            _ => None,
+        }
+    }
+}
+
+/// [`Q38Kernels::enqueue_embed_rows`]'s arguments: the table, one unit's
+/// ids, the word holding the first position of the input the ids are a
+/// window of and the window's offset in it, and the three outputs — the
+/// rows, each row's position and its live key count.
+pub struct EmbedArgs<'a> {
+    pub table: EmbedRows<'a>,
     pub ids: &'a DeviceBuffer<u32>,
     pub pos0: &'a DeviceBuffer<u32>,
     pub first: usize,
@@ -935,30 +1097,44 @@ impl Q38Kernels {
         Ok(Q38Kernels { module })
     }
 
-    /// Enqueue the Q8_0 embedding lookup of one unit of rows ([`EmbedQ8Args`],
-    /// module doc): `k = 32 · d.cols()` values a row, `qs.cols()` its
-    /// `8 · d.cols()` words. The rows are `gguf::quant::dequant_row`'s bits.
+    /// Enqueue the embedding lookup of one unit of rows ([`EmbedArgs`],
+    /// module doc): a Q8_0 table of `k = 32 · d.cols()` values a row,
+    /// `qs.cols()` its `8 · d.cols()` words, or a BF16 table of `2 · w.cols()`
+    /// values a row. The rows are `gguf::quant::dequant_row`'s bits.
     /// One launch. Asynchronous, allocation-free, capturable.
     pub fn enqueue_embed_rows(
         &self,
         stream: &CudaStream,
-        a: EmbedQ8Args<'_>,
+        a: EmbedArgs<'_>,
     ) -> Result<(), GpuError> {
         let what = "q38::enqueue_embed_rows";
-        let (qs, d) = (a.qs, a.d);
-        let k32 = d.cols();
-        if qs.rows() == 0 || qs.rows() != d.rows() || k32 == 0 || qs.cols() != 8 * k32 {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "Q8_0 planes qs {}x{} and d {}x{}: equal rows, 8 words a scale",
-                    qs.rows(),
-                    qs.cols(),
-                    d.rows(),
-                    d.cols()
-                ),
-            ));
-        }
+        let (n_rows, width) = match a.table {
+            EmbedRows::Q8_0 { qs, d } => {
+                let k32 = d.cols();
+                if qs.rows() == 0 || qs.rows() != d.rows() || k32 == 0 || qs.cols() != 8 * k32 {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "Q8_0 planes qs {}x{} and d {}x{}: equal rows, 8 words a scale",
+                            qs.rows(),
+                            qs.cols(),
+                            d.rows(),
+                            d.cols()
+                        ),
+                    ));
+                }
+                (qs.rows(), 32 * k32)
+            }
+            EmbedRows::Bf16(w) => {
+                if w.rows() == 0 || w.cols() == 0 {
+                    return Err(GpuError::shape(
+                        what,
+                        format!("BF16 words {}x{}: no rows or no values", w.rows(), w.cols()),
+                    ));
+                }
+                (w.rows(), 2 * w.cols())
+            }
+        };
         let n = a.ids.len();
         if n == 0 {
             return Err(GpuError::shape(what, "empty ids"));
@@ -966,32 +1142,54 @@ impl Q38Kernels {
         short(
             what,
             &[
-                ("y", a.y.len(), 32 * k32 * n),
+                ("y", a.y.len(), width * n),
                 ("pos0", a.pos0.len(), 1),
                 ("pos", a.pos.len(), n),
                 ("n_keys", a.n_keys.len(), n),
             ],
         )?;
-        let cfg = grid(what, 32 * k32 * n)?;
+        let cfg = grid(what, width * n)?;
         let first = launch_u32(what, "first", a.first)?;
-        let n_rows = launch_u32(what, "rows", qs.rows())?;
-        let k32 = launch_u32(what, "k32", k32)?;
-        let prep = self.module.prepare_embed_rows_q8_0(cfg)?;
-        self.module.embed_rows_q8_0(
-            stream,
-            &prep,
-            qs.buf(),
-            d.buf(),
-            a.ids,
-            a.pos0,
-            first,
-            n_rows,
-            k32,
-            a.fault,
-            a.y,
-            a.pos,
-            a.n_keys,
-        )?;
+        let n_rows = launch_u32(what, "rows", n_rows)?;
+        match a.table {
+            EmbedRows::Q8_0 { qs, d } => {
+                let k32 = launch_u32(what, "k32", d.cols())?;
+                let prep = self.module.prepare_embed_rows_q8_0(cfg)?;
+                self.module.embed_rows_q8_0(
+                    stream,
+                    &prep,
+                    qs.buf(),
+                    d.buf(),
+                    a.ids,
+                    a.pos0,
+                    first,
+                    n_rows,
+                    k32,
+                    a.fault,
+                    a.y,
+                    a.pos,
+                    a.n_keys,
+                )?;
+            }
+            EmbedRows::Bf16(w) => {
+                let k2 = launch_u32(what, "k2", w.cols())?;
+                let prep = self.module.prepare_embed_rows_bf16(cfg)?;
+                self.module.embed_rows_bf16(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    a.ids,
+                    a.pos0,
+                    first,
+                    n_rows,
+                    k2,
+                    a.fault,
+                    a.y,
+                    a.pos,
+                    a.n_keys,
+                )?;
+            }
+        }
         Ok(())
     }
 

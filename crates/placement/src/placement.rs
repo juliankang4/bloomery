@@ -108,6 +108,14 @@ pub struct ModelTensors {
     /// one token uses.
     pub experts: u64,
     pub experts_used: u64,
+    /// Whether its program reads bf16 matrix `t` of a dense role in its words
+    /// ([`CardFormat::Bf16Raw`], [`ModelTensors::card_format`]): the
+    /// architecture's classifier names each tensor a bf16 site, head or
+    /// embedding lookup reads (qwen4exp's projections); a tensor of the same
+    /// role its program reads as f32 values (a conv, an inject, the parts of
+    /// a joined stack) is not one. `|_| false` loads every bf16 tensor as f32
+    /// values ([`CardFormat::Bf16AsF32`]).
+    pub bf16_words: fn(&ModelTensor) -> bool,
 }
 
 /// The experts of routed stack `t` of a model of `experts`: its last dim
@@ -123,6 +131,38 @@ pub fn stack_experts(t: &ModelTensor, experts: u64) -> u64 {
 }
 
 impl ModelTensors {
+    /// The format file tensor `t` of this model loads in on a card:
+    /// [`CardFormat::of`] of its type, except
+    /// - an engram gain, which the card reads as f32 values whatever its
+    ///   type: a K-quant one is decoded at load;
+    /// - a bf16 matrix (two or more dims) [`ModelTensors::bf16_words`] names,
+    ///   of a role whose matrices the bf16 dense site, head and embedding
+    ///   lookup read (attention, a hyper-connection, a shared expert, a dense
+    ///   FFN, an engram's dense projections, the head, the token embedding):
+    ///   [`CardFormat::Bf16Raw`], which those kernels widen as they read it
+    ///   (`crate::kernels`' `SiteEntry::Bf16`, `HeadEntry::Bf16`,
+    ///   `EmbedEntry::Bf16`). Every other bf16 tensor (a vector, a router, a
+    ///   norm, a matrix it does not name) stays [`CardFormat::Bf16AsF32`]:
+    ///   the kernels that read those read f32 values.
+    #[must_use]
+    pub fn card_format(&self, t: &ModelTensor) -> Option<CardFormat> {
+        match (t.role, card_format_of_role(t.ty, t.role)) {
+            (
+                Role::Attention
+                | Role::HyperConnection
+                | Role::SharedExpert
+                | Role::DenseFfn
+                | Role::EngramDense
+                | Role::Head
+                | Role::TokenEmbedding,
+                Some(CardFormat::Bf16AsF32),
+            ) if (self.bf16_words)(t) && t.ty == GgmlType::BF16 && t.dims.len() >= 2 => {
+                Some(CardFormat::Bf16Raw)
+            }
+            (_, f) => f,
+        }
+    }
+
     /// The experts of routed stack `t` ([`stack_experts`]).
     #[must_use]
     pub fn experts_of(&self, t: &ModelTensor) -> u64 {
@@ -1584,14 +1624,15 @@ fn card_heaps(
 }
 
 /// A card segment of `rows` rows of `t` — all of it, or an expert slice —
-/// in the format its role gives its type ([`card_format_of_role`]).
+/// in the format `model` gives it ([`ModelTensors::card_format`]).
 fn card_segment(
+    model: &ModelTensors,
     t: &ModelTensor,
     card: usize,
     rows: u64,
     experts: Option<ExpertList>,
 ) -> Result<Segment, PlacementError> {
-    card_segment_as(t, card, rows, experts, card_format_of_role(t.ty, t.role))
+    card_segment_as(t, card, rows, experts, model.card_format(t))
 }
 
 /// [`card_segment`] in `format`; `None` is the refusal of a tensor no card
@@ -1633,8 +1674,9 @@ fn place_whole(
     i: usize,
     t: &ModelTensor,
     stages: &Stages,
-    layers: usize,
+    model: &ModelTensors,
 ) -> Result<Row, PlacementError> {
+    let layers = model.layers;
     let stage = stages.stage_of(t, layers)?;
     let (segment, read_bytes) = match t.role {
         Role::Attention
@@ -1646,11 +1688,20 @@ fn place_whole(
         | Role::EngramDense
         | Role::EngramGain => {
             layer_of(t, layers)?;
-            (card_segment(t, stage, rows_of(t), None)?, t.file_bytes)
+            (
+                card_segment(model, t, stage, rows_of(t), None)?,
+                t.file_bytes,
+            )
         }
-        Role::Head => (card_segment(t, stage, rows_of(t), None)?, t.file_bytes),
+        Role::Head => (
+            card_segment(model, t, stage, rows_of(t), None)?,
+            t.file_bytes,
+        ),
         Role::TokenEmbedding => match stages.embedding {
-            Some(card) => (card_segment(t, card, rows_of(t), None)?, gathered(t)?),
+            Some(card) => (
+                card_segment(model, t, card, rows_of(t), None)?,
+                gathered(t)?,
+            ),
             None => (
                 in_place(Device::Host, Format::HostFile, None, t.file_bytes),
                 gathered(t)?,
@@ -1744,14 +1795,7 @@ pub fn routed_row_on(
     on_cards: Vec<(usize, ExpertList)>,
     model: &ModelTensors,
 ) -> Result<Row, PlacementError> {
-    routed_row_on_as(
-        i,
-        t,
-        stage,
-        on_cards,
-        model,
-        card_format_of_role(t.ty, t.role),
-    )
+    routed_row_on_as(i, t, stage, on_cards, model, model.card_format(t))
 }
 
 /// [`routed_row_on`] with the card segments in `format`: the expert rule's
@@ -1810,13 +1854,18 @@ fn routed_row_on_as(
     })
 }
 
-/// Row `i`, the tensor `t` whole on card `card` in its card format, whatever
-/// its role — for a load that fixes its own split ([`routed_row`] places the
-/// routed stacks).
-pub fn whole_on_card(i: usize, t: &ModelTensor, card: usize) -> Result<Row, PlacementError> {
+/// Row `i`, the tensor `t` of `model` whole on card `card` in its card
+/// format, whatever its role — for a load that fixes its own split
+/// ([`routed_row`] places the routed stacks).
+pub fn whole_on_card(
+    i: usize,
+    t: &ModelTensor,
+    card: usize,
+    model: &ModelTensors,
+) -> Result<Row, PlacementError> {
     Ok(Row {
         tensor: i,
-        segments: vec![card_segment(t, card, rows_of(t), None)?],
+        segments: vec![card_segment(model, t, card, rows_of(t), None)?],
         read_bytes: t.file_bytes,
         stage: card,
     })
@@ -2288,13 +2337,13 @@ fn plan_rule<'a>(
     let mut stacks: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
     for (i, t) in model.tensors.iter().enumerate() {
         // A never-loaded tensor's shape is nothing a card must take.
-        if let Some(format) = card_format_of_role(t.ty, t.role).filter(|_| t.role != Role::Unused) {
+        if let Some(format) = model.card_format(t).filter(|_| t.role != Role::Unused) {
             card_bytes(t, format, rows_of(t))?;
         }
         if t.role == Role::RoutedExperts {
             stacks[layer_of(t, model.layers)?].push(i);
         } else {
-            rows[i] = Some(place_whole(i, t, &stages, model.layers)?);
+            rows[i] = Some(place_whole(i, t, &stages, model)?);
         }
     }
     check_tiers(&machine.tiers)?;
@@ -2720,7 +2769,7 @@ impl fmt::Display for WholeNeed {
 /// whole-fit verdict. The load uploads every tensor its loader takes — each
 /// of the model's layers and every model-level tensor, whatever its role —
 /// in the model's order, each in the card format its role gives its type
-/// ([`card_format_of_role`]) and each one's buffers through the card's
+/// ([`ModelTensors::card_format`]) and each one's buffers through the card's
 /// allocator ([`Heap`]), so the granules are counted; then the cache, the
 /// card's set-aside and what the program holds past them (`load`), summed
 /// by the card's floor ([`Card::floor_bytes`]). The budget is the card's
@@ -2745,8 +2794,9 @@ pub fn whole_need(
         .iter()
         .filter(|t| t.layer.is_none_or(|l| l < model.layers));
     for t in loaded {
-        let format =
-            card_format_of_role(t.ty, t.role).ok_or_else(|| PlacementError::NoCardFormat {
+        let format = model
+            .card_format(t)
+            .ok_or_else(|| PlacementError::NoCardFormat {
                 name: t.name.clone(),
                 ty: t.ty,
                 role: t.role,
@@ -4188,6 +4238,7 @@ mod tests {
             layers: 1,
             experts: 1,
             experts_used: 1,
+            bf16_words: |_| false,
         };
         let pool = |unified: bool| {
             let mut c = card("GB10", 0..1, true, true);
@@ -4414,11 +4465,125 @@ mod tests {
             layers,
             experts: 8,
             experts_used: 2,
+            bf16_words: |_| false,
         }
     }
 
     const HEAD: u64 = 4_352;
     const EXPERT: u64 = 576;
+
+    /// A model of 4 layers with every role's bf16 tensor (an attention
+    /// matrix, a hyper-connection, a shared expert, a router, an FFN norm,
+    /// the head and the token embedding, 256-value rows) beside a routed
+    /// q4_K stack, its readers' choice `bf16_words`, planned on `n` cards of
+    /// `4 / n` layers each: every bf16 tensor's card segment is on the card
+    /// that runs it, in the format `ModelTensors::card_format` names, at its
+    /// format's bytes. With `bf16_words` the matrices of the dense roles keep
+    /// their words (the file's bytes); the router and the norm, and every
+    /// tensor without it, are f32 values (twice the file's bytes): the plan
+    /// of a model that does not set it is the one it was.
+    #[test]
+    fn a_bf16_matrix_keeps_its_words_where_its_readers_read_them() {
+        let bf16 = |name: String, layer, role, rows: &[u64]| {
+            let mut dims = vec![256];
+            dims.extend_from_slice(rows);
+            ModelTensor {
+                name,
+                shard: 0,
+                layer,
+                role,
+                ty: GgmlType::BF16,
+                file_bytes: 2 * dims.iter().product::<u64>(),
+                dims,
+                gathered_rows: (role == Role::TokenEmbedding).then_some(1),
+            }
+        };
+        let raw = [
+            Role::Attention,
+            Role::HyperConnection,
+            Role::SharedExpert,
+            Role::Head,
+            Role::TokenEmbedding,
+        ];
+        for bf16_words in [false, true] {
+            for n in [1usize, 2, 4] {
+                let mut model = layered(4);
+                model.bf16_words = if bf16_words { |_| true } else { |_| false };
+                for l in 0..4 {
+                    for (what, role, rows) in [
+                        ("attn", Role::Attention, &[16][..]),
+                        ("hc", Role::HyperConnection, &[4]),
+                        ("shexp", Role::SharedExpert, &[8]),
+                        ("router", Role::Router, &[9]),
+                        ("norm", Role::FfnNorm, &[]),
+                    ] {
+                        model
+                            .tensors
+                            .push(bf16(format!("{what} {l}"), Some(l), role, rows));
+                    }
+                }
+                for (name, role) in [
+                    ("bf16 head", Role::Head),
+                    ("bf16 embd", Role::TokenEmbedding),
+                ] {
+                    model.tensors.push(bf16(name.into(), None, role, &[16]));
+                }
+                let per = 4 / n;
+                let cards = (0..n)
+                    .map(|c| Card {
+                        usable_bytes: 1 << 30,
+                        ..card(
+                            &format!("card{c}"),
+                            c * per..(c + 1) * per,
+                            c == n - 1,
+                            c == 0,
+                        )
+                    })
+                    .collect();
+                let machine = Machine {
+                    cards,
+                    tiers: Vec::new(),
+                    nodes: vec![Node {
+                        host: host(),
+                        unified: None,
+                    }],
+                };
+                let plan = plan_with(&model, &machine, 4096, &NoKv, None)
+                    .unwrap_or_else(|e| panic!("n={n} words={bf16_words}: {e}"));
+                let mut seen = 0;
+                for r in &plan.rows {
+                    let t = &model.tensors[r.tensor];
+                    if t.ty != GgmlType::BF16 {
+                        continue;
+                    }
+                    seen += 1;
+                    let (format, bytes) = if bf16_words && raw.contains(&t.role) {
+                        (CardFormat::Bf16Raw, t.file_bytes)
+                    } else {
+                        (CardFormat::Bf16AsF32, 2 * t.file_bytes)
+                    };
+                    let card = match (t.layer, t.role) {
+                        (Some(l), _) => l / per,
+                        (None, Role::Head) => n - 1,
+                        (None, _) => 0,
+                    };
+                    assert_eq!(model.card_format(t), Some(format), "{}", t.name);
+                    let got: Vec<_> = r
+                        .segments
+                        .iter()
+                        .map(|s| (s.device, s.format, s.experts.is_none(), s.resident_bytes))
+                        .collect();
+                    assert_eq!(
+                        got,
+                        [(Device::Card(card), Format::Card(format), true, bytes)],
+                        "n={n} words={bf16_words} {}",
+                        t.name
+                    );
+                }
+                assert_eq!(seen, 4 * 5 + 2, "n={n}");
+            }
+        }
+    }
 
     /// A card of `usable` bytes and nothing else set aside.
     fn bytes_card(name: &str, usable: u64, layers: Range<usize>) -> Card {

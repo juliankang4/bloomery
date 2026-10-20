@@ -1760,6 +1760,9 @@ impl Body38 {
                 model::arch::qwen35moe::mtp::output_form(*ty)
                     .unwrap_or(model::arch::qwen35moe::mtp::BorrowedHead::Q8_0)
             }
+            Some(crate::weights::DevWeight::Bf16 { .. }) => {
+                model::arch::qwen35moe::mtp::BorrowedHead::Bf16
+            }
             _ => model::arch::qwen35moe::mtp::BorrowedHead::Q8_0,
         };
         let mut body = Body38 {

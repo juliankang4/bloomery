@@ -287,7 +287,7 @@ mod gate {
             .iter()
             .enumerate()
             .filter(|(_, t)| keep.contains(&t.name))
-            .map(|(i, t)| placement::whole_on_card(i, t, 0))
+            .map(|(i, t)| placement::whole_on_card(i, t, 0, &model))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Weights::load_rows(stream, split, &model, &rows, 0)?)
     }

@@ -353,12 +353,13 @@ pub(super) fn dense_site(
         Some(DevWeight::Q8_0 { .. }) => GgmlType::Q8_0,
         Some(DevWeight::Mxfp8 { .. }) => GgmlType::MXFP8,
         Some(DevWeight::Fp8B128 { .. }) => GgmlType::FP8_B128,
+        Some(DevWeight::Bf16 { .. }) => GgmlType::BF16,
         Some(DevWeight::F32 { .. }) => GgmlType::F32,
         Some(_) => {
             return Err(GpuError::tensor(
                 what,
                 name,
-                "a K-quant word plane, Q8_0, MXFP8 or FP8_B128 planes, or an F32 plane",
+                "a K-quant word plane, Q8_0, MXFP8 or FP8_B128 planes, BF16 words or an F32 plane",
             ));
         }
         None => return Err(GpuError::tensor(what, name, "resident")),

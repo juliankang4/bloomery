@@ -878,6 +878,8 @@ pub(crate) mod synthetic {
         F32,
         /// Two bytes a value.
         F16,
+        /// Two bytes a value.
+        Bf16,
         /// Blocks of 32 values in 34 bytes; the first dim a multiple of 32.
         Q8_0,
         /// Blocks of 256 values in 210 bytes; any first dim (a partial final
@@ -900,6 +902,7 @@ pub(crate) mod synthetic {
             match self {
                 Ty::F32 => (0, 4 * n),
                 Ty::F16 => (1, 2 * n),
+                Ty::Bf16 => (30, 2 * n),
                 Ty::Q8_0 => {
                     assert!(n.is_multiple_of(32), "{n} values are not whole Q8_0 blocks");
                     (8, n / 32 * 34)

@@ -103,6 +103,7 @@ fn node_nvme_host_run(
             layers: LAYERS,
             experts: EXPERTS as u64,
             experts_used: 2,
+            bf16_words: |_| false,
         };
         // Leave expert 0 off the tier so its places are not global ids.
         let assigned: Vec<Row> = model

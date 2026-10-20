@@ -268,8 +268,8 @@ pub enum PlaceError {
     /// A target matrix an MTP draft file borrows ([`PlanInputs::mtp_borrows`])
     /// absent, or in another format than the one the draft's program reads.
     #[error(
-        "the target's {name} is {}; the MTP draft reads the target's token_embd as Q8_0 and its \
-         output as Q8_0 or Q6_K",
+        "the target's {name} is {}; the MTP draft reads the target's token_embd as Q8_0 or BF16 \
+         and its output as Q8_0, Q6_K or BF16",
         ty.map_or("absent".to_string(), |t| t.to_string())
     )]
     DraftBorrow { name: String, ty: Option<GgmlType> },
@@ -322,8 +322,8 @@ impl PlanInputs {
 
     /// The target's matrices an MTP draft file borrows, `token_embd` and
     /// `output`, each in a format the draft's program reads: `token_embd`
-    /// Q8_0 (the embedding-row reads its q8_0 rows), `output` one of
-    /// [`mtp::head_kind`]'s forms (Q8_0 or Q6_K, one owner with it in
+    /// Q8_0 or BF16 (the embedding rows read either), `output` one of
+    /// [`mtp::head_kind`]'s forms (Q8_0, Q6_K or BF16, one owner with it in
     /// [`mtp::output_form`]); else the first that is absent or another
     /// format, by name ([`PlaceError::DraftBorrow`]). [`MtpInputs::read`]
     /// refuses a draft by it; the Qwen3.8 seat's unset `BLOOMERY_DRAFT`
@@ -339,7 +339,7 @@ impl PlanInputs {
             let ok = if borrowed {
                 mtp::output_form(ty.unwrap_or(GgmlType::F32)).is_some()
             } else {
-                ty == Some(GgmlType::Q8_0)
+                matches!(ty, Some(GgmlType::Q8_0 | GgmlType::BF16))
             };
             if !ok {
                 return Err(PlaceError::DraftBorrow { name, ty });
@@ -1000,7 +1000,7 @@ const MTP_HEAD_ROWS: u64 = 8;
 
 /// Card bytes a Q6_K borrowed head's walk adds to the program's arena beside
 /// [`mtp_arena_bytes`]: the head's input rows quantized to q8_1, 0 for a
-/// Q8_0 head whose projection reads the f32 rows. [derived: `Q8Act::with_k`
+/// Q8_0 or BF16 head whose projection reads the f32 rows. [derived: `Q8Act::with_k`
 /// at `MTP_HEAD_ROWS` columns of `hidden` values — per column, at n_sb =
 /// hidden/256 super-blocks, q3 `64 · ⌈n_sb/2⌉` u64, q4 `256 · ⌈n_sb/4⌉`
 /// u32, q6 `128 · ⌈n_sb/2⌉` u32, s8 `8 · n_sb` i32 and d8 `2 · n_sb` f32,
@@ -1011,7 +1011,7 @@ const MTP_HEAD_ROWS: u64 = 8;
 #[must_use]
 pub fn mtp_head_act_bytes(head: mtp::BorrowedHead, hidden: u64) -> u64 {
     match head {
-        mtp::BorrowedHead::Q8_0 => 0,
+        mtp::BorrowedHead::Q8_0 | mtp::BorrowedHead::Bf16 => 0,
         mtp::BorrowedHead::Q6K => crate::placement::kernels::q8_act_bytes(MTP_HEAD_ROWS, hidden),
     }
 }
@@ -2007,6 +2007,7 @@ impl MtpInputs {
                 layers: 1,
                 experts,
                 experts_used,
+                bf16_words: |_| false,
             },
             machine: draft_machine(),
             kv,
@@ -2441,6 +2442,7 @@ mod tests {
                 layers: 6,
                 experts: EXPERTS,
                 experts_used: 10,
+                bf16_words: |_| false,
             }
         }
 
@@ -3074,6 +3076,7 @@ mod tests {
                     layers: LAYERS,
                     experts: 512,
                     experts_used: 10,
+                    bf16_words: |_| false,
                 },
                 spec,
                 kv,
@@ -3501,13 +3504,15 @@ mod tests {
         }
 
         /// The target's `token_embd` and `output`, which an MTP draft file
-        /// borrows, pass as Q8_0, and `output` besides as the Q6_K form its
-        /// gemv also reads (the UD-Q3_K_XL file's `output`); the first
-        /// absent or of another format is named.
+        /// borrows, pass as Q8_0 or BF16, and `output` besides as the Q6_K
+        /// form its gemv also reads (the UD-Q3_K_XL file's `output`); the
+        /// first absent or of another format is named.
         // PIN(2026-10-06): `output` widened to `mtp::head_kind`'s set (Q8_0
         // or Q6_K, one owner `mtp::output_form`) so the UD-Q3_K_XL target
         // lends its Q6_K head to the draft; `token_embd` stays Q8_0 alone —
         // the old test refused a Q6_K `output` by name.
+        // PIN(2026-10-20): `token_embd` and `output` also pass as BF16, the
+        // words the bf16 embedding rows and head gemvs read.
         #[test]
         fn mtp_borrows_name_a_matrix_the_head_does_not_read() {
             let matrix = |name: &str, ty: GgmlType| ModelTensor {
@@ -3529,8 +3534,10 @@ mod tests {
                 );
                 i.mtp_borrows()
             };
-            for out in [GgmlType::Q8_0, GgmlType::Q6_K] {
-                assert!(with(Some(GgmlType::Q8_0), Some(out)).is_ok(), "{out}");
+            for out in [GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::BF16] {
+                for embd in [GgmlType::Q8_0, GgmlType::BF16] {
+                    assert!(with(Some(embd), Some(out)).is_ok(), "{embd} {out}");
+                }
             }
             for (embd, out, name, ty) in [
                 (
@@ -3558,7 +3565,7 @@ mod tests {
                 Err(e) => assert_eq!(
                     e.to_string(),
                     "the target's output.weight is q4_K; the MTP draft reads the target's \
-                     token_embd as Q8_0 and its output as Q8_0 or Q6_K"
+                     token_embd as Q8_0 or BF16 and its output as Q8_0, Q6_K or BF16"
                 ),
                 Ok(()) => panic!("a Q4_K output passed"),
             }

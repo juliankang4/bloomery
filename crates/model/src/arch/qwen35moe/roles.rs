@@ -204,5 +204,45 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
             t.gathered_rows = ple_rows;
         }
     }
+    // Body38 reads these bf16 matrices through the bf16 site, head and
+    // embedding rows, and every other one (the convs, the injects, the parts
+    // of its joined beta/alpha stack and router) as f32 values; Qwen3.5's
+    // body reads none in its words.
+    model.bf16_words = if hp.variant == Variant::Qwen4Exp {
+        |t| {
+            let stem = t
+                .name
+                .strip_prefix("blk.")
+                .and_then(|name| name.split_once('.'))
+                .map_or(t.name.as_str(), |(_, stem)| stem);
+            matches!(
+                stem,
+                "output.weight"
+                    | "token_embd.weight"
+                    | "output_hc_down.weight"
+                    | "output_hc_up.weight"
+                    | "attn_qkv.weight"
+                    | "attn_gate.weight"
+                    | "ssm_out.weight"
+                    | "attn_q.weight"
+                    | "attn_k.weight"
+                    | "attn_v.weight"
+                    | "attn_output.weight"
+                    | "indexer.q_proj.weight"
+                    | "indexer.k_proj.weight"
+                    | "hc_attn_down.weight"
+                    | "hc_attn_up.weight"
+                    | "hc_ffn_down.weight"
+                    | "hc_ffn_up.weight"
+                    | "ffn_gate_shexp.weight"
+                    | "ffn_up_shexp.weight"
+                    | "ffn_down_shexp.weight"
+                    | "ple_key.weight"
+                    | "ple_value.weight"
+            )
+        }
+    } else {
+        |_| false
+    };
     Ok(model)
 }

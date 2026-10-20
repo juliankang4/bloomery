@@ -4910,6 +4910,7 @@ mod tests {
             layers: 4,
             experts: 8,
             experts_used: 2,
+            bf16_words: |_| false,
         };
         for (layer, types) in [
             [Q4_K, Q4_K, Q6_K],
@@ -6104,6 +6105,7 @@ mod tests {
             layers: 1,
             experts: 8,
             experts_used: 2,
+            bf16_words: |_| false,
         };
         let pool = model::placement::churn::ChurnPool {
             pinned: 0,

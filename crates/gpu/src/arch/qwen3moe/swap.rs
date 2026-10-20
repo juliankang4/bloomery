@@ -120,6 +120,7 @@ mod tests {
             layers,
             experts: 8,
             experts_used: 2,
+            bf16_words: |_| false,
         }
     }
 

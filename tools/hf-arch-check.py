@@ -208,8 +208,9 @@ TYPE_PLACES = {
     "qwen38": (("crates/model/src/arch/qwen35moe/place.rs", "pub fn card_routed(ty: GgmlType)"),
                ("crates/placement/src/accepts.rs", "pub const fn qwen38_gate_up(ty: GgmlType)"),
                ("crates/placement/src/accepts.rs", "pub const fn qwen38_down(ty: GgmlType)"),
-               ("crates/gpu/src/arch/qwen3moe/program38.rs",
-                "let (qs, d) = q8(c.w, &model::arch::qwen35moe::names::token_embd())?;"),
+               ("crates/gpu/src/arch/qwen3moe/plan38.rs",
+                "pub(super) fn dense_shape(w: &Weights, name: &str, rows: usize, k: usize)"),
+               ("crates/gpu/src/q38.rs", "pub fn of_weight(dw: &'a DevWeight) -> Option<Self>"),
                ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "qwen3": (("crates/gpu/src/arch/qwen3moe/body.rs", "g.q_ty = dense_site(w, &g.attn_q, q, h)?;"),
               ("crates/gpu/src/head.rs", "fn head_out_w(w: &Weights)"),
@@ -1758,6 +1759,10 @@ def self_test():
         check("the mirror equals the router, reader and decide-row sources", not diffs, "; ".join(diffs))
     except SourceError as e:
         check("the mirror equals the router, reader and decide-row sources", False, f"a source cannot be parsed: {e}")
+
+    check("BF16 is a dense family in the card table",
+          lambda: src_site_names(Src(SITE_RS, read_source(SITE_RS)),
+                                 Src(QTYPE_RS, read_source(QTYPE_RS))).get("Bf16") == "BF16")
 
     def doctored(path, old, new):
         def read(p):

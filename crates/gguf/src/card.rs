@@ -64,14 +64,11 @@
 //!   `grouped_tiles` and `q4k_gemv_tiles` in `crates/gpu/src/q4k_sel.rs`) run
 //!   the Q4_K and Q5_K stacks the `_sel` entries already name and add no type.
 //!
-//! BF16 and a dense site. A BF16 file tensor loads on a card as f32 values
-//! decoded at load ([`CardFormat::Bf16AsF32`],
-//! `crates/gpu/src/weights.rs`) and is then an F32 weight, but
-//! `site::file_site` names a site by the file's own type and has no BF16 arm,
-//! so BF16 has no [`Card::dense`] entry. Qwen3.8's indexer projections are where a BF16
-//! tensor runs as a dense projection: `program38.rs` and `wide38.rs` in
-//! `crates/gpu/src/arch/qwen3moe` call the f32 gemv and tile on the decoded
-//! weight directly, outside `site.rs`.
+//! BF16 matrices a program's dense site, head or embedding lookup reads load
+//! in their words ([`CardFormat::Bf16Raw`]), selected per tensor by
+//! `placement::ModelTensors::card_format`. These entries widen values to f32
+//! as they read them. Other BF16 tensors decode to f32 at load
+//! ([`CardFormat::Bf16AsF32`]).
 
 use crate::qtype::{OWN_ROWS, QROWS, QRow};
 use crate::quant::GgmlType;
@@ -245,6 +242,9 @@ pub enum SiteEntry {
     /// `fp8_b128_gemv_mcol`; wide, `fp8_b128_tile_gemm`) over bloomery's
     /// FP8_B128 planes (`GgmlType::FP8_B128`) and the f32 rows.
     Fp8B128,
+    /// `Q8F32Kernels::enqueue_bf16_gemv` over BF16 words and f32 rows;
+    /// wide, `Q8F32Kernels::enqueue_bf16_tile` over the same words and rows.
+    Bf16,
 }
 
 /// The activation a dense site's launch reads; `crates/gpu/src/site.rs`
@@ -276,7 +276,7 @@ impl SiteEntry {
             SiteEntry::F32 => SiteAct::F32,
             SiteEntry::Q5_0 => SiteAct::Q8Blocks32,
             SiteEntry::Nvfp4 => SiteAct::Q8x128,
-            SiteEntry::Mxfp8 | SiteEntry::Fp8B128 => SiteAct::F32,
+            SiteEntry::Mxfp8 | SiteEntry::Fp8B128 | SiteEntry::Bf16 => SiteAct::F32,
         }
     }
 
@@ -290,7 +290,7 @@ impl SiteEntry {
 }
 
 /// One past the last [`SiteEntry`]: the span [`DENSE_TYPE`] covers.
-const DENSE_SPAN: usize = SiteEntry::Fp8B128 as usize + 1;
+const DENSE_SPAN: usize = SiteEntry::Bf16 as usize + 1;
 
 /// Dense entry to the file type of the row that names it. The build refuses
 /// an entry two rows name, an entry no row names, and an entry past
@@ -335,6 +335,9 @@ pub enum HeadEntry {
     /// `Q8F32Kernels::enqueue_q8_0_gemv` over the q8f32 planes and the normed
     /// f32 rows, then `argmax_finite_fault`.
     Q8_0,
+    /// `Q8F32Kernels::enqueue_bf16_gemv` over BF16 words and normed f32 rows,
+    /// then `argmax_finite_fault`.
+    Bf16,
 }
 
 /// A card embedding row lookup: the rows of the ids dequantized token-major,
@@ -356,6 +359,8 @@ pub enum EmbedEntry {
     /// `Q38Kernels::enqueue_embed_rows` (`embed_rows_q8_0`, the q8f32 planes)
     /// in `crates/gpu/src/q38.rs`.
     Q8_0,
+    /// `Q38Kernels::enqueue_embed_rows` (`embed_rows_bf16`) over BF16 words.
+    Bf16,
 }
 
 impl DownEntry {
@@ -519,9 +524,8 @@ pub enum CardFormat {
     /// bf16 as the file stores it, two values to a little-endian u32 word
     /// (value `2j` in the low half of word `j`), for a kernel that widens on
     /// the card. No file type loads in it by [`CardFormat::of`]: a reader
-    /// picks it for its own tensors (the DSpark draft's Markov weights and
-    /// the target embedding rows it reads), and uploads it itself; the GPU
-    /// loader's `Weights` refuses it.
+    /// picks it for its own tensors, including dense sites, the head and
+    /// embedding rows (`placement::ModelTensors::card_format`).
     Bf16Raw,
 }
 

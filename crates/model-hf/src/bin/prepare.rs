@@ -8,7 +8,10 @@
 //!
 //! writes `<out prefix>-00001-of-0000N.gguf` and on, each shard at most `n` GiB (48 by default)
 //! unless one tensor with its scale and file layout is larger, the metadata in the first.
-//! `--keep-bf16` writes a BF16 matrix the map would make Q8_0 as it is stored. Each shard is
+//! `--keep-bf16` writes a BF16 matrix the map would make Q8_0 as it is stored, the head and the
+//! token embedding among them; the server reads each through its BF16 site. Qwen3.8's decode then
+//! reads about 9.27 GiB of weights a token where the Q8_0 split reads 5.73, the head alone 0.55
+//! GiB more (1,271,398,400 bytes of BF16 against 34 bytes a 32 values). Each shard is
 //! written as `<name>.part` and renamed when whole. The disk must hold the split and a tenth
 //! more. The written split is opened and its hyperparameters read as the server reads them.
 //! One line per tensor, a summary line, and exit status 1 with the error on any failure. Before

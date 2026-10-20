@@ -1336,6 +1336,7 @@ pub(super) mod tests {
             layers: 1,
             experts: 0,
             experts_used: 0,
+            bf16_words: |_| false,
         };
         let machine = workstation::placed_with_arena(workstation::A6000, 1, 0);
         let mut card = machine.whole_card().expect("one card");

@@ -754,6 +754,7 @@ impl NextnInputs {
                 layers: 1,
                 experts: inputs.model.experts,
                 experts_used: inputs.model.experts_used,
+                bf16_words: |_| false,
             },
             machine: nextn_machine(),
             kv: NextnKv {
@@ -1519,6 +1520,7 @@ mod tests {
                 layers: n,
                 experts: 288,
                 experts_used: 8,
+                bf16_words: |_| false,
             }
         }
 

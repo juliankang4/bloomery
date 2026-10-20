@@ -36,6 +36,7 @@ gate-gemma-embedding-meta	family	gemma-embedding	meta	arch_registry
 gate-gemma-embedding2-meta	family	gemma-embedding2	meta	arch_registry
 gate-glm5next-hf-map	family	glm5next	meta	refset_readers
 gate-glm5next-meta	family	glm5next	meta	arch_registry
+gate-gpu-bf16	common		kernel	quant_q8+quant_gemm+weights_load+head_sample
 gate-gpu-block	tooling		harness	-
 gate-gpu-cand	common		kernel	moe_route
 gate-gpu-clef-hidden	family	qwen35	e2e	attn_linear_gdn_kda+attn_gqa

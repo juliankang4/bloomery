@@ -73,7 +73,7 @@ use crate::mamba2::{Mamba2Kernels, Mamba2PassScratch, PassScan};
 use crate::model::GpuModel;
 use crate::model::fit::{FIT_RESERVE, act_col_bytes, act32_col_bytes, largest_fit, route_bytes};
 use crate::mxfp4_sel::Nvfp4Stack;
-use crate::q38::EmbedQ8Args;
+use crate::q38::{EmbedArgs, EmbedRows};
 use crate::quant_sel::QuantSelKernels;
 use crate::site::{self, SiteTy};
 use crate::site::{KGemvKernels, SiteWeight, WideActs, WideKernels};
@@ -1457,9 +1457,8 @@ impl Body {
             let pos0 = Window::<u32>::of(&b.words, P_POS * size_of::<u32>(), 1)?;
             self.q38.enqueue_embed_rows(
                 stream,
-                EmbedQ8Args {
-                    qs,
-                    d,
+                EmbedArgs {
+                    table: EmbedRows::Q8_0 { qs, d },
                     ids: &ids_w,
                     pos0: &pos0,
                     first: 0,

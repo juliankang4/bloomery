@@ -585,6 +585,7 @@ mod gate {
                 layers: 1,
                 experts: EXPERTS as u64,
                 experts_used: 2,
+                bf16_words: |_| false,
             };
             let list = |ids: &[u32]| ExpertList::new(ids.to_vec(), EXPERTS as u64);
             let rows = model

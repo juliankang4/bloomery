@@ -27,12 +27,12 @@
 //! 5. refuse: a shape no instance serves (3 streams; rank 256), a hidden
 //!    width off the 256 grid, 0 and 9 columns, the up's planes in the down's
 //!    place, an inject of the wrong width and a file type other than F32 /
-//!    Q8_0, each refused by name.
+//!    Q8_0 or BF16, each refused by name.
 //! 6. fault: a NaN in one stream of one column raises the site
 //!    (`hc_gated::SITE`, unlabelled) and leaves the other column bit for bit
 //!    the clean launch's, the NaN column's `mixed` all NaN; an infinity in
 //!    the combine's `y` raises it too; clean launches raise nothing.
-//! 7. shape: the eight entries compile with no local depot.
+//! 7. shape: the ten entries compile with no local depot.
 //! 8. wide: the wide arm (`HcWideKernels`, a ubatch's mix over any column
 //!    count): its norm and combine the capped entries' bits at three
 //!    columns, the combine alone the rule; over 37 columns its glue — the
@@ -46,6 +46,12 @@
 //!    38 columns on a 37-column scratch refused by name, and — before any
 //!    launch, the streams as they went in — planes of another shape and a
 //!    one-expert table filled for fewer slots than the mix's columns.
+//!
+//! A BF16 site (down and up in their words, `HcMatrix::Bf16`, values on
+//! the Q8_0 site's ranges) runs clauses 1, 2, 3 and 8 again: its down and
+//! up rows dotted in `card::f32_dot`'s order over the widened values, the
+//! dense gemv beside them `bf16_gemv`, and its wide arm the BF16 tile with
+//! no quantizer, so a NaN raises the mix's site alone.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -56,7 +62,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmKernels, GemmRoute};
     use bloomery_gpu::hc_gated::{
-        Before, HcGatedKernels, HcScratch, HcWideKernels, HcWideScratch, MixArgs, SITE,
+        Before, HcGatedKernels, HcMatrix, HcScratch, HcWideKernels, HcWideScratch, MixArgs, SITE,
         SiteWeights, WideMixArgs, check_types,
     };
     use bloomery_gpu::linear::{sigmoid, silu};
@@ -121,25 +127,68 @@ mod gate {
         (qs, d, deq)
     }
 
+    /// `n` BF16 values uniform on `±scale`, in their words (value `2j` the
+    /// low half of word `j`) and widened on the host (exact).
+    fn bf16_rows(n: usize, scale: f64, seed: u64) -> (Vec<u32>, Vec<f32>) {
+        let mut rng = Rng(seed);
+        let vals: Vec<f32> = (0..n)
+            .map(|_| {
+                let u = (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
+                let v = ((2.0 * u - 1.0) * scale) as f32;
+                f32::from_bits(v.to_bits() & 0xFFFF_0000)
+            })
+            .collect();
+        let words = vals
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[lo, hi]| (lo.to_bits() >> 16) | (hi.to_bits() & 0xFFFF_0000))
+            .collect();
+        (words, vals)
+    }
+
+    /// A site's down and up on the card, each with the down's view as `R·S`
+    /// rows of `D` (the dense gemv's): Q8_0 planes, or BF16 words.
+    enum Planes {
+        Q8_0 {
+            down_qs: DeviceTensor<u32>,
+            down_d: DeviceTensor<u16>,
+            up_qs: DeviceTensor<u32>,
+            up_d: DeviceTensor<u16>,
+            view_qs: DeviceTensor<u32>,
+            view_d: DeviceTensor<u16>,
+        },
+        Bf16 {
+            down: DeviceTensor<u32>,
+            up: DeviceTensor<u32>,
+            view: DeviceTensor<u32>,
+        },
+    }
+
     /// One site's weights, on the card and dequantized on the host.
     struct Site {
+        /// A down or up row's dot in the card's lane order: `card::q8_dot`
+        /// for Q8_0, `card::f32_dot` for BF16.
+        dot: fn(&[f32], &[f32]) -> f32,
         gamma: Vec<f32>,
         down: Vec<f32>,
         up: Vec<f32>,
         inject: Vec<f32>,
         gamma_d: DeviceBuffer<f32>,
-        down_qs: DeviceTensor<u32>,
-        down_d: DeviceTensor<u16>,
-        up_qs: DeviceTensor<u32>,
-        up_d: DeviceTensor<u16>,
+        planes: Planes,
         inject_d: DeviceTensor<f32>,
-        /// The down's planes as `R·S` rows of `D`: the q8f32 gemv's view.
-        view_qs: DeviceTensor<u32>,
-        view_d: DeviceTensor<u16>,
     }
 
     impl Site {
-        fn new(gpu: &Gpu, seed: u64) -> Result<Site, GateError> {
+        /// The norm's gain and the inject rows from `seed`, with `planes`
+        /// and their host rows.
+        fn with(
+            gpu: &Gpu,
+            seed: u64,
+            dot: fn(&[f32], &[f32]) -> f32,
+            planes: Planes,
+            (down, up): (Vec<f32>, Vec<f32>),
+        ) -> Result<Site, GateError> {
             let st = gpu.stream();
             let gamma: Vec<f32> = activations(WIDE, 1, seed as u32)
                 .iter()
@@ -149,19 +198,11 @@ mod gate {
                 .iter()
                 .map(|v| v / 64.0)
                 .collect();
-            // Down scales in [2^-12, 2^-11), up scales in [2^-8, 2^-7): the
-            // bottleneck and the gate both move off their flat ends.
-            let (dq, dd, down) = q8_rows(R, WIDE, 3, seed ^ 0xd0d0);
-            let (uq, ud, up) = q8_rows(WIDE, R, 7, seed ^ 0x0909);
             Ok(Site {
+                dot,
                 gamma_d: DeviceBuffer::from_host(st, &gamma)?,
-                down_qs: DeviceTensor::upload(st, &dq, R, WIDE / 4)?,
-                down_d: DeviceTensor::upload(st, &dd, R, WIDE / 32)?,
-                up_qs: DeviceTensor::upload(st, &uq, WIDE, R / 4)?,
-                up_d: DeviceTensor::upload(st, &ud, WIDE, R / 32)?,
+                planes,
                 inject_d: DeviceTensor::upload(st, &inject, S, WIDE)?,
-                view_qs: DeviceTensor::upload(st, &dq, R * S, D / 4)?,
-                view_d: DeviceTensor::upload(st, &dd, R * S, D / 32)?,
                 gamma,
                 down,
                 up,
@@ -169,14 +210,109 @@ mod gate {
             })
         }
 
+        fn new(gpu: &Gpu, seed: u64) -> Result<Site, GateError> {
+            let st = gpu.stream();
+            // Down scales in [2^-12, 2^-11), up scales in [2^-8, 2^-7): the
+            // bottleneck and the gate both move off their flat ends.
+            let (dq, dd, down) = q8_rows(R, WIDE, 3, seed ^ 0xd0d0);
+            let (uq, ud, up) = q8_rows(WIDE, R, 7, seed ^ 0x0909);
+            let planes = Planes::Q8_0 {
+                down_qs: DeviceTensor::upload(st, &dq, R, WIDE / 4)?,
+                down_d: DeviceTensor::upload(st, &dd, R, WIDE / 32)?,
+                up_qs: DeviceTensor::upload(st, &uq, WIDE, R / 4)?,
+                up_d: DeviceTensor::upload(st, &ud, WIDE, R / 32)?,
+                view_qs: DeviceTensor::upload(st, &dq, R * S, D / 4)?,
+                view_d: DeviceTensor::upload(st, &dd, R * S, D / 32)?,
+            };
+            Site::with(gpu, seed, card::q8_dot, planes, (down, up))
+        }
+
+        /// The BF16 site: down values on `±2^-4` and up values on `±1`,
+        /// the Q8_0 site's ranges.
+        fn new_bf16(gpu: &Gpu, seed: u64) -> Result<Site, GateError> {
+            let st = gpu.stream();
+            let (dw, down) = bf16_rows(R * WIDE, 1.0 / 16.0, seed ^ 0xd0d0);
+            let (uw, up) = bf16_rows(WIDE * R, 1.0, seed ^ 0x0909);
+            let planes = Planes::Bf16 {
+                down: DeviceTensor::upload(st, &dw, R, WIDE / 2)?,
+                up: DeviceTensor::upload(st, &uw, WIDE, R / 2)?,
+                view: DeviceTensor::upload(st, &dw, R * S, D / 2)?,
+            };
+            Site::with(gpu, seed, card::f32_dot, planes, (down, up))
+        }
+
         fn weights(&self, inject: bool) -> SiteWeights<'_> {
+            let (down, up) = match &self.planes {
+                Planes::Q8_0 {
+                    down_qs,
+                    down_d,
+                    up_qs,
+                    up_d,
+                    ..
+                } => (
+                    HcMatrix::Q8_0 {
+                        qs: down_qs,
+                        d: down_d,
+                    },
+                    HcMatrix::Q8_0 { qs: up_qs, d: up_d },
+                ),
+                Planes::Bf16 { down, up, .. } => (HcMatrix::Bf16(down), HcMatrix::Bf16(up)),
+            };
             SiteWeights {
                 gamma: &self.gamma_d,
-                down_qs: &self.down_qs,
-                down_d: &self.down_d,
-                up_qs: &self.up_qs,
-                up_d: &self.up_d,
+                down,
+                up,
                 inject: inject.then_some(&self.inject_d),
+            }
+        }
+
+        /// The dense gemv of the down's view (`view`) or the up rows against
+        /// `m` columns of `x`, row-major: `q8_0_gemv_mcol` or `bf16_gemv`.
+        fn gemv(
+            &self,
+            c: &Ctx,
+            view: bool,
+            x: &DeviceBuffer<f32>,
+            m: usize,
+            y: &mut DeviceBuffer<f32>,
+        ) -> Result<(), GpuError> {
+            let st = c.gpu.stream();
+            match &self.planes {
+                Planes::Q8_0 {
+                    up_qs,
+                    up_d,
+                    view_qs,
+                    view_d,
+                    ..
+                } => {
+                    let (qs, d) = if view {
+                        (view_qs, view_d)
+                    } else {
+                        (up_qs, up_d)
+                    };
+                    c.q8.enqueue_q8_0_gemv_mcol(
+                        st,
+                        Q8_0GemvMcolArgs {
+                            qs,
+                            d,
+                            x,
+                            m,
+                            out: GemvOut::RowMajor,
+                            y,
+                        },
+                    )
+                }
+                Planes::Bf16 { up, view: v_w, .. } => {
+                    c.q8.enqueue_bf16_gemv(st, if view { v_w } else { up }, x, m, y)
+                }
+            }
+        }
+
+        /// The gemv [`Site::gemv`] runs, as the clauses name it.
+        fn gemv_name(&self) -> &'static str {
+            match self.planes {
+                Planes::Q8_0 { .. } => "q8_0_gemv_mcol",
+                Planes::Bf16 { .. } => "bf16_gemv",
             }
         }
 
@@ -299,10 +435,18 @@ mod gate {
         ok &= check_refuse(&mut c, &site)?;
         ok &= check_fault(&mut c, &site)?;
         ok &= check_wide(&mut c, &site)?;
+        let bf16 = Site::new_bf16(&c.gpu, 0x38c0_0002)?;
+        println!("site=bf16");
+        ok &= check_band(&mut c, &bf16)?;
+        ok &= check_stages(&mut c, &bf16)?;
+        ok &= check_cols(&mut c, &bf16)?;
+        ok &= check_wide(&mut c, &bf16)?;
         ok &= no_local_depot(&[
             "hc_gated_norm_4",
             "hc_gated_down_4x320",
             "hc_gated_up_mix_4x320",
+            "hc_gated_down_bf16_4x320",
+            "hc_gated_up_mix_bf16_4x320",
             "hc_gated_combine_4",
             "hc_gated_norm_4w",
             "hc_gated_combine_4w",
@@ -320,7 +464,8 @@ mod gate {
              columns, planes and types refused by name; a NaN stream raises the site and \
              leaves the other column clean; the wide arm's norm and combine the capped \
              entries' bits, its glue the card rule, its mix within the error model's bands, \
-             each column its own, a NaN raised; no local depot"
+             each column its own, a NaN raised; a BF16 site the same over its widened \
+             values; no local depot"
         );
         Ok(())
     }
@@ -395,7 +540,8 @@ mod gate {
         let geo = c.geo;
         let xn = per_col(&|k| card::norm(geo, col(&res, WIDE, k), &site.gamma, EPS));
         line("xn", &o.xn, &xn);
-        let dp = per_col(&|k| card::down_parts(geo, &site.down, col(&o.xn, WIDE, k)));
+        let dot = site.dot;
+        let dp = per_col(&|k| card::down_parts_by(geo, dot, &site.down, col(&o.xn, WIDE, k)));
         line("down_parts", &o.dpart, &dp);
         let lo = per_col(&|k| card::lo(geo, col(&o.dpart, R * S, k), ACT));
         line("lo", &o.lo, &lo);
@@ -403,10 +549,17 @@ mod gate {
         line("inject_parts", &o.ipart, &ip);
         let w = per_col(&|k| card::wgt(geo, col(&o.ipart, S * S, k), ACT));
         line("wgt", &o.wgt, &w);
-        let mx =
-            per_col(&|k| card::up_mix(geo, &site.up, col(&o.lo, R, k), col(&o.xn, WIDE, k), ACT));
+        let mx = per_col(&|k| {
+            card::up_mix_by(
+                geo,
+                dot,
+                (&site.up, col(&o.lo, R, k)),
+                col(&o.xn, WIDE, k),
+                ACT,
+            )
+        });
         line("mixed", &o.mixed, &mx);
-        // The down partials through the q8f32 gemv on the view: stream s's
+        // The down partials through the dense gemv on the view: stream s's
         // columns against every view row, rows j·S + s kept.
         let st = c.gpu.stream();
         let mut gemv = vec![0.0f32; m * R * S];
@@ -416,17 +569,7 @@ mod gate {
                 .collect();
             let x_d = DeviceBuffer::from_host(st, &x)?;
             let mut y_d = DeviceBuffer::from_host(st, &vec![0.0f32; R * S * m])?;
-            c.q8.enqueue_q8_0_gemv_mcol(
-                st,
-                Q8_0GemvMcolArgs {
-                    qs: &site.view_qs,
-                    d: &site.view_d,
-                    x: &x_d,
-                    m,
-                    out: GemvOut::RowMajor,
-                    y: &mut y_d,
-                },
-            )?;
+            site.gemv(c, true, &x_d, m, &mut y_d)?;
             let y = y_d.to_host_vec(st)?;
             for k in 0..m {
                 for j in 0..R {
@@ -434,22 +577,16 @@ mod gate {
                 }
             }
         }
-        line("down_parts_vs_q8_0_gemv_mcol", &o.dpart, &gemv);
-        // The up rows through the q8f32 gemv on the card's `lo`, then the gate
+        line(
+            &format!("down_parts_vs_{}", site.gemv_name()),
+            &o.dpart,
+            &gemv,
+        );
+        // The up rows through the dense gemv on the card's `lo`, then the gate
         // and the mean on the host over the card's `xn`.
         let lo_d = DeviceBuffer::from_host(st, &o.lo)?;
         let mut g_d = DeviceBuffer::from_host(st, &vec![0.0f32; WIDE * m])?;
-        c.q8.enqueue_q8_0_gemv_mcol(
-            st,
-            Q8_0GemvMcolArgs {
-                qs: &site.up_qs,
-                d: &site.up_d,
-                x: &lo_d,
-                m,
-                out: GemvOut::RowMajor,
-                y: &mut g_d,
-            },
-        )?;
+        site.gemv(c, false, &lo_d, m, &mut g_d)?;
         let g = g_d.to_host_vec(st)?;
         let mut mx = vec![0.0f32; m * D];
         for k in 0..m {
@@ -467,13 +604,13 @@ mod gate {
                 mx[k * D + i] = acc * (1.0 / S as f32);
             }
         }
-        line("mixed_vs_q8_0_gemv_mcol", &o.mixed, &mx);
+        line(&format!("mixed_vs_{}", site.gemv_name()), &o.mixed, &mx);
         // The head after the site: no inject, its own stages, the site's
         // weights left in the scratch for the next combine.
         let head_res = activations(WIDE, 1, 0x57a7);
         let h = mix(c, site, false, &head_res, Pre::Plain, 1)?;
         let hx = card::norm(geo, &head_res, &site.gamma, EPS);
-        let hmx = card::up_mix(geo, &site.up, &h.lo, &h.xn, ACT);
+        let hmx = card::up_mix_by(geo, dot, (&site.up, &h.lo), &h.xn, ACT);
         let (p_x, p_m) = (bits_equal(&h.xn, &hx), bits_equal(&h.mixed, &hmx));
         let kept = bits_equal(&h.wgt, &o.wgt[..S]);
         let pass = p_x && p_m && kept && h.fault.is_none();
@@ -631,8 +768,7 @@ mod gate {
         let mut res_d = DeviceBuffer::from_host(st, &vec![0.0f32; WIDE])?;
         let mut mixed_d = DeviceBuffer::from_host(st, &vec![0.0f32; D])?;
         let mut w = site.weights(true);
-        w.down_qs = &site.up_qs;
-        w.down_d = &site.up_d;
+        w.down = w.up;
         let e = c.hc.enqueue_mix(
             st,
             MixArgs {
@@ -690,10 +826,11 @@ mod gate {
             e.err().map(|e| e.to_string()),
             "hc inject is F16",
         );
-        let clean = check_types(GgmlType::F32, GgmlType::Q8_0, GgmlType::Q8_0, None).is_ok();
+        let clean = check_types(GgmlType::F32, GgmlType::Q8_0, GgmlType::Q8_0, None).is_ok()
+            && check_types(GgmlType::F32, GgmlType::BF16, GgmlType::BF16, None).is_ok();
         ok &= clean;
         println!(
-            "refuse[file_types] f32/q8_0/q8_0 accepted={clean} {}",
+            "refuse[file_types] f32/q8_0/q8_0 and f32/bf16/bf16 accepted={clean} {}",
             verdict(clean)
         );
         let f = c.gpu.take_fault()?;
@@ -832,6 +969,7 @@ mod gate {
                 fault: c.gpu.unlabelled_sink(),
                 scratch: &mut w.scratch,
                 gemm: &w.g32,
+                q8f32: &c.q8,
                 dense: &w.route,
                 mixed: &mut mixed_d,
             },
@@ -878,6 +1016,7 @@ mod gate {
                 fault: c.gpu.unlabelled_sink(),
                 scratch: &mut w.scratch,
                 gemm: &w.g32,
+                q8f32: &c.q8,
                 dense: &w.route,
                 mixed: &mut mixed_d,
             },
@@ -1078,7 +1217,11 @@ mod gate {
         let mut bad = res.clone();
         bad[2 * WIDE + D + 11] = f32::NAN;
         let o2 = wide_mix(c, &mut w, site, true, &bad, Pre::Plain, m)?;
-        let want = Some(Fault::of_sites(LAYER_NONE, &[FaultSite::QuantColumn, SITE]));
+        let want = Some(match site.planes {
+            Planes::Q8_0 { .. } => Fault::of_sites(LAYER_NONE, &[FaultSite::QuantColumn, SITE]),
+            // A BF16 down and up read the f32 rows: no quantizer runs.
+            Planes::Bf16 { .. } => Fault::of_sites(LAYER_NONE, &[SITE]),
+        });
         let others = (0..m).filter(|&k| k != 2).all(|k| {
             bits_equal(col(&o2.mixed, D, k), col(&o.mixed, D, k))
                 && bits_equal(col(&o2.wgt, S, k), col(&o.wgt, S, k))
@@ -1114,10 +1257,8 @@ mod gate {
         let m = 5;
         let sw = site.weights(true);
         let swapped = SiteWeights {
-            down_qs: sw.up_qs,
-            down_d: sw.up_d,
-            up_qs: sw.down_qs,
-            up_d: sw.down_d,
+            down: sw.up,
+            up: sw.down,
             ..sw
         };
         let cases = [

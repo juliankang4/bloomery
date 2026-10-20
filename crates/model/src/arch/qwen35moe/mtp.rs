@@ -160,12 +160,12 @@ pub fn mtp_of(
     layer_tensors(draft, index)?;
     let borrows = borrows(draft)?;
     let (hidden_u, vocab_u) = (u64::from(spec.hidden), u64::from(spec.vocab));
-    // The types as well as the shape: the embedding runs as Q8_0 planes, the
-    // head as Q8_0 planes or Q6_K rows (`gpu::q6k_ids`), where ik checks the
-    // shape alone and clones any type it has kernels for.
+    // The types as well as the shape: the embedding runs as Q8_0 planes or
+    // BF16 words, the head as those or Q6_K rows (`gpu::q6k_ids`), where ik
+    // checks the shape alone and clones any type it has kernels for.
     for (name, borrowed, kinds) in [
-        (EMBEDDING, borrows.embedding, "Q8_0"),
-        (HEAD, borrows.head, "Q8_0 or Q6_K"),
+        (EMBEDDING, borrows.embedding, "Q8_0 or BF16"),
+        (HEAD, borrows.head, "Q8_0, Q6_K or BF16"),
     ] {
         let (file, whose) = if borrowed {
             (target, "the target's")
@@ -175,7 +175,8 @@ pub fn mtp_of(
         let found = file.find(name).map(|(_, t)| t);
         let ok = |t: &TensorInfo| {
             t.dims == [hidden_u, vocab_u]
-                && (t.ty == GgmlType::Q8_0 || (name == HEAD && t.ty == GgmlType::Q6_K))
+                && (matches!(t.ty, GgmlType::Q8_0 | GgmlType::BF16)
+                    || (name == HEAD && t.ty == GgmlType::Q6_K))
         };
         if !found.is_some_and(ok) {
             return Err(PlacementError::Tensor {
@@ -437,12 +438,14 @@ pub fn target_usable(target: &Split, checkpoint: Option<&str>) -> Result<(), Pla
 }
 
 /// The borrowed `output.weight`'s form, as [`mtp_of`] admitted it: Q8_0
-/// planes, or the Q6_K rows the card head's quantizer feeds
-/// (`bloomery_gpu::q6k_ids`).
+/// planes, the Q6_K rows the card head's quantizer feeds
+/// (`bloomery_gpu::q6k_ids`), or BF16 words (a target the load keeps in
+/// them, `ModelTensors::bf16_words`), which read the f32 rows as Q8_0 does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BorrowedHead {
     Q8_0,
     Q6K,
+    Bf16,
 }
 
 /// The head [`mtp_of`] admitted for the `target`'s `output.weight`: the form
@@ -456,8 +459,8 @@ pub fn head_kind(target: &Split, hidden: u32, vocab: u32) -> Result<BorrowedHead
         .ok_or_else(|| PlacementError::Tensor {
             name: HEAD.to_string(),
             detail: format!(
-                "is absent in the target file; the MTP layer reads a Q8_0 or Q6_K [{hidden}, \
-                 {vocab}] matrix"
+                "is absent in the target file; the MTP layer reads a Q8_0, Q6_K or BF16 \
+                 [{hidden}, {vocab}] matrix"
             ),
         })?;
     match output_form(found.ty) {
@@ -465,8 +468,8 @@ pub fn head_kind(target: &Split, hidden: u32, vocab: u32) -> Result<BorrowedHead
         _ => Err(PlacementError::Tensor {
             name: HEAD.to_string(),
             detail: format!(
-                "is {} {:?} in the target file; the MTP layer reads a Q8_0 or Q6_K [{hidden}, \
-                 {vocab}] matrix",
+                "is {} {:?} in the target file; the MTP layer reads a Q8_0, Q6_K or BF16 \
+                 [{hidden}, {vocab}] matrix",
                 found.ty, found.dims
             ),
         }),
@@ -483,6 +486,7 @@ pub fn output_form(ty: GgmlType) -> Option<BorrowedHead> {
     match ty {
         GgmlType::Q8_0 => Some(BorrowedHead::Q8_0),
         GgmlType::Q6_K => Some(BorrowedHead::Q6K),
+        GgmlType::BF16 => Some(BorrowedHead::Bf16),
         _ => None,
     }
 }
@@ -1362,8 +1366,40 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The embedding stays Q8_0 whatever the head: a Q6_K `token_embd` is
-    /// refused by name.
+    /// A target whose load keeps its BF16 head and embedding in their words
+    /// (`prepare --keep-bf16`) is admitted with both borrowed, and
+    /// `head_kind` records the BF16 form the draft's head reads.
+    #[test]
+    fn a_bf16_target_head_and_embedding_are_admitted() {
+        let mut c = Case::wide();
+        for t in &mut c.target {
+            if t.0 == HEAD || t.0 == EMBEDDING {
+                t.2 = Ty::Bf16;
+            }
+        }
+        let m = c.read("mtp-t-bf16").expect("the draft reads");
+        assert_eq!(
+            borrows_of(&m),
+            Borrows {
+                embedding: true,
+                head: true
+            }
+        );
+        let mut tk = keys();
+        tk.iter_mut().for_each(|(k, v)| {
+            if *k == "embedding_length" {
+                *v = V::U32(256);
+            }
+        });
+        let path = header_typed("mtp-hk-bf16", "qwen4exp", &tk, &tokens(), &c.target);
+        let target = gguf::Split::open(&path).expect("the synthetic target opens");
+        let got = head_kind(&target, 256, 2).expect("the target's head reads");
+        assert_eq!(got, BorrowedHead::Bf16);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The embedding reads Q8_0 or BF16 whatever the head: a Q6_K
+    /// `token_embd` is refused by name.
     #[test]
     fn a_q6_k_token_embd_is_still_refused() {
         let mut c = Case::wide();

@@ -69,7 +69,9 @@ use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::{FlashGqaKernels, GqaSelArgs};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
-use crate::hc_gated::{Before, HcGatedKernels, HcScratch, HcWideKernels, MixArgs, SiteWeights};
+use crate::hc_gated::{
+    Before, HcGatedKernels, HcMatrix, HcScratch, HcWideKernels, MixArgs, SiteWeights,
+};
 use crate::head::Head;
 use crate::host::handoff::{Handoff, HandoffKernels, Places};
 use crate::host::run::HostRun;
@@ -81,14 +83,14 @@ use crate::linear::{self, LinearKernels};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::MtpKernels;
 use crate::ple::{PleConvArgs, PleGateArgs, PleKernels};
-use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::q38::{
-    CardSharedAddArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs,
+    CardSharedAddArgs, EmbedArgs, EmbedRows, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs,
 };
 use crate::qsa::{PoolArgs, QsaKernels, QsaScratch, SelectArgs};
 use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
+use crate::site;
 use crate::tensor::{DeviceTensor, Window, WindowMut};
-use crate::weights::Weights;
+use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
@@ -127,7 +129,7 @@ pub(super) const HEAD_LAUNCHES: usize = 3 + 2;
 /// The head's launches in a captured walk for its borrowed form — the one
 /// owner of the form is `model::arch::qwen35moe::mtp` (`head_kind`, its
 /// `output_form` the borrow check asks): [`HEAD_LAUNCHES`] for the Q8_0
-/// planes, whose projection reads the normed f32 rows; a Q6_K word plane's
+/// planes and the BF16 words, whose projections read the normed f32 rows; a Q6_K word plane's
 /// walk quantizes its input rows to q8_1 first, one launch more
 /// (`Head::enqueue`'s `enqueue_quantize_q8_1_head`).
 fn head_launches(head: model::arch::qwen35moe::mtp::BorrowedHead) -> usize {
@@ -256,14 +258,6 @@ impl Kernels38 {
     }
 }
 
-/// The resident Q8_0 planes of `name`, as this walk's errors name them.
-pub(super) fn q8<'w>(
-    w: &'w Weights,
-    name: &str,
-) -> Result<(&'w DeviceTensor<u32>, &'w DeviceTensor<u16>), GpuError> {
-    w.q8_planes(WHAT, name)
-}
-
 /// What every launch of a walk reads besides the arena and the stores: the
 /// engine, the weights, the kernels, the norms' epsilon, the rope table and
 /// the stores' positions.
@@ -277,35 +271,22 @@ pub(super) struct Ctx38<'a> {
 }
 
 impl Ctx38<'_> {
-    /// `y = W · x` for the Q8_0 weight `name` over `m` columns, token-major.
-    pub(super) fn q8_gemv(
+    /// `y = W · x` for the Q8_0 or BF16 weight `name` (its resident form,
+    /// `plan38::plans` checks which) over `m` columns, token-major: the
+    /// common dense site (`site::resident_gemv_cols`).
+    pub(super) fn dense_gemv(
         &self,
         name: &str,
         x: &DeviceBuffer<f32>,
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let (qs, d) = q8(self.w, name)?;
-        let (q, stream) = (self.gpu.q8f32(), self.gpu.stream());
-        if m == 1 {
-            q.enqueue_q8_0_gemv(stream, qs, d, x, 1, y)
-        } else {
-            q.enqueue_q8_0_gemv_mcol(
-                stream,
-                Q8_0GemvMcolArgs {
-                    qs,
-                    d,
-                    x,
-                    m,
-                    out: GemvOut::TokenMajor,
-                    y,
-                },
-            )
-        }
+        site::resident_gemv_cols(self.gpu, &self.k.g32, (self.w, name), x, m, y)
     }
 
-    /// `y = W · x` for the F32 weight `name` over `m` columns, row-major
-    /// (`[rows][m]`).
+    /// `y = W · x` for the F32 or BF16 weight `name` over `m` columns,
+    /// row-major (`[rows][m]`): `f32_gemv`, or `bf16_gemv` bit for bit it
+    /// over the widened values.
     fn f32_gemv(
         &self,
         name: &str,
@@ -313,9 +294,11 @@ impl Ctx38<'_> {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        self.gpu
-            .q8f32()
-            .enqueue_f32_gemv(self.gpu.stream(), f32_tensor(self.w, name)?, x, m, y)
+        let (q, stream) = (self.gpu.q8f32(), self.gpu.stream());
+        match self.w.get(name) {
+            Some(DevWeight::Bf16 { w, .. }) => q.enqueue_bf16_gemv(stream, w, x, m, y),
+            _ => q.enqueue_f32_gemv(stream, f32_tensor(self.w, name)?, x, m, y),
+        }
     }
 
     /// The mix of `site` over `m` columns of `res`, after `before`, into
@@ -335,8 +318,6 @@ impl Ctx38<'_> {
         mixed: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let w = self.w;
-        let (down_qs, down_d) = q8(w, &site.down)?;
-        let (up_qs, up_d) = q8(w, &site.up)?;
         let inject = match &site.inject {
             Some(n) => Some(f32_tensor(w, n)?),
             None => None,
@@ -348,10 +329,8 @@ impl Ctx38<'_> {
                 before,
                 w: SiteWeights {
                     gamma: f32_gain(w, &site.norm)?,
-                    down_qs,
-                    down_d,
-                    up_qs,
-                    up_d,
+                    down: HcMatrix::of(w, WHAT, &site.down)?,
+                    up: HcMatrix::of(w, WHAT, &site.up)?,
                     inject,
                 },
                 eps: self.eps,
@@ -557,8 +536,8 @@ impl Parts38<'_> {
             tap(&mut self.taps, &s.res[self.cur], l - 1, gpu)?;
             let w = c.w;
             let pl = &mut s.ple;
-            c.q8_gemv(&pp.key, &pl.e, m, &mut pl.key)?;
-            c.q8_gemv(&pp.value, &pl.e, m, &mut pl.value)?;
+            c.dense_gemv(&pp.key, &pl.e, m, &mut pl.key)?;
+            c.dense_gemv(&pp.value, &pl.e, m, &mut pl.value)?;
             let x = &s.res[self.cur];
             c.k.ple.enqueue_gate(
                 stream,
@@ -666,12 +645,12 @@ impl Parts38<'_> {
         let (c, m) = (&self.c, self.m);
         let s = &mut *self.s;
         let x = x.unwrap_or(&s.ffn_x);
-        c.q8_gemv(&p.ffn.gate_sh, x, m, &mut s.sh_g)?;
-        c.q8_gemv(&p.ffn.up_sh, x, m, &mut s.sh_u)?;
+        c.dense_gemv(&p.ffn.gate_sh, x, m, &mut s.sh_g)?;
+        c.dense_gemv(&p.ffn.up_sh, x, m, &mut s.sh_u)?;
         c.gpu
             .elem()
             .enqueue_swiglu(c.gpu.stream(), &s.sh_g, &s.sh_u, geo::FF * m, &mut s.sh_h)?;
-        c.q8_gemv(&p.ffn.down_sh, &s.sh_h, m, &mut s.sh_y)
+        c.dense_gemv(&p.ffn.down_sh, &s.sh_h, m, &mut s.sh_y)
     }
 
     /// Layer `l`'s card leg over `x` (`None`: the arena's `ffn_x`), when it
@@ -858,7 +837,11 @@ impl Parts38<'_> {
 /// Each sequence's embedding of its ids into its rows of `s` — `emb`, and
 /// each row's position and live key count — from its own input record.
 fn embed(c: &Ctx38<'_>, seqs: &Seqs38<'_>, s: &mut Arena38) -> Result<(), GpuError> {
-    let (qs, d) = q8(c.w, &model::arch::qwen35moe::names::token_embd())?;
+    let table = EmbedRows::of(
+        c.w,
+        "qwen3moe::program38::embed",
+        &model::arch::qwen35moe::names::token_embd(),
+    )?;
     let (gpu, stream) = (c.gpu, c.gpu.stream());
     let Arena38 {
         emb, pos, n_keys, ..
@@ -866,9 +849,8 @@ fn embed(c: &Ctx38<'_>, seqs: &Seqs38<'_>, s: &mut Arena38) -> Result<(), GpuErr
     match seqs {
         Seqs38::One { io, .. } => c.k.q38.enqueue_embed_rows(
             stream,
-            EmbedQ8Args {
-                qs,
-                d,
+            EmbedArgs {
+                table,
                 ids: io.ids,
                 pos0: io.pos0,
                 first: io.first,
@@ -883,9 +865,8 @@ fn embed(c: &Ctx38<'_>, seqs: &Seqs38<'_>, s: &mut Arena38) -> Result<(), GpuErr
                 let r = &q.rows;
                 c.k.q38.enqueue_embed_rows(
                     stream,
-                    EmbedQ8Args {
-                        qs,
-                        d,
+                    EmbedArgs {
+                        table,
                         ids: q.io.ids,
                         pos0: q.io.pos0,
                         first: q.io.first,
@@ -1060,8 +1041,8 @@ fn gdn_in(c: &Ctx38<'_>, gp: &GdnPlan, s: &mut Arena38, m: usize) -> Result<(), 
     let stream = c.gpu.stream();
     let nv = GDN.n_v;
     let Arena38 { mixed, gdn: g, .. } = s;
-    c.q8_gemv(&gp.qkv, mixed, m, &mut g.x)?;
-    c.q8_gemv(&gp.z, mixed, m, &mut g.z)?;
+    c.dense_gemv(&gp.qkv, mixed, m, &mut g.x)?;
+    c.dense_gemv(&gp.z, mixed, m, &mut g.z)?;
     c.f32_gemv(&gp.beta_alpha, mixed, m, &mut g.ba)?;
     if m > 1 {
         let (wb, wa) = beta_alpha_rows(&g.ba, m)?;
@@ -1183,7 +1164,7 @@ fn gdn_out(
         },
     )?;
     debug_assert_eq!(nv * linear::HEAD, geo::ATTN);
-    c.q8_gemv(&gp.ssm_out, &*attn, m, y)
+    c.dense_gemv(&gp.ssm_out, &*attn, m, y)
 }
 
 /// The rows a selecting layer's indexer keys of one sequence read and
@@ -1321,9 +1302,9 @@ fn qsa(
 /// of `s.mixed`.
 fn qsa_qkv(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
     let Arena38 { mixed, qsa: qa, .. } = s;
-    c.q8_gemv(&qp.q, mixed, m, &mut qa.qg)?;
-    c.q8_gemv(&qp.k, mixed, m, &mut qa.k)?;
-    c.q8_gemv(&qp.v, mixed, m, &mut qa.v)
+    c.dense_gemv(&qp.q, mixed, m, &mut qa.qg)?;
+    c.dense_gemv(&qp.k, mixed, m, &mut qa.k)?;
+    c.dense_gemv(&qp.v, mixed, m, &mut qa.v)
 }
 
 /// A selecting layer's indexer keys of one sequence's `m` rows: their
@@ -1506,7 +1487,7 @@ fn qsa_out(
             y: &mut *attn,
         },
     )?;
-    c.q8_gemv(&qp.out, &*attn, m, y)
+    c.dense_gemv(&qp.out, &*attn, m, y)
 }
 
 /// The captured decode step's walk `(1, 1, Step)`, into `head`.

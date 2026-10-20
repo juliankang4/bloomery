@@ -16,9 +16,8 @@
 //! against the whole tree: a need any program's row covers, and a tensor type
 //! any program's pin reads, is not an item; the program itself is one.
 
-use bloomery_placement::accepts::{BOLT_LEG, qwen3moe_dense};
+use bloomery_placement::accepts::{BOLT_LEG, embed_of_widened, head_of_widened, qwen3moe_dense};
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
-use bloomery_placement::kernels;
 pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
 use gguf::GgmlType;
 use models::shape::{RouterBody, gqa_row, gqa_row_v, select_router};
@@ -914,15 +913,15 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::Attention,
         matrices: true,
         names: Some(|n| !indexer_projection(n)),
-        what: "attention matrices (the body reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "attention matrices (the body reads q8_0 and bf16)",
+        reads: &[GgmlType::Q8_0, GgmlType::BF16],
     },
     TypePin {
         programs: &[Program::Qwen38Body],
         role: Role::Attention,
         matrices: true,
         names: Some(indexer_projection),
-        what: "indexer projections (the body reads bf16 widened to f32)",
+        what: "indexer projections (the body reads bf16)",
         reads: &[GgmlType::BF16],
     },
     TypePin {
@@ -930,32 +929,40 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::HyperConnection,
         matrices: true,
         names: None,
-        what: "hyper-connection down and up (the body reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "hyper-connection down and up (the body reads q8_0 and bf16)",
+        reads: &[GgmlType::Q8_0, GgmlType::BF16],
     },
     TypePin {
         programs: &[Program::Qwen38Body],
         role: Role::SharedExpert,
         matrices: true,
         names: None,
-        what: "shared expert (the body reads q8_0)",
-        reads: &[GgmlType::Q8_0],
+        what: "shared expert (the body reads q8_0 and bf16)",
+        reads: &[GgmlType::Q8_0, GgmlType::BF16],
     },
+    // The qwen4exp load keeps a bf16 head and embedding in their words
+    // (`ModelTensors::bf16_words`), which the head and the embedding rows
+    // read; a body without it would load them as f32, which neither reads.
     TypePin {
         programs: &[Program::Qwen38Body],
         role: Role::Head,
         matrices: true,
         names: None,
-        what: "output head (the head reads q8_0 planes, q6_K or q4_K word planes)",
-        reads: &[GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K],
+        what: "output head (the head reads q8_0 planes, q6_K or q4_K word planes, bf16 words)",
+        reads: &[
+            GgmlType::Q8_0,
+            GgmlType::Q6_K,
+            GgmlType::Q4_K,
+            GgmlType::BF16,
+        ],
     },
     TypePin {
         programs: &[Program::Qwen38Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
-        what: "token embedding (the card reads q8_0 rows)",
-        reads: &[GgmlType::Q8_0],
+        what: "token embedding (the card reads q8_0 or bf16 rows)",
+        reads: &[GgmlType::Q8_0, GgmlType::BF16],
     },
     TypePin {
         programs: &[Program::Mimo2Body],
@@ -1182,8 +1189,8 @@ struct RowPin {
 /// The per-tensor pins whose types are the card kernel table's: the qwen3moe
 /// body's attention sites ([`qwen3moe_dense`]: the table's dense row kept to
 /// the forms that body's arena carries, the fused Q4_K ones among them), head
-/// ([`kernels::head`]: `head.rs`) and token embedding ([`kernels::embed`]:
-/// `elem.rs`) and routed stacks ([`qwen35_gate_up`], [`qwen35_down`]: the FFN
+/// ([`head_of_widened`]: `head.rs`) and token embedding ([`embed_of_widened`]:
+/// `elem.rs`), each the table's row but BF16, and routed stacks ([`qwen35_gate_up`], [`qwen35_down`]: the FFN
 /// dispatch both bodies share), and `Body35`'s FFN ([`qwen35_gate_up`],
 /// [`qwen35_down`], [`qwen35_shared`]),
 /// and the glm5next and mimo2 bodies' token embedding (the host's rows,
@@ -1204,16 +1211,16 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::Head,
         matrices: true,
         names: None,
-        what: "output head (the types kernels::head names)",
-        row: |ty| kernels::head(ty).is_some(),
+        what: "output head (the types head_of_widened names)",
+        row: |ty| head_of_widened(ty).is_some(),
     },
     RowPin {
         program: Program::Qwen3moeBody,
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
-        what: "token embedding (the card's rows: the types kernels::embed names)",
-        row: |ty| kernels::embed(ty).is_some(),
+        what: "token embedding (the card's rows: the types embed_of_widened names)",
+        row: |ty| embed_of_widened(ty).is_some(),
     },
     RowPin {
         program: Program::Glm5nextBody,
@@ -1359,8 +1366,8 @@ fn per_layer_model_proj(name: &str) -> bool {
 }
 
 /// A qwen4exp selector's key or query projection, which `Body38` reads as
-/// bf16 widened to f32 (`plan38::plans`), where it reads every other
-/// attention matrix as q8_0.
+/// bf16 (`plan38::plans`), where it reads every other attention matrix as
+/// q8_0 or bf16.
 fn indexer_projection(name: &str) -> bool {
     name.ends_with(".indexer.k_proj.weight") || name.ends_with(".indexer.q_proj.weight")
 }
@@ -1799,11 +1806,15 @@ mod tests {
                 &none,
             );
         }
-        check(
-            "head q5_K".into(),
-            global("output.weight", Role::Head, GgmlType::Q5_K),
-            &["q5_K output head (the types kernels::head names)".to_string()],
-        );
+        for ty in [GgmlType::Q5_K, GgmlType::BF16] {
+            check(
+                format!("head {ty}"),
+                global("output.weight", Role::Head, ty),
+                &[format!(
+                    "{ty} output head (the types head_of_widened names)"
+                )],
+            );
+        }
         for ty in [
             GgmlType::Q3_K,
             GgmlType::Q4_K,
@@ -1817,11 +1828,15 @@ mod tests {
                 &none,
             );
         }
-        check(
-            "embedding f16".into(),
-            global("token_embd.weight", Role::TokenEmbedding, GgmlType::F16),
-            &["f16 token embedding (the card's rows: the types kernels::embed names)".to_string()],
-        );
+        for ty in [GgmlType::F16, GgmlType::BF16] {
+            check(
+                format!("embedding {ty}"),
+                global("token_embd.weight", Role::TokenEmbedding, ty),
+                &[format!(
+                    "{ty} token embedding (the card's rows: the types embed_of_widened names)"
+                )],
+            );
+        }
         // The routed stacks are the FFN dispatch's rows (`qwen35_gate_up`,
         // `qwen35_down`): a Q6_K gate·up is refused by name, a Q5_K down runs.
         check(
@@ -2221,6 +2236,7 @@ mod tests {
             layers: 5,
             experts: 288,
             experts_used: 8,
+            bf16_words: |_| false,
         };
         super::check(&spec, &model)
             .into_iter()
@@ -2399,6 +2415,7 @@ mod tests {
                 layers: 42,
                 experts: 0,
                 experts_used: 0,
+                bf16_words: |_| false,
             };
             super::check(&spec, &model)
                 .into_iter()
@@ -2563,14 +2580,21 @@ mod tests {
     }
 
     /// The qwen4exp head's pin reads the set the head kernel reads
-    /// (`gpu::head`'s `head_out_w`): q8_0 planes, a q6_K or q4_K word plane;
-    /// another type of `output` is an item, and the embedding's pin stays
-    /// q8_0 alone.
+    /// (`gpu::head`'s `head_out_w`): q8_0 planes, a q6_K or q4_K word plane,
+    /// bf16 words; another type of `output` is an item, and the embedding's
+    /// pin reads q8_0 and bf16.
     // PIN(2026-10-06): q6_K (and q4_K, which the same gemv reads) joined the
     /// head's set so the UD-Q3_K_XL file's q6_K output loads.
+    // PIN(2026-10-20): bf16 joined the head's and the embedding's sets with
+    /// the bf16 head gemv and embedding rows (`prepare --keep-bf16`).
     #[test]
     fn the_qwen38_head_pin_reads_the_head_kernels_set() {
-        for ty in [GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K] {
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q6_K,
+            GgmlType::Q4_K,
+            GgmlType::BF16,
+        ] {
             assert_eq!(
                 items(
                     Program::Qwen38Body,
@@ -2593,7 +2617,7 @@ mod tests {
                     ..matrix("", Role::Head, GgmlType::Q5_K)
                 }
             ),
-            ["q5_K output head (the head reads q8_0 planes, q6_K or q4_K word planes)"]
+            ["q5_K output head (the head reads q8_0 planes, q6_K or q4_K word planes, bf16 words)"]
         );
         assert_eq!(
             items(
@@ -2604,7 +2628,18 @@ mod tests {
                     ..matrix("", Role::TokenEmbedding, GgmlType::Q6_K)
                 }
             ),
-            ["q6_K token embedding (the card reads q8_0 rows)"]
+            ["q6_K token embedding (the card reads q8_0 or bf16 rows)"]
+        );
+        assert_eq!(
+            items(
+                Program::Qwen38Body,
+                &ModelTensor {
+                    name: "token_embd.weight".into(),
+                    layer: None,
+                    ..matrix("", Role::TokenEmbedding, GgmlType::BF16)
+                }
+            ),
+            Vec::<String>::new()
         );
     }
 
@@ -2777,6 +2812,7 @@ mod tests {
             layers: 48,
             experts: 256,
             experts_used: 8,
+            bf16_words: |_| false,
         };
         let chat = models::ChatSpec {
             pre: "qwen2".to_string(),

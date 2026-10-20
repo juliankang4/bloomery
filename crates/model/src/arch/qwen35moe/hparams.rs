@@ -1274,6 +1274,101 @@ pub(super) mod tests {
         );
     }
 
+    /// Every classified qwen4exp tensor as a BF16 matrix: the ones a BF16
+    /// reader takes (the dense site's projections, the indexer's, the head
+    /// and the embedding) keep their words; every one body38 reads as F32
+    /// values (the `f32_len` and `f32_shape` checks of `plan38::plans`, and
+    /// the parts of its joined β·α stack and router) is widened, the conv
+    /// and the injects at their own shapes. A tensor in neither list fails.
+    #[test]
+    fn a_qwen4exp_bf16_matrix_keeps_its_words_only_for_a_word_reader() {
+        use crate::placement::CardFormat;
+        use gguf::quant::GgmlType;
+        const RAW: &[&str] = &[
+            "output.weight",
+            "token_embd.weight",
+            "output_hc_down.weight",
+            "output_hc_up.weight",
+            "attn_qkv.weight",
+            "attn_gate.weight",
+            "ssm_out.weight",
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "indexer.q_proj.weight",
+            "indexer.k_proj.weight",
+            "hc_attn_down.weight",
+            "hc_attn_up.weight",
+            "hc_ffn_down.weight",
+            "hc_ffn_up.weight",
+            "ffn_gate_shexp.weight",
+            "ffn_up_shexp.weight",
+            "ffn_down_shexp.weight",
+            "ple_key.weight",
+            "ple_value.weight",
+        ];
+        const WIDE: &[&str] = &[
+            "output_hc_norm.weight",
+            "hc_attn_norm.weight",
+            "hc_attn_inject.weight",
+            "hc_ffn_norm.weight",
+            "hc_ffn_inject.weight",
+            "ssm_conv1d.weight",
+            "ssm_dt.bias",
+            "ssm_a",
+            "ssm_alpha.weight",
+            "ssm_beta.weight",
+            "ssm_norm.weight",
+            "attn_q_norm.weight",
+            "attn_k_norm.weight",
+            "indexer.q_norm.weight",
+            "indexer.k_norm.weight",
+            "ffn_gate_inp.weight",
+            "ffn_gate_inp_shexp.weight",
+            "ple_norm_key.weight",
+            "ple_norm_query.weight",
+            "ple_norm_conv.weight",
+            "ple_conv1d.weight",
+        ];
+        let path = header_shaped("q4x-bf16", "qwen4exp", &keys(), &[], &tensors());
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let hp = Hparams::read(&split).expect("the header reads");
+        let model = roles::classify(&split, &hp).expect("every tensor has a role");
+        let _ = std::fs::remove_file(&path);
+        let (mut seen, mut wrong) = (0, Vec::new());
+        for t in &model.tensors {
+            if matches!(t.role, Role::RoutedExperts | Role::EngramTable) {
+                continue;
+            }
+            let stem = t
+                .name
+                .strip_prefix("blk.")
+                .and_then(|n| n.split_once('.'))
+                .map_or(t.name.as_str(), |(_, s)| s);
+            let mut m = t.clone();
+            m.ty = GgmlType::BF16;
+            m.dims = match stem {
+                "ssm_conv1d.weight" => vec![4, 10_240],
+                "hc_attn_inject.weight" | "hc_ffn_inject.weight" => vec![10_240, 4],
+                _ => vec![256, 16],
+            };
+            let want = if RAW.contains(&stem) {
+                CardFormat::Bf16Raw
+            } else {
+                assert!(WIDE.contains(&stem), "{} is in neither list", t.name);
+                CardFormat::Bf16AsF32
+            };
+            let got = model.card_format(&m);
+            if got != Some(want) {
+                wrong.push(format!("{} {got:?}", t.name));
+            }
+            seen += 1;
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert_eq!(seen, model.tensors.len() - 1 - 4 * 3, "every other tensor");
+    }
+
     /// The qwen4exp stems are not qwen35moe's: a Qwen3.6 file carrying a
     /// hyper-connection tensor fails as unclassified, named.
     #[test]

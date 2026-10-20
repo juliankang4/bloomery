@@ -184,6 +184,7 @@ impl Shape {
             layers: self.layers,
             experts: self.experts,
             experts_used: self.used,
+            bf16_words: |_| false,
         }
     }
 }
@@ -441,6 +442,7 @@ fn tiny(experts: u64, used: u64, bytes: u64) -> ModelTensors {
         layers: 1,
         experts,
         experts_used: used,
+        bf16_words: |_| false,
     }
 }
 
