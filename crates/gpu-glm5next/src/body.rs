@@ -1107,6 +1107,29 @@ fn shape(detail: String) -> GpuError {
     GpuError::Shape { what: WHAT, detail }
 }
 
+/// A load's positions, the one-card body's and a tensor-parallel rank's: at least one, and at
+/// most the positions a reference set checks the latent selector at.
+pub(crate) fn check_ctx(ctx: usize) -> Result<(), GpuError> {
+    if ctx == 0 || ctx as u64 > place::ORACLE_POSITIONS {
+        return Err(shape(format!(
+            "ctx {ctx}: at least 1 and at most the {} positions a reference set checks the \
+             selector at",
+            place::ORACLE_POSITIONS
+        )));
+    }
+    Ok(())
+}
+
+/// A step at `pos` inside stores of `ctx` positions, refused by name past them.
+pub(crate) fn check_pos(pos: u32, ctx: usize) -> Result<(), GpuError> {
+    if pos as usize >= ctx {
+        return Err(shape(format!(
+            "a step at position {pos} in stores of {ctx}"
+        )));
+    }
+    Ok(())
+}
+
 /// The layer's SwiGLU limit, 0 (the plain combine) when it has none. Any
 /// other activation has no clamp and is refused by name.
 pub(crate) fn limit_of(act: Act) -> Result<f32, GpuError> {
@@ -1566,16 +1589,8 @@ impl Body {
             )));
         }
         let ctx = usize::try_from(plan.ctx_max)
-            .ok()
-            .filter(|&c| c > 0 && c as u64 <= place::ORACLE_POSITIONS)
-            .ok_or_else(|| {
-                shape(format!(
-                    "ctx_max {}: at least 1 and at most the {} positions a reference set \
-                     checks the selector at",
-                    plan.ctx_max,
-                    place::ORACLE_POSITIONS
-                ))
-            })?;
+            .map_err(|_| shape(format!("ctx_max {} passes usize", plan.ctx_max)))?;
+        check_ctx(ctx)?;
         let dense = usize::try_from(place::dense_positions(hp))
             .map_err(|_| shape(format!("dense positions {}", place::dense_positions(hp))))?;
         let run = host_run(&spec.layers, nextn.map(|(_, n)| n.index))?;
@@ -2282,12 +2297,7 @@ impl ChainBody for Body {
     /// past the stores, or one the stores do not stand at, is refused by
     /// name ([`Body::stores_at`]).
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
-        if pos as usize >= self.ctx {
-            return Err(shape(format!(
-                "a step at position {pos} in stores of {}",
-                self.ctx
-            )));
-        }
+        check_pos(pos, self.ctx)?;
         self.stores_at(pos)?;
         self.embd.fill(token)?;
         Ok(StepInput { pos })

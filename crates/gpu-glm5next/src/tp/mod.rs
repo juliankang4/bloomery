@@ -37,13 +37,13 @@ use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use cuda_core::{CudaStream, DeviceBuffer, sys};
 use gguf::Split;
 use model::arch::glm5next::names::{self, Sub};
-use model::arch::glm5next::place::{self, KdaLanes, PlanInputs};
+use model::arch::glm5next::place::{KdaLanes, PlanInputs};
 use runtime::layer::{FfnKind, MixerKind};
 
 use crate::body::pair::write_row;
 use crate::body::{
-    Body, Dims, Embedding, Kernels, LayerCfg, Parts, Scratch, Store, dims_of, host_run, layer_cfg,
-    store, trunk_plans,
+    Body, Dims, Embedding, Kernels, LayerCfg, Parts, Scratch, Store, check_ctx, check_pos, dims_of,
+    host_run, layer_cfg, store, trunk_plans,
 };
 use crate::ffn::{CardExperts, block_names};
 use crate::program::{hc_in, hc_out};
@@ -65,7 +65,9 @@ struct RankLink {
 }
 
 /// One rank of a tensor-parallel load (module doc): its parts of the weights, the one-card
-/// step's buffers and stores at its widths, its card experts and its head. Its drop waits for
+/// step's buffers and stores at its widths, its card experts and its head. Its stores take each
+/// position once, from 0 up, and a step that fails once its launches go out leaves them holding
+/// part of it: the rank takes no further step, and is opened again. Its drop waits for
 /// every launch it enqueued before any field frees memory those launches name ([`Drop`]); field
 /// order is then drop order, the buffers before the page the gathers read.
 pub struct Rank {
@@ -85,6 +87,9 @@ pub struct Rank {
     embd: Embedding,
     head: Head,
     ctx: usize,
+    /// The position the next step takes, every one before it in the stores; `None` from a step's
+    /// first launch until the step completes ([`step`]).
+    next_pos: Option<u32>,
     /// The stream buffer the next sub-layer reads.
     cur: usize,
     /// Each layer's streams and each routed layer's picks after the last step, when armed.
@@ -166,7 +171,7 @@ impl Rank {
         let card = CardExperts::rank(gpu, &w, &spec.layers, dims.embd, ff)?;
         let embd = Embedding::new(file, dims.embd)?;
         let head = Head::new(gpu, &w, dims.rms_eps)?;
-        if head.n_vocab().checked_mul(n) != Some(inputs.hp.n_vocab) {
+        if head.n_vocab() != at.part("the vocabulary", inputs.hp.n_vocab)? {
             return Err(shape(format!(
                 "the head projects {} rows a rank; the vocabulary is {} over {n} ranks",
                 head.n_vocab(),
@@ -215,6 +220,7 @@ impl Rank {
             embd,
             head,
             ctx,
+            next_pos: Some(0),
             cur: 0,
             taps: None,
             routes: None,
@@ -235,8 +241,13 @@ impl Rank {
         self.cfg.len()
     }
 
-    /// Keep every layer's streams and every routed layer's picks after each step, or stop.
+    /// Keep every layer's streams and every routed layer's picks after each step, or stop. Taps
+    /// are armed before the first step ([`arm_at`]): arming later is refused by name, so the
+    /// readers never hand back buffers no step wrote.
     pub fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
+        if on {
+            arm_at(self.next_pos)?;
+        }
         let stream = on_card(gpu)?;
         (self.taps, self.routes) = if on {
             let n = HC_STREAMS * self.dims.embd;
@@ -267,8 +278,10 @@ impl Rank {
     }
 
     /// Every layer's streams after the last step, `4 · n_embd` a layer, as the one-card body's
-    /// taps lay them; refused when the taps are not armed. Blocking.
+    /// taps lay them; refused when the taps are not armed or no step completed last
+    /// ([`Rank::stepped`]). Blocking.
     pub fn taps(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
+        self.stepped()?;
         let taps = self.taps.as_ref().ok_or(GpuError::State {
             what: WHAT,
             missing: "armed taps (Rank::set_taps)",
@@ -282,8 +295,9 @@ impl Rank {
     }
 
     /// Each routed layer's picks after the last step, `None` for a dense layer; refused when
-    /// the taps are not armed. Blocking.
+    /// the taps are not armed or no step completed last ([`Rank::stepped`]). Blocking.
     pub fn routes(&self, gpu: &Gpu) -> Result<Vec<Option<RoutePick>>, GpuError> {
+        self.stepped()?;
         let routes = self.routes.as_ref().ok_or(GpuError::State {
             what: WHAT,
             missing: "armed taps (Rank::set_taps)",
@@ -302,21 +316,28 @@ impl Rank {
         Ok(out)
     }
 
-    /// The last step's logits over the rank's part of the vocabulary. Blocking.
+    /// The last step's logits over the rank's part of the vocabulary; refused when no step
+    /// completed last ([`Rank::stepped`]). Blocking.
     pub fn logits(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
+        self.stepped()?;
         on_card(gpu)?;
         self.head.logits_to_host(gpu)
     }
 
-    /// Token `token` at `pos` into the step's row; refused past the stores' positions or the
-    /// vocabulary.
-    fn begin(&mut self, gpu: &Gpu, token: u32, pos: u32) -> Result<(), GpuError> {
-        if pos as usize >= self.ctx {
-            return Err(shape(format!(
-                "a step at position {pos} in stores of {}",
-                self.ctx
-            )));
+    /// Refused by name unless the last step on the rank completed: none ran yet, or one failed
+    /// once its launches went out.
+    fn stepped(&self) -> Result<(), GpuError> {
+        match self.next_pos {
+            Some(p) if p > 0 => Ok(()),
+            _ => Err(GpuError::State {
+                what: WHAT,
+                missing: "a completed step (tp::step)",
+            }),
         }
+    }
+
+    /// Token `token` at `pos` into the step's row; refused past the vocabulary.
+    fn begin(&mut self, gpu: &Gpu, token: u32, pos: u32) -> Result<(), GpuError> {
         self.embd.fill(token)?;
         write_row(on_card(gpu)?, &mut self.s.rows[0], &self.embd.streams, pos)?;
         self.cur = 0;
@@ -424,8 +445,10 @@ impl Rank {
 /// One step of `token` at `pos` on every rank of a load, each with its card, rank `r` at
 /// `ranks[r]`: the ranks' launches a sub-layer at a time (module doc), every head, then the
 /// merge of the ranks' picks, the step's token. The ranks' links are joined before the first
-/// step. Blocking; ranks out of rank order or of another count than their own are refused by
-/// name before any launch.
+/// step. Blocking. Refused by name before any launch: ranks out of rank order or of another
+/// count than their own, a position past a rank's stores or other than the one its stores stand
+/// at ([`at_pos`]), and a token past the vocabulary. A step that fails once its launches go out
+/// leaves every rank refusing the next (`Rank`).
 pub fn step(ranks: &mut [(&Gpu, &mut Rank)], token: u32, pos: u32) -> Result<u32, GpuError> {
     let n = ranks.len();
     for (i, (_, r)) in ranks.iter().enumerate() {
@@ -436,10 +459,14 @@ pub fn step(ranks: &mut [(&Gpu, &mut Rank)], token: u32, pos: u32) -> Result<u32
                 r.at.ranks()
             )));
         }
+        at_pos(r.next_pos, r.ctx, pos)?;
     }
-    let layers = ranks.first().map_or(0, |(_, r)| r.layers());
+    let layers = ranks.iter().map(|(_, r)| r.layers()).max().unwrap_or(0);
     for (gpu, r) in ranks.iter_mut() {
         r.begin(gpu, token, pos)?;
+    }
+    for (_, r) in ranks.iter_mut() {
+        r.next_pos = None;
     }
     for l in 0..layers {
         for sub in [Sub::Attn, Sub::Ffn] {
@@ -455,7 +482,39 @@ pub fn step(ranks: &mut [(&Gpu, &mut Rank)], token: u32, pos: u32) -> Result<u32
         .iter()
         .map(|(gpu, r)| r.pick(gpu))
         .collect::<Result<Vec<_>, _>>()?;
-    head::merge(&picks)
+    let token = head::merge(&picks)?;
+    for (_, r) in ranks.iter_mut() {
+        r.next_pos = Some(pos + 1);
+    }
+    Ok(token)
+}
+
+/// Refused by name unless stores of `ctx` positions that stand at `next` (a rank's
+/// `next_pos`) take a step at `pos`: inside them ([`check_pos`]), and the position they stand at.
+fn at_pos(next: Option<u32>, ctx: usize, pos: u32) -> Result<(), GpuError> {
+    check_pos(pos, ctx)?;
+    match next {
+        Some(p) if p == pos => Ok(()),
+        Some(p) => Err(shape(format!(
+            "position {pos}, where the stores hold {p} positions"
+        ))),
+        None => Err(shape(format!(
+            "position {pos}: a step failed once its launches went out, so the stores hold part \
+             of it; open the rank again"
+        ))),
+    }
+}
+
+/// Refused by name unless stores that stand at `next` (a rank's `next_pos`) have taken no step,
+/// the one state where armed taps are written before they are read.
+fn arm_at(next: Option<u32>) -> Result<(), GpuError> {
+    match next {
+        Some(0) => Ok(()),
+        _ => Err(GpuError::State {
+            what: WHAT,
+            missing: "taps armed before the first step (open the rank again)",
+        }),
+    }
 }
 
 /// The rank's part `out` of a sub-layer's output posted to the other ranks, their parts waited
@@ -517,19 +576,6 @@ fn load(
     Weights::load_parts(gpu.stream(), &parts)
 }
 
-/// A load's positions: at least one, and at most the positions a reference set checks the
-/// latent selector at, as the one-card body's.
-fn check_ctx(ctx: usize) -> Result<(), GpuError> {
-    if ctx == 0 || ctx as u64 > place::ORACLE_POSITIONS {
-        return Err(shape(format!(
-            "ctx {ctx}: at least 1 and at most the {} positions a reference set checks the \
-             selector at",
-            place::ORACLE_POSITIONS
-        )));
-    }
-    Ok(())
-}
-
 /// `gpu`'s context current on this thread, which runs every rank of a loopback in turn, and its
 /// stream.
 fn on_card(gpu: &Gpu) -> Result<&CudaStream, GpuError> {
@@ -543,7 +589,7 @@ fn shape(detail: String) -> GpuError {
 
 #[cfg(test)]
 mod tests {
-    use super::check_ctx;
+    use super::{arm_at, at_pos, check_ctx};
     use model::arch::glm5next::place::ORACLE_POSITIONS;
 
     /// A load of no positions or past the reference sets' positions is refused.
@@ -552,5 +598,35 @@ mod tests {
         let max = usize::try_from(ORACLE_POSITIONS).unwrap();
         assert!(check_ctx(1).is_ok() && check_ctx(max).is_ok());
         assert!(check_ctx(0).is_err() && check_ctx(max + 1).is_err());
+    }
+
+    /// Stores take the position they stand at, inside them; any other position, the one past
+    /// them and every position after a failed step are refused.
+    #[test]
+    fn a_step_takes_only_the_position_its_stores_stand_at() {
+        assert!(at_pos(Some(0), 4, 0).is_ok() && at_pos(Some(3), 4, 3).is_ok());
+        for (next, pos) in [
+            (Some(0), 1),
+            (Some(2), 1),
+            (Some(4), 4),
+            (None, 0),
+            (None, 2),
+        ] {
+            assert!(at_pos(next, 4, pos).is_err(), "{next:?} at {pos}");
+        }
+    }
+
+    /// Taps arm only on stores that have taken no step; after a step or a failed one, arming is
+    /// refused by name.
+    #[test]
+    fn taps_arm_only_before_the_first_step() {
+        assert!(arm_at(Some(0)).is_ok());
+        for next in [Some(1), Some(3), None] {
+            let e = arm_at(next).unwrap_err().to_string();
+            assert!(
+                e.contains("taps armed before the first step"),
+                "{next:?}: {e}"
+            );
+        }
     }
 }

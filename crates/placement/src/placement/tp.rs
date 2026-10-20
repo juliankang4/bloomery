@@ -35,6 +35,55 @@ pub struct Cut {
     pub unit: u64,
 }
 
+impl Cut {
+    /// One rank's extent along the cut of tensor `name` of `dims` into `n` ranks, its format block
+    /// `blocks` values along dims 0 and 1 (1 past them). No rank, a dim the tensor lacks, a part
+    /// of no units or of other than whole units, and a part off the format's block are refused by
+    /// name.
+    ///
+    /// # Errors
+    ///
+    /// [`TpError::NoRank`], [`TpError::NoDim`], [`TpError::Unit`] or [`TpError::Block`].
+    pub fn part(
+        self,
+        name: &str,
+        dims: &[u64],
+        blocks: [u64; 2],
+        n: usize,
+    ) -> Result<u64, TpError> {
+        if n == 0 {
+            return Err(TpError::NoRank);
+        }
+        let dim = self.dim;
+        let extent = *dims.get(dim).ok_or_else(|| TpError::NoDim {
+            name: name.into(),
+            dim,
+            dims: dims.to_vec(),
+        })?;
+        let part = extent / n as u64;
+        if part == 0 || !extent.is_multiple_of(n as u64) || !part.is_multiple_of(self.unit) {
+            return Err(TpError::Unit {
+                name: name.into(),
+                dim,
+                extent,
+                ranks: n,
+                unit: self.unit,
+            });
+        }
+        let block = blocks.get(dim).copied().unwrap_or(1);
+        if !part.is_multiple_of(block) {
+            return Err(TpError::Block {
+                name: name.into(),
+                dim,
+                extent,
+                ranks: n,
+                block,
+            });
+        }
+        Ok(part)
+    }
+}
+
 /// One rank's node, by the name its lines print, and the bytes its pool holds for the rank.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RankPool {
@@ -144,8 +193,8 @@ pub enum TpError {
 ///
 /// # Errors
 ///
-/// A cut along a dim the tensor lacks, into parts that are not whole units or whole format blocks,
-/// a rank past its pool and two ranks on one device, each by name; no rank or a byte sum past u64.
+/// A cut [`Cut::part`] refuses, a rank past its pool and two ranks on one device, each by name; no
+/// rank or a byte sum past u64.
 pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, TpError> {
     let n = pools.len();
     if n == 0 {
@@ -174,34 +223,8 @@ pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, Tp
             whole_n += 1;
             continue;
         };
-        let Some(&extent) = t.dims.get(cut.dim) else {
-            return Err(TpError::NoDim {
-                name: t.name.clone(),
-                dim: cut.dim,
-                dims: t.dims.clone(),
-            });
-        };
+        cut.part(&t.name, &t.dims, t.block, n)?;
         let ranks = n as u64;
-        let part = extent / ranks;
-        if !extent.is_multiple_of(ranks) || !part.is_multiple_of(cut.unit) {
-            return Err(TpError::Unit {
-                name: t.name.clone(),
-                dim: cut.dim,
-                extent,
-                ranks: n,
-                unit: cut.unit,
-            });
-        }
-        let block = t.block.get(cut.dim).copied().unwrap_or(1);
-        if !part.is_multiple_of(block) {
-            return Err(TpError::Block {
-                name: t.name.clone(),
-                dim: cut.dim,
-                extent,
-                ranks: n,
-                block,
-            });
-        }
         // Whole blocks a part: the bytes split evenly with the values.
         split = split
             .checked_add(t.bytes / ranks)
@@ -378,7 +401,7 @@ mod tests {
     }
 
     /// A part that is not whole units of the role, or that cuts a format block, is refused by name;
-    /// so are a dim the tensor lacks and no rank.
+    /// so are a part of no units, a dim the tensor lacks and no rank.
     #[test]
     fn cuts_off_a_unit_or_a_block_are_refused_by_name() {
         let heads = Some(Cut { dim: 1, unit: 128 });
@@ -417,6 +440,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, TpError::NoDim { dim: 2, .. }), "{e}");
+        // An extent of no values leaves every rank no unit.
+        let empty = t("empty", 0, 64, [1, 1], Some(Cut { dim: 0, unit: 1 }));
+        assert!(matches!(
+            plan_tp(&pools(2, u64::MAX), &[empty]).unwrap_err(),
+            TpError::Unit { extent: 0, .. }
+        ));
         assert_eq!(plan_tp(&[], &[]).unwrap_err(), TpError::NoRank);
     }
 }

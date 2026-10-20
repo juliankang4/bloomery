@@ -23,6 +23,12 @@
 //!   block ([`REFUSED`]), whose open is refused by name: the gate prints the refusal and holds it
 //!   to name the tensor and the count; a refusal at any other count fails the gate.
 //! - (rr) the first N past one twice from fresh opens: the two runs bit for bit.
+//! - (st) one rank's positions: opens of no positions or past the reference sets' refused by
+//!   name; on a fresh open its reads refused for want of a step, and a first step at position 1
+//!   or at the stores' end refused by name before any launch; after the step at 0 the same
+//!   position refused again, its logits read, and the step at 1 taken. Taps armed on the fresh
+//!   open; after a step, arming again refused by name and the step's taps read bit for bit as
+//!   before it, and once disarmed, the taps' read and a new arming refused by name.
 //! - (fx) every run that loaded against ik's batch set of the fixture (`fx_ref_glm5next`), as the
 //!   e2e gate's (cfx) holds the one-card body: a flip first on its path held to the pair rule
 //!   under the layer's router band, every layer output off every flip's path within its stream
@@ -72,7 +78,7 @@ mod gate {
     use bloomery_gpu_glm5next::{Body, set_taps};
     use gguf::{GgmlType, Split};
     use model::arch::glm5next::names;
-    use model::arch::glm5next::place::PlanInputs;
+    use model::arch::glm5next::place::{ORACLE_POSITIONS, PlanInputs};
     use model::placement::PlanLevers;
     use refset::arch::glm5next::fixture as fx;
     use runtime::layer::FfnKind;
@@ -127,6 +133,8 @@ mod gate {
         ok &= merge_clause(1, &n1);
         ok &= n1_clause(&one, &n1, host_from, &bands, embd);
         ok &= q6_clause(&file, &one, &n1, host_from, embd)?;
+        let first = *toks.first().ok_or("no batch tokens")?;
+        ok &= state_clause(&file, &inputs, first)?;
         let mut loaded = vec![(1, n1)];
         for &n in RANKS.iter().filter(|&&n| n > 1) {
             match ranks_run(&file, &inputs, n, &toks) {
@@ -465,6 +473,105 @@ mod gate {
             verdict(named)
         );
         named
+    }
+
+    /// (st) (module doc), stepping `token`: each refusal names what it refuses.
+    fn state_clause(file: &Arc<Split>, inputs: &PlanInputs, token: u32) -> Result<bool, GateError> {
+        let says = |r: Result<(), GpuError>, want: &str| match r {
+            Err(e) => {
+                let e = e.to_string();
+                (e.contains(want), e)
+            }
+            Ok(()) => (false, "accepted".to_string()),
+        };
+        let taken = |r: Result<(), GpuError>| match r {
+            Ok(()) => (true, "accepted".to_string()),
+            Err(e) => (false, e.to_string()),
+        };
+        let gpu = Gpu::new()?;
+        let src = GgufSource::new(file, inputs.hp.n_head);
+        let at = RankOf::new(0, 1)?;
+        let open = |ctx| Rank::open(&gpu, Arc::clone(file), &src, at, ctx);
+        let over = usize::try_from(ORACLE_POSITIONS)? + 1;
+        let mut held = vec![
+            (
+                "an open of no positions",
+                says(open(0).map(drop), "ctx 0: at least 1"),
+            ),
+            (
+                "an open past the reference sets' positions",
+                says(open(over).map(drop), &format!("ctx {over}: at least 1")),
+            ),
+        ];
+        let mut r = open(CTX)?;
+        let step = |r: &mut Rank, pos: u32| tp::step(&mut [(&gpu, r)], token, pos).map(drop);
+        let late = "taps armed before the first step";
+        held.push(("tap arming on a fresh open", taken(r.set_taps(&gpu, true))));
+        held.push((
+            "logits before a step",
+            says(r.logits(&gpu).map(drop), "a completed step"),
+        ));
+        held.push((
+            "a first step at position 1",
+            says(
+                step(&mut r, 1),
+                "position 1, where the stores hold 0 positions",
+            ),
+        ));
+        let end = u32::try_from(CTX)?;
+        held.push((
+            "a first step at the stores' end",
+            says(
+                step(&mut r, end),
+                &format!("position {end} in stores of {CTX}"),
+            ),
+        ));
+        held.push(("the step at 0", taken(step(&mut r, 0))));
+        held.push((
+            "position 0 after its step",
+            says(
+                step(&mut r, 0),
+                "position 0, where the stores hold 1 positions",
+            ),
+        ));
+        held.push((
+            "logits after the step at 0",
+            taken(r.logits(&gpu).map(drop)),
+        ));
+        held.push(("the step at 1", taken(step(&mut r, 1))));
+        let traced = r.taps(&gpu)?;
+        held.push((
+            "tap arming after a step",
+            says(r.set_taps(&gpu, true), late),
+        ));
+        held.push((
+            "the step's taps after the refused arming",
+            match r.taps(&gpu) {
+                Ok(t) => {
+                    let kept = same_bits(&t, &traced);
+                    (
+                        kept,
+                        format!("{} values, bit for bit the read before it: {kept}", t.len()),
+                    )
+                }
+                Err(e) => (false, e.to_string()),
+            },
+        ));
+        held.push(("disarming after a step", taken(r.set_taps(&gpu, false))));
+        held.push((
+            "taps once disarmed",
+            says(r.taps(&gpu).map(drop), "armed taps"),
+        ));
+        held.push((
+            "tap arming once disarmed",
+            says(r.set_taps(&gpu, true), late),
+        ));
+        let mut ok = true;
+        for (what, (pass, said)) in held {
+            println!("(st) one rank: {what}: {said} {}", verdict(pass));
+            ok &= pass;
+        }
+        Ok(ok)
     }
 
     /// Two runs' tokens, logits, taps and picks bit for bit.

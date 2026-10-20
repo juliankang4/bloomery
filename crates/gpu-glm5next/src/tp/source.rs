@@ -39,13 +39,14 @@ impl RankOf {
         Ok(RankOf { rank, ranks })
     }
 
-    /// This rank's part of `v`, `what`'s count over the ranks: refused by name when the ranks
-    /// do not divide it or outnumber it.
+    /// This rank's part of `v`, `what`'s count over the ranks, by the plan's rule for a cut of
+    /// one-value units (`Cut::part`): refused by name when the ranks do not divide it or
+    /// outnumber it.
     pub fn part(self, what: &str, v: usize) -> Result<usize, GpuError> {
-        let n = self.ranks;
-        (v.is_multiple_of(n) && v >= n)
-            .then_some(v / n)
-            .ok_or_else(|| GpuError::shape(WHAT, format!("{what} {v} over {n} ranks")))
+        Cut { dim: 0, unit: 1 }
+            .part(what, &[v as u64], [1, 1], self.ranks)
+            .map(|p| p as usize)
+            .map_err(|e| GpuError::shape(WHAT, e.to_string()))
     }
 
     #[must_use]
@@ -103,9 +104,9 @@ impl GgufSource<'_> {
 }
 
 /// Rank `at`'s part of tensor `t` cut by `cut` (module doc): the part's header entry (its dims,
-/// its bytes) and the byte ranges of its rows in the tensor's bytes, in row order. An extent the
-/// ranks do not divide into whole `cut.unit`s, a dim-0 part off the type's block, a dim past the
-/// tensor's and byte counts past u64 or usize are refused by name.
+/// its bytes) and the byte ranges of its rows in the tensor's bytes, in row order. A tensor whose
+/// dims and bytes disagree, a cut the plan's rule refuses (`Cut::part`, the type's block along
+/// dim 0) and byte counts past u64 or usize are refused by name.
 fn part_of(
     t: &TensorInfo,
     cut: Option<Cut>,
@@ -115,36 +116,25 @@ fn part_of(
     let over = || refuse("its byte count passes the integer it is held in".into());
     check_part_bytes(WHAT, t)?;
     let whole = usize::try_from(t.nbytes).map_err(|_| over())?;
-    let Some(Cut { dim, unit }) = cut else {
+    let Some(cut) = cut else {
         return Ok((t.clone(), std::iter::once(0..whole).collect()));
     };
+    let dim = cut.dim;
     let n = at.ranks as u64;
-    let extent = *t
-        .dims
-        .get(dim)
-        .ok_or_else(|| refuse(format!("dim {dim} past its dims {:?}", t.dims)))?;
-    let part = extent / n;
-    if unit == 0 || !extent.is_multiple_of(n) || !part.is_multiple_of(unit) {
-        return Err(refuse(format!(
-            "dim {dim} of {extent} into {n} ranks is not whole {unit}-value units a rank"
-        )));
-    }
+    let block =
+        t.ty.blck_size()
+            .filter(|&b| b > 0)
+            .ok_or_else(|| refuse(format!("{} has no block size", t.ty)))?;
+    let part = cut
+        .part(&t.name, &t.dims, [block, 1], at.ranks)
+        .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
+    let extent = t.dims[dim];
     let rows: u64 = t.dims[1..].iter().product();
     let row = t.nbytes / rows;
     let r = at.rank as u64;
     let mut dims = t.dims.clone();
     dims[dim] = part;
     let spans: Vec<(u64, u64)> = if dim == 0 {
-        let block =
-            t.ty.blck_size()
-                .filter(|&b| b > 0)
-                .ok_or_else(|| refuse(format!("{} has no block size", t.ty)))?;
-        if !part.is_multiple_of(block) {
-            return Err(refuse(format!(
-                "dim 0 of {extent} into {n} ranks cuts off its {block}-value {} block",
-                t.ty
-            )));
-        }
         let take = row / (extent / block) * (part / block);
         (0..rows).map(|i| (i * row + r * take, take)).collect()
     } else {
