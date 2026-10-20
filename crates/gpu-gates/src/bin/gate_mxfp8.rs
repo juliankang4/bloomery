@@ -103,14 +103,13 @@ fn main() -> std::process::ExitCode {
 }
 
 mod gate {
-    use crate::dense_file::{columns, decl, host_rows, q8_0_bytes};
+    use crate::dense_file::{check, columns, decl, host_rows, q8_0_bytes};
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::q8f32::{E4m3GemvArgs, E4m3Scales, E4m3Weight, SelArgs, e4m3_planes};
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
-    use bloomery_gpu_gates::rounding::{U64, gamma};
-    use bloomery_gpu_gates::{GateError, GateRng, checks_failed, par_map, verdict, write_gguf};
+    use bloomery_gpu_gates::{GateError, GateRng, checks_failed, verdict, write_gguf};
     use cuda_core::DeviceBuffer;
     use gguf::Split;
     use gguf::quant::GgmlType;
@@ -491,9 +490,14 @@ mod gate {
                         ok &= nan;
                         continue;
                     };
-                    ok &= check((tag, "sel"), &shown, (y, x, k), w, &|r, _| {
-                        byte_rule(&w[r], x)
-                    });
+                    ok &= check(
+                        (tag, "sel"),
+                        &shown,
+                        (y, x, k),
+                        w,
+                        &|at| (at % w.len(), at / w.len()),
+                        &|r, _| byte_rule(&w[r], x),
+                    );
                 }
             }
         }
@@ -664,54 +668,14 @@ mod gate {
         let y = y_dev.to_host_vec(stream)?;
         let walk = |r: usize, c: usize| byte_rule(&wf[r], &x[c * k..][..k]);
         let shown = format!("parts={} rows={rows} k={k} m=1", parts.len());
-        Ok(check((tag, "join"), &shown, (&y, &x, k), &wf, &walk))
-    }
-
-    /// One launch's outputs (token-major, `rows` a column) against the host:
-    /// `rule(r, c)` the bits the kernel must give for row `r` of column
-    /// `c`, `w` the host rows for the band. Prints the clauses `written`,
-    /// `band` and `bits` and returns whether all hold.
-    fn check(
-        (ty, clause): (&str, &str),
-        tag: &str,
-        (y, x, k): (&[f32], &[f32], usize),
-        w: &[Vec<f32>],
-        rule: &(dyn Fn(usize, usize) -> f32 + Sync),
-    ) -> bool {
-        let rows = w.len();
-        let per: Vec<(bool, f64, f64)> = par_map(y.len(), |at| {
-            let (c, r) = (at / rows, at % rows);
-            let (sum, mag) =
-                w[r].iter()
-                    .zip(&x[c * k..][..k])
-                    .fold((0.0f64, 0.0f64), |(s, m), (&a, &b)| {
-                        let t = f64::from(a) * f64::from(b);
-                        (s + t, m + t.abs())
-                    });
-            (
-                y[at].to_bits() == rule(r, c).to_bits(),
-                (f64::from(y[at]) - sum).abs(),
-                (gamma(k / 32 + 5) + k as f64 * U64) * mag,
-            )
-        });
-        let written = y.iter().all(|v| v.is_finite());
-        let bits_n = per.iter().filter(|p| p.0).count();
-        let band_ok = per.iter().all(|p| p.1 <= p.2);
-        let worst = per
-            .iter()
-            .map(|p| if p.2 > 0.0 { p.1 / p.2 } else { p.1 })
-            .fold(0.0f64, f64::max);
-        println!("{ty} clause={clause}.written {tag} {}", verdict(written));
-        println!(
-            "{ty} clause={clause}.band {tag} worst_err_over_band={worst:.3e} {}",
-            verdict(band_ok)
-        );
-        println!(
-            "{ty} clause={clause}.bits {tag} equal={bits_n}/{} {}",
-            per.len(),
-            verdict(bits_n == per.len())
-        );
-        written && band_ok && bits_n == per.len()
+        Ok(check(
+            (tag, "join"),
+            &shown,
+            (&y, &x, k),
+            &wf,
+            &|at| (at % wf.len(), at / wf.len()),
+            &walk,
+        ))
     }
 
     /// One shape of the E4M3 type `ty` at each of its column counts through `site::gemv`
@@ -761,16 +725,37 @@ mod gate {
             let tile = |r: usize, c: usize| tile_rule(&wf[r], &x[c * k..][..k]);
             let shown = format!("shape={} rows={rows} k={k} m={m}", s.stem);
             ok &= if wide {
-                check((tag, "tile"), &shown, (&y, &x, k), &wf, &tile)
+                check(
+                    (tag, "tile"),
+                    &shown,
+                    (&y, &x, k),
+                    &wf,
+                    &|at| (at % wf.len(), at / wf.len()),
+                    &tile,
+                )
             } else {
-                check((tag, "gemv"), &shown, (&y, &x, k), &wf, &walk)
+                check(
+                    (tag, "gemv"),
+                    &shown,
+                    (&y, &x, k),
+                    &wf,
+                    &|at| (at % wf.len(), at / wf.len()),
+                    &walk,
+                )
             };
             if m == 1 {
                 let mut y_dev = DeviceBuffer::from_host(stream, &vec![f32::NAN; rows])?;
                 site::resident_gemv(gpu, &w, &name, &x_dev, &mut y_dev)?;
                 stream.synchronize()?;
                 let y = y_dev.to_host_vec(stream)?;
-                ok &= check((tag, "decode"), &shown, (&y, &x, k), &wf, &walk);
+                ok &= check(
+                    (tag, "decode"),
+                    &shown,
+                    (&y, &x, k),
+                    &wf,
+                    &|at| (at % wf.len(), at / wf.len()),
+                    &walk,
+                );
             }
         }
         Ok(ok)
@@ -797,7 +782,14 @@ mod gate {
             let y = y_dev.to_host_vec(stream)?;
             let walk = |r: usize, c: usize| byte_rule(&wf[r], &x[c * k..][..k]);
             let tag = format!("rows={rows} k={k} m={m}");
-            ok &= check(("q8_0", "q8_0"), &tag, (&y, &x, k), &wf, &walk);
+            ok &= check(
+                ("q8_0", "q8_0"),
+                &tag,
+                (&y, &x, k),
+                &wf,
+                &|at| (at % wf.len(), at / wf.len()),
+                &walk,
+            );
         }
         Ok(ok)
     }
@@ -821,7 +813,14 @@ mod gate {
         let y = y_dev.to_host_vec(stream)?;
         let tile = |r: usize, c: usize| tile_rule(&wf[r], &x[c * k..][..k]);
         let tag = format!("rows={rows} k={k} m={WIDE}");
-        Ok(check(("f32", "f32_tile"), &tag, (&y, &x, k), &wf, &tile))
+        Ok(check(
+            ("f32", "f32_tile"),
+            &tag,
+            (&y, &x, k),
+            &wf,
+            &|at| (at % wf.len(), at / wf.len()),
+            &tile,
+        ))
     }
 
     /// `--bench-kernels` (module doc): one column at each shape, the MXFP8

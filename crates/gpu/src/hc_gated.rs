@@ -358,7 +358,13 @@ unsafe fn mix_out<const M: usize>(
             thread::__unroll_config::<0>();
             // SAFETY: (c·STREAMS + s)·hidden + h < M·STREAMS·hidden <= xn.len().
             let x = unsafe { *xn.get_unchecked((c * STREAMS + s) * hidden + h) };
-            let sg = sigmoid(g[s][c]);
+            let gv = g[s][c];
+            let sg = if gv.is_finite() {
+                sigmoid(gv)
+            } else {
+                fault.raise(SITE);
+                f32::NAN
+            };
             acc = if s == 0 {
                 x * sg
             } else {
@@ -1706,7 +1712,12 @@ mod hc_wide_kernels {
             let at = (c * STREAMS + s) * hid + h;
             // SAFETY: at < m·4·hidden <= xn.len(), g.len().
             let (x, gv) = unsafe { (*xn.get_unchecked(at), *g.get_unchecked(at)) };
-            let sg = sigmoid(gv);
+            let sg = if gv.is_finite() {
+                sigmoid(gv)
+            } else {
+                fault.raise(SITE);
+                f32::NAN
+            };
             acc = if s == 0 {
                 x * sg
             } else {

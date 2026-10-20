@@ -58,7 +58,7 @@ fn main() -> std::process::ExitCode {
 }
 
 mod gate {
-    use crate::dense_file::{Decl, columns, decl, host_rows, q8_0_bytes};
+    use crate::dense_file::{Decl, check, columns, decl, host_rows, q8_0_bytes};
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::head::{Head, HeadNorm};
     use bloomery_gpu::q8f32::Bf16GemvIdsArgs;
@@ -66,9 +66,8 @@ mod gate {
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{Fault, FaultSite, Gpu, LAYER_NONE};
-    use bloomery_gpu_gates::rounding::{U64, gamma};
     use bloomery_gpu_gates::{
-        GateError, GateRng, checks_failed, no_local_depot, par_map, verdict, write_gguf,
+        GateError, GateRng, checks_failed, no_local_depot, verdict, write_gguf,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
@@ -279,53 +278,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// One launch's outputs against the host: output `at` is row `r` of
-    /// column `c` by `index(at)`, `rule(r, c)` the bits the kernel must give,
-    /// `w` the host rows for the band. Prints the clauses `written`, `band`
-    /// and `bits` and returns whether all hold.
-    fn check(
-        clause: &str,
-        tag: &str,
-        (y, x, k): (&[f32], &[f32], usize),
-        w: &[Vec<f32>],
-        index: &(dyn Fn(usize) -> (usize, usize) + Sync),
-        rule: &(dyn Fn(usize, usize) -> f32 + Sync),
-    ) -> bool {
-        let per: Vec<(bool, f64, f64)> = par_map(y.len(), |at| {
-            let (r, c) = index(at);
-            let (sum, mag) =
-                w[r].iter()
-                    .zip(&x[c * k..][..k])
-                    .fold((0.0f64, 0.0f64), |(s, m), (&a, &b)| {
-                        let t = f64::from(a) * f64::from(b);
-                        (s + t, m + t.abs())
-                    });
-            (
-                y[at].to_bits() == rule(r, c).to_bits(),
-                (f64::from(y[at]) - sum).abs(),
-                (gamma(k / 32 + 5) + k as f64 * U64) * mag,
-            )
-        });
-        let written = y.iter().all(|v| v.is_finite());
-        let bits_n = per.iter().filter(|p| p.0).count();
-        let band_ok = per.iter().all(|p| p.1 <= p.2);
-        let worst = per
-            .iter()
-            .map(|p| if p.2 > 0.0 { p.1 / p.2 } else { p.1 })
-            .fold(0.0f64, f64::max);
-        println!("bf16 clause={clause}.written {tag} {}", verdict(written));
-        println!(
-            "bf16 clause={clause}.band {tag} worst_err_over_band={worst:.3e} {}",
-            verdict(band_ok)
-        );
-        println!(
-            "bf16 clause={clause}.bits {tag} equal={bits_n}/{} {}",
-            per.len(),
-            verdict(bits_n == per.len())
-        );
-        written && band_ok && bits_n == per.len()
-    }
-
     /// Clauses 1 and 2 at one shape (module doc).
     fn site_case(
         gpu: &Gpu,
@@ -375,7 +327,7 @@ mod gate {
             let y = y_dev.to_host_vec(stream)?;
             let rule = |r: usize, c: usize| f32_dot(&wf[r], &x[c * k..][..k]);
             let tag = format!("shape={name} rows={rows} k={k} call={call} m={cols}");
-            ok &= check("site", &tag, (&y, &x, k), wf, &token_major, &rule);
+            ok &= check(("bf16", "site"), &tag, (&y, &x, k), wf, &token_major, &rule);
             if m == 0 || m == WIDE {
                 // The F32 site over the values loaded as f32: the same bits.
                 let mut f_dev = DeviceBuffer::from_host(stream, &vec![f32::NAN; cols * rows])?;
@@ -424,7 +376,14 @@ mod gate {
         let y = y_dev.to_host_vec(stream)?;
         let rule = |r: usize, c: usize| f32_dot(&wf[r], &x[c * k..][..k]);
         let tag = format!("parts={} rows={rows} k={k} m=1", JOIN.len());
-        Ok(check("join", &tag, (&y, &x, k), wf, &|at| (at, 0), &rule))
+        Ok(check(
+            ("bf16", "join"),
+            &tag,
+            (&y, &x, k),
+            wf,
+            &|at| (at, 0),
+            &rule,
+        ))
     }
 
     /// Clause 7 (module doc).
@@ -494,7 +453,14 @@ mod gate {
             let rule = |r: usize, c: usize| dot(&wf[r], &x[c * HIDDEN..][..HIDDEN]);
             let tag = format!("type={ty} rows={VOCAB} k={HIDDEN} m={m}");
             let row_major = |at: usize| (at / m, at % m);
-            ok &= check("head", &tag, (&logits, &x, HIDDEN), wf, &row_major, &rule);
+            ok &= check(
+                ("bf16", "head"),
+                &tag,
+                (&logits, &x, HIDDEN),
+                wf,
+                &row_major,
+                &rule,
+            );
             let want = argmax(&logits, m);
             let pass = tokens == want;
             println!(
@@ -539,7 +505,7 @@ mod gate {
             let rule = |r: usize, c: usize| f32_dot(&wf[r], &x[c * HIDDEN..][..HIDDEN]);
             let listed = |at: usize| (ids[at / m] as usize, at % m);
             let tag = format!("rows={} k={HIDDEN} m={m}", ids.len());
-            ok &= check("ids", &tag, (&y, &x, HIDDEN), wf, &listed, &rule);
+            ok &= check(("bf16", "ids"), &tag, (&y, &x, HIDDEN), wf, &listed, &rule);
             let pass = same && fault.is_none();
             println!(
                 "bf16 clause=ids.full {tag} each row the full head's row ids[i] equal={same} \

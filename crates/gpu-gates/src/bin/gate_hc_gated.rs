@@ -51,7 +51,9 @@
 //! the Q8_0 site's ranges) runs clauses 1, 2, 3 and 8 again: its down and
 //! up rows dotted in `card::f32_dot`'s order over the widened values, the
 //! dense gemv beside them `bf16_gemv`, and its wide arm the BF16 tile with
-//! no quantizer, so a NaN raises the mix's site alone.
+//! no quantizer, so a NaN raises the mix's site alone. Maximum-finite BF16
+//! up weights that overflow the up projection raise the site and leave NaN
+//! mixed outputs in both capped and wide arms, with a finite bottleneck.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -441,6 +443,7 @@ mod gate {
         ok &= check_stages(&mut c, &bf16)?;
         ok &= check_cols(&mut c, &bf16)?;
         ok &= check_wide(&mut c, &bf16)?;
+        ok &= check_up_overflow(&mut c)?;
         ok &= no_local_depot(&[
             "hc_gated_norm_4",
             "hc_gated_down_4x320",
@@ -884,6 +887,44 @@ mod gate {
     /// count for the independence clause.
     const WIDE_COLS: usize = 37;
 
+    fn check_up_overflow(c: &mut Ctx) -> Result<bool, GateError> {
+        let st = c.gpu.stream();
+        let down = vec![1.0 / 4096.0; R * WIDE];
+        let up = vec![f32::from_bits(0x7f7f_0000); WIDE * R];
+        let planes = Planes::Bf16 {
+            down: DeviceTensor::upload(st, &vec![0x3980_3980; R * WIDE / 2], R, WIDE / 2)?,
+            up: DeviceTensor::upload(st, &vec![0x7f7f_7f7f; WIDE * R / 2], WIDE, R / 2)?,
+            view: DeviceTensor::upload(st, &vec![0x3980_3980; R * WIDE / 2], R * S, D / 2)?,
+        };
+        let mut site = Site::with(&c.gpu, 0x38c0_0003, card::f32_dot, planes, (down, up))?;
+        site.gamma.fill(1.0);
+        site.gamma_d.copy_from_host(st, &site.gamma)?;
+        let mut w = Wide::new(c)?;
+        let want = Some(Fault::at(LAYER_NONE, SITE));
+        let mut ok = true;
+        for m in [1, WIDE_COLS] {
+            let res = vec![1.0; m * WIDE];
+            let (lo, mixed, fault) = if m == 1 {
+                let o = mix(c, &site, false, &res, Pre::Plain, m)?;
+                (o.lo, o.mixed, o.fault)
+            } else {
+                let o = wide_mix(c, &mut w, &site, false, &res, Pre::Plain, m)?;
+                (o.lo, o.mixed, o.fault)
+            };
+            let finite_lo = lo.iter().all(|v| v.is_finite());
+            let nan = mixed.iter().all(|v| v.is_nan());
+            let pass = finite_lo && nan && fault == want;
+            println!(
+                "fault[bf16_up_overflow] m={m} finite_lo={finite_lo} mixed_all_nan={nan} fault=\"{}\" want=\"{}\" {}",
+                shown(fault),
+                shown(want),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
     /// `v` followed by zeros to `len` values: a device buffer's copy takes its
     /// whole length, and the wide scratch holds more columns than a site's run.
     fn padded(v: &[f32], len: usize) -> Vec<f32> {
@@ -919,6 +960,18 @@ mod gate {
         gemm: GemmKernels,
         route: GemmRoute,
         scratch: HcWideScratch,
+    }
+
+    impl Wide {
+        fn new(c: &Ctx) -> Result<Self, GateError> {
+            Ok(Self {
+                hcw: HcWideKernels::load(c.gpu.context())?,
+                g32: Gemm32Kernels::load(c.gpu.context())?,
+                gemm: GemmKernels::load(c.gpu.context())?,
+                route: GemmRoute::new(c.gpu.stream(), WIDE_COLS, 1)?,
+                scratch: HcWideScratch::new(c.gpu.stream(), c.geo, WIDE_COLS)?,
+            })
+        }
     }
 
     /// Everything one wide mix leaves, read back, for its `m` columns.
@@ -1042,13 +1095,7 @@ mod gate {
 
     /// Clause 8 (module doc).
     fn check_wide(c: &mut Ctx, site: &Site) -> Result<bool, GateError> {
-        let mut w = Wide {
-            hcw: HcWideKernels::load(c.gpu.context())?,
-            g32: Gemm32Kernels::load(c.gpu.context())?,
-            gemm: GemmKernels::load(c.gpu.context())?,
-            route: GemmRoute::new(c.gpu.stream(), WIDE_COLS, 1)?,
-            scratch: HcWideScratch::new(c.gpu.stream(), c.geo, WIDE_COLS)?,
-        };
+        let mut w = Wide::new(c)?;
         let mut ok = true;
         // (a) the norm and the combine: the capped entries' bits at m <= 8.
         let m = 3;
