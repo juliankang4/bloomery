@@ -162,7 +162,7 @@
 //!   made the NaN and the negative infinity a zero.
 //! - `g32_dense`: at every K above and m ∈ {1, 8, 9, 512, 4096}, one
 //!   quantization and the three entries over the dense table, 272 rows (two
-//!   full slabs and one of 16): every output inside its band of the f64
+//!   full slabs and one of 16): every checked output inside its band of the f64
 //!   reference (per block the exact integer dot, at most three f32 roundings
 //!   and the accumulation, `|y − ref| <= γ(K/32 + 3) · Σ_b (|D_b| + |M_b|)`)
 //!   and bit for bit the contract's transcription (`gemm32.rs`); the file's
@@ -178,13 +178,14 @@
 //!   dense table — 16 columns (one tile, 33 blocks: `gemm_q8_0p`), 65 (two
 //!   tiles, 66 blocks, under one wave of the card: `gemm_q8_0p`) and 1100
 //!   (18 tiles, 594 blocks: `gemm_q8_0p_slab`, one full raster group of 16
-//!   tiles and one of 2): the entry `q8_0p_slab` names for each, every
-//!   output inside its band and bit for bit the contract's transcription.
+//!   tiles and one of 2): the entry `q8_0p_slab` names for each. Numerical checks
+//!   cover all outputs at 16/65 columns and a rotating quarter at 1100;
+//!   checked outputs match the band and the contract's transcription bit for bit.
 //! - `g32_nvfp4_dense`: the resident NVFP4 planes (`mxfp4`'s `repack`, the
 //!   stack the dense gemv reads) in `gemm_nvfp4p` at Bolt's two NVFP4
 //!   projections' shapes — `ssm_in` 18560 × 4096, `ssm_out` 4096 × 8192 —
 //!   and 128 rows at both K, over the dense table for 1, 9, 64 and 448
-//!   columns: the decode ggml's, every output inside its band
+//!   columns: the decode ggml's, every checked output inside its band
 //!   `γ(2K/32 + 4) · Σ_b |scale·d_a·(d0·i0 + d1·i1)|` of the f64 reference
 //!   and bit for bit the contract (`gemm32::dot32_nv`); a rerun
 //!   bit-identical, a captured table and GEMM replayed.
@@ -3600,7 +3601,7 @@ mod gate {
         /// weight rows `e(s)·rows ..` (`None`: a host slot, whose outputs must
         /// still read [`SENT`]), column `col(s)`, one output's three ways
         /// (`dot(row, col)`: the contract's bits, the f64 value and its band's
-        /// magnitude), every output inside `γ(roundings)` of its magnitude
+        /// magnitude), every checked output inside `γ(roundings)` of its magnitude
         /// (`dot32`: the plain families' `K/32 + 3`, `dot32_nv`: `2·K/32 + 4`).
         #[allow(clippy::too_many_arguments, reason = "a gate helper's operands, named")]
         fn check_dot(
@@ -4514,8 +4515,9 @@ mod gate {
         /// Both Q8_0-plane entries over the dense table on one stack of
         /// 4112 rows at K 2560 (11.2 MB of planes, past
         /// `GEMM32_RASTER_BYTES`): 16, 65 and 1100 columns, each against the
-        /// reference and the contract's transcription. The expected entry uses
-        /// the loaded slab wave; a separate grid below it checks the selector.
+        /// reference and the contract's transcription (all outputs at 16/65
+        /// columns, a rotating quarter at 1100). Captured nodes name the launched
+        /// entry; a separate grid below the loaded wave checks the selector.
         fn slab_case(dev: &Dev<'_>) -> Result<bool, GateError> {
             if !wanted("g32_slab") {
                 return Ok(true);
@@ -4550,21 +4552,42 @@ mod gate {
                 stream.synchronize()?;
                 let (ha, want) = host_act(&x, k, m);
                 let act_ok = planes_equal(&act, m, &want, stream)?;
-                let got = gemm(
-                    dev,
-                    &res,
-                    Lay::Q8Plane,
-                    SLAB_ROWS,
-                    &act,
-                    &route,
-                    GemmInput::PerSlot,
-                    &mut y,
-                    m,
-                )?;
+                y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                let weight = res.weight(Lay::Q8Plane)?;
+                let graph = gpu.capture(|stream| {
+                    dev.g32.enqueue_gemm32(
+                        stream,
+                        Gemm32Args {
+                            w: weight,
+                            rows_per_expert: SLAB_ROWS,
+                            act: &act,
+                            route: &route,
+                            input: GemmInput::PerSlot,
+                            y: &mut y,
+                        },
+                    )
+                })?;
+                let nodes = graph.nodes()?;
+                let entry = match nodes.as_slice() {
+                    [node] => node
+                        .kernel
+                        .as_ref()
+                        .ok_or("Q8_0 GEMM node is not a kernel")?,
+                    _ => return Err("Q8_0 GEMM capture must contain one node".into()),
+                };
                 // The launch's grid: 128-row slabs times the dense table's
                 // `m / 64 + 1` tiles (`gemm_max_tiles`).
                 let grid = u32::try_from(SLAB_ROWS.div_ceil(128) * (m / 64 + 1))?;
-                let slab = dev.g32.q8_0p_slab(grid, u32::try_from(m)?, 1);
+                let expected_entry = if m > 64 && grid >= wave {
+                    "gemm_q8_0p_slab"
+                } else {
+                    "gemm_q8_0p"
+                };
+                let entry_ok = entry.name == expected_entry && entry.grid == [grid, 1, 1];
+                graph.launch(stream)?;
+                stream.synchronize()?;
+                let mut got = y.to_host_vec(stream)?;
+                got.truncate(m * SLAB_ROWS);
                 let unwritten = got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
                 let Checked {
                     checked,
@@ -4577,17 +4600,18 @@ mod gate {
                 let fault = gpu.take_fault()?;
                 let pass = act_ok
                     && dec
-                    // PIN(2026-10-20): the loaded wave replaces the fixed 1100-column entry expectation.
-                    && slab == (m > 64 && grid >= wave)
+                    // PIN(2026-10-20): captured entry and grid replace the recomputed selector assertion.
+                    && entry_ok
                     && unwritten == 0
                     && band_off == 0
                     && bits_off == 0
                     && fault.is_none();
                 println!(
-                    "gemm32 case=g32_slab K={k} m={m} rows={SLAB_ROWS} grid={grid} slab={slab} \
-                     act_eq_host={act_ok} decode_vs_ggml={dec} unwritten={unwritten} \
+                    "gemm32 case=g32_slab K={k} m={m} rows={SLAB_ROWS} grid={grid} \
+                     entry={} entry_ok={entry_ok} act_eq_host={act_ok} decode_vs_ggml={dec} unwritten={unwritten} \
                      checked={checked} worst_err_over_band={worst:.3} band_off={band_off} \
                      contract_bits_differ={bits_off} y_fnv={:016x} {}",
+                    entry.name,
                     Fnv1a64::default().f32s(&got).value(),
                     verdict(pass)
                 );
@@ -4787,7 +4811,7 @@ mod gate {
 
         /// The resident NVFP4 planes (`mxfp4`'s `repack`, the stack the dense
         /// gemv reads) in `gemm_nvfp4p` over the dense table at
-        /// [`NV_SHAPES`] × [`NV_MS`]: the decode ggml's, every output in its
+        /// [`NV_SHAPES`] × [`NV_MS`]: the decode ggml's, every checked output in its
         /// band `γ(2K/32 + 4) · Σ_b |scale·d_a·(d0·i0 + d1·i1)|` of the f64
         /// reference and bit for bit the contract's transcription
         /// (`gemm32::dot32_nv`); a rerun bit-identical, a captured table and
@@ -5375,8 +5399,8 @@ mod gate {
         /// The IQ4_NL down of the Qwen3.8 card route (`gemm_iq4nl`): a
         /// synthetic stack of 64 experts × 2560 rows at K 640 (random nibble
         /// codes, finite f16 `d`), each slot its own column, the four routings
-        /// at TOKENS; the decode against ggml's `dequant_row`, every output
-        /// in its band and bit for bit the contract with `y_fnv`, a rerun
+        /// at TOKENS; the decode against ggml's `dequant_row`, every checked
+        /// output in its band and bit for bit the contract with `y_fnv`, a rerun
         /// bit-identical, a NaN `d` block's outputs NaN, and the host API's
         /// refusal of the stack at another K.
         fn iq4nl_case(dev: &Dev<'_>) -> Result<bool, GateError> {
