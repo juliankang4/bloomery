@@ -2061,6 +2061,19 @@ mod tests {
             e.contains("64 columns are not 4 V heads of 16 whole blocks"),
             "{e}"
         );
+        // Four V heads of one MXFP8 block each: the blocks move whole, each byte unchanged.
+        let block = |h: u8| -> Vec<u8> { (0..33).map(|i| 33 * h + i).collect() };
+        let mut x = Normal {
+            type_id: gguf::quant::GgmlType::MXFP8.as_u32(),
+            dims: vec![128, 1],
+            bytes: (0..4).flat_map(block).collect(),
+            scale: vec![],
+        };
+        Step::VCols { head: 32 }.apply(&g, "x", &mut x).unwrap();
+        assert_eq!(
+            x.bytes,
+            [0, 2, 1, 3].into_iter().flat_map(block).collect::<Vec<_>>()
+        );
     }
 
     /// A table in two FP8 parts, each with its own scale: each part reads its own, so unequal

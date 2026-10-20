@@ -23,7 +23,9 @@
 
 use std::collections::HashMap;
 
-use gguf::quant::{E4m3Rows, GgmlType, Nvfp4Rows, Q8Block, QuantError, fp4_pair, ue4m3_to_f32_half};
+use gguf::quant::{
+    E4m3Rows, GgmlType, Nvfp4Rows, Q8Block, QuantError, check_mxfp8, fp4_pair, ue4m3_to_f32_half,
+};
 
 use crate::csf;
 use crate::quant_config::{Format, Placed};
@@ -104,6 +106,7 @@ pub struct Normal {
 /// |---|---|---|
 /// | NVFP4 (ModelOpt) | NVFP4 (40), `.scale` a tensor or an expert (`linear`, `experts`) | [`GgmlType::NVFP4_ROWS`], `.scale` the table's |
 /// | NVFP4 with `csf` or `csf_32x2_v1` scales | as NVFP4, the scales decoded first ([`csf`]) | none |
+/// | MXFP8 (E8M0 `weight_scale` a 32 values) | [`GgmlType::MXFP8`], bytes as stored (`mxfp8`) | none |
 /// | BF16, F32 | Q8_0, F32 or BF16 as [`Plain`] says | none |
 /// | FP8 with one tensor scale (its companion) | none | [`GgmlType::F8E4M3_ROWS`], bytes as stored |
 ///
@@ -115,6 +118,7 @@ pub fn type_of(format: Format, role: Use) -> Option<u32> {
             Some(GgmlType::NVFP4.as_u32())
         }
         (Format::Nvfp4, Use::Rows) => Some(GgmlType::NVFP4_ROWS.as_u32()),
+        (Format::Mxfp8, Use::Matrix(_)) => Some(GgmlType::MXFP8.as_u32()),
         (Format::Bf16 | Format::F32, Use::Matrix(Plain::Q8_0)) => Some(GgmlType::Q8_0.as_u32()),
         (Format::Bf16 | Format::F32, Use::Matrix(Plain::F32)) => Some(GgmlType::F32.as_u32()),
         (Format::Bf16, Use::Matrix(Plain::Bf16)) => Some(GgmlType::BF16.as_u32()),
@@ -211,6 +215,7 @@ pub fn normalize<'a>(
                 sources.len()
             )));
         }
+        Format::Mxfp8 => return mxfp8(get, sources[0], type_id),
         _ => return plain(get, name, placed, role, type_id),
     };
     if role == Use::Rows {
@@ -387,6 +392,72 @@ fn nvfp4_rows<'a>(
         dims: vec![k, rows as u64],
         bytes,
         scale: vec![scale],
+    })
+}
+
+/// The MXFP8 weight `source` as [`GgmlType::MXFP8`], moved without a change of value: each
+/// row's 32-value blocks in order, each its E8M0 `weight_scale` byte then its 32 F8_E4M3 value
+/// bytes as stored. A block [`check_mxfp8`] refuses (an E8M0 or E4M3 NaN, a product past f32) is
+/// refused naming its row.
+fn mxfp8<'a>(
+    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    (weight, placed): (&str, &Placed),
+    type_id: u32,
+) -> Result<Normal, Error> {
+    let refuse = |what: String| Error::Format {
+        name: weight.to_string(),
+        format: Format::Mxfp8,
+        what,
+    };
+    let [sname] = placed.companions.as_slice() else {
+        return Err(refuse(format!(
+            "its place names {:?}, not one E8M0 scale",
+            placed.companions
+        )));
+    };
+    let (w, s) = (get(weight)?, get(sname)?);
+    let &[rows, k] = w.shape else {
+        return Err(refuse(format!("shape {:?}, not [rows, k]", w.shape)));
+    };
+    if w.dtype != Dtype::F8E4M3 || rows == 0 || k == 0 || !k.is_multiple_of(32) {
+        return Err(refuse(format!(
+            "{} {:?}, not F8_E4M3 rows of whole 32-value blocks",
+            w.dtype.name(),
+            w.shape
+        )));
+    }
+    let blocks = rows.checked_mul(k / 32);
+    if !matches!(s.dtype, Dtype::U8 | Dtype::F8E8M0)
+        || s.shape != [rows, k / 32]
+        || Some(s.bytes.len()) != blocks
+        || Some(w.bytes.len()) != rows.checked_mul(k)
+    {
+        return Err(refuse(format!(
+            "{sname} {} {:?} ({} bytes), {} bytes of values: not one E8M0 byte a 32 values",
+            s.dtype.name(),
+            s.shape,
+            s.bytes.len(),
+            w.bytes.len()
+        )));
+    }
+    let capacity = w
+        .bytes
+        .len()
+        .checked_add(s.bytes.len())
+        .ok_or_else(|| refuse("block bytes size overflow".into()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    for (values, &e) in w.bytes.as_chunks::<32>().0.iter().zip(s.bytes) {
+        bytes.push(e);
+        bytes.extend_from_slice(values);
+    }
+    for (row, blocks) in bytes.chunks_exact(bytes.len() / rows).enumerate() {
+        check_mxfp8(blocks).map_err(|e| refuse(format!("row {row}: {e}")))?;
+    }
+    Ok(Normal {
+        type_id,
+        dims: vec![k as u64, rows as u64],
+        bytes,
+        scale: vec![],
     })
 }
 
@@ -952,6 +1023,7 @@ mod tests {
             )
         );
 
+        // PIN(2026-10-20): positive MXFP8 matrix and NVFP4 row tests replace their unsupported-pair cases.
         let refused = |names: &[&str], p: Placed, role: Use, want: &str| {
             let names: Vec<_> = names.iter().map(|n| (*n, &p)).collect();
             let e = normalize(get, &names, role).unwrap_err().to_string();
@@ -960,8 +1032,8 @@ mod tests {
         refused(
             &["b.weight"],
             placed(Format::Mxfp8, &[]),
-            m,
-            "b.weight: MXFP8 read as Matrix(Q8_0) has no GGUF type here",
+            Use::Rows,
+            "b.weight: MXFP8 read as Rows has no GGUF type here",
         );
         refused(
             &["b.weight"],
@@ -1084,6 +1156,107 @@ mod tests {
             }
         }
         assert!(missed.is_empty(), "accepted: {missed:?}");
+    }
+
+    /// An MXFP8 weight moves into [`GgmlType::MXFP8`] bit for bit, whatever its role's plain
+    /// type: block `(r, b)` is scale byte `[r, b]` then value bytes `[r, 32 b ..][..32]`, so
+    /// splitting the blocks gives back the checkpoint's bytes, and `dequant_row` gives each
+    /// value as its E4M3 byte times `2^(e - 127)` (decoded here from the bits). A stack, a block
+    /// `check_mxfp8` refuses, and a weight or scale of the wrong shape are refused by name.
+    #[test]
+    fn mxfp8_weights_move_into_the_mxfp8_block_unchanged() {
+        let (rows, k) = (3, 64);
+        let values: Vec<u8> = (0..rows * k)
+            .map(|i| (i * 37 % 256) as u8)
+            .map(|b| if b & 0x7F == 0x7F { b ^ 1 } else { b })
+            .collect();
+        let scales = [127u8, 120, 134, 1, 140, 0];
+        let file = |values: &[u8], scales: &[u8], scale_shape: &[usize]| {
+            Safetensors::parse(write(&[
+                ("m.weight", "F8_E4M3", &[rows, k][..], values),
+                ("m.weight_scale", "U8", scale_shape, scales),
+            ]))
+            .unwrap()
+        };
+        let p = Placed {
+            format: Format::Mxfp8,
+            companions: vec!["m.weight_scale".into()],
+        };
+        let st = file(&values, &scales, &[rows, 2]);
+        let get = |n: &str| st.raw(n);
+        for plain in [Plain::Q8_0, Plain::F32, Plain::Bf16] {
+            let n = normalize(get, &[("m.weight", &p)], Use::Matrix(plain)).unwrap();
+            assert_eq!(
+                (n.type_id, &n.dims, n.bytes.len(), n.scale.len()),
+                (GgmlType::MXFP8.as_u32(), &vec![64, 3], 6 * 33, 0)
+            );
+            let (mut back_scales, mut back_values) = (vec![], vec![]);
+            for block in n.bytes.as_chunks::<33>().0 {
+                back_scales.push(block[0]);
+                back_values.extend_from_slice(&block[1..]);
+            }
+            assert_eq!((&back_scales[..], &back_values), (&scales[..], &values));
+            let mut got = vec![0f32; rows * k];
+            dequant_row(GgmlType::MXFP8, &n.bytes, &mut got).unwrap();
+            for (i, (&g, &v)) in got.iter().zip(&values).enumerate() {
+                let (exp, man) = (i32::from((v >> 3) & 0xF), f64::from(v & 7));
+                let mag = if exp == 0 {
+                    man / 8.0 * 2f64.powi(-6)
+                } else {
+                    (1.0 + man / 8.0) * 2f64.powi(exp - 7)
+                };
+                let sign = if v & 0x80 == 0 { 1.0 } else { -1.0 };
+                let want = sign * mag * 2f64.powi(i32::from(scales[i / 32]) - 127);
+                assert_eq!(
+                    g.to_bits(),
+                    (want as f32).to_bits(),
+                    "value {i} byte {v:#04x}"
+                );
+            }
+        }
+
+        let refused = |st: &Safetensors, sources: &[(&str, &Placed)], want: &str| {
+            let e = normalize(|n| st.raw(n), sources, Use::Matrix(Plain::Q8_0))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(want), "{e}");
+        };
+        let two = [("m.weight", &p), ("m.weight", &p)];
+        refused(&st, &two, "in a stack of 2: only NVFP4 experts stack here");
+        let mut nan = scales;
+        nan[3] = 0xFF;
+        refused(
+            &file(&values, &nan, &[rows, 2]),
+            &two[..1],
+            "m.weight: MXFP8 row 1:",
+        );
+        let mut bad = values.clone();
+        bad[2 * k + 5] = 0x7F;
+        refused(&file(&bad, &scales, &[rows, 2]), &two[..1], "MXFP8 row 2:");
+        refused(
+            &file(&values, &scales, &[rows * 2]),
+            &two[..1],
+            "m.weight_scale U8 [6] (6 bytes), 192 bytes of values: not one E8M0 byte a 32 values",
+        );
+        let bare = Placed {
+            format: Format::Mxfp8,
+            companions: vec![],
+        };
+        refused(
+            &st,
+            &[("m.weight", &bare)],
+            "its place names [], not one E8M0 scale",
+        );
+        let odd = Safetensors::parse(write(&[
+            ("m.weight", "F8_E4M3", &[4, 48][..], &values),
+            ("m.weight_scale", "U8", &[4, 1], &scales[..4]),
+        ]))
+        .unwrap();
+        refused(
+            &odd,
+            &two[..1],
+            "F8_E4M3 [4, 48], not F8_E4M3 rows of whole 32-value blocks",
+        );
     }
 
     /// The compressed-scale lines and the row line. A `csf` and a `csf_32x2_v1` weight, a
