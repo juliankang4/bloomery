@@ -709,8 +709,10 @@ sj_selftest() {
   trap st_cleanup EXIT
   trap 'exit 143' TERM
   trap 'exit 130' INT
+  # The stub tables read no official model rows from the caller's data directory.
+  mkdir "$T/bin" "$T/data" || exit 2
+  export BLOOMERY_DATA=$T/data
   # A host without timeout (the Mac) takes the stand-in the other self-tests use.
-  mkdir "$T/bin"
   if ! command -v timeout > /dev/null; then
     cp "$HERE/stub-timeout.py" "$T/bin/timeout" && chmod +x "$T/bin/timeout" || exit 2
   fi

@@ -46,6 +46,20 @@ cp "$T/tools/box.sh" "$tmp/old/tools/box.sh"
 cp "$T/tools/box.sh" "$tmp/nocard/tools/box.sh"
 cp "$ROOT/tools/ref/card.py" "$ROOT/tools/ref/tdist.py" "$tmp/nocard/tools/ref/"
 
+# The schemajump stub self-test must not read the caller's official rows.
+python3 -I - "$ROOT/tools/ref/clef" "$tmp/sj-data" << 'PY' || exit 70
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from e2e import SUITES
+
+for _, _, ref in SUITES:
+    path = Path(sys.argv[2]) / ref
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("not JSON\n")
+PY
+
 # The depth-serve runner's stub tests (arms, rotation, refusals, the servers' stop, the tables' math; a stub server, no lease) are one
 # long process that mostly waits on its stub servers, so it runs beside every test below and is judged at the end. The runner calls
 # lease_take, so gate-batch's walker refuses check-recipes for naming it; a *-tests directory is the harness the walker does not read.
@@ -53,7 +67,7 @@ bash "$ROOT/tools/ref/depth-serve.sh" --self-test > "$tmp/depth-serve.out" 2>&1 
 depth_pid=$!
 # The schemajump against Clef-Flash runner's stub tests (the refusals, the windows' servers and their lever, a server that does not
 # start or never listens, a TERM mid-window, the ruler's math) are the same kind of process: a stub server, no lease.
-bash "$ROOT/tools/ref/sj-vs-clef.sh" --self-test > "$tmp/sj-vs-clef.out" 2>&1 &
+BLOOMERY_DATA="$tmp/sj-data" bash "$ROOT/tools/ref/sj-vs-clef.sh" --self-test > "$tmp/sj-vs-clef.out" 2>&1 &
 sj_pid=$!
 
 pass() { n=$((n + 1)); echo "ok $1"; }
