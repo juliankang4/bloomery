@@ -427,7 +427,7 @@ pub struct Card {
 
 impl Card {
     /// No layout and no entry: a type the card neither loads nor runs.
-    pub const NONE: Card = Card {
+    pub(crate) const NONE: Card = Card {
         layout: None,
         routed: None,
         gate_up: None,
@@ -471,7 +471,7 @@ macro_rules! card {
 pub(crate) use card;
 
 impl GgmlType {
-    /// The card columns of the type's row; [`Card::NONE`] for a tag with no
+    /// The card columns of the type's row; `Card::NONE` for a tag with no
     /// row, which has no layout and no entry.
     #[must_use]
     pub const fn card(self) -> Card {
