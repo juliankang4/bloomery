@@ -620,9 +620,7 @@ mod gate {
         let mut first_ok = true;
         for (f, z) in flips.iter().zip(&logits_at) {
             let cap = fx_route_cap(bands.router[f.layer], z);
-            let first = !flips
-                .iter()
-                .any(|g| g.layer < f.layer && g.token <= f.token);
+            let first = f.layer == 0 || !on_path(&flips, f.layer - 1, f.token, false);
             if first {
                 first_ok &= f.allowed(cap);
             }

@@ -235,12 +235,6 @@ impl Rank {
         self.link.as_ref().map(|l| (&l.layout, &l.page))
     }
 
-    /// The trunk's layers.
-    #[must_use]
-    pub fn layers(&self) -> usize {
-        self.cfg.len()
-    }
-
     /// Keep every layer's streams and every routed layer's picks after each step, or stop. Taps
     /// are armed before the first step ([`arm_at`]): arming later is refused by name, so the
     /// readers never hand back buffers no step wrote.
@@ -461,7 +455,7 @@ pub fn step(ranks: &mut [(&Gpu, &mut Rank)], token: u32, pos: u32) -> Result<u32
         }
         at_pos(r.next_pos, r.ctx, pos)?;
     }
-    let layers = ranks.iter().map(|(_, r)| r.layers()).max().unwrap_or(0);
+    let layers = ranks.iter().map(|(_, r)| r.cfg.len()).max().unwrap_or(0);
     for (gpu, r) in ranks.iter_mut() {
         r.begin(gpu, token, pos)?;
     }
