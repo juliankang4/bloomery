@@ -9,8 +9,11 @@
 //! either is refused by name. What the dims, units and blocks are comes from the caller: the
 //! family says which dim and unit ([`TpTensor::cut`]), the tensor's format its bytes and blocks.
 
+use gguf::GgmlType;
+
 use super::devices::DeviceId;
 use super::workstation::{CardSpec, unified_of};
+use crate::kernels;
 
 /// A tensor as the plan takes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,7 +25,8 @@ pub struct TpTensor {
     pub bytes: u64,
     /// The bytes every rank holds whole beside its part (a tensor scale a matrix).
     pub whole_bytes: u64,
-    /// The values a format block spans along dims 0 and 1.
+    /// The values a part keeps whole along dims 0 and 1: the format's block, along dim 0 at
+    /// least the card layout's unit ([`card_blocks`]).
     pub block: [u64; 2],
     /// `None` keeps the tensor whole on every rank.
     pub cut: Option<Cut>,
@@ -82,6 +86,26 @@ impl Cut {
         }
         Ok(part)
     }
+}
+
+/// The values a part of a tensor of card type `ty`, whose format block spans `block` values along
+/// dims 0 and 1, keeps whole: along dim 0 the least multiple of the block and the card layout's K
+/// unit ([`kernels::card_k_unit`]), so a cut never leaves a rank a part the card cannot hold. A
+/// block past u64 is refused.
+///
+/// # Errors
+///
+/// [`TpError::Overflow`].
+pub fn card_blocks(ty: GgmlType, block: [u64; 2]) -> Result<[u64; 2], TpError> {
+    let unit = kernels::card_k_unit(ty);
+    let (mut gcd, mut b) = (block[0], unit);
+    while b != 0 {
+        (gcd, b) = (b, gcd % b);
+    }
+    let k = (block[0] / gcd)
+        .checked_mul(unit)
+        .ok_or(TpError::Overflow)?;
+    Ok([k, block[1]])
 }
 
 /// One rank's node, by the name its lines print, and the bytes its pool holds for the rank.
@@ -261,7 +285,7 @@ pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, Tp
 
 #[cfg(test)]
 mod tests {
-    use super::{Cut, RankPool, TpError, TpTensor, plan_tp};
+    use super::{Cut, GgmlType, RankPool, TpError, TpTensor, card_blocks, plan_tp};
 
     fn pools(n: usize, bytes: u64) -> Vec<RankPool> {
         (0..n)
@@ -447,5 +471,34 @@ mod tests {
             TpError::Unit { extent: 0, .. }
         ));
         assert_eq!(plan_tp(&[], &[]).unwrap_err(), TpError::NoRank);
+    }
+
+    /// A cut along K keeps the card layout's unit whole past the format's 32-value block: MXFP8
+    /// planes 128 values (K 4096 at N = 32 is 128 a rank, at N = 64 64), an MXFP4 stack 256 (K
+    /// 1024 at N = 4 is 256, at N = 8 128); a type whose block is its layout keeps its block.
+    #[test]
+    fn a_cut_keeps_the_card_layouts_k_unit_whole() {
+        for (ty, k, fits, cuts) in [
+            (GgmlType::MXFP8, 4096, 32, 64),
+            (GgmlType::MXFP4, 1024, 4, 8),
+        ] {
+            let block = card_blocks(ty, [32, 1]).unwrap();
+            let down = || t("down", k, 64, block, Some(Cut { dim: 0, unit: 1 }));
+            assert!(plan_tp(&pools(fits, u64::MAX), &[down()]).is_ok(), "{ty}");
+            assert!(
+                matches!(
+                    plan_tp(&pools(cuts, u64::MAX), &[down()]).unwrap_err(),
+                    TpError::Block { .. }
+                ),
+                "{ty}"
+            );
+        }
+        assert_eq!(card_blocks(GgmlType::NVFP4, [64, 1]), Ok([64, 1]));
+        assert_eq!(card_blocks(GgmlType::Q4_K, [256, 1]), Ok([256, 1]));
+        assert_eq!(card_blocks(GgmlType::MXFP8, [48, 128]), Ok([384, 128]));
+        assert_eq!(
+            card_blocks(GgmlType::MXFP4, [u64::MAX, 1]),
+            Err(TpError::Overflow)
+        );
     }
 }

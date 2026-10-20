@@ -176,6 +176,22 @@ pub const fn card_planes_runs(ty: GgmlType) -> bool {
         && matches!(down(ty), Some((DownEntry::Nvfp4, DownAct::Q8Blocks32)))
 }
 
+/// The values along K (dim 0) a card layout of a tensor of type `ty` holds whole beyond the
+/// type's own block, a power of two: an MXFP4 stack's 256, the q8_1 activation's block its rows
+/// are read against (`MxStack::upload` in `crates/gpu/src/mxfp4_sel.rs`), and MXFP8's 128, one
+/// scale word of four blocks (`mxfp8_planes` in `crates/gpu/src/q8f32.rs`); 1 for every other
+/// type. A tensor-parallel part keeps it whole ([`crate::placement::tp::card_blocks`]).
+#[must_use]
+pub const fn card_k_unit(ty: GgmlType) -> u64 {
+    if matches!(gate_up(ty), Some(GateUpEntry::Mxfp4)) {
+        256
+    } else if matches!(dense(ty), Some(SiteEntry::Mxfp8)) {
+        128
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

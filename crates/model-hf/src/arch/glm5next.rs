@@ -12,8 +12,8 @@
 //! weight's caller gives its unpacked shape.
 //!
 //! Tensor parallel splits each mapped tensor by the family's rule ([`tp::cut`]); the bytes and the
-//! blocks a cut keeps are its format's ([`Format::held`]), and the plan is
-//! [`plan_tp`](model::placement::tp::plan_tp)'s.
+//! blocks a cut keeps are its format's ([`Format::held`]), along K at least its card layout's
+//! unit ([`card_blocks`]), and the plan is [`plan_tp`](model::placement::tp::plan_tp)'s.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -22,7 +22,7 @@ use hf::quant_config::{self, Config, Format};
 use hf::safetensors::{Dtype, Folder};
 use model::arch::glm5next::names::{self, Sub};
 use model::arch::glm5next::tp;
-use model::placement::tp::TpTensor;
+use model::placement::tp::{TpTensor, card_blocks};
 use serde_json::Value;
 
 /// Why the checkpoint was refused.
@@ -397,6 +397,10 @@ pub fn tp_tensors(
             let h = f
                 .held(&dims)
                 .ok_or_else(|| refuse(&name, format!("no held form for {f} {dims:?}")))?;
+            let block = match f.card_type() {
+                Some(ty) => card_blocks(ty, h.block).map_err(|e| refuse(&name, e.to_string()))?,
+                None => h.block,
+            };
             Ok(TpTensor {
                 cut: tp::cut(&name, &dims, g.heads as u64)
                     .map_err(|why| refuse(&name, why.to_string()))?,
@@ -404,7 +408,7 @@ pub fn tp_tensors(
                 dims,
                 bytes: h.bytes,
                 whole_bytes: h.whole_bytes,
-                block: h.block,
+                block,
             })
         })
         .collect()
@@ -747,6 +751,12 @@ mod tests {
             .find(|t| t.name == "blk.3.attn_q_b.weight")
             .unwrap();
         assert_eq!(q_b.bytes, 16_384 * 1536 / 128 * 132);
+        // The MXFP8 projections cut along K keep the planes' 128 values a rank, past the 32 of
+        // the format's block.
+        for name in ["blk.0.ffn_down.weight", "blk.0.attn_output.weight"] {
+            let block = ts.iter().find(|t| t.name == name).map(|t| t.block);
+            assert_eq!(block, Some([128, 1]), "{name}");
+        }
         let mut no_bias = table.clone();
         no_bias.retain(|(n, _, _)| !n.ends_with(".mlp.gate.e_score_correction_bias"));
         assert_eq!(table.len() - no_bias.len(), 2);
@@ -1032,8 +1042,9 @@ mod tests {
     // PIN(2026-10-20): was cuts_off_a_head_or_a_block_and_unknown_stems_are_refused; its per-tensor
     // refusals (a stem with no rule, a split tensor of other dims) moved with the rule to
     // model::arch::glm5next::tp::cut, whose test holds them.
-    /// A table with no text tensors, 64 heads into 3 ranks and a routed down's 2,048 inputs into 64
-    /// ranks (32 a rank, off the 64-value NVFP4 block) are refused by name.
+    /// A table with no text tensors, 64 heads into 3 ranks, the MXFP8 down's 12,288 inputs into 64
+    /// ranks (192 a rank, off the planes' 128) and a routed down's 2,048 (32 a rank, off the
+    /// 64-value NVFP4 block) are refused by name.
     #[test]
     fn a_table_without_text_and_cuts_off_a_head_or_a_block_are_refused() {
         let (g, quant, _, table) = fp4_local();
@@ -1071,9 +1082,26 @@ mod tests {
         let ts = tp_tensors(g, &quant, &table).unwrap();
         let e = plan_tp(&pools(3), &ts).unwrap_err();
         assert!(matches!(&e, TpError::Unit { ranks: 3, .. }), "{e}");
+        // At 64 ranks the MXFP8 down's 192 values a rank are off its planes' 128, and the NVFP4
+        // experts' 32 off their 64-value block.
         let e = plan_tp(&pools(64), &ts).unwrap_err();
         assert_eq!(
             e,
+            TpError::Block {
+                name: "blk.0.ffn_down.weight".into(),
+                dim: 0,
+                extent: 12288,
+                ranks: 64,
+                block: 128
+            }
+        );
+        let exps: Vec<_> = ts
+            .iter()
+            .filter(|t| t.name == "blk.3.ffn_down_exps.weight")
+            .cloned()
+            .collect();
+        assert_eq!(
+            plan_tp(&pools(64), &exps).unwrap_err(),
             TpError::Block {
                 name: "blk.3.ffn_down_exps.weight".into(),
                 dim: 0,

@@ -15,7 +15,7 @@ use bloomery_gpu::GpuError;
 use bloomery_gpu::weights::{TensorPart, check_part_bytes};
 use gguf::{Split, TensorInfo};
 use model::arch::glm5next::tp;
-use model::placement::tp::Cut;
+use model::placement::tp::{Cut, card_blocks};
 
 /// What the errors name.
 const WHAT: &str = "glm5next tp source";
@@ -105,8 +105,9 @@ impl GgufSource<'_> {
 
 /// Rank `at`'s part of tensor `t` cut by `cut` (module doc): the part's header entry (its dims,
 /// its bytes) and the byte ranges of its rows in the tensor's bytes, in row order. A tensor whose
-/// dims and bytes disagree, a cut the plan's rule refuses (`Cut::part`, the type's block along
-/// dim 0) and byte counts past u64 or usize are refused by name.
+/// dims and bytes disagree, a cut the plan's rule refuses (`Cut::part`, along dim 0 the type's
+/// block and its card layout's unit, `card_blocks`) and byte counts past u64 or usize are refused
+/// by name.
 fn part_of(
     t: &TensorInfo,
     cut: Option<Cut>,
@@ -125,8 +126,8 @@ fn part_of(
         t.ty.blck_size()
             .filter(|&b| b > 0)
             .ok_or_else(|| refuse(format!("{} has no block size", t.ty)))?;
-    let part = cut
-        .part(&t.name, &t.dims, [block, 1], at.ranks)
+    let part = card_blocks(t.ty, [block, 1])
+        .and_then(|blocks| cut.part(&t.name, &t.dims, blocks, at.ranks))
         .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
     let extent = t.dims[dim];
     let rows: u64 = t.dims[1..].iter().product();
@@ -294,8 +295,8 @@ mod tests {
     }
 
     /// An extent the ranks do not divide, a part of other than whole units, a dim-0 part off the
-    /// type's block, a dim past the tensor's, no rank, and a width the ranks do not divide or
-    /// outnumber are refused.
+    /// type's block or its card layout's K unit, a dim past the tensor's, no rank, and a width the
+    /// ranks do not divide or outnumber are refused.
     #[test]
     fn a_cut_off_its_unit_or_block_is_refused() {
         let (t, _) = tensor(GgmlType::Q5_K, &[512, 6, 4]);
@@ -309,6 +310,10 @@ mod tests {
         ] {
             assert!(part_of(&t, Some(cut), rank).is_err(), "{cut:?} {rank:?}");
         }
+        // An MXFP4 stack's card layout keeps 256 values along K: 1024 into 4 ranks, not into 8.
+        let (mx, _) = tensor(GgmlType::MXFP4, &[1024, 4]);
+        let k = Some(Cut { dim: 0, unit: 1 });
+        assert!(part_of(&mx, k, at(0, 4)).is_ok() && part_of(&mx, k, at(0, 8)).is_err());
         assert!(RankOf::new(0, 0).is_err() && RankOf::new(2, 2).is_err());
         assert_eq!(at(1, 4).part("heads", 64).unwrap(), 16);
         assert!(at(0, 4).part("heads", 6).is_err() && at(0, 4).part("heads", 2).is_err());
