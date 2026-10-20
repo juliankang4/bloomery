@@ -272,7 +272,7 @@ mod gate {
     }
 
     /// The tensors `keep` names, each whole on card 0 in the format the
-    /// engine's placed load gives its role (`CardFormat::of_role`: an engram
+    /// engine's placed load gives its role (`card_format_of_role`: an engram
     /// gain in a K-quant is decoded to f32 at load, the form the piece reads
     /// its gains in). `Weights::load_where` takes the type's format alone.
     fn load_kept(

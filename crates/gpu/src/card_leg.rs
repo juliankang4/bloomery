@@ -2008,11 +2008,14 @@ pub(crate) mod tests {
             scales: &scales,
         });
         let words = StackW::Words(&qs);
+        // PIN(2026-10-21): IQ2_XXS's words join the grouped routes with the
+        // table's GEMM row for the type (`gemm_iq2xxs`).
         for ty in [
             GgmlType::Q3_K,
             GgmlType::Q4_K,
             GgmlType::Q5_K,
             GgmlType::Q6_K,
+            GgmlType::IQ2_XXS,
             GgmlType::IQ3_XXS,
             GgmlType::IQ4_XS,
         ] {
@@ -2049,12 +2052,7 @@ pub(crate) mod tests {
             assert!(planes.route(ty).is_none(), "{ty} in planes");
         }
         assert!(words.route(GgmlType::NVFP4).is_none(), "NVFP4 as words");
-        for ty in [
-            GgmlType::IQ2_XXS,
-            GgmlType::MXFP4,
-            GgmlType::Q5_0,
-            GgmlType::F32,
-        ] {
+        for ty in [GgmlType::MXFP4, GgmlType::Q5_0, GgmlType::F32] {
             assert!(kernels::gemm(ty).is_none(), "{ty} has a GEMM row");
             assert!(words.route(ty).is_none(), "{ty}");
         }

@@ -177,6 +177,7 @@ crates/models/src/lib.rs	derive	its re-exports (Role, Need: every placement path
 crates/models/src/shape.rs	derive	MoeShape and the router rows (RouterInst, router_row) the routers' kernels select by
 crates/gguf/src/lib.rs	derive	LoadError (in GpuError and placement's errors) and Gguf: every gate that reads a file or names a load error
 crates/gguf/src/{quant.rs,qtype.rs}	derive	GgmlType (gguf's lib.rs, placement) and the f16 conversion the card's fused kernels name; gate-dspark-read also runs gguf's own quant tests
+crates/gguf/src/card.rs	derive	the card columns of a type's row (CardFormat and the card kernel entries, which placement re-exports): every gate that plans a placement or launches by a card entry
 crates/gguf/src/iq_tables.rs	derive	KVALUES_IQ4NL, which quant.rs's dequant and the card's IQ kernels read
 crates/qdot/src/{lib,generic}.rs	derive	QdotError in ModelError, and the fused dots coverage and quant ask for
 crates/threads/src/lib.rs	derive	the pool: upload's memcpy_pool, ops' matmul and the host tier's legs

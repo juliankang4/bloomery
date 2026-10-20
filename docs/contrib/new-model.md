@@ -213,7 +213,7 @@ MiMo's first card-expert design skipped two rows, with these results:
 | Owner | Where it lives | How a model attaches |
 |---|---|---|
 | Placement plan | `placement::plan_routed` (`crates/placement/src/placement.rs:1771`) | Pass the model's card rule; no model-owned planner |
-| Kernel table | `crates/placement/src/kernels.rs` | A quant type gets a row there; the body dispatches through the table, never by matching `GgmlType` itself |
+| Kernel table | The card columns of each type's `QROWS` row (`crates/gguf/src/qtype.rs`), read by operation in `crates/placement/src/kernels.rs` | A quant type gets its card columns in its row; the body dispatches through `kernels`, never by matching `GgmlType` itself |
 | Card expert leg | Each family's own today (the three files above) | Call an existing leg, or lift it to a common owner in `crates/gpu`; never add a copy |
 | Residency (hot experts move to the card at run time) | `crates/gpu/src/host/served.rs` (`TierBody::residency_parts`, `ResidencyParts`) | The body's `residency_parts` returns `Some`; glue like GLM's `crates/gpu-glm5next/src/swap.rs` (72 lines) |
 | Expert tier (a second card holds experts) | `crates/gpu/src/host/tier.rs` | Glue like `crates/gpu-glm5next/src/tier.rs` or `crates/gpu/src/arch/qwen3moe/tier38.rs` |
