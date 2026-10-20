@@ -263,8 +263,9 @@ macro_rules! w32 {
         if $live {
             // SAFETY: block `n` is inside the stack (the launch contract
             // holds `8 · n_experts · rows · K/32` words), its eight words
-            // start at word `8n`, 32-byte aligned; the destination is the
-            // pair's eight words of its staged row, 16-byte aligned.
+            // start at word `8n`, 16-byte aligned by the host's base check;
+            // the destination is the pair's eight words of its staged row,
+            // 16-byte aligned.
             unsafe {
                 let src = $qs.as_ptr().add(8 * $n);
                 let dst = $dst.add(8 * $pj);
@@ -1111,7 +1112,8 @@ macro_rules! gemm32_block {
 #[derive(Clone, Copy)]
 pub enum Gemm32Weight<'a> {
     /// Q8_0 in the q8f32 planes: `qs` rows × K/4 words, `d` rows × K/32
-    /// f16 scale bits.
+    /// f16 scale bits. `qs` must be 16-byte aligned; slab launches also
+    /// require `d` to be 16-byte aligned.
     Q8_0Plane {
         qs: &'a DeviceTensor<u32>,
         d: &'a DeviceTensor<u16>,
@@ -1412,6 +1414,11 @@ impl Gemm32Kernels {
         }
         match w {
             Gemm32Weight::Q8_0Plane { qs, d } => {
+                crate::tensor::check_alignment::<cuda_device::vector::U32x4, _>(
+                    "Gemm32Kernels::enqueue_gemm32",
+                    "Q8_0 code plane",
+                    qs.buf(),
+                )?;
                 if self.q8_0p_slab(g.grid, g.n_slots, g.n_experts) {
                     crate::tensor::check_alignment::<cuda_device::vector::U32x4, _>(
                         "Gemm32Kernels::enqueue_gemm32",

@@ -4601,37 +4601,51 @@ mod gate {
             scales.insert(0, 0);
             let parent = DeviceBuffer::from_host(stream, &scales)?;
             let d_off = DeviceTensor::<u16>::window_of(&parent, 2, SLAB_ROWS, k / 32)?;
-            y.copy_from_host(stream, &vec![SENT; y.len()])?;
-            let got = dev.g32.enqueue_gemm32(
-                stream,
-                Gemm32Args {
-                    w: Gemm32Weight::Q8_0Plane { qs, d: &d_off },
-                    rows_per_expert: SLAB_ROWS,
-                    act: &act,
-                    route: &route,
-                    input: GemmInput::PerSlot,
-                    y: &mut y,
-                },
-            );
-            let refused = matches!(
-                &got,
-                Err(bloomery_gpu::GpuError::Shape { what, detail })
-                    if *what == "Gemm32Kernels::enqueue_gemm32"
-                        && detail.contains("Q8_0 scale plane")
-                        && detail.contains("is not 16-byte aligned")
-            );
-            let untouched = refused
-                && y.to_host_vec(stream)?
-                    .iter()
-                    .all(|v| v.to_bits() == SENT.to_bits());
-            let grid = u32::try_from(SLAB_ROWS.div_ceil(128) * (max / 64 + 1))?;
-            let pass = dev.g32.q8_0p_slab(grid, u32::try_from(max)?, 1) && refused && untouched;
-            println!(
-                "gemm32 case=g32_slab_scale_unaligned byte_offset=2 named_shape={refused} \
-                 output_untouched={untouched} result={got:?} {}",
-                verdict(pass)
-            );
-            Ok(ok && pass)
+            let mut codes = qs.buf().to_host_vec(stream)?;
+            codes.insert(0, 0);
+            let code_parent = DeviceBuffer::from_host(stream, &codes)?;
+            let qs_off = DeviceTensor::<u32>::window_of(&code_parent, 4, SLAB_ROWS, k / 4)?;
+            // PIN(2026-10-20): per-plane checks replace the slab-only scale-alignment clause.
+            for (name, qs, d, offset, m, expect_slab) in [
+                ("scale", qs, &*d_off, 2, max, true),
+                ("code", &*qs_off, d, 4, max, true),
+                ("code", &*qs_off, d, 4, ms[0], false),
+            ] {
+                dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
+                y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                let got = dev.g32.enqueue_gemm32(
+                    stream,
+                    Gemm32Args {
+                        w: Gemm32Weight::Q8_0Plane { qs, d },
+                        rows_per_expert: SLAB_ROWS,
+                        act: &act,
+                        route: &route,
+                        input: GemmInput::PerSlot,
+                        y: &mut y,
+                    },
+                );
+                let refused = matches!(
+                    &got,
+                    Err(bloomery_gpu::GpuError::Shape { what, detail })
+                        if *what == "Gemm32Kernels::enqueue_gemm32"
+                            && detail.contains(&format!("Q8_0 {name} plane"))
+                            && detail.contains("is not 16-byte aligned")
+                );
+                let untouched = refused
+                    && y.to_host_vec(stream)?
+                        .iter()
+                        .all(|v| v.to_bits() == SENT.to_bits());
+                let grid = u32::try_from(SLAB_ROWS.div_ceil(128) * (m / 64 + 1))?;
+                let slab = dev.g32.q8_0p_slab(grid, u32::try_from(m)?, 1);
+                let pass = slab == expect_slab && refused && untouched;
+                println!(
+                    "gemm32 case=g32_slab_{name}_unaligned byte_offset={offset} m={m} slab={slab} \
+                     named_shape={refused} output_untouched={untouched} result={got:?} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            Ok(ok)
         }
 
         /// Routed stacks: a Q8_0 file stack and a Q5_1 one of 16 experts ×
