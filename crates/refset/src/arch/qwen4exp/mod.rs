@@ -7,6 +7,7 @@
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
+use crate::ik::RefManifest;
 
 pub mod fixture;
 pub mod mtp;
@@ -50,6 +51,33 @@ pub const VERIFIED_POSITIONS: u64 = 3001;
 /// The decode-step sets (the model profile's `ref_step_variant`), by
 /// position.
 pub const STEP_SETS: &[&str] = &[STEP4, STEP4_EVERY_NODE, D1K, D3K];
+
+/// The Qwen3.8 oracle sets' batch and decode-step input positions.
+pub fn check_inputs(man: &RefManifest, name: &str) -> Result<(), RefError> {
+    let (pos, step, prefill) = man
+        .step()
+        .map_err(|e| RefError::malformed(name, e.to_string()))?;
+    let expected = match name {
+        BATCH | fixture::BATCH | nvfp4::BATCH | nvfp4::BATCH_BF16 => (0, 5),
+        STEP4 | STEP4_EVERY_NODE | fixture::STEP4 | fixture::STEP4_EVERY_NODE => (4, 1),
+        D1K | fixture::D1K => (1024, 1),
+        D3K | fixture::D3K | nvfp4::D3K | nvfp4::D3K_BF16 => (3000, 1),
+        _ => return Err(RefError::malformed(name, "unknown Qwen3.8 oracle set")),
+    };
+    if (pos, step.len()) != expected || prefill.len() != pos as usize {
+        return Err(RefError::malformed(
+            name,
+            format!(
+                "oracle position {pos}, {} step ids, {} prefill ids; expected position {}, {} step ids",
+                step.len(),
+                prefill.len(),
+                expected.0,
+                expected.1
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// [`MODEL`], as a family's `runs`.
 fn model() -> Result<String, RefError> {

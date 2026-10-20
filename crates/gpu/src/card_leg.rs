@@ -252,29 +252,17 @@ impl<'a> StackW<'a> {
     /// a type the table names no GEMM for, or a form that GEMM does not read.
     pub(crate) fn route(self, ty: GgmlType) -> Option<RouteW<'a>> {
         Some(match (kernels::gemm(ty)?, self) {
-            (GemmEntry::Q3k, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Q3K, w),
-            (GemmEntry::Q4k, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Q4K, w),
-            (GemmEntry::Q5k, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Q5K, w),
-            (GemmEntry::Q6k, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Q6K, w),
-            (GemmEntry::Iq3xxs, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Iq3Xxs, w),
-            (GemmEntry::Iq4xs, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Iq4Xs, w),
             (GemmEntry::Q8_0, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q8_0File(w)),
             (GemmEntry::Q5_1, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q5_1File(w)),
             (GemmEntry::Iq4nl, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Iq4NlFile(w)),
             (GemmEntry::Nvfp4, StackW::Nvfp4(s)) => RouteW::Blocks32(Gemm32Weight::Nvfp4Planes(s)),
-            (
-                GemmEntry::Q3k
-                | GemmEntry::Q4k
-                | GemmEntry::Q5k
-                | GemmEntry::Q6k
-                | GemmEntry::Iq3xxs
-                | GemmEntry::Iq4xs
-                | GemmEntry::Q8_0
-                | GemmEntry::Q5_1
-                | GemmEntry::Iq4nl,
-                StackW::Nvfp4(_),
-            )
-            | (GemmEntry::Nvfp4, StackW::Words(_)) => return None,
+            (_, StackW::Words(w)) => {
+                let Ok(t) = GemmWeight::from_ggml(ty) else {
+                    return None;
+                };
+                RouteW::Grouped(t, w)
+            }
+            (_, StackW::Nvfp4(_)) => return None,
         })
     }
 }

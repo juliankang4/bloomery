@@ -55,8 +55,8 @@ mod gate {
     use std::time::Instant;
 
     use crate::e2e::{
-        argmax, flips_report, ik_last, layer_rels, layer_table, print_layers, rel, set_open,
-        tie_numbers, worst_off_path,
+        argmax, flips_report, ik_last, layer_rels, layer_table, print_layers, rel, tie_numbers,
+        worst_off_path,
     };
     use crate::q38_oracle::{FLIP_ERR_CAP, FREE_BAND, IkRoute, route_flips};
     use crate::qwen38_open::{Open38, open_split};
@@ -98,7 +98,9 @@ mod gate {
 
     /// The set `name` of the family, checked against it.
     fn set(name: &str) -> Result<RefManifest, GateError> {
-        Ok(RefManifest::open(&HF.path_in(&data_dir(), name), &HF)?)
+        let man = RefManifest::open(&HF.path_in(&data_dir(), name), &HF)?;
+        refset::arch::qwen4exp::check_inputs(&man, name)?;
+        Ok(man)
     }
 
     /// (l): the plan on the one visible card, every routed expert on it, and the load.
@@ -236,12 +238,12 @@ mod gate {
         toks: &[u32],
         vocab: usize,
         (tag, path, how): (&str, Prompt38, &str),
+        man: &RefManifest,
     ) -> Result<bool, GateError> {
-        let man = set(BATCH)?;
         m.reset()?;
         let top = m.prompt38(toks, path)?;
         let ours = m.logits()?;
-        let oracle = ik_last(&man, vocab)?;
+        let oracle = ik_last(man, vocab)?;
         let ok = top == argmax(&oracle);
         println!(
             "({tag}) the batch set by {how}: last argmax ours={top} oracle={} logits_rel={:.3e} \
@@ -255,17 +257,23 @@ mod gate {
 
     /// (t): D3K's prefill by ubatches from a reset, then its step by an eager step with the taps
     /// armed, against `D3K` and, recorded, `D3K_BF16`.
-    fn d3k_step(m: &mut Qwen38Model, d: &Dims, vocab: usize) -> Result<bool, GateError> {
-        let (man, pos, tok, prefill, _) = set_open((D3K, &HF), None)?;
+    fn d3k_step(
+        m: &mut Qwen38Model,
+        d: &Dims,
+        vocab: usize,
+        man: &RefManifest,
+        bf16: &RefManifest,
+    ) -> Result<bool, GateError> {
+        let (pos, step, prefill) = man.step()?;
+        let tok = step[0];
         m.reset()?;
         let t = Instant::now();
-        m.prompt38(&prefill, Prompt38::Gemm)?;
+        m.prompt38(prefill, Prompt38::Gemm)?;
         let fed = t.elapsed().as_secs_f64();
         let r = run_steps(m, &[tok])?;
         let ours = r.logits.last().ok_or("no logits")?;
         let mut ok = true;
-        for (name, judged) in [(D3K, true), (D3K_BF16, false)] {
-            let man = if judged { &man } else { &set(name)? };
+        for (name, man, judged) in [(D3K, man, true), (D3K_BF16, bf16, false)] {
             let oracle = ik_last(man, vocab)?;
             let (top, oracle_top, oracle_2, margin, dist, logits_rel) = tie_numbers(ours, &oracle);
             let tie = top != oracle_top
@@ -315,19 +323,43 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let batch = set(BATCH)?;
+        let batch_bf16 = set(BATCH_BF16)?;
+        let d3k = set(D3K)?;
+        let d3k_bf16 = set(D3K_BF16)?;
+        for (q8, bf16) in [(&batch, &batch_bf16), (&d3k, &d3k_bf16)] {
+            if q8.header.tokens != bf16.header.tokens {
+                return Err(format!(
+                    "{}: oracle token ids differ from {}",
+                    bf16.dir.display(),
+                    q8.dir.display()
+                )
+                .into());
+            }
+        }
+        let (_, toks, _) = batch.step()?;
         let d = dims()?;
         let (mut m, mut ok) = open(&d)?;
         let vocab = m.body("run")?.vocab();
-        let batch = set(BATCH)?;
-        let (_, toks, _) = batch.step()?;
-        let toks = toks.to_vec();
         m.reset()?;
-        let r = run_steps(&mut m, &toks)?;
+        let r = run_steps(&mut m, toks)?;
         ok &= free(&batch, &r, &d, vocab, true)?;
-        ok &= free(&set(BATCH_BF16)?, &r, &d, vocab, false)?;
-        ok &= batch_by(&mut m, &toks, vocab, ("p", Prompt38::Pass, "one pass"))?;
-        ok &= batch_by(&mut m, &toks, vocab, ("g", Prompt38::Gemm, "one ubatch"))?;
-        ok &= d3k_step(&mut m, &d, vocab)?;
+        ok &= free(&batch_bf16, &r, &d, vocab, false)?;
+        ok &= batch_by(
+            &mut m,
+            toks,
+            vocab,
+            ("p", Prompt38::Pass, "one pass"),
+            &batch,
+        )?;
+        ok &= batch_by(
+            &mut m,
+            toks,
+            vocab,
+            ("g", Prompt38::Gemm, "one ubatch"),
+            &batch,
+        )?;
+        ok &= d3k_step(&mut m, &d, vocab, &d3k, &d3k_bf16)?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

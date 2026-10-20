@@ -710,7 +710,9 @@ mod gate {
     /// [`input_set`]'s manifest, and the set's name as the lines print it.
     fn input_manifest(name: &str) -> Result<(RefManifest, &str), GateError> {
         let set = input_set(name)?;
-        Ok((RefManifest::open(&set.path, set.family)?, set.name))
+        let man = RefManifest::open(&set.path, set.family)?;
+        refset::arch::qwen4exp::check_inputs(&man, set.name)?;
+        Ok((man, set.name))
     }
 
     /// Whether our last argmax `top` is ik's `result_output` argmax, and
@@ -1156,6 +1158,7 @@ mod gate {
         }
         let input = input_set(name)?;
         let (man, pos, tok, prefill, held) = set_open((input.name, input.family), band)?;
+        refset::arch::qwen4exp::check_inputs(&man, input.name)?;
         Ok(Some(StepSet {
             name: input.name,
             path,
@@ -4916,7 +4919,9 @@ mod gate {
     /// and then its reader.
     fn fx_set(clause: &str, set: &str) -> Result<RefManifest, GateError> {
         let path = tier::fixture_set(clause, &fixture::IK, set)?;
-        Ok(RefManifest::open(&path, &fixture::IK)?)
+        let man = RefManifest::open(&path, &fixture::IK)?;
+        refset::arch::qwen4exp::check_inputs(&man, set)?;
+        Ok(man)
     }
 
     /// The fixture's `ik_argmax`: our last argmax `top` is ik's, or ik's own logit at it lies
@@ -5454,6 +5459,7 @@ mod gate {
         }
         tier::fixture_set(&clause, &fixture::IK, set)?;
         let (man, pos, tok, prefill, first_batch) = set_open((set, &fixture::IK), band)?;
+        refset::arch::qwen4exp::check_inputs(&man, set)?;
         let bands = fx_bands(feed.arm())?;
         fresh(m)?;
         let t = Instant::now();

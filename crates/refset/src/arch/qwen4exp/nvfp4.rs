@@ -21,7 +21,7 @@ pub const MODEL: &str =
 // PIN(2026-10-20): the writer at transformers 4c414256 that dequantizes one decoder layer at a
 // time and writes the route ids' logical copy and exact twins as ik's dumper does;
 // `the_oracle_writer_pin_is_the_source_in_the_tree` holds it to the tree.
-pub const HARNESS: &str = "892a07afd9ac0c7efbd63de165f655bf";
+pub const HARNESS: &str = "3e4604613303dfa99992c57be76d894f";
 
 /// The 5-token batch, every position.
 pub const BATCH: &str = "hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4";
@@ -55,6 +55,7 @@ pub static HF: Family = Family {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{self as qwen, fixture};
     use super::{BATCH, HARNESS, HF, MODEL};
     use crate::RefError;
     use std::path::Path;
@@ -96,6 +97,7 @@ mod tests {
             HF.check_set(&dir)
         };
         let p = check(MODEL, HARNESS)?;
+        let mut man = crate::ik::RefManifest::open(&dir, &HF)?;
         assert_eq!(
             (p.dumped_from.as_str(), p.build.as_deref()),
             (MODEL, Some(HARNESS))
@@ -105,6 +107,42 @@ mod tests {
         let other = check(MODEL, "0123").expect_err("a set of another writer");
         assert!(other.to_string().contains("0123"), "{other}");
         assert!(HF.sets.contains(&BATCH));
+        for (name, pos) in [
+            (BATCH, 0),
+            (super::BATCH_BF16, 0),
+            (super::D3K, 3000),
+            (super::D3K_BF16, 3000),
+            (qwen::BATCH, 0),
+            (fixture::BATCH, 0),
+            (qwen::STEP4, 4),
+            (fixture::STEP4, 4),
+            (qwen::STEP4_EVERY_NODE, 4),
+            (fixture::STEP4_EVERY_NODE, 4),
+            (qwen::D1K, 1024),
+            (fixture::D1K, 1024),
+            (qwen::D3K, 3000),
+            (fixture::D3K, 3000),
+        ] {
+            let deep = pos != 0;
+            let count = if deep { pos as usize + 1 } else { 5 };
+            man.header.tokens = Some(vec![1; count]);
+            man.header.decode_pos = deep.then_some(pos);
+            man.header.prefill = deep.then_some(pos);
+            qwen::check_inputs(&man, name)?;
+            for bad in [0, 2, 9, count - 1, count + 1] {
+                man.header.tokens = Some(vec![1; bad]);
+                man.header.decode_pos = deep.then_some(bad.saturating_sub(1) as u32);
+                man.header.prefill = man.header.decode_pos;
+                let err =
+                    qwen::check_inputs(&man, name).expect_err("wrong oracle position or length");
+                assert!(err.to_string().contains(name), "{err}");
+            }
+        }
+        man.header.tokens = Some(vec![1; 5]);
+        man.header.decode_pos = None;
+        man.header.prefill = None;
+        let err = qwen::check_inputs(&man, "other").expect_err("unknown oracle set");
+        assert!(err.to_string().contains("other"), "{err}");
         std::fs::remove_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))
     }
 }

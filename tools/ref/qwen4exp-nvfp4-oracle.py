@@ -403,7 +403,6 @@ class Arm:
     def __init__(self, name, ids, dense, every_position):
         self.name, self.ids, self.dense, self.every_position = name, ids, dense, every_position
         self.rows = []
-        self.files = 0
         self.h = None
 
 
@@ -422,6 +421,9 @@ class SetWriter:
     def __init__(self, out, arm):
         self.dir = os.path.join(out, arm.name)
         os.makedirs(self.dir, exist_ok=True)
+        manifest = os.path.join(self.dir, "MANIFEST.tsv")
+        if os.path.exists(manifest):
+            os.replace(manifest, manifest + ".incomplete")
         self.arm = arm
 
     def tensor(self, name, t, ty="f32", int_twin=False):
@@ -436,7 +438,6 @@ class SetWriter:
         self.arm.rows.append("tensor\t%s\t0\t%s\t%d\t%d\t%d\t%d\t%d\t%.17g\thf\t1\t%d\t-\t-"
                              % (name, ty, ne[0], ne[1], ne[2], ne[3], a.size * 4, float(np.sum(a, dtype=np.float64)),
                                 int(int_twin)))
-        self.arm.files += len(layouts)
         if int_twin:
             b = t.detach().to(torch.int32).contiguous().numpy()
             wide = b.astype(np.int64)
@@ -445,7 +446,6 @@ class SetWriter:
                 self.arm.rows.append("int\t%s\t0\ttensor\t%s\ti32\t%s\t%d\t%d\t%d\t%d\t%s"
                                      % (name, ty, layout, b.size, b.size * 4, int(wide.sum()), int(np.abs(wide).max()),
                                         stem + at + ".i32"))
-            self.arm.files += len(layouts)
 
 
 def main():
@@ -476,13 +476,30 @@ def main():
     if not 0 < until <= n_layers:
         raise SystemExit("--until %d: not in 1..%d" % (until, n_layers))
 
-    prose = [int(x) for x in open(a.prose).read().split()]
+    prose_bytes = open(a.prose, "rb").read()
+    try:
+        prose = [int(x) for x in prose_bytes.split()]
+    except ValueError:
+        raise SystemExit("--prose: expected integer token ids")
+    if len(prose) != 3001:
+        raise SystemExit("--prose: expected 3,001 ids for the D3K reference")
+    if any(t < 0 or t >= cfg.vocab_size for t in prose):
+        raise SystemExit("--prose: token id outside the model vocabulary")
     arms = [Arm("hf_qwen4exp_nvfp4", REF_TOKENS, "q8", True),
             Arm("hf_qwen4exp_nvfp4_d3k", prose, "q8", True),
             Arm("hf_qwen4exp_nvfp4_bf16", REF_TOKENS, "bf16", True),
             Arm("hf_qwen4exp_nvfp4_d3k_bf16", prose, "bf16", False)]
-    writers = {arm.name: SetWriter(a.out, arm) for arm in arms}
     ckpt_path = os.path.join(a.out, "resume.pt")
+    identity = (build, model, cfg_json, sha256(hf.__file__), str(torch.__version__),
+                tuple((arm.name, tuple(arm.ids), arm.dense, arm.every_position) for arm in arms))
+    ck = None
+    if a.resume:
+        if not os.path.isfile(ckpt_path):
+            raise SystemExit("resume.pt: no saved state for --resume")
+        ck = torch.load(ckpt_path)
+        if ck.get("identity") != identity:
+            raise SystemExit("resume.pt: writer, model or tokens changed; restart without --resume")
+    writers = {arm.name: SetWriter(a.out, arm) for arm in arms}
 
     stop = threading.Event()
     threading.Thread(target=watch_memory, args=(os.path.join(a.out, "mem.log"), stop), daemon=True).start()
@@ -515,11 +532,10 @@ def main():
     t_all = time.time()
     start = 0
     ple_stats = None
-    if a.resume and os.path.exists(ckpt_path):
-        ck = torch.load(ckpt_path)
+    if ck is not None:
         start = ck["next"]
         for arm in arms:
-            arm.h, arm.rows, arm.files = ck["arms"][arm.name]
+            arm.h, arm.rows = ck["arms"][arm.name]
         rules.counts, rules.scale_bytes, rules.checked_nvfp4 = ck["counts"], ck["scale_bytes"], ck["checked"]
         ple_stats = ck["ple"]
         print("resume at layer", start, flush=True)
@@ -560,7 +576,7 @@ def main():
             print("PLE layer %d rows read %d, zero bytes %d, no NaN byte, torch == f64 rule on every row" % (
                 i, ple_stats["rows"], ple_stats["zero"]), flush=True)
         del layer, ple_rows, bf16, q8
-        torch.save({"next": i + 1, "arms": {arm.name: (arm.h, arm.rows, arm.files) for arm in arms},
+        torch.save({"identity": identity, "next": i + 1, "arms": {arm.name: (arm.h, arm.rows) for arm in arms},
                     "counts": rules.counts, "scale_bytes": rules.scale_bytes, "checked": rules.checked_nvfp4,
                     "ple": ple_stats}, ckpt_path + ".tmp")
         os.replace(ckpt_path + ".tmp", ckpt_path)
@@ -625,7 +641,7 @@ def main():
             f.write("# tokens\t%s\n" % ",".join(map(str, arm.ids)))
             if arm.ids is not REF_TOKENS:
                 f.write("# tokens_file\t%s\n" % os.path.realpath(a.prose))
-                f.write("# tokens_file_sha256\t%s\n" % sha256(a.prose))
+                f.write("# tokens_file_sha256\t%s\n" % hashlib.sha256(prose_bytes).hexdigest())
                 f.write("# tokens_count\t%d\n" % len(arm.ids))
                 f.write("# prefill\t%d\n" % (len(arm.ids) - 1))
                 f.write("# decode_pos\t%d\n" % (len(arm.ids) - 1))
