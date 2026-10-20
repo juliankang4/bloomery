@@ -636,6 +636,10 @@ name = "gate_qwen4exp_iqleg"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_qwen4exp_nvfp4"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_clef_hidden"
 required-features = ["gpu"]
 

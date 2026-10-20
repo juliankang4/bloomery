@@ -146,14 +146,18 @@ pub const fn qwen3moe_dense(ty: GgmlType) -> Option<SiteEntry> {
 
 /// The card gate·up entry `Body38`'s card leg (`crates/gpu/src/arch/qwen3moe/card38.rs`)
 /// runs a routed gate or up stack of `ty` with: the table's [`kernels::gate_up`]
-/// row of the K-quants and i-quants the leg launches (`kq_gate_up_act_q4k`,
-/// `kq_gate_up_act_q5k`, `iq3_xxs_gate_up_sel`, `iq4_xs_gate_up_sel`): a Q4_K,
-/// Q5_K, IQ3_XXS or IQ4_XS.
+/// row of the K-quants, i-quants and NVFP4 the leg launches (`kq_gate_up_act_q4k`,
+/// `kq_gate_up_act_q5k`, `iq3_xxs_gate_up_sel`, `iq4_xs_gate_up_sel`,
+/// `nvfp4_gate_up_sel`): a Q4_K, Q5_K, IQ3_XXS, IQ4_XS or NVFP4.
 #[must_use]
 pub const fn qwen38_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
     match kernels::gate_up(ty) {
         Some(
-            e @ (GateUpEntry::Q4k | GateUpEntry::Q5k | GateUpEntry::Iq3xxs | GateUpEntry::Iq4xs),
+            e @ (GateUpEntry::Q4k
+            | GateUpEntry::Q5k
+            | GateUpEntry::Iq3xxs
+            | GateUpEntry::Iq4xs
+            | GateUpEntry::Nvfp4),
         ) => Some(e),
         _ => None,
     }
@@ -162,14 +166,28 @@ pub const fn qwen38_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
 /// The card down entry `Body38`'s card leg runs a routed down stack of `ty`
 /// with: the table's [`kernels::down`] row over the 32-value activation the leg
 /// quantizes ([`DownAct::Q8Blocks32`]: `q5_1_gemv_sel`, `q8_0_gemv_sel32`,
-/// `iq4_nl_gemv_sel32`): a Q5_1, Q8_0 or IQ4_NL.
+/// `iq4_nl_gemv_sel32`, `nvfp4_gemv_sel32`): a Q5_1, Q8_0, IQ4_NL or NVFP4.
 #[must_use]
 pub const fn qwen38_down(ty: GgmlType) -> Option<DownEntry> {
     match kernels::down(ty) {
-        Some((e @ (DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl), DownAct::Q8Blocks32)) => {
-            Some(e)
-        }
+        Some((
+            e @ (DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl | DownEntry::Nvfp4),
+            DownAct::Q8Blocks32,
+        )) => Some(e),
         _ => None,
+    }
+}
+
+/// The card format every card leg reads a routed stack of `ty` in: NVFP4 in
+/// its planes ([`kernels::card_planes_runs`]: codes, block scales and a tensor
+/// scale an expert), every other type in the file's blocks. A leg's arms say
+/// which types it runs; this says how each loads, for every leg alike.
+#[must_use]
+pub const fn leg_card_format(ty: GgmlType) -> CardFormat {
+    if kernels::card_planes_runs(ty) {
+        CardFormat::Nvfp4Planes
+    } else {
+        CardFormat::KQuant
     }
 }
 
@@ -239,20 +257,20 @@ pub fn leg_runs(p: Program, [gate, up, down]: [GgmlType; 3]) -> Option<bool> {
 pub fn routed_rule(p: Program) -> RoutedRule {
     match p {
         Program::Qwen3moeBody | Program::Qwen35Body => RoutedRule::Leg {
-            gate_up: |ty| qwen35_gate_up(ty).map(|_| CardFormat::KQuant),
-            down: |ty| qwen35_down(ty).map(|_| CardFormat::KQuant),
+            gate_up: |ty| qwen35_gate_up(ty).map(|_| leg_card_format(ty)),
+            down: |ty| qwen35_down(ty).map(|_| leg_card_format(ty)),
         },
         Program::Qwen38Body => RoutedRule::Leg {
-            gate_up: |ty| qwen38_gate_up(ty).map(|_| CardFormat::KQuant),
-            down: |ty| qwen38_down(ty).map(|_| CardFormat::KQuant),
+            gate_up: |ty| qwen38_gate_up(ty).map(|_| leg_card_format(ty)),
+            down: |ty| qwen38_down(ty).map(|_| leg_card_format(ty)),
         },
         Program::Glm5nextBody | Program::Mimo2Body | Program::Solar2Body => RoutedRule::Leg {
             gate_up: common_leg_card,
             down: common_leg_card,
         },
         Program::Deepseek41Chain => RoutedRule::Leg {
-            gate_up: |ty| (ty == DS41_LEG[0]).then_some(CardFormat::KQuant),
-            down: |ty| (ty == DS41_LEG[2]).then_some(CardFormat::KQuant),
+            gate_up: |ty| (ty == DS41_LEG[0]).then(|| leg_card_format(ty)),
+            down: |ty| (ty == DS41_LEG[2]).then(|| leg_card_format(ty)),
         },
         Program::NemotronHMoeBody => RoutedRule::Leg {
             gate_up: bolt_leg_card,
@@ -263,14 +281,14 @@ pub fn routed_rule(p: Program) -> RoutedRule {
     }
 }
 
-/// The latent MoE body's plan arm: [`BOLT_LEG`] in the file's blocks.
+/// The latent MoE body's plan arm: [`BOLT_LEG`], in its card format.
 fn bolt_leg_card(ty: GgmlType) -> Option<CardFormat> {
-    (ty == BOLT_LEG).then_some(CardFormat::KQuant)
+    (ty == BOLT_LEG).then(|| leg_card_format(ty))
 }
 
 /// The common leg's plan arm: a type both its gate·up and down launches read.
 fn common_leg_card(ty: GgmlType) -> Option<CardFormat> {
-    kernels::card_runs(ty).then_some(CardFormat::KQuant)
+    kernels::card_runs(ty).then(|| leg_card_format(ty))
 }
 
 #[cfg(test)]
@@ -367,8 +385,9 @@ mod tests {
         );
     }
 
-    /// Qwen3.8's arms are the card leg's launches: a Q4_K, Q5_K, IQ3_XXS or
-    /// IQ4_XS gate·up and a Q5_1, Q8_0 or IQ4_NL down, no other type.
+    /// Qwen3.8's arms are the card leg's launches: a Q4_K, Q5_K, IQ3_XXS,
+    /// IQ4_XS or NVFP4 gate·up and a Q5_1, Q8_0, IQ4_NL or NVFP4 down, no
+    /// other type.
     #[test]
     fn qwen38_arms_are_its_legs_launches() {
         for ty in types() {
@@ -376,15 +395,46 @@ mod tests {
                 qwen38_gate_up(ty).is_some(),
                 matches!(
                     ty,
-                    GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::IQ3_XXS | GgmlType::IQ4_XS
+                    GgmlType::Q4_K
+                        | GgmlType::Q5_K
+                        | GgmlType::IQ3_XXS
+                        | GgmlType::IQ4_XS
+                        | GgmlType::NVFP4
                 ),
                 "{ty} gate·up"
             );
             assert_eq!(
                 qwen38_down(ty).is_some(),
-                matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::IQ4_NL),
+                matches!(
+                    ty,
+                    GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::IQ4_NL | GgmlType::NVFP4
+                ),
                 "{ty} down"
             );
+        }
+    }
+
+    /// Every program's card leg loads a stack it runs by the one format rule
+    /// ([`leg_card_format`]): NVFP4 in its planes, every other type in the
+    /// file's blocks. Mutant, the defect Qwen3.8's rule had: a leg that loads
+    /// an NVFP4 stack it runs as the file's blocks.
+    #[test]
+    fn every_leg_loads_a_stack_by_the_shared_format() {
+        for ty in types() {
+            let want = if ty == GgmlType::NVFP4 {
+                CardFormat::Nvfp4Planes
+            } else {
+                CardFormat::KQuant
+            };
+            assert_eq!(leg_card_format(ty), want, "{ty}");
+            for p in PROGRAMS {
+                let RoutedRule::Leg { gate_up, down } = routed_rule(p) else {
+                    continue;
+                };
+                for f in [gate_up(ty), down(ty)].into_iter().flatten() {
+                    assert_eq!(f, want, "{p:?} {ty}");
+                }
+            }
         }
     }
 

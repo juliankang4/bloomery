@@ -1584,11 +1584,20 @@ impl Body38 {
             ff: geo::FF,
             n_used: geo::N_USED,
         };
-        let arena = crate::model::nvme_tier(gpu.context(), plan, file, host.r8, set.arena())?;
-        let mut experts = HostRun::build(Arc::clone(file), 0, host.r8, widths, |src| {
-            model::arch::qwen35moe::host::layers(src, hp, run.clone())
-        })?;
-        experts.attach_tier(arena)?;
+        // The host run holds the layers with a host leg alone: a layer that
+        // keeps every expert on the card has no host view, so its stacks may
+        // be of a type no host kernel reads (NVFP4).
+        let hosted: Vec<usize> = run.clone().filter(|&l| !card.hostless(l)).collect();
+        let mut experts = crate::model::host_run(
+            gpu.context(),
+            plan,
+            file,
+            hosted.iter().copied(),
+            host.r8,
+            set.arena(),
+            widths,
+            |src| model::arch::qwen35moe::host::layers(src, hp, hosted.iter().copied()),
+        )?;
         residency_glue.attach_tier(experts.tier())?;
         let nvme_tier = experts.tier().cloned();
         if nvme_tier.is_some() {

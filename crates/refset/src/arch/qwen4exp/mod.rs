@@ -2,13 +2,15 @@
 //! unsloth's UD-Q4_K_XL split set, [`MODEL`], by the ik tree [`IK_BUILD`]
 //! (`tools/ref/models/qwen4exp.sh`); the MTP draft set from the same file
 //! and the shared draft file by the ik tree that carries the MTP graph
-//! ([`mtp`]). The fixture tier's mirror of each is in [`fixture`].
+//! ([`mtp`]); the NVFP4 checkpoint's sets by transformers on the CPU
+//! ([`nvfp4`]). The fixture tier's mirror of the first two is in [`fixture`].
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
 pub mod fixture;
 pub mod mtp;
+pub mod nvfp4;
 pub mod vis;
 
 /// The first shard of the split set every qwen4exp set is dumped from and
@@ -72,6 +74,7 @@ pub static IK: Family = Family {
 pub static FAMILIES: &[&Family] = &[
     &IK,
     &mtp::MTP,
+    &nvfp4::HF,
     &fixture::IK,
     &fixture::MTP,
     &vis::TAPS,

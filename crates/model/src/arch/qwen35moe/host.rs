@@ -10,7 +10,6 @@
 //! `k`) — never a slower path in its place.
 
 use std::fmt;
-use std::ops::Range;
 
 use super::hparams::Hparams;
 use super::names;
@@ -122,28 +121,30 @@ const _: fn() = || {
     boxable::<RefusedLayers>();
 };
 
-/// The host views of the layers `run` ([`layer`] of each), in order; every
+/// The host views of the layers of `set` ([`layer`] of each), in its order
+/// (a host run's layers that carry a host share, contiguous or not); every
 /// layer is tried and the run is refused with every refused layer listed.
 /// Load-time only.
 pub fn layers(
     src: R8Source<'_>,
     hp: &Hparams,
-    run: Range<usize>,
+    set: impl IntoIterator<Item = usize>,
 ) -> Result<Vec<HostLayer>, RefusedLayers> {
-    routed_layers(src, RoutedDims::of(hp), run, "qwen4exp")
+    routed_layers(src, RoutedDims::of(hp), set, "qwen4exp")
 }
 
-/// The host views of the layers `run` of a file of the family whose stacks
-/// are `dims`, the refusal naming the run as `arch`'s ([`layers`]' rule).
+/// The host views of the layers of `set` of a file of the family whose
+/// stacks are `dims`, the refusal naming the run as `arch`'s ([`layers`]'
+/// rule).
 pub fn routed_layers(
     src: R8Source<'_>,
     dims: RoutedDims,
-    run: Range<usize>,
+    set: impl IntoIterator<Item = usize>,
     arch: &'static str,
 ) -> Result<Vec<HostLayer>, RefusedLayers> {
-    let mut views = Vec::with_capacity(run.len());
+    let mut views = Vec::new();
     let mut refused = Vec::new();
-    for l in run {
+    for l in set {
         match routed_layer(src, dims, l) {
             Ok(v) => views.push(v),
             Err(e) => refused.push((l, e)),

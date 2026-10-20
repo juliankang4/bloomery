@@ -45,9 +45,10 @@ use super::plan38::geo;
 use super::scratch::{f32_view, param_view};
 use super::scratch38::ROUTE_ROWS;
 use super::swap38::Qwen38Stacks;
+use super::wide38::down_weight;
+use crate::card_leg::RouteW;
 use crate::gemm::{
-    Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
-    GemmRoute, GemmWeight,
+    Gemm32Args, Gemm32Kernels, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels, GemmRoute,
 };
 use crate::host::node::{NodeFamily, NodeOpen};
 use crate::host::tier::{
@@ -59,7 +60,6 @@ use crate::q38::{Q38Kernels, TierRowsPackArgs};
 use crate::weights::Weights;
 use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
-use gguf::GgmlType;
 use gguf::Split;
 use model::placement::{ModelTensors, Plan};
 
@@ -371,9 +371,11 @@ impl BlockRoute38 {
     /// the ids, the route, the q8_1 of the run's rows of `io.x`, the gate and
     /// up GEMMs, the SwiGLU of the tier slots, the down GEMM into the run's
     /// rows and their pack into `io.down` at their ranks. A block of no
-    /// column or past the route's columns, buffers short of the block, and a
-    /// count the route holds no table for are refused by name. Eager,
-    /// allocation-free.
+    /// column or past the route's columns, buffers short of the block, a
+    /// count the route holds no table for, a gate and up the grouped GEMM does
+    /// not read over q8_1 rows (NVFP4's planes among them;
+    /// `crate::card_leg::StackW::route`) and a down no route GEMM reads are
+    /// refused by name. Eager, allocation-free.
     fn enqueue(
         &mut self,
         gpu: &Gpu,
@@ -418,18 +420,19 @@ impl BlockRoute38 {
                     ),
                 )
             })?;
-        let gate_up_ty = GemmWeight::from_ggml(st.gate_up_ty)?;
-        let down = match st.down_ty {
-            GgmlType::Q5_1 => Gemm32Weight::Q5_1File(st.down),
-            GgmlType::Q8_0 => Gemm32Weight::Q8_0File(st.down),
-            GgmlType::IQ4_NL => Gemm32Weight::Iq4NlFile(st.down),
-            other => {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!("layer {l}: a down stack of {other}, which no route GEMM reads"),
-                ));
-            }
+        let (Some(RouteW::Grouped(gate_up_ty, gate)), Some(RouteW::Grouped(_, up))) =
+            (st.gate.route(st.gate_up_ty), st.up.route(st.gate_up_ty))
+        else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}: a gate and an up of {} on the tier card, whose block route reads \
+                     them by the grouped GEMM over q8_1 rows",
+                    st.gate_up_ty
+                ),
+            ));
         };
+        let down = down_weight(WHAT, l, st.down_ty, st.down)?;
         let (stream, sink) = (gpu.stream(), gpu.layer_sink(l)?);
         self.q38
             .enqueue_tier_rank(stream, io.sel, (cols * n, n_tier), &mut self.rank)?;
@@ -457,7 +460,7 @@ impl BlockRoute38 {
                 sink,
             )?;
             gpu.enqueue_quantize_gemm(&x_w, m, &mut self.x, sink)?;
-            for (wt, y) in [(st.gate, &mut self.g), (st.up, &mut self.u)] {
+            for (wt, y) in [(gate, &mut self.g), (up, &mut self.u)] {
                 self.gemm.enqueue_gemm(
                     stream,
                     GemmArgs {

@@ -54,9 +54,15 @@
 //! A stack of any other type is refused by name when the stacks are read
 //! ([`LegStacks::of`]), and an entry the table names but the run has no arm
 //! for is refused by name at the launch.
+//!
+//! A prompt walk that runs a unit's card slots through a route table reads
+//! each resident stack by the GEMM entry [`kernels::gemm`] names for its type
+//! ([`StackW::route`]); the table, the launches and the SwiGLU between them
+//! stay with the walk.
 
 use crate::card_slots::{CardAcc, CardSlotKernels, CardSlots};
 use crate::fault::FaultSink;
+use crate::gemm::{Gemm32Weight, GemmWeight};
 use crate::iq_sel::{IqDown, IqGateUp};
 use crate::kquant::{Act, GateUpAct, SelDown};
 use crate::mxfp4_sel::{Mxfp4SelKernels, Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels, Nvfp4Stack};
@@ -69,7 +75,7 @@ use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
-use model::placement::kernels::{self, DownAct, DownEntry, GateUpEntry};
+use model::placement::kernels::{self, DownAct, DownEntry, GateUpEntry, GemmEntry};
 
 /// What the leg's errors name.
 const WHAT: &str = "CardLeg";
@@ -225,9 +231,64 @@ const fn q8_act_bytes(cols: usize, k: usize) -> usize {
 /// (`DevWeight::KQuant`), or NVFP4's planes and its experts' scales
 /// (`DevWeight::Nvfp4Stack`).
 #[derive(Clone, Copy)]
-enum StackW<'a> {
+pub(crate) enum StackW<'a> {
     Words(&'a DeviceTensor<u32>),
     Nvfp4(Nvfp4Stack<'a>),
+}
+
+impl<'a> StackW<'a> {
+    /// Rows the stack holds, every expert's.
+    pub(crate) fn rows(&self) -> usize {
+        match self {
+            StackW::Words(w) => w.rows(),
+            StackW::Nvfp4(s) => s.qs.rows(),
+        }
+    }
+
+    /// The stack, of file type `ty`, as the route GEMM the kernel table names
+    /// for that type reads it ([`kernels::gemm`]): a K-quant's or an
+    /// i-quant's words through the grouped GEMM, the file's Q8_0, Q5_1 or
+    /// IQ4_NL blocks and NVFP4's planes through the 32-value GEMM. `None` for
+    /// a type the table names no GEMM for, or a form that GEMM does not read.
+    pub(crate) fn route(self, ty: GgmlType) -> Option<RouteW<'a>> {
+        Some(match (kernels::gemm(ty)?, self) {
+            (GemmEntry::Q3k, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Q3K, w),
+            (GemmEntry::Q4k, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Q4K, w),
+            (GemmEntry::Q5k, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Q5K, w),
+            (GemmEntry::Q6k, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Q6K, w),
+            (GemmEntry::Iq3xxs, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Iq3Xxs, w),
+            (GemmEntry::Iq4xs, StackW::Words(w)) => RouteW::Grouped(GemmWeight::Iq4Xs, w),
+            (GemmEntry::Q8_0, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q8_0File(w)),
+            (GemmEntry::Q5_1, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q5_1File(w)),
+            (GemmEntry::Iq4nl, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Iq4NlFile(w)),
+            (GemmEntry::Nvfp4, StackW::Nvfp4(s)) => RouteW::Blocks32(Gemm32Weight::Nvfp4Planes(s)),
+            (
+                GemmEntry::Q3k
+                | GemmEntry::Q4k
+                | GemmEntry::Q5k
+                | GemmEntry::Q6k
+                | GemmEntry::Iq3xxs
+                | GemmEntry::Iq4xs
+                | GemmEntry::Q8_0
+                | GemmEntry::Q5_1
+                | GemmEntry::Iq4nl,
+                StackW::Nvfp4(_),
+            )
+            | (GemmEntry::Nvfp4, StackW::Words(_)) => return None,
+        })
+    }
+}
+
+/// A resident routed stack as a prompt walk's route GEMM reads it
+/// ([`StackW::route`]).
+#[derive(Clone, Copy)]
+pub(crate) enum RouteW<'a> {
+    /// The grouped GEMM's type and the stack's words, over the unit's q8_1
+    /// rows of 128 values (`GemmAct`).
+    Grouped(GemmWeight, &'a DeviceTensor<u32>),
+    /// The 32-value GEMM's weight, over the unit's q8 rows of 32 values
+    /// (`GemmAct32`).
+    Blocks32(Gemm32Weight<'a>),
 }
 
 /// One resident routed stack: its name, file type, device form and row width.
@@ -272,10 +333,7 @@ impl<'a> LegStack<'a> {
 
     /// Rows the stack holds, every expert's.
     fn rows(&self) -> usize {
-        match self.w {
-            StackW::Words(w) => w.rows(),
-            StackW::Nvfp4(s) => s.qs.rows(),
-        }
+        self.w.rows()
     }
 
     /// The stack's words, for an entry over the file's blocks.
@@ -1948,6 +2006,78 @@ pub(crate) mod tests {
         }
         let bufs = LegBufs::new(gpu.stream(), shape).expect("the buffers");
         assert_eq!(bufs.bytes(), leg_bytes(shape));
+    }
+
+    /// A stack routes by the GEMM entry the kernel table names for its type
+    /// (`kernels::gemm`): a K-quant's or an i-quant's words through the
+    /// grouped GEMM in the type that GEMM decodes (`GemmWeight::from_ggml`),
+    /// the file's Q8_0, Q5_1 and IQ4_NL blocks and NVFP4's planes through the
+    /// 32-value GEMM in their own weights; a stack in the other form, and a
+    /// type the table names no GEMM for, has no route.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_stack_routes_by_the_tables_gemm_entry() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let qs = DeviceTensor::upload(stream, &[0u32; 4], 1, 4).expect("the words");
+        let e = DeviceTensor::upload(stream, &[0u32], 1, 1).expect("the exponents");
+        let scales = DeviceTensor::upload(stream, &[1.0f32], 1, 1).expect("the scales");
+        let planes = StackW::Nvfp4(Nvfp4Stack {
+            qs: &qs,
+            e: &e,
+            scales: &scales,
+        });
+        let words = StackW::Words(&qs);
+        for ty in [
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ4_XS,
+        ] {
+            let want = GemmWeight::from_ggml(ty).expect("a type the grouped GEMM decodes");
+            assert!(
+                matches!(words.route(ty), Some(RouteW::Grouped(t, _)) if t == want),
+                "{ty}"
+            );
+            assert!(planes.route(ty).is_none(), "{ty} in planes");
+        }
+        fn blocks32(st: StackW<'_>, ty: GgmlType) -> Option<Gemm32Weight<'_>> {
+            match st.route(ty) {
+                Some(RouteW::Blocks32(w)) => Some(w),
+                Some(RouteW::Grouped(..)) | None => None,
+            }
+        }
+        assert!(matches!(
+            blocks32(words, GgmlType::Q8_0),
+            Some(Gemm32Weight::Q8_0File(_))
+        ));
+        assert!(matches!(
+            blocks32(words, GgmlType::Q5_1),
+            Some(Gemm32Weight::Q5_1File(_))
+        ));
+        assert!(matches!(
+            blocks32(words, GgmlType::IQ4_NL),
+            Some(Gemm32Weight::Iq4NlFile(_))
+        ));
+        assert!(matches!(
+            blocks32(planes, GgmlType::NVFP4),
+            Some(Gemm32Weight::Nvfp4Planes(_))
+        ));
+        for ty in [GgmlType::Q8_0, GgmlType::Q5_1, GgmlType::IQ4_NL] {
+            assert!(planes.route(ty).is_none(), "{ty} in planes");
+        }
+        assert!(words.route(GgmlType::NVFP4).is_none(), "NVFP4 as words");
+        for ty in [
+            GgmlType::IQ2_XXS,
+            GgmlType::MXFP4,
+            GgmlType::Q5_0,
+            GgmlType::F32,
+        ] {
+            assert!(kernels::gemm(ty).is_none(), "{ty} has a GEMM row");
+            assert!(words.route(ty).is_none(), "{ty}");
+        }
     }
 
     /// A run whose down entry reads the other activation form than the

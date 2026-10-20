@@ -49,7 +49,9 @@ use super::hparams::{Hparams, Kind};
 use super::{mtp, names, roles, spec};
 use crate::arch::coverage;
 use crate::fileio::hex;
-use crate::placement::accepts::{Program, qwen38_down, qwen38_gate_up, routed_rule};
+use crate::placement::accepts::{
+    Program, leg_card_format, qwen38_down, qwen38_gate_up, routed_rule,
+};
 use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
 use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{
@@ -102,19 +104,21 @@ pub enum Experts {
 }
 
 /// The Qwen3.8 program, whose card experts read the routed stacks
-/// ([`routed_rule`] of it) by part, each as the file stores it
-/// ([`CardFormat::KQuant`]): a gate and an up of one type, a Q4_K, Q5_K,
-/// IQ3_XXS or IQ4_XS ([`qwen38_gate_up`]), and a Q5_1, Q8_0 or IQ4_NL down
-/// ([`qwen38_down`]). A layer with a stack of another type, or of one of
+/// ([`routed_rule`] of it) by part, each in its card format
+/// ([`leg_card_format`]: NVFP4 in its planes, every other type as the
+/// file stores it): a gate and an up of one type, a Q4_K, Q5_K, IQ3_XXS,
+/// IQ4_XS or NVFP4 ([`qwen38_gate_up`]), and a Q5_1, Q8_0, IQ4_NL or NVFP4
+/// down ([`qwen38_down`]). A layer with a stack of another type, or of one of
 /// these in a part the card leg does not run it in (a Q8_0 gate, a Q4_K
 /// down), keeps its experts on the host.
 pub const PROGRAM: Program = Program::Qwen38Body;
 
-/// A type [`PROGRAM`]'s card leg reads in some part. Coverage reads this
-/// type union; the plan and its host-only diagnosis use [`routed_rule`] by part.
+/// A type [`PROGRAM`]'s card leg reads in some part, in its card format.
+/// Coverage reads this type union; the plan and its host-only diagnosis use
+/// [`routed_rule`] by part.
 #[must_use]
 pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    (qwen38_gate_up(ty).is_some() || qwen38_down(ty).is_some()).then_some(CardFormat::KQuant)
+    (qwen38_gate_up(ty).is_some() || qwen38_down(ty).is_some()).then(|| leg_card_format(ty))
 }
 
 /// What a target plan sets aside beside its own terms: `reserve` bytes the
@@ -1115,7 +1119,9 @@ pub const CARD_ROUTE_ROWS: u64 = 2_048;
 /// Card bytes a ubatch walk's card route holds a run token, an upper bound
 /// [derived: the compressed ids and the places 80 B (ten u32 each); the
 /// gate·up input `GemmAct` at K = 2,560, 8,592 B a column (q3 2,560 + q4
-/// 3,072 + q6 2,560 + s8 320 + d8 80); the gate and up f32 rows
+/// 3,072 + q6 2,560 + s8 320 + d8 80), which also holds a load whose card
+/// gate·up the 32-value GEMM reads in its one input form, a `GemmAct32` of
+/// 3,200 B a column (40 steps of 80 B); the gate and up f32 rows
 /// 2 · 10 · 640 · 4 = 51,200 B; the SwiGLU `GemmAct32` at K = 640, 800 B a
 /// column, 8,000 B; the down f32 rows 10 · 2,560 · 4 = 102,400 B; two route
 /// tables — the cols list 2 · 40 B, their tile words at the most experts
@@ -2107,9 +2113,11 @@ mod tests {
         assert_eq!(kv.layer_bytes(3, 4096), 0);
     }
 
-    /// A qwen4exp file whose PLE table is F8 rows describes with the table's
-    /// scale beside it: both on the PLE site, the scale left in the file for
-    /// the load to read by name.
+    /// A qwen4exp file whose PLE table is F8 rows and whose layer 2 routed
+    /// stacks are NVFP4 with an expert scale each describes with every scale
+    /// beside its tensor (the shared walk's rule, no row of the family's
+    /// table): the table's on the PLE site, each stack's on its layer, each
+    /// left in the file for the load to read by name.
     #[test]
     fn an_f8_ple_table_and_its_scale_describe() {
         use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
@@ -2119,11 +2127,18 @@ mod tests {
 
         let table = "per_layer_token_embd.weight";
         let scale = "per_layer_token_embd.scale";
+        let stack_scales = [
+            "blk.2.ffn_gate_exps.scale",
+            "blk.2.ffn_up_exps.scale",
+            "blk.2.ffn_down_exps.scale",
+        ];
         let typed: Vec<_> = tensors()
             .into_iter()
             .map(|(n, d)| {
                 if n == table {
                     (n, d, Ty::F8Rows)
+                } else if n.starts_with("blk.2.ffn_") && n.ends_with("_exps.weight") {
+                    (n, vec![64, 1, 8], Ty::Nvfp4)
                 } else if n.ends_with(".attn_q.weight") {
                     // The query projection writes each of the 4 heads' 16
                     // values and its gate beside them.
@@ -2133,6 +2148,11 @@ mod tests {
                 }
             })
             .chain([(scale.to_string(), vec![1], Ty::F32)])
+            .chain(
+                stack_scales
+                    .iter()
+                    .map(|n| (n.to_string(), vec![8], Ty::F32)),
+            )
             .collect();
         let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
         let path = header_typed("q4x-f8-ple", "qwen4exp", &keys(), &pre, &typed);
@@ -2150,6 +2170,9 @@ mod tests {
         };
         assert_eq!(role(table), Some((Role::EngramTable, Some(1))));
         assert_eq!(role(scale), Some((Role::Unread, Some(1))));
+        for s in stack_scales {
+            assert_eq!(role(s), Some((Role::Unread, Some(2))), "{s}");
+        }
     }
 
     /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth

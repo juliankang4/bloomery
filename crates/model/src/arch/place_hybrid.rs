@@ -27,7 +27,7 @@ use models::{DeltaRule, Mixer, ModelSpec, RopeMode};
 use runtime::stores::{self, Rows};
 
 use crate::arch::coverage;
-use crate::placement::accepts::{program_of, routed_rule};
+use crate::placement::accepts::{leg_card_format, program_of, routed_rule};
 use crate::placement::ctx_ask::{PlanRefusal, Short, Side};
 use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
@@ -38,12 +38,12 @@ use crate::placement::{
 // The prompt batch a window ring keeps room for is the batch the card walks the prompt in.
 const _: () = assert!(stores::PROMPT_BATCH == crate::moe::UNION_MAX_COLS as u64);
 
-/// The routed stacks the card experts read, each as the file stores it ([`CardFormat::KQuant`]):
-/// the types the common card leg runs ([`placement::kernels::card_runs`]). The rule reads a stack's
+/// The routed stacks the card experts read, each in its card format ([`leg_card_format`]): the
+/// types the common card leg runs ([`placement::kernels::card_runs`]). The rule reads a stack's
 /// type alone; a layer with a stack of any other type keeps its experts on the host.
 #[must_use]
 pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    placement::kernels::card_runs(ty).then_some(CardFormat::KQuant)
+    placement::kernels::card_runs(ty).then(|| leg_card_format(ty))
 }
 
 /// What a plan of a hybrid file is made from, read from its headers. `H` is the family's own

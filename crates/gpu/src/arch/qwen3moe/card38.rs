@@ -5,10 +5,10 @@
 //! The captured step, the verify and the eager pass run the card leg: on a
 //! layer with card experts the shadow quantizes the unit's normed rows to
 //! q8_1, runs the gate·up `_sel` of the layer's type (Q4_K, Q5_K, IQ3_XXS
-//! or IQ4_XS) with
+//! or IQ4_XS in the file's blocks, NVFP4 in its planes) with
 //! SiLU·mul over the unit's ten slots a column, the 32-value q8_1 of the
 //! card slots' columns, the down `_sel` of its type (Q5_1, Q8_0 or IQ4_NL,
-//! the file's blocks) — the four launches of the common card leg
+//! the file's blocks, or NVFP4's planes) — the four launches of the common card leg
 //! (`crate::card_leg`) — and the card slots' weighted sum (`ds41_ffn_card_acc_10`,
 //! this family's own: ten slots at a weight pitch of eleven, and a place in
 //! `[n_card, HOST)` is a fault the leg's sum does not raise) —
@@ -53,12 +53,11 @@ use super::plan38::geo;
 use super::program38::Ctx38;
 use super::scratch38::PASS_ROWS;
 use super::swap38::Qwen38Stacks;
-use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
+use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, RouteW, StackW};
 use crate::card_slots::CardAcc;
 use crate::hybrid::SlotMap;
 use crate::kquant::Act;
 use crate::q38::{CardTierSharedAddArgs, SLOTS, W_PITCH};
-use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
@@ -198,12 +197,12 @@ impl LegLayer {
 /// three resident stacks ([`Card38::stacks`]) and their types.
 pub(super) struct Stacks38<'w> {
     pub(super) n_card: usize,
-    pub(super) gate: &'w DeviceTensor<u32>,
-    pub(super) up: &'w DeviceTensor<u32>,
-    pub(super) down: &'w DeviceTensor<u32>,
-    /// The gate's and the up's type: Q4_K, Q5_K, IQ3_XXS or IQ4_XS.
+    pub(super) gate: StackW<'w>,
+    pub(super) up: StackW<'w>,
+    pub(super) down: StackW<'w>,
+    /// The gate's and the up's type: Q4_K, Q5_K, IQ3_XXS, IQ4_XS or NVFP4.
     pub(super) gate_up_ty: GgmlType,
-    /// The down's type: Q5_1, Q8_0 or IQ4_NL.
+    /// The down's type: Q5_1, Q8_0, IQ4_NL or NVFP4.
     pub(super) down_ty: GgmlType,
 }
 
@@ -294,6 +293,8 @@ pub(super) struct Card38 {
     /// Per layer, whether the step and the verify run it without a host leg
     /// ([`Card38::hostless`]).
     hostless: Vec<bool>,
+    /// [`Card38::blocks32_gate_up`].
+    blocks32_gate_up: bool,
     run: Option<CardRun>,
 }
 
@@ -304,16 +305,23 @@ fn stack<'w>(
     name: &str,
     ty: GgmlType,
     rows: usize,
-) -> Result<&'w DeviceTensor<u32>, GpuError> {
-    match w.get(name) {
-        Some(DevWeight::KQuant { ty: t, w, .. }) if *t == ty && w.rows() == rows => Ok(w),
+) -> Result<StackW<'w>, GpuError> {
+    let held = match w.get(name) {
+        Some(DevWeight::KQuant { ty: t, w, .. }) if *t == ty => Some(StackW::Words(w)),
+        Some(DevWeight::Nvfp4Stack { .. }) if ty == GgmlType::NVFP4 => {
+            Some(StackW::Nvfp4(w.nvfp4_stack(WHAT, name)?))
+        }
+        _ => None,
+    };
+    match held {
+        Some(st) if st.rows() == rows => Ok(st),
         _ => Err(GpuError::Tensor {
             what: WHAT,
             name: name.to_string(),
             need: "a resident routed stack of the slot map's experts of its layer on this card, \
-                   in the file's blocks of the type the plan lists for it (the gate and up Q4_K, \
-                   Q5_K, IQ3_XXS or IQ4_XS, the down Q5_1, Q8_0 or IQ4_NL), each that count's \
-                   rows",
+                   of the type the plan lists for it (the gate and up Q4_K, Q5_K, IQ3_XXS or \
+                   IQ4_XS, the down Q5_1, Q8_0 or IQ4_NL, in the file's blocks; NVFP4 in its \
+                   planes), each that count's rows",
         }),
     }
 }
@@ -381,6 +389,33 @@ fn leg_types(stacks: &Qwen38Stacks, l: usize) -> Result<(GgmlType, GgmlType), Gp
     }
 }
 
+/// Whether a load's card gate and up are read by the 32-value GEMM in the
+/// ubatch route, from each card layer's `(layer, read by it)`: the route
+/// holds the run's rows in one input form, the q8_1 rows of the grouped GEMM
+/// or the 32-value rows, and the plan counts a run of the q8_1 form, the
+/// larger (`place::CARD_ROUTE_RUN_TOKEN_BYTES`). A load whose card layers
+/// read both is refused by name, naming a layer of each; one with no card
+/// layer reads the q8_1 form.
+fn one_gate_up_form(forms: &[(usize, bool)]) -> Result<bool, GpuError> {
+    let Some(&(first, blocks32)) = forms.first() else {
+        return Ok(false);
+    };
+    match forms.iter().find(|&&(_, b)| b != blocks32) {
+        None => Ok(blocks32),
+        Some(&(l, _)) => {
+            let [a, b] = if blocks32 { [first, l] } else { [l, first] };
+            Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "card gate and up stacks the ubatch route reads by two GEMMs (layer {a} by \
+                     the 32-value GEMM, layer {b} by the grouped GEMM): the route holds the \
+                     run's rows in one form, the one the plan counts"
+                ),
+            ))
+        }
+    }
+}
+
 impl Card38 {
     /// The card experts of `layers` layers as `map` places them and `w`
     /// holds them, each layer's types as `stacks` lists them (the plan's). A
@@ -403,6 +438,14 @@ impl Card38 {
             .iter()
             .map(|c| !keep_host && c.as_ref().is_some_and(|c| c.n_card == geo::EXPERTS))
             .collect();
+        let mut forms = Vec::new();
+        for (l, c) in per.iter().enumerate() {
+            if let Some(c) = c {
+                let route = c.stacks(w)?.gate.route(c.gate_up_ty);
+                forms.push((l, matches!(route, Some(RouteW::Blocks32(_)))));
+            }
+        }
+        let blocks32_gate_up = one_gate_up_form(&forms)?;
         let run = if per.iter().any(Option::is_some) {
             let stream = gpu.stream();
             let slots = PASS_ROWS * SLOTS;
@@ -421,6 +464,7 @@ impl Card38 {
         Ok(Card38 {
             layers: per,
             hostless,
+            blocks32_gate_up,
             run,
         })
     }
@@ -441,8 +485,10 @@ impl Card38 {
     /// host tier refuses a machine started later
     /// ([`crate::host::HostTier::start_swap`]) and a route trace, which the
     /// host service writes ([`crate::host::HostTier::attach_route_trace`]).
-    /// The prompt pass serves every layer on the host either way. `l` must be
-    /// a layer of the load.
+    /// The prompt walk runs such a layer without one too (no download, no
+    /// service, zeros for the host's sum), and the host run holds no view of
+    /// it (`crate::model::host_run` over the other layers), so its stacks may
+    /// be of a type no host kernel reads. `l` must be a layer of the load.
     pub(super) fn hostless(&self, l: usize) -> bool {
         assert!(
             l < self.hostless.len(),
@@ -517,6 +563,13 @@ impl Card38 {
         counts.sort_unstable();
         counts.dedup();
         counts
+    }
+
+    /// The load's card gate and up are read by the 32-value GEMM in the
+    /// ubatch route ([`StackW::route`]), over the 32-value activation; else
+    /// by the grouped GEMM over the q8_1 rows ([`one_gate_up_form`]).
+    pub(super) fn blocks32_gate_up(&self) -> bool {
+        self.blocks32_gate_up
     }
 
     /// Layer `l`'s card experts for the ubatch route (`wide38`'s): their
@@ -670,4 +723,27 @@ fn no_card(l: usize) -> GpuError {
         WHAT,
         format!("a card leg on layer {l}, which has no card experts"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A load reads its card gate and up by one GEMM: none, all grouped and
+    /// all 32-value pass as such, and a mix is refused naming a layer of
+    /// each. Mutants: a mix taken as either form, or the layers swapped in
+    /// the refusal.
+    #[test]
+    fn a_load_reads_its_card_gate_up_in_one_form() {
+        assert!(!one_gate_up_form(&[]).expect("no card layer"));
+        assert!(!one_gate_up_form(&[(0, false), (3, false)]).expect("all grouped"));
+        assert!(one_gate_up_form(&[(1, true), (2, true)]).expect("all 32-value"));
+        for forms in [[(4, true), (7, false)], [(7, false), (4, true)]] {
+            let err = one_gate_up_form(&forms).expect_err("a mix").to_string();
+            assert!(
+                err.contains("layer 4 by the 32-value GEMM, layer 7 by the grouped GEMM"),
+                "{err}"
+            );
+        }
+    }
 }

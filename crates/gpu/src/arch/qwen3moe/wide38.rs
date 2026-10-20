@@ -18,11 +18,12 @@
 //!   experts, the card route ([`CardRoute38`]): per [`ROUTE_ROWS`] run, in
 //!   the shadow after the front's download, the compressed ids and the
 //!   places from the walk's ids, the remapped route table, the gate and up
-//!   GEMMs of the layer's type (Q4_K, Q5_K, IQ3_XXS or IQ4_XS), the card
-//!   slots' SwiGLU
-//!   (`swiglu_quant32_sel`), the down GEMM of its type (the file's Q5_1,
-//!   Q8_0 or IQ4_NL blocks) and the card sum into the unit's acc — the
-//!   host tier
+//!   GEMMs the kernel table names for the layer's type
+//!   (`crate::card_leg::StackW::route`: Q4_K, Q5_K, IQ3_XXS or IQ4_XS over
+//!   the run's q8_1 rows; NVFP4's planes over its 32-value rows), the card
+//!   slots' SwiGLU (`swiglu_quant32_sel`), the down GEMM of its type (the
+//!   file's Q5_1, Q8_0 or IQ4_NL blocks, or NVFP4's planes) and the card sum
+//!   into the unit's acc — the host tier
 //!   serves the rest of the slots, and the back adds the card sum on a
 //!   layer with card experts (`q38_card_shared_add`);
 //! - the selecting layer's rows the prefill flash while `qsa::scored` says a
@@ -149,6 +150,7 @@ use super::scratch38::{Arena38, ROUTE_ROWS, SELECT_ROWS, Store38};
 use super::tier38::TierSide38;
 use super::wide::{RingStacks, with_ring_windows};
 use crate::GpuError;
+use crate::card_leg::{RouteW, StackW};
 use crate::card_slots::CardAcc;
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaSelArgs;
@@ -687,10 +689,9 @@ pub(super) struct CardRoute38 {
     /// a load with an expert tier: the places launch over the same ids with
     /// the slot map's layer row.
     sel: DeviceBuffer<u32>,
-    /// The run's normed rows (`[run][HIDDEN]`) in the K-quant GEMM's
-    /// activation form — the same q8_1 bytes a `Q8Act` of the same values
-    /// holds, the gate and up GEMMs' input.
-    x: GemmAct,
+    /// The run's normed rows (`[run][HIDDEN]`), the gate and up GEMMs'
+    /// input, in the one form the load's card gate and up read ([`RouteX`]).
+    x: RouteX,
     /// The gate and up GEMMs' outputs, ten slots a run token of [`geo::FF`]
     /// values, slot-major.
     g: DeviceBuffer<f32>,
@@ -736,22 +737,42 @@ struct RingRoute38 {
     union: DeviceBuffer<u32>,
 }
 
-/// Layer `l`'s down stack `w` of type `ty` as the 32-value GEMM reads it:
-/// the file's Q5_1, Q8_0 or IQ4_NL blocks; any other type refused by name.
-fn down_weight(
+/// Layer `l`'s down stack `w` of type `ty` as the route's down GEMM reads it
+/// over the SwiGLU's 32-value rows ([`StackW::route`]); a stack no 32-value
+/// GEMM reads is refused by name as `what`'s.
+pub(super) fn down_weight<'a>(
+    what: &'static str,
     l: usize,
     ty: GgmlType,
-    w: &DeviceTensor<u32>,
-) -> Result<Gemm32Weight<'_>, GpuError> {
-    match ty {
-        GgmlType::Q5_1 => Ok(Gemm32Weight::Q5_1File(w)),
-        GgmlType::Q8_0 => Ok(Gemm32Weight::Q8_0File(w)),
-        GgmlType::IQ4_NL => Ok(Gemm32Weight::Iq4NlFile(w)),
-        other => Err(GpuError::shape(
-            WHAT,
-            format!("layer {l}: a down stack of {other}, which no route GEMM reads"),
+    w: StackW<'a>,
+) -> Result<Gemm32Weight<'a>, GpuError> {
+    match w.route(ty) {
+        Some(RouteW::Blocks32(w)) => Ok(w),
+        Some(RouteW::Grouped(..)) | None => Err(GpuError::shape(
+            what,
+            format!("layer {l}: a down stack of {ty}, which no route GEMM reads"),
         )),
     }
+}
+
+/// The run's normed rows in the gate and up GEMMs' input form, one a load
+/// ([`Card38::blocks32_gate_up`]): the K-quant GEMM's activation form (the
+/// same q8_1 bytes a `Q8Act` of the same values holds), or the 32-value
+/// GEMM's where that GEMM reads the card gate and up. The plan counts a run
+/// of the q8_1 form, the larger (`place::CARD_ROUTE_RUN_TOKEN_BYTES`).
+enum RouteX {
+    Q8_1(GemmAct),
+    Blocks32(GemmAct32),
+}
+
+/// A layer's gate and up as the route's GEMMs read them ([`StackW::route`]),
+/// each with the run's normed rows in the form it reads: the grouped GEMM's
+/// words over the q8_1 rows, or the 32-value GEMM's weights over the
+/// 32-value rows.
+#[derive(Clone, Copy)]
+enum GateUp<'a> {
+    Grouped(GemmWeight, [&'a DeviceTensor<u32>; 2], &'a GemmAct),
+    Blocks32([Gemm32Weight<'a>; 2], &'a GemmAct32),
 }
 
 /// One GEMM batch of a route pass over `map` — the batch's places, a
@@ -774,13 +795,12 @@ fn enqueue_gemm_batch(
     wait: Option<&CudaEvent>,
     (walk_ids, ids): (&DeviceBuffer<u32>, &DeviceBuffer<u32>),
     map: &DeviceBuffer<u32>,
-    (ty, gate, up): (GemmWeight, &DeviceTensor<u32>, &DeviceTensor<u32>),
+    gate_up: GateUp<'_>,
     down: Gemm32Weight<'_>,
     (n, n_places): (usize, usize),
     sink: FaultSink,
     down_y: &mut DeviceBuffer<f32>,
-    (x, g, u, act): (
-        &GemmAct,
+    (g, u, act): (
         &mut DeviceBuffer<f32>,
         &mut DeviceBuffer<f32>,
         &mut GemmAct32,
@@ -805,19 +825,39 @@ fn enqueue_gemm_batch(
     )?;
     c.k.g32
         .enqueue_route_remap(stream, ids, map, n * geo::N_USED, route, sink)?;
-    for (w, y) in [(gate, &mut *g), (up, &mut *u)] {
-        c.k.gemm.enqueue_gemm(
-            stream,
-            GemmArgs {
-                ty,
-                w,
-                rows_per_expert: geo::FF,
-                act: x,
-                route,
-                input: GemmInput::Shared { top_k: geo::N_USED },
-                y,
-            },
-        )?;
+    let input = GemmInput::Shared { top_k: geo::N_USED };
+    match gate_up {
+        GateUp::Grouped(ty, [gate, up], act) => {
+            for (w, y) in [(gate, &mut *g), (up, &mut *u)] {
+                c.k.gemm.enqueue_gemm(
+                    stream,
+                    GemmArgs {
+                        ty,
+                        w,
+                        rows_per_expert: geo::FF,
+                        act,
+                        route,
+                        input,
+                        y,
+                    },
+                )?;
+            }
+        }
+        GateUp::Blocks32([gate, up], act) => {
+            for (w, y) in [(gate, &mut *g), (up, &mut *u)] {
+                c.k.g32.enqueue_gemm32(
+                    stream,
+                    Gemm32Args {
+                        w,
+                        rows_per_expert: geo::FF,
+                        act,
+                        route,
+                        input,
+                        y,
+                    },
+                )?;
+            }
+        }
     }
     c.k.g32
         .enqueue_swiglu_quant32_sel(stream, g, u, sel, n_places, n * geo::N_USED, act, sink)?;
@@ -867,7 +907,11 @@ impl CardRoute38 {
             run,
             ids: DeviceBuffer::zeroed(stream, slots)?,
             sel: DeviceBuffer::zeroed(stream, kept)?,
-            x: GemmAct::new(stream, run, geo::HIDDEN)?,
+            x: if card.blocks32_gate_up() {
+                RouteX::Blocks32(GemmAct32::new(stream, run, geo::HIDDEN)?)
+            } else {
+                RouteX::Q8_1(GemmAct::new(stream, run, geo::HIDDEN)?)
+            },
             g: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
             u: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
             act: GemmAct32::new(stream, slots, geo::FF)?,
@@ -920,7 +964,10 @@ impl CardRoute38 {
     pub(super) fn bytes(&self) -> usize {
         self.ids.num_bytes()
             + self.sel.num_bytes()
-            + self.x.bytes()
+            + match &self.x {
+                RouteX::Q8_1(x) => x.bytes(),
+                RouteX::Blocks32(x) => x.bytes(),
+            }
             + self.g.num_bytes()
             + self.u.num_bytes()
             + self.act.bytes()
@@ -957,7 +1004,8 @@ impl CardRoute38 {
     /// doc): per run of at most `run` tokens, the compressed ids and the
     /// full places from the unit's ids (`ids`, eleven slots a token, the
     /// shared expert's last — never read), the q8_1 of the run's normed rows
-    /// (`ffn_x`, `[m][HIDDEN]`), then the stack pass as one GEMM batch a
+    /// (`ffn_x`, `[m][HIDDEN]`; their 32-value form for a gate and up the
+    /// 32-value GEMM reads), then the stack pass as one GEMM batch a
     /// landing batch of the layer's pick (`land`, [`enqueue_gemm_batch`]):
     /// the leading batch the slots no copy lands in, which wait nothing,
     /// then the admits' slots in slot order, each batch behind its own
@@ -977,8 +1025,11 @@ impl CardRoute38 {
     /// card sum reads the union places at the stack's experts plus the
     /// streamed ones, so the stack's and the ring's slots sum in slot order
     /// in one launch. Refused by name: a layer without card experts, a
-    /// stream on a tier layer, and a stream on a route the load did not arm
-    /// ([`CardRoute38::arm_ring`]). Asynchronous, allocation-free,
+    /// stream on a tier layer, on a layer of NVFP4 stacks (the ring holds
+    /// the file's blocks) and on a route the load did not arm
+    /// ([`CardRoute38::arm_ring`]), a gate and up or a down no route GEMM
+    /// reads ([`StackW::route`]), and a gate and up the 32-value GEMM reads
+    /// on a route made with no 32-value rows. Asynchronous, allocation-free,
     /// capturable.
     #[allow(
         clippy::too_many_arguments,
@@ -1001,9 +1052,8 @@ impl CardRoute38 {
         land: &[LandBatch],
     ) -> Result<(), GpuError> {
         let st = card.stacks(c.w, l)?;
-        let (n_card, gate, up) = (st.n_card, st.gate, st.up);
-        let gate_up_ty = GemmWeight::from_ggml(st.gate_up_ty)?;
-        let down = down_weight(l, st.down_ty, st.down)?;
+        let n_card = st.n_card;
+        let down = down_weight(WHAT, l, st.down_ty, st.down)?;
         let (gpu, stream, sink) = (c.gpu, c.gpu.stream(), c.gpu.layer_sink(l)?);
         let pitch = geo::N_USED + 1;
         // SAFETY: layer l's row of the slot map's card copy (`EXPERTS` words
@@ -1022,13 +1072,43 @@ impl CardRoute38 {
                 ),
             ));
         }
-        if ring.is_some() && (tiered || self.ring.is_none()) {
+        let gate_up = match (
+            st.gate.route(st.gate_up_ty),
+            st.up.route(st.gate_up_ty),
+            &self.x,
+        ) {
+            (Some(gate @ RouteW::Grouped(..)), Some(up @ RouteW::Grouped(..)), RouteX::Q8_1(_))
+            | (
+                Some(gate @ RouteW::Blocks32(_)),
+                Some(up @ RouteW::Blocks32(_)),
+                RouteX::Blocks32(_),
+            ) => [gate, up],
+            _ => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {l}: a card route over a gate and an up of {}, which the route \
+                         was not made to read",
+                        st.gate_up_ty
+                    ),
+                ));
+            }
+        };
+        let ring_cols = match (st.gate, st.up, st.down) {
+            (StackW::Words(gate), StackW::Words(up), StackW::Words(down)) => {
+                Some([gate.cols(), up.cols(), down.cols()])
+            }
+            _ => None,
+        };
+        if ring.is_some() && (tiered || self.ring.is_none() || ring_cols.is_none()) {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
                     "layer {l}: a stream of the expert stream's ring on a {}",
                     if tiered {
                         "tier layer (the ring serves a load with no expert tier)"
+                    } else if ring_cols.is_none() {
+                        "layer of NVFP4 stacks (the ring holds the file's blocks)"
                     } else {
                         "card route the load did not arm for it"
                     }
@@ -1081,7 +1161,23 @@ impl CardRoute38 {
                 };
                 places(&self.ids_map, &mut self.ids)?;
                 let table = self.table_at(n_card)?;
-                gpu.enqueue_quantize_gemm(&x_w, n, &mut self.x, sink)?;
+                let gate_up = match (gate_up, &mut self.x) {
+                    ([RouteW::Grouped(ty, gate), RouteW::Grouped(_, up)], RouteX::Q8_1(x)) => {
+                        gpu.enqueue_quantize_gemm(&x_w, n, x, sink)?;
+                        GateUp::Grouped(ty, [gate, up], x)
+                    }
+                    ([RouteW::Blocks32(gate), RouteW::Blocks32(up)], RouteX::Blocks32(x32)) => {
+                        c.k.g32
+                            .enqueue_quantize_gemm32(stream, &x_w, n, x32, sink)?;
+                        GateUp::Blocks32([gate, up], x32)
+                    }
+                    _ => {
+                        return Err(GpuError::state(
+                            WHAT,
+                            "a card route checked for its gate and up's form at its entry",
+                        ));
+                    }
+                };
                 // The stack pass: one GEMM batch a landing batch of the
                 // layer's pick, the leading one (nothing lands in it) first,
                 // or the whole stack at once when the pick moved nothing.
@@ -1092,12 +1188,12 @@ impl CardRoute38 {
                         None,
                         (&ids_w, &self.ids),
                         &map,
-                        (gate_up_ty, gate, up),
+                        gate_up,
                         down,
                         (n, n_card),
                         sink,
                         &mut down_w,
-                        (&self.x, &mut self.g, &mut self.u, &mut self.act),
+                        (&mut self.g, &mut self.u, &mut self.act),
                         (&mut sel_w, &mut self.routes[table]),
                     )?;
                 } else {
@@ -1112,12 +1208,12 @@ impl CardRoute38 {
                                 b.event.as_deref(),
                                 (&ids_w, &self.ids),
                                 bmap,
-                                (gate_up_ty, gate, up),
+                                gate_up,
                                 down,
                                 (n, n_card),
                                 sink,
                                 &mut down_w,
-                                (&self.x, &mut self.g, &mut self.u, &mut self.act),
+                                (&mut self.g, &mut self.u, &mut self.act),
                                 (&mut self.bsel, &mut self.routes[table]),
                             )
                         })?;
@@ -1126,8 +1222,8 @@ impl CardRoute38 {
                 // The card sum's places and experts: the stack's, or with a
                 // stream the union row's over the stack's and the ring's.
                 let mut sum_places = (&*sel_w, n_card);
-                if let (Some(r), Some((union_map, w)), Some(rr)) =
-                    (ring, windows, self.ring.as_mut())
+                if let (Some(r), Some((union_map, w)), Some(rr), GateUp::Grouped(ty, _, x)) =
+                    (ring, windows, self.ring.as_mut(), gate_up)
                 {
                     places(union_map, &mut rr.union)?;
                     for b in &r.batches {
@@ -1138,12 +1234,12 @@ impl CardRoute38 {
                                 b.event.as_deref(),
                                 (&ids_w, &self.ids),
                                 bmap,
-                                (gate_up_ty, w.gate, w.up),
-                                down_weight(l, st.down_ty, w.down)?,
+                                GateUp::Grouped(ty, [w.gate, w.up], x),
+                                down_weight(WHAT, l, st.down_ty, StackW::Words(w.down))?,
                                 (n, r.n),
                                 sink,
                                 &mut down_w,
-                                (&self.x, &mut self.g, &mut self.u, &mut self.act),
+                                (&mut self.g, &mut self.u, &mut self.act),
                                 (&mut rr.sel, &mut rr.route),
                             )
                         })?;
@@ -1168,15 +1264,14 @@ impl CardRoute38 {
             }
             Ok(())
         };
-        match ring {
-            Some(r) => {
+        match (ring, ring_cols) {
+            (Some(r), Some(cols)) => {
                 let rows = [geo::FF, geo::FF, geo::HIDDEN];
-                let cols = [gate.cols(), up.cols(), st.down.cols()];
                 with_ring_windows(r, ctx, geo::EXPERTS, rows, cols, |union_map, w| {
                     run(Some((union_map, w)))
                 })
             }
-            None => run(None),
+            _ => run(None),
         }
     }
 
@@ -2442,11 +2537,18 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
     /// the walk of one unit.
     const BATCH_ORDER: BatchOrder = GROUP_WALK_ORDER;
 
+    /// A layer the load runs without a host leg ([`Card38::hostless`]) has
+    /// none here either: the host run holds no view of it.
+    fn host_leg(&self, at: At) -> bool {
+        !self.p.card.hostless(at.layer)
+    }
+
     /// The layer up to its router, the mix into the unit's `ffn_x`, then
     /// the download of the unit's activations and routed slots — on a tier
     /// layer with the unit's tier places beside them
-    /// ([`WideParts::download_tiered`]). The download names the unit's rows
-    /// by the port's key and takes the arena's buffers whole.
+    /// ([`WideParts::download_tiered`]); a layer without a host leg
+    /// downloads nothing. The download names the unit's rows by the port's
+    /// key and takes the arena's buffers whole.
     fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let enq = port.part_start();
@@ -2459,7 +2561,9 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
         port.mark(at, Mark::FrontEnd as usize)?;
         let key = port.key(at);
         let stream = p.c.gpu.stream();
-        let r = if p.tier_k(l) > 0 {
+        let r = if p.card.hostless(l) {
+            Ok(())
+        } else if p.tier_k(l) > 0 {
             p.download_tiered(u, port, key)
         } else {
             port.hybrid().enqueue_download_pitched(
@@ -2545,17 +2649,21 @@ impl<'a> LayerProgram for UnitWalk<'_, 'a> {
     }
 
     /// The gated sum over the host sums the walk's serve uploaded, the card
-    /// route's beside them on a layer with card experts. On a tier layer the
-    /// join first ([`BatchLeg::join_tiered`]): once the host has seen the
-    /// tier's service complete, the card sum over both cards' slots
-    /// ([`WideParts::tier_acc`]), then the host sums' upload.
+    /// route's beside them on a layer with card experts; a layer without a
+    /// host leg sums zeros for the host's, as the host writes for empty
+    /// lists. On a tier layer the join first ([`BatchLeg::join_tiered`]):
+    /// once the host has seen the tier's service complete, the card sum over
+    /// both cards' slots ([`WideParts::tier_acc`]), then the host sums'
+    /// upload.
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let enq = port.part_start();
         let units = self.units.len();
         let u = unit_at(&mut self.units, at)?;
         let p = &mut *self.p;
-        let joined = if p.tier_k(l) > 0 {
+        let joined = if p.card.hostless(l) {
+            u.hsum.zero_async(p.c.gpu.stream()).map_err(GpuError::from)
+        } else if p.tier_k(l) > 0 {
             port.join_tiered(at, |_, trows| p.tier_acc(u, l, trows))
         } else {
             Ok(())

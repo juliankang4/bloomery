@@ -13,11 +13,14 @@
 //! ([`stacks`] reads each layer's from the plan). On
 //! the card each part of slot `s` is the file's bytes of that expert at byte
 //! `s · part` of its layer's stack, which the placed load uploads as file
-//! bytes in slot order ([`place::routed_rule`] keeps all three stacks in
+//! bytes in slot order ([`place::routed_rule`] keeps these stacks in
 //! `CardFormat::KQuant`, and `super::card38` reads them exactly so). Nothing
 //! converts: a staged part is its slot's bytes as they are, so the r8
 //! sidecar, which exists for Q3_K stacks alone (`qdot::repack_q3k_r8`), is
-//! undefined input here, refused by name.
+//! undefined input here, refused by name. An NVFP4 stack loads in its planes,
+//! which no staged part writes; a load that runs the machine builds every
+//! layer's host view, and that build refuses an NVFP4 stack by name, so no
+//! machine starts over one.
 
 use super::swap::{self, CardLeg};
 use crate::GpuError;
@@ -28,8 +31,9 @@ use model::placement::{ModelTensors, Plan};
 pub use crate::host::swap_source::{DEADLINE, LIVE_DELAY};
 
 /// Qwen3.8's card leg ([`CardLeg`]): the Qwen3.8 body's arms
-/// (`placement::accepts::leg_arms`: a Q4_K, Q5_K, IQ3_XXS or IQ4_XS gate and
-/// up, a Q5_1, Q8_0 or IQ4_NL down), which its place rule reads too.
+/// (`placement::accepts::leg_arms`: a Q4_K, Q5_K, IQ3_XXS, IQ4_XS or NVFP4
+/// gate and up, a Q5_1, Q8_0, IQ4_NL or NVFP4 down), which its place rule
+/// reads too.
 pub(super) struct Leg38;
 
 impl CardLeg for Leg38 {

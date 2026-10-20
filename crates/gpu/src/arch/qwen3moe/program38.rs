@@ -29,8 +29,9 @@
 //!
 //! A layer the load runs without a host leg ([`Card38::hostless`]: every
 //! routed expert on the card, no residency machine, no route trace) has
-//! none in the step and the verify: its handoff writes the row's image and
-//! the card's places and no go follows, its back has no wait, the host is
+//! none in the step, the verify or the pass: its handoff writes the row's
+//! image and the card's places and no go follows (the pass downloads
+//! nothing and the walk serves nothing), its back has no wait, the host is
 //! not told of it, and the host's sum it adds is zeros
 //! ([`Card38::zero_sum`]), what the host writes for an empty list.
 //!
@@ -1713,11 +1714,17 @@ impl<'a> Pass38<'a> {
 impl<'a> LayerProgram for Pass38<'a> {
     type Port = BatchLeg<'a, HostRun>;
 
+    /// A layer the load runs without a host leg ([`Card38::hostless`]) has
+    /// none in the pass either: the host run holds no view of it.
+    fn host_leg(&self, at: At) -> bool {
+        !self.p.card.hostless(at.layer)
+    }
+
     /// The layer up to its router, the mix into the arena's `ffn_x`, then
     /// the download of the unit's activations and routed slots (the router's
-    /// `N_USED + 1` a token, the routed `N_USED` of them), and on a layer
-    /// with card experts each routed slot's place into the arena's `sel`
-    /// from the slot map's card copy.
+    /// `N_USED + 1` a token, the routed `N_USED` of them; none on a layer
+    /// without a host leg), and on a layer with card experts each routed
+    /// slot's place into the arena's `sel` from the slot map's card copy.
     fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         self.p.front(l)?;
@@ -1726,13 +1733,15 @@ impl<'a> LayerProgram for Pass38<'a> {
         let key = port.key(at);
         let stream = self.p.c.gpu.stream();
         let s = &mut *self.p.s;
-        port.hybrid().enqueue_download_pitched(
-            stream,
-            [&s.ffn_x, &s.route.weights],
-            &s.route.ids,
-            geo::N_USED + 1,
-            key,
-        )?;
+        if !self.p.card.hostless(l) {
+            port.hybrid().enqueue_download_pitched(
+                stream,
+                [&s.ffn_x, &s.route.weights],
+                &s.route.ids,
+                geo::N_USED + 1,
+                key,
+            )?;
+        }
         if !self.p.card.has(l) {
             return Ok(());
         }
@@ -1758,8 +1767,10 @@ impl<'a> LayerProgram for Pass38<'a> {
         self.p.shared(at.layer, None)
     }
 
-    /// The gated sum over the host sums the walk's serve uploaded.
+    /// The gated sum over the host sums the walk's serve uploaded, or the
+    /// card's zeros on a layer without a host leg ([`Card38::zero_sum`]).
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        self.p.shared_add(at.layer, Some(port.hsum()))
+        let hsum = (!self.p.card.hostless(at.layer)).then(|| port.hsum());
+        self.p.shared_add(at.layer, hsum)
     }
 }

@@ -932,6 +932,15 @@ dump-ref-glm5next-cuda:
 dump-ref-glm5next-hf-map:
     ./tools/box.sh 'bash tools/ref/real-only.sh dump-ref-glm5next-hf-map && python3 tools/ref/glm5next-hf-map.py "$BLOOMERY_DATA/ref-glm5next-hf-map"'
 
+# The Qwen3.8 NVFP4 oracle (tools/ref/qwen4exp-nvfp4-oracle.py, refset family hf-qwen4exp-nvfp4) into
+# $BLOOMERY_DATA/hf-qwen4exp-nvfp4/: the forward of nvidia/Qwen3.8-Flash-Next-NVFP4 at the family's revision in transformers'
+# qwen4_exp, f32 on the CPU, with the weights the prepared split holds, on the batch set's ids and on IDS, a file of the 3,001
+# ids of ref_qwen4exp_d3k (its `# tokens` line). One decoder layer is resident at a time (about 13 GiB of the folder read a
+# layer); no card. QWEN4EXP_NVFP4_PY (in BLOOMERY_BOX_ENV) names a Python with torch, numpy, safetensors and transformers at the
+# script's TRANSFORMERS_REV. `just gate-gpu-qwen4exp-nvfp4` reads the sets.
+dump-ref-qwen4exp-nvfp4 IDS *ARGS:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh dump-ref-qwen4exp-nvfp4 && "${QWEN4EXP_NVFP4_PY:-python3}" tools/ref/qwen4exp-nvfp4-oracle.py --model /models/nvidia__Qwen3.8-Flash-Next-NVFP4/fc694b54fb0174e0913e6adf86691ef85a4ead47 --out "$BLOOMERY_DATA/hf-qwen4exp-nvfp4" --prose {{IDS}} {{ARGS}}'
+
 # ik's node dump of a family's fixture file (glm5next, qwen4exp, qwen35moe, deepseek41), into $BLOOMERY_DATA/fx_<the real twin's set>
 # (refset's fixture families): the same dumper and profile as the family's real recipe, the fixture first shard as the model,
 # the fixture file's `# fixture` line in the header (refset-check --fixture-line), and in the long variants (d1k, d3k, d3kdsa,
@@ -1344,6 +1353,15 @@ gate-gpu-qwen4exp-e2e:
 [group('v41-load')]
 gate-gpu-qwen4exp-iqleg:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen4exp-iqleg && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_iqleg && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_iqleg'
+
+# Qwen3.8-Flash-Next from the NVIDIA NVFP4 checkpoint (the split `prepare` writes from nvidia/Qwen3.8-Flash-Next-NVFP4) on
+# one card whose plan holds every routed expert (`--place a`; a DGX Spark's GB10): the load puts no expert on the host; the
+# batch set's eager steps hold every layer's streams within the e2e gate's band of the checkpoint's own forward (refset
+# hf-qwen4exp-nvfp4), the router's flips named, and its last argmax; the batch set by one ubatch and D3K's step after its
+# prefill by ubatches hold the oracle's argmax (D3K's a named tie allowed); the distances to the BF16-dense sets are
+# recorded. Real-only: the fixture holds no NVFP4 stack.
+gate-gpu-qwen4exp-nvfp4:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen4exp-nvfp4 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_nvfp4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_nvfp4'
 
 # Qwen3.8's MTP draft program on the 3090 beside the target: first, before any walk, the draft's load — its weights,
 # store and row map hold its plan's bytes, its token_embd and output are the target's own buffers at their addresses,

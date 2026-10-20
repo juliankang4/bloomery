@@ -322,6 +322,10 @@ mod gate_card;
 mod q38_arch;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/q38_oracle.rs"]
+mod q38_oracle;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/qwen38_open.rs"]
 mod qwen38_open;
 
@@ -334,6 +338,7 @@ mod gate {
         argmax, first_flip_layers, flips_report, ik_last, layer_rels, layer_table, on_path,
         print_layers, rel, same_bits, second, set_open, tap, tie_numbers, worst_off_path,
     };
+    use crate::q38_oracle::{FLIP_ERR_CAP, FREE_BAND, IkRoute, route_flips};
     use crate::qwen38_open::{Open38, Opened38, PlanFacts};
 
     use bloomery_gpu::arch::qwen3moe::{
@@ -358,8 +363,7 @@ mod gate {
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
-        Fnv1a64, GateError, RefManifest, checks_failed, ref_model_path, topk_ids_logical_within,
-        verdict,
+        Fnv1a64, GateError, RefManifest, checks_failed, ref_model_path, verdict,
     };
     use bloomery_levers::{CARD_BUDGET, HostCfg};
     use cuda_core::{DeviceBuffer, sys};
@@ -669,28 +673,6 @@ mod gate {
     /// An f16 NaN: the deep verify's pooled rows past the count after its
     /// commit, so a select that scores one raises `pool_select` by name.
     const POOL_POISON: u16 = 0x7e00;
-
-    /// PIN(2026-09-27): the free-running bound on a layer output's relative
-    /// distance from ik's, off every flip's path. Borrowed, not measured on
-    /// this model: GLM-5.3's gate's derivation (√45 · 1.415e-2, its forced
-    /// arm's worst layer error on the streams on ik's inputs) over this
-    /// model's 48 layers, √48 · 1.415e-2 ≈ 0.098, rounded up. GLM is the
-    /// analog and Qwen3.6 (0.26) is not: at every q8_0 projection our side
-    /// reads the f32 row, so the gap is ik's q8_2 activation alone, as in
-    /// GLM, where Qwen3.6's inputs are quantized on both sides; the host
-    /// experts run the q8_2_x4 rule on both. This gate has no forced arm to
-    /// re-derive it on Qwen3.8; (c) prints every layer's distance, the input
-    /// a forced arm would take.
-    const FREE_BAND: f64 = 0.10;
-
-    /// PIN(2026-09-28): [잠정 — 백로그] the most error, in router logit units, our
-    /// two logits may carry at an excused flip — a measured frontier, not a derivation.
-    /// In the batch set's free run the clean chain's largest pair error
-    /// was 0.942 (gap 0.483); the PLE site skipped (m06) reached 4.69, the other broken
-    /// chains 20.15 and 20.66; 2.0 sits 2.1x above clean and 2.3x below m06. The route tap
-    /// reading the next layer's logits (m14, 6.99) is left out: that error is the tap's,
-    /// not the router's. A flip-aware bound from a Qwen3.8 forced arm replaces it.
-    const FLIP_ERR_CAP: f64 = 2.0;
 
     /// The selecting layers the header's interval names (`(il + 1) % interval
     /// == 0`): every fourth on the real file, every second on the fixture.
@@ -1054,56 +1036,6 @@ mod gate {
         Ok((ok, eager))
     }
 
-    /// ik's routing of one layer over the set's tokens: its logits
-    /// ([`N_EXPERT`] a token; the pick ranks their softmax, the same order)
-    /// and its chosen ids ([`N_USED`] a token).
-    struct IkRoute {
-        logits: Vec<f32>,
-        ids: Vec<i32>,
-    }
-
-    impl IkRoute {
-        fn read(man: &RefManifest, l: usize) -> Result<IkRoute, GateError> {
-            let logits = tap(man, &format!("ffn_moe_logits-{l}"))?;
-            let row = man.tensor(&format!("ffn_moe_topk-{l}"), 0)?;
-            let ids = topk_ids_logical_within(man, row, N_EXPERT as u32)?;
-            if logits.len() % N_EXPERT != 0 || ids.len() * N_EXPERT != logits.len() * N_USED {
-                return Err(format!(
-                    "layer {l}: {} logits and {} ids; a token takes {N_EXPERT} and {N_USED}",
-                    logits.len(),
-                    ids.len()
-                )
-                .into());
-            }
-            Ok(IkRoute { logits, ids })
-        }
-
-        fn tokens(&self) -> usize {
-            self.ids.len() / N_USED
-        }
-
-        /// Token `t`'s logits and ids.
-        fn at(&self, t: usize) -> (&[f32], &[i32]) {
-            (
-                &self.logits[t * N_EXPERT..(t + 1) * N_EXPERT],
-                &self.ids[t * N_USED..(t + 1) * N_USED],
-            )
-        }
-
-        /// ik's own margin at token `t`: its tenth pick's logit less the
-        /// best it left.
-        fn margin(&self, t: usize) -> f64 {
-            let (v, ids) = self.at(t);
-            flip::margin(v, ids)
-        }
-    }
-
-    /// The flip at layer `l`, token `t`, if our chosen set is not ik's.
-    fn flip_at(l: usize, t: usize, ours: &RouteTap, ik: &IkRoute) -> Option<Flip> {
-        let (iv, ids) = ik.at(t);
-        Flip::between((l, t), (&ours.ids, &ours.logits), (ids, iv), ik.margin(t))
-    }
-
     /// The free clause's verdict, and by position the first layer a flip
     /// lies on the path of ([`n_layer`] where none does). Every route tap
     /// the top ten of its own logits is a self-consistency clause; the
@@ -1140,28 +1072,16 @@ mod gate {
                 .collect();
             println!("free table layer={l} l_out_rel by tap {}", cells.join(" "));
         }
-        let mut flips = Vec::new();
-        for l in 0..n_layer() {
-            let ik = IkRoute::read(man, l)?;
-            if ik.tokens() != eager.routes.len() {
-                return Err(format!(
-                    "layer {l}: ik routes {} tokens, the run {}",
-                    ik.tokens(),
-                    eager.routes.len()
-                )
-                .into());
-            }
+        let ik_routes = (0..n_layer())
+            .map(|l| IkRoute::read(man, l, N_EXPERT, N_USED))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (l, ik) in ik_routes.iter().enumerate() {
             let margins: Vec<String> = (0..ik.tokens())
                 .map(|t| format!("{:.2e}", ik.margin(t)))
                 .collect();
             println!("ik margin layer={l} by token {}", margins.join(" "));
-            for (t, routes) in eager.routes.iter().enumerate() {
-                let ours = routes
-                    .get(l)
-                    .ok_or_else(|| format!("position {t}: no route tap for layer {l}"))?;
-                flips.extend(flip_at(l, t, ours, &ik));
-            }
         }
+        let flips = route_flips(&eager.routes, &ik_routes)?;
         let flips_ok = flips_report(&flips, "free", FLIP_ERR_CAP);
         let (held, hl, ht, exempt) = worst_off_path(&table, &flips, false);
         let firsts = first_flip_layers(&flips, eager.taps.len(), n_layer());
@@ -5166,31 +5086,6 @@ mod gate {
             .collect()
     }
 
-    /// The flips of a run's routes (`[token][layer]`) against ik's `ik_routes` (one per layer).
-    fn fx_flips(
-        eager_routes: &[Vec<RouteTap>],
-        ik_routes: &[IkRoute],
-    ) -> Result<Vec<Flip>, GateError> {
-        let mut flips = Vec::new();
-        for (l, ik) in ik_routes.iter().enumerate() {
-            if ik.tokens() != eager_routes.len() {
-                return Err(format!(
-                    "layer {l}: ik routes {} tokens, the run {}",
-                    ik.tokens(),
-                    eager_routes.len()
-                )
-                .into());
-            }
-            for (t, routes) in eager_routes.iter().enumerate() {
-                let ours = routes
-                    .get(l)
-                    .ok_or_else(|| format!("position {t}: no route tap for layer {l}"))?;
-                flips.extend(flip_at(l, t, ours, ik));
-            }
-        }
-        Ok(flips)
-    }
-
     /// Whether a flip lies on an earlier flip's path: a flip at an earlier layer at this token or
     /// before.
     fn after_flip(f: &Flip, flips: &[Flip]) -> bool {
@@ -5280,9 +5175,9 @@ mod gate {
         let bands = fx_bands(Arm::Gemv)?;
         let table = layer_table(&man, &eager.taps, STREAMS * HIDDEN, n_layer())?;
         let ik_routes = (0..n_layer())
-            .map(|l| IkRoute::read(&man, l))
+            .map(|l| IkRoute::read(&man, l, N_EXPERT, N_USED))
             .collect::<Result<Vec<_>, _>>()?;
-        let flips = fx_flips(&eager.routes, &ik_routes)?;
+        let flips = route_flips(&eager.routes, &ik_routes)?;
         let (first, refused) = judge_fx_flips("fx free", &flips, &ik_routes, bands);
         let firsts = first_flip_layers(&flips, eager.taps.len(), n_layer());
         let (mut worst, mut past, mut held) = ((0.0f64, 0usize, 0usize), Vec::new(), 0usize);
@@ -5374,7 +5269,7 @@ mod gate {
         let mut ik_routes = Vec::with_capacity(n_layer());
         let mut plant: Vec<Vec<RouteTap>> = (0..n).map(|_| Vec::with_capacity(n_layer())).collect();
         for l in 0..n_layer() {
-            let ik = IkRoute::read(&man, l)?;
+            let ik = IkRoute::read(&man, l, N_EXPERT, N_USED)?;
             let w = tap(&man, &format!("ffn_moe_weights_norm-{l}"))?;
             if ik.tokens() != n || w.len() != n * N_USED {
                 return Err(format!(
@@ -5583,9 +5478,9 @@ mod gate {
         let fed = t.elapsed().as_secs_f64();
         let r = run_last(m, tok)?;
         let ik_routes = (0..n_layer())
-            .map(|l| IkRoute::read(&man, l))
+            .map(|l| IkRoute::read(&man, l, N_EXPERT, N_USED))
             .collect::<Result<Vec<_>, _>>()?;
-        let flips = fx_flips(&r.routes, &ik_routes)?;
+        let flips = route_flips(&r.routes, &ik_routes)?;
         let step_first = flips.iter().map(|f| f.layer).min().unwrap_or(n_layer());
         let prefill_first = match (feed, band) {
             (FxFeed::PlantedUbatches, _) => n_layer(),
