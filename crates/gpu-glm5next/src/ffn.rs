@@ -209,22 +209,13 @@ impl CardExperts {
                     detail: format!("layer {l}: card experts on a dense block"),
                 });
             };
-            let limit = match m.act {
-                models::Act::SwiGlu { limit } => limit,
-                other => {
-                    return Err(GpuError::Shape {
-                        what: CARD,
-                        detail: format!("layer {l}: {} has no SwiGLU clamp", other.what()),
-                    });
-                }
-            };
             // The card leg's arms ([`accepts::leg_arms`]); a prompt batch runs
             // a layer the tiles do not on the card leg.
             let st = CardStacks::of(w, l)?;
             prompt_leg |= !card_tiles_run(st.gate.ty, st.down.ty);
             let layer = CardLayer {
                 n_card,
-                limit: limit.unwrap_or(0.0),
+                limit: crate::body::limit_of(m.act)?,
                 names,
             };
             LegStacks::of(w, layer.names())?.check(n_card, leg_shape(n_embd, ff))?;
@@ -268,15 +259,9 @@ impl CardExperts {
                 let Ffn::Moe(m) = &spec.ffn else {
                     return Ok(None);
                 };
-                let models::Act::SwiGlu { limit } = m.act else {
-                    return Err(GpuError::Shape {
-                        what: CARD,
-                        detail: format!("layer {l}: {} has no SwiGLU clamp", m.act.what()),
-                    });
-                };
                 let layer = CardLayer {
                     n_card: N_EXPERT,
-                    limit: limit.unwrap_or(0.0),
+                    limit: crate::body::limit_of(m.act)?,
                     names: routed_stacks(l),
                 };
                 LegStacks::of_rank(w, layer.names())?.check(N_EXPERT, leg_shape(n_embd, ff))?;

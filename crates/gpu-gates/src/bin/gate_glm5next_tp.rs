@@ -497,7 +497,7 @@ mod gate {
             }
             let ik = IkRoute::read(man, l)?;
             let z = crate::e2e::tap(man, &format!("ffn_moe_logits-{l}"))?;
-            let bias = bias_of(file, l)?;
+            let bias = bloomery_gpu_gates::split_f32(file, &names::exp_probs_b(l), N_EXPERT)?;
             for (t, routes) in run.routes.iter().enumerate().take(ik.tokens()) {
                 let ours = routes[l].as_ref().ok_or("a routed layer with no picks")?;
                 let ranked: Vec<f32> = ours.probs.iter().zip(&bias).map(|(p, b)| p + b).collect();
@@ -563,23 +563,5 @@ mod gate {
             verdict(pass)
         );
         Ok(pass)
-    }
-
-    /// Layer `l`'s selection bias from the file, as the router adds it to the scores.
-    fn bias_of(file: &Split, l: usize) -> Result<Vec<f32>, GateError> {
-        let name = names::exp_probs_b(l);
-        let (shard, t) = file
-            .find(&name)
-            .ok_or_else(|| format!("{name}: not in the file"))?;
-        if t.ty != GgmlType::F32 || t.dims.iter().product::<u64>() != N_EXPERT as u64 {
-            return Err(format!("{name}: {} of {:?}; want F32 of {N_EXPERT}", t.ty, t.dims).into());
-        }
-        let bytes = file.shard(shard).ok_or("the bias's shard")?.data(t)?;
-        Ok(bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect())
     }
 }

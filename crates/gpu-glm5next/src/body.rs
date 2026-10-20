@@ -1109,7 +1109,7 @@ fn shape(detail: String) -> GpuError {
 
 /// The layer's SwiGLU limit, 0 (the plain combine) when it has none. Any
 /// other activation has no clamp and is refused by name.
-fn limit_of(act: Act) -> Result<f32, GpuError> {
+pub(crate) fn limit_of(act: Act) -> Result<f32, GpuError> {
     match act {
         Act::SwiGlu { limit } => Ok(limit.unwrap_or(0.0)),
         other => Err(shape(format!("{} has no SwiGLU clamp", other.what()))),
