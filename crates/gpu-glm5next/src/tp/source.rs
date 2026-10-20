@@ -12,7 +12,7 @@
 use std::ops::Range;
 
 use bloomery_gpu::GpuError;
-use bloomery_gpu::weights::TensorPart;
+use bloomery_gpu::weights::{TensorPart, check_part_bytes};
 use gguf::{Split, TensorInfo};
 use model::arch::glm5next::tp;
 use model::placement::tp::Cut;
@@ -113,6 +113,7 @@ fn part_of(
 ) -> Result<(TensorInfo, Vec<Range<usize>>), GpuError> {
     let refuse = |why: String| GpuError::shape(WHAT, format!("{}: {why}", t.name));
     let over = || refuse("its byte count passes the integer it is held in".into());
+    check_part_bytes(WHAT, t)?;
     let whole = usize::try_from(t.nbytes).map_err(|_| over())?;
     let Some(Cut { dim, unit }) = cut else {
         return Ok((t.clone(), std::iter::once(0..whole).collect()));
@@ -123,15 +124,12 @@ fn part_of(
         .get(dim)
         .ok_or_else(|| refuse(format!("dim {dim} past its dims {:?}", t.dims)))?;
     let part = extent / n;
-    if unit == 0 || part * n != extent || !part.is_multiple_of(unit) {
+    if unit == 0 || !extent.is_multiple_of(n) || !part.is_multiple_of(unit) {
         return Err(refuse(format!(
             "dim {dim} of {extent} into {n} ranks is not whole {unit}-value units a rank"
         )));
     }
     let rows: u64 = t.dims[1..].iter().product();
-    if rows == 0 || !t.nbytes.is_multiple_of(rows) {
-        return Err(refuse(format!("{} bytes in {rows} rows", t.nbytes)));
-    }
     let row = t.nbytes / rows;
     let r = at.rank as u64;
     let mut dims = t.dims.clone();
@@ -141,7 +139,7 @@ fn part_of(
             t.ty.blck_size()
                 .filter(|&b| b > 0)
                 .ok_or_else(|| refuse(format!("{} has no block size", t.ty)))?;
-        if !part.is_multiple_of(block) || !extent.is_multiple_of(block) {
+        if !part.is_multiple_of(block) {
             return Err(refuse(format!(
                 "dim 0 of {extent} into {n} ranks cuts off its {block}-value {} block",
                 t.ty
@@ -264,6 +262,45 @@ mod tests {
                 assert_eq!(spans, vec![0..bytes.len()]);
             }
         }
+    }
+
+    #[test]
+    fn malformed_tensor_sizes_are_refused_before_cutting() {
+        let mut accepted = Vec::new();
+        for (dims, nbytes) in [
+            (vec![256, 1], 143),
+            (vec![256, 1], 145),
+            (vec![], 0),
+            (vec![0, 1], 0),
+            (vec![256, 0], 0),
+            (vec![257, 1], 144),
+            (vec![256, u64::MAX, 2], 144),
+        ] {
+            let t = TensorInfo {
+                name: "bad".into(),
+                dims: dims.clone(),
+                ty: GgmlType::Q4_K,
+                offset: 0,
+                nbytes,
+            };
+            for cut in [None, Some(Cut { dim: 1, unit: 1 })] {
+                if !std::panic::catch_unwind(|| part_of(&t, cut, RankOf::new(0, 1).unwrap()))
+                    .is_ok_and(|result| result.is_err())
+                {
+                    accepted.push((dims.clone(), nbytes, cut));
+                }
+            }
+        }
+        assert!(accepted.is_empty(), "not refused safely: {accepted:?}");
+        let (t, _) = tensor(GgmlType::Q4_K, &[256, 1]);
+        assert!(
+            part_of(
+                &t,
+                Some(Cut { dim: 1, unit: 1 }),
+                RankOf::new(0, 4).unwrap()
+            )
+            .is_err()
+        );
     }
 
     /// An extent the ranks do not divide, a part of other than whole units, a dim-0 part off the

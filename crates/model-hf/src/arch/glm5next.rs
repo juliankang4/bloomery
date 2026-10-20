@@ -398,7 +398,8 @@ pub fn tp_tensors(
                 .held(&dims)
                 .ok_or_else(|| refuse(&name, format!("no held form for {f} {dims:?}")))?;
             Ok(TpTensor {
-                cut: tp::cut(&name, &dims, g.heads as u64).map_err(|why| refuse(&name, why))?,
+                cut: tp::cut(&name, &dims, g.heads as u64)
+                    .map_err(|why| refuse(&name, why.to_string()))?,
                 name,
                 dims,
                 bytes: h.bytes,

@@ -12,13 +12,14 @@
 //! router and its bias, the hyper-connection mixes, the next-token layer's own tensors and the
 //! embedding stay whole on every rank.
 
+use crate::placement::PlacementError;
 use crate::placement::tp::Cut;
 
 /// Where the glm5next tensor `name` of `dims` splits among ranks, `None` for whole on every rank.
 /// A head's part along a dim is that dim over `heads`. A stem with no rule, a split tensor of
 /// other dims than its stem has, and a head split of an extent that is not whole heads are
 /// refused, the reason the error.
-pub fn cut(name: &str, dims: &[u64], heads: u64) -> Result<Option<Cut>, String> {
+pub fn cut(name: &str, dims: &[u64], heads: u64) -> Result<Option<Cut>, PlacementError> {
     let stem = name
         .strip_prefix("blk.")
         .and_then(|r| r.split_once('.'))
@@ -61,17 +62,28 @@ pub fn cut(name: &str, dims: &[u64], heads: u64) -> Result<Option<Cut>, String> 
         "ffn_gate_exps.weight" | "ffn_up_exps.weight" => (3, 1, false),
         "ffn_down.weight" | "ffn_down_shexp.weight" => (2, 0, false),
         "ffn_down_exps.weight" => (3, 0, false),
-        _ => return Err("no tensor-parallel split rule".into()),
+        _ => {
+            return Err(PlacementError::Tensor {
+                name: name.into(),
+                detail: "no tensor-parallel split rule".into(),
+            });
+        }
     };
     if dims.len() != rank {
-        return Err(format!("{dims:?} is not {rank}-D"));
+        return Err(PlacementError::Tensor {
+            name: name.into(),
+            detail: format!("{dims:?} is not {rank}-D"),
+        });
     }
     let extent = dims[dim];
     if !by_head {
         return Ok(Some(Cut { dim, unit: 1 }));
     }
     if heads == 0 || !extent.is_multiple_of(heads) {
-        return Err(format!("dim {dim} of {extent} is not {heads} heads"));
+        return Err(PlacementError::Tensor {
+            name: name.into(),
+            detail: format!("dim {dim} of {extent} is not {heads} heads"),
+        });
     }
     Ok(Some(Cut {
         dim,
@@ -81,14 +93,14 @@ pub fn cut(name: &str, dims: &[u64], heads: u64) -> Result<Option<Cut>, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{Cut, cut};
+    use super::{Cut, PlacementError, cut};
 
     /// Each kind of split at the GLM fixture's dims (64 heads), the whole tensors, and the
     /// refusals: a stem with no rule, a split tensor of another dim count, and a head split of an
     /// extent that is not whole heads.
     #[test]
     fn every_stem_cuts_by_its_rule_and_the_rest_is_refused() {
-        let at = |dim, unit| Ok(Some(Cut { dim, unit }));
+        let at = |dim, unit| Some(Cut { dim, unit });
         for (name, dims, want) in [
             ("blk.0.attn_q.weight", &[4096u64, 8192][..], at(1, 128)),
             ("blk.0.attn_output.weight", &[8192, 4096], at(0, 128)),
@@ -101,7 +113,7 @@ mod tests {
             ("blk.3.ffn_down_exps.weight", &[512, 4096, 288], at(0, 1)),
             ("output.weight", &[4096, 154880], at(1, 1)),
         ] {
-            assert_eq!(cut(name, dims, 64), want, "{name}");
+            assert_eq!(cut(name, dims, 64).unwrap(), want, "{name}");
         }
         for name in [
             "token_embd.weight",
@@ -111,19 +123,20 @@ mod tests {
             "blk.0.hc_attn_fn.weight",
             "blk.6.nextn.eh_proj.weight",
         ] {
-            assert_eq!(cut(name, &[4096, 128], 64), Ok(None), "{name}");
+            assert_eq!(cut(name, &[4096, 128], 64).unwrap(), None, "{name}");
         }
-        assert_eq!(
+        assert!(matches!(
             cut("blk.3.attn_sinks.weight", &[64], 64),
-            Err("no tensor-parallel split rule".to_string())
-        );
+            Err(PlacementError::Tensor { name, detail })
+                if name == "blk.3.attn_sinks.weight" && detail == "no tensor-parallel split rule"
+        ));
         for (name, dims) in [
             ("blk.3.ffn_up_exps.weight", &[4096u64, 288][..]),
             ("blk.0.ffn_down.weight", &[4096, 2048, 2]),
             ("blk.0.ssm_a", &[64, 1]),
         ] {
             assert!(
-                cut(name, dims, 64).is_err_and(|e| e.ends_with("-D")),
+                matches!(cut(name, dims, 64), Err(PlacementError::Tensor { detail, .. }) if detail.ends_with("-D")),
                 "{name}"
             );
         }

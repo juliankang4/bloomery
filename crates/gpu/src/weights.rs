@@ -228,10 +228,32 @@ pub struct TensorPart<'a> {
 /// What [`Weights::load_parts`]' errors name.
 const PARTS: &str = "Weights::load_parts";
 
-/// Each part's card format and the staging bytes of them all, checked before anything moves: a
-/// name given twice or one a derived weight would take, a type with no device format or one whose
-/// values a tensor scale multiplies (a scale is not cut here), and staging bytes past usize are
-/// refused by name.
+/// Check a tensor's declared file bytes before cutting or uploading it. Empty or zero dims,
+/// partial format blocks, an overflowing byte count and a size unlike `nbytes` are refused.
+pub fn check_part_bytes(what: &'static str, t: &TensorInfo) -> Result<(), GpuError> {
+    let bytes =
+        t.ty.blck_size()
+            .zip(t.ty.type_size())
+            .filter(|&(block, _)| {
+                block > 0
+                    && !t.dims.is_empty()
+                    && t.dims.iter().all(|&d| d > 0)
+                    && t.dims[0].is_multiple_of(block)
+            })
+            .and_then(|(block, size)| gguf::tensor_bytes(block, size, &t.dims));
+    if bytes != Some(t.nbytes) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "tensor {}: {} {:?} do not hold {} file bytes",
+                t.name, t.ty, t.dims, t.nbytes
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Each part's format, shape, spans and staging bytes, checked before anything moves.
 fn part_formats(parts: &[TensorPart<'_>]) -> Result<(Vec<CardFormat>, usize), GpuError> {
     let mut seen = BTreeSet::new();
     let mut budget = 0usize;
@@ -254,8 +276,31 @@ fn part_formats(parts: &[TensorPart<'_>]) -> Result<(Vec<CardFormat>, usize), Gp
                 ));
             }
         }
+        check_part_bytes(PARTS, t)?;
+        let held = p
+            .spans
+            .iter()
+            .try_fold(0usize, |sum, s| sum.checked_add(s.len()));
+        if held.and_then(|v| u64::try_from(v).ok()) != Some(t.nbytes) {
+            return Err(GpuError::shape(
+                PARTS,
+                format!(
+                    "tensor {}: spans hold {held:?} bytes, want {}",
+                    t.name, t.nbytes
+                ),
+            ));
+        }
+        let bytes = usize::try_from(t.dims[0])
+            .ok()
+            .and_then(|k| resident_size(t.ty, k, tensor_rows(t)))
+            .ok_or_else(|| {
+                GpuError::shape(
+                    PARTS,
+                    format!("tensor {}: resident bytes pass usize", t.name),
+                )
+            })?;
         budget = budget
-            .checked_add(upload_budget(t))
+            .checked_add(bytes)
             .ok_or_else(|| GpuError::shape(PARTS, "the parts' staging bytes pass usize"))?;
     }
     Ok((formats, budget))
@@ -384,7 +429,8 @@ impl Weights {
     /// [`TensorPart::info`] states the part's name, type and dims, and [`TensorPart::spans`]
     /// holds its rows' file bytes in row order. A name given twice or one a derived weight would
     /// take, a type with no device format or one whose values a tensor scale multiplies (a scale
-    /// is not cut here), and spans short of the part's bytes are refused by name. One staging ring
+    /// is not cut here), a shape unlike its byte count and spans unlike the part's bytes are
+    /// refused by name. One staging ring
     /// carries every copy, and one synchronize ends them.
     pub fn load_parts(stream: &CudaStream, parts: &[TensorPart<'_>]) -> Result<Weights, GpuError> {
         let (formats, budget) = part_formats(parts)?;
@@ -1658,20 +1704,69 @@ mod tests {
         assert!(file_slot("output.weight").is_ok());
     }
 
+    #[test]
+    fn malformed_part_sizes_are_refused_before_upload() {
+        let mut accepted = Vec::new();
+        for (dims, nbytes, spans) in [
+            (vec![256, 1], 143, vec![&[0u8; 143][..]]),
+            (vec![256, 1], 145, vec![&[0u8; 145][..]]),
+            (vec![0, 1], 0, vec![]),
+            (vec![256, 0], 0, vec![]),
+            (vec![], 0, vec![]),
+            (vec![257, 1], 144, vec![&[0u8; 144][..]]),
+            (vec![256, u64::MAX], 144, vec![&[0u8; 144][..]]),
+            (vec![256, 1], 144, vec![&[0u8; 143][..]]),
+            (vec![256, 1], 144, vec![&[0u8; 145][..]]),
+        ] {
+            let part = TensorPart {
+                info: TensorInfo {
+                    name: "bad".into(),
+                    dims: dims.clone(),
+                    ty: GgmlType::Q4_K,
+                    offset: 0,
+                    nbytes,
+                },
+                spans,
+            };
+            if !std::panic::catch_unwind(|| part_formats(&[part]))
+                .is_ok_and(|result| result.is_err())
+            {
+                accepted.push((dims, nbytes));
+            }
+        }
+        assert!(accepted.is_empty(), "not refused safely: {accepted:?}");
+        let part = TensorPart {
+            info: TensorInfo {
+                name: "good".into(),
+                dims: vec![256, 1],
+                ty: GgmlType::Q4_K,
+                offset: 0,
+                nbytes: 144,
+            },
+            spans: vec![&[0u8; 72], &[0u8; 72]],
+        };
+        assert!(part_formats(&[part]).is_ok());
+    }
+
     /// A part list is checked whole before any upload: a name given twice, a derived name, and a
     /// type whose values a tensor scale multiplies are refused by name; distinct parts of types
     /// with a card format pass, their staging bytes summed.
     #[test]
     fn a_part_list_is_refused_before_any_upload() {
-        let part = |name: &str, ty: GgmlType| TensorPart {
-            info: TensorInfo {
-                name: name.to_string(),
-                dims: vec![32, 2],
-                ty,
-                offset: 0,
-                nbytes: 0,
-            },
-            spans: Vec::new(),
+        let part = |name: &str, ty: GgmlType| {
+            let nbytes =
+                gguf::tensor_bytes(ty.blck_size().unwrap(), ty.type_size().unwrap(), &[32, 2])
+                    .unwrap();
+            TensorPart {
+                info: TensorInfo {
+                    name: name.to_string(),
+                    dims: vec![32, 2],
+                    ty,
+                    offset: 0,
+                    nbytes,
+                },
+                spans: vec![&[0u8; 256][..nbytes as usize]],
+            }
         };
         let ok = [part("a", GgmlType::Q8_0), part("b", GgmlType::F32)];
         let (formats, budget) = part_formats(&ok).unwrap_or_else(|e| panic!("{e}"));

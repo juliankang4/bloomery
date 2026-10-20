@@ -452,8 +452,10 @@ impl GatherLoop {
     /// Release every counter a rank's card waits on, so that a card stuck on
     /// a part that will not come runs on: for a run that failed with a rank
     /// waiting. `Err` names the ends that could not settle.
-    pub fn release(&self) -> Result<(), String> {
-        self.0.release(RELEASE)
+    pub fn release(&self) -> Result<(), GpuError> {
+        self.0
+            .release(RELEASE)
+            .map_err(|detail| GpuError::shape("GatherLoop::release", detail))
     }
 }
 
