@@ -130,7 +130,7 @@ mod media;
 pub mod prefill;
 
 #[path = "pair.rs"]
-mod pair;
+pub(crate) mod pair;
 
 #[path = "nextn.rs"]
 pub mod nextn;
@@ -216,7 +216,7 @@ pub(crate) struct Kernels {
 }
 
 impl Kernels {
-    fn load(gpu: &Gpu, k_blocks: bool) -> Result<Kernels, GpuError> {
+    pub(crate) fn load(gpu: &Gpu, k_blocks: bool) -> Result<Kernels, GpuError> {
         let ctx = gpu.context();
         Ok(Kernels {
             step: StepKernels::load(ctx)?,
@@ -470,7 +470,7 @@ pub(crate) struct Scratch {
 impl Scratch {
     /// Each row's buffers ([`RowScratch::new`]) and the lane word at lane 0.
     /// Load-time only.
-    fn new(
+    pub(crate) fn new(
         stream: &CudaStream,
         d: &Dims,
         (ff, ctx): (usize, usize),
@@ -699,16 +699,16 @@ impl RowScratch {
 /// The token embedding as the host reads it: the shared table's rows of a
 /// type [`EmbedTable`] reads, one dequantized per step and written four
 /// times, one copy a stream.
-struct Embedding {
+pub(crate) struct Embedding {
     file: Arc<Split>,
     n_vocab: usize,
     row: Vec<f32>,
-    streams: Vec<f32>,
+    pub(crate) streams: Vec<f32>,
     table: EmbedTable,
 }
 
 impl Embedding {
-    fn new(file: Arc<Split>, n_embd: usize) -> Result<Embedding, GpuError> {
+    pub(crate) fn new(file: Arc<Split>, n_embd: usize) -> Result<Embedding, GpuError> {
         let name = names::token_embd();
         let table = EmbedTable::new(file.clone(), &name, n_embd)?;
         Ok(Embedding {
@@ -722,7 +722,7 @@ impl Embedding {
 
     /// Row `token`, dequantized and repeated into the four streams; a token
     /// past the vocabulary is refused by name.
-    fn fill(&mut self, token: u32) -> Result<(), GpuError> {
+    pub(crate) fn fill(&mut self, token: u32) -> Result<(), GpuError> {
         self.table.row_into(token, &mut self.row)?;
         for s in self.streams.chunks_exact_mut(self.row.len()) {
             s.copy_from_slice(&self.row);
@@ -1210,7 +1210,10 @@ pub const TIER_BEFORE_UPLOAD: &str = "glm5next Body::open_placed_lanes (before u
 /// NextN load the next-token layer `nextn` after them — the slot map's
 /// layers. Refused by name: a trunk with no routed run, and a next-token
 /// layer that does not follow it.
-fn host_run(layers: &[LayerSpec], nextn: Option<usize>) -> Result<Range<usize>, GpuError> {
+pub(crate) fn host_run(
+    layers: &[LayerSpec],
+    nextn: Option<usize>,
+) -> Result<Range<usize>, GpuError> {
     let trunk = hosted(layers).map_err(|e| shape(e.to_string()))?;
     match nextn {
         None => Ok(trunk),
@@ -1469,7 +1472,7 @@ impl Body {
     /// and its three conv tap sets into one, in the conv's channel order; a
     /// latent layer's four projections of the normed input. Each row keeps
     /// its file bits.
-    fn derive(
+    pub(crate) fn derive(
         stream: &CudaStream,
         kinds: &[Layer],
         layers: Range<usize>,
@@ -2081,7 +2084,7 @@ pub fn trunk_blocks(file: &Split) -> Result<Vec<BlockPlan>, GpuError> {
 
 /// Each trunk layer's block plan from `inputs`' layer descriptions and `file`'s
 /// tensor types.
-fn trunk_plans(file: &Split, inputs: &PlanInputs) -> Result<Vec<BlockPlan>, GpuError> {
+pub(crate) fn trunk_plans(file: &Split, inputs: &PlanInputs) -> Result<Vec<BlockPlan>, GpuError> {
     let embd = dims_of(inputs)?.embd;
     inputs
         .spec
@@ -2109,7 +2112,7 @@ fn trunk_plans(file: &Split, inputs: &PlanInputs) -> Result<Vec<BlockPlan>, GpuE
 
 /// The file's widths and constants, each checked against the kernel that
 /// fixes it.
-fn dims_of(inputs: &PlanInputs) -> Result<Dims, GpuError> {
+pub(crate) fn dims_of(inputs: &PlanInputs) -> Result<Dims, GpuError> {
     let hp = &inputs.hp;
     let heads = hp.n_head;
     let checks = [
@@ -2180,7 +2183,7 @@ fn dims_of(inputs: &PlanInputs) -> Result<Dims, GpuError> {
 /// Layer `l`'s programs from its description and the values its launches
 /// take, its block read as `block`; a routed layer's row in the card copy is
 /// `map`'s ([`SlotMap::row_offset`]).
-fn layer_cfg(
+pub(crate) fn layer_cfg(
     l: usize,
     s: &LayerSpec,
     map: &SlotMap,
@@ -2236,7 +2239,7 @@ fn layer_cfg(
 /// Layer `kind`'s store at `ctx` positions: a KDA layer's state of `lanes`
 /// lanes, lane 0 stamped at position 0, and its conv ring, a latent layer's
 /// latent and index rows and its pool plane.
-fn store(
+pub(crate) fn store(
     stream: &CudaStream,
     kind: Layer,
     d: &Dims,

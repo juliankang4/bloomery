@@ -43,6 +43,7 @@ mod program;
 mod swap;
 mod tensors;
 mod tier;
+pub mod tp;
 
 pub use body::nextn::{
     GlmArena, Nextn, NextnHead, WALK_ROWS, nextn_chain, nextn_hidden, nextn_logits, nextn_router,

@@ -148,7 +148,7 @@ impl Lanes {
 /// A row's inputs at position `p` into its buffers `r`: the embedding's
 /// four stream copies `streams` into stream buffer 0, the position, the
 /// visible counts and the live count.
-fn write_row(
+pub(crate) fn write_row(
     stream: &CudaStream,
     r: &mut RowScratch,
     streams: &[f32],

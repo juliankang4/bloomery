@@ -447,7 +447,11 @@ gpu-gemma-embedding2 2 0 0
 # PIN(2026-10-17): gpu-gemma4a 10 -> 11 blocks: Ops::sink constructs a launch-local
 # FaultSink from its retained allocation, with its SAFETY line. No Send impl is added.
 gpu-gemma4a 11 0 0
-gpu-glm5next 4 0 0
+# PIN(2026-10-20): gpu-glm5next 4 -> 7 blocks, new code, not old code relaxed: a tensor-parallel rank's gather
+# (tp::gather) writes its part into its own mapped page through a window, posts and waits on the page's counters
+# (mem_batch) and adds the parts in rank order (Gathers::enqueue_sum), each call in a block of its own with its
+# SAFETY line; the rank holds the page past every launch it enqueues.
+gpu-glm5next 7 0 0
 gpu-mimo2 0 0 0
 gpu-solar2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and

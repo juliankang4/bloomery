@@ -248,6 +248,54 @@ impl CardExperts {
         })
     }
 
+    /// A tensor-parallel rank's card experts (`crate::tp`): every expert of
+    /// every routed layer of `layers` on the card at its own id, `ff` the
+    /// rank's part of the routed width, each layer's stacks of a type a
+    /// rank's leg runs ([`LegStacks::of_rank`]: a Q6_K down too) at every
+    /// expert, and the buffers of the one row a rank steps. No prompt batch
+    /// and no tier card run on a rank. Load-time only.
+    pub(crate) fn rank(
+        gpu: &Gpu,
+        w: &Weights,
+        layers: &[LayerSpec],
+        n_embd: usize,
+        ff: usize,
+    ) -> Result<CardExperts, GpuError> {
+        let per = layers
+            .iter()
+            .enumerate()
+            .map(|(l, spec)| {
+                let Ffn::Moe(m) = &spec.ffn else {
+                    return Ok(None);
+                };
+                let models::Act::SwiGlu { limit } = m.act else {
+                    return Err(GpuError::Shape {
+                        what: CARD,
+                        detail: format!("layer {l}: {} has no SwiGLU clamp", m.act.what()),
+                    });
+                };
+                let layer = CardLayer {
+                    n_card: N_EXPERT,
+                    limit: limit.unwrap_or(0.0),
+                    names: routed_stacks(l),
+                };
+                LegStacks::of_rank(w, layer.names())?.check(N_EXPERT, leg_shape(n_embd, ff))?;
+                Ok(Some(layer))
+            })
+            .collect::<Result<Vec<_>, GpuError>>()?;
+        let stream = gpu.stream();
+        Ok(CardExperts {
+            leg: CardLeg::load(gpu)?,
+            tiles: KquantTileKernels::load(gpu.context(), gpu.fault_word())?,
+            batch: FfnBatchKernels::load(gpu.context())?,
+            layers: per,
+            prompt_leg: false,
+            ff,
+            rows: vec![CardRow::new(stream, n_embd, ff)?],
+            tier: None,
+        })
+    }
+
     /// Layer `l` computes experts on the card.
     pub(crate) fn has(&self, l: usize) -> bool {
         self.layer(l).is_some()
@@ -596,6 +644,104 @@ fn card_slots(
         acc: &mut k.acc,
     });
     leg.enqueue(gpu, &mut k.leg, &run, sum)
+}
+
+/// Enqueue layer `l`'s routed block on a tensor-parallel rank (`crate::tp`),
+/// whose card holds every expert at its own id and the rank's part of each
+/// one's inner width: `ffn_norm` RMS, the router (as [`front`]'s), each slot's
+/// place from the slot map (`ds41_ffn_places`, the handoff's rule), the card
+/// leg over the eight slots with their weighted sum, the shared expert at the
+/// rank's width, and the sum plus the shared expert's output into `out`: the
+/// rank's part of the block's output, which the ranks' gather adds. With every
+/// expert on the card these are the launches the one-card body's front, shadow
+/// and back make but the handoff, the go and the wait, and the sum is theirs
+/// with no host part added.
+pub(crate) fn rank_moe(
+    gpu: &Gpu,
+    w: &Weights,
+    p: &mut Parts<'_>,
+    l: usize,
+) -> Result<(), GpuError> {
+    const W: &str = "glm5next rank_moe";
+    let stream = gpu.stream();
+    let (d, c) = (*p.d, p.cfg[l]);
+    let fault = gpu.layer_sink(l)?;
+    let n = moe_names(p, l)?;
+    let s = &mut *p.s;
+    gpu.elem().enqueue_rms_norm(
+        stream,
+        &s.x,
+        f32v(w, n.norm)?,
+        d.rms_eps,
+        d.embd,
+        1,
+        &mut s.xn,
+    )?;
+    let bias = if c.bias { f32v(w, n.bias)? } else { &s.no_bias };
+    p.k.router.enqueue_router(
+        stream,
+        f32t(w, n.router)?,
+        &s.xn,
+        bias,
+        d.scale,
+        &mut s.rout,
+        fault,
+    )?;
+    let CardExperts {
+        leg,
+        batch,
+        layers,
+        rows,
+        ..
+    } = &mut *p.card;
+    let cl = layer_of(layers, l).ok_or(GpuError::State {
+        what: W,
+        missing: "card experts on the layer",
+    })?;
+    batch.enqueue_places(
+        stream,
+        &Places {
+            ids: &s.rout.ids,
+            n: N_USED,
+            map: p.slots.buf(),
+            row_off: c.row_off,
+            n_expert: N_EXPERT,
+        },
+        fault,
+        &mut s.sel,
+    )?;
+    let k = card_row_mut(rows, p.row)?;
+    let stacks = LegStacks::of_rank(w, cl.names())?;
+    let run = LegRun {
+        layer: l,
+        stacks: &stacks,
+        normed: &s.xn,
+        m: 1,
+        sel: &s.sel,
+        n_card: cl.n_card,
+        rule: Act::SwigluClamp { limit: cl.limit },
+    };
+    let sum = LegSum {
+        w: &s.rout.weights,
+        acc: &mut k.acc,
+    };
+    leg.enqueue(gpu, &mut k.leg, &run, Some(sum))?;
+    let kernels = p.k.block_kernels();
+    let blk = Block {
+        plan: c.block,
+        names: [n.sh_gate, n.sh_up, n.sh_down],
+        ff: c.ff,
+        limit: c.limit,
+        layer: l,
+    };
+    let io = BlockIo {
+        x: &s.xn,
+        h: &mut s.h,
+        y: &mut s.sh_y,
+    };
+    enqueue_block(gpu, w, &kernels, &mut s.block, &blk, io)?;
+    gpu.elem()
+        .enqueue_add(stream, &k.acc, &s.sh_y, d.embd, &mut s.out)
 }
 
 /// A prompt batch's card slots ([`card_rows`]): the batch's `t` normed rows
