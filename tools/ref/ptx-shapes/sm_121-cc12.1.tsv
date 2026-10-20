@@ -117,6 +117,10 @@ generate_ds41   flash_latent_mma                        24           8
 generate_ds41   flash_latent_q8                          0           0
 generate_ds41   flash_merge                              0           0
 generate_ds41   flash_merge_q8                           0           0
+generate_ds41   fp8_b128_gemv                            0           0
+generate_ds41   fp8_b128_gemv_mcol                       0           0
+generate_ds41   fp8_b128_gemv_sel_f32                    0           0
+generate_ds41   fp8_b128_tile_gemm                       0           0
 generate_ds41   gap_coop                                 0           0
 generate_ds41   gap_coop_sync                            0           0
 generate_ds41   gap_plain                                0           0
@@ -381,6 +385,10 @@ gate_e2e   flash_latent_mma                        24           8
 gate_e2e   flash_latent_q8                          0           0
 gate_e2e   flash_merge                              0           0
 gate_e2e   flash_merge_q8                           0           0
+gate_e2e   fp8_b128_gemv                            0           0
+gate_e2e   fp8_b128_gemv_mcol                       0           0
+gate_e2e   fp8_b128_gemv_sel_f32                    0           0
+gate_e2e   fp8_b128_tile_gemm                       0           0
 gate_e2e   gap_coop                                 0           0
 gate_e2e   gap_coop_sync                            0           0
 gate_e2e   gap_plain                                0           0

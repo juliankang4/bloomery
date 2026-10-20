@@ -637,7 +637,8 @@ mod gate {
             | CardFormat::Q5_1
             | CardFormat::Bf16Raw
             | CardFormat::Nvfp4Planes
-            | CardFormat::Mxfp8Planes => {
+            | CardFormat::Mxfp8Planes
+            | CardFormat::Fp8B128Planes => {
                 return Err(format!("no host packing of {format:?} here: V4.1 has none").into());
             }
         })
@@ -661,6 +662,9 @@ mod gate {
             }
             DevWeight::Mxfp8 { .. } => {
                 return Err("an mxfp8 weight: V4.1 has none".into());
+            }
+            DevWeight::Fp8B128 { .. } => {
+                return Err("an fp8_b128 weight: V4.1 has none".into());
             }
         })
     }

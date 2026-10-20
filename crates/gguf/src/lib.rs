@@ -1547,7 +1547,8 @@ mod private_tests {
     /// bloomery's own value types open as they did before their rows named
     /// them: through a split and nowhere else. The strict open refuses each
     /// by the tensor's name; `Split::open` sizes F8 rows one byte a
-    /// value, MXFP8 33 bytes a 32 values and NVFP4 rows 9 bytes a 16 values,
+    /// value, MXFP8 33 bytes a 32 values, NVFP4 rows 9 bytes a 16 values and
+    /// FP8_B128 132 bytes a 128 values,
     /// keeps each id and hands back
     /// the bytes as written; an id past them is refused by both. A private
     /// table cannot claim their ids.
@@ -1558,6 +1559,7 @@ mod private_tests {
         let f8: Vec<u8> = (0..320u32).map(|i| (i * 7) as u8).collect();
         let mx: Vec<u8> = (0..132u32).map(|i| (i * 5 + 1) as u8).collect();
         let fp: Vec<u8> = (0..180u32).map(|i| (i * 3 + 2) as u8).collect();
+        let b8: Vec<u8> = (0..264u32).map(|i| (i * 11 + 4) as u8).collect();
         let decl = |name: &str, dims: Vec<u64>, ty: GgmlType, nbytes| TensorDecl {
             name: name.to_string(),
             dims,
@@ -1565,6 +1567,7 @@ mod private_tests {
             nbytes,
         };
         let (f8_ty, mx_ty, fp_ty) = (GgmlType::F8E4M3_ROWS, GgmlType::MXFP8, GgmlType::NVFP4_ROWS);
+        let b8_ty = GgmlType::FP8_B128;
         write_file(
             &p,
             &[],
@@ -1572,6 +1575,7 @@ mod private_tests {
                 (decl("f8", vec![160, 2], f8_ty, 320), f8.clone()),
                 (decl("mx", vec![64, 2], mx_ty, 132), mx.clone()),
                 (decl("fp", vec![160, 2], fp_ty, 180), fp.clone()),
+                (decl("b8", vec![128, 2], b8_ty, 264), b8.clone()),
             ],
         );
         assert!(
@@ -1580,6 +1584,7 @@ mod private_tests {
         for (name, ty, dims, bytes) in [
             ("mx", mx_ty, vec![64, 2], &mx),
             ("fp", fp_ty, vec![160, 2], &fp),
+            ("b8", b8_ty, vec![128, 2], &b8),
         ] {
             let only = d.join(format!("{name}-only.gguf"));
             let t = decl(name, dims, ty, bytes.len() as u64);
@@ -1593,6 +1598,7 @@ mod private_tests {
             ("f8", f8_ty, 2000, [160u64, 2], &f8),
             ("mx", mx_ty, 2001, [64, 2], &mx),
             ("fp", fp_ty, 2002, [160, 2], &fp),
+            ("b8", b8_ty, 2003, [128, 2], &b8),
         ] {
             let (s, t) = split.find(name).unwrap();
             assert_eq!(
@@ -1604,21 +1610,25 @@ mod private_tests {
         assert_eq!((f8_ty.blck_size(), f8_ty.type_size()), (Some(1), Some(1)));
         assert_eq!((mx_ty.blck_size(), mx_ty.type_size()), (Some(32), Some(33)));
         assert_eq!((fp_ty.blck_size(), fp_ty.type_size()), (Some(16), Some(9)));
+        assert_eq!(
+            (b8_ty.blck_size(), b8_ty.type_size()),
+            (Some(128), Some(132))
+        );
         let other = d.join("other.gguf");
         write_file(
             &other,
             &[],
             &[(
-                decl("o", vec![32, 2], GgmlType::Unknown(2003), 66),
+                decl("o", vec![32, 2], GgmlType::Unknown(2004), 66),
                 vec![0; 66],
             )],
         );
         assert!(matches!(
             Split::open(&other),
             Err(LoadError::Shard { ref source, .. })
-                if matches!(**source, LoadError::UnsupportedType { ty: GgmlType::Unknown(2003), .. })
+                if matches!(**source, LoadError::UnsupportedType { ty: GgmlType::Unknown(2004), .. })
         ));
-        for id in [2000, 2001, 2002] {
+        for id in [2000, 2001, 2002, 2003] {
             let table = [PrivateType {
                 id,
                 blck: 1,

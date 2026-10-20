@@ -348,6 +348,7 @@ pub(super) const fn site_ty(entry: SiteEntry) -> SiteTy {
         SiteEntry::F32 => SiteTy::F32,
         SiteEntry::Nvfp4 => SiteTy::Nvfp4,
         SiteEntry::Mxfp8 => SiteTy::Mxfp8,
+        SiteEntry::Fp8B128 => SiteTy::Fp8B128,
     }
 }
 
@@ -365,13 +366,14 @@ pub(super) const fn ggml_ty(site: SiteTy) -> GgmlType {
         SiteTy::F32 => GgmlType::F32,
         SiteTy::Nvfp4 => GgmlType::NVFP4,
         SiteTy::Mxfp8 => GgmlType::MXFP8,
+        SiteTy::Fp8B128 => GgmlType::FP8_B128,
     }
 }
 
 /// Weight `name` as a dense site of `rows` rows of `k` values and the launch
 /// family the qwen3moe body's dense owner ([`qwen3moe_dense`]) picks for the
-/// type it is resident as (a K-quant word plane, Q8_0 or MXFP8 planes,
-/// or an F32 plane). A type the table names no dense site for, a site whose activation
+/// type it is resident as (a K-quant word plane, Q8_0, MXFP8 or FP8_B128
+/// planes, or an F32 plane). A type the table names no dense site for, a site whose activation
 /// the arena does not carry, or a weight of another shape or form, is refused
 /// by name.
 pub(super) fn dense_site(
@@ -386,12 +388,13 @@ pub(super) fn dense_site(
         Some(DevWeight::Q5_0 { .. }) => GgmlType::Q5_0,
         Some(DevWeight::Q8_0 { .. }) => GgmlType::Q8_0,
         Some(DevWeight::Mxfp8 { .. }) => GgmlType::MXFP8,
+        Some(DevWeight::Fp8B128 { .. }) => GgmlType::FP8_B128,
         Some(DevWeight::F32 { .. }) => GgmlType::F32,
         Some(_) => {
             return Err(GpuError::tensor(
                 what,
                 name,
-                "a K-quant word plane, Q8_0 or MXFP8 planes, or an F32 plane",
+                "a K-quant word plane, Q8_0, MXFP8 or FP8_B128 planes, or an F32 plane",
             ));
         }
         None => return Err(GpuError::tensor(what, name, "resident")),
@@ -1332,6 +1335,7 @@ mod tests {
             GgmlType::Q6_K,
             GgmlType::Q8_0,
             GgmlType::MXFP8,
+            GgmlType::FP8_B128,
             GgmlType::IQ3_XXS,
             GgmlType::IQ4_NL,
             GgmlType::IQ4_XS,

@@ -29,7 +29,7 @@
 //! last row ([`MtpFeed::Own`], ik's scheme A: its token the draft's argmax,
 //! its hidden the draft's own streams). Every launch is an entry the
 //! target's chain has, but two of its own (`crate::mtp`), the routed
-//! experts' `q8_0_gemv_sel_f32` and a listed head's `q8_0_gemv_ids` (one
+//! experts' expert-select gemv and a listed head's `q8_0_gemv_ids` (one
 //! row) or `q8_0_gemv_ids_mcol`, and over a Q6_K `output` its quantize and
 //! `q6k_gemv_ids` pair (`crate::q6k_ids`):
 //! - the target's embedding rows (`embed_rows_q8_0`, the borrowed
@@ -45,9 +45,11 @@
 //!   and the output projection;
 //! - the feed-forward site's mix (the attention's combine first), the joined
 //!   router, the routed slots' places over the identity map (every expert
-//!   is the card's), the routed gate and up and down through
-//!   `q8_0_gemv_sel_f32` (the stacks are Q8_0 planes, and the down's 640
-//!   values are no multiple of `Q8Act`'s 256), SwiGLU between, the slots'
+//!   is the card's), the routed gate and up and down through the
+//!   expert-select gemv of the stacks' form (`site::resident_sel_f32`:
+//!   `q8_0_gemv_sel_f32` over Q8_0 planes, `fp8_b128_gemv_sel_f32` over
+//!   FP8_B128 ones; the f32 rows, since the down's 640 values are no multiple
+//!   of `Q8Act`'s 256), SwiGLU between, the slots'
 //!   weighted sum (`ds41_ffn_card_acc_10` over 512 card experts), the shared expert
 //!   and its gated sum (`q38_shared_add`);
 //! - the head site's mix (`nextn.hc_head_*`, the block's combine first, so
@@ -108,7 +110,7 @@ use crate::host::handoff::Places;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};
 use crate::q6k_ids::{Q6kIdsArgs, Q6kIdsKernels};
-use crate::q8f32::{GemvOut, Q8_0GemvIdsArgs, Q8_0GemvMcolArgs, Q8_0SelArgs};
+use crate::q8f32::{GemvOut, Q8_0GemvIdsArgs, Q8_0GemvMcolArgs, SelArgs};
 use crate::q38::{EmbedQ8Args, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
 use crate::rope_neox::PartialNeoxArgs;
 use crate::tensor::{Q8Act, WindowMut};
@@ -2031,12 +2033,11 @@ impl Mtp38 {
         )?;
         let slots = m * used;
         for (name, out) in [(&n.gate_exps, &mut a.rg), (&n.up_exps, &mut a.ru)] {
-            let (qs, d) = q8(w, name)?;
-            gpu.q8f32().enqueue_q8_0_gemv_sel_f32(
-                stream,
-                &Q8_0SelArgs {
-                    qs,
-                    d,
+            crate::site::resident_sel_f32(
+                gpu,
+                w,
+                name,
+                &SelArgs {
                     x: &a.ffn_x,
                     sel: &a.sel,
                     n_slots: slots,
@@ -2049,12 +2050,11 @@ impl Mtp38 {
         }
         gpu.elem()
             .enqueue_swiglu(stream, &a.rg, &a.ru, slots * ff, &mut a.rh)?;
-        let (qs, d) = q8(w, &n.down_exps)?;
-        gpu.q8f32().enqueue_q8_0_gemv_sel_f32(
-            stream,
-            &Q8_0SelArgs {
-                qs,
-                d,
+        crate::site::resident_sel_f32(
+            gpu,
+            w,
+            &n.down_exps,
+            &SelArgs {
                 x: &a.rh,
                 sel: &a.sel,
                 n_slots: slots,

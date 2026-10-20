@@ -49,8 +49,9 @@
 //! - Q4_K gate·up in `crates/gpu/src/arch/qwen3moe/experts.rs`
 //!   (`qwen3moe_gate_up_swiglu_q4k`): the whole-card qwen3moe body's own, with
 //!   the SiLU rule fixed. The common Q4_K gate·up is the row below.
-//! - Q8_0 `_sel` over f32 activations
-//!   (`Q8F32Kernels::enqueue_q8_0_gemv_sel_f32`, the MTP draft's experts): an
+//! - Q8_0 and FP8_B128 `_sel` over f32 activations
+//!   (`Q8F32Kernels::enqueue_q8_0_gemv_sel_f32` and `enqueue_e4m3_gemv_sel_f32`
+//!   through `site::resident_sel_f32`, the MTP draft's experts): an
 //!   activation form [`DownAct`] does not name.
 //! - `dflash_expert_gate_up` and `dflash_expert_down` in
 //!   `crates/gpu/src/mxfp4_sel.rs`: the V4.1 DSpark draft's route-plan entries
@@ -236,11 +237,15 @@ pub enum SiteEntry {
     /// over the NVFP4 planes and the q8_1 rows, times the tensor's scale,
     /// through `site::kgemv`. No wide GEMM.
     Nvfp4,
-    /// `Q8F32Kernels::enqueue_mxfp8_gemv` (`mxfp8_gemv`, `mxfp8_gemv_mcol`,
+    /// `Q8F32Kernels::enqueue_e4m3_gemv` (`mxfp8_gemv`, `mxfp8_gemv_mcol`,
     /// `crates/gpu/src/q8f32.rs`) over bloomery's MXFP8 planes
-    /// (`GgmlType::MXFP8`) and the f32 rows; wide, `Gemm32Kernels::enqueue_mxfp8_tile`
-    /// over the f32 rows.
+    /// (`GgmlType::MXFP8`) and the f32 rows; wide, `Gemm32Kernels::enqueue_e4m3_tile`
+    /// (`mxfp8_tile_gemm`) over the f32 rows.
     Mxfp8,
+    /// The same launchers' FP8_B128 entries (`fp8_b128_gemv`,
+    /// `fp8_b128_gemv_mcol`; wide, `fp8_b128_tile_gemm`) over bloomery's
+    /// FP8_B128 planes (`GgmlType::FP8_B128`) and the f32 rows.
+    Fp8B128,
 }
 
 /// The activation a dense site's launch reads; `crates/gpu/src/site.rs`
@@ -272,7 +277,7 @@ impl SiteEntry {
             SiteEntry::F32 => SiteAct::F32,
             SiteEntry::Q5_0 => SiteAct::Q8Blocks32,
             SiteEntry::Nvfp4 => SiteAct::Q8x128,
-            SiteEntry::Mxfp8 => SiteAct::F32,
+            SiteEntry::Mxfp8 | SiteEntry::Fp8B128 => SiteAct::F32,
         }
     }
 }
@@ -353,6 +358,7 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GgmlType::F8E4M3_ROWS
         | GgmlType::NVFP4_ROWS
         | GgmlType::MXFP8
+        | GgmlType::FP8_B128
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -400,6 +406,7 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         | GgmlType::F8E4M3_ROWS
         | GgmlType::NVFP4_ROWS
         | GgmlType::MXFP8
+        | GgmlType::FP8_B128
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -460,6 +467,7 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
         | GgmlType::F8E4M3_ROWS
         | GgmlType::NVFP4_ROWS
         | GgmlType::MXFP8
+        | GgmlType::FP8_B128
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -477,6 +485,7 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         GgmlType::F32 => Some(SiteEntry::F32),
         GgmlType::NVFP4 => Some(SiteEntry::Nvfp4),
         GgmlType::MXFP8 => Some(SiteEntry::Mxfp8),
+        GgmlType::FP8_B128 => Some(SiteEntry::Fp8B128),
         GgmlType::F16
         | GgmlType::Q4_0
         | GgmlType::Q4_1
@@ -552,6 +561,7 @@ pub const fn head(ty: GgmlType) -> Option<HeadEntry> {
         | GgmlType::F8E4M3_ROWS
         | GgmlType::NVFP4_ROWS
         | GgmlType::MXFP8
+        | GgmlType::FP8_B128
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -598,6 +608,7 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
         | GgmlType::F8E4M3_ROWS
         | GgmlType::NVFP4_ROWS
         | GgmlType::MXFP8
+        | GgmlType::FP8_B128
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -710,7 +721,7 @@ mod tests {
 
     /// Every `GgmlType` variant in declaration order, then one id the enum
     /// does not name.
-    const ALL: [GgmlType; 39] = [
+    const ALL: [GgmlType; 40] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::Q5_0,
@@ -749,6 +760,7 @@ mod tests {
         GgmlType::F8E4M3_ROWS,
         GgmlType::MXFP8,
         GgmlType::NVFP4_ROWS,
+        GgmlType::FP8_B128,
         GgmlType::Unknown(99),
     ];
 
@@ -794,7 +806,8 @@ mod tests {
             GgmlType::F8E4M3_ROWS => 35,
             GgmlType::MXFP8 => 36,
             GgmlType::NVFP4_ROWS => 37,
-            GgmlType::Unknown(_) => 38,
+            GgmlType::FP8_B128 => 38,
+            GgmlType::Unknown(_) => 39,
         }
     }
 
@@ -972,6 +985,8 @@ mod tests {
     // `site::kgemv`); every other pair is unchanged.
     // PIN(2026-10-19): and bloomery's own MXFP8 (`mxfp8_gemv` through
     // `site::gemv`); every other pair is unchanged.
+    // PIN(2026-10-20): and bloomery's own FP8_B128 (`fp8_b128_gemv` through
+    // `site::gemv`); every other pair is unchanged.
     #[test]
     fn dense_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -986,6 +1001,7 @@ mod tests {
                 (GgmlType::Q6_K, SiteEntry::Q6k),
                 (GgmlType::NVFP4, SiteEntry::Nvfp4),
                 (GgmlType::MXFP8, SiteEntry::Mxfp8),
+                (GgmlType::FP8_B128, SiteEntry::Fp8B128),
             ]
         );
     }

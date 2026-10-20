@@ -12,7 +12,7 @@
 use crate::mxfp4::{Nvfp4, Nvfp4Weight, Planes, repack};
 use crate::mxfp4_sel::Nvfp4Stack;
 use crate::q5::{pack_q5_0, pack_q5_1};
-use crate::q8f32::{GemvOut, Mxfp8Weight, Q8_0GemvMcolArgs, mxfp8_planes};
+use crate::q8f32::{E4m3Scales, E4m3Weight, GemvOut, Q8_0GemvMcolArgs, e4m3_planes};
 use crate::tensor::{DeviceTensor, window};
 use crate::upload::{Stage, UploadRing, bytes_of};
 use crate::{Gpu, GpuError};
@@ -118,10 +118,18 @@ pub enum DevWeight {
         scales: DeviceTensor<f32>,
     },
     /// bloomery's MXFP8 file tensor (`GgmlType::MXFP8`) in the two planes of
-    /// `q8f32::mxfp8_planes` (`CardFormat::Mxfp8Planes`): `qs` rows × k/4
+    /// `q8f32::e4m3_planes` (`CardFormat::Mxfp8Planes`): `qs` rows × k/4
     /// value words, `e` rows × k/128 scale words (four E8M0 bytes a word).
     /// `k` is a multiple of 128.
     Mxfp8 {
+        qs: DeviceTensor<u32>,
+        e: DeviceTensor<u32>,
+        k: usize,
+    },
+    /// bloomery's FP8_B128 file tensor (`GgmlType::FP8_B128`) in the same
+    /// two planes (`CardFormat::Fp8B128Planes`), `e` one f32 scale a word
+    /// (a 128-value block's). `k` is a multiple of 128.
+    Fp8B128 {
         qs: DeviceTensor<u32>,
         e: DeviceTensor<u32>,
         k: usize,
@@ -150,7 +158,8 @@ impl DevWeight {
             DevWeight::F32 { w, .. } => w.rows(),
             DevWeight::Nvfp4 { qs, .. }
             | DevWeight::Nvfp4Stack { qs, .. }
-            | DevWeight::Mxfp8 { qs, .. } => qs.rows(),
+            | DevWeight::Mxfp8 { qs, .. }
+            | DevWeight::Fp8B128 { qs, .. } => qs.rows(),
         }
     }
 
@@ -166,7 +175,8 @@ impl DevWeight {
             | DevWeight::F32 { k, .. }
             | DevWeight::Nvfp4 { k, .. }
             | DevWeight::Nvfp4Stack { k, .. }
-            | DevWeight::Mxfp8 { k, .. } => *k,
+            | DevWeight::Mxfp8 { k, .. }
+            | DevWeight::Fp8B128 { k, .. } => *k,
         }
     }
 
@@ -189,7 +199,9 @@ impl DevWeight {
             | DevWeight::Nvfp4Stack { qs, e, scales, .. } => {
                 vec![held(qs), held(e), held(scales)]
             }
-            DevWeight::Mxfp8 { qs, e, .. } => vec![held(qs), held(e)],
+            DevWeight::Mxfp8 { qs, e, .. } | DevWeight::Fp8B128 { qs, e, .. } => {
+                vec![held(qs), held(e)]
+            }
         }
     }
 
@@ -383,9 +395,9 @@ impl Weights {
     /// Refused unless every part is resident as a K-quant of the first
     /// part's type and width, and every part but the last ends on a word
     /// boundary (its rows' bytes a multiple of 4). F32 parts join the same
-    /// way ([`Weights::join_f32_rows`]) when the first part is F32, and Q8_0
-    /// or MXFP8 parts plane by plane ([`Weights::join_byte_rows`]) when it is
-    /// one of those.
+    /// way ([`Weights::join_f32_rows`]) when the first part is F32, and Q8_0,
+    /// MXFP8 or FP8_B128 parts plane by plane ([`Weights::join_byte_rows`])
+    /// when it is one of those.
     /// Load-time only: the copies are synchronized before the parts are
     /// freed.
     pub fn join_rows(
@@ -420,6 +432,18 @@ impl Weights {
                         _ => None,
                     },
                     |qs, e, k| DevWeight::Mxfp8 { qs, e, k },
+                );
+            }
+            Some(DevWeight::Fp8B128 { .. }) => {
+                return self.join_byte_rows(
+                    stream,
+                    (parts, joint),
+                    128,
+                    |w| match w {
+                        DevWeight::Fp8B128 { qs, e, k } => Some((qs, e, *k)),
+                        _ => None,
+                    },
+                    |qs, e, k| DevWeight::Fp8B128 { qs, e, k },
                 );
             }
             _ => {}
@@ -570,7 +594,7 @@ impl Weights {
     }
 
     /// [`Weights::join_rows`] over parts in two planes, one byte a value
-    /// (Q8_0 or MXFP8): every part resident in the first part's format at its
+    /// (Q8_0, MXFP8 or FP8_B128): every part resident in the first part's format at its
     /// width `k`, a `scale_values`-value scale an entry of the scale plane,
     /// their rows one after another in each of the two planes (`qs` words,
     /// the scales), filed as `joint` in that format — every row the bits its
@@ -714,13 +738,16 @@ impl Weights {
         }
     }
 
-    /// The planes of the resident MXFP8 weight `name`; any other variant is
-    /// refused by name as `what`'s.
-    pub fn mxfp8(&self, what: &'static str, name: &str) -> Result<Mxfp8Weight<'_>, GpuError> {
-        match self.resident(what, name)? {
-            DevWeight::Mxfp8 { qs, e, .. } => Ok(Mxfp8Weight { qs, e }),
-            _ => Err(GpuError::tensor(what, name, "an mxfp8 weight")),
-        }
+    /// The planes of the resident E4M3 weight `name` (MXFP8 or FP8_B128) and
+    /// the scales they hold; any other variant is refused by name as
+    /// `what`'s.
+    pub fn e4m3(&self, what: &'static str, name: &str) -> Result<E4m3Weight<'_>, GpuError> {
+        let (qs, e, scales) = match self.resident(what, name)? {
+            DevWeight::Mxfp8 { qs, e, .. } => (qs, e, E4m3Scales::Mxfp8),
+            DevWeight::Fp8B128 { qs, e, .. } => (qs, e, E4m3Scales::Fp8B128),
+            _ => return Err(GpuError::tensor(what, name, "an mxfp8 or fp8_b128 weight")),
+        };
+        Ok(E4m3Weight { qs, e, scales })
     }
 
     /// The planes and the experts' scales of the resident NVFP4 stack
@@ -1351,13 +1378,19 @@ fn upload_rows(
                 }
             }
         }
-        CardFormat::Mxfp8Planes => {
-            let (qs, e) = mxfp8_planes(&flat_of(src, take)?, rows, k)
+        CardFormat::Mxfp8Planes | CardFormat::Fp8B128Planes => {
+            let scales = if format == CardFormat::Mxfp8Planes {
+                E4m3Scales::Mxfp8
+            } else {
+                E4m3Scales::Fp8B128
+            };
+            let (qs, e) = e4m3_planes(scales, &flat_of(src, take)?, rows, k)
                 .map_err(|err| GpuError::shape(what, format!("tensor {name}: {err}")))?;
-            DevWeight::Mxfp8 {
-                qs: upload_packed(stream, ring, what, name, &qs, rows, k / 4)?,
-                e: upload_packed(stream, ring, what, name, &e, rows, k / 128)?,
-                k,
+            let qs = upload_packed(stream, ring, what, name, &qs, rows, k / 4)?;
+            let e = upload_packed(stream, ring, what, name, &e, rows, k / 128)?;
+            match scales {
+                E4m3Scales::Mxfp8 => DevWeight::Mxfp8 { qs, e, k },
+                E4m3Scales::Fp8B128 => DevWeight::Fp8B128 { qs, e, k },
             }
         }
         CardFormat::Bf16Raw => {

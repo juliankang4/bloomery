@@ -134,6 +134,10 @@ pub(crate) const OWN_ROWS: &[QRow] = &[
     // `dequant_row` does not decode it. A row of any multiple of 16 values is whole groups, where
     // GGUF's NVFP4 block needs 64.
     QRow { ty: T::NVFP4_ROWS, name: "nvfp4_rows", blck: 16, bytes: 9, dequant: false, host_act: H::None },
+    // fp8_b128: F8_E4M3 values in blocks of 128 along the row, the block's f32 scale (little-endian)
+    // then its 128 value bytes (`quant::check_fp8_b128`, `dequant_fp8_b128`); a checkpoint's one scale
+    // a 128 by 128 square is written into each row's block of it. No CPU matmul here.
+    QRow { ty: T::FP8_B128, name: "fp8_b128", blck: 128, bytes: 132, dequant: true, host_act: H::None },
 ];
 
 /// The build refuses an own row whose type `from_u32` does not name, whose tag ggml's table

@@ -19,17 +19,19 @@
 //! — the GEMM families' `y[s][n]`, not `f32_gemv`'s `y[r · m + c]`.
 //!
 //! The rows come from a [`TileRows`]: an F32 weight's values are copied into
-//! the stage as they are ([`F32Rows`], `cp.async`), and an MXFP8 weight's
-//! planes (`q8f32::mxfp8_planes`) are decoded into it ([`Mxfp8Rows`]: each
+//! the stage as they are ([`F32Rows`], `cp.async`), and an E4M3 weight's
+//! planes (`q8f32::e4m3_planes`) are decoded into it ([`ByteRows`]: each
 //! piece's value word and its block's scale loaded, the four values formed
-//! as `Mxfp8Bytes` gives them, exactly the host's dequant, and stored) —
-//! `mxfp8_tile_gemm`. Either way the warps read f32 values from the stage, so
-//! an MXFP8 tile is bit for bit `f32_gemv` over the host's dequantized rows.
+//! as the planes' `ByteBlocks` gives them, exactly the host's dequant, and
+//! stored) — `mxfp8_tile_gemm` and `fp8_b128_tile_gemm`. Either way the warps
+//! read f32 values from the stage, so an E4M3 tile is bit for bit `f32_gemv`
+//! over the host's dequantized rows.
 
 use super::kernels32::Gemm32Kernels;
-use crate::q8f32::{ByteBlocks, Mxfp8Bytes, Mxfp8Weight, TILE, f32_tile_chunk, gemv_lane_sums};
+use crate::q8f32::{ByteBlocks, E4m3Scales, E4m3Weight, TILE, f32_tile_chunk, gemv_lane_sums};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
+use core::marker::PhantomData;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
 use cuda_device::{DisjointSlice, thread, warp};
@@ -93,14 +95,34 @@ impl TileRows for F32Rows<'_> {
     }
 }
 
-/// An MXFP8 weight's two planes, decoded as they are staged.
-#[derive(Clone, Copy)]
-pub(super) struct Mxfp8Rows<'a> {
-    pub qs: &'a [u32],
-    pub e: &'a [u32],
+/// An E4M3 weight's two planes, decoded as they are staged by `F`, the
+/// planes' [`ByteBlocks`].
+pub(super) struct ByteRows<'a, F> {
+    qs: &'a [u32],
+    e: &'a [u32],
+    blocks: PhantomData<F>,
 }
 
-impl TileRows for Mxfp8Rows<'_> {
+impl<'a, F> ByteRows<'a, F> {
+    #[inline(always)]
+    pub(super) fn new(qs: &'a [u32], e: &'a [u32]) -> Self {
+        ByteRows {
+            qs,
+            e,
+            blocks: PhantomData,
+        }
+    }
+}
+
+impl<F> Clone for ByteRows<'_, F> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<F> Copy for ByteRows<'_, F> {}
+
+impl<F: ByteBlocks<Scale = u32>> TileRows for ByteRows<'_, F> {
     #[inline(always)]
     unsafe fn stage(self, dst: *mut f32, at: usize) {
         // SAFETY: values at .. at + 4 are the bytes of word at / 4, and their
@@ -110,17 +132,17 @@ impl TileRows for Mxfp8Rows<'_> {
         let (q, e) = unsafe {
             (
                 *self.qs.get_unchecked(at >> 2),
-                Mxfp8Bytes::scale_at(self.e, at >> 5),
+                F::scale_at(self.e, at >> 5),
             )
         };
-        let d = Mxfp8Bytes::scale(e, at >> 5);
+        let d = F::scale(e, at >> 5);
         // SAFETY: dst is this thread's own 16 bytes of the stage (this fn's
         // contract); the stores are plain, published by the barrier.
         unsafe {
-            *dst = Mxfp8Bytes::value(q) * d;
-            *dst.add(1) = Mxfp8Bytes::value(q >> 8) * d;
-            *dst.add(2) = Mxfp8Bytes::value(q >> 16) * d;
-            *dst.add(3) = Mxfp8Bytes::value(q >> 24) * d;
+            *dst = F::value(q) * d;
+            *dst.add(1) = F::value(q >> 8) * d;
+            *dst.add(2) = F::value(q >> 16) * d;
+            *dst.add(3) = F::value(q >> 24) * d;
         }
     }
 }
@@ -344,40 +366,37 @@ impl Gemm32Kernels {
         Ok(())
     }
 
-    /// Enqueue [`Self::enqueue_f32_tile`]'s product for an MXFP8 weight in
+    /// Enqueue [`Self::enqueue_f32_tile`]'s product for an E4M3 weight in
     /// its two planes (`rows × k` values, `k = 4 · w.qs.cols()`), its values
-    /// decoded as they are staged (module doc): every output bit for bit
+    /// decoded as they are staged (module doc) by `mxfp8_tile_gemm` or
+    /// `fp8_b128_tile_gemm` as its scales say: every output bit for bit
     /// `Q8F32Kernels::enqueue_f32_gemv`'s over the host's dequantized rows.
     /// `k` must be a positive multiple of 128 with `e` `k / 128` words a row
     /// over the same rows, and `x` 16-byte aligned; another is a named
     /// `Shape` error. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_mxfp8_tile(
+    pub fn enqueue_e4m3_tile(
         &self,
         stream: &CudaStream,
-        w: Mxfp8Weight<'_>,
+        w: E4m3Weight<'_>,
         x: &DeviceBuffer<f32>,
         n: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let what = "Gemm32Kernels::enqueue_mxfp8_tile";
+        let what = "Gemm32Kernels::enqueue_e4m3_tile";
         let (rows, k) = w.dimensions(what)?;
         let t = tile_launch(what, rows, k, x, n, y)?;
-        let prep = self.module.prepare_mxfp8_tile_gemm(LaunchConfig1D::new(
-            t.grid,
-            F32T_THREADS_U32,
-            0,
-        ))?;
-        self.module.mxfp8_tile_gemm(
-            stream,
-            &prep,
-            w.qs.buf(),
-            w.e.buf(),
-            x,
-            t.rows,
-            t.k,
-            t.n,
-            y,
-        )?;
+        let cfg = LaunchConfig1D::new(t.grid, F32T_THREADS_U32, 0);
+        let (qs, e, module) = (w.qs.buf(), w.e.buf(), &self.module);
+        match w.scales {
+            E4m3Scales::Mxfp8 => {
+                let prep = module.prepare_mxfp8_tile_gemm(cfg)?;
+                module.mxfp8_tile_gemm(stream, &prep, qs, e, x, t.rows, t.k, t.n, y)?;
+            }
+            E4m3Scales::Fp8B128 => {
+                let prep = module.prepare_fp8_b128_tile_gemm(cfg)?;
+                module.fp8_b128_tile_gemm(stream, &prep, qs, e, x, t.rows, t.k, t.n, y)?;
+            }
+        }
         Ok(())
     }
 }
