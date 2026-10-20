@@ -174,8 +174,9 @@
 //!   token share its column; a Q5_1 stack of 8 × 2560 rows at K 640 (the
 //!   routed down's shape) up to 4096 slots.
 //! - `g32_slab`: both Q8_0-plane entries on one stack past the raster's
-//!   bytes, 4112 rows (32 full slabs and one of 16) at K 2560, through the
-//!   dense table — 16 columns (one tile, 33 blocks: `gemm_q8_0p`), 65 (two
+//!   bytes, 4112 rows (32 full slabs and one of 16) at K 2560 and at K 2592
+//!   (81 blocks a row, so rows start inside a group of eight scales), through
+//!   the dense table — 16 columns (one tile, 33 blocks: `gemm_q8_0p`), 65 (two
 //!   tiles, 66 blocks, under one wave of the card: `gemm_q8_0p`) and 1100
 //!   (18 tiles, 594 blocks: `gemm_q8_0p_slab`, one full raster group of 16
 //!   tiles and one of 2): the entry `q8_0p_slab` names for each. Numerical checks
@@ -4513,7 +4514,7 @@ mod gate {
         }
 
         /// Both Q8_0-plane entries over the dense table on one stack of
-        /// 4112 rows at K 2560 (11.2 MB of planes, past
+        /// 4112 rows at K 2560 and K 2592 (11.2 and 11.3 MB of planes, past
         /// `GEMM32_RASTER_BYTES`): 16, 65 and 1100 columns, each against the
         /// reference and the contract's transcription (all outputs at 16/65
         /// columns, a rotating quarter at 1100). Captured nodes name the launched
@@ -4524,16 +4525,13 @@ mod gate {
             }
             /// Rows of the stack: 32 full 128-row slabs and one of 16.
             const SLAB_ROWS: usize = 4112;
-            let (k, ms) = (2560usize, [16usize, 65, 1100]);
+            let ms = [16usize, 65, 1100];
             let gpu = dev.gpu;
             let stream = gpu.stream();
             let sink = gpu.unlabelled_sink();
             let max = ms[ms.len() - 1];
             let mut route = GemmRoute::new(stream, max, 1)?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, max * SLAB_ROWS)?;
-            let (w, dec) = weights(false, SLAB_ROWS, k, 0x3510)?;
-            let res = Res::new(dev, &w, false, SLAB_ROWS)?;
-            let mut act = GemmAct32::new(stream, max, k)?;
             let wave = dev.g32.q8_0p_wave();
             let selector_ok = !dev.g32.q8_0p_slab(wave - 1, 65, 1)
                 && !dev.g32.q8_0p_slab(u32::MAX, 64, 1)
@@ -4543,131 +4541,139 @@ mod gate {
                 verdict(selector_ok)
             );
             let mut ok = selector_ok;
-            for m in ms {
-                let x = activations(k, m, 9700 + m as u32);
-                let xd = DeviceBuffer::from_host(stream, &x)?;
-                dev.g32
-                    .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
-                dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
-                stream.synchronize()?;
-                let (ha, want) = host_act(&x, k, m);
-                let act_ok = planes_equal(&act, m, &want, stream)?;
-                y.copy_from_host(stream, &vec![SENT; y.len()])?;
-                let weight = res.weight(Lay::Q8Plane)?;
-                let graph = gpu.capture(|stream| {
-                    dev.g32.enqueue_gemm32(
+            // K 2592 is 81 blocks a row, so most rows start inside a group
+            // of eight scales and read the window `@prep` binds before the
+            // window first moves; K 2560 starts every row on a group.
+            for k in [2560usize, 2592] {
+                let (w, dec) = weights(false, SLAB_ROWS, k, 0x3510)?;
+                let res = Res::new(dev, &w, false, SLAB_ROWS)?;
+                let mut act = GemmAct32::new(stream, max, k)?;
+                for m in ms {
+                    let x = activations(k, m, 9700 + m as u32);
+                    let xd = DeviceBuffer::from_host(stream, &x)?;
+                    dev.g32
+                        .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
+                    dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
+                    stream.synchronize()?;
+                    let (ha, want) = host_act(&x, k, m);
+                    let act_ok = planes_equal(&act, m, &want, stream)?;
+                    y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                    let weight = res.weight(Lay::Q8Plane)?;
+                    let graph = gpu.capture(|stream| {
+                        dev.g32.enqueue_gemm32(
+                            stream,
+                            Gemm32Args {
+                                w: weight,
+                                rows_per_expert: SLAB_ROWS,
+                                act: &act,
+                                route: &route,
+                                input: GemmInput::PerSlot,
+                                y: &mut y,
+                            },
+                        )
+                    })?;
+                    let nodes = graph.nodes()?;
+                    let entry = match nodes.as_slice() {
+                        [node] => node
+                            .kernel
+                            .as_ref()
+                            .ok_or("Q8_0 GEMM node is not a kernel")?,
+                        _ => return Err("Q8_0 GEMM capture must contain one node".into()),
+                    };
+                    // The launch's grid: 128-row slabs times the dense table's
+                    // `m / 64 + 1` tiles (`gemm_max_tiles`).
+                    let grid = u32::try_from(SLAB_ROWS.div_ceil(128) * (m / 64 + 1))?;
+                    let expected_entry = if m > 64 && grid >= wave {
+                        "gemm_q8_0p_slab"
+                    } else {
+                        "gemm_q8_0p"
+                    };
+                    let entry_ok = entry.name == expected_entry && entry.grid == [grid, 1, 1];
+                    graph.launch(stream)?;
+                    stream.synchronize()?;
+                    let mut got = y.to_host_vec(stream)?;
+                    got.truncate(m * SLAB_ROWS);
+                    let unwritten = got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
+                    let Checked {
+                        checked,
+                        band_off,
+                        bits_off,
+                        worst,
+                        first,
+                        ..
+                    } = check(&w, false, SLAB_ROWS, &ha, &|_| Some(0), &|s| s, &got, m)?;
+                    let fault = gpu.take_fault()?;
+                    let pass = act_ok
+                        && dec
+                        // PIN(2026-10-20): captured entry and grid replace the recomputed selector assertion.
+                        && entry_ok
+                        && unwritten == 0
+                        && band_off == 0
+                        && bits_off == 0
+                        && fault.is_none();
+                    println!(
+                        "gemm32 case=g32_slab K={k} m={m} rows={SLAB_ROWS} grid={grid} \
+                         entry={} entry_ok={entry_ok} act_eq_host={act_ok} decode_vs_ggml={dec} unwritten={unwritten} \
+                         checked={checked} worst_err_over_band={worst:.3} band_off={band_off} \
+                         contract_bits_differ={bits_off} y_fnv={:016x} {}",
+                        entry.name,
+                        Fnv1a64::default().f32s(&got).value(),
+                        verdict(pass)
+                    );
+                    if let Some(f) = first {
+                        println!("gemm32 case=g32_slab K={k} m={m} first_failure: {f}");
+                    }
+                    ok &= pass;
+                }
+                let (qs, d) = res.plane.as_ref().ok_or("a Q8_0 stack with no planes")?;
+                let mut scales = d.buf().to_host_vec(stream)?;
+                scales.insert(0, 0);
+                let parent = DeviceBuffer::from_host(stream, &scales)?;
+                let d_off = DeviceTensor::<u16>::window_of(&parent, 2, SLAB_ROWS, k / 32)?;
+                let mut codes = qs.buf().to_host_vec(stream)?;
+                codes.insert(0, 0);
+                let code_parent = DeviceBuffer::from_host(stream, &codes)?;
+                let qs_off = DeviceTensor::<u32>::window_of(&code_parent, 4, SLAB_ROWS, k / 4)?;
+                // PIN(2026-10-20): per-plane checks replace the slab-only scale-alignment clause.
+                for (name, qs, d, offset, m, expect_slab) in [
+                    ("scale", qs, &*d_off, 2, max, true),
+                    ("code", &*qs_off, d, 4, max, true),
+                    ("code", &*qs_off, d, 4, ms[0], false),
+                ] {
+                    dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
+                    y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                    let got = dev.g32.enqueue_gemm32(
                         stream,
                         Gemm32Args {
-                            w: weight,
+                            w: Gemm32Weight::Q8_0Plane { qs, d },
                             rows_per_expert: SLAB_ROWS,
                             act: &act,
                             route: &route,
                             input: GemmInput::PerSlot,
                             y: &mut y,
                         },
-                    )
-                })?;
-                let nodes = graph.nodes()?;
-                let entry = match nodes.as_slice() {
-                    [node] => node
-                        .kernel
-                        .as_ref()
-                        .ok_or("Q8_0 GEMM node is not a kernel")?,
-                    _ => return Err("Q8_0 GEMM capture must contain one node".into()),
-                };
-                // The launch's grid: 128-row slabs times the dense table's
-                // `m / 64 + 1` tiles (`gemm_max_tiles`).
-                let grid = u32::try_from(SLAB_ROWS.div_ceil(128) * (m / 64 + 1))?;
-                let expected_entry = if m > 64 && grid >= wave {
-                    "gemm_q8_0p_slab"
-                } else {
-                    "gemm_q8_0p"
-                };
-                let entry_ok = entry.name == expected_entry && entry.grid == [grid, 1, 1];
-                graph.launch(stream)?;
-                stream.synchronize()?;
-                let mut got = y.to_host_vec(stream)?;
-                got.truncate(m * SLAB_ROWS);
-                let unwritten = got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
-                let Checked {
-                    checked,
-                    band_off,
-                    bits_off,
-                    worst,
-                    first,
-                    ..
-                } = check(&w, false, SLAB_ROWS, &ha, &|_| Some(0), &|s| s, &got, m)?;
-                let fault = gpu.take_fault()?;
-                let pass = act_ok
-                    && dec
-                    // PIN(2026-10-20): captured entry and grid replace the recomputed selector assertion.
-                    && entry_ok
-                    && unwritten == 0
-                    && band_off == 0
-                    && bits_off == 0
-                    && fault.is_none();
-                println!(
-                    "gemm32 case=g32_slab K={k} m={m} rows={SLAB_ROWS} grid={grid} \
-                     entry={} entry_ok={entry_ok} act_eq_host={act_ok} decode_vs_ggml={dec} unwritten={unwritten} \
-                     checked={checked} worst_err_over_band={worst:.3} band_off={band_off} \
-                     contract_bits_differ={bits_off} y_fnv={:016x} {}",
-                    entry.name,
-                    Fnv1a64::default().f32s(&got).value(),
-                    verdict(pass)
-                );
-                if let Some(f) = first {
-                    println!("gemm32 case=g32_slab K={k} m={m} first_failure: {f}");
+                    );
+                    let refused = matches!(
+                        &got,
+                        Err(bloomery_gpu::GpuError::Shape { what, detail })
+                            if *what == "Gemm32Kernels::enqueue_gemm32"
+                                && detail.contains(&format!("Q8_0 {name} plane"))
+                                && detail.contains("is not 16-byte aligned")
+                    );
+                    let untouched = refused
+                        && y.to_host_vec(stream)?
+                            .iter()
+                            .all(|v| v.to_bits() == SENT.to_bits());
+                    let grid = u32::try_from(SLAB_ROWS.div_ceil(128) * (m / 64 + 1))?;
+                    let slab = dev.g32.q8_0p_slab(grid, u32::try_from(m)?, 1);
+                    let pass = slab == expect_slab && refused && untouched;
+                    println!(
+                        "gemm32 case=g32_slab_{name}_unaligned K={k} byte_offset={offset} m={m} slab={slab} \
+                         named_shape={refused} output_untouched={untouched} result={got:?} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
                 }
-                ok &= pass;
-            }
-            let (qs, d) = res.plane.as_ref().ok_or("a Q8_0 stack with no planes")?;
-            let mut scales = d.buf().to_host_vec(stream)?;
-            scales.insert(0, 0);
-            let parent = DeviceBuffer::from_host(stream, &scales)?;
-            let d_off = DeviceTensor::<u16>::window_of(&parent, 2, SLAB_ROWS, k / 32)?;
-            let mut codes = qs.buf().to_host_vec(stream)?;
-            codes.insert(0, 0);
-            let code_parent = DeviceBuffer::from_host(stream, &codes)?;
-            let qs_off = DeviceTensor::<u32>::window_of(&code_parent, 4, SLAB_ROWS, k / 4)?;
-            // PIN(2026-10-20): per-plane checks replace the slab-only scale-alignment clause.
-            for (name, qs, d, offset, m, expect_slab) in [
-                ("scale", qs, &*d_off, 2, max, true),
-                ("code", &*qs_off, d, 4, max, true),
-                ("code", &*qs_off, d, 4, ms[0], false),
-            ] {
-                dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
-                y.copy_from_host(stream, &vec![SENT; y.len()])?;
-                let got = dev.g32.enqueue_gemm32(
-                    stream,
-                    Gemm32Args {
-                        w: Gemm32Weight::Q8_0Plane { qs, d },
-                        rows_per_expert: SLAB_ROWS,
-                        act: &act,
-                        route: &route,
-                        input: GemmInput::PerSlot,
-                        y: &mut y,
-                    },
-                );
-                let refused = matches!(
-                    &got,
-                    Err(bloomery_gpu::GpuError::Shape { what, detail })
-                        if *what == "Gemm32Kernels::enqueue_gemm32"
-                            && detail.contains(&format!("Q8_0 {name} plane"))
-                            && detail.contains("is not 16-byte aligned")
-                );
-                let untouched = refused
-                    && y.to_host_vec(stream)?
-                        .iter()
-                        .all(|v| v.to_bits() == SENT.to_bits());
-                let grid = u32::try_from(SLAB_ROWS.div_ceil(128) * (m / 64 + 1))?;
-                let slab = dev.g32.q8_0p_slab(grid, u32::try_from(m)?, 1);
-                let pass = slab == expect_slab && refused && untouched;
-                println!(
-                    "gemm32 case=g32_slab_{name}_unaligned byte_offset={offset} m={m} slab={slab} \
-                     named_shape={refused} output_untouched={untouched} result={got:?} {}",
-                    verdict(pass)
-                );
-                ok &= pass;
             }
             Ok(ok)
         }
