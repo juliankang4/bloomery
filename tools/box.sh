@@ -1167,10 +1167,9 @@ OXREV=$(sed -n '/^\[patch\."https:\/\/github.com\/NVIDIA\/cuda-rust.git"\]/,/^\[
 [ -n "$OXREV" ] || OXREV=$(sed -n 's/^cuda-device = .*rev = "\([0-9a-f]*\)".*/\1/p' "$HERE/Cargo.toml" | head -1)
 [ -n "$OXREV" ] || { echo "box.sh: no cuda-oxide rev in $HERE/Cargo.toml" >&2; exit 70; }
 OXIDE="export CUDA_OXIDE_BACKEND=\$HOME/.cargo/cuda-oxide-bloomery/$OXREV/librustc_codegen_cuda.so && "
-# PATH의 cargo-oxide도 그 핀 rev여야 한다: 더 오래된 cargo-oxide는 .cargo/cuda-oxide.toml의 [target.<triple>] 표를
-# 아무 말 없이 무시해서, 호스트 코드가 CPU 플래그 없이 빌드된다. `cargo install --list`는 git 설치의 rev를 적는다
-# (`cargo-oxide vX (https://...?rev=<rev>#<short>)`). 목록은 PATH의 cargo-oxide가 든 루트에서 읽는다(CARGO_INSTALL_ROOT가 다른 루트를 가리키는 컨테이너에서도 같은 바이너리를 대조한다). 그 rev가 핀이 아니거나 rev가 없으면 이름을 대고 멈춘다(rc 70).
-OXCLI='{ __c=$(cargo install --list --root "$(dirname "$(dirname "$(command -v cargo-oxide)")")" 2>/dev/null | sed -n "s/^cargo-oxide v[^ ]* (.*#\([0-9a-f]\{7,\}\)).*/\1/p" | head -1); case OXREV in "$__c"*) [ -n "$__c" ] ;; *) false ;; esac || { echo "box.sh: the installed cargo-oxide is from rev ${__c:-none}, not the pin OXREV: reinstall it (docs/BUILD.md, cargo install ... --rev OXREV cargo-oxide)" >&2; exit 70; }; unset __c; } && '
+# Cargo searches CARGO_HOME/bin before PATH. Read the resolved executable's install record, not CARGO_INSTALL_ROOT's:
+# an older cargo-oxide silently ignores [target.<triple>] tables and builds host code without its CPU flags.
+OXCLI='{ __p="${CARGO_HOME:-$HOME/.cargo}/bin/cargo-oxide"; { [ -f "$__p" ] && [ -x "$__p" ] || __p=$(type -P cargo-oxide); } && __p=$(readlink -f -- "$__p") || { echo "box.sh: cannot resolve cargo-oxide executable" >&2; exit 70; }; __r=$(dirname "$(dirname "$__p")"); __c=$(cargo install --list --root "$__r" 2>/dev/null) || { echo "box.sh: cannot read cargo-oxide install record at $__r" >&2; exit 70; }; __c=$(printf "%s\n" "$__c" | sed -n "s/^cargo-oxide v[^ ]* (.*#\([0-9a-f]\{7,\}\)).*/\1/p" | head -1); case OXREV in "$__c"*) [ -n "$__c" ] ;; *) false ;; esac || { echo "box.sh: the installed cargo-oxide at $__r is from rev ${__c:-none}, not the pin OXREV: reinstall it (docs/BUILD.md, cargo install ... --rev OXREV cargo-oxide)" >&2; exit 70; }; unset __p __r __c; } && '
 OXCLI=${OXCLI//OXREV/$OXREV}
 case "$*" in
   *"cargo oxide"*) OXIDE="${OXIDE}{ [ -f \"\$CUDA_OXIDE_BACKEND\" ] || { echo \"box.sh: no cuda-oxide backend for rev $OXREV at \$CUDA_OXIDE_BACKEND (tools/box.sh header)\" >&2; exit 70; }; } && { __r=\$(cat \"\${CUDA_OXIDE_BACKEND%/*}/source-rev.txt\" 2>/dev/null); [ \"\$__r\" = $OXREV ] || { echo \"box.sh: the backend at \$CUDA_OXIDE_BACKEND records source rev '\$__r', not $OXREV\" >&2; exit 70; }; unset __r; } && " ;;
