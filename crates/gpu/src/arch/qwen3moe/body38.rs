@@ -156,7 +156,8 @@ use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::{
-    ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRows, Slots,
+    CardBytes, ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRows,
+    Slots,
 };
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
@@ -165,13 +166,14 @@ use crate::weights::{Weights, tensor_scales};
 use crate::{DeviceTensor, Gpu, GpuError, launch_u32, ple};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
-use engram::Hash;
 use engram::hash::{History, Window};
 use engram::prefetch::{FillMode, HelperOptions, Prefetcher, caller_sibling};
-use engram::rows::SplitTable;
+use engram::rows::{PageAdvice, RunTable, SplitTable};
+use engram::{Hash, RowTables};
 use gguf::quant::{E4m3Rows, Nvfp4Rows, dequant_row};
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
+use model::part::{Source, StoredRows};
 use model::placement::{Device, Plan};
 use runtime::seqstate::{Kept, Price, Take};
 use runtime::swaprule::KeptRows;
@@ -493,14 +495,28 @@ struct PleBatch {
 }
 
 impl PleRead {
-    /// The reader of `file`'s table `name`, for fills of up to `max_rows`
-    /// rows; its helper on the SMT sibling of the loading thread's core when
-    /// that thread is pinned (the step thread loads), else floating.
-    fn open(file: &Arc<Split>, name: &str, max_rows: usize) -> Result<PleRead, GpuError> {
-        let table =
-            SplitTable::open(Arc::clone(file), name).map_err(|e| GpuError::plan(WHAT, e))?;
+    /// The reader of `file`'s table `name`, or of its rows where `stored`
+    /// holds them (a checkpoint folder's, [`RunTable`]), for fills of up to
+    /// `max_rows` rows; its helper on the SMT sibling of the loading thread's
+    /// core when that thread is pinned (the step thread loads), else
+    /// floating.
+    fn open(
+        file: &Arc<Split>,
+        stored: Option<&StoredRows>,
+        name: &str,
+        max_rows: usize,
+    ) -> Result<PleRead, GpuError> {
+        let table: Arc<dyn RowTables> = match stored {
+            None => Arc::new(
+                SplitTable::open(Arc::clone(file), name).map_err(|e| GpuError::plan(WHAT, e))?,
+            ),
+            Some(s) => Arc::new(
+                RunTable::open(name, s.row_bytes, &s.runs, PageAdvice::Random)
+                    .map_err(|e| GpuError::plan(WHAT, e))?,
+            ),
+        };
         let rows = Prefetcher::over(
-            Arc::new(table),
+            table,
             &[max_rows],
             HelperOptions {
                 mode: FillMode::Touch,
@@ -590,9 +606,12 @@ impl PleHost {
     /// shard's keys, for calls of up to
     /// `cap` positions, read from `tier` — the plan's
     /// ([`Plan::row_tier`]): the host, or the NVMe tier through its reader
-    /// ([`PleRead`]); any other tier is refused by name. Load-time only.
+    /// ([`PleRead`]); any other tier is refused by name. A checkpoint
+    /// folder's table (`file` its header) is read where `stored` holds its F8
+    /// rows, at its scale, from the NVMe tier alone. Load-time only.
     fn new(
         file: Arc<Split>,
+        stored: Option<&StoredRows>,
         n_vocab: usize,
         cap: usize,
         tier: Device,
@@ -603,14 +622,10 @@ impl PleHost {
             name: name.clone(),
             need,
         };
-        let path = file
-            .shard_path(0)
-            .ok_or(GpuError::state(WHAT, "the file's first shard"))?;
-        let meta = gguf::inventory_of(path).map_err(|e| GpuError::plan(WHAT, e))?;
         let vocab = u32::try_from(n_vocab)
             .map_err(|_| GpuError::shape(WHAT, format!("a vocabulary of {n_vocab}")))?;
-        let hash =
-            Hash::ple_from_gguf(&meta, "qwen4exp", vocab).map_err(|e| GpuError::plan(WHAT, e))?;
+        let hash = Hash::ple_from_keys(file.keys(), "qwen4exp", vocab)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
         let hist = hash
             .new_history()
             .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
@@ -621,19 +636,21 @@ impl PleHost {
         let width = info.dims.first().copied().unwrap_or(0) as usize;
         let rows = info.dims.get(1).copied().unwrap_or(0) as usize;
         let per_token = (geo::HIDDEN).checked_div(width).unwrap_or(0);
-        let scale = || {
-            tensor_scales(WHAT, &info, |n| {
+        let scale = || match stored {
+            Some(s) => Ok(s.scale),
+            None => tensor_scales(WHAT, &info, |n| {
                 let (s, t) = file.find(n)?;
                 Some((file.shard(s)?, t))
             })?
             .and_then(|s| s.first().copied())
-            .ok_or_else(|| refuse("a scale beside its rows"))
+            .ok_or_else(|| refuse("a scale beside its rows")),
         };
-        let decode = match info.ty {
-            GgmlType::IQ4_NL => PleRows::Iq4Nl,
-            GgmlType::F8E4M3_ROWS => PleRows::F8(Box::new(E4m3Rows::new(scale()?))),
-            GgmlType::NVFP4_ROWS => PleRows::Nvfp4(Box::new(Nvfp4Rows::new(scale()?))),
-            _ => return Err(refuse("IQ4_NL, F8 or NVFP4 rows")),
+        let decode = match (info.ty, stored) {
+            (GgmlType::IQ4_NL, None) => PleRows::Iq4Nl,
+            (GgmlType::F8E4M3_ROWS, _) => PleRows::F8(Box::new(E4m3Rows::new(scale()?))),
+            (GgmlType::NVFP4_ROWS, None) => PleRows::Nvfp4(Box::new(Nvfp4Rows::new(scale()?))),
+            (_, None) => return Err(refuse("IQ4_NL, F8 or NVFP4 rows")),
+            (_, Some(_)) => return Err(refuse("F8 rows where a checkpoint folder stores them")),
         };
         let (Some(blck), Some(size)) = (info.ty.blck_size(), info.ty.type_size()) else {
             return Err(refuse("a sized type"));
@@ -643,12 +660,20 @@ impl PleHost {
             return Err(refuse("rows of a whole part of the model width"));
         }
         let row_bytes = width / blck * size;
-        if rows == 0 || info.nbytes != (rows * row_bytes) as u64 {
+        if rows == 0
+            || info.nbytes != (rows * row_bytes) as u64
+            || stored.is_some_and(|s| s.row_bytes != row_bytes as u64)
+        {
             return Err(refuse("a whole number of rows"));
         }
         let nvme = match tier {
+            Device::Host if stored.is_some() => {
+                return Err(refuse(
+                    "on the NVMe tier, where a checkpoint folder's rows are read",
+                ));
+            }
             Device::Host => None,
-            Device::Nvme => Some(PleRead::open(&file, &name, cap * per_token)?),
+            Device::Nvme => Some(PleRead::open(&file, stored, &name, cap * per_token)?),
             Device::Card(_) | Device::Unused => {
                 return Err(refuse(
                     "on the host or the NVMe tier, where the plan reads it",
@@ -1166,6 +1191,90 @@ pub struct Body38 {
     who: Identity,
 }
 
+/// The model a Qwen3.8 load reads ([`Body38::open_placed`] and its siblings): a GGUF split, or a
+/// checkpoint folder ([`Folder38`]).
+pub enum Model38 {
+    Split(Split),
+    Folder(Folder38),
+}
+
+impl Model38 {
+    /// The header the load plans by: the split's first shard's, or the folder's
+    /// (`gguf::Split::header_only`).
+    pub fn header(&self) -> &Split {
+        match self {
+            Model38::Split(file) => file,
+            Model38::Folder(f) => &f.header,
+        }
+    }
+}
+
+impl From<Split> for Model38 {
+    fn from(file: Split) -> Model38 {
+        Model38::Split(file)
+    }
+}
+
+impl From<Folder38> for Model38 {
+    fn from(folder: Folder38) -> Model38 {
+        Model38::Folder(folder)
+    }
+}
+
+/// The card's tensors of a plan from a part source ([`crate::parts::load_placed`]).
+type CardParts =
+    Box<dyn Fn(&CudaStream, &Plan<'_>, usize, bool) -> Result<Weights, GpuError> + Send>;
+
+/// A checkpoint folder as a Qwen3.8 load reads it: its header (`gguf::Split::header_only`, the
+/// header its plan was made from), its card tensors through its part source, and the PLE
+/// table's rows where the folder stores them, which the table's NVMe reader maps
+/// ([`StoredRows`]). The load holds every tensor on its one card and the PLE table on the NVMe
+/// tier ([`crate::parts::OnCard`]): no host set, so no residency machine, and the folder's MTP
+/// layers are not read, so no draft. Each card part's file pages leave the page cache once it is
+/// staged under the host config's `card_dontneed`, as a split's card segments do.
+pub struct Folder38 {
+    header: Split,
+    parts: CardParts,
+    ple: Option<StoredRows>,
+}
+
+impl Folder38 {
+    /// The folder of header `header`, its card tensors read from `source` and its PLE rows at
+    /// `ple`.
+    pub fn new<S: Source + Send + 'static>(
+        header: Split,
+        source: S,
+        ple: Option<StoredRows>,
+    ) -> Folder38 {
+        Folder38 {
+            header,
+            parts: Box::new(move |stream, plan, card, release| {
+                crate::parts::load_placed(stream, &source, plan, card, release)
+            }),
+            ple,
+        }
+    }
+}
+
+/// A folder's load under `residency`, `drafted` or not, refused by name unless it runs no
+/// residency machine and no draft ([`Folder38`]).
+fn refuse_folder(residency: Residency, drafted: bool) -> Result<(), GpuError> {
+    if residency != Residency::Off {
+        return Err(GpuError::shape(
+            WHAT,
+            "a checkpoint folder's load runs under BLOOMERY_RESIDENCY=off: a residency machine \
+             moves experts through a host set, which the folder's load does not hold",
+        ));
+    }
+    if drafted {
+        return Err(GpuError::shape(
+            WHAT,
+            "a checkpoint folder's load runs no MTP draft: the folder's MTP layers are not read",
+        ));
+    }
+    Ok(())
+}
+
 impl Body38 {
     /// Card `card` of `plan`, which `inputs` made, resident: the plan's
     /// segments, the joins ([`Body38::derive`]) and the body over them with
@@ -1181,9 +1290,11 @@ impl Body38 {
     /// or not every layer, a
     /// layer or a width the kernels do not take, a `ubatch` outside
     /// `1..=min(UBATCH, ctx)`, and a ubatch arena past what the plan's
-    /// scratch counts.
+    /// scratch counts. `file` is a GGUF split or a checkpoint folder
+    /// ([`Model38`]); a folder's load is refused by name under a residency
+    /// machine or with an MTP draft ([`Folder38`]).
     pub fn open_placed(
-        file: Split,
+        file: impl Into<Model38>,
         plan: &Plan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
@@ -1210,7 +1321,7 @@ impl Body38 {
     /// and a sequence past the count is refused by name. Zero slots is
     /// refused by name.
     pub fn open_placed_slots(
-        file: Split,
+        file: impl Into<Model38>,
         plan: &Plan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
@@ -1250,7 +1361,7 @@ impl Body38 {
         reason = "open_placed's six, the residency and its pool's hosting, and the planned slots (rust-quality R8)"
     )]
     pub fn open_placed_residency(
-        file: Split,
+        file: impl Into<Model38>,
         plan: &Plan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
@@ -1274,7 +1385,7 @@ impl Body38 {
         reason = "open_placed's six and the draft's file and inputs (rust-quality R8)"
     )]
     pub fn open_placed_mtp(
-        file: Split,
+        file: impl Into<Model38>,
         plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
@@ -1306,7 +1417,7 @@ impl Body38 {
         reason = "open_placed_mtp's eight and the slot count (rust-quality R8)"
     )]
     pub fn open_placed_mtp_slots(
-        file: Split,
+        file: impl Into<Model38>,
         plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
@@ -1339,7 +1450,7 @@ impl Body38 {
         reason = "open_placed_mtp's eight, the residency and its pool's hosting, and the planned slots (rust-quality R8)"
     )]
     pub fn open_placed_mtp_residency(
-        file: Split,
+        file: impl Into<Model38>,
         plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
@@ -1375,7 +1486,7 @@ impl Body38 {
         reason = "open_placed's six, the residency and its pool's hosting, the draft's file, inputs and plan, and the planned slots (rust-quality R8)"
     )]
     fn open_with(
-        file: Split,
+        file: impl Into<Model38>,
         plan: &Plan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
         card: usize,
@@ -1393,6 +1504,17 @@ impl Body38 {
         if slots == 0 {
             return Err(GpuError::shape(WHAT, "a load of 0 resident sequence slots"));
         }
+        let (file, folder) = match file.into() {
+            Model38::Split(file) => (file, None),
+            Model38::Folder(f) => (f.header, Some((f.parts, f.ple))),
+        };
+        if folder.is_some() {
+            refuse_folder(residency, mtp.is_some())?;
+        }
+        let (bytes, stored) = match &folder {
+            Some((parts, ple)) => (CardBytes::Parts(parts.as_ref()), ple.as_ref()),
+            None => (CardBytes::File, None),
+        };
         refuse_tier_count(WHAT, plan.machine.tiers.len())?;
         let refused: Vec<String> = inputs
             .unimplemented()
@@ -1440,12 +1562,14 @@ impl Body38 {
             max_rows: PASS_ROWS,
             stacks: Arc::new(swap38::stacks(&inputs.model, plan)?),
         };
-        GpuModel::load_placed_with(
+        GpuModel::load_placed_from(
             file,
+            bytes,
             plan,
             card,
             host,
             spec,
+            (&[], 0),
             |stream, _, layers, w| Body38::derive(stream, &shape.kinds, layers, w),
             |gpu, file, w, set, glue| {
                 let draft = mtp
@@ -1453,7 +1577,7 @@ impl Body38 {
                     .transpose()?;
                 let mut body = Body38::load_placed(
                     gpu,
-                    file,
+                    (file, stored),
                     w,
                     plan,
                     inputs,
@@ -1514,11 +1638,11 @@ impl Body38 {
     /// sized ([`HostServed::start_residency`], the load's last step).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card handle, file, weights, plan, inputs and chain shape, the host tier's residency and levers, the residency glue, and the ubatch with the arena bytes the plan counts and the planned slots (rust-quality R8)"
+        reason = "the load's card handle, file with its stored PLE rows, weights, plan, inputs and chain shape, the host tier's residency and levers, the residency glue, and the ubatch with the arena bytes the plan counts and the planned slots (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
-        file: &Arc<Split>,
+        (file, stored): (&Arc<Split>, Option<&StoredRows>),
         w: &Weights,
         plan: &Plan<'_>,
         inputs: &model::arch::qwen35moe::place::PlanInputs,
@@ -1734,7 +1858,13 @@ impl Body38 {
             .row_tier()
             .map_err(|e| GpuError::plan(WHAT, e))?
             .ok_or(GpuError::state(WHAT, "a plan that places the PLE table"))?;
-        let ple = PleHost::new(Arc::clone(file), spec.vocab as usize, host_cols, ple_tier)?;
+        let ple = PleHost::new(
+            Arc::clone(file),
+            stored,
+            spec.vocab as usize,
+            host_cols,
+            ple_tier,
+        )?;
         let ckpt = Checkpoints::sequence(
             gpu.context(),
             checkpoint_lens_of(&stores),
@@ -5537,8 +5667,9 @@ const _: () = assert!(VERIFY_ROWS <= PASS_ROWS);
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, Device, E4m3Rows, GgmlType, GpuError, Nvfp4Rows, PleHost, Split, checkpoint_budget38,
-        checkpoint_bytes, checkpoint_lens, checkpoint_price38, dequant_row, ple_takes,
+        Arc, Device, E4m3Rows, GgmlType, GpuError, Nvfp4Rows, PleHost, Residency, Split,
+        checkpoint_budget38, checkpoint_bytes, checkpoint_lens, checkpoint_price38, dequant_row,
+        ple_takes, refuse_folder,
     };
     use engram::hash::{EosWindow, Window};
 
@@ -5599,13 +5730,11 @@ mod tests {
         assert!(e.to_string().contains("token 0:"), "{e}");
     }
 
-    /// A one-file split of the PLE keys (16 heads of 5 rows, 160 values a
-    /// row) and the table `rows` of type id `ty`, with `scale` as its
-    /// `.scale` when given, opened as the body opens its file, and the PLE host over it. The
-    /// file is removed once the host is open.
-    fn ple_host(ty: u32, rows: &[u8], scale: Option<f32>, cap: usize) -> Result<PleHost, GpuError> {
+    /// The header of a one-file split of the PLE keys (16 heads of 5 rows, 160 values a row)
+    /// and the table of type id `ty` in `nbytes`, with its `.scale` when `scaled`.
+    fn ple_layout(ty: u32, nbytes: usize, scaled: bool) -> gguf::write::Layout {
         use gguf::Value;
-        use gguf::write::{Layout, TensorDecl, Writer};
+        use gguf::write::{Layout, TensorDecl};
         let k = |s: &str| format!("qwen4exp.ple.{s}");
         let u64s = |v: Vec<u64>| Value::Array(v.into_iter().map(Value::U64).collect());
         let kvs = [
@@ -5627,26 +5756,45 @@ mod tests {
             type_id,
             nbytes: nbytes as u64,
         };
-        let scale = scale.map(f32::to_le_bytes);
-        let mut tensors = vec![(
-            decl("per_layer_token_embd.weight", vec![160, 80], ty, rows.len()),
-            rows,
+        let mut tensors = vec![decl(
+            "per_layer_token_embd.weight",
+            vec![160, 80],
+            ty,
+            nbytes,
         )];
-        if let Some(b) = &scale {
-            tensors.push((
-                decl("per_layer_token_embd.scale", vec![1], 0, 4),
-                b.as_slice(),
-            ));
+        if scaled {
+            tensors.push(decl("per_layer_token_embd.scale", vec![1], 0, 4));
         }
-        let layout = Layout::new(&kvs, tensors.iter().map(|t| t.0.clone()).collect()).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("body38-ple-{ty}-{}.gguf", std::process::id()));
+        Layout::new(&kvs, tensors).unwrap()
+    }
+
+    /// The split of [`ple_layout`] holding the table `rows` and `scale` as its `.scale` when
+    /// given, opened as the body opens its file, and the PLE host over it. The file, its own
+    /// whichever test runs beside it, is removed once the host is open.
+    fn ple_host(ty: u32, rows: &[u8], scale: Option<f32>, cap: usize) -> Result<PleHost, GpuError> {
+        use gguf::write::Writer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static FILES: AtomicUsize = AtomicUsize::new(0);
+        let layout = ple_layout(ty, rows.len(), scale.is_some());
+        let path = std::env::temp_dir().join(format!(
+            "body38-ple-{ty}-{}-{}.gguf",
+            std::process::id(),
+            FILES.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut w = Writer::new(std::fs::File::create(&path).unwrap(), layout).unwrap();
-        for (d, b) in &tensors {
-            w.tensor(&d.name, b).unwrap();
+        w.tensor("per_layer_token_embd.weight", rows).unwrap();
+        if let Some(scale) = scale {
+            w.tensor("per_layer_token_embd.scale", &scale.to_le_bytes())
+                .unwrap();
         }
         w.finish().unwrap();
-        let host = PleHost::new(Arc::new(Split::open(&path).unwrap()), 16, cap, Device::Host);
+        let host = PleHost::new(
+            Arc::new(Split::open(&path).unwrap()),
+            None,
+            16,
+            cap,
+            Device::Host,
+        );
         std::fs::remove_file(&path).unwrap();
         host
     }
@@ -5715,5 +5863,78 @@ mod tests {
                 "{e}"
             );
         }
+    }
+
+    /// A checkpoint folder's load runs no residency machine and no draft: either is refused by
+    /// name, and a load under neither passes.
+    #[test]
+    fn a_folder_load_refuses_residency_and_a_draft() {
+        assert!(refuse_folder(Residency::Off, false).is_ok());
+        let mid = Residency::Mid {
+            pinned: 1,
+            spares: 1,
+        };
+        for (residency, drafted, need) in [
+            (mid, false, "BLOOMERY_RESIDENCY=off"),
+            (Residency::Off, true, "no MTP draft"),
+        ] {
+            let e = refuse_folder(residency, drafted).unwrap_err().to_string();
+            assert!(e.contains(need), "{e}");
+        }
+    }
+
+    /// A checkpoint folder's F8 table, its rows in runs of two files where the folder stores
+    /// them and its header alone in the split, decodes from the NVMe tier's reader the values
+    /// the split holding the same rows decodes on the host; on the host, and as rows of another
+    /// type, the folder's table is refused by name.
+    #[test]
+    fn a_folder_s_stored_rows_decode_as_the_split_s() {
+        let f8: Vec<u8> = (0..80 * 160u32)
+            .map(|i| (i * 53 % 256) as u8)
+            .map(|b| if b & 0x7F == 0x7F { 0x38 } else { b })
+            .collect();
+        let tokens = [7u32, 3, 9, 2, 1, 5];
+        let mut want = ple_host(GgmlType::F8E4M3_ROWS.as_u32(), &f8, Some(0.375), 8).unwrap();
+        want.fill(0, &tokens).unwrap();
+        let dir = std::env::temp_dir().join(format!("body38-ple-folder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.safetensors"), dir.join("b.safetensors"));
+        let cut = 30 * 160;
+        std::fs::write(&a, [&[9u8; 7][..], &f8[..cut]].concat()).unwrap();
+        std::fs::write(&b, &f8[cut..]).unwrap();
+        let stored = model::part::StoredRows {
+            row_bytes: 160,
+            runs: vec![(a, 7..7 + cut as u64), (b, 0..(f8.len() - cut) as u64)],
+            scale: 0.375,
+        };
+        let open = |ty: GgmlType, tier| {
+            let row = if ty == GgmlType::F8E4M3_ROWS { 160 } else { 90 };
+            let layout = ple_layout(ty.as_u32(), 80 * row, true);
+            let header = Split::header_only(dir.clone(), &layout).unwrap();
+            PleHost::new(Arc::new(header), Some(&stored), 16, 8, tier)
+        };
+        let mut got = open(GgmlType::F8E4M3_ROWS, Device::Nvme).unwrap();
+        got.fill(0, &tokens).unwrap();
+        assert_eq!(got.ids[..got.named], want.ids[..want.named]);
+        assert!(
+            got.e.len() == want.e.len()
+                && got
+                    .e
+                    .iter()
+                    .zip(&want.e)
+                    .all(|(g, w)| g.to_bits() == w.to_bits())
+        );
+        for (ty, tier, need) in [
+            (GgmlType::F8E4M3_ROWS, Device::Host, "on the NVMe tier"),
+            (
+                GgmlType::NVFP4_ROWS,
+                Device::Nvme,
+                "F8 rows where a checkpoint",
+            ),
+        ] {
+            let e = open(ty, tier).err().expect("refused");
+            assert!(e.to_string().contains(need), "{ty}: {e}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

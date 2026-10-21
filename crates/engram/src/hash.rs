@@ -6,7 +6,7 @@
 //! nothing in this module has a default, because a default would be a number
 //! nobody measured. Two key sets exist, each read by its own constructor:
 //! [`Hash::from_gguf`] (V4.1's engram, `deepseek41.engram.*`) and
-//! [`Hash::ple_from_gguf`] (a PLE site, `<arch>.ple.*`).
+//! [`Hash::ple_from_keys`] (a PLE site, `<arch>.ple.*`).
 //!
 //! The formula, per site `e` and per token ([`ngram::rows`]):
 //!
@@ -69,7 +69,7 @@ pub enum Window {
 
 /// The hash constants of one model, one set per site.
 ///
-/// Built by [`Hash::from_gguf`] or [`Hash::ple_from_gguf`] from a shard
+/// Built by [`Hash::from_gguf`] or [`Hash::ple_from_keys`] from a shard
 /// header; nothing here is derived and nothing has a default.
 pub struct Hash {
     /// Block index of each site, in the order the metadata lists them. This is
@@ -97,7 +97,7 @@ impl Hash {
     /// key rather than a set of constants that is silently short.
     pub fn from_gguf(meta: &Inventory) -> Result<Hash, EngramError> {
         let k = |suffix: &str| format!("{ENGRAM_PREFIX}{suffix}");
-        let layer_ids: Vec<u32> = ints(meta, &k("layer_ids"))?
+        let layer_ids: Vec<u32> = ints(&meta.meta, &k("layer_ids"))?
             .into_iter()
             .map(|v| u32::try_from(v).map_err(|_| value_err(k("layer_ids"), "a block index")))
             .collect::<Result<_, _>>()?;
@@ -106,9 +106,9 @@ impl Hash {
             return Err(value_err(k("layer_ids"), "at least one engram site"));
         }
 
-        let n_heads = usize::try_from(scalar(meta, &k("head_count"))?)
+        let n_heads = usize::try_from(scalar(&meta.meta, &k("head_count"))?)
             .map_err(|_| value_err(k("head_count"), "a head count"))?;
-        let n_gram = usize::try_from(scalar(meta, &k("max_ngram_size"))?)
+        let n_gram = usize::try_from(scalar(&meta.meta, &k("max_ngram_size"))?)
             .map_err(|_| value_err(k("max_ngram_size"), "an n-gram size"))?;
         // The port's own floor: one head and a 2-gram, because `n_cols` is
         // `(n_gram - 1) * n_heads` and a site with no buckets reads no rows.
@@ -120,15 +120,15 @@ impl Hash {
         }
         let n_cols = (n_gram - 1) * n_heads;
 
-        let key_length = u32::try_from(scalar(meta, &k("key_length"))?)
+        let key_length = u32::try_from(scalar(&meta.meta, &k("key_length"))?)
             .map_err(|_| value_err(k("key_length"), "a key length"))?;
-        let pad = scalar(meta, &k("pad_id"))?;
+        let pad = scalar(&meta.meta, &k("pad_id"))?;
 
-        let mult = ints(meta, &k("multipliers"))?;
+        let mult = ints(&meta.meta, &k("multipliers"))?;
         need_len(k("multipliers"), mult.len(), sites * n_gram)?;
-        let prime = ints(meta, &k("primes"))?;
+        let prime = ints(&meta.meta, &k("primes"))?;
         need_len(k("primes"), prime.len(), sites * n_cols)?;
-        let offset = ints(meta, &k("offsets"))?;
+        let offset = ints(&meta.meta, &k("offsets"))?;
         need_len(k("offsets"), offset.len(), sites * n_cols)?;
         check_buckets(
             &prime,
@@ -138,7 +138,7 @@ impl Hash {
             "a bucket top inside u32",
         )?;
 
-        let token_map: Vec<u32> = ints(meta, &k("token_map"))?
+        let token_map: Vec<u32> = ints(&meta.meta, &k("token_map"))?
             .into_iter()
             .map(|v| {
                 u32::try_from(v).map_err(|_| value_err(k("token_map"), "a compressed vocab id"))
@@ -161,8 +161,9 @@ impl Hash {
         })
     }
 
-    /// Read a PLE site's constants out of the header of the shard that
-    /// carries `<arch>.ple.*` (the first shard of a split set).
+    /// Read a PLE site's constants out of the metadata pairs of the header
+    /// that carries `<arch>.ple.*` (`gguf::Split::keys`: the first shard of a
+    /// split set, or a checkpoint folder's header).
     ///
     /// The keys, as the port's loader reads them (qwen4exp.cpp:66-121):
     /// `ple.layers` (exactly one site), `ple.ngram_size` (2 to 8),
@@ -178,7 +179,11 @@ impl Hash {
     /// states. The EOS is the file's `ple.eos_token_id`, never the
     /// tokenizer's end of text: the two differ (qwen4exp: 248,044 against
     /// 248,046).
-    pub fn ple_from_gguf(meta: &Inventory, arch: &str, n_vocab: u32) -> Result<Hash, EngramError> {
+    pub fn ple_from_keys(
+        meta: &[(String, Value)],
+        arch: &str,
+        n_vocab: u32,
+    ) -> Result<Hash, EngramError> {
         let k = |suffix: &str| format!("{arch}.ple.{suffix}");
         let layer_ids: Vec<u32> = ints(meta, &k("layers"))?
             .into_iter()
@@ -223,7 +228,7 @@ impl Hash {
                 .ok_or_else(|| value_err(k(suffix), "a token of the vocabulary"))
         };
         let eos = token("eos_token_id")?;
-        let image = match meta.value(&k("image_token_id")) {
+        let image = match value(meta, &k("image_token_id")) {
             Some(_) => Some(token("image_token_id")?),
             None => None,
         };
@@ -391,7 +396,7 @@ impl Hash {
     /// # Panics
     ///
     /// On a raw-id hash ([`Window::Eos`]), which has no map; its vocabulary
-    /// is the one [`Hash::ple_from_gguf`] was given.
+    /// is the one [`Hash::ple_from_keys`] was given.
     pub fn check_vocab(&self, n_vocab: usize) -> Result<(), EngramError> {
         let map = self.mapped("check_vocab").0;
         if map.len() == n_vocab {
@@ -646,12 +651,15 @@ fn unsigned(v: &Value) -> Option<u64> {
     }
 }
 
+/// `key`'s value among `meta`'s pairs, the first if it repeats (`Inventory::value`'s rule).
+fn value<'m>(meta: &'m [(String, Value)], key: &str) -> Option<&'m Value> {
+    meta.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
 /// One mandatory unsigned scalar.
-fn scalar(meta: &Inventory, key: &str) -> Result<u64, EngramError> {
+fn scalar(meta: &[(String, Value)], key: &str) -> Result<u64, EngramError> {
     let key = key.to_string();
-    let v = meta
-        .value(&key)
-        .ok_or_else(|| EngramError::MissingKey { key: key.clone() })?;
+    let v = value(meta, &key).ok_or_else(|| EngramError::MissingKey { key: key.clone() })?;
     unsigned(v).ok_or(EngramError::KeyType {
         key,
         want: "a non-negative integer",
@@ -659,11 +667,9 @@ fn scalar(meta: &Inventory, key: &str) -> Result<u64, EngramError> {
 }
 
 /// One mandatory array of unsigned integers, widened to `u64`.
-fn ints(meta: &Inventory, key: &str) -> Result<Vec<u64>, EngramError> {
+fn ints(meta: &[(String, Value)], key: &str) -> Result<Vec<u64>, EngramError> {
     let key = key.to_string();
-    let v = meta
-        .value(&key)
-        .ok_or_else(|| EngramError::MissingKey { key: key.clone() })?;
+    let v = value(meta, &key).ok_or_else(|| EngramError::MissingKey { key: key.clone() })?;
     let Value::Array(items) = v else {
         return Err(EngramError::KeyType {
             key,
@@ -1080,7 +1086,7 @@ mod tests {
     /// tokens at position 9.
     #[test]
     fn ple_rows_are_iks() {
-        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let hash = Hash::ple_from_keys(&ple_fixture().meta, "qwen4exp", 248_320).unwrap();
         assert_eq!((hash.sites(), hash.n_gram(), hash.n_cols()), (1, 3, 16));
         let want: Vec<u32> = PLE_IK_ROWS.iter().flatten().copied().collect();
 
@@ -1108,7 +1114,7 @@ mod tests {
     /// another length, and a V4.1 hash asked for raw-id rows.
     #[test]
     fn ple_refusals_leave_the_state() {
-        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let hash = Hash::ple_from_keys(&ple_fixture().meta, "qwen4exp", 248_320).unwrap();
         let mut hist = History::new(3, 248_044);
         hash.ple_rows_into(&mut hist, 0, &[7, 8], &mut [0; 32])
             .unwrap();
@@ -1208,7 +1214,7 @@ mod tests {
     /// read as EOS differ).
     #[test]
     fn ple_media_rows_are_llamacpps() {
-        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let hash = Hash::ple_from_keys(&ple_fixture().meta, "qwen4exp", 248_320).unwrap();
         let want = llamacpp_rows(&hash, &MEDIA_IDS, 248_044);
         let mut as_eos = MEDIA_IDS;
         as_eos[3..8].fill(248_044);
@@ -1240,7 +1246,7 @@ mod tests {
     /// same history, and the same refusal of the image id.
     #[test]
     fn ple_media_without_spans_is_text_only() {
-        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let hash = Hash::ple_from_keys(&ple_fixture().meta, "qwen4exp", 248_320).unwrap();
         let mut a = hash.new_history().unwrap();
         let mut b = hash.new_history().unwrap();
         let mut rows_a = vec![0u32; 9 * 16];
@@ -1262,7 +1268,7 @@ mod tests {
     /// end, between two spans, and past the last.
     #[test]
     fn ple_media_refuses_an_image_id_outside_its_span() {
-        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let hash = Hash::ple_from_keys(&ple_fixture().meta, "qwen4exp", 248_320).unwrap();
         let mut hist = hash.new_history().unwrap();
         let before = hist.clone();
         let cases: [([u32; 6], Vec<Range<usize>>); 4] = [
@@ -1292,7 +1298,7 @@ mod tests {
     /// hash with no image id.
     #[test]
     fn ple_media_refuses_malformed_spans() {
-        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let hash = Hash::ple_from_keys(&ple_fixture().meta, "qwen4exp", 248_320).unwrap();
         let mut hist = hash.new_history().unwrap();
         let before = hist.clone();
         let tokens = [IMG, IMG, IMG, 5];
@@ -1326,7 +1332,7 @@ mod tests {
 
         let mut inv = ple_fixture();
         inv.meta.retain(|(k, _)| k != "qwen4exp.ple.image_token_id");
-        let no_image = Hash::ple_from_gguf(&inv, "qwen4exp", 248_320).unwrap();
+        let no_image = Hash::ple_from_keys(&inv.meta, "qwen4exp", 248_320).unwrap();
         assert_eq!(
             no_image.ple_rows_media(&mut hist, 0, &tokens, &one(0..3), &mut [0; 4 * 16]),
             Err(NgramError::NoImageToken)
@@ -1340,7 +1346,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Hash::pad_id: this hash reads raw ids")]
     fn ple_hash_has_no_pad() {
-        let hash = Hash::ple_from_gguf(&ple_fixture(), "qwen4exp", 248_320).unwrap();
+        let hash = Hash::ple_from_keys(&ple_fixture().meta, "qwen4exp", 248_320).unwrap();
         let _ = hash.pad_id();
     }
 
@@ -1355,7 +1361,7 @@ mod tests {
             if let Some(v) = v {
                 inv.meta.push((key.to_string(), v));
             }
-            Hash::ple_from_gguf(&inv, "qwen4exp", 248_320).err()
+            Hash::ple_from_keys(&inv.meta, "qwen4exp", 248_320).err()
         };
         let key = |e: Option<EngramError>| match e {
             Some(EngramError::MissingKey { key } | EngramError::KeyValue { key, .. }) => key,

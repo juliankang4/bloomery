@@ -695,7 +695,16 @@ impl<B: ChainBody> GpuModel<B> {
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
         body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
-        let (p, residency) = placed_pre(&file, plan, card, host, (&[], 0), &[], derive)?;
+        let (p, residency) = placed_pre(
+            &file,
+            CardBytes::File,
+            plan,
+            card,
+            host,
+            (&[], 0),
+            &[],
+            derive,
+        )?;
         let t_body = Instant::now();
         let body = body(&p.gpu, file, &p.weights, residency)?;
         placed_done(p, body, t_body.elapsed())
@@ -757,6 +766,43 @@ impl<B: ChainBody> GpuModel<B> {
             ResidencyGlue,
         ) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
+        GpuModel::load_placed_from(
+            file,
+            CardBytes::File,
+            plan,
+            card,
+            host,
+            residency,
+            hosted,
+            derive,
+            body,
+        )
+    }
+
+    /// [`GpuModel::load_placed_hosting`] with the card's tensors read from `bytes`: the file's
+    /// own, or a part source's when `file` is a checkpoint folder's header
+    /// ([`CardBytes::Parts`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "load_placed_hosting's arguments and where the card's bytes come from (rust-quality R8)"
+    )]
+    pub fn load_placed_from(
+        file: Split,
+        bytes: CardBytes<'_>,
+        plan: &Plan<'_>,
+        card: usize,
+        host: HostCfg,
+        residency: ResidencySpec,
+        hosted: (&[(usize, ExpertList)], u64),
+        derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
+        body: impl FnOnce(
+            &Gpu,
+            &Arc<Split>,
+            &Weights,
+            HostResidency,
+            ResidencyGlue,
+        ) -> Result<B, GpuError>,
+    ) -> Result<GpuModel<B>, GpuError> {
         const WHAT: &str = "GpuModel::load_placed_with";
         let churn = match residency.lever {
             Residency::Off => None,
@@ -787,7 +833,7 @@ impl<B: ChainBody> GpuModel<B> {
             (&joined[..], pool.1 + hosted.1)
         };
         let file = Arc::new(file);
-        let (p, set) = placed_pre(&file, plan, card, host, extra, known, derive)?;
+        let (p, set) = placed_pre(&file, bytes, plan, card, host, extra, known, derive)?;
         let t_body = Instant::now();
         let glue = match residency.lever {
             Residency::Off => ResidencyGlue::off(),
@@ -2054,9 +2100,20 @@ where
     Ok(hybrid)
 }
 
+/// Where a placed load's card tensors come from ([`GpuModel::load_placed_from`]).
+pub enum CardBytes<'a> {
+    /// The file's own mapped tensors ([`Weights::load_placed`]).
+    File,
+    /// A part source's, for a file that is a checkpoint folder's header
+    /// (`gguf::Split::header_only`): card `card` of `plan` loaded on the stream, each part's file
+    /// pages released when the host config's `card_dontneed` asks (`crate::parts::load_placed`).
+    Parts(&'a dyn Fn(&CudaStream, &Plan<'_>, usize, bool) -> Result<Weights, GpuError>),
+}
+
 /// The steps of a placed load before its body: the plan's card and context
 /// budget, the card, the host's memory against the plan's host need, the
-/// card's weights with `derive`'s filings, and — after the uploads, so the
+/// card's weights (`bytes`': the file's, or a part source's) with `derive`'s
+/// filings, and — after the uploads, so the
 /// card's file bytes have left the page cache first — the plan's host set
 /// read in and locked as `host` asks, with `extra`'s runs (of `extra`'s
 /// bytes) beside it and `known`'s runs known, neither read in nor locked nor
@@ -2066,8 +2123,13 @@ where
 /// (`BLOOMERY_NEED_HOOK`, first, before the load's own open of the card), a plan's card
 /// that is not one visible device ([`Gpu::open_card`]), and a
 /// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the load's file and where its card bytes come from, its plan and card, the host's levers, the extra and known host runs, and the derive (rust-quality R8)"
+)]
 fn placed_pre(
     file: &Split,
+    bytes: CardBytes<'_>,
     plan: &Plan<'_>,
     card: usize,
     host: HostCfg,
@@ -2108,7 +2170,12 @@ fn placed_pre(
         .grant(available, least)
         .map_err(|e| GpuError::plan(what, format!("{e}{}", plan.host.room_clause())))?;
     let t = Instant::now();
-    let mut weights = Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?;
+    let mut weights = match bytes {
+        CardBytes::File => {
+            Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?
+        }
+        CardBytes::Parts(load) => load(gpu.stream(), plan, card, host.card_dontneed)?,
+    };
     let upload = t.elapsed();
     let t = Instant::now();
     derive(gpu.stream(), file, layers.clone(), &mut weights)?;
