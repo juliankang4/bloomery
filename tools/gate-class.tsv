@@ -92,6 +92,7 @@ gate-gpu-glm5next-nvtier	family	glm5next	tier	tier_legs+residency
 gate-gpu-glm5next-residency	family	glm5next	residency	residency
 gate-gpu-glm5next-serve	family	glm5next	serve	seats_serve_engine+serve_http_api
 gate-gpu-glm5next-stagger	family	glm5next	e2e	prompt_walks
+gate-gpu-glm5next-tp	family	glm5next	e2e	placement_nodes+attn_latent_mla+moe_route
 gate-gpu-glm5next-twocard	family	glm5next	tier	tier_legs+placement_sizing
 gate-gpu-glm5v-tower	family	glm5next	media	serve_media
 gate-gpu-hc-gated	common		kernel	attn_ds41_csa_hca
