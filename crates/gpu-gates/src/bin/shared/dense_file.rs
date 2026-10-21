@@ -1,7 +1,10 @@
 //! Synthetic weight files and activation columns for dense-format gates.
 
 use bloomery_gpu::Gpu;
-use bloomery_gpu_gates::{GateError, GateRng, par_map};
+use bloomery_gpu::gemm::{Gemm32Kernels, GemmAct32, GemmKernels, GemmRoute};
+use bloomery_gpu::site::{self, WideIn, WideKernels};
+use bloomery_gpu::weights::Weights;
+use bloomery_gpu_gates::{GateError, GateRng, bits_equal, par_map, verdict};
 use cuda_core::DeviceBuffer;
 use gguf::quant::{GgmlType, dequant_row};
 
@@ -101,6 +104,107 @@ pub(crate) fn columns(
     let x_dev = DeviceBuffer::from_host(gpu.stream(), &x)?;
     let y_dev = DeviceBuffer::from_host(gpu.stream(), &vec![f32::NAN; m * rows])?;
     Ok((x, x_dev, y_dev))
+}
+
+/// The dense calls by name over the resident weight `name`, `rows` rows of
+/// `k` values, of type `ty`: each clause holds one launch's outputs bit for
+/// bit to another's, so it holds at any type the site launches by name.
+/// - `by_name.cols`: `site::resident_gemv_cols` at three columns, each
+///   column the one-column `site::resident_gemv` of it;
+/// - `by_name.rows`: `site::resident_gemv_rows` over rows `at .. at + n`
+///   alone, the whole weight's outputs at those rows;
+/// - `by_name.wide`: `site::resident_gemm_rows` over the same rows on the
+///   one-expert table `route` filled for `wide` slots, `site::resident_gemm`'s
+///   at those rows;
+/// - `by_name.past`: rows past the weight refused by name.
+pub(crate) fn by_name(
+    gpu: &Gpu,
+    (g32, gemm, route, wide): (&Gemm32Kernels, &GemmKernels, &GemmRoute, usize),
+    (ty, w, name): (&str, &Weights, &str),
+    (rows, k): (usize, usize),
+    (at, n): (usize, usize),
+    seed: u64,
+) -> Result<bool, GateError> {
+    const M: usize = 3;
+    let stream = gpu.stream();
+    let bits = |y: &[f32], want: &[f32]| y.iter().all(|v| v.is_finite()) && bits_equal(y, want);
+    let part = |y: &[f32], cols: usize| -> Vec<f32> {
+        (0..cols)
+            .flat_map(|c| y[c * rows + at..][..n].to_vec())
+            .collect()
+    };
+    let mut ok = true;
+    let mut line = |clause: &str, shown: &str, pass: bool| {
+        println!(
+            "{ty} clause=by_name.{clause} tensor={name} {shown} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+    };
+
+    let (x, x_dev, mut whole) = columns(gpu, (M, k, rows), seed, 1.0)?;
+    site::resident_gemv_cols(gpu, Some(g32), (w, name), &x_dev, M, &mut whole)?;
+    let mut one = Vec::with_capacity(M * rows);
+    for c in 0..M {
+        let xc = DeviceBuffer::from_host(stream, &x[c * k..][..k])?;
+        let mut yc = DeviceBuffer::from_host(stream, &vec![f32::NAN; rows])?;
+        site::resident_gemv(gpu, w, name, &xc, &mut yc)?;
+        stream.synchronize()?;
+        one.extend(yc.to_host_vec(stream)?);
+    }
+    let whole = whole.to_host_vec(stream)?;
+    line("cols", &format!("m={M}"), bits(&whole, &one));
+
+    let mut y = DeviceBuffer::from_host(stream, &vec![f32::NAN; M * n])?;
+    site::resident_gemv_rows(gpu, Some(g32), (w, name, (at, n)), &x_dev, M, &mut y)?;
+    stream.synchronize()?;
+    let shown = format!("rows={at}+{n} of {rows} m={M}");
+    line(
+        "rows",
+        &shown,
+        bits(&y.to_host_vec(stream)?, &part(&whole, M)),
+    );
+
+    let kernels = WideKernels {
+        gemm,
+        g32: Some(g32),
+    };
+    let (_, xw, mut gw) = columns(gpu, (wide, k, rows), seed ^ 0x77, 1.0)?;
+    let mut act = GemmAct32::new(stream, wide, k)?;
+    let sink = gpu.unlabelled_sink();
+    site::resident_quantize(gpu, &kernels, (w, &[name]), (&xw, wide), &mut act, sink)?;
+    let x_in = WideIn {
+        q128: None,
+        q32: Some(&act),
+        f32: Some(&xw),
+    };
+    site::resident_gemm(gpu, &kernels, (w, name), &x_in, route, wide, &mut gw)?;
+    let mut pw = DeviceBuffer::from_host(stream, &vec![f32::NAN; wide * n])?;
+    let src = (w, name, (at, n));
+    site::resident_gemm_rows(gpu, &kernels, src, &x_in, route, wide, &mut pw)?;
+    stream.synchronize()?;
+    let (gw, pw) = (gw.to_host_vec(stream)?, pw.to_host_vec(stream)?);
+    line(
+        "wide",
+        &format!("rows={at}+{n} m={wide}"),
+        bits(&pw, &part(&gw, wide)),
+    );
+
+    let past = (w, name, (at, rows - at + 1));
+    let got = site::resident_gemv_rows(gpu, Some(g32), past, &x_dev, 1, &mut y);
+    let refused = got
+        .as_ref()
+        .is_err_and(|e| e.to_string().contains(name) && e.to_string().contains("rows"));
+    let shown = match got {
+        Ok(()) => "accepted".to_owned(),
+        Err(e) => format!("{:?}", e.to_string()),
+    };
+    line(
+        "past",
+        &format!("rows={at}+{}: {shown}", rows - at + 1),
+        refused,
+    );
+    Ok(ok)
 }
 
 #[cfg(test)]

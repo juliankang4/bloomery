@@ -58,7 +58,11 @@
 //!
 //! Parts of each type joined into one weight at load (`Weights::join_rows`,
 //! as a model joins its projections) run through `site::resident_gemv`, bit
-//! for bit the host walk over the parts' rows (`join`).
+//! for bit the host walk over the parts' rows (`join`). Over each joint, and
+//! over the Q8_0 and F32 tensors, the dense calls by name hold their outputs
+//! to one another bit for bit (`by_name`, `shared/dense_file.rs`): the
+//! m-column gemv, a part's rows alone through the gemv and the wide GEMM,
+//! and rows past the weight refused by name.
 //!
 //! The expert select (`sel`, through `site::resident_sel_f32`, the MTP
 //! draft's routed launch): a stack of 4 experts of 64 rows of 256 values in
@@ -103,7 +107,7 @@ fn main() -> std::process::ExitCode {
 }
 
 mod gate {
-    use crate::dense_file::{check, columns, decl, host_rows, q8_0_bytes};
+    use crate::dense_file::{by_name, check, columns, decl, host_rows, q8_0_bytes};
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::q8f32::{E4m3GemvArgs, E4m3Scales, E4m3Weight, SelArgs, e4m3_planes};
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
@@ -419,8 +423,29 @@ mod gate {
             ok &= pass;
         }
         for (ty, tag, parts) in &joined {
-            ok &= join_case(gpu, &split, (*ty, tag), parts)?;
+            ok &= join_case(gpu, (wide, WIDE), &split, (*ty, tag), parts)?;
         }
+        let shared =
+            Weights::load_where(gpu.stream(), &split, |n| n == Q8_0_NAME || n == F32_NAME)?;
+        let wide_at = (&g32, &gemm, &route, WIDE);
+        let q8_shape = (q_rows, k);
+        ok &= by_name(
+            gpu,
+            wide_at,
+            ("q8_0", &shared, Q8_0_NAME),
+            q8_shape,
+            (8192, 4096),
+            0x5eed_0860,
+        )?;
+        let f32_shape = (F32_ROWS, k);
+        ok &= by_name(
+            gpu,
+            wide_at,
+            ("f32", &shared, F32_NAME),
+            f32_shape,
+            (64, 128),
+            0x5eed_0861,
+        )?;
         ok &= sel_case(gpu, &split, (b128, SEL_FP8), &sel_fp8)?;
         ok &= sel_case(gpu, &split, (GgmlType::Q8_0, SEL_Q8_0), &sel_q8)?;
         ok &= sel_refusal(gpu, &split)?;
@@ -646,9 +671,11 @@ mod gate {
     /// Parts of the E4M3 type `ty` joined into one weight, as a model joins
     /// its projections at load (`Weights::join_rows`), run through
     /// `site::resident_gemv`: every output bit for bit the host walk over the
-    /// parts' rows one after another, and within the band.
+    /// parts' rows one after another, and within the band; then the calls by
+    /// name over it, the last part's rows alone ([`by_name`]).
     fn join_case(
         gpu: &Gpu,
+        ((g32, gemm, route), wide): ((&Gemm32Kernels, &GemmKernels, &GemmRoute), usize),
         split: &Split,
         (ty, tag): (GgmlType, &str),
         parts: &[(String, Vec<u8>)],
@@ -668,14 +695,19 @@ mod gate {
         let y = y_dev.to_host_vec(stream)?;
         let walk = |r: usize, c: usize| byte_rule(&wf[r], &x[c * k..][..k]);
         let shown = format!("parts={} rows={rows} k={k} m=1", parts.len());
-        Ok(check(
+        let joined = check(
             (tag, "join"),
             &shown,
             (&y, &x, k),
             &wf,
             &|at| (at % wf.len(), at / wf.len()),
             &walk,
-        ))
+        );
+        let last = parts.last().map_or(0, |p| p.1.len()) / (k / 128 * 132);
+        let wide_at = (g32, gemm, route, wide);
+        let part = (rows - last, last);
+        let named = by_name(gpu, wide_at, (tag, &w, JOINT), (rows, k), part, 0x5eed_0833)?;
+        Ok(joined && named)
     }
 
     /// One shape of the E4M3 type `ty` at each of its column counts through `site::gemv`

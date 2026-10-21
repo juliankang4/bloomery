@@ -281,7 +281,7 @@ impl Ctx38<'_> {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        site::resident_gemv_cols(self.gpu, &self.k.g32, (self.w, name), x, m, y)
+        site::resident_gemv_cols(self.gpu, Some(&self.k.g32), (self.w, name), x, m, y)
     }
 
     /// `y = W · x` for the F32 or BF16 weight `name` over `m` columns,

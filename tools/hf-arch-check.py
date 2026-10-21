@@ -198,7 +198,7 @@ BODY35_HEAD_TENSOR = "output.weight"
 # The other seats have no one owner list: each decides in several places, (file, anchor) pairs with the line found by
 # the anchor. A type there is printed and never judged.
 TYPE_PLACES = {
-    "ds41": (("crates/gpu-deepseek41/src/dense.rs", "GgmlType::Q3_K => Ok(Dense::Q3K(t))"),
+    "ds41": (("crates/gpu-deepseek41/src/dense.rs", "const TYS: [SiteTy;"),
              ("crates/gpu-deepseek41/src/chain/glue.rs", "let embd_ok = matches!(embd.ty()"),
              ("crates/gguf/src/card.rs", "pub fn of(ty: GgmlType) -> Option<CardFormat>"),
              ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),

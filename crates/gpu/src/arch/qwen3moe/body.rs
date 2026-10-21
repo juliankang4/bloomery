@@ -315,10 +315,10 @@ fn stack_entries([gate, up, down]: [SiteTy; 3], l: usize) -> Result<(), GpuError
 
 /// Weight `name` as a dense site of `rows` rows of `k` values and the launch
 /// family the qwen3moe body's dense owner ([`qwen3moe_dense`]) picks for the
-/// type it is resident as (a K-quant word plane, Q8_0, MXFP8 or FP8_B128
-/// planes, or an F32 plane). A type the table names no dense site for, a site whose activation
-/// the arena does not carry, or a weight of another shape or form, is refused
-/// by name.
+/// site type of its resident form ([`SiteTy::of_resident`]). A form no site
+/// reads, a type the table names no dense site for, a site whose activation
+/// the arena does not carry, or a weight of another shape, is refused by
+/// name.
 pub(super) fn dense_site(
     w: &Weights,
     name: &str,
@@ -326,24 +326,13 @@ pub(super) fn dense_site(
     k: usize,
 ) -> Result<SiteTy, GpuError> {
     let what = "qwen3moe::Body::load";
-    let ty = match w.get(name) {
-        Some(DevWeight::KQuant { ty, .. }) => *ty,
-        Some(DevWeight::Q5_0 { .. }) => GgmlType::Q5_0,
-        Some(DevWeight::Q8_0 { .. }) => GgmlType::Q8_0,
-        Some(DevWeight::Mxfp8 { .. }) => GgmlType::MXFP8,
-        Some(DevWeight::Fp8B128 { .. }) => GgmlType::FP8_B128,
-        Some(DevWeight::Bf16 { .. }) => GgmlType::BF16,
-        Some(DevWeight::F32 { .. }) => GgmlType::F32,
-        Some(_) => {
-            return Err(GpuError::tensor(
-                what,
-                name,
-                "a K-quant word plane, Q8_0, MXFP8 or FP8_B128 planes, BF16 words or an F32 plane",
-            ));
-        }
-        None => return Err(GpuError::tensor(what, name, "resident")),
+    let Some(ty) = SiteTy::of_resident(w.resident(what, name)?) else {
+        return Err(GpuError::shape(
+            what,
+            format!("{name} is resident in a form no site launch reads"),
+        ));
     };
-    let family = admit_dense(what, name, ty)?;
+    let family = admit_dense(what, name, ty.ggml())?;
     site::site(w, what, name, (rows, k), family)?;
     Ok(family)
 }

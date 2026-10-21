@@ -41,9 +41,10 @@
 //!   only), MXFP8 and FP8_B128 the same tile over their planes
 //!   (`mxfp8_tile_gemm`, `fp8_b128_tile_gemm`, the values decoded as they
 //!   are staged), BF16 the same tile over widened words (`bf16_tile_gemm`).
-//!   A site's weight is the resident tensor of its name, or, for a K-quant,
-//!   the words a caller holds ([`SiteWeight`]). NVFP4 has no
-//!   wide GEMM and is refused here by name.
+//!   A site's weight is the resident tensor of its name, rows of it (a part
+//!   of a weight joined at load), or, for a K-quant, the words a caller
+//!   holds ([`SiteWeight`]). NVFP4 has no wide GEMM and is refused here by
+//!   name.
 //! - [`gated`], a wide gate·up·down block over one table: the gate and up
 //!   [`gemm`]s, the gate·up rule's SwiGLU written into the form the down's
 //!   type reads (the down's activation), and the down [`gemm`] over those
@@ -51,6 +52,15 @@
 //!
 //! Which activation form a site reads is [`SiteTy::reads`]: a body
 //! quantizes a unit's rows into exactly the forms its sites read.
+//!
+//! A body that names a weight and leaves its type to the file calls a site
+//! by name: [`resident_gemv`] at one column, [`resident_gemv_cols`] at up to
+//! eight, [`resident_gemv_rows`] over rows of a joined weight, and on the
+//! wide arm [`resident_gemm`] and [`resident_gemm_rows`]. Each launches
+//! what the typed call launches for the site type of the weight's resident
+//! form, which the kernel table's dense entry decides
+//! ([`SiteTy::of_resident`]); [`resident_site`] checks that type and shape
+//! at load.
 
 use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
@@ -62,10 +72,10 @@ use crate::q5::Q8Blocks32;
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q8f32::{E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, Q8_0GemvMcolArgs, SelArgs};
 use crate::quant_sel::QuantSelKernels;
-use crate::tensor::Q8Act;
+use crate::tensor::{Q8Act, TensorWindow};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
-use cuda_core::DeviceBuffer;
+use cuda_core::{DeviceBuffer, DeviceCopy};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::placement::kernels::{self, SiteEntry};
@@ -138,6 +148,31 @@ impl SiteTy {
             }
             None => None,
         }
+    }
+
+    /// The family of a resident weight: the kernel table's dense entry for
+    /// the file type its form holds ([`SiteTy::of_ggml`]; an F32 plane is
+    /// the f32 site whatever type it was widened from). `None` for a form no
+    /// dense entry reads: a stack in the file's blocks of a type whose entry
+    /// reads another layout (Q8_0's planes, an i-quant), a derived weight and
+    /// an NVFP4 stack.
+    #[must_use]
+    pub fn of_resident(w: &DevWeight) -> Option<SiteTy> {
+        let ty = match w {
+            DevWeight::KQuant { ty, .. } => {
+                return SiteTy::of_ggml(*ty).filter(|s| s.kquant());
+            }
+            DevWeight::Q5_0 { .. } => GgmlType::Q5_0,
+            DevWeight::Q5_1 { .. } => GgmlType::Q5_1,
+            DevWeight::Q8_0 { .. } => GgmlType::Q8_0,
+            DevWeight::F32 { .. } => GgmlType::F32,
+            DevWeight::Nvfp4 { .. } => GgmlType::NVFP4,
+            DevWeight::Mxfp8 { .. } => GgmlType::MXFP8,
+            DevWeight::Fp8B128 { .. } => GgmlType::FP8_B128,
+            DevWeight::Bf16 { .. } => GgmlType::BF16,
+            DevWeight::Q8_0Derived { .. } | DevWeight::Nvfp4Stack { .. } => return None,
+        };
+        SiteTy::of_ggml(ty)
     }
 
     /// The family that launches the kernel table's dense entry `entry`;
@@ -277,42 +312,60 @@ pub fn vector(
 
 /// The resident weight of site `name`: of type `ty`, `rows` rows of `k`
 /// values — the type its file entry was read as ([`file_site`]); any other
-/// variant or shape is refused by name.
+/// variant or shape is refused by name ([`resident_site`]).
 pub fn site(
     w: &Weights,
     what: &'static str,
     name: &str,
-    (rows, k): (usize, usize),
+    shape: (usize, usize),
     ty: SiteTy,
 ) -> Result<(), GpuError> {
-    let got = match w.get(name) {
-        None => return Err(GpuError::tensor(what, name, "resident")),
-        Some(DevWeight::KQuant { ty: t, w: p, k: wk }) => SiteTy::of_ggml(*t)
-            .filter(|s| s.kquant())
-            .map(|s| (s, p.rows(), *wk)),
-        Some(DevWeight::Q8_0 { d, k: wk, .. }) => Some((SiteTy::Q8_0, d.rows(), *wk)),
-        Some(DevWeight::Q5_0 { w: p, k: wk }) => Some((SiteTy::Q5_0, p.rows(), *wk)),
-        Some(DevWeight::F32 { w: p, k: wk }) => Some((SiteTy::F32, p.rows(), *wk)),
-        Some(DevWeight::Nvfp4 { qs, k: wk, .. }) => Some((SiteTy::Nvfp4, qs.rows(), *wk)),
-        Some(DevWeight::Mxfp8 { qs, k: wk, .. }) => Some((SiteTy::Mxfp8, qs.rows(), *wk)),
-        Some(DevWeight::Fp8B128 { qs, k: wk, .. }) => Some((SiteTy::Fp8B128, qs.rows(), *wk)),
-        Some(DevWeight::Bf16 { w: p, k: wk }) => Some((SiteTy::Bf16, p.rows(), *wk)),
-        Some(_) => None,
-    };
-    match got {
-        Some(g) if g == (ty, rows, k) => Ok(()),
-        Some((t, r, wk)) => Err(GpuError::shape(
+    resident_site(w, what, name, shape, &[ty]).map(drop)
+}
+
+/// The family of the resident weight `name` ([`SiteTy::of_resident`]), `rows`
+/// rows (every expert's of a stack) of `k` values: a family outside
+/// `allowed`, a form no site launch reads, another shape or a weight that is
+/// not resident is refused by name as `what`'s.
+pub fn resident_site(
+    w: &Weights,
+    what: &'static str,
+    name: &str,
+    (rows, k): (usize, usize),
+    allowed: &[SiteTy],
+) -> Result<SiteTy, GpuError> {
+    let t = w.resident(what, name)?;
+    let (r, wk) = (t.rows(), t.k());
+    match SiteTy::of_resident(t) {
+        Some(ty) if allowed.contains(&ty) && (r, wk) == (rows, k) => Ok(ty),
+        Some(ty) => Err(GpuError::shape(
             what,
             format!(
-                "{name} is resident as {t} {r} rows of {wk}; the site takes {ty} {rows} of {k}"
+                "{name} is resident as {ty} {r} rows of {wk}; the site takes {} {rows} of {k}",
+                list(allowed)
             ),
         )),
         None => Err(GpuError::shape(
             what,
-            format!("{name} is resident in a form no site launch reads; the site takes {ty}"),
+            format!(
+                "{name} is resident in a form no site launch reads; the site takes {}",
+                list(allowed)
+            ),
         )),
     }
 }
+
+/// The types a dense site of a resident weight launches by name on both
+/// arms, the gemv over `m` columns ([`resident_gemv_cols`]) and the wide
+/// GEMM ([`resident_gemm`]): those whose launch reads the f32 rows or the q8
+/// blocks of 32 ([`SiteTy::reads`]; a unit test holds the list to it).
+pub const BY_NAME: [SiteTy; 5] = [
+    SiteTy::Q8_0,
+    SiteTy::F32,
+    SiteTy::Mxfp8,
+    SiteTy::Fp8B128,
+    SiteTy::Bf16,
+];
 
 /// `allowed` as a list of names.
 fn list(allowed: &[SiteTy]) -> String {
@@ -349,28 +402,52 @@ pub fn gemv(
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let weight = w.resident("site::gemv", name)?;
-    launch(gpu, Some(g32), (Some(ty), weight, name), x, m, y)
+    let src = (Some(ty), w, SiteWeight::Resident(name));
+    launch(gpu, Some(g32), src, x, m, y)
 }
 
-/// [`gemv`] for the resident weight `name` by its resident form (Q8_0, F32,
-/// MXFP8 or BF16) over the first `m` (1..=8) columns of the f32 rows `x`,
-/// token-major: a body whose plan picks each site's form per tensor.
+/// [`gemv`] for the resident weight `name` at the site type of its resident
+/// form ([`SiteTy::of_resident`]) over the first `m` (1..=8) columns of the
+/// f32 rows `x`, token-major: a body whose plan picks each site's type per
+/// tensor. `g32` is read only by an F32 site past one column, which is
+/// refused by name without it.
 pub fn resident_gemv_cols(
     gpu: &Gpu,
-    g32: &Gemm32Kernels,
+    g32: Option<&Gemm32Kernels>,
     (w, name): (&Weights, &str),
     x: &DeviceBuffer<f32>,
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let weight = w.resident("site::resident_gemv_cols", name)?;
-    launch(gpu, Some(g32), (None, weight, name), x, m, y)
+    launch(gpu, g32, (None, w, SiteWeight::Resident(name)), x, m, y)
+}
+
+/// [`resident_gemv_cols`] over rows `at .. at + n` of the resident weight
+/// `name` alone ([`SiteWeight::Part`]), their `n` outputs of each column
+/// token-major into `y`, each bit for bit the whole weight's for its row
+/// and column.
+pub fn resident_gemv_rows(
+    gpu: &Gpu,
+    g32: Option<&Gemm32Kernels>,
+    (w, name, (at, n)): (&Weights, &str, (usize, usize)),
+    x: &DeviceBuffer<f32>,
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    launch(
+        gpu,
+        g32,
+        (None, w, SiteWeight::Part { name, at, n }),
+        x,
+        m,
+        y,
+    )
 }
 
 /// `y = W · x` at one column for the resident weight `name`, by the site
-/// type of its resident form ([`gemv`] at `m` = 1): the one-column gemv of a
-/// model that names a projection and leaves its format to the file.
+/// type of its resident form ([`resident_gemv_cols`] at `m` = 1): the
+/// one-column gemv of a model that names a projection and leaves its format
+/// to the file.
 pub fn resident_gemv(
     gpu: &Gpu,
     w: &Weights,
@@ -378,8 +455,7 @@ pub fn resident_gemv(
     x: &DeviceBuffer<f32>,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let weight = w.resident("site::resident_gemv", name)?;
-    launch(gpu, None, (None, weight, name), x, 1, y)
+    launch(gpu, None, (None, w, SiteWeight::Resident(name)), x, 1, y)
 }
 
 /// The expert-select gemv over the f32 rows (`a`, [`SelArgs`]) of the
@@ -406,93 +482,197 @@ pub fn resident_sel_f32(
     }
 }
 
-/// [`gemv`]'s launch; `g32` is read only by an F32 site past one column.
-/// `ty` checks a declared site type, or `None` dispatches by the resident form.
+/// The site type of the resident weight `name` ([`SiteTy::of_resident`]): a
+/// missing weight, or a form no site launch reads, is refused by name as
+/// `what`'s.
+pub fn resident_type(w: &Weights, what: &'static str, name: &str) -> Result<SiteTy, GpuError> {
+    resident_ty(what, (None, w.resident(what, name)?, name))
+}
+
+/// The site type of the resident weight `name` ([`SiteTy::of_resident`]),
+/// which must be `declared` when the caller names one: another type, or a
+/// form no site launch reads, is refused by name as `what`'s.
+fn resident_ty(
+    what: &'static str,
+    (declared, w, name): (Option<SiteTy>, &DevWeight, &str),
+) -> Result<SiteTy, GpuError> {
+    match (SiteTy::of_resident(w), declared) {
+        (Some(ty), None) => Ok(ty),
+        (Some(ty), Some(d)) if ty == d => Ok(ty),
+        (Some(ty), Some(d)) => Err(GpuError::shape(
+            what,
+            format!("{name} is resident as {ty}; the site takes {d}"),
+        )),
+        (None, _) => Err(GpuError::shape(
+            what,
+            format!("{name} is resident in a form no site launch reads"),
+        )),
+    }
+}
+
+/// The gemv of site `src` over the first `m` (1..=8) columns of the f32 rows
+/// `x`, token-major, at the site type of its resident form, which must be
+/// `declared` when the caller names one ([`resident_ty`]). `g32` is read
+/// only by an F32 site past one column.
 fn launch(
     gpu: &Gpu,
     g32: Option<&Gemm32Kernels>,
-    (ty, w, name): (Option<SiteTy>, &DevWeight, &str),
+    (declared, w, src): (Option<SiteTy>, &Weights, SiteWeight<'_>),
     x: &DeviceBuffer<f32>,
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     const WHAT: &str = "site::gemv";
-    let stream = gpu.stream();
-    match (ty, w) {
-        (None | Some(SiteTy::Q8_0), DevWeight::Q8_0 { qs, d, .. }) => {
-            let q = gpu.q8f32();
-            if m == 1 {
-                q.enqueue_q8_0_gemv(stream, qs, d, x, 1, y)
-            } else {
-                q.enqueue_q8_0_gemv_mcol(
-                    stream,
-                    Q8_0GemvMcolArgs {
-                        qs,
-                        d,
-                        x,
-                        m,
-                        out: GemvOut::TokenMajor,
-                        y,
-                    },
-                )
-            }
-        }
+    let (name, part) = src.rows(WHAT)?;
+    let weight = w.resident(WHAT, name)?;
+    let ty = resident_ty(WHAT, (declared, weight, name))?;
+    match ty.reads() {
+        Form::F32 | Form::Q8x32 => with_planes(WHAT, (ty, weight, name), part, |p| {
+            gemv_planes(gpu, g32, p, x, m, y)
+        }),
+        Form::Q8x128 => Err(GpuError::shape(
+            WHAT,
+            format!("{name} is {ty}: its gemv is `site::kgemv`, on the q8_1 rows"),
+        )),
+        Form::Q8Blocks32 => Err(GpuError::shape(
+            WHAT,
+            format!("{name} is {ty}: its gemv is `site::blocks32_gemv`, on the Q8Blocks32 rows"),
+        )),
+    }
+}
+
+/// `y = W · x` for the planes `p` over the first `m` (1..=8) columns of the
+/// f32 rows `x`, token-major: Q8_0 `q8_0_gemv` at one column and
+/// `q8_0_gemv_mcol` past it, F32 `f32_gemv` and past one column the F32 tile
+/// (`g32`), BF16 `bf16_gemv` and its tile, MXFP8 and FP8_B128 their gemvs.
+fn gemv_planes(
+    gpu: &Gpu,
+    g32: Option<&Gemm32Kernels>,
+    p: Planes<'_>,
+    x: &DeviceBuffer<f32>,
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let (q, stream) = (gpu.q8f32(), gpu.stream());
+    match p {
+        Planes::Q8_0(qs, d) if m == 1 => q.enqueue_q8_0_gemv(stream, qs, d, x, 1, y),
+        Planes::Q8_0(qs, d) => q.enqueue_q8_0_gemv_mcol(
+            stream,
+            Q8_0GemvMcolArgs {
+                qs,
+                d,
+                x,
+                m,
+                out: GemvOut::TokenMajor,
+                y,
+            },
+        ),
         // One column runs `f32_gemv`, a warp a row: the tile gives the same bits in one block
         // for a site of 32 rows or fewer.
-        (None | Some(SiteTy::F32), DevWeight::F32 { w, .. }) => {
-            if m == 1 {
-                gpu.q8f32().enqueue_f32_gemv(stream, w, x, 1, y)
-            } else {
-                g32.ok_or(GpuError::state(WHAT, "the F32 tile's kernels"))?
-                    .enqueue_f32_tile(stream, w, x, m, y)
-            }
-        }
+        Planes::F32(w) if m == 1 => q.enqueue_f32_gemv(stream, w, x, 1, y),
+        Planes::F32(w) => g32
+            .ok_or(GpuError::state("site::gemv", "the F32 tile's kernels"))?
+            .enqueue_f32_tile(stream, w, x, m, y),
         // One column runs `bf16_gemv`, past it the BF16 tile: F32's pair over
         // the widened values.
-        (None | Some(SiteTy::Bf16), DevWeight::Bf16 { w, .. }) => {
-            let q = gpu.q8f32();
-            if m == 1 {
-                q.enqueue_bf16_gemv(stream, w, x, 1, y)
+        Planes::Bf16(w) if m == 1 => q.enqueue_bf16_gemv(stream, w, x, 1, y),
+        Planes::Bf16(w) => q.enqueue_bf16_tile(stream, w, x, m, y),
+        Planes::E4m3(w) => q.enqueue_e4m3_gemv(stream, E4m3GemvArgs { w, x, m, y }),
+    }
+}
+
+/// Rows `at .. at + n` of a weight a site reads, `(at, n)`; all of them at
+/// `None`.
+type Part = Option<(usize, usize)>;
+
+/// A plane of a dense weight as a launch reads it: the resident plane, or a
+/// window of its rows.
+enum View<'t, T> {
+    All(&'t DeviceTensor<T>),
+    Rows(TensorWindow<'t, T>),
+}
+
+impl<T> std::ops::Deref for View<'_, T> {
+    type Target = DeviceTensor<T>;
+
+    fn deref(&self) -> &DeviceTensor<T> {
+        match self {
+            View::All(t) => t,
+            View::Rows(w) => w,
+        }
+    }
+}
+
+/// Plane `t` of site `name`, or its rows `at .. at + n` at `part`: an empty
+/// part or one past the plane's rows is refused by name as `what`'s.
+fn view<'t, T: DeviceCopy>(
+    what: &'static str,
+    (name, part): (&str, Part),
+    t: &'t DeviceTensor<T>,
+) -> Result<View<'t, T>, GpuError> {
+    let Some((at, n)) = part else {
+        return Ok(View::All(t));
+    };
+    if n == 0 || at.checked_add(n).is_none_or(|end| end > t.rows()) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{name}: rows {at} .. {at} + {n} of a weight of {} rows",
+                t.rows()
+            ),
+        ));
+    }
+    let off = at
+        .checked_mul(t.cols())
+        .and_then(|v| v.checked_mul(size_of::<T>()))
+        .ok_or_else(|| GpuError::shape(what, format!("{name}: row {at}'s byte overflows")))?;
+    DeviceTensor::window_of(t.buf(), off, n, t.cols()).map(View::Rows)
+}
+
+/// The planes of a dense site whose launch reads the f32 rows or q8 blocks
+/// of 32 (Q8_0, F32, MXFP8, FP8_B128, BF16).
+enum Planes<'p> {
+    Q8_0(&'p DeviceTensor<u32>, &'p DeviceTensor<u16>),
+    F32(&'p DeviceTensor<f32>),
+    Bf16(&'p DeviceTensor<u32>),
+    E4m3(E4m3Weight<'p>),
+}
+
+/// `f` over the planes of the resident weight `name` as a site of type
+/// `ty` reads them ([`Planes`]), each plane's rows `part` (all of them at
+/// `None`). A form that is not the one the type's dense entry reads, a type
+/// with no such planes and a part past the rows are refused by name as
+/// `what`'s.
+fn with_planes<R>(
+    what: &'static str,
+    (ty, w, name): (SiteTy, &DevWeight, &str),
+    part: Part,
+    f: impl FnOnce(Planes<'_>) -> Result<R, GpuError>,
+) -> Result<R, GpuError> {
+    let at = (name, part);
+    match (ty, w) {
+        (SiteTy::Q8_0, DevWeight::Q8_0 { qs, d, .. }) => {
+            f(Planes::Q8_0(&*view(what, at, qs)?, &*view(what, at, d)?))
+        }
+        (SiteTy::F32, DevWeight::F32 { w, .. }) => f(Planes::F32(&*view(what, at, w)?)),
+        (SiteTy::Bf16, DevWeight::Bf16 { w, .. }) => f(Planes::Bf16(&*view(what, at, w)?)),
+        (SiteTy::Mxfp8, DevWeight::Mxfp8 { qs, e, .. })
+        | (SiteTy::Fp8B128, DevWeight::Fp8B128 { qs, e, .. }) => {
+            let scales = if ty == SiteTy::Mxfp8 {
+                E4m3Scales::Mxfp8
             } else {
-                q.enqueue_bf16_tile(stream, w, x, m, y)
-            }
-        }
-        (None | Some(SiteTy::Mxfp8), DevWeight::Mxfp8 { qs, e, .. }) => {
-            let w = E4m3Weight {
-                qs,
-                e,
-                scales: E4m3Scales::Mxfp8,
+                E4m3Scales::Fp8B128
             };
-            gpu.q8f32()
-                .enqueue_e4m3_gemv(stream, E4m3GemvArgs { w, x, m, y })
+            let (qs, e) = (view(what, at, qs)?, view(what, at, e)?);
+            f(Planes::E4m3(E4m3Weight {
+                qs: &qs,
+                e: &e,
+                scales,
+            }))
         }
-        (None | Some(SiteTy::Fp8B128), DevWeight::Fp8B128 { qs, e, .. }) => {
-            let w = E4m3Weight {
-                qs,
-                e,
-                scales: E4m3Scales::Fp8B128,
-            };
-            gpu.q8f32()
-                .enqueue_e4m3_gemv(stream, E4m3GemvArgs { w, x, m, y })
-        }
-        (Some(ty @ (SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Nvfp4)), _) => {
-            Err(GpuError::shape(
-                WHAT,
-                format!("{name} is {ty}: its gemv is `site::kgemv`, on the q8_1 rows"),
-            ))
-        }
-        (Some(SiteTy::Q5_0), _) => Err(GpuError::shape(
-            WHAT,
-            format!("{name} is Q5_0: its gemv is `site::blocks32_gemv`, on the Q8Blocks32 rows"),
-        )),
-        (Some(SiteTy::Q8_0), _) => Err(GpuError::tensor(WHAT, name, "a q8_0 weight")),
-        (Some(SiteTy::F32), _) => Err(GpuError::tensor(WHAT, name, "an f32 tensor")),
-        (Some(SiteTy::Mxfp8), _) => Err(GpuError::tensor(WHAT, name, "an mxfp8 weight")),
-        (Some(SiteTy::Fp8B128), _) => Err(GpuError::tensor(WHAT, name, "an fp8_b128 weight")),
-        (Some(SiteTy::Bf16), _) => Err(GpuError::tensor(WHAT, name, "a bf16 weight")),
-        (None, _) => Err(GpuError::shape(
-            "site::resident_gemv",
-            format!("{name} is resident in a form no site launch reads"),
+        _ => Err(GpuError::shape(
+            what,
+            format!("{name} is resident in a form a {ty} site's planes are not"),
         )),
     }
 }
@@ -627,16 +807,20 @@ pub fn blocks32_gemv(
         .enqueue_gemv_q5_0(gpu.stream(), wt, act, 0, wt.rows(), 0, act.m(), y, 0)
 }
 
-/// Where a wide site reads its weight: the resident tensor of a name
-/// (`Weights`), or the K-quant words a caller holds — a window of experts
-/// laid out as the resident stack of the site's type, kept outside
-/// `Weights`. Both carry the site's name, which a refusal names. A Q8_0 or
-/// F32 site is resident alone: words under any other type than a K-quant's
-/// are refused by name ([`gemm`], [`gated`]).
+/// Where a site reads its weight: the resident tensor of a name
+/// (`Weights`), rows of it, or the K-quant words a caller holds — a window
+/// of experts laid out as the resident stack of the site's type, kept
+/// outside `Weights`. Each carries the site's name, which a refusal names.
+/// Words under any other type than a K-quant's, and rows of a site whose
+/// launch reads neither the f32 rows nor q8 blocks of 32, are refused by
+/// name ([`gemm`], [`gated`], [`resident_gemv_rows`]).
 #[derive(Clone, Copy)]
 pub enum SiteWeight<'a> {
     /// The resident weight of this name.
     Resident(&'a str),
+    /// Rows `at .. at + n` of the resident weight `name`: one part of a
+    /// weight joined at load (`Weights::join_rows`).
+    Part { name: &'a str, at: usize, n: usize },
     /// The words of site `name`, `w`.
     Words {
         name: &'a str,
@@ -649,26 +833,43 @@ impl<'a> SiteWeight<'a> {
     #[must_use]
     pub fn name(self) -> &'a str {
         match self {
-            SiteWeight::Resident(name) | SiteWeight::Words { name, .. } => name,
+            SiteWeight::Resident(name)
+            | SiteWeight::Part { name, .. }
+            | SiteWeight::Words { name, .. } => name,
         }
     }
 
-    /// Words under a type that is not a K-quant's, refused by name as
-    /// `what`.
+    /// Words under a type that is not a K-quant's, and rows of a type whose
+    /// launch reads neither the f32 rows nor q8 blocks of 32, refused by
+    /// name as `what`.
     fn check(self, what: &'static str, ty: SiteTy) -> Result<(), GpuError> {
         match self {
             SiteWeight::Words { name, .. } if !ty.kquant() => Err(GpuError::shape(
                 what,
                 format!("{name} is {ty} on words a caller holds; only a K-quant's words launch"),
             )),
+            SiteWeight::Part { name, .. } if !BY_NAME.contains(&ty) => Err(GpuError::shape(
+                what,
+                format!(
+                    "{name} is {ty}: only a site on the f32 rows or q8 blocks of 32 launches \
+                         rows of its weight"
+                ),
+            )),
             _ => Ok(()),
         }
     }
 
-    /// The resident name of a site whose type reads no words (Q8_0, F32).
-    fn resident(self, what: &'static str, ty: SiteTy) -> Result<&'a str, GpuError> {
-        self.check(what, ty)?;
-        Ok(self.name())
+    /// The resident weight's name and the rows of it a site reads, all of
+    /// them at `None`; words a caller holds are refused by name as `what`.
+    fn rows(self, what: &'static str) -> Result<(&'a str, Part), GpuError> {
+        match self {
+            SiteWeight::Resident(name) => Ok((name, None)),
+            SiteWeight::Part { name, at, n } => Ok((name, Some((at, n)))),
+            SiteWeight::Words { name, .. } => Err(GpuError::shape(
+                what,
+                format!("{name} is on words a caller holds; this site reads a resident weight"),
+            )),
+        }
     }
 }
 
@@ -894,6 +1095,7 @@ pub fn gemm(
             ))
         }
     };
+    src.check(WHAT, ty)?;
     match ty {
         SiteTy::Nvfp4 => Err(no_wide_gemm(WHAT, name, ty)),
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => k.gemm.enqueue_gemm(
@@ -903,8 +1105,8 @@ pub fn gemm(
                     .gemm_weight()
                     .ok_or(GpuError::state(WHAT, "a K-quant's GEMM type"))?,
                 w: match src {
-                    SiteWeight::Resident(name) => kq(w, WHAT, name)?,
                     SiteWeight::Words { w, .. } => w,
+                    _ => kq(w, WHAT, name)?,
                 },
                 rows_per_expert: rows,
                 act: x.q128.ok_or_else(|| missing("q8_1 blocks of 128"))?,
@@ -913,76 +1115,38 @@ pub fn gemm(
                 y,
             },
         ),
-        SiteTy::Q8_0 => {
+        SiteTy::Q8_0 | SiteTy::F32 | SiteTy::Mxfp8 | SiteTy::Fp8B128 | SiteTy::Bf16 => {
             dense()?;
-            let (qs, d) = w.q8_planes(WHAT, src.resident(WHAT, ty)?)?;
-            k.g32(
-                WHAT,
-                "the 32-value kernels a Q8_0 site runs on (this load holds none)",
-            )?
-            .enqueue_gemm32(
-                stream,
-                Gemm32Args {
-                    w: Gemm32Weight::Q8_0Plane { qs, d },
-                    rows_per_expert: rows,
-                    act: x.q32.ok_or_else(|| missing("q8 blocks of 32"))?,
-                    route,
-                    input,
-                    y,
-                },
-            )
-        }
-        SiteTy::F32 => {
-            dense()?;
-            let rows = x.f32.ok_or_else(|| missing("f32 rows"))?;
-            k.g32(
-                WHAT,
-                "the 32-value kernels an F32 site runs on (this load holds none)",
-            )?
-            .enqueue_f32_tile(
-                stream,
-                w.f32_tensor(WHAT, src.resident(WHAT, ty)?)?,
-                rows,
-                m,
-                y,
-            )
-        }
-        SiteTy::Mxfp8 | SiteTy::Fp8B128 => {
-            dense()?;
-            let rows = x.f32.ok_or_else(|| missing("f32 rows"))?;
-            let site = src.resident(WHAT, ty)?;
-            let wt = w.e4m3(WHAT, site)?;
-            if SiteTy::of_ggml(wt.scales.ggml()) != Some(ty) {
-                return Err(GpuError::shape(
+            let (site, part) = src.rows(WHAT)?;
+            let weight = w.resident(WHAT, site)?;
+            let g32 = || {
+                k.g32(
                     WHAT,
-                    format!(
-                        "{site} is resident as {}; the site takes {ty}",
-                        wt.scales.ggml()
-                    ),
-                ));
-            }
-            k.g32(
-                WHAT,
-                "the 32-value kernels an E4M3 site runs on (this load holds none)",
-            )?
-            .enqueue_e4m3_tile(stream, wt, rows, m, y)
-        }
-        SiteTy::Bf16 => {
-            dense()?;
-            let rows = x.f32.ok_or_else(|| missing("f32 rows"))?;
-            gpu.q8f32().enqueue_bf16_tile(
-                stream,
-                w.bf16(WHAT, src.resident(WHAT, ty)?)?,
-                rows,
-                m,
-                y,
-            )
+                    "the 32-value kernels a Q8_0, F32 or E4M3 site runs on (this load holds none)",
+                )
+            };
+            let f32_rows = || x.f32.ok_or_else(|| missing("f32 rows"));
+            with_planes(WHAT, (ty, weight, site), part, |p| match p {
+                Planes::Q8_0(qs, d) => g32()?.enqueue_gemm32(
+                    stream,
+                    Gemm32Args {
+                        w: Gemm32Weight::Q8_0Plane { qs, d },
+                        rows_per_expert: rows,
+                        act: x.q32.ok_or_else(|| missing("q8 blocks of 32"))?,
+                        route,
+                        input,
+                        y,
+                    },
+                ),
+                Planes::F32(t) => g32()?.enqueue_f32_tile(stream, t, f32_rows()?, m, y),
+                Planes::E4m3(t) => g32()?.enqueue_e4m3_tile(stream, t, f32_rows()?, m, y),
+                Planes::Bf16(t) => gpu.q8f32().enqueue_bf16_tile(stream, t, f32_rows()?, m, y),
+            })
         }
         SiteTy::Q5_0 => {
             dense()?;
-            let site = src.resident(WHAT, ty)?;
-            let Some(DevWeight::Q5_0 { w: packed, .. }) = w.get(site) else {
-                return Err(GpuError::tensor(WHAT, site, "a packed Q5_0 weight"));
+            let Some(DevWeight::Q5_0 { w: packed, .. }) = w.get(name) else {
+                return Err(GpuError::tensor(WHAT, name, "a packed Q5_0 weight"));
             };
             k.g32(
                 WHAT,
@@ -1003,11 +1167,11 @@ pub fn gemm(
     }
 }
 
-/// [`gemm`] for the resident weight `name` by its resident form (Q8_0, F32,
-/// MXFP8 or BF16) on the unit's one-expert table `route`, filled for the
-/// first `m` slots, token-major: a body whose plan picks each dense site's
-/// form per tensor. A Q8_0 weight reads `x.q32` ([`resident_quantize`]), the
-/// others the f32 rows.
+/// [`gemm`] for the resident weight `name` at the site type of its resident
+/// form ([`SiteTy::of_resident`]) on the unit's one-expert table `route`,
+/// filled for the first `m` slots, token-major: a body whose plan picks each
+/// dense site's type per tensor. A site reads the form its type reads from
+/// `x` ([`resident_quantize`] writes the q8 blocks of 32).
 pub fn resident_gemm(
     gpu: &Gpu,
     k: &WideKernels<'_>,
@@ -1017,36 +1181,47 @@ pub fn resident_gemm(
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    const WHAT: &str = "site::resident_gemm";
-    let weight = w.resident(WHAT, name)?;
-    let ty = match weight {
-        DevWeight::Q8_0 { .. } => SiteTy::Q8_0,
-        DevWeight::F32 { .. } => SiteTy::F32,
-        DevWeight::Mxfp8 { .. } => SiteTy::Mxfp8,
-        DevWeight::Bf16 { .. } => SiteTy::Bf16,
-        _ => {
-            return Err(GpuError::tensor(
-                WHAT,
-                name,
-                "a Q8_0, F32, MXFP8 or BF16 weight",
-            ));
-        }
-    };
-    gemm(
-        gpu,
-        k,
-        (ty, w, SiteWeight::Resident(name)),
-        weight.rows(),
-        x,
-        (route, GemmInput::PerSlot),
-        m,
-        y,
-    )
+    let rows = w.resident("site::resident_gemm", name)?.rows();
+    let src = SiteWeight::Resident(name);
+    wide_by_name(gpu, k, (w, src, rows), x, route, m, y)
+}
+
+/// [`resident_gemm`] over rows `at .. at + n` of the resident weight `name`
+/// alone ([`SiteWeight::Part`]), their `n` outputs of each slot token-major
+/// into `y`, each bit for bit the whole weight's for its row and slot.
+pub fn resident_gemm_rows(
+    gpu: &Gpu,
+    k: &WideKernels<'_>,
+    (w, name, (at, n)): (&Weights, &str, (usize, usize)),
+    x: &WideIn<'_>,
+    route: &GemmRoute,
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let src = SiteWeight::Part { name, at, n };
+    wide_by_name(gpu, k, (w, src, n), x, route, m, y)
+}
+
+/// [`gemm`] of site `src`, `rows` rows, at the site type of its resident
+/// form, on the one-expert table `route` filled for `m` slots.
+fn wide_by_name(
+    gpu: &Gpu,
+    k: &WideKernels<'_>,
+    (w, src, rows): (&Weights, SiteWeight<'_>, usize),
+    x: &WideIn<'_>,
+    route: &GemmRoute,
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let ty = resident_type(w, "site::resident_gemm", src.name())?;
+    let table = (route, GemmInput::PerSlot);
+    gemm(gpu, k, (ty, w, src), rows, x, table, m, y)
 }
 
 /// The q8 blocks of 32 of the first `m` columns of the f32 rows `x` into
-/// `q32` when one of the resident weights `names` is Q8_0, the one dense form
-/// whose [`resident_gemm`] reads them.
+/// `q32` when a site of one of the resident weights `names` reads them
+/// ([`WideActs::wants`] of its type, [`SiteTy::of_resident`]): what
+/// [`resident_gemm`] reads for a Q8_0 or Q5_0 site.
 pub fn resident_quantize(
     gpu: &Gpu,
     k: &WideKernels<'_>,
@@ -1055,13 +1230,15 @@ pub fn resident_quantize(
     q32: &mut GemmAct32,
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    if names
-        .iter()
-        .any(|n| matches!(w.get(n), Some(DevWeight::Q8_0 { .. })))
-    {
+    let reads_q32 = |n: &&str| {
+        w.get(n)
+            .and_then(SiteTy::of_resident)
+            .is_some_and(|ty| WideActs::wants(ty).1)
+    };
+    if names.iter().any(reads_q32) {
         k.g32(
             "site::resident_quantize",
-            "the 32-value kernels a Q8_0 site's rows are quantized by",
+            "the 32-value kernels a site's q8 blocks of 32 are quantized by",
         )?
         .enqueue_quantize_gemm32(gpu.stream(), x, m, q32, sink)?;
     }
@@ -1453,8 +1630,10 @@ mod tests {
     /// has a family exactly where the table names a dense entry for it (F16,
     /// which loads widened to f32, is the f32 site of its widened rows), the
     /// family maps back to that type and is named by it in upper case, its
-    /// K-quant GEMM is the one the table names for the type, and it is a
-    /// `kgemv` exactly where it reads the q8_1 rows of 128 values.
+    /// K-quant GEMM is the one the table names for the type, it is a
+    /// `kgemv` exactly where it reads the q8_1 rows of 128 values, and it
+    /// launches by name (`BY_NAME`) exactly where it reads the f32 rows or
+    /// the q8 blocks of 32.
     #[test]
     fn every_family_is_the_tables_dense_row_of_one_type() {
         // PIN(2026-10-21): consolidate the three site pins, preserving their assertions.
@@ -1501,6 +1680,8 @@ mod tests {
             assert_eq!(s.gemm_weight(), grouped);
             assert_eq!(s.kquant(), grouped.is_some());
             assert_eq!(s.kgemv_order().is_some(), s.reads() == Form::Q8x128);
+            let by_name = matches!(s.reads(), Form::F32 | Form::Q8x32);
+            assert_eq!(super::BY_NAME.contains(&s), by_name, "{s}");
         }
         assert_eq!(SiteTy::Q5_0.reads(), Form::Q8Blocks32);
         assert_eq!(SiteTy::Q5_0.kgemv_order(), None);

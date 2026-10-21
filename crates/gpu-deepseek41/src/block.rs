@@ -427,7 +427,7 @@ pub fn enqueue_block_act(
             h,
         )?;
         if !blk.plan.down.kquant() {
-            return w.q8_gemv(gpu, BLOCK, down, h, y);
+            return site::resident_gemv(gpu, w, down, h, y);
         }
     }
     let fault = gpu.layer_sink(blk.layer)?;
@@ -471,7 +471,7 @@ pub fn enqueue_block_act(
         }
     }
     if !blk.plan.down.kquant() {
-        return w.q8_gemv(gpu, BLOCK, down, h, y);
+        return site::resident_gemv(gpu, w, down, h, y);
     }
     let (kk, sc) = kit(k, s)?;
     let act = h_blocks(&mut sc.ha, blk.ff)?;
@@ -579,7 +579,7 @@ pub fn enqueue_block_cols_act(
                 gpu.layer_sink(blk.layer)?,
                 h,
             )?;
-            w.q8_gemv_mcol(gpu, BLOCK, down, h, cols, y)
+            site::resident_gemv_cols(gpu, None, (w, down), h, cols, y)
         }
         ColsLaunch::PerColumn => {
             let n = x.len() / cols;

@@ -26,7 +26,12 @@
 //!    the BF16 site's outputs. A BF16 site over that F32 resident is refused
 //!    by name.
 //! 3. join: two BF16 parts joined at load (`Weights::join_rows`) through
-//!    `site::resident_gemv`, bit for bit the rule over the parts' rows.
+//!    `site::resident_gemv`, bit for bit the rule over the parts' rows; the
+//!    same parts loaded as f32 values the same. Over each joint the dense
+//!    calls by name hold their outputs to one another bit for bit
+//!    (`by_name`, `shared/dense_file.rs`): the m-column gemv, the last part's
+//!    rows alone through the gemv and the wide GEMM, and rows past the joint
+//!    refused by name.
 //! 4. head: a BF16 `output.weight` of 4,099 rows through `head::Head` at one
 //!    and three rows (`HeadNorm::Mixed`): its logits the rule bit for bit,
 //!    each row's token the host argmax; the Q8_0 head of the same shape the
@@ -58,7 +63,7 @@ fn main() -> std::process::ExitCode {
 }
 
 mod gate {
-    use crate::dense_file::{Decl, check, columns, decl, host_rows, q8_0_bytes};
+    use crate::dense_file::{Decl, by_name, check, columns, decl, host_rows, q8_0_bytes};
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::head::{Head, HeadNorm};
     use bloomery_gpu::q8f32::Bf16GemvIdsArgs;
@@ -263,7 +268,10 @@ mod gate {
             .flat_map(host)
             .collect();
         let joined = load_placed(gpu, &split, |n| JOIN.iter().any(|j| j.0 == n))?;
-        ok &= join_case(gpu, joined, &parts)?;
+        let widened = Weights::load_where(gpu.stream(), &split, |n| JOIN.iter().any(|j| j.0 == n))?;
+        let wide_at = (&g32, &gemm, &route, WIDE);
+        ok &= join_case(gpu, wide_at, ("bf16", joined), &parts)?;
+        ok &= join_case(gpu, wide_at, ("f32", widened), &parts)?;
         ok &= k96_case(gpu, &w, &host(&decls[SHAPES.len() + JOIN.len()]))?;
         let head_rows = host(&decls[SHAPES.len() + JOIN.len() + 1]);
         let embd_rows = host(&decls[SHAPES.len() + JOIN.len() + 2]);
@@ -364,8 +372,13 @@ mod gate {
         Ok(ok && refused)
     }
 
-    /// Clause 3 (module doc).
-    fn join_case(gpu: &Gpu, mut w: Weights, wf: &[Vec<f32>]) -> Result<bool, GateError> {
+    /// Clause 3 (module doc), over the parts resident as `tag`.
+    fn join_case(
+        gpu: &Gpu,
+        wide: (&Gemm32Kernels, &GemmKernels, &GemmRoute, usize),
+        (tag, mut w): (&str, Weights),
+        wf: &[Vec<f32>],
+    ) -> Result<bool, GateError> {
         const JOINT: &str = "derived.bf16_joint";
         let stream = gpu.stream();
         w.join_rows(stream, &JOIN.map(|(n, _)| n), JOINT.to_string())?;
@@ -375,15 +388,11 @@ mod gate {
         stream.synchronize()?;
         let y = y_dev.to_host_vec(stream)?;
         let rule = |r: usize, c: usize| f32_dot(&wf[r], &x[c * k..][..k]);
-        let tag = format!("parts={} rows={rows} k={k} m=1", JOIN.len());
-        Ok(check(
-            ("bf16", "join"),
-            &tag,
-            (&y, &x, k),
-            wf,
-            &|at| (at, 0),
-            &rule,
-        ))
+        let shown = format!("parts={} rows={rows} k={k} m=1", JOIN.len());
+        let joined = check((tag, "join"), &shown, (&y, &x, k), wf, &|at| (at, 0), &rule);
+        let part = (JOIN[0].1, JOIN[1].1);
+        let named = by_name(gpu, wide, (tag, &w, JOINT), (rows, k), part, 0x5eed_b012)?;
+        Ok(joined && named)
     }
 
     /// Clause 7 (module doc).

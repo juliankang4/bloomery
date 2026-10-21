@@ -1,7 +1,8 @@
 //! Resident weights (package P10): every tensor of the model file uploaded
 //! once, in the device format its kernel consumes (docs/gpu-design.md
-//! decision 4 — format conversion is load-time work; per step this file only
-//! finds what was uploaded, by name, and launches [`Weights::q8_gemv`] on it).
+//! decision 4 — format conversion is load-time work; per step a site finds
+//! what was uploaded, by name, and launches the kernel its type reads:
+//! `crate::site`).
 //! A [`Weights`] owns one contiguous block range plus,
 //! optionally, the non-block tensors, so a `Stage` loads exactly its own
 //! layers — or, for a placed model, every segment its plan puts on one card
@@ -9,13 +10,13 @@
 //! `model::placement::CardFormat`'s. The gates (`gate_p10`, `gate_load_v41`)
 //! pin the uploads against independent host packings bit for bit.
 
+use crate::GpuError;
 use crate::mxfp4::{Nvfp4, Nvfp4Weight, Planes, repack};
 use crate::mxfp4_sel::Nvfp4Stack;
 use crate::q5::{pack_q5_0, pack_q5_1};
-use crate::q8f32::{E4m3Scales, E4m3Weight, GemvOut, Q8_0GemvMcolArgs, e4m3_planes};
+use crate::q8f32::{E4m3Scales, E4m3Weight, e4m3_planes};
 use crate::tensor::{DeviceTensor, window};
 use crate::upload::{Stage, UploadRing, bytes_of};
-use crate::{Gpu, GpuError};
 use ::model::placement::host_lock::PageDrop;
 use ::model::placement::{
     CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment, Span, tp,
@@ -1036,50 +1037,6 @@ impl Weights {
     /// gain, a bias); refused as [`Weights::f32_tensor`] is.
     pub fn f32_buf(&self, what: &'static str, name: &str) -> Result<&DeviceBuffer<f32>, GpuError> {
         self.f32_tensor(what, name).map(DeviceTensor::buf)
-    }
-
-    /// `y = W · x` for the resident Q8_0 weight `name` at one column of `x`
-    /// (`q8_0_gemv`, the decode shape); a weight of another variant is
-    /// refused by name as `what`'s. The multi-column launches lay their
-    /// outputs out as their bodies read them ([`crate::site::gemv`]).
-    pub fn q8_gemv(
-        &self,
-        gpu: &Gpu,
-        what: &'static str,
-        name: &str,
-        x: &DeviceBuffer<f32>,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        let (qs, d) = self.q8_planes(what, name)?;
-        gpu.q8f32().enqueue_q8_0_gemv(gpu.stream(), qs, d, x, 1, y)
-    }
-
-    /// `y = W · x` for the resident Q8_0 weight `name` over `c` columns of `x`
-    /// (1 to [`crate::COL_GROUP`], token-major), the columns' outputs
-    /// token-major into `y` (`q8_0_gemv_mcol`: each column is the one-column
-    /// gemv's bits); a weight of another variant is refused by name as
-    /// `what`'s.
-    pub fn q8_gemv_mcol(
-        &self,
-        gpu: &Gpu,
-        what: &'static str,
-        name: &str,
-        x: &DeviceBuffer<f32>,
-        c: usize,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        let (qs, d) = self.q8_planes(what, name)?;
-        gpu.q8f32().enqueue_q8_0_gemv_mcol(
-            gpu.stream(),
-            Q8_0GemvMcolArgs {
-                qs,
-                d,
-                x,
-                m: c,
-                out: GemvOut::TokenMajor,
-                y,
-            },
-        )
     }
 
     /// Every resident name, sorted.

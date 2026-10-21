@@ -61,6 +61,7 @@ use bloomery_gpu::latent::{
     INDEX_HEAD, INDEX_ROW, IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for,
 };
 use bloomery_gpu::media::widen_bf16;
+use bloomery_gpu::site;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockPlan, enqueue_block};
@@ -1106,10 +1107,10 @@ impl Body {
                 &mut *span_mut(WHAT, &mut a.pack, t * 2 * n + n, n)?,
             )?;
         }
-        w.q8_gemv_mcol(
+        site::resident_gemv_cols(
             gpu,
-            BODY,
-            &nm.eh,
+            None,
+            (w, &nm.eh),
             &*span(WHAT, &a.pack, 0, m * 2 * n)?,
             m,
             &mut a.x,
@@ -1127,10 +1128,10 @@ impl Body {
             m,
             &mut a.xn,
         )?;
-        w.q8_gemv_mcol(
+        site::resident_gemv_cols(
             gpu,
-            BODY,
-            &ln.stack,
+            None,
+            (w, &ln.stack),
             &*span(WHAT, &a.xn, 0, m * n)?,
             m,
             &mut a.stack,

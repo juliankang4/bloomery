@@ -63,6 +63,7 @@ use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::rope_neox::K192Args;
 use bloomery_gpu::routed_block::{RouteBlock, RoutedRows};
+use bloomery_gpu::site;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, Gpu, GpuError};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockKernels, enqueue_block_cols};
@@ -810,7 +811,7 @@ impl PromptProgram<'_> {
         for (c0, cn) in chunks(t, COL_GROUP) {
             let xs = span(W, &b.xn, c0 * d.embd, cn * d.embd)?;
             let mut ys = span_mut(W, &mut b.qkv, c0 * width, cn * width)?;
-            w.q8_gemv_mcol(gpu, WHAT, &n.qkv, &xs, cn, &mut ys)?;
+            site::resident_gemv_cols(gpu, None, (w, &n.qkv), &xs, cn, &mut ys)?;
         }
         enqueue_append(
             &self.k.rope,
@@ -867,7 +868,7 @@ impl PromptProgram<'_> {
         for (c0, cn) in chunks(t, COL_GROUP) {
             let ys = span(W, &b.y, c0 * y_row, cn * y_row)?;
             let mut out = span_mut(W, &mut b.out, c0 * d.embd, cn * d.embd)?;
-            w.q8_gemv_mcol(gpu, WHAT, &n.o, &ys, cn, &mut out)?;
+            site::resident_gemv_cols(gpu, None, (w, &n.o), &ys, cn, &mut out)?;
         }
         gpu.elem()
             .enqueue_add(stream, &ub.x, &b.out, t * d.embd, &mut ub.x1)

@@ -36,6 +36,7 @@ use super::scratch::{Arena, Dims, Forms, KvPlanes, StepParams, StoreMut};
 use crate::head::{Head, HeadNorm};
 use crate::model::lookup::f32_gain;
 use crate::mtp::{MtpInputArgs, MtpKernels};
+use crate::site;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use crate::{Gpu, GpuError, launch_u32};
 use cuda_core::DeviceBuffer;
@@ -309,8 +310,7 @@ impl Mtp35 {
                 out: &mut self.pack,
             },
         )?;
-        self.w
-            .q8_gemv(gpu, WHAT, &self.names.eh, &self.pack, &mut self.s.x)?;
+        site::resident_gemv(gpu, &self.w, &self.names.eh, &self.pack, &mut self.s.x)?;
         let c = Ctx::new(
             gpu,
             &self.w,

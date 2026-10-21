@@ -19,6 +19,7 @@
 
 use bloomery_gpu::flash_gqa::{self, FlashGqaKernels, GqaK192Args};
 use bloomery_gpu::rope_neox::{K192Args, RopeNeoxKernels};
+use bloomery_gpu::site;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 use cuda_core::CudaStream;
@@ -115,7 +116,7 @@ pub(crate) fn attention(
         1,
         &mut s.xn,
     )?;
-    w.q8_gemv(gpu, WHAT, &n.qkv, &s.xn, &mut s.qkv)?;
+    site::resident_gemv(gpu, w, &n.qkv, &s.xn, &mut s.qkv)?;
     enqueue_append(
         &p.k.rope,
         stream,
@@ -162,7 +163,7 @@ pub(crate) fn attention(
         d.heads,
         rows,
     )?;
-    w.q8_gemv(gpu, WHAT, &n.o, &s.y, &mut s.out)?;
+    site::resident_gemv(gpu, w, &n.o, &s.y, &mut s.out)?;
     gpu.elem()
         .enqueue_add(stream, &s.x, &s.out, d.embd, &mut s.x1)
 }

@@ -43,6 +43,7 @@
 //! m columns the next projection quantizes.
 
 use bloomery_gpu::cores::{q3k_row_dot, q3k_row_dot_cols};
+use bloomery_gpu::site::{self, SiteTy};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{
     ColGroups, DeviceTensor, Gpu, GpuError, Q8Act, col_group, col_group_count, col_group_of,
@@ -53,7 +54,6 @@ use cuda_device::convert::{cvt_f32_f16x2_hi, cvt_f32_f16x2_lo};
 use cuda_device::float::{fma_rn_f32, mul_rn_f32};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
-use gguf::quant::GgmlType;
 use std::sync::Arc;
 
 use bloomery_gpu::fault::FaultSink;
@@ -728,44 +728,22 @@ pub enum Dense<'w> {
 }
 
 impl<'w> Dense<'w> {
-    /// `name`'s resident weight, refused unless it projects `k` values onto
-    /// `rows` rows in a format this module runs.
+    /// `name`'s resident weight, refused by name unless it projects `k`
+    /// values onto `rows` rows at a site type this module runs (the type of
+    /// its resident form, `site::resident_site`).
     pub fn of(w: &'w Weights, name: &str, k: usize, rows: usize) -> Result<Dense<'w>, GpuError> {
-        let shape = |got_k: usize, got_rows: usize| GpuError::Shape {
-            what: WHAT,
-            detail: format!("{name} is {got_rows} rows of {got_k} values, want {rows} of {k}"),
-        };
-        match w.get(name) {
-            Some(DevWeight::Q8_0 { qs, d, k: wk }) => {
-                if *wk != k || d.rows() != rows {
-                    return Err(shape(*wk, d.rows()));
-                }
-                Ok(Dense::Q8_0 { qs, d })
-            }
-            Some(DevWeight::KQuant { ty, w: t, k: wk }) => {
-                if *wk != k || t.rows() != rows {
-                    return Err(shape(*wk, t.rows()));
-                }
-                match ty {
-                    GgmlType::Q3_K => Ok(Dense::Q3K(t)),
-                    GgmlType::Q4_K => Ok(Dense::Q4K(t)),
-                    GgmlType::Q5_K => Ok(Dense::Q5K(t)),
-                    _ => Err(GpuError::Tensor {
-                        what: WHAT,
-                        name: name.to_string(),
-                        need: "Q8_0, Q3_K, Q4_K or Q5_K",
-                    }),
-                }
-            }
-            found => Err(GpuError::Tensor {
-                what: WHAT,
-                name: name.to_string(),
-                need: if found.is_some() {
-                    "Q8_0, Q3_K, Q4_K or Q5_K"
-                } else {
-                    "resident"
-                },
-            }),
+        const TYS: [SiteTy; 4] = [SiteTy::Q8_0, SiteTy::Q3K, SiteTy::Q4K, SiteTy::Q5K];
+        let ty = site::resident_site(w, WHAT, name, (rows, k), &TYS)?;
+        match (ty, w.resident(WHAT, name)?) {
+            (SiteTy::Q8_0, DevWeight::Q8_0 { qs, d, .. }) => Ok(Dense::Q8_0 { qs, d }),
+            (SiteTy::Q3K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q3K(t)),
+            (SiteTy::Q4K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q4K(t)),
+            (SiteTy::Q5K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q5K(t)),
+            _ => Err(GpuError::tensor(
+                WHAT,
+                name,
+                "in the planes of its site type",
+            )),
         }
     }
 

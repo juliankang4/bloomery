@@ -114,7 +114,7 @@ use bloomery_gpu::media::{CallRows, MediaBody, MediaSpan, check_spans};
 use bloomery_gpu::prompt_timing::{Mark, PromptStats, PromptTiming, nanos};
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
 use bloomery_gpu::qsa::list_width;
-use bloomery_gpu::site::Form;
+use bloomery_gpu::site::{self, Form};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::{self, AttnArgs, SelectedRows};
@@ -138,7 +138,6 @@ use runtime::prompt::{
 };
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
-use super::WHAT as BODY;
 use super::media::{check_image_ids, stage_row};
 use super::nextn::GlmArena;
 use super::{Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape};
@@ -2276,56 +2275,56 @@ impl KdaProj for KdaBatch<'_> {
         for (c0, c) in chunks(t, CHUNK) {
             let xs = span(W, xn, c0 * n, c * n)?;
             if !gemm {
-                w.q8_gemv_mcol(
+                site::resident_gemv_cols(
                     gpu,
-                    BODY,
-                    &nm.qkv,
+                    None,
+                    (w, &nm.qkv),
                     &xs,
                     c,
                     &mut *span_mut(W, &mut *qkv, c0 * ch, c * ch)?,
                 )?;
             }
-            w.q8_gemv_mcol(
+            site::resident_gemv_cols(
                 gpu,
-                BODY,
-                &nm.f_a,
+                None,
+                (w, &nm.f_a),
                 &xs,
                 c,
                 &mut *span_mut(W, &mut *fa, c0 * HEAD, c * HEAD)?,
             )?;
             if !gemm {
-                w.q8_gemv_mcol(
+                site::resident_gemv_cols(
                     gpu,
-                    BODY,
-                    &nm.g_a,
+                    None,
+                    (w, &nm.g_a),
                     &xs,
                     c,
                     &mut *span_mut(W, &mut *ga, c0 * HEAD, c * HEAD)?,
                 )?;
-                w.q8_gemv_mcol(
+                site::resident_gemv_cols(
                     gpu,
-                    BODY,
-                    &nm.beta,
+                    None,
+                    (w, &nm.beta),
                     &xs,
                     c,
                     &mut *span_mut(W, &mut *beta_raw, c0 * nv, c * nv)?,
                 )?;
             }
             let fa_rows = span(W, &*fa, c0 * HEAD, c * HEAD)?;
-            w.q8_gemv_mcol(
+            site::resident_gemv_cols(
                 gpu,
-                BODY,
-                &nm.f_b,
+                None,
+                (w, &nm.f_b),
                 &fa_rows,
                 c,
                 &mut *span_mut(W, &mut *f, c0 * v, c * v)?,
             )?;
             if !gemm {
                 let ga_rows = span(W, &*ga, c0 * HEAD, c * HEAD)?;
-                w.q8_gemv_mcol(
+                site::resident_gemv_cols(
                     gpu,
-                    BODY,
-                    &nm.g_b,
+                    None,
+                    (w, &nm.g_b),
                     &ga_rows,
                     c,
                     &mut *span_mut(W, &mut *z, c0 * v, c * v)?,
@@ -2351,10 +2350,10 @@ impl KdaProj for KdaBatch<'_> {
         let (n, v) = (self.d.embd, self.d.kda.n_v * HEAD);
         for (c0, c) in chunks(t, CHUNK) {
             let gs = span(W, gated, c0 * v, c * v)?;
-            w.q8_gemv_mcol(
+            site::resident_gemv_cols(
                 gpu,
-                BODY,
-                &nm.out,
+                None,
+                (w, &nm.out),
                 &gs,
                 c,
                 &mut *span_mut(W, &mut *out, c0 * n, c * n)?,
@@ -2620,10 +2619,10 @@ impl PromptProgram<'_> {
             for (c0, c) in chunks(t, CHUNK) {
                 let qr = span(W, &b.qr, c0 * ql, c * ql)?;
                 if !gemm {
-                    w.q8_gemv_mcol(
+                    site::resident_gemv_cols(
                         gpu,
-                        BODY,
-                        &nm.q_b,
+                        None,
+                        (w, &nm.q_b),
                         &qr,
                         c,
                         &mut *span_mut(W, q, c0 * hq, c * hq)?,
@@ -2712,10 +2711,10 @@ impl PromptProgram<'_> {
                     },
                 )?;
                 if !gemm {
-                    w.q8_gemv_mcol(
+                    site::resident_gemv_cols(
                         gpu,
-                        BODY,
-                        &nm.out,
+                        None,
+                        (w, &nm.out),
                         &*span(W, av, c0 * hv, c * hv)?,
                         c,
                         &mut *span_mut(W, &mut b.out, c0 * n, c * n)?,
