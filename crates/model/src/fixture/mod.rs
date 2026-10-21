@@ -137,6 +137,8 @@ pub enum FixtureError {
     },
     #[error("the card budget: {0}")]
     Budget(String),
+    #[error("the card budget: {0}")]
+    BudgetMismatch(String),
     #[error("the r8 sidecar {path}: {detail}")]
     Sidecar { path: PathBuf, detail: String },
     #[error("the source is {got:?}, not a {want} file")]

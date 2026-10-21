@@ -941,17 +941,49 @@ pub fn witness<T: PartialEq + Debug>(name: &str, derived: T, real: T) -> bool {
     }
 }
 
-/// The key the generator records the single-card budget under, read from a header.
+/// The recorded single-card budget, re-planned before a fixture gate can use it.
 ///
 /// # Errors
-/// A key of another type than u64.
+/// A malformed budget, an unknown fixture family, a planned family's file the planner refuses,
+/// or a stale planned budget.
 pub fn header_budget(split: &Split) -> Result<Option<u64>, GateError> {
-    match split.value(KEY_CARD_BUDGET) {
-        None => Ok(None),
-        Some(v) => v
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| format!("{KEY_CARD_BUDGET} holds {v:?}, not a u64").into()),
+    let Some(value) = split.value(KEY_CARD_BUDGET) else {
+        return Ok(None);
+    };
+    let path = split.shard_path(0).expect("a split has a first shard");
+    let budget = value.as_u64().filter(|&b| b > 0).ok_or_else(|| {
+        format!(
+            "{}: {KEY_CARD_BUDGET} holds {value:?}, not a positive u64",
+            path.display()
+        )
+    })?;
+    if split.value(VERSION_KEY).is_some() && split.value(model::fixture::KEY_VARIANT).is_none() {
+        let spec = split
+            .architecture()
+            .and_then(model::arch::registry::fixture_spec)
+            .ok_or_else(|| {
+                format!(
+                    "{}: no fixture spec for {:?}",
+                    path.display(),
+                    split.architecture()
+                )
+            })?;
+        if let model::fixture::CardBudget::Planned(planner) = spec.card_budget {
+            model::fixture::check_budget(&planner, split, budget)
+                .map_err(|e| fixture_budget_error(path, budget, e))?;
+        }
+    }
+    Ok(Some(budget))
+}
+
+fn fixture_budget_error(path: &Path, budget: u64, error: model::fixture::FixtureError) -> String {
+    match error {
+        model::fixture::FixtureError::BudgetMismatch(_) => format!(
+            "{}: stale recorded fixture budget {budget}: {error}; regenerate the fixture using \
+             docs/contrib/local-check.md, 'When a recorded fixture budget is stale'",
+            path.display()
+        ),
+        _ => format!("{}: {error}", path.display()),
     }
 }
 
@@ -963,7 +995,7 @@ pub fn header_budget(split: &Split) -> Result<Option<u64>, GateError> {
 /// name, never planned under.
 ///
 /// # Errors
-/// The fixture tier's file with no budget key, or a lever that names another budget.
+/// An invalid tier, an error from [`header_budget`], or an error from [`budget_levers`].
 pub fn plan_levers(split: &Split, levers: &Levers, extra: u64) -> Result<PlanLevers, GateError> {
     budget_levers(
         Tier::from_env()?,
@@ -976,7 +1008,8 @@ pub fn plan_levers(split: &Split, levers: &Levers, extra: u64) -> Result<PlanLev
 /// [`plan_levers`] of its three inputs: the tier, the header's budget and the caller's lever.
 ///
 /// # Errors
-/// As [`plan_levers`].
+/// The fixture tier's missing header budget, a lever that names another budget,
+/// or a header budget plus draft reservation that overflows u64.
 pub fn budget_levers(
     tier: Tier,
     header: Option<u64>,
@@ -1000,7 +1033,9 @@ pub fn budget_levers(
                 .into());
             }
             Ok(PlanLevers {
-                card_budget_bytes: Some(header + extra),
+                card_budget_bytes: Some(header.checked_add(extra).ok_or_else(|| {
+                    format!("fixture budget {header} plus draft reservation {extra} overflows u64")
+                })?),
             })
         }
     }
@@ -1610,6 +1645,156 @@ mod tests {
         );
         assert!(b(Tier::Fixture, Some(9), Some(8), 0).is_err());
         assert!(b(Tier::Fixture, None, None, 0).is_err());
+        assert!(b(Tier::Fixture, Some(u64::MAX), None, 1).is_err());
+    }
+
+    #[test]
+    fn a_recorded_budget_is_checked_before_a_gate_can_use_it() {
+        use gguf::Value;
+
+        let dir = temp("budget");
+        let path = dir.join("no-hparams-qwen38.gguf");
+        let mut keys = vec![
+            (
+                gguf::GENERAL_ARCHITECTURE.into(),
+                Value::String("qwen4exp".into()),
+            ),
+            (KEY_CARD_BUDGET.into(), Value::U64(9_490_661_376)),
+        ];
+        write_fixture(&path, 1, &keys);
+        let split = Split::open(&path).unwrap();
+        let error = header_budget(&split)
+            .expect_err("the planner must check the header")
+            .to_string();
+        assert!(error.contains("no-hparams-qwen38.gguf"), "{error}");
+        assert!(error.contains("metadata"), "{error}");
+        assert!(!error.contains("stale"), "{error}");
+        assert!(!error.contains("regenerate"), "{error}");
+        drop(split);
+
+        keys[0].1 = Value::String("nemotron_h".into());
+        write_fixture(&path, 1, &keys);
+        assert_eq!(
+            header_budget(&Split::open(&path).unwrap()).unwrap(),
+            Some(9_490_661_376)
+        );
+        keys[1].1 = Value::U64(0);
+        write_fixture(&path, 1, &keys);
+        assert!(header_budget(&Split::open(&path).unwrap()).is_err());
+        keys[1].1 = Value::String("bad".into());
+        write_fixture(&path, 1, &keys);
+        assert!(header_budget(&Split::open(&path).unwrap()).is_err());
+        write_fixture(&path, 1, &[]);
+        assert_eq!(header_budget(&Split::open(&path).unwrap()).unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_budget_mismatch_names_the_file_and_regeneration_step() {
+        use model::fixture::{Budget, CardExperts};
+
+        let dir = temp("stale-budget");
+        let path = dir.join("stale.gguf");
+        write_fixture(&path, 1, &[]);
+        let split = Split::open(&path).unwrap();
+        let planner = Budget {
+            ctx: 1,
+            card_experts: |_, cap| {
+                Ok(CardExperts {
+                    per_layer: vec![cap.unwrap_or(8)],
+                    experts: 8,
+                })
+            },
+        };
+        model::fixture::check_budget(&planner, &split, 4).unwrap();
+        let mismatch = model::fixture::check_budget(&planner, &split, 3).unwrap_err();
+        let error = fixture_budget_error(&path, 3, mismatch);
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("stale recorded fixture budget 3"), "{error}");
+        assert!(error.contains("not [4]"), "{error}");
+        assert!(error.contains("regenerate the fixture"), "{error}");
+        assert!(
+            error
+                .contains("docs/contrib/local-check.md, 'When a recorded fixture budget is stale'"),
+            "{error}"
+        );
+        drop(split);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fixture_variants_keep_the_base_budget_without_replanning() {
+        use gguf::Value;
+
+        let dir = temp("variant-budget");
+        let path = dir.join("variant.gguf");
+        let rows = model::fixture::variant_parse_table(include_str!(
+            "../../../tools/fixture-variants.tsv"
+        ))
+        .unwrap();
+        for row in rows {
+            let keys = [
+                (gguf::GENERAL_ARCHITECTURE.into(), Value::String(row.family)),
+                (KEY_CARD_BUDGET.into(), Value::U64(9_490_661_376)),
+                (
+                    model::fixture::KEY_VARIANT.into(),
+                    Value::String(row.tag.clone()),
+                ),
+            ];
+            write_fixture(&path, 1, &keys);
+            assert_eq!(
+                header_budget(&Split::open(&path).unwrap())
+                    .unwrap_or_else(|e| panic!("{}: {e}", row.tag)),
+                Some(9_490_661_376),
+                "{}",
+                row.tag
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn every_gate_header_budget_reader_uses_the_checked_owner() {
+        for (caller, source, call) in [
+            (
+                "plan_levers",
+                include_str!("tier.rs")
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap(),
+                "header_budget(split)?",
+            ),
+            (
+                "qwen4exp MTP init",
+                include_str!("bin/gate_qwen4exp_mtp.rs"),
+                "tier::header_budget(&file)?",
+            ),
+            (
+                "GLM init_file",
+                include_str!("bin/shared/glm5next_tier.rs"),
+                "tier::header_budget(&split)?",
+            ),
+            (
+                "DeepSeek two-card run",
+                include_str!("bin/gate_deepseek41_twocard.rs"),
+                "bloomery_gpu_gates::tier::header_budget(&head)?",
+            ),
+            (
+                "budget admission fixture lookup",
+                include_str!("tier.rs")
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap(),
+                ".and_then(model::arch::registry::fixture_spec)",
+            ),
+            (
+                "fixture CLI lookup",
+                include_str!("../../model-hf/src/bin/fixture.rs"),
+                "arch.and_then(registry::fixture_spec)",
+            ),
+        ] {
+            assert!(source.contains(call), "{caller} does not call its owner");
+        }
     }
 
     /// A temp directory of this process for one test, empty.
@@ -1622,14 +1807,15 @@ mod tests {
     }
 
     /// A GGUF file at `path` whose header holds the fixture generator's version key and `seed`
-    /// (`gguf::write`'s `Writer`, no tensor).
-    fn write_fixture(path: &Path, seed: u64) {
+    /// and `extra` metadata (`gguf::write`'s `Writer`, no tensor).
+    fn write_fixture(path: &Path, seed: u64, extra: &[(String, gguf::Value)]) {
         use gguf::Value;
         use gguf::write::{Layout, Writer};
-        let kvs = vec![
+        let mut kvs = vec![
             (VERSION_KEY.to_string(), Value::U32(1)),
             ("bloomery.fixture.seed".to_string(), Value::U64(seed)),
         ];
+        kvs.extend_from_slice(extra);
         let layout =
             Layout::new(&kvs, Vec::new()).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let file =
@@ -1736,7 +1922,7 @@ mod tests {
     fn a_fixture_set_opens_or_fails_by_name() {
         let root = temp("set");
         let first = root.join("f-00001-of-00001.gguf");
-        write_fixture(&first, 1);
+        write_fixture(&first, 1, &[]);
         let first_text = first.display().to_string();
         FIXTURE_FILE
             .set(first_text.clone())
@@ -1747,7 +1933,7 @@ mod tests {
             .expect("a fixture line");
         let theirs = {
             let other = root.join("g-00001-of-00001.gguf");
-            write_fixture(&other, 2);
+            write_fixture(&other, 2, &[]);
             let l = refset::fixture::line(&other).expect("the other fixture's line");
             l.strip_prefix(refset::fixture::LINE_PREFIX)
                 .expect("a fixture line")

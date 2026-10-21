@@ -54,14 +54,7 @@ use std::process::ExitCode;
 use gguf::Split;
 use hf::fetch::Client;
 use hf::{Entry, RepoRef};
-use model::arch::deepseek41::fixture as v41;
-use model::arch::glm5next::fixture as glm5;
-use model::arch::nemotron_h::fixture as nemo;
-use model::arch::nemotron_h_moe::fixture as bolt;
-use model::arch::qwen35moe::fixture as qwen38;
-use model::arch::qwen35moe::fixture::qwen35moe as qwen36;
 use model::arch::registry::{self, DraftSource};
-use model::arch::solar2::fixture as solar;
 use model::fixture::{
     self, DEFAULT_SEED, FilePlan, FixtureError, FixtureSpec, Options, PlannedTensor, Sample,
     TensorStat, VARIANT_TABLE,
@@ -78,19 +71,6 @@ const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft
        fixture registry
 flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...
 flags of fetch: the same but --draft, and --rev R";
-
-/// Every family's spec, found by the architecture it declares: the canonical string of its registry
-/// row, which holds the hub source and the draft ([`registry::fixture_of`]). The generators stay here,
-/// so the registry the engine reads reaches none of them.
-const SPECS: [fn() -> FixtureSpec; 7] = [
-    v41::spec,
-    qwen38::spec,
-    qwen36::spec,
-    glm5::spec,
-    solar::spec,
-    nemo::spec,
-    bolt::spec,
-];
 
 /// The flags `plan` and `generate` take.
 const PLAN_FLAGS: [&str; 6] = [
@@ -262,15 +242,13 @@ fn open(path: &str) -> Res<Split> {
 /// declares.
 fn spec_of(split: &Split, path: &str) -> Res<FixtureSpec> {
     let arch = split.architecture();
-    SPECS
-        .iter()
-        .map(|spec| spec())
-        .find(|spec| Some(spec.arch) == arch)
-        .ok_or_else(|| {
-            let known: Vec<&str> = SPECS.iter().map(|spec| spec().arch).collect();
-            format!("{path}: architecture {arch:?} has no fixture spec (the specs: {known:?})")
-                .into()
-        })
+    arch.and_then(registry::fixture_spec).ok_or_else(|| {
+        let known: Vec<&str> = registry::FIXTURE_SPECS
+            .iter()
+            .map(|spec| spec().arch)
+            .collect();
+        format!("{path}: architecture {arch:?} has no fixture spec (the specs: {known:?})").into()
+    })
 }
 
 /// One file set's lines: per shard, per layer, and the parts' sum checked
@@ -746,7 +724,8 @@ mod tests {
 
     #[test]
     fn every_spec_has_one_source_row_and_v41s_draft_is_not_fetchable() {
-        for spec in SPECS.iter().map(|f| f()) {
+        for spec in registry::FIXTURE_SPECS.iter().map(|f| f()) {
+            assert_eq!(registry::fixture_spec(spec.arch).unwrap().arch, spec.arch);
             let row = registry::fixture_of(spec.arch)
                 .unwrap_or_else(|| panic!("{}: no fixture row", spec.arch));
             assert!(RepoRef::parse(&format!("{}:{}", row.repo, row.quant)).is_ok());
@@ -761,11 +740,13 @@ mod tests {
         }
         // One spec to one row: each spec found its row above, the counts agree, and no two specs
         // declare one architecture.
-        assert_eq!(registry::fixtures().count(), SPECS.len());
-        let archs: std::collections::HashSet<_> = SPECS.iter().map(|f| f().arch).collect();
+        assert!(registry::fixture_spec("no-such-fixture").is_none());
+        assert_eq!(registry::fixtures().count(), registry::FIXTURE_SPECS.len());
+        let archs: std::collections::HashSet<_> =
+            registry::FIXTURE_SPECS.iter().map(|f| f().arch).collect();
         assert_eq!(
             archs.len(),
-            SPECS.len(),
+            registry::FIXTURE_SPECS.len(),
             "two specs declare one architecture"
         );
         let find = |family: &str| {
@@ -801,7 +782,7 @@ mod tests {
 
         let root = PathBuf::from(refset::fixture::root().expect("the fixture root"));
         let (mut held, mut bad) = (Vec::new(), Vec::new());
-        for spec in SPECS.iter().map(|f| f()) {
+        for spec in registry::FIXTURE_SPECS.iter().map(|f| f()) {
             let row = registry::fixture_of(spec.arch).expect("a fixture row");
             let CardBudget::Planned(planner) = spec.card_budget else {
                 println!("{}: a fixed budget, nothing planned to check", row.family);

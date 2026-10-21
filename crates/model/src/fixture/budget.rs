@@ -144,7 +144,7 @@ pub fn check(planner: &Budget, split: &Split, budget: u64) -> Result<CardExperts
         .map(|(l, &n)| if eligible.contains(&l) { half } else { n })
         .collect();
     if got.per_layer != want {
-        return Err(FixtureError::Budget(format!(
+        return Err(FixtureError::BudgetMismatch(format!(
             "the plan under the budget {budget} holds {:?} experts per layer, not {want:?} \
              (half of the file's {} on each layer the budgetless plan fills)",
             got.per_layer, full.experts
@@ -203,4 +203,46 @@ pub fn choose(planner: &Budget, target: &FilePlan) -> Result<u64, FixtureError> 
     };
     check(planner, &headers.first, chosen)?;
     Ok(chosen)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::synthetic::header;
+
+    #[test]
+    fn a_budget_mismatch_is_distinct_from_a_planner_failure() {
+        let path = header("budget-counts", "test", &[], &[]);
+        let split = Split::open(&path).unwrap();
+        let planner = Budget {
+            ctx: 1,
+            card_experts: |_, cap| {
+                let n = match cap {
+                    None => 8,
+                    Some(0) => {
+                        return Err(FixtureError::Budget("no room for dense weights".into()));
+                    }
+                    Some(n) => n,
+                };
+                Ok(CardExperts {
+                    per_layer: vec![n, 0, n],
+                    experts: 8,
+                })
+            },
+        };
+        assert_eq!(check(&planner, &split, 4).unwrap().per_layer, [4, 0, 4]);
+        for budget in [3, 5] {
+            let error = check(&planner, &split, budget).unwrap_err();
+            assert!(matches!(error, FixtureError::BudgetMismatch(_)), "{error}");
+            assert!(error.to_string().contains("not [4, 0, 4]"), "{error}");
+        }
+        let error = check(&planner, &split, 0).unwrap_err();
+        assert!(matches!(error, FixtureError::Budget(_)), "{error}");
+        assert!(
+            error.to_string().contains("no room for dense weights"),
+            "{error}"
+        );
+        drop(split);
+        std::fs::remove_file(path).unwrap();
+    }
 }

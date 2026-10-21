@@ -1343,7 +1343,7 @@ fn hw_fixture_v41_budget() {
         ("64 MiB above", recorded + (64 << 20)),
     ] {
         match fixture::check_budget(&planner, &fx, budget) {
-            Err(e @ FixtureError::Budget(_)) => println!("v41 budget: {what}: {e}"),
+            Err(e @ FixtureError::BudgetMismatch(_)) => println!("v41 budget: {what}: {e}"),
             Err(e) => bad.push(format!("{what}: refused as {e}")),
             Ok(c) => bad.push(format!("{what}: holds {:?}", c.per_layer)),
         }
@@ -1357,7 +1357,7 @@ fn hw_fixture_v41_budget() {
     write_biases(&edited, &first2);
     let fx2 = Split::open(&first2).unwrap();
     match fixture::verify(&spec, &fx2, &src, None, &mut |_, _| {}) {
-        Err(e @ FixtureError::Budget(_)) if e.to_string().contains("plan under the budget") => {
+        Err(e @ FixtureError::BudgetMismatch(_)) => {
             println!(
                 "v41 budget: verify of a header recording {}: {e}",
                 recorded - (64 << 20)
@@ -1367,7 +1367,9 @@ fn hw_fixture_v41_budget() {
     }
     // The control: the recorded header passes that check and meets its holes.
     match fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}) {
-        Err(FixtureError::Budget(m)) => bad.push(format!("verify of the recorded budget: {m}")),
+        Err(FixtureError::Budget(m) | FixtureError::BudgetMismatch(m)) => {
+            bad.push(format!("verify of the recorded budget: {m}"));
+        }
         Err(e) => println!("v41 budget: control, the recorded header passes the budget check: {e}"),
         Ok(_) => bad.push("a file of holes verified".into()),
     }
@@ -2583,7 +2585,7 @@ fn budget_round_trip(
         ("1 GiB above", recorded + (1 << 30)),
     ] {
         match fixture::check_budget(&planner, fx, budget) {
-            Err(e @ FixtureError::Budget(_)) => println!("{tag} budget: {what}: {e}"),
+            Err(e @ FixtureError::BudgetMismatch(_)) => println!("{tag} budget: {what}: {e}"),
             Err(e) => bad.push(format!("{what}: refused as {e}")),
             Ok(c) => bad.push(format!("{what}: holds {:?}", c.per_layer)),
         }
@@ -2598,7 +2600,7 @@ fn budget_round_trip(
         &p.target,
         |kvs| *kv(kvs, KEY_CARD_BUDGET) = Value::U64(edited),
     ) {
-        Err(e @ FixtureError::Budget(_)) if e.to_string().contains("plan under the budget") => {
+        Err(e @ FixtureError::BudgetMismatch(_)) => {
             println!("{tag} budget: verify of a header recording {edited}: {e}");
         }
         other => bad.push(format!("verify of an edited budget: {other:?}")),
@@ -2611,7 +2613,9 @@ fn budget_round_trip(
         &p.target,
         |_| {},
     ) {
-        Err(FixtureError::Budget(m)) => bad.push(format!("verify of the recorded budget: {m}")),
+        Err(FixtureError::Budget(m) | FixtureError::BudgetMismatch(m)) => {
+            bad.push(format!("verify of the recorded budget: {m}"));
+        }
         Err(e) => {
             println!("{tag} budget: control, the recorded header passes the budget check: {e}")
         }
@@ -3271,7 +3275,7 @@ fn hw_fixture_glm_budget() {
         ("64 MiB above", recorded + (64 << 20)),
     ] {
         match fixture::check_budget(&planner, &fx, budget) {
-            Err(e @ FixtureError::Budget(_)) => println!("glm budget: {what}: {e}"),
+            Err(e @ FixtureError::BudgetMismatch(_)) => println!("glm budget: {what}: {e}"),
             Err(e) => bad.push(format!("{what}: refused as {e}")),
             Ok(c) => bad.push(format!("{what}: holds {:?}", c.per_layer)),
         }
@@ -3283,7 +3287,7 @@ fn hw_fixture_glm_budget() {
     let g2 = dir("glmbudget-edited");
     let fx2 = Split::open(header_only(&edited, &g2.0)).unwrap();
     match fixture::verify(&spec, &fx2, &src, None, &mut |_, _| {}) {
-        Err(e @ FixtureError::Budget(_)) if e.to_string().contains("plan under the budget") => {
+        Err(e @ FixtureError::BudgetMismatch(_)) => {
             println!(
                 "glm budget: verify of a header recording {}: {e}",
                 recorded - (64 << 20)
@@ -3293,7 +3297,9 @@ fn hw_fixture_glm_budget() {
     }
     // The control: the recorded header passes that check and meets its holes.
     match fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}) {
-        Err(FixtureError::Budget(m)) => bad.push(format!("verify of the recorded budget: {m}")),
+        Err(FixtureError::Budget(m) | FixtureError::BudgetMismatch(m)) => {
+            bad.push(format!("verify of the recorded budget: {m}"));
+        }
         Err(e) => println!("glm budget: control, the recorded header passes the budget check: {e}"),
         Ok(_) => bad.push("a file of holes verified".into()),
     }

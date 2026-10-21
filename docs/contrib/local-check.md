@@ -289,9 +289,10 @@ A fixture-tier gate reads two inputs: the family's fixture and the `fx_` referen
 
 Run `BLOOMERY_BOX_LOCAL=1 just gate-fixture-budget` after updating the planner. It re-plans the fixtures under their
 recorded `bloomery.fixture.card_budget` and requires half the routed experts on every card-eligible layer. A planner
-that counts a new allocation can leave an older fixture one expert short without changing its tensor data. For example,
-the Qwen stage rope table is now counted in the card plan; a qwen38 fixture made before that accounting change can fail
-this check and the qwen4exp e2e and MTP gates.
+whose allocation sizes change can leave an older fixture with too many or too few card experts without changing its
+tensor data. Gates that read this budget re-plan it before using it and refuse a stale fixture by file name, recorded
+budget and current per-layer expert counts. The error points to this regeneration procedure. A fixture variant keeps
+its base fixture's budget and is not re-planned, since requantization can change its card-eligible layers.
 
 Regenerate the affected family with the current checkout's `fixture fetch` command from step 2. Use a new output
 directory, since `fetch` refuses an existing one, and keep the old fixture until the replacement passes. For qwen38:
@@ -307,6 +308,9 @@ by hand or relax the expert-count check. A changed budget alone does not require
 identity excludes the budget, and the fixture's tensor generation is unchanged. A changed seed, source header or
 fixture spec still needs matching reference sets. After checking the replacement, put it at the original
 `/models/fixtures/qwen38` path before running the card gates, so their sets' model paths still match step 1.
+
+After replacing the base fixture, regenerate each of its variants with `just fixture-requant FAMILY TAG` so it
+inherits the new budget. Move the old variant directory aside first; `fixture-requant` refuses an existing directory.
 
 ## 5. Timing on your own card
 

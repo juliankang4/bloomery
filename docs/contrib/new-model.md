@@ -44,7 +44,7 @@ dumps, real-file gates, timed runs).
 | 1 | GGUF arch reading | `crates/model/src/arch/<arch>/{hparams,names,roles,spec,place}.rs`; arms in `arch/mod.rs` (`spec`), `crates/models/src/lib.rs` (`Arch`), `crates/placement/src/accepts.rs` (`program_of`, re-exported from `coverage`) | L; header meta test needs the real file's headers |
 | 2 | Tokenizer, chat template | `crates/tokenizer/src/pretok.rs:350`, `ChatSpec` `crates/models/src/lib.rs:589`, `chat_of` `arch/mod.rs:256`, tool parsers `crates/serve/src/{glmxml,qwenxml,dsml,hermes}.rs` | A for the code; the id oracle is B |
 | 3 | Refset family and its dump | `crates/refset/src/arch/<arch>/mod.rs` and the table `arch/mod.rs:17-28`; `tools/ref/models/<arch>.sh`, `tools/ref/build-ik-<arch>.sh`, `justfile:667` (`dump-ref-mimo2`) | A for the row's tests; the dump is B |
-| 4 | Fixture row | `crates/model/src/arch/<arch>/fixture.rs`, `crates/model-hf/src/bin/fixture.rs:44`, `crates/refset/src/fixture.rs:33`, `tools/ref/ref-paths.sh:73-79` | generate L; its `fx_` oracle sets B |
+| 4 | Fixture row | `crates/model/src/arch/<arch>/fixture.rs`, `FIXTURE_SPECS` and each row's `FixtureRow` in `crates/model/src/arch/registry.rs`, `crates/refset/src/fixture.rs:33`, `tools/ref/ref-paths.sh:73-79` | generate L; its `fx_` oracle sets B |
 | 5 | Card body | `crates/gpu-<arch>/` (or `crates/gpu/src/arch/...` for a variant); root `Cargo.toml:3`, `crates/gpu-gates/Cargo.toml` | G to build and run |
 | 6 | App session | `crates/app/src/arch/<arch>/mod.rs`, feature in `crates/app/Cargo.toml` | G (feature-gated); L for default-feature tests |
 | 7 | Serve seat | `crates/gpu-gates/src/bin/shared/serve_seats/<seat>.rs`, `serve_seats/mod.rs`, `bloomery_serve.rs:206-226` | G, then B for the seat gates |
@@ -114,8 +114,8 @@ A fixture is a small file with the real file's header, every per-layer shape and
 weight set fits in host memory (`crates/model/src/fixture/mod.rs:1-30`); the bytes are a function of the seed and the
 source header alone (`:29`), and only headers are hashed (`plan.rs:224`). Three families have one
 (`refset/src/fixture.rs:33-37`); MiMo does not, so its end-to-end gate is a weekly that the fixture tier refuses by
-name (`justfile:2016`). To add one: a `FixtureSpec` in `arch/<arch>/fixture.rs`, a line in `SPECS`
-(`bin/fixture.rs:44`), the registry row's fixture source (`arch/registry.rs`) and a row of `tools/fixture-dirs.tsv` (the one table of the
+name (`justfile:2016`). To add one: a `FixtureSpec` in `arch/<arch>/fixture.rs`, a line in `FIXTURE_SPECS`
+and the row's fixture source (both `arch/registry.rs`), and a row of `tools/fixture-dirs.tsv` (the one table of the
 fixture directories: refset, `ref-paths.sh` and the tools read that file, and the registry's test holds each row's `family` to it), then `just dump-ref-fixture` (`justfile:609`) for the `fx_` sets, which needs ik: B.
 `fixture fetch <family> <out>` (`bin/fixture.rs`, the fixture rows of `arch/registry.rs`) regenerates a fixture from the
 source's GGUF headers alone, read by HTTP Range: the output is byte-identical to the box's fixtures for V4.1, Qwen3.8
