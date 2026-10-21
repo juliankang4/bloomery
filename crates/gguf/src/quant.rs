@@ -486,6 +486,23 @@ pub fn f32_to_f16_bits(x: f32) -> u16 {
     sign | h as u16
 }
 
+/// Converts fp32 to bf16 bits with round to nearest even.
+#[inline]
+pub fn fp32_to_bf16_bits(s: f32) -> u16 {
+    let u = s.to_bits();
+    if (u & 0x7fff_ffff) > 0x7f80_0000 {
+        ((u >> 16) | 64) as u16
+    } else {
+        (u.wrapping_add(0x7fff + ((u >> 16) & 1)) >> 16) as u16
+    }
+}
+
+/// Converts bf16 bits to f32.
+#[inline]
+pub fn bf16_bits_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
 // ------------------------------------------------------------ legacy quants
 
 /// Port of `dequantize_row_q5_0` (ggml-quants.c:1628). Block geometry
@@ -837,7 +854,7 @@ fn dequant_q2_0(src: &[u8], dst: &mut [f32]) {
 /// ggml.c:457 is the same shift), so the conversion is exact.
 fn dequant_bf16(src: &[u8], dst: &mut [f32]) {
     for (o, c) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
-        *o = f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16);
+        *o = bf16_bits_to_f32(u16::from_le_bytes(*c));
     }
 }
 
@@ -1546,10 +1563,9 @@ pub fn quantize_row_q8_k_roundtrip(x: &[f32], out: &mut [f32]) {
         let iscale = -127.0f32 / max;
         let d = 1.0f32 / iscale;
         for (o, &v) in ob.iter_mut().zip(xb) {
-            // ggml's nearest_int, then the same clamp at +127 (and only at +127: the
-            // negative side reaches -127 exactly by construction of iscale).
-            let q = (iscale * v).round_ties_even().min(127.0);
-            *o = d * q;
+            // Clamped at +127 only: the negative side reaches -127 exactly by construction
+            // of iscale.
+            *o = d * f32::from(nearest_int(iscale * v).min(127) as i8);
         }
     }
 }
@@ -1580,7 +1596,8 @@ pub fn quantize_row_q8_k_roundtrip(x: &[f32], out: &mut [f32]) {
 ///     from the signed extreme;
 ///   * `d` is converted to bf16 **and read back** before it is used to code, so the codes
 ///     are computed against the stored scale, not the exact one;
-///   * rounding is round-half-to-even.
+///   * rounding is round-half-to-even, the codes saturated to i8, with [`q82_inverse`]'s
+///     multiplier.
 pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len(), "q8_2 round-trip needs matching lengths");
     assert!(x.len().is_multiple_of(32), "q8_2 blocks are 32 values");
@@ -1591,15 +1608,10 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
         .zip(out.as_chunks_mut::<32>().0)
     {
         let amax = activation_max(xb, "quantize_row_q8_2_x4_roundtrip").abs();
-        // ggml_compute_fp32_to_bf16 (ggml-impl.h:106), then straight back: bf16 -> f32 is
-        // the bits in the high half. NaN cannot occur here (amax is finite and non-negative).
-        let d_exact = amax / 127.0f32;
-        let bits = d_exact.to_bits();
-        let bf16 = ((bits + (0x7fff + ((bits >> 16) & 1))) >> 16) as u16;
-        let d = f32::from_bits((bf16 as u32) << 16);
-        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let t = fp32_to_bf16_bits(amax / 127.0);
+        let (d, id) = (bf16_bits_to_f32(t), q82_inverse(t));
         for (o, &v) in ob.iter_mut().zip(xb) {
-            *o = d * (v * id).round_ties_even();
+            *o = d * f32::from(nearest_int(v * id).clamp(-128, 127) as i8);
         }
     }
 }
@@ -1610,7 +1622,7 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 /// even, and each code `round_half_even(v * id)` with `id = 127 / amax`. That is not
 /// `quantize_row_q8_0_ref`'s rule, which codes with `1 / d` of the f32 `d = amax / 127`, before
 /// its f16 rounding, and `roundf`. A block whose multiplier overflows (amax below about 2^-121)
-/// restores to zero, as qdot's encoder flushes it.
+/// restores to zero ([`q80_inverse`]).
 pub fn quantize_row_q8_0_roundtrip(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len(), "q8_0 round-trip needs matching lengths");
     assert!(x.len().is_multiple_of(32), "q8_0 blocks are 32 values");
@@ -1693,7 +1705,13 @@ pub struct Q8Block {
     pub q: [i8; 32],
 }
 
-/// ggml's f32 mantissa trick for rounding quantized codes to nearest even.
+/// ggml's `nearest_int` (ggml-quants.c:1726): round-to-nearest via the
+/// 2^23 + 2^22 f32 mantissa trick. Identical to `round_ties_even` on the
+/// |v| <= 127 domain the activation codes live in. Every activation encoder
+/// rounds through this, the f32 round trips included: without SSE4.1 in the
+/// baseline target `round_ties_even` is a libm `rintf` call per element. An
+/// infinite or NaN product extracts to -2^22 or 0, whose low byte is 0, so an
+/// overflowing Q8_K scale gives zero `as i8` codes, as ggml's do.
 #[inline]
 pub fn nearest_int(fval: f32) -> i32 {
     let val = fval + 12582912.0;
@@ -1701,15 +1719,45 @@ pub fn nearest_int(fval: f32) -> i32 {
     ((i & 0x007f_ffff) as i32) - 0x0040_0000
 }
 
-/// Quantize one 32-value block by ggml's x86 Q8_0 rule, not its weight-file reference rule.
+/// The q8_2 block's code multiplier from its bf16 scale bits: `1/d`, and 0
+/// where `d` is 0 or `1/d` overflows (a block whose scale is at or below
+/// about 2^-128 flushes to zero codes and a zero sum). Codes are `nearest_int(v
+/// * id)` saturated to i8, the sum over the unsaturated ints, which is ik's
+/// x86 rule (`_mm256_cvtps_epi32` then the saturating packs): with a normal
+/// `d` the bf16 round-down is at most 2^-8 relative and every code stays in
+/// ±127, but a subnormal `d` keeps fewer bits and `v * id` reaches 128,
+/// saturated to 127, not wrapped to -128 (`hw_q82_codes_at_bf16_round_down`).
+#[inline(always)]
+pub fn q82_inverse(t: u16) -> f32 {
+    let d = bf16_bits_to_f32(t);
+    let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+    if id.is_finite() { id } else { 0.0 }
+}
+
+/// The q8_0 block's code multiplier from its max |value| `amax`: `127 / amax`,
+/// 0 for a zero block, as mainline's x86 `quantize_row_q8_0` (llama.cpp
+/// `f2cc7282c` ggml-cpu/arch/x86/quants.c:333) computes it, from `amax` and
+/// not from the stored f16 scale. 0 too where `127 / amax` overflows (amax
+/// below about 2^-121), where mainline's codes are the integer-indefinite
+/// -128 and ours 0. No dot tells them apart: that block's f16 `d` is exactly
+/// +0, so `fma(d, s, sumi)` adds a signed zero to `sumi`, whatever `s` is, and
+/// `sumi` is never -0 (it starts at +0, and no step rounds to -0), so it keeps
+/// its value.
+#[inline(always)]
+pub fn q80_inverse(amax: f32) -> f32 {
+    let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+    if id.is_finite() { id } else { 0.0 }
+}
+
+/// Quantize one 32-value block by ggml's x86 Q8_0 rule, not its weight-file reference rule:
+/// `d = f16(amax / 127)`, codes `nearest_int(v * id)` with [`q80_inverse`]'s `id`.
 /// Non-finite input is refused by name before a scale or code is written.
 #[inline]
 #[must_use]
 pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
     assert_eq!(x.len(), 32, "quantize_q8_0: one 32-value block at a time");
     let amax = activation_max(x, "quantize_q8_0").abs();
-    let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-    let id = if id.is_finite() { id } else { 0.0 };
+    let id = q80_inverse(amax);
     let mut q = [0i8; 32];
     for (q, &v) in q.iter_mut().zip(x) {
         *q = nearest_int(v * id).clamp(-128, 127) as i8;
@@ -1824,6 +1872,24 @@ mod tests {
         for x in [[0.0; 32], [f32::from_bits(1); 32]] {
             assert_eq!(super::quantize_q8_0(&x).to_bytes(), [0; 34]);
         }
+        // A multiplier that overflows restores to zero in every format.
+        for (weight, n) in [
+            (GgmlType::Q2_0, 32),
+            (GgmlType::Q3_K, 256),
+            (GgmlType::Q4_K, 128),
+        ] {
+            let x: Vec<f32> = (0..n)
+                .map(|i| if i % 2 == 0 { 1e-38 } else { -1e-38 })
+                .collect();
+            let mut out = vec![1.0; n];
+            super::quantize_activations(weight, &x, &mut out).unwrap();
+            assert!(out.iter().all(|&v| v == 0.0), "{weight:?}: {out:?}");
+        }
+        // amax / 127 = 0x00407f00 rounds down to the bf16 scale 2^-127, so amax * id is 127.98:
+        // the code saturates at 127 as the q8_2 encoders' does.
+        let mut out = [0.0; 32];
+        super::quantize_row_q8_2_x4_roundtrip(&[f32::from_bits(0x037f_f808); 32], &mut out);
+        assert_eq!(out, [127.0 * f32::from_bits(0x0040_0000); 32]);
     }
 
     use super::{

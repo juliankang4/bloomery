@@ -68,7 +68,8 @@ use gguf::iq_tables::{
     IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
 use gguf::quant::{
-    KVALUES_MXFP4, e8m0_to_f32_half, f32_to_f16_bits, half_to_f32, non_finite_activation,
+    KVALUES_MXFP4, bf16_bits_to_f32, e8m0_to_f32_half, f32_to_f16_bits, fp32_to_bf16_bits,
+    half_to_f32, non_finite_activation, q80_inverse, q82_inverse,
 };
 
 pub mod generic;
@@ -1434,13 +1435,6 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
 
 // ----------------------------------------------------------- q8_K encode
 
-/// ggml's `nearest_int` (ggml-quants.c:1726): round-to-nearest via the
-/// 2^23 + 2^22 f32 mantissa trick. Identical to `round_ties_even` on the
-/// |v| <= 127 domain `iscale * x` lives in, which is what lets gate 1
-/// compare restored values bit for bit against
-/// `quantize_row_q8_k_roundtrip` (which rounds with `round_ties_even`).
-/// Every activation encoder rounds through this: without SSE4.1 in the
-/// baseline target `round_ties_even` is a libm `rintf` call per element.
 pub use gguf::quant::nearest_int;
 
 /// Quantizes one 256-value block into 296-byte `block_q8_K` layout. Refuses a
@@ -3538,38 +3532,6 @@ fn make_q4_scales(scales12: &[u8]) -> [u32; 4] {
     ]
 }
 
-/// Converts fp32 to bf16 bits with round to nearest even.
-#[inline]
-fn fp32_to_bf16_bits(s: f32) -> u16 {
-    let u = s.to_bits();
-    if (u & 0x7fff_ffff) > 0x7f80_0000 {
-        ((u >> 16) | 64) as u16
-    } else {
-        (u.wrapping_add(0x7fff + ((u >> 16) & 1)) >> 16) as u16
-    }
-}
-
-/// Converts bf16 bits to f32.
-#[inline]
-fn bf16_bits_to_f32(h: u16) -> f32 {
-    f32::from_bits((h as u32) << 16)
-}
-
-/// The q8_2 block's code multiplier from its bf16 scale bits: `1/d`, and 0
-/// where `d` is 0 or `1/d` overflows (a block whose scale is at or below
-/// about 2^-128 flushes to zero codes and a zero sum). Codes are `nearest_int(v
-/// * id)` saturated to i8, the sum over the unsaturated ints, which is ik's
-/// x86 rule (`_mm256_cvtps_epi32` then the saturating packs): with a normal
-/// `d` the bf16 round-down is at most 2^-8 relative and every code stays in
-/// ±127, but a subnormal `d` keeps fewer bits and `v * id` reaches 128 —
-/// saturated to 127, not wrapped to -128 (`hw_q82_codes_at_bf16_round_down`).
-#[inline(always)]
-fn q82_inverse(t: u16) -> f32 {
-    let d = bf16_bits_to_f32(t);
-    let id = if d > 0.0 { 1.0 / d } else { 0.0 };
-    if id.is_finite() { id } else { 0.0 }
-}
-
 /// Quantizes activations into Q8_2_X4 column layout.
 ///
 /// Leftover blocks past 128-multiples are stored as standard 36-byte block_q8_2.
@@ -3728,21 +3690,6 @@ unsafe fn quantize_q82x4_col_avx2(x: &[f32], out: &mut [u8]) {
             tb[4..36].copy_from_slice(&codes);
         }
     }
-}
-
-/// The q8_0 block's code multiplier from its max |value| `amax`: `127 / amax`,
-/// 0 for a zero block, as mainline's x86 `quantize_row_q8_0` (llama.cpp
-/// `f2cc7282c` ggml-cpu/arch/x86/quants.c:333) computes it, from `amax` and
-/// not from the stored f16 scale. 0 too where `127 / amax` overflows (amax
-/// below about 2^-121), where mainline's codes are the integer-indefinite
-/// -128 and ours 0. No dot tells them apart: that block's f16 `d` is exactly
-/// +0, so `fma(d, s, sumi)` adds a signed zero to `sumi`, whatever `s` is, and
-/// `sumi` is never -0 (it starts at +0, and no step rounds to -0), so it keeps
-/// its value.
-#[inline(always)]
-fn q80_inverse(amax: f32) -> f32 {
-    let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-    if id.is_finite() { id } else { 0.0 }
 }
 
 /// Quantizes activations into `block_q8_0` blocks (34 bytes / 32 values: f16

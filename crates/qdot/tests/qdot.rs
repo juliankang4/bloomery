@@ -3009,6 +3009,8 @@ fn q2_0_column_matches_mainline() {
     let mut rt = vec![0.0f32; 256];
     quantize_row_q8_0_roundtrip(&x, &mut rt);
     for (b, blk) in col.as_chunks::<34>().0.iter().enumerate() {
+        let scale_bits = u16::from_le_bytes([blk[0], blk[1]]);
+        assert_eq!(q8f0_block(|i| blk[2 + i] as i8, scale_bits), *blk);
         let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         for (j, &q) in blk[2..].iter().enumerate() {
             let v = d * f32::from(q as i8);
@@ -5135,12 +5137,11 @@ fn q5f1_block(u: impl Fn(usize) -> u8, d: u16, m: u16) -> [u8; 24] {
 
 /// A synthetic Q8_0 block: code `i` is `q(i)`, the f16 bits `d`.
 fn q8f0_block(q: impl Fn(usize) -> i8, d: u16) -> [u8; 34] {
-    let mut b = [0u8; 34];
-    b[0..2].copy_from_slice(&d.to_le_bytes());
-    for (i, c) in b[2..].iter_mut().enumerate() {
-        *c = q(i) as u8;
+    qdot::Q8Block {
+        d,
+        q: std::array::from_fn(q),
     }
-    b
+    .to_bytes()
 }
 
 /// The ends a Q5_1 tile clause's adversarial rows are built from, as (codes,

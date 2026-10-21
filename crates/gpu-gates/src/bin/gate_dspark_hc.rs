@@ -254,8 +254,7 @@ mod gate {
 
     /// `x` rounded to the nearest bf16, ties to even (finite `x`).
     fn bf16_round(x: f32) -> f32 {
-        let b = x.to_bits();
-        f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        gguf::quant::bf16_bits_to_f32(gguf::quant::fp32_to_bf16_bits(x))
     }
 
     /// The first maximum (lowest index on a tie), `ggml_argmax`'s rule.
@@ -785,6 +784,10 @@ mod gate {
         let (q, d) = q8_0_rows(&[127.0; 32]);
         assert_eq!(q, [0x7f7f7f7f; 8]);
         assert_eq!(d, [0x3c00]);
+        let x: [f32; 32] = std::array::from_fn(|i| [100.0, -100.0, 0.0, 50.0][i % 4]);
+        let (q, d) = q8_0_rows(&x);
+        assert_eq!(q, [0x4000_817f; 8]);
+        assert_eq!(d, [0x3a4d]);
     }
 
     /// The largest probability of a row of logits by `argmax_p_rows_fault`'s

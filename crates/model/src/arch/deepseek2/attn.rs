@@ -485,27 +485,19 @@ impl MlaParams {
 
 // `Q8Block` lives in `gguf::quant` with the other GGUF block formats; re-exported so `Derived`'s storage, the gates' `assert_eq!` and the size assertion (`tests/derived.rs`) keep compiling; field-wise equality is equality of every byte.
 pub use gguf::quant::Q8Block;
-// The one Q8_0 quantizer lives at the crate's shared level (`crate::quant`),
-// where the qwen3 family's cache seed reads it too; re-exported so this
+// The one Q8_0 quantizer lives in `gguf::quant` beside `Q8Block`; re-exported so this
 // module's own readers keep their path.
-pub use crate::quant::quantize_q8_0;
+pub use gguf::quant::quantize_q8_0;
 
 // `ActBlock` lives in qdot with the cell kernel; the quantizer below still owns its conventions — the scale as **bf16**, int8 codes.
 use qdot::ActBlock;
 
-/// `ggml_compute_fp32_to_bf16` (ggml-impl.h:106): round-to-nearest-even via the carry trick. NaN cannot reach the gated graph.
-fn bf16_round(x: f32) -> f32 {
-    let mut b = x.to_bits();
-    b += 0x7fff + ((b >> 16) & 1);
-    f32::from_bits(b & 0xffff_0000)
-}
-
 /// The activation quantizer the reference actually runs for this mul_mat —
 /// `quantize_row_q8_1_x4_T<block_q8_2, …>` (iqk_quantize.cpp:1074+), NOT
 /// `quantize_row_q8_0`: at M ≤ 7 rows `iqk_mul_mat_4d` quantizes the F32 activation
-/// itself, with the scale `amax/127` rounded to bf16 and the codes `id = 1/d` on that
-/// rounded scale, RNE. Each difference alone moves gated values by up to 2⁻⁹ relative —
-/// far outside the 1e-4 gate.
+/// itself, with the scale `amax/127` rounded to bf16 and the codes on that rounded
+/// scale's multiplier ([`gguf::quant::q82_inverse`]), RNE. Each difference alone moves
+/// gated values by up to 2⁻⁹ relative — far outside the 1e-4 gate.
 ///
 /// Codes clamp to ±127, ENFORCED, not defensive: a -128 activation code under a
 /// negative weight code is the one input pair outside the sign-fold kernel's
@@ -515,11 +507,14 @@ fn bf16_round(x: f32) -> f32 {
 /// -128: a WEIGHT code of -128 is legal.
 fn quantize_act(x: &[f32]) -> ActBlock {
     let amax = gguf::quant::activation_max(x, "quantize_act").abs();
-    let d = bf16_round(amax / 127.0);
-    let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+    let t = gguf::quant::fp32_to_bf16_bits(amax / 127.0);
+    let (d, id) = (
+        gguf::quant::bf16_bits_to_f32(t),
+        gguf::quant::q82_inverse(t),
+    );
     let mut q = [0i8; 32];
     for (j, &v) in x.iter().enumerate() {
-        q[j] = qdot::nearest_int(v * id).clamp(-127, 127) as i8;
+        q[j] = gguf::quant::nearest_int(v * id).clamp(-127, 127) as i8;
     }
     ActBlock { d, q }
 }
@@ -3174,6 +3169,9 @@ mod tests {
         let block = super::quantize_act(&[0.0; 32]);
         assert_eq!(block.d, 0.0);
         assert_eq!(block.q, [0; 32]);
+        // A bf16 scale whose inverse overflows gives zero codes, not saturated ones.
+        let tiny: [f32; 32] = std::array::from_fn(|i| if i % 2 == 0 { 1e-38 } else { -1e-38 });
+        assert_eq!(super::quantize_act(&tiny).q, [0; 32]);
     }
 
     fn assert_isa() {

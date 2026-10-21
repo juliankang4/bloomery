@@ -1,9 +1,8 @@
 # mutant: nearest_int biases its mantissa extraction one ulp low; expected killer: gate-qdot (also gate-quant)
-diff --git a/crates/qdot/src/lib.rs b/crates/qdot/src/lib.rs
-index 303c8ccc5..88f753488 100644
---- a/crates/qdot/src/lib.rs
-+++ b/crates/qdot/src/lib.rs
-@@ -1443,7 +1443,7 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
+diff --git a/crates/gguf/src/quant.rs b/crates/gguf/src/quant.rs
+--- a/crates/gguf/src/quant.rs
++++ b/crates/gguf/src/quant.rs
+@@ -1716,7 +1716,7 @@
  pub fn nearest_int(fval: f32) -> i32 {
      let val = fval + 12582912.0;
      let i = f32::to_bits(val);
@@ -11,4 +10,4 @@ index 303c8ccc5..88f753488 100644
 +    ((i & 0x007f_ffff) as i32) - 0x0040_0001
  }
  
- /// A NaN or an infinity in an activation block is undefined input: every
+ /// The q8_2 block's code multiplier from its bf16 scale bits: `1/d`, and 0

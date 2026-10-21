@@ -216,17 +216,14 @@ fn report(ty: &str, k: usize, rows: usize, m: usize, rel: f32, bit_same: bool, b
 #[cfg(feature = "gpu")]
 fn quant_q8_0_row(x: &[f32], qs: &mut Vec<u32>, d: &mut Vec<u16>, deq: &mut Vec<f32>) {
     assert!(x.len().is_multiple_of(32), "Q8_0 row needs whole blocks");
-    for blk in x.as_chunks::<32>().0 {
-        let block = gguf::quant::quantize_q8_0(blk);
-        let scale = gguf::quant::half_to_f32(block.d);
-        let mut word = [0u32; 8];
-        for (j, &q) in block.q.iter().enumerate() {
-            word[j / 4] |= u32::from(q as u8) << (8 * (j % 4));
-            deq.push(f32::from(q) * scale);
-        }
-        qs.extend_from_slice(&word);
-        d.push(block.d);
-    }
+    let blocks: Vec<_> = x.chunks(32).map(gguf::quant::quantize_q8_0).collect();
+    let (words, scales) = bloomery_gpu::weights::q8_0_planes(&blocks);
+    qs.extend(words);
+    d.extend(scales);
+    deq.extend(blocks.iter().flat_map(|b| {
+        let scale = gguf::quant::half_to_f32(b.d);
+        b.q.map(move |q| f32::from(q) * scale)
+    }));
 }
 
 #[cfg(all(test, feature = "gpu"))]
@@ -267,6 +264,11 @@ mod tests {
         assert_eq!(q, [0x7f7f7f7f; 8]);
         assert_eq!(d, [0x3c00]);
         assert_eq!(deq, [127.0; 32]);
+        let x: [f32; 32] = std::array::from_fn(|i| [100.0, -100.0, 0.0, 50.0][i % 4]);
+        super::quant_q8_0_row(&x, &mut q, &mut d, &mut deq);
+        assert_eq!(&q[8..], &[0x4000_817f; 8]);
+        assert_eq!(d, [0x3c00, 0x3a4d]);
+        assert_eq!(&deq[32..36], &[100.0249, -100.0249, 0.0, 50.40625]);
     }
 }
 
