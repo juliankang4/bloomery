@@ -39,7 +39,7 @@ pub use registry::{
     PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE,
     SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES, WARM_PROFILE,
 };
-pub use registry::{SCHEMAJUMP, SPLIT_WALK, XSTREAM};
+pub use registry::{PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 
 #[cfg(test)]
 mod tests;
@@ -1183,6 +1183,13 @@ impl Levers {
         self.flag(SCHEMAJUMP)
     }
 
+    /// `BLOOMERY_PREPARE_Q8`: `prepare` writes the BF16 or F32 matrices its map
+    /// reads as Q8_0 in Q8_0, not as stored.
+    #[must_use]
+    pub fn prepare_q8(&self) -> bool {
+        self.flag(PREPARE_Q8)
+    }
+
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],
     /// [`CARD_DONTNEED`], [`R8`], and whether [`ROUTE_TRACE`] is set.
     #[must_use]
@@ -2025,7 +2032,7 @@ pub enum Draft38Off {
     /// Unset, and the last window needs `need` positions of `ctx`.
     Ctx { need: usize, ctx: usize },
     /// Unset on the Qwen3.8 seat, and the target's `name`, a matrix the
-    /// draft borrows, is `ty` (or `absent`), not the Q8_0 the draft reads.
+    /// draft borrows, is `ty` (or `absent`), not a form the draft reads.
     Borrowed { name: String, ty: String },
     /// Unset, and the draft yielded to the context
     /// ([`RungCost::of`]'s answer, the seats' plan-side rule).
@@ -2072,7 +2079,7 @@ impl fmt::Display for Draft38Off {
             ),
             Draft38Off::Borrowed { name, ty } => write!(
                 f,
-                "unset: the target's {name} is {ty}; the MTP draft reads it as Q8_0"
+                "unset: the target's {name} is {ty}, not a form the MTP draft reads"
             ),
             Draft38Off::Yield(y) => y.fmt(f),
             Draft38Off::Paged { arena } => write!(

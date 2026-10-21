@@ -8,11 +8,16 @@
 //!
 //! writes `<out prefix>-00001-of-0000N.gguf` and on, each shard at most `n` GiB (48 by default)
 //! unless one tensor with its scale and file layout is larger, the metadata in the first.
-//! `--keep-bf16` writes a BF16 matrix the map would make Q8_0 as it is stored, the head and the
-//! token embedding among them; the server reads each through its BF16 site. Qwen3.8's decode then
-//! reads about 9.27 GiB of weights a token where the Q8_0 split reads 5.73, the head alone 0.55
-//! GiB more (1,271,398,400 bytes of BF16 against 34 bytes a 32 values). Each shard is
-//! written as `<name>.part` and renamed when whole. The disk must hold the split and a tenth
+//! A quantized tensor keeps its stored format (NVFP4, MXFP8, FP8), and a BF16 matrix stays BF16,
+//! the head and the token embedding among them; the server reads each through its BF16 site.
+//! BF16 and F32 expert stacks are refused by name. An F32 matrix the map reads as Q8_0 is
+//! refused unless `BLOOMERY_PREPARE_Q8=1` writes each single BF16 or F32 matrix read as Q8_0 as
+//! ggml's reference Q8_0 instead, a lossy rewrite whose cost its lever row states; `--keep-bf16`
+//! asks for the stored form and is refused beside it. Qwen3.8's decode reads about 9.27 GiB
+//! of weights a token from the stored split where the Q8_0 one reads 5.73, the head alone
+//! 0.55 GiB more
+//! (1,271,398,400 bytes of BF16 against 34 bytes a 32 values). Each shard is written as
+//! `<name>.part` and renamed when whole. The disk must hold the split and a tenth
 //! more. The written split is opened and its hyperparameters read as the server reads them.
 //! One line per tensor, a summary line, and exit status 1 with the error on any failure. Before
 //! any shard is written, the tokenizer serving builds from the header is checked to split text
@@ -25,10 +30,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use bloomery_levers::PREPARE_Q8;
 use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GgmlType, Value};
 use hf::modelopt::{self, Normal, Plain, Use};
-use hf::quant_config::{self, Config, Format};
+use hf::quant_config::{self, Config, Format, Plan};
 use model_hf::arch::qwen35moe::{Checkpoint, Mapped};
 use safetensors::{Dtype, Folder};
 
@@ -37,8 +43,13 @@ const USAGE: &str = "usage: prepare <folder> <out prefix> [--shard-gib <n>] [--k
 type Res<T> = Result<T, Box<dyn Error>>;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
+    let ran = bloomery_levers::at_main(&[PREPARE_Q8])
+        .map_err(Into::into)
+        .and_then(|levers| {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            run(&args, levers.prepare_q8())
+        });
+    match ran {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("prepare: error: {e}");
@@ -60,7 +71,9 @@ enum Make {
     Scale { of: String },
 }
 
-fn run(args: &[String]) -> Res<()> {
+/// The split of the folder `args` name; `q8` (`BLOOMERY_PREPARE_Q8`) writes its BF16 matrices the
+/// map reads as Q8_0, and its F32 matrices, in Q8_0.
+fn run(args: &[String], q8: bool) -> Res<()> {
     let (mut shard_gib, mut keep_bf16, mut paths) = (48u64, false, vec![]);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -73,6 +86,12 @@ fn run(args: &[String]) -> Res<()> {
     let [dir, prefix] = paths[..] else {
         return Err(USAGE.into());
     };
+    if keep_bf16 && q8 {
+        return Err(format!(
+            "--keep-bf16 keeps the BF16 matrices {PREPARE_Q8}=1 asks to write as Q8_0: set one"
+        )
+        .into());
+    }
     let limit = u64::checked_mul(shard_gib, 1 << 30)
         .filter(|&l| l > 0)
         .ok_or_else(|| {
@@ -91,77 +110,7 @@ fn run(args: &[String]) -> Res<()> {
                 .map(|r| (n.to_string(), r.dtype, r.shape.to_vec()))
         })
         .collect::<Result<_, _>>()?;
-    let plan = quant_config::plan(
-        &Config::read(dir)?,
-        entries
-            .iter()
-            .map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
-    );
-    let logical: Vec<(&str, Vec<usize>)> = entries
-        .iter()
-        .filter_map(
-            |(n, _, s)| match (plan.placed.get(n), plan.refused.contains_key(n)) {
-                (Some(p), _) => Some((n.as_str(), p.format.logical(s))),
-                (None, true) => Some((n.as_str(), s.clone())),
-                (None, false) => None,
-            },
-        )
-        .collect();
-    let mapped = checkpoint.map(logical.iter().map(|(n, s)| (*n, s.as_slice())))?;
-
-    let mut planned = Vec::new();
-    for (name, mut m) in mapped {
-        let source = &m.sources[0];
-        let format = modelopt::format_of(&m.placed(&plan)?)?;
-        if keep_bf16 && format == Format::Bf16 && m.role == Use::Matrix(Plain::Q8_0) {
-            m.role = Use::Matrix(Plain::Bf16);
-        }
-        let type_id = modelopt::type_of(format, m.role).ok_or_else(|| {
-            format!(
-                "{source}: {format} read as {:?} has no GGUF type here",
-                m.role
-            )
-        })?;
-        let nbytes = size_of(type_id, &m.dims).ok_or_else(|| {
-            format!(
-                "{name}: dims {:?} are not whole blocks of type {type_id}",
-                m.dims
-            )
-        })?;
-        // One tensor scale an expert of a stack; one for a row table, whatever its parts.
-        let scales = GgmlType::from_u32(type_id)
-            .reads_scale()
-            .then_some(match m.role {
-                Use::Rows => 1,
-                Use::Matrix(_) => m.sources.len(),
-            });
-        let decl = TensorDecl {
-            name: name.clone(),
-            dims: m.dims.clone(),
-            type_id,
-            nbytes,
-        };
-        planned.push(Planned {
-            decl,
-            make: Make::Tensor(m),
-        });
-        if let Some(n) = scales {
-            let n = u64::try_from(n).map_err(|_| format!("{name}: scale count exceeds u64"))?;
-            let nbytes = size_of(0, &[n])
-                .ok_or_else(|| format!("{name}: scale byte count overflows u64"))?;
-            let stem = name.strip_suffix(".weight").unwrap_or(&name);
-            let decl = TensorDecl {
-                name: format!("{stem}.scale"),
-                dims: vec![n],
-                type_id: 0,
-                nbytes,
-            };
-            planned.push(Planned {
-                decl,
-                make: Make::Scale { of: name },
-            });
-        }
-    }
+    let (plan, planned) = plan_tensors(&checkpoint, &Config::read(dir)?, &entries, q8)?;
 
     let mut kvs = checkpoint.header(
         planned
@@ -284,6 +233,104 @@ fn run(args: &[String]) -> Res<()> {
         split.tensor_count()
     );
     Ok(())
+}
+
+/// The folder's `entries` (name, dtype, shape) placed by its `config`, and each tensor the map
+/// makes of them declared in the type its placed format and role give, its `.scale` beside it
+/// where the type reads one. An unquantized matrix the map reads as Q8_0 stays in its stored
+/// format unless `q8` asks for the rewrite; F32 matrices need that rewrite. Unquantized expert
+/// stacks are unsupported.
+fn plan_tensors(
+    checkpoint: &Checkpoint,
+    config: &Config,
+    entries: &[(String, Dtype, Vec<usize>)],
+    q8: bool,
+) -> Res<(Plan, Vec<Planned>)> {
+    let plan = quant_config::plan(
+        config,
+        entries
+            .iter()
+            .map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+    );
+    let logical: Vec<(&str, Vec<usize>)> = entries
+        .iter()
+        .filter_map(
+            |(n, _, s)| match (plan.placed.get(n), plan.refused.contains_key(n)) {
+                (Some(p), _) => Some((n.as_str(), p.format.logical(s))),
+                (None, true) => Some((n.as_str(), s.clone())),
+                (None, false) => None,
+            },
+        )
+        .collect();
+    let mapped = checkpoint.map(logical.iter().map(|(n, s)| (*n, s.as_slice())))?;
+    let mut planned = Vec::new();
+    for (name, mut m) in mapped {
+        let source = &m.sources[0];
+        let format = modelopt::format_of(&m.placed(&plan)?)?;
+        if m.role == Use::Matrix(Plain::Q8_0) && matches!(format, Format::Bf16 | Format::F32) {
+            if m.dims.len() == 3 {
+                return Err(format!(
+                    "{source}: {name}: {format} expert stacks are unsupported by the converter"
+                )
+                .into());
+            }
+            if !q8 {
+                if format == Format::F32 {
+                    return Err(format!(
+                        "{source}: {name} is stored {format}, a form its card site does not read; {PREPARE_Q8}=1 writes Q8_0"
+                    )
+                    .into());
+                }
+                m.role = Use::Matrix(Plain::Bf16);
+            }
+        }
+        let type_id = modelopt::type_of(format, m.role).ok_or_else(|| {
+            format!(
+                "{source}: {format} read as {:?} has no GGUF type here",
+                m.role
+            )
+        })?;
+        let nbytes = size_of(type_id, &m.dims).ok_or_else(|| {
+            format!(
+                "{name}: dims {:?} are not whole blocks of type {type_id}",
+                m.dims
+            )
+        })?;
+        // One tensor scale an expert of a stack; one for a row table, whatever its parts.
+        let scales = GgmlType::from_u32(type_id)
+            .reads_scale()
+            .then_some(match m.role {
+                Use::Rows => 1,
+                Use::Matrix(_) => m.sources.len(),
+            });
+        let decl = TensorDecl {
+            name: name.clone(),
+            dims: m.dims.clone(),
+            type_id,
+            nbytes,
+        };
+        planned.push(Planned {
+            decl,
+            make: Make::Tensor(m),
+        });
+        if let Some(n) = scales {
+            let n = u64::try_from(n).map_err(|_| format!("{name}: scale count exceeds u64"))?;
+            let nbytes = size_of(0, &[n])
+                .ok_or_else(|| format!("{name}: scale byte count overflows u64"))?;
+            let stem = name.strip_suffix(".weight").unwrap_or(&name);
+            let decl = TensorDecl {
+                name: format!("{stem}.scale"),
+                dims: vec![n],
+                type_id: 0,
+                nbytes,
+            };
+            planned.push(Planned {
+                decl,
+                make: Make::Scale { of: name },
+            });
+        }
+    }
+    Ok((plan, planned))
 }
 
 fn plan_shards(
@@ -749,8 +796,166 @@ mod tests {
     fn a_shard_size_out_of_range_is_refused() {
         for n in ["0", "17179869184", "17179869185"] {
             let args = ["no-folder", "out", "--shard-gib", n].map(String::from);
-            let e = super::run(&args).unwrap_err().to_string();
+            let e = super::run(&args, false).unwrap_err().to_string();
             assert!(e.contains("--shard-gib"), "{n}: {e}");
+        }
+    }
+
+    /// Every tensor of layers 0, 1 and 3 and the unlayered text tensors of
+    /// nvidia/Qwen3.8-Flash-Next-NVFP4 is declared in its stored format: each one unsloth's
+    /// UD-Q4_K_XL holds in Q8_0, a BF16 matrix in the checkpoint (the head and the token
+    /// embedding among them), is BF16, and Q8_0 only when `BLOOMERY_PREPARE_Q8` asks; every other
+    /// tensor (the NVFP4 stacks, the PLE table's F8 rows, the gains, the scales) is the same
+    /// either way. Synthetic F32 matrices require the Q8_0 rewrite; BF16 and F32 routed stacks
+    /// are refused with either lever value. Dropping either refusal fails these assertions.
+    /// `--keep-bf16` asks for the stored form: taken alone, refused beside the lever.
+    #[test]
+    fn a_bf16_matrix_is_written_as_stored_unless_q8_is_asked() {
+        use super::*;
+        use model::arch::qwen35moe::names;
+        use std::collections::BTreeMap;
+
+        let gz = |name: &str| -> serde_json::Value {
+            let path = format!("{}/../hf/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+            let file = File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            serde_json::from_reader(flate2::read::GzDecoder::new(file)).unwrap()
+        };
+        let config = gz("quant-configs/nvidia__Qwen3.8-Flash-Next-NVFP4__config.json.gz");
+        let hf_quant =
+            gz("quant-configs/nvidia__Qwen3.8-Flash-Next-NVFP4__hf_quant_config.json.gz");
+        let quant = Config::parse(&config, Some(&hf_quant)).unwrap();
+        let checkpoint = Checkpoint::parse(&config).unwrap();
+        let header = gz("checkpoint-headers/qwen3.8-flash-next-nvfp4-layers-0-1-3.tensors.json.gz");
+        let entries: Vec<(String, Dtype, Vec<usize>)> = header
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(n, e)| {
+                let shape = e["shape"].as_array().unwrap();
+                (
+                    n.clone(),
+                    Dtype::of(e["dtype"].as_str().unwrap()).unwrap(),
+                    shape.iter().map(|d| d.as_u64().unwrap() as usize).collect(),
+                )
+            })
+            .collect();
+        let unsloth: Vec<(String, Vec<u64>, u32)> = serde_json::from_value(gz(
+            "checkpoint-headers/unsloth-qwen3.8-flash-next-ud-q4_k_xl-layers-0-1-3.tensors.json.gz",
+        ))
+        .unwrap();
+        let q8_0: Vec<&str> = unsloth
+            .iter()
+            .filter(|(_, _, ty)| *ty == GgmlType::Q8_0.as_u32())
+            .map(|(n, _, _)| n.as_str())
+            .collect();
+        for name in [names::output(), names::token_embd(), names::attn_output(3)] {
+            assert!(q8_0.contains(&name.as_str()), "{name}");
+        }
+        let types = |q8| -> BTreeMap<String, GgmlType> {
+            let (_, planned) = plan_tensors(&checkpoint, &quant, &entries, q8).unwrap();
+            planned
+                .into_iter()
+                .map(|p| (p.decl.name, GgmlType::from_u32(p.decl.type_id)))
+                .collect()
+        };
+        let (stored, rewritten) = (types(false), types(true));
+        assert_eq!(
+            stored.keys().collect::<Vec<_>>(),
+            rewritten.keys().collect::<Vec<_>>()
+        );
+        for (name, ty) in &stored {
+            let want = if q8_0.contains(&name.as_str()) {
+                (GgmlType::BF16, GgmlType::Q8_0)
+            } else {
+                (*ty, *ty)
+            };
+            assert_eq!((*ty, rewritten[name]), want, "{name}");
+        }
+        for (target, source) in [
+            (
+                names::attn_output(3),
+                "model.language_model.layers.3.self_attn.o_proj.weight",
+            ),
+            (names::output(), "lm_head.weight"),
+            (
+                names::token_embd(),
+                "model.language_model.embed_tokens.weight",
+            ),
+        ] {
+            let mut f32 = entries.clone();
+            f32.iter_mut().find(|(n, _, _)| n == source).unwrap().1 = Dtype::F32;
+            for q8 in [false, true] {
+                let result = plan_tensors(&checkpoint, &quant, &f32, q8);
+                if !q8 {
+                    let Err(e) = result else {
+                        panic!("F32 matrix {target} must be refused");
+                    };
+                    let e = e.to_string();
+                    assert!(
+                        e.contains(source) && e.contains(&target) && e.contains(PREPARE_Q8),
+                        "{e}"
+                    );
+                } else {
+                    let (_, planned) = result.unwrap();
+                    let p = planned.iter().find(|p| p.decl.name == target).unwrap();
+                    assert_eq!(p.decl.type_id, 8, "{target}");
+                }
+            }
+        }
+        let bf16: Vec<_> = entries
+            .iter()
+            .filter_map(|(n, d, s)| {
+                if n.contains("layers.0.mlp.experts.") && n.contains(".gate_proj.") {
+                    n.ends_with(".weight")
+                        .then(|| (n.clone(), Dtype::Bf16, Format::Nvfp4.logical(s)))
+                } else {
+                    Some((n.clone(), *d, s.clone()))
+                }
+            })
+            .collect();
+        let mut single = config.clone();
+        single["text_config"]["num_experts"] = 1.into();
+        single["text_config"]["num_experts_per_tok"] = 1.into();
+        let single = Checkpoint::parse(&single).unwrap();
+        for dtype in [Dtype::Bf16, Dtype::F32] {
+            let mut stack = bf16.clone();
+            for (n, d, _) in &mut stack {
+                if n.contains("layers.0.mlp.experts.") && n.contains(".gate_proj.") {
+                    *d = dtype;
+                }
+            }
+            let source = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight";
+            let one: Vec<_> = stack
+                .iter()
+                .filter(|(n, _, _)| {
+                    n == source
+                        || n == "lm_head.weight"
+                        || n == "model.language_model.embed_tokens.weight"
+                })
+                .cloned()
+                .collect();
+            for (checkpoint, stack) in [(&checkpoint, &stack), (&single, &one)] {
+                for q8 in [false, true] {
+                    let Err(e) = plan_tensors(checkpoint, &quant, stack, q8) else {
+                        panic!(
+                            "{dtype:?} expert stacks must be refused for q8={q8}, entries={}",
+                            stack.len()
+                        );
+                    };
+                    let e = e.to_string();
+                    assert!(
+                        e.contains(source)
+                            && e.contains(&names::ffn_gate_exps(0))
+                            && e.contains("expert stacks are unsupported"),
+                        "{e}"
+                    );
+                }
+            }
+        }
+        for q8 in [false, true] {
+            let args = ["no-folder", "out", "--keep-bf16"].map(String::from);
+            let e = run(&args, q8).unwrap_err().to_string();
+            assert_eq!(e.contains("--keep-bf16"), q8, "q8={q8}: {e}");
         }
     }
 }

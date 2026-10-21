@@ -1,8 +1,12 @@
 //! The Qwen3.8-Flash-Next NVFP4 gate: the split `prepare` writes from `nvidia/Qwen3.8-Flash-Next-NVFP4`
-//! (routed experts NVFP4 with a tensor scale an expert, dense projections Q8_0, gains F32, the PLE
-//! table in its F8 rows) against the checkpoint's own forward with the weights the split holds
-//! (refset `hf-qwen4exp-nvfp4`, `tools/ref/qwen4exp-nvfp4-oracle.py`), by the e2e gate's bands
-//! (`shared/q38_oracle.rs`). The plan is `--place a`'s on the one visible card, a DGX Spark's GB10,
+//! (routed experts NVFP4 with a tensor scale an expert, dense projections BF16 as the checkpoint
+//! stores them or, under `BLOOMERY_PREPARE_Q8=1`, rewritten to Q8_0, gains F32, the PLE table in
+//! its F8 rows) against the checkpoint's own forward (refset
+//! `hf-qwen4exp-nvfp4`, `tools/ref/qwen4exp-nvfp4-oracle.py`: the `_bf16` sets for the stored
+//! projections, the others for the Q8_0 ones; the head's type says which), by the e2e gate's bands
+//! (`shared/q38_oracle.rs`). The oracle keeps indexer projections in BF16; the model loader
+//! refuses Q8_0 indexer projections.
+//! The plan is `--place a`'s on the one visible card, a DGX Spark's GB10,
 //! whose budget holds every routed expert: no CPU kernel reads an NVFP4 stack.
 //!
 //! What is asserted:
@@ -19,10 +23,11 @@
 //!   named tie (ours the oracle's runner-up, the oracle's margin at most twice our distance at the
 //!   two ids, the logits within `FREE_BAND`). The layer outputs are printed: a flip in any of the
 //!   3,000 positions before it may lie on their path.
-//! - Recorded, not judged: the batch run and the D3K step against the sets that keep the
-//!   checkpoint's BF16 projections, the Q8_0 rounding's share of the distance.
+//! - Recorded, not judged: the batch run and the D3K step against the other pair of sets, the Q8_0
+//!   rounding's share of the distance.
 //!
 //! Real-only: the fixture holds no NVFP4 stack. Loads the whole file on the card.
+//! `BLOOMERY_REF_MODEL` selects a split outside the recipe's model folder.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -66,27 +71,41 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::flip;
     use bloomery_gpu_gates::generate::Place;
-    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{
+        GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
+    };
     use gguf::GgmlType;
     use model::arch::qwen35moe::names;
     use model::arch::qwen35moe::place::{Experts, PlanInputs};
-    use model::placement::PlanLevers;
+    use model::placement::{ModelTensors, PlanLevers, Role};
     use refset::arch::qwen4exp::nvfp4::{BATCH, BATCH_BF16, D3K, D3K_BF16, HF};
-
-    /// The split `prepare` writes from the family's folder, first of its shards.
-    const MODEL: &str =
-        "/models/Qwen3.8-Flash-Next-NVFP4/Qwen3.8-Flash-Next-NVFP4-00001-of-00004.gguf";
 
     /// Cache rows: D3K's step at position 3,000, with room.
     const CTX: usize = 3072;
 
     /// What the clauses read of the file's header: the trunk's layers, a layer output's values
-    /// (every stream of the hidden width), and the routed experts and the slots a token takes.
+    /// (every stream of the hidden width), the routed experts and the slots a token takes, and
+    /// the sets its dense form is judged by.
     struct Dims {
         n_layer: usize,
         row: usize,
         n_expert: usize,
         n_used: usize,
+        dense: Dense,
+    }
+
+    /// The form of a split's dense matrices ([`dense_of`]) and the oracle's sets it is judged by,
+    /// each beside the set of the other form, recorded.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Dense {
+        /// The head's type: BF16 or Q8_0.
+        ty: GgmlType,
+        /// At least one indexer projection is Q8_0; the oracle's are all BF16.
+        q8_indexer: bool,
+        /// The batch set judged, then the one recorded.
+        batch: (&'static str, &'static str),
+        /// The D3K set judged, then the one recorded.
+        d3k: (&'static str, &'static str),
     }
 
     /// Steps' last logits, and with the taps armed each step's layer outputs and route taps.
@@ -104,8 +123,8 @@ mod gate {
     }
 
     /// (l): the plan on the one visible card, every routed expert on it, and the load.
-    fn open(d: &Dims) -> Result<(Qwen38Model, bool), GateError> {
-        let file = open_split(Path::new(MODEL))?;
+    fn open(path: &Path, d: &Dims) -> Result<(Qwen38Model, bool), GateError> {
+        let file = open_split(path)?;
         let levers = bloomery_levers::at_main(&[])?;
         let specs = Place::A.on_host()?.card_specs()?;
         let [card] = specs[..] else {
@@ -256,13 +275,13 @@ mod gate {
     }
 
     /// (t): D3K's prefill by ubatches from a reset, then its step by an eager step with the taps
-    /// armed, against `D3K` and, recorded, `D3K_BF16`.
+    /// armed, against the judged set `man` and, recorded, the other one.
     fn d3k_step(
         m: &mut Qwen38Model,
         d: &Dims,
         vocab: usize,
-        man: &RefManifest,
-        bf16: &RefManifest,
+        (name, man): (&str, &RefManifest),
+        (other, recorded): (&str, &RefManifest),
     ) -> Result<bool, GateError> {
         let (pos, step, prefill) = man.step()?;
         let tok = step[0];
@@ -273,7 +292,7 @@ mod gate {
         let r = run_steps(m, &[tok])?;
         let ours = r.logits.last().ok_or("no logits")?;
         let mut ok = true;
-        for (name, man, judged) in [(D3K, man, true), (D3K_BF16, bf16, false)] {
+        for (name, man, judged) in [(name, man, true), (other, recorded, false)] {
             let oracle = ik_last(man, vocab)?;
             let (top, oracle_top, oracle_2, margin, dist, logits_rel) = tie_numbers(ours, &oracle);
             let tie = top != oracle_top
@@ -302,49 +321,127 @@ mod gate {
         Ok(ok)
     }
 
-    /// The header's dims, and the file's routed gate type, which must be NVFP4.
-    fn dims() -> Result<Dims, GateError> {
-        let file = open_split(Path::new(MODEL))?;
-        let hp = PlanInputs::describe(&file)?.hp;
+    /// The dense form of the loaded dense projections of `model`: the head's
+    /// type, BF16 as the checkpoint stores it (what `prepare` writes by default, judged by the
+    /// `_bf16` sets) or Q8_0 (what `BLOOMERY_PREPARE_Q8=1` writes, or another converter, judged by
+    /// the others). Every other BF16 or Q8_0 tensor but the indexer's projections, which `prepare`
+    /// keeps in BF16 beside either form, must be of the head's type: the sets hold one form or the
+    /// other. This picks the reference sets only; the model loader refuses Q8_0 indexer projections.
+    /// A head of another type or none, and a mixed split, are refused by name.
+    fn dense_of(model: &ModelTensors) -> Result<Dense, String> {
+        let tensors: Vec<(&str, GgmlType)> = model
+            .tensors
+            .iter()
+            .filter(|t| t.role != Role::Unused)
+            .filter(|t| (model.bf16_words)(t))
+            .map(|t| (t.name.as_str(), t.ty))
+            .collect();
+        let head = names::output();
+        let ty = match tensors.iter().find(|(n, _)| *n == head) {
+            Some(&(_, ty @ (GgmlType::BF16 | GgmlType::Q8_0))) => ty,
+            Some((_, ty)) => return Err(format!("{head} is {ty:?}, not BF16 or Q8_0")),
+            None => return Err(format!("the file has no {head}")),
+        };
+        let indexer: Vec<String> = (0..model.layers)
+            .flat_map(|l| [names::indexer_q_proj(l), names::indexer_k_proj(l)])
+            .collect();
+        if let Some((name, other)) = tensors.iter().find(|(n, t)| {
+            matches!(t, GgmlType::BF16 | GgmlType::Q8_0)
+                && *t != ty
+                && !indexer.iter().any(|i| i == n)
+        }) {
+            return Err(format!(
+                "{name} is {other:?} beside a {ty:?} {head}, a dense form no pair of sets holds"
+            ));
+        }
+        let q8_indexer = tensors
+            .iter()
+            .any(|(n, t)| *t == GgmlType::Q8_0 && indexer.iter().any(|i| i == n));
+        Ok(if ty == GgmlType::BF16 {
+            Dense {
+                ty,
+                q8_indexer,
+                batch: (BATCH_BF16, BATCH),
+                d3k: (D3K_BF16, D3K),
+            }
+        } else {
+            Dense {
+                ty,
+                q8_indexer,
+                batch: (BATCH, BATCH_BF16),
+                d3k: (D3K, D3K_BF16),
+            }
+        })
+    }
+
+    /// The header's dims, the file's routed gate type, which must be NVFP4, and its dense form
+    /// ([`dense_of`]).
+    fn dims(path: &Path) -> Result<Dims, GateError> {
+        let file = open_split(path)?;
+        let inputs = PlanInputs::describe(&file)?;
+        let hp = &inputs.hp;
         let gate = file
             .find(&names::ffn_gate_exps(0))
             .map(|(_, t)| t.ty)
             .ok_or("the file has no routed gate stack on layer 0")?;
         if gate != GgmlType::NVFP4 {
-            return Err(format!("{MODEL}: layer 0's routed gate is {gate:?}, not NVFP4").into());
+            return Err(format!(
+                "{}: layer 0's routed gate is {gate:?}, not NVFP4",
+                path.display()
+            )
+            .into());
         }
+        let dense = dense_of(&inputs.model).map_err(|e| format!("{}: {e}", path.display()))?;
         let streams = hp.exp.as_ref().map_or(1, |e| e.hc_streams);
         Ok(Dims {
             n_layer: hp.n_trunk,
             row: streams * hp.n_embd,
             n_expert: hp.n_expert,
             n_used: hp.n_used,
+            dense,
         })
     }
 
     pub fn run() -> Result<(), GateError> {
-        let batch = set(BATCH)?;
-        let batch_bf16 = set(BATCH_BF16)?;
-        let d3k = set(D3K)?;
-        let d3k_bf16 = set(D3K_BF16)?;
-        for (q8, bf16) in [(&batch, &batch_bf16), (&d3k, &d3k_bf16)] {
-            if q8.header.tokens != bf16.header.tokens {
+        let path = ref_model_path()?;
+        println!("model {}", path.display());
+        let d = dims(&path)?;
+        let Dense {
+            ty,
+            q8_indexer,
+            batch: (batch_name, other_batch),
+            d3k: (d3k_name, other_d3k),
+        } = d.dense;
+        println!(
+            "dense projections {}: judged by {batch_name} and {d3k_name}; indexer {}, the oracle's BF16",
+            if ty == GgmlType::BF16 {
+                "BF16 as stored"
+            } else {
+                "Q8_0"
+            },
+            if q8_indexer { "includes Q8_0" } else { "BF16" }
+        );
+        let batch = set(batch_name)?;
+        let batch_other = set(other_batch)?;
+        let d3k = set(d3k_name)?;
+        let d3k_other = set(other_d3k)?;
+        for (judged, other) in [(&batch, &batch_other), (&d3k, &d3k_other)] {
+            if judged.header.tokens != other.header.tokens {
                 return Err(format!(
                     "{}: oracle token ids differ from {}",
-                    bf16.dir.display(),
-                    q8.dir.display()
+                    other.dir.display(),
+                    judged.dir.display()
                 )
                 .into());
             }
         }
         let (_, toks, _) = batch.step()?;
-        let d = dims()?;
-        let (mut m, mut ok) = open(&d)?;
+        let (mut m, mut ok) = open(&path, &d)?;
         let vocab = m.body("run")?.vocab();
         m.reset()?;
         let r = run_steps(&mut m, toks)?;
         ok &= free(&batch, &r, &d, vocab, true)?;
-        ok &= free(&batch_bf16, &r, &d, vocab, false)?;
+        ok &= free(&batch_other, &r, &d, vocab, false)?;
         ok &= batch_by(
             &mut m,
             toks,
@@ -359,7 +456,113 @@ mod gate {
             ("g", Prompt38::Gemm, "one ubatch"),
             &batch,
         )?;
-        ok &= d3k_step(&mut m, &d, vocab, &d3k, &d3k_bf16)?;
+        ok &= d3k_step(&mut m, &d, vocab, (d3k_name, &d3k), (other_d3k, &d3k_other))?;
         if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The sets follow the split's dense form: `prepare`'s default split (every dense matrix
+        /// BF16) the `_bf16` pair; its `BLOOMERY_PREPARE_Q8=1` split (Q8_0, the indexer's
+        /// projections BF16) and a Q8_0 split another converter wrote (the indexer Q8_0 too) the
+        /// Q8_0 pair; a projection of the other form, a head of a third type and no head are
+        /// refused by name. Mutants: the form read as one type whatever the head, the pairs
+        /// swapped, the mixed check dropped, the indexer not exempt.
+        #[test]
+        fn a_split_is_judged_by_the_sets_of_its_dense_form() {
+            let split = |dense, indexer| -> Vec<(String, GgmlType)> {
+                vec![
+                    (names::output(), dense),
+                    (names::token_embd(), dense),
+                    (names::ssm_out(0), dense),
+                    (names::ffn_down_shexp(0), dense),
+                    (names::ffn_gate_exps(0), GgmlType::NVFP4),
+                    (names::attn_q_norm(3), GgmlType::F32),
+                    (names::attn_output(3), dense),
+                    (names::indexer_q_proj(3), indexer),
+                    (names::indexer_k_proj(3), indexer),
+                ]
+            };
+            let of = |t: &[(String, GgmlType)]| {
+                use model::placement::ModelTensor;
+                dense_of(&ModelTensors {
+                    tensors: t
+                        .iter()
+                        .map(|(n, ty)| ModelTensor {
+                            name: n.clone(),
+                            shard: 0,
+                            layer: None,
+                            role: if n.starts_with("blk.4.") {
+                                Role::Unused
+                            } else {
+                                Role::Head
+                            },
+                            ty: *ty,
+                            dims: vec![32, 32],
+                            file_bytes: 0,
+                            gathered_rows: None,
+                        })
+                        .collect(),
+                    layers: 4,
+                    experts: 1,
+                    experts_used: 1,
+                    bf16_words: |t| t.name != names::ffn_gate_inp(0),
+                })
+            };
+            let (bf16, q8) = (GgmlType::BF16, GgmlType::Q8_0);
+            let stored = Dense {
+                ty: bf16,
+                q8_indexer: false,
+                batch: (BATCH_BF16, BATCH),
+                d3k: (D3K_BF16, D3K),
+            };
+            let rewritten = Dense {
+                ty: q8,
+                q8_indexer: false,
+                batch: (BATCH, BATCH_BF16),
+                d3k: (D3K, D3K_BF16),
+            };
+            let mut unused = split(q8, bf16);
+            unused.push((names::indexer_q_proj(4), bf16));
+            unused.push((names::attn_output(4), bf16));
+            assert_eq!(of(&unused), Ok(rewritten));
+            let mut values = split(q8, bf16);
+            values.push((names::ffn_gate_inp(0), bf16));
+            assert_eq!(of(&values), Ok(rewritten));
+            assert_eq!(of(&split(bf16, bf16)), Ok(stored));
+            assert_eq!(of(&split(q8, bf16)), Ok(rewritten));
+            for (ty, expected) in [(bf16, stored), (q8, rewritten)] {
+                assert_eq!(
+                    of(&split(ty, q8)),
+                    Ok(Dense {
+                        q8_indexer: true,
+                        ..expected
+                    })
+                );
+                let mut mixed = split(ty, bf16);
+                mixed[7].1 = q8;
+                assert_eq!(
+                    of(&mixed),
+                    Ok(Dense {
+                        q8_indexer: true,
+                        ..expected
+                    })
+                );
+            }
+            for (at, ty, named) in [
+                (3, bf16, names::ffn_down_shexp(0)),
+                (6, q8, names::attn_output(3)),
+                (0, GgmlType::Q6_K, format!("{} is Q6_K", names::output())),
+            ] {
+                let mut t = split(if ty == q8 { bf16 } else { q8 }, bf16);
+                t[at].1 = ty;
+                let e = of(&t).unwrap_err();
+                assert!(e.contains(&named), "{e}");
+            }
+            let e = of(&split(q8, bf16)[1..]).unwrap_err();
+            assert!(e.contains(&names::output()), "{e}");
+        }
     }
 }

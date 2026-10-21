@@ -1093,6 +1093,11 @@ mod tests {
         );
         let kept = normalize(get, &[("b.weight", &b)], Use::Matrix(Plain::Bf16)).unwrap();
         assert_eq!((kept.type_id, &kept.bytes), (30, &bf16));
+        let f32 = placed(Format::F32, &[]);
+        let kept = normalize(get, &[("f.weight", &f32)], Use::Matrix(Plain::F32)).unwrap();
+        assert_eq!((kept.type_id, &kept.bytes), (0, &f32s));
+        let q = normalize(get, &[("f.weight", &f32)], m).unwrap();
+        assert_eq!((q.type_id, &q.bytes), (8, &want));
         let rows = normalize(
             get,
             &[("t.weight", &placed(Format::Fp8Tensor, &["t.scale"]))],

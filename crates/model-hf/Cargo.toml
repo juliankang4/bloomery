@@ -15,6 +15,8 @@ workspace = true
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
 bloomery-hf = { path = "../hf" }
+# The `prepare` bin reads its one lever, `BLOOMERY_PREPARE_Q8`.
+bloomery-levers = { path = "../levers" }
 bloomery-model = { path = "../model" }
 bloomery-safetensors = { path = "../safetensors" }
 # The `prepare` bin builds serving's tokenizer from the GGUF header it wrote and checks its split.

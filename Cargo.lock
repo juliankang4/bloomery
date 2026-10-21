@@ -341,6 +341,7 @@ version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-hf",
+ "bloomery-levers",
  "bloomery-model",
  "bloomery-refset",
  "bloomery-safetensors",

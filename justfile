@@ -1405,11 +1405,13 @@ gate-gpu-qwen4exp-iqleg:
 # Qwen3.8-Flash-Next from the NVIDIA NVFP4 checkpoint (the split `prepare` writes from nvidia/Qwen3.8-Flash-Next-NVFP4) on
 # one card whose plan holds every routed expert (`--place a`; a DGX Spark's GB10): the load puts no expert on the host; the
 # batch set's eager steps hold every layer's streams within the e2e gate's band of the checkpoint's own forward (refset
-# hf-qwen4exp-nvfp4), the router's flips named, and its last argmax; the batch set by one ubatch and D3K's step after its
-# prefill by ubatches hold the oracle's argmax (D3K's a named tie allowed); the distances to the BF16-dense sets are
-# recorded. Real-only: the fixture holds no NVFP4 stack.
+# hf-qwen4exp-nvfp4, the sets of the split's dense form: BF16 as stored, or the Q8_0 of BLOOMERY_PREPARE_Q8=1), the
+# router's flips named, and its last argmax; the batch set by one ubatch and D3K's step after its prefill by ubatches hold
+# the oracle's argmax (D3K's a named tie allowed); the distances to the other form's sets are recorded. The bin's unit
+# test, which holds the choice of sets to the split's dense form, runs first. BLOOMERY_REF_MODEL moves the split from
+# the model folder below, including to prepare's stored-form output. Real-only: the fixture holds no NVFP4 stack.
 gate-gpu-qwen4exp-nvfp4:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen4exp-nvfp4 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_nvfp4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_nvfp4'
+    BLOOMERY_REF_MODEL="${BLOOMERY_REF_MODEL:-/models/Qwen3.8-Flash-Next-NVFP4/Qwen3.8-Flash-Next-NVFP4-00001-of-00004.gguf}" BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen4exp-nvfp4 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen4exp_nvfp4 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_nvfp4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_nvfp4'
 
 # Qwen3.8's MTP draft program on the 3090 beside the target: first, before any walk, the draft's load — its weights,
 # store and row map hold its plan's bytes, its token_embd and output are the target's own buffers at their addresses,

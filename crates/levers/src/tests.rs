@@ -404,6 +404,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.host_lanes(), HOST_LANES_DEFAULT);
     assert_eq!(unset.nvtier_mem(), NvTierMem::Auto);
     assert_eq!(unset.gen_slots(), 1);
+    assert!(!unset.prepare_q8());
     assert_eq!(
         unset.host(),
         HostCfg {
@@ -448,6 +449,7 @@ fn accessors_read_their_rows() {
             (NVTIER_MEM, "pinned"),
             (PREFILL_GROUP, "8"),
             (GEN_SLOTS, "2"),
+            (PREPARE_Q8, "1"),
         ]),
         Scope::Every,
     )
@@ -498,6 +500,7 @@ fn accessors_read_their_rows() {
         );
     }
     assert_eq!(set.gen_slots(), 2);
+    assert!(set.prepare_q8());
     assert_eq!(
         set.host(),
         HostCfg {
@@ -553,7 +556,8 @@ fn accessors_read_their_rows() {
             GEN_SLOTS,
             FORCE_IDS,
             SCREEN,
-            SCHEMAJUMP
+            SCHEMAJUMP,
+            PREPARE_Q8
         ]
     );
 }
@@ -1303,10 +1307,10 @@ fn draft38_unset_follows_the_place_and_the_file() {
     assert_eq!(
         Draft38Off::Borrowed {
             name: "output.weight".to_string(),
-            ty: "q6_K".to_string()
+            ty: "f16".to_string()
         }
         .to_string(),
-        "unset: the target's output.weight is q6_K; the MTP draft reads it as Q8_0"
+        "unset: the target's output.weight is f16, not a form the MTP draft reads"
     );
 }
 
@@ -1449,7 +1453,7 @@ fn a_paged_plan_turns_only_an_unset_draft_off() {
         Draft38Off::Ctx { need: 5, ctx: 4 },
         Draft38Off::Borrowed {
             name: "output.weight".to_string(),
-            ty: "q6_K".to_string(),
+            ty: "f16".to_string(),
         },
     ] {
         assert_eq!(

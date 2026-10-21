@@ -51,6 +51,7 @@ pub const TIER_NODES: &str = "BLOOMERY_TIER_NODES";
 pub const TP_NODES: &str = "BLOOMERY_TP_NODES";
 pub const SCREEN: &str = "BLOOMERY_SCREEN";
 pub const SCHEMAJUMP: &str = "BLOOMERY_SCHEMAJUMP";
+pub const PREPARE_Q8: &str = "BLOOMERY_PREPARE_Q8";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -1068,6 +1069,30 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               takes the step arm whatever this says. A request's `timings.constrained` counts \
               the calls of the arm it took. A server takes it as \
               `serve::SlotConfig::schema_jump`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: PREPARE_Q8,
+        class: Class::M,
+        kind: Kind::Flag,
+        default: Unset::Is("0"),
+        doc: "`prepare`: `1` writes each BF16 or F32 matrix its checkpoint map reads as Q8_0 (the \
+              attention and linear-attention projections, the shared expert, the PLE key and \
+              value, the hyper-connections' down and up, the head and the token embedding) as \
+              ggml's reference Q8_0; `0` keeps each single BF16 matrix as stored and refuses \
+              F32 matrices read as Q8_0. BF16 and F32 expert stacks are refused, and the \
+              quantized tensors (NVFP4, MXFP8, FP8) keep their stored blocks, under both \
+              values. The rewrite is lossy: on \
+              `nvidia/Qwen3.8-Flash-Next-NVFP4` at fc694b54, the checkpoint's own f32 forward \
+              with its BF16 projections rounded to Q8_0 is at a KL divergence of 4.288e-02 from \
+              the forward with them as stored, at the last of the five positions of the \
+              batch set, and 4.181e-02 at position 3,000 of the D3K set (refset \
+              `hf-qwen4exp-nvfp4`, the `_bf16` sets against the others), so it is asked for, \
+              never a default. `--keep-bf16`, which asks for the stored form, is refused \
+              beside it.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

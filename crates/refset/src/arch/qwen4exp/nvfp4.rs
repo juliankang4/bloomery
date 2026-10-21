@@ -1,11 +1,12 @@
 //! The Qwen3.8-Flash-Next NVFP4 oracle: the forward of `nvidia/Qwen3.8-Flash-Next-NVFP4` in
-//! transformers' qwen4_exp, f32 on the CPU, with the weights the split `prepare` writes from that
+//! transformers' qwen4_exp, f32 on the CPU, with the weights a split `prepare` writes from that
 //! folder holds — the routed experts by ModelOpt's NVFP4 rule, the PLE rows by their F8 rule, the
-//! BF16 projections `prepare` writes as Q8_0 rounded by ggml's reference Q8_0 rule
-//! (`tools/ref/qwen4exp-nvfp4-oracle.py`). Its sets are in ik's dump layout and carry ik's tap
-//! names, so a gate reads them as it reads [`super::IK`]'s; the ids are the batch set's and
-//! [`super::D3K`]'s. The two `_bf16` sets widen the checkpoint's BF16 projections instead: the
-//! Q8_0 rounding's own share of the difference, recorded beside the oracle.
+//! BF16 projections `prepare` rewrites to Q8_0 under `BLOOMERY_PREPARE_Q8=1` rounded by ggml's
+//! reference Q8_0 rule (`tools/ref/qwen4exp-nvfp4-oracle.py`). Its sets are in ik's dump layout
+//! and carry ik's tap names, so a gate reads them as it reads [`super::IK`]'s; the ids are the
+//! batch set's and [`super::D3K`]'s. The two `_bf16` sets widen the checkpoint's BF16 projections
+//! instead, as the split `prepare` writes by default holds them; between the two pairs lies the
+//! Q8_0 rounding's own share.
 
 use super::ARCH;
 use crate::RefError;
@@ -28,7 +29,7 @@ pub const BATCH: &str = "hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4";
 /// The 3,001 ids of [`super::D3K`] as a decode-step set: the step at position 3,000, every
 /// position's taps kept.
 pub const D3K: &str = "hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4_d3k";
-/// [`BATCH`] with the BF16 projections widened.
+/// [`BATCH`] with the BF16 projections widened, as stored.
 pub const BATCH_BF16: &str = "hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4_bf16";
 /// [`D3K`] with the BF16 projections widened: the layer outputs and logits of the last position,
 /// the routes of every position.

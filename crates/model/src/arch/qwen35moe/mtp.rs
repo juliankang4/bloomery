@@ -1367,7 +1367,7 @@ mod tests {
     }
 
     /// A target whose load keeps its BF16 head and embedding in their words
-    /// (`prepare --keep-bf16`) is admitted with both borrowed, and
+    /// (`prepare`'s default, the stored form) is admitted with both borrowed, and
     /// `head_kind` records the BF16 form the draft's head reads.
     #[test]
     fn a_bf16_target_head_and_embedding_are_admitted() {
