@@ -27,8 +27,11 @@
 //!   `BLOOMERY_TP_NODES` names the other ranks' nodes, each running a
 //!   `tier_server` that answers its census. `--plan` prints one `tp rank=`
 //!   line a rank, each rank's split and whole bytes against its own node's
-//!   pool (`model_hf::arch::glm5next::read_tp`); the load is refused by name, as
-//!   is `BLOOMERY_DRAFT=mtp`.
+//!   pool (`model_hf::arch::glm5next::open`). Without `--plan`, rank 0
+//!   reads its own parts of the folder onto this process's card
+//!   (`bloomery_gpu_glm5next::tp::load`) and the run is refused by name after
+//!   the load: the ranks' step over the link between nodes is not built.
+//!   `BLOOMERY_DRAFT=mtp` is refused by name.
 //!   Unset, the common rule every serving seat takes (`generate::Place::choose`,
 //!   by the GLM family's `glm_place::TIER_RULE`): the cards' offer, `bp` on
 //!   two cards, kept when its plan puts at least the rule's break-even
@@ -220,6 +223,7 @@ mod cli {
     use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident, open_resident_slots};
     use app::mtp::MtpDraft;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
+    use bloomery_gpu::Gpu;
     use bloomery_gpu::host::node::node_cards;
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
@@ -236,6 +240,7 @@ mod cli {
         GLM_CARD, churn_bytes, glm_machine, residency_room, residency_set,
     };
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
+    use bloomery_gpu_glm5next::tp::{self, RankOf};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, checkpoint_price, prompt_bytes};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, DRAFT, GEN_SLOTS, HOST_LOCK, HOST_POPULATE, LANE_PREFETCH,
@@ -432,10 +437,12 @@ mod cli {
     }
 
     /// `--place tp`: the plan of each rank of the checkpoint folder `BLOOMERY_REF_MODEL` names,
-    /// one line a rank (`model_hf::arch::glm5next::read_tp`, `placement::tp::plan_tp`): rank 0 this
+    /// one line a rank (`model_hf::arch::glm5next::open`, `placement::tp::plan_tp`): rank 0 this
     /// process's one card, the others the nodes of `BLOOMERY_TP_NODES` in order, each against its
-    /// own node's pool as its census reads it. The tensor-parallel load is not built, so a run
-    /// without `--plan` is refused after the plan.
+    /// own node's pool as its census reads it. `--plan` stops there. Without it rank 0 reads its
+    /// own parts of the folder onto the card (`model_hf::arch::glm5next::open`, `tp::load`), every
+    /// part refused by name before any upload, and the run is refused after the load: the ranks'
+    /// step over the link between nodes is not built.
     fn tp_plan(
         levers: &bloomery_levers::Levers,
         drafted: bool,
@@ -462,21 +469,26 @@ mod cli {
             .zip(node_cards(nodes)?)
             .map(|(&addr, (_, spec))| (addr, spec))
             .collect();
-        let ranks = tp_ranks(
-            &spec_of_device(here),
-            &cards,
-            &model_hf::arch::glm5next::read_tp(&ref_model_path()?)?,
-        )?;
+        let dir = ref_model_path()?;
+        let (g, tensors, checkpoint) = model_hf::arch::glm5next::open(&dir)?;
+        let ranks = tp_ranks(&spec_of_device(here), &cards, &tensors)?;
         for r in &ranks {
             record::tp_rank(r, ranks.len()).print();
         }
         if plan {
             return Ok(());
         }
-        Err(
-            "--place tp: the tensor-parallel load is not built; --plan prints each rank's plan"
-                .into(),
+        let gpu = Gpu::new()?;
+        let at = RankOf::new(0, ranks.len())?;
+        let w = tp::load(&gpu, &checkpoint, at, g.layers, g.heads)?;
+        let bytes = w.resident_bytes();
+        Err(format!(
+            "--place tp: rank 0 of {} holds its parts of {} tensors ({bytes} B on the card); the \
+             ranks' step over the link between nodes is not built",
+            ranks.len(),
+            w.names().count()
         )
+        .into())
     }
 
     /// The plan of `tensors` over N ranks: rank 0 on `here`, this process's one card, then one

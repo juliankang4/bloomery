@@ -302,12 +302,7 @@ mod tests {
     use gguf::{GENERAL_ARCHITECTURE, Value};
     use std::cell::RefCell;
 
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fixture-remote-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).expect("scratch dir");
-        d
-    }
+    use crate::test_support::temp_dir as scratch;
 
     /// A GGUF of `n_tokens` tokenizer strings (a header of about `n_tokens * 30` bytes) and
     /// `tensors` F32 tensors of 8 values each, whole in memory.

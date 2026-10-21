@@ -7,9 +7,13 @@
 //! hold whole units of the tensor's role along that dim (a head's rows, say) and whole blocks of
 //! its format (a 64-value NVFP4 block along dim 0, a 128-row FP8 block along dim 1): a cut off
 //! either is refused by name. The family says which dim and unit ([`TpTensor::cut`]), the
-//! format its bytes and blocks, and [`card_blocks`] includes the role's kernel K unit.
+//! format its bytes and blocks, and [`card_blocks`] includes the role's kernel K unit. Which
+//! indices a rank holds is [`Cut::span`]'s, for every source of a rank's parts; [`part_of`] cuts
+//! a file tensor's bytes to them.
 
-use gguf::GgmlType;
+use std::ops::Range;
+
+use gguf::{GgmlType, TensorInfo};
 use models::Role;
 
 use super::devices::DeviceId;
@@ -87,6 +91,119 @@ impl Cut {
         }
         Ok(part)
     }
+
+    /// Rank `rank`'s indices along the cut of tensor `name` into `n` ranks: its [`Cut::part`],
+    /// `rank` parts in. A rank that is not one of the `n` is refused by name, as is every cut
+    /// [`Cut::part`] refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`TpError::Rank`] and [`Cut::part`]'s.
+    pub fn span(
+        self,
+        name: &str,
+        dims: &[u64],
+        blocks: [u64; 2],
+        rank: usize,
+        n: usize,
+    ) -> Result<Range<u64>, TpError> {
+        let part = self.part(name, dims, blocks, n)?;
+        check_rank(name, rank, n)?;
+        // `part · n` is the dim's extent, so the start does not wrap.
+        let start = part * rank as u64;
+        Ok(start..start + part)
+    }
+}
+
+/// Refuse a rank of `name` that is not one of `ranks`.
+///
+/// # Errors
+///
+/// [`TpError::Rank`].
+pub fn check_rank(name: &str, rank: usize, ranks: usize) -> Result<(), TpError> {
+    if rank >= ranks {
+        return Err(TpError::Rank {
+            name: name.into(),
+            rank,
+            ranks,
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a file tensor whose dims do not hold its bytes: no dim or a zero one, a dim 0 off its
+/// type's blocks, or a byte count those give past u64 or other than `t.nbytes`. Returns the
+/// checked type's block width and byte size.
+///
+/// # Errors
+///
+/// [`TpError::Tensor`] naming the tensor.
+pub fn check_bytes(t: &TensorInfo) -> Result<(u64, u64), TpError> {
+    let layout =
+        t.ty.blck_size()
+            .zip(t.ty.type_size())
+            .filter(|&(block, _)| {
+                block > 0
+                    && !t.dims.is_empty()
+                    && t.dims.iter().all(|&d| d > 0)
+                    && t.dims[0].is_multiple_of(block)
+            })
+            .filter(|&(block, size)| gguf::tensor_bytes(block, size, &t.dims) == Some(t.nbytes));
+    let Some(layout) = layout else {
+        return Err(TpError::Tensor {
+            name: t.name.clone(),
+            detail: format!("{} {:?} do not hold {} file bytes", t.ty, t.dims, t.nbytes),
+        });
+    };
+    Ok(layout)
+}
+
+/// The part of the file tensor `t` that holds the indices `at.1` along dim `at.0` (a rank's,
+/// [`Cut::span`]), or the whole tensor for `None`: the part's header entry (its dims, its bytes,
+/// the tensor's offset) and the byte ranges of its rows in the tensor's bytes, in row order. A
+/// tensor [`check_bytes`] refuses, indices that are empty, past the dim or along dim 0 off the
+/// type's blocks, and bytes past usize are refused by name.
+///
+/// # Errors
+///
+/// [`check_bytes`]' and [`TpError::Tensor`].
+pub fn part_of(
+    t: &TensorInfo,
+    at: Option<(usize, Range<u64>)>,
+) -> Result<(TensorInfo, Vec<Range<usize>>), TpError> {
+    let (block, size) = check_bytes(t)?;
+    let refuse = |detail: String| TpError::Tensor {
+        name: t.name.clone(),
+        detail,
+    };
+    let fit = |v: u64| usize::try_from(v).map_err(|_| refuse(format!("{v} bytes pass usize")));
+    let Some((dim, at)) = at else {
+        return Ok((t.clone(), std::iter::once(0..fit(t.nbytes)?).collect()));
+    };
+    let runs = gguf::tensor_runs(block, size, &t.dims, dim, at.clone()).ok_or_else(|| {
+        refuse(format!(
+            "indices {at:?} along dim {dim} of {:?} are not whole {} blocks of it",
+            t.dims, t.ty
+        ))
+    })?;
+    let mut dims = t.dims.clone();
+    dims[dim] = at.end - at.start;
+    // Each run lies inside the tensor's bytes, so neither the sum nor an end passes them.
+    let nbytes = runs.iter().map(|r| r.end - r.start).sum();
+    let ranges = runs
+        .into_iter()
+        .map(|r| Ok(fit(r.start)?..fit(r.end)?))
+        .collect::<Result<Vec<_>, TpError>>()?;
+    Ok((
+        TensorInfo {
+            name: t.name.clone(),
+            dims,
+            ty: t.ty,
+            offset: t.offset,
+            nbytes,
+        },
+        ranges,
+    ))
 }
 
 /// The values a part of a tensor of card type `ty`, whose format block spans `block` values along
@@ -199,6 +316,14 @@ pub enum TpError {
         ranks: usize,
         block: u64,
     },
+    #[error("tp: {name}: rank {rank} is not one of {ranks} ranks")]
+    Rank {
+        name: String,
+        rank: usize,
+        ranks: usize,
+    },
+    #[error("tp: {name}: {detail}")]
+    Tensor { name: String, detail: String },
     #[error("tp: rank {rank} on {node} is the device of rank {other}")]
     SameDevice {
         rank: usize,
@@ -286,7 +411,10 @@ pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, Tp
 
 #[cfg(test)]
 mod tests {
-    use super::{Cut, GgmlType, RankPool, Role, TpError, TpTensor, card_blocks, plan_tp};
+    use super::{
+        Cut, GgmlType, Range, RankPool, Role, TensorInfo, TpError, TpTensor, card_blocks, part_of,
+        plan_tp,
+    };
 
     fn pools(n: usize, bytes: u64) -> Vec<RankPool> {
         (0..n)
@@ -529,5 +657,198 @@ mod tests {
             card_blocks(GgmlType::MXFP4, [u64::MAX, 1], Role::RoutedExperts),
             Err(TpError::Overflow)
         );
+    }
+
+    /// A file tensor of `dims` of `ty`, its bytes numbered so a part's bytes name where they came
+    /// from.
+    fn tensor(ty: GgmlType, dims: &[u64]) -> (TensorInfo, Vec<u8>) {
+        let rows: u64 = dims[1..].iter().product();
+        let row = dims[0] / ty.blck_size().unwrap() * ty.type_size().unwrap();
+        let nbytes = rows * row;
+        let t = TensorInfo {
+            name: "t.weight".into(),
+            dims: dims.to_vec(),
+            ty,
+            offset: 0,
+            nbytes,
+        };
+        let bytes = (0..nbytes).map(|i| (i * 7 % 251) as u8).collect();
+        (t, bytes)
+    }
+
+    /// Rank `rank` of `n`'s part of `t` cut by `cut` as role `role` reads it: [`Cut::span`] at
+    /// the type's blocks and the role's K unit, then [`part_of`].
+    fn rank_part(
+        t: &TensorInfo,
+        cut: Option<Cut>,
+        role: Role,
+        rank: usize,
+        n: usize,
+    ) -> Result<(TensorInfo, Vec<Range<usize>>), TpError> {
+        let at = match cut {
+            None => None,
+            Some(c) => {
+                let blocks = card_blocks(t.ty, [super::check_bytes(t)?.0, 1], role)?;
+                Some((c.dim, c.span(&t.name, &t.dims, blocks, rank, n)?))
+            }
+        };
+        part_of(t, at)
+    }
+
+    /// Element `(i0, i1, i2)`'s bytes of a tensor of `dims`: `[row(i1, i2)][i0 block]`.
+    fn block_bytes(t: &TensorInfo, bytes: &[u8], i: [u64; 3]) -> Vec<u8> {
+        let (bs, ts) = (t.ty.blck_size().unwrap(), t.ty.type_size().unwrap());
+        let d = |k: usize| t.dims.get(k).copied().unwrap_or(1);
+        let row = d(0) / bs * ts;
+        let at = (i[2] * d(1) + i[1]) * row + i[0] / bs * ts;
+        bytes[at as usize..(at + ts) as usize].to_vec()
+    }
+
+    /// At N = 1, 2 and 4, along every dim of a 3-D stack and of a 2-D matrix, each rank's part
+    /// is the dims with the cut dim over N, its bytes the tensor's blocks at those indices, and
+    /// the parts' bytes add to the tensor's; whole tensors are their bytes on every rank.
+    #[test]
+    fn every_rank_holds_its_indices_of_the_cut_dim() {
+        for (ty, dims) in [
+            (GgmlType::Q5_K, vec![1024u64, 8, 4]),
+            (GgmlType::Q8_0, vec![256, 16]),
+            (GgmlType::F32, vec![8, 4, 16]),
+        ] {
+            let (t, bytes) = tensor(ty, &dims);
+            let bs = ty.blck_size().unwrap();
+            for n in [1usize, 2, 4] {
+                for dim in 0..dims.len() {
+                    let cut = Some(Cut { dim, unit: 1 });
+                    let mut total = 0;
+                    for r in 0..n {
+                        let (p, spans) = rank_part(&t, cut, Role::DenseFfn, r, n).unwrap();
+                        let part = dims[dim] / n as u64;
+                        let mut want_dims = dims.clone();
+                        want_dims[dim] = part;
+                        assert_eq!(p.dims, want_dims, "{ty} {dims:?} dim {dim} rank {r}/{n}");
+                        let got: Vec<u8> = spans
+                            .iter()
+                            .flat_map(|s| bytes[s.clone()].to_vec())
+                            .collect();
+                        assert_eq!(got.len() as u64, p.nbytes);
+                        let mut want = Vec::new();
+                        let d = |k: usize| want_dims.get(k).copied().unwrap_or(1);
+                        for i2 in 0..d(2) {
+                            for i1 in 0..d(1) {
+                                for i0 in (0..d(0)).step_by(bs as usize) {
+                                    let mut i = [i0, i1, i2];
+                                    i[dim] += r as u64 * part;
+                                    want.extend(block_bytes(&t, &bytes, i));
+                                }
+                            }
+                        }
+                        assert_eq!(got, want, "{ty} {dims:?} dim {dim} rank {r}/{n}");
+                        total += p.nbytes;
+                    }
+                    assert_eq!(total, t.nbytes);
+                }
+                let (p, spans) = rank_part(&t, None, Role::DenseFfn, n - 1, n).unwrap();
+                assert_eq!((&p.dims, p.nbytes), (&t.dims, t.nbytes));
+                assert_eq!(spans, vec![0..bytes.len()]);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_tensor_sizes_are_refused_before_cutting() {
+        let mut accepted = Vec::new();
+        for (dims, nbytes) in [
+            (vec![256, 1], 143),
+            (vec![256, 1], 145),
+            (vec![], 0),
+            (vec![0, 1], 0),
+            (vec![256, 0], 0),
+            (vec![257, 1], 144),
+            (vec![256, u64::MAX, 2], 144),
+        ] {
+            let t = TensorInfo {
+                name: "bad".into(),
+                dims: dims.clone(),
+                ty: GgmlType::Q4_K,
+                offset: 0,
+                nbytes,
+            };
+            for cut in [None, Some(Cut { dim: 1, unit: 1 })] {
+                if !std::panic::catch_unwind(|| rank_part(&t, cut, Role::DenseFfn, 0, 1))
+                    .is_ok_and(|result| result.is_err())
+                {
+                    accepted.push((dims.clone(), nbytes, cut));
+                }
+            }
+        }
+        assert!(accepted.is_empty(), "not refused safely: {accepted:?}");
+        assert!(gguf::tensor_runs(1, 0, &[64, 2, 1], 1, 0..1).is_none());
+        for dims in [[0, 2, 1], [64, 2, 0]] {
+            assert!(
+                gguf::tensor_runs(1, 4, &dims, 1, 0..1).is_none(),
+                "{dims:?}"
+            );
+        }
+        let (t, _) = tensor(GgmlType::Q5_K, &[512, 4]);
+        assert_eq!(super::check_bytes(&t).unwrap(), (256, 176));
+        for at in [
+            (0, 128..384),
+            (0, 256..768),
+            (1, 2..2),
+            (1, 3..5),
+            (2, 0..1),
+        ] {
+            assert!(part_of(&t, Some(at.clone())).is_err(), "{at:?}");
+        }
+        let (p, spans) = part_of(&t, Some((0, 256..512))).unwrap();
+        assert_eq!((p.dims, spans.len()), (vec![256, 4], 4));
+        let (t, _) = tensor(GgmlType::Q4_K, &[256, 1]);
+        assert!(rank_part(&t, Some(Cut { dim: 1, unit: 1 }), Role::DenseFfn, 0, 4).is_err());
+    }
+
+    /// An extent the ranks do not divide, a part of other than whole units, a dim-0 part off the
+    /// type's block or its card layout's K unit, a dim past the tensor's and a rank that is not
+    /// one of the ranks are refused by name.
+    #[test]
+    fn a_cut_off_its_unit_or_block_is_refused() {
+        let (t, _) = tensor(GgmlType::Q5_K, &[512, 6, 4]);
+        for (cut, rank, n) in [
+            (Cut { dim: 1, unit: 1 }, 0, 4),
+            (Cut { dim: 1, unit: 2 }, 0, 2),
+            (Cut { dim: 0, unit: 1 }, 0, 4),
+            (Cut { dim: 3, unit: 1 }, 0, 2),
+            (Cut { dim: 2, unit: 0 }, 0, 2),
+            (Cut { dim: 2, unit: 1 }, 2, 2),
+        ] {
+            assert!(
+                rank_part(&t, Some(cut), Role::DenseFfn, rank, n).is_err(),
+                "{cut:?} {rank}/{n}"
+            );
+        }
+        assert_eq!(
+            rank_part(&t, Some(Cut { dim: 2, unit: 1 }), Role::DenseFfn, 2, 2).unwrap_err(),
+            TpError::Rank {
+                name: t.name.clone(),
+                rank: 2,
+                ranks: 2
+            }
+        );
+        // An MXFP4 stack's card layout keeps 256 values along K: 1024 into 4 ranks, not into 8.
+        let (mx, _) = tensor(GgmlType::MXFP4, &[1024, 4]);
+        let k = Some(Cut { dim: 0, unit: 1 });
+        assert!(rank_part(&mx, k, Role::DenseFfn, 0, 4).is_ok());
+        assert!(rank_part(&mx, k, Role::DenseFfn, 0, 8).is_err());
+        let (nv, _) = tensor(GgmlType::NVFP4, &[1024, 64]);
+        for role in [Role::Attention, Role::DenseFfn, Role::SharedExpert] {
+            for n in [1, 2, 4] {
+                assert!(rank_part(&nv, k, role, 0, n).is_ok(), "{role:?} N={n}");
+            }
+            for n in [8, 16] {
+                let e = rank_part(&nv, k, role, 0, n).unwrap_err().to_string();
+                assert!(e.contains(&nv.name) && e.contains("256"), "{e}");
+            }
+        }
+        let (routed, _) = tensor(GgmlType::NVFP4, &[1024, 64, 2]);
+        assert!(rank_part(&routed, k, Role::RoutedExperts, 0, 16).is_ok());
     }
 }

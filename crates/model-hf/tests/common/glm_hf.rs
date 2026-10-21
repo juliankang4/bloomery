@@ -5,7 +5,7 @@ use hf::quant_config::{Config, plan};
 use safetensors::Dtype;
 use serde_json::Value;
 
-use super::{Geometry, Layout};
+use super::Geometry;
 
 pub(super) const GLM: Geometry = Geometry {
     layers: 45,
@@ -79,42 +79,4 @@ pub(super) fn gguf_table(text: &str, keep: impl Fn(&str) -> bool) -> BTreeMap<St
             )
         })
         .collect()
-}
-
-/// The glm5next tensor's elements from the source's `src`, `size` bytes an element, row-major
-/// `shape`; for [`Layout::NegExp`], `src` is f32. A stack's experts are joined by the caller.
-pub(super) fn apply(layout: &Layout, src: &[u8], shape: &[usize], size: usize) -> Vec<u8> {
-    match *layout {
-        Layout::Same | Layout::Stack(_) => src.to_vec(),
-        Layout::KeyHalf { heads, nope, v } => {
-            let rank = shape[1];
-            let mut out = Vec::with_capacity(heads * rank * nope * size);
-            for h in 0..heads {
-                let head = &src[h * (nope + v) * rank * size..];
-                for c in 0..rank {
-                    for r in 0..nope {
-                        out.extend_from_slice(&head[(r * rank + c) * size..][..size]);
-                    }
-                }
-            }
-            out
-        }
-        Layout::ValueHalf { heads, nope, v } => {
-            let row = shape[1] * size;
-            (0..heads)
-                .flat_map(|h| &src[(h * (nope + v) + nope) * row..][..v * row])
-                .copied()
-                .collect()
-        }
-        Layout::NegExp { heads } => src
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .take(heads)
-            .flat_map(|&b| {
-                let x = f32::from_le_bytes(b);
-                ((-f64::from(x).exp()) as f32).to_le_bytes()
-            })
-            .collect(),
-    }
 }

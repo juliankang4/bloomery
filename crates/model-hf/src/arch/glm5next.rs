@@ -11,19 +11,25 @@
 //! Shapes are logical element counts in ggml's order, the fastest axis first; a packed
 //! weight's caller gives its unpacked shape.
 //!
-//! Tensor parallel splits each mapped tensor by the family's rule ([`tp::cut`]); the bytes and the
-//! blocks a cut keeps are its format's ([`Format::held`]), along K at least its card layout's
-//! unit ([`card_blocks`]), and the plan is [`plan_tp`](model::placement::tp::plan_tp)'s.
+//! Tensor parallel splits each mapped tensor by the family's rule ([`tp::cut_of`]); the bytes and
+//! the blocks a cut keeps are its format's ([`Format::held`]), along K at least its card layout's
+//! unit, and the plan is [`plan_tp`](model::placement::tp::plan_tp)'s. [`open`] gives the folder
+//! as a load reads it ([`Checkpoint`]): each glm5next tensor made of its checkpoint
+//! tensors, its layout the move after they are normalized ([`Layout::apply`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use gguf::GgmlType;
+use hf::modelopt::{Normal, Plain, Use};
 use hf::quant_config::{self, Config, Format};
 use model::arch::glm5next::names::{self, Sub};
-use model::arch::glm5next::{roles, tp};
-use model::placement::tp::{TpTensor, card_blocks};
+use model::arch::glm5next::tp;
+use model::placement::tp::TpTensor;
 use safetensors::{Dtype, Folder};
 use serde_json::Value;
+
+use crate::part::{self, Checkpoint, Made};
 
 /// Why the checkpoint was refused.
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +42,8 @@ pub enum Error {
     Folder(#[from] safetensors::Error),
     #[error("glm5next hf: {0}")]
     Quant(#[from] quant_config::Error),
+    #[error("glm5next hf: {0}")]
+    Part(#[from] part::Error),
 }
 
 fn refuse(name: &str, what: impl Into<String>) -> Error {
@@ -91,6 +99,83 @@ pub enum Layout {
     ValueHalf { heads: usize, nope: usize, v: usize },
     /// `-exp(x)` of the first `heads` values, as f32, computed in f64 and rounded once.
     NegExp { heads: usize },
+}
+
+impl Layout {
+    /// Move `n`, the normalized source of the glm5next tensor `name` (a stack's experts already
+    /// one after another), into the layout: its bytes and dims become the tensor's. A layout
+    /// that moves single values of a tensor of blocks, `-exp` of other than F32, and a source of
+    /// other values than the layout reads are refused by name.
+    pub fn apply(&self, name: &str, n: &mut Normal) -> Result<(), Error> {
+        let ty = GgmlType::from_u32(n.type_id);
+        let size = match ty {
+            GgmlType::BF16 => 2,
+            GgmlType::F32 => 4,
+            _ if matches!(self, Layout::Same | Layout::Stack(_)) => return Ok(()),
+            _ => {
+                return Err(refuse(
+                    name,
+                    format!("{ty} holds blocks; {self:?} moves single values"),
+                ));
+            }
+        };
+        let held = |want: Option<usize>| {
+            want.filter(|&w| w == n.bytes.len()).ok_or_else(|| {
+                refuse(
+                    name,
+                    format!("{self:?} does not read {} bytes of {ty}", n.bytes.len()),
+                )
+            })
+        };
+        let (bytes, dims) = match *self {
+            Layout::Same | Layout::Stack(_) => return Ok(()),
+            Layout::KeyHalf { heads, nope, v } | Layout::ValueHalf { heads, nope, v } => {
+                let rows = nope.checked_add(v).and_then(|w| w.checked_mul(heads));
+                let rank = n.dims.first().map(|&r| r as usize).unwrap_or(0);
+                held(rows.and_then(|r| r.checked_mul(rank)?.checked_mul(size)))?;
+                let row = rank * size;
+                let head = |h: usize| &n.bytes[h * (nope + v) * row..][..(nope + v) * row];
+                if matches!(self, Layout::KeyHalf { .. }) {
+                    let mut out = Vec::with_capacity(heads * nope * row);
+                    for h in 0..heads {
+                        for c in 0..rank {
+                            for r in 0..nope {
+                                out.extend_from_slice(&head(h)[(r * rank + c) * size..][..size]);
+                            }
+                        }
+                    }
+                    (out, vec![nope, rank, heads])
+                } else {
+                    let out = (0..heads)
+                        .flat_map(|h| &head(h)[nope * row..])
+                        .copied()
+                        .collect();
+                    (out, vec![rank, v, heads])
+                }
+            }
+            Layout::NegExp { heads } => {
+                if ty != GgmlType::F32 || n.bytes.len() < heads.saturating_mul(4) {
+                    return Err(refuse(
+                        name,
+                        format!(
+                            "-exp reads {heads} F32 values, not {ty} of {} bytes",
+                            n.bytes.len()
+                        ),
+                    ));
+                }
+                let mut out = Vec::with_capacity(heads * 4);
+                for (i, &b) in n.bytes.as_chunks::<4>().0[..heads].iter().enumerate() {
+                    let y = super::neg_exp(f32::from_le_bytes(b))
+                        .map_err(|why| refuse(name, format!("-exp at {i}: {why}")))?;
+                    out.extend_from_slice(&y.to_le_bytes());
+                }
+                (out, vec![heads])
+            }
+        };
+        n.bytes = bytes;
+        n.dims = dims.into_iter().map(|d| d as u64).collect();
+        Ok(())
+    }
 }
 
 /// One glm5next tensor.
@@ -188,10 +273,7 @@ pub fn map<'a>(
             },
         )?;
     }
-    let layers: BTreeSet<usize> = out
-        .keys()
-        .filter_map(|n| n.strip_prefix("blk.")?.split_once('.')?.0.parse().ok())
-        .collect();
+    let layers: BTreeSet<usize> = out.keys().filter_map(|n| layer_of(n)).collect();
     for l in layers {
         for (trigger, required) in parts(l) {
             if let Some(have) = trigger.iter().find(|n| out.contains_key(*n))
@@ -345,15 +427,18 @@ fn layer(
     }
 }
 
-/// The tensor-parallel tensors of the checkpoint whose tensors are `table` (name, dtype, stored shape)
-/// under `config` and geometry `g`, as the plan takes them: each placed by its format, mapped to
-/// its glm5next name and dims, held and cut. A tensor the config refuses, a format with no held
-/// form, a stack of mixed formats and a table with no text tensors are refused by name.
-pub fn tp_tensors(
+/// Each glm5next tensor, by name, with the format it is held in.
+type HeldMap = BTreeMap<String, (Mapped, Format)>;
+
+/// The checkpoint whose tensors are `table` (name, dtype, stored shape) placed by `config` and
+/// mapped under geometry `g`: the placement plan, and each glm5next tensor with the format it is
+/// held in. A tensor the config refuses, a stack of mixed formats and a table with no text
+/// tensors are refused by name.
+fn placed_map(
     g: Geometry,
     config: &Config,
     table: &[(String, Dtype, Vec<usize>)],
-) -> Result<Vec<TpTensor>, Error> {
+) -> Result<(quant_config::Plan, HeldMap), Error> {
     let placed = quant_config::plan(
         config,
         table.iter().map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
@@ -375,7 +460,7 @@ pub fn tp_tensors(
         return Err(refuse("checkpoint", "no GLM-5.3-Flash text tensors"));
     }
     let format = |name: &str| placed.placed[name].format;
-    mapped
+    let held = mapped
         .into_iter()
         .map(|(name, m)| {
             let f = match &m.layout {
@@ -393,30 +478,102 @@ pub fn tp_tensors(
                 }
                 _ => format(&m.source),
             };
+            Ok((name, (m, f)))
+        })
+        .collect::<Result<_, Error>>()?;
+    Ok((placed, held))
+}
+
+/// The tensor-parallel tensors of the checkpoint whose tensors are `table` (name, dtype, stored
+/// shape) under `config` and geometry `g`, as the plan takes them: each placed by its format,
+/// mapped to its glm5next name and dims, held and cut ([`mapped_tp`]). A refusal of
+/// [`placed_map`] or of [`mapped_tp`] is refused by name.
+#[cfg(test)]
+fn tp_tensors(
+    g: Geometry,
+    config: &Config,
+    table: &[(String, Dtype, Vec<usize>)],
+) -> Result<Vec<TpTensor>, Error> {
+    let (_, mapped) = placed_map(g, config, table)?;
+    mapped_tp(g, &mapped)
+}
+
+/// The layer of the glm5next name `name` the map writes, `None` for a tensor of no layer.
+fn layer_of(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("blk.")?;
+    let l = rest.split('.').next().unwrap_or_default();
+    Some(l.parse().expect("mapped layer index"))
+}
+
+/// The tensors of `mapped` a TP rank of trunk geometry `g` holds on the card ([`tp::card_holds`]),
+/// each in its format's held form, cut by the family's rule. A format with no held or resident
+/// card form and a cut the rule refuses are refused by name.
+fn mapped_tp(g: Geometry, mapped: &HeldMap) -> Result<Vec<TpTensor>, Error> {
+    mapped
+        .iter()
+        .filter(|(name, _)| tp::card_holds(name, layer_of(name), g.layers))
+        .map(|(name, (m, f))| {
             let dims: Vec<u64> = m.dims.iter().map(|&d| d as u64).collect();
-            let h = f
+            let (h, ty) = f
                 .held(&dims)
-                .ok_or_else(|| refuse(&name, format!("no held form for {f} {dims:?}")))?;
-            let cut = tp::cut(&name, &dims, g.heads as u64)
-                .map_err(|why| refuse(&name, why.to_string()))?;
-            let block = match (f.card_type(), cut) {
-                (Some(ty), Some(_)) => {
-                    let role =
-                        roles::tensor_role(&name).ok_or_else(|| refuse(&name, "no tensor role"))?;
-                    card_blocks(ty, h.block, role).map_err(|e| refuse(&name, e.to_string()))?
-                }
-                _ => h.block,
-            };
+                .zip(f.card_type())
+                .ok_or_else(|| refuse(name, format!("no held form for {f} {dims:?}")))?;
+            let split = tp::cut_of(name, ty, &dims, g.heads as u64)
+                .map_err(|why| refuse(name, why.to_string()))?;
+            let bytes = dims
+                .split_first()
+                .and_then(|(&k, rest)| {
+                    let rows = rest.iter().try_fold(1u64, |a, &b| a.checked_mul(b))?;
+                    gguf::card::CardFormat::of(ty)?.resident_bytes(ty, k, rows)
+                })
+                .ok_or_else(|| refuse(name, format!("no resident card form for {ty} {dims:?}")))?;
             Ok(TpTensor {
-                cut,
-                name,
+                cut: split.map(|(c, _)| c),
+                block: split.map_or(h.block, |(_, b)| b),
+                name: name.clone(),
                 dims,
-                bytes: h.bytes,
+                bytes,
                 whole_bytes: h.whole_bytes,
-                block,
             })
         })
         .collect()
+}
+
+/// How a load reads the glm5next tensor `m` held in format `f` ([`part::Made`]): its sources, the
+/// role's read (BF16 as stored, an F32 or `-exp` source as F32, a quantized one in its card
+/// type) and, for a layout that moves values, that move. A layout that moves single values of a
+/// quantized source is refused by name.
+fn made(name: &str, m: Mapped, f: Format) -> Result<Made, Error> {
+    let moves = matches!(
+        m.layout,
+        Layout::KeyHalf { .. } | Layout::ValueHalf { .. } | Layout::NegExp { .. }
+    );
+    if moves && !matches!(f, Format::Bf16 | Format::F32) {
+        return Err(refuse(
+            name,
+            format!("{:?} moves single values; {f} holds blocks", m.layout),
+        ));
+    }
+    let role = Use::Matrix(if f == Format::Bf16 {
+        Plain::Bf16
+    } else {
+        Plain::F32
+    });
+    let sources = match &m.layout {
+        Layout::Stack(sources) => sources.clone(),
+        _ => vec![m.source.clone()],
+    };
+    let step = moves.then(|| {
+        let (layout, name) = (m.layout.clone(), name.to_string());
+        Box::new(move |n: &mut Normal| layout.apply(&name, n).map_err(|e| e.to_string()))
+            as part::Step
+    });
+    Ok(Made {
+        sources,
+        role,
+        dims: m.dims.iter().map(|&d| d as u64).collect(),
+        step,
+    })
 }
 
 /// The required mapped names of a whole checkpoint, including its configured next-token layers.
@@ -499,16 +656,25 @@ fn required(
     Ok((Geometry { layers, ..g }, required))
 }
 
-/// [`tp_tensors`] of the model folder `dir`: its `config.json` (the geometry and the quantization
-/// config, with `hf_quant_config.json` when present) and every shard's header. Every configured
-/// text layer and required tensor must be present, including NextN; the returned plan covers
-/// the trunk and its embedding, head and final norm. NextN is not loaded by this plan.
-pub fn read_tp(dir: &Path) -> Result<Vec<TpTensor>, Error> {
+/// The model folder `dir` read whole: its config's trunk geometry, its quantization config
+/// (`config.json`, with `hf_quant_config.json` when present), the folder, every shard's header
+/// table, and the required tensors of every configured text layer, NextN's included, under the
+/// geometry of the trunk and NextN layers.
+struct Read {
+    trunk: Geometry,
+    all: Geometry,
+    required: BTreeSet<String>,
+    config: Config,
+    folder: Folder,
+    table: Vec<(String, Dtype, Vec<usize>)>,
+}
+
+fn read(dir: &Path) -> Result<Read, Error> {
     let path = dir.join("config.json");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
     let json: Value = serde_json::from_str(&text).map_err(|e| Error::Config(e.to_string()))?;
-    let g = Geometry::of(&json)?;
+    let trunk = Geometry::of(&json)?;
     let config = Config::read(dir)?;
     let folder = Folder::open(dir)?;
     let table = folder
@@ -518,21 +684,44 @@ pub fn read_tp(dir: &Path) -> Result<Vec<TpTensor>, Error> {
             Ok((n.to_string(), raw.dtype, raw.shape.to_vec()))
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    let (all, required) = required(&json, g, table.len())?;
-    let tensors = tp_tensors(all, &config, &table)?;
-    let present: BTreeSet<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
-    if let Some(name) = required.iter().find(|n| !present.contains(n.as_str())) {
-        return Err(refuse(name, "checkpoint is missing a required text tensor"));
+    let (all, required) = required(&json, trunk, table.len())?;
+    Ok(Read {
+        trunk,
+        all,
+        required,
+        config,
+        folder,
+        table,
+    })
+}
+
+impl Read {
+    /// The first required tensor `present` lacks, refused by name.
+    fn check_required<'a>(&self, present: impl IntoIterator<Item = &'a str>) -> Result<(), Error> {
+        let present: BTreeSet<&str> = present.into_iter().collect();
+        match self.required.iter().find(|n| !present.contains(n.as_str())) {
+            Some(name) => Err(refuse(name, "checkpoint is missing a required text tensor")),
+            None => Ok(()),
+        }
     }
-    Ok(tensors
+}
+
+/// The model folder `dir` as a load reads it ([`Checkpoint`]), with its trunk geometry,
+/// header-only placement tensors and checkpoint parts ([`made`]). Every configured text layer
+/// and required tensor must be present, including NextN. The checkpoint parts cover the trunk,
+/// embedding, head and final norm ([`tp::in_trunk`]); NextN is not made. The card plan excludes
+/// the host-read embedding ([`mapped_tp`]).
+pub fn open(dir: &Path) -> Result<(Geometry, Vec<TpTensor>, Checkpoint), Error> {
+    let r = read(dir)?;
+    let (plan, mapped) = placed_map(r.all, &r.config, &r.table)?;
+    r.check_required(mapped.keys().map(String::as_str))?;
+    let tensors = mapped_tp(r.trunk, &mapped)?;
+    let made = mapped
         .into_iter()
-        .filter(|t| {
-            t.name
-                .strip_prefix("blk.")
-                .and_then(|n| n.split_once('.'))
-                .is_none_or(|(l, _)| l.parse::<usize>().expect("mapped layer index") < g.layers)
-        })
-        .collect())
+        .filter(|(name, _)| tp::in_trunk(layer_of(name), r.trunk.layers))
+        .map(|(name, (m, f))| Ok((name.clone(), made(&name, m, f)?)))
+        .collect::<Result<_, Error>>()?;
+    Ok((r.trunk, tensors, Checkpoint::new(r.folder, plan, made)?))
 }
 
 #[cfg(test)]
@@ -543,6 +732,8 @@ mod test_support;
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::test_support::temp_dir;
+    use model::part::{Source, Take};
     use model::placement::tp::{RankPool, TpError, plan_tp};
 
     /// Layers 0 (KDA, dense) and 3 (latent attention, 288 experts) and the unlayered tensors of
@@ -584,8 +775,9 @@ mod tests {
     }
 
     /// kv_b_proj splits per head as llama.cpp's converter does (`view(heads, nope + v, rank)`,
-    /// split, key half transposed); `A_log` becomes `-exp` of its first `heads` values; a missing
-    /// expert, an unknown name and a zero count in the config are refused by name.
+    /// split, key half transposed); `A_log` becomes `-exp` of its first `heads` values; a move of
+    /// blocks or of other values than it reads, a missing expert, an unknown name and a zero
+    /// count in the config are refused by name.
     #[test]
     fn layouts_move_elements_as_the_converter_does() {
         // Two heads of nope 2 and v 1 over rank 3: element (row, col) holds 10 * row + col.
@@ -607,22 +799,86 @@ mod tests {
             &shape,
         )
         .unwrap();
-        let k = apply(&kv[0].1.layout, &src, &shape, 1);
-        assert_eq!(k, [0, 10, 1, 11, 2, 12, 30, 40, 31, 41, 32, 42]);
-        let v_half = apply(&kv[1].1.layout, &src, &shape, 1);
-        assert_eq!(v_half, [20, 21, 22, 50, 51, 52]);
+        let moved = |layout: &Layout, ty: GgmlType, bytes: Vec<u8>, dims: Vec<u64>| {
+            let mut n = Normal {
+                type_id: ty.as_u32(),
+                dims,
+                bytes,
+                scale: vec![],
+            };
+            layout.apply("t", &mut n).unwrap();
+            n
+        };
+        let wide: Vec<u8> = src
+            .iter()
+            .flat_map(|&b| u16::from(b).to_le_bytes())
+            .collect();
+        let dims = vec![rank as u64, (heads * (nope + v)) as u64];
+        let k = moved(&kv[0].1.layout, GgmlType::BF16, wide.clone(), dims.clone());
+        let narrow = |n: &Normal| n.bytes.iter().step_by(2).copied().collect::<Vec<u8>>();
+        assert_eq!(narrow(&k), [0, 10, 1, 11, 2, 12, 30, 40, 31, 41, 32, 42]);
+        assert_eq!(
+            (k.dims, kv[0].1.dims.clone()),
+            (vec![2, 3, 2], vec![2, 3, 2])
+        );
+        let v_half = moved(&kv[1].1.layout, GgmlType::BF16, wide, dims);
+        assert_eq!(narrow(&v_half), [20, 21, 22, 50, 51, 52]);
+        assert_eq!(v_half.dims, [3, 1, 2]);
         let a: Vec<u8> = [0.0f32, 1.0, 9.0]
             .iter()
             .flat_map(|x| x.to_le_bytes())
             .collect();
-        let neg = apply(&Layout::NegExp { heads: 2 }, &a, &[3], 4);
+        let neg = moved(
+            &Layout::NegExp { heads: 2 },
+            GgmlType::F32,
+            a.clone(),
+            vec![3],
+        );
         let neg: Vec<f32> = neg
+            .bytes
             .as_chunks::<4>()
             .0
             .iter()
             .map(|&b| f32::from_le_bytes(b))
             .collect();
         assert_eq!(neg, [-1.0, -1.0f32.exp()]);
+        for x in [
+            100.0f32,
+            -1000.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            let mut n = Normal {
+                type_id: GgmlType::F32.as_u32(),
+                dims: vec![1],
+                bytes: x.to_le_bytes().to_vec(),
+                scale: vec![],
+            };
+            let e = Layout::NegExp { heads: 1 }
+                .apply("blk.0.ssm_a", &mut n)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("blk.0.ssm_a") && e.contains("-exp at 0"),
+                "{x}: {e}"
+            );
+            assert_eq!(n.bytes, x.to_le_bytes(), "a refusal leaves {x} unchanged");
+        }
+        for (layout, ty, bytes) in [
+            (kv[0].1.layout.clone(), GgmlType::Q8_0, vec![0; 34]),
+            (kv[0].1.layout.clone(), GgmlType::BF16, vec![0; 6]),
+            (Layout::NegExp { heads: 4 }, GgmlType::F32, a.clone()),
+            (Layout::NegExp { heads: 2 }, GgmlType::BF16, a),
+        ] {
+            let mut n = Normal {
+                type_id: ty.as_u32(),
+                dims: vec![32, 1],
+                bytes,
+                scale: vec![],
+            };
+            assert!(layout.apply("t", &mut n).is_err(), "{layout:?} {ty}");
+        }
 
         let g = Geometry {
             layers: 2,
@@ -742,15 +998,19 @@ mod tests {
             .collect()
     }
 
-    /// Each rank's bytes at N = 1, 2 and 4 on the three layers, and on the whole trunk by the
-    /// layers of each kind the config lists: the sums an independent count of the checkpoint's
-    /// 42 headers gives (91,635,719,928 B a rank at N = 2, 46,703,294,072 at N = 4, the
-    /// checkpoint's text weights with block scales decoded and BF16 as shipped), its FP8 weights
-    /// of one scale a 128 by 128 block held as FP8_B128, an f32 scale a 128 values of a row.
+    /// Each rank's resident card bytes at N = 1, 2 and 4 on the three layers, and on the whole
+    /// trunk by the layers of each kind the config lists: the host-read embedding excluded,
+    /// BF16 expanded to F32, block scales decoded and FP8_B128 held with an f32 scale a 128 values.
     #[test]
     fn fp4_local_ranks_hold_the_header_tables_split_bytes() {
         let (g, quant, config, table) = fp4_local();
         let ts = tp_tensors(g, &quant, &table).unwrap();
+        assert!(ts.iter().all(|t| t.name != "token_embd.weight"));
+        let bf16 = ts
+            .iter()
+            .find(|t| t.name == "blk.0.attn_norm.weight")
+            .unwrap();
+        assert_eq!(bf16.bytes, bf16.dims.iter().product::<u64>() * 4);
         let q_b = ts
             .iter()
             .find(|t| t.name == "blk.3.attn_q_b.weight")
@@ -776,10 +1036,6 @@ mod tests {
             .map(|t| t.bytes)
             .sum();
         assert_ne!(bias_bytes, 0);
-        let layer = |name: &str| {
-            name.strip_prefix("blk.")
-                .and_then(|r| r.split('.').next()?.parse::<usize>().ok())
-        };
         let text = &config["text_config"];
         let kind = |l: usize| {
             (
@@ -793,10 +1049,11 @@ mod tests {
             copies.insert(Some(l), n);
         }
         assert_eq!(copies.values().sum::<u64>(), 1 + g.layers as u64);
+        // PIN(2026-10-21): card budgets exclude the host-read embedding's 2,537,553,920 F32 bytes.
         for (n, fixture, trunk) in [
-            (1, 10_737_098_888, 181_500_571_640),
-            (2, 6_021_603_208, 91_635_719_928),
-            (4, 3_663_855_368, 46_703_294_072),
+            (1, 9_540_311_176, 181_173_986_296),
+            (2, 4_803_123_080, 91_041_026_808),
+            (4, 2_434_529_032, 45_974_547_064),
         ] {
             let plan = plan_tp(&pools(n), &ts).unwrap();
             assert!(
@@ -814,7 +1071,7 @@ mod tests {
             for (l, k) in &copies {
                 let part: Vec<_> = ts
                     .iter()
-                    .filter(|t| layer(&t.name) == *l)
+                    .filter(|t| layer_of(&t.name) == *l)
                     .cloned()
                     .collect();
                 sum += k * plan_tp(&pools(n), &part).unwrap()[0].bytes();
@@ -864,8 +1121,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_folder_requires_the_whole_configured_text_model() {
+    /// A three-layer GLM checkpoint of F32 tensors two wide (KDA and dense, latent and routed,
+    /// KDA and routed) with one NextN layer, from the FP4-Local table: its config and its tensors
+    /// (name, shape).
+    fn small_glm() -> (Value, Vec<(String, Vec<usize>)>) {
         let (_, quant, _, raw) = fp4_local();
         let config = serde_json::json!({"text_config": {
             "num_hidden_layers": 3, "num_attention_heads": 2,
@@ -908,43 +1167,191 @@ mod tests {
                 shape,
             ));
         }
-        let dir = std::env::temp_dir().join(format!(
-            "glm-tp-folder-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let write = |config: &Value, omit: &[&str]| {
-            std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
-            let kept: Vec<_> = table
-                .iter()
-                .filter(|(n, _)| !omit.iter().any(|p| n.contains(p)))
-                .collect();
-            let data: Vec<_> = kept
-                .iter()
-                .map(|(_, s)| vec![0u8; 4 * s.iter().product::<usize>()])
-                .collect();
-            let entries: Vec<_> = kept
-                .iter()
-                .zip(&data)
-                .map(|((n, s), d)| (n.as_str(), "F32", s.as_slice(), d.as_slice()))
-                .collect();
-            std::fs::write(dir.join("model.safetensors"), safetensors::write(&entries)).unwrap();
-            let weights: BTreeMap<_, _> = kept
-                .iter()
-                .map(|(n, _)| (n.as_str(), "model.safetensors"))
-                .collect();
-            std::fs::write(
-                dir.join(Folder::INDEX),
-                serde_json::json!({"weight_map": weights}).to_string(),
-            )
-            .unwrap();
+        (config, table)
+    }
+
+    /// Write `config` and the tensors of `table` that no part of `omit` names into `dir` as a
+    /// one-shard folder, every value distinct and finite.
+    fn write_small(dir: &Path, config: &Value, table: &[(String, Vec<usize>)], omit: &[&str]) {
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let kept: Vec<_> = table
+            .iter()
+            .filter(|(n, _)| !omit.iter().any(|p| n.contains(p)))
+            .collect();
+        let mut at = 0u32;
+        let data: Vec<Vec<u8>> = kept
+            .iter()
+            .map(|(_, s)| {
+                (0..s.iter().product::<usize>())
+                    .flat_map(|_| {
+                        at += 1;
+                        (at as f32 / 64.0).to_le_bytes()
+                    })
+                    .collect()
+            })
+            .collect();
+        let entries: Vec<_> = kept
+            .iter()
+            .zip(&data)
+            .map(|((n, s), d)| (n.as_str(), "F32", s.as_slice(), d.as_slice()))
+            .collect();
+        std::fs::write(dir.join("model.safetensors"), safetensors::write(&entries)).unwrap();
+        let weights: BTreeMap<_, _> = kept
+            .iter()
+            .map(|(n, _)| (n.as_str(), "model.safetensors"))
+            .collect();
+        std::fs::write(
+            dir.join(Folder::INDEX),
+            serde_json::json!({"weight_map": weights}).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// The small GLM folder, opened as a load reads it, holds the plan's tensors at the plan's
+    /// dims and gives each rank the part the GGUF file of the same model gives
+    /// under the family's rule (`tp::rank_span`): every trunk tensor, the key and value halves
+    /// and `-exp(A_log)` moved as the converter moves them before their cut, NextN left out.
+    /// Too many ranks are refused by name before a read; a move of single values over a
+    /// quantized source is refused when the folder opens.
+    #[test]
+    fn a_glm_folder_gives_each_rank_its_gguf_s_part() {
+        let (mut config, mut table) = small_glm();
+        config["text_config"]["num_attention_heads"] = 4.into();
+        for (name, shape) in &mut table {
+            for dim in shape.iter_mut().filter(|d| **d == 2) {
+                *dim = 4;
+            }
+            if name.ends_with(".kv_b_proj.weight") {
+                shape[0] = 16;
+            }
+        }
+        let dir = temp_dir("tp-rank");
+        write_small(&dir, &config, &table, &[]);
+        let (g, opened_plan, checkpoint) = open(&dir).unwrap();
+        let plan: BTreeMap<String, Vec<u64>> = opened_plan
+            .iter()
+            .map(|t| (t.name.clone(), t.dims.clone()))
+            .collect();
+        let mut held: BTreeMap<String, Vec<u64>> = checkpoint
+            .made()
+            .iter()
+            .map(|(n, m)| (n.clone(), m.dims.clone()))
+            .collect();
+        assert_eq!(held.remove("token_embd.weight"), Some(vec![4, 4]));
+        assert!(!plan.contains_key("token_embd.weight"));
+        let nextn = |n: &String| layer_of(n) == Some(g.layers);
+        assert!(
+            !plan.keys().any(nextn),
+            "the card plan holds no NextN tensor"
+        );
+        assert!(
+            !held.keys().any(nextn),
+            "the checkpoint makes no NextN tensor"
+        );
+        assert_eq!(held, plan);
+        let folder = &checkpoint;
+        let file = part::tests::gguf_of(folder, &dir.join("model.gguf"));
+        let gguf = &file;
+        let rule = |rank, ranks| {
+            move |name: &str, ty, dims: &[u64]| {
+                if name == "token_embd.weight" {
+                    return Ok(Take::Skip);
+                }
+                let span = tp::rank_span(name, ty, dims, g.heads as u64, rank, ranks)?;
+                Ok::<_, model::placement::PlacementError>(
+                    span.map_or(Take::Whole, |(d, at)| Take::Part(d, at)),
+                )
+            }
         };
+        fn parts<E: std::fmt::Display>(
+            src: &impl Source,
+            rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
+        ) -> BTreeMap<String, (Vec<u64>, Vec<u8>)> {
+            src.plan(rule)
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    let part = src.read(p).unwrap();
+                    (
+                        p.info.name.clone(),
+                        (part.info.dims.clone(), part.spans().concat()),
+                    )
+                })
+                .collect()
+        }
+        let mut cut = 0;
+        for ranks in [1, 2, 4] {
+            let budget = plan_tp(&pools(ranks), &opened_plan).unwrap();
+            for (rank, planned) in budget.iter().enumerate() {
+                for loaded in [
+                    gguf.plan(rule(rank, ranks)).unwrap(),
+                    folder.plan(rule(rank, ranks)).unwrap(),
+                ] {
+                    let bytes: u64 = loaded
+                        .iter()
+                        .map(|p| {
+                            let t = &p.info;
+                            gguf::card::CardFormat::of(t.ty)
+                                .unwrap()
+                                .resident_bytes(t.ty, t.dims[0], t.dims[1..].iter().product())
+                                .unwrap()
+                        })
+                        .sum();
+                    assert_eq!(planned.bytes(), bytes, "rank {rank} of {ranks}");
+                }
+                let (want, got) = (
+                    parts(gguf, rule(rank, ranks)),
+                    parts(folder, rule(rank, ranks)),
+                );
+                assert_eq!(got.len(), plan.len());
+                assert_eq!(got, want, "rank {rank} of {ranks}");
+                cut += got.iter().filter(|(n, (d, _))| plan[*n] != *d).count();
+            }
+        }
+        assert!(cut > 20, "{cut} parts cut");
+        let r = read(&dir).unwrap();
+        let (placed, mapped) = placed_map(r.all, &r.config, &r.table).unwrap();
+        let whole = parts(folder, rule(0, 1));
+        let mut moved = 0;
+        for (name, m) in checkpoint.made().iter().filter(|(_, m)| m.step.is_some()) {
+            let source = [(m.sources[0].as_str(), &placed.placed[&m.sources[0]])];
+            let mut want = hf::modelopt::normalize(|n| r.folder.raw(n), &source, m.role).unwrap();
+            mapped[name].0.layout.apply(name, &mut want).unwrap();
+            assert_eq!(whole[name].1, want.bytes, "{name}");
+            moved += 1;
+        }
+        assert!(moved >= 3, "{moved} moved");
+        // PIN(2026-10-21): four-head success replaces the two-head N=4 refusal; N=8 still refuses.
+        let e = [
+            gguf.plan(rule(0, 8)).unwrap_err().to_string(),
+            folder.plan(rule(0, 8)).unwrap_err().to_string(),
+        ];
+        for e in e {
+            assert!(e.contains("into 8 ranks"), "{e}");
+        }
+        let kv = Mapped {
+            source: "kv_b_proj".into(),
+            layout: Layout::KeyHalf {
+                heads: 2,
+                nope: 2,
+                v: 2,
+            },
+            dims: vec![2, 2, 2],
+        };
+        let e = made("blk.1.attn_k_b.weight", kv, Format::Mxfp8)
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("MXFP8 holds blocks"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_requires_the_whole_configured_text_model() {
+        let (config, table) = small_glm();
+        let dir = temp_dir("tp-folder");
+        let write = |config: &Value, omit: &[&str]| write_small(&dir, config, &table, omit);
         write(&config, &[]);
-        let full = read_tp(&dir).unwrap();
+        let (_, full, _) = open(&dir).unwrap();
         let full_bytes = plan_tp(&pools(2), &full).unwrap()[0].bytes();
         assert!(full.iter().all(|t| !t.name.starts_with("blk.3.")));
         let mut accepted = Vec::new();
@@ -1016,8 +1423,8 @@ mod tests {
             ),
         ] {
             write(&config, omit);
-            match read_tp(&dir) {
-                Ok(tensors) => {
+            match open(&dir) {
+                Ok((_, tensors, _)) => {
                     let bytes = plan_tp(&pools(2), &tensors).unwrap()[0].bytes();
                     println!("ACCEPTED {what}: PLAN_OK bytes={bytes}, full={full_bytes}");
                     accepted.push(what);
@@ -1047,8 +1454,8 @@ mod tests {
             let mut bad = config.clone();
             bad["text_config"][key] = value;
             write(&bad, &[]);
-            match read_tp(&dir) {
-                Ok(tensors) => {
+            match open(&dir) {
+                Ok((_, tensors, _)) => {
                     println!(
                         "ACCEPTED {key}: PLAN_OK bytes={}",
                         plan_tp(&pools(2), &tensors).unwrap()[0].bytes()
@@ -1066,12 +1473,12 @@ mod tests {
             &config,
             &["e_score_correction_bias", "shared_head.norm.weight"],
         );
-        read_tp(&dir).unwrap();
+        open(&dir).unwrap();
         let mut trunk_only = config.clone();
         trunk_only["text_config"]["num_nextn_predict_layers"] = serde_json::json!(0);
         write(&trunk_only, &["layers.3."]);
         assert_eq!(
-            plan_tp(&pools(2), &read_tp(&dir).unwrap()).unwrap()[0].bytes(),
+            plan_tp(&pools(2), &open(&dir).unwrap().1).unwrap()[0].bytes(),
             full_bytes
         );
         std::fs::remove_dir_all(&dir).unwrap();

@@ -22,6 +22,7 @@
 //! scale ModelOpt calibrates for 4-bit activations, has no place in the block; the reader leaves it.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use gguf::quant::{
     E4m3Rows, GgmlType, Nvfp4Rows, Q8Block, QuantError, check_fp8_b128, check_mxfp8,
@@ -193,8 +194,9 @@ pub fn format_of(sources: &[(&str, &Placed)]) -> Result<Format, Error> {
 ///
 /// A refusal of [`format_of`]; a pair [`type_of`] has no type for; a tensor `get` refuses or
 /// lacks; a refusal of `linear`, `experts` or `fp8`; a stack of a type other than NVFP4 and
-/// FP8_B128; a shape or dtype the format does not hold; a non-finite value or scaled value; and
-/// a row a [`Plain::Q8_0`] block does not divide, each by name.
+/// FP8_B128 or of unquantized experts read other than as F32 or BF16, and one of experts of
+/// differing shapes; a shape or dtype the format does not hold; a non-finite value or scaled
+/// value; and a row a [`Plain::Q8_0`] block does not divide, each by name.
 pub fn normalize<'a>(
     get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     sources: &[(&str, &Placed)],
@@ -213,6 +215,11 @@ pub fn normalize<'a>(
         Format::Nvfp4 => None,
         Format::Nvfp4Csf => Some(csf::Encoding::Csf),
         Format::Nvfp4Csf32 => Some(csf::Encoding::Csf32),
+        Format::Bf16 | Format::F32
+            if sources.len() > 1 && matches!(role, Use::Matrix(Plain::Bf16 | Plain::F32)) =>
+        {
+            return plain_stack(get, sources, role, type_id);
+        }
         _ if sources.len() != 1 && type_id != GgmlType::FP8_B128.as_u32() => {
             return Err(refuse(format!(
                 "in a stack of {}: only NVFP4 and FP8_B128 experts stack here",
@@ -235,32 +242,374 @@ pub fn normalize<'a>(
     let Some(encoding) = encoding else {
         return nvfp4(get, sources, type_id);
     };
-    // Each compressed block scale decoded to the bytes a plain checkpoint stores, and its weight
-    // placed as plain NVFP4 reading those bytes and the tensor scale its own place names.
-    let mut decoded: HashMap<String, ([usize; 2], Vec<u8>)> = HashMap::new();
-    let mut plain_places = Vec::with_capacity(sources.len());
+    let (decoded, places) = decode_scales(&get, sources, encoding)?;
+    let get = |n: &str| match decoded.get(n) {
+        Some(t) => Ok(t.raw()),
+        None => get(n),
+    };
+    let sources: Vec<_> = places.iter().map(|(w, p)| (*w, p)).collect();
+    nvfp4(get, &sources, type_id)
+}
+
+/// [`normalize`] of the part of `sources` that holds the values `at` along dim `dim` of `dims`, the
+/// tensor's ggml dims as its map gives them (a weight's `[k, rows]`, a routed stack's
+/// `[k, rows, n_expert]`, a plain tensor's own): along a stack's experts the experts `at`; along
+/// a matrix dim each weight and the block scale its place names cut to `at` first
+/// ([`check_part`]), a compressed scale decoded before it is cut, and the tensor scale kept whole.
+///
+/// # Errors
+///
+/// [`check_part`]'s, and every refusal of [`normalize`], each by name.
+pub fn normalize_part<'a>(
+    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    sources: &[(&str, &Placed)],
+    role: Use,
+    dims: &[u64],
+    at: (usize, Range<u64>),
+) -> Result<Normal, Error> {
+    let cuts = match plan_part(&get, sources, role, dims, at)? {
+        PartPlan::Experts(r) => return normalize(get, &sources[r], role),
+        PartPlan::Cuts(cuts) => cuts,
+    };
+    let encoding = match sources[0].1.format {
+        Format::Nvfp4Csf => Some(csf::Encoding::Csf),
+        Format::Nvfp4Csf32 => Some(csf::Encoding::Csf32),
+        _ => None,
+    };
+    let (decoded, places) = match encoding {
+        Some(encoding) => decode_scales(&get, sources, encoding)?,
+        None => (HashMap::new(), vec![]),
+    };
+    let read = |n: &str| match decoded.get(n) {
+        Some(t) => Ok(t.raw()),
+        None => get(n),
+    };
+    let mut cut = HashMap::new();
+    for c in cuts {
+        let raw = read(&c.name)?;
+        let mut bytes = Vec::new();
+        for r in &c.runs {
+            let run = usize::try_from(r.start)
+                .ok()
+                .zip(usize::try_from(r.end).ok())
+                .and_then(|(a, b)| raw.bytes.get(a..b))
+                .ok_or_else(|| Error::Format {
+                    name: c.name.clone(),
+                    format: sources[0].1.format,
+                    what: format!("{} bytes do not hold the part's run {r:?}", raw.bytes.len()),
+                })?;
+            bytes.extend_from_slice(run);
+        }
+        let shape = c.dims.iter().rev().map(|&d| d as usize).collect();
+        cut.insert(
+            c.name,
+            Stored {
+                dtype: raw.dtype,
+                shape,
+                bytes,
+            },
+        );
+    }
+    let read = |n: &str| match cut.get(n) {
+        Some(t) => Ok(t.raw()),
+        None => read(n),
+    };
+    if encoding.is_some() {
+        let sources: Vec<_> = places.iter().map(|(w, p)| (*w, p)).collect();
+        return normalize(read, &sources, role);
+    }
+    normalize(read, sources, role)
+}
+
+/// Check the part of `sources` [`normalize_part`] makes at `at` against what they store, reading
+/// headers alone: the cut keeps whole stored values of each weight and whole blocks of its scale
+/// grid (a compressed scale's decoded one), except a grid of one block along the dim, which every
+/// part reads whole.
+///
+/// # Errors
+///
+/// A format with no type for `role`, a row table's part; a dim `dims` lacks, values `dims` does
+/// not hold or a stack of another count; a weight whose bytes are not `dims`; values off its
+/// stored values or across a scale block, and a scale grid of another shape than its format's,
+/// each by name.
+pub fn check_part<'a>(
+    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    sources: &[(&str, &Placed)],
+    role: Use,
+    dims: &[u64],
+    at: (usize, Range<u64>),
+) -> Result<(), Error> {
+    plan_part(&get, sources, role, dims, at).map(|_| ())
+}
+
+/// What a part of a tensor reads ([`check_part`]): a stack's experts, or each weight and block
+/// scale cut.
+enum PartPlan {
+    Experts(Range<usize>),
+    Cuts(Vec<Cut>),
+}
+
+/// One stored tensor a part reads cut: its name, the part's ggml dims, and the byte runs of the
+/// stored bytes that hold it.
+struct Cut {
+    name: String,
+    dims: Vec<u64>,
+    runs: Vec<Range<u64>>,
+}
+
+/// The plan of the part of `sources` at `at` ([`check_part`]), from headers alone.
+fn plan_part<'a>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    sources: &[(&str, &Placed)],
+    role: Use,
+    dims: &[u64],
+    (dim, at): (usize, Range<u64>),
+) -> Result<PartPlan, Error> {
+    let format = format_of(sources)?;
+    let refuse = |name: &str, what: String| Error::Format {
+        name: name.to_string(),
+        format,
+        what,
+    };
+    let first = sources[0].0;
+    if role == Use::Rows {
+        return Err(refuse(first, "is a row table, which is read whole".into()));
+    }
+    type_of(format, role)
+        .ok_or_else(|| refuse(first, format!("read as {role:?} has no GGUF type here")))?;
+    let n = sources.len();
+    let matrix = match dims {
+        [k, rows, experts] if *experts == n as u64 && get(first)?.shape.len() == 2 => {
+            vec![*k, *rows]
+        }
+        _ if n == 1 => dims.to_vec(),
+        _ => {
+            return Err(refuse(
+                first,
+                format!("{dims:?} are not the dims of a stack of {n}"),
+            ));
+        }
+    };
+    if dims.len() == 3 && matrix.len() == 2 && dim == 2 {
+        let picked = usize::try_from(at.start)
+            .ok()
+            .zip(usize::try_from(at.end).ok())
+            .filter(|&(a, b)| a < b && b <= n)
+            .ok_or_else(|| refuse(first, format!("experts {at:?} of a stack of {n}")))?;
+        return Ok(PartPlan::Experts(picked.0..picked.1));
+    }
+    let values_per_element = format.logical(&[1])[0] as u64;
+    let mut cuts = Vec::new();
     for &(weight, placed) in sources {
+        let w = get(weight)?;
+        let size = w.dtype.size() as u64;
+        if gguf::tensor_bytes(values_per_element, size, &matrix) != Some(w.bytes.len() as u64) {
+            return Err(refuse(
+                weight,
+                format!(
+                    "{} {:?} ({} bytes) does not hold {matrix:?}",
+                    w.dtype.name(),
+                    w.shape,
+                    w.bytes.len()
+                ),
+            ));
+        }
+        let runs = gguf::tensor_runs(values_per_element, size, &matrix, dim, at.clone())
+            .ok_or_else(|| {
+                refuse(
+                    weight,
+                    format!(
+                        "values {at:?} along dim {dim} of {matrix:?} are not whole stored values"
+                    ),
+                )
+            })?;
+        let mut part = matrix.clone();
+        part[dim] = at.end - at.start;
+        part[0] /= values_per_element;
+        cuts.push(Cut {
+            name: weight.to_string(),
+            dims: part,
+            runs,
+        });
+        if let Some(scale) = scale_grid(get, weight, format, placed, &matrix)? {
+            let cut = scale.cut(dim, &at, matrix[dim]);
+            cuts.push(cut.map_err(|what| refuse(&scale.name, what))?);
+        }
+    }
+    Ok(PartPlan::Cuts(cuts))
+}
+
+/// A weight's block scales as a grid: its name, ggml dims `[columns, rows]` of scales, bytes a
+/// scale, and the values and rows one covers.
+struct Grid {
+    name: String,
+    dims: [u64; 2],
+    size: u64,
+    block: [u64; 2],
+}
+
+impl Grid {
+    /// The grid's part for values `at` along dim `dim` of its weight of `extent` values there.
+    fn cut(&self, dim: usize, at: &Range<u64>, extent: u64) -> Result<Cut, String> {
+        let unit = self.block[dim];
+        let span = if self.dims[dim] == 1 {
+            0..1
+        } else if at.start.is_multiple_of(unit) && (at.end.is_multiple_of(unit) || at.end == extent)
+        {
+            at.start / unit..at.end.div_ceil(unit)
+        } else {
+            return Err(format!(
+                "values {at:?} along dim {dim} split its {unit}-value scale blocks"
+            ));
+        };
+        let runs = gguf::tensor_runs(1, self.size, &self.dims, dim, span.clone())
+            .ok_or_else(|| format!("scales {span:?} along dim {dim} pass its grid"))?;
+        let mut dims = self.dims.to_vec();
+        dims[dim] = span.end - span.start;
+        Ok(Cut {
+            name: self.name.clone(),
+            dims,
+            runs,
+        })
+    }
+}
+
+/// The block scale grid of the weight placed as `placed` of ggml dims `matrix` (`[k, rows]`):
+/// NVFP4's one F8_E4M3 a 16 values (a compressed scale's decoded grid), an F8_E4M3 format's by
+/// [`Format::fp8_scale_block`]; `None` for an unquantized format.
+fn scale_grid<'a>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    weight: &str,
+    format: Format,
+    placed: &Placed,
+    matrix: &[u64],
+) -> Result<Option<Grid>, Error> {
+    let two_d = || {
+        let &[k, rows] = matrix else {
+            return Err(Error::Format {
+                name: weight.to_string(),
+                format,
+                what: format!("{matrix:?} is not a 2-D quantized weight"),
+            });
+        };
+        Ok(placed.companions.first().map(|first| (first, [k, rows])))
+    };
+    let refuse = |name: &str, what: String| Error::Format {
+        name: name.to_string(),
+        format,
+        what,
+    };
+    let grid = |name: String, [k, rows]: [u64; 2], size: usize, [a, b]: [usize; 2]| Grid {
+        name,
+        dims: [k.div_ceil(b as u64), rows.div_ceil(a as u64)],
+        size: size as u64,
+        block: [b as u64, a as u64],
+    };
+    let g = match format {
+        Format::Nvfp4Csf | Format::Nvfp4Csf32 => {
+            let Some((first, dims)) = two_d()? else {
+                return Ok(None);
+            };
+            let (stem, _) = first
+                .rsplit_once('.')
+                .ok_or_else(|| refuse(first, "is not a part of a compressed block scale".into()))?;
+            return Ok(Some(grid(stem.to_string(), dims, 1, [1, 16])));
+        }
+        Format::Nvfp4 => {
+            let Some((first, dims)) = two_d()? else {
+                return Ok(None);
+            };
+            grid(first.clone(), dims, 1, [1, 16])
+        }
+        Format::Mxfp8 | Format::Fp8Block { .. } | Format::Fp8Channel | Format::Fp8Tensor => {
+            let Some((first, [k, rows])) = two_d()? else {
+                return Ok(None);
+            };
+            let s = get(first)?;
+            let block = format
+                .fp8_scale_block(rows as usize, k as usize, s.shape)
+                .ok_or_else(|| {
+                    refuse(
+                        first,
+                        format!("{:?} is not its weight's scale grid", s.shape),
+                    )
+                })?;
+            grid(first.clone(), [k, rows], s.dtype.size(), block)
+        }
+        _ => return Ok(None),
+    };
+    let s = get(&g.name)?;
+    if gguf::tensor_bytes(1, g.size, &g.dims) != Some(s.bytes.len() as u64) {
+        return Err(refuse(
+            &g.name,
+            format!("{} bytes do not hold the grid {:?}", s.bytes.len(), g.dims),
+        ));
+    }
+    Ok(Some(g))
+}
+
+/// A tensor this reader made: decoded from a compressed form or cut from a stored one.
+struct Stored {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+impl Stored {
+    fn raw(&self) -> Raw<'_> {
+        Raw {
+            dtype: self.dtype,
+            shape: &self.shape,
+            bytes: &self.bytes,
+        }
+    }
+}
+
+/// Decoded block scales by name, and each weight placed as plain NVFP4 reading them.
+type Decoded<'s> = (HashMap<String, Stored>, Vec<(&'s str, Placed)>);
+
+/// Each compressed block scale of the NVFP4 `sources` decoded by `encoding` to the bytes a plain
+/// checkpoint stores, by the scale's name, and each weight placed as plain NVFP4 reading those
+/// bytes and the tensor scale its own place names.
+fn decode_scales<'s, 'a>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    sources: &[(&'s str, &Placed)],
+    encoding: csf::Encoding,
+) -> Result<Decoded<'s>, Error> {
+    let mut decoded = HashMap::new();
+    let mut places = Vec::with_capacity(sources.len());
+    for &(weight, placed) in sources {
+        let refuse = |what: String| Error::Format {
+            name: weight.to_string(),
+            format: placed.format,
+            what,
+        };
         let (Some((scale, _)), [_, .., tensor_scale]) = (
             placed.companions.first().and_then(|c| c.rsplit_once('.')),
             placed.companions.as_slice(),
         ) else {
             return Err(refuse(format!(
-                "{weight}: its place names {:?}, not a compressed block scale and a tensor scale",
+                "its place names {:?}, not a compressed block scale and a tensor scale",
                 placed.companions
             )));
         };
         let w = get(weight)?;
         let &[rows, half] = w.shape else {
-            return Err(refuse(format!("{weight} {:?} is not [rows, k/2]", w.shape)));
+            return Err(refuse(format!("{:?} is not [rows, k/2]", w.shape)));
         };
         if !half.is_multiple_of(8) {
-            return Err(refuse(format!(
-                "{weight}: k/2 = {half} is not whole 16-value groups"
-            )));
+            return Err(refuse(format!("k/2 = {half} is not whole 16-value groups")));
         }
-        let bytes = csf::weight_scale(&get, scale, encoding, rows, half / 8)?;
-        decoded.insert(scale.to_string(), ([rows, half / 8], bytes));
-        plain_places.push((
+        let bytes = csf::weight_scale(get, scale, encoding, rows, half / 8)?;
+        decoded.insert(
+            scale.to_string(),
+            Stored {
+                dtype: Dtype::F8E4M3,
+                shape: vec![rows, half / 8],
+                bytes,
+            },
+        );
+        places.push((
             weight,
             Placed {
                 format: Format::Nvfp4,
@@ -268,16 +617,7 @@ pub fn normalize<'a>(
             },
         ));
     }
-    let get = |n: &str| match decoded.get(n) {
-        Some((shape, bytes)) => Ok(Raw {
-            dtype: Dtype::F8E4M3,
-            shape: shape.as_slice(),
-            bytes,
-        }),
-        None => get(n),
-    };
-    let sources: Vec<_> = plain_places.iter().map(|(w, p)| (*w, p)).collect();
-    nvfp4(get, &sources, type_id)
+    Ok((decoded, places))
 }
 
 /// The NVFP4 `sources` (one linear, or a routed stack's experts) in GGUF's NVFP4 block.
@@ -646,6 +986,37 @@ fn plain<'a>(
         bytes,
         scale: vec![],
     })
+}
+
+/// Unquantized experts `sources`, each written as [`plain`] writes it, one after another as
+/// `[k, rows, n_expert]`; an expert that is not a matrix of the first's shape is refused by name.
+fn plain_stack<'a>(
+    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    sources: &[(&str, &Placed)],
+    role: Use,
+    type_id: u32,
+) -> Result<Normal, Error> {
+    let mut out = Normal {
+        type_id,
+        ..Normal::default()
+    };
+    for &(name, placed) in sources {
+        let n = plain(&get, name, placed, role, type_id)?;
+        if n.dims.len() != 2 || (!out.dims.is_empty() && out.dims != n.dims) {
+            return Err(Error::Format {
+                name: name.to_string(),
+                format: placed.format,
+                what: format!(
+                    "dims {:?}; the stack's first expert {} has {:?}",
+                    n.dims, sources[0].0, out.dims
+                ),
+            });
+        }
+        out.dims = n.dims;
+        out.bytes.extend(n.bytes);
+    }
+    out.dims.push(sources.len() as u64);
+    Ok(out)
 }
 
 /// The NVFP4 linear `source`: its weight, and the block and tensor scales its place names,
@@ -1098,6 +1469,27 @@ mod tests {
         assert_eq!((kept.type_id, &kept.bytes), (0, &f32s));
         let q = normalize(get, &[("f.weight", &f32)], m).unwrap();
         assert_eq!((q.type_id, &q.bytes), (8, &want));
+        let zero = vec![0u8; bf16.len()];
+        let get_pair = |name: &str| {
+            if name == "zero.weight" {
+                Ok(Raw {
+                    dtype: Dtype::Bf16,
+                    shape: &[2, 32],
+                    bytes: &zero,
+                })
+            } else {
+                get(name)
+            }
+        };
+        let pair = [("b.weight", &b), ("zero.weight", &b)];
+        let stack = normalize(get_pair, &pair, Use::Matrix(Plain::Bf16)).unwrap();
+        assert_eq!(
+            (&stack.dims, &stack.bytes),
+            (&vec![32, 2, 2], &[&bf16[..], &zero].concat())
+        );
+        let ragged = [("b.weight", &b), ("odd.weight", &b)];
+        let e = normalize(get, &ragged, Use::Matrix(Plain::F32)).unwrap_err();
+        assert!(e.to_string().contains("odd.weight"), "{e}");
         let rows = normalize(
             get,
             &[("t.weight", &placed(Format::Fp8Tensor, &["t.scale"]))],
@@ -1925,6 +2317,49 @@ mod tests {
             ),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_quantized_single_tensor_requires_a_matrix_before_reading() {
+        for format in [
+            Format::Nvfp4,
+            Format::Nvfp4Csf,
+            Format::Nvfp4Csf32,
+            Format::Mxfp8,
+            Format::Fp8Block {
+                rows: 128,
+                cols: 128,
+            },
+            Format::Fp8Channel,
+            Format::Fp8Tensor,
+        ] {
+            let p = Placed {
+                format,
+                companions: vec!["w.scale".into()],
+            };
+            let values_per_element = format.logical(&[1])[0];
+            let bytes = vec![0; 64 * 2 * 2 / values_per_element];
+            let shape = [2, 2, 64 / values_per_element];
+            let e = check_part(
+                |_| {
+                    Ok(Raw {
+                        dtype: Dtype::U8,
+                        shape: &shape,
+                        bytes: &bytes,
+                    })
+                },
+                &[("w.weight", &p)],
+                Use::Matrix(Plain::F32),
+                &[64, 2, 2],
+                (1, 0..1),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                e.contains("w.weight") && e.contains("not a 2-D quantized weight"),
+                "{format}: {e}"
+            );
+        }
     }
 
     /// A row table is one source; a second source, found or missing, is refused, not dropped.

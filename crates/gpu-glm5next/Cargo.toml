@@ -24,3 +24,13 @@ bloomery-models = { path = "../models" }
 # Host only: the step is a walk of the schedules' overlap (`runtime::sched`) over the layers'
 # programs (`runtime::layer`).
 bloomery-runtime = { path = "../runtime" }
+# Host only, through the `hf` feature: the folder test's checkpoint (`model_hf::part::Checkpoint`)
+# and the folders it writes.
+bloomery-hf = { path = "../hf", optional = true }
+bloomery-model-hf = { path = "../model-hf", optional = true }
+bloomery-safetensors = { path = "../safetensors", optional = true }
+
+[features]
+# A checkpoint folder's rank parts on the card (`tp::source`'s folder test, `just gate-gpu-glm5next-tp`). The load
+# itself takes any `model::part::Source`, so the gates that read a GGUF file leave it off and do not key the hf crates.
+hf = ["dep:bloomery-hf", "dep:bloomery-model-hf", "dep:bloomery-safetensors"]

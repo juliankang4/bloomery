@@ -4,14 +4,34 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use gguf::GgmlType;
+use hf::modelopt::Normal;
 use hf::quant_config::Config;
 use model_hf::arch::glm5next::{Geometry, Layout, map};
-use safetensors::Dtype;
+use safetensors::{Dtype, Raw};
 
 #[path = "common/glm_hf.rs"]
 mod hf_support;
 
-use hf_support::{apply, gguf_table, gunzip, logical, table};
+use hf_support::{gguf_table, gunzip, logical, table};
+
+/// The glm5next tensor `name`'s bytes: `layout` ([`Layout::apply`]) over its source's stored
+/// F32 or BF16 values `raw`.
+fn moved(name: &str, layout: &Layout, raw: &Raw<'_>) -> Vec<u8> {
+    let ty = if raw.dtype == Dtype::F32 {
+        GgmlType::F32
+    } else {
+        GgmlType::BF16
+    };
+    let mut n = Normal {
+        type_id: ty.as_u32(),
+        dims: raw.shape.iter().rev().map(|&d| d as u64).collect(),
+        bytes: raw.bytes.to_vec(),
+        scale: vec![],
+    };
+    layout.apply(name, &mut n).unwrap();
+    n.bytes
+}
 
 /// The glm5next stems whose values the map gate compares, each with the comparison: every mapped
 /// tensor of these stems must be in the oracle's `gguf.safetensors`, and no other.
@@ -127,7 +147,7 @@ fn hw_glm_map_matches_the_unsloth_gguf() {
             // The converter's `torch.exp` is not correctly rounded, so `-exp` may differ in
             // the last place: `ssm_a` is held to one unit there.
             Dtype::F32 if m.layout != Layout::Same => {
-                let out = apply(&m.layout, raw.bytes, raw.shape, 4);
+                let out = moved(name, &m.layout, &raw);
                 assert_eq!(out.len(), want.len(), "{name}: converted byte count");
                 for (&o, &w) in out.as_chunks::<4>().0.iter().zip(want.as_chunks::<4>().0) {
                     let o = i32::from_le_bytes(o);
@@ -139,7 +159,7 @@ fn hw_glm_map_matches_the_unsloth_gguf() {
             }
             Dtype::F32 => {
                 assert_eq!(
-                    apply(&m.layout, raw.bytes, raw.shape, 4),
+                    moved(name, &m.layout, &raw),
                     want,
                     "{name} from {}",
                     m.source
@@ -149,7 +169,7 @@ fn hw_glm_map_matches_the_unsloth_gguf() {
             // NVIDIA's export stores these BF16 where the GGUF's source kept F32: each BF16
             // value is the GGUF's F32 rounded to nearest even.
             Dtype::Bf16 => {
-                let out = apply(&m.layout, raw.bytes, raw.shape, 2);
+                let out = moved(name, &m.layout, &raw);
                 let round = |b: [u8; 4]| {
                     let x = u32::from_le_bytes(b);
                     ((x + 0x7fff + ((x >> 16) & 1)) >> 16) as u16

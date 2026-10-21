@@ -10,10 +10,33 @@
 //! up by row, down along its input. The head splits by vocabulary row. The norms, the low-rank
 //! inputs every head shares (`ssm_f_a`, `ssm_g_a`, `attn_q_a`, `attn_kv_a_mqa`), the indexer, the
 //! router and its bias, the hyper-connection mixes, the next-token layer's own tensors and the
-//! embedding stay whole on every rank.
+//! embedding stay whole on every rank. A rank's load takes the trunk's layers, not the next-token
+//! layers past them ([`in_trunk`]), and holds them on the card but the embedding, which is read
+//! on the host ([`card_holds`]).
+//!
+//! A part keeps whole blocks of the tensor's card type, and along K at least its role's kernel
+//! unit ([`cut_of`]); which indices a rank holds is then [`Cut::span`]'s ([`rank_span`]), for the
+//! GGUF file and the checkpoint folder alike.
 
+use std::ops::Range;
+
+use gguf::GgmlType;
+
+use super::{names, roles};
 use crate::placement::PlacementError;
-use crate::placement::tp::Cut;
+use crate::placement::tp::{Cut, card_blocks, check_rank};
+
+/// Whether a tensor of layer `layer` (`None` for one of no layer) is one a TP rank of a trunk of
+/// `layers` layers loads: not one of the next-token layers past the trunk's.
+pub fn in_trunk(layer: Option<usize>, layers: usize) -> bool {
+    layer.is_none_or(|l| l < layers)
+}
+
+/// Whether a TP rank of a trunk of `layers` layers holds the tensor `name` of layer `layer` on the
+/// card: one it loads ([`in_trunk`]) but the token embedding, which stays in the host file.
+pub fn card_holds(name: &str, layer: Option<usize>, layers: usize) -> bool {
+    name != names::token_embd() && in_trunk(layer, layers)
+}
 
 /// Where the glm5next tensor `name` of `dims` splits among ranks, `None` for whole on every rank.
 /// A head's part along a dim is that dim over `heads`. A stem with no rule, a split tensor of
@@ -91,9 +114,58 @@ pub fn cut(name: &str, dims: &[u64], heads: u64) -> Result<Option<Cut>, Placemen
     }))
 }
 
+/// The [`cut`] of the glm5next tensor `name` of `dims` held in card type `ty`, with the values a
+/// part keeps whole along dims 0 and 1: whole blocks of the type, along K at least the K unit of
+/// its role's kernel ([`card_blocks`]); `None` for whole on every rank. A refusal of [`cut`], a
+/// split tensor with no role or of a type with no block, and blocks past u64 are refused by name.
+pub fn cut_of(
+    name: &str,
+    ty: GgmlType,
+    dims: &[u64],
+    heads: u64,
+) -> Result<Option<(Cut, [u64; 2])>, PlacementError> {
+    let Some(c) = cut(name, dims, heads)? else {
+        return Ok(None);
+    };
+    let refuse = |detail: String| PlacementError::Tensor {
+        name: name.into(),
+        detail,
+    };
+    let role = roles::tensor_role(name).ok_or_else(|| refuse("no tensor role".into()))?;
+    let block = ty
+        .blck_size()
+        .filter(|&b| b > 0)
+        .ok_or_else(|| refuse(format!("{ty} has no block size")))?;
+    let blocks = card_blocks(ty, [block, 1], role).map_err(|e| refuse(e.to_string()))?;
+    Ok(Some((c, blocks)))
+}
+
+/// Rank `rank` of `ranks`' indices of the glm5next tensor `name` of card type `ty` and `dims`
+/// over `heads` heads: the dim its [`cut_of`] splits and the indices along it ([`Cut::span`]);
+/// `None` for the whole tensor, at one rank or where the family keeps it whole. A rank that is
+/// not one of the ranks, and a refusal of [`cut_of`] or [`Cut::span`], are refused by name.
+pub fn rank_span(
+    name: &str,
+    ty: GgmlType,
+    dims: &[u64],
+    heads: u64,
+    rank: usize,
+    ranks: usize,
+) -> Result<Option<(usize, Range<u64>)>, PlacementError> {
+    check_rank(name, rank, ranks)?;
+    if ranks == 1 {
+        return Ok(None);
+    }
+    let Some((c, blocks)) = cut_of(name, ty, dims, heads)? else {
+        return Ok(None);
+    };
+    let at = c.span(name, dims, blocks, rank, ranks)?;
+    Ok(Some((c.dim, at)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cut, PlacementError, cut};
+    use super::{Cut, GgmlType, PlacementError, cut, cut_of, rank_span};
 
     /// Each kind of split at the GLM fixture's dims (64 heads), the whole tensors, and the
     /// refusals: a stem with no rule, a split tensor of another dim count, and a head split of an
@@ -142,5 +214,53 @@ mod tests {
         }
         assert!(cut("blk.0.attn_q.weight", &[4096, 8190], 64).is_err());
         assert!(cut("blk.0.attn_q.weight", &[4096, 8192], 0).is_err());
+    }
+
+    /// A cut keeps its type's block along K, at least its role's kernel unit there (NVFP4's
+    /// 64-value block, 256 for a dense down and 32 for a routed one), and one row along dim 1; a
+    /// whole tensor has no blocks, and a type with no block is refused by name.
+    #[test]
+    fn a_cut_keeps_its_card_type_s_blocks_and_kernel_unit() {
+        let nv = GgmlType::NVFP4;
+        for (name, dims, want) in [
+            ("blk.0.ffn_down.weight", &[12288u64, 4096][..], [256, 1]),
+            ("blk.3.ffn_down_exps.weight", &[512, 4096, 288], [64, 1]),
+            ("blk.3.ffn_up_exps.weight", &[4096, 512, 288], [64, 1]),
+        ] {
+            let (_, blocks) = cut_of(name, nv, dims, 64).unwrap().unwrap();
+            assert_eq!(blocks, want, "{name}");
+        }
+        assert_eq!(
+            cut_of("blk.0.attn_norm.weight", nv, &[4096], 64).unwrap(),
+            None
+        );
+        let e = cut_of("blk.0.ffn_down.weight", GgmlType::Unknown(99), &[64, 4], 64);
+        assert!(
+            matches!(e, Err(PlacementError::Tensor { name, .. }) if name == "blk.0.ffn_down.weight")
+        );
+    }
+
+    /// One rank reads every tensor whole; past one, a split tensor's rank reads its indices along
+    /// the cut and a kept one the whole; a rank past the ranks and a cut off the type's block are
+    /// refused by name.
+    #[test]
+    fn a_rank_reads_its_indices_of_each_cut() {
+        let nv = GgmlType::NVFP4;
+        let up = ("blk.3.ffn_up_exps.weight", &[4096u64, 512, 288][..]);
+        let down = ("blk.3.ffn_down_exps.weight", &[512u64, 4096, 288][..]);
+        let span =
+            |(name, dims): (&str, &[u64]), rank, ranks| rank_span(name, nv, dims, 64, rank, ranks);
+        assert_eq!(span(up, 0, 1).unwrap(), None);
+        assert_eq!(span(up, 1, 4).unwrap(), Some((1, 128..256)));
+        assert_eq!(span(down, 3, 4).unwrap(), Some((0, 384..512)));
+        assert_eq!(
+            span(("blk.0.attn_norm.weight", &[4096]), 1, 2).unwrap(),
+            None
+        );
+        for (rank, ranks) in [(1, 1), (2, 2), (0, 0)] {
+            assert!(span(up, rank, ranks).is_err(), "{rank}/{ranks}");
+        }
+        let e = span(down, 0, 16).unwrap_err().to_string();
+        assert!(e.contains(down.0) && e.contains("64"), "{e}");
     }
 }

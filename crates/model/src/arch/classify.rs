@@ -67,11 +67,7 @@ fn tensor_scale_role(
     name: &str,
     role_of: &impl Fn(&str) -> Option<(Role, Option<usize>)>,
 ) -> Option<(Role, Option<usize>)> {
-    let weight = format!("{}.weight", name.strip_suffix(".scale")?);
-    let (_, w) = split.find(&weight)?;
-    if !w.ty.reads_scale() {
-        return None;
-    }
+    let weight = gguf::scaled_weight(split, name)?;
     role_of(&weight).map(|(_, layer)| (Role::Unread, layer))
 }
 

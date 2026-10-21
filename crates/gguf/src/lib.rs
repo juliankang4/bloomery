@@ -198,6 +198,9 @@ pub enum LoadError {
     /// A [`PrivateType`] entry that cannot size a tensor, or one listed twice.
     #[error("private type id {id}: {detail}")]
     BadPrivateType { id: u32, detail: &'static str },
+    /// The tensor scales beside a tensor of a type that reads them ([`tensor_scales`]).
+    #[error("tensor {name}: {detail}")]
+    Scale { name: String, detail: String },
 }
 
 /// A parsed, mmap-backed GGUF file.
@@ -789,6 +792,115 @@ pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
 pub fn tensor_bytes(blck: u64, tsz: u64, dims: &[u64]) -> Option<u64> {
     let row = tsz.checked_mul(dims[0] / blck)?;
     dims[1..].iter().try_fold(row, |acc, &d| acc.checked_mul(d))
+}
+
+/// The byte runs, in order, that hold the values `at` along dim `dim` of a tensor of `dims` held as
+/// `tsz`-byte blocks of `blck` values along dim 0 ([`tensor_bytes`]' layout): along dim 0 one run a
+/// row, whole blocks; along a dim past it one run of whole rows for each index of the dims past
+/// `dim`. `None` for no dim `dim`, an empty `at` or one past the dim, a dim 0 or an `at` along it
+/// off the blocks, and a byte count past u64.
+#[must_use]
+pub fn tensor_runs(
+    blck: u64,
+    tsz: u64,
+    dims: &[u64],
+    dim: usize,
+    at: std::ops::Range<u64>,
+) -> Option<Vec<std::ops::Range<u64>>> {
+    let extent = *dims.get(dim)?;
+    if blck == 0
+        || tsz == 0
+        || dims.contains(&0)
+        || at.start >= at.end
+        || at.end > extent
+        || !dims[0].is_multiple_of(blck)
+    {
+        return None;
+    }
+    // Every run lies inside the tensor's bytes, so a count that fits u64 bounds every offset.
+    tensor_bytes(blck, tsz, dims)?;
+    let row = tsz * (dims[0] / blck);
+    if dim == 0 {
+        if !at.start.is_multiple_of(blck) || !at.end.is_multiple_of(blck) {
+            return None;
+        }
+        let (lo, hi) = (at.start / blck * tsz, at.end / blck * tsz);
+        let rows: u64 = dims[1..].iter().product();
+        return Some((0..rows).map(|i| i * row + lo..i * row + hi).collect());
+    }
+    let inner = row * dims[1..dim].iter().product::<u64>();
+    let outer: u64 = dims[dim + 1..].iter().product();
+    let stride = inner * extent;
+    Some(
+        (0..outer)
+            .map(|o| o * stride + at.start * inner..o * stride + at.end * inner)
+            .collect(),
+    )
+}
+
+/// The tensor scales `t`'s values are multiplied by: the f32 values of `<stem>.scale` beside
+/// `<stem>.weight`, found through `find` (the file's tensors by name: its shard and entry), one
+/// for a tensor and one an expert, in expert order, for a routed stack (three dims, mainline's
+/// `.scale` `[n_expert]`). A type that reads them ([`GgmlType::reads_scale`]: NVFP4 and
+/// bloomery's F8 and NVFP4 rows) carries them; `None` for any other type.
+///
+/// # Errors
+///
+/// A name without the `.weight` suffix, a missing scale, one of another type or count, and a
+/// value that is not finite, as [`LoadError::Scale`]; a scale's bytes [`Gguf::data`] refuses.
+pub fn tensor_scales<'g>(
+    t: &TensorInfo,
+    find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
+) -> Result<Option<Vec<f32>>, LoadError> {
+    if !t.ty.reads_scale() {
+        return Ok(None);
+    }
+    let refuse = |detail: String| LoadError::Scale {
+        name: t.name.clone(),
+        detail,
+    };
+    let stem = t.name.strip_suffix(".weight").ok_or_else(|| {
+        refuse("a scaled tensor's name ends in .weight, its scale's in .scale".into())
+    })?;
+    let name = format!("{stem}.scale");
+    let (g, s) =
+        find(&name).ok_or_else(|| refuse(format!("its scale {name} is not in the file")))?;
+    let (want, of) = match t.dims.as_slice() {
+        [_, _, n] => (*n, "one f32 value an expert is a stack's scales"),
+        _ => (1, "one f32 value is the tensor's scale"),
+    };
+    if s.ty != GgmlType::F32 || s.dims.iter().try_fold(1u64, |a, &d| a.checked_mul(d)) != Some(want)
+    {
+        return Err(refuse(format!(
+            "its scale {name} is {} {:?}; {of}",
+            s.ty, s.dims
+        )));
+    }
+    let scales: Vec<f32> = g
+        .data(s)?
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    if u64::try_from(scales.len()).ok() != Some(want) {
+        return Err(refuse(format!("its scale {name} is not {want} f32 values")));
+    }
+    if let Some((i, v)) = scales.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(refuse(format!(
+            "its scale {name} [{i}] is {v}, not a finite value"
+        )));
+    }
+    Ok(Some(scales))
+}
+
+/// The tensor `name` is the tensor scale of ([`tensor_scales`]): `<stem>.weight` of `split`
+/// beside `<stem>.scale`, of a type that reads one. `None` for any other name.
+#[must_use]
+pub fn scaled_weight(split: &Split, name: &str) -> Option<String> {
+    let weight = format!("{}.weight", name.strip_suffix(".scale")?);
+    let (_, t) = split.find(&weight)?;
+    t.ty.reads_scale().then_some(weight)
 }
 
 /// [`tensor_bytes`], or [`LoadError::TooLarge`] naming the tensor.

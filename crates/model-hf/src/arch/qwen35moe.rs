@@ -1260,20 +1260,21 @@ impl Step {
                     .zip(moved.as_chunks_mut::<4>().0)
                 {
                     let x = f32::from_le_bytes(*src);
-                    if !x.is_finite() {
-                        return Err(refuse(name, format!("{self:?}: non-finite input {x}")));
-                    }
                     let y = if neg {
-                        (-f64::from(x).exp()) as f32
+                        super::neg_exp(x).map_err(|why| refuse(name, format!("{self:?}: {why}")))?
                     } else {
-                        x + 1.0
+                        if !x.is_finite() {
+                            return Err(refuse(name, format!("{self:?}: non-finite input {x}")));
+                        }
+                        let y = x + 1.0;
+                        if !y.is_finite() {
+                            return Err(refuse(
+                                name,
+                                format!("{self:?}: result {y} is outside its F32 range"),
+                            ));
+                        }
+                        y
                     };
-                    if !y.is_finite() || (neg && y == 0.0) {
-                        return Err(refuse(
-                            name,
-                            format!("{self:?}: result {y} is outside its F32 range"),
-                        ));
-                    }
                     *dst = y.to_le_bytes();
                 }
             }
@@ -1417,8 +1418,7 @@ mod tests {
     #[test]
     fn checkpoint_input_refusals() {
         use serde_json::json;
-        let dir = std::env::temp_dir().join(format!("qwen-prepare-inputs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::temp_dir("qwen-prepare-inputs");
         let mut valid = config();
         valid["text_config"]["vocab_size"] = json!(8);
         valid["text_config"]["bos_token_id"] = json!(2);

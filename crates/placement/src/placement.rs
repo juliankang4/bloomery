@@ -1068,6 +1068,9 @@ pub enum PlacementError {
     /// beside its pair: the sidecar's own named refusal.
     #[error(transparent)]
     R8(#[from] crate::r8::R8Error),
+    /// A tensor-parallel cut or rank of a named tensor refused.
+    #[error(transparent)]
+    Tp(#[from] tp::TpError),
     /// An expert list that is not one: a repeated id, an id past the stack.
     #[error("expert list: {0}")]
     Experts(String),
@@ -4119,6 +4122,45 @@ fn segment_shape(t: &ModelTensor, segments: &[Segment], experts: u64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_accessors_use_the_first_node() {
+        let nodes = [11, 22].map(|bytes| Node {
+            host: Host {
+                usable_bytes: bytes,
+                ..host()
+            },
+            unified: Some(UnifiedPool { bytes: bytes + 1 }),
+        });
+        let mut machine = Machine {
+            cards: vec![],
+            tiers: vec![],
+            nodes: nodes.to_vec(),
+        };
+        assert_eq!(machine.host(), &nodes[0].host);
+        assert_eq!(machine.unified(), nodes[0].unified);
+        machine.host_mut().usable_bytes = 33;
+        *machine.unified_mut() = Some(UnifiedPool { bytes: 44 });
+        assert_eq!(machine.nodes[0].host.usable_bytes, 33);
+        assert_eq!(machine.nodes[0].unified, Some(UnifiedPool { bytes: 44 }));
+        assert_eq!(machine.nodes[1], nodes[1]);
+        machine.nodes.clear();
+        for mutable in [false, true] {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if mutable {
+                    machine.host_mut();
+                } else {
+                    let _ = machine.host();
+                }
+            }))
+            .unwrap_err();
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied());
+            assert_eq!(message, Some("a machine lists this process's node first"));
+        }
+    }
 
     /// Each format's word names it back, every word apart; another word
     /// names none.

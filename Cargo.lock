@@ -248,10 +248,13 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-gpu",
  "bloomery-gpu-deepseek41",
+ "bloomery-hf",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-model-hf",
  "bloomery-models",
  "bloomery-runtime",
+ "bloomery-safetensors",
  "cuda-core",
 ]
 

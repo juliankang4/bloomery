@@ -30,6 +30,7 @@ pub mod kv;
 pub mod mamba2;
 pub mod moe;
 pub mod ops;
+pub mod part;
 pub mod placement;
 pub mod profile;
 pub mod quant;

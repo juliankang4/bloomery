@@ -664,9 +664,13 @@ pub(super) mod tests {
                     nbytes: bytes.len() as u64,
                 },
                 spans: vec![bytes.as_slice()],
+                scale: None,
             })
             .collect();
-        Weights::load_parts(gpu.stream(), &parts).expect("the layer's tensors")
+        let mut w = Weights::default();
+        w.add_parts(gpu.stream(), &parts)
+            .expect("the layer's tensors");
+        w
     }
 
     /// Bit for bit.

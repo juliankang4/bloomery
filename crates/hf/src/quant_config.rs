@@ -94,8 +94,6 @@ impl fmt::Display for Format {
 /// A tensor of one format as a card holds it, its block scales decoded to plain ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Held {
-    /// The values and their block scales: the bytes a cut splits.
-    pub bytes: u64,
     /// One tensor scale a matrix, which every rank holds whole.
     pub whole_bytes: u64,
     /// The values a cut keeps whole along dims 0 and 1 (ggml's order).
@@ -163,8 +161,8 @@ impl Format {
     }
 
     /// The held form of a tensor of the format and logical `dims` (ggml's order: dim 0 the values
-    /// a row holds, dim 1 the rows, the dims past them whole matrices) in its card type, whose
-    /// row gives its bytes; `None` for a format no card holds, a zero dimension, a byte count past
+    /// a row holds, dim 1 the rows, the dims past them whole matrices) in its card type;
+    /// `None` for a format no card holds, a zero dimension, a byte count past
     /// `u64`, or a row that is not whole blocks of its card type. NVFP4 adds its one F32 tensor
     /// scale a matrix.
     #[must_use]
@@ -179,16 +177,12 @@ impl Format {
         if k % block[0] != 0 {
             return None;
         }
-        let bytes = gguf::tensor_bytes(row.blck, row.bytes, dims)?;
+        gguf::tensor_bytes(row.blck, row.bytes, dims)?;
         let whole_bytes = match self {
             Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 => matrices.checked_mul(4)?,
             _ => 0,
         };
-        Some(Held {
-            bytes,
-            whole_bytes,
-            block,
-        })
+        Some(Held { whole_bytes, block })
     }
 
     /// The logical shape of a tensor of the format with `stored` shape (row-major): two E2M1
@@ -1402,8 +1396,7 @@ mod tests {
         assert!(p.refused.is_empty(), "{:?}", p.refused);
     }
 
-    /// Each format's held bytes and blocks, the stored values plus plain scales: NVFP4 in every
-    /// encoding is GGUF's 36 bytes a 64 values and one tensor scale a matrix.
+    /// Each format's held blocks and tensor scales, including shape and byte-count refusals.
     #[test]
     fn each_format_holds_its_values_and_plain_scales() {
         let expert = [2048, 4096, 288];
@@ -1411,7 +1404,6 @@ mod tests {
             assert_eq!(
                 f.held(&expert),
                 Some(Held {
-                    bytes: 2048 * 4096 * 288 / 2 + 2048 * 4096 * 288 / 16,
                     whole_bytes: 4 * 288,
                     block: [64, 1],
                 })
@@ -1421,7 +1413,6 @@ mod tests {
         assert_eq!(
             Format::Mxfp8.held(&[4096, 8192]),
             Some(Held {
-                bytes: 4096 * 8192 + 4096 * 8192 / 32,
                 whole_bytes: 0,
                 block: [32, 1],
             })
@@ -1429,7 +1420,6 @@ mod tests {
         assert_eq!(
             B128.held(&[16384, 4096]),
             Some(Held {
-                bytes: 16384 * 4096 + 4 * 4096 * 128,
                 whole_bytes: 0,
                 block: [128, 1],
             })
@@ -1446,7 +1436,7 @@ mod tests {
             assert_eq!(B128.held(dims), None, "{dims:?}");
         }
         for ranks in [1, 2, 4] {
-            assert_eq!(B128.held(&[128, 1, ranks]).unwrap().bytes, 132 * ranks);
+            assert!(B128.held(&[128, 1, ranks]).is_some());
         }
         for (rows, cols) in [(0, 128), (128, 0), (0, 0)] {
             assert_eq!(Format::Fp8Block { rows, cols }.held(&[128, 1]), None);
@@ -1457,7 +1447,6 @@ mod tests {
         assert_eq!(
             fp8.held(&[16384, 4096]),
             Some(Held {
-                bytes: 16384 * 4096 + 512 * 4096,
                 whole_bytes: 0,
                 block: [32, 1],
             })
@@ -1466,18 +1455,22 @@ mod tests {
             assert_eq!(
                 f.held(&[16384, 4096]),
                 Some(Held {
-                    bytes: 16384 * 4096 + 4 * 128 * 4096,
                     whole_bytes: 0,
                     block: [128, 1],
                 })
             );
         }
         assert_eq!(Format::Fp8Block { rows: 32, cols: 48 }.held(&[96, 4]), None);
-        assert_eq!(
-            Format::Bf16.held(&[512, 256, 64]).unwrap().bytes,
-            2 * 512 * 256 * 64
-        );
-        assert_eq!(Format::F32.held(&[64]).unwrap().bytes, 256);
+        // PIN(2026-10-21): resident byte counts belong to CardFormat; Held keeps cut units and scales.
+        for (f, dims) in [(Format::Bf16, &[512, 256, 64][..]), (Format::F32, &[64])] {
+            assert_eq!(
+                f.held(dims),
+                Some(Held {
+                    whole_bytes: 0,
+                    block: [1, 1],
+                })
+            );
+        }
         assert_eq!(Format::Fp8Tensor.held(&[64, 64]), None);
         assert_eq!(Format::Bf16.held(&[0, 8192]), None);
         assert_eq!(Format::Bf16.held(&[64, 0]), None);
