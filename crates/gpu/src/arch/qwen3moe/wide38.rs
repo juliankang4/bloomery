@@ -145,7 +145,7 @@ use super::body::ATTN_SCALE_256;
 use super::card38::Card38;
 use super::image::MediaRows;
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
-use super::program38::Ctx38;
+use super::program38::{Ctx38, beta_alpha_mut, beta_alpha_rows};
 use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
 use super::scratch38::{Arena38, ROUTE_ROWS, SELECT_ROWS, Store38};
 use super::tier38::TierSide38;
@@ -1551,20 +1551,6 @@ fn dense_gemm(
     site::resident_gemm(c.gpu, &dense_kernels(c), (c.w, name), &x, dense, m, y)
 }
 
-/// [`dense_gemm`] over rows `at .. at + n` of the dense weight `name` alone
-/// ([`site::resident_gemm_rows`]).
-fn dense_gemm_rows(
-    c: &Ctx38<'_>,
-    (name, part): (&str, (usize, usize)),
-    (rows, act, m): (&DeviceBuffer<f32>, &GemmAct32, usize),
-    dense: &GemmRoute,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let x = wide_in(rows, act);
-    let k = dense_kernels(c);
-    site::resident_gemm_rows(c.gpu, &k, (c.w, name, part), &x, dense, m, y)
-}
-
 /// The f32 rows `rows` and their q8 `act`, the forms a dense site reads.
 fn wide_in<'a>(rows: &'a DeviceBuffer<f32>, act: &'a GemmAct32) -> WideIn<'a> {
     WideIn {
@@ -2134,16 +2120,20 @@ fn gdn(
     dense_gemm(c, &gp.z, act, dense, &mut g.z)?;
     // The joined stack is `2·nv` rows (`plan38::plans` refuses another shape
     // at load), β's rows first and α's next.
-    let ba = &gp.beta_alpha;
-    dense_gemm_rows(c, (ba, (0, nv)), act, dense, &mut g.b)?;
-    dense_gemm_rows(c, (ba, (nv, nv)), act, dense, &mut g.a)?;
+    let (k, x_in) = (dense_kernels(c), wide_in(mixed, &x.act_hid));
+    for (i, part) in [(0, nv), (nv, nv)].into_iter().enumerate() {
+        let mut y = beta_alpha_mut(&mut g.ba, m, i)?;
+        let src = (c.w, &*gp.beta_alpha, part);
+        site::resident_gemm_rows(c.gpu, &k, src, &x_in, dense, m, &mut y)?;
+    }
+    let (b, a) = beta_alpha_rows(&g.ba, m)?;
     let lin = &c.k.linear;
     lin.conv.enqueue_conv_prep(
         stream,
         ConvArgs {
             x: &g.x,
-            b_raw: &g.b,
-            a_raw: &g.a,
+            b_raw: &b,
+            a_raw: &a,
             w: f32_gain(w, &gp.conv)?,
             dt_bias: f32_gain(w, &gp.dt_bias)?,
             ssm_a: f32_gain(w, &gp.ssm_a)?,

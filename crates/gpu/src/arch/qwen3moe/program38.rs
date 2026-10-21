@@ -954,9 +954,8 @@ fn gdn(
     let nv = GDN.n_v;
     {
         let Arena38 { gdn: g, pos, .. } = &mut *s;
-        let (wb, wa) = beta_alpha_rows(&g.ba)?;
-        let (b, a): (&DeviceBuffer<f32>, &DeviceBuffer<f32>) =
-            if m == 1 { (&*wb, &*wa) } else { (&g.b, &g.a) };
+        let (wb, wa) = beta_alpha_rows(&g.ba, m)?;
+        let (b, a): (&DeviceBuffer<f32>, &DeviceBuffer<f32>) = (&wb, &wa);
         match seqs {
             Seqs38::One { stores, io, .. } => {
                 let lane = lane_of(io)?;
@@ -1009,9 +1008,9 @@ fn gdn(
     gdn_out(c, gp, s, m, sink)
 }
 
-/// A delta layer's projections over every row of `s.mixed`: q·k·v, `z`,
-/// and the joined β·α at one row (`ba`, β's values then α's), past it β's
-/// rows and α's rows of the joined weight each token-major into `b` and `a`.
+/// A delta layer's projections over every row of `s.mixed`: q·k·v, `z` and
+/// the joined β·α into `ba` ([`beta_alpha_rows`]): one launch at one row,
+/// past it β's rows and α's rows of the joined weight, one launch each.
 fn gdn_in(c: &Ctx38<'_>, gp: &GdnPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
     let nv = GDN.n_v;
     let Arena38 { mixed, gdn: g, .. } = s;
@@ -1021,20 +1020,36 @@ fn gdn_in(c: &Ctx38<'_>, gp: &GdnPlan, s: &mut Arena38, m: usize) -> Result<(), 
         return c.dense_gemv(&gp.beta_alpha, mixed, 1, &mut g.ba);
     }
     let g32 = Some(&c.k.g32);
-    for ((at, n), y) in [((0, nv), &mut g.b), ((nv, nv), &mut g.a)] {
-        site::resident_gemv_rows(c.gpu, g32, (c.w, &gp.beta_alpha, (at, n)), mixed, m, y)?;
+    for (i, part) in [(0, nv), (nv, nv)].into_iter().enumerate() {
+        let mut y = beta_alpha_mut(&mut g.ba, m, i)?;
+        site::resident_gemv_rows(c.gpu, g32, (c.w, &gp.beta_alpha, part), mixed, m, &mut y)?;
     }
     Ok(())
 }
 
-/// β's and α's values of the joined projection `ba` at one row: its first
-/// `n_v` values, then the next.
-fn beta_alpha_rows(ba: &DeviceBuffer<f32>) -> Result<(Window<'_, f32>, Window<'_, f32>), GpuError> {
-    let n = GDN.n_v;
+/// β's rows and α's rows of the joined projection `ba` over `m` rows, each
+/// token-major: its first `n_v·m` values, then the next. At one row they
+/// are the whole joined gemv's output, β's values then α's.
+pub(super) fn beta_alpha_rows(
+    ba: &DeviceBuffer<f32>,
+    m: usize,
+) -> Result<(Window<'_, f32>, Window<'_, f32>), GpuError> {
+    let n = GDN.n_v * m;
     Ok((
         Window::of(ba, 0, n)?,
         Window::of(ba, n * size_of::<f32>(), n)?,
     ))
+}
+
+/// β's rows (`i` 0) or α's rows (`i` 1) of [`beta_alpha_rows`], to write
+/// through.
+pub(super) fn beta_alpha_mut(
+    ba: &mut DeviceBuffer<f32>,
+    m: usize,
+    i: usize,
+) -> Result<WindowMut<'_, f32>, GpuError> {
+    let n = GDN.n_v * m;
+    WindowMut::of_mut(ba, i * n * size_of::<f32>(), n)
 }
 
 /// A delta layer's launches bound to one sequence, over `io`'s `m` rows:
@@ -1209,9 +1224,8 @@ fn qsa(
                 flash,
                 ..
             } = &mut *s;
-            let qsel: &DeviceBuffer<f32> = if m == 1 { &qa.qr } else { &qa.qi };
             let io = AttendIo {
-                qsel,
+                qsel: &qa.qi,
                 n_keys,
                 qg: &qa.qg,
                 q: &mut qa.q,
@@ -1253,9 +1267,8 @@ fn qsa(
                     n_keys: &n_keys,
                 };
                 qsa_keys(c, qp, (raw, pooled), keys, r.len(), sink)?;
-                let qsel: &DeviceBuffer<f32> = if m == 1 { &qa.qr } else { &qa.qi };
                 let io = AttendIo {
-                    qsel: &*rows_of(qsel, r, geo::IDX_HEADS * d)?,
+                    qsel: &*rows_of(&qa.qi, r, geo::IDX_HEADS * d)?,
                     n_keys: &n_keys,
                     qg: &*rows_of(&qa.qg, r, geo::Q_ROWS)?,
                     q: &mut *rows_mut(&mut qa.q, r, geo::ATTN)?,
@@ -1324,12 +1337,11 @@ fn qsa_keys(
     )
 }
 
-/// A selecting layer's indexer queries over every row of `s.mixed`,
-/// token-major: into `qr` at one row, `qi` past it.
+/// A selecting layer's indexer queries over every row of `s.mixed` into
+/// `qi`, token-major.
 fn qsa_query(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
     let Arena38 { mixed, qsa: qa, .. } = s;
-    let q = if m == 1 { &mut qa.qr } else { &mut qa.qi };
-    c.dense_gemv(&qp.idx_q, mixed, m, q)
+    c.dense_gemv(&qp.idx_q, mixed, m, &mut qa.qi)
 }
 
 /// A selecting layer's attention over one sequence's `m` rows and its
