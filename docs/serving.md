@@ -266,6 +266,8 @@ computes the arena's experts decides whether the tokens equal the all-RAM load's
   a load whose residency machine runs, and the other families stay with the host. The `nvtier` record's `card_leg`
   says `on` or why the card does not compute them.
 
+NVMe arena eviction options are documented in the [lever registry](../crates/levers/src/registry.rs).
+
 The load prints an `nvtier` record (the arena's budget, the paged bytes and its
 counters; a load that attached no tier prints none). Limits of a paged load, as the code has them:
 - Qwen3.8 steps one column on a paged plan. With no `--parallel` it serves one slot and the MTP draft stays off; a set

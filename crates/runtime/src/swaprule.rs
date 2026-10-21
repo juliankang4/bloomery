@@ -537,7 +537,10 @@ pub struct SwapRule {
     slot: Vec<Slot>,
     /// `stream * layers * experts + layer * experts + id`: each stream's own
     /// decayed counts, what an end of pass folds into and a planning pass
-    /// decays. A stream that is not live holds zeros.
+    /// decays. A stream that is not live holds zeros. The NVMe tier's arena
+    /// ranks its victims by counts of its own (`gpu::host::nvtier`'s
+    /// `Books::counts`): every column it serves, a prompt's too, on one clock a
+    /// layer, where these are a stream's kept decode rows.
     heat: Vec<f64>,
     /// Per stream: its heat counts toward the blend.
     live: Vec<bool>,

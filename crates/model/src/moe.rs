@@ -1787,7 +1787,7 @@ fn serve_tiered<'w>(
     let slots = tier.slots.slots(tier.layer);
     if slots >= 2 * batch && s.tier_ids.len() <= slots - 2 * batch {
         tier.slots
-            .note_union(tier.layer, &s.plan.ids, &s.plan.off, false);
+            .note_union(tier.layer, &s.plan.ids, &s.plan.off, lists.len(), false);
         let pin = tier
             .slots
             .ensure_pinned(tier.layer, &s.tier_ids, Claim::Keep)?;
@@ -1806,7 +1806,7 @@ fn serve_tiered<'w>(
         .into());
     }
     tier.slots
-        .note_union(tier.layer, &s.plan.ids, &s.plan.off, true);
+        .note_union(tier.layer, &s.plan.ids, &s.plan.off, lists.len(), true);
     let batching = Batching {
         tier,
         keep: slots - 2 * batch,
@@ -1867,6 +1867,8 @@ fn serve_batched<'w>(
         tier.layer,
         &ids[span(cut.host)],
         claim_of(cut.host),
+        1,
+        None,
     )?);
     let mut base = 0;
     for g in 0..ends.len() {
@@ -1879,6 +1881,8 @@ fn serve_batched<'w>(
                     tier.layer,
                     &ids[span(g + 1)],
                     claim_of(g + 1),
+                    1,
+                    None,
                 )?);
             }
             tier.check_lent(&stacks, &ids[span(g)])?;
@@ -2466,12 +2470,16 @@ pub trait TierSlots: Send + Sync {
     /// ticket's pin (the claim found it so), and an id whose slot lends
     /// nothing is in flight until the wait: a step computes the first early
     /// and the second after its wait. The default fills on the caller, the
-    /// ticket ready.
+    /// ticket ready. `columns` is the call's column count. With `column_off`,
+    /// `ids` is the full union plan, including host ids, and `ids[d]` routes
+    /// `column_off[d + 1] - column_off[d]` columns; without, each id routes once.
     fn prefetch_pinned<'a>(
         &'a self,
         layer: usize,
         ids: &[u32],
         claim: Claim,
+        _columns: u64,
+        _column_off: Option<&[usize]>,
     ) -> Result<Ticket<'a>, TierError> {
         self.ensure_pinned(layer, ids, claim).map(Ticket::ready)
     }
@@ -2481,15 +2489,24 @@ pub trait TierSlots: Send + Sync {
     /// [`TierSlots::ensure_pinned`], a [`Ticket`]'s pin): no claim takes a
     /// pinned slot, and an unpinned one is the LRU's to refill.
     fn slot(&self, layer: usize, id: u32, part: usize) -> Option<&[u8]>;
-    /// A prompt union call on `layer`, told once per tiered union call,
-    /// before its first batch's claim, as it takes its path: `batched` when
-    /// its arena ids are more than the layer's slots less two batches. `ids`
-    /// are the call's distinct ids, ascending, those of the plan's host
-    /// segment included, and the columns that list `ids[d]` number
-    /// `off[d + 1] - off[d]`. A call refused before its path is told is not
-    /// told. It must not lock or allocate unless its tier was asked to keep
-    /// the call; a tier that keeps no books takes the default.
-    fn note_union(&self, _layer: usize, _ids: &[u32], _off: &[usize], _batched: bool) {}
+    /// A prompt union call of `cols` columns on `layer`, told once per tiered
+    /// union call, before its first batch's claim, as it takes its path:
+    /// `batched` when its arena ids are more than the layer's slots less two
+    /// batches. `ids` are the call's distinct ids, ascending, those of the
+    /// plan's host segment included, and the columns that list `ids[d]`
+    /// number `off[d + 1] - off[d]`. A call refused before its path is told
+    /// is not told. It must not lock or allocate unless its tier keeps books
+    /// of the call (a gate's record of it, or the routing counts its
+    /// victims are ranked by); a tier that keeps none takes the default.
+    fn note_union(
+        &self,
+        _layer: usize,
+        _ids: &[u32],
+        _off: &[usize],
+        _cols: usize,
+        _batched: bool,
+    ) {
+    }
     /// Host compute of a step's hit group while its miss ticket was still
     /// in flight, in ns. A tier that does not count it takes the default.
     /// A ready ticket never reaches the hit group, so it adds nothing.
@@ -3077,9 +3094,9 @@ impl HostLayer {
         if union.tier_ids.is_empty() {
             return self.serve_column(lanes, split, x, experts, out, scratch);
         }
-        let ticket = tier
-            .slots
-            .prefetch_pinned(tier.layer, &union.tier_ids, Claim::Step)?;
+        let ticket =
+            tier.slots
+                .prefetch_pinned(tier.layer, &union.tier_ids, Claim::Step, 1, None)?;
         if ticket.is_ready() || !union.plan.fits(union.max_slots) {
             let _pin = ticket.wait()?;
             return self.serve_column(lanes, split, x, experts, out, scratch);
@@ -3220,9 +3237,13 @@ impl HostLayer {
         // The claim is made now and the misses fill on the tier's threads;
         // the pin lasts until the union's reads end, as `experts_into_on`'s
         // ids are.
-        let ticket = tier
-            .slots
-            .prefetch_pinned(tier.layer, &scratch.tier_ids, Claim::Step)?;
+        let ticket = tier.slots.prefetch_pinned(
+            tier.layer,
+            &scratch.plan.ids,
+            Claim::Step,
+            lists.len() as u64,
+            Some(&scratch.plan.off),
+        )?;
         tier.lend(&mut stacks);
         if ticket.is_ready() || !scratch.plan.fits(scratch.max_slots) {
             let pin = ticket.wait()?;
@@ -4164,8 +4185,7 @@ mod tests {
         ensured: std::sync::Mutex<Vec<(usize, Vec<u32>)>>,
         asked: std::sync::Mutex<Vec<(usize, u32, usize)>>,
         pins: std::sync::Mutex<PinLog>,
-        /// What `note_union` was told: the layer, the call's ids and column
-        /// offsets, and whether it took the batched path.
+        /// The prompt note or step prefetch's column plan and batch path.
         told: std::sync::Mutex<Vec<Told>>,
         /// A step's claim: `None` holds every id of a ticket unwaited (the
         /// prompt batches' mode); `Some(late)` holds the claim's hits waited
@@ -4187,12 +4207,13 @@ mod tests {
         Wait,
     }
 
-    /// One `note_union` call as the mock was told it.
+    /// One union's column plan and batch path as the mock was told it.
     #[derive(Debug, PartialEq)]
     struct Told {
         layer: usize,
         ids: Vec<u32>,
         off: Vec<usize>,
+        cols: usize,
         batched: bool,
     }
 
@@ -4336,7 +4357,12 @@ mod tests {
             layer: usize,
             ids: &[u32],
             claim: super::Claim,
+            columns: u64,
+            column_off: Option<&[usize]>,
         ) -> Result<super::Ticket<'a>, super::TierError> {
+            if let Some(off) = column_off {
+                self.note_union(layer, ids, off, usize::try_from(columns).unwrap(), false);
+            }
             self.ensured.lock().unwrap().push((layer, ids.to_vec()));
             let pin = self.pin_batch(ids, claim, false);
             if let Some(late) = &self.late {
@@ -4387,11 +4413,12 @@ mod tests {
             self.filled.then(|| &self.parts[3 * id as usize + part][..])
         }
 
-        fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], batched: bool) {
+        fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], cols: usize, batched: bool) {
             self.told.lock().unwrap().push(Told {
                 layer,
                 ids: ids.to_vec(),
                 off: off.to_vec(),
+                cols,
                 batched,
             });
         }
@@ -4799,7 +4826,7 @@ mod tests {
 
     /// A tiered union call tells its tier its path once, before its first
     /// batch's claim: the call's distinct ids ascending (the host segment's
-    /// included) with their column offsets, `batched` when its arena ids are
+    /// included) with their column offsets, its columns, `batched` when its arena ids are
     /// more than the slots less two batches and not when they fit. A call
     /// refused before its path (a layer under the floor, an expert past the
     /// stacks') tells nothing.
@@ -4845,6 +4872,7 @@ mod tests {
                 layer: 4,
                 ids: vec![2, 3, 4, 5, 6, 7],
                 off: vec![0, 1, 2, 4, 5, 6, 7],
+                cols: 2,
                 batched: true
             }],
             "one note, batched, with the call's ids and offsets"
@@ -4861,6 +4889,7 @@ mod tests {
                 layer: 4,
                 ids: vec![0, 2, 7],
                 off: vec![0, 1, 3, 4],
+                cols: 2,
                 batched: false
             }],
             "one note, not batched, the host segment's id in the ids"
@@ -5050,6 +5079,7 @@ mod tests {
             &[(5, 0.6), (3, 0.4)],
         ];
         let tier_ids = [0u32, 2, 3, 5];
+        let claim_ids = [0u32, 1, 2, 3, 5];
         let src = R8Source::rows(&split);
         let mut us = UnionScratch::new_routed(embd, ff, 8, 3).unwrap();
 
@@ -5068,16 +5098,16 @@ mod tests {
         }
         assert_eq!(
             empty.ensured(),
-            vec![(4, tier_ids.to_vec())],
-            "ensure saw the call's distinct tier ids once, ascending, at the tier's layer"
+            vec![(4, claim_ids.to_vec())],
+            "ensure saw the full plan's distinct ids once, ascending, at the tier's layer"
         );
         assert_eq!(
             empty.events(),
             vec![
-                PinEvent::Pinned(super::Claim::Step, tier_ids.to_vec()),
-                PinEvent::Unpinned(tier_ids.to_vec()),
+                PinEvent::Pinned(super::Claim::Step, claim_ids.to_vec()),
+                PinEvent::Unpinned(claim_ids.to_vec()),
             ],
-            "the step union's tier ids are pinned as the step's, and let go when it refuses"
+            "the mock holds the full step plan and lets go when it refuses"
         );
 
         let mut full = MockTier::of(&split, &layer, true);
@@ -5092,14 +5122,25 @@ mod tests {
         assert_eq!(
             full.events(),
             vec![
-                PinEvent::Pinned(super::Claim::Step, tier_ids.to_vec()),
-                PinEvent::Unpinned(tier_ids.to_vec()),
+                PinEvent::Pinned(super::Claim::Step, claim_ids.to_vec()),
+                PinEvent::Unpinned(claim_ids.to_vec()),
             ],
-            "the step union's tier ids stay pinned for the call and are let go after it"
+            "the mock holds the full step plan for the call and lets go after it"
         );
         assert!(
             full.pins.lock().unwrap().loose.is_empty(),
             "every slot the step union read was pinned"
+        );
+        assert_eq!(
+            full.told(),
+            vec![Told {
+                layer: 4,
+                ids: claim_ids.to_vec(),
+                off: vec![0, 1, 3, 4, 5, 7],
+                cols,
+                batched: false,
+            }],
+            "the step claim carries each id's routed columns, including host ids"
         );
         let asked = full.asked();
         assert!(
@@ -5168,7 +5209,7 @@ mod tests {
             &[(2, 0.5), (6, 3e-4), (1, 0.25), (5, 7.0)],
             &[(7, 0.6), (3, 2.0), (5, 1e-2), (0, 0.125)],
         ];
-        let tier_ids = [0u32, 2, 3, 5, 6, 7];
+        let claim_ids = [0u32, 1, 2, 3, 5, 6, 7];
         let (late, hits) = ([0u32, 6], [2u32, 3, 5, 7]);
         let src = R8Source::rows(&split);
         let mut us = UnionScratch::new_routed(embd, ff, 8, 4).unwrap();
@@ -5239,10 +5280,10 @@ mod tests {
         assert_eq!(
             tier.events(),
             vec![
-                PinEvent::Pinned(super::Claim::Step, tier_ids.to_vec()),
-                PinEvent::Unpinned(tier_ids.to_vec()),
+                PinEvent::Pinned(super::Claim::Step, claim_ids.to_vec()),
+                PinEvent::Unpinned(claim_ids.to_vec()),
             ],
-            "one claim for the call's tier ids, let go after it"
+            "one claim for the full plan, let go after it"
         );
         std::fs::remove_file(&path).unwrap();
     }
@@ -5286,8 +5327,8 @@ mod tests {
         assert_eq!(
             tier.events(),
             vec![
-                PinEvent::Pinned(super::Claim::Step, vec![0, 2, 5]),
-                PinEvent::Unpinned(vec![0, 2, 5]),
+                PinEvent::Pinned(super::Claim::Step, vec![0, 1, 2, 5]),
+                PinEvent::Unpinned(vec![0, 1, 2, 5]),
             ],
             "the claim is let go whole"
         );

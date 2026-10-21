@@ -94,6 +94,8 @@
 //!   reads 128 KiB, 32 pages at 4 KiB, so a band of 64 pages and 240 a flip.
 //!   The line also prints each read's band pages, and the prompt's drops and
 //!   their wall against the prompt's.
+//! - Under `heat`, `stepunion` also holds a four-column Step claim to each
+//!   id's routed column count and the unrouted id's four-column decay.
 //! - `stepunion` (clause 8, a load of its own): the step port's union of
 //!   two columns on a paged plan — the plan made for two slots at the same
 //!   room and context (the two arms' plan counts one sequence, and a second
@@ -207,6 +209,17 @@
 //!   and counts), every greedy token and every logits row are the same bit
 //!   for bit. Pricing the rule at the probed rate parts the second
 //!   sitting's picks and then its bits.
+//! - `evict` (clause 15, `BLOOMERY_NVTIER_EVICT`): two tiers of the
+//!   floor's own arena over the paged plan, one each rule, through the same
+//!   claims on the first paged layer: its first served id stepped three
+//!   times, the next ids once each until every slot is full, then a
+//!   transient's miss and two steps' misses. Under `heat` the transient's
+//!   miss takes the hot slot whose expert has the least routing count
+//!   ([`NvTier::route_count`], read just before), the first id staying; the
+//!   next step's miss takes that transient, and the one after it the
+//!   coldest count again. Under `tick` the transient's miss takes the first
+//!   id, the least recently used, and the tier counts nothing. A tier that
+//!   evicts by tick alone under `heat` takes the first id: red.
 //!
 //! PIN(2026-10-11): clause 7 judges 0 interior pages after the prompt, where it judged at most `layers x cpus x 2R`. Derived, not measured: the prompt's union reads every tier id from its arena slot (`prefetch_pinned`), so it faults no page of a drop run, and no drop follows it (`release_union` is gone), so a page of a run read after the prompt would stay. The interiors leave out the edge bands where the host segment's own reads reach. The pre-change run (R4b-1, the same union) read 0 against the old bound of 196608. FAIL-first: a layer left unattached to the tier reads the mapping and its interior pages stay, turning the clause red.
 //!
@@ -267,12 +280,14 @@ use bloomery_gpu::host::swap::{LateLog, PassReport, Residency, SwapSource};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, exit_with, verdict};
+use bloomery_levers::NvTierEvict;
 use bloomery_levers::{
     CARD_DONTNEED, ChurnHosting, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HostCfg, RESIDENCY38_SPARES,
 };
 use gguf::Split;
 use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
 use model::moe::UNION_BATCH_IDS;
+use model::moe::{Claim, TierSlots};
 use model::placement::churn::ChurnPool;
 use model::placement::host_lock::page_bytes;
 use model::placement::workstation::{ArenaGrant, HostNeed, HostRead};
@@ -1062,6 +1077,8 @@ struct StepRun {
     solo_prompts: [u32; 2],
     solo_tokens: Vec<u32>,
     solo_digests: Vec<u64>,
+    /// A four-column Step claim's routing counts and decay.
+    counts: bool,
     flips: usize,
     misses: u64,
     fills: u64,
@@ -1104,6 +1121,7 @@ fn stepunion_arm(
     ids: &[u32],
     probe: &Split,
     band: Option<u64>,
+    evict: NvTierEvict,
 ) -> Result<StepRun, GateError> {
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = inputs_of(&file, Some(ROOM))?;
@@ -1207,6 +1225,41 @@ fn stepunion_arm(
             solo_tokens.push(argmax);
         }
     }
+    let layer = regions[0].0;
+    let counts = if evict == NvTierEvict::Heat {
+        let ids: Vec<_> = (0..plan.model.experts as u32)
+            .filter(|&id| tier.slot_filled(layer, id))
+            .take(3)
+            .collect();
+        if ids.len() != 3 {
+            return Err("the stepunion heat check needs three filled ids".into());
+        }
+        let before: Vec<_> = ids.iter().map(|&id| tier.route_count(layer, id)).collect();
+        let pin = tier
+            .prefetch_pinned(layer, &ids[..2], Claim::Step, 4, Some(&[0, 4, 5]))?
+            .wait()?;
+        let decay = (-4.0f64 / 32.0).exp2();
+        let counts = ids
+            .iter()
+            .zip(before)
+            .zip([4.0, 1.0, 0.0])
+            .all(|((&id, before), added)| {
+                let (Some(before), Some(after)) = (before, tier.route_count(layer, id)) else {
+                    return false;
+                };
+                let want = before * decay + added;
+                before > 0.0 && after.is_finite() && (after - want).abs() <= 1e-12 * want
+            });
+        drop(pin);
+        counts
+    } else {
+        tier.route_count(layer, 0).is_none()
+    };
+    println!(
+        "stepunion counts {evict:?}: four columns route one id four times and another once, \
+        the third decays four columns: {}",
+        verdict(counts)
+    );
     Ok(StepRun {
         prompts,
         tokens,
@@ -1214,6 +1267,7 @@ fn stepunion_arm(
         solo_prompts,
         solo_tokens,
         solo_digests,
+        counts,
         flips,
         misses: t1.misses - t0.misses,
         fills: t1.fills - t0.fills,
@@ -2177,6 +2231,7 @@ fn run() -> Result<(), GateError> {
         plan.host.nvme_expert_bytes, plan.host.nvme_arena_bytes
     );
     pass &= refuse_clauses(path, &machine, &plan)?;
+    pass &= evict_clause(path, &plan)?;
     let least = ArenaFloor::of(&plan)?;
     let grant_terms = GrantTerms::of(
         plan.host.nvme_arena_bytes,
@@ -2841,7 +2896,15 @@ fn run() -> Result<(), GateError> {
     let mut census = std::mem::take(&mut paged.census);
     let prompt_fill = paged.prompt_fill.take();
     drop((paged, ram));
-    let step = stepunion_arm(path, &machine, host, &ids, &probe, band)?;
+    let step = stepunion_arm(
+        path,
+        &machine,
+        host,
+        &ids,
+        &probe,
+        band,
+        levers.nvtier_evict(),
+    )?;
     let solo_bits = !step.tokens.is_empty()
         && step.prompts == step.solo_prompts
         && step.tokens == step.solo_tokens
@@ -2853,7 +2916,7 @@ fn run() -> Result<(), GateError> {
     // Under a set `off` no lane fills the arena and no prompt union runs: the
     // passes' fills are the step claims', and the union's counters stand.
     let counted = step.step_fills > 0 && step.union_fills == 0 && step.union_hits == 0;
-    let stepunion = solo_bits && step_pages_ok && served && counted;
+    let stepunion = solo_bits && step_pages_ok && served && counted && step.counts;
     println!(
         "stepunion: {STEP_COLS} two-column passes on a two-slot load, {} tokens and logits rows \
          and both prompts' argmax bit for bit the same sequences stepped alone: {}; {}; misses \
@@ -3054,6 +3117,90 @@ fn run() -> Result<(), GateError> {
     }
 }
 
+/// `evict` (clause 15): the victim rule each `BLOOMERY_NVTIER_EVICT` word
+/// names, on a tier of the floor's own arena over `plan` (the module doc).
+fn evict_clause(path: &Path, plan: &model::placement::Plan<'_>) -> Result<bool, GateError> {
+    let split = Arc::new(Split::open(path)?);
+    let least = ArenaFloor::of(plan)?;
+    let mut floor = plan.clone();
+    floor.host.nvme_arena_bytes = least.bytes;
+    let mut pass = true;
+    for evict in [NvTierEvict::Tick, NvTierEvict::Heat] {
+        let tier = NvTier::of_paged(
+            &floor,
+            &split,
+            true,
+            ArenaGrant::whole(least.bytes),
+            ArenaKind::Anon,
+            evict,
+        )?
+        .ok_or("the floor's arena built no tier")?;
+        let layer = (0..plan.model.layers)
+            .find(|&l| tier.covers(l))
+            .ok_or("the paged plan covers no layer")?;
+        let slots = tier.layer_slots(layer);
+        let ids: Vec<u32> = (0..plan.model.experts as u32)
+            .filter(|&id| tier.serves(layer, id))
+            .take(slots + 3)
+            .collect();
+        if ids.len() < slots + 3 {
+            return Err(format!(
+                "layer {layer} serves {} ids, under {} slots and 3",
+                ids.len(),
+                slots
+            )
+            .into());
+        }
+        let (first, transient) = (ids[0], ids[slots]);
+        for &id in [first, first].iter().chain(&ids[..slots]) {
+            tier.ensure(layer, &[id])?;
+        }
+        let filled = |id: u32| tier.slot_filled(layer, id);
+        // The hot id of the least count the tier holds, which `heat` takes.
+        let coldest = || -> Result<Option<u32>, GateError> {
+            let mut least: Option<(u32, f64)> = None;
+            for &id in ids[..slots].iter().filter(|&&id| filled(id)) {
+                let count = tier
+                    .route_count(layer, id)
+                    .ok_or_else(|| format!("layer {layer} id {id}: a heat tier holds no count"))?;
+                if least.is_none_or(|(_, c)| count < c) {
+                    least = Some((id, count));
+                }
+            }
+            Ok(least.map(|(id, _)| id))
+        };
+        let heat = evict == NvTierEvict::Heat;
+        let first_victim = if heat { coldest()? } else { Some(first) };
+        tier.ensure_as(layer, &[transient], Claim::Transient)?;
+        let took = first_victim.is_some_and(|v| !filled(v)) && filled(transient);
+        let kept = !heat || (filled(first) && first_victim != Some(first));
+        tier.ensure(layer, &[ids[slots + 1]])?;
+        let transient_first = !filled(transient) && filled(ids[slots + 1]);
+        let next_victim = if heat { coldest()? } else { Some(ids[1]) };
+        tier.ensure(layer, &[ids[slots + 2]])?;
+        let next = next_victim.is_some_and(|v| !filled(v)) && filled(first) == heat;
+        let counted = tier.route_count(layer, first).is_some() == heat;
+        let ok = took && kept && transient_first && next && counted;
+        println!(
+            "evict {evict:?}: layer {layer} of {slots} slots, id {first} stepped three times then \
+             {} ids once: the transient's miss took {first_victim:?} ({}), the first id {} \
+             ({}); the next step's miss took the transient ({}); the one after took \
+             {next_victim:?} ({}); counts {} ({}): {}",
+            slots - 1,
+            verdict(took),
+            if filled(first) { "kept" } else { "gone" },
+            verdict(kept),
+            verdict(transient_first),
+            verdict(next),
+            if heat { "kept" } else { "none" },
+            verdict(counted),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    Ok(pass)
+}
+
 /// `refuse` (clause 4): each refusal by name before any load. The room
 /// under the tier's floor is the plan's; the arena budgets under the
 /// arena's floor — one byte, the routed width less one slot sets, the
@@ -3082,7 +3229,14 @@ fn refuse_clauses(
     let with_arena = |bytes: u64| {
         let mut p = plan.clone();
         p.host.nvme_arena_bytes = bytes;
-        NvTier::of_paged(&p, &split, true, ArenaGrant::whole(bytes), ArenaKind::Anon)
+        NvTier::of_paged(
+            &p,
+            &split,
+            true,
+            ArenaGrant::whole(bytes),
+            ArenaKind::Anon,
+            NvTierEvict::Tick,
+        )
     };
     let slot = match with_arena(1) {
         Err(e) => e.to_string().contains("carves 0 slots"),

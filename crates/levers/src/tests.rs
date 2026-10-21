@@ -41,7 +41,7 @@ fn retired() -> impl Iterator<Item = &'static LeverSpec> {
 
 /// Whether the pool reads it: it is on every binary's list.
 /// The rows read below every binary's `main` (the pool's two, the host's
-/// room, the NVMe tier's three, [`nvtier_levers`], the tier link,
+/// room, the NVMe tier's four, [`nvtier_levers`], the tier link,
 /// [`tier_link`], the tiers' nodes, [`tier_nodes`], and the need hook,
 /// [`need_levers`]), which no `at_main` list refuses.
 fn pool(r: &LeverSpec) -> bool {
@@ -52,6 +52,7 @@ fn pool(r: &LeverSpec) -> bool {
         || r.name == NVTIER_BYTES
         || r.name == NVTIER_READ
         || r.name == NVTIER_MEM
+        || r.name == NVTIER_EVICT
         || r.name == TIER_LINK
         || r.name == TIER_NODES
 }
@@ -447,6 +448,7 @@ fn accessors_read_their_rows() {
             (LANE_PREFETCH, "on"),
             (HOST_LANES, "flat"),
             (NVTIER_MEM, "pinned"),
+            (NVTIER_EVICT, "heat"),
             (PREFILL_GROUP, "8"),
             (GEN_SLOTS, "2"),
             (PREPARE_Q8, "1"),
@@ -483,6 +485,7 @@ fn accessors_read_their_rows() {
     assert!(set.lane_prefetch());
     assert_eq!(set.host_lanes(), HostLanes::Flat);
     assert_eq!(set.nvtier_mem(), NvTierMem::Pinned);
+    assert_eq!(set.nvtier_evict(), NvTierEvict::Heat);
     // Each word as the tier's build reads it, and whether it pins the arena
     // on an integrated device and on a card with its own memory.
     for (word, integrated, discrete) in [
@@ -528,6 +531,7 @@ fn accessors_read_their_rows() {
             NVTIER_BYTES,
             NVTIER_READ,
             NVTIER_MEM,
+            NVTIER_EVICT,
             TIER_LINK,
             TIER_NODES,
             TP_NODES,
@@ -642,6 +646,27 @@ fn the_need_hook_is_read_below_main() {
         panic!("a binary that leaves the lock out refuses it");
     };
     assert!(e.to_string().contains(HOST_LOCK), "{e}");
+}
+
+/// `BLOOMERY_NVTIER_EVICT` is read where the tier is built
+/// ([`Scope::NvTier`]): unset is `tick`, main's rule, each word is its rule,
+/// and any other word is refused by name with the words the row takes.
+#[test]
+fn nvtier_evict_takes_tick_or_heat_and_refuses_the_rest() {
+    let evict = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::NvTier).map(|l| l.nvtier_evict());
+    assert_eq!(evict(&[]).unwrap(), NvTierEvict::Tick);
+    assert_eq!(evict(&[(NVTIER_EVICT, "tick")]).unwrap(), NvTierEvict::Tick);
+    assert_eq!(evict(&[(NVTIER_EVICT, "heat")]).unwrap(), NvTierEvict::Heat);
+    for bad in ["lru", "HEAT", ""] {
+        let Err(e) = evict(&[(NVTIER_EVICT, bad)]) else {
+            panic!("{bad:?} is not a word of the row and must be refused");
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains(NVTIER_EVICT) && text.contains("one of tick, heat"),
+            "{text}"
+        );
+    }
 }
 
 /// `BLOOMERY_HOST_ROOM` takes bytes (`M` and `G` binary units) where the

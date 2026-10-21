@@ -70,7 +70,11 @@
 //! cold end (tick 0 and a sequence number in claim order), so the next miss
 //! takes the oldest transient before any hot slot, and a later step or keep
 //! hit turns a transient hot; a transient claim's hit leaves a hot or
-//! transient slot as it is. A batch pin ([`NvTier::pin`]) counts the ids
+//! transient slot as it is. Among the hot slots a miss takes the least
+//! recently used under `BLOOMERY_NVTIER_EVICT=tick` (unset), and under `heat`
+//! the one whose expert has the least decayed routing count ([`LayerCounts`],
+//! the least recently used among equal counts); a call's own ids are never
+//! its victims then. A batch pin ([`NvTier::pin`]) counts the ids
 //! of a batch in the same open-read counts a lane's read does, so the books
 //! take none of them until the guard drops. A prompt call's union claims
 //! each batch of its experts as one claim and pin ([`NvTier::prefetch_pinned`]):
@@ -97,7 +101,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use bloomery_levers::NvTierMem;
+use bloomery_levers::{NvTierEvict, NvTierMem};
 use cuda_core::CudaContext;
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::Split;
@@ -390,19 +394,26 @@ enum NoSlot {
     /// Every slot is filling: two ensures raced the layer.
     Filling,
     /// No slot is free and every filled one is pinned by a lane's open read
-    /// or a batch pin, or is one of a transient call's own ids: the arena's
-    /// floor does not cover the pins open beside the call.
+    /// or a batch pin, or is one of the call's own ids (a transient call's,
+    /// or any call's under [`NvTierEvict::Heat`]): the arena's floor does not
+    /// cover the pins open beside the call.
     Pinned,
 }
 
 /// The slot a miss takes: the first free one, else the victim of the filled
 /// ones `pinned` does not name — the oldest transient (the least `seq`: a
-/// transient sits at tick 0), else the least recently used. A filling slot is
+/// transient sits at tick 0), else the least recently used, or with the
+/// layer's `counts` ([`NvTierEvict::Heat`]) the hot slot whose expert has the
+/// least count, the least recently used among equal counts. A filling slot is
 /// never the arena's to take, its fill owns it, and a pinned one is being
 /// read. Refused by name when none is left, never waited for and never
 /// overwritten: all filling is the race of two ensures, all the rest pinned
 /// the floor's.
-fn pick_slot(slots: &[SlotBook], pinned: impl Fn(&SlotBook) -> bool) -> Result<usize, NoSlot> {
+fn pick_slot(
+    slots: &[SlotBook],
+    pinned: impl Fn(&SlotBook) -> bool,
+    counts: Option<&LayerCounts>,
+) -> Result<usize, NoSlot> {
     if let Some(k) = slots
         .iter()
         .position(|s| s.state.load(Ordering::Relaxed) == FREE)
@@ -415,20 +426,35 @@ fn pick_slot(slots: &[SlotBook], pinned: impl Fn(&SlotBook) -> bool) -> Result<u
             .enumerate()
             .filter(|(_, s)| s.state.load(Ordering::Relaxed) == FILLED)
     };
-    filled()
-        .filter(|(_, s)| !pinned(s))
-        .min_by_key(|(_, s)| {
-            (
-                s.tick.load(Ordering::Relaxed),
-                s.seq.load(Ordering::Relaxed),
-            )
-        })
-        .map(|(k, _)| k)
-        .ok_or(if filled().next().is_some() {
-            NoSlot::Pinned
-        } else {
-            NoSlot::Filling
-        })
+    let tick = |s: &SlotBook| {
+        (
+            s.tick.load(Ordering::Relaxed),
+            s.seq.load(Ordering::Relaxed),
+        )
+    };
+    let unpinned = filled().filter(|(_, s)| !pinned(s));
+    let victim = match counts {
+        None => unpinned.min_by_key(|(_, s)| tick(s)),
+        Some(counts) => {
+            // A transient (seq from 1) before every hot slot (seq 0).
+            let cold = |s: &SlotBook| match s.seq.load(Ordering::Relaxed) {
+                0 => u64::MAX,
+                seq => seq,
+            };
+            let score = |s: &SlotBook| counts.score(s.id.load(Ordering::Relaxed));
+            unpinned.min_by(|(_, a), (_, b)| {
+                cold(a)
+                    .cmp(&cold(b))
+                    .then(score(a).total_cmp(&score(b)))
+                    .then(tick(a).cmp(&tick(b)))
+            })
+        }
+    };
+    victim.map(|(k, _)| k).ok_or(if filled().next().is_some() {
+        NoSlot::Pinned
+    } else {
+        NoSlot::Filling
+    })
 }
 
 /// What one `ensure` claimed under the books' lock: the slots to fill, the
@@ -452,7 +478,9 @@ struct Claimed {
 /// call's own ids are never its victims: a hit on a transient keeps its cold
 /// place, the first place a later miss of the call would look, and a hit on a
 /// hot id keeps its tick, so the ids a keep claim took stay newer than it.
-/// Pure over the
+/// Under [`NvTierEvict::Heat`] no call's own id is its victim: a hit's count
+/// moves only at the call's counting ([`Books::count_step`]), after the
+/// picks. Pure over the
 /// books: no read, no page returned. The `seen` marks are this call's alone;
 /// a mark that outlived its call would skip an expert evicted since, and its
 /// slot would read unfilled. Refused by name before any slot is claimed, the
@@ -611,10 +639,12 @@ fn claim_fill(
             continue;
         }
         misses += 1;
+        let counts = books.counts.as_ref().map(|c| &c[layer]);
         let own = |s: &SlotBook| {
-            kind == Claim::Transient && books.named[s.id.load(Ordering::Relaxed) as usize]
+            (kind == Claim::Transient || counts.is_some())
+                && books.named[s.id.load(Ordering::Relaxed) as usize]
         };
-        let slot = match pick_slot(&arena.slots, |s| arena.pins(s) || own(s)) {
+        let slot = match pick_slot(&arena.slots, |s| arena.pins(s) || own(s), counts) {
             Ok(slot) => slot,
             Err(why) => {
                 unclaim(arena, picks);
@@ -1648,6 +1678,10 @@ pub struct NvTier {
     /// The LRU tick and the dedup pass's marks, under one lock taken per
     /// `ensure`.
     books: Mutex<Books>,
+    /// The victim rule the build was asked for; the books hold their
+    /// routing counts exactly under [`NvTierEvict::Heat`], so a call that
+    /// only counts takes no lock under [`NvTierEvict::Tick`].
+    evict: NvTierEvict,
     stats: Stats,
     /// The arena the plan reserved and the load took ([`NvTier::budget`] is
     /// the second).
@@ -1711,8 +1745,112 @@ struct Books {
     seq: u64,
     /// The dedup pass's seen marks, reused across calls.
     seen: Vec<bool>,
-    /// The ids the current call names, for a transient call's victim pick.
+    /// The ids the current call names, for a transient call's victim pick
+    /// and, under [`NvTierEvict::Heat`], every call's and its counting.
     named: Vec<bool>,
+    /// The NVMe tier's routing counts, the one owner of the heat a miss
+    /// evicts by under [`NvTierEvict::Heat`]; `None` under
+    /// [`NvTierEvict::Tick`], which counts nothing. By the plan's layer (a
+    /// layer the arena does not cover holds no expert), per expert, the
+    /// columns that routed it, each halved every [`HEAT_HALF_LIFE`] columns
+    /// the layer has served since. A step's claim counts each id it names
+    /// once and moves the layer's clock one column ([`Books::count_step`]); a
+    /// prompt's union call counts each id by the columns that list it and
+    /// moves the clock by its columns ([`TierSlots::note_union`]); a prompt
+    /// batch's claim counts nothing, its call did. An evicted expert keeps its
+    /// count. Written under the books' lock, sized at the build, so a count
+    /// allocates nothing. The card's residency rule keeps its own counts
+    /// (`runtime::SwapRule`): its rows are a stream's kept rows, blended
+    /// across streams and decayed at its plans, and the arena's are every
+    /// column the arena serves, a prompt's included.
+    counts: Option<Vec<LayerCounts>>,
+}
+
+impl Books {
+    /// Count a step's claim on layer `layer`, as the claim left its marks in
+    /// `named` (each id the arena serves that the call names, once): advance
+    /// the layer's clock by `columns`, then add each marked id's routed
+    /// columns from `column_off`, or one without offsets, and clear its mark.
+    /// A residency victim's fill moves the clock none, since the card served
+    /// its columns and the arena never saw them. Nothing under [`NvTierEvict::Tick`].
+    fn count_step(
+        &mut self,
+        layer: usize,
+        ids: &[u32],
+        columns: u64,
+        column_off: Option<&[usize]>,
+    ) {
+        let Some(counts) = self.counts.as_mut() else {
+            return;
+        };
+        let layer = &mut counts[layer];
+        layer.advance(columns);
+        for (i, &id) in ids.iter().enumerate() {
+            if std::mem::replace(&mut self.named[id as usize], false) {
+                let routed_columns = column_off.map_or(1.0, |off| (off[i + 1] - off[i]) as f64);
+                layer.add(id, routed_columns);
+            }
+        }
+    }
+}
+
+/// The half-life of a routing count ([`LayerCounts`]), in the columns its
+/// layer serves.
+const HEAT_HALF_LIFE: f64 = 32.0;
+
+/// The half-lives a layer's clock runs past its scores' base before they are
+/// scaled down to it ([`LayerCounts::advance`]): a score stays below
+/// `2^HEAT_RESCALE` times the columns since, far inside an `f64`.
+const HEAT_RESCALE: f64 = 64.0;
+
+/// One layer's counts, each held as a score: a column at `since` columns past
+/// the base adds `2^(since / HEAT_HALF_LIFE)`, so every score of the layer is
+/// its decayed count times one factor, and two experts rank by their scores
+/// with no decay applied.
+struct LayerCounts {
+    /// The columns the layer has served since its scores' base.
+    since: u64,
+    scores: Vec<f64>,
+}
+
+impl LayerCounts {
+    fn new(experts: usize) -> LayerCounts {
+        LayerCounts {
+            since: 0,
+            scores: vec![0.0; experts],
+        }
+    }
+
+    /// What one column at the clock adds to a score.
+    fn weight(&self) -> f64 {
+        (self.since as f64 / HEAT_HALF_LIFE).exp2()
+    }
+
+    /// The clock `columns` on; past [`HEAT_RESCALE`] half-lives the base
+    /// moves up to it, every score scaled down by the weight it reached.
+    fn advance(&mut self, columns: u64) {
+        self.since += columns;
+        if self.since as f64 >= HEAT_RESCALE * HEAT_HALF_LIFE {
+            let down = self.weight().recip();
+            self.scores.iter_mut().for_each(|s| *s *= down);
+            self.since = 0;
+        }
+    }
+
+    /// `columns` columns of expert `id` at the clock.
+    fn add(&mut self, id: u32, columns: f64) {
+        self.scores[id as usize] += columns * self.weight();
+    }
+
+    /// Expert `id`'s rank among the layer's: its score.
+    fn score(&self, id: u32) -> f64 {
+        self.scores[id as usize]
+    }
+
+    /// Expert `id`'s decayed count at the clock.
+    fn count(&self, id: u32) -> f64 {
+        self.score(id) / self.weight()
+    }
 }
 
 impl NvTier {
@@ -1729,13 +1867,15 @@ impl NvTier {
     /// that is not its file's mapping ([`gguf::Gguf::file_backed`]: a drop
     /// would zero a copy), and a budget whose carve falls under the
     /// arena's floor ([`ArenaFloor::of`] at the served column: a plan whose
-    /// arena was not the split dial's).
+    /// arena was not the split dial's). A miss once no slot is free takes its
+    /// victim as `evict` says ([`pick_slot`]).
     pub fn of_paged(
         plan: &Plan<'_>,
         split: &Arc<Split>,
         direct: bool,
         arena: ArenaGrant,
         mem: ArenaKind<'_>,
+        evict: NvTierEvict,
     ) -> Result<Option<NvTier>, GpuError> {
         const WHAT: &str = "NvTier::of_paged";
         if plan.host.nvme_expert_bytes == 0 || arena.granted == 0 {
@@ -1922,7 +2062,7 @@ impl NvTier {
         let least = ArenaFloor::of(plan).map_err(|e| GpuError::plan(WHAT, e))?;
         let count =
             slots_of(arena.granted, &slot_sizes, &least).map_err(|e| GpuError::shape(WHAT, e))?;
-        NvTier::carve(
+        let mut tier = NvTier::carve(
             arenas,
             &slot_sizes,
             count,
@@ -1930,8 +2070,24 @@ impl NvTier {
             plan.host.nvme_expert_bytes,
             split,
             mem,
-        )
-        .map(Some)
+        )?;
+        if evict == NvTierEvict::Heat {
+            tier.count_routes();
+        }
+        Ok(Some(tier))
+    }
+
+    /// Rank the hot slots by routing counts ([`NvTierEvict::Heat`]): zero
+    /// counts over the covered layers. Load-time, before any claim.
+    fn count_routes(&mut self) {
+        let books = self.books.get_mut().unwrap_or_else(|e| e.into_inner());
+        books.counts = Some(
+            self.by_layer
+                .iter()
+                .map(|a| LayerCounts::new(a.as_ref().map_or(0, |a| a.n_expert as usize)))
+                .collect(),
+        );
+        self.evict = NvTierEvict::Heat;
     }
 
     /// The tier over `arenas`, each paged layer's books with no slots yet,
@@ -2004,6 +2160,7 @@ impl NvTier {
             step,
             by_layer: arenas,
             books: Mutex::new(Books::default()),
+            evict: NvTierEvict::Tick,
             stats: Stats::default(),
             arena,
             slots: count,
@@ -2071,6 +2228,17 @@ impl NvTier {
     #[must_use]
     pub fn slot_heat(&self, layer: usize, id: u32) -> Option<Heat> {
         self.by_layer.get(layer)?.as_ref()?.heat(id)
+    }
+
+    /// Layer `layer`'s expert `id`'s routing count at the layer's clock
+    /// ([`LayerCounts`]), filled or not; `None` under [`NvTierEvict::Tick`],
+    /// which counts nothing, and for a layer or an id the arena does not
+    /// cover.
+    #[must_use]
+    pub fn route_count(&self, layer: usize, id: u32) -> Option<f64> {
+        let books = self.books.lock().unwrap_or_else(|e| e.into_inner());
+        let counts = books.counts.as_ref()?.get(layer)?;
+        ((id as usize) < counts.scores.len()).then(|| counts.count(id))
     }
 
     /// Keep each layer's last union call from now on
@@ -2551,10 +2719,11 @@ impl NvTier {
     /// the chain's: beside the chain the lane takes only the books' lock, for
     /// the claim and the publish, which wait on nothing. A victim holds no
     /// pin once published, and the fill counts as a fill, not a union's.
-    /// Refused by name like [`NvTier::ensure`], and once the reader has
-    /// stopped.
+    /// Under [`NvTierEvict::Heat`] each victim counts one column and the
+    /// layer's clock stays ([`Books::count_step`]). Refused by name like
+    /// [`NvTier::ensure`], and once the reader has stopped.
     pub fn ensure_victim(&self, layer: usize, ids: &[u32]) -> Result<(), GpuError> {
-        let (arena, claim) = self.claim(layer, ids, Claim::Step, false)?;
+        let (arena, claim) = self.claim(layer, ids, Claim::Step, false, 0, None)?;
         if !claim.picks.is_empty() {
             let reads: Vec<PickRead> = claim.picks.iter().map(|p| read_of(arena, p)).collect();
             let mem = Arc::clone(&self.mem);
@@ -2623,7 +2792,7 @@ impl NvTier {
         layer: usize,
         ids: &'a [u32],
     ) -> Result<CardTicket<'a>, GpuError> {
-        let ticket = TierSlots::prefetch_pinned(self.as_ref(), layer, ids, Claim::Step)
+        let ticket = TierSlots::prefetch_pinned(self.as_ref(), layer, ids, Claim::Step, 1, None)
             .map_err(|e| GpuError::from(model::ModelError::Tier(e)))?;
         Ok(CardTicket {
             tier: self,
@@ -2785,14 +2954,18 @@ impl NvTier {
     /// Layer `layer`'s arena and the books' claim of `ids` as `kind`, the
     /// misses counted, and each evicted slot counted out of the resident
     /// bytes — the pass the sync fill and the reader's share. With `pin` the
-    /// ids found filled are pinned as the claim finds them. Refused by name:
-    /// a layer the arena does not cover and the claim's own refusals.
+    /// ids found filled are pinned as the claim finds them. A step's claim
+    /// is counted with the clock `columns` on ([`Books::count_step`]).
+    /// Refused by name: a layer the arena does not cover and the claim's own
+    /// refusals.
     fn claim(
         &self,
         layer: usize,
         ids: &[u32],
         kind: Claim,
         pin: bool,
+        columns: u64,
+        column_off: Option<&[usize]>,
     ) -> Result<(&LayerArena, Claimed), GpuError> {
         const WHAT: &str = "NvTier::ensure";
         let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) else {
@@ -2800,11 +2973,15 @@ impl NvTier {
         };
         let claim = {
             let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-            if pin {
+            let claim = if pin {
                 claim_slots_pinned(layer, arena, &mut books, ids, kind)?
             } else {
                 claim_slots(layer, arena, &mut books, ids, kind)?
+            };
+            if kind == Claim::Step {
+                books.count_step(layer, ids, columns, column_off);
             }
+            claim
         };
         self.stats.note_claim(
             arena,
@@ -2827,7 +3004,7 @@ impl NvTier {
         kind: Claim,
         pin: bool,
     ) -> Result<BatchPin<'_>, GpuError> {
-        let (arena, claim) = self.claim(layer, ids, kind, pin)?;
+        let (arena, claim) = self.claim(layer, ids, kind, pin, 1, None)?;
         // The hits' pins close if anything below refuses.
         let mut held = BatchPin {
             arena,
@@ -2889,6 +3066,8 @@ impl NvTier {
         layer: usize,
         ids: &[u32],
         kind: Claim,
+        columns: u64,
+        column_off: Option<&[usize]>,
     ) -> Result<Option<TierPin<'_>>, TierError> {
         const WHAT: &str = "NvTier::ensure";
         let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) else {
@@ -2903,7 +3082,7 @@ impl NvTier {
         let mut pinned = Vec::new();
         let filled = {
             let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-            claim_fill(
+            let filled = claim_fill(
                 layer,
                 arena,
                 &mut books,
@@ -2913,7 +3092,11 @@ impl NvTier {
                 &mut picks,
                 &mut evicted,
                 &mut pinned,
-            )
+            );
+            if filled.is_ok() && kind == Claim::Step {
+                books.count_step(layer, ids, columns, column_off);
+            }
+            filled
         };
         let misses = match filled {
             Ok(misses) => misses,
@@ -3038,8 +3221,15 @@ impl NvTier {
     /// it. A batch with no miss queues nothing and allocates no job: its
     /// pins are the batch's. Refused by name like [`NvTier::ensure_pinned`],
     /// and once the reader has stopped; nothing is pinned then.
-    fn prefetch(&self, layer: usize, ids: &[u32], kind: Claim) -> Result<Prefetch<'_>, GpuError> {
-        let (arena, claim) = self.claim(layer, ids, kind, true)?;
+    fn prefetch(
+        &self,
+        layer: usize,
+        ids: &[u32],
+        kind: Claim,
+        columns: u64,
+        column_off: Option<&[usize]>,
+    ) -> Result<Prefetch<'_>, GpuError> {
+        let (arena, claim) = self.claim(layer, ids, kind, true, columns, column_off)?;
         let held = BatchPin {
             arena,
             layer,
@@ -3455,11 +3645,13 @@ impl TierSlots for NvTier {
         layer: usize,
         ids: &[u32],
         claim: Claim,
+        columns: u64,
+        column_off: Option<&[usize]>,
     ) -> Result<Ticket<'a>, TierError> {
         // The steady step reuses one slot and boxes nothing. A prefetch that
         // arrives while that slot is open keeps the allocating path.
         if self.step.try_begin() {
-            match self.issue_step(layer, ids, claim) {
+            match self.issue_step(layer, ids, claim, columns, column_off) {
                 Ok(Some(pin)) => {
                     if self.audit.get().is_some() {
                         let audit_ids = pin.ids().to_vec();
@@ -3480,7 +3672,7 @@ impl TierSlots for NvTier {
             }
         }
         let inflight = match self
-            .prefetch(layer, ids, claim)
+            .prefetch(layer, ids, claim, columns, column_off)
             .map_err(|e| seam_error(layer, ids, e))?
         {
             Prefetch::Held(held) => {
@@ -3512,8 +3704,22 @@ impl TierSlots for NvTier {
         self.stats.note_hits_under_read(ns);
     }
 
-    fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], batched: bool) {
+    fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], cols: usize, batched: bool) {
         self.stats.union_call(batched);
+        if self.evict == NvTierEvict::Heat
+            && let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref())
+        {
+            let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(counts) = books.counts.as_mut() {
+                let layer = &mut counts[layer];
+                layer.advance(cols as u64);
+                for (&id, w) in ids.iter().zip(off.windows(2)) {
+                    if !arena.host.contains(&id) {
+                        layer.add(id, (w[1] - w[0]) as f64);
+                    }
+                }
+            }
+        }
         if let Some(books) = self.stats.unions.get() {
             let book = UnionBook::of(&self.host_ids(layer), ids, off, batched);
             let mut books = books.lock().unwrap_or_else(|e| e.into_inner());
@@ -3545,6 +3751,7 @@ mod tests {
         FILLED, FILLING, FREE, NoSlot, PARTS, PartRange, SlotBook, advice_disjoint, audit_offsets,
         layer_bases, pick_slot, slots_of, window_bytes, window_span,
     };
+    use bloomery_levers::NvTierEvict;
     use engram::direct::{DIRECT_ALIGN, aligned_span};
     use model::moe::Claim;
     use model::placement::{ARENA_LANE_SLOTS, UNION_BATCH_IDS};
@@ -3664,22 +3871,26 @@ mod tests {
     fn a_miss_takes_a_free_slot_else_the_least_recently_used_unpinned() {
         let open = |_: &SlotBook| false;
         let free = [book(FREE, 0), book(FILLED, 5), book(FILLED, 2)];
-        assert_eq!(pick_slot(&free, open), Ok(0), "the first free slot");
+        assert_eq!(pick_slot(&free, open, None), Ok(0), "the first free slot");
         let lru = [book(FILLED, 5), book(FILLED, 2), book(FILLED, 9)];
-        assert_eq!(pick_slot(&lru, open), Ok(1), "the least recently used");
+        assert_eq!(
+            pick_slot(&lru, open, None),
+            Ok(1),
+            "the least recently used"
+        );
         let mixed = [book(FILLING, 1), book(FILLED, 7), book(FILLED, 3)];
         assert_eq!(
-            pick_slot(&mixed, open),
+            pick_slot(&mixed, open, None),
             Ok(2),
             "a filling slot is not taken"
         );
         assert_eq!(
-            pick_slot(&[book(FILLING, 1)], open),
+            pick_slot(&[book(FILLING, 1)], open, None),
             Err(NoSlot::Filling),
             "all filling: raced"
         );
         assert_eq!(
-            pick_slot(&[], open),
+            pick_slot(&[], open, None),
             Err(NoSlot::Filling),
             "no slots at all"
         );
@@ -3689,24 +3900,77 @@ mod tests {
             b.id.store(i as u32, std::sync::atomic::Ordering::Relaxed);
         }
         let pins_one = |s: &SlotBook| s.id.load(std::sync::atomic::Ordering::Relaxed) == 1;
-        assert_eq!(pick_slot(&lru, pins_one), Ok(0), "the oldest unpinned");
+        assert_eq!(
+            pick_slot(&lru, pins_one, None),
+            Ok(0),
+            "the oldest unpinned"
+        );
         // A free slot is taken before any pin is read; every filled slot
         // pinned is the floor's refusal, not the race's.
         assert_eq!(
-            pick_slot(&free, |_| true),
+            pick_slot(&free, |_| true, None),
             Ok(0),
             "a free slot needs no unpinned one"
         );
         assert_eq!(
-            pick_slot(&lru, |_| true),
+            pick_slot(&lru, |_| true, None),
             Err(NoSlot::Pinned),
             "all pinned: the named refusal"
         );
         let filling_and_pinned = [book(FILLING, 1), book(FILLED, 3)];
         assert_eq!(
-            pick_slot(&filling_and_pinned, |_| true),
+            pick_slot(&filling_and_pinned, |_| true, None),
             Err(NoSlot::Pinned),
             "a filling slot beside the pinned one"
+        );
+    }
+
+    /// Under heat a miss takes the oldest transient first, whatever its
+    /// count, then the hot slot whose expert has the least count, the least
+    /// recently used among equal counts; a pinned slot is passed over and a
+    /// free one taken first, as under tick.
+    #[test]
+    fn a_heat_miss_takes_a_transient_then_the_coldest_count() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut counts = super::LayerCounts::new(8);
+        for (id, n) in [(0u32, 5.0), (1, 1.0), (2, 1.0), (3, 0.5), (4, 9.0)] {
+            counts.add(id, n);
+        }
+        let heat = Some(&counts);
+        // Each slot's id, tick and sequence word (a transient's from 1).
+        let slots = |books: &[(u32, u64, u64)]| -> Vec<SlotBook> {
+            books
+                .iter()
+                .map(|&(id, tick, seq)| {
+                    let b = book(FILLED, tick);
+                    b.id.store(id, Relaxed);
+                    b.seq.store(seq, Relaxed);
+                    b
+                })
+                .collect()
+        };
+        let open = |_: &SlotBook| false;
+        let hot = slots(&[(0, 1, 0), (1, 7, 0), (2, 4, 0), (4, 9, 0)]);
+        assert_eq!(
+            pick_slot(&hot, open, heat),
+            Ok(2),
+            "the least count, the older of two"
+        );
+        assert_eq!(pick_slot(&hot, open, None), Ok(0), "tick: the oldest");
+        let pins_two = |s: &SlotBook| s.id.load(Relaxed) == 2;
+        assert_eq!(pick_slot(&hot, pins_two, heat), Ok(1), "the next coldest");
+        let mixed = slots(&[(0, 1, 0), (4, 0, 2), (3, 9, 0), (2, 0, 1)]);
+        assert_eq!(
+            pick_slot(&mixed, open, heat),
+            Ok(3),
+            "the oldest transient before the coldest hot slot"
+        );
+        let free = [book(FILLED, 1), book(FREE, 0)];
+        assert_eq!(pick_slot(&free, |_| true, heat), Ok(1), "a free slot");
+        assert_eq!(
+            pick_slot(&hot, |_| true, heat),
+            Err(NoSlot::Pinned),
+            "all pinned"
         );
     }
 
@@ -4974,6 +5238,16 @@ mod tests {
     /// An anonymous tier of two slots whose layer 1 is the card hold tests'
     /// layer.
     fn card_tier(scratch: &Scratch) -> std::sync::Arc<super::NvTier> {
+        eight_tier(scratch, 2, NvTierEvict::Tick)
+    }
+
+    /// An anonymous tier of `count` slots whose layer 1 is the card hold
+    /// tests' layer, its victims taken as `evict` says.
+    fn eight_tier(
+        scratch: &Scratch,
+        count: usize,
+        evict: NvTierEvict,
+    ) -> std::sync::Arc<super::NvTier> {
         use super::{ArenaKind, NvTier};
         use engram::direct::DirectFile;
         use model::placement::workstation::ArenaGrant;
@@ -5002,19 +5276,21 @@ mod tests {
             Some(arena)
         };
         let slots = [3 * CARD_PAGE];
-        let grant = ArenaGrant::whole((2 * slots[0]) as u64);
-        Arc::new(
-            NvTier::carve(
-                vec![None, layer()],
-                &slots,
-                2,
-                grant,
-                0,
-                &split,
-                ArenaKind::Anon,
-            )
-            .expect("the tier's carve"),
+        let grant = ArenaGrant::whole((count * slots[0]) as u64);
+        let mut tier = NvTier::carve(
+            vec![None, layer()],
+            &slots,
+            count,
+            grant,
+            0,
+            &split,
+            ArenaKind::Anon,
         )
+        .expect("the tier's carve");
+        if evict == NvTierEvict::Heat {
+            tier.count_routes();
+        }
+        Arc::new(tier)
     }
 
     /// A card hold ([`NvTier::hold_for_card`]) fills and pins its ids for as
@@ -5109,6 +5385,150 @@ mod tests {
             None,
             "an anonymous arena has no card address"
         );
+    }
+
+    /// A heat arena's victim order beside the gate's (`gate_nvtier`'s
+    /// `evict` clause, which checks the tick and heat orders): a call's own
+    /// hit is never its victim, however cold, and an evicted expert keeps
+    /// its count.
+    #[test]
+    fn a_heat_arena_evicts_the_coldest_count() {
+        const LAYER: usize = 1;
+        let scratch = Scratch::new("heat-evict");
+        let tier = eight_tier(&scratch, 4, NvTierEvict::Heat);
+        // Expert 0 three times, then 1, 2 and 3 once each: the four slots full.
+        for id in [0, 0, 0, 1, 2, 3] {
+            tier.ensure(LAYER, &[id]).unwrap();
+        }
+        // Expert 1 is the coldest; the step that names it misses 7, which
+        // takes 2, the next coldest.
+        tier.ensure(LAYER, &[1, 7]).unwrap();
+        let filled: Vec<u32> = (0..8).filter(|&id| tier.slot_filled(LAYER, id)).collect();
+        assert_eq!(filled, [0, 1, 3, 7], "the call's own hit stays");
+        let count = |id| tier.route_count(LAYER, id).expect("a heat tier counts");
+        // Expert 2 went two steps after its one column: 2^(-2/H) of it.
+        assert!(
+            (count(2) - (-2.0 / super::HEAT_HALF_LIFE).exp2()).abs() < 1e-12,
+            "{}",
+            count(2)
+        );
+        assert!(count(0) > count(1) && count(1) > count(3) && count(3) > count(2));
+    }
+
+    /// The routing counts: a step's claim counts each id it names once and
+    /// moves the layer's clock one column, so a count halves every
+    /// `HEAT_HALF_LIFE` columns; a prompt's union call counts each id by its columns and moves
+    /// the clock by the call's; a residency victim's fill counts one column
+    /// and moves no clock; a refused claim counts nothing; a tick arena
+    /// counts nothing. Past the rescale every count and rank holds.
+    #[test]
+    fn a_step_union_counts_each_experts_columns_on_both_prefetch_paths() {
+        use model::moe::TierSlots;
+        const LAYER: usize = 1;
+        let scratch = Scratch::new("heat-step-union");
+        let decay = (-4.0 / super::HEAT_HALF_LIFE).exp2();
+        for allocating in [false, true] {
+            let mut tier = eight_tier(&scratch, 4, NvTierEvict::Heat);
+            std::sync::Arc::get_mut(&mut tier).unwrap().by_layer[LAYER]
+                .as_mut()
+                .unwrap()
+                .host = 0..1;
+            for id in [1, 2].into_iter().chain([3; 10]).chain([4; 10]) {
+                tier.ensure(LAYER, &[id]).unwrap();
+            }
+            let before: Vec<_> = (0..8)
+                .map(|id| tier.route_count(LAYER, id).unwrap())
+                .collect();
+            let clock = || tier.books.lock().unwrap().counts.as_ref().unwrap()[LAYER].since;
+            let start = clock();
+            if allocating {
+                assert!(tier.step.try_begin());
+            }
+            // Four columns route [0, 1, 2], [1], [1], [1].
+            let pin = tier
+                .prefetch_pinned(LAYER, &[0, 1, 2], Claim::Step, 4, Some(&[0, 1, 5, 6]))
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(clock() - start, 4, "allocating={allocating}: column clock");
+            for (id, added) in [(0, 0.0), (1, 4.0), (2, 1.0), (3, 0.0), (4, 0.0)] {
+                let count = tier.route_count(LAYER, id).unwrap();
+                let want = before[id as usize] * decay + added;
+                assert!(
+                    (count - want).abs() <= 1e-12 * want.abs(),
+                    "allocating={allocating}: id {id}: {count} != {want}"
+                );
+            }
+            assert_eq!(pin.ids(), [1, 2]);
+            drop(pin);
+            // The next miss takes 2, not the older but more frequent 1.
+            let pin = tier
+                .prefetch_pinned(LAYER, &[0, 5], Claim::Step, 4, Some(&[0, 2, 6]))
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert!(
+                !tier.slot_filled(LAYER, 2),
+                "allocating={allocating}: cold victim"
+            );
+            assert!(tier.slot_filled(LAYER, 1) && tier.slot_filled(LAYER, 5));
+            assert_eq!(clock() - start, 8, "allocating={allocating}: miss clock");
+            assert_eq!(tier.route_count(LAYER, 5), Some(4.0));
+            assert_eq!(tier.route_count(LAYER, 0), Some(0.0));
+            drop(pin);
+            if allocating {
+                tier.step.release();
+            }
+        }
+    }
+
+    #[test]
+    fn the_routing_counts_follow_the_columns() {
+        use model::moe::TierSlots;
+        const LAYER: usize = 1;
+        // Relative error, so the counts below one after a rescale are checked too.
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs();
+        let scratch = Scratch::new("heat-counts");
+        let tier = eight_tier(&scratch, 4, NvTierEvict::Heat);
+        let count = |id| tier.route_count(LAYER, id).expect("a heat tier counts");
+        tier.ensure(LAYER, &[1, 1, 2]).unwrap();
+        assert_eq!(
+            (count(1), count(2), count(3)),
+            (1.0, 1.0, 0.0),
+            "once an id"
+        );
+        // A union of one half-life's columns lists 1 in a quarter of them and
+        // 3 in the rest.
+        let h = super::HEAT_HALF_LIFE as usize;
+        tier.note_union(LAYER, &[1, 3], &[0, h / 4, h], h, true);
+        let quarter = (h / 4) as f64;
+        assert!(
+            near(count(1), quarter + 0.5)
+                && near(count(2), 0.5)
+                && near(count(3), (h - h / 4) as f64)
+        );
+        tier.ensure_victim(LAYER, &[4]).unwrap();
+        assert!(
+            near(count(4), 1.0) && near(count(2), 0.5),
+            "the clock stays"
+        );
+        tier.ensure(LAYER, &[1, 8]).unwrap_err();
+        assert!(
+            near(count(1), quarter + 0.5),
+            "a refused claim counts nothing"
+        );
+        assert_eq!(
+            eight_tier(&scratch, 4, NvTierEvict::Tick).route_count(LAYER, 1),
+            None
+        );
+        let mut c = super::LayerCounts::new(2);
+        c.add(0, 1.0);
+        c.advance(h as u64);
+        c.add(1, 1.0);
+        c.advance(super::HEAT_RESCALE as u64 * h as u64);
+        assert_eq!(c.since, 0, "rescaled");
+        assert!(near(c.count(0), (-65.0f64).exp2()) && near(c.count(1), (-64.0f64).exp2()));
+        assert!(c.score(0) < c.score(1));
     }
 
     /// How far the test has let the held reads go.

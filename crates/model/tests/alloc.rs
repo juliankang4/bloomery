@@ -342,6 +342,8 @@ impl TierSlots for PoolTier {
         layer: usize,
         ids: &[u32],
         claim: Claim,
+        _columns: u64,
+        _column_off: Option<&[usize]>,
     ) -> Result<Ticket<'a>, TierError> {
         let in_flight = ids.iter().fold(0, |m, &id| m | ((1u64 << id) & self.late));
         if in_flight == 0 {

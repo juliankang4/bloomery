@@ -1869,7 +1869,8 @@ fn launch_served<B: ChainBody>(
 /// over `file`'s shards, read `O_DIRECT` or — the lever's fallback —
 /// through the page cache, in pinned host memory `ctx`'s card maps or in
 /// anonymous memory, as the lever asks of `ctx`'s device: pinned on an
-/// integrated device by default ([`bloomery_levers::NvTierMem`]). `None`
+/// integrated device by default ([`bloomery_levers::NvTierMem`]), its
+/// victims taken as the lever's rule asks ([`bloomery_levers::NvTierEvict`]). `None`
 /// on a plan that pages no routed expert or reserved no arena: the host
 /// leg reads the file mapping as it stands. Refused by name: a load
 /// whose r8 pair reads a sidecar while the plan pages routed experts —
@@ -1898,7 +1899,7 @@ pub fn nvme_tier(
         ));
     }
     let mem = ArenaKind::of(ctx, levers.mem)?;
-    NvTier::of_paged(plan, file, levers.direct, arena, mem).map(|t| t.map(Arc::new))
+    NvTier::of_paged(plan, file, levers.direct, arena, mem, levers.evict).map(|t| t.map(Arc::new))
 }
 
 /// The host leg of a load on `plan`: the routed layers of `set` (the layers

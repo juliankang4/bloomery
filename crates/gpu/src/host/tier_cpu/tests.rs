@@ -5,6 +5,7 @@ use crate::host::nvtier::{ArenaKind, NvTier};
 use crate::host::run::HostWidths;
 use crate::host::tier::{TierAct, TierWork};
 use crate::weights::Weights;
+use bloomery_levers::NvTierEvict;
 use cuda_core::DeviceBuffer;
 use gguf::write::{Layout, TensorDecl, Writer};
 use model::moe::{HostLayer, HostLayerSpec};
@@ -231,9 +232,16 @@ fn node_nvme_host_run(
         let gpu = Gpu::new().unwrap();
         let make_tier = || {
             Arc::new(
-                NvTier::of_paged(&projected, &file, false, paging.arena, ArenaKind::Anon)
-                    .unwrap()
-                    .unwrap(),
+                NvTier::of_paged(
+                    &projected,
+                    &file,
+                    false,
+                    paging.arena,
+                    ArenaKind::Anon,
+                    NvTierEvict::Tick,
+                )
+                .unwrap()
+                .unwrap(),
             )
         };
         let tier = make_tier();

@@ -46,6 +46,7 @@ pub const HOST_ROOM: &str = "BLOOMERY_HOST_ROOM";
 pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
 pub const NVTIER_READ: &str = "BLOOMERY_NVTIER_READ";
 pub const NVTIER_MEM: &str = "BLOOMERY_NVTIER_MEM";
+pub const NVTIER_EVICT: &str = "BLOOMERY_NVTIER_EVICT";
 pub const TIER_LINK: &str = "BLOOMERY_TIER_LINK";
 pub const TIER_NODES: &str = "BLOOMERY_TIER_NODES";
 pub const TP_NODES: &str = "BLOOMERY_TP_NODES";
@@ -346,6 +347,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               elsewhere (a prompt's batch, every other load); `auto` is `pinned` on an \
               integrated device and `anon` on a card with its own memory. `anon` and `pinned` are \
               the same-binary arms. Read where the tier is built.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: NVTIER_EVICT,
+        class: Class::A,
+        kind: Kind::Words(&["tick", "heat"]),
+        default: Unset::Is("tick"),
+        doc: "Which filled slot of the NVMe expert tier's RAM arena a miss takes once no slot is \
+              free. Both words take a prompt's transients first, oldest first. `tick` then takes \
+              the least recently used hot slot. `heat` takes the hot slot whose expert has the \
+              least decayed routing count, the least recently used among equal counts: the \
+              tier counts per layer and expert the columns that route it, the prompt's at its \
+              union call and a step's at its claim, halved every 32 columns the layer serves. \
+              The two words read and compute the same bytes, so a token is the same under \
+              either; only the fills differ. `tick` and `heat` are the same-binary arms. Read \
+              where the tier is built.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
