@@ -1052,7 +1052,7 @@ mod site_tests {
                 .unwrap_or_else(|e| panic!("crates/gpu/src/{file}: {e}"))
         };
         let (site, gemm, grouped) = (
-            read("../../placement/src/kernels.rs"),
+            read("../../gguf/src/card.rs"),
             read("gemm/mod.rs"),
             read("gemm/grouped.rs"),
         );
