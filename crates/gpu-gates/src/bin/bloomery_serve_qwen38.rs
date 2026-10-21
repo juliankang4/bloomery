@@ -22,6 +22,11 @@ fn main() -> std::process::ExitCode {
 #[path = "shared/serve_seats/qwen38.rs"]
 mod qwen38;
 
+// A Qwen3.8 checkpoint folder, which the seat opens, a sibling of the seat as in `bloomery-serve`.
+#[cfg(feature = "gpu")]
+#[path = "shared/serve_seats/qwen38_folder.rs"]
+mod qwen38_folder;
+
 // The seats' MTP drafts, one a resident slot, a sibling of the seat as in
 // `bloomery-serve`.
 #[cfg(feature = "gpu")]
@@ -46,7 +51,7 @@ mod tests {
     use bloomery_levers::Draft38Off;
 
     use super::qwen38::{
-        ACTS_ON, Feed38, draft_under_media, prompt_cuts, refuse_feed, refuse_lookup_feed,
+        ACTS_ON, Feed38, draft_off_for, prompt_cuts, refuse_feed, refuse_lookup_feed,
         refuse_media_feed,
     };
 
@@ -163,7 +168,7 @@ mod tests {
     /// name.
     #[test]
     fn a_media_load_refuses_a_set_mtp_draft() {
-        let why = draft_under_media(Some("mtp"), (true, None))
+        let why = draft_off_for(Draft38Off::Media, Some("mtp"), (true, None))
             .expect_err("BLOOMERY_DRAFT=mtp beside --mmproj")
             .to_string();
         assert!(why.contains("BLOOMERY_DRAFT=mtp with --mmproj"), "{why}");
@@ -173,7 +178,9 @@ mod tests {
     /// already off keeps its own reason, and a set `off` is as set.
     #[test]
     fn a_media_load_turns_an_unset_draft_off_and_keeps_an_earlier_reason() {
-        let off = |word, run| draft_under_media(word, run).expect("a word the media load takes");
+        let off = |word, run| {
+            draft_off_for(Draft38Off::Media, word, run).expect("a word the media load takes")
+        };
         assert_eq!(off(None, (true, None)), (false, Some(Draft38Off::Media)));
         assert_eq!(
             off(None, (false, Some(Draft38Off::Gate))),
@@ -183,6 +190,21 @@ mod tests {
             off(Some("off"), (false, Some(Draft38Off::Set))),
             (false, Some(Draft38Off::Set))
         );
+    }
+
+    /// A checkpoint folder's load reads no MTP layers: a set `mtp` is refused by name, and an
+    /// unset draft the rule would have run goes off naming the folder.
+    #[test]
+    fn a_folder_load_refuses_a_set_mtp_draft_and_turns_an_unset_one_off() {
+        let why = draft_off_for(Draft38Off::Folder, Some("mtp"), (true, None))
+            .expect_err("BLOOMERY_DRAFT=mtp on a checkpoint folder")
+            .to_string();
+        assert!(
+            why.contains("BLOOMERY_DRAFT=mtp with a checkpoint folder"),
+            "{why}"
+        );
+        let off = draft_off_for(Draft38Off::Folder, None, (true, None)).unwrap();
+        assert_eq!(off, (false, Some(Draft38Off::Folder)));
     }
 
     #[test]

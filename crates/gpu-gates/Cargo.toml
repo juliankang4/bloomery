@@ -16,12 +16,14 @@ bloomery-gguf = { path = "../gguf" }
 # node dumps' manifest (re-exported from `lib.rs`), the draft sets, greedy files, KLD bases and
 # the vision set.
 bloomery-refset = { path = "../refset" }
-# Host only, through the `hf` feature: a server's `--hf <repo>[:<quant>]`, the repo's GGUF set fetched into a
-# local cache, and a DSpark draft's configuration. The gates that read no such thing do not link it.
+# Host only, through the `hf` feature: a server's `--hf <repo>[:<quant>]`, the repo's GGUF set or safetensors
+# checkpoint fetched into a local cache, and a DSpark draft's configuration. The gates that read no such thing do
+# not link it.
 bloomery-hf = { path = "../hf", optional = true }
 # Host-only checkpoint weights, through `hf` for DSpark and `clef` for the decision head.
 bloomery-safetensors = { path = "../safetensors", optional = true }
-# Host only, through the `glm5next-hf` feature: GLM-5.3-Flash's checkpoint map (`generate_glm5next`'s tensor-parallel read).
+# Host only, through the `checkpoint` feature: the checkpoint maps, a Qwen3.8 checkpoint folder a server or
+# a gate opens (`serve_seats/qwen38_folder.rs`) and GLM-5.3-Flash's (`generate_glm5next`'s tensor-parallel read).
 bloomery-model-hf = { path = "../model-hf", optional = true }
 # Host only: the lever registry, which the binaries parse once at `main`.
 bloomery-levers = { path = "../levers" }
@@ -104,8 +106,11 @@ bloomery-vision = { path = "../vision", optional = true }
 [features]
 # The hub: `--hf` fetches, plus DSpark configuration and checkpoint weights.
 hf = ["dep:bloomery-hf", "dep:bloomery-safetensors"]
+# A safetensors checkpoint folder read as stored: a server's or a gate's `-m <folder>`, and the folder a
+# `--hf` repo that holds a checkpoint resolves to.
+checkpoint = ["hf", "dep:bloomery-model-hf"]
 # GLM-5.3-Flash read from its Hugging Face checkpoint folder: `generate_glm5next --place tp`.
-glm5next-hf = ["glm5next", "hf", "dep:bloomery-model-hf"]
+glm5next-hf = ["glm5next", "checkpoint"]
 gpu = [
     "dep:bloomery-gpu",
     "dep:bloomery-verbs",

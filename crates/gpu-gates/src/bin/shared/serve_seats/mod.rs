@@ -44,6 +44,9 @@ mod served;
 // as its per-model binary's doc says.
 #[cfg(feature = "deepseek41")]
 pub mod qwen38;
+// A Qwen3.8 checkpoint folder, which the qwen38 seat opens and [`header`] reads.
+#[cfg(feature = "deepseek41")]
+pub mod qwen38_folder;
 // The qwen3 seat sits behind the same server-surface feature.
 #[cfg(feature = "deepseek41")]
 pub mod qwen3;
@@ -83,3 +86,14 @@ pub mod tiered;
 // The decide seat: a decision model's backbone on the card, its head on the host.
 #[cfg(feature = "clef")]
 pub mod decide;
+
+/// The header of the model at `path`, which the server seats it by: its GGUF split's first shard,
+/// or a checkpoint folder's when `path` is a directory (a Qwen3.8 checkpoint,
+/// [`qwen38_folder::open`]).
+#[cfg(feature = "deepseek41")]
+pub fn header(path: &std::path::Path) -> Result<gguf::Split, bloomery_gpu_gates::GateError> {
+    if path.is_dir() {
+        return qwen38_folder::open(path).map(|f| f.header);
+    }
+    gguf::Split::open(path).map_err(|e| format!("open {}: {e}", path.display()).into())
+}

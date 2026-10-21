@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model};
+use bloomery_gpu::arch::qwen3moe::{Body38, Model38, Qwen38Model};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
@@ -89,7 +89,7 @@ pub struct Opened38 {
 /// ([`Planned38::open`]); the load writes lines of its own to stderr, which a gate's log orders
 /// after the plan line.
 pub struct Planned38<'a> {
-    file: Split,
+    file: Model38,
     inputs: PlanInputs,
     machine: Machine,
     args: Open38<'a>,
@@ -97,10 +97,12 @@ pub struct Planned38<'a> {
 }
 
 impl<'a> Open38<'a> {
-    /// `file` described and planned. `describe`, not `read`, so the chat surface's two coverage
-    /// items are not refused here; the load refuses what `ALLOWED` does not name.
-    pub fn plan(&self, file: Split) -> Result<Planned38<'a>, GateError> {
-        let mut inputs = PlanInputs::describe(&file)?;
+    /// `file` (a split, or a checkpoint folder: [`Model38`]) described and planned. `describe`,
+    /// not `read`, so the chat surface's two coverage items are not refused here; the load
+    /// refuses what `ALLOWED` does not name.
+    pub fn plan(&self, file: impl Into<Model38>) -> Result<Planned38<'a>, GateError> {
+        let file = file.into();
+        let mut inputs = PlanInputs::describe(file.header())?;
         if let Some(r) = self.room {
             inputs.room = (r, HostRead::Given);
         }

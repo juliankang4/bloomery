@@ -56,7 +56,7 @@ the tested toolkit, answer 7) with LLVM 21.1.8's ARM64 release `llc` named by `C
 for example:
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,gemma-embedding2,hf --release --bin bloomery-serve
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
 ```
 
 The binary carries `sm_86` PTX, and the driver compiles it for cc 12.1 at the first start, about 6.5 s on the Arm cores
@@ -73,7 +73,10 @@ load, as the first run did (section 3).
 Models by size, in the order to try them (`docs/models.md:12,31-34`, `docs/BUILD.md` table): Clef-Flash 4.8–9.7 GB,
 Qwen3-30B-A3B `Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M` 21.2 GB; then Qwen3.8 `UD-Q4_K_XL` 111.3 GB and GLM-5.3-Flash
 `UD-Q2_K_XL` 101.3 GiB (the size chosen "to fit a DGX Spark", https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L359) if the first `MemAvailable` reading
-allows. A 64 GB Spark (section 3; announced, not yet shipping) holds only the first three.
+allows. NVIDIA's own `nvidia/Qwen3.8-Flash-Next-NVFP4` checkpoint (132.7 GB on disk) serves from its folder as
+downloaded, `bloomery-serve -m <folder>`, with every routed expert on the GB10 and the PLE table read from the folder
+on the NVMe tier (`docs/serving.md`, the seats). A 64 GB Spark (section 3; announced, not yet shipping) holds only the
+first three.
 
 ## 3. The machine
 

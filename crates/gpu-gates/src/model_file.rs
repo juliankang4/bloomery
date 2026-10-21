@@ -7,7 +7,9 @@
 //! (`hf::source`'s), a decision model's head from the repo a `--hf` repo's model card says it
 //! quantizes (`quantized_from`), a family's MTP draft fetched beside a set only when its
 //! architecture's rule says the set can run that file, and a seat's image projector under `--hf`
-//! (`hf_projector`), the repo's own beside the model.
+//! (`hf_projector`), the repo's own beside the model. A `--hf` repo that holds a safetensors
+//! checkpoint and no GGUF set resolves to the checkpoint's folder, which the seat that serves it
+//! opens.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -24,8 +26,8 @@ pub use fetch::{
 };
 
 /// The refusal when nothing names the model.
-pub(crate) const NONE: &str = "no model file: pass -m PATH (the first shard) or --hf <repo>[:<quant>], \
-                               or set BLOOMERY_REF_MODEL";
+pub(crate) const NONE: &str = "no model file: pass -m PATH (the first shard, or a checkpoint folder) \
+                               or --hf <repo>[:<quant>], or set BLOOMERY_REF_MODEL";
 
 /// A present decision marker is a string; malformed metadata is not an absent head.
 pub fn decision_type(file: &Split) -> Result<Option<&str>, GateError> {

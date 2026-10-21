@@ -27,7 +27,8 @@
 //!   rounding's share of the distance.
 //!
 //! Real-only: the fixture holds no NVFP4 stack. Loads the whole file on the card.
-//! `BLOOMERY_REF_MODEL` selects a split outside the recipe's model folder.
+//! `BLOOMERY_REF_MODEL` selects a split outside the recipe's model folder, or the checkpoint folder
+//! itself, which the load reads as stored (`qwen38_folder::open`, a build with the `checkpoint` feature).
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -47,6 +48,14 @@ mod e2e;
 mod q38_oracle;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/serve_seats/qwen38_folder.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the folder's parts, not its tokenizer"
+)]
+mod qwen38_folder;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/qwen38_open.rs"]
 #[allow(
     dead_code,
@@ -64,9 +73,10 @@ mod gate {
         worst_off_path,
     };
     use crate::q38_oracle::{FLIP_ERR_CAP, FREE_BAND, IkRoute, route_flips};
+    use crate::qwen38_folder;
     use crate::qwen38_open::{Open38, open_split};
 
-    use bloomery_gpu::arch::qwen3moe::{Prompt38, Qwen38Model, RouteTap};
+    use bloomery_gpu::arch::qwen3moe::{Model38, Prompt38, Qwen38Model, RouteTap};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::flip;
@@ -122,9 +132,19 @@ mod gate {
         Ok(man)
     }
 
+    /// The model at `path`: a split of architecture `qwen4exp` ([`open_split`]), or the checkpoint
+    /// folder when `path` is a directory ([`qwen38_folder::open`]).
+    fn model_of(path: &Path) -> Result<Model38, GateError> {
+        if path.is_dir() {
+            let f = qwen38_folder::open(path)?;
+            return Ok((f.parts)(f.header).into());
+        }
+        open_split(path).map(Model38::from)
+    }
+
     /// (l): the plan on the one visible card, every routed expert on it, and the load.
     fn open(path: &Path, d: &Dims) -> Result<(Qwen38Model, bool), GateError> {
-        let file = open_split(path)?;
+        let file = model_of(path)?;
         let levers = bloomery_levers::at_main(&[])?;
         let specs = Place::A.on_host()?.card_specs()?;
         let [card] = specs[..] else {
@@ -377,8 +397,9 @@ mod gate {
     /// The header's dims, the file's routed gate type, which must be NVFP4, and its dense form
     /// ([`dense_of`]).
     fn dims(path: &Path) -> Result<Dims, GateError> {
-        let file = open_split(path)?;
-        let inputs = PlanInputs::describe(&file)?;
+        let model = model_of(path)?;
+        let file = model.header();
+        let inputs = PlanInputs::describe(file)?;
         let hp = &inputs.hp;
         let gate = file
             .find(&names::ffn_gate_exps(0))

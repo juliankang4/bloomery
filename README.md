@@ -124,7 +124,10 @@ One binary, seven seats; the file's architecture picks the seat, and `--place` c
 The seventh seat, `nemotron`, serves Nemotron 3 Nano 4B (new in 0.3.3) and Nemotron 3.5 Bolt 74B-A9B (new in 0.3.4)
 from a file on disk, tested as `NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf` and `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`:
 `bloomery-serve -m PATH/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf`.
-The table above lists the seats with a checked `--hf` row.
+The table above lists the seats with a checked `--hf` row. The qwen38 seat also serves NVIDIA's NVFP4 checkpoint
+folder as downloaded, with no conversion, on a card that holds every routed expert such as a DGX Spark's GB10:
+`bloomery-serve -m PATH/Qwen3.8-Flash-Next-NVFP4` or `bloomery-serve --hf nvidia/Qwen3.8-Flash-Next-NVFP4`
+([`docs/serving.md`](docs/serving.md#the-seats)).
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/chat/completions \

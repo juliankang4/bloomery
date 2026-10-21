@@ -69,7 +69,7 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 |---|---|---|
 | `generate_ds41`, `bloomery-chat` | `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin <bin>` | DeepSeek-V4.1-Flash |
 | `bloomery-serve-ds41`, `bloomery-serve-qwen38` | the same, `--features deepseek41,gemma-embedding2` (`gemma-embedding2` attaches the optional embedding side seat) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next |
-| `bloomery-serve` | `… --features glm5next,clef,vision,mimo2,solar2,gemma-embedding2,hf --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|mimo2\|solar2\|nemotron\|decide`; the ds41 and qwen38 seats are the two binaries above; `vision` adds V4.1's `--mmproj`) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, Solar-Open2-250B, Nemotron 3 Nano 4B, Clef-Flash, lev |
+| `bloomery-serve` | `… --features glm5next,clef,vision,mimo2,solar2,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|mimo2\|solar2\|nemotron\|decide`; the ds41 and qwen38 seats are the two binaries above; `vision` adds V4.1's `--mmproj`; `checkpoint` opens a Qwen3.8 safetensors checkpoint folder as stored) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, Solar-Open2-250B, Nemotron 3 Nano 4B, Clef-Flash, lev |
 | `generate_qwen3moe` | `… --features gpu --release --bin generate_qwen3moe` | Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B |
 | `generate_glm5next` | `… --features glm5next --release --bin generate_glm5next` | GLM-5.3-Flash |
 | `r8conv` | `cargo build --release -p bloomery-model --bin r8conv` | the V4.1 sidecar |

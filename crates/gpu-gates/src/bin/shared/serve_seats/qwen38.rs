@@ -18,6 +18,14 @@
 //! binaries read the one the profile pins); its first shard gives the
 //! vocabulary, `tokenizer.chat_template` the chat template
 //! (`--chat-template-file` replaces it) and `general.name` the default alias.
+//! A model path that is a directory is a Qwen3.8 checkpoint folder, served as
+//! stored (`qwen38_folder::open`): its header (`gguf::Split::header_only`)
+//! takes the first shard's place in every rule and plan, its tokenizer is the
+//! vocabulary, and the engine loads every card tensor from the folder's parts
+//! ([`Folder38`]) and reads its PLE rows where the folder stores them. Such a
+//! load holds every tensor on the stage card and runs no residency machine and
+//! no MTP draft: unset, the draft goes off naming the folder
+//! ([`draft_off_for`]); `BLOOMERY_DRAFT=mtp` is refused by name.
 //! The `plan` record, then the `load` and `capture` lines of the qwen4exp
 //! open, go to stderr as `generate_qwen3moe` prints them, then `listening on
 //! http://<addr>` once the model is loaded and the port is bound (`--port 0`
@@ -214,7 +222,7 @@
 //! own 400.
 //!
 //! An image load drafts nothing, the engine's media load refusing a load that carries the MTP
-//! draft ([`draft_under_media`]): `BLOOMERY_DRAFT=mtp` beside `--mmproj` is refused by name
+//! draft ([`draft_off_for`]): `BLOOMERY_DRAFT=mtp` beside `--mmproj` is refused by name
 //! before the plan; unset, the draft goes off with a `load draft=off` record that names
 //! `--mmproj`, and the lever words that name the draft are then refused as they are on any
 //! server that drafts nothing. `BLOOMERY_PREFILL=steps` (one step an id) and the route trace
@@ -344,8 +352,8 @@ use std::time::{Duration, Instant};
 use app::mtp::{MtpBody, MtpDraft};
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{
-    Body38, Prompt38, Seq38, TargetRows, checkpoint_budget38, checkpoint_price38,
-    point_row_budget38, seq38_bytes,
+    Body38, Folder38, Model38, Prompt38, Seq38, TargetRows, checkpoint_budget38,
+    checkpoint_price38, point_row_budget38, seq38_bytes,
 };
 use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::census::TierCensus;
@@ -885,26 +893,37 @@ fn draft38(
     }
 }
 
-/// [`draft38`]'s answer `(mtp, off)` under `--mmproj`: an image load carries no MTP draft (the
-/// engine's `GpuModel::enable_media` refuses a load that does), so `BLOOMERY_DRAFT=mtp` is
-/// refused by name; the other words keep the plain path, `off` as set, and a draft the rule would
-/// have run goes off with [`Draft38Off::Media`], while a reason it was already off for stands.
-/// The lever words that name the draft are then refused by the seat's own rule
-/// (`refuse_mtp_levers`).
-pub(crate) fn draft_under_media(
+/// [`draft38`]'s answer `(mtp, off)` on a load that carries no MTP draft, for the reason `why`
+/// ([`Draft38Off::Media`]: an image load, whose sequences the engine's `GpuModel::enable_media`
+/// refuses a draft beside; [`Draft38Off::Folder`]: a checkpoint folder's, which reads no MTP
+/// layers): `BLOOMERY_DRAFT=mtp` is refused by name; the other words keep the plain path, `off`
+/// as set, and a draft the rule would have run goes off with `why`, while a reason it was
+/// already off for stands. The lever words that name the draft are then refused by the seat's
+/// own rule (`refuse_mtp_levers`).
+pub(crate) fn draft_off_for(
+    why: Draft38Off,
     word: Option<&str>,
     (mtp, off): (bool, Option<Draft38Off>),
 ) -> Result<(bool, Option<Draft38Off>), GateError> {
     if word == Some("mtp") {
-        return Err(
-            "BLOOMERY_DRAFT=mtp with --mmproj: an image load carries no MTP draft (the media \
-             load refuses it); drop --mmproj, or set BLOOMERY_DRAFT=off (unset, the draft goes \
-             off by itself)"
-                .into(),
-        );
+        let load = match why {
+            Draft38Off::Folder => {
+                "with a checkpoint folder: the folder's load reads no MTP layers; \
+                                   serve a prepared split with its draft"
+            }
+            _ => {
+                "with --mmproj: an image load carries no MTP draft (the media load refuses it); \
+                  drop --mmproj"
+            }
+        };
+        return Err(format!(
+            "BLOOMERY_DRAFT=mtp {load}, or set BLOOMERY_DRAFT=off (unset, the draft goes off by \
+             itself)"
+        )
+        .into());
     }
     Ok(if mtp {
-        (false, Some(Draft38Off::Media))
+        (false, Some(why))
     } else {
         (false, off)
     })
@@ -1269,7 +1288,15 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let path = ref_model_path()?;
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
     let draft_looked = draft_places(&path);
-    let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    // A checkpoint folder is opened once, here: its header plans as a split's first shard
+    // does, its tokenizer is the vocabulary, and the engine thread loads its parts.
+    let (split, folder, folder_tok) = if path.is_dir() {
+        let f = super::qwen38_folder::open(&path)?;
+        (f.header, Some(f.parts), Some(f.tokenizer))
+    } else {
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        (split, None, None)
+    };
     // The stage card's first open is made before the room is read
     // (`Gpu::hold_card`: its context and the bundle), so the plans' room has
     // lost its host bytes as the load's check after its open has; plan
@@ -1307,6 +1334,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &draft_looked,
         &inputs,
     )?;
+    let (mtp, draft_off) = match folder {
+        Some(_) => draft_off_for(Draft38Off::Folder, levers.draft(), (mtp, draft_off))?,
+        None => (mtp, draft_off),
+    };
     // A draft lever set on a server that drafts nothing is refused, with
     // why — asked once the yield below has said its last word, so a draft
     // the plan turns off refuses them the same as one the rule did.
@@ -1338,11 +1369,14 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let width = WidthMode::of(levers.mtp_width())?;
     let experts = experts38(&levers)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
-    let tok = Tokenizer::from_gguf(&path)?;
+    let tok = match folder_tok {
+        Some(tok) => tok,
+        None => Tokenizer::from_gguf(&path)?,
+    };
     // `--mmproj`'s encoder file, held against the text model and the vocabulary before anything
     // is planned. The `--hf` repo's projector is taken only where the load can serve images and
     // keep what it runs without them: the draft rule's first word is off and the prompt is not
-    // fed a step an id. An image load takes no MTP draft ([`draft_under_media`]).
+    // fed a step an id. An image load takes no MTP draft ([`draft_off_for`]).
     let token = |id: u32| tok.text(id).map(str::to_owned);
     let vision = vision_of(
         &a.vision,
@@ -1352,19 +1386,17 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     )?;
     let (mtp, draft_off) = if vision.is_some() {
         refuse_media_feed(feed)?;
-        draft_under_media(levers.draft(), (mtp, draft_off))?
+        draft_off_for(Draft38Off::Media, levers.draft(), (mtp, draft_off))?
     } else {
         (mtp, draft_off)
     };
-    let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let ChatSurface { template, name, .. } = ChatSurface::read(
         &path,
-        inv.value("tokenizer.chat_template"),
-        inv.value("general.name"),
+        split.value("tokenizer.chat_template"),
+        split.value("general.name"),
         a.template_file.path(),
         "qwen3.8",
     )?;
-    drop(inv);
     // The message start the server cuts prompt calls at, when both the
     // vocabulary and the template have it.
     let has_start = tok
@@ -1399,7 +1431,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             Some(MtpInputs::read(&draft, &split, &inputs, h.rows.clone())?)
         }
     };
-    drop(split);
+    // The folder's header goes to the engine thread with its parts; a split's is reopened there.
+    let folder = folder.map(|parts| parts(split));
     if from == SlotsFrom::Ctx {
         eprintln!(
             "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
@@ -1817,6 +1850,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         host: levers.host(),
         pin_main: levers.pin_main(),
         path: path.clone(),
+        folder,
         mtp,
         lookup,
         head,
@@ -1963,6 +1997,9 @@ struct SeatArgs {
     host: bloomery_levers::HostCfg,
     pin_main: bool,
     path: PathBuf,
+    /// The checkpoint folder at `path`, opened by the main thread; `None` for a split, which
+    /// the open reads from `path`.
+    folder: Option<Folder38>,
     /// `BLOOMERY_DRAFT=mtp`, the MTP draft; unset the plain path.
     mtp: bool,
     /// `BLOOMERY_DRAFT=lookup`, the lookup draft (`drafted::Lookups`).
@@ -2086,12 +2123,17 @@ impl Q38 {
         }
         let t = Instant::now();
         let media = a.vision.is_some();
-        let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
+        let model: Model38 = match a.folder {
+            Some(folder) => folder.into(),
+            None => Split::open(&a.path)
+                .map_err(|e| format!("open {}: {e}", a.path.display()))?
+                .into(),
+        };
         // The room is the main thread's: a reading of the host's available
         // bytes of its own would plan the load from another room than the
         // plan the seat ruled by, and the paged tier's arena is that room's
         // difference.
-        let mut inputs = PlanInputs::describe(&file)?;
+        let mut inputs = PlanInputs::describe(model.header())?;
         inputs.room = a.room.clone();
         let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.hp)?;
         let ub = ubatch_for(a.ctx)?;
@@ -2115,7 +2157,7 @@ impl Q38 {
                 a.plan.hold(&PlanKey::of(&plan)?)?;
                 opened = t.elapsed();
                 Body38::open_placed_residency(
-                    file,
+                    model,
                     &plan,
                     &inputs,
                     CARD38,
@@ -2132,7 +2174,7 @@ impl Q38 {
                     .as_ref()
                     .ok_or("a drafted load with no head picked")?;
                 let draft = open_draft(&a.draft_path, a.draft_from)?;
-                let mtp = MtpInputs::read(&draft, &file, &inputs, head.rows.clone())?;
+                let mtp = MtpInputs::read(&draft, model.header(), &inputs, head.rows.clone())?;
                 let machine = a
                     .place
                     .machine(&inputs, ctx_ub, a.experts, Some(&mtp), a.slots)?;
@@ -2148,7 +2190,7 @@ impl Q38 {
                 a.plan.hold(&PlanKey::of(&plan.plan)?)?;
                 opened = t.elapsed();
                 Body38::open_placed_mtp_residency(
-                    file,
+                    model,
                     &plan,
                     &inputs,
                     CARD38,

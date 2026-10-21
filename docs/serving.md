@@ -124,7 +124,8 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   this server keeps the template's own default when a request names neither field (BUILD.md: thinking is off for
   V4.1).
 - **The files**: the GGUF uploads as downloaded, the same quantizations, the chat template read from the file,
-  and a tokenizer bit-identical to `llama-tokenize`.
+  and a tokenizer bit-identical to `llama-tokenize`. Qwen3.8 also serves NVIDIA's NVFP4 safetensors checkpoint as
+  downloaded (The seats, below).
 - **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched
   twice; it also fetches the model's MTP draft when the repo publishes it, as unsloth's Qwen3.8-Flash-Next GGUFs
   do under `MTP/`, landing it beside the set, where the run picks it up), `--parallel/-np`, `--queue-depth`,
@@ -183,6 +184,16 @@ Where it ends today: one model a server, sm_86+ GPUs, and the seats' own default
 (see [Limits](#limits)).
 
 ## The seats
+
+The qwen38 seat serves a Qwen3.8 safetensors checkpoint folder as downloaded, with no conversion step, in a build with
+the `checkpoint` feature (the release's has it; any other build refuses the folder by name): `-m` names the
+folder that holds `model.safetensors.index.json`, and `--hf <repo>` names a repo that holds such a checkpoint and no
+GGUF set (a `:<quant>` on that repo is refused by name, as the checkpoint is the repo's one model). Every part keeps the
+format the checkpoint stores it in. Checked with `nvidia/Qwen3.8-Flash-Next-NVFP4` on a DGX Spark's GB10, where it plans
+the same bytes and gives the same greedy ids as the GGUF split made from it. The load holds every tensor on the stage
+card and reads the PLE table from the folder on the NVMe tier, so a plan that puts a tensor elsewhere, a set
+`BLOOMERY_RESIDENCY` other than `off`, and `BLOOMERY_DRAFT=mtp` are refused by name; unset, the MTP draft stays off,
+as the folder's MTP layers are not read.
 
 The nemotron seat serves Nemotron 3 Nano 4B (`--model nemotron -m PATH`) whole on one card, one slot: `--parallel`
 above 1, a placement of more than one card or with a tier card, and a draft lever are refused by name. The body has
