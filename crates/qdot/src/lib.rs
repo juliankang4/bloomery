@@ -1439,17 +1439,9 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
 /// `quantize_row_q8_k_roundtrip` (which rounds with `round_ties_even`).
 /// Every activation encoder rounds through this: without SSE4.1 in the
 /// baseline target `round_ties_even` is a libm `rintf` call per element.
-#[inline]
-pub fn nearest_int(fval: f32) -> i32 {
-    let val = fval + 12582912.0;
-    let i = f32::to_bits(val);
-    ((i & 0x007f_ffff) as i32) - 0x0040_0000
-}
+pub use gguf::quant::nearest_int;
 
-/// A NaN or an infinity in an activation block is undefined input: every
-/// encoder path refuses it here, by name, instead of quantizing the block to a
-/// defined value (a lane-wise max would skip the NaN; an infinity would give a
-/// zero scale). `x` is the block; the message names the first offending value.
+/// Refuse a non-finite activation by name at its first offending value.
 #[cold]
 #[inline(never)]
 fn non_finite_activation(x: &[f32]) -> ! {
@@ -3802,18 +3794,7 @@ fn quantize_q8f0_col(x: &[f32], out: &mut [u8]) {
     let (blocks, _) = x.as_chunks::<32>();
     let (oblocks, _) = out.as_chunks_mut::<Q8F0_BLOCK>();
     for (xb, ob) in blocks.iter().zip(oblocks) {
-        let mut amax = 0.0f32;
-        for &v in xb {
-            if !v.is_finite() {
-                non_finite_activation(xb);
-            }
-            amax = amax.max(v.abs());
-        }
-        ob[0..2].copy_from_slice(&f32_to_f16_bits(amax / 127.0).to_le_bytes());
-        let id = q80_inverse(amax);
-        for (o, &v) in ob[2..].iter_mut().zip(xb) {
-            *o = nearest_int(v * id).clamp(-128, 127) as i8 as u8;
-        }
+        ob.copy_from_slice(&gguf::quant::quantize_q8_0(xb).to_bytes());
     }
 }
 

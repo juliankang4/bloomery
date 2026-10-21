@@ -9,8 +9,7 @@
 //!
 //! The Q8_0 weights are quantized here, not read: the engine's Q8_0 on this
 //! model is derived at load (`gguf::quant::Q8Block`), not a file tensor, so the
-//! ggml quantize rule the engine's load-time requant runs is transcribed below,
-//! verbatim from `model::arch::deepseek2::attn` and `gguf::quant`, and each
+//! shared quantize rule in `gguf::quant` supplies the blocks, and each
 //! reference value is `code × scale` as the block is written — the product
 //! `dequant_row`'s Q8_0 arm computes, exact in f32.
 
@@ -213,110 +212,61 @@ fn report(ty: &str, k: usize, rows: usize, m: usize, rel: f32, bit_same: bool, b
     !fail
 }
 
-// ------------------------------------------------- local Q8_0 quantizer
-
-/// `f32_to_f16_bits` — IEEE round-to-nearest-even, transcribed from
-/// `gguf::quant` (the engine's load-time requant stores this rounding).
-#[cfg(feature = "gpu")]
-fn f32_to_f16_bits(x: f32) -> u16 {
-    let b = x.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let a = b & 0x7fff_ffff;
-    if a >= 0x7f80_0000 {
-        return sign | 0x7c00;
-    }
-    let exp = ((a >> 23) as i32) - 127;
-    let frac = a & 0x007f_ffff;
-    if exp > 15 {
-        // Past f16's finite range; the LCG weights never reach it.
-        return sign | 0x7c00;
-    }
-    if exp >= -14 {
-        // Normal f16: keep 11 significand bits, ties-to-even carry.
-        let v = (((exp + 15) as u32) << 23) | frac;
-        let t = v + 0x0fff + ((v >> 13) & 1);
-        let h = t >> 13;
-        if h & 0x7c00 == 0x7c00 {
-            return sign | 0x7c00;
-        }
-        sign | h as u16
-    } else {
-        // Subnormal f16.
-        if exp < -25 {
-            return sign;
-        }
-        let shift = (-1 - exp) as u32;
-        let v = 0x0080_0000 | frac;
-        let half = 1u32 << (shift - 1);
-        let rem = v & ((1 << shift) - 1);
-        let mut h = v >> shift;
-        if rem > half || (rem == half && (h & 1) == 1) {
-            h += 1;
-        }
-        sign | h as u16
-    }
-}
-
-/// IEEE half to f32, integer-only — every f16 value is exact in f32, so any
-/// correct conversion is bit-identical to the engine's.
-#[cfg(feature = "gpu")]
-fn half_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) as u32) << 31;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let mant = (bits & 0x3ff) as u32;
-    let mag = if exp == 0x1f {
-        0x7f800000 | (mant << 13)
-    } else if exp == 0 {
-        if mant == 0 {
-            0
-        } else {
-            let mut e = 127 - 14;
-            let mut m = mant;
-            while m & 0x400 == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            (e << 23) | ((m & 0x3ff) << 13)
-        }
-    } else {
-        ((exp + 112) << 23) | (mant << 13)
-    };
-    f32::from_bits(sign | mag)
-}
-
-/// `nearest_int` — the f32 magic-round the engine's quantizers use
-/// (`qdot::nearest_int`, ggml's `nearest_int`).
-#[cfg(feature = "gpu")]
-fn nearest_int(fval: f32) -> i32 {
-    let val = fval + 12582912.0;
-    let i = f32::to_bits(val);
-    ((i & 0x007f_ffff) as i32) - 0x0040_0000
-}
-
-/// ggml `quantize_row_q8_0` x86 branch, as the engine's load-time requant
-/// runs it: `d = amax/127` stored as f16, `id = 127/amax` (a different f32
-/// than `1/d`), codes `nearest_int(v*id)` clamped to [-128, 127]. Appends
-/// one row's device layout (k/4 u32 words, k/32 f16 scale bits) and the
-/// dequantized reference row (k values of `q as f32 * scale` — the exact
-/// bits the kernel reconstructs, its scale widened from the stored f16).
+/// Packs the shared Q8_0 rule into device words and a dequantized reference row.
 #[cfg(feature = "gpu")]
 fn quant_q8_0_row(x: &[f32], qs: &mut Vec<u32>, d: &mut Vec<u16>, deq: &mut Vec<f32>) {
+    assert!(x.len().is_multiple_of(32), "Q8_0 row needs whole blocks");
     for blk in x.as_chunks::<32>().0 {
-        let mut amax = 0.0f32;
-        for &v in blk {
-            amax = amax.max(v.abs());
-        }
-        let bits = f32_to_f16_bits(amax / 127.0);
-        let scale = half_to_f32(bits);
-        let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+        let block = gguf::quant::quantize_q8_0(blk);
+        let scale = gguf::quant::half_to_f32(block.d);
         let mut word = [0u32; 8];
-        for (j, &v) in blk.iter().enumerate() {
-            let q = nearest_int(v * id).clamp(-128, 127) as i8;
+        for (j, &q) in block.q.iter().enumerate() {
             word[j / 4] |= u32::from(q as u8) << (8 * (j % 4));
-            deq.push(q as f32 * scale);
+            deq.push(f32::from(q) * scale);
         }
         qs.extend_from_slice(&word);
-        d.push(bits);
+        d.push(block.d);
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    #[test]
+    fn q8_0_rows_refuse_non_finite_blocks() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut x = [1.0; 32];
+            x[17] = bad;
+            for x in [x, [bad; 32]] {
+                assert!(
+                    std::panic::catch_unwind(|| {
+                        super::quant_q8_0_row(
+                            &x,
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                            &mut Vec::new(),
+                        );
+                    })
+                    .is_err(),
+                    "non-finite Q8_0 input must fail"
+                );
+            }
+        }
+        assert!(
+            std::panic::catch_unwind(|| {
+                super::quant_q8_0_row(
+                    &[1.0; 31],
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                );
+            })
+            .is_err()
+        );
+        let (mut q, mut d, mut deq) = (Vec::new(), Vec::new(), Vec::new());
+        super::quant_q8_0_row(&[127.0; 32], &mut q, &mut d, &mut deq);
+        assert_eq!(q, [0x7f7f7f7f; 8]);
+        assert_eq!(d, [0x3c00]);
+        assert_eq!(deq, [127.0; 32]);
     }
 }
 

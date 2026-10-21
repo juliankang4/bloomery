@@ -3,31 +3,27 @@
 //! shared by the deepseek2 requant that owned it first and the qwen3
 //! family's q8_0 cache seed.
 
-use gguf::quant::{Q8Block, f32_to_f16_bits};
+pub use gguf::quant::quantize_q8_0;
 
-/// The weight requant the reference's `wk_b` cast runs: `quantize_row_q8_0`,
-/// x86 branch (ggml-quants.c:938+) — `d = amax/127` stored f16, `id =
-/// 127/amax` (a different f32 than `1/d`), `_mm256_round_ps
-/// (_MM_ROUND_NEAREST)` codes; the ref variant (`id = 1/d`, `roundf`) is NOT
-/// what runs here.
-///
-/// One 32-value block at a time: a shorter slice would leave trailing codes
-/// at 0 silently.
-#[must_use]
-pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
-    assert_eq!(x.len(), 32, "quantize_q8_0: one 32-value block at a time");
-    let mut amax = 0.0f32;
-    for &v in x {
-        amax = amax.max(v.abs());
-    }
-    let d = amax / 127.0;
-    let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-    let mut q = [0i8; 32];
-    for (j, &v) in x.iter().enumerate() {
-        q[j] = qdot::nearest_int(v * id).clamp(-128, 127) as i8;
-    }
-    Q8Block {
-        d: f32_to_f16_bits(d),
-        q,
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn q8_0_refuses_non_finite_blocks() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut x = [1.0; 32];
+            x[17] = bad;
+            for x in [x, [bad; 32]] {
+                let err = std::panic::catch_unwind(|| super::quantize_q8_0(&x))
+                    .expect_err("non-finite Q8_0 input must fail");
+                let msg = err.downcast_ref::<String>().unwrap();
+                assert!(
+                    msg.contains("quantize_q8_0: non-finite activation value"),
+                    "{msg}"
+                );
+            }
+        }
+        let block = super::quantize_q8_0(&[127.0; 32]);
+        assert_eq!(block.d, 0x3c00);
+        assert_eq!(block.q, [127; 32]);
     }
 }

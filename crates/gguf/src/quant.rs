@@ -1592,12 +1592,10 @@ pub fn quantize_row_q8_0_roundtrip(x: &[f32], out: &mut [f32]) {
     assert!(x.len().is_multiple_of(32), "q8_0 blocks are 32 values");
     let (blocks, _) = x.as_chunks::<32>();
     for (xb, ob) in blocks.iter().zip(out.as_chunks_mut::<32>().0) {
-        let amax = xb.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        let d = half_to_f32(f32_to_f16_bits(amax / 127.0));
-        let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-        let id = if id.is_finite() { id } else { 0.0 };
-        for (o, &v) in ob.iter_mut().zip(xb) {
-            *o = d * (v * id).round_ties_even();
+        let block = quantize_q8_0(xb);
+        let d = half_to_f32(block.d);
+        for (o, &q) in ob.iter_mut().zip(&block.q) {
+            *o = d * f32::from(q);
         }
     }
 }
@@ -1671,6 +1669,40 @@ pub struct Q8Block {
     pub q: [i8; 32],
 }
 
+/// ggml's f32 mantissa trick for rounding quantized codes to nearest even.
+#[inline]
+pub fn nearest_int(fval: f32) -> i32 {
+    let val = fval + 12582912.0;
+    let i = f32::to_bits(val);
+    ((i & 0x007f_ffff) as i32) - 0x0040_0000
+}
+
+/// Quantize one 32-value block by ggml's x86 Q8_0 rule, not its weight-file reference rule.
+/// Non-finite input is refused by name before a scale or code is written.
+#[inline]
+#[must_use]
+pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
+    assert_eq!(x.len(), 32, "quantize_q8_0: one 32-value block at a time");
+    let mut amax = 0.0f32;
+    for (i, &v) in x.iter().enumerate() {
+        assert!(
+            v.is_finite(),
+            "quantize_q8_0: non-finite activation value {v} at offset {i}"
+        );
+        amax = amax.max(v.abs());
+    }
+    let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+    let id = if id.is_finite() { id } else { 0.0 };
+    let mut q = [0i8; 32];
+    for (q, &v) in q.iter_mut().zip(x) {
+        *q = nearest_int(v * id).clamp(-128, 127) as i8;
+    }
+    Q8Block {
+        d: f32_to_f16_bits(amax / 127.0),
+        q,
+    }
+}
+
 impl Q8Block {
     /// The block a file's 34 bytes hold: the scale's f16 bits little-endian, then the
     /// codes (`block_q8_0`, ggml-common.h).
@@ -1726,6 +1758,36 @@ impl Q8Block {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn q8_0_roundtrip_refuses_non_finite_blocks() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut x = [1.0; 32];
+            x[17] = bad;
+            for x in [x, [bad; 32]] {
+                let err = std::panic::catch_unwind(|| {
+                    super::quantize_row_q8_0_roundtrip(&x, &mut [0.0; 32]);
+                })
+                .expect_err("non-finite Q8_0 input must fail");
+                let msg = err.downcast_ref::<String>().unwrap();
+                assert!(
+                    msg.contains("quantize_q8_0: non-finite activation value"),
+                    "{msg}"
+                );
+            }
+        }
+        let mut out = [0.0; 32];
+        super::quantize_row_q8_0_roundtrip(&[127.0; 32], &mut out);
+        assert_eq!(out, [127.0; 32]);
+        let mut x = [127.0; 32];
+        x[..5].copy_from_slice(&[0.5, 1.5, 2.5, -1.5, -127.0]);
+        let block = super::quantize_q8_0(&x);
+        assert_eq!(block.d, 0x3c00);
+        assert_eq!(&block.q[..5], &[0, 2, 2, -2, -127]);
+        for x in [[0.0; 32], [f32::from_bits(1); 32]] {
+            assert_eq!(super::quantize_q8_0(&x).to_bytes(), [0; 34]);
+        }
+    }
+
     use super::{
         GgmlType, QuantError, activation_format, check_fp8_b128, check_mxfp8, dequant_row,
     };
