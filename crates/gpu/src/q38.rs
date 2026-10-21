@@ -871,8 +871,8 @@ mod q38_kernels {
     }
 }
 
-/// The token embedding as [`Q38Kernels::enqueue_embed_rows`] reads it: a
-/// Q8_0 table's planes or a BF16 table's words.
+/// A resident matrix as the embedding lookup ([`Q38Kernels::enqueue_embed_rows`])
+/// and the hyper-connection sites read it: Q8_0 planes or BF16 words.
 #[derive(Clone, Copy)]
 pub enum EmbedRows<'a> {
     Q8_0 {

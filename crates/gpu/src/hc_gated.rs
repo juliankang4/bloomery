@@ -74,7 +74,6 @@ use crate::q8f32::{
 };
 use crate::tensor::DeviceTensor;
 use crate::view::{Elem, StreamFma};
-use crate::weights::{DevWeight, Weights};
 use crate::{GpuError, launch_u32, store_cols};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
@@ -1139,30 +1138,10 @@ pub struct SiteWeights<'a> {
     pub inject: Option<&'a DeviceTensor<f32>>,
 }
 
-/// A site's down or up as its kernels read it: the q8f32 Q8_0 planes
-/// (`crate::weights::q8_0_planes`), or a BF16 weight's words, each value
-/// widened as it is read (the F32 core's lane walk, module doc).
-#[derive(Clone, Copy)]
-pub enum HcMatrix<'a> {
-    Q8_0 {
-        qs: &'a DeviceTensor<u32>,
-        d: &'a DeviceTensor<u16>,
-    },
-    Bf16(&'a DeviceTensor<u32>),
-}
+/// A site's Q8_0 planes or BF16 words, shared with the embedding reader.
+pub use crate::q38::EmbedRows as HcMatrix;
 
-impl<'a> HcMatrix<'a> {
-    /// The resident weight `name` of `w` as a site matrix; another form is
-    /// refused by name as `what`'s.
-    pub fn of(w: &'a Weights, what: &'static str, name: &str) -> Result<Self, GpuError> {
-        match w.get(name) {
-            Some(DevWeight::Q8_0 { qs, d, .. }) => Ok(HcMatrix::Q8_0 { qs, d }),
-            Some(DevWeight::Bf16 { w, .. }) => Ok(HcMatrix::Bf16(w)),
-            Some(_) => Err(GpuError::tensor(what, name, "Q8_0 planes or BF16 words")),
-            None => Err(GpuError::tensor(what, name, "resident")),
-        }
-    }
-
+impl HcMatrix<'_> {
     /// Its rows and row width, or what is wrong with its planes.
     fn shape(&self) -> Result<(usize, usize), String> {
         match *self {
