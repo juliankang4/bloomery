@@ -1143,7 +1143,7 @@ pub use crate::q38::EmbedRows as HcMatrix;
 
 impl HcMatrix<'_> {
     /// Its rows and row width, or what is wrong with its planes.
-    fn shape(&self) -> Result<(usize, usize), String> {
+    pub(crate) fn shape(&self) -> Result<(usize, usize), String> {
         match *self {
             HcMatrix::Q8_0 { qs, d } if qs.rows() == d.rows() && qs.cols() == 8 * d.cols() => {
                 Ok((d.rows(), 32 * d.cols()))

@@ -886,9 +886,7 @@ impl<'a> EmbedRows<'a> {
     /// The resident table `name` of `w` as the lookup reads it; another
     /// format is refused by name as `what`'s.
     pub fn of(w: &'a Weights, what: &'static str, name: &str) -> Result<Self, GpuError> {
-        let dw = w
-            .get(name)
-            .ok_or_else(|| GpuError::tensor(what, name, "resident"))?;
+        let dw = w.resident(what, name)?;
         Self::of_weight(dw).ok_or_else(|| GpuError::tensor(what, name, "Q8_0 planes or BF16 words"))
     }
 
@@ -1075,33 +1073,13 @@ impl Q38Kernels {
         a: EmbedArgs<'_>,
     ) -> Result<(), GpuError> {
         let what = "q38::enqueue_embed_rows";
-        let (n_rows, width) = match a.table {
-            EmbedRows::Q8_0 { qs, d } => {
-                let k32 = d.cols();
-                if qs.rows() == 0 || qs.rows() != d.rows() || k32 == 0 || qs.cols() != 8 * k32 {
-                    return Err(GpuError::shape(
-                        what,
-                        format!(
-                            "Q8_0 planes qs {}x{} and d {}x{}: equal rows, 8 words a scale",
-                            qs.rows(),
-                            qs.cols(),
-                            d.rows(),
-                            d.cols()
-                        ),
-                    ));
-                }
-                (qs.rows(), 32 * k32)
-            }
-            EmbedRows::Bf16(w) => {
-                if w.rows() == 0 || w.cols() == 0 {
-                    return Err(GpuError::shape(
-                        what,
-                        format!("BF16 words {}x{}: no rows or no values", w.rows(), w.cols()),
-                    ));
-                }
-                (w.rows(), 2 * w.cols())
-            }
-        };
+        let (n_rows, width) = a.table.shape().map_err(|e| GpuError::shape(what, e))?;
+        if n_rows == 0 || width == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("embedding table {n_rows}x{width}: no rows or no values"),
+            ));
+        }
         let n = a.ids.len();
         if n == 0 {
             return Err(GpuError::shape(what, "empty ids"));
