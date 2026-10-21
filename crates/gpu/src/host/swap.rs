@@ -369,6 +369,15 @@ pub trait SwapSource: Send + Sync {
     /// refusing the flip or sending the expert on.
     fn host_resident(&self, layer: usize, id: u32) -> Result<bool, GpuError>;
 
+    /// Whether the NVMe tier pages layer `layer`'s expert `id`, so a lane's
+    /// copy of it reads the drive rather than host memory: the plan's fact
+    /// the expert stream prices its lane by ([`super::xstream`]). No by
+    /// default.
+    fn paged(&self, layer: usize, id: u32) -> bool {
+        let _ = (layer, id);
+        false
+    }
+
     /// Release what the host holds of layer `layer`'s expert `id`, which
     /// stays on the card: when its flip lands and at a reset that leaves it
     /// there; the bytes released, 0 for an expert the host held nothing of
@@ -3815,8 +3824,8 @@ impl SwapMachine {
         r
     }
 
-    /// The call's return copies queued and not issued yet: what the walk's
-    /// price reads to know the lane fell behind
+    /// The call's return copies queued and not issued yet: how far the lane
+    /// fell behind, a timing the walk's price never reads
     /// ([`runtime::xsplit::ReturnCost`]).
     #[must_use]
     pub fn returns_owed(&self) -> usize {

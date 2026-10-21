@@ -7,8 +7,8 @@
 //! the host experts the unit still routes split in two: the ones the rule
 //! sends over the copy lane to the card for this unit alone (the stream),
 //! and the ones the host union keeps. The rule is [`runtime::xsplit`]'s,
-//! over constants the load measured (the lane's rate, [`XStream::new`]'s
-//! probe) and the costs the model carries for its expert shape
+//! over the lane's rate the load prices from where the lane's sources sit
+//! (`lane_rate`) and the costs the model carries for its expert shape
 //! ([`Costs`]): an expert streams when its columns cost the union more than
 //! its copy and the card's columns, ranked count descending, id ascending.
 //! Two caps follow the rule, in that ranking: a half of the ring
@@ -127,9 +127,9 @@ impl XMode {
 }
 
 /// The rule's costs a model carries for its expert shape beside the lane's
-/// measured rate: the host union's cost of one expert per column and its
-/// floor, and the card's cost of one streamed expert, fixed and per column,
-/// each in µs.
+/// priced rate (`lane_rate`): the host union's cost of one expert per column
+/// and its floor, and the card's cost of one streamed expert, fixed and per
+/// column, each in µs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Costs {
     pub host_us_per_col: f64,
@@ -213,8 +213,8 @@ pub trait XStreamBody {
 
     /// The load line's `xstream=` word: the mode, and under a started
     /// stream its ring's slots a half, its pinned staging slots (0:
-    /// pageable), the lane's measured rate in GB/s and the least unit
-    /// width that streams.
+    /// pageable), the lane's rate its probe measured and the rate the rule
+    /// prices in GB/s, and the least unit width that streams.
     fn xstream_word(&self) -> String;
 }
 
@@ -256,7 +256,7 @@ pub struct XReport {
     pub issue_us: u64,
     pub backlog_us: u64,
     /// The ring's slots a half, the staging's slots (0: pageable) and the
-    /// lane's measured rate [B/µs].
+    /// lane's rate its probe measured [B/µs], which the rule does not read.
     pub half_slots: usize,
     pub staging_slots: usize,
     pub lane_b_per_us: f64,
@@ -445,6 +445,38 @@ pub const STAGING_SLOTS: usize = 64;
 
 /// The experts the load's lane probe streams.
 pub const PROBE: usize = 32;
+
+/// The lane's rate [B/µs] the rule prices a copy of an expert in host memory
+/// at: the median of the load probe's quiet readings on the box the family's
+/// [`Costs`] rows were fitted on (`tools/flow/q38-constants.tsv`,
+/// `a6000.lane_gbs`).
+const LANE_HELD_B_PER_US: f64 = 20_410.0;
+
+/// The lane's rate [B/µs] the rule prices a copy of an expert the NVMe tier
+/// pages at, read through the file's mapping from the drive: the load probe's
+/// quiet readings on an RTX 5090 workstation over a paged Qwen3.8 plan.
+const LANE_PAGED_B_PER_US: f64 = 3_600.0;
+
+/// The lane's rate [B/µs] the rule prices every copy at, for a probe of
+/// `(bytes, paged)` experts: their bytes over the time their copies take at
+/// their sources' rates ([`LANE_PAGED_B_PER_US`] for an expert the NVMe tier
+/// pages, [`LANE_HELD_B_PER_US`] for one in host memory). A function of the
+/// plan alone, never of a timing: two loads of one plan price their copies
+/// alike, so the rule's picks and streams are a function of the prompt. 0
+/// for a probe of no bytes.
+fn lane_rate(probe: impl IntoIterator<Item = (u64, bool)>) -> f64 {
+    let (mut bytes, mut us) = (0.0, 0.0);
+    for (b, paged) in probe {
+        let rate = if paged {
+            LANE_PAGED_B_PER_US
+        } else {
+            LANE_HELD_B_PER_US
+        };
+        bytes += b as f64;
+        us += b as f64 / rate;
+    }
+    if us > 0.0 { bytes / us } else { 0.0 }
+}
 
 /// What the refusal of a ring the card has no room for names: a caller that
 /// resolves an unset lever tells it from every other refusal by it.
@@ -764,7 +796,11 @@ pub struct XStream {
     /// The rule's scratch.
     split: Split,
     rank: Vec<u32>,
+    /// The lane's rate the rule prices every copy at ([`lane_rate`] of the
+    /// probe's experts), and the rate the probe measured, a witness the rule
+    /// does not read.
     lane_b_per_us: f64,
+    probed_b_per_us: f64,
     report: XReport,
     /// Per layer the rule's constants: `None` for a layer the source holds
     /// no stage stack of.
@@ -781,7 +817,8 @@ impl XStream {
     /// `cfg.keep_free` (at most `cfg.max_half` slots a half), the staging
     /// (pinned, else the source's pageable bytes), the fill threads, then the
     /// lane's probe — `cfg.probe`'s experts streamed into the first half and
-    /// timed — whose rate is the rule's. Refused by name: a ring of fewer
+    /// timed, a witness beside the rate the rule prices, [`lane_rate`] of the
+    /// same experts by where their bytes sit. Refused by name: a ring of fewer
     /// than `cfg.min_half` slots a half, no layer with stage stacks, a part
     /// not a whole number of words, more parts than [`PARTS`], an empty
     /// probe. Load-time only.
@@ -886,11 +923,17 @@ impl XStream {
             split: Split::default(),
             rank: Vec::new(),
             lane_b_per_us: 0.0,
+            probed_b_per_us: 0.0,
             report: XReport::default(),
             land,
             land_n: vec![0; layers],
         };
-        x.lane_b_per_us = x.probe()?;
+        x.probed_b_per_us = x.probe()?;
+        let source = Arc::clone(x.source());
+        x.lane_b_per_us = lane_rate(x.probe_set().iter().map(|&(layer, id)| {
+            let bytes: usize = source.part_bytes(layer).iter().sum();
+            (bytes as u64, source.paged(layer, id))
+        }));
         x.consts = (0..layers).map(|l| x.constants_of(l)).collect();
         x.report = x.fresh_report();
         Ok(x)
@@ -902,11 +945,10 @@ impl XStream {
     /// copy stream, and nothing reads them.
     fn probe(&mut self) -> Result<f64, GpuError> {
         const WHAT: &str = "XStream probe";
-        let probe = self.cfg.probe.clone();
-        let n = probe.len().min(self.ring.half);
+        let probe = self.probe_set().to_vec();
         let t0 = Instant::now();
         let mut bytes = 0u64;
-        for (i, &(layer, id)) in probe[..n].iter().enumerate() {
+        for (i, &(layer, id)) in probe.iter().enumerate() {
             self.wait_backlog()?;
             bytes += self.copy_expert(layer, id, 0, i)?;
         }
@@ -917,6 +959,12 @@ impl XStream {
             return Err(GpuError::protocol(WHAT, "a probe that copied nothing"));
         }
         Ok(bytes as f64 / us)
+    }
+
+    /// The probe's experts: `cfg.probe`'s, at most a half's slots of them.
+    fn probe_set(&self) -> &[(usize, u32)] {
+        let n = self.cfg.probe.len().min(self.ring.half);
+        &self.cfg.probe[..n]
     }
 
     /// The rule's constants of layer `layer` at the lane's rate: the family
@@ -958,7 +1006,7 @@ impl XStream {
                 Lane::Pinned { shared, .. } => shared.slots,
                 Lane::Pageable { .. } => 0,
             },
-            lane_b_per_us: self.lane_b_per_us,
+            lane_b_per_us: self.probed_b_per_us,
             ..XReport::default()
         }
     }
@@ -975,10 +1023,17 @@ impl XStream {
         self.fresh_report().staging_slots
     }
 
-    /// The lane's rate the load measured [B/µs].
+    /// The lane's rate the rule prices every copy at [B/µs] ([`lane_rate`]).
     #[must_use]
     pub fn lane_b_per_us(&self) -> f64 {
         self.lane_b_per_us
+    }
+
+    /// The lane's rate the load's probe measured [B/µs]: a witness of the
+    /// sitting, which the rule does not read.
+    #[must_use]
+    pub fn probed_b_per_us(&self) -> f64 {
+        self.probed_b_per_us
     }
 
     /// Layer `layer`'s constants of the rule; `None` for a layer with no
@@ -989,7 +1044,7 @@ impl XStream {
     }
 
     /// Set the rule's costs (the family's, or a calibration's): every layer's
-    /// constants follow at the lane's measured rate. Refused by name while a
+    /// constants follow at the lane's priced rate. Refused by name while a
     /// call is open.
     pub fn set_costs(&mut self, costs: Costs) -> Result<(), GpuError> {
         if self.open {
@@ -1917,6 +1972,25 @@ mod tests {
         assert!(!g.holds(unit_key(2)));
         assert!(!g.read(), "one of two units has read");
         assert!(g.read(), "the group's last unit's read closes the stream");
+    }
+
+    /// The lane's rate is the probe's bytes over the time their copies take
+    /// at each expert's source rate: a held probe prices at the held rate, a
+    /// paged one at the paged rate, a mixed one between them weighted by
+    /// bytes, and no bytes at 0 (mutants: a paged expert priced at the held
+    /// rate; the mix weighted by count, not bytes).
+    #[test]
+    fn the_lane_prices_each_copy_at_its_sources_rate() {
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b;
+        let b = 3_072_000u64;
+        assert!(close(lane_rate([(b, false); 3]), LANE_HELD_B_PER_US));
+        assert!(close(lane_rate([(b, true); 3]), LANE_PAGED_B_PER_US));
+        let us = 3.0 * b as f64 / LANE_PAGED_B_PER_US + b as f64 / LANE_HELD_B_PER_US;
+        assert!(close(
+            lane_rate([(3 * b, true), (b, false)]),
+            4.0 * b as f64 / us
+        ));
+        assert_eq!(lane_rate([]).to_bits(), 0.0f64.to_bits());
     }
 
     /// A unit alone is today's stream: its one read closes it.

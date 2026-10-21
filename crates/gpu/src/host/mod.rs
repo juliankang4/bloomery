@@ -1566,15 +1566,6 @@ impl<H: HostExperts> HostTier<H> {
         m.return_pump(&self.slots, |_| port.routed_landed(key))
     }
 
-    /// The open call's return copies queued and not issued yet
-    /// ([`swap::SwapMachine::returns_owed`]); 0 without a machine.
-    #[must_use]
-    pub fn call_returns_owed(&self) -> usize {
-        self.swap
-            .as_ref()
-            .map_or(0, swap::SwapMachine::returns_owed)
-    }
-
     /// Whether the residency machine's rule holds any decode history
     /// ([`swap::SwapMachine::has_history`]): what a prompt call's end reads
     /// to keep its placement only when the decode has none of its own.

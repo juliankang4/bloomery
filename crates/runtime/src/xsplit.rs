@@ -1,12 +1,13 @@
 //! The expert-stream split rule: for one layer of one prompt unit, which host
 //! experts the card pool admits, which a transient ring streams over the copy
 //! lane, and which the host union keeps — a pure function of the unit's routed
-//! counts and constants measured at load. No machine, card or model name
-//! enters the rule; every constant is an input.
+//! counts and constants the load fixes. No machine, card or model name
+//! enters the rule; every constant is an input, and none is a timing, so one
+//! prompt gets one split on every load of the same plan.
 //!
 //! **Two rates.** A copy gets one of two rates. Alone — the pick phase, while
 //! the walk thread waits for the staging thread — it runs at the lane's
-//! measured rate `lane_b_per_us`. Beside the union — every copy a pick leaves
+//! rate `lane_b_per_us`. Beside the union — every copy a pick leaves
 //! behind it, and every copy the ring makes — the union's expert-weight reads
 //! hold the host's DRAM for their share of its own window, and a copy beside
 //! it runs at [`beside_b_per_us`]: the lane's rate less the union's burst
@@ -50,12 +51,12 @@
 use std::cmp::Reverse;
 use std::fmt;
 
-/// The rule's constants: the machine's measured rates and the layer's
+/// The rule's constants: the machine's priced rates and the layer's
 /// geometry, every field's unit in its name.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Constants {
-    /// The copy lane's host→card rate [B/µs], measured alone: the pick
-    /// phase's rate, and the base the beside-union rate takes from.
+    /// The copy lane's host→card rate [B/µs], alone: the pick phase's
+    /// rate, and the base the beside-union rate takes from.
     pub lane_b_per_us: f64,
     /// The host union's per-column cost of one expert [µs/col].
     pub host_us_per_col: f64,
@@ -161,7 +162,7 @@ pub fn unit_constants(
     Ok(unit)
 }
 
-/// The beside-union copy rate [B/µs]: the lane's measured rate less the
+/// The beside-union copy rate [B/µs]: the lane's rate less the
 /// union's burst share of it — the rate every copy the pick leaves behind
 /// it, and every ring copy, gets.
 #[must_use]
@@ -206,13 +207,11 @@ pub fn rank_key(count: u32, id: u32) -> (Reverse<u32>, u32) {
 pub enum ReturnCost {
     /// No return copy the walk pays: a call that keeps its placement, an
     /// earlier unit's admit (its return runs in the last unit), or a last
-    /// unit whose lane keeps up with its returns inside the walk's waits for
-    /// the card's fronts.
+    /// unit's admit whose return a later front's wait takes.
     Hidden,
-    /// The return copy lands at the call's end, alone on the lane: the walk
-    /// owes returns it has not issued, or no front follows this layer's.
-    /// The admit is priced at two copies: its own beside the union, its
-    /// return's at the lane's measured rate alone.
+    /// The return copy lands at the call's end, alone on the lane: no front
+    /// follows this layer's. The admit is priced at two copies: its own
+    /// beside the union, its return's at the lane's rate alone.
     Exposed,
 }
 

@@ -132,9 +132,8 @@ mod gate {
 
     /// The gate's costs: a host column far dearer than a copy of the
     /// synthetic expert and its card columns, so neither the floor nor the
-    /// balance cuts a unit's set before the half at any lane rate the probe
-    /// measures above a megabyte a second (a copy of the 5,120-byte expert
-    /// is latency, and its measured rate moves with the box's load).
+    /// balance cuts a unit's set before the half at the lane's priced rate,
+    /// or at any rate above a megabyte a second.
     const COSTS: Costs = Costs {
         host_us_per_col: 10_000.0,
         host_us_fixed: 1.0,
@@ -386,11 +385,16 @@ mod gate {
             L,
             cfg(2, 4),
         )?;
-        let probe_ok = x.half_slots() == HALF && x.staging_slots() == 4 && x.lane_b_per_us() > 0.0;
+        let probe_ok = x.half_slots() == HALF
+            && x.staging_slots() == 4
+            && x.probed_b_per_us() > 0.0
+            && x.lane_b_per_us() > 0.0;
         println!(
-            "probe: half {} (asked {HALF}), staging {} (asked 4), lane {:.3} GB/s {}",
+            "probe: half {} (asked {HALF}), staging {} (asked 4), lane probed {:.3} GB/s, priced \
+             {:.3} GB/s {}",
             x.half_slots(),
             x.staging_slots(),
+            x.probed_b_per_us() / 1000.0,
             x.lane_b_per_us() / 1000.0,
             verdict(probe_ok)
         );

@@ -913,6 +913,21 @@ pub static NVTIER_ARM: Kind = Kind {
     ],
 };
 
+pub static NVTIER_SITTING: Kind = Kind {
+    name: "nvtier_sitting",
+    head: "sitting",
+    doc: "One independent load's stream decisions, tokens and logits digests.",
+    parts: &[
+        key("mode", Word, ""),
+        key("probed", F64(17), "B/us"),
+        key("priced", F64(17), "B/us"),
+        key("picks", U64, ""),
+        key("pick_digest", U64, ""),
+        key("tokens", Csv, "token ids"),
+        key("digests", Csv, ""),
+    ],
+};
+
 /// One span's tier census on a paged load (`bloomery_gpu::host::census`): the
 /// span's phase, its tokens, the routed picks its host services saw and where
 /// each was served — the stage card (or a tier card), the NVMe tier's arena,
@@ -3214,7 +3229,12 @@ pub fn mtp_stats(
 /// paged arm child's reply.
 pub static GATE_NVTIER: &[&Kind] = kinds![
     groups::nvtier_family::ARM_RUN,
-    &[&RESIDENCY_UNSET, &RESIDENCY_HOST, &TIER_CENSUS],
+    &[
+        &RESIDENCY_UNSET,
+        &RESIDENCY_HOST,
+        &TIER_CENSUS,
+        &NVTIER_SITTING,
+    ],
     groups::nvtier_family::ARM,
 ];
 
@@ -4426,6 +4446,32 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn nvtier_sitting_requires_a_whole_reply() {
+        let line = Record::new(&NVTIER_SITTING)
+            .w("mode", "split")
+            .f("probed", 1234.5)
+            .f("priced", 3600.0)
+            .u("picks", 7)
+            .u("pick_digest", u64::MAX)
+            .csv("tokens", &[1u32, 2])
+            .csv("digests", &[0u64, u64::MAX])
+            .line();
+        let f = Log::of(&line, GATE_NVTIER).one(&NVTIER_SITTING).unwrap();
+        assert_eq!(f.csv("tokens").unwrap(), ["1", "2"]);
+        assert_eq!(f.u64("pick_digest").unwrap(), u64::MAX);
+        for field in line.split_whitespace().skip(1) {
+            let torn = line.replace(&format!(" {field}"), "");
+            assert!(matches!(
+                Log::of(&torn, GATE_NVTIER).one(&NVTIER_SITTING),
+                Err(ReadError::Broken {
+                    kind: "nvtier_sitting",
+                    ..
+                })
+            ));
         }
     }
 

@@ -20,8 +20,8 @@
 //! A call that returns to its start (a decode history before it) returns
 //! each layer once its host service has run, asked at the next layer's
 //! shadow, whose download wait the call's queued return copies fill
-//! ([`PromptStream::return_at_shadow`]); a split pick there prices an
-//! admit's way back when the lane fell behind
+//! ([`PromptStream::return_at_shadow`]); a split pick at the last walk's
+//! last card layer prices an admit's way back, which no front follows
 //! ([`PromptStream::return_cost`]), and the call's end issues what is left.
 //! The stream's placement never stays.
 
@@ -144,16 +144,18 @@ impl PromptStream {
 
     /// The load line's `xstream=` word: the mode, and under a started stream
     /// its ring's slots a half, its pinned staging slots (0: pageable), the
-    /// lane's measured rate in GB/s and the least unit width that streams.
+    /// lane's rate its probe measured and the rate the rule prices in GB/s,
+    /// and the least unit width that streams.
     #[must_use]
     pub fn word<H: HostExperts>(&self, tier: &HostTier<H>) -> String {
         let mode = self.mode().word();
         match tier.xstream() {
             Some(x) => format!(
                 "{mode} xstream_half={} xstream_staging={} xstream_lane_gbs={:.2} \
-                 xstream_m_min={}",
+                 xstream_priced_gbs={:.2} xstream_m_min={}",
                 x.half_slots(),
                 x.staging_slots(),
+                x.probed_b_per_us() / 1000.0,
                 x.lane_b_per_us() / 1000.0,
                 x.m_min().map_or("none".to_string(), |m| m.to_string())
             ),
@@ -334,7 +336,7 @@ impl PromptStream {
         }
         let key = port.key(at);
         let stream = port.stream();
-        let ret = self.return_cost(port, l, walk_end, &card);
+        let ret = self.return_cost(l, walk_end, &card);
         let mut pick = match (split, k) {
             (true, Some(k)) => port.hybrid().call_pick_walk_scaled(
                 stream,
@@ -408,22 +410,12 @@ impl PromptStream {
     }
 
     /// The return cost of an admit at layer `l`'s pick
-    /// ([`ReturnCost`]): exposed in the returning call's last walk while the
-    /// call owes return copies the walk has not issued (the lane fell behind
-    /// the fronts), and at the walk's last card layer, whose return no front
-    /// follows; hidden otherwise.
-    fn return_cost<H: HostExperts>(
-        &self,
-        port: &mut BatchLeg<'_, H>,
-        l: usize,
-        walk_end: usize,
-        card: &dyn Fn(usize) -> bool,
-    ) -> ReturnCost {
-        if !self.returns_here(walk_end) {
-            return ReturnCost::Hidden;
-        }
-        let last = !(l + 1..self.layers).any(card);
-        if last || port.hybrid().call_returns_owed() > 0 {
+    /// ([`ReturnCost`]): exposed at the returning call's last walk's last
+    /// card layer, whose return no front follows, and hidden everywhere else
+    /// — by the layer's place in the walk alone, never by how far the lane
+    /// has got, so the pick is a function of the prompt.
+    fn return_cost(&self, l: usize, walk_end: usize, card: &dyn Fn(usize) -> bool) -> ReturnCost {
+        if self.returns_here(walk_end) && !(l + 1..self.layers).any(card) {
             ReturnCost::Exposed
         } else {
             ReturnCost::Hidden

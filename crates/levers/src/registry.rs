@@ -886,8 +886,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               stay for the decode after it. `split` admits, then streams the host experts the \
               rule (`runtime::xsplit`) sends to the card through a ring of card slots for the \
               ubatch alone (`host::xstream`): an expert streams when its columns cost the host \
-              union more than its copy and the card's columns, at the lane's rate the load's \
-              probe measured, cut at the ring's half and where the layer's copies would pass the \
+              union more than its copy and the card's columns, at the lane's rate its sources \
+              price (host memory, or the drive under the NVMe tier; the load's probe is printed, \
+              never priced), cut at the ring's half and where the layer's copies would pass the \
               union it keeps; a ubatch narrower than the rule's least width streams nothing, so \
               decode and short prompts run as under `admit`. The host union leaves the streamed \
               experts out. The prompt's bits are then the band's, not the decode steps'. `off` \

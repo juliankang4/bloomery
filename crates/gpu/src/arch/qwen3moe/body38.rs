@@ -991,7 +991,7 @@ pub struct DecodeInput38 {
 }
 
 /// The stream rule's costs of one Qwen3.8 expert — the architecture fact the
-/// expert stream reads beside the lane's measured rate: the host union's
+/// expert stream reads beside the lane's priced rate: the host union's
 /// tile-path cost a column for an expert of the file's common layer kind and
 /// its weight-listing floor, and the card route's fixed and per-column cost
 /// of one streamed expert. The union's costs are the constrained fit of the
@@ -2297,8 +2297,8 @@ impl Body38 {
 
     /// The load line's `xstream=` word: the mode, and under a started
     /// stream its ring's slots a half, its pinned staging slots (0:
-    /// pageable), the lane's measured rate in GB/s and the least unit width
-    /// that streams ([`PromptStream::word`]).
+    /// pageable), the lane's probed and priced rates in GB/s and the least
+    /// unit width that streams ([`PromptStream::word`]).
     #[must_use]
     pub fn xstream_word(&self) -> String {
         self.stream.word(&self.hybrid)

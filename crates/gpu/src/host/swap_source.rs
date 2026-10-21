@@ -909,6 +909,11 @@ impl SwapSource for FileSwap {
         Ok(true)
     }
 
+    /// An id the arena serves: the tier pages it.
+    fn paged(&self, layer: usize, id: u32) -> bool {
+        self.tier_serving(layer, id).is_some()
+    }
+
     /// An id the arena serves goes to the card holding no slot: its slot is
     /// freed ([`NvTier::release`]) and the bytes it took returned. An id the
     /// mapping serves frees nothing: the churn pool the load's host set holds

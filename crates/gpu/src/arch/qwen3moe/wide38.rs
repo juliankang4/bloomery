@@ -134,9 +134,9 @@
 //! its start (a decode history before it): then the call's last unit returns
 //! each layer once its host service has run, asked at the next layer's
 //! shadow, whose download wait the call's queued return copies fill
-//! ([`PromptStream::return_at_shadow`]); a split pick there prices an admit's way back
-//! when the lane fell behind ([`runtime::xsplit::ReturnCost`]), and the
-//! call's end issues what is left. The stream's placement never stays. A
+//! ([`PromptStream::return_at_shadow`]); a split pick at the last walk's last
+//! card layer prices an admit's way back, which no front follows
+//! ([`runtime::xsplit::ReturnCost`]), and the call's end issues what is left. The stream's placement never stays. A
 //! token's bits then depend on its ubatch's routing too — which of its
 //! experts the pick moved or the stream sent sums on the card, not the host
 //! — so the numeric class above holds for an unstreamed walk only.
