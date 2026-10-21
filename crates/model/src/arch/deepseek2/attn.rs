@@ -514,10 +514,7 @@ fn bf16_round(x: f32) -> f32 {
 /// -128 → -127 is bit-identical by derivation). `quantize_q8_0`'s clamp stays
 /// -128: a WEIGHT code of -128 is legal.
 fn quantize_act(x: &[f32]) -> ActBlock {
-    let mut amax = 0.0f32;
-    for &v in x {
-        amax = amax.max(v.abs());
-    }
+    let amax = gguf::quant::activation_max(x, "quantize_act").abs();
     let d = bf16_round(amax / 127.0);
     let id = if d > 0.0 { 1.0 / d } else { 0.0 };
     let mut q = [0i8; 32];
@@ -3152,6 +3149,32 @@ fn heads_split_k(
 mod tests {
     use super::{lane_tree8, lane_tree8x8, v_expf, v_expf8};
     use std::arch::x86_64::*;
+
+    #[test]
+    fn activation_blocks_refuse_non_finite_values() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for offset in 0..32 {
+                let mut x = [1.0; 32];
+                x[offset] = bad;
+                for x in [x, [bad; 32]] {
+                    let err = std::panic::catch_unwind(|| super::quantize_act(&x))
+                        .expect_err("non-finite MLA activation must fail");
+                    let msg = err.downcast_ref::<String>().unwrap();
+                    assert!(
+                        msg.contains("quantize_act: non-finite activation value"),
+                        "{msg}"
+                    );
+                    assert!(msg.contains("at offset "), "{msg}");
+                }
+            }
+        }
+        let block = super::quantize_act(&[127.0; 32]);
+        assert_eq!(block.d, 1.0);
+        assert_eq!(block.q, [127; 32]);
+        let block = super::quantize_act(&[0.0; 32]);
+        assert_eq!(block.d, 0.0);
+        assert_eq!(block.q, [0; 32]);
+    }
 
     fn assert_isa() {
         assert!(

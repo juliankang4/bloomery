@@ -4305,11 +4305,14 @@ fn quantize_col_non_finite_panics_on_both_paths() {
         dropped_max[8 + 5] = f32::NAN;
         let mut inf = base(k);
         inf[blk / 2] = f32::INFINITY;
+        let mut tail_nan = base(k);
+        tail_nan[k - blk..].fill(f32::NAN);
         for (name, x) in [
             ("all_nan", &all_nan),
             ("last_in_lane", &last_in_lane),
             ("dropped_max", &dropped_max),
             ("inf", &inf),
+            ("tail_nan", &tail_nan),
         ] {
             for (path, f) in [
                 ("avx2", quantize_col as fn(GgmlType, &[f32], &mut [u8])),

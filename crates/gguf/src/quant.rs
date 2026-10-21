@@ -1478,6 +1478,41 @@ fn dequant_iq4_xs(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Refuse a non-finite activation by quantizer name and block-relative offset.
+#[cold]
+#[inline(never)]
+pub fn non_finite_activation(x: &[f32], quantizer: &str) -> ! {
+    let (i, v) = x
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !v.is_finite())
+        .expect("the caller already found a non-finite activation");
+    panic!(
+        "{quantizer}: non-finite activation value {v} at offset {i} of a {}-value block",
+        x.len()
+    );
+}
+
+/// Signed maximum-magnitude nonzero value (first on ties), or positive zero.
+/// Refuses non-finite input by quantizer name and block-relative offset.
+#[inline]
+pub fn activation_max(x: &[f32], quantizer: &str) -> f32 {
+    let mut max = 0.0f32;
+    let mut amax = 0u32;
+    for &v in x {
+        // Magnitude bits order NaNs above infinity, so neither can disappear in the max.
+        let ax = v.to_bits() & 0x7fff_ffff;
+        if ax > amax {
+            amax = ax;
+            max = v;
+        }
+    }
+    if !max.is_finite() {
+        non_finite_activation(x, quantizer);
+    }
+    max
+}
+
 /// Round-trip f32 activations through ggml's Q8_K activation quantization.
 ///
 /// ggml does not multiply K-quant weights by f32 activations. Before a
@@ -1503,16 +1538,8 @@ pub fn quantize_row_q8_k_roundtrip(x: &[f32], out: &mut [f32]) {
         .iter()
         .zip(out.as_chunks_mut::<256>().0)
     {
-        let mut amax = 0.0f32;
-        let mut max = 0.0f32;
-        for &v in xb {
-            let ax = v.abs();
-            if ax > amax {
-                amax = ax;
-                max = v;
-            }
-        }
-        if amax == 0.0 {
+        let max = activation_max(xb, "quantize_row_q8_k_roundtrip");
+        if max == 0.0 {
             ob.fill(0.0);
             continue;
         }
@@ -1563,10 +1590,7 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
         .iter()
         .zip(out.as_chunks_mut::<32>().0)
     {
-        let mut amax = 0.0f32;
-        for &v in xb {
-            amax = amax.max(v.abs());
-        }
+        let amax = activation_max(xb, "quantize_row_q8_2_x4_roundtrip").abs();
         // ggml_compute_fp32_to_bf16 (ggml-impl.h:106), then straight back: bf16 -> f32 is
         // the bits in the high half. NaN cannot occur here (amax is finite and non-negative).
         let d_exact = amax / 127.0f32;
@@ -1683,14 +1707,7 @@ pub fn nearest_int(fval: f32) -> i32 {
 #[must_use]
 pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
     assert_eq!(x.len(), 32, "quantize_q8_0: one 32-value block at a time");
-    let mut amax = 0.0f32;
-    for (i, &v) in x.iter().enumerate() {
-        assert!(
-            v.is_finite(),
-            "quantize_q8_0: non-finite activation value {v} at offset {i}"
-        );
-        amax = amax.max(v.abs());
-    }
+    let amax = activation_max(x, "quantize_q8_0").abs();
     let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
     let id = if id.is_finite() { id } else { 0.0 };
     let mut q = [0i8; 32];
@@ -1759,22 +1776,43 @@ impl Q8Block {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn q8_0_roundtrip_refuses_non_finite_blocks() {
-        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let mut x = [1.0; 32];
-            x[17] = bad;
-            for x in [x, [bad; 32]] {
-                let err = std::panic::catch_unwind(|| {
-                    super::quantize_row_q8_0_roundtrip(&x, &mut [0.0; 32]);
-                })
-                .expect_err("non-finite Q8_0 input must fail");
-                let msg = err.downcast_ref::<String>().unwrap();
-                assert!(
-                    msg.contains("quantize_q8_0: non-finite activation value"),
-                    "{msg}"
-                );
+    fn activation_roundtrips_refuse_non_finite_blocks() {
+        let mut accepted = Vec::new();
+        for (weight, n, owner) in [
+            (GgmlType::Q2_0, 32, "quantize_q8_0"),
+            (GgmlType::Q3_K, 256, "quantize_row_q8_k_roundtrip"),
+            (GgmlType::Q4_K, 128, "quantize_row_q8_2_x4_roundtrip"),
+        ] {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                for offset in 0..n {
+                    let mut x = vec![1.0; n];
+                    x[offset] = bad;
+                    for x in [x, vec![bad; n]] {
+                        let Err(err) = std::panic::catch_unwind(|| {
+                            super::quantize_activations(weight, &x, &mut vec![0.0; n]).unwrap();
+                        }) else {
+                            accepted.push((weight, offset, bad));
+                            continue;
+                        };
+                        let msg = err.downcast_ref::<String>().unwrap();
+                        assert!(
+                            msg.contains(&format!("{owner}: non-finite activation value")),
+                            "{msg}"
+                        );
+                        assert!(msg.contains("at offset "), "{msg}");
+                    }
+                }
             }
+            let mut out = vec![0.0; n];
+            super::quantize_activations(weight, &vec![127.0; n], &mut out).unwrap();
+            assert_eq!(out, vec![127.0; n]);
+            super::quantize_activations(weight, &vec![0.0; n], &mut out).unwrap();
+            assert_eq!(out, vec![0.0; n]);
         }
+        assert!(
+            accepted.is_empty(),
+            "non-finite inputs accepted: {accepted:?}"
+        );
         let mut out = [0.0; 32];
         super::quantize_row_q8_0_roundtrip(&[127.0; 32], &mut out);
         assert_eq!(out, [127.0; 32]);

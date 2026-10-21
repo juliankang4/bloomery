@@ -67,7 +67,9 @@ use gguf::GgmlType;
 use gguf::iq_tables::{
     IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
-use gguf::quant::{KVALUES_MXFP4, e8m0_to_f32_half, f32_to_f16_bits, half_to_f32};
+use gguf::quant::{
+    KVALUES_MXFP4, e8m0_to_f32_half, f32_to_f16_bits, half_to_f32, non_finite_activation,
+};
 
 pub mod generic;
 
@@ -1441,40 +1443,14 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
 /// baseline target `round_ties_even` is a libm `rintf` call per element.
 pub use gguf::quant::nearest_int;
 
-/// Refuse a non-finite activation by name at its first offending value.
-#[cold]
-#[inline(never)]
-fn non_finite_activation(x: &[f32]) -> ! {
-    let (i, v) = x
-        .iter()
-        .enumerate()
-        .find(|(_, v)| !v.is_finite())
-        .map_or((usize::MAX, f32::NAN), |(i, &v)| (i, v));
-    panic!(
-        "qdot: non-finite activation value {v} at offset {i} of a {}-value block",
-        x.len()
-    );
-}
-
 /// Quantizes one 256-value block into 296-byte `block_q8_K` layout. Refuses a
 /// block with a non-finite value ([`non_finite_activation`]).
 fn quantize_q8k_block(x: &[f32], out: &mut [u8]) {
     debug_assert_eq!(x.len(), 256);
     debug_assert_eq!(out.len(), Q8K_STRIDE);
-    let mut max = 0.0f32;
-    let mut amax = 0.0f32;
-    for &v in x {
-        if !v.is_finite() {
-            non_finite_activation(x);
-        }
-        let ax = v.abs();
-        if ax > amax {
-            amax = ax;
-            max = v;
-        }
-    }
+    let max = gguf::quant::activation_max(x, "qdot");
     out[4..8].fill(0);
-    if amax == 0.0 {
+    if max == 0.0 {
         out.fill(0);
         return;
     }
@@ -1586,7 +1562,7 @@ unsafe fn quantize_q8k_block_avx2(x: &[f32; 256], out: &mut [u8; 296]) {
         }
         let amax = hmax_ps(m);
         if _mm256_movemask_ps(unord) != 0 || !amax.is_finite() {
-            non_finite_activation(x);
+            non_finite_activation(x, "qdot");
         }
         if amax == 0.0 {
             *out = [0u8; Q8K_STRIDE];
@@ -3605,13 +3581,7 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
         group.fill(0);
         for ir in 0..4 {
             let xb = &blocks[4 * gi + ir];
-            let mut amax = 0.0f32;
-            for &v in xb {
-                if !v.is_finite() {
-                    non_finite_activation(xb);
-                }
-                amax = amax.max(v.abs());
-            }
+            let amax = gguf::quant::activation_max(xb, "qdot").abs();
             let t = fp32_to_bf16_bits(amax / 127.0);
             group[2 * ir..2 * ir + 2].copy_from_slice(&t.to_le_bytes());
             let id = q82_inverse(t);
@@ -3627,13 +3597,7 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
     }
     for (t, xb) in blocks[nb4..].iter().enumerate() {
         let tb = &mut out[nb4 / 4 * Q82X4_STRIDE + t * Q82_BLOCK..][..Q82_BLOCK];
-        let mut amax = 0.0f32;
-        for &v in xb {
-            if !v.is_finite() {
-                non_finite_activation(xb);
-            }
-            amax = amax.max(v.abs());
-        }
+        let amax = gguf::quant::activation_max(xb, "qdot").abs();
         let b = fp32_to_bf16_bits(amax / 127.0);
         tb[0..2].copy_from_slice(&b.to_le_bytes());
         let id = q82_inverse(b);
@@ -3699,7 +3663,7 @@ unsafe fn quantize_q8_block_avx2(
         }
         let amax = hmax_ps(m);
         if _mm256_movemask_ps(unord) != 0 || !amax.is_finite() {
-            non_finite_activation(x);
+            non_finite_activation(x, "qdot");
         }
         // The scale rule stays scalar: one conversion per block.
         let (t, id) = rule(amax);
