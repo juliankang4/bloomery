@@ -358,24 +358,6 @@ pub enum EmbedEntry {
     Q8_0,
 }
 
-impl GateUpEntry {
-    /// The card layout this entry reads a stack in: NVFP4's planes, and the
-    /// file's blocks for every other entry.
-    pub(crate) const fn layout(self) -> CardFormat {
-        match self {
-            GateUpEntry::Nvfp4 => CardFormat::Nvfp4Planes,
-            GateUpEntry::Q4k
-            | GateUpEntry::Q5k
-            | GateUpEntry::Q8_0
-            | GateUpEntry::Iq2xs
-            | GateUpEntry::Iq3xxs
-            | GateUpEntry::Iq3s
-            | GateUpEntry::Iq4xs
-            | GateUpEntry::Mxfp4 => CardFormat::KQuant,
-        }
-    }
-}
-
 impl DownEntry {
     /// The card layout this entry reads a stack in: the packed q5_0 layout,
     /// NVFP4's planes, and the file's blocks for every other entry.
@@ -646,7 +628,7 @@ impl CardFormat {
     /// a K-quant (`placement::card_format_of_role`'s engram gain),
     /// [`CardFormat::Bf16Raw`] for bf16, which only a reader that picks it
     /// uses, or the layout a routed card entry of `ty` reads a stack in
-    /// (`GateUpEntry::layout`, `DownEntry::layout`): the file's blocks
+    /// (`DownEntry::layout`): the file's blocks
     /// ([`CardFormat::KQuant`]) of q5_1, q8_0, iq2_xs, iq3_xxs, iq3_s,
     /// iq4_xs, iq4_nl and mxfp4, which only a program's
     /// `placement::RoutedFormat` picks.
@@ -655,7 +637,6 @@ impl CardFormat {
         CardFormat::of(ty) == Some(self)
             || (self == CardFormat::Bf16AsF32 && CardFormat::of(ty) == Some(CardFormat::KQuant))
             || (self == CardFormat::Bf16Raw && ty == GgmlType::BF16)
-            || ty.card().gate_up.is_some_and(|e| e.layout() == self)
             || ty.card().down.is_some_and(|(e, _)| e.layout() == self)
     }
 
