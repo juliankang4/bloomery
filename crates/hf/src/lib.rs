@@ -79,8 +79,16 @@ pub enum HfError {
     Listing { repo: String, why: String },
     #[error("{repo}: the listing names {path:?}, which is not a relative path inside the repo")]
     Path { repo: String, path: String },
-    #[error("{repo} holds no GGUF model file")]
+    #[error(
+        "{repo} holds no GGUF model file and no safetensors checkpoint (a model.safetensors.index.json at its top level)"
+    )]
     NoGguf { repo: String },
+    /// A quant named for a repo whose model is a safetensors checkpoint: the checkpoint is the
+    /// repo's one model, in the formats it stores.
+    #[error(
+        "{repo} holds a safetensors checkpoint, which is served as stored: --hf {repo} names it; :{quant} picks a GGUF set"
+    )]
+    CheckpointQuant { repo: String, quant: String },
     #[error("{repo} holds {} GGUF sets and no quant was given; pick one with --hf {repo}:<quant>: {}", .sets.len(), .sets.join(", "))]
     NoQuant { repo: String, sets: Vec<String> },
     #[error("{repo}: no GGUF set carries the quant {quant:?}; its quants: {}", .tags.join(", "))]
@@ -392,6 +400,30 @@ fn tag_of(name: &str) -> String {
         return String::new();
     }
     base[at..].to_ascii_uppercase()
+}
+
+/// The safetensors checkpoint `entries` hold at the repo's top level: its index
+/// (`model.safetensors.index.json`), every `.safetensors` file, and the configs, tokenizer and
+/// chat template beside them (`.json`, `.jinja`), in the listing's order. `None` for a repo with
+/// no index there.
+pub fn checkpoint_files(entries: &[Entry]) -> Option<Vec<Entry>> {
+    let top = |e: &&Entry| !e.path.contains('/');
+    entries
+        .iter()
+        .filter(top)
+        .any(|e| e.path == safetensors::Folder::INDEX)
+        .then(|| {
+            entries
+                .iter()
+                .filter(top)
+                .filter(|e| {
+                    [".safetensors", ".json", ".jinja"]
+                        .iter()
+                        .any(|x| e.path.ends_with(x))
+                })
+                .cloned()
+                .collect()
+        })
 }
 
 /// The GGUF model sets of `entries`, in the listing's order of their first

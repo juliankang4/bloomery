@@ -91,6 +91,13 @@ impl State {
 pub enum Event<'a> {
     /// The set a quant picked.
     Set { repo: &'a str, set: &'a GgufSet },
+    /// The safetensors checkpoint a repo with no GGUF set holds (`crate::checkpoint_files`):
+    /// its files and their bytes.
+    Checkpoint {
+        repo: &'a str,
+        files: usize,
+        bytes: u64,
+    },
     /// A file before its fetch: its size, its state, and the byte the
     /// fetch starts at (its size when cached).
     File {
@@ -592,7 +599,9 @@ impl Client {
     }
 
     /// The set `r` picks in its repo, every file fetched and checked; the
-    /// local paths in shard order (the first shard first). `draft`, the MTP
+    /// local paths in shard order (the first shard first). A repo with no
+    /// GGUF set and a safetensors checkpoint ([`crate::checkpoint_files`])
+    /// gives the checkpoint's folder, its files fetched and checked. `draft`, the MTP
     /// draft a model family runs beside its set, is fetched too when the
     /// repo holds a file of its name ([`crate::mtp_draft`]) and the fetched
     /// set can run it ([`Draft::usable`]; a `DraftSkip` event says why not):
@@ -626,6 +635,15 @@ impl Client {
             Listed::Cache(why) => return self.offline_set(r, &why, events),
         };
         let sets = gguf_sets(&r.repo, &entries)?;
+        if sets.is_empty()
+            && let Some(files) = crate::checkpoint_files(&entries)
+        {
+            let dir = checkpoint(r, &self.root, &files, events)?;
+            for e in &files {
+                self.fetch(&r.repo, e, events)?;
+            }
+            return Ok(vec![dir]);
+        }
         let set = crate::pick(&r.repo, &sets, r.quant.as_deref())?;
         events(&Event::Set { repo: &r.repo, set });
         let mut files = Vec::with_capacity(set.files.len());
@@ -679,6 +697,14 @@ impl Client {
         };
         let entries = verified_entries(&self.root, &r.repo).map_err(offline)?;
         let sets = gguf_sets(&r.repo, &entries).map_err(offline)?;
+        if sets.is_empty()
+            && let Some(files) = crate::checkpoint_files(&entries)
+        {
+            events(&Event::Offline { repo: &r.repo, why });
+            let dir = checkpoint(r, &self.root, &files, events).map_err(offline)?;
+            self.offline_files(&r.repo, &files, events)?;
+            return Ok(vec![dir]);
+        }
         let set = crate::pick(&r.repo, &sets, r.quant.as_deref()).map_err(offline)?;
         events(&Event::Offline { repo: &r.repo, why });
         events(&Event::Set { repo: &r.repo, set });
@@ -737,6 +763,30 @@ impl Client {
             .map(|e| self.fetch(repo, e, events))
             .collect()
     }
+}
+
+/// The folder in `root`'s cache of the checkpoint `files` of `r`'s repo, which a resolve gives
+/// in place of a set's first shard, its event sent; a quant is refused by name, as the
+/// checkpoint is the repo's one model.
+fn checkpoint(
+    r: &RepoRef,
+    root: &Path,
+    files: &[Entry],
+    events: &mut dyn FnMut(&Event<'_>),
+) -> Result<PathBuf, HfError> {
+    if let Some(quant) = &r.quant {
+        return Err(HfError::CheckpointQuant {
+            repo: r.repo.clone(),
+            quant: quant.clone(),
+        });
+    }
+    events(&Event::Checkpoint {
+        repo: &r.repo,
+        files: files.len(),
+        bytes: files.iter().map(|f| f.size).sum(),
+    });
+    let index = cache_path(root, &r.repo, safetensors::Folder::INDEX)?;
+    Ok(index.parent().unwrap_or(root).to_path_buf())
 }
 
 /// The files under `repo`'s cache directory in `root` that a fetch checked:
@@ -950,6 +1000,7 @@ mod tests {
                 Event::DraftSkip { .. } => "draft-skip".to_owned(),
                 Event::Progress { .. } => "progress".to_owned(),
                 Event::Set { .. } => "set".to_owned(),
+                Event::Checkpoint { .. } => "checkpoint".to_owned(),
                 Event::Offline { .. } => "offline".to_owned(),
             })
         });
@@ -1335,6 +1386,56 @@ mod tests {
         assert_eq!(
             seen[1..],
             ["set m-Q4_K_M", "file m-Q4_K_M.gguf offline-cached"]
+        );
+    }
+
+    /// A repo with no GGUF set and a safetensors checkpoint at its top level resolves to the
+    /// checkpoint's folder in the cache, its index, shards, configs and template fetched and
+    /// nothing else; offline the verified checkpoint stands in. A quant on such a repo is
+    /// refused by name, and a repo with neither model is refused naming both.
+    #[test]
+    fn a_safetensors_repo_resolves_to_its_checkpoint_folder() {
+        let d = scratch("checkpoint");
+        let files = [
+            "model.safetensors.index.json",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            "config.json",
+            "tokenizer.json",
+            "chat_template.jinja",
+            "README.md",
+            "extra/other.safetensors",
+        ];
+        let body = content();
+        let listed: Vec<(&str, &[u8])> = files.iter().map(|f| (*f, body.as_slice())).collect();
+        let c = hub(&d, "a/b", &listed);
+        let (got, seen) = offline_run(&c, "a/b");
+        assert_eq!(got.expect("resolve"), [d.join("cache/a/b")], "{seen:?}");
+        let fetched: Vec<&str> = files[..6].to_vec();
+        for f in &files {
+            assert_eq!(
+                d.join("cache/a/b").join(f).exists(),
+                fetched.contains(f),
+                "{f}"
+            );
+        }
+        let (got, seen) = offline_run(&unreachable(&d.join("cache")), "a/b");
+        assert_eq!(got.expect("offline"), [d.join("cache/a/b")], "{seen:?}");
+        assert_eq!(
+            seen.iter()
+                .filter(|s| s.ends_with("offline-cached"))
+                .count(),
+            6
+        );
+        match offline_run(&c, "a/b:Q4_K_M").0 {
+            Err(HfError::CheckpointQuant { quant, .. }) => assert_eq!(quant, "Q4_K_M"),
+            other => panic!("{other:?}"),
+        }
+        let none = hub(&d, "a/c", &[("README.md", b"x")]);
+        let e = offline_run(&none, "a/c").0.expect_err("no model");
+        assert!(
+            matches!(e, HfError::NoGguf { .. }) && e.to_string().contains("safetensors"),
+            "{e}"
         );
     }
 

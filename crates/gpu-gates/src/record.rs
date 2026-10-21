@@ -2086,6 +2086,18 @@ pub static HF_SET: Kind = Kind {
     ],
 };
 
+/// The safetensors checkpoint a `--hf` repo with no GGUF set holds.
+pub static HF_CHECKPOINT: Kind = Kind {
+    name: "hf_checkpoint",
+    head: "hf checkpoint",
+    doc: "The safetensors checkpoint `--hf <repo>` resolved to, the repo holding no GGUF set: the checkpoint folder is served as stored, and its files and their bytes are fetched.",
+    parts: &[
+        key("repo", Word, ""),
+        key("files", U64, ""),
+        key("bytes", U64, "B"),
+    ],
+};
+
 /// A file of a `--hf` fetch before it runs.
 pub static HF_FILE: Kind = Kind {
     name: "hf_file",
@@ -2579,7 +2591,7 @@ pub mod groups {
     /// `model_file/fetch.rs`.
     pub mod fetch {
         use crate::record::{
-            HF_DONE, HF_DRAFT_SKIP, HF_FILE, HF_OFFLINE, HF_PROGRESS, HF_SET, Kind,
+            HF_CHECKPOINT, HF_DONE, HF_DRAFT_SKIP, HF_FILE, HF_OFFLINE, HF_PROGRESS, HF_SET, Kind,
         };
 
         /// A fetch of exact files: the lines `resolve_exact` prints, which
@@ -2587,8 +2599,9 @@ pub mod groups {
         pub const FETCH: &[&Kind] = &[&HF_OFFLINE, &HF_FILE, &HF_PROGRESS, &HF_DONE];
 
         /// A `--hf` set's resolve (`resolve`, through `model_file::name`),
-        /// which prints its own two besides the fetch's.
-        pub const SET: &[&Kind] = &[&HF_SET, &HF_DRAFT_SKIP];
+        /// which prints its own three besides the fetch's: a GGUF set's or a
+        /// checkpoint's, and a skipped draft.
+        pub const SET: &[&Kind] = &[&HF_SET, &HF_CHECKPOINT, &HF_DRAFT_SKIP];
     }
 
     /// `bin/shared/serve_seats/drafted.rs`.

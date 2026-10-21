@@ -46,6 +46,11 @@ fn print(e: &Event<'_>) {
             .u("files", set.files.len())
             .u("bytes", set.bytes())
             .eprint(),
+        Event::Checkpoint { repo, files, bytes } => Record::new(&record::HF_CHECKPOINT)
+            .w("repo", repo)
+            .u("files", files)
+            .u("bytes", bytes)
+            .eprint(),
         Event::File {
             file,
             bytes,
