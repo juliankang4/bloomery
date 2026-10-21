@@ -329,6 +329,36 @@ fn part_formats(
     Ok((formats, budget))
 }
 
+/// Upload `parts` through `ring`, whose copies the caller ends with one synchronize, each part
+/// in the card format `card` names for it, else its type's ([`part_format`]): every part checked
+/// first as [`Weights::add_parts`] checks them, a name `held` holds refused. The uploaded weights
+/// by name, for the caller to file once its copies end.
+pub(crate) fn stage_parts(
+    stream: &CudaStream,
+    ring: &mut UploadRing,
+    parts: &[TensorPart<'_>],
+    held: impl Fn(&str) -> bool,
+    card: impl Fn(&TensorInfo) -> Option<CardFormat>,
+) -> Result<Vec<(String, DevWeight)>, GpuError> {
+    let (formats, _) = part_formats(parts, held)?;
+    let mut added = Vec::with_capacity(parts.len());
+    for (p, format) in parts.iter().zip(formats) {
+        let t = &p.info;
+        let dw = upload_rows(
+            stream,
+            ring,
+            PARTS,
+            card(t).unwrap_or(format),
+            t,
+            tensor_rows(t),
+            &p.spans,
+            p.scale.clone(),
+        )?;
+        added.push((t.name.clone(), dw));
+    }
+    Ok(added)
+}
+
 /// The resident weights of a layer range: every `blk.L.*` tensor with L in
 /// `layers`, what the architecture derives for those blocks, and — when
 /// loaded with globals — the non-block tensors. Load-time only; per-step
@@ -466,27 +496,22 @@ impl Weights {
         stream: &CudaStream,
         parts: &[TensorPart<'_>],
     ) -> Result<(), GpuError> {
-        let (formats, budget) = part_formats(parts, |name| self.by_name.contains_key(name))?;
+        let held = |name: &str| self.by_name.contains_key(name);
+        let (_, budget) = part_formats(parts, held)?;
         stream.context().bind_to_thread()?;
         let mut ring = UploadRing::new(stream, budget)?;
-        let mut added = Vec::with_capacity(parts.len());
-        for (p, format) in parts.iter().zip(formats) {
-            let t = &p.info;
-            let dw = upload_rows(
-                stream,
-                &mut ring,
-                PARTS,
-                format,
-                t,
-                tensor_rows(t),
-                &p.spans,
-                p.scale.clone(),
-            )?;
-            added.push((t.name.clone(), dw));
-        }
+        let added = stage_parts(stream, &mut ring, parts, held, |_| None)?;
         ring.finish(stream)?;
         self.by_name.extend(added);
         Ok(())
+    }
+
+    /// The weights a load staged ([`stage_parts`]), once its ring's copies have ended.
+    pub(crate) fn of_staged(by_name: BTreeMap<String, DevWeight>) -> Weights {
+        Weights {
+            by_name,
+            tied: false,
+        }
     }
 
     /// [`Weights::load_where`], and with `tied` the token embedding is also the head

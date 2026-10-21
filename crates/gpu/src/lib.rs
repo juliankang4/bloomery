@@ -69,6 +69,7 @@ pub mod moe_fused;
 pub mod mtp;
 pub mod mxfp4;
 pub mod mxfp4_sel;
+pub mod parts;
 pub mod ple;
 pub mod probe;
 pub mod prompt_timing;

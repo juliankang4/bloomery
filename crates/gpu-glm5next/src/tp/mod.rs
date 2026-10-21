@@ -31,7 +31,7 @@ use std::sync::Arc;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::{GatherLoop, GatherSet, GatherShape, Gathers};
 use bloomery_gpu::hybrid::SlotMap;
-use bloomery_gpu::weights::{TensorPart, Weights, block_index, part_format};
+use bloomery_gpu::weights::{Weights, block_index};
 use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, MappedHost, WindowMut, mem_batch};
 use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
@@ -39,7 +39,7 @@ use cuda_core::{CudaStream, DeviceBuffer, sys};
 use gguf::Split;
 use model::arch::glm5next::names::Sub;
 use model::arch::glm5next::place::{KdaLanes, PlanInputs};
-use model::part::{Part, Source, Take};
+use model::part::{Source, Take};
 use runtime::layer::{FfnKind, MixerKind};
 
 use crate::body::pair::write_row;
@@ -613,15 +613,11 @@ impl Drop for Rank {
     }
 }
 
-/// The host bytes of a source's parts uploaded together: a load holds at most this much of its
-/// own beside the card, past one tensor's. A file's parts are its mapping's and count none.
-const GROUP: usize = 1 << 30;
-
 /// Rank `at`'s parts of the trunk's `layers` layers of `heads` heads and of the head, from
-/// `source` on `gpu`: every tensor but the token embedding, which the host reads, and the layers
-/// past the trunk's, each the part the family's cut gives the rank ([`RankOf::take`]). Every part
-/// is planned and its card format checked ([`part_format`]), and refused by name, before any is
-/// read or uploaded; the parts go up a group at a time ([`GROUP`]).
+/// `source` on `gpu` ([`bloomery_gpu::parts::load`]): every tensor the card holds
+/// (`model::arch::glm5next::tp::card_holds`: not the token embedding, which the host reads, nor
+/// the layers past the trunk's), each the part the family's cut gives the rank
+/// ([`RankOf::take`]), in its type's card format.
 pub fn load(
     gpu: &Gpu,
     source: &impl Source,
@@ -629,45 +625,18 @@ pub fn load(
     layers: usize,
     heads: usize,
 ) -> Result<Weights, GpuError> {
-    let planned = source
-        .plan(|name, ty, dims| {
+    bloomery_gpu::parts::load(
+        gpu.stream(),
+        source,
+        |name, ty, dims| {
             if !model::arch::glm5next::tp::card_holds(name, block_index(name)?, layers) {
                 return Ok(Take::Skip);
             }
             at.take(name, ty, dims, heads as u64)
-        })
-        .map_err(|e| shape(e.to_string()))?;
-    for p in &planned {
-        part_format(&p.info)?;
-    }
-    let mut w = Weights::default();
-    let mut group: Vec<Part<'_>> = Vec::new();
-    let mut held = 0;
-    for p in &planned {
-        let part = source.read(p).map_err(|e| shape(e.to_string()))?;
-        held += part.held();
-        group.push(part);
-        if held >= GROUP {
-            upload(gpu, &mut w, &group)?;
-            group.clear();
-            held = 0;
-        }
-    }
-    upload(gpu, &mut w, &group)?;
-    Ok(w)
-}
-
-/// Upload `group` beside the parts `w` holds.
-fn upload(gpu: &Gpu, w: &mut Weights, group: &[Part<'_>]) -> Result<(), GpuError> {
-    let parts: Vec<TensorPart<'_>> = group
-        .iter()
-        .map(|p| TensorPart {
-            info: p.info.clone(),
-            spans: p.spans(),
-            scale: p.scale.clone(),
-        })
-        .collect();
-    w.add_parts(gpu.stream(), &parts)
+        },
+        |_| None,
+        false,
+    )
 }
 
 /// `gpu`'s context current on this thread, which runs every rank of a loopback in turn, and its
