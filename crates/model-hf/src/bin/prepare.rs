@@ -31,12 +31,10 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use bloomery_levers::PREPARE_Q8;
-use gguf::write::{Layout, TensorDecl, Writer};
-use gguf::{GgmlType, Value};
-use hf::modelopt::{self, Normal, Plain, Use};
-use hf::quant_config::{self, Config, Format, Plan};
-use model_hf::arch::qwen35moe::{Checkpoint, Mapped};
-use safetensors::{Dtype, Folder};
+use gguf::Value;
+use gguf::write::{Layout, Writer};
+use hf::modelopt::{self, Normal, Use};
+use model_hf::arch::qwen35moe::folder::{self, Make, Planned};
 
 const USAGE: &str = "usage: prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]";
 
@@ -56,19 +54,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// One tensor of the split: its declaration and how its bytes are made.
-struct Planned {
-    decl: TensorDecl,
-    make: Make,
-}
-
-enum Make {
-    /// The mapped tensor, from its sources as the plan places them.
-    Tensor(Mapped),
-    /// The `.scale` beside the tensor `of`: its tensor scales, one a source for a stack.
-    Scale { of: String },
 }
 
 /// The split of the folder `args` name; `q8` (`BLOOMERY_PREPARE_Q8`) writes its BF16 matrices the
@@ -98,33 +83,14 @@ fn run(args: &[String], q8: bool) -> Res<()> {
             format!("--shard-gib {shard_gib}: not a shard size of 1 GiB or more in u64 bytes")
         })?;
     let dir = Path::new(dir);
-    let config: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-    let checkpoint = Checkpoint::parse(&config)?;
-    let folder = Folder::open(dir)?;
-    let entries: Vec<(String, Dtype, Vec<usize>)> = folder
-        .names()
-        .map(|n| {
-            folder
-                .raw(n)
-                .map(|r| (n.to_string(), r.dtype, r.shape.to_vec()))
-        })
-        .collect::<Result<_, _>>()?;
-    let (plan, planned) = plan_tensors(&checkpoint, &Config::read(dir)?, &entries, q8)?;
-
-    let mut kvs = checkpoint.header(
-        planned
-            .iter()
-            .map(|p| (p.decl.name.as_str(), p.decl.dims.as_slice())),
-        &folder,
-    )?;
-    let vocab = hf::vocab::keys(dir, &checkpoint.vocab)?;
-    kvs.extend(vocab.keys.iter().cloned());
-    served_as_hf(
-        &kvs,
-        &vocab,
-        Path::new(&format!("{prefix}.tokenizer.gguf.part")),
-    )?;
+    let folder::Read {
+        checkpoint,
+        folder,
+        plan,
+        planned,
+        kvs,
+        ..
+    } = folder::read(dir, q8)?;
 
     let tensors = planned.len();
     let shards = plan_shards(planned, &kvs, limit)?;
@@ -235,105 +201,6 @@ fn run(args: &[String], q8: bool) -> Res<()> {
     Ok(())
 }
 
-/// The folder's `entries` (name, dtype, shape) placed by its `config`, and each tensor the map
-/// makes of them declared in the type its placed format and role give, its `.scale` beside it
-/// where the type reads one. An unquantized matrix the map reads as Q8_0 stays in its stored
-/// format unless `q8` asks for the rewrite; F32 matrices need that rewrite. Unquantized expert
-/// stacks are unsupported.
-fn plan_tensors(
-    checkpoint: &Checkpoint,
-    config: &Config,
-    entries: &[(String, Dtype, Vec<usize>)],
-    q8: bool,
-) -> Res<(Plan, Vec<Planned>)> {
-    let plan = quant_config::plan(
-        config,
-        entries
-            .iter()
-            .map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
-        model_hf::arch::module_class,
-    );
-    let logical: Vec<(&str, Vec<usize>)> = entries
-        .iter()
-        .filter_map(
-            |(n, _, s)| match (plan.placed.get(n), plan.refused.contains_key(n)) {
-                (Some(p), _) => Some((n.as_str(), p.format.logical(s))),
-                (None, true) => Some((n.as_str(), s.clone())),
-                (None, false) => None,
-            },
-        )
-        .collect();
-    let mapped = checkpoint.map(logical.iter().map(|(n, s)| (*n, s.as_slice())))?;
-    let mut planned = Vec::new();
-    for (name, mut m) in mapped {
-        let source = &m.sources[0];
-        let format = modelopt::format_of(&m.placed(&plan)?)?;
-        if m.role == Use::Matrix(Plain::Q8_0) && matches!(format, Format::Bf16 | Format::F32) {
-            if m.dims.len() == 3 {
-                return Err(format!(
-                    "{source}: {name}: {format} expert stacks are unsupported by the converter"
-                )
-                .into());
-            }
-            if !q8 {
-                if format == Format::F32 {
-                    return Err(format!(
-                        "{source}: {name} is stored {format}, a form its card site does not read; {PREPARE_Q8}=1 writes Q8_0"
-                    )
-                    .into());
-                }
-                m.role = Use::Matrix(Plain::Bf16);
-            }
-        }
-        let type_id = modelopt::type_of(format, m.role).ok_or_else(|| {
-            format!(
-                "{source}: {format} read as {:?} has no GGUF type here",
-                m.role
-            )
-        })?;
-        let nbytes = size_of(type_id, &m.dims).ok_or_else(|| {
-            format!(
-                "{name}: dims {:?} are not whole blocks of type {type_id}",
-                m.dims
-            )
-        })?;
-        // One tensor scale an expert of a stack; one for a row table, whatever its parts.
-        let scales = GgmlType::from_u32(type_id)
-            .reads_scale()
-            .then_some(match m.role {
-                Use::Rows => 1,
-                Use::Matrix(_) => m.sources.len(),
-            });
-        let decl = TensorDecl {
-            name: name.clone(),
-            dims: m.dims.clone(),
-            type_id,
-            nbytes,
-        };
-        planned.push(Planned {
-            decl,
-            make: Make::Tensor(m),
-        });
-        if let Some(n) = scales {
-            let n = u64::try_from(n).map_err(|_| format!("{name}: scale count exceeds u64"))?;
-            let nbytes = size_of(0, &[n])
-                .ok_or_else(|| format!("{name}: scale byte count overflows u64"))?;
-            let stem = name.strip_suffix(".weight").unwrap_or(&name);
-            let decl = TensorDecl {
-                name: format!("{stem}.scale"),
-                dims: vec![n],
-                type_id: 0,
-                nbytes,
-            };
-            planned.push(Planned {
-                decl,
-                make: Make::Scale { of: name },
-            });
-        }
-    }
-    Ok((plan, planned))
-}
-
 fn plan_shards(
     planned: Vec<Planned>,
     kvs: &[(String, Value)],
@@ -384,103 +251,14 @@ fn plan_shards(
         .collect()
 }
 
-/// Serving's tokenizer, which must preserve HF's split, rendering, special ids, automatic BOS/EOS
-/// and generation stop sets. The header-only `probe` is removed before any shard is written.
-fn served_as_hf(
-    kvs: &[(String, Value)],
-    vocab: &hf::vocab::Keys,
-    probe: &Path,
-) -> Res<tokenizer::Tokenizer> {
-    let open = || -> Res<tokenizer::Tokenizer> {
-        let layout = Layout::new(kvs, Vec::new())?;
-        Writer::new(File::create(probe)?, layout)?.finish()?;
-        Ok(tokenizer::Tokenizer::from_gguf(probe)?)
-    };
-    let served = open();
-    if probe.exists() {
-        std::fs::remove_file(probe)?;
-    }
-    let served = served?;
-    let mut split = served.special_tokens().to_vec();
-    split.sort_unstable();
-    if split != vocab.added {
-        return Err(format!(
-            "serving splits text on tokens {split:?}, HF on its added tokens {:?}",
-            vocab.added
-        )
-        .into());
-    }
-    if let Some(id) = vocab.stop.iter().find(|id| !served.eog().contains(id)) {
-        return Err(format!(
-            "HF's generate stops at token {id}, where serving does not end generation"
-        )
-        .into());
-    }
-    if let Some(id) = served.eog().iter().find(|id| !vocab.stop.contains(id)) {
-        return Err(format!("serving stops at token {id}, where HF's generate continues").into());
-    }
-    let expected = |key: &str| vocab.keys.iter().find(|(k, _)| k == key).map(|(_, v)| v);
-    let Some(Value::Array(types)) = expected("tokenizer.ggml.token_type") else {
-        return Err("HF tokenizer has no tokenizer.ggml.token_type".into());
-    };
-    if types.len() != served.n_vocab() {
-        return Err("serving vocabulary size differs from HF's".into());
-    }
-    for (id, ty) in types.iter().enumerate() {
-        let id = u32::try_from(id)?;
-        let control = served
-            .attr(id)
-            .is_some_and(|a| a & (tokenizer::attr::CONTROL | tokenizer::attr::UNKNOWN) != 0);
-        if control != (*ty == Value::I32(3)) {
-            return Err(
-                format!("serving control/rendering at token {id} differs from HF's").into(),
-            );
-        }
-    }
-    for (key, actual) in [
-        ("tokenizer.ggml.add_bos_token", served.add_bos()),
-        ("tokenizer.ggml.add_eos_token", served.add_eos()),
-    ] {
-        if actual != expected(key).and_then(Value::as_bool).unwrap_or(false) {
-            return Err(format!("serving {key} differs from HF's").into());
-        }
-    }
-    let specials = served.specials();
-    for (key, actual) in [
-        ("tokenizer.ggml.bos_token_id", specials.bos),
-        ("tokenizer.ggml.eos_token_id", specials.eos),
-        ("tokenizer.ggml.padding_token_id", specials.pad),
-        ("tokenizer.ggml.unknown_token_id", specials.unk),
-        ("tokenizer.ggml.seperator_token_id", specials.sep),
-    ] {
-        if actual.is_none()
-            && matches!(
-                key,
-                "tokenizer.ggml.bos_token_id" | "tokenizer.ggml.eos_token_id"
-            )
-        {
-            return Err(format!("serving requires {key}").into());
-        }
-        if actual.map(u64::from) != expected(key).and_then(Value::as_u64) {
-            return Err(format!("serving {key} differs from HF's").into());
-        }
-    }
-    Ok(served)
-}
-
-/// The bytes of a tensor of `type_id` and `dims`, its blocks as the type's row sizes them.
-fn size_of(type_id: u32, dims: &[u64]) -> Option<u64> {
-    let ty = GgmlType::from_u32(type_id);
-    let (blck, size) = ty.blck_size().zip(ty.type_size())?;
-    if dims.is_empty() || !dims[0].is_multiple_of(blck) {
-        return None;
-    }
-    gguf::tensor_bytes(blck, size, dims)
-}
-
 #[cfg(test)]
 mod tests {
-    use gguf::GENERAL_ARCHITECTURE;
+    use gguf::write::TensorDecl;
+    use gguf::{GENERAL_ARCHITECTURE, GgmlType};
+    use hf::quant_config::{Config, Format};
+    use model_hf::arch::qwen35moe::Checkpoint;
+    use model_hf::arch::qwen35moe::folder::{plan_tensors, served_as_hf};
+    use safetensors::Dtype;
     #[test]
     fn shard_budget_counts_scales_metadata_and_padding() {
         use super::*;
@@ -564,8 +342,6 @@ mod tests {
     fn the_served_tokenizer_splits_and_stops_as_hf() {
         use super::*;
 
-        let probe =
-            std::env::temp_dir().join(format!("prepare-served-{}.gguf", std::process::id()));
         let stop_key = "tokenizer.bloomery.eog_token_ids";
         for (second, added, stop, explicit, refused) in [
             ("b", vec![2], vec![2], false, None),
@@ -649,12 +425,11 @@ mod tests {
                 added,
                 stop,
             };
-            match (served_as_hf(&keys, &vocab, &probe).map(|_| ()), refused) {
+            match (served_as_hf(&keys, &vocab).map(|_| ()), refused) {
                 (Ok(()), None) => {}
                 (Err(e), Some(what)) if e.to_string().contains(what) => {}
                 (other, _) => panic!("{second} {:?}: {other:?}", vocab.stop),
             }
-            assert!(!probe.exists());
             if explicit && refused.is_none() {
                 for (key, value, error) in [
                     (
@@ -698,9 +473,8 @@ mod tests {
                     let mut changed = keys.clone();
                     changed.retain(|(k, _)| k != key);
                     changed.push((key.into(), value));
-                    let err = served_as_hf(&changed, &vocab, &probe).err().unwrap();
+                    let err = served_as_hf(&changed, &vocab).err().unwrap();
                     assert!(err.to_string().contains(error), "{second} {key}: {err}");
-                    assert!(!probe.exists());
                 }
                 for key in ["tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id"] {
                     let mut absent = hf::vocab::Keys {
@@ -709,12 +483,11 @@ mod tests {
                         stop: vocab.stop.clone(),
                     };
                     absent.keys.retain(|(k, _)| k != key);
-                    let err = served_as_hf(&absent.keys, &absent, &probe).err().unwrap();
+                    let err = served_as_hf(&absent.keys, &absent).err().unwrap();
                     assert!(
                         err.to_string().contains(&format!("serving requires {key}")),
                         "{err}"
                     );
-                    assert!(!probe.exists());
                 }
                 let mut both = keys.clone();
                 let mut expected = hf::vocab::Keys {
@@ -724,14 +497,14 @@ mod tests {
                 };
                 both.push(("tokenizer.ggml.add_bos_token".into(), Value::Bool(true)));
                 assert!(
-                    served_as_hf(&both, &expected, &probe)
+                    served_as_hf(&both, &expected)
                         .err()
                         .unwrap()
                         .to_string()
                         .contains("add_bos_token")
                 );
                 expected.keys = both.clone();
-                assert!(served_as_hf(&both, &expected, &probe).is_ok());
+                assert!(served_as_hf(&both, &expected).is_ok());
             }
         }
     }
@@ -766,9 +539,7 @@ mod tests {
         let config = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap());
         let checkpoint = Checkpoint::parse(&config.unwrap()).unwrap();
         let vocab = hf::vocab::keys(&dir, &checkpoint.vocab).unwrap();
-        let probe =
-            std::env::temp_dir().join(format!("prepare-corpus-{}.gguf", std::process::id()));
-        let served = served_as_hf(&vocab.keys, &vocab, &probe).unwrap();
+        let served = served_as_hf(&vocab.keys, &vocab).unwrap();
         let cases = corpus["cases"].as_array().unwrap();
         assert!(cases.len() >= 2000, "{} cases in {path}", cases.len());
         let (mut ids, mut failures) = (0, Vec::new());

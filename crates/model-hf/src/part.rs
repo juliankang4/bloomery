@@ -27,6 +27,11 @@ pub enum Error {
     /// A model's move refused the tensor; the reason names it.
     #[error("{0}")]
     Step(String),
+    /// A stored tensor's file pages could not be released.
+    #[error(transparent)]
+    Release(#[from] model::placement::PlacementError),
+    #[error(transparent)]
+    Tensors(#[from] safetensors::Error),
 }
 
 impl From<TpError> for Error {
@@ -204,6 +209,27 @@ impl Source for Checkpoint {
             bytes,
             ty.reads_scale().then_some(n.scale),
         ))
+    }
+
+    /// Every stored tensor the part was read from, its values and its companions (scales, the
+    /// packed shape), each the whole pages inside its bytes: a read normalizes into bytes of its
+    /// own ([`Part::made`]), so no later reader of the part takes them from the file.
+    fn release(&self, p: &Planned) -> Result<(), Error> {
+        let name = p.info.name.as_str();
+        let m = self
+            .made
+            .get(name)
+            .ok_or_else(|| refuse(name, "is not one the map makes"))?;
+        for (source, placed) in self.placed(m) {
+            for stored in
+                std::iter::once(source).chain(placed.companions.iter().map(String::as_str))
+            {
+                let (path, map, at) = self.folder.mapped(stored)?;
+                // SAFETY: `Folder::mapped` gives the shard file's own read-only mapping whole.
+                unsafe { model::placement::host_lock::release_file_pages(&path, map, at) }?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -571,7 +597,7 @@ pub(crate) mod tests {
     /// whole, uncut; at two and four ranks along every dim of each format, a stack's experts and
     /// a tensor the map moves. A part off the card type's blocks is refused by both sources;
     /// one that splits FP8's 128-row scale blocks by the folder alone, naming its scale, in its
-    /// plan.
+    /// plan. A part read again after its file pages' release gives the same bytes.
     #[test]
     fn a_folder_and_its_gguf_give_every_rank_the_same_part() {
         let dir = temp_dir("same");
@@ -669,6 +695,14 @@ pub(crate) mod tests {
             "{e}"
         );
         println!("SAME {same} rank parts");
+        for (name, _) in cases {
+            let before = read_one(f, rule(name, 0, 0, 1)).unwrap();
+            for p in f.plan(rule(name, 0, 0, 1)).unwrap() {
+                f.release(&p).unwrap();
+            }
+            let after = read_one(f, rule(name, 0, 0, 1)).unwrap();
+            assert_eq!(after, before, "{name} read again after its pages' release");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

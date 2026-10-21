@@ -23,6 +23,8 @@ use serde_json::Value as Json;
 use model::arch::qwen35moe::hparams::{MAX_PLE_HEADS, MAX_PLE_NGRAM};
 use model::arch::qwen35moe::names::{self, Sub};
 
+pub mod folder;
+
 /// Why the checkpoint was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
