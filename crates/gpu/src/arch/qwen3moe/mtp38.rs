@@ -1711,6 +1711,11 @@ impl Mtp38 {
             p.copy_from_device_async(&w_p, stream)?;
             walks.push(m);
         }
+        // The own rows are the proposal's, and no later walk reads them: the
+        // store holds the sequence through the refresh, where the next
+        // refresh starts at or below its end (a verify's kept rows, or the
+        // step's row when no verify takes the proposal).
+        self.held = end;
         // The last walk's fault word and site mask close the chain: the word
         // is the card's own, so a fault any walk of the chain raised is on
         // it (the argmax kernel copies it after its launch).

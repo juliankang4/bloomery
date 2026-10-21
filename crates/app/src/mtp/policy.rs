@@ -156,7 +156,8 @@ pub(super) struct Policy<A> {
     /// The next window's refresh; `None` between a prompt call and its
     /// `begin`.
     next: Option<Refresh<A>>,
-    /// The last prompt unit's arena and rows, for [`Policy::begin`]'s anchor.
+    /// The last prompt unit's arena and rows, until a call takes its last row
+    /// in: [`Policy::begin`]'s anchor, or the first step's or join's walk.
     last_unit: Option<(A, usize)>,
     /// The last join to a held sequence a call continued, until taken.
     joined: Option<Join>,
@@ -452,6 +453,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
         }
         let (walk, rows) = self
             .last_unit
+            .take()
             .ok_or_else(|| Refused(format!("{WHAT}: a prompt the draft never saw")))?;
         self.next = Some(Refresh {
             tokens: vec![first],
@@ -875,6 +877,23 @@ mod tests {
         fn plain_step(&mut self) -> Result<(), String> {
             let (pos, last) = (self.c.pos, self.last);
             self.p.before_step(&mut self.c, pos, last)?;
+            self.step()
+        }
+
+        /// A pass the width chooser runs as a plain step after the draft's
+        /// chain (a shadow, scored and never verified, or a window its
+        /// closing gate cuts to no id): the chain, its proposal dropped, then
+        /// the step. No walk runs before the step: the chain took the rows
+        /// that waited.
+        fn walked_pass(&mut self) -> Result<(), String> {
+            self.chain()?;
+            self.step()
+        }
+
+        /// The target's step of the token at its position, then the draft
+        /// told (`stepped`, `held`).
+        fn step(&mut self) -> Result<(), String> {
+            let last = self.last;
             self.c.ran(Ar::Step, 1);
             let pos = self.c.pos;
             let next = 1000 + pos;
@@ -883,18 +902,25 @@ mod tests {
             Ok(())
         }
 
+        /// The draft's chain at the target's position: its refresh walked,
+        /// then its own walks, whose rows the body takes back once the
+        /// proposal is read: the store ends at the refresh.
+        fn chain(&mut self) -> Result<Chain<Ar>, String> {
+            let (here, ctx, last) = (self.c.pos, self.c.ctx, self.last);
+            let chain = self
+                .p
+                .chain(here, ctx, last, SHAPE.width)
+                .map_err(|e| e.to_string())?
+                .ok_or("a chain of a draft that skips")?;
+            self.c.walk(&chain.refresh.as_walk(chain.mode))?;
+            Ok(chain)
+        }
+
         /// A drafted pass that keeps `kept` rows (all of them when `None`):
         /// the chain, the verify, the accept's record, the commit.
         fn drafted_pass(&mut self, kept: Option<usize>) -> Result<(), String> {
-            let (p0, ctx, last) = (self.c.pos, self.c.ctx, self.last);
-            let chain = self
-                .p
-                .chain(p0, ctx, last, SHAPE.width)
-                .map_err(|e| e.to_string())?
-                .ok_or("a drafted pass of a draft that skips")?;
-            self.c.walk(&chain.refresh.as_walk(chain.mode))?;
-            let end = chain.refresh.pos0 as usize + chain.refresh.tokens.len();
-            self.c.store = end + chain.own;
+            let (p0, last) = (self.c.pos, self.last);
+            let chain = self.chain()?;
             let mut rows = vec![last];
             rows.extend((0..=chain.own as u32).map(|i| 500 + i));
             self.c.ran(Ar::Pass, rows.len());
@@ -1081,6 +1107,42 @@ mod tests {
             [seen(HEAD, 14, &[1014], rows_of(Ar::Step, 0))]
         );
         rig.drafted_pass(None).unwrap();
+    }
+
+    /// A window no verify takes (the width chooser's shadow, or the window
+    /// its closing gate cuts to no id), first after `begin` and then after
+    /// a drafted pass: its chain walks the waiting rows, and its step walks
+    /// nothing more (the prompt call's last unit is the anchor `begin` took,
+    /// not rows that still wait) and leaves the step's row waiting, the
+    /// store at the target's position.
+    #[test]
+    fn a_dropped_window_walks_its_chain_alone() {
+        let mut rig = after_prompt(64);
+        rig.begin().unwrap();
+        rig.walked_pass().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            rig.c.take(),
+            [seen(HEAD, 9, &[1009], rows_of(Ar::Ubatch, 0))]
+        );
+        assert_eq!((rig.c.store, rig.c.pos), (10, 10));
+        assert_eq!((rig.next().pos0, rig.next().walk), (10, Ar::Step));
+
+        let mut rig = after_prompt(64);
+        rig.begin().unwrap();
+        rig.drafted_pass(None).unwrap();
+        rig.c.take();
+        rig.walked_pass().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            rig.c.take(),
+            [seen(HEAD, 10, &[500, 501, 502, 2003], rows_of(Ar::Pass, 0))]
+        );
+        assert_eq!((rig.c.store, rig.c.pos), (14, 14));
+        assert_eq!((rig.next().pos0, rig.next().walk), (14, Ar::Step));
+        rig.drafted_pass(None).unwrap();
+        assert_eq!(
+            rig.c.take(),
+            [seen(HEAD, 14, &[1014], rows_of(Ar::Step, 0))]
+        );
     }
 
     /// A step that ends at the context: its row is left unwalked, since no
@@ -1332,6 +1394,7 @@ mod tests {
             "{why}"
         );
 
+        let mut rig = after_prompt(64);
         rig.begin().unwrap();
         let why = refused(&mut rig, 9, 0);
         assert!(why.ends_with("a proposal into no room"), "{why}");
@@ -1450,14 +1513,15 @@ mod tests {
     /// the draft's store holding a position at or past the target's — what
     /// a sequence state needs to save the draft's side — and none ends in a
     /// refusal: every sequence of up to six calls from a plain step (the
-    /// seat's step and a pass the width chooser holds back, one order) and
-    /// a drafted pass (keeping one row or all) over a prompt, started by
-    /// `begin` or by the server's cut step, runs without a refusal, each of
-    /// its walks one the card model accepts, and after every call the store
-    /// holds no position past the target's. The runtime's own plain loop —
-    /// a step with no walk before it, which is what refused here once —
-    /// never follows a cut step (its steps come only after the draft's own
-    /// proposal), so it is not among the calls.
+    /// seat's step and a pass the width chooser holds back, one order), a
+    /// pass whose chain no verify takes (the chooser's shadow, or its
+    /// closing gate's cut to no id) and a drafted pass (keeping one row or
+    /// all) over a prompt, started by `begin` or by the server's cut step,
+    /// runs without a refusal, each of its walks one the card model accepts,
+    /// and after every call the store holds no position past the target's.
+    /// The runtime's own plain loop — a step with no walk before it, which
+    /// is what refused here once — never follows a cut step (its steps come
+    /// only after the draft's own proposal), so it is not among the calls.
     ///
     /// The contexts the sequences run at are one the calls cannot reach the
     /// end of and one they can (the prompt's nine ids plus three rows):
@@ -1472,9 +1536,15 @@ mod tests {
         #[derive(Clone, Copy, Debug)]
         enum Call {
             Plain,
+            Walked,
             Drafted(Option<usize>),
         }
-        const CALLS: [Call; 3] = [Call::Plain, Call::Drafted(Some(1)), Call::Drafted(None)];
+        const CALLS: [Call; 4] = [
+            Call::Plain,
+            Call::Walked,
+            Call::Drafted(Some(1)),
+            Call::Drafted(None),
+        ];
 
         fn run(rig: &mut Rig, calls: &[Call]) -> Result<(), String> {
             for (i, call) in calls.iter().enumerate() {
@@ -1487,11 +1557,12 @@ mod tests {
                 // A drafted pass runs while its narrowest verify fits the
                 // context; closer to the end the caller steps.
                 let call = match *call {
-                    Call::Drafted(_) if pos + 2 > ctx => Call::Plain,
+                    Call::Walked | Call::Drafted(_) if pos + 2 > ctx => Call::Plain,
                     c => c,
                 };
                 match call {
                     Call::Plain => rig.plain_step(),
+                    Call::Walked => rig.walked_pass(),
                     Call::Drafted(kept) => rig.drafted_pass(kept),
                 }
                 .map_err(|e| format!("call {} ({call:?}): {e}", i + 1))?;
@@ -1542,6 +1613,6 @@ mod tests {
                 }
             }
         }
-        assert_eq!(count, 2 * 2 * (1093 + 364));
+        assert_eq!(count, 2 * 2 * (5461 + 1365));
     }
 }

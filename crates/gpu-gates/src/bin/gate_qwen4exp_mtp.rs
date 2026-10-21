@@ -125,10 +125,10 @@
 //!   the pass steps plainly with the draft's proposals shadowed, never a
 //!   window of one, the ids still the plain run's.
 //! - (p) a partial accept's records: the commit of a verify that kept fewer
-//!   rows than it ran cuts the draft's records to the kept rows — after a
-//!   drafted run the draft store's count stands at the model's position, a
-//!   snapshot there holds exactly the accepted rows, a store walked past the
-//!   position (an anchor row) makes the snapshot refused by name, and after
+//!   rows than it ran cuts the draft's records to the kept rows. A window
+//!   starting at p0 and keeping k rows leaves the draft store at p0 + 1
+//!   and the target at p0 + k. A snapshot preserves both counts. A store
+//!   walked past the position (an anchor row) makes the snapshot refused by name, and after
 //!   a scripted window that keeps 2 of its 4 rows the pass arena's rejected
 //!   row is refused by name for a walk that reads it (the uncut record
 //!   would let the walk run).
@@ -169,8 +169,17 @@
 //!   chooser walks the draft's waiting rows first (`Draft::before_plain`,
 //!   the call its propose makes on the plain pass it returns), then the
 //!   target steps and overwrites the arena the anchor read — after the
-//!   walk — so the pass takes the position in instead of refusing and the
-//!   drafted ids stay the plain run's.
+//!   walk — so the pass takes the position in instead of refusing, the
+//!   draft's store stands at the target's position, a snapshot there is
+//!   taken, and the drafted ids stay the plain run's.
+//! - (v) a window no verify takes (the width chooser's shadow, or the window
+//!   its closing gate cuts to no id), after `begin` and after a drafted pass
+//!   from the prompt's anchor: the draft's chain runs, its proposal is
+//!   dropped, the target steps and the draft hears of it through
+//!   `Draft::held`. The step walks nothing the prompt call left (`begin`
+//!   took its anchor), the draft's store stands at the target's position
+//!   (the chain took its own rows back), a snapshot there is taken, and the
+//!   drafted ids after it are the plain run's.
 //! - (y) two drafted sequences resident over a plan of two
 //!   (`PlanInputs::plan_mtp_with_slots`, `Body38::open_placed_mtp_slots`),
 //!   in the server's order (`worker.rs`'s `start` → `genloop`'s `prompt`):
@@ -2350,11 +2359,89 @@ mod gate {
         Ok(ok && runs_ok)
     }
 
+    /// The target position and the draft's committed store count travel together in a state.
+    #[derive(Clone, Copy, PartialEq)]
+    struct DraftEnd {
+        held: usize,
+        pos: u32,
+    }
+
+    impl DraftEnd {
+        fn read(m: &Qwen38Model) -> Result<Self, GateError> {
+            Ok(Self {
+                held: held_of(m)?,
+                pos: m.pos(),
+            })
+        }
+
+        // PIN(2026-10-22): the refresh commits p0 + 1, not the target's p0 + kept rows.
+        fn after(pos: u32, kept: usize) -> Option<Self> {
+            Some(Self {
+                held: (pos as usize).checked_sub(kept.checked_sub(1)?)?,
+                pos,
+            })
+        }
+
+        // PIN(2026-10-22): a whole restore preserves both counts, including a trailing store.
+        fn restored(self, m: &Qwen38Model) -> Result<bool, GateError> {
+            Ok(Self::read(m)? == self)
+        }
+    }
+
+    /// A real MTP chain, with the first proposal kept and the second rejected by a forced pick:
+    /// the draft's store trails the target. Its state is put back whole on the engine stream
+    /// and from a lane, then the store walked past the target refuses both saves
+    /// ([`past_refused`]).
+    fn partial_state(
+        m: Qwen38Model,
+        prompt: &[u32],
+        kv_bytes: u64,
+    ) -> Result<(Qwen38Model, bool), GateError> {
+        let ctx = m.body("partial state")?.ctx() as u32;
+        let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
+        let first = spec.prompt(&mut s, prompt)?;
+        spec.begin(&s, prompt, first)?;
+        let p0 = s.pos();
+        let mut rows = [first; 4];
+        let n = Draft::propose(spec.draft_mut(), &mut s, first, &mut rows[1..])?;
+        if n != 3 {
+            return Err("partial state needs three proposals".into());
+        }
+        let mut picked = Verify::verify(&mut s, rows)?;
+        let vocab = u32::try_from(s.model().body("partial state")?.vocab())?;
+        picked[0] = rows[1];
+        picked[1] = (rows[2] + 1) % vocab;
+        let kept = runtime::accepted_rows(&rows, &picked);
+        Draft::accept(spec.draft_mut(), &mut s, &rows, &picked, kept)?;
+        Verify::commit(&mut s, kept)?;
+        let mut m = s.into_model();
+        let end = DraftEnd::read(&m)?;
+        let shape = kept == 2 && end.pos == p0 + 2 && end.held == p0 as usize + 1;
+        let cut = DraftEnd::after(end.pos, kept) == Some(end);
+        let before = store_of(&m, end.pos as usize)?;
+        let state = m.seq_save()?;
+        m.reset()?;
+        m.seq_resume(&state)?;
+        let whole = end.restored(&m)? && store_of(&m, end.pos as usize)? == before;
+        let (_, _, lane) = lane_round(&mut m, prompt, kv_bytes, ("partial accept", 4))?;
+        let past = past_refused(&mut m, prompt, end.pos)?;
+        println!(
+            "(p-partial) kept {kept}, target {} (p0 {p0}), store {}; shape {}, kept_state {}, prefix_draft {}, lane_save {}, past_refused {}",
+            end.pos,
+            end.held,
+            verdict(shape),
+            verdict(cut),
+            verdict(whole),
+            verdict(lane),
+            verdict(past)
+        );
+        Ok((m, shape && cut && whole && lane && past))
+    }
+
     /// (p): a partial accept's records and snapshot. The commit of a verify
     /// that kept fewer rows than it ran cuts the draft's records to the kept
-    /// rows: after a drafted run the store's count stands at the model's
-    /// position, a snapshot there holds exactly the accepted rows, and once
-    /// the store walks past the position (an anchor row) the snapshot is
+    /// rows. The store's count follows [`DraftEnd::after`], and a snapshot
+    /// preserves both counts. Once the store walks past the position (an anchor row) the snapshot is
     /// refused by name; after a scripted window that keeps 2 of its 4 rows
     /// the pass arena's rejected row is a position the arena no longer
     /// holds — a walk that reads it is refused by name, where the uncut
@@ -2380,7 +2467,8 @@ mod gate {
         };
         let at = m.pos() as usize;
         let held = m.body("kept state")?.mtp().map_or(0, |d| d.held());
-        let cut = held == at;
+        let cut = kept.rows.last().and_then(|&k| DraftEnd::after(m.pos(), k))
+            == Some(DraftEnd::read(&m)?);
         println!(
             "(p) after the drafted run's {} windows at {at}: the draft store holds {held} \
              positions {}",
@@ -2397,28 +2485,8 @@ mod gate {
             },
             verdict(snap_ok)
         );
-        // The store walked past the position — an anchor row: the state
-        // carries the rows below the position only.
-        let zeros = vec![0.0f32; WIDE];
-        m.mtp_walk(
-            DraftFeed::Rows(Feed {
-                tokens: &prompt[..1],
-                pos0: u32::try_from(at)?,
-                hidden: Hidden::Host(&zeros),
-                media: None,
-            }),
-            DraftHead::Rows,
-            WalkMode::Store,
-        )?;
         let mut ok = cut && snap_ok;
-        ok &= refused(
-            "a snapshot of a store past the position",
-            m.seq_save(),
-            &format!(
-                "a state at {at} of a draft store that holds {} positions",
-                at + 1
-            ),
-        );
+        ok &= past_refused(&mut m, prompt, u32::try_from(at)?)?;
         // A scripted window that keeps `KEEP` of its 4 rows: the arena's
         // rows `KEEP` on are the rejected tail the commit takes back. The
         // scripted drafter walks no draft, so the store is warmed over the
@@ -2570,8 +2638,8 @@ mod gate {
 
     /// (kp-draft): a cut to a point and a prefix restore to it keep the draft. A drafted run
     /// with a point at its prompt's end (`p`) below its end is saved; put back whole, the
-    /// draft's store holds the state's positions (the contrast). Then the state put back whole
-    /// and cut to `p` by `rollback`, the state put back as its first `p` positions
+    /// draft's store holds its saved count, which can trail the target (the contrast).
+    /// Then the state put back whole and cut to `p` by `rollback`, the state put back as its first `p` positions
     /// (`seq_resume_prefix` asked one short of the end), and a state saved there put back whole
     /// each stand at `p` with the draft rejoined ([`AtPoint::rejoined`]): the draft's store
     /// holds the `p` positions below the point, its rows the drafted run's, and the step
@@ -2588,6 +2656,7 @@ mod gate {
     fn prefix_draft(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
         const N: usize = 6;
         let (mut m, first, point_row) = drafted_run(m, prompt, N)?;
+        let end = DraftEnd::read(&m)?;
         let state = m.seq_save()?;
         let n = state.positions();
         let ask = n.saturating_sub(1);
@@ -2606,6 +2675,7 @@ mod gate {
         m.reset()?;
         m.seq_resume(&state)?;
         let (whole_held, whole_pos) = (held_of(&m)?, m.pos());
+        let contrast = end.restored(&m)?;
         let rows = store_of(&m, p)?;
         let saved_all = store_of(&m, n as usize)?;
         m.reset()?;
@@ -2641,7 +2711,6 @@ mod gate {
         };
         m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
         m.reset()?;
-        let contrast = whole_held == n as usize && whole_pos == n;
         let roll_ok = roll.rejoined(p, &rows, &point_row) && roll_walk.is_ok();
         let tail = |a, b| same_rows(a, b, n as usize)[p..].iter().all(|&s| s);
         let (kept_tail, differs) = (tail(&past, &other_all), !tail(&other_all, &saved_all));
@@ -2743,8 +2812,8 @@ mod gate {
     }
 
     /// (sl): a drafted run's state saved on a save lane (`seq_save_async`) three times, its copy
-    /// landed each time: whole, the draft's store holding all `n` positions, then after a
-    /// rollback to a point `at` below `n`, which the draft rejoins (its store counts `at`), then
+    /// landed each time: whole, the draft's store holding its saved count at target `n`,
+    /// then after a rollback to a point `at` below `n`, which the draft rejoins (its store counts `at`), then
     /// a state of `BEHIND` ids from a reset by a prompt call without the draft (the store holds 0
     /// of `BEHIND`). Each
     /// copy's bytes (`SaveCost::bytes`) are the target's rows of the state's positions
@@ -2784,11 +2853,10 @@ mod gate {
             s.into_model()
         };
         let n = m.pos();
-        let (state, held, whole_ok) = lane_round(&mut m, prompt, kv_bytes, ("whole", 1))?;
-        let whole_ok = whole_ok && held == n as usize;
+        let (state, _, whole_ok) = lane_round(&mut m, prompt, kv_bytes, ("whole", 1))?;
         let at = state.keep_point(n.saturating_sub(1));
         let prefix_ok = whole_ok && lane_prefix(&mut m, &state, n, at)?;
-        let refused_ok = whole_ok && lane_refused(&mut m, prompt, n)?;
+        let refused_ok = whole_ok && past_refused(&mut m, prompt, n)?;
         let cut_ok = if at == 0 || at >= n {
             println!(
                 "(sl) the state of {n} positions carries no point below its end (asked {}, \
@@ -2874,10 +2942,8 @@ mod gate {
     ) -> Result<(Seq38, usize, bool), GateError> {
         let (what, shift) = round;
         let n = m.pos() as usize;
-        let held_of = |m: &Qwen38Model| -> Result<usize, GateError> {
-            Ok(m.body("(sl)")?.mtp().map_or(0, Mtp38::held))
-        };
-        let held = held_of(m)?;
+        let end = DraftEnd::read(m)?;
+        let held = end.held;
         let store_ctx = m
             .body("(sl)")?
             .mtp()
@@ -2900,7 +2966,7 @@ mod gate {
         let put = held_of(m)?;
         let same = store_of(m, n)? == before;
         let bytes_ok = cost.bytes == derived;
-        let back_ok = put == held && seen && same;
+        let back_ok = end.restored(m)? && seen && same;
         println!(
             "(sl) {what}, a state of {n} positions whose draft store holds {held} saved on a \
              lane: the copy {} bytes (derived {derived}: the target's {target}, recurrent copies \
@@ -2914,38 +2980,30 @@ mod gate {
         Ok((state, held, bytes_ok && back_ok))
     }
 
-    /// The save on a lane of a model whose draft store was walked past its position `n` (a
-    /// store walk from `n`, the anchor row): refused by name with the words of the engine
-    /// stream's save ((p)), nothing enqueued. The walk follows a whole put-back, which leaves
-    /// the store counting `n`.
-    fn lane_refused(m: &mut Qwen38Model, prompt: &[u32], n: u32) -> Result<bool, GateError> {
-        let zeros = vec![0.0f32; WIDE];
-        m.mtp_walk(
-            DraftFeed::Rows(Feed {
-                tokens: &prompt[..1],
-                pos0: n,
-                hidden: Hidden::Host(&zeros),
-                media: None,
-            }),
-            DraftHead::Rows,
-            WalkMode::Store,
-        )?;
+    /// The saves of a model at position `n` whose draft store was walked past it: store walks
+    /// from position 0 through `n` (the anchor row), wherever the store stood, since a store
+    /// left by a partial accept trails the target and a walk from `n` would be refused. The
+    /// save on the engine stream and the one on a lane are each refused by name, nothing
+    /// enqueued.
+    fn past_refused(m: &mut Qwen38Model, prompt: &[u32], n: u32) -> Result<bool, GateError> {
+        overwrite_store(m, prompt, n as usize + 1, 1)?;
         let (gdn, qsa) = (cfg().shape.n_gdn(), cfg().shape.n_qsa());
         let lane = m.seq_lane(seq38_bytes(gdn, qsa, n as usize, true))?;
-        let got = m
-            .seq_save_async(&lane)
-            .err()
-            .map_or_else(|| "ran".to_owned(), |e| e.to_string());
         let want = format!(
             "a state at {n} of a draft store that holds {} positions",
             n + 1
         );
-        let ok = got.contains(&want);
-        println!(
-            "(sl) a lane save of a store walked past the state's {n} positions: {got} {}",
-            verdict(ok)
+        let sync = refused(
+            "a snapshot of a store past the position",
+            m.seq_save(),
+            &want,
         );
-        Ok(ok)
+        let on_lane = refused(
+            "a lane save of a store past the position",
+            m.seq_save_async(&lane),
+            &want,
+        );
+        Ok(sync && on_lane)
     }
 
     /// The draft's store rows at positions `0..n` written by store walks of other ids (the
@@ -5001,42 +5059,105 @@ mod gate {
         Ok(vec![first, next])
     }
 
-    /// (i) the width chooser's held pass right after the server's cut step
-    /// (a request's prompt call, then its last id as the seat's first step,
-    /// [`start`]): the chooser walks the draft's waiting rows first
-    /// ([`Draft::before_plain`], the call `runtime::width`'s `Choosing`
-    /// makes on the plain pass its `propose` returns), then the target
-    /// steps and the draft hears of it through [`Draft::held`] — the step
-    /// overwrites the arena the anchor read only after the walk, so the
-    /// held pass takes the position in instead of refusing, the store
-    /// never holds a position past the target's, and the drafted ids after
-    /// it stay the plain run's.
-    fn held_after_cut(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
-        const N: usize = 8;
-        let ctx = m.body("held after the cut")?.ctx() as u32;
-        let (m, plain, _) = plain_to(m, prompt, Prompt38::Auto, N)?;
+    /// A plain pass of the width chooser's: a pass its `propose` returns no
+    /// verify for, as `runtime::width`'s `Choosing` runs it.
+    #[derive(Clone, Copy)]
+    enum PlainPass {
+        /// (i) a held pass right after the server's cut step (a request's
+        /// prompt call, then its last id as the seat's first step,
+        /// [`start`]): the draft's waiting rows walked first
+        /// ([`Draft::before_plain`]), then the target's step, which
+        /// overwrites the arena the anchor read only after the walk.
+        Held,
+        /// (v) a window no verify takes (the chooser's shadow, or the window
+        /// its closing gate cuts to no id), after `begin` and after a
+        /// drafted pass from the prompt's anchor: the draft's chain, its
+        /// proposal dropped ([`Draft::unproposed`]), then the target's step,
+        /// which walks no row of the prompt call's arena (`begin` took its
+        /// anchor) and finds the chain's own rows taken back.
+        Dropped,
+    }
+
+    /// The chooser's plain pass `plain`, then the draft told through
+    /// [`Draft::held`]: told without a refusal, the draft's store at the
+    /// target's position, a snapshot there, and the drafted ids after it
+    /// the plain run's.
+    fn chooser_plain(
+        m: Qwen38Model,
+        prompt: &[u32],
+        plain: PlainPass,
+    ) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 12;
+        const WIDTH: usize = <app::mtp::MtpDraft<Body38> as Draft<app::Session<Body38>>>::WIDTH;
+        let ctx = m.body("the chooser's plain pass")?.ctx() as u32;
+        let (m, plain_ids, _) = plain_to(m, prompt, Prompt38::Auto, N)?;
         let mut s = app::Session::from_model(m, ctx);
-        let mut d = fresh_draft(&s)?;
-        let mut out = start(&mut s, &mut d, prompt)?;
-        // The chooser-held pass as the width chooser's propose runs it: the
-        // hook walks the anchor the cut step recorded, then the target
-        // steps (overwriting that arena), then the draft is told through
-        // Draft::held.
-        let last = *out.last().ok_or("no token after the cut step")?;
-        Draft::before_plain(&mut d, &mut s, last)?;
-        let next = Target::step(&mut s, last, Want::Argmax)?.argmax();
-        Draft::held(&mut d, &mut s, last, next)?;
-        out.push(next);
-        let mut spec = Spec38::new(d);
-        while out.len() < N {
-            one_pass(&mut s, &mut spec, &mut out)?;
+        let (label, cases): (&str, &[(&str, bool)]) = match plain {
+            PlainPass::Held => ("(i) the held pass", &[("the cut step", false)]),
+            PlainPass::Dropped => (
+                "(v) a window no verify takes",
+                &[("begin", false), ("a drafted pass", true)],
+            ),
+        };
+        let mut ok = true;
+        for &(after, drafted) in cases {
+            let mut spec = Spec38::new(fresh_draft(&s)?);
+            let mut out = match plain {
+                PlainPass::Held => start(&mut s, spec.draft_mut(), prompt)?,
+                PlainPass::Dropped => {
+                    s.reset()?;
+                    let first = Advance::prompt(&mut spec, &mut s, prompt)?;
+                    Advance::begin(&mut spec, &s, prompt, first)?;
+                    vec![first]
+                }
+            };
+            if drafted {
+                one_pass(&mut s, &mut spec, &mut out)?;
+            }
+            let last = *out.last().ok_or("no token before the plain pass")?;
+            let d = spec.draft_mut();
+            let told = (|| -> Result<u32, app::SessionError> {
+                match plain {
+                    PlainPass::Held => Draft::before_plain(d, &mut s, last)?,
+                    PlainPass::Dropped => {
+                        Draft::propose(d, &mut s, last, &mut [0u32; WIDTH])?;
+                        Draft::<app::Session<Body38>>::unproposed(d);
+                    }
+                }
+                let next = Target::step(&mut s, last, Want::Argmax)?.argmax();
+                Draft::held(d, &mut s, last, next)?;
+                Ok(next)
+            })();
+            let pos = s.pos() as usize;
+            let held = held_of(s.model())?;
+            let saved = s.model_mut().seq_save().map(|st| st.positions() as usize);
+            let told_ok = told.is_ok();
+            if let Ok(next) = &told {
+                out.push(*next);
+                while out.len() < N {
+                    one_pass(&mut s, &mut spec, &mut out)?;
+                }
+            }
+            let ids_ok = told_ok && out[..N] == plain_ids[..N];
+            let saved_ok = matches!(&saved, Ok(n) if *n == pos);
+            println!(
+                "{label} after {after}: the step told {} {}; the draft store at {held} of the \
+                 target's {pos} {}; a snapshot there {} {}; the ids the plain run's {}",
+                match &told {
+                    Ok(_) => "ok".to_string(),
+                    Err(e) => e.to_string(),
+                },
+                verdict(told_ok),
+                verdict(held == pos),
+                match &saved {
+                    Ok(n) => format!("{n} positions"),
+                    Err(e) => e.to_string(),
+                },
+                verdict(saved_ok),
+                verdict(ids_ok)
+            );
+            ok &= told_ok && held == pos && saved_ok && ids_ok;
         }
-        let ok = out[..N] == plain[..N];
-        println!(
-            "(i) the held pass after the cut step: {} ids, the plain run's {}",
-            out.len(),
-            verdict(ok)
-        );
         Ok((s.into_model(), ok))
     }
 
@@ -5863,11 +5984,16 @@ mod gate {
         ok &= c_ok;
         ok &= arena_holds(&mut m, &prompt)?;
         tier::sc("(p) a partial accept's records")?;
+        let (m, partial_ok) = partial_state(m, &prompt, draft_kv)?;
+        ok &= partial_ok;
         let (model, p_ok) = kept_state(m, &prompt)?;
         ok &= p_ok;
         tier::sc("(i) the width chooser's held pass after the server's cut step")?;
-        let (model, i_ok) = held_after_cut(model, &prompt)?;
+        let (model, i_ok) = chooser_plain(model, &prompt, PlainPass::Held)?;
         ok &= i_ok;
+        tier::sc("(v) a window no verify takes: no stale walk, the draft store at the step")?;
+        let (model, v_ok) = chooser_plain(model, &prompt, PlainPass::Dropped)?;
+        ok &= v_ok;
         tier::sc("(x) a resume of a state without the draft's side is refused")?;
         let (model, x_ok) = resume_refused(model, &inputs, ub, &prompt)?;
         ok &= x_ok;
