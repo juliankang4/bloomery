@@ -145,10 +145,11 @@ pub(super) struct Gdn38 {
     /// The q·k·v channels and `z`.
     pub(super) x: DeviceBuffer<f32>,
     pub(super) z: DeviceBuffer<f32>,
-    /// The joined β·α gemv's output, row-major `[2·n_v][m]` (β's rows
-    /// first): at one row it is β then α, which the conv reads in place.
+    /// The joined β·α gemv's output at one row, β's values then α's, which
+    /// the conv reads in place.
     pub(super) ba: DeviceBuffer<f32>,
-    /// β and α token-major, copied out of `ba` at more than one row.
+    /// β and α token-major at more than one row, each the gemv of its own
+    /// rows of the joined weight.
     pub(super) b: DeviceBuffer<f32>,
     pub(super) a: DeviceBuffer<f32>,
     pub(super) conv: DeviceBuffer<f32>,
@@ -168,9 +169,8 @@ pub(super) struct Qsa38 {
     /// The flash's partials, over a list's width.
     pub(super) part_v: DeviceBuffer<f32>,
     pub(super) part_ms: DeviceBuffer<f32>,
-    /// The indexer's raw keys and queries, row-major as the f32 gemv writes
-    /// them (`[IDX_DIM][m]`, `[IDX_HEADS·IDX_DIM][m]`), and the queries
-    /// token-major, copied out at more than one row.
+    /// The indexer's raw keys and queries, token-major: the queries in `qr`
+    /// at one row and in `qi` past it.
     pub(super) kr: DeviceBuffer<f32>,
     pub(super) qr: DeviceBuffer<f32>,
     pub(super) qi: DeviceBuffer<f32>,

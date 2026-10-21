@@ -451,7 +451,11 @@ mod gate {
     /// the go, the wait and the head (its mix's three, one q8_0 gemv over
     /// every row, one argmax) are one each whatever the rows:
     /// 1151 + 36·2 + 12·1.
-    const REAL_NODES_VERIFY: usize = 1235;
+    /// PIN(2026-10-22): the site writes every dense projection token-major, so
+    /// no copy is left: at more than one row each delta layer adds one launch
+    /// (the joined β·α projection as β's rows and α's rows) and a selecting
+    /// layer none: 1151 + 36·1.
+    const REAL_NODES_VERIFY: usize = 1187;
 
     /// PIN(2026-10-05): the nodes one more busy slot adds to a captured pass
     /// of several slots' rows, derived before the pass was built: the
@@ -485,8 +489,9 @@ mod gate {
     /// 1151 + 5·43 and 1235 + 5·43.
     /// PIN(2026-10-01): over the 48 card layers, the same five launches on
     /// each whatever its types: 1151 + 5·48 and 1235 + 5·48.
+    /// PIN(2026-10-22): the verify's [`REAL_NODES_VERIFY`]: 1187 + 5·48.
     const REAL_NODES_DECODE_CARD: usize = 1391;
-    const REAL_NODES_VERIFY_CARD: usize = 1475;
+    const REAL_NODES_VERIFY_CARD: usize = 1427;
 
     // PIN(2026-10-11): the split prompt walk moves none of the counts
     // above: it orders the eager ubatch walk's parts (`GROUP_WALK_ORDER`), and

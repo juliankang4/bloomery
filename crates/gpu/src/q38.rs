@@ -15,8 +15,8 @@
 //!   quantizer's (`route_core::sigmoid`); the output projection reads the f32
 //!   product (its weights are Q8_0 with f32 activations).
 //! - [`q38_kernels::qsa_key_append`] — one thread per value: the indexer's
-//!   raw key, `DIM` values a row of the `f32_gemv` output (row-major `[DIM]
-//!   [m]`), rounded once to f16 into the raw plane at the row's position.
+//!   raw key, `DIM` values a row of the key projection (token-major `[m]
+//!   [DIM]`), rounded once to f16 into the raw plane at the row's position.
 //! - [`q38_kernels::q38_shared_add`] — one thread per value: `hsum + sh · w`,
 //!   the shared expert's output times its gate weight (the router's last slot)
 //!   rounded, then added to the host tier's routed sum and rounded — ggml's
@@ -341,12 +341,12 @@ mod q38_kernels {
         }
     }
 
-    /// Row `c` of `m` indexer keys — value `r` at `kr[r·m + c]`, the f32
-    /// gemv's row-major output — rounded once to f16 into the raw plane's
-    /// row `pos[c]`, [`DIM`] values a row. A position at or past `ctx`
-    /// raises [`FaultSite::CachePos`] and writes nothing; a value that is not
-    /// finite after its rounding raises [`FaultSite::PoolSelect`] and is
-    /// written.
+    /// Row `c` of `m` indexer keys — value `r` at `kr[c·DIM + r]`, the key
+    /// projection's token-major output — rounded once to f16 into the raw
+    /// plane's row `pos[c]`, [`DIM`] values a row. A position at or past
+    /// `ctx` raises [`FaultSite::CachePos`] and writes nothing; a value that
+    /// is not finite after its rounding raises [`FaultSite::PoolSelect`] and
+    /// is written.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -367,9 +367,9 @@ mod q38_kernels {
             return;
         }
         let (c, r) = (i / DIM, i % DIM);
-        // SAFETY: c < m, so c < pos.len() and r·m + c < DIM·m <= kr.len(), by
+        // SAFETY: i = c·DIM + r < DIM·m <= kr.len() and c < m <= pos.len(), by
         // the launch contract.
-        let (p, x) = unsafe { (*pos.get_unchecked(c), *kr.get_unchecked(r * m as usize + c)) };
+        let (p, x) = unsafe { (*pos.get_unchecked(c), *kr.get_unchecked(i)) };
         if p >= ctx {
             if r == 0 {
                 fault.raise(FaultSite::CachePos);
@@ -989,7 +989,7 @@ pub struct OutGateArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
-/// [`Q38Kernels::enqueue_key_append`]'s arguments: the f32 gemv's `[DIM][m]`
+/// [`Q38Kernels::enqueue_key_append`]'s arguments: the projection's `[m][DIM]`
 /// raw keys and the `m` rows' positions, the plane's `ctx` rows, and the
 /// layer's raw plane.
 pub struct KeyAppendArgs<'a> {
@@ -1154,7 +1154,7 @@ impl Q38Kernels {
     }
 
     /// Enqueue the raw key append of `m` rows ([`KeyAppendArgs`], module
-    /// doc): `kr` the f32 gemv's `[DIM][m]` output, `pos` the rows'
+    /// doc): `kr` the projection's `[m][DIM]` output, `pos` the rows'
     /// positions, `raw` the layer's `[ctx][DIM]` f16 plane. One launch.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_key_append(

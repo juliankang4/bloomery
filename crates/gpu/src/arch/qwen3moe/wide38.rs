@@ -166,6 +166,7 @@ use crate::host::handoff::Places;
 use crate::host::prompt_stream::PromptStream;
 use crate::host::run::HostRun;
 use crate::host::xstream::{GROUP_WALK_ORDER, LandBatch, RingLayer};
+use crate::kquant::Act;
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
@@ -178,9 +179,8 @@ use crate::q38::{
 };
 use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
-use crate::site::{self, WideIn, WideKernels};
+use crate::site::{self, Gated, GatedIo, SiteWeight, SwigluRows, WideIn, WideKernels};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
-use crate::weights::DevWeight;
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use runtime::hc_gated::Geometry;
@@ -1358,9 +1358,6 @@ pub(super) struct Wide38 {
     act_attn: GemmAct32,
     act_ff: GemmAct32,
     hc: HcWideScratch,
-    /// The indexer keys token-major, as the tile writes them, before their
-    /// copy into the append's layout.
-    kr: DeviceBuffer<f32>,
     /// Every token's `N_USED + 1` slots: the routed ids and weights the
     /// download reads, the shared expert's weight the gated sum reads.
     ids: DeviceBuffer<u32>,
@@ -1424,7 +1421,6 @@ impl Wide38 {
             act_attn: GemmAct32::new(stream, rows, geo::ATTN)?,
             act_ff: GemmAct32::new(stream, rows, geo::FF)?,
             hc: HcWideScratch::new(stream, geometry, rows)?,
-            kr: DeviceBuffer::zeroed(stream, rows * geo::IDX_DIM)?,
             ids: DeviceBuffer::zeroed(stream, rows * slots)?,
             weights: DeviceBuffer::zeroed(stream, rows * slots)?,
             taps: None,
@@ -1474,7 +1470,6 @@ impl Wide38 {
             + self.act_attn.bytes()
             + self.act_ff.bytes()
             + self.hc.bytes()
-            + self.kr.num_bytes()
             + self.ids.num_bytes()
             + self.weights.num_bytes()
             + self.card.as_ref().map_or(0, CardRoute38::bytes)
@@ -1552,37 +1547,30 @@ fn dense_gemm(
     dense: &GemmRoute,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let x = WideIn {
-        q128: None,
-        q32: Some(act),
-        f32: Some(rows),
-    };
+    let x = wide_in(rows, act);
     site::resident_gemm(c.gpu, &dense_kernels(c), (c.w, name), &x, dense, m, y)
 }
 
-/// The wide tile over rows `at .. at + n` of the F32 or BF16 weight `name`
-/// against the first `m` columns of `x`, token-major: the F32 tile, or the
-/// BF16 tile bit for bit it over the widened values.
-fn rows_tile(
+/// [`dense_gemm`] over rows `at .. at + n` of the dense weight `name` alone
+/// ([`site::resident_gemm_rows`]).
+fn dense_gemm_rows(
     c: &Ctx38<'_>,
-    name: &str,
-    (at, n): (usize, usize),
-    (x, m): (&DeviceBuffer<f32>, usize),
+    (name, part): (&str, (usize, usize)),
+    (rows, act, m): (&DeviceBuffer<f32>, &GemmAct32, usize),
+    dense: &GemmRoute,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let stream = c.gpu.stream();
-    match c.w.get(name) {
-        Some(DevWeight::Bf16 { w, k }) => {
-            let words = k / 2;
-            let part = DeviceTensor::<u32>::window_of(w.buf(), at * words * 4, n, words)?;
-            c.gpu.q8f32().enqueue_bf16_tile(stream, &part, x, m, y)
-        }
-        _ => {
-            let w = f32_tensor(c.w, name)?;
-            let k = w.cols();
-            let part = DeviceTensor::<f32>::window_of(w.buf(), at * k * 4, n, k)?;
-            c.k.g32.enqueue_f32_tile(stream, &part, x, m, y)
-        }
+    let x = wide_in(rows, act);
+    let k = dense_kernels(c);
+    site::resident_gemm_rows(c.gpu, &k, (c.w, name, part), &x, dense, m, y)
+}
+
+/// The f32 rows `rows` and their q8 `act`, the forms a dense site reads.
+fn wide_in<'a>(rows: &'a DeviceBuffer<f32>, act: &'a GemmAct32) -> WideIn<'a> {
+    WideIn {
+        q128: None,
+        q32: Some(act),
+        f32: Some(rows),
     }
 }
 
@@ -1898,12 +1886,12 @@ impl WideParts<'_> {
     }
 
     /// Layer `l`'s shared expert over unit `u`'s `ffn_x` into its `sh_y`:
-    /// gate and up, SwiGLU quantized, down.
+    /// gate and up, the SwiGLU into the form the down reads, down, each at
+    /// its resident type ([`site::gated`]).
     fn shared(&mut self, u: &mut UnitRows38, l: usize) -> Result<(), GpuError> {
         let p = plan_of(self.plans, l)?;
         let sink = self.c.gpu.layer_sink(l)?;
         let (c, m) = (&self.c, u.m);
-        let stream = c.gpu.stream();
         let (s, x) = (&mut *self.s, &mut *self.x);
         let f = &p.ffn;
         quantize_for(
@@ -1913,20 +1901,35 @@ impl WideParts<'_> {
             &mut x.act_hid,
             sink,
         )?;
-        let dense = &x.dense[u.route];
-        let act = (&*u.ffn_x, &x.act_hid, m);
-        dense_gemm(c, &f.gate_sh, act, dense, &mut s.sh_g)?;
-        dense_gemm(c, &f.up_sh, act, dense, &mut s.sh_u)?;
-        // A Q8_0 down reads the SwiGLU's q8, a BF16 one its f32 rows.
-        if let Some(DevWeight::Bf16 { .. }) = c.w.get(&f.down_sh) {
-            c.gpu
-                .elem()
-                .enqueue_swiglu(stream, &s.sh_g, &s.sh_u, geo::FF * m, &mut s.sh_h)?;
-        } else {
-            c.k.g32
-                .enqueue_swiglu_quant32(stream, &s.sh_g, &s.sh_u, m, &mut x.act_ff, sink)?;
-        }
-        dense_gemm(c, &f.down_sh, (&s.sh_h, &x.act_ff, m), dense, &mut u.sh_y)
+        let site = |name| -> Result<_, GpuError> {
+            let ty = site::resident_type(c.w, "qwen38::wide shared", name)?;
+            Ok((ty, SiteWeight::Resident(name)))
+        };
+        let block = Gated {
+            w: c.w,
+            route: &x.dense[u.route],
+            gate: site(&f.gate_sh)?,
+            up: site(&f.up_sh)?,
+            down: site(&f.down_sh)?,
+            ff: geo::FF,
+            hidden: geo::HIDDEN,
+            rule: Act::SiluMul,
+            input: GemmInput::PerSlot,
+        };
+        // The SwiGLU writes the form the down's type reads: the q8 of its
+        // rows, or the f32 rows.
+        let io = GatedIo {
+            x: &wide_in(&u.ffn_x, &x.act_hid),
+            gate: &mut s.sh_g,
+            up: &mut s.sh_u,
+            rows: SwigluRows {
+                q128: None,
+                q32: Some(&mut x.act_ff),
+                f32: Some(&mut s.sh_h),
+            },
+            y: &mut u.sh_y,
+        };
+        site::gated(c.gpu, &dense_kernels(c), &block, (m, m), io, sink)
     }
 
     /// Layer `l`'s card route over unit `u`'s `ffn_x`, when it has card
@@ -2123,15 +2126,17 @@ fn gdn(
         attn,
         ..
     } = s;
-    quantize_for(c, &[&gp.qkv, &gp.z], (mixed, m), &mut x.act_hid, sink)?;
+    let names = [&*gp.qkv, &gp.z, &gp.beta_alpha];
+    quantize_for(c, &names, (mixed, m), &mut x.act_hid, sink)?;
     let dense = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
     dense_gemm(c, &gp.qkv, act, dense, &mut g.x)?;
     dense_gemm(c, &gp.z, act, dense, &mut g.z)?;
     // The joined stack is `2·nv` rows (`plan38::plans` refuses another shape
     // at load), β's rows first and α's next.
-    rows_tile(c, &gp.beta_alpha, (0, nv), (mixed, m), &mut g.b)?;
-    rows_tile(c, &gp.beta_alpha, (nv, nv), (mixed, m), &mut g.a)?;
+    let ba = &gp.beta_alpha;
+    dense_gemm_rows(c, (ba, (0, nv)), act, dense, &mut g.b)?;
+    dense_gemm_rows(c, (ba, (nv, nv)), act, dense, &mut g.a)?;
     let lin = &c.k.linear;
     lin.conv.enqueue_conv_prep(
         stream,
@@ -2217,18 +2222,14 @@ fn qsa(
         attn,
         ..
     } = s;
-    quantize_for(c, &[&qp.q, &qp.k, &qp.v], (mixed, m), &mut x.act_hid, sink)?;
+    let names = [&*qp.q, &qp.k, &qp.v, &qp.idx_k, &qp.idx_q];
+    quantize_for(c, &names, (mixed, m), &mut x.act_hid, sink)?;
     let table = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
     dense_gemm(c, &qp.q, act, table, &mut q.qg)?;
     dense_gemm(c, &qp.k, act, table, &mut q.k)?;
     dense_gemm(c, &qp.v, act, table, &mut q.v)?;
-    rows_tile(c, &qp.idx_k, (0, geo::IDX_DIM), (mixed, m), &mut x.kr)?;
-    // The append reads the keys row-major (`[IDX_DIM][m]`, the gemv's
-    // layout): the tile's `[m][IDX_DIM]` turned.
-    c.k.proj
-        .token_major
-        .enqueue(stream, &x.kr, m, geo::IDX_DIM, &mut q.kr)?;
+    dense_gemm(c, &qp.idx_k, act, table, &mut q.kr)?;
     c.k.q38.enqueue_key_append(
         stream,
         KeyAppendArgs {
@@ -2254,8 +2255,7 @@ fn qsa(
             pooled: &mut *pooled,
         },
     )?;
-    let idx_q_rows = geo::IDX_HEADS * geo::IDX_DIM;
-    rows_tile(c, &qp.idx_q, (0, idx_q_rows), (mixed, m), &mut q.qi)?;
+    dense_gemm(c, &qp.idx_q, act, table, &mut q.qi)?;
     // The selecting store is f16 (the qwen38 family's stores carry no q8_0
     // form), so the family's shared append runs its f16 arm.
     let (kcache, vcache) = kv.f16_mut("qwen38::wide")?;

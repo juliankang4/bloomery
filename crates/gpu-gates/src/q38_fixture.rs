@@ -19,10 +19,11 @@ const QSA_LAYER_LAUNCHES: usize = 6 + 14 + 9;
 const PLE_SITE_LAUNCHES: usize = 5;
 /// Launches of the head: its mix's three, the q8_0 gemv and the argmax.
 const HEAD_LAUNCHES: usize = 5;
-/// Nodes a verify of more than one row adds on a delta layer (β and α out of the joined
-/// projection, two token-major copies) and on a selecting layer (the indexer queries, one).
-const VERIFY_GDN_EXTRA: usize = 2;
-const VERIFY_QSA_EXTRA: usize = 1;
+/// Nodes a verify of more than one row adds on a delta layer: the joined β·α projection runs as
+/// β's rows and α's rows, one launch each. A selecting layer adds none.
+/// PIN(2026-10-22): the token-major copies and the indexer's extra launch are gone, so a delta layer
+/// adds one launch (two before) and a selecting layer none (one before).
+const VERIFY_GDN_EXTRA: usize = 1;
 /// Launches bound to one sequence on a selecting layer, and on a delta layer (its conv and delta
 /// step); a captured pass of several slots' rows repeats them for each busy slot.
 const SLOT_QSA_LAUNCHES: usize = 8;
@@ -129,7 +130,7 @@ impl Shape {
     /// The captured verify's nodes at 2, 3 and 4 rows.
     #[must_use]
     pub fn nodes_verify(&self) -> usize {
-        self.nodes_decode() + self.n_gdn() * VERIFY_GDN_EXTRA + self.n_qsa() * VERIFY_QSA_EXTRA
+        self.nodes_decode() + self.n_gdn() * VERIFY_GDN_EXTRA
     }
 
     /// The nodes one more busy slot adds to a captured pass of several slots' rows: the
@@ -173,20 +174,20 @@ mod tests {
         assert_eq!((real.n_qsa(), real.n_gdn()), (12, 36));
         assert_eq!(real.nodes_decode(), 1151);
         assert_eq!(real.memops(), 96);
-        assert_eq!(real.nodes_verify(), 1235);
+        assert_eq!(real.nodes_verify(), 1187);
         assert_eq!(real.nodes_slot(), 171);
         assert_eq!(real.nodes_decode_card(48), 1391);
-        assert_eq!(real.nodes_verify_card(48), 1475);
+        assert_eq!(real.nodes_verify_card(48), 1427);
         assert_eq!((real.memops_card(0), real.memops_card(48)), (96, 0));
         let fix = Shape::from_header(4, 2, Some(2), Some(248_056)).expect("fixture");
         assert_eq!(fix.qsa, [1, 3]);
         assert_eq!((fix.n_qsa(), fix.n_gdn()), (2, 2));
         assert_eq!(fix.nodes_decode(), 1 + 2 * 22 + 2 * 29 + 5 + 5);
         assert_eq!(fix.nodes_decode(), 113);
-        assert_eq!(fix.nodes_verify(), 119);
+        assert_eq!(fix.nodes_verify(), 115);
         assert_eq!(fix.nodes_slot(), 23);
         assert_eq!(fix.nodes_decode_card(4), 133);
-        assert_eq!(fix.nodes_verify_card(4), 139);
+        assert_eq!(fix.nodes_verify_card(4), 135);
     }
 
     /// A header no gate can read a shape from is a named error, and a file with no PLE site has

@@ -13,7 +13,9 @@
 //! the streams before its mix.
 
 use super::router::RouterDims;
+use crate::hc_gated::HcMatrix;
 use crate::linear::{self, KHeadMap, LinearShape};
+use crate::site::{self as dense, SiteTy};
 use crate::weights::{DevWeight, Weights};
 use crate::{GpuError, flash_gqa, ple, q38, qsa};
 use model::arch::coverage::turns_as_neox;
@@ -398,18 +400,19 @@ fn gqa_fits(g: &Gqa) -> bool {
 }
 
 /// Every layer's plan from its kind, `ple` the PLE site's layer, each weight
-/// checked against the geometry: type and shape. A dense projection is Q8_0
-/// (the q8f32 planes) or BF16 (its words), each tensor's own: the walks pick
-/// its site by the resident form. The gains, the conv, the injects, the
-/// router and the joined β·α stack are F32 (the load widens a BF16 one,
-/// `ModelTensors::bf16_words`); the indexer's projections F32 or BF16.
+/// checked against the geometry: type and shape. A dense projection, the
+/// indexer's two and the joined β·α stack among them, is of a type the
+/// common site launches by name (`site::BY_NAME`), each tensor's own: the
+/// walks pick its launch by the resident form. An HC matrix is one
+/// `HcMatrix::of` reads. The gains, the conv, the injects and the router are
+/// F32 (the load widens a BF16 one, `ModelTensors::bf16_words`).
 pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Layer38>, GpuError> {
     use geo::{ATTN, EXPERTS, FF, HEAD, HIDDEN, IDX_DIM, IDX_HEADS, KV, Q_ROWS, RANK, STREAMS};
     let wide = STREAMS * HIDDEN;
     let check_site = |s: &HcSite| -> Result<(), GpuError> {
         f32_len(w, &s.norm, wide)?;
-        dense_shape(w, &s.down, RANK, wide)?;
-        dense_shape(w, &s.up, wide, RANK)?;
+        hc_shape(w, &s.down, RANK, wide)?;
+        hc_shape(w, &s.up, wide, RANK)?;
         if let Some(inj) = &s.inject {
             f32_shape(w, inj, STREAMS, wide)?;
         }
@@ -435,7 +438,7 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                     let (c, nv) = (GDN.channels(), GDN.n_v);
                     dense_shape(w, &p.qkv, c, HIDDEN)?;
                     dense_shape(w, &p.z, nv * linear::HEAD, HIDDEN)?;
-                    f32_shape(w, &p.beta_alpha, 2 * nv, HIDDEN)?;
+                    dense_shape(w, &p.beta_alpha, 2 * nv, HIDDEN)?;
                     f32_len(w, &p.conv, c * linear::CONV_TAPS)?;
                     f32_len(w, &p.dt_bias, nv)?;
                     f32_len(w, &p.ssm_a, nv)?;
@@ -462,8 +465,8 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                     f32_len(w, &p.q_norm, HEAD)?;
                     f32_len(w, &p.k_norm, HEAD)?;
                     dense_shape(w, &p.out, HIDDEN, ATTN)?;
-                    f32_rows_shape(w, &p.idx_k, IDX_DIM, HIDDEN)?;
-                    f32_rows_shape(w, &p.idx_q, IDX_HEADS * IDX_DIM, HIDDEN)?;
+                    dense_shape(w, &p.idx_k, IDX_DIM, HIDDEN)?;
+                    dense_shape(w, &p.idx_q, IDX_HEADS * IDX_DIM, HIDDEN)?;
                     f32_len(w, &p.idx_k_norm, IDX_DIM)?;
                     f32_len(w, &p.idx_q_norm, IDX_DIM)?;
                     Mixer38::Qsa(p)
@@ -515,64 +518,34 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
         .collect()
 }
 
-/// The resident weight `name` in one of `forms` (by [`DevWeight`]'s
-/// variant), `rows` rows of `k` values; another form or shape is refused by
-/// name, `want` naming the forms.
-fn shape_in(
-    w: &Weights,
-    name: &str,
-    (rows, k): (usize, usize),
-    forms: fn(&DevWeight) -> bool,
-    want: &'static str,
-) -> Result<(), GpuError> {
-    match w.get(name) {
-        Some(t) if forms(t) && t.rows() == rows && t.k() == k => Ok(()),
-        Some(t) if forms(t) => Err(GpuError::shape(
+/// The resident weight `name`, `rows` rows of `k` values, of a type the
+/// common dense site launches by name on both walks (`site::BY_NAME`).
+fn dense_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
+    dense::resident_site(w, WHAT, name, (rows, k), &dense::BY_NAME).map(drop)
+}
+
+/// The resident HC matrix `name` in a form `HcMatrix::of` reads, `rows`
+/// rows of `k` values; another form or shape is refused by name.
+fn hc_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
+    let got = HcMatrix::of(w, WHAT, name)?
+        .shape()
+        .map_err(|e| GpuError::shape(WHAT, format!("{name}: {e}")))?;
+    if got == (rows, k) {
+        Ok(())
+    } else {
+        Err(GpuError::shape(
             WHAT,
             format!(
                 "{name} is {} rows of {}, the kernels read {rows} of {k}",
-                t.rows(),
-                t.k()
+                got.0, got.1
             ),
-        )),
-        Some(_) => Err(GpuError::tensor(WHAT, name, want)),
-        None => Err(GpuError::tensor(WHAT, name, "resident")),
+        ))
     }
-}
-
-/// The resident Q8_0 planes or BF16 words of `name`, `rows` rows of `k`
-/// values: a dense projection the common site reads.
-pub(super) fn dense_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
-    shape_in(
-        w,
-        name,
-        (rows, k),
-        |t| matches!(t, DevWeight::Q8_0 { .. } | DevWeight::Bf16 { .. }),
-        "Q8_0 (the q8f32 planes) or BF16 (its words)",
-    )
-}
-
-/// The resident F32 plane or BF16 words of `name`, `rows` rows of `k`: a
-/// projection the F32 gemv and tile read, or their BF16 pair.
-fn f32_rows_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
-    shape_in(
-        w,
-        name,
-        (rows, k),
-        |t| matches!(t, DevWeight::F32 { .. } | DevWeight::Bf16 { .. }),
-        "F32 or BF16",
-    )
 }
 
 /// The resident F32 plane of `name`, `rows` rows of `k`; refused otherwise.
 fn f32_shape(w: &Weights, name: &str, rows: usize, k: usize) -> Result<(), GpuError> {
-    shape_in(
-        w,
-        name,
-        (rows, k),
-        |t| matches!(t, DevWeight::F32 { .. }),
-        "F32",
-    )
+    dense::site(w, WHAT, name, (rows, k), SiteTy::F32)
 }
 
 /// The resident F32 plane of `name`, `len` values in all; refused otherwise.
