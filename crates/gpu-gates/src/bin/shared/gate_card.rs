@@ -4,9 +4,9 @@
 //! under `BLOOMERY_GATE_CARD`); the fixture tier plans on `a`, the largest visible card as the
 //! device reports itself (`--place a`), its free bytes included. The card spec keeps every byte of
 //! `RTX_3090` in the real tier and takes the visible card's name, by which the open finds the
-//! device, so on the 3090 the machine is `plan_gate`'s exactly and on the A6000 it plans the
-//! 3090's usable bytes. A census of other than one visible card, or a card no name of `CARDS`
-//! matches, is refused by name before any load.
+//! device, so on the 3090 the machine is `plan_gate`'s exactly and on the A6000 or RTX 5090 it
+//! plans the 3090's usable bytes. A census of other than one visible card, or a card outside
+//! the named workstation cards and RTX 5090, is refused by name before any load.
 
 use std::sync::OnceLock;
 
@@ -21,7 +21,7 @@ static CARD: OnceLock<CardSpec> = OnceLock::new();
 /// own name.
 ///
 /// # Errors
-/// A census of other than one visible card, or a card none of `CARDS` matches.
+/// A census of other than one visible card, or a card outside the named gate cards.
 fn census() -> Result<CardSpec, GateError> {
     let census = bloomery_gpu::census()?;
     let [device] = census.as_slice() else {
@@ -33,16 +33,16 @@ fn census() -> Result<CardSpec, GateError> {
         )
         .into());
     };
-    let name = CARDS
-        .iter()
-        .find(|c| device.name.contains(c.name))
-        .map(|c| c.name)
+    let names = CARDS.map(|c| c.name).into_iter().chain(["5090"]);
+    let name = names
+        .clone()
+        .find(|&name| device.name.contains(name))
         .ok_or_else(|| {
             format!(
                 "the visible card {} is none of this workstation's cards ({}): the gate plan \
                  opens its card by name",
                 device.name,
-                CARDS.map(|c| c.name).join(", ")
+                names.collect::<Vec<_>>().join(", ")
             )
         })?;
     Ok(CardSpec { name, ..RTX_3090 })
