@@ -76,8 +76,6 @@ use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
 use crate::hybrid::HOST;
 use crate::q8f32::{Bf16Words, RowValues};
 use crate::route_core::sigmoid;
-use crate::tensor::DeviceTensor;
-use crate::weights::{DevWeight, Weights};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
@@ -871,36 +869,8 @@ mod q38_kernels {
     }
 }
 
-/// A resident matrix as the embedding lookup ([`Q38Kernels::enqueue_embed_rows`])
-/// and the hyper-connection sites read it: Q8_0 planes or BF16 words.
-#[derive(Clone, Copy)]
-pub enum EmbedRows<'a> {
-    Q8_0 {
-        qs: &'a DeviceTensor<u32>,
-        d: &'a DeviceTensor<u16>,
-    },
-    Bf16(&'a DeviceTensor<u32>),
-}
-
-impl<'a> EmbedRows<'a> {
-    /// The resident table `name` of `w` as the lookup reads it; another
-    /// format is refused by name as `what`'s.
-    pub fn of(w: &'a Weights, what: &'static str, name: &str) -> Result<Self, GpuError> {
-        let dw = w.resident(what, name)?;
-        Self::of_weight(dw).ok_or_else(|| GpuError::tensor(what, name, "Q8_0 planes or BF16 words"))
-    }
-
-    /// The resident table `dw` as the lookup reads it; `None` for another
-    /// format.
-    #[must_use]
-    pub fn of_weight(dw: &'a DevWeight) -> Option<Self> {
-        match dw {
-            DevWeight::Q8_0 { qs, d, .. } => Some(EmbedRows::Q8_0 { qs, d }),
-            DevWeight::Bf16 { w, .. } => Some(EmbedRows::Bf16(w)),
-            _ => None,
-        }
-    }
-}
+/// The embedding table as [`Q38Kernels::enqueue_embed_rows`] reads it.
+pub use crate::hc_gated::HcMatrix as EmbedRows;
 
 /// [`Q38Kernels::enqueue_embed_rows`]'s arguments: the table, one unit's
 /// ids, the word holding the first position of the input the ids are a

@@ -74,6 +74,7 @@ use crate::q8f32::{
 };
 use crate::tensor::DeviceTensor;
 use crate::view::{Elem, StreamFma};
+use crate::weights::{DevWeight, Weights};
 use crate::{GpuError, launch_u32, store_cols};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
@@ -1138,10 +1139,35 @@ pub struct SiteWeights<'a> {
     pub inject: Option<&'a DeviceTensor<f32>>,
 }
 
-/// A site's Q8_0 planes or BF16 words, shared with the embedding reader.
-pub use crate::q38::EmbedRows as HcMatrix;
+/// A resident matrix as a site's down or up and the embedding lookup read
+/// it: Q8_0 planes or BF16 words.
+#[derive(Clone, Copy)]
+pub enum HcMatrix<'a> {
+    Q8_0 {
+        qs: &'a DeviceTensor<u32>,
+        d: &'a DeviceTensor<u16>,
+    },
+    Bf16(&'a DeviceTensor<u32>),
+}
 
-impl HcMatrix<'_> {
+impl<'a> HcMatrix<'a> {
+    /// The resident matrix `name` of `w`; another format is refused by name
+    /// as `what`'s.
+    pub fn of(w: &'a Weights, what: &'static str, name: &str) -> Result<Self, GpuError> {
+        let dw = w.resident(what, name)?;
+        Self::of_weight(dw).ok_or_else(|| GpuError::tensor(what, name, "Q8_0 planes or BF16 words"))
+    }
+
+    /// The resident matrix `dw`; `None` for another format.
+    #[must_use]
+    pub fn of_weight(dw: &'a DevWeight) -> Option<Self> {
+        match dw {
+            DevWeight::Q8_0 { qs, d, .. } => Some(HcMatrix::Q8_0 { qs, d }),
+            DevWeight::Bf16 { w, .. } => Some(HcMatrix::Bf16(w)),
+            _ => None,
+        }
+    }
+
     /// Its rows and row width, or what is wrong with its planes.
     pub(crate) fn shape(&self) -> Result<(usize, usize), String> {
         match *self {

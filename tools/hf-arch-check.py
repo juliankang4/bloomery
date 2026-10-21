@@ -210,7 +210,7 @@ TYPE_PLACES = {
                ("crates/placement/src/accepts.rs", "pub const fn qwen38_down(ty: GgmlType)"),
                ("crates/gpu/src/arch/qwen3moe/plan38.rs",
                 "pub(super) fn dense_shape(w: &Weights, name: &str, rows: usize, k: usize)"),
-               ("crates/gpu/src/q38.rs", "pub fn of_weight(dw: &'a DevWeight) -> Option<Self>"),
+               ("crates/gpu/src/hc_gated.rs", "pub fn of_weight(dw: &'a DevWeight) -> Option<Self>"),
                ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "qwen3": (("crates/gpu/src/arch/qwen3moe/body.rs", "g.q_ty = dense_site(w, &g.attn_q, q, h)?;"),
               ("crates/gpu/src/head.rs", "fn head_out_w(w: &Weights)"),
