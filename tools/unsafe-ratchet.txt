@@ -370,7 +370,7 @@ gguf 9 2 0
 # q8_0_gemv_sel_f32's own body held) with each entry's one call (+2), and the planes test's scale read, 8 blocks;
 # fp8_b128_tile_gemm (gemm/kernels32.rs) its shared-memory view and its body call, 2 blocks. Each block has its
 # SAFETY line.
-# PIN(2026-10-20): gpu 1994 -> 2023 blocks, 223 -> 238 fns, new code, not old code relaxed: BF16 weights read in their
+# PIN(2026-10-20): gpu 1994 -> 2023 blocks, 223 -> 236 fns, new code, not old code relaxed: BF16 weights read in their
 # words add 29 blocks and 15 fns, counted on their own diff. q8f32.rs (+11 blocks, +4 fns): the RowValues trait's value
 # read (an unsafe fn declared and implemented for F32 values and BF16 words, one block in each impl), the strided lane
 # walk f32_lane_partials_view (an unsafe fn, its weight and activation reads), and bf16_gemv, bf16_gemv_ids and
@@ -381,7 +381,7 @@ gguf 9 2 0
 # down_inject, up_stage and down_row_end taken out of the Q8_0 entries so the BF16 entries share them, and the BF16 down
 # row and up value (down_row_bf16, up_mix_value_bf16) with their reads and stores; wide38.rs (-1 block). Each block has
 # its SAFETY line.
-# PIN(2026-10-21): gpu 238 -> 236 fns: q38's embedding entries reuse RowValues and Bf16Words, removing
+# PIN(2026-10-21): gpu 223 -> 236 fns: q38's embedding entries reuse RowValues and Bf16Words, removing
 # EmbedTable::value and Bf16Table::value. Q8Table's two plane reads each have one SAFETY block; blocks unchanged.
 gpu 2023 236 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
