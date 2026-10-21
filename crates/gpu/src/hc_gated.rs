@@ -906,7 +906,8 @@ mod hc_kernels {
             return;
         }
         if inject == 1 && b - DOWN_Q8_BLOCKS < DOWN_INJ_BLOCKS {
-            // SAFETY: as in `hc_gated_down_4x320`.
+            // SAFETY: IP is this block's private DOWN_WARPS * MAX_COLS allocation;
+            // every thread calls down_inject, which writes it before its barrier.
             unsafe {
                 let ip = SharedArray::as_raw_mut_ptr(&raw mut IP);
                 down_inject(inj, xn, (hid, m, b - DOWN_Q8_BLOCKS), fault, &mut ipart, ip);
@@ -1029,7 +1030,8 @@ mod hc_kernels {
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
         let hid = hidden as usize;
-        // SAFETY: as in `hc_gated_up_mix_4x320`.
+        // SAFETY: LO is this block's private MAX_COLS * RANK allocation;
+        // up_stage initializes its live slots before the barrier that publishes them.
         let lo_s = unsafe { SharedArray::as_raw_mut_ptr(&raw mut LO) };
         // SAFETY: the launch contract above holds; every thread of the
         // block calls it.
