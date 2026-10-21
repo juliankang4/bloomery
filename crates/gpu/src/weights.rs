@@ -265,7 +265,7 @@ fn part_formats(parts: &[TensorPart<'_>]) -> Result<(Vec<CardFormat>, usize), Gp
             return Err(GpuError::shape(PARTS, format!("{} given twice", t.name)));
         }
         match CardFormat::of(t.ty) {
-            Some(f) if t.ty != GgmlType::NVFP4 && t.ty != GgmlType::F8E4M3_ROWS => formats.push(f),
+            Some(f) if !t.ty.reads_scale() => formats.push(f),
             _ => {
                 return Err(GpuError::shape(
                     PARTS,
@@ -1748,6 +1748,35 @@ mod tests {
         assert!(part_formats(&[part]).is_ok());
     }
 
+    #[test]
+    fn part_formats_follows_the_scale_rule() {
+        for row in gguf::QROWS {
+            let nbytes = gguf::tensor_bytes(row.blck, row.bytes, &[256, 2]).unwrap();
+            let bytes = vec![0u8; usize::try_from(nbytes).unwrap()];
+            let part = TensorPart {
+                info: TensorInfo {
+                    name: "part".into(),
+                    dims: vec![256, 2],
+                    ty: row.ty,
+                    offset: 0,
+                    nbytes,
+                },
+                spans: vec![&bytes],
+            };
+            let result = part_formats(&[part]);
+            if row.card.layout.is_some() && !row.ty.reads_scale() {
+                assert!(result.is_ok(), "{}: {result:?}", row.ty);
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("no part upload takes"),
+                    "{}: {error}",
+                    row.ty
+                );
+            }
+        }
+    }
+
     /// A part list is checked whole before any upload: a name given twice, a derived name, and a
     /// type whose values a tensor scale multiplies are refused by name; distinct parts of types
     /// with a card format pass, their staging bytes summed.
@@ -1779,7 +1808,14 @@ mod tests {
                 "given twice",
             ),
             (vec![part("derived.x", GgmlType::F32)], "derived"),
-            (vec![part("a", GgmlType::NVFP4)], "no part upload takes"),
+            (
+                vec![part("a", GgmlType::F8E4M3_ROWS)],
+                "no part upload takes",
+            ),
+            (
+                vec![part("a", GgmlType::NVFP4_ROWS)],
+                "no part upload takes",
+            ),
         ] {
             let e = part_formats(&bad).map(|_| ()).unwrap_err().to_string();
             assert!(e.contains(says), "{e}");
