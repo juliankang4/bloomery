@@ -164,7 +164,7 @@ DECIDE_ROWS = (
 )
 # The decide seat's backbone body has one owner list of the weight types it launches: crates/gpu/src/arch/qwen3moe/body35.rs
 # (its `const` lists of SiteTy, read at each site by `ty_of` and `routed_ty`). The lists are read from that source each run
-# (body35_lists, SiteTy::Q3K being Q3_K through crates/gpu/src/site.rs:SiteTy::of_ggml), so a type added to one is followed.
+# (body35_lists joins SiteTy::entry in site.rs to the card! dense column in gguf's qtype.rs), so a type added is followed.
 # BODY35_ARCHS are the architectures that body reads (crates/model/src/arch/mod.rs:QWEN35_BODY); BODY35_SITES the tensors
 # each list is read for, by the `ty_of`/`routed_ty` calls of `plan_gqa`, `plan_delta`, `plan_ffn` and `open`; --self-test
 # holds how many calls read each list. A routed layer's stacks and shared expert are read against FFN_READ, their admission
@@ -199,7 +199,7 @@ BODY35_HEAD_TENSOR = "output.weight"
 TYPE_PLACES = {
     "ds41": (("crates/gpu-deepseek41/src/dense.rs", "GgmlType::Q3_K => Ok(Dense::Q3K(t))"),
              ("crates/gpu-deepseek41/src/chain/glue.rs", "let embd_ok = matches!(embd.ty()"),
-             ("crates/placement/src/placement.rs", "pub fn of(ty: GgmlType) -> Option<CardFormat>"),
+             ("crates/gguf/src/card.rs", "pub fn of(ty: GgmlType) -> Option<CardFormat>"),
              ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "glm": (("crates/model/src/arch/place_hybrid.rs", "pub fn card_routed(ty: GgmlType)"),
             ("crates/gpu/src/card_leg.rs", "match kernels::gate_up(st.gate.ty)"),
@@ -552,7 +552,8 @@ def body35_lists(lists=None):
     if lists is None:
         if _BODY35 is None:
             try:
-                _BODY35 = src_body35(Src(BODY35_RS, read_source(BODY35_RS)), Src(SITE_RS, read_source(SITE_RS)))[0]
+                _BODY35 = src_body35(Src(BODY35_RS, read_source(BODY35_RS)), Src(SITE_RS, read_source(SITE_RS)),
+                                     Src(QTYPE_RS, read_source(QTYPE_RS)))[0]
             except SourceError as e:
                 raise Refuse(65, f"the type lists of the decide seat's body cannot be read: {e}")
         lists = _BODY35
@@ -1106,6 +1107,7 @@ DECIDE_SERVE_RS = "crates/serve/src/decide.rs"
 DECIDE_SEAT_RS = "crates/gpu-gates/src/bin/shared/serve_seats/decide.rs"
 QUANT_RS = "crates/gguf/src/quant.rs"
 SITE_RS = "crates/gpu/src/site.rs"
+QTYPE_RS = "crates/gguf/src/qtype.rs"
 RELEASE_RS = {"clef": "crates/decision/src/release/clef.rs", "lev": "crates/decision/src/release/lev.rs"}
 
 
@@ -1496,31 +1498,51 @@ def src_types(quant):
     return out
 
 
-def src_site_names(site):
-    """SiteTy::of_ggml: {SiteTy variant: ggml type name}."""
-    lo, hi = site.one_body("of_ggml")
-    out = {}
-    for pat, (a, b) in site.match_arms(lo, hi, r"\bmatch\s+ty\b"):
-        p = re.fullmatch(r"\s*GgmlType::(\w+)\s*", site.m[pat[0]:pat[1]])
-        if not p:
+def src_site_names(site, qtype):
+    """Join SiteTy::entry to the card! dense column of gguf's type rows."""
+    lo, hi = site.one_body("entry")
+    entry = {}
+    for pat, (a, b) in site.match_arms(lo, hi, r"\bmatch\s+self\b"):
+        p = re.fullmatch(r"\s*SiteTy::(\w+)\s*", site.m[pat[0]:pat[1]])
+        v = re.fullmatch(r"\s*SiteEntry::(\w+)\s*", site.m[a:b])
+        if not p or not v:
+            raise site.err(a, f"an entry arm this tool cannot read: {site.m[a:b].strip()!r}")
+        entry[p.group(1)] = v.group(1)
+    dense = {}
+    for row in re.finditer(r"\bQRow\s*\{\s*ty:\s*T::(\w+)\s*,", qtype.m):
+        hi = qtype.close(qtype.m.index("{", row.start()))
+        card = re.search(r"\bcard:\s*(.*?)\s*,?\s*$", qtype.m[row.end():hi], re.S)
+        if card is None:
+            raise qtype.err(row.start(), f"the {row.group(1)} row has no card column")
+        if card.group(1) == "Card::NONE":
             continue
-        v = re.fullmatch(r"\s*Some\(SiteTy::(\w+)\)\s*", site.m[a:b])
-        if not v:
-            raise site.err(a, f"an of_ggml arm this tool cannot read: {site.m[a:b].strip()!r}")
-        out[v.group(1)] = p.group(1)
+        args = re.fullmatch(r"card!\((.*)\)", card.group(1), re.S)
+        if args is None:
+            raise qtype.err(row.start(), f"the {row.group(1)} row's card is not card! or Card::NONE")
+        words = re.findall(r"\([^()]*\)|[^\s()]+", args.group(1))
+        if len(words) != 8:
+            raise qtype.err(row.start(), f"the {row.group(1)} row's card! has {len(words)} columns, not 8")
+        if words[5] != "-":
+            dense.setdefault(words[5], []).append(row.group(1))
+    out = {}
+    for variant, e in entry.items():
+        tys = dense.get(e, [])
+        if len(tys) != 1:
+            raise qtype.err(0, f"SiteEntry::{e} is the dense column of {len(tys)} rows, not one")
+        out[variant] = tys[0]
     return out
 
 
-def src_body35(body, site):
+def src_body35(body, site, qtype):
     """body35.rs: ({list name: [ggml type names]}, {list name: how many `ty_of`/`routed_ty` calls read it})."""
-    names = src_site_names(site)
+    names = src_site_names(site, qtype)
     lists = {}
     for hit in re.finditer(r"\bconst\s+(\w+)\s*:\s*&\[SiteTy\]\s*=\s*&\[", body.m):
         lo = hit.end() - 1
         items = re.findall(r"SiteTy::(\w+)", body.m[lo:body.close(lo)])
         for v in items:
             if v not in names:
-                raise body.err(lo, f"SiteTy::{v} is no arm of {SITE_RS}:SiteTy::of_ggml")
+                raise body.err(lo, f"SiteTy::{v} is no family of {SITE_RS}:SiteTy::entry")
         lists[hit.group(1)] = [names[v] for v in items]
     calls = {}
     for hit in re.finditer(r"(?<!fn )\b(?:ty_of|routed_ty)\(", body.m):
@@ -1628,7 +1650,7 @@ def mirror_vs_source(read):
     out += [f"{ARCH_RS}:QWEN35_BODY: {n!r} has no reader in {REGISTRY_TSV}" for n in consts.get("QWEN35_BODY", [])
             if n not in spec]
     out += diff_sets(f"{DECIDE_SEAT_RS}:BODIES predicates", DECIDE_BODY_PREDICATES, src_bodies(seat), DECIDE_SEAT_RS)
-    _, calls = src_body35(Src(BODY35_RS, read(BODY35_RS)), Src(SITE_RS, read(SITE_RS)))
+    _, calls = src_body35(Src(BODY35_RS, read(BODY35_RS)), Src(SITE_RS, read(SITE_RS)), Src(QTYPE_RS, read(QTYPE_RS)))
     mine = {}
     for _, lst in BODY35_SITES:
         mine[lst] = mine.get(lst, 0) + 1
@@ -1747,6 +1769,21 @@ def self_test():
             return text
         return read
 
+    for name, old, new, want in (
+        ("a missing dense family is refused from the card table",
+         "-      F32     -    -)", "-      -       -    -)", "dense column of 0 rows"),
+        ("a duplicate dense family is refused from the card table",
+         "Q5_1   -       -    -)", "Q5_1   F32     -    -)", "dense column of 2 rows"),
+        ("a malformed card row is refused by file and line",
+         "-      F32     -    -)", "-      F32     -)", "columns, not 8"),
+        ("a row without a card column is refused",
+         "card: card!(F32", "missing: card!(F32", "has no card column"),
+        ("an unreadable card expression is refused",
+         "card: card!(F32", "card: other!(F32", "card is not card! or Card::NONE"),
+    ):
+        refused, detail = raises(lambda: mirror_vs_source(doctored(QTYPE_RS, old, new)), SourceError, want)
+        check(name, refused and re.search(re.escape(QTYPE_RS) + r":\d+:", detail), detail)
+
     for name, path, old, new, want in (
         ("a name added to the registry's glm row is named", REGISTRY_TSV,
          "glm5next,glm5-next\t", "glm5next,glm5-next,glm5-nxt\t", "glm5-nxt"),
@@ -1786,7 +1823,7 @@ def self_test():
         if old not in text:
             raise SourceError(f"{BODY35_RS}: the self-test's doctoring text is gone: {old!r}")
         doc = Src(BODY35_RS, text.replace(old, old + "SiteTy::Q3K,", 1))
-        lists = src_body35(doc, Src(SITE_RS, read_source(SITE_RS)))[0]
+        lists = src_body35(doc, Src(SITE_RS, read_source(SITE_RS)), Src(QTYPE_RS, read_source(QTYPE_RS)))[0]
         pair = lambda ty: [[("token_embd.weight", ty, [], 0), ("output.weight", 14, [], 0)]]
         return (body35_types(pair(11), lists)[0] is None and "Q3_K" in lists["EMBED"]
                 and body35_types(pair(1), lists)[0] is not None)
