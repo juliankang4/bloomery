@@ -1279,48 +1279,6 @@ mod tests {
         }
     }
 
-    /// Q5_0 is the blocks32 gemv: the `Q8Blocks32` form, no K-quant GEMM
-    /// type, and `kgemv_order` is `None` (that is kgemv's layout; the
-    /// row-major layout stays on `blocks32_gemv`). The file type maps back.
-    #[test]
-    fn a_q5_0_site_reads_q8blocks32_and_is_not_a_kgemv() {
-        assert_eq!(SiteTy::of_ggml(GgmlType::Q5_0), Some(SiteTy::Q5_0));
-        assert!(SiteTy::ALL.contains(&SiteTy::Q5_0));
-        assert_eq!(SiteTy::Q5_0.reads(), Form::Q8Blocks32);
-        assert_eq!(SiteTy::Q5_0.kgemv_order(), None);
-        assert!(!SiteTy::Q5_0.kquant());
-        assert_eq!(SiteTy::Q5_0.gemm_weight(), None);
-        assert_eq!(SiteTy::Q5_0.to_string(), "Q5_0");
-    }
-
-    /// NVFP4 is a `kgemv` site: the q8_1 rows of 128 values, token-major, no
-    /// K-quant GEMM type; the file type maps to it and back to its table row.
-    #[test]
-    fn an_nvfp4_site_reads_q8_1_and_is_a_token_major_kgemv() {
-        assert_eq!(SiteTy::of_ggml(GgmlType::NVFP4), Some(SiteTy::Nvfp4));
-        assert!(SiteTy::ALL.contains(&SiteTy::Nvfp4));
-        assert_eq!(SiteTy::Nvfp4.reads(), Form::Q8x128);
-        assert_eq!(SiteTy::Nvfp4.kgemv_order(), Some(super::Order::TokenMajor));
-        assert!(!SiteTy::Nvfp4.kquant());
-        assert_eq!(SiteTy::Nvfp4.to_string(), "NVFP4");
-    }
-
-    /// MXFP8 is a `gemv` site on the f32 rows, narrow and wide: no K-quant
-    /// GEMM type, not a `kgemv`; bloomery's private id maps to it and the F8
-    /// and NVFP4 rows' ids do not.
-    #[test]
-    fn an_mxfp8_site_reads_the_f32_rows_and_is_a_gemv() {
-        let ty = GgmlType::MXFP8;
-        assert_eq!(SiteTy::of_ggml(ty), Some(SiteTy::Mxfp8));
-        assert_eq!(SiteTy::of_ggml(GgmlType::F8E4M3_ROWS), None);
-        assert_eq!(SiteTy::of_ggml(GgmlType::NVFP4_ROWS), None);
-        assert!(SiteTy::ALL.contains(&SiteTy::Mxfp8));
-        assert_eq!(SiteTy::Mxfp8.reads(), Form::F32);
-        assert_eq!(SiteTy::Mxfp8.kgemv_order(), None);
-        assert_eq!(SiteTy::Mxfp8.gemm_weight(), None);
-        assert_eq!(SiteTy::Mxfp8.to_string(), "MXFP8");
-    }
-
     /// Every family is the kernel table's dense row of one file type: a type
     /// has a family exactly where the table names a dense entry for it, the
     /// family maps back to that type and is named by it in upper case, its
@@ -1328,6 +1286,7 @@ mod tests {
     /// `kgemv` exactly where it reads the q8_1 rows of 128 values.
     #[test]
     fn every_family_is_the_tables_dense_row_of_one_type() {
+        // PIN(2026-10-21): consolidate the three site pins, preserving their assertions.
         let own = [
             GgmlType::F8E4M3_ROWS,
             GgmlType::MXFP8,
@@ -1341,40 +1300,31 @@ mod tests {
                 assert_eq!(s.ggml(), ty, "{s}");
             }
         }
-        let types: Vec<_> = SiteTy::ALL
-            .iter()
-            .map(|&s| (s.to_string(), s.ggml()))
-            .collect();
-        assert_eq!(
-            types,
-            [
-                ("Q3_K".to_string(), GgmlType::Q3_K),
-                ("Q4_K".to_string(), GgmlType::Q4_K),
-                ("Q5_K".to_string(), GgmlType::Q5_K),
-                ("Q6_K".to_string(), GgmlType::Q6_K),
-                ("Q5_0".to_string(), GgmlType::Q5_0),
-                ("Q8_0".to_string(), GgmlType::Q8_0),
-                ("F32".to_string(), GgmlType::F32),
-                ("NVFP4".to_string(), GgmlType::NVFP4),
-                ("MXFP8".to_string(), GgmlType::MXFP8),
-                ("FP8_B128".to_string(), GgmlType::FP8_B128),
-            ]
-        );
-        let grouped: Vec<_> = SiteTy::ALL
-            .iter()
-            .filter_map(|&s| s.gemm_weight().map(|g| (s, g)))
-            .collect();
-        assert_eq!(
-            grouped,
-            [
-                (SiteTy::Q3K, GemmWeight::Q3K),
-                (SiteTy::Q4K, GemmWeight::Q4K),
-                (SiteTy::Q5K, GemmWeight::Q5K),
-                (SiteTy::Q6K, GemmWeight::Q6K),
-            ]
-        );
-        for &s in SiteTy::ALL {
-            assert_eq!(s.kgemv_order().is_some(), s.reads() == Form::Q8x128, "{s}");
+        let expected = [
+            (SiteTy::Q3K, GgmlType::Q3_K, "Q3_K", Some(GemmWeight::Q3K)),
+            (SiteTy::Q4K, GgmlType::Q4_K, "Q4_K", Some(GemmWeight::Q4K)),
+            (SiteTy::Q5K, GgmlType::Q5_K, "Q5_K", Some(GemmWeight::Q5K)),
+            (SiteTy::Q6K, GgmlType::Q6_K, "Q6_K", Some(GemmWeight::Q6K)),
+            (SiteTy::Q5_0, GgmlType::Q5_0, "Q5_0", None),
+            (SiteTy::Q8_0, GgmlType::Q8_0, "Q8_0", None),
+            (SiteTy::F32, GgmlType::F32, "F32", None),
+            (SiteTy::Nvfp4, GgmlType::NVFP4, "NVFP4", None),
+            (SiteTy::Mxfp8, GgmlType::MXFP8, "MXFP8", None),
+            (SiteTy::Fp8B128, GgmlType::FP8_B128, "FP8_B128", None),
+        ];
+        assert_eq!(SiteTy::ALL.len(), expected.len());
+        for (&s, (want, ty, label, grouped)) in SiteTy::ALL.iter().zip(expected) {
+            assert_eq!(s, want);
+            assert_eq!(s.ggml(), ty);
+            assert_eq!(s.to_string(), label);
+            assert_eq!(s.gemm_weight(), grouped);
+            assert_eq!(s.kquant(), grouped.is_some());
+            assert_eq!(s.kgemv_order().is_some(), s.reads() == Form::Q8x128);
         }
+        assert_eq!(SiteTy::Q5_0.reads(), Form::Q8Blocks32);
+        assert_eq!(SiteTy::Q5_0.kgemv_order(), None);
+        assert_eq!(SiteTy::Nvfp4.reads(), Form::Q8x128);
+        assert_eq!(SiteTy::Nvfp4.kgemv_order(), Some(super::Order::TokenMajor));
+        assert_eq!(SiteTy::Mxfp8.reads(), Form::F32);
     }
 }
