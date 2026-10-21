@@ -74,6 +74,7 @@
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
 use crate::hybrid::HOST;
+use crate::q8f32::{Bf16Words, RowValues};
 use crate::route_core::sigmoid;
 use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights};
@@ -105,56 +106,22 @@ pub const SLOTS: usize = 10;
 pub const W_PITCH: usize = SLOTS + 1;
 const _: () = assert!(SLOTS == 10 && W_PITCH == 11);
 
-/// An embedding table's values as the lookup reads them.
-trait EmbedTable: Copy {
-    /// Value `v` of row `row`, as f32.
-    ///
-    /// # Safety
-    ///
-    /// `row` is a row of the table and `v` below its width.
-    unsafe fn value(self, row: usize, v: usize) -> f32;
-}
-
-/// A Q8_0 table's planes (`k32` blocks a row).
+/// A Q8_0 table's contiguous value and scale planes.
 #[derive(Clone, Copy)]
 struct Q8Table<'a> {
     qs: &'a [u32],
     d: &'a [u16],
-    k32: usize,
 }
 
-impl EmbedTable for Q8Table<'_> {
+impl RowValues for Q8Table<'_> {
     #[inline(always)]
-    unsafe fn value(self, row: usize, v: usize) -> f32 {
-        // SAFETY: word row·8·k32 + v/4 and scale row·k32 + v/32 lie inside
-        // qs and d for a row of the table and v below its 32·k32 values
-        // (this fn's contract, the kernel's launch contract).
-        let (word, bits) = unsafe {
-            (
-                *self.qs.get_unchecked(row * 8 * self.k32 + v / 4),
-                *self.d.get_unchecked(row * self.k32 + v / 32),
-            )
-        };
-        let code = (word >> (8 * (v % 4))) as u8 as i8;
+    unsafe fn at(self, i: usize) -> f32 {
+        // SAFETY: i is a value of the table, so its word lies within qs.
+        let word = unsafe { *self.qs.get_unchecked(i / 4) };
+        // SAFETY: i is a value of the table, so its scale lies within d.
+        let bits = unsafe { *self.d.get_unchecked(i / 32) };
+        let code = (word >> (8 * (i % 4))) as u8 as i8;
         code as f32 * half_bits_to_f32(bits)
-    }
-}
-
-/// A BF16 table's words (`k2` words, `2·k2` values, a row).
-#[derive(Clone, Copy)]
-struct Bf16Table<'a> {
-    w: &'a [u32],
-    k2: usize,
-}
-
-impl EmbedTable for Bf16Table<'_> {
-    #[inline(always)]
-    unsafe fn value(self, row: usize, v: usize) -> f32 {
-        // SAFETY: word row·k2 + v/2 lies inside w for a row of the table and
-        // v below its 2·k2 values (this fn's contract, the kernel's launch
-        // contract).
-        let word = unsafe { *self.w.get_unchecked(row * self.k2 + v / 2) };
-        crate::q8f32::Bf16Words::widen(word, v % 2 == 1)
     }
 }
 
@@ -169,7 +136,7 @@ impl EmbedTable for Bf16Table<'_> {
 /// `pos0` holds a word, `pos` and `n_keys` hold `ids.len()` and `y`
 /// `ids.len() · width`; `table` has `n_rows` rows of `width` values.
 #[inline(always)]
-unsafe fn embed_rows_body<T: EmbedTable>(
+unsafe fn embed_rows_body<T: RowValues>(
     i: usize,
     table: T,
     (n_rows, width): (u32, usize),
@@ -200,7 +167,7 @@ unsafe fn embed_rows_body<T: EmbedTable>(
     let id = unsafe { *ids.get_unchecked(t) };
     let val = if id < n_rows {
         // SAFETY: id < n_rows is a row of the table, v < width.
-        unsafe { table.value(id as usize, v) }
+        unsafe { table.at(id as usize * width + v) }
     } else {
         if v == 0 {
             fault.raise(FaultSite::TokenId);
@@ -273,7 +240,7 @@ mod q38_kernels {
         unsafe {
             embed_rows_body(
                 thread::index_1d().get(),
-                Q8Table { qs, d, k32 },
+                Q8Table { qs, d },
                 (n_rows, 32 * k32),
                 (ids, pos0, first),
                 fault,
@@ -319,7 +286,7 @@ mod q38_kernels {
         unsafe {
             embed_rows_body(
                 thread::index_1d().get(),
-                Bf16Table { w, k2 },
+                Bf16Words(w),
                 (n_rows, 2 * k2),
                 (ids, pos0, first),
                 fault,

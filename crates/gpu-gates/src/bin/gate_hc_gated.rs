@@ -443,7 +443,7 @@ mod gate {
         ok &= check_stages(&mut c, &bf16)?;
         ok &= check_cols(&mut c, &bf16)?;
         ok &= check_wide(&mut c, &bf16)?;
-        ok &= check_up_overflow(&mut c)?;
+        ok &= check_overflow(&mut c)?;
         ok &= no_local_depot(&[
             "hc_gated_norm_4",
             "hc_gated_down_4x320",
@@ -878,7 +878,42 @@ mod gate {
             shown(want),
             verdict(p2)
         );
-        Ok(p1 && p2)
+        let mut norm_ok = true;
+        for (case, x, eps) in [
+            ("sum", f32::from_bits(0x5f80_0000), EPS),
+            ("eps", f32::from_bits(0x5c00_0000), f32::MAX),
+        ] {
+            let st = c.gpu.stream();
+            let mut res_d = DeviceBuffer::from_host(st, &vec![x; WIDE])?;
+            let mut mixed_d = DeviceBuffer::from_host(st, &vec![f32::NAN; D])?;
+            c.hc.enqueue_mix(
+                st,
+                MixArgs {
+                    res: &mut res_d,
+                    before: Before::Plain,
+                    w: site.weights(false),
+                    eps,
+                    m: 1,
+                    fault: c.gpu.unlabelled_sink(),
+                    scratch: &mut c.scratch,
+                    mixed: &mut mixed_d,
+                },
+            )?;
+            let nan_xn = c.scratch.xn.to_host_vec(st)?[..WIDE]
+                .iter()
+                .all(|v| v.is_nan());
+            let nan_mix = mixed_d.to_host_vec(st)?.iter().all(|v| v.is_nan());
+            let fault = c.gpu.take_fault()?;
+            let pass = nan_xn && nan_mix && fault == want;
+            println!(
+                "fault[norm_{case}_overflow] xn_all_nan={nan_xn} mixed_all_nan={nan_mix} fault=\"{}\" want=\"{}\" {}",
+                shown(fault),
+                shown(want),
+                verdict(pass)
+            );
+            norm_ok &= pass;
+        }
+        Ok(p1 && p2 && norm_ok)
     }
 
     // ------------------------------------------------------ 8. the wide arm
@@ -887,40 +922,61 @@ mod gate {
     /// count for the independence clause.
     const WIDE_COLS: usize = 37;
 
-    fn check_up_overflow(c: &mut Ctx) -> Result<bool, GateError> {
-        let st = c.gpu.stream();
-        let down = vec![1.0 / 4096.0; R * WIDE];
-        let up = vec![f32::from_bits(0x7f7f_0000); WIDE * R];
-        let planes = Planes::Bf16 {
-            down: DeviceTensor::upload(st, &vec![0x3980_3980; R * WIDE / 2], R, WIDE / 2)?,
-            up: DeviceTensor::upload(st, &vec![0x7f7f_7f7f; WIDE * R / 2], WIDE, R / 2)?,
-            view: DeviceTensor::upload(st, &vec![0x3980_3980; R * WIDE / 2], R * S, D / 2)?,
-        };
-        let mut site = Site::with(&c.gpu, 0x38c0_0003, card::f32_dot, planes, (down, up))?;
-        site.gamma.fill(1.0);
-        site.gamma_d.copy_from_host(st, &site.gamma)?;
+    fn check_overflow(c: &mut Ctx) -> Result<bool, GateError> {
         let mut w = Wide::new(c)?;
         let want = Some(Fault::at(LAYER_NONE, SITE));
         let mut ok = true;
-        for m in [1, WIDE_COLS] {
-            let res = vec![1.0; m * WIDE];
-            let (lo, mixed, fault) = if m == 1 {
-                let o = mix(c, &site, false, &res, Pre::Plain, m)?;
-                (o.lo, o.mixed, o.fault)
-            } else {
-                let o = wide_mix(c, &mut w, &site, false, &res, Pre::Plain, m)?;
-                (o.lo, o.mixed, o.fault)
+        for (stage, db, ub, inj) in [
+            ("up", 0x3980u32, 0x7f7fu32, 0.0f32),
+            ("down", 0x7980, 0, 0.0),
+            ("inject_pos", 0, 0, f32::from_bits(0x7980_0000)),
+            ("inject_neg", 0, 0, -f32::from_bits(0x7980_0000)),
+        ] {
+            let st = c.gpu.stream();
+            let down = vec![f32::from_bits(db << 16); R * WIDE];
+            let up = vec![f32::from_bits(ub << 16); WIDE * R];
+            let planes = Planes::Bf16 {
+                down: DeviceTensor::upload(st, &vec![db | db << 16; R * WIDE / 2], R, WIDE / 2)?,
+                up: DeviceTensor::upload(st, &vec![ub | ub << 16; WIDE * R / 2], WIDE, R / 2)?,
+                view: DeviceTensor::upload(st, &vec![db | db << 16; R * WIDE / 2], R * S, D / 2)?,
             };
-            let finite_lo = lo.iter().all(|v| v.is_finite());
-            let nan = mixed.iter().all(|v| v.is_nan());
-            let pass = finite_lo && nan && fault == want;
-            println!(
-                "fault[bf16_up_overflow] m={m} finite_lo={finite_lo} mixed_all_nan={nan} fault=\"{}\" want=\"{}\" {}",
-                shown(fault),
-                shown(want),
-                verdict(pass)
-            );
-            ok &= pass;
+            let mut site = Site::with(&c.gpu, 0x38c0_0003, card::f32_dot, planes, (down, up))?;
+            site.gamma.fill(1.0);
+            site.gamma_d.copy_from_host(st, &site.gamma)?;
+            site.inject.fill(inj);
+            site.inject_d = DeviceTensor::upload(st, &site.inject, S, WIDE)?;
+            let inject = inj != 0.0;
+            for m in [1, WIDE_COLS] {
+                let res = vec![1.0; m * WIDE];
+                let (lo, wgt, mixed, partials_finite, fault) = if m == 1 {
+                    let o = mix(c, &site, inject, &res, Pre::Plain, m)?;
+                    let part = if inject { &o.ipart } else { &o.dpart };
+                    let finite = part.iter().all(|v| v.is_finite());
+                    (o.lo, o.wgt, o.mixed, finite, o.fault)
+                } else {
+                    let o = wide_mix(c, &mut w, &site, inject, &res, Pre::Plain, m)?;
+                    (o.lo, o.wgt, o.mixed, true, o.fault)
+                };
+                let lo_ok = lo.iter().all(|v| {
+                    if stage == "down" {
+                        v.is_nan()
+                    } else {
+                        v.is_finite()
+                    }
+                });
+                let mixed_ok = mixed
+                    .iter()
+                    .all(|v| if inject { v.is_finite() } else { v.is_nan() });
+                let wgt_ok = !inject || wgt.iter().all(|v| v.is_nan());
+                let pass = partials_finite && lo_ok && mixed_ok && wgt_ok && fault == want;
+                println!(
+                    "fault[bf16_{stage}_overflow] m={m} partials_finite={partials_finite} lo_ok={lo_ok} mixed_ok={mixed_ok} wgt_ok={wgt_ok} fault=\"{}\" want=\"{}\" {}",
+                    shown(fault),
+                    shown(want),
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
         }
         Ok(ok)
     }

@@ -471,7 +471,11 @@ unsafe fn up_stage(
             let p = dpart.as_ptr().add(e * STREAMS);
             ((*p + *p.add(1)) + *p.add(2)) + *p.add(3)
         };
-        let l = silu(v * INV);
+        let l = if v.is_finite() {
+            silu(v * INV)
+        } else {
+            f32::NAN
+        };
         // SAFETY: e < m·RANK <= MAX_COLS·RANK, this thread's slot.
         unsafe { *lo_s.add(e) = l };
         if b == 0 {
@@ -489,7 +493,11 @@ unsafe fn up_stage(
             let p = ipart.as_ptr().add(tid * STREAMS);
             ((*p + *p.add(1)) + *p.add(2)) + *p.add(3)
         };
-        let w = 2.0 * sigmoid(v * INV);
+        let w = if v.is_finite() {
+            2.0 * sigmoid(v * INV)
+        } else {
+            f32::NAN
+        };
         if !w.is_finite() {
             fault.raise(SITE);
         }
@@ -666,10 +674,15 @@ unsafe fn norm_stream(
     // SAFETY: every thread of the block is here, and `ws` is as
     // `block_sum` asks (# Safety).
     let sum = unsafe { block_sum(acc, tid, ws) };
-    if tid == 0 && !sum.is_finite() {
-        fault.raise(SITE);
-    }
-    let r = 1.0 / (sum / hidden as f32 + eps).sqrt();
+    let mean = sum / hidden as f32 + eps;
+    let r = if sum.is_finite() && mean.is_finite() {
+        1.0 / mean.sqrt()
+    } else {
+        if tid == 0 {
+            fault.raise(SITE);
+        }
+        f32::NAN
+    };
     let mut i0 = tid;
     while i0 < hid {
         let (mut xv, mut gv) = ([0.0f32; NORM_CHUNK], [0.0f32; NORM_CHUNK]);
@@ -1653,7 +1666,11 @@ mod hc_wide_kernels {
             // contract's exact 1-D block.
             let e = unsafe { Elem::new(down, &mut lo, i) };
             e.map(move |d| {
-                let l = silu(d * INV);
+                let l = if d.is_finite() {
+                    silu(d * INV)
+                } else {
+                    f32::NAN
+                };
                 if !l.is_finite() {
                     fault.raise(SITE);
                 }
@@ -1671,7 +1688,11 @@ mod hc_wide_kernels {
         // and the launch is `domain = 1` with the contract's exact 1-D block.
         let e = unsafe { Elem::new(inj, &mut wgt, j) };
         e.map(move |v| {
-            let w = 2.0 * sigmoid(v * INV);
+            let w = if v.is_finite() {
+                2.0 * sigmoid(v * INV)
+            } else {
+                f32::NAN
+            };
             if !w.is_finite() {
                 fault.raise(SITE);
             }
