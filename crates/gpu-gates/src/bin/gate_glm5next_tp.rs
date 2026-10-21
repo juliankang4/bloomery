@@ -763,9 +763,17 @@ mod gate {
                 continue;
             }
             let ik = IkRoute::read(man, l)?;
+            if ik.tokens() != run.routes.len() {
+                return Err(format!(
+                    "layer {l}: ik routes {} tokens, the run {}",
+                    ik.tokens(),
+                    run.routes.len()
+                )
+                .into());
+            }
             let z = crate::e2e::tap(man, &format!("ffn_moe_logits-{l}"))?;
             let bias = bloomery_gpu_gates::split_f32(file, &names::exp_probs_b(l), N_EXPERT)?;
-            for (t, routes) in run.routes.iter().enumerate().take(ik.tokens()) {
+            for (t, routes) in run.routes.iter().enumerate() {
                 let ours = routes[l].as_ref().ok_or("a routed layer with no picks")?;
                 let ranked: Vec<f32> = ours.probs.iter().zip(&bias).map(|(p, b)| p + b).collect();
                 let (iv, ids) = ik.at(t);
