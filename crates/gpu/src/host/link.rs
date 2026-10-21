@@ -121,6 +121,10 @@ impl Drop for Remote {
 }
 
 impl pump::Page for MappedHost {
+    fn bytes(&self) -> usize {
+        self.bytes()
+    }
+
     fn word(&self, off: usize) -> &AtomicU32 {
         self.atomic_u32(off)
             .expect("the tier page's layout keeps every word the link touches 4-aligned inside it")

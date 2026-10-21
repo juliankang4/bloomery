@@ -38,6 +38,9 @@ use std::time::{Duration, Instant};
 
 /// A page of 4-byte words an end reads and writes by byte offset.
 pub(super) trait Page: Send + Sync {
+    /// The page's byte length.
+    fn bytes(&self) -> usize;
+
     /// The u32 at byte `off`, which the caller keeps 4-aligned and inside the
     /// page.
     fn word(&self, off: usize) -> &AtomicU32;
@@ -599,6 +602,10 @@ pub(super) mod tests {
     pub(in crate::host::link) struct Mem(pub(in crate::host::link) Vec<AtomicU32>);
 
     impl Page for Mem {
+        fn bytes(&self) -> usize {
+            self.0.len() * 4
+        }
+
         fn word(&self, off: usize) -> &AtomicU32 {
             &self.0[off / 4]
         }

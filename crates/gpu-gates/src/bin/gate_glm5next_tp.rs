@@ -28,7 +28,9 @@
 //!   or at the stores' end refused by name before any launch; after the step at 0 the same
 //!   position refused again, its logits read, and the step at 1 taken. Taps armed on the fresh
 //!   open; after a step, arming again refused by name and the step's taps read bit for bit as
-//!   before it, and once disarmed, the taps' read and a new arming refused by name.
+//!   before it, and once disarmed, the taps' read and a new arming refused by name. Wrong GPUs,
+//!   shared rank streams, invalid tokens, and missing, foreign or released links are refused
+//!   before a launch; a loopback refuses short pages.
 //! - (fx) every run that loaded against ik's batch set of the fixture (`fx_ref_glm5next`), as the
 //!   e2e gate's (cfx) holds the one-card body: a flip first on its path held to the pair rule
 //!   under the layer's router band, every layer output off every flip's path within its stream
@@ -234,7 +236,7 @@ mod gate {
             .collect();
         for (pos, &t) in toks.iter().enumerate() {
             let mut pairs: Vec<(&Gpu, &mut Rank)> = gpus.iter().zip(ranks.iter_mut()).collect();
-            let token = match tp::step(&mut pairs, t, pos as u32) {
+            let token = match tp::step(&mut pairs, ring.as_ref(), t, pos as u32) {
                 Ok(token) => token,
                 Err(e) => {
                     let released = ring.as_ref().map(GatherLoop::release);
@@ -491,7 +493,7 @@ mod gate {
             ),
         ];
         let mut r = open(CTX)?;
-        let step = |r: &mut Rank, pos: u32| tp::step(&mut [(&gpu, r)], token, pos).map(drop);
+        let step = |r: &mut Rank, pos: u32| tp::step(&mut [(&gpu, r)], None, token, pos).map(drop);
         let late = "taps armed before the first step";
         held.push(("tap arming on a fresh open", taken(r.set_taps(&gpu, true))));
         held.push((
@@ -553,12 +555,183 @@ mod gate {
             "tap arming once disarmed",
             says(r.set_taps(&gpu, true), late),
         ));
-        let mut ok = true;
+        let other = Gpu::new()?;
+        let gpu_ok = gpu_clause(&mut r, &other, 2);
+        held.push((
+            "a token past the vocabulary",
+            says(
+                tp::step(&mut [(&gpu, &mut r)], None, u32::MAX, 2).map(drop),
+                "token",
+            ),
+        ));
+        held.push(("the step after refusals", taken(step(&mut r, 2))));
+        let mut shared = (0..2)
+            .map(|i| Rank::open(&gpu, Arc::clone(file), RankOf::new(i, 2)?, CTX))
+            .collect::<Result<Vec<_>, GpuError>>()?;
+        let foreign = join(&shared)?;
+        let mut pairs: Vec<_> = shared.iter_mut().map(|r| (&gpu, r)).collect();
+        held.push((
+            "two ranks on one GPU",
+            says(
+                tp::step(&mut pairs, foreign.as_ref(), token, 0).map(drop),
+                "each rank must use a distinct stream",
+            ),
+        ));
+        if let Some(link) = &foreign {
+            link.release()?;
+        }
+        drop(pairs);
+        let mut separate = vec![
+            Rank::open(&gpu, Arc::clone(file), RankOf::new(0, 2)?, CTX)?,
+            Rank::open(&other, Arc::clone(file), RankOf::new(1, 2)?, CTX)?,
+        ];
+        let mut pairs: Vec<_> = [&gpu, &other]
+            .into_iter()
+            .zip(separate.iter_mut())
+            .collect();
+        pairs.swap(0, 1);
+        held.push((
+            "ranks out of order",
+            says(
+                tp::step(&mut pairs, foreign.as_ref(), token, 0).map(drop),
+                "at place 0",
+            ),
+        ));
+        pairs.swap(0, 1);
+        held.push((
+            "a rank of another count",
+            says(
+                tp::step(&mut pairs[..1], None, token, 0).map(drop),
+                "step over 1",
+            ),
+        ));
+        held.push((
+            "unjoined ranks",
+            says(
+                tp::step(&mut pairs, None, token, 0).map(drop),
+                "needs its joined link",
+            ),
+        ));
+        drop(pairs);
+        let ring = join(&separate)?;
+        let link = ring.as_ref().ok_or("two ranks without a link")?;
+        let (layout, _) = separate[0].link().ok_or("no gather page")?;
+        let short = Arc::new(MappedHost::new(
+            gpu.context(),
+            layout.page_bytes() - 4,
+            "short gather page",
+        )?);
+        let short_pages = [
+            short,
+            Arc::clone(separate[1].link().ok_or("no gather page")?.1),
+        ];
+        let layouts = vec![
+            layout.clone(),
+            separate[1].link().ok_or("no gather page")?.0.clone(),
+        ];
+        held.push((
+            "a short gather page",
+            says(
+                GatherLoop::new(&layouts, &short_pages, &PostCols::default()).map(drop),
+                "page has",
+            ),
+        ));
+        let mut pairs: Vec<_> = [&gpu, &other]
+            .into_iter()
+            .zip(separate.iter_mut())
+            .collect();
+        held.push((
+            "a foreign link",
+            says(
+                tp::step(&mut pairs, foreign.as_ref(), token, 0).map(drop),
+                "page is not joined",
+            ),
+        ));
+        link.release()?;
+        held.push((
+            "a released link",
+            says(
+                tp::step(&mut pairs, Some(link), token, 0).map(drop),
+                "link was released",
+            ),
+        ));
+        drop(pairs);
+        let mut ok = gpu_ok;
         for (what, (pass, said)) in held {
             println!("(st) one rank: {what}: {said} {}", verdict(pass));
             ok &= pass;
         }
         Ok(ok)
+    }
+
+    /// A wrong GPU is refused before token decoding, state reads or tap changes.
+    fn gpu_clause(r: &mut Rank, other: &Gpu, pos: u32) -> bool {
+        let mut ok = true;
+        for (what, result) in [
+            (
+                "step",
+                tp::step(&mut [(other, &mut *r)], None, u32::MAX, pos).map(drop),
+            ),
+            ("set_taps", r.set_taps(other, false)),
+            ("taps", r.taps(other).map(drop)),
+            ("routes", r.routes(other).map(drop)),
+            ("logits", r.logits(other).map(drop)),
+        ] {
+            let said = match result {
+                Err(e) => e.to_string(),
+                Ok(()) => "accepted".into(),
+            };
+            let pass = said.contains("use the GPU that opened it");
+            println!("(st) {what} on a different GPU: {said} {}", verdict(pass));
+            ok &= pass;
+        }
+        ok
+    }
+
+    #[test]
+    #[ignore = "needs an NVIDIA card and the GLM fixture"]
+    fn hw_gpu_inputs_use_the_rank_opener() -> Result<(), GateError> {
+        crate::gate_card::init()?;
+        glm5next_tier::init_file()?;
+        let file = Arc::new(glm5next_tier::open()?);
+        let gpu = Gpu::new()?;
+        let other = Gpu::new()?;
+        let mut r = Rank::open(&gpu, Arc::clone(&file), RankOf::new(0, 1)?, CTX)?;
+        assert!(gpu_clause(&mut r, &other, 0));
+        let mut ranks = vec![
+            Rank::open(&gpu, Arc::clone(&file), RankOf::new(0, 2)?, CTX)?,
+            Rank::open(&other, file, RankOf::new(1, 2)?, CTX)?,
+        ];
+        let ring = join(&ranks)?;
+        let layouts: Vec<_> = ranks
+            .iter()
+            .map(|r| r.link().expect("a rank of two has a page").0.clone())
+            .collect();
+        let pages = [&gpu, &other]
+            .into_iter()
+            .zip(&layouts)
+            .map(|(g, l)| {
+                MappedHost::new(g.context(), l.page_bytes(), "foreign gather page").map(Arc::new)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let cols = PostCols::default();
+        cols.set(1);
+        let foreign = GatherLoop::new(&layouts, &pages, &cols)?;
+        let mut pairs: Vec<_> = [&gpu, &other].into_iter().zip(ranks.iter_mut()).collect();
+        for (link, want) in [
+            (None, "needs its joined link"),
+            (Some(&foreign), "page is not joined"),
+        ] {
+            let e = tp::step(&mut pairs, link, u32::MAX, 0).unwrap_err();
+            println!("(st) link preflight: {e}");
+            assert!(e.to_string().contains(want), "{e}");
+        }
+        let link = ring.as_ref().ok_or("two ranks without a link")?;
+        link.release()?;
+        let e = tp::step(&mut pairs, Some(link), u32::MAX, 0).unwrap_err();
+        println!("(st) link preflight: {e}");
+        assert!(e.to_string().contains("link was released"), "{e}");
+        Ok(())
     }
 
     /// Two runs' tokens, logits, taps and picks bit for bit.

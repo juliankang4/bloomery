@@ -77,7 +77,7 @@ impl Slot {
 }
 
 /// The gather slots of one rank's page, laid out alike on every rank's.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Gathers {
     ranks: usize,
     rank: usize,
@@ -355,6 +355,46 @@ impl Gathers {
     }
 }
 
+/// One live loopback owns each page until its pump stops and its posts settle.
+static JOINED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+struct Joined<P>(Vec<Arc<P>>);
+
+impl<P> Joined<P> {
+    fn new(pages: &[Arc<P>]) -> Result<Self, GpuError> {
+        let mut joined = JOINED
+            .lock()
+            .expect("the gather page registry is not poisoned");
+        for (rank, page) in pages.iter().enumerate() {
+            if joined.contains(&(Arc::as_ptr(page) as usize)) {
+                return Err(GpuError::shape(
+                    "the gather loopback",
+                    format!("rank {rank}: page is already joined"),
+                ));
+            }
+        }
+        for page in pages {
+            joined.insert(Arc::as_ptr(page) as usize);
+        }
+        Ok(Joined(pages.to_vec()))
+    }
+}
+
+impl<P> Drop for Joined<P> {
+    fn drop(&mut self) {
+        let mut joined = JOINED
+            .lock()
+            .expect("the gather page registry is not poisoned");
+        for page in &self.0 {
+            assert!(
+                joined.remove(&(Arc::as_ptr(page) as usize)),
+                "a gather owns its joined page"
+            );
+        }
+    }
+}
+
 /// N ranks' pages joined pairwise by the loopback's wire, every end on one
 /// pump thread, each end posting the rows `cols` holds.
 ///
@@ -362,6 +402,10 @@ impl Gathers {
 struct Ring<P: Page + 'static> {
     pumps: Vec<Pump>,
     ends: Vec<Arc<dyn Side<P>>>,
+    pages: Joined<P>,
+    cols: PostCols,
+    layouts: Vec<Gathers>,
+    released: std::sync::atomic::AtomicBool,
 }
 
 impl<P: Page + 'static> Ring<P> {
@@ -395,6 +439,47 @@ impl<P: Page + 'static> Ring<P> {
                 ));
             }
         }
+        for (rank, page) in pages.iter().enumerate() {
+            if page.bytes() < layouts[rank].page_bytes() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "rank {rank}: page has {} bytes, needs {}",
+                        page.bytes(),
+                        layouts[rank].page_bytes()
+                    ),
+                ));
+            }
+            if pages[..rank].iter().any(|p| Arc::ptr_eq(p, page)) {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("rank {rank}: each rank needs a distinct page"),
+                ));
+            }
+        }
+        if first.slots.is_empty() {
+            return Err(GpuError::shape(WHAT, "no gather slots"));
+        }
+        if cols.get() == 0 {
+            return Err(GpuError::shape(WHAT, "no rows to post"));
+        }
+        let joined = Joined::new(pages)?;
+        for (rank, (layout, page)) in layouts.iter().zip(pages).enumerate() {
+            let counters = (0..layout.slots.len()).flat_map(|slot| {
+                (0..Gathers::SETS).flat_map(move |set| {
+                    (0..layout.ranks).map(move |peer| layout.counter(slot, set, peer))
+                })
+            });
+            if counters
+                .chain((layout.end..layout.page_bytes()).step_by(4))
+                .any(|off| page.word(off).load(std::sync::atomic::Ordering::Acquire) != 0)
+            {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("rank {rank}: gather counters and tail must be zero"),
+                ));
+            }
+        }
         let mut ends: Vec<Arc<dyn Side<P>>> = Vec::new();
         for (a, la) in layouts.iter().enumerate() {
             for b in (0..layouts.len()).filter(|&b| b != a) {
@@ -418,7 +503,48 @@ impl<P: Page + 'static> Ring<P> {
         Ok(Ring {
             pumps: vec![pump],
             ends,
+            pages: joined,
+            cols: cols.clone(),
+            layouts: layouts.to_vec(),
+            released: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Refuse a page outside this live loopback or a different row count before a launch.
+    fn check(&self, layout: &Gathers, page: &Arc<P>, rows: usize) -> Result<(), GpuError> {
+        const WHAT: &str = "the gather loopback";
+        let rank = layout.rank;
+        if self.layouts.get(rank) != Some(layout) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("rank {rank}: layout is not joined by this link"),
+            ));
+        }
+        if !self.pages.0.get(rank).is_some_and(|p| Arc::ptr_eq(p, page)) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("rank {rank}: page is not joined by this link"),
+            ));
+        }
+        if self.released.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(GpuError::shape(WHAT, "the link was released"));
+        }
+        if let Some(why) = self.broken() {
+            return Err(GpuError::shape(WHAT, format!("the link is broken: {why}")));
+        }
+        let posted = self.cols.get();
+        if rows == 0
+            || layout
+                .slots
+                .iter()
+                .any(|s| posted.min(s.shape.rows) != rows)
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{rows} rows requested, the link posts {posted}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Why an end stopped carrying, if one did.
@@ -431,6 +557,8 @@ impl<P: Page + 'static> Ring<P> {
 
     /// Release every counter the ends read ([`release_settled`]).
     fn release(&self) -> Result<(), String> {
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
         let ends: Vec<&dyn Side<P>> = self.ends.iter().map(|e| &**e).collect();
         release_settled(&ends, RELEASE)
     }
@@ -453,14 +581,25 @@ impl GatherLoop {
     /// Rank `r` of `layouts` (one [`Gathers`] a rank, alike) on `pages[r]`,
     /// every end posting the rows `cols` holds. Pages of another count than
     /// the layouts, layouts that are not ranks 0..N of N laid out alike, and
-    /// a layout whose crossings do not fit before its tail are refused by
-    /// name.
+    /// duplicate, undersized or already joined pages, nonzero counters or tails,
+    /// empty slots, no rows to post, or a layout whose crossings do not fit
+    /// before its tail are refused by name.
     pub fn new(
         layouts: &[Gathers],
         pages: &[Arc<MappedHost>],
         cols: &PostCols,
     ) -> Result<GatherLoop, GpuError> {
         Ring::new(layouts, pages, cols).map(GatherLoop)
+    }
+
+    /// Check that `layout` and `page` belong to this live link, posting `rows` rows.
+    pub fn check(
+        &self,
+        layout: &Gathers,
+        page: &Arc<MappedHost>,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        self.0.check(layout, page, rows)
     }
 
     /// Why the loopback stopped carrying, if it did.
@@ -582,6 +721,110 @@ mod tests {
             }
         }
         assert!(accepted.is_empty(), "not refused by name: {accepted:?}");
+    }
+
+    #[test]
+    fn a_launch_needs_its_live_link_and_rows() {
+        let (layouts, pages, ring) = mem_ring(2);
+        assert!(ring.check(&layouts[0], &pages[0], ROWS).is_ok());
+        assert!(ring.check(&layouts[1], &pages[1], ROWS).is_ok());
+        let mut other = layouts[0].clone();
+        other.ranks = 4;
+        for (layout, page, rows, want) in [
+            (&layouts[0], &pages[1], ROWS, "page is not joined"),
+            (&other, &pages[0], ROWS, "layout is not joined"),
+            (&layouts[0], &pages[0], 0, "rows requested"),
+            (&layouts[0], &pages[0], SHAPE.rows + 1, "rows requested"),
+        ] {
+            let e = ring.check(layout, page, rows).unwrap_err();
+            assert!(e.to_string().contains(want), "{e}");
+        }
+        assert!(
+            Ring::new(&layouts, &pages, &ring.cols)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("already joined")
+        );
+        ring.cols.set(0);
+        assert!(
+            ring.check(&layouts[0], &pages[0], 1)
+                .unwrap_err()
+                .to_string()
+                .contains("link posts 0")
+        );
+        assert!(
+            Ring::new(&layouts, &pages, &ring.cols)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("no rows")
+        );
+        ring.cols.set(SHAPE.rows);
+        ring.release().expect("release the idle loopback");
+        assert!(
+            ring.check(&layouts[0], &pages[0], SHAPE.rows)
+                .unwrap_err()
+                .to_string()
+                .contains("link was released")
+        );
+        let short = Arc::new(Mem(vec![AtomicU32::new(0)]));
+        let short_pages = [short, Arc::clone(&pages[1])];
+        assert!(
+            Ring::new(&layouts, &short_pages, &PostCols::default())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("page has")
+        );
+        let duplicate = [Arc::clone(&pages[0]), Arc::clone(&pages[0])];
+        assert!(
+            Ring::new(&layouts, &duplicate, &PostCols::default())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("distinct page")
+        );
+        drop(ring);
+        assert!(
+            Ring::new(&layouts, &pages, &PostCols::default())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("must be zero")
+        );
+        for page in &pages {
+            for word in &page.0 {
+                word.store(0, Ordering::Relaxed);
+            }
+        }
+        let clean =
+            Ring::new(&layouts, &pages, &PostCols::default()).expect("fresh pages can join again");
+        pages[0]
+            .word(layouts[0].counter(0, 0, 0))
+            .store(2, Ordering::Release);
+        let until = Instant::now() + Duration::from_secs(3);
+        while clean.broken().is_none() && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert!(
+            clean
+                .check(&layouts[0], &pages[0], SHAPE.rows)
+                .unwrap_err()
+                .to_string()
+                .contains("link is broken")
+        );
+        drop(clean);
+        let empty = (0..2)
+            .map(|r| Gathers::new(40, 2, r, &[]).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            Ring::new(&empty, &pages, &PostCols::default())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("no gather slots")
+        );
     }
 
     /// Wait until the counter at `off` holds at least one, then take one

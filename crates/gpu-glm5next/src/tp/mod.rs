@@ -28,7 +28,7 @@ mod source;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
-use bloomery_gpu::host::{GatherSet, GatherShape, Gathers};
+use bloomery_gpu::host::{GatherLoop, GatherSet, GatherShape, Gathers};
 use bloomery_gpu::hybrid::SlotMap;
 use bloomery_gpu::weights::{TensorPart, Weights, block_index};
 use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, MappedHost, WindowMut, mem_batch};
@@ -125,6 +125,8 @@ impl Rank {
         let spec = &inputs.spec;
         let n = at.ranks();
         let whole = dims_of(&inputs)?;
+        let vocab = at.part("the vocabulary", inputs.hp.n_vocab)?;
+        let embd = Embedding::new(file.clone(), whole.embd, inputs.hp.n_vocab)?;
         let mut dims = whole;
         dims.heads = at.part("heads", whole.heads)?;
         dims.kda.n_k = at.part("KDA key heads", whole.kda.n_k)?;
@@ -163,9 +165,8 @@ impl Rank {
             .collect::<Result<Vec<_>, _>>()?;
         let slots = DeviceTensor::upload(stream, &map.stage_view(), run.len(), N_EXPERT)?;
         let card = CardExperts::rank(gpu, &w, &spec.layers, dims.embd, ff)?;
-        let embd = Embedding::new(file, dims.embd, inputs.hp.n_vocab)?;
         let head = Head::new(gpu, &w, dims.rms_eps)?;
-        if head.n_vocab() != at.part("the vocabulary", inputs.hp.n_vocab)? {
+        if head.n_vocab() != vocab {
             return Err(shape(format!(
                 "the head projects {} rows a rank; the vocabulary is {} over {n} ranks",
                 head.n_vocab(),
@@ -233,6 +234,7 @@ impl Rank {
     /// are armed before the first step ([`arm_at`]): arming later is refused by name, so the
     /// readers never hand back buffers no step wrote.
     pub fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
+        streams_at(self.at.rank(), &self.stream, gpu.stream(), [])?;
         if on {
             arm_at(self.next_pos)?;
         }
@@ -269,6 +271,7 @@ impl Rank {
     /// taps lay them; refused when the taps are not armed or no step completed last
     /// ([`Rank::stepped`]). Blocking.
     pub fn taps(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
+        streams_at(self.at.rank(), &self.stream, gpu.stream(), [])?;
         self.stepped()?;
         let taps = self.taps.as_ref().ok_or(GpuError::State {
             what: WHAT,
@@ -285,6 +288,7 @@ impl Rank {
     /// Each routed layer's picks after the last step, `None` for a dense layer; refused when
     /// the taps are not armed or no step completed last ([`Rank::stepped`]). Blocking.
     pub fn routes(&self, gpu: &Gpu) -> Result<Vec<Option<RoutePick>>, GpuError> {
+        streams_at(self.at.rank(), &self.stream, gpu.stream(), [])?;
         self.stepped()?;
         let routes = self.routes.as_ref().ok_or(GpuError::State {
             what: WHAT,
@@ -307,6 +311,7 @@ impl Rank {
     /// The last step's logits over the rank's part of the vocabulary; refused when no step
     /// completed last ([`Rank::stepped`]). Blocking.
     pub fn logits(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
+        streams_at(self.at.rank(), &self.stream, gpu.stream(), [])?;
         self.stepped()?;
         on_card(gpu)?;
         self.head.logits_to_host(gpu)
@@ -324,9 +329,8 @@ impl Rank {
         }
     }
 
-    /// Token `token` at `pos` into the step's row; refused past the vocabulary.
-    fn begin(&mut self, gpu: &Gpu, token: u32, pos: u32) -> Result<(), GpuError> {
-        self.embd.fill(token)?;
+    /// The checked token's embedding at `pos` into the step's row.
+    fn begin(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
         write_row(on_card(gpu)?, &mut self.s.rows[0], &self.embd.streams, pos)?;
         self.cur = 0;
         Ok(())
@@ -432,19 +436,30 @@ impl Rank {
 
 /// One step of `token` at `pos` on every rank of a load, each with its card, rank `r` at
 /// `ranks[r]`: the ranks' launches a sub-layer at a time (module doc), every head, then the
-/// merge of the ranks' picks, the step's token. The ranks' links are joined before the first
-/// step. Blocking. Refused by name before any launch: ranks out of rank order or of another
+/// merge of the ranks' picks, the step's token. `link` joins these ranks' pages and stays live
+/// for the step; `None` at one rank. Each rank uses its opener's distinct stream. Blocking.
+/// Refused by name before any launch: ranks out of rank order or of another
 /// count than their own, ranks of unlike trunks ([`alike`]), a position past a rank's stores or
 /// other than the one its stores stand at ([`at_pos`]), and a token past the vocabulary. A step
 /// that fails once its launches go out leaves every rank refusing the next (`Rank`).
-pub fn step(ranks: &mut [(&Gpu, &mut Rank)], token: u32, pos: u32) -> Result<u32, GpuError> {
+pub fn step(
+    ranks: &mut [(&Gpu, &mut Rank)],
+    link: Option<&GatherLoop>,
+    token: u32,
+    pos: u32,
+) -> Result<u32, GpuError> {
     let n = ranks.len();
     let layers = alike(
         ranks
             .iter()
             .map(|(_, r)| (r.cfg.len(), r.dims.embd, r.head.n_vocab())),
     )?;
-    for (i, (_, r)) in ranks.iter().enumerate() {
+    if (n > 1) != link.is_some() {
+        return Err(shape(format!(
+            "a step over {n} ranks needs its joined link only at N > 1"
+        )));
+    }
+    for (i, (gpu, r)) in ranks.iter().enumerate() {
         if r.at.rank() != i || r.at.ranks() != n {
             return Err(shape(format!(
                 "rank {} of {} at place {i} of a step over {n}",
@@ -452,13 +467,28 @@ pub fn step(ranks: &mut [(&Gpu, &mut Rank)], token: u32, pos: u32) -> Result<u32
                 r.at.ranks()
             )));
         }
+        streams_at(
+            i,
+            &r.stream,
+            gpu.stream(),
+            ranks[..i].iter().map(|(_, p)| &p.stream),
+        )?;
         at_pos(r.next_pos, r.ctx, pos)?;
+        if let Some(link) = link {
+            let (layout, page) = r
+                .link()
+                .ok_or_else(|| shape(format!("rank {i}: no gather page")))?;
+            link.check(layout, page, 1)?;
+        }
     }
-    for (gpu, r) in ranks.iter_mut() {
-        r.begin(gpu, token, pos)?;
+    for (_, r) in ranks.iter_mut() {
+        r.embd.fill(token)?;
     }
     for (_, r) in ranks.iter_mut() {
         r.next_pos = None;
+    }
+    for (gpu, r) in ranks.iter_mut() {
+        r.begin(gpu, pos)?;
     }
     for l in 0..layers {
         for sub in [Sub::Attn, Sub::Ffn] {
@@ -479,6 +509,24 @@ pub fn step(ranks: &mut [(&Gpu, &mut Rank)], token: u32, pos: u32) -> Result<u32
         r.next_pos = Some(pos + 1);
     }
     Ok(token)
+}
+
+/// Each rank uses its opener's stream, distinct from every earlier rank's.
+fn streams_at<'a, T: 'a>(
+    rank: usize,
+    opened: &Arc<T>,
+    offered: &T,
+    prior: impl IntoIterator<Item = &'a Arc<T>>,
+) -> Result<(), GpuError> {
+    if !std::ptr::eq(offered, opened.as_ref()) {
+        return Err(shape(format!("rank {rank}: use the GPU that opened it")));
+    }
+    if prior.into_iter().any(|p| Arc::ptr_eq(p, opened)) {
+        return Err(shape(format!(
+            "rank {rank}: each rank must use a distinct stream"
+        )));
+    }
+    Ok(())
 }
 
 /// The layer count of ranks whose trunks are `(layers, embedding width, head rows)` each, which
@@ -610,6 +658,22 @@ fn shape(detail: String) -> GpuError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    #[test]
+    fn ranks_use_their_openers_distinct_streams() {
+        let a = Arc::new(0u8);
+        let b = Arc::new(0u8);
+        assert!(super::streams_at(0, &a, &a, []).is_ok());
+        assert!(super::streams_at(1, &b, &b, [&a]).is_ok());
+        for (opened, offered, prior, want) in [
+            (&a, &b, &b, "use the GPU that opened it"),
+            (&a, &a, &a, "each rank must use a distinct stream"),
+        ] {
+            let e = super::streams_at(1, opened, offered, [prior]).unwrap_err();
+            assert!(e.to_string().contains(want), "{e}");
+        }
+    }
     use super::{alike, arm_at, at_pos, check_ctx};
     use model::arch::glm5next::place::ORACLE_POSITIONS;
 
