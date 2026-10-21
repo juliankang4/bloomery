@@ -245,6 +245,24 @@ impl Safetensors {
         self.entries.get(name)
     }
 
+    /// Where `name`'s bytes lie in the file: the byte range from the file's start.
+    pub fn file_range(&self, name: &str) -> Result<std::ops::Range<u64>, Error> {
+        let e = self
+            .entries
+            .get(name)
+            .ok_or_else(|| Error::Missing(name.to_string()))?;
+        Ok((self.data + e.start) as u64..(self.data + e.end) as u64)
+    }
+
+    /// The whole of the file's own read-only mapping, file offset `o` at index `o`; `None` for
+    /// bytes held on the heap ([`Safetensors::parse`]).
+    pub fn file_mapping(&self) -> Option<&[u8]> {
+        match &self.bytes {
+            Backing::Map(m) => Some(m),
+            Backing::Heap(_) => None,
+        }
+    }
+
     /// `name` as stored: dtype, shape and the bytes in the file.
     pub fn raw(&self, name: &str) -> Result<Raw<'_>, Error> {
         let e = self
@@ -373,6 +391,7 @@ pub fn f32_values(name: &str, raw: &Raw<'_>) -> Result<Vec<f32>, Error> {
 /// and folder names with no `\` or `:`, as `tensors/native-QB.safetensors`), and either mismatch,
 /// are refused by name.
 pub struct Folder {
+    dir: std::path::PathBuf,
     /// Each shard's file name and file, in the order the index first names them.
     shards: Vec<(String, Safetensors)>,
     /// A tensor's name to its shard.
@@ -444,7 +463,34 @@ impl Folder {
                 )));
             }
         }
-        Ok(Folder { shards, by_name })
+        Ok(Folder {
+            dir: dir.to_path_buf(),
+            shards,
+            by_name,
+        })
+    }
+
+    /// Where `name`'s bytes lie: its shard's path and the byte range in that file
+    /// ([`Safetensors::file_range`]), for a reader that maps or reads the file itself.
+    pub fn file_range(
+        &self,
+        name: &str,
+    ) -> Result<(std::path::PathBuf, std::ops::Range<u64>), Error> {
+        let (file, st) = self.shard(name)?;
+        Ok((self.dir.join(file), st.file_range(name)?))
+    }
+
+    /// Tensor `name`'s shard file, that file's whole read-only mapping
+    /// ([`Safetensors::file_mapping`]) and the tensor's byte range in it.
+    pub fn mapped(
+        &self,
+        name: &str,
+    ) -> Result<(std::path::PathBuf, &[u8], std::ops::Range<u64>), Error> {
+        let (file, st) = self.shard(name)?;
+        let map = st
+            .file_mapping()
+            .ok_or_else(|| bad(format!("{file} is no file's mapping")))?;
+        Ok((self.dir.join(file), map, st.file_range(name)?))
     }
 
     /// Every tensor name, sorted.
@@ -454,11 +500,16 @@ impl Folder {
 
     /// `name` as stored, from its shard.
     pub fn raw(&self, name: &str) -> Result<Raw<'_>, Error> {
+        self.shard(name)?.1.raw(name)
+    }
+
+    /// The file name and file of the shard that holds `name`.
+    fn shard(&self, name: &str) -> Result<&(String, Safetensors), Error> {
         let &at = self
             .by_name
             .get(name)
             .ok_or_else(|| Error::Missing(name.to_string()))?;
-        self.shards[at].1.raw(name)
+        Ok(&self.shards[at])
     }
 }
 

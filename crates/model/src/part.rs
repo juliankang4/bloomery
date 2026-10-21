@@ -10,6 +10,7 @@
 //! cut of a stack's experts.
 
 use std::ops::Range;
+use std::path::PathBuf;
 
 use gguf::{GgmlType, Split, TensorInfo};
 
@@ -103,15 +104,17 @@ impl Part<'_> {
             Bytes::Made(bytes) => vec![bytes],
         }
     }
+}
 
-    /// The bytes the part holds in memory of its own, beside the file's mapping.
-    #[must_use]
-    pub fn held(&self) -> usize {
-        match &self.bytes {
-            Bytes::File(_) => 0,
-            Bytes::Made(bytes) => bytes.len(),
-        }
-    }
+/// A row-gathered table's rows where a source stores them, for a reader that maps them there
+/// (a checkpoint folder's PLE table, its parts in the folder's shard files): rows of `row_bytes`
+/// bytes as the program reads them, each run a byte range of whole rows in a file, in row
+/// order, every row at the one tensor scale `scale`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredRows {
+    pub row_bytes: u64,
+    pub runs: Vec<(PathBuf, Range<u64>)>,
+    pub scale: f32,
 }
 
 /// Where a load reads its tensors.
@@ -131,6 +134,13 @@ pub trait Source {
     /// The bytes of the part `p` planned ([`Source::plan`]) and the tensor scales its type reads;
     /// a tensor no longer in the source is refused by name.
     fn read(&self, p: &Planned) -> Result<Part<'_>, Self::Error>;
+
+    /// Drop the file pages the source read part `p` from, once a load has copied its bytes and no
+    /// later reader takes them from the file. A source whose loads release their own pages (a
+    /// split's placed load, `PageDrop`) drops none here.
+    fn release(&self, _p: &Planned) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 impl Source for Split {

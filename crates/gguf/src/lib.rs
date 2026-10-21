@@ -205,8 +205,9 @@ pub enum LoadError {
 
 /// A parsed, mmap-backed GGUF file.
 pub struct Gguf {
-    // Kept alive for the mapping's lifetime; the mapping borrows the fd.
-    _file: File,
+    // Kept alive for the mapping's lifetime; the mapping borrows the fd. A
+    // header alone ([`Split::header_only`]) has no file.
+    _file: Option<File>,
     map: Backing,
     meta: Vec<(String, Value)>,
     tensors: Vec<TensorInfo>,
@@ -229,6 +230,8 @@ pub enum Weights {
 enum Backing {
     File(Mmap),
     Anon(MmapMut),
+    /// The header's bytes and no tensor's ([`Split::header_only`]).
+    Header(Vec<u8>),
 }
 
 impl std::ops::Deref for Backing {
@@ -237,6 +240,7 @@ impl std::ops::Deref for Backing {
         match self {
             Backing::File(m) => m,
             Backing::Anon(m) => m,
+            Backing::Header(h) => h,
         }
     }
 }
@@ -322,7 +326,7 @@ impl Gguf {
             }
         };
         Ok(Gguf {
-            _file: file,
+            _file: Some(file),
             map,
             meta: h.meta,
             tensors,
@@ -344,6 +348,11 @@ impl Gguf {
     /// Iterate all metadata pairs.
     pub fn iter_kv(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.meta.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Every metadata pair, in file order.
+    pub fn keys(&self) -> &[(String, Value)] {
+        &self.meta
     }
 
     /// Raw metadata lookup by exact key.
@@ -580,6 +589,27 @@ impl Split {
         Split::assemble(shards, paths)
     }
 
+    /// The header `layout` lays out, as one shard named `path`, holding no tensor's bytes: the
+    /// model of a checkpoint folder whose tensors a load reads through its part source
+    /// (`model::part::Source`) while its plan, tokenizer and chat surface read this header as
+    /// they read a split's. Every tensor is checked as a shard's is (its type, block alignment
+    /// and size, against the file `layout` would write), and every read of a tensor's bytes is
+    /// refused by name ([`Gguf::data`]: past the data the shard holds).
+    pub fn header_only(path: PathBuf, layout: &write::Layout) -> Result<Split, LoadError> {
+        let bytes = layout.header_bytes().to_vec();
+        let h = parse_header(&bytes, layout.file_len())?;
+        let tensors = strict_tensors(h.tensors, h.data_base, layout.file_len(), &[], true)?;
+        let shard = Gguf {
+            _file: None,
+            map: Backing::Header(bytes),
+            meta: h.meta,
+            tensors,
+            data_base: h.data_base,
+            alignment: h.alignment,
+        };
+        Split::assemble(vec![shard], vec![path])
+    }
+
     /// Index every tensor by name, refusing a name that appears twice.
     fn assemble(shards: Vec<Gguf>, paths: Vec<PathBuf>) -> Result<Split, LoadError> {
         let mut by_name: HashMap<String, (usize, usize)> = HashMap::new();
@@ -644,6 +674,11 @@ impl Split {
     /// The first shard's metadata pairs, in file order.
     pub fn iter_kv(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.shards[0].iter_kv()
+    }
+
+    /// [`Gguf::keys`] of the first shard.
+    pub fn keys(&self) -> &[(String, Value)] {
+        self.shards[0].keys()
     }
 
     /// [`Gguf::architecture`] of the first shard.
@@ -1360,6 +1395,40 @@ mod split_tests {
         );
         let s = Split::open(&p).unwrap();
         assert_eq!((s.shard_count(), s.tensor_count()), (1, 2));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A layout's header alone reads as the file the layout writes reads, and holds no tensor
+    /// bytes: every read of one is refused by name.
+    #[test]
+    fn a_header_alone_reads_as_its_file_and_refuses_every_byte() {
+        let d = set_dir("header");
+        let p = d.join("whole.gguf");
+        let kvs = [kv(GENERAL_ARCHITECTURE, Value::String("test".into()))];
+        write_gguf(&p, &kvs, &["a", "b"]);
+        let decl = |name: &str| TensorDecl {
+            name: name.into(),
+            dims: vec![4],
+            type_id: 0,
+            nbytes: 16,
+        };
+        let layout = crate::write::Layout::new(&kvs, vec![decl("a"), decl("b")]).unwrap();
+        let file = Split::open(&p).unwrap();
+        let head = Split::header_only(d.clone(), &layout).unwrap();
+        assert_eq!(head.keys(), file.keys());
+        let infos = |s: &Split| {
+            s.iter_tensors()
+                .map(|(i, t)| (i, t.name.clone(), t.dims.clone(), t.ty, t.offset, t.nbytes))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(infos(&head), infos(&file));
+        assert_eq!(head.shard_path(0), Some(d.as_path()));
+        let shard = head.shard(0).unwrap();
+        assert!(!shard.file_backed());
+        for (_, t) in head.iter_tensors() {
+            let e = shard.data(t).unwrap_err().to_string();
+            assert!(e.contains(&format!("{:?}", t.name)), "{e}");
+        }
         std::fs::remove_dir_all(&d).unwrap();
     }
 

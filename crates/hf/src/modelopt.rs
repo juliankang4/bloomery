@@ -887,6 +887,51 @@ fn fp8_append<'a>(
     Ok([rows, k])
 }
 
+/// The tensor scale of the FP8 row table `name` placed as `placed` ([`Format::Fp8Tensor`] read as
+/// [`Use::Rows`], whose bytes [`normalize`] keeps as stored), and its companion's name, from the
+/// headers and that one value: a table that is not 2-D F8_E4M3, or a companion that is not one
+/// finite F32 or BF16, is refused by name. A reader that maps the table's rows where they are
+/// stored checks its parts here without copying them.
+pub fn fp8_rows_scale<'a, 'p>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    name: &str,
+    placed: &'p Placed,
+) -> Result<(f32, &'p str), Error> {
+    let refuse = |what: String| Error::Format {
+        name: name.to_string(),
+        format: placed.format,
+        what,
+    };
+    let raw = get(name)?;
+    if placed.format != Format::Fp8Tensor || raw.dtype != Dtype::F8E4M3 || raw.shape.len() != 2 {
+        return Err(refuse(format!(
+            "is {} {:?}, not F8_E4M3 rows",
+            raw.dtype.name(),
+            raw.shape
+        )));
+    }
+    let [scale_name] = placed.companions.as_slice() else {
+        return Err(refuse(format!(
+            "reads {:?}, not one tensor scale",
+            placed.companions
+        )));
+    };
+    let s = get(scale_name)?;
+    finite(scale_name, &s)?;
+    let scale = match (s.dtype, s.bytes) {
+        (Dtype::F32, &[a, b, c, d]) => f32::from_le_bytes([a, b, c, d]),
+        (Dtype::Bf16, &[a, b]) => f32::from_bits(u32::from(u16::from_le_bytes([a, b])) << 16),
+        _ => {
+            return Err(refuse(format!(
+                "scale {scale_name} is {} {:?}, not one F32 or BF16",
+                s.dtype.name(),
+                s.shape
+            )));
+        }
+    };
+    Ok((scale, scale_name))
+}
+
 /// A tensor of a format that is neither NVFP4 nor stacked: FP8 rows, or BF16 and F32.
 fn plain<'a>(
     get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
@@ -903,32 +948,7 @@ fn plain<'a>(
     let raw = get(name)?;
     let dims: Vec<u64> = raw.shape.iter().rev().map(|&d| d as u64).collect();
     if placed.format == Format::Fp8Tensor {
-        if raw.dtype != Dtype::F8E4M3 || raw.shape.len() != 2 {
-            return Err(refuse(format!(
-                "is {} {:?}, not F8_E4M3 rows",
-                raw.dtype.name(),
-                raw.shape
-            )));
-        }
-        let [scale_name] = placed.companions.as_slice() else {
-            return Err(refuse(format!(
-                "reads {:?}, not one tensor scale",
-                placed.companions
-            )));
-        };
-        let s = get(scale_name)?;
-        finite(scale_name, &s)?;
-        let scale = match (s.dtype, s.bytes) {
-            (Dtype::F32, &[a, b, c, d]) => f32::from_le_bytes([a, b, c, d]),
-            (Dtype::Bf16, &[a, b]) => f32::from_bits(u32::from(u16::from_le_bytes([a, b])) << 16),
-            _ => {
-                return Err(refuse(format!(
-                    "scale {scale_name} is {} {:?}, not one F32 or BF16",
-                    s.dtype.name(),
-                    s.shape
-                )));
-            }
-        };
+        let (scale, scale_name) = fp8_rows_scale(&get, name, placed)?;
         let decoder = E4m3Rows::new(scale);
         let mut values = [0.0; 256];
         for (chunk, bytes) in raw.bytes.chunks(values.len()).enumerate() {

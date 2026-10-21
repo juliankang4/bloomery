@@ -26,7 +26,9 @@ embed 0 0 0
 # libc's pread into a buffer that may hold bytes never written (read_span_uninit, which the NVMe tier's pinned arena
 # reads into), one block, and read_span views its initialized bytes as that buffer, one block; each with its SAFETY
 # line.
-engram 10 0 0
+# PIN(2026-10-22): engram 10 -> 11 blocks, new code, not old code relaxed: RunTable maps each file that holds a
+# table's runs (a checkpoint folder's shards) read-only with memmap2's map, one block with its SAFETY line.
+engram 11 0 0
 engram-lab 0 0 0
 gguf 7 2 0
 # PIN(2026-10-01): gpu 1354 -> 1356, a new kernel entry, not old code relaxed: kda_delta_lanes (GLM's two-row
@@ -552,10 +554,15 @@ metal 21 6 13
 # compute call (ops.rs dispatch_ccd, over each run of a block) and the warm walk's prefetch (ops.rs warm_touch), each
 # with its SAFETY line, and the cut test's RowSet double (ccd_tests::Pairs, whose `unsafe fn compute` the trait
 # makes unsafe).
-model 108 31 13
+# PIN(2026-10-22): model 108 -> 109 blocks, 31 -> 32 fns, new code, not old code relaxed: host_lock's
+# release_file_pages, an unsafe fn whose caller states that the slice is a file's own read-only mapping, and the one
+# block that hands that slice to FileMapping::new, with its SAFETY line.
+model 109 32 13
 # model-hf: the four blocks that left model (119 -> 115) with the fixture bin and its test, the page-fault reads (`getrusage`),
 # each with its SAFETY line; no new unsafe.
-model-hf 0 0 0
+# PIN(2026-10-22): model-hf 0 -> 1 block, new code, not old code relaxed: Checkpoint::release calls
+# release_file_pages on the shard mapping safetensors::Folder::mapped gives, with its SAFETY line.
+model-hf 1 0 0
 models 0 0 0
 # PIN(2026-10-21): os 24 blocks, 5 fns, not old code relaxed: the host chain's OS calls moved here from threads,
 # gguf, engram and model (their pins come down), each beside its macOS body, each block with its SAFETY line.

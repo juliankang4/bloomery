@@ -787,12 +787,17 @@ impl<'a> FileMapping<'a> {
         FileMapping(map)
     }
 
-    /// Shard `s` of `split`'s mapping.
+    /// Shard `s` of `split`'s mapping; a shard that is no file's mapping (a
+    /// header alone, `Split::header_only`) is refused by name.
     pub(crate) fn shard(split: &'a Split, s: usize) -> Result<FileMapping<'a>, PlacementError> {
         let g = shard_of(split, s)?;
-        // SAFETY: `Split::open` opens every shard with `Gguf::open`, a
-        // read-only file mapping (`Weights::Mapped`), and a split has no
-        // other constructor.
+        if !g.file_backed() {
+            return Err(PlacementError::Host(format!(
+                "shard {s} is a header alone, no file's mapping: it holds no page of the file"
+            )));
+        }
+        // SAFETY: a file-backed shard's mapping is the file's own read-only
+        // mapping (`Gguf::file_backed`, `Split::open`'s `Gguf::open`).
         Ok(unsafe { FileMapping::new(g.mapping()) })
     }
 
@@ -808,9 +813,10 @@ impl<'a> FileMapping<'a> {
 /// `map` is the file's own mapping ([`FileMapping`]); `None` is a file this
 /// process maps no page of there (a resident sidecar), and only the page
 /// cache's copy goes. The one owner of page release: [`PageDrop`] and
-/// `r8file::verify` call it.
+/// `r8file::verify` call it, and [`release_file_pages`] for a file outside a
+/// split.
 pub(crate) fn drop_pages(
-    name: &HostFile,
+    name: &dyn fmt::Display,
     file: &File,
     map: Option<FileMapping<'_>>,
     at: Range<u64>,
@@ -861,6 +867,28 @@ pub(crate) fn drop_pages(
         ))
     })?;
     Ok(end - first)
+}
+
+/// [`PageDrop::release`] for a file outside a split (a checkpoint folder's
+/// shard): the whole pages inside bytes `at` of the file at `path`, whose
+/// whole mapping is `map`, dropped from this process's page tables and then
+/// from the page cache; the bytes dropped. For bytes a load has copied that
+/// no later reader takes from the file.
+///
+/// # Safety
+///
+/// `map` is the whole of the file's own read-only `MAP_SHARED` mapping, file
+/// offset `o` at index `o` ([`FileMapping::new`]'s contract).
+pub unsafe fn release_file_pages(
+    path: &std::path::Path,
+    map: &[u8],
+    at: Range<u64>,
+) -> Result<u64, PlacementError> {
+    let file = File::open(path)
+        .map_err(|e| PlacementError::Host(format!("open {}: {e}", path.display())))?;
+    // SAFETY: the caller's contract is `FileMapping::new`'s.
+    let map = unsafe { FileMapping::new(map) };
+    drop_pages(&path.display(), &file, Some(map), at)
 }
 
 /// The line a page drop prints once when the platform has no
@@ -1401,6 +1429,25 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).unwrap();
         println!("walk: a chunk's panic is its named refusal, its taken span handed back ({e})");
+    }
+
+    /// A header alone (`Split::header_only`) is no file's mapping: a page release over it is
+    /// refused by name before any advice, as its bytes are a heap copy `MADV_DONTNEED` would zero.
+    #[test]
+    fn a_header_alone_releases_no_page() {
+        let decl = TensorDecl {
+            name: "w".to_string(),
+            dims: vec![4],
+            type_id: 0,
+            nbytes: 16,
+        };
+        let layout = Layout::new(&[], vec![decl]).unwrap();
+        let split = Split::header_only(std::env::temp_dir().join("header-alone"), &layout).unwrap();
+        let e = super::PageDrop::new(&split)
+            .release(0, 0..16)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("a header alone"), "{e}");
     }
 
     /// A cut keeps every page once and in order, and its pieces differ by at

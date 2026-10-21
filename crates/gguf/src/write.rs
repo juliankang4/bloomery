@@ -211,6 +211,11 @@ impl Layout {
         self.header.len() as u64
     }
 
+    /// The header's bytes, zero-padded to the data base.
+    pub fn header_bytes(&self) -> &[u8] {
+        &self.header
+    }
+
     /// The alignment every tensor's offset and the data base keep.
     pub fn alignment(&self) -> u64 {
         self.alignment

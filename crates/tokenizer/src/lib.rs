@@ -124,7 +124,16 @@ impl Tokenizer {
     /// Load the vocabulary from a GGUF file's header; for a split set, the
     /// first shard (the one that carries `tokenizer.ggml.*`).
     pub fn from_gguf(path: impl AsRef<Path>) -> Result<Tokenizer, Error> {
-        let (vocab, encoding, hf_texts) = Vocab::load(path.as_ref())?;
+        let path = path.as_ref();
+        let inv =
+            gguf::inventory_of(path).map_err(|e| Error::Gguf(path.display().to_string(), e))?;
+        Tokenizer::from_keys(&inv.meta)
+    }
+
+    /// Load the vocabulary from a model header's metadata pairs (`gguf::Split::keys`): a
+    /// checkpoint folder's header, which no file holds, reads as a GGUF file's.
+    pub fn from_keys(keys: &[(String, gguf::Value)]) -> Result<Tokenizer, Error> {
+        let (vocab, encoding, hf_texts) = Vocab::load(keys)?;
         let encoder = encoder::Encoder::new(encoding, &vocab)?;
         let spelling = encoder.spelling();
         let specials = vocab.special_order();

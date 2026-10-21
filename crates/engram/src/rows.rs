@@ -14,6 +14,7 @@
 //! advised, populated, classified, copied and evicted by expert id.
 
 use std::fs::File;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -290,5 +291,255 @@ impl RowTables for SplitTable {
 
     fn table(&self, i: usize) -> Option<&dyn RowTable> {
         (i == 0).then_some(self as &dyn RowTable)
+    }
+}
+
+/// A row-gathered table held as runs of whole rows in files of its own, in row order (a
+/// checkpoint folder's PLE table, each part a tensor of the folder's shards), read from the
+/// NVMe tier as [`SplitTable`] reads a split's table: one read-only mapping a file, and the
+/// same advice, residency query and copy over each run's bytes.
+pub struct RunTable {
+    name: String,
+    /// Each file's path and mapping, in the order the runs first name them.
+    files: Vec<(PathBuf, memmap2::Mmap)>,
+    /// Each run's file, its first byte in that file, and the table's first row past it.
+    runs: Vec<(usize, usize, u64)>,
+    row_bytes: u64,
+    page: usize,
+}
+
+impl RunTable {
+    /// The table `name` of `row_bytes`-byte rows held as `runs`, in row order: each a file and
+    /// the byte range of whole rows it holds there. Each file is mapped once, read-only, under
+    /// `advice`. A table of no rows, of empty rows or past `u32` row ids, a run that is not whole
+    /// rows and a run past its file's end are refused by name before any advice.
+    pub fn open(
+        name: &str,
+        row_bytes: u64,
+        runs: &[(PathBuf, Range<u64>)],
+        advice: PageAdvice,
+    ) -> Result<RunTable, EngramError> {
+        let rows_err = |rows: u64| EngramError::RunRows {
+            name: name.to_owned(),
+            rows,
+            row_bytes,
+        };
+        if row_bytes == 0 {
+            return Err(rows_err(0));
+        }
+        let mut files: Vec<(PathBuf, memmap2::Mmap)> = Vec::new();
+        let mut placed = Vec::with_capacity(runs.len());
+        let mut end = 0u64;
+        for (path, at) in runs {
+            let file = match files.iter().position(|(p, _)| p == path) {
+                Some(file) => file,
+                None => {
+                    let io = |op, source| EngramError::SiteIo {
+                        name: name.to_owned(),
+                        path: path.clone(),
+                        op,
+                        source,
+                    };
+                    let f = File::open(path).map_err(|e| io("open", e))?;
+                    // SAFETY: read-only, and nothing maps the file writable: the contract
+                    // `gguf::Gguf::open_backed` accepts for a split's shards.
+                    let map = unsafe { memmap2::Mmap::map(&f) }.map_err(|e| io("mmap", e))?;
+                    files.push((path.clone(), map));
+                    files.len() - 1
+                }
+            };
+            let len = files[file].1.len() as u64;
+            let nbytes = at.end.saturating_sub(at.start);
+            if at.end > len || at.start > at.end {
+                return Err(EngramError::PastEndOfFile {
+                    name: name.to_owned(),
+                    path: path.clone(),
+                    base: 0,
+                    off: at.start,
+                    nbytes,
+                    len,
+                });
+            }
+            if !nbytes.is_multiple_of(row_bytes) {
+                return Err(EngramError::Untiled {
+                    name: name.to_owned(),
+                    rows: nbytes / row_bytes,
+                    row_bytes,
+                    product: nbytes / row_bytes * row_bytes,
+                    nbytes,
+                });
+            }
+            // Inside a mapping of the file, so inside usize.
+            let start = at.start as usize;
+            end += nbytes / row_bytes;
+            placed.push((file, start, end));
+        }
+        if end == 0 || u32::try_from(end - 1).is_err() {
+            return Err(rows_err(end));
+        }
+        let table = RunTable {
+            name: name.to_owned(),
+            files,
+            runs: placed,
+            row_bytes,
+            page: page_size(),
+        };
+        let (flag, op) = advice.madvise();
+        for i in 0..table.runs.len() {
+            table.view(i).advise_all(flag, op)?;
+        }
+        Ok(table)
+    }
+
+    /// Rows in the table.
+    pub fn rows(&self) -> u64 {
+        self.runs.last().map_or(0, |r| r.2)
+    }
+
+    /// Run `i`'s bytes as the row reads see them.
+    fn view(&self, i: usize) -> TableBytes<'_> {
+        let (file, start, end) = self.runs[i];
+        let first = i.checked_sub(1).map_or(0, |p| self.runs[p].2);
+        let len = ((end - first) * self.row_bytes) as usize;
+        let (path, map) = &self.files[file];
+        TableBytes {
+            name: &self.name,
+            path,
+            bytes: &map[start..start + len],
+            row_bytes: self.row_bytes as usize,
+            page: self.page,
+        }
+    }
+
+    /// `ids` cut into stretches that lie in one run, in order: each run, the stretch's ids as
+    /// that run's own rows, and where the stretch starts in `ids`. An id past the table is
+    /// refused by name.
+    fn stretches(&self, ids: &[u32]) -> Result<Vec<(usize, Vec<u32>, usize)>, EngramError> {
+        let mut out: Vec<(usize, Vec<u32>, usize)> = Vec::new();
+        for (at, &id) in ids.iter().enumerate() {
+            let run = self.runs.partition_point(|r| r.2 <= u64::from(id));
+            if run == self.runs.len() {
+                return Err(EngramError::RowOutOfRange {
+                    name: self.name.clone(),
+                    id,
+                    rows: self.rows(),
+                });
+            }
+            let first = run.checked_sub(1).map_or(0, |p| self.runs[p].2);
+            // Below the run's end, which `open` held inside u32.
+            let own = (u64::from(id) - first) as u32;
+            match out.last_mut() {
+                Some((r, own_ids, _)) if *r == run => own_ids.push(own),
+                _ => out.push((run, vec![own], at)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// `op` over each stretch of `ids` in its run's bytes.
+    fn each(
+        &self,
+        ids: &[u32],
+        mut op: impl FnMut(TableBytes<'_>, &[u32]) -> Result<(), EngramError>,
+    ) -> Result<(), EngramError> {
+        for (run, own, _) in self.stretches(ids)? {
+            op(self.view(run), &own)?;
+        }
+        Ok(())
+    }
+}
+
+impl RowTable for RunTable {
+    fn row_bytes(&self) -> u64 {
+        self.row_bytes
+    }
+
+    fn prefetch(&self, ids: &[u32]) -> Result<(), EngramError> {
+        self.each(ids, |v, own| v.prefetch(own))
+    }
+
+    fn populate(&self, ids: &[u32]) -> Result<(), EngramError> {
+        self.each(ids, |v, own| v.populate(own))
+    }
+
+    fn resident_rows(&self, ids: &[u32]) -> Result<u64, EngramError> {
+        let mut n = 0;
+        self.each(ids, |v, own| {
+            n += v.resident_rows(own)?;
+            Ok(())
+        })?;
+        Ok(n)
+    }
+
+    fn copy_rows(&self, ids: &[u32], out: &mut [u8]) -> Result<(), EngramError> {
+        let rb = self.row_bytes as usize;
+        if out.len() != ids.len() * rb {
+            return Err(EngramError::OutBufferSize {
+                name: self.name.clone(),
+                rows: ids.len(),
+                want: ids.len() * rb,
+                got: out.len(),
+            });
+        }
+        for (run, own, at) in self.stretches(ids)? {
+            let span = at * rb..(at + own.len()) * rb;
+            self.view(run).copy_rows(&own, &mut out[span])?;
+        }
+        Ok(())
+    }
+}
+
+impl RowTables for RunTable {
+    fn count(&self) -> usize {
+        1
+    }
+
+    fn table(&self, i: usize) -> Option<&dyn RowTable> {
+        (i == 0).then_some(self as &dyn RowTable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PageAdvice, RunTable};
+    use crate::{EngramError, RowTable};
+
+    /// Rows read across runs in two files come back in the ids' order, each run's own; an id
+    /// past the table, a run past its file and a run of part of a row are refused by name.
+    #[test]
+    fn a_run_table_reads_each_row_from_its_run() {
+        let dir = std::env::temp_dir().join(format!("engram-runs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        // Rows of 4 bytes, every byte the row's id; file a holds rows 0..2 after 3 bytes of
+        // something else, file b rows 2..5 and then rows 5..6 after one row's gap.
+        let row = |id: u8| [id; 4];
+        let mut fa = vec![9u8; 3];
+        fa.extend(row(0).iter().chain(&row(1)));
+        let mut fb: Vec<u8> = [2, 3, 4].iter().flat_map(|&i| row(i)).collect();
+        fb.extend([7u8; 4].iter().chain(&row(5)));
+        std::fs::write(&a, &fa).unwrap();
+        std::fs::write(&b, &fb).unwrap();
+        let run = |path: &std::path::Path, offset: u64, rows: u64| {
+            (path.to_path_buf(), offset..offset + rows * 4)
+        };
+        let runs = [run(&a, 3, 2), run(&b, 0, 3), run(&b, 16, 1)];
+        let t = RunTable::open("t", 4, &runs, PageAdvice::Random).unwrap();
+        assert_eq!(t.rows(), 6);
+        let ids = [5, 0, 1, 2, 4, 3, 1];
+        let mut out = vec![0u8; ids.len() * 4];
+        t.copy_rows(&ids, &mut out).unwrap();
+        let want: Vec<u8> = ids.iter().flat_map(|&i| row(i as u8)).collect();
+        assert_eq!(out, want);
+        t.prefetch(&ids).unwrap();
+        assert!(matches!(
+            t.copy_rows(&[6], &mut [0; 4]),
+            Err(EngramError::RowOutOfRange { id: 6, rows: 6, .. })
+        ));
+        let past = RunTable::open("t", 4, &[run(&b, 16, 2)], PageAdvice::Random);
+        assert!(matches!(past, Err(EngramError::PastEndOfFile { .. })));
+        let torn = RunTable::open("t", 4, &[(a.clone(), 3..9)], PageAdvice::Random);
+        assert!(matches!(torn, Err(EngramError::Untiled { .. })));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

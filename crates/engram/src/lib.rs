@@ -185,6 +185,16 @@ pub enum EngramError {
         product: u64,
         nbytes: u64,
     },
+    /// A table held as runs ([`rows::RunTable`]) of no rows, of empty rows, or of more rows
+    /// than a `u32` row id names.
+    #[error(
+        "{name}: {rows} rows of {row_bytes} B: a run table holds 1 to 2^32 rows of at least one byte"
+    )]
+    RunRows {
+        name: String,
+        rows: u64,
+        row_bytes: u64,
+    },
     #[error("{name}: data at {base}+{off} + {nbytes} B runs past the {len} B file {path}")]
     PastEndOfFile {
         name: String,
@@ -670,7 +680,8 @@ impl TableBytes<'_> {
         // mapping this type covers is a read-only file mapping (a site's own,
         // and a split's, whose shards `gguf::Split::open` maps from their
         // files and nothing else), where it drops the page-table entries and
-        // the next touch reads the file's bytes again.
+        // the next touch reads the file's bytes again. A run table's
+        // (`rows::RunTable`) maps its files read-only too.
         let rc = unsafe { libc::madvise(first as *mut libc::c_void, len, advice) };
         if rc == 0 {
             Ok(())
