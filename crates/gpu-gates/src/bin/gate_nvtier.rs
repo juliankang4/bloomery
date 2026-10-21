@@ -1996,6 +1996,12 @@ fn run() -> Result<(), GateError> {
     // `grant` (clause 13)'s children run before the paged arm holds its
     // arena; their answer is read after the `bits` line.
     let grant = grant_run(&grant_terms);
+    // The all-RAM arm loads first: the paged arm's tier, which the clauses
+    // below read, holds its arena until the stepunion arms, and the host's
+    // reading at the all-RAM arm's load would lose those bytes.
+    let ram = arm(
+        path, &machine, None, residency, host, &ids, false, &probe, None,
+    )?;
     let mut paged = arm(
         path,
         &machine,
@@ -2006,9 +2012,6 @@ fn run() -> Result<(), GateError> {
         audit,
         &probe,
         band,
-    )?;
-    let ram = arm(
-        path, &machine, None, residency, host, &ids, false, &probe, None,
     )?;
 
     let tokens_eq = paged.tokens == ram.tokens;
