@@ -4580,26 +4580,16 @@ impl ChainBody for Body38 {
     /// raw and pooled keys need nothing: nothing reads a row at or past a
     /// live count, and every row below it is written by its own step first.
     /// Synchronizes: the engine stream waited for within
-    /// [`crate::host::ENGINE_BOUND`] before the first blocking copy and at
+    /// [`crate::host::ENGINE_BOUND`] before zeroing the stores and at
     /// the end ([`crate::host::await_done`]).
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         const WHAT: &str = "Body38::reset";
         let stream = gpu.stream();
         self.hybrid.settle(stream)?;
         crate::host::await_done(WHAT, || stream.query()).map_err(|e| self.hybrid.noted(e))?;
-        let most = self
-            .stores
-            .iter()
-            .map(|s| match s {
-                Store38::Rec { rec, .. } => rec.state.len().max(rec.ring.len()),
-                Store38::Qsa { .. } => 0,
-            })
-            .max()
-            .unwrap_or(0);
-        let zeros = vec![0.0f32; most];
         for s in &mut self.stores {
             if let Store38::Rec { rec, .. } = s {
-                rec.clear(stream, &zeros)?;
+                rec.clear(stream)?;
             }
             s.restamp(stream)?;
         }

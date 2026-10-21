@@ -60,8 +60,7 @@ pub(crate) fn rda_store(
 /// addresses): every lane and the ring zero, lane 0 at position 0. Never
 /// inside a capture.
 pub(crate) fn clear_store(stream: &CudaStream, store: &mut RecStore) -> Result<(), GpuError> {
-    store.state.zero_async(stream)?;
-    store.ring.zero_async(stream)?;
+    store.clear(stream)?;
     store.restamp(stream)
 }
 
@@ -281,7 +280,31 @@ impl Lanes {
 
 #[cfg(test)]
 mod tests {
-    use super::{Book, PASS_ROWS, Pass, Waiting};
+    use super::{Book, GpuError, PASS_ROWS, Pass, RecStore, Waiting, clear_store};
+
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_clear_store_resets_values_and_stamps() -> Result<(), GpuError> {
+        let (_ctx, stream) = crate::capsync::fresh_stream(0)?;
+        let mut store = RecStore::stamped(&stream, [68, 13], 4)?;
+        store.restamp_at(&stream, 3, 29)?;
+        for buf in [&mut store.state, &mut store.ring] {
+            buf.copy_from_host(&stream, &vec![f32::NAN; buf.len()])?;
+        }
+        clear_store(&stream, &mut store)?;
+        for buf in [&store.state, &store.ring] {
+            assert!(buf.to_host_vec(&stream)?.iter().all(|v| v.to_bits() == 0));
+        }
+        assert_eq!(
+            store
+                .stamp
+                .as_ref()
+                .expect("stamped store")
+                .to_host_vec(&stream)?,
+            crate::recur::fresh_stamps(4)
+        );
+        Ok(())
+    }
 
     fn book(committed: u32) -> Book {
         Book {

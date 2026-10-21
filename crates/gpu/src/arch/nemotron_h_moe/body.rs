@@ -75,9 +75,6 @@ pub struct Body {
     ms: MoeScratch,
     /// The residual stream's second buffer ([`Body::enqueue`]).
     r: DeviceBuffer<f32>,
-    /// Host zeros as long as the longest recurrent buffer, what a reset
-    /// copies over every store.
-    zeros: Vec<f32>,
     /// The step record's host words, rewritten by every refresh.
     words: Words,
     /// The prompt pass's buffers ([`Body::enqueue_pass`]).
@@ -302,14 +299,6 @@ impl Body {
             scale: hp.weights_scale,
         };
         let ff = hp.experts.iter().flatten().map(|x| x.ff).max().unwrap_or(0);
-        let longest = layers
-            .iter()
-            .filter_map(|l| match l {
-                Layer::Mamba(m) => Some(m.store.state.len().max(m.store.ring.len())),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
         // A whole-card load's pass rows come from the card's room after the
         // weights, the stores and the acts are resident: the largest pass
         // whose buffers fit what is left, before anything after them
@@ -347,7 +336,6 @@ impl Body {
             s: hybrid::Scratch::new(stream, &sh, hp.n_head, 0)?,
             ms: MoeScratch::new(stream, moe, hidden, ff)?,
             r: DeviceBuffer::zeroed(stream, hidden)?,
-            zeros: vec![0.0; longest],
             words: Words::new(n_kv),
             sh,
             moe,
@@ -536,7 +524,7 @@ impl ChainBody for Body {
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         for layer in &mut self.layers {
             if let Layer::Mamba(m) = layer {
-                m.store.clear(gpu.stream(), &self.zeros)?;
+                m.store.clear(gpu.stream())?;
             }
         }
         if let Some(p) = self.placed.as_mut() {

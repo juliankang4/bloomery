@@ -2805,19 +2805,9 @@ impl ChainBody for Body35 {
         if let Some(p) = self.placed.as_mut() {
             p.reset(stream)?;
         }
-        let most = self
-            .stores
-            .iter()
-            .map(|s| match s {
-                LayerStore::Rec(r) => r.state.len().max(r.ring.len()),
-                LayerStore::Kv(_) => 0,
-            })
-            .max()
-            .unwrap_or(0);
-        let zeros = vec![0.0f32; most];
         for s in &mut self.stores {
             if let LayerStore::Rec(r) = s {
-                r.clear(stream, &zeros)?;
+                r.clear(stream)?;
             }
         }
         self.ckpt.clear();

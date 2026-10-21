@@ -78,20 +78,11 @@ impl RecStore {
         }
     }
 
-    /// Every lane of the state and the whole ring back to zero, in stream
-    /// order through `zeros` (host zeros at least as long as the longer of
-    /// the two). Never inside a capture.
-    pub(crate) fn clear(&mut self, stream: &CudaStream, zeros: &[f32]) -> Result<(), GpuError> {
-        for buf in [&mut self.state, &mut self.ring] {
-            let n = buf.len();
-            let src = zeros.get(..n).ok_or_else(|| {
-                GpuError::shape(
-                    "recur::RecStore::clear",
-                    format!("{} host zeros for a {n}-value buffer", zeros.len()),
-                )
-            })?;
-            buf.copy_from_host(stream, src)?;
-        }
+    /// Every lane of the state and the whole ring back to zero on the
+    /// device, ordered on `stream`. The stamps are unchanged.
+    pub(crate) fn clear(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.state.zero_async(stream)?;
+        self.ring.zero_async(stream)?;
         Ok(())
     }
 
@@ -99,6 +90,48 @@ impl RecStore {
         self.state.num_bytes()
             + self.ring.num_bytes()
             + self.stamp.as_ref().map_or(0, DeviceBuffer::num_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_clear_keeps_stamps_and_addresses() -> Result<(), GpuError> {
+        let (_ctx, stream) = crate::capsync::fresh_stream(0)?;
+        for lanes in [1, 2, 4] {
+            let mut store = RecStore::stamped(&stream, [17 * lanes, 13], lanes)?;
+            let lane = u32::try_from(lanes - 1).expect("test lane fits u32");
+            store.restamp_at(&stream, lane, 29)?;
+            let stamps = store
+                .stamp
+                .as_ref()
+                .expect("stamped store")
+                .to_host_vec(&stream)?;
+            let addresses = (store.state.cu_deviceptr(), store.ring.cu_deviceptr());
+            for buf in [&mut store.state, &mut store.ring] {
+                buf.copy_from_host(&stream, &vec![f32::NAN; buf.len()])?;
+            }
+            store.clear(&stream)?;
+            for buf in [&store.state, &store.ring] {
+                assert!(buf.to_host_vec(&stream)?.iter().all(|v| v.to_bits() == 0));
+            }
+            assert_eq!(
+                addresses,
+                (store.state.cu_deviceptr(), store.ring.cu_deviceptr())
+            );
+            assert_eq!(
+                store
+                    .stamp
+                    .as_ref()
+                    .expect("stamped store")
+                    .to_host_vec(&stream)?,
+                stamps
+            );
+        }
+        Ok(())
     }
 }
 

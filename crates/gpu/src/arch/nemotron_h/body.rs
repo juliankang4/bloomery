@@ -36,9 +36,6 @@ pub struct Body {
     pub(super) r: DeviceBuffer<f32>,
     /// A prompt pass's buffers ([`super::prefill`]).
     pub(super) prompt: Prompt,
-    /// Host zeros as long as the longest recurrent buffer, what a reset
-    /// copies over every store.
-    zeros: Vec<f32>,
     /// The step record's host words, rewritten by every refresh.
     words: Words,
 }
@@ -103,21 +100,12 @@ impl Body {
             ctx,
         };
         let ff = hp.ff.iter().copied().max().unwrap_or(0);
-        let longest = layers
-            .iter()
-            .filter_map(|l| match l {
-                Layer::Mamba(m) => Some(m.store.state.len().max(m.store.ring.len())),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
         Ok(Body {
             k: Kernels::load(gpu)?,
             prompt: Prompt::new(stream, PASS_ROWS.min(ctx), &sh, (hp.n_head, ff), &layers)?,
             acts: Acts::new(stream, layers.iter().flat_map(Layer::sites))?,
             s: Scratch::new(stream, &sh, hp.n_head, ff)?,
             r: DeviceBuffer::zeroed(stream, hidden)?,
-            zeros: vec![0.0; longest],
             words: Words::new(n_kv),
             sh,
             layers,
@@ -200,7 +188,7 @@ impl ChainBody for Body {
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         for layer in &mut self.layers {
             if let Layer::Mamba(m) = layer {
-                m.store.clear(gpu.stream(), &self.zeros)?;
+                m.store.clear(gpu.stream())?;
             }
         }
         Ok(())

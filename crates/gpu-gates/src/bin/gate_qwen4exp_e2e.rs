@@ -1032,14 +1032,33 @@ mod gate {
             &graph,
             true,
         );
-        // After the pass's state: `reset` must clear it.
-        let again = run_steps(m, toks, StepMode::Graph, true)?;
+        m.reset()?;
+        let (reset_stores, ring) = stores(m)?;
+        let mut recs = 0;
+        let zero = reset_stores.iter().all(|s| match s {
+            Store38Host::Rec { state, ring } => {
+                recs += 1;
+                state.iter().chain(ring).all(|v| v.to_bits() == 0)
+            }
+            Store38Host::Qsa { .. } => true,
+        });
+        let cleared = recs > 0 && zero && ring.iter().all(|v| v.to_bits() == 0);
+        println!(
+            "reset: {recs} recurrent stores and PLE ring zero {}",
+            verdict(cleared)
+        );
+        ok &= cleared;
+        let again = run_steps(m, toks, StepMode::Graph, false)?;
         ok &= same_run(
             "after the pass's state and a reset, the same five steps",
             &again,
             &graph,
             false,
         );
+        let (&last, prompt) = toks.split_last().ok_or("reset clause has no tokens")?;
+        run_pass(m, prompt)?;
+        let decode = run_steps(m, &[last], StepMode::Graph, false)?;
+        ok &= same_run("prompt then graph decode vs steps", &decode, &graph, true);
         Ok((ok, eager))
     }
 
@@ -3723,21 +3742,7 @@ mod gate {
     /// of each layer it runs without the host leg ([`hostless`]), and its
     /// replay serves each other layer on the host once.
     fn card_rows(m: &mut Qwen38Model, toks: &[u32], plan: &PlanFacts) -> Result<bool, GateError> {
-        let eager = run_steps(m, toks, StepMode::Eager, true)?;
-        let graph = run_steps(m, toks, StepMode::Graph, true)?;
-        let mut ok = same_run(
-            "card plan: five eager steps vs five graph replays",
-            &eager,
-            &graph,
-            false,
-        );
-        let pass = run_pass(m, toks)?;
-        ok &= same_run(
-            "card plan: one pass of five rows vs five graph steps",
-            &pass,
-            &graph,
-            true,
-        );
+        let (mut ok, _) = paths(m, toks)?;
         let want_memops = shape().memops_card(hostless(plan));
         let want = (
             shape().nodes_verify_card(plan.card_layers) - (memops() - want_memops),
