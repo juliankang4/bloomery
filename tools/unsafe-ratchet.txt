@@ -428,7 +428,11 @@ gguf 7 2 0
 # PIN(2026-10-22): gpu 2127 -> 2150 blocks, 249 -> 251 fns, new code, not old code relaxed:
 # dense MMA staging, shared reads, calls and stores, three checked kernel entries, and block-wide replay votes.
 # The exact tile owner takes explicit coordinates for exceptional MMA replay; each block has its SAFETY invariant.
-gpu 2150 251 10
+# PIN(2026-10-23): gpu 2150 -> 2159 blocks, 251 -> 259 fns: head-128, per-sequence and K192
+# appends require distinct cache writers, including ring rows modulo the ring height. The KV
+# helpers propagate the contract to their callers, which upload consecutive positions per sequence.
+# Each new call block has its SAFETY invariant; no device operation changes.
+gpu 2159 259 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -506,7 +510,10 @@ gpu-deepseek41 382 44 0
 # PIN(2026-10-22): gpu-gates 88 -> 89 blocks, new code, not old code relaxed: MiniCPM-V 4.7's full-vocabulary DSpark
 # draft (shared/dspark_hf.rs) borrows the target's resident Q6_K head in place, as the DFlash2 draft does, with its
 # SAFETY line; the seat checks the draft's CUDA context against the target's first.
-gpu-gates 89 5 1
+# PIN(2026-10-23): gpu-gates 89 -> 99 blocks: head-128 and K192 append calls vouch for
+# cache writers checked before upload or generated consecutively within each plane or ring.
+# Each call has its own SAFETY line; no device memory operation is added.
+gpu-gates 99 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of
@@ -522,7 +529,10 @@ gpu-gemma4a 11 0 0
 # (mem_batch) and adds the parts in rank order (Gathers::enqueue_sum), each call in a block of its own with its
 # SAFETY line; the rank holds the page past every launch it enqueues.
 gpu-glm5next 7 0 0
-gpu-mimo2 0 0 0
+# PIN(2026-10-23): gpu-mimo2 0 -> 5 blocks, 0 -> 1 fns: enqueue_append propagates the
+# K192 cache-writer contract to one-token and consecutive prompt/slot callers within each ring.
+# Each call has its SAFETY invariant; no device operation changes.
+gpu-mimo2 5 1 0
 # PIN(2026-10-21): gpu-minimaxm3 0 -> 19 blocks, 0 -> 1 fns, a new crate, not old code relaxed: the score and select kernels
 # (attn.rs) read and write their buffers through raw places and shared words, each block with its SAFETY line, and
 # enqueue_index is an unsafe fn, as the head kernel it calls (the positions are distinct).
