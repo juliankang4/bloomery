@@ -536,6 +536,10 @@ impl MmaTile {
     clippy::manual_range_contains,
     reason = "the kernel's two compares on the bits; a RangeInclusive would move its PTX"
 )]
+#[allow(
+    clippy::question_mark,
+    reason = "the kernel's early return on the raster; a `?` would move its PTX"
+)]
 pub(crate) unsafe fn bf16_mma_tile<W: TileRows, const ISOLATE: bool>(
     w: W,
     x: &[f32],

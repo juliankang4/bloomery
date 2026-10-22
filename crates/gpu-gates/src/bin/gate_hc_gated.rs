@@ -1277,8 +1277,20 @@ mod gate {
         if matches!(site.planes, Planes::Bf16 { .. })
             && c.gpu.context().compute_capability()? == (12, 1)
         {
-            let down: Vec<Vec<f32>> = site.down.chunks_exact(WIDE).map(<[f32]>::to_vec).collect();
-            let up: Vec<Vec<f32>> = site.up.chunks_exact(R).map(<[f32]>::to_vec).collect();
+            let down: Vec<Vec<f32>> = site
+                .down
+                .as_chunks::<WIDE>()
+                .0
+                .iter()
+                .map(|r| r.to_vec())
+                .collect();
+            let up: Vec<Vec<f32>> = site
+                .up
+                .as_chunks::<R>()
+                .0
+                .iter()
+                .map(|r| r.to_vec())
+                .collect();
             ok &= check_mma("hc_down", (&o.down, &o.xn, WIDE), &down);
             ok &= check_mma("hc_up", (&o.g, &o.lo, R), &up);
 
