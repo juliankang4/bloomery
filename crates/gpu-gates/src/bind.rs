@@ -115,6 +115,22 @@ impl Vocab {
         Ok(self)
     }
 
+    /// Registers ChatML's message start when both the template and vocabulary carry it.
+    pub fn with_chat_template(self, template: &str) -> Result<Vocab, GateError> {
+        const MESSAGE_START: &str = "<|im_start|>";
+        if template.contains(MESSAGE_START)
+            && self
+                .tok
+                .special_tokens()
+                .iter()
+                .any(|&id| self.tok.text(id) == Some(MESSAGE_START))
+        {
+            self.with_user_start(MESSAGE_START)
+        } else {
+            Ok(self)
+        }
+    }
+
     /// The vocabulary itself.
     pub fn tokenizer(&self) -> &tokenizer::Tokenizer {
         &self.tok
@@ -3265,12 +3281,52 @@ impl Drop for SeatEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, Link, Reply};
+    use super::{Cmd, Link, Reply, Vocab};
     use std::sync::mpsc;
 
     const N_VOCAB: usize = 8;
 
     // PIN(2026-10-21): Removed seat-source/copy wiring assertions; the shared binder reads parsed levers.
+
+    #[test]
+    fn chat_templates_register_only_a_special_message_start() {
+        use gguf::Value;
+        use serve::Tokenizer;
+
+        for (text, kind, template, expected) in [
+            ("<|im_start|>", 3, "<|im_start|>user", vec![2]),
+            ("<|im_start|>", 3, "{{ messages }}", vec![]),
+            ("<|im_start|>", 1, "<|im_start|>user", vec![]),
+            ("other", 3, "<|im_start|>user", vec![]),
+        ] {
+            let tok = tokenizer::Tokenizer::from_keys(&[
+                ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+                ("tokenizer.ggml.pre".into(), Value::String("qwen2".into())),
+                (
+                    "tokenizer.ggml.tokens".into(),
+                    Value::Array(
+                        ["<s>", "</s>", text]
+                            .into_iter()
+                            .map(|s| Value::String(s.into()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "tokenizer.ggml.token_type".into(),
+                    Value::Array([3, 3, kind].into_iter().map(Value::I32).collect()),
+                ),
+                ("tokenizer.ggml.merges".into(), Value::Array(vec![])),
+                ("tokenizer.ggml.bos_token_id".into(), Value::U32(0)),
+                ("tokenizer.ggml.eos_token_id".into(), Value::U32(1)),
+            ])
+            .unwrap();
+            let vocab = Vocab::new(tok)
+                .unwrap()
+                .with_chat_template(template)
+                .unwrap();
+            assert_eq!(vocab.user_start(), expected, "{text} {kind} {template}");
+        }
+    }
 
     /// The factory's sampler is the sampler crate's chain over the request's
     /// parameters, and a parameter the chain refuses (a non-finite

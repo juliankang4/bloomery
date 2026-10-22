@@ -430,10 +430,6 @@ const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place
 /// `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
 
-/// The token every message of the chat template opens with: a prompt call is
-/// cut at the first and the last inside it.
-const MESSAGE_START: &str = "<|im_start|>";
-
 /// Why a cut leaves the MTP draft proposing nothing
 /// ([`SlotDrafts::turn_off`]): the body did not keep its side at the kept
 /// position ([`Body38::draft_rejoins`]), or it was off already.
@@ -1397,19 +1393,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         a.template_file.path(),
         "qwen3.8",
     )?;
-    // The message start the server cuts prompt calls at, when both the
-    // vocabulary and the template have it.
-    let has_start = tok
-        .special_tokens()
-        .iter()
-        .any(|&id| tok.text(id) == Some(MESSAGE_START));
-    let in_template = template.contains(MESSAGE_START);
-    let vocab = Vocab::new(tok)?;
-    let vocab = Arc::new(if has_start && in_template {
-        vocab.with_user_start(MESSAGE_START)?
-    } else {
-        vocab
-    });
+    let vocab = Arc::new(Vocab::new(tok)?.with_chat_template(&template)?);
 
     // The plan record, and `/props` from the same plan the load runs by:
     // under the draft `plan_mtp_with`'s, its draft's card bytes (granules,
@@ -1690,10 +1674,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         mtp_inputs = None;
     }
     eprintln!("{}", rule.line);
-    eprint_noted(&format!(
-        "{} message_start={MESSAGE_START} in_vocab={has_start} in_template={in_template}",
-        cache.line()
-    ));
+    eprint_noted(&cache.line());
     // The rounds of several slots, decided once (the open takes it through
     // `SeatArgs`): one pass of the busy rows, a slot at a time beside an
     // expert tier card ([`Place38::tiered`]).

@@ -61,6 +61,9 @@
 //!   or no residency, prints `off` on the second, red there;
 //! - the positions the server serves: `/props`' `n_ctx` is the context it
 //!   was started at ([`props_ctx`]);
+//! - `shared_system_prompt_stays_in_the_slot`: different questions sharing one
+//!   system message keep its message-start checkpoint in the live slot and
+//!   answer a fresh run's ids. Removing the message-start registration keeps zero;
 //! - `systemone_is_the_schema_path` (`shared/systemone_clause.rs`, the clause
 //!   `gate_qwen3_serve` holds too; the plain arm's main server, after
 //!   `cache`): the rows of `tools/ref/clef/suite.jsonl` that fit the
@@ -488,7 +491,7 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
         LookupCompletion, PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore,
-        server_log, slot_erased,
+        server_log, shared_system_prompt, slot_erased,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -4732,6 +4735,7 @@ mod gate {
 
         ok &= props_ctx(&url)?;
         ok &= cache(&url, &err_log, false, "plain")?;
+        ok &= shared_system_prompt(&url, dir, TURN_A, [TURN_A, TURN_B], N_PREDICT)?;
         // Last on the main server: its requests leave the slot another conversation's.
         ok &= crate::systemone_clause::is_the_schema_path(&url, dir)?;
 

@@ -527,7 +527,9 @@ pub fn greedy(
     let v = json_of("/completion", st, &text)?;
     let tokens = ids_of(&v["tokens"]);
     let stop = v["stop_type"].as_str().unwrap_or("").to_owned();
-    let cache_n = v["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX);
+    let cache_n = v["timings"]["cache_n"]
+        .as_u64()
+        .ok_or("/completion: missing or invalid timings.cache_n")?;
     println!("{name} completion tokens {tokens:?} stop {stop} cache_n {cache_n}");
     Ok((
         Answer {
@@ -670,6 +672,55 @@ impl ChatReply {
         }
         (agree, None, true)
     }
+}
+
+/// Two questions share a system message in the live slot and answer the ids of a fresh run.
+pub fn shared_system_prompt(
+    url: &dyn Fn(&str) -> String,
+    dir: &Path,
+    system: &str,
+    users: [&str; 2],
+    n: usize,
+) -> Result<bool, GateError> {
+    let mut ok = true;
+    let mut prompts = Vec::new();
+    for user in users {
+        prompts.push(rendered(
+            url,
+            json!([
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ]),
+        )?);
+    }
+    let marker = tokenized(url, "<|im_start|>")?;
+    if marker.is_empty() {
+        return Err("the message-start marker encodes no ids".into());
+    }
+    let start = prompts[0]
+        .windows(marker.len())
+        .enumerate()
+        .filter_map(|(i, ids)| (ids == marker).then_some(i))
+        .nth(1)
+        .ok_or("the shared-system chat has no second message start")?;
+    let (first, _) = greedy(url, prompts[0].clone(), n, dir, "system_first", false)?;
+    let (reused, _) = greedy(url, prompts[1].clone(), n, dir, "system_reused", true)?;
+    let (fresh, _) = greedy(url, prompts[1].clone(), n, dir, "system_fresh", false)?;
+    println!(
+        "shared system: message_start={start} kept={} reused={:?} fresh={:?}",
+        reused.cache_n, reused.tokens, fresh.tokens
+    );
+    check(
+        &mut ok,
+        "shared_system_prompt_stays_in_the_slot",
+        start > 0 && first.cache_n == 0 && reused.cache_n >= start as u64,
+    );
+    check(
+        &mut ok,
+        "shared_system_prompt_ids_are_a_fresh_runs",
+        fresh.cache_n == 0 && !reused.tokens.is_empty() && reused.tokens == fresh.tokens,
+    );
+    Ok(ok)
 }
 
 /// The prefix clauses of a seat that keeps the prefix a request shares with

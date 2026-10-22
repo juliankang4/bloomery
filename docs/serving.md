@@ -327,8 +327,10 @@ the slot. A request that shares only part of an earlier prompt, such as the same
 restores too: a saved state keeps checkpoints at 512·2^i positions below its end and the last one, and a shared
 prefix restores at the largest of them inside it. On Qwen3.8 the card's own checkpoints are 4,096 positions
 apart, so there a shared prefix shorter than 4,096 tokens does not restore. Saving runs off the request path. The
-MiMo and Qwen3 seats run no prompt cache: a request keeps the longest prefix the slot holds, and a save is refused
-by name. `timings.cache_ms` and `/metrics`'
+MiMo and Qwen3 seats keep only the longest prefix the live slot holds; they run no saved prompt cache, and a
+save is refused by name. For Qwen3.5 and Qwen3.6, when the vocabulary and chat template both carry
+`<|im_start|>`, the seat cuts prompt calls at message starts, so a shared system prompt stays in the live slot
+for another question. Reuse still requires that slot to hold the shared prefix; another conversation can replace it. `timings.cache_ms` and `/metrics`'
 `prompt_cache_seconds_total` count the cache's work.
 
 **Image input (V4.1, Qwen3.6, MiniCPM-V 4.7, Sage-A1.5, GLM-5.3, Clef).** These seats read images when they have a vision encoder: `--mmproj <file>`,

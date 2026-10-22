@@ -1623,7 +1623,18 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     }
     // The vocabulary before the plans: `--mmproj`'s encoder is held against it, and its bytes
     // are a reserve of every plan that follows.
-    let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
+    let ChatSurface {
+        template,
+        name: alias,
+        ..
+    } = ChatSurface::read(
+        &path,
+        split.value("tokenizer.chat_template"),
+        split.value("general.name"),
+        a.template_file.path(),
+        "qwen3",
+    )?;
+    let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?.with_chat_template(&template)?);
     let tok = vocab.tokenizer();
     let token = |id| tok.text(id).map(str::to_owned);
     // A string that is exactly one token: MiniCPM's marks and its `<unk>` pad.
@@ -1640,17 +1651,6 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         .map(|s| s.seat(a.place.unwrap_or(Place::A)))
         .transpose()?;
     let embedding = side_seat.as_ref().and_then(|s| s.reserve);
-    let ChatSurface {
-        template,
-        name: alias,
-        ..
-    } = ChatSurface::read(
-        &path,
-        split.value("tokenizer.chat_template"),
-        split.value("general.name"),
-        a.template_file.path(),
-        "qwen3",
-    )?;
     // The slot count before the context it sizes: a set `--ctx` with no
     // `--parallel` is one request's context — one slot at the whole of it
     // (`bind::slots_of`).

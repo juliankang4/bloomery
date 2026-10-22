@@ -81,6 +81,10 @@
 //!   a request of the prompt and the answer the jump arm fed, but its last
 //!   id, keeps the prompt call's end (`P + lead - 1`). FAIL-first: a run fed
 //!   with the body's marks on keeps its start, `P + lead`;
+//! - `shared_system_prompt_stays_in_the_slot`: two chats with the same system
+//!   message and different users keep at least the second message's start and
+//!   answer the ids of a fresh run. FAIL-first: a recurrent seat without its
+//!   message-start marker keeps no checkpoint inside the shared prefix;
 //! - `systemone_is_the_schema_path` (`shared/systemone_clause.rs`, the clause
 //!   `gate_qwen38_serve` holds too): the rows of `tools/ref/clef/suite.jsonl`
 //!   POSTed to `/v1/systemone`, answered by this model through the
@@ -3284,6 +3288,7 @@ mod gate {
             prefix35(&url, dir, ok)?;
             tool_call_is_parsed(&url, dir, ok)?;
         }
+        *ok &= serve_client::shared_system_prompt(&url, dir, SYSTEM_MSG, [EDIT_A, EDIT_B], N)?;
         *ok &= crate::systemone_clause::is_the_schema_path(&url, dir)?;
         println!("server stopped: {}", s.stop()?);
         let mut answers = vec![chat_ids, prose_ids];
