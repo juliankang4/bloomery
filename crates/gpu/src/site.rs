@@ -408,7 +408,7 @@ pub fn gemv(
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     let src = (Some(ty), w, SiteWeight::Resident(name));
-    launch(gpu, Some(g32), src, x, m, y)
+    launch(gpu, gpu.stream(), Some(g32), src, x, m, y)
 }
 
 /// [`gemv`] for the resident weight `name` at the site type of its resident
@@ -424,7 +424,28 @@ pub fn resident_gemv_cols(
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    launch(gpu, g32, (None, w, SiteWeight::Resident(name)), x, m, y)
+    resident_gemv_cols_on(gpu, gpu.stream(), g32, (w, name), x, m, y)
+}
+
+/// [`resident_gemv_cols`] on `stream`, ordered by the caller before its consumers.
+pub(crate) fn resident_gemv_cols_on(
+    gpu: &Gpu,
+    stream: &cuda_core::CudaStream,
+    g32: Option<&Gemm32Kernels>,
+    (w, name): (&Weights, &str),
+    x: &DeviceBuffer<f32>,
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    launch(
+        gpu,
+        stream,
+        g32,
+        (None, w, SiteWeight::Resident(name)),
+        x,
+        m,
+        y,
+    )
 }
 
 /// [`resident_gemv_cols`] over rows `at .. at + n` of the resident weight
@@ -441,6 +462,7 @@ pub fn resident_gemv_rows(
 ) -> Result<(), GpuError> {
     launch(
         gpu,
+        gpu.stream(),
         g32,
         (None, w, SiteWeight::Part { name, at, n }),
         x,
@@ -460,7 +482,7 @@ pub fn resident_gemv(
     x: &DeviceBuffer<f32>,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    launch(gpu, None, (None, w, SiteWeight::Resident(name)), x, 1, y)
+    resident_gemv_cols(gpu, None, (w, name), x, 1, y)
 }
 
 /// The expert-select gemv over the f32 rows (`a`, [`SelArgs`]) of the
@@ -528,6 +550,7 @@ fn resident_ty(
 /// only by an F32 site past one column.
 fn launch(
     gpu: &Gpu,
+    stream: &cuda_core::CudaStream,
     g32: Option<&Gemm32Kernels>,
     (declared, w, src): (Option<SiteTy>, &Weights, SiteWeight<'_>),
     x: &DeviceBuffer<f32>,
@@ -540,7 +563,7 @@ fn launch(
     let ty = resident_ty(WHAT, (declared, weight, name))?;
     match ty.reads() {
         Form::F32 | Form::Q8x32 => with_planes(WHAT, (ty, weight, name), part, |p| {
-            gemv_planes(gpu, g32, p, x, m, y)
+            gemv_planes(gpu, stream, g32, p, x, m, y)
         }),
         Form::Q8x128 => Err(GpuError::shape(
             WHAT,
@@ -559,13 +582,14 @@ fn launch(
 /// (`g32`), BF16 `bf16_gemv`, MXFP8 and FP8_B128 their gemvs.
 fn gemv_planes(
     gpu: &Gpu,
+    stream: &cuda_core::CudaStream,
     g32: Option<&Gemm32Kernels>,
     p: Planes<'_>,
     x: &DeviceBuffer<f32>,
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let (q, stream) = (gpu.q8f32(), gpu.stream());
+    let q = gpu.q8f32();
     match p {
         Planes::Q8_0(qs, d) if m == 1 => q.enqueue_q8_0_gemv(stream, qs, d, x, 1, y),
         Planes::Q8_0(qs, d) => q.enqueue_q8_0_gemv_mcol(
