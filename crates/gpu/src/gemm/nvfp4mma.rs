@@ -66,13 +66,6 @@ fn compact(x: u32) -> u32 {
 }
 
 #[inline(always)]
-fn weight_word(q: &[u32], row: usize, steps: usize, step: usize, word: usize) -> u32 {
-    let at = row * steps * 8 + step * 8 + (word / 2) * 2;
-    let shift = 4 * (word & 1);
-    compact(q[at] >> shift) | (compact(q[at + 1] >> shift) << 16)
-}
-
-#[inline(always)]
 fn mma(c: [f32; 4], a: [u32; 4], b: [u32; 2], sa: u32, sb: u32) -> [f32; 4] {
     let (d0, d1, d2, d3): (f32, f32, f32, f32);
     // SAFETY: the caller executes this register-only instruction in every lane of its warp.
@@ -230,48 +223,103 @@ mod native {
         let expert = tiles[2 * tile] as usize;
         let (start, len) = super::super::route::tile_parts(tiles[2 * tile + 1]);
         let (start, len) = (start as usize, len as usize);
+        static mut W: cuda_device::SharedArray<u32, 768, 16> = cuda_device::SharedArray::UNINIT;
+        static mut B: cuda_device::SharedArray<u32, 768, 16> = cuda_device::SharedArray::UNINIT;
+        static mut S: cuda_device::SharedArray<u32, 128, 16> = cuda_device::SharedArray::UNINIT;
+        // SAFETY: these raw addresses name this block's shared allocations.
+        let (wp, bp, sp) = unsafe {
+            (
+                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W),
+                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B),
+                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S),
+            )
+        };
         let row = rt * 64 + 16 * (tid / 32);
-        if row >= rows {
-            return;
-        }
         let g = lane / 4;
         let t = lane & 3;
         let nt = len.div_ceil(8);
+        let sr = tid / 2;
+        let half = tid & 1;
+        let wr = expert * rows + (rt * 64 + sr).min(rows - 1);
+        let col = cols[start + sr.min(len - 1)] as usize / slot_div as usize;
         let mut acc = [0.0f32; 32];
         let mut step = 0;
         while step < steps {
-            let r = expert * rows + row + g;
-            let a = [
-                weight_word(wq, r, steps, step, t),
-                weight_word(wq, r + 8, steps, step, t),
-                weight_word(wq, r, steps, step, t + 4),
-                weight_word(wq, r + 8, steps, step, t + 4),
-            ];
-            let sa = we[(r + 8 * (t & 1)) * steps + step];
-            #[unroll]
-            for n in 0..8 {
-                if n >= nt {
-                    continue;
-                }
-                let j = if n * 8 + g < len { n * 8 + g } else { 0 };
-                let col = cols[start + j] as usize / slot_div as usize;
-                let b = [
-                    aq[col * steps * 8 + step * 8 + t],
-                    aq[col * steps * 8 + step * 8 + t + 4],
-                ];
-                let c = mma(
-                    [acc[n * 4], acc[n * 4 + 1], acc[n * 4 + 2], acc[n * 4 + 3]],
-                    a,
-                    b,
-                    sa,
-                    ae[col * steps + step],
-                );
-                acc[n * 4] = c[0];
-                acc[n * 4 + 1] = c[1];
-                acc[n * 4 + 2] = c[2];
-                acc[n * 4 + 3] = c[3];
+            let wi = wr * steps * 8 + step * 8 + 4 * half;
+            // SAFETY: the checked weight plane is aligned to 16 bytes, K divides 64, and wr is live.
+            let w = unsafe { (*wq.as_ptr().add(wi).cast::<cuda_device::vector::U32x4>()).0 };
+            let packed = cuda_device::vector::U32x4::new([
+                compact(w[0]) | (compact(w[1]) << 16),
+                compact(w[0] >> 4) | (compact(w[1] >> 4) << 16),
+                compact(w[2]) | (compact(w[3]) << 16),
+                compact(w[2] >> 4) | (compact(w[3] >> 4) << 16),
+            ]);
+            // SAFETY: each thread owns one aligned four-word half of its shared row.
+            unsafe {
+                *wp.add(sr * 12 + 4 * half)
+                    .cast::<cuda_device::vector::U32x4>() = packed;
             }
+            let ai = col * steps * 8 + step * 8 + 4 * half;
+            // SAFETY: the owned activation buffer and every column/step offset are 16-byte aligned.
+            let av = unsafe { *aq.as_ptr().add(ai).cast::<cuda_device::vector::U32x4>() };
+            // SAFETY: each thread owns one aligned four-word half of its shared activation row.
+            unsafe {
+                *bp.add(sr * 12 + 4 * half)
+                    .cast::<cuda_device::vector::U32x4>() = av;
+            }
+            if half == 0 {
+                // SAFETY: the first thread of each row owns its weight scale word.
+                unsafe {
+                    *sp.add(sr) = we[wr * steps + step];
+                }
+                // SAFETY: the first thread of each row owns its activation scale word.
+                unsafe {
+                    *sp.add(64 + sr) = ae[col * steps + step];
+                }
+            }
+            thread::sync_threads();
+            if row < rows {
+                let r = 16 * (tid / 32) + g;
+                // SAFETY: this live warp reads rows r and r+8, both inside the 64-row shared tile.
+                let a0 = unsafe { *wp.add(r * 12 + t) };
+                // SAFETY: r+8 is below 64 and t is below four.
+                let a1 = unsafe { *wp.add((r + 8) * 12 + t) };
+                // SAFETY: t+4 is below eight in this shared row.
+                let a2 = unsafe { *wp.add(r * 12 + t + 4) };
+                // SAFETY: r+8 and t+4 are inside the shared tile.
+                let a3 = unsafe { *wp.add((r + 8) * 12 + t + 4) };
+                // SAFETY: each pair of lanes reads the scale row selected by the MMA layout.
+                let sa = unsafe { *sp.add(r + 8 * (t & 1)) };
+                #[unroll]
+                for n in 0..8 {
+                    if n >= nt {
+                        continue;
+                    }
+                    let br = n * 8 + g;
+                    // SAFETY: br is below 64 and t is below four.
+                    let b0 = unsafe { *bp.add(br * 12 + t) };
+                    // SAFETY: br is below 64 and t+4 is below eight.
+                    let b1 = unsafe { *bp.add(br * 12 + t + 4) };
+                    // SAFETY: the activation scale follows the weight scales in the 128-word allocation.
+                    let sb = unsafe { *sp.add(64 + br) };
+                    let c = mma(
+                        [acc[n * 4], acc[n * 4 + 1], acc[n * 4 + 2], acc[n * 4 + 3]],
+                        [a0, a1, a2, a3],
+                        [b0, b1],
+                        sa,
+                        sb,
+                    );
+                    acc[n * 4] = c[0];
+                    acc[n * 4 + 1] = c[1];
+                    acc[n * 4 + 2] = c[2];
+                    acc[n * 4 + 3] = c[3];
+                }
+            }
+            thread::sync_threads();
             step += 1;
+        }
+        if row >= rows {
+            return;
         }
         #[unroll]
         for n in 0..8 {
