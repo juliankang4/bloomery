@@ -17,7 +17,7 @@
 //! any program's pin reads, is not an item; the program itself is one.
 
 use bloomery_placement::accepts::{
-    BOLT_LEG, embed_of_widened, head_of_widened, qwen3moe_dense, resident_down_runs,
+    BOLT_LEG, dense_by_name, embed_of_widened, head_of_widened, qwen3moe_dense, resident_down_runs,
 };
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
 use bloomery_placement::accepts::{prompt_leg_down, prompt_leg_gate_up};
@@ -1045,34 +1045,10 @@ const TYPE_PINS: &[TypePin] = &[
     },
     TypePin {
         programs: &[Program::Qwen38Body],
-        role: Role::Attention,
-        matrices: true,
-        names: Some(|n| !indexer_projection(n)),
-        what: "attention matrices (the body reads q8_0 and bf16)",
-        reads: &[GgmlType::Q8_0, GgmlType::BF16],
-    },
-    TypePin {
-        programs: &[Program::Qwen38Body],
-        role: Role::Attention,
-        matrices: true,
-        names: Some(indexer_projection),
-        what: "indexer projections (the body reads bf16)",
-        reads: &[GgmlType::BF16],
-    },
-    TypePin {
-        programs: &[Program::Qwen38Body],
         role: Role::HyperConnection,
         matrices: true,
         names: None,
         what: "hyper-connection down and up (the body reads q8_0 and bf16)",
-        reads: &[GgmlType::Q8_0, GgmlType::BF16],
-    },
-    TypePin {
-        programs: &[Program::Qwen38Body],
-        role: Role::SharedExpert,
-        matrices: true,
-        names: None,
-        what: "shared expert (the body reads q8_0 and bf16)",
         reads: &[GgmlType::Q8_0, GgmlType::BF16],
     },
     // The qwen4exp load keeps a bf16 head and embedding in their words
@@ -1373,6 +1349,23 @@ struct RowPin {
 /// and per-layer input projection (the host's rows), each `what` naming the
 /// types its row takes or the table row it follows.
 const ROW_PINS: &[RowPin] = &[
+    // PIN(2026-10-22): Qwen38 dense pins admit MXFP8/FP8_B128 and Q8_0 indexers via BY_NAME; the old MXFP8 refusal fails the new coverage test (PR FAIL-first).
+    RowPin {
+        program: Program::Qwen38Body,
+        role: Role::Attention,
+        matrices: true,
+        names: None,
+        what: "attention matrices (the types dense_by_name names)",
+        row: |ty| dense_by_name(ty).is_some(),
+    },
+    RowPin {
+        program: Program::Qwen38Body,
+        role: Role::SharedExpert,
+        matrices: true,
+        names: None,
+        what: "shared expert (the types dense_by_name names)",
+        row: |ty| dense_by_name(ty).is_some(),
+    },
     RowPin {
         program: Program::Qwen3moeBody,
         role: Role::Attention,
@@ -1579,13 +1572,6 @@ fn glm5next_card_routed(ty: GgmlType) -> bool {
 /// input's other matrices as q8_0.
 fn per_layer_model_proj(name: &str) -> bool {
     name == crate::arch::gemma_embedding2::names::PER_LAYER_MODEL_PROJ
-}
-
-/// A qwen4exp selector's key or query projection, which `Body38` reads as
-/// bf16 (`plan38::plans`), where it reads every other attention matrix as
-/// q8_0 or bf16.
-fn indexer_projection(name: &str) -> bool {
-    name.ends_with(".indexer.k_proj.weight") || name.ends_with(".indexer.q_proj.weight")
 }
 
 /// The `nemotron_h_moe` router instances: the (experts, kept) pairs
@@ -2883,6 +2869,46 @@ mod tests {
                     )],
                     "{program:?} {ty}"
                 );
+            }
+        }
+    }
+
+    // PIN(2026-10-22): MXFP8/FP8_B128 dense and Q8_0 indexer refusals were wrong: both walks launch them.
+    #[test]
+    fn the_qwen38_dense_pins_read_the_by_name_sites() {
+        for (name, role, what) in [
+            ("attn_q.weight", Role::Attention, "attention matrices"),
+            (
+                "indexer.q_proj.weight",
+                Role::Attention,
+                "attention matrices",
+            ),
+            (
+                "indexer.k_proj.weight",
+                Role::Attention,
+                "attention matrices",
+            ),
+            ("ffn_gate_shexp.weight", Role::SharedExpert, "shared expert"),
+        ] {
+            for ty in gguf::QROWS
+                .iter()
+                .map(|row| row.ty)
+                .chain([GgmlType::MXFP8, GgmlType::FP8_B128])
+            {
+                let got = items(Program::Qwen38Body, &matrix(name, role, ty));
+                if matches!(
+                    ty,
+                    GgmlType::Q8_0
+                        | GgmlType::BF16
+                        | GgmlType::MXFP8
+                        | GgmlType::FP8_B128
+                        | GgmlType::F32
+                ) {
+                    assert!(got.is_empty(), "{name} {ty}: {got:?}");
+                } else {
+                    assert_eq!(got.len(), 1, "{name} {ty}: {got:?}");
+                    assert!(got[0].starts_with(&format!("{ty} {what}")), "{got:?}");
+                }
             }
         }
     }

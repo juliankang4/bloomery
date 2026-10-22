@@ -140,7 +140,7 @@ crates/model/src/arch/coverage.rs	gemma	18	baseline P 18: MK2 program by body
 crates/model/src/arch/coverage.rs	glm	21	baseline P 21: MK2 program by body
 crates/model/src/arch/coverage.rs	mimo	10	baseline P 10: MK2 program by body
 crates/model/src/arch/coverage.rs	nemotron	36	baseline P 36: MK2 program by body
-crates/model/src/arch/coverage.rs	qwen	59	baseline P 63: MK2 program by body
+crates/model/src/arch/coverage.rs	qwen	58	baseline P 63: MK2 program by body
 crates/model/src/arch/draft.rs	mimo	3	baseline D 4: MK1a draft usability as an ArchRow row
 crates/model/src/arch/draft.rs	qwen	13	baseline D 15: MK1a draft usability as an ArchRow row
 crates/model/src/arch/dspark.rs	deepseek	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory

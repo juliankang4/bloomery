@@ -247,6 +247,16 @@ pub const fn qwen3moe_dense(ty: GgmlType) -> Option<SiteEntry> {
     }
 }
 
+/// The dense sites launched by name on both the gemv and wide GEMM arms:
+/// the kernel table's entries that read f32 rows or q8 blocks of 32.
+#[must_use]
+pub const fn dense_by_name(ty: GgmlType) -> Option<SiteEntry> {
+    match kernels::dense(ty) {
+        Some(entry) if matches!(entry.reads(), SiteAct::F32 | SiteAct::Q8x32) => Some(entry),
+        _ => None,
+    }
+}
+
 /// The head a body whose load widens BF16 to f32 (`ModelTensors::bf16_words`
 /// naming none, as the qwen3moe body's files) runs an `output` of `ty` with: the
 /// table's [`kernels::head`] row but BF16, whose words that load does not keep.

@@ -1688,8 +1688,11 @@ mod tests {
             assert_eq!(s.gemm_weight(), grouped);
             assert_eq!(s.kquant(), grouped.is_some());
             assert_eq!(s.kgemv_order().is_some(), s.reads() == Form::Q8x128);
-            let by_name = matches!(s.reads(), Form::F32 | Form::Q8x32);
-            assert_eq!(super::BY_NAME.contains(&s), by_name, "{s}");
+            let by_name = model::placement::accepts::dense_by_name(ty);
+            assert_eq!(super::BY_NAME.contains(&s), by_name.is_some(), "{s}");
+            if let Some(entry) = by_name {
+                assert_eq!(SiteTy::of_entry(entry), Some(s), "{s}");
+            }
         }
         assert_eq!(SiteTy::Q5_0.reads(), Form::Q8Blocks32);
         assert_eq!(SiteTy::Q5_0.kgemv_order(), None);
