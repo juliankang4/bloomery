@@ -218,7 +218,7 @@ Status words are the inventory's. "Owned" names who queues it. An enabler that m
 | 21 | `q3kvdepth` | E, A | Fewer KV bytes as depth grows. Owned by quant (a quant format, and a quality call) |
 | 22 | `v41lookup` default | E | Positions per pass from a lookup draft. A default change: ask the lead before it is turned on. The gain `[stated]` is ≤ +10 % code, ~0 prose |
 | 23 | Chooser state by head class | E | 0…+2.5 % `[derived from an assumption, adaptive-picks §3.1]`. Superseded by the L2 recut |
-| 24a | Multi-slot width | D | A round verifies every slot's whole width. Gain unknown on mixed slots. Ledger only |
+| 24a | Multi-slot width | D | A round prices its slots' widths together by its rows and wall (`runtime::width::Batch`). Landed |
 | 24b | n-gram beside MTP | E | ≤ +11.4 % ceiling `[derived, adaptive-picks §3.6]`. Ledger only |
 | 24c | Residency carried across starts | F | Gain unknown. Ledger only |
 | 24d | Held-out residency constants | F | Gain unknown. Ledger only |

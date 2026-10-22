@@ -170,10 +170,9 @@ where
 /// depth the seat's one-slot pass proposes, its kept ids into `out` and
 /// what it drafted into `drafted`, exactly as the fallback loop's `pass`
 /// fills them. Returns the passes it ran. The windows run the draft's
-/// whole width past the slot's width chooser, which only counts them
-/// (`runtime::width::Choosing::round_ran`): the pass packs every window at
-/// the full depth, so a cut row is no work saved, and its wall is the
-/// round's, no width's.
+/// batch width selected by `runtime::width::Batch`, using each slot's
+/// acceptance profile and the complete round's wall time. A zero width
+/// skips that pass's proposal without turning the slot's draft off.
 ///
 /// Rows are laid in slot order ([`slot_order`]), each row's kept ids and
 /// counts back to that row; each slot's rows are bit for bit its own
@@ -186,9 +185,8 @@ where
 /// turned off ([`SlotDrafts::is_off`]) runs before the passes, alone: its
 /// slot selected and the table's own pass on it, the plain step the
 /// fallback loop runs for it, its draft told nothing and never asked to
-/// propose — [`pass_slots`] proposes on every window and refuses a window
-/// of depth 0 by name, and an off draft holds no refresh at the slot's
-/// position — so a round with off slots runs one more pass for each. No row
+/// propose, since an off draft holds no refresh at the slot's position.
+/// A round with off slots runs one more pass for each. No row
 /// the server sends is refused here that the fallback loop would run: the
 /// rows are distinct slots below the seat's [`Seat::slots`] (`bind`'s own
 /// named refusal), so the fallback is the seat's open decision alone
@@ -202,6 +200,7 @@ pub(crate) fn pass_rows_one_pass<B, const M: usize>(
     rows: &mut [SlotPassRow],
     drafts: &mut SlotDrafts<B, M>,
     depth: usize,
+    allowed: std::ops::RangeInclusive<usize>,
 ) -> Result<usize, GateError>
 where
     B: MtpBody + SlotRows,
@@ -226,12 +225,8 @@ where
     }
     // `on` keeps each window's row index, the key its answer goes back by.
     let on = slot_order(on, |i| rows[i].slot);
-    // A pass's windows: as many as their most rows — the token before a
-    // full-depth proposal — fit the body's pass; a window past the bound is
-    // refused by name, a depth the body's pass of several slots cannot hold.
     let w = 1 + depth.min(B::WIDTH);
-    let per = <B as SlotRows>::MAX_ROWS / w;
-    if per == 0 {
+    if w > <B as SlotRows>::MAX_ROWS {
         return Err(format!(
             "a drafted window of {w} rows past this body's pass of several slots' {} \
              (SlotRows::MAX_ROWS)",
@@ -239,14 +234,56 @@ where
         )
         .into());
     }
-    for pass in on.chunks(per) {
-        let specs = drafts.specs_mut();
-        if let Some(&i) = pass
+    let (specs, batch) = drafts.round_mut();
+    if let Some(&i) = on
+        .iter()
+        .find(|&&i| specs.get(rows[i].slot).is_none_or(Option::is_none))
+    {
+        return Err(format!("slot {}: the seat holds no draft of it", rows[i].slot).into());
+    }
+    let mut widths: Vec<_> = on
+        .iter()
+        .map(|&i| {
+            let draft = specs[rows[i].slot]
+                .as_ref()
+                .expect("a checked draft")
+                .draft();
+            if draft.draft().skipping() {
+                0
+            } else {
+                depth.min(B::WIDTH)
+            }
+        })
+        .collect();
+    let mode = specs[rows[on[0]].slot]
+        .as_ref()
+        .expect("a checked draft")
+        .draft()
+        .mode();
+    if on.len() > 1 {
+        let profiles: Vec<_> = on
             .iter()
-            .find(|&&i| specs.get(rows[i].slot).is_none_or(Option::is_none))
-        {
-            return Err(format!("slot {}: the seat holds no draft of it", rows[i].slot).into());
+            .map(|&i| {
+                specs[rows[i].slot]
+                    .as_ref()
+                    .expect("a checked draft")
+                    .draft()
+                    .batch_profile()
+            })
+            .collect();
+        batch.choose(mode, &profiles, &mut widths, allowed, 0)?;
+    }
+    let started = std::time::Instant::now();
+    let mut verified_rows = 0;
+    let mut first = 0;
+    while first < on.len() {
+        let mut end = first;
+        let mut packed = 0;
+        while end < on.len() && widths[end] < <B as SlotRows>::MAX_ROWS - packed {
+            packed += 1 + widths[end];
+            end += 1;
         }
+        let pass = &on[first..end];
         let mut taken: Vec<_> = pass.iter().map(|&i| specs[rows[i].slot].take()).collect();
         let mut outs: Vec<Vec<u32>> = pass
             .iter()
@@ -254,12 +291,17 @@ where
             .collect();
         let run = {
             let mut windows: Vec<SlotWindow<'_, B>> = Vec::with_capacity(pass.len());
-            for ((&i, spec), out) in pass.iter().zip(&mut taken).zip(&mut outs) {
+            for (((&i, spec), out), &width) in pass
+                .iter()
+                .zip(&mut taken)
+                .zip(&mut outs)
+                .zip(&widths[first..end])
+            {
                 out.clear();
                 windows.push(SlotWindow {
                     slot: rows[i].slot,
                     last: rows[i].last,
-                    depth,
+                    depth: width,
                     // The check above took every row's draft.
                     draft: spec
                         .as_mut()
@@ -275,7 +317,9 @@ where
             specs[rows[i].slot] = spec;
             rows[i].out = out;
         }
-        for (&i, c) in pass.iter().zip(run?) {
+        let done = run?;
+        verified_rows += done.iter().map(|c| c.rows).sum::<usize>();
+        for (&i, c) in pass.iter().zip(done) {
             if let Some(spec) = specs[rows[i].slot].as_mut() {
                 spec.draft_mut().round_ran(c.rows, c.kept);
             }
@@ -285,6 +329,10 @@ where
             };
         }
         passes += 1;
+        first = end;
+    }
+    if on.len() > 1 && mode == runtime::width::Mode::Cost {
+        batch.observe(verified_rows, started.elapsed().as_secs_f64() * 1000.0)?;
     }
     Ok(passes)
 }

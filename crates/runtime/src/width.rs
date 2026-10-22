@@ -390,6 +390,168 @@ fn expected(a: &[f64], k: usize) -> f64 {
     e
 }
 
+/// Widths for one shared verify pass, priced by its total rows. Readings
+/// belong to one active-slot count and prompt-row count; a shape change
+/// starts fresh readings rather than reusing another batch's wall.
+#[derive(Default)]
+pub struct Batch {
+    shape: (usize, usize),
+    costs: Vec<Timings>,
+    passes: u32,
+    probe: usize,
+    caps: Vec<usize>,
+    candidate: Vec<usize>,
+}
+
+impl Batch {
+    /// Cut each slot's maximum width using its conditional acceptance profile.
+    /// `allowed` is the body's supported draft-width set; a slot already at
+    /// zero has no draft. Fixed mode leaves all widths untouched.
+    pub fn choose(
+        &mut self,
+        mode: Mode,
+        profiles: &[&[f64]],
+        widths: &mut [usize],
+        allowed: std::ops::RangeInclusive<usize>,
+        prompt_rows: usize,
+    ) -> Result<(), WidthError> {
+        if profiles.len() != widths.len() || widths.is_empty() {
+            return Err(WidthError::Rule(
+                "batch profiles and widths must name the same nonempty slots",
+            ));
+        }
+        if allowed.is_empty() {
+            return Err(WidthError::Rule("batch allowed-width set is empty"));
+        }
+        for (a, &width) in profiles.iter().zip(widths.iter()) {
+            if width > 0 && !allowed.contains(&width) {
+                return Err(WidthError::Rule(
+                    "batch width outside the body's allowed set",
+                ));
+            }
+            if width > a.len() {
+                return Err(WidthError::Rule(
+                    "batch width exceeds its acceptance profile",
+                ));
+            }
+            if a.iter().any(|p| !p.is_finite() || !(0.0..=1.0).contains(p)) {
+                return Err(WidthError::Rule(
+                    "batch acceptance must be finite and in [0, 1]",
+                ));
+            }
+        }
+        let first = widths
+            .len()
+            .checked_add(prompt_rows)
+            .ok_or(WidthError::Rule("batch row count overflow"))?;
+        let end = widths
+            .iter()
+            .try_fold(first, |n, &w| n.checked_add(w))
+            .and_then(|n| n.checked_add(1))
+            .ok_or(WidthError::Rule("batch row count overflow"))?;
+        if mode == Mode::Fixed {
+            return Ok(());
+        }
+        let shape = (widths.len(), prompt_rows);
+        if self.shape != shape {
+            self.shape = shape;
+            self.costs.clear();
+            self.passes = 0;
+            self.probe = 0;
+        }
+        self.costs.resize_with(end.max(self.costs.len()), || {
+            Timings::new("batch", Rule::DEFAULT.timings)
+        });
+        let max = widths.iter().copied().max().unwrap_or(0);
+        let min = (*allowed.start()).min(max);
+        // Sample complete passes, not a slot's share of another slot's wall.
+        for cap in (min..=max).rev() {
+            let rows = first + widths.iter().map(|&w| w.min(cap)).sum::<usize>();
+            if self.costs[rows].len() < Rule::DEFAULT.min_timings {
+                for w in widths {
+                    *w = (*w).min(cap);
+                }
+                return Ok(());
+            }
+        }
+        self.passes += 1;
+        if self.passes >= Rule::DEFAULT.probe_every {
+            self.passes = 0;
+            self.probe = if self.probe < min || self.probe >= max {
+                min
+            } else {
+                self.probe + 1
+            };
+            for w in widths {
+                *w = (*w).min(self.probe);
+            }
+            return Ok(());
+        }
+        self.caps.clear();
+        self.caps.extend_from_slice(widths);
+        self.candidate.clear();
+        self.candidate.extend(widths.iter().map(|&w| w.min(min)));
+        widths.copy_from_slice(&self.candidate);
+        let mut kept: f64 = profiles
+            .iter()
+            .zip(widths.iter())
+            .map(|(a, &w)| expected(a, w))
+            .sum();
+        let start = first + widths.iter().sum::<usize>();
+        let mut best = kept / self.cost(start);
+        // Conditional probabilities make each slot's marginal yield decrease.
+        // Taking the largest next yield maximizes tokens for each row budget.
+        for rows in start + 1..end {
+            let mut next = None;
+            for (i, a) in profiles.iter().enumerate() {
+                let k = self.candidate[i];
+                if k < self.caps[i] {
+                    let gain = expected(a, k + 1) - expected(a, k);
+                    if next.is_none_or(|(_, g)| gain > g) {
+                        next = Some((i, gain));
+                    }
+                }
+            }
+            let Some((i, gain)) = next else { break };
+            self.candidate[i] += 1;
+            kept += gain;
+            let rate = kept / self.cost(rows);
+            if rate > best * Rule::DEFAULT.margin {
+                best = rate;
+                widths.copy_from_slice(&self.candidate);
+            }
+        }
+        Ok(())
+    }
+
+    fn cost(&mut self, rows: usize) -> f64 {
+        if let Some(ms) = self.costs[rows].median() {
+            return ms;
+        }
+        let lo = (self.shape.0 + self.shape.1..rows)
+            .rev()
+            .find(|&r| self.costs[r].len() > 0)
+            .expect("the narrowest batch was sampled");
+        let hi = (rows + 1..self.costs.len())
+            .find(|&r| self.costs[r].len() > 0)
+            .expect("the full batch was sampled");
+        let a = self.costs[lo].median().expect("a sampled cost");
+        let b = self.costs[hi].median().expect("a sampled cost");
+        a + (b - a) * ((rows - lo) as f64 / (hi - lo) as f64)
+    }
+
+    /// Record the whole pass, including drafting and commit, in milliseconds.
+    /// `rows` includes the prompt rows supplied to [`Batch::choose`].
+    pub fn observe(&mut self, rows: usize, ms: f64) -> Result<(), WidthError> {
+        if rows < self.shape.0 + self.shape.1 || rows >= self.costs.len() {
+            return Err(WidthError::Rule(
+                "batch reading outside the chosen row range",
+            ));
+        }
+        self.costs[rows].push(ms)
+    }
+}
+
 /// What a pass ran, as its proposal left it, for its wall's reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -560,6 +722,8 @@ pub struct Choosing<D, C = Wall> {
     passes: u64,
     /// The calibration `g_i`, one a proposal index.
     gains: Vec<f64>,
+    /// Conditional acceptance of round windows, which carry no probabilities.
+    batch_gains: Vec<f64>,
     /// The tests each `g_i` has taken.
     tested: Vec<u64>,
     /// The running mean of the draft's `p_i` over its full proposals, and
@@ -640,6 +804,7 @@ where
             since_shadow: 0,
             passes: 0,
             gains: vec![1.0; D::WIDTH],
+            batch_gains: vec![1.0; D::WIDTH],
             tested: vec![0; D::WIDTH],
             mean: vec![0.0; D::WIDTH],
             seen: 0,
@@ -752,6 +917,11 @@ impl<D, C: Clock> Choosing<D, C> {
         }
     }
 
+    /// The conditional acceptance learned from whole-round windows.
+    pub fn batch_profile(&self) -> &[f64] {
+        &self.batch_gains
+    }
+
     /// A pass of several sequences' windows ran this draft's window (its
     /// [`Draft::propose`] and the round's record called on the draft itself,
     /// the chooser bypassed): `rows` ran, `kept` were kept. Counted; no cost
@@ -761,7 +931,14 @@ impl<D, C: Clock> Choosing<D, C> {
             return;
         }
         self.drop_flight();
-        self.ran(rows.saturating_sub(1), kept);
+        let k = rows.saturating_sub(1);
+        let j = kept.saturating_sub(1);
+        let tested = j + usize::from(j < k);
+        for (i, a) in self.batch_gains.iter_mut().enumerate().take(tested) {
+            let hit = if i < j { 1.0 } else { 0.0 };
+            *a += self.rule.calibrate * (hit - *a);
+        }
+        self.ran(k, kept);
     }
 
     /// The pass that just ran landed now, the target at `pos`: its wall is
@@ -1225,7 +1402,7 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use super::{Choosing, Chosen, Mode, Rule, Tally, Wall, WidthError, expected};
+    use super::{Batch, Choosing, Chosen, Mode, Rule, Tally, Wall, WidthError, expected};
     use crate::mock::{Call, Clockwork, Mock, MockError, Quiet};
     use crate::{Advance, Committed, Draft, Plain, Speculative, Stop, TapNeed, Target, generate};
 
@@ -2301,7 +2478,10 @@ mod tests {
         }
         assert!(r.choosing().shadow.n > 0, "no shadow pending");
         let _ = r.choosing().take_tally();
+        let gains = r.choosing().gains().to_vec();
         r.choosing().round_ran(4, 2);
+        assert_eq!(r.choosing().gains(), gains);
+        assert_eq!(r.choosing().batch_profile(), &[1.0, 0.95, 1.0]);
         assert_eq!(r.choosing().shadow.n, 0, "the round left the shadow up");
         assert!(r.choosing().flight.is_none());
         let t = r.choosing().take_tally();
@@ -2506,6 +2686,74 @@ mod tests {
             .accept(&mut r.t, &rows, &[0; 4], 0)
             .unwrap_err();
         assert!(matches!(e, MockError::Width(WidthError::NoRowKept)), "{e}");
+    }
+
+    #[test]
+    fn batch_width_prices_all_slots_and_their_rows() {
+        let times = [
+            0.0, 10.0, 11.0, 14.0, 30.0, 50.0, 70.0, 90.0, 110.0, 130.0, 150.0, 170.0, 190.0,
+            210.0, 230.0, 250.0, 270.0,
+        ];
+        for (slots, want) in [(1, vec![2]), (2, vec![1, 0]), (4, vec![0; 4])] {
+            let mut batch = Batch::default();
+            let profiles = vec![&[0.8, 0.8, 0.8][..]; slots];
+            let mut widths = vec![3; slots];
+            batch
+                .choose(Mode::Cost, &profiles, &mut widths, 0..=3, 0)
+                .unwrap();
+            for (rows, &ms) in times.iter().enumerate().take(slots * 4 + 1).skip(slots) {
+                for _ in 0..Rule::DEFAULT.min_timings {
+                    batch.observe(rows, ms).unwrap();
+                }
+            }
+            widths.fill(3);
+            batch
+                .choose(Mode::Cost, &profiles, &mut widths, 0..=3, 0)
+                .unwrap();
+            assert_eq!(widths, want, "batch of {slots}");
+            widths.fill(3);
+            batch
+                .choose(Mode::Fixed, &profiles, &mut widths, 0..=3, 0)
+                .unwrap();
+            assert_eq!(widths, vec![3; slots]);
+        }
+        let mut glm = Batch::default();
+        let mut widths = [1, 1];
+        for _ in 0..=Rule::DEFAULT.min_timings {
+            glm.choose(Mode::Cost, &[&[0.0], &[0.0]], &mut widths, 1..=1, 0)
+                .unwrap();
+            glm.observe(2, 1.0).unwrap();
+            glm.observe(4, 100.0).unwrap();
+            assert_eq!(widths, [1, 1], "GLM NextN admits only paired rows");
+        }
+        let p = &[0.8][..];
+        for (profiles, mut widths, allowed, prompt_rows, why) in [
+            (vec![], vec![1], 0..=3, 0, "same nonempty slots"),
+            (vec![], vec![], 0..=3, 0, "same nonempty slots"),
+            (
+                vec![p],
+                vec![1],
+                std::ops::RangeInclusive::new(2, 1),
+                0,
+                "set is empty",
+            ),
+            (vec![p], vec![2], 0..=1, 0, "outside the body's allowed set"),
+            (vec![p], vec![2], 0..=3, 0, "exceeds its acceptance profile"),
+            (
+                vec![&[f64::NAN][..]],
+                vec![1],
+                0..=3,
+                0,
+                "finite and in [0, 1]",
+            ),
+            (vec![&[1.1][..]], vec![1], 0..=3, 0, "finite and in [0, 1]"),
+            (vec![p], vec![0], 0..=3, usize::MAX, "row count overflow"),
+        ] {
+            let error = Batch::default()
+                .choose(Mode::Fixed, &profiles, &mut widths, allowed, prompt_rows)
+                .unwrap_err();
+            assert!(error.to_string().contains(why), "{error}");
+        }
     }
 
     /// `E(k)` is row 0 and the accepted ids, and the tally's `E` the mean

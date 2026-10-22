@@ -589,8 +589,9 @@ pub struct SlotWindow<'a, B: MtpBody> {
 /// slot 0 selected. A draft that proposes nothing is one that skips (an
 /// [`MtpDraft`] proposes at least one id otherwise): its row is a plain step
 /// the draft is told nothing of, as its [`Draft::stepped`] would do nothing.
-/// Refused by name: a depth of 0, a draft that proposes nothing while it
-/// drafts, and one that moves its slot's position.
+/// Depth zero runs a plain row and keeps the draft ready for a later pass.
+/// Refused by name: a draft that proposes nothing at a positive depth while
+/// it drafts, and one that moves its slot's position.
 pub fn pass_slots<B>(
     t: &mut Session<B>,
     windows: &mut [SlotWindow<'_, B>],
@@ -602,16 +603,15 @@ where
     let mut rows: Vec<Vec<u32>> = Vec::with_capacity(windows.len());
     let mut firsts = Vec::with_capacity(windows.len());
     for w in windows.iter_mut() {
-        if w.depth == 0 {
-            return Err(SessionError::Refused(format!(
-                "{WHAT}: slot {}'s window of depth 0 (a plain row is a pass of no draft)",
-                w.slot
-            )));
-        }
         t.select_slot(w.slot)?;
         let pos = t.pos();
         let mut ids = vec![w.last; 1 + w.depth.min(B::WIDTH)];
-        let n = Draft::propose(w.draft, t, w.last, &mut ids[1..])?;
+        let n = if w.depth == 0 {
+            w.draft.before_step(t, w.last)?;
+            0
+        } else {
+            Draft::propose(w.draft, t, w.last, &mut ids[1..])?
+        };
         if t.pos() != pos {
             return Err(SessionError::Refused(format!(
                 "{WHAT}: slot {}'s proposal moved the target from position {pos} to {}",
@@ -619,7 +619,7 @@ where
                 t.pos()
             )));
         }
-        if n == 0 && !w.draft.skipping() {
+        if n == 0 && w.depth > 0 && !w.draft.skipping() {
             return Err(SessionError::Refused(format!(
                 "{WHAT}: slot {}'s draft proposed nothing while it drafts",
                 w.slot
@@ -646,7 +646,9 @@ where
             ))
         })?;
         let k = accepted_rows(r, got);
-        if r.len() > 1 {
+        if w.depth == 0 {
+            w.draft.policy.record(p0, r, got, k)?;
+        } else if r.len() > 1 {
             w.draft.record(p0, r, got, k)?;
         }
         kept.push(k);

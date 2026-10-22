@@ -2848,6 +2848,7 @@ impl Seat for Q38 {
                     rows,
                     &mut q.drafts,
                     <Body38 as MtpBody>::WIDTH,
+                    0..=<Body38 as MtpBody>::WIDTH,
                 )
             },
             Q38::print_passes,

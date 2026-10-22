@@ -388,8 +388,9 @@ where
 {
     /// Each slot's window over its own draft; empty without a draft. An
     /// entry is `None` only while a round holds its window out
-    /// ([`SlotDrafts::specs_mut`]).
+    /// ([`SlotDrafts::round_mut`]).
     specs: Vec<Option<Spec<B, M>>>,
+    batch: runtime::width::Batch,
     /// Why each slot's draft is off until the slot's next reset, and whether
     /// a record has said so since it was turned off; `None` while it drafts.
     off: Vec<Option<(&'static str, bool)>>,
@@ -406,6 +407,7 @@ where
     pub(crate) fn none() -> Self {
         SlotDrafts {
             specs: Vec::new(),
+            batch: runtime::width::Batch::default(),
             off: Vec::new(),
             lookups: None,
         }
@@ -423,6 +425,7 @@ where
     ) -> Result<Self, GateError> {
         Ok(SlotDrafts {
             specs: Vec::new(),
+            batch: runtime::width::Batch::default(),
             off: Vec::new(),
             lookups: Some(Lookups::open(s, slots, mode, log, None)?),
         })
@@ -460,6 +463,7 @@ where
         }
         Ok(SlotDrafts {
             specs,
+            batch: runtime::width::Batch::default(),
             off: vec![None; slots],
             lookups: None,
         })
@@ -872,8 +876,8 @@ where
     /// drafts at once (`serve_seats::rounds::pass_rows_one_pass`, which
     /// takes each busy slot's window out and puts it back); empty without a
     /// draft.
-    pub(crate) fn specs_mut(&mut self) -> &mut [Option<Spec<B, M>>] {
-        &mut self.specs
+    pub(crate) fn round_mut(&mut self) -> (&mut [Option<Spec<B, M>>], &mut runtime::width::Batch) {
+        (&mut self.specs, &mut self.batch)
     }
 }
 

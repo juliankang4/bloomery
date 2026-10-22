@@ -1299,7 +1299,8 @@ impl Glm {
         for r in rows {
             let skips = self
                 .drafted
-                .specs_mut()
+                .round_mut()
+                .0
                 .get(r.slot)
                 .and_then(Option::as_ref)
                 .is_some_and(|spec| spec.draft().draft().skipping());
@@ -1570,6 +1571,7 @@ impl Seat for Glm {
                     rows,
                     &mut g.drafted,
                     <Body as MtpBody>::WIDTH,
+                    1..=<Body as MtpBody>::WIDTH,
                 )
             },
             Glm::print_passes,

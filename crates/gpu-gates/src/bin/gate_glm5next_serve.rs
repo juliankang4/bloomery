@@ -206,9 +206,9 @@
 //!   the greedy row's `advance`. These pin today's shape: a
 //!   sampled row is a select and a step, its round the server's call apart
 //!   from the drafted passes', because the drafted pass cannot carry a
-//!   window that proposes nothing (`app::mtp::pass_slots` refuses depth 0,
-//!   the body's NextN pass of several slots a slot of one row, and the
-//!   drafted row lends no logits row). Mutant: the seat running a NextN
+//!   window that proposes nothing (the body's NextN pass of several slots
+//!   refuses a slot of one row, and the drafted row lends no logits row).
+//!   Mutant: the seat running a NextN
 //!   load's step round as one pass — the body refuses it by name, the
 //!   server dies, and the sampled clauses go red.
 //! - then on the same server the drafted round's skip path
@@ -1912,10 +1912,9 @@ mod gate {
     /// included). A slot left alone drafts again on the one-slot path. The
     /// default seat runs neither as one pass
     /// with the drafted rows: a sampled row would be a window that proposes
-    /// nothing, which `app::mtp::pass_slots` refuses (depth 0, and every
-    /// window's draft proposes), the body's NextN pass of several slots
-    /// refuses (a slot of one row, `Body::refuse_slots`), and no call of the
-    /// server carries (the drafted row lends no logits row, `SlotPassRow`).
+    /// nothing, which the body's NextN pass of several slots refuses (a slot
+    /// of one row, `Body::refuse_slots`) and no call of the server carries
+    /// (the drafted row lends no logits row, `SlotPassRow`).
     /// So the clauses pin today's shape: two sampled slots' round is a
     /// select and a step a row (`cmd=step`, `passes=rows`), and a round of a
     /// greedy and a sampled slot is two calls of one slot — the sampled

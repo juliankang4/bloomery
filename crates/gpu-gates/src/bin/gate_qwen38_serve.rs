@@ -192,8 +192,8 @@
 //!   one-id flush the chooser's `mtp width` record is its own aggregate —
 //!   windows the widths above 0 and E inside the window's rows
 //!   (`slots_default_width_record_is_the_choosers`; a round of both slots
-//!   runs the draft's whole width, so whether a run cuts a narrower window
-//!   here is not fixed, and the cut is the width chooser's server's,
+//!   runs the widths its timings choose, so whether a run cuts a narrower
+//!   window here is not fixed, and the cut is the width chooser's server's,
 //!   `width_cost_cut_a_window`); and `POST /residency/reset` is a
 //!   200 whose `diff` is 0, with the server's `residency reset` record
 //!   carrying the same counts
@@ -2446,13 +2446,12 @@ mod gate {
         );
         // The chooser's record of each slot's request prints at that slot's
         // next prompt call: a one-id flush on each prompt, which takes the
-        // slot that holds its ids. A round of both slots runs the draft's
-        // whole width and is only counted ([`Choosing::round_ran`]): a pass
-        // below the draft's width comes only from a head or tail round beside
-        // the other's prompt, which a run need not have, so the cut is
-        // [`width_cost`]'s clause. FAIL-first: a seat that runs the draft
-        // with no chooser prints no record; a record off by a window turns
-        // the sum red.
+        // slot that holds its ids. A round of both slots runs the widths the
+        // round's timings choose and is counted at the rows it ran
+        // ([`Choosing::round_ran`]): whether a run cuts a window depends on
+        // those timings, so the cut is [`width_cost`]'s clause. FAIL-first: a
+        // seat that runs the draft with no chooser prints no record; a record
+        // off by a window turns the sum red.
         let mut flushed = true;
         for ids in [&a_ids, &b_ids] {
             let flush = json!({
