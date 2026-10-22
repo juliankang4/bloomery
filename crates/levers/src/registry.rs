@@ -456,8 +456,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         kind: Kind::Words(&["lookup", "dspark", "mtp", "off"]),
         default: Unset::Means(
             "the plain path, one token a step; `generate_qwen3moe` on a qwen4exp file and \
-             `bloomery-serve-qwen38` under `--place a`: `mtp` when the MTP draft file is there, \
-             else the plain path with a `load draft=off` record naming why; the GLM seat of \
+             `bloomery-serve-qwen38` under `--place a`: `mtp` when the MTP draft file is there \
+             (on the server, on one slot), else the plain path with a `load draft=off` record \
+             naming why; the GLM seat of \
              `bloomery-serve`: `mtp` under `--place a` or `bp` on a file of one next-token layer, else the \
              plain path, with a `draft unset` record naming why (`bloomery_levers::glm_unset`)",
         ),
@@ -500,7 +501,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               with no file there, with stores too short for one window (`--ctx-size` under \
               5: the server takes a window only while its rows fit), and when the target's \
               `token_embd` or `output` is not Q8_0, the format the draft reads them in (a set \
-              `mtp` is refused there by name before the load), with the same record; it \
+              `mtp` is refused there by name before the load), and under `--parallel` above 1, \
+              where a drafted server steps a round of sampled or id-banning requests a slot at a \
+              time (a set `mtp` drafts there), with the same record; it \
               has no `--logits` (a request that reads the logits row steps plainly) and takes \
               no route trace. The GLM seat of `bloomery-serve` takes `mtp` and `off`; unset \
               (`bloomery_levers::glm_unset`, a `draft unset` record before the plan) it drafts \

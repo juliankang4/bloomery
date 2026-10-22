@@ -51,8 +51,8 @@ mod tests {
     use bloomery_levers::Draft38Off;
 
     use super::qwen38::{
-        ACTS_ON, Feed38, draft_off_for, prompt_cuts, refuse_feed, refuse_lookup_feed,
-        refuse_media_feed,
+        ACTS_ON, Feed38, draft_for_slots, draft_off_for, prompt_cuts, refuse_feed,
+        refuse_lookup_feed, refuse_media_feed,
     };
 
     const STEPS: Feed38 = Feed38 {
@@ -205,6 +205,27 @@ mod tests {
         );
         let off = draft_off_for(Draft38Off::Folder, None, (true, None)).unwrap();
         assert_eq!(off, (false, Some(Draft38Off::Folder)));
+    }
+
+    /// An unset draft, from a GGUF draft file or a checkpoint folder's MTP layer alike, drafts
+    /// on one slot and goes off naming the slots from the second on; a set `mtp` drafts on any
+    /// count, and a set `off` and an earlier reason stand.
+    #[test]
+    fn an_unset_draft_drafts_on_one_slot_only() {
+        assert_eq!(draft_for_slots(1, None, (true, None)), (true, None));
+        assert_eq!(
+            draft_for_slots(2, None, (true, None)),
+            (false, Some(Draft38Off::Slots { slots: 2 }))
+        );
+        assert_eq!(draft_for_slots(4, Some("mtp"), (true, None)), (true, None));
+        assert_eq!(
+            draft_for_slots(4, Some("off"), (false, Some(Draft38Off::Set))),
+            (false, Some(Draft38Off::Set))
+        );
+        assert_eq!(
+            draft_for_slots(4, None, (false, Some(Draft38Off::Gate))),
+            (false, Some(Draft38Off::Gate))
+        );
     }
 
     #[test]

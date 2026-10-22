@@ -171,10 +171,11 @@
 //!   proposal riding a pass only while its draft skips (`pass_slots`' own
 //!   case).
 //!   Then one more server of `--parallel 2` under the seat's own defaults
-//!   — no `--place`, no `BLOOMERY_DRAFT`, no `BLOOMERY_RESIDENCY`, no
-//!   `BLOOMERY_MTP_WIDTH` (the user's case: the unset rule picks the
-//!   placement, the adaptive residency runs, the draft runs behind the
-//!   width chooser; `BLOOMERY_STEP_STATS=1` for (v3)'s records). Its
+//!   but the draft (no `--place`, no `BLOOMERY_RESIDENCY`, no
+//!   `BLOOMERY_MTP_WIDTH`, and `BLOOMERY_DRAFT=mtp`, as the unset draft is
+//!   off on two slots, `draft_slot_share`'s clause): the unset rule picks
+//!   the placement, the adaptive residency runs, the draft runs behind the
+//!   width chooser; `BLOOMERY_STEP_STATS=1` for (v3)'s records. Its
 //!   residency and width clauses, like the `xstream=` clause's second line,
 //!   rest on the unset rule picking an adaptive word on the box: where it
 //!   picks `off` (MemAvailable under the churn pool), each of them fails by
@@ -241,8 +242,8 @@
 //!   drafted server this gate starts pins `BLOOMERY_MTP_WIDTH=fixed` (the
 //!   clauses that compare draft counts across two runs of a server hold the
 //!   fixed window; a chooser its clock drives promises no count twice), and
-//!   the seat under its own defaults (the slots clause's second server)
-//!   holds the chooser's records but no id equality.
+//!   the seat under its own defaults but the draft (the slots clause's
+//!   second server) holds the chooser's records but no id equality.
 //! - the shared-prefix clause ([`prefix`], a server of its own under
 //!   `BLOOMERY_DRAFT=off` and `BLOOMERY_RESIDENCY=off` at a context of two
 //!   checkpoint spacings): a prompt past the first spacing answered and
@@ -271,7 +272,7 @@
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for — the drafted arm ends here — and, on the plain arm, more
 //! servers start on the card, one at a time: the `ctx` clause's three, the
-//! `paged` clause's eight, the draft share clause's two and the residency
+//! `paged` clause's eight, the draft share clause's three and the residency
 //! word's one (they stop before the load, or are refused before it, but the
 //! `paged` clause's small card and the draft share clause's unset-draft
 //! server, stopped at their load's draft record), the `paged` clause's
@@ -346,8 +347,12 @@
 //!   positions a slot, a window needs five) an unset draft turns off, its
 //!   `load draft=off` record naming the ten positions of the two slots past
 //!   the eight (`draft_unset_yields_to_the_slot_share`), and a set one is
-//!   refused by name before its plan (`draft_set_is_refused_by_name`); the
-//!   fixture tier defers the clause by name (the draft file is the real
+//!   refused by name before its plan (`draft_set_is_refused_by_name`); at
+//!   the default context of `--parallel 2` the unset draft is off by the
+//!   slot count, on this split as on a checkpoint folder, so a server with
+//!   `BLOOMERY_MTP_WIDTH` set beside it is refused by name before its plan,
+//!   the refusal naming the two slots (`draft_unset_is_off_on_two_slots`);
+//!   the fixture tier defers the clause by name (the draft file is the real
 //!   file's);
 //! - `residency_loads_the_word` ([`residency_loads_the_word`]): a server of
 //!   the main arguments under `BLOOMERY_RESIDENCY=mid-p0-s1`, stopped before
@@ -439,9 +444,10 @@
 //! the drafted arm's main server and the drafting clauses' own servers, `off`
 //! on the plain arm's main server and the plain clauses' own) and
 //! `BLOOMERY_RESIDENCY` (`off`; the residency word's server sets its word) —
-//! the slots clause's second server alone sets neither: it is the seat under
-//! its own defaults (the user's case); the unhosted-pool clause's servers
-//! set the draft `off` and leave the residency unset. The drafted arm's main
+//! the slots clause's second server sets the draft `mtp` and leaves the
+//! residency unset: it is the seat under its own defaults but the draft,
+//! which the unset rule leaves off on two slots; the unhosted-pool clause's
+//! servers set the draft `off` and leave the residency unset. The drafted arm's main
 //! server also takes the drafting load's `BLOOMERY_CARD_BUDGET`
 //! (`tier::plan_levers`: in the fixture tier the header's budget plus the
 //! draft's card bytes at `CTX`, as a drafting load plans there; the runner
@@ -2037,10 +2043,11 @@ mod gate {
     /// and the load, `listening` and `/props` name the split ((v4)). Then,
     /// on the same server, the off slot beside a drafted window and the late
     /// request in both orders ([`slots_drafted_beside`]). The second server,
-    /// into `<dir>/slots-default`, is the seat under its own defaults at
-    /// `--parallel 2` — `--place a`, neither lever set (the user's case: the
-    /// A6000 stages, the adaptive residency and the draft run) — and runs
-    /// the together pair once ([`slots_default_residency`]).
+    /// into `<dir>/slots-default`, is the seat under its own defaults but the
+    /// draft at `--parallel 2` (`--place a`, the residency unset and
+    /// `BLOOMERY_DRAFT=mtp`: the A6000 stages, the adaptive residency and the
+    /// draft run), and runs the together pair once
+    /// ([`slots_default_residency`]).
     // PIN(2026-10-05): the swap clause (`swap_rejoins_the_draft`) is removed — the
     /// turn path it checked (`serve::SwapEngine`, the park of a preempted request's
     /// state) left the seat with the resident slots, and its coverage (a preempted
@@ -2249,8 +2256,9 @@ mod gate {
     }
 
     /// The slots clause's second server (the module header): the seat under
-    /// its own defaults at `--parallel 2` — no `--place`, no lever set (the
-    /// user's case) — runs the together pair once and holds (v2) and (v3)
+    /// its own defaults at `--parallel 2` but the draft (no `--place`, no
+    /// residency or width lever, `BLOOMERY_DRAFT=mtp` set as the unset draft
+    /// is off on two slots) runs the together pair once and holds (v2) and (v3)
     /// alone; under the adaptive residency a stream's bits need not equal
     /// its alone run's, so no id equality is asked. The recipe leaves the
     /// box env file's CUDA_VISIBLE_DEVICES pin (the 3090) in place, so the
@@ -2263,15 +2271,19 @@ mod gate {
     /// reset route answers 200 and prints its `residency reset` record;
     /// and, after a one-id flush, the draft's width chooser (`cost`, the
     /// unset lever) prints its `mtp width` record as the chooser's own
-    /// aggregate. The fixture tier defers that last clause by name: beside
-    /// the fixture's card budget the unset rule leaves the draft off, so no
-    /// chooser runs, and the draft is the real file's in any case.
+    /// aggregate. The fixture tier defers that last clause by name: the
+    /// draft is the real file's, which proposes nothing a random-weight
+    /// target accepts.
     fn slots_default_residency(dir: &Path, ok: &mut bool) -> Result<bool, GateError> {
         let own = dir.join("slots-default");
         std::fs::create_dir_all(&own)?;
         let err_log = own.join("server.err");
+        // PIN(2026-10-23): the draft is set, where this server took the unset draft. Unset
+        // on two slots it is off on a GGUF split as on a checkpoint folder (`draft_for_slots`),
+        // so this server keeps the drafted residency, rounds and chooser it holds by the set
+        // word, and the unset rule's two-slot answer is `draft_unset_is_off_on_two_slots`.
         let mut cmd = Command::new(Served38::exe()?);
-        cmd.env_remove(bloomery_levers::DRAFT)
+        cmd.env(bloomery_levers::DRAFT, "mtp")
             .env_remove(bloomery_levers::RESIDENCY)
             .env_remove(bloomery_levers::MTP_HEAD_ROWS)
             .env_remove(bloomery_levers::MTP_DRAFT)
@@ -3803,14 +3815,22 @@ mod gate {
     /// (`draft_unset_yields_to_the_slot_share`); with `BLOOMERY_DRAFT=mtp`
     /// set the server is refused by name before its plan record, the
     /// message's total the same ten positions (`draft_set_is_refused_by_name`).
+    /// At the default context the window fits, and the slot count alone turns
+    /// the unset draft off on this split, as on a checkpoint folder
+    /// (`draft_for_slots`): a server of `--parallel 2` with
+    /// `BLOOMERY_MTP_WIDTH` set and the draft unset is refused by name before
+    /// its plan record, the refusal naming the width lever and the two slots
+    /// (`draft_unset_is_off_on_two_slots`).
     /// FAIL-first: a seat that judges the window on the total `--ctx-size`
     /// (eight, past five) keeps the unset draft and refuses it at the context
     /// the rule chose, so the first clause's server exits with the refusal
     /// before its load; a refusal whose total is one window short (the
     /// `VERIFY_ROWS` a slot) turns the second clause red; a seat whose check
     /// passes a set draft loads it, so its server prints a `plan` record and
-    /// no refusal. The fixture tier defers the clause by name: the draft file
-    /// is the real file's.
+    /// no refusal; a seat that keeps the slot rule to checkpoint folders drafts
+    /// on this split's two slots, takes the width lever and prints its `plan`
+    /// record, red on the third. The fixture tier defers the clause by name:
+    /// the draft file is the real file's.
     fn draft_slot_share(dir: &Path) -> Result<bool, GateError> {
         // The draft is the real file's: its draft file sits beside the target,
         // which a fixture's directory is not known to hold.
@@ -3823,49 +3843,67 @@ mod gate {
         let err_log = own.join("server.err");
         let positions = (<Body38 as MtpBody>::VERIFY_ROWS + 1) * 2;
         let mut ok = true;
+        // Each server runs with the residency off and the draft's levers unset
+        // but `env`.
+        let server = |env: &[(&str, &str)]| -> Result<Command, GateError> {
+            let mut cmd = Command::new(Served38::exe()?);
+            cmd.env(bloomery_levers::RESIDENCY, "off")
+                .env_remove(bloomery_levers::DRAFT)
+                .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+                .env_remove(bloomery_levers::MTP_DRAFT)
+                .env_remove(bloomery_levers::MTP_WIDTH)
+                .envs(env.iter().copied());
+            Ok(cmd)
+        };
+        // A server refused before its plan, to its exit or its `plan` record:
+        // its exit, its log and whether it planned.
+        let refused =
+            |what: &str,
+             env: &[(&str, &str)],
+             args: &[&str]|
+             -> Result<(Option<std::process::ExitStatus>, String, bool), GateError> {
+                let mut served = Served38::spawn_with(args, &own, &mut server(env)?)?;
+                let mut status = None;
+                for _ in 0..POLLS {
+                    status = served.child.try_wait()?;
+                    let text = std::fs::read_to_string(&err_log)?;
+                    let planned = matches!(
+                        record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
+                            .first(&record::PLAN38),
+                        Ok(Some(_))
+                    );
+                    if status.is_some() || planned {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                let text = std::fs::read_to_string(&err_log)?;
+                println!("draft-share: {what}: exit {status:?}");
+                if status.is_none() {
+                    println!("draft-share: the {what} server stopped: {}", served.stop()?);
+                }
+                let planned = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
+                    .first(&record::PLAN38)?
+                    .is_some();
+                Ok((status, text, planned))
+            };
+        let last_lines = |what: &str, text: &str| {
+            println!("draft-share: the {what} server's last lines:");
+            for l in text.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
+                println!("  {l}");
+            }
+        };
 
         // The set draft: refused before the plan record and any load.
-        let mut cmd = Command::new(Served38::exe()?);
-        cmd.env(bloomery_levers::DRAFT, "mtp")
-            .env(bloomery_levers::RESIDENCY, "off")
-            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
-            .env_remove(bloomery_levers::MTP_DRAFT)
-            .env_remove(bloomery_levers::MTP_WIDTH);
         let args: Vec<&str> = DEFAULT_ARGS.iter().chain(&FLAGS).copied().collect();
-        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
-        let mut status = None;
-        for _ in 0..POLLS {
-            status = served.child.try_wait()?;
-            let text = std::fs::read_to_string(&err_log)?;
-            let planned = matches!(
-                record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38).first(&record::PLAN38),
-                Ok(Some(_))
-            );
-            if status.is_some() || planned {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        let text = std::fs::read_to_string(&err_log)?;
-        println!("draft-share: set draft: exit {status:?}");
-        if status.is_none() {
-            println!(
-                "draft-share: the set-draft server stopped: {}",
-                served.stop()?
-            );
-        }
+        let (status, text, planned) =
+            refused("set-draft", &[(bloomery_levers::DRAFT, "mtp")], &args)?;
         let want = format!(
             "a slot's context of 4 leaves no positions for the MTP draft's window; --ctx-size \
              names a total of at least {positions}"
         );
-        let planned = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
-            .first(&record::PLAN38)?
-            .is_some();
         if !text.contains(&want) {
-            println!("draft-share: the set-draft server's last lines:");
-            for l in text.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
-                println!("  {l}");
-            }
+            last_lines("set-draft", &text);
         }
         check(
             &mut ok,
@@ -3873,15 +3911,32 @@ mod gate {
             status.is_some_and(|s| !s.success()) && text.contains(&want) && !planned,
         );
 
+        // The unset draft at the default context of two slots: off by the slot
+        // count, so the width lever beside it is refused by name.
+        let args: Vec<&str> = DEFAULT_ARGS[..4]
+            .iter()
+            .chain(&["--parallel", "2"])
+            .copied()
+            .collect();
+        let (status, text, planned) =
+            refused("two-slot", &[(bloomery_levers::MTP_WIDTH, "fixed")], &args)?;
+        let why = bloomery_levers::Draft38Off::Slots { slots: 2 }.to_string();
+        let named = text.contains(&format!(
+            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; the server drafts \
+             nothing ({why})"
+        ));
+        if !named {
+            last_lines("two-slot", &text);
+        }
+        check(
+            &mut ok,
+            "draft_unset_is_off_on_two_slots",
+            status.is_some_and(|s| !s.success()) && named && !planned,
+        );
+
         // The unset draft: off, and the load's record names why.
-        let mut cmd = Command::new(Served38::exe()?);
-        cmd.env(bloomery_levers::RESIDENCY, "off")
-            .env_remove(bloomery_levers::DRAFT)
-            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
-            .env_remove(bloomery_levers::MTP_DRAFT)
-            .env_remove(bloomery_levers::MTP_WIDTH);
         let args: Vec<&str> = DEFAULT_ARGS[..4].iter().chain(&FLAGS).copied().collect();
-        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+        let mut served = Served38::spawn_with(&args, &own, &mut server(&[])?)?;
         let mut off = None;
         for _ in 0..POLLS {
             let text = std::fs::read_to_string(&err_log)?;
@@ -3910,9 +3965,7 @@ mod gate {
             off.as_deref().unwrap_or("none")
         );
         if off.is_none() {
-            for l in text.lines().rev().take(20).collect::<Vec<_>>().iter().rev() {
-                println!("  {l}");
-            }
+            last_lines("unset-draft", &text);
         }
         let why = bloomery_levers::Draft38Off::Ctx {
             need: positions,
@@ -4742,7 +4795,8 @@ mod gate {
         ok &= draft_slot_share(dir)?;
         ok &= residency_loads_the_word(dir)?;
         // The resident slots together (the module header): its own servers,
-        // the first with the draft on, the second the seat's own defaults.
+        // the first with the draft on, the second the seat's own defaults but
+        // the draft.
         ok &= slots_flow_together(dir)?;
         // An unset residency whose churn pool the host's room cannot take
         // keeps its P and runs the pool from the file (the module header):

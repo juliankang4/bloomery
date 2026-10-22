@@ -197,11 +197,11 @@ folder that holds `model.safetensors.index.json`, and `--hf <repo>` names a repo
 GGUF set (a `:<quant>` on that repo is refused by name, as the checkpoint is the repo's one model). Every part keeps the
 format the checkpoint stores it in. Checked with `nvidia/Qwen3.8-Flash-Next-NVFP4` on a DGX Spark's GB10, where it plans
 the same bytes and gives the same greedy ids as the GGUF split made from it. The load holds every tensor on the stage
-card and reads the PLE table from the folder on the NVMe tier, so a plan that puts a tensor elsewhere, a set
-`BLOOMERY_RESIDENCY` other than `off` is refused by name. The folder's MTP layer uses the same draft and verification
-path as a shared GGUF draft. `BLOOMERY_DRAFT=mtp` selects it, and `BLOOMERY_DRAFT=off` disables it. The default draft
-rule can select the folder's layer when the placement and context allow it. The draft borrows the target's embedding
-and vocabulary head; its experts and dense projections keep their stored formats.
+card and reads the PLE table from the folder on the NVMe tier, so a plan that puts a tensor elsewhere and a set
+`BLOOMERY_RESIDENCY` other than `off` are refused by name. The folder's MTP layer uses the same draft and verification
+path as a shared GGUF draft, under the same `BLOOMERY_DRAFT` rule (Speculative decoding, below): `mtp` selects it,
+`off` disables it, and unset selects it where the rule would select a GGUF draft. The draft borrows the target's
+embedding and vocabulary head; its experts and dense projections keep their stored formats.
 
 The nemotron seat serves Nemotron 3 Nano 4B (`--model nemotron -m PATH`), Nemotron 3.5 Bolt 74B-A9B and
 Nemotron-3.5-Lightning 30B-A3B, one sequence: `--parallel` above 1, a placement of more than one card or with a
@@ -306,7 +306,9 @@ by name.
 Unset, the MTP draft yields to the context: it goes off when the plan with it would leave a slot fewer positions
 than the plan without it, a set `--ctx-size`/`--ctx` included, a `draft yield` record naming its
 card bytes and the positions a slot gets either way, and the context line that follows is the plain plan's.
-`BLOOMERY_DRAFT=mtp` keeps it on whatever the context. The
+`BLOOMERY_DRAFT=mtp` keeps it on whatever the context. On Qwen3.8 an unset MTP draft also stays off under
+`--parallel` above 1, from a GGUF draft file and a checkpoint folder alike, because a drafted server steps a round of
+sampled or id-banning requests one slot at a time; `BLOOMERY_DRAFT=mtp` drafts on any slot count. The
 drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
 (the default, temperature 0.8 as in llama-server) while one request runs: each kept id is the request's own
 sampler's draw from its verified row, as llama.cpp's speculative decoding takes it. A sampled request beside

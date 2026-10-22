@@ -23,9 +23,11 @@
 //! takes the first shard's place in every rule and plan, its tokenizer is the
 //! vocabulary, and the engine loads every card tensor from the folder's parts
 //! ([`Folder38`]) and reads its PLE rows where the folder stores them. Such a
-//! load holds every tensor on the stage card and runs no residency machine and
-//! no MTP draft: unset, the draft goes off naming the folder
-//! ([`draft_off_for`]); `BLOOMERY_DRAFT=mtp` is refused by name.
+//! load holds every tensor on the stage card and runs no residency machine.
+//! Unless `BLOOMERY_MTP_DRAFT` names a file, its MTP draft is the folder's own
+//! MTP layer, under the draft rule below; a folder without the layer turns the
+//! unset draft off naming the folder and refuses `BLOOMERY_DRAFT=mtp` by name
+//! ([`draft_off_for`]).
 //! The `plan` record, then the `load` and `capture` lines of the qwen4exp
 //! open, go to stderr as `generate_qwen3moe` prints them, then `listening on
 //! http://<addr>` once the model is loaded and the port is bound (`--port 0`
@@ -240,7 +242,11 @@
 //! total under 5 a slot), each printed as a `load draft=off (<why>)` record
 //! after the `load` line (`no file at <path>[, <path>…]`, every place the pick looked), never a
 //! refusal; `BLOOMERY_DRAFT=mtp` set with stores that short is refused by
-//! name before the plan. Unset, the draft then yields to the context
+//! name before the plan. Unset, the draft also goes off under `--parallel`
+//! above 1, whatever its source ([`draft_for_slots`]: a `load draft=off`
+//! record naming the slots): a drafted load steps a round of sampled or
+//! id-banning requests a slot at a time, where a plain load runs it as one
+//! pass. Unset, the draft then yields to the context
 //! (`bloomery_levers::RungCost::of`, at [`ctx38`]'s caller): it goes off
 //! when the plan with it leaves a slot fewer positions than the plan
 //! without it, a set `--ctx-size` included, one `draft yield` record naming
@@ -928,6 +934,24 @@ pub(crate) fn draft_off_for(
     })
 }
 
+/// [`draft38`]'s answer `(mtp, off)` with `slots` resident sequences, whatever the draft's
+/// source (a GGUF draft file or a checkpoint folder's MTP layer): a draft the unset rule would
+/// have run goes off on more than one slot ([`Draft38Off::Slots`]), as a drafted load steps a
+/// round of sampled or id-banning requests a slot at a time (`Q38::step_pass` is false on it),
+/// where a plain load runs the round as one pass; a set word runs as set, and a reason the
+/// draft was already off for stands.
+pub(crate) fn draft_for_slots(
+    slots: usize,
+    word: Option<&str>,
+    (mtp, off): (bool, Option<Draft38Off>),
+) -> (bool, Option<Draft38Off>) {
+    if mtp && word.is_none() && slots > 1 {
+        (false, Some(Draft38Off::Slots { slots }))
+    } else {
+        (mtp, off)
+    }
+}
+
 /// The residency the load of `plan` at `place` runs: `set` (the word and
 /// its parse) as given; unset, the Qwen3.8 rule's
 /// ([`residency38`]: before the plan `off` under `--place gate`, beside the
@@ -1338,6 +1362,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     } else {
         (mtp, draft_off)
     };
+    let (mtp, draft_off) = draft_for_slots(slots, levers.draft(), (mtp, draft_off));
     // A draft lever set on a server that drafts nothing is refused, with
     // why — asked once the yield below has said its last word, so a draft
     // the plan turns off refuses them the same as one the rule did.

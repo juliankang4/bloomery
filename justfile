@@ -2632,8 +2632,8 @@ gate-gpu-qwen38-nodes-remote:
 # end-of-generation id), the same /completion once more after a chat turn, the served context in /props, and the
 # plain cache clause; then its own servers one at a time: the ctx clause's flagless, refused and one-slot servers
 # (they stop before the load), the slots pair (the gate's own --parallel 2 shape, which also holds the drafted
-# off-slot and late-request clauses, and the seat under its own defaults, which also holds the residency and
-# width-chooser wiring and the reset route) and the sampled rounds one. --arm drafted second: the main server
+# off-slot and late-request clauses, and the seat under its own defaults but BLOOMERY_DRAFT=mtp, which also holds
+# the residency and width-chooser wiring and the reset route) and the sampled rounds one. --arm drafted second: the main server
 # under BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=off (the fixed window), /props' draft object against the gate's
 # drafted plan, the greedy pass's ids and its draft counts, the continued requests (each keeps the held prefix,
 # one `mtp prompt` record a prompt call past it, the plain ids), the sampled ones (a sampled /completion drafts;
