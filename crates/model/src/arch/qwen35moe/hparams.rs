@@ -1274,18 +1274,19 @@ pub(super) mod tests {
         );
     }
 
-    /// Every classified qwen4exp tensor as a BF16 matrix: the ones a BF16
-    /// reader takes (the dense site's projections, the indexer's, the head
-    /// and the embedding) keep their words; every one body38 reads as F32
-    /// values (the `f32_len` and `f32_shape` checks of `plan38::plans`, and
-    /// the parts of its joined β·α stack and router) is widened, the conv
-    /// and the injects at their own shapes. A tensor in neither list fails.
+    /// Every classified qwen4exp tensor as a BF16 matrix: the independent
+    /// head, its rows a multiple of 128 values wide, occupies MXFP8 planes;
+    /// the others a BF16 reader takes (the dense site's projections, the
+    /// indexer's and the embedding) keep their words; every one body38 reads
+    /// as F32 values (the `f32_len` and `f32_shape` checks of
+    /// `plan38::plans`, and the parts of its joined β·α stack and router) is
+    /// widened, the conv and the injects at their own shapes. A tensor in
+    /// neither list fails.
     #[test]
     fn a_qwen4exp_bf16_matrix_keeps_its_words_only_for_a_word_reader() {
         use crate::placement::CardFormat;
         use gguf::quant::GgmlType;
         const RAW: &[&str] = &[
-            "output.weight",
             "token_embd.weight",
             "output_hc_down.weight",
             "output_hc_up.weight",
@@ -1353,7 +1354,10 @@ pub(super) mod tests {
                 "hc_attn_inject.weight" | "hc_ffn_inject.weight" => vec![10_240, 4],
                 _ => vec![256, 16],
             };
-            let want = if RAW.contains(&stem) {
+            let want = if stem == "output.weight" {
+                // PIN(2026-10-23): independent BF16 heads at K=256 occupy MXFP8 planes.
+                CardFormat::Mxfp8Planes
+            } else if RAW.contains(&stem) {
                 CardFormat::Bf16Raw
             } else {
                 assert!(WIDE.contains(&stem), "{} is in neither list", t.name);

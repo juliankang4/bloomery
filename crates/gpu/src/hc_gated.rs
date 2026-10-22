@@ -625,7 +625,12 @@ unsafe fn up_bf16<const M: usize>(
     // before its barrier, and the entry owns this warp's output.
     unsafe {
         up_mix_value_bf16::<M>(
-            w, lo_s, xn, (hidden as usize, h, warp::lane_id() as usize), fault, mixed,
+            w,
+            lo_s,
+            xn,
+            (hidden as usize, h, warp::lane_id() as usize),
+            fault,
+            mixed,
         )
     };
 }
@@ -1136,8 +1141,13 @@ mod hc_kernels {
         // thread calls the stage before any row guard.
         unsafe {
             up_bf16::<1>(
-                w, (dpart, ipart), xn, (hidden, inject), fault,
-                (&mut lo, &mut wgt, &mut mixed), lo_s,
+                w,
+                (dpart, ipart),
+                xn,
+                (hidden, inject),
+                fault,
+                (&mut lo, &mut wgt, &mut mixed),
+                lo_s,
             )
         };
     }
@@ -1536,8 +1546,18 @@ impl HcGatedKernels {
             HcMatrix::Bf16(w) if mu == 1 => {
                 let prep = self.module.prepare_hc_gated_up_mix_bf16_1col(cfg)?;
                 self.module.hc_gated_up_mix_bf16_1col(
-                    stream, &prep, w.buf(), &s.dpart, &s.ipart, &s.xn,
-                    hidden, inject, a.fault, &mut s.lo, &mut s.wgt, a.mixed,
+                    stream,
+                    &prep,
+                    w.buf(),
+                    &s.dpart,
+                    &s.ipart,
+                    &s.xn,
+                    hidden,
+                    inject,
+                    a.fault,
+                    &mut s.lo,
+                    &mut s.wgt,
+                    a.mixed,
                 )?;
             }
             HcMatrix::Bf16(w) => {

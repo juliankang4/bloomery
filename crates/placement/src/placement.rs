@@ -146,6 +146,9 @@ impl ModelTensors {
     ///   the kernels that read those read f32 values.
     #[must_use]
     pub fn card_format(&self, t: &ModelTensor) -> Option<CardFormat> {
+        if t.role == Role::Head && t.name == HEAD_TENSOR {
+            return file_card_format(HEAD_TENSOR, t.ty, *t.dims.first()?);
+        }
         match (t.role, card_format_of_role(t.ty, t.role)) {
             (
                 Role::Attention
@@ -503,9 +506,24 @@ pub enum Device {
     Unused,
 }
 
-/// The format a file tensor of type `ty` in role `role` loads in on a
-/// card: [`CardFormat::of`], except an engram gain, which the card reads
-/// as f32 values whatever its type — a K-quant one is decoded at load.
+/// The independent output projection, separate from its norm and hyper-connection.
+pub const HEAD_TENSOR: &str = "output.weight";
+
+/// Resident format of file tensor `name` of type `ty`, its rows `k` values wide, as the loader
+/// makes it: a BF16 [`HEAD_TENSOR`] occupies MXFP8 planes when `k` is a multiple of 128 and keeps
+/// its words otherwise; every other tensor, a tied embedding included, takes its type's format.
+#[must_use]
+pub fn file_card_format(name: &str, ty: GgmlType, k: u64) -> Option<CardFormat> {
+    if name != HEAD_TENSOR || ty != GgmlType::BF16 {
+        CardFormat::of(ty)
+    } else if k.is_multiple_of(128) {
+        Some(CardFormat::Mxfp8Planes)
+    } else {
+        Some(CardFormat::Bf16Raw)
+    }
+}
+
+/// The card format by role. Engram gains are decoded to f32 at load.
 #[must_use]
 pub fn card_format_of_role(ty: GgmlType, role: Role) -> Option<CardFormat> {
     match (role, CardFormat::of(ty)) {
@@ -4575,6 +4593,18 @@ mod tests {
                 gathered_rows: (role == Role::TokenEmbedding).then_some(1),
             }
         };
+        assert_eq!(
+            file_card_format(HEAD_TENSOR, GgmlType::BF16, 320),
+            Some(CardFormat::Bf16Raw)
+        );
+        assert_eq!(
+            file_card_format(HEAD_TENSOR, GgmlType::Q8_0, 256),
+            Some(CardFormat::Q8_0Planes)
+        );
+        assert_eq!(
+            file_card_format("token_embd.weight", GgmlType::BF16, 256),
+            CardFormat::of(GgmlType::BF16)
+        );
         let raw = [
             Role::Attention,
             Role::HyperConnection,
@@ -4600,7 +4630,8 @@ mod tests {
                     }
                 }
                 for (name, role) in [
-                    ("bf16 head", Role::Head),
+                    (HEAD_TENSOR, Role::Head),
+                    ("output_hc_up.weight", Role::Head),
                     ("bf16 embd", Role::TokenEmbedding),
                 ] {
                     model.tensors.push(bf16(name.into(), None, role, &[16]));
@@ -4634,7 +4665,12 @@ mod tests {
                         continue;
                     }
                     seen += 1;
-                    let (format, bytes) = if bf16_words && raw.contains(&t.role) {
+                    let (format, bytes) = if t.name == HEAD_TENSOR {
+                        (
+                            CardFormat::Mxfp8Planes,
+                            t.file_bytes / 2 + t.file_bytes / 64,
+                        )
+                    } else if bf16_words && raw.contains(&t.role) {
                         (CardFormat::Bf16Raw, t.file_bytes)
                     } else {
                         (CardFormat::Bf16AsF32, 2 * t.file_bytes)
@@ -4657,7 +4693,7 @@ mod tests {
                         t.name
                     );
                 }
-                assert_eq!(seen, 4 * 5 + 2, "n={n}");
+                assert_eq!(seen, 4 * 5 + 3, "n={n}");
             }
         }
     }

@@ -1337,6 +1337,74 @@ unsafe fn blocks_lane_partials_m<F: ByteBlocks>(
     })
 }
 
+/// # Safety
+/// The caller validates both planes for F, ids for n_rows, x for k*m,
+/// and y for n_rows*m. k is positive and m is in 1..=8.
+#[inline(always)]
+unsafe fn blocks_gemv_ids<F: ByteBlocks>(
+    weight: (&[u32], &[F::Scale]),
+    x: &[f32],
+    map: (&[u32], u32, u32),
+    shape: (u32, u32),
+    fault: FaultSink,
+    mut y: DisjointSlice<f32>,
+) {
+    let (qs, d) = weight;
+    let (ids, n_rows, n_matrix) = map;
+    let (k, m_cols) = shape;
+    let t = thread::threadIdx_x() as usize;
+    let row = thread::blockIdx_x() as usize * 8 + t / 32;
+    if row >= n_rows as usize {
+        return;
+    }
+    // SAFETY: row < n_rows <= ids.len() by the launch contract.
+    let id = unsafe { *ids.get_unchecked(row) };
+    let lane = warp::lane_id() as usize;
+    if id >= n_matrix {
+        if lane == 0 {
+            fault.raise(FaultSite::TokenId);
+            // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
+            // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
+            // launch contract's bound; only lane 0 of the row's warp
+            // writes them.
+            unsafe {
+                store_sums(
+                    &mut y,
+                    row * m_cols as usize,
+                    1,
+                    m_cols as usize,
+                    &[f32::NAN; 8],
+                );
+            }
+        }
+        return;
+    }
+    // SAFETY: id < n_matrix puts the matrix row's words and scales inside
+    // qs and d (the host-checked code and scale extents), and
+    // column c at c*k with x.len() >= m_cols*k = (m_cols-1)*k + k; the
+    // host passes k a positive multiple of 32.
+    let f = if m_cols == 1 {
+        // SAFETY: the validated row and planes cover this one input column.
+        let f = unsafe { blocks_lane_partial_1col::<F>(qs, d, x, k, id as usize, 0, lane) };
+        [f, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    } else {
+        let Some(f) = (unsafe {
+            blocks_lane_partials_m::<F>(qs, d, x, k, id as usize, 0, k as usize, m_cols, lane)
+        }) else {
+            return;
+        };
+        f
+    };
+    let sums = gemv_lane_sums(f, m_cols);
+    if lane == 0 {
+        // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
+        // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
+        // launch contract's bound; only lane 0 of the row's warp writes
+        // them.
+        unsafe { store_sums(&mut y, row * m_cols as usize, 1, m_cols as usize, &sums) };
+    }
+}
+
 /// The row's m sums from the per-lane partials: the fixed five-step
 /// butterfly per column (`warp::reduce_sum_f32`), columns past `m_cols`
 /// left at 0.0. `m_cols` must be warp-uniform — a launch-wide constant in
@@ -1879,6 +1947,8 @@ mod q8f32_kernels {
         n_rows: u32,
         k: u32,
         m_cols: u32,
+        y_row: u32,
+        y_col: u32,
         mut y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -1896,10 +1966,16 @@ mod q8f32_kernels {
         };
         let sums = gemv_lane_sums(f, m_cols);
         if lane == 0 {
-            // SAFETY: row + c*n_rows < n_rows*m_cols <= y.len();
+            // SAFETY: the launcher selects row-major or token-major strides within y;
             // this row's lane 0 alone writes these slots.
             unsafe {
-                store_sums(&mut y, row, n_rows as usize, m_cols as usize, &sums);
+                store_sums(
+                    &mut y,
+                    row * y_row as usize,
+                    y_col as usize,
+                    m_cols as usize,
+                    &sums,
+                );
             }
         }
     }
@@ -1968,6 +2044,8 @@ mod q8f32_kernels {
         n_rows: u32,
         k: u32,
         m_cols: u32,
+        y_row: u32,
+        y_col: u32,
         mut y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -1985,10 +2063,16 @@ mod q8f32_kernels {
         };
         let sums = gemv_lane_sums(f, m_cols);
         if lane == 0 {
-            // SAFETY: row + c*n_rows < n_rows*m_cols <= y.len();
+            // SAFETY: the launcher selects row-major or token-major strides within y;
             // this row's lane 0 alone writes these slots.
             unsafe {
-                store_sums(&mut y, row, n_rows as usize, m_cols as usize, &sums);
+                store_sums(
+                    &mut y,
+                    row * y_row as usize,
+                    y_col as usize,
+                    m_cols as usize,
+                    &sums,
+                );
             }
         }
     }
@@ -2313,62 +2397,55 @@ mod q8f32_kernels {
         k: u32,
         m_cols: u32,
         fault: FaultSink,
-        mut y: DisjointSlice<f32>,
+        y: DisjointSlice<f32>,
     ) {
-        let t = thread::index_1d().get() % 256;
-        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
-        if row >= n_rows as usize {
-            return;
-        }
-        // SAFETY: row < n_rows <= ids.len() by the launch contract.
-        let id = unsafe { *ids.get_unchecked(row) };
-        let lane = warp::lane_id() as usize;
-        if id >= n_matrix {
-            if lane == 0 {
-                fault.raise(FaultSite::TokenId);
-                // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
-                // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
-                // launch contract's bound; only lane 0 of the row's warp
-                // writes them.
-                unsafe {
-                    store_sums(
-                        &mut y,
-                        row * m_cols as usize,
-                        1,
-                        m_cols as usize,
-                        &[f32::NAN; 8],
-                    );
-                }
-            }
-            return;
-        }
-        // SAFETY: id < n_matrix puts the matrix row's words and scales inside
-        // qs and d (the contract's 4·qs.len() and 32·d.len() bounds), and
-        // column c at c*k with x.len() >= m_cols*k = (m_cols-1)*k + k; the
-        // host passes k a positive multiple of 32.
-        let Some(f) = (unsafe {
-            blocks_lane_partials_m::<Q8_0Bytes>(
-                qs,
-                d,
-                x,
-                k,
-                id as usize,
-                0,
-                k as usize,
-                m_cols,
-                lane,
-            )
-        }) else {
-            return;
+        // SAFETY: the launch contract bounds each buffer; the host checks k and m.
+        unsafe {
+            blocks_gemv_ids::<Q8_0Bytes>((qs, d), x, (ids, n_rows, n_matrix), (k, m_cols), fault, y)
         };
-        let sums = gemv_lane_sums(f, m_cols);
-        if lane == 0 {
-            // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
-            // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
-            // launch contract's bound; only lane 0 of the row's warp writes
-            // them.
-            unsafe { store_sums(&mut y, row * m_cols as usize, 1, m_cols as usize, &sums) };
-        }
+    }
+
+    /// Selected MXFP8 rows, with row-major output and checked vocabulary IDs.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_matrix * k,
+            128 * e.len() >= n_matrix * k,
+            ids.len() >= n_rows,
+            x.len() >= m_cols * k,
+            y.len() >= n_rows * m_cols
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn mxfp8_gemv_ids(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        ids: &[u32],
+        n_rows: u32,
+        n_matrix: u32,
+        k: u32,
+        m_cols: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract bounds each buffer; the host checks k and m.
+        unsafe {
+            blocks_gemv_ids::<Mxfp8Bytes>(
+                (qs, e),
+                x,
+                (ids, n_rows, n_matrix),
+                (k, m_cols),
+                fault,
+                y,
+            )
+        };
     }
 }
 
@@ -2629,10 +2706,63 @@ impl Q8F32Kernels {
         Ok(())
     }
 
+    /// Project selected MXFP8 rows with the same layout and ID faults as Q8_0.
+    pub fn enqueue_mxfp8_gemv_ids(
+        &self,
+        stream: &CudaStream,
+        a: Mxfp8GemvIdsArgs<'_>,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_mxfp8_gemv_ids";
+        let Mxfp8GemvIdsArgs {
+            qs,
+            e,
+            ids,
+            rows,
+            x,
+            m,
+            y,
+        } = a;
+        let (n_matrix, k) = E4m3Weight {
+            qs,
+            e,
+            scales: E4m3Scales::Mxfp8,
+        }
+        .dimensions(what)?;
+        if rows > ids.len() || rows > n_matrix {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{rows} listed rows: at most {} map IDs and {n_matrix} matrix rows",
+                    ids.len()
+                ),
+            ));
+        }
+        check_gemv_geometry(what, rows, k, x.len(), m, y.len())?;
+        let rows = launch_u32(what, "rows", rows)?;
+        let cfg = LaunchConfig1D::new(rows.div_ceil(8), 256, 0);
+        let prep = self.module.prepare_mxfp8_gemv_ids(cfg)?;
+        self.module.mxfp8_gemv_ids(
+            stream,
+            &prep,
+            qs.buf(),
+            e.buf(),
+            x,
+            ids,
+            rows,
+            launch_u32(what, "n_matrix", n_matrix)?,
+            launch_u32(what, "k", k)?,
+            launch_u32(what, "m", m)?,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
+
     /// Enqueue `y = W · x` for an E4M3 weight in its two planes (module doc,
     /// [`E4m3Weight`]) against `m` (1..=8) f32 activation columns of `k =
-    /// 4 · qs.cols()` values each, token-major (row r's column c at
-    /// `y[c · n_rows + r]`): `m = 1` runs `mxfp8_gemv` or `fp8_b128_gemv` as
+    /// 4 · qs.cols()` values each, with the layout selected by `out`.
+    /// `m = 1` runs `mxfp8_gemv` or `fp8_b128_gemv` as
     /// its scales say, `m > 1` the `_mcol` entry, whose column c is the
     /// `m = 1` launch of column c bit for bit. `k` must be a multiple of 128
     /// and `e` `k / 128` words a row over the same rows; another geometry is
@@ -2642,7 +2772,7 @@ impl Q8F32Kernels {
         stream: &CudaStream,
         a: E4m3GemvArgs<'_>,
     ) -> Result<(), GpuError> {
-        let E4m3GemvArgs { w, x, m, y } = a;
+        let E4m3GemvArgs { w, x, m, out, y } = a;
         let what = "enqueue_e4m3_gemv";
         let (n_rows, k) = w.dimensions(what)?;
         check_gemv_geometry(what, n_rows, k, x.len(), m, y.len())?;
@@ -2665,14 +2795,19 @@ impl Q8F32Kernels {
             return Ok(());
         }
         let m = launch_u32(what, "m", m)?;
+        let (y_row, y_col) = match out {
+            GemvOut::RowMajor => (m, 1),
+            GemvOut::TokenMajor => (1, n_rows),
+        };
         match w.scales {
             E4m3Scales::Mxfp8 => {
                 let prep = module.prepare_mxfp8_gemv_mcol(cfg)?;
-                module.mxfp8_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y)?;
+                module.mxfp8_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y_row, y_col, y)?;
             }
             E4m3Scales::Fp8B128 => {
                 let prep = module.prepare_fp8_b128_gemv_mcol(cfg)?;
-                module.fp8_b128_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y)?;
+                module
+                    .fp8_b128_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y_row, y_col, y)?;
             }
         }
         Ok(())
@@ -2987,6 +3122,17 @@ pub struct Bf16GemvIdsArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
+/// Selected rows of an MXFP8 matrix, read in place, with row-major output.
+pub struct Mxfp8GemvIdsArgs<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub e: &'a DeviceTensor<u32>,
+    pub ids: &'a DeviceBuffer<u32>,
+    pub rows: usize,
+    pub x: &'a DeviceBuffer<f32>,
+    pub m: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
 /// [`Q8F32Kernels::enqueue_q8_0_gemv_ids`]'s arguments: the Q8_0 planes of
 /// the whole matrix as [`Q8F32Kernels::enqueue_q8_0_gemv`] takes them, the
 /// row → matrix row map and how many of its rows the launch reads, `m`
@@ -3176,6 +3322,7 @@ pub struct E4m3GemvArgs<'a> {
     pub w: E4m3Weight<'a>,
     pub x: &'a DeviceBuffer<f32>,
     pub m: usize,
+    pub out: GemvOut,
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
@@ -3354,14 +3501,105 @@ fn check_gemv_geometry(
     Ok(())
 }
 
+/// Quantize BF16 rows to E4M3 with one upward-rounded E8M0 scale per 32 values.
+pub(crate) fn bf16_mxfp8_planes(
+    src: &[u8],
+    rows: usize,
+    k: usize,
+) -> Result<(Vec<u32>, Vec<u32>), GpuError> {
+    const WHAT: &str = "bf16_mxfp8_planes";
+    let count = rows
+        .checked_mul(k)
+        .ok_or_else(|| GpuError::shape(WHAT, "value count passes usize"))?;
+    if rows == 0 || k == 0 || !k.is_multiple_of(128) || count.checked_mul(2) != Some(src.len()) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("{rows} rows of {k} do not match {} BF16 bytes", src.len()),
+        ));
+    }
+    let mut qs = vec![0u32; count / 4];
+    let mut scales = vec![0u32; count / 128];
+    for (block, bytes) in src.chunks_exact(64).enumerate() {
+        let values: [f32; 32] = std::array::from_fn(|i| {
+            f32::from_bits(u32::from(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])) << 16)
+        });
+        if !values.iter().all(|v| v.is_finite()) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("block {block} has a non-finite value"),
+            ));
+        }
+        let amax = values.iter().fold(f32::MIN_POSITIVE, |a, v| a.max(v.abs()));
+        let exponent = ((amax / 448.0).log2().ceil() as i32).clamp(-127, 127);
+        scales[block / 4] |= ((exponent + 127) as u32) << (8 * (block % 4));
+        let scale = 2.0f32.powi(exponent);
+        let inverse = 2.0f32.powi(-exponent);
+        for (i, value) in values.into_iter().enumerate() {
+            let magnitude = (value * inverse).abs();
+            let code = if magnitude < 1.0 / 64.0 {
+                (magnitude * 512.0).round_ties_even() as u32
+            } else {
+                let bits = magnitude.to_bits() - (120 << 23);
+                let kept = bits >> 20;
+                let tail = bits & 0x000f_ffff;
+                (kept + u32::from(tail > 0x0008_0000 || (tail == 0x0008_0000 && kept & 1 != 0)))
+                    .min(126)
+            };
+            if !(Mxfp8Bytes::value(code) * scale).is_finite() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("block {block} rounds a value past f32's range"),
+                ));
+            }
+            let signed = code | ((value.to_bits() >> 24) & 0x80);
+            let at = block * 32 + i;
+            qs[at / 4] |= signed << (8 * (at % 4));
+        }
+    }
+    Ok((qs, scales))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ByteBlocks, E4m3Scales, Fp8B128Bytes, Mxfp8Bytes, check_gemv_geometry, e4m3_planes,
-        f32_lane_partial_1col_w32, f32_lane_partials, q8_0_lane_partial_1col,
+        ByteBlocks, E4m3Scales, Fp8B128Bytes, Mxfp8Bytes, bf16_mxfp8_planes, check_gemv_geometry,
+        e4m3_planes, f32_lane_partial_1col_w32, f32_lane_partials, q8_0_lane_partial_1col,
         q8_0_lane_partials_mcol,
     };
     use gguf::quant::{GgmlType, dequant_row};
+
+    #[test]
+    fn bf16_head_encoding_refuses_bad_shapes_and_non_finite_values() {
+        for (rows, k, len) in [
+            (0, 128, 0),
+            (1, 0, 0),
+            (1, 32, 64),
+            (1, 128, 255),
+            (usize::MAX, 128, 0),
+        ] {
+            assert!(bf16_mxfp8_planes(&vec![0; len], rows, k).is_err());
+        }
+        for (bits, reason) in [
+            (0x7f80u16, "non-finite"),
+            (0xff80, "non-finite"),
+            (0x7fc0, "non-finite"),
+            (0x7f7f, "f32's range"),
+            (0xff7f, "f32's range"),
+        ] {
+            let mut bytes = vec![0; 256];
+            bytes[..2].copy_from_slice(&bits.to_le_bytes());
+            let error = bf16_mxfp8_planes(&bytes, 1, 128).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+        let mut bytes = [0; 256];
+        bytes[..2].copy_from_slice(&0x7f70u16.to_le_bytes());
+        let (codes, scales) = bf16_mxfp8_planes(&bytes, 1, 128).unwrap();
+        assert_eq!(codes[0], 0x77);
+        assert_eq!(scales[0], 247);
+        let (codes, scales) = bf16_mxfp8_planes(&[0; 256], 1, 128).unwrap();
+        assert_eq!(codes, vec![0; 32]);
+        assert_eq!(scales, [0]);
+    }
 
     #[test]
     fn gemv_geometry_refuses_wrapped_buffer_spans() {

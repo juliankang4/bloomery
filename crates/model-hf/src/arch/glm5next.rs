@@ -526,7 +526,7 @@ fn mapped_tp(g: Geometry, mapped: &HeldMap) -> Result<Vec<TpTensor>, Error> {
                 .split_first()
                 .and_then(|(&k, rest)| {
                     let rows = rest.iter().try_fold(1u64, |a, &b| a.checked_mul(b))?;
-                    gguf::card::CardFormat::of(ty)?.resident_bytes(ty, k, rows)
+                    model::placement::file_card_format(name, ty, k)?.resident_bytes(ty, k, rows)
                 })
                 .ok_or_else(|| refuse(name, format!("no resident card form for {ty} {dims:?}")))?;
             Ok(TpTensor {
@@ -1123,6 +1123,27 @@ mod tests {
         );
     }
 
+    /// A BF16 head 256 values wide is planned in the MXFP8 codes and scales its load makes, cut
+    /// by rows at N = 1, 2 and 4.
+    #[test]
+    fn a_bf16_head_is_planned_in_its_mxfp8_planes() {
+        let (g, _, _, _) = fp4_local();
+        let quant = Config::parse(&serde_json::json!({}), None).unwrap();
+        let table = [("lm_head.weight".to_string(), Dtype::Bf16, vec![64, 256])];
+        let ts = tp_tensors(g, &quant, &table).unwrap();
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts[0].name, "output.weight");
+        // 64 rows of 256 E4M3 codes and 256 / 32 E8M0 scales.
+        assert_eq!(ts[0].bytes, 64 * (256 + 8));
+        for n in [1, 2, 4] {
+            let plan = plan_tp(&pools(n), &ts).unwrap();
+            assert!(
+                plan.iter().all(|r| r.bytes() == 16_896 / n as u64),
+                "N = {n}: {plan:?}"
+            );
+        }
+    }
+
     /// A three-layer GLM checkpoint of F32 tensors two wide (KDA and dense, latent and routed,
     /// KDA and routed) with one NextN layer, from the FP4-Local table: its config and its tensors
     /// (name, shape).
@@ -1293,7 +1314,7 @@ mod tests {
                         .iter()
                         .map(|p| {
                             let t = &p.info;
-                            gguf::card::CardFormat::of(t.ty)
+                            model::placement::file_card_format(&t.name, t.ty, t.dims[0])
                                 .unwrap()
                                 .resident_bytes(t.ty, t.dims[0], t.dims[1..].iter().product())
                                 .unwrap()

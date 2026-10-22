@@ -94,8 +94,8 @@ pub struct Mtp35 {
     borrowed: [BorrowedPlanes; 2],
 }
 
-/// A weight's device addresses as a [`BorrowedPlanes`] holds them: a Q8_0
-/// weight's two planes or a BF16 weight's words and a zero
+/// Device addresses held by [`BorrowedPlanes`]: Q8_0 or MXFP8 planes,
+/// or BF16 words and a zero
 /// ([`super::mtp38::planes`]), a K-quant weight's one plane and a zero.
 pub fn addresses(dw: &DevWeight) -> Option<[u64; 2]> {
     match dw {
@@ -129,7 +129,7 @@ fn borrow(
         GpuError::tensor(
             WHAT,
             name,
-            "Q8_0 planes or a K-quant word plane (the head's forms)",
+            "Q8_0 or MXFP8 planes, BF16 words, or a K-quant word plane",
         )
     })?;
     Ok(BorrowedPlanes {

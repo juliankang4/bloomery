@@ -1,14 +1,10 @@
 //! The GPU output head: `result_norm → lm_head → argmax` as one capturable
 //! sequence over resident scratch (docs/gpu-design.md decisions 4 and 6). No
-//! kernels of its own — the chain is the gated `rms_norm`, then for a Q6_K
-//! or Q4_K lm_head the shared q8_1 quantizer and that type's gemv, then
-//! `argmax_fault`,
-//! for a Q8_0 one the f32-activation Q8_0 gemv and for a BF16 one the BF16
-//! gemv (`bf16_gemv`, `f32_gemv` over the widened values), then
-//! `argmax_finite_fault`, exactly as the block path launches them, so their
-//! gates are this chain's gates. The Q6_K head's quantizer refuses a
-//! non-finite input; the Q8_0 and BF16 heads have none, so their argmax
-//! refuses a non-finite logit — over `m > 1` rows
+//! kernels of its own: after `rms_norm`, a K-quant head uses the shared
+//! q8_1 quantizer and its format's gemv, then `argmax_fault`. Q8_0, BF16
+//! and E4M3 heads read f32 activations through the shared gemvs and use
+//! `argmax_finite_fault`. The quantized path refuses non-finite inputs;
+//! the f32-activation path refuses non-finite logits, using for `m > 1` rows
 //! `argmax_rows_finite_fault`, whose last block to finish copies the word, so
 //! the readback carries every row's raise.
 //!
@@ -37,6 +33,7 @@
 use crate::Gpu;
 use crate::GpuError;
 use crate::fault::{Fault, FaultSink, LAYER_HEAD};
+use crate::q8f32::{E4m3GemvArgs, E4m3Weight, GemvOut};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use cuda_core::DeviceBuffer;
@@ -44,7 +41,7 @@ use model::arch::names::output_norm;
 use model::placement::kernels::{self, HeadEntry};
 
 /// The lm_head weight (`output.weight`) in a format a gemv here reads: a
-/// Q6_K or Q4_K word plane over q8_1 rows, or Q8_0's two planes or BF16's
+/// K-quant words over q8_1 rows, E4M3 or Q8_0 planes, or BF16's
 /// words over the f32 rows.
 enum OutW<'a> {
     Q6K(&'a DeviceTensor<u32>),
@@ -54,6 +51,7 @@ enum OutW<'a> {
         d: &'a DeviceTensor<u16>,
     },
     Bf16(&'a DeviceTensor<u32>),
+    E4m3(E4m3Weight<'a>),
 }
 
 impl OutW<'_> {
@@ -62,13 +60,14 @@ impl OutW<'_> {
         match self {
             OutW::Q6K(w) | OutW::Q4K(w) | OutW::Bf16(w) => w.rows(),
             OutW::Q8_0 { d, .. } => d.rows(),
+            OutW::E4m3(w) => w.qs.rows(),
         }
     }
 
-    /// Whether its gemv reads the f32 rows (Q8_0, BF16): the head then holds
+    /// Whether its gemv reads f32 rows: the head then holds
     /// no q8_1 form and its argmax refuses a non-finite logit.
     fn reads_f32(&self) -> bool {
-        matches!(self, OutW::Q8_0 { .. } | OutW::Bf16(_))
+        matches!(self, OutW::Q8_0 { .. } | OutW::Bf16(_) | OutW::E4m3(_))
     }
 }
 
@@ -96,10 +95,13 @@ fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
         },
         Some(DevWeight::Q8_0 { qs, d, k }) => Ok((OutW::Q8_0 { qs, d }, *k)),
         Some(DevWeight::Bf16 { w, k }) => Ok((OutW::Bf16(w), *k)),
+        Some(DevWeight::Mxfp8 { k, .. } | DevWeight::Fp8B128 { k, .. }) => {
+            Ok((OutW::E4m3(w.e4m3("head_out_w", HEAD_TENSOR)?), *k))
+        }
         Some(_) => Err(GpuError::tensor(
             "head_out_w",
             HEAD_TENSOR,
-            "a K-quant word plane, Q8_0 planes or BF16 words",
+            "K-quant words, Q8_0 or E4M3 planes, or BF16 words",
         )),
         None => Err(GpuError::tensor(
             "head_out_w",
@@ -115,7 +117,7 @@ fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
 fn head_q6k_w(w: &Weights) -> Result<&DeviceTensor<u32>, GpuError> {
     match head_out_w(w)?.0 {
         OutW::Q6K(w) => Ok(w),
-        OutW::Q4K(_) | OutW::Q8_0 { .. } | OutW::Bf16(_) => Err(GpuError::tensor(
+        OutW::Q4K(_) | OutW::Q8_0 { .. } | OutW::Bf16(_) | OutW::E4m3(_) => Err(GpuError::tensor(
             "head_q6k_w",
             HEAD_TENSOR,
             "a Q6_K word plane: the tail this chain hands the head reads Q6_K rows",
@@ -196,8 +198,7 @@ pub struct Head {
     /// The chain's input — the last block's output vector. The assembly round
     /// writes here through `input_mut`; the gate through `set_input`.
     x: DeviceBuffer<f32>,
-    /// The q8_1 form of the normed rows a K-quant projection reads; a Q8_0
-    /// or BF16 head reads the f32 rows and holds none (its width need not divide 256).
+    /// The q8_1 form a K-quant projection reads; f32-activation heads hold none.
     act: Option<Q8Act>,
     logits: DeviceBuffer<f32>,
     /// The `m` argmax tokens, then the fault's first-layer word and that
@@ -205,7 +206,7 @@ pub struct Head {
     /// pair, which no raise can store: `tokens` refuses that pair as an
     /// unwritten readback rather than decode it as a fault.
     token_out: DeviceBuffer<u32>,
-    /// The ticket count of a Q8_0 or BF16 head of `m > 1` rows (its argmax's blocks
+    /// The ticket count of an f32-activation head of `m > 1` rows (its argmax's blocks
     /// each draw one), zero between launches; `None` for every other head.
     rows_done: Option<DeviceBuffer<u32>>,
 }
@@ -348,14 +349,10 @@ impl Head {
             + self.act.as_ref().map_or(0, Q8Act::device_bytes)
     }
 
-    /// Enqueue the whole head for the rows in `x`: rms_norm → quantize_q8_1
-    /// → gemv_q6k (gemv_q4k for a Q4_K lm_head) → argmax_fault
-    /// (`argmax_rows_fault` when `m > 1`), or for
-    /// a Q8_0 lm_head q8_0_gemv (a BF16 one bf16_gemv) over the normed f32
-    /// rows → argmax_finite_fault
-    /// (`argmax_rows_finite_fault` when `m > 1`), the argmax copying the fault
-    /// word after the tokens. Pure enqueues — no allocation, no
-    /// synchronization — so the same body is what a capture records.
+    /// Enqueue normalization, projection and argmax for the rows in `x`.
+    /// K-quant projections quantize the rows to q8_1; other formats read
+    /// f32 rows. The argmax copies fault words after the tokens.
+    /// Allocation-free and asynchronous, so capture records the same body.
     pub fn enqueue(&mut self, gpu: &Gpu, w: &Weights) -> Result<(), GpuError> {
         self.enqueue_over(gpu, w, w)
     }
@@ -394,6 +391,19 @@ impl Head {
                     .enqueue_q8_0_gemv(stream, qs, d, rows, self.m, &mut self.logits)?;
                 return self.argmax_finite(gpu, fault);
             }
+            OutW::E4m3(w) => {
+                gpu.q8f32().enqueue_e4m3_gemv(
+                    stream,
+                    E4m3GemvArgs {
+                        w,
+                        x: rows,
+                        m: self.m,
+                        out: GemvOut::RowMajor,
+                        y: &mut self.logits,
+                    },
+                )?;
+                return self.argmax_finite(gpu, fault);
+            }
             OutW::Bf16(out_w) => {
                 gpu.q8f32()
                     .enqueue_bf16_gemv(stream, out_w, rows, self.m, &mut self.logits)?;
@@ -421,7 +431,7 @@ impl Head {
         Ok(())
     }
 
-    /// The argmax after a gemv over the f32 rows (Q8_0, BF16), which refuses
+    /// The argmax after a gemv over f32 rows, which refuses
     /// a non-finite logit: `argmax_finite_fault`, or `argmax_rows_finite_fault`
     /// past one row, the fault word copied after the tokens.
     fn argmax_finite(&mut self, gpu: &Gpu, fault: FaultSink) -> Result<(), GpuError> {

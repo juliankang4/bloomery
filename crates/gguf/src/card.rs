@@ -600,10 +600,10 @@ impl CardFormat {
             }
             CardFormat::Mxfp8Planes => {
                 // Whole scale words a row: a row's four blocks a word.
-                if !blocks.is_multiple_of(4) {
+                if !k.is_multiple_of(128) {
                     return None;
                 }
-                vec![rows.checked_mul(k)?, rows.checked_mul(blocks)?]
+                vec![rows.checked_mul(k)?, rows.checked_mul(k / 32)?]
             }
             CardFormat::Fp8B128Planes => {
                 vec![
@@ -650,7 +650,8 @@ impl CardFormat {
     pub fn holds(self, ty: GgmlType) -> bool {
         CardFormat::of(ty) == Some(self)
             || (self == CardFormat::Bf16AsF32 && CardFormat::of(ty) == Some(CardFormat::KQuant))
-            || (self == CardFormat::Bf16Raw && ty == GgmlType::BF16)
+            || (matches!(self, CardFormat::Bf16Raw | CardFormat::Mxfp8Planes)
+                && ty == GgmlType::BF16)
             || ty.card().down.is_some_and(|(e, _)| e.layout() == self)
     }
 

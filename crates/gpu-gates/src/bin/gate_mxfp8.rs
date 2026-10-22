@@ -109,7 +109,10 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use crate::dense_file::{by_name, check, columns, decl, host_rows, q8_0_bytes};
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
-    use bloomery_gpu::q8f32::{E4m3GemvArgs, E4m3Scales, E4m3Weight, SelArgs, e4m3_planes};
+    use bloomery_gpu::head::{Head, HeadNorm};
+    use bloomery_gpu::q8f32::{
+        E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, Mxfp8GemvIdsArgs, SelArgs, e4m3_planes,
+    };
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
@@ -452,6 +455,7 @@ mod gate {
         for (ty, tag) in TYPES {
             ok &= plane_shapes(gpu, &g32, (scales_of(ty), tag))?;
         }
+        ok &= normalized_head(gpu, dir)?;
         Ok(ok)
     }
 
@@ -616,6 +620,7 @@ mod gate {
                     w,
                     x: &x,
                     m: 1,
+                    out: GemvOut::TokenMajor,
                     y: &mut y,
                 },
             );
@@ -710,6 +715,133 @@ mod gate {
         Ok(joined && named)
     }
 
+    fn normalized_head(gpu: &Gpu, dir: &Path) -> Result<bool, GateError> {
+        let (rows, k) = (19, 128);
+        let source = [1.0f32, 1.015625, 1.0625, 1.125, 1.1875, 1.25, 1.5, -2.0];
+        let rounded = [1.0f32, 1.0, 1.0, 1.125, 1.25, 1.25, 1.5, -2.0];
+        let codes = [0x70u8, 0x70, 0x70, 0x71, 0x72, 0x72, 0x74, 0xf8];
+        let raw = (0..rows * k)
+            .flat_map(|i| ((source[(i + i / k) % 8].to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let name = bloomery_gpu::weights::HEAD_TENSOR;
+        let path = dir.join("bf16-head.gguf");
+        write_gguf(&path, &[], &[decl(name, GgmlType::BF16, (rows, k), raw)])?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let w = Weights::load_where(gpu.stream(), &split, |n| n == name)?;
+        let planes = w.e4m3("gate_mxfp8", name)?;
+        let expected_codes: Vec<u8> = (0..rows * k).map(|i| codes[(i + i / k) % 8]).collect();
+        let expected_words: Vec<u32> = expected_codes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("four code bytes")))
+            .collect();
+        let mut ok = planes.scales == E4m3Scales::Mxfp8
+            && planes.qs.buf().to_host_vec(gpu.stream())? == expected_words
+            && planes.e.buf().to_host_vec(gpu.stream())? == vec![0x78787878; rows * k / 128];
+        println!(
+            "mxfp8 clause=head.encode rne-ties=true scale=2^-7 {}",
+            verdict(ok)
+        );
+        let wf: Vec<Vec<f32>> = (0..rows)
+            .map(|r| (0..k).map(|c| rounded[(r + c) % 8]).collect())
+            .collect();
+        for m in [1, 3] {
+            let (x, _, _) = columns(gpu, (m, k, rows), 0x5eed_0870 + m as u64, 1.0)?;
+            let mut head = Head::with_norm(gpu, &w, 1e-6, m, HeadNorm::Mixed)?;
+            head.set_input(gpu, &x)?;
+            head.enqueue(gpu, &w)?;
+            let logits = head.logits_to_host(gpu)?;
+            let rule = |r: usize, c: usize| byte_rule(&wf[r], &x[c * k..][..k]);
+            ok &= check(
+                ("mxfp8", "head"),
+                &format!("rows={rows} k={k} m={m}"),
+                (&logits, &x, k),
+                &wf,
+                &|at| (at / m, at % m),
+                &rule,
+            );
+        }
+        Ok(ok)
+    }
+
+    fn head_rows_case(
+        gpu: &Gpu,
+        w: E4m3Weight<'_>,
+        x: &DeviceBuffer<f32>,
+        (rows, m): (usize, usize),
+        full: &[f32],
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let mut row_major = DeviceBuffer::from_host(stream, &vec![f32::NAN; rows * m])?;
+        gpu.q8f32().enqueue_e4m3_gemv(
+            stream,
+            E4m3GemvArgs {
+                w,
+                x,
+                m,
+                out: GemvOut::RowMajor,
+                y: &mut row_major,
+            },
+        )?;
+        let row_major = row_major.to_host_vec(stream)?;
+        let layout = (0..rows * m)
+            .all(|at| row_major[at].to_bits() == full[(at % m) * rows + at / m].to_bits());
+        let ids = [rows as u32 - 1, 0, rows as u32 - 1];
+        let mut ids_dev = DeviceBuffer::from_host(stream, &ids)?;
+        let mut selected = DeviceBuffer::from_host(stream, &vec![f32::NAN; ids.len() * m])?;
+        gpu.q8f32().enqueue_mxfp8_gemv_ids(
+            stream,
+            Mxfp8GemvIdsArgs {
+                qs: w.qs,
+                e: w.e,
+                ids: &ids_dev,
+                rows: ids.len(),
+                x,
+                m,
+                y: &mut selected,
+            },
+            gpu.unlabelled_sink(),
+        )?;
+        let eager = selected.to_host_vec(stream)?;
+        let graph = gpu.capture(|_| {
+            gpu.q8f32().enqueue_mxfp8_gemv_ids(
+                stream,
+                Mxfp8GemvIdsArgs {
+                    qs: w.qs,
+                    e: w.e,
+                    ids: &ids_dev,
+                    rows: ids.len(),
+                    x,
+                    m,
+                    y: &mut selected,
+                },
+                gpu.unlabelled_sink(),
+            )
+        })?;
+        graph.launch(stream)?;
+        let replay = selected.to_host_vec(stream)?;
+        let same = (0..ids.len() * m).all(|at| {
+            eager[at].to_bits() == full[(at % m) * rows + ids[at / m] as usize].to_bits()
+                && eager[at].to_bits() == replay[at].to_bits()
+        });
+        let clean = gpu.take_fault()?.is_none();
+        ids_dev.copy_from_host(stream, &[ids[0], ids[1], rows as u32])?;
+        graph.launch(stream)?;
+        let bad = selected.to_host_vec(stream)?;
+        let fault = gpu.take_fault()?;
+        let refusal = bad[..2 * m]
+            .iter()
+            .zip(&eager)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+            && bad[2 * m..].iter().all(|v| v.is_nan())
+            && fault == Some(Fault::of_sites(LAYER_NONE, &[FaultSite::TokenId]));
+        let pass = layout && same && clean && refusal && graph.node_count() == 1;
+        println!(
+            "mxfp8 clause=head.rows rows={rows} m={m} layout={layout} bits={same} fault={fault:?} {}",
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     /// One shape of the E4M3 type `ty` at each of its column counts through `site::gemv`
     /// and at [`WIDE`] columns through `site::gemm` on `route`'s dense table
     /// (the tile), with activations scaled by `x_scale`: the clauses of the
@@ -775,6 +907,9 @@ mod gate {
                     &walk,
                 )
             };
+            if !wide && file_ty == GgmlType::MXFP8 {
+                ok &= head_rows_case(gpu, w.e4m3("gate_mxfp8", &name)?, &x_dev, (rows, m), &y)?;
+            }
             if m == 1 {
                 let mut y_dev = DeviceBuffer::from_host(stream, &vec![f32::NAN; rows])?;
                 site::resident_gemv(gpu, &w, &name, &x_dev, &mut y_dev)?;
@@ -862,7 +997,7 @@ mod gate {
         use super::{SHAPES, mxfp8_bytes};
         use crate::bench_arm::{GREPS, N, ROUNDS, burst, fill_pattern, fill_pattern_f32};
         use crate::bench_arm::{print_arm, replay};
-        use bloomery_gpu::q8f32::{E4m3GemvArgs, E4m3Scales, E4m3Weight, e4m3_planes};
+        use bloomery_gpu::q8f32::{E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, e4m3_planes};
         use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
         use bloomery_gpu_gates::GateError;
         use cuda_core::{CudaStream, DeviceBuffer};
@@ -912,6 +1047,7 @@ mod gate {
                                 },
                                 x: &x,
                                 m: 1,
+                                out: GemvOut::TokenMajor,
                                 y: &mut y,
                             },
                         )

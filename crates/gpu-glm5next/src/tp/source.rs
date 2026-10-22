@@ -323,7 +323,7 @@ mod tests {
         let whole = load(0, 1);
         assert!(off_card.iter().all(|n| whole.get(n).is_none()));
         for ranks in [1, 2, 4] {
-            let budget = gguf::card::CardFormat::of(GgmlType::BF16)
+            let budget = model::placement::file_card_format("output.weight", GgmlType::BF16, 256)
                 .unwrap()
                 .resident_bytes(GgmlType::BF16, 256, 64 / ranks as u64)
                 .unwrap();
@@ -334,7 +334,8 @@ mod tests {
                 .map(Vec::len)
                 .sum();
             assert_eq!(allocated as u64, budget, "BF16 rank 0 of {ranks}");
-            assert_eq!(budget, 65_536 / ranks as u64);
+            // PIN(2026-10-22): K=256, 64 BF16 head rows occupy MXFP8 codes and scales.
+            assert_eq!(budget, 16_896 / ranks as u64);
         }
         for ranks in [2, 4] {
             let parts: Vec<_> = (0..ranks).map(|rank| load(rank, ranks)).collect();

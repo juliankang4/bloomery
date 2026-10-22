@@ -183,7 +183,19 @@ mod gate {
             .iter()
             .enumerate()
             .filter(|(_, t)| keep(&t.name))
-            .map(|(i, t)| placement::whole_on_card(i, t, 0, &model))
+            .map(|(i, t)| {
+                placement::whole_on_card(i, t, 0, &model).map(|mut row| {
+                    // This gate retains the BF16 head pins; gate_mxfp8 checks default conversion.
+                    if t.name == HEAD && t.ty == GgmlType::BF16 {
+                        let format = placement::CardFormat::Bf16Raw;
+                        row.segments[0].format = placement::Format::Card(format);
+                        row.segments[0].resident_bytes = format
+                            .resident_bytes(t.ty, t.dims[0], t.dims[1])
+                            .expect("fixed BF16 fixture dimensions");
+                    }
+                    row
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("rows: {e}"))?;
         Ok(Weights::load_rows(gpu.stream(), split, &model, &rows, 0)?)

@@ -752,12 +752,16 @@ mod tests {
                 GgmlType::IQ2_XXS,
             ]
         );
+        // PIN(2026-10-22): independent BF16 heads also occupy MXFP8 planes.
+        assert_eq!(
+            held(CardFormat::Mxfp8Planes),
+            [GgmlType::BF16, GgmlType::MXFP8]
+        );
         for (f, ty) in [
             (CardFormat::Q5_0, GgmlType::Q5_0),
             (CardFormat::Q5_1, GgmlType::Q5_1),
             (CardFormat::Q8_0Planes, GgmlType::Q8_0),
             (CardFormat::Nvfp4Planes, GgmlType::NVFP4),
-            (CardFormat::Mxfp8Planes, GgmlType::MXFP8),
             (CardFormat::Fp8B128Planes, GgmlType::FP8_B128),
             (CardFormat::F32, GgmlType::F32),
             (CardFormat::Bf16Raw, GgmlType::BF16),

@@ -113,7 +113,10 @@ use crate::host::handoff::Places;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};
 use crate::q6k_ids::{Q6kIdsArgs, Q6kIdsKernels};
-use crate::q8f32::{Bf16GemvIdsArgs, Q8_0GemvIdsArgs, SelArgs};
+use crate::q8f32::{
+    Bf16GemvIdsArgs, E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, Mxfp8GemvIdsArgs,
+    Q8_0GemvIdsArgs, SelArgs,
+};
 use crate::q38::{EmbedArgs, EmbedRows, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
 use crate::rope_neox::PartialNeoxArgs;
 use crate::site::{self, WideIn, WideKernels};
@@ -130,8 +133,8 @@ use runtime::hc_gated::Geometry;
 
 const WHAT: &str = "qwen4exp Mtp38";
 
-/// A matrix of the target's the draft reads in place: its name and its two
-/// Q8_0 planes' device addresses at open, or its BF16 words' and a zero
+/// A target matrix read in place: its name and Q8_0 or MXFP8 code and scale
+/// addresses at open, or its BF16 words and a zero
 /// ([`planes`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BorrowedPlanes {
@@ -140,12 +143,13 @@ pub struct BorrowedPlanes {
     pub planes: [u64; 2],
 }
 
-/// The target's `output` the draft reads in place: its Q8_0 planes' or
-/// BF16 words' device addresses at open, or its Q6_K word plane's with the
+/// The target's `output` read in place: its Q8_0 or MXFP8 planes, BF16
+/// words, or Q6_K word plane's device addresses, with the
 /// row width and rows the gemv reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BorrowedHead {
     Q8_0(BorrowedPlanes),
+    Mxfp8(BorrowedPlanes),
     Bf16(BorrowedPlanes),
     Q6K {
         name: String,
@@ -162,6 +166,10 @@ pub enum HeadOut<'w> {
     Q8_0 {
         qs: &'w DeviceTensor<u32>,
         d: &'w DeviceTensor<u16>,
+    },
+    Mxfp8 {
+        qs: &'w DeviceTensor<u32>,
+        e: &'w DeviceTensor<u32>,
     },
     Q6K {
         w: &'w DeviceTensor<u32>,
@@ -402,7 +410,7 @@ impl Mtp38 {
     #[must_use]
     pub fn borrowed_planes(&self) -> [BorrowedPlanes; 2] {
         let head = match &self.head_w {
-            BorrowedHead::Q8_0(b) | BorrowedHead::Bf16(b) => b.clone(),
+            BorrowedHead::Q8_0(b) | BorrowedHead::Mxfp8(b) | BorrowedHead::Bf16(b) => b.clone(),
             BorrowedHead::Q6K { name, plane, .. } => BorrowedPlanes {
                 name: name.clone(),
                 planes: [*plane, 0],
@@ -425,6 +433,12 @@ impl Mtp38 {
                     return Err(GpuError::tensor(WHAT, b.name.clone(), "Q8_0 planes"));
                 };
                 HeadOut::Q8_0 { qs, d }
+            }
+            BorrowedHead::Mxfp8(b) => {
+                let DevWeight::Mxfp8 { qs, e, .. } = at_open(target, b, WHAT)? else {
+                    return Err(GpuError::tensor(WHAT, b.name.clone(), "MXFP8 planes"));
+                };
+                HeadOut::Mxfp8 { qs, e }
             }
             BorrowedHead::Bf16(b) => {
                 let DevWeight::Bf16 { w, .. } = at_open(target, b, WHAT)? else {
@@ -572,11 +586,12 @@ impl Mtp38 {
     }
 }
 
-/// A Q8_0 weight's two planes' device addresses, or a BF16 weight's words'
-/// and a zero; `None` for another format.
+/// Q8_0 or MXFP8 code and scale addresses, or BF16 words and a zero.
+/// Returns `None` for another format.
 pub(super) fn planes(dw: &DevWeight) -> Option<[u64; 2]> {
     match dw {
         DevWeight::Q8_0 { qs, d, .. } => Some([qs.buf().cu_deviceptr(), d.buf().cu_deviceptr()]),
+        DevWeight::Mxfp8 { qs, e, .. } => Some([qs.buf().cu_deviceptr(), e.buf().cu_deviceptr()]),
         DevWeight::Bf16 { w, .. } => Some([w.buf().cu_deviceptr(), 0]),
         _ => None,
     }
@@ -604,8 +619,7 @@ pub(super) fn at_open<'w>(
     }
 }
 
-/// `name` of the target's weights `w`, resident as a Q8_0 or BF16 `[hidden,
-/// vocab]` matrix: its planes' addresses ([`planes`]).
+/// Addresses of a resident Q8_0, MXFP8 or BF16 `[hidden, vocab]` matrix.
 fn borrowed_planes(
     w: &Weights,
     name: String,
@@ -621,8 +635,8 @@ fn borrowed_planes(
         _ => Err(GpuError::shape(
             WHAT,
             format!(
-                "the target's {name} is {} rows of {} values in another format than Q8_0 or \
-                 BF16; the draft reads a Q8_0 or BF16 [{hidden}, {vocab}] matrix",
+                "the target's {name} is {} rows of {} values; the draft requires a \
+                 Q8_0, MXFP8 or BF16 [{hidden}, {vocab}] matrix",
                 shape.1, shape.0
             ),
         )),
@@ -630,7 +644,7 @@ fn borrowed_planes(
 }
 
 /// `name` of the target's weights `w`, resident as the head's read form over
-/// a `[hidden, vocab]` matrix: its Q8_0 planes or BF16 words, or its Q6_K
+/// a `[hidden, vocab]` matrix: its Q8_0 or MXFP8 planes, BF16 words, or Q6_K
 /// word plane with the row width and rows the gemv reads.
 fn borrowed_head(
     w: &Weights,
@@ -645,6 +659,9 @@ fn borrowed_head(
         DevWeight::Q8_0 { .. } if (dw.k(), dw.rows()) == (hidden, vocab) => {
             Ok(BorrowedHead::Q8_0(borrowed_planes(w, name, hidden, vocab)?))
         }
+        DevWeight::Mxfp8 { .. } if (dw.k(), dw.rows()) == (hidden, vocab) => Ok(
+            BorrowedHead::Mxfp8(borrowed_planes(w, name, hidden, vocab)?),
+        ),
         DevWeight::Bf16 { .. } if (dw.k(), dw.rows()) == (hidden, vocab) => {
             Ok(BorrowedHead::Bf16(borrowed_planes(w, name, hidden, vocab)?))
         }
@@ -664,7 +681,7 @@ fn borrowed_head(
                 WHAT,
                 format!(
                     "the target's {name} is {rows} rows of {k} values in another format than \
-                     Q8_0, Q6_K or BF16; the draft reads a [{hidden}, {vocab}] matrix of one of \
+                     Q8_0, MXFP8, Q6_K or BF16; the draft reads a [{hidden}, {vocab}] matrix of one of \
                      them"
                 ),
             ))
@@ -2063,6 +2080,7 @@ impl Mtp38 {
         }
         let full_rows = match &head_out {
             HeadOut::Q8_0 { d, .. } => d.rows(),
+            HeadOut::Mxfp8 { qs, .. } => qs.rows(),
             HeadOut::Q6K { w } | HeadOut::Bf16 { w } => w.rows(),
         };
         let (rows, map) = match head {
@@ -2088,6 +2106,35 @@ impl Mtp38 {
                     Q8_0GemvIdsArgs {
                         qs,
                         d,
+                        ids,
+                        rows,
+                        x: &a.head_x,
+                        m,
+                        y: &mut lg,
+                    },
+                    sink,
+                )?,
+            },
+            HeadOut::Mxfp8 { qs, e } => match map {
+                None => gpu.q8f32().enqueue_e4m3_gemv(
+                    stream,
+                    E4m3GemvArgs {
+                        w: E4m3Weight {
+                            qs,
+                            e,
+                            scales: E4m3Scales::Mxfp8,
+                        },
+                        x: &a.head_x,
+                        m,
+                        out: GemvOut::RowMajor,
+                        y: &mut lg,
+                    },
+                )?,
+                Some(ids) => gpu.q8f32().enqueue_mxfp8_gemv_ids(
+                    stream,
+                    Mxfp8GemvIdsArgs {
+                        qs,
+                        e,
                         ids,
                         rows,
                         x: &a.head_x,

@@ -33,8 +33,12 @@ use std::mem::ManuallyDrop;
 use std::ops::Range;
 
 /// The lm_head tensor's name, and the token embedding that serves as it when the file ties them.
-pub const HEAD_TENSOR: &str = "output.weight";
+pub use ::model::placement::HEAD_TENSOR;
 const EMBED_TENSOR: &str = "token_embd.weight";
+
+fn file_format(t: &TensorInfo) -> Option<CardFormat> {
+    ::model::placement::file_card_format(&t.name, t.ty, *t.dims.first()?)
+}
 
 /// The file tensor that is `split`'s lm_head: `output.weight`, or `token_embd.weight` when the
 /// file carries no `output.weight` (tied embeddings: llama.cpp's loader falls back to the token
@@ -246,7 +250,7 @@ const PARTS: &str = "Weights::add_parts";
 /// ([`Weights::add_parts`] checks each again with its bytes).
 pub fn part_format(t: &TensorInfo) -> Result<(CardFormat, usize), GpuError> {
     file_slot(&t.name)?;
-    let format = CardFormat::of(t.ty).ok_or_else(|| {
+    let format = file_format(t).ok_or_else(|| {
         GpuError::shape(
             PARTS,
             format!(
@@ -258,7 +262,8 @@ pub fn part_format(t: &TensorInfo) -> Result<(CardFormat, usize), GpuError> {
     tp::check_bytes(t).map_err(|e| GpuError::shape(PARTS, e.to_string()))?;
     let bytes = usize::try_from(t.dims[0])
         .ok()
-        .and_then(|k| resident_size(t.ty, k, tensor_rows(t)))
+        .and_then(|k| format.resident_bytes(t.ty, k as u64, tensor_rows(t) as u64))
+        .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or_else(|| {
             GpuError::shape(
                 PARTS,
@@ -1354,7 +1359,7 @@ fn upload_file_tensor_with<'g>(
     t: &TensorInfo,
     find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
 ) -> Result<DevWeight, GpuError> {
-    let Some(format) = CardFormat::of(t.ty) else {
+    let Some(format) = file_format(t) else {
         return Err(GpuError::shape(
             "Weights::load",
             format!("tensor {} has type {} with no device format", t.name, t.ty),
@@ -1561,8 +1566,13 @@ fn upload_rows(
             } else {
                 E4m3Scales::Fp8B128
             };
-            let (qs, e) = e4m3_planes(scales, &flat_of(src, take)?, rows, k)
-                .map_err(|err| GpuError::shape(what, format!("tensor {name}: {err}")))?;
+            let bytes = flat_of(src, take)?;
+            let (qs, e) = if t.ty == GgmlType::BF16 {
+                crate::q8f32::bf16_mxfp8_planes(&bytes, rows, k)
+            } else {
+                e4m3_planes(scales, &bytes, rows, k)
+            }
+            .map_err(|err| GpuError::shape(what, format!("tensor {name}: {err}")))?;
             let qs = upload_packed(stream, ring, what, name, &qs, rows, k / 4)?;
             let e = upload_packed(stream, ring, what, name, &e, rows, k / 128)?;
             match scales {

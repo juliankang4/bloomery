@@ -585,7 +585,16 @@ fn gemv_planes(
                 y,
             },
         ),
-        Planes::E4m3(w) => q.enqueue_e4m3_gemv(stream, E4m3GemvArgs { w, x, m, y }),
+        Planes::E4m3(w) => q.enqueue_e4m3_gemv(
+            stream,
+            E4m3GemvArgs {
+                w,
+                x,
+                m,
+                out: GemvOut::TokenMajor,
+                y,
+            },
+        ),
     }
 }
 
