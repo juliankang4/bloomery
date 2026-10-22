@@ -55,7 +55,7 @@
 //!
 //! The combination tree is a function of (k, m) only — never of the data,
 //! the row index, or the grid geometry. Output layout matches the K-quant
-//! gemvs, `y[r·m + c]`; `q8_0_gemv_mcol` can write token-major instead
+//! gemvs, `y[r·m + c]`; `bf16_gemv` and `q8_0_gemv_mcol` can write token-major instead
 //! ([`GemvOut`]).
 //!
 //! [`f32_tile_chunk`] is the F32 lane share for a warp that owns a
@@ -1544,7 +1544,9 @@ mod q8f32_kernels {
     /// `f32_gemv` over a BF16 weight's words (`w` two values a word, the
     /// module doc's BF16 layout), each value widened as it is read
     /// ([`Bf16Words`]): every output bit for bit `f32_gemv`'s over the widened
-    /// rows. `k` a positive multiple of 32 (host-checked).
+    /// rows. `k` a positive multiple of 32 (host-checked). Row r's column c
+    /// lands at `y[r*y_row + c*y_col]`; the host picks (m_cols, 1) for
+    /// row-major or (1, n_rows) for token-major, with one writer per slot.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -1553,8 +1555,12 @@ mod q8f32_kernels {
         requires = (
             2 * w.len() >= n_rows * k,
             x.len() >= m_cols * k,
-            y.len() >= n_rows * m_cols
+            y.len() >= (n_rows - 1) * y_row + (m_cols - 1) * y_col + 1
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
     )]
     pub fn bf16_gemv(
         w: &[u32],
@@ -1562,6 +1568,8 @@ mod q8f32_kernels {
         n_rows: u32,
         k: u32,
         m_cols: u32,
+        y_row: u32,
+        y_col: u32,
         mut y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -1577,10 +1585,18 @@ mod q8f32_kernels {
         let partials = unsafe { f32_lane_partials(Bf16Words(w), x, k, row, m_cols, lane) };
         let sums = gemv_lane_sums(partials, m_cols);
         if lane == 0 {
-            // SAFETY: as in `f32_gemv`: the slots row*m_cols + c, c < m_cols,
-            // lie inside y by the launch contract; only lane 0 of the row's
-            // warp writes them.
-            unsafe { store_sums(&mut y, row * m_cols as usize, 1, m_cols as usize, &sums) };
+            // SAFETY: the launcher sets (y_row, y_col) to (m_cols, 1) or
+            // (1, n_rows), so row*y_row + c*y_col for c < m_cols is inside
+            // y; only lane 0 of this row's warp writes those slots.
+            unsafe {
+                store_sums(
+                    &mut y,
+                    row * y_row as usize,
+                    y_col as usize,
+                    m_cols as usize,
+                    &sums,
+                )
+            };
         }
     }
 
@@ -2412,6 +2428,26 @@ impl Q8F32Kernels {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
+        self.enqueue_bf16_gemv_mcol(
+            stream,
+            Bf16GemvMcolArgs {
+                w,
+                x,
+                m,
+                out: GemvOut::RowMajor,
+                y,
+            },
+        )
+    }
+
+    /// [`Self::enqueue_bf16_gemv`]'s product in `out`'s layout, with the same
+    /// geometry and bit contract. Asynchronous, allocation-free, capturable.
+    pub(crate) fn enqueue_bf16_gemv_mcol(
+        &self,
+        stream: &CudaStream,
+        a: Bf16GemvMcolArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let Bf16GemvMcolArgs { w, x, m, out, y } = a;
         let what = "enqueue_bf16_gemv";
         let (n_rows, k) = (w.rows(), 2 * w.cols());
         check_gemv_geometry(what, n_rows, k, x.len(), m, y.len())?;
@@ -2421,8 +2457,12 @@ impl Q8F32Kernels {
         let prep =
             self.module
                 .prepare_bf16_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
+        let (y_row, y_col) = match out {
+            GemvOut::RowMajor => (m, 1),
+            GemvOut::TokenMajor => (1, n_rows),
+        };
         self.module
-            .bf16_gemv(stream, &prep, w.buf(), x, n_rows, k, m, y)?;
+            .bf16_gemv(stream, &prep, w.buf(), x, n_rows, k, m, y_row, y_col, y)?;
         Ok(())
     }
 
@@ -3043,6 +3083,16 @@ pub enum GemvOut {
     /// `y[c·rows + r]`: column c's `rows` outputs together — the token-major
     /// order the step's element ops read.
     TokenMajor,
+}
+
+/// [`Q8F32Kernels::enqueue_bf16_gemv_mcol`]'s arguments: the BF16 words,
+/// `m` activation columns (1..=8), and the output layout.
+pub(crate) struct Bf16GemvMcolArgs<'a> {
+    pub w: &'a DeviceTensor<u32>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub m: usize,
+    pub out: GemvOut,
+    pub y: &'a mut DeviceBuffer<f32>,
 }
 
 /// [`Q8F32Kernels::enqueue_q8_0_gemv_mcol`]'s arguments: the Q8_0 planes as

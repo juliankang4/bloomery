@@ -16,15 +16,16 @@
 //!   over the widened values (lane `L` the values `32i + L` in increasing
 //!   `i`, one fused multiply-add each, then the warp butterfly).
 //!
-//! 1. site: three projection shapes (8,192 × 2,560, 2,560 × 4,096 and
-//!    1,024 × 128) through `site::gemv` at one and more columns (the gemv,
-//!    then the BF16 tile), `site::resident_gemv` at one (the call GLM's
-//!    `body::gemv` is) and `site::gemm` at 64 columns (the tile).
+//! 1. site: projection shapes (8,192 × 2,560, 2,560 × 4,096 and
+//!    1,024 × 128), plus a 19 × 128 tail, through `site::gemv` at every
+//!    width in 1..=8 (the token-major gemv), `site::resident_gemv` at one
+//!    (the call GLM's `body::gemv` is) and `site::gemm` at 64 columns (the tile).
 //! 2. f32: the same tensors loaded as f32 values (`Weights::load_where`,
 //!    `CardFormat::Bf16AsF32`, the load of every body that does not set
-//!    `bf16_words`) through the F32 site at one and 64 columns: bit for bit
+//!    `bf16_words`) through the F32 site at 1..=8 and 64 columns: bit for bit
 //!    the BF16 site's outputs. A BF16 site over that F32 resident is refused
-//!    by name.
+//!    by name. Each small site call captures as one graph node and replays
+//!    bit for bit the eager output.
 //! 3. join: two BF16 parts joined at load (`Weights::join_rows`) through
 //!    `site::resident_gemv`, bit for bit the rule over the parts' rows; the
 //!    same parts loaded as f32 values the same. Over each joint the dense
@@ -83,37 +84,37 @@ mod gate {
 
     const WHAT: &str = "gate_bf16";
 
-    /// A projection: its tensor name, rows, row width and the column counts
-    /// its gemv runs at.
     struct Shape {
         name: &'static str,
         rows: usize,
         k: usize,
-        ms: [usize; 2],
         seed: u64,
     }
 
-    const SHAPES: [Shape; 3] = [
+    const SHAPES: [Shape; 4] = [
         Shape {
             name: "blk.3.attn_q.weight",
             rows: 8192,
             k: 2560,
-            ms: [1, 3],
             seed: 0x5eed_b001,
         },
         Shape {
             name: "blk.3.attn_output.weight",
             rows: 2560,
             k: 4096,
-            ms: [1, 8],
             seed: 0x5eed_b002,
         },
         Shape {
             name: "blk.3.ssm_beta.weight",
             rows: 1024,
             k: 128,
-            ms: [1, 2],
             seed: 0x5eed_b003,
+        },
+        Shape {
+            name: "blk.3.tail.weight",
+            rows: 19,
+            k: 128,
+            seed: 0x5eed_b004,
         },
     ];
 
@@ -302,7 +303,7 @@ mod gate {
         let token_major = |at: usize| (at % rows, at / rows);
         let mut ok = true;
         // m = 0 marks the resident gemv's one column.
-        for (i, &m) in [0].iter().chain(&s.ms).chain(&[WIDE]).enumerate() {
+        for (i, m) in (0..=8).chain([WIDE]).enumerate() {
             let cols = m.max(1);
             let seed = s.seed ^ (0x1000 + i as u64);
             let (x, x_dev, mut y_dev) = columns(gpu, (cols, k, rows), seed, 1.0)?;
@@ -336,7 +337,7 @@ mod gate {
             let rule = |r: usize, c: usize| f32_dot(&wf[r], &x[c * k..][..k]);
             let tag = format!("shape={name} rows={rows} k={k} call={call} m={cols}");
             ok &= check(("bf16", "site"), &tag, (&y, &x, k), wf, &token_major, &rule);
-            if m == 0 || m == WIDE {
+            {
                 // The F32 site over the values loaded as f32: the same bits.
                 let mut f_dev = DeviceBuffer::from_host(stream, &vec![f32::NAN; cols * rows])?;
                 site::gemv(
@@ -355,6 +356,39 @@ mod gate {
                     verdict(same)
                 );
                 ok &= same;
+                if (1..=8).contains(&m) {
+                    // Poisoned again, so a tile that skips a write cannot pass on the site's values.
+                    f_dev = DeviceBuffer::from_host(stream, &vec![f32::NAN; cols * rows])?;
+                    gpu.q8f32().enqueue_bf16_tile(
+                        stream,
+                        w.bf16(WHAT, name)?,
+                        &x_dev,
+                        m,
+                        &mut f_dev,
+                    )?;
+                    stream.synchronize()?;
+                    let tile = f_dev.to_host_vec(stream)?;
+                    let same = bloomery_gpu_gates::bits_equal(&tile, &y);
+                    println!("bf16 clause=tile.bits {tag} equal={same} {}", verdict(same));
+                    ok &= same;
+                }
+            }
+            if (1..=8).contains(&m) {
+                y_dev.zero_async(stream)?;
+                stream.synchronize()?;
+                let graph =
+                    gpu.capture(|_| site::gemv(gpu, g32, (ty, w, name), &x_dev, m, &mut y_dev))?;
+                graph.launch(stream)?;
+                stream.synchronize()?;
+                let replay = y_dev.to_host_vec(stream)?;
+                let same = bloomery_gpu_gates::bits_equal(&replay, &y);
+                let pass = same && graph.node_count() == 1;
+                println!(
+                    "bf16 clause=graph.bits {tag} equal={same} nodes={} {}",
+                    graph.node_count(),
+                    verdict(pass)
+                );
+                ok &= pass;
             }
         }
         let got = site::site(&f32_w, WHAT, name, (rows, k), ty);
@@ -415,6 +449,23 @@ mod gate {
             &|at| (at / 2, at % 2),
             &rule,
         );
+        for m in 1..=8 {
+            let (host, input, mut output) = columns(gpu, (m, 96, 8), 0x5eed_b021, 1.0)?;
+            site::resident_gemv_cols(gpu, None, (w, K96), &input, m, &mut output)?;
+            stream.synchronize()?;
+            let got = output.to_host_vec(stream)?;
+            let rule = |r: usize, c: usize| f32_dot(&wf[r], &host[c * 96..][..96]);
+            if !check(
+                ("bf16", "k96.site"),
+                &format!("rows=8 k=96 m={m}"),
+                (&got, &host, 96),
+                wf,
+                &|at| (at % 8, at / 8),
+                &rule,
+            ) {
+                return Err(checks_failed());
+            }
+        }
         let tile = gpu.q8f32().enqueue_bf16_tile(stream, words, &x, 2, &mut y);
         stream.synchronize()?;
         let pass = gemv_ok && tile.as_ref().is_err_and(|e| e.to_string().contains("96"));

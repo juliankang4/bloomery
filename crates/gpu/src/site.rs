@@ -17,8 +17,8 @@
 //!   q8f32 MXFP8 gemv (`mxfp8_gemv` at one column, `mxfp8_gemv_mcol`
 //!   token-major past it, bit for bit equal on a column), FP8_B128
 //!   (`GgmlType::FP8_B128`) the same walk's FP8_B128 entries
-//!   (`fp8_b128_gemv`, `fp8_b128_gemv_mcol`). BF16 uses `bf16_gemv` and
-//!   `bf16_tile_gemm` over widened words, bit for bit the F32 entries.
+//!   (`fp8_b128_gemv`, `fp8_b128_gemv_mcol`). BF16 uses `bf16_gemv`
+//!   token-major over widened words, bit for bit the F32 entries.
 //!   A K-quant site's gemv is [`kgemv`]. A Q5_0 site's is [`blocks32_gemv`].
 //! - [`kgemv`], a site at most eight columns over the q8_1 rows: Q3_K, Q4_K
 //!   and Q6_K their gemvs, row-major (`m` outputs a row; a Q6_K row of an odd
@@ -70,7 +70,9 @@ use crate::kquant::{Act, SelDown};
 use crate::mxfp4::Nvfp4Kernels;
 use crate::q5::Q8Blocks32;
 use crate::q6k_sel::Q6kSelKernels;
-use crate::q8f32::{E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, Q8_0GemvMcolArgs, SelArgs};
+use crate::q8f32::{
+    Bf16GemvMcolArgs, E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, Q8_0GemvMcolArgs, SelArgs,
+};
 use crate::quant_sel::QuantSelKernels;
 use crate::tensor::{Q8Act, TensorWindow};
 use crate::weights::{DevWeight, Weights};
@@ -544,7 +546,7 @@ fn launch(
 /// `y = W · x` for the planes `p` over the first `m` (1..=8) columns of the
 /// f32 rows `x`, token-major: Q8_0 `q8_0_gemv` at one column and
 /// `q8_0_gemv_mcol` past it, F32 `f32_gemv` and past one column the F32 tile
-/// (`g32`), BF16 `bf16_gemv` and its tile, MXFP8 and FP8_B128 their gemvs.
+/// (`g32`), BF16 `bf16_gemv`, MXFP8 and FP8_B128 their gemvs.
 fn gemv_planes(
     gpu: &Gpu,
     g32: Option<&Gemm32Kernels>,
@@ -573,10 +575,16 @@ fn gemv_planes(
         Planes::F32(w) => g32
             .ok_or(GpuError::state("site::gemv", "the F32 tile's kernels"))?
             .enqueue_f32_tile(stream, w, x, m, y),
-        // One column runs `bf16_gemv`, past it the BF16 tile: F32's pair over
-        // the widened values.
-        Planes::Bf16(w) if m == 1 => q.enqueue_bf16_gemv(stream, w, x, 1, y),
-        Planes::Bf16(w) => q.enqueue_bf16_tile(stream, w, x, m, y),
+        Planes::Bf16(w) => q.enqueue_bf16_gemv_mcol(
+            stream,
+            Bf16GemvMcolArgs {
+                w,
+                x,
+                m,
+                out: GemvOut::TokenMajor,
+                y,
+            },
+        ),
         Planes::E4m3(w) => q.enqueue_e4m3_gemv(stream, E4m3GemvArgs { w, x, m, y }),
     }
 }
