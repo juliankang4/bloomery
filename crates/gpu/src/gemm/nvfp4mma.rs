@@ -7,6 +7,9 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, ptx_asm
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
+const TILE_ROWS: usize = 128;
+const TILE_THREADS: u32 = 256;
+
 pub(super) struct Act {
     q: DeviceBuffer<u32>,
     e: DeviceBuffer<u32>,
@@ -176,8 +179,8 @@ mod native {
     }
 
     #[kernel]
-    #[launch_bounds(128)]
-    #[launch_contract(domain = 1, block = (128, 1, 1))]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, block = (256, 1, 1))]
     pub fn product(
         wq: &[u32],
         we: &[u32],
@@ -206,15 +209,16 @@ mod native {
             let refused = ntiles[1] as usize;
             let first = slots as usize - refused;
             let mut i = tid;
-            while i < refused * 64 {
-                let row = rt * 64 + i % 64;
+            while i < refused * TILE_ROWS {
+                let row = rt * TILE_ROWS + i % TILE_ROWS;
                 if row < rows {
                     // SAFETY: the route's refused slots are disjoint from live tiles; one thread owns this row.
                     unsafe {
-                        *y.get_unchecked_mut(cols[first + i / 64] as usize * rows + row) = f32::NAN;
+                        *y.get_unchecked_mut(cols[first + i / TILE_ROWS] as usize * rows + row) =
+                            f32::NAN;
                     }
                 }
-                i += 128;
+                i += TILE_THREADS as usize;
             }
         }
         if tile >= ntiles[0] as usize {
@@ -223,9 +227,9 @@ mod native {
         let expert = tiles[2 * tile] as usize;
         let (start, len) = super::super::route::tile_parts(tiles[2 * tile + 1]);
         let (start, len) = (start as usize, len as usize);
-        static mut W: cuda_device::SharedArray<u32, 768, 16> = cuda_device::SharedArray::UNINIT;
+        static mut W: cuda_device::SharedArray<u32, 1536, 16> = cuda_device::SharedArray::UNINIT;
         static mut B: cuda_device::SharedArray<u32, 768, 16> = cuda_device::SharedArray::UNINIT;
-        static mut S: cuda_device::SharedArray<u32, 128, 16> = cuda_device::SharedArray::UNINIT;
+        static mut S: cuda_device::SharedArray<u32, 192, 16> = cuda_device::SharedArray::UNINIT;
         // SAFETY: these raw addresses name this block's shared allocations.
         let (wp, bp, sp) = unsafe {
             (
@@ -234,13 +238,13 @@ mod native {
                 cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S),
             )
         };
-        let row = rt * 64 + 16 * (tid / 32);
+        let row = rt * TILE_ROWS + 16 * (tid / 32);
         let g = lane / 4;
         let t = lane & 3;
         let nt = len.div_ceil(8);
         let sr = tid / 2;
         let half = tid & 1;
-        let wr = expert * rows + (rt * 64 + sr).min(rows - 1);
+        let wr = expert * rows + (rt * TILE_ROWS + sr).min(rows - 1);
         let col = cols[start + sr.min(len - 1)] as usize / slot_div as usize;
         let mut acc = [0.0f32; 32];
         let mut step = 0;
@@ -259,30 +263,34 @@ mod native {
                 *wp.add(sr * 12 + 4 * half)
                     .cast::<cuda_device::vector::U32x4>() = packed;
             }
-            let ai = col * steps * 8 + step * 8 + 4 * half;
-            // SAFETY: the owned activation buffer and every column/step offset are 16-byte aligned.
-            let av = unsafe { *aq.as_ptr().add(ai).cast::<cuda_device::vector::U32x4>() };
-            // SAFETY: each thread owns one aligned four-word half of its shared activation row.
-            unsafe {
-                *bp.add(sr * 12 + 4 * half)
-                    .cast::<cuda_device::vector::U32x4>() = av;
+            if sr < 64 {
+                let ai = col * steps * 8 + step * 8 + 4 * half;
+                // SAFETY: the owned activation buffer and every column/step offset are 16-byte aligned.
+                let av = unsafe { *aq.as_ptr().add(ai).cast::<cuda_device::vector::U32x4>() };
+                // SAFETY: each thread owns one aligned four-word half of its shared activation row.
+                unsafe {
+                    *bp.add(sr * 12 + 4 * half)
+                        .cast::<cuda_device::vector::U32x4>() = av;
+                }
             }
             if half == 0 {
                 // SAFETY: the first thread of each row owns its weight scale word.
                 unsafe {
                     *sp.add(sr) = we[wr * steps + step];
                 }
-                // SAFETY: the first thread of each row owns its activation scale word.
-                unsafe {
-                    *sp.add(64 + sr) = ae[col * steps + step];
+                if sr < 64 {
+                    // SAFETY: the first thread of each live activation row owns its scale word.
+                    unsafe {
+                        *sp.add(TILE_ROWS + sr) = ae[col * steps + step];
+                    }
                 }
             }
             thread::sync_threads();
             if row < rows {
                 let r = 16 * (tid / 32) + g;
-                // SAFETY: this live warp reads rows r and r+8, both inside the 64-row shared tile.
+                // SAFETY: this live warp reads rows r and r+8, both inside the 128-row shared tile.
                 let a0 = unsafe { *wp.add(r * 12 + t) };
-                // SAFETY: r+8 is below 64 and t is below four.
+                // SAFETY: r+8 is below 128 and t is below four.
                 let a1 = unsafe { *wp.add((r + 8) * 12 + t) };
                 // SAFETY: t+4 is below eight in this shared row.
                 let a2 = unsafe { *wp.add(r * 12 + t + 4) };
@@ -300,8 +308,8 @@ mod native {
                     let b0 = unsafe { *bp.add(br * 12 + t) };
                     // SAFETY: br is below 64 and t+4 is below eight.
                     let b1 = unsafe { *bp.add(br * 12 + t + 4) };
-                    // SAFETY: the activation scale follows the weight scales in the 128-word allocation.
-                    let sb = unsafe { *sp.add(64 + br) };
+                    // SAFETY: the activation scale follows the weight scales in the 192-word allocation.
+                    let sb = unsafe { *sp.add(TILE_ROWS + br) };
                     let c = mma(
                         [acc[n * 4], acc[n * 4 + 1], acc[n * 4 + 2], acc[n * 4 + 3]],
                         [a0, a1, a2, a3],
@@ -390,13 +398,13 @@ impl Kernels {
             .native
             .as_ref()
             .ok_or_else(|| GpuError::shape("NVFP4 MMA", "activation K must divide 64"))?;
-        let rt = rows.div_ceil(64);
+        let rt = rows.div_ceil(TILE_ROWS as u32);
         let grid = max_tiles
             .checked_mul(rt)
             .ok_or_else(|| GpuError::shape("NVFP4 MMA", "grid overflow"))?;
         let prep = self
             .module
-            .prepare_product(LaunchConfig1D::new(grid, 128, 0))?;
+            .prepare_product(LaunchConfig1D::new(grid, TILE_THREADS, 0))?;
         self.module.product(
             stream,
             &prep,

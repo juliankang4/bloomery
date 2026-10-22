@@ -3340,11 +3340,11 @@ mod gate {
             };
             use bloomery_gpu::mxfp4_sel::Nvfp4Stack;
             let (rows, k, per_slot) = match arm {
-                "gemm_nvfp4_gate_t4096" => (640usize, 2560usize, false),
-                "gemm_nvfp4_down_t4096" => (2560, 640, true),
+                "gemm_nvfp4_gate_t2048" => (640usize, 2560usize, false),
+                "gemm_nvfp4_down_t2048" => (2560, 640, true),
                 _ => return Ok(false),
             };
-            let (tokens, experts, top_k) = (4096usize, 512usize, 8usize);
+            let (tokens, experts, top_k) = (2048usize, 512usize, 10usize);
             let slots = tokens * top_k;
             let cols = if per_slot { slots } else { tokens };
             let stream = gpu.stream();
@@ -3364,7 +3364,7 @@ mod gate {
             let e = DeviceTensor::upload(stream, &se, experts * rows, k / 64)?;
             let scales = DeviceTensor::upload(stream, &vec![0.015625f32; experts], experts, 1)?;
             let xs = DeviceBuffer::from_host(stream, &fill_pattern_f32(cols * k))?;
-            let mut act = GemmAct32::new(stream, cols, k)?;
+            let mut act = GemmAct32::new_routed(stream, cols, k)?;
             g32.enqueue_quantize_gemm32(stream, &xs, cols, &mut act, sink)?;
             let ids = DeviceBuffer::from_host(stream, &gemm_ids(tokens, top_k, experts))?;
             let mut route = GemmRoute::new(stream, slots, experts)?;

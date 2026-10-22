@@ -66,11 +66,7 @@ impl GemmAct32 {
         let steps = k.div_ceil(GEMM32_STEP);
         Ok(GemmAct32 {
             #[cfg(feature = "nvfp4-mma")]
-            native: if k.is_multiple_of(64) {
-                Some(super::nvfp4mma::Act::new(stream, cols, k)?)
-            } else {
-                None
-            },
+            native: None,
             q: DeviceBuffer::zeroed(stream, cols * 16 * steps)?,
             d: DeviceBuffer::zeroed(stream, cols * 2 * steps)?,
             s: DeviceBuffer::zeroed(stream, cols * 2 * steps)?,
@@ -78,6 +74,20 @@ impl GemmAct32 {
             k,
             filled: 0,
         })
+    }
+
+    /// Routed columns, including the native FP4 representation when the build supports it.
+    pub fn new_routed(stream: &CudaStream, cols: usize, k: usize) -> Result<Self, GpuError> {
+        let act = Self::new(stream, cols, k)?;
+        #[cfg(feature = "nvfp4-mma")]
+        let act = {
+            let mut act = act;
+            if k.is_multiple_of(64) {
+                act.native = Some(super::nvfp4mma::Act::new(stream, cols, k)?);
+            }
+            act
+        };
+        Ok(act)
     }
 
     /// Columns this scratch holds.

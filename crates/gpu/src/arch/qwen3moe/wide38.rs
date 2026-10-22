@@ -911,13 +911,13 @@ impl CardRoute38 {
             ids: DeviceBuffer::zeroed(stream, slots)?,
             sel: DeviceBuffer::zeroed(stream, kept)?,
             x: if card.blocks32_gate_up() {
-                RouteX::Blocks32(GemmAct32::new(stream, run, geo::HIDDEN)?)
+                RouteX::Blocks32(GemmAct32::new_routed(stream, run, geo::HIDDEN)?)
             } else {
                 RouteX::Q8_1(GemmAct::new(stream, run, geo::HIDDEN)?)
             },
             g: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
             u: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
-            act: GemmAct32::new(stream, slots, geo::FF)?,
+            act: GemmAct32::new_routed(stream, slots, geo::FF)?,
             down: DeviceBuffer::zeroed(stream, kept * geo::HIDDEN)?,
             acc: DeviceBuffer::zeroed(stream, rows * geo::HIDDEN)?,
             tsel: tiered
