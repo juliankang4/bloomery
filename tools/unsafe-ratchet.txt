@@ -28,7 +28,9 @@ embed 0 0 0
 # line.
 # PIN(2026-10-22): engram 10 -> 11 blocks, new code, not old code relaxed: RunTable maps each file that holds a
 # table's runs (a checkpoint folder's shards) read-only with memmap2's map, one block with its SAFETY line.
-engram 11 0 0
+# PIN(2026-10-23): engram 11 -> 12 blocks, 0 -> 1 fns, new test-only syscall recorder forwards
+# whole pages of a read-only file mapping to libc::madvise, one block with its SAFETY line.
+engram 12 1 0
 engram-lab 0 0 0
 gguf 7 2 0
 # PIN(2026-10-01): gpu 1354 -> 1356, a new kernel entry, not old code relaxed: kda_delta_lanes (GLM's two-row

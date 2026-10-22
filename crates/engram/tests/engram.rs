@@ -81,8 +81,8 @@ fn sample(site: &Site, n: usize) -> Vec<u32> {
 /// with itself, and a one-byte shift of `Site::file_offset` passes.
 ///
 /// So this catches an offset off by a row or a byte, a stride taken from the
-/// wrong type, a shard opened at the wrong tensor, and a prefetch that advises
-/// a different range than the read touches.
+/// wrong type, or a shard opened at the wrong tensor. Advice targets are
+/// checked separately from reads, which can fault the pages in themselves.
 #[test]
 #[ignore = "hw: needs the box and the V4.1 split"]
 fn hw_engram_rows_match_pread() {
@@ -145,9 +145,9 @@ fn hw_engram_rows_match_pread() {
 /// straddler for exactly that reason.
 ///
 /// The same table read through its split's own mapping ([`SplitTable`], the
-/// read Qwen3.8's PLE table takes from the NVMe tier) copies the same bytes,
-/// and its advice takes rows that start mid-page: each is rounded out to the
-/// whole pages that hold it, which `madvise` requires.
+/// read Qwen3.8's PLE table takes from the NVMe tier) copies the same bytes.
+/// Prefetch runs before the copy, but the copy can fault pages in itself;
+/// this comparison checks the copied bytes, not the advice range.
 #[test]
 #[ignore = "hw: needs the box and the V4.1 split"]
 fn hw_engram_copy_rows_matches_row() {
