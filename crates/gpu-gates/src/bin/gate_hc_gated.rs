@@ -50,10 +50,12 @@
 //! A BF16 site (down and up in their words, `HcMatrix::Bf16`, values on
 //! the Q8_0 site's ranges) runs clauses 1, 2, 3 and 8 again: its down and
 //! up rows dotted in `card::f32_dot`'s order over the widened values, the
-//! dense gemv beside them `bf16_gemv`, and its wide arm the BF16 tile with
-//! no quantizer, so a NaN raises the mix's site alone. Maximum-finite BF16
-//! up weights that overflow the up projection raise the site and leave NaN
-//! mixed outputs in both capped and wide arms, with a finite bottleneck.
+//! dense gemv beside them `bf16_gemv`, and its wide arm the BF16 prompt
+//! product with no quantizer, so a NaN raises the mix's site alone. On GB10
+//! that product runs on BF16 tensor cores, the down and up within the BF16
+//! operand bands (`check_mma`). Maximum-finite BF16 up weights that overflow
+//! the up projection raise the site and leave NaN mixed outputs in both
+//! capped and wide arms, with a finite bottleneck.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -71,7 +73,7 @@ mod gate {
     use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvMcolArgs, Q8F32Kernels};
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
-    use bloomery_gpu_gates::rounding::q8_32_rel;
+    use bloomery_gpu_gates::rounding::{check_mma, q8_32_rel};
     use bloomery_gpu_gates::{
         GateError, activations, bits_equal, max_rel_err, max_ulps, no_local_depot, verdict,
     };
@@ -1227,6 +1229,14 @@ mod gate {
                 "wide[glue:{name}] m={m} the card rule on the readback bit_equal={p} {}",
                 verdict(p)
             );
+        }
+        if matches!(site.planes, Planes::Bf16 { .. })
+            && c.gpu.context().compute_capability()? == (12, 1)
+        {
+            let down: Vec<Vec<f32>> = site.down.chunks_exact(WIDE).map(<[f32]>::to_vec).collect();
+            let up: Vec<Vec<f32>> = site.up.chunks_exact(R).map(<[f32]>::to_vec).collect();
+            ok &= check_mma("hc_down", (&o.down, &o.xn, WIDE), &down);
+            ok &= check_mma("hc_up", (&o.g, &o.lo, R), &up);
         }
         // (c) the error model's bands against the f64 rule, per column.
         let mut worst = [0.0f64; 4];

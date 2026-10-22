@@ -1,0 +1,12 @@
+kind: profile
+question: do shared BF16 tensor-core HC prompt products reduce 4K prefill latency on GB10?
+term: prefill tokens per second for one 4096-id code-fn request per arm
+unit: %
+predict: +10..+30
+condition: load the baseline and candidate once each on an otherwise idle GPU
+  in one lease. Use identical NVFP4 stored weights, prompt ids, C=1, draft off,
+  and two generated tokens. Use separate build targets and check distinct
+  binary hashes before loading. Restore the host clock cap on every exit.
+decide-in: report the observed ratio and actual one-request sample counts.
+decide-below: inspect remaining BF16 MMA throughput before another candidate.
+decide-above: check input length, cache hits and binary provenance.

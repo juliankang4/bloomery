@@ -2591,6 +2591,7 @@ mod q8f32_kernels {
 /// the rest of the step and are capturable.
 pub struct Q8F32Kernels {
     module: q8f32_kernels::LoadedModule,
+    pub(crate) dense_mma: bool,
 }
 
 impl Q8F32Kernels {
@@ -2599,7 +2600,10 @@ impl Q8F32Kernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(q8f32_kernels, ctx)? };
-        Ok(Q8F32Kernels { module })
+        Ok(Q8F32Kernels {
+            module,
+            dense_mma: ctx.compute_capability()? == (12, 1),
+        })
     }
 
     /// Enqueue `y = W · x` for an F32 weight of `w.rows()` rows × `w.cols()`
@@ -2757,6 +2761,23 @@ impl Q8F32Kernels {
         self.module
             .bf16_tile_gemm(stream, &prep, w.buf(), x, t.rows, t.k, t.n, y)?;
         Ok(())
+    }
+
+    /// Dense prompt product, using BF16 tensor cores on GB10 and the exact
+    /// F32-activation tile on other devices.
+    pub fn enqueue_bf16_prompt(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        if self.dense_mma {
+            self.enqueue_bf16_mma(stream, w, x, n, y)
+        } else {
+            self.enqueue_bf16_tile(stream, w, x, n, y)
+        }
     }
 
     /// Dense BF16 prompt product with BF16 activations and F32 accumulation.

@@ -55,8 +55,9 @@
 //! and the up are the 32-value GEMM (`crate::gemm`'s `gemm_q8_0p` over a
 //! one-expert table) on `xn` and on the bottleneck quantized per 32 values;
 //! the inject rows are the wide F32 tile, and a BF16 down or up the BF16
-//! tile (`Q8F32Kernels::enqueue_bf16_tile`) on `xn` or the bottleneck in f32,
-//! with no quantize; two glue entries finish the rule —
+//! prompt product (`Q8F32Kernels::enqueue_bf16_prompt`) on `xn` or the
+//! bottleneck, with BF16 operands on GB10 and F32 activations otherwise;
+//! two glue entries finish the rule —
 //! `hc_gated_lo_4x320` (`silu(·/4)` of each down row, `2·σ(·/4)` of each
 //! inject row) and `hc_gated_mix_4` (`(xn_0·σ(g_0), fma for the rest)·¼`,
 //! the up's order). A column's values are a function of that column alone;
@@ -1935,7 +1936,7 @@ pub struct WideMixArgs<'a> {
     pub fault: FaultSink,
     pub scratch: &'a mut HcWideScratch,
     pub gemm: &'a Gemm32Kernels,
-    /// The BF16 tile, for a site whose down or up is BF16.
+    /// The BF16 prompt kernels, for a site whose down or up is BF16.
     pub q8f32: &'a Q8F32Kernels,
     pub dense: &'a GemmRoute,
     pub mixed: &'a mut DeviceBuffer<f32>,
@@ -2037,7 +2038,7 @@ impl HcWideKernels {
             }
             HcMatrix::Bf16(w) => a
                 .q8f32
-                .enqueue_bf16_tile(stream, w, &s.xn, m, &mut s.down)?,
+                .enqueue_bf16_prompt(stream, w, &s.xn, m, &mut s.down)?,
         }
         if let Some(inj) = a.w.inject {
             a.gemm.enqueue_f32_tile(stream, inj, &s.xn, m, &mut s.inj)?;
@@ -2069,7 +2070,7 @@ impl HcWideKernels {
                     },
                 )?;
             }
-            HcMatrix::Bf16(w) => a.q8f32.enqueue_bf16_tile(stream, w, &s.lo, m, &mut s.g)?,
+            HcMatrix::Bf16(w) => a.q8f32.enqueue_bf16_prompt(stream, w, &s.lo, m, &mut s.g)?,
         }
         let prep = self.module.prepare_hc_gated_mix_4(LaunchConfig1D::new(
             launch_u32(what, "mix grid", z.mixed.div_ceil(GLUE_THREADS as usize))?,

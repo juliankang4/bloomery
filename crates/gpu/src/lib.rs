@@ -2213,8 +2213,6 @@ pub struct Gpu {
     fault: Arc<DeviceBuffer<u32>>,
     /// [`row_prefetch`] of this context's device, for the decode gemvs.
     row_prefetch: bool,
-    /// GB10 dense prompt products use BF16 tensor cores.
-    dense_mma: bool,
 }
 
 /// The sink over a `Gpu`'s fault allocation ([`Gpu::fault_word`]), for
@@ -2526,7 +2524,6 @@ impl Gpu {
         let module = unsafe { crate::shared_module!(kernels, &ctx)? };
         Ok(Gpu {
             row_prefetch: row_prefetch(&ctx)?,
-            dense_mma: ctx.compute_capability()? == (12, 1),
             q4k_sel: q4k_sel::Q4kSelKernels::load(&ctx, &fault)?,
             q5: q5::Q5Kernels::load(&ctx, &fault)?,
             q8f32: q8f32::Q8F32Kernels::load(&ctx)?,
