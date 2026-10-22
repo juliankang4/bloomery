@@ -497,7 +497,12 @@ mod native {
         let sr = tid / 2;
         let half = tid & 1;
         let wr = expert * rows + (rt * TILE_ROWS + sr).min(rows - 1);
-        let col = cols[start + sr.min(len - 1)] as usize / slot_div as usize;
+        let source = cols[start + sr.min(len - 1)] as usize;
+        let col = if slot_div == 1 {
+            source
+        } else {
+            source / slot_div as usize
+        };
         let wi = wr * steps * 8 + 4 * half;
         // SAFETY: K is positive and divides 64; wr and both aligned halves are in the checked plane.
         let mut w = unsafe { (*wq.as_ptr().add(wi).cast::<cuda_device::vector::U32x4>()).0 };
@@ -615,17 +620,26 @@ mod native {
         if row >= rows {
             return;
         }
+        let weight_scale = ws[expert];
         #[unroll]
         for n in 0..8 {
             #[unroll]
-            for j in 0..4 {
-                let c = n * 8 + 2 * t + (j & 1);
+            for j in 0..2 {
+                let c = n * 8 + 2 * t + j;
                 if c < len {
                     let slot = cols[start + c] as usize;
-                    // SAFETY: each lane owns these two rows and two columns of a live route tile.
+                    let column = if slot_div == 1 {
+                        slot
+                    } else {
+                        slot / slot_div as usize
+                    };
+                    let input_scale = ag[column];
+                    // SAFETY: this lane owns both rows of this live column; row counts divide 16.
                     unsafe {
-                        *y.get_unchecked_mut(slot * rows + row + g + 8 * (j / 2)) =
-                            acc[n * 4 + j] * ws[expert] * ag[slot / slot_div as usize];
+                        *y.get_unchecked_mut(slot * rows + row + g) =
+                            acc[n * 4 + j] * weight_scale * input_scale;
+                        *y.get_unchecked_mut(slot * rows + row + g + 8) =
+                            acc[n * 4 + j + 2] * weight_scale * input_scale;
                     }
                 }
             }
