@@ -445,8 +445,8 @@ fn pick_slot(
             unpinned.min_by(|(_, a), (_, b)| {
                 cold(a)
                     .cmp(&cold(b))
-                    .then(score(a).total_cmp(&score(b)))
-                    .then(tick(a).cmp(&tick(b)))
+                    .then_with(|| score(a).total_cmp(&score(b)))
+                    .then_with(|| tick(a).cmp(&tick(b)))
             })
         }
     };
