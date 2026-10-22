@@ -104,6 +104,7 @@ bloomery-gpu-vision = { path = "../gpu-vision", optional = true }
 bloomery-vision = { path = "../vision", optional = true }
 
 [features]
+nvfp4-mma = ["gpu", "bloomery-gpu/nvfp4-mma"]
 # The hub: `--hf` fetches, plus DSpark configuration and checkpoint weights.
 hf = ["dep:bloomery-hf", "dep:bloomery-safetensors"]
 # A safetensors checkpoint folder read as stored: a server's or a gate's `-m <folder>`, and the folder a

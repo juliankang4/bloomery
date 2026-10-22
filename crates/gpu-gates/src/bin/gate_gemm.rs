@@ -2968,6 +2968,7 @@ mod gate {
                 return if gemm_arms(gpu, Some(arm))?
                     || iq_gemm_arms(gpu, Some(arm))?
                     || q8p_gemm_arms(gpu, Some(arm))?
+                    || nvfp4_gemm_arm(gpu, arm)?
                 {
                     Ok(())
                 } else {
@@ -3330,6 +3331,86 @@ mod gate {
                 }
             }
             Ok(ran)
+        }
+
+        fn nvfp4_gemm_arm(gpu: &bloomery_gpu::Gpu, arm: &str) -> Result<bool, GateError> {
+            use bloomery_gpu::gemm::{
+                Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmKernels,
+                GemmRoute,
+            };
+            use bloomery_gpu::mxfp4_sel::Nvfp4Stack;
+            let (rows, k, per_slot) = match arm {
+                "gemm_nvfp4_gate_t4096" => (640usize, 2560usize, false),
+                "gemm_nvfp4_down_t4096" => (2560, 640, true),
+                _ => return Ok(false),
+            };
+            let (tokens, experts, top_k) = (4096usize, 512usize, 8usize);
+            let slots = tokens * top_k;
+            let cols = if per_slot { slots } else { tokens };
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let g32 = Gemm32Kernels::load(gpu.context())?;
+            let gk = GemmKernels::load(gpu.context())?;
+            let qs = DeviceTensor::upload(
+                stream,
+                &fill_pattern(experts * rows * k / 8),
+                experts * rows,
+                k / 8,
+            )?;
+            let se: Vec<u32> = fill_pattern(experts * rows * k / 64)
+                .into_iter()
+                .map(|v| v & 0x7e7e7e7e)
+                .collect();
+            let e = DeviceTensor::upload(stream, &se, experts * rows, k / 64)?;
+            let scales = DeviceTensor::upload(stream, &vec![0.015625f32; experts], experts, 1)?;
+            let xs = DeviceBuffer::from_host(stream, &fill_pattern_f32(cols * k))?;
+            let mut act = GemmAct32::new(stream, cols, k)?;
+            g32.enqueue_quantize_gemm32(stream, &xs, cols, &mut act, sink)?;
+            let ids = DeviceBuffer::from_host(stream, &gemm_ids(tokens, top_k, experts))?;
+            let mut route = GemmRoute::new(stream, slots, experts)?;
+            gk.enqueue_route(stream, &ids, slots, &mut route, sink)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, slots * rows)?;
+            let mut enq = |s: &CudaStream| {
+                g32.enqueue_gemm32(
+                    s,
+                    Gemm32Args {
+                        w: Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
+                            qs: &qs,
+                            e: &e,
+                            scales: &scales,
+                        }),
+                        rows_per_expert: rows,
+                        act: &act,
+                        route: &route,
+                        input: if per_slot {
+                            GemmInput::PerSlot
+                        } else {
+                            GemmInput::Shared { top_k }
+                        },
+                        y: &mut y,
+                    },
+                )
+            };
+            let eager = burst(stream, &mut enq)?;
+            let graph = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+            let timed = replay(stream, &graph)?;
+            let bytes = (experts * rows * k * 9 / 16 + cols * k + slots * rows * 4) as u64;
+            print_arm(arm, rows, bytes, graph.node_count(), eager, timed);
+            let out = y.to_host_vec(stream)?;
+            let invalid = out.iter().filter(|v| !v.is_finite()).count();
+            let norm: f64 = out
+                .iter()
+                .map(|&v| f64::from(v).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            println!(
+                "bench op={arm} slots={slots} k={k} experts={experts} invalid={invalid} l2={norm:.9} sample={:?}",
+                &out[..8]
+            );
+            if invalid != 0 || gpu.take_fault()?.is_some() {
+                return Err("NVFP4 benchmark produced invalid output".into());
+            }
+            Ok(true)
         }
 
         /// The int8 dense tensor peak of the card named `name`, in TOPS — GA102

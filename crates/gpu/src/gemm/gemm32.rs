@@ -1442,6 +1442,19 @@ impl Gemm32Kernels {
                 launch!(prepare_gemm_q5_0p, gemm_q5_0p, w.buf(), s_words);
             }
             Gemm32Weight::Nvfp4Planes(Nvfp4Stack { qs, e, scales }) => {
+                #[cfg(feature = "nvfp4-mma")]
+                return self.native.product(
+                    stream,
+                    Nvfp4Stack { qs, e, scales },
+                    act,
+                    route,
+                    g.rows,
+                    g.n_slots,
+                    g.max_tiles,
+                    g.slot_div,
+                    y,
+                );
+                #[cfg(not(feature = "nvfp4-mma"))]
                 launch!(
                     prepare_gemm_nvfp4p,
                     gemm_nvfp4p,

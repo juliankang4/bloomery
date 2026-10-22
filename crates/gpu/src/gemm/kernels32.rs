@@ -1375,6 +1375,8 @@ mod gemm32_kernels {
 /// Owns no context and no stream — every enqueue takes the engine stream, so
 /// launches order with the rest of the step and are capturable.
 pub struct Gemm32Kernels {
+    #[cfg(feature = "nvfp4-mma")]
+    pub(super) native: super::nvfp4mma::Kernels,
     pub(super) module: gemm32_kernels::LoadedModule,
     /// One wave of `gemm_q8_0p_slab` on the card ([`q8_0p_wave`]).
     pub(super) q8_0p_wave: u32,
@@ -1387,7 +1389,12 @@ impl Gemm32Kernels {
         // the module above; every launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(gemm32_kernels, ctx)? };
         let q8_0p_wave = q8_0p_wave(ctx, &module)?;
-        Ok(Gemm32Kernels { module, q8_0p_wave })
+        Ok(Gemm32Kernels {
+            module,
+            q8_0p_wave,
+            #[cfg(feature = "nvfp4-mma")]
+            native: super::nvfp4mma::Kernels::load(ctx)?,
+        })
     }
 }
 

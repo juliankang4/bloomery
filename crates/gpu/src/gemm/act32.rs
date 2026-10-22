@@ -35,6 +35,8 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 /// ([`GemmAct32::filled`]): a GEMM that would read a column past them is
 /// refused by name rather than reading another call's bytes.
 pub struct GemmAct32 {
+    #[cfg(feature = "nvfp4-mma")]
+    pub(super) native: Option<super::nvfp4mma::Act>,
     pub(super) q: DeviceBuffer<u32>,
     pub(super) d: DeviceBuffer<f32>,
     pub(super) s: DeviceBuffer<i32>,
@@ -63,6 +65,12 @@ impl GemmAct32 {
         }
         let steps = k.div_ceil(GEMM32_STEP);
         Ok(GemmAct32 {
+            #[cfg(feature = "nvfp4-mma")]
+            native: if k.is_multiple_of(64) {
+                Some(super::nvfp4mma::Act::new(stream, cols, k)?)
+            } else {
+                None
+            },
             q: DeviceBuffer::zeroed(stream, cols * 16 * steps)?,
             d: DeviceBuffer::zeroed(stream, cols * 2 * steps)?,
             s: DeviceBuffer::zeroed(stream, cols * 2 * steps)?,
@@ -125,7 +133,10 @@ impl GemmAct32 {
     /// Device bytes of the three planes.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.q.num_bytes() + self.d.num_bytes() + self.s.num_bytes()
+        let bytes = self.q.num_bytes() + self.d.num_bytes() + self.s.num_bytes();
+        #[cfg(feature = "nvfp4-mma")]
+        let bytes = bytes + self.native.as_ref().map_or(0, super::nvfp4mma::Act::bytes);
+        bytes
     }
 
     /// The launch shape both quantizers take for `n_cols` columns: the grid
@@ -188,6 +199,8 @@ impl Gemm32Kernels {
             stream, &prep, x, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s, fault,
         )?;
         act.filled = n_cols;
+        #[cfg(feature = "nvfp4-mma")]
+        self.native.quantize(stream, act)?;
         Ok(())
     }
 
@@ -221,6 +234,8 @@ impl Gemm32Kernels {
             stream, &prep, x, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s, fault,
         )?;
         act.filled = n_cols;
+        #[cfg(feature = "nvfp4-mma")]
+        self.native.quantize(stream, act)?;
         Ok(())
     }
 
@@ -260,6 +275,8 @@ impl Gemm32Kernels {
             fault,
         )?;
         act.filled = n_cols;
+        #[cfg(feature = "nvfp4-mma")]
+        self.native.quantize(stream, act)?;
         Ok(())
     }
 
@@ -311,6 +328,8 @@ impl Gemm32Kernels {
             &mut act.s, fault,
         )?;
         act.filled = n_cols;
+        #[cfg(feature = "nvfp4-mma")]
+        self.native.quantize(stream, act)?;
         Ok(())
     }
 
@@ -369,6 +388,8 @@ impl Gemm32Kernels {
             &mut act.s, fault,
         )?;
         act.filled = n_cols;
+        #[cfg(feature = "nvfp4-mma")]
+        self.native.quantize(stream, act)?;
         Ok(())
     }
 }
