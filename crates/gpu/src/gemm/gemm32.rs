@@ -1442,7 +1442,7 @@ impl Gemm32Kernels {
                 launch!(prepare_gemm_q5_0p, gemm_q5_0p, w.buf(), s_words);
             }
             Gemm32Weight::Nvfp4Planes(Nvfp4Stack { qs, e, scales }) => {
-                #[cfg(feature = "nvfp4-mma")]
+                #[cfg(bloomery_nvfp4_mma)]
                 if act.native.is_some() {
                     return self.native.product(
                         stream,

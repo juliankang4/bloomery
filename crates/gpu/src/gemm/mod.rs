@@ -54,7 +54,7 @@ mod kernels;
 
 mod act32;
 mod f32tile;
-#[cfg(feature = "nvfp4-mma")]
+#[cfg(bloomery_nvfp4_mma)]
 mod nvfp4mma;
 #[macro_use]
 mod gemm32;

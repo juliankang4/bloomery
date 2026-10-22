@@ -572,6 +572,13 @@ impl Card38 {
         self.blocks32_gate_up
     }
 
+    pub(super) fn routed_types(&self) -> impl Iterator<Item = (GgmlType, GgmlType)> + '_ {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|layer| (layer.gate_up_ty, layer.down_ty))
+    }
+
     /// Layer `l`'s card experts for the ubatch route (`wide38`'s): their
     /// count, the three routed stacks the grouped GEMMs read (the gate and
     /// up at `n_card · FF` rows, the down at `n_card · HIDDEN`) and their

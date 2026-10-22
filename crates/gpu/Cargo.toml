@@ -8,9 +8,6 @@ license = "MIT"
 [lints]
 workspace = true
 
-[features]
-nvfp4-mma = []
-
 [dependencies]
 cuda-device.workspace = true
 cuda-host.workspace = true

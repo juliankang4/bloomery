@@ -1375,7 +1375,7 @@ mod gemm32_kernels {
 /// Owns no context and no stream — every enqueue takes the engine stream, so
 /// launches order with the rest of the step and are capturable.
 pub struct Gemm32Kernels {
-    #[cfg(feature = "nvfp4-mma")]
+    #[cfg(bloomery_nvfp4_mma)]
     pub(super) native: super::nvfp4mma::Kernels,
     pub(super) module: gemm32_kernels::LoadedModule,
     /// One wave of `gemm_q8_0p_slab` on the card ([`q8_0p_wave`]).
@@ -1392,7 +1392,7 @@ impl Gemm32Kernels {
         Ok(Gemm32Kernels {
             module,
             q8_0p_wave,
-            #[cfg(feature = "nvfp4-mma")]
+            #[cfg(bloomery_nvfp4_mma)]
             native: super::nvfp4mma::Kernels::load(ctx)?,
         })
     }

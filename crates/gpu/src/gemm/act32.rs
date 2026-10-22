@@ -14,6 +14,7 @@ use crate::kquant::Act;
 use crate::tensor::Q8ACT_MAX_K;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
+use gguf::GgmlType;
 
 /// q8_1 activations with one scale and one code sum per 32 values, for up to
 /// `cols` columns of `k` values each — `q5::Q8Blocks32`'s convention (per
@@ -35,7 +36,7 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 /// ([`GemmAct32::filled`]): a GEMM that would read a column past them is
 /// refused by name rather than reading another call's bytes.
 pub struct GemmAct32 {
-    #[cfg(feature = "nvfp4-mma")]
+    #[cfg(bloomery_nvfp4_mma)]
     pub(super) native: Option<super::nvfp4mma::Act>,
     pub(super) q: DeviceBuffer<u32>,
     pub(super) d: DeviceBuffer<f32>,
@@ -65,7 +66,7 @@ impl GemmAct32 {
         }
         let steps = k.div_ceil(GEMM32_STEP);
         Ok(GemmAct32 {
-            #[cfg(feature = "nvfp4-mma")]
+            #[cfg(bloomery_nvfp4_mma)]
             native: None,
             q: DeviceBuffer::zeroed(stream, cols * 16 * steps)?,
             d: DeviceBuffer::zeroed(stream, cols * 2 * steps)?,
@@ -79,7 +80,7 @@ impl GemmAct32 {
     /// Routed columns, including the native FP4 representation when the build supports it.
     pub fn new_routed(stream: &CudaStream, cols: usize, k: usize) -> Result<Self, GpuError> {
         let act = Self::new(stream, cols, k)?;
-        #[cfg(feature = "nvfp4-mma")]
+        #[cfg(bloomery_nvfp4_mma)]
         let act = {
             let mut act = act;
             if k.is_multiple_of(64) {
@@ -88,6 +89,20 @@ impl GemmAct32 {
             act
         };
         Ok(act)
+    }
+
+    /// Scratch for the resident routed formats. Other formats keep only their Q8 representation.
+    pub fn new_routed_for(
+        stream: &CudaStream,
+        cols: usize,
+        k: usize,
+        types: impl IntoIterator<Item = GgmlType>,
+    ) -> Result<Self, GpuError> {
+        if types.into_iter().any(|ty| ty == GgmlType::NVFP4) {
+            Self::new_routed(stream, cols, k)
+        } else {
+            Self::new(stream, cols, k)
+        }
     }
 
     /// Columns this scratch holds.
@@ -144,7 +159,7 @@ impl GemmAct32 {
     #[must_use]
     pub fn bytes(&self) -> usize {
         let bytes = self.q.num_bytes() + self.d.num_bytes() + self.s.num_bytes();
-        #[cfg(feature = "nvfp4-mma")]
+        #[cfg(bloomery_nvfp4_mma)]
         let bytes = bytes + self.native.as_ref().map_or(0, super::nvfp4mma::Act::bytes);
         bytes
     }
@@ -209,7 +224,7 @@ impl Gemm32Kernels {
             stream, &prep, x, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s, fault,
         )?;
         act.filled = n_cols;
-        #[cfg(feature = "nvfp4-mma")]
+        #[cfg(bloomery_nvfp4_mma)]
         self.native.quantize(stream, act)?;
         Ok(())
     }
@@ -244,7 +259,7 @@ impl Gemm32Kernels {
             stream, &prep, x, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s, fault,
         )?;
         act.filled = n_cols;
-        #[cfg(feature = "nvfp4-mma")]
+        #[cfg(bloomery_nvfp4_mma)]
         self.native.quantize(stream, act)?;
         Ok(())
     }
@@ -277,7 +292,7 @@ impl Gemm32Kernels {
                 ),
             ));
         }
-        #[cfg(feature = "nvfp4-mma")]
+        #[cfg(bloomery_nvfp4_mma)]
         if act.native.is_some() {
             self.native
                 .swiglu(stream, g, u, None, Act::SiluMul, m, act, fault)?;
@@ -335,7 +350,7 @@ impl Gemm32Kernels {
             ));
         }
         let (code, limit) = rule.code(what)?;
-        #[cfg(feature = "nvfp4-mma")]
+        #[cfg(bloomery_nvfp4_mma)]
         if act.native.is_some() {
             self.native
                 .swiglu(stream, g, u, None, rule, m, act, fault)?;
@@ -400,7 +415,7 @@ impl Gemm32Kernels {
             ));
         }
         let n_card = launch_u32(what, "n_card", n_card)?;
-        #[cfg(feature = "nvfp4-mma")]
+        #[cfg(bloomery_nvfp4_mma)]
         if act.native.is_some() {
             self.native.swiglu(
                 stream,
