@@ -495,7 +495,9 @@ mod gate {
             }
         }
         let tile = gpu.q8f32().enqueue_bf16_tile(stream, words, &x, 2, &mut y);
-        let mma = gpu.q8f32().enqueue_bf16_mma(stream, words, &x, 2, &mut y);
+        let mma = gpu
+            .q8f32()
+            .enqueue_bf16_mma::<false>(stream, words, &x, 2, &mut y);
         stream.synchronize()?;
         let pass = gemv_ok
             && [&tile, &mma]

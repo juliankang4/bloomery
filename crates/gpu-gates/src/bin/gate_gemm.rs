@@ -6664,7 +6664,7 @@ mod gate {
                             if exact {
                                 gpu.q8f32().enqueue_bf16_tile(s, &w, &x, n, y)
                             } else {
-                                gpu.q8f32().enqueue_bf16_mma(s, &w, &x, n, y)
+                                gpu.q8f32().enqueue_bf16_mma::<false>(s, &w, &x, n, y)
                             }
                         } else {
                             let (qs, mx, fp) = byte_planes.as_ref().unwrap();

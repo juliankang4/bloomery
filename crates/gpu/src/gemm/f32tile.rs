@@ -257,7 +257,9 @@ pub(crate) unsafe fn f32_tile_body<W: TileRows>(
         return; // block-uniform, before the first barrier
     }
     // SAFETY: the wrapper supplies this block's checked tile and all 512 threads.
-    unsafe { f32_tile_at::<W, F32T_THREADS>(w, x, (rows, k as usize, n), y, sh, (row0, c0, 0)) };
+    unsafe {
+        f32_tile_at::<W, F32T_THREADS, false>(w, x, (rows, k as usize, n), y, sh, (row0, c0, 0))
+    };
 }
 
 /// Exact tile owner, with 256 threads walking one row half or 512 walking both.
@@ -270,7 +272,7 @@ pub(crate) unsafe fn f32_tile_body<W: TileRows>(
 /// values, and y holds rows*n outputs. The aligned shared allocation holds
 /// STAGES*STAGE_FLOATS values. No other block writes this output tile.
 #[inline(always)]
-unsafe fn f32_tile_at<W: TileRows, const THREADS: usize>(
+unsafe fn f32_tile_at<W: TileRows, const THREADS: usize, const MARKED: bool>(
     w: W,
     x: &[f32],
     (rows, kk, n): (usize, usize, usize),
@@ -376,7 +378,22 @@ unsafe fn f32_tile_at<W: TileRows, const THREADS: usize>(
                 // r0 + i, i < live_rows, lie inside y (this fn's contract);
                 // lane 0 of the warp owning rows r0 .. of that column is their
                 // only writer.
-                unsafe { store_live(y, (cw + $c) * rows + r0, &sums, live_rows) };
+                if MARKED {
+                    for i in 0..TILE {
+                        thread::__unroll_config::<0>();
+                        if i < live_rows {
+                            // SAFETY: this lane owns the checked live cell, published
+                            // before replay; marked stores preserve healthy MMA cells.
+                            let slot = unsafe { y.get_unchecked_mut((cw + $c) * rows + r0 + i) };
+                            if slot.is_nan() {
+                                *slot = sums[i];
+                            }
+                        }
+                    }
+                } else {
+                    // SAFETY: this warp owns the checked column's live rows.
+                    unsafe { store_live(y, (cw + $c) * rows + r0, &sums, live_rows) };
+                }
             }
         }};
     }
@@ -392,6 +409,7 @@ unsafe fn f32_tile_at<W: TileRows, const THREADS: usize>(
 
 /// Threads in a dense BF16 MMA tile: eight warps, each covering 32 by 16.
 pub(crate) const MMA_THREADS: u32 = 256;
+pub(crate) const MMA_ROW_LANES: usize = 4;
 const MMA_ROWS: usize = 64;
 const MMA_COLS: usize = 64;
 const MMA_LINE: usize = 32;
@@ -399,15 +417,116 @@ const _: () = assert!(MMA_THREADS == 256 && MMA_ROWS == 64 && MMA_COLS == 64 && 
 const _: () = assert!(MMA_THREADS as usize * 2 == MMA_ROWS * (MMA_LINE / 4));
 const _: () = assert!((MMA_ROWS + MMA_COLS) * MMA_LINE == STAGE_FLOATS && STAGES == 3);
 
-/// BF16 tensor-core product over the stored weight's decoded rows.
-/// Activations and decoded weights round once to BF16; accumulation is F32.
+/// A thread's completed MMA fragment and logical output coordinates.
+pub(crate) struct MmaTile {
+    pub(crate) values: [[[f32; 4]; 2]; 2],
+    row0: usize,
+    col0: usize,
+    warp: usize,
+    lane: usize,
+    retry: bool,
+    bad: u32,
+}
+
+impl MmaTile {
+    #[inline(always)]
+    pub(crate) fn coordinates(&self, cell: usize) -> (usize, usize) {
+        let (mi, j, i) = (cell / 8, (cell / 4) % 2, cell % 4);
+        (
+            self.row0 + (self.warp / 4) * 32 + mi * 16 + self.lane / MMA_ROW_LANES + (i / 2) * 8,
+            self.col0 + (self.warp % 4) * 16 + j * 8 + 2 * (self.lane % MMA_ROW_LANES) + i % 2,
+        )
+    }
+}
+
+impl MmaTile {
+    /// # Safety
+    /// All 256 threads call with the tile's original shared allocation and K.
+    #[inline(always)]
+    pub(crate) unsafe fn needs_replay(&self, sh: *mut f32, k: usize) -> bool {
+        // SAFETY: the next stage is inside the allocation and is no longer in use.
+        let votes = unsafe { sh.add((k / MMA_LINE % STAGES) * STAGE_FLOATS) };
+        let retry = warp::any(self.retry);
+        if self.lane == 0 {
+            // SAFETY: each warp owns one slot of the unused stage.
+            unsafe { *votes.add(self.warp) = if retry { 1.0 } else { 0.0 } };
+        }
+        thread::sync_threads();
+        let mut any = false;
+        for i in 0..MMA_THREADS as usize / 32 {
+            // SAFETY: the block barrier published all eight warp votes.
+            any |= unsafe { *votes.add(i) != 0.0 };
+        }
+        if any {
+            thread::sync_threads();
+        }
+        any
+    }
+
+    /// # Safety
+    /// y holds rows*n cells. This tile is disjoint from every other block's.
+    #[inline(always)]
+    pub(crate) unsafe fn store<const MARKED: bool>(
+        &self,
+        y: &mut DisjointSlice<f32>,
+        rows: usize,
+        n: usize,
+    ) {
+        for cell in 0..16 {
+            thread::__unroll_config::<0>();
+            let (r, c) = self.coordinates(cell);
+            if r < rows && c < n {
+                let value = self.values[cell / 8][(cell / 4) % 2][cell % 4];
+                let value = if MARKED && (self.bad & (1 << cell) != 0 || !value.is_finite()) {
+                    f32::NAN
+                } else {
+                    value
+                };
+                // SAFETY: this thread owns the checked live output cell.
+                unsafe { *y.get_unchecked_mut(c * rows + r) = value };
+            }
+        }
+    }
+
+    /// # Safety
+    /// All 256 threads call converged with this tile's checked spans and shared
+    /// allocation. Prior output stores and shared readers have completed.
+    #[inline(always)]
+    pub(crate) unsafe fn replay<W: TileRows, const MARKED: bool>(
+        &self,
+        w: W,
+        x: &[f32],
+        dims: (usize, usize, usize),
+        y: &mut DisjointSlice<f32>,
+        sh: *mut f32,
+    ) {
+        for dr in 0..MMA_ROWS / TILE_ROWS {
+            for dc in 0..MMA_COLS / TILE_COLS {
+                for half in 0..2 {
+                    // SAFETY: the passes cover disjoint checked halves and reuse
+                    // the exact owner's shared allocation with 256 threads.
+                    unsafe {
+                        f32_tile_at::<W, { MMA_THREADS as usize }, MARKED>(
+                            w,
+                            x,
+                            dims,
+                            y,
+                            sh,
+                            (self.row0 + dr * TILE_ROWS, self.col0 + dc * TILE_COLS, half),
+                        )
+                    };
+                    thread::sync_threads();
+                }
+            }
+        }
+    }
+}
+/// Compute a BF16 MMA fragment and its replay decision.
 ///
 /// # Safety
-///
-/// All 256 threads call converged. Rows and columns are positive, K is a
-/// positive multiple of 64, x holds n aligned K-value columns, y holds
-/// rows*n outputs, and w holds rows*K values. The grid covers 64 by 64
-/// output tiles. sh holds STAGES*STAGE_FLOATS aligned shared values.
+/// All 256 threads call converged. Rows and n are positive, K is a positive
+/// multiple of 64, and w/x hold rows*K and n*K values. x and sh are aligned;
+/// sh holds STAGES*STAGE_FLOATS values and the grid covers 64x64 tiles.
 #[inline(always)]
 #[allow(
     clippy::needless_range_loop,
@@ -417,22 +536,21 @@ const _: () = assert!((MMA_ROWS + MMA_COLS) * MMA_LINE == STAGE_FLOATS && STAGES
     clippy::manual_range_contains,
     reason = "the kernel's two compares on the bits; a RangeInclusive would move its PTX"
 )]
-pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
+pub(crate) unsafe fn bf16_mma_tile<W: TileRows, const ISOLATE: bool>(
     w: W,
     x: &[f32],
     rows: u32,
     k: u32,
     n: u32,
-    y: &mut DisjointSlice<f32>,
     sh: *mut f32,
-) {
+) -> Option<MmaTile> {
     let (rows, kk, n) = (rows as usize, k as usize, n as usize);
     let row_blocks = rows.div_ceil(MMA_ROWS);
     let block = thread::blockIdx_x() as usize;
     let group_size = GEMM32_GROUP * TILE_COLS / MMA_COLS;
     let Some((col_tile, row_tile)) = raster32(block, row_blocks, n.div_ceil(MMA_COLS), group_size)
     else {
-        return;
+        return None;
     };
     let row0 = row_tile * MMA_ROWS;
     let col0 = col_tile * MMA_COLS;
@@ -445,6 +563,7 @@ pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
     let pair = 2 * (lane % 4);
     let mut acc = [[[0.0f32; 4]; 2]; 2];
     let mut retry = false;
+    let mut bad = 0u32;
     let stages = kk / MMA_LINE;
     let staged_at = |at: usize| at ^ (((at / MMA_LINE) & 3) * 8);
     macro_rules! copy {
@@ -525,11 +644,18 @@ pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
                 let a2 = packed(at + 8);
                 let a3 = packed(at + 8 * MMA_LINE + 8);
                 let a = [a0.0, a1.0, a2.0, a3.0];
+                if ISOLATE {
+                    bad |= u32::from(!(a0.1 && a2.1)) << (mi * 2);
+                    bad |= u32::from(!(a1.1 && a3.1)) << (mi * 2 + 1);
+                }
                 for j in 0..2 {
                     thread::__unroll_config::<0>();
                     let at = (MMA_ROWS + wc + j * 8 + group) * MMA_LINE + off;
                     let b0 = packed(at);
                     let b1 = packed(at + 8);
+                    if ISOLATE {
+                        bad |= u32::from(!(b0.1 && b1.1)) << (4 + j);
+                    }
                     let safe = a0.1 && a1.1 && a2.1 && a3.1 && b0.1 && b1.1;
                     // SAFETY: the whole warp is converged; A is row-major
                     // and B column-major in the m16n8k16 fragment layout.
@@ -544,59 +670,65 @@ pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
             }
         }
     }
-    for mi in 0..2 {
-        thread::__unroll_config::<0>();
+    let mut cells = 0u32;
+    if ISOLATE {
+        let mut row_bad = [0u32; 4];
+        let mut col_bad = [0u32; 2];
+        for i in 0..4 {
+            thread::__unroll_config::<0>();
+            row_bad[i] = warp::ballot(bad & (1 << i) != 0);
+        }
         for j in 0..2 {
             thread::__unroll_config::<0>();
-            for i in 0..4 {
-                thread::__unroll_config::<0>();
-                let r = row0 + wr + mi * 16 + group + (i / 2) * 8;
-                let c = col0 + wc + j * 8 + pair + i % 2;
-                if r < rows && c < n {
-                    // SAFETY: this lane owns the fragment output; its checked
-                    // live row and column lie inside rows*n.
-                    unsafe { *y.get_unchecked_mut(c * rows + r) = acc[mi][j][i] };
-                }
+            col_bad[j] = warp::ballot(bad & (1 << (4 + j)) != 0);
+        }
+        let lanes = (1u32 << MMA_ROW_LANES) - 1;
+        for cell in 0..16 {
+            thread::__unroll_config::<0>();
+            let (mi, j, i) = (cell / 8, (cell / 4) % 2, cell % 4);
+            if row_bad[mi * 2 + i / 2] & (lanes << (group * MMA_ROW_LANES) as u32) != 0
+                || (col_bad[j] >> ((pair + i % 2) * MMA_ROW_LANES) as u32) & lanes != 0
+            {
+                cells |= 1 << cell;
             }
         }
     }
-    // The next stage's buffer is no longer read or written by the pipeline.
-    // SAFETY: the buffer is inside sh; the last stage reads a different buffer.
-    let votes = unsafe { sh.add((stages % STAGES) * STAGE_FLOATS) };
-    let retry = warp::any(retry);
-    if lane == 0 {
-        // SAFETY: each warp owns one slot of that unused buffer.
-        unsafe { *votes.add(warp) = if retry { 1.0 } else { 0.0 } };
-    }
-    thread::sync_threads();
-    let mut any = false;
-    for i in 0..MMA_THREADS as usize / 32 {
-        // SAFETY: all warp votes were published by the block barrier.
-        any |= unsafe { *votes.add(i) != 0.0 };
-    }
-    if any {
-        // All readers finish the votes before the exact owner reuses shared memory.
-        thread::sync_threads();
-        for dr in 0..MMA_ROWS / TILE_ROWS {
-            for dc in 0..MMA_COLS / TILE_COLS {
-                for half in 0..2 {
-                    // SAFETY: all 256 threads replay disjoint halves of the
-                    // checked 64-by-64 tile with the exact owner's staging bound.
-                    unsafe {
-                        f32_tile_at::<W, { MMA_THREADS as usize }>(
-                            w,
-                            x,
-                            (rows, kk, n),
-                            y,
-                            sh,
-                            (row0 + dr * TILE_ROWS, col0 + dc * TILE_COLS, half),
-                        )
-                    };
-                    // The next pass must not refill a stage another warp still reads.
-                    thread::sync_threads();
-                }
-            }
-        }
+    Some(MmaTile {
+        values: acc,
+        row0,
+        col0,
+        warp,
+        lane,
+        retry,
+        bad: cells,
+    })
+}
+
+/// Dense prompt product with the exact owner's exceptional-tile replay.
+///
+/// # Safety
+/// The checked launch supplies 256 converged threads, aligned stages and x,
+/// rows*K weight values, n*K activations and rows*n disjoint output cells.
+#[inline(always)]
+pub(crate) unsafe fn bf16_mma_body<W: TileRows, const ISOLATE: bool>(
+    w: W,
+    x: &[f32],
+    rows: u32,
+    k: u32,
+    n: u32,
+    y: &mut DisjointSlice<f32>,
+    sh: *mut f32,
+) {
+    // SAFETY: the wrapper's spans and launch satisfy the tile's contract.
+    let Some(tile) = (unsafe { bf16_mma_tile::<W, ISOLATE>(w, x, rows, k, n, sh) }) else {
+        return;
+    };
+    // SAFETY: the checked output belongs to this tile.
+    unsafe { tile.store::<ISOLATE>(y, rows as usize, n as usize) };
+    // SAFETY: all threads share the original staging allocation and K.
+    if unsafe { tile.needs_replay(sh, k as usize) } {
+        // SAFETY: the barrier published stores; spans and allocation are unchanged.
+        unsafe { tile.replay::<W, ISOLATE>(w, x, (rows as usize, k as usize, n as usize), y, sh) };
     }
 }
 
@@ -781,4 +913,40 @@ pub(crate) fn tile_launch(
         k: launch_u32(what, "k", k)?,
         n: launch_u32(what, "n", n)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hc_mma_layout() {
+        let mut seen = std::collections::HashSet::new();
+        for warp in 0..8 {
+            for lane in 0..32 {
+                let tile = MmaTile {
+                    values: [[[0.0; 4]; 2]; 2],
+                    row0: 64,
+                    col0: 128,
+                    warp,
+                    lane,
+                    retry: false,
+                    bad: 0,
+                };
+                for cell in 0..16 {
+                    let (r, c) = tile.coordinates(cell);
+                    assert!((64..128).contains(&r) && (128..192).contains(&c));
+                    assert!(seen.insert((r, c)));
+                    for stream in 0..4 {
+                        let peer = MmaTile {
+                            lane: (lane & !(3 * MMA_ROW_LANES)) + stream * MMA_ROW_LANES,
+                            ..tile
+                        };
+                        assert_eq!(peer.coordinates(cell), ((r / 4) * 4 + stream, c));
+                    }
+                }
+            }
+        }
+        assert_eq!(seen.len(), 64 * 64);
+    }
 }
