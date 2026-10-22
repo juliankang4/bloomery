@@ -1,0 +1,13 @@
+kind: profile
+question: does shared BF16 tensor-core prompt GEMM reduce 4K prefill latency on GB10?
+term: prefill tokens per second for one 4096-id code-fn request per arm
+unit: %
+predict: +50..+200
+condition: load baseline once and candidate once on the same otherwise idle
+  GPU and timing lease. Use identical stored weights and prompt ids, C=1,
+  draft off and two generated tokens. Run each request once, without rounds.
+  Check distinct binary hashes and zero cached prompt tokens. Restore the
+  host clock limit on every exit and yield to waiting PR checks.
+decide-in: report the observed ratio with the actual one-request sample counts.
+decide-below: report the measured difference without adding repetitions.
+decide-above: inspect input length, cache hits and binary provenance before reporting.

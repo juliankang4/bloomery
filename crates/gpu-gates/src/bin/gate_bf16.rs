@@ -72,6 +72,7 @@ mod gate {
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{Fault, FaultSite, Gpu, LAYER_NONE};
+    use bloomery_gpu_gates::rounding::check_mma;
     use bloomery_gpu_gates::{
         GateError, GateRng, checks_failed, no_local_depot, verdict, write_gguf,
     };
@@ -337,6 +338,21 @@ mod gate {
                     let src = (ty, w, SiteWeight::Resident(name));
                     let table = (route, GemmInput::PerSlot);
                     site::gemm(gpu, &kernels, src, rows, &x_in, table, m, &mut y_dev)?;
+                    if gpu.context().compute_capability()? == (12, 1) {
+                        stream.synchronize()?;
+                        let mma = y_dev.to_host_vec(stream)?;
+                        ok &= check_mma(name, (&mma, &x, k), wf);
+                        // PIN(2026-10-22): GB10 BF16 operand rounding replaces the site's F32 bit
+                        // contract with the band/KL check above; the exact tile's output replaces
+                        // the site's here, so the bit checks below hold for the exact tile only.
+                        gpu.q8f32().enqueue_bf16_tile(
+                            stream,
+                            w.bf16(WHAT, name)?,
+                            &x_dev,
+                            m,
+                            &mut y_dev,
+                        )?;
+                    }
                     "gemm"
                 }
                 _ => {
@@ -479,11 +495,16 @@ mod gate {
             }
         }
         let tile = gpu.q8f32().enqueue_bf16_tile(stream, words, &x, 2, &mut y);
+        let mma = gpu.q8f32().enqueue_bf16_mma(stream, words, &x, 2, &mut y);
         stream.synchronize()?;
-        let pass = gemv_ok && tile.as_ref().is_err_and(|e| e.to_string().contains("96"));
+        let pass = gemv_ok
+            && [&tile, &mma]
+                .iter()
+                .all(|r| r.as_ref().is_err_and(|e| e.to_string().contains("96")));
         println!(
-            "bf16 clause=refusal k=96 gemv_outputs={gemv_ok} tile={:?} {}",
+            "bf16 clause=refusal k=96 gemv_outputs={gemv_ok} tile={:?} mma={:?} {}",
             tile.as_ref().map_err(ToString::to_string),
+            mma.as_ref().map_err(ToString::to_string),
             verdict(pass)
         );
         Ok(pass)

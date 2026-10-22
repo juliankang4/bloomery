@@ -27,6 +27,11 @@
 //! read f32 values from the stage, so an E4M3 tile is bit for bit `f32_gemv`
 //! over the host's dequantized rows. BF16 words are widened into the same stage
 //! ([`Bf16Rows`], `q8f32`'s `bf16_tile_gemm`), bit for bit the F32 tile over those values.
+//!
+//! GB10 prompt sites select [`bf16_mma_body`] for BF16 and E4M3 weights.
+//! It rounds activations and decoded weights to BF16 and accumulates in F32.
+//! A fragment outside normal BF16 range uses F32 terms instead, preserving
+//! the file formats' full exponent range. The exact tile entries stay available.
 
 use super::kernels32::Gemm32Kernels;
 use crate::q8f32::{
@@ -37,6 +42,8 @@ use crate::{GpuError, launch_u32};
 use core::marker::PhantomData;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
+use cuda_device::convert::cvt_bf16x2_f32;
+use cuda_device::wmma::mma_m16n8k16_f32_bf16;
 use cuda_device::{DisjointSlice, thread, warp};
 
 /// Columns and rows one block covers.
@@ -356,6 +363,145 @@ pub(crate) unsafe fn f32_tile_body<W: TileRows>(
     column!(7);
 }
 
+/// Threads in a dense BF16 MMA tile: four warps, each covering 16 by 16.
+pub(crate) const MMA_THREADS: u32 = 128;
+const _: () = assert!(MMA_THREADS as usize * 4 == TILE_ROWS * LINE_COPIES);
+const _: () = assert!(TILE_ROWS == 32 && TILE_COLS == 32 && LINE == 64 && STAGES == 3);
+
+/// BF16 tensor-core product over the stored weight's decoded rows.
+/// Activations and decoded weights round once to BF16; accumulation is F32.
+///
+/// # Safety
+///
+/// All 128 threads call converged. Rows and columns are positive, K is a
+/// positive multiple of LINE, x holds n aligned K-value columns, y holds
+/// rows*n outputs, and w holds rows*K values. The grid covers 32 by 32
+/// output tiles. sh holds STAGES*STAGE_FLOATS aligned shared values.
+#[inline(always)]
+pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
+    w: W,
+    x: &[f32],
+    rows: u32,
+    k: u32,
+    n: u32,
+    y: &mut DisjointSlice<f32>,
+    sh: *mut f32,
+) {
+    let (rows, kk, n) = (rows as usize, k as usize, n as usize);
+    let row_blocks = rows.div_ceil(TILE_ROWS);
+    let block = thread::blockIdx_x() as usize;
+    let row0 = (block % row_blocks) * TILE_ROWS;
+    let col0 = (block / row_blocks) * TILE_COLS;
+    if col0 >= n {
+        return;
+    }
+    let tid = thread::threadIdx_x() as usize;
+    let lane = warp::lane_id() as usize;
+    let warp = tid / 32;
+    let wr = (warp / 2) * 16;
+    let wc = (warp % 2) * 16;
+    let group = lane / 4;
+    let pair = 2 * (lane % 4);
+    let mut acc = [[0.0f32; 4]; 2];
+    let stages = kk / LINE;
+    macro_rules! copy {
+        ($s:expr, $buf:expr) => {{
+            let (s, buf): (usize, usize) = ($s, $buf);
+            for i in 0..4 {
+                let piece = tid + i * MMA_THREADS as usize;
+                let line = piece / LINE_COPIES;
+                let offset = 4 * (piece % LINE_COPIES);
+                let wa = (row0 + line).min(rows - 1) * kk + s * LINE + offset;
+                let xa = (col0 + line).min(n - 1) * kk + s * LINE + offset;
+                // SAFETY: each thread owns four disjoint aligned pieces of
+                // each stage plane; source rows are clamped inside the weight.
+                unsafe { w.stage(sh.add(buf * STAGE_FLOATS + line * LINE + offset), wa) };
+                // SAFETY: x holds n rows of kk values; xa is an aligned live
+                // four-value piece. Its stage plane is disjoint from w's.
+                unsafe {
+                    cp_async_cg_16(
+                        sh.add(buf * STAGE_FLOATS + (TILE_ROWS + line) * LINE + offset)
+                            .cast(),
+                        x.as_ptr().add(xa).cast(),
+                    )
+                };
+            }
+        }};
+    }
+    copy!(0, 0);
+    // SAFETY: commits this thread's copies of the first stage.
+    unsafe { cp_async_commit_group() };
+    if stages > 1 {
+        copy!(1, 1);
+    }
+    // SAFETY: one group for each stage, empty when there is no second stage.
+    unsafe { cp_async_commit_group() };
+    for s in 0..stages {
+        let buf = s % STAGES;
+        // SAFETY: two groups precede this wait; the oldest is this stage.
+        unsafe { cp_async_wait_group(1) };
+        thread::sync_threads();
+        if s + 2 < stages {
+            copy!(s + 2, (s + 2) % STAGES);
+        }
+        // SAFETY: advances the pipeline even when the final group is empty.
+        unsafe { cp_async_commit_group() };
+        // SAFETY: this stage is published and no thread refills it before
+        // the next iteration's barrier. Its extent is the allocation's.
+        let stage =
+            unsafe { core::slice::from_raw_parts(sh.add(buf * STAGE_FLOATS), STAGE_FLOATS) };
+        let packed = |at| {
+            let (a, b) = (stage[at], stage[at + 1]);
+            let fits = |v: f32| {
+                let bits = v.to_bits() & 0x7fff_ffff;
+                bits == 0 || (bits >= 0x0080_0000 && bits <= 0x7f7f_0000)
+            };
+            (cvt_bf16x2_f32(a, b), fits(a) && fits(b))
+        };
+        for step in 0..4 {
+            let off = step * 16 + pair;
+            let at = (wr + group) * LINE + off;
+            let a0 = packed(at);
+            let a1 = packed(at + 8 * LINE);
+            let a2 = packed(at + 8);
+            let a3 = packed(at + 8 * LINE + 8);
+            let a = [a0.0, a1.0, a2.0, a3.0];
+            for j in 0..2 {
+                let at = (TILE_ROWS + wc + j * 8 + group) * LINE + off;
+                let b0 = packed(at);
+                let b1 = packed(at + 8);
+                let safe = a0.1 && a1.1 && a2.1 && a3.1 && b0.1 && b1.1;
+                if warp::any(!safe) {
+                    // BF16 MMA need not preserve subnormal operands. The
+                    // same output fragment keeps the full-range F32 terms.
+                    for i in 0..4 {
+                        let ra = (wr + group + (i / 2) * 8) * LINE + step * 16;
+                        let rb = (TILE_ROWS + wc + j * 8 + pair + i % 2) * LINE + step * 16;
+                        for t in 0..16 {
+                            acc[j][i] = stage[ra + t].mul_add(stage[rb + t], acc[j][i]);
+                        }
+                    }
+                } else {
+                    // SAFETY: the whole warp is converged; A is row-major and
+                    // B column-major in the m16n8k16 fragment layout.
+                    acc[j] = unsafe { mma_m16n8k16_f32_bf16(acc[j], a, [b0.0, b1.0]) };
+                }
+            }
+        }
+    }
+    for j in 0..2 {
+        for i in 0..4 {
+            let r = row0 + wr + group + (i / 2) * 8;
+            let c = col0 + wc + j * 8 + pair + i % 2;
+            if r < rows && c < n {
+                // SAFETY: each lane owns these four distinct fragment outputs;
+                // the checked live row and column lie inside rows*n.
+                unsafe { *y.get_unchecked_mut(c * rows + r) = acc[j][i] };
+            }
+        }
+    }
+}
+
 impl Gemm32Kernels {
     /// Enqueue `y[c · rows + r] = Σ_k w[r·k + k'] · x[c·k + k']` for the
     /// first `n` columns of `x`, `w` an F32 weight of `rows × k` (module
@@ -425,6 +571,36 @@ impl Gemm32Kernels {
             E4m3Scales::Fp8B128 => {
                 let prep = module.prepare_fp8_b128_tile_gemm(cfg)?;
                 module.fp8_b128_tile_gemm(stream, &prep, qs, e, x, t.rows, t.k, t.n, y)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Gemm32Kernels {
+    /// Dense E4M3 prompt product, with BF16 operands and F32 accumulation.
+    /// The stored planes are decoded in shared memory, never rewritten.
+    pub fn enqueue_e4m3_mma(
+        &self,
+        stream: &CudaStream,
+        w: E4m3Weight<'_>,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_e4m3_mma";
+        let (rows, k) = w.dimensions(what)?;
+        let t = tile_launch(what, rows, k, x, n, y)?;
+        let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
+        let (qs, e, module) = (w.qs.buf(), w.e.buf(), &self.module);
+        match w.scales {
+            E4m3Scales::Mxfp8 => {
+                let prep = module.prepare_mxfp8_mma_gemm(cfg)?;
+                module.mxfp8_mma_gemm(stream, &prep, qs, e, x, t.rows, t.k, t.n, y)?;
+            }
+            E4m3Scales::Fp8B128 => {
+                let prep = module.prepare_fp8_b128_mma_gemm(cfg)?;
+                module.fp8_b128_mma_gemm(stream, &prep, qs, e, x, t.rows, t.k, t.n, y)?;
             }
         }
         Ok(())

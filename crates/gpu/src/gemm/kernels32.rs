@@ -9,7 +9,7 @@
 //! `f32tile.rs`) or are written out here.
 
 use super::act32::quant32_group;
-use super::f32tile::{ByteRows, F32Rows, STAGE_FLOATS, STAGES, f32_tile_body};
+use super::f32tile::{ByteRows, F32Rows, STAGE_FLOATS, STAGES, bf16_mma_body, f32_tile_body};
 use super::gemm32::{
     B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, GEMM32_GROUP, GEMM32_RASTER_BYTES,
     GEMM32_THREADS_U32, IQ4_NL_BLOCK_BYTES, Q5_1_BLOCK_WORDS, Q8_0_BLOCK_BYTES, W32_ROW,
@@ -1172,6 +1172,90 @@ mod gemm32_kernels {
         // word), the other lengths are the contract's.
         unsafe {
             f32_tile_body(
+                ByteRows::<Fp8B128Bytes>::new(qs, e),
+                x,
+                rows,
+                k,
+                n,
+                &mut y,
+                sh,
+            )
+        };
+    }
+
+    /// Dense prompt product with BF16 operands and F32 accumulation.
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            rows >= 1,
+            n >= 1,
+            4 * qs.len() >= rows * k,
+            128 * e.len() >= rows * k,
+            x.len() >= n * k,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn mxfp8_mma_gemm(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        // SAFETY: the checked launch supplies 128 converged threads, the grid,
+        // aligned activations and the weight and output spans in the contract.
+        unsafe {
+            bf16_mma_body(
+                ByteRows::<Mxfp8Bytes>::new(qs, e),
+                x,
+                rows,
+                k,
+                n,
+                &mut y,
+                sh,
+            )
+        };
+    }
+
+    /// Dense prompt product with BF16 operands and F32 accumulation.
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            rows >= 1,
+            n >= 1,
+            4 * qs.len() >= rows * k,
+            128 * e.len() >= rows * k,
+            x.len() >= n * k,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn fp8_b128_mma_gemm(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        // SAFETY: the checked launch supplies 128 converged threads, the grid,
+        // aligned activations and the weight and output spans in the contract.
+        unsafe {
+            bf16_mma_body(
                 ByteRows::<Fp8B128Bytes>::new(qs, e),
                 x,
                 rows,

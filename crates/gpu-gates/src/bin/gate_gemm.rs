@@ -2359,6 +2359,14 @@ mod gate {
         };
         let mut ok = true;
 
+        if case_filter().as_deref() == Some("dense_mma") {
+            return if g32::run(&gpu, &dev.gk)? {
+                Ok(())
+            } else {
+                Err(checks_failed())
+            };
+        }
+
         // Qwen3: the model file of this profile.
         let qwen = open_model()?;
         let find_q = |name: &str| {
@@ -6465,6 +6473,61 @@ mod gate {
             Ok(all)
         }
 
+        /// Ragged dense MMA tiles, tails, repeatability and graph replay.
+        fn dense_mma_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("dense_mma") {
+                return Ok(true);
+            }
+            use gguf::quant::{bf16_bits_to_f32, fp32_to_bf16_bits};
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let mut ok = true;
+            for (rows, k, n) in [(1, 64, 1), (17, 128, 17), (33, 2560, 33), (100, 256, 65)] {
+                let wh = activations(k, rows, 9271 + rows as u32);
+                let bits: Vec<u16> = wh.into_iter().map(fp32_to_bf16_bits).collect();
+                let wf: Vec<Vec<f32>> = bits
+                    .chunks_exact(k)
+                    .map(|r| r.iter().copied().map(bf16_bits_to_f32).collect())
+                    .collect();
+                let words: Vec<u32> = bits
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| u32::from(p[0]) | (u32::from(p[1]) << 16))
+                    .collect();
+                let w = DeviceTensor::upload(stream, &words, rows, k / 2)?;
+                let xh = activations(k, n, 9281 + n as u32);
+                let x = DeviceBuffer::from_host(stream, &xh)?;
+                let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 64])?;
+                gpu.q8f32().enqueue_bf16_mma(stream, &w, &x, n, &mut y)?;
+                stream.synchronize()?;
+                let eager = y.to_host_vec(stream)?;
+                let tag = format!("bf16 rows={rows} K={k} n={n}");
+                let quality = bloomery_gpu_gates::rounding::check_mma(
+                    &tag,
+                    (&eager[..rows * n], &xh, k),
+                    &wf,
+                );
+                let tail = eager[rows * n..]
+                    .iter()
+                    .all(|v| v.to_bits() == SENT.to_bits());
+                let graph = gpu.capture(|s| gpu.q8f32().enqueue_bf16_mma(s, &w, &x, n, &mut y))?;
+                graph.launch(stream)?;
+                stream.synchronize()?;
+                let replay = y.to_host_vec(stream)?;
+                let same = eager
+                    .iter()
+                    .zip(&replay)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                println!(
+                    "dense_mma {tag} past_end_untouched={tail} eager_graph_bits={same} {}",
+                    verdict(tail && same)
+                );
+                ok &= quality && tail && same;
+            }
+            Ok(ok)
+        }
+
         /// Every 32-value case.
         pub(super) fn run(gpu: &Gpu, gk: &GemmKernels) -> Result<bool, GateError> {
             let dev = Dev {
@@ -6485,6 +6548,7 @@ mod gate {
             ok &= iq4nl_case(&dev)?;
             ok &= remap_case(&dev)?;
             ok &= f32tile_case(&dev)?;
+            ok &= dense_mma_case(&dev)?;
             ok &= refusals(&dev)?;
             println!("gemm32 wall_s={:.1}", t0.elapsed().as_secs_f64());
             Ok(ok)

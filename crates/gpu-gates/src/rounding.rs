@@ -78,6 +78,86 @@ pub fn q8_32_rel() -> f64 {
     CREST_MAX_32 / (127.0 * 12f64.sqrt())
 }
 
+/// BF16 operands against exact dequantized rows and the released Q8_0
+/// weight/activation representation. KL is over each column's output rows.
+pub fn check_mma(tag: &str, (y, x, k): (&[f32], &[f32], usize), w: &[Vec<f32>]) -> bool {
+    use crate::prompts::log_softmax;
+    use crate::verdict;
+    use gguf::quant::quantize_row_q8_0_roundtrip;
+
+    let rows = w.len();
+    let mut wq = vec![vec![0.0; k]; rows];
+    for (src, dst) in w.iter().zip(&mut wq) {
+        quantize_row_q8_0_roundtrip(src, dst);
+    }
+    let (act, _) = crate::gemm32::host_act(x, k, x.len() / k);
+    let xq: Vec<f32> = act
+        .codes
+        .iter()
+        .enumerate()
+        .map(|(i, &q)| f32::from(q) * act.d[i / 32])
+        .collect();
+    let q8_representable = wq.iter().flatten().chain(&xq).all(|v| v.is_finite());
+    let mut kl = 0.0f64;
+    let mut kl_q8 = 0.0f64;
+    let mut worst = 0.0f64;
+    let mut band = true;
+    let mut err2 = 0.0f64;
+    let mut qerr2 = 0.0f64;
+    for c in 0..x.len() / k {
+        let mut exact = Vec::with_capacity(rows);
+        let mut q8 = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let mut sum = 0.0f64;
+            let mut mag = 0.0f64;
+            let mut sq = 0.0f64;
+            for j in 0..k {
+                let term = f64::from(w[r][j]) * f64::from(x[c * k + j]);
+                sum += term;
+                mag += term.abs();
+                sq += f64::from(wq[r][j]) * f64::from(xq[c * k + j]);
+            }
+            // BF16 rounding in each operand, followed by F32 accumulation.
+            let u = 1.0 / 256.0;
+            let bound = (2.0 * u + u * u + gamma(k)) * mag;
+            let err = (f64::from(y[c * rows + r]) - sum).abs();
+            band &= err.is_finite() && err <= bound;
+            worst = worst.max(if bound > 0.0 { err / bound } else { err });
+            err2 += err * err;
+            qerr2 += (sq - sum).powi(2);
+            exact.push(sum as f32);
+            q8.push(sq as f32);
+        }
+        let p = log_softmax(&exact);
+        let q = log_softmax(&y[c * rows..][..rows]);
+        let q8 = if q8_representable {
+            log_softmax(&q8)
+        } else {
+            vec![0.0; rows]
+        };
+        for ((p, q), q8) in p.into_iter().zip(q).zip(q8) {
+            kl += p.exp() * (p - q);
+            if q8_representable {
+                kl_q8 += p.exp() * (p - q8);
+            }
+        }
+    }
+    let cols = x.len() / k;
+    kl = kl.max(0.0) / cols as f64;
+    kl_q8 = kl_q8.max(0.0) / cols as f64;
+    // A single dot's L2 error depends on cancellation; KL and the derived band decide acceptance.
+    let quality = kl.is_finite() && (!q8_representable || kl <= kl_q8 + 1e-12);
+    let pass = band && quality;
+    println!(
+        "dense_mma {tag} columns={cols} q8_representable={q8_representable} worst_err_over_band={worst:.6e} \
+         kl={kl:.6e} q8_kl={kl_q8:.6e} error_l2={:.6e} q8_error_l2={:.6e} {}",
+        err2.sqrt(),
+        qerr2.sqrt(),
+        verdict(pass)
+    );
+    pass
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

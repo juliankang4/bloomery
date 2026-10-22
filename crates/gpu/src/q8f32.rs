@@ -88,7 +88,10 @@
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
-use crate::gemm::{Bf16Rows, F32T_THREADS_U32, STAGE_FLOATS, STAGES, f32_tile_body, tile_launch};
+use crate::gemm::{
+    Bf16Rows, F32T_THREADS_U32, MMA_THREADS, STAGE_FLOATS, STAGES, bf16_mma_body, f32_tile_body,
+    tile_launch,
+};
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -1772,6 +1775,36 @@ mod q8f32_kernels {
         unsafe { f32_tile_body(Bf16Rows(w), x, rows, k, n, &mut y, sh) };
     }
 
+    /// Dense prompt product with BF16 operands and F32 accumulation.
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            rows >= 1,
+            n >= 1,
+            2 * w.len() >= rows * k,
+            x.len() >= n * k,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn bf16_mma_gemm(
+        w: &[u32],
+        x: &[f32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        // SAFETY: the checked launch supplies 128 converged threads, the grid,
+        // aligned activations and the weight and output spans in the contract.
+        unsafe { bf16_mma_body(Bf16Rows(w), x, rows, k, n, &mut y, sh) };
+    }
+
     /// Q8_0 gemv against one f32 activation column, `y[r] = Σ_k' w[r, k'] ·
     /// x[k']`, the decode shape: `f32_gemv`'s skeleton, weights decoded per
     /// the module doc's device layout, each lane's share of the row walked by
@@ -2620,6 +2653,30 @@ impl Q8F32Kernels {
                 .prepare_bf16_tile_gemm(LaunchConfig1D::new(t.grid, F32T_THREADS_U32, 0))?;
         self.module
             .bf16_tile_gemm(stream, &prep, w.buf(), x, t.rows, t.k, t.n, y)?;
+        Ok(())
+    }
+
+    /// Dense BF16 prompt product with BF16 activations and F32 accumulation.
+    /// The weight stays in its stored BF16 words.
+    pub fn enqueue_bf16_mma(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "Q8F32Kernels::enqueue_bf16_mma";
+        let k = w
+            .cols()
+            .checked_mul(2)
+            .ok_or_else(|| GpuError::shape(what, "BF16 words to values overflows"))?;
+        let t = tile_launch(what, w.rows(), k, x, n, y)?;
+        let prep =
+            self.module
+                .prepare_bf16_mma_gemm(LaunchConfig1D::new(t.grid, MMA_THREADS, 0))?;
+        self.module
+            .bf16_mma_gemm(stream, &prep, w.buf(), x, t.rows, t.k, t.n, y)?;
         Ok(())
     }
 

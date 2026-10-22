@@ -41,6 +41,9 @@
 //!   only), MXFP8 and FP8_B128 the same tile over their planes
 //!   (`mxfp8_tile_gemm`, `fp8_b128_tile_gemm`, the values decoded as they
 //!   are staged), BF16 the same tile over widened words (`bf16_tile_gemm`).
+//!   On GB10, BF16 and the E4M3 formats instead use BF16 tensor-core operands
+//!   with F32 accumulation (`bf16_mma_gemm`, `mxfp8_mma_gemm`, `fp8_b128_mma_gemm`);
+//!   values outside normal BF16 range keep F32 terms within that kernel.
 //!   A site's weight is the resident tensor of its name, rows of it (a part
 //!   of a weight joined at load), or, for a K-quant, the words a caller
 //!   holds ([`SiteWeight`]). NVFP4 has no wide GEMM and is refused here by
@@ -1156,7 +1159,13 @@ pub fn gemm(
                     },
                 ),
                 Planes::F32(t) => g32()?.enqueue_f32_tile(stream, t, f32_rows()?, m, y),
+                Planes::E4m3(t) if gpu.dense_mma => {
+                    g32()?.enqueue_e4m3_mma(stream, t, f32_rows()?, m, y)
+                }
                 Planes::E4m3(t) => g32()?.enqueue_e4m3_tile(stream, t, f32_rows()?, m, y),
+                Planes::Bf16(t) if gpu.dense_mma => {
+                    gpu.q8f32().enqueue_bf16_mma(stream, t, f32_rows()?, m, y)
+                }
                 Planes::Bf16(t) => gpu.q8f32().enqueue_bf16_tile(stream, t, f32_rows()?, m, y),
             })
         }

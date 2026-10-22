@@ -116,6 +116,7 @@ mod gate {
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
+    use bloomery_gpu_gates::rounding::check_mma;
     use bloomery_gpu_gates::{GateError, GateRng, checks_failed, verdict, write_gguf};
     use cuda_core::DeviceBuffer;
     use gguf::Split;
@@ -625,6 +626,7 @@ mod gate {
                 },
             );
             let tile = g32.enqueue_e4m3_tile(gpu.stream(), w, &x, 1, &mut y);
+            let mma = g32.enqueue_e4m3_mma(gpu.stream(), w, &x, 1, &mut y);
             let routed = gpu.q8f32().enqueue_e4m3_gemv_sel_f32(
                 gpu.stream(),
                 w,
@@ -638,7 +640,7 @@ mod gate {
                 gpu.unlabelled_sink(),
                 &mut y,
             );
-            let errors = [gemv, tile, routed].map(|r| match r {
+            let errors = [gemv, tile, mma, routed].map(|r| match r {
                 Ok(()) => "launched".to_owned(),
                 Err(e) => e.to_string(),
             });
@@ -663,11 +665,13 @@ mod gate {
             scales,
         };
         let tile = g32.enqueue_e4m3_tile(gpu.stream(), w, &x, (1 << 61) + 1, &mut y);
-        let pass = tile
-            .as_ref()
-            .is_err_and(|e| e.to_string().contains("overflows"));
+        let mma = g32.enqueue_e4m3_mma(gpu.stream(), w, &x, (1 << 61) + 1, &mut y);
+        let pass = [&tile, &mma].iter().all(|r| {
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("overflows"))
+        });
         println!(
-            "{tag} clause=plane-shape case=column-overflow tile={tile:?} {}",
+            "{tag} clause=plane-shape case=column-overflow tile={tile:?} mma={mma:?} {}",
             verdict(pass)
         );
         Ok(ok && pass)
@@ -880,6 +884,21 @@ mod gate {
                 let src = (ty, &w, SiteWeight::Resident(&name));
                 let table = (route, GemmInput::PerSlot);
                 site::gemm(gpu, &k32, src, rows, &x_in, table, m, &mut y_dev)?;
+                if gpu.context().compute_capability()? == (12, 1) {
+                    stream.synchronize()?;
+                    let mma = y_dev.to_host_vec(stream)?;
+                    ok &= check_mma(&name, (&mma, &x, k), &wf);
+                    // PIN(2026-10-22): GB10 BF16 operand rounding replaces the site's F32 bit
+                    // contract with the band/KL check above; the exact tile's output replaces
+                    // the site's here, so the bit checks below hold for the exact tile only.
+                    g32.enqueue_e4m3_tile(
+                        stream,
+                        w.e4m3("gate_mxfp8", &name)?,
+                        &x_dev,
+                        m,
+                        &mut y_dev,
+                    )?;
+                }
             } else {
                 site::gemv(gpu, g32, (ty, &w, &name), &x_dev, m, &mut y_dev)?;
             }

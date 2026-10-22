@@ -18,6 +18,7 @@ generate_ds41   argmax_rows_fault                        0           0
 generate_ds41   argmax_rows_finite_fault                 0           0
 generate_ds41   bf16_gemv                                0           0
 generate_ds41   bf16_gemv_ids                            0           0
+generate_ds41   bf16_mma_gemm                            0           0
 generate_ds41   bf16_tile_gemm                           0           0
 generate_ds41   cand_block_max                           0           0
 generate_ds41   cand_compact                             0           0
@@ -124,6 +125,7 @@ generate_ds41   flash_merge_q8                           0           0
 generate_ds41   fp8_b128_gemv                            0           0
 generate_ds41   fp8_b128_gemv_mcol                       0           0
 generate_ds41   fp8_b128_gemv_sel_f32                    0           0
+generate_ds41   fp8_b128_mma_gemm                        0           0
 generate_ds41   fp8_b128_tile_gemm                       0           0
 generate_ds41   gap_coop                                 0           0
 generate_ds41   gap_coop_sync                            0           0
@@ -244,6 +246,7 @@ generate_ds41   mxfp4_gemv_sel                           0           0
 generate_ds41   mxfp8_gemv                               0           0
 generate_ds41   mxfp8_gemv_ids                           0           0
 generate_ds41   mxfp8_gemv_mcol                          0           0
+generate_ds41   mxfp8_mma_gemm                           0           0
 generate_ds41   mxfp8_tile_gemm                          0           0
 generate_ds41   neox_append_k192                         0           0
 generate_ds41   neox_append_k192_ring                    0           0
