@@ -289,6 +289,11 @@ fn alone(prompt: &str, n: usize) -> Value {
     post(addr, "/completion", &completion(prompt, n)).json()["tokens"].clone()
 }
 
+/// The ids a request holds reach its streaming client before the engine runs
+/// another request's prompt call: with A decoding and B and C queued behind
+/// it, A's stream carries two ids before B's first prompt call, and B's
+/// stream its first id before the call of C's prompt that follows B's last,
+/// for a B prompt of one call (with and without a quantum) and of five.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_a_decode_answer_reaches_the_client_before_a_new_prompt_starts() {
@@ -674,6 +679,11 @@ fn document() -> Value {
             "json_schema": {"name": "r", "schema": schema}}})
 }
 
+/// A run of fixed ids reaches its streaming client before another request's
+/// fill finishes: beside a decoding stream, of two streams of [`document`],
+/// the first carries its 24-byte property name while the second's last fill
+/// call is held, with and without a quantum, and with a third property after
+/// that name or none; both streams give the same valid document.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_a_schema_fill_reaches_the_client_before_the_next_fill_finishes() {
