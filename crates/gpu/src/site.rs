@@ -364,7 +364,7 @@ pub fn resident_site(
 /// arms, the gemv over `m` columns ([`resident_gemv_cols`]) and the wide
 /// GEMM ([`resident_gemm`]): those whose launch reads the f32 rows or the q8
 /// blocks of 32 ([`SiteTy::reads`]; a unit test holds the list to it).
-pub const BY_NAME: [SiteTy; 5] = [
+pub(crate) const BY_NAME: [SiteTy; 5] = [
     SiteTy::Q8_0,
     SiteTy::F32,
     SiteTy::Mxfp8,
@@ -519,7 +519,11 @@ pub fn resident_sel_f32(
 /// The site type of the resident weight `name` ([`SiteTy::of_resident`]): a
 /// missing weight, or a form no site launch reads, is refused by name as
 /// `what`'s.
-pub fn resident_type(w: &Weights, what: &'static str, name: &str) -> Result<SiteTy, GpuError> {
+pub(crate) fn resident_type(
+    w: &Weights,
+    what: &'static str,
+    name: &str,
+) -> Result<SiteTy, GpuError> {
     resident_ty(what, (None, w.resident(what, name)?, name))
 }
 
@@ -1017,7 +1021,7 @@ impl WideActs {
     }
 
     /// The forms as views.
-    pub fn views_mut(&mut self) -> WideActsMut<'_> {
+    pub(crate) fn views_mut(&mut self) -> WideActsMut<'_> {
         WideActsMut {
             q128: self.q128.as_mut(),
             q32: self.q32.as_mut(),
@@ -1047,7 +1051,7 @@ impl WideActs {
 /// One wide input's quantized forms as views: those of a [`WideActs`], or of
 /// an arena that holds them as plain buffers, so one launch sequence runs over
 /// either.
-pub struct WideActsMut<'a> {
+pub(crate) struct WideActsMut<'a> {
     pub q128: Option<&'a mut GemmAct>,
     pub q32: Option<&'a mut GemmAct32>,
 }

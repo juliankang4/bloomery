@@ -210,7 +210,7 @@ TYPE_PLACES = {
     "qwen38": (("crates/model/src/arch/qwen35moe/place.rs", "pub fn card_routed(ty: GgmlType)"),
                ("crates/placement/src/accepts.rs", "pub const fn qwen38_gate_up(ty: GgmlType)"),
                ("crates/placement/src/accepts.rs", "pub const fn qwen38_down(ty: GgmlType)"),
-               ("crates/gpu/src/site.rs", "pub const BY_NAME: [SiteTy;"),
+               ("crates/gpu/src/site.rs", "pub(crate) const BY_NAME: [SiteTy;"),
                ("crates/gpu/src/hc_gated.rs", "pub fn of_weight(dw: &'a DevWeight) -> Option<Self>"),
                ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
     "qwen3": (("crates/gpu/src/arch/qwen3moe/body.rs", "g.q_ty = dense_site(w, &g.attn_q, q, h)?;"),
