@@ -425,7 +425,10 @@ gguf 7 2 0
 # PIN(2026-10-22): gpu 2121 -> 2127 blocks, 247 -> 249 fns: the one-column BF16 HC entry and its shared
 # stage/mix helper add three calls and one fn; the shared byte-row ID helper and MXFP8 entry add three
 # calls and one fn. Each call keeps its buffer-bound and single-writer SAFETY contract.
-gpu 2127 249 10
+# PIN(2026-10-22): gpu 2127 -> 2150 blocks, 249 -> 251 fns, new code, not old code relaxed:
+# dense MMA staging, shared reads, calls and stores, three checked kernel entries, and block-wide replay votes.
+# The exact tile owner takes explicit coordinates for exceptional MMA replay; each block has its SAFETY invariant.
+gpu 2150 251 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
