@@ -2201,13 +2201,26 @@ mod tests {
             (&inputs, placement::Device::Host),
             (&source, placement::Device::Nvme),
         ] {
-            let plan = input
-                .plan_with(&machine, 4096, &levers, super::Experts::Card)
-                .unwrap();
-            assert_eq!(plan.row_tier().unwrap(), Some(tier));
-            if tier == placement::Device::Nvme {
-                assert_eq!(plan.host.table_bytes, 0);
-                assert!(plan.host.row_reserve_bytes > 0);
+            for plan in [
+                input.plan_with(&machine, 4096, &levers, super::Experts::Card),
+                input.plan_nodes(&machine, 4096, &levers, &[8]),
+                input.plan_with_slots(&machine, 4096, &levers, super::Experts::Card, 2),
+            ] {
+                let plan = plan.unwrap();
+                assert_eq!(plan.row_tier().unwrap(), Some(tier));
+                if tier == placement::Device::Nvme {
+                    assert_eq!(plan.host.table_bytes, 0);
+                    assert_eq!(
+                        plan.host.row_reserve_bytes,
+                        placement::row_room(
+                            &input.model,
+                            super::UBATCH_PLANNED,
+                            os::page_bytes().unwrap(),
+                            input.row_source,
+                        )
+                        .unwrap()
+                    );
+                }
             }
         }
         let _ = std::fs::remove_file(&path);
