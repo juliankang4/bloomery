@@ -18,7 +18,7 @@
 //! copies are in flight between the open and the seal or abandon, and its
 //! slot is the open take's alone until then.
 //!
-//! A slot is made (pinned and zeroed) the first time a checkpoint needs it,
+//! The sequence's budgeted slots are pinned and zeroed at construction,
 //! and kept for the load. Each slot records the position its last finished
 //! copy holds, apart from the ledger: a restore reads a slot only as that
 //! position ([`seqstate::restorable`]), so no ledger point can hand back a
@@ -159,10 +159,20 @@ impl Checkpoints {
         every: u32,
     ) -> Result<Checkpoints, GpuError> {
         let cap = seqstate::capacity(budget, point_bytes(&lens)).map_err(refused)?;
+        let ledger = Ledger::new(cap, every).map_err(refused)?;
+        let slots = (0..cap)
+            .map(|_| {
+                let bufs = lens
+                    .iter()
+                    .map(|&n| PinnedHostBuffer::<f32>::zeroed(ctx, n))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Slot { bufs, holds: None })
+            })
+            .collect::<Result<Vec<_>, GpuError>>()?;
         Ok(Checkpoints {
-            ledger: Ledger::new(cap, every).map_err(refused)?,
+            ledger,
             lens,
-            slots: Vec::new(),
+            slots,
             points: Vec::new(),
             open: 0,
             every,
@@ -300,8 +310,7 @@ impl Checkpoints {
         self.apply(stream, stores)?;
         self.check(stores)?;
         let take = self.ledger.take(at).map_err(refused)?;
-        if let Take::Copy { slot, new, evicted } = take {
-            self.make_slot(slot, new)?;
+        if let Take::Copy { slot, evicted, .. } = take {
             self.took(at, slot, evicted);
             if let Err(e) = self.copy_into(stream, slot, at, stores) {
                 // The slot holds part of a copy: no point may name it.
@@ -310,27 +319,6 @@ impl Checkpoints {
             }
         }
         Ok(take)
-    }
-
-    /// Slot `slot` made (pinned and zeroed) when the ledger names it `new`:
-    /// next to the made ones.
-    fn make_slot(&mut self, slot: usize, new: bool) -> Result<(), GpuError> {
-        if !new {
-            return Ok(());
-        }
-        if slot != self.slots.len() {
-            return Err(GpuError::State {
-                what: WHAT,
-                missing: "the ledger's new slot next to the made ones",
-            });
-        }
-        let bufs = self
-            .lens
-            .iter()
-            .map(|&n| PinnedHostBuffer::<f32>::zeroed(&self.ctx, n))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.slots.push(Slot { bufs, holds: None });
-        Ok(())
     }
 
     /// A take of the mark `at` opened ahead of the stores reaching it, after
@@ -347,14 +335,9 @@ impl Checkpoints {
         self.unread("an open take")?;
         self.apply(stream, stores)?;
         self.check(stores)?;
-        let Take::Copy { slot, new, evicted } = self.ledger.take(at).map_err(refused)? else {
+        let Take::Copy { slot, evicted, .. } = self.ledger.take(at).map_err(refused)? else {
             return Ok(None);
         };
-        if let Err(e) = self.make_slot(slot, new) {
-            // The point names a slot that was not made: no point may name it.
-            self.clear();
-            return Err(e);
-        }
         self.took(at, slot, evicted);
         self.slots[slot].holds = None;
         self.open += 1;
@@ -609,34 +592,12 @@ impl Checkpoints {
         self.unread("an adopt")?;
         self.fits(src.len())?;
         let take = self.ledger.take(at).map_err(refused)?;
-        let Take::Copy { slot, new, evicted } = take else {
+        let Take::Copy { slot, evicted, .. } = take else {
             return Err(GpuError::Shape {
                 what: WHAT,
                 detail: format!("a point adopted at {at}, where the ledger takes {take:?}"),
             });
         };
-        if new {
-            if slot != self.slots.len() {
-                self.clear();
-                return Err(GpuError::State {
-                    what: WHAT,
-                    missing: "the ledger's new slot next to the made ones",
-                });
-            }
-            let bufs = match self
-                .lens
-                .iter()
-                .map(|&n| PinnedHostBuffer::<f32>::zeroed(&self.ctx, n))
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    self.clear();
-                    return Err(e.into());
-                }
-            };
-            self.slots.push(Slot { bufs, holds: None });
-        }
         self.took(at, slot, evicted);
         let Some(dst) = self.slots.get_mut(slot) else {
             self.clear();
@@ -867,6 +828,8 @@ mod tests {
         for (positions, points) in [(512usize, 2usize), (4_096, 9)] {
             let c = Checkpoints::sequence(&ctx, lens.clone(), positions, 512).expect("checkpoints");
             assert_eq!(c.capacity(), points, "{positions} positions");
+            assert_eq!(c.slots(), points, "all slots pinned before a take");
+            assert!(c.slots.iter().all(|s| s.holds.is_none()));
             assert_eq!(c.bytes(), point_bytes(&lens));
             let planned = budget(price(&lens, 512), positions as u64).expect("a budget");
             assert_eq!(planned, points as u64 * c.bytes(), "{positions} positions");
@@ -885,15 +848,14 @@ mod tests {
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_restore_refuses_a_slot_no_copy_filled() {
         let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
-        let mut c = Checkpoints::new(&ctx, vec![4, 3], 1 << 20, 512).expect("checkpoints");
+        let mut c = Checkpoints::sequence(&ctx, vec![4, 3], 512, 512).expect("checkpoints");
         let mut a = DeviceBuffer::from_host(&stream, &[1.0f32; 4]).expect("a store");
         let mut b = DeviceBuffer::from_host(&stream, &[2.0f32; 3]).expect("a store");
         let take = c
             .take(&stream, 5, &mut [&mut a, &mut b])
             .expect("a take at 5");
         assert!(matches!(take, Take::Copy { slot: 0, .. }), "{take:?}");
-        // The plant: the ledger names a new slot at 9, the slot is made as a
-        // take makes it, and no copy runs.
+        // The ledger names a new slot at 9, but no copy runs.
         let planted = c.ledger.take(9).expect("the ledger's point at 9");
         assert!(
             matches!(
@@ -906,13 +868,7 @@ mod tests {
             ),
             "{planted:?}"
         );
-        let bufs = c
-            .lens
-            .iter()
-            .map(|&n| PinnedHostBuffer::<f32>::zeroed(&ctx, n))
-            .collect::<Result<Vec<_>, _>>()
-            .expect("the slot's buffers");
-        c.slots.push(Slot { bufs, holds: None });
+        assert!(c.slots[1].holds.is_none());
         c.cut(9, 10).expect("a cut to the planted point");
         let err = c
             .apply(&stream, &mut [&mut a, &mut b])
@@ -945,7 +901,7 @@ mod tests {
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_open_copy_seal_and_abandon() {
         let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
-        let mut c = Checkpoints::new(&ctx, vec![4, 3], 1 << 20, 512).expect("checkpoints");
+        let mut c = Checkpoints::sequence(&ctx, vec![4, 3], 512, 512).expect("checkpoints");
         let mut a = DeviceBuffer::from_host(&stream, &[1.0f32; 4]).expect("a store");
         let mut b = DeviceBuffer::from_host(&stream, &[2.0f32; 3]).expect("a store");
         let p = c
