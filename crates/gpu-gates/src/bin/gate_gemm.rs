@@ -6868,6 +6868,34 @@ mod gate {
             let gpu = dev.gpu;
             let stream = gpu.stream();
             let mut ok = true;
+            // Each input 4 bytes past a 16-byte boundary: refused by name before the launch.
+            let parent = DeviceBuffer::from_host(stream, &[1.0f32; 65])?;
+            let whole = bloomery_gpu::Window::<f32>::of(&parent, 0, 64)?;
+            let off = bloomery_gpu::Window::<f32>::of(&parent, 4, 64)?;
+            for (name, g, u) in [("g", &off, &whole), ("u", &whole, &off)] {
+                let mut act = GemmAct32::new_routed(stream, 1, 64)?;
+                let got = dev.g32.enqueue_swiglu_quant32(
+                    stream,
+                    g,
+                    u,
+                    1,
+                    &mut act,
+                    gpu.unlabelled_sink(),
+                );
+                let refused = matches!(
+                    &got,
+                    Err(bloomery_gpu::GpuError::Shape { what, detail })
+                        if *what == "NVFP4 activation"
+                            && detail.starts_with(&format!("{name} at "))
+                            && detail.contains("is not 16-byte aligned")
+                );
+                let pass = refused && gpu.take_fault()?.is_none();
+                println!(
+                    "gemm32 case=nvfp4_native misaligned={name} refused={refused} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
             for (rows, slots, k, input) in [
                 (16usize, 14usize, 128usize, Native::Pattern),
                 (128, 73, 64, Native::Pattern),

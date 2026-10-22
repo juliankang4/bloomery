@@ -702,6 +702,16 @@ impl Kernels {
         fault: crate::fault::FaultSink,
     ) -> Result<(), GpuError> {
         let (code, limit) = rule.code("NVFP4 activation")?;
+        crate::tensor::check_alignment::<cuda_device::vector::F32x4, _>(
+            "NVFP4 activation",
+            "g",
+            g,
+        )?;
+        crate::tensor::check_alignment::<cuda_device::vector::F32x4, _>(
+            "NVFP4 activation",
+            "u",
+            u,
+        )?;
         let k = act.k as u32;
         let shared = ((act.k.min(ACT_CACHE_VALUES) + 2) * 4) as u32;
         let out = act
