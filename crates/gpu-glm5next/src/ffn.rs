@@ -131,6 +131,7 @@ pub(crate) struct CardExperts {
     batch: FfnBatchKernels,
     /// Per layer of the description, `None` without card experts.
     layers: Vec<Option<CardLayer>>,
+    keep_host: bool,
     /// The down forms of the card layers whose stacks are not
     /// [`card_tiles_run`]'s: a prompt batch runs those on the card leg, whose
     /// buffers [`CardTiles`] then holds in these forms.
@@ -186,7 +187,7 @@ impl CardExperts {
         map: &SlotMap,
         n_embd: usize,
         ff: usize,
-        rows: usize,
+        (rows, keep_host): (usize, bool),
     ) -> Result<CardExperts, GpuError> {
         let mut per = Vec::with_capacity(layers.len());
         let (mut downs, mut prompt_leg) = (DownForms::NONE, DownForms::NONE);
@@ -237,6 +238,7 @@ impl CardExperts {
             tiles: KquantTileKernels::load(gpu.context(), gpu.fault_word())?,
             batch: FfnBatchKernels::load(gpu.context())?,
             layers: per,
+            keep_host,
             prompt_leg,
             ff,
             rows: (0..rows)
@@ -286,6 +288,7 @@ impl CardExperts {
             tiles: KquantTileKernels::load(gpu.context(), gpu.fault_word())?,
             batch: FfnBatchKernels::load(gpu.context())?,
             layers: per,
+            keep_host: false,
             prompt_leg: DownForms::NONE,
             ff,
             rows: vec![CardRow::new(stream, n_embd, ff, downs)?],
@@ -296,6 +299,11 @@ impl CardExperts {
     /// Layer `l` computes experts on the card.
     pub(crate) fn has(&self, l: usize) -> bool {
         self.layer(l).is_some()
+    }
+
+    /// A fully resident layer needs no host view unless residency can move its experts.
+    pub(crate) fn hostless(&self, l: usize) -> bool {
+        !self.keep_host && self.n_card(l) == N_EXPERT
     }
 
     /// The experts of layer `l` the expert tier holds: 0 without a tier.
@@ -540,6 +548,20 @@ pub(crate) fn front(
         p.k.ffn
             .enqueue_handoff_tier(stream, &h, places, targets, fault, (&mut s.sel, tsel))?;
         return hybrid.enqueue_tier_go(stream, l, p.row);
+    }
+    if p.card.hostless(l) {
+        return p.card.batch.enqueue_places(
+            stream,
+            &Places {
+                ids: h.ids,
+                n: N_USED,
+                map: h.map,
+                row_off: h.row_off,
+                n_expert: N_EXPERT,
+            },
+            fault,
+            &mut s.sel,
+        );
     }
     let target = hybrid.boundary_mut().handoff_target_of(p.row)?;
     p.k.ffn
@@ -1027,6 +1049,12 @@ pub(crate) fn back(
     }
     let n = p.d.embd;
     let s = &mut *p.s;
+    if p.card.hostless(l) {
+        return s
+            .out
+            .copy_from_device_async(&card_row(&p.card.rows, p.row)?.pre, gpu.stream())
+            .map_err(Into::into);
+    }
     let shadowed = if p.card.has(l) {
         &card_row(&p.card.rows, p.row)?.pre
     } else {

@@ -1876,7 +1876,7 @@ impl<H: HostExperts> HostTier<H> {
     /// refuses a trace, which the service writes, and
     /// [`HostTier::start_swap`] a residency machine, which moves card experts
     /// to the service. Load-time only.
-    pub(crate) fn mark_unserved(&mut self, l: usize) {
+    pub fn mark_unserved(&mut self, l: usize) {
         self.unserved.get_or_insert(l);
     }
 

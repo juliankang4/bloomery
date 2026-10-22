@@ -351,6 +351,9 @@
 //! model unusable does not end the gate before H5's one-slot case and the
 //! stagger.
 //!
+//! `--only hostless` opens a fixture with nonzero NVFP4 routed stacks fully on the card,
+//! checks that it holds no host views, compares eager, graph and batch generation, and
+//! compares its logits with a load for a route trace, which keeps the host leg.
 //! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
 //! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
 //! at [`CTX`] of one lane, `--only verify` (s) and (v) alone on a load at
@@ -508,7 +511,7 @@ mod gate {
     use gguf::{GgmlType, Split};
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{KdaLanes, NextnInputs, NextnPlan, PlanInputs};
-    use model::placement::{Machine, Plan};
+    use model::placement::{Machine, Plan, PlanLevers};
     use refset::arch::glm5next::fixture as fx;
     use refset::arch::glm5next::{BATCH, D1K, D3K_DSA, IK, IK_DSA, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
@@ -831,28 +834,37 @@ mod gate {
             verdict(card_ok)
         );
         ok &= card_ok;
-        let (decode, memops) = (shape.nodes_decode(), shape.memops());
+        // PIN(2026-10-22): a hostless layer omits go/wait and copies its card sum instead of adding a host sum.
+        let hostless = (0..kinds.len())
+            .filter(|&l| planned(l) == o.experts)
+            .count();
+        let (decode, memops) = (
+            shape.nodes_decode() - 2 * hostless,
+            shape.memops() - 2 * hostless,
+        );
         // The blocks' plans from the header, and the loaded body's: the launches a K-quant block
         // adds are the plan's, and both sides count them.
         let header_blocks = trunk_blocks(&glm5next_tier::open()?)?;
         let block_extra: usize = header_blocks.iter().map(|b| b.extra_launches()).sum();
         let want = decode + block_extra + CARD_NODES * card_layers.len();
         let blocks_ok = header_blocks == body.blocks();
-        let counted = step_launches(&mixers, &ffns, &cards, &body.blocks());
+        let counted = step_launches(&mixers, &ffns, &cards, &body.blocks()) - 2 * hostless;
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
-        let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
+        let copy = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY;
+        let ([k, b, c], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop, copy]);
         let pass = blocks_ok
             && nodes == want
             && counted == want
             && b == memops
-            && k == want - memops
+            && k == want - memops - hostless
+            && c == hostless
             && other == 0;
         println!(
             "structure decode graph_nodes={nodes} (want {want} = {decode} + {block_extra} block \
              launches + {CARD_NODES} x {} card layers; the program counts {counted}; the header's \
              block plans are the body's {blocks_ok}) kernel={k} batch_mem_op={b} (want {memops}) \
-             other={other} {}",
+             memcpy={c} (want {hostless}) other={other} {}",
             card_layers.len(),
             verdict(pass)
         );
@@ -5124,6 +5136,8 @@ mod gate {
         /// (sm) alone, on a load at [`CTX`] on the batch feed: the serve seat's media call on our
         /// tower's rows against the body's own (the `vision` feature).
         MediaSeat,
+        /// Fully resident NVFP4 routed stacks, without host views.
+        Hostless,
     }
 
     impl Only {
@@ -5190,11 +5204,12 @@ mod gate {
 
     /// `--only main`, `--only pp`, `--only pplong`, `--only verify`, `--only
     /// keep`, `--only slots`, `--only stagger`, `--only stagger-draft`,
-    /// `--only media`, `--only media-seat`, or every clause.
+    /// `--only media`, `--only media-seat`, `--only hostless`, or every clause.
     fn only() -> Result<Only, GateError> {
         match word_after("--only") {
             None => Ok(Only::All),
             Some(w) => match w.as_deref() {
+                Some("hostless") => Ok(Only::Hostless),
                 Some("main") => Ok(Only::Main),
                 Some("pp") => Ok(Only::Pp),
                 Some("pplong") => Ok(Only::PpLong),
@@ -5207,21 +5222,300 @@ mod gate {
                 Some("media-seat") => Ok(Only::MediaSeat),
                 other => Err(format!(
                     "--only is main, pp, pplong, verify, keep, slots, stagger, stagger-draft, \
-                     media or media-seat, not {other:?}"
+                     media, media-seat or hostless, not {other:?}"
                 )
                 .into()),
             },
         }
     }
 
+    /// A synthetic one-layer KDA trunk whose routed stacks are `routed` blocks,
+    /// every expert on the card.
+    fn hostless_fixture(routed: GgmlType) -> Result<PathBuf, GateError> {
+        use gguf::Value;
+        let mut kvs = vec![
+            (
+                gguf::GENERAL_ARCHITECTURE.into(),
+                Value::String("glm5next".into()),
+            ),
+            ("tokenizer.ggml.pre".into(), Value::String("glm4".into())),
+        ];
+        for (key, value) in [
+            ("block_count", 1),
+            ("nextn_predict_layers", 0),
+            ("embedding_length", 256),
+            ("vocab_size", 32),
+            ("context_length", 1024),
+            ("feed_forward_length", 256),
+            ("leading_dense_block_count", 0),
+            ("attention.head_count", 2),
+            ("attention.q_lora_rank", 128),
+            ("attention.kv_lora_rank", 512),
+            ("attention.key_length", 512),
+            ("attention.value_length", 512),
+            ("attention.key_length_mla", 128),
+            ("attention.value_length_mla", 128),
+            ("rope.dimension_count", 0),
+            ("ssm.conv_kernel", 4),
+            ("kda.head_dim", 128),
+            ("attention.indexer.head_count", 32),
+            ("attention.indexer.key_length", 128),
+            ("attention.indexer.top_k", 16),
+            ("attention.indexer.kpool", 4),
+            ("hyper_connection.count", 4),
+            ("hyper_connection.sinkhorn_iterations", 20),
+            ("expert_count", 288),
+            ("expert_used_count", 8),
+            ("expert_group_count", 1),
+            ("expert_group_used_count", 1),
+            ("expert_gating_func", 2),
+            ("expert_feed_forward_length", 256),
+            ("expert_shared_feed_forward_length", 256),
+            ("expert_shared_count", 1),
+        ] {
+            kvs.push((format!("glm5next.{key}"), Value::U32(value)));
+        }
+        kvs.push((
+            "glm5next.attention.head_count_kv".into(),
+            Value::Array(vec![Value::I32(0)]),
+        ));
+        kvs.push(("glm5next.expert_weights_norm".into(), Value::Bool(true)));
+        for (key, value) in [
+            ("attention.layer_norm_rms_epsilon", 1e-5),
+            ("attention.layer_norm_epsilon", 1e-6),
+            ("kda.gate_lower_bound", -5.0),
+            ("hyper_connection.epsilon", 1e-6),
+            ("expert_weights_scale", 2.5),
+            ("swiglu_clamp_exp", 10.0),
+            ("swiglu_clamp_shexp", 10.0),
+        ] {
+            kvs.push((format!("glm5next.{key}"), Value::F32(value)));
+        }
+        let mut decls = Vec::new();
+        let mut add =
+            |name: String, dims: Vec<u64>, ty: GgmlType, value: f32| -> Result<(), GateError> {
+                let (_, block, size) =
+                    gguf::ggml_type_info(ty.as_u32()).ok_or("hostless: no type info")?;
+                let len = usize::try_from(
+                    gguf::tensor_bytes(block, size, &dims)
+                        .ok_or("hostless: tensor size overflow")?,
+                )?;
+                // A nonzero quantized tensor holds finite blocks: Q8_0 with a small scale
+                // and varied quants, NVFP4 with one finite scale and value byte throughout.
+                let bytes = match ty {
+                    GgmlType::F32 => (0..len / 4).flat_map(|_| value.to_le_bytes()).collect(),
+                    _ if value == 0.0 => vec![0; len],
+                    GgmlType::Q8_0 => (0..len / 34)
+                        .flat_map(|b| {
+                            let mut blk = [0u8; 34];
+                            blk[..2].copy_from_slice(&0x2400u16.to_le_bytes());
+                            for (k, q) in blk[2..].iter_mut().enumerate() {
+                                *q = ((((b * 31 + k * 7) % 61) as i8) - 30) as u8;
+                            }
+                            blk
+                        })
+                        .collect(),
+                    _ => vec![0x22; len],
+                };
+                decls.push((name, dims, ty, bytes));
+                Ok(())
+            };
+        for (name, dims) in [
+            ("blk.0.attn_q.weight", vec![256, 256]),
+            ("blk.0.attn_k.weight", vec![256, 256]),
+            ("blk.0.attn_v.weight", vec![256, 256]),
+            ("blk.0.attn_output.weight", vec![256, 256]),
+            ("blk.0.ssm_f_a.weight", vec![256, 128]),
+            ("blk.0.ssm_g_a.weight", vec![256, 128]),
+            ("blk.0.ssm_f_b.weight", vec![128, 256]),
+            ("blk.0.ssm_g_b.weight", vec![128, 256]),
+            ("blk.0.ffn_gate_shexp.weight", vec![256, 256]),
+            ("blk.0.ffn_up_shexp.weight", vec![256, 256]),
+            ("blk.0.ffn_down_shexp.weight", vec![256, 256]),
+            ("blk.0.ssm_beta.weight", vec![256, 2]),
+            ("blk.0.hc_attn_fn.weight", vec![1024, 24]),
+            ("blk.0.hc_ffn_fn.weight", vec![1024, 24]),
+        ] {
+            add(name.into(), dims, GgmlType::Q8_0, 0.0)?;
+        }
+        for name in ["token_embd.weight", "output.weight"] {
+            add(name.into(), vec![256, 32], GgmlType::Q8_0, 1.0)?;
+        }
+        for (name, dims, value) in [
+            ("output_norm.weight", vec![256], 1.0),
+            ("blk.0.attn_norm.weight", vec![256], 1.0),
+            ("blk.0.ffn_norm.weight", vec![256], 1.0),
+            ("blk.0.ssm_norm.weight", vec![128], 1.0),
+            ("blk.0.ssm_conv1d_q.weight", vec![4, 1, 256], 0.0),
+            ("blk.0.ssm_conv1d_k.weight", vec![4, 1, 256], 0.0),
+            ("blk.0.ssm_conv1d_v.weight", vec![4, 1, 256], 0.0),
+            ("blk.0.ssm_a", vec![2], -5.0),
+            ("blk.0.ssm_dt.bias", vec![256], -1.0),
+            ("blk.0.ffn_gate_inp.weight", vec![256, 288], 0.0),
+            ("blk.0.exp_probs_b.bias", vec![288], 0.0),
+            ("blk.0.hc_attn_scale.weight", vec![3], 1.0),
+            ("blk.0.hc_ffn_scale.weight", vec![3], 1.0),
+            ("blk.0.hc_attn_base.weight", vec![24], 0.0),
+            ("blk.0.hc_ffn_base.weight", vec![24], 0.0),
+        ] {
+            add(name.into(), dims, GgmlType::F32, value)?;
+        }
+        for name in model::arch::names::routed_stacks(0) {
+            add(name.clone(), vec![256, 256, 288], routed, 1.0)?;
+            if routed != GgmlType::NVFP4 {
+                continue;
+            }
+            add(
+                format!(
+                    "{}.scale",
+                    name.strip_suffix(".weight")
+                        .ok_or("hostless: stack suffix")?
+                ),
+                vec![288],
+                GgmlType::F32,
+                1.0,
+            )?;
+        }
+        let dir = std::env::temp_dir().join(format!("gate-glm-hostless-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("hostless-{routed:?}.gguf"));
+        bloomery_gpu_gates::write_gguf(&path, &kvs, &decls)?;
+        println!("hostless: model={}", path.display());
+        Ok(path)
+    }
+
+    /// Opens `path` on one card under `host`: whether the load holds no host view,
+    /// the model, stepped through `ids` in `mode` when one is given, and its inputs.
+    fn hostless_open(
+        path: &std::path::Path,
+        host: bloomery_levers::HostCfg,
+        ids: &[u32],
+        mode: Option<StepMode>,
+    ) -> Result<(bool, Glm5nextModel, PlanInputs), GateError> {
+        let file = Split::open(path)?;
+        let inputs = PlanInputs::read(&file)?;
+        let machine = slot_machine(&inputs, 1)?;
+        let plan = inputs.plan_slots(
+            &machine,
+            SLOT_CTX as u64,
+            &PlanLevers::default(),
+            KdaLanes::One,
+            1,
+        )?;
+        if plan.host.experts != 0 || plan.n_l != [288] {
+            return Err("hostless: the fixture must hold every routed expert on the card".into());
+        }
+        let mut m = Body::open_placed(file, &plan, &inputs, 0, host)?;
+        let no_views = {
+            let (_, _, body) = m.body_parts("hostless")?;
+            body.hybrid_mut().host_mut().is_empty()
+        };
+        if let Some(mode) = mode {
+            m.set_mode(mode);
+            for &id in ids {
+                m.step(&[id])?;
+            }
+        }
+        Ok((no_views, m, inputs))
+    }
+
+    /// Fully card-resident routed layers: an NVFP4 trunk opens without a host view
+    /// and its eager, graph and batched prompt paths agree; a K-quant trunk opens
+    /// without one too, and a load for a route trace keeps its host leg with the
+    /// same logits.
+    fn hostless(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        tier::sc("hostless NVFP4 placed load and generation")?;
+        let path = hostless_fixture(GgmlType::NVFP4)?;
+        let ids = [1, 2, 3, 4];
+        let (no_views, mut m, inputs) = hostless_open(&path, levers.host(), &ids, None)?;
+        let mut outputs = Vec::new();
+        for mode in [StepMode::Eager, StepMode::Graph] {
+            m.reset()?;
+            m.set_mode(mode);
+            for &id in &ids {
+                m.step(&[id])?;
+            }
+            outputs.push(m.logits()?);
+        }
+        let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
+        let ([host_ops], _) = count_kinds(&m.step_graph_nodes()?, [memop]);
+        m.reset()?;
+        let token = prefill(&mut m, &ids)?;
+        let logits = m.logits()?;
+        let ok = no_views
+            && host_ops == 0
+            && same_bits(&outputs[0], &outputs[1])
+            && same_bits(&outputs[0], &logits)
+            && logits.iter().all(|v| v.is_finite())
+            && token < inputs.hp.n_vocab as u32;
+        let next = m.step(&[token])?;
+        let generated =
+            next < inputs.hp.n_vocab as u32 && m.logits()?.iter().all(|v| v.is_finite());
+        println!(
+            "hostless: nvfp4 no_host_views={no_views} host_memops={host_ops} eager=graph=batch finite logits tokens={token},{next} {}",
+            verdict(ok && generated)
+        );
+        // A forced row of the hostless layer serves no host row: no host sum, and the
+        // block's output is the card sum plus the shared expert's.
+        let streams = inputs.hp.hc.streams * inputs.hp.n_embd;
+        let x: Vec<f32> = (0..streams).map(|i| (i % 7) as f32 * 0.01).collect();
+        let row = layer_rows(&mut m, 0, &[&x], None)?.remove(0);
+        let route = row
+            .route
+            .as_ref()
+            .ok_or("hostless: layer 0 forced row has no route")?;
+        let sum: Vec<f32> = route
+            .card
+            .iter()
+            .zip(&route.shared)
+            .map(|(c, s)| c + s)
+            .collect();
+        let host_zero = route.routed.iter().all(|&v| v == 0.0);
+        let forced_rel = rel(&row.ffn_out, &sum);
+        let forced_ok = host_zero && route.card.iter().any(|&v| v != 0.0) && forced_rel <= 1e-6;
+        println!(
+            "hostless: nvfp4 forced_row host_sum_zero={host_zero} ffn_out_vs_card_plus_shared_rel={forced_rel:.3e} {}",
+            verdict(forced_ok)
+        );
+        // A route trace is written by the host service, so its load keeps the host leg
+        // of a fully resident K-quant layer; both loads give the same logits.
+        let path = hostless_fixture(GgmlType::Q4_K)?;
+        let eager = Some(StepMode::Eager);
+        let (bare, m, _) = hostless_open(&path, levers.host(), &ids, eager)?;
+        let want = m.logits()?;
+        drop(m);
+        let mut traced = levers.host();
+        traced.route_trace = true;
+        let (kept, m, _) = hostless_open(&path, traced, &ids, eager)?;
+        let hosted = rel(&m.logits()?, &want);
+        let trace_ok = bare && !kept && want.iter().all(|v| v.is_finite()) && hosted <= 1e-6;
+        println!(
+            "hostless: q4_k no_host_views={bare} traced_host_views={} traced_rel={hosted:.3e} {}",
+            !kept,
+            verdict(trace_ok)
+        );
+        Ok(ok && generated && forced_ok && trace_ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&tier::acts_on(&[CARD_BUDGET])?)?;
         crate::gate_card::init()?;
+        let only = only()?;
+        if only == Only::Hostless {
+            return if hostless(&levers)? {
+                Ok(())
+            } else {
+                Err(checks_failed())
+            };
+        }
         glm5next_tier::init_file()?;
         glm5next_tier::dense_ctx(CTX_PP)?;
-        let only = only()?;
         let sets = step_sets(only)?;
         let mut ok = true;
+        let fixture = tier::Tier::from_env()? == tier::Tier::Fixture;
+        if fixture && only == Only::All {
+            ok &= hostless(&levers)?;
+        }
         if only.runs_main() {
             let t = Instant::now();
             ok &= main_clauses(&levers, sets)?;

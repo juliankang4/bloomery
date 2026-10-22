@@ -48,10 +48,10 @@ use crate::{ffn, kda, mla};
 /// What the walk's errors name.
 const WHAT: &str = "glm5next Body::enqueue_chain";
 
-/// The launches of the step's captured chain: every layer's
+/// The launches of the step's captured chain with a host leg at every routed layer: every layer's
 /// ([`layer_launches`], `cards[l]` whether layer `l` has card experts,
 /// `blocks[l]` the plan of its dense block or shared expert) and the head's
-/// four.
+/// four. A hostless layer omits its go and wait; its sum becomes a device copy.
 #[must_use]
 pub fn step_launches(
     mixers: &[MixerKind],
@@ -69,7 +69,7 @@ pub fn step_launches(
         + 4
 }
 
-/// One layer's launches: two sub-layers' three for the streams, its mixer's
+/// One host-served layer's launches: two sub-layers' three for the streams, its mixer's
 /// and its block's, with its card experts' when `card` and the K-quant
 /// block's own ([`BlockPlan::extra_launches`]).
 #[must_use]
@@ -314,7 +314,11 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
         ffn::back(gpu, &mut self.parts, port.hybrid(), l)?;
         self.hc_out()?;
         self.parts.tap(gpu, l, self.cur[at.unit])?;
-        port.hybrid().row_enqueued(l, at.unit)
+        if self.parts.card.hostless(l) {
+            Ok(())
+        } else {
+            port.hybrid().row_enqueued(l, at.unit)
+        }
     }
 
     /// The row's streams' mean into its head, and the head.

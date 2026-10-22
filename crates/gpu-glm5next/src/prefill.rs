@@ -2872,6 +2872,9 @@ impl PromptProgram<'_> {
         }
         port.mark(at, Mark::FrontEnd as usize)?;
         let key = port.key(at);
+        if self.p.card.hostless(l) {
+            return Ok(());
+        }
         let Some(side) = self.p.card.tier().filter(|t| t.k(l) > 0) else {
             return port
                 .hybrid()
@@ -3060,6 +3063,7 @@ impl<'a> LayerProgram for PromptProgram<'a> {
     /// A routed layer's; the dense lead has none.
     fn host_leg(&self, at: At) -> bool {
         self.p.cfg.get(at.layer).is_some_and(|c| c.kind.host_leg())
+            && !self.p.card.hostless(at.layer)
     }
 
     /// The mixer sub-layer, then the block's input and the dense block with
@@ -3154,13 +3158,18 @@ impl<'a> LayerProgram for PromptProgram<'a> {
             let t = self.t[at.unit];
             let b = &mut *self.b;
             let shadowed = if self.p.card.sums(l) { &b.pre } else { &b.sh_y };
-            self.gpu.elem().enqueue_add(
-                self.gpu.stream(),
-                port.hsum(),
-                shadowed,
-                t * n,
-                &mut b.out,
-            )?;
+            if self.p.card.hostless(l) {
+                span_mut(WHAT, &mut b.out, 0, t * n)?
+                    .copy_from_device_async(&*span(WHAT, shadowed, 0, t * n)?, self.gpu.stream())?;
+            } else {
+                self.gpu.elem().enqueue_add(
+                    self.gpu.stream(),
+                    port.hsum(),
+                    shadowed,
+                    t * n,
+                    &mut b.out,
+                )?;
+            }
             self.hc_out(at.unit)?;
             port.mark(at, Mark::Back as usize)
         })();

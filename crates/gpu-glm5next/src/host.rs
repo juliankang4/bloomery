@@ -2,8 +2,6 @@
 //! host run ([`bloomery_gpu::host::run::HostRun`]), which owns the stacks'
 //! storage, the scratch and the [`bloomery_gpu::hybrid::HostExperts`] calls.
 
-use std::ops::Range;
-
 use model::ModelError;
 use model::arch::glm5next::host;
 use model::arch::glm5next::hparams::Hparams;
@@ -16,14 +14,15 @@ use model::r8file::R8Source;
 pub(crate) fn routed_layers(
     src: R8Source<'_>,
     hp: &Hparams,
-    run: Range<usize>,
+    run: impl IntoIterator<Item = usize>,
 ) -> Result<Vec<HostLayer>, ModelError> {
-    run.map(|l| {
-        host::layer(src, hp, l)?.ok_or_else(|| {
-            ModelError::MissingTensor(format!(
-                "layer {l}'s routed stacks: a layer of the host run does not route"
-            ))
+    run.into_iter()
+        .map(|l| {
+            host::layer(src, hp, l)?.ok_or_else(|| {
+                ModelError::MissingTensor(format!(
+                    "layer {l}'s routed stacks: a layer of the host run does not route"
+                ))
+            })
         })
-    })
-    .collect()
+        .collect()
 }

@@ -134,7 +134,10 @@ impl Body {
                 ffn::front(gpu, w, &mut p, hybrid, l)?;
                 ffn::shadow(gpu, w, &mut p, hybrid.boundary(), l)?;
                 ffn::back(gpu, &mut p, hybrid, l)?;
-                hybrid.row_enqueued(l, 0)?;
+                let hostless = p.card.hostless(l);
+                if !hostless {
+                    hybrid.row_enqueued(l, 0)?;
+                }
                 let bias = if p.cfg[l].bias {
                     f32v(w, ffn::moe_names(&p, l)?.bias)?
                 } else {
@@ -147,7 +150,11 @@ impl Body {
                     bias: bias.to_host_vec(stream)?,
                     ids: r.ids.to_host_vec(stream)?,
                     weights: r.weights.to_host_vec(stream)?,
-                    routed: hybrid.boundary().hsum_of(0)?.to_host_vec(stream)?,
+                    routed: if hostless {
+                        vec![0.0; n]
+                    } else {
+                        hybrid.boundary().hsum_of(0)?.to_host_vec(stream)?
+                    },
                     card: if p.card.has(l) {
                         p.card.acc()?.to_host_vec(stream)?
                     } else {

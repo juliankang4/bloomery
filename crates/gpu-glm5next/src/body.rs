@@ -1671,7 +1671,7 @@ impl Body {
             &map,
             dims.embd,
             hp.expert_ff,
-            LOAD_ROWS,
+            (LOAD_ROWS, glue.source().is_some() || host.route_trace),
         )?;
         let boundary = Boundary::with_rows(
             gpu.context(),
@@ -1683,6 +1683,10 @@ impl Body {
             LOAD_ROWS,
         )?;
         let file = Arc::clone(file);
+        let hosted: Vec<usize> = run
+            .clone()
+            .filter(|&l| !experts_on_card.hostless(l))
+            .collect();
         // The common chain's host-run build: a paged plan's NVMe expert tier
         // is attached before the run's first call. The run includes the
         // NextN layer's index, which the tier does not cover.
@@ -1690,7 +1694,7 @@ impl Body {
             gpu.context(),
             plan,
             &file,
-            run.clone(),
+            hosted.iter().copied(),
             host.r8,
             residency.arena(),
             HostWidths {
@@ -1698,11 +1702,14 @@ impl Body {
                 ff: hp.expert_ff,
                 n_used: hp.n_used,
             },
-            |src| routed_layers(src, hp, run.clone()),
+            |src| routed_layers(src, hp, hosted.iter().copied()),
         )?;
         glue.attach_tier(experts.tier())?;
         let nvme_tier = experts.tier().cloned();
         let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
+        if let Some(l) = run.clone().find(|&l| experts_on_card.hostless(l)) {
+            hybrid.mark_unserved(l);
+        }
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(residency);
         let hang = Hang {
