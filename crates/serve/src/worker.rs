@@ -307,8 +307,8 @@ struct Active {
     slot: usize,
     job: Gen,
     events: mpsc::Sender<Msg>,
-    /// Under turns: the engine call the request needs, taken from its
-    /// generation before its slot was parked.
+    /// The engine call the request needs next, taken from its generation
+    /// by a pump that ran ahead of the call ([`Worker::hold_need`]).
     need: Option<Need>,
     /// Under turns: when it last left the engine (the turns' clock).
     left: u64,
@@ -789,10 +789,9 @@ impl Worker {
                     }
                     // `/slots` shows the run's positions as its calls run.
                     tick_of(&self.sh, a.slot)(a.job.timings());
-                    let Some(need) = self.pump_at(k) else {
+                    if !self.hold_need(k) {
                         continue;
-                    };
-                    self.active[k].need = Some(need);
+                    }
                     needs.push(Need::Fill);
                     k += 1;
                 }
@@ -1062,11 +1061,8 @@ impl Worker {
     /// one engine call — unless the stop was read after the change of hands,
     /// which leaves the call to the halt at the next round's top.
     fn turn(&mut self) -> Result<(), Dead> {
-        if let Some(i) = self.t().running.and_then(|r| self.index_of(r))
-            && self.active[i].need.is_none()
-            && let Some(need) = self.pump_at(i)
-        {
-            self.active[i].need = Some(need);
+        if let Some(i) = self.t().running.and_then(|r| self.index_of(r)) {
+            self.hold_need(i);
         }
         let running = self.t().running;
         let on = running.and_then(|r| self.index_of(r));
@@ -1168,25 +1164,36 @@ impl Worker {
         Ok(())
     }
 
-    fn take_need(&mut self, i: usize) -> Option<Need> {
-        self.active[i].need.take().or_else(|| self.pump_at(i))
-    }
-
+    /// Every running request's tokens in hand to its client, each keeping its
+    /// next engine call ([`Worker::hold_need`]); a stop read between them
+    /// leaves the rest.
     fn pump_ready(&mut self) {
         let mut i = 0;
         while i < self.active.len() && !self.sh.stopped() {
-            if self.active[i].need.is_some() {
-                i += 1;
-            } else if let Some(need) = self.pump_at(i) {
-                self.active[i].need = Some(need);
+            if self.hold_need(i) {
                 i += 1;
             }
         }
     }
 
-    /// Takes the tokens request `i` holds; its next engine call, or `None`
-    /// when it ended (and is booked).
-    fn pump_at(&mut self, i: usize) -> Option<Need> {
+    /// Request `i`'s next engine call ([`Worker::take_need`]) kept on it until
+    /// that call runs, so the tokens it holds reach its client before the
+    /// engine's next call; `false` when it ended (and is booked).
+    fn hold_need(&mut self, i: usize) -> bool {
+        let Some(need) = self.take_need(i) else {
+            return false;
+        };
+        self.active[i].need = Some(need);
+        true
+    }
+
+    /// Request `i`'s next engine call: the one it holds from an earlier pump,
+    /// else the one its generation gives once the tokens it holds have gone
+    /// to its client; `None` when it ended (and is booked).
+    fn take_need(&mut self, i: usize) -> Option<Need> {
+        if let Some(need) = self.active[i].need.take() {
+            return Some(need);
+        }
         let a = &mut self.active[i];
         let pumped = a
             .job
