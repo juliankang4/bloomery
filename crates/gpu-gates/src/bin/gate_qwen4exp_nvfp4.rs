@@ -327,6 +327,26 @@ mod gate {
         Ok(ok || !judged)
     }
 
+    fn logits_kl(oracle: &[f32], ours: &[f32]) -> Result<f64, GateError> {
+        if oracle.is_empty() || oracle.len() != ours.len() {
+            return Err("NVFP4 KL: empty or unequal logits rows".into());
+        }
+        for row in [oracle, ours] {
+            if row.iter().any(|x| x.is_nan() || *x == f32::INFINITY)
+                || !row.iter().any(|x| x.is_finite())
+            {
+                return Err("NVFP4 KL: invalid logits distribution".into());
+            }
+        }
+        let p = bloomery_gpu_gates::prompts::log_softmax(oracle);
+        let q = bloomery_gpu_gates::prompts::log_softmax(ours);
+        Ok(p.iter()
+            .zip(q)
+            .filter(|(lp, _)| lp.is_finite())
+            .map(|(lp, lq)| lp.exp() * (lp - lq))
+            .sum())
+    }
+
     /// (p) or (g), `tag`: the batch set by `path` (one pass or one ubatch walk, `how`) from a
     /// reset; its last argmax against the oracle's.
     fn batch_by(
@@ -343,9 +363,10 @@ mod gate {
         let ok = top == argmax(&oracle);
         println!(
             "({tag}) the batch set by {how}: last argmax ours={top} oracle={} logits_rel={:.3e} \
-             (printed) {}",
+             kld={:.9} (printed) {}",
             argmax(&oracle),
             rel(&ours, &oracle),
+            logits_kl(&oracle, &ours)?,
             verdict(ok)
         );
         Ok(ok)
@@ -379,10 +400,11 @@ mod gate {
             let rels = layer_rels(man, &r.taps, d.row, d.n_layer)?;
             print_layers(name, &rels, 0, FREE_BAND);
             let step_ok = top == oracle_top || tie;
+            let kl = logits_kl(&oracle, ours)?;
             println!(
                 "(t) {name}: position {pos} after {} ids by ubatches ({fed:.1} s, runtime value); \
                  argmax ours={top} oracle={oracle_top} (its runner-up {oracle_2}, margin {margin:.4}, \
-                 our distance at the two {dist:.4}{}); logits_rel {logits_rel:.3e}; worst \
+                 our distance at the two {dist:.4}{}); logits_rel {logits_rel:.3e}; kld={kl:.9}; worst \
                  l_out_rel {:.3e} (printed) {}",
                 prefill.len(),
                 if tie { ", a named tie" } else { "" },
@@ -625,6 +647,21 @@ mod gate {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn logits_kl_compares_distributions_and_refuses_invalid_rows() {
+            let p = [0.0, 1.0, f32::NEG_INFINITY];
+            assert!(logits_kl(&p, &[4.0, 5.0, f32::NEG_INFINITY]).unwrap().abs() < 1e-12);
+            assert!(logits_kl(&p, &[1.0, 0.0, f32::NEG_INFINITY]).unwrap() > 0.4);
+            for q in [
+                &[][..],
+                &[0.0][..],
+                &[0.0, f32::NAN, 0.0][..],
+                &[f32::NEG_INFINITY; 3][..],
+            ] {
+                assert!(logits_kl(&p, q).is_err());
+            }
+        }
 
         /// The sets follow the split's dense form: `prepare`'s default split (every dense matrix
         /// BF16) the `_bf16` pair; its `BLOOMERY_PREPARE_Q8=1` split (Q8_0, the indexer's
