@@ -89,8 +89,8 @@ use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
-    Bf16Rows, F32T_THREADS_U32, MMA_THREADS, STAGE_FLOATS, STAGES, bf16_mma_body, f32_tile_body,
-    mma_launch, tile_launch,
+    Bf16Rows, F32T_THREADS_U32, MMA_THREADS, STAGE_FLOATS, STAGES, bf16_mma_body, bf16_mma_launch,
+    f32_tile_body, tile_launch,
 };
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
@@ -2812,10 +2812,10 @@ impl Q8F32Kernels {
     }
 
     /// Dense BF16 prompt product with BF16 activations and F32 accumulation.
-    /// The weight stays in its stored BF16 words. An exceptional tile replays
-    /// on the exact owner: whole, or with `INDEPENDENT_COLUMNS` only the cells
-    /// whose row or column holds an out-of-range operand or whose value is
-    /// not finite.
+    /// The weight stays in its stored BF16 words, 16-byte aligned
+    /// ([`bf16_mma_launch`]). An exceptional tile replays on the exact owner:
+    /// whole, or with `INDEPENDENT_COLUMNS` only the cells whose row or column
+    /// holds an out-of-range operand or whose value is not finite.
     pub fn enqueue_bf16_mma<const INDEPENDENT_COLUMNS: bool>(
         &self,
         stream: &CudaStream,
@@ -2824,12 +2824,7 @@ impl Q8F32Kernels {
         n: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let what = "Q8F32Kernels::enqueue_bf16_mma";
-        let k = w
-            .cols()
-            .checked_mul(2)
-            .ok_or_else(|| GpuError::shape(what, "BF16 words to values overflows"))?;
-        let t = mma_launch(what, w.rows(), k, x, n, y)?;
+        let t = bf16_mma_launch("Q8F32Kernels::enqueue_bf16_mma", w, x, n, y)?;
         let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
         if INDEPENDENT_COLUMNS {
             let prep = self.module.prepare_bf16_mma_gemm_columns(cfg)?;

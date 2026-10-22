@@ -214,7 +214,10 @@ generate_ds41   hc_gated_norm_4w                         0           0
 generate_ds41   hc_gated_up_mix_4x320                    0           0
 # PIN(2026-10-23): the new HC fused entry uses sm_86 ptxas 13.3.73 spill/stack (24/16).
 # cc8.6 JIT was not measured; this new entry's jit_local pin uses the measured ptxas stack frame.
-generate_ds41   hc_gated_up_mma_mix_4                   24          16
+# PIN(2026-10-23): 24 -> 920 spill bytes, 16 -> 136 stack frame bytes (sm_86 ptxas 13.3.73; cc8.6
+# JIT still not measured): the 128 by 128 MMA tile gives each thread 64 cells, and the fused mix
+# holds half of them while it mixes the other half. The entry runs only on GB10.
+generate_ds41   hc_gated_up_mma_mix_4                  920         136
 generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0

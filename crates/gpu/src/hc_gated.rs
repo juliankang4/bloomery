@@ -69,8 +69,9 @@
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
-    Bf16Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmRoute,
-    MMA_ROW_LANES, MMA_THREADS, MmaTile, STAGE_FLOATS, STAGES, TileRows, bf16_mma_tile, mma_launch,
+    Bf16Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmRoute, MMA_CELLS,
+    MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaRows, MmaTile, STAGE_FLOATS,
+    STAGES, TileRows, bf16_mma_launch, bf16_mma_tile,
 };
 use crate::linear::{sigmoid, silu};
 use crate::q8f32::{
@@ -1658,20 +1659,53 @@ struct HcUpRows<'a> {
     hidden: usize,
 }
 
-impl TileRows for HcUpRows<'_> {
+impl HcUpRows<'_> {
+    /// The stored value of logical value `at`: logical rows interleave the streams.
     #[inline(always)]
-    unsafe fn stage(self, dst: *mut f32, at: usize) {
-        let row = hc_stream_row(self.hidden, at / RANK);
-        // SAFETY: the logical row is live, and RANK preserves the aligned
-        // four-value piece. The permutation stays inside the checked weight.
-        unsafe { Bf16Rows(self.words).stage(dst, row * RANK + at % RANK) };
+    fn stored_at(self, at: usize) -> usize {
+        hc_stream_row(self.hidden, at / RANK) * RANK + at % RANK
     }
 }
 
+impl TileRows for HcUpRows<'_> {
+    #[inline(always)]
+    unsafe fn stage(self, dst: *mut f32, at: usize) {
+        // SAFETY: the logical row is live, and RANK preserves the aligned
+        // four-value piece. The permutation stays inside the checked weight.
+        unsafe { Bf16Rows(self.words).stage(dst, self.stored_at(at)) };
+    }
+}
+
+impl MmaRows for HcUpRows<'_> {
+    type Piece = ();
+
+    #[inline(always)]
+    unsafe fn fetch(self, dst: *mut u32, at: usize) {
+        // SAFETY: as in `stage`, RANK preserves the aligned eight-value piece.
+        unsafe { Bf16Rows(self.words).fetch(dst, self.stored_at(at)) };
+    }
+}
+
+/// Rows of the warp's outputs one pass of [`mma_mix`] holds in the scratch.
+const MIX_ROWS: usize = MMA_WARP_SCRATCH / MMA_WARP_COLS;
+/// A thread's cells in those rows ([`MmaTile::value`]).
+const MIX_CELLS: usize = MMA_CELLS * MIX_ROWS / MMA_WARP_ROWS;
+const _: () = assert!(MIX_ROWS == 32 && MIX_ROWS.is_multiple_of(STREAMS));
+
+/// Mixes the tile's gates: each pass stores the gates of [`MIX_ROWS`] of the
+/// warp's rows in its scratch, `[row][column]`, and lane `L` then mixes the
+/// streams of column `L` for each hidden index of those rows.
+///
 /// # Safety
-/// The tile and spans come from the checked HC launch. If FROM_G, replay
-/// completed before this call; otherwise the completed MMA values are used.
+/// All 256 threads call converged. The tile and spans come from the checked
+/// HC launch, and `scratch` is the warp's [`MmaTile::warp_scratch`] after
+/// `needs_replay`. If FROM_G, replay completed before this call; otherwise
+/// the completed MMA values are used.
 #[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fused epilogue's spans, sizes and scratch, as its kernel passes them"
+)]
 unsafe fn mma_mix<const FROM_G: bool>(
     tile: &MmaTile,
     xn: &[f32],
@@ -1680,47 +1714,55 @@ unsafe fn mma_mix<const FROM_G: bool>(
     m: u32,
     fault: FaultSink,
     mixed: &mut DisjointSlice<f32>,
+    scratch: *mut f32,
 ) {
     let wide = STREAMS * hid;
     let lane = warp::lane_id() as usize;
-    let source = lane & !((STREAMS - 1) * MMA_ROW_LANES);
-    for mi in 0..2 {
+    let (r0, c0) = tile.warp_origin();
+    let col = c0 + lane;
+    for pass in 0..MMA_CELLS / MIX_CELLS {
         thread::__unroll_config::<0>();
-        for j in 0..2 {
+        let first = r0 + pass * MIX_ROWS;
+        for i in 0..MIX_CELLS {
             thread::__unroll_config::<0>();
-            for i in 0..4 {
-                thread::__unroll_config::<0>();
-                let (r, c) = tile.coordinates(mi * 8 + j * 4 + i);
-                let h = r / STREAMS;
-                let live = h < hid && c < m as usize && r % STREAMS == 0;
-                let value = if FROM_G {
-                    if r < wide && c < m as usize {
-                        // SAFETY: replay completed and this thread owns the live cell.
-                        unsafe { *g.get_unchecked_mut(c * wide + r) }
-                    } else {
-                        0.0
-                    }
+            let cell = pass * MIX_CELLS + i;
+            let (r, c) = tile.coordinates(cell);
+            let value = if FROM_G {
+                if r < wide && c < m as usize {
+                    // SAFETY: replay completed and this thread owns the live cell.
+                    unsafe { *g.get_unchecked_mut(c * wide + r) }
                 } else {
-                    tile.values[mi][j][i]
-                };
-                let gate = gate_value(value);
+                    0.0
+                }
+            } else {
+                tile.value(cell)
+            };
+            // SAFETY: the cell's row lies in this pass's rows and its column in
+            // the warp's, so the slot is inside the scratch, this lane's alone.
+            unsafe { *scratch.add((r - first) * MMA_WARP_COLS + c - c0) = gate_value(value) };
+        }
+        warp::sync_mask(u32::MAX);
+        for q in 0..MIX_ROWS / STREAMS {
+            thread::__unroll_config::<0>();
+            let h = first / STREAMS + q;
+            if h < hid && col < m as usize {
                 let mut acc = 0.0f32;
                 for s in 0..STREAMS {
                     thread::__unroll_config::<0>();
-                    let sg = warp::shuffle_f32(gate, (source + s * MMA_ROW_LANES) as u32);
-                    if live {
-                        let at = c * wide + hc_stream_row(hid, h * STREAMS + s);
-                        // SAFETY: this live column/hidden pair addresses its stream in xn.
-                        let x = unsafe { *xn.get_unchecked(at) };
-                        acc = mix_step(acc, x, sg, s);
-                    }
+                    // SAFETY: row STREAMS·q + s, column `lane` of the scratch,
+                    // published by the warp sync above.
+                    let sg = unsafe { *scratch.add((STREAMS * q + s) * MMA_WARP_COLS + lane) };
+                    let at = col * wide + hc_stream_row(hid, h * STREAMS + s);
+                    // SAFETY: this live column/hidden pair addresses its stream in xn.
+                    let x = unsafe { *xn.get_unchecked(at) };
+                    acc = mix_step(acc, x, sg, s);
                 }
-                if live {
-                    // SAFETY: only stream zero stores this hidden value and column.
-                    unsafe { store_mix(acc, c * hid + h, fault, mixed) };
-                }
+                // SAFETY: only this lane stores this hidden value and column.
+                unsafe { store_mix(acc, col * hid + h, fault, mixed) };
             }
         }
+        // The next pass overwrites the scratch this one read.
+        warp::sync_mask(u32::MAX);
     }
 }
 
@@ -1728,7 +1770,7 @@ unsafe fn mma_mix<const FROM_G: bool>(
 mod hc_wide_kernels {
     use super::*;
 
-    /// Interleave four streams in MMA rows and consume g before it leaves registers.
+    /// Interleave four streams in MMA rows and mix g through shared memory, unstored.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -1773,6 +1815,7 @@ mod hc_wide_kernels {
         else {
             return;
         };
+        let scratch = tile.warp_scratch(sh, RANK);
         // SAFETY: every thread shares this checked tile's allocation and K.
         if unsafe { tile.needs_replay(sh, RANK) } {
             // SAFETY: g covers the logical output tile, with one writer per cell.
@@ -1781,10 +1824,10 @@ mod hc_wide_kernels {
             // SAFETY: stores are published and the exact owner uses the same spans.
             unsafe { tile.replay::<_, true>(rows, lo, (wide, RANK, m as usize), &mut g, sh) };
             // SAFETY: replay finished; g, xn and mixed cover this tile.
-            unsafe { mma_mix::<true>(&tile, xn, &mut g, hid, m, fault, &mut mixed) };
+            unsafe { mma_mix::<true>(&tile, xn, &mut g, hid, m, fault, &mut mixed, scratch) };
         } else {
             // SAFETY: no replay is needed; the checked live cells remain in registers.
-            unsafe { mma_mix::<false>(&tile, xn, &mut g, hid, m, fault, &mut mixed) };
+            unsafe { mma_mix::<false>(&tile, xn, &mut g, hid, m, fault, &mut mixed, scratch) };
         }
     }
 
@@ -2143,7 +2186,7 @@ impl HcWideKernels {
         {
             Some((
                 w,
-                mma_launch(what, wide, r, &a.scratch.lo, m, &mut a.scratch.g)?,
+                bf16_mma_launch(what, w, &a.scratch.lo, m, &mut a.scratch.g)?,
             ))
         } else {
             None

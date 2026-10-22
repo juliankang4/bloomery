@@ -6831,6 +6831,22 @@ mod gate {
                     ok &= quality && range && tail && same;
                 }
             }
+            // The tile copies a BF16 weight's words in 16-byte pieces, so a
+            // weight that does not start 16-byte aligned is refused by name.
+            let words = DeviceBuffer::from_host(stream, &vec![0x3f80_3f80u32; 64 * 32 + 1])?;
+            let w = DeviceTensor::<u32>::window_of(&words, 4, 64, 32)?;
+            let x = DeviceBuffer::from_host(stream, &vec![1.0f32; 64])?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, 64)?;
+            let refused = matches!(
+                gpu.q8f32()
+                    .enqueue_bf16_mma::<false>(stream, &w, &x, 1, &mut y),
+                Err(e) if e.to_string().contains("is not 16-byte aligned")
+            );
+            println!(
+                "dense_mma bf16 weight_unaligned refused={refused} {}",
+                verdict(refused)
+            );
+            ok &= refused;
             Ok(ok)
         }
 

@@ -44,7 +44,9 @@ use core::marker::PhantomData;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
 use cuda_device::convert::cvt_bf16x2_f32;
-use cuda_device::wmma::mma_m16n8k16_f32_bf16;
+use cuda_device::shared::cvta_generic_to_shared_u32;
+use cuda_device::vector::{F32x4, U32x4};
+use cuda_device::wmma::{ldmatrix_x4_shared_u32, mma_m16n8k16_f32_bf16};
 use cuda_device::{DisjointSlice, thread, warp};
 
 /// Columns and rows one block covers.
@@ -407,35 +409,255 @@ unsafe fn f32_tile_at<W: TileRows, const THREADS: usize, const MARKED: bool>(
     column!(7);
 }
 
-/// Threads in a dense BF16 MMA tile: eight warps, each covering 32 by 16.
+/// Threads in a dense BF16 MMA tile: eight warps, two row halves by four
+/// column quarters, each covering 64 rows by 32 columns.
 pub(crate) const MMA_THREADS: u32 = 256;
-pub(crate) const MMA_ROW_LANES: usize = 4;
-const MMA_ROWS: usize = 64;
-const MMA_COLS: usize = 64;
+/// Lanes that hold one fragment row's cells.
+const MMA_ROW_LANES: usize = 4;
+const MMA_ROWS: usize = 128;
+const MMA_COLS: usize = 128;
+/// K values one stage holds of every row and column: two 16-value MMA steps.
 const MMA_LINE: usize = 32;
-const _: () = assert!(MMA_THREADS == 256 && MMA_ROWS == 64 && MMA_COLS == 64 && MMA_LINE == 32);
-const _: () = assert!(MMA_THREADS as usize * 2 == MMA_ROWS * (MMA_LINE / 4));
-const _: () = assert!((MMA_ROWS + MMA_COLS) * MMA_LINE == STAGE_FLOATS && STAGES == 3);
+/// 16-byte pieces of BF16 values in one staged line.
+const MMA_PIECES: usize = MMA_LINE / 8;
+/// 32-bit words in one staged line, two BF16 values a word.
+const MMA_LINE_WORDS: usize = MMA_LINE / 2;
+/// Staged words before the column lines.
+const MMA_COLS_AT: usize = MMA_ROWS * MMA_LINE_WORDS;
+/// Lines whose pieces one pass of the block stages.
+const MMA_PASS_LINES: usize = MMA_THREADS as usize / MMA_PIECES;
+const _: () = assert!(MMA_THREADS == 256 && MMA_ROWS == 128 && MMA_COLS == 128 && MMA_LINE == 32);
+// Every thread stages the same piece of two row lines and of two column lines.
+const _: () = assert!(2 * MMA_PASS_LINES == MMA_ROWS && MMA_ROWS == MMA_COLS);
+// The BF16 rows and columns of a stage fill the exact owner's stage, which the replay reuses.
+const _: () = assert!((MMA_ROWS + MMA_COLS) * MMA_LINE_WORDS == STAGE_FLOATS && STAGES == 3);
+
+/// Word offset of piece `slot` of staged line `line`. The slot is permuted by
+/// the line's pair, so the eight lines one `ldmatrix` phase reads at one slot
+/// cover all 32 banks.
+#[inline(always)]
+fn mma_piece_at(line: usize, slot: usize) -> usize {
+    line * MMA_LINE_WORDS + 4 * (slot ^ ((line >> 1) & (MMA_PIECES - 1)))
+}
+
+/// Whether an operand stays on the tensor cores: zero or normal with
+/// `|v| <= 2^47`. With K below `2^32` that bounds every partial absolute sum
+/// below `2^126`, so no product, sum or exact butterfly leaves the finite range.
+#[inline(always)]
+#[allow(
+    clippy::manual_range_contains,
+    reason = "the kernel's two compares on the bits; a RangeInclusive would move its PTX"
+)]
+fn mma_fits(v: f32) -> bool {
+    let bits = v.to_bits() & 0x7fff_ffff;
+    bits == 0 || (bits >= 0x0080_0000 && bits <= 0x5700_0000)
+}
+
+/// [`mma_fits`] for both BF16 values of a word, each its f32's high half.
+#[inline(always)]
+fn mma_fits_bf16x2(word: u32) -> bool {
+    // Every 15-bit magnitude lane stays below 2^16 after each add, so no
+    // carry crosses into the other value's lane.
+    let big = (word & 0x7fff_7fff) + 0x28ff_28ff; // bit 15 set above 0x5700
+    let exponent = (word & 0x7f80_7f80) + 0x7f80_7f80; // bit 15 set for a nonzero exponent
+    let mantissa = (word & 0x007f_007f) + 0x7fff_7fff; // bit 15 set for a nonzero mantissa
+    (big | (mantissa & !exponent)) & 0x8000_8000 == 0
+}
+
+/// A weight that the MMA tile stages as BF16 pieces of eight values.
+pub(crate) trait MmaRows: TileRows {
+    /// What a thread holds of one piece between [`Self::fetch`] and
+    /// [`Self::land`].
+    type Piece: Copy + Default;
+
+    /// Starts moving values `at .. at + 8` (`at` a multiple of 8) to the 16
+    /// bytes at `dst`: an asynchronous copy completed by this thread's
+    /// `cp_async_wait_group` for its committed group, or loads [`Self::land`]
+    /// stores.
+    ///
+    /// # Safety
+    ///
+    /// The eight values lie inside the weight's rows; `dst` is 16 bytes of
+    /// shared memory, 16-byte aligned, that this thread alone writes and no
+    /// warp reads before the barrier after that wait or that store.
+    unsafe fn fetch(self, dst: *mut u32, at: usize) -> Self::Piece;
+
+    /// Stores a fetched piece of values `at ..` at `dst` as BF16 rounded to
+    /// nearest even; false when a value fails [`mma_fits`]. The default, for
+    /// a piece [`Self::fetch`] copies as BF16 words, stores nothing.
+    ///
+    /// # Safety
+    ///
+    /// `piece` and `at` are one [`Self::fetch`]'s, and `dst` is its 16 bytes.
+    #[inline(always)]
+    unsafe fn land(_piece: Self::Piece, _dst: *mut u32, _at: usize) -> bool {
+        true
+    }
+
+    /// After this thread's wait completed its copy to `dst`, whether the
+    /// piece's values pass [`mma_fits`]. The default reads the copied BF16
+    /// words; a weight whose [`Self::land`] checks its values returns true.
+    ///
+    /// # Safety
+    ///
+    /// `dst` is a completed, 16-byte aligned piece of this thread's.
+    #[inline(always)]
+    unsafe fn landed_fits(dst: *const u32) -> bool {
+        // SAFETY: this fn's contract.
+        let [a, b, c, d] = unsafe { (*dst.cast::<U32x4>()).0 };
+        mma_fits_bf16x2(a) & mma_fits_bf16x2(b) & mma_fits_bf16x2(c) & mma_fits_bf16x2(d)
+    }
+}
+
+impl MmaRows for Bf16Rows<'_> {
+    type Piece = ();
+
+    #[inline(always)]
+    unsafe fn fetch(self, dst: *mut u32, at: usize) {
+        // SAFETY: values at .. at + 8 are words at / 2 .. at / 2 + 4, inside
+        // the weight by this fn's contract and 16-byte aligned (the launcher
+        // checks the words' alignment, at is a multiple of 8); dst is this
+        // thread's own 16 bytes until the wait that completes the copy.
+        unsafe { cp_async_cg_16(dst, self.0.as_ptr().add(at >> 1)) };
+    }
+}
+
+impl<F: ByteBlocks<Scale = u32>> MmaRows for ByteRows<'_, F> {
+    /// The piece's two value words and its block's scale element.
+    type Piece = (u32, u32, u32);
+
+    #[inline(always)]
+    unsafe fn fetch(self, _: *mut u32, at: usize) -> (u32, u32, u32) {
+        // SAFETY: values at .. at + 8 are the bytes of words at / 4 and
+        // at / 4 + 1, inside `qs` by this fn's contract.
+        let (lo, hi) = unsafe {
+            (
+                *self.qs.get_unchecked(at >> 2),
+                *self.qs.get_unchecked((at >> 2) + 1),
+            )
+        };
+        // SAFETY: their 32-value block at / 32 has its scale in the `e` plane.
+        let e = unsafe { F::scale_at(self.e, at >> 5) };
+        (lo, hi, e)
+    }
+
+    #[inline(always)]
+    unsafe fn land((lo, hi, e): (u32, u32, u32), dst: *mut u32, at: usize) -> bool {
+        let d = F::scale(e, at >> 5);
+        let v = [
+            F::value(lo) * d,
+            F::value(lo >> 8) * d,
+            F::value(lo >> 16) * d,
+            F::value(lo >> 24) * d,
+            F::value(hi) * d,
+            F::value(hi >> 8) * d,
+            F::value(hi >> 16) * d,
+            F::value(hi >> 24) * d,
+        ];
+        // SAFETY: dst is this fetch's 16 bytes (this fn's contract).
+        unsafe { land_values(v, dst) }
+    }
+
+    #[inline(always)]
+    unsafe fn landed_fits(_: *const u32) -> bool {
+        true
+    }
+}
+
+/// Eight f32 values at `dst` as BF16 rounded to nearest even, two a word in
+/// increasing order; false when one fails [`mma_fits`].
+///
+/// # Safety
+///
+/// `dst` is 16 bytes of shared memory, 16-byte aligned, that this thread
+/// alone writes and no warp reads before the barrier after this store.
+#[inline(always)]
+unsafe fn land_values(v: [f32; 8], dst: *mut u32) -> bool {
+    let fits = mma_fits(v[0])
+        & mma_fits(v[1])
+        & mma_fits(v[2])
+        & mma_fits(v[3])
+        & mma_fits(v[4])
+        & mma_fits(v[5])
+        & mma_fits(v[6])
+        & mma_fits(v[7]);
+    let words = U32x4([
+        cvt_bf16x2_f32(v[0], v[1]),
+        cvt_bf16x2_f32(v[2], v[3]),
+        cvt_bf16x2_f32(v[4], v[5]),
+        cvt_bf16x2_f32(v[6], v[7]),
+    ]);
+    // SAFETY: dst is this thread's own aligned 16 bytes (this fn's contract).
+    unsafe { *dst.cast::<U32x4>() = words };
+    fits
+}
+
+/// Cells of a thread's MMA fragments: four row by four column tiles of four.
+pub(crate) const MMA_CELLS: usize = 64;
+/// Words of the stage left after the pipeline before the line flags
+/// [`bf16_mma_tile`] isolates with: one vote a warp ([`MmaTile::needs_replay`]).
+const MMA_FLAGS_AT: usize = MMA_THREADS as usize / 32;
+const _: () = assert!(MMA_FLAGS_AT.is_multiple_of(4) && MMA_CELLS == 4 * 4 * 4);
+const _: () = assert!(MMA_FLAGS_AT + (MMA_ROWS + MMA_COLS) * MMA_PIECES <= STAGE_FLOATS);
+/// Rows and columns of one warp's outputs.
+pub(crate) const MMA_WARP_ROWS: usize = 64;
+pub(crate) const MMA_WARP_COLS: usize = 32;
+/// Shared floats [`MmaTile::warp_scratch`] gives each warp: the two stages
+/// that hold no votes, divided between the eight warps.
+pub(crate) const MMA_WARP_SCRATCH: usize = 2 * STAGE_FLOATS / (MMA_THREADS as usize / 32);
+const _: () = assert!(MMA_ROWS == 2 * MMA_WARP_ROWS && MMA_COLS == 4 * MMA_WARP_COLS);
+
+/// Row and column of warp `warp`'s outputs inside the tile.
+#[inline(always)]
+fn mma_warp_at(warp: usize) -> (usize, usize) {
+    ((warp / 4) * MMA_WARP_ROWS, (warp % 4) * MMA_WARP_COLS)
+}
 
 /// A thread's completed MMA fragment and logical output coordinates.
 pub(crate) struct MmaTile {
-    pub(crate) values: [[[f32; 4]; 2]; 2],
+    values: [[[f32; 4]; 4]; 4],
     row0: usize,
     col0: usize,
     warp: usize,
     lane: usize,
     retry: bool,
-    bad: u32,
+    bad: u64,
 }
 
 impl MmaTile {
     #[inline(always)]
     pub(crate) fn coordinates(&self, cell: usize) -> (usize, usize) {
-        let (mi, j, i) = (cell / 8, (cell / 4) % 2, cell % 4);
+        let (mi, j, i) = (cell / 16, (cell / 4) % 4, cell % 4);
+        let (r0, c0) = self.warp_origin();
         (
-            self.row0 + (self.warp / 4) * 32 + mi * 16 + self.lane / MMA_ROW_LANES + (i / 2) * 8,
-            self.col0 + (self.warp % 4) * 16 + j * 8 + 2 * (self.lane % MMA_ROW_LANES) + i % 2,
+            r0 + mi * 16 + self.lane / MMA_ROW_LANES + (i / 2) * 8,
+            c0 + j * 8 + 2 * (self.lane % MMA_ROW_LANES) + i % 2,
         )
+    }
+
+    /// The accumulated value of `cell` (< [`MMA_CELLS`]). Cells
+    /// `n·MMA_CELLS/4 ..` hold the warp's output rows `16n .. 16n + 16`.
+    #[inline(always)]
+    pub(crate) fn value(&self, cell: usize) -> f32 {
+        self.values[cell / 16][(cell / 4) % 4][cell % 4]
+    }
+
+    /// Row and column of this warp's first output.
+    #[inline(always)]
+    pub(crate) fn warp_origin(&self) -> (usize, usize) {
+        let (wr, wc) = mma_warp_at(self.warp);
+        (self.row0 + wr, self.col0 + wc)
+    }
+
+    /// This warp's [`MMA_WARP_SCRATCH`] floats of `sh`, the tile's allocation
+    /// for K = `k`. No other warp uses them, and once [`Self::needs_replay`]
+    /// returns no read of the pipeline or the votes is left in them; a replay
+    /// reuses them.
+    #[inline(always)]
+    pub(crate) fn warp_scratch(&self, sh: *mut f32, k: usize) -> *mut f32 {
+        let warps_a_stage = STAGE_FLOATS / MMA_WARP_SCRATCH;
+        let stage = (k / MMA_LINE + 1 + self.warp / warps_a_stage) % STAGES;
+        sh.wrapping_add(stage * STAGE_FLOATS + (self.warp % warps_a_stage) * MMA_WARP_SCRATCH)
     }
 }
 
@@ -472,11 +694,11 @@ impl MmaTile {
         rows: usize,
         n: usize,
     ) {
-        for cell in 0..16 {
+        for cell in 0..MMA_CELLS {
             thread::__unroll_config::<0>();
             let (r, c) = self.coordinates(cell);
             if r < rows && c < n {
-                let value = self.values[cell / 8][(cell / 4) % 2][cell % 4];
+                let value = self.value(cell);
                 let value = if MARKED && (self.bad & (1 << cell) != 0 || !value.is_finite()) {
                     f32::NAN
                 } else {
@@ -502,6 +724,10 @@ impl MmaTile {
     ) {
         for dr in 0..MMA_ROWS / TILE_ROWS {
             for dc in 0..MMA_COLS / TILE_COLS {
+                let (r, c) = (self.row0 + dr * TILE_ROWS, self.col0 + dc * TILE_COLS);
+                if r >= dims.0 || c >= dims.2 {
+                    continue; // block-uniform: the sub-tile holds no output
+                }
                 for half in 0..2 {
                     // SAFETY: the passes cover disjoint checked halves and reuse
                     // the exact owner's shared allocation with 256 threads.
@@ -512,7 +738,7 @@ impl MmaTile {
                             dims,
                             y,
                             sh,
-                            (self.row0 + dr * TILE_ROWS, self.col0 + dc * TILE_COLS, half),
+                            (r, c, half),
                         )
                     };
                     thread::sync_threads();
@@ -521,26 +747,35 @@ impl MmaTile {
         }
     }
 }
-/// Compute a BF16 MMA fragment and its replay decision.
+
+/// BF16 tensor-core fragments of the stored weight's decoded rows, and
+/// whether the tile replays. Activations and decoded weights round once to
+/// BF16; accumulation is F32, each output's 16-value MMA steps in increasing K.
+///
+/// Both operands are staged as BF16 lines, three stages deep: the weight's
+/// pieces through [`MmaRows`] (a BF16 weight by asynchronous copy, two stages
+/// ahead), the activations loaded two stages ahead and converted after the
+/// current stage's products. Each warp reads its fragments with `ldmatrix`.
+/// A tile that stages an operand [`mma_fits`] refuses replays through the
+/// exact owner; with ISOLATE the tile also marks the cells whose row or
+/// column staged such an operand.
 ///
 /// # Safety
+///
 /// All 256 threads call converged. Rows and n are positive, K is a positive
-/// multiple of 64, and w/x hold rows*K and n*K values. x and sh are aligned;
-/// sh holds STAGES*STAGE_FLOATS values and the grid covers 64x64 tiles.
+/// multiple of 64, x holds n aligned K-value columns and w holds rows*K values
+/// ([`MmaRows::fetch`]'s bound). The grid covers 128 by 128 output tiles. sh
+/// holds STAGES*STAGE_FLOATS aligned shared values.
 #[inline(always)]
 #[allow(
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
 #[allow(
-    clippy::manual_range_contains,
-    reason = "the kernel's two compares on the bits; a RangeInclusive would move its PTX"
-)]
-#[allow(
     clippy::question_mark,
     reason = "the kernel's early return on the raster; a `?` would move its PTX"
 )]
-pub(crate) unsafe fn bf16_mma_tile<W: TileRows, const ISOLATE: bool>(
+pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, const ISOLATE: bool>(
     w: W,
     x: &[f32],
     rows: u32,
@@ -561,151 +796,176 @@ pub(crate) unsafe fn bf16_mma_tile<W: TileRows, const ISOLATE: bool>(
     let tid = thread::threadIdx_x() as usize;
     let lane = warp::lane_id() as usize;
     let warp = tid / 32;
-    let wr = (warp / 4) * 32;
-    let wc = (warp % 4) * 16;
-    let group = lane / 4;
-    let pair = 2 * (lane % 4);
-    let mut acc = [[[0.0f32; 4]; 2]; 2];
-    let mut retry = false;
-    let mut bad = 0u32;
+    let (wr, wc) = mma_warp_at(warp);
     let stages = kk / MMA_LINE;
-    let staged_at = |at: usize| at ^ (((at / MMA_LINE) & 3) * 8);
-    macro_rules! copy {
-        ($s:expr, $buf:expr) => {{
-            let (s, buf): (usize, usize) = ($s, $buf);
-            for i in 0..2 {
-                thread::__unroll_config::<0>();
-                let piece = tid + i * MMA_THREADS as usize;
-                let line = piece / (MMA_LINE / 4);
-                let offset = 4 * (piece % (MMA_LINE / 4));
-                let wa = (row0 + line).min(rows - 1) * kk + s * MMA_LINE + offset;
-                let xa = (col0 + line).min(n - 1) * kk + s * MMA_LINE + offset;
-                // SAFETY: each thread owns two aligned pieces of each plane;
-                // source rows are clamped inside the checked weight.
-                unsafe {
-                    w.stage(
-                        sh.add(buf * STAGE_FLOATS + staged_at(line * MMA_LINE + offset)),
-                        wa,
-                    )
-                };
-                // SAFETY: xa is an aligned live four-value piece of x. Its
-                // stage plane is disjoint from the weight plane.
-                unsafe {
-                    cp_async_cg_16(
-                        sh.add(
-                            buf * STAGE_FLOATS + staged_at((MMA_ROWS + line) * MMA_LINE + offset),
-                        )
-                        .cast(),
-                        x.as_ptr().add(xa).cast(),
-                    )
-                };
-            }
-        }};
+    let words = sh.cast::<u32>();
+    // SAFETY: sh is this block's shared allocation (this fn's contract).
+    let shared = unsafe { cvta_generic_to_shared_u32(words.cast_const().cast::<u8>()) };
+
+    // This thread's piece `slot` of lines `line` and `line + MMA_PASS_LINES`
+    // of both operands; a row past the last is staged as the last row and a
+    // column past the last as the last column.
+    let slot = tid % MMA_PIECES;
+    let line = tid / MMA_PIECES;
+    let w_src = [
+        (row0 + line).min(rows - 1) * kk + 8 * slot,
+        (row0 + line + MMA_PASS_LINES).min(rows - 1) * kk + 8 * slot,
+    ];
+    let x_src = [
+        (col0 + line).min(n - 1) * kk + 8 * slot,
+        (col0 + line + MMA_PASS_LINES).min(n - 1) * kk + 8 * slot,
+    ];
+    let w_dst = [
+        mma_piece_at(line, slot),
+        mma_piece_at(line + MMA_PASS_LINES, slot),
+    ];
+    let x_dst = [MMA_COLS_AT + w_dst[0], MMA_COLS_AT + w_dst[1]];
+    // The eight activations of piece i at stage s, s < stages.
+    let fetch_x = |s: usize, i: usize| {
+        let p = x
+            .as_ptr()
+            .wrapping_add(x_src[i] + s * MMA_LINE)
+            .cast::<F32x4>();
+        // SAFETY: p starts eight values of a live column inside x, 16-byte
+        // aligned (x aligned, offsets multiples of 8).
+        let [F32x4([a0, a1, a2, a3]), F32x4([b0, b1, b2, b3])] = unsafe { [*p, *p.add(1)] };
+        [a0, a1, a2, a3, b0, b1, b2, b3]
+    };
+
+    // Bit i (2 + i) is set once this thread stages a value of its weight
+    // (activation) line i that fails mma_fits.
+    let mut bad = 0u32;
+    for s in 0..2 {
+        thread::__unroll_config::<0>();
+        let stage = words.wrapping_add(s * STAGE_FLOATS);
+        for i in 0..2 {
+            thread::__unroll_config::<0>();
+            let at = w_src[i] + s * MMA_LINE;
+            let dst = stage.wrapping_add(w_dst[i]);
+            // SAFETY: K is a positive multiple of 64, so stage s < 2 lies
+            // inside it; dst is this thread's own aligned 16 bytes of the stage.
+            let piece = unsafe { w.fetch(dst, at) };
+            // SAFETY: that fetch's piece and bytes.
+            bad |= u32::from(!unsafe { W::land(piece, dst, at) }) << i;
+            let v = fetch_x(s, i);
+            // SAFETY: this thread's own aligned activation piece of the stage.
+            bad |= u32::from(!unsafe { land_values(v, stage.wrapping_add(x_dst[i])) }) << (2 + i);
+        }
+        // SAFETY: commits this thread's copies of stage s as one group.
+        unsafe { cp_async_commit_group() };
     }
-    copy!(0, 0);
-    // SAFETY: commits this thread's copies of the first stage.
-    unsafe { cp_async_commit_group() };
-    copy!(1, 1);
-    // SAFETY: K is a positive multiple of 64, so a second 32-value stage exists.
-    unsafe { cp_async_commit_group() };
+
+    // [m tile][n tile] accumulators of the warp's 64 by 32 outputs.
+    let mut acc = [[[0.0f32; 4]; 4]; 4];
+    // ldmatrix rows: A row `lane % 16` at K half `lane / 16`; B column
+    // `lane % 8 + 8·(lane / 16)` at K half `(lane / 8) % 2`. Bits 1..2 of the
+    // line pick the permutation, and the warp's line offsets keep them.
+    let a_lane = mma_piece_at(lane % 16, lane / 16);
+    let b_lane = mma_piece_at(lane % 8 + 8 * (lane / 16), (lane / 8) % 2);
     for s in 0..stages {
         let buf = s % STAGES;
-        // SAFETY: two groups precede this wait; the oldest is this stage.
+        // SAFETY: two groups precede this wait; the oldest is stage s.
         unsafe { cp_async_wait_group(1) };
-        thread::sync_threads();
-        if s + 2 < stages {
-            copy!(s + 2, (s + 2) % STAGES);
+        for i in 0..2 {
+            thread::__unroll_config::<0>();
+            // SAFETY: the wait completed this thread's copies of stage s.
+            let fits = unsafe { W::landed_fits(words.add(buf * STAGE_FLOATS + w_dst[i])) };
+            bad |= u32::from(!fits) << i;
         }
-        // SAFETY: advances the pipeline even when the final group is empty.
-        unsafe { cp_async_commit_group() };
-        // SAFETY: this stage is published and no thread refills it before
-        // the next iteration's barrier. Its extent is the allocation's.
-        let stage =
-            unsafe { core::slice::from_raw_parts(sh.add(buf * STAGE_FLOATS), STAGE_FLOATS) };
-        let read = |at| {
-            // SAFETY: each fragment coordinate has row < 128 and K < 32.
-            // The permutation changes only K bits, so its slot is below 4096.
-            unsafe { *stage.get_unchecked(staged_at(at)) }
-        };
-        let packed = |at| {
-            let (a, b) = (read(at), read(at + 1));
-            let fits = |v: f32| {
-                let bits = v.to_bits() & 0x7fff_ffff;
-                // |a|, |b| <= 2^47 and K < 2^32 bound every partial
-                // absolute sum below 2^126, including the exact butterfly.
-                bits == 0 || (bits >= 0x0080_0000 && bits <= 0x5700_0000)
-            };
-            (cvt_bf16x2_f32(a, b), fits(a) && fits(b))
-        };
+        thread::sync_threads();
+        // Stage s + 2 goes to the buffer every warp finished reading before
+        // the barrier above: piece `step` of each operand is fetched before
+        // MMA step `step` and landed after it, so a thread holds one piece
+        // of each in flight.
+        let ahead = s + 2 < stages;
+        let next = words.wrapping_add(((s + 2) % STAGES) * STAGE_FLOATS);
+        let stage = shared + (4 * buf * STAGE_FLOATS) as u32;
         for step in 0..2 {
             thread::__unroll_config::<0>();
-            let off = step * 16 + pair;
-            for mi in 0..2 {
+            let at = w_src[step] + (s + 2) * MMA_LINE;
+            let mut piece = W::Piece::default();
+            let mut xs = [0.0; 8];
+            if ahead {
+                // SAFETY: stage s + 2 lies inside K; the piece is this thread's.
+                piece = unsafe { w.fetch(next.wrapping_add(w_dst[step]), at) };
+                xs = fetch_x(s + 2, step);
+            }
+            if step == 1 {
+                // SAFETY: commits this pass's copies as one group, empty near the end.
+                unsafe { cp_async_commit_group() };
+            }
+            let half = 8 * step;
+            // Both column fragments first; then one row fragment at a time,
+            // so the warp holds twelve fragment words, not twenty.
+            let mut b = [[0u32; 4]; 2];
+            for nj in 0..2 {
                 thread::__unroll_config::<0>();
-                let at = (wr + mi * 16 + group) * MMA_LINE + off;
-                let a0 = packed(at);
-                let a1 = packed(at + 8 * MMA_LINE);
-                let a2 = packed(at + 8);
-                let a3 = packed(at + 8 * MMA_LINE + 8);
-                let a = [a0.0, a1.0, a2.0, a3.0];
-                if ISOLATE {
-                    bad |= u32::from(!(a0.1 && a2.1)) << (mi * 2);
-                    bad |= u32::from(!(a1.1 && a3.1)) << (mi * 2 + 1);
-                }
-                for j in 0..2 {
+                let at = MMA_COLS_AT + (wc + 16 * nj) * MMA_LINE_WORDS + (b_lane ^ half);
+                // SAFETY: the warp is converged; each lane's 16-byte row lies
+                // in this published stage's column lines.
+                b[nj] = unsafe { ldmatrix_x4_shared_u32(stage + (4 * at) as u32) };
+            }
+            for mi in 0..4 {
+                thread::__unroll_config::<0>();
+                let at = (wr + 16 * mi) * MMA_LINE_WORDS + (a_lane ^ half);
+                // SAFETY: as above, in the stage's row lines.
+                let a = unsafe { ldmatrix_x4_shared_u32(stage + (4 * at) as u32) };
+                for j in 0..4 {
                     thread::__unroll_config::<0>();
-                    let at = (MMA_ROWS + wc + j * 8 + group) * MMA_LINE + off;
-                    let b0 = packed(at);
-                    let b1 = packed(at + 8);
-                    if ISOLATE {
-                        bad |= u32::from(!(b0.1 && b1.1)) << (4 + j);
-                    }
-                    let safe = a0.1 && a1.1 && a2.1 && a3.1 && b0.1 && b1.1;
-                    // SAFETY: the whole warp is converged; A is row-major
-                    // and B column-major in the m16n8k16 fragment layout.
-                    let next = unsafe { mma_m16n8k16_f32_bf16(acc[mi][j], a, [b0.0, b1.0]) };
-                    let finite = next[0].is_finite()
-                        && next[1].is_finite()
-                        && next[2].is_finite()
-                        && next[3].is_finite();
-                    retry |= !(safe && finite);
-                    acc[mi][j] = next;
+                    let b = [b[j / 2][2 * (j % 2)], b[j / 2][2 * (j % 2) + 1]];
+                    // SAFETY: the whole warp is converged; A is row-major and
+                    // B column-major in the m16n8k16 fragment layout.
+                    acc[mi][j] = unsafe { mma_m16n8k16_f32_bf16(acc[mi][j], a, b) };
                 }
             }
-        }
-    }
-    let mut cells = 0u32;
-    if ISOLATE {
-        let mut row_bad = [0u32; 4];
-        let mut col_bad = [0u32; 2];
-        for i in 0..4 {
-            thread::__unroll_config::<0>();
-            row_bad[i] = warp::ballot(bad & (1 << i) != 0);
-        }
-        for j in 0..2 {
-            thread::__unroll_config::<0>();
-            col_bad[j] = warp::ballot(bad & (1 << (4 + j)) != 0);
-        }
-        let lanes = (1u32 << MMA_ROW_LANES) - 1;
-        for cell in 0..16 {
-            thread::__unroll_config::<0>();
-            let (mi, j, i) = (cell / 8, (cell / 4) % 2, cell % 4);
-            if row_bad[mi * 2 + i / 2] & (lanes << (group * MMA_ROW_LANES) as u32) != 0
-                || (col_bad[j] >> ((pair + i % 2) * MMA_ROW_LANES) as u32) & lanes != 0
-            {
-                cells |= 1 << cell;
+            if ahead {
+                // SAFETY: this thread's own aligned activation piece of stage
+                // s + 2, which no warp reads before the next pass's barrier.
+                let fits = unsafe { land_values(xs, next.wrapping_add(x_dst[step])) };
+                bad |= u32::from(!fits) << (2 + step);
+                // SAFETY: this step's fetch of stage s + 2, into its piece, as above.
+                let fits = unsafe { W::land(piece, next.wrapping_add(w_dst[step]), at) };
+                bad |= u32::from(!fits) << step;
             }
         }
     }
-    Some(MmaTile {
+    let mut tile = MmaTile {
         values: acc,
         row0,
         col0,
         warp,
         lane,
-        retry,
-        bad: cells,
-    })
+        retry: bad != 0,
+        bad: 0,
+    };
+    if ISOLATE {
+        // Each thread flags its four lines' pieces in the stage the pipeline
+        // left; a cell is marked when a piece of its row or column is flagged.
+        // The last pass's barrier retired that stage's readers, and the flags
+        // lie after the warp votes inside it.
+        let flags = words.wrapping_add((stages % STAGES) * STAGE_FLOATS + MMA_FLAGS_AT);
+        let lines = [line, line + MMA_PASS_LINES];
+        for i in 0..4 {
+            thread::__unroll_config::<0>();
+            let at = (MMA_ROWS * (i / 2) + lines[i % 2]) * MMA_PIECES + slot;
+            // SAFETY: this thread alone writes its piece's flag, inside the stage.
+            unsafe { *flags.add(at) = (bad >> i) & 1 };
+        }
+        thread::sync_threads();
+        let line_bad = |line: usize| {
+            // SAFETY: the barrier published the line's four aligned flags.
+            let [a, b, c, d] = unsafe { (*flags.add(line * MMA_PIECES).cast::<U32x4>()).0 };
+            a | b | c | d != 0
+        };
+        for cell in 0..MMA_CELLS {
+            thread::__unroll_config::<0>();
+            let (r, c) = tile.coordinates(cell);
+            if line_bad(r - row0) || line_bad(MMA_ROWS + c - col0) {
+                tile.bad |= 1 << cell;
+            }
+        }
+    }
+    Some(tile)
 }
 
 /// Dense prompt product with the exact owner's exceptional-tile replay.
@@ -714,7 +974,7 @@ pub(crate) unsafe fn bf16_mma_tile<W: TileRows, const ISOLATE: bool>(
 /// The checked launch supplies 256 converged threads, aligned stages and x,
 /// rows*K weight values, n*K activations and rows*n disjoint output cells.
 #[inline(always)]
-pub(crate) unsafe fn bf16_mma_body<W: TileRows, const ISOLATE: bool>(
+pub(crate) unsafe fn bf16_mma_body<W: MmaRows, const ISOLATE: bool>(
     w: W,
     x: &[f32],
     rows: u32,
@@ -855,6 +1115,25 @@ pub(crate) fn mma_launch(
     Ok(launch)
 }
 
+/// [`mma_launch`] for a BF16 weight's `rows × 2·cols` values. The tile copies
+/// its words in 16-byte pieces, so they must be 16-byte aligned; another is a
+/// named `Shape` error.
+pub(crate) fn bf16_mma_launch(
+    what: &'static str,
+    w: &DeviceTensor<u32>,
+    x: &DeviceBuffer<f32>,
+    n: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<TileLaunch, GpuError> {
+    let k = w
+        .cols()
+        .checked_mul(2)
+        .ok_or_else(|| GpuError::shape(what, "BF16 words to values overflows"))?;
+    let launch = mma_launch(what, w.rows(), k, x, n, y)?;
+    crate::tensor::check_alignment::<U32x4, _>(what, "w", w.buf())?;
+    Ok(launch)
+}
+
 /// A tile launch's grid and its `u32` arguments.
 pub(crate) struct TileLaunch {
     pub(crate) grid: u32,
@@ -929,28 +1208,23 @@ mod tests {
         for warp in 0..8 {
             for lane in 0..32 {
                 let tile = MmaTile {
-                    values: [[[0.0; 4]; 2]; 2],
-                    row0: 64,
-                    col0: 128,
+                    values: [[[0.0; 4]; 4]; 4],
+                    row0: 128,
+                    col0: 256,
                     warp,
                     lane,
                     retry: false,
                     bad: 0,
                 };
-                for cell in 0..16 {
+                let (r0, c0) = tile.warp_origin();
+                for cell in 0..MMA_CELLS {
                     let (r, c) = tile.coordinates(cell);
-                    assert!((64..128).contains(&r) && (128..192).contains(&c));
+                    assert!((128..256).contains(&r) && (256..384).contains(&c));
                     assert!(seen.insert((r, c)));
-                    for stream in 0..4 {
-                        let peer = MmaTile {
-                            lane: (lane & !(3 * MMA_ROW_LANES)) + stream * MMA_ROW_LANES,
-                            ..tile
-                        };
-                        assert_eq!(peer.coordinates(cell), ((r / 4) * 4 + stream, c));
-                    }
+                    assert!((r - r0) / 16 == cell / 16 && c - c0 < MMA_WARP_COLS);
                 }
             }
         }
-        assert_eq!(seen.len(), 64 * 64);
+        assert_eq!(seen.len(), MMA_ROWS * MMA_COLS);
     }
 }
