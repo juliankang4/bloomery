@@ -1047,7 +1047,11 @@ impl Nvfp4Rows {
             need,
             n: dst.len(),
         })?;
-        self.decode_groups(src.as_chunks::<9>().0.iter().copied(), dst)
+        let groups = src.as_chunks::<9>().0.iter().map(|g| {
+            let [scale, codes @ ..] = g;
+            (*scale, codes)
+        });
+        self.decode_groups(groups, dst)
     }
 
     /// Separate code and block-scale planes decoded with the same rounding
@@ -1078,11 +1082,7 @@ impl Nvfp4Rows {
             .0
             .iter()
             .zip(&scales[..groups])
-            .map(|(codes, &scale)| {
-                let mut group = [scale; 9];
-                group[1..].copy_from_slice(codes);
-                group
-            });
+            .map(|(codes, &scale)| (scale, codes));
         self.decode_groups(groups, dst)
     }
 
@@ -1097,22 +1097,25 @@ impl Nvfp4Rows {
         Ok(values / 16)
     }
 
-    fn decode_groups(
+    fn decode_groups<'a>(
         &self,
-        groups: impl Iterator<Item = [u8; 9]> + Clone,
+        groups: impl Iterator<Item = (u8, &'a [u8; 8])> + Clone,
         dst: &mut [f32],
     ) -> Result<(), QuantError> {
-        let undefined = groups.clone().enumerate().find_map(|(block, g)| {
-            let why = match ue4m3(g[0]) {
-                Err(why) => Some(why),
-                Ok(half) => g[1..]
-                    .iter()
-                    .flat_map(|&q| fp4_pair(q))
-                    .any(|v| !(half * f32::from(v) * self.scale).is_finite())
-                    .then_some("a value times the tensor scale leaves f32's range"),
-            };
-            why.map(|why| (block, g[0], why))
-        });
+        let undefined = groups
+            .clone()
+            .enumerate()
+            .find_map(|(block, (byte, codes))| {
+                let why = match ue4m3(byte) {
+                    Err(why) => Some(why),
+                    Ok(half) => codes
+                        .iter()
+                        .flat_map(|&q| fp4_pair(q))
+                        .any(|v| !(half * f32::from(v) * self.scale).is_finite())
+                        .then_some("a value times the tensor scale leaves f32's range"),
+                };
+                why.map(|why| (block, byte, why))
+            });
         if let Some((block, byte, why)) = undefined {
             return Err(QuantError::UndefinedScale {
                 ty: GgmlType::NVFP4_ROWS,
@@ -1122,9 +1125,9 @@ impl Nvfp4Rows {
                 why,
             });
         }
-        for (g, out) in groups.zip(dst.as_chunks_mut::<16>().0) {
-            let half = self.halves[usize::from(g[0])];
-            for (pair, &q) in out.as_chunks_mut::<2>().0.iter_mut().zip(&g[1..]) {
+        for ((byte, codes), out) in groups.zip(dst.as_chunks_mut::<16>().0) {
+            let half = self.halves[usize::from(byte)];
+            for (pair, &q) in out.as_chunks_mut::<2>().0.iter_mut().zip(codes) {
                 let [l, h] = fp4_pair(q);
                 pair[0] = half * f32::from(l) * self.scale;
                 pair[1] = half * f32::from(h) * self.scale;
