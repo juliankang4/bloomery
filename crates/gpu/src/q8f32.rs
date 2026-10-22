@@ -136,6 +136,28 @@ impl RowValues for &[f32] {
 #[derive(Clone, Copy)]
 pub(crate) struct Bf16Words<'a>(pub &'a [u32]);
 
+#[derive(Clone, Copy)]
+struct Nvfp4Values<'a> {
+    qs: &'a [u32],
+    e: &'a [u32],
+}
+
+impl RowValues for Nvfp4Values<'_> {
+    #[inline(always)]
+    unsafe fn at(self, i: usize) -> f32 {
+        let sub = i / 16;
+        let off = i % 16;
+        // SAFETY: i is inside the weight's logical span; two code words hold each sub-block.
+        let q = unsafe { *self.qs.get_unchecked(sub * 2 + (off % 8) / 4) };
+        // SAFETY: one scale word holds four sub-blocks inside the same logical span.
+        let e = unsafe { *self.e.get_unchecked(sub / 4) };
+        let (low, high) = crate::cores::table16_word(q, crate::mxfp4::E2M1);
+        let codes = if off < 8 { low } else { high };
+        let value = (codes >> (8 * (off % 4))) as u8 as i8 as f32;
+        value * crate::mxfp4::ue4m3_half((e >> (8 * (sub % 4))) & 255)
+    }
+}
+
 impl Bf16Words<'_> {
     /// The f32 of the BF16 value in half `odd` of word `w`: its sixteen bits
     /// as the f32's high half, exact.
@@ -2270,6 +2292,78 @@ mod q8f32_kernels {
         }
     }
 
+    /// NVFP4 selected rows over unquantized activations, with one tensor scale per expert.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            8 * qs.len() >= n_experts * rows_per_expert * k,
+            64 * e.len() >= n_experts * rows_per_expert * k,
+            scales.len() >= n_experts,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            x.len() >= m_cols * k,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn nvfp4_gemv_sel_f32(
+        qs: &[u32],
+        e: &[u32],
+        scales: &[f32],
+        x: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        k: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let _ = m_cols;
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        let slot = row / rows_per_expert as usize;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        let mut sum = f32::NAN;
+        if id < n_experts {
+            let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
+            let col = slot / slots_per_col as usize;
+            // SAFETY: col < m_cols, whose k-value columns the launch contract covers.
+            let x = unsafe { x.get_unchecked(col * k as usize..) };
+            // SAFETY: the launch contract covers the selected row and activation column.
+            let partial =
+                unsafe { f32_lane_partial_1col(Nvfp4Values { qs, e }, x, k, row_abs, lane) };
+            sum = warp::reduce_sum_f32(partial);
+            // SAFETY: id < n_experts <= scales.len().
+            let scale = unsafe { *scales.get_unchecked(id as usize) };
+            sum *= scale;
+            if !sum.is_finite() && lane == 0 {
+                fault.raise(FaultSite::F32Product);
+                sum = f32::NAN;
+            }
+        } else if lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+        }
+        if lane == 0 {
+            // SAFETY: row < n_slots * rows_per_expert <= y.len(), with one writer per row.
+            unsafe { *y.get_unchecked_mut(row) = sum };
+        }
+    }
+
     /// `q8_0_gemv_sel_f32` over an FP8_B128 stack in its two planes: thread
     /// row `n = slot · rows_per_expert + r` dots weight row `sel[slot] ·
     /// rows_per_expert + r` with activation column `slot / slots_per_col`
@@ -3030,6 +3124,45 @@ impl Q8F32Kernels {
             &prep,
             qs.buf(),
             d.buf(),
+            a.x,
+            a.sel,
+            l.n_experts,
+            l.rpe,
+            l.n_slots,
+            l.m_cols,
+            l.spc,
+            l.k,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Selected NVFP4 rows over f32 activations, without an activation quantization pass.
+    pub fn enqueue_nvfp4_gemv_sel_f32(
+        &self,
+        stream: &CudaStream,
+        w: crate::mxfp4_sel::Nvfp4Stack<'_>,
+        a: &SelArgs<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_nvfp4_gemv_sel_f32";
+        let k =
+            w.qs.cols()
+                .checked_mul(8)
+                .ok_or_else(|| GpuError::shape(what, "NVFP4 width overflows"))?;
+        w.experts(what, k, a.rows_per_expert)?;
+        let l = sel_launch(what, w.qs.rows(), k, a, y.len())?;
+        let prep = self
+            .module
+            .prepare_nvfp4_gemv_sel_f32(LaunchConfig1D::new(l.grid, 256, 0))?;
+        self.module.nvfp4_gemv_sel_f32(
+            stream,
+            &prep,
+            w.qs.buf(),
+            w.e.buf(),
+            w.scales.buf(),
             a.x,
             a.sel,
             l.n_experts,

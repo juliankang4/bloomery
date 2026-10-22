@@ -483,7 +483,14 @@ pub fn resident_sel_f32(
         DevWeight::Fp8B128 { .. } => {
             q.enqueue_e4m3_gemv_sel_f32(stream, w.e4m3(WHAT, name)?, a, fault, y)
         }
-        _ => Err(GpuError::tensor(WHAT, name, "a q8_0 or fp8_b128 stack")),
+        DevWeight::Nvfp4Stack { .. } => {
+            q.enqueue_nvfp4_gemv_sel_f32(stream, w.nvfp4_stack(WHAT, name)?, a, fault, y)
+        }
+        _ => Err(GpuError::tensor(
+            WHAT,
+            name,
+            "a q8_0, fp8_b128 or nvfp4 stack",
+        )),
     }
 }
 

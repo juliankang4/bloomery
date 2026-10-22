@@ -693,6 +693,100 @@ mod gate {
                 .map(|_| rng.uni(-3.0, 3.0))
                 .collect();
             let hx_dev = DeviceBuffer::from_host(stream, &hx)?;
+            let selected = [0u32, 1, 2, 0, 2, 1];
+            let selected_dev = DeviceBuffer::from_host(stream, &selected)?;
+            for (part, st) in stacks.iter().enumerate() {
+                let (input, device, spc) = if part == 2 {
+                    (&hx, &hx_dev, 1)
+                } else {
+                    (&x, &x_dev, SPC)
+                };
+                let args = bloomery_gpu::q8f32::SelArgs {
+                    x: device,
+                    sel: &selected_dev,
+                    n_slots: selected.len(),
+                    rows_per_expert: st.rows,
+                    slots_per_col: spc,
+                };
+                let mut output = DeviceBuffer::zeroed(stream, selected.len() * st.rows)?;
+                bloomery_gpu::site::resident_sel_f32(
+                    gpu,
+                    &w,
+                    &names[part],
+                    &args,
+                    gpu.unlabelled_sink(),
+                    &mut output,
+                )?;
+                let got = output.to_host_vec(stream)?;
+                let mut worst = 0.0f64;
+                let band = f64::from(f32::EPSILON) * (st.k.div_ceil(32) + 7) as f64 * 2.0;
+                for (slot, &id) in selected.iter().enumerate() {
+                    let scale = f64::from(st.scales[CARD[id as usize] as usize]);
+                    for row in 0..st.rows {
+                        let (mut sum, mut magnitude) = (0.0f64, 0.0f64);
+                        for (&weight, &activation) in st.w[id as usize][row]
+                            .iter()
+                            .zip(&input[(slot / spc) * st.k..][..st.k])
+                        {
+                            let term = f64::from(weight) * f64::from(activation) * scale;
+                            sum += term;
+                            magnitude += term.abs();
+                        }
+                        worst = worst.max(
+                            (f64::from(got[slot * st.rows + row]) - sum).abs()
+                                / magnitude.max(f64::MIN_POSITIVE),
+                        );
+                    }
+                }
+                let pass = got.iter().all(|v| v.is_finite())
+                    && worst <= band
+                    && gpu.take_fault()?.is_none();
+                println!(
+                    "nvfp4 clause=routed_f32 part={part} rows={} k={} normalized_error={worst:.9} band={band:.9} {}",
+                    st.rows,
+                    st.k,
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            let mut nonfinite = hx[..ROUTED_FF].to_vec();
+            nonfinite[0] = f32::NAN;
+            let nonfinite_dev = DeviceBuffer::from_host(stream, &nonfinite)?;
+            for (label, id, input, expected) in [
+                ("id", CARD.len() as u32, &hx_dev, "expert_id"),
+                ("nonfinite", 0, &nonfinite_dev, "f32_product"),
+            ] {
+                let ids = DeviceBuffer::from_host(stream, &[id])?;
+                let args = bloomery_gpu::q8f32::SelArgs {
+                    x: input,
+                    sel: &ids,
+                    n_slots: 1,
+                    rows_per_expert: ROUTED_N,
+                    slots_per_col: 1,
+                };
+                let mut output = DeviceBuffer::zeroed(stream, ROUTED_N)?;
+                bloomery_gpu::site::resident_sel_f32(
+                    gpu,
+                    &w,
+                    &names[2],
+                    &args,
+                    gpu.unlabelled_sink(),
+                    &mut output,
+                )?;
+                let got = output.to_host_vec(stream)?;
+                let named = gpu.take_fault()?.is_some_and(|f| {
+                    GpuError::fault("routed_f32", f)
+                        .to_string()
+                        .contains(expected)
+                });
+                let pass = named && got.iter().all(|v| v.is_nan());
+                println!(
+                    "nvfp4 clause=routed_f32_refusal input={label} named={named} rows_nan={} {}",
+                    got.iter().all(|v| v.is_nan()),
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
             let mut act32 = Q8Blocks32::new(stream, ROUTED_FF, n_slots)?;
             gpu.q5()
                 .enqueue_quantize_q8(stream, &hx_dev, &mut act32, gpu.unlabelled_sink())?;

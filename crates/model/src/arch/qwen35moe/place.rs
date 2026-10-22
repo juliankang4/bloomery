@@ -1945,8 +1945,58 @@ impl MtpInputs {
     /// absent (an unread one may be), one of another type or shape, and a
     /// tensor the file holds that is none of them.
     pub fn from_parts(draft: MtpDraft, file: &[FileTensor]) -> Result<MtpInputs, PlacementError> {
-        let tensors = mtp_tensors(&draft)?;
+        let mut tensors = mtp_tensors(&draft)?;
+        let (Mixer::Gqa(g), Ffn::Moe(m)) = (&draft.layer.mixer, &draft.layer.ffn) else {
+            return Err(PlacementError::Metadata {
+                key: "mtp layer".to_string(),
+                detail: "is not a routed GQA layer".to_string(),
+            });
+        };
         let index = draft.index;
+        let mut scales = Vec::new();
+        for t in &mut tensors {
+            let Some(f) = file.iter().find(|f| f.name == t.name(index)) else {
+                continue;
+            };
+            let Some((ty, _)) = &mut t.form else {
+                continue;
+            };
+            match (*ty, f.ty, t.load) {
+                (GgmlType::Q8_0, GgmlType::BF16, MtpLoad::Card(role))
+                    if role != Role::RoutedExperts =>
+                {
+                    *ty = f.ty
+                }
+                (GgmlType::Q8_0, GgmlType::FP8_B128, MtpLoad::Card(Role::RoutedExperts)) => {
+                    *ty = f.ty
+                }
+                (GgmlType::Q8_0, GgmlType::F32, MtpLoad::Widened(role)) => {
+                    *ty = f.ty;
+                    t.load = MtpLoad::Card(role);
+                }
+                (GgmlType::Q8_0, GgmlType::NVFP4, MtpLoad::Card(Role::RoutedExperts)) => {
+                    *ty = f.ty;
+                    let stem = match t.stem {
+                        "ffn_gate_exps.weight" => "ffn_gate_exps.scale",
+                        "ffn_up_exps.weight" => "ffn_up_exps.scale",
+                        "ffn_down_exps.weight" => "ffn_down_exps.scale",
+                        _ => {
+                            return Err(PlacementError::Tensor {
+                                name: f.name.clone(),
+                                detail: "is not a routed MTP stack".to_string(),
+                            });
+                        }
+                    };
+                    scales.push(MtpTensor {
+                        stem,
+                        form: Some((GgmlType::F32, vec![u64::from(m.experts)])),
+                        load: MtpLoad::Card(Role::Unread),
+                    });
+                }
+                _ => {}
+            }
+        }
+        tensors.extend(scales);
         let layer = Some(0);
         let mut model = Vec::with_capacity(file.len() + 3);
         for f in file {
@@ -2007,13 +2057,6 @@ impl MtpInputs {
             }
         }
         let map_bytes = u64::from(draft.vocab) * runtime::stores::U32_BYTES;
-        // `mtp_tensors` refused any other layer.
-        let (Mixer::Gqa(g), Ffn::Moe(m)) = (&draft.layer.mixer, &draft.layer.ffn) else {
-            return Err(PlacementError::Metadata {
-                key: "mtp layer".to_string(),
-                detail: "is not a routed GQA layer".to_string(),
-            });
-        };
         let (experts, experts_used) = (u64::from(m.experts), u64::from(m.top_k));
         let kv = MtpKv {
             kv_heads: g.kv_heads as usize,
@@ -2027,7 +2070,7 @@ impl MtpInputs {
                 layers: 1,
                 experts,
                 experts_used,
-                bf16_words: |_| false,
+                bf16_words: |_| true,
             },
             machine: draft_machine(),
             kv,
@@ -2882,6 +2925,70 @@ mod tests {
         const LIST_ROWS: usize = 40_960;
         const MAP: u64 = 993_280;
 
+        #[test]
+        fn mtp_stored_bf16_and_nvfp4_keep_their_types_and_scales() {
+            let d = draft(HeadSet::Full);
+            let mut stored = file();
+            let mut scales = Vec::new();
+            for f in &mut stored {
+                if f.ty == GgmlType::Q8_0 {
+                    f.ty = if f.name.contains("_exps.weight") {
+                        scales.push(FileTensor {
+                            name: f.name.replace(".weight", ".scale"),
+                            shard: 0,
+                            ty: GgmlType::F32,
+                            dims: vec![512],
+                            nbytes: 512 * 4,
+                        });
+                        GgmlType::NVFP4
+                    } else if f.name.contains("_inject.weight") {
+                        GgmlType::F32
+                    } else {
+                        GgmlType::BF16
+                    };
+                    f.nbytes = f.dims.iter().product::<u64>() / f.ty.blck_size().unwrap()
+                        * f.ty.type_size().unwrap();
+                }
+            }
+            stored.extend(scales);
+            let m = MtpInputs::from_parts(d.clone(), &stored).unwrap();
+            assert!(
+                m.tensors
+                    .iter()
+                    .all(|t| !matches!(t.load, MtpLoad::Widened(_)))
+            );
+            let plan = m.draft_plan(4096).unwrap().0;
+            assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+            assert_eq!(plan.n_l, [512]);
+            for t in &m.model.tensors {
+                if !t.name.contains("indexer.") {
+                    assert_ne!(t.role, Role::Unused, "{}", t.name);
+                }
+                if t.ty == GgmlType::BF16 {
+                    assert!((m.model.bf16_words)(t));
+                }
+            }
+            let scale = stored.pop().unwrap();
+            assert!(
+                MtpInputs::from_parts(d.clone(), &stored)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&scale.name)
+            );
+            stored.push(scale);
+            let f = stored
+                .iter_mut()
+                .find(|f| f.name.ends_with("attn_q.weight"))
+                .unwrap();
+            f.ty = GgmlType::F16;
+            assert!(
+                MtpInputs::from_parts(d, &stored)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("attn_q.weight")
+            );
+        }
+
         fn list(n: usize) -> HeadSet {
             HeadSet::List {
                 ids: (0..n as u32).map(|i| i * 6).collect::<Vec<_>>().into(),
@@ -2962,6 +3069,7 @@ mod tests {
             assert_eq!(count(|l| matches!(l, MtpLoad::Unread)), 4);
         }
 
+        // PIN(2026-10-22): F32 injects load directly; BF16 injects require normalization.
         #[test]
         fn a_draft_tensor_of_another_form_absent_or_foreign_is_refused() {
             let err = |f: Vec<FileTensor>| {
@@ -2973,9 +3081,9 @@ mod tests {
             f.iter_mut()
                 .find(|t| t.name == "blk.48.hc_attn_inject.weight")
                 .expect("the inject")
-                .ty = GgmlType::F32;
+                .ty = GgmlType::BF16;
             assert!(
-                err(f).contains("tensor blk.48.hc_attn_inject.weight: is f32 [10240, 4]"),
+                err(f).contains("tensor blk.48.hc_attn_inject.weight: is bf16 [10240, 4]"),
                 "type"
             );
             let mut f = file();

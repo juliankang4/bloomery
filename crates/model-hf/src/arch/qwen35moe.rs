@@ -8,7 +8,7 @@
 //! to tiled (`_LinearAttentionVReorderBase`), the indexer's joint q and k projection split by
 //! rows, `+1` on the zero-centred gammas, and `A_log` as `-exp`. The routed experts of a
 //! projection stack by expert id, and the PLE table's parts concatenate in part order. The
-//! next-token layers (`mtp.*`) and the vision tower are left out; any other name is refused.
+//! target and next-token layers share the layer map; the vision tower is left out.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -629,7 +629,7 @@ impl Checkpoint {
         &self,
         tensors: impl IntoIterator<Item = (&'a str, &'a [usize])>,
     ) -> Result<BTreeMap<String, Mapped>, Error> {
-        let mapped = map(&self.geometry, tensors)?;
+        let mapped = map(&self.geometry, tensors, false)?;
         for m in mapped.values() {
             for name in &m.sources {
                 if name.contains(".ple.")
@@ -782,6 +782,8 @@ pub enum Step {
     VRows { from: usize, head: usize },
     /// Each row's columns are V heads of `head` columns, grouped by K head; tile them.
     VCols { head: usize },
+    /// Two stacked matrices joined along their columns, embedding before hidden.
+    JoinColumns,
     /// Only these rows.
     Rows(Range<usize>),
     /// `x + 1`, on F32.
@@ -857,6 +859,7 @@ const PLE_CONSTANTS: [(&str, &str); 3] = [
 fn map<'a>(
     g: &Geometry,
     tensors: impl IntoIterator<Item = (&'a str, &'a [usize])>,
+    draft: bool,
 ) -> Result<BTreeMap<String, Mapped>, Error> {
     let mut out = BTreeMap::new();
     let mut put = |name: String, m: Mapped| match out.insert(name, m) {
@@ -869,15 +872,17 @@ fn map<'a>(
     // A layer's experts: (layer, projection) to each expert's name and shape.
     let mut experts: BTreeMap<(usize, &str), Parts> = BTreeMap::new();
     let mut ple = Parts::new();
+    let mut join = Parts::new();
     for (name, shape) in tensors {
-        if !name.starts_with("mtp.")
-            && !name.starts_with("model.visual.")
-            && (shape.is_empty()
-                || shape.contains(&0)
-                || shape
-                    .iter()
-                    .try_fold(1usize, |n, &d| n.checked_mul(d))
-                    .is_none())
+        if name.starts_with("model.visual.") || name.starts_with("mtp.") != draft {
+            continue;
+        }
+        if shape.is_empty()
+            || shape.contains(&0)
+            || shape
+                .iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .is_none()
         {
             return Err(refuse(
                 name,
@@ -891,8 +896,45 @@ fn map<'a>(
             steps,
             dims,
         };
-        if name.starts_with("mtp.") || name.starts_with("model.visual.") {
-            continue;
+        if draft {
+            let stem = match name.strip_prefix("mtp.") {
+                Some("fc_embedding.weight") => {
+                    join.insert(0, (name, shape));
+                    continue;
+                }
+                Some("fc_hidden.weight") => {
+                    join.insert(1, (name, shape));
+                    continue;
+                }
+                Some("pre_fc_norm_embedding.weight") => Some(("enorm.weight", true)),
+                Some("pre_fc_norm_hidden.weight") => Some(("hnorm.weight", true)),
+                Some("hyper_connection_mixer.hc_norm.weight") => {
+                    Some(("hc_head_norm.weight", true))
+                }
+                Some("hyper_connection_mixer.input_mix_weight_down.weight") => {
+                    Some(("hc_head_down.weight", false))
+                }
+                Some("hyper_connection_mixer.input_mix_weight_up.weight") => {
+                    Some(("hc_head_up.weight", false))
+                }
+                _ => None,
+            };
+            if let Some((stem, plus_one)) = stem {
+                let plain = if plus_one { Plain::F32 } else { Plain::Q8_0 };
+                put(
+                    format!("blk.{}.nextn.{stem}", g.layers),
+                    one(
+                        Use::Matrix(plain),
+                        if plus_one {
+                            vec![Step::PlusOne]
+                        } else {
+                            vec![]
+                        },
+                        dims(),
+                    ),
+                )?;
+                continue;
+            }
         }
         if name == "lm_head.weight" {
             put(
@@ -902,7 +944,7 @@ fn map<'a>(
             continue;
         }
         let short = name
-            .strip_prefix(TEXT)
+            .strip_prefix(if draft { "mtp." } else { TEXT })
             .ok_or_else(|| refuse(name, "not a Qwen3.8 tensor"))?;
         let mixer = |rest: &str| match rest {
             "hc_norm.weight" => Some((Plain::F32, vec![Step::PlusOne])),
@@ -933,9 +975,13 @@ fn map<'a>(
             .and_then(|r| r.split_once('.'))
             .and_then(|(l, rest)| Some((l.parse::<usize>().ok()?, rest)))
             .ok_or_else(|| refuse(name, "not a Qwen3.8 tensor"))?;
-        if l >= g.layers {
-            return Err(refuse(name, format!("layer {l} of {}", g.layers)));
+        if l >= if draft { 1 } else { g.layers } {
+            return Err(refuse(
+                name,
+                format!("layer {l} outside the checkpoint's layer count"),
+            ));
         }
+        let l = if draft { g.layers } else { l };
         if let Some(e) = rest.strip_prefix("mlp.experts.") {
             let (id, proj) = e
                 .split_once('.')
@@ -971,6 +1017,32 @@ fn map<'a>(
         for (to, m) in layer(g, l, rest, name, shape)? {
             put(to, m)?;
         }
+    }
+    if draft && !join.is_empty() {
+        let (Some(&(embedding, e)), Some(&(hidden, h))) = (join.get(&0), join.get(&1)) else {
+            return Err(refuse(
+                "mtp.fc_embedding.weight",
+                "the input join needs both fc_embedding and fc_hidden",
+            ));
+        };
+        let &[rows, cols] = e else {
+            return Err(refuse(embedding, "the input projection is not a matrix"));
+        };
+        if h != e || cols.checked_mul(2).is_none() {
+            return Err(refuse(
+                hidden,
+                "the two input projections differ in shape or their joined width overflows",
+            ));
+        }
+        put(
+            format!("blk.{}.nextn.eh_proj.weight", g.layers),
+            Mapped {
+                sources: vec![embedding.to_string(), hidden.to_string()],
+                role: Use::Matrix(Plain::Q8_0),
+                steps: vec![Step::JoinColumns],
+                dims: vec![(cols * 2) as u64, rows as u64],
+            },
+        )?;
     }
     for ((l, proj), by_id) in experts {
         let (sources, dims) = safetensors::expert_stack(&by_id, g.experts)
@@ -1243,6 +1315,24 @@ impl Step {
                     }
                 }
             }
+            Step::JoinColumns => {
+                let [_, matrix_rows, 2] = t.dims.as_slice() else {
+                    return Err(refuse(name, "the input join needs two stacked matrices"));
+                };
+                let matrix_rows = usize::try_from(*matrix_rows)
+                    .map_err(|_| refuse(name, "input join rows exceed usize"))?;
+                let joined_width = t.dims[0]
+                    .checked_mul(2)
+                    .ok_or_else(|| refuse(name, "input join width overflows u64"))?;
+                for r in 0..matrix_rows {
+                    for part in 0..2 {
+                        let src = (part * matrix_rows + r) * row;
+                        let dst = (r * 2 + part) * row;
+                        moved[dst..dst + row].copy_from_slice(&t.bytes[src..src + row]);
+                    }
+                }
+                t.dims = vec![joined_width, matrix_rows as u64];
+            }
             Step::Rows(ref keep) => {
                 if keep.end > rows {
                     return Err(refuse(name, format!("rows {keep:?} of {rows}")));
@@ -1316,6 +1406,97 @@ mod tests {
         json("quant-configs/nvidia__Qwen3.8-Flash-Next-NVFP4__config.json.gz")
     }
 
+    #[test]
+    fn draft_mapping_joins_embedding_before_hidden_and_reuses_the_layer_map() {
+        let c = Checkpoint::parse(&config()).unwrap();
+        let entries = [
+            ("mtp.fc_embedding.weight", vec![2, 2]),
+            ("mtp.fc_hidden.weight", vec![2, 2]),
+            ("mtp.layers.0.self_attn.q_norm.weight", vec![256]),
+            ("mtp.pre_fc_norm_embedding.weight", vec![2560]),
+            ("mtp.pre_fc_norm_hidden.weight", vec![10240]),
+            (
+                "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight",
+                vec![4, 10240],
+            ),
+            ("mtp.hyper_connection_mixer.hc_norm.weight", vec![10240]),
+            (
+                "model.language_model.embed_tokens.weight",
+                vec![248320, 2560],
+            ),
+        ];
+        let mapped = map(
+            &c.geometry,
+            entries.iter().map(|(n, s)| (*n, s.as_slice())),
+            true,
+        )
+        .unwrap();
+        assert_eq!(mapped.len(), 6);
+        for stem in ["enorm", "hnorm"] {
+            assert_eq!(
+                mapped[&format!("blk.{}.nextn.{stem}.weight", c.geometry.layers)].steps,
+                [Step::PlusOne]
+            );
+        }
+        let name = format!("blk.{}.nextn.eh_proj.weight", c.geometry.layers);
+        let join = &mapped[&name];
+        assert_eq!(
+            join.sources,
+            ["mtp.fc_embedding.weight", "mtp.fc_hidden.weight"]
+        );
+        let mut n = Normal {
+            type_id: gguf::GgmlType::BF16.as_u32(),
+            dims: vec![2, 2, 2],
+            bytes: (0u16..8).flat_map(u16::to_le_bytes).collect(),
+            scale: vec![],
+        };
+        join.steps[0].apply(&c.geometry, &name, &mut n).unwrap();
+        assert_eq!(n.dims, join.dims);
+        assert_eq!(
+            n.bytes,
+            [0u16, 1, 4, 5, 2, 3, 6, 7]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            mapped[&format!("blk.{}.attn_q_norm.weight", c.geometry.layers)].steps,
+            [Step::PlusOne]
+        );
+        assert_eq!(
+            mapped[&format!("blk.{}.hc_attn_inject.weight", c.geometry.layers)].role,
+            Use::Matrix(Plain::F32)
+        );
+        assert!(
+            map(
+                &c.geometry,
+                entries[..1].iter().map(|(n, s)| (*n, s.as_slice())),
+                true
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("both fc_embedding and fc_hidden")
+        );
+        assert!(
+            map(
+                &c.geometry,
+                [("mtp.layers.1.self_attn.q_norm.weight", &[256][..])],
+                true
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("layer 1")
+        );
+        n.dims = vec![4, 2];
+        assert!(
+            Step::JoinColumns
+                .apply(&c.geometry, &name, &mut n)
+                .unwrap_err()
+                .to_string()
+                .contains("two stacked matrices")
+        );
+    }
+
     /// Layers 0, 1 (the PLE site) and 3 (attention) and every unlayered text tensor of
     /// nvidia/Qwen3.8-Flash-Next-NVFP4, placed by its quantization config, map to exactly the
     /// names and ggml dims unsloth's UD-Q4_K_XL holds for them, and every tensor that file keeps
@@ -1359,7 +1540,7 @@ mod tests {
             })
             .collect();
         let g = Checkpoint::parse(&config()).unwrap().geometry;
-        let mapped = map(&g, logical.iter().map(|(n, s)| (*n, s.as_slice()))).unwrap();
+        let mapped = map(&g, logical.iter().map(|(n, s)| (*n, s.as_slice())), false).unwrap();
         let unsloth: Vec<(String, Vec<u64>, u32)> = serde_json::from_slice(&fixture(
             "checkpoint-headers/unsloth-qwen3.8-flash-next-ud-q4_k_xl-layers-0-1-3.tensors.json.gz",
         ))

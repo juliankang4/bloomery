@@ -31,6 +31,9 @@ pub static BESIDE: BesideDraft = BesideDraft {
 /// ([`BesideDraft::pick`]).
 #[must_use]
 pub fn draft_file(set: Option<&Path>, target: &Path) -> (PathBuf, DraftFrom) {
+    if set.is_none() && target.is_dir() {
+        return (target.to_path_buf(), DraftFrom::Folder);
+    }
     BESIDE.pick(set, target)
 }
 
@@ -38,6 +41,9 @@ pub fn draft_file(set: Option<&Path>, target: &Path) -> (PathBuf, DraftFrom) {
 /// ([`BesideDraft::places`]).
 #[must_use]
 pub fn draft_places(target: &Path) -> Vec<PathBuf> {
+    if target.is_dir() {
+        return vec![target.to_path_buf()];
+    }
     BESIDE.places(target)
 }
 
@@ -106,6 +112,12 @@ mod tests {
         assert_eq!(
             draft_file(Some(&other), &target),
             (other.clone(), DraftFrom::Lever(MTP_LEVER))
+        );
+        assert_eq!(draft_file(None, &dir), (dir.clone(), DraftFrom::Folder));
+        assert_eq!(super::draft_places(&dir), [dir.clone()]);
+        assert_eq!(
+            draft_file(Some(&other), &dir),
+            (other, DraftFrom::Lever(MTP_LEVER))
         );
         std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     }

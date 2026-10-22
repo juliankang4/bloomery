@@ -655,6 +655,9 @@ fn gdn_layers(inputs: &PlanInputs) -> usize {
 
 /// The MTP draft file at `path`, which `from` picked; an error names both.
 fn open_draft(path: &Path, from: DraftFrom) -> Result<Split, GateError> {
+    if path.is_dir() {
+        return super::qwen38_folder::draft(path);
+    }
     Split::open(path).map_err(|e| {
         format!(
             "open the MTP draft {} ({}): {e}",
@@ -873,7 +876,7 @@ fn draft38(
                 logits: false,
                 route_trace: levers.route_trace().is_some(),
                 file,
-                file_is_there: file.is_file(),
+                file_is_there: file.is_file() || file.is_dir(),
                 looked,
                 need: window_positions(slots),
                 ctx,
@@ -895,8 +898,7 @@ fn draft38(
 
 /// [`draft38`]'s answer `(mtp, off)` on a load that carries no MTP draft, for the reason `why`
 /// ([`Draft38Off::Media`]: an image load, whose sequences the engine's `GpuModel::enable_media`
-/// refuses a draft beside; [`Draft38Off::Folder`]: a checkpoint folder's, which reads no MTP
-/// layers): `BLOOMERY_DRAFT=mtp` is refused by name; the other words keep the plain path, `off`
+/// refuses a draft beside; [`Draft38Off::Folder`]: a checkpoint folder without an MTP layer): `BLOOMERY_DRAFT=mtp` is refused by name; the other words keep the plain path, `off`
 /// as set, and a draft the rule would have run goes off with `why`, while a reason it was
 /// already off for stands. The lever words that name the draft are then refused by the seat's
 /// own rule (`refuse_mtp_levers`).
@@ -907,10 +909,7 @@ pub(crate) fn draft_off_for(
 ) -> Result<(bool, Option<Draft38Off>), GateError> {
     if word == Some("mtp") {
         let load = match why {
-            Draft38Off::Folder => {
-                "with a checkpoint folder: the folder's load reads no MTP layers; \
-                                   serve a prepared split with its draft"
-            }
+            Draft38Off::Folder => "with a checkpoint folder that holds no MTP layer",
             _ => {
                 "with --mmproj: an image load carries no MTP draft (the media load refuses it); \
                   drop --mmproj"
@@ -1290,12 +1289,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let draft_looked = draft_places(&path);
     // A checkpoint folder is opened once, here: its header plans as a split's first shard
     // does, its tokenizer is the vocabulary, and the engine thread loads its parts.
-    let (split, folder, folder_tok) = if path.is_dir() {
+    let (split, folder, folder_tok, folder_draft) = if path.is_dir() {
         let f = super::qwen38_folder::open(&path)?;
-        (f.header, Some(f.parts), Some(f.tokenizer))
+        (f.header, Some(f.parts), Some(f.tokenizer), f.has_draft)
     } else {
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        (split, None, None)
+        (split, None, None, false)
     };
     // The stage card's first open is made before the room is read
     // (`Gpu::hold_card`: its context and the bundle), so the plans' room has
@@ -1334,9 +1333,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &draft_looked,
         &inputs,
     )?;
-    let (mtp, draft_off) = match folder {
-        Some(_) => draft_off_for(Draft38Off::Folder, levers.draft(), (mtp, draft_off))?,
-        None => (mtp, draft_off),
+    let (mtp, draft_off) = if folder.is_some() && !folder_draft && draft_path == path {
+        draft_off_for(Draft38Off::Folder, levers.draft(), (mtp, draft_off))?
+    } else {
+        (mtp, draft_off)
     };
     // A draft lever set on a server that drafts nothing is refused, with
     // why — asked once the yield below has said its last word, so a draft

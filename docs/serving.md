@@ -198,8 +198,10 @@ GGUF set (a `:<quant>` on that repo is refused by name, as the checkpoint is the
 format the checkpoint stores it in. Checked with `nvidia/Qwen3.8-Flash-Next-NVFP4` on a DGX Spark's GB10, where it plans
 the same bytes and gives the same greedy ids as the GGUF split made from it. The load holds every tensor on the stage
 card and reads the PLE table from the folder on the NVMe tier, so a plan that puts a tensor elsewhere, a set
-`BLOOMERY_RESIDENCY` other than `off`, and `BLOOMERY_DRAFT=mtp` are refused by name; unset, the MTP draft stays off,
-as the folder's MTP layers are not read.
+`BLOOMERY_RESIDENCY` other than `off` is refused by name. The folder's MTP layer uses the same draft and verification
+path as a shared GGUF draft. `BLOOMERY_DRAFT=mtp` selects it, and `BLOOMERY_DRAFT=off` disables it. The default draft
+rule can select the folder's layer when the placement and context allow it. The draft borrows the target's embedding
+and vocabulary head; its experts and dense projections keep their stored formats.
 
 The nemotron seat serves Nemotron 3 Nano 4B (`--model nemotron -m PATH`), Nemotron 3.5 Bolt 74B-A9B and
 Nemotron-3.5-Lightning 30B-A3B, one sequence: `--parallel` above 1, a placement of more than one card or with a

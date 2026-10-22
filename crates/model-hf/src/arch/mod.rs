@@ -25,10 +25,11 @@ pub fn module_class(module: &str) -> Option<hf::quant_config::ModuleClass> {
     let short = module
         .strip_prefix("model.language_model.")
         .or_else(|| module.strip_prefix("model."))
+        .or_else(|| module.strip_prefix("mtp."))
         .unwrap_or(module);
     match short {
         "embed_tokens" => return Some(Embedding),
-        "lm_head" => return Some(Linear),
+        "lm_head" | "fc_embedding" | "fc_hidden" => return Some(Linear),
         "hyper_connection_mixer.input_mix_weight_down"
         | "hyper_connection_mixer.input_mix_weight_up" => return Some(Linear),
         _ => {}

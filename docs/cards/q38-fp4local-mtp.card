@@ -1,0 +1,22 @@
+# Native FP4-Local MTP against the same checkpoint with drafting off.
+# These stored-format budgets are upper bounds before shared output-head normalization.
+# The checkpoint shape budget gives 6.619 GiB read per target step, including 1.236 GiB of routed
+# weights. Four verify rows share the remaining 5.383 GiB [derived]. Counting separate routed
+# reads for all four rows gives 10.327 GiB per verify [derived, an upper bound before shared picks].
+# The shipped reduced head, BF16 draft dense weights and ten selected experts cost about 0.56 GiB
+# per proposal [derived]. Three proposals plus verification cost about 12 GiB per window. Keeping
+# two to three ids predicts a bandwidth-only gain of 10 to 65 percent. Acceptance and launch gaps
+# are the terms this run measures; loading is reported separately.
+kind: ab
+question: does the checkpoint folder's native MTP draft reduce decode time on the four corpora?
+term: decode tok/s @ n=128, prompt 4096 ids, one DGX Spark, one slot, Qwen3.8-Flash-Next-FP4-Local b9ce18a6,
+  native MTP against drafting off on the same head and checkpoint
+unit: %
+predict: +10..+65
+rounds: 2
+condition: one machine and lease, two alternating rounds, code-fn, code-js, prose-en and prose-ko,
+  no prompt cache hits, greedy output, identical input ids, no failed requests or co-tenant process;
+  record prefill, TTFT, decode and load separately
+decide-in: keep the native draft path and report acceptance beside the decode delta
+decide-below: separate low acceptance from draft and verify cost before changing the default
+decide-above: inspect the shared expert picks and measured bytes to refine the read budget

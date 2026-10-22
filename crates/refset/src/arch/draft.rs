@@ -43,6 +43,8 @@ pub enum DraftFrom {
     /// The file of the row's draft name in the target's directory, or in the
     /// directory the target's symlinks resolve to.
     Beside,
+    /// The target checkpoint folder's own MTP tensors.
+    Folder,
     /// The row's path itself: the row's lever unset and no file of its name
     /// beside the target.
     Family(&'static str),
@@ -55,6 +57,7 @@ impl DraftFrom {
         match self {
             DraftFrom::Lever(lever) => lever.to_owned(),
             DraftFrom::Beside => "the shared draft's name beside the target".to_owned(),
+            DraftFrom::Folder => "the target checkpoint folder".to_owned(),
             DraftFrom::Family(lever) => format!(
                 "the family's path: {lever} is unset and no file of the shared draft's name is \
                  beside the target"

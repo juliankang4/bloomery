@@ -252,7 +252,7 @@ impl Mtp38 {
     pub fn open(
         gpu: &Gpu,
         target_w: &Weights,
-        draft_file: &Split,
+        (draft_file, parts): (&Split, Option<&crate::model::PartsLoad<'_>>),
         mtp: &model::arch::qwen35moe::place::MtpInputs,
         plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
         card_dontneed: bool,
@@ -299,13 +299,11 @@ impl Mtp38 {
             hidden,
             vocab,
         )?;
-        let mut w = Weights::load_placed(
-            stream,
-            draft_file,
-            &file_rows(&plan.draft),
-            0,
-            card_dontneed,
-        )?;
+        let rows = file_rows(&plan.draft);
+        let mut w = match parts {
+            Some(load) => load(stream, &rows, 0, card_dontneed)?,
+            None => Weights::load_placed(stream, draft_file, &rows, 0, card_dontneed)?,
+        };
         for t in &mtp.tensors {
             if let model::arch::qwen35moe::place::MtpLoad::Widened(_) = t.load {
                 let name = model::arch::qwen35moe::place::mtp_widened(d.index, t.stem);
@@ -1319,16 +1317,21 @@ struct Names {
 }
 
 impl Names {
-    fn of(index: u32) -> Names {
+    fn of(index: u32, w: &Weights) -> Names {
         let b = |stem: &str| format!("blk.{index}.{stem}");
         let site = |sub: &str| HcSite {
             norm: b(&format!("hc_{sub}_norm.weight")),
             down: b(&format!("hc_{sub}_down.weight")),
             up: b(&format!("hc_{sub}_up.weight")),
-            inject: Some(model::arch::qwen35moe::place::mtp_widened(
-                index,
-                &format!("hc_{sub}_inject.weight"),
-            )),
+            inject: Some({
+                let stem = format!("hc_{sub}_inject.weight");
+                let name = b(&stem);
+                if w.get(&name).is_some() {
+                    name
+                } else {
+                    model::arch::qwen35moe::place::mtp_widened(index, &stem)
+                }
+            }),
         };
         Names {
             attn_site: site("attn"),
@@ -1405,6 +1408,58 @@ impl Mtp38 {
         }
         self.a = Some(a);
         stream.synchronize()?;
+        Ok(())
+    }
+
+    pub(super) fn poison_scratch(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        let a = self.arena()?;
+        for b in [
+            &mut a.emb,
+            &mut a.pack,
+            &mut a.res,
+            &mut a.mixed,
+            &mut a.qg,
+            &mut a.q,
+            &mut a.k,
+            &mut a.v,
+            &mut a.part_v,
+            &mut a.part_ms,
+            &mut a.flash,
+            &mut a.attn,
+            &mut a.y,
+            &mut a.ffn_x,
+            &mut a.rg,
+            &mut a.ru,
+            &mut a.rh,
+            &mut a.rdown,
+            &mut a.acc,
+            &mut a.sh_g,
+            &mut a.sh_u,
+            &mut a.sh_h,
+            &mut a.sh_y,
+            &mut a.head_x,
+            &mut a.logits,
+            &mut a.hc.xn,
+            &mut a.hc.dpart,
+            &mut a.hc.ipart,
+            &mut a.hc.lo,
+            &mut a.hc.wgt,
+            &mut a.route.logits,
+            &mut a.route.probs,
+            &mut a.route.weights,
+        ] {
+            b.copy_from_host(stream, &vec![f32::NAN; b.len()])?;
+        }
+        for b in [
+            &mut a.pos,
+            &mut a.n_keys,
+            &mut a.sel,
+            &mut a.route.ids,
+            &mut a.out,
+            &mut a.chain,
+        ] {
+            b.copy_from_host(stream, &vec![u32::MAX; b.len()])?;
+        }
         Ok(())
     }
 
@@ -1797,7 +1852,7 @@ impl Mtp38 {
         let (gpu, k) = (c.gpu, c.k);
         let stream = gpu.stream();
         let sink = gpu.layer_sink(*index as usize)?;
-        let n = Names::of(*index);
+        let n = Names::of(*index, w);
         let cx = Ctx38 {
             gpu,
             w,
@@ -2232,7 +2287,7 @@ impl Mtp38 {
         let (gpu, k) = (c.gpu, c.k);
         let stream = gpu.stream();
         let sink = gpu.layer_sink(*index as usize)?;
-        let n = Names::of(*index);
+        let n = Names::of(*index, w);
         let (h, cols) = (geo::HIDDEN, geo::STREAMS * m);
         let s = &mut a.st;
 

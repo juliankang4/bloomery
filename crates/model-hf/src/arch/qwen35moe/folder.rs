@@ -124,6 +124,8 @@ pub struct Opened {
     /// The header `prepare` writes as its split's first shard, with every tensor of the split
     /// and none of their bytes, named by the folder's path.
     pub header: Split,
+    /// The MTP layer's header, borrowing the target's embedding and head.
+    pub draft: Option<Split>,
     /// Every tensor of the header but the PLE table and the `.scale` tensors, whose scales each
     /// part carries.
     pub source: part::Checkpoint,
@@ -142,12 +144,45 @@ pub fn open(dir: &Path) -> Result<Opened, Error> {
         checkpoint,
         folder,
         plan,
-        planned,
+        mut planned,
         kvs,
         tokenizer,
     } = read(dir, false)?;
+    let logical = folder
+        .names()
+        .filter(|n| n.starts_with("mtp."))
+        .filter_map(|n| {
+            if let Some(p) = plan.placed.get(n) {
+                Some(
+                    folder
+                        .raw(n)
+                        .map(|r| (n.to_string(), p.format.logical(r.shape))),
+                )
+            } else if plan.refused.contains_key(n) {
+                Some(folder.raw(n).map(|r| (n.to_string(), r.shape.to_vec())))
+            } else {
+                None
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let draft_tensors = planned_tensors(
+        &plan,
+        super::map(
+            &checkpoint.geometry,
+            logical.iter().map(|(n, s)| (n.as_str(), s.as_slice())),
+            true,
+        )?,
+        false,
+    )?;
+    let draft = draft_header(
+        dir,
+        &kvs,
+        checkpoint.geometry.layers,
+        draft_tensors.iter().map(|p| p.decl.clone()).collect(),
+    )?;
     let layout = Layout::new(&kvs, planned.iter().map(|p| p.decl.clone()).collect())?;
     let header = Split::header_only(dir.to_path_buf(), &layout)?;
+    planned.extend(draft_tensors);
     let mut made = BTreeMap::new();
     let mut ple = None;
     for Planned { decl, make } in planned {
@@ -179,10 +214,43 @@ pub fn open(dir: &Path) -> Result<Opened, Error> {
     }
     Ok(Opened {
         header,
+        draft,
         source: part::Checkpoint::new(folder, plan, made)?,
         ple,
         tokenizer,
     })
+}
+
+fn draft_header(
+    dir: &Path,
+    kvs: &[(String, Value)],
+    layers: usize,
+    tensors: Vec<TensorDecl>,
+) -> Result<Option<Split>, Error> {
+    if tensors.is_empty() {
+        return Ok(None);
+    }
+    let mut keys = kvs.to_vec();
+    for (key, value) in &mut keys {
+        if key == "qwen4exp.block_count" {
+            *value = Value::U32(
+                u32::try_from(layers)
+                    .ok()
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(|| "MTP block count exceeds u32".to_string())?,
+            );
+        }
+        if key == "qwen4exp.attention.compress_ratios" {
+            let Value::Array(ratios) = value else {
+                return Err("MTP compression ratios are not an array".to_string().into());
+            };
+            // The shared MTP walk uses full attention and leaves the indexer unread.
+            ratios.push(Value::I32(0));
+        }
+    }
+    keys.push(("qwen4exp.nextn_predict_layers".to_string(), Value::U32(1)));
+    let layout = Layout::new(&keys, tensors)?;
+    Ok(Some(Split::header_only(dir.to_path_buf(), &layout)?))
 }
 
 /// The row table `decl`, mapped as `m`, where `folder` stores it: each part's byte range in its
@@ -288,6 +356,15 @@ pub fn plan_tensors(
         )
         .collect();
     let mapped = checkpoint.map(logical.iter().map(|(n, s)| (*n, s.as_slice())))?;
+    let planned = planned_tensors(&plan, mapped, q8)?;
+    Ok((plan, planned))
+}
+
+fn planned_tensors(
+    plan: &Plan,
+    mapped: BTreeMap<String, Mapped>,
+    q8: bool,
+) -> Result<Vec<Planned>, Error> {
     let mut planned = Vec::new();
     for (name, mut m) in mapped {
         let source = &m.sources[0];
@@ -355,7 +432,7 @@ pub fn plan_tensors(
             });
         }
     }
-    Ok((plan, planned))
+    Ok(planned)
 }
 
 /// Serving's tokenizer, built from the header's keys `kvs`, which must preserve HF's split,
@@ -451,6 +528,51 @@ mod tests {
     use hf::quant_config::plan;
 
     use super::*;
+
+    #[test]
+    fn mtp_header_keeps_the_signed_ratio_array_and_the_target_header() {
+        let keys = vec![
+            ("qwen4exp.block_count".to_string(), Value::U32(48)),
+            (
+                "qwen4exp.attention.compress_ratios".to_string(),
+                Value::Array(vec![Value::I32(128); 48]),
+            ),
+        ];
+        let tensors = vec![TensorDecl {
+            name: "blk.48.nextn.eh_proj.weight".to_string(),
+            dims: vec![32, 32],
+            type_id: GgmlType::BF16.as_u32(),
+            nbytes: 32 * 32 * 2,
+        }];
+        let dir = Path::new("/synthetic-qwen-folder");
+        let draft = draft_header(dir, &keys, 48, tensors.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(draft.value("qwen4exp.block_count"), Some(&Value::U32(49)));
+        assert_eq!(
+            draft.value("qwen4exp.nextn_predict_layers"),
+            Some(&Value::U32(1))
+        );
+        assert_eq!(
+            draft.value("qwen4exp.attention.compress_ratios"),
+            Some(&Value::Array(
+                (0..48)
+                    .map(|_| Value::I32(128))
+                    .chain([Value::I32(0)])
+                    .collect()
+            ))
+        );
+        assert_eq!(keys[0].1, Value::U32(48));
+        assert_eq!(keys[1].1, Value::Array(vec![Value::I32(128); 48]));
+        assert!(draft_header(dir, &keys, 48, vec![]).unwrap().is_none());
+        assert!(
+            draft_header(dir, &keys, usize::MAX, tensors)
+                .err()
+                .expect("overflow refused")
+                .to_string()
+                .contains("block count exceeds u32")
+        );
+    }
 
     /// A table in F8 parts across two shards is read where the folder stores it: each part's
     /// byte range in its shard, in the parts' order, at the one tensor scale. Parts at unequal

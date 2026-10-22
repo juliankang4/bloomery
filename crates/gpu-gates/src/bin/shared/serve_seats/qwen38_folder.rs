@@ -14,6 +14,7 @@ use tokenizer::Tokenizer;
 pub struct Opened {
     pub header: Split,
     pub tokenizer: Tokenizer,
+    pub has_draft: bool,
     pub parts: Box<dyn FnOnce(Split) -> Folder38>,
 }
 
@@ -27,8 +28,23 @@ pub fn open(path: &Path) -> Result<Opened, GateError> {
     Ok(Opened {
         header: f.header,
         tokenizer: f.tokenizer,
+        has_draft: f.draft.is_some(),
         parts: Box::new(move |header| Folder38::new(header, source, ple)),
     })
+}
+
+/// The checkpoint folder's MTP header, borrowing its target's embedding and head.
+#[cfg(feature = "checkpoint")]
+pub fn draft(path: &Path) -> Result<Split, GateError> {
+    model_hf::arch::qwen35moe::folder::open(path)?
+        .draft
+        .ok_or_else(|| format!("checkpoint folder {} holds no MTP layer", path.display()).into())
+}
+
+/// A checkpoint folder's draft in a build without checkpoint support, refused by name.
+#[cfg(not(feature = "checkpoint"))]
+pub fn draft(path: &Path) -> Result<Split, GateError> {
+    open(path).map(|f| f.header)
 }
 
 /// A checkpoint folder in a build without the `checkpoint` feature, refused by name.

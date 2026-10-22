@@ -4356,7 +4356,7 @@ mod gate {
                 head: false,
             };
         }
-        let r1 = Mtp38::open(m.gpu(), m.weights(), draft, &own, &plan, false, 1)
+        let r1 = Mtp38::open(m.gpu(), m.weights(), (draft, None), &own, &plan, false, 1)
             .err()
             .map_or("opened".to_string(), |e| e.to_string());
         let r1_ok = r1.contains("the load borrows the target's token_embd and output");
@@ -4364,7 +4364,7 @@ mod gate {
         println!("(q) a draft with its own matrices: {r1} {}", verdict(r1_ok));
         let mut other = plan;
         other.map_bytes += 4;
-        let r2 = Mtp38::open(m.gpu(), m.weights(), draft, mtp, &other, false, 1)
+        let r2 = Mtp38::open(m.gpu(), m.weights(), (draft, None), mtp, &other, false, 1)
             .err()
             .map_or("opened".to_string(), |e| e.to_string());
         let r2_ok = r2.contains("resident weights, store and row map hold");

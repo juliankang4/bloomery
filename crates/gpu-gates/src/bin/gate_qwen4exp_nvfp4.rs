@@ -64,6 +64,10 @@ mod qwen38_folder;
 mod qwen38_open;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/quiet.rs"]
+mod quiet;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::path::Path;
     use std::time::Instant;
@@ -76,7 +80,10 @@ mod gate {
     use crate::qwen38_folder;
     use crate::qwen38_open::{Open38, open_split};
 
-    use bloomery_gpu::arch::qwen3moe::{Model38, Prompt38, Qwen38Model, RouteTap};
+    use bloomery_gpu::arch::qwen3moe::{
+        Body38, Model38, Prompt38, Qwen38Model, RouteTap, TargetRows,
+    };
+    use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::flip;
@@ -85,10 +92,12 @@ mod gate {
         GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
     };
     use gguf::GgmlType;
+    use model::arch::models::headpick::HeadSet;
     use model::arch::qwen35moe::names;
     use model::arch::qwen35moe::place::{Experts, PlanInputs};
     use model::placement::{ModelTensors, PlanLevers, Role};
     use refset::arch::qwen4exp::nvfp4::{BATCH, BATCH_BF16, D3K, D3K_BF16, HF};
+    use runtime::Advance;
 
     /// Cache rows: D3K's step at position 3,000, with room.
     const CTX: usize = 3072;
@@ -143,9 +152,12 @@ mod gate {
     }
 
     /// (l): the plan on the one visible card, every routed expert on it, and the load.
-    fn open(path: &Path, d: &Dims) -> Result<(Qwen38Model, bool), GateError> {
+    fn open(
+        path: &Path,
+        d: &Dims,
+        levers: &bloomery_levers::Levers,
+    ) -> Result<(Qwen38Model, bool), GateError> {
         let file = model_of(path)?;
-        let levers = bloomery_levers::at_main(&[])?;
         let specs = Place::A.on_host()?.card_specs()?;
         let [card] = specs[..] else {
             return Err(format!("--place a resolved to {} cards, not one", specs.len()).into());
@@ -153,6 +165,51 @@ mod gate {
         let t = Instant::now();
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let plan_levers = PlanLevers::default();
+        if levers.draft() == Some("mtp") {
+            let inputs = PlanInputs::describe(file.header())?;
+            let draft = qwen38_folder::draft(path)?;
+            let mtp = model::arch::qwen35moe::place::MtpInputs::read(
+                &draft,
+                file.header(),
+                &inputs,
+                HeadSet::Full,
+            )?;
+            let machine = model::arch::qwen35moe::place::machine_for_experts(
+                card,
+                inputs.spec.layers.len(),
+                ub as u64,
+                Experts::Card,
+            );
+            let plan = inputs.plan_mtp_with_slots(
+                &machine,
+                CTX as u64,
+                &plan_levers,
+                &mtp,
+                Experts::Card,
+                1,
+            )?;
+            let ok = plan.plan.host.experts == 0
+                && plan.plan.n_l.iter().all(|&n| n == d.n_expert as u64);
+            println!(
+                "(l) folder MTP draft_resident_bytes={} arena_bytes={} {}",
+                plan.draft_resident_bytes(),
+                plan.arena_bytes,
+                verdict(ok)
+            );
+            let mut model = Body38::open_placed_mtp_slots(
+                file,
+                &plan,
+                &inputs,
+                0,
+                levers.host(),
+                ub,
+                &draft,
+                &mtp,
+                1,
+            )?;
+            model.set_mode(StepMode::Graph);
+            return Ok((model, ok));
+        }
         let planned = Open38 {
             card,
             ctx: CTX,
@@ -423,10 +480,94 @@ mod gate {
         })
     }
 
+    fn mtp(mut m: Qwen38Model, prompt: &[u32]) -> Result<bool, GateError> {
+        m.reset()?;
+        m.prompt38(prompt, Prompt38::Pass)?;
+        let hidden = m.target_streams(TargetRows::Pass, prompt.len())?;
+        let width = hidden.len() / prompt.len();
+        let mut ok = true;
+        for rows in 1..=4 {
+            let mut eager = None;
+            for mode in [WalkMode::Eager, WalkMode::Graph, WalkMode::Graph] {
+                m.poison_mtp_scratch()?;
+                let out = m.mtp_draft(
+                    DraftFeed::Rows(Feed {
+                        tokens: &prompt[..rows],
+                        pos0: 0,
+                        hidden: Hidden::Host(&hidden[..rows * width]),
+                        media: None,
+                    }),
+                    DraftHead::Full,
+                    mode,
+                )?;
+                let state = m
+                    .mtp_l_out()?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>();
+                let got = (
+                    out.tokens,
+                    out.p.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                    state,
+                );
+                match &eager {
+                    None => eager = Some(got),
+                    Some(want) => ok &= *want == got,
+                }
+            }
+            println!(
+                "(mtp-g) rows={rows} poisoned scratch: eager = graph = replay {}",
+                verdict(ok)
+            );
+        }
+        m.reset()?;
+        let mut plain = vec![m.prompt38(prompt, Prompt38::Auto)?];
+        while plain.len() < 32 {
+            plain.push(m.step(&[*plain.last().ok_or("no plain token")?])?);
+        }
+        m.reset()?;
+        let mut session = app::Session::from_model(m, CTX as u32);
+        let draft = app::mtp::MtpDraft::open(session.model(), Prompt38::Auto, StepMode::Graph)?;
+        let mut spec =
+            session.with_draft::<app::mtp::MtpDraft<Body38>, 4>(draft, &mut crate::quiet::Quiet)?;
+        let first = spec.prompt(&mut session, prompt)?;
+        spec.begin(&session, prompt, first)?;
+        let mut drafted = vec![first];
+        while drafted.len() < plain.len() {
+            spec.pass(
+                &mut session,
+                *drafted.last().ok_or("no draft token")?,
+                &mut drafted,
+            )?;
+        }
+        let same = drafted[..plain.len()] == plain;
+        println!(
+            "(mtp-v) greedy target oracle: {} tokens plain = verified {}",
+            plain.len(),
+            verdict(same)
+        );
+        Ok(ok && same)
+    }
+
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main(&[bloomery_levers::DRAFT])?;
+        if let Some(word) = levers.draft()
+            && !matches!(word, "off" | "mtp")
+        {
+            return Err(
+                format!("BLOOMERY_DRAFT={word:?}: this gate supports only off or mtp").into(),
+            );
+        }
         let path = ref_model_path()?;
         println!("model {}", path.display());
         let d = dims(&path)?;
+        if levers.draft() == Some("mtp") {
+            let batch = set(d.dense.batch.0)?;
+            let (_, toks, _) = batch.step()?;
+            let (m, mut ok) = open(&path, &d, &levers)?;
+            ok &= mtp(m, toks)?;
+            return if ok { Ok(()) } else { Err(checks_failed()) };
+        }
         let Dense {
             ty,
             q8_indexer,
@@ -457,7 +598,7 @@ mod gate {
             }
         }
         let (_, toks, _) = batch.step()?;
-        let (mut m, mut ok) = open(&path, &d)?;
+        let (mut m, mut ok) = open(&path, &d, &levers)?;
         let vocab = m.body("run")?.vocab();
         m.reset()?;
         let r = run_steps(&mut m, toks)?;

@@ -401,6 +401,7 @@ fn layer_tensors(draft: &Split, index: usize) -> Result<(), PlacementError> {
                 && !allowed.iter().any(|a| a == n)
                 && *n != EMBEDDING
                 && *n != HEAD
+                && !gguf::scaled_weight(draft, n).is_some_and(|weight| required.contains(&weight))
         })
         .collect();
     if let Some(name) = other.first() {

@@ -402,4 +402,5 @@ generate_ds41     nemotron_moe_router_496_pick                 0           0
 generate_ds41     nvfp4_gate_up_sel                            0           0
 generate_ds41     nvfp4_gemv                                   0           0
 generate_ds41     nvfp4_gemv_sel32                             0           0
+generate_ds41     nvfp4_gemv_sel_f32                           0           0
 generate_ds41     relu_sqr                                     0           0

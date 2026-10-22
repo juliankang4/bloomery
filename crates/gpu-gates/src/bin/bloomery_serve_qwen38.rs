@@ -192,12 +192,12 @@ mod tests {
         );
     }
 
-    /// A checkpoint folder's load reads no MTP layers: a set `mtp` is refused by name, and an
-    /// unset draft the rule would have run goes off naming the folder.
+    /// A checkpoint folder without an MTP layer refuses a set `mtp`, and turns an unset
+    /// draft off naming the folder.
     #[test]
     fn a_folder_load_refuses_a_set_mtp_draft_and_turns_an_unset_one_off() {
         let why = draft_off_for(Draft38Off::Folder, Some("mtp"), (true, None))
-            .expect_err("BLOOMERY_DRAFT=mtp on a checkpoint folder")
+            .expect_err("BLOOMERY_DRAFT=mtp without a folder MTP layer")
             .to_string();
         assert!(
             why.contains("BLOOMERY_DRAFT=mtp with a checkpoint folder"),

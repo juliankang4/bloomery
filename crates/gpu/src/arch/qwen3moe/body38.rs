@@ -1274,8 +1274,8 @@ type CardParts =
 /// header its plan was made from), its card tensors through its part source, and the PLE
 /// table's rows where the folder stores them, which the table's NVMe reader maps
 /// ([`StoredRows`]). The load holds every tensor on its one card and the PLE table on the NVMe
-/// tier ([`crate::parts::OnCard`]): no host set, so no residency machine, and the folder's MTP
-/// layers are not read, so no draft. Each card part's file pages leave the page cache once it is
+/// tier ([`crate::parts::OnCard`]): no host set, so no residency machine. The part source also
+/// reads the folder's MTP tensors when a draft is planned. Each part's pages leave the cache once it is
 /// staged under the host config's `card_dontneed`, as a split's card segments do.
 pub struct Folder38 {
     header: Split,
@@ -1294,27 +1294,24 @@ impl Folder38 {
         Folder38 {
             header,
             parts: Box::new(move |stream, plan, card, release| {
-                crate::parts::load_placed(stream, &source, plan, card, release)
+                let selected = model::part::Filtered {
+                    source: &source,
+                    keep: |name: &str| plan.model.tensors.iter().any(|t| t.name == name),
+                };
+                crate::parts::load_placed(stream, &selected, plan, card, release)
             }),
             ple,
         }
     }
 }
 
-/// A folder's load under `residency`, `drafted` or not, refused by name unless it runs no
-/// residency machine and no draft ([`Folder38`]).
-fn refuse_folder(residency: Residency, drafted: bool) -> Result<(), GpuError> {
+/// A folder's load under `residency`, refused unless it runs no residency machine.
+fn refuse_folder(residency: Residency) -> Result<(), GpuError> {
     if residency != Residency::Off {
         return Err(GpuError::shape(
             WHAT,
             "a checkpoint folder's load runs under BLOOMERY_RESIDENCY=off: a residency machine \
              moves experts through a host set, which the folder's load does not hold",
-        ));
-    }
-    if drafted {
-        return Err(GpuError::shape(
-            WHAT,
-            "a checkpoint folder's load runs no MTP draft: the folder's MTP layers are not read",
         ));
     }
     Ok(())
@@ -1554,8 +1551,12 @@ impl Body38 {
             Model38::Folder(f) => (f.header, Some((f.parts, f.ple))),
         };
         if folder.is_some() {
-            refuse_folder(residency, mtp.is_some())?;
+            refuse_folder(residency)?;
         }
+        let draft_parts = folder.as_ref().and_then(|(parts, _)| {
+            mtp.filter(|(draft, _, _)| draft.shard_path(0) == file.shard_path(0))
+                .map(|_| parts.as_ref() as &crate::model::PartsLoad<'_>)
+        });
         let (bytes, stored) = match &folder {
             Some((parts, ple)) => (CardBytes::Parts(parts.as_ref()), ple.as_ref()),
             None => (CardBytes::File, None),
@@ -1618,7 +1619,9 @@ impl Body38 {
             |stream, _, layers, w| Body38::derive(stream, &shape.kinds, layers, w),
             |gpu, file, w, set, glue| {
                 let draft = mtp
-                    .map(|(d, m, p)| Mtp38::open(gpu, w, d, m, p, host.card_dontneed, slots))
+                    .map(|(d, m, p)| {
+                        Mtp38::open(gpu, w, (d, draft_parts), m, p, host.card_dontneed, slots)
+                    })
                     .transpose()?;
                 let mut body = Body38::load_placed(
                     gpu,
@@ -4222,6 +4225,12 @@ impl GpuModel<Body38> {
         self.note_fault(WHAT_D, r)
     }
 
+    /// Fill the draft walk's scratch with NaNs without changing its inbox or stored state.
+    pub fn poison_mtp_scratch(&mut self) -> Result<(), GpuError> {
+        let (gpu, _, body) = self.body_parts("qwen4exp poison_mtp_scratch")?;
+        body.draft_mut()?.poison_scratch(gpu.stream())
+    }
+
     /// Arm (or disarm) the draft's taps ([`Mtp38::set_taps`]); its captured
     /// walks are dropped first. Load-time allocation.
     pub fn set_mtp_taps(&mut self, on: bool) -> Result<(), GpuError> {
@@ -5900,22 +5909,16 @@ mod tests {
         }
     }
 
-    /// A checkpoint folder's load runs no residency machine and no draft: either is refused by
-    /// name, and a load under neither passes.
+    // PIN(2026-10-22): folder drafts use the placed MTP load; only residency is refused here.
     #[test]
-    fn a_folder_load_refuses_residency_and_a_draft() {
-        assert!(refuse_folder(Residency::Off, false).is_ok());
+    fn a_folder_load_refuses_residency() {
+        assert!(refuse_folder(Residency::Off).is_ok());
         let mid = Residency::Mid {
             pinned: 1,
             spares: 1,
         };
-        for (residency, drafted, need) in [
-            (mid, false, "BLOOMERY_RESIDENCY=off"),
-            (Residency::Off, true, "no MTP draft"),
-        ] {
-            let e = refuse_folder(residency, drafted).unwrap_err().to_string();
-            assert!(e.contains(need), "{e}");
-        }
+        let e = refuse_folder(mid).unwrap_err().to_string();
+        assert!(e.contains("BLOOMERY_RESIDENCY=off"), "{e}");
     }
 
     /// A checkpoint folder's F8 table, its rows in runs of two files where the folder stores
