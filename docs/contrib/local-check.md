@@ -113,9 +113,9 @@ For `bursts`, omitting `--n-l` keeps the host-only replay; explicitly passing an
 
 Exceptions:
 
-- **`just` is a T0 prerequisite.** Three T0 units call it: `recipes-self-test`, `check-recipes` and the self-test of
-  `tools/check-comment-only.py`. The script's own preflight checks only `python3` and `rustup`
-  ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
+- **`just` is a T0 prerequisite.** The T0 unit `check-recipes` calls it, directly and through two self-tests it runs:
+  `tools/recipes.py --self-test` and `tools/check-comment-only.py --self-test`. The script's own preflight checks only
+  `python3` and `rustup` ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)).
 - **aarch64 Linux.** `tools/nightly/install.sh` installs the x86_64 packages only. One DGX Spark ran T1 with the CUDA 13.3
   headers of the `nvidia/cuda:13.3.1-devel-ubuntu24.04` image, LLVM 21.1.8's libclang, the distribution's numpy and
   PIL, and `just` built from source (same link).

@@ -361,7 +361,6 @@ blk_releasebuild() { tool_selftest release/build.sh; }
 # Every Python tool's own tests, on the Mac and the Linux host nightly (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison (unit pytools.list) fails on one that is not. Each tool is a unit of its own
 # (pytools.K, the K-th line, run from the repository root), so the scheduler bounds them with every other unit.
-# tools/contrib-check.sh reads the same list by its `  selftests=(` and `  )` lines.
 pytools_list() {
   selftests=(
     "tools/bloomery/manifest.py --self-test"

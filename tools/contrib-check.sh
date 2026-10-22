@@ -13,18 +13,17 @@
 #         lab-<name>-fmt         cargo fmt --check on that lab (the root fmt does not reach it). Building and running a lab is
 #                                its contributor's verify script on their card (CONTRIBUTING.md)
 #         test-<crate>           cargo test -p <crate>, for each crate `recipes.py pure-crates` lists
-#         recipes-self-test      python3 tools/recipes.py --self-test
-#         <tools/…/x.py>         each Python tool self-test tools/check-recipes.sh lists (read from its `selftests=(` array: the
-#                                one owner of that list), run as that script runs it
 #         check-<name>           every tools/check-*.sh, as `tools/mac-static.sh --checks --list --no-base` lists them with
 #                                their arguments (check-model-tax with no base revision: its tables against the code alone).
 #                                None is left out: each reads the tree and runs no cargo and no box command, and
 #                                `recipes.py host-nightly` runs the same set on a Linux host (all ran green on a Mac).
-#                                check-rustflags holds the two cargo files against each other, never this machine's CPU
+#                                check-rustflags holds the two cargo files against each other, never this machine's CPU.
+#                                check-recipes runs `tools/recipes.py --self-test` and each Python tool self-test of its
+#                                `selftests=(` array, so neither is a unit of its own here
 #   T1  x86_64 or aarch64 Linux with no card: T0, then every unit of `python3 tools/recipes.py host-nightly` that T0 did
-#       not already run by name (the check scripts and recipes-self-test run once), each `bash tools/gate.sh --release
-#       --locked -p <crate>`. Needs what tools/nightly/install.sh lists: the CUDA headers (cuda.h, curand.h,
-#       crt/host_config.h under CUDA_TOOLKIT_PATH), libclang for bindgen, python3-numpy and python3-pil.
+#       not already run (the check scripts run once, and recipes-self-test runs inside check-recipes), each
+#       `bash tools/gate.sh --release --locked -p <crate>`. Needs what tools/nightly/install.sh lists: the CUDA headers
+#       (cuda.h, curand.h, crt/host_config.h under CUDA_TOOLKIT_PATH), libclang for bindgen, python3-numpy and python3-pil.
 #   T2  the card and fixture tier is not built: `--tier t2` prints that and exits 64.
 #
 # RUSTFLAGS: the repo's .cargo/config.toml targets Zen 3 (znver3) on x86_64 Linux, and a binary built for it may stop with an
@@ -40,7 +39,7 @@
 # CONTRIB_INJECT_FAIL=1 adds one deliberately failing unit, `inject-fail`: the red path end to end.
 #
 # Exit: 0 every unit green; 1 a unit red; 64 usage (a tier this host cannot run included; `--tier t2`); 69 a prerequisite is
-# missing (named, with how it is made); 70 a list this script reads (the self-tests, the pure crates, the nightly's units) is
+# missing (named, with how it is made); 70 a list this script reads (the pure crates, the nightly's units) is
 # empty, `--only` matches no unit, or `git status` fails in the tree (whether it is clean is unknown, so no commit is named).
 set -uo pipefail
 
@@ -191,13 +190,6 @@ crates=$(python3 tools/recipes.py pure-crates --names) || { say "contrib-check: 
 [ -n "$crates" ] || { say "contrib-check: recipes.py pure-crates lists no crate"; exit 70; }
 for c in $crates; do add "test-$c" "cargo test -p $c"; done
 
-add recipes-self-test 'python3 tools/recipes.py --self-test'
-
-# check-recipes.sh's `selftests=(` array: lines `    "tools/x.py --self-test"`.
-selftests=$(sed -n '/^  selftests=($/,/^  )$/p' tools/check-recipes.sh | sed -n 's/^ *"\(tools\/[^"]*\)"$/\1/p')
-[ -n "$selftests" ] || { say "contrib-check: no Python self-test found in tools/check-recipes.sh's selftests=( array"; exit 70; }
-while IFS= read -r t; do add "${t%% *}" "python3 $t"; done <<< "$selftests"
-
 # The check scripts and the arguments each takes come from tools/mac-static.sh, the one owner of that discovery; --no-base because a
 # contributor's checkout has no revision to hold check-model-tax's tables to (that unit's output says so).
 checks=$(bash tools/mac-static.sh --checks --list --no-base) || { say "contrib-check: tools/mac-static.sh --checks --list failed"; exit 70; }
@@ -211,8 +203,8 @@ if [ "$TIER" = t1 ]; then
   nightly=$(python3 tools/recipes.py host-nightly) || { say "contrib-check: tools/recipes.py host-nightly failed"; exit 70; }
   [ -n "$nightly" ] || { say "contrib-check: recipes.py host-nightly lists no unit"; exit 70; }
   while IFS=$'\t' read -r name cmd; do
-    # the check scripts and recipes-self-test are the same commands T0 ran under the same names
-    if cut -f1 "$PLAN" | grep -qxF "$name"; then continue; fi
+    # the check scripts are the same commands T0 ran under the same names; check-recipes ran recipes-self-test
+    if [ "$name" = recipes-self-test ] || cut -f1 "$PLAN" | grep -qxF "$name"; then continue; fi
     add "$name" "$cmd"
   done <<< "$nightly"
 fi
