@@ -6836,7 +6836,9 @@ mod gate {
             if !wanted("nvfp4_native") {
                 return Ok(true);
             }
-            if !cfg!(feature = "nvfp4-mma") {
+            let native = GemmAct32::new_routed(dev.gpu.stream(), 1, 64)?.bytes()
+                > GemmAct32::new(dev.gpu.stream(), 1, 64)?.bytes();
+            if !native {
                 return if super::case_filter().as_deref() == Some("nvfp4_native") {
                     Err("nvfp4_native requires the native FP4 build".into())
                 } else {
@@ -6846,9 +6848,27 @@ mod gate {
             let gpu = dev.gpu;
             let stream = gpu.stream();
             let mut ok = true;
-            for (rows, slots, k) in [(16usize, 14usize, 128usize), (128, 73, 64), (144, 129, 256)] {
+            for (rows, slots, k, one_hot) in [
+                (16usize, 14usize, 128usize, false),
+                (128, 73, 64, false),
+                (144, 129, 256, false),
+                (48, 73, 64, true),
+                (16, 14, 20_480, false),
+            ] {
                 let codes: Vec<u32> = (0..2 * rows * k / 8)
-                    .map(|i| (2 + (i / (k / 8) % rows) as u32 % 3) * 0x11111111)
+                    .map(|i| {
+                        let row = i / (k / 8) % rows;
+                        if !one_hot {
+                            return (2 + row as u32 % 3) * 0x11111111;
+                        }
+                        let word = i % (k / 8);
+                        let at = 16 * (word / 2) + 4 * (word & 1);
+                        (0..4).fold(0u32, |bits, j| {
+                            let lo = ((row + 3 * (at + j)) & 15) as u32;
+                            let hi = ((row + 3 * (at + j + 8)) & 15) as u32;
+                            bits | (lo | (hi << 4)) << (8 * j)
+                        })
+                    })
                     .collect();
                 let wq = DeviceTensor::upload(stream, &codes, 2 * rows, k / 8)?;
                 let we = DeviceTensor::upload(
@@ -6859,7 +6879,12 @@ mod gate {
                 )?;
                 let ws = DeviceTensor::upload(stream, &[1.0f32, 0.5], 2, 1)?;
                 let xs: Vec<f32> = (0..slots * k)
-                    .map(|i| 2.0f32.powi((i / k % 4) as i32 - 2) * [2.0, 1.0, 4.0, 8.0][i / 16 % 4])
+                    .map(|i| {
+                        if one_hot {
+                            return if i % k == i / k % k { 1.0 } else { 0.0 };
+                        }
+                        2.0f32.powi((i / k % 4) as i32 - 2) * [2.0, 1.0, 4.0, 8.0][i / 16 % 4]
+                    })
                     .collect();
                 let x = DeviceBuffer::from_host(stream, &xs)?;
                 let ids: Vec<u32> = (0..slots).map(|i| (i % 2) as u32).collect();
@@ -6947,19 +6972,27 @@ mod gate {
                         .filter(|(i, value)| {
                             let row = i % rows;
                             let col = i / rows;
-                            let expected = (k / 64) as f32
-                                * 1360.0
-                                * [1.0, 1.5, 2.0][row % 3]
-                                * 2.0f32.powi((col % 4) as i32 - 2)
-                                * [1.0, 0.5][ids[col] as usize];
-                            !value.is_finite() || (**value - expected).abs() > 5.0e-7 * expected
+                            let dot = if one_hot {
+                                let code = (row + 3 * (col % k)) & 15;
+                                let level = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][code & 7];
+                                let value = if code & 8 == 0 { level } else { -level };
+                                value * [2.0, 1.0, 4.0, 8.0][(col % k) / 16]
+                            } else {
+                                (k / 64) as f32
+                                    * 1360.0
+                                    * [1.0, 1.5, 2.0][row % 3]
+                                    * 2.0f32.powi((col % 4) as i32 - 2)
+                            };
+                            let expected = dot * [1.0, 0.5][ids[col] as usize];
+                            !value.is_finite()
+                                || (**value - expected).abs() > 5.0e-7 * expected.abs().max(1.0)
                         })
                         .count();
                     let replay_eq = bits_equal(&eager, &replay);
                     let pass =
                         tail && wrong == 0 && replay_eq && q8_eq && gpu.take_fault()?.is_none();
                     println!(
-                        "gemm32 case=nvfp4_native rows={rows} slots={slots} k={k} fused={fused} q8_eq={q8_eq} wrong={wrong} guard={tail} eager_graph_eq={replay_eq} {}",
+                        "gemm32 case=nvfp4_native rows={rows} slots={slots} k={k} one_hot={one_hot} fused={fused} q8_eq={q8_eq} wrong={wrong} guard={tail} eager_graph_eq={replay_eq} {}",
                         verdict(pass)
                     );
                     ok &= pass;

@@ -257,8 +257,24 @@ fn e4m3(x: f32) -> u32 {
 }
 
 #[inline(always)]
-fn compact(x: u32) -> u32 {
-    (x & 15) | ((x >> 4) & 240) | ((x >> 8) & 3840) | ((x >> 12) & 61440)
+fn packed_pair(a: u32, b: u32) -> [u32; 2] {
+    let (lo, hi): (u32, u32);
+    // SAFETY: shifts, nibble selection and byte permutation use registers only.
+    unsafe {
+        ptx_asm!(
+            "{ .reg .b32 a4, a8, b4, b8, al, ah, bl, bh;\n\
+             shr.u32 a4, %2, 4; shr.u32 a8, %2, 8;\n\
+             shr.u32 b4, %3, 4; shr.u32 b8, %3, 8;\n\
+             lop3.b32 al, %2, a4, 0x0f0f0f0f, 0xe4;\n\
+             lop3.b32 ah, a4, a8, 0x0f0f0f0f, 0xe4;\n\
+             lop3.b32 bl, %3, b4, 0x0f0f0f0f, 0xe4;\n\
+             lop3.b32 bh, b4, b8, 0x0f0f0f0f, 0xe4;\n\
+             prmt.b32 %0, al, bl, 0x6420;\n\
+             prmt.b32 %1, ah, bh, 0x6420; }",
+            out("=r") lo, out("=r") hi, in("r") a, in("r") b,
+        );
+    }
+    [lo, hi]
 }
 
 #[inline(always)]
@@ -511,12 +527,9 @@ mod native {
                     sp.add((step & 1) * 192),
                 )
             };
-            let packed = cuda_device::vector::U32x4::new([
-                compact(w[0]) | (compact(w[1]) << 16),
-                compact(w[0] >> 4) | (compact(w[1] >> 4) << 16),
-                compact(w[2]) | (compact(w[3]) << 16),
-                compact(w[2] >> 4) | (compact(w[3] >> 4) << 16),
-            ]);
+            let p0 = packed_pair(w[0], w[1]);
+            let p1 = packed_pair(w[2], w[3]);
+            let packed = cuda_device::vector::U32x4::new([p0[0], p0[1], p1[0], p1[1]]);
             // SAFETY: each thread owns one aligned four-word half of its shared row.
             unsafe {
                 *wp.add(sr * 12 + 4 * half)
