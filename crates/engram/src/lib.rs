@@ -406,11 +406,8 @@ impl Site {
 
     /// Start the reads for `ids` and return without waiting.
     ///
-    /// One `madvise(WILLNEED)` per row, which is how ik's own port does it: the
-    /// kernel submits each row's page(s) and the later touch finds them in
-    /// flight. That turns 48 serial faults into one batch at the drive's queue
-    /// depth. The cost is one syscall per row, paid whether or not the page is
-    /// already resident.
+    /// One `madvise(WILLNEED)` per distinct page run. Repeated and neighbouring
+    /// rows share advice; the later touch finds their reads in flight.
     pub fn prefetch(&self, ids: &[u32]) -> Result<(), EngramError> {
         self.view().prefetch(ids)
     }
@@ -640,16 +637,29 @@ impl TableBytes<'_> {
         Ok((first, end - first))
     }
 
-    /// One `madvise(advice)` over each row's pages, `op` naming it in a
-    /// refusal.
+    /// The distinct page runs of `ids`, sorted and joined at page boundaries.
+    fn page_runs(&self, ids: &[u32]) -> Result<Vec<(usize, usize)>, EngramError> {
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (first, last) in adjacent_runs(ids) {
+            let (at, len) = self.run_pages(first, last)?;
+            match spans.last_mut() {
+                Some((start, size)) if at <= *start + *size => {
+                    *size = (*start + *size).max(at + len) - *start;
+                }
+                _ => spans.push((at, len)),
+            }
+        }
+        Ok(spans)
+    }
+
+    /// One `madvise(advice)` per distinct page run, `op` naming a refusal.
     fn advise(
         &self,
         ids: &[u32],
         advice: libc::c_int,
         op: &'static str,
     ) -> Result<(), EngramError> {
-        for &id in ids {
-            let (first, len) = self.pages(id)?;
+        for (first, len) in self.page_runs(ids)? {
             self.advise_pages(first, len, advice, op)?;
         }
         Ok(())
@@ -690,19 +700,18 @@ impl TableBytes<'_> {
         }
     }
 
-    /// [`Site::prefetch`]'s read: `WILLNEED` over each row's pages.
+    /// [`Site::prefetch`]'s read: `WILLNEED` over the distinct page runs.
     fn prefetch(&self, ids: &[u32]) -> Result<(), EngramError> {
         self.advise(ids, libc::MADV_WILLNEED, "madvise(WILLNEED)")
     }
 
-    /// [`Site::populate`]'s read: `POPULATE_READ` over each row's pages.
+    /// [`Site::populate`]'s read: `POPULATE_READ` over the distinct page runs.
     fn populate(&self, ids: &[u32]) -> Result<(), EngramError> {
         let page = u64::try_from(self.page).expect("a page size fits a u64");
-        for &id in ids {
-            let (first, len) = self.pages(id)?;
+        for (first, len) in self.page_runs(ids)? {
             let addr = first as *mut libc::c_void;
-            // SAFETY: the range is whole pages inside the mapping (`pages`
-            // rounds a row out to the mapping's own pages).
+            // SAFETY: page_runs joins only overlapping or adjacent whole
+            // pages inside the same file mapping.
             unsafe { os::populate_span(addr, len, page, || os::advise_populate(addr, len)) }
                 .map_err(|e| self.io("madvise(POPULATE_READ)", e.into()))?;
         }
@@ -971,7 +980,39 @@ fn faults_of(who: libc::c_int) -> Faults {
 
 #[cfg(test)]
 mod tests {
-    use super::{EngramError, RawTensorInfo, Site, adjacent_runs};
+    use super::{EngramError, RawTensorInfo, Site, TableBytes, adjacent_runs};
+
+    #[test]
+    fn page_runs_advise_each_requested_page_once() {
+        let bytes = [0u8; 512];
+        for row_bytes in [3, 16, 23] {
+            let table = TableBytes {
+                name: "rows",
+                path: std::path::Path::new("rows"),
+                bytes: &bytes,
+                row_bytes,
+                page: 16,
+            };
+            let ids = [15, 2, 0, 2, 1, 8, 9];
+            let mut expected = std::collections::BTreeSet::new();
+            for &id in &ids {
+                let start = bytes.as_ptr() as usize + id as usize * row_bytes;
+                expected.extend(start / 16..=(start + row_bytes - 1) / 16);
+            }
+            let runs = table.page_runs(&ids).unwrap();
+            let actual: Vec<_> = runs
+                .iter()
+                .flat_map(|&(at, len)| at / 16..(at + len) / 16)
+                .collect();
+            assert_eq!(actual, expected.into_iter().collect::<Vec<_>>());
+            assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0));
+            assert!(table.page_runs(&[]).unwrap().is_empty());
+            assert!(matches!(
+                table.page_runs(&[0, table.rows() as u32]),
+                Err(EngramError::RowOutOfRange { .. })
+            ));
+        }
+    }
 
     /// A table whose start or end passes u64 is past the end of its file, named
     /// with the data base and the header's offset: an F32 [4, 1] table in an

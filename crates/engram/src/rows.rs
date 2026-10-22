@@ -436,13 +436,15 @@ impl RunTable {
         Ok(out)
     }
 
-    /// `op` over each stretch of `ids` in its run's bytes.
+    /// An order-independent `op` over each file's rows. Repeated ids stay repeated.
     fn each(
         &self,
         ids: &[u32],
         mut op: impl FnMut(TableBytes<'_>, &[u32]) -> Result<(), EngramError>,
     ) -> Result<(), EngramError> {
-        for (run, own, _) in self.stretches(ids)? {
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        for (run, own, _) in self.stretches(&sorted)? {
             op(self.view(run), &own)?;
         }
         Ok(())
@@ -532,6 +534,13 @@ mod tests {
         let want: Vec<u8> = ids.iter().flat_map(|&i| row(i as u8)).collect();
         assert_eq!(out, want);
         t.prefetch(&ids).unwrap();
+        let mut groups = Vec::new();
+        t.each(&ids, |_, rows| {
+            groups.push(rows.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(groups, [vec![0, 1, 1], vec![0, 1, 2], vec![0]]);
         assert!(matches!(
             t.copy_rows(&[6], &mut [0; 4]),
             Err(EngramError::RowOutOfRange { id: 6, rows: 6, .. })
