@@ -18,7 +18,7 @@ use hf::modelopt::{self, Plain, Use};
 use hf::quant_config::{self, Config, Format, Plan};
 use safetensors::{Dtype, Folder};
 
-use model::part::StoredRows;
+use model::part::{StoredPlane, StoredRows};
 
 use super::{Checkpoint, Mapped};
 use crate::part::{self, Made};
@@ -186,9 +186,9 @@ pub fn open(dir: &Path) -> Result<Opened, Error> {
 }
 
 /// The row table `decl`, mapped as `m`, where `folder` stores it: each part's byte range in its
-/// shard. Only F8 rows are stored as the program reads them (`modelopt::fp8_rows_scale`), so a
-/// table of another type, a part that is not `decl`'s rows wide, parts at different tensor
-/// scales, and parts that do not add up to the table's rows are refused by name.
+/// shard. F8 values or NVFP4 codes and block scales stay in their separate
+/// stored planes. Each part must have the table's width and tensor scale,
+/// and their rows must add up to the table's.
 fn ple_rows(
     folder: &Folder,
     plan: &Plan,
@@ -197,47 +197,64 @@ fn ple_rows(
 ) -> Result<StoredRows, Error> {
     let name = &decl.name;
     let ty = GgmlType::from_u32(decl.type_id);
-    if ty != GgmlType::F8E4M3_ROWS {
-        return Err(format!(
-            "{name}: a folder load reads the PLE table's rows where the folder stores them, which \
-             holds F8 rows as the program reads them; {} ({ty}) is stored in another layout: \
-             prepare the folder into a split",
-            m.sources[0]
-        )
-        .into());
+    if !matches!(ty, GgmlType::F8E4M3_ROWS | GgmlType::NVFP4_ROWS) {
+        return Err(format!("{name}: {ty} is not F8 or NVFP4 rows").into());
     }
-    let (row_bytes, rows) = match decl.dims[..] {
-        [width, rows] => (width, rows),
+    let (width, rows) = match decl.dims[..] {
+        [width, rows]
+            if width > 0 && rows > 0 && size_of(decl.type_id, &decl.dims) == Some(decl.nbytes) =>
+        {
+            (width, rows)
+        }
         _ => return Err(format!("{name}: dims {:?} are not a table's", decl.dims).into()),
     };
     let get = |n: &str| folder.raw(n);
     let mut scale: Option<f32> = None;
     let mut runs = Vec::with_capacity(m.sources.len());
+    let mut scale_runs = Vec::new();
+    let divisor = if ty == GgmlType::NVFP4_ROWS { 2 } else { 1 };
     let mut held = 0u64;
     for (source, placed) in m.placed(plan)? {
-        let (s, _) = modelopt::fp8_rows_scale(&get, source, placed)?;
+        let s = if ty == GgmlType::NVFP4_ROWS {
+            let (s, block_scale) = modelopt::nvfp4_rows_scale(&get, source, placed)?;
+            scale_runs.push(folder.file_range(block_scale)?);
+            s
+        } else {
+            modelopt::fp8_rows_scale(&get, source, placed)?.0
+        };
         if let Some(t) = scale.filter(|&t| t != s) {
             return Err(format!("{source}: tensor scale {s}, the table's {t}").into());
         }
         scale = Some(s);
         let shape = folder.raw(source)?.shape;
-        let &[part_rows, width] = shape else {
+        let &[part_rows, columns] = shape else {
             return Err(format!("{source}: shape {shape:?} is not a table part's").into());
         };
-        if width as u64 != row_bytes {
+        let part_width = (columns as u64)
+            .checked_mul(divisor)
+            .ok_or_else(|| format!("{source}: row width overflow"))?;
+        if part_width != width {
             return Err(
-                format!("{source}: rows of {width} values, the table's {row_bytes}").into(),
+                format!("{source}: rows of {part_width} values, the table's {width}").into(),
             );
         }
-        held += part_rows as u64;
+        held = held
+            .checked_add(part_rows as u64)
+            .ok_or_else(|| format!("{name}: row count overflow"))?;
         runs.push(folder.file_range(source)?);
     }
     if held != rows {
         return Err(format!("{name}: its parts hold {held} rows, the table {rows}").into());
     }
     Ok(StoredRows {
-        row_bytes,
-        runs,
+        values: StoredPlane {
+            row_bytes: width / divisor,
+            runs,
+        },
+        block_scales: (ty == GgmlType::NVFP4_ROWS).then(|| StoredPlane {
+            row_bytes: width / 16,
+            runs: scale_runs,
+        }),
         scale: scale.ok_or_else(|| format!("{name}: a table of no parts"))?,
     })
 }
@@ -442,28 +459,58 @@ mod tests {
     #[test]
     fn a_table_s_rows_are_read_where_the_folder_stores_them() {
         let dir = std::env::temp_dir().join(format!("folder-ple-{}", std::process::id()));
-        let hq = serde_json::json!({"quantization": {"quant_algo": "MIXED_PRECISION",
-            "quantized_layers": {"e": {"quant_algo": "FP8"}}}});
-        let make = |second_scale: f32, width: usize| {
+        let make = |nvfp4: bool, second_scale: f32, width: usize| {
+            let hq = serde_json::json!({"quantization": {"quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {"e": {"quant_algo": if nvfp4 { "NVFP4" } else { "FP8" }}}}});
             std::fs::create_dir_all(&dir).unwrap();
             let (one, two) = (1.5f32.to_le_bytes(), second_scale.to_le_bytes());
-            let (a, b) = (vec![0x38u8; 2 * 160], vec![0x40u8; 3 * width]);
-            let first: [(&str, &str, &[usize], &[u8]); 2] = [
-                ("e.shard_0.weight", "F8_E4M3", &[2, 160], &a),
-                ("e.shard_0.weight_scale", "F32", &[1], &one),
+            let divisor = if nvfp4 { 2 } else { 1 };
+            let (a, b) = (
+                vec![0x38u8; 2 * 160 / divisor],
+                vec![0x40u8; 3 * width / divisor],
+            );
+            let (a_shape, b_shape) = ([2, 160 / divisor], [3, width / divisor]);
+            let (sa_shape, sb_shape) = ([2, 160 / 16], [3, width / 16]);
+            let (sa, sb) = (vec![0x38; 2 * 160 / 16], vec![0x40; 3 * width / 16]);
+            let dtype = if nvfp4 { "U8" } else { "F8_E4M3" };
+            let mut first: Vec<(&str, &str, &[usize], &[u8])> = vec![
+                ("e.shard_0.weight", dtype, &a_shape, &a),
+                (
+                    if nvfp4 {
+                        "e.shard_0.weight_scale_2"
+                    } else {
+                        "e.shard_0.weight_scale"
+                    },
+                    "F32",
+                    &[1],
+                    &one,
+                ),
             ];
-            let second: [(&str, &str, &[usize], &[u8]); 2] = [
-                ("e.shard_1.weight", "F8_E4M3", &[3, width], &b),
-                ("e.shard_1.weight_scale", "F32", &[1], &two),
+            let mut second: Vec<(&str, &str, &[usize], &[u8])> = vec![
+                ("e.shard_1.weight", dtype, &b_shape, &b),
+                (
+                    if nvfp4 {
+                        "e.shard_1.weight_scale_2"
+                    } else {
+                        "e.shard_1.weight_scale"
+                    },
+                    "F32",
+                    &[1],
+                    &two,
+                ),
             ];
+            if nvfp4 {
+                first.push(("e.shard_0.weight_scale", "F8_E4M3", &sa_shape, &sa));
+                second.push(("e.shard_1.weight_scale", "F8_E4M3", &sb_shape, &sb));
+            }
             std::fs::write(dir.join("a.safetensors"), safetensors::write(&first)).unwrap();
             std::fs::write(dir.join("b.safetensors"), safetensors::write(&second)).unwrap();
             std::fs::write(
                 dir.join(Folder::INDEX),
-                r#"{"weight_map": {"e.shard_0.weight": "a.safetensors",
-                    "e.shard_0.weight_scale": "a.safetensors",
-                    "e.shard_1.weight": "b.safetensors",
-                    "e.shard_1.weight_scale": "b.safetensors"}}"#,
+                serde_json::json!({"weight_map": first.iter().map(|t| (t.0, "a.safetensors"))
+                    .chain(second.iter().map(|t| (t.0, "b.safetensors")))
+                    .collect::<std::collections::BTreeMap<_, _>>()})
+                .to_string(),
             )
             .unwrap();
             let folder = Folder::open(&dir).unwrap();
@@ -493,30 +540,53 @@ mod tests {
             name: "per_layer_token_embd.weight".into(),
             dims: vec![160, rows],
             type_id: ty.as_u32(),
-            nbytes: 160 * rows,
+            nbytes: size_of(ty.as_u32(), &[160, rows]).unwrap(),
         };
-        let (folder, p) = make(1.5, 160);
+        let (folder, p) = make(false, 1.5, 160);
         let got = ple_rows(&folder, &p, &decl(GgmlType::F8E4M3_ROWS, 5), &m).unwrap();
-        assert_eq!((got.row_bytes, got.scale), (160, 1.5));
+        assert_eq!((got.values.row_bytes, got.scale), (160, 1.5));
+        assert!(got.block_scales.is_none());
         let read = |(path, range): &(std::path::PathBuf, std::ops::Range<u64>)| {
             std::fs::read(path).unwrap()[range.start as usize..range.end as usize].to_vec()
         };
-        assert_eq!(read(&got.runs[0]), vec![0x38u8; 320]);
-        assert_eq!(read(&got.runs[1]), vec![0x40u8; 480]);
+        assert_eq!(read(&got.values.runs[0]), vec![0x38u8; 320]);
+        assert_eq!(read(&got.values.runs[1]), vec![0x40u8; 480]);
         let refusal = |folder: &Folder, p: &Plan, ty, rows| {
             ple_rows(folder, p, &decl(ty, rows), &m)
                 .expect_err("refused")
                 .to_string()
         };
+        for dims in [vec![0, 5], vec![160, 0], vec![160, u64::MAX]] {
+            let mut bad = decl(GgmlType::F8E4M3_ROWS, 5);
+            bad.dims = dims;
+            bad.nbytes = 0;
+            let e = ple_rows(&folder, &p, &bad, &m).unwrap_err().to_string();
+            assert!(e.contains("not a table"), "{e}");
+        }
         let e = refusal(&folder, &p, GgmlType::F8E4M3_ROWS, 6);
         assert!(e.contains("its parts hold 5 rows, the table 6"), "{e}");
         let e = refusal(&folder, &p, GgmlType::NVFP4_ROWS, 5);
-        assert!(e.contains("prepare the folder into a split"), "{e}");
-        let (folder, p) = make(2.0, 160);
+        assert!(e.contains("not plain NVFP4 code and scale rows"), "{e}");
+        let (folder, p) = make(false, 2.0, 160);
         let e = refusal(&folder, &p, GgmlType::F8E4M3_ROWS, 5);
         assert!(e.contains("e.shard_1.weight: tensor scale 2"), "{e}");
-        let (folder, p) = make(1.5, 96);
+        let (folder, p) = make(false, 1.5, 96);
         let e = refusal(&folder, &p, GgmlType::F8E4M3_ROWS, 5);
+        assert!(e.contains("rows of 96 values, the table's 160"), "{e}");
+        let (folder, p) = make(true, 1.5, 160);
+        let got = ple_rows(&folder, &p, &decl(GgmlType::NVFP4_ROWS, 5), &m).unwrap();
+        assert_eq!((got.values.row_bytes, got.scale), (80, 1.5));
+        assert_eq!(read(&got.values.runs[0]), vec![0x38; 160]);
+        assert_eq!(read(&got.values.runs[1]), vec![0x40; 240]);
+        let scales = got.block_scales.unwrap();
+        assert_eq!(scales.row_bytes, 10);
+        assert_eq!(read(&scales.runs[0]), vec![0x38; 20]);
+        assert_eq!(read(&scales.runs[1]), vec![0x40; 30]);
+        let (folder, p) = make(true, 2.0, 160);
+        let e = refusal(&folder, &p, GgmlType::NVFP4_ROWS, 5);
+        assert!(e.contains("e.shard_1.weight: tensor scale 2"), "{e}");
+        let (folder, p) = make(true, 1.5, 96);
+        let e = refusal(&folder, &p, GgmlType::NVFP4_ROWS, 5);
         assert!(e.contains("rows of 96 values, the table's 160"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }

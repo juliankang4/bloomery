@@ -639,13 +639,20 @@ fn nvfp4<'a>(
     })
 }
 
-/// The NVFP4 weight `source` as [`GgmlType::NVFP4_ROWS`]: each 16-value group its scale byte
-/// then its 8 code bytes as stored, the tensor scale the one its place names.
-fn nvfp4_rows<'a>(
-    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
-    (weight, placed): (&str, &Placed),
-    type_id: u32,
-) -> Result<Normal, Error> {
+/// The tensor scale and block-scale name of plain NVFP4 rows. Checks the
+/// code and scale planes' shapes and byte counts without copying either.
+pub fn nvfp4_rows_scale<'a, 'p>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    weight: &str,
+    placed: &'p Placed,
+) -> Result<(f32, &'p str), Error> {
+    if placed.format != Format::Nvfp4 {
+        return Err(Error::Format {
+            name: weight.to_string(),
+            format: placed.format,
+            what: "not plain NVFP4 code and scale rows".into(),
+        });
+    }
     let shape = |name: String, what: String| Error::Shape { name, what };
     let wname = weight.to_string();
     let [sname, tname] = placed.companions.as_slice() else {
@@ -674,15 +681,15 @@ fn nvfp4_rows<'a>(
             ),
         ));
     }
-    let k = (half as u64)
-        .checked_mul(2)
-        .ok_or_else(|| shape(wname.clone(), "row size overflow".into()))?;
+    if (half as u64).checked_mul(2).is_none() {
+        return Err(shape(wname.clone(), "row size overflow".into()));
+    }
     let size = rows
         .checked_mul(half)
         .ok_or_else(|| shape(wname.clone(), "weight size overflow".into()))?;
-    let capacity = (size / 8)
-        .checked_mul(9)
-        .ok_or_else(|| shape(wname.clone(), "row bytes size overflow".into()))?;
+    if (size / 8).checked_mul(9).is_none() {
+        return Err(shape(wname.clone(), "row bytes size overflow".into()));
+    }
     if w.bytes.len() != size {
         return Err(shape(wname, format!("{} bytes, not {size}", w.bytes.len())));
     }
@@ -713,6 +720,21 @@ fn nvfp4_rows<'a>(
             format!("tensor scale {scale} is not finite"),
         ));
     }
+    Ok((scale, sname))
+}
+
+/// The NVFP4 weight `source` as [`GgmlType::NVFP4_ROWS`]: each 16-value group
+/// its scale byte then its 8 code bytes, at the tensor's scale.
+fn nvfp4_rows<'a>(
+    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    (weight, placed): (&str, &Placed),
+    type_id: u32,
+) -> Result<Normal, Error> {
+    let (scale, sname) = nvfp4_rows_scale(&get, weight, placed)?;
+    let (w, s) = (get(weight)?, get(sname)?);
+    let (rows, half) = (w.shape[0], w.shape[1]);
+    let k = half as u64 * 2;
+    let capacity = w.bytes.len() / 8 * 9;
     let decoder = Nvfp4Rows::new(scale);
     let mut values = [0.0; 16];
     let mut bytes = Vec::with_capacity(capacity);
@@ -726,9 +748,9 @@ fn nvfp4_rows<'a>(
             bytes.push(byte);
             bytes.extend_from_slice(codes);
             decoder
-                .decode(&bytes[bytes.len() - 9..], &mut values)
+                .decode_planes(codes, &[byte], &mut values)
                 .map_err(|source| Error::Scale {
-                    name: sname.clone(),
+                    name: sname.to_string(),
                     row,
                     group,
                     source,

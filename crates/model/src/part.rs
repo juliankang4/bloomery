@@ -106,14 +106,20 @@ impl Part<'_> {
     }
 }
 
-/// A row-gathered table's rows where a source stores them, for a reader that maps them there
-/// (a checkpoint folder's PLE table, its parts in the folder's shard files): rows of `row_bytes`
-/// bytes as the program reads them, each run a byte range of whole rows in a file, in row
-/// order, every row at the one tensor scale `scale`.
+/// One plane of a row-gathered table, in row order: each run holds whole
+/// rows of `row_bytes` bytes where the source stores them.
 #[derive(Clone, Debug, PartialEq)]
-pub struct StoredRows {
+pub struct StoredPlane {
     pub row_bytes: u64,
     pub runs: Vec<(PathBuf, Range<u64>)>,
+}
+
+/// A row-gathered table where its source stores it: F8 values, or NVFP4
+/// codes with a separate plane of block scales, at one tensor `scale`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredRows {
+    pub values: StoredPlane,
+    pub block_scales: Option<StoredPlane>,
     pub scale: f32,
 }
 

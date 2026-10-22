@@ -1040,22 +1040,69 @@ impl Nvfp4Rows {
     /// sub-block 0), before any value of the span is written.
     pub fn decode(&self, src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
         let ty = GgmlType::NVFP4_ROWS;
-        if !dst.len().is_multiple_of(16) {
-            return Err(QuantError::UnalignedDst {
-                ty,
-                dst: dst.len(),
-                blck: 16,
-            });
-        }
-        let need = dst.len() / 16 * 9;
+        let need = Self::group_count(dst.len())? * 9;
         let src = src.get(..need).ok_or(QuantError::ShortSrc {
             ty,
             src: src.len(),
             need,
             n: dst.len(),
         })?;
-        let (groups, _) = src.as_chunks::<9>();
-        let undefined = groups.iter().enumerate().find_map(|(block, g)| {
+        self.decode_groups(src.as_chunks::<9>().0.iter().copied(), dst)
+    }
+
+    /// Separate code and block-scale planes decoded with the same rounding
+    /// and refusals as [`Self::decode`], without packing an intermediate row.
+    pub fn decode_planes(
+        &self,
+        codes: &[u8],
+        scales: &[u8],
+        dst: &mut [f32],
+    ) -> Result<(), QuantError> {
+        let groups = Self::group_count(dst.len())?;
+        let take = |src: &[u8], need| {
+            if src.len() < need {
+                Err(QuantError::ShortSrc {
+                    ty: GgmlType::NVFP4_ROWS,
+                    src: src.len(),
+                    need,
+                    n: dst.len(),
+                })
+            } else {
+                Ok(())
+            }
+        };
+        take(codes, groups * 8)?;
+        take(scales, groups)?;
+        let groups = codes[..groups * 8]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(&scales[..groups])
+            .map(|(codes, &scale)| {
+                let mut group = [scale; 9];
+                group[1..].copy_from_slice(codes);
+                group
+            });
+        self.decode_groups(groups, dst)
+    }
+
+    fn group_count(values: usize) -> Result<usize, QuantError> {
+        if !values.is_multiple_of(16) {
+            return Err(QuantError::UnalignedDst {
+                ty: GgmlType::NVFP4_ROWS,
+                dst: values,
+                blck: 16,
+            });
+        }
+        Ok(values / 16)
+    }
+
+    fn decode_groups(
+        &self,
+        groups: impl Iterator<Item = [u8; 9]> + Clone,
+        dst: &mut [f32],
+    ) -> Result<(), QuantError> {
+        let undefined = groups.clone().enumerate().find_map(|(block, g)| {
             let why = match ue4m3(g[0]) {
                 Err(why) => Some(why),
                 Ok(half) => g[1..]
@@ -1068,14 +1115,14 @@ impl Nvfp4Rows {
         });
         if let Some((block, byte, why)) = undefined {
             return Err(QuantError::UndefinedScale {
-                ty,
+                ty: GgmlType::NVFP4_ROWS,
                 block,
                 sub: 0,
                 byte,
                 why,
             });
         }
-        for (g, out) in groups.iter().zip(dst.as_chunks_mut::<16>().0) {
+        for (g, out) in groups.zip(dst.as_chunks_mut::<16>().0) {
             let half = self.halves[usize::from(g[0])];
             for (pair, &q) in out.as_chunks_mut::<2>().0.iter_mut().zip(&g[1..]) {
                 let [l, h] = fp4_pair(q);
@@ -2961,13 +3008,20 @@ mod tests {
             for (r, (codes, scales)) in rows.iter().enumerate() {
                 let want = modelopt_row(codes, scales, scale);
                 let mut got = vec![0.0f32; want.len()];
-                decode.decode(&nvfp4_rows(codes, scales), &mut got).unwrap();
-                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                    assert_eq!(
-                        g.to_bits(),
-                        *w,
-                        "scale {scale:e} row {r} value {i}: got {g:e}"
-                    );
+                for separate in [false, true] {
+                    got.fill(f32::NAN);
+                    if separate {
+                        decode.decode_planes(codes, scales, &mut got).unwrap();
+                    } else {
+                        decode.decode(&nvfp4_rows(codes, scales), &mut got).unwrap();
+                    }
+                    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            *w,
+                            "scale {scale:e} row {r} value {i} separate={separate}: got {g:e}"
+                        );
+                    }
                 }
             }
         }
@@ -2996,6 +3050,10 @@ mod tests {
                 }
             );
             assert!(e.to_string().contains("block 3 sub-block 0"), "{e}");
+            assert_eq!(dst, [0.0; 80], "a refusal must leave dst unchanged");
+            let mut scales = [0x38; 5];
+            scales[3] = byte;
+            assert_eq!(decode.decode_planes(&[0x38; 40], &scales, &mut dst), Err(e));
             assert_eq!(dst, [0.0; 80], "a refusal must leave dst unchanged");
         }
         for (code, byte, divisor) in [(0x77, 0x38, 8.0), (0x22, 0x40, 2.0)] {
@@ -3030,6 +3088,26 @@ mod tests {
                 blck: 16
             })
         );
+        assert!(matches!(
+            decode.decode_planes(&[0x38; 8], &[0x38], &mut [0.0; 8]),
+            Err(QuantError::UnalignedDst { dst: 8, .. })
+        ));
+        assert!(matches!(
+            decode.decode_planes(&[0x38; 7], &[0x38], &mut [0.0; 16]),
+            Err(QuantError::ShortSrc {
+                src: 7,
+                need: 8,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode.decode_planes(&[0x38; 8], &[], &mut [0.0; 16]),
+            Err(QuantError::ShortSrc {
+                src: 0,
+                need: 1,
+                ..
+            })
+        ));
         assert_eq!(
             decode.decode(&[0x38; 9], &mut [0.0; 32]),
             Err(QuantError::ShortSrc {

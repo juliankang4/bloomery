@@ -480,6 +480,7 @@ struct PleHost {
 /// them computes ([`PleHost::prompt_start`]).
 struct PleRead {
     rows: Prefetcher,
+    planes: usize,
     /// A prompt call's ubatches not yet filled, in order; while `flight`
     /// holds, the front's rows are on the helper.
     ahead: VecDeque<PleBatch>,
@@ -505,19 +506,38 @@ impl PleRead {
         stored: Option<&StoredRows>,
         name: &str,
         max_rows: usize,
+        expected_rows: usize,
     ) -> Result<PleRead, GpuError> {
         let table: Arc<dyn RowTables> = match stored {
             None => Arc::new(
                 SplitTable::open(Arc::clone(file), name).map_err(|e| GpuError::plan(WHAT, e))?,
             ),
-            Some(s) => Arc::new(
-                RunTable::open(name, s.row_bytes, &s.runs, PageAdvice::Random)
-                    .map_err(|e| GpuError::plan(WHAT, e))?,
-            ),
+            Some(s) => {
+                let open = |p: &model::part::StoredPlane| {
+                    let table = RunTable::open(name, p.row_bytes, &p.runs, PageAdvice::Random)
+                        .map_err(|e| GpuError::plan(WHAT, e))?;
+                    if table.rows() != expected_rows as u64 {
+                        return Err(GpuError::shape(
+                            WHAT,
+                            format!(
+                                "{name}: source plane has {} rows, the table {expected_rows}",
+                                table.rows()
+                            ),
+                        ));
+                    }
+                    Ok(table)
+                };
+                let values = open(&s.values)?;
+                match &s.block_scales {
+                    None => Arc::new(values),
+                    Some(scales) => Arc::new(vec![values, open(scales)?]),
+                }
+            }
         };
+        let planes = table.count();
         let rows = Prefetcher::over(
             table,
-            &[max_rows],
+            &[max_rows; 2][..planes],
             HelperOptions {
                 mode: FillMode::Touch,
                 cpu: caller_sibling(),
@@ -527,6 +547,7 @@ impl PleRead {
         .map_err(|e| GpuError::plan(WHAT, e))?;
         Ok(PleRead {
             rows,
+            planes,
             ahead: VecDeque::new(),
             flight: false,
         })
@@ -558,14 +579,14 @@ impl PleRead {
         }
         if !self.flight {
             self.rows
-                .submit([ids])
+                .submit(std::iter::repeat_n(ids, self.planes))
                 .map_err(|e| GpuError::plan(WHAT, e))?;
         }
         self.flight = false;
         self.rows.wait().map_err(|e| GpuError::plan(WHAT, e))?;
         if let Some(next) = self.ahead.front() {
             self.rows
-                .submit([next.ids.as_slice()])
+                .submit(std::iter::repeat_n(next.ids.as_slice(), self.planes))
                 .map_err(|e| GpuError::plan(WHAT, e))?;
             self.flight = true;
         }
@@ -607,8 +628,8 @@ impl PleHost {
     /// `cap` positions, read from `tier` — the plan's
     /// ([`Plan::row_tier`]): the host, or the NVMe tier through its reader
     /// ([`PleRead`]); any other tier is refused by name. A checkpoint
-    /// folder's table (`file` its header) is read where `stored` holds its F8
-    /// rows, at its scale, from the NVMe tier alone. Load-time only.
+    /// folder's table (`file` its header) is read from its stored value and
+    /// optional block-scale planes, from the NVMe tier alone. Load-time only.
     fn new(
         file: Arc<Split>,
         stored: Option<&StoredRows>,
@@ -648,9 +669,13 @@ impl PleHost {
         let decode = match (info.ty, stored) {
             (GgmlType::IQ4_NL, None) => PleRows::Iq4Nl,
             (GgmlType::F8E4M3_ROWS, _) => PleRows::F8(Box::new(E4m3Rows::new(scale()?))),
-            (GgmlType::NVFP4_ROWS, None) => PleRows::Nvfp4(Box::new(Nvfp4Rows::new(scale()?))),
+            (GgmlType::NVFP4_ROWS, _) => PleRows::Nvfp4(Box::new(Nvfp4Rows::new(scale()?))),
             (_, None) => return Err(refuse("IQ4_NL, F8 or NVFP4 rows")),
-            (_, Some(_)) => return Err(refuse("F8 rows where a checkpoint folder stores them")),
+            (_, Some(_)) => {
+                return Err(refuse(
+                    "F8 or NVFP4 rows where a checkpoint folder stores them",
+                ));
+            }
         };
         let (Some(blck), Some(size)) = (info.ty.blck_size(), info.ty.type_size()) else {
             return Err(refuse("a sized type"));
@@ -660,11 +685,23 @@ impl PleHost {
             return Err(refuse("rows of a whole part of the model width"));
         }
         let row_bytes = width / blck * size;
-        if rows == 0
-            || info.nbytes != (rows * row_bytes) as u64
-            || stored.is_some_and(|s| s.row_bytes != row_bytes as u64)
-        {
+        if rows == 0 || rows.checked_mul(row_bytes).map(|n| n as u64) != Some(info.nbytes) {
             return Err(refuse("a whole number of rows"));
+        }
+        if let Some(s) = stored {
+            let fits = match (info.ty, &s.block_scales) {
+                (GgmlType::F8E4M3_ROWS, None) => s.values.row_bytes == width as u64,
+                (GgmlType::NVFP4_ROWS, Some(scales)) => {
+                    s.values.row_bytes == (width / 2) as u64
+                        && scales.row_bytes == (width / 16) as u64
+                }
+                _ => false,
+            };
+            if !fits {
+                return Err(refuse(
+                    "value and block-scale planes of the table's row type",
+                ));
+            }
         }
         let nvme = match tier {
             Device::Host if stored.is_some() => {
@@ -673,7 +710,7 @@ impl PleHost {
                 ));
             }
             Device::Host => None,
-            Device::Nvme => Some(PleRead::open(&file, stored, &name, cap * per_token)?),
+            Device::Nvme => Some(PleRead::open(&file, stored, &name, cap * per_token, rows)?),
             Device::Card(_) | Device::Unused => {
                 return Err(refuse(
                     "on the host or the NVMe tier, where the plan reads it",
@@ -762,12 +799,20 @@ impl PleHost {
                         ),
                     ));
                 }
-                ple_decode(
-                    &mut self.e,
-                    self.width,
-                    &self.decode,
-                    filled.chunks_exact(rb),
-                )?;
+                match (&self.decode, read.planes) {
+                    (PleRows::Nvfp4(fp4), 2) => {
+                        let (codes, scales) = filled.split_at(filled.len() / 9 * 8);
+                        fp4.decode_planes(codes, scales, &mut self.e[..ids.len() * self.width])
+                            .map_err(model::ModelError::from)?;
+                    }
+                    (_, 1) => ple_decode(
+                        &mut self.e,
+                        self.width,
+                        &self.decode,
+                        filled.chunks_exact(rb),
+                    )?,
+                    _ => return Err(GpuError::state(WHAT, "the PLE reader's storage planes")),
+                }
             }
         }
         Ok(hist)
@@ -5893,8 +5938,11 @@ mod tests {
         std::fs::write(&a, [&[9u8; 7][..], &f8[..cut]].concat()).unwrap();
         std::fs::write(&b, &f8[cut..]).unwrap();
         let stored = model::part::StoredRows {
-            row_bytes: 160,
-            runs: vec![(a, 7..7 + cut as u64), (b, 0..(f8.len() - cut) as u64)],
+            values: model::part::StoredPlane {
+                row_bytes: 160,
+                runs: vec![(a, 7..7 + cut as u64), (b, 0..(f8.len() - cut) as u64)],
+            },
+            block_scales: None,
             scale: 0.375,
         };
         let open = |ty: GgmlType, tier| {
@@ -5917,14 +5965,86 @@ mod tests {
         for (ty, tier, need) in [
             (GgmlType::F8E4M3_ROWS, Device::Host, "on the NVMe tier"),
             (
+                GgmlType::IQ4_NL,
+                Device::Nvme,
+                "F8 or NVFP4 rows where a checkpoint",
+            ),
+            (
                 GgmlType::NVFP4_ROWS,
                 Device::Nvme,
-                "F8 rows where a checkpoint",
+                "value and block-scale planes",
             ),
         ] {
             let e = open(ty, tier).err().expect("refused");
             assert!(e.to_string().contains(need), "{ty}: {e}");
         }
+        let codes = &f8[..80 * 80];
+        let scales: Vec<u8> = (0..80 * 10).map(|i| 0x30 + (i % 48) as u8).collect();
+        let packed: Vec<u8> = codes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(&scales)
+            .flat_map(|(c, &s)| std::iter::once(s).chain(c.iter().copied()))
+            .collect();
+        let mut want = ple_host(GgmlType::NVFP4_ROWS.as_u32(), &packed, Some(0.375), 8).unwrap();
+        let (a, b) = (dir.join("fp4-a.safetensors"), dir.join("fp4-b.safetensors"));
+        let (cc, sc) = (30 * 80, 30 * 10);
+        std::fs::write(&a, [&[9u8; 7][..], &codes[..cc], &scales[..sc]].concat()).unwrap();
+        std::fs::write(&b, [&codes[cc..], &scales[sc..]].concat()).unwrap();
+        let stored = model::part::StoredRows {
+            values: model::part::StoredPlane {
+                row_bytes: 80,
+                runs: vec![
+                    (a.clone(), 7..7 + cc as u64),
+                    (b.clone(), 0..(codes.len() - cc) as u64),
+                ],
+            },
+            block_scales: Some(model::part::StoredPlane {
+                row_bytes: 10,
+                runs: vec![
+                    (a, 7 + cc as u64..7 + cc as u64 + sc as u64),
+                    (
+                        b,
+                        (codes.len() - cc) as u64..(codes.len() - cc + scales.len() - sc) as u64,
+                    ),
+                ],
+            }),
+            scale: 0.375,
+        };
+        let layout = ple_layout(GgmlType::NVFP4_ROWS.as_u32(), packed.len(), true);
+        let header = Arc::new(Split::header_only(dir.clone(), &layout).unwrap());
+        let mut got =
+            PleHost::new(Arc::clone(&header), Some(&stored), 16, 8, Device::Nvme).unwrap();
+        got.prompt_start(0, &tokens, 2, &[]).unwrap();
+        for (i, unit) in tokens.chunks(2).enumerate() {
+            let pos = (i * 2) as u32;
+            want.hist = want.fill(pos, unit).unwrap();
+            got.hist = got.fill(pos, unit).unwrap();
+            assert_eq!(got.ids[..got.named], want.ids[..want.named]);
+            assert_eq!(got.e.len(), want.e.len());
+            assert!(
+                got.e
+                    .iter()
+                    .zip(&want.e)
+                    .all(|(g, w)| g.to_bits() == w.to_bits())
+            );
+        }
+        let mut wrong_width = stored.clone();
+        wrong_width.block_scales.as_mut().unwrap().row_bytes = 9;
+        let e = PleHost::new(Arc::clone(&header), Some(&wrong_width), 16, 8, Device::Nvme)
+            .err()
+            .expect("refused");
+        assert!(
+            e.to_string().contains("value and block-scale planes"),
+            "{e}"
+        );
+        let mut short = stored;
+        short.block_scales.as_mut().unwrap().runs[1].1.end -= 10;
+        let e = PleHost::new(header, Some(&short), 16, 8, Device::Nvme)
+            .err()
+            .expect("refused");
+        assert!(e.to_string().contains("source plane has 79 rows"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -839,6 +839,16 @@ pub trait RowTables: Send + Sync {
     fn table(&self, i: usize) -> Option<&dyn RowTable>;
 }
 
+impl<T: RowTable> RowTables for Vec<T> {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn table(&self, i: usize) -> Option<&dyn RowTable> {
+        self.get(i).map(|t| t as &dyn RowTable)
+    }
+}
+
 impl RowTables for Engram {
     fn count(&self) -> usize {
         self.sites.len()
