@@ -3697,8 +3697,8 @@ unsafe fn quantize_q82x4_col_avx2(x: &[f32], out: &mut [u8]) {
 /// `d`, 32 i8 codes) by mainline's x86 `quantize_row_q8_0` (llama.cpp
 /// `f2cc7282c` ggml-cpu/arch/x86/quants.c:302), the column its
 /// `ggml_vec_dot_q2_0_q8_0` reads: `d = f16(amax / 127)` rounded to nearest
-/// even (mainline's F16C conversion, [`f32_to_f16_bits`] here), codes
-/// `round_half_even(v * id)` with [`q80_inverse`]'s `id`.
+/// even (mainline's F16C conversion, [`gguf::quant::f32_to_f16_bits`] here), codes
+/// `round_half_even(v * id)` with [`gguf::quant::q80_inverse`]'s `id`.
 /// So a block whose `d` rounds to an f16 zero keeps its codes. The reference
 /// encoder `quantize_row_q8_0_ref` differs: it codes with `1 / d` of the f32
 /// `d = amax / 127`, before its f16 rounding, and rounds half away from zero.
