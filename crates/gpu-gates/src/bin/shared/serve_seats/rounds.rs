@@ -234,44 +234,39 @@ where
         )
         .into());
     }
-    let (specs, batch) = drafts.round_mut();
+    let (specs, batch, widths) = drafts.round_mut();
     if let Some(&i) = on
         .iter()
         .find(|&&i| specs.get(rows[i].slot).is_none_or(Option::is_none))
     {
         return Err(format!("slot {}: the seat holds no draft of it", rows[i].slot).into());
     }
-    let mut widths: Vec<_> = on
-        .iter()
-        .map(|&i| {
-            let draft = specs[rows[i].slot]
-                .as_ref()
-                .expect("a checked draft")
-                .draft();
-            if draft.draft().skipping() {
-                0
-            } else {
-                depth.min(B::WIDTH)
-            }
-        })
-        .collect();
+    widths.clear();
+    widths.extend(on.iter().map(|&i| {
+        let draft = specs[rows[i].slot]
+            .as_ref()
+            .expect("a checked draft")
+            .draft();
+        if draft.draft().skipping() {
+            0
+        } else {
+            depth.min(B::WIDTH)
+        }
+    }));
     let mode = specs[rows[on[0]].slot]
         .as_ref()
         .expect("a checked draft")
         .draft()
         .mode();
     if on.len() > 1 {
-        let profiles: Vec<_> = on
-            .iter()
-            .map(|&i| {
-                specs[rows[i].slot]
-                    .as_ref()
-                    .expect("a checked draft")
-                    .draft()
-                    .batch_profile()
-            })
-            .collect();
-        batch.choose(mode, &profiles, &mut widths, allowed, 0)?;
+        let profiles = on.iter().map(|&i| {
+            specs[rows[i].slot]
+                .as_ref()
+                .expect("a checked draft")
+                .draft()
+                .batch_profile()
+        });
+        batch.choose(mode, profiles, widths, allowed)?;
     }
     let started = std::time::Instant::now();
     let mut verified_rows = 0;

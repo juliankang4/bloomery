@@ -390,12 +390,12 @@ fn expected(a: &[f64], k: usize) -> f64 {
     e
 }
 
-/// Widths for one shared verify pass, priced by its total rows. Readings
-/// belong to one active-slot count and prompt-row count; a shape change
-/// starts fresh readings rather than reusing another batch's wall.
+/// Widths for one shared verify round of decode windows, priced by its total
+/// rows. Readings belong to one active-slot count; a change of count starts
+/// fresh readings rather than reusing another batch's wall.
 #[derive(Default)]
 pub struct Batch {
-    shape: (usize, usize),
+    slots: usize,
     costs: Vec<Timings>,
     passes: u32,
     probe: usize,
@@ -407,13 +407,12 @@ impl Batch {
     /// Cut each slot's maximum width using its conditional acceptance profile.
     /// `allowed` is the body's supported draft-width set; a slot already at
     /// zero has no draft. Fixed mode leaves all widths untouched.
-    pub fn choose(
+    pub fn choose<'a>(
         &mut self,
         mode: Mode,
-        profiles: &[&[f64]],
+        profiles: impl ExactSizeIterator<Item = &'a [f64]> + Clone,
         widths: &mut [usize],
         allowed: std::ops::RangeInclusive<usize>,
-        prompt_rows: usize,
     ) -> Result<(), WidthError> {
         if profiles.len() != widths.len() || widths.is_empty() {
             return Err(WidthError::Rule(
@@ -423,7 +422,7 @@ impl Batch {
         if allowed.is_empty() {
             return Err(WidthError::Rule("batch allowed-width set is empty"));
         }
-        for (a, &width) in profiles.iter().zip(widths.iter()) {
+        for (a, &width) in profiles.clone().zip(widths.iter()) {
             if width > 0 && !allowed.contains(&width) {
                 return Err(WidthError::Rule(
                     "batch width outside the body's allowed set",
@@ -440,21 +439,17 @@ impl Batch {
                 ));
             }
         }
-        let first = widths
-            .len()
-            .checked_add(prompt_rows)
-            .ok_or(WidthError::Rule("batch row count overflow"))?;
+        let slots = widths.len();
         let end = widths
             .iter()
-            .try_fold(first, |n, &w| n.checked_add(w))
+            .try_fold(slots, |n, &w| n.checked_add(w))
             .and_then(|n| n.checked_add(1))
             .ok_or(WidthError::Rule("batch row count overflow"))?;
         if mode == Mode::Fixed {
             return Ok(());
         }
-        let shape = (widths.len(), prompt_rows);
-        if self.shape != shape {
-            self.shape = shape;
+        if self.slots != slots {
+            self.slots = slots;
             self.costs.clear();
             self.passes = 0;
             self.probe = 0;
@@ -464,9 +459,9 @@ impl Batch {
         });
         let max = widths.iter().copied().max().unwrap_or(0);
         let min = (*allowed.start()).min(max);
-        // Sample complete passes, not a slot's share of another slot's wall.
-        for cap in (min..=max).rev() {
-            let rows = first + widths.iter().map(|&w| w.min(cap)).sum::<usize>();
+        // Bracket the row costs; selected rounds supply intermediate readings.
+        for cap in [max, min] {
+            let rows = slots + widths.iter().map(|&w| w.min(cap)).sum::<usize>();
             if self.costs[rows].len() < Rule::DEFAULT.min_timings {
                 for w in widths {
                     *w = (*w).min(cap);
@@ -493,17 +488,17 @@ impl Batch {
         self.candidate.extend(widths.iter().map(|&w| w.min(min)));
         widths.copy_from_slice(&self.candidate);
         let mut kept: f64 = profiles
-            .iter()
+            .clone()
             .zip(widths.iter())
             .map(|(a, &w)| expected(a, w))
             .sum();
-        let start = first + widths.iter().sum::<usize>();
+        let start = slots + widths.iter().sum::<usize>();
         let mut best = kept / self.cost(start);
         // Conditional probabilities make each slot's marginal yield decrease.
         // Taking the largest next yield maximizes tokens for each row budget.
         for rows in start + 1..end {
             let mut next = None;
-            for (i, a) in profiles.iter().enumerate() {
+            for (i, a) in profiles.clone().enumerate() {
                 let k = self.candidate[i];
                 if k < self.caps[i] {
                     let gain = expected(a, k + 1) - expected(a, k);
@@ -528,7 +523,7 @@ impl Batch {
         if let Some(ms) = self.costs[rows].median() {
             return ms;
         }
-        let lo = (self.shape.0 + self.shape.1..rows)
+        let lo = (self.slots..rows)
             .rev()
             .find(|&r| self.costs[r].len() > 0)
             .expect("the narrowest batch was sampled");
@@ -540,10 +535,10 @@ impl Batch {
         a + (b - a) * ((rows - lo) as f64 / (hi - lo) as f64)
     }
 
-    /// Record the whole pass, including drafting and commit, in milliseconds.
-    /// `rows` includes the prompt rows supplied to [`Batch::choose`].
+    /// Record the whole round of `rows` verified rows, including drafting and
+    /// commits, in milliseconds.
     pub fn observe(&mut self, rows: usize, ms: f64) -> Result<(), WidthError> {
-        if rows < self.shape.0 + self.shape.1 || rows >= self.costs.len() {
+        if rows < self.slots || rows >= self.costs.len() {
             return Err(WidthError::Rule(
                 "batch reading outside the chosen row range",
             ));
@@ -2699,8 +2694,17 @@ mod tests {
             let profiles = vec![&[0.8, 0.8, 0.8][..]; slots];
             let mut widths = vec![3; slots];
             batch
-                .choose(Mode::Cost, &profiles, &mut widths, 0..=3, 0)
+                .choose(Mode::Cost, profiles.iter().copied(), &mut widths, 0..=3)
                 .unwrap();
+            assert_eq!(widths, vec![3; slots]);
+            for _ in 0..Rule::DEFAULT.min_timings {
+                batch.observe(slots * 4, times[slots * 4]).unwrap();
+            }
+            widths.fill(3);
+            batch
+                .choose(Mode::Cost, profiles.iter().copied(), &mut widths, 0..=3)
+                .unwrap();
+            assert_eq!(widths, vec![0; slots], "sample the opposite endpoint next");
             for (rows, &ms) in times.iter().enumerate().take(slots * 4 + 1).skip(slots) {
                 for _ in 0..Rule::DEFAULT.min_timings {
                     batch.observe(rows, ms).unwrap();
@@ -2708,49 +2712,74 @@ mod tests {
             }
             widths.fill(3);
             batch
-                .choose(Mode::Cost, &profiles, &mut widths, 0..=3, 0)
+                .choose(Mode::Cost, profiles.iter().copied(), &mut widths, 0..=3)
                 .unwrap();
             assert_eq!(widths, want, "batch of {slots}");
             widths.fill(3);
             batch
-                .choose(Mode::Fixed, &profiles, &mut widths, 0..=3, 0)
+                .choose(Mode::Fixed, profiles.iter().copied(), &mut widths, 0..=3)
                 .unwrap();
             assert_eq!(widths, vec![3; slots]);
         }
+        // Only the two endpoint row counts read: every width between is
+        // priced on the line through them.
+        let mut batch = Batch::default();
+        let profiles = [&[0.8, 0.8, 0.8][..]; 2];
+        let mut widths = [3, 3];
+        for (rows, ms) in [(8, 28.0), (2, 10.0)] {
+            batch
+                .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3)
+                .unwrap();
+            assert_eq!(widths.iter().sum::<usize>() + 2, rows, "endpoint {rows}");
+            for _ in 0..Rule::DEFAULT.min_timings {
+                batch.observe(rows, ms).unwrap();
+            }
+            widths.fill(3);
+        }
+        assert_eq!((batch.cost(3), batch.cost(5)), (13.0, 19.0));
+        batch
+            .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3)
+            .unwrap();
+        assert_eq!(widths, [1, 1], "the rate peaks between the endpoints");
         let mut glm = Batch::default();
         let mut widths = [1, 1];
         for _ in 0..=Rule::DEFAULT.min_timings {
-            glm.choose(Mode::Cost, &[&[0.0], &[0.0]], &mut widths, 1..=1, 0)
-                .unwrap();
+            glm.choose(
+                Mode::Cost,
+                [&[0.0][..], &[0.0][..]].into_iter(),
+                &mut widths,
+                1..=1,
+            )
+            .unwrap();
             glm.observe(2, 1.0).unwrap();
             glm.observe(4, 100.0).unwrap();
             assert_eq!(widths, [1, 1], "GLM NextN admits only paired rows");
         }
+        // PIN(2026-10-23): the prompt-row overflow case went with `choose`'s
+        // prompt-row count; a batch round holds decode windows only, one row a
+        // slot plus each width, and a width is bounded by its profile.
         let p = &[0.8][..];
-        for (profiles, mut widths, allowed, prompt_rows, why) in [
-            (vec![], vec![1], 0..=3, 0, "same nonempty slots"),
-            (vec![], vec![], 0..=3, 0, "same nonempty slots"),
+        for (profiles, mut widths, allowed, why) in [
+            (vec![], vec![1], 0..=3, "same nonempty slots"),
+            (vec![], vec![], 0..=3, "same nonempty slots"),
             (
                 vec![p],
                 vec![1],
                 std::ops::RangeInclusive::new(2, 1),
-                0,
                 "set is empty",
             ),
-            (vec![p], vec![2], 0..=1, 0, "outside the body's allowed set"),
-            (vec![p], vec![2], 0..=3, 0, "exceeds its acceptance profile"),
+            (vec![p], vec![2], 0..=1, "outside the body's allowed set"),
+            (vec![p], vec![2], 0..=3, "exceeds its acceptance profile"),
             (
                 vec![&[f64::NAN][..]],
                 vec![1],
                 0..=3,
-                0,
                 "finite and in [0, 1]",
             ),
-            (vec![&[1.1][..]], vec![1], 0..=3, 0, "finite and in [0, 1]"),
-            (vec![p], vec![0], 0..=3, usize::MAX, "row count overflow"),
+            (vec![&[1.1][..]], vec![1], 0..=3, "finite and in [0, 1]"),
         ] {
             let error = Batch::default()
-                .choose(Mode::Fixed, &profiles, &mut widths, allowed, prompt_rows)
+                .choose(Mode::Fixed, profiles.iter().copied(), &mut widths, allowed)
                 .unwrap_err();
             assert!(error.to_string().contains(why), "{error}");
         }
