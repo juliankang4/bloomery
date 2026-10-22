@@ -65,9 +65,10 @@
 //! current so the chooser can open again. A proposal no row of which a pass
 //! verifies (a shadow, a cut to 0) is [`Draft::unproposed`].
 //!
-//! A pass of several sequences' windows ([`Choosing::round_ran`]) runs the
-//! draft's whole width and is only counted: its wall is the round's, no
-//! width's.
+//! A round of several sequences' windows runs the widths [`Batch`] chooses
+//! for the whole round, priced by the round's rows and wall. Each window is
+//! counted ([`Choosing::round_ran`]) and feeds its slot's conditional
+//! acceptance ([`Choosing::batch_profile`]); no width's wall is read from it.
 //!
 //! [`Mode::Fixed`] passes every call to the draft untouched: every proposal
 //! verified whole, no clock read, nothing counted.
@@ -719,6 +720,7 @@ pub struct Choosing<D, C = Wall> {
     gains: Vec<f64>,
     /// Conditional acceptance of round windows, which carry no probabilities.
     batch_gains: Vec<f64>,
+    batch_tested: Vec<u64>,
     /// The tests each `g_i` has taken.
     tested: Vec<u64>,
     /// The running mean of the draft's `p_i` over its full proposals, and
@@ -800,6 +802,7 @@ where
             passes: 0,
             gains: vec![1.0; D::WIDTH],
             batch_gains: vec![1.0; D::WIDTH],
+            batch_tested: vec![0; D::WIDTH],
             tested: vec![0; D::WIDTH],
             mean: vec![0.0; D::WIDTH],
             seen: 0,
@@ -846,6 +849,7 @@ impl<D, C: Clock> Choosing<D, C> {
     /// prompt over the same ids with spans spliced in) goes through it, so the two have one owner.
     pub fn prompt_by<R>(&mut self, f: impl FnOnce(&mut D) -> R) -> R {
         self.drop_flight();
+        self.reset_batch();
         f(&mut self.draft)
     }
 
@@ -917,10 +921,16 @@ impl<D, C: Clock> Choosing<D, C> {
         &self.batch_gains
     }
 
+    fn reset_batch(&mut self) {
+        self.batch_gains.fill(1.0);
+        self.batch_tested.fill(0);
+    }
+
     /// A pass of several sequences' windows ran this draft's window (its
     /// [`Draft::propose`] and the round's record called on the draft itself,
-    /// the chooser bypassed): `rows` ran, `kept` were kept. Counted; no cost
-    /// read (the wall is the round's) and nothing in flight survives it.
+    /// the chooser bypassed): `rows` ran, `kept` were kept. Counted, and its
+    /// rows feed [`Choosing::batch_profile`]; no cost read (the wall is the
+    /// round's, [`Batch::observe`]) and nothing in flight survives it.
     pub fn round_ran(&mut self, rows: usize, kept: usize) {
         if self.mode == Mode::Fixed {
             return;
@@ -929,9 +939,17 @@ impl<D, C: Clock> Choosing<D, C> {
         let k = rows.saturating_sub(1);
         let j = kept.saturating_sub(1);
         let tested = j + usize::from(j < k);
-        for (i, a) in self.batch_gains.iter_mut().enumerate().take(tested) {
+        for (i, (a, n)) in self
+            .batch_gains
+            .iter_mut()
+            .zip(&mut self.batch_tested)
+            .enumerate()
+            .take(tested)
+        {
+            *n = n.saturating_add(1);
             let hit = if i < j { 1.0 } else { 0.0 };
-            *a += self.rule.calibrate * (hit - *a);
+            let weight = self.rule.calibrate.max(1.0 / *n as f64);
+            *a += weight * (hit - *a);
         }
         self.ran(k, kept);
     }
@@ -1244,6 +1262,7 @@ where
 
     fn begin(&mut self, t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error> {
         self.drop_flight();
+        self.reset_batch();
         self.draft.begin(t, prompt, first)
     }
 
@@ -2476,7 +2495,7 @@ mod tests {
         let gains = r.choosing().gains().to_vec();
         r.choosing().round_ran(4, 2);
         assert_eq!(r.choosing().gains(), gains);
-        assert_eq!(r.choosing().batch_profile(), &[1.0, 0.95, 1.0]);
+        assert_eq!(r.choosing().batch_profile(), &[1.0, 0.0, 1.0]);
         assert_eq!(r.choosing().shadow.n, 0, "the round left the shadow up");
         assert!(r.choosing().flight.is_none());
         let t = r.choosing().take_tally();
@@ -2485,6 +2504,15 @@ mod tests {
             (1, 1, 1, 0),
             "{t:?}"
         );
+        r.choosing().round_ran(4, 4);
+        assert_eq!(r.choosing().gains(), gains);
+        assert_eq!(r.choosing().batch_profile(), &[1.0, 0.5, 1.0]);
+        r.choosing().round_ran(4, 3);
+        assert_eq!(r.choosing().gains(), gains);
+        assert_eq!(r.choosing().batch_profile(), &[1.0, 2.0 / 3.0, 0.5]);
+        Draft::begin(r.spec.draft_mut(), &r.t, &[], r.last).unwrap();
+        assert_eq!(r.choosing().gains(), gains);
+        assert_eq!(r.choosing().batch_profile(), &[1.0; 3]);
     }
 
     /// A prompt call of the draft's own shape ([`Choosing::prompt_by`]) forgets the pass in flight
@@ -2510,6 +2538,9 @@ mod tests {
         }
         assert!(r.choosing().shadow.n > 0, "no shadow pending");
         assert!(r.choosing().flight.is_some(), "no pass in flight");
+        let gains = r.choosing().gains().to_vec();
+        r.choosing().batch_gains.fill(0.25);
+        r.choosing().batch_tested.fill(4);
         let got = r.choosing().prompt_by(|_| 7_u32);
         assert_eq!(got, 7);
         assert_eq!(r.choosing().shadow.n, 0, "the prompt left the shadow up");
@@ -2517,6 +2548,10 @@ mod tests {
             r.choosing().flight.is_none(),
             "the prompt left a pass in flight"
         );
+        assert_eq!(r.choosing().batch_profile(), &[1.0; 3]);
+        r.choosing().round_ran(4, 1);
+        assert_eq!(r.choosing().gains(), gains);
+        assert_eq!(r.choosing().batch_profile(), &[0.0, 1.0, 1.0]);
     }
 
     /// Input the chooser has no answer for is refused by name, never read as

@@ -604,9 +604,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               many of a proposal's ids a pass verifies. `cost` \
               (unset) puts the draft behind the width chooser (`runtime::width`): each window \
               verifies the width whose expected kept positions over its measured pass wall is \
-              highest, and none while no width beats the plain step by its margin; the draft \
-              still proposes its whole width, and only the rows a pass runs change, never a \
-              token. `fixed` verifies every proposal whole, the same-binary arm. A drafting \
+              highest, and none while no width beats the plain step by its margin. A \
+              single-sequence pass can cut a full proposal to a prefix. Batched MTP rounds \
+              price all active slots together, choose proposal depths before drafting and \
+              pack complete windows within the body's row bounds. Widths never change a \
+              generated token. `fixed` verifies every proposal whole, the same-binary arm. A drafting \
               server prints an `mtp width` record a request under `cost`. Refused by name on a \
               run that drafts nothing. Read once at `main`, the policy every window of the \
               process runs by; no setter changes it between calls.",
