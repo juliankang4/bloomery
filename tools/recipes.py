@@ -141,7 +141,7 @@ tests open no card and build as host code. The Mac's second condition (x86_64 an
 x86_64 Linux. A unit runs `tools/gate.sh --release --locked -p <crate> --no-fail-fast`, so the bound and the exit code have their one
 owner; `#[ignore]`d tests (the `hw_` gates, which need a card, the model files or `$BLOOMERY_DATA`) stay ignored. A non-ignored test
 that needs such a file is HOST_TEST_SKIP's, by exact libtest name and reason, and `--excluded` prints every exclusion; the rest
-of the units are every `tools/check-*.sh` minus HOST_CHECK_SKIP, then HOST_EXTRA_UNITS (the recipes.py self-test). A skip that names no `fn` of its crate, a crate outside the set or a script that is gone is an
+of the units are every `tools/check-*.sh` minus HOST_CHECK_SKIP, then HOST_EXTRA_UNITS (none now; check-recipes.sh runs the recipes.py self-test). A skip that names no `fn` of its crate, a crate outside the set or a script that is gone is an
 error of `check` and of this command, never a silent no-op.
 
 Orphan tests (`orphan-tests`). Every `#[test]` fn of every workspace target (lib, bins, tests/*.rs) is run
@@ -6288,9 +6288,7 @@ HOST_TEST_SKIP: dict[str, list[tuple[str, str]]] = {}
 # A `tools/check-*.sh` left out: script file name -> reason.
 HOST_CHECK_SKIP: dict[str, str] = {}
 # A unit that is no crate and no check script: name -> shell command, run from the tree's root.
-HOST_EXTRA_UNITS: dict[str, str] = {
-    "recipes-self-test": "python3 tools/recipes.py --self-test",
-}
+HOST_EXTRA_UNITS: dict[str, str] = {}
 HOST_GATE = "bash tools/gate.sh --release --locked"
 
 
@@ -6335,6 +6333,8 @@ def nightly_problems(
     for n in sorted(extras):
         if n in taken:
             problems.append(f"host nightly: HOST_EXTRA_UNITS names {n}, which a crate or a check script already is")
+        if "recipes.py --self-test" in extras[n] and "check-recipes.sh" in host_check_scripts(tree.root) and "check-recipes.sh" not in checks:
+            problems.append(f"host nightly: HOST_EXTRA_UNITS names {n}, which runs the recipes.py self-test that check-recipes already runs")
     in_set = {n for n, _ in host_crates(tree, lock, linked)}
     for n in sorted(linked):
         if n not in tree.packages:
@@ -12293,6 +12293,10 @@ def _st_pure_crates(fails: list[str], side: Side) -> None:
         with open(os.path.join(tmp, "user", "src", "lib.rs"), "a", encoding="utf-8") as fh:
             fh.write("#[test]\nfn one() {}\n")
         expect(any("HOST_EXTRA_UNITS names check-a" in g for g in nightly_problems(pt, lock, {}, {}, {}, {"check-a": "true"})), "host nightly: an extra unit that is a check script")
+        with open(os.path.join(tmp, "tools", "check-recipes.sh"), "w", encoding="utf-8") as fh:
+            fh.write("")
+        expect(any("runs the recipes.py self-test that check-recipes already runs" in g for g in nightly_problems(pt, lock, {}, {}, {}, {"st": "python3 tools/recipes.py --self-test"})), "host nightly: an extra unit that repeats the check-recipes self-test")
+        os.remove(os.path.join(tmp, "tools", "check-recipes.sh"))
         for linked, skips, checks, want in [
             ({}, {"user": [("tests::one", "needs a file")]}, {"check-b.sh": "needs a box"}, None),
             ({"nope": "r"}, {}, {}, "HOST_DEVICE_LINKED names nope, which is no workspace crate"),
