@@ -522,12 +522,7 @@ mod gate {
         fault: FaultSink,
     ) -> Result<RopeQ8Out, GateError> {
         use bloomery_gpu::rope_neox::PartialNeoxQ8Args;
-        assert!(
-            pos.iter()
-                .enumerate()
-                .all(|(i, &p)| p as usize >= ROPE_CTX || !pos[..i].contains(&p)),
-            "rope gate: cache-valid positions must be distinct"
-        );
+        rope_gate::check_cache_positions(pos, ROPE_CTX, ROPE_CTX)?;
         let m = pos.len();
         let qg = DeviceBuffer::from_host(stream, &inp.qg)?;
         let mut q = DeviceBuffer::from_host(stream, &vec![0.0f32; m * N_HEAD * HEAD])?;
@@ -544,7 +539,7 @@ mod gate {
         let mut kd = DeviceBuffer::from_host(stream, &sc)?;
         let mut vq = DeviceBuffer::from_host(stream, &codes)?;
         let mut vd = DeviceBuffer::from_host(stream, &sc)?;
-        // SAFETY: the host assertion above checks distinct cache-valid positions before upload.
+        // SAFETY: check_cache_positions checked distinct cache-valid positions before upload.
         unsafe {
             kern.enqueue_head_norm_neox_append_256_q8(
                 stream,
@@ -3979,5 +3974,22 @@ mod gate {
             return Err(checks_failed());
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        #[ignore = "needs a CUDA card"]
+        fn hw_q8_rope_rejects_duplicate_writers() -> Result<(), GateError> {
+            let gpu = Gpu::new()?;
+            let kern = RopeNeoxKernels::load(gpu.context())?;
+            let (inp, mut pos) = rope_inputs()?;
+            pos[1] = pos[0];
+            let result = rope_q8_run(&kern, gpu.stream(), &inp, &pos, gpu.unlabelled_sink());
+            assert!(result.is_err_and(|e| e.to_string().contains("distinct rows")));
+            Ok(())
+        }
     }
 }

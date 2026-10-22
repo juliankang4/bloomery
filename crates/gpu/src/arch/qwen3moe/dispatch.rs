@@ -680,25 +680,28 @@ fn attention(
     let i = s.col(m)?;
     match n.kind {
         GqaKind::Neox128 => {
-            kv.append_128(
-                &k.neox,
-                stream,
-                Append128 {
-                    q: &mut s.q,
-                    k: &mut s.k,
-                    v: &s.v,
-                    gq: f32_gain(w, &n.attn_q_norm)?,
-                    gk: f32_gain(w, &n.attn_k_norm)?,
-                    table: c.table,
-                    pos: &s.pos,
-                    eps: c.eps,
-                    n_head: d.n_head,
-                    n_kv: d.n_kv,
-                    ctx: d.ctx,
-                    m,
-                    fault: c.sink,
-                },
-            )?;
+            // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
+            unsafe {
+                kv.append_128(
+                    &k.neox,
+                    stream,
+                    Append128 {
+                        q: &mut s.q,
+                        k: &mut s.k,
+                        v: &s.v,
+                        gq: f32_gain(w, &n.attn_q_norm)?,
+                        gk: f32_gain(w, &n.attn_k_norm)?,
+                        table: c.table,
+                        pos: &s.pos,
+                        eps: c.eps,
+                        n_head: d.n_head,
+                        n_kv: d.n_kv,
+                        ctx: d.ctx,
+                        m,
+                        fault: c.sink,
+                    },
+                )
+            }?;
             kv.flash_128(
                 &k.flash,
                 stream,

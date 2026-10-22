@@ -549,25 +549,28 @@ impl<'s> PassProgram<'s> {
                 let mut qkv = span_mut(W, &mut s.qkv, r0 * width, mj * width)?;
                 let mut q = span_mut(W, &mut s.q, r0 * q_row, mj * q_row)?;
                 let pos = span(W, &s.pos, r0, mj)?;
-                enqueue_append(
-                    &self.k.rope,
-                    stream,
-                    K192Args {
-                        qkv: &mut qkv,
-                        q: &mut q,
-                        table: &self.ropes[c.rope].rows.table,
-                        pos: &pos,
-                        v_scale: a.v_scale,
-                        n_head: d.heads,
-                        n_kv: a.kv_heads,
-                        ctx: self.ctx,
-                        m: mj,
-                        fault,
-                        cache_k: &mut store.k,
-                        cache_v: &mut store.v,
-                    },
-                    rows,
-                )?;
+                // SAFETY: each sequence uploads consecutive positions, and its batch is no taller than its ring.
+                unsafe {
+                    enqueue_append(
+                        &self.k.rope,
+                        stream,
+                        K192Args {
+                            qkv: &mut qkv,
+                            q: &mut q,
+                            table: &self.ropes[c.rope].rows.table,
+                            pos: &pos,
+                            v_scale: a.v_scale,
+                            n_head: d.heads,
+                            n_kv: a.kv_heads,
+                            ctx: self.ctx,
+                            m: mj,
+                            fault,
+                            cache_k: &mut store.k,
+                            cache_v: &mut store.v,
+                        },
+                        rows,
+                    )
+                }?;
             }
             let q = span(W, &s.q, r0 * q_row, mj * q_row)?;
             let keys = span(W, &s.n_keys, r0, mj)?;

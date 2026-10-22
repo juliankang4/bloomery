@@ -326,6 +326,7 @@ pub mod dev {
         eps: f32,
         ctx: usize,
     ) -> Result<(NeoxOut, usize), GateError> {
+        crate::rope_gate::check_cache_positions(&rows.pos, ctx, ctx)?;
         let mut q = DeviceBuffer::from_host(stream, &rows.q)?;
         let mut kb = DeviceBuffer::from_host(stream, &rows.k)?;
         let v = DeviceBuffer::from_host(stream, &rows.v)?;
@@ -337,26 +338,29 @@ pub mod dev {
         let mut cache_k = DeviceBuffer::from_host(stream, &plane)?;
         let mut cache_v = DeviceBuffer::from_host(stream, &plane)?;
         let mut enqueue = |s: &CudaStream| {
-            k.enqueue_head_norm_neox_append(
-                s,
-                NeoxArgs {
-                    q: &mut q,
-                    k: &mut kb,
-                    v: &v,
-                    gq: &gq,
-                    gk: &gk,
-                    table: &table,
-                    pos: &pos,
-                    eps,
-                    n_head: rows.n_head,
-                    n_kv: rows.n_kv,
-                    ctx,
-                    m: rows.m,
-                    fault,
-                    cache_k: &mut cache_k,
-                    cache_v: &mut cache_v,
-                },
-            )
+            // SAFETY: check_cache_positions validated the host positions before upload.
+            unsafe {
+                k.enqueue_head_norm_neox_append(
+                    s,
+                    NeoxArgs {
+                        q: &mut q,
+                        k: &mut kb,
+                        v: &v,
+                        gq: &gq,
+                        gk: &gk,
+                        table: &table,
+                        pos: &pos,
+                        eps,
+                        n_head: rows.n_head,
+                        n_kv: rows.n_kv,
+                        ctx,
+                        m: rows.m,
+                        fault,
+                        cache_k: &mut cache_k,
+                        cache_v: &mut cache_v,
+                    },
+                )
+            }
         };
         let nodes = match graph {
             None => {
@@ -460,6 +464,7 @@ pub mod dev {
         ctx: usize,
     ) -> Result<(NeoxQ8Out, usize), GateError> {
         use bloomery_gpu::rope_neox::{NeoxQ8Args, q8_plane_lens};
+        crate::rope_gate::check_cache_positions(&rows.pos, ctx, ctx)?;
         let mut q = DeviceBuffer::from_host(stream, &rows.q)?;
         let mut kb = DeviceBuffer::from_host(stream, &rows.k)?;
         let v = DeviceBuffer::from_host(stream, &rows.v)?;
@@ -475,28 +480,31 @@ pub mod dev {
         let mut vq = DeviceBuffer::from_host(stream, &codes)?;
         let mut vd = DeviceBuffer::from_host(stream, &sc)?;
         let mut enqueue = |s: &CudaStream| {
-            k.enqueue_head_norm_neox_append_q8(
-                s,
-                NeoxQ8Args {
-                    q: &mut q,
-                    k: &mut kb,
-                    v: &v,
-                    gq: &gq,
-                    gk: &gk,
-                    table: &table,
-                    pos: &pos,
-                    eps,
-                    n_head: rows.n_head,
-                    n_kv: rows.n_kv,
-                    ctx,
-                    m: rows.m,
-                    fault,
-                    kq: &mut kq,
-                    kd: &mut kd,
-                    vq: &mut vq,
-                    vd: &mut vd,
-                },
-            )
+            // SAFETY: check_cache_positions validated the host positions before upload.
+            unsafe {
+                k.enqueue_head_norm_neox_append_q8(
+                    s,
+                    NeoxQ8Args {
+                        q: &mut q,
+                        k: &mut kb,
+                        v: &v,
+                        gq: &gq,
+                        gk: &gk,
+                        table: &table,
+                        pos: &pos,
+                        eps,
+                        n_head: rows.n_head,
+                        n_kv: rows.n_kv,
+                        ctx,
+                        m: rows.m,
+                        fault,
+                        kq: &mut kq,
+                        kd: &mut kd,
+                        vq: &mut vq,
+                        vd: &mut vd,
+                    },
+                )
+            }
         };
         let nodes = match graph {
             None => {
@@ -521,5 +529,94 @@ pub mod dev {
             },
             nodes,
         ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        #[ignore = "needs a CUDA card"]
+        fn hw_neox_cache_writers() -> Result<(), GateError> {
+            let gpu = Gpu::new()?;
+            let kernels = RopeNeoxKernels::load(gpu.context())?;
+            let mut rows = AttnRows {
+                layer: 0,
+                m: 2,
+                n_head: 1,
+                n_kv: 1,
+                q: vec![0.25; 2 * HEAD],
+                k: vec![0.5; 2 * HEAD],
+                v: vec![0.75; 2 * HEAD],
+                pos: vec![0, 0],
+                q_normed: Vec::new(),
+                k_normed: Vec::new(),
+                q_roped: Vec::new(),
+                k_roped: Vec::new(),
+                k_rows: Vec::new(),
+                v_rows: Vec::new(),
+                gq_name: String::new(),
+                gk_name: String::new(),
+            };
+            let gains = vec![1.0; HEAD];
+            let table: Vec<f32> = [1.0, 0.0].into_iter().cycle().take(2 * HEAD).collect();
+            for graph in [false, true] {
+                let f16 = launch(
+                    &kernels,
+                    gpu.stream(),
+                    graph.then_some(&gpu),
+                    gpu.unlabelled_sink(),
+                    &rows,
+                    &gains,
+                    &gains,
+                    &table,
+                    1e-5,
+                    2,
+                );
+                assert!(f16.is_err_and(|e| e.to_string().contains("distinct rows")));
+                let q8 = launch_q8(
+                    &kernels,
+                    gpu.stream(),
+                    graph.then_some(&gpu),
+                    gpu.unlabelled_sink(),
+                    &rows,
+                    &gains,
+                    &gains,
+                    &table,
+                    1e-5,
+                    2,
+                );
+                assert!(q8.is_err_and(|e| e.to_string().contains("distinct rows")));
+            }
+            // PIN(2026-10-23): graph parity and node counts stay in gate_qwen3moe_rope.
+            rows.pos = vec![0, 1];
+            for graph in [false, true] {
+                launch(
+                    &kernels,
+                    gpu.stream(),
+                    graph.then_some(&gpu),
+                    gpu.unlabelled_sink(),
+                    &rows,
+                    &gains,
+                    &gains,
+                    &table,
+                    1e-5,
+                    2,
+                )?;
+                launch_q8(
+                    &kernels,
+                    gpu.stream(),
+                    graph.then_some(&gpu),
+                    gpu.unlabelled_sink(),
+                    &rows,
+                    &gains,
+                    &gains,
+                    &table,
+                    1e-5,
+                    2,
+                )?;
+            }
+            Ok(())
+        }
     }
 }

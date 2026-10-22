@@ -691,25 +691,28 @@ pub(super) fn neox_128_rows(
         let one = (dense, GemmInput::PerSlot);
         gemm_site((gpu, w, k), (ty, name), rows, &input, one, t, y)?;
     }
-    kv.append_128(
-        &k.neox,
-        stream,
-        Append128 {
-            q: &mut *q,
-            k: &mut *kr,
-            v: &*v,
-            gq: f32_gain(w, &n.attn_q_norm)?,
-            gk: f32_gain(w, &n.attn_k_norm)?,
-            table,
-            pos,
-            eps,
-            n_head: d.n_head,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            m: t,
-            fault: sink,
-        },
-    )?;
+    // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
+    unsafe {
+        kv.append_128(
+            &k.neox,
+            stream,
+            Append128 {
+                q: &mut *q,
+                k: &mut *kr,
+                v: &*v,
+                gq: f32_gain(w, &n.attn_q_norm)?,
+                gk: f32_gain(w, &n.attn_k_norm)?,
+                table,
+                pos,
+                eps,
+                n_head: d.n_head,
+                n_kv: d.n_kv,
+                ctx: d.ctx,
+                m: t,
+                fault: sink,
+            },
+        )
+    }?;
     kv.prefill_128(
         &k.prefill,
         stream,

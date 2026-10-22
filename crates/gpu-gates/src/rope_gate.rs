@@ -235,6 +235,26 @@ pub fn check_overflow<const H: usize>(
     Ok(pass)
 }
 
+/// Refuse two cache-valid positions that write the same row of a plane or ring.
+pub fn check_cache_positions(pos: &[u32], ctx: usize, rows: usize) -> Result<(), GpuError> {
+    let what = "rope gate positions";
+    if rows == 0 {
+        return Err(GpuError::shape(what, "cache rows must be positive"));
+    }
+    if pos.iter().enumerate().any(|(i, &p)| {
+        (p as usize) < ctx
+            && pos[..i]
+                .iter()
+                .any(|&q| (q as usize) < ctx && p as usize % rows == q as usize % rows)
+    }) {
+        return Err(GpuError::shape(
+            what,
+            "cache-valid positions must map to distinct rows",
+        ));
+    }
+    Ok(())
+}
+
 /// Check distinct positions, enqueue the rope and read its outputs.
 pub fn run(
     stream: &CudaStream,
@@ -244,10 +264,7 @@ pub fn run(
     fault: FaultSink,
     enqueue: impl FnOnce(&CudaStream, PartialNeoxArgs<'_>) -> Result<(), GpuError>,
 ) -> Result<RopeOut, GateError> {
-    assert!(
-        pos.iter().enumerate().all(|(i, p)| !pos[..i].contains(p)),
-        "rope gate: positions must be distinct"
-    );
+    check_cache_positions(pos, shape.ctx, shape.ctx)?;
     let RopeShape {
         head,
         n_head,
@@ -295,4 +312,42 @@ pub fn run(
         ck: ck.to_host_vec(stream)?,
         cv: cv.to_host_vec(stream)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_cache_positions;
+
+    #[test]
+    fn cache_writers_are_distinct() {
+        assert!(check_cache_positions(&[0, 0], 2, 2).is_err());
+        assert!(check_cache_positions(&[0, 2], 4, 2).is_err());
+        assert!(check_cache_positions(&[0, 1], 2, 2).is_ok());
+        assert!(check_cache_positions(&[1, 2], 4, 2).is_ok());
+        assert!(check_cache_positions(&[2, 2], 2, 2).is_ok());
+        assert!(check_cache_positions(&[0], 2, 0).is_err());
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_rope_rejects_duplicate_writers() -> Result<(), crate::GateError> {
+        let gpu = bloomery_gpu::Gpu::new()?;
+        let (inp, _) = super::seeded_inputs(128, 128, 10000.0, (2, 2), (1, 1))?;
+        let result = super::run(
+            gpu.stream(),
+            &inp,
+            &[0, 0],
+            super::RopeShape {
+                head: 128,
+                n_head: 1,
+                n_kv: 1,
+                ctx: 2,
+                eps: 1e-5,
+            },
+            gpu.unlabelled_sink(),
+            |_, _| panic!("duplicate writers reached enqueue"),
+        );
+        assert!(result.is_err_and(|e| e.to_string().contains("distinct rows")));
+        Ok(())
+    }
 }

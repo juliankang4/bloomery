@@ -1255,6 +1255,10 @@ gate-qwen3moe-meta:
 gate-qwen35moe-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test qwen35moe_meta -- --ignored --nocapture'
 
+# Cache append safety contracts and model-less plane/ring writer refusals.
+gate-gpu-rope-writers:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --doc rope_neox::RopeNeoxKernels && bash tools/gate.sh --oxide -p bloomery-gpu-gates --features gpu,mimo2 --release --lib --bin gate_qwen35moe_attn --bin gate_mimo2_flash -- --include-ignored writers --nocapture'
+
 # qwen3moe 커널 게이트(ik CPU 덤프 네 세트: 5토큰 프리필, 깊이 4·1,024·4,096의 디코드 스텝). `rope`는 헤드별 QK RMS
 # 노름과 NEOX 로프·K/V 캐시 쓰기(한 런치)를 두 절로, `router`는 소프트맥스 라우터 128/8과 재정규화, 그리고 ubatch 라우터를,
 # `down`은 다운 `_sel`(Q6_K, Q4_K)을, `head`는 argmax를 접은 Q6_K 헤드를, `flash`는 GQA 플래시 디코드 두 패스(스칼라·텐서

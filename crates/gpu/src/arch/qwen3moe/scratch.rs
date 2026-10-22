@@ -441,7 +441,10 @@ impl KvPlanes {
     /// [`enqueue_head_norm_neox_append`](crate::rope_neox::RopeNeoxKernels::enqueue_head_norm_neox_append)'s
     /// f16 launch, or its q8_0 twin's on a q8_0 cache. Asynchronous,
     /// allocation-free, capturable.
-    pub(super) fn append_128(
+    ///
+    /// # Safety
+    /// Among the first `s.m` positions in `s.pos`, those below `s.ctx` are pairwise distinct.
+    pub(super) unsafe fn append_128(
         &mut self,
         neox: &RopeNeoxKernels,
         stream: &CudaStream,
@@ -463,48 +466,54 @@ impl KvPlanes {
             fault,
         } = s;
         match self {
-            KvPlanes::F16 { k: kc, v: vc } => neox.enqueue_head_norm_neox_append(
-                stream,
-                NeoxArgs {
-                    q,
-                    k,
-                    v,
-                    gq,
-                    gk,
-                    table,
-                    pos,
-                    eps,
-                    n_head,
-                    n_kv,
-                    ctx,
-                    m,
-                    fault,
-                    cache_k: kc,
-                    cache_v: vc,
-                },
-            ),
-            KvPlanes::Q8 { kq, kd, vq, vd } => neox.enqueue_head_norm_neox_append_q8(
-                stream,
-                NeoxQ8Args {
-                    q,
-                    k,
-                    v,
-                    gq,
-                    gk,
-                    table,
-                    pos,
-                    eps,
-                    n_head,
-                    n_kv,
-                    ctx,
-                    m,
-                    fault,
-                    kq,
-                    kd,
-                    vq,
-                    vd,
-                },
-            ),
+            // SAFETY: the enclosing helper requires distinct cache-valid positions per sequence.
+            KvPlanes::F16 { k: kc, v: vc } => unsafe {
+                neox.enqueue_head_norm_neox_append(
+                    stream,
+                    NeoxArgs {
+                        q,
+                        k,
+                        v,
+                        gq,
+                        gk,
+                        table,
+                        pos,
+                        eps,
+                        n_head,
+                        n_kv,
+                        ctx,
+                        m,
+                        fault,
+                        cache_k: kc,
+                        cache_v: vc,
+                    },
+                )
+            },
+            // SAFETY: the enclosing helper requires distinct cache-valid positions per sequence.
+            KvPlanes::Q8 { kq, kd, vq, vd } => unsafe {
+                neox.enqueue_head_norm_neox_append_q8(
+                    stream,
+                    NeoxQ8Args {
+                        q,
+                        k,
+                        v,
+                        gq,
+                        gk,
+                        table,
+                        pos,
+                        eps,
+                        n_head,
+                        n_kv,
+                        ctx,
+                        m,
+                        fault,
+                        kq,
+                        kd,
+                        vq,
+                        vd,
+                    },
+                )
+            },
         }
     }
 
@@ -954,7 +963,10 @@ impl KvPlanes {
     /// ([`RopeNeoxKernels::enqueue_head_norm_neox_append_rows`]): each row
     /// [`KvPlanes::append_128`]'s row over its own planes. Asynchronous,
     /// allocation-free, capturable.
-    pub(super) fn append_128_rows(
+    ///
+    /// # Safety
+    /// Within each sequence in `table`, cache-valid positions in `s.pos` are pairwise distinct.
+    pub(super) unsafe fn append_128_rows(
         neox: &RopeNeoxKernels,
         stream: &CudaStream,
         table: &RowTable<'_>,
@@ -975,25 +987,28 @@ impl KvPlanes {
             m,
             fault,
         } = s;
-        neox.enqueue_head_norm_neox_append_rows(
-            stream,
-            table,
-            NeoxRowsArgs {
-                q,
-                k,
-                v,
-                gq,
-                gk,
-                table: rope,
-                pos,
-                eps,
-                n_head,
-                n_kv,
-                ctx,
-                m,
-                fault,
-            },
-        )
+        // SAFETY: the enclosing helper requires distinct cache-valid positions per sequence.
+        unsafe {
+            neox.enqueue_head_norm_neox_append_rows(
+                stream,
+                table,
+                NeoxRowsArgs {
+                    q,
+                    k,
+                    v,
+                    gq,
+                    gk,
+                    table: rope,
+                    pos,
+                    eps,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    m,
+                    fault,
+                },
+            )
+        }
     }
 
     /// The head-128 tensor-core decode flash of `s`'s rows over several

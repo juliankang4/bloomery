@@ -813,25 +813,28 @@ impl PromptProgram<'_> {
             let mut ys = span_mut(W, &mut b.qkv, c0 * width, cn * width)?;
             site::resident_gemv_cols(gpu, None, (w, &n.qkv), &xs, cn, &mut ys)?;
         }
-        enqueue_append(
-            &self.k.rope,
-            stream,
-            K192Args {
-                qkv: &mut b.qkv,
-                q: &mut b.q,
-                table: &self.ropes[c.rope].rows.table,
-                pos: &ub.pos,
-                v_scale: a.v_scale,
-                n_head: d.heads,
-                n_kv: a.kv_heads,
-                ctx: self.ctx,
-                m: t,
-                fault,
-                cache_k: &mut store.k,
-                cache_v: &mut store.v,
-            },
-            rows,
-        )?;
+        // SAFETY: each sequence uploads consecutive positions, and its batch is no taller than its ring.
+        unsafe {
+            enqueue_append(
+                &self.k.rope,
+                stream,
+                K192Args {
+                    qkv: &mut b.qkv,
+                    q: &mut b.q,
+                    table: &self.ropes[c.rope].rows.table,
+                    pos: &ub.pos,
+                    v_scale: a.v_scale,
+                    n_head: d.heads,
+                    n_kv: a.kv_heads,
+                    ctx: self.ctx,
+                    m: t,
+                    fault,
+                    cache_k: &mut store.k,
+                    cache_v: &mut store.v,
+                },
+                rows,
+            )
+        }?;
         let sinks = n
             .sinks
             .as_deref()

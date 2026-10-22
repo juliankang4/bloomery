@@ -64,16 +64,21 @@ impl AttnNames {
 /// `args.ctx` is the ring entry; a cache that fills the context is the plane
 /// entry (a full layer, a window layer whose ring is the whole plane, and
 /// the oracle's plane sequence).
-pub(crate) fn enqueue_append(
+///
+/// # Safety
+/// Cache-valid positions map to distinct cache rows modulo `rows`.
+pub(crate) unsafe fn enqueue_append(
     rope: &RopeNeoxKernels,
     stream: &CudaStream,
     args: K192Args<'_>,
     rows: usize,
 ) -> Result<(), GpuError> {
     if rows < args.ctx {
-        rope.enqueue_neox_append_k192_ring(stream, args, rows)
+        // SAFETY: enqueue_append requires distinct cache-valid rows modulo rows.
+        unsafe { rope.enqueue_neox_append_k192_ring(stream, args, rows) }
     } else {
-        rope.enqueue_neox_append_k192(stream, args)
+        // SAFETY: enqueue_append requires distinct cache-valid rows modulo rows.
+        unsafe { rope.enqueue_neox_append_k192(stream, args) }
     }
 }
 
@@ -117,25 +122,28 @@ pub(crate) fn attention(
         &mut s.xn,
     )?;
     site::resident_gemv(gpu, w, &n.qkv, &s.xn, &mut s.qkv)?;
-    enqueue_append(
-        &p.k.rope,
-        stream,
-        K192Args {
-            qkv: &mut s.qkv,
-            q: &mut s.q,
-            table: &p.ropes[c.rope].rows.table,
-            pos: &s.pos,
-            v_scale: a.v_scale,
-            n_head: d.heads,
-            n_kv: a.kv_heads,
-            ctx: p.ctx,
-            m: 1,
-            fault,
-            cache_k: &mut store.k,
-            cache_v: &mut store.v,
-        },
-        rows,
-    )?;
+    // SAFETY: this is one token, so there is only one cache writer per head.
+    unsafe {
+        enqueue_append(
+            &p.k.rope,
+            stream,
+            K192Args {
+                qkv: &mut s.qkv,
+                q: &mut s.q,
+                table: &p.ropes[c.rope].rows.table,
+                pos: &s.pos,
+                v_scale: a.v_scale,
+                n_head: d.heads,
+                n_kv: a.kv_heads,
+                ctx: p.ctx,
+                m: 1,
+                fault,
+                cache_k: &mut store.k,
+                cache_v: &mut store.v,
+            },
+            rows,
+        )
+    }?;
     let sinks = n
         .sinks
         .as_deref()

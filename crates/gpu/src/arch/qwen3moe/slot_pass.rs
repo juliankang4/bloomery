@@ -344,8 +344,12 @@ fn attention(
         fault: c.sink,
     };
     match &mut planes {
-        Planes::Slot(kv) => kv.append_128(&c.k.neox, stream, append)?,
-        Planes::Rows(table) => KvPlanes::append_128_rows(&c.k.neox, stream, table, append)?,
+        // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
+        Planes::Slot(kv) => unsafe { kv.append_128(&c.k.neox, stream, append) }?,
+        // SAFETY: the sequence uploads consecutive positions for its rows; different sequences use disjoint planes.
+        Planes::Rows(table) => {
+            unsafe { KvPlanes::append_128_rows(&c.k.neox, stream, table, append) }?
+        }
     }
     let n_keys = rows(n_keys, r, 1)?;
     let mut part_v = rows_mut(part_v, r, partials_v_len(1, d.n_head))?;

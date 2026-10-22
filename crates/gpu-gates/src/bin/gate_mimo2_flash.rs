@@ -1430,6 +1430,7 @@ mod gate {
         pos: &[u32],
         v_scale: f32,
     ) -> Result<Appended, GateError> {
+        bloomery_gpu_gates::rope_gate::check_cache_positions(pos, ctx, rows.unwrap_or(ctx))?;
         let stream = gpu.stream();
         let m = pos.len();
         let plane_rows = rows.unwrap_or(ctx);
@@ -1455,8 +1456,10 @@ mod gate {
             cache_v: &mut vc,
         };
         match rows {
-            None => a.enqueue_neox_append_k192(stream, args)?,
-            Some(rows) => a.enqueue_neox_append_k192_ring(stream, args, rows)?,
+            // SAFETY: check_cache_positions checked distinct cache rows before upload.
+            None => unsafe { a.enqueue_neox_append_k192(stream, args) }?,
+            // SAFETY: check_cache_positions checked distinct cache rows before upload.
+            Some(rows) => unsafe { a.enqueue_neox_append_k192_ring(stream, args, rows) }?,
         }
         stream.synchronize()?;
         Ok(Appended {
@@ -1633,23 +1636,26 @@ mod gate {
         let mut kc = DeviceBuffer::<u16>::zeroed(stream, KV_FULL * ctx * HEAD_K192)?;
         let mut vc = DeviceBuffer::<u16>::zeroed(stream, KV_FULL * ctx * HEAD)?;
         let mut refuse = |v_scale: f32, n_kv: usize, m: usize| {
-            a.enqueue_neox_append_k192(
-                stream,
-                K192Args {
-                    qkv: &mut qkv_d,
-                    q: &mut q_d,
-                    table: &table_d,
-                    pos: &pos_d,
-                    v_scale,
-                    n_head: N_HEAD,
-                    n_kv,
-                    ctx,
-                    m,
-                    fault: gpu.unlabelled_sink(),
-                    cache_k: &mut kc,
-                    cache_v: &mut vc,
-                },
-            )
+            // SAFETY: the position buffer contains one token; malformed shapes return before launch.
+            unsafe {
+                a.enqueue_neox_append_k192(
+                    stream,
+                    K192Args {
+                        qkv: &mut qkv_d,
+                        q: &mut q_d,
+                        table: &table_d,
+                        pos: &pos_d,
+                        v_scale,
+                        n_head: N_HEAD,
+                        n_kv,
+                        ctx,
+                        m,
+                        fault: gpu.unlabelled_sink(),
+                        cache_k: &mut kc,
+                        cache_v: &mut vc,
+                    },
+                )
+            }
         };
         let r_nan = refused(refuse(f32::NAN, KV_FULL, 1), "finite");
         let r_inf = refused(refuse(f32::INFINITY, KV_FULL, 1), "finite");
@@ -1980,41 +1986,47 @@ mod gate {
             let mut pms_r = DeviceBuffer::<f32>::zeroed(stream, plen(m, N_HEAD, segs, 2))?;
             let mut y_p = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
             let mut y_r = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
-            a.enqueue_neox_append_k192(
-                stream,
-                K192Args {
-                    qkv: &mut qkv_p,
-                    q: &mut q_p,
-                    table: &table,
-                    pos: &pos,
-                    v_scale: V_SCALE,
-                    n_head: N_HEAD,
-                    n_kv,
-                    ctx,
-                    m,
-                    fault: gpu.unlabelled_sink(),
-                    cache_k: &mut plane.0,
-                    cache_v: &mut plane.1,
-                },
-            )?;
-            if let Err(e) = a.enqueue_neox_append_k192_ring(
-                stream,
-                K192Args {
-                    qkv: &mut qkv_r,
-                    q: &mut q_r,
-                    table: &table,
-                    pos: &pos,
-                    v_scale: V_SCALE,
-                    n_head: N_HEAD,
-                    n_kv,
-                    ctx,
-                    m,
-                    fault: gpu.unlabelled_sink(),
-                    cache_k: &mut ring.0,
-                    cache_v: &mut ring.1,
-                },
-                rows,
-            ) {
+            // SAFETY: the pass uploads consecutive positions and the ring holds at least m rows.
+            unsafe {
+                a.enqueue_neox_append_k192(
+                    stream,
+                    K192Args {
+                        qkv: &mut qkv_p,
+                        q: &mut q_p,
+                        table: &table,
+                        pos: &pos,
+                        v_scale: V_SCALE,
+                        n_head: N_HEAD,
+                        n_kv,
+                        ctx,
+                        m,
+                        fault: gpu.unlabelled_sink(),
+                        cache_k: &mut plane.0,
+                        cache_v: &mut plane.1,
+                    },
+                )
+            }?;
+            // SAFETY: the pass uploads consecutive positions and the ring holds at least m rows.
+            if let Err(e) = unsafe {
+                a.enqueue_neox_append_k192_ring(
+                    stream,
+                    K192Args {
+                        qkv: &mut qkv_r,
+                        q: &mut q_r,
+                        table: &table,
+                        pos: &pos,
+                        v_scale: V_SCALE,
+                        n_head: N_HEAD,
+                        n_kv,
+                        ctx,
+                        m,
+                        fault: gpu.unlabelled_sink(),
+                        cache_k: &mut ring.0,
+                        cache_v: &mut ring.1,
+                    },
+                    rows,
+                )
+            } {
                 println!("W2 pass p0={p0}: the ring append was refused: {e} FAIL");
                 return Ok(false);
             }
@@ -2178,8 +2190,10 @@ mod gate {
                 cache_v: &mut self.vc,
             };
             match self.rows {
-                None => a.enqueue_neox_append_k192(s, args)?,
-                Some(rows) => a.enqueue_neox_append_k192_ring(s, args, rows)?,
+                // SAFETY: Decode enqueues one token, so each cache head has one writer.
+                None => unsafe { a.enqueue_neox_append_k192(s, args) }?,
+                // SAFETY: Decode enqueues one token, so each cache head has one writer.
+                Some(rows) => unsafe { a.enqueue_neox_append_k192_ring(s, args, rows) }?,
             }
             let args = GqaK192Args {
                 q: &self.q,
@@ -2415,24 +2429,27 @@ mod gate {
                 2 => (&mut self.ck, &mut self.short_cv),
                 _ => (&mut self.ck, &mut self.cv),
             };
-            a.enqueue_neox_append_k192_ring(
-                gpu.stream(),
-                K192Args {
-                    qkv: &mut self.qkv,
-                    q: &mut self.q,
-                    table: &self.table,
-                    pos: &self.pos,
-                    v_scale: V_SCALE,
-                    n_head: N_HEAD,
-                    n_kv: KV_SWA,
-                    ctx,
-                    m,
-                    fault: gpu.unlabelled_sink(),
-                    cache_k,
-                    cache_v,
-                },
-                rows,
-            )
+            // SAFETY: valid launches use consecutive positions within the ring; malformed shapes return before launch.
+            unsafe {
+                a.enqueue_neox_append_k192_ring(
+                    gpu.stream(),
+                    K192Args {
+                        qkv: &mut self.qkv,
+                        q: &mut self.q,
+                        table: &self.table,
+                        pos: &self.pos,
+                        v_scale: V_SCALE,
+                        n_head: N_HEAD,
+                        n_kv: KV_SWA,
+                        ctx,
+                        m,
+                        fault: gpu.unlabelled_sink(),
+                        cache_k,
+                        cache_v,
+                    },
+                    rows,
+                )
+            }
         }
 
         /// Whether the query output is still zero and both planes the sentinel.
@@ -2982,5 +2999,34 @@ mod gate {
             return Err(checks_failed());
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        #[ignore = "needs a CUDA card"]
+        fn hw_append_rejects_duplicate_writers() -> Result<(), GateError> {
+            let gpu = Gpu::new()?;
+            let kern = RopeNeoxKernels::load(gpu.context())?;
+            let (qkv, ..) = fused(2, 1, 1, 1);
+            let table = table_for(10000.0, 4)?;
+            for (rows, pos) in [(None, [0, 0]), (Some(2), [0, 2])] {
+                let result = append_launch(
+                    &kern,
+                    &gpu,
+                    gpu.unlabelled_sink(),
+                    (1, 1, 4),
+                    rows,
+                    &qkv,
+                    &table,
+                    &pos,
+                    1.0,
+                );
+                assert!(result.is_err_and(|e| e.to_string().contains("distinct rows")));
+            }
+            Ok(())
+        }
     }
 }
