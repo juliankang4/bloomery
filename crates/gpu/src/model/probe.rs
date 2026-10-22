@@ -81,8 +81,7 @@ fn act_planes(k: usize) -> (usize, usize, usize, usize, usize) {
 /// Bytes `cols` columns of the q8_1 quantizer write: every plane, since one
 /// quantize serves the Q3_K, Q4_K and Q6_K gemvs alike.
 pub(crate) fn act_write_bytes(a: &Q8Act, cols: usize) -> usize {
-    let (q3, q4, q6, s8, d8) = act_planes(a.k());
-    cols * (q3 + q4 + q6 + s8 + d8)
+    cols * super::fit::act_col_bytes(a.k())
 }
 
 /// Bytes `cols` activation columns cost the gemv of `w`: Q3_K loads the u64

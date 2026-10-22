@@ -1165,7 +1165,7 @@ impl ApartRows {
             .map(|b| b.num_bytes())
             .sum::<usize>()
             + self.sel.num_bytes()
-            + self.act.iter().map(act_bytes).sum::<usize>()
+            + self.act.iter().map(Q8Act::device_bytes).sum::<usize>()
     }
 }
 
@@ -1994,13 +1994,8 @@ impl Arena {
             + self.cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.apart.as_ref().map_or(0, ApartRows::bytes)
             + self.route.bytes()
-            + acts.map(act_bytes).sum::<usize>()
+            + acts.map(Q8Act::device_bytes).sum::<usize>()
     }
-}
-
-/// Device bytes of one quantized activation's planes.
-fn act_bytes(a: &Q8Act) -> usize {
-    a.q3.num_bytes() + a.q4.num_bytes() + a.q6.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes()
 }
 
 #[cfg(test)]

@@ -114,11 +114,7 @@ impl MoeScratch {
         total += self.act32_exp.q.num_bytes()
             + self.act32_exp.s8.num_bytes()
             + self.act32_exp.d8.num_bytes();
-        total += self.act_sh.q3.num_bytes()
-            + self.act_sh.q4.num_bytes()
-            + self.act_sh.q6.num_bytes()
-            + self.act_sh.s8.num_bytes()
-            + self.act_sh.d8.num_bytes();
+        total += self.act_sh.device_bytes();
         total
     }
 }
@@ -262,18 +258,16 @@ impl LayerScratch {
         .sum::<usize>();
         // The four parameter windows are counted once, through their parent.
         total += self.step_params.num_bytes() + self.probe_buf.num_bytes();
-        let act = |a: &Q8Act| {
-            a.q3.num_bytes()
-                + a.q4.num_bytes()
-                + a.q6.num_bytes()
-                + a.s8.num_bytes()
-                + a.d8.num_bytes()
-        };
-        total += act(&self.act_q)
-            + act(&self.act_kv_lo)
-            + act(&self.act_kv_hi)
-            + act(&self.act_ao)
-            + act(&self.act_ffn);
+        total += [
+            &self.act_q,
+            &self.act_kv_lo,
+            &self.act_kv_hi,
+            &self.act_ao,
+            &self.act_ffn,
+        ]
+        .into_iter()
+        .map(Q8Act::device_bytes)
+        .sum::<usize>();
         total += [&self.g_f_rope_lo, &self.g_f_rope_hi]
             .iter()
             .map(|g| g.src.num_bytes() + g.dst.num_bytes())
