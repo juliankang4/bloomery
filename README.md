@@ -1,11 +1,9 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
-    <img src="docs/assets/logo.svg" width="128" alt="bloomery">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
+    <img src="docs/assets/banner.svg" width="720" alt="bloomery">
   </picture>
 </p>
-
-<h1 align="center">bloomery</h1>
 
 <p align="center">
   <b>A fast inference engine for mixture-of-experts models, built for offloading.</b><br>
