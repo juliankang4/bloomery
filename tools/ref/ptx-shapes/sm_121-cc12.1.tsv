@@ -193,6 +193,7 @@ generate_ds41   hc_gated_mix_4                           0           0
 generate_ds41   hc_gated_norm_4                          0           0
 generate_ds41   hc_gated_norm_4w                         0           0
 generate_ds41   hc_gated_up_mix_4x320                    0           0
+generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
 generate_ds41   head_norm_neox_append                    0           0

@@ -594,6 +594,42 @@ unsafe fn up_mix_value_bf16<const M: usize>(
     }
 }
 
+/// Stage the bottleneck and mix one warp's four BF16 rows.
+///
+/// # Safety
+/// Every thread of a 512-thread block calls this with M in 1..=8. The
+/// BF16 up entry's launch contract holds for M columns, and lo_s owns
+/// M * RANK shared f32 slots for this block.
+#[inline(always)]
+unsafe fn up_bf16<const M: usize>(
+    w: &[u32],
+    parts: (&[f32], &[f32]),
+    xn: &[f32],
+    (hidden, inject): (u32, u32),
+    fault: FaultSink,
+    (lo, wgt, mixed): (
+        &mut DisjointSlice<f32>,
+        &mut DisjointSlice<f32>,
+        &mut DisjointSlice<f32>,
+    ),
+    lo_s: *mut f32,
+) {
+    // SAFETY: the entry's buffers satisfy up_stage for M columns, and
+    // every thread calls it before any row guard.
+    unsafe { up_stage(parts.0, parts.1, (M as u32, inject), fault, (lo, wgt), lo_s) };
+    let h = thread::blockIdx_x() as usize * UP_WARPS + thread::threadIdx_x() as usize / 32;
+    if h >= hidden as usize {
+        return;
+    }
+    // SAFETY: h < hidden; up_stage initialized M * RANK shared values
+    // before its barrier, and the entry owns this warp's output.
+    unsafe {
+        up_mix_value_bf16::<M>(
+            w, lo_s, xn, (hidden as usize, h, warp::lane_id() as usize), fault, mixed,
+        )
+    };
+}
+
 /// One block of `hc_gated_norm_4` and `hc_gated_norm_4w`, which say what it
 /// computes: stream `s` of column `c`, this thread `tid` of its
 /// [`NORM_THREADS`]. A thread walks its values `tid`, `tid + NORM_THREADS`
@@ -1039,37 +1075,71 @@ mod hc_kernels {
         mut mixed: DisjointSlice<f32>,
     ) {
         static mut LO: SharedArray<f32, { MAX_COLS * RANK }> = SharedArray::UNINIT;
-        let b = thread::blockIdx_x() as usize;
-        let tid = thread::threadIdx_x() as usize;
-        let lane = warp::lane_id() as usize;
-        let hid = hidden as usize;
-        // SAFETY: LO is this block's private MAX_COLS * RANK allocation;
-        // up_stage initializes its live slots before the barrier that publishes them.
+        // SAFETY: LO owns MAX_COLS * RANK values in this block.
         let lo_s = unsafe { SharedArray::as_raw_mut_ptr(&raw mut LO) };
-        // SAFETY: the launch contract above holds; every thread of the
-        // block calls it.
-        unsafe { up_stage(dpart, ipart, (m, inject), fault, (&mut lo, &mut wgt), lo_s) };
-        let h = b * UP_WARPS + tid / 32;
-        if h >= hid {
-            return; // warp-uniform; no barrier follows
-        }
-        let at = (hid, h, lane);
-        // SAFETY: the words hold 4·hidden rows of RANK values by the launch
-        // contract, lo_s m·RANK values written before the barrier, xn m
-        // columns and mixed m·hidden slots; h < hidden.
+        let parts = (dpart, ipart);
+        let geometry = (hidden, inject);
+        let outputs = (&mut lo, &mut wgt, &mut mixed);
+        // SAFETY: the launch contract holds for m columns; every thread
+        // takes the same arm and enters the stage before any row guard.
         unsafe {
             match m {
-                1 => up_mix_value_bf16::<1>(w, lo_s, xn, at, fault, &mut mixed),
-                2 => up_mix_value_bf16::<2>(w, lo_s, xn, at, fault, &mut mixed),
-                3 => up_mix_value_bf16::<3>(w, lo_s, xn, at, fault, &mut mixed),
-                4 => up_mix_value_bf16::<4>(w, lo_s, xn, at, fault, &mut mixed),
-                5 => up_mix_value_bf16::<5>(w, lo_s, xn, at, fault, &mut mixed),
-                6 => up_mix_value_bf16::<6>(w, lo_s, xn, at, fault, &mut mixed),
-                7 => up_mix_value_bf16::<7>(w, lo_s, xn, at, fault, &mut mixed),
-                8 => up_mix_value_bf16::<8>(w, lo_s, xn, at, fault, &mut mixed),
+                2 => up_bf16::<2>(w, parts, xn, geometry, fault, outputs, lo_s),
+                3 => up_bf16::<3>(w, parts, xn, geometry, fault, outputs, lo_s),
+                4 => up_bf16::<4>(w, parts, xn, geometry, fault, outputs, lo_s),
+                5 => up_bf16::<5>(w, parts, xn, geometry, fault, outputs, lo_s),
+                6 => up_bf16::<6>(w, parts, xn, geometry, fault, outputs, lo_s),
+                7 => up_bf16::<7>(w, parts, xn, geometry, fault, outputs, lo_s),
+                8 => up_bf16::<8>(w, parts, xn, geometry, fault, outputs, lo_s),
                 _ => {}
             }
         }
+    }
+
+    /// One-column BF16 up and mix, with only its live bottleneck in shared memory.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            inject <= 1,
+            2 * w.len() >= 1280 * hidden,
+            dpart.len() >= 1280,
+            ipart.len() >= 16,
+            xn.len() >= 4 * hidden,
+            lo.len() >= 320,
+            wgt.len() >= 4,
+            mixed.len() >= hidden
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn hc_gated_up_mix_bf16_1col(
+        w: &[u32],
+        dpart: &[f32],
+        ipart: &[f32],
+        xn: &[f32],
+        hidden: u32,
+        inject: u32,
+        fault: FaultSink,
+        mut lo: DisjointSlice<f32>,
+        mut wgt: DisjointSlice<f32>,
+        mut mixed: DisjointSlice<f32>,
+    ) {
+        static mut LO: SharedArray<f32, RANK> = SharedArray::UNINIT;
+        // SAFETY: LO owns this column's RANK shared values in this block.
+        let lo_s = unsafe { SharedArray::as_raw_mut_ptr(&raw mut LO) };
+        // SAFETY: the launch contract holds for one column, and every
+        // thread calls the stage before any row guard.
+        unsafe {
+            up_bf16::<1>(
+                w, (dpart, ipart), xn, (hidden, inject), fault,
+                (&mut lo, &mut wgt, &mut mixed), lo_s,
+            )
+        };
     }
 
     /// The combine alone: value `i` of `res` (`[m][4][hidden]`) becomes
@@ -1461,6 +1531,13 @@ impl HcGatedKernels {
                     &mut s.lo,
                     &mut s.wgt,
                     a.mixed,
+                )?;
+            }
+            HcMatrix::Bf16(w) if mu == 1 => {
+                let prep = self.module.prepare_hc_gated_up_mix_bf16_1col(cfg)?;
+                self.module.hc_gated_up_mix_bf16_1col(
+                    stream, &prep, w.buf(), &s.dpart, &s.ipart, &s.xn,
+                    hidden, inject, a.fault, &mut s.lo, &mut s.wgt, a.mixed,
                 )?;
             }
             HcMatrix::Bf16(w) => {
