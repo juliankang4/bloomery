@@ -46,7 +46,6 @@ mod gemm32_kernels {
     use cuda_device::async_copy::{
         cp_async_ca_4, cp_async_cg_16, cp_async_commit_group, cp_async_wait_group,
     };
-    use cuda_device::float::{fma_rn_f32, mul_rn_f32};
     use cuda_device::shared::cvta_generic_to_shared_u32;
     use cuda_device::vector::U32x4;
     use cuda_device::wmma::{ldmatrix_x4_shared_u32, mma_m16n8k32_s32_s8};

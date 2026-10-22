@@ -27,8 +27,8 @@
 //!   `qs` u32 words, four a 32-value unit, `e` one word a 64-value block)
 //!   with one F32 tensor scale an expert of the stack — each unit's nibbles
 //!   decoded to the E2M1 table's int8 values, its two sub-block scales
-//!   staged as f32, the store one `mul_rn` by the tile's expert's scale — no
-//!   Q8_0 twin derived beside them.
+//!   staged as f32, the store applying the tile's expert's scale. No
+//!   Q8_0 twin is derived beside them.
 //!
 //! Numeric contract, every entry. Per 32-value block `b` of an output
 //! `(slot, row)`: `isum` the exact i32 dot of the weight codes (Q8_0 int8;
@@ -57,6 +57,9 @@
 //! slot's expert `e`. Each `d_s·f32(i_s)`
 //! is exact in f32 — a 4-bit significand times a 15-bit integer — so a unit
 //! rounds twice and the store once; the same K-only order rule holds.
+//! These F32 roundings apply while the intermediates stay in range. An
+//! exceptional magnitude stays in F64 until the expert scale is applied,
+//! so an intermediate overflow or underflow cannot erase a finite output.
 //!
 //! Geometry. A block is [`GEMM_THREADS`] threads, eight warps of sixteen
 //! rows over the tile's columns in n-tiles of eight (the K-quant family's
@@ -618,8 +621,10 @@ macro_rules! w32 {
         let _ = $xs;
         1.0f32
     }};
+    (@acc nvfp4p($($w:ident),+)) => { [0.0f64; 4 * GEMM_NT] };
+    (@acc $kind:ident($($w:ident),+)) => { [0.0f32; 4 * GEMM_NT] };
     (@scale nvfp4p($qs:ident, $e:ident, $scales:ident), $s:expr, $v:expr) => {
-        mul_rn_f32($s, $v)
+        $crate::gemm::grouped::scaled_sum([$v, 0.0], [$s, 0.0], 1.0, 0.0) as f32
     };
     (@scale $kind:ident($($w:ident),+), $s:expr, $v:expr) => {{
         let _ = $s;
@@ -675,13 +680,18 @@ macro_rules! epi32 {
         let sa: [u32; 2] = $sa;
         for i in 0..4usize {
             ::cuda_device::thread::__unroll_config::<0>();
-            let tv = mul_rn_f32($dw[i / 2], $isum[i] as f32);
-            let tv = if $mins {
-                fma_rn_f32($mw[i / 2], sa[i & 1] as i32 as f32, tv)
-            } else {
-                tv
-            };
-            $acc[4 * $nt + i] = fma_rn_f32(f32::from_bits(da[i & 1]), tv, $acc[4 * $nt + i]);
+            $acc[4 * $nt + i] = $crate::gemm::grouped::scaled_sum(
+                [
+                    f64::from($dw[i / 2]),
+                    f64::from(if $mins { $mw[i / 2] } else { 0.0 }),
+                ],
+                [
+                    $isum[i] as f32,
+                    if $mins { sa[i & 1] as i32 as f32 } else { 0.0 },
+                ],
+                f32::from_bits(da[i & 1]),
+                f64::from($acc[4 * $nt + i]),
+            ) as f32;
         }
     }};
 }
@@ -697,9 +707,12 @@ macro_rules! epi32_nv {
         let da: [u32; 2] = $da;
         for i in 0..4usize {
             ::cuda_device::thread::__unroll_config::<0>();
-            let tv = mul_rn_f32($d0[i / 2], $i0[i] as f32);
-            let tv = fma_rn_f32($d1[i / 2], $i1[i] as f32, tv);
-            $acc[4 * $nt + i] = fma_rn_f32(f32::from_bits(da[i & 1]), tv, $acc[4 * $nt + i]);
+            $acc[4 * $nt + i] = $crate::gemm::grouped::scaled_sum(
+                [f64::from($d0[i / 2]), f64::from($d1[i / 2])],
+                [$i0[i] as f32, $i1[i] as f32],
+                f32::from_bits(da[i & 1]),
+                $acc[4 * $nt + i],
+            );
         }
     }};
 }
@@ -1002,7 +1015,7 @@ macro_rules! gemm32_block {
         // SAFETY: commits this thread's copies above as one group.
         unsafe { cp_async_commit_group() };
 
-        let mut acc = [0.0f32; 4 * GEMM_NT];
+        let mut acc = w32!(@acc $kind($($w),+));
         let mut h = 0usize;
         while h < steps {
             let st = h & 1;

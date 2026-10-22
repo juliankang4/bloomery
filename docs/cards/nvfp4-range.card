@@ -1,0 +1,13 @@
+kind: baseline
+question: do range-preserving NVFP4 scales retain normal 4096-token prefill throughput?
+term: head prefill tokens per second divided by the pre-fix native NVFP4 result
+unit: ratio
+predict: 0.97..1.03
+condition: one GB10, one lease, the same NVFP4 checkpoint and 4096 code prompt IDs,
+  eight greedy output tokens, draft off, one server and request at a time, and
+  separate first-use and warm requests; model load is outside each timed request
+reason: the fix adds an exceptional-range branch and keeps ordinary F32 rounding;
+  a short paired observation checks for an obvious regression without estimating significance
+decide-in: retain the fix and report the pair as one observation with its limits
+decide-below: inspect the added epilogue and packing work before retaining the fix
+decide-above: report the observation and investigate a speed claim separately

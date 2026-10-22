@@ -3464,7 +3464,9 @@ mod gate {
         use bloomery_gpu::mxfp4_sel::Nvfp4Stack;
         use bloomery_gpu::q5::{Q8Blocks32, pack_q5_0};
         use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
-        use bloomery_gpu_gates::gemm32::{HostAct, Planes32, dot32, dot32_nv, host_act};
+        use bloomery_gpu_gates::gemm32::{
+            HostAct, Planes32, dot32, dot32_nv, dot32_nv_fp4, host_act,
+        };
         use bloomery_gpu_gates::rounding::gamma;
         use bloomery_gpu_gates::swiglu_host;
         use bloomery_gpu_gates::{
@@ -6832,6 +6834,24 @@ mod gate {
             Ok(ok)
         }
 
+        /// The input of one `nvfp4_native` case.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Native {
+            /// Powers of two, exact on both formats' grids.
+            Pattern,
+            /// One signed value a column.
+            OneHot,
+            /// The pattern at subnormal magnitude.
+            Tiny,
+            /// Values off the E2M1 grid, held to the host W4A4 transcription.
+            Varied,
+            /// A NaN among zeros, a NaN beside varied values, and a varied column:
+            /// `QuantColumn`, and NaN in every row of a refused column.
+            Refused,
+            /// One expert scale and one input value at the edge of the range.
+            Range(f32, f32),
+        }
+
         fn nvfp4_native_case(dev: &Dev<'_>) -> Result<bool, GateError> {
             if !wanted("nvfp4_native") {
                 return Ok(true);
@@ -6848,17 +6868,62 @@ mod gate {
             let gpu = dev.gpu;
             let stream = gpu.stream();
             let mut ok = true;
-            for (rows, slots, k, one_hot) in [
-                (16usize, 14usize, 128usize, false),
-                (128, 73, 64, false),
-                (144, 129, 256, false),
-                (48, 73, 64, true),
-                (16, 14, 20_480, false),
+            for (rows, slots, k, input) in [
+                (16usize, 14usize, 128usize, Native::Pattern),
+                (128, 73, 64, Native::Pattern),
+                (144, 129, 256, Native::Pattern),
+                (48, 73, 64, Native::OneHot),
+                (16, 14, 20_480, Native::Pattern),
+                (16, 14, 64, Native::Tiny),
+                (16, 14, 64, Native::Varied),
+                (16, 3, 64, Native::Refused),
+                (
+                    16,
+                    1,
+                    64,
+                    Native::Range(2.0f32.powi(120), 2.0f32.powi(-100)),
+                ),
+                (16, 1, 64, Native::Range(2.0f32.powi(-120), f32::MAX)),
+                (16, 1, 64, Native::Range(2.0f32.powi(-120), -f32::MAX)),
+                (
+                    16,
+                    1,
+                    64,
+                    Native::Range(2.0f32.powi(-100), 2.0f32.powi(120)),
+                ),
+                (
+                    16,
+                    1,
+                    64,
+                    Native::Range(f32::from_bits(1), 2.0f32.powi(120)),
+                ),
+                (
+                    16,
+                    1,
+                    64,
+                    Native::Range(f32::from_bits(0x7b2aa555), f32::from_bits(0x40c00600)),
+                ),
             ] {
+                let range = match input {
+                    Native::Range(scale, x) => Some((scale, x)),
+                    _ => None,
+                };
+                let (one_hot, tiny) = (input == Native::OneHot, input == Native::Tiny);
+                let refused = input == Native::Refused;
+                // Off-grid inputs meet the host W4A4 transcription and weights that vary along K.
+                let host = refused || input == Native::Varied;
+                let block_scale = if range.is_some_and(|(s, _)| s == f32::from_bits(1)) {
+                    0.001953125f32
+                } else {
+                    1.0
+                };
                 let codes: Vec<u32> = (0..2 * rows * k / 8)
                     .map(|i| {
                         let row = i / (k / 8) % rows;
-                        if !one_hot {
+                        if range.is_some() {
+                            return 0x22222222;
+                        }
+                        if !(one_hot || host) {
                             return (2 + row as u32 % 3) * 0x11111111;
                         }
                         let word = i % (k / 8);
@@ -6873,20 +6938,56 @@ mod gate {
                 let wq = DeviceTensor::upload(stream, &codes, 2 * rows, k / 8)?;
                 let we = DeviceTensor::upload(
                     stream,
-                    &vec![0x50483840u32; 2 * rows * k / 64],
+                    &vec![
+                        if range.is_some() {
+                            if block_scale == 1.0 {
+                                0x38383838u32
+                            } else {
+                                0x01010101u32
+                            }
+                        } else {
+                            0x50483840u32
+                        };
+                        2 * rows * k / 64
+                    ],
                     2 * rows,
                     k / 64,
                 )?;
-                let ws = DeviceTensor::upload(stream, &[1.0f32, 0.5], 2, 1)?;
+                let weight_scales = range.map_or([1.0f32, 0.5], |(scale, _)| [scale; 2]);
+                let ws = DeviceTensor::upload(stream, &weight_scales, 2, 1)?;
                 let xs: Vec<f32> = (0..slots * k)
                     .map(|i| {
-                        if one_hot {
-                            return if i % k == i / k % k { 1.0 } else { 0.0 };
+                        if let Some((_, input)) = range {
+                            return input;
                         }
-                        2.0f32.powi((i / k % 4) as i32 - 2) * [2.0, 1.0, 4.0, 8.0][i / 16 % 4]
+                        if one_hot {
+                            return if i % k == i / k % k {
+                                [1.0, -1.0][i / k % 2]
+                            } else {
+                                0.0
+                            };
+                        }
+                        if refused && (i == 0 || i == k + 5) {
+                            return f32::NAN;
+                        }
+                        if refused && i < k {
+                            return 0.0;
+                        }
+                        if host {
+                            return ((i * 37 % 257) as f32 - 128.0) / 64.0;
+                        }
+                        let x =
+                            2.0f32.powi((i / k % 4) as i32 - 2) * [2.0, 1.0, 4.0, 8.0][i / 16 % 4];
+                        if tiny {
+                            x * 1.0e-40 * [1.0, 0.5][i & 1]
+                        } else {
+                            x
+                        }
                     })
                     .collect();
-                let x = DeviceBuffer::from_host(stream, &xs)?;
+                let x_host: Vec<f32> = xs.iter().map(|v| (v / 128.0) * 128.0).collect();
+                let x = DeviceBuffer::from_host(stream, &x_host)?;
+                let want_fault = refused.then(|| Fault::at(LAYER_NONE, FaultSite::QuantColumn));
                 let ids: Vec<u32> = (0..slots).map(|i| (i % 2) as u32).collect();
                 let ids_d = DeviceBuffer::from_host(stream, &ids)?;
                 let mut route = GemmRoute::new(stream, slots, 2)?;
@@ -6897,8 +6998,16 @@ mod gate {
                     stream,
                     &xs.iter().map(|v| v / 128.0).collect::<Vec<_>>(),
                 )?;
-                for fused in [false, true] {
-                    let mut act = GemmAct32::new_routed(stream, slots, k)?;
+                let mut plain = Vec::new();
+                for (fused, native) in [(false, true), (true, true), (false, false)] {
+                    if !native && range.is_none() && !refused {
+                        continue;
+                    }
+                    let mut act = if native {
+                        GemmAct32::new_routed(stream, slots, k)?
+                    } else {
+                        GemmAct32::new(stream, slots, k)?
+                    };
                     let mut legacy = GemmAct32::new(stream, slots, k)?;
                     dev.g32.enqueue_swiglu_quant32_sel(
                         stream,
@@ -6910,6 +7019,7 @@ mod gate {
                         &mut legacy,
                         gpu.unlabelled_sink(),
                     )?;
+                    let legacy_fault = gpu.take_fault()?;
                     let mut y = DeviceBuffer::from_host(stream, &vec![SENT; slots * rows + 16])?;
                     let graph = {
                         let mut enqueue = |s: &cuda_core::CudaStream| {
@@ -6966,17 +7076,62 @@ mod gate {
                     let tail = eager[slots * rows..]
                         .iter()
                         .all(|v| v.to_bits() == SENT.to_bits());
+                    let host_want = if host {
+                        let (ha, _) = host_act(&x_host, k, slots);
+                        let host_w: Vec<i8> = (0..rows * k)
+                            .map(|i| KVALUES_MXFP4[(i / k + 3 * (i % k)) & 15])
+                            .collect();
+                        let host_wsc: Vec<f32> = (0..k / 16)
+                            .map(|s| ue4m3_half([0x40, 0x38, 0x48, 0x50][s % 4]))
+                            .collect();
+                        (0..slots * rows)
+                            .map(|i| {
+                                let (row, col) = (i % rows, i / rows);
+                                let w = &host_w[row * k..(row + 1) * k];
+                                let scale = weight_scales[ids[col] as usize];
+                                if native {
+                                    dot32_nv_fp4(w, &host_wsc, scale, &ha, col)
+                                } else {
+                                    let (_, want, mag) = dot32_nv(w, &host_wsc, scale, &ha, col);
+                                    Ok((want, mag))
+                                }
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        Vec::new()
+                    };
                     let wrong = eager[..slots * rows]
                         .iter()
                         .enumerate()
                         .filter(|(i, value)| {
+                            if host {
+                                let (want, mag) = host_want[*i];
+                                // The block-scaled MMA sums at the hardware's own width, so
+                                // the band is 2^-16 of the magnitude.
+                                return if want.is_nan() {
+                                    !value.is_nan()
+                                } else {
+                                    !value.is_finite()
+                                        || (f64::from(**value) - want).abs()
+                                            > mag * 2.0f64.powi(-16)
+                                };
+                            }
                             let row = i % rows;
                             let col = i / rows;
+                            if let Some((scale, input)) = range {
+                                let expected = (k as f64
+                                    * f64::from(input)
+                                    * f64::from(scale)
+                                    * f64::from(block_scale))
+                                    as f32;
+                                return !value.is_finite()
+                                    || (**value - expected).abs() > expected.abs() * 5.0e-7;
+                            }
                             let dot = if one_hot {
                                 let code = (row + 3 * (col % k)) & 15;
                                 let level = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][code & 7];
                                 let value = if code & 8 == 0 { level } else { -level };
-                                value * [2.0, 1.0, 4.0, 8.0][(col % k) / 16]
+                                value * [2.0, 1.0, 4.0, 8.0][(col % k) / 16] * [1.0, -1.0][col % 2]
                             } else {
                                 (k / 64) as f32
                                     * 1360.0
@@ -6984,15 +7139,31 @@ mod gate {
                                     * 2.0f32.powi((col % 4) as i32 - 2)
                             };
                             let expected = dot * [1.0, 0.5][ids[col] as usize];
-                            !value.is_finite()
-                                || (**value - expected).abs() > 5.0e-7 * expected.abs().max(1.0)
+                            let (expected, band) = if tiny {
+                                let expected = expected * 0.75e-40;
+                                // Subnormal Q8 scales have coarser relative spacing.
+                                (expected, expected.abs() * 0.02)
+                            } else {
+                                (expected, 5.0e-7 * expected.abs().max(1.0))
+                            };
+                            !value.is_finite() || (**value - expected).abs() > band
                         })
                         .count();
                     let replay_eq = bits_equal(&eager, &replay);
-                    let pass =
-                        tail && wrong == 0 && replay_eq && q8_eq && gpu.take_fault()?.is_none();
+                    let producer_eq = !fused || bits_equal(&eager, &plain);
+                    let hash = Fnv1a64::default().f32s(&eager).value();
+                    if !fused {
+                        plain = eager;
+                    }
+                    let pass = tail
+                        && wrong == 0
+                        && replay_eq
+                        && q8_eq
+                        && producer_eq
+                        && legacy_fault == want_fault
+                        && gpu.take_fault()? == want_fault;
                     println!(
-                        "gemm32 case=nvfp4_native rows={rows} slots={slots} k={k} one_hot={one_hot} fused={fused} q8_eq={q8_eq} wrong={wrong} guard={tail} eager_graph_eq={replay_eq} {}",
+                        "gemm32 case=nvfp4_native rows={rows} slots={slots} k={k} input={input:?} fused={fused} native={native} q8_eq={q8_eq} producer_eq={producer_eq} wrong={wrong} guard={tail} eager_graph_eq={replay_eq} hash={hash:016x} {}",
                         verdict(pass)
                     );
                     ok &= pass;

@@ -155,7 +155,7 @@ impl GemmAct32 {
         &self.s
     }
 
-    /// Device bytes of the three planes.
+    /// Device bytes of the stored activation representations.
     #[must_use]
     pub fn bytes(&self) -> usize {
         let bytes = self.q.num_bytes() + self.d.num_bytes() + self.s.num_bytes();

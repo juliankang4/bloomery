@@ -5,6 +5,8 @@
 //! output bit for bit holds it to the same transcription (`gate_gemm`'s
 //! `g32_*` cases, `gate_glm5next_gemm`).
 
+use gguf::quant::{KVALUES_MXFP4, QuantError, ue4m3_to_f32_half};
+
 /// A `GemmAct32`'s three planes on the host, in the device layout: codes,
 /// scales, sums.
 pub type Planes32 = (Vec<u32>, Vec<f32>, Vec<i32>);
@@ -152,6 +154,93 @@ pub fn dot32_nv(wq: &[i8], wsc: &[f32], scale: f32, a: &HostAct, col: usize) -> 
         mag += t.abs();
     }
     (scale * acc, f64::from(scale) * y, f64::from(scale) * mag)
+}
+
+/// One output of the native NVFP4 product (`gemm_nvfp4_mma`, W4A4): weight
+/// row `(wq, wsc, scale)` as [`dot32_nv`] takes it, against column `col` of
+/// `a` packed as that product's activation producer packs it. The column
+/// scale `gs` is `max_b d_b · (127/6)` over the blocks holding a nonzero
+/// code, 1 when none does. Each 16-value sub-block of values `code·d_b`
+/// takes the UE4M3 scale nearest `amax / (6·gs)`, and each value divided by
+/// that scale times `gs` takes the nearest E2M1 level, ties to even both
+/// times. A sub-block whose scale does not decode to a normal f32 is packed
+/// again from `code · (d_b/gs)` against `amax / 6` and the scale alone.
+/// Returns the f64 value `scale · gs · Σ_s w_s·a_s·Σ codes` and its band's
+/// magnitude; both are NaN when a block of the column was refused.
+///
+/// # Errors
+///
+/// [`QuantError::NotUe4m3`] from the scale table, whose bytes are all
+/// UE4M3 scales.
+pub fn dot32_nv_fp4(
+    wq: &[i8],
+    wsc: &[f32],
+    scale: f32,
+    a: &HostAct,
+    col: usize,
+) -> Result<(f64, f64), QuantError> {
+    let (k, kb) = (a.k, a.k / 32);
+    let codes = &a.codes[col * k..(col + 1) * k];
+    let d = &a.d[col * kb..(col + 1) * kb];
+    if d.iter().any(|v| !v.is_finite()) {
+        return Ok((f64::NAN, f64::NAN));
+    }
+    let max = (0..kb)
+        .filter(|&b| codes[32 * b..32 * b + 32].iter().any(|&c| c != 0))
+        .fold(0.0f32, |m, b| m.max(d[b]));
+    let gs = if max > 0.0 { max * (127.0 / 6.0) } else { 1.0 };
+    let halves = (0..0x7f)
+        .map(ue4m3_to_f32_half)
+        .collect::<Result<Vec<_>, _>>()?;
+    let scales: Vec<f64> = halves.iter().map(|&h| 2.0 * f64::from(h)).collect();
+    let levels: Vec<f64> = KVALUES_MXFP4[..8]
+        .iter()
+        .map(|&v| f64::from(v) / 2.0)
+        .collect();
+    // The index of the ascending table's entry nearest x, ties to the even index.
+    let nearest = |table: &[f64], x: f64| {
+        (1..table.len()).fold(0, |best, i| {
+            let (di, db) = ((x - table[i]).abs(), (x - table[best]).abs());
+            if di < db || (di == db && i % 2 == 0) {
+                i
+            } else {
+                best
+            }
+        })
+    };
+    let (mut y, mut mag) = (0.0f64, 0.0f64);
+    for (s, q) in codes.as_chunks::<16>().0.iter().enumerate() {
+        let pack = |unit: f32, g: f32| {
+            let v = q.map(|c| f32::from(c) * unit);
+            let amax = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let byte = nearest(&scales, f64::from(amax / (6.0 * g)));
+            (v, amax, byte, halves[byte] * 2.0 * g)
+        };
+        let (mut v, amax, mut byte, mut decoded) = pack(d[s / 2], gs);
+        if !amax.is_finite()
+            || !(6.0 * gs).is_finite()
+            || decoded < f32::MIN_POSITIVE
+            || !(1.0 / decoded).is_finite()
+        {
+            let nonzero = q.iter().any(|&c| c != 0);
+            (v, _, byte, decoded) = pack(if nonzero { d[s / 2] / gs } else { 0.0 }, 1.0);
+        }
+        let inv = if decoded > 0.0 { 1.0 / decoded } else { 0.0 };
+        let isum: i32 = v
+            .iter()
+            .zip(&wq[16 * s..16 * s + 16])
+            .map(|(&x, &w)| {
+                let t = x * inv;
+                let code = KVALUES_MXFP4[nearest(&levels, f64::from(t.abs()))];
+                i32::from(w) * i32::from(if t < 0.0 { -code } else { code })
+            })
+            .sum();
+        let t = f64::from(wsc[s]) * f64::from(halves[byte]) * f64::from(isum);
+        y += t;
+        mag += t.abs();
+    }
+    let g = f64::from(scale) * f64::from(gs);
+    Ok((g * y, g.abs() * mag))
 }
 
 /// The f32 roundings that separate a `gemm_q5_0p` output from the Q5_0

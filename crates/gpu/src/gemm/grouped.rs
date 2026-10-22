@@ -35,7 +35,8 @@
 //! Q4_K and Q5_K, `acc = fma(d8, d·f32(isum), acc)` for Q6_K, Q3_K, IQ3_S and
 //! IQ4_XS, `acc = fma(d8, (d/4)·f32(isum), acc)` for IQ3_XXS (`d/4` exact in
 //! f32), `acc = fma(d8, (d/8)·f32(isum), acc)` for IQ2_XXS (`d/8` exact in
-//! f32), blocks in increasing k.
+//! f32), blocks in increasing k. Intermediate products outside the F32
+//! normal range retain F64 range until the activation scale is applied.
 //!
 //! Geometry. A block is [`GEMM_THREADS`] threads, eight warps over
 //! [`GEMM_BM`] rows, sixteen rows per warp, every warp over all of the
@@ -65,6 +66,39 @@ use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use model::placement::kernels::{self, GemmEntry};
+
+/// Keep the F32 reduction's rounding while retaining exceptional intermediate range.
+#[inline(always)]
+pub(super) fn scaled_sum(a: [f64; 2], b: [f32; 2], scale: f32, acc: f64) -> f64 {
+    use cuda_device::float::{fma_rn_f32, mul_rn_f32};
+    let first = mul_rn_f32(a[0] as f32, b[0]);
+    let inner = fma_rn_f32(a[1] as f32, b[1], first);
+    let result = fma_rn_f32(scale, inner, acc as f32);
+    let inner_in_range = f64::from(a[0] as f32) == a[0]
+        && f64::from(a[1] as f32) == a[1]
+        && (first.abs() >= f32::MIN_POSITIVE || a[0] == 0.0 || b[0] == 0.0)
+        && first.is_finite()
+        && (inner.abs() >= f32::MIN_POSITIVE || inner == 0.0)
+        && inner.is_finite();
+    if inner_in_range
+        && f64::from(acc as f32) == acc
+        && (result.abs() >= f32::MIN_POSITIVE || (inner == 0.0 && acc == 0.0) || scale == 0.0)
+        && result.is_finite()
+    {
+        f64::from(result)
+    } else {
+        let inner = if inner_in_range
+            && result.is_finite()
+            && (result.abs() >= f32::MIN_POSITIVE
+                || f64::from(inner) * f64::from(scale) + acc == 0.0)
+        {
+            f64::from(inner)
+        } else {
+            a[0] * f64::from(b[0]) + a[1] * f64::from(b[1])
+        };
+        inner * f64::from(scale) + acc
+    }
+}
 
 /// Rows one GEMM block covers: eight warps of sixteen.
 pub(super) const GEMM_BM: usize = 128;
@@ -467,9 +501,12 @@ macro_rules! qk_min_epi {
         while i < 4 {
             ::cuda_device::thread::__unroll_config::<{ 0 }>();
             let r = i / 2;
-            let tv = mul_rn_f32(dr[r], $isum[i] as f32);
-            let tv = fma_rn_f32(ndr[r], imin[i] as f32, tv);
-            $acc[4 * $nt + i] = fma_rn_f32($dcol[i & 1], tv, $acc[4 * $nt + i]);
+            $acc[4 * $nt + i] = $crate::gemm::grouped::scaled_sum(
+                [f64::from(dr[r]), f64::from(ndr[r])],
+                [$isum[i] as f32, imin[i] as f32],
+                $dcol[i & 1],
+                f64::from($acc[4 * $nt + i]),
+            ) as f32;
             i += 1;
         }
     }};
@@ -506,8 +543,12 @@ macro_rules! k16_epi {
         let mut i = 0usize;
         while i < 4 {
             ::cuda_device::thread::__unroll_config::<{ 0 }>();
-            let tv = mul_rn_f32(dr[i / 2], $isum[i] as f32);
-            $acc[4 * $nt + i] = fma_rn_f32($dcol[i & 1], tv, $acc[4 * $nt + i]);
+            $acc[4 * $nt + i] = $crate::gemm::grouped::scaled_sum(
+                [f64::from(dr[i / 2]), 0.0],
+                [$isum[i] as f32, 0.0],
+                $dcol[i & 1],
+                f64::from($acc[4 * $nt + i]),
+            ) as f32;
             i += 1;
         }
     }};

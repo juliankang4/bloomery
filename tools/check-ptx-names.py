@@ -26,6 +26,9 @@ The other tables the recipe names, one per PTX arch and card capability (an argu
 
 A kernel added on a cc 8.6 card has no jit_local reading for another capability, so its row there comes from a
 scan on that card; until then that table's gate on that card names it unpinned.
+A target-only module may instead be pinned in a target table with a `# cfg: NAME` line,
+matching its sibling mod.rs or lib.rs's `#[cfg(NAME)] mod name;` declaration. Its target's
+runtime spill check still requires every emitted entry; unconditional entries require default rows.
 
 What declares an entry. A `#[kernel]` attribute (its attribute stack may span lines: `#[allow(..)]`,
 `#[launch_bounds(..)]`, `#[launch_contract(..)]` and doc lines sit between it and the `fn`) on a line of its own,
@@ -81,6 +84,7 @@ import re
 import shutil
 import sys
 import tempfile
+from recipes import rust_lex
 
 TABLE = "tools/ref/ptx-shapes.tsv"
 JUSTFILE = "justfile"
@@ -628,6 +632,22 @@ def check(root):
     """(violation lines, summary) for the tree under root. Raises Refuse for a thing it cannot read."""
     others, bins = recipe_call(os.path.join(root, JUSTFILE))
     rows = read_table(os.path.join(root, TABLE))
+    tables = []
+    for rel in others:
+        if not rel.endswith("/"):
+            tables.append(rel)
+            continue
+        found = sorted(glob.glob(os.path.join(root, rel, "*.tsv")))
+        if not found:
+            raise Refuse(f"recipe {RECIPE} names the directory {rel}, which holds no table")
+        tables += [os.path.relpath(p, root) for p in found]
+    # PIN(2026-10-23): target-only modules use measured target rows; default builds cannot emit them.
+    conditional = []
+    for rel in tables:
+        with open(os.path.join(root, rel), encoding="utf-8") as fh:
+            cfg = re.findall(r"^# cfg: ([A-Za-z_]\w*)$", fh.read(), re.M)
+        if cfg:
+            conditional.append((cfg, read_table(os.path.join(root, rel))))
     problems = []
     for b in sorted(set(rows) - {b for b, _ in bins}):
         problems.append(f"{b}: the table pins this binary, the {RECIPE} recipe does not run it")
@@ -646,21 +666,32 @@ def check(root):
                 declared.setdefault(name, site)
         decl[b] = declared
         have = rows.get(b, {})
+        target_rows = 0
         for e in sorted(set(have) - set(declared)):
             problems.append(f"{b} {e} stale")
         for e in sorted(set(declared) - set(have)):
+            source = declared[e][0]
+            parent = os.path.dirname(os.path.join(root, source))
+            module = os.path.splitext(os.path.basename(source))[0]
+            guarded = False
+            for cfgs, pins in conditional:
+                if e not in pins.get(b, {}):
+                    continue
+                for owner in ("mod.rs", "lib.rs"):
+                    path = os.path.join(parent, owner)
+                    if not os.path.isfile(path):
+                        continue
+                    with open(path, encoding="utf-8") as fh:
+                        text = rust_lex(fh.read())[1]
+                    for cfg in cfgs:
+                        pattern = r"^\s*#\[cfg\(" + re.escape(cfg) + r"\)\]\s*mod\s+" + re.escape(module) + r"\s*;"
+                        guarded |= re.search(pattern, text, re.M) is not None
+            if guarded:
+                target_rows += 1
+                continue
             problems.append(f"{b} {e} unpinned ({declared[e][0]}:{declared[e][1]})")
-        nrows += len(have)
+        nrows += len(have) + target_rows
         ndecl += len(declared)
-    tables = []
-    for rel in others:
-        if not rel.endswith("/"):
-            tables.append(rel)
-            continue
-        found = sorted(glob.glob(os.path.join(root, rel, "*.tsv")))
-        if not found:
-            raise Refuse(f"recipe {RECIPE} names the directory {rel}, which holds no table")
-        tables += [os.path.relpath(p, root) for p in found]
     for rel in tables:
         brows = read_table(os.path.join(root, rel))
         for b in sorted(set(brows) - set(decl)):
@@ -668,7 +699,7 @@ def check(root):
         for b in decl:
             for e in sorted(set(brows.get(b, {})) - set(decl[b])):
                 problems.append(f"{b} {e} stale ({rel})")
-    tail = f"; {len(tables)} tables beside it read for stale rows" if tables else ""
+    tail = f"; {len(tables)} tables beside it read for stale rows and target-only pins" if tables else ""
     more, covered = covered_problems(root, bins, recipe_builds(os.path.join(root, JUSTFILE)))
     problems += more
     return problems, f"{len(bins)} binaries, {nrows} rows = {ndecl} declared entries{tail}; {covered}"
@@ -985,6 +1016,21 @@ def self_test():
         out = run("green: every row declared, every declared entry pinned (macro names and the filter included)", 0, [])
         if "2 binaries, 9 rows = 9 declared entries" not in out or "gate_e2e covered (bloomery-gpu by generate_ds41)" not in out:
             fails.append(f"green summary: {out!r}")
+        native = "#[kernel]\npub fn k_native() {}\n"
+        guarded_gpu = GPU_RS + "\n#[cfg(native)]\nmod native;\n"
+        native_table = "# cfg: native\ngenerate_ds41 k_native 0 0\n"
+        fixture = {"gpu": guarded_gpu, "extra": (("crates/gpu/src/native.rs", native),)}
+        run("target-gated: its target table pins the entry", 0, [], beside=native_table, **fixture)
+        run("target-gated: an unannotated target table cannot hide the missing default pin", 1,
+            ["generate_ds41 k_native unpinned (crates/gpu/src/native.rs:1)"],
+            beside=native_table.replace("# cfg: native\n", ""), **fixture)
+        run("target-gated: the source guard must match the table", 1,
+            ["generate_ds41 k_native unpinned (crates/gpu/src/native.rs:1)"],
+            beside=native_table.replace("cfg: native", "cfg: different"), **fixture)
+        run("target-gated: a commented guard is not a build condition", 1,
+            ["generate_ds41 k_native unpinned (crates/gpu/src/native.rs:1)"],
+            beside=native_table, gpu=guarded_gpu.replace("#[cfg(native)]", "// #[cfg(native)]"),
+            extra=fixture["extra"])
         # stale: a kernel deleted from source, its row left.
         run("stale: a deleted kernel's row", 1, ["generate_ds41 k_two_8 stale"],
             gpu=GPU_RS.replace("    #[kernel]\n    pub fn k_two_8(a: &[u32]) {}\n", ""))

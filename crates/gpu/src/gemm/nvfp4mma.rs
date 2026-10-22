@@ -26,25 +26,56 @@ impl Act {
     }
 
     pub(super) fn bytes(&self) -> usize {
-        self.q.len() * 4 + self.e.len() * 4 + self.scale.len() * 4
+        self.q.num_bytes() + self.e.num_bytes() + self.scale.num_bytes()
     }
 }
 
 #[cuda_device::device]
-#[inline(always)]
-fn nvfp4_pack_block(values: [f32; 16], gs: f32) -> ([u32; 2], u32) {
+fn nvfp4_pack_q8(words: [u32; 4], d: f32, gs: f32) -> ([u32; 2], u32) {
+    let mut values = [0.0f32; 16];
+    #[unroll]
+    for i in 0..16 {
+        values[i] = ((words[i / 4] >> (8 * (i % 4))) as i8) as f32 * d;
+    }
     let mut largest = 0.0f32;
     #[unroll]
     for i in 0..16 {
         largest = largest.max(values[i].abs());
     }
-    let scale = if gs.is_finite() {
-        e4m3(largest / (6.0 * gs))
+    let mut scale = if gs.is_finite() {
+        let x = largest / (6.0 * gs);
+        u32::from(cuda_device::convert::cvt_rn_satfinite_e4m3x2_f32(x, x)) & 255
     } else {
         0
     };
     let decoded = crate::mxfp4::ue4m3_half(scale) * 2.0 * gs;
-    let inv = if decoded > 0.0 { 1.0 / decoded } else { 0.0 };
+    let mut inv = if decoded > 0.0 { 1.0 / decoded } else { 0.0 };
+    if !largest.is_finite()
+        || !(6.0 * gs).is_finite()
+        || decoded < f32::MIN_POSITIVE
+        || !inv.is_finite()
+    {
+        let nonzero = words[0] | words[1] | words[2] | words[3];
+        let ratio = if gs > 0.0 && nonzero != 0 {
+            d / gs
+        } else {
+            0.0
+        };
+        largest = 0.0;
+        #[unroll]
+        for i in 0..16 {
+            values[i] = ((words[i / 4] >> (8 * (i % 4))) as i8) as f32 * ratio;
+            largest = largest.max(values[i].abs());
+        }
+        let x = largest / 6.0;
+        scale = if gs.is_finite() {
+            u32::from(cuda_device::convert::cvt_rn_satfinite_e4m3x2_f32(x, x)) & 255
+        } else {
+            0
+        };
+        let decoded = crate::mxfp4::ue4m3_half(scale) * 2.0;
+        inv = if decoded > 0.0 { 1.0 / decoded } else { 0.0 };
+    }
     let mut packed = [0u32; 2];
     #[unroll]
     for i in 0..8 {
@@ -69,13 +100,10 @@ const _: () = assert!((ACT_CACHE_VALUES + 2) * 4 == 32776);
 /// Both inputs contain the aligned four-value span at `base`.
 #[inline(always)]
 unsafe fn act_quad(g: &[f32], u: &[f32], base: usize, code: u32, limit: f32) -> [f32; 4] {
-    // SAFETY: the caller supplies an aligned, in-bounds quad in each input.
-    let (g, u) = unsafe {
-        (
-            (*g.as_ptr().add(base).cast::<cuda_device::vector::F32x4>()).0,
-            (*u.as_ptr().add(base).cast::<cuda_device::vector::F32x4>()).0,
-        )
-    };
+    // SAFETY: the caller supplies an aligned, in-bounds gate quad.
+    let g = unsafe { (*g.as_ptr().add(base).cast::<cuda_device::vector::F32x4>()).0 };
+    // SAFETY: the caller supplies an aligned, in-bounds up quad.
+    let u = unsafe { (*u.as_ptr().add(base).cast::<cuda_device::vector::F32x4>()).0 };
     if crate::fault::quad_finite(g) & crate::fault::quad_finite(u) {
         [
             crate::kquant::act::apply(code, limit, g[0], u[0]),
@@ -88,30 +116,7 @@ unsafe fn act_quad(g: &[f32], u: &[f32], base: usize, code: u32, limit: f32) -> 
     }
 }
 
-/// # Safety
-/// The aligned quad at `at` is in this column; its cached prefix has been published.
-#[inline(always)]
-unsafe fn cached_quad(
-    g: &[f32],
-    u: &[f32],
-    base: usize,
-    at: usize,
-    code: u32,
-    limit: f32,
-    cache: *const f32,
-    cached: usize,
-) -> [f32; 4] {
-    if at < cached {
-        // SAFETY: at and cached are multiples of four and the quad is in the published prefix.
-        unsafe { (*cache.add(at).cast::<cuda_device::vector::F32x4>()).0 }
-    } else {
-        // SAFETY: the caller bounds this aligned quad by the column's K.
-        unsafe { act_quad(g, u, base + at, code, limit) }
-    }
-}
-
 #[cuda_device::device]
-#[inline(always)]
 fn fused_swiglu(
     g: &[f32],
     u: &[f32],
@@ -167,12 +172,15 @@ fn fused_swiglu(
         }
     }
     thread::sync_threads();
-    // SAFETY: both warp maxima and all cached quads were published by the block barrier.
-    let largest = unsafe { (*cache.add(cached)).max(*cache.add(cached + 1)) };
+    // SAFETY: the first warp published its maximum in the first reduction word.
+    let first = unsafe { *cache.add(cached) };
+    // SAFETY: the second warp published its maximum in the second reduction word.
+    let second = unsafe { *cache.add(cached + 1) };
+    let largest = first.max(second);
     let gs = if !largest.is_finite() {
         f32::NAN
     } else if largest > 0.0 {
-        largest / 6.0
+        (largest / 127.0) * (127.0 / 6.0)
     } else {
         1.0
     };
@@ -188,8 +196,13 @@ fn fused_swiglu(
     while group < blocks.div_ceil(4) {
         let block = (4 * group + (lane >> 3)).min(blocks - 1);
         let at = 32 * block + 4 * (lane & 7);
-        // SAFETY: this aligned quad is in the column and the cached prefix is published.
-        let v = unsafe { cached_quad(g, u, col * k, at, code, limit, cache, cached) };
+        let v = if at < cached {
+            // SAFETY: this aligned quad is inside the published shared prefix.
+            unsafe { (*cache.add(at).cast::<cuda_device::vector::F32x4>()).0 }
+        } else {
+            // SAFETY: this aligned quad is inside both checked input columns.
+            unsafe { act_quad(g, u, col * k + at, code, limit) }
+        };
         // SAFETY: each warp owns one group of four 32-value blocks in this checked column.
         let refused = unsafe {
             super::act32::quant32_group(
@@ -201,35 +214,23 @@ fn fused_swiglu(
         }
         group += 2;
     }
+    thread::sync_threads();
     let mut block = tid;
     while block - lane < k / 16 {
         let source = block.min(k / 16 - 1);
-        let mut v = [0.0f32; 16];
-        #[unroll]
-        for quad in 0..4 {
-            // SAFETY: each aligned quad is in the source sub-block and the cached prefix is published.
-            let x = unsafe {
-                cached_quad(
-                    g,
-                    u,
-                    col * k,
-                    16 * source + 4 * quad,
-                    code,
-                    limit,
-                    cache,
-                    cached,
-                )
-            };
-            #[unroll]
-            for j in 0..4 {
-                v[4 * quad + j] = x[j];
-            }
-        }
-        let (packed, scale) = nvfp4_pack_block(v, gs);
+        let at = col * steps * 16 + source * 4;
+        // SAFETY: this aligned four-word block is in the column's published Q8 plane.
+        let words = unsafe { (*q.as_mut_ptr().add(at).cast::<cuda_device::vector::U32x4>()).0 };
+        // SAFETY: the block barrier published this checked column's Q8 scales.
+        let dx = unsafe { *d.as_mut_ptr().add(col * 2 * steps + source / 2) };
+        let (packed, scale) = nvfp4_pack_q8(words, dx, gs);
         if block < k / 16 {
-            // SAFETY: this lane owns both words of the live 16-value sub-block.
+            // SAFETY: this lane owns the first word of the live 16-value sub-block.
             unsafe {
                 *out.get_unchecked_mut(col * k / 8 + 2 * block) = packed[0];
+            }
+            // SAFETY: this lane owns the second word of the live 16-value sub-block.
+            unsafe {
                 *out.get_unchecked_mut(col * k / 8 + 2 * block + 1) = packed[1];
             }
         }
@@ -244,16 +245,6 @@ fn fused_swiglu(
         }
         block += 64;
     }
-}
-
-#[inline(always)]
-fn e4m3(x: f32) -> u32 {
-    let out: u16;
-    // SAFETY: conversion only reads and writes registers.
-    unsafe {
-        ptx_asm!("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %1;", out("=h") out, in("f") x);
-    }
-    u32::from(out) & 255
 }
 
 #[inline(always)]
@@ -378,8 +369,13 @@ mod native {
                 | q[at + 5]
                 | q[at + 6]
                 | q[at + 7];
-            if nonzero != 0 {
-                max = max.max(d[col * 2 * steps + block]);
+            // A refused block's NaN scale makes the column's global scale NaN,
+            // so every output of the column reads NaN.
+            let dx = d[col * 2 * steps + block];
+            if !dx.is_finite() {
+                max = f32::INFINITY;
+            } else if nonzero != 0 {
+                max = max.max(dx);
             }
             block += 32;
         }
@@ -388,7 +384,13 @@ mod native {
             max = max.max(warp::shuffle_xor_f32(max, delta));
             delta /= 2;
         }
-        let gs = if max > 0.0 { max * (127.0 / 6.0) } else { 1.0 };
+        let gs = if !max.is_finite() {
+            f32::NAN
+        } else if max > 0.0 {
+            max * (127.0 / 6.0)
+        } else {
+            1.0
+        };
         if lane == 0 {
             // SAFETY: one block owns this column, below the allocated column count.
             unsafe {
@@ -401,12 +403,7 @@ mod native {
             let at = col * steps * 16 + source * 4;
             let dx = d[col * 2 * steps + source / 2];
             let words = [q[at], q[at + 1], q[at + 2], q[at + 3]];
-            let mut values = [0.0f32; 16];
-            #[unroll]
-            for i in 0..16 {
-                values[i] = ((words[i / 4] >> (8 * (i % 4))) as i8) as f32 * dx;
-            }
-            let (packed, scale) = nvfp4_pack_block(values, gs);
+            let (packed, scale) = nvfp4_pack_q8(words, dx, gs);
             if block < 4 * steps {
                 // SAFETY: this lane owns the live sub-block's first word.
                 unsafe {
@@ -482,14 +479,12 @@ mod native {
         static mut W: cuda_device::SharedArray<u32, 3072, 16> = cuda_device::SharedArray::UNINIT;
         static mut B: cuda_device::SharedArray<u32, 1536, 16> = cuda_device::SharedArray::UNINIT;
         static mut S: cuda_device::SharedArray<u32, 384, 16> = cuda_device::SharedArray::UNINIT;
-        // SAFETY: these raw addresses name this block's shared allocations.
-        let (wp, bp, sp) = unsafe {
-            (
-                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W),
-                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B),
-                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S),
-            )
-        };
+        // SAFETY: W is this block's shared weight allocation.
+        let wp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W) };
+        // SAFETY: B is this block's shared activation allocation.
+        let bp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B) };
+        // SAFETY: S is this block's shared scale allocation.
+        let sp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S) };
         let row = rt * TILE_ROWS + 16 * (tid / 32);
         let g = lane / 4;
         let t = lane & 3;
@@ -524,14 +519,12 @@ mod native {
         let mut acc = [0.0f32; 32];
         let mut step = 0;
         while step < steps {
-            // SAFETY: alternate stages are disjoint. The publishing barrier completes the preceding stage's reads.
-            let (wp, bp, sp) = unsafe {
-                (
-                    wp.add((step & 1) * 1536),
-                    bp.add((step & 1) * 768),
-                    sp.add((step & 1) * 192),
-                )
-            };
+            // SAFETY: this selects one of W's two disjoint stages.
+            let wp = unsafe { wp.add((step & 1) * 1536) };
+            // SAFETY: this selects one of B's two disjoint stages.
+            let bp = unsafe { bp.add((step & 1) * 768) };
+            // SAFETY: this selects one of S's two disjoint stages.
+            let sp = unsafe { sp.add((step & 1) * 192) };
             let p0 = packed_pair(w[0], w[1]);
             let p1 = packed_pair(w[2], w[3]);
             let packed = cuda_device::vector::U32x4::new([p0[0], p0[1], p1[0], p1[1]]);
@@ -600,7 +593,7 @@ mod native {
                             bp.add(b_off).cast_const().cast::<u8>(),
                         ))
                     };
-                    // SAFETY: the activation scale follows the weight scales in the 192-word allocation.
+                    // SAFETY: the activation scale follows the weight scales in this 192-word stage.
                     let sb = unsafe { *sp.add(TILE_ROWS + br) };
                     let c = mma(
                         [acc[n * 4], acc[n * 4 + 1], acc[n * 4 + 2], acc[n * 4 + 3]],
@@ -634,12 +627,25 @@ mod native {
                         slot / slot_div as usize
                     };
                     let input_scale = ag[column];
-                    // SAFETY: this lane owns both rows of this live column; row counts divide 16.
+                    // SAFETY: this lane owns the first row of this live column; row counts divide 16.
                     unsafe {
                         *y.get_unchecked_mut(slot * rows + row + g) =
-                            acc[n * 4 + j] * weight_scale * input_scale;
+                            crate::gemm::grouped::scaled_sum(
+                                [f64::from(acc[n * 4 + j]), 0.0],
+                                [weight_scale, 0.0],
+                                input_scale,
+                                0.0,
+                            ) as f32;
+                    }
+                    // SAFETY: this lane owns the row eight positions later in the same live column.
+                    unsafe {
                         *y.get_unchecked_mut(slot * rows + row + g + 8) =
-                            acc[n * 4 + j + 2] * weight_scale * input_scale;
+                            crate::gemm::grouped::scaled_sum(
+                                [f64::from(acc[n * 4 + j + 2]), 0.0],
+                                [weight_scale, 0.0],
+                                input_scale,
+                                0.0,
+                            ) as f32;
                     }
                 }
             }
