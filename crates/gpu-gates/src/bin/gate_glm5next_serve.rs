@@ -305,8 +305,8 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
-        self, PrefixRestore, agree, base64, beside, check, completion, curl, ids_of, json_of,
-        metric, parse_ids, plan_run, prefix_restore, rendered, server_log, tokenized,
+        self, PrefixRestore, agree, base64, beside, check, completion, curl, draft_counts, ids_of,
+        json_of, metric, parse_ids, plan_run, prefix_restore, rendered, server_log, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -1319,12 +1319,12 @@ mod gate {
         ) -> Result<Turn, GateError> {
             let from = lines_from(err_log, 0)?.len();
             let c = greedy(url, ids, N_PREDICT, cache)?;
-            let t = &c["timings"];
+            let (draft_n, accepted) = draft_counts(&c)?;
             Ok(Turn {
                 tokens: ids_of(&c["tokens"]),
-                cache_n: t["cache_n"].as_u64().unwrap_or(u64::MAX),
-                draft_n: t["draft_n"].as_u64().unwrap_or(0),
-                accepted: t["draft_n_accepted"].as_u64().unwrap_or(0),
+                cache_n: c["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX),
+                draft_n,
+                accepted,
                 stop: c["stop_type"].as_str().unwrap_or("").to_owned(),
                 lines: lines_from(err_log, from)?,
             })
@@ -1815,12 +1815,9 @@ mod gate {
             field(&parallel_line, "pass") == Some("one"),
         );
         // A request's ids and the draft's counts.
-        let run = |v: &Value| {
-            (
-                ids_of(&v["tokens"]),
-                v["timings"]["draft_n"].as_u64().unwrap_or(0),
-                v["timings"]["draft_n_accepted"].as_u64().unwrap_or(0),
-            )
+        let run = |v: &Value| -> Result<(Vec<u32>, u64, u64), GateError> {
+            let (drafts, accepted) = draft_counts(v)?;
+            Ok((ids_of(&v["tokens"]), drafts, accepted))
         };
         let a_ids = rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?;
         let c_ids = rendered(&url, json!([{ "role": "user", "content": TURN_C }]))?;
@@ -1828,7 +1825,7 @@ mod gate {
         for ids in [&a_ids, &c_ids] {
             let v = greedy(&url, ids, SLOTS_PREDICT, false)?;
             stops.push(v["stop_type"].as_str().unwrap_or("").to_owned());
-            alone.push(run(&v));
+            alone.push(run(&v)?);
         }
         let busy = |decodes: f64| -> Result<f64, GateError> {
             Ok(metric(&url, "n_busy_slots_per_decode")?.unwrap_or(f64::NAN) * decodes)
@@ -1845,8 +1842,8 @@ mod gate {
             ["slots A", "slots C"],
         )?
         .iter()
-        .map(|v| v.as_ref().map(run))
-        .collect();
+        .map(|v| v.as_ref().map(run).transpose())
+        .collect::<Result<_, _>>()?;
         let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy1 = busy(decode1)?;
         let swaps = metric(&url, "swaps_total")?;
@@ -2017,14 +2014,11 @@ mod gate {
                 None => tally.push((key, 1)),
             }
         }
-        let counts = |v: &Value| {
-            (
-                ids_of_v(v),
-                v["timings"]["draft_n"].as_u64().unwrap_or(0),
-                v["timings"]["draft_n_accepted"].as_u64().unwrap_or(0),
-            )
+        let counts = |v: &Value| -> Result<(Vec<u32>, u64, u64), GateError> {
+            let (drafts, accepted) = draft_counts(v)?;
+            Ok((ids_of_v(v), drafts, accepted))
         };
-        let greedy_mixed = mixed[0].as_ref().map(counts);
+        let greedy_mixed = mixed[0].as_ref().map(counts).transpose()?;
         println!(
             "slots mixed greedy (ids, drafts, accepted) {:?} against alone {:?}; sampled {:?} ids",
             greedy_mixed.as_ref().map(|c| (c.0.len(), c.1, c.2)),
@@ -2136,12 +2130,9 @@ mod gate {
         let turn_end = ids[0].len() as u64 - 1;
         let plain = |v: &Value| v["timings"].get("draft_n").is_none();
         let cache_n = |v: &Value| v["timings"]["cache_n"].as_u64();
-        let run_of = |v: &Value| {
-            (
-                ids_of(&v["tokens"]),
-                v["timings"]["draft_n"].as_u64().unwrap_or(0),
-                v["timings"]["draft_n_accepted"].as_u64().unwrap_or(0),
-            )
+        let run_of = |v: &Value| -> Result<(Vec<u32>, u64, u64), GateError> {
+            let (drafts, accepted) = draft_counts(v)?;
+            Ok((ids_of(&v["tokens"]), drafts, accepted))
         };
         // The `mtp prompt` records of `lines` that say the draft skips, their
         // `skipped` texts.
@@ -2169,7 +2160,7 @@ mod gate {
         erase(url, 0)?;
         erase(url, 1)?;
         greedy(url, ids[0], SLOTS_PREDICT, false)?;
-        let turn_alone = run_of(&greedy(url, ids[1], SLOTS_PREDICT, false)?);
+        let turn_alone = run_of(&greedy(url, ids[1], SLOTS_PREDICT, false)?)?;
         let before = round_count(err_log)?;
         let from = lines_from(err_log, 0)?.len();
         let together = both_at_once(
@@ -2183,15 +2174,14 @@ mod gate {
         let strip_at = together[0].as_ref();
         let turn_at = together[1].as_ref();
         let strip_ids = strip_at.map(|v| ids_of(&v["tokens"]));
+        let strip_drafts = strip_at.map(draft_counts).transpose()?.map(|(d, _)| d);
+        let turn_together = turn_at.map(run_of).transpose()?;
         println!(
-            "slots skipping: together the strip {:?} ids cache_n {:?} draft_n {}, the turn (ids, \
-             drafts, accepted) {:?} of alone {turn_alone:?}; skips {skips:?}",
+            "slots skipping: together the strip {:?} ids cache_n {:?} draft_n {strip_drafts:?}, \
+             the turn (ids, drafts, accepted) {turn_together:?} of alone {turn_alone:?}; skips \
+             {skips:?}",
             strip_ids.as_ref().map(Vec::len),
             strip_at.and_then(cache_n),
-            strip_at
-                .map(|v| v["timings"]["draft_n"].as_u64().unwrap_or(0))
-                .unwrap_or(0),
-            turn_at.map(run_of),
         );
         print_rounds("slots skipping", &window, &passes);
         // PIN(2026-10-11): the together strip keeps every id of the strip but its last, the alone
@@ -2210,7 +2200,7 @@ mod gate {
                 && strip_ids.as_deref() == Some(alone_ids.as_slice())
                 && strip_at.is_some_and(plain)
                 && strip_at.and_then(cache_n) == Some(strip_end)
-                && turn_at.map(run_of).as_ref() == Some(&turn_alone)
+                && turn_together.as_ref() == Some(&turn_alone)
                 && turn_alone.1 > 0,
         );
         check(

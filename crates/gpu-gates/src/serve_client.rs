@@ -239,7 +239,7 @@ pub fn ids_of(v: &Value) -> Vec<u32> {
 /// as the server omits them then. Refused by name: no `timings` object,
 /// one count present without the other, a count that is no unsigned
 /// integer, no proposal, and more ids accepted than proposed.
-fn draft_counts(answer: &Value) -> Result<(u64, u64), GateError> {
+pub fn draft_counts(answer: &Value) -> Result<(u64, u64), GateError> {
     let t = &answer["timings"];
     if !t.is_object() {
         return Err(format!("a completion with no timings object: {answer}").into());
