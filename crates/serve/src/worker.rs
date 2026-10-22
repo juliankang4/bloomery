@@ -494,16 +494,6 @@ impl Worker {
                     return;
                 }
             }
-            let mut i = 0;
-            while i < self.active.len() {
-                if self.sh.stopped() {
-                    return self.halt();
-                }
-                if let Some(need) = self.pump_at(i) {
-                    self.active[i].need = Some(need);
-                    i += 1;
-                }
-            }
             for (slot, held, sub) in admitted {
                 if self.sh.stopped() {
                     return self.halt();
@@ -511,6 +501,7 @@ impl Worker {
                 if self.start(slot, &held, sub).is_err() {
                     return;
                 }
+                self.pump_ready();
             }
             if self.prompts().is_err() {
                 return;
@@ -521,6 +512,7 @@ impl Worker {
             if self.step().is_err() {
                 return;
             }
+            self.pump_ready();
             if self.seal_ended().is_err() {
                 return;
             }
@@ -755,6 +747,7 @@ impl Worker {
                     } else {
                         let p = self.prompting.remove(k);
                         self.active.push(p.a);
+                        self.pump_ready();
                     }
                 }
                 Err(GenError::Engine(e)) => {
@@ -778,12 +771,8 @@ impl Worker {
         let mut needs = Vec::with_capacity(self.active.len());
         let mut k = 0;
         while k < self.active.len() {
-            let need = match self.active[k].need.take() {
-                Some(need) => need,
-                None => match self.pump_at(k) {
-                    Some(need) => need,
-                    None => continue,
-                },
+            let Some(need) = self.take_need(k) else {
+                continue;
             };
             match need {
                 Need::Fill => {
@@ -800,6 +789,10 @@ impl Worker {
                     }
                     // `/slots` shows the run's positions as its calls run.
                     tick_of(&self.sh, a.slot)(a.job.timings());
+                    let Some(need) = self.pump_at(k) else {
+                        continue;
+                    };
+                    self.active[k].need = Some(need);
                     needs.push(Need::Fill);
                     k += 1;
                 }
@@ -1175,6 +1168,22 @@ impl Worker {
         Ok(())
     }
 
+    fn take_need(&mut self, i: usize) -> Option<Need> {
+        self.active[i].need.take().or_else(|| self.pump_at(i))
+    }
+
+    fn pump_ready(&mut self) {
+        let mut i = 0;
+        while i < self.active.len() && !self.sh.stopped() {
+            if self.active[i].need.is_some() {
+                i += 1;
+            } else if let Some(need) = self.pump_at(i) {
+                self.active[i].need = Some(need);
+                i += 1;
+            }
+        }
+    }
+
     /// Takes the tokens request `i` holds; its next engine call, or `None`
     /// when it ended (and is booked).
     fn pump_at(&mut self, i: usize) -> Option<Need> {
@@ -1209,12 +1218,8 @@ impl Worker {
         let Some(i) = self.t().running.and_then(|r| self.index_of(r)) else {
             return Ok(());
         };
-        let need = match self.active[i].need.take() {
-            Some(n) => n,
-            None => match self.pump_at(i) {
-                Some(n) => n,
-                None => return Ok(()),
-            },
+        let Some(need) = self.take_need(i) else {
+            return Ok(());
         };
         if matches!(need, Need::Fill) {
             return match self.active[i].job.fill(&mut self.slot, None) {
