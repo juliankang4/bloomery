@@ -60,10 +60,11 @@
 //! two glue entries finish the rule —
 //! `hc_gated_lo_4x320` (`silu(·/4)` of each down row, `2·σ(·/4)` of each
 //! inject row) and `hc_gated_mix_4` (`(xn_0·σ(g_0), fma for the rest)·¼`,
-//! the up's order). A column's values are a function of that column alone;
-//! against the narrow arm the down and the up read q8 activations and sum
-//! each row whole, so the two arms agree to the error of that quantization
-//! and are not bit-equal. The same values raise [`SITE`].
+//! the up's order). A column's values are a function of that column alone.
+//! The wide products use a different sum order from the narrow arm, with
+//! Q8_0 activations for Q8_0 weights and BF16 operands for BF16 weights on
+//! GB10. The gate checks their error bands, not bit equality between arms.
+//! The same values raise [`SITE`].
 
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;

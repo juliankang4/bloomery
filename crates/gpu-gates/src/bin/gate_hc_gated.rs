@@ -51,8 +51,9 @@
 //! the Q8_0 site's ranges) runs clauses 1, 2, 3 and 8 again: its down and
 //! up rows dotted in `card::f32_dot`'s order over the widened values, the
 //! dense gemv beside them `bf16_gemv`, and its wide arm the BF16 prompt
-//! product with no quantizer, so a NaN raises the mix's site alone. On GB10
-//! that product runs on BF16 tensor cores, the down and up within the BF16
+//! product with no quantizer, so a NaN raises the mix's site alone and a
+//! subnormal column leaves the other columns' bits unchanged. On GB10 that
+//! product runs on BF16 tensor cores, the down and up within the BF16
 //! operand bands (`check_mma`). Maximum-finite BF16 up weights that overflow
 //! the up projection raise the site and leave NaN mixed outputs in both
 //! capped and wide arms, with a finite bottleneck.
@@ -1347,6 +1348,24 @@ mod gate {
             shown(want),
             verdict(p)
         );
+        if matches!(site.planes, Planes::Bf16 { .. }) {
+            let mut tiny = res.clone();
+            tiny[2 * WIDE..3 * WIDE].fill(f32::from_bits(0x100));
+            let many = wide_mix(c, &mut w, site, true, &tiny, Pre::Plain, m)?;
+            let one = wide_mix(c, &mut w, site, true, col(&tiny, WIDE, 2), Pre::Plain, 1)?;
+            let others = (0..m).filter(|&k| k != 2).all(|k| {
+                bits_equal(col(&many.mixed, D, k), col(&o.mixed, D, k))
+                    && bits_equal(col(&many.wgt, S, k), col(&o.wgt, S, k))
+            });
+            let same = bits_equal(col(&many.mixed, D, 2), &one.mixed)
+                && bits_equal(col(&many.wgt, S, 2), &one.wgt);
+            let p = others && same && many.fault.is_none() && one.fault.is_none();
+            ok &= p;
+            println!(
+                "wide[subnormal_columns] other_columns_clean={others} one_column_bits={same} {}",
+                verdict(p)
+            );
+        }
         let past_cols = WIDE_COLS + 1;
         let res_long = activations(WIDE, past_cols, 0x3a04);
         // A route as wide as the call, so the refusal is the scratch's own.

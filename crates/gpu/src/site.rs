@@ -1198,7 +1198,9 @@ pub fn gemm(
                     g32()?.enqueue_e4m3_mma(stream, t, f32_rows()?, m, y)
                 }
                 Planes::E4m3(t) => g32()?.enqueue_e4m3_tile(stream, t, f32_rows()?, m, y),
-                Planes::Bf16(t) => gpu.q8f32().enqueue_bf16_prompt(stream, t, f32_rows()?, m, y),
+                Planes::Bf16(t) => gpu
+                    .q8f32()
+                    .enqueue_bf16_prompt(stream, t, f32_rows()?, m, y),
             })
         }
         SiteTy::Q5_0 => {
