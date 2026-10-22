@@ -2359,7 +2359,7 @@ mod gate {
         };
         let mut ok = true;
 
-        if case_filter().as_deref() == Some("dense_mma") {
+        if matches!(case_filter().as_deref(), Some("dense_mma" | "nvfp4_native")) {
             return if g32::run(&gpu, &dev.gk)? {
                 Ok(())
             } else {
@@ -6832,6 +6832,142 @@ mod gate {
             Ok(ok)
         }
 
+        fn nvfp4_native_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("nvfp4_native") {
+                return Ok(true);
+            }
+            if !cfg!(feature = "nvfp4-mma") {
+                return if super::case_filter().as_deref() == Some("nvfp4_native") {
+                    Err("nvfp4_native requires the native FP4 build".into())
+                } else {
+                    Ok(true)
+                };
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let mut ok = true;
+            for (rows, slots, k) in [(16usize, 14usize, 128usize), (128, 73, 64), (144, 129, 256)] {
+                let codes: Vec<u32> = (0..2 * rows * k / 8)
+                    .map(|i| (2 + (i / (k / 8) % rows) as u32 % 3) * 0x11111111)
+                    .collect();
+                let wq = DeviceTensor::upload(stream, &codes, 2 * rows, k / 8)?;
+                let we = DeviceTensor::upload(
+                    stream,
+                    &vec![0x50483840u32; 2 * rows * k / 64],
+                    2 * rows,
+                    k / 64,
+                )?;
+                let ws = DeviceTensor::upload(stream, &[1.0f32, 0.5], 2, 1)?;
+                let xs: Vec<f32> = (0..slots * k)
+                    .map(|i| 2.0f32.powi((i / k % 4) as i32 - 2) * [2.0, 1.0, 4.0, 8.0][i / 16 % 4])
+                    .collect();
+                let x = DeviceBuffer::from_host(stream, &xs)?;
+                let ids: Vec<u32> = (0..slots).map(|i| (i % 2) as u32).collect();
+                let ids_d = DeviceBuffer::from_host(stream, &ids)?;
+                let mut route = GemmRoute::new(stream, slots, 2)?;
+                dev.gk
+                    .enqueue_route(stream, &ids_d, slots, &mut route, gpu.unlabelled_sink())?;
+                let g = DeviceBuffer::from_host(stream, &vec![128.0f32; slots * k])?;
+                let u = DeviceBuffer::from_host(
+                    stream,
+                    &xs.iter().map(|v| v / 128.0).collect::<Vec<_>>(),
+                )?;
+                for fused in [false, true] {
+                    let mut act = GemmAct32::new_routed(stream, slots, k)?;
+                    let mut legacy = GemmAct32::new(stream, slots, k)?;
+                    dev.g32.enqueue_swiglu_quant32_sel(
+                        stream,
+                        &g,
+                        &u,
+                        &ids_d,
+                        2,
+                        slots,
+                        &mut legacy,
+                        gpu.unlabelled_sink(),
+                    )?;
+                    let mut y = DeviceBuffer::from_host(stream, &vec![SENT; slots * rows + 16])?;
+                    let graph = {
+                        let mut enqueue = |s: &cuda_core::CudaStream| {
+                            if fused {
+                                dev.g32.enqueue_swiglu_quant32_sel(
+                                    s,
+                                    &g,
+                                    &u,
+                                    &ids_d,
+                                    2,
+                                    slots,
+                                    &mut act,
+                                    gpu.unlabelled_sink(),
+                                )?;
+                            } else {
+                                dev.g32.enqueue_quantize_gemm32(
+                                    s,
+                                    &x,
+                                    slots,
+                                    &mut act,
+                                    gpu.unlabelled_sink(),
+                                )?;
+                            }
+
+                            dev.g32.enqueue_gemm32(
+                                s,
+                                Gemm32Args {
+                                    w: Gemm32Weight::Nvfp4Planes(Nvfp4Stack {
+                                        qs: &wq,
+                                        e: &we,
+                                        scales: &ws,
+                                    }),
+                                    rows_per_expert: rows,
+                                    act: &act,
+                                    route: &route,
+                                    input: GemmInput::PerSlot,
+                                    y: &mut y,
+                                },
+                            )
+                        };
+                        enqueue(stream)?;
+                        gpu.capture(|s| enqueue(s))?
+                    };
+                    let q8_eq = !fused
+                        || (act.q().to_host_vec(stream)? == legacy.q().to_host_vec(stream)?
+                            && bits_equal(
+                                &act.d().to_host_vec(stream)?,
+                                &legacy.d().to_host_vec(stream)?,
+                            )
+                            && act.s().to_host_vec(stream)? == legacy.s().to_host_vec(stream)?);
+                    let eager = y.to_host_vec(stream)?;
+                    graph.launch(stream)?;
+                    let replay = y.to_host_vec(stream)?;
+                    let tail = eager[slots * rows..]
+                        .iter()
+                        .all(|v| v.to_bits() == SENT.to_bits());
+                    let wrong = eager[..slots * rows]
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, value)| {
+                            let row = i % rows;
+                            let col = i / rows;
+                            let expected = (k / 64) as f32
+                                * 1360.0
+                                * [1.0, 1.5, 2.0][row % 3]
+                                * 2.0f32.powi((col % 4) as i32 - 2)
+                                * [1.0, 0.5][ids[col] as usize];
+                            !value.is_finite() || (**value - expected).abs() > 5.0e-7 * expected
+                        })
+                        .count();
+                    let replay_eq = bits_equal(&eager, &replay);
+                    let pass =
+                        tail && wrong == 0 && replay_eq && q8_eq && gpu.take_fault()?.is_none();
+                    println!(
+                        "gemm32 case=nvfp4_native rows={rows} slots={slots} k={k} fused={fused} q8_eq={q8_eq} wrong={wrong} guard={tail} eager_graph_eq={replay_eq} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            Ok(ok)
+        }
+
         /// Every 32-value case.
         pub(super) fn run(gpu: &Gpu, gk: &GemmKernels) -> Result<bool, GateError> {
             let dev = Dev {
@@ -6848,6 +6984,7 @@ mod gate {
             ok &= routed_case(&dev)?;
             ok &= nvfp4_dense_case(&dev)?;
             ok &= nvfp4_routed_case(&dev)?;
+            ok &= nvfp4_native_case(&dev)?;
             ok &= q5_0p_case(&dev)?;
             ok &= iq4nl_case(&dev)?;
             ok &= remap_case(&dev)?;

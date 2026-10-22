@@ -277,6 +277,13 @@ impl Gemm32Kernels {
                 ),
             ));
         }
+        #[cfg(feature = "nvfp4-mma")]
+        if act.native.is_some() {
+            self.native
+                .swiglu(stream, g, u, None, Act::SiluMul, m, act, fault)?;
+            act.filled = n_cols;
+            return Ok(());
+        }
         let prep = self
             .module
             .prepare_swiglu_quant32(LaunchConfig1D::new(grid, 32, 0))?;
@@ -285,8 +292,6 @@ impl Gemm32Kernels {
             fault,
         )?;
         act.filled = n_cols;
-        #[cfg(feature = "nvfp4-mma")]
-        self.native.quantize(stream, act)?;
         Ok(())
     }
 
@@ -330,6 +335,13 @@ impl Gemm32Kernels {
             ));
         }
         let (code, limit) = rule.code(what)?;
+        #[cfg(feature = "nvfp4-mma")]
+        if act.native.is_some() {
+            self.native
+                .swiglu(stream, g, u, None, rule, m, act, fault)?;
+            act.filled = n_cols;
+            return Ok(());
+        }
         let prep = self
             .module
             .prepare_swiglu_act_quant32(LaunchConfig1D::new(grid, 32, 0))?;
@@ -338,8 +350,6 @@ impl Gemm32Kernels {
             &mut act.s, fault,
         )?;
         act.filled = n_cols;
-        #[cfg(feature = "nvfp4-mma")]
-        self.native.quantize(stream, act)?;
         Ok(())
     }
 
@@ -390,6 +400,21 @@ impl Gemm32Kernels {
             ));
         }
         let n_card = launch_u32(what, "n_card", n_card)?;
+        #[cfg(feature = "nvfp4-mma")]
+        if act.native.is_some() {
+            self.native.swiglu(
+                stream,
+                g,
+                u,
+                Some((sel, n_card)),
+                Act::SiluMul,
+                m,
+                act,
+                fault,
+            )?;
+            act.filled = n_cols;
+            return Ok(());
+        }
         let prep = self
             .module
             .prepare_swiglu_quant32_sel(LaunchConfig1D::new(grid, 32, 0))?;
@@ -398,8 +423,6 @@ impl Gemm32Kernels {
             &mut act.s, fault,
         )?;
         act.filled = n_cols;
-        #[cfg(feature = "nvfp4-mma")]
-        self.native.quantize(stream, act)?;
         Ok(())
     }
 }

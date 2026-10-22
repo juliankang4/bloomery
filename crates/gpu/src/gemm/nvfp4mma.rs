@@ -30,27 +30,220 @@ impl Act {
     }
 }
 
+#[cuda_device::device]
 #[inline(always)]
-fn e2m1(x: f32) -> u32 {
-    let a = x.abs();
-    let q = if a <= 0.25 {
-        0
-    } else if a < 0.75 {
-        1
-    } else if a <= 1.25 {
-        2
-    } else if a < 1.75 {
-        3
-    } else if a <= 2.5 {
-        4
-    } else if a < 3.5 {
-        5
-    } else if a <= 5.0 {
-        6
+fn nvfp4_pack_block(values: [f32; 16], gs: f32) -> ([u32; 2], u32) {
+    let mut largest = 0.0f32;
+    #[unroll]
+    for i in 0..16 {
+        largest = largest.max(values[i].abs());
+    }
+    let scale = if gs.is_finite() {
+        e4m3(largest / (6.0 * gs))
     } else {
-        7
+        0
     };
-    q | ((x.to_bits() >> 28) & 8)
+    let decoded = crate::mxfp4::ue4m3_half(scale) * 2.0 * gs;
+    let inv = if decoded > 0.0 { 1.0 / decoded } else { 0.0 };
+    let mut packed = [0u32; 2];
+    #[unroll]
+    for i in 0..8 {
+        let byte: u32;
+        // SAFETY: this conversion only reads and writes registers.
+        unsafe {
+            ptx_asm!(
+                "{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, %2, %1; cvt.u32.u8 %0, b; }",
+                out("=r") byte, in("f") values[2 * i] * inv, in("f") values[2 * i + 1] * inv,
+            );
+        }
+        packed[i / 4] |= byte << (8 * (i & 3));
+    }
+    (packed, scale)
+}
+
+// Bound each block's cache to 32 KiB. Wider rows recompute the uncached quads.
+const ACT_CACHE_VALUES: usize = 8192;
+const _: () = assert!((ACT_CACHE_VALUES + 2) * 4 == 32776);
+
+/// # Safety
+/// Both inputs contain the aligned four-value span at `base`.
+#[inline(always)]
+unsafe fn act_quad(g: &[f32], u: &[f32], base: usize, code: u32, limit: f32) -> [f32; 4] {
+    // SAFETY: the caller supplies an aligned, in-bounds quad in each input.
+    let (g, u) = unsafe {
+        (
+            (*g.as_ptr().add(base).cast::<cuda_device::vector::F32x4>()).0,
+            (*u.as_ptr().add(base).cast::<cuda_device::vector::F32x4>()).0,
+        )
+    };
+    if crate::fault::quad_finite(g) & crate::fault::quad_finite(u) {
+        [
+            crate::kquant::act::apply(code, limit, g[0], u[0]),
+            crate::kquant::act::apply(code, limit, g[1], u[1]),
+            crate::kquant::act::apply(code, limit, g[2], u[2]),
+            crate::kquant::act::apply(code, limit, g[3], u[3]),
+        ]
+    } else {
+        [f32::NAN; 4]
+    }
+}
+
+/// # Safety
+/// The aligned quad at `at` is in this column; its cached prefix has been published.
+#[inline(always)]
+unsafe fn cached_quad(
+    g: &[f32],
+    u: &[f32],
+    base: usize,
+    at: usize,
+    code: u32,
+    limit: f32,
+    cache: *const f32,
+    cached: usize,
+) -> [f32; 4] {
+    if at < cached {
+        // SAFETY: at and cached are multiples of four and the quad is in the published prefix.
+        unsafe { (*cache.add(at).cast::<cuda_device::vector::F32x4>()).0 }
+    } else {
+        // SAFETY: the caller bounds this aligned quad by the column's K.
+        unsafe { act_quad(g, u, base + at, code, limit) }
+    }
+}
+
+#[cuda_device::device]
+#[inline(always)]
+fn fused_swiglu(
+    g: &[f32],
+    u: &[f32],
+    code: u32,
+    limit: f32,
+    k: u32,
+    mut q: DisjointSlice<u32>,
+    mut d: DisjointSlice<f32>,
+    mut sums: DisjointSlice<i32>,
+    mut out: DisjointSlice<u32>,
+    mut scales: DisjointSlice<u32>,
+    mut global: DisjointSlice<f32>,
+    fault: crate::fault::FaultSink,
+) {
+    let col = thread::blockIdx_x() as usize;
+    let tid = thread::threadIdx_x() as usize;
+    let lane = warp::lane_id() as usize;
+    let k = k as usize;
+    let cached = k.min(ACT_CACHE_VALUES);
+    let cache = cuda_device::DynamicSharedArray::<f32>::get();
+    let mut largest = 0.0f32;
+    let mut at = 4 * tid;
+    while at < k {
+        // SAFETY: K divides 64; the loop's aligned quad is inside both checked input columns.
+        let v = unsafe { act_quad(g, u, col * k + at, code, limit) };
+        if at < cached {
+            // SAFETY: this thread owns the aligned quad inside the allocated shared prefix.
+            unsafe {
+                *cache.add(at).cast::<cuda_device::vector::F32x4>() =
+                    cuda_device::vector::F32x4::new(v);
+            }
+        }
+        largest = if crate::fault::quad_finite(v) {
+            largest
+                .max(v[0].abs())
+                .max(v[1].abs())
+                .max(v[2].abs())
+                .max(v[3].abs())
+        } else {
+            f32::INFINITY
+        };
+        at += 256;
+    }
+    let mut delta = 16;
+    while delta > 0 {
+        largest = largest.max(warp::shuffle_xor_f32(largest, delta));
+        delta /= 2;
+    }
+    if lane == 0 {
+        // SAFETY: each warp owns one of the two shared reduction words after the cached prefix.
+        unsafe {
+            *cache.add(cached + tid / 32) = largest;
+        }
+    }
+    thread::sync_threads();
+    // SAFETY: both warp maxima and all cached quads were published by the block barrier.
+    let largest = unsafe { (*cache.add(cached)).max(*cache.add(cached + 1)) };
+    let gs = if !largest.is_finite() {
+        f32::NAN
+    } else if largest > 0.0 {
+        largest / 6.0
+    } else {
+        1.0
+    };
+    if tid == 0 {
+        // SAFETY: this block owns the live column's global scale.
+        unsafe {
+            *global.get_unchecked_mut(col) = gs;
+        }
+    }
+    let blocks = k / 32;
+    let steps = k / 64;
+    let mut group = tid / 32;
+    while group < blocks.div_ceil(4) {
+        let block = (4 * group + (lane >> 3)).min(blocks - 1);
+        let at = 32 * block + 4 * (lane & 7);
+        // SAFETY: this aligned quad is in the column and the cached prefix is published.
+        let v = unsafe { cached_quad(g, u, col * k, at, code, limit, cache, cached) };
+        // SAFETY: each warp owns one group of four 32-value blocks in this checked column.
+        let refused = unsafe {
+            super::act32::quant32_group(
+                v, col, group, blocks, steps, lane, &mut q, &mut d, &mut sums,
+            )
+        };
+        if refused && lane & 7 == 0 {
+            fault.raise(crate::FaultSite::QuantColumn);
+        }
+        group += 2;
+    }
+    let mut block = tid;
+    while block - lane < k / 16 {
+        let source = block.min(k / 16 - 1);
+        let mut v = [0.0f32; 16];
+        #[unroll]
+        for quad in 0..4 {
+            // SAFETY: each aligned quad is in the source sub-block and the cached prefix is published.
+            let x = unsafe {
+                cached_quad(
+                    g,
+                    u,
+                    col * k,
+                    16 * source + 4 * quad,
+                    code,
+                    limit,
+                    cache,
+                    cached,
+                )
+            };
+            #[unroll]
+            for j in 0..4 {
+                v[4 * quad + j] = x[j];
+            }
+        }
+        let (packed, scale) = nvfp4_pack_block(v, gs);
+        if block < k / 16 {
+            // SAFETY: this lane owns both words of the live 16-value sub-block.
+            unsafe {
+                *out.get_unchecked_mut(col * k / 8 + 2 * block) = packed[0];
+                *out.get_unchecked_mut(col * k / 8 + 2 * block + 1) = packed[1];
+            }
+        }
+        let mut word = scale << (8 * (lane & 3));
+        word |= warp::shuffle_xor(word, 1);
+        word |= warp::shuffle_xor(word, 2);
+        if block < k / 16 && lane & 3 == 0 {
+            // SAFETY: one lane per quad owns these four packed scales.
+            unsafe {
+                *scales.get_unchecked_mut(col * steps + block / 4) = word;
+            }
+        }
+        block += 64;
+    }
 }
 
 #[inline(always)]
@@ -88,11 +281,65 @@ fn mma(c: [f32; 4], a: [u32; 4], b: [u32; 2], sa: u32, sb: u32) -> [f32; 4] {
 #[cuda_module]
 mod native {
     use super::*;
+    use cuda_device::shared::cvta_generic_to_shared_u32;
+    use cuda_device::wmma::{ldmatrix_x2_shared_u32, ldmatrix_x4_shared_u32};
+
+    #[kernel]
+    #[launch_bounds(64)]
+    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (264, 32776))]
+    pub fn swiglu_nvfp4_32(
+        g: &[f32],
+        u: &[f32],
+        code: u32,
+        limit: f32,
+        k: u32,
+        q: DisjointSlice<u32>,
+        d: DisjointSlice<f32>,
+        sums: DisjointSlice<i32>,
+        out: DisjointSlice<u32>,
+        scales: DisjointSlice<u32>,
+        global: DisjointSlice<f32>,
+        fault: crate::fault::FaultSink,
+    ) {
+        fused_swiglu(g, u, code, limit, k, q, d, sums, out, scales, global, fault);
+    }
+
+    #[kernel]
+    #[launch_bounds(64)]
+    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (264, 32776))]
+    pub fn swiglu_nvfp4_32_sel(
+        g: &[f32],
+        u: &[f32],
+        sel: &[u32],
+        n_card: u32,
+        code: u32,
+        limit: f32,
+        k: u32,
+        q: DisjointSlice<u32>,
+        d: DisjointSlice<f32>,
+        sums: DisjointSlice<i32>,
+        out: DisjointSlice<u32>,
+        scales: DisjointSlice<u32>,
+        global: DisjointSlice<f32>,
+        fault: crate::fault::FaultSink,
+    ) {
+        let place = sel[thread::blockIdx_x() as usize];
+        if place == crate::hybrid::HOST {
+            return;
+        }
+        if place >= n_card {
+            if thread::threadIdx_x() == 0 {
+                fault.raise(crate::FaultSite::ExpertId);
+            }
+            return;
+        }
+        fused_swiglu(g, u, code, limit, k, q, d, sums, out, scales, global, fault);
+    }
 
     #[kernel]
     #[launch_bounds(32)]
     #[launch_contract(domain = 1, block = (32, 1, 1))]
-    pub fn quantize(
+    pub fn quantize_nvfp4_32(
         q: &[u32],
         d: &[f32],
         steps: u32,
@@ -138,23 +385,12 @@ mod native {
             let at = col * steps * 16 + source * 4;
             let dx = d[col * 2 * steps + source / 2];
             let words = [q[at], q[at + 1], q[at + 2], q[at + 3]];
-            let mut largest = 0.0f32;
-            let mut i = 0;
-            while i < 16 {
-                let v = ((words[i / 4] >> (8 * (i % 4))) as i8) as f32 * dx;
-                largest = largest.max(v.abs());
-                i += 1;
+            let mut values = [0.0f32; 16];
+            #[unroll]
+            for i in 0..16 {
+                values[i] = ((words[i / 4] >> (8 * (i % 4))) as i8) as f32 * dx;
             }
-            let scale = e4m3(largest / (6.0 * gs));
-            let decoded = crate::mxfp4::ue4m3_half(scale) * 2.0 * gs;
-            let inv = if decoded > 0.0 { 1.0 / decoded } else { 0.0 };
-            let mut packed = [0u32; 2];
-            i = 0;
-            while i < 16 {
-                let v = ((words[i / 4] >> (8 * (i % 4))) as i8) as f32 * dx;
-                packed[i / 8] |= e2m1(v * inv) << (4 * (i % 8));
-                i += 1;
-            }
+            let (packed, scale) = nvfp4_pack_block(values, gs);
             if block < 4 * steps {
                 // SAFETY: this lane owns the live sub-block's first word.
                 unsafe {
@@ -181,7 +417,7 @@ mod native {
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(domain = 1, block = (256, 1, 1))]
-    pub fn product(
+    pub fn gemm_nvfp4_mma(
         wq: &[u32],
         we: &[u32],
         ws: &[f32],
@@ -227,9 +463,9 @@ mod native {
         let expert = tiles[2 * tile] as usize;
         let (start, len) = super::super::route::tile_parts(tiles[2 * tile + 1]);
         let (start, len) = (start as usize, len as usize);
-        static mut W: cuda_device::SharedArray<u32, 1536, 16> = cuda_device::SharedArray::UNINIT;
-        static mut B: cuda_device::SharedArray<u32, 768, 16> = cuda_device::SharedArray::UNINIT;
-        static mut S: cuda_device::SharedArray<u32, 192, 16> = cuda_device::SharedArray::UNINIT;
+        static mut W: cuda_device::SharedArray<u32, 3072, 16> = cuda_device::SharedArray::UNINIT;
+        static mut B: cuda_device::SharedArray<u32, 1536, 16> = cuda_device::SharedArray::UNINIT;
+        static mut S: cuda_device::SharedArray<u32, 384, 16> = cuda_device::SharedArray::UNINIT;
         // SAFETY: these raw addresses name this block's shared allocations.
         let (wp, bp, sp) = unsafe {
             (
@@ -246,12 +482,35 @@ mod native {
         let half = tid & 1;
         let wr = expert * rows + (rt * TILE_ROWS + sr).min(rows - 1);
         let col = cols[start + sr.min(len - 1)] as usize / slot_div as usize;
+        let wi = wr * steps * 8 + 4 * half;
+        // SAFETY: K is positive and divides 64; wr and both aligned halves are in the checked plane.
+        let mut w = unsafe { (*wq.as_ptr().add(wi).cast::<cuda_device::vector::U32x4>()).0 };
+        let mut av = cuda_device::vector::U32x4::new([0; 4]);
+        if sr < 64 {
+            // SAFETY: col is a live column and each half is an aligned four-word vector.
+            av = unsafe {
+                *aq.as_ptr()
+                    .add(col * steps * 8 + 4 * half)
+                    .cast::<cuda_device::vector::U32x4>()
+            };
+        }
+        let mut sw = if half == 0 { we[wr * steps] } else { 0 };
+        let mut sb = if half == 0 && sr < 64 {
+            ae[col * steps]
+        } else {
+            0
+        };
         let mut acc = [0.0f32; 32];
         let mut step = 0;
         while step < steps {
-            let wi = wr * steps * 8 + step * 8 + 4 * half;
-            // SAFETY: the checked weight plane is aligned to 16 bytes, K divides 64, and wr is live.
-            let w = unsafe { (*wq.as_ptr().add(wi).cast::<cuda_device::vector::U32x4>()).0 };
+            // SAFETY: alternate stages are disjoint. The publishing barrier completes the preceding stage's reads.
+            let (wp, bp, sp) = unsafe {
+                (
+                    wp.add((step & 1) * 1536),
+                    bp.add((step & 1) * 768),
+                    sp.add((step & 1) * 192),
+                )
+            };
             let packed = cuda_device::vector::U32x4::new([
                 compact(w[0]) | (compact(w[1]) << 16),
                 compact(w[0] >> 4) | (compact(w[1] >> 4) << 16),
@@ -264,9 +523,6 @@ mod native {
                     .cast::<cuda_device::vector::U32x4>() = packed;
             }
             if sr < 64 {
-                let ai = col * steps * 8 + step * 8 + 4 * half;
-                // SAFETY: the owned activation buffer and every column/step offset are 16-byte aligned.
-                let av = unsafe { *aq.as_ptr().add(ai).cast::<cuda_device::vector::U32x4>() };
                 // SAFETY: each thread owns one aligned four-word half of its shared activation row.
                 unsafe {
                     *bp.add(sr * 12 + 4 * half)
@@ -276,26 +532,41 @@ mod native {
             if half == 0 {
                 // SAFETY: the first thread of each row owns its weight scale word.
                 unsafe {
-                    *sp.add(sr) = we[wr * steps + step];
+                    *sp.add(sr) = sw;
                 }
                 if sr < 64 {
                     // SAFETY: the first thread of each live activation row owns its scale word.
                     unsafe {
-                        *sp.add(TILE_ROWS + sr) = ae[col * steps + step];
+                        *sp.add(TILE_ROWS + sr) = sb;
                     }
                 }
             }
             thread::sync_threads();
+            if step + 1 < steps {
+                let wi = wr * steps * 8 + (step + 1) * 8 + 4 * half;
+                // SAFETY: the next step is in the same aligned live weight row.
+                w = unsafe { (*wq.as_ptr().add(wi).cast::<cuda_device::vector::U32x4>()).0 };
+                if sr < 64 {
+                    let ai = col * steps * 8 + (step + 1) * 8 + 4 * half;
+                    // SAFETY: the next step is in this aligned live activation column.
+                    av = unsafe { *aq.as_ptr().add(ai).cast::<cuda_device::vector::U32x4>() };
+                }
+                if half == 0 {
+                    sw = we[wr * steps + step + 1];
+                    if sr < 64 {
+                        sb = ae[col * steps + step + 1];
+                    }
+                }
+            }
             if row < rows {
                 let r = 16 * (tid / 32) + g;
-                // SAFETY: this live warp reads rows r and r+8, both inside the 128-row shared tile.
-                let a0 = unsafe { *wp.add(r * 12 + t) };
-                // SAFETY: r+8 is below 128 and t is below four.
-                let a1 = unsafe { *wp.add((r + 8) * 12 + t) };
-                // SAFETY: t+4 is below eight in this shared row.
-                let a2 = unsafe { *wp.add(r * 12 + t + 4) };
-                // SAFETY: r+8 and t+4 are inside the shared tile.
-                let a3 = unsafe { *wp.add((r + 8) * 12 + t + 4) };
+                let a_off = (16 * (tid / 32) + (lane & 15)) * 12 + 4 * (lane >> 4);
+                // SAFETY: all lanes issue the load; its four sets of eight aligned rows lie in the live shared stage.
+                let a = unsafe {
+                    ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                        wp.add(a_off).cast_const().cast::<u8>(),
+                    ))
+                };
                 // SAFETY: each pair of lanes reads the scale row selected by the MMA layout.
                 let sa = unsafe { *sp.add(r + 8 * (t & 1)) };
                 #[unroll]
@@ -304,16 +575,19 @@ mod native {
                         continue;
                     }
                     let br = n * 8 + g;
-                    // SAFETY: br is below 64 and t is below four.
-                    let b0 = unsafe { *bp.add(br * 12 + t) };
-                    // SAFETY: br is below 64 and t+4 is below eight.
-                    let b1 = unsafe { *bp.add(br * 12 + t + 4) };
+                    let b_off = (n * 8 + (lane & 7)) * 12 + 4 * ((lane >> 3) & 1);
+                    // SAFETY: the whole warp loads two sets of eight aligned rows within this activation stage.
+                    let b = unsafe {
+                        ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
+                            bp.add(b_off).cast_const().cast::<u8>(),
+                        ))
+                    };
                     // SAFETY: the activation scale follows the weight scales in the 192-word allocation.
                     let sb = unsafe { *sp.add(TILE_ROWS + br) };
                     let c = mma(
                         [acc[n * 4], acc[n * 4 + 1], acc[n * 4 + 2], acc[n * 4 + 3]],
-                        [a0, a1, a2, a3],
-                        [b0, b1],
+                        a,
+                        b,
                         sa,
                         sb,
                     );
@@ -323,7 +597,6 @@ mod native {
                     acc[n * 4 + 3] = c[3];
                 }
             }
-            thread::sync_threads();
             step += 1;
         }
         if row >= rows {
@@ -365,10 +638,12 @@ impl Kernels {
         act: &mut GemmAct32,
     ) -> Result<(), GpuError> {
         if let Some(out) = act.native.as_mut() {
-            let prep =
-                self.module
-                    .prepare_quantize(LaunchConfig1D::new(act.filled as u32, 32, 0))?;
-            self.module.quantize(
+            let prep = self.module.prepare_quantize_nvfp4_32(LaunchConfig1D::new(
+                act.filled as u32,
+                32,
+                0,
+            ))?;
+            self.module.quantize_nvfp4_32(
                 stream,
                 &prep,
                 &act.q,
@@ -377,6 +652,67 @@ impl Kernels {
                 &mut out.q,
                 &mut out.e,
                 &mut out.scale,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn swiglu(
+        &self,
+        stream: &CudaStream,
+        g: &DeviceBuffer<f32>,
+        u: &DeviceBuffer<f32>,
+        selected: Option<(&DeviceBuffer<u32>, u32)>,
+        rule: crate::kquant::Act,
+        cols: u32,
+        act: &mut GemmAct32,
+        fault: crate::fault::FaultSink,
+    ) -> Result<(), GpuError> {
+        let (code, limit) = rule.code("NVFP4 activation")?;
+        let k = act.k as u32;
+        let shared = ((act.k.min(ACT_CACHE_VALUES) + 2) * 4) as u32;
+        let out = act
+            .native
+            .as_mut()
+            .ok_or_else(|| GpuError::shape("NVFP4 activation", "K must divide 64"))?;
+        let config = LaunchConfig1D::new(cols, 64, shared);
+        if let Some((sel, n_card)) = selected {
+            let prep = self.module.prepare_swiglu_nvfp4_32_sel(config)?;
+            self.module.swiglu_nvfp4_32_sel(
+                stream,
+                &prep,
+                g,
+                u,
+                sel,
+                n_card,
+                code,
+                limit,
+                k,
+                &mut act.q,
+                &mut act.d,
+                &mut act.s,
+                &mut out.q,
+                &mut out.e,
+                &mut out.scale,
+                fault,
+            )?;
+        } else {
+            let prep = self.module.prepare_swiglu_nvfp4_32(config)?;
+            self.module.swiglu_nvfp4_32(
+                stream,
+                &prep,
+                g,
+                u,
+                code,
+                limit,
+                k,
+                &mut act.q,
+                &mut act.d,
+                &mut act.s,
+                &mut out.q,
+                &mut out.e,
+                &mut out.scale,
+                fault,
             )?;
         }
         Ok(())
@@ -402,10 +738,10 @@ impl Kernels {
         let grid = max_tiles
             .checked_mul(rt)
             .ok_or_else(|| GpuError::shape("NVFP4 MMA", "grid overflow"))?;
-        let prep = self
-            .module
-            .prepare_product(LaunchConfig1D::new(grid, TILE_THREADS, 0))?;
-        self.module.product(
+        let prep =
+            self.module
+                .prepare_gemm_nvfp4_mma(LaunchConfig1D::new(grid, TILE_THREADS, 0))?;
+        self.module.gemm_nvfp4_mma(
             stream,
             &prep,
             w.qs.buf(),
