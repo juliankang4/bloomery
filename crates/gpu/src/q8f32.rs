@@ -90,7 +90,7 @@ use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
     Bf16Rows, F32T_THREADS_U32, MMA_THREADS, STAGE_FLOATS, STAGES, bf16_mma_body, f32_tile_body,
-    tile_launch,
+    mma_launch, tile_launch,
 };
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
@@ -1777,10 +1777,10 @@ mod q8f32_kernels {
 
     /// Dense prompt product with BF16 operands and F32 accumulation.
     #[kernel]
-    #[launch_bounds(128)]
+    #[launch_bounds(256)]
     #[launch_contract(
         domain = 1,
-        block = (128, 1, 1),
+        block = (256, 1, 1),
         requires = (
             rows >= 1,
             n >= 1,
@@ -1800,7 +1800,7 @@ mod q8f32_kernels {
         static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
         // SAFETY: this block's aligned shared allocation, accessed without a reference.
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
-        // SAFETY: the checked launch supplies 128 converged threads, the grid,
+        // SAFETY: the checked launch supplies 256 converged threads, the grid,
         // aligned activations and the weight and output spans in the contract.
         unsafe { bf16_mma_body(Bf16Rows(w), x, rows, k, n, &mut y, sh) };
     }
@@ -2671,7 +2671,7 @@ impl Q8F32Kernels {
             .cols()
             .checked_mul(2)
             .ok_or_else(|| GpuError::shape(what, "BF16 words to values overflows"))?;
-        let t = tile_launch(what, w.rows(), k, x, n, y)?;
+        let t = mma_launch(what, w.rows(), k, x, n, y)?;
         let prep =
             self.module
                 .prepare_bf16_mma_gemm(LaunchConfig1D::new(t.grid, MMA_THREADS, 0))?;

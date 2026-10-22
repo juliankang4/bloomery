@@ -66,7 +66,7 @@ pub use act32::GemmAct32;
 pub use f32tile::LINE as F32_TILE_LINE;
 pub(crate) use f32tile::{
     Bf16Rows, F32T_THREADS_U32, MMA_THREADS, STAGE_FLOATS, STAGES, bf16_mma_body, f32_tile_body,
-    tile_launch,
+    mma_launch, tile_launch,
 };
 pub use gemm32::{Gemm32Args, Gemm32Weight};
 pub use grouped::{GemmArgs, GemmInput, GemmWeight};

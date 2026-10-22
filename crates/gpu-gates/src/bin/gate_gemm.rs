@@ -6482,7 +6482,13 @@ mod gate {
             let gpu = dev.gpu;
             let stream = gpu.stream();
             let mut ok = true;
-            for (rows, k, n) in [(1, 64, 1), (17, 128, 17), (33, 2560, 33), (100, 256, 65)] {
+            for (rows, k, n) in [
+                (1, 64, 1),
+                (17, 128, 17),
+                (33, 2560, 33),
+                (100, 256, 65),
+                (33, 640, 513),
+            ] {
                 let wh = activations(k, rows, 9271 + rows as u32);
                 let bits: Vec<u16> = wh.into_iter().map(fp32_to_bf16_bits).collect();
                 let wf: Vec<Vec<f32>> = bits

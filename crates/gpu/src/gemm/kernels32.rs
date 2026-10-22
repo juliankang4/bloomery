@@ -1185,10 +1185,10 @@ mod gemm32_kernels {
 
     /// Dense prompt product with BF16 operands and F32 accumulation.
     #[kernel]
-    #[launch_bounds(128)]
+    #[launch_bounds(256)]
     #[launch_contract(
         domain = 1,
-        block = (128, 1, 1),
+        block = (256, 1, 1),
         requires = (
             rows >= 1,
             n >= 1,
@@ -1210,7 +1210,7 @@ mod gemm32_kernels {
         static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
         // SAFETY: this block's aligned shared allocation, accessed without a reference.
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
-        // SAFETY: the checked launch supplies 128 converged threads, the grid,
+        // SAFETY: the checked launch supplies 256 converged threads, the grid,
         // aligned activations and the weight and output spans in the contract.
         unsafe {
             bf16_mma_body(
@@ -1227,10 +1227,10 @@ mod gemm32_kernels {
 
     /// Dense prompt product with BF16 operands and F32 accumulation.
     #[kernel]
-    #[launch_bounds(128)]
+    #[launch_bounds(256)]
     #[launch_contract(
         domain = 1,
-        block = (128, 1, 1),
+        block = (256, 1, 1),
         requires = (
             rows >= 1,
             n >= 1,
@@ -1252,7 +1252,7 @@ mod gemm32_kernels {
         static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
         // SAFETY: this block's aligned shared allocation, accessed without a reference.
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
-        // SAFETY: the checked launch supplies 128 converged threads, the grid,
+        // SAFETY: the checked launch supplies 256 converged threads, the grid,
         // aligned activations and the weight and output spans in the contract.
         unsafe {
             bf16_mma_body(

@@ -33,6 +33,7 @@
 //! A fragment outside normal BF16 range uses F32 terms instead, preserving
 //! the file formats' full exponent range. The exact tile entries stay available.
 
+use super::gemm32::{GEMM32_GROUP, raster32};
 use super::kernels32::Gemm32Kernels;
 use crate::q8f32::{
     Bf16Words, ByteBlocks, E4m3Scales, E4m3Weight, TILE, f32_tile_chunk, gemv_lane_sums,
@@ -363,19 +364,23 @@ pub(crate) unsafe fn f32_tile_body<W: TileRows>(
     column!(7);
 }
 
-/// Threads in a dense BF16 MMA tile: four warps, each covering 16 by 16.
-pub(crate) const MMA_THREADS: u32 = 128;
-const _: () = assert!(MMA_THREADS as usize * 4 == TILE_ROWS * LINE_COPIES);
-const _: () = assert!(TILE_ROWS == 32 && TILE_COLS == 32 && LINE == 64 && STAGES == 3);
+/// Threads in a dense BF16 MMA tile: eight warps, each covering 32 by 16.
+pub(crate) const MMA_THREADS: u32 = 256;
+const MMA_ROWS: usize = 64;
+const MMA_COLS: usize = 64;
+const MMA_LINE: usize = 32;
+const _: () = assert!(MMA_THREADS == 256 && MMA_ROWS == 64 && MMA_COLS == 64 && MMA_LINE == 32);
+const _: () = assert!(MMA_THREADS as usize * 2 == MMA_ROWS * (MMA_LINE / 4));
+const _: () = assert!((MMA_ROWS + MMA_COLS) * MMA_LINE == STAGE_FLOATS && STAGES == 3);
 
 /// BF16 tensor-core product over the stored weight's decoded rows.
 /// Activations and decoded weights round once to BF16; accumulation is F32.
 ///
 /// # Safety
 ///
-/// All 128 threads call converged. Rows and columns are positive, K is a
-/// positive multiple of LINE, x holds n aligned K-value columns, y holds
-/// rows*n outputs, and w holds rows*K values. The grid covers 32 by 32
+/// All 256 threads call converged. Rows and columns are positive, K is a
+/// positive multiple of 64, x holds n aligned K-value columns, y holds
+/// rows*n outputs, and w holds rows*K values. The grid covers 64 by 64
 /// output tiles. sh holds STAGES*STAGE_FLOATS aligned shared values.
 #[inline(always)]
 pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
@@ -388,40 +393,51 @@ pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
     sh: *mut f32,
 ) {
     let (rows, kk, n) = (rows as usize, k as usize, n as usize);
-    let row_blocks = rows.div_ceil(TILE_ROWS);
+    let row_blocks = rows.div_ceil(MMA_ROWS);
     let block = thread::blockIdx_x() as usize;
-    let row0 = (block % row_blocks) * TILE_ROWS;
-    let col0 = (block / row_blocks) * TILE_COLS;
-    if col0 >= n {
+    let group_size = GEMM32_GROUP * TILE_COLS / MMA_COLS;
+    let Some((col_tile, row_tile)) = raster32(block, row_blocks, n.div_ceil(MMA_COLS), group_size)
+    else {
         return;
-    }
+    };
+    let row0 = row_tile * MMA_ROWS;
+    let col0 = col_tile * MMA_COLS;
     let tid = thread::threadIdx_x() as usize;
     let lane = warp::lane_id() as usize;
     let warp = tid / 32;
-    let wr = (warp / 2) * 16;
-    let wc = (warp % 2) * 16;
+    let wr = (warp / 4) * 32;
+    let wc = (warp % 4) * 16;
     let group = lane / 4;
     let pair = 2 * (lane % 4);
-    let mut acc = [[0.0f32; 4]; 2];
-    let stages = kk / LINE;
+    let mut acc = [[[0.0f32; 4]; 2]; 2];
+    let stages = kk / MMA_LINE;
+    let staged_at = |at: usize| at ^ (((at / MMA_LINE) & 3) * 8);
     macro_rules! copy {
         ($s:expr, $buf:expr) => {{
             let (s, buf): (usize, usize) = ($s, $buf);
-            for i in 0..4 {
+            for i in 0..2 {
+                thread::__unroll_config::<0>();
                 let piece = tid + i * MMA_THREADS as usize;
-                let line = piece / LINE_COPIES;
-                let offset = 4 * (piece % LINE_COPIES);
-                let wa = (row0 + line).min(rows - 1) * kk + s * LINE + offset;
-                let xa = (col0 + line).min(n - 1) * kk + s * LINE + offset;
-                // SAFETY: each thread owns four disjoint aligned pieces of
-                // each stage plane; source rows are clamped inside the weight.
-                unsafe { w.stage(sh.add(buf * STAGE_FLOATS + line * LINE + offset), wa) };
-                // SAFETY: x holds n rows of kk values; xa is an aligned live
-                // four-value piece. Its stage plane is disjoint from w's.
+                let line = piece / (MMA_LINE / 4);
+                let offset = 4 * (piece % (MMA_LINE / 4));
+                let wa = (row0 + line).min(rows - 1) * kk + s * MMA_LINE + offset;
+                let xa = (col0 + line).min(n - 1) * kk + s * MMA_LINE + offset;
+                // SAFETY: each thread owns two aligned pieces of each plane;
+                // source rows are clamped inside the checked weight.
+                unsafe {
+                    w.stage(
+                        sh.add(buf * STAGE_FLOATS + staged_at(line * MMA_LINE + offset)),
+                        wa,
+                    )
+                };
+                // SAFETY: xa is an aligned live four-value piece of x. Its
+                // stage plane is disjoint from the weight plane.
                 unsafe {
                     cp_async_cg_16(
-                        sh.add(buf * STAGE_FLOATS + (TILE_ROWS + line) * LINE + offset)
-                            .cast(),
+                        sh.add(
+                            buf * STAGE_FLOATS + staged_at((MMA_ROWS + line) * MMA_LINE + offset),
+                        )
+                        .cast(),
                         x.as_ptr().add(xa).cast(),
                     )
                 };
@@ -431,10 +447,8 @@ pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
     copy!(0, 0);
     // SAFETY: commits this thread's copies of the first stage.
     unsafe { cp_async_commit_group() };
-    if stages > 1 {
-        copy!(1, 1);
-    }
-    // SAFETY: one group for each stage, empty when there is no second stage.
+    copy!(1, 1);
+    // SAFETY: K is a positive multiple of 64, so a second 32-value stage exists.
     unsafe { cp_async_commit_group() };
     for s in 0..stages {
         let buf = s % STAGES;
@@ -450,53 +464,69 @@ pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
         // the next iteration's barrier. Its extent is the allocation's.
         let stage =
             unsafe { core::slice::from_raw_parts(sh.add(buf * STAGE_FLOATS), STAGE_FLOATS) };
+        let read = |at| {
+            // SAFETY: each fragment coordinate has row < 128 and K < 32.
+            // The permutation changes only K bits, so its slot is below 4096.
+            unsafe { *stage.get_unchecked(staged_at(at)) }
+        };
         let packed = |at| {
-            let (a, b) = (stage[at], stage[at + 1]);
+            let (a, b) = (read(at), read(at + 1));
             let fits = |v: f32| {
                 let bits = v.to_bits() & 0x7fff_ffff;
                 bits == 0 || (bits >= 0x0080_0000 && bits <= 0x7f7f_0000)
             };
             (cvt_bf16x2_f32(a, b), fits(a) && fits(b))
         };
-        for step in 0..4 {
+        for step in 0..2 {
+            thread::__unroll_config::<0>();
             let off = step * 16 + pair;
-            let at = (wr + group) * LINE + off;
-            let a0 = packed(at);
-            let a1 = packed(at + 8 * LINE);
-            let a2 = packed(at + 8);
-            let a3 = packed(at + 8 * LINE + 8);
-            let a = [a0.0, a1.0, a2.0, a3.0];
-            for j in 0..2 {
-                let at = (TILE_ROWS + wc + j * 8 + group) * LINE + off;
-                let b0 = packed(at);
-                let b1 = packed(at + 8);
-                let safe = a0.1 && a1.1 && a2.1 && a3.1 && b0.1 && b1.1;
-                if warp::any(!safe) {
-                    // BF16 MMA need not preserve subnormal operands. The
-                    // same output fragment keeps the full-range F32 terms.
-                    for i in 0..4 {
-                        let ra = (wr + group + (i / 2) * 8) * LINE + step * 16;
-                        let rb = (TILE_ROWS + wc + j * 8 + pair + i % 2) * LINE + step * 16;
-                        for t in 0..16 {
-                            acc[j][i] = stage[ra + t].mul_add(stage[rb + t], acc[j][i]);
+            for mi in 0..2 {
+                thread::__unroll_config::<0>();
+                let at = (wr + mi * 16 + group) * MMA_LINE + off;
+                let a0 = packed(at);
+                let a1 = packed(at + 8 * MMA_LINE);
+                let a2 = packed(at + 8);
+                let a3 = packed(at + 8 * MMA_LINE + 8);
+                let a = [a0.0, a1.0, a2.0, a3.0];
+                for j in 0..2 {
+                    thread::__unroll_config::<0>();
+                    let at = (MMA_ROWS + wc + j * 8 + group) * MMA_LINE + off;
+                    let b0 = packed(at);
+                    let b1 = packed(at + 8);
+                    let safe = a0.1 && a1.1 && a2.1 && a3.1 && b0.1 && b1.1;
+                    if warp::any(!safe) {
+                        // BF16 MMA need not preserve subnormal operands. The
+                        // same output fragment keeps the full-range F32 terms.
+                        for i in 0..4 {
+                            thread::__unroll_config::<0>();
+                            let ra = (wr + mi * 16 + group + (i / 2) * 8) * MMA_LINE + step * 16;
+                            let rb = (MMA_ROWS + wc + j * 8 + pair + i % 2) * MMA_LINE + step * 16;
+                            for t in 0..16 {
+                                acc[mi][j][i] = read(ra + t).mul_add(read(rb + t), acc[mi][j][i]);
+                            }
                         }
+                    } else {
+                        // SAFETY: the whole warp is converged; A is row-major
+                        // and B column-major in the m16n8k16 fragment layout.
+                        acc[mi][j] = unsafe { mma_m16n8k16_f32_bf16(acc[mi][j], a, [b0.0, b1.0]) };
                     }
-                } else {
-                    // SAFETY: the whole warp is converged; A is row-major and
-                    // B column-major in the m16n8k16 fragment layout.
-                    acc[j] = unsafe { mma_m16n8k16_f32_bf16(acc[j], a, [b0.0, b1.0]) };
                 }
             }
         }
     }
-    for j in 0..2 {
-        for i in 0..4 {
-            let r = row0 + wr + group + (i / 2) * 8;
-            let c = col0 + wc + j * 8 + pair + i % 2;
-            if r < rows && c < n {
-                // SAFETY: each lane owns these four distinct fragment outputs;
-                // the checked live row and column lie inside rows*n.
-                unsafe { *y.get_unchecked_mut(c * rows + r) = acc[j][i] };
+    for mi in 0..2 {
+        thread::__unroll_config::<0>();
+        for j in 0..2 {
+            thread::__unroll_config::<0>();
+            for i in 0..4 {
+                thread::__unroll_config::<0>();
+                let r = row0 + wr + mi * 16 + group + (i / 2) * 8;
+                let c = col0 + wc + j * 8 + pair + i % 2;
+                if r < rows && c < n {
+                    // SAFETY: this lane owns the fragment output; its checked
+                    // live row and column lie inside rows*n.
+                    unsafe { *y.get_unchecked_mut(c * rows + r) = acc[mi][j][i] };
+                }
             }
         }
     }
@@ -590,7 +620,7 @@ impl Gemm32Kernels {
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_e4m3_mma";
         let (rows, k) = w.dimensions(what)?;
-        let t = tile_launch(what, rows, k, x, n, y)?;
+        let t = mma_launch(what, rows, k, x, n, y)?;
         let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
         let (qs, e, module) = (w.qs.buf(), w.e.buf(), &self.module);
         match w.scales {
@@ -605,6 +635,20 @@ impl Gemm32Kernels {
         }
         Ok(())
     }
+}
+
+/// Checked spans shared with the exact tile, with the MMA tile's grid.
+pub(crate) fn mma_launch(
+    what: &'static str,
+    rows: usize,
+    k: usize,
+    x: &DeviceBuffer<f32>,
+    n: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<TileLaunch, GpuError> {
+    let mut launch = tile_launch(what, rows, k, x, n, y)?;
+    launch.grid = launch_u32(what, "grid", n.div_ceil(MMA_COLS) * rows.div_ceil(MMA_ROWS))?;
+    Ok(launch)
 }
 
 /// A tile launch's grid and its `u32` arguments.
