@@ -2850,15 +2850,20 @@ fn row_cache_reserve(model: &ModelTensors, rows: &[Row]) -> u64 {
 /// The page-cache bytes a reader of `model`'s row-gathered tables
 /// ([`Role::EngramTable`]) holds while it reads one call of up to
 /// `positions` positions from the NVMe tier: per table, its rows a position
-/// ([`ModelTensor::gathered_rows`]) for every position, each row on at most
-/// `1 + ⌈(row bytes − 1) / page⌉` pages of `page` — the host's base page
-/// ([`workstation::ROW_PAGE`] on this workstation, the page the caller's own
-/// host has elsewhere) — the ids are hashed, so a call's rows are counted on
-/// pages of their own, and a row may straddle a page boundary. The reader
+/// ([`ModelTensor::gathered_rows`]) for every position, each physical plane of
+/// a row on at most `1 + ceil((plane bytes - 1) / page)` host base pages.
+/// Split rows are packed; NVFP4 part-source rows have separate code and scale
+/// planes. The ids are hashed, so a call's rows are counted on pages of their
+/// own, and each plane may straddle a page boundary. The reader
 /// advises and copies one call at a time, so one call's pages are what must
 /// stay resident until its copy. A table with no per-token row count, or a
 /// room past u64, is refused by name.
-pub fn row_room(model: &ModelTensors, positions: u64, page: u64) -> Result<u64, PlacementError> {
+pub fn row_room(
+    model: &ModelTensors,
+    positions: u64,
+    page: u64,
+    source: RowTableSource,
+) -> Result<u64, PlacementError> {
     model
         .tensors
         .iter()
@@ -2867,7 +2872,21 @@ pub fn row_room(model: &ModelTensors, positions: u64, page: u64) -> Result<u64, 
             let rows = t.gathered_rows.ok_or_else(|| {
                 PlacementError::tensor(t, "a row-gathered table without a per-token row count")
             })?;
-            let pages = 1 + row_bytes(t)?.saturating_sub(1).div_ceil(page);
+            let bytes = row_bytes(t)?;
+            let span = |bytes: u64| 1 + bytes.saturating_sub(1).div_ceil(page);
+            let pages = match (source, t.ty) {
+                (RowTableSource::Parts, GgmlType::NVFP4_ROWS) => {
+                    if !bytes.is_multiple_of(9) {
+                        return Err(PlacementError::tensor(
+                            t,
+                            "NVFP4 row bytes are not whole groups",
+                        ));
+                    }
+                    let groups = bytes / 9;
+                    span(groups * 8) + span(groups)
+                }
+                _ => span(bytes),
+            };
             positions
                 .checked_mul(rows)
                 .and_then(|n| n.checked_mul(pages))
@@ -2882,6 +2901,15 @@ pub fn row_room(model: &ModelTensors, positions: u64, page: u64) -> Result<u64, 
         })
 }
 
+/// Where a row reader obtains its table. Part sources have no split host set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowTableSource {
+    /// A split's mappings, held on the host when its room permits.
+    Split,
+    /// A part source's file ranges, gathered from the NVMe tier.
+    Parts,
+}
+
 /// Where `plan`'s row-gathered tables ([`Role::EngramTable`]) are read
 /// from, the one rule for a plan whose maker sizes their reader: on the
 /// host in their file bytes when `room` — the host's available bytes
@@ -2891,7 +2919,8 @@ pub fn row_room(model: &ModelTensors, positions: u64, page: u64) -> Result<u64, 
 /// else on the NVMe tier, where the role rule placed them ([`place_whole`]),
 /// with their reader's room for a call of up to `positions` positions
 /// ([`row_room`], on `page` pages) as the plan's row reserve, in place of
-/// the row cache [`totals`] set aside.
+/// the row cache [`totals`] set aside. [`RowTableSource::Parts`] stays on
+/// NVMe, with its row window sized for the stored planes.
 ///
 /// `floor` is the prompt cache's: the caller's two saved sequence states at
 /// the plan's context. The cache's default budget is half of what the room
@@ -2913,6 +2942,7 @@ pub fn row_table_tier(
     floor: u64,
     positions: u64,
     page: u64,
+    source: RowTableSource,
 ) -> Result<(), PlacementError> {
     let model = plan.model;
     let tables: Vec<usize> = (0..plan.rows.len())
@@ -2973,7 +3003,7 @@ pub fn row_table_tier(
         .bytes()
         .checked_add(floor)
         .ok_or_else(|| past("the host's need with the prompt cache's floor"))?;
-    let new = if held <= room {
+    let new = if source == RowTableSource::Split && held <= room {
         plan.nvme_bytes = plan.nvme_bytes.checked_sub(moved).ok_or_else(|| {
             PlacementError::tensor(
                 named,
@@ -2991,7 +3021,7 @@ pub fn row_table_tier(
         }
         0
     } else {
-        row_room(model, positions, page)?
+        row_room(model, positions, page, source)?
     };
     plan.host.reserve_bytes = host_arm
         .reserves
@@ -6553,8 +6583,49 @@ mod tests {
             experts_used: 0,
             bf16_words: |_| false,
         };
-        let room = |page| row_room(&model, 4096, page).expect("the row room");
-        assert_eq!(room(4096), 536_870_912);
-        assert_eq!(room(16384), 2_147_483_648);
+        for source in [RowTableSource::Split, RowTableSource::Parts] {
+            let room = |page| row_room(&model, 4096, page, source).expect("the row room");
+            assert_eq!(room(4096), 536_870_912);
+            assert_eq!(room(16384), 2_147_483_648);
+        }
+
+        let mut model = model;
+        let table = &mut model.tensors[0];
+        table.ty = GgmlType::NVFP4_ROWS;
+        table.dims = vec![160, 100];
+        table.file_bytes = 90 * 100;
+        table.gathered_rows = Some(1);
+        let touched: u64 = [80, 10]
+            .into_iter()
+            .map(|width| {
+                let start = 256 + 99 * width;
+                (start + width - 1) / 4096 - start / 4096 + 1
+            })
+            .sum();
+        assert_eq!(touched, 3);
+        let reserve =
+            row_room(&model, 1, 4096, RowTableSource::Parts).expect("the separate-plane row room");
+        assert!(
+            reserve >= touched * 4096,
+            "{reserve} B reserved for {touched} pages"
+        );
+        model.tensors[0].gathered_rows = Some(16);
+        for (source, want) in [
+            (RowTableSource::Split, 536_870_912),
+            (RowTableSource::Parts, 1_073_741_824),
+        ] {
+            for page in [4096, 16384] {
+                assert_eq!(
+                    row_room(&model, 4096, page, source).unwrap(),
+                    want * (page / 4096)
+                );
+            }
+        }
+        model.tensors[0].file_bytes = 89 * 100;
+        let e = row_room(&model, 4096, 4096, RowTableSource::Parts).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("NVFP4 row bytes are not whole groups")
+        );
     }
 }

@@ -20,7 +20,8 @@ use super::workstation::{
 };
 use super::{
     CardFormat, Device, Format, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan,
-    PlanLevers, PoolNeed, Role, RoutedRule, Violation, plan_routed, plan_with, row_table_tier,
+    PlanLevers, PoolNeed, Role, RoutedRule, RowTableSource, Violation, plan_routed, plan_with,
+    row_table_tier,
 };
 use crate::accepts::{Program, routed_rule};
 
@@ -987,7 +988,8 @@ fn n1_is_today() {
     assert_eq!(nvme.serial_nvme, 4 * row);
     let (_, faster_step) = step_of(&plan, n, 2_000_000_000);
     assert_eq!(filled_step - faster_step, 2 * row);
-    row_table_tier(&mut plan, u64::MAX, 0, 1, ROW_PAGE).expect("the table's tier");
+    row_table_tier(&mut plan, u64::MAX, 0, 1, ROW_PAGE, RowTableSource::Split)
+        .expect("the table's tier");
     assert_eq!(plan.row_tier().expect("one tier"), Some(Device::Host));
     let (t, step) = step_of(&plan, n, 0);
     let serial = (attn * shape.layers as u64 + 1) * row + VOCAB * n * 4;
@@ -1039,7 +1041,8 @@ fn n1_is_today() {
     unread.rows[table].segments[0].format = Format::NvmeFile;
     unread.rows[table].read_bytes = 0;
     let unread = Terms::of(&unread, 2560).expect("the file's unread table");
-    row_table_tier(&mut plan, u64::MAX, 0, 1, ROW_PAGE).expect("the PLE table's tier");
+    row_table_tier(&mut plan, u64::MAX, 0, 1, ROW_PAGE, RowTableSource::Split)
+        .expect("the PLE table's tier");
     let on_host = Terms::of(&plan, 2560).expect("the file's host terms");
     let gathered = ple.gathered_rows.expect("its rows") * ple.file_bytes
         / ple.dims[1..].iter().product::<u64>();
@@ -1792,6 +1795,27 @@ fn fills_balance() {
         plan.fills_apart().expect("a prediction"),
         Some(FillsApart { low: 2, high: 1 })
     );
+    let mut terms = terms;
+    terms.serial_nvme = 4096;
+    let filled = plan_nodes(&nodes, &terms, &budgets, w).expect("three Sparks");
+    let faster = plan_nodes(
+        &nodes,
+        &terms,
+        &budgets,
+        Workload {
+            nvme_read: 2_000_000_000,
+            ..w
+        },
+    )
+    .expect("three Sparks with a faster row fill");
+    assert_eq!(filled.owned(), [2, 2, 1]);
+    assert_eq!(faster.owned(), filled.owned());
+    let filled = filled.predict().expect("a prediction");
+    let faster = faster.predict().expect("a prediction");
+    for (a, b) in filled.per_node.iter().zip(&faster.per_node) {
+        assert_eq!(a.window_ns, b.window_ns);
+    }
+    assert_eq!(filled.step_ns - faster.step_ns, 2048);
 }
 
 /// Undefined inputs and sums past their integers are refused by name: a

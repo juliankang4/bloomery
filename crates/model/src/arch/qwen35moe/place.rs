@@ -179,15 +179,18 @@ pub struct PlanInputs {
     pub kv: KvLayout,
     /// The host's available bytes when the inputs were read, with the
     /// reading that decided ([`workstation::host_available_read`]): the PLE
-    /// table's tier follows it ([`placement::row_table_tier`]) — on the host
+    /// split table's tier follows it ([`placement::row_table_tier`]): on the host
     /// while the room holds the plan with the table there, else on the NVMe
     /// tier; the routed experts the room still cannot hold follow it there
     /// ([`placement::expert_nvme_tier`]). A gate that plans an arm by a room
-    /// of its own sets it, read [`HostRead::Given`].
+    /// of its own sets it, read [`HostRead::Given`]. Part-source tables stay
+    /// on NVMe regardless of this room ([`PlanInputs::row_source`]).
     ///
     /// The plan is made at [`workstation::plan_room`]: a read room less
     /// [`workstation::HOST_DRIFT`], a given room as given.
     pub room: (u64, HostRead),
+    /// A part source's rows stay on NVMe, with room for each stored plane.
+    pub row_source: placement::RowTableSource,
     /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
     /// as its `given` ([`placement::expert_nvme_tier`]). A gate that plans an
@@ -388,6 +391,11 @@ impl PlanInputs {
             spec,
             kv,
             room,
+            row_source: if split.is_header_only() {
+                placement::RowTableSource::Parts
+            } else {
+                placement::RowTableSource::Split
+            },
             arena,
         })
     }
@@ -480,7 +488,7 @@ impl PlanInputs {
             let room = plan.plan_at(&self.room);
             let floor = 2 * self.seq_state_bytes(ctx_max, None);
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
-            placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED, page)?;
+            self.place_rows(&mut plan, room, floor, page)?;
             plan.host.step_slots(1, placement::STEP_PORT_COLUMNS)?;
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             Ok(plan)
@@ -594,6 +602,16 @@ impl PlanInputs {
         self.target_rule(machine, ctx_max, levers, rule, beside)
     }
 
+    fn place_rows(
+        &self,
+        plan: &mut Plan<'_>,
+        room: u64,
+        floor: u64,
+        page: u64,
+    ) -> Result<(), PlacementError> {
+        placement::row_table_tier(plan, room, floor, UBATCH_PLANNED, page, self.row_source)
+    }
+
     /// [`PlanInputs::target`] over `kv`'s per-layer bytes instead of the
     /// file's own — the multiplying view a multi-slot plan counts by.
     fn target_of<'a>(
@@ -662,7 +680,7 @@ impl PlanInputs {
             let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
             let room = plan.plan_at(&self.room);
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
-            placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED, page)?;
+            self.place_rows(&mut plan, room, floor, page)?;
             plan.host
                 .step_slots(beside.slots, placement::STEP_PORT_COLUMNS)?;
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
@@ -2117,8 +2135,9 @@ mod tests {
     fn an_f8_ple_table_and_its_scale_describe() {
         use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
         use crate::arch::synthetic::{Ty, V, header_typed};
-        use crate::placement::Role;
         use crate::placement::workstation::HostRead;
+        use crate::placement::{self, PlanLevers, Role};
+        use gguf::Split;
 
         let table = "per_layer_token_embd.weight";
         let scale = "per_layer_token_embd.scale";
@@ -2134,6 +2153,8 @@ mod tests {
                     (n, d, Ty::F8Rows)
                 } else if n.starts_with("blk.2.ffn_") && n.ends_with("_exps.weight") {
                     (n, vec![64, 1, 8], Ty::Nvfp4)
+                } else if n.contains(".ffn_") && n.ends_with("_exps.weight") {
+                    (n, vec![64, 1, 8], Ty::F32)
                 } else if n.ends_with(".attn_q.weight") {
                     // The query projection writes each of the 4 heads' 16
                     // values and its gate beside them.
@@ -2152,9 +2173,44 @@ mod tests {
         let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
         let path = header_typed("q4x-f8-ple", "qwen4exp", &keys(), &pre, &typed);
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
-        let inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given));
+        let inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given))
+            .expect("the file describes");
+        let layout = gguf::write::Layout::new(
+            split.keys(),
+            split
+                .iter_tensors()
+                .map(|(_, t)| gguf::write::TensorDecl {
+                    name: t.name.clone(),
+                    dims: t.dims.clone(),
+                    type_id: t.ty.as_u32(),
+                    nbytes: t.nbytes,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let header = Split::header_only(path.clone(), &layout).unwrap();
+        assert!(!split.is_header_only());
+        assert!(header.is_header_only());
+        let source = super::PlanInputs::describe_in(&header, (u64::MAX, HostRead::Given))
+            .expect("the folder header describes");
+        let machine = super::machine(super::A6000, inputs.model.layers, 8);
+        let levers = PlanLevers {
+            card_budget_bytes: None,
+        };
+        for (input, tier) in [
+            (&inputs, placement::Device::Host),
+            (&source, placement::Device::Nvme),
+        ] {
+            let plan = input
+                .plan_with(&machine, 4096, &levers, super::Experts::Card)
+                .unwrap();
+            assert_eq!(plan.row_tier().unwrap(), Some(tier));
+            if tier == placement::Device::Nvme {
+                assert_eq!(plan.host.table_bytes, 0);
+                assert!(plan.host.row_reserve_bytes > 0);
+            }
+        }
         let _ = std::fs::remove_file(&path);
-        let inputs = inputs.expect("the file describes");
         let role = |name: &str| {
             inputs
                 .model
@@ -3083,6 +3139,7 @@ mod tests {
                 spec,
                 kv,
                 room: (u64::MAX, HostRead::Given),
+                row_source: placement::RowTableSource::Split,
                 arena: None,
             }
         }
@@ -3438,7 +3495,8 @@ mod tests {
                         placement::row_room(
                             &inputs.model,
                             super::super::UBATCH_PLANNED,
-                            os::page_bytes().expect("the base page reads")
+                            os::page_bytes().expect("the base page reads"),
+                            inputs.row_source,
                         )
                         .unwrap()
                     );

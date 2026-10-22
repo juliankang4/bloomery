@@ -405,6 +405,7 @@ fn planned<'a>(
         2 * state38(ctx, false),
         UBATCH_PLANNED,
         ROW_PAGE,
+        super::RowTableSource::Split,
     )?;
     if let Some(given) = split {
         plan.host.step_slots(
@@ -640,7 +641,14 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     // and a table on no tier a reader takes is refused by name.
     let mut moved = at(PLAN_ROOM);
     assert!(matches!(
-        super::row_table_tier(&mut moved, PLAN_ROOM, 0, UBATCH_PLANNED, ROW_PAGE),
+        super::row_table_tier(
+            &mut moved,
+            PLAN_ROOM,
+            0,
+            UBATCH_PLANNED,
+            ROW_PAGE,
+            super::RowTableSource::Split,
+        ),
         Err(PlacementError::Tensor { .. })
     ));
     let ple = moved
@@ -1795,7 +1803,14 @@ fn spark_holds(
     )
     .and_then(|mut plan| {
         let floor = 2 * state38(ctx, fixed.is_some());
-        super::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED, ROW_PAGE)?;
+        super::row_table_tier(
+            &mut plan,
+            room,
+            floor,
+            UBATCH_PLANNED,
+            ROW_PAGE,
+            super::RowTableSource::Split,
+        )?;
         super::expert_nvme_tier(&mut plan, room, None)?;
         plan.cards[0].grow_kv(rows);
         Ok(plan)

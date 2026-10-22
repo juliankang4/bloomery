@@ -637,6 +637,11 @@ impl Split {
         self.shards.len()
     }
 
+    /// Whether tensors are supplied by a part source rather than this split's mappings.
+    pub fn is_header_only(&self) -> bool {
+        matches!(&self.shards[0].map, Backing::Header(_))
+    }
+
     /// Shard `i`'s reader — the one whose [`Gguf::data`] holds its tensors.
     pub fn shard(&self, i: usize) -> Option<&Gguf> {
         self.shards.get(i)
