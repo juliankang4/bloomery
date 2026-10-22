@@ -294,6 +294,58 @@ fn alone(prompt: &str, n: usize) -> Value {
 /// two, and each request gives the ids it gives alone.
 #[test]
 #[ignore = "gate: just gate-serve"]
+fn hw_a_decode_answer_reaches_the_client_before_a_new_prompt_starts() {
+    for quantum in [None, Some(Q)] {
+        let log = new_log();
+        let decoded = Arc::new(Latch::default());
+        let prompting = Arc::new(Latch::default());
+        let mut engine = Yielding::new(quantum, &log);
+        engine
+            .at
+            .push((Kind::Next, 0, 2, Then::Hold(Arc::clone(&decoded))));
+        engine
+            .at
+            .push((Kind::Pre, 1, 1, Then::Hold(Arc::clone(&prompting))));
+        let (addr, _) = serve(engine, None);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let chunks = Arc::clone(&seen);
+        let a = std::thread::spawn(move || {
+            let mut body = completion(A, 6);
+            body["stream"] = json!(true);
+            super::read_stream(addr, &body, &chunks);
+        });
+        assert!(decoded.wait_entered(BOUND), "A never decoded");
+        let b = post_bg(addr, completion(B5, 6));
+        wait_deferred(addr, 1, BOUND);
+        decoded.release();
+        let entered = prompting.wait_entered(BOUND);
+        let end = Instant::now() + BOUND;
+        let delivered = loop {
+            let n = seen
+                .lock()
+                .expect("seen")
+                .iter()
+                .filter(|(_, _, last, _)| !last)
+                .count();
+            if n >= 2 || Instant::now() >= end {
+                break n;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        prompting.release();
+        a.join().expect("A stream");
+        let b = b.join().expect("B");
+        assert!(entered, "B never started its prompt");
+        assert_eq!(b.status, 200, "{}", b.body);
+        assert!(
+            delivered >= 2,
+            "only {delivered} tokens before B's prompt, quantum {quantum:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore]
 fn hw_a_long_prompt_runs_a_call_a_round_beside_a_decoding_stream() {
     assert_eq!(MockTokenizer.encode(B5).len(), 5 * Q + 1, "the fixture");
     let log = new_log();

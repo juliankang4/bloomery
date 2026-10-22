@@ -494,6 +494,16 @@ impl Worker {
                     return;
                 }
             }
+            let mut i = 0;
+            while i < self.active.len() {
+                if self.sh.stopped() {
+                    return self.halt();
+                }
+                if let Some(need) = self.pump_at(i) {
+                    self.active[i].need = Some(need);
+                    i += 1;
+                }
+            }
             for (slot, held, sub) in admitted {
                 if self.sh.stopped() {
                     return self.halt();
@@ -768,17 +778,15 @@ impl Worker {
         let mut needs = Vec::with_capacity(self.active.len());
         let mut k = 0;
         while k < self.active.len() {
-            let a = &mut self.active[k];
-            let pumped = a
-                .job
-                .pump(&mut sink_of(&a.events), &mut tick_of(&self.sh, a.slot));
-            match pumped {
-                Ok(Need::Done) => {
-                    let mut a = self.active.remove(k);
-                    let r = a.job.finish(&mut sink_of(&a.events));
-                    self.end_request(a, r);
-                }
-                Ok(Need::Fill) => {
+            let need = match self.active[k].need.take() {
+                Some(need) => need,
+                None => match self.pump_at(k) {
+                    Some(need) => need,
+                    None => continue,
+                },
+            };
+            match need {
+                Need::Fill => {
                     // A call of its own, like a prompt's: a quantum of ids
                     // beside other busy slots. The request steps next round.
                     let quantum = self.quantum.filter(|_| self.active.len() > 1);
@@ -795,13 +803,9 @@ impl Worker {
                     needs.push(Need::Fill);
                     k += 1;
                 }
-                Ok(need) => {
+                need => {
                     needs.push(need);
                     k += 1;
-                }
-                Err(e) => {
-                    let a = self.active.remove(k);
-                    self.end_request(a, Err(e));
                 }
             }
         }
@@ -1188,7 +1192,11 @@ impl Worker {
             Err(e) => Some((self.active.remove(i), Err(e))),
         };
         if let Some((a, r)) = ended {
-            if self.t().running == Some(a.slot) {
+            if self
+                .turns
+                .as_ref()
+                .is_some_and(|t| t.running == Some(a.slot))
+            {
                 self.t_mut().running = None;
             }
             self.end_request(a, r);
