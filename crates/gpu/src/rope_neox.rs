@@ -2063,6 +2063,15 @@ impl RopeNeoxKernels {
     /// consecutive); a position `>= ctx` raises [`FaultSite::CachePos`] on
     /// `args.fault`, leaves the token's heads NaN and is not appended.
     /// Asynchronous, allocation-free, capturable.
+    ///
+    /// ```compile_fail,E0133
+    /// use bloomery_gpu::{GpuError, rope_neox::{NeoxArgs, RopeNeoxKernels}};
+    /// use cuda_core::CudaStream;
+    ///
+    /// fn append(k: &RopeNeoxKernels, s: &CudaStream, args: NeoxArgs<'_>) -> Result<(), GpuError> {
+    ///     k.enqueue_head_norm_neox_append(s, args)
+    /// }
+    /// ```
     pub fn enqueue_head_norm_neox_append(
         &self,
         stream: &CudaStream,
@@ -2418,6 +2427,15 @@ impl RopeNeoxKernels {
     /// 32-value blocks in `args`' four planes — per side the codes and the
     /// scales ([`q8_plane_lens`]), the quantization rule and refusal
     /// [`q8_block_warp`]'s. Asynchronous, allocation-free, capturable.
+    ///
+    /// ```compile_fail,E0133
+    /// use bloomery_gpu::{GpuError, rope_neox::{NeoxQ8Args, RopeNeoxKernels}};
+    /// use cuda_core::CudaStream;
+    ///
+    /// fn append(k: &RopeNeoxKernels, s: &CudaStream, args: NeoxQ8Args<'_>) -> Result<(), GpuError> {
+    ///     k.enqueue_head_norm_neox_append_q8(s, args)
+    /// }
+    /// ```
     pub fn enqueue_head_norm_neox_append_q8(
         &self,
         stream: &CudaStream,
@@ -2643,6 +2661,15 @@ impl RopeNeoxKernels {
     /// leaves the token's heads NaN and is not appended. A non-finite
     /// `v_scale`, a short buffer or a zero count is refused by name before the
     /// launch. Asynchronous, allocation-free, capturable.
+    ///
+    /// ```compile_fail,E0133
+    /// use bloomery_gpu::{GpuError, rope_neox::{K192Args, RopeNeoxKernels}};
+    /// use cuda_core::CudaStream;
+    ///
+    /// fn append(k: &RopeNeoxKernels, s: &CudaStream, args: K192Args<'_>) -> Result<(), GpuError> {
+    ///     k.enqueue_neox_append_k192(s, args)
+    /// }
+    /// ```
     pub fn enqueue_neox_append_k192(
         &self,
         stream: &CudaStream,
@@ -2660,6 +2687,15 @@ impl RopeNeoxKernels {
     /// host's check. Refused by name before the launch, besides the plane
     /// entry's: `rows == 0`, `rows > ctx`, `rows < m`, and a plane shorter
     /// than `n_kv · rows` rows. Asynchronous, allocation-free, capturable.
+    ///
+    /// ```compile_fail,E0133
+    /// use bloomery_gpu::{GpuError, rope_neox::{K192Args, RopeNeoxKernels}};
+    /// use cuda_core::CudaStream;
+    ///
+    /// fn append(k: &RopeNeoxKernels, s: &CudaStream, args: K192Args<'_>) -> Result<(), GpuError> {
+    ///     k.enqueue_neox_append_k192_ring(s, args, 2)
+    /// }
+    /// ```
     pub fn enqueue_neox_append_k192_ring(
         &self,
         stream: &CudaStream,
