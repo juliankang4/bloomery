@@ -5,9 +5,9 @@
 //! The engine's step is its calling thread's serial time, so the question this
 //! module answers is not "how long does the read take" but "how many
 //! microseconds does the read steal from the step thread". Everything the read
-//! costs — the `WILLNEED` syscall per row, the optional `MADV_POPULATE_READ`
-//! pass, and the minor fault per row that consuming through the mapping takes —
-//! is moved onto a helper. What crosses back is a buffer of plain bytes.
+//! costs — the `WILLNEED` syscall per distinct merged page run, the optional
+//! `MADV_POPULATE_READ` pass, and the minor fault per row that consuming
+//! through the mapping takes — is moved onto a helper. What crosses back is a buffer of plain bytes.
 //!
 //! The handoff is by ownership, not by sharing: two buffers circulate over a
 //! pair of channels, so there is no lock on the step thread's path and no
