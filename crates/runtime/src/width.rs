@@ -1392,13 +1392,14 @@ where
     /// A step: the chooser's plain pass, counted, a pending shadow scored
     /// against `next`, the draft told it was held back; any other step
     /// (the caller's own, outside a pass) the draft's plain
-    /// [`Draft::stepped`], and nothing in flight survives it.
+    /// [`Draft::stepped`], with batch acceptance reset and nothing in flight.
     fn stepped(&mut self, t: &mut T, last: u32, next: u32) -> Result<(), T::Error> {
         if self.mode == Mode::Fixed {
             return self.draft.stepped(t, last, next);
         }
         if self.turn.take() != Some(Turn::Plain) {
             self.drop_flight();
+            self.reset_batch();
             return self.draft.stepped(t, last, next);
         }
         match &mut self.flight {
@@ -1418,7 +1419,9 @@ mod tests {
 
     use super::{Batch, Choosing, Chosen, Mode, Rule, Tally, Wall, WidthError, expected};
     use crate::mock::{Call, Clockwork, Mock, MockError, Quiet};
-    use crate::{Advance, Committed, Draft, Plain, Speculative, Stop, TapNeed, Target, generate};
+    use crate::{
+        Advance, Committed, Draft, Plain, Speculative, Stop, TapNeed, Target, Want, generate,
+    };
 
     /// The draft's own walk on the mock's clock, µs, every proposal.
     const DRAFT_US: u64 = 500;
@@ -2513,6 +2516,53 @@ mod tests {
         Draft::begin(r.spec.draft_mut(), &r.t, &[], r.last).unwrap();
         assert_eq!(r.choosing().gains(), gains);
         assert_eq!(r.choosing().batch_profile(), &[1.0; 3]);
+        assert_eq!(r.choosing().batch_tested, [0; 3]);
+    }
+
+    #[test]
+    fn batch_acceptance_resets_on_an_external_step() {
+        for held in [false, true] {
+            let mut r = Rig::with(
+                [0.40, 0.20, 0.10],
+                [0.6, 0.5, 0.4],
+                &[71_000, 95_000, 118_000],
+                Mode::Cost,
+                Rule::DEFAULT,
+            );
+            r.run(200);
+            let gains = r.choosing().gains().to_vec();
+            let tested = r.choosing().tested.clone();
+            r.choosing().round_ran(4, 1);
+            assert_eq!(r.choosing().batch_profile(), &[0.0, 1.0, 1.0]);
+            assert_eq!(r.choosing().batch_tested, [1, 0, 0]);
+
+            // A chooser-owned plain pass keeps this request's observations.
+            r.choosing().warm.clear();
+            r.choosing().warm.push_back(0);
+            r.run(1);
+            assert_eq!(r.passes.last().unwrap().rows, 1);
+            assert_eq!(r.choosing().batch_profile(), &[0.0, 1.0, 1.0]);
+            assert_eq!(r.choosing().batch_tested, [1, 0, 0]);
+
+            // A cached request can start with only its last prompt token.
+            let next = r.t.step(r.last, Want::Argmax).unwrap().argmax();
+            if held {
+                Draft::held(r.spec.draft_mut(), &mut r.t, r.last, next).unwrap();
+            } else {
+                Draft::stepped(r.spec.draft_mut(), &mut r.t, r.last, next).unwrap();
+            }
+            assert_eq!(r.choosing().batch_profile(), &[1.0; 3]);
+            assert_eq!(r.choosing().batch_tested, [0; 3]);
+            assert_eq!(r.choosing().gains(), gains);
+            assert_eq!(r.choosing().tested, tested);
+            assert!(r.choosing().flight.is_none());
+            assert_eq!(r.choosing().shadow.n, 0);
+
+            r.choosing().round_ran(4, 4);
+            assert_eq!(r.choosing().batch_profile(), &[1.0; 3]);
+            assert_eq!(r.choosing().batch_tested, [1; 3]);
+            assert_eq!(r.choosing().gains(), gains);
+        }
     }
 
     /// A prompt call of the draft's own shape ([`Choosing::prompt_by`]) forgets the pass in flight
@@ -2549,6 +2599,7 @@ mod tests {
             "the prompt left a pass in flight"
         );
         assert_eq!(r.choosing().batch_profile(), &[1.0; 3]);
+        assert_eq!(r.choosing().batch_tested, [0; 3]);
         r.choosing().round_ran(4, 1);
         assert_eq!(r.choosing().gains(), gains);
         assert_eq!(r.choosing().batch_profile(), &[0.0, 1.0, 1.0]);
