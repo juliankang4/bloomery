@@ -44,7 +44,7 @@
 //!   stride, which the load's stack-size check, the byte check and `c1` all
 //!   pass, and the header's down size does not).
 //!   PIN(2026-10-01): the file's card layers share one part layout —
-//!   `card_routed` admits the common card leg's types, not Q6_K, and
+//!   `accepts::routed_rule` admits the card leg's types, not Q6_K, and
 //!   `eligible` needs every stack of a layer routable, so the one Q5_K
 //!   gate/up layer, whose down is Q6_K, has no card slot — and per-layer part
 //!   sizes are not exercised by this file.

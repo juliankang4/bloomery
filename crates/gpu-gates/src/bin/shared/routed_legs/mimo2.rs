@@ -21,8 +21,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use super::{Adapter, Arm, Outcome, Refusal, floor_or, outcome_of, probed, refused_of, view_of};
-use bloomery_gpu_gates::GateError;
+use super::{Adapter, Arm, Outcome, Refusal, floor_or, outcome_by, probed, refused_of, view_of};
 use bloomery_gpu_gates::generate::choose_ctx;
 use bloomery_gpu_mimo2::swap;
 use gguf::Split;
@@ -65,7 +64,7 @@ fn arm(inputs: &Arc<PlanInputs>, split: &Split) -> Result<Arm, Outcome> {
         })
         .map(|chosen| chosen.slot_ctx),
     )
-    .map_err(|e| place_gate(&e))?;
+    .map_err(|e| outcome_by(&e, place_of))?;
     let unbudgeted = planned(inputs, &machine, ctx, &PlanLevers::default(), n);
     let inputs = Arc::clone(inputs);
     Ok(Arm {
@@ -102,19 +101,6 @@ fn plan_of<'a>(
     inputs
         .plan_with_slots(machine, ctx, levers, slots)
         .map_err(|e| place_of(&e))
-}
-
-/// A `choose_ctx` error as an outcome: the family's plan refusal keeps its
-/// name ([`place_of`]); anything else is the gate's common reading.
-fn place_gate(e: &GateError) -> Outcome {
-    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e.as_ref());
-    while let Some(c) = cur {
-        if let Some(p) = c.downcast_ref::<PlaceError>() {
-            return place_of(p);
-        }
-        cur = c.source();
-    }
-    outcome_of(e.as_ref())
 }
 
 /// A plan refusal as an outcome: the placement's own are named by

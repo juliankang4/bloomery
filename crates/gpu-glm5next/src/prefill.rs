@@ -130,6 +130,7 @@ use cuda_core::DeviceBuffer;
 use model::arch::glm5next::names::Sub;
 use model::arch::glm5next::place::{self, DenseForms, FrontWidths};
 use model::moe::UNION_MAX_COLS;
+use model::placement::kernels::DownForms;
 use runtime::layer::{FfnKind, MixerKind};
 pub use runtime::prompt::PrefillMode;
 use runtime::prompt::{
@@ -881,7 +882,8 @@ impl Bufs {
     /// `expert_ff` a routed expert's, over stores of `ctx` positions. The attention's partials
     /// cover `ctx` keys: a chunk selects only on stores past the dense
     /// positions, which are a list's width, so they cover a list too. The
-    /// card experts' scratch holds the card leg's buffers when `card_leg`.
+    /// card experts' scratch holds the card leg's buffers in the forms
+    /// `card_leg` names, when it names any.
     /// Load-time or first-prompt only.
     fn new(
         gpu: &Gpu,
@@ -890,7 +892,7 @@ impl Bufs {
         forms: DenseForms,
         ctx: usize,
         cap: usize,
-        card_leg: bool,
+        card_leg: DownForms,
     ) -> Result<Bufs, GpuError> {
         let stream = gpu.stream();
         let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);

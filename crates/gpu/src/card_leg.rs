@@ -51,9 +51,10 @@
 //! tables and keep a Q8_0 gate·up on the host). The launchers read an
 //! activation of more columns than a run uses (a [`LegBufs`] sized for `cap`
 //! tokens serves a unit of fewer in one launch).
-//! The buffers hold the down's activation in one form ([`LegBufs::for_down`]);
-//! a stack whose down entry reads the other is refused by name before the
-//! first launch.
+//! The buffers hold the down's activation in one form ([`LegBufs::for_down`])
+//! or in both, for a caller whose layers' downs read either
+//! ([`LegBufs::for_downs`]); a stack whose down entry reads a form they do not
+//! hold is refused by name before the first launch.
 //! A stack of any other type is refused by name when the stacks are read
 //! ([`LegStacks::of`]), and an entry the table names but the run has no arm
 //! for is refused by name at the launch. A tensor-parallel rank's stacks may
@@ -87,7 +88,7 @@ use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
 use model::placement::accepts::{self, LegArms};
-use model::placement::kernels::{self, DownAct, DownEntry, GateUpEntry, GemmEntry, q8_act_bytes};
+use model::placement::kernels::{self, DownAct, DownEntry, DownForms, GateUpEntry, GemmEntry};
 
 /// What the leg's errors name.
 const WHAT: &str = "CardLeg";
@@ -112,35 +113,44 @@ impl LegShape {
     }
 }
 
-/// The card slots' q8_1 columns in the form a down entry reads.
-enum ActH {
-    Q8Act(Q8Act),
-    Blocks32(Q8Blocks32),
+/// The card slots' q8_1 columns in each form the buffers hold.
+struct ActForms {
+    q8_act: Option<Q8Act>,
+    blocks32: Option<Q8Blocks32>,
 }
 
-impl ActH {
-    fn form(&self) -> DownAct {
-        match self {
-            ActH::Q8Act(_) => DownAct::Q8Act,
-            ActH::Blocks32(_) => DownAct::Q8Blocks32,
+impl ActForms {
+    /// The columns in the form `act`, `None` when the buffers hold none.
+    fn of(&mut self, act: DownAct) -> Option<ActH<'_>> {
+        match act {
+            DownAct::Q8Act => self.q8_act.as_mut().map(ActH::Q8Act),
+            DownAct::Q8Blocks32 => self.blocks32.as_mut().map(ActH::Blocks32),
         }
     }
 
     fn bytes(&self) -> usize {
-        match self {
-            ActH::Q8Act(a) => a.device_bytes(),
-            ActH::Blocks32(a) => a.q.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes(),
-        }
+        self.q8_act.as_ref().map_or(0, Q8Act::device_bytes)
+            + self
+                .blocks32
+                .as_ref()
+                .map_or(0, |a| a.q.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes())
     }
 }
 
+/// The card slots' q8_1 columns in the form a run's down entry reads.
+enum ActH<'b> {
+    Q8Act(&'b mut Q8Act),
+    Blocks32(&'b mut Q8Blocks32),
+}
+
 /// One run's buffers for up to `shape.cap` tokens: the normed rows' q8_1 form,
-/// the gate·up's rows, the card slots' q8_1 columns and the down's rows.
+/// the gate·up's rows, the card slots' q8_1 columns in each form the buffers
+/// hold and the down's rows.
 pub struct LegBufs {
     shape: LegShape,
     act_x: Q8Act,
     h: DeviceBuffer<f32>,
-    act_h: ActH,
+    act_h: ActForms,
     down: DeviceBuffer<f32>,
 }
 
@@ -160,10 +170,28 @@ impl LegBufs {
         shape: LegShape,
         act: DownAct,
     ) -> Result<LegBufs, GpuError> {
+        LegBufs::for_downs(stream, shape, DownForms::of(act))
+    }
+
+    /// The buffers for runs of `shape` over layers whose down entries read
+    /// either form of `downs`: the slots' columns in each, the rest shared, so
+    /// one run's rows land in [`LegBufs::down`] whatever its down's form.
+    /// Load-time or first-prompt only.
+    pub fn for_downs(
+        stream: &CudaStream,
+        shape: LegShape,
+        downs: DownForms,
+    ) -> Result<LegBufs, GpuError> {
         let slots = shape.slots();
-        let act_h = match act {
-            DownAct::Q8Act => ActH::Q8Act(Q8Act::with_slots(stream, slots, shape.ff)?),
-            DownAct::Q8Blocks32 => ActH::Blocks32(Q8Blocks32::with_slots(stream, shape.ff, slots)?),
+        let act_h = ActForms {
+            q8_act: downs
+                .holds(DownAct::Q8Act)
+                .then(|| Q8Act::with_slots(stream, slots, shape.ff))
+                .transpose()?,
+            blocks32: downs
+                .holds(DownAct::Q8Blocks32)
+                .then(|| Q8Blocks32::with_slots(stream, shape.ff, slots))
+                .transpose()?,
         };
         Ok(LegBufs {
             shape,
@@ -180,8 +208,8 @@ impl LegBufs {
         self.shape
     }
 
-    /// Device bytes of the buffers: [`leg_bytes_for`] of their shape and
-    /// form, as allocated.
+    /// Device bytes of the buffers, as allocated: [`kernels::leg_bytes`] of
+    /// their shape and forms.
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.act_x.device_bytes() + self.h.num_bytes() + self.act_h.bytes() + self.down.num_bytes()
@@ -204,31 +232,20 @@ pub fn leg_bytes(shape: LegShape) -> usize {
 }
 
 /// Device bytes a [`LegBufs::for_down`] of `shape` and `act` allocates,
-/// counted before it does: the normed rows' q8_1 form (`cap` columns of `n`),
-/// the gate·up's rows, the card slots' q8_1 columns (`cap · slots_per_col` of
-/// `ff`) and the down's rows.
+/// counted before it does: [`kernels::leg_bytes`] of the one form, the one
+/// formula of them (the normed rows' q8_1 form, `cap` columns of `n`; the
+/// gate·up's rows; the card slots' q8_1 columns, `cap · slots_per_col` of
+/// `ff`; the down's rows).
 #[must_use]
 pub fn leg_bytes_for(shape: LegShape, act: DownAct) -> usize {
-    let slots = shape.slots();
-    let f = size_of::<f32>();
-    let act_h = match act {
-        DownAct::Q8Act => usize::try_from(q8_act_bytes(slots as u64, shape.ff as u64))
-            .expect("the q8_1 activation's bytes fit a usize"),
-        DownAct::Q8Blocks32 => q8_blocks32_bytes(slots, shape.ff),
-    };
-    usize::try_from(q8_act_bytes(shape.cap as u64, shape.n as u64))
-        .expect("the q8_1 activation's bytes fit a usize")
-        + f * slots * shape.ff
-        + act_h
-        + f * slots * shape.n
-}
-
-/// Device bytes of a [`Q8Blocks32`] of `cols` columns of `k` values (a multiple
-/// of 32): per column `256 · ceil(k_blocks / 32)` words of `q` and `k_blocks`
-/// values each of `s8` and `d8`, of 4 bytes, `k_blocks = k / 32`.
-const fn q8_blocks32_bytes(cols: usize, k: usize) -> usize {
-    let k_blocks = k / 32;
-    cols * 4 * (256 * k_blocks.div_ceil(32) + 2 * k_blocks)
+    let b = kernels::leg_bytes(
+        shape.cap as u64,
+        shape.slots_per_col as u64,
+        shape.n as u64,
+        shape.ff as u64,
+        DownForms::of(act),
+    );
+    usize::try_from(b).expect("the leg's bytes fit a usize")
 }
 
 /// A resident routed stack's device form: the file's blocks as words
@@ -607,6 +624,24 @@ impl<'a> LegStacks<'a> {
         Ok(LegStacks { gate, up, down })
     }
 
+    /// The gate's and the up's type.
+    #[must_use]
+    pub fn gate_up_ty(&self) -> GgmlType {
+        self.gate.ty
+    }
+
+    /// The down's type.
+    #[must_use]
+    pub fn down_ty(&self) -> GgmlType {
+        self.down.ty
+    }
+
+    /// The gate's, up's and down's words, for kernels over the file's blocks
+    /// (the grouped tiles); a stack in another layout is refused by name.
+    pub fn words(&self) -> Result<[&'a DeviceTensor<u32>; 3], GpuError> {
+        Ok([self.gate.words()?, self.up.words()?, self.down.words()?])
+    }
+
     /// The three stacks as a prompt walk's route GEMMs read them
     /// ([`StackW::route`]), `[gate, up, down]`: each stack's own type through
     /// the kernel table's GEMM entry. A stack no route GEMM reads is refused
@@ -679,7 +714,7 @@ struct Scratch<'a> {
     shape: LegShape,
     act_x: &'a mut Q8Act,
     h: &'a mut DeviceBuffer<f32>,
-    act_h: &'a mut ActH,
+    act_h: &'a mut ActForms,
 }
 
 impl CardLeg {
@@ -805,19 +840,16 @@ impl CardLeg {
             });
         }
         let st = run.stacks;
-        if let Some((_, form)) = kernels::down(st.down.ty)
-            && form != act_h.form()
-        {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "the down stack {} of {} reads {form:?} columns; the buffers hold {:?}",
-                    st.down.name,
-                    st.down.ty,
-                    act_h.form()
-                ),
-            });
-        }
+        let Some((_, form)) = kernels::down(st.down.ty) else {
+            return Err(st.down.unrun());
+        };
+        let mut act_h = act_h.of(form).ok_or_else(|| GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "the down stack {} of {} reads {form:?} columns, which the buffers do not hold",
+                st.down.name, st.down.ty
+            ),
+        })?;
         let stream = gpu.stream();
         let fault = gpu.layer_sink(run.layer)?;
         let slots = run.m * slots_per_col;
@@ -887,12 +919,12 @@ impl CardLeg {
             sel: run.sel,
             n_card: run.n_card,
         };
-        match act_h {
+        match &mut act_h {
             ActH::Q8Act(act) => gpu.q4k_sel().enqueue_quantize_sel(stream, &q, fault, act)?,
             ActH::Blocks32(act) => gpu.q5().enqueue_quantize_q8_sel(stream, &q, act, fault)?,
         }
         let (sel, rows_per_expert) = (run.sel, n);
-        match (kernels::down(st.down.ty), &*act_h) {
+        match (kernels::down(st.down.ty), &act_h) {
             (Some((DownEntry::Q4k, DownAct::Q8Act)), ActH::Q8Act(act)) => {
                 gpu.q4k_sel().enqueue_gemv_q4k_sel(
                     stream,
@@ -1202,10 +1234,11 @@ impl Relu2Bufs {
 pub fn relu2_leg_bytes(shape: LegShape) -> usize {
     let slots = shape.slots();
     let f = size_of::<f32>();
-    q8_blocks32_bytes(slots, shape.n)
-        + f * slots * shape.ff
-        + q8_blocks32_bytes(slots, shape.ff)
-        + f * slots * shape.n
+    let b32 = |k: usize| {
+        usize::try_from(kernels::q8_blocks32_bytes(slots as u64, k as u64))
+            .expect("the 32-value activation's bytes fit a usize")
+    };
+    b32(shape.n) + f * slots * shape.ff + b32(shape.ff) + f * slots * shape.n
 }
 
 /// What [`Relu2Leg::enqueue`] reads: layer `layer`'s `stacks`, `m` tokens'
@@ -1362,6 +1395,8 @@ pub(crate) mod tests {
     const CAP: usize = 3;
     /// What a slot the run leaves alone still holds.
     const SENT: f32 = 1.0e30;
+    /// Buffers of both down forms.
+    const BOTH: DownForms = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
     /// Three tokens' places: duplicates, every card expert, and slots the
     /// card does not serve.
     const SEL: [u32; CAP * SPC] = [
@@ -2075,8 +2110,9 @@ pub(crate) mod tests {
 
     /// The leg's NVFP4 arms against the launches the table names, run by hand
     /// on buffers of exactly the run's slots: the gate·up over a `Q8Act`, the
-    /// down over the 32-value form the buffers hold for it, for a run of every
-    /// token the buffers hold and of fewer. A slot the card serves holds a
+    /// down over the 32-value form of buffers that hold both forms (a load
+    /// whose layers' downs read either), for a run of every token the buffers
+    /// hold and of fewer. A slot the card serves holds a
     /// finite value the run wrote, a host slot what it held, and the rows are
     /// the hand launches' bit for bit; a stack the leg holds in planes is
     /// refused by the relu² form by name.
@@ -2101,8 +2137,7 @@ pub(crate) mod tests {
         let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
         let sel = DeviceBuffer::from_host(stream, &SEL).expect("the places");
         let rule = Act::SwigluClamp { limit: 7.0 };
-        let mut bufs =
-            LegBufs::for_down(stream, SHAPE, DownAct::Q8Blocks32).expect("the leg's buffers");
+        let mut bufs = LegBufs::for_downs(stream, SHAPE, BOTH).expect("the leg's buffers");
         let plane = |name: &str| w.nvfp4_stack(WHAT, name).expect("a resident stack");
         for m in [CAP, CAP - 1] {
             let case = format!("NVFP4, {m} tokens");
@@ -2341,7 +2376,9 @@ pub(crate) mod tests {
     /// warp's 32, are read through the leg's own quantize steps and buffers;
     /// the places and rows are functions of the token, so the same token holds
     /// the same slots in every run. The oracle is the leg's own run of that one
-    /// token in buffers of one token. Each card slot's rows must equal its
+    /// token in buffers of one token and its down's one form; the runs' buffers
+    /// hold both forms ([`LegBufs::for_downs`]), so each down reads the columns
+    /// of its own form beside the other's. Each card slot's rows must equal its
     /// oracle's bit for bit, a host slot must keep its sentinel, and nothing
     /// past the run's slots may be written. Every case and `m` is judged, and
     /// the failures are listed together, each naming the slot and its column.
@@ -2424,7 +2461,7 @@ pub(crate) mod tests {
                 .collect();
 
             for m in WIDE_RUNS {
-                let mut bufs = LegBufs::for_down(stream, WIDE_SHAPE, form).expect("the buffers");
+                let mut bufs = LegBufs::for_downs(stream, WIDE_SHAPE, BOTH).expect("the buffers");
                 let got = leg_rows(&gpu, &leg, &mut bufs, &stacks, &normed, &sel, m);
                 let slots = m * SPC;
                 let mut bad = Vec::new();
@@ -2470,7 +2507,9 @@ pub(crate) mod tests {
     }
 
     /// The buffers of each activation form hold the bytes [`leg_bytes_for`]
-    /// counts for their shape.
+    /// counts for their shape, and buffers of both forms the bytes
+    /// [`kernels::leg_bytes`] counts for the pair: each form's columns beside
+    /// one set of the rest.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_the_buffers_hold_the_counted_bytes_of_each_form() {
@@ -2482,6 +2521,13 @@ pub(crate) mod tests {
         }
         let bufs = LegBufs::new(gpu.stream(), shape).expect("the buffers");
         assert_eq!(bufs.bytes(), leg_bytes(shape));
+        let both = LegBufs::for_downs(gpu.stream(), shape, BOTH).expect("the buffers");
+        let b32_cols = kernels::q8_blocks32_bytes((CAP * SPC) as u64, FF as u64);
+        assert_eq!(both.bytes() as u64, leg_bytes(shape) as u64 + b32_cols);
+        assert_eq!(
+            both.bytes() as u64,
+            kernels::leg_bytes(CAP as u64, SPC as u64, N as u64, FF as u64, BOTH)
+        );
     }
 
     /// A stack routes by the GEMM entry the kernel table names for its type

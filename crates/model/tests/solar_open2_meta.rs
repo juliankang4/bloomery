@@ -200,7 +200,8 @@ fn hw_solar_open2_spec_iq4_xs() {
 #[test]
 #[ignore = "needs the Solar-Open2-250B Q4_K_M shards on the box"]
 fn hw_solar_open2_plan_a() {
-    use model::arch::solar2::place::{PlaceError, PlanInputs, card_routed};
+    use model::arch::solar2::place::{PlaceError, PlanInputs};
+    use model::placement::kernels::card_runs;
     use model::placement::workstation::{self, TierBatchBytes};
     use model::placement::{PlanLevers, Role};
 
@@ -276,7 +277,7 @@ fn hw_solar_open2_plan_a() {
             .tensors
             .iter()
             .filter(|t| t.role == Role::RoutedExperts && t.layer == Some(l))
-            .all(|t| card_routed(t.ty).is_some())
+            .all(|t| card_runs(t.ty))
     };
     let candidates: Vec<usize> = (0..layers).filter(|&l| candidate(l)).collect();
     row(

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use super::glmplace;
 use super::{
-    Adapter, Arm, Outcome, Refusal, census, floor_or, outcome_of, probed, refused_of, view_of,
+    Adapter, Arm, Outcome, Refusal, census, floor_or, outcome_by, probed, refused_of, view_of,
 };
 use app::mtp::MtpBody;
 use bloomery_gpu_gates::GateError;
@@ -27,7 +27,7 @@ use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::residency38::glm_machine;
 use bloomery_gpu_glm5next::{Body, checkpoint_price};
 use bloomery_levers::{GlmAt, glm_unset};
-use gguf::Split;
+use gguf::{GgmlType, Split};
 use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlaceError, PlanInputs};
 use model::placement::ctx_ask::DEFAULT_SLOTS;
 use model::placement::{Machine, Plan, PlanLevers};
@@ -60,6 +60,18 @@ impl Adapter for Row {
             // The file is read once; a refusal of it is each arm's.
             Err(refusal) => vec![Err(refusal.clone()), Err(refusal)],
         }
+    }
+
+    /// The NVFP4 stacks the body's leg holds in their planes, alone and beside
+    /// a K-quant part, and beside the Q6_K down it leaves to the host.
+    fn extra_triples(&self) -> Vec<[GgmlType; 3]> {
+        use GgmlType::{NVFP4, Q4_K, Q6_K};
+        vec![
+            [NVFP4; 3],
+            [NVFP4, NVFP4, Q4_K],
+            [Q4_K, Q4_K, NVFP4],
+            [NVFP4, NVFP4, Q6_K],
+        ]
     }
 }
 
@@ -143,13 +155,13 @@ fn choose(
         )
     })
     .map(|chosen| chosen.place)
-    .map_err(|e| outcome_of(e.as_ref()))
+    .map_err(|e| outcome_by(&e, place_of))
 }
 
 /// The machine a load of `slots` sequences of `ctx` positions plans on:
 /// `glm_machine` of `place`, its slots' checkpoints declared.
 fn machine(place: Place, inputs: &PlanInputs, ctx: u64, slots: usize) -> Result<Machine, Outcome> {
-    machine_of(place, inputs, ctx, slots).map_err(|e| outcome_of(e.as_ref()))
+    machine_of(place, inputs, ctx, slots).map_err(|e| outcome_by(&e, place_of))
 }
 
 /// [`machine`] in the planner's own error, as the seat's choice probes it.
@@ -189,7 +201,7 @@ fn fit(
         )
         .and_then(|(ctx, _)| Ok(u64::try_from(ctx)?)),
     )
-    .map_err(|e| outcome_of(e.as_ref()))?;
+    .map_err(|e| outcome_by(&e, place_of))?;
     Ok((machine(place, inputs, ctx, slots)?, ctx))
 }
 
@@ -230,6 +242,7 @@ fn place_of(p: &PlaceError) -> Outcome {
         PlaceError::Placement(e) => return refused_of(e),
         PlaceError::PastOracle { .. } => "past-oracle",
         PlaceError::FrontOver { .. } => "front-over",
+        PlaceError::TierLeg { .. } => "tier-leg",
         PlaceError::Broken(_) | PlaceError::NextnCards { .. } | PlaceError::Slots { .. } => {
             return Outcome::Red(p.to_string());
         }

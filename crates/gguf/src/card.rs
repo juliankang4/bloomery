@@ -629,7 +629,7 @@ impl CardFormat {
     /// draft's experts). A card expert kernel does read q5_K
     /// (`kq_gate_up_act_q5k`, `q5k_gemv_sel`), which that column leaves out,
     /// and the program that runs them names q5_K in its own `RoutedFormat`
-    /// (glm5next's `card_routed`). An nvfp4 stack loads in its planes, which
+    /// (`placement::accepts::routed_rule`). An nvfp4 stack loads in its planes, which
     /// the card leg's nvfp4 pair reads (`placement::kernels::card_planes_runs`).
     /// A stack of a type with none stays on the host.
     #[must_use]

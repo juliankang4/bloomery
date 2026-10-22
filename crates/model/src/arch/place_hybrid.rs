@@ -23,29 +23,20 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use bloomery_placement::slots::{SeqTerms, Stores};
-use gguf::GgmlType;
 use models::{DeltaRule, Gqa, Mixer, ModelSpec, RopeMode, Selector};
 use runtime::stores::{self, Rows};
 
 use crate::arch::coverage;
-use crate::placement::accepts::{leg_card_format, program_of, routed_rule};
+use crate::placement::accepts::{program_of, routed_rule};
 use crate::placement::ctx_ask::{PlanRefusal, Short, Side};
 use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
-    self, Card, CardFormat, CardTotals, KvBytes, Machine, ModelTensors, PlacementError, Plan,
-    PlanLevers, Unimplemented, Violation, checked_beside, joined,
+    self, Card, CardTotals, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
+    Unimplemented, Violation, checked_beside, joined,
 };
 
 // The prompt batch a window ring keeps room for is the batch the card walks the prompt in.
 const _: () = assert!(stores::PROMPT_BATCH == crate::moe::UNION_MAX_COLS as u64);
-
-/// The routed stacks the card experts read, each in its card format ([`leg_card_format`]): the
-/// types the common card leg runs ([`placement::kernels::card_runs`]). The rule reads a stack's
-/// type alone; a layer with a stack of any other type keeps its experts on the host.
-#[must_use]
-pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    placement::kernels::card_runs(ty).then(|| leg_card_format(ty))
-}
 
 /// What a plan of a hybrid file is made from, read from its headers. `H` is the family's own
 /// hyperparameters, carried for its body and never read here.
@@ -271,7 +262,8 @@ impl<H> PlanInputs<H> {
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions under the placement's
-    /// `levers`: the expert rule on the layers whose routed stacks [`card_routed`] runs, each such
+    /// `levers`: the expert rule on the layers whose routed stacks the program's rule carries
+    /// ([`routed_rule`]), each such
     /// layer's id prefix on the card as far as its budget holds them, the next ids on the expert
     /// tier card of a machine that names one, the rest on the host; refused by name a context of no
     /// position, a machine that hangs an expert tier card where the body serves none
@@ -602,10 +594,13 @@ impl KvBytes for KvLayout {
 
 #[cfg(test)]
 mod tests {
+    use gguf::GgmlType;
     use models::{DeltaKind, Gqa, KdaGate, Mamba2, OutGate, PoolRule, Rope};
     use runtime::stores::ring_rows;
 
     use super::*;
+    use crate::placement::accepts::Program;
+    use crate::placement::{CardFormat, RoutedRule};
 
     /// A GQA layer of `kv` key heads, key width `k` and value width `v`, a window of `window`
     /// positions or none, and a rope of `rope` (base, dims) or none.
@@ -941,9 +936,10 @@ mod tests {
     }
 
     /// A stack is card-routed when the common kernel table gives its type the entries this
-    /// program's leg launches, and not otherwise: the types the table runs on the card for other
-    /// families (Q8_0 and IQ4_NL) and the ones it has no row for (Q2_K, the floats) keep their
-    /// layer's experts on the host.
+    /// program's leg launches, and not otherwise, in either part, for each body on the common leg
+    /// ([`routed_rule`]): the types the table runs on the card for other families (Q8_0 and
+    /// IQ4_NL) and the ones it has no row for (Q2_K, the floats) keep their layer's experts on the
+    /// host.
     // PIN(2026-10-11): card_runs now runs Q4_K/Q5_K through the common leg.
     // PIN(2026-10-11): the leg also runs IQ2_XS, IQ3_XXS and IQ4_XS (the raw-block entries of
     // `iq_sel.rs`), so those three are card-routed too.
@@ -951,6 +947,25 @@ mod tests {
     // card-routed too.
     #[test]
     fn only_the_stacks_the_leg_runs_are_card_routed() {
+        let rules = [
+            Program::Mimo2Body,
+            Program::Solar2Body,
+            Program::MiniMaxM3Body,
+        ]
+        .map(|p| {
+            let RoutedRule::Leg { gate_up, down } = routed_rule(p) else {
+                panic!("{p:?}: a leg rule");
+            };
+            (p, gate_up, down)
+        });
+        let card_routed = |ty: GgmlType| {
+            let parts: Vec<_> = rules
+                .iter()
+                .flat_map(|(_, gate_up, down)| [gate_up(ty), down(ty)])
+                .collect();
+            assert!(parts.windows(2).all(|w| w[0] == w[1]), "{ty}: {rules:?}");
+            parts[0]
+        };
         for ty in [
             GgmlType::MXFP4,
             GgmlType::Q4_K,

@@ -16,7 +16,7 @@ use crate::placement::PlacementError;
 
 // The ring rule's owner is `runtime::stores`; these names stay on this path for
 // `gpu-mimo2` and the gates, which import them from here.
-pub use place_hybrid::{KvLayout, PlaceError, card_routed};
+pub use place_hybrid::{KvLayout, PlaceError};
 pub use runtime::stores::{Rows, cut_depth_keeps};
 
 /// What a plan of a mimo2 file is made from, read from its headers.

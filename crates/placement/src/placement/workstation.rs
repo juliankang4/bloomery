@@ -17,7 +17,7 @@ pub use super::devices::{
 #[cfg(test)]
 use super::nodes::{Fabric, Nodes};
 use super::{Card, Host, HostTotals, Machine, Node, PlacementError, Plan, UnifiedPool};
-use crate::kernels::q8_act_bytes;
+use crate::kernels::{DownAct, DownForms, leg_bytes, q8_act_bytes};
 
 pub const MIB: u64 = 1 << 20;
 
@@ -431,14 +431,11 @@ pub const fn walk_a_tile_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: 
 /// The tier's chunk scratch for blocks of rows of `n_embd`, `n_used` slots a
 /// token, through experts of `ff`, cut in chunks of `chunk` tokens: one run of
 /// the card leg's buffers (`bloomery_gpu::card_leg::LegBufs`, the GLM-5.3-Flash
-/// tier), in place of the tile path's scratch. Per `LegBufs` field: the q8_1
-/// of a chunk's rows (`act_x`, a column a token), its gate·up rows (`h`, `ff`
-/// values a slot), the q8_1 of its slots' columns (`act_h`, a column a slot
-/// of `ff`) and its down rows (`down`, `n_embd` values a slot).
+/// tier) with its slots' columns in the 128-value q8_1 form the tier's downs
+/// read ([`leg_bytes`]), in place of the tile path's scratch.
 #[must_use]
 pub const fn tier_chunk_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, chunk: u64) -> u64 {
-    let slots = chunk * n_used;
-    q8_act_bytes(chunk, n_embd) + 4 * slots * ff + q8_act_bytes(slots, ff) + 4 * slots * n_embd
+    leg_bytes(chunk, n_used, n_embd, ff, DownForms::of(DownAct::Q8Act))
 }
 
 /// The host's part of the tier's prompt-batch service: per exchange set, the

@@ -279,36 +279,48 @@ pub const fn embed_of_widened(ty: GgmlType) -> Option<EmbedEntry> {
     }
 }
 
+/// Whether a card leg whose buffers hold the form each layer's down reads
+/// runs a routed gate or up stack of `ty`: the common leg's gate·up arms in
+/// the file's blocks ([`kernels::card_gate_up_runs`]) or in NVFP4's planes
+/// ([`kernels::card_planes_runs`]).
+#[must_use]
+pub const fn planes_leg_gate_up(ty: GgmlType) -> bool {
+    kernels::card_gate_up_runs(ty) || kernels::card_planes_runs(ty)
+}
+
+/// Whether a card leg whose buffers hold the form each layer's down reads
+/// runs a routed down stack of `ty`: the common leg's down arms in the file's
+/// blocks over either form ([`kernels::card_down_runs`]: the 128-value
+/// `Q8Act` or the 32-value `Q8Blocks32`) or in NVFP4's planes
+/// ([`kernels::card_planes_runs`], over `Q8Blocks32`).
+#[must_use]
+pub const fn planes_leg_down(ty: GgmlType) -> bool {
+    kernels::card_down_runs(ty) || kernels::card_planes_runs(ty)
+}
+
 /// The card gate·up entry `Body38`'s card leg (`crates/gpu/src/arch/qwen3moe/card38.rs`)
 /// runs a routed gate or up stack of `ty` with: the table's [`kernels::gate_up`]
-/// row of the K-quants, i-quants and NVFP4 the leg launches (`kq_gate_up_act_q4k`,
-/// `kq_gate_up_act_q5k`, `iq3_xxs_gate_up_sel`, `iq4_xs_gate_up_sel`,
-/// `nvfp4_gate_up_sel`): a Q4_K, Q5_K, IQ3_XXS, IQ4_XS or NVFP4.
+/// row of a type [`planes_leg_gate_up`] admits whose prompt GEMM the table names
+/// ([`kernels::gemm`]), which its prompt walk reads the stack through.
 #[must_use]
 pub const fn qwen38_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
-    match kernels::gate_up(ty) {
-        Some(
-            e @ (GateUpEntry::Q4k
-            | GateUpEntry::Q5k
-            | GateUpEntry::Iq3xxs
-            | GateUpEntry::Iq4xs
-            | GateUpEntry::Nvfp4),
-        ) => Some(e),
-        _ => None,
+    if planes_leg_gate_up(ty) && kernels::gemm(ty).is_some() {
+        kernels::gate_up(ty)
+    } else {
+        None
     }
 }
 
 /// The card down entry `Body38`'s card leg runs a routed down stack of `ty`
-/// with: the table's [`kernels::down`] row over the 32-value activation the leg
-/// quantizes ([`DownAct::Q8Blocks32`]: `q5_1_gemv_sel`, `q8_0_gemv_sel32`,
-/// `iq4_nl_gemv_sel32`, `nvfp4_gemv_sel32`): a Q5_1, Q8_0, IQ4_NL or NVFP4.
+/// with: the table's [`kernels::down`] row of a type [`planes_leg_down`] admits
+/// over the one form its buffers hold, the 32-value [`DownAct::Q8Blocks32`],
+/// whose prompt GEMM the table names.
 #[must_use]
 pub const fn qwen38_down(ty: GgmlType) -> Option<DownEntry> {
     match kernels::down(ty) {
-        Some((
-            e @ (DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl | DownEntry::Nvfp4),
-            DownAct::Q8Blocks32,
-        )) => Some(e),
+        Some((e, DownAct::Q8Blocks32)) if planes_leg_down(ty) && kernels::gemm(ty).is_some() => {
+            Some(e)
+        }
         _ => None,
     }
 }
@@ -370,10 +382,11 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: |ty| qwen38_gate_up(ty).is_some(),
             down: |ty| qwen38_down(ty).is_some(),
         }),
-        Program::Glm5nextBody
-        | Program::Mimo2Body
-        | Program::Solar2Body
-        | Program::MiniMaxM3Body => Some(LegArms {
+        Program::Glm5nextBody => Some(LegArms {
+            gate_up: planes_leg_gate_up,
+            down: planes_leg_down,
+        }),
+        Program::Mimo2Body | Program::Solar2Body | Program::MiniMaxM3Body => Some(LegArms {
             gate_up: kernels::card_gate_up_runs,
             down: kernels::card_down_runs,
         }),
@@ -404,11 +417,13 @@ pub fn leg_runs(p: Program, [gate, up, down]: [GgmlType; 3]) -> Option<bool> {
 
 /// Program `p`'s plan rule for its routed stacks ([`RoutedRule`]): on a card
 /// leg, each part by the arm its load reads ([`leg_runs`]), so a layer the
-/// plan gives card experts is one the load runs. The common leg's plan
-/// carries a type on the card only where both its gate·up and its down
-/// launches read it ([`kernels::card_runs`]), in every part. V4.1's chain
-/// runs [`DS41_LEG`] alone. A program with no routed expert puts none on a
-/// card.
+/// plan gives card experts is one the load runs. The common leg's plan, over
+/// buffers of the 128-value form alone, carries a type on the card only where
+/// both its gate·up and its down launches read it ([`kernels::card_runs`]),
+/// in every part; the glm5next body's, whose buffers hold the form each card
+/// layer's down reads, carries each part by its arm ([`planes_leg_gate_up`],
+/// [`planes_leg_down`]). V4.1's chain runs [`DS41_LEG`] alone. A program with
+/// no routed expert puts none on a card.
 #[must_use]
 pub fn routed_rule(p: Program) -> RoutedRule {
     match p {
@@ -420,10 +435,11 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             gate_up: |ty| qwen38_gate_up(ty).map(|_| leg_card_format(ty)),
             down: |ty| qwen38_down(ty).map(|_| leg_card_format(ty)),
         },
-        Program::Glm5nextBody
-        | Program::Mimo2Body
-        | Program::Solar2Body
-        | Program::MiniMaxM3Body => RoutedRule::Leg {
+        Program::Glm5nextBody => RoutedRule::Leg {
+            gate_up: |ty| planes_leg_gate_up(ty).then(|| leg_card_format(ty)),
+            down: |ty| planes_leg_down(ty).then(|| leg_card_format(ty)),
+        },
+        Program::Mimo2Body | Program::Solar2Body | Program::MiniMaxM3Body => RoutedRule::Leg {
             gate_up: common_leg_card,
             down: common_leg_card,
         },
@@ -459,7 +475,10 @@ fn resident_down_card(ty: GgmlType) -> Option<CardFormat> {
     }
 }
 
-/// The common leg's plan arm: a type both its gate·up and down launches read.
+/// The common leg's plan arm, in every part ([`routed_rule`] of the mimo2,
+/// solar2 and minimax-m3 bodies): a type both its gate·up and down launches
+/// read ([`kernels::card_runs`]), in its card format; a layer with a stack of
+/// any other type keeps its experts on the host.
 fn common_leg_card(ty: GgmlType) -> Option<CardFormat> {
     kernels::card_runs(ty).then(|| leg_card_format(ty))
 }
@@ -644,8 +663,10 @@ mod tests {
     }
 
     /// Qwen3.8's arms are the card leg's launches: a Q4_K, Q5_K, IQ3_XXS,
-    /// IQ4_XS or NVFP4 gate·up and a Q5_1, Q8_0, IQ4_NL or NVFP4 down, no
-    /// other type.
+    /// IQ3_S, IQ4_XS or NVFP4 gate·up and a Q5_1, Q8_0, IQ4_NL or NVFP4 down,
+    /// no other type. Mutants: the prompt GEMM left out of the gate·up (MXFP4
+    /// and IQ2_XS join it); the down's form left out (the `Q8Act` downs join
+    /// it).
     #[test]
     fn qwen38_arms_are_its_legs_launches() {
         for ty in types() {
@@ -656,6 +677,7 @@ mod tests {
                     GgmlType::Q4_K
                         | GgmlType::Q5_K
                         | GgmlType::IQ3_XXS
+                        | GgmlType::IQ3_S
                         | GgmlType::IQ4_XS
                         | GgmlType::NVFP4
                 ),
@@ -670,6 +692,53 @@ mod tests {
                 "{ty} down"
             );
         }
+    }
+
+    /// The glm5next body's arms are the common leg's in the file's blocks and
+    /// NVFP4's in its planes, its downs over either form, and its plan rule
+    /// reads them part by part (NVFP4 in its planes, the rest in the file's
+    /// blocks): a Q4_K, Q5_K, MXFP4, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS or NVFP4
+    /// gate·up and those or a Q5_1, Q8_0 or IQ4_NL down; no Q6_K down, which
+    /// the host tier keeps. The common leg's plan, over 128-value buffers alone,
+    /// keeps NVFP4 and the 32-value downs on the host. Mutants: glm5next's rule
+    /// left on the common leg's (an NVFP4 layer stays on the host); NVFP4 left
+    /// out of the down arm.
+    #[test]
+    fn glm5next_arms_are_the_leg_with_planes_over_both_forms() {
+        use GgmlType::{
+            IQ2_XS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, NVFP4, Q4_K, Q5_1, Q5_K, Q8_0,
+        };
+        let gate_up = [Q4_K, Q5_K, MXFP4, NVFP4, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS];
+        let down = [
+            Q5_1, Q8_0, Q4_K, Q5_K, MXFP4, NVFP4, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ4_XS,
+        ];
+        let arms = leg_arms(Program::Glm5nextBody).expect("a card leg");
+        let RoutedRule::Leg {
+            gate_up: rule_gate_up,
+            down: rule_down,
+        } = routed_rule(Program::Glm5nextBody)
+        else {
+            panic!("a leg rule");
+        };
+        for ty in types() {
+            assert_eq!((arms.gate_up)(ty), gate_up.contains(&ty), "{ty} gate·up");
+            assert_eq!((arms.down)(ty), down.contains(&ty), "{ty} down");
+            let format = if ty == NVFP4 {
+                CardFormat::Nvfp4Planes
+            } else {
+                CardFormat::KQuant
+            };
+            let card = |admits: bool| admits.then_some(format);
+            assert_eq!(
+                rule_gate_up(ty),
+                card((arms.gate_up)(ty)),
+                "{ty} gate·up rule"
+            );
+            assert_eq!(rule_down(ty), card((arms.down)(ty)), "{ty} down rule");
+        }
+        assert_eq!(leg_runs(Program::Glm5nextBody, [NVFP4; 3]), Some(true));
+        assert_eq!(common_leg_card(NVFP4), None);
+        assert_eq!(common_leg_card(Q8_0), None);
     }
 
     /// The raon1 body's arms are the common leg's launches and the Q5_0 down: a gate·up of

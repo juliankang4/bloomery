@@ -7,16 +7,20 @@
 //! **Parts.** An expert is three parts in stack order: gate and up (`ff`
 //! rows of `n_embd` values each) and down (`n_embd` rows of `ff`). The
 //! parts are each layer's own as the file holds them.
-//! [`model::arch::glm5next::place::card_routed`] admits a type the common card
-//! leg runs in every role (`placement::kernels::card_runs`), and a layer takes
-//! card slots only when every one of its stacks is routable, so a layer with a
-//! stack of another type (a Q6_K down, which the leg has no down arm for)
-//! keeps its experts whole on the host. On the
+//! The body's plan rule (`placement::accepts::routed_rule`) admits each part
+//! by the card leg's arm for it, and a layer takes card slots only when every
+//! one of its stacks is routable, so a layer with a stack of another type (a
+//! Q6_K down, which the leg has no down arm for) keeps its experts whole on
+//! the host. On the
 //! card each part of slot `s` is the file's bytes of that expert at byte
 //! `s · part` of its layer's stack, which the placed load uploads as file
 //! bytes in slot order — no convert step, and no r8 sidecar (that format is
 //! Q3_K's alone, and no GLM stack is one), so a staged part is its slot's
-//! bytes as it stands.
+//! bytes as it stands. An NVFP4 stack loads in its planes, which no staged
+//! part writes; the common file source takes a carded layer's stacks in the
+//! file's blocks alone and refuses an NVFP4 one by name
+//! (`bloomery_gpu::host::swap_source::FileSwap`), so no machine starts over
+//! one.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::host::swap_source::{PlanStacks, StackFacts};

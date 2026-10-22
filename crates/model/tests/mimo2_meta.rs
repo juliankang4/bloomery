@@ -190,7 +190,7 @@ fn hw_mimo2_spec() {
 // row-gathered table.
 // PIN(2026-10-10): an expert is 13,369,344 B = 3 stacks × 4,096 × 2,048 values × 17/32 B (MXFP4), the
 // routed experts 47 × 256 = 12,032 and 160,859,947,008 B [derived]. The card experts run
-// (`place::card_routed`: the MXFP4 stacks the common pair reads), so the plan puts on the card as many
+// (`accepts::routed_rule`: the MXFP4 stacks the common pair reads), so the plan puts on the card as many
 // as its budget holds, one at a time on the routed layer with the fewest (the first on a tie): the dense
 // layer 0 none, the routed layers' counts non-increasing and within one of each other. The count N
 // is bounded by the budget arithmetic [derived]: the card's usable bytes less 1,600 MiB (context 512,

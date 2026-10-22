@@ -17,7 +17,7 @@ use crate::placement::kernels::q8_act_bytes;
 use crate::placement::workstation::TierBatchBytes;
 use crate::placement::{PlacementError, workstation};
 
-pub use place_hybrid::{KvLayout, PlaceError, card_routed};
+pub use place_hybrid::{KvLayout, PlaceError};
 
 /// What a plan of a Solar-Open2 file is made from, read from its headers.
 pub type PlanInputs = place_hybrid::PlanInputs<Hparams>;

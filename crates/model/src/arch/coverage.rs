@@ -17,7 +17,8 @@
 //! any program's pin reads, is not an item; the program itself is one.
 
 use bloomery_placement::accepts::{
-    BOLT_LEG, dense_by_name, embed_of_widened, head_of_widened, qwen3moe_dense, resident_down_runs,
+    BOLT_LEG, dense_by_name, embed_of_widened, head_of_widened, leg_arms, qwen3moe_dense,
+    resident_down_runs,
 };
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
 use bloomery_placement::accepts::{prompt_leg_down, prompt_leg_gate_up};
@@ -1561,10 +1562,11 @@ fn qwen38_card_routed(ty: GgmlType) -> bool {
     crate::arch::qwen35moe::place::card_routed(ty).is_some()
 }
 
-/// The glm5next body's card rule: the types its card experts load
-/// ([`card_routed`](crate::arch::glm5next::place::card_routed)).
+/// The glm5next body's card rule: a type its card leg reads in some part
+/// ([`leg_arms`], whose arms its plan rule reads by part), the type union
+/// coverage reads as it does qwen4exp's.
 fn glm5next_card_routed(ty: GgmlType) -> bool {
-    crate::arch::glm5next::place::card_routed(ty).is_some()
+    leg_arms(Program::Glm5nextBody).is_some_and(|a| (a.gate_up)(ty) || (a.down)(ty))
 }
 
 /// gemma-embedding2's projection of the token rows to the per-layer inputs,
@@ -1696,7 +1698,7 @@ pub fn check_with(
                     }
                 }
                 // The glm5next body's rule: a stack passes when the program
-                // can run it — on the card by its expert rule (`card_routed`)
+                // can run it — on the card by its leg's arms (`leg_arms`)
                 // or on the host by a qdot fused kernel at the stack's row
                 // width ([`routed_unrun`], the one owner). A layer with a
                 // stack the card experts do not read keeps all its experts on
@@ -2597,7 +2599,7 @@ mod tests {
     }
 
     /// A routed stack of a glm5next file passes when the program can run it
-    /// — on the card by the card experts' types (q4_K, q5_K) or on the host
+    /// — on the card by its leg's arms (q4_K, q5_K, nvfp4 in its planes) or on the host
     /// by a fused qdot kernel at its row width, so a layer with a stack the
     /// card does not read keeps its experts on the host — and a type neither
     /// side runs is an item for each layer that holds it, named by its type,
@@ -2606,6 +2608,9 @@ mod tests {
     // to card-or-host so a file's i-quant stacks (iq3_xxs, iq4_xs gate and
     // up or down) are no items; a bf16 stack, which `CardFormat::of` took but
     // no host kernel reads, is an item.
+    // PIN(2026-10-22): the glm5next leg holds NVFP4 stacks in their planes and
+    // quantizes the 32-value form their down reads, so an NVFP4 layer, which
+    // no host kernel reads, is no item (it was one).
     #[test]
     fn a_glm5next_routed_stack_runs_on_a_card_or_the_host() {
         let none = Vec::<(Option<usize>, String)>::new();
@@ -2630,6 +2635,9 @@ mod tests {
             // down) and its NextN layer (q2_K gate and up, q3_K down).
             (GgmlType::IQ2_XS, GgmlType::IQ3_XXS, none.clone()),
             (GgmlType::Q2_K, GgmlType::Q3_K, none.clone()),
+            // The card's alone: NVFP4 in its planes, which no host kernel
+            // reads (mutant: glm5next's rule left on the common leg).
+            (GgmlType::NVFP4, GgmlType::NVFP4, none.clone()),
             // No side: bf16 has no card expert and no fused qdot kernel, as
             // a gate and up or as a down.
             (GgmlType::BF16, GgmlType::Q4_K, item(GgmlType::BF16)),

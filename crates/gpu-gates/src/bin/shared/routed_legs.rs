@@ -1470,6 +1470,21 @@ fn outcome_of(e: &(dyn StdError + 'static)) -> Outcome {
     Outcome::Red(e.to_string())
 }
 
+/// A family planner's error as an outcome: the first `P` in `e`'s chain as
+/// the family's `place_of` reads it, else [`outcome_of`]'s reading. A
+/// family error that wraps the placement's own transparently hides it from
+/// [`outcome_of`]'s walk, so a refusal the placement names would read red.
+fn outcome_by<P: StdError + 'static>(e: &GateError, place_of: fn(&P) -> Outcome) -> Outcome {
+    let mut cur: Option<&(dyn StdError + 'static)> = Some(e.as_ref());
+    while let Some(c) = cur {
+        if let Some(p) = c.downcast_ref::<P>() {
+            return place_of(p);
+        }
+        cur = c.source();
+    }
+    outcome_of(e.as_ref())
+}
+
 /// A [`PlacementError`] as an outcome: the read refusals a real census file
 /// can state and the budget floor are named; the machine state and the
 /// invariant breaks (a card another process holds, a plan that breaks its

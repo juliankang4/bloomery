@@ -5,8 +5,10 @@
 //! rest of its facts; `gguf::card` documents each entry's launcher and the
 //! layouts the entries read. A tag with no row has no entry.
 //!
-//! The card bytes of an activation form are here too ([`q8_act_bytes`]): the
-//! q8_1 form every card leg, plan and family sizes, in one place.
+//! The card bytes of an activation form are here too ([`q8_act_bytes`],
+//! [`q8_blocks32_bytes`]) and of one run of the card leg's buffers
+//! ([`leg_bytes`]): the forms every card leg, plan and family sizes, in one
+//! place.
 
 use gguf::GgmlType;
 pub use gguf::card::{
@@ -104,6 +106,86 @@ pub const fn q8_act_bytes(cols: u64, k: u64) -> u64 {
         + 4 * cols * 128 * n_sb.div_ceil(2)
         + 4 * cols * 8 * n_sb
         + 4 * cols * 2 * n_sb
+}
+
+/// The card bytes of the 32-value q8_1 activation of `cols` columns of `k`
+/// values ([`DownAct::Q8Blocks32`], `Q8Blocks32` in `crates/gpu/src/q5.rs`):
+/// per column `256 · ceil(k_blocks / 32)` code words and `k_blocks` block sums
+/// and scales, four bytes each, `k_blocks = k / 32`.
+#[must_use]
+pub const fn q8_blocks32_bytes(cols: u64, k: u64) -> u64 {
+    let k_blocks = k / 32;
+    cols * 4 * (256 * k_blocks.div_ceil(32) + 2 * k_blocks)
+}
+
+/// The down activation forms ([`DownAct`]) a card leg's buffers hold: the
+/// forms the downs of the layers a load runs on them read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DownForms {
+    q8_act: bool,
+    blocks32: bool,
+}
+
+impl DownForms {
+    /// No form: a load with no layer of the kind.
+    pub const NONE: DownForms = DownForms {
+        q8_act: false,
+        blocks32: false,
+    };
+
+    /// The one form `act`.
+    #[must_use]
+    pub const fn of(act: DownAct) -> DownForms {
+        DownForms::NONE.with(act)
+    }
+
+    /// These forms and `act`.
+    #[must_use]
+    pub const fn with(self, act: DownAct) -> DownForms {
+        match act {
+            DownAct::Q8Act => DownForms {
+                q8_act: true,
+                ..self
+            },
+            DownAct::Q8Blocks32 => DownForms {
+                blocks32: true,
+                ..self
+            },
+        }
+    }
+
+    /// Whether `act` is one of the forms.
+    #[must_use]
+    pub const fn holds(self, act: DownAct) -> bool {
+        match act {
+            DownAct::Q8Act => self.q8_act,
+            DownAct::Q8Blocks32 => self.blocks32,
+        }
+    }
+}
+
+/// The card bytes of one run of the card leg's buffers
+/// (`bloomery_gpu::card_leg::LegBufs`) for up to `cap` tokens of `n` values,
+/// `slots_per_col` slots a token, through experts of `ff` rows, the slots'
+/// columns held in each form of `downs`: the q8_1 of the tokens' rows (a
+/// column a token), the gate·up's rows (`ff` values a slot), the slots'
+/// columns in each form and the down's rows (`n` values a slot). The one
+/// formula of those bytes: the leg's buffers and every plan that reserves
+/// them read it.
+#[must_use]
+pub const fn leg_bytes(cap: u64, slots_per_col: u64, n: u64, ff: u64, downs: DownForms) -> u64 {
+    let slots = cap * slots_per_col;
+    let q8 = if downs.q8_act {
+        q8_act_bytes(slots, ff)
+    } else {
+        0
+    };
+    let b32 = if downs.blocks32 {
+        q8_blocks32_bytes(slots, ff)
+    } else {
+        0
+    };
+    q8_act_bytes(cap, n) + 4 * slots * ff + q8 + b32 + 4 * slots * n
 }
 
 /// Whether the common card leg (`crates/gpu/src/card_leg.rs`) launches the

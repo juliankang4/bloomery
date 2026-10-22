@@ -14,7 +14,7 @@ use crate::arch::chat_of;
 use crate::arch::place_hybrid;
 use crate::placement::PlacementError;
 
-pub use place_hybrid::{KvLayout, PlaceError, card_routed};
+pub use place_hybrid::{KvLayout, PlaceError};
 
 /// What a plan of an M3 file is made from, read from its headers.
 pub type PlanInputs = place_hybrid::PlanInputs<Hparams>;
