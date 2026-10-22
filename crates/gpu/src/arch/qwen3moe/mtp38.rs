@@ -796,8 +796,10 @@ pub fn walk_launches(m: usize, q6k_head: bool) -> usize {
 
 /// The target arena a [`Hidden::Target`] feed reads: the target's streams
 /// after its last walk of that arena, from the row the feed names on; that
-/// walk must have run its head, whose mix applies the last layer's combine (a
-/// step, a verify, a prompt's last pass or ubatch).
+/// walk must have left them final, the last layer's combine applied: the
+/// head's mix applies it over the rows it covers (a step, a verify, a
+/// prompt's last pass or ubatch, a split walk's last unit), and a prompt
+/// call with a tap applies it alone to every other row it walks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetRows {
     /// The step's one row.

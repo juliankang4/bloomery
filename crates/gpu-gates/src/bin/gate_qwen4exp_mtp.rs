@@ -116,6 +116,14 @@
 //!   sequence: the draft joins at the call's start and drafts with the plain
 //!   run's ids, and restarted beside the held sequence it skips the next
 //!   call by name, proposing nothing, the ids still the plain run's.
+//! - (fr) a prompt call feeds the draft final rows, the last layer's combine applied to every
+//!   row the head's mix does not cover: the set's prompt called once with the draft, one ubatch
+//!   walked as one unit (the split walk off), is the reference; the same call under
+//!   `SplitWalk::Every` (two units, the head's mix over the second alone) and, on a load of the
+//!   same plan whose ubatch holds a third of the prompt, as several ubatches (the head on the
+//!   last alone), one unit each and two under `Every`, leaves the draft's store and the next id
+//!   the reference's bit for bit; the call by passes (the head on the last pass alone) leaves
+//!   the call by steps' (each row its own step's head).
 //! - (c) the width chooser (`BLOOMERY_MTP_WIDTH=cost`): the draft behind
 //!   `runtime::width`'s `Choosing` over the same model — every window's
 //!   verify width at most its proposal, its kept rows the target's, the
@@ -263,8 +271,8 @@ mod gate {
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
         Body38, CHECKPOINT_EVERY, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
-        MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38, Store38Host, TargetRows, checkpoint_bytes,
-        seq_positional_bytes, seq38_bytes,
+        MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38, SplitWalk, Store38Host, TargetRows,
+        checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
     use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
     use bloomery_gpu::fault::FaultSite;
@@ -3794,6 +3802,163 @@ mod gate {
         }
     }
 
+    /// What one drafted prompt call leaves ((fr)): the draft's store at the
+    /// call's positions, the target's next id, and on a call by ubatches the
+    /// ubatches it ran and the units its last walk cut (0 and 0 by steps or
+    /// passes).
+    struct Stored {
+        store: (Vec<u16>, Vec<u16>),
+        next: u32,
+        ubatches: usize,
+        units: usize,
+    }
+
+    /// The drafted session's prompt call of `prompt` by `path` from a reset,
+    /// its draft eager, the ubatch walks cut by `split` for the call and by
+    /// the load's own cut again after it, failed or not: what it leaves.
+    fn drafted_store(
+        m: Qwen38Model,
+        prompt: &[u32],
+        path: Prompt38,
+        split: SplitWalk,
+    ) -> Result<(Qwen38Model, Stored), GateError> {
+        let mut m = m;
+        let ctx = m.body("(fr)")?.ctx() as u32;
+        let own = m.body("(fr)")?.split_walk();
+        m.body_parts("(fr)")?.2.set_split_walk(split)?;
+        let cfg = app::arch::qwen3moe::Q38Cfg {
+            prompt: path,
+            draft: bloomery_gpu::model::StepMode::Eager,
+        };
+        let (mut s, mut spec) = drafted_session(m, cfg, ctx)?;
+        let next = spec.prompt(&mut s, prompt);
+        let mut m = s.into_model();
+        m.body_parts("(fr)")?.2.set_split_walk(own)?;
+        let next = next?;
+        let b = m.body("(fr)")?;
+        let (ubatches, units) = match b.resolve_prompt(path, prompt.len()) {
+            Prompt38::Gemm => (b.ubatch_cut(prompt.len()).count(), b.ubatch_units()),
+            _ => (0, 0),
+        };
+        let store = store_of(&m, prompt.len())?;
+        Ok((
+            m,
+            Stored {
+                store,
+                next,
+                ubatches,
+                units,
+            },
+        ))
+    }
+
+    /// `got`'s draft store against `want`'s at their `n` positions, in words
+    /// for (fr)'s line: the same bits, or how many positions differ from the
+    /// first; and whether they are the same.
+    fn store_said(got: &Stored, want: &Stored, n: usize) -> (String, bool) {
+        let same = same_rows(&got.store, &want.store, n);
+        match same.iter().position(|&s| !s) {
+            None => ("bit for bit".to_string(), true),
+            Some(first) => (
+                format!(
+                    "{} of {n} positions other from {first}",
+                    same.iter().filter(|&&s| !s).count()
+                ),
+                false,
+            ),
+        }
+    }
+
+    /// (fr) on the gate's load: the set's prompt called once with the draft,
+    /// one ubatch walked as one unit (the split walk off), is the reference;
+    /// the same call under the split walk (`SplitWalk::Every`: two units, the
+    /// head's mix over the second alone) leaves the draft's store and the
+    /// next id the reference's bit for bit, and so does the call by passes
+    /// (the head on the last pass alone) the call by steps' (each row its own
+    /// step's head; a pass's rows are its steps' bit for bit). The reference
+    /// goes on to [`final_rows_ubatches`].
+    fn final_rows(
+        m: Qwen38Model,
+        prompt: &[u32],
+    ) -> Result<(Qwen38Model, Stored, bool), GateError> {
+        let n = prompt.len();
+        let (m, one) = drafted_store(m, prompt, Prompt38::Gemm, SplitWalk::Off)?;
+        let (m, two) = drafted_store(m, prompt, Prompt38::Gemm, SplitWalk::Every)?;
+        let (m, steps) = drafted_store(m, prompt, Prompt38::Step, SplitWalk::Off)?;
+        let (m, passes) = drafted_store(m, prompt, Prompt38::Pass, SplitWalk::Off)?;
+        let shape_ok = (one.ubatches, one.units, two.ubatches, two.units) == (1, 1, 1, 2)
+            && n > Prompt38::PASS_ROWS;
+        let (split_said, split_same) = store_said(&two, &one, n);
+        let (pass_said, pass_same) = store_said(&passes, &steps, n);
+        let split_ok = split_same && two.next == one.next;
+        let pass_ok = pass_same && passes.next == steps.next;
+        println!(
+            "(fr) a prompt call of {n} ids with the draft: as one ubatch of {} unit and under \
+             the split walk as {} units (want 1 and 2) {}; the split walk's draft store against \
+             the one unit's {split_said}, its next id {} (the one unit's {}) {}; by {} passes \
+             against by steps {pass_said}, the next id {} (by steps {}) {}",
+            one.units,
+            two.units,
+            verdict(shape_ok),
+            two.next,
+            one.next,
+            verdict(split_ok),
+            n.div_ceil(Prompt38::PASS_ROWS),
+            passes.next,
+            steps.next,
+            verdict(pass_ok)
+        );
+        Ok((m, one, shape_ok && split_ok && pass_ok))
+    }
+
+    /// (fr) on a load of the gate's plan whose ubatch holds a third of the
+    /// set's prompt: the call runs as several ubatches, the head on the last
+    /// alone, each walked as one unit and then under the split walk as two,
+    /// and leaves the draft's store and the next id of `one` (the gate's
+    /// load's one unit, [`final_rows`]) bit for bit either way.
+    fn final_rows_ubatches(
+        inputs: &PlanInputs,
+        mtp: &MtpInputs,
+        prompt: &[u32],
+        one: &Stored,
+    ) -> Result<bool, GateError> {
+        let n = prompt.len();
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX)?)?;
+        let (file, draft) = (open_target()?, open_draft()?);
+        let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let extra = mtp.card_bytes(CTX)?;
+        let plan = inputs.plan_mtp(&machine, CTX, &plan_levers(extra)?, mtp)?;
+        let small = n.div_ceil(3);
+        let m = Body38::open_placed_mtp(file, &plan, inputs, 0, cfg().host, small, &draft, mtp)?;
+        let (m, cut) = drafted_store(m, prompt, Prompt38::Gemm, SplitWalk::Off)?;
+        let (m, cut_two) = drafted_store(m, prompt, Prompt38::Gemm, SplitWalk::Every)?;
+        drop(m);
+        let ubatches = n.div_ceil(small);
+        let shape_ok = ubatches > 1
+            && (cut.ubatches, cut.units, cut_two.ubatches, cut_two.units)
+                == (ubatches, 1, ubatches, 2);
+        let (said, same) = store_said(&cut, one, n);
+        let (two_said, two_same) = store_said(&cut_two, one, n);
+        let ok_one = same && cut.next == one.next;
+        let ok_two = two_same && cut_two.next == one.next;
+        println!(
+            "(fr) the call on a load of the same plan with ubatches of {small} rows: {} ubatches \
+             of {} unit, and of {} units under the split walk (want {ubatches}, 1 and 2) {}; \
+             the draft store against the gate's load's one unit {said}, the next id {} (want \
+             {}) {}; under the split walk {two_said}, the next id {} {}",
+            cut.ubatches,
+            cut.units,
+            cut_two.units,
+            verdict(shape_ok),
+            cut.next,
+            one.next,
+            verdict(ok_one),
+            cut_two.next,
+            verdict(ok_two)
+        );
+        Ok(shape_ok && ok_one && ok_two)
+    }
+
     /// (w): the windows end to end, against the plain run — at the set's
     /// prompt and D3K's (depth 3,000 after it): the drafted greedy ids are
     /// the plain run's for 64 tokens, with a rejected row among the windows
@@ -5983,6 +6148,9 @@ mod gate {
         let (mut m, c_ok) = continued(m, &prompt)?;
         ok &= c_ok;
         ok &= arena_holds(&mut m, &prompt)?;
+        tier::sc("(fr) a prompt call's rows the head does not cover feed the draft final")?;
+        let (m, one_unit, fr_ok) = final_rows(m, &prompt)?;
+        ok &= fr_ok;
         tier::sc("(p) a partial accept's records")?;
         let (m, partial_ok) = partial_state(m, &prompt, draft_kv)?;
         ok &= partial_ok;
@@ -6007,6 +6175,8 @@ mod gate {
         let (model, sl_ok) = lane_save(model, &prompt, draft_kv)?;
         ok &= sl_ok;
         drop(model);
+        tier::sc("(fr) a prompt call of several ubatches feeds the draft final rows")?;
+        ok &= final_rows_ubatches(&inputs, &mtp, &prompt, &one_unit)?;
         tier::sc("(kp-draft) a point inside a long prompt call, cut to and put back as a prefix")?;
         ok &= long_point(&inputs, &mtp, &prompt)?;
         // Window B diverges from window A from position 0 on: the corpus's

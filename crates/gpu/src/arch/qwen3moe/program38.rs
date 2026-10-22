@@ -1694,7 +1694,8 @@ impl<'a> LayerProgram for Verify38<'a> {
 }
 
 /// An eager pass's walk `(1, m, Batch)`: every layer through the batch port;
-/// the head is the caller's ([`Pass38::head`]).
+/// the head and the final rows are the caller's ([`Pass38::head`],
+/// [`Pass38::finals`]).
 pub(super) struct Pass38<'a> {
     pub(super) branch: &'a mut Branch,
     pub(super) p: Parts38<'a>,
@@ -1734,6 +1735,21 @@ impl<'a> Pass38<'a> {
         head.input_mut()
             .copy_from_device_async(&row, gpu.stream())?;
         head.enqueue(gpu, self.p.c.w)
+    }
+
+    /// After the walk of a prompt call's pass that runs no head, when the
+    /// call's tap reads its rows ([`super::body38::Prompt38Sink`]): the last
+    /// layer's combine alone over the unit's columns, the one the head's mix
+    /// applies first ([`Parts38::head_mix`]), so each row holds the target's
+    /// final streams. One launch.
+    pub(super) fn finals(&mut self) -> Result<(), GpuError> {
+        let p = &mut self.p;
+        let gpu = p.c.gpu;
+        let fault = gpu.layer_sink(p.plans.len().saturating_sub(1))?;
+        let s = &mut *p.s;
+        p.c.k
+            .hc
+            .enqueue_combine(gpu.stream(), &mut s.res[p.cur], &s.y, p.m, fault, &s.hc)
     }
 }
 

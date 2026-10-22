@@ -1341,7 +1341,7 @@ impl CardRoute38 {
 
 /// What a ubatch walk reads and writes besides the arena: the one-expert
 /// tables, the GEMMs' activations, the wide mixes' scratch, the indexer keys
-/// token-major, the walk's routed slots, the last walk's last unit and its cut
+/// token-major, the walk's routed slots, the last walk's units and its cut
 /// of its selecting layers' rows, and how the walks cut their rows into units.
 pub(super) struct Wide38 {
     /// The most rows a unit holds.
@@ -1371,9 +1371,9 @@ pub(super) struct Wide38 {
     /// The last walk's rows of each selecting layer: those the prefill flash
     /// ran and those the selection did.
     pub(super) split: Option<(usize, usize)>,
-    /// The last walk's last unit, whose rows the head reads; its windows
-    /// stay valid until the next walk replaces it.
-    last: Option<UnitRows38>,
+    /// The last walk's units, the head reading the last one's rows; their
+    /// windows stay valid until the next walk replaces them.
+    units: Vec<UnitRows38>,
     /// How the walks cut their rows ([`SplitWalk`]), and what the load keeps
     /// its routed experts on, which the rule prices only when resident.
     split_walk: SplitWalk,
@@ -1381,8 +1381,6 @@ pub(super) struct Wide38 {
     /// The width rule's costs on this card ([`SPLIT_COSTS`] at its
     /// multiprocessors).
     split_costs: SplitCosts,
-    /// The units the last walk ran; 0 before a walk.
-    pub(super) walked_units: usize,
 }
 
 impl Wide38 {
@@ -1427,15 +1425,19 @@ impl Wide38 {
             force: None,
             card,
             split: None,
-            last: None,
+            units: Vec::new(),
             split_walk,
             load,
             split_costs: SplitCosts {
                 card_row_us: SPLIT_COSTS.card_row_us * SPLIT_COSTS_SMS / sms,
                 ..SPLIT_COSTS
             },
-            walked_units: 0,
         })
+    }
+
+    /// The units the last walk ran; 0 before a walk.
+    pub(super) fn walked_units(&self) -> usize {
+        self.units.len()
     }
 
     /// The load's plan pages routed experts to the NVMe tier: the walks cut
@@ -1606,6 +1608,20 @@ fn mix(
     )
 }
 
+/// The combine alone over unit `u`'s columns: `res += wgt · y` per stream,
+/// the weights the unit's last inject site left ([`UnitHc`]), a fault
+/// raised on `fault`.
+fn combine(
+    c: &Ctx38<'_>,
+    u: &mut UnitRows38,
+    scratch: &mut HcWideScratch,
+    fault: FaultSink,
+) -> Result<(), GpuError> {
+    let hc = UnitHc::on(scratch, u.wgt)?;
+    c.k.hcw
+        .enqueue_combine(c.gpu.stream(), &mut u.res[u.cur], &u.y, u.m, fault, &*hc.hc)
+}
+
 impl WideParts<'_> {
     /// Layer `l`'s front of unit `u` up to its feed-forward site
     /// (`Parts38::front`'s order): the embedding in front of layer 0, the
@@ -1653,12 +1669,7 @@ impl WideParts<'_> {
                 &mut s.mixed,
             )?;
         } else if let Some(pp) = &p.ple {
-            let prev = gpu.layer_sink(l - 1)?;
-            {
-                let hc = UnitHc::on(&mut x.hc, u.wgt)?;
-                c.k.hcw
-                    .enqueue_combine(stream, &mut u.res[u.cur], &u.y, m, prev, &*hc.hc)?;
-            }
+            combine(c, u, &mut x.hc, gpu.layer_sink(l - 1)?)?;
             let w = c.w;
             let pl = &mut s.ple;
             let e = (&*u.ple_e, m);
@@ -2386,7 +2397,8 @@ fn qsa(
 pub(super) const STREAM_FLOOR: u32 = 32;
 
 /// A ubatch's walk `(units, cols, Batch)`: every layer through the batch
-/// port at each unit's width; the head is the caller's ([`Gemm38::head`]).
+/// port at each unit's width; the head and the final rows are the caller's
+/// ([`Gemm38::head`], [`Gemm38::finals`]).
 pub(super) struct Gemm38<'a> {
     pub(super) p: WideParts<'a>,
 }
@@ -2426,8 +2438,8 @@ impl<'a> Gemm38<'a> {
     /// before any launch (`Body38::plan_gemm` refuses the taps' first, before
     /// the call moves anything; this is the windows' own guard). Once every
     /// layer is walked, armed taps record the walk's positions, the units'
-    /// cuts of the selecting layers' rows add up to the walk's, and the last
-    /// unit stays for the head.
+    /// cuts of the selecting layers' rows add up to the walk's, and the units
+    /// stay for the head and the final rows ([`Gemm38::finals`]).
     pub(super) fn walk(&mut self, leg: &mut BatchLeg<'a, HostRun>) -> Result<(), GpuError> {
         let m = self.p.m;
         let taps = self.p.x.taps.as_ref().map_or(usize::MAX, |t| t.rows);
@@ -2443,15 +2455,14 @@ impl<'a> Gemm38<'a> {
         }
         let gpu = self.p.c.gpu;
         self.p.x.split = None;
-        self.p.x.last = None;
-        self.p.x.walked_units = 0;
+        let mut units = std::mem::take(&mut self.p.x.units);
+        units.clear();
         if let Some(t) = self.p.x.taps.as_mut() {
             t.walked = None;
         }
         let cut = unit_rows(m, &self.p.widths()?)?;
         let rows: Vec<std::ops::Range<usize>> = cut.iter().map(|&(r0, w)| r0..r0 + w).collect();
         leg.set_unit_rows(&rows);
-        let mut units = Vec::with_capacity(cut.len());
         for (route, at) in cut.into_iter().enumerate() {
             units.push(UnitRows38::new(&self.p, leg.hsum(), at, route)?);
         }
@@ -2496,8 +2507,30 @@ impl<'a> Gemm38<'a> {
         self.p.x.split = units
             .iter()
             .try_fold((0, 0), |(d, s), u| u.split.map(|(ud, us)| (d + ud, s + us)));
-        self.p.x.walked_units = units.len();
-        self.p.x.last = units.into_iter().last();
+        self.p.x.units = units;
+        Ok(())
+    }
+
+    /// After the walk of a prompt call whose tap reads every row it ran
+    /// ([`super::body38::Prompt38Sink`]): the last layer's combine alone over
+    /// each unit the head's mix leaves — every unit but the last when `head`
+    /// runs after it, every unit otherwise — at the unit's own combine
+    /// weights ([`combine`]), so each row holds the target's final streams.
+    /// One launch a unit. Refused by name before a walk.
+    pub(super) fn finals(&mut self, head: bool) -> Result<(), GpuError> {
+        let fault = self
+            .p
+            .c
+            .gpu
+            .layer_sink(self.p.plans.len().saturating_sub(1))?;
+        let Wide38 { units, hc, .. } = &mut *self.p.x;
+        if units.is_empty() {
+            return Err(GpuError::state(WHAT, "a ubatch walk before its final rows"));
+        }
+        let left = units.len() - usize::from(head);
+        for u in &mut units[..left] {
+            combine(&self.p.c, u, hc, fault)?;
+        }
         Ok(())
     }
 
@@ -2509,10 +2542,10 @@ impl<'a> Gemm38<'a> {
         let fault = gpu.fault_sink(LAYER_HEAD);
         let s = &mut *self.p.s;
         let Wide38 {
-            last, hc, dense, ..
+            units, hc, dense, ..
         } = &mut *self.p.x;
-        let u = last
-            .as_mut()
+        let u = units
+            .last_mut()
             .ok_or(GpuError::state(WHAT, "a ubatch walk before its head"))?;
         let m = u.m;
         mix(

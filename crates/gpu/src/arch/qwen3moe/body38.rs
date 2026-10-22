@@ -2044,15 +2044,15 @@ impl Body38 {
     }
 
     /// The streams' buffer that holds the target's hidden rows after a walk
-    /// of `walk`'s arena ran its head: the walk's current buffer flips once
-    /// at each PLE layer past layer 0.
+    /// of `walk`'s arena left them final ([`TargetRows`]): the walk's current
+    /// buffer flips once at each PLE layer past layer 0.
     fn final_streams(&self, walk: TargetRows) -> &DeviceBuffer<f32> {
         final_streams(&self.plans, [&self.s, &self.a, &self.wa], walk)
     }
 
     /// The target's hidden rows `0..rows` after a walk of `walk`'s arena
-    /// that ran its head, four streams of [`geo::HIDDEN`] a row. Blocking;
-    /// gate use.
+    /// that left them final ([`TargetRows`]), four streams of
+    /// [`geo::HIDDEN`] a row. Blocking; gate use.
     pub fn target_streams(
         &self,
         gpu: &Gpu,
@@ -2327,7 +2327,7 @@ impl Body38 {
     /// a walk since the load. Gate use.
     #[must_use]
     pub fn ubatch_units(&self) -> usize {
-        self.wide.walked_units
+        self.wide.walked_units()
     }
 
     /// Whether a returning prompt call ([`super::wide38`]'s module doc) runs
@@ -3334,7 +3334,9 @@ impl Body38 {
     }
 
     /// Launch the planned pass of `m` rows from `pos` through the batch
-    /// port, then the head of its last row into `head` when given.
+    /// port, then the head of its last row into `head` when given; with no
+    /// head and `tapped` (the call's tap reads the pass's rows) the last
+    /// layer's combine alone over them ([`Pass38::finals`]).
     fn walk_pass(
         &mut self,
         gpu: &Gpu,
@@ -3342,6 +3344,7 @@ impl Body38 {
         m: usize,
         pos: u32,
         head: Option<&mut Head>,
+        tapped: bool,
     ) -> Result<(), GpuError> {
         if !(1..=self.a.rows).contains(&m) {
             return Err(GpuError::shape(
@@ -3405,6 +3408,7 @@ impl Body38 {
         planted(plant, Plant::AfterLaunch)?;
         match head {
             Some(h) => prog.head(h),
+            None if tapped => prog.finals(),
             None => Ok(()),
         }
     }
@@ -3474,7 +3478,9 @@ impl Body38 {
 
     /// Launch the planned ubatch of `m` rows from `pos` through the batch
     /// port at its width, then the head of its last row into `head` when
-    /// given.
+    /// given; with `tapped` (the call's tap reads the walk's rows) the last
+    /// layer's combine alone first, over every unit the head's mix leaves
+    /// ([`Gemm38::finals`]).
     fn walk_gemm(
         &mut self,
         gpu: &Gpu,
@@ -3482,6 +3488,7 @@ impl Body38 {
         m: usize,
         pos: u32,
         head: Option<&mut Head>,
+        tapped: bool,
     ) -> Result<(), GpuError> {
         if !(1..=self.wide.rows).contains(&m) {
             return Err(GpuError::shape(
@@ -3550,6 +3557,9 @@ impl Body38 {
         leg.set_timer(wide_timing.as_mut());
         prog.walk(&mut leg)?;
         planted(plant, Plant::AfterLaunch)?;
+        if tapped {
+            prog.finals(head.is_some())?;
+        }
         match head {
             Some(h) => prog.head(h),
             None => Ok(()),
@@ -3754,9 +3764,13 @@ impl GpuModel<Body38> {
     /// called after each unit the path runs — every token's step, every
     /// pass, every ubatch — with the arena its rows' final streams sit in,
     /// the unit's first position and its rows, before the next unit
-    /// overwrites them. A `None` sink is [`GpuModel::prompt38`] itself: the
-    /// steps run as one call of the whole prompt; a sink's per-token steps
-    /// leave the same bits, a head readback a token.
+    /// overwrites them. A row the head's mix does not cover (a pass or a
+    /// ubatch before the last, a split walk's first unit) gets the last
+    /// layer's combine alone before the sink reads it; only a tap reads such
+    /// a row, so a call without one runs no such combine. A `None` sink is
+    /// [`GpuModel::prompt38`] itself: the steps run as one call of the whole
+    /// prompt; a sink's per-token steps leave the same bits, a head readback
+    /// a token.
     ///
     /// The call is one residency pass ([`crate::host::swap`]): its boundary
     /// before it and none inside — the passes and the ubatches run through
@@ -4011,7 +4025,7 @@ impl GpuModel<Body38> {
                         body.plan_gemm(gpu.stream(), chunk, pos)?;
                     }
                     next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
-                        body.walk_gemm(gpu, w, m, pos, last.then_some(head))?;
+                        body.walk_gemm(gpu, w, m, pos, last.then_some(head), tapped)?;
                         body.stream.walk_done();
                         Ok(last)
                     })?;
@@ -4036,7 +4050,7 @@ impl GpuModel<Body38> {
                     }
                     let m = chunk.len();
                     next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
-                        body.walk_pass(gpu, w, m, pos, last.then_some(head))?;
+                        body.walk_pass(gpu, w, m, pos, last.then_some(head), tapped)?;
                         Ok(last)
                     })?;
                     if let Some(f) = sink.as_deref_mut() {
@@ -4115,8 +4129,9 @@ impl Wrote38 {
 }
 
 /// The streams' buffer of `walk`'s arena (the step's, the pass's, the
-/// ubatch walk's) that holds the target's hidden rows once the walk ran its
-/// head: a walk's current buffer flips once at each PLE layer past layer 0.
+/// ubatch walk's) that holds the target's hidden rows once the walk left
+/// them final ([`TargetRows`]): a walk's current buffer flips once at each
+/// PLE layer past layer 0.
 fn final_streams<'b>(
     plans: &[Layer38],
     [s, a, wa]: [&'b Arena38; 3],
