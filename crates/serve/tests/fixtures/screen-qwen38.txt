@@ -1,20 +1,32 @@
 
-      (   )      ╭──────────────────────────────────────────────────────────────────────────╮
-     (  )  )     │ bloomery-serve-qwen38 is ready                                           │
-      )  (       │                                                                          │
-    .-'--'-.     │ url      http://127.0.0.1:8080                                           │
-   /  ____  \    │ place    a (one card)                                                    │
-  |  /▓▓▓▓\  |   │ card     3090 · 4813 experts · 22.0 GiB resident                         │
-  |  \▓▓▓▓/  |== │ host     5427 experts                                                    │
-  |__________|   │ nvme     100.0 GiB paged through a 24.0 GiB RAM arena (32.0 GiB planned) │
- ~~~~~~~~~~~~~~  │ context  1 slot · 8192 positions                                         │
-                 │ cache    4.0 GiB of prompt cache in RAM                                  │
-                 │ loaded   in 23.7 s                                                       │
-                 ╰──────────────────────────────────────────────────────────────────────────╯
+                                                                                       ██
+                                                                                      ▄██▄
+                                                                                     ▄▀▀▀▀▄
+                                                                                    ▄██████▄
+  ▄▄▄▄▄▄   ▄▄        ▄▄▄▄▄    ▄▄▄▄▄   ▄▄   ▄▄  ▄▄▄▄▄▄▄  ▄▄▄▄▄▄   ▄▄   ▄▄            ████████
+  ██▀▀▀██  ██       ██▀▀▀██  ██▀▀▀██  ███▄███  ██▀▀▀▀▀  ██▀▀▀██  ██   ██           ▄████████▄
+  ██  ▄█▀  ██       ██   ██  ██   ██  ██ ▀ ██  ██       ██   ██   ██▄██            ██████████
+  █████▄   ██       ██   ██  ██   ██  ██   ██  ██████   ██████▀    ███            ▄████▀▀████▄
+  ██   ██  ██       ██   ██  ██   ██  ██   ██  ██       ██ ▀█▄     ███            ███▀    ▀███
+  ██▄▄▄██  ██▄▄▄▄▄  ██▄▄▄██  ██▄▄▄██  ██   ██  ██▄▄▄▄▄  ██  ▀█▄    ███        ███████      ███▄
+  ▀▀▀▀▀▀   ▀▀▀▀▀▀▀   ▀▀▀▀▀    ▀▀▀▀▀   ▀▀   ▀▀  ▀▀▀▀▀▀▀  ▀▀   ▀▀    ▀▀▀           ████      ████
+                                                                              ▀▀████████████████▀▀
 
-  try:
-    curl http://127.0.0.1:8080/v1/chat/completions \
+   READY   bloomery-serve-qwen38                                                  loaded in 23.7 s
+           → http://127.0.0.1:8080
+
+  placement ──────────────────────────────────   serving ─────────────────────────────────────────
+  experts  ████████████████░░░░░░░░░░░░░░░░░░    place    a (one card)
+           █ card   ░ host                       context  1 slot · 8192 positions
+  card     3090 · 4813 experts ·                 cache    4.0 GiB of prompt cache in RAM
+           22.0 GiB resident
+  host     5427 experts
+  nvme     100.0 GiB paged through a 24.0 GiB
+           RAM arena (32.0 GiB planned)
+
+  try ────────────────────────────────────────────────────────────────────────────────────────────
+  $ curl http://127.0.0.1:8080/v1/chat/completions \
       -H 'Content-Type: application/json' \
       -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 
-  Ctrl+C stops the server · BLOOMERY_SCREEN=off hides this screen
+   Ctrl+C  stops the server     BLOOMERY_SCREEN=off  hides this screen

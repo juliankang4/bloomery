@@ -11,19 +11,28 @@
 //! the start did not print is left off, and two records that name different
 //! placements are not joined. A record the start printed whose value the
 //! screen could not read as a number is named on an `unread` row, never left
-//! off as if it had not been printed. `NO_COLOR` (set and not empty) and `TERM=dumb`
-//! draw it without colour; `TERM=dumb` or a locale that does not name UTF-8
-//! draws it in plain ASCII.
+//! off as if it had not been printed. `NO_COLOR` (set and not empty) and
+//! `TERM=dumb` draw it without colour; `TERM=dumb` or a locale that does not
+//! name UTF-8 draws it in plain ASCII. `COLORTERM=truecolor` (or `24bit`)
+//! draws its colours as they are; any other terminal gets the nearest of the
+//! 256-colour cube.
+//!
+//! The screen is the wordmark and the furnace in half-block pixels, a status
+//! line with the address, then two panels: where the model went (the card,
+//! the host and the NVMe tier, with a bar of the experts each holds) and how
+//! it serves (the placement, the context and slots, the prompt cache).
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// How the screen is drawn: with colour, and with UTF-8 glyphs or plain ASCII.
+/// How the screen is drawn: with colour (24-bit, or the 256-colour cube),
+/// and with UTF-8 glyphs or plain ASCII.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Style {
     color: bool,
+    truecolor: bool,
     utf8: bool,
 }
 
@@ -32,6 +41,7 @@ struct Style {
 struct TermVars<'a> {
     term: Option<&'a str>,
     no_color: Option<&'a str>,
+    colorterm: Option<&'a str>,
     lc_all: Option<&'a str>,
     lc_ctype: Option<&'a str>,
     lang: Option<&'a str>,
@@ -39,8 +49,9 @@ struct TermVars<'a> {
 
 impl Style {
     /// The style of `v`: colour unless `NO_COLOR` is set and not empty or
-    /// `TERM` is `dumb`; UTF-8 when the first non-empty of `LC_ALL`,
-    /// `LC_CTYPE` and `LANG` names it, and never on a `dumb` terminal.
+    /// `TERM` is `dumb`, 24-bit when `COLORTERM` is `truecolor` or `24bit`;
+    /// UTF-8 when the first non-empty of `LC_ALL`, `LC_CTYPE` and `LANG`
+    /// names it, and never on a `dumb` terminal.
     #[must_use]
     fn of(v: TermVars<'_>) -> Style {
         fn set(x: Option<&str>) -> Option<&str> {
@@ -55,8 +66,10 @@ impl Style {
                 let l = l.to_ascii_lowercase();
                 l.contains("utf-8") || l.contains("utf8")
             });
+        let color = !no_color && !dumb;
         Style {
-            color: !no_color && !dumb,
+            color,
+            truecolor: color && matches!(set(v.colorterm), Some("truecolor" | "24bit")),
             utf8: utf8 && !dumb,
         }
     }
@@ -66,21 +79,59 @@ impl Style {
     fn of_terminal() -> Style {
         let term = std::env::var_os("TERM");
         let no_color = std::env::var_os("NO_COLOR");
+        let colorterm = std::env::var_os("COLORTERM");
         let lc_all = std::env::var_os("LC_ALL");
         let lc_ctype = std::env::var_os("LC_CTYPE");
         let lang = std::env::var_os("LANG");
         let s =
             |v: &Option<std::ffi::OsString>| v.as_ref().map(|v| v.to_string_lossy().into_owned());
-        let (term, no_color, lc_all, lc_ctype, lang) =
-            (s(&term), s(&no_color), s(&lc_all), s(&lc_ctype), s(&lang));
+        let (term, no_color, colorterm) = (s(&term), s(&no_color), s(&colorterm));
+        let (lc_all, lc_ctype, lang) = (s(&lc_all), s(&lc_ctype), s(&lang));
         Style::of(TermVars {
             term: term.as_deref(),
             no_color: no_color.as_deref(),
+            colorterm: colorterm.as_deref(),
             lc_all: lc_all.as_deref(),
             lc_ctype: lc_ctype.as_deref(),
             lang: lang.as_deref(),
         })
     }
+
+    /// The escape that sets `c` as the foreground (`layer` 3) or the
+    /// background (`layer` 4), empty without colour.
+    fn ink(self, layer: u8, c: Rgb) -> String {
+        let Rgb(r, g, b) = c;
+        match (self.color, self.truecolor) {
+            (false, _) => String::new(),
+            (true, true) => format!("\x1b[{layer}8;2;{r};{g};{b}m"),
+            (true, false) => format!("\x1b[{layer}8;5;{}m", cube(c)),
+        }
+    }
+
+    /// `code` with colour, nothing without.
+    fn code(self, code: &str) -> &str {
+        if self.color { code } else { "" }
+    }
+
+    fn fg(self, c: Rgb) -> String {
+        self.ink(3, c)
+    }
+
+    fn bg(self, c: Rgb) -> String {
+        self.ink(4, c)
+    }
+}
+
+/// The index of the xterm 256-colour cube's colour nearest `c`, channel by
+/// channel.
+fn cube(Rgb(r, g, b): Rgb) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let near = |v: u8| {
+        (0u8..6)
+            .min_by_key(|&i| LEVELS[usize::from(i)].abs_diff(v))
+            .unwrap_or(0)
+    };
+    16 + 36 * near(r) + 6 * near(g) + near(b)
 }
 
 /// Whether the screen is armed and not drawn yet: [`note`] reads it before
@@ -280,6 +331,19 @@ struct Facts {
     addr: String,
     /// Each row's label and value, in the screen's order.
     rows: Vec<(&'static str, String)>,
+    /// The plan's routed experts on the card, the tier card and the host,
+    /// when its card and host counts are numbers; the tier card's count is
+    /// the plan's, else the load's (a plan record that has none), and a
+    /// tier count that is no number leaves the split off.
+    split: Option<Split>,
+}
+
+/// Where the plan put its routed experts, by count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Split {
+    card: u64,
+    tier: u64,
+    host: u64,
 }
 
 /// The separators a row's value is written with, per [`Style`].
@@ -298,13 +362,27 @@ fn facts<S: AsRef<str>>(lines: &[S], m: Marks) -> Option<Facts> {
     let seat = head.split(':').next()?.trim().to_owned();
     let addr = addr.trim().to_owned();
     let place = listen.word("place");
-    let mut rows = vec![("url", format!("http://{addr}"))];
-    rows.extend(seat_rows(&start, listen, m));
+    let mut rows = seat_rows(&start, listen, m);
     let plan = start.last("plan ", "place").filter(|l| l.same_place(place));
     let load = start
         .last("load ", "resident_bytes")
         .filter(|l| l.same_place(place));
     rows.extend(where_rows(&start, plan, load, m));
+    let split = plan.and_then(|p| {
+        let tier = match [Some(p), load]
+            .into_iter()
+            .flatten()
+            .find(|l| l.text("tier_experts").is_some())
+        {
+            Some(l) => l.num("tier_experts")?,
+            None => 0,
+        };
+        Some(Split {
+            card: p.num("card_experts")?,
+            tier,
+            host: p.num("host_experts")?,
+        })
+    });
     rows.extend(context_row(&start, listen, m));
     if let Some(ram) = start.last("cache ", "ram").and_then(|c| c.num("ram")) {
         rows.push(match ram {
@@ -333,7 +411,12 @@ fn facts<S: AsRef<str>>(lines: &[S], m: Marks) -> Option<Facts> {
             ),
         ));
     }
-    Some(Facts { seat, addr, rows })
+    Some(Facts {
+        seat,
+        addr,
+        rows,
+        split,
+    })
 }
 
 /// The rows the `listening` line itself holds: the placement (with the
@@ -522,28 +605,432 @@ fn width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
-/// The furnace beside the rows: smoke, the stack, the bloom glowing in its
-/// hearth and the tuyere on its side. `*` is the glow, drawn per [`Style`].
-const FURNACE: [&str; 9] = [
-    r"      (   )     ",
-    r"     (  )  )    ",
-    r"      )  (      ",
-    r"    .-'--'-.    ",
-    r"   /  ____  \   ",
-    r"  |  /****\  |  ",
-    r"  |  \****/  |==",
-    r"  |__________|  ",
-    r" ~~~~~~~~~~~~~~ ",
-];
+/// The art's height in pixels, two to a terminal row (a half block).
+const ART_H: usize = 24;
+/// The art's width in columns, one pixel each: the screen's width.
+const ART_W: usize = 98;
+/// The columns the text is indented by.
+const MARGIN: &str = "  ";
+/// The text's width inside the margin.
+const INNER: usize = ART_W - MARGIN.len();
+/// The columns of a row's label, its padding included.
+const LABEL: usize = 9;
+/// The columns between the two panels.
+const GAP: usize = 3;
+/// The placement panel's columns beside the serving panel.
+const LEFT: usize = 44;
+/// The experts bar's cells.
+const BAR: usize = LEFT - LABEL - 1;
 
-/// The smoke's rows at the top of [`FURNACE`].
-const SMOKE_ROWS: usize = 3;
+/// A colour of the art and the screen's accents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rgb(u8, u8, u8);
+
+/// The heat ramp, hottest first: the wordmark is warmed down its rows by it,
+/// and the bar's card cells along their length.
+const HEAT: [Rgb; 4] = [
+    Rgb(0xFC, 0xEF, 0xC7),
+    Rgb(0xF5, 0xC5, 0x42),
+    Rgb(0xF0, 0x8A, 0x3C),
+    Rgb(0xE0, 0x53, 0x3A),
+];
+const CREAM: Rgb = HEAT[0];
+const YELLOW: Rgb = HEAT[1];
+const ORANGE: Rgb = HEAT[2];
+const RED: Rgb = HEAT[3];
+const WHITE_HOT: Rgb = Rgb(0xFF, 0xF8, 0xE8);
+const SHADOW: Rgb = Rgb(0x5E, 0x2A, 0x18);
+const CLAY: Rgb = Rgb(0xA5, 0x5A, 0x36);
+const CLAY_LIT: Rgb = Rgb(0xC9, 0x82, 0x56);
+const CLAY_DARK: Rgb = Rgb(0x73, 0x38, 0x1F);
+const CLAY_BAND: Rgb = Rgb(0x8E, 0x4A, 0x2C);
+const TUYERE: Rgb = Rgb(0x8C, 0x7B, 0x6E);
+const TUYERE_LOW: Rgb = Rgb(0x6B, 0x5D, 0x52);
+const GROUND: Rgb = Rgb(0x4A, 0x2A, 0x1C);
+const GROUND_LOW: Rgb = Rgb(0x2E, 0x1A, 0x12);
+const HOST: Rgb = Rgb(0x9A, 0x4A, 0x2C);
+const INK: Rgb = Rgb(0x0E, 0x11, 0x19);
+const KEY: Rgb = Rgb(0x23, 0x28, 0x38);
 
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
-const GLOW: &str = "\x1b[1;33m";
-const URL: &str = "\x1b[1;36m";
+const UNDERLINE: &str = "\x1b[4m";
 const RESET: &str = "\x1b[0m";
+
+/// Step `i` of `n` along [`HEAT`]: the first step its first colour, the
+/// last its last.
+fn heat(i: usize, n: usize) -> Rgb {
+    let span = n.saturating_sub(1).max(1);
+    let at = i.min(span) * (HEAT.len() - 1);
+    let seg = (at / span).min(HEAT.len() - 2);
+    let rem = at - seg * span;
+    let (Rgb(r0, g0, b0), Rgb(r1, g1, b1)) = (HEAT[seg], HEAT[seg + 1]);
+    let mix = |a: u8, b: u8| {
+        let v = (usize::from(a) * (span - rem) + usize::from(b) * rem) / span;
+        u8::try_from(v).unwrap_or(u8::MAX)
+    };
+    Rgb(mix(r0, r1), mix(g0, g1), mix(b0, b1))
+}
+
+/// The wordmark's letters B, L, O, M, E, R and Y, seven pixels wide and
+/// twelve tall, `#` lit.
+const LETTERS: [[&str; 12]; 7] = [
+    [
+        "######.", "#######", "##...##", "##...##", "##..##.", "#####..", "######.", "##...##",
+        "##...##", "##...##", "#######", "######.",
+    ],
+    [
+        "##.....", "##.....", "##.....", "##.....", "##.....", "##.....", "##.....", "##.....",
+        "##.....", "##.....", "#######", "#######",
+    ],
+    [
+        ".#####.", "#######", "##...##", "##...##", "##...##", "##...##", "##...##", "##...##",
+        "##...##", "##...##", "#######", ".#####.",
+    ],
+    [
+        "##...##", "###.###", "#######", "##.#.##", "##...##", "##...##", "##...##", "##...##",
+        "##...##", "##...##", "##...##", "##...##",
+    ],
+    [
+        "#######", "#######", "##.....", "##.....", "##.....", "######.", "######.", "##.....",
+        "##.....", "##.....", "#######", "#######",
+    ],
+    [
+        "######.", "#######", "##...##", "##...##", "##...##", "#######", "######.", "##.##..",
+        "##..##.", "##..##.", "##...##", "##...##",
+    ],
+    [
+        "##...##", "##...##", "##...##", ".##.##.", ".#####.", "..###..", "..###..", "..###..",
+        "..###..", "..###..", "..###..", "..###..",
+    ],
+];
+
+/// `bloomery` as indices into [`LETTERS`].
+const WORD: [usize; 8] = [0, 1, 2, 2, 3, 4, 5, 6];
+
+/// The art in pixels: the wordmark warmed down its rows over its shadow,
+/// and beside it the furnace (a clay stack widening to its base, a flame at
+/// its mouth, the bloom glowing in its arch, the tuyere at its side).
+/// Without colour only the shapes stay: no shadow, no sparks, and the mouth
+/// and the arch left open.
+fn art(color: bool) -> Vec<Vec<Option<Rgb>>> {
+    let mut px = vec![vec![None; ART_W]; ART_H];
+    let (top, left) = (9, 2);
+    let layers: &[bool] = if color { &[true, false] } else { &[false] };
+    for &shadow in layers {
+        for (i, &letter) in WORD.iter().enumerate() {
+            for (r, row) in LETTERS[letter].iter().enumerate() {
+                for (k, _) in row.bytes().enumerate().filter(|&(_, b)| b == b'#') {
+                    let (y, x) = (top + r, left + 9 * i + k);
+                    if shadow {
+                        px[y + 1][x + 1] = Some(SHADOW);
+                    } else {
+                        px[y][x] = Some(heat(r, 12));
+                    }
+                }
+            }
+        }
+    }
+
+    let glow = |c: Rgb| color.then_some(c);
+    let ox = ART_W - 20;
+    for (y, row) in px.iter_mut().enumerate() {
+        for x in 0..20usize {
+            // The distance from the stack's middle, in quarter pixels.
+            let q = (4 * x + 2).abs_diff(40);
+            row[ox + x] = match y {
+                0..=4 => {
+                    let flame = [2, 2, 4, 6, 8][y];
+                    (q <= flame).then_some(if y >= 3 && q <= 2 {
+                        WHITE_HOT
+                    } else if y >= 2 && q <= 4 {
+                        YELLOW
+                    } else if y <= 1 {
+                        RED
+                    } else {
+                        ORANGE
+                    })
+                }
+                5..=21 => {
+                    let half = 12 + (y - 5);
+                    let arch = match y {
+                        15 => Some(2),
+                        16 => Some(6),
+                        17.. => Some(10),
+                        _ => None,
+                    };
+                    if q > half {
+                        ((y == 18 || y == 19) && x < 10).then_some(if y == 18 {
+                            TUYERE
+                        } else {
+                            TUYERE_LOW
+                        })
+                    } else if y == 5 && q <= 6 {
+                        glow(ORANGE)
+                    } else if arch.is_some_and(|a| q <= a) {
+                        glow(if y >= 18 && q <= 2 {
+                            WHITE_HOT
+                        } else if q <= 6 {
+                            YELLOW
+                        } else {
+                            ORANGE
+                        })
+                    } else if q > half - 4 {
+                        Some(if 4 * x + 2 < 40 { CLAY_LIT } else { CLAY_DARK })
+                    } else if (y - 5) % 4 == 3 {
+                        Some(CLAY_BAND)
+                    } else {
+                        Some(CLAY)
+                    }
+                }
+                22 => Some(GROUND),
+                _ => (2..18).contains(&x).then_some(GROUND_LOW),
+            };
+        }
+    }
+    if color {
+        for (y, x, c) in [
+            (0, 5, RED),
+            (0, 15, YELLOW),
+            (0, 19, ORANGE),
+            (1, 4, ORANGE),
+            (1, 12, WHITE_HOT),
+            (1, 14, YELLOW),
+            (2, 2, YELLOW),
+            (2, 14, RED),
+            (2, 18, YELLOW),
+            (3, 0, ORANGE),
+            (3, 17, RED),
+            (4, 5, YELLOW),
+            (4, 15, ORANGE),
+            (5, 1, RED),
+            (6, 18, ORANGE),
+            (7, 16, YELLOW),
+            (8, 19, RED),
+            (9, 2, ORANGE),
+        ] {
+            px[y][ox + x] = Some(c);
+        }
+    }
+    px
+}
+
+/// The terminal rows of the pixel rows `px`, two to a row. A cell lit above
+/// and below draws `█` (with colour, `▀` over a background when the two
+/// differ), above only `▀`, below only `▄`; in ASCII `#`, `"` and `.`. A
+/// row's trailing blank cells are left off.
+fn blocks(px: &[Vec<Option<Rgb>>], style: Style) -> Vec<String> {
+    let (full, upper, lower) = if style.utf8 {
+        ('█', '▀', '▄')
+    } else {
+        ('#', '"', '.')
+    };
+    px.chunks(2)
+        .map(|pair| {
+            let (top, low) = (&pair[0], pair.get(1));
+            let mut line = String::new();
+            let mut pen = (None, None);
+            for (x, &a) in top.iter().enumerate() {
+                let b = low.and_then(|l| l.get(x)).copied().flatten();
+                let (glyph, ink) = match (a, b) {
+                    (None, None) => (' ', (None, None)),
+                    (Some(a), None) => (upper, (Some(a), None)),
+                    (None, Some(b)) => (lower, (Some(b), None)),
+                    (Some(a), Some(b)) if a == b || !style.color => (full, (Some(a), None)),
+                    (Some(a), Some(b)) => (upper, (Some(a), Some(b))),
+                };
+                if style.color && ink != pen {
+                    if pen != (None, None) {
+                        line.push_str(RESET);
+                    }
+                    if let Some(fg) = ink.0 {
+                        line.push_str(&style.fg(fg));
+                    }
+                    if let Some(bg) = ink.1 {
+                        line.push_str(&style.bg(bg));
+                    }
+                    pen = ink;
+                }
+                line.push(glyph);
+            }
+            if pen != (None, None) {
+                line.push_str(RESET);
+            }
+            line.truncate(line.trim_end_matches(' ').len());
+            line
+        })
+        .collect()
+}
+
+/// A piece of the screen as a terminal shows it (`shown`, which sets its
+/// width) and as it is written (`painted`, with its escapes).
+#[derive(Clone, Default)]
+struct Text {
+    shown: String,
+    painted: String,
+}
+
+impl Text {
+    /// Appends `s`, painted with `code` (no escape when it is empty).
+    fn push(&mut self, s: &str, code: &str) {
+        self.shown.push_str(s);
+        if code.is_empty() {
+            self.painted.push_str(s);
+        } else {
+            self.painted.push_str(code);
+            self.painted.push_str(s);
+            self.painted.push_str(RESET);
+        }
+    }
+
+    /// Pads with spaces to column `to`.
+    fn pad(&mut self, to: usize) {
+        let n = to.saturating_sub(width(&self.shown));
+        self.push(&" ".repeat(n), "");
+    }
+
+    fn append(&mut self, other: &Text) {
+        self.shown.push_str(&other.shown);
+        self.painted.push_str(&other.painted);
+    }
+}
+
+/// `text` broken into lines of at most `w` columns: at a `dot` separator
+/// when the part after it fits a line, else at a space, and a word longer
+/// than `w` where the columns run out.
+fn wrap(text: &str, w: usize, dot: &str) -> Vec<String> {
+    let used = |lines: &[String]| lines.last().map_or(0, |l| width(l));
+    let sep = format!(" {dot} ");
+    let parts: Vec<&str> = text.split(sep.as_str()).collect();
+    let mut lines = vec![String::new()];
+    for (i, part) in parts.iter().enumerate() {
+        let part = if i + 1 < parts.len() {
+            format!("{part} {dot}")
+        } else {
+            (*part).to_owned()
+        };
+        let at = used(&lines);
+        if at > 0 && at + 1 + width(&part) > w && width(&part) <= w {
+            lines.push(String::new());
+        }
+        for word in part.split(' ').filter(|w| !w.is_empty()) {
+            let at = used(&lines);
+            if at > 0 && at + 1 + width(word) > w {
+                lines.push(String::new());
+            } else if let Some(l) = lines.last_mut().filter(|l| !l.is_empty()) {
+                l.push(' ');
+            }
+            for c in word.chars() {
+                let at = used(&lines);
+                if at > 0 && at + char_width(c) > w {
+                    lines.push(String::new());
+                }
+                if let Some(l) = lines.last_mut() {
+                    l.push(c);
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// The lines of the row `label`: its value wrapped to `w` columns less the
+/// label's ([`wrap`]), the label dimmed before the first line and the rest
+/// indented under it.
+fn row_lines(label: &str, value: &str, w: usize, style: Style, dot: &str) -> Vec<Text> {
+    wrap(value, w - LABEL, dot)
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let mut t = Text::default();
+            if i == 0 {
+                t.push(&format!("{label:<w$}", w = LABEL), style.code(DIM));
+            } else {
+                t.push(&" ".repeat(LABEL), "");
+            }
+            t.push(&v, "");
+            t
+        })
+        .collect()
+}
+
+/// A section's heading: its name, then a rule to `w` columns.
+fn heading(name: &str, w: usize, style: Style) -> Text {
+    let mut t = Text::default();
+    t.push(name, &style.fg(ORANGE));
+    let rule = if style.utf8 { "─" } else { "-" };
+    let rest = w.saturating_sub(width(name) + 1);
+    t.push(&format!(" {}", rule.repeat(rest)), style.code(DIM));
+    t
+}
+
+/// The cells of the `BAR`-cell bar the card, the tier card and the host take
+/// of `s`: the nearest share each, at least one for a part that holds
+/// experts, `None` when no part holds any or the counts overflow a `u64`.
+fn bar_cells(s: Split) -> Option<[usize; 3]> {
+    let parts = [s.card, s.tier, s.host];
+    let total = parts.iter().try_fold(0u64, |t, &p| t.checked_add(p))?;
+    if total == 0 {
+        return None;
+    }
+    let (total, n128) = (u128::from(total), BAR as u128);
+    let mut cells = parts.map(|p| match p {
+        0 => 0,
+        p => usize::try_from((u128::from(p) * n128 + total / 2) / total)
+            .unwrap_or(BAR)
+            .max(1),
+    });
+    while cells.iter().sum::<usize>() != BAR {
+        let widest = (0..3).max_by_key(|&i| cells[i]).unwrap_or(0);
+        if cells.iter().sum::<usize>() > BAR {
+            cells[widest] -= 1;
+        } else {
+            cells[widest] += 1;
+        }
+    }
+    Some(cells)
+}
+
+/// The experts bar and its legend, each a row under the `experts` label:
+/// the card's cells warmed along their length, then the tier card's and
+/// the host's.
+fn bar(s: Split, style: Style) -> Option<[Text; 2]> {
+    let [card, tier, host] = bar_cells(s)?;
+    let glyphs = if style.utf8 {
+        ["█", "▓", "░"]
+    } else {
+        ["#", "=", "."]
+    };
+    let mut cells = Text::default();
+    cells.push(&format!("{:<w$}", "experts", w = LABEL), style.code(DIM));
+    for i in 0..card {
+        cells.push(glyphs[0], &style.fg(heat(i, card)));
+    }
+    cells.push(&glyphs[1].repeat(tier), &style.fg(RED));
+    cells.push(&glyphs[2].repeat(host), &style.fg(HOST));
+
+    let mut legend = Text::default();
+    legend.push(&" ".repeat(LABEL), "");
+    for (glyph, name, color, held) in [
+        (glyphs[0], "card", YELLOW, s.card),
+        (glyphs[1], "tier", RED, s.tier),
+        (glyphs[2], "host", HOST, s.host),
+    ] {
+        if held > 0 {
+            if width(&legend.shown) > LABEL {
+                legend.push("   ", "");
+            }
+            legend.push(glyph, &style.fg(color));
+            legend.push(&format!(" {name}"), "");
+        }
+    }
+    Some([cells, legend])
+}
+
+/// The rows the placement panel shows, in the records' order.
+const PLACED: [&str; 4] = ["card", "tier", "host", "nvme"];
+/// The rows the serving panel shows.
+const SERVED: [&str; 6] = ["place", "arch", "model", "head", "context", "cache"];
 
 /// The screen of the record lines `lines` in `style`, or `None` when they
 /// hold no `listening` line.
@@ -560,14 +1047,12 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
             times: "x",
         }
     };
-    let Facts { seat, addr, rows } = facts(lines, marks)?;
-    let paint = |code: &str, text: &str| {
-        if style.color {
-            format!("{code}{text}{RESET}")
-        } else {
-            text.to_owned()
-        }
-    };
+    let Facts {
+        seat,
+        addr,
+        rows,
+        split,
+    } = facts(lines, marks)?;
     // A record value is shown without its control characters, and in ASCII
     // with `?` for every character past it.
     let plain = |text: &str| -> String {
@@ -576,110 +1061,140 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
             .map(|c| if style.utf8 || c.is_ascii() { c } else { '?' })
             .collect()
     };
+    let pick = |keep: &dyn Fn(&str) -> bool| -> Vec<(&str, String)> {
+        rows.iter()
+            .filter(|(l, _)| keep(l))
+            .map(|(l, v)| (*l, plain(v)))
+            .collect()
+    };
+    let dim = style.code(DIM);
+    let mut out = vec![String::new()];
+    out.extend(blocks(&art(style.color), style));
+    out.push(String::new());
 
     let seat = plain(&seat);
-    let addr = plain(&addr);
-    let title = format!("{seat} is ready");
-    let label_w = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
-    let body: Vec<(String, String)> = rows
-        .iter()
-        .map(|(label, value)| {
-            let value = plain(value);
-            let shown = format!("{label:<label_w$}  {value}");
-            let label = paint(DIM, &format!("{label:<label_w$}"));
-            let value = if shown.starts_with("url ") {
-                paint(URL, &value)
-            } else {
-                value
-            };
-            (shown, format!("{label}  {value}"))
-        })
-        .collect();
-    let inner = body
-        .iter()
-        .map(|(s, _)| width(s))
-        .chain([width(&title)])
-        .max()
-        .unwrap_or(0);
-    let (tl, tr, bl, br, h, v) = if style.utf8 {
-        ("╭", "╮", "╰", "╯", "─", "│")
-    } else {
-        ("+", "+", "+", "+", "-", "|")
-    };
-    let rule = h.repeat(inner + 2);
-    let mut boxed = vec![format!("{tl}{rule}{tr}")];
-    let mut row = |shown: &str, painted: &str| {
-        let pad = " ".repeat(inner - width(shown));
-        boxed.push(format!("{v} {painted}{pad} {v}"));
-    };
-    row(&title, &paint(BOLD, &title));
-    row("", "");
-    for (shown, painted) in &body {
-        row(shown, painted);
+    let mut status = Text::default();
+    let badge = format!("{}{}{}", style.bg(ORANGE), style.fg(INK), style.code(BOLD));
+    status.push(" READY ", &badge);
+    status.push("  ", "");
+    status.push(&seat, style.code(BOLD));
+    if let Some((_, loaded)) = pick(&|l| l == "loaded").first() {
+        let right = format!("loaded {loaded}");
+        status.pad(
+            INNER
+                .saturating_sub(width(&right))
+                .max(width(&status.shown) + 2),
+        );
+        status.push(&right, dim);
     }
-    boxed.push(format!("{bl}{rule}{br}"));
+    out.push(format!("{MARGIN}{}", status.painted));
+    let url = format!("http://{}", plain(&addr));
+    let mut at = Text::default();
+    at.push(&" ".repeat(LABEL), "");
+    at.push(if style.utf8 { "→ " } else { "-> " }, dim);
+    let link = format!(
+        "{}{}{}",
+        style.code(BOLD),
+        style.code(UNDERLINE),
+        style.fg(YELLOW)
+    );
+    at.push(&url, &link);
+    out.push(format!("{MARGIN}{}", at.painted));
 
-    let mut out = String::from("\n");
-    for i in 0..FURNACE.len().max(boxed.len()) {
-        let art = FURNACE.get(i).copied().unwrap_or("                ");
-        let art = furnace_row(art, i, style);
-        match boxed.get(i) {
-            Some(b) => out.push_str(&format!("{art} {b}\n")),
-            None => out.push_str(&format!("{}\n", art.trim_end())),
+    let placed = pick(&|l| PLACED.contains(&l));
+    let served = pick(&|l| SERVED.contains(&l));
+    let bar = split.and_then(|s| bar(s, style));
+    let has_left = !placed.is_empty() || bar.is_some();
+    let (lw, rw) = match (has_left, served.is_empty()) {
+        (true, false) => (LEFT, INNER - LEFT - GAP),
+        (true, true) => (INNER, 0),
+        (false, _) => (0, INNER),
+    };
+    let mut left = Vec::new();
+    if has_left {
+        left.push(heading("placement", lw, style));
+        left.extend(bar.into_iter().flatten());
+        for (label, value) in &placed {
+            left.extend(row_lines(label, value, lw, style, marks.dot));
         }
     }
-    out.push('\n');
-    let url = format!("http://{addr}");
-    if seat.ends_with("-decide") {
-        out.push_str(&format!(
-            "  try:  POST {}\n",
-            paint(URL, &format!("{url}/v1/systemone"))
-        ));
-    } else {
-        out.push_str("  try:\n");
-        out.push_str(&format!(
-            "    curl {} \\\n",
-            paint(URL, &format!("{url}/v1/chat/completions"))
-        ));
-        out.push_str("      -H 'Content-Type: application/json' \\\n");
-        out.push_str("      -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}'\n");
+    let mut right = Vec::new();
+    if !served.is_empty() {
+        right.push(heading("serving", rw, style));
+        for (label, value) in &served {
+            right.extend(row_lines(label, value, rw, style, marks.dot));
+        }
     }
-    out.push('\n');
-    out.push_str(&paint(
-        DIM,
-        &format!(
-            "  Ctrl+C stops the server {} BLOOMERY_SCREEN=off hides this screen",
-            marks.dot
-        ),
-    ));
-    out.push('\n');
-    Some(out)
-}
+    if !left.is_empty() || !right.is_empty() {
+        out.push(String::new());
+    }
+    for i in 0..left.len().max(right.len()) {
+        let mut line = left.get(i).cloned().unwrap_or_default();
+        if let Some(r) = right.get(i) {
+            if has_left {
+                line.pad(lw + GAP);
+            }
+            line.append(r);
+        }
+        out.push(format!("{MARGIN}{}", line.painted));
+    }
+    // Rows neither panel names (the plan's card list, the unread records)
+    // run the full width below them.
+    let wide = pick(&|l| l != "loaded" && !PLACED.contains(&l) && !SERVED.contains(&l));
+    if !wide.is_empty() {
+        out.push(String::new());
+        for (label, value) in &wide {
+            for t in row_lines(label, value, INNER, style, marks.dot) {
+                out.push(format!("{MARGIN}{}", t.painted));
+            }
+        }
+    }
 
-/// Row `i` of [`FURNACE`] in `style`: the smoke dimmed, the glow as `▓` in
-/// UTF-8 and `#` in ASCII, coloured when the style is.
-fn furnace_row(art: &str, i: usize, style: Style) -> String {
-    let glow = if style.utf8 { "▓" } else { "#" };
-    if !style.color {
-        return art.replace('*', glow);
+    out.push(String::new());
+    out.push(format!("{MARGIN}{}", heading("try", INNER, style).painted));
+    let yellow = style.fg(YELLOW);
+    let mut lines = Vec::new();
+    if seat.ends_with("-decide") {
+        let mut t = Text::default();
+        t.push("POST ", dim);
+        t.push(&format!("{url}/v1/systemone"), &yellow);
+        lines.push(t);
+    } else {
+        let mut t = Text::default();
+        t.push("$ ", dim);
+        t.push("curl ", "");
+        t.push(&format!("{url}/v1/chat/completions"), &yellow);
+        t.push(" \\", dim);
+        lines.push(t);
+        let mut t = Text::default();
+        t.push("    -H 'Content-Type: application/json' \\", dim);
+        lines.push(t);
+        let mut t = Text::default();
+        t.push("    -d ", dim);
+        t.push(r#"'{"messages":[{"role":"user","content":"Hello!"}]}'"#, "");
+        lines.push(t);
     }
-    if i < SMOKE_ROWS {
-        return format!("{DIM}{art}{RESET}");
-    }
-    match (art.find('*'), art.rfind('*')) {
-        (Some(a), Some(b)) => format!(
-            "{}{GLOW}{}{RESET}{}",
-            &art[..a],
-            glow.repeat(b - a + 1),
-            &art[b + 1..]
-        ),
-        _ => art.to_owned(),
-    }
+    out.extend(lines.iter().map(|t| format!("{MARGIN}{}", t.painted)));
+
+    out.push(String::new());
+    let key = format!("{}{}", style.bg(KEY), style.fg(CREAM));
+    let mut keys = Text::default();
+    keys.push(" Ctrl+C ", &key);
+    keys.push(" stops the server", dim);
+    keys.push("    ", "");
+    keys.push(" BLOOMERY_SCREEN=off ", &key);
+    keys.push(" hides this screen", dim);
+    out.push(format!("{MARGIN}{}", keys.painted));
+    out.push(String::new());
+    Some(out.join("\n"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Style, TermVars, render, width};
+    use super::{
+        ART_H, GAP, LABEL, LEFT, MARGIN, Rgb, Split, Style, TermVars, bar_cells, blocks, render,
+        width,
+    };
 
     /// The record lines of a V4.1 seat's start, as its log carries them.
     const START: &str = include_str!("../tests/fixtures/screen-start.log");
@@ -689,15 +1204,33 @@ mod tests {
 
     const ASCII: Style = Style {
         color: false,
+        truecolor: false,
         utf8: false,
     };
     const UTF8: Style = Style {
         color: false,
+        truecolor: false,
+        utf8: true,
+    };
+    const CUBE: Style = Style {
+        color: true,
+        truecolor: false,
+        utf8: true,
+    };
+    const TRUE: Style = Style {
+        color: true,
+        truecolor: true,
         utf8: true,
     };
 
     fn lines(text: &str) -> Vec<&str> {
         text.lines().collect()
+    }
+
+    /// How the row `label` starts on the screen: its label padded to the
+    /// label's columns, after a space.
+    fn row(label: &str) -> String {
+        format!(" {label:<w$}", w = LABEL)
     }
 
     fn golden_path(name: &str) -> String {
@@ -725,31 +1258,31 @@ mod tests {
     }
 
     /// The screen of a fixed start, in UTF-8 and in ASCII, each the golden
-    /// text; with colour, the same screen once the escapes are taken out.
+    /// text; with colour, in 24 bits and in the 256-colour cube, the same
+    /// text below the art once the escapes are taken out (the art keeps its
+    /// shadow and glow only in colour).
     #[test]
     fn renders_the_golden_screens() {
-        let got = render(&lines(START), UTF8).expect("the start has a listening line");
-        golden("screen-utf8.txt", &got);
+        let plain = render(&lines(START), UTF8).expect("the start has a listening line");
+        golden("screen-utf8.txt", &plain);
         let got = render(&lines(START), ASCII).expect("the start has a listening line");
         golden("screen-ascii.txt", &got);
         assert!(got.is_ascii(), "the ASCII screen holds a byte past ASCII");
 
-        let colored = render(
-            &lines(START),
-            Style {
-                color: true,
-                utf8: true,
-            },
-        )
-        .unwrap();
-        assert!(
-            colored.contains("\x1b["),
-            "no escape in the coloured screen"
-        );
-        assert_eq!(
-            strip_escapes(&colored),
-            render(&lines(START), UTF8).unwrap()
-        );
+        // PIN(2026-10-22): colour adds the art's shadow and glow; the text below must match.
+        let below_art = |s: &str| {
+            s.split('\n')
+                .skip(1 + ART_H / 2)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for (style, escape) in [(TRUE, "\x1b[38;2;"), (CUBE, "\x1b[38;5;")] {
+            let colored = render(&lines(START), style).unwrap();
+            assert!(colored.contains(escape), "no {escape:?} in {style:?}");
+            assert_eq!(below_art(&strip_escapes(&colored)), below_art(&plain));
+        }
+        assert!(!render(&lines(START), CUBE).unwrap().contains("\x1b[38;2;"));
+        assert_eq!(super::cube(Rgb(255, 0, 0)), 196);
     }
 
     /// A Qwen3.8 start that pages its experts: the NVMe row names the arena
@@ -772,11 +1305,11 @@ mod tests {
 
     /// The fixed start with its `plan`, `load` and `place unset` lines taken
     /// out: the screen leaves off the rows those records hold (card, host,
-    /// nvme, loaded, the place's why) and keeps the rest, the golden text.
-    /// The same lines in reverse order draw the same screen, and so does the
-    /// whole start reversed: each head has one line here, and a row is read
-    /// from the last line of its head, never from where it sits among the
-    /// others.
+    /// nvme, the experts bar, the load time, the place's why) and keeps the
+    /// rest, the golden text. The same lines in reverse order draw the same
+    /// screen, and so does the whole start reversed: each head has one line
+    /// here, and a row is read from the last line of its head, never from
+    /// where it sits among the others.
     #[test]
     fn missing_and_reordered_lines_keep_to_the_records() {
         let missing: Vec<&str> = lines(START)
@@ -803,7 +1336,7 @@ mod tests {
 
     /// Records that name another placement than the `listening` line are not
     /// joined to it: a `place unset` line gives no why, a `plan` and a `load`
-    /// line no card, host or load row.
+    /// line no card, host, experts or load time.
     #[test]
     fn records_of_another_place_are_left_off() {
         let start: Vec<String> = lines(START)
@@ -819,10 +1352,16 @@ mod tests {
             })
             .collect();
         let got = render(&start, ASCII).unwrap();
-        assert!(got.contains("| place    a "), "{got}");
-        for gone in ["break-even", "| card ", "| host ", "| loaded "] {
+        assert!(got.contains(&format!("{}a\n", row("place"))), "{got}");
+        for gone in [
+            "break-even".to_owned(),
+            row("card"),
+            row("host"),
+            row("experts"),
+            "loaded in".to_owned(),
+        ] {
             assert!(
-                !got.contains(gone),
+                !got.contains(&gone),
                 "{gone} from a record of place bp:\n{got}"
             );
         }
@@ -836,15 +1375,20 @@ mod tests {
             "bloomery-serve-qwen38: place=a ctx=8192 slots=2 slot_ctx=8192 listening on http://0.0.0.0:9000",
         ];
         let got = render(&only, ASCII).unwrap();
-        for row in ["url", "place", "context"] {
-            assert!(got.contains(&format!("| {row} ")), "no {row} row:\n{got}");
+        assert!(got.contains("-> http://0.0.0.0:9000\n"), "{got}");
+        for label in ["place", "context"] {
+            assert!(got.contains(&row(label)), "no {label} row:\n{got}");
         }
-        for row in ["card", "host", "nvme", "cache", "loaded"] {
+        for label in ["card", "host", "nvme", "cache", "experts"] {
             assert!(
-                !got.contains(&format!("| {row} ")),
-                "a {row} row from no record:\n{got}"
+                !got.contains(&row(label)),
+                "a {label} row from no record:\n{got}"
             );
         }
+        assert!(
+            !got.contains("loaded in"),
+            "a load time from no record:\n{got}"
+        );
         assert!(got.contains("2 slots x 8192 positions"), "{got}");
     }
 
@@ -879,7 +1423,7 @@ mod tests {
                 "load ",
                 " in 41.2 s ",
                 " in soon s ",
-                "| loaded ",
+                "loaded in".to_owned(),
                 "load",
             ),
             (
@@ -887,7 +1431,7 @@ mod tests {
                 "load ",
                 "resident_bytes=48318382080",
                 "resident_bytes=lots",
-                " resident",
+                " resident".to_owned(),
                 "load",
             ),
             (
@@ -895,7 +1439,7 @@ mod tests {
                 "plan ",
                 "card_experts=2668 (",
                 "card_experts=many (",
-                "2668",
+                "2668".to_owned(),
                 "plan",
             ),
             (
@@ -903,7 +1447,7 @@ mod tests {
                 "plan ",
                 "(44750684160 B)",
                 "(lots B)",
-                "(41.7 GiB)",
+                "(41.7 GiB)".to_owned(),
                 "plan",
             ),
             (
@@ -911,7 +1455,7 @@ mod tests {
                 "parallel ",
                 "slots=2 ",
                 "slots=two ",
-                "slots",
+                "slots".to_owned(),
                 "parallel",
             ),
             (
@@ -919,7 +1463,7 @@ mod tests {
                 "cache ",
                 "ram=8589934592",
                 "ram=lots",
-                "| cache ",
+                row("cache"),
                 "cache",
             ),
             (
@@ -927,26 +1471,26 @@ mod tests {
                 "nvtier ",
                 "paged=107374182400",
                 "paged=lots",
-                "| nvme ",
+                row("nvme"),
                 "nvtier",
             ),
         ] {
             let start = mutated(start, head, from, to);
             let got = render(&start, ASCII).unwrap();
             assert!(
-                !got.contains(gone),
+                !got.contains(&gone),
                 "{gone} from a {record} value that is no number:\n{got}"
             );
             assert!(
                 got.lines()
-                    .any(|l| l.contains("| unread ") && l.contains(record)),
+                    .any(|l| l.contains(&row("unread")) && l.contains(record)),
                 "no unread row naming {record}:\n{got}"
             );
         }
         for start in [START, START38] {
             let got = render(&lines(start), ASCII).unwrap();
             assert!(
-                !got.contains("| unread "),
+                !got.contains(&row("unread")),
                 "an unread row from a clean start:\n{got}"
             );
         }
@@ -965,20 +1509,23 @@ mod tests {
         ];
         let got = render(&start, ASCII).unwrap();
         assert!(
-            got.contains(
-                "| devices  [stage:A6000:cuda1:50952404992,tier0:3090:cuda0:25350373376] "
-            ),
+            got.contains(&format!(
+                "{}[stage:A6000:cuda1:50952404992,tier0:3090:cuda0:25350373376]\n",
+                row("devices")
+            )),
             "{got}"
         );
     }
 
     /// A value with Hangul and a combining mark pads by the columns a
-    /// terminal draws, so every row of the box ends in the same column; a
-    /// control character in a value is not drawn.
+    /// terminal draws, so the serving panel's rows start in one column beside
+    /// a placement row that holds wide characters; a control character in a
+    /// value is not drawn.
     #[test]
-    fn wide_and_control_characters_keep_the_box_square() {
+    fn wide_and_control_characters_keep_the_panels_aligned() {
         let start = [
-            "bloomery-serve-decide: model=삽살이-Q4_K_M.gguf quant=q4_K×1988 q6_K×97 \
+            "plan place=a card=삽살개카드 card_experts=10 host_experts=30",
+            "bloomery-serve-decide: place=a model=삽살이-Q4_K_M.gguf quant=q4_K×1988 q6_K×97 \
              head=e\u{301}tiquette.safetensors\x1b[31m row=clef listening on http://127.0.0.1:8080",
         ];
         let got = render(&start, UTF8).unwrap();
@@ -986,14 +1533,79 @@ mod tests {
             !got.contains('\x1b'),
             "an escape from a record value:\n{got}"
         );
-        let boxed: Vec<&str> = got.lines().filter(|l| l.contains('│')).collect();
-        assert!(boxed.iter().any(|l| l.contains("삽살이")), "{got}");
-        let ends: Vec<usize> = boxed.iter().map(|l| width(l)).collect();
-        assert!(ends.windows(2).all(|w| w[0] == w[1]), "{ends:?}\n{got}");
+        assert!(got.contains("삽살개카드"), "{got}");
+        let column = width(MARGIN) + LEFT + GAP;
+        let mut met = 0;
+        for line in got.lines() {
+            for label in ["place", "model", "head"] {
+                if let Some(at) = line.find(&format!("{label:<w$}", w = LABEL)) {
+                    assert_eq!(width(&line[..at]), column, "{label} in {line:?}\n{got}");
+                    met += 1;
+                }
+            }
+        }
+        assert_eq!(met, 3, "{got}");
         assert_eq!(width("삽살이"), 6);
         assert_eq!(width("か\u{3099}"), width("が"));
         assert_eq!(width("\u{1F680}"), 2);
         assert_eq!(width("e\u{301}"), 1);
+    }
+
+    /// Two pixel rows make one terminal row: lit above and below `█` (with
+    /// two colours, `▀` over the lower one's background), above only `▀`,
+    /// below only `▄`, in ASCII `#`, `"` and `.`; an odd last pixel row
+    /// draws as an upper half, and trailing blank cells are left off.
+    #[test]
+    fn half_blocks_pair_the_pixel_rows() {
+        let (a, b) = (Some(Rgb(1, 2, 3)), Some(Rgb(4, 5, 6)));
+        let px = vec![
+            vec![a, a, a, None, None],
+            vec![a, b, None, b, None],
+            vec![a, None, None, None, None],
+        ];
+        assert_eq!(blocks(&px, UTF8), ["██▀▄", "▀"]);
+        assert_eq!(blocks(&px, ASCII), ["##\".", "\""]);
+        let colored = blocks(&px, TRUE);
+        assert_eq!(
+            colored[0],
+            "\x1b[38;2;1;2;3m█\x1b[0m\x1b[38;2;1;2;3m\x1b[48;2;4;5;6m▀\x1b[0m\
+             \x1b[38;2;1;2;3m▀\x1b[0m\x1b[38;2;4;5;6m▄\x1b[0m"
+        );
+        assert_eq!(strip_escapes(&colored[0]), "█▀▀▄");
+    }
+
+    /// The experts bar's cells: the nearest share each, a part that holds
+    /// experts at least one cell however small, every cell taken, and no bar
+    /// when no part holds any.
+    #[test]
+    fn the_bar_shares_its_cells() {
+        let split = |card, tier, host| Split { card, tier, host };
+        assert_eq!(bar_cells(split(2668, 0, 12692)), Some([6, 0, 28]));
+        assert_eq!(bar_cells(split(1, 0, 100_000)), Some([1, 0, 33]));
+        assert_eq!(bar_cells(split(10, 10, 10)), Some([11, 11, 12]));
+        assert_eq!(bar_cells(split(0, 0, 0)), None);
+        assert_eq!(bar_cells(split(u64::MAX, 0, 2)), None);
+    }
+
+    /// The tier card's experts come from the plan, else from the load when
+    /// the plan record has no count (a placement whose plan names only its
+    /// first card), so the bar keeps the tier's cells; a tier count that is
+    /// no number leaves the bar off and the `unread` row names the record.
+    #[test]
+    fn the_bar_takes_the_tier_count_from_the_load() {
+        let start = |tier: &str| {
+            [
+                "plan place=bp card=A6000 card_experts=10 host_experts=10".to_owned(),
+                format!("load resident_bytes=1 place=bp tier_experts={tier} in 1.0 s"),
+                "bloomery-serve-glm: place=bp listening on http://127.0.0.1:8080".to_owned(),
+            ]
+        };
+        let got = render(&start("10"), UTF8).unwrap();
+        assert!(got.contains("▓ tier"), "{got}");
+        assert!(got.contains(&"▓".repeat(11)), "{got}");
+        let got = render(&start("lots"), UTF8).unwrap();
+        assert!(!got.contains(&row("experts")), "{got}");
+        assert!(got.contains("load: a value is no number"), "{got}");
     }
 
     /// No `listening` line, no screen: a start that did not reach its
@@ -1004,21 +1616,13 @@ mod tests {
             .into_iter()
             .filter(|l| !l.contains(" listening on http://"))
             .collect();
-        assert_eq!(
-            render(
-                &start,
-                Style {
-                    color: true,
-                    utf8: true
-                }
-            ),
-            None
-        );
+        assert_eq!(render(&start, TRUE), None);
     }
 
     /// The terminal's variables: `NO_COLOR` set and not empty, or
-    /// `TERM=dumb`, turn colour off; the first non-empty locale variable
-    /// decides UTF-8, which `TERM=dumb` turns off too.
+    /// `TERM=dumb`, turn colour off; `COLORTERM` of `truecolor` or `24bit`
+    /// draws 24-bit colour when there is colour; the first non-empty locale
+    /// variable decides UTF-8, which `TERM=dumb` turns off too.
     #[test]
     fn the_style_follows_the_terminal_variables() {
         let utf8 = Some("ko_KR.UTF-8");
@@ -1028,21 +1632,34 @@ mod tests {
                 lang: utf8,
                 ..TermVars::default()
             }),
-            Style {
-                color: true,
-                utf8: true
-            }
+            CUBE
+        );
+        for colorterm in ["truecolor", "24bit"] {
+            assert_eq!(
+                style(TermVars {
+                    colorterm: Some(colorterm),
+                    lang: utf8,
+                    ..TermVars::default()
+                }),
+                TRUE
+            );
+        }
+        assert!(
+            !style(TermVars {
+                colorterm: Some("yes"),
+                ..TermVars::default()
+            })
+            .truecolor,
+            "COLORTERM=yes is not 24-bit"
         );
         assert_eq!(
             style(TermVars {
                 no_color: Some("1"),
+                colorterm: Some("truecolor"),
                 lang: utf8,
                 ..TermVars::default()
             }),
-            Style {
-                color: false,
-                utf8: true
-            }
+            UTF8
         );
         assert!(
             style(TermVars {
@@ -1055,13 +1672,11 @@ mod tests {
         assert_eq!(
             style(TermVars {
                 term: Some("dumb"),
+                colorterm: Some("truecolor"),
                 lang: utf8,
                 ..TermVars::default()
             }),
-            Style {
-                color: false,
-                utf8: false
-            }
+            ASCII
         );
         assert!(
             !style(TermVars {

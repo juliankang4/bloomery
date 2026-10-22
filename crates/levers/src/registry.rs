@@ -1055,10 +1055,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               printed (where the model went, its context and slots, the address); `off` \
               leaves the record lines alone. It is drawn only when stderr is a terminal, so \
               piped stderr never shows it, whatever this says. `NO_COLOR` (set and not empty) \
-              or `TERM=dumb` draws it without colour; `TERM=dumb` or a locale whose first set \
-              variable of `LC_ALL`, `LC_CTYPE` and `LANG` names no UTF-8 draws it in plain \
-              ASCII. Every seat of `bloomery-serve` acts on it, and so do the per-model \
-              binaries that are its seats.",
+              or `TERM=dumb` draws it without colour; `COLORTERM=truecolor` (or `24bit`) draws \
+              its colours in 24 bits, any other terminal in the 256-colour cube; `TERM=dumb` \
+              or a locale whose first set variable of `LC_ALL`, `LC_CTYPE` and `LANG` names \
+              no UTF-8 draws it in plain ASCII. Every seat of `bloomery-serve` acts on it, \
+              and so do the per-model binaries that are its seats.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

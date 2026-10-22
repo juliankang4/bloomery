@@ -1,20 +1,31 @@
 
-      (   )      +--------------------------------------------------------------+
-     (  )  )     | bloomery-serve-ds41 is ready                                 |
-      )  (       |                                                              |
-    .-'--'-.     | url      http://127.0.0.1:8080                               |
-   /  ____  \    | place    a (one card)                                        |
-  |  /####\  |   | card     A6000 - 2668 experts (41.7 GiB) - 45.0 GiB resident |
-  |  \####/  |== | host     12692 experts (199.3 GiB)                           |
-  |__________|   | nvme     nothing paged                                       |
- ~~~~~~~~~~~~~~  | context  2 slots x 16384 positions (32768 in all)            |
-                 | cache    8.0 GiB of prompt cache in RAM                      |
-                 | loaded   in 41.2 s                                           |
-                 +--------------------------------------------------------------+
+                                                                                       ##
+                                                                                      .##.
+                                                                                     ."""".
+                                                                                    .######.
+  ......   ..        .....    .....   ..   ..  .......  ......   ..   ..            ########
+  ##"""##  ##       ##"""##  ##"""##  ###.###  ##"""""  ##"""##  ##   ##           .########.
+  ##  .#"  ##       ##   ##  ##   ##  ## " ##  ##       ##   ##   ##.##            ##########
+  #####.   ##       ##   ##  ##   ##  ##   ##  ######   ######"    ###            .####""####.
+  ##   ##  ##       ##   ##  ##   ##  ##   ##  ##       ## "#.     ###            ###"    "###
+  ##...##  ##.....  ##...##  ##...##  ##   ##  ##.....  ##  "#.    ###        #######      ###.
+  """"""   """""""   """""    """""   ""   ""  """""""  ""   ""    """           ####      ####
+                                                                              ""################""
 
-  try:
-    curl http://127.0.0.1:8080/v1/chat/completions \
+   READY   bloomery-serve-ds41                                                    loaded in 41.2 s
+           -> http://127.0.0.1:8080
+
+  placement ----------------------------------   serving -----------------------------------------
+  experts  ######............................    place    a (one card)
+           # card   . host                       context  2 slots x 16384 positions (32768 in all)
+  card     A6000 - 2668 experts (41.7 GiB) -     cache    8.0 GiB of prompt cache in RAM
+           45.0 GiB resident
+  host     12692 experts (199.3 GiB)
+  nvme     nothing paged
+
+  try --------------------------------------------------------------------------------------------
+  $ curl http://127.0.0.1:8080/v1/chat/completions \
       -H 'Content-Type: application/json' \
       -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 
-  Ctrl+C stops the server - BLOOMERY_SCREEN=off hides this screen
+   Ctrl+C  stops the server     BLOOMERY_SCREEN=off  hides this screen
