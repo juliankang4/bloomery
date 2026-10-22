@@ -43,7 +43,7 @@
 //!   are staged), BF16 the same tile over widened words (`bf16_tile_gemm`).
 //!   On GB10, BF16 and the E4M3 formats instead use BF16 tensor-core operands
 //!   with F32 accumulation (`bf16_mma_gemm`, `mxfp8_mma_gemm`, `fp8_b128_mma_gemm`);
-//!   values outside normal BF16 range keep F32 terms within that kernel.
+//!   exceptional operands replay the exact F32 tile within that kernel.
 //!   A site's weight is the resident tensor of its name, rows of it (a part
 //!   of a weight joined at load), or, for a K-quant, the words a caller
 //!   holds ([`SiteWeight`]). NVFP4 has no wide GEMM and is refused here by

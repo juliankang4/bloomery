@@ -143,10 +143,11 @@ pub fn check_mma(tag: &str, (y, x, k): (&[f32], &[f32], usize), w: &[Vec<f32>]) 
         }
     }
     let cols = x.len() / k;
-    kl = kl.max(0.0) / cols as f64;
-    kl_q8 = kl_q8.max(0.0) / cols as f64;
+    kl /= cols as f64;
+    kl_q8 /= cols as f64;
     // A single dot's L2 error depends on cancellation; KL and the derived band decide acceptance.
-    let quality = kl.is_finite() && (!q8_representable || kl <= kl_q8 + 1e-12);
+    let quality = kl.is_finite()
+        && (!q8_representable || (kl_q8.is_finite() && kl.max(0.0) <= kl_q8.max(0.0) + 1e-12));
     let pass = band && quality;
     println!(
         "dense_mma {tag} columns={cols} q8_representable={q8_representable} worst_err_over_band={worst:.6e} \
@@ -161,6 +162,28 @@ pub fn check_mma(tag: &str, (y, x, k): (&[f32], &[f32], usize), w: &[Vec<f32>]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mma_rejects_undefined_kl() {
+        let mut w = vec![vec![0.0; 64]];
+        let mut x = vec![0.0; 64];
+        w[0][0] = f32::from_bits(0x7f01_0000);
+        x[0] = f32::from_bits(0x3ffe_0419);
+        let scalar = check_mma(
+            "overflow_scalar",
+            (&[f32::from_bits(0x7f7f_fc00)], &x, 64),
+            &w,
+        );
+        let rows = check_mma(
+            "overflow_rows",
+            (&[f32::MAX, 0.0], &[4.0; 64], 64),
+            &[vec![2.0f32.powi(120); 64], vec![0.0; 64]],
+        );
+        assert!(
+            !scalar && !rows,
+            "undefined KL accepted: scalar={scalar} rows={rows}"
+        );
+    }
 
     /// √32 is the crest's bound, and the model's value is the one the
     /// bands' derivations quote.

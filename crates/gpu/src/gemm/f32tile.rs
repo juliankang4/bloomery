@@ -30,8 +30,8 @@
 //!
 //! GB10 prompt sites select [`bf16_mma_body`] for BF16 and E4M3 weights.
 //! It rounds activations and decoded weights to BF16 and accumulates in F32.
-//! A fragment outside normal BF16 range uses F32 terms instead, preserving
-//! the file formats' full exponent range. The exact tile entries stay available.
+//! Exceptional operands replay the tile through the exact F32 owner, preserving
+//! its exponent range and reduction order. The exact tile entries stay available.
 
 use super::gemm32::{GEMM32_GROUP, raster32};
 use super::kernels32::Gemm32Kernels;
@@ -256,38 +256,64 @@ pub(crate) unsafe fn f32_tile_body<W: TileRows>(
     if c0 >= n {
         return; // block-uniform, before the first barrier
     }
+    // SAFETY: the wrapper supplies this block's checked tile and all 512 threads.
+    unsafe { f32_tile_at::<W, F32T_THREADS>(w, x, (rows, k as usize, n), y, sh, (row0, c0, 0)) };
+}
+
+/// Exact tile owner, with 256 threads walking one row half or 512 walking both.
+///
+/// # Safety
+///
+/// All THREADS threads call converged. THREADS is 256 or 512; row_half is
+/// 0 for 512 and 0 or 1 for 256. Rows and n are positive; kk is a positive
+/// multiple of LINE. The weight holds rows*kk values, x holds n*kk aligned
+/// values, and y holds rows*n outputs. The aligned shared allocation holds
+/// STAGES*STAGE_FLOATS values. No other block writes this output tile.
+#[inline(always)]
+unsafe fn f32_tile_at<W: TileRows, const THREADS: usize>(
+    w: W,
+    x: &[f32],
+    (rows, kk, n): (usize, usize, usize),
+    y: &mut DisjointSlice<f32>,
+    sh: *mut f32,
+    (row0, c0, row_half): (usize, usize, usize),
+) {
     let tid = thread::threadIdx_x() as usize;
     let lane = warp::lane_id() as usize;
-    let (rg, cg) = ((tid / 32) / COL_GROUPS, (tid / 32) % COL_GROUPS);
-    let kk = k as usize;
+    let (rg, cg) = (
+        (tid / 32) / COL_GROUPS + row_half * 2,
+        (tid / 32) % COL_GROUPS,
+    );
     let stages = kk / LINE;
 
     // This thread's copies of every stage: piece `piece` of row line `line`
     // and of column line `line`, a row past the last staged as the last and
     // a column past the last as the last.
-    let line = tid / LINE_COPIES;
-    let piece = 4 * (tid % LINE_COPIES);
-    let w_off = (row0 + line).min(rows - 1) * kk + piece;
-    let x_off = (c0 + line).min(n - 1) * kk + piece;
-    let w_dst = line * LINE + piece;
-    let x_dst = (TILE_ROWS + line) * LINE + piece;
     macro_rules! stage_copy {
         ($s:expr, $buf:expr) => {{
             let (s, buf): (usize, usize) = ($s, $buf);
-            // SAFETY: s < stages, so s·LINE + piece + 4 <= k: the four values
-            // lie in a row below `rows` of w and the 16 source bytes in a
-            // column below `n` of x, 16-byte aligned (k a multiple of 64, x's
-            // base 16-byte aligned: this fn's contract). Each destination is
-            // this thread's own 16 bytes of stage buf < STAGES, 16-byte
-            // aligned, read by no warp until the barrier after the wait that
-            // completes this stage.
-            unsafe {
-                let dst = sh.add(buf * STAGE_FLOATS);
-                w.stage(dst.add(w_dst), w_off + s * LINE);
-                cp_async_cg_16(
-                    dst.add(x_dst).cast::<u32>(),
-                    x.as_ptr().add(x_off + s * LINE).cast::<u32>(),
-                );
+            for i in 0..F32T_THREADS / THREADS {
+                thread::__unroll_config::<0>();
+                let copy = tid + i * THREADS;
+                let line = copy / LINE_COPIES;
+                let piece = 4 * (copy % LINE_COPIES);
+                let w_off = (row0 + line).min(rows - 1) * kk + piece;
+                let x_off = (c0 + line).min(n - 1) * kk + piece;
+                let w_dst = line * LINE + piece;
+                let x_dst = (TILE_ROWS + line) * LINE + piece;
+                // SAFETY: buf < STAGES selects this block's allocated stage.
+                let dst = unsafe { sh.add(buf * STAGE_FLOATS) };
+                // SAFETY: the copies partition the checked tile's aligned
+                // weight pieces; no warp reads them until the wait/barrier.
+                unsafe { w.stage(dst.add(w_dst), w_off + s * LINE) };
+                // SAFETY: x_off selects a live aligned column piece and x_dst
+                // is this thread's disjoint aligned piece of the stage.
+                unsafe {
+                    cp_async_cg_16(
+                        dst.add(x_dst).cast::<u32>(),
+                        x.as_ptr().add(x_off + s * LINE).cast::<u32>(),
+                    )
+                };
             }
         }};
     }
@@ -410,6 +436,7 @@ pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
     let group = lane / 4;
     let pair = 2 * (lane % 4);
     let mut acc = [[[0.0f32; 4]; 2]; 2];
+    let mut retry = false;
     let stages = kk / MMA_LINE;
     let staged_at = |at: usize| at ^ (((at / MMA_LINE) & 3) * 8);
     macro_rules! copy {
@@ -473,7 +500,9 @@ pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
             let (a, b) = (read(at), read(at + 1));
             let fits = |v: f32| {
                 let bits = v.to_bits() & 0x7fff_ffff;
-                bits == 0 || (bits >= 0x0080_0000 && bits <= 0x7f7f_0000)
+                // |a|, |b| <= 2^47 and K < 2^32 bound every partial
+                // absolute sum below 2^126, including the exact butterfly.
+                bits == 0 || (bits >= 0x0080_0000 && bits <= 0x5700_0000)
             };
             (cvt_bf16x2_f32(a, b), fits(a) && fits(b))
         };
@@ -494,22 +523,15 @@ pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
                     let b0 = packed(at);
                     let b1 = packed(at + 8);
                     let safe = a0.1 && a1.1 && a2.1 && a3.1 && b0.1 && b1.1;
-                    if warp::any(!safe) {
-                        // BF16 MMA need not preserve subnormal operands. The
-                        // same output fragment keeps the full-range F32 terms.
-                        for i in 0..4 {
-                            thread::__unroll_config::<0>();
-                            let ra = (wr + mi * 16 + group + (i / 2) * 8) * MMA_LINE + step * 16;
-                            let rb = (MMA_ROWS + wc + j * 8 + pair + i % 2) * MMA_LINE + step * 16;
-                            for t in 0..16 {
-                                acc[mi][j][i] = read(ra + t).mul_add(read(rb + t), acc[mi][j][i]);
-                            }
-                        }
-                    } else {
-                        // SAFETY: the whole warp is converged; A is row-major
-                        // and B column-major in the m16n8k16 fragment layout.
-                        acc[mi][j] = unsafe { mma_m16n8k16_f32_bf16(acc[mi][j], a, [b0.0, b1.0]) };
-                    }
+                    // SAFETY: the whole warp is converged; A is row-major
+                    // and B column-major in the m16n8k16 fragment layout.
+                    let next = unsafe { mma_m16n8k16_f32_bf16(acc[mi][j], a, [b0.0, b1.0]) };
+                    let finite = next[0].is_finite()
+                        && next[1].is_finite()
+                        && next[2].is_finite()
+                        && next[3].is_finite();
+                    retry |= !(safe && finite);
+                    acc[mi][j] = next;
                 }
             }
         }
@@ -526,6 +548,44 @@ pub(crate) unsafe fn bf16_mma_body<W: TileRows>(
                     // SAFETY: this lane owns the fragment output; its checked
                     // live row and column lie inside rows*n.
                     unsafe { *y.get_unchecked_mut(c * rows + r) = acc[mi][j][i] };
+                }
+            }
+        }
+    }
+    // The next stage's buffer is no longer read or written by the pipeline.
+    // SAFETY: the buffer is inside sh; the last stage reads a different buffer.
+    let votes = unsafe { sh.add((stages % STAGES) * STAGE_FLOATS) };
+    let retry = warp::any(retry);
+    if lane == 0 {
+        // SAFETY: each warp owns one slot of that unused buffer.
+        unsafe { *votes.add(warp) = if retry { 1.0 } else { 0.0 } };
+    }
+    thread::sync_threads();
+    let mut any = false;
+    for i in 0..MMA_THREADS as usize / 32 {
+        // SAFETY: all warp votes were published by the block barrier.
+        any |= unsafe { *votes.add(i) != 0.0 };
+    }
+    if any {
+        // All readers finish the votes before the exact owner reuses shared memory.
+        thread::sync_threads();
+        for dr in 0..MMA_ROWS / TILE_ROWS {
+            for dc in 0..MMA_COLS / TILE_COLS {
+                for half in 0..2 {
+                    // SAFETY: all 256 threads replay disjoint halves of the
+                    // checked 64-by-64 tile with the exact owner's staging bound.
+                    unsafe {
+                        f32_tile_at::<W, { MMA_THREADS as usize }>(
+                            w,
+                            x,
+                            (rows, kk, n),
+                            y,
+                            sh,
+                            (row0 + dr * TILE_ROWS, col0 + dc * TILE_COLS, half),
+                        )
+                    };
+                    // The next pass must not refill a stage another warp still reads.
+                    thread::sync_threads();
                 }
             }
         }

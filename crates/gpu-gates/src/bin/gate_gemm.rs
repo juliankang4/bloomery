@@ -6482,14 +6482,126 @@ mod gate {
             let gpu = dev.gpu;
             let stream = gpu.stream();
             let mut ok = true;
-            for (rows, k, n) in [
-                (1, 64, 1),
-                (17, 128, 17),
-                (33, 2560, 33),
-                (100, 256, 65),
-                (33, 640, 513),
+            // Sparse operands exercise range changes at every reduction boundary.
+            type Edge<'a> = (&'a str, &'a [(usize, u32)], &'a [(usize, u32)], u32);
+            const OVERFLOW: Edge<'static> = (
+                "rounded_product",
+                &[(0, 0x7f00_0000)],
+                &[(0, 0x3fff_8000)],
+                0x7f7f_8000,
+            );
+            let cancel = |at| {
+                let mut w = CANCEL.1.to_vec();
+                let mut x = CANCEL.2.to_vec();
+                w[2].0 = at;
+                x[2].0 = at;
+                (w, x)
+            };
+            const CANCEL: Edge<'static> = (
+                "within_fragment",
+                &[(0, 0x7f00_0000), (1, 0x7f00_0000), (2, 0xff00_0000)],
+                &[
+                    (0, 0x3f80_0000),
+                    (1, 0x3f80_0000),
+                    (2, 0x3f80_0000),
+                    (15, 0x0040_0000),
+                ],
+                0x7f00_0000,
+            );
+            let fragment = cancel(16);
+            let stage = cancel(32);
+            let pipeline = cancel(96);
+            const BUTTERFLY: Edge<'static> = (
+                "butterfly",
+                &[
+                    (0, 0x7f00_0000),
+                    (1, 0xff00_0000),
+                    (32, 0x7f00_0000),
+                    (33, 0xff00_0000),
+                ],
+                &[
+                    (0, 0x3f80_0000),
+                    (1, 0x3f80_0000),
+                    (32, 0x3f80_0000),
+                    (33, 0x3f80_0000),
+                ],
+                0x7fc0_0000,
+            );
+            const STORE: Edge<'static> = (
+                "store_overflow",
+                &[(0, 0x7f00_0000), (1, 0x7f00_0000)],
+                &[(0, 0x3f80_0000), (1, 0x3f80_0000)],
+                0x7f80_0000,
+            );
+            let sparse = |v: &mut Vec<f32>, offset, set: &[(usize, u32)]| {
+                v.fill(0.0);
+                for &(i, b) in set {
+                    v[offset + i] = f32::from_bits(b);
+                }
+            };
+            for (rows, k, n, r, c, edge) in [
+                (1, 64, 1, 0, 0, None),
+                (17, 128, 17, 0, 0, None),
+                (33, 2560, 33, 0, 0, None),
+                (100, 256, 65, 0, 0, None),
+                (33, 640, 513, 0, 0, None),
+                (1, 128, 1, 0, 0, Some(OVERFLOW)),
+                (1, 128, 1, 0, 0, Some(CANCEL)),
+                (
+                    1,
+                    64,
+                    1,
+                    0,
+                    0,
+                    Some(("between_fragments", &fragment.0, &fragment.1, 0x7f00_0000)),
+                ),
+                (
+                    1,
+                    128,
+                    1,
+                    0,
+                    0,
+                    Some(("between_fragments", &fragment.0, &fragment.1, 0x7f00_0000)),
+                ),
+                (
+                    1,
+                    128,
+                    1,
+                    0,
+                    0,
+                    Some(("between_stages", &stage.0, &stage.1, 0x7f00_0000)),
+                ),
+                (
+                    1,
+                    128,
+                    1,
+                    0,
+                    0,
+                    Some(("pipeline_wrap", &pipeline.0, &pipeline.1, 0x7f00_0000)),
+                ),
+                (
+                    65,
+                    128,
+                    65,
+                    63,
+                    63,
+                    Some(("warp_corner", &pipeline.0, &pipeline.1, 0x7f00_0000)),
+                ),
+                (
+                    65,
+                    128,
+                    65,
+                    64,
+                    64,
+                    Some(("tile_corner", &pipeline.0, &pipeline.1, 0x7f00_0000)),
+                ),
+                (1, 128, 1, 0, 0, Some(BUTTERFLY)),
+                (1, 128, 1, 0, 0, Some(STORE)),
             ] {
-                let wh = activations(k, rows, 9271 + rows as u32);
+                let mut wh = activations(k, rows, 9271 + rows as u32);
+                if let Some((_, w0, _, _)) = edge {
+                    sparse(&mut wh, r * k, w0);
+                }
                 let bits: Vec<u16> = wh.into_iter().map(fp32_to_bf16_bits).collect();
                 let wf: Vec<Vec<f32>> = bits
                     .chunks_exact(k)
@@ -6502,34 +6614,139 @@ mod gate {
                     .map(|p| u32::from(p[0]) | (u32::from(p[1]) << 16))
                     .collect();
                 let w = DeviceTensor::upload(stream, &words, rows, k / 2)?;
-                let xh = activations(k, n, 9281 + n as u32);
+                let mut xh = activations(k, n, 9281 + n as u32);
+                if let Some((_, _, x0, _)) = edge {
+                    sparse(&mut xh, c * k, x0);
+                }
                 let x = DeviceBuffer::from_host(stream, &xh)?;
-                let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 64])?;
-                gpu.q8f32().enqueue_bf16_mma(stream, &w, &x, n, &mut y)?;
-                stream.synchronize()?;
-                let eager = y.to_host_vec(stream)?;
-                let tag = format!("bf16 rows={rows} K={k} n={n}");
-                let quality = bloomery_gpu_gates::rounding::check_mma(
-                    &tag,
-                    (&eager[..rows * n], &xh, k),
-                    &wf,
-                );
-                let tail = eager[rows * n..]
-                    .iter()
-                    .all(|v| v.to_bits() == SENT.to_bits());
-                let graph = gpu.capture(|s| gpu.q8f32().enqueue_bf16_mma(s, &w, &x, n, &mut y))?;
-                graph.launch(stream)?;
-                stream.synchronize()?;
-                let replay = y.to_host_vec(stream)?;
-                let same = eager
-                    .iter()
-                    .zip(&replay)
-                    .all(|(a, b)| a.to_bits() == b.to_bits());
-                println!(
-                    "dense_mma {tag} past_end_untouched={tail} eager_graph_bits={same} {}",
-                    verdict(tail && same)
-                );
-                ok &= quality && tail && same;
+                let formats = if edge.is_some() && k % 128 == 0 { 3 } else { 1 };
+                use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight};
+                let byte_planes = if formats > 1 {
+                    // Sparse weights are zero or +/-2^127: E4M3 +/-1 with scale 2^127.
+                    let qs: Vec<u32> = wf
+                        .iter()
+                        .flat_map(|row| row.as_chunks::<4>().0.iter())
+                        .map(|v| {
+                            v.iter().enumerate().fold(0, |word, (i, &value)| {
+                                let code = if value == 0.0 {
+                                    0
+                                } else if value < 0.0 {
+                                    0xb8
+                                } else {
+                                    0x38
+                                };
+                                word | (code << (8 * i))
+                            })
+                        })
+                        .collect();
+                    Some((
+                        DeviceTensor::upload(stream, &qs, rows, k / 4)?,
+                        DeviceTensor::upload(
+                            stream,
+                            &vec![0xfefe_fefe; rows * k / 128],
+                            rows,
+                            k / 128,
+                        )?,
+                        DeviceTensor::upload(
+                            stream,
+                            &vec![0x7f00_0000; rows * k / 128],
+                            rows,
+                            k / 128,
+                        )?,
+                    ))
+                } else {
+                    None
+                };
+                for format in 0..formats {
+                    let format_name = ["bf16", "mxfp8", "fp8_b128"][format];
+                    let enqueue = |s: &cuda_core::CudaStream, exact, y: &mut DeviceBuffer<f32>| {
+                        if format == 0 {
+                            if exact {
+                                gpu.q8f32().enqueue_bf16_tile(s, &w, &x, n, y)
+                            } else {
+                                gpu.q8f32().enqueue_bf16_mma(s, &w, &x, n, y)
+                            }
+                        } else {
+                            let (qs, mx, fp) = byte_planes.as_ref().unwrap();
+                            let weight = E4m3Weight {
+                                qs,
+                                e: if format == 1 { mx } else { fp },
+                                scales: if format == 1 {
+                                    E4m3Scales::Mxfp8
+                                } else {
+                                    E4m3Scales::Fp8B128
+                                },
+                            };
+                            if exact {
+                                dev.g32.enqueue_e4m3_tile(s, weight, &x, n, y)
+                            } else {
+                                dev.g32.enqueue_e4m3_mma(s, weight, &x, n, y)
+                            }
+                        }
+                    };
+                    let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 64])?;
+                    enqueue(stream, false, &mut y)?;
+                    stream.synchronize()?;
+                    let eager = y.to_host_vec(stream)?;
+                    let want = edge.map(|(_, _, _, bits)| bits);
+                    let name = edge.map_or("ordinary", |(name, _, _, _)| name);
+                    let tag = format!(
+                        "{format_name} rows={rows} K={k} n={n} probe={r},{c} edge={name} edge_bits={want:x?}"
+                    );
+                    let range = want.map_or_else(
+                        || eager[..rows * n].iter().all(|v| v.is_finite()),
+                        |bits| {
+                            let expected = f32::from_bits(bits);
+                            let got = eager[c * rows + r];
+                            if expected.is_nan() {
+                                got.is_nan()
+                            } else {
+                                got.to_bits() == bits
+                            }
+                        },
+                    );
+                    let quality = if edge.is_some() {
+                        let mut exact = DeviceBuffer::from_host(stream, &vec![SENT; y.len()])?;
+                        enqueue(stream, true, &mut exact)?;
+                        let exact = exact.to_host_vec(stream)?;
+                        let same = eager
+                            .iter()
+                            .zip(&exact)
+                            .all(|(a, b)| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()));
+                        println!("dense_mma {tag} exact_tile_bits={same}");
+                        let finite_quality = !f32::from_bits(want.unwrap()).is_finite()
+                            || bloomery_gpu_gates::rounding::check_mma(
+                                &tag,
+                                (&eager[..rows * n], &xh, k),
+                                &wf,
+                            );
+                        same && finite_quality
+                    } else {
+                        bloomery_gpu_gates::rounding::check_mma(
+                            &tag,
+                            (&eager[..rows * n], &xh, k),
+                            &wf,
+                        )
+                    };
+                    let tail = eager[rows * n..]
+                        .iter()
+                        .all(|v| v.to_bits() == SENT.to_bits());
+                    y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                    let graph = gpu.capture(|s| enqueue(s, false, &mut y))?;
+                    y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                    graph.launch(stream)?;
+                    stream.synchronize()?;
+                    let replay = y.to_host_vec(stream)?;
+                    let same = eager
+                        .iter()
+                        .zip(&replay)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                    println!(
+                        "dense_mma {tag} range={range} past_end_untouched={tail} eager_graph_bits={same} {}",
+                        verdict(range && tail && same && quality)
+                    );
+                    ok &= quality && range && tail && same;
+                }
             }
             Ok(ok)
         }
