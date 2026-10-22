@@ -163,7 +163,7 @@ use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::tensor::WindowMut;
 use crate::weights::{Weights, tensor_scales};
-use crate::{DeviceTensor, Gpu, GpuError, launch_u32, ple};
+use crate::{Branch, DeviceTensor, Gpu, GpuError, launch_u32, ple};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use engram::hash::{History, Window};
@@ -1147,6 +1147,8 @@ pub struct Body38 {
     rp: PassRecord<PASS_ROWS>,
     pass_hsum: DeviceBuffer<f32>,
     k: Kernels38,
+    /// The stream every walk's shared expert runs on beside its card leg.
+    branch: Branch,
     /// The slot map's card copy, and the card leg over its card experts. The
     /// host tier holds the host copy, and its residency machine, when it runs
     /// one, this `Arc`: the buffer lives until both let go.
@@ -1959,6 +1961,7 @@ impl Body38 {
             rp,
             pass_hsum,
             k: Kernels38::load(gpu)?,
+            branch: Branch::new(gpu.stream_handle())?,
             slots,
             card,
             tier,
@@ -3362,6 +3365,7 @@ impl Body38 {
             a,
             pass_hsum,
             k,
+            branch,
             slots,
             card,
             eps,
@@ -3370,6 +3374,7 @@ impl Body38 {
             ..
         } = self;
         let mut prog = Pass38 {
+            branch,
             p: Parts38 {
                 c: Ctx38 {
                     gpu,
@@ -4585,6 +4590,7 @@ impl ChainBody for Body38 {
             seq_rope,
             s,
             k,
+            branch,
             slots,
             card,
             tier,
@@ -4595,6 +4601,7 @@ impl ChainBody for Body38 {
             ..
         } = self;
         let prog = Step38 {
+            branch,
             p: Parts38 {
                 c: Ctx38 {
                     gpu,
@@ -5008,6 +5015,7 @@ impl Body38 {
             seq_rope,
             a,
             k,
+            branch,
             slots,
             card,
             tier,
@@ -5017,6 +5025,7 @@ impl Body38 {
             ..
         } = self;
         let prog = Verify38 {
+            branch,
             p: Parts38 {
                 c: Ctx38 {
                     gpu,
@@ -5426,6 +5435,7 @@ impl Body38 {
             seq_rope,
             a,
             k,
+            branch,
             slots,
             card,
             tier,
@@ -5487,6 +5497,7 @@ impl Body38 {
             });
         }
         let prog = Verify38 {
+            branch,
             p: Parts38 {
                 c: Ctx38 {
                     gpu,

@@ -90,8 +90,8 @@ use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
 use crate::site;
 use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::weights::Weights;
-use crate::{Gpu, GpuError};
-use cuda_core::DeviceBuffer;
+use crate::{Branch, Gpu, GpuError};
+use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use std::ops::Range;
 
@@ -615,26 +615,75 @@ impl Parts38<'_> {
 
     /// Layer `l`'s shared expert over `x` (`None`: the arena's `ffn_x`) into
     /// `sh_y`: gate and up, SwiGLU, down.
-    fn shared(&mut self, l: usize, x: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
+    fn shared(
+        &mut self,
+        stream: &CudaStream,
+        l: usize,
+        x: Option<&DeviceBuffer<f32>>,
+    ) -> Result<(), GpuError> {
         let p = plan_of(self.plans, l)?;
         let (c, m) = (&self.c, self.m);
         let s = &mut *self.s;
         let x = x.unwrap_or(&s.ffn_x);
-        c.dense_gemv(&p.ffn.gate_sh, x, m, &mut s.sh_g)?;
-        c.dense_gemv(&p.ffn.up_sh, x, m, &mut s.sh_u)?;
+        site::resident_gemv_cols_on(
+            c.gpu,
+            stream,
+            Some(&c.k.g32),
+            (c.w, &p.ffn.gate_sh),
+            x,
+            m,
+            &mut s.sh_g,
+        )?;
+        site::resident_gemv_cols_on(
+            c.gpu,
+            stream,
+            Some(&c.k.g32),
+            (c.w, &p.ffn.up_sh),
+            x,
+            m,
+            &mut s.sh_u,
+        )?;
         c.gpu
             .elem()
-            .enqueue_swiglu(c.gpu.stream(), &s.sh_g, &s.sh_u, geo::FF * m, &mut s.sh_h)?;
-        c.dense_gemv(&p.ffn.down_sh, &s.sh_h, m, &mut s.sh_y)
+            .enqueue_swiglu(stream, &s.sh_g, &s.sh_u, geo::FF * m, &mut s.sh_h)?;
+        site::resident_gemv_cols_on(
+            c.gpu,
+            stream,
+            Some(&c.k.g32),
+            (c.w, &p.ffn.down_sh),
+            &s.sh_h,
+            m,
+            &mut s.sh_y,
+        )
     }
 
-    /// Layer `l`'s card leg over `x` (`None`: the arena's `ffn_x`), when it
-    /// has card experts: the places in the arena's `sel`, the router's
-    /// weights, into the card sum ([`Card38::enqueue`]).
-    fn card(&mut self, l: usize, x: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
+    /// Layer `l`'s shadow over `x` (`None`: the arena's `ffn_x`): the shared
+    /// expert on `branch` beside the card leg on the main stream, joined
+    /// before the main stream's next launch, so the block's sum reads both.
+    /// A layer without card experts has no card leg to run beside, so its
+    /// shared expert runs on the main stream and the layer forks nothing.
+    /// Every walk here holds at most [`super::scratch38::PASS_ROWS`] rows.
+    fn beside(
+        &mut self,
+        branch: &mut Branch,
+        l: usize,
+        x: Option<&DeviceBuffer<f32>>,
+    ) -> Result<(), GpuError> {
         if !self.card.has(l) {
-            return Ok(());
+            let gpu = self.c.gpu;
+            return self.shared(gpu.stream(), l, x);
         }
+        let fork = branch.fork()?;
+        self.shared(fork.stream(), l, x)?;
+        self.card(l, x)?;
+        fork.join()
+    }
+
+    /// Layer `l`'s card leg over `x` (`None`: the arena's `ffn_x`): the
+    /// places in the arena's `sel`, the router's weights, into the card sum
+    /// ([`Card38::enqueue`], which refuses a layer without card experts by
+    /// name).
+    fn card(&mut self, l: usize, x: Option<&DeviceBuffer<f32>>) -> Result<(), GpuError> {
         let s = &*self.s;
         let x = x.unwrap_or(&s.ffn_x);
         if self.tier_k(l) > 0 {
@@ -1477,6 +1526,7 @@ fn qsa_out(
 
 /// The captured decode step's walk `(1, 1, Step)`, into `head`.
 pub(super) struct Step38<'a> {
+    pub(super) branch: &'a mut Branch,
     pub(super) p: Parts38<'a>,
     pub(super) head: &'a mut Head,
 }
@@ -1512,11 +1562,11 @@ impl<'a> LayerProgram for Step38<'a> {
         })
     }
 
-    /// The card leg, then the shared expert, over the boundary's activation.
+    /// The shared expert beside the card leg over the boundary's activation
+    /// ([`Parts38::beside`]).
     fn shadow(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let x = port.hybrid().boundary().normed();
-        self.p.card(at.layer, Some(x))?;
-        self.p.shared(at.layer, Some(x))
+        self.p.beside(self.branch, at.layer, Some(x))
     }
 
     /// The wait, the gated sum, and the host tier told the layer is enqueued
@@ -1547,6 +1597,7 @@ impl<'a> LayerProgram for Step38<'a> {
 /// `head`, a head of `m` rows (one projection and one argmax for every
 /// row), and each of `copies` after it. Each row is bit for bit its step.
 pub(super) struct Verify38<'a> {
+    pub(super) branch: &'a mut Branch,
     pub(super) p: Parts38<'a>,
     pub(super) head: &'a mut Head,
     pub(super) copies: Vec<RowsCopy<'a>>,
@@ -1608,12 +1659,11 @@ impl<'a> LayerProgram for Verify38<'a> {
         })
     }
 
-    /// The card leg, then the shared expert, over the boundary's
-    /// activations.
+    /// The shared expert beside the card leg over the boundary's
+    /// activations ([`Parts38::beside`]).
     fn shadow(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let x = port.hybrid().boundary().normed();
-        self.p.card(at.layer, Some(x))?;
-        self.p.shared(at.layer, Some(x))
+        self.p.beside(self.branch, at.layer, Some(x))
     }
 
     /// The wait, the gated sum over the `m` columns' host sums, and the host
@@ -1646,6 +1696,7 @@ impl<'a> LayerProgram for Verify38<'a> {
 /// An eager pass's walk `(1, m, Batch)`: every layer through the batch port;
 /// the head is the caller's ([`Pass38::head`]).
 pub(super) struct Pass38<'a> {
+    pub(super) branch: &'a mut Branch,
     pub(super) p: Parts38<'a>,
 }
 
@@ -1736,10 +1787,10 @@ impl<'a> LayerProgram for Pass38<'a> {
         )
     }
 
-    /// The card leg, then the shared expert, over the arena's `ffn_x`.
+    /// The shared expert beside the card leg over the arena's `ffn_x`
+    /// ([`Parts38::beside`]).
     fn shadow(&mut self, _: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        self.p.card(at.layer, None)?;
-        self.p.shared(at.layer, None)
+        self.p.beside(self.branch, at.layer, None)
     }
 
     /// The gated sum over the host sums the walk's serve uploaded, or the
