@@ -212,6 +212,9 @@
 #   warm         BLOOMERY_WARM_ROWS=1, 6 4 lcpp:6: the two ours arms in one load (one C) as 6 6 4 4, each
 #                after its PRIME; 4's row cold once (a fresh load of 4 4, then clean), lcpp:6 cold twice (COLD,
 #                then FAIL rc=cold); rc 1.
+#   fault-windows  bin: and mem= loads add faults before an --arm prompt: their timed counts stay zero;
+#                faults after the prompt still tag or reject the row. An older binary or a missing
+#                prompt marker keeps the whole-process fallback. --fault-windows runs only these cases.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -458,7 +461,14 @@ tokens='' n=32 ctx=0 sync='' arms=() place=''
 while [ $# -gt 0 ]; do
   case $1 in
     --tokens) tokens=$2; shift ;; -n) n=$2; shift ;; --ctx) ctx=$2; shift ;; --warm) shift ;;
-    --arm) arms+=("$2"); shift ;; --arm-sync) sync=1 ;; --place) place=$2; shift ;;
+    --arm)
+      if [ -n "${STUB_GEN_NO_ARM:-}" ]; then
+        echo 'generate_qwen3moe: give exactly one of --prompt, --tokens, --seed-depth' >&2
+        exit 1
+      fi
+      if [ $# -eq 1 ]; then echo 'generate_qwen3moe: --arm needs a value' >&2; exit 1; fi
+      arms+=("$2"); shift ;;
+    --arm-sync) sync=1 ;; --place) place=$2; shift ;;
   esac
   shift
 done
@@ -466,6 +476,7 @@ echo "${place:--}" >> "${TMPDIR:-/tmp}/stub-gen-place"
 count() { echo "$1" | tr ',' '\n' | grep -c .; }
 listed=1
 if [ ${#arms[@]} -eq 0 ]; then listed='' arms=("$tokens"); echo "prompt_ids [$tokens]"; fi
+echo $(($(cat "$STUB_MAJFLT") + ${STUB_GEN_LOAD_FAULTS:-0})) > "$STUB_MAJFLT"
 echo "$(for a in "${arms[@]}"; do printf '%s ' "$(count "$a")"; done)" >> "${TMPDIR:-/tmp}/stub-gen-loads"
 [ -z "${STUB_GEN_RES:-}" ] || echo "residency lever residency=$STUB_GEN_RES why=set"
 cards=''
@@ -500,7 +511,7 @@ for k in "${!arms[@]}"; do
   if [ -n "$listed" ]; then
     echo "arm i=$k arms=${#arms[@]} ids=$depth n=$n"
     if [ -n "$sync" ]; then read -r _ || { echo "error: stdin closed before arm $k" >&2; exit 65; }; fi
-    echo "prompt_ids [${arms[$k]}]"
+    [ -n "${STUB_GEN_NO_MARK:-}" ] || echo "prompt_ids [${arms[$k]}]"
   fi
   # STUB_COLD_GEN=<depth>:<K>: the first K arms of that depth add 100000 faults after their prompt ids.
   cm=${TMPDIR:-/tmp}/stub-cold-gen-$depth
@@ -637,6 +648,7 @@ want() {
 }
 heads() { grep -oE '^(DISCARD|WARMUP|ROW|FAIL) r[0-9]+ [^ ]+ [dp]=[0-9]+' "$1"; }
 
+if [ "${1:-}" != --fault-windows ]; then
 L=$tmp/rotate.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=2 -- 6 lcpp:6 lcpppp:4 ik:6 mrs:6 mrspp:4 "bin:$BASEBIN:6"
 want_seq="ROW r1 ours d=6
@@ -1729,6 +1741,58 @@ elif want warm "$L" 1 '^FAIL r1 lcpp d=6 rc=cold \| cold after warm-up and one r
   want warm "$L" 1 '^warm rows: 2 COLD row\(s\) ran once more: 1 clean on the retry, 1 FAIL rc=cold$'; then
   pass warm
 fi
+fi
+
+L=$tmp/bin-load-faults.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_GEN_LOAD_FAULTS=100000 -- "bin:$BASEBIN:6"
+if [ "$RC" != 0 ]; then
+  fail bin-load-faults "rc $RC, want 0" "$L"
+elif want bin-load-faults "$L" 2 '^(PRIME|ROW) r1 bin:base d=6 .*\| majflt 100000 \(timed 0; ' &&
+  want bin-load-faults "$L" 0 '^(COLD|FAIL) ' &&
+  want bin-load-faults "$L" 1 '^mean bin:base d=6 .*\(n=1\)'; then
+  pass bin-load-faults
+fi
+
+L=$tmp/bin-timed-faults.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_GEN_LOAD_FAULTS=100000 STUB_COLD_GEN=6:99 -- "bin:$BASEBIN:6"
+if [ "$RC" != 1 ]; then
+  fail bin-timed-faults "rc $RC, want 1" "$L"
+elif want bin-timed-faults "$L" 1 '^COLD r1 bin:base d=6 .*\| majflt 200000 \(timed 100000; ' &&
+  want bin-timed-faults "$L" 1 '^FAIL r1 bin:base d=6 rc=cold .*timed 100000; ' &&
+  want bin-timed-faults "$L" 0 '^mean bin:base '; then
+  pass bin-timed-faults
+fi
+
+for mode in NO_ARM NO_MARK; do
+  L=$tmp/bin-fallback-$mode.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_GEN_LOAD_FAULTS=100000 "STUB_GEN_$mode=1" -- "bin:$BASEBIN:6"
+  if [ "$RC" != 1 ]; then
+    fail "bin-fallback-$mode" "rc $RC, want 1" "$L"
+  elif want "bin-fallback-$mode" "$L" 1 '^COLD r1 bin:base d=6 .*\| majflt 100000 \(timed \? .*the whole process\); ' &&
+    want "bin-fallback-$mode" "$L" 1 '^FAIL r1 bin:base d=6 rc=cold .*timed 100000; ' &&
+    want "bin-fallback-$mode" "$L" 0 '^mean bin:base '; then
+    pass "bin-fallback-$mode"
+  fi
+done
+
+for faults in load timed legacy; do
+  L=$tmp/mem-faults-$faults.log
+  extra=()
+  case $faults in
+    timed) extra=(STUB_COLD_GEN=6:99); whole=200000; timed=100000; cold=' \[cold\]' ;;
+    legacy) extra=(STUB_GEN_NO_ARM=1); whole=100000; timed='\? .*the whole process\)'; cold=' \[cold\]' ;;
+    *) whole=100000; timed=0; cold='' ;;
+  esac
+  arms=("bin:$BASEBIN:6@mem=29G")
+  [ "$faults" = legacy ] || arms+=("6@mem=29G")
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_LOAD_FAULTS=100000 "${extra[@]}" -- "${arms[@]}"
+  if [ "$RC" != 0 ]; then
+    fail "mem-faults-$faults" "rc $RC, want 0" "$L"
+  elif want "mem-faults-$faults" "$L" "${#arms[@]}" "^ROW r1 .*capped mem=29G .*\| majflt $whole \(timed $timed; .*${cold}$" &&
+    want "mem-faults-$faults" "$L" 0 '^FAIL '; then
+    pass "mem-faults-$faults"
+  fi
+done
 
 if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/rotate.log "$tmp"/rotate-dry.log "$tmp"/mrs-noiter.log "$tmp"/warmup-rotate.log \
