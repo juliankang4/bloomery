@@ -1956,8 +1956,7 @@ mod tests {
         assert_eq!(render(&start, TRUE, super::ART_W), None);
     }
 
-    #[test]
-    fn narrow_screens_keep_every_record_value() {
+    fn wide_start() -> Vec<String> {
         let start = mutated(START, "plan ", "card=A6000", "card=삽살개카드");
         let mut start = mutated(
             &start.join("\n"),
@@ -1970,6 +1969,12 @@ mod tests {
             "127.0.0.1:8080",
             &format!("{}example.org:8080", "inference.".repeat(16)),
         );
+        start
+    }
+
+    #[test]
+    fn narrow_screens_keep_every_record_value() {
+        let start = wide_start();
         let compact =
             |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
         let facts = super::facts(
@@ -2012,7 +2017,15 @@ mod tests {
             let armed = super::arm(true);
             println!("screen armed={armed}");
             std::io::stdout().flush().unwrap();
-            for line in lines(if fixture == "qwen38" { START38 } else { START }) {
+            let start = if fixture == "unicode" {
+                wide_start()
+            } else {
+                lines(if fixture == "qwen38" { START38 } else { START })
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            };
+            for line in &start {
                 super::note(line);
             }
             if armed {
@@ -2053,7 +2066,7 @@ mod tests {
             (0, 0),
             (1, 1),
         ] {
-            for fixture in ["v41", "qwen38"] {
+            for fixture in ["v41", "qwen38", "unicode"] {
                 for (term, color) in [("xterm", ""), ("xterm", "1"), ("dumb", "")] {
                     let mut size = libc::winsize {
                         ws_row: 100,
@@ -2063,18 +2076,16 @@ mod tests {
                     };
                     let (mut master, mut slave) = (-1, -1);
                     // SAFETY: both fd outputs and the initialized window size live through the call; the other pointers are null.
-                    assert_eq!(
-                        unsafe {
-                            libc::openpty(
-                                &mut master,
-                                &mut slave,
-                                std::ptr::null_mut(),
-                                std::ptr::null(),
-                                &size,
-                            )
-                        },
-                        0
-                    );
+                    let rc = unsafe {
+                        libc::openpty(
+                            &mut master,
+                            &mut slave,
+                            std::ptr::null_mut(),
+                            std::ptr::null(),
+                            &size,
+                        )
+                    };
+                    assert_eq!(rc, 0);
                     // SAFETY: openpty succeeded and transferred ownership of this distinct master fd.
                     let mut master = unsafe { std::fs::File::from_raw_fd(master) };
                     // SAFETY: openpty succeeded and transferred ownership of this distinct slave fd.
@@ -2098,10 +2109,8 @@ mod tests {
                     }
                     size.ws_col = resized;
                     // SAFETY: slave is an open PTY fd and size is an initialized winsize for this ioctl.
-                    assert_eq!(
-                        unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
-                        0
-                    );
+                    let rc = unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+                    assert_eq!(rc, 0);
                     drop(slave);
                     child.stdin.take().unwrap().write_all(b"x").unwrap();
                     let mut bytes = Vec::new();
