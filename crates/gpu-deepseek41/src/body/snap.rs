@@ -229,15 +229,20 @@ impl SeqSnapshot {
     /// Its host bytes.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        let kv: usize = self
-            .kv
-            .iter()
-            .map(|l| {
-                2 * (l.ring.len() + l.rows.len() + l.keys.len())
-                    + 4 * (l.values.len() + l.scores.len())
-            })
-            .sum();
-        kv + 2 * self.shadow.len() + 4 * self.history.len()
+        state_bytes(
+            self.kv.iter().map(|l| {
+                [
+                    l.ring.len(),
+                    l.rows.len(),
+                    l.keys.len(),
+                    l.values.len(),
+                    l.scores.len(),
+                ]
+            }),
+            self.shadow.len(),
+            self.history.len(),
+        )
+        .expect("a saved state's host arrays fit the address space")
     }
 
     /// [`Body::keep_point`] of the body right after a [`resume`] of this
@@ -1064,6 +1069,37 @@ pub fn snapshot(m: &mut Deepseek41Model) -> Result<SeqSnapshot, GpuError> {
     }
     let (gpu, _, body) = m.body_parts(WHAT)?;
     body.save(gpu)
+}
+
+fn state_bytes(
+    kv: impl IntoIterator<Item = [usize; 5]>,
+    shadow: usize,
+    history: usize,
+) -> Option<usize> {
+    kv.into_iter()
+        .try_fold(0usize, |n, [ring, rows, keys, values, scores]| {
+            let f16 = ring.checked_add(rows)?.checked_add(keys)?.checked_mul(2)?;
+            let f32 = values.checked_add(scores)?.checked_mul(4)?;
+            n.checked_add(f16)?.checked_add(f32)
+        })?
+        .checked_add(shadow.checked_mul(2)?)?
+        .checked_add(history.checked_mul(4)?)
+}
+
+/// The host array bytes a snapshot holds, without reading the card.
+pub fn snapshot_size(m: &mut Deepseek41Model) -> Result<u64, GpuError> {
+    let (_, _, b) = m.body_parts(WHAT)?;
+    let n = b.seq.history.len();
+    let shape = b.shape(n)?;
+    let shadow = kept_runs(b.seq.shadow_from, n, &b.seq.holes)
+        .iter()
+        .try_fold(0usize, |v, r| v.checked_add(r.len()))
+        .and_then(|v| v.checked_mul(b.seq.kv.len()))
+        .and_then(|v| v.checked_mul(b.seq.shadows.width));
+    shadow
+        .and_then(|shadow| state_bytes(shape.kv, shadow, n))
+        .map(|bytes| bytes as u64)
+        .ok_or_else(|| GpuError::shape(WHAT, "snapshot host bytes pass the address space"))
 }
 
 /// Replace `m`'s sequence state with `s`, which [`snapshot`] took of a model

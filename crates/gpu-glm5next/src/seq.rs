@@ -286,6 +286,27 @@ pub fn seq_save(m: &mut GpuModel<Body>) -> Result<GlmSeq, GpuError> {
     body.save_state(gpu.stream(), pos)
 }
 
+/// The host arrays a sequence save would hold, without reading the card.
+pub fn seq_save_bytes(m: &mut GpuModel<Body>) -> Result<u64, GpuError> {
+    let pos = m.pos();
+    let (_, _, b) = m.body_parts("glm5next snapshot size")?;
+    let points = b.ckpt.save_points(pos);
+    let draft = b.draft_bytes()?;
+    let (mut positional, mut recurrent) = lend(
+        &mut b.stores,
+        b.nextn.as_deref_mut(),
+        b.s.lanes.committed(),
+        pos as usize,
+    )?;
+    Lent {
+        positional: &mut positional,
+        recurrent: &mut recurrent,
+    }
+    .bytes(points.len())?
+    .checked_add(draft as u64)
+    .ok_or_else(|| shape("snapshot host bytes pass u64".into()))
+}
+
 /// [`seq_save`] whose copy runs on `lane`'s stream into its pinned staging and
 /// whose call returns once it is enqueued ([`SeqState::save_async`]): the
 /// state and its copy in flight, which the model's rows are not cut, reset or

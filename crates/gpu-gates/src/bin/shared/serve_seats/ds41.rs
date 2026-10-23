@@ -1426,6 +1426,10 @@ impl Seat for V41 {
         }
     }
 
+    fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+        Ok(Some(body::snapshot_size(self.s.model_mut())?))
+    }
+
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
         let window = self.window();
         Ok(Arc::new(Ds41Saved {

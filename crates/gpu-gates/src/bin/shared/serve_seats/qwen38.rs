@@ -2953,6 +2953,10 @@ impl Seat for Q38 {
         p
     }
 
+    fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+        Ok(Some(self.s.model_mut().seq_save_bytes()?))
+    }
+
     /// The sequence state (`GpuModel::seq_save`, the draft's rows within it)
     /// as the prompt cache holds it, with the draft's side of it
     /// ([`SlotDrafts::park`]) beside the body's.

@@ -463,6 +463,11 @@ pub trait Engine: Send {
     fn cache_ram(&self) -> u64 {
         0
     }
+    /// The host bytes a snapshot would hold, without copying its stores.
+    /// `None` when the engine has no size query.
+    fn snapshot_size(&self) -> Result<Option<u64>, StateError> {
+        Ok(None)
+    }
     /// Returns the engine's adaptive expert residency to the placement it
     /// loaded with, the sequence left as it stands: the one explicit call a
     /// runner makes before a timed request (`POST /residency/reset`); no

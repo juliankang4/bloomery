@@ -268,7 +268,7 @@ use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::set_prefill_media;
 use bloomery_gpu_glm5next::{
     Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, checkpoint_budget, checkpoint_price,
-    seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async,
+    seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async, seq_save_bytes,
 };
 use bloomery_levers::{
     ChurnHosting, GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
@@ -1758,6 +1758,10 @@ impl Seat for Glm {
     /// one the checkpoint spacing did not choose.
     fn splits(&self, _: usize, _: usize, _: &[usize]) -> Vec<usize> {
         Vec::new()
+    }
+
+    fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+        Ok(Some(seq_save_bytes(self.s.model_mut())?))
     }
 
     /// The sequence state ([`seq_save`]) and, under the draft, its side of

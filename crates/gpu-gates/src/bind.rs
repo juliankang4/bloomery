@@ -1180,6 +1180,7 @@ enum Cmd {
     },
     /// The sequence state, as a value.
     Save,
+    SaveSize,
     /// The sequence state, as a value whose copy may still run
     /// ([`Seat::snapshot_begin`]).
     SaveBegin,
@@ -1245,6 +1246,7 @@ enum Extra {
     Splits(Vec<usize>),
     /// A `Save`'s state, or its failure with its kind ([`snapshot_of`]).
     Saved(Result<Arc<dyn Saved>, StateError>),
+    SaveSize(Result<Option<u64>, StateError>),
     /// A `SaveBegin`'s state with its copy in flight, or its failure with its
     /// kind ([`begin_of`]).
     Begun(Result<Pending, StateError>),
@@ -1473,6 +1475,10 @@ pub trait Seat: 'static {
     /// request's: the server keeps no state and serves on. Any other error is
     /// the engine's, which ends the server.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError>;
+    /// The host array bytes of a snapshot, without reading its stores.
+    fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+        Ok(None)
+    }
     /// Whether [`Seat::snapshot_begin`] copies the state on a stream of the
     /// seat's own, so the server may ask for it when a request ends without
     /// stopping the slots (`serve::Engine::snapshots_async`). The default is
@@ -1719,6 +1725,14 @@ impl SeatEngine {
                             (result, None, extra)
                         }
                         Cmd::Save => (Ok(0), None, Extra::Saved(snapshot_of(&mut g))),
+                        Cmd::SaveSize => (
+                            Ok(0),
+                            None,
+                            Extra::SaveSize(
+                                g.snapshot_size()
+                                    .map_err(|e| seat_failure(&*e, "snapshot size".to_owned())),
+                            ),
+                        ),
                         Cmd::SaveBegin => (Ok(0), None, Extra::Begun(begin_of(&mut g))),
                         Cmd::SavePoll(p) => (Ok(0), None, Extra::Polled(p.flight().poll())),
                         Cmd::SaveWait(p) => {
@@ -1874,6 +1888,17 @@ impl Link {
             (Err(e), _) => Err(StateError::Engine(EngineError(e))),
             (Ok(_), _) => Err(StateError::Engine(EngineError(
                 "the engine thread answered a save with no state".to_owned(),
+            ))),
+        }
+    }
+
+    fn snapshot_size(&self) -> Result<Option<u64>, StateError> {
+        let reply = self.ask(Cmd::SaveSize)?;
+        match (reply.result, reply.extra) {
+            (Ok(_), Extra::SaveSize(size)) => size,
+            (Err(e), _) => Err(StateError::Engine(EngineError(e))),
+            (Ok(_), _) => Err(StateError::Engine(EngineError(
+                "the engine thread answered a snapshot size with no size".to_owned(),
             ))),
         }
     }
@@ -2350,6 +2375,7 @@ fn serve_cmd<S: Seat>(
         Cmd::Keep(..)
         | Cmd::Splits { .. }
         | Cmd::Save
+        | Cmd::SaveSize
         | Cmd::SaveBegin
         | Cmd::SavePoll(_)
         | Cmd::SaveWait(_)
@@ -3171,6 +3197,10 @@ impl Engine for SeatEngine {
 
     fn cache_ram(&self) -> u64 {
         self.cache_ram
+    }
+
+    fn snapshot_size(&self) -> Result<Option<u64>, StateError> {
+        self.link.snapshot_size()
     }
 
     /// The seat's state ([`Link::snapshot`]): a refusal by name is the

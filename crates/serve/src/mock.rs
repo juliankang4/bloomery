@@ -677,6 +677,10 @@ impl Engine for MockEngine {
         }
     }
 
+    fn snapshot_size(&self) -> Result<Option<u64>, StateError> {
+        Ok(Some(MOCK_STATE_HEAD + 4 * self.ctx.len() as u64))
+    }
+
     fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
         let Some(saves) = &self.saves else {
             return snapshot_bytes(self);

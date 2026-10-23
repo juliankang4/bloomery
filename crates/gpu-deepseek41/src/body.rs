@@ -129,7 +129,9 @@ pub use prefill::{
 };
 use seq::RowSeqs;
 pub use seq::{KeepLimit, Seq};
-pub use snap::{SeqSnapshot, StateFail, restore_state, resume, save_state, snapshot};
+pub use snap::{
+    SeqSnapshot, StateFail, restore_state, resume, save_state, snapshot, snapshot_size,
+};
 
 /// The V4.1 engine: the shared skeleton over this body.
 pub type Deepseek41Model = GpuModel<Body>;

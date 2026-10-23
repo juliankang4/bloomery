@@ -59,6 +59,7 @@ pub use body::prefill::{
 };
 pub use body::seq::{
     GlmSeq, seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async,
+    seq_save_bytes,
 };
 pub use body::{
     Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, LOAD_ROWS, NEXTN_ON_TIER, Plant,

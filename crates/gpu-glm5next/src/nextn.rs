@@ -853,6 +853,19 @@ impl Body {
         self.wrote.step = Held::NONE;
     }
 
+    /// The host array bytes the draft side of a sequence save would hold.
+    pub(super) fn draft_bytes(&self) -> Result<usize, GpuError> {
+        if self.nextn.is_none() {
+            return Ok(0);
+        }
+        (self.wrote.step.rows as usize)
+            .checked_add(self.wrote.pair.rows as usize)
+            .and_then(|n| n.checked_mul(HC_STREAMS))
+            .and_then(|n| n.checked_mul(self.dims.embd))
+            .and_then(|n| n.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| shape("snapshot draft bytes pass the address space".to_owned()))
+    }
+
     /// The NextN side of a sequence state at `pos` ([`DraftRows`]); `None`
     /// on a load without the layer. Refused by name when the store holds
     /// positions past `pos`. Blocking.

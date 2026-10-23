@@ -4559,6 +4559,40 @@ impl GpuModel<Body38> {
         body.save_state(gpu.stream(), pos)
     }
 
+    /// The host arrays a sequence save would hold, without reading the card.
+    pub fn seq_save_bytes(&mut self) -> Result<u64, GpuError> {
+        let pos = self.pos();
+        let (_, _, b) = self.body_parts("qwen4exp snapshot size")?;
+        let points = b.ckpt.save_points(pos);
+        let draft = if b.mtp.is_some() {
+            let rows = b.wrote.step.parts().1 as usize + b.wrote.pass.parts().1 as usize;
+            (rows * geo::STREAMS * geo::HIDDEN
+                + b.point_rows
+                    .iter()
+                    .filter(|(p, _)| points.contains(p))
+                    .map(|(_, r)| r.len())
+                    .sum::<usize>())
+                * size_of::<f32>()
+        } else {
+            0
+        };
+        let mut stores = Copied::of(
+            &mut b.stores,
+            &mut b.ple_ring,
+            b.lane.lane(),
+            Some((b.ctx, pos as usize)),
+            b.mtp.as_mut(),
+        )?;
+        let (positional, mut recurrent) = stores.list_split();
+        Lent {
+            positional,
+            recurrent: &mut recurrent,
+        }
+        .bytes(points.len())?
+        .checked_add(draft as u64)
+        .ok_or_else(|| GpuError::shape("qwen4exp snapshot size", "host bytes pass u64"))
+    }
+
     /// [`GpuModel::seq_save`] whose copy runs on `lane`'s stream into its
     /// pinned staging and whose call returns once it is enqueued
     /// ([`SeqState::save_async`]): the state and its copy in flight, which

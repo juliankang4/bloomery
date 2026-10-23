@@ -84,8 +84,8 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -429,6 +429,9 @@ pub(crate) struct Slot {
     /// Each slot's state copy while it may still run ([`Slot::seal`]): its
     /// rows are not cut, reset or replaced before it has landed.
     saving: Vec<Option<Pending>>,
+    /// A seal's state until the next request consumes this slot. A weak
+    /// reference leaves the cache free to return its staging.
+    sealed: Vec<Option<Weak<dyn Saved>>>,
     /// Whether a request that follows a program takes the jump arm.
     jump: bool,
 }
@@ -463,6 +466,7 @@ impl Slot {
             away: None,
             off: false,
             saving: vec![None; n],
+            sealed: vec![None; n],
             jump: true,
         }
     }
@@ -540,6 +544,7 @@ impl Slot {
     }
 
     fn held_mut(&mut self, slot: usize) -> &mut Held {
+        self.sealed[slot] = None;
         if slot == self.cur {
             &mut self.held
         } else {
@@ -652,6 +657,7 @@ impl Slot {
     /// no prefix it shared is noted.
     fn reuse(&mut self, req: &Held, want: bool) -> Result<usize, EngineError> {
         let away = self.away.take();
+        let sealed = self.sealed[self.cur].take();
         // The slot's own state copy lands before its rows are cut, reset or
         // replaced; the copies of the other slots that have landed leave
         // the cache free to evict them.
@@ -677,6 +683,9 @@ impl Slot {
         if self.cache.enabled()
             && !self.held.is_empty()
             && (picked.is_some() || (saves_cut && !continues))
+            && !sealed
+                .as_ref()
+                .is_some_and(|s| self.cache.contains(s, &self.held))
         {
             self.save_held(away.as_ref())?;
         }
@@ -732,6 +741,7 @@ impl Slot {
         if !self.off && self.saving[self.cur].is_some() {
             return Err(SaveInFlight { slot: self.cur }.into());
         }
+        self.sealed[self.cur] = None;
         Ok(self.engine.as_mut())
     }
 
@@ -763,6 +773,9 @@ impl Slot {
     /// not kept; an engine failure is the request's error.
     fn save_held(&mut self, away: Option<&Arc<dyn Saved>>) -> Result<(), EngineError> {
         if self.cache.covers(&self.held) {
+            return Ok(());
+        }
+        if away.is_none() && !self.snapshot_fits()? {
             return Ok(());
         }
         let t = Instant::now();
@@ -856,6 +869,9 @@ impl Slot {
             return Ok(());
         }
         self.settle(slot)?;
+        if !self.snapshot_fits()? {
+            return Ok(());
+        }
         let t = Instant::now();
         let mut begun = self.engine.snapshot_begin();
         while let Err(StateError::NoRoom { need, held, .. }) = &begun
@@ -884,6 +900,23 @@ impl Slot {
         }
     }
 
+    fn snapshot_fits(&self) -> Result<bool, EngineError> {
+        let note = match self.engine.snapshot_size() {
+            Ok(Some(bytes)) => self.cache.admission(self.held.len(), bytes),
+            Ok(None) => None,
+            Err(StateError::Engine(e)) => return Err(e),
+            Err(e) => Some(CacheNote::Skip {
+                positions: self.held.len(),
+                why: format!("the engine could not size its snapshot: {e}"),
+            }),
+        };
+        if let Some(note) = note {
+            self.engine.note(&note);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// `slot`'s state taken on this path, the engine having begun no copy of
     /// it for `why`: [`StateError::NoRoom`] keeps it with the pool's state
     /// named, any other refusal is noted and keeps nothing.
@@ -898,7 +931,11 @@ impl Slot {
         let t = Instant::now();
         match self.engine.snapshot() {
             Ok(state) => {
+                let sealed = Arc::downgrade(&state);
                 self.keep(slot, state, true, Some(fallback), t);
+                if self.cache.contains(&sealed, self.held_of(slot)) {
+                    self.sealed[slot] = Some(sealed);
+                }
                 Ok(())
             }
             Err(StateError::Engine(e)) => Err(e),
@@ -935,6 +972,7 @@ impl Slot {
             self.engine.note(&note);
         }
         if kept {
+            self.sealed[slot] = Some(Arc::downgrade(pending.state()));
             self.saving[slot] = Some(pending);
             Ok(())
         } else {
@@ -2835,6 +2873,10 @@ mod cache_tests {
         fn cache_ram(&self) -> u64 {
             self.budget
         }
+        fn snapshots_async(&self) -> bool {
+            true
+        }
+
         fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
             std::thread::sleep(self.snapshot_takes);
             self.log.lock().expect("the log").snapshots += 1;
@@ -3295,6 +3337,9 @@ mod cache_tests {
     }
 
     impl Engine for Noted {
+        fn snapshot_size(&self) -> Result<Option<u64>, StateError> {
+            self.inner.snapshot_size()
+        }
         fn tokenizer(&self) -> Arc<dyn Tokenizer> {
             self.inner.tokenizer()
         }
@@ -3592,6 +3637,69 @@ mod cache_tests {
             "{n:?}"
         );
         assert!(evicted(&n).is_empty(), "a state left for nothing: {n:?}");
+    }
+
+    #[test]
+    fn a_sealed_sparse_state_is_not_copied_again_on_a_switch() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut slot = Slot::new(Box::new(Probe::new(1 << 20, false, &log)));
+        outcome(&mut slot, &[10; 20]);
+        slot.seal(0).expect("a sealed state");
+        outcome(&mut slot, &[11; 20]);
+        assert_eq!(log.lock().expect("the log").snapshots, 1);
+    }
+
+    #[test]
+    fn an_over_budget_state_is_never_copied_for_seal_or_switch() {
+        let (mock, stats) = MockEngine::new(4096)
+            .with_cache_ram(CELL)
+            .with_async_snapshots(Duration::ZERO);
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let mut slot = Slot::new(Box::new(Noted {
+            inner: mock.with_staging(CELL, 1),
+            notes: Arc::clone(&notes),
+        }));
+        served(&mut slot, 0, &enc(LONG));
+        served(&mut slot, 0, &enc(SHORT[0]));
+        assert_eq!(
+            stats.sync_snapshots.load(SeqCst),
+            0,
+            "a switch or fallback copied an oversized state"
+        );
+        assert_eq!(
+            stats.no_room.load(SeqCst),
+            0,
+            "an oversized state reached staging"
+        );
+        assert_eq!(
+            stats.begun.load(SeqCst),
+            1,
+            "only the small state is copied"
+        );
+        assert!(
+            notes
+                .lock()
+                .expect("notes")
+                .iter()
+                .any(|n| matches!(n, CacheNote::Skip { why, .. } if why.contains("budget")))
+        );
+    }
+
+    #[test]
+    fn snapshot_admission_uses_array_bytes_at_the_exact_budget() {
+        for fits in [false, true] {
+            let (mut slot, stats, _) = async_slot(1, Duration::ZERO, Some(2));
+            outcome(&mut slot, &enc(SHORT[0]));
+            let bytes = slot
+                .engine
+                .snapshot_size()
+                .expect("a size")
+                .expect("known bytes");
+            slot.cache = crate::promptcache::PromptCache::new(bytes - u64::from(!fits));
+            slot.seal(0).expect("a seal");
+            assert_eq!(stats.begun.load(SeqCst), usize::from(fits));
+            assert_eq!(stats.sync_snapshots.load(SeqCst), 0);
+        }
     }
 
     /// A cache hit puts back the prefix the request keeps and nothing past

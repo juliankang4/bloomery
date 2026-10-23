@@ -19,7 +19,7 @@
 //! or lent again while the copy writes it. A state that fits only by one
 //! leaving is not kept, and the cache is then as it was.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::engine::{CacheNote, Pending, Saved};
 use crate::media::{Held, common_prefix, keep_whole_spans};
@@ -67,6 +67,22 @@ impl PromptCache {
         self.budget > 0
     }
 
+    pub(crate) fn contains(&self, state: &Weak<dyn Saved>, held: &Held) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.held == *held && state.ptr_eq(&Arc::downgrade(&e.state)))
+    }
+
+    pub(crate) fn admission(&self, positions: usize, bytes: u64) -> Option<CacheNote> {
+        (bytes > self.budget).then(|| CacheNote::Skip {
+            positions,
+            why: format!(
+                "its {bytes} bytes pass the cache's budget of {}",
+                self.budget
+            ),
+        })
+    }
+
     /// The host bytes the states hold.
     pub(crate) fn bytes(&self) -> u64 {
         self.entries.iter().map(|e| e.state.n_bytes()).sum()
@@ -78,14 +94,19 @@ impl PromptCache {
     }
 
     /// The state that keeps the most of `req` (a request of at least one id),
-    /// if it keeps more than `floor`; of equals, the most recent.
+    /// if it keeps more than `floor`; of equals, a landed state, then the
+    /// most recent.
     pub(crate) fn best(&self, req: &Held, floor: usize) -> Option<Pick> {
         let last = req.ids.len().checked_sub(1)?;
         let mut best: Option<Pick> = None;
         for (index, e) in self.entries.iter().enumerate().rev() {
             let common = common_prefix(&e.held, req);
             let kept = keep_whole_spans(req, common.min(last), |n| e.state.keepable(n));
-            if kept > best.map_or(floor, |b| b.kept) {
+            if kept > best.map_or(floor, |b| b.kept)
+                || best.is_some_and(|b| {
+                    kept == b.kept && e.pending.is_none() && self.entries[b.index].pending.is_some()
+                })
+            {
                 best = Some(Pick {
                     index,
                     common,
@@ -136,11 +157,11 @@ impl PromptCache {
     }
 
     /// Whether a state already keeps all of `req`: its held sequence extends
-    /// `req`'s and it keeps every one of its positions.
+    /// `req`'s and it keeps every prefix of it.
     pub(crate) fn covers(&self, req: &Held) -> bool {
         self.entries
             .iter()
-            .any(|e| e.held.starts_with(req) && e.state.keepable(req.ids.len()) == req.ids.len())
+            .any(|e| e.held.starts_with(req) && keeps_prefixes(&*e.state, req.ids.len(), |n| n))
     }
 
     /// Keeps `state` of `held` (as many ids as it holds positions): the
@@ -212,14 +233,8 @@ impl PromptCache {
     ) -> Vec<CacheNote> {
         let bytes = state.n_bytes();
         let positions = held.ids.len();
-        if bytes > self.budget {
-            return vec![CacheNote::Skip {
-                positions,
-                why: format!(
-                    "its {bytes} bytes pass the cache's budget of {}",
-                    self.budget
-                ),
-            }];
+        if let Some(note) = self.admission(positions, bytes) {
+            return vec![note];
         }
         // What leaves, decided before anything does: the entries the new
         // state keeps all of, then the oldest, none of them one whose copy
@@ -229,7 +244,7 @@ impl PromptCache {
         for (i, e) in self.entries.iter().enumerate() {
             let covered = e.pending.is_none()
                 && held.starts_with(&e.held)
-                && state.keepable(e.held.ids.len()) >= e.state.keepable(e.held.ids.len());
+                && keeps_prefixes(&*state, e.held.ids.len(), |n| e.state.keepable(n));
             if covered {
                 gone.push((i, "a newer state keeps all of it"));
                 held_bytes -= e.state.n_bytes();
@@ -286,6 +301,10 @@ impl PromptCache {
         });
         notes
     }
+}
+
+fn keeps_prefixes(state: &dyn Saved, positions: usize, kept: impl Fn(usize) -> usize) -> bool {
+    (1..=positions).rev().all(|n| state.keepable(n) >= kept(n))
 }
 
 #[cfg(test)]
@@ -469,6 +488,42 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert!(c.covers(&head(&a, 40)));
         assert!(!c.covers(&head(&a, 60)), "the newer state keeps 0 of 60");
+    }
+
+    #[test]
+    fn an_end_position_does_not_cover_the_inner_prefixes() {
+        let mut c = PromptCache::new(100);
+        let a = ids(24, 1);
+        c.insert(head(&a, 20), state(20, 1, None), 0.0, true);
+        c.insert(a.clone(), Arc::new(Fours(24)), 0.0, true);
+        let mut req = head(&a, 11);
+        req.push(999);
+        assert_eq!(c.best(&req, 0).expect("an inner prefix").kept, 11);
+        let mut sparse = PromptCache::new(100);
+        sparse.insert(a.clone(), Arc::new(Fours(24)), 0.0, true);
+        assert!(
+            !sparse.covers(&head(&a, 20)),
+            "the inner prefixes are missing"
+        );
+    }
+
+    #[test]
+    fn equal_prefixes_prefer_a_landed_state_before_recency() {
+        let mut c = PromptCache::new(100);
+        let a = ids(12, 1);
+        let mut b = head(&a, 10);
+        b.ids.extend([888, 889]);
+        let mut req = head(&a, 10);
+        req.push(999);
+        c.insert(a.clone(), state(12, 1, None), 0.0, true);
+        c.insert_pending(b.clone(), running(12, 1), 0.0);
+        let pick = c.best(&req, 0).expect("a shared prefix");
+        let taken = c.take(pick);
+        assert_eq!(taken.held, a);
+        assert!(taken.pending.is_none());
+        let pick = c.best(&b, 0).expect("the longer pending prefix");
+        assert_eq!(pick.kept, 11);
+        assert!(c.take(pick).pending.is_some());
     }
 
     /// A copy that runs until `land` is called.

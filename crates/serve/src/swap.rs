@@ -175,6 +175,9 @@ impl Engine for SwapEngine {
     fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
         self.inner.snapshot()
     }
+    fn snapshot_size(&self) -> Result<Option<u64>, StateError> {
+        self.inner.snapshot_size()
+    }
     fn resume(&mut self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
         self.inner.resume(state)
     }
