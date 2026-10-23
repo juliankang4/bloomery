@@ -1894,8 +1894,10 @@ mod gate {
             Ok(())
         }
 
+        // PIN(2026-10-23): the census clause runs with model and corpus fixtures in gate-gpu-qwen38-nodes.
         #[test]
-        fn census_clause_requires_the_remote_census() -> Result<(), GateError> {
+        #[ignore = "needs the Qwen model and corpus files"]
+        fn hw_census_clause_requires_the_remote_census() -> Result<(), GateError> {
             let levers = bloomery_levers::at_main(&[
                 super::CARD_BUDGET,
                 super::HOST_POPULATE,
