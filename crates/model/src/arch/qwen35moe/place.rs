@@ -681,8 +681,14 @@ impl PlanInputs {
             let room = plan.plan_at(&self.room);
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
             self.place_rows(&mut plan, room, floor, page)?;
-            plan.host
-                .step_slots(beside.slots, placement::STEP_PORT_COLUMNS)?;
+            plan.host.step_slots(
+                if beside.mtp.is_some() {
+                    beside.slots.saturating_mul(DELTA_LANES)
+                } else {
+                    beside.slots
+                },
+                placement::STEP_PORT_COLUMNS,
+            )?;
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             Ok(plan)
         };
@@ -3392,7 +3398,7 @@ mod tests {
             let mtp =
                 MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
             let levers = PlanLevers::default();
-            for n in [1, 2, 4] {
+            for (n, columns) in [(1, 4), (2, 8), (4, 8)] {
                 let slots = n as u64;
                 let plain = inputs
                     .plan_with_slots(&machine, CTX, &levers, Experts::Host, n)
@@ -3409,7 +3415,8 @@ mod tests {
                     .expect("the drafted plan");
                 let (draft_want, reserve) = draft_of(&mtp, slots);
                 assert_eq!(view(&drafted.draft), view(&draft_want), "{n} slots");
-                let want = target(&inputs, &machine, slots, reserve);
+                let mut want = target(&inputs, &machine, slots, reserve);
+                want.host.arena_columns = columns;
                 assert_eq!(view(&drafted.plan), view(&want), "{n} slots");
                 assert_eq!(
                     drafted.plan.cards[0].kv_bytes + drafted.draft.cards[0].kv_bytes,
@@ -3456,6 +3463,64 @@ mod tests {
                 });
             }
             inputs
+        }
+
+        #[test]
+        fn drafted_slot_plans_floor_the_arena_for_every_verify_row() {
+            let mut machine = machine();
+            machine.cards[0].usable_bytes = 8 << 30;
+            let mtp =
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            for experts in [Experts::Host, Experts::Card] {
+                for (n, columns) in [(2, 8), (1, 4), (4, 8)] {
+                    let mut inputs = routed(inputs());
+                    let (room, slot_set, lane_slots) = {
+                        let drafted = inputs
+                            .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, experts, n)
+                            .expect("the resident plan");
+                        let plan = &drafted.plan;
+                        let floor = placement::ArenaFloor::of(plan).expect("the arena floor");
+                        assert_eq!(floor.columns, columns, "{experts:?}, {n} slots");
+                        assert!(floor.slot_set > 0);
+                        let lane_slots = if experts == Experts::Card { 5 } else { 0 };
+                        assert_eq!(floor.lane_slots, lane_slots);
+                        (
+                            placement::workstation::HostNeed::of(plan, 0).bytes()
+                                - plan.host.expert_bytes / 32,
+                            floor.slot_set,
+                            lane_slots,
+                        )
+                    };
+                    inputs.room = (room, HostRead::Given);
+                    let old_arena = 37 * slot_set;
+                    let slots = 10 * columns + lane_slots;
+                    let arena = slots * slot_set;
+                    inputs.arena = Some(old_arena);
+                    match inputs.plan_mtp_with_slots(&machine, CTX, &levers, &mtp, experts, n) {
+                        Err(PlaceError::Placement(PlacementError::NvTierArenaUnder {
+                            arena: got,
+                            least,
+                        })) => {
+                            assert_eq!(got, old_arena);
+                            assert_eq!(
+                                (least.columns, least.slots, least.bytes),
+                                (columns, slots, arena)
+                            );
+                        }
+                        other => panic!(
+                            "{experts:?}, {n} slots: not the arena's refusal: {:?}",
+                            other.err()
+                        ),
+                    }
+                    inputs.arena = Some(arena);
+                    let drafted = inputs
+                        .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, experts, n)
+                        .expect("the exact arena floor fits");
+                    assert_eq!(drafted.plan.host.nvme_arena_bytes, arena);
+                    assert!(drafted.plan.host.nvme_expert_bytes > 0);
+                }
+            }
         }
 
         /// The stage card's headroom past the bytes a plan of several slots
