@@ -840,6 +840,7 @@ impl Worker {
             // alone in its round: here it steps.
             let mut steps: Vec<SlotRow<'_>> = Vec::new();
             let mut step_at: Vec<usize> = Vec::new();
+            let mut pass_at: Vec<usize> = Vec::new();
             for (i, (a, need)) in self.active.iter_mut().zip(&needs).enumerate() {
                 match *need {
                     Need::Step(last) | Need::Sampled(last) => {
@@ -851,7 +852,10 @@ impl Worker {
                             next: 0,
                         });
                     }
-                    Need::Advance(last) => a.need = Some(Need::Advance(last)),
+                    Need::Advance(last) => {
+                        pass_at.push(a.slot);
+                        a.need = Some(Need::Advance(last));
+                    }
                     Need::Fill => {}
                     Need::Done => unreachable!("a finished request left the running ones"),
                 }
@@ -869,8 +873,7 @@ impl Worker {
             if called.is_ok() {
                 let answers: Vec<u32> = steps.iter().map(|r| r.next).collect();
                 drop(steps);
-                let mixed =
-                    !step_at.is_empty() && needs.iter().any(|n| matches!(n, Need::Advance(_)));
+                let mixed = !step_at.is_empty() && !pass_at.is_empty();
                 for (i, g) in step_at.into_iter().zip(answers) {
                     self.active[i].job.stepped(g);
                 }
@@ -882,18 +885,21 @@ impl Worker {
                 }
                 // Pumping may end a request and move the remaining entries.
                 let mut passes: Vec<SlotPass<'_>> = Vec::new();
-                let mut pass_at: Vec<usize> = Vec::new();
-                for (i, a) in self.active.iter_mut().enumerate() {
-                    if let Some(Need::Advance(last)) = a.need {
-                        a.need = None;
-                        pass_at.push(i);
-                        passes.push(SlotPass {
-                            slot: a.slot,
-                            last,
-                            out: a.job.kept_mut(),
-                            drafted: Drafted::default(),
-                        });
-                    }
+                let mut active = self.active.iter_mut().enumerate();
+                for at in &mut pass_at {
+                    let (i, a) = active
+                        .find(|(_, a)| a.slot == *at)
+                        .expect("uncalled advances survive pumping in their original order");
+                    let Some(Need::Advance(last)) = a.need.take() else {
+                        unreachable!("an original advance keeps its uncalled need");
+                    };
+                    *at = i;
+                    passes.push(SlotPass {
+                        slot: a.slot,
+                        last,
+                        out: a.job.kept_mut(),
+                        drafted: Drafted::default(),
+                    });
                 }
                 called = if passes.len() > 1 {
                     self.slot.advance_slots(&mut passes)
