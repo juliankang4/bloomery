@@ -1725,14 +1725,7 @@ impl SeatEngine {
                             (result, None, extra)
                         }
                         Cmd::Save => (Ok(0), None, Extra::Saved(snapshot_of(&mut g))),
-                        Cmd::SaveSize => (
-                            Ok(0),
-                            None,
-                            Extra::SaveSize(
-                                g.snapshot_size()
-                                    .map_err(|e| seat_failure(&*e, "snapshot size".to_owned())),
-                            ),
-                        ),
+                        Cmd::SaveSize => (Ok(0), None, Extra::SaveSize(snapshot_size_of(&mut g))),
                         Cmd::SaveBegin => (Ok(0), None, Extra::Begun(begin_of(&mut g))),
                         Cmd::SavePoll(p) => (Ok(0), None, Extra::Polled(p.flight().poll())),
                         Cmd::SaveWait(p) => {
@@ -2600,6 +2593,12 @@ fn snapshot_of<S: Seat + ?Sized>(g: &mut S) -> Result<Arc<dyn Saved>, StateError
     let at = g.pos();
     g.snapshot()
         .map_err(|e| seat_failure(&*e, format!("snapshot at position {at}")))
+}
+
+fn snapshot_size_of<S: Seat + ?Sized>(g: &mut S) -> Result<Option<u64>, StateError> {
+    let at = g.pos();
+    g.snapshot_size()
+        .map_err(|e| seat_failure(&*e, format!("snapshot size at position {at}")))
 }
 
 /// `state` back into the selected slot ([`Seat::resume`]), on the engine
@@ -4239,6 +4238,10 @@ mod tests {
         impl Seat for Caches {
             no_steps!();
 
+            fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+                Err((self.fail)())
+            }
+
             fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
                 Err((self.fail)())
             }
@@ -4325,12 +4328,18 @@ mod tests {
         struct Whole {
             pos: usize,
             resumes: usize,
+            snapshots: usize,
         }
 
         impl Seat for Whole {
             no_steps!();
 
+            fn snapshot_size(&mut self) -> Result<Option<u64>, GateError> {
+                Ok(Some(0))
+            }
+
             fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+                self.snapshots += 1;
                 Ok(Arc::new(Held(30)))
             }
 
@@ -4369,6 +4378,7 @@ mod tests {
                         Cmd::SaveState(chunks) => Extra::State(save_into(&mut seat, chunks)),
                         Cmd::RestoreState(chunks) => Extra::State(restore_from(&mut seat, chunks)),
                         Cmd::Save => Extra::Saved(snapshot_of(&mut seat)),
+                        Cmd::SaveSize => Extra::SaveSize(snapshot_size_of(&mut seat)),
                         Cmd::Resume(state) => Extra::Resumed(resume_of(&mut seat, &*state)),
                         Cmd::SaveBegin => Extra::Begun(begin_of(&mut seat)),
                         Cmd::SavePoll(p) => Extra::Polled(p.flight().poll()),
@@ -4445,6 +4455,7 @@ mod tests {
             let whole = Whole {
                 pos: 30,
                 resumes: 0,
+                snapshots: 0,
             };
             assert!(!whole.snapshots_async());
             let (mut link, worker) = file_link(whole);
@@ -4459,6 +4470,20 @@ mod tests {
             );
             link.tx = None;
             assert_eq!(worker.join().expect("the file thread").resumes, 1);
+        }
+
+        #[test]
+        fn a_snapshot_size_crosses_the_link_without_copying() {
+            let (mut link, worker) = file_link(Whole {
+                pos: 30,
+                resumes: 0,
+                snapshots: 0,
+            });
+            assert_eq!(link.snapshot_size().expect("a size query"), Some(0));
+            link.tx = None;
+            let seat = worker.join().expect("the file thread");
+            assert_eq!(seat.snapshots, 0);
+            assert_eq!(seat.pos, 30);
         }
 
         /// A body's sequence state of `.0` positions, every one a point.
@@ -4893,6 +4918,7 @@ mod tests {
             ];
             for (fail, refused) in cases {
                 let (mut link, worker) = file_link(Caches { pos: 7, fail });
+                let size = link.snapshot_size().expect_err("a failed size query");
                 let saved = link.snapshot().map(|_| ()).expect_err("a failed snapshot");
                 let resumed = link.resume(&held).expect_err("a failed resume");
                 let begun = link
@@ -4902,6 +4928,7 @@ mod tests {
                 let prefix = link.resume_prefix(&held, 3).expect_err("a failed prefix");
                 let want = fail().to_string();
                 for (e, head) in [
+                    (&size, "snapshot size at position 7: "),
                     (&saved, "snapshot at position 7: "),
                     (&resumed, "resume of a state of 4 positions: "),
                     (&begun, "snapshot begun at position 7: "),
