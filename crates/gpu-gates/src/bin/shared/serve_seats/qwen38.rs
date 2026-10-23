@@ -272,12 +272,12 @@
 //! most and none while no width beats the plain step, `fixed` the draft's
 //! three ids whole — the greedy ids the plain server's, `pass_rows` 4;
 //! under `cost` a request's `mtp width` record prints at the slot's next
-//! prompt call. A sampling request drafts while its slot runs alone in the
-//! round, each kept id its sampler's draw from its verified row
-//! (`Seat::pass_sampled`), and takes plain steps beside another busy slot;
-//! an id-banning request takes plain steps. Each step's row is the
-//! target's, read before the step is told to the draft; its ids are the
-//! plain server's. A `load draft=mtp` line
+//! prompt call. A sampling or id-banning request drafts while its slot runs
+//! alone in the round, each kept id its draw from its verified row
+//! (`Seat::pass_sampled`; an id-banning request's draw sets the banned
+//! logits to -inf first), and takes plain steps beside another busy slot.
+//! Each step's row is the target's, read before the step is told to the
+//! draft; its ids are the plain server's. A `load draft=mtp` line
 //! follows the `load` line, then the `mtp head` record (which head, what
 //! picked it and why), and `/props`' `engine.draft` names the draft
 //! with its resident bytes as the card's `draft` class. Every other word of

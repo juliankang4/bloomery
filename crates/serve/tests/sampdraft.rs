@@ -1,11 +1,13 @@
 //! Gate: a sampled request on an engine that drafts sampled requests
 //! ([`serve::Engine::advance_sampled`]) takes the ids a plain run of the same
 //! seed takes, alone in its round, and steps where a pass would read what the
-//! loop has not settled: an id it bans, a think close it forces, another busy
-//! slot's rows. The drafted mock is [`DraftMock`]; its plain twin is the same
-//! mock [`DraftMock::without_sampled`]. Both servers sample with
-//! [`penalised`], whose draws read the history, so a pass that hands the
-//! sampler another history than a step does takes other ids.
+//! loop has not settled: a think close it forces, another busy slot's rows. A
+//! request that bans an id (`ignore_eos`) draws in those passes too, greedy or
+//! sampled, from rows whose banned ids are at -inf. The drafted mock is
+//! [`DraftMock`]; its plain twin is the same mock
+//! [`DraftMock::without_sampled`]. Both servers sample with [`penalised`],
+//! whose draws read the history, so a pass that hands the sampler another
+//! history than a step does takes other ids.
 
 mod common;
 
@@ -340,49 +342,89 @@ fn hw_greedy_requests_still_advance() {
     assert_eq!(count(&calls, MockCall::Sampled), 0, "{calls:?}");
 }
 
-/// What a pass cannot serve steps on the drafting mock: a request that bans
-/// the end of generation (`ignore_eos`) and one whose think budget forces its
-/// close before a pass's rows fit run no sampled pass and take the plain ids;
-/// the same requests without the ban or the budget do pass.
+/// A request that bans the end of generation (`ignore_eos`) drafts as it
+/// would without the ban, greedy and sampled: its passes draw from rows
+/// whose stop ids are at -inf, and its ids are the plain twin's, none a stop
+/// id, to `n_predict`. The prompt ends on an id the mock never saw, so after
+/// the first generated id (also unseen) the target's argmax is the end of
+/// generation, which the greedy run's first pass proposes: a pass that kept
+/// it fails the request.
 #[test]
 #[ignore = "gate: just gate-serve"]
-fn hw_a_banned_id_or_a_forced_close_steps() {
+fn hw_a_banned_id_drafts() {
+    let (dlog, plog) = (log(), log());
+    let drafted = serve(drafting(4096), &dlog);
+    let plain = serve(drafting(4096).without_sampled(), &plog);
+    let eos = u64::from(serve::MockTokenizer.eos());
+    let (mut proposed, mut accepted) = (0, 0);
+    for temperature in [0.0, 0.8] {
+        for seed in 1..=4u64 {
+            let mut body = sampled("abacadaez", 24, temperature, seed);
+            body["ignore_eos"] = json!(true);
+            let at = format!("T {temperature}, seed {seed}");
+            let (want, w) = ids_of(plain, &body);
+            let (got, v) = ids_of(drafted, &body);
+            assert_eq!(got, want, "{at}: {v}");
+            assert_eq!(got.len(), 24, "{at}: {v}");
+            assert!(!got.contains(&eos), "{at}: {got:?}");
+            assert_eq!(
+                draft_counts(&w),
+                (0, 0),
+                "{at}: the plain twin drafted: {w}"
+            );
+            let (n, a) = draft_counts(&v);
+            assert!(n > 0, "{at}: the banned request drafted nothing: {v}");
+            (proposed, accepted) = (proposed + n, accepted + a);
+        }
+    }
+    assert!(
+        0 < accepted && accepted < proposed,
+        "the passes kept {accepted} of {proposed} proposed ids: both kept and taken-back rows are \
+         needed"
+    );
+    assert!(count(&drain(&dlog), MockCall::Sampled) > 0, "no pass drew");
+    assert_eq!(
+        count(&drain(&plog), MockCall::Sampled),
+        0,
+        "the plain twin ran a pass"
+    );
+}
+
+/// A forced think close steps on the drafting mock: a request whose budget
+/// forces its close before a pass's rows fit runs no sampled pass and takes
+/// the plain ids; the same request without the budget does pass.
+// PIN(2026-10-23): hw_a_banned_id_or_a_forced_close_steps keeps its forced
+// close arm here; its ignore_eos arm drafts now (hw_a_banned_id_drafts).
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_forced_close_steps() {
     let (dlog, plog) = (log(), log());
     let drafted = serve(drafting(4096), &dlog);
     let plain = serve(drafting(4096).without_sampled(), &plog);
     let close = u64::from(serve::MockTokenizer.encode("</think>")[0]);
-    let mut banned = sampled(BRANCHY, 24, 0.8, 3);
-    banned["ignore_eos"] = json!(true);
     // A budget of 2 under a pass's four rows: two drawn steps, then the
     // forced close, which ends the request at its `n_predict`.
     let mut budget = sampled("q<think>aa<think>", 3, 0.8, 3);
     budget["reasoning_budget"] = json!(2);
-    for (what, body, trigger) in [
-        ("ignore_eos", &banned, "ignore_eos"),
-        ("reasoning_budget", &budget, "reasoning_budget"),
-    ] {
-        drain(&dlog);
-        let (want, _) = ids_of(plain, body);
-        let (got, v) = ids_of(drafted, body);
-        assert_eq!(got, want, "{what}: {v}");
-        assert_eq!(draft_counts(&v), (0, 0), "{what}: {v}");
-        let calls = drain(&dlog);
-        assert_eq!(count(&calls, MockCall::Sampled), 0, "{what}: {calls:?}");
-        if what == "reasoning_budget" {
-            assert_eq!(got.last(), Some(&close), "{got:?}");
-        }
-        let mut free = body.clone();
-        free.as_object_mut().expect("a body").remove(trigger);
-        if what == "reasoning_budget" {
-            free["n_predict"] = json!(12);
-        }
-        ids_of(drafted, &free);
-        let calls = drain(&dlog);
-        assert!(
-            count(&calls, MockCall::Sampled) > 0,
-            "{what}: without it the request passes: {calls:?}"
-        );
-    }
+    drain(&dlog);
+    let (want, _) = ids_of(plain, &budget);
+    let (got, v) = ids_of(drafted, &budget);
+    assert_eq!(got, want, "{v}");
+    assert_eq!(draft_counts(&v), (0, 0), "{v}");
+    let calls = drain(&dlog);
+    assert_eq!(count(&calls, MockCall::Sampled), 0, "{calls:?}");
+    assert_eq!(got.last(), Some(&close), "{got:?}");
+    let mut free = budget.clone();
+    free.as_object_mut()
+        .expect("a body")
+        .remove("reasoning_budget");
+    free["n_predict"] = json!(12);
+    ids_of(drafted, &free);
+    let calls = drain(&dlog);
+    assert!(
+        count(&calls, MockCall::Sampled) > 0,
+        "without the budget the request passes: {calls:?}"
+    );
 }
 
 /// Waits until `requests_deferred` reaches `n`.

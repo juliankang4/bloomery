@@ -175,11 +175,12 @@
 //!   case).
 //!   Then the drafted sampled clauses ([`slots_drafted_sampled`]): the
 //!   sampled rounds clauses' pair (below) banning the end ids
-//!   (`ignore_eos`), so each request steps on this drafted load too: over
-//!   the together run every record is `cmd=step` of `passes=1` carrying
-//!   both slots (`slots_drafted_sampled_rounds_run_one_pass`: the seat runs
-//!   a drafted load's round of plain steps as one pass of its rows) and
-//!   each request's together ids are its alone ones
+//!   (`ignore_eos`), so each request draws in drafted passes alone and
+//!   steps beside the other on this drafted load: over the together run
+//!   every record is `cmd=step` of `passes=1` carrying both slots
+//!   (`slots_drafted_sampled_rounds_run_one_pass`: the seat runs a drafted
+//!   load's round of plain steps as one pass of its rows) and each
+//!   request's together ids are its alone ones
 //!   (`slots_drafted_sampled_together_alone`); then the pair with no ban,
 //!   the second asking 8 ids: the first steps beside it and then drafts
 //!   alone from the state its rows of the pass told its draft, its draft
@@ -1957,7 +1958,7 @@ mod gate {
     /// when `ignore_eos`: its ids a function of its logits rows and the seed
     /// alone (the server seeds each request's sampler from its own `seed`).
     /// It steps on a load that drafts nothing; on a drafted load it drafts
-    /// while its slot runs alone in the round, unless it bans an id.
+    /// while its slot runs alone in the round, banning or not.
     fn sampled_stream(
         addr: &str,
         ids: &[u32],
@@ -2997,8 +2998,9 @@ mod gate {
 
     /// The drafted sampled clauses (the module header) on the slots clause's
     /// server, after [`slots_drafted_beside`]: the sampled pair of `ids`
-    /// banning the end ids, which steps on this drafted load too
-    /// ([`sampled_pair`], `slots_drafted_sampled_*`); then the pair with no
+    /// banning the end ids, which draws in drafted passes alone and steps
+    /// together on this drafted load ([`sampled_pair`],
+    /// `slots_drafted_sampled_*`); then the pair with no
     /// ban, `ids[1]` asking [`DRAFTED_SAMPLED_SHORT`] ids, so `ids[0]` steps
     /// beside it and then drafts alone from the state its rows in the pass
     /// told its draft: its proposals an id past the short request's are at

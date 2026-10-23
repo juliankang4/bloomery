@@ -19,13 +19,14 @@
 //! pass that would run past the context is not run; the positions left take
 //! one step each, so the ids end where a plain run's end. `timings` then carry
 //! llama-server's `draft_n` and `draft_n_accepted`: the ids the passes proposed
-//! and kept. A request that samples takes its passes through
-//! [`Engine::advance_sampled`] on an engine that drafts sampled requests
-//! ([`Engine::drafts_sampled`]), its sampler drawing each kept id from the
-//! verified rows, and only while its slot runs alone in the round: beside
-//! another busy slot, a pass's rows are not pinned to a step's, so it steps.
-//! A request that bans an id, or samples on another drafting engine, reads the
-//! logits row every token, which a pass does not give, so it takes one
+//! and kept. A request that draws (it samples, or bans an id: `ignore_eos`'s
+//! draw is the row with the stop ids at -inf, then its sampler or the argmax)
+//! takes its passes through [`Engine::advance_sampled`] on an engine that
+//! drafts sampled requests ([`Engine::drafts_sampled`]), its draw taking each
+//! kept id from the verified rows, and only while its slot runs alone in the
+//! round: beside another busy slot, a pass's rows are not pinned to a step's,
+//! so it steps. On another drafting engine such a request reads the logits
+//! row every token, which a pass does not give, so it takes one
 //! [`Engine::next`] a token and carries no draft counts.
 //!
 //! A request that asks for probabilities ([`GenParams::logprobs`]) reads the
@@ -350,42 +351,49 @@ fn prompt_tail(held: &Held, n: usize) -> Vec<u32> {
     tail
 }
 
-/// The next id: the engine's argmax, or the sampler's draw. `banned` (the
-/// stop ids under `ignore_eos`, as llama-server's `logit_bias_eog`) get a
-/// -inf logit first, and a greedy request whose argmax is banned takes the
-/// largest other logit (first of equals).
-fn choose(
-    sampler: &mut Option<Sampler>,
-    greedy: u32,
-    logits: &mut [f32],
-    history: &[u32],
-    banned: &[u32],
-) -> u32 {
-    for &b in banned {
-        if let Some(l) = usize::try_from(b).ok().and_then(|i| logits.get_mut(i)) {
-            *l = f32::NEG_INFINITY;
+/// The draw of a request that bans ids (the stop ids under `ignore_eos`, as
+/// llama-server's `logit_bias_eog`): a copy of the row with each banned id's
+/// logit at -inf, then `draw` on it, or for a greedy request the copy's
+/// largest logit (first of equals). A step's row ([`Gen::answer`], where a
+/// greedy request whose argmax is not banned keeps it unread) and a pass's
+/// verified row ([`Engine::advance_sampled`]) are drawn from alike, so a pass
+/// never keeps a banned id: where the draft proposed one, the draw takes
+/// another and the pass stops there.
+fn banning(mut draw: Option<Sampler>, banned: Vec<u32>) -> Sampler {
+    let greedy = draw.is_none();
+    let mut row: Vec<f32> = Vec::new();
+    Box::new(move |logits: &[f32], history: &[u32]| {
+        row.clear();
+        row.extend(
+            logits
+                .iter()
+                .map(|&l| if greedy && l == 0.0 { 0.0 } else { l }),
+        );
+        for &b in &banned {
+            if let Some(l) = usize::try_from(b).ok().and_then(|i| row.get_mut(i)) {
+                *l = f32::NEG_INFINITY;
+            }
         }
-    }
-    match sampler {
-        Some(s) => s(logits, history),
-        None if banned.contains(&greedy) => sampling::argmax(logits),
-        None => greedy,
-    }
+        match &mut draw {
+            Some(s) => s(&row, history),
+            None => sampling::argmax(&row),
+        }
+    })
 }
 
 /// Whether a request takes its tokens after the first through the engine's
-/// passes when the engine drafts: one that bans no id, asks for no
-/// probabilities (`asks`) and follows no program (`constrained`, whose every
-/// token is picked from its own row), greedy ([`Engine::advance`]) or sampling
-/// on an engine that drafts sampled requests ([`Engine::advance_sampled`]).
+/// passes when the engine drafts: one that asks for no probabilities
+/// (`asks`) and follows no program (`constrained`, whose every token is
+/// picked from its own row), greedy ([`Engine::advance`]) or drawing (it
+/// samples or bans an id, [`banning`]) on an engine that drafts sampled
+/// requests ([`Engine::advance_sampled`]).
 fn takes_passes(
     sampler: Option<&Sampler>,
-    banned: &[u32],
     asks: bool,
     constrained: bool,
     engine: &dyn Engine,
 ) -> bool {
-    banned.is_empty() && !asks && !constrained && (sampler.is_none() || engine.drafts_sampled())
+    !asks && !constrained && (sampler.is_none() || engine.drafts_sampled())
 }
 
 /// The engine and its slots: what each slot's cache holds — the ids, one per
@@ -1621,9 +1629,10 @@ impl Think {
 /// thread can step several slots' generations in one engine call. `ids` is
 /// non-empty and shorter than the context. [`Gen::timings`] are filled even
 /// when the sink failed midway (the caller's counters still see the work
-/// done). A greedy request that asks for no probabilities never asks the
-/// engine for its logits, and takes its tokens after the first through the
-/// engine's passes. `tick` sees the timings after every generated token.
+/// done). A greedy request that bans no id and asks for no probabilities
+/// never asks the engine for its logits, and takes its tokens after the
+/// first through the engine's passes. `tick` sees the timings after every
+/// generated token.
 pub(crate) struct Gen {
     n: usize,
     ctx_max: usize,
@@ -1631,6 +1640,9 @@ pub(crate) struct Gen {
     stops: Vec<u32>,
     /// The stop ids under `ignore_eos`, else empty.
     banned: Vec<u32>,
+    /// Whether the request is greedy: one that bans an id draws through
+    /// [`banning`] only where the engine's argmax is banned.
+    greedy: bool,
     /// The engine's logits row, or empty on a greedy request.
     logits: Vec<f32>,
     tim: Timings,
@@ -1649,8 +1661,8 @@ pub(crate) struct Gen {
     stop: StopKind,
     stopping_word: String,
     truncated: bool,
-    /// A pass's rows; 1 steps. A request with no banned id passes when it is
-    /// greedy, or samples on an engine that drafts sampled requests.
+    /// A pass's rows; 1 steps. A request passes when it is greedy, or draws
+    /// (samples or bans an id) on an engine that drafts sampled requests.
     rows: usize,
     /// The last pass's kept tokens, and how many of them the loop has taken.
     kept: Vec<u32>,
@@ -1712,14 +1724,19 @@ impl Gen {
         } else {
             Vec::new()
         };
+        let greedy = sampler.is_none();
+        let sampler = if banned.is_empty() {
+            sampler
+        } else {
+            Some(banning(sampler, banned.clone()))
+        };
         let probs = p.logprobs.as_ref().map(Ask::collector);
-        // A greedy request reads the logits only to step past a banned argmax,
-        // for the probabilities it asked for, or to pick among the ids its
-        // program allows.
+        // A greedy request that bans no id reads the logits only for the
+        // probabilities it asked for, or to pick among the ids its program
+        // allows.
         let logits = vec![
             0.0f32;
-            if sampler.is_some() || !banned.is_empty() || probs.is_some() || p.constraint.is_some()
-            {
+            if sampler.is_some() || probs.is_some() || p.constraint.is_some() {
                 slot.vocab.n_vocab()
             } else {
                 0
@@ -1727,7 +1744,6 @@ impl Gen {
         ];
         let rows = if takes_passes(
             sampler.as_ref(),
-            &banned,
             probs.is_some(),
             p.constraint.is_some(),
             slot.engine.as_ref(),
@@ -1742,6 +1758,7 @@ impl Gen {
             sampler,
             stops,
             banned,
+            greedy,
             logits,
             tim: Timings::default(),
             t1: Instant::now(),
@@ -1806,9 +1823,11 @@ impl Gen {
 
     /// The id the loop takes for an engine answer `g`: the next forced close id
     /// while one is queued (the engine's answer is discarded — the loop never
-    /// commits it, so nothing desyncs), else the sampled or greedy choice. A
-    /// request that asks for probabilities reads the row first, as the engine
-    /// wrote it, before a banned id's logit is set to -inf.
+    /// commits it, so nothing desyncs), else the request's draw from the row
+    /// (a sampled one, or one that bans an id: [`banning`] draws from a
+    /// copy) or the engine's argmax `g`, which a greedy request keeps unless
+    /// it is banned. A request that asks for probabilities reads the row as
+    /// the engine wrote it.
     fn answer(&mut self, g: u32) -> u32 {
         if let Some(c) = self.probs.as_mut() {
             c.read(&self.logits);
@@ -1831,13 +1850,12 @@ impl Gen {
                 }
             };
         }
-        choose(
-            &mut self.sampler,
-            g,
-            &mut self.logits,
-            &self.history,
-            &self.banned,
-        )
+        match self.sampler.as_mut() {
+            Some(draw) if !self.greedy || self.banned.contains(&g) => {
+                draw(&self.logits, &self.history)
+            }
+            _ => g,
+        }
     }
 
     /// Whether a close id is queued to force: the budget spent with the span
@@ -1919,7 +1937,6 @@ impl Gen {
         // the passes make at most the rest.
         let passes = takes_passes(
             self.sampler.as_ref(),
-            &self.banned,
             self.probs.is_some(),
             self.walk.is_some(),
             slot.engine.as_ref(),
@@ -4103,11 +4120,34 @@ mod think_tests {
 mod sampled_tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{GenParams, Slot, Timings, generate};
+    use super::{GenParams, Slot, Timings, banning, generate};
     use crate::engine::{Drafted, Engine, EngineError, Sampler, SamplingParams, Tokenizer};
     use crate::mock::{DraftMock, MockTokenizer};
     use crate::reasoning::{ThinkEntry, ThinkTags};
     use crate::sampling;
+
+    #[test]
+    fn a_greedy_banning_draw_ties_signed_zeros_by_id() {
+        let mut draw = banning(None, vec![2]);
+        for row in [[-0.0, 0.0, -1.0], [0.0, -0.0, -1.0]] {
+            assert_eq!(draw(&row, &[]), 0);
+        }
+        let mut draw = banning(None, vec![0]);
+        assert_eq!(draw(&[1.0, -0.0, 0.0], &[]), 1);
+    }
+
+    #[test]
+    fn a_sampled_banning_draw_keeps_the_rows_zero_signs() {
+        let sampler: Sampler = Box::new(|row, history| {
+            assert_eq!(row[0].to_bits(), (-0.0f32).to_bits());
+            assert_eq!(row[1].to_bits(), 0.0f32.to_bits());
+            assert_eq!(row[2], f32::NEG_INFINITY);
+            assert_eq!(history, [4, 5]);
+            sampling::argmax(row)
+        });
+        let mut draw = banning(Some(sampler), vec![2]);
+        assert_eq!(draw(&[-0.0, 0.0, -1.0], &[4, 5]), 1);
+    }
 
     /// [`DraftMock`] that logs what each request tells [`Engine::will_reply`].
     struct Replies {
@@ -4162,8 +4202,8 @@ mod sampled_tests {
 
     /// On an engine that drafts sampled requests, a sampled request tells it
     /// the tokens after its first, as a greedy one does (the passes make at
-    /// most those); the same request banning the end of generation, which
-    /// steps, tells it none.
+    /// most those), and so does the same request banning the end of
+    /// generation, which draws in those passes too.
     #[test]
     fn a_sampled_request_tells_a_drafting_engine_its_passes() {
         let replies = Arc::new(Mutex::new(Vec::new()));
@@ -4205,6 +4245,6 @@ mod sampled_tests {
             )
             .expect("a generation");
         }
-        assert_eq!(*replies.lock().expect("the replies"), [Some(7), Some(0)]);
+        assert_eq!(*replies.lock().expect("the replies"), [Some(7), Some(7)]);
     }
 }

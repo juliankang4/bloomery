@@ -313,10 +313,10 @@ card bytes and the positions a slot gets either way, and the context line that f
 id-banning requests as one pass, as a plain server does, but also walks each slot's draft over its row, one slot
 after another. `BLOOMERY_DRAFT=mtp` drafts on any slot count. The
 drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
-(the default, temperature 0.8 as in llama-server) while one request runs: each kept id is the request's own
-sampler's draw from its verified row, as llama.cpp's speculative decoding takes it. A sampled request beside
-another running one, a request that bans an id (`ignore_eos`), and a sampled request under DSpark decode one token
-a step.
+(the default, temperature 0.8 as in llama-server) and on ones that ban an id (`ignore_eos`) while one request runs:
+each kept id is the request's own draw from its verified row (its sampler's, or the argmax, with every banned id's
+logit at -inf), as llama.cpp's speculative decoding takes it. A sampled or id-banning request beside another running
+one, and one under DSpark, decode one token a step.
 
 **Adaptive residency.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and swap routed experts
 between the card and the host between steps; a prompt call streams its hottest host experts onto the card, so

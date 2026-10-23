@@ -182,10 +182,11 @@
 //! with the shared window `app::mtp::MtpDraft`, as `generate_glm5next` does:
 //! windows of two rows, the target's next token and the draft's one
 //! proposal, the draft's walks eager, `pass_rows` 2; the greedy ids are the
-//! plain run's of the same load. A sampling or id-banning request takes
-//! plain steps (the server's loop asks a pass only of a greedy request with
-//! no banned id), each step's row the target's, read before the step is told
-//! to the draft. A `load draft=mtp` record follows the `load` line, and
+//! plain run's of the same load. A sampling or id-banning request drafts
+//! while its slot runs alone in the round, each kept id its draw from its
+//! verified row (`Seat::pass_sampled`), and takes plain steps beside another
+//! busy slot, each step's row the target's, read before the step is told to
+//! the draft. A `load draft=mtp` record follows the `load` line, and
 //! `/props`' `engine.draft` names the draft (the target file, whose NextN
 //! layer it is) with the plan's bytes for it as the card's `draft` class.
 //! `BLOOMERY_DRAFT=off` is the plain path, one step a pass, with a `load

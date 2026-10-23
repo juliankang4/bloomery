@@ -3419,11 +3419,12 @@ fn served_ids(addr: std::net::SocketAddr, body: &Value) -> (Vec<u64>, Value) {
     (ids, v)
 }
 
-/// A drafting engine serves what needs the logits row — sampling, and a banned
-/// end-of-generation id — through plain steps, llama-server's default
-/// temperature included: each request's ids are the plain engine's, and it
-/// drafts nothing (no draft counts in its `timings`, `/metrics`' draft sums
-/// unmoved); a greedy request after them still drafts. The sampled requests
+/// A drafting engine that drafts no sampled request serves what needs the
+/// logits row — sampling, and a banned end-of-generation id — through plain
+/// steps, llama-server's default temperature included: each request's ids
+/// are the plain engine's, and it drafts nothing (no draft counts in its
+/// `timings`, `/metrics`' draft sums unmoved); a greedy request after them
+/// still drafts. The sampled requests
 /// branch: some seed's ids are not the greedy ones. Mutant: the refusal of a
 /// sampled or id-banning request under a draft restored (a 400).
 #[test]

@@ -482,9 +482,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               through a four-row window; `generate_glm5next` and the GLM seat of `bloomery-serve` on a \
               glm5next file: `mtp` serves the target file's NextN layer as the MTP draft through a \
               two-row window, and `lookup` and `dspark` are refused by name; the greedy ids are the \
-              plain run's. A server serves a \
-              request that samples or bans an id through plain steps, each step's logits row the \
-              target's, and drafts only its greedy requests. `off` is the plain path on a \
+              plain run's. A server drafts a request that samples or bans an id while its slot \
+              runs alone on a seat that drafts sampled requests (the Qwen3.8 and GLM seats), \
+              each kept id its draw from its verified row, and serves it through plain steps \
+              otherwise, each step's logits row the target's. `off` is the plain path on a \
               qwen4exp file, the same-binary arm of the unset draft. Unset in \
               `generate_qwen3moe` on a qwen4exp file follows the placement \
               (`bloomery_levers::draft38_unset`): under `--place a` the MTP draft runs when a \
