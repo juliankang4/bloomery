@@ -1248,28 +1248,55 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style, columns: usize) -> Option<St
     out.push(String::new());
     out.push(format!("{margin}{}", heading("try", inner, style).painted));
     let yellow = style.fg(YELLOW);
-    let mut lines = Vec::new();
     if seat.ends_with("-decide") {
         let mut t = Text::default();
         t.push("POST ", dim);
         t.push(&format!("{url}/v1/systemone"), &yellow);
-        lines.push(t);
+        out.push(format!("{margin}{}", t.painted));
     } else {
         let mut t = Text::default();
         t.push("$ ", dim);
         t.push("curl ", "");
-        t.push(&format!("{url}/v1/chat/completions"), &yellow);
-        t.push(" \\", dim);
-        lines.push(t);
+        let request = format!("{url}/v1/chat/completions");
+        let quoted = request.contains('[');
+        if width(&t.shown) + width(&request) + usize::from(quoted) * 2 + 2 > inner {
+            t.push("\\", dim);
+            out.push(format!("{margin}{}", t.painted));
+            let parts = wrap(&request, inner.saturating_sub(3).max(2), marks.dot);
+            for (i, part) in parts.iter().enumerate() {
+                let mut t = Text::default();
+                let prefix = if i == 0 { margin } else { "" };
+                if i == 0 {
+                    t.push("\"", &yellow);
+                }
+                t.push(part, &yellow);
+                if i + 1 == parts.len() {
+                    t.push("\"", &yellow);
+                    t.push(" \\", dim);
+                } else {
+                    t.push("\\", dim);
+                }
+                out.push(format!("{prefix}{}", t.painted));
+            }
+        } else {
+            if quoted {
+                t.push("\"", &yellow);
+            }
+            t.push(&request, &yellow);
+            if quoted {
+                t.push("\"", &yellow);
+            }
+            t.push(" \\", dim);
+            out.push(format!("{margin}{}", t.painted));
+        }
         let mut t = Text::default();
         t.push("    -H 'Content-Type: application/json' \\", dim);
-        lines.push(t);
+        out.push(format!("{margin}{}", t.painted));
         let mut t = Text::default();
         t.push("    -d ", dim);
         t.push(r#"'{"messages":[{"role":"user","content":"Hello!"}]}'"#, "");
-        lines.push(t);
+        out.push(format!("{margin}{}", t.painted));
     }
-    out.extend(lines.iter().map(|t| format!("{margin}{}", t.painted)));
 
     out.push(String::new());
     let key = format!("{}{}", style.bg(KEY), style.fg(CREAM));
@@ -1991,6 +2018,48 @@ mod tests {
             },
         )
         .unwrap();
+        #[cfg(unix)]
+        for addr in [
+            "127.0.0.1:8080",
+            "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535",
+            "[fe80:ffff:ffff:ffff:ffff:ffff:ffff:ffff%4294967295]:65535",
+            facts.addr.as_str(),
+        ] {
+            let start = [format!("bloomery-serve: listening on http://{addr}")];
+            for columns in [80, 97, 98, 99, 120] {
+                for style in [ASCII, TRUE] {
+                    let got = strip_escapes(&render(&start, style, columns).unwrap());
+                    let command = got
+                        .lines()
+                        .skip_while(|l| !l.contains("$ curl "))
+                        .take_while(|l| !l.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .replacen("$ curl ", "curl ", 1);
+                    assert!(!command.is_empty(), "{got}");
+                    for line in command.lines() {
+                        assert!(width(line) <= columns, "{columns}: {line:?}");
+                    }
+                    let output = std::process::Command::new("sh")
+                        .args([
+                            "-c",
+                            &format!("curl() {{ printf '%s\\n' \"$@\"; }}\n{command}"),
+                        ])
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "{:?}", output.stderr);
+                    let stdout = String::from_utf8(output.stdout).unwrap();
+                    let args: Vec<_> = stdout.lines().collect();
+                    assert_eq!(args.len(), 5, "{command}\n{stdout}");
+                    assert_eq!(args[0], format!("http://{addr}/v1/chat/completions"));
+                    assert_eq!(&args[1..4], ["-H", "Content-Type: application/json", "-d"]);
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(args[4]).unwrap(),
+                        serde_json::json!({"messages": [{"role": "user", "content": "Hello!"}]})
+                    );
+                }
+            }
+        }
         for columns in [2, 9, 12, 20, 40, 80, 97] {
             for style in [UTF8, CUBE, TRUE] {
                 let got = strip_escapes(&render(&start, style, columns).unwrap());
