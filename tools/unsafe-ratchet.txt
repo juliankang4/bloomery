@@ -439,7 +439,12 @@ gguf 7 2 0
 # PIN(2026-10-23): gpu 2166 -> 2186 blocks, 260 -> 267 fns: HC's isolated MMA
 # entry, fused up/mix and checked row permutation share tile computation and
 # exact replay. Marked stores preserve healthy cells; each access has its SAFETY invariant.
-gpu 2186 267 10
+# PIN(2026-10-23): gpu 2186 -> 2231 blocks, 267 -> 268 fns, new code, not old code relaxed:
+# nvfp4mma.rs adds bounded activation quads, shared staging, register conversions, MMA and output stores,
+# and its module load. Each block has its SAFETY invariant; act_quad states its input bounds.
+# PIN(2026-10-23): range-preserving GEMM epilogues and normalized Q8 packing retain
+# 2195 blocks, 252 unsafe fns and 10 impls; the shared scale owner adds no unsafe operation.
+gpu 2231 268 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
