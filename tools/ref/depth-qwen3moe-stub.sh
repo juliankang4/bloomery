@@ -628,7 +628,8 @@ stub_run() {
   rm -f "$tmp/tmp/stub-gen-loads" "$tmp/tmp"/stub-once-* "$tmp/tmp"/stub-cold-* "$tmp/tmp"/stub-srv-*
   rm -f "$tmp/tmp/stub-xid" "$tmp/tmp/stub-systemd-run" "$tmp/tmp/stub-gen-levers"
   echo 0 > "$tmp/tmp/stub-majflt"
-  (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
+  # Both build stubs are the same fixture, so the comparison is declared A/A.
+  (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 BLOOMERY_AB_AA=1 \
     STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 STUB_MAJFLT="$tmp/tmp/stub-majflt" \
     BLOOMERY_CPU_BUSY_COMMS=none "${e[@]}" bash tools/ref/depth-qwen3moe.sh "$@") > "$log" 2>&1
   RC=$?
