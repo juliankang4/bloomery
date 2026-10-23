@@ -264,10 +264,14 @@ impl<'a> Line<'a> {
         self.text(key)?.split_whitespace().next()
     }
 
-    /// `key`'s first word as a whole number; a word that is none is noted as
-    /// unread.
+    /// `key`'s first word as a whole number; a value that is empty or none is
+    /// noted as unread.
     fn num(self, key: &str) -> Option<u64> {
-        let n = self.word(key)?.parse().ok();
+        let n = self
+            .text(key)?
+            .split_whitespace()
+            .next()
+            .and_then(|w| w.parse().ok());
         if n.is_none() {
             self.unread.note(self.text);
         }
@@ -1477,6 +1481,22 @@ mod tests {
                 "paged=lots",
                 row("nvme"),
                 "nvtier",
+            ),
+            (
+                START,
+                "cache ",
+                "ram=8589934592",
+                "ram=",
+                row("cache"),
+                "cache",
+            ),
+            (
+                START,
+                "parallel ",
+                "slots=2 ",
+                "slots= ",
+                "slots".to_owned(),
+                "parallel",
             ),
         ] {
             let start = mutated(start, head, from, to);
