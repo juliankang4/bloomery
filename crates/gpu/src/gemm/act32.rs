@@ -164,11 +164,11 @@ impl GemmAct32 {
         bytes
     }
 
-    /// The launch shape both quantizers take for `n_cols` columns: the grid
+    /// The launch shape the quantizers take for `n_cols` columns: the grid
     /// (one 32-thread block per column and group of four 32-value blocks),
     /// then `n_cols`, the blocks, the groups and the steps per column, each
     /// as the kernel's u32.
-    fn quant_launch(
+    pub(super) fn quant_launch(
         &self,
         what: &'static str,
         n_cols: usize,

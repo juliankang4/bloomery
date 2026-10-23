@@ -13,8 +13,8 @@ use super::f32tile::{ByteRows, F32Rows, STAGE_FLOATS, STAGES, bf16_mma_body, f32
 use super::gemm32::{
     B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, GEMM32_GROUP, GEMM32_RASTER_BYTES,
     GEMM32_THREADS_U32, IQ4_NL_BLOCK_BYTES, NV_CODE_W, NV_STAGE_W, NV_STAGES, Q5_1_BLOCK_WORDS,
-    Q8_0_BLOCK_BYTES, W32_ROW, W32_STAGE_W, iq4_nl_file_block, mma_m16n8k16_s32_s8_zero, nv_half,
-    nv_scale, q8_0_file_block, raster32,
+    Q8_0_BLOCK_BYTES, SW_NT, SW_PITCH, W32_ROW, W32_STAGE_W, iq4_nl_file_block,
+    mma_m16n8k16_s32_s8_zero, nv_half, nv_scale, q8_0_file_block, raster32,
 };
 use super::grouped::{GEMM_BM, GEMM_NT, GEMM_THREADS, VOTE_WORDS};
 use super::remap::remap_id;
@@ -759,6 +759,97 @@ mod gemm32_kernels {
             epi: nvfp4p,
             params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
                 n_slots, max_tiles, slot_div, row_tiles, y),
+        );
+    }
+
+    /// [`gemm_nvfp4p`] as the up GEMM of a SwiGLU pair, its products never
+    /// stored: each tile's up values `u` and the gate GEMM's rows `gate` (the
+    /// same slot-major `n_slots · rows` f32) go through `silu(gate) · u`
+    /// into the down GEMM's activations `oq`, `od`, `os` (a `GemmAct32` of K
+    /// = `rows`, `oblocks` blocks and `osteps` steps a column, column = slot),
+    /// each slot's column the bytes and faults [`swiglu_quant32_sel`] gives
+    /// it from the stored `u` with `sel` and `n_card`: a slab's 128 rows are
+    /// one quantizer group, staged in WT a round of [`SW_NT`] n-tiles at a
+    /// time once the walk is done. Every slot's place is checked before the
+    /// table's walk: a place in `[n_card, HOST)` raises `ExpertId` even if the
+    /// route omits it. A refused slot on a card place gets the quantizer's
+    /// refused blocks (its `u` is NaN); a host slot is not touched.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            qs.len() >= n_experts * rows * 4 * blocks,
+            2 * e.len() >= n_experts * rows * blocks,
+            scales.len() >= n_experts,
+            2 * steps >= blocks,
+            q.len() >= act_cols * 16 * steps,
+            d.len() >= act_cols * 2 * steps,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            gate.len() >= n_slots * rows,
+            sel.len() >= n_slots,
+            oblocks >= 1,
+            rows == 32 * oblocks,
+            2 * osteps >= oblocks,
+            oq.len() >= n_slots * 16 * osteps,
+            od.len() >= n_slots * 2 * osteps,
+            os.len() >= n_slots * 2 * osteps
+        )
+    )]
+    pub fn gemm_nvfp4p_swiglu(
+        qs: &[u32],
+        e: &[u32],
+        scales: &[f32],
+        q: &[u32],
+        d: &[f32],
+        s: &[i32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        blocks: u32,
+        steps: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        gate: &[f32],
+        sel: &[u32],
+        n_card: u32,
+        oblocks: u32,
+        osteps: u32,
+        mut oq: DisjointSlice<u32>,
+        mut od: DisjointSlice<f32>,
+        mut os: DisjointSlice<i32>,
+        fault: FaultSink,
+    ) {
+        if thread::blockIdx_x() == 0 {
+            let mut slot = thread::threadIdx_x() as usize;
+            while slot < n_slots as usize {
+                // SAFETY: slot < n_slots <= sel.len() by the launch contract.
+                let place = unsafe { *sel.get_unchecked(slot) };
+                if place != crate::hybrid::HOST && place >= n_card {
+                    fault.raise(FaultSite::ExpertId);
+                }
+                slot += GEMM_THREADS;
+            }
+        }
+        gemm32_block!(
+            wt: nvfp4p(qs, e, scales),
+            mins: false,
+            epi: nvfp4p,
+            params: (q, d, s, cols, tiles, n_tiles, n_experts, rows, blocks, steps, act_cols,
+                n_slots, max_tiles, slot_div, row_tiles,
+                [swiglu(gate, sel, n_card, oblocks, osteps, oq, od, os, fault)]),
         );
     }
 

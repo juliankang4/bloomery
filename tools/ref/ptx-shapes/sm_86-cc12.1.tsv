@@ -148,7 +148,12 @@ generate_ds41   gemm_iq3xxs                             16           0
 generate_ds41   gemm_iq4nl               0  0
 generate_ds41   gemm_iq4xs               0  0
 # PIN(2026-10-23): ptxas at sm_86 and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1, on the F32 GEMM epilogue whose exact walk runs only for a tile that leaves the F32 range.
-generate_ds41   gemm_nvfp4p                             24          32
+# PIN(2026-10-24): staged NVFP4 weights: 48 spill bytes at sm_86 (ptxas 13.3.73),
+# 32 local bytes in the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.
+generate_ds41   gemm_nvfp4p                             48          32
+# PIN(2026-10-24): fused SwiGLU: 0 spill bytes at sm_86 (ptxas 13.3.73),
+# 64 local bytes in the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.
+generate_ds41   gemm_nvfp4p_swiglu                       0          64
 generate_ds41   gemm_q3k                                 0           0
 generate_ds41   gemm_q4k                                 0           0
 generate_ds41   gemm_q5_1                                0           0

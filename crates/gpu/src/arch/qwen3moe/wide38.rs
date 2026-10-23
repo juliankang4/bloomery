@@ -811,10 +811,12 @@ enum GateUp<'a> {
 /// `stream` waiting `wait` first (the batch's landed event; `None` for a
 /// batch nothing lands in): the places into `sel`, the route table over the
 /// map, the gate and up GEMMs, the SwiGLU over `sel` (every place below
-/// `n_places` a column it writes) and the down GEMM into the run's `down_y`
-/// rows. Six launches; only the batch's slots are touched, so a pass's
-/// batches write the rows the whole pass always wrote, the same kernels on
-/// the same values — the bits do not move.
+/// `n_places` a column it writes; the 32-value GEMM's NVFP4 up folds it into
+/// its own launch, `Gemm32Kernels::enqueue_up_swiglu32`) and the down GEMM
+/// into the run's `down_y` rows. Six launches, five with the fold; only the
+/// batch's slots are touched, so a pass's batches write the rows the whole
+/// pass always wrote, the same values in the same order — the bits do not
+/// move.
 #[allow(
     clippy::too_many_arguments,
     reason = "the batch's context, wait, ids, map, weights, width, places bound, sink, run rows and buffers (rust-quality R8)"
@@ -857,7 +859,7 @@ fn enqueue_gemm_batch(
         .enqueue_route_remap(stream, ids, map, n * geo::N_USED, route, sink)?;
     let input = GemmInput::Shared { top_k: geo::N_USED };
     match gate_up {
-        GateUp::Grouped(ty, [gate, up], act) => {
+        GateUp::Grouped(ty, [gate, up], x) => {
             for (w, y) in [(gate, &mut *g), (up, &mut *u)] {
                 c.k.gemm.enqueue_gemm(
                     stream,
@@ -865,32 +867,54 @@ fn enqueue_gemm_batch(
                         ty,
                         w,
                         rows_per_expert: geo::FF,
-                        act,
+                        act: x,
                         route,
                         input,
                         y,
                     },
                 )?;
             }
+            c.k.g32.enqueue_swiglu_quant32_sel(
+                stream,
+                g,
+                u,
+                sel,
+                n_places,
+                n * geo::N_USED,
+                act,
+                sink,
+            )?;
         }
-        GateUp::Blocks32([gate, up], act) => {
-            for (w, y) in [(gate, &mut *g), (up, &mut *u)] {
-                c.k.g32.enqueue_gemm32(
-                    stream,
-                    Gemm32Args {
-                        w,
-                        rows_per_expert: geo::FF,
-                        act,
-                        route,
-                        input,
-                        y,
-                    },
-                )?;
-            }
+        GateUp::Blocks32([gate, up], x) => {
+            c.k.g32.enqueue_gemm32(
+                stream,
+                Gemm32Args {
+                    w: gate,
+                    rows_per_expert: geo::FF,
+                    act: x,
+                    route,
+                    input,
+                    y: g,
+                },
+            )?;
+            c.k.g32.enqueue_up_swiglu32(
+                stream,
+                Gemm32Args {
+                    w: up,
+                    rows_per_expert: geo::FF,
+                    act: x,
+                    route,
+                    input,
+                    y: u,
+                },
+                g,
+                sel,
+                n_places,
+                act,
+                sink,
+            )?;
         }
     }
-    c.k.g32
-        .enqueue_swiglu_quant32_sel(stream, g, u, sel, n_places, n * geo::N_USED, act, sink)?;
     c.k.g32.enqueue_gemm32(
         stream,
         Gemm32Args {

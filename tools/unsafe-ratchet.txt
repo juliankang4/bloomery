@@ -496,7 +496,19 @@ gguf 7 2 0
 # with the inject's below them (`HcDownRows`: stage, fetch and land, five blocks), its kernel entry's shared stage and
 # body call, and the HC glue's indexed reads and stores of the dots in place of two `Elem` views (two blocks more).
 # Each block has its SAFETY line.
-gpu 2282 285 10
+# PIN(2026-10-24): gpu 2273 -> 2293 blocks, new code, not old code relaxed: gemm_nvfp4p's NVFP4 weight stages
+# (gemm32.rs, nv_copy, nv_frags and the nvfp4p walk) in place of the register relay's arms: the stage pointer, the
+# code vector's and the scale word's cp.async, the staged word read at the fragment, and the walk's copy groups.
+# Each block has its SAFETY line.
+# PIN(2026-10-24): gpu 2273 -> 2293 blocks, a new kernel entry, not old code relaxed: gemm_nvfp4p_swiglu's store
+# (gemm32.rs, the SwiGLU arm of gemm32_block: the gate row's and the slot's reads, the staged round's write and
+# read, the place read and quant32_group) and its refused-slot arm (the place read and the three plane writes), and
+# the refused rows' NaN store split from its slot read. Each block has its SAFETY line.
+# PIN(2026-10-24): gpu 2273 -> 2293 blocks, new validation: gemm_nvfp4p_swiglu reads every slot's place before
+# the table walk, with its SAFETY line. This scan owns ExpertId validation in place of the store and refused-slot arms.
+# PIN(2026-10-24): gpu 2273 -> 2293 blocks: the fused SwiGLU refused-slot arm calls quant32_group
+# instead of writing its three planes directly; the place read and quantizer call each state their SAFETY invariant.
+gpu 2302 285 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
