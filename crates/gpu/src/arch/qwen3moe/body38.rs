@@ -3184,7 +3184,8 @@ impl Body38 {
     /// it and the point there carries its hidden row (the store counted at
     /// `at`, [`Mtp38::adopt`], and [`Body38::rejoin_draft`]), else the
     /// draft's store forgotten. Refused by name, as [`Body38::draft_fits`]
-    /// refuses, before any copy. Blocking.
+    /// refuses, before any copy. The arenas are zeroed on the card and only
+    /// `d`'s rows copied in; those copies block.
     fn put_draft_rows(
         &mut self,
         stream: &CudaStream,
@@ -3209,10 +3210,11 @@ impl Body38 {
             ..
         } = &mut *self;
         for (walk, (_, v)) in [(TargetRows::Step, &d.step), (TargetRows::Pass, &d.pass)] {
-            let len = final_streams(plans, [s, a, wa], walk).len();
-            let mut host = vec![0.0f32; len];
-            host[..v.len()].copy_from_slice(v);
-            final_streams_mut(plans, [s, a, wa], walk).copy_from_host(stream, &host)?;
+            let arena = final_streams_mut(plans, [s, a, wa], walk);
+            arena.zero_async(stream)?;
+            if !v.is_empty() {
+                WindowMut::<f32>::of_mut(arena, 0, v.len())?.copy_from_host(stream, v)?;
+            }
         }
         let draft = mtp.as_mut().ok_or(GpuError::state(
             WHAT_P,

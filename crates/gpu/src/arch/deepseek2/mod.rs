@@ -520,9 +520,8 @@ impl ChainBody for Body {
                 m.h_exp.zero_async(gpu.stream())?;
             }
         }
-        let zero_row = vec![0u16; self.cache_cols("GpuModel::reset")?];
         for cache in self.kv.iter_mut() {
-            seed_cache(gpu, cache, &zero_row, "reset")?;
+            cache.buf_mut().zero_async(gpu.stream())?;
         }
         Ok(())
     }

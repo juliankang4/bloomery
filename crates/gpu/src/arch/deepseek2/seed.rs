@@ -1,7 +1,7 @@
 //! Synthetic KV cache contents: the deterministic row pattern and the
 //! whole-cache write the depth and gate seeds go through.
 
-use crate::tensor::DeviceTensor;
+use crate::tensor::{DeviceTensor, WindowMut};
 use crate::{Gpu, GpuError};
 
 /// `rows` cache rows of `width` f16 values for [`GpuModel::seed_depth`](crate::GpuModel::seed_depth),
@@ -29,8 +29,8 @@ pub(super) fn seed_pattern(rows: usize, width: usize) -> Vec<u16> {
     out
 }
 
-/// Write `rows` (whole cache rows) at the head of `cache`, zeroing the rest.
-/// Synchronizes; never inside a capture.
+/// Write `rows` (whole cache rows) at the head of `cache`, zeroing the rest
+/// on the card. Synchronizes; never inside a capture.
 pub(super) fn seed_cache(
     gpu: &Gpu,
     cache: &mut DeviceTensor<u16>,
@@ -48,8 +48,8 @@ pub(super) fn seed_cache(
             ),
         ));
     }
-    let mut full = vec![0u16; full_len];
-    full[..rows.len()].copy_from_slice(rows);
-    cache.buf_mut().copy_from_host(gpu.stream(), &full)?;
+    let buf = cache.buf_mut();
+    buf.zero_async(gpu.stream())?;
+    WindowMut::<u16>::of_mut(buf, 0, rows.len())?.copy_from_host(gpu.stream(), rows)?;
     Ok(())
 }
