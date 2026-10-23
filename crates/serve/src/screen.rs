@@ -23,6 +23,8 @@
 //! it serves (the placement, the context and slots, the prompt cache).
 //! Below the art's width it uses a text wordmark and stacks the panels;
 //! the width is read when it draws, after any resize during the load.
+//! Widths below four columns are refused because a quoted shell chunk
+//! needs a character, two quotes and a continuation.
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
@@ -194,8 +196,9 @@ pub(crate) fn draw() {
         );
         return;
     }
-    if size.ws_col < 2 {
-        eprintln!("start screen: terminal width must be at least 2 columns");
+    // PIN(2026-10-23): quoted shell chunks need a character, two quotes and a continuation.
+    if size.ws_col < 4 {
+        eprintln!("start screen: terminal width must be at least 4 columns");
         return;
     }
     if let Some(screen) = render(&lines, style, usize::from(size.ws_col)) {
@@ -1077,10 +1080,12 @@ const SERVED: [&str; 6] = ["place", "arch", "model", "head", "context", "cache"]
 
 /// Hard wraps painted lines without counting their SGR escapes as columns.
 /// Record rows use word wrapping first; this also bounds art, links and commands.
-fn wrap_painted(line: &str, columns: usize) -> String {
+/// Shell continuations close and reopen single quotes to preserve each argument.
+fn wrap_painted(line: &str, columns: usize, shell: bool) -> String {
     let mut out = String::new();
     let mut used = 0;
     let mut escape = false;
+    let mut quoted = false;
     for c in line.chars() {
         if c == '\x1b' {
             escape = true;
@@ -1092,13 +1097,26 @@ fn wrap_painted(line: &str, columns: usize) -> String {
             }
             continue;
         }
+        let after = quoted ^ (shell && c == '\'');
+        let reserve = if shell { 1 + usize::from(after) } else { 0 };
         let n = char_width(c);
-        if used + n > columns {
+        if used + n + reserve > columns {
+            if shell && quoted {
+                out.push('\'');
+            }
+            if shell {
+                out.push('\\');
+            }
             out.push('\n');
             used = 0;
+            if shell && quoted {
+                out.push('\'');
+                used = 1;
+            }
         }
         out.push(c);
         used += n;
+        quoted = after;
     }
     out
 }
@@ -1248,6 +1266,7 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style, columns: usize) -> Option<St
     out.push(String::new());
     out.push(format!("{margin}{}", heading("try", inner, style).painted));
     let yellow = style.fg(YELLOW);
+    let command_start = out.len();
     if seat.ends_with("-decide") {
         let mut t = Text::default();
         t.push("POST ", dim);
@@ -1259,36 +1278,15 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style, columns: usize) -> Option<St
         t.push("curl ", "");
         let request = format!("{url}/v1/chat/completions");
         let quoted = request.contains('[');
-        if width(&t.shown) + width(&request) + usize::from(quoted) * 2 + 2 > inner {
-            t.push("\\", dim);
-            out.push(format!("{margin}{}", t.painted));
-            let parts = wrap(&request, inner.saturating_sub(3).max(2), marks.dot);
-            for (i, part) in parts.iter().enumerate() {
-                let mut t = Text::default();
-                let prefix = if i == 0 { margin } else { "" };
-                if i == 0 {
-                    t.push("\"", &yellow);
-                }
-                t.push(part, &yellow);
-                if i + 1 == parts.len() {
-                    t.push("\"", &yellow);
-                    t.push(" \\", dim);
-                } else {
-                    t.push("\\", dim);
-                }
-                out.push(format!("{prefix}{}", t.painted));
-            }
-        } else {
-            if quoted {
-                t.push("\"", &yellow);
-            }
-            t.push(&request, &yellow);
-            if quoted {
-                t.push("\"", &yellow);
-            }
-            t.push(" \\", dim);
-            out.push(format!("{margin}{}", t.painted));
+        if quoted {
+            t.push("\"", &yellow);
         }
+        t.push(&request, &yellow);
+        if quoted {
+            t.push("\"", &yellow);
+        }
+        t.push(" \\", dim);
+        out.push(format!("{margin}{}", t.painted));
         let mut t = Text::default();
         t.push("    -H 'Content-Type: application/json' \\", dim);
         out.push(format!("{margin}{}", t.painted));
@@ -1297,6 +1295,7 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style, columns: usize) -> Option<St
         t.push(r#"'{"messages":[{"role":"user","content":"Hello!"}]}'"#, "");
         out.push(format!("{margin}{}", t.painted));
     }
+    let command_end = out.len();
 
     out.push(String::new());
     let key = format!("{}{}", style.bg(KEY), style.fg(CREAM));
@@ -1317,7 +1316,14 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style, columns: usize) -> Option<St
     out.push(String::new());
     Some(
         out.iter()
-            .map(|line| wrap_painted(line, columns))
+            .enumerate()
+            .map(|(i, line)| {
+                wrap_painted(
+                    line,
+                    columns,
+                    !seat.ends_with("-decide") && (command_start..command_end).contains(&i),
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n"),
     )
@@ -2026,16 +2032,16 @@ mod tests {
             facts.addr.as_str(),
         ] {
             let start = [format!("bloomery-serve: listening on http://{addr}")];
-            for columns in [80, 97, 98, 99, 120] {
+            for columns in [4, 9, 12, 20, 40, 80, 97, 98, 99, 120] {
                 for style in [ASCII, TRUE] {
                     let got = strip_escapes(&render(&start, style, columns).unwrap());
                     let command = got
                         .lines()
-                        .skip_while(|l| !l.contains("$ curl "))
+                        .skip_while(|l| !l.contains("$ "))
                         .take_while(|l| !l.trim().is_empty())
                         .collect::<Vec<_>>()
                         .join("\n")
-                        .replacen("$ curl ", "curl ", 1);
+                        .replacen("$ ", "", 1);
                     assert!(!command.is_empty(), "{got}");
                     for line in command.lines() {
                         assert!(width(line) <= columns, "{columns}: {line:?}");
@@ -2043,13 +2049,13 @@ mod tests {
                     let output = std::process::Command::new("sh")
                         .args([
                             "-c",
-                            &format!("curl() {{ printf '%s\\n' \"$@\"; }}\n{command}"),
+                            &format!("curl() {{ printf '%s\\0' \"$@\"; }}\n{command}"),
                         ])
                         .output()
                         .unwrap();
                     assert!(output.status.success(), "{:?}", output.stderr);
                     let stdout = String::from_utf8(output.stdout).unwrap();
-                    let args: Vec<_> = stdout.lines().collect();
+                    let args: Vec<_> = stdout.strip_suffix('\0').unwrap().split('\0').collect();
                     assert_eq!(args.len(), 5, "{command}\n{stdout}");
                     assert_eq!(args[0], format!("http://{addr}/v1/chat/completions"));
                     assert_eq!(&args[1..4], ["-H", "Content-Type: application/json", "-d"]);
@@ -2060,7 +2066,7 @@ mod tests {
                 }
             }
         }
-        for columns in [2, 9, 12, 20, 40, 80, 97] {
+        for columns in [4, 9, 12, 20, 40, 80, 97] {
             for style in [UTF8, CUBE, TRUE] {
                 let got = strip_escapes(&render(&start, style, columns).unwrap());
                 for line in got.lines() {
@@ -2140,6 +2146,11 @@ mod tests {
             (80, 98),
             (0, 0),
             (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (98, 4),
+            (4, 98),
         ] {
             for fixture in ["v41", "qwen38", "unicode"] {
                 for (term, color) in [("xterm", ""), ("xterm", "1"), ("dumb", "")] {
@@ -2201,15 +2212,17 @@ mod tests {
                     assert!(child.wait().unwrap().success());
                     let got = String::from_utf8(bytes).unwrap().replace("\r\n", "\n");
                     let plain = strip_escapes(&got);
-                    if resized < 2 {
+                    if resized < 4 {
                         assert!(
-                            plain.contains("terminal width must be at least 2 columns"),
+                            plain.contains("terminal width must be at least 4 columns"),
                             "{plain}"
                         );
                         assert!(!plain.contains("READY"), "{plain}");
                         continue;
                     }
-                    assert_eq!(plain.matches(" READY ").count(), 1, "{plain}");
+                    let joined = plain.replace("'\\\n'", "").replace("\\\n", "");
+                    let compact: String = joined.chars().filter(|c| !c.is_whitespace()).collect();
+                    assert_eq!(compact.matches("READY").count(), 1, "{plain}");
                     for line in plain.lines() {
                         assert!(
                             width(line) <= usize::from(resized),
@@ -2227,9 +2240,9 @@ mod tests {
                         "BLOOMERY_SCREEN=off",
                         "Hello!",
                     ] {
-                        assert!(plain.contains(fact), "missing {fact}:\n{plain}");
+                        assert!(compact.contains(fact), "missing {fact}:\n{plain}");
                     }
-                    if resized < 98 {
+                    if (80..98).contains(&resized) {
                         assert!(
                             plain.lines().any(|l| l.starts_with("  placement")),
                             "{plain}"
