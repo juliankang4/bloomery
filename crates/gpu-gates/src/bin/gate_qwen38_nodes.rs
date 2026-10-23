@@ -1825,7 +1825,7 @@ mod gate {
         }
 
         use super::{
-            Command, Duration, Instant, NAME, PlaceError, PlacementError, Proc, census_specs,
+            Command, Duration, Instant, NAME, PlaceError, PlacementError, Proc, census_plan,
             plan_refusal, remove_open_copy, remove_run,
         };
         use bloomery_gpu::GpuError;
@@ -1895,14 +1895,25 @@ mod gate {
         }
 
         #[test]
-        fn census_clause_requires_the_remote_census() {
+        fn census_clause_requires_the_remote_census() -> Result<(), GateError> {
+            let levers = bloomery_levers::at_main(&[
+                super::CARD_BUDGET,
+                super::HOST_POPULATE,
+                super::HOST_LOCK,
+                super::CARD_DONTNEED,
+            ])?;
+            let c = super::Common::new(&levers)?;
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an address");
             let addr = listener.local_addr().expect("the address");
             drop(listener);
+            let Err(err) = census_plan(&c, &mut None, addr) else {
+                panic!("the plan requires the remote census");
+            };
             assert!(
-                census_specs(addr).is_err(),
-                "no local census replaces the remote"
+                err.to_string().contains(&format!("the node at {addr}:")),
+                "no local census replaces the remote: {err}"
             );
+            Ok(())
         }
 
         #[test]
