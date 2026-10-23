@@ -81,7 +81,7 @@ mod connections {
     }
 
     /// `MAX_CONNECTIONS` connections inside a request hold every place: the next one
-    /// gets a 503 with `Retry-After` and no thread, and once one closes a new one is
+    /// gets a 503 with `Retry-After` on the refusal thread, and once one closes a new one is
     /// served. The decide server takes the same rule from the same owner: its 503 is the
     /// generative server's byte for byte.
     #[test]

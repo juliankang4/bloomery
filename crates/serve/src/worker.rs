@@ -128,9 +128,9 @@ pub(crate) enum Msg {
     Text(String, Timings),
     /// The last message.
     Done(Result<Outcome, GenError>),
-    /// The request was not started: the state of the request on the engine
-    /// could not be parked. Sent before any other message; the request may
-    /// succeed later as it is.
+    /// The request took its slot but did not start: the state of the request
+    /// on the engine could not be parked. Its one message after
+    /// [`Msg::Started`]; the request may succeed later as it is.
     Refused(String),
 }
 
@@ -627,10 +627,14 @@ impl Worker {
 
     /// A request that took `slot`: its prompt (`held`, with its images'
     /// feeds), run now, or planned as calls of the engine's quantum that
-    /// [`Worker::prompts`] runs one a round ([`Worker::interleaves`]).
-    /// Returns whether it runs on (an error ended it otherwise).
+    /// [`Worker::prompts`] runs one a round ([`Worker::interleaves`]). A
+    /// request whose client left is cancelled before anything runs, here or,
+    /// when the slots take turns, in [`Worker::begin`] before the engine
+    /// moves. Returns whether it runs on (an error ended it otherwise).
     fn start(&mut self, slot: usize, held: &Held, sub: Submit) -> Result<bool, Dead> {
-        if sub.client.check().is_err() || sub.events.send(Msg::Started(slot)).is_err() {
+        if self.turns.is_none()
+            && (sub.client.check().is_err() || sub.events.send(Msg::Started(slot)).is_err())
+        {
             relock(&self.sh.stats).n_cancelled_before_prompt_total += 1;
             relock(&self.sh.board).release(slot);
             return Ok(false);
@@ -1132,12 +1136,14 @@ impl Worker {
             .map(|a| a.slot)
     }
 
-    /// The first pending request's prompt: the engine moves to its slot (a
-    /// live request's state that cannot be parked refuses it by name), its
-    /// prompt runs, and its turn begins.
+    /// The first pending request's prompt: unless its client left, the engine
+    /// moves to its slot (a live request's state that cannot be parked refuses
+    /// it by name), its prompt runs, and its turn begins. Nothing after the
+    /// move cancels it: the move may hand the slot's parked state back, which
+    /// only its prompt takes ([`Slot::reuse`]).
     fn begin(&mut self) -> Result<(), Dead> {
         let p = self.t_mut().pending.remove(0);
-        if p.sub.client.check().is_err() {
+        if p.sub.client.check().is_err() || p.sub.events.send(Msg::Started(p.slot)).is_err() {
             relock(&self.sh.stats).n_cancelled_before_prompt_total += 1;
             relock(&self.sh.board).release(p.slot);
             self.show_turns();

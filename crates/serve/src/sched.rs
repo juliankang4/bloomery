@@ -242,6 +242,18 @@ impl<R, A> Board<R, A> {
         Ok(())
     }
 
+    /// Removes a matching waiting request and passes its ticket.
+    pub(crate) fn cancel(&mut self, matches: impl Fn(&R) -> bool) -> bool {
+        let Some(at) = self.waiting.iter().position(|w| matches(&w.payload)) else {
+            return false;
+        };
+        self.waiting
+            .remove(at)
+            .expect("the matched waiter is still queued");
+        self.tickets.pass(self.tickets.serving());
+        true
+    }
+
     /// Reserves the slots of an action: free, and no request waiting. `slot`
     /// in `Reserve::One` is below the slot count; the caller checked it.
     pub(crate) fn reserve(&mut self, what: Reserve, action: A) -> Result<(), Refusal> {
@@ -763,6 +775,13 @@ mod tests {
         b.release(0);
         assert_eq!(b.admit(nothing, None).len(), 1);
         b.enqueue(Held::from(vec![3]), 3).expect("the place freed");
+        assert!(!b.cancel(|r| *r == 4));
+        assert!(b.cancel(|r| *r == 3));
+        assert_eq!(b.waiting(), 0);
+        b.release(0);
+        b.release(1);
+        b.reserve(Reserve::All, "reset")
+            .expect("cancellation passed the waiting request's ticket");
         let mut none = board(1, 0);
         none.enqueue(Held::from(vec![0]), 0).expect("the free slot");
         none.admit(nothing, None);
