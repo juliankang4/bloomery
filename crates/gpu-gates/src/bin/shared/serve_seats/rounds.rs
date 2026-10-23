@@ -311,7 +311,7 @@ where
                 .draft()
                 .batch_profile()
         });
-        batch.choose(mode, profiles, widths, allowed)?;
+        batch.choose(mode, profiles, widths, allowed, <B as SlotRows>::MAX_ROWS)?;
     }
     let started = std::time::Instant::now();
     let mut taken: Vec<_> = on.iter().map(|&i| specs[rows[i].slot].take()).collect();
@@ -343,8 +343,7 @@ where
         rows[i].out = out;
     }
     let (done, ran) = run?;
-    let verified_rows: usize = done.iter().map(|c| c.rows).sum();
-    for (&i, c) in on.iter().zip(done) {
+    for (&i, c) in on.iter().zip(&done) {
         if let Some(spec) = specs[rows[i].slot].as_mut() {
             spec.draft_mut().round_ran(c.rows, c.kept);
         }
@@ -355,7 +354,10 @@ where
     }
     passes += ran;
     if on.len() > 1 && mode == runtime::width::Mode::Cost {
-        batch.observe(verified_rows, started.elapsed().as_secs_f64() * 1000.0)?;
+        batch.observe(
+            done.iter().map(|c| c.rows),
+            started.elapsed().as_secs_f64() * 1000.0,
+        )?;
     }
     Ok(passes)
 }

@@ -59,6 +59,67 @@ pub use width::{Choosing, Chosen, Rule, Tally, WidthError};
 
 use std::time::{Duration, Instant};
 
+/// A window that cannot fit a round's pass bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoundError {
+    slot: usize,
+    rows: usize,
+    max_rows: usize,
+}
+
+impl std::fmt::Display for RoundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "slot {}'s {} rows in a round of passes of at most {} rows",
+            self.slot, self.rows, self.max_rows
+        )
+    }
+}
+
+impl std::error::Error for RoundError {}
+
+/// Cut `(slot, rows)` entries into passes of at most `max_rows`, without
+/// splitting a window, and put the pass holding slot 0 last. Reuses `cuts`;
+/// an empty or oversized window is refused before any passes are written.
+pub fn round_passes(
+    rows: impl Iterator<Item = (usize, usize)> + Clone,
+    max_rows: usize,
+    cuts: &mut Vec<std::ops::Range<usize>>,
+) -> Result<(), RoundError> {
+    for (slot, n) in rows.clone() {
+        if n == 0 || n > max_rows {
+            return Err(RoundError {
+                slot,
+                rows: n,
+                max_rows,
+            });
+        }
+    }
+    cuts.clear();
+    let (mut packed, mut zero) = (0, None);
+    for (i, (slot, n)) in rows.enumerate() {
+        match cuts.last_mut() {
+            Some(cut) if packed <= max_rows - n => {
+                cut.end = i + 1;
+                packed += n;
+            }
+            _ => {
+                cuts.push(i..i + 1);
+                packed = n;
+            }
+        }
+        if slot == 0 {
+            zero = Some(cuts.len() - 1);
+        }
+    }
+    if let Some(z) = zero {
+        let holds_zero = cuts.remove(z);
+        cuts.push(holds_zero);
+    }
+    Ok(())
+}
+
 /// What a call of the target reads back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Want {
@@ -283,3 +344,28 @@ where
 
 #[cfg(test)]
 pub(crate) mod mock;
+
+#[cfg(test)]
+mod tests {
+    use super::round_passes;
+
+    #[test]
+    fn round_packing_keeps_windows_and_the_slot_zero_pass_last() {
+        let mut cuts = Vec::new();
+        for (rows, want) in [
+            (vec![3, 3, 3, 3, 4], vec![2..4, 4..5, 0..2]),
+            (vec![4, 4, 3, 3, 2], vec![2..5, 0..2]),
+            (vec![4, 4], std::iter::once(0..2).collect()),
+        ] {
+            round_passes(rows.iter().copied().enumerate(), 8, &mut cuts).unwrap();
+            assert_eq!(cuts, want);
+        }
+        round_passes([(1, usize::MAX), (2, 1)].into_iter(), usize::MAX, &mut cuts).unwrap();
+        assert_eq!(cuts, [0..1, 1..2]);
+        for (n, max) in [(0, 8), (9, 8), (1, 0)] {
+            let err = round_passes([(3, n)].into_iter(), max, &mut cuts).unwrap_err();
+            assert!(err.to_string().contains(&format!("slot 3's {n} rows")));
+            assert_eq!(cuts, [0..1, 1..2], "a refusal preserves the previous plan");
+        }
+    }
+}

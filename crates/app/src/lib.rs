@@ -758,35 +758,12 @@ where
 /// draft's next walk only when no pass runs after its own. Refused by name:
 /// an entry of no row or of more than `max`.
 pub(crate) fn round_passes(
-    rows: impl Iterator<Item = (usize, usize)>,
+    rows: impl Iterator<Item = (usize, usize)> + Clone,
     max: usize,
 ) -> Result<Vec<std::ops::Range<usize>>, SessionError> {
-    let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
-    let (mut packed, mut zero) = (0, None);
-    for (i, (slot, n)) in rows.enumerate() {
-        if n == 0 || n > max {
-            return Err(SessionError::Refused(format!(
-                "slot {slot}'s {n} rows in a round of passes of at most {max} rows"
-            )));
-        }
-        match cuts.last_mut() {
-            Some(cut) if packed + n <= max => {
-                cut.end = i + 1;
-                packed += n;
-            }
-            _ => {
-                cuts.push(i..i + 1);
-                packed = n;
-            }
-        }
-        if slot == 0 {
-            zero = Some(cuts.len() - 1);
-        }
-    }
-    if let Some(z) = zero {
-        let holds_zero = cuts.remove(z);
-        cuts.push(holds_zero);
-    }
+    let mut cuts = Vec::new();
+    runtime::round_passes(rows, max, &mut cuts)
+        .map_err(|e| SessionError::Refused(e.to_string()))?;
     Ok(cuts)
 }
 
