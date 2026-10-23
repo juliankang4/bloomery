@@ -32,6 +32,45 @@ pub fn butterfly<T: Copy + std::ops::Add<Output = T>>(mut v: [T; 32]) -> T {
     v[0]
 }
 
+/// One GEMM epilogue step on the host, bit for bit `bloomery_gpu::gemm`'s
+/// `scaled_sum`: `fma(scale, fma(a[1], b[1], a[0]·b[0]), acc)` in F32 while
+/// every intermediate stays in the F32 normal range, and otherwise the inner
+/// sum (F32 when it stayed in range, else exact) times `scale` plus `acc` as
+/// one F64 fused multiply-add (the kernel's `inner * scale + acc` contracts
+/// to `fma.rn.f64`), so an intermediate overflow or underflow cannot erase a
+/// finite result. A GEMM contract walks its blocks with it (`grouped.rs` module
+/// doc, "Range").
+#[must_use]
+pub fn scaled_sum(a: [f64; 2], b: [f32; 2], scale: f32, acc: f64) -> f64 {
+    let first = a[0] as f32 * b[0];
+    let inner = (a[1] as f32).mul_add(b[1], first);
+    let result = scale.mul_add(inner, acc as f32);
+    let inner_in_range = f64::from(a[0] as f32) == a[0]
+        && f64::from(a[1] as f32) == a[1]
+        && (first.abs() >= f32::MIN_POSITIVE || a[0] == 0.0 || b[0] == 0.0)
+        && first.is_finite()
+        && (inner.abs() >= f32::MIN_POSITIVE || inner == 0.0)
+        && inner.is_finite();
+    if inner_in_range
+        && f64::from(acc as f32) == acc
+        && (result.abs() >= f32::MIN_POSITIVE || (inner == 0.0 && acc == 0.0) || scale == 0.0)
+        && result.is_finite()
+    {
+        f64::from(result)
+    } else {
+        let inner = if inner_in_range
+            && result.is_finite()
+            && (result.abs() >= f32::MIN_POSITIVE
+                || f64::from(inner) * f64::from(scale) + acc == 0.0)
+        {
+            f64::from(inner)
+        } else {
+            a[0] * f64::from(b[0]) + a[1] * f64::from(b[1])
+        };
+        inner.mul_add(f64::from(scale), acc)
+    }
+}
+
 /// One head's norm and NeoX turn, in the device rule's sum order.
 #[cfg(feature = "gpu")]
 #[must_use]

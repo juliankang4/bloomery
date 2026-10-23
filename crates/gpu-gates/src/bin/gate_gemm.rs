@@ -203,7 +203,11 @@
 //!   columns: the decode ggml's, every checked output inside its band
 //!   `γ(2K/32 + 4) · Σ_b |scale·d_a·(d0·i0 + d1·i1)|` of the f64 reference
 //!   and bit for bit the contract (`gemm32::dot32_nv`); a rerun
-//!   bit-identical, a captured table and GEMM replayed.
+//!   bit-identical; at K 64 outputs whose F32 walk overflows before the
+//!   tensor scale (activation codes 127, scale 2^-120) stored as the finite
+//!   value the contract gives: 8128, and 2^-33 where two steps cancel and
+//!   only the fused F64 multiply-add keeps the residual; a captured table
+//!   and GEMM replayed.
 //! - `g32_nvfp4_routed`: the same planes under routed tables — a 16-expert
 //!   stack of 272 rows at K 4096 each slot its own column, an 8-expert stack
 //!   at K 8192 whose two slots a token share the token's column, each expert
@@ -275,7 +279,7 @@ mod gate {
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::act_rule::q8_1_codes;
-    use bloomery_gpu_gates::rounding::gamma;
+    use bloomery_gpu_gates::rounding::{gamma, scaled_sum};
     use bloomery_gpu_gates::swiglu_host;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, activations, bits_equal, bytes_to_words, checks_failed, data_dir,
@@ -645,8 +649,9 @@ mod gate {
     /// the module's numeric contract transcribed — per block the exact i32
     /// `isum` and `imin`, then `acc = fma(d8, fma(−dmin, f32(imin),
     /// d·f32(isum)), acc)` (`acc = fma(d8, d·f32(isum), acc)` for a type
-    /// without mins) from `acc = 0`, blocks in increasing k. `d` and `dmin`
-    /// are f16 values, exact in f32.
+    /// without mins) from `acc = 0`, blocks in increasing k, each step a
+    /// [`scaled_sum`] into the F32 accumulator. `d` and `dmin` are f16
+    /// values, exact in f32.
     fn dot_ref(dec: &Dec, a: &[i8], d8: &[f32]) -> (f64, f64, f32) {
         let (mut y, mut mag) = (0.0f64, 0.0f64);
         let mut acc = 0.0f32;
@@ -666,14 +671,17 @@ mod gate {
                     imin += dec.mn[j / 32] * s;
                 }
             }
-            let (d, dmin) = (dec.d[sb] as f32, dec.dmin[sb] as f32);
-            let t = d * isum as f32;
-            let t = if dec.mn.is_empty() {
-                t
+            let (nd, m) = if dec.mn.is_empty() {
+                (0.0, 0.0)
             } else {
-                (-dmin).mul_add(imin as f32, t)
+                (-(dec.dmin[sb] as f32), imin as f32)
             };
-            acc = db.mul_add(t, acc);
+            acc = scaled_sum(
+                [f64::from(dec.d[sb] as f32), f64::from(nd)],
+                [isum as f32, m],
+                db,
+                f64::from(acc),
+            ) as f32;
             let dd = f64::from(db) * dec.d[sb] * f64::from(isum);
             let mm = f64::from(db) * dec.dmin[sb] * f64::from(imin);
             y += dd - mm;
@@ -5130,8 +5138,9 @@ mod gate {
         /// [`NV_SHAPES`] × [`NV_MS`]: the decode ggml's, every checked output in its
         /// band `γ(2K/32 + 4) · Σ_b |scale·d_a·(d0·i0 + d1·i1)|` of the f64
         /// reference and bit for bit the contract's transcription
-        /// (`gemm32::dot32_nv`); a rerun bit-identical, a captured table and
-        /// GEMM replayed.
+        /// (`gemm32::dot32_nv`); a rerun bit-identical, outputs whose F32
+        /// walk overflows before the tensor scale stored finite, a captured
+        /// table and GEMM replayed.
         fn nvfp4_dense_case(dev: &Dev<'_>) -> Result<bool, GateError> {
             if !wanted("g32_nvfp4_dense") {
                 return Ok(true);
@@ -5217,6 +5226,88 @@ mod gate {
                     }
                     ok &= pass;
                 }
+            }
+            // Range: K 64, activation codes 127 and tensor scale 2^-120; the
+            // F32 walk overflows and the exact walk stores the value given.
+            // `range`: every code 2 under sub-block scales 0.5 (UE4M3 0x38),
+            // `d_a` 2^120, 8128. `cancel`: codes (12 ×16, 1, 0 ×15) then their
+            // negation under sub-block scales (224, 2^-10) (UE4M3 0x7e, 0x01),
+            // `d_a` (1 + 2^-23)·2^120; the second step's fused F64
+            // multiply-add keeps the first step's rounding error, 2^-33.
+            let (rows, k, m) = (128usize, 64usize, 1usize);
+            let unit: Vec<i8> = [[12; 16].as_slice(), &[1], &[0; 15]].concat();
+            let mut cancel = [0u8; 36];
+            cancel[..4].copy_from_slice(&[0x7e, 0x01, 0x7e, 0x01]);
+            cancel[4..12].fill(0x77);
+            cancel[12] = 0x01;
+            cancel[20..28].fill(0xff);
+            cancel[28] = 0x09;
+            let range_cases = [
+                (
+                    "range",
+                    std::array::from_fn(|i| if i < 4 { 0x38 } else { 0x22 }),
+                    vec![2; 64],
+                    [0.5; 4],
+                    2f32.powi(120),
+                    8128f32,
+                ),
+                (
+                    "cancel",
+                    cancel,
+                    [unit.clone(), unit.iter().map(|c| -c).collect()].concat(),
+                    [224.0, 2f32.powi(-10), 224.0, 2f32.powi(-10)],
+                    f32::from_bits(0x7b80_0001),
+                    2f32.powi(-33),
+                ),
+            ];
+            for (tag, block, codes, wsc, d_a, want) in range_cases {
+                let planes = repack::<Nvfp4>(&block.repeat(rows * k / 64), rows, k)?;
+                let qs = DeviceTensor::upload(stream, &planes.qs, rows, k / 8)?;
+                let e = DeviceTensor::upload(stream, &planes.e, rows, k / 64)?;
+                let scale = 2f32.powi(-120);
+                let scales = DeviceTensor::upload(stream, &[scale], 1, 1)?;
+                let nv = Nvfp4Stack {
+                    qs: &qs,
+                    e: &e,
+                    scales: &scales,
+                };
+                let mut route = GemmRoute::new(stream, m, 1)?;
+                let mut act = GemmAct32::new(stream, m, k)?;
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, m * rows)?;
+                let x = vec![127.0 * d_a; k * m];
+                let xd = DeviceBuffer::from_host(stream, &x)?;
+                dev.g32
+                    .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
+                dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
+                let got = gemm_nv(dev, nv, rows, &act, &route, GemmInput::PerSlot, &mut y, m)?;
+                let (ha, _) = host_act(&x, k, m);
+                let act_ok = ha.codes.iter().all(|&c| c == 127) && ha.d.iter().all(|&d| d == d_a);
+                let Checked {
+                    band_off,
+                    bits_off,
+                    first,
+                    ..
+                } = check_dot(
+                    2 * (k / 32) + 4,
+                    rows,
+                    &|_| Some(0),
+                    &|s| s,
+                    &|_, col| dot32_nv(&codes, &wsc, scale, &ha, col),
+                    &got,
+                    m,
+                )?;
+                let fault = gpu.take_fault()?;
+                let stored = got.iter().all(|v| v.to_bits() == want.to_bits());
+                let pass = act_ok && stored && band_off == 0 && bits_off == 0 && fault.is_none();
+                println!(
+                    "gemm32 case=g32_nvfp4_dense {tag} K={k} m={m} act_codes_127={act_ok} \
+                     want={want:e} stored_eq={stored} band_off={band_off} contract_bits_differ={bits_off} {}",
+                    verdict(pass)
+                );
+                if let Some(f) = first {
+                    println!("gemm32 case=g32_nvfp4_dense {tag} first_failure: {f}");
+                }
+                ok &= pass;
             }
             // Graph: the dense table and the NVFP4 GEMM captured, replayed.
             let (rows, k, m) = (128usize, 4096usize, 64usize);
@@ -7363,6 +7454,30 @@ mod gate {
                 assert!(clean.decode_ok && clean.fail.is_none() && clean.bits_differ == 0);
                 assert_gate_failure(check_ref(&st, &ids, &codes, &d8, &y[..y.len() - 1]));
                 assert_gate_failure(check_ref(&st, &ids, &codes, &d8, &[]));
+            }
+
+            /// A K-quant step whose product leaves the F32 normal range: `d8`
+            /// 2^-149, inner sum `1.5 - 2^-24`, whose F32 rounding 1.5 would
+            /// tie the subnormal product up to 2^-148; the exact inner sum
+            /// gives 2^-149.
+            #[test]
+            fn kquant_contract_keeps_a_subnormal_step_exact() {
+                use super::super::{Dec, dot_ref};
+
+                let mut q = vec![0i8; 128];
+                q[0] = -1;
+                let dec = Dec {
+                    grp: 32,
+                    d: vec![2f64.powi(-24)],
+                    dmin: vec![-1.5],
+                    sc: vec![1; 4],
+                    mn: vec![1; 4],
+                    q,
+                };
+                let mut a = vec![0i8; 128];
+                a[0] = 1;
+                let contract = dot_ref(&dec, &a, &[f32::from_bits(1)]).2;
+                assert_eq!(contract.to_bits(), 1);
             }
         }
     }

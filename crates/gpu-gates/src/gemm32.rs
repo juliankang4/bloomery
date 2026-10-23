@@ -5,6 +5,7 @@
 //! output bit for bit holds it to the same transcription (`gate_gemm`'s
 //! `g32_*` cases, `gate_glm5next_gemm`).
 
+use crate::rounding::scaled_sum;
 use gguf::quant::{KVALUES_MXFP4, QuantError, ue4m3_to_f32_half};
 
 /// A `GemmAct32`'s three planes on the host, in the device layout: codes,
@@ -83,8 +84,8 @@ pub fn host_act(x: &[f32], k: usize, n: usize) -> (HostAct, Planes32) {
 /// column `col` of `a`, three ways: the contract's transcription (per block
 /// the exact i32 dot, then `acc = fma(d_a, d_w·f32(isum), acc)`, the min
 /// term `fma(m_w, f32(s_a), ·)` inside for Q5_1, from 0, blocks in
-/// increasing k), the f64 value and its band's magnitude
-/// `Σ_b (|D_b| + |M_b|)`.
+/// increasing k, each step a [`scaled_sum`] into the F32 accumulator), the
+/// f64 value and its band's magnitude `Σ_b (|D_b| + |M_b|)`.
 #[must_use]
 pub fn dot32(
     wq: &[i8],
@@ -106,9 +107,13 @@ pub fn dot32(
             .sum();
         let dw = wd[b];
         let (da, sa) = (a.d[col * kb + b], a.s[col * kb + b]);
-        let t = dw * isum as f32;
-        let t = if mins { wm[b].mul_add(sa as f32, t) } else { t };
-        acc = da.mul_add(t, acc);
+        let (m, s) = if mins { (wm[b], sa as f32) } else { (0.0, 0.0) };
+        acc = scaled_sum(
+            [f64::from(dw), f64::from(m)],
+            [isum as f32, s],
+            da,
+            f64::from(acc),
+        ) as f32;
         let dd = f64::from(da) * f64::from(dw) * f64::from(isum);
         let mm = if mins {
             f64::from(da) * f64::from(wm[b]) * f64::from(sa)
@@ -126,12 +131,13 @@ pub fn dot32(
 /// unit in turn) and the tensor's `scale` — against column `col` of `a`,
 /// three ways: the contract's transcription (per unit the two exact i32
 /// sub-block dots, `acc = fma(d_a, fma(d1, f32(i1), d0·f32(i0)), acc)` from
-/// 0, units in increasing k, the stored value `scale·acc`), the f64 value
+/// 0, units in increasing k, each step a [`scaled_sum`] into an F64
+/// accumulator, the stored value `scale·acc` one more), the f64 value
 /// `scale · Σ_b d_a·(d0·i0 + d1·i1)` and its band's magnitude.
 #[must_use]
 pub fn dot32_nv(wq: &[i8], wsc: &[f32], scale: f32, a: &HostAct, col: usize) -> (f32, f64, f64) {
     let kb = a.k / 32;
-    let (mut acc, mut y, mut mag) = (0.0f32, 0.0f64, 0.0f64);
+    let (mut acc, mut y, mut mag) = (0.0f64, 0.0f64, 0.0f64);
     for b in 0..kb {
         let (wb, ab) = (
             &wq[32 * b..32 * b + 32],
@@ -146,14 +152,21 @@ pub fn dot32_nv(wq: &[i8], wsc: &[f32], scale: f32, a: &HostAct, col: usize) -> 
                 .sum()
         };
         let (i0, i1) = (dot(&wb[..16], &ab[..16]), dot(&wb[16..], &ab[16..]));
-        let tv = d0 * i0 as f32;
-        let tv = d1.mul_add(i1 as f32, tv);
-        acc = da.mul_add(tv, acc);
+        acc = scaled_sum(
+            [f64::from(d0), f64::from(d1)],
+            [i0 as f32, i1 as f32],
+            da,
+            acc,
+        );
         let t = f64::from(da) * (f64::from(d0) * f64::from(i0) + f64::from(d1) * f64::from(i1));
         y += t;
         mag += t.abs();
     }
-    (scale * acc, f64::from(scale) * y, f64::from(scale) * mag)
+    (
+        scaled_sum([acc, 0.0], [scale, 0.0], 1.0, 0.0) as f32,
+        f64::from(scale) * y,
+        f64::from(scale) * mag,
+    )
 }
 
 /// One output of the native NVFP4 product (`gemm_nvfp4_mma`, W4A4): weight
@@ -267,4 +280,60 @@ pub fn dot32_nv_fp4(
 #[must_use]
 pub fn q5_0p_gemv_roundings(kb: usize) -> usize {
     kb + kb.div_ceil(32) + 6
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NVFP4 outputs whose F32 walk overflows before the expert scale, at
+    /// K 64 with activation codes 127 and tensor scale 2^-120. Codes 2 under
+    /// sub-block scales 0.5 with `d_a` 2^120: the kernel keeps the sum in
+    /// F64 and stores 8128. Codes `(12 ×16, 1, 0 ×15)` and their negation
+    /// under sub-block scales `(224, 2^-10)` with `d_a` `(1 + 2^-23)·2^120`:
+    /// sub-block dots `(24384, 127)` then `(-24384, -127)`, and the second
+    /// step's fused F64 multiply-add keeps the first step's rounding error,
+    /// stored as 2^-33 (a separate product and sum would cancel to 0).
+    #[test]
+    fn nvfp4_contract_keeps_range_through_the_expert_scale() {
+        let unit: Vec<i8> = [[12; 16].as_slice(), &[1], &[0; 15]].concat();
+        let cancel = [unit.clone(), unit.iter().map(|c| -c).collect()].concat();
+        let d_cancel = f32::from_bits(0x7b80_0001);
+        for (codes, wsc, d_a, want, want_y) in [
+            (vec![2; 64], [0.5; 4], 2f32.powi(120), 8128.0, 8128.0),
+            (
+                cancel,
+                [224.0, 2f32.powi(-10), 224.0, 2f32.powi(-10)],
+                d_cancel,
+                2f32.powi(-33),
+                0.0,
+            ),
+        ] {
+            let (a, _) = host_act(&[127.0 * d_a; 64], 64, 1);
+            assert_eq!((a.codes[0], a.d[0]), (127, d_a));
+            let (got, y, _) = dot32_nv(&codes, &wsc, 2f32.powi(-120), &a, 0);
+            assert_eq!(
+                (got.to_bits(), y),
+                (want.to_bits(), want_y),
+                "{got:e} against {want:e}"
+            );
+        }
+    }
+
+    /// A Q5_1 step whose product leaves the F32 normal range: `d_a` 2^-149,
+    /// inner sum `1.5 - 2^-24`, whose F32 rounding 1.5 would tie the
+    /// subnormal product up to 2^-148; the exact inner sum gives 2^-149.
+    #[test]
+    fn plain_contract_keeps_a_subnormal_step_exact() {
+        let mut codes = vec![0i8; 32];
+        codes[0] = 1;
+        let a = HostAct {
+            k: 32,
+            codes: codes.clone(),
+            d: vec![f32::from_bits(1)],
+            s: vec![1],
+        };
+        let (got, _, _) = dot32(&codes, &[-(2f32.powi(-24))], &[1.5], &a, 0, true);
+        assert_eq!(got.to_bits(), 1);
+    }
 }
