@@ -1958,6 +1958,12 @@ mod tests {
 
     fn wide_start() -> Vec<String> {
         let start = mutated(START, "plan ", "card=A6000", "card=삽살개카드");
+        let start = mutated(
+            &start.join("\n"),
+            "plan ",
+            "devices=[stage:A6000:cuda0:50952404992]",
+            "devices=[stage:A6000:cuda0:50952404992,tier0:3090:cuda1:25350373376,tier1:3090:cuda2:25350373376,tier2:3090:cuda3:25350373376]",
+        );
         let mut start = mutated(
             &start.join("\n"),
             "bloomery-serve-ds41:",
