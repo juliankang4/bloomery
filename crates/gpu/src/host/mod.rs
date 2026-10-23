@@ -219,7 +219,8 @@ pub fn refuse_expert_tiers(what: &'static str, machine: &Machine) -> Result<(), 
 /// its routing weight; an architecture's scratch is made for that width at
 /// load and refuses a longer list by name. The protocol around the call — waiting for the go, checking the
 /// handoff, signalling the card, releasing it on a failure — is
-/// [`HostTier`]'s alone.
+/// [`HostTier`]'s alone. `columns` is one for a new routed column, zero
+/// when another leg has already counted it on the attached tier.
 pub trait HostExperts {
     fn experts_into(
         &mut self,
@@ -227,6 +228,7 @@ pub trait HostExperts {
         x: &Tensor2,
         experts: &[(u32, f32)],
         out: &mut [f32],
+        columns: u64,
     ) -> Result<(), GpuError>;
 
     /// The batch form: `lists[j]` for column `j` of `x`, its sum over

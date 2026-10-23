@@ -4195,8 +4195,8 @@ mod gate {
         };
         let mut ours = vec![0.0f32; hp.n_embd];
         let mut theirs = vec![0.0f32; hp.n_embd];
-        host.experts_into(l, &xt, &only(&rt.ids, &rt.weights, ik), &mut ours)?;
-        host.experts_into(l, &xt, &only(ik, &ik_w, &rt.ids), &mut theirs)?;
+        host.experts_into(l, &xt, &only(&rt.ids, &rt.weights, ik), &mut ours, 1)?;
+        host.experts_into(l, &xt, &only(ik, &ik_w, &rt.ids), &mut theirs, 1)?;
         let d: Vec<f32> = ours.iter().zip(&theirs).map(|(a, b)| a - b).collect();
         let p: f64 = hc[4..8].iter().map(|&v| f64::from(v) * f64::from(v)).sum();
         Ok((p * sumsq(&d) / sumsq(&s)).sqrt())

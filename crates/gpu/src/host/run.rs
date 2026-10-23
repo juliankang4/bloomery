@@ -386,6 +386,7 @@ impl HostExperts for HostRun {
         x: &Tensor2,
         experts: &[(u32, f32)],
         out: &mut [f32],
+        columns: u64,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "HostRun::experts_into";
         if self.zero_sum(layer, &[experts], (x.ne0, x.ne1), out, WHAT)? {
@@ -406,24 +407,29 @@ impl HostExperts for HostRun {
                 ..
             } = self;
             let view = view_of(layers, layer, WHAT)?;
-            view.experts_into_resident(
+            view.experts_into_on(
+                model::ops::Lanes::host_tier(),
                 file.source(),
                 x,
                 experts,
                 out,
                 &mut scratch[scratch_of[layer]],
-                &mut union[scratch_of[layer]],
+                Some(&mut union[scratch_of[layer]]),
+                columns,
             )?;
             reads.arena_or_file(tier.as_deref(), layer, experts.iter().map(|&(id, _)| id));
             return Ok(());
         }
         let view = view_of(&self.layers, layer, WHAT)?;
-        view.experts_into(
+        view.experts_into_on(
+            model::ops::Lanes::host_tier(),
             self.file.source(),
             x,
             experts,
             out,
             &mut self.scratch[self.scratch_of[layer]],
+            None,
+            columns,
         )?;
         self.reads.arena_or_file(
             self.tier.as_deref(),
@@ -642,7 +648,7 @@ mod tests {
                 };
                 assert!(e.contains(&named), "{e}");
                 let e = run
-                    .experts_into(gap, &x, &[(0, 1.0)], &mut out)
+                    .experts_into(gap, &x, &[(0, 1.0)], &mut out, 1)
                     .unwrap_err()
                     .to_string();
                 assert!(e.contains(&named), "{e}");
@@ -658,17 +664,17 @@ mod tests {
                 }
                 assert!(out.iter().all(|&v| v == 7.0), "a refused call wrote");
                 let e = run
-                    .experts_into(gap, &x, &[], &mut out[1..])
+                    .experts_into(gap, &x, &[], &mut out[1..], 1)
                     .unwrap_err()
                     .to_string();
                 assert!(e.contains("a sum of 255 values"), "{e}");
-                run.experts_into(gap, &x, &[], &mut out).unwrap();
+                run.experts_into(gap, &x, &[], &mut out, 1).unwrap();
                 assert!(out.iter().all(|&v| v == 0.0), "layer {gap} step");
                 let empty: [&[(u32, f32)]; 1] = [&[]];
                 let wrong = Tensor2::zeros(1, 1);
                 let mut short = [7.0];
                 let e = run
-                    .experts_into(gap, &wrong, &[], &mut short)
+                    .experts_into(gap, &wrong, &[], &mut short, 1)
                     .unwrap_err()
                     .to_string();
                 assert!(e.contains("HostRun::experts_into"), "{e}");
@@ -693,7 +699,7 @@ mod tests {
                 }
                 out.fill(7.0);
             }
-            run.experts_into(4, &x, &[(0, 1.0)], &mut out).unwrap();
+            run.experts_into(4, &x, &[(0, 1.0)], &mut out, 1).unwrap();
         });
     }
 
@@ -758,7 +764,7 @@ mod tests {
             };
             let mut out = vec![7.0f32; WIDTH];
             for l in SET {
-                run.experts_into(l, &x, &[(0, 1.0)], &mut out).unwrap();
+                run.experts_into(l, &x, &[(0, 1.0)], &mut out, 1).unwrap();
             }
             let mut wide = HostScratch::new(WIDTH, WIDTH, 2).unwrap();
             let e = run
@@ -800,7 +806,7 @@ mod tests {
                         data: x2.data[j * WIDTH..(j + 1) * WIDTH].to_vec(),
                     };
                     let mut one = vec![0.0f32; WIDTH];
-                    run.experts_into(l, &col, list, &mut one).unwrap();
+                    run.experts_into(l, &col, list, &mut one, 1).unwrap();
                     assert_eq!(
                         &union[j * WIDTH..(j + 1) * WIDTH],
                         &one[..],

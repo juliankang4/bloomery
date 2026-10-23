@@ -2492,7 +2492,9 @@ pub trait TierSlots: Send + Sync {
     /// ticket's pin (the claim found it so), and an id whose slot lends
     /// nothing is in flight until the wait: a step computes the first early
     /// and the second after its wait. The default fills on the caller, the
-    /// ticket ready. `columns` is the call's column count. With `column_off`,
+    /// ticket ready. `columns` advances the tier's column clock; without
+    /// `column_off`, zero keeps selections at the endpoint another leg counted.
+    /// With `column_off`,
     /// `ids` is the full union plan, including host ids, and `ids[d]` routes
     /// `off[d + 1] - off[d]` columns at positions `positions[off[d]..off[d + 1]]`,
     /// where `column_off` is `(off, positions)`; without, each id routes once.
@@ -2923,33 +2925,7 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut HostScratch,
     ) -> Result<(), ModelError> {
-        self.experts_into_on(Lanes::host_tier(), src, x, experts, out, scratch, None)
-    }
-
-    /// [`HostLayer::experts_into`] on a load that prepared union slabs: a
-    /// tiered layer's one column prefetches its misses and, when that ticket
-    /// is still in flight and the one-column plan fits the slabs, computes
-    /// the hits through [`serve_step_split`] while they fill. A ready ticket
-    /// keeps today's [`serve`] on `scratch`. A layer with no tier, or a call
-    /// that passes no slabs, is [`HostLayer::experts_into`].
-    pub fn experts_into_resident(
-        &self,
-        src: R8Source<'_>,
-        x: &Tensor2,
-        experts: &[(u32, f32)],
-        out: &mut [f32],
-        scratch: &mut HostScratch,
-        union: &mut UnionScratch,
-    ) -> Result<(), ModelError> {
-        self.experts_into_on(
-            Lanes::host_tier(),
-            src,
-            x,
-            experts,
-            out,
-            scratch,
-            Some(union),
-        )
+        self.experts_into_on(Lanes::host_tier(), src, x, experts, out, scratch, None, 1)
     }
 
     /// [`HostLayer::experts_into`] with its two row dispatches laid over the
@@ -2957,8 +2933,9 @@ impl HostLayer {
     /// `union` is the load's slabs. With them, a tiered call's claim is
     /// [`TierSlots::prefetch_pinned`]: a ready ticket, or a plan that does
     /// not fit, waits and then runs today's [`serve`]; a pending ticket whose
-    /// plan fits runs the one-list split. Without them the claim is
-    /// [`TierSlots::ensure_pinned`] and the serve is today's, as before.
+    /// plan fits runs the one-list split. Without slabs the ticket is
+    /// waited before serving. `columns` is one for a new column, zero if
+    /// another tier leg already counted it.
     #[allow(
         clippy::too_many_arguments,
         reason = "the leg's pieces, plus the load's slabs when the call is resident"
@@ -2972,6 +2949,7 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut HostScratch,
         union: Option<&mut UnionScratch>,
+        columns: u64,
     ) -> Result<(), ModelError> {
         self.read_beside(src)?;
         let split = src.split();
@@ -2989,7 +2967,8 @@ impl HostLayer {
         if self.tier.is_some()
             && let Some(union) = union
         {
-            return self.serve_column_resident(lanes, split, x, experts, out, scratch, union);
+            return self
+                .serve_column_resident(lanes, split, x, experts, out, scratch, union, columns);
         }
         // The call's ids stay pinned until the leg's reads end: no claim of
         // a lane's victim takes one of their slots between the fill and the
@@ -3000,7 +2979,8 @@ impl HostLayer {
                 scratch.tier_ids.extend(experts.iter().map(|&(e, _)| e));
                 Some(
                     tier.slots
-                        .ensure_pinned(tier.layer, &scratch.tier_ids, Claim::Step)?,
+                        .prefetch_pinned(tier.layer, &scratch.tier_ids, Claim::Step, columns, None)?
+                        .wait()?,
                 )
             }
             None => None,
@@ -3111,13 +3091,14 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut HostScratch,
         union: &mut UnionScratch,
+        columns: u64,
     ) -> Result<(), ModelError> {
         let lists: [&[(u32, f32)]; 1] = [experts];
         let tier = self.tier.as_ref().expect("a resident column has a tier");
         self.prepare_step_ids(tier, &lists, union)?;
         let ticket =
             tier.slots
-                .prefetch_pinned(tier.layer, &union.tier_ids, Claim::Step, 1, None)?;
+                .prefetch_pinned(tier.layer, &union.tier_ids, Claim::Step, columns, None)?;
         if ticket.is_ready() || !union.plan.fits(union.max_slots) {
             let _pin = ticket.wait()?;
             return self.serve_column(lanes, split, x, experts, out, scratch);
@@ -5408,6 +5389,7 @@ mod tests {
                 &mut got,
                 &mut hs,
                 Some(&mut us),
+                1,
             )
             .unwrap();
         let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();

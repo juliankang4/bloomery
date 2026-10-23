@@ -1151,8 +1151,10 @@ impl StepPort {
                 .f32_mut(hsum_off, h.hidden)
                 .ok_or(GpuError::state(what, "the sum is outside the page"))?;
             match &ticket {
-                Some(t) => t.under_fill(|| experts.experts_into(layer, &self.x, &self.list, out)),
-                None => experts.experts_into(layer, &self.x, &self.list, out),
+                Some(t) => {
+                    t.under_fill(|| experts.experts_into(layer, &self.x, &self.list, out, 0))
+                }
+                None => experts.experts_into(layer, &self.x, &self.list, out, 1),
             }?;
             self.stats.host_calls += 1;
             // Read every offset before writing any, so a refusal leaves the

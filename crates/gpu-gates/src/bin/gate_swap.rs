@@ -2851,6 +2851,7 @@ mod gate {
             _x: &Tensor2,
             _experts: &[(u32, f32)],
             out: &mut [f32],
+            _columns: u64,
         ) -> Result<(), GpuError> {
             out.fill(0.0);
             Ok(())

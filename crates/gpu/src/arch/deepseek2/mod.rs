@@ -138,6 +138,7 @@ impl HostExperts for PlanHost {
         x: &Tensor2,
         experts: &[(u32, f32)],
         out: &mut [f32],
+        _columns: u64,
     ) -> Result<(), GpuError> {
         let what = "Hybrid::serve";
         let gguf = self

@@ -189,7 +189,7 @@ fn hw_a_ccd_dispatch_allocates_no_more_than_a_flat_one() {
     let (mut out1, mut out3) = (vec![0.0f32; embd], vec![0.0f32; 3 * embd]);
     let mut calls = |lanes: Lanes, n: usize| {
         for _ in 0..n {
-            host.experts_into_on(lanes, src, &x, &lists[0], &mut out1, &mut hs, None)
+            host.experts_into_on(lanes, src, &x, &lists[0], &mut out1, &mut hs, None, 1)
                 .unwrap();
             host.experts_step_union_into_on(lanes, src, &x3, &refs, &mut out3, &mut us)
                 .unwrap();
@@ -427,7 +427,7 @@ fn hw_a_tier_pin_adds_no_allocator_call_to_the_step_legs() {
     let mut least = |host: &HostLayer| {
         let mut calls = |n: usize| {
             for _ in 0..n {
-                host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs, None)
+                host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs, None, 1)
                     .unwrap();
                 host.experts_step_union_into_on(Lanes::Flat, src, &x3, &refs, &mut out3, &mut us)
                     .unwrap();
@@ -507,7 +507,7 @@ fn hw_a_step_with_misses_pins_the_allocator_calls_of_its_miss_path() {
     let mut least = |host: &HostLayer| {
         let mut calls = |n: usize| {
             for _ in 0..n {
-                host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs, None)
+                host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs, None, 1)
                     .unwrap();
                 host.experts_step_union_into_on(Lanes::Flat, src, &x3, &refs, &mut out3, &mut us)
                     .unwrap();
@@ -580,10 +580,11 @@ fn hw_a_one_column_miss_allocates_nothing() {
                         &mut out,
                         &mut hs,
                         Some(&mut us),
+                        1,
                     )
                     .unwrap();
                 } else {
-                    host.experts_into_on(Lanes::Flat, src, &x, &list, &mut out, &mut hs, None)
+                    host.experts_into_on(Lanes::Flat, src, &x, &list, &mut out, &mut hs, None, 1)
                         .unwrap();
                 }
             }

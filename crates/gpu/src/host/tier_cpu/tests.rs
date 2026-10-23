@@ -305,6 +305,7 @@ fn node_nvme_host_run(
                             &x,
                             &[(selected[at] + 1, 1.0)],
                             &mut expected[at * WIDTH..(at + 1) * WIDTH],
+                            1,
                         )
                         .unwrap();
                 }

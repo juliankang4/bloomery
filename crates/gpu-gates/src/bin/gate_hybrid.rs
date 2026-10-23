@@ -767,6 +767,7 @@ mod gate {
             x: &Tensor2,
             experts: &[(u32, f32)],
             out: &mut [f32],
+            _columns: u64,
         ) -> Result<(), GpuError> {
             assert!(!self.panics, "the refusal arm's planted host panic");
             if let Some(&(id, _)) = experts.iter().find(|e| e.0 as usize >= R_EXPERTS) {
@@ -793,7 +794,7 @@ mod gate {
             let n = x.ne0();
             for (j, list) in lists.iter().enumerate() {
                 let col = Tensor2::from_vec(n, 1, x.col(j).to_vec());
-                self.experts_into(layer, &col, list, &mut out[j * n..][..n])?;
+                self.experts_into(layer, &col, list, &mut out[j * n..][..n], 1)?;
             }
             Ok(())
         }
@@ -1452,7 +1453,13 @@ mod gate {
                 host.into_iter().filter(|(e, _)| !set.contains(e)).collect();
             kept += list.len();
             let col = Tensor2::from_vec(R_HIDDEN, 1, x[j * R_HIDDEN..][..R_HIDDEN].to_vec());
-            stub.experts_into(R_LAYER, &col, &list, &mut want[j * R_HIDDEN..][..R_HIDDEN])?;
+            stub.experts_into(
+                R_LAYER,
+                &col,
+                &list,
+                &mut want[j * R_HIDDEN..][..R_HIDDEN],
+                1,
+            )?;
         }
         let mut h = refusal_tier(gpu, false)?;
         let mut out = vec![f32::NAN; cols * R_HIDDEN];

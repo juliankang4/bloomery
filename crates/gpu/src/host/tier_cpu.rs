@@ -64,6 +64,7 @@ impl State {
                     }
                 };
             }
+            let mut columns = 1;
             for slot in 0..self.used {
                 let index = col * self.used + slot;
                 // SAFETY: the page holds cols * used selection words at
@@ -84,7 +85,25 @@ impl State {
                     )
                 })?;
                 let out = &mut self.output[index * self.hidden..(index + 1) * self.hidden];
-                self.run.experts_into(layer, &self.x, &[(id, 1.0)], out)?;
+                self.run
+                    .experts_into(layer, &self.x, &[(id, 1.0)], out, columns)?;
+                columns = 0;
+            }
+            if columns != 0
+                && let Some(tier) = self.run.tier()
+            {
+                drop(
+                    model::moe::TierSlots::prefetch_pinned(
+                        tier.as_ref(),
+                        layer,
+                        &[],
+                        model::moe::Claim::Step,
+                        columns,
+                        None,
+                    )
+                    .and_then(|ticket| ticket.wait())
+                    .map_err(model::ModelError::from)?,
+                );
             }
         }
         Ok(())

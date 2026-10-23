@@ -1551,7 +1551,6 @@ struct DropQueue {
     /// Per layer: the runs a request named, until the dropper takes them.
     pending: Vec<Option<DropRuns>>,
     queued: usize,
-    running: bool,
     /// The first drop the kernel refused, named; every later request and
     /// flush returns it.
     failed: Option<String>,
@@ -1601,10 +1600,8 @@ impl DropShared {
             };
             let runs = q.pending[layer].take().expect("the position found it");
             q.queued -= 1;
-            q.running = true;
             // Read entry holds this lock while it updates a queued range.
             let r = self.release(layer, &runs);
-            q.running = false;
             if let Err(e) = r {
                 q.failed.get_or_insert(e);
             }
@@ -2154,7 +2151,6 @@ impl NvTier {
             queue: Mutex::new(DropQueue {
                 pending: vec![None; arenas.len()],
                 queued: 0,
-                running: false,
                 failed: None,
                 stop: false,
             }),
@@ -2596,7 +2592,7 @@ impl NvTier {
     pub fn flush(&self) -> Result<(), GpuError> {
         const WHAT: &str = "NvTier::flush";
         let mut q = self.drops.queue();
-        while q.queued > 0 || q.running {
+        while q.queued > 0 {
             q = self.drops.done.wait(q).unwrap_or_else(|e| e.into_inner());
         }
         match &q.failed {
@@ -4167,6 +4163,41 @@ mod tests {
     }
 
     #[test]
+    fn a_card_claim_and_its_host_tail_count_one_column() {
+        use model::moe::TierSlots;
+        let scratch = Scratch::new("card-host-heat");
+        let tier = eight_tier(&scratch, 3, NvTierEvict::Heat);
+        let ids = [1];
+        let ticket = tier.issue_card_hold(1, &ids).unwrap();
+        let host = TierSlots::prefetch_pinned(tier.as_ref(), 1, &[], Claim::Step, 0, None)
+            .unwrap()
+            .wait()
+            .unwrap();
+        drop(host);
+        drop(ticket.finish().unwrap());
+        assert_eq!(tier.route_count(1, 1), Some(1.0));
+        drop(
+            TierSlots::prefetch_pinned(tier.as_ref(), 1, &[2], Claim::Step, 0, None)
+                .unwrap()
+                .wait()
+                .unwrap(),
+        );
+        assert_eq!(tier.route_count(1, 1), Some(1.0));
+        assert_eq!(tier.route_count(1, 2), Some(1.0));
+        drop(
+            TierSlots::prefetch_pinned(tier.as_ref(), 1, &[], Claim::Step, 1, None)
+                .unwrap()
+                .wait()
+                .unwrap(),
+        );
+        assert_eq!(
+            tier.books.lock().unwrap().counts.as_ref().unwrap()[1].since,
+            2,
+            "the standalone empty column advances the clock once"
+        );
+    }
+
+    #[test]
     fn heat_counts_keep_the_same_rank_across_prompt_splits() {
         heat_without_arena_ids("prompt");
     }
@@ -4179,6 +4210,12 @@ mod tests {
     #[test]
     fn heat_counts_keep_the_same_rank_across_resident_columns() {
         heat_without_arena_ids("resident");
+    }
+
+    #[test]
+    fn heat_counts_keep_the_same_rank_across_card_and_host_legs() {
+        heat_without_arena_ids("card-resident");
+        heat_without_arena_ids("card-mapped");
     }
 
     fn heat_without_arena_ids(mode: &str) {
@@ -4245,7 +4282,9 @@ mod tests {
             arena.slot_bytes = PARTS * window_bytes(per);
             arena.names = names.map(str::to_owned);
             arena.files = std::array::from_fn(|_| Arc::clone(&file));
-            arena.part_of.set([0, 1, 2]).unwrap();
+            if !mode.starts_with("card-") {
+                arena.part_of.set([0, 1, 2]).unwrap();
+            }
             arena.parts = (0..EXPERTS)
                 .map(|id| {
                     std::array::from_fn(|part| {
@@ -4274,12 +4313,33 @@ mod tests {
             .unwrap();
             tier.count_routes();
             let tier = Arc::new(tier);
-            tier.ensure_as(0, &(1..=SLOTS as u32).collect::<Vec<_>>(), Claim::Keep)
-                .unwrap();
             let mut layer = HostLayer::build(source, &spec).unwrap();
             layer.attach_tier(0, 0..1, tier.clone());
             let mut union = UnionScratch::new_routed(WIDTH, WIDTH, routes.len(), 1).unwrap();
             let mut host = HostScratch::new(WIDTH, WIDTH, 1).unwrap();
+            let mut run = if mode.starts_with("card-") {
+                let mut run = super::super::run::HostRun::build(
+                    Arc::clone(&split),
+                    0,
+                    false,
+                    super::super::run::HostWidths {
+                        embd: WIDTH,
+                        ff: WIDTH,
+                        n_used: 1,
+                    },
+                    |src| HostLayer::build(src, &spec).map(|layer| vec![layer]),
+                )
+                .unwrap();
+                run.attach_tier(Some(Arc::clone(&tier))).unwrap();
+                if mode == "card-resident" {
+                    run.prepare_union(1).unwrap();
+                }
+                Some(run)
+            } else {
+                None
+            };
+            tier.ensure_as(0, &(1..=SLOTS as u32).collect::<Vec<_>>(), Claim::Keep)
+                .unwrap();
             let chunks = match mode {
                 "whole" => vec![131],
                 "prompt" | "step" => vec![2, 128, 1],
@@ -4290,6 +4350,15 @@ mod tests {
                 let x = Tensor2::zeros(WIDTH, cols);
                 let mut out = vec![f32::NAN; WIDTH * cols];
                 let lists = &routes[start..start + cols];
+                let card_id = [lists[0].first().map_or(0, |&(id, _)| id)];
+                let ticket = match mode {
+                    "card-resident" | "card-mapped" if card_id[0] != 0 => {
+                        Some(tier.issue_card_hold(0, &card_id).unwrap())
+                    }
+                    _ => None,
+                };
+                let empty: [&[(u32, f32)]; 1] = [&[]];
+                let lists = if ticket.is_some() { &empty } else { lists };
                 match mode {
                     "whole" | "prompt" => {
                         layer.experts_union_into(source, &x, lists, &mut out, &mut union)
@@ -4302,6 +4371,14 @@ mod tests {
                         &mut out,
                         &mut union,
                     ),
+                    "card-resident" | "card-mapped" => {
+                        use super::super::HostExperts;
+                        run.as_mut()
+                            .unwrap()
+                            .experts_into(0, &x, lists[0], &mut out, u64::from(ticket.is_none()))
+                            .unwrap();
+                        Ok(())
+                    }
                     _ => layer.experts_into_on(
                         Lanes::Flat,
                         source,
@@ -4310,9 +4387,13 @@ mod tests {
                         &mut out,
                         &mut host,
                         Some(&mut union),
+                        1,
                     ),
                 }
                 .unwrap();
+                if let Some(ticket) = ticket {
+                    drop(ticket.finish().unwrap());
+                }
                 assert!(
                     out.iter().all(|&v| v == 0.0),
                     "{mode} {middle:?}: the zero weights"
