@@ -121,6 +121,79 @@ pub trait RowValues: Copy {
     ///
     /// `i` is below the weight's value count.
     unsafe fn at(self, i: usize) -> f32;
+
+    /// The [`LANE_UNROLL`] chunk values a lane reads at `at`, values
+    /// `at + 32·j` for j = 0..8, each load issued before any value is made
+    /// from one, so the loads are in flight together.
+    ///
+    /// # Safety
+    ///
+    /// `at + 224` is below the weight's value count.
+    #[inline(always)]
+    unsafe fn chunks8(self, at: usize) -> [f32; LANE_UNROLL] {
+        // SAFETY: at + 32·j <= at + 224, below the value count by this fn's
+        // contract.
+        unsafe {
+            [
+                self.at(at),
+                self.at(at + 32),
+                self.at(at + 64),
+                self.at(at + 96),
+                self.at(at + 128),
+                self.at(at + 160),
+                self.at(at + 192),
+                self.at(at + 224),
+            ]
+        }
+    }
+
+    /// [`RowValues::chunks8`] at [`LANE_UNROLL_W32`] chunks: values
+    /// `at + 32·j` for j = 0..32.
+    ///
+    /// # Safety
+    ///
+    /// `at + 992` is below the weight's value count.
+    #[inline(always)]
+    unsafe fn chunks32(self, at: usize) -> [f32; LANE_UNROLL_W32] {
+        // SAFETY: at + 32·j <= at + 992, below the value count by this fn's
+        // contract.
+        unsafe {
+            [
+                self.at(at),
+                self.at(at + 32),
+                self.at(at + 64),
+                self.at(at + 96),
+                self.at(at + 128),
+                self.at(at + 160),
+                self.at(at + 192),
+                self.at(at + 224),
+                self.at(at + 256),
+                self.at(at + 288),
+                self.at(at + 320),
+                self.at(at + 352),
+                self.at(at + 384),
+                self.at(at + 416),
+                self.at(at + 448),
+                self.at(at + 480),
+                self.at(at + 512),
+                self.at(at + 544),
+                self.at(at + 576),
+                self.at(at + 608),
+                self.at(at + 640),
+                self.at(at + 672),
+                self.at(at + 704),
+                self.at(at + 736),
+                self.at(at + 768),
+                self.at(at + 800),
+                self.at(at + 832),
+                self.at(at + 864),
+                self.at(at + 896),
+                self.at(at + 928),
+                self.at(at + 960),
+                self.at(at + 992),
+            ]
+        }
+    }
 }
 
 impl RowValues for &[f32] {
@@ -174,6 +247,111 @@ impl RowValues for Bf16Words<'_> {
         // below the weight's value count (this fn's contract).
         let w = unsafe { *self.0.get_unchecked(i >> 1) };
         Bf16Words::widen(w, i & 1 == 1)
+    }
+
+    // The chunks' words are loaded first and widened after: a widening
+    // between two loads waits for the first load's word, so it would hold
+    // the next load back and leave one in flight. Value `at + 32·j` is in
+    // word `at / 2 + 16·j`, in the half `at`'s parity names.
+    #[inline(always)]
+    unsafe fn chunks8(self, at: usize) -> [f32; LANE_UNROLL] {
+        let (w, odd) = (self.0, at & 1 == 1);
+        let at = at >> 1;
+        // SAFETY: word at + 16·j holds value 2·at + 32·j <= 2·at + 224,
+        // below the value count by this fn's contract.
+        let r = unsafe {
+            [
+                *w.get_unchecked(at),
+                *w.get_unchecked(at + 16),
+                *w.get_unchecked(at + 32),
+                *w.get_unchecked(at + 48),
+                *w.get_unchecked(at + 64),
+                *w.get_unchecked(at + 80),
+                *w.get_unchecked(at + 96),
+                *w.get_unchecked(at + 112),
+            ]
+        };
+        let v = |j: usize| Bf16Words::widen(r[j], odd);
+        [v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7)]
+    }
+
+    #[inline(always)]
+    unsafe fn chunks32(self, at: usize) -> [f32; LANE_UNROLL_W32] {
+        let (w, odd) = (self.0, at & 1 == 1);
+        let at = at >> 1;
+        // SAFETY: word at + 16·j holds value 2·at + 32·j <= 2·at + 992,
+        // below the value count by this fn's contract.
+        let r = unsafe {
+            [
+                *w.get_unchecked(at),
+                *w.get_unchecked(at + 16),
+                *w.get_unchecked(at + 32),
+                *w.get_unchecked(at + 48),
+                *w.get_unchecked(at + 64),
+                *w.get_unchecked(at + 80),
+                *w.get_unchecked(at + 96),
+                *w.get_unchecked(at + 112),
+                *w.get_unchecked(at + 128),
+                *w.get_unchecked(at + 144),
+                *w.get_unchecked(at + 160),
+                *w.get_unchecked(at + 176),
+                *w.get_unchecked(at + 192),
+                *w.get_unchecked(at + 208),
+                *w.get_unchecked(at + 224),
+                *w.get_unchecked(at + 240),
+                *w.get_unchecked(at + 256),
+                *w.get_unchecked(at + 272),
+                *w.get_unchecked(at + 288),
+                *w.get_unchecked(at + 304),
+                *w.get_unchecked(at + 320),
+                *w.get_unchecked(at + 336),
+                *w.get_unchecked(at + 352),
+                *w.get_unchecked(at + 368),
+                *w.get_unchecked(at + 384),
+                *w.get_unchecked(at + 400),
+                *w.get_unchecked(at + 416),
+                *w.get_unchecked(at + 432),
+                *w.get_unchecked(at + 448),
+                *w.get_unchecked(at + 464),
+                *w.get_unchecked(at + 480),
+                *w.get_unchecked(at + 496),
+            ]
+        };
+        let v = |j: usize| Bf16Words::widen(r[j], odd);
+        [
+            v(0),
+            v(1),
+            v(2),
+            v(3),
+            v(4),
+            v(5),
+            v(6),
+            v(7),
+            v(8),
+            v(9),
+            v(10),
+            v(11),
+            v(12),
+            v(13),
+            v(14),
+            v(15),
+            v(16),
+            v(17),
+            v(18),
+            v(19),
+            v(20),
+            v(21),
+            v(22),
+            v(23),
+            v(24),
+            v(25),
+            v(26),
+            v(27),
+            v(28),
+            v(29),
+            v(30),
+            v(31),
+        ]
     }
 }
 
@@ -268,35 +446,35 @@ pub(crate) unsafe fn f32_lane_partials<W: RowValues>(
         let kk = it * 32 + lane;
         // SAFETY: w_row + kk + 224 < w_row + k, inside w: kk + 224 < k by
         // the loop guard (LANE_UNROLL = 8) and the safety contract.
-        let wv = unsafe { f32_load_chunks(w, w_row + kk) };
+        let wv = unsafe { w.chunks8(w_row + kk) };
         // SAFETY: kk + 224 < k <= x.len(), since m_cols >= 1.
-        let x0 = unsafe { f32_load_chunks(x, kk) };
+        let x0 = unsafe { x.chunks8(kk) };
         // SAFETY: m_cols > 1 here, so k + kk + 224 < 2*k <= x.len().
-        let x1 = unsafe { f32_load_chunks(x, k + kk) };
+        let x1 = unsafe { x.chunks8(k + kk) };
         f0 = f32_fold_values(f0, &wv, &x0);
         f1 = f32_fold_values(f1, &wv, &x1);
         if m_cols > 2 {
             // SAFETY: 2*k + kk + 224 < 3*k <= x.len(), since m_cols > 2.
-            let x2 = unsafe { f32_load_chunks(x, 2 * k + kk) };
+            let x2 = unsafe { x.chunks8(2 * k + kk) };
             // SAFETY: a3 is 3*k when m_cols > 3 and 0 otherwise, so
             // a3 + kk + 224 < m_cols*k <= x.len().
-            let x3 = unsafe { f32_load_chunks(x, a3 + kk) };
+            let x3 = unsafe { x.chunks8(a3 + kk) };
             f2 = f32_fold_values(f2, &wv, &x2);
             f3 = f32_fold_values(f3, &wv, &x3);
         }
         if m_cols > 4 {
             // SAFETY: 4*k + kk + 224 < 5*k <= x.len(), since m_cols > 4.
-            let x4 = unsafe { f32_load_chunks(x, 4 * k + kk) };
+            let x4 = unsafe { x.chunks8(4 * k + kk) };
             // SAFETY: a5 is 5*k when m_cols > 5 and 0 otherwise; as for a3.
-            let x5 = unsafe { f32_load_chunks(x, a5 + kk) };
+            let x5 = unsafe { x.chunks8(a5 + kk) };
             f4 = f32_fold_values(f4, &wv, &x4);
             f5 = f32_fold_values(f5, &wv, &x5);
         }
         if m_cols > 6 {
             // SAFETY: 6*k + kk + 224 < 7*k <= x.len(), since m_cols > 6.
-            let x6 = unsafe { f32_load_chunks(x, 6 * k + kk) };
+            let x6 = unsafe { x.chunks8(6 * k + kk) };
             // SAFETY: a7 is 7*k when m_cols > 7 and 0 otherwise; as for a3.
-            let x7 = unsafe { f32_load_chunks(x, a7 + kk) };
+            let x7 = unsafe { x.chunks8(a7 + kk) };
             f6 = f32_fold_values(f6, &wv, &x6);
             f7 = f32_fold_values(f7, &wv, &x7);
         }
@@ -346,30 +524,6 @@ pub(crate) unsafe fn f32_lane_partials<W: RowValues>(
     [f0, f1, f2, f3, f4, f5, f6, f7]
 }
 
-/// The [`LANE_UNROLL`] chunk values a lane reads at `at`:
-/// `v[at + 32·i]` for i = 0..8.
-///
-/// # Safety
-///
-/// `at + 224` is below `v`'s value count.
-#[inline(always)]
-unsafe fn f32_load_chunks<V: RowValues>(v: V, at: usize) -> [f32; LANE_UNROLL] {
-    // SAFETY: at + 32·i <= at + 224, below v's value count by this fn's
-    // contract.
-    unsafe {
-        [
-            v.at(at),
-            v.at(at + 32),
-            v.at(at + 64),
-            v.at(at + 96),
-            v.at(at + 128),
-            v.at(at + 160),
-            v.at(at + 192),
-            v.at(at + 224),
-        ]
-    }
-}
-
 /// `f` with the [`LANE_UNROLL`] chunks of one column added in order:
 /// `fma(w[i], x[at + 32·i], ·)` for i = 0..8, the column's loads issued
 /// before the first multiply-add.
@@ -380,7 +534,7 @@ unsafe fn f32_load_chunks<V: RowValues>(v: V, at: usize) -> [f32; LANE_UNROLL] {
 #[inline(always)]
 unsafe fn f32_fold_chunks(f: f32, w: &[f32; LANE_UNROLL], x: &[f32], at: usize) -> f32 {
     // SAFETY: at + 224 < x.len() by this fn's contract.
-    let xv = unsafe { f32_load_chunks(x, at) };
+    let xv = unsafe { x.chunks8(at) };
     f32_fold_values(f, w, &xv)
 }
 
@@ -444,7 +598,7 @@ pub unsafe fn f32_lane_partial_1col<W: RowValues>(
         let kk = it * 32 + lane;
         // SAFETY: w_row + kk + 224 < w_row + k, inside w: kk + 224 < k by
         // the loop guard (LANE_UNROLL = 8) and the caller contract.
-        let wv = unsafe { f32_load_chunks(w, w_row + kk) };
+        let wv = unsafe { w.chunks8(w_row + kk) };
         // SAFETY: kk + 224 < k <= x.len() by the loop guard and the caller
         // contract.
         f = unsafe { f32_fold_chunks(f, &wv, x, kk) };
@@ -501,9 +655,9 @@ pub unsafe fn f32_lane_partial_1col_w32<W: RowValues>(
     while it + LANE_UNROLL_W32 <= iters {
         let kk = it * 32 + lane;
         // SAFETY: kk + 992 < k by the loop guard (LANE_UNROLL_W32 = 32), so
-        // every read is inside w[w_row .. w_row + k] and x[0 .. k], both
-        // covered by the caller contract (w.len() >= (row+1)*k, x.len() >= k).
-        let (
+        // every read is inside the row's values w_row .. w_row + k, which
+        // the caller contract covers (w holds (row + 1)·k values).
+        let [
             w0,
             w1,
             w2,
@@ -536,6 +690,10 @@ pub unsafe fn f32_lane_partial_1col_w32<W: RowValues>(
             w29,
             w30,
             w31,
+        ] = unsafe { w.chunks32(w_row + kk) };
+        // SAFETY: kk + 992 < k <= x.len() by the loop guard and the caller
+        // contract.
+        let [
             x0,
             x1,
             x2,
@@ -568,74 +726,7 @@ pub unsafe fn f32_lane_partial_1col_w32<W: RowValues>(
             x29,
             x30,
             x31,
-        ) = unsafe {
-            (
-                w.at(w_row + kk),
-                w.at(w_row + kk + 32),
-                w.at(w_row + kk + 64),
-                w.at(w_row + kk + 96),
-                w.at(w_row + kk + 128),
-                w.at(w_row + kk + 160),
-                w.at(w_row + kk + 192),
-                w.at(w_row + kk + 224),
-                w.at(w_row + kk + 256),
-                w.at(w_row + kk + 288),
-                w.at(w_row + kk + 320),
-                w.at(w_row + kk + 352),
-                w.at(w_row + kk + 384),
-                w.at(w_row + kk + 416),
-                w.at(w_row + kk + 448),
-                w.at(w_row + kk + 480),
-                w.at(w_row + kk + 512),
-                w.at(w_row + kk + 544),
-                w.at(w_row + kk + 576),
-                w.at(w_row + kk + 608),
-                w.at(w_row + kk + 640),
-                w.at(w_row + kk + 672),
-                w.at(w_row + kk + 704),
-                w.at(w_row + kk + 736),
-                w.at(w_row + kk + 768),
-                w.at(w_row + kk + 800),
-                w.at(w_row + kk + 832),
-                w.at(w_row + kk + 864),
-                w.at(w_row + kk + 896),
-                w.at(w_row + kk + 928),
-                w.at(w_row + kk + 960),
-                w.at(w_row + kk + 992),
-                *x.get_unchecked(kk),
-                *x.get_unchecked(kk + 32),
-                *x.get_unchecked(kk + 64),
-                *x.get_unchecked(kk + 96),
-                *x.get_unchecked(kk + 128),
-                *x.get_unchecked(kk + 160),
-                *x.get_unchecked(kk + 192),
-                *x.get_unchecked(kk + 224),
-                *x.get_unchecked(kk + 256),
-                *x.get_unchecked(kk + 288),
-                *x.get_unchecked(kk + 320),
-                *x.get_unchecked(kk + 352),
-                *x.get_unchecked(kk + 384),
-                *x.get_unchecked(kk + 416),
-                *x.get_unchecked(kk + 448),
-                *x.get_unchecked(kk + 480),
-                *x.get_unchecked(kk + 512),
-                *x.get_unchecked(kk + 544),
-                *x.get_unchecked(kk + 576),
-                *x.get_unchecked(kk + 608),
-                *x.get_unchecked(kk + 640),
-                *x.get_unchecked(kk + 672),
-                *x.get_unchecked(kk + 704),
-                *x.get_unchecked(kk + 736),
-                *x.get_unchecked(kk + 768),
-                *x.get_unchecked(kk + 800),
-                *x.get_unchecked(kk + 832),
-                *x.get_unchecked(kk + 864),
-                *x.get_unchecked(kk + 896),
-                *x.get_unchecked(kk + 928),
-                *x.get_unchecked(kk + 960),
-                *x.get_unchecked(kk + 992),
-            )
-        };
+        ] = unsafe { x.chunks32(kk) };
         f = f32::mul_add(w0, x0, f);
         f = f32::mul_add(w1, x1, f);
         f = f32::mul_add(w2, x2, f);
@@ -674,7 +765,7 @@ pub unsafe fn f32_lane_partial_1col_w32<W: RowValues>(
         let kk = it * 32 + lane;
         // SAFETY: w_row + kk + 224 < w_row + k <= w.len(): kk + 224 < k by
         // the loop guard (LANE_UNROLL = 8) and the caller contract.
-        let wv = unsafe { f32_load_chunks(w, w_row + kk) };
+        let wv = unsafe { w.chunks8(w_row + kk) };
         // SAFETY: kk + 224 < k <= x.len() by the loop guard and the caller
         // contract.
         f = unsafe { f32_fold_chunks(f, &wv, x, kk) };
