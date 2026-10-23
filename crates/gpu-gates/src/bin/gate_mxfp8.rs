@@ -119,7 +119,7 @@ mod gate {
     };
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
     use bloomery_gpu::weights::Weights;
-    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
     use bloomery_gpu_gates::rounding::check_mma;
     use bloomery_gpu_gates::{GateError, GateRng, checks_failed, verdict, write_gguf};
     use cuda_core::DeviceBuffer;
@@ -541,9 +541,11 @@ mod gate {
     /// `site::resident_sel_f32` refuses an MXFP8 stack by name.
     fn sel_refusal(gpu: &Gpu, split: &Split) -> Result<bool, GateError> {
         let stream = gpu.stream();
-        let name = shape_name(&SHAPES[2], "mxfp8");
+        let s = &SHAPES[2];
+        let name = shape_name(s, "mxfp8");
         let w = Weights::load_where(stream, split, |n| n == name)?;
-        let x = DeviceBuffer::<f32>::zeroed(stream, SHAPES[2].k)?;
+        site::site(&w, "gate_mxfp8", &name, (s.rows, s.k), SiteTy::Mxfp8)?;
+        let x = DeviceBuffer::<f32>::zeroed(stream, s.k)?;
         let sel = DeviceBuffer::from_host(stream, &[0u32])?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, 64)?;
         let a = SelArgs {
@@ -553,11 +555,10 @@ mod gate {
             rows_per_expert: 64,
             slots_per_col: 1,
         };
-        let got = match site::resident_sel_f32(gpu, &w, &name, &a, gpu.unlabelled_sink(), &mut y) {
-            Ok(()) => "launched".to_string(),
-            Err(e) => e.to_string(),
-        };
-        let pass = got.contains(&name) && got.contains("a q8_0 or fp8_b128 stack");
+        let got = site::resident_sel_f32(gpu, &w, &name, &a, gpu.unlabelled_sink(), &mut y);
+        // PIN(2026-10-23): pin the refusal's kind, site and tensor, independent of supported formats.
+        let pass = matches!(&got, Err(GpuError::Tensor { what: "site::resident_sel_f32", name: n, .. })
+            if n == &name);
         println!("mxfp8 clause=sel.refusal got={got:?} {}", verdict(pass));
         Ok(pass)
     }
