@@ -3586,182 +3586,67 @@ mod gate {
             }
         }
 
-        // The captured chain — pool, score, top-k, segment pass, merge — on
-        // the eight verify rows: five nodes, the eager bits.
-        let cs: Vec<u32> = (SEL_ROWS0..=SEL_N)
-            .map(u32::try_from)
-            .collect::<Result<_, _>>()?;
-        let m = cs.len();
-        let qi = DeviceBuffer::from_host(stream, &idx_queries(m, 631))?;
-        let qa = DeviceBuffer::from_host(
-            stream,
-            &activations(HEAD, m * N_HEAD_Q38, 632)
-                .iter()
-                .map(|v| v * SEED_Q_SCALE)
-                .collect::<Vec<_>>(),
-        )?;
-        let nk = DeviceBuffer::from_host(stream, &cs)?;
         let mut pooled_g = DeviceBuffer::from_host(stream, &pooled.to_host_vec(stream)?)?;
-        let mut pv =
-            DeviceBuffer::<f32>::zeroed(stream, listed_partials_v_len_256(m, N_HEAD_Q38, WIDTH))?;
-        let mut pms =
-            DeviceBuffer::<f32>::zeroed(stream, listed_partials_ms_len(m, N_HEAD_Q38, WIDTH))?;
-        let mut ya = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
-        let mut yg = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
-        let chain = |s: &CudaStream,
-                     pooled: &mut DeviceBuffer<u16>,
-                     scratch: &mut QsaScratch,
-                     pv: &mut DeviceBuffer<f32>,
-                     pms: &mut DeviceBuffer<f32>,
-                     y: &mut DeviceBuffer<f32>|
-         -> Result<(), GpuError> {
-            qk.enqueue_pool(
-                s,
-                PoolArgs {
-                    raw: &idx.raw_d,
-                    gain: &idx.gk_d,
-                    table: &idx.table_d,
-                    n_keys: &nk,
-                    eps: EPS,
-                    ctx: SEL_CTX,
-                    m,
-                    fault: unl,
-                    pooled: &mut *pooled,
-                },
+        let mut pv = DeviceBuffer::<f32>::zeroed(
+            stream,
+            listed_partials_v_len_256(MAX_ROWS, N_HEAD_Q38, WIDTH),
+        )?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(
+            stream,
+            listed_partials_ms_len(MAX_ROWS, N_HEAD_Q38, WIDTH),
+        )?;
+        for (entry, counts, seed) in [
+            (SelFlash::Pass, (SEL_ROWS0..=SEL_N).collect::<Vec<_>>(), 631),
+            (SelFlash::Fold, wide_counts(), 633),
+        ] {
+            let cs: Vec<u32> = counts
+                .into_iter()
+                .map(u32::try_from)
+                .collect::<Result<_, _>>()?;
+            let m = cs.len();
+            let qi = DeviceBuffer::from_host(stream, &idx_queries(m, seed))?;
+            let qa = DeviceBuffer::from_host(
+                stream,
+                &activations(HEAD, m * N_HEAD_Q38, seed + 1)
+                    .iter()
+                    .map(|v| v * SEED_Q_SCALE)
+                    .collect::<Vec<_>>(),
             )?;
-            qk.enqueue_select(
-                s,
-                SelectArgs {
-                    q: &qi,
-                    gain: &idx.gq_d,
-                    table: &idx.table_d,
-                    n_keys: &nk,
-                    pooled: &*pooled,
-                    eps: EPS,
-                    ctx: SEL_CTX,
-                    kept: KEPT,
-                    m,
-                    fault: unl,
-                    scratch: &mut *scratch,
-                },
-            )?;
-            k.enqueue_pass_256_p12_sel(
-                s,
-                GqaSelArgs {
-                    attn: GqaFoldArgs {
-                        q: &qa,
-                        kc: &c.kc,
-                        vc: &c.vc,
-                        list: &scratch.list,
-                        n_sel: &scratch.n_sel,
-                        width: WIDTH,
-                        scale: scale(),
-                        n_kv: N_KV,
+            let nk = DeviceBuffer::from_host(stream, &cs)?;
+            let mut ya = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
+            let mut yg = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
+            let mut chain = |s: &CudaStream, y: &mut DeviceBuffer<f32>| -> Result<(), GpuError> {
+                qk.enqueue_pool(
+                    s,
+                    PoolArgs {
+                        raw: &idx.raw_d,
+                        gain: &idx.gk_d,
+                        table: &idx.table_d,
+                        n_keys: &nk,
+                        eps: EPS,
                         ctx: SEL_CTX,
                         m,
                         fault: unl,
-                        y,
+                        pooled: &mut pooled_g,
                     },
-                    part_v: pv,
-                    part_ms: pms,
-                },
-                N_HEAD_Q38,
-            )
-        };
-        chain(
-            stream,
-            &mut pooled_g,
-            &mut scratch,
-            &mut pv,
-            &mut pms,
-            &mut ya,
-        )?;
-        stream.synchronize()?;
-        let eager = ya.to_host_vec(stream)?;
-        let graph =
-            gpu.capture(|s| chain(s, &mut pooled_g, &mut scratch, &mut pv, &mut pms, &mut yg))?;
-        graph.launch(stream)?;
-        stream.synchronize()?;
-        let same = bits_equal(&yg.to_host_vec(stream)?, &eager);
-        let nodes = graph.node_count();
-        // The segment pass: one block of PACK_12 warps a (row, key head,
-        // segment), not a block a pack of four.
-        let want_grid = [u32::try_from(m * N_KV * listed_segments(WIDTH))?, 1, 1];
-        let seg = graph
-            .nodes()?
-            .into_iter()
-            .filter_map(|n| n.kernel)
-            .find(|kn| kn.name.starts_with("gqa_flash_seg_mma_256_p12_sel"));
-        let seg_ok = seg.as_ref().is_some_and(|kn| {
-            kn.grid == want_grid && kn.block == [u32::try_from(PACK_12 * 32).unwrap_or(0), 1, 1]
-        });
-        let graph_ok = same && nodes == 5 && seg_ok;
-        println!(
-            "qsa chain graph m={m}: eager_vs_graph_bit_identical={same} graph_nodes={nodes} \
-             seg_pass={:?} (want grid {want_grid:?}, block [{}, 1, 1]) {}",
-            seg.as_ref().map(|kn| (kn.grid, kn.block)),
-            PACK_12 * 32,
-            verdict(graph_ok)
-        );
-        ok &= graph_ok;
-
-        // The ubatch walk's chain — pool, score, top-k, fold — on the wide
-        // rows: four nodes, the eager bits, the fold one block of PACK_12
-        // warps a (row, key head).
-        let cs: Vec<u32> = wide_counts()
-            .into_iter()
-            .map(u32::try_from)
-            .collect::<Result<_, _>>()?;
-        let m = cs.len();
-        let qi = DeviceBuffer::from_host(stream, &idx_queries(m, 633))?;
-        let qa = DeviceBuffer::from_host(
-            stream,
-            &activations(HEAD, m * N_HEAD_Q38, 634)
-                .iter()
-                .map(|v| v * SEED_Q_SCALE)
-                .collect::<Vec<_>>(),
-        )?;
-        let nk = DeviceBuffer::from_host(stream, &cs)?;
-        let mut ya = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
-        let mut yg = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
-        let chain = |s: &CudaStream,
-                     pooled: &mut DeviceBuffer<u16>,
-                     scratch: &mut QsaScratch,
-                     y: &mut DeviceBuffer<f32>|
-         -> Result<(), GpuError> {
-            qk.enqueue_pool(
-                s,
-                PoolArgs {
-                    raw: &idx.raw_d,
-                    gain: &idx.gk_d,
-                    table: &idx.table_d,
-                    n_keys: &nk,
-                    eps: EPS,
-                    ctx: SEL_CTX,
-                    m,
-                    fault: unl,
-                    pooled: &mut *pooled,
-                },
-            )?;
-            qk.enqueue_select(
-                s,
-                SelectArgs {
-                    q: &qi,
-                    gain: &idx.gq_d,
-                    table: &idx.table_d,
-                    n_keys: &nk,
-                    pooled: &*pooled,
-                    eps: EPS,
-                    ctx: SEL_CTX,
-                    kept: KEPT,
-                    m,
-                    fault: unl,
-                    scratch: &mut *scratch,
-                },
-            )?;
-            k.enqueue_fold_256_p12_sel(
-                s,
-                GqaFoldArgs {
+                )?;
+                qk.enqueue_select(
+                    s,
+                    SelectArgs {
+                        q: &qi,
+                        gain: &idx.gq_d,
+                        table: &idx.table_d,
+                        n_keys: &nk,
+                        pooled: &pooled_g,
+                        eps: EPS,
+                        ctx: SEL_CTX,
+                        kept: KEPT,
+                        m,
+                        fault: unl,
+                        scratch: &mut scratch,
+                    },
+                )?;
+                let attn = GqaFoldArgs {
                     q: &qa,
                     kc: &c.kc,
                     vc: &c.vc,
@@ -3774,36 +3659,46 @@ mod gate {
                     m,
                     fault: unl,
                     y,
-                },
-                N_HEAD_Q38,
-            )
-        };
-        chain(stream, &mut pooled_g, &mut scratch, &mut ya)?;
-        stream.synchronize()?;
-        let eager = ya.to_host_vec(stream)?;
-        let graph = gpu.capture(|s| chain(s, &mut pooled_g, &mut scratch, &mut yg))?;
-        graph.launch(stream)?;
-        stream.synchronize()?;
-        let same = bits_equal(&yg.to_host_vec(stream)?, &eager);
-        let nodes = graph.node_count();
-        let want_grid = [u32::try_from(m * N_KV)?, 1, 1];
-        let fold = graph
-            .nodes()?
-            .into_iter()
-            .filter_map(|n| n.kernel)
-            .find(|kn| kn.name.starts_with("gqa_flash_fold_mma_256_p12_sel"));
-        let fold_ok = fold.as_ref().is_some_and(|kn| {
-            kn.grid == want_grid && kn.block == [u32::try_from(PACK_12 * 32).unwrap_or(0), 1, 1]
-        });
-        let graph_ok = same && nodes == 4 && fold_ok;
-        println!(
-            "qsa fold chain graph m={m}: eager_vs_graph_bit_identical={same} graph_nodes={nodes} \
-             fold={:?} (want grid {want_grid:?}, block [{}, 1, 1]) {}",
-            fold.as_ref().map(|kn| (kn.grid, kn.block)),
-            PACK_12 * 32,
-            verdict(graph_ok)
-        );
-        ok &= graph_ok;
+                };
+                match entry {
+                    SelFlash::Pass => k.enqueue_pass_256_p12_sel(
+                        s,
+                        GqaSelArgs {
+                            attn,
+                            part_v: &mut pv,
+                            part_ms: &mut pms,
+                        },
+                        N_HEAD_Q38,
+                    ),
+                    SelFlash::Fold => k.enqueue_fold_256_p12_sel(s, attn, N_HEAD_Q38),
+                }
+            };
+            chain(stream, &mut ya)?;
+            stream.synchronize()?;
+            let eager = ya.to_host_vec(stream)?;
+            let graph = gpu.capture(|s| chain(s, &mut yg))?;
+            graph.launch(stream)?;
+            stream.synchronize()?;
+            let same = bits_equal(&yg.to_host_vec(stream)?, &eager);
+            let (kernel, nodes, segments) = match entry {
+                SelFlash::Pass => ("gqa_flash_seg_mma_256_p12_sel", 5, listed_segments(WIDTH)),
+                SelFlash::Fold => ("gqa_flash_fold_mma_256_p12_sel", 4, 1),
+            };
+            let grid = [u32::try_from(m * N_KV * segments)?, 1, 1];
+            let block = [u32::try_from(PACK_12 * 32)?, 1, 1];
+            let shape = graph
+                .nodes()?
+                .into_iter()
+                .filter_map(|n| n.kernel)
+                .find(|n| n.name.starts_with(kernel))
+                .is_some_and(|n| n.grid == grid && n.block == block);
+            let pass = same && graph.node_count() == nodes && shape;
+            println!(
+                "qsa chain {kernel} m={m}: eager={same} shape={shape} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
 
         // 13. Refusals: row 0's list naming the cache's height raises
         // pool_select, row 1's length zero and past the width raise key_count;

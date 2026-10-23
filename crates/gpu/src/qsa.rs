@@ -1294,14 +1294,14 @@ impl QsaScratch {
 
     /// The most rows one selection into this scratch takes.
     #[must_use]
-    pub fn rows(&self) -> usize {
+    pub(crate) fn rows(&self) -> usize {
         self.rows
     }
 
     /// Device bytes a scratch over a cache of `ctx` rows keeping `kept`
     /// pools holds a row: its query heads, scores, list and length, 4 B each.
     #[must_use]
-    pub fn row_bytes(ctx: usize, kept: usize) -> usize {
+    pub(crate) fn row_bytes(ctx: usize, kept: usize) -> usize {
         4 * (HEADS * DIM + pools_for(ctx) + list_width(kept) + 1)
     }
 }
