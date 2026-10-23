@@ -25,10 +25,12 @@
 //!   and no second copy;
 //! - `gemm_nvfp4p`: NVFP4 in the resident planes (`mxfp4.rs`'s `repack`:
 //!   `qs` u32 words, four a 32-value unit, `e` one word a 64-value block)
-//!   with one F32 tensor scale an expert of the stack — each unit's nibbles
-//!   decoded to the E2M1 table's int8 values, its two sub-block scales
-//!   staged as f32, the store applying the tile's expert's scale. No
-//!   Q8_0 twin is derived beside them.
+//!   with one F32 tensor scale an expert of the stack — the step's code
+//!   vectors and scale words copied raw into one of [`NV_STAGES`] weight
+//!   stages two steps ahead ([`nv_copy`]), each warp decoding its own rows'
+//!   nibbles to the E2M1 table's int8 values and their sub-block scales to
+//!   f32 as it reads them ([`nv_frags`]), the store applying the tile's
+//!   expert's scale. No Q8_0 twin is derived beside them.
 //!
 //! Numeric contract, every entry. Per 32-value block `b` of an output
 //! `(slot, row)`: `isum` the exact i32 dot of the weight codes (Q8_0 int8;
@@ -72,7 +74,10 @@
 //! plane's scales and every other layout's bytes are read into registers one
 //! step ahead and written into the stage after the step's compute, decoded
 //! to the staged form — per row sixteen code words then the two blocks' `d`
-//! (and Q5_1's `m`) as f32 ([`W32_ROW`] words). One barrier a step: it
+//! (and Q5_1's `m`) as f32 ([`W32_ROW`] words). NVFP4 is the exception: its
+//! raw weights arrive by `cp.async` two steps ahead into three stages of
+//! their own, and each warp decodes them at its fragment reads, so no weight
+//! load waits in registers through a step's compute. One barrier a step: it
 //! publishes step `h`'s stage and tells that every warp is done with step
 //! `h − 1`'s, which the copies and stores for step `h + 1` then refill. Each
 //! warp loads its `mma` A fragments with `ldmatrix.x4` from the staged rows
@@ -108,6 +113,15 @@ pub(super) const B32_STAGE_W: usize = GEMM_BN * B32_ROW;
 pub(super) const D32_ROW: usize = 4;
 /// u32 words of one scale stage.
 pub(super) const D32_STAGE_W: usize = GEMM_BN * D32_ROW;
+/// u32 words of one NVFP4 weight stage's codes ([`nv_copy`]): a step's two
+/// 16-byte code vectors a slab row.
+pub(super) const NV_CODE_W: usize = GEMM_BM * 8;
+/// u32 words of one NVFP4 weight stage: the codes, then the rows' scale
+/// words of the step, one a row.
+pub(super) const NV_STAGE_W: usize = NV_CODE_W + GEMM_BM;
+/// NVFP4 weight stages: a step's weights are copied two steps ahead.
+pub(super) const NV_STAGES: usize = 3;
+const _: () = assert!(NV_STAGES * NV_STAGE_W <= 2 * W32_STAGE_W);
 /// [`GEMM_THREADS`] as the block width a launch takes.
 pub(super) const GEMM32_THREADS_U32: u32 = GEMM_THREADS as u32;
 /// Tiles one group of the Q8_0 planes' block raster takes ([`raster32`]):
@@ -208,6 +222,21 @@ pub(super) fn iq4_nl_file_block(w: [u32; 5], x: usize) -> (u16, [u32; 8]) {
     let (l2, h2) = iq4_word(win(2));
     let (l3, h3) = iq4_word(win(3));
     ((w[0] as u64 >> o) as u16, [l0, l1, l2, l3, h0, h1, h2, h3])
+}
+
+/// One lane's A word of an NVFP4 sub-block: the low (`hi` false) or high
+/// nibbles of code word `v` through the E2M1 table (`mxfp4`'s card decode).
+#[inline(always)]
+pub(super) fn nv_half(v: u32, hi: bool) -> u32 {
+    let (l, h) = crate::cores::table16_word(v, crate::mxfp4::E2M1);
+    if hi { h } else { l }
+}
+
+/// Sub-block scale byte `b` of an NVFP4 scale word as f32 (unit `b / 2`,
+/// sub-block `b % 2` of the 64-value block).
+#[inline(always)]
+pub(super) fn nv_scale(w: u32, b: u32) -> f32 {
+    crate::mxfp4::ue4m3_half((w >> (8 * b)) & 0xff)
 }
 
 /// `mma.sync.m16n8k16` of s8 × s8 into s32 from a zero accumulator: rows `g`
@@ -447,28 +476,6 @@ macro_rules! w32 {
             ([0u32; 8], 0.0f32)
         }
     }};
-    (@load nvfp4p($qs:ident, $e:ident, $scale:ident), $live:expr, $n:expr, $pv:ident) => {{
-        if $live {
-            // SAFETY: unit `n` is inside the stack: its code vector is words
-            // `4n ..= 4n + 3` and its scale word `n >> 1` — K a multiple of
-            // 64 keeps a row's units at an even stream index, so `n`'s
-            // parity is the unit's half of its 64-value block — both inside
-            // the planes (launch contract).
-            unsafe {
-                (
-                    [
-                        *$qs.get_unchecked(4 * $n),
-                        *$qs.get_unchecked(4 * $n + 1),
-                        *$qs.get_unchecked(4 * $n + 2),
-                        *$qs.get_unchecked(4 * $n + 3),
-                    ],
-                    *$e.get_unchecked($n >> 1),
-                )
-            }
-        } else {
-            ([0u32; 4], 0u32)
-        }
-    }};
     (@store plane($qs:ident, $wd:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr, $pv:ident) => {{
         if $live {
             // SAFETY: word 16 + pj of the pair's staged row, which no warp
@@ -568,40 +575,6 @@ macro_rules! w32 {
                 *p.add(6) = c[6];
                 *p.add(7) = c[7];
                 *$dst.add(16 + $pj) = d.to_bits();
-            }
-        }
-    }};
-    (
-        @store nvfp4p($qs:ident, $e:ident, $scale:ident), $raw:ident, $live:expr, $n:expr,
-        $dst:expr, $pj:expr, $pv:ident
-    ) => {{
-        if $live {
-            let (v, ew) = $raw;
-            // The unit's eight staged code words in value order: its first
-            // sub-block's low words, then its high words, then its second
-            // sub-block's, through the one nibble-table decode (`mxfp4`'s
-            // card path). K a multiple of 64 keeps `n`'s parity the unit's
-            // half, so bytes `2(n & 1)` and `2(n & 1) + 1` of its scale word
-            // are its sub-blocks'.
-            let (l0, h0) = crate::cores::table16_word(v[0], crate::mxfp4::E2M1);
-            let (l1, h1) = crate::cores::table16_word(v[1], crate::mxfp4::E2M1);
-            let (l2, h2) = crate::cores::table16_word(v[2], crate::mxfp4::E2M1);
-            let (l3, h3) = crate::cores::table16_word(v[3], crate::mxfp4::E2M1);
-            let sh = 16 * ($n & 1) as u32;
-            // SAFETY: the pair's eight code words and its two scale words of
-            // its staged row, which no warp reads before the next barrier.
-            unsafe {
-                let p = $dst.add(8 * $pj);
-                *p = l0;
-                *p.add(1) = l1;
-                *p.add(2) = h0;
-                *p.add(3) = h1;
-                *p.add(4) = l2;
-                *p.add(5) = l3;
-                *p.add(6) = h2;
-                *p.add(7) = h3;
-                *$dst.add(16 + $pj) = crate::mxfp4::ue4m3_half((ew >> sh) & 0xff).to_bits();
-                *$dst.add(18 + $pj) = crate::mxfp4::ue4m3_half((ew >> (sh + 8)) & 0xff).to_bits();
             }
         }
     }};
@@ -843,6 +816,86 @@ macro_rules! nt_walk {
     };
 }
 
+/// Copy step `hh`'s NVFP4 weights of the relay pair's row into weight stage
+/// `hh % NV_STAGES` (the `nvfp4p` walk of [`gemm32_block`]): the pair's
+/// 16-byte code vector, unit `pj` of the step, at half `pj` of the row's
+/// eight code words (the halves swapped on rows with bit 2 set, so a warp's
+/// reads in [`nv_frags`] fall in sixteen banks) and, from the row's first
+/// thread, the step's scale word after the stage's codes. A step past the
+/// row's blocks copies nothing.
+macro_rules! nv_copy {
+    (
+        $qs:ident, $e:ident, $wt:ident, $hh:expr, $pr:ident, $pj:ident, $prow_live:ident,
+        $pn0:ident, $kb:ident
+    ) => {{
+        let hh: usize = $hh;
+        if $prow_live && 2 * hh + $pj < $kb {
+            let n = $pn0 + 2 * hh;
+            let half = $pj ^ (($pr >> 2) & 1);
+            // SAFETY: stage `hh % NV_STAGES` is inside WT (NV_STAGES ·
+            // NV_STAGE_W words fit).
+            let wst = unsafe { $wt.add((hh % NV_STAGES) * NV_STAGE_W) };
+            // SAFETY: unit n's code words 4n ..= 4n + 3 are inside the plane
+            // (launch contract), 16-byte aligned (the host checks the plane);
+            // the destination, the slab row's half of the stage's codes, is
+            // this thread's own chunk, read by no warp before the barrier after
+            // the wait that completes it.
+            unsafe { cp_async_cg_16(wst.add($pr * 8 + 4 * half), $qs.as_ptr().add(4 * n)) };
+            if $pj == 0 {
+                // SAFETY: the block's scale word n >> 1 (n is even for pj = 0:
+                // K a multiple of 64) is inside the plane (launch contract);
+                // the destination is the slab row's scale word of the stage,
+                // this thread's own, read by no warp before the barrier after
+                // the wait that completes it.
+                unsafe { cp_async_ca_4(wst.add(NV_CODE_W + $pr), $e.as_ptr().add(n >> 1)) };
+            }
+        }
+    }};
+}
+
+/// One warp's operands of a step from NVFP4 weight stage `wst`: the A
+/// fragments of both units in the staged walk's `ldmatrix.x4` order (rows
+/// `lr`, `lr + 8` of the first sub-block, then of the second), each lane's
+/// word decoded by [`nv_half`] (a sub-block's 16 values are the low nibbles
+/// of its two code words, then their high nibbles, so lane `t` takes word
+/// `t & 1`, low for `t < 2` and high after), and the rows' sub-block scales:
+/// `dw` the first sub-blocks', `mw` the second's, of units 0 and 1.
+macro_rules! nv_frags {
+    ($wst:ident, $lr:ident, $t:ident) => {{
+        // Unit 0's half of the rows' code words ([`nv_copy`]'s swap: bit 2
+        // of the row, the same for `lr` and `lr + 8`) and unit 1's.
+        let h0 = 4 * (($lr >> 2) & 1) + ($t & 1);
+        let h1 = (4 + h0) & 7;
+        let hi = $t >= 2;
+        let (r0, r1) = (8 * $lr, 8 * ($lr + 8));
+        // SAFETY: rows lr and lr + 8 are below GEMM_BM, so a code word `r + h`
+        // (h < 8) of either row and the rows' scale words `NV_CODE_W + lr`
+        // and `+ 8` stay inside the stage, published by the step's barrier.
+        let word = |at: usize| unsafe { *$wst.add(at) };
+        let a0 = [
+            nv_half(word(r0 + h0), hi),
+            nv_half(word(r1 + h0), hi),
+            nv_half(word(r0 + h0 + 2), hi),
+            nv_half(word(r1 + h0 + 2), hi),
+        ];
+        let a1 = [
+            nv_half(word(r0 + h1), hi),
+            nv_half(word(r1 + h1), hi),
+            nv_half(word(r0 + h1 + 2), hi),
+            nv_half(word(r1 + h1 + 2), hi),
+        ];
+        let (e0, e1) = (word(NV_CODE_W + $lr), word(NV_CODE_W + $lr + 8));
+        (
+            a0,
+            a1,
+            [nv_scale(e0, 0), nv_scale(e1, 0)],
+            [nv_scale(e0, 2), nv_scale(e1, 2)],
+            [nv_scale(e0, 1), nv_scale(e1, 1)],
+            [nv_scale(e0, 3), nv_scale(e1, 3)],
+        )
+    }};
+}
+
 /// The 32-value GEMM block: one tile's columns against one 128-row slab of
 /// that tile's expert (module doc). A macro, not a function, for the
 /// K-quant block's reason (`grouped.rs`, `gemm_block`): the entries share
@@ -1021,6 +1074,71 @@ macro_rules! gemm32_block {
             nt_live,
             votes
         );
+    }};
+    (
+        @walk $mode:ident, $nx:expr, $acc:ident, $off:ident, nvfp4p($qs:ident, $e:ident, $sc:ident),
+        $mins:literal, $epi:ident, $q:ident, $d:ident, $s:ident, (
+            $tid:ident, $t:ident, $active:ident, $ncols:ident, $nt_live:ident, $steps:ident,
+            $kb:ident, $col_q:ident, $col_d:ident, $bt:ident, $dt:ident, $wt:ident,
+            $acol_sh:ident, $pr:ident, $pj:ident, $prow:ident: $prow_row:expr,
+            $prow_live:ident, $pn0:ident, $slab_n:ident, $live_rows:ident, $a_off:ident,
+            $r_off:ident, $b_off:ident
+        )
+    ) => {{
+        let _ = ($slab_n, $live_rows, $a_off, $r_off);
+        // The lane's two slab rows (`g`, `g + 8` of its warp's sixteen).
+        let lr = 16 * ($tid / 32) + ($tid % 32) / 4;
+        // Step 0's activations, then steps 0 and 1's weights: three groups.
+        stage32_act!(0usize, 0usize, $mins, $tid, $ncols, $col_q, $col_d, $q, $d, $s, $bt, $dt,
+            $acol_sh);
+        // SAFETY: commits only this thread's pending step-0 activation copies as one group.
+        unsafe { cp_async_commit_group() };
+        nv_copy!($qs, $e, $wt, 0usize, $pr, $pj, $prow_live, $pn0, $kb);
+        // SAFETY: commits only this thread's pending step-0 weight copies as one group.
+        unsafe { cp_async_commit_group() };
+        nv_copy!($qs, $e, $wt, 1usize, $pr, $pj, $prow_live, $pn0, $kb);
+        // SAFETY: commits only this thread's pending step-1 weight copies as one group.
+        unsafe { cp_async_commit_group() };
+
+        let mut h = 0usize;
+        while h < $steps {
+            let st = h & 1;
+            // SAFETY: each step commits its activation group and then its
+            // weight group, so the newest group is step h + 1's weights and
+            // waiting for all but one completes step h's activations and
+            // weights; the barrier publishes them and tells that every warp
+            // is done with step h − 1, whose stages step h's copies refill.
+            unsafe { cp_async_wait_group(1) };
+            thread::sync_threads();
+            if h + 1 < $steps {
+                stage32_act!(h + 1, st ^ 1, $mins, $tid, $ncols, $col_q, $col_d, $q, $d, $s, $bt,
+                    $dt, $acol_sh);
+            }
+            // SAFETY: one activation group a step, empty past the last step.
+            unsafe { cp_async_commit_group() };
+            nv_copy!($qs, $e, $wt, h + 2, $pr, $pj, $prow_live, $pn0, $kb);
+            // SAFETY: one weight group a step, empty past the last step.
+            unsafe { cp_async_commit_group() };
+
+            if $active {
+                // Block 1 of this step exists (warp-uniform).
+                let two = 2 * h + 1 < $kb;
+                // SAFETY: stage `st` of BT and DT and stage `h % NV_STAGES`
+                // of WT are inside the shared arrays (NV_STAGES · NV_STAGE_W
+                // ≤ WT's words), published by the barrier above.
+                let (wst, bst, dst) = unsafe {
+                    (
+                        $wt.add((h % NV_STAGES) * NV_STAGE_W),
+                        $bt.add(st * B32_STAGE_W),
+                        $dt.add(st * D32_STAGE_W),
+                    )
+                };
+                let (a0, a1, dw0, dw1, mw0, mw1) = nv_frags!(wst, lr, $t);
+                nt_walk!($epi, $mode, $nx, $mins, $nt_live, two, $t, bst, dst, $b_off, a0, a1,
+                    dw0, dw1, mw0, mw1, $acc, $off);
+            }
+            h += 1;
+        }
     }};
     (
         @walk $mode:ident, $nx:expr, $acc:ident, $off:ident, $kind:ident($($w:ident),+),

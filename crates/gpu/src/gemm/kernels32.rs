@@ -12,8 +12,9 @@ use super::act32::quant32_group;
 use super::f32tile::{ByteRows, F32Rows, STAGE_FLOATS, STAGES, bf16_mma_body, f32_tile_body};
 use super::gemm32::{
     B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, GEMM32_GROUP, GEMM32_RASTER_BYTES,
-    GEMM32_THREADS_U32, IQ4_NL_BLOCK_BYTES, Q5_1_BLOCK_WORDS, Q8_0_BLOCK_BYTES, W32_ROW,
-    W32_STAGE_W, iq4_nl_file_block, mma_m16n8k16_s32_s8_zero, q8_0_file_block, raster32,
+    GEMM32_THREADS_U32, IQ4_NL_BLOCK_BYTES, NV_CODE_W, NV_STAGE_W, NV_STAGES, Q5_1_BLOCK_WORDS,
+    Q8_0_BLOCK_BYTES, W32_ROW, W32_STAGE_W, iq4_nl_file_block, mma_m16n8k16_s32_s8_zero, nv_half,
+    nv_scale, q8_0_file_block, raster32,
 };
 use super::grouped::{GEMM_BM, GEMM_NT, GEMM_THREADS, VOTE_WORDS};
 use super::remap::remap_id;
@@ -701,13 +702,14 @@ mod gemm32_kernels {
     /// `qs` is `n_experts · rows` rows of `4 · blocks` words (one 16-byte
     /// vector a 32-value unit), `e` their `blocks / 2` scale words — one a
     /// 64-value block, its four UE4M3 bytes, every one the repack checked —
-    /// and `scales` the experts' F32 tensor scales, one an expert. Each
-    /// staged row's eight code words are the unit's nibbles decoded through
-    /// the E2M1 table in value order and words 16 and 18 its two sub-block
-    /// scales as f32; the store multiplies by the tile's expert's scale. No
-    /// min term (`s` is not read), and K is a
-    /// multiple of 64 (the host refuses it otherwise, so a unit's stream
-    /// index carries its half of the block).
+    /// and `scales` the experts' F32 tensor scales, one an expert. A step's
+    /// code vectors and scale words are copied raw, two steps ahead, and
+    /// each warp decodes its rows' nibbles through the E2M1 table and their
+    /// sub-block scales to f32 as it reads them (`gemm32.rs`, `nv_copy`,
+    /// `nv_frags`); the store multiplies by the tile's expert's scale. No
+    /// min term (`s` is not read), `qs` is 16-byte aligned (the host checks
+    /// it), and K is a multiple of 64 (the host refuses it otherwise, so a
+    /// unit's stream index carries its half of the block).
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"

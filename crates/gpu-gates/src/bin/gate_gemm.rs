@@ -3342,12 +3342,14 @@ mod gate {
                 GemmRoute,
             };
             use bloomery_gpu::mxfp4_sel::Nvfp4Stack;
-            let (rows, k, per_slot) = match arm {
-                "gemm_nvfp4_gate_t2048" => (640usize, 2560usize, false),
-                "gemm_nvfp4_down_t2048" => (2560, 640, true),
+            let (rows, k, per_slot, tokens) = match arm {
+                "gemm_nvfp4_gate_t2048" => (640usize, 2560usize, false, 2048usize),
+                "gemm_nvfp4_down_t2048" => (2560, 640, true, 2048),
+                "gemm_nvfp4_gate_t4096" => (640, 2560, false, 4096),
+                "gemm_nvfp4_down_t4096" => (2560, 640, true, 4096),
                 _ => return Ok(false),
             };
-            let (tokens, experts, top_k) = (2048usize, 512usize, 10usize);
+            let (experts, top_k) = (512usize, 10usize);
             let slots = tokens * top_k;
             let cols = if per_slot { slots } else { tokens };
             let stream = gpu.stream();
