@@ -70,6 +70,14 @@ pub trait Draft<T: Verify> {
     /// What the draft reads of the target besides the tokens.
     const TAPS: TapNeed;
 
+    /// Whether each id of a proposal is a walk of the draft's own after the
+    /// one before it (a chain draft), so a proposal into less room than
+    /// [`Draft::WIDTH`] stops at the room and runs only its walks. The width
+    /// chooser hands such a draft the width it plans to verify; a draft that
+    /// makes its whole proposal in one call (a block draft, a lookup) is
+    /// handed its whole width, as every draft is by default.
+    const CHAIN: bool = false;
+
     /// Holds when a proposal and the token before it fit one verify of `T`.
     /// [`Speculative`]'s pass reads it, so a draft wider than
     /// `T::MAX_ROWS − 1` fails to compile where it is driven.
@@ -94,9 +102,10 @@ pub trait Draft<T: Verify> {
     fn begin(&mut self, t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error>;
 
     /// Write up to [`Draft::WIDTH`] ids to follow `last`, the token at the
-    /// target's position, into the front of `out` (`WIDTH` long) and return
-    /// how many: 0 is no proposal, and the pass is then one step; `n` is a
-    /// verify of `n + 1` rows. A draft may run its own program on the
+    /// target's position, into the front of `out` (`WIDTH` long, or for a
+    /// [`Draft::CHAIN`] draft the room it is handed) and return how many: 0
+    /// is no proposal, and the pass is then one step; `n` is a verify of
+    /// `n + 1` rows. A draft may run its own program on the
     /// target's buffers, and leaves the target at the position it found it:
     /// a draft that moves it, or proposes more than `WIDTH` ids, is broken,
     /// and the pass panics by name.

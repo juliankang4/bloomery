@@ -810,6 +810,9 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// The most ids a proposal holds: the body's [`MtpBody::WIDTH`].
     const WIDTH: usize = B::WIDTH;
     const TAPS: TapNeed = TapNeed::Final;
+    /// Each id past the first is one of the chain's own walks, which stop at
+    /// the room the proposal is handed.
+    const CHAIN: bool = true;
 
     /// The prompt through the target's own call, the draft walked over its
     /// units as they complete (the module doc): position 0 first — the

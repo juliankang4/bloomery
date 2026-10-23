@@ -26,7 +26,9 @@
 //!   caller that runs other sequences' passes between a sequence's own lands
 //!   each pass at its end instead ([`Choosing::finish_pass`]), so no other
 //!   call is read as its wall. A plain pass whose draft proposed (a shadow,
-//!   a cut to 0) holds the draft's walk and is no reading of the plain step.
+//!   a cut to 0) holds the draft's walk and is no reading of the plain step,
+//!   and a verify a window cut below the ids a chain draft walked holds the
+//!   walks past its width and is no reading of its width.
 //!
 //! Until every width's cost holds [`Rule::min_timings`] readings the passes
 //! rotate the widths, widest first, and nothing is decided. Past that two
@@ -52,11 +54,18 @@
 //! readings taken since, and the gate decides on their median. One fast
 //! reading cannot open the gate and one slow one cannot hold it closed, and
 //! one probe after a load step replaces a median read under the old load. A
-//! proposal shorter than the draft's width (the context's end) moves neither
-//! the mean nor the gate.
+//! proposal shorter than the room it was handed (the context's end) moves
+//! neither the mean nor the gate.
 //!
-//! The draft proposes its whole width whenever it proposes, and the pass
-//! verifies the front `k` ids. While closed, a plain pass asks the draft one
+//! A draft proposes into the room the chooser hands it, and the pass
+//! verifies the front `k` ids. A draft that makes its whole proposal in one
+//! call is handed its whole width. A chain draft ([`Draft::CHAIN`]), whose
+//! ids are walks of its own one after another, is handed the width the pass
+//! plans to verify (the warm-up's or a probe's width, else the gate's) and
+//! stops there: a window's own profile can then cut that width, never widen
+//! it, and the mean and the calibration hear of the positions a proposal
+//! reached, a position past them keeping what it last heard. A shadow walks
+//! the whole width. While closed, a plain pass asks the draft one
 //! thing — to walk the rows waiting for its next walk before its step
 //! overwrites their arena ([`Draft::before_plain`]) — and hears the position
 //! through [`Draft::held`], but every [`Rule::shadow_every`]th: that
@@ -559,6 +568,16 @@ enum Kind {
     /// A plain step after the draft's proposal (a shadow, a cut to 0): its
     /// wall holds the draft's whole chain, no reading.
     Walked,
+    /// A verify whose window cut it below the ids a chain draft walked: its
+    /// wall holds the walks past its width, no reading.
+    Cut,
+}
+
+impl Kind {
+    /// Whether the pass verifies a proposal.
+    fn verifies(self) -> bool {
+        matches!(self, Kind::Verify | Kind::Cut)
+    }
 }
 
 /// The pass in flight since its proposal.
@@ -723,10 +742,10 @@ pub struct Choosing<D, C = Wall> {
     batch_tested: Vec<u64>,
     /// The tests each `g_i` has taken.
     tested: Vec<u64>,
-    /// The running mean of the draft's `p_i` over its full proposals, and
-    /// how many it has seen.
+    /// The running mean of the draft's `p_i` over the proposals that filled
+    /// their room, and how many of them reached each position.
     mean: Vec<f64>,
-    seen: u64,
+    seen: Vec<u64>,
     /// The gate's profile, `mean_i · g_i`, reused.
     gated: Vec<f64>,
     /// The last readings of each width's cost: index `k` the passes that
@@ -805,7 +824,7 @@ where
             batch_tested: vec![0; D::WIDTH],
             tested: vec![0; D::WIDTH],
             mean: vec![0.0; D::WIDTH],
-            seen: 0,
+            seen: vec![0; D::WIDTH],
             gated: vec![0.0; D::WIDTH],
             costs: (0..widths)
                 .map(|k| Timings::new(if k == 0 { "step" } else { "verify" }, rule.timings))
@@ -988,9 +1007,16 @@ impl<D, C: Clock> Choosing<D, C> {
             Some(d) => d.as_secs_f64() * 1e3,
             None => -(f.at - now).as_secs_f64() * 1e3,
         };
-        if f.kind == Kind::Walked {
-            positive("plain pass", ms)?;
-            return Ok(());
+        match f.kind {
+            Kind::Walked => {
+                positive("plain pass", ms)?;
+                return Ok(());
+            }
+            Kind::Cut => {
+                positive("verify", ms)?;
+                return Ok(());
+            }
+            Kind::Verify | Kind::Step => {}
         }
         let k = f.width;
         let ms = positive(self.costs[k].what, ms)?;
@@ -1119,12 +1145,13 @@ impl<D, C: Clock> Choosing<D, C> {
         }
     }
 
-    /// The proposal's probabilities into the mean: a running mean until the
-    /// calibration's step is the smaller, then that step.
+    /// The proposal's probabilities of its first `n` ids into the mean: each
+    /// position a running mean until the calibration's step is the smaller,
+    /// then that step.
     fn learn(&mut self, n: usize) {
-        self.seen += 1;
-        let step = (1.0 / self.seen as f64).max(self.rule.calibrate);
-        for (m, &p) in self.mean[..n].iter_mut().zip(&self.p) {
+        for ((m, seen), &p) in self.mean[..n].iter_mut().zip(&mut self.seen).zip(&self.p) {
+            *seen += 1;
+            let step = (1.0 / *seen as f64).max(self.rule.calibrate);
             *m += step * (f64::from(p) - *m);
         }
     }
@@ -1227,12 +1254,21 @@ impl<D, C: Clock> Choosing<D, C> {
         0
     }
 
-    /// This pass a verify of the proposal's front `k` ids, written to `out`;
-    /// `probe` a closed chooser's probe.
-    fn verify(&mut self, out: &mut [u32], k: usize, pos: u32, at: Duration, probe: bool) -> usize {
+    /// This pass a verify of the proposal's front `k` ids, written to `out`,
+    /// the draft having walked `walked` ids for it (`k` for a draft whose
+    /// proposal costs its whole width whatever the pass verifies); `probe` a
+    /// closed chooser's probe.
+    fn verify(
+        &mut self,
+        out: &mut [u32],
+        (k, walked): (usize, usize),
+        pos: u32,
+        at: Duration,
+        probe: bool,
+    ) -> usize {
         out[..k].copy_from_slice(&self.ids[..k]);
         self.flight = Some(Flight {
-            kind: Kind::Verify,
+            kind: if k < walked { Kind::Cut } else { Kind::Verify },
             width: k,
             pos,
             at,
@@ -1255,6 +1291,7 @@ where
 {
     const WIDTH: usize = D::WIDTH;
     const TAPS: TapNeed = D::TAPS;
+    const CHAIN: bool = D::CHAIN;
 
     fn prompt(&mut self, t: &mut T, ids: &[u32]) -> Result<u32, T::Error> {
         self.prompt_by(|d| d.prompt(t, ids))
@@ -1270,10 +1307,10 @@ where
     /// proposal first — a shadow in flight, the warm-up's rotation or a
     /// width's readings started over, a probe — then while closed a plain
     /// step (the draft's waiting rows walked first, [`Draft::before_plain`])
-    /// or a shadow, else the draft's own
-    /// proposal with its probabilities, the gate decided on the mean they
-    /// move, and the front ids of the window's width ([`Choosing::cut`]) as
-    /// the pass's rows.
+    /// or a shadow, else the draft's own proposal with its probabilities
+    /// (a chain draft's into the width the pass plans to verify), the gate
+    /// decided on the mean they move, and the front ids of the window's
+    /// width ([`Choosing::cut`]) as the pass's rows.
     fn propose(&mut self, t: &mut T, last: u32, out: &mut [u32]) -> Result<usize, T::Error> {
         if self.mode == Mode::Fixed {
             return self.draft.propose(t, last, out);
@@ -1331,21 +1368,27 @@ where
             self.draft.unproposed();
             return Ok(self.plain(Kind::Walked, pos, at));
         }
+        let depth = if D::CHAIN {
+            forced.unwrap_or(self.width).min(room)
+        } else {
+            room
+        };
         let n = self
             .draft
-            .propose_p(t, last, &mut self.ids[..room], &mut self.p)?;
+            .propose_p(t, last, &mut self.ids[..depth], &mut self.p)?;
         if n == 0 {
             return Ok(self.plain(Kind::Step, pos, at));
         }
         check_p(&self.p[..n])?;
         self.profile(n);
-        if n == D::WIDTH {
+        let filled = n == depth;
+        if filled {
             self.learn(n);
         }
         let k = match forced {
             Some(k) => k.min(n),
             None => {
-                if n == D::WIDTH {
+                if filled {
                     self.gate();
                 }
                 if self.width == 0 { 0 } else { self.cut(n) }
@@ -1355,7 +1398,8 @@ where
             self.draft.unproposed();
             return Ok(self.plain(Kind::Walked, pos, at));
         }
-        Ok(self.verify(out, k, pos, at, probe))
+        let walked = if D::CHAIN { n } else { k };
+        Ok(self.verify(out, (k, walked), pos, at, probe))
     }
 
     /// The verify of `rows` kept its first `accepted` rows: the cost and the
@@ -1374,7 +1418,7 @@ where
         let k = rows.len() - 1;
         match (self.turn.take(), &mut self.flight) {
             (Some(Turn::Verify { k: chose }), Some(f))
-                if chose == k && f.kind == Kind::Verify && f.ends.is_none() =>
+                if chose == k && f.kind.verifies() && f.ends.is_none() =>
             {
                 f.ends = u32::try_from(accepted).ok().map(|a| f.pos + a);
                 let predicted = f.predicted;
@@ -1403,7 +1447,7 @@ where
             return self.draft.stepped(t, last, next);
         }
         match &mut self.flight {
-            Some(f) if f.kind != Kind::Verify && f.ends.is_none() => f.ends = Some(f.pos + 1),
+            Some(f) if !f.kind.verifies() && f.ends.is_none() => f.ends = Some(f.pos + 1),
             _ => self.drop_flight(),
         }
         self.score_shadow(next);
@@ -1423,7 +1467,8 @@ mod tests {
         Advance, Committed, Draft, Plain, Speculative, Stop, TapNeed, Target, Want, generate,
     };
 
-    /// The draft's own walk on the mock's clock, µs, every proposal.
+    /// The draft's own walk on the mock's clock, µs, every proposal; a chain
+    /// draft's, every id.
     const DRAFT_US: u64 = 500;
     const STEP_US: u64 = 37_450;
     /// Verifies of 2, 3 and 4 rows at W(3) = 2.15 of the step, the rows
@@ -1436,8 +1481,9 @@ mod tests {
     /// a counter of its own, `⌊(k + 1)·a⌋ > ⌊k·a⌋` making its stream hold
     /// exactly its rate over any long run. Like the engine's card draft it
     /// refuses to propose unless it holds every position before the
-    /// target's, and it queues a held position until its next call.
-    struct Scored {
+    /// target's, and it queues a held position until its next call. `C` is
+    /// [`Draft::CHAIN`]: a chain draft's proposal walks one id at a time.
+    struct Scored<const C: bool = false> {
         acc: Rc<Cell<[f64; 3]>>,
         p: Rc<Cell<[f32; 3]>>,
         draws: [u64; 3],
@@ -1445,6 +1491,8 @@ mod tests {
         at: u32,
         queued: u32,
         proposals: u64,
+        /// The ids every proposal held, summed.
+        walked: u64,
         held: u64,
         unproposed: u64,
         plains: u64,
@@ -1453,8 +1501,8 @@ mod tests {
         open: u64,
     }
 
-    impl Scored {
-        fn new(acc: &Rc<Cell<[f64; 3]>>, p: &Rc<Cell<[f32; 3]>>) -> Scored {
+    impl<const C: bool> Scored<C> {
+        fn new(acc: &Rc<Cell<[f64; 3]>>, p: &Rc<Cell<[f32; 3]>>) -> Scored<C> {
             Scored {
                 acc: Rc::clone(acc),
                 p: Rc::clone(p),
@@ -1463,6 +1511,7 @@ mod tests {
                 at: 0,
                 queued: 0,
                 proposals: 0,
+                walked: 0,
                 held: 0,
                 unproposed: 0,
                 plains: 0,
@@ -1483,9 +1532,10 @@ mod tests {
         }
     }
 
-    impl Draft<Mock> for Scored {
+    impl<const C: bool> Draft<Mock> for Scored<C> {
         const WIDTH: usize = 3;
         const TAPS: TapNeed = TapNeed::None;
+        const CHAIN: bool = C;
 
         fn prompt(&mut self, t: &mut Mock, ids: &[u32]) -> Result<u32, MockError> {
             let next = Plain.prompt(t, ids)?;
@@ -1517,13 +1567,14 @@ mod tests {
             self.flush();
             assert_eq!(self.at, t.pos(), "the draft missed a position");
             assert_eq!(self.open, 0, "a proposal never verified was not dropped");
+            let n = out.len().min(3);
             if let Some(c) = &self.clock {
-                c.advance(DRAFT_US);
+                c.advance(if C { DRAFT_US * n as u64 } else { DRAFT_US });
             }
             self.proposals += 1;
+            self.walked += n as u64;
             self.open += 1;
             let truth = t.greedy_after(last, 3);
-            let n = out.len().min(3);
             for i in 0..n {
                 out[i] = if self.right(i) {
                     truth[i]
@@ -1577,13 +1628,11 @@ mod tests {
         }
     }
 
-    type Spec = Speculative<Choosing<Scored, Rc<Clockwork>>, 4>;
-
     /// A chooser over a [`Scored`] draft on the mock, standing after a
     /// prompt, its steps costing `STEP_US` and its verifies `by_rows`.
-    struct Rig {
+    struct Rig<const C: bool = false> {
         t: Mock,
-        spec: Spec,
+        spec: Speculative<Choosing<Scored<C>, Rc<Clockwork>>, 4>,
         clock: Rc<Clockwork>,
         acc: Rc<Cell<[f64; 3]>>,
         last: u32,
@@ -1600,6 +1649,12 @@ mod tests {
         }
 
         fn with(acc: [f64; 3], p: [f32; 3], by_rows: &[u64], mode: Mode, rule: Rule) -> Rig {
+            Rig::build(acc, p, by_rows, mode, rule)
+        }
+    }
+
+    impl<const C: bool> Rig<C> {
+        fn build(acc: [f64; 3], p: [f32; 3], by_rows: &[u64], mode: Mode, rule: Rule) -> Rig<C> {
             let clock = Clockwork::new(STEP_US, 0);
             clock.verify_rows(by_rows);
             let acc = Rc::new(Cell::new(acc));
@@ -1636,7 +1691,7 @@ mod tests {
             }
         }
 
-        fn choosing(&mut self) -> &mut Choosing<Scored, Rc<Clockwork>> {
+        fn choosing(&mut self) -> &mut Choosing<Scored<C>, Rc<Clockwork>> {
             self.spec.draft_mut()
         }
 
@@ -2148,6 +2203,40 @@ mod tests {
         }
     }
 
+    /// A chain draft walks the width the pass plans to verify and no more:
+    /// on a profile whose third id loses it settles on 2, the ids its
+    /// proposals held equal the ids the passes verified, and its positions a
+    /// microsecond come within 2 % of the best fixed width's at a walk an id.
+    /// Handed its whole width, it would walk a third id every window.
+    #[test]
+    fn a_chain_draft_walks_the_width_it_verifies() {
+        let acc = [0.95, 0.90, 0.30];
+        let mut r = Rig::<true>::build(
+            acc,
+            acc.map(|a| a as f32),
+            &LINEAR,
+            Mode::Cost,
+            Rule::DEFAULT,
+        );
+        r.run(600);
+        let (walked, calls) = (r.choosing().draft().walked, r.rows().len());
+        let (t0, p0) = (r.clock.now.get(), r.t.pos());
+        r.run(400);
+        assert_eq!(r.choosing().width(), 2, "settled elsewhere");
+        let verified: usize = r.rows()[calls..].iter().map(|m| m - 1).sum();
+        let walked = r.choosing().draft().walked - walked;
+        assert_eq!(walked, verified as u64, "walked past the verified width");
+        let rate = f64::from(r.t.pos() - p0) / (r.clock.now.get() - t0) as f64;
+        let best = (1..=3)
+            .map(|k| expected(&acc, k) / (LINEAR[k - 1] + k as u64 * DRAFT_US) as f64)
+            .fold(1.0 / STEP_US as f64, f64::max);
+        assert!(
+            rate >= best * 0.98,
+            "{:.4} of the best fixed width's rate",
+            rate / best
+        );
+    }
+
     /// The gate moves on the mean profile alone and keeps its margin: an
     /// open chooser stays open while a drafted width beats the plain step
     /// and closes once none does, a closed one opens only past the margin,
@@ -2203,7 +2292,7 @@ mod tests {
         };
         c.width = 3;
         c.mean.copy_from_slice(&[0.8, 0.81, 0.85]);
-        c.seen = 1_000;
+        c.seen.fill(1_000);
         assert_eq!(window(&mut c, [0.9, 0.9, 0.9]), 3, "a sure window cut");
         assert_eq!(
             window(&mut c, [0.5, 0.2, 0.2]),
@@ -2695,7 +2784,7 @@ mod tests {
             let acc = Rc::new(Cell::new([0.8; 3]));
             let p = Rc::new(Cell::new([0.8; 3]));
             assert!(
-                Scored::new(&acc, &p)
+                Scored::<false>::new(&acc, &p)
                     .choosing_by(Mode::Cost, rule, Wall::new())
                     .is_err()
             );

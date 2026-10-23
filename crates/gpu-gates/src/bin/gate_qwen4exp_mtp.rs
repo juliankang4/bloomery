@@ -4261,10 +4261,12 @@ mod gate {
     /// [`Ticks`] clock. First the walls of the A6000's passes (2, 3, 4 rows
     /// at 1.383, 1.767, 2.15 steps, W(3)'s line [derived]): the tokens the
     /// plain run's whatever ran; every window's record the width its pass
-    /// ran (rows − 1), the whole proposal the draft's three ids, its kept
-    /// ids the plain run's next tokens and its first rejected id not; the
-    /// chooser's tally the passes' widths and kept rows; the warm-up's cuts
-    /// below the draft's width ran. Then walls on which no drafted width
+    /// ran (rows − 1), the proposal at least that width and at most the
+    /// draft's three ids, its kept ids the plain run's next tokens and its
+    /// first rejected id not; the chooser's tally the passes' widths and kept
+    /// rows; the warm-up's cuts below the draft's width ran, and some
+    /// proposal stopped short of three ids (a chain draft walks the width its
+    /// pass plans, not its own). Then walls on which no drafted width
     /// pays: the chooser closes, the draft's proposals run as shadows (never
     /// a window) and the plain passes are the draft's held steps — the tokens
     /// still the plain run's, the windows the verifies' alone.
@@ -4296,7 +4298,9 @@ mod gate {
                     || plain.tokens.get(at + 1 + w.accepted) != Some(&w.ids[w.accepted]);
                 let one = w.width + 1 == cut.rows[i]
                     && w.accepted + 1 == cut.kept[i]
-                    && w.ids.len() == 3
+                    // PIN(2026-10-23): chains now stop at the chooser's planned width, so a
+                    // proposal holds the verified width up to three ids.
+                    && (w.width..=3).contains(&w.ids.len())
                     && ids_kept
                     && rejected;
                 if !one {
@@ -4318,7 +4322,12 @@ mod gate {
             }
             let tally_ok = tally.widths == widths && tally.kept == kept;
             let shape_ok = match what {
-                "paying" => widths[1] > 0 && widths[2] > 0 && widths[0] > 0,
+                "paying" => {
+                    widths[1] > 0
+                        && widths[2] > 0
+                        && widths[0] > 0
+                        && windows.iter().any(|w| w.ids.len() < 3)
+                }
                 _ => width == 0 && widths[0] * 2 > widths.iter().sum::<u64>(),
             };
             println!(
