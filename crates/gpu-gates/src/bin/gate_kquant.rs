@@ -91,7 +91,14 @@
 //!     column not read) and in the card sum (its token NaN), a `HOST` place
 //!     in neither, each launch alone over NaN host columns; the launchers
 //!     refuse weights at a pitch of ten, the quantizer a card of no expert,
-//!     columns past the scratch and a slot past the weights.
+//!     columns past the scratch and a slot past the weights. A layer
+//!     without a host leg's one launch (`q38_card_sum_shared_add`) over the
+//!     same down rows, the host slots NaN, is `runtime::combine::combine`
+//!     over a zero host sum and the sum and combine launches over zeros, bit
+//!     for bit, a card sum of `-0.0` (every product rounding to it) and a
+//!     `-0.0` shared row giving `+0.0`; a stray place raises `ExpertId` and
+//!     the NaN sum's `F32Product`, its token NaN; its launcher refuses no
+//!     token and an output a value short.
 //! 11. q8_0_sel32: the Q8_0 down `_sel` of 32-value blocks
 //!     (`bloomery_gpu::q8_0_sel32`, the file's `block_q8_0` bytes resident as
 //!     one word stream) over clause 7's seven experts and ten slots, at the
@@ -162,6 +169,10 @@
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_kquant", gate::run())
 }
+
+#[cfg(feature = "gpu")]
+#[path = "shared/q38_combine.rs"]
+mod q38_combine;
 
 #[cfg(feature = "gpu")]
 mod gate {
@@ -507,11 +518,11 @@ mod gate {
     const E: usize = 4;
     /// What an output buffer holds before a launch: a slot left alone reads
     /// back as these bits.
-    const SENT: f32 = 1.0e30;
+    pub(crate) const SENT: f32 = 1.0e30;
 
     /// Everything the clauses share.
-    struct Ctx {
-        gpu: Gpu,
+    pub(crate) struct Ctx {
+        pub(crate) gpu: Gpu,
         kq: QuantSelKernels,
         q51: Q51SelKernels,
         q80: Q80SelKernels,
@@ -903,7 +914,7 @@ mod gate {
 
     /// ` <label>=slot S row R got 0x… want 0x…` at the first index where the
     /// bits differ, `rpe` rows a slot; empty when they agree.
-    fn mismatch(label: &str, got: &[f32], want: &[f32], rpe: usize) -> String {
+    pub(crate) fn mismatch(label: &str, got: &[f32], want: &[f32], rpe: usize) -> String {
         if got.len() != want.len() {
             return format!(" {label}=length got {} want {}", got.len(), want.len());
         }
@@ -923,7 +934,7 @@ mod gate {
         }
     }
 
-    fn shown(f: Option<Fault>) -> String {
+    pub(crate) fn shown(f: Option<Fault>) -> String {
         f.map_or_else(|| "none".to_owned(), |f| f.to_string())
     }
 
@@ -982,7 +993,9 @@ mod gate {
              Q5_K's; Qwen3.8's card leg over two tokens: the card columns' q8_1 the plain \
              quantizer's, the host columns untouched, the card sum and the combine the \
              runtime's rule bit for bit, five nodes replaying moved places, q5_quant and \
-             f32_product named, the launchers' refusals; q8_0_gemv_sel32 within \
+             f32_product named, a layer without a host leg's one launch the rule over a zero \
+             host sum and the two launches over zeros bit for bit, a -0.0 sum giving +0.0, \
+             the launchers' refusals; q8_0_gemv_sel32 within \
              {KERNEL_BAND:e} of the f64 dequant_row reference at 5 shapes (odd blocks a row \
              among them), HOST untouched, graph replay, expert_id past the stack, q5_quant on a \
              NaN column, a NaN scale NaNs its rows, a wider activation bit for bit, the launcher's \
@@ -2066,15 +2079,15 @@ mod gate {
     }
 
     /// Clause 10's card experts: Qwen3.8's shapes, [`E51`] experts a stack.
-    const E38: usize = E51;
+    pub(crate) const E38: usize = E51;
     /// Clause 10's tokens.
-    const M38: usize = 2;
+    pub(crate) const M38: usize = 2;
     /// Clause 10's hidden width and routed expert width.
-    const N38: usize = 2560;
+    pub(crate) const N38: usize = 2560;
     const FF38: usize = 640;
     /// Clause 10's places, ten a token: token 0 [`SEL51`], token 1 two host
     /// slots and a repeat.
-    const SEL38: [u32; 20] = [
+    pub(crate) const SEL38: [u32; 20] = [
         6, 0, 3, 3, HOST, 1, 6, 2, 5, 4, //
         1, HOST, 5, 0, HOST, 2, 4, 6, 3, 3,
     ];
@@ -2086,7 +2099,7 @@ mod gate {
 
     /// [`SEL38`] with token 1's first host slot (slot 11) at place [`E38`]:
     /// neither a card expert nor [`HOST`].
-    const SEL38_STRAY: [u32; 20] = {
+    pub(crate) const SEL38_STRAY: [u32; 20] = {
         let mut s = SEL38;
         s[11] = E38 as u32;
         s
@@ -2109,22 +2122,22 @@ mod gate {
 
     /// Clause 10's buffers: the stacks, the tokens' q8_1 columns, the places
     /// and weights, and every launch's output.
-    struct Leg38 {
-        q38: Q38Kernels,
+    pub(crate) struct Leg38 {
+        pub(crate) q38: Q38Kernels,
         slots: CardSlotKernels,
         gate: Stack,
         up: Stack,
         down: Stack51,
         act_x: Q8Act,
-        sel: DeviceBuffer<u32>,
-        w: DeviceBuffer<f32>,
-        hsum: DeviceBuffer<f32>,
-        sh: DeviceBuffer<f32>,
+        pub(crate) sel: DeviceBuffer<u32>,
+        pub(crate) w: DeviceBuffer<f32>,
+        pub(crate) hsum: DeviceBuffer<f32>,
+        pub(crate) sh: DeviceBuffer<f32>,
         h: DeviceBuffer<f32>,
         act_h: Q8Blocks32,
-        y_down: DeviceBuffer<f32>,
-        acc: DeviceBuffer<f32>,
-        y: DeviceBuffer<f32>,
+        pub(crate) y_down: DeviceBuffer<f32>,
+        pub(crate) acc: DeviceBuffer<f32>,
+        pub(crate) y: DeviceBuffer<f32>,
     }
 
     impl Leg38 {
@@ -2183,6 +2196,14 @@ mod gate {
                 rows_per_expert: N38,
             };
             c.q51.enqueue_gemv_q5_1_sel(s, &d, sink, &mut self.y_down)?;
+            self.sum(c, s)
+        }
+
+        /// The leg's last two launches on `s`: the card sum of the down rows
+        /// into `acc`, then the combine with `hsum` and the gated `sh` into
+        /// `y`.
+        pub(crate) fn sum(&mut self, c: &Ctx, s: &cuda_core::CudaStream) -> Result<(), GpuError> {
+            let sink = c.gpu.unlabelled_sink();
             let a = CardAcc {
                 down: &self.y_down,
                 w: &self.w,
@@ -2215,7 +2236,11 @@ mod gate {
         /// The runtime's rule on the leg's own down outputs for places `sel`:
         /// each value's card sum and its combine. A host slot's down value is
         /// NaN here, so reading it would show.
-        fn host_rule(&self, c: &Ctx, sel: &[u32; 20]) -> Result<(Vec<f32>, Vec<f32>), GateError> {
+        pub(crate) fn host_rule(
+            &self,
+            c: &Ctx,
+            sel: &[u32; 20],
+        ) -> Result<(Vec<f32>, Vec<f32>), GateError> {
             let stream = c.gpu.stream();
             let down = self.y_down.to_host_vec(stream)?;
             let w = weights38();
@@ -2373,6 +2398,7 @@ mod gate {
             verdict(pass)
         );
         ok &= check_q38_card_places(c, &mut leg, &h)?;
+        ok &= leg.check_hostless(c)?;
         ok &= check_q38_card_host_contract(c, &mut leg)?;
         Ok(ok)
     }
@@ -2495,21 +2521,6 @@ mod gate {
                     .enqueue_quantize_q8_sel(stream, &q, &mut leg.act_h, sink),
             );
         }
-        let r_slot = leg.q38.enqueue_card_shared_add(
-            stream,
-            CardSharedAddArgs {
-                hsum: &leg.hsum,
-                acc: &leg.acc,
-                sh: &leg.sh,
-                w: &leg.w,
-                slot: W_PITCH,
-                slots: W_PITCH,
-                n: N38,
-                m: M38,
-                fault: sink,
-                y: &mut leg.y,
-            },
-        );
         let [r_quant_card0, r_quant_past]: [Result<(), GpuError>; 2] = r_quant
             .try_into()
             .map_err(|_| "gate_kquant: two quantizer cases")?;
@@ -2517,7 +2528,7 @@ mod gate {
         // Qwen3.8's own launcher: the common sum serves a card of no expert as
         // zeros (V4.1's layers with no card experts), and card_slots.rs's hw
         // test holds that; Qwen3.8 keeps `q38_shared_add` for such a layer.
-        let cases: [(&str, &str, Result<(), GpuError>); 4] = [
+        let cases: [(&str, &str, Result<(), GpuError>); 3] = [
             (
                 "ds41_ffn_card_acc_10",
                 "weights_at_a_pitch_of_10",
@@ -2533,10 +2544,9 @@ mod gate {
                 "columns_past_the_scratch",
                 r_quant_past,
             ),
-            ("q38::enqueue_card_shared_add", "slot_11_of_11", r_slot),
         ];
         let mut ok = true;
-        for (what, case, r) in cases {
+        for (what, case, r) in cases.into_iter().chain(leg.combine_refusals(c)?) {
             let pass = matches!(&r, Err(GpuError::Shape { what: w, .. }) if *w == what);
             let seen = match &r {
                 Ok(()) => "Ok (accepted)".to_string(),

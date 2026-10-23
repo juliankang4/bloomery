@@ -425,7 +425,7 @@ mod card_slots_kernels {
     reason = "device helper: the entries' arguments flat (rust-quality R8)"
 )]
 #[inline(always)]
-unsafe fn card_acc_at<const N: usize>(
+pub(crate) unsafe fn card_acc_at<const N: usize>(
     down: &[f32],
     w: &[f32],
     sel: &[u32],

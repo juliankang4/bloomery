@@ -15,7 +15,9 @@
 //! [`CARD_LAUNCHES`] — and the back combines `(hsum + acc) + sh·w`
 //! (`q38_card_shared_add`). The ubatch walk runs the card route
 //! (`wide38`'s, over the same stacks through the grouped GEMMs) on a layer
-//! with card experts and the same back. A layer without card experts
+//! with card experts and the same back; on a layer without a host leg
+//! ([`Card38::hostless`]) its sum and the combine are one launch
+//! (`q38_card_sum_shared_add`). A layer without card experts
 //! launches none of them and keeps `q38_shared_add`. The slot places each
 //! launch reads are the ones the walk's handoff or places launch wrote
 //! beside the ids from the slot map's card copy, and the host tier skips
@@ -486,9 +488,10 @@ impl Card38 {
     /// ([`crate::host::HostTier::start_swap`]) and a route trace, which the
     /// host service writes ([`crate::host::HostTier::attach_route_trace`]).
     /// The prompt walk runs such a layer without one too (no download, no
-    /// service, zeros for the host's sum), and the host run holds no view of
-    /// it (`crate::model::host_run` over the other layers), so its stacks may
-    /// be of a type no host kernel reads. `l` must be a layer of the load.
+    /// service, no host sum: its card route writes the block's output), and
+    /// the host run holds no view of it (`crate::model::host_run` over the
+    /// other layers), so its stacks may be of a type no host kernel reads.
+    /// `l` must be a layer of the load.
     pub(super) fn hostless(&self, l: usize) -> bool {
         assert!(
             l < self.hostless.len(),
