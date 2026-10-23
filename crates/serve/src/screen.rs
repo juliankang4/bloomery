@@ -1196,8 +1196,8 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ART_H, GAP, LABEL, LEFT, MARGIN, Rgb, Split, Style, TermVars, bar_cells, blocks, render,
-        width,
+        ART_H, GAP, LABEL, LEFT, MARGIN, Marks, Rgb, Split, Style, TermVars, bar_cells, blocks,
+        facts, render, width,
     };
 
     /// The record lines of a V4.1 seat's start, as its log carries them.
