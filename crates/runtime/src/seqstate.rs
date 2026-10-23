@@ -127,8 +127,8 @@ impl Price {
     /// two ends, so the point a resumed prefix needs, where the call before
     /// ended, is never the one displaced. A ledger of this budget is made of
     /// exactly that many slots, so it is the bound on what the sequence pins;
-    /// a later call's points past them displace the least recently used that
-    /// is not an anchor ([`Ledger::take`]), never grow the pin. Refused by name
+    /// later points use [`Ledger::take`]'s order, preserving the first prefix
+    /// and anchors before later marks, and never grow the pin. Refused by name
     /// for a context of no positions or past the u32 positions, and a
     /// checkpoint [`capacity`] refuses.
     pub fn budget(self, ctx: u64) -> Result<u64, CheckpointError> {
@@ -418,11 +418,10 @@ struct Point {
 }
 
 /// The checkpoints of one model's recurrent state: at most `cap` slots,
-/// the least recently used point giving its slot up to a new one. Anchors
-/// ([`anchor`] at the spacing `every`) are the last to go: a prompt longer
-/// than the slots gives up its later marks and keeps the doubling ones a
-/// save carries ([`save_points`]), an anchor giving its slot up only when
-/// every point is one.
+/// the least recently used point giving its slot up to a new one. With
+/// nonzero spacing, the first point leaves last, and later anchors
+/// ([`anchor`] at the spacing `every`) stay before later non-anchor marks.
+/// A save carries the first point and the doubling ones ([`save_points`]).
 #[derive(Clone, Debug)]
 pub struct Ledger {
     cap: usize,
