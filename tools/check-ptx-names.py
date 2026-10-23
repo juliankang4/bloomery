@@ -1018,9 +1018,18 @@ def self_test():
             fails.append(f"green summary: {out!r}")
         native = "#[kernel]\npub fn k_native() {}\n"
         guarded_gpu = GPU_RS + "\n#[cfg(native)]\nmod native;\n"
-        native_table = "# cfg: native\ngenerate_ds41 k_native 0 0\n"
+        native_table = "# cfg: native\n" + table_text(dict(TABLE_ROWS, generate_ds41=TABLE_ROWS["generate_ds41"] + ["k_native"]))
         fixture = {"gpu": guarded_gpu, "extra": (("crates/gpu/src/native.rs", native),)}
         run("target-gated: its target table pins the entry", 0, [], beside=native_table, **fixture)
+        run("target-gated: the target table must pin its conditional entry", 1,
+            [f"generate_ds41 k_native unpinned (crates/gpu/src/native.rs:1; {BESIDE_FIXTURE})"],
+            beside=native_table.replace("generate_ds41   k_native   0   0\n", ""), **fixture)
+        run("target-gated: the target table must also pin unconditional entries", 1,
+            [f"generate_ds41 k_two_8 unpinned (crates/gpu/src/lib.rs:{line_of(GPU_RS, 'pub fn k_two_8') - 1}; {BESIDE_FIXTURE})"],
+            beside=native_table.replace("generate_ds41   k_two_8   0   0\n", ""), **fixture)
+        run("target-gated: another target does not need this conditional entry", 0, [],
+            beside=native_table, **dict(fixture, extra=fixture["extra"] +
+                (("tools/ref/ptx-shapes/sm_86-cc12.1.tsv", table_text(TABLE_ROWS)),)))
         run("target-gated: an unannotated target table cannot hide the missing default pin", 1,
             ["generate_ds41 k_native unpinned (crates/gpu/src/native.rs:1)"],
             beside=native_table.replace("# cfg: native\n", ""), **fixture)
@@ -1092,11 +1101,19 @@ def self_test():
             fails.append(f"unknown binary: {out!r}")
         out = run("table: a binary the recipe does not run", 1, ["gate_old: the table pins this binary, the gate-ptx-spill recipe does not run it"],
                   rows=dict(TABLE_ROWS, gate_old=["k_one"]))
-        # a table beside the base: a row no source declares is stale there too; an entry it lacks is not a failure
+        # Every table holds the unconditional entries and the entries of its own target.
         lag = {b: [e for e in es if e != "k_two_8"] for b, es in TABLE_ROWS.items()}
-        out = run("beside: a missing row is not checked", 0, [], beside=table_text(lag))
-        if "1 tables beside it read for stale rows" not in out:
+        out = run("beside: a missing row is unpinned", 1,
+            [f"generate_ds41 k_two_8 unpinned (crates/gpu/src/lib.rs:{line_of(GPU_RS, 'pub fn k_two_8') - 1}; {BESIDE_FIXTURE})"],
+            beside=table_text(lag))
+        if "1 violation(s)" not in out:
             fails.append(f"beside summary: {out!r}")
+        run("beside: a missing filtered entry is unpinned", 1,
+            [f"gate_qwen3vl_tower vis_two unpinned (crates/gpu-vision/src/vis.rs:{line_of(VIS_RS, 'pub fn vis_two') - 1}; {BESIDE_FIXTURE})"],
+            beside=table_text(dict(TABLE_ROWS, gate_qwen3vl_tower=["vis_one"])))
+        run("beside: an explicit table path is checked too", 1,
+            [f"generate_ds41 k_two_8 unpinned (crates/gpu/src/lib.rs:{line_of(GPU_RS, 'pub fn k_two_8') - 1}; {BESIDE_FIXTURE})"],
+            beside=table_text(lag), justfile=JUSTFILE_TXT.replace(f"{TABLE} ", f"{TABLE} {BESIDE_FIXTURE} ").replace(f"{BESIDE_DIR} ", ""))
         run("beside: a deleted kernel's row there is stale", 1,
             [f"generate_ds41 k_old stale ({BESIDE_FIXTURE})"],
             beside=table_text(dict(TABLE_ROWS, generate_ds41=TABLE_ROWS["generate_ds41"] + ["k_old"])))

@@ -126,7 +126,11 @@ self_test() {
   marked f " jit=skipped(no-jit)" "skipped(no-jit)" "k1 0"
   marked g " jit=skipped(no-jit)" 0 "k1 0"
   marked h "" "skipped(no-jit)" "k1 0"
+  scan v "vis_a 0 0" "outside 0 0"
   scan v.vis_ "vis_a 0 0"
+  scan v.vis_a "vis_a 0 0"
+  scan v.outside "outside 0 0"
+  scan v.vis_missing "vis_missing 0 0"
   # p75: a scan whose JIT met a held lock, as ptx-scan ends it: a banner with no rows, six module lines on stderr and the line that
   # names the contention (gpu-gate.sh's own last line in it) last, rc 75.
   hold='the batch hold /root/bloomery-batch.gpuhold (owner leadbatch) was still up after 4 s (CARD_BOUND 4 s) - contention, not a red gate (rc 75)'
@@ -140,7 +144,7 @@ self_test() {
   SC=9.0 scan y "k1 0 0"
   SA=sm_121 SC=12.1 scan z "k1 0 16"
   printf '%s\n' '# fixture' '# arch: sm_86' '# jit-cc: 8.6' 'a k1 0 0' '# PIN(2000-01-01): fixture' 'a k2 8 0' 'b k3 0 0' \
-    'd k1 0 0' 'd k9 0 0' 'f k1 0 0' 'g k1 0 0' 'h k1 0 0' 'v vis_a 0 0' 'w k1 0 0' 'w k2 8 0' 'x k1 0 0' 'y k1 0 0' 'z k1 0 0' \
+    'd k1 0 0' 'd k9 0 0' 'f k1 0 0' 'g k1 0 0' 'h k1 0 0' 'v vis_a 0 0' 'v outside 0 0' 'w k1 0 0' 'w k2 8 0' 'x k1 0 0' 'y k1 0 0' 'z k1 0 0' \
     > "$t/table"
   mkdir "$t/side" "$t/empty"
   printf '%s\n' '# fixture' '# arch: sm_86' '# jit-cc: 12.1' 'w k1 0 0' '# PIN(2000-01-01): fixture' 'w k2 8 24' 'y k1 0 0' \
@@ -181,6 +185,11 @@ self_test() {
   check "a no-jit banner over a numeric jit_local" 1 "ptx-spill bin=g scan is no-jit (jit_local not read) FAIL" "$t/table" g
   check "a skipped jit_local under a banner that ran the JIT" 1 "ptx-spill bin=h scan is no-jit (jit_local not read) FAIL" "$t/table" h
   check "a binary scanned under an entry filter pins only the filtered entries" 0 "ptx-spill bin=v entries=1 pinned=1 nonzero=none violations=0 PASS" "$t/table" v:vis_
+  check "two filters of the same binary read their own pins" 0 "ptx-spill bin=v entries=1 pinned=1 nonzero=none violations=0 PASS" "$t/table" v:vis_a v:outside
+  check "an unfiltered binary still checks every pin" 0 "ptx-spill bin=v entries=2 pinned=2 nonzero=none violations=0 PASS" "$t/table" v
+  check "an unpinned entry inside the filter is refused" 1 "v vis_missing unpinned spill=0 jit_local=0" "$t/table" v:vis_missing
+  scan v.vis_ "vis_other 0 0"
+  check "a missing entry inside the filter is stale" 1 "v vis_a stale" "$t/table" v:vis_
   check "no binary" 2 - "$t/table"
   check "no table" 2 - a
   # The table: the scan's arch and capability pick it among the tables named.
