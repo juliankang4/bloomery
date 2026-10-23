@@ -1708,7 +1708,10 @@ pub fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEAD_TENSOR, TensorPart, derived_slot_free, file_slot, head_tensor, part_formats};
+    use super::{
+        HEAD_TENSOR, TensorPart, derived_slot_free, file_slot, head_tensor, part_format, part_formats,
+        upload_budget,
+    };
     use gguf::Split;
     use gguf::write::{Layout, TensorDecl, Writer};
     use gguf::{GgmlType, TensorInfo};
@@ -1733,6 +1736,29 @@ mod tests {
             w.tensor(n, &[0u8; 32]).unwrap_or_else(|e| panic!("{e}"));
         }
         w.finish().unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn file_upload_budget_counts_the_named_format() {
+        for (name, ty, k, bytes) in [
+            (HEAD_TENSOR, GgmlType::BF16, 256, 16_896),
+            (HEAD_TENSOR, GgmlType::BF16, 320, 40_960),
+            ("token_embd.weight", GgmlType::BF16, 256, 65_536),
+            ("plain.weight", GgmlType::BF16, 256, 65_536),
+            (HEAD_TENSOR, GgmlType::F32, 256, 65_536),
+            (HEAD_TENSOR, GgmlType::Q8_0, 256, 17_408),
+        ] {
+            let (block, size) = (ty.blck_size().unwrap(), ty.type_size().unwrap());
+            let t = TensorInfo {
+                name: name.into(),
+                ty,
+                dims: vec![k, 64],
+                offset: 0,
+                nbytes: k / block * size * 64,
+            };
+            assert_eq!(part_format(&t).unwrap().1, bytes, "{name} {ty} k={k}");
+            assert_eq!(upload_budget(&t), bytes, "{name} {ty} k={k}");
+        }
     }
 
     /// The head is `output.weight` when the file has it, the token embedding
