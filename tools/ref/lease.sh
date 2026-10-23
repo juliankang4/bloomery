@@ -1244,10 +1244,14 @@ EOF
     __lease_trace_waiter "$t/tlock4" "$t/trace3.log" 100.7 100
     check trace-waiter-no-duplicate "$(grep -c ' free id=100.7 ' "$t/trace3.log")" 2
     # A write that fails: one named line, the take goes on (rc 0, no id, no waiter).
+    # The slow-fork waiter's shared probe can still hold its lock.
+    exec 8>"$t/tlock3"
+    flock -s 8 || exit 70
     BLOOMERY_LEASE_TRACE=$t/no-such-dir/trace.log
     export BLOOMERY_LEASE_TRACE
     RC=0
-    (exec 9>"$t/tlock3" && flock -n 9 && lease_trace_take 2> "$t/err" && echo "id=[$LEASE_TRACE_ID]" > "$t/out") || RC=$?
+    (exec 9>"$t/tlock5" && flock -n 9 && lease_trace_take 2> "$t/err" && echo "id=[$LEASE_TRACE_ID]" > "$t/out") || RC=$?
+    exec 8>&-
     check trace-write-fail-rc "$RC" 0
     check trace-write-fail-lines "$(wc -l < "$t/err" | tr -d '[:space:]')" 1
     case $(cat "$t/err") in

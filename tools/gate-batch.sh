@@ -1973,7 +1973,11 @@ HK
   rc=$(BLOOMERY_BATCH_START_HOOK="$t/hk/no-such-hook" steal_case hook-m "plain-any	B	a6000	5	$d" -- plain-any)
   printf '%s' "$rc" > "$t/rc-hook-m"
   rc_ok 'start hook: a hook that is not there leaves the batch green' hook-m 1
-  want_count 'start hook: and is one stderr line with the shell'"'"'s 127' "$t/out-hook-m.log" '^gate-batch: start hook \(rc=127\): .*no-such-hook' 1
+  want_count 'start hook: and is one stderr line with the shell'"'"'s 127' "$t/out-hook-m.log" '^gate-batch: start hook \(rc=127\): .' 1
+  want 'start hook: the full log names the missing command' "$t/target/c-hook-m/start-hook.log" 'no-such-hook'
+  IFS= read -r hook_line < "$t/target/c-hook-m/start-hook.log"
+  check 'start hook: the summary keeps at most 200 characters of its first line' 0 '^$' test \
+    "$(grep '^gate-batch: start hook (rc=127): ' "$t/out-hook-m.log")" "gate-batch: start hook (rc=127): ${hook_line:0:200}"
   rc=$(BLOOMERY_BATCH_START_HOOK='   ' steal_case hook-b "plain-any	B	a6000	5	$d" -- plain-any)
   printf '%s' "$rc" > "$t/rc-hook-b"
   rc_ok 'start hook: a value of blanks leaves the batch green' hook-b 1
