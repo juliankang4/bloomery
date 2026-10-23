@@ -36,6 +36,10 @@ pub mod profile;
 pub mod quant;
 pub mod r8file;
 
+#[cfg(test)]
+#[path = "../tests/common/process.rs"]
+mod test_process;
+
 pub use ops::{Tensor2, Tensor2View};
 
 /// Which sequence and which position a token occupies. See decision 2 above — this pair is

@@ -3651,25 +3651,13 @@ mod tests {
     /// refuses it too.
     #[test]
     fn host_layer_build_refuses_a_qdot_lever_value_by_name() {
-        // The fresh process's own argument: a filter no test's name is.
-        const FRESH: &str = "a-fresh-process-for-the-qdot-lever";
-        if !std::env::args().any(|a| a == FRESH) {
-            let (_, tests) = module_path!().split_once("::").expect("a crate path");
-            let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-                .args([
-                    "--exact",
-                    &format!("{tests}::host_layer_build_refuses_a_qdot_lever_value_by_name"),
-                    FRESH,
-                ])
-                .env("BLOOMERY_QDOT_AVX512", "2")
-                .output()
-                .expect("the fresh process");
-            assert!(
-                out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
-                "the fresh process: {}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
+        if !crate::test_process::in_process(
+            concat!(
+                module_path!(),
+                "::host_layer_build_refuses_a_qdot_lever_value_by_name"
+            ),
+            ("BLOOMERY_QDOT_AVX512", "2"),
+        ) {
             return;
         }
         let (embd, ff, n_expert) = (256, 256, 2);

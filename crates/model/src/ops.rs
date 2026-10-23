@@ -6945,29 +6945,23 @@ mod ccd_tests {
     )]
     #[test]
     fn a_ccd_dispatch_returns_the_error_of_the_lowest_failing_run() {
+        if !crate::test_process::in_process(
+            concat!(
+                module_path!(),
+                "::a_ccd_dispatch_returns_the_error_of_the_lowest_failing_run"
+            ),
+            ("BLOOMERY_THREADS", "8"),
+        ) {
+            return;
+        }
+        assert_eq!(threads::pool().threads(), 8);
         let pool = threads::pool();
-        assert!(pool.threads() >= 4, "needs a pool of 4 or more threads");
         let map = CcdMap::new(pool.threads(), 2, 0);
-        // A lane of CCD 0 that crosses from one pair into the next, and the
-        // first unit of CCD 1's first lane, which lies between the lane's
-        // first unit and its second run.
-        let found = (30..200usize).find_map(|n| {
-            let set = Pairs::new(&[n; 3], &[1; 3], true);
-            let cut = CcdCut::of(&set, map, true);
-            let low = cut.first_unit(&set, map.first_lane(1), 0);
-            (0..map.first_lane(1)).find_map(|lane| {
-                let mut runs = Vec::new();
-                cut.for_each_run(&set, 0, cut.bounds[lane]..cut.bounds[lane + 1], |p, u| {
-                    runs.push(set.start(p) + u.start);
-                    Ok::<(), ()>(())
-                })
-                .unwrap();
-                (runs.len() >= 2 && runs[0] < low && low < runs[1]).then(|| (n, runs[1], low))
-            })
-        });
-        let (n, high, low) = found.expect("some lane of CCD 0 crosses a pair");
+        // Five pairs over four lanes per CCD put units 0 and 16 in CCD 0's first lane,
+        // with unit 8 in CCD 1's first lane between them in the set's order.
+        let (high, low) = (16, 8);
         for lvl in [0, 1] {
-            let mut set = Pairs::new(&[n; 3], &[1; 3], true);
+            let mut set = Pairs::new(&[16; 5], &[1; 5], true);
             set.fail = vec![high, low];
             let mut acc = profile::CallAcc::new();
             let err = run_row_pool_with(&set, lvl, &mut acc, true, Lanes::Ccd(map), false)
@@ -6991,12 +6985,18 @@ mod ccd_tests {
     )]
     #[test]
     fn a_profiled_ccd_dispatch_counts_busy_time_by_participant() {
+        if !crate::test_process::in_process(
+            concat!(
+                module_path!(),
+                "::a_profiled_ccd_dispatch_counts_busy_time_by_participant"
+            ),
+            ("BLOOMERY_THREADS", "8"),
+        ) {
+            return;
+        }
+        assert_eq!(threads::pool().threads(), 8);
         let pool = threads::pool();
         let ccds = 4;
-        assert!(
-            pool.threads() >= 2 * ccds,
-            "needs a pool of 8 or more threads"
-        );
         let map = CcdMap::new(pool.threads(), ccds, 0);
         // The first lane whose participant is neither the lane nor its CCD number: a table indexed
         // by sorted position or by CCD puts the time under another index.

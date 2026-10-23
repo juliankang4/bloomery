@@ -1121,14 +1121,24 @@ mod tests {
                 );
             }
         }
-        let e = config("nvidia__NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB").unwrap_err();
-        assert!(
-            e.to_string().contains(
-                "quant_algo IQ2_XXS for language_model.backbone.layers.1.mixer.experts.0.up_proj \
-                 is not a format"
+        let mut q =
+            fixture("nvidia__NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB__hf_quant_config.json").unwrap();
+        let layers = std::mem::take(&mut q["quantization"]["quantized_layers"]);
+        for (module, algo) in [
+            ("language_model.lm_head", "Q8_0"),
+            (
+                "language_model.backbone.layers.1.mixer.experts.0.up_proj",
+                "IQ2_XXS",
             ),
-            "{e}"
-        );
+        ] {
+            q["quantization"]["quantized_layers"] = serde_json::json!({ (module): layers[module] });
+            let e = Config::parse(&serde_json::json!({}), Some(&q)).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains(&format!("quant_algo {algo} for {module} is not a format")),
+                "{e}"
+            );
+        }
         for (entry, want) in [
             (
                 serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16, "weight_scale_encoding": "csf_64" }),
