@@ -1236,20 +1236,29 @@ fn stepunion_arm(
         }
         let before: Vec<_> = ids.iter().map(|&id| tier.route_count(layer, id)).collect();
         let pin = tier
-            .prefetch_pinned(layer, &ids[..2], Claim::Step, 4, Some(&[0, 4, 5]))?
+            .prefetch_pinned(
+                layer,
+                &ids[..2],
+                Claim::Step,
+                4,
+                Some((&[0, 4, 5], &[0, 1, 2, 3, 0])),
+            )?
             .wait()?;
         let decay = (-4.0f64 / 32.0).exp2();
-        let counts = ids
-            .iter()
-            .zip(before)
-            .zip([4.0, 1.0, 0.0])
-            .all(|((&id, before), added)| {
-                let (Some(before), Some(after)) = (before, tier.route_count(layer, id)) else {
-                    return false;
-                };
-                let want = before * decay + added;
-                before > 0.0 && after.is_finite() && (after - want).abs() <= 1e-12 * want
-            });
+        // PIN(2026-10-23): each selection decays from its original column.
+        let first = (-3.0f64 / 32.0).exp2();
+        let four: f64 = (0..4).map(|col| ((col as f64 - 3.0) / 32.0).exp2()).sum();
+        let counts =
+            ids.iter()
+                .zip(before)
+                .zip([four, first, 0.0])
+                .all(|((&id, before), added)| {
+                    let (Some(before), Some(after)) = (before, tier.route_count(layer, id)) else {
+                        return false;
+                    };
+                    let want = before * decay + added;
+                    before > 0.0 && after.is_finite() && (after - want).abs() <= 1e-12 * want
+                });
         drop(pin);
         counts
     } else {

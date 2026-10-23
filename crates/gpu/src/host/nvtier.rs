@@ -62,8 +62,9 @@
 //! `SwapSource::release_host`), so every demotion fills. A victim's fill runs
 //! on the tier's fill reader at the victim rank, behind every queued prompt
 //! batch ([`NvTier::ensure_victim`]), and never on the pool, whose one
-//! dispatch mutex is the chain's: beside the chain the lane takes only the
-//! books' lock, for claims, pins and publishes that wait on nothing.
+//! dispatch mutex is the chain's. Claims, pins and publishes take the books'
+//! lock; a lane's read entry also takes the drop queue lock, so a page
+//! release cannot overlap it.
 //!
 //! A call's claim kind ([`Claim`]) places what it takes in the books. A
 //! step's and a keep's slots take a fresh tick; a transient's enter at the
@@ -73,8 +74,8 @@
 //! transient slot as it is. Among the hot slots a miss takes the least
 //! recently used under `BLOOMERY_NVTIER_EVICT=tick` (unset), and under `heat`
 //! the one whose expert has the least decayed routing count ([`LayerCounts`],
-//! the least recently used among equal counts); a call's own ids are never
-//! its victims then. A batch pin ([`NvTier::pin`]) counts the ids
+//! the least recently used among equal counts). A call's own ids are never
+//! its victims under either policy. A batch pin ([`NvTier::pin`]) counts the ids
 //! of a batch in the same open-read counts a lane's read does, so the books
 //! take none of them until the guard drops. A prompt call's union claims
 //! each batch of its experts as one claim and pin ([`NvTier::prefetch_pinned`]):
