@@ -686,6 +686,10 @@ fn read_stream(addr: SocketAddr, body: &Value, seen: &Mutex<Vec<SeenChunk>>) {
         text.len()
     );
     s.write_all(req.as_bytes()).expect("write");
+    read_chunks(s, seen);
+}
+
+fn read_chunks(mut s: impl Read, seen: &Mutex<Vec<SeenChunk>>) {
     let mut held = String::new();
     let mut buf = [0u8; 8192];
     let mut head = true;
@@ -717,6 +721,36 @@ fn read_stream(addr: SocketAddr, body: &Value, seen: &Mutex<Vec<SeenChunk>>) {
                 .push((Instant::now(), slot, last, v));
         }
     }
+}
+
+#[test]
+fn stream_chunks_preserve_utf8() {
+    let first = json!({"id_slot": 0, "stop": false, "content": "가é🦀"});
+    let last = json!({"id_slot": 0, "stop": true, "content": "끝"});
+    let raw = format!("HTTP/1.0 200 OK\r\n\r\ndata: {first}\n\ndata: {last}\n\n");
+    for at in 0..=raw.len() {
+        let seen = Mutex::new(Vec::new());
+        read_chunks(raw.as_bytes()[..at].chain(&raw.as_bytes()[at..]), &seen);
+        let seen = seen.into_inner().expect("seen");
+        assert_eq!(seen.len(), 2, "split at {at}");
+        assert_eq!(seen[0].3, first, "split at {at}");
+        assert_eq!(seen[1].3, last, "split at {at}");
+    }
+}
+
+#[test]
+fn stream_chunks_refuse_invalid_or_incomplete_frames() {
+    let mut accepted = Vec::new();
+    for raw in [
+        &b"HTTP/1.0 200 OK\r\n"[..],
+        &b"HTTP/1.0 200 OK\r\n\r\ndata: {\"id_slot\":0"[..],
+        &b"HTTP/1.0 200 OK\r\n\r\ndata: {\"id_slot\":0,\"stop\":true,\"content\":\"\xff\"}\n\n"[..],
+    ] {
+        if std::panic::catch_unwind(|| read_chunks(raw, &Mutex::new(Vec::new()))).is_ok() {
+            accepted.push(raw);
+        }
+    }
+    assert!(accepted.is_empty(), "accepted invalid stream: {accepted:?}");
 }
 
 /// The slots of the drafted passes in engine-call order: each pass pairs with

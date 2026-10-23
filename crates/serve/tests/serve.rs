@@ -1255,9 +1255,20 @@ fn spawn_mock(
     std::net::SocketAddr,
     std::sync::mpsc::Receiver<String>,
 ) {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_bloomery-serve"));
+    command.args(args);
+    spawn_command(&mut command)
+}
+
+fn spawn_command(
+    command: &mut std::process::Command,
+) -> (
+    Reaped,
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<String>,
+) {
     use std::io::BufRead;
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bloomery-serve"))
-        .args(args)
+    let mut child = command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1279,6 +1290,42 @@ fn spawn_mock(
         .and_then(|(_, a)| a.parse().ok())
         .unwrap_or_else(|| panic!("no address in {first:?}"));
     (Reaped(child), addr, rx)
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_failed_startup_reaps_its_child() {
+    let dir = common::fresh_dir("failed-startup");
+    let pidfile = dir.join("child.pid");
+    let mut leaked = Vec::new();
+    for failure in ["bad-address", "closed-stderr"] {
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "echo $$ > \"$1\"; if [ \"$2\" = bad-address ]; then echo invalid-startup >&2; else exec 2>&-; fi; read line",
+            "startup-fixture",
+        ]);
+        command
+            .arg(&pidfile)
+            .arg(failure)
+            .stdin(std::process::Stdio::piped());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                spawn_command(&mut command)
+            }))
+            .is_err(),
+            "{failure} must refuse startup"
+        );
+        let pid = std::fs::read_to_string(&pidfile).expect("child pid");
+        if std::path::Path::new(&format!("/proc/{}", pid.trim())).exists() {
+            leaked.push(failure);
+        }
+    }
+    common::drop_dir(&dir);
+    assert!(
+        leaked.is_empty(),
+        "startup left unreaped children: {leaked:?}"
+    );
 }
 
 #[test]
