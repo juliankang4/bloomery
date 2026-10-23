@@ -1603,8 +1603,10 @@ mod tests {
         let got = render(&start("10"), UTF8).unwrap();
         assert!(got.contains("▓ tier"), "{got}");
         assert!(got.contains(&"▓".repeat(11)), "{got}");
+        assert!(got.contains(&format!("{}10 experts\n", row("tier"))), "{got}");
         let got = render(&start("lots"), UTF8).unwrap();
         assert!(!got.contains(&row("experts")), "{got}");
+        assert!(!got.contains(&row("tier")), "{got}");
         assert!(got.contains("load: a value is no number"), "{got}");
     }
 
