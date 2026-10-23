@@ -25,7 +25,7 @@ while [ $# -gt 2 ]; do
     *) echo "batch-replay: unknown option '$1'" >&2; exit 64 ;;
   esac
 done
-[ $# = 2 ] || { echo "usage: tools/batch-replay.sh [--scale N] [--base REV] LIST RUNLOG" >&2; exit 64; }
+[ $# = 2 ] || { echo "usage: tools/batch-replay.sh [--scale N] [--base REV] [--out DIR] LIST RUNLOG" >&2; exit 64; }
 case $SCALE in '' | *[!0-9]* | 0) echo "batch-replay: --scale is a whole number from 1, got '$SCALE'" >&2; exit 64 ;; esac
 LIST=$1 RUNLOG=$2
 [ -f "$LIST" ] || { echo "batch-replay: $LIST: not a file" >&2; exit 64; }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The one unit runner and the one commit label: a library, sourced by tools/nightly/run.sh (the nightly host run) and
 # tools/contrib-check.sh (a contributor's off-box check), and, for the label alone, by tools/gate-batch.sh,
-# tools/ptx-compare.sh and tools/narrow-scan.sh. A unit is a `name<TAB>command` line of `python3 tools/recipes.py
+# tools/ptx-compare.sh and tools/narrow-scan.sh. Output directory ownership is shared by gate-batch.sh and batch-replay.sh.
+# A unit is a `name<TAB>command` line of `python3 tools/recipes.py
 # host-nightly`, or any command a caller names; this file runs one and reads its outcome, and a caller decides what to do
 # with it.
 #

@@ -2,6 +2,7 @@
 # `bash tools/nightly/selftest.sh --self-test`: the commit label of tools/nightly/units.sh (`tree_commit`) and the two scripts
 # that print it, tools/contrib-check.sh and tools/nightly/run.sh, and `archive_tree`, on temp repositories. No card, no box, no cargo, no network.
 # One line per check, `ok <name>` or `FAIL <name>: got … want …`, the verdict last (bash 3.2 on the Mac).
+# --output-only checks the production output-allocation and receipt blocks without running any units.
 #
 # What it blocks: a `git status` that fails (a corrupt index, an unreadable tree) prints nothing, and a test of that output
 # reads nothing as a clean tree. A run on such a tree then published its HEAD as the commit it tested, without `+local`, and went
@@ -47,6 +48,10 @@ with tempfile.TemporaryDirectory(prefix="output-owner-") as tmp:
     gate = (root / "tools/gate-batch.sh").read_text()
     end = gate.index('RUNLOG=$OUT/run.log')
     gate = gate[gate.rfind('if [ "$DRY" = 0 ]; then', 0, end):end]
+    body = common + 'OUT_AUTO=1; ' + gate + '\nprintf "%s\\n" "$OUT"'
+    a, b = (run(body, root, t / "automatic") for _ in range(2))
+    check("gate-batch automatic outputs stay private",
+          a.returncode == b.returncode == 0 and a.stdout != b.stdout, (a.stdout + b.stdout).strip())
     replay = (root / "tools/batch-replay.sh").read_text()
     begin = replay.index('WORK=$(mktemp ')
     replay_out = replay[begin:replay.index('# The measured seconds,')]

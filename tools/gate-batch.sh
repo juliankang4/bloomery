@@ -297,7 +297,7 @@
 # the caller's BLOOMERY_REMOTE, so box.sh's remote is that directory's basename: a tree it already
 # holds is not synced, and rsync never sends target/, so the binary already built there is the one
 # the recheck runs. The batch's own rc does not change.
-# DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp> (<tree> the
+# DIR defaults to $HOME/.cache/bloomery/batches/<tree>/<stamp>.<unique> (<tree> the
 # basename of this worktree's root): outside every tree, so the logs survive a `rm -rf target/`
 # cleanup of the worktrees and neither mark a tree dirty nor reach box.sh's rsync. An explicit
 # --out is still taken: under the tree's target/ it is gitignored and accepted, a DIR inside the
@@ -4061,7 +4061,7 @@ if [ "${1:-}" = --self-test ]; then
     *) die "--self-test takes nothing else, or --part K|all; $USAGE" ;;
   esac
 fi
-OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD=''
+OUT='' OUT_AUTO=0 SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD=''
 CANARY=1 RED_MAIN=0
 ITEMS=()
 while [ $# -gt 0 ]; do
