@@ -2002,9 +2002,12 @@ mod gate {
 
     /// Whether every request of `together` answered ids, each the ids of the
     /// same request in `alone`.
-    fn ids_as_alone(alone: &[Option<Streamed>], together: &[Option<Streamed>]) -> bool {
+    fn ids_as_alone<'a>(
+        alone: impl ExactSizeIterator<Item = &'a Option<Streamed>>,
+        together: &[Option<Streamed>],
+    ) -> bool {
         alone.len() == together.len()
-            && alone.iter().zip(together).all(|(a, t)| {
+            && alone.zip(together).all(|(a, t)| {
                 a.as_ref()
                     .zip(t.as_ref())
                     .is_some_and(|(a, t)| !t.tokens.is_empty() && a.tokens == t.tokens)
@@ -2233,14 +2236,7 @@ mod gate {
         check(
             &mut ok,
             "slots_alone_ids_stay",
-            together[0].as_ref().is_some_and(|t| !t.tokens.is_empty())
-                && together[1].as_ref().is_some_and(|t| !t.tokens.is_empty())
-                && alone[0]
-                    .as_ref()
-                    .is_some_and(|a| a.tokens == together[0].as_ref().unwrap().tokens)
-                && alone[1]
-                    .as_ref()
-                    .is_some_and(|a| a.tokens == together[1].as_ref().unwrap().tokens),
+            ids_as_alone(alone.iter(), &together),
         );
         check(
             &mut ok,
@@ -2927,15 +2923,7 @@ mod gate {
                 late[0].as_ref().map_or(0, |s| s.tokens.len()),
                 late[1].as_ref().map_or(0, |s| s.tokens.len()),
             );
-            check(
-                &mut ok,
-                name,
-                late.iter().zip(want).all(|(l, a)| {
-                    l.as_ref()
-                        .zip(a.as_ref())
-                        .is_some_and(|(l, a)| !l.tokens.is_empty() && l.tokens == a.tokens)
-                }),
-            );
+            check(&mut ok, name, ids_as_alone(want.into_iter(), &late));
         }
         Ok(ok)
     }
@@ -2958,7 +2946,7 @@ mod gate {
         ignore_eos: bool,
     ) -> Result<bool, GateError> {
         let mut ok = true;
-        let alone = vec![
+        let alone = [
             answer(
                 name,
                 sampled_stream(addr, ids[0], SLOTS_PREDICT, ignore_eos)?,
@@ -3003,7 +2991,7 @@ mod gate {
         check(
             &mut ok,
             &format!("{name}_together_alone"),
-            ids_as_alone(&alone, &together),
+            ids_as_alone(alone.iter(), &together),
         );
         Ok(ok)
     }
@@ -3020,6 +3008,10 @@ mod gate {
     /// to has no refresh to propose from, refused by name), and some are
     /// accepted
     /// (`slots_drafted_sampled_tail_accepts`, which the fixture tier defers).
+    /// Refused by name before either check unless the short request answered
+    /// its [`DRAFTED_SAMPLED_SHORT`] ids and a `slots round` record of the
+    /// tail run is one `step` pass of both rows: the tail checks hold only
+    /// for a long request whose rows rode a pass beside the short one.
     fn slots_drafted_sampled(
         addr: &str,
         err_log: &Path,
@@ -3031,6 +3023,7 @@ mod gate {
             sampled_stream(addr, ids[0], SLOTS_PREDICT, false)?,
             "alone long",
         )?;
+        let before = seat_log(err_log)?.all(&record::SLOTS_ROUND)?.len();
         let runs = vec![
             (
                 sampled_stream(addr, ids[0], SLOTS_PREDICT, false)?,
@@ -3041,7 +3034,22 @@ mod gate {
                 "tail short",
             ),
         ];
-        let tail = answers("slots-drafted-sampled", runs)?.remove(0);
+        let mut tail = answers("slots-drafted-sampled", runs)?;
+        let short = tail
+            .pop()
+            .flatten()
+            .ok_or("sampled tail: short request failed")?;
+        if short.tokens.len() != DRAFTED_SAMPLED_SHORT {
+            return Err("sampled tail: short request ended before its requested length".into());
+        }
+        let rounds = seat_log(err_log)?.all(&record::SLOTS_ROUND)?;
+        let shared = rounds.iter().skip(before).any(|r| {
+            r.word("cmd") == Ok("step") && r.u64("rows") == Ok(2) && r.u64("passes") == Ok(1)
+        });
+        if !shared {
+            return Err("sampled tail: no shared plain round exercised the refresh".into());
+        }
+        let tail = tail.remove(0);
         // Proposals an id the request could draft: every id alone, the ids
         // past the short request's on the tail.
         let per_id = |s: &Streamed, from: usize| {
