@@ -9,7 +9,7 @@
 //! [`bind::step_rows_in_turn`]: bloomery_gpu_gates::bind::step_rows_in_turn
 //! [`bind::pass_rows_in_turn`]: bloomery_gpu_gates::bind::pass_rows_in_turn
 
-use app::mtp::{MtpBody, SlotWindow};
+use app::mtp::{MtpBody, SlotWalks, SlotWindow};
 use bloomery_gpu::model::SlotRows;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{Seat, SlotPassRow, SlotStep, pass_rows_in_turn, step_rows_in_turn};
@@ -165,11 +165,12 @@ where
 /// One round of several slots' plain steps on a load that drafts with the
 /// MTP draft as passes of `GpuModel::step_slots` ([`step_rows_one_pass`]),
 /// each slot's draft told of its row as a step alone tells it: before the
-/// pass, on each row's slot, [`SlotDrafts::before_row`] (the rows its draft
-/// left waiting walked, the pass overwriting the arena they read); after
-/// it [`SlotDrafts::after_row`] with the position the row ran from and its
-/// answer (the next refresh the row's, its hidden row in the pass's arena,
-/// which no later pass of the round overwrites: a round past
+/// pass, on each row's slot, [`SlotDrafts::gather_row`] (shared prompt rows
+/// walked now, step and verify rows gathered), then the gathered rows in one
+/// store walk ([`SlotWalks::run`], the pass overwriting the arenas they
+/// read); after it [`SlotDrafts::after_row`] with the position the row ran
+/// from and its answer (the next refresh the row's, its hidden row in the
+/// pass's arena, which no later pass of the round overwrites: a round past
 /// [`SlotRows::MAX_ROWS`] rows runs the pass that holds slot 0 last,
 /// [`app::Session::step_slots_rounds`]).
 /// A slot whose draft is off rides the pass as a plain row its draft is
@@ -189,11 +190,13 @@ where
     Window<M>: Widths,
 {
     let mut p0 = Vec::with_capacity(rows.len());
+    let mut walks = SlotWalks::default();
     for r in rows.iter() {
         s.select_slot(r.slot)?;
         p0.push(s.pos());
-        drafts.before_row(s, r.slot, r.last)?;
+        drafts.gather_row(s, r.slot, r.last, &mut walks)?;
     }
+    walks.run(s)?;
     let passes = step_rows_one_pass(s, rows)?;
     for (r, &p) in rows.iter().zip(&p0) {
         drafts.after_row(r.slot, p, r.last, r.next)?;

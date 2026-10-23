@@ -231,8 +231,9 @@ inside the one model, switched by pointer exchange: nothing parks, and each roun
 token or one drafted pass. Where the body runs several slots' rows as one pass, the round reads the weights once for
 all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 and MiMo-V2.6-Flash (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
 request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows).
-Qwen3.8 also batches sampled steps on a drafting load. A Qwen3.8 step or verify round that leaves an enabled slot 0
-draft out runs each slot in turn, keeping slot 0's waiting hidden rows intact across the two kinds of call. A
+Qwen3.8 also batches sampled steps on a drafting load, with every slot's draft brought up to date in one draft pass
+before the round's pass. A Qwen3.8 step or verify round that leaves an enabled slot 0 draft out runs each slot in
+turn, keeping slot 0's waiting hidden rows intact across the two kinds of call. A
 placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 load, V4.1 with the
 lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
@@ -310,8 +311,8 @@ than the plan without it, a set `--ctx-size`/`--ctx` included, a `draft yield` r
 card bytes and the positions a slot gets either way, and the context line that follows is the plain plan's.
 `BLOOMERY_DRAFT=mtp` keeps it on whatever the context. On Qwen3.8 an unset MTP draft also stays off under
 `--parallel` above 1, from a GGUF draft file and a checkpoint folder alike: a drafted server runs a round of sampled or
-id-banning requests as one pass, as a plain server does, but also walks each slot's draft over its row, one slot
-after another. `BLOOMERY_DRAFT=mtp` drafts on any slot count. The
+id-banning requests as one pass, as a plain server does, but also walks every slot's draft over its row, one store
+walk beside the pass. `BLOOMERY_DRAFT=mtp` drafts on any slot count. The
 drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
 (the default, temperature 0.8 as in llama-server) and on ones that ban an id (`ignore_eos`) while one request runs:
 each kept id is the request's own draw from its verified row (its sampler's, or the argmax, with every banned id's

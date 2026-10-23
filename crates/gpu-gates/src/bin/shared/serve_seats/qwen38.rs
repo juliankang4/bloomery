@@ -250,7 +250,7 @@
 //! above 1, whatever its source ([`draft_for_slots`]: a `load draft=off`
 //! record naming the slots): a drafted load runs a round of sampled or
 //! id-banning requests as one pass, as a plain load does, and also walks
-//! each slot's draft over its row, one slot after another. Unset, the draft
+//! every slot's draft over its row, one store walk beside the pass. Unset, the draft
 //! then yields to the context
 //! (`bloomery_levers::RungCost::of`, at [`ctx38`]'s caller): it goes off
 //! when the plan with it leaves a slot fewer positions than the plan
@@ -939,10 +939,10 @@ pub(crate) fn draft_off_for(
 
 /// [`draft38`]'s answer `(mtp, off)` with `slots` resident sequences, whatever the draft's
 /// source (a GGUF draft file or a checkpoint folder's MTP layer): a draft the unset rule would
-/// have run goes off on more than one slot ([`Draft38Off::Slots`]), as a drafted load walks each
-/// slot's draft over its row of a round of sampled or id-banning requests, one slot after
-/// another, beside the round's one pass (`rounds::step_rows_drafted`); a set word runs as set,
-/// and a reason the draft was already off for stands.
+/// have run goes off on more than one slot ([`Draft38Off::Slots`]), as a drafted load walks every
+/// slot's draft over its row of a round of sampled or id-banning requests, one store walk beside
+/// the round's one pass (`rounds::step_rows_drafted`); a set word runs as set, and a reason the
+/// draft was already off for stands.
 pub(crate) fn draft_for_slots(
     slots: usize,
     word: Option<&str>,

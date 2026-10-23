@@ -35,10 +35,10 @@
 //! ([`SlotDrafts::lookup`]) and the served draft (`served::ServedDraft`)
 //! alike.
 
-use app::mtp::{MtpBody, MtpDraft, Parked};
+use app::mtp::{MtpBody, MtpDraft, Parked, SlotWalks};
 use app::{Keep, Prompt, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
-use bloomery_gpu::model::{Rollback, Rows};
+use bloomery_gpu::model::{Rollback, Rows, Slots};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
 use runtime::width::{Choosing, Chosen, Clock, Mode as WidthMode, Wall};
@@ -710,11 +710,11 @@ where
         Ok(next)
     }
 
-    /// What a plain row of `last` on `slot`, the session's selected one, does
-    /// to the slot's draft before the target runs it, a step's or a row of a
-    /// pass of several slots' ([`SlotDrafts::after_row`]): an off draft's
-    /// record, once; under the draft the chooser's passes closed out, the
-    /// rows the draft left waiting walked with `last` their last
+    /// What a plain step of `last` on `slot`, the session's selected one,
+    /// does to the slot's draft before the target runs it (a row of a pass of
+    /// several slots gathers instead, [`SlotDrafts::gather_row`]): an off
+    /// draft's record, once; under the draft the chooser's passes closed
+    /// out, the rows the draft left waiting walked with `last` their last
     /// ([`MtpDraft::before_step`]: the target's call overwrites the arena
     /// they read) and the join record. Refused as [`SlotDrafts::has`].
     pub(crate) fn before_row(
@@ -723,13 +723,25 @@ where
         slot: usize,
         last: u32,
     ) -> Result<(), GateError> {
+        self.before_row_by(s, slot, |d, s| d.before_step(s, last))
+    }
+
+    /// [`SlotDrafts::before_row`]'s records around `walk`, the call that
+    /// catches the slot's draft up: an off draft's record, once; under the
+    /// draft, the chooser's passes closed out, `walk`, then the join record.
+    fn before_row_by(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        walk: impl FnOnce(&mut MtpDraft<B>, &mut Session<B>) -> Result<(), SessionError>,
+    ) -> Result<(), GateError> {
         if matches!(self.off.get(slot), Some(Some((_, false)))) {
             self.print_off(s, slot);
         }
         let drafting = !self.is_off(slot);
         if let Some(spec) = self.spec_mut(slot)?.filter(|_| drafting) {
             print_widths(spec);
-            spec.draft_mut().draft_mut().before_step(s, last)?;
+            walk(spec.draft_mut().draft_mut(), s)?;
             print_join(spec);
         }
         Ok(())
@@ -929,6 +941,27 @@ where
         &mut Vec<usize>,
     ) {
         (&mut self.specs, &mut self.batch, &mut self.widths)
+    }
+}
+
+impl<B: MtpBody + Slots, const M: usize> SlotDrafts<B, M>
+where
+    B::Seq: 'static,
+    Window<M>: Widths,
+{
+    /// [`SlotDrafts::before_row`] on `slot`, the session's selected one, the
+    /// draft caught up through [`MtpDraft::gather`]: shared prompt rows
+    /// walked now, step and verify rows gathered into `walks` for one store
+    /// walk of the round's gathered rows ([`SlotWalks::run`]) before its
+    /// pass. Refused as [`SlotDrafts::has`].
+    pub(crate) fn gather_row(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        last: u32,
+        walks: &mut SlotWalks<B>,
+    ) -> Result<(), GateError> {
+        self.before_row_by(s, slot, |d, s| d.gather(s, last, walks))
     }
 }
 

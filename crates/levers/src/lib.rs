@@ -2068,8 +2068,8 @@ pub enum Draft38Off {
     /// one, whatever the draft's source (a GGUF draft file or a checkpoint
     /// folder's MTP layer): a drafted load runs a round of sampled or
     /// id-banning requests as one pass, as a plain load does, and also walks
-    /// each slot's draft over its row, one slot after another; a set
-    /// [`DRAFT`]`=mtp` runs.
+    /// every slot's draft over its row, one store walk beside the pass; a
+    /// set [`DRAFT`]`=mtp` runs.
     Slots { slots: usize },
 }
 

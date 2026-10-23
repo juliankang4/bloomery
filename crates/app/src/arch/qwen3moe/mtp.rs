@@ -65,6 +65,16 @@ impl MtpBody for Body38 {
         m.mtp_walk(DraftFeed::Rows(feed), head, mode)
     }
 
+    /// One store walk of every slot's rows at once
+    /// ([`Qwen38Model::mtp_store_slots`]).
+    fn store_slots(
+        m: &mut Qwen38Model,
+        walks: &[(usize, Feed<'_, TargetRows>)],
+        head: DraftHead,
+    ) -> Result<(), GpuError> {
+        m.mtp_store_slots(walks, head)
+    }
+
     fn chain(
         m: &mut Qwen38Model,
         refresh: Feed<'_, TargetRows>,

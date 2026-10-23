@@ -87,7 +87,13 @@
 //!
 //! Each op computes a row's values from that row's inputs alone, so a
 //! row's keys and values do not depend on the walk it lands in or on its
-//! neighbours. Against an [`WalkMode::Eager`] walk, which reads the f32
+//! neighbours. A store walk of several resident sequences' rows (the
+//! body's `mtp_store_slots`, a round's waiting rows) rests on it: each
+//! sequence's rows are checked and staged on that sequence as a block of
+//! the store arena's rows ([`StoreBlock`]), the launches run once over
+//! every block, the embedding a block at its own positions, and each
+//! block's norm and append go into its own sequence's store. Against an
+//! [`WalkMode::Eager`] walk, which reads the f32
 //! rows, the three projections read q8 activations: the two stores agree to
 //! the error of that quantization and are not bit-equal.
 //!
@@ -120,7 +126,7 @@ use crate::q8f32::{
 use crate::q38::{EmbedArgs, EmbedRows, OutGateArgs, SLOTS, SharedAddArgs, W_PITCH};
 use crate::rope_neox::PartialNeoxArgs;
 use crate::site::{self, WideIn, WideKernels};
-use crate::tensor::{Q8Act, WindowMut};
+use crate::tensor::{Q8Act, Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -902,6 +908,49 @@ pub(super) struct Target38<'a> {
     pub(super) held: Held38,
 }
 
+/// One sequence's rows of a store walk ([`Mtp38::store_rows`]): rows
+/// `at .. at + m` of the store arena, at positions `pos0 ..` of their
+/// sequence. A walk of one sequence is one block at row 0; a store walk of
+/// several sequences' rows (`Body38`'s `mtp_store_slots`) lays a block a
+/// sequence, each appended to its own store ([`Mtp38::append_store`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StoreBlock {
+    at: usize,
+    m: usize,
+    pos0: u32,
+}
+
+/// A walk's hidden rows `hidden` copied into `h`, a row for each of its
+/// rows: the host's, or the target's streams `src` from their row `first`.
+fn copy_hidden(
+    stream: &CudaStream,
+    h: &mut DeviceBuffer<f32>,
+    hidden: Hidden<'_, TargetRows>,
+    src: Option<(&DeviceBuffer<f32>, usize)>,
+) -> Result<(), GpuError> {
+    match (hidden, src) {
+        (Hidden::Host(v), _) => h.copy_from_host(stream, v)?,
+        (Hidden::Target { .. }, Some((t, first))) => {
+            let src = Window::<f32>::of(t, first * WIDE * size_of::<f32>(), h.len())?;
+            h.copy_from_device_async(&src, stream)?;
+        }
+        (Hidden::Target { .. }, None) => {
+            return Err(GpuError::state(WHAT, "the target's streams to copy"));
+        }
+    }
+    Ok(())
+}
+
+/// A walk's rows as [`Mtp38::checked`] passed them: their count and first
+/// position, the call's rows (`None` for the draft's own row) and the
+/// target's streams their hidden rows copy from, with the row they start at.
+struct Checked<'f, 't> {
+    m: usize,
+    pos0: u32,
+    rows: Option<Feed<'f, TargetRows>>,
+    src: Option<(&'t DeviceBuffer<f32>, usize)>,
+}
+
 /// A captured walk's key: its rows, whether it reads its own last row, its
 /// head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1589,11 +1638,70 @@ impl Mtp38 {
     ) -> Result<usize, GpuError> {
         let stream = c.gpu.stream();
         head.check_opened(WHAT, self.head.rows.is_some())?;
-        let ctx = self.ctx;
         let taps_on = self.arena_ref()?.taps.is_some();
         if mode == WalkMode::Graph && taps_on {
             return Err(GpuError::state(WHAT, "the taps off for a captured walk"));
         }
+        let w = self.checked(target, feed, mode)?;
+        let (m, pos0) = (w.m, w.pos0);
+        if mode == WalkMode::Store {
+            let b = StoreBlock { at: 0, m, pos0 };
+            self.stage_hidden(stream, &w, b)?;
+            let ids = w.rows.map_or(&[][..], |f| f.tokens);
+            self.store_rows(c, ids, &[b], w.rows.is_none())?;
+            self.append_store(c, b)?;
+            return Ok(m);
+        }
+        let own = w.rows.is_none();
+        let a = self.arena()?;
+        match w.rows {
+            Some(f) => {
+                put_input(a.inbox.host_mut()?, f.tokens, pos0)?;
+                a.inbox.upload(stream, IN_IDS + m)?;
+                let mut h = WindowMut::<f32>::of_mut(&mut a.h_in, 0, m * WIDE)?;
+                copy_hidden(stream, &mut h, f.hidden, w.src)?;
+            }
+            None => {
+                put_input(a.inbox.host_mut()?, &[], pos0)?;
+                a.inbox.upload(stream, IN_IDS)?;
+            }
+        }
+        let key = MtpKey { m, own, head };
+        if mode == WalkMode::Graph {
+            let mut graphs = std::mem::take(&mut self.graphs);
+            let found = graphs.iter().position(|(k, _)| *k == key);
+            let r = match found {
+                Some(i) => Ok(i),
+                None => Graph::capture(stream, |_| self.walk(c, key)).map(|g| {
+                    graphs.push((key, g));
+                    graphs.len() - 1
+                }),
+            };
+            let launched = r.and_then(|i| graphs[i].1.launch(stream));
+            self.graphs = graphs;
+            launched?;
+        } else {
+            self.walk(c, key)?;
+        }
+        self.last = Some((m, head));
+        self.held = pos0 as usize + m;
+        Ok(m)
+    }
+
+    /// `feed`'s rows checked for a walk in `mode` on this sequence, before
+    /// anything moves ([`Mtp38::run_walk`]'s refusals): rows outside the
+    /// mode's 1..=rows, positions past the store, an own row before any
+    /// walk of this sequence, a walk starting past the positions the store
+    /// holds, a token past the vocabulary, a host hidden slice of other than
+    /// the rows' values, target rows that do not hold the positions before
+    /// the rows' ([`check_target_rows`]), media rows.
+    fn checked<'f, 't>(
+        &self,
+        target: Option<Target38<'t>>,
+        feed: DraftFeed<'f, TargetRows>,
+        mode: WalkMode,
+    ) -> Result<Checked<'f, 't>, GpuError> {
+        let ctx = self.ctx;
         let rows = media_free_rows(feed)?;
         let (m, own, pos0) = (feed.count(), rows.is_none(), feed.pos0());
         refuse_rows::<Mtp38>(WHAT, mode, m)?;
@@ -1638,63 +1746,60 @@ impl Mtp38 {
                 }
             }
         }
+        Ok(Checked { m, pos0, rows, src })
+    }
+
+    /// One sequence's rows of a store walk of several sequences' rows (the
+    /// body's `mtp_store_slots`), staged at rows `at ..` of the store arena:
+    /// `feed` checked as a store walk into `head` on this sequence, the live
+    /// one ([`Mtp38::checked`]), and its hidden rows copied in. Refused by
+    /// name as [`Mtp38::run_walk`] refuses a store walk, and for rows past
+    /// the store arena's [`MTP_STORE_ROWS`]; nothing but the arena's scratch
+    /// moves.
+    pub(super) fn stage_store(
+        &mut self,
+        stream: &CudaStream,
+        target: Option<Target38<'_>>,
+        feed: Feed<'_, TargetRows>,
+        head: DraftHead,
+        at: usize,
+    ) -> Result<StoreBlock, GpuError> {
+        head.check_opened(WHAT, self.head.rows.is_some())?;
+        let w = self.checked(target, DraftFeed::Rows(feed), WalkMode::Store)?;
+        if at + w.m > MTP_STORE_ROWS {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} rows from row {at} of a store walk of at most {MTP_STORE_ROWS} rows",
+                    w.m
+                ),
+            ));
+        }
+        let b = StoreBlock {
+            at,
+            m: w.m,
+            pos0: w.pos0,
+        };
+        self.stage_hidden(stream, &w, b)?;
+        Ok(b)
+    }
+
+    /// The hidden rows of `w`, a store walk's checked rows, copied into rows
+    /// `b.at ..` of the store arena's `h`; nothing for the own row, which the
+    /// walk reads in place.
+    fn stage_hidden(
+        &mut self,
+        stream: &CudaStream,
+        w: &Checked<'_, '_>,
+        b: StoreBlock,
+    ) -> Result<(), GpuError> {
+        let Some(f) = w.rows else {
+            return Ok(());
+        };
         let a = self.arena()?;
-        match rows {
-            Some(f) => {
-                let (tokens, hidden) = (f.tokens, f.hidden);
-                put_input(a.inbox.host_mut()?, tokens, pos0)?;
-                a.inbox.upload(stream, IN_IDS + m)?;
-                // SAFETY: `h_in` holds MTP_ROWS · WIDE values and the store
-                // arena's `h` MTP_STORE_ROWS · WIDE, and m is at most the
-                // mode's rows (checked above); the window lives for this copy.
-                let mut h = unsafe {
-                    match mode {
-                        WalkMode::Store => f32_view(&a.st.h, 0, m * WIDE),
-                        WalkMode::Eager | WalkMode::Graph => f32_view(&a.h_in, 0, m * WIDE),
-                    }
-                };
-                match (hidden, src) {
-                    (Hidden::Host(v), _) => h.copy_from_host(stream, v)?,
-                    (Hidden::Target { .. }, Some((t, first))) => {
-                        // SAFETY: rows first .. first + m lie inside `t` (checked
-                        // above); the window lives for this copy.
-                        let src = unsafe { f32_view(t, first * WIDE, m * WIDE) };
-                        h.copy_from_device_async(&src, stream)?;
-                    }
-                    (Hidden::Target { .. }, None) => {
-                        return Err(GpuError::state(WHAT, "the target's streams to copy"));
-                    }
-                }
-            }
-            None => {
-                put_input(a.inbox.host_mut()?, &[], pos0)?;
-                a.inbox.upload(stream, IN_IDS)?;
-            }
-        }
-        let key = MtpKey { m, own, head };
-        match mode {
-            WalkMode::Eager => self.walk(c, key)?,
-            WalkMode::Store => self.store_walk(c, m, own)?,
-            WalkMode::Graph => {
-                let mut graphs = std::mem::take(&mut self.graphs);
-                let found = graphs.iter().position(|(k, _)| *k == key);
-                let r = match found {
-                    Some(i) => Ok(i),
-                    None => Graph::capture(stream, |_| self.walk(c, key)).map(|g| {
-                        graphs.push((key, g));
-                        graphs.len() - 1
-                    }),
-                };
-                let launched = r.and_then(|i| graphs[i].1.launch(stream));
-                self.graphs = graphs;
-                launched?;
-            }
-        }
-        // A store walk wrote no own row, no streams past its attention's
-        // input and no head: nothing of it is there to read.
-        self.last = (mode != WalkMode::Store).then_some((m, head));
-        self.held = pos0 as usize + m;
-        Ok(m)
+        let mut h =
+            WindowMut::<f32>::of_mut(&mut a.st.h, b.at * WIDE * size_of::<f32>(), b.m * WIDE)?;
+        copy_hidden(stream, &mut h, f.hidden, w.src)
     }
 
     /// One window's chain — the draft's proposal, one readback: `refresh`'s
@@ -2268,21 +2373,25 @@ impl Mtp38 {
         Ok(())
     }
 
-    /// A store walk over `m` rows (module doc): the embedding and the pack,
-    /// `eh_proj`, the attention site's mix, q, k and v, the norm and
-    /// append, every launch over the rows at once in the store arena, on
-    /// the card's stream. The rows' tokens are the inbox's and their hidden
-    /// rows the store arena's `h`, or the draft's own last row when `own`.
-    fn store_walk(&mut self, c: &MtpCtx<'_>, m: usize, own: bool) -> Result<(), GpuError> {
+    /// The launches of a store walk before its append (module doc) over
+    /// `blocks`' rows, rows `0 ..` of the store arena in order, every launch
+    /// once over them all but the embedding, one a block at its own
+    /// positions: the embedding and the pack, `eh_proj`, the attention
+    /// site's mix, q, k and v, on the card's stream. The rows' tokens are
+    /// `ids`, the blocks' in order, and their hidden rows the store arena's
+    /// `h`; or, when `own`, one block of the draft's own last row. Each row's
+    /// values are its inputs' alone, so a block's are those of a walk of it
+    /// alone; [`Mtp38::append_store`] writes each block into its sequence's
+    /// store.
+    pub(super) fn store_rows(
+        &mut self,
+        c: &MtpCtx<'_>,
+        ids: &[u32],
+        blocks: &[StoreBlock],
+        own: bool,
+    ) -> Result<(), GpuError> {
         let (embd, _) = self.borrowed(c.tw)?;
-        let Mtp38 {
-            w,
-            store,
-            index,
-            ctx,
-            a,
-            ..
-        } = self;
+        let Mtp38 { w, index, a, .. } = self;
         let a = a
             .as_mut()
             .ok_or(GpuError::state(WHAT, "the program's arena (Mtp38::arm)"))?;
@@ -2290,30 +2399,45 @@ impl Mtp38 {
         let stream = gpu.stream();
         let sink = gpu.layer_sink(*index as usize)?;
         let n = Names::of(*index, w);
+        let m = blocks.last().map_or(0, |b| b.at + b.m);
+        if !own && ids.len() != m {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{} ids for a store walk of {m} rows", ids.len()),
+            ));
+        }
         let (h, cols) = (geo::HIDDEN, geo::STREAMS * m);
+
+        // The rows' tokens, the input record's first position 0: each
+        // block's embedding takes its first position as its offset.
+        put_input(a.inbox.host_mut()?, ids, 0)?;
+        a.inbox.upload(stream, IN_IDS + ids.len())?;
         let s = &mut a.st;
 
-        // The embedding rows and the input pack.
+        // The embedding rows, a block at a time, and the input pack.
         let table = EmbedRows::of_weight(embd).ok_or_else(|| {
             GpuError::tensor(WHAT, "token_embd.weight", "Q8_0 planes or BF16 words")
         })?;
-        // SAFETY: words IN_IDS .. IN_IDS + m of the inbox's IN_IDS +
-        // MTP_STORE_ROWS words (m <= MTP_STORE_ROWS); the window lives for
-        // the embedding's enqueue.
-        let ids = unsafe { param_view::<u32>(a.inbox.dev(), IN_IDS, m) };
-        k.q38.enqueue_embed_rows(
-            stream,
-            EmbedArgs {
-                table,
-                ids: if own { &a.own_id } else { &ids },
-                pos0: &a.pos0,
-                first: 0,
-                fault: sink,
-                y: &mut s.emb,
-                pos: &mut s.pos,
-                n_keys: &mut s.n_keys,
-            },
-        )?;
+        let word = size_of::<u32>();
+        for b in blocks {
+            let block_ids = Window::<u32>::of(a.inbox.dev(), (IN_IDS + b.at) * word, b.m)?;
+            let mut y = WindowMut::<f32>::of_mut(&mut s.emb, b.at * h * size_of::<f32>(), b.m * h)?;
+            let mut pos = WindowMut::<u32>::of_mut(&mut s.pos, b.at * word, b.m)?;
+            let mut n_keys = WindowMut::<u32>::of_mut(&mut s.n_keys, b.at * word, b.m)?;
+            k.q38.enqueue_embed_rows(
+                stream,
+                EmbedArgs {
+                    table,
+                    ids: if own { &a.own_id } else { &block_ids },
+                    pos0: &a.pos0,
+                    first: b.pos0 as usize,
+                    fault: sink,
+                    y: &mut y,
+                    pos: &mut pos,
+                    n_keys: &mut n_keys,
+                },
+            )?;
+        }
         k.mtp.enqueue_mtp_input(
             stream,
             MtpInputArgs {
@@ -2398,33 +2522,69 @@ impl Mtp38 {
         for (name, y) in [(&n.q, &mut s.qg), (&n.k, &mut s.k), (&n.v, &mut s.v)] {
             site::resident_gemm(gpu, &dense, (tw, name), &x, &s.rows, m, y)?;
         }
+        Ok(())
+    }
+
+    /// The keys and values of `b`'s rows, which [`Mtp38::store_rows`] ran,
+    /// normed, turned and appended to this sequence's store (the live one's)
+    /// at their positions: the store then holds the sequence through the
+    /// block's last row, and no walk is there to read (a store walk leaves
+    /// no own row, no streams past its attention's input and no head).
+    pub(super) fn append_store(&mut self, c: &MtpCtx<'_>, b: StoreBlock) -> Result<(), GpuError> {
+        let Mtp38 {
+            w,
+            store,
+            index,
+            ctx,
+            a,
+            ..
+        } = self;
+        let s = &mut a
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "the program's arena (Mtp38::arm)"))?
+            .st;
+        let (gpu, k) = (c.gpu, c.k);
+        let sink = gpu.layer_sink(*index as usize)?;
+        let n = Names::of(*index, w);
+        let f = size_of::<f32>();
+        let rows = |width: usize| (b.at * width * f, b.m * width);
+        let ((qg_at, qg_n), (q_at, q_n), (kv_at, kv_n)) =
+            (rows(geo::Q_ROWS), rows(geo::ATTN), rows(geo::KV));
+        let qg = Window::<f32>::of(&s.qg, qg_at, qg_n)?;
+        let mut q = WindowMut::<f32>::of_mut(&mut s.q, q_at, q_n)?;
+        let mut kw = WindowMut::<f32>::of_mut(&mut s.k, kv_at, kv_n)?;
+        let v = Window::<f32>::of(&s.v, kv_at, kv_n)?;
+        let pos = Window::<u32>::of(&s.pos, b.at * size_of::<u32>(), b.m)?;
         // The draft's store is f16: the family's shared append runs its f16
         // arm.
         let (kc, vc) = store.f16_mut("qwen38::mtp")?;
         // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
         unsafe {
             k.neox.enqueue_head_norm_neox_append_256(
-                stream,
+                gpu.stream(),
                 PartialNeoxArgs {
-                    qg: &s.qg,
-                    q: &mut s.q,
-                    k: &mut s.k,
-                    v: &s.v,
+                    qg: &qg,
+                    q: &mut q,
+                    k: &mut kw,
+                    v: &v,
                     gq: f32_gain(w, &n.q_norm)?,
                     gk: f32_gain(w, &n.k_norm)?,
                     table: c.table,
-                    pos: &s.pos,
+                    pos: &pos,
                     eps: c.eps,
                     n_head: geo::N_HEAD,
                     n_kv: geo::N_KV,
                     ctx: *ctx,
-                    m,
+                    m: b.m,
                     fault: sink,
                     cache_k: kc,
                     cache_v: vc,
                 },
-            )
+            )?;
         }
+        self.last = None;
+        self.held = b.pos0 as usize + b.m;
+        Ok(())
     }
 
     /// The streams of the last walk's rows: the layer's output, `l_out`.

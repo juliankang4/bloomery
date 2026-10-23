@@ -78,7 +78,7 @@
 use std::fmt;
 
 use bloomery_gpu::media::{CallRows, MediaBody};
-use bloomery_gpu::model::{Rollback, Rows, SlotRows, StepMode};
+use bloomery_gpu::model::{Rollback, Rows, SlotRows, Slots, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
 use runtime::{Draft, TapNeed, Target, accepted_rows};
 
@@ -264,6 +264,31 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
         mode: WalkMode,
     ) -> Result<(), GpuError>;
 
+    /// One store walk ([`WalkMode::Store`]) of several resident sequences'
+    /// rows: each `(slot, feed)` the rows of that slot's draft, as
+    /// [`MtpBody::walk`] walks them with the slot selected, every slot named
+    /// once and at most [`MtpBody::STORE_ROWS`] rows in all. Each slot's
+    /// draft store comes out as its own walk leaves it, and the selected
+    /// slot stays selected. The default walks the slots in turn; a body
+    /// whose store walk runs several sequences' rows at once overrides it.
+    fn store_slots(
+        m: &mut GpuModel<Self>,
+        walks: &[(usize, Feed<'_, Self::Arena>)],
+        head: DraftHead,
+    ) -> Result<(), GpuError>
+    where
+        Self: Slots,
+        Self::Seq: 'static,
+    {
+        let home = m.selected();
+        let walked = walks.iter().try_for_each(|&(slot, feed)| {
+            m.select_slot(slot)?;
+            Self::walk(m, feed, head, WalkMode::Store)
+        });
+        let back = m.select_slot(home);
+        walked.and(back)
+    }
+
     /// One window's chain, one readback, never in [`WalkMode::Store`]:
     /// `refresh` walked (the rows the target kept with their hidden rows, its
     /// last row the target's own next token), then `own` walks, each reading the walk before it on the card;
@@ -379,6 +404,108 @@ impl<B: MtpBody> Exec<B::Arena> for Card<'_, B> {
 
     fn held(&mut self) -> Result<usize, GpuError> {
         B::held(self.m)
+    }
+}
+
+/// The waiting step and verify rows of several slots' drafts, gathered
+/// before a round's target call ([`MtpDraft::gather`]) and walked together
+/// ([`SlotWalks::run`]): one store walk of every slot's rows
+/// ([`MtpBody::store_slots`]) in place of one walk a slot. Rows gathered and
+/// never run are lost to their drafts, whose next call then skips.
+#[must_use = "the gathered rows wait for SlotWalks::run"]
+pub struct SlotWalks<B: MtpBody> {
+    head: Option<DraftHead>,
+    walks: Vec<(usize, Refresh<B::Arena>)>,
+}
+
+impl<B: MtpBody> Default for SlotWalks<B> {
+    fn default() -> Self {
+        SlotWalks {
+            head: None,
+            walks: Vec::new(),
+        }
+    }
+}
+
+impl<B: MtpBody + Slots> SlotWalks<B>
+where
+    B::Seq: 'static,
+{
+    /// Every gathered slot's rows walked, in store walks of at most
+    /// [`MtpBody::STORE_ROWS`] rows, before the target call that may
+    /// overwrite the arenas they read; nothing stays gathered. The selected
+    /// slot stays selected.
+    ///
+    /// # Errors
+    ///
+    /// The walk's.
+    pub fn run(&mut self, t: &mut Session<B>) -> Result<(), SessionError> {
+        let Some(head) = self.head.take() else {
+            return Ok(());
+        };
+        let walks = std::mem::take(&mut self.walks);
+        let feeds: Vec<(usize, Feed<'_, B::Arena>)> =
+            walks.iter().map(|(slot, r)| (*slot, r.feed())).collect();
+        let mut start = 0;
+        let mut rows = 0;
+        for (i, (_, f)) in feeds.iter().enumerate() {
+            if rows + f.tokens.len() > B::STORE_ROWS {
+                B::store_slots(t.model_mut(), &feeds[start..i], head)?;
+                (start, rows) = (i, 0);
+            }
+            rows += f.tokens.len();
+        }
+        Ok(B::store_slots(t.model_mut(), &feeds[start..], head)?)
+    }
+}
+
+/// The card's side of a gathered call ([`MtpDraft::gather`]): the positions
+/// the selected slot's draft store holds read from the model. Walks of its
+/// step and verify rows wait for [`SlotWalks::run`]; shared arenas are read
+/// before the selected slot changes.
+struct Gather<'a, B: MtpBody> {
+    m: &'a mut GpuModel<B>,
+    slot: usize,
+    head: DraftHead,
+    walks: &'a mut SlotWalks<B>,
+}
+
+impl<B: MtpBody> Exec<B::Arena> for Gather<'_, B> {
+    type Err = SessionError;
+
+    fn walk(&mut self, w: &Walk<'_, B::Arena>) -> Result<(), SessionError> {
+        let (WalkMode::Store, Hidden::Target { walk, first }) = (w.mode, w.hidden) else {
+            return Err(SessionError::Refused(format!(
+                "{WHAT}: a gathered walk is a store walk of the target's rows"
+            )));
+        };
+        if walk != B::STEP_ARENA && walk != B::VERIFY_ARENA {
+            return Ok(Card {
+                m: &mut *self.m,
+                head: self.head,
+                media: None,
+            }
+            .walk(w)?);
+        }
+        if *self.walks.head.get_or_insert(self.head) != self.head {
+            return Err(SessionError::Refused(format!(
+                "{WHAT}: the gathered walks name two heads"
+            )));
+        }
+        self.walks.walks.push((
+            self.slot,
+            Refresh {
+                tokens: w.tokens.to_vec(),
+                pos0: w.pos0,
+                walk,
+                first,
+            },
+        ));
+        Ok(())
+    }
+
+    fn held(&mut self) -> Result<usize, SessionError> {
+        Ok(B::held(self.m)?)
     }
 }
 
@@ -564,6 +691,37 @@ impl<B: MtpBody> MtpDraft<B> {
     }
 }
 
+impl<B: MtpBody + Slots> MtpDraft<B>
+where
+    B::Seq: 'static,
+{
+    /// [`MtpDraft::before_step`] on the session's selected slot, its walk
+    /// gathered into `walks` when it reads the slot's own step or verify
+    /// arena. Shared prompt rows are walked immediately, before a slot
+    /// change invalidates them. [`SlotWalks::run`] walks the gathered rows
+    /// together before the target's next call. Every decision (the rows
+    /// walked, a skip and its join) is made here as `before_step` makes it.
+    ///
+    /// # Errors
+    ///
+    /// The store's positions unread, or a walk `before_step` would not make.
+    pub fn gather(
+        &mut self,
+        t: &mut Session<B>,
+        last: u32,
+        walks: &mut SlotWalks<B>,
+    ) -> Result<(), SessionError> {
+        let (slot, pos) = (t.selected(), t.pos());
+        let mut g = Gather {
+            m: t.model_mut(),
+            slot,
+            head: self.head,
+            walks,
+        };
+        self.policy.before_step(&mut g, pos, last)
+    }
+}
+
 /// The proposal depth a caller gives each slot's window of a pass of two
 /// slots ([`SlotWindow::depth`]) unless it chooses another: two rows a slot,
 /// a pass of four rows, the shape the cost model prices first at two slots.
@@ -605,7 +763,10 @@ pub struct SlotWindow<'a, B: MtpBody> {
 /// slot 0 selected. A draft that proposes nothing is one that skips (an
 /// [`MtpDraft`] proposes at least one id otherwise): its row is a plain step
 /// the draft is told nothing of, as its [`Draft::stepped`] would do nothing.
-/// Depth zero runs a plain row and keeps the draft ready for a later pass.
+/// Depth zero runs a plain row and keeps the draft ready for a later pass:
+/// each such draft's shared prompt rows are walked immediately, and its
+/// step and verify rows are gathered ([`MtpDraft::gather`]) and walked
+/// together before the first pass ([`SlotWalks::run`]).
 /// Returns each window's commit, in the windows' order, and the passes run.
 /// Refused by name: a draft that proposes nothing at a positive depth while
 /// it drafts, one that moves its slot's position, and as
@@ -620,12 +781,13 @@ where
 {
     let mut rows: Vec<Vec<u32>> = Vec::with_capacity(windows.len());
     let mut firsts = Vec::with_capacity(windows.len());
+    let mut plain = SlotWalks::default();
     for w in windows.iter_mut() {
         t.select_slot(w.slot)?;
         let pos = t.pos();
         let mut ids = vec![w.last; 1 + w.depth.min(B::WIDTH)];
         let n = if w.depth == 0 {
-            w.draft.before_step(t, w.last)?;
+            w.draft.gather(t, w.last, &mut plain)?;
             0
         } else {
             Draft::propose(w.draft, t, w.last, &mut ids[1..])?
@@ -647,6 +809,7 @@ where
         rows.push(ids);
         firsts.push(pos);
     }
+    plain.run(t)?;
     let cuts = crate::round_passes(
         windows.iter().zip(&rows).map(|(w, r)| (w.slot, r.len())),
         <B as SlotRows>::MAX_ROWS,

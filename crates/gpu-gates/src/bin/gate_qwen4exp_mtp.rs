@@ -230,6 +230,8 @@
 //!   logits row bit for bit, its committed lane and position its window's
 //!   run alone on the load's own sequence before any slot exists, through
 //!   the session's verify of one sequence at the same counts.
+//!   A plain round immediately after slot 0's GEMM prompt and `begin`,
+//!   beside slot 1's started request, matches immediate draft walks.
 //!
 //! (l) and (h) hold at least one row each off a flip: a run that excuses
 //! every row as a flip fails.
@@ -4841,11 +4843,16 @@ mod gate {
         let mut capped = Vec::with_capacity(DEPTHS.len());
         for depth in DEPTHS {
             capped.push([
-                capped_run(&mut s, a, depth, ROUNDS)?,
-                capped_run(&mut s, b, depth, ROUNDS)?,
+                capped_run(&mut s, a, &[Some(depth); ROUNDS])?,
+                capped_run(&mut s, b, &[Some(depth); ROUNDS])?,
             ]);
         }
         let after = [after_alone(&mut s, 0, a)?, after_alone(&mut s, 1, b)?];
+        let plain = [0, 1].map(|half| PLAIN_ROUNDS.map(|pass| half_of(pass, half)));
+        let plain = [
+            capped_run(&mut s, a, &plain[0])?,
+            capped_run(&mut s, b, &plain[1])?,
+        ];
         s.model_mut().add_slots(2)?;
         // Together, in the server's order: slot 0's prompt call and first
         // plain step run together, then slot 1's, then the drafted passes
@@ -4905,6 +4912,8 @@ mod gate {
         }
         z_ok &= z_red("waiting", waiting_select(&mut s));
         z_ok &= z_red("step after", step_after(&mut s, [a, b], &after));
+        z_ok &= z_red("plain rounds", plain_rounds(&mut s, [a, b], &plain, uneven));
+        z_ok &= z_red("prompt anchor", prompt_anchor(&mut s, [a, b]));
         tier::sc(
             "(kp-draft) two slots cut to points at one position: each rejoins with its own row",
         )?;
@@ -5196,7 +5205,7 @@ mod gate {
             plain.push(Target::step(s, last, Want::Argmax)?.argmax());
         }
         s.select_slot(1)?;
-        let alone = capped_run(s, windows[1], depth, KP_PASSES)?;
+        let alone = capped_run(s, windows[1], &[Some(depth); KP_PASSES])?;
         let off_same = o0 == plain;
         let drafted_same = o1 == alone.ids && passes == alone.passes && store1 == alone.store;
         let ok = held == 0 && skips && plain_rows && drafted_rows > 0 && off_same && drafted_same;
@@ -5436,21 +5445,43 @@ mod gate {
         Ok((s.into_model(), ok))
     }
 
-    /// Window `ids` alone on the selected slot, `rounds` drafted passes of
-    /// proposals capped to `depth` ([`Capped`]), each verified through the
+    /// Window `ids` alone on the selected slot, a pass of each of `depths`:
+    /// none for `None`; at 0 one step with the draft told of it as a seat's
+    /// step tells it (its waiting rows walked first,
+    /// [`app::mtp::MtpDraft::before_step`]); else a drafted pass of
+    /// proposals capped to the depth ([`Capped`]), verified through the
     /// session's verify of one sequence.
     fn capped_run(
         s: &mut app::Session<Body38>,
         ids: &[u32],
-        depth: usize,
-        rounds: usize,
+        depths: &[Option<usize>],
     ) -> Result<Drafted, GateError> {
         let mut d = fresh_draft(s)?;
         let mut out = start(s, &mut d, ids)?;
-        let mut spec = runtime::Speculative::<Capped, 4>::new(Capped { d, depth });
-        let mut passes = Vec::with_capacity(rounds);
-        for _ in 0..rounds {
-            passes.push(one_pass(s, &mut spec, &mut out)?);
+        let mut spec = runtime::Speculative::<Capped, 4>::new(Capped { d, depth: 0 });
+        let mut passes = Vec::with_capacity(depths.len());
+        for &depth in depths {
+            match depth {
+                None => {}
+                Some(0) => {
+                    let (pos, last) = (s.pos(), *out.last().ok_or("no token")?);
+                    let d = &mut spec.draft_mut().d;
+                    d.before_step(s, last)?;
+                    let next = Target::step(s, last, Want::Argmax)?.argmax();
+                    Draft::stepped(d, s, last, next)?;
+                    out.push(next);
+                    passes.push(Committed {
+                        pos,
+                        kept: 1,
+                        rows: 1,
+                        proposed: false,
+                    });
+                }
+                Some(depth) => {
+                    spec.draft_mut().depth = depth;
+                    passes.push(one_pass(s, &mut spec, &mut out)?);
+                }
+            }
         }
         Ok(Drafted {
             ids: out,
@@ -5460,22 +5491,22 @@ mod gate {
         })
     }
 
-    /// (z) at `depth`: each window's request started alone on its own slot
-    /// (slot 0 window A, slot 1 window B, in the server's order), then
-    /// `rounds` passes of both slots' drafted rows in one pass
-    /// ([`app::mtp::pass_slots`]), each slot's draft its own; against
-    /// `refs`, each window's [`capped_run`]. `uneven` holds the passes to
-    /// the module doc's coverage of a pass keeping different counts on the
-    /// two slots: the real tier's, where the shipped draft's proposals are
-    /// accepted unevenly.
-    fn one_pass_windows(
+    /// Each round's committed rows per slot, and the clauses that differ from their references.
+    type SlotRounds = (Vec<Vec<(usize, Committed)>>, Vec<String>);
+
+    /// Each window's request started alone on its own slot (slot 0 window A,
+    /// slot 1 window B, in the server's order), then a pass of each of
+    /// `rounds`' slots (a depth a slot, `None` for a slot the pass leaves
+    /// out, [`app::mtp::pass_slots`]), each slot's draft its own: each
+    /// pass's commits by slot, and the parts of each slot's run (its ids,
+    /// kept rows, draft windows and draft store) that differ from its
+    /// reference in `refs`.
+    fn slot_rounds(
         s: &mut app::Session<Body38>,
         windows: [&[u32]; 2],
-        depth: usize,
-        rounds: usize,
+        rounds: &[(Option<usize>, Option<usize>)],
         refs: &[Drafted; 2],
-        uneven: bool,
-    ) -> Result<bool, GateError> {
+    ) -> Result<SlotRounds, GateError> {
         let mut drafts = [fresh_draft(s)?, fresh_draft(s)?];
         let mut outs = [Vec::new(), Vec::new()];
         for (slot, ((d, out), ids)) in drafts.iter_mut().zip(&mut outs).zip(windows).enumerate() {
@@ -5483,37 +5514,39 @@ mod gate {
             *out = start(s, d, ids)?;
         }
         let mut passes = [Vec::new(), Vec::new()];
-        let (mut rejected, mut apart) = (0usize, 0usize);
-        for _ in 0..rounds {
+        let mut by_pass = Vec::with_capacity(rounds.len());
+        for &(a, b) in rounds {
             let [d0, d1] = &mut drafts;
             let [o0, o1] = &mut outs;
-            let (l0, l1) = (
-                *o0.last().ok_or("slot 0 gave no id")?,
-                *o1.last().ok_or("slot 1 gave no id")?,
-            );
-            let mut w = [
-                app::mtp::SlotWindow {
-                    slot: 0,
-                    draft: d0,
-                    last: l0,
-                    depth,
-                    out: o0,
-                },
-                app::mtp::SlotWindow {
-                    slot: 1,
-                    draft: d1,
-                    last: l1,
-                    depth,
-                    out: o1,
-                },
-            ];
+            let mut w = Vec::with_capacity(2);
+            for (slot, depth, draft, out) in [(0, a, d0, o0), (1, b, d1, o1)] {
+                if let Some(depth) = depth {
+                    let last = *out
+                        .last()
+                        .ok_or_else(|| format!("slot {slot} gave no id"))?;
+                    w.push(app::mtp::SlotWindow {
+                        slot,
+                        draft,
+                        last,
+                        depth,
+                        out,
+                    });
+                }
+            }
+            let slots: Vec<usize> = w.iter().map(|w| w.slot).collect();
             let (done, _) = app::mtp::pass_slots(s, &mut w)?;
-            let [c0, c1] = <[Committed; 2]>::try_from(done)
-                .map_err(|d| format!("a pass of 2 slots committed {} slots", d.len()))?;
-            rejected += usize::from(c0.kept < c0.rows) + usize::from(c1.kept < c1.rows);
-            apart += usize::from(c0.kept != c1.kept);
-            passes[0].push(c0);
-            passes[1].push(c1);
+            if done.len() != slots.len() {
+                return Err(format!(
+                    "a pass of {} slots committed {} slots",
+                    slots.len(),
+                    done.len()
+                )
+                .into());
+            }
+            for (&slot, &c) in slots.iter().zip(&done) {
+                passes[slot].push(c);
+            }
+            by_pass.push(slots.into_iter().zip(done).collect());
         }
         let mut off = Vec::new();
         for (slot, (((d, out), passes), r)) in drafts
@@ -5543,6 +5576,43 @@ mod gate {
                     .map(|(part, _)| format!("slot {slot} {part}")),
             );
         }
+        Ok((by_pass, off))
+    }
+
+    /// A (z) clause's words for [`slot_rounds`]' differing parts `off`.
+    fn alone_runs(off: &[String]) -> String {
+        if off.is_empty() {
+            "each slot's ids, kept rows, draft windows and draft store its window's alone run's"
+                .to_string()
+        } else {
+            format!("differs in {}", off.join(", "))
+        }
+    }
+
+    /// (z) at `depth`: each window's request started alone on its own slot
+    /// (slot 0 window A, slot 1 window B, in the server's order), then
+    /// `rounds` passes of both slots' drafted rows in one pass
+    /// ([`app::mtp::pass_slots`]), each slot's draft its own; against
+    /// `refs`, each window's [`capped_run`]. `uneven` holds the passes to
+    /// the module doc's coverage of a pass keeping different counts on the
+    /// two slots: the real tier's, where the shipped draft's proposals are
+    /// accepted unevenly.
+    fn one_pass_windows(
+        s: &mut app::Session<Body38>,
+        windows: [&[u32]; 2],
+        depth: usize,
+        rounds: usize,
+        refs: &[Drafted; 2],
+        uneven: bool,
+    ) -> Result<bool, GateError> {
+        let (done, off) = slot_rounds(s, windows, &vec![(Some(depth), Some(depth)); rounds], refs)?;
+        let (mut rejected, mut apart) = (0usize, 0usize);
+        for pass in &done {
+            rejected += pass.iter().filter(|(_, c)| c.kept < c.rows).count();
+            if let [(_, c0), (_, c1)] = pass.as_slice() {
+                apart += usize::from(c0.kept != c1.kept);
+            }
+        }
         let same = off.is_empty();
         let ok = same && rejected > 0 && (!uneven || apart > 0);
         println!(
@@ -5550,18 +5620,137 @@ mod gate {
              {}; {rejected} slot passes kept fewer rows than they ran, {apart} passes kept \
              different counts on the two slots{} {}",
             2 * (depth + 1),
-            if same {
-                "each slot's ids, kept rows, draft windows and draft store its window's alone \
-                 run's"
-                    .to_string()
-            } else {
-                format!("differs in {}", off.join(", "))
-            },
+            alone_runs(&off),
             if uneven {
                 ""
             } else {
                 " (printed, not pinned in this tier)"
             },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (z) plain rounds' passes: each pass's depth a slot (slot 0, slot 1),
+    /// `None` for a slot the pass leaves out, 0 a plain row whose draft's
+    /// waiting rows the pass's one store walk of every depth zero slot's
+    /// rows takes ([`app::mtp::SlotWalks`]), 3 a drafted window of up to 4
+    /// rows. A plain pass after a drafted one walks the rows that pass kept,
+    /// both slots' together where both are plain, one beside the other's
+    /// drafted window where one is.
+    const PLAIN_ROUNDS: [(Option<usize>, Option<usize>); 8] = [
+        (Some(0), Some(0)),
+        (Some(3), Some(3)),
+        (Some(0), Some(0)),
+        (Some(3), Some(3)),
+        (Some(0), Some(3)),
+        (Some(3), Some(0)),
+        (Some(0), Some(0)),
+        (Some(3), Some(3)),
+    ];
+
+    /// (z) plain rounds: each window's request started alone on its own
+    /// slot, then [`PLAIN_ROUNDS`]' passes of the slots each names
+    /// ([`app::mtp::pass_slots`]): each slot's ids, kept rows, draft windows
+    /// and draft store equal its window run alone ([`capped_run`]). At
+    /// least one pass's store walk takes both slots' rows; under `wide` (the
+    /// real tier, where the shipped draft's proposals are accepted) at least
+    /// one store walk takes more than one row of a slot, the rows a drafted
+    /// pass kept (the fixture's draft has every proposal refused: printed,
+    /// not pinned there).
+    fn plain_rounds(
+        s: &mut app::Session<Body38>,
+        windows: [&[u32]; 2],
+        refs: &[Drafted; 2],
+        wide: bool,
+    ) -> Result<bool, GateError> {
+        let (done, off) = slot_rounds(s, windows, &PLAIN_ROUNDS, refs)?;
+        // The rows each slot's draft has waiting: its start's step leaves one.
+        let mut waiting = [1, 1];
+        let (mut both, mut deep) = (0usize, 0usize);
+        for (pass, depths) in done.iter().zip(PLAIN_ROUNDS) {
+            both += usize::from(depths == (Some(0), Some(0)));
+            for &(slot, c) in pass {
+                deep += usize::from(half_of(depths, slot) == Some(0) && waiting[slot] > 1);
+                waiting[slot] = c.kept;
+            }
+        }
+        let same = off.is_empty();
+        let ok = same && both > 0 && (!wide || deep > 0);
+        println!(
+            "(z) plain rounds: {} passes, a plain slot's waiting rows walked in one store walk \
+             of the pass's plain slots; {}; {both} walks took both slots' rows, {deep} walks \
+             took more than one row of a slot{} {}",
+            PLAIN_ROUNDS.len(),
+            alone_runs(&off),
+            if wide {
+                ""
+            } else {
+                " (printed, not pinned in this tier)"
+            },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (z) a shared prompt anchor consumed before selecting the other slot,
+    /// against the same round with each draft walked immediately.
+    fn prompt_anchor(
+        s: &mut app::Session<Body38>,
+        windows: [&[u32]; 2],
+    ) -> Result<bool, GateError> {
+        let mut runs = Vec::new();
+        for immediate in [true, false] {
+            let mut drafts = [
+                app::mtp::MtpDraft::open(
+                    s.model(),
+                    Prompt38::Gemm,
+                    bloomery_gpu::model::StepMode::Graph,
+                )?,
+                fresh_draft(s)?,
+            ];
+            s.select_slot(1)?;
+            let mut out1 = start(s, &mut drafts[1], windows[1])?;
+            s.select_slot(0)?;
+            s.reset()?;
+            let first = Draft::prompt(&mut drafts[0], s, windows[0])?;
+            Draft::begin(&mut drafts[0], s, windows[0], first)?;
+            let mut out0 = vec![first];
+            let last1 = *out1.last().ok_or("slot 1 gave no id")?;
+            if immediate {
+                drafts[0].before_step(s, first)?;
+                s.select_slot(1)?;
+                drafts[1].before_step(s, last1)?;
+            }
+            let [d0, d1] = &mut drafts;
+            let (done, passes) = app::mtp::pass_slots(
+                s,
+                &mut [
+                    app::mtp::SlotWindow {
+                        slot: 0,
+                        draft: d0,
+                        last: first,
+                        depth: 0,
+                        out: &mut out0,
+                    },
+                    app::mtp::SlotWindow {
+                        slot: 1,
+                        draft: d1,
+                        last: last1,
+                        depth: 0,
+                        out: &mut out1,
+                    },
+                ],
+            )?;
+            s.select_slot(0)?;
+            let store0 = slot_store(s)?;
+            s.select_slot(1)?;
+            runs.push((out0, out1, done, passes, store0, slot_store(s)?));
+        }
+        let ok = runs[0] == runs[1] && runs[1].2.len() == 2 && runs[1].3 == 1;
+        println!(
+            "(z) prompt anchor: a plain round after slot 0's GEMM prompt and begin beside \
+             slot 1's first step matches immediate walks in ids, commits and draft stores {}",
             verdict(ok)
         );
         Ok(ok)
@@ -5638,7 +5827,7 @@ mod gate {
     }
 
     /// Slot `half`'s count of a `(slot 0, slot 1)` pair.
-    fn half_of((a, b): (usize, usize), half: usize) -> usize {
+    fn half_of<T>((a, b): (T, T), half: usize) -> T {
         if half == 0 { a } else { b }
     }
 

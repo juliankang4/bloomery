@@ -2230,6 +2230,25 @@ impl Body38 {
         )
     }
 
+    /// The draft's program and its context over this body's own pieces, for
+    /// a store walk of several sequences' rows ([`Mtp38::store_rows`],
+    /// [`Mtp38::append_store`]).
+    fn mtp_with<T>(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        f: impl FnOnce(&mut Mtp38, &MtpCtx<'_>) -> Result<T, GpuError>,
+    ) -> Result<T, GpuError> {
+        let Body38 {
+            mtp, k, rope, eps, ..
+        } = self;
+        let d = mtp.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "an MTP draft (Body38::open_placed_mtp)",
+        ))?;
+        f(d, &mtp_ctx(gpu, w, k, *eps, &rope.table))
+    }
+
     /// One window's chain of the draft's program ([`Mtp38::run_chain`])
     /// beside this body: `refresh`'s walk then `own` own walks, one readback.
     fn mtp_run_chain(
@@ -4379,6 +4398,85 @@ impl GpuModel<Body38> {
         let (gpu, w, body) = self.body_parts(WHAT_D)?;
         let r = body.mtp_run_walk(gpu, w, feed, head, mode).map(|_| ());
         self.note_fault(WHAT_D, r)
+    }
+
+    /// One store walk of several resident sequences' rows (module doc of
+    /// `mtp38`): each `(slot, feed)`'s rows checked and staged on its slot as
+    /// [`GpuModel::mtp_walk`] checks a store walk there, then the walk's
+    /// launches once over every slot's rows, the embedding and the append a
+    /// slot, each slot's into its own store. Each slot's store and the
+    /// positions it holds come out bit for bit as its own store walk leaves
+    /// them, and the selected slot stays selected. Refused by name: a slot
+    /// named twice, rows past the store walk's
+    /// [`MTP_STORE_ROWS`](super::mtp38::MTP_STORE_ROWS), a poisoned
+    /// model, and as `mtp_walk` refuses each slot's walk, before anything but
+    /// the walk's scratch moves. A fault a launch raises stays on the card's
+    /// fault word, which the next readback names.
+    pub fn mtp_store_slots(
+        &mut self,
+        walks: &[(usize, Feed<'_, TargetRows>)],
+        head: DraftHead,
+    ) -> Result<(), GpuError> {
+        const WHAT_D: &str = "qwen4exp mtp_store_slots";
+        self.refuse_if_poisoned(WHAT_D)?;
+        if let Some((i, &(slot, _))) = walks
+            .iter()
+            .enumerate()
+            .find(|&(i, (slot, _))| walks[..i].iter().any(|(s, _)| s == slot))
+        {
+            return Err(GpuError::shape(
+                WHAT_D,
+                format!("slot {slot} named again at walk {i}: one walk a slot"),
+            ));
+        }
+        let home = self.selected();
+        let r = self.store_slots_at(walks, head);
+        let back = self.select_slot(home);
+        self.note_fault(WHAT_D, r.and(back))
+    }
+
+    /// [`GpuModel::mtp_store_slots`]'s walk, its checks done: every slot's
+    /// rows staged with that slot selected, the launches over all of them,
+    /// then each slot's append with that slot selected.
+    fn store_slots_at(
+        &mut self,
+        walks: &[(usize, Feed<'_, TargetRows>)],
+        head: DraftHead,
+    ) -> Result<(), GpuError> {
+        const WHAT_D: &str = "qwen4exp mtp_store_slots";
+        let mut blocks = Vec::with_capacity(walks.len());
+        let mut ids = Vec::new();
+        for &(slot, feed) in walks {
+            self.select_slot(slot)?;
+            let (gpu, _, body) = self.body_parts(WHAT_D)?;
+            let Body38 {
+                mtp,
+                plans,
+                s,
+                a,
+                wa,
+                wrote,
+                ..
+            } = body;
+            let d = mtp.as_mut().ok_or(GpuError::state(
+                WHAT_D,
+                "an MTP draft (Body38::open_placed_mtp)",
+            ))?;
+            let target = mtp_target(plans, [s, a, wa], wrote, DraftFeed::Rows(feed));
+            blocks.push(d.stage_store(gpu.stream(), target, feed, head, ids.len())?);
+            ids.extend_from_slice(feed.tokens);
+        }
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let (gpu, w, body) = self.body_parts(WHAT_D)?;
+        body.mtp_with(gpu, w, |d, c| d.store_rows(c, &ids, &blocks, false))?;
+        for (&(slot, _), &b) in walks.iter().zip(&blocks) {
+            self.select_slot(slot)?;
+            let (gpu, w, body) = self.body_parts(WHAT_D)?;
+            body.mtp_with(gpu, w, |d, c| d.append_store(c, b))?;
+        }
+        Ok(())
     }
 
     /// Fill the draft walk's scratch with NaNs without changing its inbox or stored state.
