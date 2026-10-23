@@ -4561,18 +4561,23 @@ impl GpuModel<Body38> {
 
     /// The host arrays a sequence save would hold, without reading the card.
     pub fn seq_save_bytes(&mut self) -> Result<u64, GpuError> {
+        const WHAT_S: &str = "qwen4exp snapshot size";
         let pos = self.pos();
-        let (_, _, b) = self.body_parts("qwen4exp snapshot size")?;
+        let (_, _, b) = self.body_parts(WHAT_S)?;
         let points = b.ckpt.save_points(pos);
         let draft = if b.mtp.is_some() {
-            let rows = b.wrote.step.parts().1 as usize + b.wrote.pass.parts().1 as usize;
-            (rows * geo::STREAMS * geo::HIDDEN
-                + b.point_rows
-                    .iter()
-                    .filter(|(p, _)| points.contains(p))
-                    .map(|(_, r)| r.len())
-                    .sum::<usize>())
-                * size_of::<f32>()
+            (b.wrote.step.parts().1 as usize)
+                .checked_add(b.wrote.pass.parts().1 as usize)
+                .and_then(|n| n.checked_mul(geo::STREAMS))
+                .and_then(|n| n.checked_mul(geo::HIDDEN))
+                .and_then(|n| {
+                    b.point_rows
+                        .iter()
+                        .filter(|(p, _)| points.contains(p))
+                        .try_fold(n, |n, (_, r)| n.checked_add(r.len()))
+                })
+                .and_then(|n| n.checked_mul(size_of::<f32>()))
+                .ok_or_else(|| GpuError::shape(WHAT_S, "draft host bytes pass the address space"))?
         } else {
             0
         };
@@ -4590,7 +4595,7 @@ impl GpuModel<Body38> {
         }
         .bytes(points.len())?
         .checked_add(draft as u64)
-        .ok_or_else(|| GpuError::shape("qwen4exp snapshot size", "host bytes pass u64"))
+        .ok_or_else(|| GpuError::shape(WHAT_S, "host bytes pass u64"))
     }
 
     /// [`GpuModel::seq_save`] whose copy runs on `lane`'s stream into its
