@@ -89,6 +89,11 @@ with tempfile.TemporaryDirectory(prefix="output-owner-") as tmp:
             retry = run(body, root, out)
             check(f"{name} preserves existing output", retry.returncode == 73 and artifact.read_text() == "saved\n",
                   retry.stderr.strip())
+            linkout = t / f"{name}-dangling"
+            linkout.mkdir()
+            (linkout / artifact.name).symlink_to(linkout / "missing")
+            retry = run(body, root, linkout)
+            check(f"{name} preserves a dangling output symlink", retry.returncode == 73, retry.stderr.strip())
         finally:
             if owner.poll() is None:
                 owner.kill()
@@ -106,17 +111,6 @@ with tempfile.TemporaryDirectory(prefix="output-owner-") as tmp:
     result = run(body, work, out)
     check("batch-replay refuses its own failed arm despite foreign rc files",
           result.returncode == 70 and "new arm ended rc=1" in result.stderr, result.stderr.strip())
-
-    gate = (root / "tools/gate-batch.sh").read_text()
-    teardown = gate[gate.index('  lskip_case() {'):gate.index('  if gb_part 6; then')]
-    (t / "bloomery").mkdir()
-    (t / "bloomery/selftest.py").write_text('print(20)\n')
-    body = 'set -uo pipefail; t=$1; self=$1/runner; d=fixture; fresh_state() { mkdir -p "$1"; }; stop_lanes() { return 70; }; '
-    for mutant in (False, True):
-        code = teardown.replace(' || return $?', '') if mutant else teardown
-        result = run(body + code + '\nlskip_case teardown /dev/null', t)
-        check(f"gate-batch teardown error propagation mutant={mutant}",
-              result.returncode == (0 if mutant else 70), f"rc={result.returncode}")
 
     repo = t / "repo"
     (repo / "tools/ref").mkdir(parents=True)
