@@ -728,6 +728,8 @@ run 'BLOOMERY_LOCK_DIR moves the lease and the holds' 0 "^$tmp/ld/bloomery-cpu\\
 # the last.
 B=$tmp/boxtree
 mkdir -p "$B/tools" "$tmp/stub"
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" 8.6' > "$tmp/stub/nvidia-smi"
+chmod +x "$tmp/stub/nvidia-smi"
 # The copy under test has its drop wait and its sync wait shrunk (box.sh's constants' lines): a retried drop would wait 5 s a time.
 sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=1 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$ROOT/tools/box.sh" > "$B/tools/box.sh"
 chmod +x "$B/tools/box.sh"
@@ -1336,11 +1338,12 @@ else
   run 'gpu-gate.sh: a lock file it cannot open ends at once, by name' 69 'cannot open /root/bloomery-gate\.lock' gg
 fi
 
-# tools/gate.sh --oxide builds for the arch tools/arch.sh reads (BLOOMERY_ARCH, sm_86 unset) and refuses a value that is no arch by
+# tools/gate.sh --oxide builds for the arch tools/arch.sh reads (BLOOMERY_ARCH, sm_86 on the fixture card) and refuses a value that is no arch by
 # name before cargo runs; a call without --oxide never reads it. A call with a test filter passes cargo's output through and ends 78
 # when no test passed. The stub timeout drops its two words and the stub cargo prints its.
 GS=$tmp/gateshtree
 mkdir -p "$GS/tools" "$GS/stub"
+cp "$tmp/stub/nvidia-smi" "$GS/stub/"
 cp "$ROOT/tools/gate.sh" "$ROOT/tools/gate-bound.sh" "$ROOT/tools/arch.sh" "$GS/tools/"
 printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$GS/stub/timeout"
 printf '#!/bin/sh\necho "cargo $*"\n' > "$GS/stub/cargo"

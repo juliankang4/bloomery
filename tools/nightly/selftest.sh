@@ -176,7 +176,7 @@ with tempfile.TemporaryDirectory(prefix="output-owner-") as tmp:
                 box = work / arm / "tools/box.sh"
                 box.write_text('#!/bin/sh\nprintf "%s\\n" "$*"\n')
                 box.chmod(0o755)
-                actual = subprocess.run(["just", "gate-probe"], cwd=work / arm, capture_output=True, text=True)
+                actual = subprocess.run(["env", "BLOOMERY_ARCH=sm_86", "just", "gate-probe"], cwd=work / arm, capture_output=True, text=True)
                 keyed = keyed and actual.returncode == 0 and actual.stdout.strip() == f"probe {arch}"
             valid = (result.returncode == 0 and result.stdout.splitlines()[-1] == f"budget={expected}" and keyed
                      and (work / "new/tools/gate-batch-resources.tsv").read_text() == "fixture\tm\t1\n"

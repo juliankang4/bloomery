@@ -96,7 +96,7 @@ PTX
         /*0080*/                   LDSM.16.M88.4 R12, [R0] ;
 SASS
   printf '%s\n' '		Function : up_down' '        /*0010*/                   LDG.E R2, [R2.64] ;' > "$t/fix/up_down.sass"
-  scan() { (cd "$t/tree" && env -u BLOOMERY_ARCH ${SCAN_ARCH:+"BLOOMERY_ARCH=$SCAN_ARCH"} PATH="${SCAN_STUBS:+$t/stubs:}$t/bin:$PATH" FIX="${SCAN_FIX:-$t/fix}" LDS_SCAN_PTXAS="$t/bin/ptxas" LDS_SCAN_CUOBJDUMP="$t/bin/cuobjdump" \
+  scan() { (cd "$t/tree" && env BLOOMERY_ARCH="${SCAN_ARCH:-sm_86}" PATH="${SCAN_STUBS:+$t/stubs:}$t/bin:$PATH" FIX="${SCAN_FIX:-$t/fix}" LDS_SCAN_PTXAS="$t/bin/ptxas" LDS_SCAN_CUOBJDUMP="$t/bin/cuobjdump" \
     LDS_SCAN_EXTRACT="$t/bin/oxart_ptx" bash "$self" "$@") > "$t/out" 2>&1; }
   # case_ <name> <want rc> <want output, whole>
   case_() {
@@ -130,7 +130,7 @@ cuobjdump stub: no function other
 lds-scan bin=target/release/gate_x cuobjdump-failed=other scan=failed"
   rc=0; scan gate_x mix extra || rc=$?
   case_ third-argument 2 "usage: lds-scan.sh <binary name> [entry substring] | --self-test"
-  # The arch is BLOOMERY_ARCH (tools/arch.sh), sm_86 unset (every case above); a value that is no arch is refused by name.
+  # The fixture builds sm_86 unless overridden; a value that is no arch is refused by name.
   rc=0; SCAN_ARCH=sm_121 scan gate_x mix || rc=$?
   case_ arch-from-env 0 "${banner/arch=sm_86/arch=sm_121} entries=1 filter=mix
 $mix"

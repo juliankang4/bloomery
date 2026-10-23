@@ -90,7 +90,8 @@ self_test() {
   t=$(mktemp -d)
   cp "${BASH_SOURCE[0]}" "$t/ptx-spill-check.sh"
   cp "${BASH_SOURCE[0]%/*}/arch.sh" "$t/arch.sh"
-  unset BLOOMERY_ARCH PTX_SPILL_FULL XDG_CACHE_HOME
+  unset PTX_SPILL_FULL XDG_CACHE_HOME
+  export BLOOMERY_ARCH=sm_86
   export PTX_SPILL_CACHE=off
   # The stub scan prints the fixture scan of its binary (`--no-jit`: the `.nj` twin), or fails as ptx-scan does on a missing binary.
   # A fixture with a `.err` file also writes that to stderr, and one with a `.rc` file ends with that code (the scan of a JIT that

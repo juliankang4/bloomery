@@ -916,8 +916,11 @@ script = Path(sys.argv[1]).parent / 'tools/arch.sh'
 env = dict(os.environ, PATH=str(fixture) + os.pathsep + os.environ['PATH'])
 env.pop('BLOOMERY_ARCH', None)
 bash = shutil.which('bash')
-for capability, override, want, rc in [
+cases = [
     ('12.1', None, 'sm_121a', 0),
+    ('12.1\n12.1', None, 'sm_121a', 0),
+    ('12.1\n12.0', None, 'sm_86', 0),
+    (None, None, 'sm_86', 0),
     ('12.0', None, 'sm_86', 0),
     ('8.6', None, 'sm_86', 0),
     ('12.1', 'sm_121', 'sm_121', 0),
@@ -925,8 +928,12 @@ for capability, override, want, rc in [
     ('error', None, '', 64),
     ('12.1', '', '', 64),
     ('12.1', 'sm_121x', '', 64),
-]:
+]
+for capability, override, want, rc in cases:
     case = dict(env, ARCH_TEST_CAPABILITY=capability)
+    if capability is None:
+        case['ARCH_TEST_CAPABILITY'] = ''
+        case['PATH'] = str(fixture / 'no-driver')
     if override is not None:
         case['BLOOMERY_ARCH'] = override
     for command in ([bash, str(script)],
@@ -934,7 +941,7 @@ for capability, override, want, rc in [
         got = subprocess.run(command, env=case, text=True, capture_output=True, timeout=10)
         if got.returncode != rc or got.stdout.strip() != want:
             sys.exit(f'check-recipes: arch selection {capability=} {override=}: {got.returncode=} {got.stdout=} {got.stderr=}')
-print(f"check-recipes: arch owner ok ({uses} recipe lines build with --arch {{{{arch}}}}, {len(fixtures)} ownership fixtures, 16 selection cases)")
+print(f"check-recipes: arch owner ok ({uses} recipe lines build with --arch {{{{arch}}}}, {len(fixtures)} ownership fixtures, {2 * len(cases)} selection cases)")
 PY
 }
 

@@ -275,16 +275,12 @@ is settled by reading.
 
 ## 6. The card
 
-The card runs the tree's `sm_86` PTX through the driver's JIT. `sm_121` PTX was checked on GB10 and gives the same SASS for
-213 of 215 functions, so it is a question of pins, not of speed.
+GB10 recipes use the native FP4 build target described in section 2. The driver compiles its PTX at the first start.
 
-- **Targets today.** Recipes pass `--arch {{arch}}`, the justfile's variable (139 lines): `BLOOMERY_ARCH`, default `sm_86`,
-  so `BLOOMERY_ARCH=sm_121 just <recipe>` passes `--arch sm_121`; ~~whether the pinned toolchain accepts it is `[unverified]`~~
-  it does (the `sm_121` bullet below). `tools/gate.sh`, `tools/lds-scan.sh` and
-  `tools/sass-scan.sh` read it through `tools/arch.sh`; `tools/ptx-scan.sh` takes `sm_86`, `sm_120` and `sm_121` (the
-  bullet on pins below) and refuses any other arch. The kernels are SIMT code with no generation-specific
-  instruction (the three `ptx_asm!` sites are `cvta`, `ld.global`, `max.f32`: `crates/gpu/src/linear/delta.rs:121-157`,
-  `flash_gqa_prefill.rs:289`; `fault.rs:714` not read).
+- **Targets today.** Recipes pass `--arch {{arch}}` from `tools/arch.sh` and export the selected `BLOOMERY_ARCH` to
+  their tools. `tools/gate.sh`, `tools/lds-scan.sh` and `tools/sass-scan.sh` use the same selector. `tools/ptx-scan.sh`
+  accepts `sm_86`, `sm_120` and `sm_121`, including the Blackwell `a` and `f` suffixes; its occupancy columns and the
+  spill tables follow the compiled target and the card's compute capability.
 - **Documented state.** `docs/cuda-oxide.md:5`: "Everything here runs on Ampere (sm_86) only." The toolchain ledger
   (`docs/upstream/nvlabs-ledger.md`) has no `sm_121` or Blackwell row; its only Spark-related entry is row 32 (the flat
   `extra-rustflags`). The GB10 runs below found no defect of the pinned cuda-oxide; the one gate they saw fail was decided by the

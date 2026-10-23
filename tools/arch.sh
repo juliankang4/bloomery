@@ -20,7 +20,10 @@ bloomery_arch() {
       echo "$1: cannot read the CUDA compute capability; set BLOOMERY_ARCH explicitly for a cross build" >&2
       return 64
     fi
-    if [ "$capability" = 12.1 ]; then v=sm_121a; fi
+    v=sm_121a
+    while IFS= read -r capability; do
+      if [ "$capability" != 12.1 ]; then v=sm_86; fi
+    done <<< "$capability"
   fi
   if ! [[ $v =~ $ARCH_SHAPE ]]; then
     echo "$1: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: sm_86), got '$v'" >&2
