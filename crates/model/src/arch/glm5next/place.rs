@@ -2100,8 +2100,9 @@ mod tests {
                 let wide = routed(1 << 40);
                 let owned = vec![wide.model.experts / ranks; ranks as usize];
                 let mut m = unified(1 << 40);
-                for _ in 1..ranks {
+                for rank in 1..ranks {
                     let mut tier = m.cards[0].clone();
+                    tier.name = format!("tier-{rank}");
                     tier.head = false;
                     tier.layers = 0..0;
                     m.tiers.push(tier);

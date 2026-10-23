@@ -6052,7 +6052,7 @@ mod tests {
                     .map(|rank| Card {
                         head: rank + 1 == ranks,
                         token_embedding: rank == 0,
-                        ..bytes_card("pool", 1 << 30, rank * 4 / ranks..(rank + 1) * 4 / ranks)
+                        ..bytes_card(&format!("pool-{rank}"), 1 << 30, rank * 4 / ranks..(rank + 1) * 4 / ranks)
                     })
                     .collect(),
                 tiers: Vec::new(),
@@ -6071,7 +6071,7 @@ mod tests {
             assert_eq!(plan.host.pool_card_bytes, before + reserve * n);
             assert_eq!(plan.host.headroom_bytes, headroom - i128::from(reserve * n));
             let before = (plan.host.pool_card_bytes, plan.host.headroom_bytes);
-            for reserve in [1, u64::MAX] {
+            for reserve in [1, u64::MAX, (u64::MAX / n).saturating_add(1)] {
                 assert!(plan.reserve_beside(reserve).is_err());
                 assert_eq!(
                     (plan.host.pool_card_bytes, plan.host.headroom_bytes),

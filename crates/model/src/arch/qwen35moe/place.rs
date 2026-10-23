@@ -3675,8 +3675,9 @@ mod tests {
                 let mut m = machine();
                 m.host_mut().usable_bytes = ample;
                 *m.unified_mut() = Some(UnifiedPool { bytes: ample });
-                for _ in 1..ranks {
+                for rank in 1..ranks {
                     let mut tier = m.cards[0].clone();
+                    tier.name = format!("tier-{rank}");
                     tier.head = false;
                     tier.layers = 0..0;
                     m.tiers.push(tier);
