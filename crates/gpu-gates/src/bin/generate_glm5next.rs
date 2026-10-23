@@ -1265,6 +1265,84 @@ mod cli {
         passes: Vec<(bool, usize, usize, f64)>,
     }
 
+    struct Times {
+        steps: Vec<f64>,
+        counted_ms: f64,
+        positions: usize,
+        ms: f64,
+    }
+
+    impl Windows {
+        fn times(&self, steps: usize, warm: usize) -> Times {
+            let per: Vec<f64> = self.kept[..steps].iter().map(|r| r.2).collect();
+            let counted_ms = per[warm..].iter().sum();
+            let positions = self.passes.iter().map(|p| p.1).sum();
+            Times {
+                steps: per,
+                counted_ms,
+                positions,
+                ms: counted_ms * positions as f64 / (steps - warm) as f64,
+            }
+        }
+
+        fn summary(&self, t: &Times) -> Record {
+            let mut kept = [0u64; VERIFY_ROWS];
+            let mut widths = [0u64; VERIFY_ROWS];
+            for &(_, k, rows, _) in &self.passes {
+                kept[k - 1] += 1;
+                widths[rows - 1] += 1;
+            }
+            Record::new(&record::MTP_SUMMARY)
+                .u("proposals", self.passes.iter().filter(|p| p.0).count())
+                .list("kept", &kept)
+                .list("widths", &widths)
+                .u("positions", t.positions)
+                .u("passes", self.passes.len())
+                .f("tok/s(positions)", t.positions as f64 * 1e3 / t.ms)
+        }
+
+        fn pass_times(&self, warm: usize) -> impl Iterator<Item = Record> + '_ {
+            self.passes
+                .iter()
+                .enumerate()
+                .scan(1, move |at, (k, &(proposed, kept, _, ms))| {
+                    let line = Record::new(&record::TIME_PASS)
+                        .u("i", k + 1)
+                        .flag("warm", *at <= warm)
+                        .f("ms", ms)
+                        .u("positions", kept)
+                        .w("kind", if proposed { "mtp" } else { "plain" });
+                    *at += kept;
+                    Some(line)
+                })
+        }
+    }
+
+    impl Times {
+        fn smoke(&self, a: &Arm<'_>) -> Record {
+            let counted = &self.steps[a.warm..];
+            let mut sorted = counted.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            let p50 = sorted[sorted.len() / 2];
+            Record::new(&record::SMOKE)
+                .w("mode", mode_name(a.mode))
+                .w("place", a.place)
+                .u("prompt_tokens", a.ids.len())
+                .u("depth", a.ids.len())
+                .u("generated", a.n_gen)
+                .u("warm", a.warm)
+                .u("steps", counted.len())
+                .f("p50_ms", p50)
+                .f("mean_ms", self.counted_ms / counted.len() as f64)
+                .f("tok/s(p50)", 1e3 / p50)
+                .u("positions", counted.len())
+                .f(
+                    "tok/s(positions)",
+                    counted.len() as f64 * 1e3 / self.counted_ms,
+                )
+        }
+    }
+
     impl PassSink<Session<Body>> for Windows {
         type Error = GateError;
 
@@ -1345,6 +1423,7 @@ mod cli {
         // Generated token i >= 1 is kept token i - 1; the last window may
         // keep one past -n.
         let rows = &sink.kept[..a.n_gen - 1];
+        let times = sink.times(rows.len(), a.warm);
         if a.timed {
             let ms = feed.as_secs_f64() * 1e3;
             Record::new(&record::TIME_PROMPT)
@@ -1355,7 +1434,7 @@ mod cli {
                 .w("kind", a.prefill.name())
                 .print();
         }
-        for (i, &(pos, token, per)) in (1usize..).zip(rows) {
+        for (i, (&(pos, token, _), &per)) in (1usize..).zip(rows.iter().zip(&times.steps)) {
             Record::new(&record::STEP)
                 .u("i", i)
                 .u("pos", pos)
@@ -1370,63 +1449,22 @@ mod cli {
             }
         }
         if a.timed {
-            // Pass k's first kept position is generated token `at`.
-            let mut at = 1;
-            for (k, &(proposed, kept, _, ms)) in (1usize..).zip(&sink.passes) {
-                Record::new(&record::TIME_PASS)
-                    .u("i", k)
-                    .flag("warm", at <= a.warm)
-                    .f("ms", ms)
-                    .u("positions", kept)
-                    .w("kind", if proposed { "mtp" } else { "plain" })
-                    .print();
-                at += kept;
+            for line in sink.pass_times(a.warm) {
+                line.print();
             }
         }
         Record::new(&record::TOKENS)
             .list("tokens", &out.tokens[..a.n_gen])
             .print();
-        let counted: Vec<f64> = rows[a.warm.min(rows.len())..].iter().map(|r| r.2).collect();
-        let counted_ms: f64 = counted.iter().sum();
-        let rate = counted.len() as f64 * 1e3 / counted_ms;
-        let mut kept = [0u64; VERIFY_ROWS];
-        let mut widths = [0u64; VERIFY_ROWS];
-        for &(_, k, rows, _) in &sink.passes {
-            kept[k - 1] += 1;
-            widths[rows - 1] += 1;
-        }
         let proposals = sink.passes.iter().filter(|p| p.0).count();
         record::mtp_stats(
-            Record::new(&record::MTP_SUMMARY)
-                .u("proposals", proposals)
-                .list("kept", &kept)
-                .list("widths", &widths)
-                .u("positions", sink.passes.iter().map(|p| p.1).sum::<usize>())
-                .u("passes", sink.passes.len())
-                .f("tok/s(positions)", rate),
+            sink.summary(&times),
             spec.draft().stats().as_ref(),
             proposals,
         )?
         .print();
         if a.timed {
-            let mut sorted = counted.clone();
-            sorted.sort_by(f64::total_cmp);
-            let p50 = sorted[sorted.len() / 2];
-            let mean = counted_ms / counted.len() as f64;
-            Record::new(&record::SMOKE)
-                .w("mode", mode_name(a.mode))
-                .w("place", a.place)
-                .u("prompt_tokens", a.ids.len())
-                .u("depth", a.ids.len())
-                .u("generated", a.n_gen)
-                .u("warm", a.warm)
-                .u("steps", counted.len())
-                .f("p50_ms", p50)
-                .f("mean_ms", mean)
-                .f("tok/s(p50)", 1e3 / p50)
-                .u("positions", counted.len())
-                .f("tok/s(positions)", rate)
-                .print();
+            times.smoke(a).print();
         }
         for (kind, r) in s
             .model_mut()
@@ -1689,8 +1727,88 @@ mod cli {
 
     #[cfg(test)]
     mod tests {
-        use super::{CardSpec, SocketAddr, TpTensor, record, tp_ranks};
+        use super::{
+            Arm, CardSpec, PrefillMode, SocketAddr, StepMode, TpTensor, Windows, record, tp_ranks,
+        };
         use model::placement::tp::Cut;
+
+        fn windows() -> Windows {
+            Windows {
+                kept: vec![(4, 10, 10.0), (5, 11, 20.0), (6, 12, 20.0)],
+                passes: vec![(false, 1, 1, 10.0), (true, 2, 2, 40.0)],
+            }
+        }
+
+        #[test]
+        fn drafted_times_keep_the_last_pass_wall() {
+            let w = windows();
+            let t = w.times(2, 0);
+            assert_eq!(t.steps, [10.0, 40.0]);
+            assert_eq!(t.counted_ms, 50.0);
+            assert_eq!((t.positions, t.ms), (3, 50.0));
+            let exact = w.times(3, 0);
+            assert_eq!(exact.steps, [10.0, 20.0, 20.0]);
+            assert_eq!(exact.counted_ms, 50.0);
+        }
+
+        #[test]
+        fn drafted_warm_counts_tokens_and_keeps_an_overlapping_pass() {
+            let w = windows();
+            for (steps, warm) in [(2, 1), (3, 1), (3, 2)] {
+                let t = w.times(steps, warm);
+                assert_eq!(t.counted_ms, 40.0, "steps={steps}, warm={warm}");
+                assert_eq!((t.positions, t.ms), (3, 50.0));
+            }
+        }
+
+        #[test]
+        fn drafted_records_distinguish_executed_positions_from_delivered_tokens() {
+            let w = windows();
+            for (n_gen, warm, delivered, mean, rate) in [
+                (3, 0, 2, 25.0, 40.0),
+                (3, 1, 1, 40.0, 25.0),
+                (4, 2, 1, 40.0, 25.0),
+            ] {
+                let a = Arm {
+                    ids: &[1, 2, 3, 4],
+                    n_gen,
+                    timed: true,
+                    warm,
+                    mode: StepMode::Eager,
+                    place: "a",
+                    prefill: PrefillMode::Batch,
+                    passes: 1,
+                    last_step: false,
+                    logits: false,
+                    pair: false,
+                };
+                let t = w.times(n_gen - 1, warm);
+                let mut lines = String::new();
+                for line in w.pass_times(warm).chain([w.summary(&t), t.smoke(&a)]) {
+                    lines.push_str(&line.line());
+                    lines.push('\n');
+                }
+                println!("{lines}");
+                let log = record::Log::of(&lines, record::GENERATE_GLM5NEXT);
+                let summary = log.all(&record::MTP_SUMMARY).unwrap();
+                assert_eq!(summary[0].u64("positions").unwrap(), 3);
+                assert_eq!(summary[0].u64("passes").unwrap(), 2);
+                assert_eq!(summary[0].f64("tok/s(positions)").unwrap(), 60.0);
+                let smoke = log.all(&record::SMOKE).unwrap();
+                assert_eq!(smoke[0].u64("generated").unwrap(), n_gen as u64);
+                assert_eq!(smoke[0].u64("steps").unwrap(), delivered);
+                assert_eq!(smoke[0].u64("positions").unwrap(), delivered);
+                assert_eq!(smoke[0].f64("mean_ms").unwrap(), mean);
+                assert_eq!(smoke[0].f64("tok/s(positions)").unwrap(), rate);
+                let passes = log.all(&record::TIME_PASS).unwrap();
+                assert_eq!(passes[0].flag("warm").unwrap(), warm >= 1);
+                assert!(!passes[1].flag("warm").unwrap());
+                assert_eq!(
+                    passes.iter().map(|p| p.f64("ms").unwrap()).sum::<f64>(),
+                    50.0
+                );
+            }
+        }
 
         /// `--place tp`'s ranks at N = 1, 2 and 4, N - 1 nodes of `BLOOMERY_TP_NODES` beside this
         /// process's card: N = 1 is refused by name; past it rank 0 is local and rank `i` the
