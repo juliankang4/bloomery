@@ -1942,27 +1942,15 @@ mod gate {
         Ok((h, rx))
     }
 
-    /// One streamed request run to its end on its own thread: its answer, or
-    /// `None` a request that failed (a red check, not the clause's end).
-    fn run_streamed(
-        addr: &str,
-        ids: &[u32],
-        n: usize,
+    /// One streamed request already posted, run to its end on its own thread
+    /// ([`answers`]): its answer, or `None` a request that failed (a red
+    /// check, not the clause's end).
+    fn answer(
+        clause: &str,
+        run: (JoinHandle<()>, StreamedRx),
         what: &str,
     ) -> Result<Option<Streamed>, GateError> {
-        let (h, rx) = streamed(addr, ids, n)?;
-        h.join()
-            .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
-        let ran = rx
-            .recv()
-            .map_err(|_| format!("slots: the {what} request's thread gave no answer"))?;
-        match ran {
-            Ok(s) => Ok(Some(s)),
-            Err(e) => {
-                println!("slots: the {what} request failed: {e}");
-                Ok(None)
-            }
-        }
+        Ok(answers(clause, vec![(run, what)])?.remove(0))
     }
 
     /// `/completion` of `ids` sampled at [`SAMPLED_TEMPERATURE`] with
@@ -1985,19 +1973,6 @@ mod gate {
                 "cache_prompt": false, "stream": true,
             }),
         )
-    }
-
-    /// One sampled streamed request ([`sampled_stream`]) run to its end on
-    /// its own thread ([`answers`]).
-    fn run_sampled(
-        addr: &str,
-        ids: &[u32],
-        n: usize,
-        ignore_eos: bool,
-        what: &str,
-    ) -> Result<Option<Streamed>, GateError> {
-        let run = sampled_stream(addr, ids, n, ignore_eos)?;
-        Ok(answers("slots", vec![(run, what)])?.remove(0))
     }
 
     /// The answers of streamed requests already posted, in order, each
@@ -2220,7 +2195,7 @@ mod gate {
         }
         let mut alone = Vec::new();
         for (ids, what) in [(&a_ids, "alone A"), (&b_ids, "alone B")] {
-            alone.push(run_streamed(&addr, ids, SLOTS_PREDICT, what)?);
+            alone.push(answer("slots", streamed(&addr, ids, SLOTS_PREDICT)?, what)?);
         }
         let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy0 = busy_total(&url, decode0)?;
@@ -2232,23 +2207,11 @@ mod gate {
         // Both posted at once: the prompts serialize on the engine thread (a
         // round or two of skew), so nearly every round carries both slots —
         // the (v2) bound's shape.
-        let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
-        let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
-        let mut together = Vec::new();
-        for ((h, rx), what) in [(first, "together A"), (second, "together B")] {
-            h.join()
-                .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
-            let ran = rx
-                .recv()
-                .map_err(|_| format!("slots: the {what} request's thread gave no answer"))?;
-            match ran {
-                Ok(s) => together.push(Some(s)),
-                Err(e) => {
-                    println!("slots: the {what} request failed: {e}");
-                    together.push(None);
-                }
-            }
-        }
+        let runs = vec![
+            (streamed(&addr, &a_ids, SLOTS_PREDICT)?, "together A"),
+            (streamed(&addr, &b_ids, SLOTS_PREDICT)?, "together B"),
+        ];
+        let together = answers("slots", runs)?;
         let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy1 = busy_total(&url, decode1)?;
         let swaps = metric(&url, "swaps_total")?;
@@ -2447,23 +2410,11 @@ mod gate {
         let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy0 = busy_total(&url, decode0)?;
         let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
-        let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
-        let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
-        let mut together = Vec::new();
-        for ((h, rx), what) in [(first, "default A"), (second, "default B")] {
-            h.join()
-                .map_err(|_| format!("slots-default: the {what} request's thread panicked"))?;
-            let ran = rx.recv().map_err(|_| {
-                format!("slots-default: the {what} request's thread gave no answer")
-            })?;
-            match ran {
-                Ok(s) => together.push(Some(s)),
-                Err(e) => {
-                    println!("slots-default: the {what} request failed: {e}");
-                    together.push(None);
-                }
-            }
-        }
+        let runs = vec![
+            (streamed(&addr, &a_ids, SLOTS_PREDICT)?, "default A"),
+            (streamed(&addr, &b_ids, SLOTS_PREDICT)?, "default B"),
+        ];
+        let together = answers("slots-default", runs)?;
         let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy1 = busy_total(&url, decode1)?;
         let swaps = metric(&url, "swaps_total")?;
@@ -3008,8 +2959,16 @@ mod gate {
     ) -> Result<bool, GateError> {
         let mut ok = true;
         let alone = vec![
-            run_sampled(addr, ids[0], SLOTS_PREDICT, ignore_eos, "alone A")?,
-            run_sampled(addr, ids[1], SLOTS_PREDICT, ignore_eos, "alone B")?,
+            answer(
+                name,
+                sampled_stream(addr, ids[0], SLOTS_PREDICT, ignore_eos)?,
+                "alone A",
+            )?,
+            answer(
+                name,
+                sampled_stream(addr, ids[1], SLOTS_PREDICT, ignore_eos)?,
+                "alone B",
+            )?,
         ];
         let before = seat_log(err_log)?.all(&record::SLOTS_ROUND)?.len();
         let runs = vec![
@@ -3067,7 +3026,11 @@ mod gate {
         ids: [&[u32]; 2],
     ) -> Result<bool, GateError> {
         let mut ok = sampled_pair("slots_drafted_sampled", addr, err_log, ids, true)?;
-        let alone = run_sampled(addr, ids[0], SLOTS_PREDICT, false, "alone long")?;
+        let alone = answer(
+            "slots-drafted-sampled",
+            sampled_stream(addr, ids[0], SLOTS_PREDICT, false)?,
+            "alone long",
+        )?;
         let runs = vec![
             (
                 sampled_stream(addr, ids[0], SLOTS_PREDICT, false)?,
@@ -3132,21 +3095,10 @@ mod gate {
             polls += 1;
         }
         let second = streamed(addr, ids[1], SLOTS_PREDICT)?;
-        let mut late = Vec::new();
-        for ((h, rx), what) in [(first, what[0]), (second, what[1])] {
-            h.join()
-                .map_err(|_| format!("slots-drafted: the late {what} request's thread panicked"))?;
-            let ran = rx.recv().map_err(|_| {
-                format!("slots-drafted: the late {what} request's thread gave no answer")
-            })?;
-            match ran {
-                Ok(s) => late.push(Some(s)),
-                Err(e) => {
-                    println!("slots-drafted: the late {what} request failed: {e}");
-                    late.push(None);
-                }
-            }
-        }
+        let late = answers(
+            "slots-drafted late",
+            vec![(first, what[0]), (second, what[1])],
+        )?;
         Ok((polls, late))
     }
 
@@ -3198,7 +3150,7 @@ mod gate {
             .into());
         }
         let decode0 = metric(url, "n_decode_total")?.unwrap_or(f64::NAN);
-        let (h, rx) = streamed(addr, a_ids, SLOTS_PREDICT)?;
+        let run = streamed(addr, a_ids, SLOTS_PREDICT)?;
         let mut polls = 0;
         while polls < DRAFTED_LATE_POLLS
             && metric(url, "n_decode_total")?.unwrap_or(decode0)
@@ -3215,18 +3167,7 @@ mod gate {
             .iter()
             .filter(|r| r.u64("rows") == Ok(2))
             .count();
-        h.join()
-            .map_err(|_| "slots-drafted off: the drafted request's thread panicked")?;
-        let drafted = match rx
-            .recv()
-            .map_err(|_| "slots-drafted off: the drafted request's thread gave no answer")?
-        {
-            Ok(s) => Some(s),
-            Err(e) => {
-                println!("slots-drafted off: the drafted request failed: {e}");
-                None
-            }
-        };
+        let drafted = answer("slots-drafted off", run, "drafted")?;
         let f = greedy(url, err_log, &strip, n, false)?;
         f.show("slots-drafted off: the same ids fresh");
         // PIN(2026-10-12): the cut rejoins the slot's draft at the turn's end (round kp-draft),
