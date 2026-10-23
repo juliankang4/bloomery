@@ -1769,20 +1769,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             (with.plan, bytes)
         }
     };
-    // The one-column rule holds at the plan the load runs: the cache's
-    // bound only lowers the context the rule read, which leaves the card
-    // more experts and the host fewer, so a paged load whose slots step
-    // together is the seat's own breach. The rule serves the asked count,
-    // so several slots that step together are that breach.
-    if plan.host.nvme_arena_bytes > 0 && pass.together(slots) {
-        return Err(format!(
-            "the load's plan pages host experts through the NVMe tier's {} B RAM arena at \
-             {slots} slots, the draft {}: the one-column rule read another plan",
-            plan.host.nvme_arena_bytes,
-            if mtp { "on" } else { "off" }
-        )
-        .into());
-    }
+    // PIN(2026-10-23): the planner's slot-aware arena floor replaces the one-column
+    // refusal; a paged pass reads every slot's experts through the same arena.
     let line = Record::new(&record::PLAN38)
         .w("place", a.place.name())
         .w("card", machine.cards[0].name.as_str())
@@ -1924,7 +1912,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 /// The terms of a plan that the seat's records and rules read: the stage
 /// card's experts a layer and in all, the host leg's experts, the routed
 /// bytes it holds resident and on the NVMe tier, that tier's RAM arena (the
-/// one-column rule's term), the tables the host holds and the experts the
+/// paged rule's term), the tables the host holds and the experts the
 /// tier cards hold. The main thread records them from the plan it ruled by;
 /// the engine thread holds the plan it loads by to them ([`Q38::open`]).
 #[derive(Clone, Debug)]

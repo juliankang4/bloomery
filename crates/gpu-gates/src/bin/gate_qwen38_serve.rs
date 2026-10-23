@@ -4609,7 +4609,8 @@ mod gate {
         // with its file there, its plan pages, and the run drafts nothing —
         // its `load draft=off` record names the paged rule at the arena it
         // names, and no `load draft=mtp` line prints. The residency is pinned
-        // off, as at the small card. It runs whole: `-n 2` past its load.
+        // off, as at the small card. It runs whole: `-n 2` past its load. The
+        // four-slot run sets the draft off and answers each slot from the arena.
         for slots in [1, 4] {
             let mut cmd =
                 Command::new(std::env::current_exe()?.with_file_name("generate_qwen3moe"));

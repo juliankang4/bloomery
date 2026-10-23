@@ -188,8 +188,8 @@
 //! pages host experts through the NVMe tier's RAM arena keeps the slots it
 //! was asked (`bloomery_levers::paged_draft`, asked of the plan the run
 //! loads): an unset draft goes off there (`unset: the plan pages …`), a set
-//! one runs, and `BLOOMERY_GEN_SLOTS` past one is refused by the load's
-//! one-column check.
+//! one runs. Plain passes serve the requested `BLOOMERY_GEN_SLOTS`, with
+//! the arena floor sized for their columns by the placement planner.
 //!
 //! Drafting (`BLOOMERY_DRAFT=mtp`, or unset as above; a qwen4exp file only,
 //! every other family and word refused by name — `dspark` on a qwen35moe file
@@ -1287,8 +1287,8 @@ mod cli {
     /// experts through the NVMe tier's RAM arena an unset draft goes off
     /// (`Draft38Off::Paged`, the `load draft=off` record's why) and a set
     /// `BLOOMERY_DRAFT=mtp` runs. The run's slots are the lever's alone:
-    /// unset, one; a set count past one is refused by the load's own
-    /// one-column check below, a plain path on a paged plan.
+    /// unset, one; a set count runs a plain pass on the paged plan, whose
+    /// arena floor counts its columns.
     fn paged38(
         file: &Split,
         levers: &Levers,
@@ -2406,7 +2406,7 @@ mod cli {
     enum Chosen {
         Qwen3(PrefillPath, Option<Place>),
         Qwen35(PrefillPath, Option<Place>),
-        /// The host's room as the run read it once: the one-column rule
+        /// The host's room as the run read it once: the paged draft rule
         /// ([`paged38`]) and the load plan by the same reading.
         Qwen38(Prompt38, Place, Draft38, (u64, HostRead)),
         NemotronH(PromptNh),
@@ -2773,16 +2773,8 @@ mod cli {
             experts,
             slots,
         )?;
-        // A paged plan steps one column (the module doc's rule): several
-        // slots at an arena is a plan the rule does not serve.
-        if plan.host.nvme_arena_bytes > 0 && slots > 1 {
-            return Err(format!(
-                "the load's plan pages host experts through the NVMe tier's {} B RAM arena at \
-                 {slots} slots: the one-column rule read another plan",
-                plan.host.nvme_arena_bytes
-            )
-            .into());
-        }
+        // PIN(2026-10-23): the planner's slot-aware arena floor replaces the
+        // one-column refusal; the paged pass serves the requested slots.
         println!("{}", plan38_line(place, experts, &plan, &inputs.room.1)?);
         for line in record::host_only(
             plan.model,
@@ -2891,13 +2883,13 @@ mod cli {
             &mtp,
             experts,
         )?;
-        // A paged plan steps one column ([`paged38`]'s rule, the module
-        // doc): an unset draft this load still drafts was a plan the rule
+        // The paged draft rule ([`paged38`], the module doc): an unset draft
+        // this load still drafts was a plan the rule
         // read another way, and a set one runs on the paged plan it read.
         if plan.plan.host.nvme_arena_bytes > 0 && levers.draft().is_none() {
             return Err(format!(
                 "the drafted load's plan pages host experts through the NVMe tier's {} B RAM \
-                 arena: the one-column rule read another plan",
+                 arena: the paged draft rule read another plan",
                 plan.plan.host.nvme_arena_bytes
             )
             .into());
