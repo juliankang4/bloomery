@@ -206,11 +206,11 @@ generate_ds41   hc_gated_mix_4                           0           0
 generate_ds41   hc_gated_norm_4                          0           0
 generate_ds41   hc_gated_norm_4w                         0           0
 generate_ds41   hc_gated_up_mix_4x320                    0           0
+generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 # PIN(2026-10-23): the new HC fused entry, ptxas 13.3.73 sm_86 and GB10 driver 595.84.
 # generate_ds41 (gpu,deepseek41): 24 spill bytes and 32 driver-JIT local bytes per thread.
 # PIN(2026-10-23): 24 -> 920 spill bytes, 32 -> 96 driver-JIT local bytes: the 128 by 128 MMA tile
 # gives each thread 64 cells, and the fused mix holds half of them while it mixes the other half.
-generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mma_mix_4                  920          96
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
