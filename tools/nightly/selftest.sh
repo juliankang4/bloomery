@@ -34,9 +34,9 @@ def check(name, ok, detail):
 
 with tempfile.TemporaryDirectory(prefix="output-owner-") as tmp:
     t = pathlib.Path(tmp)
-    def run(body, *args):
+    def run(body, *args, cwd=None):
         return subprocess.run(["bash", "-c", body, "_", *map(str, args)],
-                              input="release\n", capture_output=True, text=True, timeout=10)
+                              input="release\n", cwd=cwd, capture_output=True, text=True, timeout=10)
     common = 'set -euo pipefail; ROOT=$1; OUT=$2; DRY=0; RC=73; die() { echo "$*" >&2; exit "$RC"; }; '
     contrib = (root / "tools/contrib-check.sh").read_text()
     allocation = contrib[contrib.index('STAMP=$(date '):contrib.index("add fmt ")]
@@ -107,10 +107,19 @@ with tempfile.TemporaryDirectory(prefix="output-owner-") as tmp:
     arm_fn = replay[replay.index('run_arm() {'):replay.index('# A base with the budget refusal')]
     end_check = replay[replay.index('for arm in base new; do', replay.index('wait "$newpid"')):replay.index('# Both walls')]
     body = 'set -euo pipefail; WORK=$1; OUT=$2; LIST=/dev/null; ' + arm_fn
-    body += '\nrun_arm base; run_arm new; printf 0 > "$OUT/base.rc"; printf 0 > "$OUT/new.rc";\n' + end_check
+    body += '\nrun_arm base; run_arm new;\n' + end_check.replace(
+        '  rc=$(cat ', '  printf 0 > "$OUT/base.rc"; printf 0 > "$OUT/new.rc"\n  rc=$(cat ')
     result = run(body, work, out)
     check("batch-replay refuses its own failed arm despite foreign rc files",
           result.returncode == 70 and "new arm ended rc=1" in result.stderr, result.stderr.strip())
+    (t / "fixture.list").write_text("gate-probe\n")
+    (work / "new/tools/gate-batch.sh").write_text('[ -f "$4" ] || exit 65\necho list-ok\n')
+    inputs = replay[replay.index('LIST=$1 RUNLOG=$2'):replay.index('command -v just')]
+    for path in ("fixture.list", str(t / "fixture.list")):
+        body = 'set -euo pipefail; WORK=$1; OUT=$2; set -- "$3" "$3"; ' + inputs + arm_fn
+        result = run(body + '\nrun_arm new; cat "$OUT/new.log"', work, out, path, cwd=t)
+        check(f"batch-replay keeps the list path across arm directories: {path}",
+              result.returncode == 0 and result.stdout.strip() == "list-ok", result.stdout + result.stderr)
 
     repo = t / "repo"
     (repo / "tools/ref").mkdir(parents=True)

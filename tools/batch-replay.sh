@@ -30,6 +30,7 @@ case $SCALE in '' | *[!0-9]* | 0) echo "batch-replay: --scale is a whole number 
 LIST=$1 RUNLOG=$2
 [ -f "$LIST" ] || { echo "batch-replay: $LIST: not a file" >&2; exit 64; }
 [ -f "$RUNLOG" ] || { echo "batch-replay: $RUNLOG: not a file" >&2; exit 64; }
+case "$LIST" in /*) ;; *) LIST=$PWD/$LIST ;; esac
 command -v just > /dev/null || { echo "batch-replay: just is not on PATH" >&2; exit 64; }
 command -v python3 > /dev/null || { echo "batch-replay: python3 is not on PATH" >&2; exit 64; }
 # shellcheck source=tools/nightly/units.sh
