@@ -40,8 +40,9 @@
 //! the state is read only once the copy has landed ([`Pending::land`]). The
 //! rows the copy reads are not cut, reset or replaced before then.
 //!
-//! The host memory of a state taken by [`SeqState::save`] is pageable: each
-//! copy runs on the engine stream, one synchronize at the end.
+//! The host memory of a state taken by [`SeqState::save`] is pageable, every
+//! page written by the host before the copies ([`crate::tensor::dtoh_2d`]):
+//! each copy runs on the engine stream, one synchronize at the end.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -559,8 +560,11 @@ impl<T> SeqState<T> {
         let runs = lent.runs();
         let strips = plan_whole(&runs).map_err(|e| shape(e.to_string()))?;
         let one: usize = lens.iter().sum();
-        let mut rows = vec![0u16; runs.iter().map(Run::values).sum()];
-        let mut recurrent = vec![0f32; one * (1 + points.len())];
+        // Filled before the copies overwrite them, so that the host has
+        // written every page (`dtoh_2d`); a zero fill would come back from
+        // the allocator as pages nothing has written yet.
+        let mut rows = vec![u16::MAX; runs.iter().map(Run::values).sum()];
+        let mut recurrent = vec![f32::NAN; one * (1 + points.len())];
         let (rows_at, rows_len) = (rows.as_mut_ptr().cast::<u8>(), rows.len() * 2);
         let rec_at = recurrent.as_mut_ptr().cast::<u8>();
         // SAFETY: both vectors are neither read nor freed before the

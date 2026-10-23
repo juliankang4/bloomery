@@ -320,10 +320,15 @@ impl Pitched {
 /// memory at `host`, `host_len` bytes of it: one call for a strided store.
 /// Refused by name, nothing enqueued, when either span leaves its buffer.
 ///
+/// The destination that costs only the copy is page-locked memory of `dev`'s
+/// context (a pinned buffer or an extent of one). A pageable one costs its
+/// pages too: a card that reads the host's page tables (unified memory)
+/// faults on each page the copy is the first to write, one page at a time,
+/// so a pageable destination has every page written by the host first.
+///
 /// # Safety
 ///
-/// - `host .. host + host_len` must be page-locked memory of `dev`'s context
-///   (a pinned buffer or an extent of one) and writable.
+/// - `host .. host + host_len` must be writable.
 /// - Nothing may read, write or free it until the copy has completed: an
 ///   event recorded on `stream` after this call and waited for, or a
 ///   synchronize of `stream`.
