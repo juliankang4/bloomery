@@ -1915,7 +1915,7 @@ impl Gemm32Kernels {
             &mut act.s,
             fault,
         )?;
-        act.filled = n_slots;
+        act.fill(n_slots);
         Ok(())
     }
 }

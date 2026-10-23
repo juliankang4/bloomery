@@ -89,8 +89,8 @@ use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
-    Bf16Rows, F32T_THREADS_U32, MMA_THREADS, STAGE_FLOATS, STAGES, bf16_mma_body, bf16_mma_launch,
-    f32_tile_body, tile_launch,
+    Bf16Rows, F32Cols, F32T_THREADS_U32, MMA_THREADS, STAGE_FLOATS, STAGES, bf16_mma_body,
+    bf16_mma_launch, f32_tile_body, tile_launch,
 };
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
@@ -1933,7 +1933,7 @@ mod q8f32_kernels {
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
         // SAFETY: the checked launch supplies 256 converged threads, the grid,
         // aligned activations and the weight and output spans in the contract.
-        unsafe { bf16_mma_body(Bf16Rows(w), x, rows, k, n, &mut y, sh) };
+        unsafe { bf16_mma_body(Bf16Rows(w), F32Cols(x), rows, k, n, &mut y, sh) };
     }
 
     /// Q8_0 gemv against one f32 activation column, `y[r] = Σ_k' w[r, k'] ·

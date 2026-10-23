@@ -508,7 +508,13 @@ gguf 7 2 0
 # the table walk, with its SAFETY line. This scan owns ExpertId validation in place of the store and refused-slot arms.
 # PIN(2026-10-24): gpu 2282 -> 2302 blocks: the fused SwiGLU refused-slot arm calls quant32_group
 # instead of writing its three planes directly; the place read and quantizer call each state their SAFETY invariant.
-gpu 2302 285 10
+# PIN(2026-10-24): gpu 2302 -> 2314 blocks, 285 -> 295 fns, new code, not old code relaxed: the dense MMA tile's
+# activation source (`f32tile::MmaCols`: three unsafe fns declared, and F32Cols' and Bf16Cols' three each, the F32 piece
+# load moved out of the tile, its landing, the refusal word read and the words' copy), the tile's calls through it in
+# place of its F32 load and two landings, the BF16 form's rounding body (`bf16_cols_body`, an unsafe fn: its load, its
+# landing and its refusal store), and the kernel entries (kernels32.rs: bf16_cols' body call, bf16_mma_cols_gemm's
+# shared-memory view and body call). Each block has its SAFETY line.
+gpu 2314 295 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

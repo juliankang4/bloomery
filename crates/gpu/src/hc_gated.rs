@@ -73,10 +73,10 @@ use crate::cores::l2_prefetch;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
-    Bf16Rows, F32Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmRoute,
-    MMA_CELLS, MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH,
-    MmaRows, MmaTile, STAGE_FLOATS, STAGES, TileRows, bf16_mma_body, bf16_mma_launch,
-    bf16_mma_tile, land_values, mma_launch, mma_tile_origin,
+    Bf16Rows, F32Cols, F32Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput,
+    GemmRoute, MMA_CELLS, MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS,
+    MMA_WARP_SCRATCH, MmaCols, MmaRows, MmaTile, STAGE_FLOATS, STAGES, TileRows, bf16_mma_body,
+    bf16_mma_launch, bf16_mma_tile, land_values, mma_launch, mma_tile_origin,
 };
 use crate::linear::{sigmoid, silu};
 use crate::q8f32::{
@@ -1733,17 +1733,12 @@ impl MmaRows for HcDownRows<'_> {
             unsafe { Bf16Rows(self.down).fetch(dst, at) };
             return true;
         }
-        let p = self
-            .inject
-            .as_ptr()
-            .wrapping_add(at - self.split)
-            .cast::<F32x4>();
-        // SAFETY: p starts the inject's values `at - split ..` of eight, inside
-        // its rows, 16-byte aligned (a multiple of 8 from the checked base).
-        let [F32x4([a0, a1, a2, a3]), F32x4([b0, b1, b2, b3])] = unsafe { [*p, *p.add(1)] };
+        // SAFETY: the inject's values `at - split ..` of eight lie inside its
+        // rows, 16-byte aligned (a multiple of 8 from the checked base).
+        let v = unsafe { F32Cols(self.inject).fetch(dst, at - self.split) };
         // SAFETY: dst is this thread's own aligned 16 bytes, which no warp
         // reads before the barrier after this fetch's wait.
-        unsafe { land_values([a0, a1, a2, a3, b0, b1, b2, b3], dst) }
+        unsafe { land_values(v, dst) }
     }
 
     #[inline(always)]
@@ -1917,7 +1912,8 @@ mod hc_wide_kernels {
         }
         // SAFETY: the checked launch supplies the shared allocation, 256 threads,
         // the MMA grid, aligned bottleneck columns and the complete BF16 weight.
-        let Some(mut tile) = (unsafe { bf16_mma_tile(rows, lo, wide as u32, RANK as u32, m, sh) })
+        let Some(mut tile) =
+            (unsafe { bf16_mma_tile(rows, F32Cols(lo), wide as u32, RANK as u32, m, sh) })
         else {
             return;
         };
@@ -2198,7 +2194,7 @@ mod hc_wide_kernels {
         unsafe {
             bf16_mma_body(
                 rows,
-                xn,
+                F32Cols(xn),
                 (RANK + STREAMS) as u32,
                 wide as u32,
                 m,

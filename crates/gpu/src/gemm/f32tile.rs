@@ -30,12 +30,16 @@
 //!
 //! GB10 prompt sites select [`bf16_mma_body`] for BF16 and E4M3 weights.
 //! It rounds activations and decoded weights to BF16 and accumulates in F32.
+//! A BF16 site whose input holds its columns already rounded
+//! ([`bf16_cols_body`], `GemmAct32::with_bf16`) copies those words instead,
+//! with the same bits.
 //! A cell whose row or column stages an operand outside the tensor cores'
 //! range is recomputed by the exact F32 owner, in its exponent range and
 //! reduction order; every other cell keeps its MMA value, so a cell's bits
 //! depend on its own row and column alone. The exact tile entries stay
 //! available.
 
+use super::GemmAct32;
 use super::gemm32::{GEMM32_GROUP, raster32};
 use super::kernels32::Gemm32Kernels;
 use crate::q8f32::{
@@ -590,8 +594,8 @@ impl<F: ByteBlocks<Scale = u32>> MmaRows for ByteRows<'_, F> {
 ///
 /// # Safety
 ///
-/// `dst` is 16 bytes of shared memory, 16-byte aligned, that this thread
-/// alone writes and no warp reads before the barrier after this store.
+/// `dst` is 16 bytes, 16-byte aligned, that this thread alone writes and no
+/// thread reads before the barrier after this store.
 #[inline(always)]
 pub(crate) unsafe fn land_values(v: [f32; 8], dst: *mut u32) -> bool {
     let fits = mma_fits(v[0])
@@ -631,6 +635,155 @@ pub(crate) fn mma_tile_origin<W: MmaRows>(rows: usize, n: usize) -> Option<(usiz
     let row0 = row_tile * MMA_ROWS;
     let col0 = col_tile * MMA_COLS;
     Some((row0, col0))
+}
+
+/// Activations that the MMA tile stages as BF16 pieces of eight values,
+/// column `c`'s value `i` at `c·K + i`.
+pub(crate) trait MmaCols: Copy {
+    /// What a thread holds of one piece between [`Self::fetch`] and
+    /// [`Self::land`].
+    type Piece: Copy + Default;
+
+    /// The f32 columns the exact owner replays.
+    fn exact(&self) -> &[f32];
+
+    /// Whether column `c` holds a value [`mma_fits`] refuses, known before
+    /// any piece is staged; false when [`Self::land`] checks each piece.
+    ///
+    /// # Safety
+    ///
+    /// `c` is a live column.
+    unsafe fn refused(self, c: usize) -> bool;
+
+    /// Starts moving values `at .. at + 8` to the 16 bytes at `dst`, as
+    /// [`MmaRows::fetch`] does.
+    ///
+    /// # Safety
+    ///
+    /// [`MmaRows::fetch`]'s, over the columns.
+    unsafe fn fetch(self, dst: *mut u32, at: usize) -> Self::Piece;
+
+    /// Stores a fetched piece at `dst` as BF16 rounded to nearest even; false
+    /// when a value fails [`mma_fits`].
+    ///
+    /// # Safety
+    ///
+    /// `piece` is one [`Self::fetch`]'s, and `dst` is its 16 bytes.
+    unsafe fn land(piece: Self::Piece, dst: *mut u32) -> bool;
+}
+
+/// F32 activations, loaded a piece at a time and rounded as they are staged.
+#[derive(Clone, Copy)]
+pub(crate) struct F32Cols<'a>(pub &'a [f32]);
+
+impl MmaCols for F32Cols<'_> {
+    type Piece = [f32; 8];
+
+    #[inline(always)]
+    fn exact(&self) -> &[f32] {
+        self.0
+    }
+
+    #[inline(always)]
+    unsafe fn refused(self, _: usize) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    unsafe fn fetch(self, _: *mut u32, at: usize) -> [f32; 8] {
+        let p = self.0.as_ptr().wrapping_add(at).cast::<F32x4>();
+        // SAFETY: p starts eight values of a live column inside x, 16-byte
+        // aligned (x aligned, at a multiple of 8).
+        let [F32x4([a0, a1, a2, a3]), F32x4([b0, b1, b2, b3])] = unsafe { [*p, *p.add(1)] };
+        [a0, a1, a2, a3, b0, b1, b2, b3]
+    }
+
+    #[inline(always)]
+    unsafe fn land(v: [f32; 8], dst: *mut u32) -> bool {
+        // SAFETY: dst is this fetch's 16 bytes (this fn's contract).
+        unsafe { land_values(v, dst) }
+    }
+}
+
+/// The same activations already rounded ([`bf16_cols_body`]): BF16 words,
+/// two values a word in increasing order, copied asynchronously as a BF16
+/// weight's are, and a word a column that is nonzero when one of the
+/// column's f32 values fails [`mma_fits`]. The f32 columns stay for the
+/// replay.
+#[derive(Clone, Copy)]
+pub(crate) struct Bf16Cols<'a> {
+    pub words: &'a [u32],
+    pub refused: &'a [u32],
+    pub exact: &'a [f32],
+}
+
+impl MmaCols for Bf16Cols<'_> {
+    type Piece = ();
+
+    #[inline(always)]
+    fn exact(&self) -> &[f32] {
+        self.exact
+    }
+
+    #[inline(always)]
+    unsafe fn refused(self, c: usize) -> bool {
+        // SAFETY: a live column has its word (this fn's contract).
+        unsafe { *self.refused.get_unchecked(c) != 0 }
+    }
+
+    #[inline(always)]
+    unsafe fn fetch(self, dst: *mut u32, at: usize) {
+        // SAFETY: the columns' words are laid out as a BF16 weight's rows, and
+        // this fn's contract is Bf16Rows::fetch's over them.
+        unsafe { Bf16Rows(self.words).fetch(dst, at) };
+    }
+
+    #[inline(always)]
+    unsafe fn land(_: (), _: *mut u32) -> bool {
+        true
+    }
+}
+
+/// Threads of a [`bf16_cols_body`] block: a warp a column.
+pub(crate) const BF16_COLS_THREADS: u32 = 256;
+
+/// The first `n` columns of `k` f32 values (`k` a multiple of 8) as
+/// [`Bf16Cols`]' words, each value rounded exactly as [`land_values`] rounds
+/// it, and each column's refusal word. Block `b`'s warp `w` writes column
+/// `8b + w`.
+///
+/// # Safety
+///
+/// x holds n aligned K-value columns, words n·K/2 and refused n.
+#[inline(always)]
+pub(crate) unsafe fn bf16_cols_body(
+    x: &[f32],
+    k: u32,
+    n: u32,
+    words: &mut DisjointSlice<u32>,
+    refused: &mut DisjointSlice<u32>,
+) {
+    let (k, n) = (k as usize, n as usize);
+    let c = thread::blockIdx_x() as usize * (BF16_COLS_THREADS as usize / 32)
+        + thread::threadIdx_x() as usize / 32;
+    let lane = warp::lane_id() as usize;
+    let mut fits = true;
+    if c < n {
+        let mut piece = lane;
+        while piece < k / 8 {
+            let at = c * k + 8 * piece;
+            // SAFETY: values at .. at + 8 lie in column c of x (this fn's contract).
+            let v = unsafe { F32Cols(x).fetch(core::ptr::null_mut(), at) };
+            // SAFETY: words at/2 .. at/2 + 4 are this lane's own, 16-byte aligned.
+            fits &= unsafe { land_values(v, words.as_mut_ptr().add(at >> 1)) };
+            piece += 32;
+        }
+    }
+    let refuse = warp::any(!fits);
+    if c < n && lane == 0 {
+        // SAFETY: lane 0 of column c's warp is its word's only writer.
+        unsafe { *refused.get_unchecked_mut(c) = u32::from(refuse) };
+    }
 }
 
 /// Cells of a thread's MMA fragments: four row by four column tiles of four.
@@ -834,13 +987,14 @@ impl MmaTile {
 /// whether the tile replays. Activations and decoded weights round once to
 /// BF16; accumulation is F32, each output's 16-value MMA steps in increasing K.
 ///
-/// Both operands are staged as BF16 lines, three stages deep: the weight's
-/// pieces through [`MmaRows`] (a BF16 weight by asynchronous copy, two stages
-/// ahead), the activations loaded two stages ahead and converted after the
-/// current stage's products. Each warp reads its fragments with `ldmatrix`.
-/// The tile keeps, per thread, which of its staged lines held an operand
-/// [`mma_fits`] refuses; [`MmaTile::needs_replay`] marks the cells of those
-/// rows and columns for the exact owner.
+/// Both operands are staged as BF16 lines, three stages deep, two stages
+/// ahead: the weight's pieces through [`MmaRows`] (a BF16 weight by
+/// asynchronous copy) and the activations' through [`MmaCols`] (F32 values
+/// loaded and converted after the current stage's products, or rounded BF16
+/// words copied). Each warp reads its fragments with `ldmatrix`. The tile
+/// keeps, per thread, which of its staged lines held an operand [`mma_fits`]
+/// refuses; [`MmaTile::needs_replay`] marks the cells of those rows and
+/// columns for the exact owner.
 ///
 /// # Safety
 ///
@@ -857,9 +1011,9 @@ impl MmaTile {
     clippy::question_mark,
     reason = "the kernel's early return on the raster; a `?` would move its PTX"
 )]
-pub(crate) unsafe fn bf16_mma_tile<W: MmaRows>(
+pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
     w: W,
-    x: &[f32],
+    x: X,
     rows: u32,
     k: u32,
     n: u32,
@@ -887,30 +1041,25 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows>(
         (row0 + line).min(rows - 1) * kk + 8 * slot,
         (row0 + line + MMA_PASS_LINES).min(rows - 1) * kk + 8 * slot,
     ];
-    let x_src = [
-        (col0 + line).min(n - 1) * kk + 8 * slot,
-        (col0 + line + MMA_PASS_LINES).min(n - 1) * kk + 8 * slot,
+    let cols = [
+        (col0 + line).min(n - 1),
+        (col0 + line + MMA_PASS_LINES).min(n - 1),
     ];
+    let x_src = [cols[0] * kk + 8 * slot, cols[1] * kk + 8 * slot];
     let w_dst = [
         mma_piece_at(line, slot),
         mma_piece_at(line + MMA_PASS_LINES, slot),
     ];
     let x_dst = [MMA_COLS_AT + w_dst[0], MMA_COLS_AT + w_dst[1]];
-    // The eight activations of piece i at stage s, s < stages.
-    let fetch_x = |s: usize, i: usize| {
-        let p = x
-            .as_ptr()
-            .wrapping_add(x_src[i] + s * MMA_LINE)
-            .cast::<F32x4>();
-        // SAFETY: p starts eight values of a live column inside x, 16-byte
-        // aligned (x aligned, offsets multiples of 8).
-        let [F32x4([a0, a1, a2, a3]), F32x4([b0, b1, b2, b3])] = unsafe { [*p, *p.add(1)] };
-        [a0, a1, a2, a3, b0, b1, b2, b3]
-    };
 
     // Bit i (2 + i) is set once this thread stages a value of its weight
     // (activation) line i that fails mma_fits.
     let mut bad = 0u32;
+    for i in 0..2 {
+        thread::__unroll_config::<0>();
+        // SAFETY: cols[i] < n is a live column.
+        bad |= u32::from(unsafe { x.refused(cols[i]) }) << (2 + i);
+    }
     for s in 0..2 {
         thread::__unroll_config::<0>();
         let stage = words.wrapping_add(s * STAGE_FLOATS);
@@ -923,9 +1072,11 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows>(
             let piece = unsafe { w.fetch(dst, at) };
             // SAFETY: that fetch's piece and bytes.
             bad |= u32::from(!unsafe { W::land(piece, dst, at) }) << i;
-            let v = fetch_x(s, i);
-            // SAFETY: this thread's own aligned activation piece of the stage.
-            bad |= u32::from(!unsafe { land_values(v, stage.wrapping_add(x_dst[i])) }) << (2 + i);
+            let dst = stage.wrapping_add(x_dst[i]);
+            // SAFETY: as the weight's, in this thread's own activation piece.
+            let piece = unsafe { x.fetch(dst, x_src[i] + s * MMA_LINE) };
+            // SAFETY: that fetch's piece and bytes.
+            bad |= u32::from(!unsafe { X::land(piece, dst) }) << (2 + i);
         }
         // SAFETY: commits this thread's copies of stage s as one group.
         unsafe { cp_async_commit_group() };
@@ -956,11 +1107,13 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows>(
                 thread::__unroll_config::<0>();
                 let at = w_src[step] + (s + 2) * MMA_LINE;
                 let mut piece = W::Piece::default();
-                let mut xs = [0.0; 8];
+                let mut xs = X::Piece::default();
                 if ahead {
                     // SAFETY: stage s + 2 lies inside K; the piece is this thread's.
                     piece = unsafe { w.fetch(next.wrapping_add(w_dst[step]), at) };
-                    xs = fetch_x(s + 2, step);
+                    let x_at = x_src[step] + (s + 2) * MMA_LINE;
+                    // SAFETY: as the weight's, in the activation piece.
+                    xs = unsafe { x.fetch(next.wrapping_add(x_dst[step]), x_at) };
                 }
                 if step == 1 {
                     // SAFETY: commits this pass's copies as one group, empty near the end.
@@ -1003,7 +1156,7 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows>(
                 if ahead {
                     // SAFETY: this thread's own aligned activation piece of stage
                     // s + 2, which no warp reads before the next pass's barrier.
-                    let fits = unsafe { land_values(xs, next.wrapping_add(x_dst[step])) };
+                    let fits = unsafe { X::land(xs, next.wrapping_add(x_dst[step])) };
                     bad |= u32::from(!fits) << (2 + step);
                     // SAFETY: this step's fetch of stage s + 2, into its piece, as above.
                     let fits = unsafe { W::land(piece, next.wrapping_add(w_dst[step]), at) };
@@ -1042,9 +1195,9 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows>(
 /// The checked launch supplies 256 converged threads, aligned stages and x,
 /// rows*K weight values, n*K activations and rows*n disjoint output cells.
 #[inline(always)]
-pub(crate) unsafe fn bf16_mma_body<W: MmaRows>(
+pub(crate) unsafe fn bf16_mma_body<W: MmaRows, X: MmaCols>(
     w: W,
-    x: &[f32],
+    x: X,
     rows: u32,
     k: u32,
     n: u32,
@@ -1063,7 +1216,7 @@ pub(crate) unsafe fn bf16_mma_body<W: MmaRows>(
         // Publishes the marked stores and retires the flags' readers.
         thread::sync_threads();
         // SAFETY: spans and allocation are unchanged.
-        unsafe { tile.replay(w, x, (rows, k, n), y, sh) };
+        unsafe { tile.replay(w, x.exact(), (rows, k, n), y, sh) };
     } else {
         // SAFETY: the checked output belongs to this tile.
         unsafe { tile.store::<false>(y, rows, n) };
@@ -1171,6 +1324,51 @@ impl Gemm32Kernels {
                 module.fp8_b128_mma_gemm(stream, &prep, qs, e, x, t.rows, t.k, t.n, y)?;
             }
         }
+        Ok(())
+    }
+
+    /// `Q8F32Kernels::enqueue_bf16_mma`'s product, bit for bit, over the BF16
+    /// form `act` holds of the first `n` columns of `x`
+    /// ([`Self::enqueue_bf16_cols`]): the tile copies the rounded words, and
+    /// only a replay reads `x`. A form of other rows or of fewer columns is a
+    /// named `State` error. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_bf16_mma_cols(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        x: &DeviceBuffer<f32>,
+        act: &GemmAct32,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_bf16_mma_cols";
+        let t = bf16_mma_launch(what, w, x, n, y)?;
+        if act.k() != t.k as usize {
+            return Err(GpuError::shape(
+                what,
+                format!("act holds {} values a column, the weight {}", act.k(), t.k),
+            ));
+        }
+        let form = act.bf16_of(x, n).ok_or(GpuError::state(
+            what,
+            "act's BF16 form of x's first n columns (Gemm32Kernels::enqueue_bf16_cols)",
+        ))?;
+        let prep =
+            self.module
+                .prepare_bf16_mma_cols_gemm(LaunchConfig1D::new(t.grid, MMA_THREADS, 0))?;
+        let (words, refused) = (&form.words, &form.refused);
+        self.module.bf16_mma_cols_gemm(
+            stream,
+            &prep,
+            w.buf(),
+            x,
+            words,
+            refused,
+            t.rows,
+            t.k,
+            t.n,
+            y,
+        )?;
         Ok(())
     }
 }

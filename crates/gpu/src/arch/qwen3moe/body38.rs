@@ -1393,10 +1393,14 @@ impl Body38 {
     /// or not every layer, a
     /// layer or a width the kernels do not take, a `ubatch` outside
     /// `1..=min(UBATCH, ctx)`, a ubatch arena past what the plan's
-    /// scratch counts, and a stage card reserve for the card route's run
-    /// that the ubatch does not read (`place::card_route_run`). The card
+    /// scratch and reserves count, and a stage card reserve for the card
+    /// route's run or the model-width rows' BF16 form that the ubatch does
+    /// not read (`place::card_route_run`, `place::bf16_form_bytes`). The card
     /// route runs the whole ubatch at once on a card that reserves that run
-    /// (`place::widen_card_route`), else in runs of `ROUTE_ROWS` tokens.
+    /// (`place::widen_card_route`), else in runs of `ROUTE_ROWS` tokens. The
+    /// model-width rows' BF16 sites read the rows rounded once on a card that
+    /// reserves their form (`place::machine_for_experts`), else round them in
+    /// each tile.
     /// `file` is a GGUF split or a checkpoint folder ([`Model38`]); a
     /// folder's load is refused by name under a residency machine or with an
     /// MTP draft ([`Folder38`]).
@@ -1873,8 +1877,16 @@ impl Body38 {
         let tier = (!tiers.is_empty())
             .then(|| TierSide38::new(gpu, &map, cols))
             .transpose()?;
-        let mut wide = Wide38::new(stream, ub, route_run, &card, tier.is_some())?;
+        // The model-width rows' BF16 form takes the stage card's reserve for it.
+        let form = plan.machine.cards.first().map_or(Ok(0), |c| {
+            model::arch::qwen35moe::place::bf16_form_bytes(c, ub as u64)
+                .map_err(|e| GpuError::shape(WHAT, e.to_string()))
+        })?;
+        let hidden_sites: Vec<&str> = plans.iter().flat_map(Layer38::hidden_sites).collect();
+        let bf16_hid = form > 0 && crate::site::reads_bf16_cols(gpu, w, &hidden_sites);
+        let mut wide = Wide38::new(stream, ub, route_run, &card, tier.is_some(), bf16_hid)?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
+        let counted = counted + form;
         if wide_bytes > counted {
             return Err(GpuError::shape(
                 WHAT,

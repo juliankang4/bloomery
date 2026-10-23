@@ -168,6 +168,48 @@ pub(super) struct Layer38 {
     pub(super) ple: Option<PlePlan>,
 }
 
+impl GdnPlan {
+    /// The sites that read the mix's rows.
+    pub(super) fn input_sites(&self) -> [&str; 3] {
+        [&self.qkv, &self.z, &self.beta_alpha]
+    }
+}
+
+impl QsaPlan {
+    /// The sites that read the mix's rows.
+    pub(super) fn input_sites(&self) -> [&str; 5] {
+        [&self.q, &self.k, &self.v, &self.idx_k, &self.idx_q]
+    }
+}
+
+impl FfnPlan {
+    /// The shared expert's sites that read the block's input rows.
+    pub(super) fn shared_inputs(&self) -> [&str; 2] {
+        [&self.gate_sh, &self.up_sh]
+    }
+}
+
+impl PlePlan {
+    /// The sites that read the PLE rows.
+    pub(super) fn input_sites(&self) -> [&str; 2] {
+        [&self.key, &self.value]
+    }
+}
+
+impl Layer38 {
+    /// The layer's sites that read model-width rows: the mixer's, the shared
+    /// expert's gate and up, and the PLE site's.
+    pub(super) fn hidden_sites(&self) -> Vec<&str> {
+        let mut sites = match &self.mixer {
+            Mixer38::Gdn(p) => p.input_sites().to_vec(),
+            Mixer38::Qsa(p) => p.input_sites().to_vec(),
+        };
+        sites.extend(self.ffn.shared_inputs());
+        sites.extend(self.ple.iter().flat_map(PlePlan::input_sites));
+        sites
+    }
+}
+
 /// The joined name of layer `l`'s β and α stack.
 pub(super) fn beta_alpha(l: usize) -> String {
     format!("derived.blk.{l}.ssm_beta_alpha")

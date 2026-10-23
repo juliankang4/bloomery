@@ -9,7 +9,10 @@
 //! `f32tile.rs`) or are written out here.
 
 use super::act32::quant32_group;
-use super::f32tile::{ByteRows, F32Rows, STAGE_FLOATS, STAGES, bf16_mma_body, f32_tile_body};
+use super::f32tile::{
+    Bf16Cols, Bf16Rows, ByteRows, F32Cols, F32Rows, STAGE_FLOATS, STAGES, bf16_cols_body,
+    bf16_mma_body, f32_tile_body,
+};
 use super::gemm32::{
     B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, GEMM32_GROUP, GEMM32_RASTER_BYTES,
     GEMM32_THREADS_U32, IQ4_NL_BLOCK_BYTES, NV_CODE_W, NV_STAGE_W, NV_STAGES, Q5_1_BLOCK_WORDS,
@@ -1275,6 +1278,72 @@ mod gemm32_kernels {
         };
     }
 
+    /// The BF16 form of `n` f32 columns of `k` values (`act32.rs`'s
+    /// `enqueue_bf16_cols`): their rounded words and refusal words.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (n >= 1, x.len() >= n * k, 2 * words.len() >= n * k, refused.len() >= n)
+    )]
+    pub fn bf16_cols(
+        x: &[f32],
+        k: u32,
+        n: u32,
+        mut words: DisjointSlice<u32>,
+        mut refused: DisjointSlice<u32>,
+    ) {
+        // SAFETY: the checked launch supplies aligned columns and the spans in
+        // the contract.
+        unsafe { bf16_cols_body(x, k, n, &mut words, &mut refused) };
+    }
+
+    /// `q8f32`'s `bf16_mma_gemm` over activations already rounded to BF16
+    /// (`xb` and `refused`, [`bf16_cols`]), with the f32 columns `x` the
+    /// replay reads: the same bits.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            rows >= 1,
+            n >= 1,
+            2 * w.len() >= rows * k,
+            x.len() >= n * k,
+            2 * xb.len() >= n * k,
+            refused.len() >= n,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn bf16_mma_cols_gemm(
+        w: &[u32],
+        x: &[f32],
+        xb: &[u32],
+        refused: &[u32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        let cols = Bf16Cols {
+            words: xb,
+            refused,
+            exact: x,
+        };
+        // SAFETY: the checked launch supplies 256 converged threads, the grid,
+        // aligned weight and activation words and the spans in the contract.
+        unsafe { bf16_mma_body(Bf16Rows(w), cols, rows, k, n, &mut y, sh) };
+    }
+
     /// Dense prompt product with BF16 operands and F32 accumulation.
     #[kernel]
     #[launch_bounds(256)]
@@ -1307,7 +1376,7 @@ mod gemm32_kernels {
         unsafe {
             bf16_mma_body(
                 ByteRows::<Mxfp8Bytes>::new(qs, e),
-                x,
+                F32Cols(x),
                 rows,
                 k,
                 n,
@@ -1349,7 +1418,7 @@ mod gemm32_kernels {
         unsafe {
             bf16_mma_body(
                 ByteRows::<Fp8B128Bytes>::new(qs, e),
-                x,
+                F32Cols(x),
                 rows,
                 k,
                 n,

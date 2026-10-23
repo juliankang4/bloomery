@@ -1049,9 +1049,12 @@ pub fn gemm(
                     g32()?.enqueue_e4m3_mma(stream, t, f32_rows()?, m, y)
                 }
                 Planes::E4m3(t) => g32()?.enqueue_e4m3_tile(stream, t, f32_rows()?, m, y),
-                Planes::Bf16(t) => gpu
-                    .q8f32()
-                    .enqueue_bf16_prompt(stream, t, f32_rows()?, m, y),
+                Planes::Bf16(t) => match (x.q32, f32_rows()?) {
+                    (Some(act), rows) if gpu.q8f32().dense_mma && act.holds_bf16(rows, m) => {
+                        g32()?.enqueue_bf16_mma_cols(stream, t, rows, act, m, y)
+                    }
+                    (_, rows) => gpu.q8f32().enqueue_bf16_prompt(stream, t, rows, m, y),
+                },
             })
         }
         SiteTy::Q5_0 => {
@@ -1135,10 +1138,23 @@ fn wide_by_name(
     gemm(gpu, k, (ty, w, src), rows, x, table, m, y)
 }
 
-/// The q8 blocks of 32 of the first `m` columns of the f32 rows `x` into
-/// `q32` when a site of one of the resident weights `names` reads them
-/// ([`WideActs::wants`] of its type, [`of_resident`]): what
-/// [`resident_gemm`] reads for a Q8_0 or Q5_0 site.
+/// Whether a site of one of the resident weights `names` is BF16 on GB10's
+/// dense MMA tile, which copies its input's BF16 form when the input holds
+/// it ([`GemmAct32::with_bf16`]).
+#[must_use]
+pub(crate) fn reads_bf16_cols(gpu: &Gpu, w: &Weights, names: &[&str]) -> bool {
+    gpu.q8f32().dense_mma
+        && names
+            .iter()
+            .any(|n| w.get(n).and_then(of_resident) == Some(SiteTy::Bf16))
+}
+
+/// The forms of the first `m` columns of the f32 rows `x` that a site of one
+/// of the resident weights `names` reads into `q32`: the q8 blocks of 32
+/// ([`WideActs::wants`] of its type, [`of_resident`]), what [`resident_gemm`]
+/// reads for a Q8_0 or Q5_0 site; and the BF16 form ([`reads_bf16_cols`])
+/// when `q32` holds room for it. A BF16 form no site reads is left marked as
+/// another rows', so no later site reads it.
 pub fn resident_quantize(
     gpu: &Gpu,
     k: &WideKernels<'_>,
@@ -1158,6 +1174,17 @@ pub fn resident_quantize(
             "the 32-value kernels a site's q8 blocks of 32 are quantized by",
         )?
         .enqueue_quantize_gemm32(gpu.stream(), x, m, q32, sink)?;
+    }
+    if q32.has_bf16() {
+        if reads_bf16_cols(gpu, w, names) {
+            k.g32(
+                "site::resident_quantize",
+                "the 32-value kernels a site's BF16 form is rounded by",
+            )?
+            .enqueue_bf16_cols(gpu.stream(), x, m, q32)?;
+        } else {
+            q32.forget_bf16();
+        }
     }
     Ok(())
 }

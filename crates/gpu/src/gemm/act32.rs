@@ -4,9 +4,11 @@
 //! card-slots-only form over a remapped route (`swiglu_quant32_sel`), its
 //! form under a gate·up rule of `kquant::act`, ik's clamped SwiGLU among
 //! them (`swiglu_act_quant32`), and the squared-ReLU quantizer between a
-//! relu² expert's up and its down (`relu_sqr_quant32`). All entries are
-//! declared in `kernels32.rs`.
+//! relu² expert's up and its down (`relu_sqr_quant32`); and the BF16 form of
+//! the same columns a BF16 site on the dense MMA tile reads (`bf16_cols`).
+//! All entries are declared in `kernels32.rs`.
 
+use super::f32tile::BF16_COLS_THREADS;
 use super::kernels32::Gemm32Kernels;
 use super::{GEMM_MAX_SLOTS, GEMM32_STEP};
 use crate::fault::FaultSink;
@@ -14,6 +16,7 @@ use crate::kquant::Act;
 use crate::tensor::Q8ACT_MAX_K;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::vector::U32x4;
 use gguf::GgmlType;
 
 /// q8_1 activations with one scale and one code sum per 32 values, for up to
@@ -35,6 +38,10 @@ use gguf::GgmlType;
 /// The host remembers how many columns the last quantizer launch wrote
 /// ([`GemmAct32::filled`]): a GEMM that would read a column past them is
 /// refused by name rather than reading another call's bytes.
+///
+/// A scratch made [`GemmAct32::with_bf16`] also holds room for its columns
+/// rounded to BF16 ([`Bf16Form`]), which a BF16 site on GB10's dense MMA
+/// tile copies instead of rounding the f32 rows itself.
 pub struct GemmAct32 {
     #[cfg(bloomery_nvfp4_mma)]
     pub(super) native: Option<super::nvfp4mma::Act>,
@@ -44,7 +51,20 @@ pub struct GemmAct32 {
     pub(super) cols: usize,
     pub(super) k: usize,
     /// The column count of the last enqueued quantizer launch; 0 before one.
-    pub(super) filled: usize,
+    filled: usize,
+    pub(super) bf16: Option<Bf16Form>,
+}
+
+/// The BF16 form of a [`GemmAct32`]'s columns (`f32tile::Bf16Cols`): `k / 2`
+/// words a column, two values a word in increasing order, and a word a
+/// column that is nonzero when one of its f32 values falls outside the
+/// tensor cores' range.
+pub(super) struct Bf16Form {
+    pub(super) words: DeviceBuffer<u32>,
+    pub(super) refused: DeviceBuffer<u32>,
+    /// The f32 rows' address and the columns the last rounding launch read;
+    /// `None` before one and after a quantizer launch that rounded none.
+    pub(super) of: Option<(u64, usize)>,
 }
 
 impl GemmAct32 {
@@ -74,7 +94,57 @@ impl GemmAct32 {
             cols,
             k,
             filled: 0,
+            bf16: None,
         })
+    }
+
+    /// This scratch with room for its columns rounded to BF16 as well
+    /// ([`Gemm32Kernels::enqueue_bf16_cols`]). Load-time only.
+    pub fn with_bf16(mut self, stream: &CudaStream) -> Result<GemmAct32, GpuError> {
+        self.bf16 = Some(Bf16Form {
+            words: DeviceBuffer::zeroed(stream, self.cols * self.k / 2)?,
+            refused: DeviceBuffer::zeroed(stream, self.cols)?,
+            of: None,
+        });
+        Ok(self)
+    }
+
+    /// The BF16 form when the last rounding launch read the first `n`
+    /// columns or more of the f32 rows `x` and no quantizer launch came
+    /// after it.
+    pub(super) fn bf16_of(&self, x: &DeviceBuffer<f32>, n: usize) -> Option<&Bf16Form> {
+        self.bf16
+            .as_ref()
+            .filter(|f| f.of.is_some_and(|(at, m)| at == x.cu_deviceptr() && n <= m))
+    }
+
+    /// Whether a BF16 site can read the BF16 form of the first `n` columns
+    /// of `x` ([`GemmAct32::bf16_of`]).
+    #[must_use]
+    pub(crate) fn holds_bf16(&self, x: &DeviceBuffer<f32>, n: usize) -> bool {
+        self.bf16_of(x, n).is_some()
+    }
+
+    /// Whether this scratch holds room for a BF16 form
+    /// ([`GemmAct32::with_bf16`]).
+    #[must_use]
+    pub(crate) fn has_bf16(&self) -> bool {
+        self.bf16.is_some()
+    }
+
+    /// Marks the BF16 form as no rows' (its columns stay as they are), so no
+    /// site reads it until the next rounding launch.
+    pub(crate) fn forget_bf16(&mut self) {
+        if let Some(f) = &mut self.bf16 {
+            f.of = None;
+        }
+    }
+
+    /// Records a quantizer launch of `n_cols` columns, which leaves the BF16
+    /// form of other rows.
+    pub(super) fn fill(&mut self, n_cols: usize) {
+        self.filled = n_cols;
+        self.forget_bf16();
     }
 
     /// Routed columns, including the native FP4 representation when the build supports it.
@@ -158,7 +228,13 @@ impl GemmAct32 {
     /// Device bytes of the stored activation representations.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        let bytes = self.q.num_bytes() + self.d.num_bytes() + self.s.num_bytes();
+        let bytes = self.q.num_bytes()
+            + self.d.num_bytes()
+            + self.s.num_bytes()
+            + self
+                .bf16
+                .as_ref()
+                .map_or(0, |f| f.words.num_bytes() + f.refused.num_bytes());
         #[cfg(bloomery_nvfp4_mma)]
         let bytes = bytes + self.native.as_ref().map_or(0, super::nvfp4mma::Act::bytes);
         bytes
@@ -191,6 +267,48 @@ impl GemmAct32 {
 }
 
 impl Gemm32Kernels {
+    /// Enqueue the BF16 form of the first `n_cols` columns of `x` (`act.k()`
+    /// f32 each, column after column) into `act`, made [`GemmAct32::with_bf16`]:
+    /// each value rounded to nearest even as the dense MMA tile rounds it, and
+    /// each column's refusal word. The q8 blocks stay as they are.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_bf16_cols(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        n_cols: usize,
+        act: &mut GemmAct32,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_bf16_cols";
+        if n_cols == 0 || n_cols > act.cols {
+            return Err(GpuError::shape(
+                what,
+                format!("1 <= n_cols <= act.cols() = {}, got {n_cols}", act.cols),
+            ));
+        }
+        if x.len() < n_cols * act.k {
+            return Err(GpuError::shape(
+                what,
+                format!("x.len() {} < n_cols*k = {n_cols}*{}", x.len(), act.k),
+            ));
+        }
+        crate::tensor::check_alignment::<U32x4, _>(what, "x", x)?;
+        let k = launch_u32(what, "k", act.k)?;
+        let Some(form) = &mut act.bf16 else {
+            return Err(GpuError::state(what, "a scratch made with_bf16"));
+        };
+        let warps = (BF16_COLS_THREADS / 32) as usize;
+        let grid = launch_u32(what, "grid", n_cols.div_ceil(warps))?;
+        let prep =
+            self.module
+                .prepare_bf16_cols(LaunchConfig1D::new(grid, BF16_COLS_THREADS, 0))?;
+        let n = launch_u32(what, "n_cols", n_cols)?;
+        self.module
+            .bf16_cols(stream, &prep, x, k, n, &mut form.words, &mut form.refused)?;
+        form.of = Some((x.cu_deviceptr(), n_cols));
+        Ok(())
+    }
+
     /// Enqueue the 32-value quantization of the first `n_cols` columns of `x`
     /// (`act.k()` f32 each, column after column) into `act`: per block
     /// `d = amax/127` (1.0 for an all-zero block), codes `round(x/d)`
@@ -223,7 +341,7 @@ impl Gemm32Kernels {
         self.module.quantize_gemm32(
             stream, &prep, x, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s, fault,
         )?;
-        act.filled = n_cols;
+        act.fill(n_cols);
         #[cfg(bloomery_nvfp4_mma)]
         self.native.quantize(stream, act)?;
         Ok(())
@@ -258,7 +376,7 @@ impl Gemm32Kernels {
         self.module.relu_sqr_quant32(
             stream, &prep, x, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s, fault,
         )?;
-        act.filled = n_cols;
+        act.fill(n_cols);
         #[cfg(bloomery_nvfp4_mma)]
         self.native.quantize(stream, act)?;
         Ok(())
@@ -296,7 +414,7 @@ impl Gemm32Kernels {
         if act.native.is_some() {
             self.native
                 .swiglu(stream, g, u, None, Act::SiluMul, m, act, fault)?;
-            act.filled = n_cols;
+            act.fill(n_cols);
             return Ok(());
         }
         let prep = self
@@ -306,7 +424,7 @@ impl Gemm32Kernels {
             stream, &prep, g, u, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s,
             fault,
         )?;
-        act.filled = n_cols;
+        act.fill(n_cols);
         Ok(())
     }
 
@@ -354,7 +472,7 @@ impl Gemm32Kernels {
         if act.native.is_some() {
             self.native
                 .swiglu(stream, g, u, None, rule, m, act, fault)?;
-            act.filled = n_cols;
+            act.fill(n_cols);
             return Ok(());
         }
         let prep = self
@@ -364,7 +482,7 @@ impl Gemm32Kernels {
             stream, &prep, g, u, code, limit, m, blocks, groups, steps, &mut act.q, &mut act.d,
             &mut act.s, fault,
         )?;
-        act.filled = n_cols;
+        act.fill(n_cols);
         Ok(())
     }
 
@@ -427,7 +545,7 @@ impl Gemm32Kernels {
                 act,
                 fault,
             )?;
-            act.filled = n_cols;
+            act.fill(n_cols);
             return Ok(());
         }
         let prep = self
@@ -437,7 +555,7 @@ impl Gemm32Kernels {
             stream, &prep, g, u, sel, n_card, m, blocks, groups, steps, &mut act.q, &mut act.d,
             &mut act.s, fault,
         )?;
-        act.filled = n_cols;
+        act.fill(n_cols);
         Ok(())
     }
 }

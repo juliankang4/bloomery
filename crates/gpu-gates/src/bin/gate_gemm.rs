@@ -7378,6 +7378,36 @@ mod gate {
                         verdict(range && tail && same && quality)
                     );
                     ok &= quality && range && tail && same;
+                    if format == 0 {
+                        // The columns' BF16 form gives the same bits, eager and replayed.
+                        let cols = |s: &cuda_core::CudaStream,
+                                    act: &mut GemmAct32,
+                                    y: &mut DeviceBuffer<f32>| {
+                            dev.g32.enqueue_bf16_cols(s, &x, n, act)?;
+                            dev.g32.enqueue_bf16_mma_cols(s, &w, &x, act, n, y)
+                        };
+                        let mut act = GemmAct32::new(stream, n, k)?.with_bf16(stream)?;
+                        y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                        cols(stream, &mut act, &mut y)?;
+                        let got = y.to_host_vec(stream)?;
+                        y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                        let graph = gpu.capture(|s| cols(s, &mut act, &mut y))?;
+                        graph.launch(stream)?;
+                        stream.synchronize()?;
+                        let replay = y.to_host_vec(stream)?;
+                        let bits = |v: &[f32]| {
+                            v.iter()
+                                .zip(&eager)
+                                .all(|(a, b)| a.to_bits() == b.to_bits())
+                        };
+                        let (eager_same, graph_same) = (bits(&got), bits(&replay));
+                        println!(
+                            "dense_mma bf16_cols rows={rows} K={k} n={n} edge={name} \
+                             eager_bits={eager_same} graph_bits={graph_same} {}",
+                            verdict(eager_same && graph_same)
+                        );
+                        ok &= eager_same && graph_same;
+                    }
                 }
             }
             // Each cell's path, visible with unit weights against activations
@@ -7446,6 +7476,18 @@ mod gate {
                             Ok::<_, GpuError>(y.to_host_vec(stream)?)
                         };
                         let (mma, exact) = (run(false)?, run(true)?);
+                        // A BF16 weight's site over the columns' BF16 form: the same bits.
+                        let cols_bits = scales.is_some() || {
+                            let mut act = GemmAct32::new(stream, n, k)?.with_bf16(stream)?;
+                            dev.g32.enqueue_bf16_cols(stream, &x, n, &mut act)?;
+                            let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n])?;
+                            dev.g32
+                                .enqueue_bf16_mma_cols(stream, &w, &x, &act, n, &mut y)?;
+                            let got = y.to_host_vec(stream)?;
+                            got.iter()
+                                .zip(&mma)
+                                .all(|(a, b)| a.to_bits() == b.to_bits())
+                        };
                         let odd = |i: usize| {
                             (odd_r && i % rows == odd_row) || (odd_c && i / rows == odd_col)
                         };
@@ -7457,10 +7499,11 @@ mod gate {
                             .all(|i| mma[i].to_bits() == exact[i].to_bits());
                         println!(
                             "dense_mma {format} cells rows={rows} K={k} n={n} row{odd_row}_odd={odd_r} \
-                             col{odd_col}_odd={odd_c} others_kept_k={kept} odd_lines_exact={replayed} {}",
-                            verdict(kept && replayed)
+                             col{odd_col}_odd={odd_c} others_kept_k={kept} odd_lines_exact={replayed} \
+                             bf16_cols_bits={cols_bits} {}",
+                            verdict(kept && replayed && cols_bits)
                         );
-                        ok &= kept && replayed;
+                        ok &= kept && replayed && cols_bits;
                     }
                 }
             }
@@ -7480,6 +7523,41 @@ mod gate {
                 verdict(refused)
             );
             ok &= refused;
+            // A BF16 form is read only for the rows and the columns it was rounded from.
+            let w = DeviceTensor::upload(stream, &vec![0x3f80_3f80u32; 64 * 32], 64, 32)?;
+            let (one, two) = (
+                DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?,
+                DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?,
+            );
+            let mut act = GemmAct32::new(stream, 2, 64)?.with_bf16(stream)?;
+            dev.g32.enqueue_bf16_cols(stream, &one, 1, &mut act)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, 128)?;
+            let stale = |r: Result<(), GpuError>| matches!(r, Err(e) if e.to_string().contains("BF16 form"));
+            let other_rows = stale(
+                dev.g32
+                    .enqueue_bf16_mma_cols(stream, &w, &two, &act, 1, &mut y),
+            );
+            let more_cols = stale(
+                dev.g32
+                    .enqueue_bf16_mma_cols(stream, &w, &one, &act, 2, &mut y),
+            );
+            let fresh = dev
+                .g32
+                .enqueue_bf16_mma_cols(stream, &w, &one, &act, 1, &mut y)
+                .is_ok();
+            dev.g32
+                .enqueue_quantize_gemm32(stream, &two, 1, &mut act, gpu.unlabelled_sink())?;
+            let requantized = stale(
+                dev.g32
+                    .enqueue_bf16_mma_cols(stream, &w, &one, &act, 1, &mut y),
+            );
+            let pass = other_rows && more_cols && fresh && requantized;
+            println!(
+                "dense_mma bf16_cols stale_refused other_rows={other_rows} more_cols={more_cols} \
+                 fresh_read={fresh} after_quantize={requantized} {}",
+                verdict(pass)
+            );
+            ok &= pass;
             Ok(ok)
         }
 

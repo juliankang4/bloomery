@@ -670,12 +670,11 @@ impl Kernels {
         stream: &CudaStream,
         act: &mut GemmAct32,
     ) -> Result<(), GpuError> {
+        let filled = act.filled() as u32;
         if let Some(out) = act.native.as_mut() {
-            let prep = self.module.prepare_quantize_nvfp4_32(LaunchConfig1D::new(
-                act.filled as u32,
-                32,
-                0,
-            ))?;
+            let prep = self
+                .module
+                .prepare_quantize_nvfp4_32(LaunchConfig1D::new(filled, 32, 0))?;
             self.module.quantize_nvfp4_32(
                 stream,
                 &prep,

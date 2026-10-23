@@ -1452,7 +1452,8 @@ pub(super) struct Wide38 {
     /// split walk, at most half of them.
     dense: Vec<GemmRoute>,
     /// q8 of the model-width rows (a mix's output, the PLE rows, the shared
-    /// expert's input), of the attention-width rows (the output
+    /// expert's input), with their BF16 form when a BF16 site on the dense
+    /// MMA tile reads them, of the attention-width rows (the output
     /// projections' input), and of the shared expert's SwiGLU.
     act_hid: GemmAct32,
     act_attn: GemmAct32,
@@ -1485,9 +1486,10 @@ pub(super) struct Wide38 {
 
 impl Wide38 {
     /// The walk's own buffers for units of up to `rows` rows over `card`'s
-    /// card experts: the card route's buffers for runs of `route_run` tokens
-    /// beside them when a layer has card experts, made for an expert tier's
-    /// join when `tiered`; the walks
+    /// card experts, the model-width rows' BF16 form with `bf16_hid`: the
+    /// card route's buffers for runs of `route_run` tokens beside them when a
+    /// layer has card experts, made for an expert tier's join when `tiered`;
+    /// the walks
     /// cut by the width rule on a load with no expert tier, as one unit on
     /// one with it ([`Wide38::paged`] for an NVMe-paged plan). Load-time
     /// only.
@@ -1497,6 +1499,7 @@ impl Wide38 {
         route_run: usize,
         card: &Card38,
         tiered: bool,
+        bf16_hid: bool,
     ) -> Result<Wide38, GpuError> {
         let geometry = Geometry::new(geo::STREAMS as u32, geo::RANK as u32, geo::HIDDEN as u32)
             .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
@@ -1517,7 +1520,10 @@ impl Wide38 {
         Ok(Wide38 {
             rows,
             dense,
-            act_hid: GemmAct32::new(stream, rows, geo::HIDDEN)?,
+            act_hid: match GemmAct32::new(stream, rows, geo::HIDDEN)? {
+                act if bf16_hid => act.with_bf16(stream)?,
+                act => act,
+            },
             act_attn: GemmAct32::new(stream, rows, geo::ATTN)?,
             act_ff: GemmAct32::new(stream, rows, geo::FF)?,
             hc: HcWideScratch::new(stream, geometry, rows)?,
@@ -1637,8 +1643,9 @@ fn dense_kernels<'a>(c: &Ctx38<'a>) -> WideKernels<'a> {
     }
 }
 
-/// The q8 of the first `m` columns of the f32 rows `rows` into `act` when
-/// any of `names` is resident in Q8_0 planes ([`site::resident_quantize`]).
+/// The forms of the first `m` columns of the f32 rows `rows` that any of
+/// `names` reads into `act`: the q8 for Q8_0 planes, the BF16 form for a BF16
+/// site on the dense MMA tile ([`site::resident_quantize`]).
 fn quantize_for(
     c: &Ctx38<'_>,
     names: &[&str],
@@ -1787,7 +1794,7 @@ impl WideParts<'_> {
             let w = c.w;
             let pl = &mut s.ple;
             let e = (&*u.ple_e, m);
-            quantize_for(c, &[&pp.key, &pp.value], e, &mut x.act_hid, sink)?;
+            quantize_for(c, &pp.input_sites(), e, &mut x.act_hid, sink)?;
             let dense = &x.dense[u.route];
             let act = (&*u.ple_e, &x.act_hid, m);
             dense_gemm(c, &pp.key, act, dense, &mut pl.key)?;
@@ -2005,13 +2012,7 @@ impl WideParts<'_> {
         let (c, m) = (&self.c, u.m);
         let (s, x) = (&mut *self.s, &mut *self.x);
         let f = &p.ffn;
-        quantize_for(
-            c,
-            &[&f.gate_sh, &f.up_sh],
-            (&*u.ffn_x, m),
-            &mut x.act_hid,
-            sink,
-        )?;
+        quantize_for(c, &f.shared_inputs(), (&*u.ffn_x, m), &mut x.act_hid, sink)?;
         let site = |name| -> Result<_, GpuError> {
             let ty = site::resident_type(c.w, "qwen38::wide shared", name)?;
             Ok((ty, SiteWeight::Resident(name)))
@@ -2249,8 +2250,7 @@ fn gdn(
         attn,
         ..
     } = s;
-    let names = [&*gp.qkv, &gp.z, &gp.beta_alpha];
-    quantize_for(c, &names, (mixed, m), &mut x.act_hid, sink)?;
+    quantize_for(c, &gp.input_sites(), (mixed, m), &mut x.act_hid, sink)?;
     let dense = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
     dense_gemm(c, &gp.qkv, act, dense, &mut g.x)?;
@@ -2349,8 +2349,7 @@ fn qsa(
         attn,
         ..
     } = s;
-    let names = [&*qp.q, &qp.k, &qp.v, &qp.idx_k, &qp.idx_q];
-    quantize_for(c, &names, (mixed, m), &mut x.act_hid, sink)?;
+    quantize_for(c, &qp.input_sites(), (mixed, m), &mut x.act_hid, sink)?;
     let table = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
     dense_gemm(c, &qp.q, act, table, &mut q.qg)?;
