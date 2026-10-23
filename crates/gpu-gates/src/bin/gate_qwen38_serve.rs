@@ -294,11 +294,11 @@
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for — the drafted arm ends here — and, on the plain arm, more
 //! servers start on the card, one at a time: the `ctx` clause's three, the
-//! `paged` clause's eight, the draft share clause's three and the residency
+//! `paged` clause's probes, the draft share clause's three and the residency
 //! word's one (they stop before the load, or are refused before it, but the
 //! `paged` clause's small card and the draft share clause's unset-draft
 //! server, stopped at their load's draft record), the `paged` clause's
-//! `generate_qwen3moe` run (whole, two tokens), then the slots clause's two
+//! `generate_qwen3moe` runs (one and four slots, two tokens each), then the slots clause's two
 //! and the sampled rounds' one (above).
 //!
 //! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default's
@@ -320,7 +320,8 @@
 //!   rule has no count to reduce, and the placement left the draft off) on a
 //!   plan that pages (`paged_default_serves_one_column`, the `cache` line's
 //!   arena), `--parallel 4` serves four requests as one pass, each with its
-//!   alone ids (`paged_parallel_serves_one_pass`, `paged_parallel_ids_as_alone`), and
+//!   alone ids (`paged_parallel_serves_one_pass`, `paged_parallel_ids_as_alone`), with
+//!   a round of all four slots in one pass (`paged_parallel_rounds_carry_all_slots`), and
 //!   `BLOOMERY_DRAFT=mtp` serves one slot with the draft on
 //!   (`paged_draft_mtp_serves_one_slot`);
 //!   at 40 GiB, where the tier pages experts with no arena, `--parallel 2`
@@ -4047,13 +4048,13 @@ mod gate {
 
     /// The NVMe tier's paged rule (the seat's module doc,
     /// `bloomery_levers::paged_columns`) on the gate plan at two rooms
-    /// (`BLOOMERY_HOST_ROOM`, the split dial's default arena), each server
-    /// stopped at its `parallel` line, before its load, or refused before it
-    /// prints one. At 27 GiB the plan pages its host experts through the
+    /// (`BLOOMERY_HOST_ROOM`, the split dial's default arena). Planning probes
+    /// stop before the load; request clauses wait for listening and completion.
+    /// At 27 GiB the plan pages its host experts through the
     /// tier's RAM arena (`bloomery_placement`'s
     /// `the_paged_rule_reads_the_arena` derives both rooms on the Mac):
     /// the flagless server serves its default one slot with no `paged` line,
-    /// the `cache` line naming the arena; `--parallel 2` serves two
+    /// the `cache` line naming the arena; `--parallel 4` serves four
     /// slots as one pass over the arena, and `BLOOMERY_DRAFT=mtp` serves
     /// one slot with the draft on (PIN(2026-10-12): the rule refused it by
     /// name; a paged step reads its columns' ids from the arena in one union
