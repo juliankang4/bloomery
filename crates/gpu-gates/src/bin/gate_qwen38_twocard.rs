@@ -1155,7 +1155,9 @@ mod gate {
         let mut h = Fnv1a64::default();
         for s in &stores {
             match s {
-                Store38Host::Rec { state, ring } => h = h.f32s(state).f32s(ring),
+                Store38Host::Rec { state, ring, carry } => {
+                    h = h.f32s(state).f32s(ring).f32s(carry);
+                }
                 Store38Host::Qsa { k, v, raw, pooled } => {
                     h = u16s(u16s(u16s(u16s(h, k), v), raw), pooled);
                 }

@@ -253,12 +253,12 @@ pool's allocations (#13 measured exactly this: allocations went on to 111.7 GB "
 `page_cache_bytes` beside `HostNeed` per span is pinned to ≤ dense + host-segment bytes + 2 GiB [assumption] once
 `HOST_LOCK` is on; before that it is printed only.
 
-Numbers (Qwen3.8 UD-Q4_K_XL, 111.3 GB): one sealed state = 28,416 B a position + 260.3 MB of checkpoints [derived from
-`qwen38_state_bytes`'s pinned formula, `qwen35moe/place.rs:2267-2300`: 12 attention layers × (2,304 + 256/4) B a
-position; 2 × (36 × 3,596,288 + 696,320) B] → 1.19 GB at 32K, 3.98 GB at 128K, 7.71 GB at 262K [the last pinned by
-the test]. Box: the two-state floor 2.4 / 8.0 GB against a 263 GB room never binds (the 27G room is the gate dial, not
-the box). GB10: 125.2 − 111.3 = 13.9 GB for KV and runtime [derived, dgx-spark.md §5] → at 128K one slot's state 3.98
-+ the floor 7.97 = 11.95 GB fits; at 262K 7.71 + 15.42 = 23.1 GB does not — the cache-bounded default context
+Numbers (Qwen3.8 UD-Q4_K_XL, 111.3 GB): one sealed state = 28,416 B a position + 296.1 MB of checkpoints [derived from
+`qwen38_state_bytes`'s pinned formula, `qwen35moe/place.rs:2474-2517`: 12 attention layers × (2,304 + 256/4) B a
+position; 2 × (36 × 4,093,584 + 696,320) B] → 1.23 GB at 32K, 4.02 GB at 128K, 7.75 GB at 262K [the last pinned by
+the test]. Box: the two-state floor 2.5 / 8.0 GB against a 263 GB room never binds (the 27G room is the gate dial, not
+the box). GB10: 125.2 − 111.3 = 13.9 GB for KV and runtime [derived, dgx-spark.md §5] → at 128K one slot's state 4.02
++ the floor 8.04 = 12.06 GB fits; at 262K 7.75 + 15.49 = 23.2 GB does not — the cache-bounded default context
 (`f51eea22`: a Spark's Q4 default 198,144 positions) is this arithmetic, already in the tree.
 
 ### (h) Unified memory: what residency and promotion mean on GB10, where the arena sits

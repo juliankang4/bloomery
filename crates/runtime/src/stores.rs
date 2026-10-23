@@ -172,6 +172,28 @@ pub const fn delta_lane_bytes(v_heads: usize, state: usize, lanes: usize) -> u64
     (l - 1) * v * d * d * F32_BYTES + l * U32_BYTES
 }
 
+/// Tokens of a chunk of the chunked gated delta rule a prompt runs on a
+/// model with a carry (Qwen3.8's `Body38`).
+pub const DELTA_CHUNK_ROWS: usize = 16;
+
+/// Rows of a gated-delta-rule layer's carry: the tokens of the chunk a call
+/// left incomplete, at most one short of a chunk.
+pub const DELTA_CARRY_ROWS: usize = DELTA_CHUNK_ROWS - 1;
+
+/// Words before a carry's rows: the rows' count, the position after them
+/// and two spare words.
+pub const DELTA_CARRY_HEAD: usize = 4;
+
+/// Bytes of a gated-delta-rule layer's carry over `v_heads` value heads and
+/// `k_heads` key heads of `state` values: [`DELTA_CARRY_HEAD`] words, then
+/// [`DELTA_CARRY_ROWS`] rows of the key and value heads and each row's β
+/// and decay a value head, in f32.
+#[must_use]
+pub const fn delta_carry_bytes(v_heads: usize, k_heads: usize, state: usize) -> u64 {
+    let row = (k_heads + v_heads) * state + 2 * v_heads;
+    (DELTA_CARRY_HEAD + DELTA_CARRY_ROWS * row) as u64 * F32_BYTES
+}
+
 /// A PLE conv ring of `taps` taps `dilation` apart over `streams` streams
 /// of `n_embd` values, in bytes (f32).
 #[must_use]
@@ -234,9 +256,9 @@ pub const fn selecting_bytes(
 mod tests {
     use super::{
         DELTA_LANES, PROMPT_BATCH, RING_ALIGN, Rows, conv_ring_rows, cut_depth_keeps,
-        delta_lane_bytes, dense_kv_bytes, kv_plane_bytes, kv_row_bytes, mamba2_bytes, mamba2_lens,
-        ple_ring_bytes, ple_ring_rows, pooled_rows, recurrent_bytes, ring_rows, selecting_bytes,
-        window_rows,
+        delta_carry_bytes, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes, kv_row_bytes,
+        mamba2_bytes, mamba2_lens, ple_ring_bytes, ple_ring_rows, pooled_rows, recurrent_bytes,
+        ring_rows, selecting_bytes, window_rows,
     };
 
     /// A GQA layer's planes over `ctx` positions are `ctx` rows of the layout asked for: f16 K and V,
@@ -256,9 +278,10 @@ mod tests {
         assert_eq!(mamba2_bytes(32, 128, 4, 1056), (4096 + 11 * 1056) * 4);
     }
 
-    /// Qwen3.8's sizes: a GDN layer holds 48 heads of 128 × 128 f32 and
-    /// eleven conv rows of 10,240 f32 channels; the PLE ring 17 rows of four
-    /// 2,560-value streams; an attention position 2 × 2 × 256 f16 of K and V
+    /// Qwen3.8's sizes: a GDN layer holds 48 heads of 128 × 128 f32,
+    /// eleven conv rows of 10,240 f32 channels and a carry of four words and
+    /// fifteen rows of 64 heads of 128 f32 and 2 × 48 f32; the PLE ring 17
+    /// rows of four 2,560-value streams; an attention position 2 × 2 × 256 f16 of K and V
     /// and a 128-value raw index key, and a 128-value pooled key per four
     /// positions, the last pool whole.
     #[test]
@@ -266,6 +289,7 @@ mod tests {
         assert_eq!(conv_ring_rows(4), 11);
         assert_eq!(ple_ring_rows(4, 3), 17);
         assert_eq!(recurrent_bytes(48, 16, 128, 4), 3_145_728 + 11 * 10_240 * 4);
+        assert_eq!(delta_carry_bytes(48, 16, 128), (4 + 15 * (8192 + 96)) * 4);
         assert_eq!(ple_ring_bytes(4, 3, 4, 2560), 696_320);
         assert_eq!(kv_row_bytes(2, 256), 2048);
         assert_eq!(

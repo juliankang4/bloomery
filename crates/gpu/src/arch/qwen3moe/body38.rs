@@ -125,7 +125,8 @@ use super::program38::{
 };
 use super::scratch::{Io, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, stamps_at};
 use super::scratch38::{
-    Arena38, LANES, PASS_ROWS, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, store_rule_bytes,
+    Arena38, LANES, PASS_ROWS, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, no_carry,
+    store_rule_bytes,
 };
 use super::slot_pass::SlotIn;
 use super::swap38::{self, DEADLINE, LIVE_DELAY};
@@ -153,6 +154,7 @@ use crate::host::tier::TierOpen;
 use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
+use crate::linear::delta::carry_fold_host;
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::slots::slot_twice;
 use crate::model::{
@@ -316,18 +318,18 @@ pub fn point_row_budget38(gdn: usize, ctx: u64) -> Result<u64, GpuError> {
 /// marks), when the load takes them ([`Body38::set_checkpoints`]): the
 /// ubatch walk's most positions, so a mark cuts a call's ubatches at most
 /// once more than the call's own cut, and a context of 60k positions takes
-/// 15 inner marks against the host budget's 32 slots of one copy
+/// 15 inner marks against the host budget's 29 slots of one copy
 /// ([`checkpoint_bytes`]).
 pub const CHECKPOINT_EVERY: u32 = UBATCH_MOST as u32;
 
 /// The f32s of each store one checkpoint of a load of `gdn` delta layers
-/// copies, in the layers' order: each delta layer's committed lane and conv
-/// ring, then the PLE ring. The one derivation of what a checkpoint holds,
-/// read by the sequences' `Checkpoints`, [`checkpoint_bytes`] and
-/// [`checkpoint_price38`].
+/// copies, in the layers' order: each delta layer's committed lane, conv
+/// ring and carry, then the PLE ring. The one derivation of what a
+/// checkpoint holds, read by the sequences' `Checkpoints`,
+/// [`checkpoint_bytes`] and [`checkpoint_price38`].
 fn checkpoint_lens(gdn: usize) -> Vec<usize> {
     (0..gdn)
-        .flat_map(|_| [GDN.state_len(), GDN.ring_len()])
+        .flat_map(|_| [GDN.state_len(), GDN.ring_len(), GDN.carry_len()])
         .chain([ple::ring_len(geo::STREAMS)])
         .collect()
 }
@@ -343,7 +345,7 @@ fn checkpoint_lens_of(stores: &[Store38]) -> Vec<usize> {
 }
 
 /// The bytes one checkpoint of a load of `gdn` delta layers copies: each
-/// delta layer's committed lane and conv ring, and the PLE ring.
+/// delta layer's committed lane, conv ring and carry, and the PLE ring.
 #[must_use]
 pub fn checkpoint_bytes(gdn: usize) -> u64 {
     checkpoint::point_bytes(&checkpoint_lens(gdn))
@@ -983,13 +985,14 @@ fn ple_takes(
 }
 
 /// A layer's store read back ([`Body38::stores_host`]): a delta layer's
-/// state and conv ring, or a selecting layer's K/V planes (f16 bits) and its
-/// raw and pooled indexer keys.
+/// state, conv ring and carry, or a selecting layer's K/V planes (f16 bits)
+/// and its raw and pooled indexer keys.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Store38Host {
     Rec {
         state: Vec<f32>,
         ring: Vec<f32>,
+        carry: Vec<f32>,
     },
     Qsa {
         k: Vec<u16>,
@@ -1009,14 +1012,31 @@ impl Store38Host {
         };
         match (self, other) {
             (
-                Store38Host::Rec { state: s, ring: r },
+                Store38Host::Rec {
+                    state: s,
+                    ring: r,
+                    carry: c,
+                },
                 Store38Host::Rec {
                     state: s2,
                     ring: r2,
+                    carry: c2,
                 },
-            ) => bits(s, s2) && bits(r, r2),
+            ) => bits(s, s2) && bits(r, r2) && bits(c, c2),
             (Store38Host::Qsa { .. }, Store38Host::Qsa { .. }) => self == other,
             _ => false,
+        }
+    }
+
+    /// A delta store's committed lane with the rows its carry holds for
+    /// count `pos` taken in ([`carry_fold_host`]): the state the next step
+    /// takes its token into, wherever the calls before it were cut. `None`
+    /// for a selecting store.
+    #[must_use]
+    pub fn live_lane(&self, pos: u32) -> Option<Vec<f32>> {
+        match self {
+            Store38Host::Rec { state, carry, .. } => Some(carry_fold_host(carry, state, pos, GDN)),
+            Store38Host::Qsa { .. } => None,
         }
     }
 }
@@ -2498,6 +2518,11 @@ impl Body38 {
                     Store38::Rec { rec, .. } => Store38Host::Rec {
                         state: lane_of(rec.state.to_host_vec(stream)?, self.lane.lane())?,
                         ring: rec.ring.to_host_vec(stream)?,
+                        carry: rec
+                            .carry
+                            .as_ref()
+                            .ok_or_else(no_carry)?
+                            .to_host_vec(stream)?,
                     },
                     Store38::Qsa { kv, raw, pooled } => {
                         let (k, v) = kv.f16("qwen38::stores_host")?;
@@ -5361,16 +5386,17 @@ struct Copied<'a> {
     /// Each selecting layer's rows of the positions the call carries, then
     /// the draft's store rows of the same positions.
     spans: Vec<Spans<'a>>,
-    /// Each delta layer's committed state lane and conv ring, in layer
-    /// order.
+    /// Each delta layer's committed state lane, conv ring and carry, in
+    /// layer order.
     lanes: Vec<WindowMut<'a, f32>>,
     rings: Vec<&'a mut DeviceBuffer<f32>>,
+    carries: Vec<&'a mut DeviceBuffer<f32>>,
     ple: &'a mut DeviceBuffer<f32>,
 }
 
 impl<'a> Copied<'a> {
     /// The stores of `stores` and `ple_ring` a checkpoint copies — each
-    /// delta layer's state lane `lane` and its conv ring, then the PLE ring
+    /// delta layer's state lane `lane`, its conv ring and carry, then the PLE ring
     /// — and, with `rows` (`(ctx, n)`), each selecting layer's rows of
     /// positions below `n`: its K and V planes' (`[N_KV][ctx][HEAD]` each),
     /// its raw keys' (`[ctx][IDX_DIM]`) and its pooled keys' of the pools
@@ -5396,15 +5422,19 @@ impl<'a> Copied<'a> {
             spans: Vec::new(),
             lanes: Vec::new(),
             rings: Vec::new(),
+            carries: Vec::new(),
             ple,
         };
         for s in stores {
             match s {
                 Store38::Rec { rec, .. } => {
-                    let RecStore { state, ring, .. } = rec;
+                    let RecStore {
+                        state, ring, carry, ..
+                    } = rec;
                     let byte = lane as usize * len * size_of::<f32>();
                     c.lanes.push(WindowMut::of_mut(state, byte, len)?);
                     c.rings.push(ring);
+                    c.carries.push(carry.as_mut().ok_or_else(no_carry)?);
                 }
                 Store38::Qsa { kv, raw, pooled } => {
                     if let Some((ctx, n)) = rows {
@@ -5427,8 +5457,8 @@ impl<'a> Copied<'a> {
         Ok(c)
     }
 
-    /// The stores in the checkpoints' order: each delta layer's lane, then
-    /// its ring, then the PLE ring.
+    /// The stores in the checkpoints' order: each delta layer's lane, ring
+    /// and carry, then the PLE ring.
     fn list(&mut self) -> Vec<&mut DeviceBuffer<f32>> {
         self.list_split().1
     }
@@ -5440,12 +5470,18 @@ impl<'a> Copied<'a> {
             spans,
             lanes,
             rings,
+            carries,
             ple,
         } = self;
         let mut out: Vec<&mut DeviceBuffer<f32>> = Vec::new();
-        for (l, r) in lanes.iter_mut().zip(rings.iter_mut()) {
+        for ((l, r), c) in lanes
+            .iter_mut()
+            .zip(rings.iter_mut())
+            .zip(carries.iter_mut())
+        {
             out.push(&mut **l);
             out.push(&mut **r);
+            out.push(&mut **c);
         }
         out.push(&mut **ple);
         (spans, out)
@@ -5974,25 +6010,29 @@ mod tests {
     use engram::hash::{EosWindow, Window};
 
     /// A checkpoint of Qwen3.8-Flash-Next's 36 delta layers (48 layers at
-    /// interval 4) copies each one's committed lane (786,432 f32) and conv
-    /// ring (112,640 f32) and the PLE ring (174,080 f32): 130,162,688 B, one
-    /// derivation for the sequences' `Checkpoints` and the plan's price,
-    /// spaced at the 4,096-token ubatch, so a slot of 2,048 positions pins
-    /// two points (a whole call's one and the previous call's end), one of
-    /// 10,240 four, and the host budget fits 32.
+    /// interval 4) copies each one's committed lane (786,432 f32), conv ring
+    /// (112,640 f32) and carry (124,324 f32), and the PLE ring (174,080
+    /// f32): 148,065,344 B, one derivation for the sequences' `Checkpoints`
+    /// and the plan's price, spaced at the 4,096-token ubatch, so a slot of
+    /// 2,048 positions pins two points (a whole call's one and the previous
+    /// call's end), one of 10,240 four, and the host budget fits 29.
     #[test]
     fn a_checkpoint_copies_the_delta_layers_lane_ring_and_the_ple_ring() {
         let lens = checkpoint_lens(36);
-        assert_eq!(lens.len(), 2 * 36 + 1);
-        assert!(lens[..72].chunks(2).all(|c| c == [786_432, 112_640]));
-        assert_eq!(lens[72], 174_080);
-        assert_eq!(checkpoint_bytes(36), 130_162_688);
-        assert_eq!(checkpoint_price38(36).point_bytes, 130_162_688);
+        assert_eq!(lens.len(), 3 * 36 + 1);
+        assert!(
+            lens[..108]
+                .chunks(3)
+                .all(|c| c == [786_432, 112_640, 124_324])
+        );
+        assert_eq!(lens[108], 174_080);
+        assert_eq!(checkpoint_bytes(36), 148_065_344);
+        assert_eq!(checkpoint_price38(36).point_bytes, 148_065_344);
         assert_eq!(checkpoint_price38(36).every, 4_096);
-        for (ctx, points) in [(2_048u64, 2u64), (10_240, 4), (1 << 20, 32)] {
+        for (ctx, points) in [(2_048u64, 2u64), (10_240, 4), (1 << 20, 29)] {
             assert_eq!(
                 checkpoint_budget38(36, ctx).expect("a budget"),
-                points * 130_162_688,
+                points * 148_065_344,
                 "ctx {ctx}"
             );
         }

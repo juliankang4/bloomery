@@ -156,7 +156,7 @@ use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_s
 use super::program38::{Ctx38, beta_alpha_mut, beta_alpha_rows};
 use super::router::gated;
 use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
-use super::scratch38::{Arena38, ROUTE_ROWS, Store38};
+use super::scratch38::{Arena38, ROUTE_ROWS, Store38, no_carry};
 use super::tier38::TierSide38;
 use super::wide::{RingStacks, with_ring_windows};
 use crate::GpuError;
@@ -2317,7 +2317,12 @@ fn gdn(
             ring: &mut r.ring,
         },
     )?;
-    lin.delta.enqueue_delta_lanes(
+    // The conv has read the q·k·v rows: the prompt form's chunk records take
+    // their room.
+    let len = g.x.len();
+    let mut work = WindowMut::<u32>::of_mut(&mut g.x, 0, len)?;
+    let carry = r.carry.as_mut().ok_or_else(no_carry)?;
+    lin.delta.enqueue_delta_prompt(
         stream,
         DeltaLanesArgs {
             delta: DeltaArgs {
@@ -2337,6 +2342,8 @@ fn gdn(
             pos: &u.pos,
             stamp,
         },
+        carry,
+        &mut work,
     )?;
     lin.norm_gate.enqueue_norm_gate_sigmoid(
         stream,

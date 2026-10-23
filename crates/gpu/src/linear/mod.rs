@@ -85,6 +85,15 @@ pub const PASS_ROWS: usize = chain::linear::PASS_ROWS;
 /// Slots of the conv ring: [`chain::linear::RING_ROWS`].
 pub const RING_ROWS: usize = chain::linear::RING_ROWS;
 
+/// Tokens of one chunk of the prompt form: [`chain::linear::CHUNK_ROWS`].
+pub const CHUNK_ROWS: usize = chain::linear::CHUNK_ROWS;
+
+/// Rows of the carry: [`chain::linear::CARRY_ROWS`].
+pub const CARRY_ROWS: usize = chain::linear::CARRY_ROWS;
+
+/// Words before the carry's rows: [`chain::linear::CARRY_HEAD`].
+pub const CARRY_HEAD: usize = chain::linear::CARRY_HEAD;
+
 /// The conv input `d` positions before `p` (`1 <= d <= CONV_ROWS`) of channel
 /// `c` of a ring of `ch` channels, when it lies before the call: zero while
 /// `p < d` (the sequence start, whatever the ring holds), else the row of

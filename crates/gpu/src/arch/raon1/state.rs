@@ -237,6 +237,7 @@ impl Lanes {
             ring,
             lanes,
             stamp,
+            ..
         } = store;
         let stamp = stamp
             .as_mut()

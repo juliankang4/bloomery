@@ -4983,24 +4983,24 @@ mod tests {
         /// past the need is the reading less the plan's own terms less that
         /// row, the budget half of it, and `checkpoints` is the term the
         /// `cache` line prints, not a second subtraction. One Qwen3.8 slot
-        /// at a context of 16,384 positions pins five points of 130,162,688
-        /// B spaced 4,096 apart (650,813,440 B) inside the need of
-        /// 27,631,529,984 B: the same plan with no reserve leaves that much
+        /// at a context of 16,384 positions pins five points of 148,065,344
+        /// B spaced 4,096 apart (740,326,720 B) inside the need of
+        /// 27,721,043,264 B: the same plan with no reserve leaves that much
         /// more room, and half of it more budget. The line's own terms
         /// (`available`, `need`, `pool`) reproduce the budget it prints.
         #[test]
         fn a_default_budget_counts_the_checkpoint_reserve_once() {
             const Q38: Price = Price {
-                point_bytes: 130_162_688,
+                point_bytes: 148_065_344,
                 every: 4_096,
             };
             let mut m = machine(0);
             reserve_checkpoints(&mut m, Seqs::priced(1, Q38), 16_384).expect("a reserve");
             let reserved = checkpoints_reserved(&m);
-            assert_eq!(reserved, 5 * 130_162_688);
+            assert_eq!(reserved, 5 * 148_065_344);
             let (terms, pool, available) = (26_980_716_544u64, 0u64, 40_000_000_000u64);
             let need = terms + reserved;
-            assert_eq!(need, 27_631_529_984);
+            assert_eq!(need, 27_721_043_264);
             let at = |need: u64, checkpoints: u64| {
                 CacheRam::at(
                     None,
@@ -5079,13 +5079,13 @@ mod tests {
         /// spacing (`checkpoint_price35`, `checkpoint_price38`, pinned where
         /// they are made: `gate-gpu-lib`) and the budget one sequence's
         /// `Checkpoints` is made with is the price's at the slot's context.
-        /// A point of 73,728,000 B (Qwen3.6-35B-A3B) or 130,162,688 B
+        /// A point of 73,728,000 B (Qwen3.6-35B-A3B) or 148,065,344 B
         /// (Qwen3.8-Flash-Next) spaced 4,096 apart takes two points in a slot
         /// of 2,048 positions and four in 10,240 (a whole call's points and
         /// the previous call's end) — not the 4 GiB of the default a slot.
         #[test]
         fn a_qwen_machine_reserves_its_familys_budget_at_each_context() {
-            for point_bytes in [73_728_000u64, 130_162_688] {
+            for point_bytes in [73_728_000u64, 148_065_344] {
                 let price = Price {
                     point_bytes,
                     every: 4_096,
@@ -5119,7 +5119,7 @@ mod tests {
         #[test]
         fn a_deeper_probe_never_reserves_less() {
             let qwen38 = Price {
-                point_bytes: 130_162_688,
+                point_bytes: 148_065_344,
                 every: 4_096,
             };
             for price in [qwen38, GLM_PRICE] {

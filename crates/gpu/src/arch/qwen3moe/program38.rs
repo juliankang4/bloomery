@@ -1173,6 +1173,7 @@ fn gdn_seq(
             pos,
             stamp,
         },
+        r.carry.as_ref(),
     )
 }
 

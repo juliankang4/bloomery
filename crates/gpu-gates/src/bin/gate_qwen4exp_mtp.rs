@@ -3256,7 +3256,7 @@ mod gate {
     }
 
     /// The store comparison's shape: the e2e gate's `(v)` rule in one bool —
-    /// the committed delta lane, the conv ring's eight slots before the
+    /// the committed delta lane and its carry, the conv ring's eight slots before the
     /// count, the K/V planes' and raw keys' rows below it, the pools
     /// complete at the count (a pool a rejected row completed is read only
     /// at a count that completes it again), the PLE ring's fourteen slots
@@ -3298,15 +3298,19 @@ mod gate {
         let layers = a.0.len() == b.0.len()
             && a.0.iter().zip(&b.0).all(|(x, y)| match (x, y) {
                 (
-                    Store38Host::Rec { state: s, ring: r },
+                    Store38Host::Rec {
+                        state: s,
+                        ring: r,
+                        carry: c,
+                    },
                     Store38Host::Rec {
                         state: s2,
                         ring: r2,
+                        carry: c2,
                     },
                 ) => {
-                    s.len() == s2.len()
-                        && s.iter().zip(s2).all(|(u, v)| u.to_bits() == v.to_bits())
-                        && ring_same(r, r2, CONV_RING, conv_ch, 8)
+                    let bits = bloomery_gpu_gates::bits_equal;
+                    bits(s, s2) && ring_same(r, r2, CONV_RING, conv_ch, 8) && bits(c, c2)
                 }
                 (
                     Store38Host::Qsa { k, v, raw, pooled },

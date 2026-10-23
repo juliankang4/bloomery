@@ -77,7 +77,7 @@ pub(super) const LANES: usize = stores::DELTA_LANES;
 pub(super) const VERIFY_ROWS: usize = LANES;
 
 /// A layer's store: the delta rule's recurrent state ([`LANES`] lanes), its
-/// lanes' stamps (`linear::delta`'s module doc) and conv ring, or a
+/// lanes' stamps (`linear::delta`'s module doc), conv ring and carry, or a
 /// selecting attention layer's K/V planes with its raw and pooled indexer
 /// keys (`[ctx][IDX_DIM]` and `[pools][IDX_DIM]` f16).
 pub(super) enum Store38 {
@@ -93,11 +93,11 @@ pub(super) enum Store38 {
 }
 
 impl Store38 {
-    /// A zeroed delta store of [`LANES`] lanes, lane 0 stamped at position
-    /// 0 and every other never written.
+    /// A zeroed delta store of [`LANES`] lanes with a carry, lane 0 stamped
+    /// at position 0 and every other never written.
     pub(super) fn rec(stream: &CudaStream) -> Result<Store38, GpuError> {
         Ok(Store38::Rec {
-            rec: RecStore::new(stream, GDN.lens(LANES), LANES)?,
+            rec: RecStore::carried(stream, GDN.lens(LANES), LANES, GDN.carry_len())?,
             stamp: DeviceBuffer::from_host(stream, &fresh_stamps(LANES))?,
         })
     }
@@ -130,13 +130,22 @@ impl Store38 {
     }
 }
 
+/// The refusal of a delta store without the carry [`Store38::rec`] keeps.
+pub(super) fn no_carry() -> GpuError {
+    GpuError::state(
+        "qwen4exp delta store",
+        "a delta store's carry (`Store38::rec` keeps one)",
+    )
+}
+
 /// The bytes `runtime::stores` counts for a delta store of [`LANES`] lanes
 /// and for a selecting store at `ctx` positions: what the load's
 /// allocations must equal.
 pub(super) fn store_rule_bytes(ctx: usize) -> (u64, u64) {
     (
         stores::recurrent_bytes(GDN.n_v, GDN.n_k, linear::HEAD, linear::CONV_TAPS)
-            + stores::delta_lane_bytes(GDN.n_v, linear::HEAD, LANES),
+            + stores::delta_lane_bytes(GDN.n_v, linear::HEAD, LANES)
+            + stores::delta_carry_bytes(GDN.n_v, GDN.n_k, linear::HEAD),
         stores::selecting_bytes(geo::N_KV, geo::HEAD, geo::IDX_DIM, geo::POOL, ctx),
     )
 }
@@ -279,7 +288,15 @@ impl Arena38 {
             ));
         }
         let route = RouterOut::for_ubatch(stream, router, rows.min(ROUTE_ROWS))?;
-        Arena38::alloc(stream, rows, (select_run(rows, ctx), 0), route, ctx)
+        let mut a = Arena38::alloc(stream, rows, (select_run(rows, ctx), 0), route, ctx)?;
+        // The prompt form's records take the q·k·v rows' room once the conv
+        // has read them (`wide38::gdn`); a walk of one or two rows needs a
+        // little more than the rows.
+        let work = linear::delta::prompt_work_len(GDN, rows);
+        if a.gdn.x.len() < work {
+            a.gdn.x = DeviceBuffer::zeroed(stream, work)?;
+        }
+        Ok(a)
     }
 
     /// The buffers for `rows` tokens, the selection's for `sel` rows and the

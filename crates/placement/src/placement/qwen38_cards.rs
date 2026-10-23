@@ -196,10 +196,11 @@ fn indexer_projection(t: &ModelTensor) -> bool {
 
 /// The file's cache bytes a layer (`qwen35moe::place::KvLayout`) [derived
 /// from `runtime::stores`]: a delta layer's state in four lanes of 48 heads
-/// of 128 × 128 f32 with a u32 stamp each and its conv ring of 11 rows of
-/// 10,240 f32, 13,033,488 B; the PLE layer's ring beside it, 17 rows of
-/// 4 · 2,560 f32; a selecting layer, every fourth, its K, V and raw index
-/// key, 2,304 B a position, and a pooled key, 256 B a pool of four.
+/// of 128 × 128 f32 with a u32 stamp each, its conv ring of 11 rows of
+/// 10,240 f32 and its carry of 124,324 f32, 13,530,784 B; the PLE layer's
+/// ring beside it, 17 rows of 4 · 2,560 f32; a selecting layer, every
+/// fourth, its K, V and raw index key, 2,304 B a position, and a pooled key,
+/// 256 B a pool of four.
 struct Kv38;
 
 impl KvBytes for Kv38 {
@@ -208,7 +209,7 @@ impl KvBytes for Kv38 {
         let own = if layer % 4 == 3 {
             ctx_max * 2304 + ctx_max.div_ceil(4) * 256
         } else {
-            13_033_488
+            13_530_784
         };
         own + ple
     }
@@ -224,8 +225,8 @@ const BESIDE: u64 = 9 * 4 * 2560 * 4 + 4;
 /// which a box gate holds equal to the engine's `seq38_bytes`) [derived]:
 /// the 12 selecting layers' positional bytes (2,304 B a position and a
 /// 256 B pooled key a pool of four), two checkpoints — the 36 delta layers'
-/// committed state lane and conv ring, 3,596,288 B each, and the PLE ring,
-/// 17 · 4 · 2,560 f32 — and, under the draft, its store (2,048 B a
+/// committed state lane, conv ring and carry, 4,093,584 B each, and the PLE
+/// ring, 17 · 4 · 2,560 f32 — and, under the draft, its store (2,048 B a
 /// position), the arena rows ([`BESIDE`] less its lane word) and one point's
 /// hidden row (4 · 2,560 f32).
 fn state38(ctx: u64, drafts: bool) -> u64 {
@@ -238,9 +239,9 @@ fn state38(ctx: u64, drafts: bool) -> u64 {
     attention + 2 * CHECKPOINT_38 + draft
 }
 
-/// One checkpoint's host bytes: the 36 delta layers' committed state lane
-/// and conv ring, and the PLE ring ([`state38`]'s term).
-const CHECKPOINT_38: u64 = 36 * 3_596_288 + 17 * 4 * 2560 * 4;
+/// One checkpoint's host bytes: the 36 delta layers' committed state lane,
+/// conv ring and carry, and the PLE ring ([`state38`]'s term).
+const CHECKPOINT_38: u64 = 36 * 4_093_584 + 17 * 4 * 2560 * 4;
 
 /// The stage card of `qwen35moe::place::machine_for_experts(spec, 48, 4096,
 /// Experts::Card)`: every layer, the head and the token embedding, its
@@ -252,7 +253,10 @@ fn stage(spec: CardSpec) -> Card {
         device: spec.device,
         usable_bytes: spec.usable_bytes(),
         context_bytes: CONTEXT,
-        scratch_bytes: 3_228_766_208,
+        // PIN(2026-10-25): the box gate's `CARD_ROUTE_SCRATCH` row at 4,096 positions, 3,231,404,032 B
+        // (was 3,228,766,208): HC's BF16 bottleneck and refusal add 644 B per ubatch position
+        // [derived: 4,096 · 644 = 2,637,824].
+        scratch_bytes: 3_231_404_032,
         margin_bytes: spec.margin(),
         granule_bytes: GRANULE,
         free_bytes: spec.free_bytes,
@@ -467,9 +471,11 @@ const ROW_ROOM: u64 = 536_870_912;
 /// host serves none and the host need is the PLE table alone; the unset
 /// residency rule is `off`, no churn pool beside it: no
 /// host expert is left to move to the card. The restated terms first give
-/// the box gate's A6000
-/// row at the same context and ubatch (`CARD_PLANS`: 262 experts on the
-/// first 46 layers, 261 on the rest, 39,404,339,200 B).
+/// an A6000 plan at the box gate's context and ubatch: 262 experts on the
+/// first 43 layers, 261 on the rest, 39,395,123,200 B, one expert more than
+/// the box gate's `CARD_PLANS` row (262 on the first 42 layers,
+/// 39,392,051,200 B), so these terms leave the card under 3,072,000 B more
+/// room than the engine's plan.
 #[test]
 fn q4_on_one_96gb_card_holds_every_routed_expert() {
     let q4 = model(false);
@@ -486,12 +492,17 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
     // 39,385,907,200 B. The card keeps the 24 indexer projections in their 2-byte words
     // (`indexer_projection`), 18 granules (37,748,736 B) fewer, which the spread fills with 6
     // experts of 3,072,000 B and their granules [derived: the box gate's CARD_PLANS row].
+    // PIN(2026-10-24): 262 on the first 43 layers and 39,395,123,200 B; was 262 on the first 46 and
+    // 39,404,339,200 B. Each of the 36 GDN layers keeps a carry of 497,296 B
+    // (`runtime::stores::delta_carry_bytes`), 17,902,656 B of the card, which the spread takes from 3
+    // experts of 3,072,000 B and their granules [derived: the box gate's CARD_PLANS row].
+    // PIN(2026-10-25): unchanged by the stage's HC scratch, 2,637,824 B at 4,096 [derived: this plan].
     let want: Vec<u64> = (0..LAYERS)
-        .map(|l| if l < 46 { 262 } else { 261 })
+        .map(|l| if l < 43 { 262 } else { 261 })
         .collect();
     assert_eq!(
         (&a6000.n_l, a6000.cards[0].expert_bytes),
-        (&want, 39_404_339_200)
+        (&want, 39_395_123_200)
     );
 
     let one = picked("a", &census_96(1))[0];
@@ -625,9 +636,15 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     // host and both needs; was 41,924,531,200, 70,724,669,440 and 42,461,402,112 B. The card keeps
     // the 24 indexer projections in their words (`indexer_projection`), 18 granules fewer
     // [derived: the same spread, 13,056,000 = 6 · 2,176,000].
+    // PIN(2026-10-24): 3 experts of 2,176,000 B fewer on the card, 6,528,000 B onto the host and both
+    // needs; was 41,911,475,200, 70,711,613,440 and 42,448,346,112 B. The GDN layers' carries take
+    // 17,902,656 B of the card [derived: the same spread, 6,528,000 = 3 · 2,176,000].
+    // PIN(2026-10-25): 1 expert of 2,176,000 B fewer on the card, onto the host and both needs; was
+    // 41,918,003,200, 70,718,141,440 and 42,454,874,112 B. The stage's scratch holds HC's 644 B per
+    // ubatch position, 2,637,824 B at 4,096 [derived: the same spread].
     assert_eq!(
         (host.host.expert_bytes, host_need, nvme_need),
-        (41_911_475_200, 70_711_613_440, 42_448_346_112)
+        (41_920_179_200, 70_720_317_440, 42_457_050_112)
     );
     assert_eq!(nvme_need + PLE_TABLE, host_need + ROW_ROOM);
     assert!(nvme_need <= SCOPE_61G && SCOPE_61G < host_need);
@@ -724,22 +741,30 @@ fn two_slots_at_4096_hold_every_routed_expert() {
     assert_eq!((bytes, n_l, host), (Q4_ROUTED, vec![EXPERTS; LAYERS], 0));
 }
 
-/// 252,928 positions a slot on one such card, two sequences and no draft,
+/// 252,416 positions a slot on one such card, two sequences and no draft,
 /// is the last step of 256 whose plan holds at most the plan's margin fewer
 /// card expert bytes than the plan at 4,096
 /// ([`two_slots_at_4096_hold_every_routed_expert`]: every routed byte); the
-/// next step passes it. There 505 or 506 experts a layer stay on the card
-/// and 335 go to the host.
+/// next step passes it. There 504 or 505 experts a layer stay on the card
+/// and 338 go to the host.
 // PIN(2026-10-21): 252,928 positions (was 252,416), 505 or 506 experts a layer with one at 506 and
 // 335 on the host (was 504 or 505 with 47 at 505 and 337). The card keeps the 24 indexer
 // projections in their words (`indexer_projection`): 37,748,736 B of room, 664 positions of the two
 // slots' cache (2 · 28,416 B a position), and the boundary moved two steps of 256 within the
 // granules [derived: the plan's own boundary, 252,928 − 252,416 = 512].
+// PIN(2026-10-24): 252,416 positions (was 252,928), 505 experts on every layer and 336 on the host
+// (was 505 or 506 with one at 506 and 335). Each sequence's 36 GDN layers keep a carry of 497,296 B
+// (`runtime::stores::delta_carry_bytes`): 35,805,312 B of the two slots' room, 630 positions of
+// their cache, and the boundary moved two steps of 256 within the granules [derived: the plan's own
+// boundary, 252,928 − 252,416 = 512].
+// PIN(2026-10-25): 504 or 505 experts a layer with 46 at 505 and 338 on the host (was 505 on every
+// layer and 336). The stage's scratch holds HC's 644 B per ubatch position, 2,637,824 B at 4,096,
+// and the boundary stays at 252,416 [derived: the plan's own counts].
 #[test]
-fn two_slots_at_252928_stay_within_the_margin() {
-    let (at, n_l, host) = two_slots(252_928);
+fn two_slots_at_252416_stay_within_the_margin() {
+    let (at, n_l, host) = two_slots(252_416);
     assert!(Q4_ROUTED - at <= MARGIN);
-    let (next, _, _) = two_slots(252_928 + 256);
+    let (next, _, _) = two_slots(252_416 + 256);
     assert!(Q4_ROUTED - next > MARGIN);
     let (lo, hi) = (
         *n_l.iter().min().expect("layers"),
@@ -747,7 +772,7 @@ fn two_slots_at_252928_stay_within_the_margin() {
     );
     assert_eq!(
         (lo, hi, n_l.iter().filter(|&&n| n == hi).count(), host),
-        (505, 506, 1, 335)
+        (504, 505, 46, 338)
     );
 }
 

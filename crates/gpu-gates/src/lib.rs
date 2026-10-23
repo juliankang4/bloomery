@@ -1070,8 +1070,8 @@ pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        GateError, GgmlType, NAN_F16, bench_arm, dequant_row, exit_status, failure_status,
-        first_ids, kquant_d_at, max_rel_err, quantile,
+        GateError, GgmlType, NAN_F16, bench_arm, bits_equal, dequant_row, exit_status,
+        failure_status, first_ids, kquant_d_at, max_rel_err, quantile,
     };
 
     /// A failed run ends 1, and 75 when the need hook refused its load,
@@ -1153,6 +1153,18 @@ mod tests {
             &[1.0, 2.0],
             1.5
         ))));
+    }
+
+    /// The store and replay checks lean on [`bits_equal`]: a shorter side is
+    /// a difference, `-0.0` is not `0.0`, and a NaN matches only its own bits.
+    #[test]
+    fn bits_equal_takes_the_length_and_every_bit() {
+        let nan = f32::from_bits(0x7fc0_0001);
+        assert!(bits_equal(&[1.0, -0.0, nan], &[1.0, -0.0, nan]));
+        assert!(!bits_equal(&[1.0, -0.0], &[1.0]));
+        assert!(!bits_equal(&[1.0], &[1.0, -0.0]));
+        assert!(!bits_equal(&[-0.0], &[0.0]));
+        assert!(!bits_equal(&[nan], &[f32::NAN]));
     }
 
     /// `f32::max` drops NaN, so a fold alone scores an all-NaN output as 0.

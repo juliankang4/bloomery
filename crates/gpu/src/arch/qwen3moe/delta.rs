@@ -201,6 +201,7 @@ pub(super) fn delta_core(
                 pos,
                 stamp,
             },
+            r.carry.as_ref(),
         )?,
         (run, stamp) => {
             return Err(GpuError::shape(

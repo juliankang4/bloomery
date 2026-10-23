@@ -1472,10 +1472,11 @@ mod tests {
 
     /// A Qwen3.6 point (30 delta layers of 32 value heads: the state's
     /// 2,097,152 B and the conv ring's 360,448 B each) and a Qwen3.8 point
-    /// (36 delta layers of 48 value heads, and the PLE ring), both spaced at
-    /// the 4,096-token default ubatch: a slot of 2,048 positions holds the one
-    /// point its whole prompt takes, of 10,240 the three (4,096, 8,192 and the
-    /// end), and the host budget's fit caps them at 58 and 32.
+    /// (36 delta layers of 48 value heads with their chunk carry, and the PLE
+    /// ring), both spaced at the 4,096-token default ubatch: a slot of 2,048
+    /// positions holds the one point its whole prompt takes, of 10,240 the
+    /// three (4,096, 8,192 and the end), and the host budget's fit caps them
+    /// at 58 and 29.
     #[test]
     fn a_slots_budget_counts_the_points_of_its_prompt() {
         const Q35: Price = Price {
@@ -1483,12 +1484,12 @@ mod tests {
             every: 4_096,
         };
         const Q38: Price = Price {
-            point_bytes: 36 * (3_145_728 + 450_560) + 696_320,
+            point_bytes: 36 * (3_145_728 + 450_560 + 497_296) + 696_320,
             every: 4_096,
         };
         assert_eq!(Q35.point_bytes, 73_728_000);
-        assert_eq!(Q38.point_bytes, 130_162_688);
-        for (price, points) in [(Q35, [2, 2, 3, 4, 58]), (Q38, [2, 2, 3, 4, 32])] {
+        assert_eq!(Q38.point_bytes, 148_065_344);
+        for (price, points) in [(Q35, [2, 2, 3, 4, 58]), (Q38, [2, 2, 3, 4, 29])] {
             for (ctx, want) in [2_048, 4_096, 4_097, 10_240, 1 << 20]
                 .into_iter()
                 .zip(points)
@@ -1505,7 +1506,7 @@ mod tests {
         assert_eq!(pinned(2, Q35.budget(2_048).expect("a budget")), 294_912_000);
         assert_eq!(
             pinned(2, Q38.budget(10_240).expect("a budget")),
-            1_041_301_504
+            1_184_522_752
         );
     }
 
@@ -1540,7 +1541,7 @@ mod tests {
     /// probe bounds what every shallower load pins.
     #[test]
     fn a_priced_reserve_never_falls_with_the_context() {
-        for point_bytes in [73_728_000, 130_162_688] {
+        for point_bytes in [73_728_000, 148_065_344] {
             let price = Price {
                 point_bytes,
                 every: 4_096,

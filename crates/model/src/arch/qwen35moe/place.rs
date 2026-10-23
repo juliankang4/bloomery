@@ -65,8 +65,8 @@ use crate::placement::{
 use gguf::digest::hex;
 
 use runtime::stores::{
-    DELTA_LANES, F32_BYTES, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes, ple_ring_bytes,
-    recurrent_bytes, selecting_bytes,
+    DELTA_LANES, F32_BYTES, delta_carry_bytes, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes,
+    ple_ring_bytes, recurrent_bytes, selecting_bytes,
 };
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
@@ -1153,8 +1153,9 @@ pub const SELECT_RUN_BYTES: u64 = 22_000_000;
 /// up to 2,000,000 positions [derived, an upper bound: the router's buffers
 /// for 2,048 tokens, 8,577,028 B; the eight-column mix scratch, 379,520 B;
 /// the selection's run, at most [`SELECT_RUN_BYTES`] (the least run, eight
-/// rows, holds 16,082,048 B at 2,000,000); 30,956,548 B, rounded up to
-/// 32 MiB]. A load whose ubatch arena passes it refuses the arena by name.
+/// rows, holds 16,082,048 B at 2,000,000); the delta layers' chunk records
+/// past the q·k·v rows of a walk of one or two positions, at most 34,820 B;
+/// 30,991,368 B, rounded up to 32 MiB]. A load whose ubatch arena passes it refuses the arena by name.
 pub const UBATCH_FIXED_BYTES: u64 = 32 << 20;
 
 /// The card bytes a qwen4exp ubatch walk of up to `u` positions holds: what
@@ -1621,7 +1622,8 @@ fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), Place
 ///   channels, `2·k_heads·state + v_heads·state`, in f32), both fixed by the
 ///   file; on a qwen4exp file its state keeps
 ///   `runtime::stores::DELTA_LANES` lanes, each stamped
-///   (`runtime::stores::delta_lane_bytes`); a qwen35moe load that verifies
+///   (`runtime::stores::delta_lane_bytes`), and a carry
+///   (`runtime::stores::delta_carry_bytes`); a qwen35moe load that verifies
 ///   drafted rows asks for its own count ([`KvLayout::of_lanes`]);
 /// - the PLE site's layer, beside that: the PLE conv ring
 ///   (`(taps − 1)·dilation + PASS_ROWS` rows of `streams · n_embd` f32);
@@ -1639,7 +1641,8 @@ pub struct KvLayout {
     /// A GDN layer's state and conv ring, in bytes.
     recurrent: u64,
     /// What one checkpoint copies of a GDN layer: the committed state lane
-    /// and the conv ring ([`recurrent_bytes`], without the other lanes).
+    /// and the conv ring ([`recurrent_bytes`], without the other lanes), and
+    /// the carry on a qwen4exp file.
     copy: u64,
     /// The PLE site's layer and its conv ring's bytes.
     ple: Option<(usize, u64)>,
@@ -1680,10 +1683,11 @@ impl KvLayout {
     pub fn of_lanes(hp: &Hparams, lanes: usize) -> KvLayout {
         let exp = hp.exp.as_ref();
         let (recurrent, copy) = gdn_bytes(hp.v_heads, hp.k_heads, hp.state, hp.conv, lanes);
+        let carry = exp.map_or(0, |_| delta_carry_bytes(hp.v_heads, hp.k_heads, hp.state));
         KvLayout {
             kinds: hp.kinds.clone(),
-            recurrent,
-            copy,
+            recurrent: recurrent + carry,
+            copy: copy + carry,
             ple: exp.and_then(|e| e.ple).map(|p| {
                 (
                     p.layer,
@@ -2388,20 +2392,22 @@ impl KvBytes for MtpKv {
 #[cfg(test)]
 mod tests {
     use super::{
-        DELTA_LANES, Kind, KvBytes, KvLayout, delta_lane_bytes, gdn_bytes, ple_ring_bytes,
-        recurrent_bytes,
+        DELTA_LANES, Kind, KvBytes, KvLayout, delta_carry_bytes, delta_lane_bytes, gdn_bytes,
+        ple_ring_bytes, recurrent_bytes,
     };
 
     /// Qwen3.8's layers by kind (the sizes themselves are
-    /// `runtime::stores`'s, pinned there): a GDN layer's state lanes and conv ring,
-    /// the PLE ring beside it on its layer, an attention layer's K/V, raw and
+    /// `runtime::stores`'s, pinned there): a GDN layer's state lanes, conv
+    /// ring and carry, the PLE ring beside it on its layer, an attention layer's K/V, raw and
     /// pooled keys at a context of whole pools and one past.
     #[test]
     fn qwen38_layer_bytes() {
         let kv = KvLayout {
             kinds: vec![Kind::DeltaRule, Kind::DeltaRule, Kind::Attention],
-            recurrent: recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES),
-            copy: recurrent_bytes(48, 16, 128, 4),
+            recurrent: recurrent_bytes(48, 16, 128, 4)
+                + delta_lane_bytes(48, 128, DELTA_LANES)
+                + delta_carry_bytes(48, 16, 128),
+            copy: recurrent_bytes(48, 16, 128, 4) + delta_carry_bytes(48, 16, 128),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
             kv_heads: 2,
             head_dim: 256,
@@ -2409,8 +2415,11 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200);
-        assert_eq!(kv.layer_bytes(1, 4096), 3_596_288 + 9_437_200 + 696_320);
+        assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200 + 497_296);
+        assert_eq!(
+            kv.layer_bytes(1, 4096),
+            3_596_288 + 9_437_200 + 497_296 + 696_320
+        );
         assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2304 + 1024 * 256);
         assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2304 + 1025 * 256);
         assert_eq!(kv.layer_bytes(3, 4096), 0);
@@ -2532,9 +2541,9 @@ mod tests {
     /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth
     /// one attention, the PLE ring on layer 1) at a context of whole pools
     /// [derived]: twelve attention layers' 2,304 B a position and 256 B a
-    /// pool of four, and two checkpoints of 36 · 3,596,288 B (the committed
-    /// lane and conv ring, not the four lanes a layer holds) and the PLE
-    /// ring's 696,320 B.
+    /// pool of four, and two checkpoints of 36 · 4,093,584 B (the committed
+    /// lane, conv ring and carry, not the four lanes a layer holds) and the
+    /// PLE ring's 696,320 B.
     #[test]
     fn qwen38_state_bytes() {
         let kv = KvLayout {
@@ -2547,8 +2556,10 @@ mod tests {
                     }
                 })
                 .collect(),
-            recurrent: recurrent_bytes(48, 16, 128, 4) + delta_lane_bytes(48, 128, DELTA_LANES),
-            copy: recurrent_bytes(48, 16, 128, 4),
+            recurrent: recurrent_bytes(48, 16, 128, 4)
+                + delta_lane_bytes(48, 128, DELTA_LANES)
+                + delta_carry_bytes(48, 16, 128),
+            copy: recurrent_bytes(48, 16, 128, 4) + delta_carry_bytes(48, 16, 128),
             ple: Some((1, ple_ring_bytes(4, 3, 4, 2560))),
             kv_heads: 2,
             head_dim: 256,
@@ -2559,13 +2570,13 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        let checkpoint = 36 * 3_596_288 + 696_320;
+        let checkpoint = 36 * 4_093_584 + 696_320;
         assert_eq!(kv.state_bytes(0), 2 * checkpoint);
         assert_eq!(
             kv.state_bytes(262_144),
             12 * (262_144 * 2304 + 65_536 * 256) + 2 * checkpoint
         );
-        assert_eq!(kv.state_bytes(262_144), 7_709_409_280);
+        assert_eq!(kv.state_bytes(262_144), 7_745_214_592);
         assert_eq!(
             kv.state_bytes(4097),
             12 * (4097 * 2304 + 1025 * 256) + 2 * checkpoint

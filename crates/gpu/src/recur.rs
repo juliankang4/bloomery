@@ -1,7 +1,9 @@
-//! Recurrent state a layer keeps on the card: the state lanes and the conv
-//! ring. A delta layer passes [`crate::linear::LinearShape::lens`]; a later
-//! scan passes its own lengths. The length pair is the only architecture
-//! fact this module takes.
+//! Recurrent state a layer keeps on the card: the state lanes, the conv
+//! ring and, for a delta layer whose prompt runs the chunked rule, the carry
+//! (`linear::delta`'s module doc). A delta layer passes
+//! [`crate::linear::LinearShape::lens`] and `carry_len`; a later scan passes
+//! its own lengths. The lengths are the only architecture facts this module
+//! takes.
 
 use crate::GpuError;
 use crate::linear::delta::NEVER;
@@ -17,6 +19,9 @@ pub(crate) struct RecStore {
     /// `lanes` u32 stamps ([`fresh_stamps`]); `None` on a store whose
     /// launches do not read stamps.
     pub(crate) stamp: Option<DeviceBuffer<u32>>,
+    /// The carry ([`RecStore::carried`]); `None` on a store whose prompt
+    /// does not run the chunked rule.
+    pub(crate) carry: Option<DeviceBuffer<f32>>,
 }
 
 impl RecStore {
@@ -33,7 +38,21 @@ impl RecStore {
             ring: DeviceBuffer::zeroed(stream, ring)?,
             lanes,
             stamp: None,
+            carry: None,
         })
+    }
+
+    /// [`RecStore::new`] with a zeroed carry of `carry` f32s: a delta layer
+    /// whose prompt runs the chunked rule. Load-time only.
+    pub(crate) fn carried(
+        stream: &CudaStream,
+        lens: [usize; 2],
+        lanes: usize,
+        carry: usize,
+    ) -> Result<RecStore, GpuError> {
+        let mut r = RecStore::new(stream, lens, lanes)?;
+        r.carry = Some(DeviceBuffer::zeroed(stream, carry)?);
+        Ok(r)
     }
 
     /// [`RecStore::new`] with its stamps fresh ([`fresh_stamps`]). Load-time
@@ -78,11 +97,14 @@ impl RecStore {
         }
     }
 
-    /// Every lane of the state and the whole ring back to zero on the
-    /// device, ordered on `stream`. The stamps are unchanged.
+    /// Every lane of the state, the whole ring and the carry back to zero on
+    /// the device, ordered on `stream`. The stamps are unchanged.
     pub(crate) fn clear(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         self.state.zero_async(stream)?;
         self.ring.zero_async(stream)?;
+        if let Some(carry) = self.carry.as_mut() {
+            carry.zero_async(stream)?;
+        }
         Ok(())
     }
 
@@ -90,6 +112,7 @@ impl RecStore {
         self.state.num_bytes()
             + self.ring.num_bytes()
             + self.stamp.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.carry.as_ref().map_or(0, DeviceBuffer::num_bytes)
     }
 }
 
@@ -122,8 +145,11 @@ mod tests {
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_clear_keeps_stamps_and_addresses() -> Result<(), GpuError> {
         let (_ctx, stream) = crate::capsync::fresh_stream(0)?;
-        for lanes in [1, 2, 4] {
+        for (lanes, carry) in [(1, 0), (2, 7), (4, 9)] {
             let mut store = RecStore::stamped(&stream, [17 * lanes, 13], lanes)?;
+            if carry > 0 {
+                store.carry = Some(DeviceBuffer::zeroed(&stream, carry)?);
+            }
             let lane = u32::try_from(lanes - 1).expect("test lane fits u32");
             store.restamp_at(&stream, lane, 29)?;
             let stamps = store
@@ -131,17 +157,31 @@ mod tests {
                 .as_ref()
                 .expect("stamped store")
                 .to_host_vec(&stream)?;
-            let addresses = (store.state.cu_deviceptr(), store.ring.cu_deviceptr());
-            for buf in [&mut store.state, &mut store.ring] {
+            let addresses = (
+                store.state.cu_deviceptr(),
+                store.ring.cu_deviceptr(),
+                store.carry.as_ref().map(DeviceBuffer::cu_deviceptr),
+            );
+            for buf in [&mut store.state, &mut store.ring]
+                .into_iter()
+                .chain(store.carry.iter_mut())
+            {
                 buf.copy_from_host(&stream, &vec![f32::NAN; buf.len()])?;
             }
             store.clear(&stream)?;
-            for buf in [&store.state, &store.ring] {
+            for buf in [&store.state, &store.ring]
+                .into_iter()
+                .chain(store.carry.iter())
+            {
                 assert!(buf.to_host_vec(&stream)?.iter().all(|v| v.to_bits() == 0));
             }
             assert_eq!(
                 addresses,
-                (store.state.cu_deviceptr(), store.ring.cu_deviceptr())
+                (
+                    store.state.cu_deviceptr(),
+                    store.ring.cu_deviceptr(),
+                    store.carry.as_ref().map(DeviceBuffer::cu_deviceptr),
+                )
             );
             assert_eq!(
                 store

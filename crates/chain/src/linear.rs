@@ -3,6 +3,7 @@
 //! with the kernels that run them.
 
 use crate::ChainError;
+use runtime::stores;
 
 /// Width of every query, key and value head (d_k = d_v).
 pub const HEAD: usize = 128;
@@ -23,6 +24,18 @@ pub const PASS_ROWS: usize = 8;
 /// 2`, which the ring holds while it keeps `m + 2` positions; with `m + 3`
 /// the call's writes also never land on the slots of `p − 3 .. p − 1`.
 pub const RING_ROWS: usize = CONV_ROWS + PASS_ROWS;
+
+/// Tokens of one chunk of the prompt form (the chunked delta rule): a
+/// prompt's chunks start at the multiples of it from the position its rows
+/// began at, whatever calls cut the rows. `runtime::stores` owns the count.
+pub const CHUNK_ROWS: usize = stores::DELTA_CHUNK_ROWS;
+
+/// Rows of the carry: the tokens of the chunk a call left incomplete.
+pub const CARRY_ROWS: usize = stores::DELTA_CARRY_ROWS;
+
+/// Words before the carry's rows: the rows' count, the position after them
+/// and two spare words that keep the rows 16-byte aligned.
+pub const CARRY_HEAD: usize = stores::DELTA_CARRY_HEAD;
 
 /// The query/key head value head `h` reads when `n_v > n_k`: a property of
 /// the file's converter, not of the architecture.
@@ -80,6 +93,15 @@ impl LinearShape {
     #[must_use]
     pub fn ring_len(&self) -> usize {
         RING_ROWS * self.channels()
+    }
+
+    /// f32s of the carry: [`CARRY_HEAD`] words, then [`CARRY_ROWS`] rows of
+    /// the key and value heads, `(n_k + n_v)·HEAD`, then the rows' β and
+    /// their decays, `n_v` a row each.
+    #[must_use]
+    pub fn carry_len(&self) -> usize {
+        let bytes = stores::delta_carry_bytes(self.n_v, self.n_k, HEAD);
+        usize::try_from(bytes / stores::F32_BYTES).expect("carry count was computed in usize")
     }
 
     /// f32s of the state of `lanes` lanes and of the conv ring: the pair

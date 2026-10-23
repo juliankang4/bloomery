@@ -696,9 +696,13 @@ mod gate {
     /// PLE ring, `(taps − 1)·dilation + PASS_ROWS` rows of the four streams
     /// in f32. PIN(2026-09-28): a delta layer's state is [`LANES`] lanes, a
     /// verify's rows each keeping its own, with a u32 stamp a lane.
+    /// PIN(2026-10-24): a delta layer keeps a carry beside them, four words
+    /// and 15 rows of the `16 + 48` key and value heads of 128 and a β and a
+    /// decay a value head, in f32.
     fn store_bytes() -> usize {
         let conv_ch = 2 * K_HEADS * HEAD_V + V_HEADS * HEAD_V;
-        let rec = LANES * (V_HEADS * HEAD_V * HEAD_V * 4 + 4) + CONV_RING * conv_ch * 4;
+        let carry = (4 + 15 * ((K_HEADS + V_HEADS) * HEAD_V + 2 * V_HEADS)) * 4;
+        let rec = LANES * (V_HEADS * HEAD_V * HEAD_V * 4 + 4) + CONV_RING * conv_ch * 4 + carry;
         let sel = CTX * (2 * N_KV * HEAD * 2 + IDX_DIM * 2) + CTX.div_ceil(POOL) * IDX_DIM * 2;
         let ple = ((PLE_TAPS - 1) * PLE_DILATION + PASS_ROWS) * STREAMS * HIDDEN * 4;
         n_gdn() * rec + n_qsa() * sel + ple
@@ -1034,13 +1038,19 @@ mod gate {
             &graph,
             true,
         );
+        fresh(m)?;
+        m.prompt38(toks, Prompt38::Gemm)?;
         m.reset()?;
         let (reset_stores, ring) = stores(m)?;
         let mut recs = 0;
         let zero = reset_stores.iter().all(|s| match s {
-            Store38Host::Rec { state, ring } => {
+            Store38Host::Rec { state, ring, carry } => {
                 recs += 1;
-                state.iter().chain(ring).all(|v| v.to_bits() == 0)
+                state
+                    .iter()
+                    .chain(ring)
+                    .chain(carry)
+                    .all(|v| v.to_bits() == 0)
             }
             Store38Host::Qsa { .. } => true,
         });
@@ -1738,10 +1748,10 @@ mod gate {
     }
 
     /// The layers whose live stores differ at count `pos`, and whether the
-    /// PLE rings' live slots do ((v)'s rule: the committed lane, the conv
-    /// ring's eight positions before the count, the K/V planes' and raw
-    /// keys' rows below it, the pools complete at the count, the PLE ring's
-    /// fourteen positions before the count).
+    /// PLE rings' live slots do ((v)'s rule: the committed lane and the
+    /// carry, the conv ring's eight positions before the count, the K/V
+    /// planes' and raw keys' rows below it, the pools complete at the count,
+    /// the PLE ring's fourteen positions before the count).
     fn live_diff(a: &VRun, b: &VRun, pos: usize) -> (Vec<usize>, bool) {
         let conv_ch = 2 * K_HEADS * HEAD_V + V_HEADS * HEAD_V;
         let slots =
@@ -1772,12 +1782,21 @@ mod gate {
         let layers = (0..n)
             .filter(|&l| match (a.stores.get(l), b.stores.get(l)) {
                 (
-                    Some(Store38Host::Rec { state: s, ring: r }),
+                    Some(Store38Host::Rec {
+                        state: s,
+                        ring: r,
+                        carry: c,
+                    }),
                     Some(Store38Host::Rec {
                         state: s2,
                         ring: r2,
+                        carry: c2,
                     }),
-                ) => !(same_bits(s, s2) && ring_same(r, r2, CONV_RING, conv_ch, 8)),
+                ) => {
+                    !(same_bits(s, s2)
+                        && ring_same(r, r2, CONV_RING, conv_ch, 8)
+                        && same_bits(c, c2))
+                }
                 (
                     Some(Store38Host::Qsa { k, v, raw, pooled }),
                     Some(Store38Host::Qsa {
@@ -2438,11 +2457,15 @@ mod gate {
     }
 
     /// Each layer's relative distance between two runs' live stores at count
-    /// `pos` — the committed lane with the conv ring, the K/V planes' and raw
+    /// `pos` — the committed lane with the rows its carry holds taken in
+    /// ([`Store38Host::live_lane`]: a ubatch walk leaves the lane at its last
+    /// chunk's start and the rows past it in the carry, where the pass takes
+    /// every row into the lane) and the conv ring, the K/V planes' and raw
     /// keys' rows below the count and the pools complete at it — and the PLE
-    /// rings'. Rows past the count hold [`PLANE_FILL`] in both and would
-    /// only dilute the distance.
-    fn live_rel(a: &Run, b: &Run, pos: usize) -> (Vec<f64>, f64) {
+    /// rings'. Rows past the count hold [`PLANE_FILL`] in both and would only
+    /// dilute the distance.
+    fn live_rel(a: &Run, b: &Run, pos: usize) -> Result<(Vec<f64>, f64), GateError> {
+        let at = u32::try_from(pos)?;
         let f = |v: &[u16]| -> Vec<f32> { v.iter().map(|&h| half_to_f32(h)).collect() };
         let rows = |x: &[u16], heads: usize, width: usize| -> Vec<f32> {
             let ctx = x.len() / (heads * width).max(1);
@@ -2458,16 +2481,12 @@ mod gate {
             .iter()
             .zip(&b.stores)
             .map(|pair| match pair {
-                (
-                    Store38Host::Rec { state: s, ring: r },
-                    Store38Host::Rec {
-                        state: s2,
-                        ring: r2,
-                    },
-                ) => {
-                    let x: Vec<f32> = s.iter().chain(r).copied().collect();
-                    let y: Vec<f32> = s2.iter().chain(r2).copied().collect();
-                    rel(&x, &y)
+                (Store38Host::Rec { ring: r, .. }, Store38Host::Rec { ring: r2, .. }) => {
+                    let live = |s: &Store38Host, ring: &[f32]| -> Vec<f32> {
+                        let lane = s.live_lane(at).unwrap_or_default();
+                        lane.into_iter().chain(ring.iter().copied()).collect()
+                    };
+                    rel(&live(pair.0, r), &live(pair.1, r2))
                 }
                 (
                     Store38Host::Qsa { k, v, raw, pooled },
@@ -2498,7 +2517,7 @@ mod gate {
                 _ => f64::INFINITY,
             })
             .collect();
-        (layers, rel(&a.ple_ring, &b.ple_ring))
+        Ok((layers, rel(&a.ple_ring, &b.ple_ring)))
     }
 
     /// The ubatch walk of `toks` from [`fresh`] with its route taps armed
@@ -2738,7 +2757,7 @@ mod gate {
             tally.smallest,
             verdict(flips_ok)
         );
-        let (layers, ple) = live_rel(&free, pass, n);
+        let (layers, ple) = live_rel(&free, pass, n)?;
         let shown: Vec<usize> = (0..layers.len())
             .filter(|l| l % 8 == 0 || l + 1 == n_layer())
             .collect();
@@ -2867,7 +2886,7 @@ mod gate {
              distance from the pass's {logits_rel:.3e} (band {head_band:.3e}) {}",
             verdict(argmax_ok && logits_ok)
         );
-        let (layers, ple) = live_rel(&forced, pass, n);
+        let (layers, ple) = live_rel(&forced, pass, n)?;
         let mut past = Vec::new();
         for (l, &e) in layers.iter().enumerate() {
             let over = e > gemm_band(l) || e.is_nan();
@@ -3815,7 +3834,7 @@ mod gate {
              distance from the pass's {logits_rel:.3e} (band {head_band:.3e}) {}",
             verdict(argmax_ok && logits_ok)
         );
-        let (layers, ple) = live_rel(&forced, &pass, n);
+        let (layers, ple) = live_rel(&forced, &pass, n)?;
         let past: Vec<usize> = layers
             .iter()
             .enumerate()
@@ -4441,7 +4460,9 @@ mod gate {
         let u16s = |h: Fnv1a64, v: &[u16]| v.iter().fold(h, |h, &w| h.bytes(&w.to_le_bytes()));
         for s in &stores {
             match s {
-                Store38Host::Rec { state, ring } => h = h.f32s(state).f32s(ring),
+                Store38Host::Rec { state, ring, carry } => {
+                    h = h.f32s(state).f32s(ring).f32s(carry);
+                }
                 Store38Host::Qsa { k, v, raw, pooled } => {
                     h = u16s(u16s(u16s(u16s(h, k), v), raw), pooled);
                 }
@@ -4551,17 +4572,18 @@ mod gate {
 
     /// (y) the plan's slot count against the owners of the per-sequence
     /// bytes (module doc): the plan of two grows the card's kv class by
-    /// exactly the bytes one sequence holds — its stores and PLE ring
-    /// (`runtime::stores`'s own terms, the ones the load holds the
-    /// allocations to), the lane word (one device word) and the two
-    /// arena-row buffers (`(1 + PASS_ROWS) · STREAMS · HIDDEN` f32,
-    /// `seq38_bytes`' rows term) — and at one slot is the plan every other
-    /// clause loads by.
+    /// exactly the bytes one sequence holds — its stores (a delta layer's
+    /// lanes, conv ring and carry) and PLE ring (`runtime::stores`'s own
+    /// terms, the ones the load holds the allocations to), the lane word
+    /// (one device word) and the two arena-row buffers (`(1 + PASS_ROWS) ·
+    /// STREAMS · HIDDEN` f32, `seq38_bytes`' rows term) — and at one slot is
+    /// the plan every other clause loads by.
     fn slots_plan(experts: Experts) -> Result<bool, GateError> {
         let seq = {
             use runtime::stores as st;
             let rec = st::recurrent_bytes(V_HEADS, K_HEADS, HEAD_V, CONV)
-                + st::delta_lane_bytes(V_HEADS, HEAD_V, LANES);
+                + st::delta_lane_bytes(V_HEADS, HEAD_V, LANES)
+                + st::delta_carry_bytes(V_HEADS, K_HEADS, HEAD_V);
             let sel = st::selecting_bytes(N_KV, HEAD, IDX_DIM, POOL, CTX);
             let ple = st::ple_ring_bytes(PLE_TAPS, PLE_DILATION, STREAMS, HIDDEN);
             let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;

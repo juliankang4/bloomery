@@ -1,7 +1,9 @@
 //! The recurrent delta step of a linear-attention layer over `m` tokens,
 //! one launch per call: decode is `m = 1`, a prompt runs its tokens through
 //! the same loop with the state held in registers, read once and written
-//! once, in place.
+//! once, in place. A GDN prompt can take the prompt form instead, three
+//! launches over chunks of 16 tokens with a carry beside the state (the
+//! last paragraphs).
 //!
 //! The state has `lanes` lanes (a load parameter); the lane a call reads is
 //! the device word `lane[lane_at]` (the body's parameter image), never a
@@ -66,15 +68,65 @@
 //! any state element that stops being finite: `Sᵢ·qᵢ` is infinite or NaN
 //! whatever `qᵢ` is (`∞·0` is NaN). A non-finite `o` raises
 //! [`FaultSite::LinearDelta`] once per lane and is written as it is.
+//!
+//! The prompt form ([`DeltaKernels::enqueue_delta_prompt`]) runs an
+//! in-place call as the chunked delta rule over chunks of
+//! [`CHUNK_ROWS`](super::CHUNK_ROWS) tokens, its products on BF16 tensor
+//! cores with f32 accumulation. In a chunk that starts from the state `S`,
+//! with `Dₜ` the product of the chunk's decays up to row `t` and `A[t][j] =
+//! βₜ·(Dₜ/Dⱼ)·kₜ·kⱼ` for `j < t`:
+//! - the solved rows `u = (I + A)⁻¹·r`, `rₜ = βₜ·(vₜ − Dₜ·Sᵀkₜ)`;
+//! - `oₜ = Dₜ·Sᵀqₜ + Σ_{j ≤ t} (Dₜ/Dⱼ)·(qₜ·kⱼ)·uⱼ`;
+//! - the state after it `D·S + Σⱼ (D/Dⱼ)·kⱼ·uⱼᵀ`, `D` the last row's.
+//!
+//! `gdn_chunk_prepare`, one block a (chunk, value head), all chunks at once,
+//! writes a record of `work` from the chunk's own rows: the inverse (by
+//! forward substitution in f32), the causal product
+//! `(Dₜ/Dⱼ)·qₜ·kⱼ` (`j ≤ t`) and the decays. `gdn_delta_prepared`, two blocks
+//! a value head of 64 columns each, walks the chunks in order with its
+//! columns' state in f32 registers, read once and written once, under
+//! `gdn_delta_lanes`'s lane and stamp rules. q, k, the state, the solved rows
+//! and the records' matrices are rounded to BF16 for the tensor cores, so
+//! the bits are not `gdn_delta_lanes`'s: `gate_linear`'s `prompt` clause
+//! holds `o` and the state within a band of [`delta_host`]. A non-finite `o`
+//! or state value raises [`FaultSite::LinearDelta`] once per thread; a
+//! non-finite `v` reaches its column of `o` from its chunk's first row on
+//! (the tensor cores' `0·∞`) and that column of the state.
+//!
+//! Carry. A token's bits do not depend on the calls a prompt is cut into: a
+//! prompt's chunks start at the multiples of
+//! [`CHUNK_ROWS`](super::CHUNK_ROWS) from the position its rows began at,
+//! and row `t` of a chunk reads only the state
+//! the chunk starts from and the chunk's rows up to `t` (the masked terms
+//! and the padding are exact zeros, and every product keeps its shape). A
+//! call that ends inside a chunk leaves the state the chunk starts from in
+//! the lane, stamped at the call's end, and the chunk's rows in the store's
+//! carry ([`LinearShape::carry_len`]): [`CARRY_HEAD`] words (the rows'
+//! count and the position after them), then up to [`CARRY_ROWS`] rows of
+//! the conv's key and value heads, then their β and decays. A call from
+//! that position takes the carried rows first. The prompt form runs them
+//! through the chunk again, writing the outputs of its own rows only, and
+//! completes the chunk; its third launch, `gdn_carry_keep`, then writes the
+//! carry the call leaves. `gdn_delta_lanes` (a step, a pass, a verify's row
+//! 0) runs them through its loop first, writing no output for them. A
+//! carry that stands at another position holds no rows for the call, so a
+//! call after any other writer of the lane starts a chunk of its own. The
+//! carry moves with the lane wherever a state is copied.
 
-use super::{BLOCK, DECAY_HEAD, DECAY_KEY, HEAD, KHeadMap, LinearShape};
+use super::{
+    BLOCK, CARRY_HEAD, CARRY_ROWS, CHUNK_ROWS as CHUNK, DECAY_HEAD, DECAY_KEY, HEAD, KHeadMap,
+    LinearShape,
+};
 use crate::GpuError;
 use crate::cores::global_addr;
-use crate::fault::{FaultSink, FaultSite};
+use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::launch_u32;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::convert::cvt_bf16x2_f32 as chunk_pair;
 use cuda_device::float::{fma_rn_f32, mul_rn_f32};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, ptx_asm, thread, warp};
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, ptx_asm, thread, warp,
+};
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
@@ -183,6 +235,34 @@ fn column_sum(x: f32) -> f32 {
     s += warp::shuffle_xor_f32(s, 4);
     s += warp::shuffle_xor_f32(s, 2);
     s += warp::shuffle_xor_f32(s, 1);
+    s
+}
+
+/// One token's update of a lane's sixteen keys (module doc, the first four
+/// items): each key decayed (by `dh`, the head's decay, for
+/// `DECAY_HEAD`, else by its own `dk`), then `u = (v − S'ᵀk)·β` and `S =
+/// fma(k, u, S')`.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+fn rule_row<const DECAY: u32>(
+    mut s: [f32; KEYS_PER_LANE],
+    k: [f32; KEYS_PER_LANE],
+    dk: [f32; KEYS_PER_LANE],
+    dh: f32,
+    (v, b): (f32, f32),
+) -> [f32; KEYS_PER_LANE] {
+    for i in 0..KEYS_PER_LANE {
+        cuda_device::thread::__unroll_config::<0>();
+        s[i] = mul_rn_f32(s[i], if DECAY == DECAY_HEAD { dh } else { dk[i] });
+    }
+    let u = mul_rn_f32(v - column_sum(lane_dot(s, k)), b);
+    for i in 0..KEYS_PER_LANE {
+        cuda_device::thread::__unroll_config::<0>();
+        s[i] = fma_rn_f32(k[i], u, s[i]);
+    }
     s
 }
 
@@ -297,16 +377,7 @@ unsafe fn delta_body<const DECAY: u32>(
                 },
             )
         };
-        for i in 0..KEYS_PER_LANE {
-            cuda_device::thread::__unroll_config::<0>();
-            s[i] = mul_rn_f32(s[i], if DECAY == DECAY_HEAD { dh } else { dk[i] });
-        }
-        let kv = column_sum(lane_dot(s, k));
-        let u = mul_rn_f32(vt - kv, bt);
-        for i in 0..KEYS_PER_LANE {
-            cuda_device::thread::__unroll_config::<0>();
-            s[i] = fma_rn_f32(k[i], u, s[i]);
-        }
+        s = rule_row::<DECAY>(s, k, dk, dh, (vt, bt));
         let y = column_sum(lane_dot(s, q));
         if !y.is_finite() && !raised {
             fault.raise(FaultSite::LinearDelta);
@@ -325,6 +396,286 @@ unsafe fn delta_body<const DECAY: u32>(
         // it by the fn's contract; each read and written by this one lane.
         unsafe { *state.add(s_at + key_of(j, i)) = s[i] };
     }
+}
+
+/// u32 words of one (chunk, value head) record `gdn_chunk_prepare` writes
+/// and `gdn_delta_prepared` reads: the BF16 pairs of the inverse and of the
+/// causal product, row-major, eight words a row; then the cumulative decays
+/// `Dₜ`, the β values and the factors `D/Dₜ` (`D` the chunk's last row's),
+/// sixteen f32 bits each.
+const CHUNK_WORDS: usize = 2 * CHUNK * CHUNK / 2 + 3 * CHUNK;
+
+/// Value columns of one `gdn_delta_prepared` block: four warps of two
+/// eight-column tiles.
+const PREPARED_COLUMNS: usize = 64;
+
+/// Row stride, in BF16 pairs, of a packed tile of [`HEAD`]-wide rows; the
+/// four spare words keep a warp's fragment loads off one bank.
+const PSTRIDE: usize = HEAD / 2 + 4;
+
+/// Words of a packed Q or K tile of one chunk.
+const PTILE: usize = CHUNK * PSTRIDE;
+
+/// Word of carried row `t`'s key heads in a carry of `kv = (n_k + n_v)·HEAD`
+/// words a row (module doc, "Carry"): its value heads follow them.
+#[inline(always)]
+const fn carry_row(t: usize, kv: usize) -> usize {
+    CARRY_HEAD + t * kv
+}
+
+/// Word of carried row `t`'s β of value head `h` in a carry of `kv` words a
+/// row over `nv` value heads; its decay lies [`CARRY_ROWS`]` · nv` words on.
+#[inline(always)]
+const fn carry_beta(t: usize, h: usize, kv: usize, nv: usize) -> usize {
+    carry_row(CARRY_ROWS, kv) + t * nv + h
+}
+
+/// The rows a call from position `p0` takes from a carry whose header holds
+/// `n` rows standing at position `at` (module doc, "Carry"): `n` when the
+/// carry stands at `p0`, else zero. A count past [`CARRY_ROWS`] is invalid.
+#[inline(always)]
+const fn held_rows(n: usize, at: u32, p0: u32) -> Option<usize> {
+    if n > CARRY_ROWS {
+        None
+    } else {
+        Some(if at == p0 { n } else { 0 })
+    }
+}
+
+/// [`held_rows`] of `carry`'s header.
+///
+/// # Safety
+///
+/// `carry` holds its [`CARRY_HEAD`] words.
+#[inline(always)]
+unsafe fn carried_rows(carry: &[f32], p0: u32) -> Option<usize> {
+    // SAFETY: word 0 of the header, by the contract.
+    let n = unsafe { carry.get_unchecked(0) }.to_bits() as usize;
+    // SAFETY: word 1 of the header, by the contract.
+    let at = unsafe { carry.get_unchecked(1) }.to_bits();
+    held_rows(n, at, p0)
+}
+
+/// A call's rows as the prompt form reads them (module doc, "Carry"), as
+/// global addresses: row `r` below `lead` is carried row `r` of `old` (a
+/// carry's layout, `kv` words a row: the key heads, then the value heads),
+/// any other row `r − lead` of `qkv` (`ch` words a row: the query, key and
+/// value heads).
+#[derive(Clone, Copy)]
+struct CallRows {
+    qkv: u64,
+    old: u64,
+    lead: usize,
+    ch: usize,
+    kv: usize,
+    nk: usize,
+}
+
+impl CallRows {
+    /// The first key of row `r`, carried or current.
+    #[inline(always)]
+    fn kv_row(self, r: usize) -> u64 {
+        if r < self.lead {
+            self.old + 4 * carry_row(r, self.kv) as u64
+        } else {
+            self.qkv + 4 * ((r - self.lead) * self.ch + self.nk * HEAD) as u64
+        }
+    }
+
+    /// Key head `kh` of row `r`.
+    #[inline(always)]
+    fn key(self, r: usize, kh: usize) -> u64 {
+        self.kv_row(r) + 4 * (kh * HEAD) as u64
+    }
+
+    /// Value word `at` (`h·HEAD` plus a column) of row `r`.
+    #[inline(always)]
+    fn value(self, r: usize, at: usize) -> u64 {
+        self.kv_row(r) + 4 * (self.nk * HEAD + at) as u64
+    }
+
+    /// Query head `kh` of row `r >= lead`: a carried row keeps no query, its
+    /// output written by the call that carried it.
+    #[inline(always)]
+    fn query(self, r: usize, kh: usize) -> u64 {
+        self.qkv + 4 * ((r - self.lead) * self.ch + kh * HEAD) as u64
+    }
+}
+
+/// A warp's 16 × 8 product `A·Bᵀ + c` over `K` columns: `a` sixteen packed
+/// rows, `b` eight, each `K / 2` pairs at stride [`PSTRIDE`] when `K` is
+/// [`HEAD`] and `K / 2` otherwise. `c` and the result are the MMA's
+/// accumulator fragment: lane `l` holds rows `l / 4` and `l / 4 + 8`,
+/// columns `2·(l % 4)` and the next.
+///
+/// # Safety
+///
+/// `a` and `b` address initialized shared words of those shapes, and every
+/// lane of the warp executes the call.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn chunk_mma<const K: usize>(a: *const u32, b: *const u32, mut c: [f32; 4]) -> [f32; 4] {
+    let lane = thread::threadIdx_x() as usize % 32;
+    let r = lane / 4;
+    let k = lane % 4;
+    let stride = if K == HEAD { PSTRIDE } else { K / 2 };
+    let mut base = 0;
+    while base < K / 2 {
+        let mut af = [0; 4];
+        for i in 0..4 {
+            let at = (r + (i % 2) * 8) * stride + base + k + (i / 2) * 4;
+            // SAFETY: rows r and r + 8 of A's sixteen, pair k or k + 4 of
+            // this step's eight.
+            af[i] = unsafe { *a.add(at) };
+        }
+        let mut bf = [0; 2];
+        for i in 0..2 {
+            let at = r * stride + base + k + i * 4;
+            // SAFETY: row r of B's eight, pair k or k + 4 of this step's.
+            bf[i] = unsafe { *b.add(at) };
+        }
+        // SAFETY: every lane runs this step with its documented fragments.
+        c = unsafe { cuda_device::wmma::mma_m16n8k16_f32_bf16(c, af, bf) };
+        base += 8;
+    }
+    c
+}
+
+/// One thread's eight 4-key pieces of a chunk's query rows (the first four)
+/// and key rows of key head `kh`, the chunk's rows `start ..` of `rows`, all
+/// loads issued before any is used; rows at or past `count`, and a carried
+/// row's query, read as zero.
+///
+/// # Safety
+///
+/// Rows `start .. start + count` of `rows` lie inside its buffers, 16-byte
+/// aligned, and no thread writes them while the kernel runs; the block is
+/// 128 threads.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn chunk_qk_regs(
+    rows: CallRows,
+    (start, count): (usize, usize),
+    kh: usize,
+) -> [[f32; 4]; 8] {
+    let tid = thread::threadIdx_x() as usize;
+    let mut v = [[0.0f32; 4]; 8];
+    for i in 0usize..8 {
+        cuda_device::thread::__unroll_config::<0>();
+        let r = start + tid / 32 + 4 * (i % 4);
+        if r < start + count && (i >= 4 || r >= rows.lead) {
+            let head = if i < 4 {
+                rows.query(r, kh)
+            } else {
+                rows.key(r, kh)
+            };
+            // SAFETY: four keys of a whole head of row r, at a multiple of
+            // four floats from an aligned base, by the contract.
+            v[i] = unsafe { ld4::<true>(head + 16 * (tid % 32) as u64) };
+        }
+    }
+    v
+}
+
+/// Store [`chunk_qk_regs`]'s pieces as BF16 pairs: the Q tile at `packed`,
+/// the K tile [`PTILE`] words on.
+///
+/// # Safety
+///
+/// `packed` addresses two tiles of shared memory the block owns that no
+/// thread reads until the next barrier.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn chunk_qk_store(packed: *mut u32, v: [[f32; 4]; 8]) {
+    let tid = thread::threadIdx_x() as usize;
+    for i in 0usize..8 {
+        cuda_device::thread::__unroll_config::<0>();
+        let t = tid / 32 + 4 * (i % 4);
+        let at = if i < 4 { 0 } else { PTILE } + t * PSTRIDE + 2 * (tid % 32);
+        // SAFETY: tid < 128 gives t < CHUNK and 2*(tid%32) < PSTRIDE; this thread owns this pair
+        // inside the two tiles.
+        unsafe { *packed.add(at) = chunk_pair(v[i][0], v[i][1]) };
+        // SAFETY: tid < 128 gives t < CHUNK and 2*(tid%32)+1 < PSTRIDE; this thread owns this pair
+        // inside the two tiles.
+        unsafe { *packed.add(at + 1) = chunk_pair(v[i][2], v[i][3]) };
+    }
+}
+
+/// Shared words of `gdn_delta_prepared`: the Q and K tiles, the keys by time,
+/// the state tile, the residuals by time, the inverse and causal product.
+const PREPARED_WORDS: usize =
+    2 * PTILE + HEAD * 8 + PREPARED_COLUMNS * PSTRIDE + PREPARED_COLUMNS * 8 + 2 * 128;
+
+/// Shared f32s of `gdn_delta_prepared`: the key and query projections and the
+/// values, `[CHUNK][PREPARED_COLUMNS]` each, then D, β and the final factors.
+const PREPARED_FLOATS: usize = 3 * CHUNK * PREPARED_COLUMNS + 3 * CHUNK;
+
+/// Words of `work` the prompt form takes for a call of `m` rows at `shape`
+/// ([`DeltaKernels::enqueue_delta_prompt`]): the records of the most chunks
+/// a call of `m` rows after a carry spans, then the lead word.
+#[must_use]
+pub fn prompt_work_len(shape: LinearShape, m: usize) -> usize {
+    (m + CARRY_ROWS).div_ceil(CHUNK) * shape.n_v * CHUNK_WORDS + 1
+}
+
+/// Refuse by name what `gdn_delta_lanes` and the prompt form cannot launch
+/// with a carry of `carry` f32s ([`DeltaKernels::enqueue_delta_lanes`]'s
+/// list).
+fn check_gdn_lanes(
+    what: &'static str,
+    args: &DeltaLanesArgs<'_>,
+    carry: Option<usize>,
+) -> Result<(), GpuError> {
+    let DeltaLanesArgs {
+        delta: d,
+        each,
+        pos,
+        stamp,
+    } = args;
+    d.shape.check(what)?;
+    let (m, lanes) = (d.m, d.lanes);
+    if m == 0 || lanes == 0 || (*each && m > lanes) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "m={m} over {lanes} lanes{}: a call takes one token or more and a lane or \
+                 more, and row mode at most a token a lane",
+                if *each { " in row mode" } else { "" }
+            ),
+        ));
+    }
+    let nv = d.shape.n_v;
+    let lens = [
+        ("qkv", d.qkv.len(), m * d.shape.channels()),
+        ("beta", d.beta.len(), m * nv),
+        ("decay", d.decay.len(), m * nv),
+        ("lane", d.lane.len(), d.lane_at + 1),
+        ("pos", pos.len(), 1),
+        ("o", d.o.len(), m * nv * HEAD),
+        ("state", d.state.len(), lanes * d.shape.state_len()),
+        ("stamp", stamp.len(), lanes),
+    ];
+    let carried = carry.map(|len| ("carry", len, d.shape.carry_len()));
+    if let Some((name, got, need)) = lens
+        .into_iter()
+        .chain(carried)
+        .find(|(_, got, need)| got < need)
+    {
+        return Err(GpuError::shape(
+            what,
+            format!("{name}.len() {got} < {need}"),
+        ));
+    }
+    Ok(())
 }
 
 #[cuda_module]
@@ -433,7 +784,8 @@ mod delta_kernels {
     /// [`gdn_delta`] over `lanes` lanes with their stamps (module doc): lane
     /// `lane[lane_at] mod lanes` read, checked against `pos[0]`, and written
     /// in place (`each == 0`) or token `j` into lane `(c + j) mod lanes`
-    /// (`each != 0`, `m <= lanes`).
+    /// (`each != 0`, `m <= lanes`); with `carried`, the rows `carry` holds
+    /// for `pos[0]` first (module doc, "Carry"), else `carry` is never read.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -452,7 +804,8 @@ mod delta_kernels {
             pos.len() >= 1,
             o.len() >= m * n_v * 128,
             state.len() >= lanes * n_v * 16384,
-            stamp.len() >= lanes
+            stamp.len() >= lanes,
+            carry.len() >= 4
         )
     )]
     pub fn gdn_delta_lanes(
@@ -468,6 +821,8 @@ mod delta_kernels {
         m: u32,
         each: u32,
         pos: &[u32],
+        carry: &[f32],
+        carried: u32,
         fault: FaultSink,
         mut o: DisjointSlice<f32>,
         mut state: DisjointSlice<f32>,
@@ -481,12 +836,762 @@ mod delta_kernels {
         // and `stamp` are this launch's own outputs, the state read and
         // written by the thread that owns each key and the stamps by block
         // 0's thread 0 alone (the body's doc); the launcher checks n_k
-        // divides n_v, `m <= lanes` in row mode, the block width and the grid.
+        // divides n_v, `m <= lanes` in row mode, a carried launch's whole
+        // carry, the block width and the grid.
         unsafe {
             delta_lanes_body::<DECAY_HEAD>(
-                qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, grouped, m, each, 0, pos, fault,
-                o, state, stamp,
+                qkv,
+                beta,
+                decay,
+                lane,
+                lane_at,
+                lanes,
+                n_k,
+                n_v,
+                grouped,
+                (m, each, 0),
+                pos,
+                (carry, carried),
+                fault,
+                o,
+                state,
+                stamp,
             );
+        }
+    }
+
+    /// The prompt form's first launch (module doc): block `b` reads chunk
+    /// `b / n_v` of the call's rows (module doc, "Carry": the rows `carry`
+    /// holds for `pos[0]`, then the call's `m`) for value head `b % n_v` and
+    /// writes its [`CHUNK_WORDS`]-word record, record `b` of `work`, from
+    /// those rows alone; a block past the call's chunks returns. Block 0's
+    /// thread 0 writes the count of carried rows into the word past the
+    /// `chunks · n_v` records, the lead word the next two launches read.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+    )]
+    #[kernel]
+    #[launch_bounds(128, 3)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            qkv.len() >= m * (2 * n_k + n_v) * 128,
+            beta.len() >= m * n_v,
+            decay.len() >= m * n_v,
+            carry.len() >= 4 + 15 * ((n_k + n_v) * 128 + 2 * n_v),
+            pos.len() >= 1,
+            work.len() >= chunks * n_v * 304 + 1,
+            chunks * 16 >= m + 15
+        )
+    )]
+    pub fn gdn_chunk_prepare(
+        qkv: &[f32],
+        beta: &[f32],
+        decay: &[f32],
+        carry: &[f32],
+        pos: &[u32],
+        n_k: u32,
+        n_v: u32,
+        grouped: u32,
+        m: u32,
+        chunks: u32,
+        fault: FaultSink,
+        mut work: DisjointSlice<u32>,
+    ) {
+        // The f32 scratch: the key products (then the strictly lower matrix)
+        // and the inverse, rows of 20; the query products and
+        // the factors `G[t][j] = Dₜ/Dⱼ`, rows of 16; then D, β and the decays.
+        const KK: usize = 0;
+        const QK: usize = KK + CHUNK * 20;
+        const INV: usize = QK + CHUNK * CHUNK;
+        const G: usize = INV + CHUNK * 20;
+        const D: usize = G + CHUNK * CHUNK;
+        const B: usize = D + CHUNK;
+        const DR: usize = B + CHUNK;
+        static mut PACKED: SharedArray<u32, { 2 * PTILE }> = SharedArray::UNINIT;
+        static mut SCRATCH: SharedArray<f32, { DR + CHUNK }> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let warp = tid / 32;
+        let lane = tid % 32;
+        let r = lane / 4;
+        let c = lane % 4 * 2;
+        let block = thread::blockIdx_x() as usize;
+        let (nk, nv, m) = (n_k as usize, n_v as usize, m as usize);
+        // SAFETY: the carry's header and pos[0], by the contract.
+        let lead = match unsafe { carried_rows(carry, *pos.get_unchecked(0)) } {
+            Some(n) => n,
+            None => {
+                // Fault the count and complete the records for the queued
+                // walk.
+                fault.raise(FaultSite::LinearDelta);
+                0
+            }
+        };
+        let all = lead + m;
+        if block >= nv * all.div_ceil(CHUNK) {
+            return;
+        }
+        let h = block % nv;
+        let start = block / nv * CHUNK;
+        let count = (all - start).min(CHUNK);
+        let kh = if grouped != 0 { h / (nv / nk) } else { h % nk };
+        let kv = (nk + nv) * HEAD;
+        let rows = CallRows {
+            qkv: global_addr(qkv.as_ptr()),
+            old: global_addr(carry.as_ptr()),
+            lead,
+            ch: (2 * nk + nv) * HEAD,
+            kv,
+            nk,
+        };
+        let work = work.as_mut_ptr();
+        if block == 0 && tid == 0 {
+            // SAFETY: the lead word, inside work by the contract; this
+            // thread alone writes it.
+            unsafe { *work.add(chunks as usize * nv * CHUNK_WORDS) = lead as u32 };
+        }
+        // SAFETY: PACKED is this block's own shared allocation.
+        let packed = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PACKED) };
+        // SAFETY: SCRATCH is this block's own shared allocation.
+        let sm = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SCRATCH) };
+        // SAFETY: the chunk's rows of the carry and qkv, by the contract.
+        let qk = unsafe { chunk_qk_regs(rows, (start, count), kh) };
+        // SAFETY: the block's two packed tiles, read by no thread yet.
+        unsafe { chunk_qk_store(packed, qk) };
+        if tid < CHUNK {
+            let r = start + tid;
+            let (d, b) = if tid >= count {
+                (1.0, 0.0)
+            } else if r < lead {
+                let at = carry_beta(r, h, kv, nv);
+                // SAFETY: carried row r's β and decay of head h, inside
+                // the carry by the contract.
+                unsafe {
+                    (
+                        *carry.get_unchecked(at + CARRY_ROWS * nv),
+                        *carry.get_unchecked(at),
+                    )
+                }
+            } else {
+                (decay[(r - lead) * nv + h], beta[(r - lead) * nv + h])
+            };
+            // SAFETY: row tid of the decays; one writer a row.
+            unsafe { *sm.add(DR + tid) = d };
+            // SAFETY: row tid of β; one writer a row.
+            unsafe { *sm.add(B + tid) = b };
+        }
+        thread::sync_threads();
+        if tid < CHUNK {
+            let mut product = 1.0;
+            let mut between = 1.0;
+            for t in 0..CHUNK {
+                // SAFETY: row t of the decays, complete past the barrier.
+                let d = unsafe { *sm.add(DR + t) };
+                product *= d;
+                if tid == 0 {
+                    // SAFETY: thread 0 alone writes D.
+                    unsafe { *sm.add(D + t) = product };
+                }
+                if t > tid {
+                    between *= d;
+                }
+                // SAFETY: thread tid alone writes column tid of G.
+                unsafe { *sm.add(G + t * CHUNK + tid) = between };
+            }
+        }
+        thread::sync_threads();
+        let a = if warp < 2 { PTILE } else { 0 };
+        let half = warp % 2 * 8;
+        // SAFETY: the complete Q and K tiles.
+        let dots = unsafe {
+            chunk_mma::<HEAD>(packed.add(a), packed.add(PTILE + half * PSTRIDE), [0.0; 4])
+        };
+        for i in 0..4 {
+            let row = r + i / 2 * 8;
+            let col = half + c + i % 2;
+            let (dst, stride) = if warp < 2 { (KK, 20) } else { (QK, CHUNK) };
+            // SAFETY: two warps a product, each its own half of the tile.
+            unsafe { *sm.add(dst + row * stride + col) = dots[i] };
+        }
+        thread::sync_threads();
+        // The strictly lower L[t][j] = −βₜ·G[t][j]·kₜ·kⱼ (j < t) over the key
+        // products.
+        let mut at = tid;
+        while at < CHUNK * CHUNK {
+            let t = at / CHUNK;
+            let j = at % CHUNK;
+            // SAFETY: the complete key products.
+            let dot = unsafe { *sm.add(KK + t * 20 + j) };
+            // SAFETY: the complete decay factors.
+            let g = unsafe { *sm.add(G + at) };
+            // SAFETY: row t of β.
+            let b = unsafe { *sm.add(B + t) };
+            let lower = if j < t { -b * g * dot } else { 0.0 };
+            // SAFETY: each thread replaces the cells it read.
+            unsafe { *sm.add(KK + t * 20 + j) = lower };
+            at += 128;
+        }
+        let t = tid / 8;
+        let j = tid % 8 * 2;
+        // SAFETY: t < CHUNK and j < CHUNK bound this QK cell; the preceding barrier published the
+        // query products.
+        let p0 = unsafe { *sm.add(QK + t * CHUNK + j) };
+        // SAFETY: t < CHUNK and j+1 < CHUNK bound this QK cell; the preceding barrier published
+        // the query products.
+        let p1 = unsafe { *sm.add(QK + t * CHUNK + j + 1) };
+        // SAFETY: t < CHUNK and j < CHUNK bound this G cell; the preceding barrier published the
+        // decay factors.
+        let g0 = unsafe { *sm.add(G + t * CHUNK + j) };
+        // SAFETY: t < CHUNK and j+1 < CHUNK bound this G cell; the preceding barrier published the
+        // decay factors.
+        let g1 = unsafe { *sm.add(G + t * CHUNK + j + 1) };
+        let p = chunk_pair(
+            if j <= t { p0 * g0 } else { 0.0 },
+            if j < t { p1 * g1 } else { 0.0 },
+        );
+        thread::sync_threads();
+        // (I − L)⁻¹ by forward substitution in f32, column tid by thread tid.
+        if tid < CHUNK {
+            let mut x = [0.0f32; CHUNK];
+            for i in 0..CHUNK {
+                cuda_device::thread::__unroll_config::<0>();
+                let mut acc = if i == tid { 1.0 } else { 0.0 };
+                for q in 0..CHUNK {
+                    cuda_device::thread::__unroll_config::<0>();
+                    if q < i {
+                        // SAFETY: the complete strictly lower matrix.
+                        let l = unsafe { *sm.add(KK + i * 20 + q) };
+                        acc = fma_rn_f32(l, x[q], acc);
+                    }
+                }
+                x[i] = acc;
+                // SAFETY: thread tid alone writes column tid of the inverse.
+                unsafe { *sm.add(INV + i * 20 + tid) = acc };
+            }
+        }
+        thread::sync_threads();
+        // SAFETY: t < CHUNK and j < CHUNK bound this INV cell at stride 20; the preceding barrier
+        // published the inverse.
+        let i0 = unsafe { *sm.add(INV + t * 20 + j) };
+        // SAFETY: t < CHUNK and j+1 < CHUNK bound this INV cell at stride 20; the preceding
+        // barrier published the inverse.
+        let i1 = unsafe { *sm.add(INV + t * 20 + j + 1) };
+        let base = block * CHUNK_WORDS;
+        // SAFETY: block < chunks·nv owns this record of work and tid < 128 < CHUNK_WORDS; thread
+        // tid alone writes this inverse word.
+        unsafe { *work.add(base + tid) = chunk_pair(i0, i1) };
+        // SAFETY: block owns this record and 128+tid < CHUNK_WORDS; thread tid alone writes this
+        // product word.
+        unsafe { *work.add(base + 128 + tid) = p };
+        if tid < CHUNK {
+            // SAFETY: tid < CHUNK bounds this D row; the preceding barriers published D.
+            let d = unsafe { *sm.add(D + tid) };
+            // SAFETY: tid < CHUNK bounds this β row; the preceding barriers published β.
+            let b = unsafe { *sm.add(B + tid) };
+            // SAFETY: 1 <= count <= CHUNK and tid < CHUNK bound this G cell of row count − 1; the
+            // preceding barriers published G.
+            let end = unsafe { *sm.add(G + (count - 1) * CHUNK + tid) };
+            // SAFETY: block owns this record and 256+tid < CHUNK_WORDS; thread tid alone writes
+            // this decay word.
+            unsafe { *work.add(base + 256 + tid) = d.to_bits() };
+            // SAFETY: block owns this record and 272+tid < CHUNK_WORDS; thread tid alone writes
+            // this beta word.
+            unsafe { *work.add(base + 272 + tid) = b.to_bits() };
+            // SAFETY: block owns this record and 288+tid < CHUNK_WORDS; thread tid alone writes
+            // this factor word.
+            unsafe { *work.add(base + 288 + tid) = end.to_bits() };
+        }
+    }
+
+    /// The prompt form's second launch (module doc): block `b` walks value
+    /// head `b / 2`'s 64 columns `64·(b % 2) ..` through the call's chunks
+    /// (module doc, "Carry"), the records `gdn_chunk_prepare` wrote into
+    /// `work` for the same rows, in order, warp `w` the eight-column tiles
+    /// `2·w` and `2·w + 1`, their state in registers from the first chunk to
+    /// the last, a last chunk the call leaves incomplete left out of it.
+    /// The lane and stamp rules are `gdn_delta_lanes`'s in place mode (block
+    /// 0's thread 0 alone touches the stamps).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+    )]
+    #[kernel]
+    #[launch_bounds(128, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            qkv.len() >= m * (2 * n_k + n_v) * 128,
+            carry.len() >= 4 + 15 * ((n_k + n_v) * 128 + 2 * n_v),
+            work.len() >= chunks * n_v * 304 + 1,
+            chunks * 16 >= m + 15,
+            lane.len() >= lane_at + 1,
+            lanes >= 1,
+            pos.len() >= 1,
+            o.len() >= m * n_v * 128,
+            state.len() >= lanes * n_v * 16384,
+            stamp.len() >= lanes
+        )
+    )]
+    pub fn gdn_delta_prepared(
+        qkv: &[f32],
+        carry: &[f32],
+        work: &[u32],
+        lane: &[u32],
+        lane_at: u32,
+        lanes: u32,
+        n_k: u32,
+        n_v: u32,
+        grouped: u32,
+        m: u32,
+        chunks: u32,
+        pos: &[u32],
+        fault: FaultSink,
+        mut o: DisjointSlice<f32>,
+        mut state: DisjointSlice<f32>,
+        mut stamp: DisjointSlice<u32>,
+    ) {
+        static mut PACKED: SharedArray<u32, PREPARED_WORDS> = SharedArray::UNINIT;
+        static mut SCRATCH: SharedArray<f32, PREPARED_FLOATS> = SharedArray::UNINIT;
+        // Offsets into PACKED and SCRATCH, in the order PREPARED_WORDS and
+        // PREPARED_FLOATS count them.
+        const COLS: usize = PREPARED_COLUMNS;
+        const KT: usize = 2 * PTILE;
+        const S_TILE: usize = KT + HEAD * 8;
+        const UB: usize = S_TILE + COLS * PSTRIDE;
+        const IP: usize = UB + COLS * 8;
+        const KS: usize = 0;
+        const QS: usize = CHUNK * COLS;
+        const U: usize = 2 * CHUNK * COLS;
+        const D: usize = 3 * CHUNK * COLS;
+        const B: usize = D + CHUNK;
+        const END: usize = B + CHUNK;
+        // SAFETY: PACKED is this block's own shared allocation.
+        let packed = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PACKED) };
+        // SAFETY: SCRATCH is this block's own shared allocation.
+        let sm = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SCRATCH) };
+        let o = o.as_mut_ptr();
+        let state = state.as_mut_ptr();
+        let stamp = stamp.as_mut_ptr();
+        let tid = thread::threadIdx_x() as usize;
+        let lane_id = tid % 32;
+        let r = lane_id / 4;
+        let c = lane_id % 4 * 2;
+        let wc = tid / 32 * 16;
+        let block = thread::blockIdx_x() as usize;
+        let h = block / 2;
+        let col0 = block % 2 * COLS;
+        let (nk, nv, m) = (n_k as usize, n_v as usize, m as usize);
+        let kh = if grouped != 0 { h / (nv / nk) } else { h % nk };
+        // SAFETY: the lead word, inside work by the contract.
+        let lead = unsafe { *work.get_unchecked(chunks as usize * nv * CHUNK_WORDS) } as usize;
+        let all = lead + m;
+        let rows = CallRows {
+            qkv: global_addr(qkv.as_ptr()),
+            old: global_addr(carry.as_ptr()),
+            lead,
+            ch: (2 * nk + nv) * HEAD,
+            kv: (nk + nv) * HEAD,
+            nk,
+        };
+        let word = lane[lane_at as usize];
+        let slot = (word % lanes) as usize;
+        if block == 0 && tid == 0 {
+            if word >= lanes {
+                fault.raise(FaultSite::DeltaLane);
+            }
+            // SAFETY: slot < lanes, inside the stamps; block 0's thread 0 is
+            // their only reader and writer in the launch.
+            let at = unsafe { *stamp.add(slot) };
+            if at != pos[0] {
+                fault.raise(FaultSite::DeltaStamp);
+            }
+            // SAFETY: slot < lanes bounds this stamp; block 0's thread 0 alone writes it after
+            // reading its old value.
+            unsafe { *stamp.add(slot) = pos[0].wrapping_add(m as u32) };
+        }
+        let s_base = slot * nv * HEAD * HEAD + (h * HEAD + col0) * HEAD;
+        let mut st = [[[0.0f32; 4]; 2]; 8];
+        for tile in 0usize..8 {
+            cuda_device::thread::__unroll_config::<0>();
+            for n in 0usize..2 {
+                cuda_device::thread::__unroll_config::<0>();
+                for i in 0usize..4 {
+                    cuda_device::thread::__unroll_config::<0>();
+                    let key = tile * 16 + r + i / 2 * 8;
+                    let col = wc + n * 8 + c + i % 2;
+                    // SAFETY: the grid gives each (key, column) of lane slot one
+                    // thread, which reads it here and writes it after the walk.
+                    st[tile][n][i] = unsafe { *state.add(s_base + col * HEAD + key) };
+                }
+            }
+        }
+        let mut raised = false;
+        for chunk in 0..all.div_ceil(CHUNK) {
+            let start = chunk * CHUNK;
+            let count = (all - start).min(CHUNK);
+            let rec = (chunk * nv + h) * CHUNK_WORDS;
+            // Every global read of the chunk is issued before the first use.
+            // SAFETY: the chunk's rows of the carry and qkv, by the contract.
+            let qk = unsafe { chunk_qk_regs(rows, (start, count), kh) };
+            let mut vr = [[0.0f32; 4]; 2];
+            for i in 0usize..2 {
+                cuda_device::thread::__unroll_config::<0>();
+                let f = tid + 128 * i;
+                if f / 16 < count {
+                    let at = rows.value(start + f / 16, h * HEAD + col0 + 4 * (f % 16));
+                    // SAFETY: four of the block's columns of the row, at a
+                    // multiple of four floats from an aligned base.
+                    vr[i] = unsafe { ld4::<true>(at) };
+                }
+            }
+            let inv = work[rec + tid];
+            let prod = work[rec + 128 + tid];
+            let meta = if tid < 3 * CHUNK {
+                work[rec + 256 + tid]
+            } else {
+                0
+            };
+            thread::sync_threads();
+            // SAFETY: past the barrier no thread reads the previous chunk's tiles.
+            unsafe { chunk_qk_store(packed, qk) };
+            // SAFETY: IP+tid < PREPARED_WORDS; thread tid owns this inverse word, read only after
+            // the following barrier.
+            unsafe { *packed.add(IP + tid) = inv };
+            // SAFETY: IP+128+tid < PREPARED_WORDS; thread tid owns this product word, read only
+            // after the following barrier.
+            unsafe { *packed.add(IP + 128 + tid) = prod };
+            if tid < 3 * CHUNK {
+                // SAFETY: D, β and the final factors follow one another in sm.
+                unsafe { *sm.add(D + tid) = f32::from_bits(meta) };
+            }
+            for i in 0usize..2 {
+                cuda_device::thread::__unroll_config::<0>();
+                let f = tid + 128 * i;
+                for e in 0usize..4 {
+                    cuda_device::thread::__unroll_config::<0>();
+                    // SAFETY: row f / 16 of the value tile; each thread owns four cells.
+                    unsafe { *sm.add(U + f / 16 * COLS + 4 * (f % 16) + e) = vr[i][e] };
+                }
+            }
+            for tile in 0usize..8 {
+                cuda_device::thread::__unroll_config::<0>();
+                for n in 0usize..2 {
+                    cuda_device::thread::__unroll_config::<0>();
+                    for i in 0usize..4 {
+                        cuda_device::thread::__unroll_config::<0>();
+                        let key = tile * 16 + r + i / 2 * 8;
+                        let col = wc + n * 8 + c + i % 2;
+                        let next = warp::shuffle_xor_f32(st[tile][n][i], 4);
+                        if r.is_multiple_of(2) {
+                            // SAFETY: the even key row owns the pair (key, key + 1).
+                            unsafe {
+                                *packed.add(S_TILE + col * PSTRIDE + key / 2) =
+                                    chunk_pair(st[tile][n][i], next);
+                            }
+                        }
+                    }
+                }
+            }
+            thread::sync_threads();
+            // The keys by time from the K tile: word (key, p) holds rows 2p and 2p + 1.
+            for i in 0usize..4 {
+                cuda_device::thread::__unroll_config::<0>();
+                let f = tid + 128 * i;
+                let (kp, p) = (f % 64, f / 64);
+                // SAFETY: key pair kp of row 2p of the complete K tile.
+                let w0 = unsafe { *packed.add(PTILE + 2 * p * PSTRIDE + kp) };
+                // SAFETY: p < 8 gives row 2p + 1 < CHUNK and kp < 64 < PSTRIDE: key pair kp of
+                // that row of the K tile, published by the preceding barrier.
+                let w1 = unsafe { *packed.add(PTILE + (2 * p + 1) * PSTRIDE + kp) };
+                // SAFETY: kp < 64 and p < 8 bound this KT word of key 2kp within HEAD*8 words;
+                // this thread alone writes it.
+                unsafe { *packed.add(KT + 2 * kp * 8 + p) = (w0 & 0xffff) | (w1 << 16) };
+                // SAFETY: kp < 64 and p < 8 bound this KT word of key 2kp + 1 within HEAD*8 words;
+                // this thread alone writes it.
+                unsafe { *packed.add(KT + (2 * kp + 1) * 8 + p) = (w0 >> 16) | (w1 & 0xffff_0000) };
+            }
+            for n in 0usize..2 {
+                cuda_device::thread::__unroll_config::<0>();
+                let sb = S_TILE + (wc + n * 8) * PSTRIDE;
+                // SAFETY: the complete K and state tiles.
+                let kp = unsafe { chunk_mma::<HEAD>(packed.add(PTILE), packed.add(sb), [0.0; 4]) };
+                // SAFETY: the complete Q and state tiles.
+                let qp = unsafe { chunk_mma::<HEAD>(packed, packed.add(sb), [0.0; 4]) };
+                for i in 0usize..4 {
+                    cuda_device::thread::__unroll_config::<0>();
+                    let at = (r + i / 2 * 8) * COLS + wc + n * 8 + c + i % 2;
+                    // SAFETY: at < CHUNK*COLS bounds this KS cell; this lane alone writes it
+                    // before the following barrier.
+                    unsafe { *sm.add(KS + at) = kp[i] };
+                    // SAFETY: at < CHUNK*COLS bounds this QS cell; this lane alone writes it
+                    // before the following barrier.
+                    unsafe { *sm.add(QS + at) = qp[i] };
+                }
+            }
+            thread::sync_threads();
+            // From here a warp reads and writes only its own sixteen columns.
+            for i in 0usize..4 {
+                cuda_device::thread::__unroll_config::<0>();
+                let f = lane_id + 32 * i;
+                let (cb, p) = (wc + f / 8, f % 8);
+                let mut pair = [0.0f32; 2];
+                for e in 0usize..2 {
+                    cuda_device::thread::__unroll_config::<0>();
+                    let t = 2 * p + e;
+                    // SAFETY: row t of β, complete past the barrier.
+                    let b = unsafe { *sm.add(B + t) };
+                    // SAFETY: row t of the warp's own value column.
+                    let v = unsafe { *sm.add(U + t * COLS + cb) };
+                    // SAFETY: row t of D, complete past the barrier.
+                    let d = unsafe { *sm.add(D + t) };
+                    // SAFETY: row t of the warp's own key projection column.
+                    let kp = unsafe { *sm.add(KS + t * COLS + cb) };
+                    pair[e] = b * (v - d * kp);
+                }
+                // SAFETY: the warp's own packed column.
+                unsafe { *packed.add(UB + cb * 8 + p) = chunk_pair(pair[0], pair[1]) };
+            }
+            warp::sync_mask(u32::MAX);
+            for n in 0usize..2 {
+                cuda_device::thread::__unroll_config::<0>();
+                // SAFETY: the inverse and the warp's packed residuals.
+                let u = unsafe {
+                    chunk_mma::<16>(packed.add(IP), packed.add(UB + (wc + n * 8) * 8), [0.0; 4])
+                };
+                for i in 0usize..4 {
+                    cuda_device::thread::__unroll_config::<0>();
+                    // SAFETY: row r + 8·(i/2) < CHUNK and column wc + n·8 + c + i%2 < COLS: one of
+                    // the warp's own U cells, whose old value the warp read before the warp sync.
+                    unsafe { *sm.add(U + (r + i / 2 * 8) * COLS + wc + n * 8 + c + i % 2) = u[i] };
+                }
+            }
+            warp::sync_mask(u32::MAX);
+            for i in 0usize..4 {
+                cuda_device::thread::__unroll_config::<0>();
+                let f = lane_id + 32 * i;
+                let (cb, p) = (wc + f / 8, f % 8);
+                // SAFETY: p < 8 gives row 2p < CHUNK and cb < COLS is one of the warp's own
+                // columns, written by this warp before the preceding warp sync.
+                let u0 = unsafe { *sm.add(U + 2 * p * COLS + cb) };
+                // SAFETY: p < 8 gives row 2p + 1 < CHUNK and cb < COLS is one of the warp's own
+                // columns, written by this warp before the preceding warp sync.
+                let u1 = unsafe { *sm.add(U + (2 * p + 1) * COLS + cb) };
+                // SAFETY: the warp's own packed column.
+                unsafe { *packed.add(UB + cb * 8 + p) = chunk_pair(u0, u1) };
+            }
+            warp::sync_mask(u32::MAX);
+            for n in 0usize..2 {
+                cuda_device::thread::__unroll_config::<0>();
+                let mut acc = [0.0f32; 4];
+                for i in 0usize..4 {
+                    cuda_device::thread::__unroll_config::<0>();
+                    let t = r + i / 2 * 8;
+                    // SAFETY: row t of D, complete past the barrier.
+                    let d = unsafe { *sm.add(D + t) };
+                    // SAFETY: a cell of the warp's own query projection columns.
+                    let qp = unsafe { *sm.add(QS + t * COLS + wc + n * 8 + c + i % 2) };
+                    acc[i] = d * qp;
+                }
+                // SAFETY: the causal product and the warp's packed solved rows.
+                let y = unsafe {
+                    chunk_mma::<16>(packed.add(IP + 128), packed.add(UB + (wc + n * 8) * 8), acc)
+                };
+                for i in 0usize..4 {
+                    cuda_device::thread::__unroll_config::<0>();
+                    let t = r + i / 2 * 8;
+                    // A carried row's output is the carrying call's.
+                    if t < count && start + t >= lead {
+                        if !y[i].is_finite() && !raised {
+                            fault.raise(FaultSite::LinearDelta);
+                            raised = true;
+                        }
+                        let row = start + t - lead;
+                        // SAFETY: row < m, a column of head h: inside o, one
+                        // lane a cell.
+                        unsafe {
+                            *o.add((row * nv + h) * HEAD + col0 + wc + n * 8 + c + i % 2) = y[i]
+                        };
+                    }
+                }
+            }
+            // A chunk the call leaves incomplete stays out of the state: the
+            // carry holds its rows for the call that completes it.
+            if count < CHUNK {
+                continue;
+            }
+            warp::sync_mask(u32::MAX);
+            for i in 0usize..4 {
+                cuda_device::thread::__unroll_config::<0>();
+                let f = lane_id + 32 * i;
+                let (cb, p) = (wc + f / 8, f % 8);
+                // SAFETY: p < 8 gives row 2p < CHUNK and cb < COLS is one of the warp's own
+                // columns, written by this warp before the preceding warp sync.
+                let u0 = unsafe { *sm.add(U + 2 * p * COLS + cb) };
+                // SAFETY: p < 8 gives row 2p + 1 < CHUNK and cb < COLS is one of the warp's own
+                // columns, written by this warp before the preceding warp sync.
+                let u1 = unsafe { *sm.add(U + (2 * p + 1) * COLS + cb) };
+                // SAFETY: p < 8 gives row 2p < CHUNK of the final factors, published by the
+                // chunk's first barriers.
+                let e0 = unsafe { *sm.add(END + 2 * p) };
+                // SAFETY: p < 8 gives row 2p + 1 < CHUNK of the final factors, published by the
+                // chunk's first barriers.
+                let e1 = unsafe { *sm.add(END + 2 * p + 1) };
+                let (u0, u1) = (u0 * e0, u1 * e1);
+                // SAFETY: the warp's own packed column, read by no MMA in flight.
+                unsafe { *packed.add(UB + cb * 8 + p) = chunk_pair(u0, u1) };
+            }
+            warp::sync_mask(u32::MAX);
+            // SAFETY: the chunk's last row of D.
+            let d = unsafe { *sm.add(D + CHUNK - 1) };
+            for tile in 0usize..8 {
+                cuda_device::thread::__unroll_config::<0>();
+                for n in 0usize..2 {
+                    cuda_device::thread::__unroll_config::<0>();
+                    for i in 0usize..4 {
+                        cuda_device::thread::__unroll_config::<0>();
+                        st[tile][n][i] *= d;
+                    }
+                    // SAFETY: the keys by time and the warp's decayed rows.
+                    st[tile][n] = unsafe {
+                        chunk_mma::<16>(
+                            packed.add(KT + tile * 16 * 8),
+                            packed.add(UB + (wc + n * 8) * 8),
+                            st[tile][n],
+                        )
+                    };
+                    if !quad_finite(st[tile][n]) && !raised {
+                        fault.raise(FaultSite::LinearDelta);
+                        raised = true;
+                    }
+                }
+            }
+        }
+        for tile in 0usize..8 {
+            cuda_device::thread::__unroll_config::<0>();
+            for n in 0usize..2 {
+                cuda_device::thread::__unroll_config::<0>();
+                for i in 0usize..4 {
+                    cuda_device::thread::__unroll_config::<0>();
+                    let key = tile * 16 + r + i / 2 * 8;
+                    let col = wc + n * 8 + c + i % 2;
+                    // SAFETY: the cell this thread read before the walk.
+                    unsafe { *state.add(s_base + col * HEAD + key) = st[tile][n][i] };
+                }
+            }
+        }
+    }
+
+    /// The prompt form's last launch (module doc, "Carry"): the rows of the
+    /// last chunk of the call's rows into `carry` when the call leaves it
+    /// incomplete. Slot `s` holds the chunk's row `s`; a slot below the
+    /// carried rows the chunk starts with keeps its row, a slot past the
+    /// chunk's rows is zero. Block `b < n_k + n_v` writes head `b` of the
+    /// rows (the key heads, then the value heads), block `n_k + n_v` their β
+    /// and decays and, on thread 0, the header: the count and `pos[0] + m`.
+    /// It reads the lead word `gdn_chunk_prepare` wrote, never the carry, so
+    /// no block reads what another writes.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            qkv.len() >= m * (2 * n_k + n_v) * 128,
+            beta.len() >= m * n_v,
+            decay.len() >= m * n_v,
+            work.len() >= chunks * n_v * 304 + 1,
+            chunks * 16 >= m + 15,
+            pos.len() >= 1,
+            carry.len() >= 4 + 15 * ((n_k + n_v) * 128 + 2 * n_v)
+        )
+    )]
+    pub fn gdn_carry_keep(
+        qkv: &[f32],
+        beta: &[f32],
+        decay: &[f32],
+        work: &[u32],
+        pos: &[u32],
+        n_k: u32,
+        n_v: u32,
+        m: u32,
+        chunks: u32,
+        mut carry: DisjointSlice<f32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let b = thread::blockIdx_x() as usize;
+        let (nk, nv, m) = (n_k as usize, n_v as usize, m as usize);
+        let (ch, kv) = ((2 * nk + nv) * HEAD, (nk + nv) * HEAD);
+        // SAFETY: the lead word, inside work by the contract.
+        let lead = unsafe { *work.get_unchecked(chunks as usize * nv * CHUNK_WORDS) } as usize;
+        let all = lead + m;
+        // The last chunk starts at call row `last`; it holds `held` rows when
+        // incomplete, and slots below `from` the rows the call carried in.
+        let last = (all - 1) / CHUNK * CHUNK;
+        let held = if all - last < CHUNK { all - last } else { 0 };
+        let from = lead.saturating_sub(last);
+        let carry = carry.as_mut_ptr();
+        if b < nk + nv {
+            for s in 0..CARRY_ROWS {
+                if s >= from || s >= held {
+                    let v = if s < held {
+                        // SAFETY: word tid of head b of qkv row last + s −
+                        // lead < m: the key heads (nk + b < 2·nk), then the
+                        // value heads past them.
+                        unsafe {
+                            *qkv.get_unchecked((last + s - lead) * ch + (nk + b) * HEAD + tid)
+                        }
+                    } else {
+                        0.0
+                    };
+                    // SAFETY: slot s < CARRY_ROWS, head b: inside the carry,
+                    // this thread's word alone.
+                    unsafe { *carry.add(carry_row(s, kv) + b * HEAD + tid) = v };
+                }
+            }
+        } else if b == nk + nv {
+            let mut f = tid;
+            while f < CARRY_ROWS * nv {
+                let (s, h) = (f / nv, f % nv);
+                if s >= from || s >= held {
+                    let (bt, dt) = if s < held {
+                        let at = (last + s - lead) * nv + h;
+                        (beta[at], decay[at])
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    let at = carry_beta(s, h, kv, nv);
+                    // SAFETY: slot s's β of head h, inside the carry; this
+                    // thread's alone.
+                    unsafe { *carry.add(at) = bt };
+                    // SAFETY: slot s < CARRY_ROWS and h < nv put this decay word CARRY_ROWS·nv
+                    // past the β word, inside the carry; this thread's alone.
+                    unsafe { *carry.add(at + CARRY_ROWS * nv) = dt };
+                }
+                f += 128;
+            }
+            if tid == 0 {
+                // SAFETY: word 0 is inside CARRY_HEAD; thread 0 of block nk+nv alone writes this
+                // header word.
+                unsafe { *carry = f32::from_bits(held as u32) };
+                // SAFETY: word 1 is inside CARRY_HEAD; thread 0 of block nk+nv alone writes this
+                // header word.
+                unsafe { *carry.add(1) = f32::from_bits(pos[0].wrapping_add(m as u32)) };
+            }
         }
     }
 
@@ -547,8 +1652,22 @@ mod delta_kernels {
         // lanes`, row 0 in place mode and `row + m <= lanes` in row mode.
         unsafe {
             delta_lanes_body::<DECAY_KEY>(
-                qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, grouped, m, each, row, pos,
-                fault, o, state, stamp,
+                qkv,
+                beta,
+                decay,
+                lane,
+                lane_at,
+                lanes,
+                n_k,
+                n_v,
+                grouped,
+                (m, each, row),
+                pos,
+                (qkv, 0),
+                fault,
+                o,
+                state,
+                stamp,
             );
         }
     }
@@ -745,6 +1864,41 @@ pub fn delta_host(
     delta_rule_host::<DECAY_HEAD>(qkv, beta, decay, state, lanes, lane, shape, m)
 }
 
+/// The host rule of the rows `carry` holds for position `p0` (module doc,
+/// "Carry") taken into `lane`, one lane of `shape`'s state: what
+/// `gdn_delta_lanes` from `p0` does to its lane before its first token,
+/// [`delta_host`] over the carried rows; `lane` itself when the carry holds
+/// none for `p0`.
+///
+/// # Panics
+///
+/// When `carry` is shorter than `shape`'s carry, its count exceeds
+/// [`CARRY_ROWS`], or `lane` is shorter than a lane.
+#[must_use]
+pub fn carry_fold_host(carry: &[f32], lane: &[f32], p0: u32, shape: LinearShape) -> Vec<f32> {
+    let held = match held_rows(carry[0].to_bits() as usize, carry[1].to_bits(), p0) {
+        Some(n) => n,
+        None => panic!("carry_fold_host: carry count exceeds CARRY_ROWS"),
+    };
+    if held == 0 {
+        return lane.to_vec();
+    }
+    let (n_k, n_v) = (shape.n_k, shape.n_v);
+    let kv = (n_k + n_v) * HEAD;
+    let mut qkv = Vec::with_capacity(held * shape.channels());
+    let (mut beta, mut decay) = (Vec::new(), Vec::new());
+    for t in 0..held {
+        // A carried row keeps no query: its output is not this rule's.
+        qkv.extend(std::iter::repeat_n(0.0, n_k * HEAD));
+        qkv.extend_from_slice(&carry[carry_row(t, kv)..carry_row(t + 1, kv)]);
+        let b = carry_beta(t, 0, kv, n_v);
+        beta.extend_from_slice(&carry[b..b + n_v]);
+        let d = b + CARRY_ROWS * n_v;
+        decay.extend_from_slice(&carry[d..d + n_v]);
+    }
+    delta_host(&qkv, &beta, &decay, lane, 1, 0, shape, held).state
+}
+
 /// The host rule of [`DeltaKernels::enqueue_kda_delta`]: [`delta_host`]
 /// with `decay` `[m][n_v][HEAD]`, key `i`'s decay scaling state key `i`.
 ///
@@ -879,15 +2033,18 @@ pub const fn read_lane(c: u32, row: u32, lanes: u32) -> u32 {
 
 /// The loop of one block of `gdn_delta_lanes` and `kda_delta_lanes` (module
 /// doc): [`delta_body`]'s loop for `DECAY` over lane [`read_lane`]`(c, row)`,
-/// `c = lane[lane_at] mod lanes`, with the stamp check and writes on block
-/// 0's thread 0 and the state stored per row (`each != 0`) or once after the
-/// last token.
+/// `c = lane[lane_at] mod lanes`, with the stamp check and writes and the
+/// carry's count check on block 0's thread 0 and the state stored per row
+/// (`each != 0`) or once after the last token. For `DECAY_HEAD` with `carried`, the rows `carry` holds for
+/// `pos[0]` come first, their outputs not written (module doc, "Carry").
 ///
 /// # Safety
 ///
 /// [`delta_body`]'s contract for `DECAY`, and `pos` holds a word, `stamp`
 /// addresses `lanes` writable u32s no other launch touches, `row == 0` when
-/// `each == 0`, and `row + m <= lanes` when `each != 0`.
+/// `each == 0` or `carried != 0`, `row + m <= lanes` when `each != 0`, and
+/// with `carried` `carry` is a whole carry of the shape no launch writes
+/// while this one runs.
 #[allow(
     clippy::too_many_arguments,
     reason = "the kernel entry's arguments, forwarded flat"
@@ -907,10 +2064,9 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
     n_k: u32,
     n_v: u32,
     grouped: u32,
-    m: u32,
-    each: u32,
-    row: u32,
+    (m, each, row): (u32, u32, u32),
     pos: &[u32],
+    (carry, carried): (&[f32], u32),
     fault: FaultSink,
     o: *mut f32,
     state: *mut f32,
@@ -940,7 +2096,7 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
         // SAFETY: rin < lanes and every (c + row + t) mod lanes < lanes:
         // inside the `lanes` stamps; block 0's thread 0 is their only reader
         // and writer in the launch, and it reads stamp rin before it writes
-        // any.
+        // any. The carry's header, by the contract.
         unsafe {
             if *stamp.add(rin as usize) != p0 {
                 fault.raise(FaultSite::DeltaStamp);
@@ -953,6 +2109,11 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
                 }
             } else {
                 *stamp.add(c as usize) = p0.wrapping_add(m as u32);
+            }
+            // The header is the launch's: this thread alone faults an
+            // invalid count, which every thread then takes as no rows.
+            if DECAY == DECAY_HEAD && carried != 0 && carried_rows(carry, p0).is_none() {
+                fault.raise(FaultSite::LinearDelta);
             }
         }
     }
@@ -970,7 +2131,7 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
     let k_at = (n_k + kh) * HEAD;
     let v_at = 2 * n_k * HEAD + h * HEAD + col;
     let lane_len = n_v * HEAD * HEAD;
-    let col_at = (h * HEAD + col) * HEAD;
+    let col_at = (b * COLUMNS_PER_BLOCK + tid / LANES_PER_COLUMN) * HEAD;
     let s_at = rin as usize * lane_len + col_at;
 
     // SAFETY: as in `delta_body`: the rows read are inside qkv and the
@@ -980,6 +2141,30 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
     let (qkv_g, state_g) = (global_addr(qkv.as_ptr()), global_addr(state.cast_const()));
     // SAFETY: s_at + HEAD <= lanes·n_v·HEAD·HEAD, the column inside state.
     let mut s = unsafe { lane_keys::<false>(state_g + 4 * s_at as u64, j) };
+    if DECAY == DECAY_HEAD && carried != 0 {
+        let kv = (n_k + n_v) * HEAD;
+        let carry_g = global_addr(carry.as_ptr());
+        // SAFETY: the carry's header, by the contract.
+        let held = unsafe { carried_rows(carry, p0) }.unwrap_or(0);
+        let mut t = 0usize;
+        while t < held {
+            let at = carry_row(t, kv);
+            // SAFETY: row t < CARRY_ROWS of the carry: this lane's sixteen
+            // keys of key head kh, 16-byte aligned.
+            let k = unsafe { lane_keys::<true>(carry_g + 4 * (at + kh * HEAD) as u64, j) };
+            let b_at = carry_beta(t, h, kv, n_v);
+            // SAFETY: the row's value column, β and decay, inside the carry.
+            let (vt, bt, dh) = unsafe {
+                (
+                    *carry.get_unchecked(at + n_k * HEAD + h * HEAD + col),
+                    *carry.get_unchecked(b_at),
+                    *carry.get_unchecked(b_at + CARRY_ROWS * n_v),
+                )
+            };
+            s = rule_row::<DECAY_HEAD>(s, k, [0.0; KEYS_PER_LANE], dh, (vt, bt));
+            t += 1;
+        }
+    }
     let mut raised = false;
     let mut t = 0usize;
     while t < m {
@@ -1018,16 +2203,7 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
                 },
             )
         };
-        for i in 0..KEYS_PER_LANE {
-            cuda_device::thread::__unroll_config::<0>();
-            s[i] = mul_rn_f32(s[i], if DECAY == DECAY_HEAD { dh } else { dk[i] });
-        }
-        let kv = column_sum(lane_dot(s, k));
-        let u = mul_rn_f32(vt - kv, bt);
-        for i in 0..KEYS_PER_LANE {
-            cuda_device::thread::__unroll_config::<0>();
-            s[i] = fma_rn_f32(k[i], u, s[i]);
-        }
+        s = rule_row::<DECAY>(s, k, dk, dh, (vt, bt));
         let y = column_sum(lane_dot(s, q));
         if !y.is_finite() && !raised {
             fault.raise(FaultSite::LinearDelta);
@@ -1083,16 +2259,117 @@ pub struct KdaLanesArgs<'a> {
 }
 
 impl DeltaKernels {
+    /// Enqueue the in-place call `args` in the prompt form (module doc):
+    /// `gdn_chunk_prepare` over `⌈(m + 15) / 16⌉·n_v` blocks writing their
+    /// records and the lead word into `work`, `gdn_delta_prepared` over
+    /// `2·n_v` blocks, which takes the rows `carry` holds for `pos[0]` first,
+    /// then `gdn_carry_keep` over `n_k + n_v + 1` blocks, which leaves in
+    /// `carry` the rows of a chunk the call does not complete (module doc,
+    /// "Carry"). Refused by name: what `enqueue_delta_lanes` refuses, row
+    /// mode, a carry shorter than the shape's and a `work` shorter than
+    /// [`prompt_work_len`]. Asynchronous, allocation-free.
+    pub fn enqueue_delta_prompt(
+        &self,
+        stream: &CudaStream,
+        args: DeltaLanesArgs<'_>,
+        carry: &mut DeviceBuffer<f32>,
+        work: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "enqueue_delta_prompt";
+        if args.each {
+            return Err(GpuError::shape(
+                WHAT,
+                "row mode: the prompt form runs a call in place",
+            ));
+        }
+        check_gdn_lanes(WHAT, &args, Some(carry.len()))?;
+        let DeltaLanesArgs {
+            delta:
+                DeltaArgs {
+                    qkv,
+                    beta,
+                    decay,
+                    lane,
+                    lane_at,
+                    lanes,
+                    shape,
+                    m,
+                    fault,
+                    o,
+                    state,
+                },
+            each: _,
+            pos,
+            stamp,
+        } = args;
+        let need = prompt_work_len(shape, m);
+        if work.len() < need {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("work.len() {} < {need}", work.len()),
+            ));
+        }
+        let chunks = (m + CARRY_ROWS).div_ceil(CHUNK);
+        let nk = launch_u32(WHAT, "n_k", shape.n_k)?;
+        let nv = launch_u32(WHAT, "n_v", shape.n_v)?;
+        let map = grouped_arg(shape.map);
+        let rows = launch_u32(WHAT, "m", m)?;
+        let count = launch_u32(WHAT, "chunks", chunks)?;
+        let grid = launch_u32(WHAT, "prepare grid", chunks * shape.n_v)?;
+        let prep = self
+            .module
+            .prepare_gdn_chunk_prepare(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.gdn_chunk_prepare(
+            stream, &prep, qkv, beta, decay, carry, pos, nk, nv, map, rows, count, fault, work,
+        )?;
+        let grid = launch_u32(WHAT, "walk grid", shape.n_v * (HEAD / PREPARED_COLUMNS))?;
+        let prep = self
+            .module
+            .prepare_gdn_delta_prepared(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.gdn_delta_prepared(
+            stream,
+            &prep,
+            qkv,
+            carry,
+            work,
+            lane,
+            launch_u32(WHAT, "lane_at", lane_at)?,
+            launch_u32(WHAT, "lanes", lanes)?,
+            nk,
+            nv,
+            map,
+            rows,
+            count,
+            pos,
+            fault,
+            o,
+            state,
+            stamp,
+        )?;
+        let grid = launch_u32(WHAT, "carry grid", shape.n_k + shape.n_v + 1)?;
+        let prep = self
+            .module
+            .prepare_gdn_carry_keep(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.gdn_carry_keep(
+            stream, &prep, qkv, beta, decay, work, pos, nk, nv, rows, count, carry,
+        )?;
+        Ok(())
+    }
+
     /// Enqueue `gdn_delta_lanes` (module doc): `8·n_v` blocks of 128
-    /// threads. Refused by name: no lane, row mode over more tokens than
+    /// threads, taking first the rows `carry` holds for `pos[0]` (module
+    /// doc, "Carry"; `None` on a store whose prompt does not run the chunked
+    /// rule). Refused by name: no lane, row mode over more tokens than
     /// lanes, a slice shorter than the launch reads. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_delta_lanes(
         &self,
         stream: &CudaStream,
         args: DeltaLanesArgs<'_>,
+        carry: Option<&DeviceBuffer<f32>>,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "enqueue_delta_lanes";
+        check_gdn_lanes(WHAT, &args, carry.map(DeviceBuffer::len))?;
         let DeltaLanesArgs {
             delta:
                 DeltaArgs {
@@ -1112,34 +2389,7 @@ impl DeltaKernels {
             pos,
             stamp,
         } = args;
-        shape.check(WHAT)?;
-        if m == 0 || lanes == 0 || (each && m > lanes) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "m={m} over {lanes} lanes{}: a call takes one token or more and a lane or \
-                     more, and row mode at most a token a lane",
-                    if each { " in row mode" } else { "" }
-                ),
-            ));
-        }
         let nv = shape.n_v;
-        let lens = [
-            ("qkv", qkv.len(), m * shape.channels()),
-            ("beta", beta.len(), m * nv),
-            ("decay", decay.len(), m * nv),
-            ("lane", lane.len(), lane_at + 1),
-            ("pos", pos.len(), 1),
-            ("o", o.len(), m * nv * HEAD),
-            ("state", state.len(), lanes * shape.state_len()),
-            ("stamp", stamp.len(), lanes),
-        ];
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("{name}.len() {got} < {need}"),
-            ));
-        }
         let grid = launch_u32(WHAT, "grid", nv * (HEAD / COLUMNS_PER_BLOCK))?;
         let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
         let prep = self.module.prepare_gdn_delta_lanes(cfg)?;
@@ -1158,6 +2408,8 @@ impl DeltaKernels {
             launch_u32(WHAT, "m", m)?,
             u32::from(each),
             pos,
+            carry.unwrap_or(qkv),
+            u32::from(carry.is_some()),
             fault,
             o,
             state,
@@ -1282,6 +2534,24 @@ pub fn lanes_refusal(m: usize, lanes: usize, each: bool, row: usize) -> Option<S
 mod tests {
     use super::{delta_host, kda_delta_host, kept_lane, lanes_refusal, read_lane, row_lane};
     use crate::linear::{HEAD, KHeadMap, LinearShape};
+
+    #[test]
+    #[should_panic(expected = "carry_fold_host: carry count exceeds CARRY_ROWS")]
+    fn a_carry_count_past_the_chunk_is_refused() {
+        let shape = LinearShape {
+            n_k: 1,
+            n_v: 1,
+            map: KHeadMap::Tiled,
+        };
+        let mut carry = vec![0.0; shape.carry_len()];
+        carry[0] = f32::from_bits((super::CARRY_ROWS + 1) as u32);
+        drop(super::carry_fold_host(
+            &carry,
+            &vec![0.0; shape.state_len()],
+            0,
+            shape,
+        ));
+    }
 
     /// Knuth's MMIX LCG, the high 24 bits as a float in `[lo, hi)`.
     fn fill(seed: &mut u64, n: usize, lo: f32, hi: f32) -> Vec<f32> {
