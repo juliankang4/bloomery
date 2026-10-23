@@ -1715,7 +1715,8 @@ fn serve_union<'w>(
 }
 
 /// [`serve_union`]'s one call: the plan in `s.plan` served from the tier when
-/// there is one and the plan names an expert.
+/// there is one, an empty plan's included, so the tier is told of every
+/// column the layer serves ([`TierSlots::note_union`]).
 fn serve_one<'w>(
     stacks: [ExpertStack<'w>; 3],
     run: LegRun,
@@ -1726,8 +1727,8 @@ fn serve_one<'w>(
     tier: Option<&'w LayerTier>,
 ) -> Result<(), ModelError> {
     match tier {
-        Some(tier) if s.plan.n() > 0 => serve_tiered(stacks, run, x, lists, out, s, tier),
-        _ => serve_planned(stacks, run, x, lists, out, s),
+        Some(tier) => serve_tiered(stacks, run, x, lists, out, s, tier),
+        None => serve_planned(stacks, run, x, lists, out, s),
     }
 }
 
@@ -1756,7 +1757,8 @@ struct Batching<'t> {
 /// whole call's, bit for bit. A layer under `2B` and the lane's slots is
 /// refused by name ([`TierError::BatchFloor`]) before any claim, and so is an
 /// expert past the stacks'. The host segment's experts compute first, under
-/// the first batch's fill.
+/// the first batch's fill. A call with no arena id (an empty plan, or the
+/// host segment's ids alone) claims nothing and is told as one that fits.
 fn serve_tiered<'w>(
     stacks: [ExpertStack<'w>; 3],
     run: LegRun,
@@ -1782,6 +1784,14 @@ fn serve_tiered<'w>(
             .filter(|e| !tier.host.contains(e)),
     );
     if s.tier_ids.is_empty() {
+        tier.slots.note_union(
+            tier.layer,
+            &s.plan.ids,
+            &s.plan.off,
+            &s.plan.cols,
+            lists.len(),
+            false,
+        );
         return serve_planned(stacks, run, x, lists, out, s);
     }
     let slots = tier.slots.slots(tier.layer);
@@ -3105,9 +3115,6 @@ impl HostLayer {
         let lists: [&[(u32, f32)]; 1] = [experts];
         let tier = self.tier.as_ref().expect("a resident column has a tier");
         self.prepare_step_ids(tier, &lists, union)?;
-        if union.tier_ids.is_empty() {
-            return self.serve_column(lanes, split, x, experts, out, scratch);
-        }
         let ticket =
             tier.slots
                 .prefetch_pinned(tier.layer, &union.tier_ids, Claim::Step, 1, None)?;
@@ -3245,9 +3252,6 @@ impl HostLayer {
             form: self.form,
             lanes,
         };
-        if scratch.tier_ids.is_empty() {
-            return serve_union(stacks, run, x, lists, out, scratch, None);
-        }
         // The claim is made now and the misses fill on the tier's threads;
         // the pin lasts until the union's reads end, as `experts_into_on`'s
         // ids are.

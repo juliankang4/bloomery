@@ -1543,6 +1543,8 @@ struct DropShared {
     drops: AtomicU64,
     drop_bytes: AtomicU64,
     drop_ns: AtomicU64,
+    #[cfg(test)]
+    release_pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 struct DropQueue {
@@ -1564,6 +1566,11 @@ impl DropShared {
     /// Out of the mapping and the page cache: `runs`, layer `layer`'s, and
     /// the drop counted.
     fn release(&self, layer: usize, runs: &DropRuns) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.release_pause.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
         let t0 = Instant::now();
         let mut pages = PageDrop::new(&self.split);
         for (shard, runs) in runs {
@@ -2156,6 +2163,8 @@ impl NvTier {
             drops: AtomicU64::new(0),
             drop_bytes: AtomicU64::new(0),
             drop_ns: AtomicU64::new(0),
+            #[cfg(test)]
+            release_pause: Mutex::new(None),
         });
         let dropper = std::thread::Builder::new()
             .name("nvtier-drop".into())
@@ -4099,51 +4108,239 @@ mod tests {
     }
 
     #[test]
-    fn heat_counts_keep_the_same_rank_across_prompt_splits() {
-        use model::moe::TierSlots;
+    fn an_active_dropper_finishes_before_a_new_read_opens() {
+        active_drop_before_read(true);
+    }
+
+    #[test]
+    fn an_active_drop_layer_finishes_before_a_new_read_opens() {
+        active_drop_before_read(false);
+    }
+
+    fn active_drop_before_read(queued: bool) {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
         const LAYER: usize = 1;
-        let scratch = Scratch::new("heat-split");
-        let whole = eight_tier(&scratch, 2, NvTierEvict::Heat);
-        let split = eight_tier(&scratch, 2, NvTierEvict::Heat);
-        whole.note_union(
-            LAYER,
-            &[1, 2],
-            &[0, 384, 512],
-            &(0..512).collect::<Vec<_>>(),
-            512,
-            true,
-        );
-        split.note_union(
-            LAYER,
-            &[1],
-            &[0, 384],
-            &(0..384).collect::<Vec<_>>(),
-            384,
-            true,
-        );
-        split.note_union(
-            LAYER,
-            &[2],
-            &[0, 128],
-            &(0..128).collect::<Vec<_>>(),
-            128,
-            true,
-        );
-        let rank = |tier: &super::NvTier| {
-            tier.route_count(LAYER, 1)
-                .unwrap()
-                .total_cmp(&tier.route_count(LAYER, 2).unwrap())
+        let scratch = Scratch::new(if queued {
+            "active-queued"
+        } else {
+            "active-layer"
+        });
+        let tier = card_tier(&scratch);
+        let (entered_tx, entered) = mpsc::channel();
+        let (resume, resume_rx) = mpsc::channel();
+        *tier.drops.release_pause.lock().unwrap() = Some((entered_tx, resume_rx));
+        let drop = if queued {
+            tier.open_read(LAYER, 1).unwrap();
+            tier.end_read(LAYER, 1).unwrap();
+            None
+        } else {
+            let tier = Arc::clone(&tier);
+            Some(std::thread::spawn(move || tier.drop_layer(LAYER).unwrap()))
         };
-        assert_eq!(rank(&whole), rank(&split));
-        for id in [1, 2] {
-            let want = whole.route_count(LAYER, id).unwrap();
-            let got = split.route_count(LAYER, id).unwrap();
-            assert!(
-                (got - want).abs() <= 1e-12 * want,
-                "expert {id}: {got} != {want}"
-            );
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (starting_tx, starting) = mpsc::channel();
+        let (opened_tx, opened) = mpsc::channel();
+        let reader = {
+            let tier = Arc::clone(&tier);
+            std::thread::spawn(move || {
+                starting_tx.send(()).unwrap();
+                tier.open_read(LAYER, 2).unwrap();
+                opened_tx.send(()).unwrap();
+                tier.end_read(LAYER, 2).unwrap();
+            })
+        };
+        starting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = opened.recv_timeout(Duration::from_millis(100));
+        resume.send(()).unwrap();
+        if let Some(drop) = drop {
+            drop.join().unwrap();
         }
-        assert_eq!(rank(&whole), std::cmp::Ordering::Less);
+        reader.join().unwrap();
+        assert_eq!(
+            early,
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "queued={queued}: a new read waits for the active page release"
+        );
+        opened.recv_timeout(Duration::from_secs(5)).unwrap();
+        tier.flush().unwrap();
+    }
+
+    #[test]
+    fn heat_counts_keep_the_same_rank_across_prompt_splits() {
+        heat_without_arena_ids("prompt");
+    }
+
+    #[test]
+    fn heat_counts_keep_the_same_rank_across_step_splits() {
+        heat_without_arena_ids("step");
+    }
+
+    #[test]
+    fn heat_counts_keep_the_same_rank_across_resident_columns() {
+        heat_without_arena_ids("resident");
+    }
+
+    fn heat_without_arena_ids(mode: &str) {
+        use engram::direct::DirectFile;
+        use gguf::write::{Layout, TensorDecl, Writer};
+        use model::Tensor2;
+        use model::moe::{HostLayer, HostLayerSpec, HostScratch, UnionScratch};
+        use model::ops::Lanes;
+        use model::placement::workstation::ArenaGrant;
+        use model::r8file::R8Source;
+        use std::sync::Arc;
+        const WIDTH: usize = 256;
+        const SLOTS: usize = 2 * UNION_BATCH_IDS as usize + 2;
+        const EXPERTS: usize = SLOTS + 2;
+        let scratch = Scratch::new(&format!("heat-{mode}"));
+        let path = scratch.0.join("layer.gguf");
+        let names = ["gate_exps", "up_exps", "down_exps"];
+        let ty = gguf::GgmlType::Q4_K;
+        let per =
+            WIDTH * WIDTH / ty.blck_size().unwrap() as usize * ty.type_size().unwrap() as usize;
+        let bytes = vec![0; per * EXPERTS];
+        let decls = names.map(|name| TensorDecl {
+            name: name.into(),
+            dims: vec![WIDTH as u64, WIDTH as u64, EXPERTS as u64],
+            type_id: ty.as_u32(),
+            nbytes: bytes.len() as u64,
+        });
+        let layout = Layout::new(&[], decls.to_vec()).unwrap();
+        let mut writer = Writer::new(std::fs::File::create(&path).unwrap(), layout).unwrap();
+        for name in names {
+            writer.tensor(name, &bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let split = Arc::new(gguf::Split::open(&path).unwrap());
+        let file = Arc::new(DirectFile::open_buffered(&path).unwrap());
+        let source = R8Source::rows(&split);
+        let spec = HostLayerSpec {
+            gate: names[0],
+            up: names[1],
+            down: names[2],
+            n_expert: EXPERTS,
+            embd: WIDTH,
+            ff: WIDTH,
+            swiglu_limit: 0.0,
+        };
+        // The middle columns name no arena expert: the host segment's
+        // expert alone, or no host expert at all (every expert on the card).
+        let host: &[(u32, f32)] = &[(0, 1.0)];
+        let expected = [2f64.powf(-130.0 / 32.0) + 2f64.powf(-129.0 / 32.0), 1.0];
+        for (middle, mode) in [host, &[]]
+            .into_iter()
+            .flat_map(|middle| [(middle, "whole"), (middle, mode)])
+        {
+            let routes: Vec<&[(u32, f32)]> = (0..131)
+                .map(|col| match col {
+                    0 | 1 => &[(1, 1.0)][..],
+                    130 => &[(2, 1.0)][..],
+                    _ => middle,
+                })
+                .collect();
+            let mut arena = arena_of(EXPERTS as u32, 0);
+            arena.host = 0..1;
+            arena.windows = std::array::from_fn(|part| part * window_bytes(per));
+            arena.slot_bytes = PARTS * window_bytes(per);
+            arena.names = names.map(str::to_owned);
+            arena.files = std::array::from_fn(|_| Arc::clone(&file));
+            arena.part_of.set([0, 1, 2]).unwrap();
+            arena.parts = (0..EXPERTS)
+                .map(|id| {
+                    std::array::from_fn(|part| {
+                        let (shard, info) = split.find(names[part]).unwrap();
+                        let at = split.shard(shard).unwrap().data_base()
+                            + info.offset
+                            + (id * per) as u64;
+                        PartRange {
+                            at,
+                            len: per,
+                            skew: at as usize % DIRECT_ALIGN,
+                        }
+                    })
+                })
+                .collect();
+            let slot_bytes = arena.slot_bytes;
+            let mut tier = super::NvTier::carve(
+                vec![Some(arena)],
+                &[slot_bytes],
+                SLOTS,
+                ArenaGrant::whole((SLOTS * slot_bytes) as u64),
+                0,
+                &split,
+                super::ArenaKind::Anon,
+            )
+            .unwrap();
+            tier.count_routes();
+            let tier = Arc::new(tier);
+            tier.ensure_as(0, &(1..=SLOTS as u32).collect::<Vec<_>>(), Claim::Keep)
+                .unwrap();
+            let mut layer = HostLayer::build(source, &spec).unwrap();
+            layer.attach_tier(0, 0..1, tier.clone());
+            let mut union = UnionScratch::new_routed(WIDTH, WIDTH, routes.len(), 1).unwrap();
+            let mut host = HostScratch::new(WIDTH, WIDTH, 1).unwrap();
+            let chunks = match mode {
+                "whole" => vec![131],
+                "prompt" | "step" => vec![2, 128, 1],
+                _ => vec![1; 131],
+            };
+            let mut start = 0;
+            for cols in chunks {
+                let x = Tensor2::zeros(WIDTH, cols);
+                let mut out = vec![f32::NAN; WIDTH * cols];
+                let lists = &routes[start..start + cols];
+                match mode {
+                    "whole" | "prompt" => {
+                        layer.experts_union_into(source, &x, lists, &mut out, &mut union)
+                    }
+                    "step" => layer.experts_step_union_into_on(
+                        Lanes::Flat,
+                        source,
+                        &x,
+                        lists,
+                        &mut out,
+                        &mut union,
+                    ),
+                    _ => layer.experts_into_on(
+                        Lanes::Flat,
+                        source,
+                        &x,
+                        lists[0],
+                        &mut out,
+                        &mut host,
+                        Some(&mut union),
+                    ),
+                }
+                .unwrap();
+                assert!(
+                    out.iter().all(|&v| v == 0.0),
+                    "{mode} {middle:?}: the zero weights"
+                );
+                start += cols;
+            }
+            for (id, want) in [1, 2].into_iter().zip(expected) {
+                let got = tier.route_count(0, id).unwrap();
+                assert!(
+                    (got - want).abs() <= 1e-12 * want,
+                    "{mode} {middle:?}: expert {id}: {got} != {want}"
+                );
+            }
+            let protected = tier
+                .pin(0, &(3..=SLOTS as u32).collect::<Vec<_>>())
+                .unwrap();
+            tier.ensure_as(0, &[(SLOTS + 1) as u32], Claim::Keep)
+                .unwrap();
+            assert!(
+                tier.by_layer[0].as_ref().unwrap().filled(1).is_none(),
+                "{mode} {middle:?}: the colder expert leaves"
+            );
+            assert!(
+                tier.by_layer[0].as_ref().unwrap().filled(2).is_some(),
+                "{mode} {middle:?}: the hotter expert stays"
+            );
+            drop(protected);
+        }
     }
 
     /// A transient miss enters at the cold end and is the first victim,
