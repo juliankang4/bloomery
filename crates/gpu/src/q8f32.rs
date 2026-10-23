@@ -244,6 +244,7 @@ pub(crate) unsafe fn f32_lane_partials<W: RowValues>(
     let k = k as usize;
     let w_row = row * k;
     let iters = k >> 5;
+    let m = m_cols as usize;
     let mut f0 = 0.0f32;
     let mut f1 = 0.0f32;
     let mut f2 = 0.0f32;
@@ -253,49 +254,56 @@ pub(crate) unsafe fn f32_lane_partials<W: RowValues>(
     let mut f6 = 0.0f32;
     let mut f7 = 0.0f32;
     let mut it = 0usize;
-    // The column guards are runtime tests, so a multiply-add sits behind
-    // its column's branch, and one chunk a trip would leave one load in
-    // flight. A trip takes [`LANE_UNROLL`] chunks instead: the row's words
-    // once for every column, then each live column's chunks loaded before
-    // its first multiply-add. Each column still adds its chunks in
-    // increasing `it`; the guarded walk below is the tail.
+    // A trip takes [`LANE_UNROLL`] chunks: the row's words once for every
+    // column, then the chunks of two columns at a time, both loaded before
+    // the first of their multiply-adds, so a trip waits on one load round
+    // trip per pair of columns instead of one per column and holds one
+    // pair's chunks at a time. When `m_cols` is odd, the last pair's second
+    // column reads column 0's chunks, which keeps the pair under one branch,
+    // and its sum is reset before the tail. Each column still adds its
+    // chunks in increasing `it`; the guarded walk below is the tail.
+    let odd = |c: usize| if c < m { c * k } else { 0 };
+    let (a3, a5, a7) = (odd(3), odd(5), odd(7));
     while it + LANE_UNROLL <= iters {
         let kk = it * 32 + lane;
         // SAFETY: w_row + kk + 224 < w_row + k, inside w: kk + 224 < k by
         // the loop guard (LANE_UNROLL = 8) and the safety contract.
         let wv = unsafe { f32_load_chunks(w, w_row + kk) };
         // SAFETY: kk + 224 < k <= x.len(), since m_cols >= 1.
-        f0 = unsafe { f32_fold_chunks(f0, &wv, x, kk) };
-        if m_cols > 1 {
-            // SAFETY: k + kk + 224 < 2*k <= x.len(), since m_cols > 1.
-            f1 = unsafe { f32_fold_chunks(f1, &wv, x, k + kk) };
-        }
+        let x0 = unsafe { f32_load_chunks(x, kk) };
+        // SAFETY: m_cols > 1 here, so k + kk + 224 < 2*k <= x.len().
+        let x1 = unsafe { f32_load_chunks(x, k + kk) };
+        f0 = f32_fold_values(f0, &wv, &x0);
+        f1 = f32_fold_values(f1, &wv, &x1);
         if m_cols > 2 {
             // SAFETY: 2*k + kk + 224 < 3*k <= x.len(), since m_cols > 2.
-            f2 = unsafe { f32_fold_chunks(f2, &wv, x, 2 * k + kk) };
-        }
-        if m_cols > 3 {
-            // SAFETY: 3*k + kk + 224 < 4*k <= x.len(), since m_cols > 3.
-            f3 = unsafe { f32_fold_chunks(f3, &wv, x, 3 * k + kk) };
+            let x2 = unsafe { f32_load_chunks(x, 2 * k + kk) };
+            // SAFETY: a3 is 3*k when m_cols > 3 and 0 otherwise, so
+            // a3 + kk + 224 < m_cols*k <= x.len().
+            let x3 = unsafe { f32_load_chunks(x, a3 + kk) };
+            f2 = f32_fold_values(f2, &wv, &x2);
+            f3 = f32_fold_values(f3, &wv, &x3);
         }
         if m_cols > 4 {
             // SAFETY: 4*k + kk + 224 < 5*k <= x.len(), since m_cols > 4.
-            f4 = unsafe { f32_fold_chunks(f4, &wv, x, 4 * k + kk) };
-        }
-        if m_cols > 5 {
-            // SAFETY: 5*k + kk + 224 < 6*k <= x.len(), since m_cols > 5.
-            f5 = unsafe { f32_fold_chunks(f5, &wv, x, 5 * k + kk) };
+            let x4 = unsafe { f32_load_chunks(x, 4 * k + kk) };
+            // SAFETY: a5 is 5*k when m_cols > 5 and 0 otherwise; as for a3.
+            let x5 = unsafe { f32_load_chunks(x, a5 + kk) };
+            f4 = f32_fold_values(f4, &wv, &x4);
+            f5 = f32_fold_values(f5, &wv, &x5);
         }
         if m_cols > 6 {
             // SAFETY: 6*k + kk + 224 < 7*k <= x.len(), since m_cols > 6.
-            f6 = unsafe { f32_fold_chunks(f6, &wv, x, 6 * k + kk) };
-        }
-        if m_cols > 7 {
-            // SAFETY: 7*k + kk + 224 < 8*k <= x.len(), since m_cols > 7.
-            f7 = unsafe { f32_fold_chunks(f7, &wv, x, 7 * k + kk) };
+            let x6 = unsafe { f32_load_chunks(x, 6 * k + kk) };
+            // SAFETY: a7 is 7*k when m_cols > 7 and 0 otherwise; as for a3.
+            let x7 = unsafe { f32_load_chunks(x, a7 + kk) };
+            f6 = f32_fold_values(f6, &wv, &x6);
+            f7 = f32_fold_values(f7, &wv, &x7);
         }
         it += LANE_UNROLL;
     }
+    let live = |c: usize, f: f32| if c < m { f } else { 0.0 };
+    let (mut f3, mut f5, mut f7) = (live(3, f3), live(5, f5), live(7, f7));
     while it < iters {
         let kk = it * 32 + lane;
         // SAFETY: w_row + kk < (row + 1)·k, inside w by the safety contract.
@@ -372,7 +380,15 @@ unsafe fn f32_load_chunks<V: RowValues>(v: V, at: usize) -> [f32; LANE_UNROLL] {
 #[inline(always)]
 unsafe fn f32_fold_chunks(f: f32, w: &[f32; LANE_UNROLL], x: &[f32], at: usize) -> f32 {
     // SAFETY: at + 224 < x.len() by this fn's contract.
-    let [x0, x1, x2, x3, x4, x5, x6, x7] = unsafe { f32_load_chunks(x, at) };
+    let xv = unsafe { f32_load_chunks(x, at) };
+    f32_fold_values(f, w, &xv)
+}
+
+/// `f` with the [`LANE_UNROLL`] chunk products of one column added in
+/// order: `fma(w[i], x[i], ·)` for i = 0..8.
+#[inline(always)]
+fn f32_fold_values(f: f32, w: &[f32; LANE_UNROLL], x: &[f32; LANE_UNROLL]) -> f32 {
+    let [x0, x1, x2, x3, x4, x5, x6, x7] = *x;
     let f = f32::mul_add(w[0], x0, f);
     let f = f32::mul_add(w[1], x1, f);
     let f = f32::mul_add(w[2], x2, f);
