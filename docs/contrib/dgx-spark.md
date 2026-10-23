@@ -56,11 +56,13 @@ the tested toolkit, answer 7) with LLVM 21.1.8's ARM64 release `llc` named by `C
 for example:
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
+cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
 ```
 
-The binary carries `sm_86` PTX, and the driver compiles it for cc 12.1 at the first start, about 6.5 s on the Arm cores
-`[derived]` once per `CUDA_CACHE_PATH` (section 6).
+Recipes select `sm_121a` on a GB10 when `BLOOMERY_ARCH` is unset. This enables the existing native FP4 routed prompt
+path for NVFP4 and FP4-Local weights: both weights and activations use FP4 tensor cores. Other routed formats keep
+their activation format, and decode is unchanged. An explicit `BLOOMERY_ARCH` still overrides the detected target;
+set it when invoking recipes from a machine without the target GPU. Other machines keep the `sm_86` default.
 
 **Smallest first placement: everything on the card, no host tier, no NVMe tier.** Two ways in, both generic already:
 `--place a` is `Pick::Rank(0)`, "the largest visible card" (`crates/placement/src/placement/devices.rs:236-243`), and an
@@ -350,8 +352,8 @@ The card runs the tree's `sm_86` PTX through the driver's JIT. `sm_121` PTX was 
   for bit on GB10 at `sm_121a`, `sm_121f` and `sm_120f`, with the raw GGUF bytes and each e2m1 code in bits 5:2 of its
   byte. `sm_120a` PTX does not load on GB10 (`a PTX JIT compilation failed`; `ptxas` says a `sm_120a` program "cannot be
   compiled to future architecture"), so a Spark build names `sm_121a`, or `sm_120f` or `sm_121f` for a family build
-  ([#19](https://github.com/midagedev/bloomery/issues/19#issuecomment-6104507343)). FP4 prefill stays parked
-  ([maintainers](https://github.com/midagedev/bloomery/issues/19#issuecomment-6105033234)).
+  ([#19](https://github.com/midagedev/bloomery/issues/19#issuecomment-6104507343)). GB10 recipes now select `sm_121a`
+  by default, enabling native W4A4 routed prompt products for NVFP4 and FP4-Local (section 2).
 
 ## 7. One pool
 

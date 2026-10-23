@@ -127,30 +127,69 @@ with tempfile.TemporaryDirectory(prefix="output-owner-") as tmp:
     for path in ("justfile", "tools/gate-batch.sh", "tools/ref/ref-paths.sh",
                  "tools/ref/real-only.sh", "tools/ref/fixture-only.sh", "tools/nightly/units.sh"):
         (repo / path).write_text("# fixture\n")
+    recipe = "\ngate-probe:\n    ./tools/box.sh 'probe {{arch}}'\n"
+    (repo / "justfile").write_text(recipe.replace("{{arch}}", "sm_86"))
+    (repo / "tools/arch.sh").write_text((root / "tools/arch.sh").read_text())
     def git(*args):
         return subprocess.run(["git", "-C", str(repo), "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
                                "-c", "commit.gpgsign=false", *args], check=True, capture_output=True, text=True).stdout.strip()
     git("init", "-q", "--template=")
     git("add", ".")
+    git("commit", "-qm", "without arch")
+    no_arch = git("rev-parse", "HEAD")
+    (repo / "justfile").write_text("arch := 'sm_86'\n" + recipe)
+    git("add", ".")
     git("commit", "-qm", "legacy")
     legacy = git("rev-parse", "HEAD")
     (repo / "tools/gate-batch-resources.tsv").write_text("fixture\tm\t1\n")
     (repo / "tools/gate-batch.sh").write_text("# --over-budget-ok\n")
+    (repo / "justfile").write_text("arch := `bash tools/arch.sh`\n" + recipe)
     git("add", ".")
     git("commit", "-qm", "current")
     copies = replay[replay.index('for arm in base new; do', replay.index('# The measured seconds,')):replay.index('# Each arm')]
     probe = replay[replay.index("BASE_BUDGET_OK=''"):replay.index('run_arm new --over-budget-ok')]
-    for base, expected in ((legacy, ""), ("HEAD", "1")):
-        for mutant in (("none", "resources") if base == legacy else ("none", "resources", "budget")):
+    table = replay[replay.index('python3 - "$LIST"'):replay.index('# The fake box:')]
+    for base, expected in ((no_arch, ""), (legacy, ""), ("HEAD", "1")):
+        mutants = ["none", "resources", "arch-helper", "arch-freeze"]
+        mutants += ["arch-absent"] if base == no_arch else (["budget"] if base == "HEAD" else [])
+        for mutant in mutants:
             work = t / f"copy-{base}-{mutant}"
             work.mkdir()
+            (work / "secs.tsv").write_text("gate-probe\t7\tA\n")
             code = copies.replace('cp "$ROOT/tools/gate-batch-resources.tsv"', ':') if mutant == "resources" else copies
+            if mutant == "arch-helper":
+                code = code.replace('cp "$ROOT/tools/arch.sh"', ':')
+            if mutant == "arch-freeze":
+                code = code.replace('mv "$WORK/$arm/justfile.resolved" "$WORK/$arm/justfile"', ':')
+            if mutant == "arch-absent":
+                code = code.replace('if grep -q \'^arch := \' "$WORK/$arm/justfile"; then', 'if true; then')
             code += probe.replace('then BASE_BUDGET_OK=1;', 'then BASE_BUDGET_OK=;') if mutant == "budget" else probe
-            result = run('set -euo pipefail; ROOT=$1; WORK=$2; BASE_REV=$3; ' + code + '\necho "budget=$BASE_BUDGET_OK"', repo, work, base)
-            valid = (result.returncode == 0 and result.stdout.strip() == f"budget={expected}"
+            code += table + '\necho "budget=$BASE_BUDGET_OK"'
+            result = run('set -euo pipefail; export BLOOMERY_ARCH=sm_121a; ROOT=$1; WORK=$2; BASE_REV=$3; LIST=$4; ' + code,
+                         repo, work, base, t / "fixture.list")
+            keyed = True
+            for arm, arch in (("base", "sm_121a" if base == "HEAD" else "sm_86"), ("new", "sm_121a")):
+                command_table = work / arm / "table.tsv"
+                if not command_table.exists() or command_table.read_text() != f"probe {arch}\tgate-probe\t7\n":
+                    keyed = False
+                    continue
+                box = work / arm / "tools/box.sh"
+                box.write_text('#!/bin/sh\nprintf "%s\\n" "$*"\n')
+                box.chmod(0o755)
+                actual = subprocess.run(["just", "gate-probe"], cwd=work / arm, capture_output=True, text=True)
+                keyed = keyed and actual.returncode == 0 and actual.stdout.strip() == f"probe {arch}"
+            valid = (result.returncode == 0 and result.stdout.splitlines()[-1] == f"budget={expected}" and keyed
                      and (work / "new/tools/gate-batch-resources.tsv").read_text() == "fixture\tm\t1\n"
                      and (work / "base/tools/gate-batch-resources.tsv").exists() == (base == "HEAD")) if (work / "new/tools/gate-batch-resources.tsv").exists() else False
-            check(f"batch-replay base={base} resources and budget mutant={mutant}", valid == (mutant == "none"), result.stdout.strip())
+            check(f"batch-replay base={base} snapshot and command keys mutant={mutant}", valid == (mutant == "none"),
+                  f"rc={result.returncode} keyed={keyed} {result.stdout.strip()} {result.stderr.strip()}")
+    work = t / "copy-invalid-arch"
+    work.mkdir()
+    result = run('set -euo pipefail; export BLOOMERY_ARCH=; ROOT=$1; WORK=$2; BASE_REV=HEAD; ' + copies,
+                 repo, work)
+    check("batch-replay refuses a failed architecture selection before making command keys",
+          result.returncode != 0 and "got ''" in result.stderr and not (work / "base/table.tsv").exists(),
+          f"rc={result.returncode} {result.stderr.strip()}")
 print(f"output-owner self-test: {checks - bad} of {checks} ok")
 sys.exit(bool(bad))
 PY

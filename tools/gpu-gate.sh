@@ -1333,7 +1333,7 @@ PY
   printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$t/rsync.log" > "$t/stub/rsync"
   chmod +x "$t/stub/ssh" "$t/stub/rsync"
   rc=0
-  BLOOMERY_BOX_LOCAL=1 env -u BLOOMERY_HOLD_OWNER -u BLOOMERY_BOX_WAIT -u BLOOMERY_BOX_ENV -u BLOOMERY_CARD -u BLOOMERY_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_V41_MODEL \
+  BLOOMERY_BOX_LOCAL=1 env -u BLOOMERY_HOLD_OWNER -u BLOOMERY_BOX_WAIT -u BLOOMERY_BOX_ENV -u BLOOMERY_CARD -u BLOOMERY_ARCH -u BLOOMERY_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_V41_MODEL \
     -u BLOOMERY_DATA -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_VARIANT -u BLOOMERY_BOX_LOCAL \
     PATH="$t/stub:$PATH" BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' BLOOMERY_BOX_READONLY=1 \
     bash "$t/boxtree/tools/box.sh" 'bash tools/gpu-gate.sh --v41-queue' > "$t/out" 2>&1 || rc=$?

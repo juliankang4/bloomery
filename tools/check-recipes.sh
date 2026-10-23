@@ -831,26 +831,31 @@ blk_orphan() {
   echo "${ot##*$'\n'}"
 }
 
-# The device arch has one owner: the justfile's `arch` variable (BLOOMERY_ARCH, sm_86 unset; tools/arch.sh reads the same name for
-# the tools that run on the box). A recipe line that spells an arch builds for it whatever BLOOMERY_ARCH says, so a contributor's
-# `BLOOMERY_ARCH=sm_121 just gate-…` would build sm_86 and run it through the driver's JIT without a word. Held: exactly one
-# `arch := env_var_or_default('BLOOMERY_ARCH', 'sm_NN')` line, no `sm_<digit>` anywhere else in the justfile, and every `--arch`
-# followed by `{{arch}}`. The fixtures below are the FAIL-first: each spelling the rule forbids is red on its own copy.
+# The justfile reads and exports the shared architecture selection. Every recipe uses that value.
+# PIN(2026-10-24): GB10 selects sm_121a through arch.sh; recipes keep no independent target default.
 blk_archowner() {
-  python3 - "$JF" << 'PY'
+  python3 - "$JF" "$B" << 'PY'
+import os
+from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 
-DEF = re.compile(r"^arch := env_var_or_default\('BLOOMERY_ARCH', 'sm_[0-9]+[af]?'\)$")
+DEF = 'arch := `bash tools/arch.sh`'
+EXPORT = 'export BLOOMERY_ARCH := arch'
 LITERAL = re.compile(r"sm_[0-9]")
 OWNED = re.compile(r" \{\{arch\}\}(?![A-Za-z0-9_])")
 
 
 def problems(text):
-    out, defs = [], 0
+    out, defs, exports = [], 0, 0
     for n, line in enumerate(text.split("\n"), 1):
-        if DEF.match(line):
+        if line == DEF:
             defs += 1
+            continue
+        if line == EXPORT:
+            exports += 1
             continue
         if LITERAL.search(line):
             out.append(f"{n}: an arch literal outside the definition of `arch`: {line.strip()[:110]}")
@@ -860,11 +865,13 @@ def problems(text):
             if not OWNED.match(rest):
                 out.append(f"{n}: `--arch` is not followed by {{{{arch}}}}: {line.strip()[:110]}")
     if defs != 1:
-        out.append(f"the justfile defines `arch` {defs} times, want exactly one `arch := env_var_or_default('BLOOMERY_ARCH', 'sm_NN')` line")
+        out.append(f"the justfile defines `arch` {defs} times, want exactly one `{DEF}` line")
+    if exports != 1:
+        out.append(f"the justfile exports the selected arch {exports} times, want exactly one `{EXPORT}` line")
     return out
 
 
-good = "arch := env_var_or_default('BLOOMERY_ARCH', 'sm_86')\nx:\n    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p y'\n"
+good = DEF + "\n" + EXPORT + "\nx:\n    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p y'\n"
 fixtures = [
     ("the owner and a recipe that takes it", good, 0),
     ("a literal arch after --arch", good.replace("--arch {{arch}}", "--arch sm_86"), 2),
@@ -877,7 +884,10 @@ fixtures = [
     ("--arch with no value", good.replace("--arch {{arch}} ", "--arch"), 1),
     ("a second --arch on one line", good.replace("-- -p y", "--arch sm_90 -- -p y"), 2),
     ("no definition of the variable", good.split("\n", 1)[1], 1),
-    ("two definitions", good + "arch := env_var_or_default('BLOOMERY_ARCH', 'sm_86')\n", 1),
+    ("two definitions", good + DEF + "\n", 1),
+    ("no export of the selected arch", good.replace(EXPORT + "\n", ""), 1),
+    ("two exports", good + EXPORT + "\n", 1),
+    ("independent target default", good.replace(DEF, "arch := env_var_or_default('BLOOMERY_ARCH', 'sm_86')"), 2),
 ]
 bad = 0
 for name, text, want in fixtures:
@@ -896,7 +906,35 @@ if found:
         print(f"  justfile:{f}", file=sys.stderr)
     sys.exit(1)
 uses = sum(1 for line in text.split("\n") if line.startswith(" ") and "--arch {{arch}}" in line)
-print(f"check-recipes: arch owner ok ({uses} recipe lines build with --arch {{{{arch}}}}, {len(fixtures)} fixtures)")
+fixture = Path(sys.argv[2]) / 'arch'
+fixture.mkdir()
+probe = fixture / 'nvidia-smi'
+probe.write_text('#!/bin/sh\n[ "$*" = "--query-gpu=compute_cap --format=csv,noheader" ] || exit 2\n'
+                 '[ "$ARCH_TEST_CAPABILITY" != error ] || exit 1\nprintf "%s\\n" "$ARCH_TEST_CAPABILITY"\n')
+probe.chmod(0o755)
+script = Path(sys.argv[1]).parent / 'tools/arch.sh'
+env = dict(os.environ, PATH=str(fixture) + os.pathsep + os.environ['PATH'])
+env.pop('BLOOMERY_ARCH', None)
+bash = shutil.which('bash')
+for capability, override, want, rc in [
+    ('12.1', None, 'sm_121a', 0),
+    ('12.0', None, 'sm_86', 0),
+    ('8.6', None, 'sm_86', 0),
+    ('12.1', 'sm_121', 'sm_121', 0),
+    ('error', 'sm_86', 'sm_86', 0),
+    ('error', None, '', 64),
+    ('12.1', '', '', 64),
+    ('12.1', 'sm_121x', '', 64),
+]:
+    case = dict(env, ARCH_TEST_CAPABILITY=capability)
+    if override is not None:
+        case['BLOOMERY_ARCH'] = override
+    for command in ([bash, str(script)],
+                    [bash, '-c', '. "$1"; bloomery_arch fixture || exit $?; printf "%s\\n" "$ARCH"', 'bash', str(script)]):
+        got = subprocess.run(command, env=case, text=True, capture_output=True, timeout=10)
+        if got.returncode != rc or got.stdout.strip() != want:
+            sys.exit(f'check-recipes: arch selection {capability=} {override=}: {got.returncode=} {got.stdout=} {got.stderr=}')
+print(f"check-recipes: arch owner ok ({uses} recipe lines build with --arch {{{{arch}}}}, {len(fixtures)} ownership fixtures, 16 selection cases)")
 PY
 }
 

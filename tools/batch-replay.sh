@@ -85,6 +85,12 @@ for arm in base new; do
   # error for every recipe of the real justfile that calls one, in both arms)
   cp "$ROOT/tools/ref/real-only.sh" "$WORK/$arm/tools/ref/real-only.sh"
   cp "$ROOT/tools/ref/fixture-only.sh" "$WORK/$arm/tools/ref/fixture-only.sh"
+  cp "$ROOT/tools/arch.sh" "$WORK/$arm/tools/arch.sh"
+  if grep -q '^arch := ' "$WORK/$arm/justfile"; then
+    replay_arch=$(cd "$WORK/$arm" && just --evaluate arch)
+    sed "s|^arch := .*|arch := '$replay_arch'|" "$WORK/$arm/justfile" > "$WORK/$arm/justfile.resolved"
+    mv "$WORK/$arm/justfile.resolved" "$WORK/$arm/justfile"
+  fi
 done
 
 # Each arm's table: the first box.sh command of every listed recipe, exactly as just substitutes

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# The CUDA arch the device builds target: BLOOMERY_ARCH, sm_86 when unset. The justfile's `arch` variable reads the same
-# name with the same default, so a recipe's `--arch {{arch}}` and a tool that runs on the box agree. Sourced, never
-# executed; one parser, so every tool takes and refuses the same values.
+# The CUDA build target: BLOOMERY_ARCH, otherwise native FP4 on GB10 and sm_86 elsewhere.
+# The justfile exports this choice so builds and the tools that inspect them agree.
 #
 # The value is `sm_` and the capability's digits, with the `a` or `f` suffix cargo-oxide accepts: sm_86, sm_121,
 # sm_121a. Anything else is refused by name, set-and-empty included: a recipe would hand `--arch ` to cargo-oxide.
@@ -10,10 +9,19 @@
 # tables, the occupancy column sm_86's and sm_120/sm_121's limits; narrow-scan and the release archive are sm_86's).
 #
 #   bloomery_arch <tool>   ARCH=<the value>, or the refusal on stderr and 64
+#   bash tools/arch.sh     print that value for the justfile
 #   ARCH_SHAPE             the value's shape, for a tool that reads an arch elsewhere (a ptx-shapes table's `# arch:`)
 ARCH_SHAPE='^sm_[1-9][0-9]{1,2}[af]?$'
 bloomery_arch() {
   local v=${BLOOMERY_ARCH-sm_86}
+  if [ "${BLOOMERY_ARCH+x}" != x ] && command -v nvidia-smi > /dev/null 2>&1; then
+    local capability
+    if ! capability=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader); then
+      echo "$1: cannot read the CUDA compute capability; set BLOOMERY_ARCH explicitly for a cross build" >&2
+      return 64
+    fi
+    if [ "$capability" = 12.1 ]; then v=sm_121a; fi
+  fi
   if ! [[ $v =~ $ARCH_SHAPE ]]; then
     echo "$1: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: sm_86), got '$v'" >&2
     return 64
@@ -21,3 +29,7 @@ bloomery_arch() {
   # shellcheck disable=SC2034 # the sourcing tool reads it
   ARCH=$v
 }
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  bloomery_arch arch.sh || exit $?
+  printf '%s\n' "$ARCH"
+fi

@@ -9,10 +9,9 @@
 # The card check a timed recipe runs first in its box command, before any build (tools/ref/card-precheck.sh).
 precheck := 'bash tools/ref/card-precheck.sh'
 
-# The CUDA arch every `cargo oxide` line builds for: BLOOMERY_ARCH, the default below when it is unset. A recipe takes it
-# as `--arch {{arch}}` and tools/check-recipes.sh fails on any other spelling; the tools that run on the box read the
-# same name through tools/arch.sh, which tools/box.sh forwards.
-arch := env_var_or_default('BLOOMERY_ARCH', 'sm_86')
+# The shared target selector also supplies the tools that inspect each build.
+arch := `bash tools/arch.sh`
+export BLOOMERY_ARCH := arch
 
 # A recipe that builds a shipped bin (tools/release/build.sh's BINS) builds it with that file's
 # feature list, spelled out: the gates of a shipped bin run the binary the release packs, a recipe parameter in a
