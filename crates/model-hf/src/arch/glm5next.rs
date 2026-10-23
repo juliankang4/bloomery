@@ -442,7 +442,10 @@ fn placed_map(
 ) -> Result<(quant_config::Plan, HeldMap), Error> {
     let placed = quant_config::plan(
         config,
-        table.iter().map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+        table
+            .iter()
+            .filter(|(n, _, _)| layer_of(n).is_none_or(|l| l < g.layers))
+            .map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
         module_class,
     );
     if let Some((name, why)) = placed.refused.iter().next() {
@@ -500,11 +503,14 @@ fn tp_tensors(
     mapped_tp(g, &mapped)
 }
 
-/// The layer of the glm5next name `name` the map writes, `None` for a tensor of no layer.
+/// The layer of a checkpoint or glm5next tensor name, `None` for a tensor of no layer.
 fn layer_of(name: &str) -> Option<usize> {
-    let rest = name.strip_prefix("blk.")?;
-    let l = rest.split('.').next().unwrap_or_default();
-    Some(l.parse().expect("mapped layer index"))
+    let rest = name
+        .strip_prefix("blk.")
+        .or_else(|| name.strip_prefix("model.language_model.layers."))
+        .or_else(|| name.strip_prefix("model.layers."))
+        .or_else(|| name.strip_prefix("layers."))?;
+    rest.split('.').next()?.parse().ok()
 }
 
 /// The tensors of `mapped` a TP rank of trunk geometry `g` holds on the card ([`tp::card_holds`]),
@@ -579,11 +585,7 @@ fn made(name: &str, m: Mapped, f: Format) -> Result<Made, Error> {
 }
 
 /// The required mapped names of a whole checkpoint, including its configured next-token layers.
-fn required(
-    config: &Value,
-    g: Geometry,
-    tensors: usize,
-) -> Result<(Geometry, BTreeSet<String>), Error> {
+fn required(config: &Value, g: Geometry, tensors: usize) -> Result<BTreeSet<String>, Error> {
     use model::arch::glm5next::roles;
     let c = config.get("text_config").unwrap_or(config);
     let count = |key: &str| {
@@ -655,16 +657,15 @@ fn required(
             required.extend(roles::required(stems).map(|s| format!("blk.{l}.{s}")));
         }
     }
-    Ok((Geometry { layers, ..g }, required))
+    Ok(required)
 }
 
 /// The model folder `dir` read whole: its config's trunk geometry, its quantization config
 /// (`config.json`, with `hf_quant_config.json` when present), the folder, every shard's header
 /// table, and the required tensors of every configured text layer, NextN's included, under the
-/// geometry of the trunk and NextN layers.
+/// geometry of the trunk layers.
 struct Read {
     trunk: Geometry,
-    all: Geometry,
     required: BTreeSet<String>,
     config: Config,
     folder: Folder,
@@ -686,10 +687,9 @@ fn read(dir: &Path) -> Result<Read, Error> {
             Ok((n.to_string(), raw.dtype, raw.shape.to_vec()))
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    let (all, required) = required(&json, trunk, table.len())?;
+    let required = required(&json, trunk, table.len())?;
     Ok(Read {
         trunk,
-        all,
         required,
         config,
         folder,
@@ -698,10 +698,18 @@ fn read(dir: &Path) -> Result<Read, Error> {
 }
 
 impl Read {
-    /// The first required tensor `present` lacks, refused by name.
-    fn check_required<'a>(&self, present: impl IntoIterator<Item = &'a str>) -> Result<(), Error> {
+    /// The first required tensor of `g` that `present` lacks, refused by name.
+    fn check_required<'a>(
+        &self,
+        g: Geometry,
+        present: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), Error> {
         let present: BTreeSet<&str> = present.into_iter().collect();
-        match self.required.iter().find(|n| !present.contains(n.as_str())) {
+        match self
+            .required
+            .iter()
+            .find(|n| tp::in_trunk(layer_of(n), g.layers) && !present.contains(n.as_str()))
+        {
             Some(name) => Err(refuse(name, "checkpoint is missing a required text tensor")),
             None => Ok(()),
         }
@@ -710,13 +718,13 @@ impl Read {
 
 /// The model folder `dir` as a load reads it ([`Checkpoint`]), with its trunk geometry,
 /// header-only placement tensors and checkpoint parts ([`made`]). Every configured text layer
-/// and required tensor must be present, including NextN. The checkpoint parts cover the trunk,
-/// embedding, head and final norm ([`tp::in_trunk`]); NextN is not made. The card plan excludes
-/// the host-read embedding ([`mapped_tp`]).
+/// and required tensor of the target must be present. The checkpoint parts cover the trunk,
+/// embedding, head and final norm ([`tp::in_trunk`]); NextN is neither planned nor made. The card
+/// plan excludes the host-read embedding ([`mapped_tp`]).
 pub fn open(dir: &Path) -> Result<(Geometry, Vec<TpTensor>, Checkpoint), Error> {
     let r = read(dir)?;
-    let (plan, mapped) = placed_map(r.all, &r.config, &r.table)?;
-    r.check_required(mapped.keys().map(String::as_str))?;
+    let (plan, mapped) = placed_map(r.trunk, &r.config, &r.table)?;
+    r.check_required(r.trunk, mapped.keys().map(String::as_str))?;
     let tensors = mapped_tp(r.trunk, &mapped)?;
     let made = mapped
         .into_iter()
@@ -1333,7 +1341,7 @@ mod tests {
         }
         assert!(cut > 20, "{cut} parts cut");
         let r = read(&dir).unwrap();
-        let (placed, mapped) = placed_map(r.all, &r.config, &r.table).unwrap();
+        let (placed, mapped) = placed_map(r.trunk, &r.config, &r.table).unwrap();
         let whole = parts(folder, rule(0, 1));
         let mut moved = 0;
         for (name, m) in checkpoint.made().iter().filter(|(_, m)| m.step.is_some()) {
@@ -1377,28 +1385,51 @@ mod tests {
                 .iter()
                 .map(|(n, s)| (n.replace("model.language_model.", prefix), s.clone()))
                 .collect();
-            for suffix in ["eh_proj.weight", "mlp.experts.0.down_proj.weight"] {
-                let refused = format!("{prefix}layers.3.{suffix}");
+            for (layer, suffix) in [
+                (3, "eh_proj.weight"),
+                (3, "mlp.experts.0.down_proj.weight"),
+                (1, "self_attn.q_b_proj.weight"),
+                (1, "mlp.experts.0.down_proj.weight"),
+            ] {
+                let refused = format!("{prefix}layers.{layer}.{suffix}");
                 write_small(&dir, &config, &table, &[]);
                 let folder = Folder::open(&dir).unwrap();
                 let entries: Vec<_> = folder
                     .names()
                     .map(|n| {
                         let r = folder.raw(n).unwrap();
-                        (n, if n == refused { "U32" } else { "F32" }, r.shape, r.bytes)
+                        (
+                            n,
+                            if n == refused { "U32" } else { "F32" },
+                            r.shape,
+                            r.bytes,
+                        )
                     })
                     .collect();
                 let bytes = safetensors::write(&entries);
                 drop(folder);
                 std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
                 let r = read(&dir).unwrap();
-                let e = placed_map(r.all, &r.config, &r.table).err().unwrap();
+                let all = Geometry {
+                    layers: 4,
+                    ..r.trunk
+                };
+                let e = placed_map(all, &r.config, &r.table).err().unwrap();
                 let e = e.to_string();
                 assert!(e.contains(&refused) && e.contains("U32"), "{e}");
-                let (_, tensors, checkpoint) = open(&dir).unwrap_or_else(|e| panic!("{refused}: {e}"));
+                if layer < r.trunk.layers {
+                    let e = open(&dir).err().unwrap().to_string();
+                    assert!(e.contains(&refused) && e.contains("U32"), "{e}");
+                    println!("TARGET_REFUSED {e}");
+                    continue;
+                }
+                let (_, tensors, checkpoint) =
+                    open(&dir).unwrap_or_else(|e| panic!("{refused}: {e}"));
                 assert!(tensors.iter().all(|t| !t.name.starts_with("blk.3.")));
                 assert!(checkpoint.made().keys().all(|n| !n.starts_with("blk.3.")));
-                let parts = checkpoint.plan(|_, _, _| Ok::<_, String>(Take::Whole)).unwrap();
+                let parts = checkpoint
+                    .plan(|_, _, _| Ok::<_, String>(Take::Whole))
+                    .unwrap();
                 assert!(!parts.is_empty());
                 for part in &parts {
                     checkpoint.read(part).unwrap();
@@ -1409,6 +1440,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    // PIN(2026-10-23): NextN completeness is checked under its full geometry, separately from
+    // the target-only folder load; the target still requires every trunk tensor.
     #[test]
     fn a_folder_requires_the_whole_configured_text_model() {
         let (config, table) = small_glm();
@@ -1487,10 +1520,23 @@ mod tests {
             ),
         ] {
             write(&config, omit);
-            match open(&dir) {
-                Ok((_, tensors, _)) => {
-                    let bytes = plan_tp(&pools(2), &tensors).unwrap()[0].bytes();
-                    println!("ACCEPTED {what}: PLAN_OK bytes={bytes}, full={full_bytes}");
+            let checked = if missing.starts_with("blk.3.") {
+                let (_, tensors, _) = open(&dir).unwrap();
+                assert_eq!(plan_tp(&pools(2), &tensors).unwrap()[0].bytes(), full_bytes);
+                let r = read(&dir).unwrap();
+                let all = Geometry {
+                    layers: 4,
+                    ..r.trunk
+                };
+                placed_map(all, &r.config, &r.table).and_then(|(_, mapped)| {
+                    r.check_required(all, mapped.keys().map(String::as_str))
+                })
+            } else {
+                open(&dir).map(|_| ())
+            };
+            match checked {
+                Ok(()) => {
+                    println!("ACCEPTED {what}");
                     accepted.push(what);
                 }
                 Err(e) => {
