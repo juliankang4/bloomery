@@ -19,16 +19,16 @@ and fails a row no source declares (`stale`) and a declared entry with no row (`
   <bin> <entry> stale                         (in the table, declared by none of the binary's crates)
   <bin> <entry> unpinned (<file>:<line>)      (declared, not in the table)
 
-The other tables the recipe names, one per PTX arch and card capability (an argument that ends in `/` is every
-`*.tsv` in that directory, and one with none is a refusal), are read for stale rows only:
+Every table the recipe names, one per PTX arch and card capability (an argument that ends in `/` is every
+`*.tsv` in that directory, and one with none is a refusal), is checked for stale and unpinned entries:
 
   <bin> <entry> stale (<table>)               (in that table, declared by none of the binary's crates)
+  <bin> <entry> unpinned (<file>:<line>; <table>) (declared for that target, not in that table)
 
-A kernel added on a cc 8.6 card has no jit_local reading for another capability, so its row there comes from a
-scan on that card; until then that table's gate on that card names it unpinned.
 A target-only module may instead be pinned in a target table with a `# cfg: NAME` line,
 matching its sibling mod.rs or lib.rs's `#[cfg(NAME)] mod name;` declaration. Its target's
-runtime spill check still requires every emitted entry; unconditional entries require default rows.
+table requires those entries and every unconditional entry; the other tables require only
+their own target entries and the unconditional ones. Resource values come from a scan on each target card.
 
 What declares an entry. A `#[kernel]` attribute (its attribute stack may span lines: `#[allow(..)]`,
 `#[launch_bounds(..)]`, `#[launch_contract(..)]` and doc lines sit between it and the `fn`) on a line of its own,
@@ -641,17 +641,15 @@ def check(root):
         if not found:
             raise Refuse(f"recipe {RECIPE} names the directory {rel}, which holds no table")
         tables += [os.path.relpath(p, root) for p in found]
-    # PIN(2026-10-23): target-only modules use measured target rows; default builds cannot emit them.
-    conditional = []
-    for rel in tables:
+    tables = [(rel, read_table(os.path.join(root, rel))) for rel in tables]
+    # PIN(2026-10-23): target-only entries use each table's cfg; another target's rows cannot supply a missing pin.
+    table_cfgs = {}
+    for rel, _ in [(TABLE, rows), *tables]:
         with open(os.path.join(root, rel), encoding="utf-8") as fh:
-            cfg = re.findall(r"^# cfg: ([A-Za-z_]\w*)$", fh.read(), re.M)
-        if cfg:
-            conditional.append((cfg, read_table(os.path.join(root, rel))))
+            table_cfgs[rel] = set(re.findall(r"^# cfg: ([A-Za-z_]\w*)$", fh.read(), re.M))
+    cfg_names = set().union(*table_cfgs.values())
     problems = []
-    for b in sorted(set(rows) - {b for b, _ in bins}):
-        problems.append(f"{b}: the table pins this binary, the {RECIPE} recipe does not run it")
-    scan, nrows, ndecl, decl = {}, 0, 0, {}
+    scan, nrows, ndecl, decl, guards = {}, 0, 0, {}, {}
     for b, flt in bins:
         if b not in BIN_CRATES:
             raise Refuse(f"{b}: the {RECIPE} recipe pins this binary and BIN_CRATES (tools/check-ptx-names.py) does not "
@@ -665,41 +663,37 @@ def check(root):
             if flt in name:
                 declared.setdefault(name, site)
         decl[b] = declared
-        have = rows.get(b, {})
-        target_rows = 0
-        for e in sorted(set(have) - set(declared)):
-            problems.append(f"{b} {e} stale")
-        for e in sorted(set(declared) - set(have)):
-            source = declared[e][0]
+        for source in {site[0] for site in declared.values()} - guards.keys():
+            guards[source] = set()
             parent = os.path.dirname(os.path.join(root, source))
             module = os.path.splitext(os.path.basename(source))[0]
-            guarded = False
-            for cfgs, pins in conditional:
-                if e not in pins.get(b, {}):
+            for owner in ("mod.rs", "lib.rs"):
+                path = os.path.join(parent, owner)
+                if not os.path.isfile(path):
                     continue
-                for owner in ("mod.rs", "lib.rs"):
-                    path = os.path.join(parent, owner)
-                    if not os.path.isfile(path):
-                        continue
-                    with open(path, encoding="utf-8") as fh:
-                        text = rust_lex(fh.read())[1]
-                    for cfg in cfgs:
-                        pattern = r"^\s*#\[cfg\(" + re.escape(cfg) + r"\)\]\s*mod\s+" + re.escape(module) + r"\s*;"
-                        guarded |= re.search(pattern, text, re.M) is not None
-            if guarded:
-                target_rows += 1
-                continue
-            problems.append(f"{b} {e} unpinned ({declared[e][0]}:{declared[e][1]})")
-        nrows += len(have) + target_rows
+                with open(path, encoding="utf-8") as fh:
+                    text = rust_lex(fh.read())[1]
+                for cfg in cfg_names:
+                    pattern = r"^\s*#\[cfg\(" + re.escape(cfg) + r"\)\]\s*mod\s+" + re.escape(module) + r"\s*;"
+                    if re.search(pattern, text, re.M):
+                        guards[source].add(cfg)
+        have = rows.get(b, {})
+        nrows += len(have) + sum(bool(guards[site[0]]) for e, site in declared.items() if e not in have)
         ndecl += len(declared)
-    for rel in tables:
-        brows = read_table(os.path.join(root, rel))
+    for rel, brows in [(TABLE, rows), *tables]:
         for b in sorted(set(brows) - set(decl)):
-            problems.append(f"{b}: {rel} pins this binary, the {RECIPE} recipe does not run it")
+            label = "the table" if rel == TABLE else rel
+            problems.append(f"{b}: {label} pins this binary, the {RECIPE} recipe does not run it")
         for b in decl:
-            for e in sorted(set(brows.get(b, {})) - set(decl[b])):
-                problems.append(f"{b} {e} stale ({rel})")
-    tail = f"; {len(tables)} tables beside it read for stale rows and target-only pins" if tables else ""
+            expected = {e for e, site in decl[b].items() if not guards[site[0]] or guards[site[0]] & table_cfgs[rel]}
+            have = set(brows.get(b, {}))
+            for e in sorted(have - expected):
+                problems.append(f"{b} {e} stale" + (f" ({rel})" if rel != TABLE else ""))
+            for e in sorted(expected - have):
+                source, line = decl[b][e]
+                where = f"{source}:{line}" + (f"; {rel}" if rel != TABLE else "")
+                problems.append(f"{b} {e} unpinned ({where})")
+    tail = f"; {len(tables)} tables beside it checked for stale and unpinned entries" if tables else ""
     more, covered = covered_problems(root, bins, recipe_builds(os.path.join(root, JUSTFILE)))
     problems += more
     return problems, f"{len(bins)} binaries, {nrows} rows = {ndecl} declared entries{tail}; {covered}"
@@ -1113,7 +1107,7 @@ def self_test():
             beside=table_text(dict(TABLE_ROWS, gate_qwen3vl_tower=["vis_one"])))
         run("beside: an explicit table path is checked too", 1,
             [f"generate_ds41 k_two_8 unpinned (crates/gpu/src/lib.rs:{line_of(GPU_RS, 'pub fn k_two_8') - 1}; {BESIDE_FIXTURE})"],
-            beside=table_text(lag), justfile=JUSTFILE_TXT.replace(f"{TABLE} ", f"{TABLE} {BESIDE_FIXTURE} ").replace(f"{BESIDE_DIR} ", ""))
+            extra=((BESIDE_FIXTURE, table_text(lag)),), justfile=JUSTFILE_TXT.replace(f"{TABLE} ", f"{TABLE} {BESIDE_FIXTURE} "))
         run("beside: a deleted kernel's row there is stale", 1,
             [f"generate_ds41 k_old stale ({BESIDE_FIXTURE})"],
             beside=table_text(dict(TABLE_ROWS, generate_ds41=TABLE_ROWS["generate_ds41"] + ["k_old"])))

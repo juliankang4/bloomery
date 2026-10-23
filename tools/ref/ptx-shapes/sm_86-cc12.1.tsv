@@ -4,8 +4,7 @@
 # Pinned from the scans on ptxas 13.3.73, sm_86, JIT on an NVIDIA GB10 (DGX Spark) with driver 595.84 (CUDA 13.3).
 # arch: sm_86
 # jit-cc: 12.1
-# A kernel added on a cc 8.6 card gets its row here from a scan on a cc 12.1 card: tools/check-ptx-names.py reads this
-# table for stale rows only.
+# Every entry has a row measured on cc 12.1; tools/check-ptx-names.py checks for stale and missing rows.
 #
 # binary          entry                              spill  jit_local
 

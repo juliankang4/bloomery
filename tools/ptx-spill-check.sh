@@ -738,7 +738,7 @@ for ARG in "$@"; do
     /^ptx-scan-md5:/ { exit }
     h && NF > 1 { print $1, $s, $j }
   ' "$TMP/$BIN.scan" > "$TMP/$BIN.got"
-  awk -v b="$BIN" '!/^[[:space:]]*#/ && NF >= 4 && $1 == b { print $2, $3, $4 }' "$TMP/table.$T" > "$TMP/$BIN.want"
+  awk -v b="$BIN" -v filter="$FILTER" '!/^[[:space:]]*#/ && NF >= 4 && $1 == b && index($2, filter) { print $2, $3, $4 }' "$TMP/table.$T" > "$TMP/$BIN.want"
   if [ ! -s "$TMP/$BIN.got" ]; then
     echo "ptx-spill bin=$BIN scan printed no entry rows FAIL"
     rc=1
