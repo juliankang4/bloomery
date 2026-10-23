@@ -210,7 +210,12 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # generate_ds41 (gpu,deepseek41): 84 spill bytes and 32 driver-JIT local bytes per thread.
 # PIN(2026-10-23): 84 -> 260 spill bytes, 32 -> 96 driver-JIT local bytes: the 128 by 128 MMA tile
 # gives each thread 64 cells, and the fused mix holds half of them while it mixes the other half.
-generate_ds41   hc_gated_up_mma_mix_4                  260          96
+# PIN(2026-10-24): 260 -> 468 spill bytes, 96 -> 176 driver-JIT local bytes (ptxas 13.3.73 sm_121, GB10
+# driver 595.84): the mix reads eight hidden values of four columns a step and keeps those columns'
+# addresses live beside the tile's waiting cells.
+# PIN(2026-10-24): 468 -> 492 spill bytes (sm_121 ptxas 13.3.73, GB10 driver 595.84) with the
+# weight-owned raster and split copied-stage loop. JIT local bytes remain unchanged.
+generate_ds41   hc_gated_up_mma_mix_4                  492         176
 generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0

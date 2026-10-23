@@ -213,7 +213,12 @@ generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 # gives each thread 64 cells, and the fused mix holds half of them while it mixes the other half.
 # PIN(2026-10-23): 920 -> 0 spill bytes, 96 driver-JIT local bytes unchanged (ptxas 13.3.73 sm_86, GB10
 # driver 595.84): read after the dense MMA tile moved its cell marking behind the replay vote.
-generate_ds41   hc_gated_up_mma_mix_4                    0          96
+# PIN(2026-10-24): 0 -> 1112 spill bytes, 96 -> 176 driver-JIT local bytes (ptxas 13.3.73 sm_86, GB10
+# driver 595.84): the mix reads eight hidden values of four columns a step and keeps those columns'
+# addresses live beside the tile's waiting cells. The entry runs only on GB10.
+# PIN(2026-10-24): 1112 -> 1352 spill bytes (sm_86 ptxas 13.3.73, GB10 driver 595.84): the shared
+# origin uses the weight's raster in the copied-stage MMA tile. JIT local bytes remain unchanged.
+generate_ds41   hc_gated_up_mma_mix_4                 1352         176
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
 generate_ds41   head_norm_neox_append                    0           0
