@@ -208,10 +208,7 @@ pub fn map<'a>(
         None => Ok(()),
     };
     for (name, shape) in tensors {
-        let short = name
-            .strip_prefix("model.language_model.")
-            .or_else(|| name.strip_prefix("model."))
-            .unwrap_or(name);
+        let short = text_name(name);
         let same = |dims: Vec<usize>| Mapped {
             source: name.to_string(),
             layout: Layout::Same,
@@ -224,11 +221,8 @@ pub fn map<'a>(
             "lm_head.weight" => put(names::output(), reversed())?,
             _ if short.starts_with("visual.") || name.starts_with("model.visual.") => {}
             _ => {
-                let (l, rest) = short
-                    .strip_prefix("layers.")
-                    .and_then(|r| r.split_once('.'))
-                    .and_then(|(l, rest)| Some((l.parse::<usize>().ok()?, rest)))
-                    .ok_or_else(|| refuse(name, "not a GLM-5.3-Flash tensor"))?;
+                let (l, rest) =
+                    text_layer(name).ok_or_else(|| refuse(name, "not a GLM-5.3-Flash tensor"))?;
                 if l >= g.layers {
                     continue;
                 }
@@ -431,6 +425,17 @@ fn layer(
 /// Each glm5next tensor, by name, with the format it is held in.
 type HeldMap = BTreeMap<String, (Mapped, Format)>;
 
+fn text_name(name: &str) -> &str {
+    name.strip_prefix("model.language_model.")
+        .or_else(|| name.strip_prefix("model."))
+        .unwrap_or(name)
+}
+
+fn text_layer(name: &str) -> Option<(usize, &str)> {
+    let (l, rest) = text_name(name).strip_prefix("layers.")?.split_once('.')?;
+    Some((l.parse().ok()?, rest))
+}
+
 /// The checkpoint whose tensors are `table` (name, dtype, stored shape) placed by `config` and
 /// mapped under geometry `g`: the placement plan, and each glm5next tensor with the format it is
 /// held in. A tensor the config refuses, a stack of mixed formats and a table with no text
@@ -444,7 +449,8 @@ fn placed_map(
         config,
         table
             .iter()
-            .filter(|(n, _, _)| layer_of(n).is_none_or(|l| l < g.layers))
+            .filter(|(n, _, _)| !text_name(n).starts_with("visual."))
+            .filter(|(n, _, _)| tp::in_trunk(text_layer(n).map(|(l, _)| l), g.layers))
             .map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
         module_class,
     );
@@ -503,14 +509,11 @@ fn tp_tensors(
     mapped_tp(g, &mapped)
 }
 
-/// The layer of a checkpoint or glm5next tensor name, `None` for a tensor of no layer.
+/// The layer of the glm5next name `name` the map writes, `None` for a tensor of no layer.
 fn layer_of(name: &str) -> Option<usize> {
-    let rest = name
-        .strip_prefix("blk.")
-        .or_else(|| name.strip_prefix("model.language_model.layers."))
-        .or_else(|| name.strip_prefix("model.layers."))
-        .or_else(|| name.strip_prefix("layers."))?;
-    rest.split('.').next()?.parse().ok()
+    let rest = name.strip_prefix("blk.")?;
+    let l = rest.split('.').next().unwrap_or_default();
+    Some(l.parse().expect("mapped layer index"))
 }
 
 /// The tensors of `mapped` a TP rank of trunk geometry `g` holds on the card ([`tp::card_holds`]),
@@ -728,7 +731,6 @@ pub fn open(dir: &Path) -> Result<(Geometry, Vec<TpTensor>, Checkpoint), Error> 
     let tensors = mapped_tp(r.trunk, &mapped)?;
     let made = mapped
         .into_iter()
-        .filter(|(name, _)| tp::in_trunk(layer_of(name), r.trunk.layers))
         .map(|(name, (m, f))| Ok((name.clone(), made(&name, m, f)?)))
         .collect::<Result<_, Error>>()?;
     Ok((r.trunk, tensors, Checkpoint::new(r.folder, plan, made)?))
@@ -1377,7 +1379,7 @@ mod tests {
     }
 
     #[test]
-    fn a_target_opens_when_only_nextn_quantization_is_refused() {
+    fn a_target_opens_when_only_unused_quantization_is_refused() {
         let (config, table) = small_glm();
         let dir = temp_dir("nextn-refusal");
         for prefix in ["model.language_model.", "model.", ""] {
@@ -1385,24 +1387,31 @@ mod tests {
                 .iter()
                 .map(|(n, s)| (n.replace("model.language_model.", prefix), s.clone()))
                 .collect();
-            for (layer, suffix) in [
-                (3, "eh_proj.weight"),
-                (3, "mlp.experts.0.down_proj.weight"),
-                (1, "self_attn.q_b_proj.weight"),
-                (1, "mlp.experts.0.down_proj.weight"),
+            for (suffix, dtype, trunk) in [
+                ("layers.3.eh_proj.weight", Dtype::U32, false),
+                ("layers.3.mlp.experts.0.down_proj.weight", Dtype::U32, false),
+                ("layers.1.self_attn.q_b_proj.weight", Dtype::U32, true),
+                ("layers.1.mlp.experts.0.down_proj.weight", Dtype::U32, true),
+                ("visual.blocks.0.attn.qkv.weight", Dtype::F16, false),
+                ("visual.blocks.0.attn.qkv.weight", Dtype::U32, false),
             ] {
-                let refused = format!("{prefix}layers.{layer}.{suffix}");
+                let refused = format!("{prefix}{suffix}");
+                let mut table = table.clone();
+                if suffix.starts_with("visual.") {
+                    table.push((refused.clone(), vec![2, 2]));
+                }
                 write_small(&dir, &config, &table, &[]);
                 let folder = Folder::open(&dir).unwrap();
                 let entries: Vec<_> = folder
                     .names()
                     .map(|n| {
                         let r = folder.raw(n).unwrap();
+                        let dtype = if n == refused { dtype } else { Dtype::F32 };
                         (
                             n,
-                            if n == refused { "U32" } else { "F32" },
+                            dtype.name(),
                             r.shape,
-                            r.bytes,
+                            &r.bytes[..r.shape.iter().product::<usize>() * dtype.size()],
                         )
                     })
                     .collect();
@@ -1410,16 +1419,18 @@ mod tests {
                 drop(folder);
                 std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
                 let r = read(&dir).unwrap();
-                let all = Geometry {
-                    layers: 4,
-                    ..r.trunk
-                };
-                let e = placed_map(all, &r.config, &r.table).err().unwrap();
-                let e = e.to_string();
-                assert!(e.contains(&refused) && e.contains("U32"), "{e}");
-                if layer < r.trunk.layers {
+                let raw = quant_config::plan(
+                    &r.config,
+                    r.table
+                        .iter()
+                        .map(|(n, d, s)| (n.as_str(), *d, s.as_slice())),
+                    module_class,
+                );
+                let e = &raw.refused[&refused];
+                assert!(e.contains(dtype.name()), "{e}");
+                if trunk {
                     let e = open(&dir).err().unwrap().to_string();
-                    assert!(e.contains(&refused) && e.contains("U32"), "{e}");
+                    assert!(e.contains(&refused) && e.contains(dtype.name()), "{e}");
                     println!("TARGET_REFUSED {e}");
                     continue;
                 }
@@ -1434,7 +1445,7 @@ mod tests {
                 for part in &parts {
                     checkpoint.read(part).unwrap();
                 }
-                println!("TARGET_OK {refused}; NEXTN_REFUSED {e}");
+                println!("TARGET_OK {refused}; UNUSED_REFUSED {e}");
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
