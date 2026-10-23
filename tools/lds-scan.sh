@@ -135,7 +135,7 @@ lds-scan bin=target/release/gate_x cuobjdump-failed=other scan=failed"
   case_ arch-from-env 0 "${banner/arch=sm_86/arch=sm_121} entries=1 filter=mix
 $mix"
   rc=0; SCAN_ARCH=sm121 scan gate_x mix || rc=$?
-  case_ arch-refused 64 "lds-scan.sh: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: sm_86), got 'sm121'"
+  case_ arch-refused 64 "lds-scan.sh: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: auto), got 'sm121'"
   SCAN_ARCH=
   # The stand-in wc counts 7 for every read and fails on a text holding the word `fail-wc`: in fix-wc, a line of it
   # closes mod1 (inside up_down's body) and up_mix_4x320's SASS listing.

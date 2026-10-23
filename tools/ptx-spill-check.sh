@@ -239,7 +239,7 @@ self_test() {
     fails=$((fails + 1))
   fi
   BLOOMERY_ARCH=sm_86 check "the table's own arch is read against the table" 0 "ptx-spill bin=a entries=2 pinned=2 nonzero=k2(spill=8,jit_local=0) violations=0 PASS" "$t/table" a
-  BLOOMERY_ARCH=sm86 check "a BLOOMERY_ARCH that is no arch" 64 "ptx-spill-check.sh: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: sm_86), got 'sm86'" "$t/table" a
+  BLOOMERY_ARCH=sm86 check "a BLOOMERY_ARCH that is no arch" 64 "ptx-spill-check.sh: BLOOMERY_ARCH is a CUDA arch, sm_ and the capability's digits with an optional a or f (unset: auto), got 'sm86'" "$t/table" a
   # A failed read is no verdict. The md5sum and wc stand-ins of tools/ref/read-stubs.sh fail on a text that holds the word
   # fail-wc: rn's scan rows and pins both hold it (no violation, so a lost count read as PASS), rp's pins alone; a sort that
   # fails loses the comparison itself.
