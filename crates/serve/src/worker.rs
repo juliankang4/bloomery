@@ -840,8 +840,6 @@ impl Worker {
             // alone in its round: here it steps.
             let mut steps: Vec<SlotRow<'_>> = Vec::new();
             let mut step_at: Vec<usize> = Vec::new();
-            let mut passes: Vec<SlotPass<'_>> = Vec::new();
-            let mut pass_at: Vec<usize> = Vec::new();
             for (i, (a, need)) in self.active.iter_mut().zip(&needs).enumerate() {
                 match *need {
                     Need::Step(last) | Need::Sampled(last) => {
@@ -853,15 +851,7 @@ impl Worker {
                             next: 0,
                         });
                     }
-                    Need::Advance(last) => {
-                        pass_at.push(i);
-                        passes.push(SlotPass {
-                            slot: a.slot,
-                            last,
-                            out: a.job.kept_mut(),
-                            drafted: Drafted::default(),
-                        });
-                    }
+                    Need::Advance(last) => a.need = Some(Need::Advance(last)),
                     Need::Fill => {}
                     Need::Done => unreachable!("a finished request left the running ones"),
                 }
@@ -877,6 +867,34 @@ impl Worker {
                 Ok(())
             };
             if called.is_ok() {
+                let answers: Vec<u32> = steps.iter().map(|r| r.next).collect();
+                drop(steps);
+                let mixed =
+                    !step_at.is_empty() && needs.iter().any(|n| matches!(n, Need::Advance(_)));
+                for (i, g) in step_at.into_iter().zip(answers) {
+                    self.active[i].job.stepped(g);
+                }
+                if mixed {
+                    self.pump_ready();
+                    if self.sh.stopped() {
+                        return Ok(());
+                    }
+                }
+                // Pumping may end a request and move the remaining entries.
+                let mut passes: Vec<SlotPass<'_>> = Vec::new();
+                let mut pass_at: Vec<usize> = Vec::new();
+                for (i, a) in self.active.iter_mut().enumerate() {
+                    if let Some(Need::Advance(last)) = a.need {
+                        a.need = None;
+                        pass_at.push(i);
+                        passes.push(SlotPass {
+                            slot: a.slot,
+                            last,
+                            out: a.job.kept_mut(),
+                            drafted: Drafted::default(),
+                        });
+                    }
+                }
                 called = if passes.len() > 1 {
                     self.slot.advance_slots(&mut passes)
                 } else if let [row] = passes.as_mut_slice() {
@@ -887,17 +905,12 @@ impl Worker {
                 } else {
                     Ok(())
                 };
-            }
-            if called.is_ok() {
-                let answers: Vec<u32> = steps.iter().map(|r| r.next).collect();
-                let drafted: Vec<Drafted> = passes.iter().map(|r| r.drafted).collect();
-                drop(steps);
-                drop(passes);
-                for (i, g) in step_at.into_iter().zip(answers) {
-                    self.active[i].job.stepped(g);
-                }
-                for (i, d) in pass_at.into_iter().zip(drafted) {
-                    self.active[i].job.advanced(d);
+                if called.is_ok() {
+                    let drafted: Vec<Drafted> = passes.iter().map(|r| r.drafted).collect();
+                    drop(passes);
+                    for (i, d) in pass_at.into_iter().zip(drafted) {
+                        self.active[i].job.advanced(d);
+                    }
                 }
             }
             called

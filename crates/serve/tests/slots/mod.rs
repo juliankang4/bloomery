@@ -1077,7 +1077,7 @@ fn hw_plain_steps_reach_clients_before_drafted_passes() {
                     json!({"prompt": p, "n_predict": if finish && plain {
                         if i == 0 { 3 } else { 2 }
                     } else { 8 }, "temperature": if plain { 0.8 } else { 0.0 }, "seed": 7,
-                        "cache_prompt": false, "ignore_eos": true,
+                        "cache_prompt": false, "ignore_eos": plain,
                         "return_tokens": true, "stream": true, "timings_per_token": true})
                 })
                 .collect();
@@ -1139,7 +1139,16 @@ fn hw_plain_steps_reach_clients_before_drafted_passes() {
                 );
                 let want = post(alone, "/completion", &body).json();
                 assert_eq!(got.3["tokens"], want["tokens"], "N = {n}: {body}");
-                assert_eq!(got.3["content"], want["content"], "N = {n}: {body}");
+                let content: String = seen
+                    .iter()
+                    .filter(|(_, slot, last, _)| *slot == got.1 && !last)
+                    .map(|(_, _, _, v)| v["content"].as_str().expect("chunk content"))
+                    .collect();
+                assert_eq!(
+                    content,
+                    want["content"].as_str().expect("content"),
+                    "N = {n}: {body}"
+                );
             }
         }
     }
