@@ -386,6 +386,12 @@ fn planned_tensors(
                 m.role = Use::Matrix(Plain::Bf16);
             }
         }
+        if format == Format::F32
+            && (name.ends_with(".ffn_gate_inp.weight")
+                || name.ends_with(".ffn_gate_inp_shexp.weight"))
+        {
+            m.role = Use::Matrix(Plain::F32);
+        }
         let type_id = modelopt::type_of(format, m.role).ok_or_else(|| {
             format!(
                 "{source}: {format} read as {:?} has no GGUF type here",

@@ -734,6 +734,7 @@ mod gate {
             assert_eq!(of(&unused), Ok(rewritten));
             let mut values = split(q8, bf16);
             values.push((names::ffn_gate_inp(0), bf16));
+            values.push((names::ffn_gate_inp_shexp(0), bf16));
             assert_eq!(of(&values), Ok(rewritten));
             assert_eq!(of(&split(bf16, bf16)), Ok(stored));
             assert_eq!(of(&split(q8, bf16)), Ok(rewritten));

@@ -869,8 +869,9 @@ mod tests {
     /// UD-Q4_K_XL holds in Q8_0, a BF16 matrix in the checkpoint (the head and the token
     /// embedding among them), is BF16, and Q8_0 only when `BLOOMERY_PREPARE_Q8` asks; every other
     /// tensor (the NVFP4 stacks, the PLE table's F8 rows, the gains, the scales) is the same
-    /// either way. Synthetic F32 matrices require the Q8_0 rewrite; BF16 and F32 routed stacks
-    /// are refused with either lever value. Dropping either refusal fails these assertions.
+    /// either way. Router parts keep their stored F32 or BF16 type with either lever value.
+    /// Other synthetic F32 matrices require the Q8_0 rewrite; BF16 and F32 routed stacks are
+    /// refused with either lever value. Dropping either refusal fails these assertions.
     /// `--keep-bf16` asks for the stored form: taken alone, refused beside the lever.
     #[test]
     fn a_bf16_matrix_is_written_as_stored_unless_q8_is_asked() {
@@ -933,6 +934,45 @@ mod tests {
                 (*ty, *ty)
             };
             assert_eq!((*ty, rewritten[name]), want, "{name}");
+        }
+        for (router, shared) in [
+            (Dtype::F32, Dtype::Bf16),
+            (Dtype::Bf16, Dtype::F32),
+            (Dtype::F32, Dtype::F32),
+        ] {
+            let mut mixed = entries.clone();
+            let parts = [
+                (
+                    "model.language_model.layers.0.mlp.gate.weight",
+                    names::ffn_gate_inp(0),
+                    router,
+                ),
+                (
+                    "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+                    names::ffn_gate_inp_shexp(0),
+                    shared,
+                ),
+            ];
+            for (source, _, dtype) in &parts {
+                mixed.iter_mut().find(|(n, _, _)| n == source).unwrap().1 = *dtype;
+            }
+            for q8 in [false, true] {
+                let (_, planned) = plan_tensors(&checkpoint, &quant, &mixed, q8).unwrap();
+                for (_, target, dtype) in &parts {
+                    let p = planned.iter().find(|p| p.decl.name == *target).unwrap();
+                    let want = if *dtype == Dtype::F32 {
+                        GgmlType::F32
+                    } else {
+                        GgmlType::BF16
+                    };
+                    assert_eq!(p.decl.type_id, want.as_u32(), "{target}, q8={q8}");
+                    assert_eq!(
+                        p.decl.nbytes,
+                        p.decl.dims.iter().product::<u64>() * want.type_size().unwrap(),
+                        "{target}, q8={q8}"
+                    );
+                }
+            }
         }
         for (target, source) in [
             (
