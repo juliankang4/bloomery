@@ -2409,7 +2409,7 @@ mod gate {
                 let rows = r.u64("rows");
                 r.word("cmd") == Ok("step")
                     && r.u64("slots") == Ok(4)
-                    && rows.is_ok_and(|n| (2..=4).contains(&n))
+                    && rows.as_ref().is_ok_and(|n| (2..=4).contains(n))
                     && r.u64("passes") == rows.map(|n| n.div_ceil(2))
             });
         println!(
