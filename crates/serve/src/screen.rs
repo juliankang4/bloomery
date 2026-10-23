@@ -367,19 +367,16 @@ fn facts<S: AsRef<str>>(lines: &[S], m: Marks) -> Option<Facts> {
     let load = start
         .last("load ", "resident_bytes")
         .filter(|l| l.same_place(place));
-    rows.extend(where_rows(&start, plan, load, m));
+    let tier = [plan, load]
+        .into_iter()
+        .flatten()
+        .find(|l| l.text("tier_experts").is_some())
+        .map(|l| l.num("tier_experts"));
+    rows.extend(where_rows(&start, plan, load, tier.flatten(), m));
     let split = plan.and_then(|p| {
-        let tier = match [Some(p), load]
-            .into_iter()
-            .flatten()
-            .find(|l| l.text("tier_experts").is_some())
-        {
-            Some(l) => l.num("tier_experts")?,
-            None => 0,
-        };
         Some(Split {
             card: p.num("card_experts")?,
-            tier,
+            tier: tier.unwrap_or(Some(0))?,
             host: p.num("host_experts")?,
         })
     });
@@ -463,6 +460,7 @@ fn where_rows<'a, S: AsRef<str>>(
     start: &'a Start<'a, S>,
     plan: Option<Line<'_>>,
     load: Option<Line<'_>>,
+    tier: Option<u64>,
     m: Marks,
 ) -> Vec<(&'static str, String)> {
     let experts = |l: Line<'_>, key: &str| {
@@ -483,15 +481,21 @@ fn where_rows<'a, S: AsRef<str>>(
     if !card.is_empty() {
         rows.push(("card", card.join(&format!(" {} ", m.dot))));
     }
+    if let Some(devices) = plan
+        .and_then(|p| p.word("devices"))
+        .filter(|d| d.contains(','))
+    {
+        rows.push(("devices", devices.to_owned()));
+    }
+    if let Some(n) = tier {
+        let name = plan
+            .and_then(|p| p.word("tier"))
+            .map(|t| format!("{t} {} ", m.dot));
+        rows.push(("tier", format!("{}{n} experts", name.unwrap_or_default())));
+    }
     let Some(p) = plan else {
         return rows;
     };
-    if let Some(devices) = p.word("devices").filter(|d| d.contains(',')) {
-        rows.push(("devices", devices.to_owned()));
-    }
-    if let (Some(tier), Some(n)) = (p.word("tier"), p.num("tier_experts")) {
-        rows.push(("tier", format!("{tier} {} {n} experts", m.dot)));
-    }
     if let Some(host) = experts(p, "host_experts") {
         rows.push(("host", host));
     }
@@ -1499,22 +1503,45 @@ mod tests {
     /// Several plan cards: the `devices` row is the plan's whole list.
     #[test]
     fn several_cards_show_the_whole_list() {
-        let start = [
-            "plan place=bp card=A6000 ctx_max=16384 card_experts=2552 (38801506304 B) \
+        let cards = [
+            "stage:A6000:cuda1:50952404992",
+            "tier0:3090:cuda0:25350373376",
+            "tier1:3090:cuda2:25350373376",
+            "tier2:3090:cuda3:25350373376",
+        ];
+        for tiers in 0..cards.len() {
+            let devices = format!("[{}]", cards[..=tiers].join(","));
+            let start = [
+                format!(
+                    "plan place=bp card=A6000 ctx_max=16384 card_experts=2552 (38801506304 B) \
              host_experts=8045 (123885584384 B) host_shadow=0 B n_l=65..66 on 39 layers \
              card_budget=none paged=0 arena=0 arena_slots=0 card_free=50668240896 \
-             devices=[stage:A6000:cuda1:50952404992,tier0:3090:cuda0:25350373376] \
-             cuda_order=unset(FASTEST_FIRST)",
-            "bloomery-serve-glm: place=bp ctx=16384 listening on http://127.0.0.1:8080",
-        ];
-        let got = render(&start, ASCII).unwrap();
-        assert!(
-            got.contains(&format!(
-                "{}[stage:A6000:cuda1:50952404992,tier0:3090:cuda0:25350373376]\n",
-                row("devices")
-            )),
-            "{got}"
-        );
+             devices={devices} cuda_order=unset(FASTEST_FIRST)"
+                ),
+                "bloomery-serve-glm: place=bp ctx=16384 listening on http://127.0.0.1:8080"
+                    .to_owned(),
+            ];
+            let facts = facts(
+                &start,
+                Marks {
+                    dot: ".",
+                    times: "x",
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                facts.rows.iter().find(|r| r.0 == "devices").map(|r| &r.1),
+                (tiers > 0).then_some(&devices)
+            );
+            let got = render(&start, ASCII).unwrap();
+            assert_eq!(got.contains(&row("devices")), tiers > 0, "{got}");
+            if tiers == 1 {
+                assert!(
+                    got.contains(&format!("{}{devices}\n", row("devices"))),
+                    "{got}"
+                );
+            }
+        }
     }
 
     /// A value with Hangul and a combining mark pads by the columns a
@@ -1603,11 +1630,180 @@ mod tests {
         let got = render(&start("10"), UTF8).unwrap();
         assert!(got.contains("▓ tier"), "{got}");
         assert!(got.contains(&"▓".repeat(11)), "{got}");
-        assert!(got.contains(&format!("{}10 experts\n", row("tier"))), "{got}");
+        assert!(
+            got.contains(&format!("{}10 experts\n", row("tier"))),
+            "{got}"
+        );
         let got = render(&start("lots"), UTF8).unwrap();
         assert!(!got.contains(&row("experts")), "{got}");
         assert!(!got.contains(&row("tier")), "{got}");
         assert!(got.contains("load: a value is no number"), "{got}");
+    }
+
+    #[test]
+    fn tier_details_and_the_bar_keep_the_record_precedence() {
+        for (plan, load, detail, count, unread) in [
+            (
+                Some("tier=3090 tier_experts=2"),
+                Some("tier_experts=1"),
+                Some("3090 · 2 experts"),
+                Some(2),
+                None,
+            ),
+            (
+                Some("tier=3090"),
+                Some("tier_experts=2"),
+                Some("3090 · 2 experts"),
+                Some(2),
+                None,
+            ),
+            (
+                Some("tier=3090 tier_experts=1"),
+                None,
+                Some("3090 · 1 experts"),
+                Some(1),
+                None,
+            ),
+            (
+                Some("tier_experts=0"),
+                Some("tier_experts=2"),
+                Some("0 experts"),
+                Some(0),
+                None,
+            ),
+            (
+                Some("tier_experts=1"),
+                None,
+                Some("1 experts"),
+                Some(1),
+                None,
+            ),
+            (
+                Some("tier_experts=2"),
+                None,
+                Some("2 experts"),
+                Some(2),
+                None,
+            ),
+            (
+                Some(""),
+                Some("tier_experts=0"),
+                Some("0 experts"),
+                Some(0),
+                None,
+            ),
+            (
+                Some(""),
+                Some("tier_experts=1"),
+                Some("1 experts"),
+                Some(1),
+                None,
+            ),
+            (Some("tier=3090"), Some(""), None, None, None),
+            (Some(""), None, None, None, None),
+            (
+                None,
+                Some("tier_experts=2"),
+                Some("2 experts"),
+                Some(2),
+                None,
+            ),
+            (
+                Some("tier=3090 tier_experts=lots"),
+                Some("tier_experts=2"),
+                None,
+                None,
+                Some("plan"),
+            ),
+            (
+                Some(""),
+                Some("tier_experts=lots"),
+                None,
+                None,
+                Some("load"),
+            ),
+            (
+                Some("tier_experts=2"),
+                Some("tier_experts=lots"),
+                Some("2 experts"),
+                Some(2),
+                None,
+            ),
+            (None, Some("tier_experts=lots"), None, None, Some("load")),
+        ] {
+            let mut start = Vec::new();
+            if let Some(fields) = plan {
+                start.push(format!(
+                    "plan place=bp card=A6000 card_experts=10 host_experts=10 {fields}"
+                ));
+            }
+            if let Some(fields) = load {
+                start.push(format!("load resident_bytes=1 place=bp {fields} in 1.0 s"));
+            }
+            start
+                .push("bloomery-serve-glm: place=bp listening on http://127.0.0.1:8080".to_owned());
+            let facts = facts(
+                &start,
+                Marks {
+                    dot: "·",
+                    times: "×",
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                facts
+                    .rows
+                    .iter()
+                    .find(|r| r.0 == "tier")
+                    .map(|r| r.1.as_str()),
+                detail,
+                "{start:?}"
+            );
+            let split = if plan.is_some() && unread.is_none() {
+                Some(count.unwrap_or(0))
+            } else {
+                None
+            };
+            assert_eq!(facts.split.map(|s| s.tier), split, "{start:?}");
+            let got = render(&start, UTF8).unwrap();
+            assert_eq!(got.contains(&row("tier")), detail.is_some(), "{got}");
+            if let Some(detail) = detail {
+                assert!(got.contains(detail), "{got}");
+            }
+            assert_eq!(
+                got.contains("▓ tier"),
+                split.is_some_and(|n| n > 0),
+                "{got}"
+            );
+            assert_eq!(got.contains(&row("unread")), unread.is_some(), "{got}");
+            if let Some(record) = unread {
+                assert!(
+                    got.contains(&format!("{record}: a value is no number")),
+                    "{got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tier_details_use_only_the_last_records_of_the_listening_place() {
+        let start = "plan place=bp card=A6000 card_experts=10 host_experts=10\n\
+                     load resident_bytes=1 place=bp tier_experts=2 in 1.0 s\n\
+                     bloomery-serve-glm: place=bp listening on http://127.0.0.1:8080";
+        let got = render(&mutated(start, "load ", "place=bp", "place=a"), UTF8).unwrap();
+        assert!(!got.contains(&row("tier")), "{got}");
+        assert!(!got.contains("▓ tier"), "{got}");
+        let got = render(&mutated(start, "plan ", "place=bp", "place=a"), UTF8).unwrap();
+        assert!(
+            got.contains(&format!("{}2 experts\n", row("tier"))),
+            "{got}"
+        );
+        assert!(!got.contains(&row("experts")), "{got}");
+        let mut start = lines(start);
+        start.push("load resident_bytes=1 place=bp in 2.0 s");
+        let got = render(&start, UTF8).unwrap();
+        assert!(!got.contains(&row("tier")), "{got}");
+        assert!(!got.contains("▓ tier"), "{got}");
     }
 
     /// No `listening` line, no screen: a start that did not reach its
