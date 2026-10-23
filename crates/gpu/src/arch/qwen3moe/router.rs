@@ -3499,8 +3499,8 @@ pub mod gated {
         ) {
             static mut P: SharedArray<f32, { MAX_TOKENS * EXPERTS_WIDE }> = SharedArray::UNINIT;
             static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
-            // SAFETY: as qwen35moe_router_fused_512's, with w ROWS_WIDE·k
-            // values in its words (the launch contract).
+            // SAFETY: LAST/P belong only to this block; all threads call converged on a ROWS_WIDE-block grid of 256 threads.
+            // The launch contract bounds m, used and all slices; the launcher checks positive k divisible by 32; done[0] is zero.
             unsafe {
                 gated_fused_body::<PER_LANE_WIDE, _>(
                     Bf16Words(w),
@@ -3589,8 +3589,8 @@ pub mod gated {
             mut logits: DisjointSlice<f32>,
         ) {
             static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
-            // SAFETY: as qwen35moe_router_logits_512's, with w ROWS_WIDE·k
-            // values in its words (the launch contract).
+            // SAFETY: STAGE is this block's own 16-byte-aligned STAGES * STAGE_FLOATS shared values; all 512 threads converge.
+            // The launcher proves the logits grid, positive k divisible by LINE and both alignments; the contract bounds all slices.
             unsafe {
                 logits_body::<ROWS_WIDE, _>(
                     Bf16Rows(w),

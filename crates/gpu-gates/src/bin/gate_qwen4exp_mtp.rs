@@ -13,6 +13,8 @@
 //!   addresses — nothing copied, the list's rows among them; the program's
 //!   arena is the plan's; the map holds one word a vocabulary id, its first
 //!   the list's ids and the rest 0.
+//!   Mixed BF16/F32 router parts in either order are planned, uploaded and
+//!   joined as F32, with the joined values and resident bytes checked.
 //! - (u) before the load: the head `BLOOMERY_MTP_HEAD_ROWS` unset picks on
 //!   this target (`head_list::head_rows_of`) is the shipped list — its
 //!   76,000 rows, its first line naming the target tokenizer's digest, the
@@ -4474,6 +4476,104 @@ mod gate {
         Ok(ok)
     }
 
+    /// Both mixed router pairs through the MTP classifier and the placed
+    /// uploader, with distinct values in the router and the shared gate.
+    fn mixed_router_load(
+        m: &Qwen38Model,
+        draft: &Split,
+        mtp: &MtpInputs,
+    ) -> Result<bool, GateError> {
+        use bloomery_gpu::weights::Weights;
+        use model::arch::qwen35moe::{names, place::FileTensor};
+        use model::placement;
+
+        let index = mtp.draft.index as usize;
+        let names = [names::ffn_gate_inp(index), names::ffn_gate_inp_shexp(index)];
+        let path =
+            std::env::temp_dir().join(format!("qwen38-mtp-router-{}.gguf", std::process::id()));
+        let result = (|| -> Result<bool, GateError> {
+            let mut ok = true;
+            for types in [
+                [GgmlType::BF16, GgmlType::F32],
+                [GgmlType::F32, GgmlType::BF16],
+            ] {
+                let mut file: Vec<FileTensor> = draft
+                    .iter_tensors()
+                    .map(|(shard, t)| FileTensor {
+                        name: t.name.clone(),
+                        shard,
+                        ty: t.ty,
+                        dims: t.dims.clone(),
+                        nbytes: t.nbytes,
+                    })
+                    .collect();
+                let mut decls = Vec::new();
+                for ((name, ty), value) in names.iter().zip(types).zip([0.125f32, -0.25]) {
+                    let t = file
+                        .iter_mut()
+                        .find(|t| t.name == *name)
+                        .ok_or("no router part")?;
+                    let bytes = match ty {
+                        GgmlType::BF16 => ((value.to_bits() >> 16) as u16).to_le_bytes().to_vec(),
+                        _ => value.to_le_bytes().to_vec(),
+                    };
+                    let data = bytes.repeat(usize::try_from(t.dims.iter().product::<u64>())?);
+                    t.ty = ty;
+                    t.shard = 0;
+                    t.nbytes = data.len() as u64;
+                    decls.push((name.clone(), t.dims.clone(), ty, data));
+                }
+                bloomery_gpu_gates::write_gguf(&path, &[], &decls)?;
+                let split = Split::open(&path)?;
+                let inputs = MtpInputs::from_parts(mtp.draft.clone(), &file)?;
+                let rows = inputs
+                    .model
+                    .tensors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| names.contains(&t.name))
+                    .map(|(i, t)| placement::whole_on_card(i, t, 0, &inputs.model))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let counted: u64 = rows
+                    .iter()
+                    .flat_map(|r| &r.segments)
+                    .map(|s| s.resident_bytes)
+                    .sum();
+                let mut weights =
+                    Weights::load_rows(m.gpu().stream(), &split, &inputs.model, &rows, 0)?;
+                weights.join_rows(
+                    m.gpu().stream(),
+                    &[&names[0], &names[1]],
+                    "derived.mtp.router".into(),
+                )?;
+                let joined = weights.f32_tensor("mixed MTP router", "derived.mtp.router")?;
+                let hidden = mtp.draft.hidden as usize;
+                let values = joined.buf().to_host_vec(m.gpu().stream())?;
+                let router_values = usize::try_from(decls[0].1.iter().product::<u64>())?;
+                let want_values = router_values + hidden;
+                let pass = rows.len() == 2
+                    && counted == (want_values * 4) as u64
+                    && joined.rows() == want_values / hidden
+                    && joined.cols() == hidden
+                    && values.len() == want_values
+                    && values[..router_values].iter().all(|&v| v == 0.125)
+                    && values[router_values..].iter().all(|&v| v == -0.25);
+                println!(
+                    "(d) mixed MTP router={:?} shared={:?} joined F32 bytes={counted} {}",
+                    types[0],
+                    types[1],
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            Ok(ok)
+        })();
+        let cleanup = std::fs::remove_file(&path);
+        let ok = result?;
+        cleanup?;
+        Ok(ok)
+    }
+
     /// (d) and (q), on the model as the load left it: no walk has run.
     fn draft_load(
         m: &Qwen38Model,
@@ -4544,6 +4644,7 @@ mod gate {
         let r2_ok = r2.contains("resident weights, store and row map hold");
         ok &= r2_ok;
         println!("(q) a plan of another row map: {r2} {}", verdict(r2_ok));
+        ok &= mixed_router_load(m, draft, mtp)?;
         Ok(ok)
     }
 

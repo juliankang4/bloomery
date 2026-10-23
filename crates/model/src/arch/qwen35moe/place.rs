@@ -2078,7 +2078,18 @@ impl MtpInputs {
                 layers: 1,
                 experts,
                 experts_used,
-                bf16_words: |_| true,
+                bf16_words: if file
+                    .iter()
+                    .filter(|t| {
+                        t.name.ends_with(".ffn_gate_inp.weight")
+                            || t.name.ends_with(".ffn_gate_inp_shexp.weight")
+                    })
+                    .all(|t| t.ty == GgmlType::BF16)
+                {
+                    |_| true
+                } else {
+                    |t| t.role != Role::Router && !t.name.ends_with(".ffn_gate_inp_shexp.weight")
+                },
             },
             machine: draft_machine(),
             kv,
@@ -2995,6 +3006,60 @@ mod tests {
                     .to_string()
                     .contains("attn_q.weight")
             );
+        }
+
+        #[test]
+        fn mtp_router_parts_use_one_resident_type() {
+            let mut mismatches = Vec::new();
+            for (router, shared, raw) in [
+                (GgmlType::BF16, GgmlType::BF16, true),
+                (GgmlType::BF16, GgmlType::F32, false),
+                (GgmlType::F32, GgmlType::BF16, false),
+                (GgmlType::F32, GgmlType::F32, false),
+            ] {
+                let mut stored = file();
+                let parts = [
+                    ("blk.48.ffn_gate_inp.weight", router),
+                    ("blk.48.ffn_gate_inp_shexp.weight", shared),
+                    ("blk.48.attn_q.weight", GgmlType::BF16),
+                ];
+                for (name, ty) in parts {
+                    let f = stored.iter_mut().find(|f| f.name == name).unwrap();
+                    f.ty = ty;
+                    f.nbytes = f.dims.iter().product::<u64>() * ty.type_size().unwrap();
+                }
+                let m = MtpInputs::from_parts(draft(HeadSet::Full), &stored).unwrap();
+                let plan = m.draft_plan(4096).unwrap().0;
+                assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+                for (name, ty) in parts {
+                    let row = plan
+                        .rows
+                        .iter()
+                        .find(|r| m.model.tensors[r.tensor].name == name)
+                        .unwrap();
+                    let t = &m.model.tensors[row.tensor];
+                    assert_eq!(t.ty, ty);
+                    let words = raw || name == "blk.48.attn_q.weight";
+                    let (format, bytes) = match (ty, words) {
+                        (GgmlType::BF16, true) => (CardFormat::Bf16Raw, 2),
+                        (GgmlType::BF16, false) => (CardFormat::Bf16AsF32, 4),
+                        _ => (CardFormat::F32, 4),
+                    };
+                    let want_bytes = t.dims.iter().product::<u64>() * bytes;
+                    assert_eq!(row.segments.len(), 1);
+                    let s = &row.segments[0];
+                    if s.device != Device::Card(0)
+                        || s.format != placement::Format::Card(format)
+                        || s.resident_bytes != want_bytes
+                    {
+                        mismatches.push(format!(
+                            "router={router:?} shared={shared:?} {name}: {s:?}, \
+                             want {format:?} {want_bytes} bytes on card 0"
+                        ));
+                    }
+                }
+            }
+            assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
         }
 
         fn list(n: usize) -> HeadSet {
