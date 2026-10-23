@@ -74,6 +74,7 @@ pub fn loaded_routed<'a>(
     };
     if let Some(owned) = owned {
         lower_routed(&mut plan, owned)?;
+        plan.reserve_beside(reserve)?;
     }
     Ok(plan)
 }

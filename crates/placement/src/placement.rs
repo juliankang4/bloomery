@@ -2467,14 +2467,7 @@ fn plan_rule<'a>(
         (n_l, tier_n_l),
         card_budget,
     )?;
-    // What the caller plans beside this plan on each card comes out of a
-    // unified pool too.
-    if machine.unified().is_some() {
-        let here = (0..machine.all_cards().count()).filter(|&c| machine.on_this_node(c));
-        let beside = reserve * here.count() as u64;
-        plan.host.pool_card_bytes += beside;
-        plan.host.headroom_bytes -= i128::from(beside);
-    }
+    plan.reserve_beside(reserve)?;
     Ok(plan)
 }
 
@@ -3854,6 +3847,26 @@ fn card_total(card: &Card, totals: &CardTotals, heap: &Heap) -> u64 {
 }
 
 impl Plan<'_> {
+    fn reserve_beside(&mut self, reserve: u64) -> Result<(), PlacementError> {
+        if self.machine.unified().is_some() {
+            let here = (0..self.machine.all_cards().count())
+                .filter(|&c| self.machine.on_this_node(c))
+                .count() as u64;
+            let past = || PlacementError::Metadata {
+                key: "unified pool reserve".into(),
+                detail: "the card share and bytes beside the plan pass u64".into(),
+            };
+            let beside = reserve.checked_mul(here).ok_or_else(past)?;
+            self.host.pool_card_bytes = self
+                .host
+                .pool_card_bytes
+                .checked_add(beside)
+                .ok_or_else(past)?;
+            self.host.headroom_bytes -= i128::from(beside);
+        }
+        Ok(())
+    }
+
     /// The room the plan's tiers use: [`workstation::plan_room`], capped by
     /// the machine's host room and its unified pool. The pool's reading already
     /// leaves out the cards' context self cost; [`workstation::HostNeed`] counts
@@ -6026,6 +6039,44 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pool_reserve_counts_local_cards_without_overflow() {
+        let model = layered(4);
+        for ranks in [1, 2, 4] {
+            let machine = Machine {
+                cards: (0..ranks)
+                    .map(|rank| Card {
+                        head: rank + 1 == ranks,
+                        token_embedding: rank == 0,
+                        ..bytes_card("pool", 1 << 30, rank * 4 / ranks..(rank + 1) * 4 / ranks)
+                    })
+                    .collect(),
+                tiers: Vec::new(),
+                nodes: vec![Node {
+                    host: host(),
+                    unified: Some(UnifiedPool { bytes: 1 << 40 }),
+                }],
+            };
+            let mut plan = plan_with(&model, &machine, 4096, &NoKv, None).unwrap();
+            let before = plan.host.pool_card_bytes;
+            let headroom = plan.host.headroom_bytes;
+            let n = ranks as u64;
+            let reserve = (u64::MAX - before) / n;
+            plan.reserve_beside(reserve)
+                .expect("the largest reserve fits u64");
+            assert_eq!(plan.host.pool_card_bytes, before + reserve * n);
+            assert_eq!(plan.host.headroom_bytes, headroom - i128::from(reserve * n));
+            let before = (plan.host.pool_card_bytes, plan.host.headroom_bytes);
+            for reserve in [1, u64::MAX] {
+                assert!(plan.reserve_beside(reserve).is_err());
+                assert_eq!(
+                    (plan.host.pool_card_bytes, plan.host.headroom_bytes),
+                    before
+                );
             }
         }
     }
