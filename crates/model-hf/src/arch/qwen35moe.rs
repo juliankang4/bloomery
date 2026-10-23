@@ -1402,8 +1402,30 @@ mod tests {
         serde_json::from_slice(&fixture(name)).unwrap()
     }
 
-    fn config() -> Json {
+    pub(super) fn config() -> Json {
         json("quant-configs/nvidia__Qwen3.8-Flash-Next-NVFP4__config.json.gz")
+    }
+
+    /// [`config`] over [`tokenizer`]'s vocabulary: eight ids, `</s>` (id 2) the BOS and EOS,
+    /// id 3 the image token.
+    pub(super) fn small_config() -> Json {
+        let mut c = config();
+        c["text_config"]["vocab_size"] = 8.into();
+        c["text_config"]["bos_token_id"] = 2.into();
+        c["text_config"]["eos_token_id"] = 2.into();
+        c["image_token_id"] = 3.into();
+        c
+    }
+
+    /// The byte-level BPE tokenizer [`small_config`] reads, its one special token `</s>` id 2.
+    pub(super) fn tokenizer() -> Json {
+        serde_json::json!({"normalizer":{"type":"NFC"},"pre_tokenizer":{"type":"Sequence","pretokenizers":[
+            {"type":"Split","pattern":{"Regex":r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"},"behavior":"Isolated","invert":false},
+            {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+            "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+            "post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+            "model":{"type":"BPE","vocab":{"A":0,"a":1,"Aa":7},"merges":[["A","a"]]},
+            "added_tokens":[{"id":2,"content":"</s>","special":true}]})
     }
 
     #[test]
@@ -1607,21 +1629,10 @@ mod tests {
     fn checkpoint_input_refusals() {
         use serde_json::json;
         let dir = crate::test_support::temp_dir("qwen-prepare-inputs");
-        let mut valid = config();
-        valid["text_config"]["vocab_size"] = json!(8);
-        valid["text_config"]["bos_token_id"] = json!(2);
-        valid["text_config"]["eos_token_id"] = json!(2);
-        valid["image_token_id"] = json!(3);
-        let tokenizer = json!({"normalizer":{"type":"NFC"},"pre_tokenizer":{"type":"Sequence","pretokenizers":[
-            {"type":"Split","pattern":{"Regex":r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"},"behavior":"Isolated","invert":false},
-            {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
-            "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
-            "post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
-            "model":{"type":"BPE","vocab":{"A":0,"a":1,"Aa":7},"merges":[["A","a"]]},
-            "added_tokens":[{"id":2,"content":"</s>","special":true}]});
+        let valid = small_config();
         let files = [
             ("config.json", valid.clone()),
-            ("tokenizer.json", tokenizer),
+            ("tokenizer.json", tokenizer()),
             ("tokenizer_config.json", json!({})),
             ("generation_config.json", json!({})),
             (

@@ -201,7 +201,9 @@ card and reads the PLE table from the folder on the NVMe tier, so a plan that pu
 `BLOOMERY_RESIDENCY` other than `off` are refused by name. The folder's MTP layer uses the same draft and verification
 path as a shared GGUF draft, under the same `BLOOMERY_DRAFT` rule (Speculative decoding, below): `mtp` selects it,
 `off` disables it, and unset selects it where the rule would select a GGUF draft. The draft borrows the target's
-embedding and vocabulary head; its experts and dense projections keep their stored formats.
+embedding and vocabulary head; its experts and dense projections keep their stored formats. A folder whose MTP layer
+the draft does not read still serves its target: `mtp` is refused with the layer's refusal, and unset turns the draft
+off with it.
 
 The nemotron seat serves Nemotron 3 Nano 4B (`--model nemotron -m PATH`), Nemotron 3.5 Bolt 74B-A9B and
 Nemotron-3.5-Lightning 30B-A3B, one sequence: `--parallel` above 1, a placement of more than one card or with a

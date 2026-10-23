@@ -124,10 +124,12 @@ pub struct Opened {
     /// The header `prepare` writes as its split's first shard, with every tensor of the split
     /// and none of their bytes, named by the folder's path.
     pub header: Split,
-    /// The MTP layer's header, borrowing the target's embedding and head.
-    pub draft: Option<Split>,
+    /// The MTP layer's header, borrowing the target's embedding and head ([`mtp`]): `None` for
+    /// a folder that holds no MTP layer, and the layer's refusal for one the draft does not
+    /// read, which refuses the draft alone.
+    pub draft: Result<Option<Split>, Error>,
     /// Every tensor of the header but the PLE table and the `.scale` tensors, whose scales each
-    /// part carries.
+    /// part carries, and the MTP layer's tensors when the draft reads them.
     pub source: part::Checkpoint,
     /// The PLE table's rows where the folder stores them, when the model has the table.
     pub ple: Option<StoredRows>,
@@ -137,8 +139,9 @@ pub struct Opened {
 
 /// The folder `dir` opened for a load, every part in its stored format (no Q8_0 rewrite): its
 /// header ([`Split::header_only`] of [`read`]'s keys and planned tensors), its card tensors as a
-/// part source, and its PLE table's rows ([`ple_rows`]). Any refusal of [`read`] or
-/// [`ple_rows`] is the folder's.
+/// part source, its PLE table's rows ([`ple_rows`]) and its MTP layer ([`mtp`]). Any refusal
+/// of [`read`] or [`ple_rows`] is the folder's; one of [`mtp`] is the draft's, held in
+/// [`Opened::draft`].
 pub fn open(dir: &Path) -> Result<Opened, Error> {
     let Read {
         checkpoint,
@@ -148,41 +151,14 @@ pub fn open(dir: &Path) -> Result<Opened, Error> {
         kvs,
         tokenizer,
     } = read(dir, false)?;
-    let logical = folder
-        .names()
-        .filter(|n| n.starts_with("mtp."))
-        .filter_map(|n| {
-            if let Some(p) = plan.placed.get(n) {
-                Some(
-                    folder
-                        .raw(n)
-                        .map(|r| (n.to_string(), p.format.logical(r.shape))),
-                )
-            } else if plan.refused.contains_key(n) {
-                Some(folder.raw(n).map(|r| (n.to_string(), r.shape.to_vec())))
-            } else {
-                None
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let draft_tensors = planned_tensors(
-        &plan,
-        super::map(
-            &checkpoint.geometry,
-            logical.iter().map(|(n, s)| (n.as_str(), s.as_slice())),
-            true,
-        )?,
-        false,
-    )?;
-    let draft = draft_header(
-        dir,
-        &kvs,
-        checkpoint.geometry.layers,
-        draft_tensors.iter().map(|p| p.decl.clone()).collect(),
-    )?;
     let layout = Layout::new(&kvs, planned.iter().map(|p| p.decl.clone()).collect())?;
     let header = Split::header_only(dir.to_path_buf(), &layout)?;
-    planned.extend(draft_tensors);
+    let draft = mtp(dir, &checkpoint, (&folder, &plan), &kvs).map(|drafted| {
+        drafted.map(|(draft, tensors)| {
+            planned.extend(tensors);
+            draft
+        })
+    });
     let mut made = BTreeMap::new();
     let mut ple = None;
     for Planned { decl, make } in planned {
@@ -219,6 +195,51 @@ pub fn open(dir: &Path) -> Result<Opened, Error> {
         ple,
         tokenizer,
     })
+}
+
+/// The MTP layer of the folder `dir` as the draft reads it, every tensor in its stored format:
+/// its header ([`draft_header`] over the target's keys `kvs`) and its planned tensors, `None`
+/// for a folder that holds no `mtp.` tensor. A layer the map or the planner refuses (a second
+/// MTP layer, an F32 projection, an unquantized expert stack) is refused by name.
+fn mtp(
+    dir: &Path,
+    checkpoint: &Checkpoint,
+    (folder, plan): (&Folder, &Plan),
+    kvs: &[(String, Value)],
+) -> Result<Option<(Split, Vec<Planned>)>, Error> {
+    let logical = folder
+        .names()
+        .filter(|n| n.starts_with("mtp."))
+        .filter_map(|n| {
+            if let Some(p) = plan.placed.get(n) {
+                Some(
+                    folder
+                        .raw(n)
+                        .map(|r| (n.to_string(), p.format.logical(r.shape))),
+                )
+            } else if plan.refused.contains_key(n) {
+                Some(folder.raw(n).map(|r| (n.to_string(), r.shape.to_vec())))
+            } else {
+                None
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tensors = planned_tensors(
+        plan,
+        super::map(
+            &checkpoint.geometry,
+            logical.iter().map(|(n, s)| (n.as_str(), s.as_slice())),
+            true,
+        )?,
+        false,
+    )?;
+    let header = draft_header(
+        dir,
+        kvs,
+        checkpoint.geometry.layers,
+        tensors.iter().map(|p| p.decl.clone()).collect(),
+    )?;
+    Ok(header.map(|h| (h, tensors)))
 }
 
 fn draft_header(
@@ -532,8 +553,100 @@ pub fn size_of(type_id: u32, dims: &[u64]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use hf::quant_config::plan;
+    use model::arch::qwen35moe::names;
 
     use super::*;
+
+    /// A folder whose target is whole opens whatever its MTP layer holds: an MTP layer the draft
+    /// reads is planned beside the target and its tensors join the part source; one it does not
+    /// read (F32 input projections) is the draft's refusal alone, held by name, with the target's
+    /// header and parts as before; a folder with no MTP layer has no draft. Mutant: the draft's
+    /// refusal propagated out of `open` (the target refused with it), or its tensors kept.
+    #[test]
+    fn a_target_opens_whatever_its_mtp_layer_holds() {
+        use super::super::tests::{small_config, tokenizer};
+        let mut config = small_config();
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("quantization_config");
+        let text = config["text_config"].as_object_mut().unwrap();
+        text.remove("quantization_config");
+        text.remove("ple_layer_ids");
+        let dir = crate::test_support::temp_dir("qwen-folder-mtp");
+        for (file, json) in [
+            ("config.json", config),
+            ("tokenizer.json", tokenizer()),
+            ("tokenizer_config.json", serde_json::json!({})),
+            ("generation_config.json", serde_json::json!({})),
+        ] {
+            std::fs::write(dir.join(file), json.to_string()).unwrap();
+        }
+        let table = vec![0u8; 8 * 2560 * 2];
+        let write = |mtp: Option<&str>| {
+            let projection = vec![0u8; 2 * 2 * if mtp == Some("F32") { 4 } else { 2 }];
+            let mut tensors: Vec<(&str, &str, &[usize], &[u8])> = vec![
+                (
+                    "model.language_model.embed_tokens.weight",
+                    "BF16",
+                    &[8, 2560],
+                    &table,
+                ),
+                ("lm_head.weight", "BF16", &[8, 2560], &table),
+            ];
+            if let Some(dtype) = mtp {
+                for name in ["mtp.fc_embedding.weight", "mtp.fc_hidden.weight"] {
+                    tensors.push((name, dtype, &[2, 2], &projection));
+                }
+            }
+            std::fs::write(dir.join("a.safetensors"), safetensors::write(&tensors)).unwrap();
+            let map: BTreeMap<&str, &str> =
+                tensors.iter().map(|t| (t.0, "a.safetensors")).collect();
+            std::fs::write(
+                dir.join(Folder::INDEX),
+                serde_json::json!({ "weight_map": map }).to_string(),
+            )
+            .unwrap();
+            open(&dir)
+        };
+        let target = [names::token_embd(), names::output()];
+        let held = |o: &Opened| {
+            let mut names: Vec<&str> = o.source.made().keys().map(String::as_str).collect();
+            names.sort_unstable();
+            names.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        };
+        let mut want = target.to_vec();
+        want.sort_unstable();
+        let eh_proj = "blk.48.nextn.eh_proj.weight".to_string();
+        let o = write(Some("BF16")).expect("a folder with a BF16 MTP layer");
+        let draft = o
+            .draft
+            .as_ref()
+            .expect("BF16 projections")
+            .as_ref()
+            .expect("a draft");
+        assert!(draft.find(&eh_proj).is_some());
+        let mut with_draft = want.clone();
+        with_draft.push(eh_proj.clone());
+        with_draft.sort_unstable();
+        assert_eq!(held(&o), with_draft);
+        let o = write(Some("F32")).expect("the target opens beside an F32 MTP layer");
+        let Err(why) = &o.draft else {
+            panic!("F32 projections: a draft");
+        };
+        let why = why.to_string();
+        assert!(why.contains("is stored F32"), "{why}");
+        assert!(why.contains("mtp.fc_embedding.weight"), "{why}");
+        assert_eq!(held(&o), want);
+        for name in &target {
+            assert!(o.header.find(name).is_some(), "{name}");
+        }
+        assert!(o.header.find(&eh_proj).is_none());
+        let o = write(None).expect("a folder with no MTP layer");
+        assert!(matches!(o.draft, Ok(None)));
+        assert_eq!(held(&o), want);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn mtp_header_keeps_the_signed_ratio_array_and_the_target_header() {

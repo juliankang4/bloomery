@@ -48,11 +48,12 @@ pub mod rounds;
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use bloomery_gpu::arch::qwen3moe::Prompt38;
+    use bloomery_gpu_gates::GateError;
     use bloomery_levers::Draft38Off;
 
     use super::qwen38::{
-        ACTS_ON, Feed38, draft_for_slots, draft_off_for, prompt_cuts, refuse_feed,
-        refuse_lookup_feed, refuse_media_feed,
+        ACTS_ON, Feed38, draft_for_slots, draft_off_for, folder_draft_for, prompt_cuts,
+        refuse_feed, refuse_lookup_feed, refuse_media_feed,
     };
 
     const STEPS: Feed38 = Feed38 {
@@ -192,19 +193,62 @@ mod tests {
         );
     }
 
-    /// A checkpoint folder without an MTP layer refuses a set `mtp`, and turns an unset
-    /// draft off naming the folder.
+    /// A checkpoint folder's own MTP layer drafts when the draft's reader takes it. A folder
+    /// without one, a layer its preparation refuses, and a prepared layer the reader refuses
+    /// each refuse a set `mtp` naming the refusal, turn an unset draft off with the refusal as
+    /// its reason (the target served), and keep a set `off` as set. Mutant: the reader's refusal
+    /// dropped (the prepared layer drafts) or propagated (the load refused).
     #[test]
     fn a_folder_load_refuses_a_set_mtp_draft_and_turns_an_unset_one_off() {
-        let why = draft_off_for(Draft38Off::Folder, Some("mtp"), (true, None))
-            .expect_err("BLOOMERY_DRAFT=mtp without a folder MTP layer")
-            .to_string();
-        assert!(
-            why.contains("BLOOMERY_DRAFT=mtp with a checkpoint folder"),
-            "{why}"
+        let layout = gguf::write::Layout::new(&[], Vec::new()).unwrap();
+        let header = || gguf::Split::header_only("mtp".into(), &layout).unwrap();
+        let ask = |layer: &Result<Option<gguf::Split>, String>,
+                   reader: Result<(), &str>,
+                   word: Option<&str>,
+                   run: (bool, Option<Draft38Off>)| {
+            folder_draft_for(layer, |_| reader.map_err(GateError::from), word, run)
+        };
+        let (f32, missing) = (
+            "mtp.fc_embedding.weight is stored F32",
+            "blk.48.attn_q.weight is not in the draft file",
         );
-        let off = draft_off_for(Draft38Off::Folder, None, (true, None)).unwrap();
-        assert_eq!(off, (false, Some(Draft38Off::Folder)));
+        for (layer, reader, why) in [
+            (Ok(None), Ok(()), Draft38Off::Folder),
+            (
+                Err(f32.to_string()),
+                Ok(()),
+                Draft38Off::FolderMtp { why: f32.into() },
+            ),
+            (
+                Ok(Some(header())),
+                Err(missing),
+                Draft38Off::FolderMtp {
+                    why: missing.into(),
+                },
+            ),
+        ] {
+            let e = ask(&layer, reader, Some("mtp"), (true, None))
+                .expect_err("BLOOMERY_DRAFT=mtp without a folder MTP layer the draft reads")
+                .to_string();
+            assert!(
+                e.contains("BLOOMERY_DRAFT=mtp with a checkpoint folder"),
+                "{e}"
+            );
+            if let Draft38Off::FolderMtp { why } = &why {
+                assert!(e.contains(why.as_str()), "{e}");
+            }
+            let off = ask(&layer, reader, None, (true, None)).unwrap();
+            assert_eq!(off, (false, Some(why)));
+            let set = ask(&layer, reader, Some("off"), (false, Some(Draft38Off::Set))).unwrap();
+            assert_eq!(set, (false, Some(Draft38Off::Set)));
+        }
+        let layer = Ok(Some(header()));
+        for word in [None, Some("mtp")] {
+            assert_eq!(
+                ask(&layer, Ok(()), word, (true, None)).unwrap(),
+                (true, None)
+            );
+        }
     }
 
     /// An unset draft, from a GGUF draft file or a checkpoint folder's MTP layer alike, drafts

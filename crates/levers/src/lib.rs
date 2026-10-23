@@ -2064,6 +2064,9 @@ pub enum Draft38Off {
     /// Unset on the Qwen3.8 seat serving a checkpoint folder without an MTP layer;
     /// a set [`DRAFT`]`=mtp` is refused.
     Folder,
+    /// Unset on the Qwen3.8 seat serving a checkpoint folder whose MTP layer the draft
+    /// does not read, `why` the layer's refusal; a set [`DRAFT`]`=mtp` is refused with it.
+    FolderMtp { why: String },
     /// Unset on the Qwen3.8 seat with `slots` resident sequences, more than
     /// one, whatever the draft's source (a GGUF draft file or a checkpoint
     /// folder's MTP layer): a drafted load runs a round of sampled or
@@ -2116,6 +2119,10 @@ impl fmt::Display for Draft38Off {
                  MTP draft's walks do not read",
             ),
             Draft38Off::Folder => f.write_str("unset: the checkpoint folder holds no MTP layer"),
+            Draft38Off::FolderMtp { why } => write!(
+                f,
+                "unset: the checkpoint folder's MTP layer is not one the draft reads: {why}"
+            ),
             Draft38Off::Slots { slots } => write!(
                 f,
                 "unset: --parallel {slots}; a drafted load also walks each slot's draft over every \
