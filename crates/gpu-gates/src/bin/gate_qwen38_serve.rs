@@ -173,6 +173,20 @@
 //!   young window beside the first's decoding one, a window with no
 //!   proposal riding a pass only while its draft skips (`pass_slots`' own
 //!   case).
+//!   Then the drafted sampled clauses ([`slots_drafted_sampled`]): the
+//!   sampled rounds clauses' pair (below) banning the end ids
+//!   (`ignore_eos`), so each request steps on this drafted load too: over
+//!   the together run every record is `cmd=step` of `passes=1` carrying
+//!   both slots (`slots_drafted_sampled_rounds_run_one_pass`: the seat runs
+//!   a drafted load's round of plain steps as one pass of its rows) and
+//!   each request's together ids are its alone ones
+//!   (`slots_drafted_sampled_together_alone`); then the pair with no ban,
+//!   the second asking 8 ids: the first steps beside it and then drafts
+//!   alone from the state its rows of the pass told its draft, its draft
+//!   proposals an id past the second's at least half its alone run's
+//!   (`slots_drafted_sampled_tail_drafts`) and some accepted
+//!   (`slots_drafted_sampled_tail_accepts`, deferred by name in the
+//!   fixture tier, whose target accepts no proposal).
 //!   Then one more server of `--parallel 2` under the seat's own defaults
 //!   but the draft (no `--place`, no `BLOOMERY_RESIDENCY`, no
 //!   `BLOOMERY_MTP_WIDTH`, and `BLOOMERY_DRAFT=mtp`, as the unset draft is
@@ -230,7 +244,12 @@
 //!   sequence left) turns the off clause red; a pass laid in the rows'
 //!   arrival order is refused by name in the order that puts slot 1's row
 //!   first and the server dies, red on that late line and every line after
-//!   it. Of the seat's own defaults: a seat that opens with
+//!   it; a drafted load's plain rounds a slot at a time (its open's
+//!   `step_pass` false under the draft) print `passes=2`, red on the
+//!   drafted sampled round clause alone; a row of the pass its draft is not
+//!   told of leaves no refresh, and the tail's first proposal is refused by
+//!   name, red on the tail clause. Of the seat's own defaults: a seat that
+//!   opens with
 //!   `Body38::open_placed` runs no residency machine whatever the rule — no
 //!   `residency host` record and no `residency pass`, and the reset is the
 //!   server's 501; a draft run with no chooser prints no `mtp width` record.
@@ -615,6 +634,9 @@ mod gate {
     const DRAFTED_LATE_ROUNDS: u64 = 4;
     const DRAFTED_LATE_POLL: Duration = Duration::from_millis(50);
     const DRAFTED_LATE_POLLS: usize = 600;
+    /// The drafted sampled tail clause's short request: the long one steps
+    /// beside it this many rounds, then drafts alone.
+    const DRAFTED_SAMPLED_SHORT: usize = 8;
     /// The one chat turn the chat clauses send.
     const CHAT: &str = "What is the capital of France? Answer in one word.";
     /// The chat's reply length.
@@ -1944,45 +1966,74 @@ mod gate {
     }
 
     /// `/completion` of `ids` sampled at [`SAMPLED_TEMPERATURE`] with
-    /// [`SAMPLED_SEED`], streamed ([`streamed_with`]): a request that never
-    /// drafts (any sampling steps), its ids a function of its logits rows
-    /// and the seed alone (the server seeds each request's sampler from its
-    /// own `seed`).
+    /// [`SAMPLED_SEED`], streamed ([`streamed_with`]), banning the end ids
+    /// when `ignore_eos`: its ids a function of its logits rows and the seed
+    /// alone (the server seeds each request's sampler from its own `seed`).
+    /// It steps on a load that drafts nothing; on a drafted load it drafts
+    /// while its slot runs alone in the round, unless it bans an id.
     fn sampled_stream(
         addr: &str,
         ids: &[u32],
         n: usize,
+        ignore_eos: bool,
     ) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
         streamed_with(
             addr,
             json!({
                 "prompt": ids, "n_predict": n, "temperature": SAMPLED_TEMPERATURE,
-                "seed": SAMPLED_SEED, "return_tokens": true, "cache_prompt": false, "stream": true,
+                "seed": SAMPLED_SEED, "ignore_eos": ignore_eos, "return_tokens": true,
+                "cache_prompt": false, "stream": true,
             }),
         )
     }
 
     /// One sampled streamed request ([`sampled_stream`]) run to its end on
-    /// its own thread ([`run_streamed`]'s shape).
+    /// its own thread ([`answers`]).
     fn run_sampled(
         addr: &str,
         ids: &[u32],
         n: usize,
+        ignore_eos: bool,
         what: &str,
     ) -> Result<Option<Streamed>, GateError> {
-        let (h, rx) = sampled_stream(addr, ids, n)?;
-        h.join()
-            .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
-        let ran = rx
-            .recv()
-            .map_err(|_| format!("slots: the {what} request's thread gave no answer"))?;
-        match ran {
-            Ok(s) => Ok(Some(s)),
-            Err(e) => {
-                println!("slots: the {what} request failed: {e}");
-                Ok(None)
+        let run = sampled_stream(addr, ids, n, ignore_eos)?;
+        Ok(answers("slots", vec![(run, what)])?.remove(0))
+    }
+
+    /// The answers of streamed requests already posted, in order, each
+    /// thread joined: `None` a request that failed (a red check, not the
+    /// clause's end), named in a line under `clause`.
+    fn answers(
+        clause: &str,
+        runs: Vec<((JoinHandle<()>, StreamedRx), &str)>,
+    ) -> Result<Vec<Option<Streamed>>, GateError> {
+        let mut out = Vec::new();
+        for ((h, rx), what) in runs {
+            h.join()
+                .map_err(|_| format!("{clause}: the {what} request's thread panicked"))?;
+            let ran = rx
+                .recv()
+                .map_err(|_| format!("{clause}: the {what} request's thread gave no answer"))?;
+            match ran {
+                Ok(s) => out.push(Some(s)),
+                Err(e) => {
+                    println!("{clause}: the {what} request failed: {e}");
+                    out.push(None);
+                }
             }
         }
+        Ok(out)
+    }
+
+    /// Whether every request of `together` answered ids, each the ids of the
+    /// same request in `alone`.
+    fn ids_as_alone(alone: &[Option<Streamed>], together: &[Option<Streamed>]) -> bool {
+        alone.len() == together.len()
+            && alone.iter().zip(together).all(|(a, t)| {
+                a.as_ref()
+                    .zip(t.as_ref())
+                    .is_some_and(|(a, t)| !t.tokens.is_empty() && a.tokens == t.tokens)
+            })
     }
 
     /// The busy slots the server has booked over its `decodes` engine calls:
@@ -2094,6 +2145,9 @@ mod gate {
                     "slots_drafted_off_slot_steps_beside_a_window",
                     "slots_drafted_late_request_together_alone",
                     "slots_drafted_late_request_other_order_together_alone",
+                    "slots_drafted_sampled_rounds_run_one_pass",
+                    "slots_drafted_sampled_together_alone",
+                    "slots_drafted_sampled_tail_drafts",
                 ] {
                     check(&mut ok, name, false);
                 }
@@ -2254,6 +2308,7 @@ mod gate {
             Some("pass"),
         )?;
         ok &= slots_drafted_beside(&url, &addr, &err_log, [&a_ids, &b_ids], &alone)?;
+        ok &= slots_drafted_sampled(&addr, &err_log, [&a_ids, &b_ids])?;
         println!("slots server stopped: {}", served.stop()?);
         slots_default_residency(dir, &mut ok)
     }
@@ -2934,6 +2989,126 @@ mod gate {
         Ok(ok)
     }
 
+    /// A sampled pair's rounds (the sampled rounds clauses, the module
+    /// header) on a `--parallel 2` server that prints its `slots round`
+    /// records: the sampled streamed requests of `ids`, banning the end ids
+    /// when `ignore_eos`, each run alone and then both together. Over the
+    /// together run every record is one `step` pass of both slots
+    /// (`<name>_rounds_run_one_pass`), and each request's together ids are
+    /// its alone ones (`<name>_together_alone`): each row of the pass and its
+    /// logits bit for bit its step alone, each answer and logits row its own
+    /// request's. The alone runs print no record (a round of one active
+    /// request is a select and a call).
+    fn sampled_pair(
+        name: &str,
+        addr: &str,
+        err_log: &Path,
+        ids: [&[u32]; 2],
+        ignore_eos: bool,
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        let alone = vec![
+            run_sampled(addr, ids[0], SLOTS_PREDICT, ignore_eos, "alone A")?,
+            run_sampled(addr, ids[1], SLOTS_PREDICT, ignore_eos, "alone B")?,
+        ];
+        let before = seat_log(err_log)?.all(&record::SLOTS_ROUND)?.len();
+        let runs = vec![
+            (
+                sampled_stream(addr, ids[0], SLOTS_PREDICT, ignore_eos)?,
+                "together A",
+            ),
+            (
+                sampled_stream(addr, ids[1], SLOTS_PREDICT, ignore_eos)?,
+                "together B",
+            ),
+        ];
+        let together = answers(name, runs)?;
+        println!(
+            "{name}: alone {:?} ids, together {:?} ids",
+            alone
+                .iter()
+                .map(|s| s.as_ref().map(|s| s.tokens.len()))
+                .collect::<Vec<_>>(),
+            together
+                .iter()
+                .map(|s| s.as_ref().map(|s| s.tokens.len()))
+                .collect::<Vec<_>>(),
+        );
+        rounds_carry_both_in_one_pass(
+            &mut ok,
+            &format!("{name}_rounds_run_one_pass"),
+            err_log,
+            before,
+            Some("step"),
+        )?;
+        check(
+            &mut ok,
+            &format!("{name}_together_alone"),
+            ids_as_alone(&alone, &together),
+        );
+        Ok(ok)
+    }
+
+    /// The drafted sampled clauses (the module header) on the slots clause's
+    /// server, after [`slots_drafted_beside`]: the sampled pair of `ids`
+    /// banning the end ids, which steps on this drafted load too
+    /// ([`sampled_pair`], `slots_drafted_sampled_*`); then the pair with no
+    /// ban, `ids[1]` asking [`DRAFTED_SAMPLED_SHORT`] ids, so `ids[0]` steps
+    /// beside it and then drafts alone from the state its rows in the pass
+    /// told its draft: its proposals an id past the short request's are at
+    /// least half its alone run's an id
+    /// (`slots_drafted_sampled_tail_drafts`; a draft its rows were not told
+    /// to has no refresh to propose from, refused by name), and some are
+    /// accepted
+    /// (`slots_drafted_sampled_tail_accepts`, which the fixture tier defers).
+    fn slots_drafted_sampled(
+        addr: &str,
+        err_log: &Path,
+        ids: [&[u32]; 2],
+    ) -> Result<bool, GateError> {
+        let mut ok = sampled_pair("slots_drafted_sampled", addr, err_log, ids, true)?;
+        let alone = run_sampled(addr, ids[0], SLOTS_PREDICT, false, "alone long")?;
+        let runs = vec![
+            (
+                sampled_stream(addr, ids[0], SLOTS_PREDICT, false)?,
+                "tail long",
+            ),
+            (
+                sampled_stream(addr, ids[1], DRAFTED_SAMPLED_SHORT, false)?,
+                "tail short",
+            ),
+        ];
+        let tail = answers("slots-drafted-sampled", runs)?.remove(0);
+        // Proposals an id the request could draft: every id alone, the ids
+        // past the short request's on the tail.
+        let per_id = |s: &Streamed, from: usize| {
+            (s.tokens.len() > from).then(|| s.drafts.0 as f64 / (s.tokens.len() - from) as f64)
+        };
+        let (a, t) = (
+            alone.as_ref().and_then(|s| per_id(s, 0)),
+            tail.as_ref().and_then(|s| per_id(s, DRAFTED_SAMPLED_SHORT)),
+        );
+        println!(
+            "slots-drafted-sampled: alone {:?} (ids, drafted, accepted), beside the short one \
+             {:?}; proposals an id {a:?} and {t:?}",
+            alone.as_ref().map(|s| (s.tokens.len(), s.drafts)),
+            tail.as_ref().map(|s| (s.tokens.len(), s.drafts)),
+        );
+        check(
+            &mut ok,
+            "slots_drafted_sampled_tail_drafts",
+            a.zip(t).is_some_and(|(a, t)| a > 0.0 && 2.0 * t >= a),
+        );
+        if tier::run_clause("slots_drafted_sampled_tail_accepts", Tag::FileBound)? {
+            check(
+                &mut ok,
+                "slots_drafted_sampled_tail_accepts",
+                tail.is_some_and(|s| s.drafts.1 > 0),
+            );
+        }
+        Ok(ok)
+    }
+
     /// The late pair of the drafted rounds clauses: `ids[0]` posted, and
     /// once `/metrics`' `n_decode_total` has moved [`DRAFTED_LATE_ROUNDS`]
     /// rounds (polled at [`DRAFTED_LATE_POLL`], at most
@@ -3252,19 +3427,12 @@ mod gate {
 
     /// The sampled rounds clauses (the module header) on one server of
     /// `--parallel 2` under `BLOOMERY_DRAFT=off`, `BLOOMERY_RESIDENCY=off`
-    /// and `BLOOMERY_STEP_STATS=1`, into its own directory: two sampled
-    /// streamed requests of the slots clause's prompts — temperature
-    /// [`SAMPLED_TEMPERATURE`], [`SAMPLED_SEED`] each, so a request's ids
-    /// are a function of its logits rows alone (the server seeds each
-    /// request's sampler from its own `seed`) — each first run alone on
-    /// that server and then both together, the together run's `slots
-    /// round` records read back — every one `cmd=step` of `passes=1`
-    /// carrying both slots (`rows=2`, `slots=2`), and each request's
-    /// together ids its alone run's: the seat runs a round of plain steps
-    /// as one pass of its rows, each row's answer and lent logits row its
-    /// own. The alone runs are on this server, the load the together run
-    /// runs (the plan of 2 sequences); a `--parallel 1` load's ids are no
-    /// reference (the placement differs).
+    /// and `BLOOMERY_STEP_STATS=1`, into its own directory: the sampled
+    /// pair of the slots clause's prompts ([`sampled_pair`]), every round of
+    /// its together run one `step` pass of both slots and each request's
+    /// together ids its alone run's. The alone runs are on this server, the
+    /// load the together run runs (the plan of 2 sequences); a
+    /// `--parallel 1` load's ids are no reference (the placement differs).
     fn slots_sampled_rounds(dir: &Path) -> Result<bool, GateError> {
         let mut ok = true;
         let d = dir.join("slots-sampled");
@@ -3307,66 +3475,7 @@ mod gate {
             rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?,
             rendered(&url, json!([{ "role": "user", "content": SLOTS_B }]))?,
         );
-        let mut alone = Vec::new();
-        for (ids, what) in [(&a_ids, "alone A"), (&b_ids, "alone B")] {
-            alone.push(run_sampled(&addr, ids, SLOTS_PREDICT, what)?);
-        }
-        // The alone runs print no record (a round of one active request is a
-        // select and a step); taken anyway, so the together run's records are
-        // exactly the ones after this point.
-        let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
-        let first = sampled_stream(&addr, &a_ids, SLOTS_PREDICT)?;
-        let second = sampled_stream(&addr, &b_ids, SLOTS_PREDICT)?;
-        let mut together = Vec::new();
-        for ((h, rx), what) in [(first, "together A"), (second, "together B")] {
-            h.join()
-                .map_err(|_| format!("slots-sampled: the {what} request's thread panicked"))?;
-            let ran = rx.recv().map_err(|_| {
-                format!("slots-sampled: the {what} request's thread gave no answer")
-            })?;
-            match ran {
-                Ok(s) => together.push(Some(s)),
-                Err(e) => {
-                    println!("slots-sampled: the {what} request failed: {e}");
-                    together.push(None);
-                }
-            }
-        }
-        let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
-        let window = &rounds[before.min(rounds.len())..];
-        let every = !window.is_empty()
-            && window.iter().all(|r| {
-                r.word("cmd") == Ok("step")
-                    && r.u64("passes") == Ok(1)
-                    && r.u64("rows") == Ok(2)
-                    && r.u64("slots") == Ok(2)
-            });
-        println!(
-            "slots-sampled: {} record(s) in the together window, {} of them one pass of 2 rows \
-             (alone {} and {} ids, together {} and {} ids)",
-            window.len(),
-            window
-                .iter()
-                .filter(|r| r.word("cmd") == Ok("step") && r.u64("passes") == Ok(1))
-                .count(),
-            alone[0].as_ref().map_or(0, |s| s.tokens.len()),
-            alone[1].as_ref().map_or(0, |s| s.tokens.len()),
-            together[0].as_ref().map_or(0, |s| s.tokens.len()),
-            together[1].as_ref().map_or(0, |s| s.tokens.len()),
-        );
-        check(&mut ok, "slots_sampled_rounds_run_one_pass", every);
-        check(
-            &mut ok,
-            "slots_sampled_together_alone",
-            together[0].as_ref().is_some_and(|t| !t.tokens.is_empty())
-                && together[1].as_ref().is_some_and(|t| !t.tokens.is_empty())
-                && alone[0]
-                    .as_ref()
-                    .is_some_and(|a| a.tokens == together[0].as_ref().unwrap().tokens)
-                && alone[1]
-                    .as_ref()
-                    .is_some_and(|a| a.tokens == together[1].as_ref().unwrap().tokens),
-        );
+        ok &= sampled_pair("slots_sampled", &addr, &err_log, [&a_ids, &b_ids], false)?;
         println!("slots-sampled server stopped: {}", served.stop()?);
         Ok(ok)
     }

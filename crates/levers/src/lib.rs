@@ -2066,9 +2066,10 @@ pub enum Draft38Off {
     Folder,
     /// Unset on the Qwen3.8 seat with `slots` resident sequences, more than
     /// one, whatever the draft's source (a GGUF draft file or a checkpoint
-    /// folder's MTP layer): a drafted load steps a round of sampled or
-    /// id-banning requests a slot at a time, where a plain load runs it as
-    /// one pass; a set [`DRAFT`]`=mtp` runs.
+    /// folder's MTP layer): a drafted load runs a round of sampled or
+    /// id-banning requests as one pass, as a plain load does, and also walks
+    /// each slot's draft over its row, one slot after another; a set
+    /// [`DRAFT`]`=mtp` runs.
     Slots { slots: usize },
 }
 
@@ -2117,8 +2118,8 @@ impl fmt::Display for Draft38Off {
             Draft38Off::Folder => f.write_str("unset: the checkpoint folder holds no MTP layer"),
             Draft38Off::Slots { slots } => write!(
                 f,
-                "unset: --parallel {slots}; a drafted load steps a round of sampled or \
-                 id-banning requests a slot at a time; set {DRAFT}=mtp to draft on {slots} slots"
+                "unset: --parallel {slots}; a drafted load also walks each slot's draft over every \
+                 row of a sampled or id-banning request; set {DRAFT}=mtp to draft on {slots} slots"
             ),
         }
     }

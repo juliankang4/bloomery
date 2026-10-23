@@ -34,9 +34,9 @@ mod qwen38_folder;
 mod drafted;
 
 // The seats' one owner of a round run as passes, a sibling of the seat as
-// in `bloomery-serve`: this seat's drafted rounds and — on a load that
-// drafts nothing — its plain rounds run through it (`step_round`); the
-// qwen3 seat's the plain ones on every load.
+// in `bloomery-serve`: this seat's drafted rounds run through it
+// (`step_round`), and so do its plain rounds on a load that drafts nothing
+// or drafts with the MTP draft; the qwen3 seat's plain ones on every load.
 #[cfg(feature = "gpu")]
 #[path = "shared/serve_seats/rounds.rs"]
 pub mod rounds;

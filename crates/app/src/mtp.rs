@@ -549,6 +549,17 @@ impl<B: MtpBody> MtpDraft<B> {
         };
         Ok(self.policy.before_step(&mut card, pos, last)?)
     }
+
+    /// A plain row of `last` that a pass of several slots ran at the target's
+    /// position `p0`, `next` the id taken after it, its rows waiting walked
+    /// before the pass ([`MtpDraft::before_step`]): `next` at `p0 + 1`, with
+    /// the hidden row the pass's row wrote ([`MtpBody::VERIFY_ARENA`]), as
+    /// the next refresh, the refresh [`Draft::stepped`] records after a step
+    /// of its own arena. A window of depth zero in [`pass_slots`] and a
+    /// seat's round of plain steps run as one pass both end here.
+    pub fn passed_plain(&mut self, p0: u32, last: u32, next: u32) -> Result<(), SessionError> {
+        Ok(self.policy.record(p0, &[last], &[next], 1)?)
+    }
 }
 
 /// The proposal depth a caller gives each slot's window of a pass of two
@@ -647,7 +658,7 @@ where
         })?;
         let k = accepted_rows(r, got);
         if w.depth == 0 {
-            w.draft.policy.record(p0, r, got, k)?;
+            w.draft.passed_plain(p0, w.last, got[0])?;
         } else if r.len() > 1 {
             w.draft.record(p0, r, got, k)?;
         }

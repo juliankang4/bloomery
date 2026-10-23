@@ -1,7 +1,8 @@
 //! The serve seats' one owner of a round run as passes: a seat whose body
 //! has [`SlotRows`] and decided at its open to run one pass overrides
 //! [`Seat::step_slots`] through [`step_round`] with [`step_rows_one_pass`]
-//! and its drafted twin [`Seat::pass_slots`] through [`pass_round`] with
+//! ([`step_rows_drafted`] on a load that drafts with the MTP draft) and its
+//! drafted twin [`Seat::pass_slots`] through [`pass_round`] with
 //! [`pass_rows_one_pass`]; any other seat keeps the defaults,
 //! [`bind::step_rows_in_turn`] and [`bind::pass_rows_in_turn`].
 //!
@@ -13,7 +14,7 @@ use bloomery_gpu::model::SlotRows;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{Seat, SlotPassRow, SlotStep, pass_rows_in_turn, step_rows_in_turn};
 use bloomery_gpu_gates::record;
-use runtime::{Widths, Window};
+use runtime::{Target, Widths, Window};
 use serve::Drafted;
 
 use super::drafted::SlotDrafts;
@@ -159,6 +160,42 @@ where
         }
     }
     Ok(out.passes)
+}
+
+/// One round of several slots' plain steps on a load that drafts with the
+/// MTP draft as passes of `GpuModel::step_slots` ([`step_rows_one_pass`]),
+/// each slot's draft told of its row as a step alone tells it: before the
+/// pass, on each row's slot, [`SlotDrafts::before_row`] (the rows its draft
+/// left waiting walked, the pass overwriting the arena they read); after
+/// it [`SlotDrafts::after_row`] with the position the row ran from and its
+/// answer (the next refresh the row's, its hidden row in the pass's arena).
+/// A slot whose draft is off rides the pass as a plain row its draft is
+/// told nothing of, as its step alone. A row's answer and lent logits row
+/// are the pass's, bit for bit its step alone, so a sampling or
+/// id-banning request's ids are its alone ids. Returns the passes it ran;
+/// refused as [`step_rows_one_pass`] refuses, and as the table refuses a
+/// slot past it.
+pub(crate) fn step_rows_drafted<B, const M: usize>(
+    s: &mut app::Session<B>,
+    rows: &mut [SlotStep],
+    drafts: &mut SlotDrafts<B, M>,
+) -> Result<usize, GateError>
+where
+    B: MtpBody + SlotRows,
+    B::Seq: 'static,
+    Window<M>: Widths,
+{
+    let mut p0 = Vec::with_capacity(rows.len());
+    for r in rows.iter() {
+        s.select_slot(r.slot)?;
+        p0.push(s.pos());
+        drafts.before_row(s, r.slot, r.last)?;
+    }
+    let passes = step_rows_one_pass(s, rows)?;
+    for (r, &p) in rows.iter().zip(&p0) {
+        drafts.after_row(r.slot, p, r.last, r.next)?;
+    }
+    Ok(passes)
 }
 
 /// One round of several slots' drafted passes as passes of

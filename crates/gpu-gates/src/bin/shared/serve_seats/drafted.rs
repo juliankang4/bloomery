@@ -683,8 +683,9 @@ where
         self.step_reading(s, slot, last, Some(row))
     }
 
-    /// The step's order, the one owner of it: the draft's waiting rows, the
-    /// target's step, the target's row when asked, then the draft told.
+    /// The step's order, the one owner of it: the draft's waiting rows
+    /// ([`SlotDrafts::before_row`]), the target's step, the target's row when
+    /// asked, then the draft told.
     fn step_reading(
         &mut self,
         s: &mut Session<B>,
@@ -692,15 +693,8 @@ where
         last: u32,
         row: Option<&mut [f32]>,
     ) -> Result<u32, GateError> {
-        if matches!(self.off.get(slot), Some(Some((_, false)))) {
-            self.print_off(s, slot);
-        }
+        self.before_row(s, slot, last)?;
         let drafting = !self.is_off(slot);
-        if let Some(spec) = self.spec_mut(slot)?.filter(|_| drafting) {
-            print_widths(spec);
-            spec.draft_mut().draft_mut().before_step(s, last)?;
-            print_join(spec);
-        }
         let next = s.step(last, Want::Argmax)?.argmax();
         if let Some(row) = row {
             s.model()
@@ -714,6 +708,53 @@ where
             Draft::stepped(spec.draft_mut(), s, last, next)?;
         }
         Ok(next)
+    }
+
+    /// What a plain row of `last` on `slot`, the session's selected one, does
+    /// to the slot's draft before the target runs it, a step's or a row of a
+    /// pass of several slots' ([`SlotDrafts::after_row`]): an off draft's
+    /// record, once; under the draft the chooser's passes closed out, the
+    /// rows the draft left waiting walked with `last` their last
+    /// ([`MtpDraft::before_step`]: the target's call overwrites the arena
+    /// they read) and the join record. Refused as [`SlotDrafts::has`].
+    pub(crate) fn before_row(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        last: u32,
+    ) -> Result<(), GateError> {
+        if matches!(self.off.get(slot), Some(Some((_, false)))) {
+            self.print_off(s, slot);
+        }
+        let drafting = !self.is_off(slot);
+        if let Some(spec) = self.spec_mut(slot)?.filter(|_| drafting) {
+            print_widths(spec);
+            spec.draft_mut().draft_mut().before_step(s, last)?;
+            print_join(spec);
+        }
+        Ok(())
+    }
+
+    /// `slot`'s plain row of `last`, run from the position `p0` in a pass of
+    /// several slots ([`super::rounds::step_rows_drafted`]) after
+    /// [`SlotDrafts::before_row`], took `next`: under the draft the row told
+    /// to it as a step is ([`MtpDraft::passed_plain`]: its hidden row the
+    /// pass's), the chooser's pass in flight and batch acceptance dropped as
+    /// for every call of the caller's own (`Choosing::prompt_by`); nothing
+    /// while the draft is off. Refused as [`SlotDrafts::has`].
+    pub(crate) fn after_row(
+        &mut self,
+        slot: usize,
+        p0: u32,
+        last: u32,
+        next: u32,
+    ) -> Result<(), GateError> {
+        let drafting = !self.is_off(slot);
+        if let Some(spec) = self.spec_mut(slot)?.filter(|_| drafting) {
+            spec.draft_mut()
+                .prompt_by(|d| d.passed_plain(p0, last, next))?;
+        }
+        Ok(())
     }
 
     /// One greedy pass on `slot`, the session's selected one, from `last`

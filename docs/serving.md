@@ -307,8 +307,9 @@ Unset, the MTP draft yields to the context: it goes off when the plan with it wo
 than the plan without it, a set `--ctx-size`/`--ctx` included, a `draft yield` record naming its
 card bytes and the positions a slot gets either way, and the context line that follows is the plain plan's.
 `BLOOMERY_DRAFT=mtp` keeps it on whatever the context. On Qwen3.8 an unset MTP draft also stays off under
-`--parallel` above 1, from a GGUF draft file and a checkpoint folder alike, because a drafted server steps a round of
-sampled or id-banning requests one slot at a time; `BLOOMERY_DRAFT=mtp` drafts on any slot count. The
+`--parallel` above 1, from a GGUF draft file and a checkpoint folder alike: a drafted server runs a round of sampled or
+id-banning requests as one pass, as a plain server does, but also walks each slot's draft over its row, one slot
+after another. `BLOOMERY_DRAFT=mtp` drafts on any slot count. The
 drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
 (the default, temperature 0.8 as in llama-server) while one request runs: each kept id is the request's own
 sampler's draw from its verified row, as llama.cpp's speculative decoding takes it. A sampled request beside

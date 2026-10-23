@@ -502,8 +502,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               5: the server takes a window only while its rows fit), and when the target's \
               `token_embd` or `output` is not Q8_0, the format the draft reads them in (a set \
               `mtp` is refused there by name before the load), and under `--parallel` above 1, \
-              where a drafted server steps a round of sampled or id-banning requests a slot at a \
-              time (a set `mtp` drafts there), with the same record; it \
+              where a drafted server also walks each slot's draft over every row of a sampled or \
+              id-banning request (a set `mtp` drafts there), with the same record; it \
               has no `--logits` (a request that reads the logits row steps plainly) and takes \
               no route trace. The GLM seat of `bloomery-serve` takes `mtp` and `off`; unset \
               (`bloomery_levers::glm_unset`, a `draft unset` record before the plan) it drafts \

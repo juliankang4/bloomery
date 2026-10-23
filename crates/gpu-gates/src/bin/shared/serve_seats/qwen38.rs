@@ -116,10 +116,12 @@
 //! as one pass of their windows (`app::mtp::pass_slots`, every slot's rows
 //! verified together, the round cut into passes at the body's
 //! `SlotRows::MAX_ROWS`), and its round of plain steps (a sampling or
-//! id-banning request's) a select and a step a row, each step told to its
-//! slot's draft; on a load that drafts nothing every request steps, and the
-//! round of the busy slots' steps runs as one pass of their rows
-//! (`GpuModel::step_slots`, each row bit for bit its step alone). The
+//! id-banning request's) as one pass of their rows, each row told to its
+//! slot's draft as its step alone would be (`rounds::step_rows_drafted`);
+//! on a load that drafts nothing every request steps, and the round of the
+//! busy slots' steps runs as one pass of their rows (`GpuModel::step_slots`,
+//! each row bit for bit its step alone). A lookup load runs its rounds a
+//! select and a call a row. The
 //! sequences are switched by pointer exchange, and one draft is held a
 //! resident slot — its host state never moved, its device side parking
 //! with the sequence on every switch — so each request's tokens are its
@@ -244,9 +246,10 @@
 //! refusal; `BLOOMERY_DRAFT=mtp` set with stores that short is refused by
 //! name before the plan. Unset, the draft also goes off under `--parallel`
 //! above 1, whatever its source ([`draft_for_slots`]: a `load draft=off`
-//! record naming the slots): a drafted load steps a round of sampled or
-//! id-banning requests a slot at a time, where a plain load runs it as one
-//! pass. Unset, the draft then yields to the context
+//! record naming the slots): a drafted load runs a round of sampled or
+//! id-banning requests as one pass, as a plain load does, and also walks
+//! each slot's draft over its row, one slot after another. Unset, the draft
+//! then yields to the context
 //! (`bloomery_levers::RungCost::of`, at [`ctx38`]'s caller): it goes off
 //! when the plan with it leaves a slot fewer positions than the plan
 //! without it, a set `--ctx-size` included, one `draft yield` record naming
@@ -267,10 +270,12 @@
 //! most and none while no width beats the plain step, `fixed` the draft's
 //! three ids whole — the greedy ids the plain server's, `pass_rows` 4;
 //! under `cost` a request's `mtp width` record prints at the slot's next
-//! prompt call. A sampling or id-banning request takes plain
-//! steps (the server's loop asks a pass only of a greedy request with no
-//! banned id), each step's row the target's, read before the step is told
-//! to the draft; its ids are the plain server's. A `load draft=mtp` line
+//! prompt call. A sampling request drafts while its slot runs alone in the
+//! round, each kept id its sampler's draw from its verified row
+//! (`Seat::pass_sampled`), and takes plain steps beside another busy slot;
+//! an id-banning request takes plain steps. Each step's row is the
+//! target's, read before the step is told to the draft; its ids are the
+//! plain server's. A `load draft=mtp` line
 //! follows the `load` line, then the `mtp head` record (which head, what
 //! picked it and why), and `/props`' `engine.draft` names the draft
 //! with its resident bytes as the card's `draft` class. Every other word of
@@ -932,10 +937,10 @@ pub(crate) fn draft_off_for(
 
 /// [`draft38`]'s answer `(mtp, off)` with `slots` resident sequences, whatever the draft's
 /// source (a GGUF draft file or a checkpoint folder's MTP layer): a draft the unset rule would
-/// have run goes off on more than one slot ([`Draft38Off::Slots`]), as a drafted load steps a
-/// round of sampled or id-banning requests a slot at a time (`Q38::step_pass` is false on it),
-/// where a plain load runs the round as one pass; a set word runs as set, and a reason the
-/// draft was already off for stands.
+/// have run goes off on more than one slot ([`Draft38Off::Slots`]), as a drafted load walks each
+/// slot's draft over its row of a round of sampled or id-banning requests, one slot after
+/// another, beside the round's one pass (`rounds::step_rows_drafted`); a set word runs as set,
+/// and a reason the draft was already off for stands.
 pub(crate) fn draft_for_slots(
     slots: usize,
     word: Option<&str>,
@@ -2082,12 +2087,13 @@ struct Q38 {
     /// the fallback loop.
     one_pass: bool,
     /// Whether a round of several slots' plain steps runs as one pass of the
-    /// busy rows ([`Q38::step_slots`]): a load that drafts nothing, of more
-    /// than one resident slot, with no expert tier card. A drafted load's
-    /// plain rounds — a sampling or id-banning request's steps — keep the
-    /// fallback loop: each of its steps is told to its slot's draft
-    /// ([`SlotDrafts::step_with_row`]), which a pass of plain steps does
-    /// not do.
+    /// busy rows ([`Q38::step_slots`]): a load of more than one resident
+    /// slot with no expert tier card, plain or MTP-drafted. A drafted load's
+    /// plain rounds (a sampling or id-banning request's steps) tell each row
+    /// to its slot's draft around the pass
+    /// ([`super::rounds::step_rows_drafted`]). A lookup load keeps the
+    /// fallback loop: its contexts follow each step at the selected slot's
+    /// position.
     step_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
@@ -2371,7 +2377,7 @@ impl Q38 {
             residency,
             break_even: a.mtp.then(|| break_even_of(a.place)),
             one_pass: pass_of_slots && a.mtp,
-            step_pass: pass_of_slots && !a.mtp && !a.lookup,
+            step_pass: pass_of_slots && !a.lookup,
             stats: a.stats,
             census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
@@ -2799,12 +2805,13 @@ impl Seat for Q38 {
 
     /// One round of several slots' plain steps
     /// ([`super::rounds::step_round`]): while the open decided so
-    /// ([`Q38::step_pass`], a plain load) one pass of the busy rows through
+    /// ([`Q38::step_pass`]) one pass of the busy rows through
     /// [`super::rounds::step_rows_one_pass`] — laid in slot order, each
-    /// row's answer and lent logits row its own, slot 0 left selected — and
-    /// the call's `residency pass` records after it, else the fallback
-    /// (`bind::step_rows_in_turn`: a select and a step a row, each step told
-    /// to its slot's draft on a drafted load).
+    /// row's answer and lent logits row its own, slot 0 left selected; on
+    /// an MTP-drafted load each row told to its slot's draft as its step
+    /// would be ([`super::rounds::step_rows_drafted`]) — and the call's
+    /// `residency pass` records after it, else the fallback
+    /// (`bind::step_rows_in_turn`: a select and a step a row).
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
         let one_pass = self.step_pass;
         super::rounds::step_round(
@@ -2817,7 +2824,11 @@ impl Seat for Q38 {
                 for r in rows.iter() {
                     q.before_call_at(r.slot);
                 }
-                super::rounds::step_rows_one_pass(&mut q.s, rows)
+                if q.drafts.mtp() {
+                    super::rounds::step_rows_drafted(&mut q.s, rows, &mut q.drafts)
+                } else {
+                    super::rounds::step_rows_one_pass(&mut q.s, rows)
+                }
             },
             Q38::print_passes,
         )
