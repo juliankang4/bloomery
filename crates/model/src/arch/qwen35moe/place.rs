@@ -1140,13 +1140,20 @@ pub const UBATCH_PLANNED: u64 = 4096;
 /// rounded up].
 pub const UBATCH_TOKEN_BYTES: u64 = 668_277;
 
+/// Card bytes a qwen4exp ubatch walk's selection holds for one run of its
+/// selecting rows: the walk takes as many rows a run as these bytes hold at
+/// the selection's bytes a row (its query heads, scores, list and length:
+/// 4 B each of 512, `⌈ctx / 4⌉`, 2,051 and 1), in whole groups of eight
+/// rows and at least one group (`crates/gpu/src/arch/qwen3moe/scratch38.rs`'s
+/// `select_run`).
+pub const SELECT_RUN_BYTES: u64 = 22_000_000;
+
 /// Card bytes a qwen4exp ubatch walk holds whatever its size, at a cache of
 /// up to 2,000,000 positions [derived, an upper bound: the router's buffers
 /// for 2,048 tokens, 8,577,028 B; the eight-column mix scratch, 379,520 B;
-/// the selected flash's partials for eight rows of 24 heads over 33 segments
-/// of 64 keys, 6,538,752 B; the selection's queries and lists, 82,048 B; its
-/// scores, 8 B a cache position, 16,000,000 B at 2,000,000; rounded up to
-/// 32 MiB]. A load past that cache refuses its ubatch arena by name.
+/// the selection's run, at most [`SELECT_RUN_BYTES`] (the least run, eight
+/// rows, holds 16,082,048 B at 2,000,000); 30,956,548 B, rounded up to
+/// 32 MiB]. A load whose ubatch arena passes it refuses the arena by name.
 pub const UBATCH_FIXED_BYTES: u64 = 32 << 20;
 
 /// The card bytes a qwen4exp ubatch walk of up to `u` positions holds: what

@@ -33,8 +33,9 @@
 //!   no acc, no host sum and nothing left for the back;
 //! - the selecting layer's rows the prefill flash while `qsa::scored` says a
 //!   row selects nothing (every key below its count), the selection and the
-//!   selected flash in runs of [`SELECT_ROWS`] from the first row that
-//!   selects; the pool pass over every row first, so a pool some row of the
+//!   selected flash's one-launch fold in runs of the arena's selection rows
+//!   (`scratch38::select_run`: as many as the plan's selection bytes hold at
+//!   the load's cache) from the first row that selects; the pool pass over every row first, so a pool some row of the
 //!   unit completes is written before any row selects;
 //! - the conv, the delta step (the committed lane, in place), the gated
 //!   norm, the PLE gate and conv, the key append, the rope with the cache
@@ -153,14 +154,14 @@ use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_s
 use super::program38::{Ctx38, beta_alpha_mut, beta_alpha_rows};
 use super::router::gated;
 use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
-use super::scratch38::{Arena38, ROUTE_ROWS, SELECT_ROWS, Store38};
+use super::scratch38::{Arena38, ROUTE_ROWS, Store38};
 use super::tier38::TierSide38;
 use super::wide::{RingStacks, with_ring_windows};
 use crate::GpuError;
 use crate::card_leg::{RouteW, StackW};
 use crate::card_slots::CardAcc;
 use crate::fault::{FaultSink, LAYER_HEAD};
-use crate::flash_gqa::GqaSelArgs;
+use crate::flash_gqa::GqaFoldArgs;
 use crate::flash_gqa_prefill::GqaPrefillArgs;
 use crate::gemm::{
     Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute, GemmWeight,
@@ -2414,11 +2415,11 @@ fn qsa(
             },
         )?;
     }
-    let width = q.sel.width();
+    let (width, run) = (q.sel.width(), q.sel.rows());
     let idx = geo::IDX_HEADS * geo::IDX_DIM;
     let mut t0 = dense;
     while t0 < m {
-        let n = SELECT_ROWS.min(m - t0);
+        let n = run.min(m - t0);
         // SAFETY: rows t0 .. t0 + n <= m of the indexer queries, the queries
         // and the flash's output (`rows` rows each) and of the unit's counts
         // (`m` rows); they stay in place for this run's launches.
@@ -2446,9 +2447,9 @@ fn qsa(
                 scratch: &mut q.sel,
             },
         )?;
-        c.k.flash.enqueue_pass_256_p12_sel(
+        c.k.flash.enqueue_fold_256_p12_sel(
             stream,
-            GqaSelArgs {
+            GqaFoldArgs {
                 q: &qw,
                 kc: kcache,
                 vc: vcache,
@@ -2459,8 +2460,6 @@ fn qsa(
                 n_kv: geo::N_KV,
                 ctx,
                 m: n,
-                part_v: &mut q.part_v,
-                part_ms: &mut q.part_ms,
                 fault: sink,
                 y: &mut yw,
             },

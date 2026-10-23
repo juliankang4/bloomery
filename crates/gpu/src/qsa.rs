@@ -29,8 +29,9 @@
 //!   plane. Every position passes through some row of some launch, so every
 //!   pool is written exactly once, before any row can see it complete.
 //! - [`qsa_kernels::qsa_score`] — per row: its [`HEADS`] indexer query heads
-//!   normed and turned at its position (every block builds them; block 0
-//!   writes them to `q_out`), then per pool the score `Σ_h relu(q_h · k)`.
+//!   normed and turned at its position (every block of its group of
+//!   [`MAX_ROWS`] rows builds them; the group's first block writes them to
+//!   `q_out`), then per pool the score `Σ_h relu(q_h · k)`.
 //! - [`qsa_kernels::qsa_topk`] — one block per row: the exact `kept`-th
 //!   order key by three histogram passes over the row's scores (10, 11, 11
 //!   bits of the order key), then every pool
@@ -84,7 +85,9 @@ pub const DIM: usize = 128;
 pub const ROT: usize = 64;
 /// Tokens per pool (`attention.compress_ratios` of a QSA layer).
 pub const POOL: usize = 4;
-/// Rows one score launch serves: a decode step or a draft's verify.
+/// Rows one score block serves: a decode step's, a draft's verify, or one
+/// group of a longer launch's rows (`⌈m / MAX_ROWS⌉` groups, each its own
+/// blocks a pool tile).
 pub const MAX_ROWS: usize = 8;
 /// Pools one score block takes, one per lane.
 pub const POOL_TILE: usize = 32;
@@ -596,21 +599,23 @@ mod qsa_kernels {
         }
     }
 
-    /// The score pass: block `b` takes pools `[32b, 32b + 32)` for every row
-    /// `t < m` that is [`scored`] and sees that tile complete. Warp `w` is
-    /// indexer head `w`. First every row's query heads are normed by `gain`
-    /// and turned by the table's row `c − 1` into shared memory (block 0
-    /// writes them to `q_out`, `[m][HEADS][DIM]`; a refused count's heads are
-    /// NaN there); then the tile's keys are staged, and per row lane `j`
-    /// scores pool `32b + j` (module doc) and writes `scores[t·pools + 32b +
-    /// j]`.
+    /// The score pass: block `b = g·tiles + i` (`tiles = ⌈pools/32⌉`) takes
+    /// pools `[32i, 32i + 32)` for every row `t` of group `g` — rows `8g ..
+    /// min(8g + 8, m)` — that is [`scored`] and sees that tile complete. Warp
+    /// `w` is indexer head `w`. First the group's query heads are normed by
+    /// `gain` and turned by the table's row `c − 1` into shared memory (the
+    /// group's block `i = 0` writes them to `q_out`, `[m][HEADS][DIM]`; a
+    /// refused count's heads are NaN there); then the tile's keys are staged,
+    /// and per row lane `j` scores pool `32i + j` (module doc) and writes
+    /// `scores[t·pools + 32i + j]`. A row's heads and scores are the same
+    /// whatever group or launch it is in.
     #[kernel]
     #[launch_bounds(128)]
     #[launch_contract(
         domain = 1,
         block = (128, 1, 1),
         requires = (
-            m <= 8,
+            pools >= 1,
             n_keys.len() >= m,
             q.len() >= m * 512,
             gain.len() >= 128,
@@ -648,25 +653,31 @@ mod qsa_kernels {
         static mut KS: SharedArray<u32, { POOL_TILE * K_STRIDE }> = SharedArray::UNINIT;
         static mut WS: SharedArray<f32, { HEADS * POOL_TILE }> = SharedArray::UNINIT;
 
+        let tiles = (pools as usize).div_ceil(POOL_TILE);
         let b = thread::blockIdx_x() as usize;
+        let (group, tile) = (b / tiles, b % tiles);
+        let r0 = group * MAX_ROWS;
+        if r0 >= m as usize {
+            return; // block-uniform: past the launch's groups
+        }
         let tid = thread::threadIdx_x() as usize;
         let w = tid / 32;
         let lane = warp::lane_id() as usize;
-        let rows = m as usize;
-        let p0 = b * POOL_TILE;
+        let rows = (m as usize - r0).min(MAX_ROWS);
+        let p0 = tile * POOL_TILE;
         // The largest complete pool count among the rows this tile serves;
         // the same in every thread.
         let mut live_max = 0usize;
         let mut t = 0usize;
         while t < rows {
-            // SAFETY: t < m <= n_keys.len() by the launch contract.
-            let c = unsafe { *n_keys.get_unchecked(t) };
+            // SAFETY: r0 + t < m <= n_keys.len() by the launch contract.
+            let c = unsafe { *n_keys.get_unchecked(r0 + t) };
             if scored(c, ctx, kept) {
                 live_max = live_max.max(c as usize / POOL);
             }
             t += 1;
         }
-        if p0 >= live_max && b != 0 {
+        if p0 >= live_max && tile != 0 {
             return; // block-uniform
         }
 
@@ -682,7 +693,7 @@ mod qsa_kernels {
             )
         };
 
-        // ---- the query heads: warp w builds head w of every row.
+        // ---- the query heads: warp w builds head w of every row of the group.
         let d = lane_dims(lane);
         let mut g = [0.0f32; 4];
         for i in 0..4 {
@@ -692,15 +703,16 @@ mod qsa_kernels {
         }
         let mut t = 0usize;
         while t < rows {
-            // SAFETY: t < m <= n_keys.len().
-            let c = unsafe { *n_keys.get_unchecked(t) };
+            // SAFETY: r0 + t < m <= n_keys.len().
+            let c = unsafe { *n_keys.get_unchecked(r0 + t) };
             let base = (t * HEADS + w) * DIM;
+            let at = r0 * HEADS * DIM + base;
             let y = if c >= 1 && c <= ctx {
                 let mut x = [0.0f32; 4];
                 for i in 0..4 {
                     thread::__unroll_config::<0>();
-                    // SAFETY: base + d[i] < m·HEADS·DIM <= q.len().
-                    x[i] = unsafe { *q.get_unchecked(base + d[i]) };
+                    // SAFETY: at + d[i] < m·HEADS·DIM <= q.len().
+                    x[i] = unsafe { *q.get_unchecked(at + d[i]) };
                 }
                 let p = c as usize - 1;
                 // SAFETY: p < ctx and 2·lane + 1 < ROT: inside the table.
@@ -718,16 +730,17 @@ mod qsa_kernels {
                 thread::__unroll_config::<0>();
                 // SAFETY: base + d[i] < MAX_ROWS·HEADS·DIM; this lane's own.
                 unsafe { *qs.add(base + d[i]) = y[i] };
-                if b == 0 {
-                    // SAFETY: base + d[i] < m·HEADS·DIM <= q_out.len();
-                    // block 0 alone writes it, each value by one lane.
-                    unsafe { *q_out.get_unchecked_mut(base + d[i]) = y[i] };
+                if tile == 0 {
+                    // SAFETY: at + d[i] < m·HEADS·DIM <= q_out.len(); the
+                    // group's tile-0 block alone writes it, each value by one
+                    // lane.
+                    unsafe { *q_out.get_unchecked_mut(at + d[i]) = y[i] };
                 }
             }
             t += 1;
         }
         if p0 >= live_max {
-            return; // block-uniform: block 0 with no tile to score
+            return; // block-uniform: a tile-0 block with no tile to score
         }
 
         // ---- the tile: pools p0 .. p0 + 32 below live_max, zeros past it.
@@ -754,8 +767,8 @@ mod qsa_kernels {
 
         let mut t = 0usize;
         while t < rows {
-            // SAFETY: t < m <= n_keys.len().
-            let c = unsafe { *n_keys.get_unchecked(t) };
+            // SAFETY: r0 + t < m <= n_keys.len().
+            let c = unsafe { *n_keys.get_unchecked(r0 + t) };
             let nb = c as usize / POOL;
             // Block-uniform: c is the row's.
             if scored(c, ctx, kept) && p0 < nb {
@@ -796,10 +809,10 @@ mod qsa_kernels {
                             + *ws.add(3 * POOL_TILE + lane)
                     };
                     let pool = p0 + lane;
-                    // SAFETY: pool < nb <= ctx/4 <= pools and t < m, so
-                    // t·pools + pool < m·pools <= scores.len(); one lane
-                    // writes each score.
-                    unsafe { *scores.get_unchecked_mut(t * pools as usize + pool) = s };
+                    // SAFETY: pool < nb <= ctx/4 <= pools and r0 + t < m, so
+                    // (r0 + t)·pools + pool < m·pools <= scores.len(); one
+                    // lane writes each score.
+                    unsafe { *scores.get_unchecked_mut((r0 + t) * pools as usize + pool) = s };
                 }
                 thread::sync_threads();
             }
@@ -1214,10 +1227,10 @@ mod qsa_kernels {
 
 // -------------------------------------------------------------- launchers
 
-/// What one selection leaves besides the list, for up to [`MAX_ROWS`] rows
-/// over a cache of `ctx` rows, allocated once and reused by every launch: the
-/// normed and turned query heads and the scores; then the lists and their
-/// lengths the selected flash reads.
+/// What one selection leaves besides the list, for up to `rows` rows over a
+/// cache of `ctx` rows, allocated once and reused by every launch: the normed
+/// and turned query heads and the scores; then the lists and their lengths the
+/// selected flash reads.
 pub struct QsaScratch {
     /// `[rows][HEADS][DIM]`: the query heads the scores used.
     pub q_out: DeviceBuffer<f32>,
@@ -1237,18 +1250,27 @@ impl QsaScratch {
     /// Load-time only.
     ///
     /// # Errors
-    /// [`GpuError::Shape`] for `rows` outside `1..=MAX_ROWS` or `kept` zero;
-    /// an allocation error.
+    /// [`GpuError::Shape`] for `rows` or `kept` zero, or rows whose bytes
+    /// ([`QsaScratch::row_bytes`] each) overflow; an allocation error.
     pub fn new(
         stream: &CudaStream,
         rows: usize,
         ctx: usize,
         kept: usize,
     ) -> Result<QsaScratch, GpuError> {
-        if rows == 0 || rows > MAX_ROWS || kept == 0 {
+        let what = "qsa::scratch";
+        if rows == 0 || kept == 0 {
             return Err(GpuError::shape(
-                "qsa::scratch",
-                format!("need 1..={MAX_ROWS} rows and kept >= 1, got rows={rows} kept={kept}"),
+                what,
+                format!("need rows and kept >= 1, got rows={rows} kept={kept}"),
+            ));
+        }
+        // Each buffer's length is at most the scratch's bytes.
+        let row = QsaScratch::row_bytes(ctx, kept);
+        if rows.checked_mul(row).is_none() {
+            return Err(GpuError::shape(
+                what,
+                format!("{rows} rows of {row} B overflow"),
             ));
         }
         let pools = pools_for(ctx);
@@ -1268,6 +1290,19 @@ impl QsaScratch {
     #[must_use]
     pub fn width(&self) -> usize {
         self.width
+    }
+
+    /// The most rows one selection into this scratch takes.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Device bytes a scratch over a cache of `ctx` rows keeping `kept`
+    /// pools holds a row: its query heads, scores, list and length, 4 B each.
+    #[must_use]
+    pub fn row_bytes(ctx: usize, kept: usize) -> usize {
+        4 * (HEADS * DIM + pools_for(ctx) + list_width(kept) + 1)
     }
 }
 
@@ -1392,10 +1427,10 @@ impl QsaKernels {
     }
 
     /// Enqueue the selection of `m` rows: the score pass (`⌈pools/32⌉` blocks
-    /// of 128) and the top-k pass (`m` blocks of 512), each row's list and
-    /// length left in `a.scratch`. `m` is 1 to the scratch's rows (at most
-    /// [`MAX_ROWS`]) and the cache and `kept` the scratch's; any other shape
-    /// is refused by name. Two launches, in order, on one stream: the top-k
+    /// of 128 for each group of [`MAX_ROWS`] rows) and the top-k pass (`m`
+    /// blocks of 512), each row's list and length left in `a.scratch`. `m` is
+    /// 1 to the scratch's rows and the cache and `kept` the scratch's; any
+    /// other shape is refused by name. Two launches, in order, on one stream: the top-k
     /// reads the scores the score pass wrote. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_select(&self, stream: &CudaStream, a: SelectArgs<'_>) -> Result<(), GpuError> {
@@ -1441,7 +1476,12 @@ impl QsaKernels {
         let kept = launch_u32(what, "kept", a.kept)?;
         let width = launch_u32(what, "width", s.width)?;
         let m = launch_u32(what, "m", a.m)?;
-        let grid = launch_u32(what, "score grid", pools.div_ceil(POOL_TILE))?;
+        let tiles = pools.div_ceil(POOL_TILE);
+        let grid =
+            a.m.div_ceil(MAX_ROWS)
+                .checked_mul(tiles)
+                .ok_or_else(|| GpuError::shape(what, format!("{} rows of {tiles} tiles", a.m)))?;
+        let grid = launch_u32(what, "score grid", grid)?;
         let prep = self
             .module
             .prepare_qsa_score(LaunchConfig1D::new(grid, THREADS, 0))?;

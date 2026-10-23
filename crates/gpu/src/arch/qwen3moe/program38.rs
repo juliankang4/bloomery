@@ -67,7 +67,7 @@ use super::scratch38::{Arena38, Store38, Taps38};
 use super::tier38::{STAGE_TIER, TierSide38};
 use crate::card_slots::CardSlotKernels;
 use crate::fault::{FaultSink, LAYER_HEAD};
-use crate::flash_gqa::{FlashGqaKernels, GqaSelArgs};
+use crate::flash_gqa::{FlashGqaKernels, GqaFoldArgs, GqaSelArgs};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::graph::Forked;
@@ -1491,20 +1491,22 @@ unsafe fn qsa_attend(
     c.k.flash.enqueue_pass_256_p12_sel(
         stream,
         GqaSelArgs {
-            q,
-            kc,
-            vc,
-            list: &sel.list,
-            n_sel: &sel.n_sel,
-            width,
-            scale: ATTN_SCALE_256,
-            n_kv: geo::N_KV,
-            ctx,
-            m,
+            attn: GqaFoldArgs {
+                q,
+                kc,
+                vc,
+                list: &sel.list,
+                n_sel: &sel.n_sel,
+                width,
+                scale: ATTN_SCALE_256,
+                n_kv: geo::N_KV,
+                ctx,
+                m,
+                fault: sink,
+                y,
+            },
             part_v,
             part_ms,
-            fault: sink,
-            y,
         },
         geo::N_HEAD,
     )

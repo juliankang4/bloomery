@@ -117,10 +117,14 @@
 //!     a rerun, each row of a
 //!     launch its one-row launch — at counts 2,051 (every token), 2,052 (the
 //!     first dropped pool), 4,097 and 8,193 and on the eight rows of a verify
-//!     at 8,186..=8,193; a tie of +0 scores across the cut, the lowest pools
+//!     at 8,186..=8,193; twenty rows in one launch (three groups of the score
+//!     pass, the last of four) checked the same way, each group's heads,
+//!     scored pools, lists and lengths its own launch's bits; a tie of +0
+//!     scores across the cut, the lowest pools
 //!     taken; counts 0 and past the cache an empty list;
 //!     a NaN query, and a finite one whose square passes f32, raising
-//!     `pool_select` with a defined list; nine rows refused by name. The rule is the modeling code's (exllamav3
+//!     `pool_select` with a defined list; nine rows over a scratch of eight,
+//!     and a scratch whose bytes overflow, refused by name. The rule is the modeling code's (exllamav3
 //!     `qsa_indexer.py`, transformers): exactly 512 pools and the tail. ik and
 //!     mainline cut 2,051 cells instead, so past position 2,050, when `(p + 1)
 //!     % 4 != 3`, they also take `3 − t` cells of the 513th pool in ggml's tie
@@ -132,18 +136,26 @@
 //!     eight-row launches. Two bodies are compared: the `_p12_sel` entry runs
 //!     its own copy of the `_p4` segment pass (`seg_mma_ps`), which differs in
 //!     the count bound, the staging load and the pack's twelve heads in one
-//!     tile, so the clause holds the copy to the dense body's bits.
+//!     tile, so the clause holds the copy to the dense body's bits. Every
+//!     launch of 11 to 13 runs the fold as well
+//!     (`flash_gqa::enqueue_fold_256_p12_sel`: the segment pass's segments
+//!     and the merge's fold in one block a row and key head), each output bit
+//!     for bit the two launches'.
 //! 12. Past 2,051: each row within the dense clause's band of the exact
 //!     attention over its listed keys, NaN in every cache row no list names
-//!     changing no bit, a rerun, each verify row its one-row launch; the
+//!     changing no bit, a rerun, each verify row and each of twenty rows its
+//!     one-row launch; the
 //!     captured chain (pool, score, top-k, segment pass, merge: five nodes)
 //!     the eager bits, the segment pass one block of 384 threads a (row, key
-//!     head, segment).
+//!     head, segment); the ubatch walk's chain on the twenty rows (pool,
+//!     score, top-k, fold: four nodes) the eager bits, the fold one block of
+//!     384 threads a (row, key head).
 //! 13. A list entry at the cache's height raising `pool_select`, a length of
 //!     zero or past the width raising `key_count`: that row NaN, the other bit
-//!     for bit clean; a group that is not twelve heads a key head refused by
-//!     name.
-//! 14. The four new entries compile with no local depot.
+//!     for bit clean, the fold raising the same word; a group that is not
+//!     twelve heads a key head refused by name by both entries.
+//! 14. The selector's three entries and the two selected flashes compile with
+//!     no local depot.
 //! 15. Deep: the selector and the selected flash at a cache of 262,144 rows
 //!     (Qwen3.8's `context_length`, the most a load serves), synthetic keys,
 //!     no model: one pool launch over every count bit for bit the
@@ -154,7 +166,8 @@
 //!     `runtime::qsa`'s rule over the full span of 65,536 pools, every list
 //!     holding rows past 65,535 and a tail ending at its position; the selected
 //!     flash, both passes, within the band of the exact attention over the
-//!     listed rows, with NaN in every unlisted cache row changing no bit.
+//!     listed rows, with NaN in every unlisted cache row changing no bit, the
+//!     fold its bits.
 //!     The counts reach the kernels as their `u32` arguments, the list
 //!     entries as `u32` cache rows: a count or a row cut to 16 bits, or the
 //!     context clamped at 65,535, reads other rows or refuses the count.
@@ -190,6 +203,15 @@
 //! fixture tier by name. [`MODEL_LAYER`] is an attention layer of both files. The bands are unchanged: they are derived
 //! per value from ik's inputs and our rules, not from the weights. The gate declares the one fixture-oracle clause
 //! (`tier::expect_fixture_oracle`).
+//!
+//! `--bench-kernels` runs no clause: it times a 4,096-position prompt's
+//! selecting rows (counts up to 4,096 over a cache of [`BENCH_CTX`] rows) the
+//! two ways a walk runs them, a selection and a segment pass with its merge a
+//! run of eight rows, or a selection and a fold a run of every row
+//! (`bench sel rows=`, wall milliseconds of the enqueued chain to its
+//! synchronize, the least and the median of seven rounds), over the first 8,
+//! 64, 256 and every selecting row, and prints whether the two outputs have
+//! the same bits. Nothing there asserts on a result.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -200,9 +222,9 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
-        FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, GqaSelArgs, HEAD_256 as HEAD, KEY_TILE, PACK_2,
-        PACK_4, PACK_12, SEG_KEYS, SEGMENTS, listed_partials_ms_len, listed_partials_v_len_256,
-        listed_segments, partials_ms_len, partials_v_len_256, seg_span,
+        FlashGqaKernels, GROUP, GqaArgs, GqaFoldArgs, GqaQ8Args, GqaSelArgs, HEAD_256 as HEAD,
+        KEY_TILE, PACK_2, PACK_4, PACK_12, SEG_KEYS, SEGMENTS, listed_partials_ms_len,
+        listed_partials_v_len_256, listed_segments, partials_ms_len, partials_v_len_256, seg_span,
     };
     use bloomery_gpu::flash_gqa_prefill::{
         FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, KEY_TILE as PREF_TILE,
@@ -2542,6 +2564,16 @@ mod gate {
     /// One-row counts of the dense-equality clause: one key, a tile edge, and
     /// the last dense count.
     const SEL_DENSE: [usize; 4] = [1, 5, 512, 2051];
+
+    /// A launch past one group of the score pass: the one-row counts, the
+    /// verify's eight and eight between, twenty rows in three groups of
+    /// [`MAX_ROWS`] (the last of four).
+    fn wide_counts() -> Vec<usize> {
+        let mut c = SEL_COUNTS.to_vec();
+        c.extend(SEL_ROWS0..=SEL_N);
+        c.extend([2053, 2500, 3001, 3334, 4096, 4098, 6000, 7779]);
+        c
+    }
     /// The raw keys' and the indexer queries' scale over [`activations`].
     const IDX_SCALE: f32 = 2.0;
     /// The pools whose raw rows the tie clause zeroes: 600 pools, so at count
@@ -3053,6 +3085,55 @@ mod gate {
             ok &= pass;
         }
 
+        // Past one score group: twenty rows in one launch check as the rows
+        // above do, and each group's rows are its own launch's bits (heads,
+        // scored pools, list and length).
+        let counts = wide_counts();
+        let m = counts.len();
+        let mut wide = QsaScratch::new(stream, m, SEL_CTX, KEPT)?;
+        let q = idx_queries(m, 513);
+        let cu = to_u32(&counts)?;
+        let s = run_select(qk, stream, unl, &idx, &pooled, &q, &cu, &mut wide)?;
+        let (heads, sc, lists, worst) = select_rows_ok(&idx, &ph, &q, &counts, &s);
+        let (pools, qw) = (pools_for(SEL_CTX), IDX_HEADS * IDX_DIM);
+        let mut grouped = true;
+        for g0 in (0..m).step_by(MAX_ROWS) {
+            let g1 = (g0 + MAX_ROWS).min(m);
+            let one = run_select(
+                qk,
+                stream,
+                unl,
+                &idx,
+                &pooled,
+                &q[g0 * qw..g1 * qw],
+                &cu[g0..g1],
+                &mut scratch,
+            )?;
+            grouped &= bits_equal(&one.q_out, &s.q_out[g0 * qw..g1 * qw]);
+            for t in g0..g1 {
+                let r = t - g0;
+                let nb = if qsa_shape().scored(counts[t], SEL_CTX) {
+                    counts[t] / POOL
+                } else {
+                    0
+                };
+                grouped &= bits_equal(
+                    &one.scores[r * pools..r * pools + nb],
+                    &s.scores[t * pools..t * pools + nb],
+                ) && row_list(&one, r) == row_list(&s, t)
+                    && one.n_sel[r] == s.n_sel[t];
+            }
+        }
+        let pass = heads && sc && lists && grouped;
+        println!(
+            "qsa select wide m={m} ({} groups of {MAX_ROWS}): heads bit_exact_host={heads} \
+             scores measured/bound {worst:.3e} band={sc} lists = rule={lists} each group = its \
+             own launch={grouped} {}",
+            m.div_ceil(MAX_ROWS),
+            verdict(pass)
+        );
+        ok &= pass;
+
         // A tie across the cut: pools 100..700 have zero raw rows, so each
         // scores +0 exactly; at count 4,097 fewer than 512 pools score above
         // it, and the rest of the 512 are the lowest of the tied pools.
@@ -3174,19 +3255,45 @@ mod gate {
             r.err().map_or("accepted".to_string(), |e| e.to_string()),
             verdict(named)
         );
-        Ok(ok && named)
+        // A scratch of more rows than a byte count holds: refused by name
+        // before any allocation.
+        let r = QsaScratch::new(stream, usize::MAX / 1024, SEL_CTX, KEPT);
+        let overflow = matches!(
+            r,
+            Err(GpuError::Shape {
+                what: "qsa::scratch",
+                ..
+            })
+        );
+        println!(
+            "qsa scratch refusal rows={}: {} {}",
+            usize::MAX / 1024,
+            r.err().map_or("accepted".to_string(), |e| e.to_string()),
+            verdict(overflow)
+        );
+        Ok(ok && named && overflow)
     }
 
-    /// One selected-flash launch of `m` rows over the lists and lengths on
-    /// the device, into fresh scratch, read back.
+    /// A selected-flash entry: the segment pass and its merge
+    /// (`enqueue_pass_256_p12_sel`), or the one-launch fold
+    /// (`enqueue_fold_256_p12_sel`).
+    #[derive(Clone, Copy)]
+    enum SelFlash {
+        Pass,
+        Fold,
+    }
+
+    /// One selected-flash launch of `m` rows through `entry` over the lists
+    /// and lengths on the device, into fresh scratch, read back.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the kernels, the stream and sink, the rows, the lists, the cache and its height"
+        reason = "the kernels, the stream and sink, the entry, the rows, the lists, the cache and its height"
     )]
     fn run_sel(
         k: &FlashGqaKernels,
         stream: &CudaStream,
         fault: FaultSink,
+        entry: SelFlash,
         q: &[f32],
         (list, n_sel): (&DeviceBuffer<u32>, &DeviceBuffer<u32>),
         m: usize,
@@ -3194,31 +3301,43 @@ mod gate {
         ctx: usize,
     ) -> Result<Vec<f32>, GateError> {
         let qd = DeviceBuffer::from_host(stream, q)?;
-        let mut pv =
-            DeviceBuffer::<f32>::zeroed(stream, listed_partials_v_len_256(m, N_HEAD_Q38, WIDTH))?;
-        let mut pms =
-            DeviceBuffer::<f32>::zeroed(stream, listed_partials_ms_len(m, N_HEAD_Q38, WIDTH))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * Q38.width())?;
-        k.enqueue_pass_256_p12_sel(
-            stream,
-            GqaSelArgs {
-                q: &qd,
-                kc,
-                vc,
-                list,
-                n_sel,
-                width: WIDTH,
-                scale: scale(),
-                n_kv: N_KV,
-                ctx,
-                m,
-                part_v: &mut pv,
-                part_ms: &mut pms,
-                fault,
-                y: &mut y,
-            },
-            N_HEAD_Q38,
-        )?;
+        let attn = GqaFoldArgs {
+            q: &qd,
+            kc,
+            vc,
+            list,
+            n_sel,
+            width: WIDTH,
+            scale: scale(),
+            n_kv: N_KV,
+            ctx,
+            m,
+            fault,
+            y: &mut y,
+        };
+        match entry {
+            SelFlash::Pass => {
+                let mut pv = DeviceBuffer::<f32>::zeroed(
+                    stream,
+                    listed_partials_v_len_256(m, N_HEAD_Q38, WIDTH),
+                )?;
+                let mut pms = DeviceBuffer::<f32>::zeroed(
+                    stream,
+                    listed_partials_ms_len(m, N_HEAD_Q38, WIDTH),
+                )?;
+                k.enqueue_pass_256_p12_sel(
+                    stream,
+                    GqaSelArgs {
+                        attn,
+                        part_v: &mut pv,
+                        part_ms: &mut pms,
+                    },
+                    N_HEAD_Q38,
+                )?;
+            }
+            SelFlash::Fold => k.enqueue_fold_256_p12_sel(stream, attn, N_HEAD_Q38)?,
+        }
         stream.synchronize()?;
         Ok(y.to_host_vec(stream)?)
     }
@@ -3247,7 +3366,7 @@ mod gate {
         let unl = gpu.unlabelled_sink();
         let idx = idx_inputs(stream, SEL_CTX, 601, false)?;
         let (pooled, _) = pool_plane(qk, stream, &idx, SEL_N, SEL_N, unl)?;
-        let mut scratch = QsaScratch::new(stream, MAX_ROWS, SEL_CTX, KEPT)?;
+        let mut scratch = QsaScratch::new(stream, wide_counts().len(), SEL_CTX, KEPT)?;
         let c = cache(stream, HEAD, N_KV, SEL_CTX, SEL_N, 610)?;
         let w = Q38.width();
         let mut ok = true;
@@ -3286,6 +3405,18 @@ mod gate {
                     k,
                     stream,
                     unl,
+                    SelFlash::Pass,
+                    &q,
+                    (&scratch.list, &scratch.n_sel),
+                    m,
+                    (&c.kc, &c.vc),
+                    SEL_CTX,
+                )?;
+                let yf = run_sel(
+                    k,
+                    stream,
+                    unl,
+                    SelFlash::Fold,
                     &q,
                     (&scratch.list, &scratch.n_sel),
                     m,
@@ -3293,13 +3424,13 @@ mod gate {
                     SEL_CTX,
                 )?;
                 let yd = run_dec(k, stream, unl, Q38, &q, &cu, (&c.kc, &c.vc), SEL_CTX, true)?;
-                let same = bits_equal(&ys, &yd);
+                let (same, fold) = (bits_equal(&ys, &yd), bits_equal(&yf, &ys));
                 println!(
                     "qsa flash dense edge pass=mma counts={cs:?}: selected = dense p4 bit for \
-                     bit {same} {}",
-                    verdict(same)
+                     bit {same} fold = selected bit for bit {fold} {}",
+                    verdict(same && fold)
                 );
-                ok &= same;
+                ok &= same && fold;
             }
         }
 
@@ -3308,7 +3439,11 @@ mod gate {
         // no bit; the eight rows each their one-row launch; a rerun.
         // PIN(2026-09-27): the band is `exact`'s at n = the list's length — the segments and tiles are cut over list positions as the dense flash cuts them over the cache, so its model holds term for term.
         let verify: Vec<usize> = (SEL_ROWS0..=SEL_N).collect();
-        for (name, counts) in [("one-row", SEL_COUNTS[1..].to_vec()), ("verify", verify)] {
+        for (name, counts) in [
+            ("one-row", SEL_COUNTS[1..].to_vec()),
+            ("verify", verify),
+            ("wide", wide_counts()),
+        ] {
             let launches: Vec<Vec<usize>> = if name == "one-row" {
                 counts.iter().map(|&n| vec![n]).collect()
             } else {
@@ -3350,11 +3485,64 @@ mod gate {
                 let vn = DeviceBuffer::from_host(stream, &nanify(&c.vb))?;
                 let exacts = exact_listed(&q, &lists, &c.host);
                 let lsel = (&scratch.list, &scratch.n_sel);
-                let y = run_sel(k, stream, unl, &q, lsel, m, (&c.kc, &c.vc), SEL_CTX)?;
-                let y2 = run_sel(k, stream, unl, &q, lsel, m, (&c.kc, &c.vc), SEL_CTX)?;
-                let yn = run_sel(k, stream, unl, &q, lsel, m, (&kn, &vn), SEL_CTX)?;
+                let y = run_sel(
+                    k,
+                    stream,
+                    unl,
+                    SelFlash::Pass,
+                    &q,
+                    lsel,
+                    m,
+                    (&c.kc, &c.vc),
+                    SEL_CTX,
+                )?;
+                let y2 = run_sel(
+                    k,
+                    stream,
+                    unl,
+                    SelFlash::Pass,
+                    &q,
+                    lsel,
+                    m,
+                    (&c.kc, &c.vc),
+                    SEL_CTX,
+                )?;
+                let yn = run_sel(
+                    k,
+                    stream,
+                    unl,
+                    SelFlash::Pass,
+                    &q,
+                    lsel,
+                    m,
+                    (&kn, &vn),
+                    SEL_CTX,
+                )?;
+                let yf = run_sel(
+                    k,
+                    stream,
+                    unl,
+                    SelFlash::Fold,
+                    &q,
+                    lsel,
+                    m,
+                    (&c.kc, &c.vc),
+                    SEL_CTX,
+                )?;
+                let yfn = run_sel(
+                    k,
+                    stream,
+                    unl,
+                    SelFlash::Fold,
+                    &q,
+                    lsel,
+                    m,
+                    (&kn, &vn),
+                    SEL_CTX,
+                )?;
                 let (band, worst) = judge(&exacts, &y, Pass::Mma);
                 let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
+                let fold = bits_equal(&yf, &y) && bits_equal(&yfn, &y);
                 let mut alone = true;
                 if m > 1 {
                     let qw = IDX_HEADS * IDX_DIM;
@@ -3373,6 +3561,7 @@ mod gate {
                             k,
                             stream,
                             unl,
+                            SelFlash::Pass,
                             &q[t * w..(t + 1) * w],
                             (&scratch.list, &scratch.n_sel),
                             1,
@@ -3384,11 +3573,12 @@ mod gate {
                     // The m-row selection again, for the clause's later checks.
                     run_select(qk, stream, unl, &idx, &pooled, &qi, &cu, &mut scratch)?;
                 }
-                let pass_ok = band && rerun && nan_same && alone;
+                let pass_ok = band && rerun && nan_same && alone && fold;
                 println!(
                     "qsa flash {name} pass=mma counts={cs:?} lengths={:?}: measured/bound \
                      {worst:.3e} band={band} rerun={rerun} nan_in_unlisted_rows_same={nan_same} \
-                     rows = one-row launches={alone} {}",
+                     rows = one-row launches={alone} fold = selected bit for bit (and with the \
+                     NaN rows)={fold} {}",
                     s.n_sel,
                     verdict(pass_ok)
                 );
@@ -3458,20 +3648,22 @@ mod gate {
             k.enqueue_pass_256_p12_sel(
                 s,
                 GqaSelArgs {
-                    q: &qa,
-                    kc: &c.kc,
-                    vc: &c.vc,
-                    list: &scratch.list,
-                    n_sel: &scratch.n_sel,
-                    width: WIDTH,
-                    scale: scale(),
-                    n_kv: N_KV,
-                    ctx: SEL_CTX,
-                    m,
+                    attn: GqaFoldArgs {
+                        q: &qa,
+                        kc: &c.kc,
+                        vc: &c.vc,
+                        list: &scratch.list,
+                        n_sel: &scratch.n_sel,
+                        width: WIDTH,
+                        scale: scale(),
+                        n_kv: N_KV,
+                        ctx: SEL_CTX,
+                        m,
+                        fault: unl,
+                        y,
+                    },
                     part_v: pv,
                     part_ms: pms,
-                    fault: unl,
-                    y,
                 },
                 N_HEAD_Q38,
             )
@@ -3513,6 +3705,106 @@ mod gate {
         );
         ok &= graph_ok;
 
+        // The ubatch walk's chain — pool, score, top-k, fold — on the wide
+        // rows: four nodes, the eager bits, the fold one block of PACK_12
+        // warps a (row, key head).
+        let cs: Vec<u32> = wide_counts()
+            .into_iter()
+            .map(u32::try_from)
+            .collect::<Result<_, _>>()?;
+        let m = cs.len();
+        let qi = DeviceBuffer::from_host(stream, &idx_queries(m, 633))?;
+        let qa = DeviceBuffer::from_host(
+            stream,
+            &activations(HEAD, m * N_HEAD_Q38, 634)
+                .iter()
+                .map(|v| v * SEED_Q_SCALE)
+                .collect::<Vec<_>>(),
+        )?;
+        let nk = DeviceBuffer::from_host(stream, &cs)?;
+        let mut ya = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
+        let mut yg = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
+        let chain = |s: &CudaStream,
+                     pooled: &mut DeviceBuffer<u16>,
+                     scratch: &mut QsaScratch,
+                     y: &mut DeviceBuffer<f32>|
+         -> Result<(), GpuError> {
+            qk.enqueue_pool(
+                s,
+                PoolArgs {
+                    raw: &idx.raw_d,
+                    gain: &idx.gk_d,
+                    table: &idx.table_d,
+                    n_keys: &nk,
+                    eps: EPS,
+                    ctx: SEL_CTX,
+                    m,
+                    fault: unl,
+                    pooled: &mut *pooled,
+                },
+            )?;
+            qk.enqueue_select(
+                s,
+                SelectArgs {
+                    q: &qi,
+                    gain: &idx.gq_d,
+                    table: &idx.table_d,
+                    n_keys: &nk,
+                    pooled: &*pooled,
+                    eps: EPS,
+                    ctx: SEL_CTX,
+                    kept: KEPT,
+                    m,
+                    fault: unl,
+                    scratch: &mut *scratch,
+                },
+            )?;
+            k.enqueue_fold_256_p12_sel(
+                s,
+                GqaFoldArgs {
+                    q: &qa,
+                    kc: &c.kc,
+                    vc: &c.vc,
+                    list: &scratch.list,
+                    n_sel: &scratch.n_sel,
+                    width: WIDTH,
+                    scale: scale(),
+                    n_kv: N_KV,
+                    ctx: SEL_CTX,
+                    m,
+                    fault: unl,
+                    y,
+                },
+                N_HEAD_Q38,
+            )
+        };
+        chain(stream, &mut pooled_g, &mut scratch, &mut ya)?;
+        stream.synchronize()?;
+        let eager = ya.to_host_vec(stream)?;
+        let graph = gpu.capture(|s| chain(s, &mut pooled_g, &mut scratch, &mut yg))?;
+        graph.launch(stream)?;
+        stream.synchronize()?;
+        let same = bits_equal(&yg.to_host_vec(stream)?, &eager);
+        let nodes = graph.node_count();
+        let want_grid = [u32::try_from(m * N_KV)?, 1, 1];
+        let fold = graph
+            .nodes()?
+            .into_iter()
+            .filter_map(|n| n.kernel)
+            .find(|kn| kn.name.starts_with("gqa_flash_fold_mma_256_p12_sel"));
+        let fold_ok = fold.as_ref().is_some_and(|kn| {
+            kn.grid == want_grid && kn.block == [u32::try_from(PACK_12 * 32).unwrap_or(0), 1, 1]
+        });
+        let graph_ok = same && nodes == 4 && fold_ok;
+        println!(
+            "qsa fold chain graph m={m}: eager_vs_graph_bit_identical={same} graph_nodes={nodes} \
+             fold={:?} (want grid {want_grid:?}, block [{}, 1, 1]) {}",
+            fold.as_ref().map(|kn| (kn.grid, kn.block)),
+            PACK_12 * 32,
+            verdict(graph_ok)
+        );
+        ok &= graph_ok;
+
         // 13. Refusals: row 0's list naming the cache's height raises
         // pool_select, row 1's length zero and past the width raise key_count;
         // those rows NaN, the other row bit for bit its clean output.
@@ -3537,6 +3829,7 @@ mod gate {
             k,
             stream,
             unl,
+            SelFlash::Pass,
             &q,
             (&clean_l, &clean_n),
             2,
@@ -3576,6 +3869,7 @@ mod gate {
                 k,
                 stream,
                 gpu.layer_sink(LAYER)?,
+                SelFlash::Pass,
                 &q,
                 (&ld, &nd),
                 2,
@@ -3583,6 +3877,18 @@ mod gate {
                 SEL_CTX,
             )?;
             let raised = gpu.take_fault()?;
+            let yf = run_sel(
+                k,
+                stream,
+                gpu.layer_sink(LAYER)?,
+                SelFlash::Fold,
+                &q,
+                (&ld, &nd),
+                2,
+                (&c.kc, &c.vc),
+                SEL_CTX,
+            )?;
+            let raised_fold = gpu.take_fault()?;
             let want = Some(Fault::at(u32::try_from(LAYER)?, site));
             let other = 1 - bad_row;
             let nan = y[bad_row * w..(bad_row + 1) * w].iter().all(|v| v.is_nan());
@@ -3590,11 +3896,13 @@ mod gate {
                 &y[other * w..(other + 1) * w],
                 &clean[other * w..(other + 1) * w],
             );
-            let f_ok = before.is_none() && raised == want && nan && others;
+            let fold = raised_fold == want && bits_equal(&yf, &y);
+            let f_ok = before.is_none() && raised == want && nan && others && fold;
             println!(
                 "qsa flash fault pass=mma: {what} at row {bad_row}, layer {LAYER}: word \
                  {raised:?} (want {want:?}), that row NaN {nan}, the other row bit-identical \
-                 {others} {}",
+                 {others}; fold word {raised_fold:?}, both rows the selected bits {} {}",
+                bits_equal(&yf, &y),
                 verdict(f_ok)
             );
             ok &= f_ok;
@@ -3608,9 +3916,8 @@ mod gate {
             let mut pv = DeviceBuffer::<f32>::zeroed(stream, 1)?;
             let mut pms = DeviceBuffer::<f32>::zeroed(stream, 1)?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, 1)?;
-            let r = k.enqueue_pass_256_p12_sel(
-                stream,
-                GqaSelArgs {
+            for entry in [SelFlash::Pass, SelFlash::Fold] {
+                let attn = GqaFoldArgs {
                     q: &qd,
                     kc: &c.kc,
                     vc: &c.vc,
@@ -3621,26 +3928,43 @@ mod gate {
                     n_kv: N_KV,
                     ctx: SEL_CTX,
                     m: 2,
-                    part_v: &mut pv,
-                    part_ms: &mut pms,
                     fault: unl,
                     y: &mut y,
-                },
-                n_head,
-            );
-            // The buffers are too short as well, so the group's own refusal
-            // is told from the length check's by its words.
-            let named = matches!(
-                &r,
-                Err(GpuError::Shape { what: "flash_gqa::enqueue_256_p12_sel", detail })
-                    if detail.contains("in one block")
-            );
-            println!(
-                "qsa flash group refusal {n_head} heads over {N_KV}: {} {}",
-                r.err().map_or("accepted".to_string(), |e| e.to_string()),
-                verdict(named)
-            );
-            ok &= named;
+                };
+                let (name, want, r) = match entry {
+                    SelFlash::Pass => (
+                        "flash",
+                        "flash_gqa::enqueue_256_p12_sel",
+                        k.enqueue_pass_256_p12_sel(
+                            stream,
+                            GqaSelArgs {
+                                attn,
+                                part_v: &mut pv,
+                                part_ms: &mut pms,
+                            },
+                            n_head,
+                        ),
+                    ),
+                    SelFlash::Fold => (
+                        "fold",
+                        "flash_gqa::enqueue_fold_256_p12_sel",
+                        k.enqueue_fold_256_p12_sel(stream, attn, n_head),
+                    ),
+                };
+                // The buffers are too short as well, so the group's own
+                // refusal is told from the length check's by its words.
+                let named = matches!(
+                    &r,
+                    Err(GpuError::Shape { what, detail })
+                        if *what == want && detail.contains("in one block")
+                );
+                println!(
+                    "qsa {name} group refusal {n_head} heads over {N_KV}: {} {}",
+                    r.err().map_or("accepted".to_string(), |e| e.to_string()),
+                    verdict(named)
+                );
+                ok &= named;
+            }
         }
         Ok(ok)
     }
@@ -3742,14 +4066,46 @@ mod gate {
                 .collect();
             let exacts = exact_listed(&q, &rows, &host);
             let lsel = (&scratch.list, &scratch.n_sel);
-            let y = run_sel(k, stream, unl, &q, lsel, m, (&kc, &vc), DEEP_CTX)?;
-            let yn = run_sel(k, stream, unl, &q, lsel, m, (&kn, &vn), DEEP_CTX)?;
+            let y = run_sel(
+                k,
+                stream,
+                unl,
+                SelFlash::Pass,
+                &q,
+                lsel,
+                m,
+                (&kc, &vc),
+                DEEP_CTX,
+            )?;
+            let yn = run_sel(
+                k,
+                stream,
+                unl,
+                SelFlash::Pass,
+                &q,
+                lsel,
+                m,
+                (&kn, &vn),
+                DEEP_CTX,
+            )?;
+            let yf = run_sel(
+                k,
+                stream,
+                unl,
+                SelFlash::Fold,
+                &q,
+                lsel,
+                m,
+                (&kc, &vc),
+                DEEP_CTX,
+            )?;
             let (band, worst) = judge(&exacts, &y, Pass::Mma);
-            let nan_same = bits_equal(&y, &yn);
-            let pass_ok = band && nan_same;
+            let (nan_same, fold) = (bits_equal(&y, &yn), bits_equal(&yf, &y));
+            let pass_ok = band && nan_same && fold;
             println!(
                 "qsa deep flash {name} pass=mma counts={counts:?}: measured/bound \
-                 {worst:.3e} band={band} nan_in_unlisted_rows_same={nan_same} {}",
+                 {worst:.3e} band={band} nan_in_unlisted_rows_same={nan_same} fold = selected \
+                 bit for bit {fold} {}",
                 verdict(pass_ok)
             );
             ok &= pass_ok;
@@ -3861,6 +4217,136 @@ mod gate {
         Ok(ok)
     }
 
+    /// The bench's cache height: a 4,096-position prompt and 128 more, one of
+    /// four sequences of a 16,896-position load.
+    const BENCH_CTX: usize = 4224;
+
+    /// One run of a bench arm: its rows' indexer queries, counts, attention
+    /// queries and output.
+    struct BenchRun {
+        qi: DeviceBuffer<f32>,
+        nk: DeviceBuffer<u32>,
+        q: DeviceBuffer<f32>,
+        y: DeviceBuffer<f32>,
+        m: usize,
+    }
+
+    /// `--bench-kernels` (module doc).
+    fn bench_select(gpu: &Gpu, k: &FlashGqaKernels, qk: &QsaKernels) -> Result<(), GateError> {
+        const N: usize = 4096;
+        const ROUNDS: usize = 7;
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let idx = idx_inputs(stream, BENCH_CTX, 801, false)?;
+        let (pooled, _) = pool_plane(qk, stream, &idx, N, N, unl)?;
+        let c = cache(stream, HEAD, N_KV, BENCH_CTX, N, 810)?;
+        let first = (1..=N)
+            .find(|&n| qsa_shape().scored(n, BENCH_CTX))
+            .unwrap_or(N);
+        let counts: Vec<u32> = (first..=N).map(u32::try_from).collect::<Result<_, _>>()?;
+        let (w, qw) = (Q38.width(), IDX_HEADS * IDX_DIM);
+        let qi = idx_queries(counts.len(), 811);
+        let qa: Vec<f32> = activations(HEAD, counts.len() * N_HEAD_Q38, 812)
+            .iter()
+            .map(|v| v * SEED_Q_SCALE)
+            .collect();
+        let mut pv = DeviceBuffer::<f32>::zeroed(
+            stream,
+            listed_partials_v_len_256(MAX_ROWS, N_HEAD_Q38, WIDTH),
+        )?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(
+            stream,
+            listed_partials_ms_len(MAX_ROWS, N_HEAD_Q38, WIDTH),
+        )?;
+        for rows in [8, 64, 256, counts.len()] {
+            let mut outs = Vec::new();
+            for (arm, run, fold) in [("pass8", MAX_ROWS, false), ("fold", rows, true)] {
+                let mut runs = Vec::new();
+                for t0 in (0..rows).step_by(run) {
+                    let m = run.min(rows - t0);
+                    runs.push(BenchRun {
+                        qi: DeviceBuffer::from_host(stream, &qi[t0 * qw..(t0 + m) * qw])?,
+                        nk: DeviceBuffer::from_host(stream, &counts[t0..t0 + m])?,
+                        q: DeviceBuffer::from_host(stream, &qa[t0 * w..(t0 + m) * w])?,
+                        y: DeviceBuffer::zeroed(stream, m * w)?,
+                        m,
+                    });
+                }
+                let mut scratch = QsaScratch::new(stream, run, BENCH_CTX, KEPT)?;
+                let mut ms = Vec::new();
+                for round in 0..=ROUNDS {
+                    let t = std::time::Instant::now();
+                    for r in &mut runs {
+                        qk.enqueue_select(
+                            stream,
+                            SelectArgs {
+                                q: &r.qi,
+                                gain: &idx.gq_d,
+                                table: &idx.table_d,
+                                n_keys: &r.nk,
+                                pooled: &pooled,
+                                eps: EPS,
+                                ctx: BENCH_CTX,
+                                kept: KEPT,
+                                m: r.m,
+                                fault: unl,
+                                scratch: &mut scratch,
+                            },
+                        )?;
+                        let attn = GqaFoldArgs {
+                            q: &r.q,
+                            kc: &c.kc,
+                            vc: &c.vc,
+                            list: &scratch.list,
+                            n_sel: &scratch.n_sel,
+                            width: WIDTH,
+                            scale: scale(),
+                            n_kv: N_KV,
+                            ctx: BENCH_CTX,
+                            m: r.m,
+                            fault: unl,
+                            y: &mut r.y,
+                        };
+                        if fold {
+                            k.enqueue_fold_256_p12_sel(stream, attn, N_HEAD_Q38)?;
+                        } else {
+                            k.enqueue_pass_256_p12_sel(
+                                stream,
+                                GqaSelArgs {
+                                    attn,
+                                    part_v: &mut pv,
+                                    part_ms: &mut pms,
+                                },
+                                N_HEAD_Q38,
+                            )?;
+                        }
+                    }
+                    stream.synchronize()?;
+                    if round > 0 {
+                        ms.push(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                ms.sort_by(f64::total_cmp);
+                println!(
+                    "bench sel rows={rows} arm={arm} runs={} ms least={:.3} median={:.3}",
+                    runs.len(),
+                    ms[0],
+                    ms[ROUNDS / 2]
+                );
+                let mut y = Vec::new();
+                for r in &runs {
+                    y.extend(r.y.to_host_vec(stream)?);
+                }
+                outs.push(y);
+            }
+            println!(
+                "bench sel rows={rows}: the two arms' outputs the same bits {}",
+                bits_equal(&outs[0], &outs[1])
+            );
+        }
+        Ok(())
+    }
+
     /// The new entries compile with no local depot (module doc, 14).
     fn sel_shapes() -> Result<bool, GateError> {
         no_local_depot(&[
@@ -3868,6 +4354,7 @@ mod gate {
             "qsa_score",
             "qsa_topk",
             "gqa_flash_seg_mma_256_p12_sel",
+            "gqa_flash_fold_mma_256_p12_sel",
         ])
     }
 
@@ -3879,6 +4366,9 @@ mod gate {
         let kp = FlashGqaPrefill::load(ctx)?;
         let gq = GatedQuantKernels::load(ctx)?;
         let qk = QsaKernels::load(ctx)?;
+        if std::env::args().any(|a| a == "--bench-kernels") {
+            return bench_select(&gpu, &k, &qk);
+        }
         println!(
             "gate_qwen35moe_attn: device {} — {N_HEAD}/{N_KV} heads of {HEAD}, rope over {ROT} at \
              θ {THETA:e}, scale {:e}",

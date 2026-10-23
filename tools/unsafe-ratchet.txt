@@ -487,7 +487,10 @@ gguf 7 2 0
 # into its private staging extent and keeps it lent until the lane drains.
 # PIN(2026-10-23): gpu 2267 -> 2268 blocks, new test-only pinned source view
 # for the XStream fallback copy's lifetime contract, with its SAFETY line.
-gpu 2268 281 10
+# PIN(2026-10-24): gpu 2268 -> 2272 blocks, 281 -> 282 fns, new code, not old code relaxed: the folded selected flash
+# (`flash_gqa::fold_mma_ps`, an unsafe fn under the segment pass's contract, with its row count read, its refused-row
+# and output writes, and its kernel entry's body call), each block with its SAFETY line.
+gpu 2272 282 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

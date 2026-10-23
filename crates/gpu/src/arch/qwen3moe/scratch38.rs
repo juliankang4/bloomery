@@ -31,10 +31,21 @@ use runtime::stores;
 /// The most tokens an eager pass walks: the m-column kernels' width.
 pub(super) const PASS_ROWS: usize = 8;
 
-/// The most rows one selection and one selected flash take: a pass selects
-/// its rows in one launch, a ubatch walk its selecting rows in runs of this
-/// many.
-pub(super) const SELECT_ROWS: usize = qsa::MAX_ROWS;
+/// The rows one selecting run of a ubatch walk of up to `rows` tokens takes
+/// over caches of `ctx` positions: as many as the plan's selection bytes
+/// (`place::SELECT_RUN_BYTES`) hold at the selection's bytes a row
+/// ([`QsaScratch::row_bytes`]), in whole groups of the score pass's
+/// [`qsa::MAX_ROWS`], at least one group and at most `rows`. Each run uses
+/// two selection launches and one attention launch; attention folds its
+/// segments without partials.
+pub(super) fn select_run(rows: usize, ctx: usize) -> usize {
+    let row = QsaScratch::row_bytes(ctx, geo::KEPT) as u64;
+    let fit = usize::try_from(model::arch::qwen35moe::place::SELECT_RUN_BYTES / row)
+        .expect("a quotient of the plan's selection bytes fits a 64-bit usize");
+    (fit / qsa::MAX_ROWS * qsa::MAX_ROWS)
+        .max(qsa::MAX_ROWS)
+        .min(rows)
+}
 
 /// The most tokens one router launch of a ubatch walk takes, and so one
 /// routed table over them: 2,048 tokens at the router's eleven slots a token
@@ -49,7 +60,6 @@ const _: () = assert!(
     linear::PASS_ROWS == stores::PASS_ROWS
         && linear::RING_ROWS == stores::conv_ring_rows(linear::CONV_TAPS)
         && ple::RING_ROWS == stores::ple_ring_rows(ple::TAPS, ple::DILATION)
-        && PASS_ROWS <= SELECT_ROWS
         && PASS_ROWS <= stores::PASS_ROWS
         && ROUTE_ROWS * (geo::N_USED + 1) <= crate::gemm::GEMM_MAX_SLOTS
 );
@@ -169,7 +179,8 @@ pub(super) struct Qsa38 {
     pub(super) v: DeviceBuffer<f32>,
     /// The normed and turned queries.
     pub(super) q: DeviceBuffer<f32>,
-    /// The flash's partials, over a list's width.
+    /// The flash's partials, over a list's width: a pass's rows, none in a
+    /// ubatch walk's arena (its selected flash folds without them).
     pub(super) part_v: DeviceBuffer<f32>,
     pub(super) part_ms: DeviceBuffer<f32>,
     /// The indexer's raw keys and queries, token-major.
@@ -245,13 +256,13 @@ impl Arena38 {
             ));
         }
         let route = RouterOut::with_tokens(stream, router, rows)?;
-        Arena38::alloc(stream, rows, rows, route, ctx)
+        Arena38::alloc(stream, rows, (rows, rows), route, ctx)
     }
 
     /// A ubatch walk's arena for up to `rows` (1..=`most`) tokens over caches
     /// of `ctx` positions: every token-major buffer for `rows` tokens, the
-    /// selection's scratch and the selected flash's partials for
-    /// [`SELECT_ROWS`] (its selecting rows run in runs of that many), the
+    /// selection's scratch for a run of [`select_run`] rows (its selecting
+    /// rows run in runs of that many) and no selected-flash partials, the
     /// router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
     /// Load-time only.
     pub(super) fn wide(
@@ -268,15 +279,15 @@ impl Arena38 {
             ));
         }
         let route = RouterOut::for_ubatch(stream, router, rows.min(ROUTE_ROWS))?;
-        Arena38::alloc(stream, rows, rows.min(SELECT_ROWS), route, ctx)
+        Arena38::alloc(stream, rows, (select_run(rows, ctx), 0), route, ctx)
     }
 
-    /// The buffers for `rows` tokens, the selection's for `sel` rows, the
-    /// router's `route`.
+    /// The buffers for `rows` tokens, the selection's for `sel` rows and the
+    /// selected flash's partials for `parts`, the router's `route`.
     fn alloc(
         stream: &CudaStream,
         rows: usize,
-        sel: usize,
+        (sel, parts): (usize, usize),
         route: RouterOut,
         ctx: usize,
     ) -> Result<Arena38, GpuError> {
@@ -314,11 +325,11 @@ impl Arena38 {
                 q: f(geo::ATTN)?,
                 part_v: DeviceBuffer::zeroed(
                     stream,
-                    listed_partials_v_len_256(sel, geo::N_HEAD, width),
+                    listed_partials_v_len_256(parts, geo::N_HEAD, width),
                 )?,
                 part_ms: DeviceBuffer::zeroed(
                     stream,
-                    listed_partials_ms_len(sel, geo::N_HEAD, width),
+                    listed_partials_ms_len(parts, geo::N_HEAD, width),
                 )?,
                 kr: f(geo::IDX_DIM)?,
                 qi: f(geo::IDX_HEADS * geo::IDX_DIM)?,

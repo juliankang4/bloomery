@@ -163,6 +163,7 @@ generate_ds41   gemm_route_remap                         0           0
 generate_ds41   gemm_swiglu_quant                        0           0
 generate_ds41   glm5next_router                          0           0
 generate_ds41   glm5next_router_pick                     0           0
+generate_ds41   gqa_flash_fold_mma_256_p12_sel           0           0
 generate_ds41   gqa_flash_merge                          0           0
 generate_ds41   gqa_flash_merge_256                      0           0
 generate_ds41   gqa_flash_merge_sink                     0           0
