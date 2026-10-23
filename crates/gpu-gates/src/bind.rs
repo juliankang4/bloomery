@@ -2619,8 +2619,8 @@ fn resume_prefix_of<S: Seat + ?Sized>(
 /// server's kind: a staging pool with no room for the state
 /// (`bloomery_gpu::checkpoint::staging::NoRoom` anywhere in the chain) is
 /// `NoRoom`, its three numbers one to one, which the server answers by giving
-/// up its oldest landed state and asking once more; a refusal by name (a
-/// `GpuError` of kind `State` or `Shape` anywhere in the chain,
+/// up its landed states, oldest first, until the copy fits; a refusal by name
+/// (a `GpuError` of kind `State` or `Shape` anywhere in the chain,
 /// [`Seat::snapshot`]) is `Format`, the request's, which the server answers
 /// by keeping no state or by resetting the slot; any other failure — the
 /// card's, the driver's, a fault, an error of no known kind — is `Engine`,

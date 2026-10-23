@@ -766,7 +766,7 @@ pub enum CacheNote {
     /// `off_path`: the state is a [`Pending`] begun when its request ended,
     /// its copy running on the engine's copy stream; `ms` is then the call
     /// that began it and [`CacheNote::Landed`] follows. `fallback`: the
-    /// engine's staging pool had no room for it even after the oldest landed
+    /// engine's staging pool had no room for it even after every landed
     /// state left, so it was taken on the request path: `full` (the pool's
     /// free bytes cannot hold it) or `fragmented` (they could, in one piece;
     /// [`StateError::fallback`]).

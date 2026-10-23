@@ -2391,7 +2391,7 @@ pub static CACHE_REUSE: Kind = Kind {
 pub static CACHE_SAVE: Kind = Kind {
     name: "cache_save",
     head: "cache save",
-    doc: "The slot's state went into the prompt cache: its positions and bytes, the server's wall clock around the snapshot (the call that began the copy when off_path), the cache after it, whether its copy runs off the request path, on the engine's copy stream, and the fallback: none, or full or fragmented when the staging pool had no room for the copy even after its oldest landed state left, so the snapshot was taken on the request path.",
+    doc: "The slot's state went into the prompt cache: its positions and bytes, the server's wall clock around the snapshot (the call that began the copy when off_path), the cache after it, whether its copy runs off the request path, on the engine's copy stream, and the fallback: none, or full or fragmented when the staging pool had no room for the copy even after every landed state left, so the snapshot was taken on the request path.",
     parts: &[
         key("positions", U64, "positions"),
         key("bytes", U64, "B"),
