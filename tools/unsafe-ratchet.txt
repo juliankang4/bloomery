@@ -482,7 +482,8 @@ gguf 7 2 0
 # BF16 joined weight (Qwen3.8's router in its words, two kernel entries' body calls), and RowValues' chunk loads
 # (chunks8 and chunks32, a provided body each and a BF16 override each that loads the words before widening them)
 # replacing f32_load_chunks, with the 32-chunk walk reading w and x in a block each. Each block has its SAFETY line.
-gpu 2269 281 10
+# PIN(2026-10-23): gpu 2269 -> 2266 blocks; checked windows replace the MTP hidden-row views and the store inbox view.
+gpu 2266 281 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
