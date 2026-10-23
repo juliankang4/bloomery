@@ -120,16 +120,16 @@ with tempfile.TemporaryDirectory(prefix="output-owner-") as tmp:
     copies = replay[replay.index('for arm in base new; do', replay.index('# The measured seconds,')):replay.index('# Each arm')]
     probe = replay[replay.index("BASE_BUDGET_OK=''"):replay.index('run_arm new --over-budget-ok')]
     for base, expected in ((legacy, ""), ("HEAD", "1")):
-        for mutant in (False, True):
+        for mutant in (("none", "resources") if base == legacy else ("none", "resources", "budget")):
             work = t / f"copy-{base}-{mutant}"
             work.mkdir()
-            code = copies.replace('cp "$ROOT/tools/gate-batch-resources.tsv"', ':') if mutant else copies
-            code += probe.replace('then BASE_BUDGET_OK=1;', 'then BASE_BUDGET_OK=;') if mutant else probe
+            code = copies.replace('cp "$ROOT/tools/gate-batch-resources.tsv"', ':') if mutant == "resources" else copies
+            code += probe.replace('then BASE_BUDGET_OK=1;', 'then BASE_BUDGET_OK=;') if mutant == "budget" else probe
             result = run('set -euo pipefail; ROOT=$1; WORK=$2; BASE_REV=$3; ' + code + '\necho "budget=$BASE_BUDGET_OK"', repo, work, base)
             valid = (result.returncode == 0 and result.stdout.strip() == f"budget={expected}"
                      and (work / "new/tools/gate-batch-resources.tsv").read_text() == "fixture\tm\t1\n"
                      and (work / "base/tools/gate-batch-resources.tsv").exists() == (base == "HEAD")) if (work / "new/tools/gate-batch-resources.tsv").exists() else False
-            check(f"batch-replay base={base} resources and budget mutant={mutant}", valid != mutant, result.stdout.strip())
+            check(f"batch-replay base={base} resources and budget mutant={mutant}", valid == (mutant == "none"), result.stdout.strip())
 print(f"output-owner self-test: {checks - bad} of {checks} ok")
 sys.exit(bool(bad))
 PY
