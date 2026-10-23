@@ -520,6 +520,7 @@ struct DraftGated {
     inner: Box<dyn Engine>,
     log: Arc<EntryLog>,
     calls: Arc<Mutex<Vec<(usize, char)>>>,
+    pass: Option<Arc<EntryLog>>,
 }
 
 impl Engine for DraftGated {
@@ -535,6 +536,11 @@ impl Engine for DraftGated {
         self.inner.next(last, out)
     }
     fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        if let Some(pass) = &self.pass
+            && self.log.len_reached(self.slots(), Duration::ZERO)
+        {
+            pass.enter("advance".to_owned());
+        }
         let d = self.inner.advance(last, out)?;
         self.calls.lock().expect("calls").push((0, 'a'));
         Ok(d)
@@ -791,6 +797,7 @@ fn hw_drafted_passes_interleave_across_slots() {
             inner: Box::new(serve::DraftMock::new(4096).with_slots(2)),
             log: Arc::clone(&log),
             calls: Arc::clone(&calls),
+            pass: None,
         }),
         2,
         None,
@@ -927,6 +934,7 @@ fn hw_a_drafted_round_is_one_advance_slots_call_of_every_running_slot() {
             inner: Box::new(serve::DraftMock::new(4096).with_slots(2)),
             log: Arc::clone(&log),
             calls: Arc::clone(&calls),
+            pass: None,
         }),
         2,
         None,
@@ -986,6 +994,7 @@ fn hw_mixed_step_and_pass_rows() {
             inner: Box::new(serve::DraftMock::new(4096).with_slots(2)),
             log: Arc::clone(&log),
             calls: Arc::clone(&calls),
+            pass: None,
         }),
         2,
         None,
@@ -1037,6 +1046,103 @@ fn hw_mixed_step_and_pass_rows() {
         per > 1.0,
         "the requests never ran one round together: {per}"
     );
+}
+
+/// Plain steps reach their streams before the round's drafted passes, even
+/// when ending a plain request removes an entry before the drafted slots.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_plain_steps_reach_clients_before_drafted_passes() {
+    for n in [2, 4] {
+        for finish in [false, true] {
+            let log = Arc::new(EntryLog::default());
+            let pass = Arc::new(EntryLog::default());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let addr = start_n(
+                Box::new(DraftGated {
+                    inner: Box::new(serve::DraftMock::new(4096).with_slots(n)),
+                    log: Arc::clone(&log),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    pass: Some(Arc::clone(&pass)),
+                }),
+                n,
+                None,
+                None,
+            );
+            let bodies: Vec<Value> = PROMPTS[..n]
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let plain = i < n / 2;
+                    json!({"prompt": p, "n_predict": if finish && plain {
+                        if i == 0 { 3 } else { 2 }
+                    } else { 8 }, "temperature": if plain { 0.8 } else { 0.0 }, "seed": 7,
+                        "cache_prompt": false, "ignore_eos": true,
+                        "return_tokens": true, "stream": true, "timings_per_token": true})
+                })
+                .collect();
+            let mut readers = Vec::new();
+            for (i, body) in bodies.iter().cloned().enumerate() {
+                let seen = Arc::clone(&seen);
+                readers.push(std::thread::spawn(move || read_stream(addr, &body, &seen)));
+                if i == 0 {
+                    assert!(log.len_reached(1, BOUND), "the first prompt never ran");
+                } else {
+                    wait_deferred(addr, i, BOUND);
+                }
+            }
+            log.release();
+            let entered = pass.len_reached(1, BOUND);
+            let until = Instant::now() + BOUND;
+            let delivered = loop {
+                let seen = seen.lock().expect("seen");
+                let ready = (0..n / 2).all(|i| {
+                    seen.iter().any(|(_, slot, last, v)| {
+                        *slot == i as u64
+                            && if finish {
+                                *last
+                            } else {
+                                v["timings"]["predicted_n"]
+                                    .as_u64()
+                                    .is_some_and(|k| k >= if i == 0 { 3 } else { 2 })
+                            }
+                    })
+                });
+                if ready || Instant::now() >= until {
+                    break ready;
+                }
+                drop(seen);
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            pass.release();
+            for reader in readers {
+                reader.join().expect("stream reader");
+            }
+            assert!(entered, "N = {n}: no mixed round reached a drafted pass");
+            assert!(
+                delivered,
+                "N = {n}, finish = {finish}: plain steps waited for a drafted pass"
+            );
+            let seen = seen.lock().expect("seen");
+            for body in &bodies {
+                let got = seen
+                    .iter()
+                    .find(|(_, _, last, v)| *last && v["prompt"] == body["prompt"])
+                    .expect("each request finishes");
+                let mut body = body.clone();
+                body["stream"] = json!(false);
+                let alone = start_n(
+                    Box::new(serve::DraftMock::new(4096).with_slots(n)),
+                    n,
+                    None,
+                    None,
+                );
+                let want = post(alone, "/completion", &body).json();
+                assert_eq!(got.3["tokens"], want["tokens"], "N = {n}: {body}");
+                assert_eq!(got.3["content"], want["content"], "N = {n}: {body}");
+            }
+        }
+    }
 }
 
 /// A drafting engine of two slots that declares no per-slot draft state is
