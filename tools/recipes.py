@@ -12964,6 +12964,10 @@ def class_stage_self_test(fails: list[str]) -> None:
 def self_test(serial: bool = False) -> int:
     side = make_side(ROOT)
     gates = [n for n in side.recipes if n.startswith(GATE_PREFIX)]
+    # The children inherit the real tree's input and reach memos copy-on-write.
+    for name in gates:
+        side.graph.inputs(name)
+        reach_of(side.tree).gate_files(side.graph, name)
 
     def small(f: list[str]) -> None:
         expect = _expecting(f)

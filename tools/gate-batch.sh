@@ -664,7 +664,7 @@ disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line,
 # after another in this process, the serial form). The summary names the three slowest cases.
 SELFTEST_PARTS=18
 self_test() {
-  local self t h n=0 bad=0 out rc part=${1:-all} case_t0=$SECONDS
+  local self t h n=0 bad=0 out rc real_classes part=${1:-all} case_t0=$SECONDS
   gb_part() {
     if [ "$part" = all ] || [ "$part" = "$1" ]; then
       case_t0=$SECONDS # the block's first case starts here, not at the previous part's shared setup
@@ -2793,6 +2793,7 @@ HK
   want_no_row '  … and made no box call at all' "$t/fake-state/box.log" '1'
   check "real-file: the tree's own recipes.py reaches the fence for a gate that opens the model, and not for one that opens none" 0 \
     '^gate-gpu-p1	D	real-file	-	family deepseek2: .* bloomery-gpu-gates:bin:gate_p1 reaches the fixture fence at crates/gpu-gates/src/bin/gate_p1\.rs:[0-9]+ \(' bash "$self" --tier fixture --classes
+  real_classes=$out
   # The fixture table is tools/fixture-dirs.tsv's: a table this reader cannot read is a named error.
   cp "$t/tools/fixture-dirs.tsv" "$t/fixture-dirs.good"
   rm -f "$t/tools/fixture-dirs.tsv"
@@ -2806,8 +2807,8 @@ HK
   check "no-fixture: a family in the table twice: a named error" 65 'line 7: the family .qwen4exp. is in the table twice' "${gb[@]}" --tier fixture --classes
   cp "$t/fixture-dirs.good" "$t/tools/fixture-dirs.tsv"
   # The real table: the tree's own tools/fixture-dirs.tsv parses, and the family it names runs (a converted V4.1 gate is balanced, not deferred).
-  check "no-fixture: the tree's own tools/fixture-dirs.tsv is a table this runner reads" 0 '^gate-gpu-ds41-step	F	balanced	' bash "$self" --tier fixture --classes
-  out=$(bash "$self" --tier fixture --classes 2>&1) || fail "no-fixture: the tree's own table: the classes run failed" "$out"
+  check "no-fixture: the tree's own tools/fixture-dirs.tsv is a table this runner reads" 0 '^gate-gpu-ds41-step	F	balanced	' printf '%s\n' "$real_classes"
+  out=$real_classes
   if grep -q '^gate-gpu-nemotron-serve	F	balanced	' <<< "$out" && grep -q '^gate-gpu-nemotron-h-moe-e2e	F	balanced	' <<< "$out"; then
     pass "no-fixture: the tree's own table names both Nemotron families (nemotron_h, nemotron_h_moe), whose gates the fixture tier places"
   else fail "no-fixture: the tree's own table names both Nemotron families (nemotron_h, nemotron_h_moe), whose gates the fixture tier places" "$(grep -E '^gate-gpu-nemotron' <<< "$out")"; fi
