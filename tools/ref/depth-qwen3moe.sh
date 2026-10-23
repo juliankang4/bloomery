@@ -2132,7 +2132,7 @@ for i in "${!ARMS[@]}"; do
       probe_rc=0
       lease_capture 60 env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} CUDA_VISIBLE_DEVICES=-1 \
         "${A_BIN[$i]}" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --arm || probe_rc=$?
-      if [ "$probe_rc" -ne 0 ] && [ "${LEASE_OUT##*$'\n'}" = 'generate_qwen3moe: --arm needs a value' ]; then
+      if [ "$probe_rc" -eq 1 ] && [ "${LEASE_OUT##*$'\n'}" = 'generate_qwen3moe: --arm needs a value' ]; then
         A_INPUT[i]=--arm
       fi
       ;;

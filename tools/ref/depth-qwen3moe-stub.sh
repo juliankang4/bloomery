@@ -466,7 +466,7 @@ while [ $# -gt 0 ]; do
         echo 'generate_qwen3moe: give exactly one of --prompt, --tokens, --seed-depth' >&2
         exit 1
       fi
-      if [ $# -eq 1 ]; then echo 'generate_qwen3moe: --arm needs a value' >&2; exit 1; fi
+      if [ $# -eq 1 ]; then echo 'generate_qwen3moe: --arm needs a value' >&2; exit "${STUB_GEN_PROBE_RC:-1}"; fi
       arms+=("$2"); shift ;;
     --arm-sync) sync=1 ;; --place) place=$2; shift ;;
   esac
@@ -1763,9 +1763,10 @@ elif want bin-timed-faults "$L" 1 '^COLD r1 bin:base d=6 .*\| majflt 200000 \(ti
   pass bin-timed-faults
 fi
 
-for mode in NO_ARM NO_MARK; do
+for spec in NO_ARM=1 NO_MARK=1 PROBE_RC=0 PROBE_RC=70; do
+  mode=${spec//=/-}
   L=$tmp/bin-fallback-$mode.log
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_GEN_LOAD_FAULTS=100000 "STUB_GEN_$mode=1" -- "bin:$BASEBIN:6"
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_GEN_LOAD_FAULTS=100000 "STUB_GEN_$spec" -- "bin:$BASEBIN:6"
   if [ "$RC" != 1 ]; then
     fail "bin-fallback-$mode" "rc $RC, want 1" "$L"
   elif want "bin-fallback-$mode" "$L" 1 '^COLD r1 bin:base d=6 .*\| majflt 100000 \(timed \? .*the whole process\); ' &&
