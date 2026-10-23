@@ -601,7 +601,9 @@ gpu-deepseek41 382 44 0
 # PIN(2026-10-22): gpu-gates 99 -> 103 blocks, new code, not old code relaxed: gate_gpu_device's module load, its raise
 # kernel's FaultSink over the gate's own fault word and its atomic view of the first word for a layer past the last,
 # and the host flag's drop once the stream that waited on it is drained, each with its SAFETY line.
-gpu-gates 103 5 1
+# PIN(2026-10-24): gpu-gates 103 -> 104 blocks, new code, not old code relaxed: gate_qwen35moe_attn's launch of the
+# head-256 append at no query head over the rows rope_gate::run checks distinct, with its SAFETY line.
+gpu-gates 104 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of

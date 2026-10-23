@@ -15,7 +15,9 @@
 //!    of the turned key and of the value — bit for bit, the planes' other rows
 //!    untouched, and a rerun bit for bit. A position at the cache's height
 //!    raises `cache_pos` with the launch's layer, leaves that token's heads NaN
-//!    and appends nothing; every other token is the clean run's. Its q8_0
+//!    and appends nothing; every other token is the clean run's. At no query
+//!    head (`n_head` 0, a store's append) the launch turns the keys and
+//!    appends both planes' rows to the same bits and writes no query. Its q8_0
 //!    append (`head_norm_neox_append_256_q8`) runs the same inputs: the heads
 //!    the f16 entry's bit for bit, every appended row the two planes of
 //!    `quantize_q8_0` (the engine's one Q8_0 quantizer) over the same f32
@@ -235,7 +237,9 @@ mod gate {
         DIM as IDX_DIM, HEADS as IDX_HEADS, MAX_ROWS, POOL, PoolArgs, QsaKernels, QsaScratch,
         ROT as IDX_ROT, SelectArgs, list_width, pools_for,
     };
-    use bloomery_gpu::rope_neox::{ROT_256 as ROT, RopeNeoxKernels, q8_plane_lens};
+    use bloomery_gpu::rope_neox::{
+        PartialNeoxArgs, ROT_256 as ROT, RopeNeoxKernels, q8_plane_lens,
+    };
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::route_core::sigmoid;
     use bloomery_gpu::weights::q8_0_planes;
@@ -522,7 +526,47 @@ mod gate {
             rope_gate::check_overflow::<HEAD>(gpu, &inp, &pos, shape, LAYER, |i, p, f| {
                 rope_run(kern, gpu.stream(), i, p, f)
             })?;
-        Ok(exact && overflow)
+        let keys = rope_keys_alone(gpu, kern, (&inp, &pos), shape)?;
+        Ok(exact && overflow && keys)
+    }
+
+    /// Clause 1's launch at no query head (`n_head` 0, a store's append): over
+    /// the same inputs it turns the keys in place and appends the key and
+    /// value rows the launch with its query heads does, bit for bit, and writes
+    /// no query (the query rows keep their zero fill). A refusal is the
+    /// clause's red line.
+    fn rope_keys_alone(
+        gpu: &Gpu,
+        kern: &RopeNeoxKernels,
+        (inp, pos): (&RopeIn, &[u32]),
+        shape: RopeShape,
+    ) -> Result<bool, GateError> {
+        let unl = gpu.unlabelled_sink();
+        let full = rope_run(kern, gpu.stream(), inp, pos, unl)?;
+        let keys = rope_gate::run(gpu.stream(), inp, pos, shape, unl, |s, args| {
+            // SAFETY: rope_gate::run checks the host positions are distinct before enqueue.
+            unsafe {
+                kern.enqueue_head_norm_neox_append_256(s, PartialNeoxArgs { n_head: 0, ..args })
+            }
+        });
+        let keys = match keys {
+            Ok(keys) => keys,
+            Err(e) => {
+                println!("rope keys alone: the launch at no query head refused: {e} FAIL");
+                return Ok(false);
+            }
+        };
+        let same = bits_equal(&keys.k, &full.k) && keys.ck == full.ck && keys.cv == full.cv;
+        let no_query = keys.q.iter().all(|v| v.to_bits() == 0);
+        let pass = same && no_query && gpu.fault()?.is_none();
+        println!(
+            "rope keys alone: m={} at no query head, the keys in place and both planes the \
+             launch's with {} query heads bit for bit {same}, no query written {no_query} {}",
+            pos.len(),
+            shape.n_head,
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// The q8_0 append's launch (`head_norm_neox_append_256_q8`) read back:

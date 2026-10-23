@@ -168,7 +168,7 @@ const DRAFT_MAP: u64 = 993_280;
 const LIST_ROWS: u32 = 40_960;
 // The largest context each card holds with the draft (full head), as predicted [derived: the plan
 // test's room after its fixed terms, less the draft granules 2,785,017,856 B, the map 993,280 B
-// and the arena 53,526,700 B, over 30,720 B a position — the cache's 28,416, the draft store's
+// and the arena 48,808,108 B, over 30,720 B a position — the cache's 28,416, the draft store's
 // 2,048 and the stage rope table's 256 — the last pool counted whole, then one fewer]. Printed
 // beside the boundary the test finds; the clause holds the plan to that boundary.
 // PIN(2026-10-15): the arena stays one fixed addend (mtp_arena_bytes at vocab 248,320). Room
@@ -177,7 +177,10 @@ const LIST_ROWS: u32 = 40_960;
 // PIN(2026-10-21): the dense and rounding bytes fall 37,748,736 B (qwen4exp_meta's CARD_DENSE), so the
 // room is 37,288,846,612 (A6000) and 11,686,814,996 (3090) over 30,720: 1,213,829 and 380,430; the
 // pin is one fewer.
-const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_213_828), ("3090", 380_429)];
+// PIN(2026-10-24): the arena falls 4,718,592 B (the store walk's query rows and turned queries),
+// so the room is 37,293,565,204 (A6000) and 11,691,533,588 (3090) over 30,720: 1,213,983 and
+// 380,583; the pin is one fewer.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_213_982), ("3090", 380_582)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
@@ -462,8 +465,14 @@ fn hw_qwen4exp_mtp_plan() {
 // layers [derived: the planner on the file's tensor table over the A6000 and tier machines of this
 // row with the draft's reserve of 2,847,926,444 B, the old row exactly under the old rule; the box's
 // planner on this tree printed this one].
+// PIN(2026-10-24): the A6000 243 on the first 5 layers (was 3), both cards 393 on the first 41
+// (was 39), the tier's 22,674,944,000 B of experts (was 22,675,456,000) and 148,361,216 B of
+// rounding (was 147,849,216). The store walk's arena holds no query rows or turned queries
+// (`place::mtp_arena_bytes`, 4,718,592 B less): plan (a)'s drafted row gains 2 experts, both cards'
+// totals the same 2, and the tier keeps its 7,236 experts on other layers [the box's planner on
+// this tree printed this row].
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (243, 3, 242, 393, 39, 7_236, 22_675_456_000, 147_849_216);
+    (243, 5, 242, 393, 41, 7_236, 22_674_944_000, 148_361_216);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`

@@ -1047,21 +1047,20 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 /// `vocab` f32; the readback 18 u32, its ticket count, the stand-in map word
 /// and the chain's 10 words; the taps none (the engine's walk arms none) —
 /// 1,212,160 + 8 · `vocab` f32 and 793 u32; then the store walk's arena for 64
-/// rows, 6,219,282 values: the hidden rows 655,360, the embedding 163,840 and
+/// rows, 5,039,634 values: the hidden rows 655,360, the embedding 163,840 and
 /// its positions and key counts 128, the pack 1,310,720 and its 32-value q8
 /// blocks over 256 columns of 5,120 (codes, scales and sums, 20 words a
 /// 64-value step) 409,600, the streams 655,360, the wide mix's scratch
 /// 1,563,392 (the normed streams and the up's rows 655,360 each, the q8 of the
 /// normed streams 204,800, the down's dots and the bottleneck 20,480 each, its
 /// q8 6,400, the inject's dots and the weights 256 each), the mix 163,840 and
-/// its q8 51,200, the query rows with their gates 786,432, the turned queries
-/// 393,216, the keys and values 65,536, and the two one-expert tables of 256
-/// and 64 slots, 524 and 134 words — four bytes a value].
+/// its q8 51,200, the keys and values 65,536, and the two one-expert tables
+/// of 256 and 64 slots, 524 and 134 words — four bytes a value].
 ///
 /// [`MtpArena::new`]: bloomery_gpu::arch::qwen3moe::Mtp38
 #[must_use]
 pub fn mtp_arena_bytes(vocab: u64) -> u64 {
-    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 6_219_282)
+    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 5_039_634)
 }
 
 /// The decode flash's segments a row of the MTP program's arena holds
@@ -3033,12 +3032,15 @@ mod tests {
         // arena at the file's 248,320-row head is 4 · (1,212,160 + 8·248,320
         // + 49,536·80 + 793 + 6,219,282) = 53,526,700 B, and only the
         // vocabulary moves it — one row of the head's logits, 4 · 8 B].
+        // PIN(2026-10-24): the store walk holds no query rows or turned
+        // queries, 4,718,592 B fewer [derived: 64 rows · (12,288 + 6,144) f32
+        // · 4 B; 53,526,700 - 4,718,592 = 48,808,108 B].
         #[test]
         fn the_mtp_arena_formula() {
-            assert_eq!(mtp_arena_bytes(248_320), 53_526_700);
+            assert_eq!(mtp_arena_bytes(248_320), 48_808_108);
             assert_eq!(
                 mtp_arena_bytes(248_320),
-                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 6_219_282)
+                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 5_039_634)
             );
             assert_eq!(mtp_arena_bytes(248_321) - mtp_arena_bytes(248_320), 4 * 8);
         }

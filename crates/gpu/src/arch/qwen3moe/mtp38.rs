@@ -75,15 +75,17 @@
 //!
 //! A store walk ([`WalkMode::Store`], the prompt's warmup) stops after the
 //! append: a later row reads a row's keys and values and nothing else of
-//! it. It runs over up to [`MTP_STORE_ROWS`] rows at once through the
-//! launches the ubatch walk (`wide38`) runs, in its own buffers:
+//! it, so the walk computes them alone. It runs over up to
+//! [`MTP_STORE_ROWS`] rows at once through the launches the ubatch walk
+//! (`wide38`) runs, in its own buffers:
 //! - the embedding rows and the input pack, as above;
 //! - the pack quantized to 32-value q8 blocks (`quantize_gemm32`) and
 //!   `eh_proj` as one 32-value GEMM (`gemm_q8_0p`) over the `4·m` packed
 //!   columns, through a one-expert table;
 //! - the attention site's wide mix (`HcWideKernels::enqueue_mix`);
-//! - the mix quantized, q (with each head's gate), k and v as three GEMMs
-//!   over the rows, then the norm and append.
+//! - the mix quantized, k and v as two GEMMs over the rows, then the key
+//!   heads' norm and append alone (`head_norm_neox_append_256` at no query
+//!   head): no query or gate is projected, normed or turned.
 //!
 //! Each op computes a row's values from that row's inputs alone, so a
 //! row's keys and values do not depend on the walk it lands in or on its
@@ -1083,8 +1085,7 @@ impl TapBufs {
 /// token-major (module doc): the hidden rows, the embedding with its
 /// positions and key counts, the pack and its q8 blocks over the `4·m`
 /// packed columns, the streams, the wide mix's scratch, the mix and its q8
-/// blocks, q with its gates, the turned q, k and v, and the two one-expert
-/// tables (`4·m` and `m` slots).
+/// blocks, k and v, and the two one-expert tables (`4·m` and `m` slots).
 struct StoreArena {
     h: DeviceBuffer<f32>,
     emb: DeviceBuffer<f32>,
@@ -1096,8 +1097,6 @@ struct StoreArena {
     hc: HcWideScratch,
     mixed: DeviceBuffer<f32>,
     mixed_q: GemmAct32,
-    qg: DeviceBuffer<f32>,
-    q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
     packed: GemmRoute,
@@ -1121,8 +1120,6 @@ impl StoreArena {
             hc: HcWideScratch::new(stream, geometry, r)?,
             mixed: f(r * h)?,
             mixed_q: GemmAct32::new(stream, r, h)?,
-            qg: f(r * geo::Q_ROWS)?,
-            q: f(r * geo::ATTN)?,
             k: f(r * geo::KV)?,
             v: f(r * geo::KV)?,
             packed: GemmRoute::new(stream, cols, 1)?,
@@ -1137,8 +1134,6 @@ impl StoreArena {
             &self.pack,
             &self.res,
             &self.mixed,
-            &self.qg,
-            &self.q,
             &self.k,
             &self.v,
         ];
@@ -2377,7 +2372,7 @@ impl Mtp38 {
     /// `blocks`' rows, rows `0 ..` of the store arena in order, every launch
     /// once over them all but the embedding, one a block at its own
     /// positions: the embedding and the pack, `eh_proj`, the attention
-    /// site's mix, q, k and v, on the card's stream. The rows' tokens are
+    /// site's mix, k and v, on the card's stream. The rows' tokens are
     /// `ids`, the blocks' in order, and their hidden rows the store arena's
     /// `h`; or, when `own`, one block of the draft's own last row. Each row's
     /// values are its inputs' alone, so a block's are those of a walk of it
@@ -2477,7 +2472,7 @@ impl Mtp38 {
         };
         site::resident_gemm(gpu, &dense, (tw, &n.eh), &x, &s.packed, cols, &mut s.res)?;
 
-        // The attention site's mix, then q, k and v over the rows.
+        // The attention site's mix, then k and v over the rows.
         k.gemm
             .enqueue_route_dense(stream, m, &mut s.rows, gpu.unlabelled_sink())?;
         let site = &n.attn_site;
@@ -2509,7 +2504,7 @@ impl Mtp38 {
         site::resident_quantize(
             gpu,
             &dense,
-            (tw, &[&n.q, &n.k, &n.v]),
+            (tw, &[&n.k, &n.v]),
             (&s.mixed, m),
             &mut s.mixed_q,
             sink,
@@ -2519,17 +2514,18 @@ impl Mtp38 {
             q32: Some(&s.mixed_q),
             f32: Some(&s.mixed),
         };
-        for (name, y) in [(&n.q, &mut s.qg), (&n.k, &mut s.k), (&n.v, &mut s.v)] {
+        for (name, y) in [(&n.k, &mut s.k), (&n.v, &mut s.v)] {
             site::resident_gemm(gpu, &dense, (tw, name), &x, &s.rows, m, y)?;
         }
         Ok(())
     }
 
     /// The keys and values of `b`'s rows, which [`Mtp38::store_rows`] ran,
-    /// normed, turned and appended to this sequence's store (the live one's)
-    /// at their positions: the store then holds the sequence through the
-    /// block's last row, and no walk is there to read (a store walk leaves
-    /// no own row, no streams past its attention's input and no head).
+    /// the keys normed and turned, appended to this sequence's store (the
+    /// live one's) at their positions by the append at no query head: the
+    /// store then holds the sequence through the block's last row, and no
+    /// walk is there to read (a store walk leaves no own row, no streams past
+    /// its attention's input and no head).
     pub(super) fn append_store(&mut self, c: &MtpCtx<'_>, b: StoreBlock) -> Result<(), GpuError> {
         let Mtp38 {
             w,
@@ -2539,32 +2535,30 @@ impl Mtp38 {
             a,
             ..
         } = self;
-        let s = &mut a
+        let a = a
             .as_mut()
-            .ok_or(GpuError::state(WHAT, "the program's arena (Mtp38::arm)"))?
-            .st;
+            .ok_or(GpuError::state(WHAT, "the program's arena (Mtp38::arm)"))?;
+        let s = &mut a.st;
         let (gpu, k) = (c.gpu, c.k);
         let sink = gpu.layer_sink(*index as usize)?;
         let n = Names::of(*index, w);
-        let f = size_of::<f32>();
-        let rows = |width: usize| (b.at * width * f, b.m * width);
-        let ((qg_at, qg_n), (q_at, q_n), (kv_at, kv_n)) =
-            (rows(geo::Q_ROWS), rows(geo::ATTN), rows(geo::KV));
-        let qg = Window::<f32>::of(&s.qg, qg_at, qg_n)?;
-        let mut q = WindowMut::<f32>::of_mut(&mut s.q, q_at, q_n)?;
+        let (kv_at, kv_n) = (b.at * geo::KV * size_of::<f32>(), b.m * geo::KV);
         let mut kw = WindowMut::<f32>::of_mut(&mut s.k, kv_at, kv_n)?;
         let v = Window::<f32>::of(&s.v, kv_at, kv_n)?;
         let pos = Window::<u32>::of(&s.pos, b.at * size_of::<u32>(), b.m)?;
         // The draft's store is f16: the family's shared append runs its f16
         // arm.
         let (kc, vc) = store.f16_mut("qwen38::mtp")?;
+        // No row of a store walk has its query read: the launch runs the key
+        // heads alone (no query head) and reads and writes no query value,
+        // so the live walk's query buffers stand in for its query arguments.
         // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
         unsafe {
             k.neox.enqueue_head_norm_neox_append_256(
                 gpu.stream(),
                 PartialNeoxArgs {
-                    qg: &qg,
-                    q: &mut q,
+                    qg: &a.qg,
+                    q: &mut a.q,
                     k: &mut kw,
                     v: &v,
                     gq: f32_gain(w, &n.q_norm)?,
@@ -2572,7 +2566,7 @@ impl Mtp38 {
                     table: c.table,
                     pos: &pos,
                     eps: c.eps,
-                    n_head: geo::N_HEAD,
+                    n_head: 0,
                     n_kv: geo::N_KV,
                     ctx: *ctx,
                     m: b.m,

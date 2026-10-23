@@ -687,6 +687,12 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // 2,906,646,700 B at 32,768, the stage rope table), which first gave all sixteen old rows exactly
 // under the old rule and gives these under the new one; the box's planner on this tree printed the
 // same sixteen].
+// PIN(2026-10-24): the eight draft rows re-pinned for the store walk's arena, which holds no query
+// rows or turned queries now (`place::mtp_arena_bytes`, 4,718,592 B less at every context): each
+// drafted row's budget gains those bytes and the spread fills them, one or two experts a row (the
+// A6000's 4k U 4,096 row 11,690 -> 11,691), the rounding moving with the counts' granules [the
+// box's planner on this tree: the old pins red on exactly the eight draft rows, green before the
+// arena change].
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -716,10 +722,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         244,
-        26,
+        27,
         243,
-        36_634_726_400,
-        534_635_008,
+        36_637_798_400,
+        535_757_312,
     ),
     (
         "A6000",
@@ -727,10 +733,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         262,
-        21,
+        22,
         261,
-        39_327_027_200,
-        535_077_376,
+        39_330_099_200,
+        538_296_832,
     ),
     (
         "A6000",
@@ -760,10 +766,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         238,
-        26,
+        28,
         237,
-        35_732_172_800,
-        558_481_920,
+        35_738_316_800,
+        556_532_224,
     ),
     (
         "A6000",
@@ -771,10 +777,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         255,
-        45,
+        46,
         254,
-        38_348_288_000,
-        633_012_736,
+        38_351_360_000,
+        636_232_192,
     ),
     (
         "3090",
@@ -804,10 +810,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         73,
-        44,
+        45,
         72,
-        10_967_756_800,
-        601_670_144,
+        10_970_828_800,
+        602_792_448,
     ),
     (
         "3090",
@@ -815,10 +821,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         92,
-        24,
+        25,
         91,
-        13_763_891_200,
-        498_278_912,
+        13_766_963_200,
+        499_401_216,
     ),
     (
         "3090",
@@ -848,10 +854,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         69,
-        2,
+        3,
         68,
-        10_235_084_800,
-        451_441_152,
+        10_239_078_400,
+        453_739_008,
     ),
     (
         "3090",
@@ -859,10 +865,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         86,
-        19,
+        21,
         85,
-        12_845_977_600,
-        535_388_672,
+        12_852_121_600,
+        533_438_976,
     ),
 ];
 // PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their
@@ -1134,6 +1140,9 @@ const CARD_ROUNDING_Q3: u64 = 398_764_544;
 // one, where the counts' granule rounding falls with them [derived: the same replica over the Q3
 // file's types, which gave all sixteen old rows exactly under the old rule; the box's planner on
 // this tree printed the same sixteen].
+// PIN(2026-10-24): the drafted rows re-pinned for the store walk's arena, as CARD_PLANS: one or
+// two experts onto six of the eight drafted rows, the 3090's 32k U 4,096 and the A6000's 32k U 512
+// rows unmoved within their granules' slack [the box's planner on this tree].
 const CARD_PLANS_Q3: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -1163,10 +1172,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         338,
-        12,
+        13,
         337,
-        36_771_481_600,
-        551_838_208,
+        36_773_657_600,
+        553_856_512,
     ),
     (
         "A6000",
@@ -1174,10 +1183,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         362,
-        34,
+        35,
         361,
-        39_436_902_400,
-        579_160_576,
+        39_439_078_400,
+        583_276_032,
     ),
     (
         "A6000",
@@ -1207,10 +1216,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         330,
-        5,
+        7,
         329,
-        35_884_006_400,
-        560_606_720,
+        35_888_358_400,
+        560_449_024,
     ),
     (
         "A6000",
@@ -1251,10 +1260,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         103,
-        40,
+        42,
         102,
-        11_211_084_800,
-        512_300_544,
+        11_215_436_800,
+        512_142_848,
     ),
     (
         "3090",
@@ -1262,10 +1271,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         128,
-        22,
+        23,
         127,
-        13_896_857_600,
-        515_076_608,
+        13_899_033_600,
+        519_192_064,
     ),
     (
         "3090",
@@ -1305,11 +1314,11 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         32_768,
         true,
         512,
+        121,
+        1,
         120,
-        48,
-        120,
-        13_083_648_000,
-        449_579_520,
+        13_085_824_000,
+        453_694_976,
     ),
 ];
 

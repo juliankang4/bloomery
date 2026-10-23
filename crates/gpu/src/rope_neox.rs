@@ -1856,7 +1856,9 @@ pub struct NeoxArgs<'a> {
 /// in place) and value heads in `v`, the gains, the rope table (at least
 /// `ctx` rows of [`ROT_256`] or [`ROT_PARTIAL`], or of `HEAD` f32 for a whole turn), the
 /// positions, the sink, and the layer's two cache planes of `n_kv · ctx` rows
-/// of `HEAD` f16.
+/// of `HEAD` f16. At `n_head` 0 the launch runs the key heads alone, each
+/// block's values its own head's as at any `n_head`: no query source is read
+/// and no query written (a store's append, whose rows' queries nothing reads).
 pub struct PartialNeoxArgs<'a> {
     pub qg: &'a DeviceBuffer<f32>,
     pub q: &'a mut DeviceBuffer<f32>,
@@ -1990,7 +1992,8 @@ pub struct K192Args<'a> {
 /// The refusals and launch values the partial-turn launchers share, at heads
 /// of `head` values whose query source rows hold `q_span` values a head and
 /// a rope table of `rot` f32 a position: the shape `[n_head, n_kv, ctx, m]`
-/// (each at least 1, `m <= ctx`), then the first buffer shorter than the
+/// (`n_kv`, `ctx` and `m` at least 1, `m <= ctx`; `n_head` 0 is the key heads
+/// alone, [`PartialNeoxArgs`]), then the first buffer shorter than the
 /// launch reads, the inputs `[qg, q, k, v, gq, gk, table, pos]` (`inputs`,
 /// their lengths) before the sink's `planes` (name, length, need), each by
 /// name. Returns `[grid, n_head, n_kv, ctx, m]` as the launch's u32s, the grid
@@ -2002,11 +2005,11 @@ fn partial_launch(
     inputs: [usize; 8],
     planes: &[(&str, usize, usize)],
 ) -> Result<[u32; 5], GpuError> {
-    if n_head == 0 || n_kv == 0 || m == 0 || ctx == 0 || m > ctx {
+    if n_kv == 0 || m == 0 || ctx == 0 || m > ctx {
         return Err(GpuError::shape(
             what,
             format!(
-                "need n_head, n_kv, ctx >= 1 and 1 <= m <= ctx, got n_head={n_head} \
+                "need n_kv, ctx >= 1 and 1 <= m <= ctx, got n_head={n_head} \
                  n_kv={n_kv} ctx={ctx} m={m}"
             ),
         ));
