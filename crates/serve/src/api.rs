@@ -6876,7 +6876,6 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn a_whole_answer_whose_client_closed_ends_at_the_next_event() {
-            const STEPS: usize = 24;
             let calls = Arc::new(AtomicUsize::new(0));
             let (permit, permits) = mpsc::channel();
             let engine = Gated {
@@ -6902,24 +6901,13 @@ mod tests {
             assert!(!free(), "the request holds the slot");
             reset(client);
 
-            for step in 1..=STEPS {
-                permit.send(()).expect("the engine holds its gate");
-                wait_for("the engine's next step or the slot's release", || {
-                    called() > step || free()
-                });
-                if free() {
-                    break;
-                }
-            }
-            assert!(
-                free(),
-                "the slot still runs the request of a closed client after {STEPS} steps"
-            );
-            assert!(
-                called() <= 8,
-                "the request ended after {} steps, not within a few events",
-                called()
-            );
+            wait_for("the HTTP handler to observe the reset", || {
+                state.shared.answers.in_flight() == 0
+            });
+            permit.send(()).expect("the engine holds its gate");
+            wait_for("the slot's release at the next event", free);
+            // PIN(2026-10-24): reset detection precedes release, so only the already blocked engine call may run.
+            assert_eq!(called(), 1, "the request took another engine step");
         }
     }
 
