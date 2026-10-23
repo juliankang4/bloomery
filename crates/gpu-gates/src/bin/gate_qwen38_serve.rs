@@ -319,10 +319,8 @@
 //!   `--ctx-size` serves its default one slot with no `paged` line (the
 //!   rule has no count to reduce, and the placement left the draft off) on a
 //!   plan that pages (`paged_default_serves_one_column`, the `cache` line's
-//!   arena), `--parallel 2` is accepted by the
-//!   plan and its server's end is printed, not judged (PIN(2026-10-12):
-//!   the clause `paged_parallel_serves_one_pass` returns when the server's
-//!   named error after the plan is fixed), and
+//!   arena), `--parallel 4` serves four requests as one pass, each with its
+//!   alone ids (`paged_parallel_serves_one_pass`, `paged_parallel_ids_as_alone`), and
 //!   `BLOOMERY_DRAFT=mtp` serves one slot with the draft on
 //!   (`paged_draft_mtp_serves_one_slot`);
 //!   at 40 GiB, where the tier pages experts with no arena, `--parallel 2`
@@ -4287,46 +4285,73 @@ mod gate {
             },
         );
 
-        // PIN(2026-10-12): `paged_parallel_is_refused_by_name` became
-        // this clause. The refusal's cause is gone — a paged step of several
-        // columns reads its ids from the arena (the placement's floor counts a
-        // column a slot, `gate_nvtier`'s census clause), so `--parallel 2`
-        // serves two slots as one pass.
-        let (line, failed, text) =
-            run(&[(bloomery_levers::HOST_ROOM, "27G")], &["--parallel", "2"])?;
-        let paged = paged_line(&text);
-        println!("paged: {}", paged.as_deref().unwrap_or("no paged line"));
-        let served = line.as_deref().is_some_and(|l| {
-            field(l, "slots").as_deref() == Some("2")
-                && field(l, "from").as_deref() == Some("flag")
-                && field(l, "pass").as_deref() == Some("one")
-        });
-        let named = paged.as_deref().is_some_and(|l| {
-            field(l, "rule").as_deref() == Some("served")
-                && field(l, "asked_slots").as_deref() == Some("2")
-                && field(l, "slots").as_deref() == Some("2")
-                && field(l, "arena").and_then(|v| v.parse::<u64>().ok()) > Some(0)
-        });
-        // PIN(2026-10-12): not judged in this release. The server accepts the
-        // count (the parallel and paged lines above) and then ends with a
-        // named error the gate does not keep; the clause returns as a check
-        // when the cause is named and fixed. Its three terms and the
-        // server's last lines are printed so the next run names it.
-        println!(
-            "paged: --parallel 2 at 27G: exited {}, served {served}, named {named} (printed, \
-             not judged); the server's last lines:",
-            if failed { "unsuccessfully" } else { "cleanly" }
+        // PIN(2026-10-23): judge the paged parallel clause again, through listening
+        // and requests; the plan's arena floor counts every resident slot's columns.
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::HOST_ROOM, "27G")
+            .env(bloomery_levers::DRAFT, "off")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env(bloomery_levers::STEP_STATS, "1")
+            .env_remove(bloomery_levers::NVTIER_BYTES);
+        let args: Vec<&str> = SERVER_ARGS[..SERVER_ARGS.len() - 1]
+            .iter()
+            .copied()
+            .chain(["4"])
+            .collect();
+        let mut parallel = Served38::spawn_with(&args, &own, &mut cmd)?;
+        let addr = parallel.address(&err_log, POLLS, POLL)?;
+        let text = std::fs::read_to_string(&err_log)?;
+        let line = parallel_line(&err_log)?.ok_or("paged: no parallel line")?;
+        let paged = paged_line(&text).ok_or("paged: no paged line")?;
+        let served = parallel_agrees(&line, Some(4)) == Some(true)
+            && field(&line, "pass").as_deref() == Some("one");
+        let named = field(&paged, "rule").as_deref() == Some("served")
+            && field(&paged, "asked_slots").as_deref() == Some("4")
+            && field(&paged, "slots").as_deref() == Some("4")
+            && field(&paged, "arena").and_then(|v| v.parse::<u64>().ok()) > Some(0);
+        check(
+            &mut ok,
+            "paged_parallel_serves_one_pass",
+            served && named && listened(&text)?,
         );
-        for l in text
-            .lines()
-            .rev()
-            .take(8)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            println!("paged:   {l}");
+        let prompts = [prompt, TURN_A, TURN_B, SLOTS_B];
+        let request = |prompt: &str| {
+            streamed_with(
+                &addr,
+                json!({
+                    "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0,
+                    "return_tokens": true, "ignore_eos": true,
+                    "cache_prompt": false, "stream": true,
+                }),
+            )
+        };
+        let mut alone = Vec::new();
+        for p in prompts {
+            alone.extend(answers("paged", vec![(request(p)?, p)])?);
         }
+        let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
+        let runs = prompts
+            .iter()
+            .map(|p| Ok((request(p)?, *p)))
+            .collect::<Result<Vec<_>, GateError>>()?;
+        let together = answers("paged", runs)?;
+        check(
+            &mut ok,
+            "paged_parallel_ids_as_alone",
+            ids_as_alone(alone.iter(), &together)
+                && together
+                    .iter()
+                    .all(|s| s.as_ref().is_some_and(|s| s.tokens.len() == N_PREDICT)),
+        );
+        let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
+        let rounds = &rounds[before..];
+        check(
+            &mut ok,
+            "paged_parallel_rounds_carry_all_slots",
+            rounds.iter().any(|r| r.u64("rows") == Ok(4))
+                && rounds.iter().all(|r| r.u64("passes") == Ok(1)),
+        );
+        println!("paged: the parallel server stopped: {}", parallel.stop()?);
 
         // PIN(2026-10-12): `paged_draft_is_refused_by_name` became this
         // clause. The refusal is gone by rule: a paged step of several
@@ -4585,65 +4610,97 @@ mod gate {
         // its `load draft=off` record names the paged rule at the arena it
         // names, and no `load draft=mtp` line prints. The residency is pinned
         // off, as at the small card. It runs whole: `-n 2` past its load.
-        let mut cmd = Command::new(std::env::current_exe()?.with_file_name("generate_qwen3moe"));
-        cmd.env(bloomery_levers::HOST_ROOM, "27G")
-            .env(bloomery_levers::RESIDENCY, "off")
-            .env_remove(bloomery_levers::DRAFT)
-            .env_remove(bloomery_levers::NVTIER_BYTES)
-            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
-            .env_remove(bloomery_levers::MTP_DRAFT)
-            .env_remove(bloomery_levers::MTP_WIDTH);
-        let mut run = Served38::spawn_with(&["--prompt", prompt, "-n", "2"], &own, &mut cmd)?;
-        let mut status = None;
-        for _ in 0..POLLS {
-            status = run.child.try_wait()?;
-            if status.is_some() {
-                break;
+        for slots in [1, 4] {
+            let mut cmd =
+                Command::new(std::env::current_exe()?.with_file_name("generate_qwen3moe"));
+            cmd.env(bloomery_levers::HOST_ROOM, "27G")
+                .env(bloomery_levers::GEN_SLOTS, slots.to_string())
+                .env(bloomery_levers::RESIDENCY, "off")
+                .env_remove(bloomery_levers::DRAFT)
+                .env_remove(bloomery_levers::NVTIER_BYTES)
+                .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+                .env_remove(bloomery_levers::MTP_DRAFT)
+                .env_remove(bloomery_levers::MTP_WIDTH);
+            if slots > 1 {
+                cmd.env(bloomery_levers::DRAFT, "off");
             }
-            std::thread::sleep(POLL);
-        }
-        if status.is_none() {
+            let args = if slots == 1 {
+                ["--prompt", prompt, "-n", "2"]
+            } else {
+                ["--tokens", "1,2,3,4", "-n", "2"]
+            };
+            let mut run = Served38::spawn_with(&args, &own, &mut cmd)?;
+            let mut status = None;
+            for _ in 0..POLLS {
+                status = run.child.try_wait()?;
+                if status.is_some() {
+                    break;
+                }
+                std::thread::sleep(POLL);
+            }
+            if status.is_none() {
+                println!(
+                    "paged: generate_qwen3moe stopped at the bound: {}",
+                    run.stop()?
+                );
+            }
+            let out = std::fs::read_to_string(own.join("server.out"))?;
+            let head =
+                "load draft=off (unset: the plan pages host experts through the NVMe tier's ";
+            let arena = out.lines().find_map(|l| {
+                l.strip_prefix(head)?
+                    .split_once(" B RAM arena")?
+                    .0
+                    .parse::<u64>()
+                    .ok()
+            });
+            let off = record::Log::of(&out, record::GENERATE_QWEN3MOE)
+                .first(&record::LOAD_DRAFT_OFF38)?
+                .map(|f| f.text("why").map(str::to_owned))
+                .transpose()?;
+            let drafted = out.lines().any(|l| l.starts_with("load draft=mtp"));
             println!(
-                "paged: generate_qwen3moe stopped at the bound: {}",
-                run.stop()?
+                "paged: generate_qwen3moe exit {status:?}: load draft=off ({}), load draft=mtp {drafted}",
+                off.as_deref().unwrap_or("none")
+            );
+            if off.is_none() {
+                let err = std::fs::read_to_string(own.join("server.err")).unwrap_or_default();
+                let tail: Vec<&str> = err.lines().rev().take(20).collect();
+                println!("paged: generate_qwen3moe's last stderr lines:");
+                for l in tail.iter().rev() {
+                    println!("  {l}");
+                }
+            }
+            let why = arena.map(|arena| bloomery_levers::Draft38Off::Paged { arena }.to_string());
+            check(
+                &mut ok,
+                if slots == 1 {
+                    "paged_cli_drafts_nothing_by_the_rule"
+                } else {
+                    "paged_cli_parallel_serves_as_asked"
+                },
+                status.is_some_and(|s| s.success())
+                    && if slots == 1 {
+                        arena.is_some_and(|a| a > 0) && why.is_some() && off == why
+                    } else {
+                        record::Log::of(&out, record::GENERATE_QWEN3MOE)
+                            .all(&record::NVTIER)?
+                            .iter()
+                            .any(|n| n.u64("arena_granted").is_ok_and(|a| a > 0))
+                    }
+                    && !drafted
+                    && (slots == 1
+                        || (0..slots).all(|slot| {
+                            out.lines().any(|l| {
+                                l.strip_prefix("tokens ")
+                                    .and_then(|l| l.strip_suffix(&format!(" slot={slot}")))
+                                    .is_some_and(|ids| {
+                                        parse_ids(ids).is_ok_and(|ids| ids.len() == 2)
+                                    })
+                            })
+                        })),
             );
         }
-        let out = std::fs::read_to_string(own.join("server.out"))?;
-        let head = "load draft=off (unset: the plan pages host experts through the NVMe tier's ";
-        let arena = out.lines().find_map(|l| {
-            l.strip_prefix(head)?
-                .split_once(" B RAM arena")?
-                .0
-                .parse::<u64>()
-                .ok()
-        });
-        let off = record::Log::of(&out, record::GENERATE_QWEN3MOE)
-            .first(&record::LOAD_DRAFT_OFF38)?
-            .map(|f| f.text("why").map(str::to_owned))
-            .transpose()?;
-        let drafted = out.lines().any(|l| l.starts_with("load draft=mtp"));
-        println!(
-            "paged: generate_qwen3moe exit {status:?}: load draft=off ({}), load draft=mtp {drafted}",
-            off.as_deref().unwrap_or("none")
-        );
-        if off.is_none() {
-            let err = std::fs::read_to_string(own.join("server.err")).unwrap_or_default();
-            let tail: Vec<&str> = err.lines().rev().take(20).collect();
-            println!("paged: generate_qwen3moe's last stderr lines:");
-            for l in tail.iter().rev() {
-                println!("  {l}");
-            }
-        }
-        let why = arena.map(|arena| bloomery_levers::Draft38Off::Paged { arena }.to_string());
-        check(
-            &mut ok,
-            "paged_cli_drafts_nothing_by_the_rule",
-            status.is_some_and(|s| s.success())
-                && arena.is_some_and(|a| a > 0)
-                && why.is_some()
-                && off == why
-                && !drafted,
-        );
         Ok(ok)
     }
 

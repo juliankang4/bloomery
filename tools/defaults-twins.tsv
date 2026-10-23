@@ -32,6 +32,7 @@ BLOOMERY_DRAFT	weekly-gpu-ds41-serve	dspark	justfile::bash tools/gpu-gate.sh gat
 BLOOMERY_DSPARK_CARD	weekly-gpu-ds41-serve	A6000	justfile::bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D &&	the bp arm's dspark runs with the lever unset (the card of the fewest usable bytes, the 3090)
 BLOOMERY_FLASH_SEGMENTS	gate-attn	1	crates/model/tests/attn.rs::fn hw_flash_split_k_bands_against_one_segment	the same test's parent run merges the default 32 segments in this process
 BLOOMERY_FLASH_SIMD	gate-attn	0	crates/model/tests/attn.rs::fn hw_flash_simd_bands_against_scalar	hw_flash_simd_bands_against_scalar: the default SIMD path banded against the scalar twin
+BLOOMERY_GEN_SLOTS	gate-gpu-qwen38-serve	slots.to_string()	crates/gpu-gates/src/bin/gate_qwen38_serve.rs::for slots in [1, 4] {	the same loop's one-slot arm runs the default slot count beside the four-slot arm
 BLOOMERY_HOST_LOCK	gate-gpu-ds41-long	${BLOOMERY_HOST_LOCK:-1}	justfile::gate-ds41-load:	gate-ds41-load runs the same load path with the lever unset (the default 0)
 BLOOMERY_HOST_LOCK	stage-gpu-load-v41-lock	1	justfile::stage-gpu-load-v41 *ARGS='--plan b':	stage-gpu-load-v41 runs the same gate without --lock
 BLOOMERY_HOST_LOCK	weekly-gpu-ds41-cand	${BLOOMERY_HOST_LOCK:-1}	justfile::gate-ds41-load:	gate-ds41-load runs the same load path with the lever unset (the default 0)
