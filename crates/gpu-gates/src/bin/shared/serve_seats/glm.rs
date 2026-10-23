@@ -1708,6 +1708,10 @@ impl Seat for Glm {
         }))
     }
 
+    fn close_nodes(&mut self) -> Result<(), GateError> {
+        Ok(self.s.model_mut().close_nodes()?)
+    }
+
     /// `/props`' `engine.draft` under the MTP draft: its kind, the target
     /// file whose NextN layer it is, its width, and the plan's bytes for it
     /// as the card's `draft` class.

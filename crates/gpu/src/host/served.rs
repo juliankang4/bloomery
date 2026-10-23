@@ -148,6 +148,11 @@ impl<B: TierBody> HostServed for B {
         }
     }
 
+    /// The tier's nodes closed ([`Hybrid::close_nodes`]).
+    fn close_nodes(&mut self) -> Result<(), GpuError> {
+        self.hybrid_mut().close_nodes()
+    }
+
     /// The machine started once the body's pieces are sized
     /// ([`ResidencyGlue::start`]).
     fn start_residency(&mut self, gpu: &Gpu) -> Result<(), GpuError> {

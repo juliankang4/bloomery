@@ -168,10 +168,8 @@ pub(crate) struct Shared {
     stop: AtomicBool,
     /// The engine thread left its loop ([`worker::serve`], on every path that
     /// ends its run: the stop's [`Worker::halt`], an engine failure, a caught
-    /// panic), set before the engine it holds drops: what the orderly stop
-    /// waits for first ([`Shared::wait_stop`]), not the thread's end, which
-    /// the engine's Drop can hold past the stop's bound while the process
-    /// exit reclaims the engine's memory anyway.
+    /// panic): what the orderly stop waits for first ([`Shared::wait_stop`]).
+    /// Past it the thread calls the engine no more and never drops it.
     loop_ended: Mutex<bool>,
     /// Wakes [`Shared::wait_loop_end`].
     loop_ended_c: Condvar,
@@ -248,10 +246,8 @@ impl Shared {
 
     /// The engine thread left its loop ([`Worker::run`] and
     /// [`Worker::run_turns`] returned): what the orderly stop waits for ends
-    /// here. Called on every path that ends the thread's run, before the
-    /// engine it holds drops — its Drop can outlast the stop's bound (a host
-    /// tier's pinned pages freed, its threads joined), and the process exit
-    /// reclaims the engine's memory anyway.
+    /// here. Called on every path that ends the thread's run; the engine it
+    /// holds is the process exit's ([`serve`]).
     pub(crate) fn end_loop(&self) {
         *relock(&self.loop_ended) = true;
         self.loop_ended_c.notify_all();
@@ -385,7 +381,14 @@ struct Worker {
     ended: Vec<usize>,
 }
 
-/// Runs the engine thread until the engine fails or the thread panics.
+/// Runs the engine thread until the engine fails, the thread panics or the
+/// server stops. The loop's end is the server's, and the process exit
+/// reclaims the engine: the thread never drops it, nor the slots' states
+/// the engine saved. Their Drop frees through the device driver, and a
+/// driver call made while the exit tears the driver's libraries down can
+/// corrupt the process's heap. What the Drop would tell other processes
+/// the thread tells them itself, before the loop's end is published
+/// ([`crate::Engine::close_nodes`]).
 pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
     let n = relock(&sh.board).slots().len();
     let turns = slot.engine.turns().map(|park| {
@@ -427,20 +430,25 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
             w.run();
         }
     }));
-    // The stop's wait on the loop ends here, every request the halt held
-    // already answered: past this point the thread only books a caught panic
-    // and drops the engine it holds, which no stop waits for.
-    sh.end_loop();
-    if let Err(p) = ran {
-        let adopted = sh.record_fatal(EngineFailure {
+    let adopted = match ran {
+        Ok(()) => None,
+        Err(p) => sh.record_fatal(EngineFailure {
             engine: "unknown: its thread panicked".to_owned(),
             error: format!("the engine thread panicked: {}", panic_text(&*p)),
-        });
-        // The running requests' channels close: their HTTP threads answer
-        // with the reason.
-        drop(w);
-        sh.end_on(adopted);
+        }),
+    };
+    // What the thread still holds is answered with what ended the loop, and
+    // the processes serving part of the load are told it ended.
+    w.close();
+    if let Err(e) = w.slot.engine.close_nodes() {
+        eprintln!("bloomery-serve: closing the engine's nodes: {e}");
     }
+    // The stop's wait on the loop ends here: past this point the thread
+    // calls the engine no more, and the engine and the slots' saved states
+    // stay for the process exit.
+    sh.end_loop();
+    std::mem::forget(w);
+    sh.end_on(adopted);
 }
 
 /// The sink a request's generation writes to: its channel.
@@ -576,12 +584,23 @@ impl Worker {
              halt was read from",
         );
         drop(relock(&self.sh.board).kill(&cause));
-        let mut held = std::mem::take(&mut self.active);
-        held.extend(std::mem::take(&mut self.prompting).into_iter().map(|p| p.a));
-        for a in &held {
+        let held = self
+            .active
+            .iter()
+            .chain(self.prompting.iter().map(|p| &p.a));
+        for a in held {
             self.book(a.job.timings());
         }
-        drop(held);
+        self.close();
+    }
+
+    /// Drops every request and action the thread holds, which closes their
+    /// channels: the running ones, those between their prompt's calls, and
+    /// under turns the pending ones and the deferred actions. Each HTTP thread
+    /// then answers with what ended the loop ([`crate::api::engine_gone`]).
+    fn close(&mut self) {
+        self.active.clear();
+        self.prompting.clear();
         if let Some(t) = &mut self.turns {
             t.pending.clear();
             t.deferred.clear();

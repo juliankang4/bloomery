@@ -136,7 +136,8 @@ type Job = (
 
 /// The model the server's embeddings endpoints call, held on a thread of its own: the facts read
 /// once at its open, and the channel each pass goes through. Dropping it closes the channel and
-/// joins the thread, so the model is released when the drop returns.
+/// joins the thread, so the model is released when the drop returns, unless a pass panicked
+/// ([`SideEngine::spawn`]).
 pub struct SideEngine {
     prompts: std::collections::BTreeMap<String, String>,
     jobs: Option<mpsc::Sender<Job>>,
@@ -155,7 +156,10 @@ impl SideEngine {
     /// The model `open` opens on a new thread, which then runs each pass in order until the
     /// engine drops. An open that fails or panics is the refusal, its panic's message named; a
     /// pass that panics answers an [`EmbedError`] naming the panic's message and ends the
-    /// thread, and every pass after it is an [`EmbedError`] too.
+    /// thread, and every pass after it is an [`EmbedError`] too. The panicked model is left to
+    /// the process exit, never dropped: its Drop frees through the device driver, and once the
+    /// error is answered the server may stop and exit, tearing the driver's libraries down
+    /// beside a Drop still running.
     pub fn spawn(
         open: impl FnOnce() -> Result<Box<dyn Embed>, String> + Send + 'static,
     ) -> Result<SideEngine, GateError> {
@@ -199,6 +203,7 @@ impl SideEngine {
                             let _ = answer.send(v);
                         }
                         Err(p) => {
+                            std::mem::forget(model);
                             let _ = answer.send(Err(EmbedError(format!(
                                 "the embedding model panicked: {p}"
                             ))));
@@ -352,8 +357,9 @@ mod tests {
     }
 
     /// The engine runs each pass on the model's thread; a panic there answers its message and
-    /// ends the thread, and later passes name the end; an open that fails or panics is the
-    /// refusal; the drop returns once the model is dropped.
+    /// ends the thread, leaving the model to the process exit, and later passes name the end; an
+    /// open that fails or panics is the refusal; an idle engine's drop returns once the model is
+    /// dropped.
     #[test]
     fn the_side_engine_answers_on_its_thread_and_names_its_end() {
         let caller = thread::current().id();
@@ -387,9 +393,11 @@ mod tests {
         let e = engine.embed(&[5]).expect_err("the end");
         assert_eq!(e.0, "the embedding model's thread ended");
         drop(engine);
+        // PIN(2026-10-23): a panicked model is no longer dropped on its thread; the check that the
+        // engine's drop released it became the check that it is left to the process exit.
         assert!(
-            dropped.load(Ordering::SeqCst),
-            "the model is dropped by the engine's drop"
+            !dropped.load(Ordering::SeqCst),
+            "a panicked side model is left to the process exit"
         );
 
         let dropped = Arc::new(AtomicBool::new(false));

@@ -1956,6 +1956,20 @@ impl<H: HostExperts> HostTier<H> {
         &mut self.tiers
     }
 
+    /// End the load on every tier's node ([`TierCard::close_node`]), as the
+    /// tier's Drop does, freeing nothing in this process. Every node is
+    /// closed; the first failure is returned.
+    pub(crate) fn close_nodes(&mut self) -> Result<(), GpuError> {
+        let mut first = Ok(());
+        for t in &mut self.tiers {
+            let closed = t.close_node();
+            if first.is_ok() {
+                first = closed;
+            }
+        }
+        first
+    }
+
     /// What each tier has done since load, in tier order.
     #[must_use]
     pub fn tier_stats(&self) -> Vec<tier::TierStats> {

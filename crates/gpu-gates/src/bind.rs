@@ -1203,6 +1203,8 @@ enum Cmd {
     Pos,
     /// The residency back to its seed.
     ResidencyReset,
+    /// The load ended on the model's tier nodes ([`Seat::close_nodes`]).
+    CloseNodes,
     /// Make `slot` the one every later command acts on ([`Seat::select`]).
     Select(usize),
     /// A step of several slots in one command ([`SeatEngine`]'s
@@ -1544,6 +1546,12 @@ pub trait Seat: 'static {
     fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, GateError> {
         Ok(None)
     }
+    /// The load ended on every expert tier's node, nothing freed
+    /// (`serve::Engine::close_nodes`); the default, for a seat whose model
+    /// runs no tier on a node, does nothing.
+    fn close_nodes(&mut self) -> Result<(), GateError> {
+        Ok(())
+    }
     /// Prints what the server's prompt cache did, as the binary's records.
     fn note(note: &CacheNote)
     where
@@ -1739,6 +1747,13 @@ impl SeatEngine {
                                 Extra::None,
                             ),
                         },
+                        Cmd::CloseNodes => (
+                            g.close_nodes()
+                                .map(|()| 0)
+                                .map_err(|e| format!("closing the tier nodes: {e}")),
+                            None,
+                            Extra::None,
+                        ),
                         Cmd::Resume(state) => {
                             (Ok(0), None, Extra::Resumed(resume_of(&mut g, &*state)))
                         }
@@ -2380,9 +2395,11 @@ fn serve_cmd<S: Seat>(
         | Cmd::PassSampled { .. }
         | Cmd::StepSlots(..)
         | Cmd::PassSlots(..)
-        | Cmd::ResidencyReset => Err(
+        | Cmd::ResidencyReset
+        | Cmd::CloseNodes => Err(
             "a keep, split, pass, step or pass of several slots, save, resume, slot file's save \
-             or restore, or residency reset reached the step loop; the engine thread answers it"
+             or restore, residency reset or close of the tier nodes reached the step loop; the \
+             engine thread answers it"
                 .to_owned(),
         ),
         Cmd::Pos => Ok(0),
@@ -3164,6 +3181,10 @@ impl Engine for SeatEngine {
                 "the engine thread answered a residency reset with no report".to_owned(),
             )),
         }
+    }
+
+    fn close_nodes(&mut self) -> Result<(), EngineError> {
+        self.link.call(Cmd::CloseNodes).map(|_| ())
     }
 
     /// The body's rule for the request's reply, asked on the engine thread

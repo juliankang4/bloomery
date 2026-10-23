@@ -870,9 +870,9 @@ pub(crate) fn wait_end(ended: &mpsc::Receiver<End>, linger: Duration) -> Ended {
 /// one engine call has none of its own, so a long one can outlast it, and
 /// the process then exits with the engine thread still inside the call, its
 /// stop line saying so, as it says when answers were still being written.
-/// The engine's Drop after the loop is not waited for: freeing a host tier's
-/// pinned pages and joining its threads can outlast the bound, and the
-/// process exit reclaims the engine's memory anyway.
+/// The loop's end comes after the engine's nodes are told the load ended, and
+/// nothing after it is waited for: the engine thread leaves the engine to the
+/// process exit ([`crate::worker::serve`]).
 const ENGINE_STOP: Duration = Duration::from_secs(5);
 
 /// The signal handlers' whole state, the only things a handler touches: the
@@ -998,10 +998,25 @@ pub(crate) enum Waited {
 /// ([`Answers::wait`]) — then one stderr line ([`stop_line`]) and success.
 /// Called from `run`, after the stop's initiator already refused new work
 /// and told the engine thread to end, so no seat's `Ok(server.run())` return
-/// is reached by it. The engine's Drop is left to run beside the exit: the
-/// wait ends at the loop and the answers, not at the thread's end.
+/// is reached by it. The exit tears the process down (its exit handlers and
+/// the loaded libraries' destructors, the device driver's among them) only
+/// after a wait that ended: past its loop the engine thread calls the driver
+/// no more ([`crate::worker::serve`]), and no answer is left running. After a
+/// wait that ran out, the engine thread or an answer can still be inside a
+/// driver call, and the driver torn down beside it can corrupt the heap: the
+/// process then ends at once, stdout flushed first.
 pub(crate) fn exit_shutdown(cause: &Stop, wait: impl FnOnce(Duration) -> Waited) -> ! {
-    eprintln!("{}", stop_line(cause, wait(ENGINE_STOP)));
+    let waited = wait(ENGINE_STOP);
+    let ended = waited == Waited::Done;
+    eprintln!("{}", stop_line(cause, waited));
+    if !ended {
+        if let Err(e) = io::Write::flush(&mut io::stdout()) {
+            eprintln!("bloomery-serve: stdout: {e}");
+        }
+        // SAFETY: `_exit` takes no pointer and does not return; it ends the
+        // process without its exit handlers and destructors.
+        unsafe { libc::_exit(0) }
+    }
     std::process::exit(0)
 }
 
@@ -4571,8 +4586,8 @@ mod tests {
     /// request after it is a 503 naming the shutdown (pinned: the listener
     /// stands while the stop runs — the exit belongs to `run`, which no test
     /// enters — so the refusal the client reads is the gate's 503, not a
-    /// refused connection). The engine thread leaves its loop on its own; its
-    /// end, the engine's Drop, is the process exit's.
+    /// refused connection). The engine thread leaves its loop on its own; the
+    /// engine it leaves is the process exit's.
     #[test]
     fn posted_shutdown_stops_the_server() {
         let (addr, state, ended) = super::testserve::spawn(
@@ -6910,24 +6925,24 @@ mod tests {
 
     /// The orderly stop's wait on the engine thread — what it waits for (the
     /// loop's end, between engine calls, every request the thread held
-    /// answered by then, and the answers in flight written) and what it does
-    /// not (the engine's Drop, which can outlast it) — pinned at a small
-    /// scale: [`ENGINE_STOP`]'s policy without spending its seconds. The
-    /// servers start the way `run` starts them ([`Server::start`]); the
-    /// engines are mocks owned by these gates alone.
+    /// answered and the engine's nodes closed by then, and the answers in
+    /// flight written), and that the thread leaves the engine to the process
+    /// exit — pinned at a small scale: [`ENGINE_STOP`]'s policy without
+    /// spending its seconds. The servers start the way `run` starts them
+    /// ([`Server::start`]); the engines are mocks owned by these gates alone.
     mod stop_wait {
         use std::io::Read;
         use std::net::{SocketAddr, TcpStream};
         use std::path::PathBuf;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex, mpsc};
         use std::time::{Duration, Instant};
 
         use serde_json::{Value, json};
 
         use crate::api::{
-            FATAL_LINGER, Server, ServerConfig, Shared, State, Stop, Waited, refused, relock,
-            stop_line, stopping, stopping_message, testserve,
+            FATAL_LINGER, Server, ServerConfig, Shared, State, Stop, Waited, exit_shutdown,
+            refused, relock, stop_line, stopping, stopping_message, testserve,
         };
         use crate::genloop::Slot;
         use crate::sched::{Reserve, Use};
@@ -6938,19 +6953,21 @@ mod tests {
         };
 
         /// The waits' bound in these gates: past it, a call the stop arrives
-        /// in is reported; the engine's Drop is made to outlast it.
+        /// in is reported.
         const BOUND: Duration = Duration::from_millis(400);
 
-        /// An engine whose Drop sleeps `ms`, as a placed engine's does (a
-        /// host tier's pinned pages freed, its threads joined), then notes
-        /// that it finished: work that outlives the stop's bound with no call
-        /// running.
-        struct SlowDrop {
-            ms: u64,
+        /// How long the witness takes to close its nodes: a close made after
+        /// the loop's end is published still runs when the stop's wait wakes.
+        const CLOSING: Duration = Duration::from_millis(100);
+
+        /// An engine whose Drop notes that it ran, and which counts the
+        /// closes of its nodes, each [`CLOSING`] long.
+        struct Witness {
             dropped: Arc<AtomicBool>,
+            closed: Arc<AtomicUsize>,
         }
 
-        impl Engine for SlowDrop {
+        impl Engine for Witness {
             fn tokenizer(&self) -> Arc<dyn Tokenizer> {
                 Arc::new(MockTokenizer)
             }
@@ -6971,13 +6988,17 @@ mod tests {
                 4096
             }
             fn describe(&self) -> String {
-                "the slow-drop mock".to_owned()
+                "the witness mock".to_owned()
+            }
+            fn close_nodes(&mut self) -> Result<(), crate::EngineError> {
+                std::thread::sleep(CLOSING);
+                self.closed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             }
         }
 
-        impl Drop for SlowDrop {
+        impl Drop for Witness {
             fn drop(&mut self) {
-                std::thread::sleep(Duration::from_millis(self.ms));
                 self.dropped.store(true, Ordering::SeqCst);
             }
         }
@@ -7039,35 +7060,73 @@ mod tests {
             Arc::clone(&state.shared)
         }
 
-        /// An idle engine thread leaves its loop at once when the stop
-        /// arrives, and the engine's Drop it leaves behind — however long —
-        /// is not waited out: the wait ends under its bound while the Drop
-        /// still runs.
+        /// Whatever ends the engine thread's loop ends the server, and the
+        /// process exit reclaims the engine: the thread never drops it, so
+        /// no driver call of the engine's Drop runs beside the exit's
+        /// teardown of the driver's libraries. What the Drop would tell the
+        /// engine's nodes the thread tells them once, before the loop's end
+        /// is published, so the stop's wait covers it. Pinned for each way
+        /// the loop ends: the stop, which an idle thread leaves at once (the
+        /// wait wakes on the loop's own leaving, not on the bound), an engine
+        /// failure and a panic; and for the stop of slots that take the
+        /// engine in turns, whose [`SwapEngine`] passes the close on.
+        // PIN(2026-10-23): the engine is no longer dropped after the loop; the check that the
+        // engine thread finished its Drop became the check that the Drop never runs.
         #[test]
-        fn the_stop_waits_out_no_engine_drop() {
-            let dropped = Arc::new(AtomicBool::new(false));
-            let sh = started(Box::new(SlowDrop {
-                ms: 900,
-                dropped: Arc::clone(&dropped),
-            }));
-            sh.begin_stop(&Stop::Sigint);
-            // A true under the bound is the loop's own leaving: the wait
-            // wakes on its signal, not on the bound running out.
-            assert!(
-                sh.wait_loop_end(BOUND),
-                "the loop left; only the engine's Drop was left to run"
-            );
-            assert!(
-                !dropped.load(Ordering::SeqCst),
-                "the engine's Drop was still running when the wait ended"
-            );
-            let until = Instant::now() + Duration::from_secs(5);
-            while !dropped.load(Ordering::SeqCst) && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(10));
+        fn the_engine_is_left_to_the_process_exit() {
+            let mut dropped_after = Vec::new();
+            let mut closes = Vec::new();
+            for end in ["stop", "failure", "panic", "stop of turns"] {
+                let dropped = Arc::new(AtomicBool::new(false));
+                let closed = Arc::new(AtomicUsize::new(0));
+                let witness = Box::new(Witness {
+                    dropped: Arc::clone(&dropped),
+                    closed: Arc::clone(&closed),
+                });
+                let sh = started(if end == "stop of turns" {
+                    Box::new(SwapEngine::new(witness, 2, Park::Ids).expect("the swap engine"))
+                } else {
+                    witness
+                });
+                if end.starts_with("stop") {
+                    sh.begin_stop(&Stop::Sigint);
+                } else {
+                    let fails = end == "failure";
+                    let action = Action {
+                        run: Box::new(move |_: &mut Slot| {
+                            if !fails {
+                                panic!("the test's panic on the engine thread");
+                            }
+                            Acted {
+                                failure: Some(EngineError("the test's failure".to_owned())),
+                                reply: Box::new(|| ()),
+                            }
+                        }),
+                        drops: false,
+                    };
+                    relock(&sh.board)
+                        .reserve(Reserve::One(0), action)
+                        .expect("the slot is free");
+                    sh.work.notify_one();
+                }
+                assert!(sh.wait_loop_end(BOUND), "{end}: the loop left");
+                let at_end = closed.load(Ordering::SeqCst);
+                std::thread::sleep(BOUND);
+                if dropped.load(Ordering::SeqCst) {
+                    dropped_after.push(end);
+                }
+                closes.push((end, at_end, closed.load(Ordering::SeqCst)));
             }
             assert!(
-                dropped.load(Ordering::SeqCst),
-                "the engine thread finished its engine's Drop"
+                dropped_after.is_empty(),
+                "the engine thread dropped its engine after its loop ended by {dropped_after:?}"
+            );
+            assert!(
+                closes
+                    .iter()
+                    .all(|&(_, at_end, after)| at_end == 1 && after == 1),
+                "the engine's nodes are closed once before the loop's end is published; \
+                 (loop ended by, closes at its end, closes after) {closes:?}"
             );
         }
 
@@ -7081,9 +7140,9 @@ mod tests {
         /// thread then leaving its loop.
         #[test]
         fn the_stop_is_published_under_the_board_lock() {
-            let sh = started(Box::new(SlowDrop {
-                ms: 0,
+            let sh = started(Box::new(Witness {
                 dropped: Arc::new(AtomicBool::new(false)),
+                closed: Arc::new(AtomicUsize::new(0)),
             }));
             let (locked, door) = mpsc::channel();
             let (seen, verdict) = mpsc::channel();
@@ -7176,11 +7235,10 @@ mod tests {
             );
         }
 
-        /// How long a halted request's answer may take to reach its client;
-        /// the engine's Drop is held past it.
+        /// How long a halted request's answer may take to reach its client.
         const READ: Duration = Duration::from_secs(2);
-        /// The longest a [`Paced`] Drop waits for its gate, and a wait for
-        /// the engine thread waits: a test that fails ends without hanging.
+        /// The longest a wait for the engine thread waits: a test that fails
+        /// ends without hanging.
         const HOLD: Duration = Duration::from_secs(10);
         /// The quantum of the planned prompts.
         const Q: usize = 4;
@@ -7197,15 +7255,13 @@ mod tests {
 
         /// The mock as built (its slots, its quantum), every call logged in
         /// order, each call in `hold` waiting once logged for a permit the
-        /// test sends. Its Drop waits until the test closes its gate (at most
-        /// [`HOLD`]), as a placed engine's Drop runs past the stop's wait.
+        /// test sends. Its Drop notes that it ran.
         struct Paced {
             inner: MockEngine,
             cur: usize,
             log: Arc<Mutex<Vec<Call>>>,
             hold: Vec<Call>,
             permits: mpsc::Receiver<()>,
-            gate: mpsc::Receiver<()>,
             dropped: Arc<AtomicBool>,
         }
 
@@ -7264,20 +7320,18 @@ mod tests {
 
         impl Drop for Paced {
             fn drop(&mut self) {
-                let _ = self.gate.recv_timeout(HOLD);
                 self.dropped.store(true, Ordering::SeqCst);
             }
         }
 
         /// A served [`Paced`] mock and the test's handles on it: its call
-        /// log, its permits, and its Drop's gate, closed when the rig drops.
+        /// log, its permits, and whether it was dropped.
         struct Rig {
             addr: SocketAddr,
             state: Arc<State>,
             log: Arc<Mutex<Vec<Call>>>,
             permit: mpsc::Sender<()>,
             dropped: Arc<AtomicBool>,
-            _gate: mpsc::Sender<()>,
         }
 
         impl Rig {
@@ -7293,7 +7347,6 @@ mod tests {
             ) -> Rig {
                 let log = Arc::new(Mutex::new(Vec::new()));
                 let (permit, permits) = mpsc::channel();
-                let (closer, gate) = mpsc::channel();
                 let dropped = Arc::new(AtomicBool::new(false));
                 let paced = Paced {
                     inner,
@@ -7301,7 +7354,6 @@ mod tests {
                     log: Arc::clone(&log),
                     hold: hold.to_vec(),
                     permits,
-                    gate,
                     dropped: Arc::clone(&dropped),
                 };
                 let engine: Box<dyn Engine> = if turns {
@@ -7329,7 +7381,6 @@ mod tests {
                     log,
                     permit,
                     dropped,
-                    _gate: closer,
                 }
             }
 
@@ -7449,9 +7500,9 @@ mod tests {
         }
 
         /// Every request the worker holds when the stop arrives is answered
-        /// before the loop's end, the engine's Drop still running: a stream
-        /// mid-generation ends with the stop's error event and its end, no
-        /// `[DONE]` (the end an engine failure gives a stream); a request
+        /// before the loop's end, the engine left to the process exit: a
+        /// stream mid-generation ends with the stop's error event and its end,
+        /// no `[DONE]` (the end an engine failure gives a stream); a request
         /// between its prompt's calls — a quantum's plan beside the busy
         /// stream — gets the stop's 503, the queued requests' answer. Both
         /// are answers in flight, and the stop's wait ends once they are
@@ -7500,7 +7551,7 @@ mod tests {
             );
             assert!(
                 !rig.dropped.load(Ordering::SeqCst),
-                "the engine's Drop was still running when the wait ended"
+                "the engine thread dropped its engine after the loop"
             );
             let (status, body) = answer(a);
             assert_eq!(status, 200, "{body}");
@@ -7543,9 +7594,9 @@ mod tests {
         /// names the cause alone.
         #[test]
         fn the_stop_waits_for_the_answers_in_flight() {
-            let sh = started(Box::new(SlowDrop {
-                ms: 0,
+            let sh = started(Box::new(Witness {
                 dropped: Arc::new(AtomicBool::new(false)),
+                closed: Arc::new(AtomicUsize::new(0)),
             }));
             let writing = sh.answers.answering();
             sh.begin_stop(&Stop::Sigint);
@@ -7563,6 +7614,50 @@ mod tests {
                 stop_line(&Stop::Sigint, waited),
                 "bloomery-serve: shutdown (SIGINT)"
             );
+        }
+
+        /// The stop's exit tears the process down (its exit handlers, the
+        /// loaded libraries' destructors) only after a wait that ended: after
+        /// one that ran out, a device driver call can still be running, and
+        /// the process ends without the teardown. Each way the wait ends
+        /// exits a process of its own, which notes whether an exit handler
+        /// ran.
+        #[test]
+        fn the_stop_tears_the_process_down_only_after_a_wait_that_ended() {
+            const NAME: &str = "api::tests::stop_wait::\
+                                the_stop_tears_the_process_down_only_after_a_wait_that_ended";
+            // The fresh process's own argument: a filter no test's name is.
+            const FRESH: &str = "a-fresh-process-for-the-stop-exit";
+            const TORN: &str = "an exit handler ran";
+            extern "C" fn torn() {
+                eprintln!("{TORN}");
+            }
+            if let Some(case) = std::env::args().skip_while(|a| a != FRESH).nth(1) {
+                // SAFETY: `torn` is a function of no arguments that lives as
+                // long as the process.
+                assert_eq!(unsafe { libc::atexit(torn) }, 0, "the exit handler");
+                let waited = match case.as_str() {
+                    "done" => Waited::Done,
+                    "loop" => Waited::Loop,
+                    "answers" => Waited::Answers(1),
+                    other => panic!("no wait ends as {other}"),
+                };
+                exit_shutdown(&Stop::Sigterm, |_| waited);
+            }
+            let exe = std::env::current_exe().expect("the test binary");
+            for (case, torn_down) in [("done", true), ("loop", false), ("answers", false)] {
+                let out = std::process::Command::new(&exe)
+                    .args(["--exact", NAME, FRESH, case, "--nocapture"])
+                    .output()
+                    .expect("the fresh process");
+                let err = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    out.status.success() && err.contains("bloomery-serve: shutdown (SIGTERM)"),
+                    "{case}: {}\n{err}",
+                    out.status
+                );
+                assert_eq!(err.contains(TORN), torn_down, "{case}: {err}");
+            }
         }
 
         /// The stop is read before each action and each start of a round:
@@ -7742,7 +7837,7 @@ mod tests {
         }
 
         /// Under turns the halt answers every request it holds too, before
-        /// the loop's end and with the engine's Drop still running: the
+        /// the loop's end and with the engine left to the process exit: the
         /// parked stream ends with the stop's error event, and the running
         /// request, the one waiting for its prompt's turn and the slot action
         /// deferred while they live each get the stop's 503.
@@ -7789,7 +7884,7 @@ mod tests {
             assert_eq!(rig.sh().wait_stop(BOUND), Waited::Done);
             assert!(
                 !rig.dropped.load(Ordering::SeqCst),
-                "the engine's Drop was still running when the wait ended"
+                "the engine thread dropped its engine after the loop"
             );
             let (status, body) = answer(a);
             assert_eq!(status, 200, "{body}");

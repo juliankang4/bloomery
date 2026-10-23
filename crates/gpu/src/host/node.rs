@@ -1225,20 +1225,29 @@ impl TierNode {
     pub fn lost(&self) -> Option<&str> {
         self.lost.as_deref()
     }
+
+    /// End the load: a close the node answers once its stream has drained,
+    /// which ends its serving of the load ([`serve`]). Nothing to a lost
+    /// node. The channel ends with it, so the node is lost to every later
+    /// request.
+    pub(super) fn close(&mut self) -> Result<(), GpuError> {
+        if self.lost.is_some() {
+            return Ok(());
+        }
+        self.req.clear();
+        let closed = self.ask(Tag::Close, DRAIN_DEADLINE + REPLY, "close");
+        if self.lost.is_none() {
+            self.ch.shutdown();
+            self.lost = Some("its load was closed".to_owned());
+        }
+        closed
+    }
 }
 
 impl Drop for TierNode {
-    /// A close the node answers once its stream has drained; nothing to a
-    /// lost node.
+    /// The load's close ([`TierNode::close`]).
     fn drop(&mut self) {
-        if self.lost.is_none() {
-            let deadline = Instant::now() + DRAIN_DEADLINE + REPLY;
-            drop(
-                self.ch
-                    .send(Tag::Close, &[], deadline)
-                    .and_then(|()| self.ch.recv(deadline)),
-            );
-        }
+        drop(self.close());
     }
 }
 
@@ -2003,6 +2012,61 @@ pub(super) mod tests {
             pci_bus: "000F:01:00.0".into(),
             held_by: None,
         }
+    }
+
+    /// Over loopback, with no card: a node's load is closed once. The node
+    /// gets one close with no payload, and neither a second close nor the
+    /// node's Drop sends anything more; the closed node is lost, so a later
+    /// request is refused.
+    #[test]
+    fn a_node_gets_one_close() {
+        use super::wire::Channel;
+        use super::{TIER_CHAINS, TierNode};
+        use std::net::{TcpListener, TcpStream};
+
+        let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = l.local_addr().expect("its address");
+        let peer = std::thread::spawn(move || {
+            let mut ch = Channel::new(l.accept().expect("an accept").0).expect("a channel");
+            let mut frames = Vec::new();
+            while let Ok(tag) = ch.recv(Instant::now() + Duration::from_secs(10)) {
+                frames.push((tag, ch.body().len()));
+                ch.send(Tag::Ok, &[], Instant::now() + Duration::from_secs(10))
+                    .expect("a reply");
+            }
+            frames
+        });
+        let mut node = TierNode {
+            addr,
+            ch: Channel::new(TcpStream::connect(addr).expect("a connect")).expect("a channel"),
+            req: Out::default(),
+            device: gb10(1),
+            shape: TierShape {
+                hidden: 2,
+                n_used: 1,
+                rows: 1,
+                act: TierAct::F32,
+            },
+            cols: 1,
+            planes: (0, 0),
+            resident_bytes: 0,
+            device_bytes: 0,
+            graphs: [None; TIER_CHAINS],
+            control_round_trips: 0,
+            lost: None,
+        };
+        // A payload left by an earlier request, which the close does not send.
+        node.req.u8(1);
+        node.close().expect("the close");
+        assert!(node.lost().is_some(), "a closed node is lost");
+        node.close().expect("a second close sends nothing");
+        assert!(node.release_remote().is_err(), "a request after the close");
+        drop(node);
+        assert_eq!(
+            peer.join().expect("the peer"),
+            [(Tag::Close, 0)],
+            "the frames the node got"
+        );
     }
 
     /// A census and an open read back as written; every chain's word names

@@ -1717,6 +1717,15 @@ impl TierCard {
         }
     }
 
+    /// End the tier's load on its node ([`TierNode::close`]); nothing for a
+    /// card of this process.
+    pub(super) fn close_node(&mut self) -> Result<(), GpuError> {
+        match &mut self.side {
+            TierSide::Here(_) => Ok(()),
+            TierSide::Node(n) => n.close(),
+        }
+    }
+
     /// The card's name, as the plan gives it.
     #[must_use]
     pub fn name(&self) -> &str {

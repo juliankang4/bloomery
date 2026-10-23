@@ -2791,6 +2791,10 @@ impl Seat for Q38 {
         }))
     }
 
+    fn close_nodes(&mut self) -> Result<(), GateError> {
+        Ok(self.s.model_mut().close_nodes()?)
+    }
+
     /// One pass from `last`: under the draft the window of at most its four
     /// rows (the width chooser's cut under `BLOOMERY_MTP_WIDTH=cost`), its
     /// kept tokens and counts; without it one step.

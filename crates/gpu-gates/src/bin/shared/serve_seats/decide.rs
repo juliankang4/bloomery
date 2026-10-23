@@ -63,6 +63,7 @@
 //! name.
 
 use std::collections::BTreeMap;
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -626,7 +627,7 @@ fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiv
         };
         Ok((head, on, q, ctx))
     })();
-    let (mut head, mut on) = match opened {
+    let model = match opened {
         Ok((head, on, q, ctx)) => {
             let _ = ready.send(Ok((q, ctx)));
             (head, on)
@@ -636,8 +637,22 @@ fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiv
             return;
         }
     };
+    answer_jobs(model, jobs, |(head, on), body| head.decide(body, on));
+}
+
+/// Answers each of `jobs` with `decide` on `model`, one at a time, until the server drops its
+/// sender, which it does only on its way to the process exit. The model is left to that exit on
+/// every way this ends: its Drop frees through the device driver, which the exit tears down, and
+/// a `decide` that panics answers its request by dropping its reply, after which the server may
+/// stop and exit at once.
+fn answer_jobs<M>(
+    model: M,
+    jobs: &Receiver<Job>,
+    decide: impl Fn(&mut M, &str) -> Result<Decided, DecideError>,
+) {
+    let mut model = ManuallyDrop::new(model);
     for (body, reply) in jobs {
-        let _ = reply.send(head.decide(&body, &mut on));
+        let _ = reply.send(decide(&mut *model, &body));
     }
 }
 
@@ -768,4 +783,58 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         .w("addr", bound)
         .eprint();
     Ok(server.run())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    /// A model that notes when it is dropped.
+    struct Witness(Arc<AtomicBool>);
+
+    impl Drop for Witness {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The worker's model is never dropped on its thread: not when a decision panics, whose
+    /// request is answered by its reply's end, nor when the server drops its sender.
+    #[test]
+    fn the_worker_leaves_its_model_to_the_process_exit() {
+        for body in ["panic", "answered"] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let model = Witness(Arc::clone(&dropped));
+            let (jobs, rx) = mpsc::channel::<Job>();
+            let worker = std::thread::spawn(move || {
+                answer_jobs(model, &rx, |_, body| {
+                    assert_ne!(body, "panic", "the test's panic in a decision");
+                    Err(DecideError::Engine(body.to_owned()))
+                });
+            });
+            let (reply, answer) = mpsc::channel();
+            jobs.send((body.to_owned(), reply))
+                .expect("the worker takes a job");
+            let answered = answer
+                .recv()
+                .map(|a| a.map(|_| ()).map_err(|e| e.to_string()));
+            drop(jobs);
+            let ended = worker.join();
+            assert_eq!(
+                (answered, ended.is_err()),
+                if body == "panic" {
+                    (Err(mpsc::RecvError), true)
+                } else {
+                    (Ok(Err("answered".to_owned())), false)
+                },
+                "{body}: (the answer, whether the worker panicked)"
+            );
+            assert!(
+                !dropped.load(Ordering::SeqCst),
+                "{body}: the worker dropped its model"
+            );
+        }
+    }
 }

@@ -8,7 +8,7 @@ crates/threads/src/lib.rs 2 the pool's workers: each pins itself, and pool() bui
 crates/gpu-gates/src/bind.rs 3 the engine thread, spawned by the serve main, which is never pinned (the engine thread pins itself); a test's echo thread; a test's file thread (the seat's state commands)
 crates/gpu-gates/src/side_seat.rs 1 the embedding model's thread, which owns its card, spawned by the serve main, never pinned
 crates/gpu-gates/src/bin/gate_gemma_embedding2_serve.rs 1 the gate's concurrent chat request, from the gate main, never pinned
-crates/gpu-gates/src/bin/shared/serve_seats/decide.rs 1 the decide seat's backbone worker thread, which owns the card, spawned by the serve main, never pinned
+crates/gpu-gates/src/bin/shared/serve_seats/decide.rs 2 the decide seat's backbone worker thread, which owns the card, spawned by the serve main, never pinned; the worker test's job thread, from a libtest thread that is never pinned
 crates/serve/src/api.rs 4 the HTTP server's threads and the signal handlers' reader thread, spawned by the serve main or its accept loop, never pinned
 crates/serve/src/embeddings.rs 2 two tests' requests that wait for a held lock (the model's, the cache's), from the test main, never pinned
 crates/serve/src/decide.rs 1 the decision server's connection threads, spawned by its accept loop, never pinned
@@ -19,6 +19,7 @@ crates/gpu-gates/src/lib.rs 1 par_map's workers, for the host references the gat
 crates/gpu/src/graph.rs 2 the capture-race tests' second threads, from a libtest thread that is never pinned
 crates/gpu/src/host/link/gather.rs 1 the gather tests' model rank cards, from a libtest thread that is never pinned
 crates/gpu/src/host/link/pump.rs 1 the relay tests' model tier card, from a libtest thread that is never pinned
+crates/gpu/src/host/node.rs 1 the one-close test's peer that reads the node's frames, from a libtest thread that is never pinned
 crates/gpu/src/host/nvtier.rs 2 the drop-queue tests' drop and read threads, from a libtest thread that is never pinned
 crates/gpu/src/host/xstream.rs 1 the fallback-copy test's thread that releases the copy stream's hold, from a libtest thread that is never pinned
 crates/gpu/src/host/step.rs 1 the scalar go-wait test's host tier thread, from a libtest thread that is never pinned

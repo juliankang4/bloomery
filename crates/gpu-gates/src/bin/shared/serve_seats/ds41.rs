@@ -1401,6 +1401,10 @@ impl Seat for V41 {
         }))
     }
 
+    fn close_nodes(&mut self) -> Result<(), GateError> {
+        Ok(self.s.model_mut().close_nodes()?)
+    }
+
     /// The body's rule; under the DSpark draft, a cut anywhere but where
     /// the draft stands also leaves the request's prompt call a window.
     fn keep(&self, n: usize) -> (usize, Option<String>) {

@@ -271,6 +271,13 @@ pub trait HostServed {
     /// first. A body with no machine does nothing.
     fn stop_residency(&mut self) {}
 
+    /// End the load on every expert tier's node
+    /// ([`crate::host::HostTier::close_nodes`]), freeing nothing in this
+    /// process. A body whose tier runs on no node does nothing.
+    fn close_nodes(&mut self) -> Result<(), GpuError> {
+        Ok(())
+    }
+
     /// Start the residency machine the load prepared
     /// ([`crate::host::HostTier::start_swap`]), once the body's pieces are
     /// sized: the machine empties each layer's spare slots, so every piece
@@ -1279,6 +1286,17 @@ impl<B: ChainBody> GpuModel<B> {
         match body.host() {
             Some(host) => host.residency_reset(gpu.stream()),
             None => Ok(None),
+        }
+    }
+
+    /// End the load on every expert tier's node ([`HostServed::close_nodes`])
+    /// and free nothing: what a server that leaves the model to the process
+    /// exit calls instead of its Drop, which would close them and then free
+    /// the model through the device driver. No call on the model follows.
+    pub fn close_nodes(&mut self) -> Result<(), GpuError> {
+        match self.body.host() {
+            Some(host) => host.close_nodes(),
+            None => Ok(()),
         }
     }
 
