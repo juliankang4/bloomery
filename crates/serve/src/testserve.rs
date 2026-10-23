@@ -3,12 +3,19 @@
 //! start their servers here, so a field `ServerConfig` gains is set in one
 //! place ([`mock_config`]).
 
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, mpsc};
 
 use super::{End, Engine, FATAL_LINGER, Server, ServerConfig, State};
 use crate::flag::ApiKeys;
+
+thread_local! {
+    pub(super) static CLIENT_PROBE: RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> = const {
+        RefCell::new(None)
+    };
+}
 
 /// The mock's chat template: each message as `<role>\n` and its content,
 /// then `<assistant>\n` when a generation prompt is asked for.

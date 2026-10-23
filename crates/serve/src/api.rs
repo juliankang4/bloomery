@@ -2264,7 +2264,7 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
         } else {
             0.0
         };
-        let rows: [(&str, &str, &str, String); 18] = [
+        let rows: [(&str, &str, &str, String); 19] = [
             (
                 "counter",
                 "prompt_tokens_total",
@@ -2367,6 +2367,12 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 "requests_processing",
                 "Number of request processing.",
                 busy.to_string(),
+            ),
+            (
+                "counter",
+                "requests_cancelled_before_prompt_total",
+                "Requests cancelled before their prompt started",
+                s.n_cancelled_before_prompt_total.to_string(),
             ),
             (
                 "gauge",
@@ -3186,7 +3192,7 @@ fn run_gen(
         .map_err(|e| invalid(format!("the sampler refuses the sampling parameters: {e}")))?;
     let client = Arc::new(Client {
         stream: peer,
-        gone: AtomicBool::new(false),
+        gone: Mutex::new(false),
     });
     let (events, rx) = mpsc::channel();
     let submit = Submit {
@@ -3255,18 +3261,28 @@ pub(crate) fn client_gone() -> io::Error {
 /// error is consumed by `take_error`, so the first observer remembers it.
 pub(crate) struct Client {
     stream: TcpStream,
-    gone: AtomicBool,
+    gone: Mutex<bool>,
 }
 
 impl Client {
     pub(crate) fn check(&self) -> io::Result<()> {
-        if self.gone.load(Ordering::Acquire) {
+        let mut gone = relock(&self.gone);
+        if *gone {
             return Err(client_gone());
         }
         let result = probe_client(&self.stream);
+        #[cfg(test)]
         if result.is_err() {
-            self.gone.store(true, Ordering::Release);
+            testserve::CLIENT_PROBE.with_borrow_mut(|pause| {
+                if let Some((probed, resume)) = pause.take() {
+                    probed.send(()).expect("the probe observer");
+                    resume
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the probe resumes");
+                }
+            });
         }
+        *gone = result.is_err();
         result
     }
 }
@@ -6368,7 +6384,7 @@ mod tests {
         fn lifecycle_half_closed_request_receives_its_whole_answer() {
             let calls = Arc::new(AtomicUsize::new(0));
             let (permit, permits) = mpsc::channel();
-            let (addr, _state, _ended) = testserve::spawn(
+            let (addr, state, _ended) = testserve::spawn(
                 Box::new(Gated {
                     inner: MockEngine::new(1024),
                     calls: Arc::clone(&calls),
@@ -6399,6 +6415,10 @@ mod tests {
                 serde_json::from_str(raw.split_once("\r\n\r\n").expect("head").1).expect("JSON");
             assert_eq!(body["content"], "a");
             assert_eq!(body["tokens_predicted"], 1);
+            assert_eq!(
+                relock(&state.shared.stats).n_cancelled_before_prompt_total,
+                0
+            );
         }
 
         #[cfg(unix)]
@@ -6468,6 +6488,100 @@ mod tests {
                 prefilled.load(Ordering::SeqCst),
                 2,
                 "a reset request reached prefill"
+            );
+            let (status, metrics) = testserve::roundtrip(addr, "GET", "/metrics", &[], "");
+            assert_eq!(status, 200, "{metrics}");
+            assert!(
+                metrics.contains("llamacpp:requests_cancelled_before_prompt_total 1\n"),
+                "{metrics}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn lifecycle_concurrent_reset_never_starts_a_prompt() {
+            use crate::api::Client;
+            use crate::genloop::GenParams;
+            use crate::media::Held;
+            use crate::worker::Submit;
+            use std::sync::Mutex;
+
+            let prefilled = Arc::new(AtomicUsize::new(0));
+            let (permit, permits) = mpsc::channel();
+            let (addr, state, _ended) = testserve::spawn(
+                Box::new(Gated {
+                    inner: MockEngine::new(1024),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    permits,
+                    prefilled: Arc::clone(&prefilled),
+                }),
+                testserve::mock_config(),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let peer = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+            let (stream, _) = listener.accept().expect("accept");
+            let client = Arc::new(Client {
+                stream,
+                gone: Mutex::new(false),
+            });
+            let (probed, consumed) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            reset(peer);
+            let observer = Arc::clone(&client);
+            let checking = std::thread::spawn(move || {
+                testserve::CLIENT_PROBE.with_borrow_mut(|pause| *pause = Some((probed, resumed)));
+                wait_for("the reset error", || observer.check().is_err());
+            });
+            consumed
+                .recv_timeout(Duration::from_secs(3))
+                .expect("the first observer consumed the reset");
+            let (events, received) = mpsc::channel();
+            relock(&state.shared.board)
+                .enqueue(
+                    Held::from(vec![97, 98, 97, 98]),
+                    Submit {
+                        p: GenParams {
+                            n_predict: 1,
+                            ..super::super::default_params(&state)
+                        },
+                        prompt: serde_json::Value::Null,
+                        settings: serde_json::Value::Null,
+                        media: Vec::new(),
+                        sampler: None,
+                        events,
+                        client,
+                    },
+                )
+                .unwrap_or_else(|_| panic!("queue refused"));
+            state.shared.work.notify_one();
+            wait_for("the worker's admission", || {
+                let board = relock(&state.shared.board);
+                board.waiting() == 0 && board.free() == 0
+            });
+            let admitted = received.recv_timeout(Duration::from_millis(200));
+            permit.send(()).expect("release any incorrect prefill");
+            resume.send(()).expect("publish the reset");
+            checking.join().expect("the first checker");
+            assert!(
+                matches!(admitted, Err(mpsc::RecvTimeoutError::Timeout)),
+                "the worker admitted a request while its reset was being observed"
+            );
+            assert!(
+                matches!(
+                    received.recv_timeout(Duration::from_secs(3)),
+                    Err(mpsc::RecvTimeoutError::Disconnected)
+                ),
+                "the reset request sent an event"
+            );
+            wait_for("the cancelled slot's release", || {
+                relock(&state.shared.board).free() == 1
+            });
+            assert_eq!(prefilled.load(Ordering::SeqCst), 0);
+            let (status, metrics) = testserve::roundtrip(addr, "GET", "/metrics", &[], "");
+            assert_eq!(status, 200, "{metrics}");
+            assert!(
+                metrics.contains("llamacpp:requests_cancelled_before_prompt_total 1\n"),
+                "{metrics}"
             );
         }
 

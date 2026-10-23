@@ -74,6 +74,8 @@ pub(crate) struct Stats {
     pub t_predicted_ms_total: f64,
     /// Engine calls: a prompt's, and each step of one slot or several.
     pub n_decode_total: u64,
+    /// Requests whose client or event receiver left before their prompt started.
+    pub n_cancelled_before_prompt_total: u64,
     /// Over every engine call, the slots it carried.
     pub n_busy_slots_total: u64,
     /// The longest a request's sequence grew (prompt and generation, `n_past`).
@@ -629,6 +631,7 @@ impl Worker {
     /// Returns whether it runs on (an error ended it otherwise).
     fn start(&mut self, slot: usize, held: &Held, sub: Submit) -> Result<bool, Dead> {
         if sub.client.check().is_err() || sub.events.send(Msg::Started(slot)).is_err() {
+            relock(&self.sh.stats).n_cancelled_before_prompt_total += 1;
             relock(&self.sh.board).release(slot);
             return Ok(false);
         }
@@ -1135,6 +1138,7 @@ impl Worker {
     fn begin(&mut self) -> Result<(), Dead> {
         let p = self.t_mut().pending.remove(0);
         if p.sub.client.check().is_err() {
+            relock(&self.sh.stats).n_cancelled_before_prompt_total += 1;
             relock(&self.sh.board).release(p.slot);
             self.show_turns();
             return Ok(());
