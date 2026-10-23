@@ -100,7 +100,7 @@ impl Flags {
     /// ([`Row::ctx`]); and its bytes. Each step refuses by name. A seat calls it after its levers
     /// and its own arguments, and before its plan.
     pub fn read(&self) -> Result<Option<Side>, GateError> {
-        let Some(path) = model_file::resolve(&self.model, None)? else {
+        let Some(path) = model_file::resolve(&self.model, None, hf::fetch::Sources::Gguf)? else {
             return Ok(None);
         };
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;

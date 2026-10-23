@@ -132,6 +132,15 @@ pub struct Draft<'a> {
     pub usable: &'a dyn Fn(&Path) -> Result<(), String>,
 }
 
+/// The model sources the caller can open, checked before any model file is fetched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sources {
+    /// Only GGUF model files, including split sets.
+    Gguf,
+    /// GGUF model files or a safetensors checkpoint folder.
+    GgufOrCheckpoint,
+}
+
 /// How a resolve reaches the hub and where it caches.
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -601,7 +610,8 @@ impl Client {
     /// The set `r` picks in its repo, every file fetched and checked; the
     /// local paths in shard order (the first shard first). A repo with no
     /// GGUF set and a safetensors checkpoint ([`crate::checkpoint_files`])
-    /// gives the checkpoint's folder, its files fetched and checked. `draft`, the MTP
+    /// gives the checkpoint's folder, its files fetched and checked, only when `sources`
+    /// includes checkpoints. Otherwise it is refused before any file is fetched. `draft`, the MTP
     /// draft a model family runs beside its set, is fetched too when the
     /// repo holds a file of its name ([`crate::mtp_draft`]) and the fetched
     /// set can run it ([`Draft::usable`]; a `DraftSkip` event says why not):
@@ -612,10 +622,11 @@ impl Client {
     pub fn resolve(
         &self,
         r: &RepoRef,
+        sources: Sources,
         draft: Option<&Draft<'_>>,
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<Vec<PathBuf>, HfError> {
-        self.resolve_drafts(r, draft.map_or(&[], std::slice::from_ref), events)
+        self.resolve_drafts(r, sources, draft.map_or(&[], std::slice::from_ref), events)
     }
 
     /// [`Client::resolve`] for a caller that does not know the set's family
@@ -627,18 +638,19 @@ impl Client {
     pub fn resolve_drafts(
         &self,
         r: &RepoRef,
+        sources: Sources,
         drafts: &[Draft<'_>],
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<Vec<PathBuf>, HfError> {
         let entries = match self.listed(&r.repo)? {
             Listed::Hub(entries) => entries,
-            Listed::Cache(why) => return self.offline_set(r, &why, events),
+            Listed::Cache(why) => return self.offline_set(r, sources, &why, events),
         };
         let sets = gguf_sets(&r.repo, &entries)?;
         if sets.is_empty()
             && let Some(files) = crate::checkpoint_files(&entries)
         {
-            let dir = checkpoint(r, &self.root, &files, events)?;
+            let dir = checkpoint(r, sources, &self.root, &files, events)?;
             for e in &files {
                 self.fetch(&r.repo, e, events)?;
             }
@@ -687,6 +699,7 @@ impl Client {
     fn offline_set(
         &self,
         r: &RepoRef,
+        sources: Sources,
         why: &str,
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<Vec<PathBuf>, HfError> {
@@ -701,7 +714,7 @@ impl Client {
             && let Some(files) = crate::checkpoint_files(&entries)
         {
             events(&Event::Offline { repo: &r.repo, why });
-            let dir = checkpoint(r, &self.root, &files, events).map_err(offline)?;
+            let dir = checkpoint(r, sources, &self.root, &files, events).map_err(offline)?;
             self.offline_files(&r.repo, &files, events)?;
             return Ok(vec![dir]);
         }
@@ -767,9 +780,10 @@ impl Client {
 
 /// The folder in `root`'s cache of the checkpoint `files` of `r`'s repo, which a resolve gives
 /// in place of a set's first shard, its event sent; a quant is refused by name, as the
-/// checkpoint is the repo's one model.
+/// checkpoint is the repo's one model. A caller that accepts only GGUF is refused before the event.
 fn checkpoint(
     r: &RepoRef,
+    sources: Sources,
     root: &Path,
     files: &[Entry],
     events: &mut dyn FnMut(&Event<'_>),
@@ -778,6 +792,11 @@ fn checkpoint(
         return Err(HfError::CheckpointQuant {
             repo: r.repo.clone(),
             quant: quant.clone(),
+        });
+    }
+    if sources == Sources::Gguf {
+        return Err(HfError::CheckpointUnsupported {
+            repo: r.repo.clone(),
         });
     }
     events(&Event::Checkpoint {
@@ -1361,7 +1380,7 @@ mod tests {
     fn offline_run(c: &Client, r: &str) -> (Result<Vec<PathBuf>, HfError>, Vec<String>) {
         let r = RepoRef::parse(r).expect("repo");
         let mut seen = Vec::new();
-        let got = c.resolve(&r, None, &mut |ev| {
+        let got = c.resolve(&r, Sources::GgufOrCheckpoint, None, &mut |ev| {
             seen.push(match ev {
                 Event::Offline { why, .. } => format!("offline {why}"),
                 Event::File { file, state, .. } => format!("file {file} {}", state.name()),
@@ -1437,6 +1456,57 @@ mod tests {
             matches!(e, HfError::NoGguf { .. }) && e.to_string().contains("safetensors"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn checkpoint_support_applies_to_online_and_cached_sources() {
+        let d = scratch("checkpoint-support");
+        let mut c = hub(
+            &d,
+            "a/b",
+            &[
+                ("model.safetensors.index.json", b"index"),
+                ("model-00001-of-00002.safetensors", b"one"),
+                ("model-00002-of-00002.safetensors", b"two"),
+            ],
+        );
+        let r = RepoRef::parse("a/b").unwrap();
+        for offline in [false, true] {
+            c.offline = offline;
+            for single in [false, true] {
+                let mut file_events = 0;
+                let mut record = |ev: &Event<'_>| {
+                    if matches!(ev, Event::File { .. } | Event::Checkpoint { .. }) {
+                        file_events += 1;
+                    }
+                };
+                let result = if single {
+                    c.resolve(&r, Sources::Gguf, Some(&RUNS), &mut record)
+                } else {
+                    c.resolve_drafts(&r, Sources::Gguf, &[RUNS], &mut record)
+                };
+                let error = result.expect_err("checkpoint unsupported");
+                let error = match &error {
+                    HfError::Offline { cache, .. } => cache.as_ref(),
+                    error => error,
+                };
+                assert!(matches!(error, HfError::CheckpointUnsupported { repo } if repo == "a/b"));
+                assert_eq!(file_events, 0);
+                if !offline {
+                    assert!(!d.join("cache/a/b").exists());
+                }
+            }
+            if !offline {
+                c.resolve_drafts(&r, Sources::GgufOrCheckpoint, &[RUNS], &mut |_| {})
+                    .expect("supported checkpoint");
+            } else {
+                assert_eq!(
+                    c.resolve_drafts(&r, Sources::GgufOrCheckpoint, &[RUNS], &mut |_| {})
+                        .unwrap(),
+                    [d.join("cache/a/b")]
+                );
+            }
+        }
     }
 
     #[test]
@@ -1660,7 +1730,7 @@ mod tests {
         let r = RepoRef::parse("a/b:UD-Q4_K_XL").expect("repo");
         let mut seen = Vec::new();
         let got = c
-            .resolve(&r, Some(&RUNS), &mut |ev| {
+            .resolve(&r, Sources::GgufOrCheckpoint, Some(&RUNS), &mut |ev| {
                 if let Event::File { file, state, .. } = ev {
                     seen.push(format!("file {file} {}", state.name()));
                 }
@@ -1691,7 +1761,7 @@ mod tests {
         );
         // A second resolve fetches nothing: the draft too is `cached`.
         let mut again = Vec::new();
-        c.resolve(&r, Some(&RUNS), &mut |ev| {
+        c.resolve(&r, Sources::GgufOrCheckpoint, Some(&RUNS), &mut |ev| {
             if let Event::File { state, .. } = ev {
                 again.push(state.name());
             }
@@ -1728,11 +1798,16 @@ mod tests {
         let r = RepoRef::parse("a/b:UD-Q3_K_XL").expect("repo");
         let mut seen = Vec::new();
         let got = c
-            .resolve(&r, Some(&draft), &mut |ev| match ev {
-                Event::File { file, .. } => seen.push(format!("file {file}")),
-                Event::DraftSkip { file, why } => seen.push(format!("skip {file}: {why}")),
-                _ => {}
-            })
+            .resolve(
+                &r,
+                Sources::GgufOrCheckpoint,
+                Some(&draft),
+                &mut |ev| match ev {
+                    Event::File { file, .. } => seen.push(format!("file {file}")),
+                    Event::DraftSkip { file, why } => seen.push(format!("skip {file}: {why}")),
+                    _ => {}
+                },
+            )
             .expect("resolve");
         assert_eq!(got.as_slice(), std::slice::from_ref(&first));
         assert_eq!(
@@ -1761,7 +1836,7 @@ mod tests {
         let r = RepoRef::parse("a/b:Q4_K_M").expect("repo");
         let mut seen = Vec::new();
         let got = c
-            .resolve(&r, Some(&RUNS), &mut |ev| {
+            .resolve(&r, Sources::GgufOrCheckpoint, Some(&RUNS), &mut |ev| {
                 if let Event::File { file, .. } = ev {
                     seen.push(file.to_string());
                 }
@@ -1788,7 +1863,7 @@ mod tests {
         let r = RepoRef::parse("a/b:Q4_K_M").expect("repo");
         let mut seen = Vec::new();
         let got = c
-            .resolve_drafts(&r, &[], &mut |ev| match ev {
+            .resolve_drafts(&r, Sources::Gguf, &[], &mut |ev| match ev {
                 Event::File { file, .. } => seen.push(format!("file {file}")),
                 Event::DraftSkip { file, .. } => seen.push(format!("skip {file}")),
                 _ => {}
@@ -1809,7 +1884,16 @@ mod tests {
     fn each_draft_of_the_slice_is_looked_up_by_its_own_name() {
         let d = scratch("draft-rows");
         let body = content();
-        let c = hub(&d, "a/b", &[("m-Q4_K_M.gguf", &body), (DRAFT, b"draft")]);
+        let c = hub(
+            &d,
+            "a/b",
+            &[
+                ("m-Q4_K_M.gguf", &body),
+                (DRAFT, b"draft"),
+                ("model.safetensors.index.json", b"index"),
+                ("model-00001-of-00001.safetensors", b"checkpoint"),
+            ],
+        );
         let r = RepoRef::parse("a/b:Q4_K_M").expect("repo");
         let drafts = [
             Draft {
@@ -1820,7 +1904,7 @@ mod tests {
         ];
         let mut seen = Vec::new();
         let got = c
-            .resolve_drafts(&r, &drafts, &mut |ev| match ev {
+            .resolve_drafts(&r, Sources::Gguf, &drafts, &mut |ev| match ev {
                 Event::File { file, .. } => seen.push(format!("file {file}")),
                 Event::DraftSkip { file, .. } => seen.push(format!("skip {file}")),
                 _ => {}
@@ -1846,7 +1930,9 @@ mod tests {
             &[("Q4_K_XL/m-Q4_K_XL.gguf", &body), (DRAFT, b"draft")],
         );
         let r = RepoRef::parse("a/b:Q4_K_XL").expect("repo");
-        online.resolve(&r, Some(&RUNS), &mut |_| {}).expect("fetch");
+        online
+            .resolve(&r, Sources::GgufOrCheckpoint, Some(&RUNS), &mut |_| {})
+            .expect("fetch");
         assert!(
             d.join("cache/a/b/Q4_K_XL").join(DRAFT).is_file(),
             "the online fetch landed the draft beside the set"
@@ -1856,7 +1942,7 @@ mod tests {
         let c = unreachable(&d.join("cache"));
         let mut seen = Vec::new();
         let got = c
-            .resolve(&r, Some(&RUNS), &mut |ev| {
+            .resolve(&r, Sources::GgufOrCheckpoint, Some(&RUNS), &mut |ev| {
                 if let Event::File { file, state, .. } = ev {
                     seen.push(format!("file {file} {}", state.name()));
                 }

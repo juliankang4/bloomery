@@ -2178,9 +2178,11 @@ gate-gpu-ds41-lib:
 # 비전 좌석(vision_seat: 플래그, 투영기↔텍스트 검사, 인코더 자리와 reserve, 표의 위치당 바이트, `vision` 레코드)과 임베딩 모델의
 # 사이드 좌석(side_seat: 플래그)의 호스트 단위 시험:
 # 샘플링 스텝이 엔진의 로짓 버퍼 하나를 빌려 쓰고, 길이가 다른 호출자 버퍼는 이름 붙은 오류다. 카드·게이트 락 없음.
+# With `checkpoint` on, model_file::fetch's admission test runs too: a checkpoint build's `--hf` takes a checkpoint
+# repo, and the side seat, which opens GGUF only, refuses it before any shard download.
 [group('host')]
 gate-ds41-bind:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- vision_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- side_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- bind::'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- vision_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- side_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,checkpoint --lib -- model_file::fetch::tests::checkpoint_support_is_checked_before_download --nocapture && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- bind::'
 
 # The Qwen3.8 serve seat's feed rules (bloomery-serve-qwen38's own unit tests, behind the deepseek41 feature like bind):
 # the route trace takes only the step feed, no MTP draft, one slot and no residency word but off; the step feed takes

@@ -11,7 +11,9 @@ fn sentence_prompts_startup(case: &str) {
         hf: Some("fixture/quant:Q4_K_M".into()),
         ..Default::default()
     };
-    let model = resolve(&flags, None).unwrap().unwrap();
+    let model = resolve(&flags, None, hf::fetch::Sources::Gguf)
+        .unwrap()
+        .unwrap();
     let result = sentence_prompts(&flags, &model);
     match case {
         "base" | "own" => {

@@ -8,8 +8,8 @@
 //! quantizes (`quantized_from`), a family's MTP draft fetched beside a set only when its
 //! architecture's rule says the set can run that file, and a seat's image projector under `--hf`
 //! (`hf_projector`), the repo's own beside the model. A `--hf` repo that holds a safetensors
-//! checkpoint and no GGUF set resolves to the checkpoint's folder, which the seat that serves it
-//! opens.
+//! checkpoint and no GGUF set resolves to the checkpoint's folder only for a caller that can
+//! open checkpoints; other callers refuse it before fetching its files.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

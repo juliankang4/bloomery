@@ -763,10 +763,6 @@ required-features = ["vision"]
 name = "sentence_prompts"
 required-features = ["hf"]
 
-[[test]]
-name = "model_sources"
-required-features = ["hf"]
-
 [[bin]]
 name = "gate_qwen38_media"
 required-features = ["vision", "deepseek41"]

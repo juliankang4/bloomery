@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use gguf::Split;
 use hf::HfError;
-use hf::fetch::{Client, Draft, Event};
+use hf::fetch::{Client, Draft, Event, Sources};
 use hf::source::{self, Flags, Source};
 use refset::arch::BesideDraft;
 use refset::arch::draft::Candidate;
@@ -119,8 +119,13 @@ fn draft_usable(row: &BesideDraft, candidate: &Candidate, first: &Path) -> Resul
 /// fetched and checked (its first shard), the family's MTP draft beside it
 /// when the repo holds the file and the set can run it ([`draft_usable`]; an
 /// `hf draft skipped` record says why not), each file of a row that has one a
-/// checkpoint offered on its own. `None` when nothing names one.
-pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<PathBuf>, GateError> {
+/// checkpoint offered on its own. `sources` names what this caller can open; unsupported
+/// checkpoint repos are refused before downloading files. `None` when nothing names one.
+pub fn resolve(
+    flags: &Flags,
+    env: Option<&str>,
+    sources: Sources,
+) -> Result<Option<PathBuf>, GateError> {
     record::require(record::groups::fetch::FETCH, "model_file::resolve");
     record::require(record::groups::fetch::SET, "model_file::resolve");
     match source::resolve(flags, env)? {
@@ -145,7 +150,7 @@ pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<PathBuf>, Gate
                     usable: usable.as_ref(),
                 })
                 .collect();
-            let files = client()?.resolve_drafts(&r, &drafts, &mut print)?;
+            let files = client()?.resolve_drafts(&r, sources, &drafts, &mut print)?;
             Ok(Some(files.into_iter().next().ok_or_else(|| {
                 format!("--hf {r}: the picked set has no file")
             })?))
@@ -236,13 +241,18 @@ fn model_card(repo: &str) -> Result<Option<String>, GateError> {
 
 /// The model file `flags` name, resolved beside `$BLOOMERY_REF_MODEL`
 /// ([`resolve`]) and set as the process's ([`set_model_file`]) when they
-/// name one.
+/// name one. A checkpoint repo requires the `checkpoint` build feature before any file fetch.
 pub fn name(flags: &Flags) -> Result<(), GateError> {
     record::require(record::groups::fetch::FETCH, "model_file::name");
     record::require(record::groups::fetch::SET, "model_file::name");
     let env = std::env::var("BLOOMERY_REF_MODEL").ok();
+    let sources = if cfg!(feature = "checkpoint") {
+        Sources::GgufOrCheckpoint
+    } else {
+        Sources::Gguf
+    };
     if *flags != Flags::default()
-        && let Some(path) = resolve(flags, env.as_deref())?
+        && let Some(path) = resolve(flags, env.as_deref(), sources)?
     {
         set_model_file(path)?;
         // A path flag wins over `--hf` ([`source::resolve`]), so the file is the repo's only
@@ -364,5 +374,177 @@ mod tests {
             };
             assert_eq!(super::no_file(&wrapped), missing);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_support_is_checked_before_download() {
+        use crate::model_file;
+        use std::os::unix::fs::PermissionsExt;
+
+        // The child half: the parent reruns this test in each case's folder, which holds `scenario`.
+        if let Ok(case) = std::fs::read_to_string("scenario") {
+            let flags = Flags {
+                hf: Some(if case == "quant" {
+                    "fixture/checkpoint:Q4_K_M".into()
+                } else {
+                    "fixture/checkpoint".into()
+                }),
+                ..Default::default()
+            };
+            let result = match case.as_str() {
+                "name" => model_file::name(&flags),
+                "resolve" => {
+                    model_file::resolve(&flags, None, hf::fetch::Sources::Gguf).map(|_| ())
+                }
+                "quant" => {
+                    let error =
+                        model_file::resolve(&flags, None, hf::fetch::Sources::GgufOrCheckpoint)
+                            .unwrap_err();
+                    assert!(error.to_string().contains(":Q4_K_M picks a GGUF set"));
+                    return;
+                }
+                "supported" => {
+                    let path =
+                        model_file::resolve(&flags, None, hf::fetch::Sources::GgufOrCheckpoint)
+                            .unwrap()
+                            .unwrap();
+                    assert!(path.is_dir());
+                    assert!(path.join("model-00002-of-00002.safetensors").is_file());
+                    return;
+                }
+                #[cfg(feature = "deepseek41")]
+                "side" => {
+                    let (side, rest) = crate::side_seat::Flags::take(&[
+                        "--embd-hf".into(),
+                        "fixture/checkpoint".into(),
+                    ])
+                    .unwrap();
+                    assert!(rest.is_empty());
+                    side.read().map(|_| ())
+                }
+                _ => panic!("unknown scenario: {case}"),
+            };
+            if case == "name" && cfg!(feature = "checkpoint") {
+                result.unwrap();
+                return;
+            }
+            assert!(
+                result
+                    .expect_err("checkpoint support is absent")
+                    .to_string()
+                    .contains("does not support safetensors checkpoints")
+            );
+            return;
+        }
+
+        // A checkpoint-only repo on a `file://` hub, reached through a `curl` that logs each hub
+        // path it is asked for in the case's folder.
+        let dir =
+            std::env::temp_dir().join(format!("bloomery-model-sources-{}", std::process::id()));
+        let hub = dir.join("hub");
+        let served = hub.join("fixture/checkpoint/resolve/main");
+        std::fs::create_dir_all(&served).unwrap();
+        let body = b"tiny fixture";
+        let mut listing = Vec::new();
+        for path in [
+            "model.safetensors.index.json",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ] {
+            let file = served.join(path);
+            std::fs::write(&file, body).unwrap();
+            let digest = hf::fetch::digest(&file, hf::Check::GitSha1, body.len() as u64).unwrap();
+            listing.push(format!(
+                r#"{{"type":"file","path":"{path}","size":{},"oid":"{digest}"}}"#,
+                body.len()
+            ));
+        }
+        let tree = hub.join("api/models/fixture/checkpoint/tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("main"), format!("[{}]", listing.join(","))).unwrap();
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let curl = bin.join("curl");
+        std::fs::write(
+            &curl,
+            format!(
+                r#"#!/bin/bash
+args=()
+for arg; do
+    case "$arg" in
+        https://huggingface.co/*)
+            printf '%s\n' "${{arg#https://huggingface.co}}" >> requests || exit 1
+            arg="file://{}/${{arg#https://huggingface.co/}}" ;;
+    esac
+    args+=("$arg")
+done
+exec /usr/bin/curl "${{args[@]}}"
+"#,
+                hub.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for case in [
+            "name",
+            "resolve",
+            "quant",
+            "supported",
+            #[cfg(feature = "deepseek41")]
+            "side",
+        ] {
+            let root = dir.join(case);
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("scenario"), case).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "model_file::fetch::tests::checkpoint_support_is_checked_before_download",
+                    "--nocapture",
+                ])
+                .current_dir(&root)
+                .env("PATH", &bin)
+                .env("BLOOMERY_CACHE", root.join("cache"))
+                .env("HOME", &root)
+                .env("HF_HUB_OFFLINE", "0")
+                .env_remove("HF_TOKEN")
+                .env_remove("BLOOMERY_REF_MODEL")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let requests = std::fs::read_to_string(root.join("requests")).unwrap();
+            let requests: Vec<&str> = requests.lines().collect();
+            let supported = case == "supported" || (case == "name" && cfg!(feature = "checkpoint"));
+            let shards = requests
+                .iter()
+                .filter(|p| p.ends_with(".safetensors"))
+                .count();
+            println!(
+                "{case}: listing requests: {}, shard requests: {shards}",
+                requests
+                    .iter()
+                    .filter(|p| p.starts_with("/api/models/"))
+                    .count()
+            );
+            assert_eq!(
+                shards,
+                if supported { 2 } else { 0 },
+                "{case}: {requests:?}"
+            );
+            assert_eq!(
+                requests.len(),
+                if supported { 4 } else { 1 },
+                "{case}: {requests:?}"
+            );
+            assert_eq!(root.join("cache/fixture/checkpoint").exists(), supported);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

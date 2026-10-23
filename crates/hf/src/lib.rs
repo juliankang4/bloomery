@@ -89,6 +89,10 @@ pub enum HfError {
         "{repo} holds a safetensors checkpoint, which is served as stored: --hf {repo} names it; :{quant} picks a GGUF set"
     )]
     CheckpointQuant { repo: String, quant: String },
+    #[error(
+        "{repo} holds a safetensors checkpoint, but this caller does not support safetensors checkpoints"
+    )]
+    CheckpointUnsupported { repo: String },
     #[error("{repo} holds {} GGUF sets and no quant was given; pick one with --hf {repo}:<quant>: {}", .sets.len(), .sets.join(", "))]
     NoQuant { repo: String, sets: Vec<String> },
     #[error("{repo}: no GGUF set carries the quant {quant:?}; its quants: {}", .tags.join(", "))]
