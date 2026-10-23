@@ -176,6 +176,9 @@ pub(crate) fn draw() {
     let Some((style, lines)) = tape().take() else {
         return;
     };
+    if Start::new(&lines).listening().is_none() {
+        return;
+    }
     let mut size = libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -1273,14 +1276,16 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style, columns: usize) -> Option<St
     let mut keys = Text::default();
     keys.push(" Ctrl+C ", &key);
     keys.push(" stops the server", dim);
-    if width(&keys.shown) + 4 + width(" BLOOMERY_SCREEN=off  hides this screen") > inner {
+    let mut hide = Text::default();
+    hide.push(" BLOOMERY_SCREEN=off ", &key);
+    hide.push(" hides this screen", dim);
+    if width(&keys.shown) + 4 + width(&hide.shown) > inner {
         out.push(format!("{margin}{}", keys.painted));
         keys = Text::default();
     } else {
         keys.push("    ", "");
     }
-    keys.push(" BLOOMERY_SCREEN=off ", &key);
-    keys.push(" hides this screen", dim);
+    keys.append(&hide);
     out.push(format!("{margin}{}", keys.painted));
     out.push(String::new());
     Some(
@@ -2045,6 +2050,8 @@ mod tests {
             (120, 120),
             (98, 80),
             (80, 98),
+            (0, 0),
+            (1, 1),
         ] {
             for fixture in ["v41", "qwen38"] {
                 for (term, color) in [("xterm", ""), ("xterm", "1"), ("dumb", "")] {
@@ -2110,6 +2117,14 @@ mod tests {
                     assert!(child.wait().unwrap().success());
                     let got = String::from_utf8(bytes).unwrap().replace("\r\n", "\n");
                     let plain = strip_escapes(&got);
+                    if resized < 2 {
+                        assert!(
+                            plain.contains("terminal width must be at least 2 columns"),
+                            "{plain}"
+                        );
+                        assert!(!plain.contains("READY"), "{plain}");
+                        continue;
+                    }
                     assert_eq!(plain.matches(" READY ").count(), 1, "{plain}");
                     for line in plain.lines() {
                         assert!(
