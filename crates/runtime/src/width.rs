@@ -2859,6 +2859,56 @@ mod tests {
     }
 
     #[test]
+    fn batch_costs_keep_different_packings_separate() {
+        let mut batch = Batch::default();
+        let profiles = [&[0.0; 3][..]; 5];
+        for _ in 0..Rule::DEFAULT.min_timings {
+            let mut widths = [2, 2, 2, 2, 3];
+            batch
+                .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3)
+                .unwrap();
+            batch.observe(16, 30.0).unwrap();
+        }
+        let mut widths = [3, 3, 2, 2, 1];
+        batch
+            .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3)
+            .unwrap();
+        assert_eq!(
+            widths,
+            [3, 3, 2, 2, 1],
+            "the two-pass layout needs its own readings"
+        );
+    }
+
+    #[test]
+    fn batch_costs_survive_alternating_slot_counts() {
+        let mut batch = Batch::default();
+        for _ in 0..2 * Rule::DEFAULT.min_timings + 1 {
+            for slots in [2, 3] {
+                let profiles = vec![&[0.0; 3][..]; slots];
+                let mut widths = vec![3; slots];
+                batch
+                    .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3)
+                    .unwrap();
+                let rows = slots + widths.iter().sum::<usize>();
+                batch.observe(rows, rows as f64).unwrap();
+            }
+        }
+        for slots in [2, 3] {
+            let profiles = vec![&[0.0; 3][..]; slots];
+            let mut widths = vec![3; slots];
+            batch
+                .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3)
+                .unwrap();
+            assert_eq!(
+                widths,
+                vec![0; slots],
+                "learned plain steps for {slots} slots"
+            );
+        }
+    }
+
+    #[test]
     fn batch_width_prices_all_slots_and_their_rows() {
         let times = [
             0.0, 10.0, 11.0, 14.0, 30.0, 50.0, 70.0, 90.0, 110.0, 130.0, 150.0, 170.0, 190.0,
