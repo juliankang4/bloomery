@@ -9,8 +9,8 @@ use super::grouped::{
     B_COL_W, B_STAGE_W, GEMM_BM, GEMM_NT, GEMM_THREADS, IQ2XXS_SB_BYTES, IQ3S_QH, IQ3S_QS,
     IQ3S_SB_BYTES, IQ3S_SCALES, IQ3S_SIGNS, IQ3XXS_SB_BYTES, IQ4XS_SB_WORDS, Q3K_D, Q3K_QS,
     Q3K_SB_BYTES, Q3K_SCALES, Q4K_SB_WORDS, Q5K_SB_WORDS, Q6K_D, Q6K_QH, Q6K_SB_BYTES, Q6K_SCALES,
-    S8_STAGE, WT_ROW_W, WT_STAGE_W, iq2xxs_lane, iq3s_lane, iq3xxs_lane, iq4xs_scale, q3k_code,
-    q3k_scale_word, q5k_code, sbyte, ubyte, win,
+    S8_STAGE, VOTE_WORDS, WT_ROW_W, WT_STAGE_W, iq2xxs_lane, iq3s_lane, iq3xxs_lane, iq4xs_scale,
+    q3k_code, q3k_scale_word, q5k_code, sbyte, ubyte, win,
 };
 use super::route::{
     GEMM_MAX_EXPERTS, NO_EXPERT, ROUTE_HIST, ROUTE_THREADS, ROUTE_WARPS, route_id, tile_parts,

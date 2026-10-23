@@ -139,15 +139,19 @@ generate_ds41   gdn_delta_lanes                          0           0
 generate_ds41   gdn_norm_gate                            0           0
 generate_ds41   gdn_norm_gate_sigmoid                    0           0
 generate_ds41   geglu_tanh                               0           0
+# PIN(2026-10-23): ptxas and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1. The bytes are the exact walk's, which runs only for a tile whose F32 walk leaves the F32 range: the same scan at sm_121 with that walk compiled out holds 0 and 0.
+generate_ds41   gemm_iq3s                               24          16
 generate_ds41   gemm_iq3xxs              0  0
 generate_ds41   gemm_iq4nl               0  0
 generate_ds41   gemm_iq4xs               0  0
+# PIN(2026-10-23): ptxas and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1. The bytes over 40 and 24 are the exact walk's, which runs only for a tile whose F32 walk leaves the F32 range: the same scan at sm_121 with that walk compiled out holds 40 and 24.
+generate_ds41   gemm_nvfp4p                             72          32
 generate_ds41   gemm_q3k                                 0           0
 generate_ds41   gemm_q4k                                 0           0
 generate_ds41   gemm_q5_1                                0           0
 generate_ds41   gemm_q5k                                 0           0
-# PIN(2026-10-14): on cc 12.1 the driver JIT gives gemm_q6k 128 registers (.minnctapersm 2: 2 blocks of 256 threads an SM) and keeps 32 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv); ptxas -arch=sm_121 assembles it at the same registers and spills 132 bytes.
-generate_ds41   gemm_q6k                               132          32
+# PIN(2026-10-23): ptxas and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1. The bytes over 212 and 48 are the exact walk's, which runs only for a tile whose F32 walk leaves the F32 range: the same scan at sm_121 with that walk compiled out holds 212 and 48.
+generate_ds41   gemm_q6k                               532          64
 generate_ds41   gemm_q8_0f                               0           0
 generate_ds41   gemm_q8_0p                               0           0
 generate_ds41   gemm_q8_0p_slab                          0           0

@@ -15,7 +15,7 @@ use super::gemm32::{
     GEMM32_THREADS_U32, IQ4_NL_BLOCK_BYTES, Q5_1_BLOCK_WORDS, Q8_0_BLOCK_BYTES, W32_ROW,
     W32_STAGE_W, iq4_nl_file_block, mma_m16n8k16_s32_s8_zero, q8_0_file_block, raster32,
 };
-use super::grouped::{GEMM_BM, GEMM_NT, GEMM_THREADS};
+use super::grouped::{GEMM_BM, GEMM_NT, GEMM_THREADS, VOTE_WORDS};
 use super::remap::remap_id;
 use super::route::{
     GEMM_MAX_EXPERTS, NO_EXPERT, ROUTE_HIST, ROUTE_THREADS, ROUTE_WARPS, tile_parts, tile_word,

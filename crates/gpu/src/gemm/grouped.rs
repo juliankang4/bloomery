@@ -36,7 +36,22 @@
 //! IQ4_XS, `acc = fma(d8, (d/4)·f32(isum), acc)` for IQ3_XXS (`d/4` exact in
 //! f32), `acc = fma(d8, (d/8)·f32(isum), acc)` for IQ2_XXS (`d/8` exact in
 //! f32), blocks in increasing k. Intermediate products outside the F32
-//! normal range retain F64 range until the activation scale is applied.
+//! normal range retain F64 range until the activation scale is applied
+//! ([`scaled_sum`]).
+//!
+//! Range. A block first walks with [`sum32`]'s F32 rounding alone, marking
+//! any activation block scale [`scale_off`] names, and checks that every
+//! output ends finite. When neither shows, no step left the F32 normal
+//! range, so these are [`scaled_sum`]'s bits: a finite weight-side factor
+//! (`d`, `−dmin`, `d/4`, `d/8`, and `gemm32.rs`'s f16 and UE4M3 scales) is a
+//! multiple of 2^-27 and every code sum an integer, so a block's inner sum
+//! is zero or at least 2^-27 in magnitude; its product with an activation
+//! scale of zero or at least 2^-64, and every rounded sum of such products,
+//! is a multiple of 2^-114, so zero or normal; a sum that cancels is +0
+//! under both rules; and a non-finite intermediate leaves the output
+//! non-finite, since F32 sums keep it. Otherwise the block walks again with
+//! [`scaled_sum`] at every step, one n-tile at a time (so the walk holds four
+//! accumulators, not the tile's), and stores that walk's outputs.
 //!
 //! Geometry. A block is [`GEMM_THREADS`] threads, eight warps over
 //! [`GEMM_BM`] rows, sixteen rows per warp, every warp over all of the
@@ -65,14 +80,40 @@ use crate::iq::{GRID3, GRID3S, iq2xxs_grid_half, sign_mask4, signed4, signs_of};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::float::{fma_rn_f32, mul_rn_f32};
 use model::placement::kernels::{self, GemmEntry};
+
+/// `a[0]·b[0]` and `fma(a[1], b[1], a[0]·b[0])` in F32: a block's inner sum.
+#[inline(always)]
+fn inner32(a: [f32; 2], b: [f32; 2]) -> (f32, f32) {
+    let first = mul_rn_f32(a[0], b[0]);
+    (first, fma_rn_f32(a[1], b[1], first))
+}
+
+/// One block folded into an F32 accumulator in the walk's order,
+/// `fma(scale, fma(a[1], b[1], a[0]·b[0]), acc)`: [`scaled_sum`] while no
+/// intermediate leaves the F32 normal range (module doc, "Range").
+#[inline(always)]
+pub(super) fn sum32(a: [f32; 2], b: [f32; 2], scale: f32, acc: f32) -> f32 {
+    fma_rn_f32(scale, inner32(a, b).1, acc)
+}
+
+/// The smallest activation block scale magnitude, other than zero, that the
+/// F32 walk takes: 2^-64.
+const SCALE_FLOOR: f32 = f32::from_bits(0x1f80_0000);
+
+/// Whether an activation block scale is one the F32 walk does not take:
+/// nonzero and under [`SCALE_FLOOR`] in magnitude. A NaN or infinite scale
+/// leaves the output non-finite, which the walk's check sees.
+#[inline(always)]
+pub(super) fn scale_off(scale: f32) -> bool {
+    scale != 0.0 && scale.abs() < SCALE_FLOOR
+}
 
 /// Keep the F32 reduction's rounding while retaining exceptional intermediate range.
 #[inline(always)]
 pub(super) fn scaled_sum(a: [f64; 2], b: [f32; 2], scale: f32, acc: f64) -> f64 {
-    use cuda_device::float::{fma_rn_f32, mul_rn_f32};
-    let first = mul_rn_f32(a[0] as f32, b[0]);
-    let inner = fma_rn_f32(a[1] as f32, b[1], first);
+    let (first, inner) = inner32([a[0] as f32, a[1] as f32], b);
     let result = fma_rn_f32(scale, inner, acc as f32);
     let inner_in_range = f64::from(a[0] as f32) == a[0]
         && f64::from(a[1] as f32) == a[1]
@@ -356,8 +397,8 @@ macro_rules! q4k_dec {
     (@rows $r0:ident, $r1:ident, $hh:expr) => {
         qk_min_rows!($r0, $r1, $hh)
     };
-    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {
-        qk_min_epi!($rw, $s8st, $n0, $dcol, $isum, $acc, $nt)
+    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $fold:tt) => {
+        qk_min_epi!($rw, $s8st, $n0, $dcol, $isum, $fold)
     };
 }
 
@@ -415,8 +456,8 @@ macro_rules! q5k_dec {
     (@rows $r0:ident, $r1:ident, $hh:expr) => {
         qk_min_rows!($r0, $r1, $hh)
     };
-    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {
-        qk_min_epi!($rw, $s8st, $n0, $dcol, $isum, $acc, $nt)
+    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $fold:tt) => {
+        qk_min_epi!($rw, $s8st, $n0, $dcol, $isum, $fold)
     };
 }
 
@@ -463,11 +504,51 @@ macro_rules! qk_min_rows {
     }};
 }
 
+/// An n-tile's four cells folded into `acc[j0..j0 + 4]`: cell `i` takes row
+/// `i / 2`'s factors `a`, its own code sums `b` and column `i & 1`'s scale.
+/// `fast` folds with [`sum32`] and sets `off` when a column's scale is one
+/// [`scale_off`] names; `exact` folds with [`scaled_sum`] into F32 or F64
+/// accumulators (module doc, "Range").
+macro_rules! fold4 {
+    (
+        @cells $a:expr, $b:expr, $scale:expr, |$i:ident, $ai:ident, $bi:ident, $si:ident|
+        $fold:expr
+    ) => {{
+        let (a, b, scale): ([[f32; 2]; 2], [[f32; 2]; 4], [f32; 2]) = ($a, $b, $scale);
+        let mut $i = 0usize;
+        while $i < 4 {
+            ::cuda_device::thread::__unroll_config::<{ 0 }>();
+            let ($ai, $bi, $si) = (a[$i / 2], b[$i], scale[$i & 1]);
+            $fold;
+            $i += 1;
+        }
+    }};
+    ((fast, $acc:ident, $j0:expr, $off:ident), $a:expr, $b:expr, $scale:expr) => {{
+        let scale: [f32; 2] = $scale;
+        $off |= $crate::gemm::grouped::scale_off(scale[0])
+            | $crate::gemm::grouped::scale_off(scale[1]);
+        fold4!(@cells $a, $b, scale, |i, a, b, s| {
+            $acc[$j0 + i] = $crate::gemm::grouped::sum32(a, b, s, $acc[$j0 + i])
+        })
+    }};
+    ((exact, $acc:ident, $j0:expr, $off:ident), $a:expr, $b:expr, $scale:expr) => {
+        fold4!(@cells $a, $b, $scale, |i, a, b, s| {
+            $acc[$j0 + i] = $crate::gemm::grouped::scaled_sum(
+                [f64::from(a[0]), f64::from(a[1])],
+                b,
+                s,
+                f64::from($acc[$j0 + i]),
+            ) as _
+        })
+    };
+}
+
 /// Q4_K/Q5_K epilogue of n-tile `nt` for one 128-value block, `isum` its
 /// four sums: `imin = Σ_c m_c · s8_c` per (row, column), then the
-/// contract's order, `acc = fma(d8, fma(−dmin, f32(imin), d·f32(isum)), acc)`.
+/// contract's order, `acc = fma(d8, fma(−dmin, f32(imin), d·f32(isum)), acc)`,
+/// by [`fold4`]'s `fold`.
 macro_rules! qk_min_epi {
-    ($rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
+    ($rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $fold:tt) => {{
         let (dr, ndr, m0, m1) = $rw;
         // SAFETY: columns `n0` and `n0 + 1` are below GEMM_BN, so both
         // 16-byte reads are inside this stage's s8, which the barrier after
@@ -497,18 +578,17 @@ macro_rules! qk_min_epi {
                 + m1[2] * sb[2] as i32
                 + m1[3] * sb[3] as i32,
         ];
-        let mut i = 0usize;
-        while i < 4 {
-            ::cuda_device::thread::__unroll_config::<{ 0 }>();
-            let r = i / 2;
-            $acc[4 * $nt + i] = $crate::gemm::grouped::scaled_sum(
-                [f64::from(dr[r]), f64::from(ndr[r])],
-                [$isum[i] as f32, imin[i] as f32],
-                $dcol[i & 1],
-                f64::from($acc[4 * $nt + i]),
-            ) as f32;
-            i += 1;
-        }
+        fold4!(
+            $fold,
+            [[dr[0], ndr[0]], [dr[1], ndr[1]]],
+            [
+                [$isum[0] as f32, imin[0] as f32],
+                [$isum[1] as f32, imin[1] as f32],
+                [$isum[2] as f32, imin[2] as f32],
+                [$isum[3] as f32, imin[3] as f32],
+            ],
+            $dcol
+        )
     }};
 }
 
@@ -536,21 +616,21 @@ macro_rules! k16_mma {
 }
 
 /// Q6_K/Q3_K epilogue of n-tile `nt`, `isum` its four sums: `acc = fma(d8,
-/// d·f32(isum), acc)`.
+/// d·f32(isum), acc)`, by [`fold4`]'s `fold`.
 macro_rules! k16_epi {
-    ($rw:ident, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
+    ($rw:ident, $dcol:ident, $isum:ident, $fold:tt) => {{
         let dr = $rw;
-        let mut i = 0usize;
-        while i < 4 {
-            ::cuda_device::thread::__unroll_config::<{ 0 }>();
-            $acc[4 * $nt + i] = $crate::gemm::grouped::scaled_sum(
-                [f64::from(dr[i / 2]), 0.0],
-                [$isum[i] as f32, 0.0],
-                $dcol[i & 1],
-                f64::from($acc[4 * $nt + i]),
-            ) as f32;
-            i += 1;
-        }
+        fold4!(
+            $fold,
+            [[dr[0], 0.0], [dr[1], 0.0]],
+            [
+                [$isum[0] as f32, 0.0],
+                [$isum[1] as f32, 0.0],
+                [$isum[2] as f32, 0.0],
+                [$isum[3] as f32, 0.0],
+            ],
+            $dcol
+        )
     }};
 }
 
@@ -622,9 +702,9 @@ macro_rules! q6k_dec {
             half_bits_to_f32(($r1[8] & 0xffff) as u16),
         ]
     };
-    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
+    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $fold:tt) => {{
         let _ = ($s8st, $n0);
-        k16_epi!($rw, $dcol, $isum, $acc, $nt)
+        k16_epi!($rw, $dcol, $isum, $fold)
     }};
 }
 
@@ -693,9 +773,9 @@ macro_rules! q3k_dec {
             half_bits_to_f32(($r1[7] & 0xffff) as u16),
         ]
     };
-    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
+    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $fold:tt) => {{
         let _ = ($s8st, $n0);
-        k16_epi!($rw, $dcol, $isum, $acc, $nt)
+        k16_epi!($rw, $dcol, $isum, $fold)
     }};
 }
 
@@ -737,9 +817,9 @@ macro_rules! iq2xxs_dec {
             half_bits_to_f32(($r1[12] & 0xffff) as u16) * 0.125,
         ]
     };
-    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
+    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $fold:tt) => {{
         let _ = ($s8st, $n0);
-        k16_epi!($rw, $dcol, $isum, $acc, $nt)
+        k16_epi!($rw, $dcol, $isum, $fold)
     }};
 }
 
@@ -796,9 +876,9 @@ macro_rules! iq3xxs_dec {
             half_bits_to_f32(($r1[12] & 0xffff) as u16) * 0.25,
         ]
     };
-    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
+    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $fold:tt) => {{
         let _ = ($s8st, $n0);
-        k16_epi!($rw, $dcol, $isum, $acc, $nt)
+        k16_epi!($rw, $dcol, $isum, $fold)
     }};
 }
 
@@ -870,9 +950,9 @@ macro_rules! iq3s_dec {
             half_bits_to_f32(($r1[12] & 0xffff) as u16),
         ]
     };
-    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
+    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $fold:tt) => {{
         let _ = ($s8st, $n0);
-        k16_epi!($rw, $dcol, $isum, $acc, $nt)
+        k16_epi!($rw, $dcol, $isum, $fold)
     }};
 }
 
@@ -926,9 +1006,9 @@ macro_rules! iq4xs_dec {
             half_bits_to_f32(($r1[0] & 0xffff) as u16),
         ]
     };
-    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
+    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $fold:tt) => {{
         let _ = ($s8st, $n0);
-        k16_epi!($rw, $dcol, $isum, $acc, $nt)
+        k16_epi!($rw, $dcol, $isum, $fold)
     }};
 }
 
@@ -1116,18 +1196,43 @@ macro_rules! wst_q4k {
 
 /// The walks an entry takes: `split` runs a full tile and a partial one
 /// through their own [`gemm_walk`] (the choice is block-uniform), `plain`
-/// through [`gemm_walk_plain`].
+/// through [`gemm_walk_plain`]. An `exact` walk (module doc, "Range") takes
+/// one n-tile, so `split` runs it as a partial tile.
 macro_rules! gemm_walks {
-    (split, $nt_live:ident, $n_sb:ident, $args:tt) => {
+    (split, fast, $nt_live:ident, $n_sb:ident, $args:tt) => {
         if $nt_live == GEMM_NT {
             gemm_walk!(true, $n_sb, $args);
         } else {
             gemm_walk!(false, $n_sb, $args);
         }
     };
-    (plain, $nt_live:ident, $n_sb:ident, $args:tt) => {
+    (split, exact, $nt_live:ident, $n_sb:ident, $args:tt) => {
+        gemm_walk!(false, $n_sb, $args)
+    };
+    (plain, $mode:ident, $nt_live:ident, $n_sb:ident, $args:tt) => {
         gemm_walk_plain!($n_sb, $args)
     };
+}
+
+/// The n-tiles a walk folds: `fast` every live one (all of a full tile),
+/// with its cells at `acc[4·nt..]`; `exact` n-tile `nx` alone, at `acc[0..4]`.
+/// `body` runs with `nt` and `j0` bound to the n-tile and its first cell.
+macro_rules! gemm_nts {
+    (fast, $nx:expr, $full:literal, $nt_live:ident, |$nt:ident, $j0:ident| $body:block) => {{
+        let mut $nt = 0usize;
+        while $nt < GEMM_NT {
+            ::cuda_device::thread::__unroll_config::<{ 0 }>();
+            if $full || $nt < $nt_live {
+                let $j0 = 4 * $nt;
+                $body
+            }
+            $nt += 1;
+        }
+    }};
+    (exact, $nx:expr, $full:literal, $nt_live:ident, |$nt:ident, $j0:ident| $body:block) => {{
+        let ($nt, $j0): (usize, usize) = ($nx, 0);
+        $body
+    }};
 }
 
 /// The step walk of [`gemm_block`]: super-block by super-block, each one's
@@ -1172,7 +1277,8 @@ macro_rules! gemm_step {
         $dec:ident, $wst:ident($($wsa:ident),*), $sb_units:expr, $w:ident, $ws:ident, $hdr:ident,
         $q6:ident, $s8:ident, $d8:ident, $bt:ident, $s8t:ident, $d8t:ident, $acol_sh:ident,
         $tid:ident, $ncols:ident, $col_words:ident,
-        $active:ident, $t:ident, $g:ident, $nt_live:ident, $acc:ident
+        $active:ident, $t:ident, $g:ident, $nt_live:ident, $acc:ident, $mode:ident, $nx:expr,
+        $off:ident
     )) => {{
         let hh: usize = $hh;
         let st = hh;
@@ -1206,29 +1312,24 @@ macro_rules! gemm_step {
             let (even1, odd1, sc1) = $dec!(@frag raw0, raw1, 1usize, hh);
             let rw = $dec!(@rows raw0, raw1, hh);
             let mut isum = [0i32; 4];
-            let mut nt = 0usize;
-            while nt < GEMM_NT {
-                ::cuda_device::thread::__unroll_config::<{ 0 }>();
-                if $full || nt < $nt_live {
-                    // SAFETY: column 8*nt + g < ncols and words 8t .. 8t + 7
-                    // < 32 of its block: inside this stage, 16-byte aligned,
-                    // published above.
-                    let (bw0, bw1) = unsafe {
-                        let p = bst.add((8 * nt + $g) * B_COL_W + 8 * $t);
-                        ((*(p as *const U32x4)).0, (*(p.add(4) as *const U32x4)).0)
-                    };
-                    $dec!(@mma even0, bw0[0], bw0[1], sc0, 0, isum, true);
-                    $dec!(@mma odd0, bw0[2], bw0[3], sc0, 1, isum, false);
-                    $dec!(@mma even1, bw1[0], bw1[1], sc1, 0, isum, false);
-                    $dec!(@mma odd1, bw1[2], bw1[3], sc1, 1, isum, false);
-                    let n0 = 8 * nt + 2 * $t;
-                    // SAFETY: n0 is even and n0 + 1 < GEMM_BN: one 8-byte
-                    // read inside this stage's d8.
-                    let dcol = unsafe { *(d8st.add(n0) as *const F32x2) }.0;
-                    $dec!(@epi rw, s8st, n0, dcol, isum, $acc, nt);
-                }
-                nt += 1;
-            }
+            gemm_nts!($mode, $nx, $full, $nt_live, |nt, j0| {
+                // SAFETY: column 8*nt + g < ncols and words 8t .. 8t + 7
+                // < 32 of its block: inside this stage, 16-byte aligned,
+                // published above.
+                let (bw0, bw1) = unsafe {
+                    let p = bst.add((8 * nt + $g) * B_COL_W + 8 * $t);
+                    ((*(p as *const U32x4)).0, (*(p.add(4) as *const U32x4)).0)
+                };
+                $dec!(@mma even0, bw0[0], bw0[1], sc0, 0, isum, true);
+                $dec!(@mma odd0, bw0[2], bw0[3], sc0, 1, isum, false);
+                $dec!(@mma even1, bw1[0], bw1[1], sc1, 0, isum, false);
+                $dec!(@mma odd1, bw1[2], bw1[3], sc1, 1, isum, false);
+                let n0 = 8 * nt + 2 * $t;
+                // SAFETY: n0 is even and n0 + 1 < GEMM_BN: one 8-byte
+                // read inside this stage's d8.
+                let dcol = unsafe { *(d8st.add(n0) as *const F32x2) }.0;
+                $dec!(@epi rw, s8st, n0, dcol, isum, ($mode, $acc, j0, $off));
+            });
         }
         // Every warp is done with stage `st` before step h + 1 stages step
         // h + 2 into it.
@@ -1277,16 +1378,18 @@ macro_rules! gemm_block {
         static mut D8T: SharedArray<f32, { 2 * GEMM_BN }, 16> = SharedArray::UNINIT;
         static mut SLOT: SharedArray<u32, GEMM_BN> = SharedArray::UNINIT;
         static mut ACOL: SharedArray<u32, GEMM_BN> = SharedArray::UNINIT;
+        static mut VOTES: SharedArray<u32, VOTE_WORDS> = SharedArray::UNINIT;
         // SAFETY: each `static mut` is this block's own shared allocation,
         // reached raw; the block walk bounds every index and orders every
         // cross-thread read behind a barrier.
-        let (bt, s8t, d8t, slot_sh, acol_sh, $($wsa,)*) = unsafe {
+        let (bt, s8t, d8t, slot_sh, acol_sh, votes, $($wsa,)*) = unsafe {
             (
                 SharedArray::as_raw_mut_ptr(&raw mut BT),
                 SharedArray::as_raw_mut_ptr(&raw mut S8T),
                 SharedArray::as_raw_mut_ptr(&raw mut D8T),
                 SharedArray::as_raw_mut_ptr(&raw mut SLOT),
                 SharedArray::as_raw_mut_ptr(&raw mut ACOL),
+                SharedArray::as_raw_mut_ptr(&raw mut VOTES),
                 $($wst!(@tile $wsa),)*
             )
         };
@@ -1371,42 +1474,128 @@ macro_rules! gemm_block {
         $wst!(@decl [$($wsa),*] ws, hdr; $w, e, rows_n, rt, row0, g, tid, wid, n_sb, $rows, $n_sb,
             $sb_units);
 
-        let mut acc = [0.0f32; 4 * GEMM_NT];
-        gemm_stage!(0usize, 0usize, false, tid, ncols, n_sb, col_words,
-            $q6, $s8, $d8, bt, s8t, d8t, acol_sh);
-        $wst!(@stage [$($wsa),*] ws; $w, 0usize, 0usize, 0usize, tid, $sb_units);
+        range_walks!(
+            gemm_block!($walk, $dec, $wst($($wsa),*), $sb_units, ($w, ws, hdr, $q6, $s8, $d8, bt,
+                s8t, d8t, acol_sh, tid, ncols, n_sb, col_words, active, t, g, nt_live)),
+            gemm_block!(($y, nt_live, active, t, row0, g, len, slot_sh, rows_n)),
+            [0.0f32; 4],
+            active,
+            nt_live,
+            votes
+        );
+    }};
+    (
+        @walk $mode:ident, $nx:expr, $acc:ident, $off:ident, $walk:ident, $dec:ident,
+        $wst:ident($($wsa:ident),*), $sb_units:expr, (
+            $w:ident, $ws:ident, $hdr:ident, $q6:ident, $s8:ident, $d8:ident, $bt:ident,
+            $s8t:ident, $d8t:ident, $acol_sh:ident, $tid:ident, $ncols:ident, $n_sb:ident,
+            $col_words:ident, $active:ident, $t:ident, $g:ident, $nt_live:ident
+        )
+    ) => {{
+        gemm_stage!(0usize, 0usize, false, $tid, $ncols, $n_sb, $col_words,
+            $q6, $s8, $d8, $bt, $s8t, $d8t, $acol_sh);
+        $wst!(@stage [$($wsa),*] $ws; $w, 0usize, 0usize, 0usize, $tid, $sb_units);
         // SAFETY: commits this thread's copies above as one group.
         unsafe { cp_async_commit_group() };
-        gemm_walks!($walk, nt_live, n_sb, ($dec, $wst($($wsa),*), $sb_units, $w, ws, hdr,
-            $q6, $s8, $d8, bt, s8t, d8t, acol_sh, tid, ncols, col_words,
-            active, t, g, nt_live, acc));
-
-        if active {
-            let mut nt = 0usize;
-            while nt < GEMM_NT {
-                ::cuda_device::thread::__unroll_config::<{ 0 }>();
-                if nt < nt_live {
-                    let mut i = 0usize;
-                    while i < 4 {
-                        ::cuda_device::thread::__unroll_config::<{ 0 }>();
-                        let n = 8 * nt + 2 * t + (i & 1);
-                        if n < len {
-                            let r = row0 + g + 8 * (i / 2);
-                            // SAFETY: n < GEMM_BN bounds the shared read; the
-                            // slot is below n_slots and r below rows, so the
-                            // store is inside y (launch contract), and one
-                            // lane of one block writes each (slot, row).
-                            unsafe {
-                                let slot = *slot_sh.add(n) as usize;
-                                *$y.get_unchecked_mut(slot * rows_n + r) = acc[4 * nt + i];
-                            }
+        gemm_walks!($walk, $mode, $nt_live, $n_sb, ($dec, $wst($($wsa),*), $sb_units, $w, $ws,
+            $hdr, $q6, $s8, $d8, $bt, $s8t, $d8t, $acol_sh, $tid, $ncols, $col_words,
+            $active, $t, $g, $nt_live, $acc, $mode, $nx, $off));
+    }};
+    (
+        @store $mode:ident, $nx:expr, $acc:ident, (
+            $y:ident, $nt_live:ident, $active:ident, $t:ident, $row0:ident, $g:ident,
+            $len:ident, $slot_sh:ident, $rows_n:ident
+        )
+    ) => {{
+        if $active {
+            gemm_nts!($mode, $nx, false, $nt_live, |nt, j0| {
+                let mut i = 0usize;
+                while i < 4 {
+                    ::cuda_device::thread::__unroll_config::<{ 0 }>();
+                    let n = 8 * nt + 2 * $t + (i & 1);
+                    if n < $len {
+                        let r = $row0 + $g + 8 * (i / 2);
+                        // SAFETY: n < GEMM_BN bounds the shared read; the
+                        // slot is below n_slots and r below rows, so the
+                        // store is inside y (launch contract), and one
+                        // lane of one block writes each (slot, row).
+                        unsafe {
+                            let slot = *$slot_sh.add(n) as usize;
+                            *$y.get_unchecked_mut(slot * $rows_n + r) = $acc[j0 + i];
                         }
-                        i += 1;
                     }
+                    i += 1;
                 }
-                nt += 1;
+            });
+        }
+    }};
+}
+
+/// A block's walks (module doc, "Range"): `walk`'s `@walk` arm in F32 into
+/// the tile's accumulators, then, when [`exact_vote`] says so, exactly into
+/// `exact` (one n-tile's accumulators) for each live n-tile in turn, each
+/// stored by `store`'s `@store` arm. Each arm takes the walk's mode, its
+/// n-tile, its accumulators and the mark [`fold4`] sets, then the tokens
+/// given here.
+macro_rules! range_walks {
+    (
+        $walk:ident!($($wa:tt)*), $store:ident!($($sa:tt)*), $exact:expr, $active:ident,
+        $nt_live:ident, $votes:ident
+    ) => {{
+        let mut acc = [0.0f32; 4 * GEMM_NT];
+        let mut off = false;
+        $walk!(@walk fast, 0usize, acc, off, $($wa)*);
+        if exact_vote!($active, acc, off, $votes) {
+            let mut ntx = 0usize;
+            while ntx < $nt_live {
+                // Every warp is done with the walk before, whose last steps
+                // read the stages this walk's first steps fill.
+                thread::sync_threads();
+                let mut one = $exact;
+                $walk!(@walk exact, ntx, one, off, $($wa)*);
+                $store!(@store exact, ntx, one, $($sa)*);
+                ntx += 1;
+            }
+        } else {
+            $store!(@store fast, 0usize, acc, $($sa)*);
+        }
+    }};
+}
+
+/// Shared words of a block's [`exact_vote`]: one a warp.
+pub(super) const VOTE_WORDS: usize = GEMM_THREADS / 32;
+
+/// Whether the block walks again exactly (module doc, "Range"): each warp
+/// writes whether any active lane's F32 walk marked a scale or ended a cell
+/// non-finite into its own word of `votes`, and after the barrier every
+/// thread reads all of them, so the answer is block-uniform. The barrier also
+/// tells that every warp is done with both stages.
+macro_rules! exact_vote {
+    ($active:ident, $acc:ident, $off:ident, $votes:ident) => {{
+        let mut off = $off;
+        if $active {
+            let mut j = 0usize;
+            while j < $acc.len() {
+                ::cuda_device::thread::__unroll_config::<{ 0 }>();
+                off |= !$acc[j].is_finite();
+                j += 1;
             }
         }
+        let any = warp::any(off);
+        if warp::lane_id() == 0 {
+            // SAFETY: each warp writes its own word, read only after the
+            // barrier below.
+            unsafe { *$votes.add(thread::threadIdx_x() as usize / 32) = u32::from(any) };
+        }
+        thread::sync_threads();
+        let mut exact = false;
+        let mut i = 0usize;
+        while i < $crate::gemm::grouped::VOTE_WORDS {
+            // SAFETY: the barrier above published every warp's word.
+            exact |= unsafe { *$votes.add(i) } != 0;
+            i += 1;
+        }
+        exact
     }};
 }
 

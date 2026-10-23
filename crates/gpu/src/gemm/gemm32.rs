@@ -59,7 +59,9 @@
 //! rounds twice and the store once; the same K-only order rule holds.
 //! These F32 roundings apply while the intermediates stay in range. An
 //! exceptional magnitude stays in F64 until the expert scale is applied,
-//! so an intermediate overflow or underflow cannot erase a finite output.
+//! so an intermediate overflow or underflow cannot erase a finite output:
+//! the block walks in F32 and walks again exactly only when that walk saw
+//! such a value (`grouped.rs` module doc, "Range").
 //!
 //! Geometry. A block is [`GEMM_THREADS`] threads, eight warps of sixteen
 //! rows over the tile's columns in n-tiles of eight (the K-quant family's
@@ -245,12 +247,13 @@ pub(super) unsafe fn mma_m16n8k16_s32_s8_zero(a: [u32; 2], b: u32) -> [i32; 4] {
 /// How the weight bytes of one (slab row, block) pair reach a stage, per
 /// entry: `@copy` the `cp.async` part (the plane's codes), `@load` the
 /// register part one step ahead, `@store` it decoded into the stage after
-/// the step's compute; `@prep` binds `$pv`, once per thread, to what a
-/// layout that addresses a row rather than the block stream needs of the
-/// pair's row (packed Q5_0 only; nothing for the others), `@stage_scale`
+/// the step's compute; `@prep` binds `$pv`, at the head of each walk, to
+/// what a layout that addresses a row rather than the block stream needs of
+/// the pair's row (packed Q5_0 only; nothing for the others), `@stage_scale`
 /// stages the tile's expert's tensor scale in shared memory before the K
 /// walk, `@expert_scale` reads it back for the stores and `@scale` folds it
-/// into a stored value (NVFP4 only). `$live` is whether
+/// into a stored value (NVFP4 only); `@acc` is the exact walk's accumulators
+/// of one n-tile, F64 for NVFP4 (module doc). `$live` is whether
 /// the pair exists (its row inside the slab's live rows, its block below
 /// K/32); `$n` is its block's index in the stack's block stream (`row · K/32
 /// + block`), `$dst` its staged row's first word.
@@ -621,10 +624,10 @@ macro_rules! w32 {
         let _ = $xs;
         1.0f32
     }};
-    (@acc nvfp4p($($w:ident),+)) => { [0.0f64; 4 * GEMM_NT] };
-    (@acc $kind:ident($($w:ident),+)) => { [0.0f32; 4 * GEMM_NT] };
+    (@acc nvfp4p($($w:ident),+)) => { [0.0f64; 4] };
+    (@acc $kind:ident($($w:ident),+)) => { [0.0f32; 4] };
     (@scale nvfp4p($qs:ident, $e:ident, $scales:ident), $s:expr, $v:expr) => {
-        $crate::gemm::grouped::scaled_sum([$v, 0.0], [$s, 0.0], 1.0, 0.0) as f32
+        $crate::gemm::grouped::scaled_sum([f64::from($v), 0.0], [$s, 0.0], 1.0, 0.0) as f32
     };
     (@scale $kind:ident($($w:ident),+), $s:expr, $v:expr) => {{
         let _ = $s;
@@ -673,26 +676,29 @@ macro_rules! stage32_act {
 /// One n-tile's product of one block into the accumulators: `isum` the
 /// `mma` result (rows `g`, `g + 8` by columns `2t`, `2t + 1`), `dw`/`mw`
 /// the two rows' block scale and min, `da`/`sa` the two columns' block scale
-/// bits and code sum bits — the contract's order per output.
+/// bits and code sum bits — the contract's order per output, by `grouped.rs`'s
+/// `fold4` `fold`.
 macro_rules! epi32 {
-    ($mins:literal, $isum:ident, $dw:ident, $mw:ident, $da:expr, $sa:expr, $acc:ident, $nt:expr) => {{
+    ($mins:literal, $isum:ident, $dw:ident, $mw:ident, $da:expr, $sa:expr, $fold:tt) => {{
         let da: [u32; 2] = $da;
-        let sa: [u32; 2] = $sa;
-        for i in 0..4usize {
-            ::cuda_device::thread::__unroll_config::<0>();
-            $acc[4 * $nt + i] = $crate::gemm::grouped::scaled_sum(
-                [
-                    f64::from($dw[i / 2]),
-                    f64::from(if $mins { $mw[i / 2] } else { 0.0 }),
-                ],
-                [
-                    $isum[i] as f32,
-                    if $mins { sa[i & 1] as i32 as f32 } else { 0.0 },
-                ],
-                f32::from_bits(da[i & 1]),
-                f64::from($acc[4 * $nt + i]),
-            ) as f32;
-        }
+        let sa: [f32; 2] = if $mins {
+            let sa: [u32; 2] = $sa;
+            [sa[0] as i32 as f32, sa[1] as i32 as f32]
+        } else {
+            [0.0; 2]
+        };
+        let mw: [f32; 2] = if $mins { $mw } else { [0.0; 2] };
+        fold4!(
+            $fold,
+            [[$dw[0], mw[0]], [$dw[1], mw[1]]],
+            [
+                [$isum[0] as f32, sa[0]],
+                [$isum[1] as f32, sa[1]],
+                [$isum[2] as f32, sa[0]],
+                [$isum[3] as f32, sa[1]],
+            ],
+            [f32::from_bits(da[0]), f32::from_bits(da[1])]
+        )
     }};
 }
 
@@ -703,17 +709,19 @@ macro_rules! epi32 {
 /// order per output: `d0·f32(i0)` exact, one fma for `d1`, one for the
 /// accumulator.
 macro_rules! epi32_nv {
-    ($d0:ident, $d1:ident, $i0:ident, $i1:ident, $da:expr, $acc:ident, $nt:expr) => {{
+    ($d0:ident, $d1:ident, $i0:ident, $i1:ident, $da:expr, $fold:tt) => {{
         let da: [u32; 2] = $da;
-        for i in 0..4usize {
-            ::cuda_device::thread::__unroll_config::<0>();
-            $acc[4 * $nt + i] = $crate::gemm::grouped::scaled_sum(
-                [f64::from($d0[i / 2]), f64::from($d1[i / 2])],
-                [$i0[i] as f32, $i1[i] as f32],
-                f32::from_bits(da[i & 1]),
-                $acc[4 * $nt + i],
-            );
-        }
+        fold4!(
+            $fold,
+            [[$d0[0], $d1[0]], [$d0[1], $d1[1]]],
+            [
+                [$i0[0] as f32, $i1[0] as f32],
+                [$i0[1] as f32, $i1[1] as f32],
+                [$i0[2] as f32, $i1[2] as f32],
+                [$i0[3] as f32, $i1[3] as f32],
+            ],
+            [f32::from_bits(da[0]), f32::from_bits(da[1])]
+        )
     }};
 }
 
@@ -725,17 +733,17 @@ macro_rules! epi32_nv {
 macro_rules! mma_epi32 {
     (
         plain, $mins:literal, $a:ident, [$($b:expr),+], $dw:ident, $mw:ident, $da:expr, $sa:expr,
-        $acc:ident, $nt:expr
+        $fold:tt
     ) => {{
         // SAFETY: every lane of the warp reaches this `mma.sync` (the
         // branches around it are uniform) with its fragments in the
         // instruction's layout.
         let i0 = unsafe { mma_m16n8k32_s32_s8([0; 4], $a, [$($b),+]) };
-        epi32!($mins, i0, $dw, $mw, $da, $sa, $acc, $nt);
+        epi32!($mins, i0, $dw, $mw, $da, $sa, $fold);
     }};
     (
         nvfp4p, $mins:literal, $a:ident, [$b0:expr, $b1:expr], $d0:ident, $d1:ident, $da:expr,
-        $sa:expr, $acc:ident, $nt:expr
+        $sa:expr, $fold:tt
     ) => {{
         // SAFETY: every lane of the warp reaches both `mma.sync`s (the
         // branches around them are uniform) with its fragments in the
@@ -746,7 +754,7 @@ macro_rules! mma_epi32 {
                 mma_m16n8k16_s32_s8_zero([$a[2], $a[3]], $b1),
             )
         };
-        epi32_nv!($d0, $d1, i0, i1, $da, $acc, $nt);
+        epi32_nv!($d0, $d1, i0, i1, $da, $fold);
     }};
 }
 
@@ -773,10 +781,11 @@ macro_rules! nt_frags {
     }};
 }
 
-/// The n-tile walk of one step of one warp: for every live n-tile, the
-/// products of the step's blocks into the accumulators. `each` is the walk
-/// that tests the tile (`nt < nt_live`) and the second block (`two`) around
-/// every product; the families but `nvfp4p` run it as it stands. `nvfp4p`
+/// The n-tile walk of one step of one warp: for every live n-tile (the
+/// exact walk's one, `grouped.rs`'s `gemm_nts`), the products of the step's
+/// blocks into the accumulators. `each` is the walk that tests the tile
+/// (`nt < nt_live`) and the second block (`two`) around every product; the
+/// families but `nvfp4p`, and the exact walk, run it as it stands. `nvfp4p`
 /// first tests the two once, warp-uniformly: with every n-tile live and both
 /// blocks present (every step of a full tile, K a multiple of 64) it runs the
 /// same products with no branch between them, one straight stretch of
@@ -785,53 +794,52 @@ macro_rules! nt_frags {
 /// bits are the same.
 macro_rules! nt_walk {
     (
-        @each $epi:ident, $mins:literal, $nt_live:ident, $two:ident, $t:ident, $bst:ident,
-        $dst:ident, $b_off:ident, $a0:ident, $a1:ident, $dw0:ident, $dw1:ident, $mw0:ident,
-        $mw1:ident, $acc:ident
+        @each $epi:ident, $mode:ident, $nx:expr, $mins:literal, $nt_live:ident, $two:ident,
+        $t:ident, $bst:ident, $dst:ident, $b_off:ident, $a0:ident, $a1:ident, $dw0:ident,
+        $dw1:ident, $mw0:ident, $mw1:ident, $acc:ident, $off:ident
     ) => {
-        for nt in 0..GEMM_NT {
-            ::cuda_device::thread::__unroll_config::<0>();
-            if nt < $nt_live {
-                let (bf, x0, x1) = nt_frags!($bst, $dst, nt, $t, $b_off);
-                // SAFETY: every lane of the warp reaches the `mma.sync`
-                // inside (the branches around it are uniform) with its
-                // fragments in the instruction's layout.
-                mma_epi32!($epi, $mins, $a0, [bf[0], bf[1]], $dw0, $mw0, [x0[0], x1[0]],
-                    [x0[2], x1[2]], $acc, nt);
-                if $two {
-                    // SAFETY: `two` and the branches around it are
-                    // warp-uniform, so every lane reaches the `mma.sync`
-                    // inside as well.
-                    mma_epi32!($epi, $mins, $a1, [bf[2], bf[3]], $dw1, $mw1, [x0[1], x1[1]],
-                        [x0[3], x1[3]], $acc, nt);
-                }
+        gemm_nts!($mode, $nx, false, $nt_live, |nt, j0| {
+            let (bf, x0, x1) = nt_frags!($bst, $dst, nt, $t, $b_off);
+            // SAFETY: every lane of the warp reaches the `mma.sync`
+            // inside (the branches around it are uniform) with its
+            // fragments in the instruction's layout.
+            mma_epi32!($epi, $mins, $a0, [bf[0], bf[1]], $dw0, $mw0, [x0[0], x1[0]],
+                [x0[2], x1[2]], ($mode, $acc, j0, $off));
+            if $two {
+                // SAFETY: `two` and the branches around it are
+                // warp-uniform, so every lane reaches the `mma.sync`
+                // inside as well.
+                mma_epi32!($epi, $mins, $a1, [bf[2], bf[3]], $dw1, $mw1, [x0[1], x1[1]],
+                    [x0[3], x1[3]], ($mode, $acc, j0, $off));
             }
-        }
+        })
     };
-    (plain, $($rest:tt)*) => {
-        nt_walk!(@each plain, $($rest)*)
+    (nvfp4p, exact, $($rest:tt)*) => {
+        nt_walk!(@each nvfp4p, exact, $($rest)*)
     };
     (
-        nvfp4p, $mins:literal, $nt_live:ident, $two:ident, $t:ident, $bst:ident, $dst:ident,
-        $b_off:ident, $a0:ident, $a1:ident, $dw0:ident, $dw1:ident, $mw0:ident, $mw1:ident,
-        $acc:ident
+        nvfp4p, fast, $nx:expr, $mins:literal, $nt_live:ident, $two:ident, $t:ident,
+        $bst:ident, $dst:ident, $b_off:ident, $a0:ident, $a1:ident, $dw0:ident, $dw1:ident,
+        $mw0:ident, $mw1:ident, $acc:ident, $off:ident
     ) => {
         if $nt_live == GEMM_NT && $two {
-            for nt in 0..GEMM_NT {
-                ::cuda_device::thread::__unroll_config::<0>();
+            gemm_nts!(fast, $nx, true, $nt_live, |nt, j0| {
                 let (bf, x0, x1) = nt_frags!($bst, $dst, nt, $t, $b_off);
                 // SAFETY: every lane of the warp reaches both `mma.sync`s
                 // (the test above is warp-uniform and nothing branches in
                 // between) with its fragments in the instruction's layout.
                 mma_epi32!(nvfp4p, $mins, $a0, [bf[0], bf[1]], $dw0, $mw0, [x0[0], x1[0]],
-                    [x0[2], x1[2]], $acc, nt);
+                    [x0[2], x1[2]], (fast, $acc, j0, $off));
                 mma_epi32!(nvfp4p, $mins, $a1, [bf[2], bf[3]], $dw1, $mw1, [x0[1], x1[1]],
-                    [x0[3], x1[3]], $acc, nt);
-            }
+                    [x0[3], x1[3]], (fast, $acc, j0, $off));
+            })
         } else {
-            nt_walk!(@each nvfp4p, $mins, $nt_live, $two, $t, $bst, $dst, $b_off, $a0, $a1,
-                $dw0, $dw1, $mw0, $mw1, $acc);
+            nt_walk!(@each nvfp4p, fast, $nx, $mins, $nt_live, $two, $t, $bst, $dst, $b_off,
+                $a0, $a1, $dw0, $dw1, $mw0, $mw1, $acc, $off);
         }
+    };
+    (plain, $($rest:tt)*) => {
+        nt_walk!(@each plain, $($rest)*)
     };
 }
 
@@ -871,10 +879,11 @@ macro_rules! gemm32_block {
         // The tile's expert's tensor scale (NVFP4), staged here so no register
         // holds the expert across the K walk.
         static mut XSCALE: SharedArray<f32, 1> = SharedArray::UNINIT;
+        static mut VOTES: SharedArray<u32, VOTE_WORDS> = SharedArray::UNINIT;
         // SAFETY: each `static mut` is this block's own shared allocation,
         // reached raw; the block walk bounds every index and orders every
         // cross-thread read behind a barrier.
-        let (wt, bt, dt, slot_sh, acol_sh, xs) = unsafe {
+        let (wt, bt, dt, slot_sh, acol_sh, xs, votes) = unsafe {
             (
                 SharedArray::as_raw_mut_ptr(&raw mut WT),
                 SharedArray::as_raw_mut_ptr(&raw mut BT),
@@ -882,6 +891,7 @@ macro_rules! gemm32_block {
                 SharedArray::as_raw_mut_ptr(&raw mut SLOT),
                 SharedArray::as_raw_mut_ptr(&raw mut ACOL),
                 SharedArray::as_raw_mut_ptr(&raw mut XSCALE),
+                SharedArray::as_raw_mut_ptr(&raw mut VOTES),
             )
         };
         // Read by the launch contract only.
@@ -993,7 +1003,6 @@ macro_rules! gemm32_block {
         let pn0 = (e * rows_n + slab0 + pr) * kb + pj;
         // The slab's first block in the stack's block stream.
         let slab_n = (e * rows_n + slab0) * kb;
-        w32!(@prep $kind($($w),+), prow, e * rows_n + slab0 + pr, pn0 - pj, kb);
         // Each lane's `ldmatrix` rows: A row `lane % 16` of the warp's slab
         // rows at 16-byte half `lane / 16`; B column `lane % 8` of an n-tile
         // at 16-byte chunk `lane / 8` (blocks 0 and 1, low and high half).
@@ -1001,29 +1010,52 @@ macro_rules! gemm32_block {
         let b_off = (lane % 8) * B32_ROW + 4 * (lane / 8);
         let r_off = (16 * wid + g) * W32_ROW + 16;
 
+        range_walks!(
+            gemm32_block!($kind($($w),+), $mins, $epi, $q, $d, $s, (tid, t, active, ncols, nt_live,
+                steps, kb, col_q, col_d, bt, dt, wt, acol_sh, pr, pj, prow: e * rows_n + slab0 + pr,
+                prow_live, pn0, slab_n, live_rows, a_off, r_off, b_off)),
+            gemm32_block!($kind($($w),+), $y, (t, active, nt_live, len, row0, g, rows_n, slot_sh,
+                xs)),
+            w32!(@acc $kind($($w),+)),
+            active,
+            nt_live,
+            votes
+        );
+    }};
+    (
+        @walk $mode:ident, $nx:expr, $acc:ident, $off:ident, $kind:ident($($w:ident),+),
+        $mins:literal, $epi:ident, $q:ident, $d:ident, $s:ident, (
+            $tid:ident, $t:ident, $active:ident, $ncols:ident, $nt_live:ident, $steps:ident,
+            $kb:ident, $col_q:ident, $col_d:ident, $bt:ident, $dt:ident, $wt:ident,
+            $acol_sh:ident, $pr:ident, $pj:ident, $prow:ident: $prow_row:expr,
+            $prow_live:ident, $pn0:ident, $slab_n:ident, $live_rows:ident, $a_off:ident,
+            $r_off:ident, $b_off:ident
+        )
+    ) => {{
+        w32!(@prep $kind($($w),+), $prow, $prow_row, $pn0 - $pj, $kb);
         // Step 0 into stage 0.
-        stage32_act!(0usize, 0usize, $mins, tid, ncols, col_q, col_d, $q, $d, $s, bt, dt, acol_sh);
+        stage32_act!(0usize, 0usize, $mins, $tid, $ncols, $col_q, $col_d, $q, $d, $s, $bt, $dt,
+            $acol_sh);
         {
-            let live = prow_live && pj < kb;
+            let live = $prow_live && $pj < $kb;
             // SAFETY: the pair's staged row of stage 0, inside WT.
-            let dst = unsafe { wt.add(pr * W32_ROW) };
-            w32!(@copy $kind($($w),+), live, pn0, dst, pj);
-            w32!(@stage $kind($($w),+), wt, 0usize, slab_n, kb, 0usize, live_rows, tid);
-            let raw = w32!(@load $kind($($w),+), live, pn0, prow);
-            w32!(@store $kind($($w),+), raw, live, pn0, dst, pj, prow);
+            let dst = unsafe { $wt.add($pr * W32_ROW) };
+            w32!(@copy $kind($($w),+), live, $pn0, dst, $pj);
+            w32!(@stage $kind($($w),+), $wt, 0usize, $slab_n, $kb, 0usize, $live_rows, $tid);
+            let raw = w32!(@load $kind($($w),+), live, $pn0, $prow);
+            w32!(@store $kind($($w),+), raw, live, $pn0, dst, $pj, $prow);
         }
         // SAFETY: commits this thread's copies above as one group.
         unsafe { cp_async_commit_group() };
 
-        let mut acc = w32!(@acc $kind($($w),+));
         let mut h = 0usize;
-        while h < steps {
+        while h < $steps {
             let st = h & 1;
-            let nx = h + 1 < steps;
+            let nx = h + 1 < $steps;
             // Step h + 1's pair, loaded now, stored after this step's compute.
-            let nlive = nx && prow_live && 2 * (h + 1) + pj < kb;
-            let nn = pn0 + 2 * (h + 1);
-            let raw = w32!(@load $kind($($w),+), nlive, nn, prow);
+            let nlive = nx && $prow_live && 2 * (h + 1) + $pj < $kb;
+            let nn = $pn0 + 2 * (h + 1);
+            let raw = w32!(@load $kind($($w),+), nlive, nn, $prow);
             // SAFETY: one group per step (possibly empty) and none newer, so
             // waiting for all leaves step h's copies complete; the barrier
             // then publishes them and every relay store of step h, and tells
@@ -1031,34 +1063,34 @@ macro_rules! gemm32_block {
             unsafe { cp_async_wait_group(0) };
             thread::sync_threads();
             // SAFETY: the pair's staged row of stage st ^ 1, inside WT.
-            let ndst = unsafe { wt.add((st ^ 1) * W32_STAGE_W + pr * W32_ROW) };
+            let ndst = unsafe { $wt.add((st ^ 1) * W32_STAGE_W + $pr * W32_ROW) };
             if nx {
-                stage32_act!(h + 1, st ^ 1, $mins, tid, ncols, col_q, col_d, $q, $d, $s, bt, dt,
-                    acol_sh);
-                w32!(@copy $kind($($w),+), nlive, nn, ndst, pj);
-                w32!(@stage $kind($($w),+), wt, st ^ 1, slab_n, kb, h + 1, live_rows, tid);
+                stage32_act!(h + 1, st ^ 1, $mins, $tid, $ncols, $col_q, $col_d, $q, $d, $s, $bt,
+                    $dt, $acol_sh);
+                w32!(@copy $kind($($w),+), nlive, nn, ndst, $pj);
+                w32!(@stage $kind($($w),+), $wt, st ^ 1, $slab_n, $kb, h + 1, $live_rows, $tid);
             }
             // SAFETY: one group per step, empty on the last.
             unsafe { cp_async_commit_group() };
 
-            if active {
+            if $active {
                 // Block 1 of this step exists (warp-uniform).
-                let two = 2 * h + 1 < kb;
+                let two = 2 * h + 1 < $kb;
                 // SAFETY: stage `st` is inside each shared array, and every
                 // offset below stays inside its stage: rows below GEMM_BM of
                 // W32_ROW words, columns below GEMM_BN of B32_ROW and D32_ROW.
                 let (wst, bst, dst) = unsafe {
                     (
-                        wt.add(st * W32_STAGE_W),
-                        bt.add(st * B32_STAGE_W),
-                        dt.add(st * D32_STAGE_W),
+                        $wt.add(st * W32_STAGE_W),
+                        $bt.add(st * B32_STAGE_W),
+                        $dt.add(st * D32_STAGE_W),
                     )
                 };
                 // SAFETY: the whole warp issues each `ldmatrix` (the branches
                 // around them are warp-uniform) with 16-byte-aligned rows of
                 // this stage, published by the barrier above.
                 let (a0, a1) = unsafe {
-                    let p = wst.add(a_off);
+                    let p = wst.add($a_off);
                     let a0 = ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
                         p.cast_const().cast::<u8>(),
                     ));
@@ -1074,7 +1106,7 @@ macro_rules! gemm32_block {
                 // SAFETY: words 16 .. 19 of rows g and g + 8 of the warp's
                 // rows in this stage, published above.
                 let (dw0, dw1, mw0, mw1) = unsafe {
-                    let p0 = wst.add(r_off);
+                    let p0 = wst.add($r_off);
                     let p1 = p0.add(8 * W32_ROW);
                     (
                         [f32::from_bits(*p0), f32::from_bits(*p1)],
@@ -1083,39 +1115,42 @@ macro_rules! gemm32_block {
                         [f32::from_bits(*p0.add(3)), f32::from_bits(*p1.add(3))],
                     )
                 };
-                nt_walk!($epi, $mins, nt_live, two, t, bst, dst, b_off, a0, a1, dw0, dw1, mw0, mw1,
-                    acc);
+                nt_walk!($epi, $mode, $nx, $mins, $nt_live, two, $t, bst, dst, $b_off, a0, a1,
+                    dw0, dw1, mw0, mw1, $acc, $off);
             }
 
             if nx {
-                w32!(@store $kind($($w),+), raw, nlive, nn, ndst, pj, prow);
+                w32!(@store $kind($($w),+), raw, nlive, nn, ndst, $pj, $prow);
             }
             h += 1;
         }
-
-        if active {
-            let ws = w32!(@expert_scale $kind($($w),+), xs);
-            for nt in 0..GEMM_NT {
-                ::cuda_device::thread::__unroll_config::<0>();
-                if nt < nt_live {
-                    for i in 0..4usize {
-                        ::cuda_device::thread::__unroll_config::<0>();
-                        let n = 8 * nt + 2 * t + (i & 1);
-                        if n < len {
-                            let r = row0 + g + 8 * (i / 2);
-                            // SAFETY: n < GEMM_BN bounds the shared read; the
-                            // slot is below n_slots and r below rows, so the
-                            // store is inside y (launch contract), and one
-                            // lane of one block writes each (slot, row).
-                            unsafe {
-                                let slot = *slot_sh.add(n) as usize;
-                                *$y.get_unchecked_mut(slot * rows_n + r) =
-                                    w32!(@scale $kind($($w),+), ws, acc[4 * nt + i]);
-                            }
+    }};
+    (
+        @store $mode:ident, $nx:expr, $acc:ident, $kind:ident($($w:ident),+), $y:ident, (
+            $t:ident, $active:ident, $nt_live:ident, $len:ident, $row0:ident, $g:ident,
+            $rows_n:ident, $slot_sh:ident, $xs:ident
+        )
+    ) => {{
+        if $active {
+            let ws = w32!(@expert_scale $kind($($w),+), $xs);
+            gemm_nts!($mode, $nx, false, $nt_live, |nt, j0| {
+                for i in 0..4usize {
+                    ::cuda_device::thread::__unroll_config::<0>();
+                    let n = 8 * nt + 2 * $t + (i & 1);
+                    if n < $len {
+                        let r = $row0 + $g + 8 * (i / 2);
+                        // SAFETY: n < GEMM_BN bounds the shared read; the
+                        // slot is below n_slots and r below rows, so the
+                        // store is inside y (launch contract), and one
+                        // lane of one block writes each (slot, row).
+                        unsafe {
+                            let slot = *$slot_sh.add(n) as usize;
+                            *$y.get_unchecked_mut(slot * $rows_n + r) =
+                                w32!(@scale $kind($($w),+), ws, $acc[j0 + i]);
                         }
                     }
                 }
-            }
+            });
         }
     }};
 }
