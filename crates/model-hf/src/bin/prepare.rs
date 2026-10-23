@@ -16,9 +16,10 @@
 //! asks for the stored form and is refused beside it. Qwen3.8's decode reads about 9.27 GiB
 //! of weights a token from the stored split where the Q8_0 one reads 5.73, the head alone
 //! 0.55 GiB more
-//! (1,271,398,400 bytes of BF16 against 34 bytes a 32 values). Each shard is written as
-//! `<name>.part` and renamed when whole. The disk must hold the split and a tenth
-//! more. The written split is opened and its hyperparameters read as the server reads them.
+//! (1,271,398,400 bytes of BF16 against 34 bytes a 32 values). The output shard paths must
+//! not exist. A private temporary directory holds the entire split until it passes the
+//! server's reader; the first shard is published last. A persistent `<out prefix>.prepare.lock`
+//! file serializes writers of that prefix. The disk must hold the split and a tenth more.
 //! One line per tensor, a summary line, and exit status 1 with the error on any failure. Before
 //! any shard is written, the tokenizer serving builds from the header is checked to split text
 //! and stop generation where Hugging Face's does.
@@ -209,17 +210,85 @@ fn write_split(
     mut write: impl FnMut(usize, &mut Writer<BufWriter<File>>) -> Res<()>,
     validate: impl FnOnce(&Path) -> Res<()>,
 ) -> Res<()> {
-    let count = layouts.len();
-    for (no, layout) in layouts.into_iter().enumerate() {
-        let path = PathBuf::from(format!("{prefix}-{:05}-of-{count:05}.gguf", no + 1));
-        let part = path.with_extension("gguf.part");
-        let mut w = Writer::new(BufWriter::new(File::create(&part)?), layout)?;
-        write(no, &mut w)?;
-        w.finish()?;
-        std::fs::rename(&part, &path)?;
-        println!("prepare: wrote {}", path.display());
+    let lock_path = format!("{prefix}.prepare.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("{lock_path}: open lock: {e}"))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(format!("{prefix}: prepare output is busy").into());
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(format!("{lock_path}: lock: {e}").into());
+        }
     }
-    validate(Path::new(&format!("{prefix}-00001-of-{count:05}.gguf")))
+    let count = layouts.len();
+    let paths: Vec<_> = (1..=count)
+        .map(|no| PathBuf::from(format!("{prefix}-{no:05}-of-{count:05}.gguf")))
+        .collect();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let stage = PathBuf::from(format!("{prefix}.part.{}.{nonce}", std::process::id()));
+    let mut staged = false;
+    let mut published = vec![];
+    let result = (|| {
+        for path in &paths {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => return Err(format!("{}: output already exists", path.display()).into()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: stat: {e}", path.display()).into()),
+            }
+        }
+        std::fs::create_dir(&stage)?;
+        staged = true;
+        for (no, layout) in layouts.into_iter().enumerate() {
+            let part = stage.join(paths[no].file_name().expect("a shard has a filename"));
+            let mut w = Writer::new(BufWriter::new(File::create_new(&part)?), layout)?;
+            write(no, &mut w)?;
+            w.finish()?;
+        }
+        validate(&stage.join(paths[0].file_name().expect("a shard has a filename")))?;
+        // The first shard is the entry point; its siblings are immutable before it appears.
+        for path in paths.iter().rev() {
+            let part = stage.join(path.file_name().expect("a shard has a filename"));
+            model::fileio::rename_noreplace(&part, path)
+                .map_err(|e| format!("{}: publish: {e}", path.display()))?;
+            published.push(path);
+        }
+        for path in &paths {
+            println!("prepare: wrote {}", path.display());
+        }
+        Ok(())
+    })();
+    let mut cleanup = vec![];
+    if result.is_err() {
+        for path in published {
+            if let Err(e) = std::fs::remove_file(path) {
+                cleanup.push(format!("{}: remove published shard: {e}", path.display()));
+            }
+        }
+    }
+    if staged && let Err(e) = std::fs::remove_dir_all(&stage) {
+        cleanup.push(format!("{}: remove temporary split: {e}", stage.display()));
+    }
+    if let Err(e) = lock.unlock() {
+        cleanup.push(format!("{lock_path}: unlock: {e}"));
+    }
+    if cleanup.is_empty() {
+        result
+    } else {
+        let cleanup = cleanup.join("; ");
+        match result {
+            Ok(()) => Err(format!("split published; cleanup failed: {cleanup}").into()),
+            Err(e) => Err(format!("{e}; cleanup failed: {cleanup}").into()),
+        }
+    }
 }
 
 fn plan_shards(
@@ -384,6 +453,101 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn split_is_complete_and_validated_before_its_first_shard_appears() {
+        use super::*;
+        for count in [1, 2, 4] {
+            let dir = split_dir(&format!("complete-{count}"));
+            let prefix = dir.join("model");
+            let prefix = prefix.to_str().unwrap();
+            let first = format!("{prefix}-00001-of-{count:05}.gguf");
+            write_split(
+                prefix,
+                split_fixture(count),
+                |no, w| {
+                    assert!(!Path::new(&first).exists());
+                    w.tensor(&format!("t{no}"), &[no as u8; 8])?;
+                    Ok(())
+                },
+                |staged| {
+                    assert!(!Path::new(&first).exists());
+                    let split = gguf::Split::open(staged)?;
+                    assert_eq!(split.shard_count(), count);
+                    assert_eq!(split.tensor_count(), count);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let split = gguf::Split::open(&first).unwrap();
+            assert_eq!(split.shard_count(), count);
+            for (no, layout) in split_fixture(count).into_iter().enumerate() {
+                let mut expected = Writer::new(vec![], layout).unwrap();
+                expected.tensor(&format!("t{no}"), &[no as u8; 8]).unwrap();
+                assert_eq!(
+                    std::fs::read(split.shard_path(no).unwrap()).unwrap(),
+                    expected.finish().unwrap()
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn split_write_validation_and_publication_errors_clean_only_their_own_files() {
+        use super::*;
+        for (case, failed_shard, invalid, conflict) in [
+            ("write-first", Some(0), false, None),
+            ("write-later", Some(1), false, None),
+            ("validate", None, true, None),
+            ("publish-first", None, false, Some(1)),
+            ("publish-last", None, false, Some(0)),
+        ] {
+            let dir = split_dir(case);
+            let prefix = dir.join("model");
+            let prefix = prefix.to_str().unwrap();
+            let paths: Vec<_> = (1..=2)
+                .map(|no| format!("{prefix}-{no:05}-of-00002.gguf"))
+                .collect();
+            let result = write_split(
+                prefix,
+                split_fixture(2),
+                |no, w| {
+                    if failed_shard == Some(no) {
+                        return Err("injected write failure".into());
+                    }
+                    w.tensor(&format!("t{no}"), &[1; 8])?;
+                    Ok(())
+                },
+                |first| {
+                    gguf::Split::open(first)?;
+                    if invalid {
+                        return Err("injected validation failure".into());
+                    }
+                    if let Some(no) = conflict {
+                        std::fs::write(&paths[no], b"external file")?;
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "{case}");
+            for (no, path) in paths.iter().enumerate() {
+                if conflict == Some(no) {
+                    assert_eq!(std::fs::read(path).unwrap(), b"external file", "{case}");
+                } else {
+                    assert!(!Path::new(path).exists(), "{case}: {path}");
+                }
+            }
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(
+                    !name.to_string_lossy().contains(".part"),
+                    "{case}: {name:?}"
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
