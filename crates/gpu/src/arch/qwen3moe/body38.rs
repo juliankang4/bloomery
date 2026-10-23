@@ -1836,8 +1836,8 @@ impl Body38 {
         let stacks = swap38::stacks(&inputs.model, plan)?;
         // A residency machine moves experts to the host after the load, and
         // the host service writes a route trace: either keeps every host leg.
-        let keep_host = residency_glue.source().is_some() || host.route_trace;
-        let card = Card38::new(gpu, w, &stacks, &map, n, keep_host)?;
+        let machine = residency_glue.source().is_some();
+        let card = Card38::new(gpu, w, &stacks, &map, n, machine || host.route_trace)?;
         // A tier layer's join sums the card's slots and the tier's in one
         // launch, which a layer with no card expert does not run.
         if let Some(l) = run
@@ -1886,10 +1886,8 @@ impl Body38 {
             ff: geo::FF,
             n_used: geo::N_USED,
         };
-        // The host run holds the layers with a host leg alone: a layer that
-        // keeps every expert on the card has no host view, so its stacks may
-        // be of a type no host kernel reads (NVFP4).
-        let hosted: Vec<usize> = run.clone().filter(|&l| !card.hostless(l)).collect();
+        let hosted: Vec<usize> =
+            HostRun::viewed(run.clone(), machine, (|l| card.n_card(l), geo::EXPERTS)).collect();
         let mut experts = crate::model::host_run(
             gpu.context(),
             plan,

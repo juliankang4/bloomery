@@ -3923,7 +3923,9 @@ mod gate {
     /// ([`card_rows`]). Against the same plan loaded keeping every host leg
     /// (`HostCfg::route_trace` set: the load is made for a route trace),
     /// whose step holds every layer's go and wait and whose verify replay
-    /// serves every layer on the host: five graph and five eager steps and a
+    /// serves every layer on the host, while its host run holds a view of
+    /// the layers with an expert off the card alone (no host kernel need read
+    /// a card-resident stack): five graph and five eager steps and a
     /// verify of four rows kept whole, every token, logits row and store bit
     /// for bit. A load that runs a layer without the host leg refuses a route
     /// trace and a residency machine by name ([`whole_refusals`]). A load
@@ -3975,6 +3977,12 @@ mod gate {
             let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
             let ([b], _) = count_kinds(&m.step_graph_nodes()?, [memop]);
             let whole = hostless(&plan);
+            let views = m
+                .body_parts("card leg whole plan")?
+                .2
+                .hybrid_mut()
+                .host_mut()
+                .len();
             let rows_ok = route_trace || card_rows(&mut m, toks, &plan)?;
             let graph = run_steps(&mut m, toks, StepMode::Graph, true)?;
             let eager = run_steps(&mut m, toks, StepMode::Eager, true)?;
@@ -3991,17 +3999,17 @@ mod gate {
                 whole_refusals(&mut m)?
             };
             Ok(Some((
-                whole,
+                (whole, views),
                 b,
                 rows_ok && refused,
                 [graph, eager],
                 verified,
             )))
         };
-        let Some((whole, b, own_ok, runs, (v, served))) = arm(false)? else {
+        let Some(((whole, views), b, own_ok, runs, (v, served))) = arm(false)? else {
             return Ok(false);
         };
-        let Some((_, kb, _, kept, (kv, kserved))) = arm(true)? else {
+        let Some(((_, kviews), kb, _, kept, (kv, kserved))) = arm(true)? else {
             return Ok(false);
         };
         let premise = !fixture || whole == n_layer();
@@ -4009,12 +4017,14 @@ mod gate {
             && b == shape().memops_card(whole)
             && kb == memops()
             && served == [(n_layer() - whole) as u64; 3]
-            && kserved == [n_layer() as u64; 3];
+            && kserved == [n_layer() as u64; 3]
+            && [views, kviews] == [n_layer() - whole; 2];
         println!(
             "card leg whole plan: {whole} of {} layers without the host leg{}; batch_mem_op {b} \
              (want {}), with every host leg kept {kb} (want {}); the verify replay's services, \
              host calls and Cols services {served:?} (want {} each), with every host leg kept \
-             {kserved:?} (want {} each) {}",
+             {kserved:?} (want {} each); host views {views}, with every host leg kept {kviews} \
+             (want {} each) {}",
             n_layer(),
             if fixture {
                 format!(" (want {}: the fixture fits the card)", n_layer())
@@ -4025,6 +4035,7 @@ mod gate {
             memops(),
             n_layer() - whole,
             n_layer(),
+            n_layer() - whole,
             verdict(counts)
         );
         let mut ok = counts && own_ok;

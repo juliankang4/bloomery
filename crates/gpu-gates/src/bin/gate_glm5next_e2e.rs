@@ -477,7 +477,7 @@ mod gate {
     use bloomery_gpu::GpuError;
     use bloomery_gpu::fault::{Fault, FaultSite, LAYER_HEAD};
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
+    use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader, TraceSet};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, POOL, pools_for};
     use bloomery_gpu::linear::RING_ROWS;
@@ -4194,6 +4194,34 @@ mod gate {
         Ok(pass)
     }
 
+    /// A route trace into `dir` of the GLM load of `model`, attached to `m`'s host tier (its body
+    /// named `what`), its header over the host run and `inputs`' counts.
+    fn attach_trace(
+        m: &mut Glm5nextModel,
+        what: &'static str,
+        (dir, model): (&std::path::Path, PathBuf),
+        inputs: &PlanInputs,
+    ) -> Result<(), GateError> {
+        let run = m.body(what)?.host_run();
+        let trace = RouteTrace::create(
+            dir,
+            TraceHeader {
+                model,
+                arch: "glm5next".to_owned(),
+                build: "gate_glm5next_e2e".to_owned(),
+                n_expert: inputs.hp.n_expert,
+                n_used: inputs.hp.n_used,
+                first_layer: run.start,
+                n_layer: run.len(),
+                extra: Vec::new(),
+            },
+        )?;
+        Ok(m.body_parts(what)?
+            .2
+            .hybrid_mut()
+            .attach_route_trace(trace)?)
+    }
+
     /// One (g5) case on both slots prompted, `t` their prompts' argmaxes:
     /// whether the pass was refused by its name, and whether both slots'
     /// positions stood (for [`G5::Held`], as the failed step left them).
@@ -4244,24 +4272,8 @@ mod gate {
             G5::Traced => {
                 let dir = std::env::temp_dir()
                     .join(format!("gate_glm5next_e2e-g5-{}", std::process::id()));
-                let run = m.body("stagger")?.host_run();
-                let trace = RouteTrace::create(
-                    &dir,
-                    TraceHeader {
-                        model: PathBuf::from(glm5next_tier::model_path()?),
-                        arch: "glm5next".to_owned(),
-                        build: "gate_glm5next_e2e".to_owned(),
-                        n_expert: inputs.hp.n_expert,
-                        n_used: inputs.hp.n_used,
-                        first_layer: run.start,
-                        n_layer: run.len(),
-                        extra: Vec::new(),
-                    },
-                )?;
-                m.body_parts("stagger")?
-                    .2
-                    .hybrid_mut()
-                    .attach_route_trace(trace)?;
+                let model = PathBuf::from(glm5next_tier::model_path()?);
+                attach_trace(m, "stagger", (&dir, model), inputs)?;
                 let r = m.step_slots(&both);
                 drop(m.body_parts("stagger")?.2.hybrid_mut().take_route_trace());
                 std::fs::remove_dir_all(&dir)?;
@@ -4789,24 +4801,8 @@ mod gate {
             "a pass with a route trace attached",
             both,
             |m, p| {
-                let run = m.body("stagger-draft")?.host_run();
-                let trace = RouteTrace::create(
-                    &dir,
-                    TraceHeader {
-                        model: PathBuf::from(glm5next_tier::model_path()?),
-                        arch: "glm5next".to_owned(),
-                        build: "gate_glm5next_e2e".to_owned(),
-                        n_expert: inputs.hp.n_expert,
-                        n_used: inputs.hp.n_used,
-                        first_layer: run.start,
-                        n_layer: run.len(),
-                        extra: Vec::new(),
-                    },
-                )?;
-                m.body_parts("stagger-draft")?
-                    .2
-                    .hybrid_mut()
-                    .attach_route_trace(trace)?;
+                let model = PathBuf::from(glm5next_tier::model_path()?);
+                attach_trace(m, "stagger-draft", (&dir, model), inputs)?;
                 let r = m.verify_slots(p);
                 drop(
                     m.body_parts("stagger-draft")?
@@ -5419,10 +5415,51 @@ mod gate {
         Ok((no_views, m, inputs))
     }
 
+    /// A route trace's load of `path` ([`hostless_open`] under `host` with `route_trace` set):
+    /// the trace attached, `ids` run by eager steps as one prompt call, then the trace finished
+    /// and read back. Whether the load holds no host view, the model and the set on disk.
+    fn traced_open(
+        path: &std::path::Path,
+        host: bloomery_levers::HostCfg,
+        ids: &[u32],
+    ) -> Result<(bool, Glm5nextModel, TraceSet), GateError> {
+        let (no_views, mut m, inputs) = hostless_open(
+            path,
+            bloomery_levers::HostCfg {
+                route_trace: true,
+                ..host
+            },
+            ids,
+            None,
+        )?;
+        let dir =
+            std::env::temp_dir().join(format!("gate-glm-hostless-trace-{}", std::process::id()));
+        attach_trace(&mut m, "hostless", (&dir, path.to_path_buf()), &inputs)?;
+        m.body_parts("hostless")?
+            .2
+            .hybrid_mut()
+            .route_prompt(0, ids.len())?;
+        m.set_mode(StepMode::Eager);
+        for &id in ids {
+            m.step(&[id])?;
+        }
+        m.body_parts("hostless")?
+            .2
+            .hybrid_mut()
+            .take_route_trace()
+            .ok_or("hostless: the route trace left the tier")?
+            .finish()?;
+        let set = TraceSet::read(&dir)?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok((no_views, m, set))
+    }
+
     /// Fully card-resident routed layers: an NVFP4 trunk opens without a host view
     /// and its eager, graph and batched prompt paths agree; a K-quant trunk opens
-    /// without one too, and a load for a route trace keeps its host leg with the
-    /// same logits.
+    /// without one too; and a load for a route trace keeps its host leg, which
+    /// writes the trace, without a host view, so an NVFP4 and a K-quant trunk both
+    /// open for one, record every step's routing on the card and give the same
+    /// logits.
     fn hostless(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         tier::sc("hostless NVFP4 placed load and generation")?;
         let path = hostless_fixture(GgmlType::NVFP4)?;
@@ -5478,22 +5515,45 @@ mod gate {
             verdict(forced_ok)
         );
         // A route trace is written by the host service, so its load keeps the host leg
-        // of a fully resident K-quant layer; both loads give the same logits.
-        let path = hostless_fixture(GgmlType::Q4_K)?;
-        let eager = Some(StepMode::Eager);
-        let (bare, m, _) = hostless_open(&path, levers.host(), &ids, eager)?;
-        let want = m.logits()?;
+        // of a fully resident layer, and holds no host view of it: no host kernel reads
+        // an NVFP4 stack. The trace records each step's routing, every slot on the card,
+        // and both loads give the same logits.
         drop(m);
-        let mut traced = levers.host();
-        traced.route_trace = true;
-        let (kept, m, _) = hostless_open(&path, traced, &ids, eager)?;
-        let hosted = rel(&m.logits()?, &want);
-        let trace_ok = bare && !kept && want.iter().all(|v| v.is_finite()) && hosted <= 1e-6;
-        println!(
-            "hostless: q4_k no_host_views={bare} traced_host_views={} traced_rel={hosted:.3e} {}",
-            !kept,
-            verdict(trace_ok)
-        );
+        let q4k = hostless_fixture(GgmlType::Q4_K)?;
+        let eager = Some(StepMode::Eager);
+        let mut trace_ok = true;
+        for (routed, path) in [(GgmlType::NVFP4, &path), (GgmlType::Q4_K, &q4k)] {
+            let (bare, m, _) = hostless_open(path, levers.host(), &ids, eager)?;
+            let want = m.logits()?;
+            drop(m);
+            let (viewless, m, set) = match traced_open(path, levers.host(), &ids) {
+                Ok(traced) => traced,
+                Err(e) => {
+                    println!(
+                        "hostless: {routed:?} the route trace's load FAILED: {e} {}",
+                        verdict(false)
+                    );
+                    trace_ok = false;
+                    continue;
+                }
+            };
+            let hosted = rel(&m.logits()?, &want);
+            let on_card = set.kinds.iter().flatten().all(|&k| k == b'C');
+            // PIN(2026-10-23): was !kept; the base NVFP4 trace load failed while building its CPU view.
+            let ok = bare
+                && viewless
+                && set.complete == Some(ids.len() as u64)
+                && on_card
+                && want.iter().all(|v| v.is_finite())
+                && hosted <= 1e-6;
+            println!(
+                "hostless: {routed:?} no_host_views={bare} traced_no_host_views={viewless} \
+                 trace_positions={:?} trace_on_card={on_card} traced_rel={hosted:.3e} {}",
+                set.complete,
+                verdict(ok)
+            );
+            trace_ok &= ok;
+        }
         Ok(ok && generated && forced_ok && trace_ok)
     }
 

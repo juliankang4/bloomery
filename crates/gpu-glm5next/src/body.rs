@@ -1664,6 +1664,7 @@ impl Body {
             run.len(),
             N_EXPERT,
         )?);
+        let machine = glue.source().is_some();
         let experts_on_card = CardExperts::new(
             gpu,
             w,
@@ -1671,7 +1672,7 @@ impl Body {
             &map,
             dims.embd,
             hp.expert_ff,
-            (LOAD_ROWS, glue.source().is_some() || host.route_trace),
+            (LOAD_ROWS, machine || host.route_trace),
         )?;
         let boundary = Boundary::with_rows(
             gpu.context(),
@@ -1683,7 +1684,11 @@ impl Body {
             LOAD_ROWS,
         )?;
         let file = Arc::clone(file);
-        let hosted = run.clone().filter(|&l| !experts_on_card.hostless(l));
+        let hosted = HostRun::viewed(
+            run.clone(),
+            machine,
+            (|l| experts_on_card.n_card(l), N_EXPERT),
+        );
         // The common chain's host-run build: a paged plan's NVMe expert tier
         // is attached before the run's first call. The run includes the
         // NextN layer's index, which the tier does not cover.

@@ -39,7 +39,8 @@ pub struct HostRun {
     /// reads through this pair.
     file: R8Pair,
     /// Per model layer, its host view; `None` for a layer that carries no
-    /// host share, which no call may read.
+    /// host share, which no call may read: a call on it that lists no expert
+    /// writes zeros ([`HostRun::zero_sum`]).
     layers: Vec<Option<HostLayer>>,
     /// One step scratch per feed-forward width the layers have, made for
     /// that width and [`HostWidths::embd`]; every layer of one width shares.
@@ -61,6 +62,20 @@ pub struct HostRun {
 }
 
 impl HostRun {
+    /// The layers of `run` a load's host run views ([`HostRun::build_at`]'s set): each that
+    /// keeps fewer than `n_expert` experts on the card (`n_card`), or every one under a
+    /// residency machine (`machine`), which moves experts to the host after the load. A layer
+    /// that keeps every expert on the card has no view, so its stacks may be of a type no host
+    /// kernel reads (NVFP4); a route trace's service of it lists no expert, whose sum the run
+    /// writes without one ([`HostRun::zero_sum`]).
+    pub fn viewed(
+        run: std::ops::Range<usize>,
+        machine: bool,
+        (n_card, n_expert): (impl Fn(usize) -> usize + Clone, usize),
+    ) -> impl Iterator<Item = usize> + Clone {
+        run.filter(move |&l| machine || n_card(l) < n_expert)
+    }
+
     /// The tier for the contiguous routed layers `first ..` of `file`, as
     /// many as `layers` builds ([`HostRun::build_at`] over
     /// `first .. first + n`).
@@ -302,6 +317,43 @@ fn view_of<'a>(
 }
 
 impl HostRun {
+    /// A call on layer `layer` where the run holds no view of it and none of
+    /// the call's `lists` names an expert, `x_cols` columns of `width` into
+    /// `out`: a layer that keeps every expert on the card, whose step a route
+    /// trace still serves (the service writes the trace), sums nothing, so
+    /// `out` takes zeros, the empty lists' sums; `true` once written. `false`
+    /// where the run holds a view or a list names an expert, which the view
+    /// serves or [`view_of`] refuses by name. Refused by name as `what`:
+    /// a width other than the model's, columns other than one a list and an
+    /// `out` of another size.
+    fn zero_sum(
+        &self,
+        layer: usize,
+        lists: &[&[(u32, f32)]],
+        (width, x_cols): (usize, usize),
+        out: &mut [f32],
+        what: &'static str,
+    ) -> Result<bool, GpuError> {
+        if lists.iter().any(|l| !l.is_empty())
+            || self.layers.get(layer).is_some_and(Option::is_some)
+        {
+            return Ok(false);
+        }
+        let cols = lists.len();
+        if width != self.widths.embd || x_cols != cols || width.checked_mul(cols) != Some(out.len())
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{x_cols} columns of {width} values beside {cols} lists, a sum of {} values",
+                    out.len()
+                ),
+            ));
+        }
+        out.fill(0.0);
+        Ok(true)
+    }
+
     /// Layer `layer`'s host view, the run's byte source and the union's
     /// slabs of the layer's width, for a union call refused by name as
     /// `what`: a layer with no host share, and slabs never made
@@ -335,6 +387,10 @@ impl HostExperts for HostRun {
         experts: &[(u32, f32)],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
+        const WHAT: &str = "HostRun::experts_into";
+        if self.zero_sum(layer, &[experts], (x.ne0, x.ne1), out, WHAT)? {
+            return Ok(());
+        }
         // A tiered load prepares union slabs of at least one column. That
         // call is the resident path: hits compute while a miss fills. A load
         // with no slabs keeps today's fill-then-serve.
@@ -349,7 +405,7 @@ impl HostExperts for HostRun {
                 tier,
                 ..
             } = self;
-            let view = view_of(layers, layer, "HostRun::experts_into")?;
+            let view = view_of(layers, layer, WHAT)?;
             view.experts_into_resident(
                 file.source(),
                 x,
@@ -361,7 +417,7 @@ impl HostExperts for HostRun {
             reads.arena_or_file(tier.as_deref(), layer, experts.iter().map(|&(id, _)| id));
             return Ok(());
         }
-        let view = view_of(&self.layers, layer, "HostRun::experts_into")?;
+        let view = view_of(&self.layers, layer, WHAT)?;
         view.experts_into(
             self.file.source(),
             x,
@@ -384,7 +440,11 @@ impl HostExperts for HostRun {
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
-        let (view, src, scratch) = self.union_of(layer, "HostRun::experts_union_into")?;
+        const WHAT: &str = "HostRun::experts_union_into";
+        if self.zero_sum(layer, lists, (x.ne0(), x.ne1()), out, WHAT)? {
+            return Ok(());
+        }
+        let (view, src, scratch) = self.union_of(layer, WHAT)?;
         view.experts_union_into(src, x, lists, out, scratch)?;
         // A layer with an arena reads the ids it serves from the arena's
         // slots, batch by batch; the plan's host segment and a layer with
@@ -407,7 +467,11 @@ impl HostExperts for HostRun {
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
-        let (view, src, scratch) = self.union_of(layer, "HostRun::experts_step_union_into")?;
+        const WHAT: &str = "HostRun::experts_step_union_into";
+        if self.zero_sum(layer, lists, (x.ne0(), x.ne1()), out, WHAT)? {
+            return Ok(());
+        }
+        let (view, src, scratch) = self.union_of(layer, WHAT)?;
         view.experts_step_union_into(src, x, lists, out, scratch)?;
         self.reads.arena_or_file(
             self.tier.as_deref(),
@@ -546,7 +610,13 @@ mod tests {
 
     /// A layer with no host share reading another layer's experts: a set with
     /// gaps maps each present layer to its own rows, and a call for a gap, or
-    /// for a layer past the set's last, is a named error that writes nothing.
+    /// for a layer past the set's last, that lists an expert is a named error
+    /// that writes nothing. A call there that lists none (a layer every
+    /// expert of which is on the card, served for a route trace) writes the
+    /// empty lists' zeros, step and union alike; one whose width, sum or
+    /// columns differ is refused by name. Mutants: the zero branch dropped
+    /// (the traced step refused), taken on a listed call, or the model width
+    /// check dropped.
     #[test]
     fn a_sparse_set_serves_its_layers_and_refuses_the_gaps_by_name() {
         const SET: [usize; 3] = [1, 4, 5];
@@ -587,6 +657,41 @@ mod tests {
                     assert!(e.contains(&named), "{e}");
                 }
                 assert!(out.iter().all(|&v| v == 7.0), "a refused call wrote");
+                let e = run
+                    .experts_into(gap, &x, &[], &mut out[1..])
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("a sum of 255 values"), "{e}");
+                run.experts_into(gap, &x, &[], &mut out).unwrap();
+                assert!(out.iter().all(|&v| v == 0.0), "layer {gap} step");
+                let empty: [&[(u32, f32)]; 1] = [&[]];
+                let wrong = Tensor2::zeros(1, 1);
+                let mut short = [7.0];
+                let e = run
+                    .experts_into(gap, &wrong, &[], &mut short)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("HostRun::experts_into"), "{e}");
+                assert_eq!(short, [7.0], "a wrong-width step wrote");
+                let two: [&[(u32, f32)]; 2] = [&[], &[]];
+                for union in [
+                    HostExperts::experts_union_into,
+                    HostExperts::experts_step_union_into,
+                ] {
+                    let e = union(&mut run, gap, wrong.view(), &empty, &mut short)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(e.contains("HostRun::experts_"), "{e}");
+                    assert_eq!(short, [7.0], "a wrong-width union wrote");
+                    out.fill(7.0);
+                    let e = union(&mut run, gap, x.view(), &two, &mut out)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(e.contains("1 columns of 256 values beside 2 lists"), "{e}");
+                    union(&mut run, gap, x.view(), &empty, &mut out).unwrap();
+                    assert!(out.iter().all(|&v| v == 0.0), "layer {gap} union");
+                }
+                out.fill(7.0);
             }
             run.experts_into(4, &x, &[(0, 1.0)], &mut out).unwrap();
         });

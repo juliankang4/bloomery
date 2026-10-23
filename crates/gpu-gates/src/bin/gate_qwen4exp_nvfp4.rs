@@ -23,6 +23,10 @@
 //!   named tie (ours the oracle's runner-up, the oracle's margin at most twice our distance at the
 //!   two ids, the logits within `FREE_BAND`). The layer outputs are printed: a flip in any of the
 //!   3,000 positions before it may lie on their path.
+//! - (rt) the load made for a route trace (`HostCfg::route_trace`): it opens, every layer keeps its
+//!   host leg, which writes the trace, and the host run holds no view (no CPU kernel reads an NVFP4
+//!   stack); the batch set's ids by eager steps as one prompt call fill a complete trace, every
+//!   slot on the card, and each step's logits are the plain load's bit for bit.
 //! - Recorded, not judged: the batch run and the D3K step against the other pair of sets, the Q8_0
 //!   rounding's share of the distance.
 //!
@@ -84,6 +88,7 @@ mod gate {
         Body38, Model38, Prompt38, Qwen38Model, RouteTap, TargetRows,
     };
     use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
+    use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader, TraceSet};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::flip;
@@ -91,6 +96,7 @@ mod gate {
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
     };
+    use bloomery_levers::HostCfg;
     use gguf::GgmlType;
     use model::arch::models::headpick::HeadSet;
     use model::arch::qwen35moe::names;
@@ -151,11 +157,13 @@ mod gate {
         open_split(path).map(Model38::from)
     }
 
-    /// (l): the plan on the one visible card, every routed expert on it, and the load.
+    /// (l): the plan on the one visible card, every routed expert on it, and the load under
+    /// `host`.
     fn open(
         path: &Path,
         d: &Dims,
         levers: &bloomery_levers::Levers,
+        host: HostCfg,
     ) -> Result<(Qwen38Model, bool), GateError> {
         let file = model_of(path)?;
         let specs = Place::A.on_host()?.card_specs()?;
@@ -196,17 +204,8 @@ mod gate {
                 plan.arena_bytes,
                 verdict(ok)
             );
-            let mut model = Body38::open_placed_mtp_slots(
-                file,
-                &plan,
-                &inputs,
-                0,
-                levers.host(),
-                ub,
-                &draft,
-                &mtp,
-                1,
-            )?;
+            let mut model =
+                Body38::open_placed_mtp_slots(file, &plan, &inputs, 0, host, ub, &draft, &mtp, 1)?;
             model.set_mode(StepMode::Graph);
             return Ok((model, ok));
         }
@@ -217,7 +216,7 @@ mod gate {
             experts: Experts::Card,
             slots: 1,
             plan_levers: &plan_levers,
-            host: levers.host(),
+            host,
             room: None,
             residency: Residency::Off,
         }
@@ -506,6 +505,78 @@ mod gate {
         })
     }
 
+    /// (rt): the load of `path` made for a route trace, the trace attached and `toks` run from a
+    /// reset as one prompt call ([`run_steps`]), against `want`, the plain load's logits of the
+    /// same steps. A load that fails is a named FAIL.
+    fn traced(
+        path: &Path,
+        d: &Dims,
+        levers: &bloomery_levers::Levers,
+        (toks, want): (&[u32], &[Vec<f32>]),
+    ) -> Result<bool, GateError> {
+        let host = HostCfg {
+            route_trace: true,
+            ..levers.host()
+        };
+        let mut m = match open(path, d, levers, host) {
+            Ok((m, _)) => m,
+            Err(e) => {
+                println!(
+                    "(rt) the load for a route trace FAILED: {e} {}",
+                    verdict(false)
+                );
+                return Ok(false);
+            }
+        };
+        let dir =
+            std::env::temp_dir().join(format!("gate_qwen4exp_nvfp4-trace-{}", std::process::id()));
+        m.reset()?;
+        let (_, _, body) = m.body_parts("rt")?;
+        let tier = body.hybrid_mut();
+        let views = tier.host_mut().len();
+        let layers = tier.slots().layers();
+        let trace = RouteTrace::create(
+            &dir,
+            TraceHeader {
+                model: path.to_path_buf(),
+                arch: "qwen4exp".to_owned(),
+                build: "gate_qwen4exp_nvfp4".to_owned(),
+                n_expert: d.n_expert,
+                n_used: d.n_used,
+                first_layer: layers.start,
+                n_layer: layers.len(),
+                extra: Vec::new(),
+            },
+        )?;
+        tier.attach_route_trace(trace)?;
+        tier.route_prompt(0, toks.len())?;
+        let same = run_steps(&mut m, toks)?
+            .logits
+            .iter()
+            .flatten()
+            .map(|v| v.to_bits())
+            .eq(want.iter().flatten().map(|v| v.to_bits()));
+        m.body_parts("rt")?
+            .2
+            .hybrid_mut()
+            .take_route_trace()
+            .ok_or("(rt): the route trace left the tier")?
+            .finish()?;
+        let set = TraceSet::read(&dir)?;
+        std::fs::remove_dir_all(&dir)?;
+        let on_card = set.kinds.iter().flatten().all(|&k| k == b'C');
+        let ok = views == 0 && set.complete == Some(toks.len() as u64) && on_card && same;
+        println!(
+            "(rt) the load for a route trace: host views {views} (want 0), trace positions {:?} \
+             (want {}), every slot on the card {on_card}, logits the plain load's bit for bit \
+             {same} {}",
+            set.complete,
+            toks.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     fn mtp(mut m: Qwen38Model, prompt: &[u32]) -> Result<bool, GateError> {
         m.reset()?;
         m.prompt38(prompt, Prompt38::Pass)?;
@@ -590,7 +661,7 @@ mod gate {
         if levers.draft() == Some("mtp") {
             let batch = set(d.dense.batch.0)?;
             let (_, toks, _) = batch.step()?;
-            let (m, mut ok) = open(&path, &d, &levers)?;
+            let (m, mut ok) = open(&path, &d, &levers, levers.host())?;
             ok &= mtp(m, toks)?;
             return if ok { Ok(()) } else { Err(checks_failed()) };
         }
@@ -624,7 +695,7 @@ mod gate {
             }
         }
         let (_, toks, _) = batch.step()?;
-        let (mut m, mut ok) = open(&path, &d, &levers)?;
+        let (mut m, mut ok) = open(&path, &d, &levers, levers.host())?;
         let vocab = m.body("run")?.vocab();
         m.reset()?;
         let r = run_steps(&mut m, toks)?;
@@ -645,6 +716,8 @@ mod gate {
             &batch,
         )?;
         ok &= d3k_step(&mut m, &d, vocab, (d3k_name, &d3k), (other_d3k, &d3k_other))?;
+        drop(m);
+        ok &= traced(&path, &d, &levers, (toks, &r.logits))?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 

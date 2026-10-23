@@ -654,8 +654,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               the host tier writes a route trace into \
               (`crates/gpu/src/host/route_trace.rs`): every position's routed ids per \
               layer and the slot each ran in, as a router set, a `call` row per prompt \
-              call. On a qwen4exp load it keeps every layer's host leg, where the trace is \
-              written. The servers need `BLOOMERY_PREFILL=steps`, no `BLOOMERY_DRAFT` set, \
+              call. On a qwen4exp or glm5next load it keeps every layer's host leg, where \
+              the trace is written; a layer that holds every expert on the card keeps no host \
+              view, so a load of experts no host kernel reads (NVFP4) takes a trace. The \
+              servers need `BLOOMERY_PREFILL=steps`, no `BLOOMERY_DRAFT` set, \
               and one resident slot (`--parallel` past 1 is refused; unset serves one); \
               `bloomery-serve-qwen38` also refuses a `BLOOMERY_RESIDENCY` word other than \
               `off`, and its unset draft and residency resolve `off`. The generators \

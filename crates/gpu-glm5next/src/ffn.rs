@@ -301,7 +301,8 @@ impl CardExperts {
         self.layer(l).is_some()
     }
 
-    /// A fully resident layer needs no host view unless residency can move its experts.
+    /// A fully resident layer runs without the host leg unless the load keeps it: a residency
+    /// machine can move its experts, or the host service writes a route trace.
     pub(crate) fn hostless(&self, l: usize) -> bool {
         !self.keep_host && self.n_card(l) == N_EXPERT
     }

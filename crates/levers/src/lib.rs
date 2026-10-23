@@ -2556,8 +2556,10 @@ pub struct HostCfg {
     /// same-binary arm.
     pub r8: bool,
     /// The load is made for a route trace ([`ROUTE_TRACE`] set,
-    /// [`Levers::host`]): a Qwen3.8 load, which can run a layer without its
-    /// host leg, keeps every one, where the host service writes the trace.
+    /// [`Levers::host`]): a load that can run a layer without its host leg
+    /// (Qwen3.8, GLM-5.3) keeps every one, where the host service writes the
+    /// trace, and holds a host view only of a layer with an expert off the
+    /// card.
     pub route_trace: bool,
 }
 
