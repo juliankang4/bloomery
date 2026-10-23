@@ -100,13 +100,17 @@
 //! two rows is captured before the prompt (a `capture` line of its nodes).
 //! Each kept token prints its `step`
 //! line and, under `--time`, a `time step` line (its window's wall over the
-//! window's kept rows, the row a plain step's wall compares with; `--warm W`
-//! marks the first W), and each window a `time pass` line (its wall from the
-//! proposal through the commit, the rows it kept, `kind=mtp`, or `plain` for
+//! delivered tokens, including the full wall when the token limit cuts the
+//! window; `--warm W` marks the first W), and each window a `time pass` line
+//! (its wall from the proposal through the commit, the rows it kept, `kind=mtp`, or `plain` for
 //! a window with no proposal). The feed's `time prompt` wall holds the
 //! draft's store walks over the prompt's units. The `mtp summary` line counts the proposals
-//! and the windows by rows kept; the `SMOKE` footer is over the kept
-//! positions past the warm ones. `lookup` and `dspark` are refused by name,
+//! and the windows by rows kept, and rates all their positions over all their
+//! wall time. The `SMOKE` footer rates delivered tokens past the warm ones
+//! over the full wall of every pass that delivered a counted token. A pass
+//! crossing the warm boundary is counted in full and is not marked warm;
+//! its counted `time step` rows share its wall and its warm rows carry zero.
+//! Token 0 belongs to the prompt time. `lookup` and `dspark` are refused by name,
 //! as are `--pair`, `--logits` and the route trace beside the draft. Unset or
 //! `off`, the load, the plan and every step are the plain run's.
 //!
@@ -223,6 +227,7 @@ mod cli {
     use std::time::{Duration, Instant};
 
     use crate::gen_slots;
+    use crate::gen_time::Windows;
     use crate::glm_place;
     use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident, open_resident_slots};
     use app::mtp::MtpDraft;
@@ -280,7 +285,6 @@ mod cli {
     /// The drafted window's verify: the target's next token and the draft's
     /// one proposal.
     const VERIFY_ROWS: usize = 2;
-    type Windows = crate::gen_time::Windows<VERIFY_ROWS>;
 
     /// The most streams the plain pass of a row a slot lays: the walk's point
     /// for a plain pass is the step for one slot and the pair for two
@@ -1262,7 +1266,7 @@ mod cli {
         }
     }
 
-    impl PassSink<Session<Body>> for Windows {
+    impl PassSink<Session<Body>> for Windows<VERIFY_ROWS> {
         type Error = GateError;
 
         fn begin(&mut self, _: &Session<Body>) -> Result<(), GateError> {
@@ -1277,9 +1281,8 @@ mod cli {
             wall: Duration,
         ) -> Result<(), GateError> {
             let ms = wall.as_secs_f64() * 1e3;
-            let per = ms / c.kept as f64;
             for (r, &token) in (0u32..).zip(tokens) {
-                self.kept.push((c.pos + r, token, per));
+                self.kept.push((c.pos + r, token));
             }
             self.passes.push((c.proposed, c.kept, c.rows, ms));
             Ok(())
@@ -1324,7 +1327,7 @@ mod cli {
             .u("fed", a.ids.len())
             .f("feed_s", feed.as_secs_f64())
             .print();
-        let mut sink = Windows {
+        let mut sink = Windows::<VERIFY_ROWS> {
             kept: Vec::with_capacity(a.n_gen + VERIFY_ROWS),
             passes: Vec::with_capacity(a.n_gen),
         };
@@ -1353,7 +1356,7 @@ mod cli {
                 .w("kind", a.prefill.name())
                 .print();
         }
-        for (i, (&(pos, token, _), &per)) in (1usize..).zip(rows.iter().zip(&times.steps)) {
+        for (i, (&(pos, token), &per)) in (1usize..).zip(rows.iter().zip(&times.step_ms)) {
             Record::new(&record::STEP)
                 .u("i", i)
                 .u("pos", pos)

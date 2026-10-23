@@ -2,31 +2,50 @@
 
 use bloomery_gpu_gates::record::{self, Record};
 
-/// What the drafted generation's windows kept: every kept token at its
-/// position with its window's wall over the window's kept rows, and every
-/// window's proposal, kept rows and wall in ms.
+/// Every kept token at its position, and each pass's proposal, kept rows,
+/// executed rows and full wall in ms.
 pub(super) struct Windows<const ROWS: usize> {
-    pub(super) kept: Vec<(u32, u32, f64)>,
+    pub(super) kept: Vec<(u32, u32)>,
     pub(super) passes: Vec<(bool, usize, usize, f64)>,
 }
 
 pub(super) struct Times {
-    pub(super) steps: Vec<f64>,
+    pub(super) step_ms: Vec<f64>,
     pub(super) counted_ms: f64,
     pub(super) positions: usize,
-    pub(super) ms: f64,
+    pub(super) total_ms: f64,
 }
 
 impl<const ROWS: usize> Windows<ROWS> {
+    /// Attribute a whole pass to the delivered tokens past the warm boundary,
+    /// or to its warm tokens when none is counted.
     pub(super) fn times(&self, steps: usize, warm: usize) -> Times {
-        let per: Vec<f64> = self.kept[..steps].iter().map(|r| r.2).collect();
-        let counted_ms = per[warm..].iter().sum();
-        let positions = self.passes.iter().map(|p| p.1).sum();
+        let tokens = &self.kept[..steps];
+        let mut per = Vec::with_capacity(tokens.len());
+        let mut counted_ms = 0.0;
+        let mut positions = 0;
+        let mut ms = 0.0;
+        for &(_, kept, _, wall) in &self.passes {
+            positions += kept;
+            ms += wall;
+            let delivered = kept.min(tokens.len() - per.len());
+            if delivered > 0 {
+                let end = per.len() + delivered;
+                if end > warm {
+                    counted_ms += wall;
+                    let counted_from = warm.max(per.len());
+                    per.resize(counted_from, 0.0);
+                    per.resize(end, wall / (end - counted_from) as f64);
+                } else {
+                    per.resize(end, wall / delivered as f64);
+                }
+            }
+        }
         Times {
-            steps: per,
+            step_ms: per,
             counted_ms,
             positions,
-            ms: counted_ms * positions as f64 / (steps - warm) as f64,
+            total_ms: ms,
         }
     }
 
@@ -43,21 +62,21 @@ impl<const ROWS: usize> Windows<ROWS> {
             .list("widths", &widths)
             .u("positions", t.positions)
             .u("passes", self.passes.len())
-            .f("tok/s(positions)", t.positions as f64 * 1e3 / t.ms)
+            .f("tok/s(positions)", t.positions as f64 * 1e3 / t.total_ms)
     }
 
     pub(super) fn pass_times(&self, warm: usize) -> impl Iterator<Item = Record> + '_ {
         self.passes
             .iter()
             .enumerate()
-            .scan(1, move |at, (k, &(proposed, kept, _, ms))| {
+            .scan(0, move |at, (k, &(proposed, kept, _, ms))| {
+                *at += kept;
                 let line = Record::new(&record::TIME_PASS)
                     .u("i", k + 1)
                     .flag("warm", *at <= warm)
                     .f("ms", ms)
                     .u("positions", kept)
                     .w("kind", if proposed { "mtp" } else { "plain" });
-                *at += kept;
                 Some(line)
             })
     }
@@ -72,10 +91,8 @@ impl Times {
         generated: usize,
         warm: usize,
     ) -> Record {
-        let counted = &self.steps[warm..];
-        let mut sorted = counted.to_vec();
-        sorted.sort_by(f64::total_cmp);
-        let p50 = sorted[sorted.len() / 2];
+        let counted = &self.step_ms[warm..];
+        let p50 = bloomery_gpu_gates::quantile(counted, 0.5);
         Record::new(&record::SMOKE)
             .w("mode", mode)
             .w("place", place)
@@ -101,7 +118,7 @@ mod tests {
 
     fn windows() -> Windows<2> {
         Windows {
-            kept: vec![(4, 10, 10.0), (5, 11, 20.0), (6, 12, 20.0)],
+            kept: vec![(4, 10), (5, 11), (6, 12)],
             passes: vec![(false, 1, 1, 10.0), (true, 2, 2, 40.0)],
         }
     }
@@ -110,21 +127,23 @@ mod tests {
     fn drafted_times_keep_the_last_pass_wall() {
         let w = windows();
         let t = w.times(2, 0);
-        assert_eq!(t.steps, [10.0, 40.0]);
+        assert_eq!(t.step_ms, [10.0, 40.0]);
         assert_eq!(t.counted_ms, 50.0);
-        assert_eq!((t.positions, t.ms), (3, 50.0));
+        assert_eq!((t.positions, t.total_ms), (3, 50.0));
         let exact = w.times(3, 0);
-        assert_eq!(exact.steps, [10.0, 20.0, 20.0]);
+        assert_eq!(exact.step_ms, [10.0, 20.0, 20.0]);
         assert_eq!(exact.counted_ms, 50.0);
     }
 
     #[test]
     fn drafted_warm_counts_tokens_and_keeps_an_overlapping_pass() {
         let w = windows();
-        for (steps, warm) in [(2, 1), (3, 1), (3, 2)] {
+        for (steps, warm) in [(3, 2), (2, 1), (3, 1)] {
             let t = w.times(steps, warm);
             assert_eq!(t.counted_ms, 40.0, "steps={steps}, warm={warm}");
-            assert_eq!((t.positions, t.ms), (3, 50.0));
+            assert_eq!(t.step_ms[warm..].iter().sum::<f64>(), 40.0);
+            assert_eq!(t.step_ms.iter().sum::<f64>(), 50.0);
+            assert_eq!((t.positions, t.total_ms), (3, 50.0));
         }
     }
 
