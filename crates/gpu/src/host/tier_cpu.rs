@@ -90,7 +90,7 @@ impl State {
                 columns = 0;
             }
             if columns != 0
-                && let Some(tier) = self.run.tier()
+                && let Some(tier) = self.run.tier().filter(|tier| tier.covers(layer))
             {
                 drop(
                     model::moe::TierSlots::prefetch_pinned(

@@ -201,7 +201,28 @@ fn node_nvme_host_run(
             .nvme
             .as_ref()
             .expect("the constrained remote node must page");
-        let projected = open.host_plan(&model, &machine).unwrap();
+        let mut projected = open.host_plan(&model, &machine).unwrap();
+        for row in &mut projected.rows {
+            let tensor = &model.tensors[row.tensor];
+            if tensor.layer != Some(1) {
+                continue;
+            }
+            let moved: u64 = row
+                .segments
+                .iter()
+                .filter(|s| s.device == Device::Nvme)
+                .map(|s| s.resident_bytes)
+                .sum();
+            row.segments = vec![Segment {
+                device: Device::Host,
+                format: Format::HostFile,
+                experts: Some(ExpertList::range(1..EXPERTS as u64).unwrap()),
+                resident_bytes: (ROW_BYTES * WIDTH * (EXPERTS - 1)) as u64,
+            }];
+            projected.host.expert_bytes += moved;
+            projected.host.nvme_expert_bytes -= moved;
+            projected.nvme_bytes -= moved;
+        }
         let mut missing = open.clone();
         missing.rows.pop();
         assert!(
@@ -245,6 +266,8 @@ fn node_nvme_host_run(
             )
         };
         let tier = make_tier();
+        assert!(tier.covers(0));
+        assert!(!tier.covers(1));
         let make_run = || {
             HostRun::build(
                 Arc::clone(&file),
@@ -334,6 +357,38 @@ fn node_nvme_host_run(
         let sel = DeviceBuffer::from_host(gpu.stream(), &selected).unwrap();
         let mut out =
             DeviceBuffer::from_host(gpu.stream(), &vec![123.0f32; expected.len()]).unwrap();
+        let host = DeviceBuffer::from_host(gpu.stream(), &[super::super::slots::HOST; 4]).unwrap();
+        for layer in [0, 1] {
+            let mut enqueue_host = || {
+                experts.enqueue_layer(
+                    &gpu,
+                    &weights,
+                    layer,
+                    TierIo {
+                        act: input_view,
+                        sel: &host,
+                        rows: &mut out,
+                        cols: 2,
+                    },
+                )
+            };
+            enqueue_host().unwrap();
+            gpu.stream().synchronize().unwrap();
+            let graph = Graph::capture(gpu.stream(), |_| enqueue_host()).unwrap();
+            drop(enqueue_host);
+            experts.check().unwrap();
+            assert_eq!(
+                out.to_host_vec(gpu.stream()).unwrap(),
+                vec![123.0; 4 * WIDTH]
+            );
+            graph.launch(gpu.stream()).unwrap();
+            gpu.stream().synchronize().unwrap();
+            experts.check().unwrap();
+            assert_eq!(
+                out.to_host_vec(gpu.stream()).unwrap(),
+                vec![123.0; 4 * WIDTH]
+            );
+        }
         let mut enqueue = || {
             experts.enqueue_layer(
                 &gpu,
