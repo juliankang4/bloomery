@@ -254,7 +254,8 @@ impl SeqView for Seq38 {
 /// address whichever is live — the same rule a slot's own captures follow,
 /// each slot's graphs addressing the buffers that were live at their
 /// capture. A pass of several slots leaves a parked slot's rows in its own
-/// buffer by a copy ([`RowsCopy`]).
+/// buffer by a copy ([`RowsCopy`]), or, for the first slot of a pass that
+/// runs no row of slot 0, by walking into that buffer ([`stands_in`]).
 pub struct Slot38 {
     stores: Vec<Store38>,
     ple_ring: DeviceBuffer<f32>,
@@ -5644,7 +5645,9 @@ impl Body38 {
 
     /// Enqueue the pass of `rows` [`Body38::plan_slots`] planned into
     /// `head`, one head of every row, `parked` as there. An eager pass
-    /// needs each slot's plan; a capture records the launches only.
+    /// needs each slot's plan; a capture records the launches only. A pass
+    /// that runs no row of slot 0 leaves slot 0's final-stream rows as they
+    /// stood ([`stands_in`]).
     pub(super) fn enqueue_slots(
         &mut self,
         gpu: &Gpu,
@@ -5670,6 +5673,42 @@ impl Body38 {
                 }
             })?;
         }
+        // The homes are canonical, so the pass arena's final-stream rows are
+        // slot 0's own, where its draft's waiting rows sit. A pass that runs
+        // no row of slot 0 walks into its first slot's own rows instead: slot
+        // 0's stay as its last call left them, and the first slot's land from
+        // row 0, where its copy would put them.
+        let stand_in = rows.first().is_some_and(|r| stands_in(r.slot));
+        let swap = |b: &mut Body38, parked: &mut [&mut Slot38]| -> Result<(), GpuError> {
+            if !stand_in {
+                return Ok(());
+            }
+            let seq = parked.first_mut().ok_or_else(|| no_parked(&rows[0]))?;
+            let arena = [&mut b.s, &mut b.a, &mut b.wa];
+            std::mem::swap(
+                final_streams_mut(&b.plans, arena, TargetRows::Pass),
+                &mut seq.rows_pass,
+            );
+            Ok(())
+        };
+        swap(self, parked)?;
+        let walked = self.walk_slots(gpu, w, head, parked, rows, total);
+        let back = swap(self, parked);
+        walked.and(back)
+    }
+
+    /// [`Body38::enqueue_slots`]'s walk of the pass's `total` rows, each
+    /// parked slot past the first copied to its own final-stream rows.
+    /// The first slot's rows are written in place.
+    fn walk_slots(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        head: &mut Head,
+        parked: &mut [&mut Slot38],
+        rows: &[SlotRange],
+        total: usize,
+    ) -> Result<(), GpuError> {
         let Body38 {
             hybrid,
             plans,
@@ -5707,7 +5746,7 @@ impl Body38 {
         let mut others = parked.iter_mut();
         let mut seqs = Vec::with_capacity(rows.len());
         let mut copies = Vec::new();
-        for (r, rec) in rows.iter().zip(&recs) {
+        for (i, (r, rec)) in rows.iter().zip(&recs).enumerate() {
             let (stores, ple_ring, lane, table) = if r.slot == 0 {
                 live.take().ok_or_else(|| slot_twice(r))?
             } else {
@@ -5719,10 +5758,12 @@ impl Body38 {
                     rope: own,
                     ..
                 } = &mut **others.next().ok_or_else(|| no_parked(r))?;
-                copies.push(RowsCopy {
-                    rows: r.rows.clone(),
-                    to: rows_pass,
-                });
+                if i != 0 {
+                    copies.push(RowsCopy {
+                        rows: r.rows.clone(),
+                        to: rows_pass,
+                    });
+                }
                 (
                     stores.as_mut_slice(),
                     ple_ring,
@@ -5793,9 +5834,11 @@ impl Body38 {
     #[must_use]
     pub fn slots_launches(&self, key: &[(usize, usize)]) -> usize {
         let rows = key.iter().map(|&(_, m)| m).sum();
+        let stand_in = key.first().is_some_and(|&(slot, _)| stands_in(slot));
         self.verify_launches(rows)
             + key.len().saturating_sub(1) * seq_launches(&self.plans)
             + key.iter().filter(|&&(slot, _)| slot != 0).count()
+            - usize::from(stand_in)
     }
 }
 
@@ -5866,6 +5909,14 @@ impl SlotRows for Body38 {
 
 /// What a pass of several slots' refusals name.
 const WHAT_SLOTS: &str = "qwen4exp slots";
+
+/// Whether a pass whose first rows are slot `first`'s runs no row of slot 0
+/// (slot 0, when busy, lays its rows first, [`slot_rows`]): its walk writes
+/// that slot's own final-stream rows in place of the arena's
+/// ([`Body38::enqueue_slots`]), and the slot's copy is not launched.
+fn stands_in(first: usize) -> bool {
+    first != 0
+}
 
 /// The pass's rows `R`, once `rows` tile `0..R` in order from row 0 with
 /// no empty range, slot 0 — when busy — first, and `parked` counts the

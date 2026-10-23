@@ -52,7 +52,7 @@ mod tests {
 
     use super::qwen38::{
         ACTS_ON, Feed38, draft_for_slots, draft_off_for, prompt_cuts, refuse_feed,
-        refuse_lookup_feed, refuse_media_feed, round_keeps_refresh,
+        refuse_lookup_feed, refuse_media_feed,
     };
 
     const STEPS: Feed38 = Feed38 {
@@ -234,63 +234,9 @@ mod tests {
             .expect("the seat's own feed beside every other lever");
     }
 
-    /// Model the pass arena: slot 0 reads it in place, parked slots have a
-    /// private copy, and a partial pass leaves absent slots' row counts intact.
-    fn mixed_refresh(slots: usize, sampled: &[usize], batched: bool) -> Vec<(Vec<u32>, usize)> {
-        let mut arena: Vec<Vec<u32>> = (0..slots).map(|slot| vec![slot as u32 + 1; 8]).collect();
-        let mut waiting = vec![4; slots];
-        let mut seen = vec![(Vec::new(), 0); slots];
-        let greedy: Vec<usize> = (0..slots).filter(|slot| !sampled.contains(slot)).collect();
-        for _ in 0..3 {
-            for (group, width) in [(sampled, 1), (&greedy[..], 4)] {
-                for &slot in group {
-                    let proposal = &arena[slot][..waiting[slot]];
-                    seen[slot].0.extend_from_slice(proposal);
-                    for &id in proposal {
-                        seen[slot].1 += runtime::accepted_rows(&[0, id], &[slot as u32 + 1, 0]) - 1;
-                    }
-                }
-                let shared = batched && round_keeps_refresh(true, false, group.iter().copied());
-                if shared {
-                    let pass: Vec<u32> = group
-                        .iter()
-                        .flat_map(|&slot| std::iter::repeat_n(slot as u32 + 1, width))
-                        .collect();
-                    arena[0][..pass.len()].copy_from_slice(&pass);
-                }
-                for &slot in group {
-                    if slot != 0 || !shared {
-                        arena[slot][..width].fill(slot as u32 + 1);
-                    }
-                    waiting[slot] = width;
-                }
-            }
-        }
-        seen
-    }
-
-    #[test]
-    fn mixed_rounds_keep_slot_zeros_proposals_and_acceptance() {
-        for slots in [3, 4] {
-            for sampled in [&[0, 1][..], &[1, 2][..], &[2, 3][..]] {
-                if sampled.iter().any(|&slot| slot >= slots) {
-                    continue;
-                }
-                let alone = mixed_refresh(slots, sampled, false);
-                assert_eq!(
-                    mixed_refresh(slots, sampled, true),
-                    alone,
-                    "slot 0 refresh across sampled {sampled:?} and greedy calls, slots={slots}"
-                );
-            }
-        }
-        for slots in [2, 4] {
-            assert!(round_keeps_refresh(true, false, 0..slots));
-        }
-        assert!(!round_keeps_refresh(true, false, [1, 2].into_iter()));
-        assert!(round_keeps_refresh(false, false, [1, 2].into_iter()));
-        assert!(round_keeps_refresh(true, true, [1, 2].into_iter()));
-    }
+    // PIN(2026-10-23): no round falls back to keep slot 0's refresh (a pass without slot 0
+    // walks into its first slot's own rows, `Body38::enqueue_slots`), so the arena model of
+    // that rule is gone; gate_qwen4exp_mtp's (z) plain rounds pin slot 0's draft on the card.
 
     /// Every accessor the seat calls on `Levers`, with the levers it reads.
     const READS: &[(&str, &[&str])] = &[

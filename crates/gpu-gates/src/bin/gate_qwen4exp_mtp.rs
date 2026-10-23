@@ -5637,15 +5637,21 @@ mod gate {
     /// rows takes ([`app::mtp::SlotWalks`]), 3 a drafted window of up to 4
     /// rows. A plain pass after a drafted one walks the rows that pass kept,
     /// both slots' together where both are plain, one beside the other's
-    /// drafted window where one is.
-    const PLAIN_ROUNDS: [(Option<usize>, Option<usize>); 8] = [
+    /// drafted window where one is. The passes of slot 1 alone run while
+    /// slot 0's draft waits on rows of the pass arena, which slot 0's next
+    /// pass reads.
+    const PLAIN_ROUNDS: [(Option<usize>, Option<usize>); 12] = [
         (Some(0), Some(0)),
         (Some(3), Some(3)),
         (Some(0), Some(0)),
         (Some(3), Some(3)),
         (Some(0), Some(3)),
         (Some(3), Some(0)),
+        (None, Some(3)),
+        (None, Some(0)),
         (Some(0), Some(0)),
+        (Some(3), Some(3)),
+        (None, Some(3)),
         (Some(3), Some(3)),
     ];
 
@@ -5653,11 +5659,15 @@ mod gate {
     /// slot, then [`PLAIN_ROUNDS`]' passes of the slots each names
     /// ([`app::mtp::pass_slots`]): each slot's ids, kept rows, draft windows
     /// and draft store equal its window run alone ([`capped_run`]). At
-    /// least one pass's store walk takes both slots' rows; under `wide` (the
-    /// real tier, where the shipped draft's proposals are accepted) at least
-    /// one store walk takes more than one row of a slot, the rows a drafted
-    /// pass kept (the fixture's draft has every proposal refused: printed,
-    /// not pinned there).
+    /// least one pass's store walk takes both slots' rows, and at least one
+    /// pass of slot 1 alone runs while slot 0's draft waits on rows of the
+    /// pass arena; the captured pass of slot 1's four rows alone holds the
+    /// body's own count of its launches (`Body38::slots_launches`: it walks
+    /// into slot 1's rows and copies none); under `wide` (the real tier,
+    /// where the shipped draft's proposals are accepted) at least one store
+    /// walk takes more than one row of a slot, the rows a drafted pass kept
+    /// (the fixture's draft has every proposal refused: printed, not pinned
+    /// there).
     fn plain_rounds(
         s: &mut app::Session<Body38>,
         windows: [&[u32]; 2],
@@ -5665,22 +5675,28 @@ mod gate {
         wide: bool,
     ) -> Result<bool, GateError> {
         let (done, off) = slot_rounds(s, windows, &PLAIN_ROUNDS, refs)?;
+        let key = [(1, 4)];
+        let nodes = s.model_mut().capture_slots(&key)?;
+        let own = s.model().body("(z) plain rounds")?.slots_launches(&key);
         // The rows each slot's draft has waiting: its start's step leaves one.
         let mut waiting = [1, 1];
-        let (mut both, mut deep) = (0usize, 0usize);
+        let (mut both, mut alone, mut deep) = (0usize, 0usize, 0usize);
         for (pass, depths) in done.iter().zip(PLAIN_ROUNDS) {
             both += usize::from(depths == (Some(0), Some(0)));
+            alone += usize::from(depths.0.is_none());
             for &(slot, c) in pass {
                 deep += usize::from(half_of(depths, slot) == Some(0) && waiting[slot] > 1);
                 waiting[slot] = c.kept;
             }
         }
         let same = off.is_empty();
-        let ok = same && both > 0 && (!wide || deep > 0);
+        let ok = same && both > 0 && alone > 0 && nodes == own && (!wide || deep > 0);
         println!(
             "(z) plain rounds: {} passes, a plain slot's waiting rows walked in one store walk \
-             of the pass's plain slots; {}; {both} walks took both slots' rows, {deep} walks \
-             took more than one row of a slot{} {}",
+             of the pass's plain slots; {}; {both} walks took both slots' rows, {alone} passes \
+             of slot 1 alone ran beside slot 0's waiting rows, the pass of slot 1's 4 rows alone \
+             holds {nodes} nodes against the body's own {own}, {deep} walks took more than one \
+             row of a slot{} {}",
             PLAIN_ROUNDS.len(),
             alone_runs(&off),
             if wide {

@@ -232,8 +232,8 @@ token or one drafted pass. Where the body runs several slots' rows as one pass, 
 all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 and MiMo-V2.6-Flash (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
 request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows).
 Qwen3.8 also batches sampled steps on a drafting load, with every slot's draft brought up to date in one draft pass
-before the round's pass. A Qwen3.8 step or verify round that leaves an enabled slot 0 draft out runs each slot in
-turn, keeping slot 0's waiting hidden rows intact across the two kinds of call. A
+before the round's pass. A round that leaves slot 0 out runs as one pass too and keeps slot 0's waiting hidden rows
+intact. A
 placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 load, V4.1 with the
 lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
