@@ -542,7 +542,7 @@ where
     ) -> Result<Vec<SlotRange>, GpuError> {
         let n = self.slots();
         let mut out: Vec<SlotRange> = Vec::new();
-        let mut at = 0;
+        let mut at = 0usize;
         for (slot, m) in rows {
             if slot >= n {
                 return Err(GpuError::shape(
@@ -565,19 +565,25 @@ where
                     format!("more than {max_slots} slots in one pass (SlotRows::MAX_SLOTS)"),
                 ));
             }
-            if m > max_rows - at {
+            let end = at
+                .checked_add(m)
+                .ok_or_else(|| GpuError::shape(what, "row count overflow in one pass"))?;
+            if end > max_rows {
                 return Err(GpuError::shape(
                     what,
-                    format!("more than {max_rows} rows in one pass (SlotRows::MAX_ROWS)"),
+                    format!(
+                        "{end} rows in one pass; this body's pass of several slots holds at most \
+                         {max_rows} (SlotRows::MAX_ROWS)"
+                    ),
                 ));
             }
             let pos0 = self.slot_pos(slot, what)?;
             out.push(SlotRange {
                 slot,
-                rows: at..at + m,
+                rows: at..end,
                 pos0,
             });
-            at += m;
+            at = end;
         }
         if out.is_empty() {
             return Err(GpuError::shape(what, "a pass of no slot"));
