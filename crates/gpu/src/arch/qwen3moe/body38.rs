@@ -818,12 +818,12 @@ impl PleHost {
         Ok(hist)
     }
 
-    /// Read a Gemm call's ubatches ahead: `tokens` at `pos`, cut into
-    /// ubatches of at most `rows` ([`ubatch_cut`], the cut the call runs),
-    /// each one's row ids computed now from a clone of the history walked
-    /// as the fills will walk it. The first ubatch's fill reads its own
-    /// rows, the call's one exposed read; each fill then hands the helper
-    /// the next ubatch's ([`PleRead::read`]). On the host nothing is read
+    /// Read a Gemm call's ubatches ahead: `tokens` at `pos`, cut into the
+    /// ubatches `cut` ([`call_units`], the cut the call runs across its
+    /// checkpoints), each one's row ids computed now from a clone of the
+    /// history walked as the fills will walk it. The first ubatch's fill
+    /// reads its own rows, the call's one exposed read; each fill then hands
+    /// the helper the next ubatch's ([`PleRead::read`]). On the host nothing is read
     /// ahead: the fills decode pages the load populated. A call whose rows
     /// the hash refuses reads nothing ahead, and its first fill refuses it
     /// by name. `spans` are the call's image spans as position ranges
@@ -833,7 +833,7 @@ impl PleHost {
         &mut self,
         pos: u32,
         tokens: &[u32],
-        rows: usize,
+        cut: impl IntoIterator<Item = usize>,
         spans: &[Range<usize>],
     ) -> Result<(), GpuError> {
         let Some(read) = &mut self.nvme else {
@@ -844,7 +844,7 @@ impl PleHost {
         let per_token = geo::HIDDEN / self.width;
         let mut hist = self.hist.clone();
         let mut at = 0usize;
-        for m in ubatch_cut(tokens.len(), rows) {
+        for m in cut {
             let Some(p) = u32::try_from(at).ok().and_then(|a| pos.checked_add(a)) else {
                 break;
             };
@@ -3335,8 +3335,9 @@ impl Body38 {
 
     /// Launch the planned pass of `m` rows from `pos` through the batch
     /// port, then the head of its last row into `head` when given; with no
-    /// head and `tapped` (the call's tap reads the pass's rows) the last
-    /// layer's combine alone over them ([`Pass38::finals`]).
+    /// head and `finals` (a reader of the pass's final rows: the call's tap,
+    /// or the checkpoint after it, [`Body38::take_mark`]) the last layer's
+    /// combine alone over them ([`Pass38::finals`]).
     fn walk_pass(
         &mut self,
         gpu: &Gpu,
@@ -3344,7 +3345,7 @@ impl Body38 {
         m: usize,
         pos: u32,
         head: Option<&mut Head>,
-        tapped: bool,
+        finals: bool,
     ) -> Result<(), GpuError> {
         if !(1..=self.a.rows).contains(&m) {
             return Err(GpuError::shape(
@@ -3408,7 +3409,7 @@ impl Body38 {
         planted(plant, Plant::AfterLaunch)?;
         match head {
             Some(h) => prog.head(h),
-            None if tapped => prog.finals(),
+            None if finals => prog.finals(),
             None => Ok(()),
         }
     }
@@ -3478,7 +3479,8 @@ impl Body38 {
 
     /// Launch the planned ubatch of `m` rows from `pos` through the batch
     /// port at its width, then the head of its last row into `head` when
-    /// given; with `tapped` (the call's tap reads the walk's rows) the last
+    /// given; with `finals` (a reader of the walk's final rows: the call's
+    /// tap, or the checkpoint after it, [`Body38::take_mark`]) the last
     /// layer's combine alone first, over every unit the head's mix leaves
     /// ([`Gemm38::finals`]).
     fn walk_gemm(
@@ -3488,7 +3490,7 @@ impl Body38 {
         m: usize,
         pos: u32,
         head: Option<&mut Head>,
-        tapped: bool,
+        finals: bool,
     ) -> Result<(), GpuError> {
         if !(1..=self.wide.rows).contains(&m) {
             return Err(GpuError::shape(
@@ -3557,7 +3559,7 @@ impl Body38 {
         leg.set_timer(wide_timing.as_mut());
         prog.walk(&mut leg)?;
         planted(plant, Plant::AfterLaunch)?;
-        if tapped {
+        if finals {
             prog.finals(head.is_some())?;
         }
         match head {
@@ -3706,6 +3708,37 @@ impl Body38 {
 /// `rows`: [`Body38::ubatch_cut`], and the cut [`GpuModel::prompt38`] runs.
 fn ubatch_cut(n: usize, rows: usize) -> impl Iterator<Item = usize> {
     (0..n.div_ceil(rows)).map(move |i| rows.min(n - i * rows))
+}
+
+/// The units of a prompt call of `n` ids from position `from` on a path of
+/// units of at most `width` rows: each run up to the next of the call's
+/// checkpoint marks past `from` (`marks`, ascending, the call's end the last
+/// of them; none on a load that takes none), else up to the call's end, cut
+/// as [`ubatch_cut`] cuts it. A unit's rows, and whether a checkpoint is
+/// taken after it. The one cut of a call: its walks run it
+/// ([`GpuModel::feed38`]) and its PLE rows are read ahead by it
+/// ([`PleHost::prompt_start`]).
+fn call_units(from: u32, n: usize, width: usize, marks: &[u32]) -> Vec<(usize, bool)> {
+    let (from, end) = (from as usize, from as usize + n);
+    let mut stops: Vec<(usize, bool)> = marks
+        .iter()
+        .map(|&p| (p as usize, true))
+        .filter(|&(p, _)| p > from)
+        .collect();
+    if stops.last().is_none_or(|&(p, _)| p < end) {
+        stops.push((end, false));
+    }
+    let (mut units, mut at) = (Vec::new(), from);
+    for (stop, marked) in stops {
+        let k = (stop - at).div_ceil(width);
+        units.extend(
+            ubatch_cut(stop - at, width)
+                .enumerate()
+                .map(|(i, m)| (m, marked && i + 1 == k)),
+        );
+        at = stop;
+    }
+    units
 }
 
 impl GpuModel<Body38> {
@@ -3937,12 +3970,12 @@ impl GpuModel<Body38> {
     }
 
     /// [`GpuModel::prompt38_with`]'s units ([`GpuModel::feed38`]); while the
-    /// load takes checkpoints ([`Body38::set_checkpoints`]) the call runs as
-    /// the runs between its marks (`Checkpoints::marks`: its start when it
-    /// continues a sequence, every [`CHECKPOINT_EVERY`] positions inside it,
-    /// its end), each on the path the whole call resolved to, a checkpoint
-    /// taken at every mark: a ubatch walk leaves the same bits cut there or
-    /// not, as a pass and a step do. The argmax after the last id.
+    /// load takes checkpoints ([`Body38::set_checkpoints`]) a checkpoint is
+    /// taken at each of the call's marks (`Checkpoints::marks`: its start
+    /// when it continues a sequence, every [`CHECKPOINT_EVERY`] positions
+    /// inside it, its end), the units cut there, each on the path the whole
+    /// call resolved to: a ubatch walk leaves the same bits cut there or not,
+    /// as a pass and a step do. The argmax after the last id.
     fn feed_marked(
         &mut self,
         tokens: &[u32],
@@ -3950,120 +3983,147 @@ impl GpuModel<Body38> {
         mut sink: Option<&mut Prompt38Sink<'_>>,
     ) -> Result<u32, GpuError> {
         const WHAT_M: &str = "qwen4exp prompt checkpoints";
-        let body = self.body(WHAT_M)?;
-        if !body.marks {
-            return self.feed38(tokens, path, sink);
-        }
         let from = self.pos();
         let to = launch_u32(WHAT_M, "positions", tokens.len())
             .ok()
             .and_then(|n| from.checked_add(n))
             .ok_or_else(|| GpuError::shape(WHAT_M, format!("{} ids from {from}", tokens.len())))?;
-        let marks = body.ckpt.marks(from, to);
+        let body = self.body(WHAT_M)?;
+        let marks = match body.marks {
+            true => body.ckpt.marks(from, to),
+            false => Vec::new(),
+        };
+        if path != Prompt38::Step {
+            return self.feed38(tokens, path, &marks, sink);
+        }
+        if marks.is_empty() {
+            return self.feed_steps(tokens, sink);
+        }
         let (mut next, mut at) = (None, from);
         for mark in marks {
             if mark > at {
                 let run = &tokens[(at - from) as usize..(mark - from) as usize];
-                next = Some(self.feed38(run, path, sink.as_deref_mut())?);
+                next = Some(self.feed_steps(run, sink.as_deref_mut())?);
                 at = mark;
             }
-            let pos = self.pos();
-            let (gpu, _, body) = self.body_parts(WHAT_M)?;
-            body.take_mark(gpu.stream(), pos)?;
+            self.mark_here(WHAT_M)?;
         }
         next.ok_or(GpuError::state(WHAT_M, "a mark at the call's end"))
     }
 
-    /// [`GpuModel::prompt38_with`]'s paths once its checks have passed, its
-    /// path resolved and its residency pass open: the resolved `path`'s
-    /// units.
+    /// The checkpoint at the model's position ([`Body38::take_mark`]).
+    fn mark_here(&mut self, what: &'static str) -> Result<(), GpuError> {
+        let pos = self.pos();
+        let (gpu, _, body) = self.body_parts(what)?;
+        body.take_mark(gpu.stream(), pos)
+    }
+
+    /// [`GpuModel::feed_marked`]'s steps: every token's body, one readback
+    /// at the end; under a tap a readback a token, the tap reading each
+    /// token's row where the step left it.
+    fn feed_steps(
+        &mut self,
+        tokens: &[u32],
+        sink: Option<&mut Prompt38Sink<'_>>,
+    ) -> Result<u32, GpuError> {
+        let Some(f) = sink else {
+            return self.step(tokens);
+        };
+        let mut next = None;
+        for &token in tokens {
+            next = Some(self.step(&[token])?);
+            let first = self.pos() - 1;
+            f(self, TargetRows::Step, first, 1)?;
+        }
+        next.ok_or(GpuError::state(
+            "qwen4exp prompt",
+            "a token read after the last step",
+        ))
+    }
+
+    /// [`GpuModel::prompt38_with`]'s passes or ubatches once its checks have
+    /// passed, its path resolved and its residency pass open: the call's
+    /// units ([`call_units`]), a checkpoint taken at each of `marks`
+    /// ([`GpuModel::feed_marked`]), and the head after the last unit alone.
+    /// A unit a checkpoint follows inside the call ends without the head: the
+    /// last layer's combine over its rows when the checkpoint keeps the last
+    /// one (the draft's point row, [`Body38::take_mark`]) or the tap reads
+    /// them, and the fault word read before the checkpoint copies a store.
     fn feed38(
         &mut self,
         tokens: &[u32],
         path: Prompt38,
+        marks: &[u32],
         mut sink: Option<&mut Prompt38Sink<'_>>,
     ) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen4exp prompt";
         let tapped = sink.is_some();
-        match path {
-            Prompt38::Step => {
-                if !tapped {
-                    // The plain call: every token's body, one readback at the
-                    // end.
-                    return self.step(tokens);
-                }
-                // A tap reads each token's row where the step left it.
-                let mut next = None;
-                for &token in tokens {
-                    next = Some(self.step(&[token])?);
-                    let (first, rows) = (self.pos() - 1, 1usize);
-                    if let Some(f) = sink.as_deref_mut() {
-                        f(self, TargetRows::Step, first, rows)?;
-                    }
-                }
-                next.ok_or(GpuError::state(WHAT_P, "a token read after the last step"))
-            }
-            Prompt38::Gemm => {
-                let rows = self.body(WHAT_P)?.wide.rows;
-                // The call's PLE rows are read ahead: the first ubatch's fill
-                // reads its own, each later one's runs under the ubatch
-                // before it ([`PleHost::prompt_start`]).
-                let pos0 = self.pos();
-                {
-                    let (_, _, body) = self.body_parts(WHAT_P)?;
-                    let spans: Vec<_> = body.media.iter().flat_map(MediaRows::positions).collect();
-                    body.ple.prompt_start(pos0, tokens, rows, &spans)?;
-                }
-                let (mut next, mut at) = (None, 0);
-                for m in ubatch_cut(tokens.len(), rows) {
-                    let chunk = &tokens[at..at + m];
-                    at += m;
-                    let last = at == tokens.len();
-                    let pos = self.pos();
-                    {
-                        let (gpu, _, body) = self.body_parts(WHAT_P)?;
-                        body.plan_gemm(gpu.stream(), chunk, pos)?;
-                    }
-                    next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
-                        body.walk_gemm(gpu, w, m, pos, last.then_some(head), tapped)?;
-                        body.stream.walk_done();
-                        Ok(last)
-                    })?;
-                    if let Some(f) = sink.as_deref_mut() {
-                        f(self, TargetRows::Ubatch, pos, m)?;
-                    }
-                }
-                next.ok_or(GpuError::state(
+        let pos0 = self.pos();
+        let body = self.body(WHAT_P)?;
+        let (width, walk) = match path {
+            Prompt38::Gemm => (body.wide.rows, TargetRows::Ubatch),
+            Prompt38::Pass => (PASS_ROWS, TargetRows::Pass),
+            Prompt38::Step | Prompt38::Auto => {
+                return Err(GpuError::state(
                     WHAT_P,
-                    "a token read after the last ubatch",
-                ))
+                    "a path of passes or ubatches `Prompt38::resolve` settles",
+                ));
             }
-            Prompt38::Pass => {
-                let n = tokens.len().div_ceil(PASS_ROWS);
-                let mut next = None;
-                for (i, chunk) in tokens.chunks(PASS_ROWS).enumerate() {
-                    let last = i + 1 == n;
-                    let pos = self.pos();
-                    {
-                        let (gpu, _, body) = self.body_parts(WHAT_P)?;
-                        body.plan_pass(gpu.stream(), chunk, pos)?;
-                    }
-                    let m = chunk.len();
-                    next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
-                        body.walk_pass(gpu, w, m, pos, last.then_some(head), tapped)?;
-                        Ok(last)
-                    })?;
-                    if let Some(f) = sink.as_deref_mut() {
-                        f(self, TargetRows::Pass, pos, m)?;
-                    }
-                }
-                next.ok_or(GpuError::state(WHAT_P, "a token read after the last pass"))
-            }
-            Prompt38::Auto => Err(GpuError::state(
-                WHAT_P,
-                "a path `Prompt38::resolve` settles (it returned `auto`)",
-            )),
+        };
+        let point_row = body.mtp.is_some();
+        let units = call_units(pos0, tokens.len(), width, marks);
+        if path == Prompt38::Gemm {
+            // The call's PLE rows are read ahead: the first ubatch's fill
+            // reads its own, each later one's runs under the ubatch before
+            // it, across the call's checkpoints ([`PleHost::prompt_start`]).
+            let (_, _, body) = self.body_parts(WHAT_P)?;
+            let spans: Vec<_> = body.media.iter().flat_map(MediaRows::positions).collect();
+            body.ple
+                .prompt_start(pos0, tokens, units.iter().map(|&(m, _)| m), &spans)?;
         }
+        if marks.first() == Some(&pos0) {
+            self.mark_here(WHAT_P)?;
+        }
+        let (mut next, mut at) = (None, 0);
+        for (i, &(m, marked)) in units.iter().enumerate() {
+            let chunk = &tokens[at..at + m];
+            at += m;
+            let last = i + 1 == units.len();
+            let point = marked && !last;
+            let finals = tapped || point && point_row;
+            let pos = self.pos();
+            {
+                let (gpu, _, body) = self.body_parts(WHAT_P)?;
+                match path {
+                    Prompt38::Gemm => body.plan_gemm(gpu.stream(), chunk, pos)?,
+                    _ => body.plan_pass(gpu.stream(), chunk, pos)?,
+                }
+            }
+            next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
+                let head = last.then_some(head);
+                match path {
+                    Prompt38::Gemm => {
+                        body.walk_gemm(gpu, w, m, pos, head, finals)?;
+                        body.stream.walk_done();
+                    }
+                    _ => body.walk_pass(gpu, w, m, pos, head, finals)?,
+                }
+                if point && let Some(f) = gpu.fault()? {
+                    return Err(GpuError::fault(WHAT_P, f));
+                }
+                Ok(last)
+            })?;
+            if let Some(f) = sink.as_deref_mut() {
+                f(self, walk, pos, m)?;
+            }
+            if marked {
+                self.mark_here(WHAT_P)?;
+            }
+        }
+        next.ok_or(GpuError::state(
+            WHAT_P,
+            "a token read after the call's last unit",
+        ))
     }
 }
 
@@ -6045,9 +6105,15 @@ mod tests {
         let header = Arc::new(Split::header_only(dir.clone(), &layout).unwrap());
         let mut got =
             PleHost::new(Arc::clone(&header), Some(&stored), 16, 8, Device::Nvme).unwrap();
-        got.prompt_start(0, &tokens, 2, &[]).unwrap();
-        for (i, unit) in tokens.chunks(2).enumerate() {
-            let pos = (i * 2) as u32;
+        // A call with a checkpoint mark inside it (position 4) reads every
+        // unit after its first ahead, across the mark.
+        let units = super::call_units(0, tokens.len(), 2, &[4, 6]);
+        got.prompt_start(0, &tokens, units.iter().map(|&(m, _)| m), &[])
+            .unwrap();
+        let mut at = 0;
+        for (i, &(m, _)) in units.iter().enumerate() {
+            let (pos, unit) = (at as u32, &tokens[at..at + m]);
+            at += m;
             want.hist = want.fill(pos, unit).unwrap();
             got.hist = got.fill(pos, unit).unwrap();
             assert_eq!(got.ids[..got.named], want.ids[..want.named]);
@@ -6057,6 +6123,12 @@ mod tests {
                     .iter()
                     .zip(&want.e)
                     .all(|(g, w)| g.to_bits() == w.to_bits())
+            );
+            let ahead = got.nvme.as_ref().is_some_and(|r| r.flight);
+            assert_eq!(
+                ahead,
+                i + 1 < units.len(),
+                "unit {i}: the next unit read ahead"
             );
         }
         let mut wrong_width = stored.clone();
@@ -6075,5 +6147,39 @@ mod tests {
             .expect("refused");
         assert!(e.to_string().contains("source plane has 79 rows"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A prompt call's units: its runs cut at the checkpoint marks past its
+    /// start, each as the ubatch cut, the unit before each mark marked; with
+    /// no marks one run of the whole call.
+    #[test]
+    fn a_call_cuts_its_units_at_its_marks() {
+        let (t, f) = (true, false);
+        for (from, n, width, marks, want) in [
+            (
+                0,
+                8192,
+                4096,
+                &[4096, 8192][..],
+                &[(4096, t), (4096, t)][..],
+            ),
+            (0, 8192, 4096, &[], &[(4096, f), (4096, f)]),
+            (100, 5000, 4096, &[100, 4096, 5100], &[(3996, t), (1004, t)]),
+            (
+                0,
+                9000,
+                4096,
+                &[4096, 8192, 9000],
+                &[(4096, t), (4096, t), (808, t)],
+            ),
+            (4090, 10, 8, &[4090, 4096, 4100], &[(6, t), (4, t)]),
+            (0, 10, 8, &[10], &[(8, f), (2, t)]),
+        ] {
+            assert_eq!(
+                super::call_units(from, n, width, marks),
+                want,
+                "{n} ids from {from}, {width} wide, marks {marks:?}"
+            );
+        }
     }
 }
