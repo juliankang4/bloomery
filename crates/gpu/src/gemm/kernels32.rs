@@ -1212,7 +1212,7 @@ mod gemm32_kernels {
         // SAFETY: the checked launch supplies 256 converged threads, the grid,
         // aligned activations and the weight and output spans in the contract.
         unsafe {
-            bf16_mma_body::<_, false>(
+            bf16_mma_body(
                 ByteRows::<Mxfp8Bytes>::new(qs, e),
                 x,
                 rows,
@@ -1254,7 +1254,7 @@ mod gemm32_kernels {
         // SAFETY: the checked launch supplies 256 converged threads, the grid,
         // aligned activations and the weight and output spans in the contract.
         unsafe {
-            bf16_mma_body::<_, false>(
+            bf16_mma_body(
                 ByteRows::<Fp8B128Bytes>::new(qs, e),
                 x,
                 rows,

@@ -5,7 +5,6 @@
 # cfg: bloomery_nvfp4_mma
 
 # binary entry spill jit_local
-generate_ds41 bf16_mma_gemm_columns 0 0
 # PIN(2026-10-23): measured spill and JIT local bytes with ptxas 13.3.73, sm_121a, GB10 cc 12.1, driver 595.84.
 generate_ds41 hc_gated_up_mma_mix_4 260 96
 generate_ds41 mamba2_steps 0 0

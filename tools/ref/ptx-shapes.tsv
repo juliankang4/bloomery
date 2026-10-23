@@ -29,9 +29,6 @@ generate_ds41   attn_out_gate_sigmoid                    0           0
 generate_ds41   bf16_gemv                                0           0
 generate_ds41   bf16_gemv_ids                            0           0
 generate_ds41   bf16_mma_gemm                            0           0
-# PIN(2026-10-23): the new column-independent entry uses sm_86 ptxas 13.3.73 spill/stack (0/0).
-# cc8.6 JIT was not measured; this new entry's jit_local pin uses the measured ptxas stack frame.
-generate_ds41   bf16_mma_gemm_columns                    0           0
 generate_ds41   bf16_tile_gemm                           0           0
 generate_ds41   cand_block_max                           0           0
 generate_ds41   cand_compact                             0           0
@@ -217,7 +214,10 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # PIN(2026-10-23): 24 -> 920 spill bytes, 16 -> 136 stack frame bytes (sm_86 ptxas 13.3.73; cc8.6
 # JIT still not measured): the 128 by 128 MMA tile gives each thread 64 cells, and the fused mix
 # holds half of them while it mixes the other half. The entry runs only on GB10.
-generate_ds41   hc_gated_up_mma_mix_4                  920         136
+# PIN(2026-10-23): 920 -> 0 spill bytes (sm_86 ptxas 13.3.73, read on GB10) after the dense MMA tile
+# moved its cell marking behind the replay vote; jit_local keeps the stack-frame pin above (the cc8.6
+# JIT and the new stack frame were not measured).
+generate_ds41   hc_gated_up_mma_mix_4                    0         136
 generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0

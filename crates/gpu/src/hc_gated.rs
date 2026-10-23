@@ -1810,8 +1810,7 @@ mod hc_wide_kernels {
         };
         // SAFETY: the checked launch supplies the shared allocation, 256 threads,
         // the MMA grid, aligned bottleneck columns and the complete BF16 weight.
-        let Some(tile) =
-            (unsafe { bf16_mma_tile::<_, true>(rows, lo, wide as u32, RANK as u32, m, sh) })
+        let Some(mut tile) = (unsafe { bf16_mma_tile(rows, lo, wide as u32, RANK as u32, m, sh) })
         else {
             return;
         };
@@ -1822,7 +1821,7 @@ mod hc_wide_kernels {
             unsafe { tile.store::<true>(&mut g, wide, m as usize) };
             thread::sync_threads();
             // SAFETY: stores are published and the exact owner uses the same spans.
-            unsafe { tile.replay::<_, true>(rows, lo, (wide, RANK, m as usize), &mut g, sh) };
+            unsafe { tile.replay(rows, lo, (wide, RANK, m as usize), &mut g, sh) };
             // SAFETY: replay finished; g, xn and mixed cover this tile.
             unsafe { mma_mix::<true>(&tile, xn, &mut g, hid, m, fault, &mut mixed, scratch) };
         } else {
@@ -2230,10 +2229,9 @@ impl HcWideKernels {
                     },
                 )?;
             }
-            HcMatrix::Bf16(w) => {
-                a.q8f32
-                    .enqueue_bf16_prompt::<true>(stream, w, &s.xn, m, &mut s.down)?
-            }
+            HcMatrix::Bf16(w) => a
+                .q8f32
+                .enqueue_bf16_prompt(stream, w, &s.xn, m, &mut s.down)?,
         }
         if let Some(inj) = a.w.inject {
             a.gemm.enqueue_f32_tile(stream, inj, &s.xn, m, &mut s.inj)?;
@@ -2283,9 +2281,7 @@ impl HcWideKernels {
                     },
                 )?;
             }
-            HcMatrix::Bf16(w) => a
-                .q8f32
-                .enqueue_bf16_prompt::<true>(stream, w, &s.lo, m, &mut s.g)?,
+            HcMatrix::Bf16(w) => a.q8f32.enqueue_bf16_prompt(stream, w, &s.lo, m, &mut s.g)?,
         }
         let prep = self.module.prepare_hc_gated_mix_4(LaunchConfig1D::new(
             launch_u32(what, "mix grid", z.mixed.div_ceil(GLUE_THREADS as usize))?,

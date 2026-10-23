@@ -6847,7 +6847,7 @@ mod gate {
                             if exact {
                                 gpu.q8f32().enqueue_bf16_tile(s, &w, &x, n, y)
                             } else {
-                                gpu.q8f32().enqueue_bf16_mma::<false>(s, &w, &x, n, y)
+                                gpu.q8f32().enqueue_bf16_mma(s, &w, &x, n, y)
                             }
                         } else {
                             let (qs, mx, fp) = byte_planes.as_ref().unwrap();
@@ -6892,8 +6892,8 @@ mod gate {
                         let mut exact = DeviceBuffer::from_host(stream, &vec![SENT; y.len()])?;
                         enqueue(stream, true, &mut exact)?;
                         let exact = exact.to_host_vec(stream)?;
-                        // The edge's row and column hold the exceptional operands, so
-                        // their cells are the exact tile's.
+                        // PIN(2026-10-23): healthy cells retain MMA values; only exceptional rows and
+                        // columns match the exact tile. The cells fixture below pins that distinction.
                         let same = eager[..rows * n]
                             .iter()
                             .zip(&exact)
@@ -6990,9 +6990,7 @@ mod gate {
                                 None if exact => {
                                     gpu.q8f32().enqueue_bf16_tile(stream, &w, &x, n, &mut y)?
                                 }
-                                None => gpu
-                                    .q8f32()
-                                    .enqueue_bf16_mma::<false>(stream, &w, &x, n, &mut y)?,
+                                None => gpu.q8f32().enqueue_bf16_mma(stream, &w, &x, n, &mut y)?,
                                 Some((e, scales)) => {
                                     let weight = E4m3Weight { qs: &qs, e, scales };
                                     if exact {
@@ -7031,7 +7029,7 @@ mod gate {
             let mut y = DeviceBuffer::<f32>::zeroed(stream, 64)?;
             let refused = matches!(
                 gpu.q8f32()
-                    .enqueue_bf16_mma::<false>(stream, &w, &x, 1, &mut y),
+                    .enqueue_bf16_mma(stream, &w, &x, 1, &mut y),
                 Err(e) if e.to_string().contains("is not 16-byte aligned")
             );
             println!(

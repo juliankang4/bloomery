@@ -43,7 +43,8 @@
 //!   are staged), BF16 the same tile over widened words (`bf16_tile_gemm`).
 //!   On GB10, BF16 and the E4M3 formats instead use BF16 tensor-core operands
 //!   with F32 accumulation (`bf16_mma_gemm`, `mxfp8_mma_gemm`, `fp8_b128_mma_gemm`);
-//!   exceptional operands replay the exact F32 tile within that kernel.
+//!   a cell whose row or column holds an exceptional operand replays the exact
+//!   F32 tile within that kernel, and every other cell keeps its MMA value.
 //!   A site's weight is the resident tensor of its name, rows of it (a part
 //!   of a weight joined at load), or, for a K-quant, the words a caller
 //!   holds ([`SiteWeight`]). NVFP4 has no wide GEMM and is refused here by
@@ -1040,10 +1041,9 @@ pub fn gemm(
                     g32()?.enqueue_e4m3_mma(stream, t, f32_rows()?, m, y)
                 }
                 Planes::E4m3(t) => g32()?.enqueue_e4m3_tile(stream, t, f32_rows()?, m, y),
-                Planes::Bf16(t) => {
-                    gpu.q8f32()
-                        .enqueue_bf16_prompt::<false>(stream, t, f32_rows()?, m, y)
-                }
+                Planes::Bf16(t) => gpu
+                    .q8f32()
+                    .enqueue_bf16_prompt(stream, t, f32_rows()?, m, y),
             })
         }
         SiteTy::Q5_0 => {

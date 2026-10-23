@@ -462,7 +462,9 @@ mod gate {
             "hc_gated_lo_4x320",
             "hc_gated_mix_4",
             "hc_gated_up_mma_mix_4",
-            "bf16_mma_gemm_columns",
+            // PIN(2026-10-23): bf16_mma_gemm_columns is gone: bf16_mma_gemm keeps every
+            // cell to its own row and column, so the HC prompt products run it.
+            "bf16_mma_gemm",
         ])?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
@@ -1127,7 +1129,7 @@ mod gate {
             && m > MAX_COLS
         {
             // Materialize the unfused product for the existing independent glue oracle.
-            c.q8.enqueue_bf16_prompt::<true>(st, up, &w.scratch.lo, m, &mut w.scratch.g)?;
+            c.q8.enqueue_bf16_prompt(st, up, &w.scratch.lo, m, &mut w.scratch.g)?;
         }
         let s = &w.scratch;
         Ok(WideOut {
@@ -1316,7 +1318,7 @@ mod gate {
             let weight = DeviceTensor::upload(st, &words, rows, k / 2)?;
             let x = DeviceBuffer::from_host(st, &input)?;
             let mut y = DeviceBuffer::from_host(st, &vec![f32::NAN; rows * n])?;
-            c.q8.enqueue_bf16_prompt::<true>(st, &weight, &x, n, &mut y)?;
+            c.q8.enqueue_bf16_prompt(st, &weight, &x, n, &mut y)?;
             let actual = y.to_host_vec(st)?;
             let cells = actual.iter().enumerate().all(|(i, value)| {
                 let (row, col) = (i % rows, i / rows);
