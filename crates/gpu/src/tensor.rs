@@ -916,11 +916,6 @@ mod tests {
         };
         let mut pin =
             cuda_core::PinnedHostBuffer::<u8>::zeroed(&ctx, PLANES * width).expect("pinned");
-        let len = pin.len();
-        // SAFETY: `pin` is page-locked memory of the device's context, `len`
-        // bytes of it; nothing touches it before the synchronize below.
-        unsafe { dtoh_2d(&stream, &dev, 0, pin.as_mut_ptr(), len, shape) }.expect("a 2-D read");
-        stream.synchronize().expect("the read lands");
         // The plane-by-plane bytes, worked out from the values.
         let by_plane: Vec<u8> = (0..PLANES)
             .flat_map(|p| {
@@ -929,30 +924,35 @@ mod tests {
                     .flat_map(|v| v.to_ne_bytes())
             })
             .collect();
-        assert_eq!(pin.as_slice().len(), PLANES * width, "the bytes moved");
-        assert_eq!(
-            pin.as_slice(),
-            &by_plane[..],
-            "the bytes of the planes, one by one"
-        );
-        let mut back = DeviceBuffer::from_host(&stream, &vec![GAP; PLANES * STRIDE])
-            .expect("a poisoned store");
-        // SAFETY: `pin` holds `len` readable bytes and is neither written nor
-        // freed before the synchronize below.
-        unsafe { htod_2d(&stream, &mut back, 0, pin.as_ptr(), len, shape) }.expect("a 2-D write");
-        stream.synchronize().expect("the write lands");
-        let got = back.to_host_vec(&stream).expect("the store");
-        for p in 0..PLANES {
-            let plane = &got[p * STRIDE..(p + 1) * STRIDE];
-            assert_eq!(
-                &plane[..LEN],
-                &on_card[p * STRIDE..p * STRIDE + LEN],
-                "plane {p}"
-            );
-            assert!(
-                plane[LEN..].iter().all(|&v| v == GAP),
-                "plane {p} written past its width"
-            );
+        let mut pageable = vec![0xA5u8; PLANES * width];
+        for host in [pageable.as_mut_slice(), pin.as_mut_slice()] {
+            let len = host.len();
+            // SAFETY: `host` holds `len` writable bytes; nothing touches or
+            // frees them before the synchronize below.
+            unsafe { dtoh_2d(&stream, &dev, 0, host.as_mut_ptr(), len, shape) }
+                .expect("a 2-D read");
+            stream.synchronize().expect("the read lands");
+            assert_eq!(host, &by_plane[..], "the bytes of the planes, one by one");
+            let mut back = DeviceBuffer::from_host(&stream, &vec![GAP; PLANES * STRIDE])
+                .expect("a poisoned store");
+            // SAFETY: `host` holds `len` readable bytes and is neither written
+            // nor freed before the synchronize below.
+            unsafe { htod_2d(&stream, &mut back, 0, host.as_ptr(), len, shape) }
+                .expect("a 2-D write");
+            stream.synchronize().expect("the write lands");
+            let got = back.to_host_vec(&stream).expect("the store");
+            for p in 0..PLANES {
+                let plane = &got[p * STRIDE..(p + 1) * STRIDE];
+                assert_eq!(
+                    &plane[..LEN],
+                    &on_card[p * STRIDE..p * STRIDE + LEN],
+                    "plane {p}"
+                );
+                assert!(
+                    plane[LEN..].iter().all(|&v| v == GAP),
+                    "plane {p} written past its width"
+                );
+            }
         }
         // From a byte offset: the last two planes only.
         let mut tail = cuda_core::PinnedHostBuffer::<u8>::zeroed(&ctx, 2 * width).expect("pinned");

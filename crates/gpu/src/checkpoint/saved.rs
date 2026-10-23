@@ -938,7 +938,9 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_a_state_goes_and_comes_back() {
-        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let gpu = crate::Gpu::new().expect("CUDA device 0");
+        let ctx = Arc::clone(gpu.context());
+        let stream = gpu.stream_handle();
         let who = Identity {
             arch: "test",
             file: PathBuf::from("/x"),
@@ -954,7 +956,23 @@ mod tests {
             c.take(&stream, 3, &mut [&mut rec]).expect("a take at 3"),
             runtime::seqstate::Take::Copy { .. }
         ));
-        rec.copy_from_host(&stream, &[5.0; 4]).expect("rec");
+        let values = [5.0f32, -0.0, 7.0, -2.0];
+        rec.copy_from_host(&stream, &values).expect("rec");
+        let token = |rec: &DeviceBuffer<f32>| {
+            let mut out = DeviceBuffer::<u32>::zeroed(&stream, 3).expect("token and fault");
+            gpu.elem()
+                .enqueue_argmax_finite_fault(
+                    &stream,
+                    rec,
+                    rec.len(),
+                    gpu.fault_sink(crate::LAYER_HEAD),
+                    &mut out,
+                )
+                .expect("the next token");
+            out.to_host_vec(&stream).expect("token and fault")
+        };
+        let next = token(&rec);
+        assert_eq!(next[0], 2, "the largest logit");
         let s = {
             let mut spans = [Spans::planes(&mut kv, 2, 16, 10).expect("spans")];
             let lent = Lent {
@@ -964,6 +982,14 @@ mod tests {
             SeqState::save(&stream, who.clone(), 5, &lent, 'c', vec![(3, 'p')], &c).expect("a save")
         };
         assert_eq!(s.bytes(), 2 * 10 * 2 + 2 * 16);
+        assert_eq!(
+            s.host.recurrent()[..4]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            values.map(f32::to_bits),
+            "a save keeps recurrent bits, including signed zero"
+        );
         assert_eq!(
             (s.keep_point(4), s.keep_point(2), s.keep_point(9)),
             (3, 0, 5)
@@ -1005,7 +1031,15 @@ mod tests {
         assert_eq!(&back[..10], &plane[..10]);
         assert_eq!(&back[16..26], &plane[16..26]);
         assert_eq!(back[10], 9, "a row past the positions is not carried");
-        assert_eq!(rec.to_host_vec(&stream).expect("rec"), [5.0; 4]);
+        assert_eq!(
+            rec.to_host_vec(&stream)
+                .expect("rec")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            values.map(f32::to_bits)
+        );
+        assert_eq!(token(&rec), next, "the resumed next token and fault bits");
         assert_eq!(d.positions(), [3]);
         d.cut(3, 5).expect("a cut to the adopted point");
         d.apply(&stream, &mut [&mut rec]).expect("its restore");
