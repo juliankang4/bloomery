@@ -5,7 +5,11 @@
 # cfg: bloomery_nvfp4_mma
 
 # binary entry spill jit_local
+generate_ds41 bf16_mma_gemm_columns 0 0
+# PIN(2026-10-23): measured spill and JIT local bytes with ptxas 13.3.73, sm_121a, GB10 cc 12.1, driver 595.84.
+generate_ds41 hc_gated_up_mma_mix_4 260 96
 generate_ds41 mamba2_steps 0 0
+generate_ds41 nvfp4_gemv_sel_f32 0 0
 # PIN(2026-10-23): measured on sm_121a, GB10, driver 595.84, CUDA 13.3.1. Shared GEMM epilogues retain exceptional range; the native 4K pair showed no throughput loss.
 generate_ds41 raon_hc_route 0 112
 generate_ds41 add 0 0

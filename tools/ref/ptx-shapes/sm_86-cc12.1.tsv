@@ -15,6 +15,7 @@ generate_ds41   argmax_finite_fault                      0           0
 generate_ds41   argmax_p_rows_fault                      0           0
 generate_ds41   argmax_rows_fault                        0           0
 generate_ds41   argmax_rows_finite_fault                 0           0
+generate_ds41   attn_out_gate_sigmoid                    0           0
 generate_ds41   bf16_gemv                                0           0
 generate_ds41   bf16_gemv_ids                            0           0
 generate_ds41   bf16_mma_gemm                            0           0
@@ -26,6 +27,7 @@ generate_ds41   cand_remap                               0           0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives cand_select 64 registers (no register bound in the PTX) and keeps 8 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv).
 generate_ds41   cand_select                              0           8
 generate_ds41   card_sel                                 0           0
+generate_ds41   dflash_conv                              0           0
 generate_ds41   dflash_expert_down                       0           0
 generate_ds41   dflash_expert_gate_up                    0           0
 generate_ds41   dflash_quantize_q8_1                     0           0
@@ -51,6 +53,7 @@ generate_ds41   ds41_expert_gate_up                      0           0
 generate_ds41   ds41_expert_gate_up_tiles                0         144
 generate_ds41   ds41_ffn_card_acc                        0           0
 generate_ds41   ds41_ffn_card_acc_10                     0           0
+generate_ds41   ds41_ffn_card_acc_4                      0           0
 generate_ds41   ds41_ffn_card_acc_8                      0           0
 generate_ds41   ds41_ffn_card_acc_8_tier                 0           0
 generate_ds41   ds41_ffn_card_acc_tier                   0           0
@@ -58,6 +61,7 @@ generate_ds41   ds41_ffn_handoff                         0           0
 generate_ds41   ds41_ffn_handoff_10                      0           0
 generate_ds41   ds41_ffn_handoff_10_cols                 0           0
 generate_ds41   ds41_ffn_handoff_10_cols_tier            0           0
+generate_ds41   ds41_ffn_handoff_4                       0           0
 generate_ds41   ds41_ffn_handoff_8                       0           0
 generate_ds41   ds41_ffn_handoff_8_tier                  0           0
 generate_ds41   ds41_ffn_handoff_tier                    0           0
@@ -175,8 +179,10 @@ generate_ds41   gqa_flash_seg_mma_256                    0           0
 generate_ds41   gqa_flash_seg_mma_256_p12_sel            0           0
 generate_ds41   gqa_flash_seg_mma_256_p4                 0           0
 generate_ds41   gqa_flash_seg_mma_256_q8                 0           0
+generate_ds41   gqa_flash_seg_mma_p16_blocks             0           0
 generate_ds41   gqa_flash_seg_mma_q8                     0           0
 generate_ds41   gqa_flash_seg_mma_rows                   0           0
+generate_ds41   gqa_flash_seg_p4_ring                    0           0
 generate_ds41   gqa_out_gate_f32                         0           0
 generate_ds41   gqa_prefill_flash                        0           0
 generate_ds41   gqa_prefill_flash_256                    0           0
@@ -204,10 +210,12 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # generate_ds41 (gpu,deepseek41): 24 spill bytes and 32 driver-JIT local bytes per thread.
 # PIN(2026-10-23): 24 -> 920 spill bytes, 32 -> 96 driver-JIT local bytes: the 128 by 128 MMA tile
 # gives each thread 64 cells, and the fused mix holds half of them while it mixes the other half.
+generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mma_mix_4                  920          96
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
 generate_ds41   head_norm_neox_append                    0           0
+generate_ds41   head_norm_neox_append_128_partial        0           0
 generate_ds41   head_norm_neox_append_256                0           0
 generate_ds41   head_norm_neox_append_256_q8             0           0
 generate_ds41   head_norm_neox_append_256_whole          0           0
@@ -229,8 +237,10 @@ generate_ds41   iq4_xs_gate_up_sel                       0           0
 generate_ds41   iq4_xs_gemv_sel                          0           0
 generate_ds41   iq4_xs_rows                              0           0
 generate_ds41   kda_conv_prep                            0           0
+generate_ds41   kda_conv_prep_sp2                        0           0
 generate_ds41   kda_delta                                0           0
 generate_ds41   kda_delta_lanes                          0           0
+generate_ds41   kda_write_gate                           0           0
 generate_ds41   kpool_score                              0           0
 generate_ds41   kq_card_gather                           0           0
 generate_ds41   kq_gate_up_act_q4k                       0           0
@@ -245,7 +255,10 @@ generate_ds41   kq_gate_up_act_q8_0                      0           0
 generate_ds41   kv_append                                0           0
 generate_ds41   kv_append_pos_buf                        0           0
 generate_ds41   kv_norm_rope_append                      0           0
+generate_ds41   latent_extra_rms_append                  0           0
 generate_ds41   latent_rms_append                        0           0
+generate_ds41   mamba2_conv_rows                         0           0
+generate_ds41   mamba2_ssd                               0           0
 generate_ds41   mimo2_router                             0           0
 generate_ds41   mimo2_router_pick                        0           0
 generate_ds41   moe_combine                              0           0
@@ -253,6 +266,8 @@ generate_ds41   mtp_input                                0           0
 generate_ds41   mxfp4_gate_up_sel                        0           0
 generate_ds41   mxfp4_gemv_sel                           0           0
 generate_ds41   mxfp8_gemv                               0           0
+# PIN(2026-10-23): measured spill and JIT local bytes with ptxas 13.3.73, sm_86, GB10 cc 12.1, driver 595.84.
+generate_ds41   mxfp8_gemv_ids                          28           0
 generate_ds41   mxfp8_gemv_mcol                          0           0
 generate_ds41   mxfp8_mma_gemm                           0           0
 generate_ds41   mxfp8_tile_gemm                          0           0
@@ -275,6 +290,7 @@ generate_ds41   q3k_gemv_groups                          0           0
 generate_ds41   q3k_gemv_heads_pair                      0           0
 generate_ds41   q3k_gemv_sel                             0           0
 generate_ds41   q3k_quantize_q8_1                        0           0
+generate_ds41   q3k_quantize_q8_1_relu_sqr               0           0
 generate_ds41   q4k_gemv                                 0           0
 generate_ds41   q4k_gemv_mcol                            0           0
 generate_ds41   q4k_gemv_prefetch                        0           0
@@ -288,11 +304,14 @@ generate_ds41   q5_1_gemv                                0           0
 generate_ds41   q5_1_gemv_sel                            0           0
 generate_ds41   q5_q8_1_quantize_pair                    0           0
 generate_ds41   q5_quantize_q8                           0           0
+generate_ds41   q5_quantize_q8_rep                       0           0
 generate_ds41   q5_quantize_q8_sel                       0           0
+generate_ds41   q5_quantize_q8_sel_relu_sqr              0           0
 generate_ds41   q5k_gemv_sel                             0           0
 generate_ds41   q5k_gemv_sel_at                          0           0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives q5k_gemv_tiles 64 registers (.minnctapersm 4: 4 blocks of 256 threads an SM) and keeps 104 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv).
 generate_ds41   q5k_gemv_tiles                           0         104
+generate_ds41   q6k_gate_up_sel                          0           0
 generate_ds41   q6k_gemv                                 0           0
 generate_ds41   q6k_gemv_ids                            0           0
 generate_ds41   q6k_gemv_ids_mcol                       0           0
@@ -300,6 +319,7 @@ generate_ds41   q6k_gemv_prefetch                        0           0
 generate_ds41   q6k_gemv_sel                             0           0
 generate_ds41   q6k_gemv_sel_at                          0           0
 generate_ds41   q6k_gemv_sel_prefetch                    0           0
+generate_ds41   q6k_heads_f32                            0           0
 generate_ds41   q8_0_gemv                                0           0
 generate_ds41   q8_0_gemv_heads                          0           0
 generate_ds41   q8_0_gemv_heads_mcol                     0           0
@@ -350,9 +370,30 @@ generate_ds41   qwen3moe_router_norm_m_prefetch          0           0
 generate_ds41   qwen3moe_router_norm_prefetch            0           0
 generate_ds41   qwen3moe_router_route                    0           0
 generate_ds41   qwen3moe_token_major                     0           0
+generate_ds41   raon_hc_fold                             0           0
+generate_ds41   raon_hc_mean                             0           0
+generate_ds41   raon_hc_mix                              0           0
+generate_ds41   raon_hc_post                             0           0
+# PIN(2026-10-23): measured spill and JIT local bytes with ptxas 13.3.73, sm_86, GB10 cc 12.1, driver 595.84.
+generate_ds41   raon_hc_route                            0         112
+generate_ds41   raon_join_qkv                            0           0
+generate_ds41   raon_row_window                          0           0
+generate_ds41   relu_sqr_quant32                         0           0
 generate_ds41   rms_norm                                 0           0
 generate_ds41   rope                                     0           0
 generate_ds41   router_topk                              0           0
+generate_ds41   sel_score                                0           0
+generate_ds41   sel_topk_merge                           0           0
+generate_ds41   sel_topk_part                            0           0
+generate_ds41   sigmoid_128_4_router                     0           0
+generate_ds41   sigmoid_128_4_router_pick                0           0
+generate_ds41   sigmoid_128_6_router                     0           0
+generate_ds41   sigmoid_128_6_router_pick                0           0
+generate_ds41   sigmoid_320_8_router                     0           0
+generate_ds41   sigmoid_320_8_router_pick                0           0
+generate_ds41   sigmoid_rows                             0           0
+generate_ds41   situ_rows                                0           0
+generate_ds41   softplus_rows                            0           0
 generate_ds41   swiglu                                   0           0
 generate_ds41   swiglu_act_quant32                       0           0
 generate_ds41   swiglu_quant32                           0           0
@@ -367,6 +408,7 @@ gate_qwen3vl_tower   vis_add_f32                        0           0
 gate_qwen3vl_tower   vis_attn                           0           0
 gate_qwen3vl_tower   vis_attn_group                     0           0
 gate_qwen3vl_tower   vis_attn_h72                       0           0
+gate_qwen3vl_tower   vis_attn_h80                       0           0
 gate_qwen3vl_tower   vis_clamp_f32                      0           0
 gate_qwen3vl_tower   vis_gelu_erf                       0           0
 gate_qwen3vl_tower   vis_gelu_tanh                      0           0
@@ -377,7 +419,9 @@ gate_qwen3vl_tower   vis_layer_norm                     0           0
 gate_qwen3vl_tower   vis_mean_groups                    0           0
 gate_qwen3vl_tower   vis_pool_order_f32                 0           0
 gate_qwen3vl_tower   vis_pos_bilinear                   0           0
+gate_qwen3vl_tower   vis_pos_half                       0           0
 gate_qwen3vl_tower   vis_position_rows                  0           0
+gate_qwen3vl_tower   vis_relu_sq                        0           0
 gate_qwen3vl_tower   vis_rms_norm                       0           0
 gate_qwen3vl_tower   vis_rms_norm_f32                   0           0
 gate_qwen3vl_tower   vis_rope2d                         0           0
