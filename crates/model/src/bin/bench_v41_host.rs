@@ -272,8 +272,6 @@ unsafe extern "C" {
 
 /// `MADV_WILLNEED` in the Linux UAPI (`asm-generic/mman-common.h`).
 const MADV_WILLNEED: c_int = 3;
-/// `MADV_HUGEPAGE`, same header.
-const MADV_HUGEPAGE: c_int = 14;
 /// `MADV_COLLAPSE`, same header: collapse a range into huge pages now.
 const MADV_COLLAPSE: c_int = 25;
 /// `PROT_READ | PROT_WRITE` (`asm-generic/mman-common.h`).
@@ -2321,19 +2319,9 @@ impl ThpCopy {
             len,
             at: Vec::new(),
         };
-        // SAFETY: `lead + len` rounded up to a huge page is at most `map_len`,
-        // so the range lies inside the mapping just made; HUGEPAGE changes only
-        // how the kernel backs pages not yet touched, and none is.
-        let rc = unsafe {
-            madvise(
-                map.wrapping_byte_add(lead),
-                len.next_multiple_of(HUGE_PAGE),
-                MADV_HUGEPAGE,
-            )
-        };
-        if rc != 0 {
-            return Err(format!("madvise(HUGEPAGE): {}", std::io::Error::last_os_error()).into());
-        }
+        // SAFETY: the rounded span lies inside the owned private anonymous mapping.
+        unsafe { os::advise_huge(map.wrapping_byte_add(lead), len.next_multiple_of(HUGE_PAGE)) }
+            .map_err(|e| format!("madvise(HUGEPAGE): {e}"))?;
         let t0 = Instant::now();
         let data = copy.data_mut();
         for (layer, ranges) in mapped.iter().zip(&at) {

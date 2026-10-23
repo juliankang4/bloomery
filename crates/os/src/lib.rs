@@ -770,6 +770,45 @@ pub unsafe fn advise_populate(_addr: *mut libc::c_void, _len: usize) -> Result<(
     })
 }
 
+/// The platform's huge-page advice for `addr .. addr + len`: back it with
+/// huge pages where the kernel can, so that its first writes fault once a
+/// huge page instead of once a base page.
+///
+/// Linux: `madvise(MADV_HUGEPAGE)`. macOS: the platform has no such advice,
+/// so the call is refused by name.
+///
+/// # Safety
+/// `addr .. addr + len` must be whole pages of private anonymous memory the
+/// caller owns.
+#[cfg(target_os = "linux")]
+pub unsafe fn advise_huge(addr: *mut libc::c_void, len: usize) -> Result<(), OsError> {
+    // SAFETY: the caller's contract above; MADV_HUGEPAGE changes how the
+    // pages are backed, never what they hold.
+    let rc = unsafe { libc::madvise(addr, len, libc::MADV_HUGEPAGE) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(OsError::Io(std::io::Error::last_os_error()))
+    }
+}
+
+/// The platform's huge-page advice for `addr .. addr + len`: back it with
+/// huge pages where the kernel can, so that its first writes fault once a
+/// huge page instead of once a base page.
+///
+/// Linux: `madvise(MADV_HUGEPAGE)`. macOS: the platform has no such advice,
+/// so the call is refused by name.
+///
+/// # Safety
+/// `addr .. addr + len` must be whole pages of private anonymous memory the
+/// caller owns.
+#[cfg(target_os = "macos")]
+pub unsafe fn advise_huge(_addr: *mut libc::c_void, _len: usize) -> Result<(), OsError> {
+    Err(OsError::Unsupported {
+        call: "madvise(MADV_HUGEPAGE)",
+    })
+}
+
 /// Fault the pages of `addr .. addr + len` in.
 ///
 /// `advise` is the platform's populate advice call. A refusal that names the
@@ -1136,6 +1175,50 @@ mod tests {
         assert_eq!(got, Populated::Advised);
         #[cfg(target_os = "macos")]
         assert_eq!(got, Populated::Touched);
+    }
+
+    /// Linux takes the huge-page advice for whole pages of anonymous memory;
+    /// macOS, which has no such advice, refuses it by name.
+    #[test]
+    fn the_huge_page_advice_is_taken_where_the_platform_has_it() {
+        let span = Page::new(4 << 20);
+        // SAFETY: the span is the page-aligned allocation above, whole pages
+        // of this process's anonymous memory.
+        let got = unsafe { super::advise_huge(span.addr(), span.len) };
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                got.is_ok()
+                    || matches!(&got, Err(OsError::Io(e)) if e.raw_os_error() == Some(libc::EINVAL)),
+                "{got:?}"
+            );
+            if got.is_ok() {
+                let smaps = std::fs::read_to_string("/proc/self/smaps").expect("the mapping flags");
+                let at = span.addr().addr();
+                let flags = smaps
+                    .lines()
+                    .skip_while(|line| {
+                        let Some((first, last)) = line
+                            .split_whitespace()
+                            .next()
+                            .and_then(|range| range.split_once('-'))
+                        else {
+                            return true;
+                        };
+                        let first = usize::from_str_radix(first, 16).expect("the mapping start");
+                        let last = usize::from_str_radix(last, 16).expect("the mapping end");
+                        !(first <= at && at < last)
+                    })
+                    .find(|line| line.starts_with("VmFlags:"))
+                    .expect("the advised mapping's flags");
+                assert!(flags.split_whitespace().any(|flag| flag == "hg"), "{flags}");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        assert!(
+            matches!(&got, Err(OsError::Unsupported { call }) if *call == "madvise(MADV_HUGEPAGE)"),
+            "{got:?}"
+        );
     }
 
     /// The resident pages of a span are counted, a byte a page.
