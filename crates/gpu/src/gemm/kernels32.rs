@@ -1149,10 +1149,10 @@ mod gemm32_kernels {
     /// row and column. `k` a positive multiple of 64 and `w`, `x` 16-byte
     /// aligned (host-checked).
     #[kernel]
-    #[launch_bounds(512)]
+    #[launch_bounds(256)]
     #[launch_contract(
         domain = 1,
-        block = (512, 1, 1),
+        block = (256, 1, 1),
         requires = (
             rows >= 1,
             n >= 1,
@@ -1174,7 +1174,7 @@ mod gemm32_kernels {
         // STAGE_FLOATS values, 16-byte aligned; the raw form reaches the
         // `static mut` without a reference.
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
-        // SAFETY: every thread of the 512-wide block calls it converged; the
+        // SAFETY: every thread of the 256-wide block calls it converged; the
         // host sized the grid, checked k and the alignments; the lengths are
         // the launch contract's.
         unsafe { f32_tile_body(F32Rows(w), x, rows, k, n, &mut y, sh) };
@@ -1185,10 +1185,10 @@ mod gemm32_kernels {
     /// is bit for bit `q8f32::f32_gemv`'s over the dequantized rows. `k` a
     /// positive multiple of 128 and `x` 16-byte aligned (host-checked).
     #[kernel]
-    #[launch_bounds(512)]
+    #[launch_bounds(256)]
     #[launch_contract(
         domain = 1,
-        block = (512, 1, 1),
+        block = (256, 1, 1),
         requires = (
             rows >= 1,
             n >= 1,
@@ -1212,7 +1212,7 @@ mod gemm32_kernels {
         // STAGE_FLOATS values, 16-byte aligned; the raw form reaches the
         // `static mut` without a reference.
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
-        // SAFETY: every thread of the 512-wide block calls it converged; the
+        // SAFETY: every thread of the 256-wide block calls it converged; the
         // host sized the grid, checked k and x's alignment; the planes hold
         // rows · k values by the launch contract (4 a qs word, 128 an e
         // word), the other lengths are the contract's.
@@ -1234,10 +1234,10 @@ mod gemm32_kernels {
     /// over the dequantized rows. `k` a positive multiple of 128 and `x`
     /// 16-byte aligned (host-checked).
     #[kernel]
-    #[launch_bounds(512)]
+    #[launch_bounds(256)]
     #[launch_contract(
         domain = 1,
-        block = (512, 1, 1),
+        block = (256, 1, 1),
         requires = (
             rows >= 1,
             n >= 1,
@@ -1261,7 +1261,7 @@ mod gemm32_kernels {
         // STAGE_FLOATS values, 16-byte aligned; the raw form reaches the
         // `static mut` without a reference.
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
-        // SAFETY: every thread of the 512-wide block calls it converged; the
+        // SAFETY: every thread of the 256-wide block calls it converged; the
         // host sized the grid, checked k and x's alignment; the planes hold
         // rows · k values by the launch contract (4 a qs word, 128 an e
         // word), the other lengths are the contract's.

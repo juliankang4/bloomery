@@ -1684,6 +1684,7 @@ impl TileRows for HcUpRows<'_> {
 
 impl MmaRows for HcUpRows<'_> {
     type Piece = ();
+    const REPLAY_ROWS: usize = 2;
 
     #[inline(always)]
     unsafe fn fetch(self, dst: *mut u32, at: usize) {

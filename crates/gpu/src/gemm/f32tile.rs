@@ -5,18 +5,24 @@
 //! projections) where the decode path runs `q8f32::f32_gemv`.
 //!
 //! Contract: every output is bit for bit `f32_gemv`'s for its (row,
-//! column). The body is `qwen3moe_router_logits`' with the row count a
-//! launch argument: a block of sixteen warps covers [`TILE_COLS`] columns
-//! and [`TILE_ROWS`] rows, each warp eight rows by eight columns, the rows'
+//! column). The row walk gives lane `L` of a row the sequential sum of the
+//! terms `32·it + L` and combines the 32 lane sums by the butterfly xor 16,
+//! 8, 4, 2, 1 (`q8f32.rs`'s module doc). A tile keeps every one of those
+//! lane sums and the tree, and only moves them between threads: a block of
+//! eight warps covers [`TILE_COLS`] columns and [`TILE_ROWS`] rows, the rows'
 //! and columns' next 64 values staged in shared memory with `cp.async`,
-//! three stages deep; each lane advances its 64 sums over the staged 32-value
-//! chunks in increasing order (`q8f32::f32_tile_chunk`), which takes each
-//! (row, column) pair's terms in `f32_gemv`'s row walk order (`q8f32.rs`'s
-//! module doc says why that keeps its bits), and each column's eight sums go
-//! through the same butterfly (`q8f32::gemv_lane_sums`). A row past the last
-//! is staged as the last row and a column past the last as the last column;
-//! their sums are not stored. The output is column-major, `y[c · rows + r]`
-//! — the GEMM families' `y[s][n]`, not `f32_gemv`'s `y[r · m + c]`.
+//! three stages deep. Sixteen threads of a warp cover a 32-value chunk, two
+//! values each, so thread `p` keeps the lane sums `2p` and `2p + 1` of each
+//! (row, column) pair it owns, eight rows by eight columns ([`pair_chunk`],
+//! one 8-byte load per row and column a chunk); the warp's two
+//! sixteen-thread halves take different columns. The butterfly then runs
+//! xor 16, 8, 4, 2 of the lanes as xor 8, 4, 2, 1 of the threads, and xor 1
+//! as the add of a thread's two sums. A row past the last is staged as the
+//! last row (and a row group with no live row is neither staged nor summed),
+//! a column past the last as the last column; their sums are not stored.
+//! The output is column-major, `y[c · rows + r]` — the GEMM families'
+//! `y[s][n]`, not `f32_gemv`'s `y[r · m + c]`. The routers' prompt logits
+//! (`qwen3moe_router_logits` and the gated router's) run this body too.
 //!
 //! The rows come from a [`TileRows`]: an F32 weight's values are copied into
 //! the stage as they are ([`F32Rows`], `cp.async`), and an E4M3 weight's
@@ -42,9 +48,7 @@
 use super::GemmAct32;
 use super::gemm32::{GEMM32_GROUP, raster32};
 use super::kernels32::Gemm32Kernels;
-use crate::q8f32::{
-    Bf16Words, ByteBlocks, E4m3Scales, E4m3Weight, TILE, f32_tile_chunk, gemv_lane_sums,
-};
+use crate::q8f32::{Bf16Words, ByteBlocks, E4m3Scales, E4m3Weight};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use core::marker::PhantomData;
@@ -52,19 +56,30 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
 use cuda_device::convert::cvt_bf16x2_f32;
 use cuda_device::shared::cvta_generic_to_shared_u32;
-use cuda_device::vector::{F32x4, U32x4};
+use cuda_device::vector::{F32x2, F32x4, U32x4};
 use cuda_device::wmma::{ldmatrix_x4_shared_u32, mma_m16n8k16_f32_bf16};
 use cuda_device::{DisjointSlice, thread, warp};
 
 /// Columns and rows one block covers.
 pub(super) const TILE_COLS: usize = 32;
 pub(super) const TILE_ROWS: usize = 32;
-/// Threads of a block: sixteen warps, [`TILE_ROWS`]` / 8` row groups by
-/// [`TILE_COLS`]` / 8` column groups.
-pub(super) const F32T_THREADS: usize = 512;
+/// Values of a chunk one thread takes ([`pair_chunk`]), the threads that
+/// cover a 32-value chunk, and the column halves of a warp (one a sixteen
+/// threads).
+const PAIR: usize = 2;
+const CHUNK_THREADS: usize = 32 / PAIR;
+const COL_HALVES: usize = 32 / CHUNK_THREADS;
+/// Rows and columns one thread sums in a full pass ([`f32_tile_body`]); the
+/// MMA replay's passes sum [`MmaRows::REPLAY_ROWS`] rows.
+const FULL_ROWS: usize = 8;
+const THREAD_COLS: usize = 8;
+/// Warps of a block: row groups by column groups, a column group
+/// [`COL_HALVES`]` · `[`THREAD_COLS`] columns.
+const ROW_GROUPS: usize = 4;
+const COL_GROUPS: usize = TILE_COLS / (COL_HALVES * THREAD_COLS);
+/// Threads of a block.
+pub(super) const F32T_THREADS: usize = ROW_GROUPS * COL_GROUPS * 32;
 pub(crate) const F32T_THREADS_U32: u32 = F32T_THREADS as u32;
-const ROW_GROUPS: usize = TILE_ROWS / TILE;
-const COL_GROUPS: usize = TILE_COLS / TILE;
 /// 32-value chunks one stage holds of every row and column, and the values
 /// of one such line: K must be a multiple of it.
 const STAGE_CHUNKS: usize = 2;
@@ -77,10 +92,18 @@ pub(crate) const STAGE_FLOATS: usize = (TILE_ROWS + TILE_COLS) * LINE;
 /// 16-byte copies per line.
 const LINE_COPIES: usize = LINE / 4;
 
-const _: () = assert!(ROW_GROUPS * TILE == TILE_ROWS && COL_GROUPS * TILE == TILE_COLS);
-const _: () = assert!(ROW_GROUPS * COL_GROUPS * 32 == F32T_THREADS && F32T_THREADS == 512);
-// Every thread copies one piece of one row line and of one column line.
-const _: () = assert!(TILE_ROWS * LINE_COPIES == F32T_THREADS && TILE_COLS == TILE_ROWS);
+// A full pass's row groups cover the tile; the column groups cover the
+// tile's columns; the kernel entries' launch bounds and contracts spell the
+// block out.
+const _: () = assert!(ROW_GROUPS * FULL_ROWS == TILE_ROWS);
+const _: () = assert!(COL_GROUPS * COL_HALVES * THREAD_COLS == TILE_COLS);
+const _: () = assert!(PAIR == 2 && CHUNK_THREADS == 16 && F32T_THREADS == 256);
+// The staged row lines are whole row groups of a full pass.
+const _: () = assert!(TILE_ROWS.is_multiple_of(FULL_ROWS));
+// Every thread copies whole pieces of row lines and column lines, the same
+// pieces of each.
+const _: () = assert!((TILE_ROWS * LINE_COPIES).is_multiple_of(F32T_THREADS));
+const _: () = assert!(TILE_COLS == TILE_ROWS);
 const _: () = assert!(4 * STAGES * STAGE_FLOATS <= 48 * 1024);
 
 /// A tile's weight rows: how one thread's piece of a row line reaches the
@@ -194,44 +217,52 @@ impl TileRows for Bf16Rows<'_> {
     }
 }
 
-/// Lane 0's stores of the first `live` of one column's [`TILE`] row sums,
-/// `y[base + i] = sums[i]`, each store guarded by a constant index.
+/// One thread's sums of one 32-value chunk (module doc): `w` points at the
+/// thread's two staged values of its first row's chunk and `x` at those of
+/// its first column's, each next row or column [`LINE`] floats on, each
+/// pair one 8-byte load. Returns `acc[c][i][e] + w_i[e]·x_c[e]`: for row
+/// `i`, column `c` and lane sum `2p + e` the term the row walk's lane `2p +
+/// e` adds for this chunk. So sums advanced over a row's chunks in
+/// increasing order hold, pair for pair, the row walk's lane sums.
 ///
 /// # Safety
 ///
-/// `live <= TILE`, `base + live <= y.len()`, and no other thread writes
-/// those slots.
+/// `w.add(i · LINE)` for `i < RT` and `x.add(c · LINE)` for `c <`
+/// [`THREAD_COLS`] are readable, 8-byte aligned pairs of f32 that nothing
+/// writes during the call.
 #[inline(always)]
-unsafe fn store_live(y: &mut DisjointSlice<f32>, base: usize, sums: &[f32; TILE], live: usize) {
-    let [s0, s1, s2, s3, s4, s5, s6, s7] = *sums;
-    // SAFETY: each store is guarded by i < live, so its slot base + i lies
-    // inside y and belongs to this thread alone by this fn's contract.
-    unsafe {
-        if live > 0 {
-            *y.get_unchecked_mut(base) = s0;
-        }
-        if live > 1 {
-            *y.get_unchecked_mut(base + 1) = s1;
-        }
-        if live > 2 {
-            *y.get_unchecked_mut(base + 2) = s2;
-        }
-        if live > 3 {
-            *y.get_unchecked_mut(base + 3) = s3;
-        }
-        if live > 4 {
-            *y.get_unchecked_mut(base + 4) = s4;
-        }
-        if live > 5 {
-            *y.get_unchecked_mut(base + 5) = s5;
-        }
-        if live > 6 {
-            *y.get_unchecked_mut(base + 6) = s6;
-        }
-        if live > 7 {
-            *y.get_unchecked_mut(base + 7) = s7;
+unsafe fn pair_chunk<const RT: usize>(
+    mut acc: [[[f32; PAIR]; RT]; THREAD_COLS],
+    w: *const f32,
+    x: *const f32,
+) -> [[[f32; PAIR]; RT]; THREAD_COLS] {
+    let mut wv = [[0.0f32; PAIR]; RT];
+    let mut i = 0usize;
+    while i < RT {
+        thread::__unroll_config::<0>();
+        // SAFETY: i < RT, a readable aligned pair by this fn's contract.
+        wv[i] = unsafe { (*w.add(i * LINE).cast::<F32x2>()).0 };
+        i += 1;
+    }
+    let mut xv = [[0.0f32; PAIR]; THREAD_COLS];
+    let mut c = 0usize;
+    while c < THREAD_COLS {
+        thread::__unroll_config::<0>();
+        // SAFETY: c < THREAD_COLS, a readable aligned pair by this fn's contract.
+        xv[c] = unsafe { (*x.add(c * LINE).cast::<F32x2>()).0 };
+        c += 1;
+    }
+    for c in 0..THREAD_COLS {
+        thread::__unroll_config::<0>();
+        for i in 0..RT {
+            thread::__unroll_config::<0>();
+            acc[c][i] = [
+                f32::mul_add(wv[i][0], xv[c][0], acc[c][i][0]),
+                f32::mul_add(wv[i][1], xv[c][1], acc[c][i][1]),
+            ];
         }
     }
+    acc
 }
 
 /// The product of `n` columns over `rows` weight rows (module doc): block
@@ -265,63 +296,76 @@ pub(crate) unsafe fn f32_tile_body<W: TileRows>(
     if c0 >= n {
         return; // block-uniform, before the first barrier
     }
-    // SAFETY: the wrapper supplies this block's checked tile and all 512 threads.
+    // SAFETY: the wrapper supplies this block's checked tile and all its threads.
     unsafe {
-        f32_tile_at::<W, F32T_THREADS, false>(w, x, (rows, k as usize, n), y, sh, (row0, c0, 0))
+        f32_tile_at::<W, FULL_ROWS, false>(w, x, (rows, k as usize, n), y, sh, (row0, c0, 0))
     };
 }
 
-/// Exact tile owner, with 256 threads walking one row half or 512 walking both.
+/// Exact tile owner (module doc): a pass of [`F32T_THREADS`] threads over
+/// the tile at `(row0, c0)`, each thread `RT` rows by [`THREAD_COLS`]
+/// columns: pass `pass` covers the tile's rows `pass · ROW_GROUPS · RT ..`,
+/// so the one pass of [`FULL_ROWS`] covers them all. With `MARKED`, only
+/// outputs that hold NaN are written.
 ///
 /// # Safety
 ///
-/// All THREADS threads call converged. THREADS is 256 or 512; row_half is
-/// 0 for 512 and 0 or 1 for 256. Rows and n are positive; kk is a positive
-/// multiple of LINE. The weight holds rows*kk values, x holds n*kk aligned
-/// values, and y holds rows*n outputs. The aligned shared allocation holds
-/// STAGES*STAGE_FLOATS values. No other block writes this output tile.
+/// All threads of the block call converged, the block [`F32T_THREADS`]
+/// wide. RT is [`FULL_ROWS`], 1 or 2 and `pass · ROW_GROUPS · RT
+/// < TILE_ROWS`. Rows and n are positive, row0 < rows and c0 < n; kk is a
+/// positive multiple of LINE. The weight holds rows*kk values, x holds n*kk
+/// aligned values, and y holds rows*n outputs. The aligned shared
+/// allocation holds STAGES*STAGE_FLOATS values. No other block writes this
+/// output tile.
 #[inline(always)]
-unsafe fn f32_tile_at<W: TileRows, const THREADS: usize, const MARKED: bool>(
+unsafe fn f32_tile_at<W: TileRows, const RT: usize, const MARKED: bool>(
     w: W,
     x: &[f32],
     (rows, kk, n): (usize, usize, usize),
     y: &mut DisjointSlice<f32>,
     sh: *mut f32,
-    (row0, c0, row_half): (usize, usize, usize),
+    (row0, c0, pass): (usize, usize, usize),
 ) {
     let tid = thread::threadIdx_x() as usize;
     let lane = warp::lane_id() as usize;
-    let (rg, cg) = (
-        (tid / 32) / COL_GROUPS + row_half * 2,
-        (tid / 32) % COL_GROUPS,
-    );
+    let (rg, cg) = ((tid / 32) / COL_GROUPS, (tid / 32) % COL_GROUPS);
+    let (p, half) = (lane % CHUNK_THREADS, lane / CHUNK_THREADS);
+    // The thread's first row line and column line in a stage.
+    let rline = (pass * ROW_GROUPS + rg) * RT;
+    let cline = (cg * COL_HALVES + half) * THREAD_COLS;
+    // Warp-uniform: whether any of the warp's rows exists.
+    let live = row0 + rline < rows;
+    // The row lines a live warp reads: the live rows rounded up to whole row
+    // groups of a full pass. The rest are not staged.
+    let staged_rows = (rows - row0).min(TILE_ROWS).next_multiple_of(FULL_ROWS);
     let stages = kk / LINE;
 
     // This thread's copies of every stage: piece `piece` of row line `line`
-    // and of column line `line`, a row past the last staged as the last and
-    // a column past the last as the last.
+    // (a staged one) and of column line `line`, a row past the last staged as
+    // the last and a column past the last as the last.
     macro_rules! stage_copy {
         ($s:expr, $buf:expr) => {{
             let (s, buf): (usize, usize) = ($s, $buf);
-            for i in 0..F32T_THREADS / THREADS {
+            // SAFETY: buf < STAGES selects this block's allocated stage.
+            let dst = unsafe { sh.add(buf * STAGE_FLOATS) };
+            for i in 0..TILE_ROWS * LINE_COPIES / F32T_THREADS {
                 thread::__unroll_config::<0>();
-                let copy = tid + i * THREADS;
+                let copy = tid + i * F32T_THREADS;
                 let line = copy / LINE_COPIES;
                 let piece = 4 * (copy % LINE_COPIES);
-                let w_off = (row0 + line).min(rows - 1) * kk + piece;
+                if line < staged_rows {
+                    let w_off = (row0 + line).min(rows - 1) * kk + piece;
+                    // SAFETY: the copies partition the checked tile's aligned
+                    // weight pieces; no warp reads them until the wait/barrier.
+                    unsafe { w.stage(dst.add(line * LINE + piece), w_off + s * LINE) };
+                }
                 let x_off = (c0 + line).min(n - 1) * kk + piece;
-                let w_dst = line * LINE + piece;
-                let x_dst = (TILE_ROWS + line) * LINE + piece;
-                // SAFETY: buf < STAGES selects this block's allocated stage.
-                let dst = unsafe { sh.add(buf * STAGE_FLOATS) };
-                // SAFETY: the copies partition the checked tile's aligned
-                // weight pieces; no warp reads them until the wait/barrier.
-                unsafe { w.stage(dst.add(w_dst), w_off + s * LINE) };
-                // SAFETY: x_off selects a live aligned column piece and x_dst
-                // is this thread's disjoint aligned piece of the stage.
+                // SAFETY: x_off selects a live aligned column piece and the
+                // destination is this thread's disjoint aligned piece of the
+                // stage.
                 unsafe {
                     cp_async_cg_16(
-                        dst.add(x_dst).cast::<u32>(),
+                        dst.add((TILE_ROWS + line) * LINE + piece).cast::<u32>(),
                         x.as_ptr().add(x_off + s * LINE).cast::<u32>(),
                     )
                 };
@@ -340,7 +384,7 @@ unsafe fn f32_tile_at<W: TileRows, const THREADS: usize, const MARKED: bool>(
     // way.
     unsafe { cp_async_commit_group() };
 
-    let mut acc = [[0.0f32; TILE]; TILE];
+    let mut acc = [[[0.0f32; PAIR]; RT]; THREAD_COLS];
     let mut s = 0usize;
     let mut buf = 0usize;
     while s < stages {
@@ -356,69 +400,66 @@ unsafe fn f32_tile_at<W: TileRows, const THREADS: usize, const MARKED: bool>(
         }
         // SAFETY: one group per pass, empty near the end.
         unsafe { cp_async_commit_group() };
-        // SAFETY: stage buf's row lines rg·TILE + i and column lines
-        // TILE_ROWS + cg·TILE + c (i, c < TILE) hold values 32·j + lane of
-        // chunks j < STAGE_CHUNKS, published by the barrier above and not
-        // refilled before the next pass's barrier.
-        unsafe {
-            let base = sh.add(buf * STAGE_FLOATS).cast_const();
-            let wp = base.add(rg * TILE * LINE + lane);
-            let xp = base.add((TILE_ROWS + cg * TILE) * LINE + lane);
-            acc = f32_tile_chunk(acc, wp, xp, LINE);
-            acc = f32_tile_chunk(acc, wp.add(32), xp.add(32), LINE);
+        if live {
+            // SAFETY: stage buf's row lines rline + i (i < RT, below
+            // staged_rows since row0 + rline < rows) and column lines
+            // TILE_ROWS + cline + c (c < THREAD_COLS) hold values 32·j + 2p
+            // and 2p + 1 of chunks j < STAGE_CHUNKS, 8-byte aligned,
+            // published by the barrier above and not refilled before the
+            // next pass's barrier.
+            unsafe {
+                let base = sh.add(buf * STAGE_FLOATS).cast_const();
+                let wp = base.add(rline * LINE + PAIR * p);
+                let xp = base.add((TILE_ROWS + cline) * LINE + PAIR * p);
+                acc = pair_chunk::<RT>(acc, wp, xp);
+                acc = pair_chunk::<RT>(acc, wp.add(32), xp.add(32));
+            }
         }
         s += 1;
         buf = if buf == STAGES - 1 { 0 } else { buf + 1 };
     }
+    if !live {
+        return; // warp-uniform: no barrier follows
+    }
 
-    // The warp's first column, how many of its columns exist, its first row
-    // and how many of its rows exist.
-    let cw = c0 + cg * TILE;
-    let live = if cw < n { (n - cw).min(TILE) } else { 0 };
-    let r0 = row0 + rg * TILE;
-    let live_rows = if r0 < rows { (rows - r0).min(TILE) } else { 0 };
-    // Every lane runs each column's butterfly; lane 0 stores a live one's
-    // live rows.
-    macro_rules! column {
-        ($c:literal) => {{
-            let sums = gemv_lane_sums(acc[$c], TILE as u32);
-            if lane == 0 && $c < live {
-                // SAFETY: column cw + $c < n, so its slots (cw + $c)·rows +
-                // r0 + i, i < live_rows, lie inside y (this fn's contract);
-                // lane 0 of the warp owning rows r0 .. of that column is their
-                // only writer.
-                if MARKED {
-                    for i in 0..TILE {
-                        thread::__unroll_config::<0>();
-                        if i < live_rows {
-                            // SAFETY: this lane owns the checked live cell, published
-                            // before replay; marked stores preserve healthy MMA cells.
-                            let slot = unsafe { y.get_unchecked_mut((cw + $c) * rows + r0 + i) };
-                            if slot.is_nan() {
-                                *slot = sums[i];
-                            }
-                        }
-                    }
-                } else {
-                    // SAFETY: this warp owns the checked column's live rows.
-                    unsafe { store_live(y, (cw + $c) * rows + r0, &sums, live_rows) };
+    // Every thread runs each pair's butterfly; thread 0 of each column half
+    // stores a live one.
+    let mut c = 0usize;
+    while c < THREAD_COLS {
+        thread::__unroll_config::<0>();
+        let mut i = 0usize;
+        while i < RT {
+            thread::__unroll_config::<0>();
+            let [mut a, mut b] = acc[c][i];
+            a = a + warp::shuffle_xor_f32(a, 8);
+            b = b + warp::shuffle_xor_f32(b, 8);
+            a = a + warp::shuffle_xor_f32(a, 4);
+            b = b + warp::shuffle_xor_f32(b, 4);
+            a = a + warp::shuffle_xor_f32(a, 2);
+            b = b + warp::shuffle_xor_f32(b, 2);
+            a = a + warp::shuffle_xor_f32(a, 1);
+            b = b + warp::shuffle_xor_f32(b, 1);
+            let (r, col) = (row0 + rline + i, c0 + cline + c);
+            if p == 0 && r < rows && col < n {
+                // SAFETY: row r < rows and column col < n, so the slot lies
+                // inside y (this fn's contract); thread 0 of the column half
+                // owning row r and column col is its only writer.
+                let slot = unsafe { y.get_unchecked_mut(col * rows + r) };
+                if !MARKED || slot.is_nan() {
+                    *slot = a + b;
                 }
             }
-        }};
+            i += 1;
+        }
+        c += 1;
     }
-    column!(0);
-    column!(1);
-    column!(2);
-    column!(3);
-    column!(4);
-    column!(5);
-    column!(6);
-    column!(7);
 }
 
 /// Threads in a dense BF16 MMA tile: eight warps, two row halves by four
 /// column quarters, each covering 64 rows by 32 columns.
 pub(crate) const MMA_THREADS: u32 = 256;
+// The replay runs the exact tile's passes with the MMA tile's threads.
+const _: () = assert!(MMA_THREADS as usize == F32T_THREADS);
 /// Lanes that hold one fragment row's cells.
 const MMA_ROW_LANES: usize = 4;
 /// Rows and columns of a block's outputs.
@@ -490,6 +531,11 @@ pub(crate) trait MmaRows: TileRows {
     /// its columns; for a BF16 weight, half an activation's bytes a value,
     /// eight tiles balance the two on GB10's 96 resident blocks.
     const GROUP: usize = 8;
+
+    /// Rows one thread sums in a pass of [`MmaTile::replay`], 1 or 2. Fewer
+    /// rows hold fewer registers beside the tile's and take more passes; a
+    /// kernel keeps the count its registers fit without a spill.
+    const REPLAY_ROWS: usize = 1;
 
     /// Starts moving values `at .. at + 8` (`at` a multiple of 8) to the 16
     /// bytes at `dst`: an asynchronous copy completed by this thread's
@@ -949,7 +995,7 @@ impl MmaTile {
     /// All 256 threads call converged with this tile's checked spans and shared
     /// allocation. Prior output stores and shared readers have completed.
     #[inline(always)]
-    pub(crate) unsafe fn replay<W: TileRows>(
+    pub(crate) unsafe fn replay<W: MmaRows>(
         &self,
         w: W,
         x: &[f32],
@@ -957,24 +1003,24 @@ impl MmaTile {
         y: &mut DisjointSlice<f32>,
         sh: *mut f32,
     ) {
+        const { assert!(W::REPLAY_ROWS == 1 || W::REPLAY_ROWS == 2) };
         for dr in 0..MMA_ROWS / TILE_ROWS {
             for dc in 0..MMA_COLS / TILE_COLS {
                 let (r, c) = (self.row0 + dr * TILE_ROWS, self.col0 + dc * TILE_COLS);
                 if r >= dims.0 || c >= dims.2 {
                     continue; // block-uniform: the sub-tile holds no output
                 }
-                for half in 0..2 {
-                    // SAFETY: the passes cover disjoint checked halves and reuse
-                    // the exact owner's shared allocation with 256 threads.
+                for pass in 0..TILE_ROWS / (ROW_GROUPS * W::REPLAY_ROWS) {
+                    let at = (r, c, pass);
+                    // SAFETY: the passes cover disjoint checked row ranges and
+                    // reuse the exact owner's shared allocation with its block
+                    // of threads (the const assert beside MMA_THREADS).
                     unsafe {
-                        f32_tile_at::<W, { MMA_THREADS as usize }, true>(
-                            w,
-                            x,
-                            dims,
-                            y,
-                            sh,
-                            (r, c, half),
-                        )
+                        if W::REPLAY_ROWS == 1 {
+                            f32_tile_at::<W, 1, true>(w, x, dims, y, sh, at)
+                        } else {
+                            f32_tile_at::<W, 2, true>(w, x, dims, y, sh, at)
+                        }
                     };
                     thread::sync_threads();
                 }
