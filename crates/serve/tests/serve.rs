@@ -1310,13 +1310,7 @@ fn a_key_never_reaches_what_the_process_prints_or_serves() {
         assert_eq!(reply.status, 401, "{}", reply.body);
         for secret in [KEY, SENT] {
             assert!(!reply.body.contains(secret), "the 401 body carries a key");
-            assert!(
-                reply
-                    .headers
-                    .iter()
-                    .all(|(k, v)| !k.contains(secret) && !v.contains(secret)),
-                "the 401 headers carry a key"
-            );
+            assert!(!reply.head.contains(secret), "the 401 head carries a key");
         }
     }
     assert!(

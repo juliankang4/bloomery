@@ -91,6 +91,7 @@ pub fn drop_dir(dir: &Path) {
 
 pub struct Reply {
     pub status: u16,
+    pub head: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
 }
@@ -159,6 +160,7 @@ pub fn call_headers(
         .collect();
     Reply {
         status,
+        head: head.to_owned(),
         headers,
         body: body.to_owned(),
     }
