@@ -1587,7 +1587,16 @@ pub(super) struct WideParts<'a> {
     /// The media call's staged rows on a media load: each unit's first layer
     /// copies the rows of the spans inside it over the unit's embeddings.
     pub(super) media: Option<&'a mut MediaRows>,
+    /// The walk's PLE rows when its plan left them on their read
+    /// (`Body38::stage_gemm`): the PLE site's first unit copies them into
+    /// the arena's `e` before any unit reads it, the walk's layers before
+    /// it enqueued.
+    pub(super) ple_rows: Option<&'a mut PleRowsIn<'a>>,
 }
+
+/// [`WideParts::ple_rows`]: the walk's PLE rows decoded and copied into the
+/// arena's `e`.
+pub(super) type PleRowsIn<'a> = dyn FnMut(&mut DeviceBuffer<f32>) -> Result<(), GpuError> + 'a;
 
 /// The kernels of the walk's dense sites ([`site::resident_gemm`]).
 fn dense_kernels<'a>(c: &Ctx38<'a>) -> WideKernels<'a> {
@@ -1740,6 +1749,9 @@ impl WideParts<'_> {
                 &mut s.mixed,
             )?;
         } else if let Some(pp) = &p.ple {
+            if let Some(rows_in) = self.ple_rows.take() {
+                rows_in(&mut s.ple.e)?;
+            }
             combine(c, u, &mut x.hc, gpu.layer_sink(l - 1)?)?;
             let w = c.w;
             let pl = &mut s.ple;

@@ -123,9 +123,7 @@ use super::program38::{
     Ctx38, Kernels38, Parts38, Pass38, RowsCopy, STEP_MEMOPS, Seqs38, SlotSeq38, Step38, Verify38,
     seq_launches, step_launches, verify_launches,
 };
-use super::scratch::{
-    Io, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, f32_view, stamps_at,
-};
+use super::scratch::{Io, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, stamps_at};
 use super::scratch38::{
     Arena38, LANES, PASS_ROWS, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, store_rule_bytes,
 };
@@ -134,7 +132,7 @@ use super::swap38::{self, DEADLINE, LIVE_DELAY};
 use super::tier38::{TierSide38, open_tier};
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
-    Gemm38, STREAM_FLOOR, SplitWalk, Wide38, WideForce, WideParts, WideTaps, dense_rows,
+    Gemm38, PleRowsIn, STREAM_FLOOR, SplitWalk, Wide38, WideForce, WideParts, WideTaps, dense_rows,
     route_taps_host,
 };
 use crate::checkpoint::saved::{
@@ -562,11 +560,10 @@ impl PleRead {
         Ok(())
     }
 
-    /// `ids`, the rows of the fill of `n` positions at `pos`, copied to
-    /// [`Prefetcher::filled`]: the batch read ahead when it is this fill's,
-    /// else read now; then the next ubatch read ahead goes to the helper, to
-    /// run while this one computes.
-    fn read(&mut self, pos: u32, n: usize, ids: &[u32]) -> Result<(), GpuError> {
+    /// `ids`, the rows of the fill of `n` positions at `pos`, on the helper:
+    /// the batch read ahead when it is this fill's, else submitted now.
+    /// [`PleRead::finish`] takes them.
+    fn start(&mut self, pos: u32, n: usize, ids: &[u32]) -> Result<(), GpuError> {
         let own = self
             .ahead
             .front()
@@ -581,8 +578,21 @@ impl PleRead {
             self.rows
                 .submit(std::iter::repeat_n(ids, self.planes))
                 .map_err(|e| GpuError::plan(WHAT, e))?;
+            self.flight = true;
         }
-        self.flight = false;
+        Ok(())
+    }
+
+    /// The started fill's rows ([`PleRead::start`]) copied to
+    /// [`Prefetcher::filled`]; then the next ubatch read ahead goes to the
+    /// helper, to run while this one computes.
+    fn finish(&mut self) -> Result<(), GpuError> {
+        if !std::mem::take(&mut self.flight) {
+            return Err(GpuError::state(
+                WHAT,
+                "a PLE fill finished before it started",
+            ));
+        }
         self.rows.wait().map_err(|e| GpuError::plan(WHAT, e))?;
         if let Some(next) = self.ahead.front() {
             self.rows
@@ -738,7 +748,7 @@ impl PleHost {
     /// `tokens.len()` positions of `e`, and the history past them, returned:
     /// the history stays where it stands until the call's launch takes the
     /// returned one ([`Body38::launch`]). On the NVMe tier the rows come
-    /// from the reader's copy ([`PleRead::read`]), on the host from the
+    /// from the reader's copy ([`PleRead::finish`]), on the host from the
     /// mapping. A token the hash refuses (the image placeholder, an id past
     /// the vocabulary), a position other than the history's next, or a row
     /// past the table is refused by name.
@@ -750,8 +760,23 @@ impl PleHost {
     /// the unit's image spans as row ranges of `tokens`
     /// ([`Hash::ple_rows_media`]), inside which the image placeholder
     /// hashes like any id and the history takes it; outside them it is
-    /// refused as in `fill`.
+    /// refused as in `fill`. The rows named ([`PleHost::name_spanned`]),
+    /// then decoded ([`PleHost::decode`]).
     fn fill_spanned(
+        &mut self,
+        pos: u32,
+        tokens: &[u32],
+        spans: &[Range<usize>],
+    ) -> Result<History, GpuError> {
+        let hist = self.name_spanned(pos, tokens, spans)?;
+        self.decode()?;
+        Ok(hist)
+    }
+
+    /// [`PleHost::fill_spanned`]'s rows named and the history past them
+    /// returned, every refusal made; on the NVMe tier their read started
+    /// ([`PleRead::start`]). [`PleHost::decode`] takes them.
+    fn name_spanned(
         &mut self,
         pos: u32,
         tokens: &[u32],
@@ -775,6 +800,15 @@ impl PleHost {
                 format!("PLE row {r} past the table's {} rows", self.rows),
             ));
         }
+        if let Some(read) = &mut self.nvme {
+            read.start(pos, n, &self.ids[..self.named])?;
+        }
+        Ok(hist)
+    }
+
+    /// The rows [`PleHost::name_spanned`] named, decoded into the first
+    /// positions of `e`.
+    fn decode(&mut self) -> Result<(), GpuError> {
         let (ids, rb) = (&self.ids[..self.named], self.row_bytes);
         match &mut self.nvme {
             None => {
@@ -787,7 +821,7 @@ impl PleHost {
                 ple_decode(&mut self.e, self.width, &self.decode, rows)?;
             }
             Some(read) => {
-                read.read(pos, n, ids)?;
+                read.finish()?;
                 let filled = read.rows.filled();
                 if filled.len() != ids.len() * rb {
                     return Err(GpuError::shape(
@@ -815,16 +849,36 @@ impl PleHost {
                 }
             }
         }
-        Ok(hist)
+        Ok(())
+    }
+
+    /// The decoded rows of the first `n` positions copied to an arena's
+    /// `e`, its first `n · HIDDEN` values: one synchronous copy.
+    fn upload(
+        &self,
+        stream: &CudaStream,
+        e: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<(), GpuError> {
+        let len = n * geo::HIDDEN;
+        let mut w = WindowMut::<f32>::of_mut(e, 0, len)?;
+        let src = self
+            .e
+            .get(..len)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("{n} PLE positions at once")))?;
+        w.copy_from_host(stream, src)?;
+        Ok(())
     }
 
     /// Read a Gemm call's ubatches ahead: `tokens` at `pos`, cut into the
     /// ubatches `cut` ([`call_units`], the cut the call runs across its
     /// checkpoints), each one's row ids computed now from a clone of the
     /// history walked as the fills will walk it. The first ubatch's fill
-    /// reads its own rows, the call's one exposed read; each fill then hands
-    /// the helper the next ubatch's ([`PleRead::read`]). On the host nothing is read
-    /// ahead: the fills decode pages the load populated. A call whose rows
+    /// reads its own rows, the call's one read no walk hides but its own
+    /// layers before the PLE site on a walk that serves no host leg
+    /// ([`Body38::stage_gemm`]); each fill then hands the helper the next
+    /// ubatch's ([`PleRead::finish`]). On the host nothing is read ahead: the
+    /// fills decode pages the load populated. A call whose rows
     /// the hash refuses reads nothing ahead, and its first fill refuses it
     /// by name. `spans` are the call's image spans as position ranges
     /// ([`MediaRows::positions`]); each ubatch hashes its own part of them
@@ -1192,6 +1246,10 @@ pub struct Body38 {
     held: u32,
     /// The call planned and not yet launched.
     staged: Option<Staged38>,
+    /// The staged ubatch's PLE rows are named and on their read, not yet
+    /// decoded into its arena: its walk copies them in at the PLE site
+    /// ([`Body38::stage_gemm`]).
+    ple_late: bool,
     /// The sequence slots the load's plan was made for ([`Slots`]), and how
     /// many stand: the load's own sequence plus every [`Slots::new_seq`]. A
     /// sequence past the plan is refused by name.
@@ -1981,6 +2039,7 @@ impl Body38 {
             ctx,
             held: 0,
             staged: None,
+            ple_late: false,
             slots_planned: planned,
             slots_made: 1,
             slot_in: (planned > 1).then(|| SlotIn::new(stream)).transpose()?,
@@ -3325,11 +3384,7 @@ impl Body38 {
         let hist = self.ple.fill(pos, tokens)?;
         self.last_walk = TargetRows::Pass;
         self.rp.write(stream, tokens, pos)?;
-        // SAFETY: the pass arena holds `PASS_ROWS · HIDDEN` rows of `e` and
-        // `n <= PASS_ROWS` (the record's write refused more), and `e` stays in
-        // place while the window lives (one synchronous copy).
-        let mut e = unsafe { f32_view(&self.a.ple.e, 0, n * geo::HIDDEN) };
-        e.copy_from_host(stream, &self.ple.e[..n * geo::HIDDEN])?;
+        self.ple.upload(stream, &mut self.a.ple.e, n)?;
         self.stage(pos, n, hist, None)
     }
 
@@ -3418,11 +3473,12 @@ impl Body38 {
 impl Body38 {
     /// Plan a ubatch of `tokens` (1..=the load's size) at `pos`, where the
     /// stores stand: the map check ([`MapCheck::refuse`]), the armed
-    /// route taps' rows and the planted routes' positions, its PLE rows, its
-    /// record and its rows' copy to the ubatch arena, staged for
-    /// [`Body38::walk_gemm`]'s launch. Each refusal comes before anything
-    /// moves. With the timing armed, the plan's host wall is the prompt's
-    /// prologue.
+    /// route taps' rows and the planted routes' positions, its PLE rows (on
+    /// a walk that serves no host leg named and on their read, the walk
+    /// copying them in at its PLE site), its record and its rows' copy to
+    /// the ubatch arena, staged for [`Body38::walk_gemm`]'s launch. Each
+    /// refusal comes before anything moves. With the timing armed, the
+    /// plan's host wall is the prompt's prologue.
     fn plan_gemm(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
         let t0 = self.wide_timing.as_ref().map(|_| Instant::now());
         let r = self.stage_gemm(stream, tokens, pos);
@@ -3466,14 +3522,21 @@ impl Body38 {
         self.settle(stream)?;
         let unit = pos as usize..pos as usize + n;
         let spans = window_spans(self.media.iter().flat_map(MediaRows::positions), &unit);
-        let hist = self.ple.fill_spanned(pos, tokens, &spans)?;
+        // A walk that serves no host leg (every layer's routed experts on the
+        // card, `Card38::hostless`, and no expert tier) enqueues nothing that
+        // waits for this thread, so it takes its rows at its PLE site and
+        // their read runs under the layers before it; any other walk copies
+        // them in now.
+        self.ple_late = self.tier.is_none() && (0..self.plans.len()).all(|l| self.card.hostless(l));
+        let hist = match self.ple_late {
+            true => self.ple.name_spanned(pos, tokens, &spans)?,
+            false => self.ple.fill_spanned(pos, tokens, &spans)?,
+        };
         self.last_walk = TargetRows::Ubatch;
         self.wr.write(stream, tokens, pos)?;
-        // SAFETY: the ubatch arena holds `wide.rows · HIDDEN` values of `e`
-        // and `n <= wide.rows` (the record's write refused more), and `e`
-        // stays in place while the window lives (one synchronous copy).
-        let mut e = unsafe { f32_view(&self.wa.ple.e, 0, n * geo::HIDDEN) };
-        e.copy_from_host(stream, &self.ple.e[..n * geo::HIDDEN])?;
+        if !self.ple_late {
+            self.ple.upload(stream, &mut self.wa.ple.e, n)?;
+        }
         self.stage(pos, n, hist, None)
     }
 
@@ -3501,6 +3564,7 @@ impl Body38 {
         let dense = dense_rows(pos as usize, m, self.ctx)?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
         self.launch(pos, m)?;
+        let late = std::mem::take(&mut self.ple_late);
         let io = Io {
             lane: Some(self.lane.word()),
             ..self.wr.io()
@@ -3510,6 +3574,7 @@ impl Body38 {
             plans,
             stores,
             ple_ring,
+            ple,
             rope,
             seq_rope,
             wa,
@@ -3527,6 +3592,10 @@ impl Body38 {
             plant,
             ..
         } = self;
+        let mut rows_in = |e: &mut DeviceBuffer<f32>| -> Result<(), GpuError> {
+            ple.decode()?;
+            ple.upload(gpu.stream(), e, m)
+        };
         let mut prog = Gemm38 {
             p: WideParts {
                 c: Ctx38 {
@@ -3552,12 +3621,19 @@ impl Body38 {
                 cur: 0,
                 stream,
                 media: media.as_mut(),
+                ple_rows: late.then_some(&mut rows_in as &mut PleRowsIn<'_>),
             },
         };
         let cap = prog.p.x.rows;
         let mut leg = BatchLeg::new(gpu.stream(), hybrid, wide_hsum, cap);
         leg.set_timer(wide_timing.as_mut());
         prog.walk(&mut leg)?;
+        if prog.p.ple_rows.is_some() {
+            return Err(GpuError::state(
+                WHAT,
+                "a ubatch walk past its PLE rows' site with the rows not copied in",
+            ));
+        }
         planted(plant, Plant::AfterLaunch)?;
         if finals {
             prog.finals(head.is_some())?;
@@ -5053,11 +5129,7 @@ impl Body38 {
         let hist = self.ple.fill(pos, tokens)?;
         self.last_walk = TargetRows::Pass;
         self.rp.write(stream, tokens, pos)?;
-        // SAFETY: the pass arena holds `PASS_ROWS · HIDDEN` rows of `e` and
-        // `n <= VERIFY_ROWS <= PASS_ROWS`, and `e` stays in place while the
-        // window lives (one synchronous copy).
-        let mut e = unsafe { f32_view(&self.a.ple.e, 0, n * geo::HIDDEN) };
-        e.copy_from_host(stream, &self.ple.e[..n * geo::HIDDEN])?;
+        self.ple.upload(stream, &mut self.a.ple.e, n)?;
         self.stage(pos, n, hist, Some(tokens.to_vec()))?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
         self.launch(pos, n)
