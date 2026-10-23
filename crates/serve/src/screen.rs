@@ -2081,8 +2081,8 @@ mod tests {
                             &mut master,
                             &mut slave,
                             std::ptr::null_mut(),
-                            std::ptr::null(),
-                            &size,
+                            std::ptr::null_mut(),
+                            &raw mut size,
                         )
                     };
                     assert_eq!(rc, 0);
