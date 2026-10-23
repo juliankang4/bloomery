@@ -1837,6 +1837,129 @@ fn start_lane(
 mod tests {
     use super::*;
 
+    struct ReusedSource {
+        bytes: MappedHost,
+        fail_part: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SwapSource for ReusedSource {
+        fn part_bytes(&self, _layer: usize) -> &[usize] {
+            &[4; PARTS]
+        }
+        fn source(
+            &self,
+            _layer: usize,
+            _id: u32,
+            part: usize,
+        ) -> Result<super::super::swap::Piece<'_>, GpuError> {
+            if self.fail_part.load(Ordering::Acquire) == part {
+                return Err(GpuError::state("test source", "part refused"));
+            }
+            // SAFETY: the pinned allocation holds four initialized bytes;
+            // the source's read protects them until release_read.
+            let bytes = unsafe { std::slice::from_raw_parts(self.bytes.host_at(0), 4) };
+            Ok(super::super::swap::Piece {
+                bytes,
+                transform: Transform::Identity,
+            })
+        }
+        fn release_read(&self, _layer: usize, _id: u32) -> Result<(), GpuError> {
+            self.bytes
+                .atomic_u32(0)
+                .unwrap()
+                .store(0x22222222, Ordering::Release);
+            Ok(())
+        }
+        fn dest(
+            &self,
+            _layer: usize,
+            _part: usize,
+            _slot: u32,
+        ) -> Result<sys::CUdeviceptr, GpuError> {
+            Err(GpuError::state(
+                "test source",
+                "the ring owns its destination",
+            ))
+        }
+        fn prepare_victim(&self, _layer: usize, _id: u32) -> Result<(), GpuError> {
+            Ok(())
+        }
+        fn host_resident(&self, _layer: usize, _id: u32) -> Result<bool, GpuError> {
+            Ok(true)
+        }
+        fn release_host(&self, _layer: usize, _id: u32) -> Result<u64, GpuError> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA device; just gate-gpu-lib runs it"]
+    fn hw_held_a_fallback_copy_keeps_its_source_until_it_lands() {
+        use crate::checkpoint::hold::Hold;
+        let (ctx, stream) = crate::capsync::fresh_stream(0).unwrap();
+        let source = Arc::new(ReusedSource {
+            bytes: MappedHost::new(&ctx, 4, "test source").unwrap(),
+            fail_part: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        });
+        let mut cfg = XCfg::new(
+            Costs {
+                host_us_per_col: 1.0,
+                host_us_fixed: 1.0,
+                card_us_fixed: 1.0,
+                card_us_per_col: 1.0,
+            },
+            1,
+            1,
+            Duration::from_secs(3),
+            None,
+        );
+        cfg.keep_free = 0;
+        cfg.max_half = 1;
+        cfg.min_half = 1;
+        cfg.staging_slots = 1;
+        cfg.fill_threads = 1;
+        cfg.probe.push((0, 0));
+        let mut x = XStream::new(&ctx, &stream, source.clone(), 1, cfg).unwrap();
+        let lane = std::mem::replace(
+            &mut x.lane,
+            Lane::Pageable {
+                source: source.clone(),
+            },
+        );
+        if let Lane::Pinned { tx, threads, .. } = lane {
+            drop(tx);
+            for thread in threads {
+                thread.join().unwrap();
+            }
+        }
+        for fail_part in [usize::MAX, 1] {
+            source.fail_part.store(fail_part, Ordering::Release);
+            source
+                .bytes
+                .atomic_u32(0)
+                .unwrap()
+                .store(0x11111111, Ordering::Release);
+            let hold = Hold::on(&x.copy).unwrap();
+            let opener = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                drop(hold);
+            });
+            let result = x.copy_expert(0, 0, 0, 0);
+            opener.join().unwrap();
+            drain_within(&x.copy, x.cfg.deadline, "test copy").unwrap();
+            assert_eq!(result.is_err(), fail_part != usize::MAX);
+            let got = x.ring.parts[0].to_host_vec(&x.copy).unwrap();
+            assert_eq!(
+                got[0], 0x11111111,
+                "the destination keeps the source's original bytes"
+            );
+            assert_eq!(
+                source.bytes.atomic_u32(0).unwrap().load(Ordering::Acquire),
+                0x22222222
+            );
+        }
+    }
+
     /// The A6000 shape of the rule's own test, at the recalibrated family
     /// row and its calibration share: beside 13116.6, m* = 70.429,
     /// m_min 3606.

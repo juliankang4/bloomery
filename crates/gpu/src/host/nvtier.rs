@@ -4029,6 +4029,67 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn a_tick_claim_keeps_hits_named_after_its_first_miss() {
+        for kind in [Claim::Step, Claim::Keep, Claim::Transient] {
+            let arena = arena_of(8, 2);
+            let mut books = super::Books::default();
+            ensure_as(&arena, &mut books, &[2, 7], Claim::Step);
+            let claim = ensure_as(&arena, &mut books, &[1, 2], kind);
+            assert_eq!(claim.misses, 1, "{kind:?}: the later hit stays filled");
+            assert_eq!(filled_ids(&arena), [1, 2]);
+        }
+    }
+
+    #[test]
+    fn a_queued_drop_keeps_a_read_opened_after_the_request() {
+        const LAYER: usize = 1;
+        let scratch = Scratch::new("queued-read");
+        let mut tier = card_tier(&scratch);
+        tier.drops.queue().stop = true;
+        tier.drops.work.notify_all();
+        tier.dropper.lock().unwrap().take().unwrap().join().unwrap();
+        let arena = std::sync::Arc::get_mut(&mut tier).unwrap().by_layer[LAYER]
+            .as_mut()
+            .unwrap();
+        for (id, parts) in arena.parts.iter_mut().enumerate() {
+            parts.fill(PartRange {
+                at: (id * CARD_PAGE) as u64,
+                len: CARD_PAGE,
+                skew: 0,
+            });
+        }
+        tier.open_read(LAYER, 1).unwrap();
+        tier.end_read(LAYER, 1).unwrap();
+        tier.open_read(LAYER, 2).unwrap();
+        let arena = tier.by_layer[LAYER].as_ref().unwrap();
+        let want = tier.runs_of(arena, &arena.layer_marks(), "test").unwrap();
+        assert_eq!(
+            tier.drops.queue().pending[LAYER].as_ref(),
+            Some(&want),
+            "the queued ranges exclude every currently open read"
+        );
+        tier.end_read(LAYER, 2).unwrap();
+    }
+
+    #[test]
+    fn heat_counts_keep_the_same_rank_across_prompt_splits() {
+        use model::moe::TierSlots;
+        const LAYER: usize = 1;
+        let scratch = Scratch::new("heat-split");
+        let whole = eight_tier(&scratch, 2, NvTierEvict::Heat);
+        let split = eight_tier(&scratch, 2, NvTierEvict::Heat);
+        whole.note_union(LAYER, &[1, 2], &[0, 384, 512], 512, true);
+        split.note_union(LAYER, &[1], &[0, 384], 384, true);
+        split.note_union(LAYER, &[2], &[0, 128], 128, true);
+        let rank = |tier: &super::NvTier| {
+            tier.route_count(LAYER, 1)
+                .unwrap()
+                .total_cmp(&tier.route_count(LAYER, 2).unwrap())
+        };
+        assert_eq!(rank(&whole), rank(&split));
+    }
+
     /// A transient miss enters at the cold end and is the first victim,
     /// whatever claim takes the next slot: transients go oldest first (the
     /// order their call claimed them in), and only then the least recently
