@@ -117,9 +117,11 @@
 //! verified together, the round cut into passes at the body's
 //! `SlotRows::MAX_ROWS`), and its round of plain steps (a sampling or
 //! id-banning request's) as one pass of their rows, each row told to its
-//! slot's draft as its step alone would be (`rounds::step_rows_drafted`);
-//! on a load that drafts nothing every request steps, and the round of the
-//! busy slots' steps runs as one pass of their rows (`GpuModel::step_slots`,
+//! slot's draft as its step alone would be (`rounds::step_rows_drafted`).
+//! Either kind of round runs a slot at a time when it leaves an enabled
+//! slot 0 draft out: its shared arena must keep that draft's waiting rows
+//! across calls. On a load that drafts nothing every request steps, and the
+//! round of the busy slots' steps runs as one pass of their rows (`GpuModel::step_slots`,
 //! each row bit for bit its step alone). A lookup load runs its rounds a
 //! select and a call a row. The
 //! sequences are switched by pointer exchange, and one draft is held a
@@ -2566,6 +2568,17 @@ impl Q38 {
     }
 }
 
+/// A shared pass overwrites slot 0's refresh arena even when it runs only
+/// other slots. With slot 0's draft enabled, a round must consume and replace
+/// its refresh, or leave the arena alone by selecting each slot in turn.
+pub(crate) fn round_keeps_refresh(
+    mtp: bool,
+    zero_off: bool,
+    mut slots: impl Iterator<Item = usize>,
+) -> bool {
+    !mtp || zero_off || slots.any(|slot| slot == 0)
+}
+
 /// The cuts of a prompt call of the positions `first..end` fed by `feed`: the
 /// message starts (`marks`) inside the call where both runs keep at least
 /// `Prompt38::GEMM_FROM` ids, so each run is a ubatch walk and the bits are
@@ -2810,10 +2823,16 @@ impl Seat for Q38 {
     /// row's answer and lent logits row its own, slot 0 left selected; on
     /// an MTP-drafted load each row told to its slot's draft as its step
     /// would be ([`super::rounds::step_rows_drafted`]) — and the call's
-    /// `residency pass` records after it, else the fallback
-    /// (`bind::step_rows_in_turn`: a select and a step a row).
+    /// `residency pass` records after it. A round that leaves an enabled
+    /// slot 0 draft out runs the fallback (`bind::step_rows_in_turn`: a
+    /// select and a step a row), preserving its waiting hidden rows.
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
-        let one_pass = self.step_pass;
+        let one_pass = self.step_pass
+            && round_keeps_refresh(
+                self.drafts.mtp(),
+                self.drafts.is_off(0),
+                rows.iter().map(|r| r.slot),
+            );
         super::rounds::step_round(
             self,
             one_pass,
@@ -2841,15 +2860,22 @@ impl Seat for Q38 {
     /// round cut into passes at the body's `SlotRows::MAX_ROWS`, a slot
     /// whose draft a cut turned off stepped alone before them, and what the
     /// fallback loop's per-row `pass` would print at its slot printed first
-    /// — else the fallback (a select and a pass a row). The open decides
-    /// once, so a load that cannot run one pass never tries it at run time:
+    /// else the fallback (a select and a pass a row). A round that leaves
+    /// an enabled slot 0 draft out also runs the fallback, preserving its
+    /// refresh across calls. The open decides which loads can run one pass,
+    /// so a load without that support never tries it at run time:
     /// a refusal on either path is the server's to die on, never a
     /// fallback. The rows are distinct slots below [`Seat::slots`] (the
     /// engine's own named refusal), a slot whose draft skips rides the pass
     /// as one plain row and an off slot runs its own plain step, so no
     /// row-level fallback exists.
     fn pass_slots(&mut self, rows: &mut [SlotPassRow]) -> Result<(), String> {
-        let one_pass = self.one_pass;
+        let one_pass = self.one_pass
+            && round_keeps_refresh(
+                self.drafts.mtp(),
+                self.drafts.is_off(0),
+                rows.iter().map(|r| r.slot),
+            );
         super::rounds::pass_round(
             self,
             one_pass,

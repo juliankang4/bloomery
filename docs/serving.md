@@ -230,8 +230,10 @@ llama-server reads it, and the startup line says so). A count you set is never l
 inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
 token or one drafted pass. Where the body runs several slots' rows as one pass, the round reads the weights once for
 all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 and MiMo-V2.6-Flash (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
-request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows). A
-placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 or Qwen3.8 load, V4.1 with the
+request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows).
+Qwen3.8 also batches sampled steps on a drafting load. A Qwen3.8 step or verify round that leaves an enabled slot 0
+draft out runs each slot in turn, keeping slot 0's waiting hidden rows intact across the two kinds of call. A
+placed Qwen3-30B or Qwen3.6 (`--place a`), a sampled request on a drafting GLM-5.3 load, V4.1 with the
 lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
