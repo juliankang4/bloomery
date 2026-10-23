@@ -1369,6 +1369,47 @@ mod tests {
     }
 
     #[test]
+    fn a_target_opens_when_only_nextn_quantization_is_refused() {
+        let (config, table) = small_glm();
+        let dir = temp_dir("nextn-refusal");
+        for prefix in ["model.language_model.", "model.", ""] {
+            let table: Vec<_> = table
+                .iter()
+                .map(|(n, s)| (n.replace("model.language_model.", prefix), s.clone()))
+                .collect();
+            for suffix in ["eh_proj.weight", "mlp.experts.0.down_proj.weight"] {
+                let refused = format!("{prefix}layers.3.{suffix}");
+                write_small(&dir, &config, &table, &[]);
+                let folder = Folder::open(&dir).unwrap();
+                let entries: Vec<_> = folder
+                    .names()
+                    .map(|n| {
+                        let r = folder.raw(n).unwrap();
+                        (n, if n == refused { "U32" } else { "F32" }, r.shape, r.bytes)
+                    })
+                    .collect();
+                let bytes = safetensors::write(&entries);
+                drop(folder);
+                std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+                let r = read(&dir).unwrap();
+                let e = placed_map(r.all, &r.config, &r.table).err().unwrap();
+                let e = e.to_string();
+                assert!(e.contains(&refused) && e.contains("U32"), "{e}");
+                let (_, tensors, checkpoint) = open(&dir).unwrap_or_else(|e| panic!("{refused}: {e}"));
+                assert!(tensors.iter().all(|t| !t.name.starts_with("blk.3.")));
+                assert!(checkpoint.made().keys().all(|n| !n.starts_with("blk.3.")));
+                let parts = checkpoint.plan(|_, _, _| Ok::<_, String>(Take::Whole)).unwrap();
+                assert!(!parts.is_empty());
+                for part in &parts {
+                    checkpoint.read(part).unwrap();
+                }
+                println!("TARGET_OK {refused}; NEXTN_REFUSED {e}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_folder_requires_the_whole_configured_text_model() {
         let (config, table) = small_glm();
         let dir = temp_dir("tp-folder");
