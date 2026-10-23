@@ -1074,6 +1074,7 @@ fn stream(
         prompt,
         mut parser,
     } = plan;
+    let peer = w.try_clone()?;
     let mut stream: Option<EventStream<'_>> = None;
     let mut w_opt = Some(w);
     let mut frames = Frames::default();
@@ -1118,7 +1119,7 @@ fn stream(
             }
             frames.send(s, events)
         };
-        run_gen(state, &input, prompt, &p, &mut sink).map(|(o, _)| o)
+        run_gen(state, &input, prompt, &p, peer, &mut sink).map(|(o, _)| o)
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),

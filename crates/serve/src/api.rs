@@ -195,6 +195,9 @@ pub const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(5);
 /// How long one read inside a request may wait (llama-server's `--timeout`).
 const REQUEST_READ: Duration = Duration::from_secs(600);
 
+/// The longest a response write may make no progress.
+const RESPONSE_WRITE: Duration = Duration::from_secs(10);
+
 /// How long the accept loop waits after a failed `accept` that will fail again
 /// at once: out of descriptors or memory, or the same failure twice in a row.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
@@ -1069,9 +1072,37 @@ where
 
 /// Answers a connection the server does not serve with a 503 carrying
 /// `Retry-After`, then closes it after reading what the client sent, for at most
-/// about [`REFUSE_DRAIN`] twice.
-fn refuse(mut stream: TcpStream, message: &str) {
-    let _ = stream.set_write_timeout(Some(REFUSE_DRAIN));
+/// about [`REFUSE_DRAIN`] twice. Refusals use one worker with at most
+/// [`MAX_CONNECTIONS`] queued sockets; a full queue closes a new socket at once.
+fn refuse(stream: TcpStream, message: &str) {
+    static REFUSALS: OnceLock<mpsc::SyncSender<(TcpStream, String)>> = OnceLock::new();
+    let refusals = REFUSALS.get_or_init(|| {
+        let (send, receive) = mpsc::sync_channel::<(TcpStream, String)>(MAX_CONNECTIONS);
+        if let Err(e) = thread::Builder::new()
+            .name("serve-refuse".into())
+            .spawn(move || {
+                for (stream, message) in receive {
+                    write_refusal(stream, &message);
+                }
+            })
+        {
+            eprintln!("bloomery-serve: cannot start the connection refusal writer: {e}");
+        }
+        send
+    });
+    match refusals.try_send((stream, message.to_owned())) {
+        Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            eprintln!("bloomery-serve: the connection refusal writer stopped");
+        }
+    }
+}
+
+/// Writes and drains a refusal on the bounded refusal worker.
+fn write_refusal(mut stream: TcpStream, message: &str) {
+    if stream.set_write_timeout(Some(REFUSE_DRAIN)).is_err() {
+        return;
+    }
     let body = error_body(503, "unavailable_error", message);
     let sent = http::respond(
         &mut stream,
@@ -1189,6 +1220,9 @@ pub(crate) fn keep_alive(
     mut route: impl FnMut(&Request, &mut TcpStream) -> io::Result<bool>,
 ) {
     let _ = stream.set_nodelay(true);
+    if stream.set_write_timeout(Some(RESPONSE_WRITE)).is_err() {
+        return;
+    }
     let Ok(mut w) = stream.try_clone() else {
         return;
     };
@@ -3120,6 +3154,7 @@ fn run_gen(
     input: &Prompt,
     prompt: Value,
     p: &GenParams,
+    peer: TcpStream,
     sink: &mut dyn FnMut(Event<'_>, usize) -> io::Result<()>,
 ) -> Result<(Result<Outcome, GenError>, usize), ApiError> {
     if let Some(reason) = state.fatal() {
@@ -3149,6 +3184,10 @@ fn run_gen(
     // slot, as any refused sampling field does.
     let sampler = genloop::sampler_of(&state.shared.sampler, p)
         .map_err(|e| invalid(format!("the sampler refuses the sampling parameters: {e}")))?;
+    let client = Arc::new(Client {
+        stream: peer,
+        gone: AtomicBool::new(false),
+    });
     let (events, rx) = mpsc::channel();
     let submit = Submit {
         p: p.clone(),
@@ -3157,6 +3196,7 @@ fn run_gen(
         media: input.feeds.clone(),
         sampler,
         events,
+        client: Arc::clone(&client),
     };
     relock(&state.shared.board)
         .enqueue(input.held.clone(), submit)
@@ -3164,10 +3204,24 @@ fn run_gen(
     state.shared.work.notify_one();
     let mut slot = None;
     loop {
-        let Ok(m) = rx.recv() else {
-            return Err(engine_gone(state, slot.is_some()));
-        };
         let at = slot.unwrap_or(0);
+        if (slot.is_none() || !p.stream)
+            && let Err(e) = client.check()
+        {
+            return Ok((Err(GenError::Client(e)), at));
+        }
+        let received = if p.stream && slot.is_some() {
+            rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            rx.recv_timeout(Duration::from_millis(100))
+        };
+        let m = match received {
+            Ok(m) => m,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(engine_gone(state, slot.is_some()));
+            }
+        };
         let sent = match m {
             Msg::Started(s) => {
                 slot = Some(s);
@@ -3197,22 +3251,32 @@ pub(crate) fn client_gone() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "the client went away")
 }
 
-/// Whether the client of `w` is still there, asked at the generation's
-/// events: a one-byte peek with the socket in non-blocking mode, so nothing
-/// waits and no byte of a pipelined next request is consumed. Readable bytes
-/// and nothing to read are a client; no bytes at all (`Ok(0)`), a reset or an
-/// abort are [`client_gone`]; any other failure is returned as it is. The
-/// socket is blocking again on return, on every path: the connection's reader
-/// shares it, and the answer is written to it.
+/// The response side's failure shared by the HTTP and engine threads. A socket
+/// error is consumed by `take_error`, so the first observer remembers it.
+pub(crate) struct Client {
+    stream: TcpStream,
+    gone: AtomicBool,
+}
+
+impl Client {
+    pub(crate) fn check(&self) -> io::Result<()> {
+        if self.gone.load(Ordering::Acquire) {
+            return Err(client_gone());
+        }
+        let result = probe_client(&self.stream);
+        if result.is_err() {
+            self.gone.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+
+/// A transport error ends a request. Read EOF alone also describes a client
+/// that closed only its write side and is still waiting for the response.
 fn probe_client(w: &TcpStream) -> io::Result<()> {
-    w.set_nonblocking(true)?;
-    let peeked = w.peek(&mut [0u8; 1]);
-    w.set_nonblocking(false)?;
-    match peeked {
-        Ok(0) => Err(client_gone()),
-        Ok(_) => Ok(()),
-        Err(e) => match e.kind() {
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(()),
+    match w.take_error()? {
+        None => Ok(()),
+        Some(e) => match e.kind() {
             io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::BrokenPipe
@@ -3223,11 +3287,10 @@ fn probe_client(w: &TcpStream) -> io::Result<()> {
 }
 
 /// [`run_gen`] for a request that answers once the generation is whole: it
-/// sends nothing while the generation runs, so its sink only watches the
-/// client of `w` ([`probe_client`]), and a client that closed ends the request
-/// at the next event, as a stream's failed write does. The outer error is that
-/// client's, whose connection ends with no answer; the inner one the request's
-/// answer, an engine error a 500.
+/// sends nothing while the generation runs. The shared transport check ends
+/// a failed connection while preserving a client's write-side shutdown. The
+/// outer error is that client's, whose connection ends with no answer; the
+/// inner one is the request's answer, an engine error a 500.
 fn run_whole(
     state: &State,
     input: &Prompt,
@@ -3235,7 +3298,7 @@ fn run_whole(
     p: &GenParams,
     w: &TcpStream,
 ) -> io::Result<Result<(Outcome, usize), ApiError>> {
-    match run_gen(state, input, prompt, p, &mut |_, _| probe_client(w)) {
+    match run_gen(state, input, prompt, p, w.try_clone()?, &mut |_, _| Ok(())) {
         Err(e) => Ok(Err(e)),
         Ok((Err(GenError::Client(e)), _)) => Err(e),
         Ok((Err(e), _)) => Ok(Err(engine_error(&e))),
@@ -3705,6 +3768,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
             ),
         };
     }
+    let peer = w.try_clone()?;
     let mut stream: Option<EventStream<'_>> = None;
     let mut w_opt = Some(w);
     let tpt = p.timings_per_token;
@@ -3744,7 +3808,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
             };
             sse(s, &v)
         };
-        run_gen(state, &input, prompt.clone(), &p, &mut sink)
+        run_gen(state, &input, prompt.clone(), &p, peer, &mut sink)
     };
     let slot = r.as_ref().map_or(0, |(_, slot)| *slot);
     finish_stream(req, stream, w_opt, r.map(|(o, _)| o), |s, o| {
@@ -4035,6 +4099,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             },
         };
     }
+    let peer = w.try_clone()?;
     let mut stream: Option<EventStream<'_>> = None;
     let mut w_opt = Some(w);
     let tpt = p.timings_per_token;
@@ -4104,7 +4169,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 }
             }
         };
-        run_gen(state, &input, prompt, &p, &mut sink).map(|(o, _)| o)
+        run_gen(state, &input, prompt, &p, peer, &mut sink).map(|(o, _)| o)
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),
@@ -6502,8 +6567,8 @@ mod tests {
 
         /// The probe over a real socket pair: a quiet peer and a peer with
         /// bytes pending are clients (the bytes are still there to read, the
-        /// next request's among them), a peer that closed is gone, and the
-        /// socket is blocking again after a probe that found a client — the
+        /// next request's among them), read EOF permits an answer, and the
+        /// socket stays blocking after a probe that found a client — the
         /// connection's reader shares it.
         #[test]
         fn the_probe_tells_a_client_from_a_gone_one_and_leaves_the_socket_blocking() {
@@ -6528,16 +6593,16 @@ mod tests {
 
             drop(client);
             assert_eq!(server.read(&mut got).expect("the end of the stream"), 0);
-            let gone = probe_client(&server).expect_err("a closed client is gone");
-            assert_eq!(gone.kind(), io::ErrorKind::BrokenPipe, "{gone}");
-            assert_eq!(gone.to_string(), "the client went away");
+            // PIN(2026-10-23): EOF permits a response to a write-side shutdown; reset is checked separately.
+            probe_client(&server).expect("EOF alone does not close the response side");
         }
 
-        /// A whole-answer request whose client closes its socket after the
+        /// A whole-answer request whose client resets its socket after the
         /// generation started ends at the next event and frees its slot. The
         /// engine is held at a gate and given one step at a time: a
         /// generation that is not cancelled takes every step the test gives,
         /// to a context the mock never ends, and the slot is still running.
+        #[cfg(unix)]
         #[test]
         fn a_whole_answer_whose_client_closed_ends_at_the_next_event() {
             const STEPS: usize = 24;
@@ -6564,7 +6629,7 @@ mod tests {
             );
             wait_for("the generation's first step", || called() >= 1);
             assert!(!free(), "the request holds the slot");
-            drop(client);
+            reset(client);
 
             for step in 1..=STEPS {
                 permit.send(()).expect("the engine holds its gate");

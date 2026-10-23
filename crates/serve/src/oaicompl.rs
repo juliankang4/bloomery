@@ -76,6 +76,7 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
             Ok((o, _)) => send_json(w, req, 200, &answer(&ids, &o, &o.content)),
         };
     }
+    let peer = w.try_clone()?;
     let mut stream: Option<EventStream<'_>> = None;
     let mut w_opt = Some(w);
     let tpt = p.timings_per_token;
@@ -107,7 +108,7 @@ pub(super) fn completions(state: &State, req: &Request, w: &mut TcpStream) -> io
             };
             sse(s, &v)
         };
-        run_gen(state, &input, prompt, &p, &mut sink)
+        run_gen(state, &input, prompt, &p, peer, &mut sink)
     };
     finish_stream(req, stream, w_opt, r.map(|(o, _)| o), |s, o| {
         sse(s, &answer(&ids, o, ""))?;

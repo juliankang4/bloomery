@@ -19,7 +19,7 @@
 //! last event is sent, so the response a client reads finds the slot free
 //! and the counters final. A client gone ends its request at the next event,
 //! a stream's or a whole answer's alike: its HTTP thread's sink fails (a
-//! stream's write, a whole answer's socket reading closed), the thread drops
+//! stream's write or the shared transport-error check), the thread drops
 //! its channel, the engine thread's send fails, and the slot is released.
 //!
 //! An engine whose slots take it in turns ([`Engine::turns`]) is run by the
@@ -115,6 +115,7 @@ pub(crate) struct Submit {
     /// ([`crate::genloop::sampler_of`]).
     pub sampler: Option<Sampler>,
     pub events: mpsc::Sender<Msg>,
+    pub client: Arc<crate::api::Client>,
 }
 
 /// What the engine thread tells a request's HTTP thread.
@@ -627,6 +628,10 @@ impl Worker {
     /// [`Worker::prompts`] runs one a round ([`Worker::interleaves`]).
     /// Returns whether it runs on (an error ended it otherwise).
     fn start(&mut self, slot: usize, held: &Held, sub: Submit) -> Result<bool, Dead> {
+        if sub.client.check().is_err() || sub.events.send(Msg::Started(slot)).is_err() {
+            relock(&self.sh.board).release(slot);
+            return Ok(false);
+        }
         let Submit {
             p,
             prompt,
@@ -634,8 +639,8 @@ impl Worker {
             media,
             sampler,
             events,
+            client: _,
         } = sub;
-        let _ = events.send(Msg::Started(slot));
         *relock(&self.sh.board).view_mut(slot) = SlotView {
             id_task: self.sh.next_id(),
             prompt,
@@ -1129,6 +1134,11 @@ impl Worker {
     /// prompt runs, and its turn begins.
     fn begin(&mut self) -> Result<(), Dead> {
         let p = self.t_mut().pending.remove(0);
+        if p.sub.client.check().is_err() {
+            relock(&self.sh.board).release(p.slot);
+            self.show_turns();
+            return Ok(());
+        }
         match self.switch(p.slot, true)? {
             Switched::Refused(why) => {
                 relock(&self.sh.stats).n_swap_refused_total += 1;

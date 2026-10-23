@@ -3,13 +3,13 @@
 //! A clip arrives as base64 inside a request ([`crate::media::Part::Video`]). It is written to a
 //! temp file (an mp4 with its index at the end needs to seek, which a pipe cannot), probed with
 //! ffprobe ([`Decoder::probe`]; a stream whose container states no frame count is decoded once to
-//! count them, on the decoder's threads and within [`PROBE_LIMIT`]), planned by the one planner
+//! count them, on the decoder's threads and within [`READ_LIMIT`]), planned by the one planner
 //! (`vision::video::plan`), and decoded by ffmpeg at its native size: only the planned frames,
 //! streamed one at a time, each handed on as soon as it arrives so the request thread resizes and
 //! patches a group while ffmpeg decodes toward the next ([`PlannedClip::prepare`]). Memory is one
-//! group of frames and the patches. Both commands read the clip's file only through the demuxers of
-//! [`VIDEO_FORMATS`] and the `file` protocol, so a playlist inside the bytes cannot lead them to
-//! another file.
+//! group of frames, one frame being read ahead, and the patches. Both commands read the clip's
+//! file only through the demuxers of [`VIDEO_FORMATS`] and the `file` protocol, so a playlist
+//! inside the bytes cannot lead them to another file.
 //!
 //! ffmpeg and ffprobe come from `PATH`, found once at startup ([`FfmpegDecoder::detect`]); an absent
 //! or too old one is a named error that names both remedies, never a fallback. The decoder is a
@@ -285,8 +285,8 @@ impl VideoSupport {
 pub struct FfmpegDecoder {
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
-    /// The longest one ffprobe run may take.
-    probe_limit: Duration,
+    /// The longest one ffprobe run or one selected frame may take.
+    read_limit: Duration,
     /// The longest ffmpeg may take to end after the last planned frame.
     exit_limit: Duration,
     /// The version text ffmpeg printed, for the startup line.
@@ -327,7 +327,7 @@ impl FfmpegDecoder {
         Ok(FfmpegDecoder {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
-            probe_limit: PROBE_LIMIT,
+            read_limit: READ_LIMIT,
             exit_limit: EXIT_LIMIT,
             version,
         })
@@ -505,10 +505,10 @@ fn first_lines(text: &[u8]) -> String {
     }
 }
 
-/// The longest an ffprobe run on a client's clip may take before it is killed and the clip refused.
-/// A container that states no frame count is decoded whole to count its frames, work that grows
-/// with the frames the clip holds, which the request's byte limit does not bound.
-const PROBE_LIMIT: Duration = Duration::from_secs(60);
+/// The longest a probe run or a selected frame read may take before the decoder is stopped.
+/// A probe can decode the clip to count frames, and a frame read can stall inside its bytes;
+/// neither operation's running time is bounded by the request's byte limit.
+const READ_LIMIT: Duration = Duration::from_secs(60);
 
 /// How often a process run under a limit is checked for its end.
 const LIMIT_POLL: Duration = Duration::from_millis(10);
@@ -587,7 +587,7 @@ fn output_within(
 impl FfmpegDecoder {
     /// ffprobe's report of the clip's first video stream (`v:0`, the stream [`Decoder::decode`]
     /// maps). With `count` ffprobe also decodes the stream and counts its frames, on that many
-    /// threads (0: its own choice). A run past [`FfmpegDecoder::probe_limit`] is killed and refused.
+    /// threads (0: its own choice). A run past [`FfmpegDecoder::read_limit`] is killed and refused.
     fn probe_stream(&self, clip: &Clip, count: Option<usize>) -> Result<Probed, VideoError> {
         let mut cmd = Command::new(&self.ffprobe);
         restrict_input(&mut cmd);
@@ -606,8 +606,8 @@ impl FfmpegDecoder {
             .args(["-of", "json"])
             .arg(clip.path()?)
             .stdin(Stdio::null());
-        let out = output_within(&mut cmd, clip.path()?, self.probe_limit)?.ok_or_else(|| {
-            let limit = self.probe_limit;
+        let out = output_within(&mut cmd, clip.path()?, self.read_limit)?.ok_or_else(|| {
+            let limit = self.read_limit;
             VideoError::Probe(if count.is_some() {
                 format!(
                     "counting the stream's frames ran past {limit:?} and was stopped; send a \
@@ -677,15 +677,14 @@ impl Decoder for FfmpegDecoder {
         let log = TempFile(log_path);
         cmd.stderr(Stdio::from(file));
         let mut child = cmd.spawn().map_err(|e| VideoError::Decode(e.to_string()))?;
-        let got = read_frames(&mut child, meta, indices, each);
+        let got = read_frames(&mut child, meta, indices, self.read_limit, each);
         // A reader that stopped or failed is done with the process, whatever it was doing. One that
         // took every planned frame lets ffmpeg end on its own, within `exit_limit`, so its status
         // is the decode's.
         let waited = if matches!(&got, Ok(Done::All)) {
             wait_within(&mut child, self.exit_limit)
         } else {
-            let _ = child.kill();
-            child.wait().map(Some)
+            wait_within(&mut child, Duration::ZERO)
         };
         let mut stderr = Vec::new();
         if let Ok(f) = std::fs::File::open(&log.0) {
@@ -707,6 +706,11 @@ impl Decoder for FfmpegDecoder {
                 ))),
                 Err(e) => Err(VideoError::Decode(format!("waiting for ffmpeg: {e}"))),
             },
+            Err(ReadError::Timeout(limit)) => Err(VideoError::Decode(format!(
+                "reading a frame ran past {limit:?} and was stopped; {}",
+                first_lines(&stderr)
+            ))),
+            Err(ReadError::Io(e)) => Err(VideoError::Decode(format!("reading a frame: {e}"))),
             Err(ReadError::Short(got)) => {
                 let said = first_lines(&stderr);
                 if said == "no message" {
@@ -737,23 +741,76 @@ enum Done {
 }
 
 enum ReadError {
+    Timeout(Duration),
+    Io(std::io::Error),
     /// The stream ended with this many whole frames.
     Short(usize),
     /// The stream ended inside a frame of `frame` bytes.
-    Size { got: usize, frame: usize },
+    Size {
+        got: usize,
+        frame: usize,
+    },
 }
 
-/// Read the child's raw rgb24 frames, one per index, handing each on.
+/// Reads selected frames through a rendezvous channel: one frame at a time,
+/// with a deadline even when the decoder stalls inside a frame. The consumer
+/// and its preparation callback stay on the request thread.
 fn read_frames(
     child: &mut Child,
     meta: &ClipMeta,
     indices: &[usize],
+    limit: Duration,
     each: &mut dyn FnMut(usize, Rgb8) -> bool,
 ) -> Result<Done, ReadError> {
-    let Some(stdout) = child.stdout.as_mut() else {
+    let Some(mut stdout) = child.stdout.take() else {
         return Err(ReadError::Short(0));
     };
-    frames_from(stdout, meta, indices, each)
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::sync_channel(0);
+        let reader = std::thread::Builder::new()
+            .name("video-frame".into())
+            .spawn_scoped(scope, move || {
+                frames_from(&mut stdout, meta, indices, &mut |index, frame| {
+                    send.send((index, frame)).is_ok()
+                })
+            })
+            .map_err(ReadError::Io)?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut result = Ok(Done::All);
+            for _ in indices {
+                match receive.recv_timeout(limit) {
+                    Ok((index, frame)) => {
+                        if !each(index, frame) {
+                            result = Ok(Done::Stopped);
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        result = Err(ReadError::Timeout(limit));
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            result
+        }));
+        drop(receive);
+        // Killing before the join releases a reader blocked inside a partial frame.
+        let stopped = if matches!(result, Ok(Ok(Done::All))) {
+            Ok(())
+        } else {
+            wait_within(child, Duration::ZERO).map(|_| ())
+        };
+        let read = reader
+            .join()
+            .map_err(|_| ReadError::Io(std::io::Error::other("the frame reader panicked")))?;
+        stopped.map_err(ReadError::Io)?;
+        match result {
+            Ok(Ok(Done::All)) => read,
+            Ok(other) => other,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
 }
 
 /// [`read_frames`] over any reader: the frame loop, testable without a process.
@@ -778,7 +835,7 @@ fn frames_from(
                 }
                 Ok(n) => at += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return Err(ReadError::Short(k)),
+                Err(e) => return Err(ReadError::Io(e)),
             }
         }
         let image = Rgb8 {
@@ -1355,13 +1412,13 @@ mod tests {
     }
 
     /// A decoder whose ffmpeg and ffprobe are the scripts `ffmpeg` and `ffprobe`, its ffprobe runs
-    /// ending after `probe_limit`.
+    /// ending after `read_limit`.
     #[cfg(unix)]
-    fn fake_decoder(ffmpeg: &TempFile, ffprobe: &TempFile, probe_limit: Duration) -> FfmpegDecoder {
+    fn fake_decoder(ffmpeg: &TempFile, ffprobe: &TempFile, read_limit: Duration) -> FfmpegDecoder {
         FfmpegDecoder {
             ffmpeg: ffmpeg.0.clone(),
             ffprobe: ffprobe.0.clone(),
-            probe_limit,
+            read_limit,
             exit_limit: EXIT_LIMIT,
             version: String::new(),
         }
@@ -1383,7 +1440,7 @@ mod tests {
         let ends = |ending: &str| {
             let ffmpeg = fake_tool("ffmpeg", &format!("head -c 18 /dev/zero\n{ending}"));
             let ffprobe = fake_tool("ffprobe", "exit 99");
-            let decoder = fake_decoder(&ffmpeg, &ffprobe, PROBE_LIMIT);
+            let decoder = fake_decoder(&ffmpeg, &ffprobe, READ_LIMIT);
             let mut seen = 0;
             let r = decoder.decode(&clip, &meta, &[0, 1, 2], 0, &mut |_, _| {
                 seen += 1;
@@ -1422,7 +1479,7 @@ mod tests {
         // `exec` leaves no child of the script holding ffmpeg's pipes open past the kill.
         let ffmpeg = fake_tool("ffmpeg", "head -c 18 /dev/zero\nexec sleep 20");
         let ffprobe = fake_tool("ffprobe", "exit 99");
-        let mut decoder = fake_decoder(&ffmpeg, &ffprobe, PROBE_LIMIT);
+        let mut decoder = fake_decoder(&ffmpeg, &ffprobe, READ_LIMIT);
         decoder.exit_limit = Duration::from_secs(1);
         let mut seen = 0;
         let started = Instant::now();
@@ -1497,7 +1554,7 @@ mod tests {
         let clip = Clip::new(b"not read".to_vec(), None);
         let ffmpeg = fake_tool("ffmpeg", "head -c 6 /dev/zero\nexec sleep 2");
         let ffprobe = fake_tool("ffprobe", "exit 99");
-        let decoder = fake_decoder(&ffmpeg, &ffprobe, PROBE_LIMIT);
+        let decoder = fake_decoder(&ffmpeg, &ffprobe, READ_LIMIT);
         let started = Instant::now();
         assert!(
             decoder
@@ -1571,7 +1628,7 @@ case " $* " in
 esac"#
             .replace("CALLS", &calls.0.display().to_string());
         let (ffmpeg, ffprobe) = (fake_tool("ffmpeg", "exit 99"), fake_tool("ffprobe", &body));
-        let decoder = fake_decoder(&ffmpeg, &ffprobe, PROBE_LIMIT);
+        let decoder = fake_decoder(&ffmpeg, &ffprobe, READ_LIMIT);
         for threads in [3, 0] {
             let _ = std::fs::remove_file(&calls.0);
             let meta = decoder.probe(&clip, threads).expect("the probe");
