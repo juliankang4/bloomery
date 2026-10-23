@@ -690,7 +690,7 @@ fn read_stream(addr: SocketAddr, body: &Value, seen: &Mutex<Vec<SeenChunk>>) {
 }
 
 fn read_chunks(mut s: impl Read, seen: &Mutex<Vec<SeenChunk>>) {
-    let mut held = String::new();
+    let mut held = Vec::new();
     let mut buf = [0u8; 8192];
     let mut head = true;
     loop {
@@ -699,21 +699,21 @@ fn read_chunks(mut s: impl Read, seen: &Mutex<Vec<SeenChunk>>) {
             Ok(n) => n,
             Err(e) => panic!("stream read: {e}"),
         };
-        held.push_str(&String::from_utf8_lossy(&buf[..n]));
+        held.extend_from_slice(&buf[..n]);
         if head {
-            let Some(at) = held.find("\r\n\r\n") else {
+            let Some(at) = held.windows(4).position(|w| w == b"\r\n\r\n") else {
                 continue;
             };
             held.drain(..at + 4);
             head = false;
         }
-        while let Some(at) = held.find("\n\n") {
-            let frame = held[..at].to_owned();
-            held.drain(..at + 2);
+        while let Some(at) = held.windows(2).position(|w| w == b"\n\n") {
+            let frame = std::str::from_utf8(&held[..at]).expect("UTF-8 SSE frame");
             let Some(payload) = frame.strip_prefix("data: ") else {
                 panic!("a frame that is no payload: {frame}");
             };
             let v: Value = serde_json::from_str(payload).expect("chunk JSON");
+            held.drain(..at + 2);
             let slot = v["id_slot"].as_u64().expect("id_slot");
             let last = v["stop"].as_bool().expect("stop");
             seen.lock()
@@ -721,6 +721,11 @@ fn read_chunks(mut s: impl Read, seen: &Mutex<Vec<SeenChunk>>) {
                 .push((Instant::now(), slot, last, v));
         }
     }
+    assert!(!head, "stream closed before the HTTP head ended");
+    assert!(
+        held.is_empty(),
+        "stream closed with an incomplete SSE frame"
+    );
 }
 
 #[test]

@@ -119,12 +119,27 @@ impl Reply {
 
 /// One request over a fresh HTTP/1.0 connection.
 pub fn call(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> Reply {
+    call_headers(addr, method, path, &[], body)
+}
+
+/// One HTTP/1.0 request with additional headers over a fresh connection.
+pub fn call_headers(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> Reply {
     let mut s = TcpStream::connect(addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(60)))
         .expect("timeout");
     let body = body.unwrap_or("");
+    let extra: String = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
     let req = format!(
-        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
     s.write_all(req.as_bytes()).expect("write");
