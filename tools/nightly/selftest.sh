@@ -36,14 +36,27 @@ with tempfile.TemporaryDirectory(prefix="output-owner-") as tmp:
     t = pathlib.Path(tmp)
     def run(body, *args):
         return subprocess.run(["bash", "-c", body, "_", *map(str, args)],
-                              capture_output=True, text=True, timeout=10)
+                              input="release\n", capture_output=True, text=True, timeout=10)
     common = 'set -euo pipefail; ROOT=$1; OUT=$2; DRY=0; RC=73; die() { echo "$*" >&2; exit "$RC"; }; '
     contrib = (root / "tools/contrib-check.sh").read_text()
     allocation = contrib[contrib.index('STAMP=$(date '):contrib.index("add fmt ")]
-    body = common + 'date() { echo same-second; }; ' + allocation + '\nprintf "%s\\n" "$LOGDIR"'
-    a, b = (run(body, t, t / "unused") for _ in range(2))
-    check("contrib-check same-second plans stay private",
-          a.returncode == b.returncode == 0 and a.stdout != b.stdout, (a.stdout + b.stdout).strip())
+    body = common + 'date() { echo same-second; }; TIER=t0; BOUND=10; '
+    body += 'run_unit() { UNIT_RC=0; bash -c "$1" > "$2" 2>&1 || UNIT_RC=$?; UNIT_SECS=0; }; unit_failure() { :; }; '
+    body += allocation + '\nadd "$3" "$4"; echo ready; read -r release;\n'
+    body += contrib[contrib.index('# ---- run ----'):]
+    first = subprocess.Popen(["bash", "-c", body, "_", str(t), str(t / "unused"), "inject-fail", "exit 101"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        ready = first.stdout.readline().strip()
+        other = run(body, t, t / "unused", "fmt", "true")
+        stdout, stderr = first.communicate("release\n", timeout=10)
+        check("contrib-check keeps a requested failure after a same-second run",
+              ready == "ready" and first.returncode == 1 and other.returncode == 0 and "inject-fail rc=101" in stdout,
+              f"first={first.returncode} other={other.returncode} {stdout.strip()} {stderr.strip()}")
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.communicate()
 
     gate = (root / "tools/gate-batch.sh").read_text()
     end = gate.index('RUNLOG=$OUT/run.log')
