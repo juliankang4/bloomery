@@ -52,7 +52,7 @@
 #   preheat-fail the preheat arms on a second fixture whose second shard the stub llama-bench removes when it
 #                runs (STUB_BENCH_RM): the hand-set arm's warm-up and row read shard 1 alone (K=1) and
 #                run; the fit twin's preheats (K=2) cannot open shard 2: its warm-up's and its row's FAIL
-#                rows carry the preheat's rc 2 and its message, the runner rc 1. Red on a runner that loses the preheat's rc.
+#                rows carry the preheat's rc 2, its message and separate full output files, the runner rc 1.
 #   ours-timed   6 through the stub generate_glm5next (needs the profile's prose ids, copied from
 #                $BLOOMERY_DATA; skipped, and said so, without them), preheat on at GLM_PREHEAT_K 2 on the
 #                fixture: each ours row counts its faults from the `fed` line and prints the whole
@@ -519,7 +519,7 @@ L=$tmp/fit-fail.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_BENCH_FIT_FAIL=1 -- lcpp27752fit:6 lcpp27754ppfit:4 lcpp27752:6
 if [ "$RC" != 1 ]; then
   fail fit-fail "rc $RC, want 1" "$L"
-elif want fit-fail "$L" 1 "^FAIL r1 lcpp27752fit d=6 rc=0 \| llama-bench.s fit failed, and llama-bench loads without it: common_fit_params: failed to fit params to free device memory: stub \| full output: " &&
+elif want fit-fail "$L" 1 "^FAIL r1 lcpp27752fit d=6 rc=0 \| llama-bench.s fit failed, and llama-bench loads without it: common_fit_params: failed to fit params to free device memory: stub; last line: .* \| full output: " &&
   want fit-fail "$L" 1 "^FAIL r1 lcpp27754ppfit p=4 rc=0 \| llama-bench.s fit failed, " &&
   want fit-fail "$L" 1 '^ROW r1 lcpp27752 d=6 ' &&
   want fit-fail "$L" 0 '^ROW r1 lcpp2775[24](pp)?fit ' &&
@@ -532,9 +532,32 @@ stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_BENCH_FIT_FAIL=1 ST
 if [ "$RC" != 1 ]; then
   fail fit-exit "rc $RC, want 1" "$L"
 elif want fit-exit "$L" 1 "^FAIL r1 lcpp27752fit d=6 rc=1 \| exited 1; llama-bench.s fit failed, and llama-bench loads without it: common_fit_params: " &&
-  want fit-exit "$L" 1 '^FAIL r1 lcpp27754 d=6 rc=1 \| exited 1 \| full output: ' &&
+  want fit-exit "$L" 1 '^FAIL r1 lcpp27754 d=6 rc=1 \| exited 1; last line: .* \| full output: ' &&
   want fit-exit "$L" 0 '^ROW '; then
   pass fit-exit
+fi
+
+L=$tmp/fail-logs-first.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_BENCH_FAIL_K=36 -- lcpp27754:512
+RC1=$RC
+first=$(sed -n 's/^FAIL r1 lcpp27754 d=512 .* | full output: //p' "$L")
+saved=$(cat "$first" 2> /dev/null)
+L2=$tmp/fail-logs-second.log
+stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_BENCH_FAIL_K=36 -- lcpp27754:512
+second=$(sed -n 's/^FAIL r1 lcpp27754 d=512 .* | full output: //p' "$L2")
+if [ "$RC1" != 1 ] || [ "$RC" != 1 ]; then
+  fail fail-logs "rc $RC1 and $RC, want 1 and 1" "$L2"
+elif [ "$first" = "$second" ] || [ ! -f "$first" ] || [ ! -f "$second" ]; then
+  fail fail-logs "repeated failed arms need distinct output files: $first, $second" "$L2"
+elif [ "$saved" != "$(cat "$first")" ]; then
+  fail fail-logs "the first failed arm's output changed" "$L"
+elif want fail-logs "$first" 1 '^FAIL r1 lcpp27754 d=512 rc=1$' &&
+  want fail-logs "$second" 1 '^FAIL r1 lcpp27754 d=512 rc=1$' &&
+  want fail-logs "$first" 1 '^llama_init_from_model: failed to create context ' &&
+  want fail-logs "$second" 1 '^llama_init_from_model: failed to create context ' &&
+  want fail-logs "$L" 1 '^failed arms: r1:lcpp27754@d=512$' &&
+  want fail-logs "$L2" 1 '^failed arms: r1:lcpp27754@d=512$'; then
+  pass fail-logs
 fi
 
 L=$tmp/fit-nobench.log
@@ -628,10 +651,18 @@ FIX2=$tmp/fix2-00001-of-00002.gguf
 python3 "$ROOT/tools/ref/gguf-ranges.py" fixture "$FIX2" || { echo "FAIL setup: gguf-ranges.py fixture"; exit 1; }
 L=$tmp/preheat-fail.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 "${PH_ENV[@]}" BLOOMERY_REF_MODEL="$FIX2" STUB_BENCH_RM="${FIX2%-00001-of-00002.gguf}-00002-of-00002.gguf" -- lcpp27752:6 lcpp27752fit:6
+first=$(sed -n 's/^FAIL r0 lcpp27752fit d=6 .* | full output: //p' "$L")
+second=$(sed -n 's/^FAIL r1 lcpp27752fit d=6 .* | full output: //p' "$L")
 if [ "$RC" != 1 ]; then
   fail preheat-fail "rc $RC, want 1" "$L"
-elif want preheat-fail "$L" 1 '^FAIL r1 lcpp27752fit d=6 rc=2 \| its preheat failed \(rc 2\): gguf-ranges.py: .*fix2-00002-of-00002.gguf: No such file or directory \| full output: ' &&
-  want preheat-fail "$L" 1 '^FAIL r0 lcpp27752fit d=6 rc=2 \| its preheat failed \(rc 2\): ' &&
+elif [ "$first" = "$second" ] || [ ! -f "$first" ] || [ ! -f "$second" ]; then
+  fail preheat-fail "preheat failures need distinct output files: $first, $second" "$L"
+elif want preheat-fail "$L" 1 '^FAIL r1 lcpp27752fit d=6 rc=2 \| its preheat failed \(rc 2\): gguf-ranges.py: .*fix2-00002-of-00002.gguf: No such file or directory; last line: .* \| full output: ' &&
+  want preheat-fail "$L" 1 '^FAIL r0 lcpp27752fit d=6 rc=2 \| its preheat failed \(rc 2\): .*; last line: .* \| full output: ' &&
+  want preheat-fail "$first" 1 '^FAIL r0 lcpp27752fit d=6 rc=2$' &&
+  want preheat-fail "$second" 1 '^FAIL r1 lcpp27752fit d=6 rc=2$' &&
+  want preheat-fail "$first" 1 '^gguf-ranges.py: .*fix2-00002-of-00002.gguf: No such file or directory$' &&
+  want preheat-fail "$second" 1 '^gguf-ranges.py: .*fix2-00002-of-00002.gguf: No such file or directory$' &&
   want preheat-fail "$L" 2 '^preheat lcpp27752 K=1 ' &&
   want preheat-fail "$L" 1 '^ROW r1 lcpp27752 d=6 ' &&
   want preheat-fail "$L" 1 '^failed arms: r0:lcpp27752fit@d=6 r1:lcpp27752fit@d=6$'; then
@@ -1067,7 +1098,7 @@ if [ -f "$PROSE_SRC" ]; then
     want mtp-rec "$L" 1 '^ROW r1 ours d=6 ' &&
     want mtp-rec "$L" 1 '\| mtp positions/pass ' &&
     want mtp-rec "$L" 1 "^\[config\] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; generate_glm5next's checked-in schema declares the mtp summary record: " &&
-    want mtp-rec "$L2" 1 '^FAIL r1 oursmtp d=6 rc=0 \| the oursmtp arm printed no mtp summary record, which its schema declares \| full output: ' &&
+    want mtp-rec "$L2" 1 '^FAIL r1 oursmtp d=6 rc=0 \| the oursmtp arm printed no mtp summary record, which its schema declares; last line: .* \| full output: ' &&
     want mtp-rec "$L2" 1 '^ROW r1 ours d=6 ' &&
     want mtp-rec "$L2" 1 '^failed arms: r1:oursmtp@d=6$'; then
     pass mtp-rec
@@ -1133,7 +1164,7 @@ if [ -f "$PROSE_SRC" ]; then
 
   if [ "$RC3" != 1 ]; then
     fail lever-res-nolever "rc $RC3, want 1" "$L3"
-  elif want lever-res-nolever "$L3" 1 "^FAIL r1 $LV d=512 rc=0 \\| the arm runs BLOOMERY_RESIDENCY=mid-p33-s1 and printed no residency lever record, which its schema declares \\| full output: " &&
+  elif want lever-res-nolever "$L3" 1 "^FAIL r1 $LV d=512 rc=0 \\| the arm runs BLOOMERY_RESIDENCY=mid-p33-s1 and printed no residency lever record, which its schema declares; last line: .* \\| full output: " &&
     want lever-res-nolever "$L3" 1 '^ROW r1 ours d=512 ' &&
     want lever-res-nolever "$L3" 1 "^failed arms: r1:$LV@d=512$"; then
     pass lever-res-nolever
@@ -1258,7 +1289,7 @@ PY
     'STUB_GEN_CARDS_A=[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]' -- 6@place=a
   if [ "$RC" != 1 ]; then
     fail twocard-place-3090 "rc $RC, want 1" "$L"
-  elif want twocard-place-3090 "$L" 1 "^FAIL r1 ours@place=a d=6 rc=0 \| two cards: the engine.s load record names cards \[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090\], and --place a loads the A6000 alone: the 3090 must stay idle \| full output: " &&
+  elif want twocard-place-3090 "$L" 1 "^FAIL r1 ours@place=a d=6 rc=0 \| two cards: the engine.s load record names cards \[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090\], and --place a loads the A6000 alone: the 3090 must stay idle; last line: .* \| full output: " &&
     want twocard-place-3090 "$L" 0 '^ROW '; then
     pass twocard-place-3090
   fi
@@ -1267,7 +1298,7 @@ PY
   stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${TC[@]}" -- 6
   if [ "$RC" != 1 ]; then
     fail twocard-nocards "rc $RC, want 1" "$L"
-  elif want twocard-nocards "$L" 1 "^FAIL r1 ours d=6 rc=0 \| two cards: the engine.s load record names no cards: which cards it loaded cannot be told \| full output: " &&
+  elif want twocard-nocards "$L" 1 "^FAIL r1 ours d=6 rc=0 \| two cards: the engine.s load record names no cards: which cards it loaded cannot be told; last line: .* \| full output: " &&
     want twocard-nocards "$L" 0 '^ROW '; then
     pass twocard-nocards
   fi

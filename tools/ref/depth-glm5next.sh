@@ -923,12 +923,11 @@ cold_pass() {
 }
 # fail_row <tag> <round> <index> <rc> <why> <output>
 fail_row() {
-  local f=${TMPDIR:-/tmp}/depth-glm5next-${A_LABEL[$3]//\//_}-${A_DEP[$3]}-r$2.log key=d
+  local key=d ARM_FAIL_STEM=depth-glm5next ROW_TAG=WARMUP
+  local -a FAILED=() FAILED_KEYS=()
   [ "${A_PP[$3]}" = 0 ] || key=p
-  echo "$6" > "$f"
-  echo "FAIL r$2 ${A_LABEL[$3]} $key=${A_DEP[$3]} rc=$4 | $5 | full output: $f$CPU_BUSY_TAG$OTHER_BUSY_TAG"
-  echo "$6" | tail -n 12 | sed 's/^/    /' >&2
   failed+=("r$2:${A_LABEL[$3]}@$key=${A_DEP[$3]}")
+  arm_fail "$2" "${A_LABEL[$3]}" "$key=${A_DEP[$3]}" "$4" "$5" "$6"
 }
 
 # srv_start_arm <index> <depth>: a server arm's process (lcpp-warm.sh: SRV_CMD under its own bound,
@@ -963,7 +962,7 @@ run_arm() {
   preheat_arm "$i" || {
     rc=$?
     [ "$tag" != ROW ] || n_rows=$((n_rows + 1))
-    if [ "$tag" = ROW ]; then fail_row "" "$r" "$i" "$rc" "$FAIL_WHY" ""; else fail_row "" 0 "$i" "$rc" "$FAIL_WHY" ""; fi
+    if [ "$tag" = ROW ]; then fail_row "" "$r" "$i" "$rc" "$FAIL_WHY" "$LEASE_OUT"; else fail_row "" 0 "$i" "$rc" "$FAIL_WHY" "$LEASE_OUT"; fi
     return
   }
   guard_cpu "pre r$r $label $dep"

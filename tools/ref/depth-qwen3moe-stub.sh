@@ -855,9 +855,9 @@ if [ "$RC" != 1 ]; then
   fail ref-fail "rc $RC, want 1" "$L"
 elif [ "$seq" != "$want_seq" ]; then
   fail ref-fail "the rows' heads: $(echo "$seq" | paste -sd'|' -)" "$L"
-elif want ref-fail "$L" 1 "^FAIL r1 lcpppp p=4 rc=134 \| no 'pp4' row; last line: ggml_cuda_error: in function ggml_backend_cuda_graph_compute \(stub\) ${FULL}lcpppp-p4-r1\.log$" &&
-  want ref-fail "$L" 1 "^FAIL r1 lcppfit d=6 rc=0 \| llama-bench.s fit did not run: 0 model load\(s\) in its -v output, want the fit.s measuring load and the real one; last line: build: stub \(0\) ${FULL}lcppfit-d6-r1\.log$" &&
-  want ref-fail "$L" 1 "^FAIL r1 mrs d=6 rc=0 \| no 'Decode \(4 tokens @ d6\)' row; last line: .*WARN mistralrs_cli: the stub prints no row once ${FULL}mrs-d6-r1\.log$" &&
+elif want ref-fail "$L" 1 "^FAIL r1 lcpppp p=4 rc=134 \| no 'pp4' row; last line: ggml_cuda_error: in function ggml_backend_cuda_graph_compute \(stub\) ${FULL}[^ ]+$" &&
+  want ref-fail "$L" 1 "^FAIL r1 lcppfit d=6 rc=0 \| llama-bench.s fit did not run: 0 model load\(s\) in its -v output, want the fit.s measuring load and the real one; last line: build: stub \(0\) ${FULL}[^ ]+$" &&
+  want ref-fail "$L" 1 "^FAIL r1 mrs d=6 rc=0 \| no 'Decode \(4 tokens @ d6\)' row; last line: .*WARN mistralrs_cli: the stub prints no row once ${FULL}[^ ]+$" &&
   want ref-fail "$L" 11 '^ROW ' &&
   want ref-fail "$L" 1 '^=== dropped from the means and the ratios below' &&
   want ref-fail "$L" 3 '^    dropped: (lcpppp at 4|lcppfit at 6|mrs at 6)$' &&
@@ -869,7 +869,7 @@ elif want ref-fail "$L" 1 "^FAIL r1 lcpppp p=4 rc=134 \| no 'pp4' row; last line
   want ref-fail "$L" 1 '^cold rows: [0-9]+ of 11 ' &&
   want ref-fail "$L" 1 '^failed arms: 3 \(FAIL rows, ' &&
   want ref-fail "$L" 1 '^failed arms: r1 lcpppp p=4 rc=134; r1 lcppfit d=6 rc=0; r1 mrs d=6 rc=0; $'; then
-  if grep -q '^ggml_cuda_error: ' "$tmp/tmp/depth-qwen3moe-lcpppp-p4-r1.log" 2> /dev/null; then
+  if grep -q '^ggml_cuda_error: ' "$(sed -n 's/^FAIL r1 lcpppp p=4 .* | full output: //p' "$L")" 2> /dev/null; then
     pass ref-fail
   else
     fail ref-fail "the FAIL row's full output file does not hold the abort" "$L"
@@ -891,8 +891,8 @@ if [ "$RC" != 1 ]; then
   fail discard-fail "rc $RC, want 1" "$L"
 elif [ "$seq" != "$want_seq" ]; then
   fail discard-fail "the rows' heads: $(echo "$seq" | paste -sd'|' -)" "$L"
-elif want discard-fail "$L" 1 "^FAIL r0 lcpp d=6 rc=0 \| no 'tg4 @ d6' row; last line: build: stub \(0\) ${FULL}lcpp-d6-r0\.log$" &&
-  want discard-fail "$L" 1 "^FAIL r0 lcppppfit8 p=8 rc=134 \| no 'pp8' row; last line: ggml_cuda_error: .* ${FULL}lcppppfit8-p8-r0\.log$" &&
+elif want discard-fail "$L" 1 "^FAIL r0 lcpp d=6 rc=0 \| no 'tg4 @ d6' row; last line: build: stub \(0\) ${FULL}[^ ]+$" &&
+  want discard-fail "$L" 1 "^FAIL r0 lcppppfit8 p=8 rc=134 \| no 'pp8' row; last line: ggml_cuda_error: .* ${FULL}[^ ]+$" &&
   want discard-fail "$L" 1 "^FAIL r0 mrs d=6 rc=0 \| no 'Decode \(4 tokens @ d6\)' row; " &&
   want discard-fail "$L" 3 '^\[discard\] ' &&
   want discard-fail "$L" 0 '^=== dropped|^    dropped: ' &&
@@ -1077,7 +1077,7 @@ elif [ "$loads" != "6 4 5|5" ]; then
 elif [ "$(heads "$L" | paste -sd'|' -)" != "ROW r1 ours d=6|FAIL r1 ours d=4|ROW r1 ours d=5" ]; then
   fail group-fail "the rows' heads: $(heads "$L" | paste -sd'|' -)" "$L"
 elif want group-fail "$L" 1 '^ROW r1 ours d=6 .*\| slot 1/3 \|' &&
-  want group-fail "$L" 1 "^FAIL r1 ours d=4 rc=3 \| exited 3; last line: error: the stub refuses depth 4 once ${FULL}ours-d4-r1\.log$" &&
+  want group-fail "$L" 1 "^FAIL r1 ours d=4 rc=3 \| exited 3; last line: error: the stub refuses depth 4 once ${FULL}[^ ]+$" &&
   want group-fail "$L" 1 '^\[load\] r1: arm 4 failed \(rc 3\); the 1 arm\(s\) after it run in a fresh load$' &&
   want group-fail "$L" 1 '^ROW r1 ours d=5 .*\| slot 1/1 \|' &&
   want group-fail "$L" 1 '^    dropped: ours at 4$' &&

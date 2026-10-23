@@ -588,6 +588,22 @@ class RecipeCommands:
     cargo_target_dir: str = ""  # the CARGO_TARGET_DIR an `export` earlier in the same shell (one recipe line, one box.sh call) left set
     models: list[str | None] = field(default_factory=list)  # the BLOOMERY_MODEL prefix of each tools/box.sh call, in order (None: that call sets none); `env` keeps the last only
 
+    def profiles(self, environ: dict[str, str] | None = None) -> set[str]:
+        """Box profiles, with shell defaults resolved and recipe parameters left for the caller."""
+        profiles: set[str] = set()
+        for model in self.models:
+            default = re.fullmatch(r"\$\{BLOOMERY_MODEL:-([A-Za-z0-9_-]+)\}", model or "")
+            if model is None or default:
+                profile = (environ or {}).get("BLOOMERY_MODEL") or (default.group(1) if default else DEFAULT_PROFILE)
+            elif "{{" in model and environ is None:
+                continue
+            else:
+                profile = model
+            if not FAMILY_NAME.fullmatch(profile):
+                raise RecipeError(f"BLOOMERY_MODEL={profile!r}: cannot resolve model profile")
+            profiles.add(profile)
+        return profiles
+
 
 def _norm(p: str) -> str:
     p = p[2:] if p.startswith("./") else p
@@ -1743,8 +1759,13 @@ class Graph:
         if rc.box:
             for g in BOX_GLOBALS:
                 files.setdefault(g, "tools/box.sh (every box command)")
-            profile = rc.env.get("BLOOMERY_MODEL", DEFAULT_PROFILE)
-            files.setdefault(f"tools/ref/models/{profile}.sh", f"profile {profile}")
+            try:
+                for profile in sorted(rc.profiles()):
+                    files.setdefault(f"tools/ref/models/{profile}.sh", f"profile {profile}")
+            except RecipeError as err:
+                errors.append(str(err))
+            if any(m is not None and "{{" in m for m in rc.models):
+                prefixes.setdefault("tools/ref/models/", "recipe parameter selects the profile")
         for s in rc.scripts + rc.paths:
             if self.tree.exists(s):
                 for f, why in self.script_closure(s).items():
@@ -8254,11 +8275,6 @@ class KeyContext:
         for n in names:
             for d in model_literal_dirs(recipes[n].text):
                 dirs.setdefault(d, f"recipe {n}")
-            rc = self.side.graph.inputs(n).commands
-            prof = f"tools/ref/models/{self.env.get('BLOOMERY_MODEL', '')}.sh"
-            if rc.box and "BLOOMERY_MODEL" not in rc.env and self.env.get("BLOOMERY_MODEL") and tree.exists(prof):
-                for d in self.literal_dirs(prof):
-                    dirs.setdefault(d, f"{prof} (the Mac's BLOOMERY_MODEL)")
         for e in self.box_env.split():
             k, _, v = e.partition("=")
             d = model_dir_of(v)
@@ -8292,7 +8308,7 @@ class KeyContext:
         the BLOOMERY_MODEL of each tools/box.sh call of its recipes, else the Mac's, else ref-paths.sh's default: tools/box.sh picks the
         profile on the Mac side and a script on the box that picks another is refused (ref-paths.sh, exit 64), so the family names
         the only fixture directory a box command opens. None — every row of FIXTURE_ROOT, never under-keyed — when the family cannot
-        be told: a value that is not a plain name (`{{FAMILY}}`, `${BLOOMERY_MODEL:-x}`), a BLOOMERY_MODEL in the item's env or
+        be told: an unresolved value such as `{{FAMILY}}`, a BLOOMERY_MODEL in the item's env or
         BLOOMERY_BOX_ENV, a dotenv file, or a recipe that runs a command on the Mac (it may call tools/box.sh with a profile of its own)."""
         st = self.settings.get("settings", {})
         if st.get("dotenv_load") or st.get("dotenv_filename") or st.get("dotenv_path"):
@@ -8308,13 +8324,13 @@ class KeyContext:
             return set()
         if self._fixture_table is None:
             self._fixture_table = fixture_table(self.side.tree.read(FIXTURE_DIRS), self.side.tree.read(REF_PATHS))
-        rows, default = self._fixture_table
-        mac = self.env.get("BLOOMERY_MODEL") or default
+        rows, _ = self._fixture_table
         dirs: set[str] = set()
-        for m in calls:
-            family = mac if m is None else m
-            if not FAMILY_NAME.fullmatch(family):
-                return None
+        try:
+            families = RecipeCommands(models=calls).profiles(self.env)
+        except RecipeError:
+            return None
+        for family in families:
             d = rows.get(family, "none")
             if d not in ("self", "none"):
                 dirs.add(d)
@@ -8362,7 +8378,7 @@ class KeyContext:
             rc = self.side.graph.inputs(n).commands
             start += rc.scripts
             if rc.box:
-                start += BOX_GLOBALS + [f"tools/ref/models/{rc.env.get('BLOOMERY_MODEL', DEFAULT_PROFILE)}.sh"]
+                start += BOX_GLOBALS + [f"tools/ref/models/{profile}.sh" for profile in sorted(rc.profiles(self.env))]
         return exec_closure(self.side.tree, start)
 
     def never(self, names: list[str], ri: RecipeInputs, envs: list[str]) -> str | None:
@@ -8445,7 +8461,7 @@ class KeyContext:
         names = recipe_closure(recipes, name)
         try:
             return self._parts(name, names, ri, envs, argv)
-        except OSError as err:
+        except (OSError, RecipeError) as err:
             return [], f"{name}: an input cannot be read: {err}", None, ""
 
     def _parts(self, name: str, names: list[str], ri: RecipeInputs, envs: list[str], argv: list[str]) -> tuple[list[str], str | None, str | None, str]:
@@ -8477,6 +8493,9 @@ class KeyContext:
             files = set(ri.files)
             for p in ri.prefixes:
                 files |= {f for f in self.tree_files() if f.startswith(p)}
+        for n in names:
+            rc = self.side.graph.inputs(n).commands
+            files |= {f"tools/ref/models/{profile}.sh" for profile in rc.profiles(self.env)}
         files |= named
         files -= set(KEY_GLOBALS)
         if scope == "closure":
@@ -9942,8 +9961,7 @@ def key_self_test(expect, real: Side) -> None:
         empty = fam_keys([f"model-dir\t{FIXTURE_ROOT}\tempty"])
         expect(only35["q4"] == empty["q4"] and only35["mimo"] == empty["mimo"] and only35["mac"] != empty["mac"],
                "a fixture root holding another family's directory only keys a told item another way than an empty root")
-        # the Mac's BLOOMERY_MODEL is the family of an item whose recipes name none (fmt-check: a box call with no BLOOMERY_MODEL); a name that
-        # is no plain family name cannot be told, and the item keeps every row
+        # the Mac's BLOOMERY_MODEL is the family of an item whose recipes name none (fmt-check: a box call with no BLOOMERY_MODEL)
         def fmt_moved(name: str) -> bool:
             env = {"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": name}
             write_manifest(fixture_free + fx_rows(sizes) + ["# end"])
@@ -9951,8 +9969,10 @@ def key_self_test(expect, real: Side) -> None:
             write_manifest(fixture_free + bump("qwen38") + ["# end"])
             return keys(sa, environ=env, only={"fmt": items["fmt"]})["fmt"] != before
 
-        got = {n: fmt_moved(n) for n in ("qwen4exp", "glm5next", "qwen35moe", "a b")}
-        expect(got == {"qwen4exp": True, "glm5next": False, "qwen35moe": False, "a b": True}, f"fmt-check, a qwen38 file rewritten, under the Mac's BLOOMERY_MODEL: moved {got}")
+        got = {n: fmt_moved(n) for n in ("qwen4exp", "glm5next", "qwen35moe")}
+        expect(got == {"qwen4exp": True, "glm5next": False, "qwen35moe": False}, f"fmt-check, a qwen38 file rewritten, under the Mac's BLOOMERY_MODEL: moved {got}")
+        _, err, _, _ = KeyContext(sa, mf, environ={"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": "a b"}, settings=settings).parts(items["fmt"])
+        expect(err is not None and "BLOOMERY_MODEL='a b': cannot resolve model profile" in err, f"fmt-check: invalid inherited profile not refused by name: {err}")
         # (e) the real tier holds no fixture row: no rewrite moves a key
         real_f = fam_keys(fx_rows(sizes), {})
         expect(all(rewritten(bump(d), {}, real_f) == set() for d in sizes), "a fixture file's rewrite moved a real-tier key")
@@ -11766,29 +11786,40 @@ def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = 
 
 
 def profile_inputs_self_test(expect, side: Side) -> None:
-    for value, profile in (("deepseek41", "deepseek41"), ("${BLOOMERY_MODEL:-deepseek41}", "deepseek41")):
+    for value, profile in (("glm5next", "glm5next"), ("${BLOOMERY_MODEL:-deepseek41}", "deepseek41")):
         recipes = {"x": Recipe("x", [f"BLOOMERY_MODEL={value} ./tools/box.sh 'true'", "BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'true'"], [], "")}
         probe = Side(side.tree, recipes, Graph(side.tree, recipes))
         inputs = probe.graph.inputs("x")
         paths = {f"tools/ref/models/{profile}.sh", "tools/ref/models/qwen3moe.sh"}
         expect(paths <= inputs.files.keys() and not inputs.errors, f"profile inputs: {value}: {inputs.files}, {inputs.errors}")
         expect(all("$" not in p for p in inputs.files), f"profile inputs: shell expression used as a path: {inputs.files}")
-        for env in ({}, {"BLOOMERY_MODEL": ""}, {"BLOOMERY_MODEL": "glm5next"}):
+        for env in ({}, {"BLOOMERY_MODEL": ""}, {"BLOOMERY_MODEL": "glm5next"}, {"BLOOMERY_MODEL": "qwen35moe"}):
             context = KeyContext(probe, None, environ=env)
-            selected = "glm5next" if value.startswith("$") and env.get("BLOOMERY_MODEL") else profile
+            selected = env["BLOOMERY_MODEL"] if value.startswith("$") and env.get("BLOOMERY_MODEL") else profile
             path = f"tools/ref/models/{selected}.sh"
             expect(path in context.run_scripts(["x"]), f"profile scripts: {value}, {env}: missing {path}")
             if value.startswith("$"):
+                context.manifest = [f"model-dir\t{d}\tabsent" for d in tree_model_dirs(side.tree.root)]
                 parts, err, _, _ = context._parts("x", ["x"], inputs, [], [])
                 expect(any(p.startswith(f"file\t{path}\t") for p in parts), f"profile key: {value}, {env}: {err}, missing {path}")
+    with tempfile.TemporaryDirectory(prefix="recipes-profile-") as tmp:
+        manifest = os.path.join(tmp, "manifest")
+        with open(manifest, "w", encoding="utf-8") as fh:
+            fh.write(f"# {MANIFEST_VERSION}\n# end\n")
+        for prefix in ("", "BLOOMERY_MODEL=${BLOOMERY_MODEL:-deepseek41} "):
+            recipes = {"x": Recipe("x", [f"{prefix}./tools/box.sh 'true'"], [], "")}
+            probe = Side(side.tree, recipes, Graph(side.tree, recipes))
+            for value in ("./glm5next", "../glm5next", "a b"):
+                parts, err, _, _ = KeyContext(probe, manifest, environ={"BLOOMERY_MODEL": value}).parts("x")
+                expect(not parts and err is not None and f"BLOOMERY_MODEL={value!r}: cannot resolve model profile" in err,
+                       f"profile key: unsupported inherited {value!r} not refused: {len(parts)} parts, {err}")
     for value in ("${OTHER:-deepseek41}", "$BLOOMERY_MODEL", "../deepseek41"):
         recipes = {"x": Recipe("x", [f"BLOOMERY_MODEL={value} ./tools/box.sh 'true'"], [], "")}
         inputs = Graph(side.tree, recipes).inputs("x")
         expect(any("BLOOMERY_MODEL" in e and value in e for e in inputs.errors), f"profile inputs: unresolved {value!r} not refused: {inputs.errors}")
-    for name in ("bench-cpu-v41-host-check", "measure-cpu-v41-host", "depth-gpu-qwen3moe"):
-        if name in side.recipes:
-            inputs = side.graph.inputs(name)
-            expect(not inputs.errors and all("$" not in p for p in inputs.files), f"profile inputs: {name}: {inputs.errors}")
+    for name in ("bench-cpu-v41-host-check", "time-cpu-v41-host", "depth-gpu-qwen3moe", "time-dma-dram"):
+        inputs = side.graph.inputs(name)
+        expect(not inputs.errors and all("$" not in p for p in inputs.files), f"profile inputs: {name}: {inputs.errors}")
 
 
 def _st_basics(fails: list[str], side: Side) -> None:
