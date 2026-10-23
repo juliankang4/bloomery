@@ -394,8 +394,7 @@ enum NoSlot {
     /// Every slot is filling: two ensures raced the layer.
     Filling,
     /// No slot is free and every filled one is pinned by a lane's open read
-    /// or a batch pin, or is one of the call's own ids (a transient call's,
-    /// or any call's under [`NvTierEvict::Heat`]): the arena's floor does not
+    /// or a batch pin, or is one of the call's own ids: the arena's floor does not
     /// cover the pins open beside the call.
     Pinned,
 }
@@ -474,11 +473,10 @@ struct Claimed {
 /// host segment holds are skipped, a filled one is placed as `kind` says (a
 /// fresh tick under [`Claim::Step`] and [`Claim::Keep`]; a hit under
 /// [`Claim::Transient`] leaves the slot as it is, hot or transient), every other takes a slot — the first free, else the victim
-/// ([`pick_slot`]), which it evicts — and is marked filling. A transient
-/// call's own ids are never its victims: a hit on a transient keeps its cold
-/// place, the first place a later miss of the call would look, and a hit on a
-/// hot id keeps its tick, so the ids a keep claim took stay newer than it.
-/// Under [`NvTierEvict::Heat`] no call's own id is its victim: a hit's count
+/// ([`pick_slot`]), which it evicts — and is marked filling. No call's own
+/// ids are its victims, including hits it has not visited yet. A transient
+/// hit keeps its cold place and a hot hit its tick, so ids a keep claim took
+/// stay newer. Under [`NvTierEvict::Heat`] a hit's count
 /// moves only at the call's counting ([`Books::count_step`]), after the
 /// picks. Pure over the
 /// books: no read, no page returned. The `seen` marks are this call's alone;
@@ -640,10 +638,7 @@ fn claim_fill(
         }
         misses += 1;
         let counts = books.counts.as_ref().map(|c| &c[layer]);
-        let own = |s: &SlotBook| {
-            (kind == Claim::Transient || counts.is_some())
-                && books.named[s.id.load(Ordering::Relaxed) as usize]
-        };
+        let own = |s: &SlotBook| books.named[s.id.load(Ordering::Relaxed) as usize];
         let slot = match pick_slot(&arena.slots, |s| arena.pins(s) || own(s), counts) {
             Ok(slot) => slot,
             Err(why) => {
@@ -1599,14 +1594,15 @@ impl DropShared {
             let runs = q.pending[layer].take().expect("the position found it");
             q.queued -= 1;
             q.running = true;
-            drop(q);
+            // Read entry holds this lock while it updates a queued range.
             let r = self.release(layer, &runs);
-            q = self.queue();
             q.running = false;
             if let Err(e) = r {
                 q.failed.get_or_insert(e);
             }
             self.done.notify_all();
+            drop(q);
+            q = self.queue();
         }
     }
 }
@@ -1745,8 +1741,8 @@ struct Books {
     seq: u64,
     /// The dedup pass's seen marks, reused across calls.
     seen: Vec<bool>,
-    /// The ids the current call names, for a transient call's victim pick
-    /// and, under [`NvTierEvict::Heat`], every call's and its counting.
+    /// The ids the current call names, protected from its victim picks
+    /// and counted under [`NvTierEvict::Heat`].
     named: Vec<bool>,
     /// The NVMe tier's routing counts, the one owner of the heat a miss
     /// evicts by under [`NvTierEvict::Heat`]; `None` under
@@ -1769,8 +1765,8 @@ struct Books {
 impl Books {
     /// Count a step's claim on layer `layer`, as the claim left its marks in
     /// `named` (each id the arena serves that the call names, once): advance
-    /// the layer's clock by `columns`, then add each marked id's routed
-    /// columns from `column_off`, or one without offsets, and clear its mark.
+    /// the layer's clock by `columns`, add each marked id's selections at
+    /// their positions in `column_off` (one without offsets), and clear its mark.
     /// A residency victim's fill moves the clock none, since the card served
     /// its columns and the arena never saw them. Nothing under [`NvTierEvict::Tick`].
     fn count_step(
@@ -1778,7 +1774,7 @@ impl Books {
         layer: usize,
         ids: &[u32],
         columns: u64,
-        column_off: Option<&[usize]>,
+        column_off: Option<(&[usize], &[usize])>,
     ) {
         let Some(counts) = self.counts.as_mut() else {
             return;
@@ -1787,8 +1783,12 @@ impl Books {
         layer.advance(columns);
         for (i, &id) in ids.iter().enumerate() {
             if std::mem::replace(&mut self.named[id as usize], false) {
-                let routed_columns = column_off.map_or(1.0, |off| (off[i + 1] - off[i]) as f64);
-                layer.add(id, routed_columns);
+                match column_off {
+                    Some((off, positions)) => {
+                        layer.add_columns(id, columns, &positions[off[i]..off[i + 1]])
+                    }
+                    None => layer.add(id, 1.0),
+                }
             }
         }
     }
@@ -1840,6 +1840,15 @@ impl LayerCounts {
     /// `columns` columns of expert `id` at the clock.
     fn add(&mut self, id: u32, columns: f64) {
         self.scores[id as usize] += columns * self.weight();
+    }
+
+    /// Routed columns at their positions within a call ending at the clock.
+    fn add_columns(&mut self, id: u32, columns: u64, positions: &[usize]) {
+        let weight: f64 = positions
+            .iter()
+            .map(|&col| ((col as f64 + 1.0 - columns as f64) / HEAT_HALF_LIFE).exp2())
+            .sum();
+        self.add(id, weight);
     }
 
     /// Expert `id`'s rank among the layer's: its score.
@@ -2384,7 +2393,9 @@ impl NvTier {
     /// and until the end no drop names a page of it — the bytes it faults in
     /// stay until the lane has copied them out. The check and the pin are
     /// made under the books' lock, so a claim either sees the pin or ran
-    /// before it. Nothing for an id the arena does not serve. Refused by
+    /// before it. The drop queue lock covers the entry and every page
+    /// release; a queued range is revised before this read begins.
+    /// Nothing for an id the arena does not serve. Refused by
     /// name: a layer the arena does not cover and an id past its experts.
     pub fn open_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
         const WHAT: &str = "NvTier::open_read";
@@ -2392,8 +2403,25 @@ impl NvTier {
         if arena.host.contains(&id) {
             return Ok(());
         }
+        let mut q = self.drops.queue();
         let _books = self.books.lock().unwrap_or_else(|e| e.into_inner());
+        let runs = if q.pending[layer].is_some() {
+            let mut marks = arena.layer_marks();
+            let mark = marks.get_mut(id as usize).ok_or_else(|| {
+                GpuError::shape(
+                    WHAT,
+                    format!("expert {id} is past the {} experts", arena.n_expert),
+                )
+            })?;
+            *mark = Mark::Held;
+            Some(self.runs_of(arena, &marks, WHAT)?)
+        } else {
+            None
+        };
         arena.open(layer, id, WHAT)?;
+        if let Some(runs) = runs {
+            q.pending[layer] = Some(runs);
+        }
         if arena.filled(id).is_some() {
             self.stats.slot_reads.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -2542,7 +2570,15 @@ impl NvTier {
     pub fn drop_layer(&self, layer: usize) -> Result<(), GpuError> {
         const WHAT: &str = "NvTier::drop_layer";
         let arena = self.arena_of(layer, WHAT)?;
-        self.drop_marked(layer, arena, &arena.layer_marks(), WHAT)
+        let _q = self.drops.queue();
+        let marks = arena.layer_marks();
+        if !marks.contains(&Mark::Read) {
+            return Ok(());
+        }
+        let runs = self.runs_of(arena, &marks, WHAT)?;
+        self.drops
+            .release(layer, &runs)
+            .map_err(|e| GpuError::shape(WHAT, e))
     }
 
     /// Wait until every queued drop has run. Refused by name: a dropper
@@ -2569,12 +2605,12 @@ impl NvTier {
         arena: &LayerArena,
         what: &'static str,
     ) -> Result<(), GpuError> {
+        let mut q = self.drops.queue();
         let marks = arena.layer_marks();
         if !marks.contains(&Mark::Read) {
             return Ok(());
         }
         let runs = self.runs_of(arena, &marks, what)?;
-        let mut q = self.drops.queue();
         if let Some(e) = &q.failed {
             return Err(GpuError::protocol(what, format!("the tier's dropper: {e}")));
         }
@@ -2588,25 +2624,6 @@ impl NvTier {
         drop(q);
         self.drops.work.notify_one();
         Ok(())
-    }
-
-    /// The pages [`drop_runs`] names over each stack row of `layer` under
-    /// `marks`, out of the mapping and the page cache on this thread, and the
-    /// drop counted; nothing when no id is read.
-    fn drop_marked(
-        &self,
-        layer: usize,
-        arena: &LayerArena,
-        marks: &[Mark],
-        what: &'static str,
-    ) -> Result<(), GpuError> {
-        if !marks.contains(&Mark::Read) {
-            return Ok(());
-        }
-        let runs = self.runs_of(arena, marks, what)?;
-        self.drops
-            .release(layer, &runs)
-            .map_err(|e| GpuError::shape(what, e))
     }
 
     /// Layer `layer`'s arena, refused by name as `what` on a layer the arena
@@ -2965,7 +2982,7 @@ impl NvTier {
         kind: Claim,
         pin: bool,
         columns: u64,
-        column_off: Option<&[usize]>,
+        column_off: Option<(&[usize], &[usize])>,
     ) -> Result<(&LayerArena, Claimed), GpuError> {
         const WHAT: &str = "NvTier::ensure";
         let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) else {
@@ -3067,7 +3084,7 @@ impl NvTier {
         ids: &[u32],
         kind: Claim,
         columns: u64,
-        column_off: Option<&[usize]>,
+        column_off: Option<(&[usize], &[usize])>,
     ) -> Result<Option<TierPin<'_>>, TierError> {
         const WHAT: &str = "NvTier::ensure";
         let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref()) else {
@@ -3227,7 +3244,7 @@ impl NvTier {
         ids: &[u32],
         kind: Claim,
         columns: u64,
-        column_off: Option<&[usize]>,
+        column_off: Option<(&[usize], &[usize])>,
     ) -> Result<Prefetch<'_>, GpuError> {
         let (arena, claim) = self.claim(layer, ids, kind, true, columns, column_off)?;
         let held = BatchPin {
@@ -3646,7 +3663,7 @@ impl TierSlots for NvTier {
         ids: &[u32],
         claim: Claim,
         columns: u64,
-        column_off: Option<&[usize]>,
+        column_off: Option<(&[usize], &[usize])>,
     ) -> Result<Ticket<'a>, TierError> {
         // The steady step reuses one slot and boxes nothing. A prefetch that
         // arrives while that slot is open keeps the allocating path.
@@ -3704,7 +3721,15 @@ impl TierSlots for NvTier {
         self.stats.note_hits_under_read(ns);
     }
 
-    fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], cols: usize, batched: bool) {
+    fn note_union(
+        &self,
+        layer: usize,
+        ids: &[u32],
+        off: &[usize],
+        positions: &[usize],
+        cols: usize,
+        batched: bool,
+    ) {
         self.stats.union_call(batched);
         if self.evict == NvTierEvict::Heat
             && let Some(arena) = self.by_layer.get(layer).and_then(|l| l.as_ref())
@@ -3715,7 +3740,7 @@ impl TierSlots for NvTier {
                 layer.advance(cols as u64);
                 for (&id, w) in ids.iter().zip(off.windows(2)) {
                     if !arena.host.contains(&id) {
-                        layer.add(id, (w[1] - w[0]) as f64);
+                        layer.add_columns(id, cols as u64, &positions[w[0]..w[1]]);
                     }
                 }
             }
@@ -4079,15 +4104,45 @@ mod tests {
         let scratch = Scratch::new("heat-split");
         let whole = eight_tier(&scratch, 2, NvTierEvict::Heat);
         let split = eight_tier(&scratch, 2, NvTierEvict::Heat);
-        whole.note_union(LAYER, &[1, 2], &[0, 384, 512], 512, true);
-        split.note_union(LAYER, &[1], &[0, 384], 384, true);
-        split.note_union(LAYER, &[2], &[0, 128], 128, true);
+        whole.note_union(
+            LAYER,
+            &[1, 2],
+            &[0, 384, 512],
+            &(0..512).collect::<Vec<_>>(),
+            512,
+            true,
+        );
+        split.note_union(
+            LAYER,
+            &[1],
+            &[0, 384],
+            &(0..384).collect::<Vec<_>>(),
+            384,
+            true,
+        );
+        split.note_union(
+            LAYER,
+            &[2],
+            &[0, 128],
+            &(0..128).collect::<Vec<_>>(),
+            128,
+            true,
+        );
         let rank = |tier: &super::NvTier| {
             tier.route_count(LAYER, 1)
                 .unwrap()
                 .total_cmp(&tier.route_count(LAYER, 2).unwrap())
         };
         assert_eq!(rank(&whole), rank(&split));
+        for id in [1, 2] {
+            let want = whole.route_count(LAYER, id).unwrap();
+            let got = split.route_count(LAYER, id).unwrap();
+            assert!(
+                (got - want).abs() <= 1e-12 * want,
+                "expert {id}: {got} != {want}"
+            );
+        }
+        assert_eq!(rank(&whole), std::cmp::Ordering::Less);
     }
 
     /// A transient miss enters at the cold end and is the first victim,
@@ -5507,12 +5562,24 @@ mod tests {
             }
             // Four columns route [0, 1, 2], [1], [1], [1].
             let pin = tier
-                .prefetch_pinned(LAYER, &[0, 1, 2], Claim::Step, 4, Some(&[0, 1, 5, 6]))
+                .prefetch_pinned(
+                    LAYER,
+                    &[0, 1, 2],
+                    Claim::Step,
+                    4,
+                    Some((&[0, 1, 5, 6], &[0, 0, 1, 2, 3, 0])),
+                )
                 .unwrap()
                 .wait()
                 .unwrap();
             assert_eq!(clock() - start, 4, "allocating={allocating}: column clock");
-            for (id, added) in [(0, 0.0), (1, 4.0), (2, 1.0), (3, 0.0), (4, 0.0)] {
+            // PIN(2026-10-23): each selection decays from its column,
+            // rather than every selection entering at the call's end.
+            let four: f64 = (0..4)
+                .map(|col| ((col as f64 - 3.0) / super::HEAT_HALF_LIFE).exp2())
+                .sum();
+            let first = (-3.0 / super::HEAT_HALF_LIFE).exp2();
+            for (id, added) in [(0, 0.0), (1, four), (2, first), (3, 0.0), (4, 0.0)] {
                 let count = tier.route_count(LAYER, id).unwrap();
                 let want = before[id as usize] * decay + added;
                 assert!(
@@ -5524,7 +5591,13 @@ mod tests {
             drop(pin);
             // The next miss takes 2, not the older but more frequent 1.
             let pin = tier
-                .prefetch_pinned(LAYER, &[0, 5], Claim::Step, 4, Some(&[0, 2, 6]))
+                .prefetch_pinned(
+                    LAYER,
+                    &[0, 5],
+                    Claim::Step,
+                    4,
+                    Some((&[0, 2, 6], &[0, 1, 0, 1, 2, 3])),
+                )
                 .unwrap()
                 .wait()
                 .unwrap();
@@ -5534,7 +5607,7 @@ mod tests {
             );
             assert!(tier.slot_filled(LAYER, 1) && tier.slot_filled(LAYER, 5));
             assert_eq!(clock() - start, 8, "allocating={allocating}: miss clock");
-            assert_eq!(tier.route_count(LAYER, 5), Some(4.0));
+            assert_eq!(tier.route_count(LAYER, 5), Some(four));
             assert_eq!(tier.route_count(LAYER, 0), Some(0.0));
             drop(pin);
             if allocating {
@@ -5561,13 +5634,20 @@ mod tests {
         // A union of one half-life's columns lists 1 in a quarter of them and
         // 3 in the rest.
         let h = super::HEAT_HALF_LIFE as usize;
-        tier.note_union(LAYER, &[1, 3], &[0, h / 4, h], h, true);
-        let quarter = (h / 4) as f64;
-        assert!(
-            near(count(1), quarter + 0.5)
-                && near(count(2), 0.5)
-                && near(count(3), (h - h / 4) as f64)
+        tier.note_union(
+            LAYER,
+            &[1, 3],
+            &[0, h / 4, h],
+            &(0..h).collect::<Vec<_>>(),
+            h,
+            true,
         );
+        // PIN(2026-10-23): the count weights each original column,
+        // replacing the call-end lump of h/4 and h-h/4 selections.
+        let weight = |col: usize| ((col as f64 + 1.0 - h as f64) / super::HEAT_HALF_LIFE).exp2();
+        let quarter: f64 = (0..h / 4).map(weight).sum();
+        let rest: f64 = (h / 4..h).map(weight).sum();
+        assert!(near(count(1), quarter + 0.5) && near(count(2), 0.5) && near(count(3), rest));
         tier.ensure_victim(LAYER, &[4]).unwrap();
         assert!(
             near(count(4), 1.0) && near(count(2), 0.5),

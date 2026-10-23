@@ -1786,8 +1786,14 @@ fn serve_tiered<'w>(
     }
     let slots = tier.slots.slots(tier.layer);
     if slots >= 2 * batch && s.tier_ids.len() <= slots - 2 * batch {
-        tier.slots
-            .note_union(tier.layer, &s.plan.ids, &s.plan.off, lists.len(), false);
+        tier.slots.note_union(
+            tier.layer,
+            &s.plan.ids,
+            &s.plan.off,
+            &s.plan.cols,
+            lists.len(),
+            false,
+        );
         let pin = tier
             .slots
             .ensure_pinned(tier.layer, &s.tier_ids, Claim::Keep)?;
@@ -1805,8 +1811,14 @@ fn serve_tiered<'w>(
         }
         .into());
     }
-    tier.slots
-        .note_union(tier.layer, &s.plan.ids, &s.plan.off, lists.len(), true);
+    tier.slots.note_union(
+        tier.layer,
+        &s.plan.ids,
+        &s.plan.off,
+        &s.plan.cols,
+        lists.len(),
+        true,
+    );
     let batching = Batching {
         tier,
         keep: slots - 2 * batch,
@@ -2472,14 +2484,15 @@ pub trait TierSlots: Send + Sync {
     /// and the second after its wait. The default fills on the caller, the
     /// ticket ready. `columns` is the call's column count. With `column_off`,
     /// `ids` is the full union plan, including host ids, and `ids[d]` routes
-    /// `column_off[d + 1] - column_off[d]` columns; without, each id routes once.
+    /// `off[d + 1] - off[d]` columns at positions `positions[off[d]..off[d + 1]]`,
+    /// where `column_off` is `(off, positions)`; without, each id routes once.
     fn prefetch_pinned<'a>(
         &'a self,
         layer: usize,
         ids: &[u32],
         claim: Claim,
         _columns: u64,
-        _column_off: Option<&[usize]>,
+        _column_off: Option<(&[usize], &[usize])>,
     ) -> Result<Ticket<'a>, TierError> {
         self.ensure_pinned(layer, ids, claim).map(Ticket::ready)
     }
@@ -2494,7 +2507,7 @@ pub trait TierSlots: Send + Sync {
     /// `batched` when its arena ids are more than the layer's slots less two
     /// batches. `ids` are the call's distinct ids, ascending, those of the
     /// plan's host segment included, and the columns that list `ids[d]`
-    /// number `off[d + 1] - off[d]`. A call refused before its path is told
+    /// are `positions[off[d]..off[d + 1]]`. A call refused before its path is told
     /// is not told. It must not lock or allocate unless its tier keeps books
     /// of the call (a gate's record of it, or the routing counts its
     /// victims are ranked by); a tier that keeps none takes the default.
@@ -2503,6 +2516,7 @@ pub trait TierSlots: Send + Sync {
         _layer: usize,
         _ids: &[u32],
         _off: &[usize],
+        _positions: &[usize],
         _cols: usize,
         _batched: bool,
     ) {
@@ -3242,7 +3256,7 @@ impl HostLayer {
             &scratch.plan.ids,
             Claim::Step,
             lists.len() as u64,
-            Some(&scratch.plan.off),
+            Some((&scratch.plan.off, &scratch.plan.cols)),
         )?;
         tier.lend(&mut stacks);
         if ticket.is_ready() || !scratch.plan.fits(scratch.max_slots) {
@@ -4201,6 +4215,7 @@ mod tests {
         layer: usize,
         ids: Vec<u32>,
         off: Vec<usize>,
+        positions: Vec<usize>,
         cols: usize,
         batched: bool,
     }
@@ -4346,10 +4361,17 @@ mod tests {
             ids: &[u32],
             claim: super::Claim,
             columns: u64,
-            column_off: Option<&[usize]>,
+            column_off: Option<(&[usize], &[usize])>,
         ) -> Result<super::Ticket<'a>, super::TierError> {
-            if let Some(off) = column_off {
-                self.note_union(layer, ids, off, usize::try_from(columns).unwrap(), false);
+            if let Some((off, positions)) = column_off {
+                self.note_union(
+                    layer,
+                    ids,
+                    off,
+                    positions,
+                    usize::try_from(columns).unwrap(),
+                    false,
+                );
             }
             self.ensured.lock().unwrap().push((layer, ids.to_vec()));
             let pin = self.pin_batch(ids, claim, false);
@@ -4401,11 +4423,20 @@ mod tests {
             self.filled.then(|| &self.parts[3 * id as usize + part][..])
         }
 
-        fn note_union(&self, layer: usize, ids: &[u32], off: &[usize], cols: usize, batched: bool) {
+        fn note_union(
+            &self,
+            layer: usize,
+            ids: &[u32],
+            off: &[usize],
+            positions: &[usize],
+            cols: usize,
+            batched: bool,
+        ) {
             self.told.lock().unwrap().push(Told {
                 layer,
                 ids: ids.to_vec(),
                 off: off.to_vec(),
+                positions: positions.to_vec(),
                 cols,
                 batched,
             });
@@ -4860,6 +4891,7 @@ mod tests {
                 layer: 4,
                 ids: vec![2, 3, 4, 5, 6, 7],
                 off: vec![0, 1, 2, 4, 5, 6, 7],
+                positions: vec![0, 0, 0, 1, 1, 1, 0],
                 cols: 2,
                 batched: true
             }],
@@ -4877,6 +4909,7 @@ mod tests {
                 layer: 4,
                 ids: vec![0, 2, 7],
                 off: vec![0, 1, 3, 4],
+                positions: vec![0, 0, 1, 1],
                 cols: 2,
                 batched: false
             }],
@@ -5125,6 +5158,7 @@ mod tests {
                 layer: 4,
                 ids: claim_ids.to_vec(),
                 off: vec![0, 1, 3, 4, 5, 7],
+                positions: vec![1, 0, 1, 1, 2, 0, 2],
                 cols,
                 batched: false,
             }],

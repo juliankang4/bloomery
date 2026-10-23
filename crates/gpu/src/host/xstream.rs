@@ -1419,10 +1419,9 @@ impl XStream {
                                 ),
                             ));
                         }
-                        // SAFETY: the source's bytes stay mapped for the
-                        // source's life, which outlives the copy stream's
-                        // drain (the drop drains it); `d` is a ring slot's
-                        // part, `len` bytes inside the ring.
+                        // SAFETY: the open read keeps the source's bytes
+                        // unchanged until the copy stream drains below;
+                        // `d` holds this part's `len` bytes inside the ring.
                         let rc = unsafe {
                             sys::cuMemcpyHtoDAsync_v2(
                                 d,
@@ -1435,9 +1434,13 @@ impl XStream {
                     }
                     Ok(())
                 })();
-                // The pieces are the file's own mapping: a page the driver
-                // still reads after the release faults in again, the same
-                // bytes.
+                // A failed part can follow copies already in flight.
+                if let Err(e) = drain_within(&copy, self.cfg.deadline, WHAT) {
+                    // The read stays open and its owner alive while DMA may
+                    // still reach the source, including a reused arena slot.
+                    std::mem::forget(source);
+                    return Err(e);
+                }
                 let released = source.release_read(layer, id);
                 copied.and(released)?;
             }
