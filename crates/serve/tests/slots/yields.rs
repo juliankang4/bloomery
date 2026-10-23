@@ -343,7 +343,7 @@ fn hw_a_decode_answer_reaches_the_client_before_a_new_prompt_starts() {
                         .lock()
                         .expect("seen")
                         .iter()
-                        .filter(|(_, _, last, chunk)| {
+                        .filter(|(_, last, chunk)| {
                             !last && !chunk["content"].as_str().expect("chunk content").is_empty()
                         })
                         .count()
@@ -729,7 +729,7 @@ fn hw_a_schema_fill_reaches_the_client_before_the_next_fill_finishes() {
                     .lock()
                     .expect("seen")
                     .iter()
-                    .map(|(_, _, _, chunk)| chunk["content"].as_str().expect("content"))
+                    .map(|(_, _, chunk)| chunk["content"].as_str().expect("content"))
                     .collect();
                 if text.contains("abcdefghijklmnopqrstuvwx") || Instant::now() >= deadline {
                     break text;
@@ -751,10 +751,10 @@ fn hw_a_schema_fill_reaches_the_client_before_the_next_fill_finishes() {
                 .iter()
                 .map(|seen| {
                     let chunks = seen.lock().expect("seen");
-                    assert!(chunks.last().expect("last chunk").2, "stream never ended");
+                    assert!(chunks.last().expect("last chunk").1, "stream never ended");
                     chunks
                         .iter()
-                        .map(|(_, _, _, chunk)| chunk["content"].as_str().expect("content"))
+                        .map(|(_, _, chunk)| chunk["content"].as_str().expect("content"))
                         .collect()
                 })
                 .collect();

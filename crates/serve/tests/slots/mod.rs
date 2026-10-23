@@ -682,14 +682,17 @@ impl Engine for SharedDraft {
     }
 }
 
-/// One arrival in [`SeenChunks`]: when it landed, its stream's slot, whether
-/// it is the last chunk, and the chunk itself.
-type SeenChunk = (Instant, u64, bool, Value);
+/// One client observation: its stream's slot, whether it is the last chunk,
+/// and the chunk itself.
+type SeenChunk = (u64, bool, Value);
 
-/// One `/completion` stream read as it arrives: every `data:` payload, with
-/// the moment it landed, its stream's slot and whether it is the last chunk,
-/// appended to `seen` — the shared log's order is the streams' arrival order.
+/// Appends each `/completion` payload with its slot and stop flag to `seen`.
+/// Different readers may run at different times.
 fn read_stream(addr: SocketAddr, body: &Value, seen: &Mutex<Vec<SeenChunk>>) {
+    read_chunks(open_stream(addr, body), seen);
+}
+
+fn open_stream(addr: SocketAddr, body: &Value) -> TcpStream {
     let mut s = TcpStream::connect(addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(60)))
         .expect("timeout");
@@ -700,7 +703,7 @@ fn read_stream(addr: SocketAddr, body: &Value, seen: &Mutex<Vec<SeenChunk>>) {
         text.len()
     );
     s.write_all(req.as_bytes()).expect("write");
-    read_chunks(s, seen);
+    s
 }
 
 fn read_chunks(mut s: impl Read, seen: &Mutex<Vec<SeenChunk>>) {
@@ -730,9 +733,7 @@ fn read_chunks(mut s: impl Read, seen: &Mutex<Vec<SeenChunk>>) {
             held.drain(..at + 2);
             let slot = v["id_slot"].as_u64().expect("id_slot");
             let last = v["stop"].as_bool().expect("stop");
-            seen.lock()
-                .expect("seen")
-                .push((Instant::now(), slot, last, v));
+            seen.lock().expect("seen").push((slot, last, v));
         }
     }
     assert!(!head, "stream closed before the HTTP head ended");
@@ -752,8 +753,8 @@ fn stream_chunks_preserve_utf8() {
         read_chunks(raw.as_bytes()[..at].chain(&raw.as_bytes()[at..]), &seen);
         let seen = seen.into_inner().expect("seen");
         assert_eq!(seen.len(), 2, "split at {at}");
-        assert_eq!(seen[0].3, first, "split at {at}");
-        assert_eq!(seen[1].3, last, "split at {at}");
+        assert_eq!(seen[0].2, first, "split at {at}");
+        assert_eq!(seen[1].2, last, "split at {at}");
     }
 }
 
@@ -792,8 +793,8 @@ fn pass_slots(calls: &[(usize, char)]) -> Vec<usize> {
 /// drafted passes: each request's ids and draft counts are its run alone's on
 /// a fresh server, the engine's passes alternate slots while both requests
 /// run (one pass a slot a round, in the engine thread's one order — the
-/// streams' arrival order is the writers' scheduling, not the engine's), and
-/// the two streams overlap in arrival.
+/// readers can drain their streams at different times). The second reader
+/// stays paused until the first has finished reading.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_drafted_passes_interleave_across_slots() {
@@ -819,29 +820,22 @@ fn hw_drafted_passes_interleave_across_slots() {
         json!({"prompt": p, "n_predict": N, "temperature": 0, "cache_prompt": false,
                "return_tokens": true, "stream": true})
     };
-    let seen: Arc<Mutex<Vec<SeenChunk>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut readers = Vec::new();
-    for (i, p) in PROMPTS[..2].iter().enumerate() {
-        let (addr, seen, body) = (addr, Arc::clone(&seen), body(p));
-        readers.push(std::thread::spawn(move || read_stream(addr, &body, &seen)));
-        if i == 0 {
-            assert!(
-                log.len_reached(1, BOUND),
-                "the first prompt never reached the engine"
-            );
-        } else {
-            wait_deferred(addr, 1, BOUND);
-        }
-    }
+    let seen = Mutex::new(Vec::<SeenChunk>::new());
+    let a = open_stream(addr, &body(PROMPTS[0]));
+    assert!(
+        log.len_reached(1, BOUND),
+        "the first prompt never reached the engine"
+    );
+    let b = open_stream(addr, &body(PROMPTS[1]));
+    wait_deferred(addr, 1, BOUND);
     log.release();
-    for r in readers {
-        r.join().expect("reader");
-    }
+    read_chunks(a, &seen);
+    read_chunks(b, &seen);
     let seen = seen.lock().expect("seen").clone();
     let finals: Vec<&Value> = seen
         .iter()
-        .filter(|(_, _, last, _)| *last)
-        .map(|(_, _, _, v)| v)
+        .filter(|(_, last, _)| *last)
+        .map(|(_, _, v)| v)
         .collect();
     assert_eq!(finals.len(), 2, "the two streams' last chunks");
     let mut slots: Vec<u64> = finals
@@ -878,8 +872,8 @@ fn hw_drafted_passes_interleave_across_slots() {
             "{p}: the proposals its target kept"
         );
     }
-    // The passes alternate: no two of one slot's passes run in a row while
-    // the other slot's request is between its first and last pass.
+    // PIN(2026-10-23): overlap is engine progress, independent of reader scheduling.
+    // The passes alternate while both requests run.
     let passes = pass_slots(&calls.lock().expect("calls").clone());
     assert!(
         passes.len() >= N,
@@ -887,8 +881,22 @@ fn hw_drafted_passes_interleave_across_slots() {
     );
     for slot in [0, 1] {
         let other = 1 - slot;
-        let other_first = passes.iter().position(|&at| at == other);
-        let other_last = passes.iter().rposition(|&at| at == other);
+        let mine_last = passes
+            .iter()
+            .rposition(|&at| at == slot)
+            .expect("slot passed");
+        let other_first = passes
+            .iter()
+            .position(|&at| at == other)
+            .expect("other slot passed");
+        let other_last = passes
+            .iter()
+            .rposition(|&at| at == other)
+            .expect("other slot passed");
+        assert!(
+            mine_last > other_first,
+            "slot {slot} ended before slot {other} began: the passes did not overlap: {passes:?}"
+        );
         let mut run = 0;
         for (i, &at) in passes.iter().enumerate() {
             if at != slot {
@@ -897,28 +905,13 @@ fn hw_drafted_passes_interleave_across_slots() {
             }
             run += 1;
             let began = i + 1 - run;
-            let live = other_first.is_some_and(|f| f <= i) && other_last.is_some_and(|l| l > began);
+            let live = other_first <= i && other_last > began;
             assert!(
                 !live || run == 1,
                 "slot {slot} ran {run} passes in a row while slot {other} was between its \
                  passes: {passes:?}"
             );
         }
-    }
-    // The streams overlap in arrival: each stream's last chunk lands after
-    // the other's first.
-    for slot in slots {
-        let other = 1 - slot;
-        let (Some(mine_last), Some(theirs_first)) = (
-            seen.iter().rposition(|(_, s, _, _)| *s == slot),
-            seen.iter().position(|(_, s, _, _)| *s == other),
-        ) else {
-            panic!("stream {slot} or {other} never sent a chunk");
-        };
-        assert!(
-            mine_last > theirs_first,
-            "stream {slot} ended before stream {other} began: the streams did not overlap"
-        );
     }
     let per = metric(&get(addr, "/metrics").body, "n_busy_slots_per_decode");
     assert!(
@@ -1113,7 +1106,7 @@ fn hw_plain_steps_reach_clients_before_drafted_passes() {
             let delivered = loop {
                 let seen = seen.lock().expect("seen");
                 let ready = (0..n / 2).all(|i| {
-                    seen.iter().any(|(_, slot, last, v)| {
+                    seen.iter().any(|(slot, last, v)| {
                         *slot == i as u64
                             && if finish {
                                 *last
@@ -1143,7 +1136,7 @@ fn hw_plain_steps_reach_clients_before_drafted_passes() {
             for body in &bodies {
                 let got = seen
                     .iter()
-                    .find(|(_, _, last, v)| *last && v["prompt"] == body["prompt"])
+                    .find(|(_, last, v)| *last && v["prompt"] == body["prompt"])
                     .expect("each request finishes");
                 let mut body = body.clone();
                 body["stream"] = json!(false);
@@ -1154,11 +1147,11 @@ fn hw_plain_steps_reach_clients_before_drafted_passes() {
                     None,
                 );
                 let want = post(alone, "/completion", &body).json();
-                assert_eq!(got.3["tokens"], want["tokens"], "N = {n}: {body}");
+                assert_eq!(got.2["tokens"], want["tokens"], "N = {n}: {body}");
                 let content: String = seen
                     .iter()
-                    .filter(|(_, slot, last, _)| *slot == got.1 && !last)
-                    .map(|(_, _, _, v)| v["content"].as_str().expect("chunk content"))
+                    .filter(|(slot, last, _)| *slot == got.0 && !last)
+                    .map(|(_, _, v)| v["content"].as_str().expect("chunk content"))
                     .collect();
                 assert_eq!(
                     content,
@@ -1217,7 +1210,7 @@ fn hw_a_reasoning_close_keeps_its_next_pass_in_the_next_round() {
     let entered = pass.len_reached(1, BOUND);
     let until = Instant::now() + BOUND;
     let delivered = loop {
-        let delivered = seen.lock().expect("seen").iter().any(|(_, slot, _, v)| {
+        let delivered = seen.lock().expect("seen").iter().any(|(slot, _, v)| {
             *slot == 1 && v["timings"]["predicted_n"].as_u64().is_some_and(|n| n >= 3)
         });
         if delivered || Instant::now() >= until {
@@ -1253,16 +1246,16 @@ fn hw_a_reasoning_close_keeps_its_next_pass_in_the_next_round() {
     for (slot, body) in bodies.iter().enumerate() {
         let got = seen
             .iter()
-            .find(|(_, s, last, _)| *s == slot as u64 && *last)
+            .find(|(s, last, _)| *s == slot as u64 && *last)
             .expect("each request finishes");
         let alone = start_n(Box::new(serve::DraftMock::new(4096)), 1, None, None);
         let want = post(alone, "/completion", body).json();
-        assert_eq!(got.3["tokens"], want["tokens"], "slot {slot}: {body}");
+        assert_eq!(got.2["tokens"], want["tokens"], "slot {slot}: {body}");
         if slot == 0 {
             let close = MockTokenizer.encode("</think>");
-            assert_eq!(got.3["tokens"][2], close[0], "the reasoning close");
+            assert_eq!(got.2["tokens"][2], close[0], "the reasoning close");
             assert!(
-                got.3["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0),
+                got.2["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0),
                 "the closed span resumes drafting"
             );
         }
