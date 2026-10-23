@@ -489,8 +489,8 @@ pub(crate) trait MmaRows: TileRows {
 
     /// Starts moving values `at .. at + 8` (`at` a multiple of 8) to the 16
     /// bytes at `dst`: an asynchronous copy completed by this thread's
-    /// `cp_async_wait_group` for its committed group, or loads [`Self::land`]
-    /// stores.
+    /// `cp_async_wait_group` for its committed group, a store it makes
+    /// itself, or loads [`Self::land`] stores.
     ///
     /// # Safety
     ///
@@ -593,7 +593,7 @@ impl<F: ByteBlocks<Scale = u32>> MmaRows for ByteRows<'_, F> {
 /// `dst` is 16 bytes of shared memory, 16-byte aligned, that this thread
 /// alone writes and no warp reads before the barrier after this store.
 #[inline(always)]
-unsafe fn land_values(v: [f32; 8], dst: *mut u32) -> bool {
+pub(crate) unsafe fn land_values(v: [f32; 8], dst: *mut u32) -> bool {
     let fits = mma_fits(v[0])
         & mma_fits(v[1])
         & mma_fits(v[2])

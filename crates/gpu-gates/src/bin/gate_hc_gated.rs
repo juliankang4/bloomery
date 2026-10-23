@@ -55,9 +55,11 @@
 //! product with no quantizer, so a NaN raises the mix's site alone and a
 //! subnormal column leaves the other columns' bits unchanged. On GB10 that
 //! product runs on BF16 tensor cores: the down and up within the BF16
-//! operand bands (`check_mma`), and in a range fixture each cell the MMA
-//! product when its row and column are in range and the exact replay when
-//! either is not. Maximum-finite BF16 up weights that overflow the up
+//! operand bands (`check_mma`), the inject rows in the down's product
+//! (`hc_gated_down_mma_4`, dots `[m][324]`) within the same band and its
+//! weights within the F32 band plus that bound through `2·σ(·/4)`, and in a
+//! range fixture each cell the MMA product when its row and column are in
+//! range and the exact replay when either is not. Maximum-finite BF16 up weights that overflow the up
 //! projection raise the site and leave NaN mixed outputs in both capped and
 //! wide arms, with a finite bottleneck.
 
@@ -77,7 +79,7 @@ mod gate {
     use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvMcolArgs, Q8F32Kernels};
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
-    use bloomery_gpu_gates::rounding::{check_mma, q8_32_rel};
+    use bloomery_gpu_gates::rounding::{bf16_dot_rel, check_mma, q8_32_rel};
     use bloomery_gpu_gates::{
         GateError, activations, bits_equal, max_rel_err, max_ulps, no_local_depot, verdict,
     };
@@ -462,6 +464,7 @@ mod gate {
             "hc_gated_lo_4x320",
             "hc_gated_mix_4",
             "hc_gated_up_mma_mix_4",
+            "hc_gated_down_mma_4",
             // PIN(2026-10-23): bf16_mma_gemm_columns is gone: bf16_mma_gemm keeps every
             // cell to its own row and column, so the HC prompt products run it.
             "bf16_mma_gemm",
@@ -1132,17 +1135,36 @@ mod gate {
             c.q8.enqueue_bf16_prompt(st, up, &w.scratch.lo, m, &mut w.scratch.g)?;
         }
         let s = &w.scratch;
+        let dots = s.down.to_host_vec(st)?;
+        let (down, inj) = if packs(c, site, inject)? {
+            let cols = dots[..m * (R + S)].as_chunks::<{ R + S }>().0;
+            (
+                cols.iter().flat_map(|dot| &dot[..R]).copied().collect(),
+                cols.iter().flat_map(|dot| &dot[R..]).copied().collect(),
+            )
+        } else {
+            (dots[..z.lo].to_vec(), dots[z.lo..z.lo + z.wgt].to_vec())
+        };
         Ok(WideOut {
             res: res_d.to_host_vec(st)?,
             xn: s.xn.to_host_vec(st)?[..z.xn].to_vec(),
-            down: s.down.to_host_vec(st)?[..z.lo].to_vec(),
-            inj: s.inj.to_host_vec(st)?[..z.wgt].to_vec(),
+            down,
+            inj,
             lo: s.lo.to_host_vec(st)?[..z.lo].to_vec(),
             g: s.g.to_host_vec(st)?[..z.xn].to_vec(),
             wgt: s.wgt.to_host_vec(st)?[..z.wgt].to_vec(),
             mixed: mixed_d.to_host_vec(st)?,
             fault: found_fault,
         })
+    }
+
+    /// Whether the wide arm runs `site`'s down and inject as one product, its
+    /// dots `[m][R + S]` in the scratch's `down` (else `[m][R]`, then
+    /// `[m][S]`): a BF16 inject site on GB10.
+    fn packs(c: &Ctx, site: &Site, inject: bool) -> Result<bool, GateError> {
+        Ok(inject
+            && matches!(site.planes, Planes::Bf16 { .. })
+            && c.gpu.context().compute_capability()? == (12, 1))
     }
 
     /// One wide mix of `m` columns after a combine, the one-expert table
@@ -1276,9 +1298,8 @@ mod gate {
                 verdict(p)
             );
         }
-        if matches!(site.planes, Planes::Bf16 { .. })
-            && c.gpu.context().compute_capability()? == (12, 1)
-        {
+        let packed = packs(c, site, true)?;
+        if packed {
             let down: Vec<Vec<f32>> = site
                 .down
                 .as_chunks::<WIDE>()
@@ -1295,6 +1316,38 @@ mod gate {
                 .collect();
             ok &= check_mma("hc_down", (&o.down, &o.xn, WIDE), &down);
             ok &= check_mma("hc_up", (&o.g, &o.lo, R), &up);
+            let inject: Vec<Vec<f32>> = site
+                .inject
+                .as_chunks::<WIDE>()
+                .0
+                .iter()
+                .map(|r| r.to_vec())
+                .collect();
+            ok &= check_mma("hc_inject", (&o.inj, &o.xn, WIDE), &inject);
+
+            // A subnormal inject value is out of the MMA's range: its row's dots
+            // replay on the exact owner, the F32 tile's bits over the card's `xn`.
+            let st = c.gpu.stream();
+            let mut odd = site.inject.clone();
+            odd[0] = f32::from_bits(1);
+            let odd_d = DeviceTensor::upload(st, &odd, S, WIDE)?;
+            let weights = SiteWeights {
+                inject: Some(&odd_d),
+                ..site.weights(true)
+            };
+            let (got, _) = wide_try(c, &mut w, weights, m, m)?;
+            got?;
+            let st = c.gpu.stream();
+            let mut want = DeviceBuffer::from_host(st, &vec![f32::NAN; m * S])?;
+            w.g32
+                .enqueue_f32_tile(st, &odd_d, &w.scratch.xn, m, &mut want)?;
+            let (dots, want) = (w.scratch.down.to_host_vec(st)?, want.to_host_vec(st)?);
+            let replayed = (0..m).all(|k| dots[k * (R + S) + R].to_bits() == want[k * S].to_bits());
+            ok &= replayed;
+            println!(
+                "wide[inject-range] m={m} the out-of-range row the F32 tile's bit_equal={replayed} {}",
+                verdict(replayed)
+            );
 
             // Power-of-two weights, with one bit below BF16 in every activation,
             // make each cell's path exact and visible: a cell in an in-range row
@@ -1343,6 +1396,36 @@ mod gate {
         for k in 0..m {
             let r = mix_ref(c.geo, site.host(true), col(&res, WIDE, k), EPS);
             let as32 = |v: &[f64]| v.iter().map(|&x| x as f32).collect::<Vec<_>>();
+            let wgt_ref = as32(r.wgt.as_deref().unwrap_or(&[]));
+            // PIN(2026-10-24): where the inject rows share the down's BF16
+            // product, each inject dot sits within `bf16_dot_rel` of its terms'
+            // absolute sum over the card's `xn` (`check_mma`'s bound), and
+            // `2·σ(·/4)` passes it at a slope of at most 1/8, on top of the F32
+            // band.
+            let wgt_band = f64::from(LO_BAND)
+                + if packed {
+                    let x = col(&o.xn, WIDE, k);
+                    let dot = site
+                        .inject
+                        .as_chunks::<WIDE>()
+                        .0
+                        .iter()
+                        .map(|row| {
+                            let mag: f64 = row
+                                .iter()
+                                .zip(x)
+                                .map(|(&w, &v)| (f64::from(w) * f64::from(v)).abs())
+                                .sum();
+                            bf16_dot_rel(WIDE) * mag
+                        })
+                        .fold(0.0, f64::max);
+                    let top = wgt_ref
+                        .iter()
+                        .fold(0.0f64, |a, &v| a.max(f64::from(v).abs()));
+                    dot / 8.0 / top
+                } else {
+                    0.0
+                };
             let g = col(&o.g, WIDE, k);
             let g_rms =
                 (g.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / g.len() as f64).sqrt();
@@ -1364,11 +1447,8 @@ mod gate {
                 ),
                 (
                     "wgt",
-                    f64::from(max_rel_err(
-                        col(&o.wgt, S, k),
-                        &as32(r.wgt.as_deref().unwrap_or(&[])),
-                    )?),
-                    f64::from(LO_BAND),
+                    f64::from(max_rel_err(col(&o.wgt, S, k), &wgt_ref)?),
+                    wgt_band,
                 ),
             ];
             for (i, (name, err, band)) in lines.into_iter().enumerate() {

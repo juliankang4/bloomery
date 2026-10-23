@@ -117,6 +117,13 @@ pub fn q8_32_rel() -> f64 {
     CREST_MAX_32 / (127.0 * 12f64.sqrt())
 }
 
+/// The bound on a `k`-term dot with both operands rounded to BF16 and F32
+/// accumulation, as a fraction of its terms' absolute sum `Σ|w·x|`.
+pub fn bf16_dot_rel(k: usize) -> f64 {
+    let u = 1.0 / 256.0;
+    2.0 * u + u * u + gamma(k)
+}
+
 /// BF16 operands against exact dequantized rows and the released Q8_0
 /// weight/activation representation. KL is over each column's output rows.
 pub fn check_mma(tag: &str, (y, x, k): (&[f32], &[f32], usize), w: &[Vec<f32>]) -> bool {
@@ -156,9 +163,7 @@ pub fn check_mma(tag: &str, (y, x, k): (&[f32], &[f32], usize), w: &[Vec<f32>]) 
                 mag += term.abs();
                 sq += f64::from(wq[r][j]) * f64::from(xq[c * k + j]);
             }
-            // BF16 rounding in each operand, followed by F32 accumulation.
-            let u = 1.0 / 256.0;
-            let bound = (2.0 * u + u * u + gamma(k)) * mag;
+            let bound = bf16_dot_rel(k) * mag;
             let err = (f64::from(y[c * rows + r]) - sum).abs();
             band &= err.is_finite() && err <= bound;
             worst = worst.max(if bound > 0.0 { err / bound } else { err });

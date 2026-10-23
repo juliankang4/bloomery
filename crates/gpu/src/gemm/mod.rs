@@ -69,7 +69,8 @@ pub use f32tile::LINE as F32_TILE_LINE;
 pub(crate) use f32tile::{
     Bf16Rows, F32Rows, F32T_THREADS_U32, MMA_CELLS, MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS,
     MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaRows, MmaTile, STAGE_FLOATS, STAGES, TileRows,
-    bf16_mma_body, bf16_mma_launch, bf16_mma_tile, f32_tile_body, mma_tile_origin, tile_launch,
+    bf16_mma_body, bf16_mma_launch, bf16_mma_tile, f32_tile_body, land_values, mma_launch,
+    mma_tile_origin, tile_launch,
 };
 pub use gemm32::{Gemm32Args, Gemm32Weight};
 pub use grouped::{GemmArgs, GemmInput, GemmWeight};

@@ -56,7 +56,10 @@
 //! one-expert table) on `xn` and on the bottleneck quantized per 32 values;
 //! the inject rows are the wide F32 tile, and a BF16 down or up the BF16
 //! prompt product (`Q8F32Kernels::enqueue_bf16_prompt`) on `xn` or the
-//! bottleneck, with BF16 operands on GB10 and F32 activations otherwise;
+//! bottleneck, with BF16 operands on GB10 and F32 activations otherwise.
+//! On GB10 an inject site's BF16 down and its inject rows are one such
+//! product (`hc_gated_down_mma_4`, [`HcDownRows`]): the inject rows below
+//! the down's, rounded to BF16 as they are staged, so `xn` is read once;
 //! two glue entries finish the rule —
 //! `hc_gated_lo_4x320` (`silu(·/4)` of each down row, `2·σ(·/4)` of each
 //! inject row) and `hc_gated_mix_4` (`(xn_0·σ(g_0), fma for the rest)·¼`,
@@ -70,20 +73,22 @@ use crate::cores::l2_prefetch;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
-    Bf16Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmRoute, MMA_CELLS,
-    MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaRows,
-    MmaTile, STAGE_FLOATS, STAGES, TileRows, bf16_mma_launch, bf16_mma_tile, mma_tile_origin,
+    Bf16Rows, F32Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmRoute,
+    MMA_CELLS, MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH,
+    MmaRows, MmaTile, STAGE_FLOATS, STAGES, TileRows, bf16_mma_body, bf16_mma_launch,
+    bf16_mma_tile, land_values, mma_launch, mma_tile_origin,
 };
 use crate::linear::{sigmoid, silu};
 use crate::q8f32::{
     Bf16Words, Q8F32Kernels, RowValues, f32_lane_partial_1col, f32_lane_partials_view,
     gemv_lane_sums, q8_0_lane_partials_mcol,
 };
-use crate::tensor::DeviceTensor;
-use crate::view::{Elem, StreamFma};
+use crate::tensor::{DeviceTensor, WindowMut, check_alignment};
+use crate::view::StreamFma;
 use crate::weights::{DevWeight, Weights};
 use crate::{GpuError, launch_u32, store_cols};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::vector::{F32x4, U32x4};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
@@ -1687,6 +1692,66 @@ impl MmaRows for HcUpRows<'_> {
     }
 }
 
+/// An inject site's down and inject as one weight of `RANK + STREAMS` rows:
+/// the down's BF16 words, then the inject's F32 rows, logical value `at`
+/// past `split` (the down's values) the inject's value `at - split`. The
+/// MMA tile stages an inject piece rounded to BF16 ([`land_values`]) as it
+/// fetches it, so a thread holds no inject values across an MMA step; the
+/// exact replay stages its F32 values.
+#[derive(Clone, Copy)]
+struct HcDownRows<'a> {
+    down: &'a [u32],
+    inject: &'a [f32],
+    split: usize,
+}
+
+impl TileRows for HcDownRows<'_> {
+    #[inline(always)]
+    unsafe fn stage(self, dst: *mut f32, at: usize) {
+        if at < self.split {
+            // SAFETY: the four values lie in the down's rows (`split` is a
+            // multiple of 4), by this fn's contract.
+            unsafe { Bf16Rows(self.down).stage(dst, at) };
+        } else {
+            // SAFETY: they are the inject's values `at - split ..`, inside its
+            // rows, a multiple of 4 from its checked 16-byte aligned base.
+            unsafe { F32Rows(self.inject).stage(dst, at - self.split) };
+        }
+    }
+}
+
+impl MmaRows for HcDownRows<'_> {
+    /// Whether an inject piece's values pass `mma_fits`; true for a down
+    /// piece, copied as its words.
+    type Piece = bool;
+
+    #[inline(always)]
+    unsafe fn fetch(self, dst: *mut u32, at: usize) -> bool {
+        if at < self.split {
+            // SAFETY: the eight values lie in the down's rows (`split` is a
+            // multiple of 8), by this fn's contract.
+            unsafe { Bf16Rows(self.down).fetch(dst, at) };
+            return true;
+        }
+        let p = self
+            .inject
+            .as_ptr()
+            .wrapping_add(at - self.split)
+            .cast::<F32x4>();
+        // SAFETY: p starts the inject's values `at - split ..` of eight, inside
+        // its rows, 16-byte aligned (a multiple of 8 from the checked base).
+        let [F32x4([a0, a1, a2, a3]), F32x4([b0, b1, b2, b3])] = unsafe { [*p, *p.add(1)] };
+        // SAFETY: dst is this thread's own aligned 16 bytes, which no warp
+        // reads before the barrier after this fetch's wait.
+        unsafe { land_values([a0, a1, a2, a3, b0, b1, b2, b3], dst) }
+    }
+
+    #[inline(always)]
+    unsafe fn land(fits: bool, _dst: *mut u32, _at: usize) -> bool {
+        fits
+    }
+}
+
 /// Rows of the warp's outputs one pass of [`mma_mix`] holds in the scratch.
 const MIX_ROWS: usize = MMA_WARP_SCRATCH / MMA_WARP_COLS;
 /// A thread's cells in those rows ([`MmaTile::value`]).
@@ -1971,9 +2036,12 @@ mod hc_wide_kernels {
     }
 
     /// The bottleneck and the combine's weights of `m` columns: thread `i <
-    /// m·320` writes `lo[i] = silu(down[i]·¼)`, `down` the down rows'
-    /// whole dots `[m][320]`; with `inject` 1, thread `m·320 + j` writes
-    /// `wgt[j] = 2·σ(inj[j]·¼)`, `inj` the inject rows' dots `[m][4]`.
+    /// m·320` writes `lo[i] = silu(d·¼)`, `d` down row `i % 320`'s dot of
+    /// column `i / 320`; with `inject` 1, thread `m·320 + j` writes `wgt[j] =
+    /// 2·σ(v·¼)`, `v` inject row `j % 4`'s dot of column `j / 4`. The dots
+    /// are `[m][320]`, then `[m][4]` with `inject`; with `packed` (the one
+    /// product of `hc_gated_down_mma_4`) `[m][324]`, a column's inject dots
+    /// after its down dots.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -1981,62 +2049,68 @@ mod hc_wide_kernels {
         block = (256, 1, 1),
         requires = (
             inject <= 1,
-            down.len() >= m * 320,
-            inj.len() >= inject * m * 4,
+            packed <= inject,
+            dots.len() >= m * (320 + 4 * inject),
             lo.len() >= m * 320,
             wgt.len() >= inject * m * 4
         )
     )]
     pub fn hc_gated_lo_4x320(
-        down: &[f32],
-        inj: &[f32],
+        dots: &[f32],
         m: u32,
         inject: u32,
+        packed: u32,
         fault: FaultSink,
         mut lo: DisjointSlice<f32>,
         mut wgt: DisjointSlice<f32>,
     ) {
         let i = thread::index_1d().get();
         let n = m as usize * RANK;
+        let stride = RANK + packed as usize * STREAMS;
         if i < n {
-            // SAFETY: the `requires` above were launcher-checked, `n = m·320`
-            // comes from this kernel's parameter and `i` is this thread's
-            // `index_1d` below it, and the launch is `domain = 1` with the
-            // contract's exact 1-D block.
-            let e = unsafe { Elem::new(down, &mut lo, i) };
-            e.map(move |d| {
-                let l = if d.is_finite() {
-                    silu(d * INV)
-                } else {
-                    f32::NAN
-                };
-                if !l.is_finite() {
-                    fault.raise(SITE);
-                }
-                l
-            });
+            // SAFETY: the `requires` above were launcher-checked; column
+            // `i / 320 < m` and row `i % 320 < 320 <= stride`, so the index
+            // is below `m·stride <= dots.len()`.
+            let d = unsafe { *dots.get_unchecked((i / RANK) * stride + i % RANK) };
+            let l = if d.is_finite() {
+                silu(d * INV)
+            } else {
+                f32::NAN
+            };
+            if !l.is_finite() {
+                fault.raise(SITE);
+            }
+            // SAFETY: `i < m·320 <= lo.len()` (`requires`), and `i` is this
+            // thread's own `index_1d` in the contract's exact 1-D block of a
+            // `domain = 1` launch, so no other thread writes `lo[i]`.
+            unsafe { *lo.get_unchecked_mut(i) = l };
             return;
         }
         let j = i - n;
         if inject == 0 || j >= m as usize * STREAMS {
             return;
         }
-        // SAFETY: the `requires` above were launcher-checked (with `inject`
-        // 1 they read `inj.len()`, `wgt.len() >= m·4`), `j` is this thread's
-        // `index_1d` less the grid-uniform `n`, below `m·4` past the guard,
-        // and the launch is `domain = 1` with the contract's exact 1-D block.
-        let e = unsafe { Elem::new(inj, &mut wgt, j) };
-        e.map(move |v| {
-            let w = if v.is_finite() {
-                2.0 * sigmoid(v * INV)
-            } else {
-                f32::NAN
-            };
-            if !w.is_finite() {
-                fault.raise(SITE);
-            }
-            w
-        });
+        let at = if packed == 1 {
+            (j / STREAMS) * stride + RANK + j % STREAMS
+        } else {
+            n + j
+        };
+        // SAFETY: with `inject` 1, `dots.len() >= m·324` (`requires`):
+        // packed, column `j / 4 < m` and row `320 + j % 4 < 324 = stride`;
+        // otherwise `m·320 + j < m·324`.
+        let v = unsafe { *dots.get_unchecked(at) };
+        let w = if v.is_finite() {
+            2.0 * sigmoid(v * INV)
+        } else {
+            f32::NAN
+        };
+        if !w.is_finite() {
+            fault.raise(SITE);
+        }
+        // SAFETY: `j < m·4 <= wgt.len()` with `inject` 1 (`requires`), and `j`
+        // is this thread's `index_1d` less the grid-uniform `n` in the
+        // contract's exact 1-D block, so no other thread writes `wgt[j]`.
+        unsafe { *wgt.get_unchecked_mut(j) = w };
     }
 
     /// The mixed values of `m` columns: value `i = c·hidden + h` is `(xn_0·
@@ -2081,6 +2155,58 @@ mod hc_wide_kernels {
         // SAFETY: i < m·hidden <= mixed.len(); one thread a value.
         unsafe { store_mix(acc, i, fault, &mut mixed) };
     }
+
+    /// An inject site's down and inject over the normed streams as one BF16
+    /// tensor-core product ([`HcDownRows`], `bf16_mma_body`): `y[c·324 + r]`,
+    /// row `r < 320` the down's dot of column `c` and row `320 + s` the
+    /// inject's, each cell of an out-of-range operand replayed on the exact
+    /// F32 owner.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            hidden > 0,
+            m > 0,
+            down.len() >= 640 * hidden,
+            inject.len() >= 16 * hidden,
+            xn.len() >= m * 4 * hidden,
+            y.len() >= m * 324
+        )
+    )]
+    pub fn hc_gated_down_mma_4(
+        down: &[u32],
+        inject: &[f32],
+        xn: &[f32],
+        hidden: u32,
+        m: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        let wide = STREAMS * hidden as usize;
+        let rows = HcDownRows {
+            down,
+            inject,
+            split: RANK * wide,
+        };
+        // SAFETY: the checked launch supplies 256 converged threads, the MMA
+        // grid, the aligned normed streams and weights and the output spans
+        // of the contract: 320 BF16 rows and 4 F32 rows of 4·hidden values.
+        unsafe {
+            bf16_mma_body(
+                rows,
+                xn,
+                (RANK + STREAMS) as u32,
+                wide as u32,
+                m,
+                &mut y,
+                sh,
+            )
+        };
+    }
 }
 
 /// The intermediates of a wide mix, allocated once for up to `cols` columns
@@ -2092,10 +2218,11 @@ pub struct HcWideScratch {
     /// `[m][streams][hidden]`.
     pub xn: DeviceBuffer<f32>,
     pub xq: GemmAct32,
-    /// `[m][RANK]`: the down rows' dots.
+    /// The down rows' and the inject rows' dots: `[m][RANK]`, then
+    /// `[m][streams]` at an inject site; `[m][RANK + streams]`, a column's
+    /// inject dots after its down dots, where one product packs both
+    /// (`hc_gated_down_mma_4`).
     pub down: DeviceBuffer<f32>,
-    /// `[m][streams]`: the inject rows' dots.
-    pub inj: DeviceBuffer<f32>,
     /// `[m][RANK]`: the bottleneck after its silu.
     pub lo: DeviceBuffer<f32>,
     pub loq: GemmAct32,
@@ -2115,8 +2242,7 @@ impl HcWideScratch {
         Ok(HcWideScratch {
             xn: DeviceBuffer::zeroed(stream, z.xn)?,
             xq: GemmAct32::new(stream, cols, geo.wide())?,
-            down: DeviceBuffer::zeroed(stream, z.lo)?,
-            inj: DeviceBuffer::zeroed(stream, z.wgt)?,
+            down: DeviceBuffer::zeroed(stream, z.lo + z.wgt)?,
             lo: DeviceBuffer::zeroed(stream, z.lo)?,
             loq: GemmAct32::new(stream, cols, geo.r())?,
             g: DeviceBuffer::zeroed(stream, z.xn)?,
@@ -2135,12 +2261,10 @@ impl HcWideScratch {
     /// Device bytes.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        [
-            &self.xn, &self.down, &self.inj, &self.lo, &self.g, &self.wgt,
-        ]
-        .iter()
-        .map(|b| b.num_bytes())
-        .sum::<usize>()
+        [&self.xn, &self.down, &self.lo, &self.g, &self.wgt]
+            .iter()
+            .map(|b| b.num_bytes())
+            .sum::<usize>()
             + self.xq.bytes()
             + self.loq.bytes()
     }
@@ -2184,8 +2308,10 @@ impl HcWideKernels {
     /// Enqueue one site's mix over `m` columns (module doc's wide arm): the
     /// norm after `before`, the down and optional inject projections, the
     /// bottleneck and weights, and the up/mix. Q8 projections add activation
-    /// quantizers. GB10 BF16 up projections with m > 8 consume g in the MMA
-    /// epilogue; other paths use separate up and mix launches. An inject site leaves its combine weights
+    /// quantizers. On GB10 an inject site's BF16 down and its inject are one
+    /// product, and BF16 up projections with m > 8 consume g in the MMA
+    /// epilogue; other paths use separate down and inject products and
+    /// separate up and mix launches. An inject site leaves its combine weights
     /// in the scratch for the next site's [`Before::Combine`]. `m` outside
     /// `1..=scratch.cols()`, a short buffer, planes of another shape
     /// (the narrow arm's check, `check_mix`) or a table filled for another
@@ -2221,6 +2347,22 @@ impl HcWideKernels {
         let hidden = launch_u32(what, "hidden", geo.d())?;
         let mu = launch_u32(what, "m", m)?;
         let inject = u32::from(a.w.inject.is_some());
+        let pack = match (a.w.down, a.w.inject) {
+            (HcMatrix::Bf16(down), Some(inj)) if a.q8f32.dense_mma => {
+                let t = mma_launch(
+                    what,
+                    r + geo.s(),
+                    wide,
+                    &a.scratch.xn,
+                    m,
+                    &mut a.scratch.down,
+                )?;
+                check_alignment::<U32x4, _>(what, "down", down.buf())?;
+                check_alignment::<F32x4, _>(what, "inject", inj.buf())?;
+                Some((down, inj, t))
+            }
+            _ => None,
+        };
         let fused = if let HcMatrix::Bf16(w) = a.w.up
             && a.q8f32.dense_mma
             && m > MAX_COLS
@@ -2255,28 +2397,47 @@ impl HcWideKernels {
             a.res,
             &mut s.xn,
         )?;
-        match a.w.down {
-            HcMatrix::Q8_0 { qs, d } => {
-                a.gemm
-                    .enqueue_quantize_gemm32(stream, &s.xn, m, &mut s.xq, a.fault)?;
-                a.gemm.enqueue_gemm32(
-                    stream,
-                    Gemm32Args {
-                        w: Gemm32Weight::Q8_0Plane { qs, d },
-                        rows_per_expert: r,
-                        act: &s.xq,
-                        route: a.dense,
-                        input: GemmInput::PerSlot,
-                        y: &mut s.down,
-                    },
-                )?;
+        let packed = u32::from(pack.is_some());
+        if let Some((down, inj, t)) = pack {
+            let prep = self
+                .module
+                .prepare_hc_gated_down_mma_4(LaunchConfig1D::new(t.grid, MMA_THREADS, 0))?;
+            self.module.hc_gated_down_mma_4(
+                stream,
+                &prep,
+                down.buf(),
+                inj.buf(),
+                &s.xn,
+                hidden,
+                mu,
+                &mut s.down,
+            )?;
+        } else {
+            match a.w.down {
+                HcMatrix::Q8_0 { qs, d } => {
+                    a.gemm
+                        .enqueue_quantize_gemm32(stream, &s.xn, m, &mut s.xq, a.fault)?;
+                    a.gemm.enqueue_gemm32(
+                        stream,
+                        Gemm32Args {
+                            w: Gemm32Weight::Q8_0Plane { qs, d },
+                            rows_per_expert: r,
+                            act: &s.xq,
+                            route: a.dense,
+                            input: GemmInput::PerSlot,
+                            y: &mut s.down,
+                        },
+                    )?;
+                }
+                HcMatrix::Bf16(w) => {
+                    a.q8f32
+                        .enqueue_bf16_prompt(stream, w, &s.xn, m, &mut s.down)?
+                }
             }
-            HcMatrix::Bf16(w) => a
-                .q8f32
-                .enqueue_bf16_prompt(stream, w, &s.xn, m, &mut s.down)?,
-        }
-        if let Some(inj) = a.w.inject {
-            a.gemm.enqueue_f32_tile(stream, inj, &s.xn, m, &mut s.inj)?;
+            if let Some(inj) = a.w.inject {
+                let mut dots = WindowMut::of_mut(&mut s.down, size_of::<f32>() * z.lo, z.wgt)?;
+                a.gemm.enqueue_f32_tile(stream, inj, &s.xn, m, &mut dots)?;
+            }
         }
         let n_lo = m * r + if inject == 1 { m * STREAMS } else { 0 };
         let prep = self.module.prepare_hc_gated_lo_4x320(LaunchConfig1D::new(
@@ -2284,10 +2445,10 @@ impl HcWideKernels {
             GLUE_THREADS,
             0,
         ))?;
-        // Without an inject the launch reads no `inj` and writes no `wgt`:
-        // the scratch's own buffers stand in, their lengths untested.
+        // Without an inject the launch writes no `wgt`: the scratch's own
+        // stands in, its length untested.
         self.module.hc_gated_lo_4x320(
-            stream, &prep, &s.down, &s.inj, mu, inject, a.fault, &mut s.lo, &mut s.wgt,
+            stream, &prep, &s.down, mu, inject, packed, a.fault, &mut s.lo, &mut s.wgt,
         )?;
         if let Some((w, t)) = fused {
             let prep = self
