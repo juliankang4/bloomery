@@ -107,8 +107,8 @@
 //! - a fourth load, a plain server of `--parallel 4` under
 //!   `BLOOMERY_STEP_STATS=1` ([`slots_one_pass`]; no draft, no residency —
 //!   the bits need no expert moving): its `parallel` line names `pass=one`,
-//!   and four requests of two rendered turns ([`TURN_A`], [`TURN_C`]), each run alone for
-//!   [`SLOTS_PREDICT`] greedy ids (`cache_prompt` off), then both posted at
+//!   and four requests of two rendered turns ([`TURN_A`], [`TURN_C`]), each
+//!   run alone for [`SLOTS_PREDICT`] greedy ids (`cache_prompt` off), then all posted at
 //!   once, answer each one's alone ids, every `slots round` record of the
 //!   together window reading `cmd=step`, `slots=4`, `rows` from 2 to 4 and
 //!   `passes=ceil(rows/2)` — the body's two-sequence bound (FAIL-first: the seat
@@ -2429,6 +2429,7 @@ mod gate {
                 .zip(&alone)
                 .all(|(got, want)| got.as_ref() == Some(want)),
         );
+        // PIN(2026-10-23): the two-slot one-pass clause now covers four slots at the sequence bound.
         check(&mut ok, "plain_slots_rounds_respect_pass_capacity", every);
         check(
             &mut ok,

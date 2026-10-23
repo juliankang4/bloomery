@@ -684,8 +684,8 @@ where
     /// pass: the busy `rows` (one a slot there, the server's rounds being one
     /// step a running slot) cut into passes bounded by [`SlotRows::MAX_ROWS`]
     /// rows and [`SlotRows::MAX_SLOTS`] sequences, run in `round_passes`'
-    /// order (the pass that holds slot 0
-    /// last), each row's greedy next token in row order and each slot's
+    /// order (the pass that holds slot 0 last), each row's greedy next
+    /// token in row order and each slot's
     /// position moved by its own. With `logits`, every row's logits of each
     /// pass come back too, read through [`GpuModel::slots_logits_into`] into
     /// the session's own buffer at the pass's rows of the round, lent until

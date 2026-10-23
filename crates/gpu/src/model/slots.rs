@@ -613,7 +613,8 @@ where
     ///
     /// Refused by name before anything runs: a pass of no slot, a slot out
     /// of range or twice, a slot of no token, more than the body's
-    /// [`SlotRows::MAX_ROWS`] rows or [`SlotRows::MAX_SLOTS`] slots, a slot's rows past the resident cache
+    /// [`SlotRows::MAX_ROWS`] rows or [`SlotRows::MAX_SLOTS`] slots, a
+    /// slot's rows past the resident cache
     /// and a poisoned model. The homes are made canonical first — slot 0
     /// selected, so every slot's state sits in its home and the body binds
     /// each slot's stores by the slot alone — and the call leaves slot 0
