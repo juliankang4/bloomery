@@ -2619,6 +2619,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn e4m3_rows_refuse_nonfinite_products_before_writing() {
+        for scale in [f32::MAX, -f32::MAX, f32::MAX / 2.0, -f32::MAX / 2.0] {
+            let rows = super::E4m3Rows::new(scale);
+            for byte in [0x40u8, 0xC0, 0x7E, 0xFE, 0x38, 0xB8, 0x00, 0x80] {
+                let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
+                let want = (sign * ue4m3(byte & 0x7F) * f64::from(scale)) as f32;
+                let mut dst = [f32::from_bits(0x7FC0_1234), -0.0];
+                let before = dst.map(f32::to_bits);
+                let got = rows.decode(&[0x38, byte, 0x7F], &mut dst);
+                if want.is_finite() {
+                    got.unwrap();
+                    assert_eq!(dst.map(f32::to_bits), [scale.to_bits(), want.to_bits()]);
+                } else {
+                    let error = got.expect_err("a scaled value outside f32 must be refused");
+                    let text = error.to_string();
+                    assert!(
+                        text.contains("value 1") && text.contains("not finite"),
+                        "{text}"
+                    );
+                    assert!(text.contains(&format!("{byte:#04x}")), "{text}");
+                    assert_eq!(dst.map(f32::to_bits), before);
+                }
+            }
+        }
+        for scale in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let mut dst = [42.0, -0.0];
+            let before = dst.map(f32::to_bits);
+            let error = super::E4m3Rows::new(scale)
+                .decode(&[0x38, 0x00], &mut dst)
+                .expect_err("a non-finite scale must be refused");
+            let text = error.to_string();
+            assert!(
+                text.contains("value 0") && text.contains("not finite"),
+                "{text}"
+            );
+            assert_eq!(dst.map(f32::to_bits), before);
+        }
+    }
+
     /// A split holding a PLE table in bloomery's F8 rows and its `.scale`,
     /// opened through `Split::open`: each row, decoded at the scale read from
     /// the file, is the reference's (every byte that holds a value appears).
