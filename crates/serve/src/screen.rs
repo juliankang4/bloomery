@@ -21,9 +21,12 @@
 //! line with the address, then two panels: where the model went (the card,
 //! the host and the NVMe tier, with a bar of the experts each holds) and how
 //! it serves (the placement, the context and slots, the prompt cache).
+//! Below the art's width it uses a text wordmark and stacks the panels;
+//! the width is read when it draws, after any resize during the load.
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
+use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -173,7 +176,26 @@ pub(crate) fn draw() {
     let Some((style, lines)) = tape().take() else {
         return;
     };
-    if let Some(screen) = render(&lines, style) {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: stderr supplies a live fd and size is a writable winsize for this ioctl.
+    let rc = unsafe { libc::ioctl(std::io::stderr().as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
+    if rc != 0 {
+        eprintln!(
+            "start screen: terminal width: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    if size.ws_col < 2 {
+        eprintln!("start screen: terminal width must be at least 2 columns");
+        return;
+    }
+    if let Some(screen) = render(&lines, style, usize::from(size.ws_col)) {
         eprint!("{screen}");
     }
 }
@@ -615,12 +637,10 @@ fn width(s: &str) -> usize {
 
 /// The art's height in pixels, two to a terminal row (a half block).
 const ART_H: usize = 24;
-/// The art's width in columns, one pixel each: the screen's width.
+/// The art's width in columns, one pixel each: the two-panel screen's width.
 const ART_W: usize = 98;
 /// The columns the text is indented by.
 const MARGIN: &str = "  ";
-/// The text's width inside the margin.
-const INNER: usize = ART_W - MARGIN.len();
 /// The columns of a row's label, its padding included.
 const LABEL: usize = 9;
 /// The columns between the two panels.
@@ -946,6 +966,18 @@ fn wrap(text: &str, w: usize, dot: &str) -> Vec<String> {
 /// label's ([`wrap`]), the label dimmed before the first line and the rest
 /// indented under it.
 fn row_lines(label: &str, value: &str, w: usize, style: Style, dot: &str) -> Vec<Text> {
+    if w <= LABEL {
+        return [(label, style.code(DIM)), (value, "")]
+            .into_iter()
+            .flat_map(|(s, code)| {
+                wrap(s, w, dot).into_iter().map(move |line| {
+                    let mut t = Text::default();
+                    t.push(&line, code);
+                    t
+                })
+            })
+            .collect();
+    }
     wrap(value, w - LABEL, dot)
         .into_iter()
         .enumerate()
@@ -1040,10 +1072,46 @@ const PLACED: [&str; 4] = ["card", "tier", "host", "nvme"];
 /// The rows the serving panel shows.
 const SERVED: [&str; 6] = ["place", "arch", "model", "head", "context", "cache"];
 
+/// Hard wraps painted lines without counting their SGR escapes as columns.
+/// Record rows use word wrapping first; this also bounds art, links and commands.
+fn wrap_painted(line: &str, columns: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    let mut escape = false;
+    for c in line.chars() {
+        if c == '\x1b' {
+            escape = true;
+        }
+        if escape {
+            out.push(c);
+            if c == 'm' {
+                escape = false;
+            }
+            continue;
+        }
+        let n = char_width(c);
+        if used + n > columns {
+            out.push('\n');
+            used = 0;
+        }
+        out.push(c);
+        used += n;
+    }
+    out
+}
+
 /// The screen of the record lines `lines` in `style`, or `None` when they
 /// hold no `listening` line.
 #[must_use]
-fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
+fn render<S: AsRef<str>>(lines: &[S], style: Style, columns: usize) -> Option<String> {
+    let columns = columns.min(ART_W);
+    let margin = if columns > LABEL + MARGIN.len() {
+        MARGIN
+    } else {
+        ""
+    };
+    let inner = columns - margin.len();
+    let stacked = columns < ART_W;
     let marks = if style.utf8 {
         Marks {
             dot: "·",
@@ -1077,7 +1145,15 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
     };
     let dim = style.code(DIM);
     let mut out = vec![String::new()];
-    out.extend(blocks(&art(style.color), style));
+    if stacked {
+        out.push(format!(
+            "{margin}{}bloomery{}",
+            style.fg(ORANGE),
+            style.code(RESET)
+        ));
+    } else {
+        out.extend(blocks(&art(style.color), style));
+    }
     out.push(String::new());
 
     let seat = plain(&seat);
@@ -1088,14 +1164,15 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
     status.push(&seat, style.code(BOLD));
     if let Some((_, loaded)) = pick(&|l| l == "loaded").first() {
         let right = format!("loaded {loaded}");
-        status.pad(
-            INNER
-                .saturating_sub(width(&right))
-                .max(width(&status.shown) + 2),
-        );
+        if width(&status.shown) + 2 + width(&right) > inner {
+            out.push(format!("{margin}{}", status.painted));
+            status = Text::default();
+        } else {
+            status.pad(inner - width(&right));
+        }
         status.push(&right, dim);
     }
-    out.push(format!("{MARGIN}{}", status.painted));
+    out.push(format!("{margin}{}", status.painted));
     let url = format!("http://{}", plain(&addr));
     let mut at = Text::default();
     at.push(&" ".repeat(LABEL), "");
@@ -1107,16 +1184,17 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
         style.fg(YELLOW)
     );
     at.push(&url, &link);
-    out.push(format!("{MARGIN}{}", at.painted));
+    out.push(format!("{margin}{}", at.painted));
 
     let placed = pick(&|l| PLACED.contains(&l));
     let served = pick(&|l| SERVED.contains(&l));
     let bar = split.and_then(|s| bar(s, style));
     let has_left = !placed.is_empty() || bar.is_some();
     let (lw, rw) = match (has_left, served.is_empty()) {
-        (true, false) => (LEFT, INNER - LEFT - GAP),
-        (true, true) => (INNER, 0),
-        (false, _) => (0, INNER),
+        (true, false) if !stacked => (LEFT, inner - LEFT - GAP),
+        (true, false) => (inner, inner),
+        (true, true) => (inner, 0),
+        (false, _) => (0, inner),
     };
     let mut left = Vec::new();
     if has_left {
@@ -1136,6 +1214,12 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
     if !left.is_empty() || !right.is_empty() {
         out.push(String::new());
     }
+    if stacked {
+        if !left.is_empty() && !right.is_empty() {
+            left.push(Text::default());
+        }
+        left.append(&mut right);
+    }
     for i in 0..left.len().max(right.len()) {
         let mut line = left.get(i).cloned().unwrap_or_default();
         if let Some(r) = right.get(i) {
@@ -1144,7 +1228,7 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
             }
             line.append(r);
         }
-        out.push(format!("{MARGIN}{}", line.painted));
+        out.push(format!("{margin}{}", line.painted));
     }
     // Rows neither panel names (the plan's card list, the unread records)
     // run the full width below them.
@@ -1152,14 +1236,14 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
     if !wide.is_empty() {
         out.push(String::new());
         for (label, value) in &wide {
-            for t in row_lines(label, value, INNER, style, marks.dot) {
-                out.push(format!("{MARGIN}{}", t.painted));
+            for t in row_lines(label, value, inner, style, marks.dot) {
+                out.push(format!("{margin}{}", t.painted));
             }
         }
     }
 
     out.push(String::new());
-    out.push(format!("{MARGIN}{}", heading("try", INNER, style).painted));
+    out.push(format!("{margin}{}", heading("try", inner, style).painted));
     let yellow = style.fg(YELLOW);
     let mut lines = Vec::new();
     if seat.ends_with("-decide") {
@@ -1182,19 +1266,29 @@ fn render<S: AsRef<str>>(lines: &[S], style: Style) -> Option<String> {
         t.push(r#"'{"messages":[{"role":"user","content":"Hello!"}]}'"#, "");
         lines.push(t);
     }
-    out.extend(lines.iter().map(|t| format!("{MARGIN}{}", t.painted)));
+    out.extend(lines.iter().map(|t| format!("{margin}{}", t.painted)));
 
     out.push(String::new());
     let key = format!("{}{}", style.bg(KEY), style.fg(CREAM));
     let mut keys = Text::default();
     keys.push(" Ctrl+C ", &key);
     keys.push(" stops the server", dim);
-    keys.push("    ", "");
+    if width(&keys.shown) + 4 + width(" BLOOMERY_SCREEN=off  hides this screen") > inner {
+        out.push(format!("{margin}{}", keys.painted));
+        keys = Text::default();
+    } else {
+        keys.push("    ", "");
+    }
     keys.push(" BLOOMERY_SCREEN=off ", &key);
     keys.push(" hides this screen", dim);
-    out.push(format!("{MARGIN}{}", keys.painted));
+    out.push(format!("{margin}{}", keys.painted));
     out.push(String::new());
-    Some(out.join("\n"))
+    Some(
+        out.iter()
+            .map(|line| wrap_painted(line, columns))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 #[cfg(test)]
@@ -1271,9 +1365,11 @@ mod tests {
     /// shadow and glow only in colour).
     #[test]
     fn renders_the_golden_screens() {
-        let plain = render(&lines(START), UTF8).expect("the start has a listening line");
+        let plain =
+            render(&lines(START), UTF8, super::ART_W).expect("the start has a listening line");
         golden("screen-utf8.txt", &plain);
-        let got = render(&lines(START), ASCII).expect("the start has a listening line");
+        let got =
+            render(&lines(START), ASCII, super::ART_W).expect("the start has a listening line");
         golden("screen-ascii.txt", &got);
         assert!(got.is_ascii(), "the ASCII screen holds a byte past ASCII");
 
@@ -1285,11 +1381,15 @@ mod tests {
                 .join("\n")
         };
         for (style, escape) in [(TRUE, "\x1b[38;2;"), (CUBE, "\x1b[38;5;")] {
-            let colored = render(&lines(START), style).unwrap();
+            let colored = render(&lines(START), style, super::ART_W).unwrap();
             assert!(colored.contains(escape), "no {escape:?} in {style:?}");
             assert_eq!(below_art(&strip_escapes(&colored)), below_art(&plain));
         }
-        assert!(!render(&lines(START), CUBE).unwrap().contains("\x1b[38;2;"));
+        assert!(
+            !render(&lines(START), CUBE, super::ART_W)
+                .unwrap()
+                .contains("\x1b[38;2;")
+        );
         assert_eq!(super::cube(Rgb(255, 0, 0)), 196);
     }
 
@@ -1298,13 +1398,14 @@ mod tests {
     /// the golden text.
     #[test]
     fn renders_the_granted_arena() {
-        let got = render(&lines(START38), UTF8).expect("the start has a listening line");
+        let got =
+            render(&lines(START38), UTF8, super::ART_W).expect("the start has a listening line");
         golden("screen-qwen38.txt", &got);
         let no_nvtier: Vec<&str> = lines(START38)
             .into_iter()
             .filter(|l| !l.starts_with("nvtier "))
             .collect();
-        let got = render(&no_nvtier, UTF8).unwrap();
+        let got = render(&no_nvtier, UTF8, super::ART_W).unwrap();
         assert!(
             !got.contains("nvme"),
             "an arena from no nvtier record:\n{got}"
@@ -1328,16 +1429,19 @@ mod tests {
                     .any(|h| l.starts_with(h))
             })
             .collect();
-        golden("screen-missing.txt", &render(&missing, ASCII).unwrap());
+        golden(
+            "screen-missing.txt",
+            &render(&missing, ASCII, super::ART_W).unwrap(),
+        );
         let reversed: Vec<&str> = missing.iter().rev().copied().collect();
         assert_eq!(
-            render(&reversed, ASCII).unwrap(),
+            render(&reversed, ASCII, super::ART_W).unwrap(),
             read_golden("screen-missing.txt")
         );
 
         let reversed: Vec<&str> = lines(START).into_iter().rev().collect();
         assert_eq!(
-            render(&reversed, UTF8).unwrap(),
+            render(&reversed, UTF8, super::ART_W).unwrap(),
             read_golden("screen-utf8.txt")
         );
     }
@@ -1359,7 +1463,7 @@ mod tests {
                 }
             })
             .collect();
-        let got = render(&start, ASCII).unwrap();
+        let got = render(&start, ASCII, super::ART_W).unwrap();
         assert!(got.contains(&format!("{}a\n", row("place"))), "{got}");
         for gone in [
             "break-even".to_owned(),
@@ -1382,7 +1486,7 @@ mod tests {
         let only = [
             "bloomery-serve-qwen38: place=a ctx=8192 slots=2 slot_ctx=8192 listening on http://0.0.0.0:9000",
         ];
-        let got = render(&only, ASCII).unwrap();
+        let got = render(&only, ASCII, super::ART_W).unwrap();
         assert!(got.contains("-> http://0.0.0.0:9000\n"), "{got}");
         for label in ["place", "context"] {
             assert!(got.contains(&row(label)), "no {label} row:\n{got}");
@@ -1500,7 +1604,7 @@ mod tests {
             ),
         ] {
             let start = mutated(start, head, from, to);
-            let got = render(&start, ASCII).unwrap();
+            let got = render(&start, ASCII, super::ART_W).unwrap();
             assert!(
                 !got.contains(&gone),
                 "{gone} from a {record} value that is no number:\n{got}"
@@ -1512,7 +1616,7 @@ mod tests {
             );
         }
         for start in [START, START38] {
-            let got = render(&lines(start), ASCII).unwrap();
+            let got = render(&lines(start), ASCII, super::ART_W).unwrap();
             assert!(
                 !got.contains(&row("unread")),
                 "an unread row from a clean start:\n{got}"
@@ -1553,7 +1657,7 @@ mod tests {
                 facts.rows.iter().find(|r| r.0 == "devices").map(|r| &r.1),
                 (tiers > 0).then_some(&devices)
             );
-            let got = render(&start, ASCII).unwrap();
+            let got = render(&start, ASCII, super::ART_W).unwrap();
             assert_eq!(got.contains(&row("devices")), tiers > 0, "{got}");
             if tiers == 1 {
                 assert!(
@@ -1575,7 +1679,7 @@ mod tests {
             "bloomery-serve-decide: place=a model=삽살이-Q4_K_M.gguf quant=q4_K×1988 q6_K×97 \
              head=e\u{301}tiquette.safetensors\x1b[31m row=clef listening on http://127.0.0.1:8080",
         ];
-        let got = render(&start, UTF8).unwrap();
+        let got = render(&start, UTF8, super::ART_W).unwrap();
         assert!(
             !got.contains('\x1b'),
             "an escape from a record value:\n{got}"
@@ -1647,14 +1751,14 @@ mod tests {
                 "bloomery-serve-glm: place=bp listening on http://127.0.0.1:8080".to_owned(),
             ]
         };
-        let got = render(&start("10"), UTF8).unwrap();
+        let got = render(&start("10"), UTF8, super::ART_W).unwrap();
         assert!(got.contains("▓ tier"), "{got}");
         assert!(got.contains(&"▓".repeat(11)), "{got}");
         assert!(
             got.contains(&format!("{}10 experts\n", row("tier"))),
             "{got}"
         );
-        let got = render(&start("lots"), UTF8).unwrap();
+        let got = render(&start("lots"), UTF8, super::ART_W).unwrap();
         assert!(!got.contains(&row("experts")), "{got}");
         assert!(!got.contains(&row("tier")), "{got}");
         assert!(got.contains("load: a value is no number"), "{got}");
@@ -1785,7 +1889,7 @@ mod tests {
                 None
             };
             assert_eq!(facts.split.map(|s| s.tier), split, "{start:?}");
-            let got = render(&start, UTF8).unwrap();
+            let got = render(&start, UTF8, super::ART_W).unwrap();
             assert_eq!(got.contains(&row("tier")), detail.is_some(), "{got}");
             if let Some(detail) = detail {
                 assert!(got.contains(detail), "{got}");
@@ -1810,10 +1914,20 @@ mod tests {
         let start = "plan place=bp card=A6000 card_experts=10 host_experts=10\n\
                      load resident_bytes=1 place=bp tier_experts=2 in 1.0 s\n\
                      bloomery-serve-glm: place=bp listening on http://127.0.0.1:8080";
-        let got = render(&mutated(start, "load ", "place=bp", "place=a"), UTF8).unwrap();
+        let got = render(
+            &mutated(start, "load ", "place=bp", "place=a"),
+            UTF8,
+            super::ART_W,
+        )
+        .unwrap();
         assert!(!got.contains(&row("tier")), "{got}");
         assert!(!got.contains("▓ tier"), "{got}");
-        let got = render(&mutated(start, "plan ", "place=bp", "place=a"), UTF8).unwrap();
+        let got = render(
+            &mutated(start, "plan ", "place=bp", "place=a"),
+            UTF8,
+            super::ART_W,
+        )
+        .unwrap();
         assert!(
             got.contains(&format!("{}2 experts\n", row("tier"))),
             "{got}"
@@ -1821,7 +1935,7 @@ mod tests {
         assert!(!got.contains(&row("experts")), "{got}");
         let mut start = lines(start);
         start.push("load resident_bytes=1 place=bp in 2.0 s");
-        let got = render(&start, UTF8).unwrap();
+        let got = render(&start, UTF8, super::ART_W).unwrap();
         assert!(!got.contains(&row("tier")), "{got}");
         assert!(!got.contains("▓ tier"), "{got}");
     }
@@ -1834,7 +1948,51 @@ mod tests {
             .into_iter()
             .filter(|l| !l.contains(" listening on http://"))
             .collect();
-        assert_eq!(render(&start, TRUE), None);
+        assert_eq!(render(&start, TRUE, super::ART_W), None);
+    }
+
+    #[test]
+    fn narrow_screens_keep_every_record_value() {
+        let start = mutated(START, "plan ", "card=A6000", "card=삽살개카드");
+        let mut start = mutated(
+            &start.join("\n"),
+            "bloomery-serve-ds41:",
+            "place=a ",
+            "place=a model=삽살이의아주긴모델이름-Q4_K_M.gguf head=e\u{301}tiquette.safetensors ",
+        );
+        let listening = start.last_mut().unwrap();
+        *listening = listening.replace(
+            "127.0.0.1:8080",
+            &format!("{}example.org:8080", "inference.".repeat(16)),
+        );
+        let compact =
+            |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        let facts = super::facts(
+            &start,
+            super::Marks {
+                dot: "·",
+                times: "×",
+            },
+        )
+        .unwrap();
+        for columns in [2, 9, 12, 20, 40, 80, 97] {
+            for style in [UTF8, CUBE, TRUE] {
+                let got = strip_escapes(&render(&start, style, columns).unwrap());
+                for line in got.lines() {
+                    assert!(width(line) <= columns, "{columns}: {line:?}");
+                }
+                let all = compact(&got);
+                for value in [&facts.seat, &facts.addr]
+                    .into_iter()
+                    .chain(facts.rows.iter().map(|(_, v)| v))
+                {
+                    assert!(
+                        all.contains(&compact(value)),
+                        "{columns}: missing {value:?}\n{got}"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1971,6 +2129,13 @@ mod tests {
                         "Hello!",
                     ] {
                         assert!(plain.contains(fact), "missing {fact}:\n{plain}");
+                    }
+                    if resized < 98 {
+                        assert!(
+                            plain.lines().any(|l| l.starts_with("  placement")),
+                            "{plain}"
+                        );
+                        assert!(plain.lines().any(|l| l.starts_with("  serving")), "{plain}");
                     }
                     if resized >= 98 && fixture == "v41" && color == "1" {
                         assert_eq!(plain, read_golden("screen-utf8.txt"));

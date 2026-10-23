@@ -726,7 +726,8 @@ sampler 4 4 1
 # handling (api.rs, libc already the workspace's) — the handlers' pipe pair, the reader thread's read,
 # the zeroed sigaction and its registration, the handler's stderr write with _exit on a second
 # interrupt and its one-byte write on the first, each with its SAFETY line.
-serve 6 0 0
+# PIN(2026-10-23): serve 6 -> 11 blocks, new code, not old code relaxed: the terminal width ioctl and the PTY viewport test, each with its SAFETY invariant.
+serve 11 0 0
 threads 3 0 1
 tokenizer 0 0 0
 # PIN(2026-10-14): verbs 0 -> 57 blocks, 22 fns, 2 impls, new crate, moved from gpu-gates/src/bin/shared/verbs.rs (45
