@@ -1792,6 +1792,14 @@ SH
   rc_ok 'chain: a lane item green on one key ends green' ch-lskip 3
   if [ "${res#* }" = 1 ]; then pass 'chain: … and its skip is recorded once'
   else fail 'chain: … and its skip is recorded once' "${res#* } skip lines (rc ${res% *}, 124 is the bound)"; fi
+  rc=0
+  res=$(
+    eval "$(declare -f stop_lanes | sed '1s/stop_lanes/lskip_stop_lanes/')"
+    stop_lanes() { lskip_stop_lanes "$@" || return $?; return 70; }
+    lskip_case ch-lskip-cleanup "$t/tools/gate-batch.sh"
+  ) || rc=$?
+  if [ "$rc" = 70 ] && [ -z "$res" ]; then pass 'chain: a failed lane cleanup returns its error without a result'
+  else fail 'chain: a failed lane cleanup returns its error without a result' "rc $rc, output [$res]"; fi
   mutant_of ch-lskip 's|^          claim_item "\$i" "\$lane" \|\| continue # the other lane skipped it first.*$|          true # MUTANT ch-lskip|' '# MUTANT ch-lskip$'
   res=$(lskip_case ch-lskipm "$t/tools/gate-batch-ch-lskip.sh")
   if [ "${res% *}" = 124 ] || [ "${res#* }" -gt 1 ]; then pass 'chain mutant: without the claim a green lane item skips again and again'
@@ -1975,9 +1983,11 @@ HK
   rc_ok 'start hook: a hook that is not there leaves the batch green' hook-m 1
   want_count 'start hook: and is one stderr line with the shell'"'"'s 127' "$t/out-hook-m.log" '^gate-batch: start hook \(rc=127\): .' 1
   want 'start hook: the full log names the missing command' "$t/target/c-hook-m/start-hook.log" 'no-such-hook'
-  IFS= read -r hook_line < "$t/target/c-hook-m/start-hook.log"
+  mkdir -p "$t/hk/summary"
+  echo 127 > "$t/hk/summary/start-hook.rc"
+  printf '%0250d\nsecond line\n' 0 > "$t/hk/summary/start-hook.log"
   check 'start hook: the summary keeps at most 200 characters of its first line' 0 '^$' test \
-    "$(grep '^gate-batch: start hook (rc=127): ' "$t/out-hook-m.log")" "gate-batch: start hook (rc=127): ${hook_line:0:200}"
+    "$(OUT=$t/hk/summary start_hook_say 2>&1)" = "gate-batch: start hook (rc=127): $(printf '%0200d' 0)"
   rc=$(BLOOMERY_BATCH_START_HOOK='   ' steal_case hook-b "plain-any	B	a6000	5	$d" -- plain-any)
   printf '%s' "$rc" > "$t/rc-hook-b"
   rc_ok 'start hook: a value of blanks leaves the batch green' hook-b 1

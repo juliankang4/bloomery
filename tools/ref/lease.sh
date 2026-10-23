@@ -1246,7 +1246,7 @@ EOF
     # A write that fails: one named line, the take goes on (rc 0, no id, no waiter).
     # The slow-fork waiter's shared probe can still hold its lock.
     exec 8>"$t/tlock3"
-    flock -s 8 || exit 70
+    flock -s -n 8 || exit 70
     BLOOMERY_LEASE_TRACE=$t/no-such-dir/trace.log
     export BLOOMERY_LEASE_TRACE
     RC=0
