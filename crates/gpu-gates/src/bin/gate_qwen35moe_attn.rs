@@ -139,23 +139,27 @@
 //!     its own copy of the `_p4` segment pass (`seg_mma_ps`), which differs in
 //!     the count bound, the staging load and the pack's twelve heads in one
 //!     tile, so the clause holds the copy to the dense body's bits. Every
-//!     launch of 11 to 13 runs the fold as well
-//!     (`flash_gqa::enqueue_fold_256_p12_sel`: the segment pass's segments
-//!     and the merge's fold in one block a row and key head), each output bit
-//!     for bit the two launches'.
+//!     launch of 11 to 13 runs the listed prefill flash as well
+//!     (`flash_gqa_prefill::enqueue_256_p12_sel`: the dense prefill walk over
+//!     each row's list, one block a row and key head, the ubatch walk's
+//!     entry), here bit for bit the dense pack-of-four prefill flash
+//!     (`enqueue_256_p4`) at the same counts: the same tiles, scores, softmax
+//!     and value products, its work split over the block's warps.
 //! 12. Past 2,051: each row within the dense clause's band of the exact
-//!     attention over its listed keys, NaN in every cache row no list names
-//!     changing no bit, a rerun, each verify row and each of twenty rows its
-//!     one-row launch; the
+//!     attention over its listed keys (the listed prefill flash within the
+//!     prefill band, `prefill_bound` over the list's tiles), NaN in every
+//!     cache row no list names changing no bit, a rerun, each verify row and
+//!     each of twenty rows its one-row launch, for both entries; the
 //!     captured chain (pool, score, top-k, segment pass, merge: five nodes)
 //!     the eager bits, the segment pass one block of 384 threads a (row, key
 //!     head, segment); the ubatch walk's chain on the twenty rows (pool,
-//!     score, top-k, fold: four nodes) the eager bits, the fold one block of
-//!     384 threads a (row, key head).
+//!     score, top-k, listed prefill: four nodes) the eager bits, the listed
+//!     prefill one block of 256 threads a (row, key head).
 //! 13. A list entry at the cache's height raising `pool_select`, a length of
 //!     zero or past the width raising `key_count`: that row NaN, the other bit
-//!     for bit clean, the fold raising the same word; a group that is not
-//!     twelve heads a key head refused by name by both entries.
+//!     for bit its clean output, in both entries, each raising the same word;
+//!     a group that is not twelve heads a key head refused by name by both
+//!     entries.
 //! 14. The selector's three entries and the two selected flashes compile with
 //!     no local depot.
 //! 15. Deep: the selector and the selected flash at a cache of 262,144 rows
@@ -168,8 +172,9 @@
 //!     `runtime::qsa`'s rule over the full span of 65,536 pools, every list
 //!     holding rows past 65,535 and a tail ending at its position; the selected
 //!     flash, both passes, within the band of the exact attention over the
-//!     listed rows, with NaN in every unlisted cache row changing no bit, the
-//!     fold its bits.
+//!     listed rows, with NaN in every unlisted cache row changing no bit, and
+//!     the listed prefill flash within its band, the same NaN rows changing
+//!     none of its bits.
 //!     The counts reach the kernels as their `u32` arguments, the list
 //!     entries as `u32` cache rows: a count or a row cut to 16 bits, or the
 //!     context clamped at 65,535, reads other rows or refuses the count.
@@ -208,12 +213,13 @@
 //!
 //! `--bench-kernels` runs no clause: it times a 4,096-position prompt's
 //! selecting rows (counts up to 4,096 over a cache of [`BENCH_CTX`] rows) the
-//! two ways a walk runs them, a selection and a segment pass with its merge a
-//! run of eight rows, or a selection and a fold a run of every row
-//! (`bench sel rows=`, wall milliseconds of the enqueued chain to its
-//! synchronize, the least and the median of seven rounds), over the first 8,
-//! 64, 256 and every selecting row, and prints whether the two outputs have
-//! the same bits. Nothing there asserts on a result.
+//! two ways a walk can run them, a selection and a segment pass with its merge
+//! a run of eight rows (a pass's), or a selection and the listed prefill flash
+//! a run of every row (the ubatch walk's) (`bench sel rows=`, wall
+//! milliseconds of the enqueued chain to its synchronize, the least and the
+//! median of seven rounds), over the first 8, 64, 256 and every selecting row,
+//! and prints the largest difference of the two outputs. Nothing there
+//! asserts on a result.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -224,7 +230,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
-        FlashGqaKernels, GROUP, GqaArgs, GqaFoldArgs, GqaQ8Args, GqaSelArgs, HEAD_256 as HEAD,
+        FlashGqaKernels, GROUP, GqaArgs, GqaListArgs, GqaQ8Args, GqaSelArgs, HEAD_256 as HEAD,
         KEY_TILE, PACK_2, PACK_4, PACK_12, SEG_KEYS, SEGMENTS, listed_partials_ms_len,
         listed_partials_v_len_256, listed_segments, partials_ms_len, partials_v_len_256, seg_span,
     };
@@ -3319,12 +3325,12 @@ mod gate {
     }
 
     /// A selected-flash entry: the segment pass and its merge
-    /// (`enqueue_pass_256_p12_sel`), or the one-launch fold
-    /// (`enqueue_fold_256_p12_sel`).
+    /// (`enqueue_pass_256_p12_sel`), or the prefill flash over each row's
+    /// list (`flash_gqa_prefill::enqueue_256_p12_sel`).
     #[derive(Clone, Copy)]
     enum SelFlash {
         Pass,
-        Fold,
+        Listed,
     }
 
     /// One selected-flash launch of `m` rows through `entry` over the lists
@@ -3334,7 +3340,7 @@ mod gate {
         reason = "the kernels, the stream and sink, the entry, the rows, the lists, the cache and its height"
     )]
     fn run_sel(
-        k: &FlashGqaKernels,
+        (k, kp): (&FlashGqaKernels, &FlashGqaPrefill),
         stream: &CudaStream,
         fault: FaultSink,
         entry: SelFlash,
@@ -3346,7 +3352,7 @@ mod gate {
     ) -> Result<Vec<f32>, GateError> {
         let qd = DeviceBuffer::from_host(stream, q)?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * Q38.width())?;
-        let attn = GqaFoldArgs {
+        let attn = GqaListArgs {
             q: &qd,
             kc,
             vc,
@@ -3380,7 +3386,7 @@ mod gate {
                     N_HEAD_Q38,
                 )?;
             }
-            SelFlash::Fold => k.enqueue_fold_256_p12_sel(stream, attn, N_HEAD_Q38)?,
+            SelFlash::Listed => kp.enqueue_256_p12_sel(stream, attn, N_HEAD_Q38)?,
         }
         stream.synchronize()?;
         Ok(y.to_host_vec(stream)?)
@@ -3405,7 +3411,12 @@ mod gate {
     }
 
     /// The selected flash's clauses (module doc, 11–13).
-    fn sel_flash_check(gpu: &Gpu, k: &FlashGqaKernels, qk: &QsaKernels) -> Result<bool, GateError> {
+    fn sel_flash_check(
+        gpu: &Gpu,
+        ks: (&FlashGqaKernels, &FlashGqaPrefill),
+        qk: &QsaKernels,
+    ) -> Result<bool, GateError> {
+        let (k, kp) = ks;
         let stream = gpu.stream();
         let unl = gpu.unlabelled_sink();
         let idx = idx_inputs(stream, SEL_CTX, 601, false)?;
@@ -3416,7 +3427,8 @@ mod gate {
         let mut ok = true;
 
         // 11. At counts up to 2,051 the list is every token; the selected
-        // flash's own body must give the dense pack-of-four body's bits.
+        // pass must give the dense pack-of-four pass's bits, and the listed
+        // prefill flash the dense pack-of-four prefill flash's.
         let dense_rows: Vec<usize> = (WIDTH - 7..=WIDTH).collect();
         for (name, counts) in [("one-row", SEL_DENSE.to_vec()), ("rows", dense_rows)] {
             let one_row = name == "one-row";
@@ -3446,7 +3458,7 @@ mod gate {
                     .map(|v| v * SEED_Q_SCALE)
                     .collect();
                 let ys = run_sel(
-                    k,
+                    ks,
                     stream,
                     unl,
                     SelFlash::Pass,
@@ -3456,11 +3468,11 @@ mod gate {
                     (&c.kc, &c.vc),
                     SEL_CTX,
                 )?;
-                let yf = run_sel(
-                    k,
+                let yl = run_sel(
+                    ks,
                     stream,
                     unl,
-                    SelFlash::Fold,
+                    SelFlash::Listed,
                     &q,
                     (&scratch.list, &scratch.n_sel),
                     m,
@@ -3468,13 +3480,14 @@ mod gate {
                     SEL_CTX,
                 )?;
                 let yd = run_dec(k, stream, unl, Q38, &q, &cu, (&c.kc, &c.vc), SEL_CTX, true)?;
-                let (same, fold) = (bits_equal(&ys, &yd), bits_equal(&yf, &ys));
+                let yp = run_pref(kp, gpu, Q38, &q, &cu, (&c.kc, &c.vc), SEL_CTX)?;
+                let (same, listed) = (bits_equal(&ys, &yd), bits_equal(&yl, &yp));
                 println!(
                     "qsa flash dense edge pass=mma counts={cs:?}: selected = dense p4 bit for \
-                     bit {same} fold = selected bit for bit {fold} {}",
-                    verdict(same && fold)
+                     bit {same} listed = dense p4 prefill bit for bit {listed} {}",
+                    verdict(same && listed)
                 );
-                ok &= same && fold;
+                ok &= same && listed;
             }
         }
 
@@ -3530,7 +3543,7 @@ mod gate {
                 let exacts = exact_listed(&q, &lists, &c.host);
                 let lsel = (&scratch.list, &scratch.n_sel);
                 let y = run_sel(
-                    k,
+                    ks,
                     stream,
                     unl,
                     SelFlash::Pass,
@@ -3541,7 +3554,7 @@ mod gate {
                     SEL_CTX,
                 )?;
                 let y2 = run_sel(
-                    k,
+                    ks,
                     stream,
                     unl,
                     SelFlash::Pass,
@@ -3552,7 +3565,7 @@ mod gate {
                     SEL_CTX,
                 )?;
                 let yn = run_sel(
-                    k,
+                    ks,
                     stream,
                     unl,
                     SelFlash::Pass,
@@ -3562,32 +3575,25 @@ mod gate {
                     (&kn, &vn),
                     SEL_CTX,
                 )?;
-                let yf = run_sel(
-                    k,
-                    stream,
-                    unl,
-                    SelFlash::Fold,
-                    &q,
-                    lsel,
-                    m,
-                    (&c.kc, &c.vc),
-                    SEL_CTX,
-                )?;
-                let yfn = run_sel(
-                    k,
-                    stream,
-                    unl,
-                    SelFlash::Fold,
-                    &q,
-                    lsel,
-                    m,
-                    (&kn, &vn),
-                    SEL_CTX,
-                )?;
+                let mut yl = Vec::new();
+                for kv in [(&c.kc, &c.vc), (&c.kc, &c.vc), (&kn, &vn)] {
+                    yl.push(run_sel(
+                        ks,
+                        stream,
+                        unl,
+                        SelFlash::Listed,
+                        &q,
+                        lsel,
+                        m,
+                        kv,
+                        SEL_CTX,
+                    )?);
+                }
                 let (band, worst) = judge(&exacts, &y, Pass::Mma);
                 let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &yn));
-                let fold = bits_equal(&yf, &y) && bits_equal(&yfn, &y);
-                let mut alone = true;
+                let (l_band, l_worst) = judge(&exacts, &yl[0], Pass::Prefill);
+                let l_same = bits_equal(&yl[0], &yl[1]) && bits_equal(&yl[0], &yl[2]);
+                let (mut alone, mut l_alone) = (true, true);
                 if m > 1 {
                     let qw = IDX_HEADS * IDX_DIM;
                     for t in 0..m {
@@ -3602,7 +3608,7 @@ mod gate {
                             &mut scratch,
                         )?;
                         let yo = run_sel(
-                            k,
+                            ks,
                             stream,
                             unl,
                             SelFlash::Pass,
@@ -3613,20 +3619,34 @@ mod gate {
                             SEL_CTX,
                         )?;
                         alone &= bits_equal(&yo, &y[t * w..(t + 1) * w]);
+                        let yo = run_sel(
+                            ks,
+                            stream,
+                            unl,
+                            SelFlash::Listed,
+                            &q[t * w..(t + 1) * w],
+                            (&scratch.list, &scratch.n_sel),
+                            1,
+                            (&c.kc, &c.vc),
+                            SEL_CTX,
+                        )?;
+                        l_alone &= bits_equal(&yo, &yl[0][t * w..(t + 1) * w]);
                     }
                     // The m-row selection again, for the clause's later checks.
                     run_select(qk, stream, unl, &idx, &pooled, &qi, &cu, &mut scratch)?;
                 }
-                let pass_ok = band && rerun && nan_same && alone && fold;
+                let pass_ok = band && rerun && nan_same && alone;
+                let l_ok = l_band && l_same && l_alone;
                 println!(
                     "qsa flash {name} pass=mma counts={cs:?} lengths={:?}: measured/bound \
                      {worst:.3e} band={band} rerun={rerun} nan_in_unlisted_rows_same={nan_same} \
-                     rows = one-row launches={alone} fold = selected bit for bit (and with the \
-                     NaN rows)={fold} {}",
+                     rows = one-row launches={alone}; listed prefill measured/bound \
+                     {l_worst:.3e} band={l_band} rerun and nan_in_unlisted_rows_same={l_same} \
+                     rows = one-row launches={l_alone} {}",
                     s.n_sel,
-                    verdict(pass_ok)
+                    verdict(pass_ok && l_ok)
                 );
-                ok &= pass_ok;
+                ok &= pass_ok && l_ok;
             }
         }
 
@@ -3641,7 +3661,7 @@ mod gate {
         )?;
         for (entry, counts, seed) in [
             (SelFlash::Pass, (SEL_ROWS0..=SEL_N).collect::<Vec<_>>(), 631),
-            (SelFlash::Fold, wide_counts(), 633),
+            (SelFlash::Listed, wide_counts(), 633),
         ] {
             let cs: Vec<u32> = counts
                 .into_iter()
@@ -3690,7 +3710,7 @@ mod gate {
                         scratch: &mut scratch,
                     },
                 )?;
-                let attn = GqaFoldArgs {
+                let attn = GqaListArgs {
                     q: &qa,
                     kc: &c.kc,
                     vc: &c.vc,
@@ -3714,7 +3734,7 @@ mod gate {
                         },
                         N_HEAD_Q38,
                     ),
-                    SelFlash::Fold => k.enqueue_fold_256_p12_sel(s, attn, N_HEAD_Q38),
+                    SelFlash::Listed => kp.enqueue_256_p12_sel(s, attn, N_HEAD_Q38),
                 }
             };
             chain(stream, &mut ya)?;
@@ -3724,12 +3744,17 @@ mod gate {
             graph.launch(stream)?;
             stream.synchronize()?;
             let same = bits_equal(&yg.to_host_vec(stream)?, &eager);
-            let (kernel, nodes, segments) = match entry {
-                SelFlash::Pass => ("gqa_flash_seg_mma_256_p12_sel", 5, listed_segments(WIDTH)),
-                SelFlash::Fold => ("gqa_flash_fold_mma_256_p12_sel", 4, 1),
+            let (kernel, nodes, segments, threads) = match entry {
+                SelFlash::Pass => (
+                    "gqa_flash_seg_mma_256_p12_sel",
+                    5,
+                    listed_segments(WIDTH),
+                    PACK_12 * 32,
+                ),
+                SelFlash::Listed => ("gqa_prefill_flash_256_p12_sel", 4, 1, 256),
             };
             let grid = [u32::try_from(m * N_KV * segments)?, 1, 1];
-            let block = [u32::try_from(PACK_12 * 32)?, 1, 1];
+            let block = [u32::try_from(threads)?, 1, 1];
             let shape = graph
                 .nodes()?
                 .into_iter()
@@ -3765,10 +3790,21 @@ mod gate {
         let clean_l = DeviceBuffer::from_host(stream, &s.list)?;
         let clean_n = DeviceBuffer::from_host(stream, &s.n_sel)?;
         let clean = run_sel(
-            k,
+            ks,
             stream,
             unl,
             SelFlash::Pass,
+            &q,
+            (&clean_l, &clean_n),
+            2,
+            (&c.kc, &c.vc),
+            SEL_CTX,
+        )?;
+        let clean_ls = run_sel(
+            ks,
+            stream,
+            unl,
+            SelFlash::Listed,
             &q,
             (&clean_l, &clean_n),
             2,
@@ -3805,7 +3841,7 @@ mod gate {
             let nd = DeviceBuffer::from_host(stream, &n)?;
             let before = gpu.fault()?;
             let y = run_sel(
-                k,
+                ks,
                 stream,
                 gpu.layer_sink(LAYER)?,
                 SelFlash::Pass,
@@ -3816,18 +3852,18 @@ mod gate {
                 SEL_CTX,
             )?;
             let raised = gpu.take_fault()?;
-            let yf = run_sel(
-                k,
+            let yl = run_sel(
+                ks,
                 stream,
                 gpu.layer_sink(LAYER)?,
-                SelFlash::Fold,
+                SelFlash::Listed,
                 &q,
                 (&ld, &nd),
                 2,
                 (&c.kc, &c.vc),
                 SEL_CTX,
             )?;
-            let raised_fold = gpu.take_fault()?;
+            let raised_l = gpu.take_fault()?;
             let want = Some(Fault::at(u32::try_from(LAYER)?, site));
             let other = 1 - bad_row;
             let nan = y[bad_row * w..(bad_row + 1) * w].iter().all(|v| v.is_nan());
@@ -3835,13 +3871,20 @@ mod gate {
                 &y[other * w..(other + 1) * w],
                 &clean[other * w..(other + 1) * w],
             );
-            let fold = raised_fold == want && bits_equal(&yf, &y);
-            let f_ok = before.is_none() && raised == want && nan && others && fold;
+            let l_nan = yl[bad_row * w..(bad_row + 1) * w]
+                .iter()
+                .all(|v| v.is_nan());
+            let l_others = bits_equal(
+                &yl[other * w..(other + 1) * w],
+                &clean_ls[other * w..(other + 1) * w],
+            );
+            let listed = raised_l == want && l_nan && l_others;
+            let f_ok = before.is_none() && raised == want && nan && others && listed;
             println!(
                 "qsa flash fault pass=mma: {what} at row {bad_row}, layer {LAYER}: word \
                  {raised:?} (want {want:?}), that row NaN {nan}, the other row bit-identical \
-                 {others}; fold word {raised_fold:?}, both rows the selected bits {} {}",
-                bits_equal(&yf, &y),
+                 {others}; listed prefill word {raised_l:?}, that row NaN {l_nan}, the other \
+                 row bit-identical {l_others} {}",
                 verdict(f_ok)
             );
             ok &= f_ok;
@@ -3855,8 +3898,8 @@ mod gate {
             let mut pv = DeviceBuffer::<f32>::zeroed(stream, 1)?;
             let mut pms = DeviceBuffer::<f32>::zeroed(stream, 1)?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, 1)?;
-            for entry in [SelFlash::Pass, SelFlash::Fold] {
-                let attn = GqaFoldArgs {
+            for entry in [SelFlash::Pass, SelFlash::Listed] {
+                let attn = GqaListArgs {
                     q: &qd,
                     kc: &c.kc,
                     vc: &c.vc,
@@ -3884,10 +3927,10 @@ mod gate {
                             n_head,
                         ),
                     ),
-                    SelFlash::Fold => (
-                        "fold",
-                        "flash_gqa::enqueue_fold_256_p12_sel",
-                        k.enqueue_fold_256_p12_sel(stream, attn, n_head),
+                    SelFlash::Listed => (
+                        "listed prefill",
+                        "flash_gqa_prefill::enqueue_256_p12_sel",
+                        kp.enqueue_256_p12_sel(stream, attn, n_head),
                     ),
                 };
                 // The buffers are too short as well, so the group's own
@@ -3905,6 +3948,40 @@ mod gate {
                 ok &= named;
             }
         }
+        ok &= window_refusals(
+            gpu,
+            "flash_gqa_prefill::enqueue_256_p12_sel",
+            "qsa listed prefill",
+            WindowCase {
+                q: &q,
+                planes: (&c.kb, &c.vb),
+                counts: &s.n_sel,
+                y: &clean_ls,
+                heads: (N_HEAD_Q38, N_KV),
+                ctx: SEL_CTX,
+                scale: scale(),
+            },
+            |stream, args| {
+                kp.enqueue_256_p12_sel(
+                    stream,
+                    GqaListArgs {
+                        q: args.q,
+                        kc: args.kc,
+                        vc: args.vc,
+                        list: &clean_l,
+                        n_sel: args.n_keys,
+                        width: WIDTH,
+                        scale: args.scale,
+                        n_kv: args.n_kv,
+                        ctx: args.ctx,
+                        m: args.t,
+                        fault: args.fault,
+                        y: args.y,
+                    },
+                    args.n_head,
+                )
+            },
+        )?;
         Ok(ok)
     }
 
@@ -3919,7 +3996,12 @@ mod gate {
 
     /// The deep clause (module doc, 15): the selector and the selected flash
     /// at [`DEEP_CTX`] on synthetic keys, no model loaded.
-    fn deep_check(gpu: &Gpu, k: &FlashGqaKernels, qk: &QsaKernels) -> Result<bool, GateError> {
+    fn deep_check(
+        gpu: &Gpu,
+        ks: (&FlashGqaKernels, &FlashGqaPrefill),
+        qk: &QsaKernels,
+    ) -> Result<bool, GateError> {
+        let k = ks.0;
         let t0 = std::time::Instant::now();
         let stream = gpu.stream();
         let unl = gpu.unlabelled_sink();
@@ -4006,7 +4088,7 @@ mod gate {
             let exacts = exact_listed(&q, &rows, &host);
             let lsel = (&scratch.list, &scratch.n_sel);
             let y = run_sel(
-                k,
+                ks,
                 stream,
                 unl,
                 SelFlash::Pass,
@@ -4017,7 +4099,7 @@ mod gate {
                 DEEP_CTX,
             )?;
             let yn = run_sel(
-                k,
+                ks,
                 stream,
                 unl,
                 SelFlash::Pass,
@@ -4027,24 +4109,29 @@ mod gate {
                 (&kn, &vn),
                 DEEP_CTX,
             )?;
-            let yf = run_sel(
-                k,
-                stream,
-                unl,
-                SelFlash::Fold,
-                &q,
-                lsel,
-                m,
-                (&kc, &vc),
-                DEEP_CTX,
-            )?;
+            let mut yl = Vec::new();
+            for kv in [(&kc, &vc), (&kn, &vn)] {
+                yl.push(run_sel(
+                    ks,
+                    stream,
+                    unl,
+                    SelFlash::Listed,
+                    &q,
+                    lsel,
+                    m,
+                    kv,
+                    DEEP_CTX,
+                )?);
+            }
             let (band, worst) = judge(&exacts, &y, Pass::Mma);
-            let (nan_same, fold) = (bits_equal(&y, &yn), bits_equal(&yf, &y));
-            let pass_ok = band && nan_same && fold;
+            let (l_band, l_worst) = judge(&exacts, &yl[0], Pass::Prefill);
+            let nan_same = bits_equal(&y, &yn);
+            let l_nan_same = bits_equal(&yl[0], &yl[1]);
+            let pass_ok = band && nan_same && l_band && l_nan_same;
             println!(
                 "qsa deep flash {name} pass=mma counts={counts:?}: measured/bound \
-                 {worst:.3e} band={band} nan_in_unlisted_rows_same={nan_same} fold = selected \
-                 bit for bit {fold} {}",
+                 {worst:.3e} band={band} nan_in_unlisted_rows_same={nan_same}; listed prefill \
+                 measured/bound {l_worst:.3e} band={l_band} nan_in_unlisted_rows_same={l_nan_same} {}",
                 verdict(pass_ok)
             );
             ok &= pass_ok;
@@ -4171,7 +4258,12 @@ mod gate {
     }
 
     /// `--bench-kernels` (module doc).
-    fn bench_select(gpu: &Gpu, k: &FlashGqaKernels, qk: &QsaKernels) -> Result<(), GateError> {
+    fn bench_select(
+        gpu: &Gpu,
+        k: &FlashGqaKernels,
+        kp: &FlashGqaPrefill,
+        qk: &QsaKernels,
+    ) -> Result<(), GateError> {
         const N: usize = 4096;
         const ROUNDS: usize = 7;
         let stream = gpu.stream();
@@ -4199,7 +4291,7 @@ mod gate {
         )?;
         for rows in [8, 64, 256, counts.len()] {
             let mut outs = Vec::new();
-            for (arm, run, fold) in [("pass8", MAX_ROWS, false), ("fold", rows, true)] {
+            for (arm, run, listed) in [("pass8", MAX_ROWS, false), ("listed", rows, true)] {
                 let mut runs = Vec::new();
                 for t0 in (0..rows).step_by(run) {
                     let m = run.min(rows - t0);
@@ -4232,7 +4324,7 @@ mod gate {
                                 scratch: &mut scratch,
                             },
                         )?;
-                        let attn = GqaFoldArgs {
+                        let attn = GqaListArgs {
                             q: &r.q,
                             kc: &c.kc,
                             vc: &c.vc,
@@ -4246,8 +4338,8 @@ mod gate {
                             fault: unl,
                             y: &mut r.y,
                         };
-                        if fold {
-                            k.enqueue_fold_256_p12_sel(stream, attn, N_HEAD_Q38)?;
+                        if listed {
+                            kp.enqueue_256_p12_sel(stream, attn, N_HEAD_Q38)?;
                         } else {
                             k.enqueue_pass_256_p12_sel(
                                 stream,
@@ -4278,22 +4370,31 @@ mod gate {
                 }
                 outs.push(y);
             }
+            let big = outs[0].iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let diff = outs[0]
+                .iter()
+                .zip(&outs[1])
+                .fold(0.0f32, |a, (x, y)| a.max((x - y).abs()));
             println!(
-                "bench sel rows={rows}: the two arms' outputs the same bits {}",
-                bits_equal(&outs[0], &outs[1])
+                "bench sel rows={rows}: listed against pass8 max abs difference {diff:.3e} of \
+                 max {big:.3e}, every value finite {}",
+                outs[1].iter().all(|v| v.is_finite())
             );
         }
         Ok(())
     }
 
     /// The new entries compile with no local depot (module doc, 14).
+    // PIN(2026-10-24): gqa_flash_fold_mma_256_p12_sel left the list with its
+    // kernel; the ubatch walk's selected rows run gqa_prefill_flash_256_p12_sel,
+    // which every clause that ran the fold now runs.
     fn sel_shapes() -> Result<bool, GateError> {
         no_local_depot(&[
             "qsa_pool",
             "qsa_score",
             "qsa_topk",
             "gqa_flash_seg_mma_256_p12_sel",
-            "gqa_flash_fold_mma_256_p12_sel",
+            "gqa_prefill_flash_256_p12_sel",
         ])
     }
 
@@ -4306,7 +4407,7 @@ mod gate {
         let gq = GatedQuantKernels::load(ctx)?;
         let qk = QsaKernels::load(ctx)?;
         if std::env::args().any(|a| a == "--bench-kernels") {
-            return bench_select(&gpu, &k, &qk);
+            return bench_select(&gpu, &k, &kp, &qk);
         }
         println!(
             "gate_qwen35moe_attn: device {} — {N_HEAD}/{N_KV} heads of {HEAD}, rope over {ROT} at \
@@ -4367,11 +4468,11 @@ mod gate {
         println!("qsa select {}", verdict(s));
         ok &= s;
         tier::sc("11-13 qsa selected flash: against the dense flash and the exact attention")?;
-        let s = sel_flash_check(&gpu, &k, &qk)?;
+        let s = sel_flash_check(&gpu, (&k, &kp), &qk)?;
         println!("qsa selected flash {}", verdict(s));
         ok &= s;
         tier::sc("15 qsa deep: the selector and the flashes at a cache of 262,144 rows")?;
-        let s = deep_check(&gpu, &k, &qk)?;
+        let s = deep_check(&gpu, (&k, &kp), &qk)?;
         println!("qsa deep {}", verdict(s));
         ok &= s;
         tier::sc("4 prefill flash 256: against the exact attention")?;

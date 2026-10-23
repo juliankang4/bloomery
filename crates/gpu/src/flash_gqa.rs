@@ -2242,7 +2242,7 @@ impl KeyWalk for Listed<'_> {
 
 /// f16 NaN in each of a u64's four halves: the stage of a listed row past
 /// the cache.
-const SEL_NAN4: u64 = 0x7e00_7e00_7e00_7e00;
+pub(crate) const SEL_NAN4: u64 = 0x7e00_7e00_7e00_7e00;
 
 /// A `_p16_blocks` row's keys: key `j` of row `t` and key head `kh` is
 /// position `j % BLOCK` of block `ids[(t·n_kv + kh)·blocks + j / BLOCK]`, so
@@ -2300,7 +2300,7 @@ impl<const BLOCK: usize> KeyWalk for BlockListed<'_, BLOCK> {
     }
 }
 
-/// The query tile of the listed passes ([`seg_mma_ps`], [`fold_mma_ps`]):
+/// The query tile of the listed passes ([`seg_mma_ps`]):
 /// warp `w` rounds the `HEAD/2` value pairs of the query head at `qb` (row
 /// `t`'s head `head0 + w`), `HEAD/64` per lane, into row `w` of the tile, and
 /// warps `w < PAD` write the zero row `PACK + w`. Each pair is one 8-byte
@@ -2647,134 +2647,6 @@ unsafe fn seg_mma_ps<
         if lane == 0 {
             *part_ms.get_unchecked_mut(2 * idx) = mx;
             *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
-        }
-    }
-}
-
-/// [`seg_mma_ps`] and the merge ([`merge_body`]) in one block a (row, key
-/// head): block `b = kh·m + t` ([`seg_block`] at one segment) walks row `t`'s
-/// keys for key head `kh`'s pack of `PACK` heads through the cut [`seg_span`]
-/// gives at `segs` segments, segment by segment ascending, each segment the
-/// segment pass's block from a fresh `(max, Σ exp, Σ exp·V)`; it joins each
-/// segment's triple to the running one through `online_fold` as the merge
-/// does, a neutral one (`Σ exp = 0`) skipped, then writes `acc · (1/s)`. Every
-/// head's output is the segment pass's and the merge's bit for bit, with no
-/// partials. A refused count raises [`FaultSite::KeyCount`] and writes NaN,
-/// as the merge does.
-///
-/// SAFETY: [`seg_mma_ps`]'s at one pack a key head, with `y` holding `m ·
-/// n_kv · PACK · HEAD` f32 in place of the partials.
-#[inline(always)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
-)]
-#[allow(
-    clippy::needless_range_loop,
-    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
-)]
-unsafe fn fold_mma_ps<
-    W: KeyWalk,
-    const HEAD: usize,
-    const QW: usize,
-    const PACK: usize,
-    const PAD: usize,
->(
-    walk: W,
-    q: &[f32],
-    kc: &[u16],
-    vc: &[u16],
-    n_keys_buf: &[u32],
-    scale: f32,
-    n_kv: u32,
-    ctx: u32,
-    segs: u32,
-    seg_keys: u32,
-    m: u32,
-    fault: FaultSink,
-    mut y: DisjointSlice<f32>,
-    qt: *mut u32,
-    kt: *mut u32,
-    vs: *mut u64,
-    ws: *mut f32,
-) {
-    const { assert!(HEAD == QW * SLICE) };
-    const { assert!(mma_row_words(HEAD) * 4 % 128 == 16 && PACK >= 4) };
-    const { assert!(PACK + PAD == MMA_ROWS && PAD <= PACK) };
-    const { assert!(KEY_TILE == 4 * MMA_NTILE && SLICE.is_multiple_of(2 * MMA_K)) };
-    let b = thread::blockIdx_x() as usize;
-    let Some((t, _, kh, head0, n_head)) = seg_block::<PACK>(b, m as usize, n_kv as usize, 1, 1)
-    else {
-        return; // block-uniform
-    };
-    let tid = thread::threadIdx_x() as usize;
-    let w = tid / 32;
-    let lane = warp::lane_id() as usize;
-    // Lane `lane` owns dims `4·lane + 128·i .. +3` of head `head0 + w`.
-    let out = (t * n_head + head0 + w) * HEAD + 4 * lane;
-    let ctx = ctx as usize;
-    // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
-    let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, walk.count_cap());
-    if limit == 0 {
-        if tid == 0 {
-            fault.raise(FaultSite::KeyCount);
-        }
-        for i in 0..QW {
-            cuda_device::thread::__unroll_config::<0>();
-            for e in 0..4 {
-                cuda_device::thread::__unroll_config::<0>();
-                // SAFETY: out + 128·i + e < (t·n_head + head0 + w + 1)·HEAD <=
-                // m·n_head·HEAD <= y.len(); this lane's own dims.
-                unsafe { *y.get_unchecked_mut(out + SLICE * i + e) = f32::NAN };
-            }
-        }
-        return; // block-uniform: the row is the block's
-    }
-    let span = seg_span(limit, segs as usize, seg_keys as usize);
-    // seg_span keeps ⌈limit / span⌉ <= segs (its const check).
-    let live = limit.div_ceil(span);
-
-    listed_query_tile!(q, (t * n_head + head0 + w) * HEAD, qt, w, lane);
-    let mut fm = f32::NEG_INFINITY;
-    let mut fs = 0.0f32;
-    let mut fa = [[0.0f32; 4]; QW];
-    let mut seg = 0usize;
-    while seg < live {
-        let lo = seg * span;
-        listed_seg_tiles!(
-            walk,
-            t,
-            kh,
-            lo,
-            (lo + span).min(limit),
-            (kc, vc, ctx),
-            scale,
-            (qt, kt, vs, ws),
-            (tid, w, lane),
-            (mx, s_sum, acc)
-        );
-        if s_sum != 0.0 {
-            let (mut nm, mut ns) = (fm, fs);
-            for i in 0..QW {
-                cuda_device::thread::__unroll_config::<0>();
-                for e in 0..4 {
-                    cuda_device::thread::__unroll_config::<0>();
-                    (nm, ns, fa[i][e]) = online_fold(fm, fs, fa[i][e], mx, s_sum, acc[i][e]);
-                }
-            }
-            fm = nm;
-            fs = ns;
-        }
-        seg += 1;
-    }
-    let inv = 1.0 / fs;
-    for i in 0..QW {
-        cuda_device::thread::__unroll_config::<0>();
-        for e in 0..4 {
-            cuda_device::thread::__unroll_config::<0>();
-            // SAFETY: out + SLICE * i + e < m * n_head * HEAD <= y.len();
-            // this lane owns these dimensions.
-            unsafe { *y.get_unchecked_mut(out + SLICE * i + e) = fa[i][e] * inv };
         }
     }
 }
@@ -5071,85 +4943,6 @@ mod flash_gqa_kernels {
         };
     }
 
-    /// [`gqa_flash_seg_mma_256_p12_sel`] and [`gqa_flash_merge_256`] in one
-    /// launch (`fold_mma_ps` at [`HEAD_256`] over [`Listed`]): one block of
-    /// twelve warps a (row, key head) walks row `t`'s list for key head `kh`'s
-    /// twelve query heads segment by segment, the cut the segment pass takes
-    /// at `segs` segments, and writes their outputs: the two launches' bits,
-    /// with no partials.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(384)]
-    #[launch_contract(
-        domain = 1,
-        block = (384, 1, 1),
-        requires = (
-            n_sel.len() >= m,
-            list.len() >= m * width,
-            segs >= 1,
-            q.len() >= m * n_kv * 12 * 256,
-            kc.len() >= n_kv * ctx * 256,
-            vc.len() >= n_kv * ctx * 256,
-            y.len() >= m * n_kv * 12 * 256
-        )
-    )]
-    pub fn gqa_flash_fold_mma_256_p12_sel(
-        q: &[f32],
-        kc: &[u16],
-        vc: &[u16],
-        list: &[u32],
-        n_sel: &[u32],
-        scale: f32,
-        n_kv: u32,
-        ctx: u32,
-        width: u32,
-        segs: u32,
-        seg_keys: u32,
-        m: u32,
-        fault: FaultSink,
-        y: DisjointSlice<f32>,
-    ) {
-        static mut QT: SharedArray<u32, { MMA_ROWS * MMA_ROW_W_256 }> = SharedArray::UNINIT;
-        static mut KT: SharedArray<u32, { KEY_TILE * MMA_ROW_W_256 }> = SharedArray::UNINIT;
-        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS_256 }> = SharedArray::UNINIT;
-        static mut WS: SharedArray<f32, { PACK_12 * KEY_TILE }> = SharedArray::UNINIT;
-
-        let walk = Listed {
-            list,
-            width: width as usize,
-            fault,
-        };
-        // SAFETY: each `static mut` above is this block's own shared
-        // allocation, sized for HEAD_256 and PACK_12; the raw form reaches it
-        // without a reference. The launch contract is `fold_mma_ps`'s at
-        // HEAD_256 and one pack of PACK_12 heads per key head, with the
-        // list's.
-        unsafe {
-            fold_mma_ps::<_, HEAD_256, QW_256, PACK_12, PAD_12>(
-                walk,
-                q,
-                kc,
-                vc,
-                n_sel,
-                scale,
-                n_kv,
-                ctx,
-                segs,
-                seg_keys,
-                m,
-                fault,
-                y,
-                SharedArray::as_raw_mut_ptr(&raw mut QT),
-                SharedArray::as_raw_mut_ptr(&raw mut KT),
-                SharedArray::as_raw_mut_ptr(&raw mut VS),
-                SharedArray::as_raw_mut_ptr(&raw mut WS),
-            )
-        };
-    }
-
     /// [`gqa_flash_seg_mma_256_p12_sel`]'s body at [`HEAD`] with block lists
     /// (`seg_mma_ps` at [`PACK_16`] over [`BlockListed`]), one block of sixteen
     /// warps a (row, key head, segment): the key head's sixteen query heads fill
@@ -6017,18 +5810,19 @@ pub struct GqaRingArgs<'a> {
 }
 
 /// [`FlashGqaKernels::enqueue_pass_256_p12_sel`]'s arguments: the shared
-/// [`GqaFoldArgs`] and the segment partials.
+/// [`GqaListArgs`] and the segment partials.
 pub struct GqaSelArgs<'a> {
-    pub attn: GqaFoldArgs<'a>,
+    pub attn: GqaListArgs<'a>,
     pub part_v: &'a mut DeviceBuffer<f32>,
     pub part_ms: &'a mut DeviceBuffer<f32>,
 }
 
-/// [`FlashGqaKernels::enqueue_fold_256_p12_sel`]'s arguments, shared by
-/// [`GqaSelArgs`]: those of [`GqaArgs`] without the partials, with each row's
-/// list (`m · width` cache rows, ascending) and its length (`n_sel`, `m` of
-/// them) in place of the live counts.
-pub struct GqaFoldArgs<'a> {
+/// A listed flash's arguments ([`GqaSelArgs`]' and
+/// [`crate::flash_gqa_prefill::FlashGqaPrefill::enqueue_256_p12_sel`]'s):
+/// those of [`GqaArgs`] without the partials, with each row's list (`m ·
+/// width` cache rows, ascending) and its length (`n_sel`, `m` of them) in
+/// place of the live counts.
+pub struct GqaListArgs<'a> {
     pub q: &'a DeviceBuffer<f32>,
     pub kc: &'a DeviceBuffer<u16>,
     pub vc: &'a DeviceBuffer<u16>,
@@ -6190,13 +5984,14 @@ pub fn check_sinks(sinks: &[f32]) -> Result<(), GpuError> {
     }
 }
 
-/// The listed passes' common checks ([`FlashGqaKernels::enqueue_pass_256_p12_sel`],
-/// [`FlashGqaKernels::enqueue_fold_256_p12_sel`]): every size at least 1, a
-/// key head's [`PACK_12`] query heads in one block, and the buffers' lengths.
-/// Returns the segments a row's list is cut into.
-fn check_listed_256(
+/// The listed flashes' common checks
+/// ([`FlashGqaKernels::enqueue_pass_256_p12_sel`],
+/// [`crate::flash_gqa_prefill::FlashGqaPrefill::enqueue_256_p12_sel`]): every
+/// size at least 1, a key head's [`PACK_12`] query heads in one block, and the
+/// buffers' lengths. Returns the segments a row's list is cut into.
+pub(crate) fn check_listed_256(
     what: &'static str,
-    a: &GqaFoldArgs<'_>,
+    a: &GqaListArgs<'_>,
     n_head: usize,
 ) -> Result<usize, GpuError> {
     let (n_kv, ctx, m, width) = (a.n_kv, a.ctx, a.m, a.width);
@@ -6845,7 +6640,7 @@ impl FlashGqaKernels {
             part_ms,
         } = args;
         let segs = check_listed_256(what, &attn, n_head)?;
-        let GqaFoldArgs {
+        let GqaListArgs {
             q,
             kc,
             vc,
@@ -6899,53 +6694,6 @@ impl FlashGqaKernels {
             .prepare_gqa_flash_merge_256(LaunchConfig1D::new(merge_grid, MERGE_THREADS_256, 0))?;
         self.module.gqa_flash_merge_256(
             stream, &prep, part_v, part_ms, n_sel, heads, width, segs, seg_keys, m, fault, y,
-        )?;
-        Ok(())
-    }
-
-    /// [`FlashGqaKernels::enqueue_pass_256_p12_sel`] in one launch and no
-    /// partials (`gqa_flash_fold_mma_256_p12_sel`): one block of
-    /// [`PACK_12`] warps a (row, key head) walks the row's
-    /// [`listed_segments`]`(width)` segments in order and folds each into the
-    /// running output as the merge folds the partials, so every row is the
-    /// two launches' output bit for bit, the faults and NaN rows included.
-    /// The pass's arguments and refusals otherwise. Its grid is `m · n_kv`
-    /// blocks against the pass's `m · n_kv · segments`, so it fills the card
-    /// only for many rows. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_fold_256_p12_sel(
-        &self,
-        stream: &CudaStream,
-        args: GqaFoldArgs<'_>,
-        n_head: usize,
-    ) -> Result<(), GpuError> {
-        let what = "flash_gqa::enqueue_fold_256_p12_sel";
-        let segs = check_listed_256(what, &args, n_head)?;
-        let GqaFoldArgs {
-            q,
-            kc,
-            vc,
-            list,
-            n_sel,
-            width,
-            scale,
-            n_kv,
-            ctx,
-            m,
-            fault,
-            y,
-        } = args;
-        let grid = launch_u32(what, "grid", m * n_kv)?;
-        let n_kv = launch_u32(what, "n_kv", n_kv)?;
-        let ctx = launch_u32(what, "ctx", ctx)?;
-        let width = launch_u32(what, "width", width)?;
-        let segs = launch_u32(what, "segs", segs)?;
-        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
-        let m = launch_u32(what, "m", m)?;
-        let cfg = LaunchConfig1D::new(grid, THREADS_P12_U32, 0);
-        let prep = self.module.prepare_gqa_flash_fold_mma_256_p12_sel(cfg)?;
-        self.module.gqa_flash_fold_mma_256_p12_sel(
-            stream, &prep, q, kc, vc, list, n_sel, scale, n_kv, ctx, width, segs, seg_keys, m,
-            fault, y,
         )?;
         Ok(())
     }

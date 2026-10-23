@@ -36,8 +36,8 @@ pub(super) const PASS_ROWS: usize = 8;
 /// (`place::SELECT_RUN_BYTES`) hold at the selection's bytes a row
 /// ([`QsaScratch::row_bytes`]), in whole groups of the score pass's
 /// [`qsa::MAX_ROWS`], at least one group and at most `rows`. Each run uses
-/// two selection launches and one attention launch; attention folds its
-/// segments without partials.
+/// two selection launches and one attention launch, which needs no
+/// partials.
 pub(super) fn select_run(rows: usize, ctx: usize) -> usize {
     let row = QsaScratch::row_bytes(ctx, geo::KEPT) as u64;
     let fit = usize::try_from(model::arch::qwen35moe::place::SELECT_RUN_BYTES / row)
@@ -189,7 +189,7 @@ pub(super) struct Qsa38 {
     /// The normed and turned queries.
     pub(super) q: DeviceBuffer<f32>,
     /// The flash's partials, over a list's width: a pass's rows, none in a
-    /// ubatch walk's arena (its selected flash folds without them).
+    /// ubatch walk's arena (its listed prefill flash takes none).
     pub(super) part_v: DeviceBuffer<f32>,
     pub(super) part_ms: DeviceBuffer<f32>,
     /// The indexer's raw keys and queries, token-major.

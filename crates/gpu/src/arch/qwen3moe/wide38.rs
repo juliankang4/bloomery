@@ -35,7 +35,7 @@
 //!   no acc, no host sum and nothing left for the back;
 //! - the selecting layer's rows the prefill flash while `qsa::scored` says a
 //!   row selects nothing (every key below its count), the selection and the
-//!   selected flash's one-launch fold in runs of the arena's selection rows
+//!   prefill flash over each row's list in runs of the arena's selection rows
 //!   (`scratch38::select_run`: as many as the plan's selection bytes hold at
 //!   the load's cache) from the first row that selects; the pool pass over every row first, so a pool some row of the
 //!   unit completes is written before any row selects;
@@ -163,7 +163,7 @@ use crate::GpuError;
 use crate::card_leg::{RouteW, StackW};
 use crate::card_slots::CardAcc;
 use crate::fault::{FaultSink, LAYER_HEAD};
-use crate::flash_gqa::GqaFoldArgs;
+use crate::flash_gqa::GqaListArgs;
 use crate::flash_gqa_prefill::GqaPrefillArgs;
 use crate::gemm::{
     GateUp32Args, Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute,
@@ -2509,9 +2509,9 @@ fn qsa(
                 scratch: &mut q.sel,
             },
         )?;
-        c.k.flash.enqueue_fold_256_p12_sel(
+        c.k.prefill.enqueue_256_p12_sel(
             stream,
-            GqaFoldArgs {
+            GqaListArgs {
                 q: &qw,
                 kc: kcache,
                 vc: vcache,
