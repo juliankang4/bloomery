@@ -168,7 +168,10 @@ where
 /// pass, on each row's slot, [`SlotDrafts::before_row`] (the rows its draft
 /// left waiting walked, the pass overwriting the arena they read); after
 /// it [`SlotDrafts::after_row`] with the position the row ran from and its
-/// answer (the next refresh the row's, its hidden row in the pass's arena).
+/// answer (the next refresh the row's, its hidden row in the pass's arena,
+/// which no later pass of the round overwrites: a round past
+/// [`SlotRows::MAX_ROWS`] rows runs the pass that holds slot 0 last,
+/// [`app::Session::step_slots_rounds`]).
 /// A slot whose draft is off rides the pass as a plain row its draft is
 /// told nothing of, as its step alone. A row's answer and lent logits row
 /// are the pass's, bit for bit its step alone, so a sampling or
@@ -215,8 +218,10 @@ where
 /// counts back to that row; each slot's rows are bit for bit its own
 /// wherever they sit in the pass. A round whose windows' rows
 /// pass the body's [`SlotRows::MAX_ROWS`] runs as more than one pass, cut
-/// between windows — a window is never split: its rows are one verify of
-/// its sequence — every pass bit for bit its windows run alone. A slot
+/// between windows by their proposals' rows, every window's proposal made
+/// first and the pass that holds slot 0 last ([`pass_slots`]) — a window
+/// is never split: its rows are one verify of its sequence — every pass
+/// bit for bit its windows run alone. A slot
 /// whose draft skips (its window the one plain row) rides the same pass as
 /// a drafted one, [`pass_slots`]'s own case. A slot whose draft the seat
 /// turned off ([`SlotDrafts::is_off`]) runs before the passes, alone: its
@@ -306,63 +311,46 @@ where
         batch.choose(mode, profiles, widths, allowed)?;
     }
     let started = std::time::Instant::now();
-    let mut verified_rows = 0;
-    let mut first = 0;
-    while first < on.len() {
-        let mut end = first;
-        let mut packed = 0;
-        while end < on.len() && widths[end] < <B as SlotRows>::MAX_ROWS - packed {
-            packed += 1 + widths[end];
-            end += 1;
+    let mut taken: Vec<_> = on.iter().map(|&i| specs[rows[i].slot].take()).collect();
+    let mut outs: Vec<Vec<u32>> = on
+        .iter()
+        .map(|&i| std::mem::take(&mut rows[i].out))
+        .collect();
+    let run = {
+        let mut windows: Vec<SlotWindow<'_, B>> = Vec::with_capacity(on.len());
+        for (((&i, spec), out), &width) in on.iter().zip(&mut taken).zip(&mut outs).zip(&*widths) {
+            out.clear();
+            windows.push(SlotWindow {
+                slot: rows[i].slot,
+                last: rows[i].last,
+                depth: width,
+                // The check above took every row's draft.
+                draft: spec
+                    .as_mut()
+                    .expect("a draft the check above took")
+                    .draft_mut()
+                    .draft_mut(),
+                out,
+            });
         }
-        let pass = &on[first..end];
-        let mut taken: Vec<_> = pass.iter().map(|&i| specs[rows[i].slot].take()).collect();
-        let mut outs: Vec<Vec<u32>> = pass
-            .iter()
-            .map(|&i| std::mem::take(&mut rows[i].out))
-            .collect();
-        let run = {
-            let mut windows: Vec<SlotWindow<'_, B>> = Vec::with_capacity(pass.len());
-            for (((&i, spec), out), &width) in pass
-                .iter()
-                .zip(&mut taken)
-                .zip(&mut outs)
-                .zip(&widths[first..end])
-            {
-                out.clear();
-                windows.push(SlotWindow {
-                    slot: rows[i].slot,
-                    last: rows[i].last,
-                    depth: width,
-                    // The check above took every row's draft.
-                    draft: spec
-                        .as_mut()
-                        .expect("a draft the check above took")
-                        .draft_mut()
-                        .draft_mut(),
-                    out,
-                });
-            }
-            app::mtp::pass_slots(s, &mut windows)
-        };
-        for ((&i, spec), out) in pass.iter().zip(taken).zip(outs) {
-            specs[rows[i].slot] = spec;
-            rows[i].out = out;
-        }
-        let done = run?;
-        verified_rows += done.iter().map(|c| c.rows).sum::<usize>();
-        for (&i, c) in pass.iter().zip(done) {
-            if let Some(spec) = specs[rows[i].slot].as_mut() {
-                spec.draft_mut().round_ran(c.rows, c.kept);
-            }
-            rows[i].drafted = Drafted {
-                proposed: if c.proposed { c.rows - 1 } else { 0 },
-                accepted: c.kept - 1,
-            };
-        }
-        passes += 1;
-        first = end;
+        app::mtp::pass_slots(s, &mut windows)
+    };
+    for ((&i, spec), out) in on.iter().zip(taken).zip(outs) {
+        specs[rows[i].slot] = spec;
+        rows[i].out = out;
     }
+    let (done, ran) = run?;
+    let verified_rows: usize = done.iter().map(|c| c.rows).sum();
+    for (&i, c) in on.iter().zip(done) {
+        if let Some(spec) = specs[rows[i].slot].as_mut() {
+            spec.draft_mut().round_ran(c.rows, c.kept);
+        }
+        rows[i].drafted = Drafted {
+            proposed: if c.proposed { c.rows - 1 } else { 0 },
+            accepted: c.kept - 1,
+        };
+    }
+    passes += ran;
     if on.len() > 1 && mode == runtime::width::Mode::Cost {
         batch.observe(verified_rows, started.elapsed().as_secs_f64() * 1000.0)?;
     }

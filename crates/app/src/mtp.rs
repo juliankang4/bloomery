@@ -580,18 +580,21 @@ pub struct SlotWindow<'a, B: MtpBody> {
     pub out: &'a mut Vec<u32>,
 }
 
-/// One drafted round of several slots in one pass of the target, each
+/// One drafted round of several slots in passes of the target, each
 /// window's in turn as [`runtime::Speculative`]'s pass runs it for one
-/// sequence, the verifies of every window run together:
+/// sequence, the verifies of the windows run together:
 /// - each window's slot selected and its draft's proposal made, at most its
-///   `depth` ids ([`Draft::propose`] into that much room);
-/// - every window's rows — the token at its slot's position, then the
-///   proposal — run as one pass ([`Session::verify_slots`]), each row bit
-///   for bit its step;
+///   `depth` ids ([`Draft::propose`] into that much room), every window's
+///   before any pass: a pass may write the arena whose rows a draft walks;
+/// - the windows' rows — the token at its slot's position, then the
+///   proposal — cut between windows into passes of at most
+///   [`SlotRows::MAX_ROWS`] rows, the pass that holds slot 0 last
+///   (`round_passes`), each pass run as one
+///   ([`Session::verify_slots`]), each row bit for bit its step;
 /// - each window's kept rows by the runtime's rule (row 0, then while the
 ///   argmax is the next proposed id), recorded by its draft from the
 ///   position its rows ran from ([`MtpDraft::record`]) before the commit of
-///   every window's kept rows together ([`Session::commit_slots`]);
+///   the pass's kept rows together ([`Session::commit_slots`]);
 /// - each window's kept ids appended to its `out`.
 ///
 /// Each slot's proposals, kept rows and ids are bit for bit its own window
@@ -601,12 +604,14 @@ pub struct SlotWindow<'a, B: MtpBody> {
 /// [`MtpDraft`] proposes at least one id otherwise): its row is a plain step
 /// the draft is told nothing of, as its [`Draft::stepped`] would do nothing.
 /// Depth zero runs a plain row and keeps the draft ready for a later pass.
+/// Returns each window's commit, in the windows' order, and the passes run.
 /// Refused by name: a draft that proposes nothing at a positive depth while
-/// it drafts, and one that moves its slot's position.
+/// it drafts, one that moves its slot's position, and as
+/// `round_passes` refuses the windows' rows.
 pub fn pass_slots<B>(
     t: &mut Session<B>,
     windows: &mut [SlotWindow<'_, B>],
-) -> Result<Vec<runtime::Committed>, SessionError>
+) -> Result<(Vec<runtime::Committed>, usize), SessionError>
 where
     B: MtpBody + SlotRows,
     B::Seq: 'static,
@@ -640,45 +645,56 @@ where
         rows.push(ids);
         firsts.push(pos);
     }
-    let pass: Vec<(usize, &[u32])> = windows
-        .iter()
-        .zip(&rows)
-        .map(|(w, r)| (w.slot, &r[..]))
-        .collect();
-    let argmax = t.verify_slots(&pass)?.ids;
-    let mut kept = Vec::with_capacity(windows.len());
-    let mut at = 0;
-    for ((w, r), &p0) in windows.iter_mut().zip(&rows).zip(&firsts) {
-        let got = argmax.get(at..at + r.len()).ok_or_else(|| {
-            SessionError::Refused(format!(
-                "{WHAT}: a pass of {} rows read back {} ids",
-                at + r.len(),
-                argmax.len()
-            ))
-        })?;
-        let k = accepted_rows(r, got);
-        if w.depth == 0 {
-            w.draft.passed_plain(p0, w.last, got[0])?;
-        } else if r.len() > 1 {
-            w.draft.record(p0, r, got, k)?;
+    let cuts = crate::round_passes(
+        windows.iter().zip(&rows).map(|(w, r)| (w.slot, r.len())),
+        <B as SlotRows>::MAX_ROWS,
+    )?;
+    let mut kept = vec![0; windows.len()];
+    for cut in &cuts {
+        let (ws, rs) = (&mut windows[cut.clone()], &rows[cut.clone()]);
+        let pass: Vec<(usize, &[u32])> = ws.iter().zip(rs).map(|(w, r)| (w.slot, &r[..])).collect();
+        let argmax = t.verify_slots(&pass)?.ids;
+        let mut at = 0;
+        for (((w, r), &p0), k) in ws
+            .iter_mut()
+            .zip(rs)
+            .zip(&firsts[cut.clone()])
+            .zip(&mut kept[cut.clone()])
+        {
+            let got = argmax.get(at..at + r.len()).ok_or_else(|| {
+                SessionError::Refused(format!(
+                    "{WHAT}: a pass of {} rows read back {} ids",
+                    at + r.len(),
+                    argmax.len()
+                ))
+            })?;
+            *k = accepted_rows(r, got);
+            if w.depth == 0 {
+                w.draft.passed_plain(p0, w.last, got[0])?;
+            } else if r.len() > 1 {
+                w.draft.record(p0, r, got, *k)?;
+            }
+            at += r.len();
         }
-        kept.push(k);
-        at += r.len();
+        t.commit_slots(&kept[cut.clone()])?;
+        let mut at = 0;
+        for ((w, r), &k) in ws.iter_mut().zip(rs).zip(&kept[cut.clone()]) {
+            w.out.extend_from_slice(&argmax[at..at + k]);
+            at += r.len();
+        }
     }
-    t.commit_slots(&kept)?;
-    let mut done = Vec::with_capacity(windows.len());
-    let mut at = 0;
-    for (((w, r), &k), &p0) in windows.iter_mut().zip(&rows).zip(&kept).zip(&firsts) {
-        w.out.extend_from_slice(&argmax[at..at + k]);
-        at += r.len();
-        done.push(runtime::Committed {
+    let done = rows
+        .iter()
+        .zip(&kept)
+        .zip(&firsts)
+        .map(|((r, &k), &p0)| runtime::Committed {
             pos: p0,
             kept: k,
             rows: r.len(),
             proposed: r.len() > 1,
-        });
-    }
-    Ok(done)
+        })
+        .collect();
+    Ok((done, cuts.len()))
 }
 
 impl<B: MtpBody> MtpDraft<B> {

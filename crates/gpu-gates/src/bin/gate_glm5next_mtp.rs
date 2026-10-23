@@ -1858,7 +1858,7 @@ mod gate {
                     out: o1,
                 },
             ];
-            let done = pass_slots(&mut s, &mut w)?;
+            let (done, _) = pass_slots(&mut s, &mut w)?;
             let [c0, c1] = <[Committed; 2]>::try_from(done)
                 .map_err(|d| format!("a pass of 2 slots committed {} slots", d.len()))?;
             rounds[0].push(c0);

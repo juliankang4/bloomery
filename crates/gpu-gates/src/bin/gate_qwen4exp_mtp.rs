@@ -5069,7 +5069,7 @@ mod gate {
                     out: &mut o1,
                 },
             ];
-            let done = app::mtp::pass_slots(s, &mut w)?;
+            let (done, _) = app::mtp::pass_slots(s, &mut w)?;
             let [c0, c1] = <[Committed; 2]>::try_from(done)
                 .map_err(|d| format!("a pass of 2 slots committed {} slots", d.len()))?;
             plain_rows &= c0.rows == 1 && c0.kept == 1;
@@ -5397,7 +5397,7 @@ mod gate {
                     out: o1,
                 },
             ];
-            let done = app::mtp::pass_slots(s, &mut w)?;
+            let (done, _) = app::mtp::pass_slots(s, &mut w)?;
             let [c0, c1] = <[Committed; 2]>::try_from(done)
                 .map_err(|d| format!("a pass of 2 slots committed {} slots", d.len()))?;
             rejected += usize::from(c0.kept < c0.rows) + usize::from(c1.kept < c1.rows);
