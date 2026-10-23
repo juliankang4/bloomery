@@ -941,6 +941,7 @@ impl SlotRows for Body {
     /// row a slot, a NextN load's drafted pass's four, each slot's verify's
     /// two.
     const MAX_ROWS: usize = LOAD_ROWS;
+    const MAX_SLOTS: usize = RowBind::SEQS;
     /// The commit settles a partial keep ([`Body::keep_slot`]: each slot's
     /// lane word, held count and draft cut to its kept rows).
     const SETTLES_PARTIAL_KEEP: bool = true;
@@ -1119,5 +1120,30 @@ impl SlotRows for Body {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Body, LANES, RowBind, slots_chain};
+    use bloomery_gpu::model::{SlotRange, SlotRows, slots_a_pass};
+
+    #[test]
+    fn pass_limits_match_the_walks_sequence_bindings() {
+        assert_eq!(<Body as SlotRows>::MAX_SLOTS, RowBind::SEQS);
+        assert_eq!(slots_a_pass::<Body>(0), 0);
+        assert_eq!(slots_a_pass::<Body>(<Body as SlotRows>::MAX_ROWS + 1), 0);
+        for each in [1, LANES] {
+            let n = slots_a_pass::<Body>(each);
+            assert_eq!(n, RowBind::SEQS);
+            let rows: Vec<_> = (0..n)
+                .map(|slot| SlotRange {
+                    slot,
+                    rows: slot * each..(slot + 1) * each,
+                    pos0: 0,
+                })
+                .collect();
+            assert!(slots_chain(&rows).is_some(), "{rows:?}");
+        }
     }
 }

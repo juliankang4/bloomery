@@ -10,7 +10,7 @@
 //! [`bind::pass_rows_in_turn`]: bloomery_gpu_gates::bind::pass_rows_in_turn
 
 use app::mtp::{MtpBody, SlotWalks, SlotWindow};
-use bloomery_gpu::model::SlotRows;
+use bloomery_gpu::model::{SlotRows, slots_a_pass};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{Seat, SlotPassRow, SlotStep, pass_rows_in_turn, step_rows_in_turn};
 use bloomery_gpu_gates::record;
@@ -171,8 +171,8 @@ where
 /// read); after it [`SlotDrafts::after_row`] with the position the row ran
 /// from and its answer (the next refresh the row's, its hidden row in the
 /// pass's arena, which no later pass of the round overwrites: a round past
-/// [`SlotRows::MAX_ROWS`] rows runs the pass that holds slot 0 last,
-/// [`app::Session::step_slots_rounds`]).
+/// [`SlotRows::MAX_ROWS`] rows or [`SlotRows::MAX_SLOTS`] sequences runs the
+/// pass that holds slot 0 last, [`app::Session::step_slots_rounds`]).
 /// A slot whose draft is off rides the pass as a plain row its draft is
 /// told nothing of, as its step alone. A row's answer and lent logits row
 /// are the pass's, bit for bit its step alone, so a sampling or
@@ -271,7 +271,7 @@ where
     // `on` keeps each window's row index, the key its answer goes back by.
     let on = slot_order(on, |i| rows[i].slot);
     let w = 1 + depth.min(B::WIDTH);
-    if w > <B as SlotRows>::MAX_ROWS {
+    if slots_a_pass::<B>(w) == 0 {
         return Err(format!(
             "a drafted window of {w} rows past this body's pass of several slots' {} \
              (SlotRows::MAX_ROWS)",
@@ -311,7 +311,8 @@ where
                 .draft()
                 .batch_profile()
         });
-        batch.choose(mode, profiles, widths, allowed, <B as SlotRows>::MAX_ROWS)?;
+        let limits = (<B as SlotRows>::MAX_ROWS, <B as SlotRows>::MAX_SLOTS);
+        batch.choose(mode, profiles, widths, allowed, limits)?;
     }
     let started = std::time::Instant::now();
     let mut taken: Vec<_> = on.iter().map(|&i| specs[rows[i].slot].take()).collect();

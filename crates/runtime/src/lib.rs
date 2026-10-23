@@ -59,37 +59,64 @@ pub use width::{Choosing, Chosen, Rule, Tally, WidthError};
 
 use std::time::{Duration, Instant};
 
-/// A window that cannot fit a round's pass bound.
+/// A round that cannot be cut into passes: its pass bound, or a window
+/// that bound cannot hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RoundError {
-    slot: usize,
-    rows: usize,
-    max_rows: usize,
+pub enum RoundError {
+    /// A pass of no sequence, or of more sequences than rows.
+    Limits { max_rows: usize, max_slots: usize },
+    /// A window of no row or of more rows than a pass holds.
+    Window {
+        slot: usize,
+        rows: usize,
+        max_rows: usize,
+    },
 }
 
 impl std::fmt::Display for RoundError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "slot {}'s {} rows in a round of passes of at most {} rows",
-            self.slot, self.rows, self.max_rows
-        )
+        match self {
+            RoundError::Limits {
+                max_rows,
+                max_slots,
+            } => write!(
+                f,
+                "a round's passes of {max_rows} rows and {max_slots} slots: both are positive, \
+                 with slots <= rows"
+            ),
+            RoundError::Window {
+                slot,
+                rows,
+                max_rows,
+            } => write!(
+                f,
+                "slot {slot}'s {rows} rows in a round of passes of at most {max_rows} rows"
+            ),
+        }
     }
 }
 
 impl std::error::Error for RoundError {}
 
-/// Cut `(slot, rows)` entries into passes of at most `max_rows`, without
-/// splitting a window, and put the pass holding slot 0 last. Reuses `cuts`;
-/// an empty or oversized window is refused before any passes are written.
+/// Cut `(slot, rows)` entries into passes of at most `max_rows` rows and
+/// `max_slots` entries (the sequences a pass binds), without splitting a
+/// window, and put the pass holding slot 0 last. Reuses `cuts`; bad limits
+/// and an empty or oversized window are refused before any passes are
+/// written.
 pub fn round_passes(
     rows: impl Iterator<Item = (usize, usize)> + Clone,
-    max_rows: usize,
+    (max_rows, max_slots): (usize, usize),
     cuts: &mut Vec<std::ops::Range<usize>>,
 ) -> Result<(), RoundError> {
+    if max_slots == 0 || max_slots > max_rows {
+        return Err(RoundError::Limits {
+            max_rows,
+            max_slots,
+        });
+    }
     for (slot, n) in rows.clone() {
         if n == 0 || n > max_rows {
-            return Err(RoundError {
+            return Err(RoundError::Window {
                 slot,
                 rows: n,
                 max_rows,
@@ -100,7 +127,7 @@ pub fn round_passes(
     let (mut packed, mut zero) = (0, None);
     for (i, (slot, n)) in rows.enumerate() {
         match cuts.last_mut() {
-            Some(cut) if packed <= max_rows - n => {
+            Some(cut) if packed <= max_rows - n && cut.len() < max_slots => {
                 cut.end = i + 1;
                 packed += n;
             }
@@ -347,24 +374,65 @@ pub(crate) mod mock;
 
 #[cfg(test)]
 mod tests {
-    use super::round_passes;
+    use super::{RoundError, round_passes};
 
+    /// Passes hold whole windows within both bounds, rows and sequences,
+    /// the pass that holds slot 0 last and the others in order; bad bounds
+    /// and windows are refused before `cuts` changes.
     #[test]
     fn round_packing_keeps_windows_and_the_slot_zero_pass_last() {
         let mut cuts = Vec::new();
+        for limits in [(4, 2), (8, 8)] {
+            for n in [1, 2, 3, 4, 8, 9] {
+                for each in [1, 2, 4] {
+                    round_passes((0..n).map(|slot| (slot, each)), limits, &mut cuts).unwrap();
+                    let per = limits.1.min(limits.0 / each);
+                    assert_eq!(cuts.len(), n.div_ceil(per), "{n} of {each} at {limits:?}");
+                    assert!(cuts.last().unwrap().contains(&0));
+                    let mut covered: Vec<_> = cuts.iter().flat_map(Clone::clone).collect();
+                    covered.sort_unstable();
+                    assert_eq!(covered, (0..n).collect::<Vec<_>>());
+                    for cut in &cuts {
+                        assert!(cut.len() <= limits.1 && cut.len() * each <= limits.0);
+                    }
+                }
+            }
+        }
         for (rows, want) in [
             (vec![3, 3, 3, 3, 4], vec![2..4, 4..5, 0..2]),
             (vec![4, 4, 3, 3, 2], vec![2..5, 0..2]),
             (vec![4, 4], std::iter::once(0..2).collect()),
         ] {
-            round_passes(rows.iter().copied().enumerate(), 8, &mut cuts).unwrap();
+            round_passes(rows.iter().copied().enumerate(), (8, 8), &mut cuts).unwrap();
             assert_eq!(cuts, want);
         }
-        round_passes([(1, usize::MAX), (2, 1)].into_iter(), usize::MAX, &mut cuts).unwrap();
+        for (entries, want) in [
+            (vec![(0, 1), (1, 2), (2, 1), (3, 2)], vec![2..4, 0..2]),
+            (vec![(1, 3), (0, 2), (2, 2)], vec![0..1, 1..3]),
+            (vec![(1, 1), (2, 1), (0, 1), (3, 1)], vec![0..2, 2..4]),
+            (vec![(1, 1), (2, 1), (3, 1)], vec![0..2, 2..3]),
+        ] {
+            round_passes(entries.into_iter(), (4, 2), &mut cuts).unwrap();
+            assert_eq!(cuts, want);
+        }
+        let all = (usize::MAX, usize::MAX);
+        round_passes([(1, usize::MAX), (2, 1)].into_iter(), all, &mut cuts).unwrap();
         assert_eq!(cuts, [0..1, 1..2]);
-        for (n, max) in [(0, 8), (9, 8), (1, 0)] {
-            let err = round_passes([(3, n)].into_iter(), max, &mut cuts).unwrap_err();
+        for (n, limits) in [(0, (8, 8)), (9, (8, 8)), (usize::MAX, (4, 2))] {
+            let err = round_passes([(3, n)].into_iter(), limits, &mut cuts).unwrap_err();
             assert!(err.to_string().contains(&format!("slot 3's {n} rows")));
+            assert_eq!(cuts, [0..1, 1..2], "a refusal preserves the previous plan");
+        }
+        for (max_rows, max_slots) in [(0, 0), (4, 0), (2, 3)] {
+            let limits = (max_rows, max_slots);
+            let err = round_passes([(3, 1)].into_iter(), limits, &mut cuts).unwrap_err();
+            assert_eq!(
+                err,
+                RoundError::Limits {
+                    max_rows,
+                    max_slots
+                }
+            );
             assert_eq!(cuts, [0..1, 1..2], "a refusal preserves the previous plan");
         }
     }

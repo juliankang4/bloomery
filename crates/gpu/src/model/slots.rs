@@ -86,6 +86,10 @@ pub trait SlotRows: Slots {
     /// verify of one sequence's positions.
     const MAX_ROWS: usize;
 
+    /// The most resident sequences one pass binds. A body whose walk binds
+    /// fewer sequences than it holds rows states that separate limit.
+    const MAX_SLOTS: usize = Self::MAX_ROWS;
+
     /// The chain a replay of the pass of `rows` is served as
     /// ([`super::HostServed::serve_captured`]), as
     /// [`super::Rows::chain_of`] is a verify's. Read only on a load whose
@@ -527,12 +531,13 @@ where
     /// The ranges of a pass of `rows` — each `(slot, tokens)` in pass order —
     /// with each slot's first position, or the named refusal of a pass of no
     /// slot, a slot out of range or twice, a slot of no token, more than
-    /// `max_rows` rows (the body's [`SlotRows::MAX_ROWS`]), or a slot's rows
+    /// `max_rows` rows or `max_slots` sequences (the body's
+    /// [`SlotRows::MAX_ROWS`] and [`SlotRows::MAX_SLOTS`]), or a slot's rows
     /// past the resident cache.
     fn slot_ranges(
         &self,
         rows: impl Iterator<Item = (usize, usize)>,
-        max_rows: usize,
+        (max_rows, max_slots): (usize, usize),
         what: &'static str,
     ) -> Result<Vec<SlotRange>, GpuError> {
         let n = self.slots();
@@ -554,6 +559,18 @@ where
             if m == 0 {
                 return Err(GpuError::shape(what, format!("slot {slot} with no token")));
             }
+            if out.len() == max_slots {
+                return Err(GpuError::shape(
+                    what,
+                    format!("more than {max_slots} slots in one pass (SlotRows::MAX_SLOTS)"),
+                ));
+            }
+            if m > max_rows - at {
+                return Err(GpuError::shape(
+                    what,
+                    format!("more than {max_rows} rows in one pass (SlotRows::MAX_ROWS)"),
+                ));
+            }
             let pos0 = self.slot_pos(slot, what)?;
             out.push(SlotRange {
                 slot,
@@ -564,15 +581,6 @@ where
         }
         if out.is_empty() {
             return Err(GpuError::shape(what, "a pass of no slot"));
-        }
-        if at > max_rows {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{at} rows in one pass; this body's pass of several slots holds at most \
-                     {max_rows} (SlotRows::MAX_ROWS)"
-                ),
-            ));
         }
         for r in &out {
             if r.pos0 as usize + r.rows.len() > self.ctx_max {
@@ -605,7 +613,7 @@ where
     ///
     /// Refused by name before anything runs: a pass of no slot, a slot out
     /// of range or twice, a slot of no token, more than the body's
-    /// [`SlotRows::MAX_ROWS`] rows, a slot's rows past the resident cache
+    /// [`SlotRows::MAX_ROWS`] rows or [`SlotRows::MAX_SLOTS`] slots, a slot's rows past the resident cache
     /// and a poisoned model. The homes are made canonical first — slot 0
     /// selected, so every slot's state sits in its home and the body binds
     /// each slot's stores by the slot alone — and the call leaves slot 0
@@ -760,7 +768,7 @@ where
         const WHAT: &str = "GpuModel::capture_slots";
         const { slots_fit::<B>() };
         self.refuse_if_slots_wait(WHAT)?;
-        let ranges = self.slot_ranges(key.iter().copied(), B::MAX_ROWS, WHAT)?;
+        let ranges = self.slot_ranges(key.iter().copied(), (B::MAX_ROWS, B::MAX_SLOTS), WHAT)?;
         self.canonical_homes(&ranges, WHAT)?;
         self.capture_ranges(&ranges, WHAT)
     }
@@ -864,7 +872,7 @@ where
         self.refuse_if_slots_wait(what)?;
         let ranges = self.slot_ranges(
             rows.iter().map(|&(slot, ids)| (slot, ids.len())),
-            B::MAX_ROWS,
+            (B::MAX_ROWS, B::MAX_SLOTS),
             what,
         )?;
         if pass == SlotPass::Kept {
@@ -1066,6 +1074,25 @@ const fn slots_fit<B: SlotRows>() {
         B::MAX_ROWS >= 1 && B::MAX_ROWS <= MAX_PASS_ROWS,
         "a body's SlotRows::MAX_ROWS is 1 to MAX_PASS_ROWS"
     );
+    assert!(
+        B::MAX_SLOTS >= 1 && B::MAX_SLOTS <= B::MAX_ROWS,
+        "a body's SlotRows::MAX_SLOTS is 1 to its MAX_ROWS"
+    );
+}
+
+/// The slots a pass binds when each holds `rows` rows, limited by both
+/// the row arena and the sequence bindings. Zero rows or a window larger
+/// than the arena takes no slot.
+#[must_use]
+pub const fn slots_a_pass<B: SlotRows>(rows: usize) -> usize {
+    let Some(fit) = B::MAX_ROWS.checked_div(rows) else {
+        return 0;
+    };
+    if fit < B::MAX_SLOTS {
+        fit
+    } else {
+        B::MAX_SLOTS
+    }
 }
 
 /// The rows of a pass of `ranges`: where its last range ends.

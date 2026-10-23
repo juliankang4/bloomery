@@ -682,8 +682,9 @@ where
     /// One round of several slots' steps as passes of [`GpuModel::step_slots`]
     /// — the round a seat serves whose body runs several slots' rows as one
     /// pass: the busy `rows` (one a slot there, the server's rounds being one
-    /// step a running slot) cut into passes of at most [`SlotRows::MAX_ROWS`]
-    /// rows, run in `round_passes`' order (the pass that holds slot 0
+    /// step a running slot) cut into passes bounded by [`SlotRows::MAX_ROWS`]
+    /// rows and [`SlotRows::MAX_SLOTS`] sequences, run in `round_passes`'
+    /// order (the pass that holds slot 0
     /// last), each row's greedy next token in row order and each slot's
     /// position moved by its own. With `logits`, every row's logits of each
     /// pass come back too, read through [`GpuModel::slots_logits_into`] into
@@ -700,12 +701,21 @@ where
         rows: &[(usize, &[u32])],
         logits: bool,
     ) -> Result<SlotsRound<'_>, SessionError> {
+        let cuts = round_passes(
+            rows.iter().map(|(slot, t)| (*slot, t.len())),
+            (B::MAX_ROWS, B::MAX_SLOTS),
+        )?;
         let n_vocab = if logits { self.model.n_vocab()? } else { 0 };
-        let total: usize = rows.iter().map(|(_, t)| t.len()).sum();
-        if self.round.len() < total * n_vocab {
-            self.round.resize(total * n_vocab, 0.0);
+        let total = rows
+            .iter()
+            .try_fold(0usize, |n, (_, ids)| n.checked_add(ids.len()))
+            .ok_or_else(|| SessionError::Refused("round row count overflow".into()))?;
+        let floats = total
+            .checked_mul(n_vocab)
+            .ok_or_else(|| SessionError::Refused("round logits size overflow".into()))?;
+        if self.round.len() < floats {
+            self.round.resize(floats, 0.0);
         }
-        let cuts = round_passes(rows.iter().map(|(slot, t)| (*slot, t.len())), B::MAX_ROWS)?;
         let mut ids = vec![0; total];
         for cut in &cuts {
             let held: usize = rows[..cut.start].iter().map(|(_, t)| t.len()).sum();
@@ -749,20 +759,21 @@ where
 
 /// The passes a round of several slots runs and their order: the round's
 /// entries `rows` (each a slot and its row count, in the order the caller
-/// lays them) cut between entries into passes of at most `max` rows, each
-/// a range of entries, the pass that holds slot 0 last. A pass of several
+/// lays them) cut by [`runtime::round_passes`] between entries into passes
+/// within the body's `limits` (its rows and sequences a pass), each a range
+/// of entries, the pass that holds slot 0 last. A pass of several
 /// slots writes the pass arena the live sequence (slot 0's, the homes made
 /// canonical) reads its hidden rows from, whether the pass holds slot 0 or
 /// not; a body copies a parked slot's rows out to its own buffer (body38's
 /// `RowsCopy`), never slot 0's. So slot 0's rows of the round stand for its
-/// draft's next walk only when no pass runs after its own. Refused by name:
-/// an entry of no row or of more than `max`.
+/// draft's next walk only when no pass runs after its own. Refused by name
+/// as that refuses the limits or an entry.
 pub(crate) fn round_passes(
     rows: impl Iterator<Item = (usize, usize)> + Clone,
-    max: usize,
+    limits: (usize, usize),
 ) -> Result<Vec<std::ops::Range<usize>>, SessionError> {
     let mut cuts = Vec::new();
-    runtime::round_passes(rows, max, &mut cuts)
+    runtime::round_passes(rows, limits, &mut cuts)
         .map_err(|e| SessionError::Refused(e.to_string()))?;
     Ok(cuts)
 }
@@ -987,22 +998,17 @@ mod tests {
     use bloomery_gpu::{Fault, FaultSite, GpuError};
 
     /// The slot each row a draft walks after a round came from, a list per
-    /// entry of `entries` (a slot and its rows), with the round cut at `max`
-    /// rows by `round_passes` and run on a model of body38's pass arena:
+    /// entry of `entries` (a slot and its rows), with the round cut within
+    /// `limits` by `round_passes` and run on a model of body38's pass arena:
     /// every pass lays its rows into the live arena from row 0, slot 0's
     /// draft reads its rows there, and each parked slot's rows are copied
     /// to its own buffer.
-    fn walked(entries: &[(usize, usize)], max: usize) -> Vec<Vec<usize>> {
-        let cuts = round_passes(entries.iter().copied(), max).expect("a round's passes");
-        let mut covered: Vec<usize> = cuts.iter().flat_map(Clone::clone).collect();
-        covered.sort_unstable();
-        assert_eq!(covered, (0..entries.len()).collect::<Vec<_>>());
+    fn walked(entries: &[(usize, usize)], limits: (usize, usize)) -> Vec<Vec<usize>> {
+        let cuts = round_passes(entries.iter().copied(), limits).expect("a round's passes");
         let mut live = Vec::new();
         let mut own = vec![Vec::new(); entries.len()];
         for cut in cuts {
-            let pass = &entries[cut.clone()];
-            assert!(pass.iter().map(|&(_, n)| n).sum::<usize>() <= max);
-            live = pass
+            live = entries[cut.clone()]
                 .iter()
                 .flat_map(|&(slot, n)| std::iter::repeat_n(slot, n))
                 .collect();
@@ -1018,34 +1024,40 @@ mod tests {
     }
 
     /// Each draft walks its own slot's hidden rows after a round of several
-    /// passes: nine sampled slots' plain rows at eight a pass, and three
-    /// drafted windows of four rows, each with slot 0's pass last; a round
-    /// that fits one pass, or holds no slot 0, keeps its order. An entry of
-    /// no row or past the bound is refused by name.
+    /// passes: nine sampled slots' plain rows at eight a pass, three drafted
+    /// windows of four rows, a round that fits one pass or holds no slot 0,
+    /// and four slots' plain rows and two-row windows at GLM's four rows and
+    /// two sequences a pass. A refused entry comes back as the session's
+    /// refusal, naming its slot.
     #[test]
     fn round_passes_keep_each_drafts_hidden_rows() {
+        // PIN(2026-10-24): the cut shapes, both pass bounds and every
+        // refusal are `runtime::round_passes`'s own test.
         let nine: Vec<(usize, usize)> = (0..9).map(|slot| (slot, 1)).collect();
+        let plain: Vec<(usize, usize)> = (0..4).map(|slot| (slot, 1)).collect();
+        let pairs: Vec<(usize, usize)> = (0..4).map(|slot| (slot, 2)).collect();
         let three = [(0, 4), (1, 4), (2, 4)];
         let tail = [(1, 4), (2, 4), (3, 4)];
-        for entries in [&nine[..], &three[..], &tail[..], &[(0, 1), (1, 1)][..]] {
-            for (&(slot, _), rows) in entries.iter().zip(walked(entries, 8)) {
+        for (entries, limits) in [
+            (&nine[..], (8, 8)),
+            (&three[..], (8, 8)),
+            (&tail[..], (8, 8)),
+            (&[(0, 1), (1, 1)][..], (8, 8)),
+            (&plain[..], (4, 2)),
+            (&pairs[..], (4, 2)),
+        ] {
+            for (&(slot, _), rows) in entries.iter().zip(walked(entries, limits)) {
                 assert!(
                     rows.iter().all(|&from| from == slot),
                     "slot {slot}'s draft walks rows of slots {rows:?} after {entries:?}"
                 );
             }
         }
-        assert_eq!(round_passes(nine.iter().copied(), 8).unwrap(), [8..9, 0..8]);
-        assert_eq!(round_passes(tail.iter().copied(), 8).unwrap(), [0..2, 2..3]);
-        let one = round_passes([(0, 1), (1, 1)].into_iter(), 8).unwrap();
-        assert!(one.len() == 1 && one[0] == (0..2), "{one:?}");
-        for bad in [(1, 0), (1, 9)] {
-            let Err(SessionError::Refused(text)) = round_passes([(0, 1), bad].into_iter(), 8)
-            else {
-                panic!("{bad:?} was not refused");
-            };
-            assert!(text.contains("slot 1's"), "{text}");
-        }
+        let Err(SessionError::Refused(text)) = round_passes([(0, 1), (1, 9)].into_iter(), (8, 8))
+        else {
+            panic!("a window past the pass was not refused");
+        };
+        assert!(text.contains("slot 1's"), "{text}");
     }
 
     /// A poisoned model is refused by name, naming its fault; a clean one

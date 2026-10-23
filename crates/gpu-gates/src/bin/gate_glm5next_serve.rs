@@ -3,7 +3,7 @@
 //! `generate_glm5next` on the same card, as one process under the GPU gate
 //! lock.
 //!
-//!     gate_glm5next_serve --arm plain|drafted|slots|unset|prefix --dir <out>
+//!     gate_glm5next_serve --arm plain|plain-slots|drafted|slots|unset|prefix --dir <out>
 //!     gate_glm5next_serve --arm media --dir <out> --mmproj <file>
 //!
 //! Each arm starts the server beside this binary (`--model glm --host
@@ -104,14 +104,14 @@
 //!   own argmax, and a verify's rows are its steps' bits — the window's
 //!   wiring end to end, which the drafted arm's clause holds only up to the
 //!   first landing.
-//! - a fourth load, a plain server of `--parallel 2` under
+//! - a fourth load, a plain server of `--parallel 4` under
 //!   `BLOOMERY_STEP_STATS=1` ([`slots_one_pass`]; no draft, no residency —
 //!   the bits need no expert moving): its `parallel` line names `pass=one`,
-//!   and two rendered turns ([`TURN_A`], [`TURN_C`]), each run alone for
+//!   and four requests of two rendered turns ([`TURN_A`], [`TURN_C`]), each run alone for
 //!   [`SLOTS_PREDICT`] greedy ids (`cache_prompt` off), then both posted at
 //!   once, answer each one's alone ids, every `slots round` record of the
 //!   together window reading `cmd=step`, `slots=2`, `rows=2` and
-//!   `passes=ceil(rows/2)` — the body's two-row bound (FAIL-first: the seat
+//!   `passes=ceil(rows/2)` — the body's two-sequence bound (FAIL-first: the seat
 //!   left on the fallback loop prints `passes=rows`);
 //! - a fifth load, the seat as a user starts it ([`unset_load`]: no
 //!   `--place`, `--ctx` or `--parallel`, no lever set; both cards in view,
@@ -338,7 +338,7 @@ mod gate {
         bloomery_levers::SCHEMAJUMP,
     ];
 
-    const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted|slots|unset|prefix \
+    const USAGE: &str = "usage: gate_glm5next_serve --arm plain|plain-slots|drafted|slots|unset|prefix \
                          --dir <out> | --arm media --dir <out> --mmproj <file>";
 
     /// The stores both engines size, the seat's floor and the CLI's default.
@@ -461,6 +461,7 @@ mod gate {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Arm {
         Plain,
+        PlainSlots,
         Drafted,
         Slots,
         Unset,
@@ -472,13 +473,14 @@ mod gate {
         fn parse(v: &str) -> Result<Arm, GateError> {
             match v {
                 "plain" => Ok(Arm::Plain),
+                "plain-slots" => Ok(Arm::PlainSlots),
                 "drafted" => Ok(Arm::Drafted),
                 "slots" => Ok(Arm::Slots),
                 "unset" => Ok(Arm::Unset),
                 "prefix" => Ok(Arm::Prefix),
                 "media" => Ok(Arm::Media),
                 other => Err(format!(
-                    "--arm is plain, drafted, slots, unset, prefix or media, not {other}"
+                    "--arm is plain, plain-slots, drafted, slots, unset, prefix or media, not {other}"
                 )
                 .into()),
             }
@@ -2254,13 +2256,13 @@ mod gate {
         })
     }
 
-    /// Two `/completion` requests of `bodies` posted at once, each on a
+    /// The `/completion` requests of `bodies` posted at once, each on a
     /// helper thread of its own: each one's response, in order, or `None`
     /// (printed under its name) when it failed.
-    fn both_at_once(
+    fn both_at_once<const N: usize>(
         url: &dyn Fn(&str) -> String,
-        bodies: [Value; 2],
-        names: [&str; 2],
+        bodies: [Value; N],
+        names: [&str; N],
     ) -> Result<Vec<Option<Value>>, GateError> {
         type Answer = Result<(u16, String), String>;
         let mut posted: Vec<(JoinHandle<()>, mpsc::Receiver<Answer>)> = Vec::new();
@@ -2339,25 +2341,16 @@ mod gate {
         );
     }
 
-    /// The plain arm's slots clause (the module header): a plain server of
-    /// `--parallel 2` under `BLOOMERY_STEP_STATS=1` — no draft, no
-    /// residency, so the bits need no expert moving — whose `parallel` line
-    /// names `pass=one`; two rendered turns ([`TURN_A`], [`TURN_C`]), each
-    /// run alone for [`SLOTS_PREDICT`] greedy ids (`cache_prompt` off),
-    /// then both posted at once: each one's ids its alone run's, and every
-    /// `slots round` record of the together window — the alone runs print
-    /// none, a round of one row being a select and a `next` — reading
-    /// `cmd=step`, `slots=2`, `rows=2` and `passes=ceil(rows/2)`, the
-    /// body's two-row bound. FAIL-first: the seat left on the fallback loop
-    /// prints `passes=rows`.
+    /// Four concurrent plain requests complete with their independently generated
+    /// greedy ids. Every recorded round fits the body's row and sequence limits.
     fn slots_one_pass(dir: &Path) -> Result<bool, GateError> {
         let dir = dir.join("slots-plain");
         std::fs::create_dir_all(&dir)?;
         // SERVER_ARGS ends in the one-slot `--parallel 1`; this clause's
-        // server takes two slots of the same total context.
+        // server takes four slots of the same total context.
         let mut args: Vec<&str> = SERVER_ARGS.to_vec();
         let parallel = args.len() - 1;
-        args[parallel] = "2";
+        args[parallel] = "4";
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&args, &dir, PLAIN_STATS)?;
         println!("plain slots server pid {}", served.child.id());
@@ -2380,7 +2373,7 @@ mod gate {
         let a_ids = rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?;
         let c_ids = rendered(&url, json!([{ "role": "user", "content": TURN_C }]))?;
         let mut alone = Vec::new();
-        for ids in [&a_ids, &c_ids] {
+        for ids in [&a_ids, &c_ids, &a_ids, &c_ids] {
             alone.push(ids_of(&greedy(&url, ids, SLOTS_PREDICT, false)?["tokens"]));
         }
         check(
@@ -2394,8 +2387,18 @@ mod gate {
         let before = round_count(&err_log)?;
         let together: Vec<Option<Vec<u32>>> = both_at_once(
             &url,
-            [greedy_body(&a_ids), greedy_body(&c_ids)],
-            ["plain slots A", "plain slots C"],
+            [
+                greedy_body(&a_ids),
+                greedy_body(&c_ids),
+                greedy_body(&a_ids),
+                greedy_body(&c_ids),
+            ],
+            [
+                "plain slots A0",
+                "plain slots C1",
+                "plain slots A2",
+                "plain slots C3",
+            ],
         )?
         .iter()
         .map(|v| v.as_ref().map(|v| ids_of(&v["tokens"])))
@@ -2405,24 +2408,33 @@ mod gate {
             && window.iter().all(|r| {
                 let rows = r.u64("rows");
                 r.word("cmd") == Ok("step")
-                    && r.u64("slots") == Ok(2)
-                    && rows == Ok(2)
+                    && r.u64("slots").is_ok_and(|n| (2..=4).contains(&n))
+                    && rows == r.u64("slots")
                     && r.u64("passes") == rows.map(|n| n.div_ceil(2))
             });
         println!(
-            "plain slots alone {} and {} ids, together {:?} and {:?}",
-            alone[0].len(),
-            alone[1].len(),
-            together[0].as_ref().map(Vec::len),
-            together[1].as_ref().map(Vec::len),
+            "plain slots alone {:?} ids, together {:?}",
+            alone.iter().map(Vec::len).collect::<Vec<_>>(),
+            together
+                .iter()
+                .map(|ids| ids.as_ref().map(Vec::len))
+                .collect::<Vec<_>>(),
         );
         print_rounds("plain slots", &window, &window.iter().collect::<Vec<_>>());
         check(
             &mut ok,
             "plain_slots_together_ids_are_alone",
-            together[0].as_ref() == Some(&alone[0]) && together[1].as_ref() == Some(&alone[1]),
+            together
+                .iter()
+                .zip(&alone)
+                .all(|(got, want)| got.as_ref() == Some(want)),
         );
-        check(&mut ok, "plain_slots_rounds_run_one_pass", every);
+        check(&mut ok, "plain_slots_rounds_respect_pass_capacity", every);
+        check(
+            &mut ok,
+            "plain_slots_four_requests_overlap",
+            window.iter().any(|r| r.u64("slots") == Ok(4)),
+        );
         println!("plain slots server stopped: {}", served.stop()?);
         Ok(ok)
     }
@@ -3020,6 +3032,7 @@ mod gate {
         std::fs::create_dir_all(&a.dir)?;
         let ok = match a.arm {
             Arm::Plain => plain(&a.dir, &levers)?,
+            Arm::PlainSlots => slots_one_pass(&a.dir)?,
             Arm::Drafted => drafted(&a.dir, &levers)?,
             Arm::Slots => slots_flow_together(&a.dir)?,
             Arm::Unset => unset_load(&a.dir)?,

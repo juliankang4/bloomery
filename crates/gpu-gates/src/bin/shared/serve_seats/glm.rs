@@ -118,7 +118,7 @@
 //! `--parallel 1` is the one-sequence server and `--parallel 0` is refused
 //! by name. `--parallel` naming no count, the seat serves one slot; a count
 //! the flags set is never lowered. The round's shape the open decided once, from the load and the
-//! body's `SlotRows::MAX_ROWS`: a plain load (no NextN draft) runs a round of
+//! body's row and sequence limits (`SlotRows::MAX_ROWS`, `SlotRows::MAX_SLOTS`): a plain load (no NextN draft) runs a round of
 //! steps as one pass of the busy rows
 //! (`serve_seats::rounds::step_rows_one_pass`, cut at that bound); a NextN
 //! load runs a round of drafted passes as one pass of the busy slots'
@@ -247,7 +247,7 @@ use app::mtp::{MtpBody, MtpDraft};
 use app::{OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::model::{SlotRows, StepMode};
+use bloomery_gpu::model::{StepMode, slots_a_pass};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
@@ -348,7 +348,7 @@ const VERIFY_ROWS: usize = <Body as MtpBody>::VERIFY_ROWS;
 enum Rounds {
     /// A plain load: one pass of the busy rows' steps
     /// (`serve_seats::rounds::step_rows_one_pass`, cut at the body's
-    /// [`SlotRows::MAX_ROWS`]).
+    /// [`slots_a_pass`]).
     Steps,
     /// A NextN load whose body's pass of several slots holds two drafted
     /// windows: one pass of the busy slots' windows
@@ -368,7 +368,7 @@ impl Rounds {
     fn of(drafts: bool) -> Rounds {
         if !drafts {
             Rounds::Steps
-        } else if <Body as SlotRows>::MAX_ROWS >= 2 * (1 + <Body as MtpBody>::WIDTH) {
+        } else if slots_a_pass::<Body>(1 + <Body as MtpBody>::WIDTH) > 1 {
             Rounds::Windows
         } else {
             Rounds::Turns
@@ -1528,7 +1528,7 @@ impl Seat for Glm {
     /// One round of several slots ([`super::rounds::step_round`]): one pass
     /// of the busy rows on a plain load ([`Rounds::Steps`], through
     /// `serve_seats::rounds::step_rows_one_pass` — cut at the body's
-    /// [`SlotRows::MAX_ROWS`], the rows' answers and lent logits rows from
+    /// [`slots_a_pass`], the rows' answers and lent logits rows from
     /// the pass's own per-row heads, slot 0 left selected), then the call's
     /// `residency pass` records, else the seat's fallback — a select and a
     /// step a row — the NextN load's step round, whose body refuses a pass
@@ -1553,7 +1553,7 @@ impl Seat for Glm {
     /// `serve_seats::rounds::pass_rows_one_pass` — each slot's window over
     /// its own draft at the depth a one-slot pass proposes, the windows laid
     /// in slot order and cut between them at the body's
-    /// [`SlotRows::MAX_ROWS`], slot 0 left selected), each slot whose draft
+    /// [`slots_a_pass`], slot 0 left selected), each slot whose draft
     /// skips turned off first ([`Glm::off_skipping`]) and stepped alone,
     /// then the call's `residency pass` records; else the fallback (a select
     /// and a pass a row, which prints its own `slots round` record). A

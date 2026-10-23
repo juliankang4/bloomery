@@ -812,7 +812,7 @@ where
     plain.run(t)?;
     let cuts = crate::round_passes(
         windows.iter().zip(&rows).map(|(w, r)| (w.slot, r.len())),
-        <B as SlotRows>::MAX_ROWS,
+        (<B as SlotRows>::MAX_ROWS, <B as SlotRows>::MAX_SLOTS),
     )?;
     let mut kept = vec![0; windows.len()];
     for cut in &cuts {

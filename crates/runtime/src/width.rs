@@ -406,7 +406,8 @@ fn expected(a: &[f64], k: usize) -> f64 {
 /// Measured round walls for one active-slot count and body pass bound.
 struct BatchCosts {
     slots: usize,
-    max_rows: usize,
+    /// The body's rows and sequences a pass.
+    limits: (usize, usize),
     /// Sorted pass row counts and the whole round's wall.
     costs: Vec<(Vec<usize>, Timings)>,
     passes: u32,
@@ -469,16 +470,17 @@ pub struct Batch {
 
 impl Batch {
     /// Cut each slot's maximum width using its conditional acceptance profile.
-    /// `allowed` is the body's supported draft-width set, and `max_rows` its
-    /// pass bound; a slot already at zero has no draft. Fixed mode leaves all
-    /// widths untouched.
+    /// `allowed` is the body's supported draft-width set, and `limits` its
+    /// rows and sequences a pass, the bound the round's passes are cut at; a
+    /// slot already at zero has no draft. Fixed mode leaves all widths
+    /// untouched.
     pub fn choose<'a>(
         &mut self,
         mode: Mode,
         profiles: impl ExactSizeIterator<Item = &'a [f64]> + Clone,
         widths: &mut [usize],
         allowed: std::ops::RangeInclusive<usize>,
-        max_rows: usize,
+        limits: (usize, usize),
     ) -> Result<(), WidthError> {
         if profiles.len() != widths.len() || widths.is_empty() {
             return Err(WidthError::Rule(
@@ -515,7 +517,7 @@ impl Batch {
         self.rows.extend(widths.iter().map(|&w| w + 1));
         crate::round_passes(
             self.rows.iter().copied().enumerate(),
-            max_rows,
+            limits,
             &mut self.cuts,
         )
         .map_err(WidthError::Round)?;
@@ -525,13 +527,13 @@ impl Batch {
         let current = match self
             .states
             .iter()
-            .position(|s| s.slots == slots && s.max_rows == max_rows)
+            .position(|s| s.slots == slots && s.limits == limits)
         {
             Some(i) => i,
             None => {
                 self.states.push(BatchCosts {
                     slots,
-                    max_rows,
+                    limits,
                     costs: Vec::new(),
                     passes: 0,
                     probe: 0,
@@ -615,7 +617,7 @@ impl Batch {
         let state = &self.states[self.current.expect("a batch was chosen")];
         crate::round_passes(
             self.rows.iter().copied().enumerate(),
-            state.max_rows,
+            state.limits,
             &mut self.cuts,
         )
         .map_err(WidthError::Round)?;
@@ -2973,13 +2975,13 @@ mod tests {
         for _ in 0..Rule::DEFAULT.min_timings {
             let mut widths = [2, 2, 2, 2, 3];
             batch
-                .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3, 8)
+                .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3, (8, 8))
                 .unwrap();
             batch.observe([3, 3, 3, 3, 4].into_iter(), 30.0).unwrap();
         }
         let mut widths = [3, 3, 2, 2, 1];
         batch
-            .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3, 8)
+            .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3, (8, 8))
             .unwrap();
         assert_eq!(
             widths,
@@ -2998,6 +3000,20 @@ mod tests {
         assert_eq!(batch.states[0].cost(&[3, 6, 7]), 40.0);
         assert_eq!(batch.states[0].cost(&[4, 6, 6]), 30.0);
         assert_eq!(batch.states[0].cost(&[8, 8]), 20.0);
+        // GLM's pass binds two sequences of its four rows: four plain rows
+        // are two passes, as the server cuts them.
+        let mut glm = Batch::default();
+        let mut widths = [0; 4];
+        glm.choose(
+            Mode::Cost,
+            [&[0.0][..]; 4].into_iter(),
+            &mut widths,
+            1..=1,
+            (4, 2),
+        )
+        .unwrap();
+        glm.observe([1; 4].into_iter(), 10.0).unwrap();
+        assert_eq!(glm.states[0].readings(&[2, 2]), 1);
     }
 
     #[test]
@@ -3008,7 +3024,7 @@ mod tests {
                 let profiles = vec![&[0.0; 3][..]; slots];
                 let mut widths = vec![3; slots];
                 batch
-                    .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3, 8)
+                    .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3, (8, 8))
                     .unwrap();
                 let rows = slots + widths.iter().sum::<usize>();
                 batch
@@ -3020,7 +3036,7 @@ mod tests {
             let profiles = vec![&[0.0; 3][..]; slots];
             let mut widths = vec![3; slots];
             batch
-                .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3, 8)
+                .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3, (8, 8))
                 .unwrap();
             assert_eq!(
                 widths,
@@ -3043,11 +3059,17 @@ mod tests {
         let profiles = [&[0.8; 3][..]; 2];
         let mut widths = [3, 3];
         let error = batch
-            .choose(Mode::Fixed, profiles.into_iter(), &mut widths, 0..=3, 3)
+            .choose(
+                Mode::Fixed,
+                profiles.into_iter(),
+                &mut widths,
+                0..=3,
+                (3, 3),
+            )
             .unwrap_err();
         assert!(error.to_string().contains("at most 3 rows"));
         batch
-            .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3, 8)
+            .choose(Mode::Cost, profiles.into_iter(), &mut widths, 0..=3, (8, 8))
             .unwrap();
         for rows in [
             vec![4],
@@ -3082,7 +3104,7 @@ mod tests {
                     profiles.iter().copied(),
                     &mut widths,
                     0..=3,
-                    usize::MAX,
+                    (usize::MAX, usize::MAX),
                 )
                 .unwrap();
             assert_eq!(widths, vec![3; slots]);
@@ -3098,7 +3120,7 @@ mod tests {
                     profiles.iter().copied(),
                     &mut widths,
                     0..=3,
-                    usize::MAX,
+                    (usize::MAX, usize::MAX),
                 )
                 .unwrap();
             assert_eq!(widths, vec![0; slots], "sample the opposite endpoint next");
@@ -3119,7 +3141,7 @@ mod tests {
                     profiles.iter().copied(),
                     &mut widths,
                     0..=3,
-                    usize::MAX,
+                    (usize::MAX, usize::MAX),
                 )
                 .unwrap();
             assert_eq!(widths, want, "batch of {slots}");
@@ -3130,7 +3152,7 @@ mod tests {
                     profiles.iter().copied(),
                     &mut widths,
                     0..=3,
-                    usize::MAX,
+                    (usize::MAX, usize::MAX),
                 )
                 .unwrap();
             assert_eq!(widths, vec![3; slots]);
@@ -3147,7 +3169,7 @@ mod tests {
                     profiles.into_iter(),
                     &mut widths,
                     0..=3,
-                    usize::MAX,
+                    (usize::MAX, usize::MAX),
                 )
                 .unwrap();
             assert_eq!(widths.iter().sum::<usize>() + 2, rows, "endpoint {rows}");
@@ -3166,7 +3188,7 @@ mod tests {
                 profiles.into_iter(),
                 &mut widths,
                 0..=3,
-                usize::MAX,
+                (usize::MAX, usize::MAX),
             )
             .unwrap();
         assert_eq!(widths, [1, 1], "the rate peaks between the endpoints");
@@ -3178,7 +3200,7 @@ mod tests {
                 [&[0.0][..], &[0.0][..]].into_iter(),
                 &mut widths,
                 1..=1,
-                8,
+                (4, 2),
             )
             .unwrap();
             glm.observe([1, 1].into_iter(), 1.0).unwrap();
@@ -3214,7 +3236,7 @@ mod tests {
                     profiles.iter().copied(),
                     &mut widths,
                     allowed,
-                    8,
+                    (8, 8),
                 )
                 .unwrap_err();
             assert!(error.to_string().contains(why), "{error}");

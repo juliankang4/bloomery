@@ -5492,6 +5492,22 @@ mod gate {
             "hostless: nvfp4 no_host_views={no_views} host_memops={host_ops} eager=graph=batch finite logits tokens={token},{next} {}",
             verdict(ok && generated)
         );
+        m.add_slots(4)?;
+        let rows = [(0, &ids[..1]), (1, &ids[..1]), (2, &ids[..1])];
+        let captures = m.capture_slots(&[(0, 1), (1, 1), (2, 1)]);
+        let steps = m.step_slots(&rows);
+        let verifies = m.verify_slots(&rows);
+        let limits_ok = [
+            captures.map(|_| ()),
+            steps.map(|_| ()),
+            verifies.map(|_| ()),
+        ]
+        .iter()
+        .all(|r| matches!(r, Err(e) if e.to_string().contains("SlotRows::MAX_SLOTS")));
+        println!(
+            "hostless: three sequences refused before capture, step and verify {}",
+            verdict(limits_ok)
+        );
         // A forced row of the hostless layer serves no host row: no host sum, and the
         // block's output is the card sum plus the shared expert's.
         let streams = inputs.hp.hc.streams * inputs.hp.n_embd;
@@ -5554,7 +5570,7 @@ mod gate {
             );
             trace_ok &= ok;
         }
-        Ok(ok && generated && forced_ok && trace_ok)
+        Ok(ok && generated && limits_ok && forced_ok && trace_ok)
     }
 
     pub fn run() -> Result<(), GateError> {
