@@ -4750,15 +4750,16 @@ mod gate {
             let plan_levers = PlanLevers {
                 card_budget_bytes: Some(budget),
             };
-            Ok(if drafted {
-                inputs
-                    .plan_mtp_with_slots(&machine, c, &plan_levers, &mtp, experts, 1)
-                    .is_ok()
-            } else {
-                inputs
-                    .plan_with_slots(&machine, c, &plan_levers, experts, 1)
-                    .is_ok()
-            })
+            Ok(inputs
+                .plan_target(
+                    &machine,
+                    c,
+                    &plan_levers,
+                    experts,
+                    drafted.then_some(&mtp),
+                    1,
+                )
+                .is_ok())
         };
         let rungs = ctx_ladder::rungs(limit38(&inputs)?.0);
         for pair in rungs.windows(2) {

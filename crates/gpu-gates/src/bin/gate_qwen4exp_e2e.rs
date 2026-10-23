@@ -504,7 +504,9 @@ mod gate {
     // sum 1) and 4 stream copies (the download's x, ids and weights, the
     // upload's sum); a selecting layer's 35 (its mixer 13) and 4, one more
     // for a unit with dense rows (the prefill flash); layer 1's PLE site 6
-    // more, layer 0's embedding 1 more.
+    // more, layer 0's embedding 1 more; and on a card route its plan gave
+    // the run of a whole unit (`place::card_route_run`), one more run of
+    // the route's launches on a layer with card experts.
 
     /// The gate's one reading of what the run is made from: the model file
     /// (`ref_model_path`, a whole fixture under the fixture tier), the host
@@ -3854,6 +3856,16 @@ mod gate {
         );
         // D3K's prefill, one walk and two cut inside the selecting rows, bit
         // for bit — the only walk that crosses the route's run boundary.
+        ok &= d3k_cut(m, "card plan")?;
+        m.reset()?;
+        Ok(ok)
+    }
+
+    /// D3K's prefill by ubatches cut at [`SPLIT`] against one ubatch of it,
+    /// bit for bit, under `what` the plan's name: a token's bits depend
+    /// neither on the ubatch it lands in nor on the card route's run (its
+    /// 3,001 tokens run two of 2,048, or one of the whole ubatch).
+    fn d3k_cut(m: &mut Qwen38Model, what: &str) -> Result<bool, GateError> {
         let (man, d3k) = input_manifest(D3K)?;
         let (_, _, prefill) = man.step()?;
         let prefill = prefill.to_vec();
@@ -3880,14 +3892,12 @@ mod gate {
             stores: cut_stores,
             ple_ring: cut_ring,
         };
-        ok &= same_run(
-            &format!("card plan: {d3k} by ubatches cut at {SPLIT} vs one ubatch"),
+        Ok(same_run(
+            &format!("{what}: {d3k} by ubatches cut at {SPLIT} vs one ubatch"),
             &cut,
             &one,
             true,
-        );
-        m.reset()?;
-        Ok(ok)
+        ))
     }
 
     /// (k): the card plan loaded on the gate card (the host plan's model
@@ -3926,7 +3936,8 @@ mod gate {
     /// serves every layer on the host: five graph and five eager steps and a
     /// verify of four rows kept whole, every token, logits row and store bit
     /// for bit. A load that runs a layer without the host leg refuses a route
-    /// trace and a residency machine by name ([`whole_refusals`]). A load
+    /// trace and a residency machine by name ([`whole_refusals`]), and its
+    /// card route runs the whole ubatch in one run ([`whole_run`]). A load
     /// that fails is a named FAIL.
     fn card_whole(toks: &[u32]) -> Result<bool, GateError> {
         let fixture = Tier::from_env()? == Tier::Fixture;
@@ -3934,15 +3945,16 @@ mod gate {
             card_budget_bytes: None,
         };
         let (rows, next) = verify_rows(toks)?;
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         // One load of the plan: its step's batch mem ops, then the runs, and
-        // on the load without every host leg its refusals; `None` after a
-        // load's named failure.
+        // on the load without every host leg its refusals and its card
+        // route's run; `None` after a load's named failure.
         let arm = |route_trace: bool| -> Result<Option<_>, GateError> {
             let opened = (|| -> Result<Opened38, GateError> {
                 Open38 {
                     card: card()?,
                     ctx: CTX,
-                    ub: bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?,
+                    ub,
                     experts: Experts::Card,
                     slots: 1,
                     plan_levers: &levers,
@@ -3988,7 +4000,7 @@ mod gate {
                 );
                 true
             } else {
-                whole_refusals(&mut m)?
+                whole_refusals(&mut m)? & whole_run(&mut m, &plan, ub, fixture)?
             };
             Ok(Some((
                 whole,
@@ -4035,6 +4047,37 @@ mod gate {
         let pos = PREFIX + LANES;
         ok &= same_vrun("whole plan vs host legs kept", &v, &kv, pos, kv.lane);
         Ok(ok)
+    }
+
+    /// (k) (iv)'s card route on a load that runs a layer without the host
+    /// leg: in the fixture tier the card holds every routed expert, so the
+    /// plan gives the route the run of the whole ubatch of `ub`
+    /// (`place::widen_card_route`; the real tier prints its run and does not
+    /// require it), the loaded route runs the plan's run
+    /// (`Body38::card_route_run`), and D3K's prefill in one run of it is its
+    /// cut walk bit for bit ([`d3k_cut`]).
+    fn whole_run(
+        m: &mut Qwen38Model,
+        plan: &PlanFacts,
+        ub: usize,
+        fixture: bool,
+    ) -> Result<bool, GateError> {
+        let widened = plan.route_run == u64::try_from(ub)?;
+        let loaded = m.body("card leg whole plan")?.card_route_run();
+        let ran = loaded.map(u64::try_from).transpose()? == Some(plan.route_run);
+        let premise = ran && (!fixture || widened);
+        println!(
+            "card leg whole plan: the card route runs {} tokens a run (the ubatch's {ub}{}), \
+             the loaded route {loaded:?} (want the plan's) {}",
+            plan.route_run,
+            if fixture {
+                ": the fixture fits the card"
+            } else {
+                ", not required in the real tier"
+            },
+            verdict(premise)
+        );
+        Ok(premise && d3k_cut(m, "whole plan")?)
     }
 
     /// (k) (iv)'s refusals on a load that runs a layer without the host leg:

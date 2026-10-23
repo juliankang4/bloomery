@@ -38,7 +38,10 @@ pub(super) const SELECT_ROWS: usize = qsa::MAX_ROWS;
 
 /// The most tokens one router launch of a ubatch walk takes, and so one
 /// routed table over them: 2,048 tokens at the router's eleven slots a token
-/// fit one GEMM route table, and a 4,096-token ubatch routes in two.
+/// fit one GEMM route table, and a 4,096-token ubatch routes in two. The
+/// tier's block route runs in runs of this many. So does the card route,
+/// unless its plan gives it a run of the whole ubatch
+/// (`place::card_route_run`); at ten slots a token, that run fits one table.
 pub(super) const ROUTE_ROWS: usize = 2048;
 
 // The card's rings keep the rows the plan counts them by.
@@ -50,6 +53,10 @@ const _: () = assert!(
         && PASS_ROWS <= stores::PASS_ROWS
         && ROUTE_ROWS * (geo::N_USED + 1) <= crate::gemm::GEMM_MAX_SLOTS
 );
+
+// At the card route's ten slots a token, the default ubatch fills exactly one
+// GEMM route table, so a card route of the whole ubatch takes one table.
+const _: () = assert!(super::ubatch::UBATCH * geo::N_USED == crate::gemm::GEMM_MAX_SLOTS);
 
 /// Lanes of a delta store's state: a verify of up to this many rows keeps
 /// the state after each of its rows in a lane of its own

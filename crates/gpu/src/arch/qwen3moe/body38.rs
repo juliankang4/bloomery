@@ -1392,10 +1392,14 @@ impl Body38 {
     /// (`HostTier::check_tier_reserves`), a plan of more than one stage card
     /// or not every layer, a
     /// layer or a width the kernels do not take, a `ubatch` outside
-    /// `1..=min(UBATCH, ctx)`, and a ubatch arena past what the plan's
-    /// scratch counts. `file` is a GGUF split or a checkpoint folder
-    /// ([`Model38`]); a folder's load is refused by name under a residency
-    /// machine or with an MTP draft ([`Folder38`]).
+    /// `1..=min(UBATCH, ctx)`, a ubatch arena past what the plan's
+    /// scratch counts, and a stage card reserve for the card route's run
+    /// that the ubatch does not read (`place::card_route_run`). The card
+    /// route runs the whole ubatch at once on a card that reserves that run
+    /// (`place::widen_card_route`), else in runs of `ROUTE_ROWS` tokens.
+    /// `file` is a GGUF split or a checkpoint folder ([`Model38`]); a
+    /// folder's load is refused by name under a residency machine or with an
+    /// MTP draft ([`Folder38`]).
     pub fn open_placed(
         file: impl Into<Model38>,
         plan: &Plan<'_>,
@@ -1648,7 +1652,15 @@ impl Body38 {
             .get(card)
             .ok_or_else(|| GpuError::shape(WHAT, format!("the plan has no card {card}")))?;
         let layers = spec.layers.clone();
-        let counted = model::placement::workstation::counted_arena_bytes(spec);
+        // The card route's run and the arena bytes the plan counts with it.
+        let (route_run, counted) = model::arch::qwen35moe::place::card_route_run(
+            spec,
+            ubatch as u64,
+            !plan.machine.tiers.is_empty(),
+        )
+        .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
+        let route_run = usize::try_from(route_run)
+            .map_err(|_| GpuError::shape(WHAT, "the card route's run passes usize"))?;
         if plan.machine.cards.len() != 1 || layers != (0..n) {
             return Err(GpuError::shape(
                 WHAT,
@@ -1694,7 +1706,7 @@ impl Body38 {
                     host,
                     set,
                     glue,
-                    (ubatch, counted, slots),
+                    (ubatch, route_run, counted, slots),
                 )?;
                 if let Some(mut d) = draft {
                     let rows = body.rope.table.len() / body.rope.width;
@@ -1747,7 +1759,7 @@ impl Body38 {
     /// sized ([`HostServed::start_residency`], the load's last step).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card handle, file with its stored PLE rows, weights, plan, inputs and chain shape, the host tier's residency and levers, the residency glue, and the ubatch with the arena bytes the plan counts and the planned slots (rust-quality R8)"
+        reason = "the load's card handle, file with its stored PLE rows, weights, plan, inputs and chain shape, the host tier's residency and levers, the residency glue, and the ubatch with the card route's run, the arena bytes the plan counts and the planned slots (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
@@ -1759,7 +1771,7 @@ impl Body38 {
         host: HostCfg,
         set: HostResidency,
         residency_glue: ResidencyGlue,
-        (ub, counted, planned): (usize, u64, usize),
+        (ub, route_run, counted, planned): (usize, usize, u64, usize),
     ) -> Result<Body38, GpuError> {
         let (spec, hp) = (&inputs.spec, &inputs.hp);
         let n = spec.layers.len();
@@ -1861,7 +1873,7 @@ impl Body38 {
         let tier = (!tiers.is_empty())
             .then(|| TierSide38::new(gpu, &map, cols))
             .transpose()?;
-        let mut wide = Wide38::new(stream, ub, &card, tier.is_some())?;
+        let mut wide = Wide38::new(stream, ub, route_run, &card, tier.is_some())?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
         if wide_bytes > counted {
             return Err(GpuError::shape(
@@ -2407,6 +2419,14 @@ impl Body38 {
     #[must_use]
     pub fn ubatch_units(&self) -> usize {
         self.wide.walked_units()
+    }
+
+    /// The tokens one run of the ubatch walk's card route takes
+    /// (`place::card_route_run`); `None` on a load whose slot map puts no
+    /// routed expert on the card. Gate use.
+    #[must_use]
+    pub fn card_route_run(&self) -> Option<usize> {
+        self.wide.card.as_ref().map(|c| c.run)
     }
 
     /// Whether a returning prompt call ([`super::wide38`]'s module doc) runs

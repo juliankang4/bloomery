@@ -15,9 +15,11 @@
 //! - the router the ubatch instance of the 512-expert router, in runs of
 //!   [`ROUTE_ROWS`] tokens, bit for bit the fused launch for each token;
 //! - the routed experts the slot map puts on the card, on a layer with card
-//!   experts, the card route ([`CardRoute38`]): per [`ROUTE_ROWS`] run, in
-//!   the shadow after the front's download, the compressed ids and the
-//!   places from the walk's ids, the remapped route table, the gate and up
+//!   experts, the card route ([`CardRoute38`]): per run of [`ROUTE_ROWS`]
+//!   tokens, or of the whole unit on a plan that gave the route that run
+//!   (`place::card_route_run`), in the shadow after the front's download,
+//!   the compressed ids and the places from the walk's ids, the remapped
+//!   route table, the gate and up
 //!   GEMMs the kernel table names for the layer's type
 //!   (`crate::card_leg::StackW::route`: Q4_K, Q5_K, IQ3_XXS or IQ4_XS over
 //!   the run's q8_1 rows; NVFP4's planes over its 32-value rows), the card
@@ -673,10 +675,10 @@ impl WideForce {
 }
 
 /// The ubatch walk's card route: the routed experts the slot map puts on the
-/// card, through the grouped GEMMs, in runs of [`ROUTE_ROWS`] tokens (the
-/// walk's module doc). Holds its own buffers for one run of `run`
-/// (`min(walk rows, ROUTE_ROWS)`) tokens and the walk-wide card sum; the
-/// stacks are the leg's ([`Card38`]'s), read through [`Card38::stacks`], and
+/// card, through the grouped GEMMs, in runs of the plan's run (the walk's
+/// module doc). Holds its own buffers for one run of `run` tokens and the
+/// walk-wide card sum; the stacks are the leg's ([`Card38`]'s), read through
+/// [`Card38::stacks`], and
 /// the route tables are one per distinct card count (the placement's spread
 /// keeps every eligible layer's count within one, so a plan of this program
 /// holds at most two).
@@ -687,7 +689,8 @@ impl WideForce {
 /// the one stream and the host tier would start serving late by their whole
 /// time, turning the layer's max(host, card) into a sum.
 pub(super) struct CardRoute38 {
-    run: usize,
+    /// The tokens one run takes (`place::card_route_run`).
+    pub(super) run: usize,
     /// The compressed routed ids, ten a run token: the places launch over
     /// the walk's ids (a pitch of eleven) with an identity map, whose bytes
     /// are the remapped route's input.
@@ -902,19 +905,19 @@ fn enqueue_gemm_batch(
 
 impl CardRoute38 {
     /// The route's buffers for ubatches of up to `rows` tokens over `card`'s
-    /// card experts: a run of `min(rows, ROUTE_ROWS)` tokens, the sums a
-    /// token of the whole unit, and one route table per distinct card count
+    /// card experts: a run of `run` tokens (`place::card_route_run`: at most
+    /// `rows`, and its slots one route table's), the sums a token of the
+    /// whole unit, and one route table per distinct card count
     /// (refused by name past two, naming them); `tiered`, a load with an
     /// expert tier, the places and the down rows a token of the whole unit
     /// and the unit's tier places beside them
     /// (`place::card_tier_join_bytes`). Load-time only.
     pub(super) fn new(
         stream: &CudaStream,
-        rows: usize,
+        (rows, run): (usize, usize),
         card: &Card38,
         tiered: bool,
     ) -> Result<CardRoute38, GpuError> {
-        let run = rows.min(ROUTE_ROWS);
         let counts = card.card_counts();
         if counts.len() > 2 {
             return Err(GpuError::shape(
@@ -1457,14 +1460,16 @@ pub(super) struct Wide38 {
 
 impl Wide38 {
     /// The walk's own buffers for units of up to `rows` rows over `card`'s
-    /// card experts: the card route's buffers beside them when a layer has
-    /// card experts, made for an expert tier's join when `tiered`; the walks
+    /// card experts: the card route's buffers for runs of `route_run` tokens
+    /// beside them when a layer has card experts, made for an expert tier's
+    /// join when `tiered`; the walks
     /// cut by the width rule on a load with no expert tier, as one unit on
     /// one with it ([`Wide38::paged`] for an NVMe-paged plan). Load-time
     /// only.
     pub(super) fn new(
         stream: &CudaStream,
         rows: usize,
+        route_run: usize,
         card: &Card38,
         tiered: bool,
     ) -> Result<Wide38, GpuError> {
@@ -1472,7 +1477,7 @@ impl Wide38 {
             .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
         let slots = geo::N_USED + 1;
         let card = (card.card_layers() > 0)
-            .then(|| CardRoute38::new(stream, rows, card, tiered))
+            .then(|| CardRoute38::new(stream, (rows, route_run), card, tiered))
             .transpose()?;
         let mut dense = vec![GemmRoute::new(stream, rows, 1)?];
         if rows >= 2 {

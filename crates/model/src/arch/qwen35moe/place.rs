@@ -58,8 +58,9 @@ use crate::placement::workstation::{
     TierBatchBytes, tier_batch_host_bytes, tier_batch_staging_bytes,
 };
 use crate::placement::{
-    self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Node,
-    PlacementError, Plan, PlanLevers, RoutedRule, Unimplemented, Violation, checked, joined,
+    self, Card, CardFormat, Device, ExpertList, Format, Host, KvBytes, Machine, ModelTensor,
+    ModelTensors, Node, PlacementError, Plan, PlanLevers, RoutedRule, Unimplemented, Violation,
+    checked, joined,
 };
 use gguf::digest::hex;
 
@@ -264,6 +265,19 @@ pub enum PlaceError {
         card: String,
         got: Vec<u64>,
         want: Option<u64>,
+    },
+    /// The stage card's reserve for the card route's run of the whole
+    /// ubatch ([`ROUTE_UNIT_RESERVE`]) is not the one a load of ubatches of
+    /// up to `u` positions reads ([`card_route_run`]).
+    #[error(
+        "card {card} reserves {got:?} B as \"{ROUTE_UNIT_RESERVE}\"; a load of ubatches of up to \
+         {u} positions reads no such row or one of {want} B"
+    )]
+    RouteUnitReserve {
+        card: String,
+        got: Vec<u64>,
+        u: u64,
+        want: u64,
     },
     /// A plan of no resident sequence slot.
     #[error("{slots} resident sequence slots: a plan serves at least one")]
@@ -972,6 +986,28 @@ impl PlanInputs {
             arena_bytes: arena,
         })
     }
+
+    /// The target's plan of `slots` resident sequences on `machine` at
+    /// `ctx_max` positions under `levers` and `experts`:
+    /// [`PlanInputs::plan_with_slots`], or with the MTP draft `mtp` beside it
+    /// [`PlanInputs::plan_mtp_with_slots`]'s target plan. Refused as they
+    /// refuse.
+    pub fn plan_target<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        experts: Experts,
+        mtp: Option<&'a MtpInputs>,
+        slots: usize,
+    ) -> Result<Plan<'a>, PlaceError> {
+        match mtp {
+            None => self.plan_with_slots(machine, ctx_max, levers, experts, slots),
+            Some(mi) => Ok(self
+                .plan_mtp_with_slots(machine, ctx_max, levers, mi, experts, slots)?
+                .plan),
+        }
+    }
 }
 
 /// A draft plan's card terms: its granules (dense, experts, rounding), its
@@ -1131,7 +1167,8 @@ pub const fn card_scratch_bytes(ubatch: u64) -> u64 {
 /// The most tokens one routed run of a ubatch walk's card route takes, and
 /// so the run buffers' width: the walk routes in runs of this many tokens
 /// (`crates/gpu/src/arch/qwen3moe/scratch38.rs`'s `ROUTE_ROWS`, restated
-/// here — the model crate does not read the gpu crate).
+/// here — the model crate does not read the gpu crate), unless the plan
+/// widened the run to the whole ubatch ([`widen_card_route`]).
 pub const CARD_ROUTE_ROWS: u64 = 2_048;
 
 /// Card bytes a ubatch walk's card route holds a run token, an upper bound
@@ -1171,9 +1208,9 @@ pub const fn card_route_scratch_bytes(u: u64) -> u64 {
 /// of up to `u` positions [derived: a tier layer's join sums the card's and
 /// the tier's slots in slot order after the host's wait, so the route keeps
 /// its card slots' down rows and places for the whole unit, not one run —
-/// (u − min(u, CARD_ROUTE_ROWS)) tokens more of 10 · 2,560 · 4 + 10 · 4 =
-/// 102,440 B — and the unit's tier places and their ranks among the tier
-/// slots, 2 · 10 · 4 = 80 B a token].
+/// (u − min(u, CARD_ROUTE_ROWS)) tokens more of [`JOIN_TOKEN_BYTES`] — and
+/// the unit's tier places and their ranks among the tier slots,
+/// 2 · 10 · 4 = 80 B a token].
 #[must_use]
 pub const fn card_tier_join_bytes(u: u64) -> u64 {
     let run = if u < CARD_ROUTE_ROWS {
@@ -1181,7 +1218,120 @@ pub const fn card_tier_join_bytes(u: u64) -> u64 {
     } else {
         CARD_ROUTE_ROWS
     };
-    (u - run) * 102_440 + u * 80
+    (u - run) * JOIN_TOKEN_BYTES + u * 80
+}
+
+/// Card bytes a tier layer's join keeps a token of the unit past the card
+/// route's run: its card slots' down rows and places [derived:
+/// 10 · 2,560 · 4 + 10 · 4], which a run holds a run token too
+/// ([`CARD_ROUTE_RUN_TOKEN_BYTES`]).
+const JOIN_TOKEN_BYTES: u64 = 102_440;
+
+/// What a stage card's reserve for its card route's run of the whole
+/// ubatch is called ([`widen_card_route`]): the bytes that run holds past
+/// the runs of [`CARD_ROUTE_ROWS`] tokens the card's scratch counts
+/// ([`route_unit_bytes`]). A load reads its run from it
+/// ([`card_route_run`]).
+const ROUTE_UNIT_RESERVE: &str = "card route's whole-ubatch run";
+
+/// The card bytes the card route's run of a whole ubatch of up to `u`
+/// positions holds past its runs of [`CARD_ROUTE_ROWS`] tokens: the
+/// `u − min(u, CARD_ROUTE_ROWS)` run tokens more
+/// ([`CARD_ROUTE_RUN_TOKEN_BYTES`]), less on a load with an expert tier
+/// (`tiered`) the down rows and places the join already keeps for them
+/// ([`card_tier_join_bytes`]). 0 for a ubatch of one such run; saturated
+/// past u64 bytes, which no card holds.
+#[must_use]
+const fn route_unit_bytes(u: u64, tiered: bool) -> u64 {
+    let past = u.saturating_sub(CARD_ROUTE_ROWS);
+    let token = if tiered {
+        CARD_ROUTE_RUN_TOKEN_BYTES - JOIN_TOKEN_BYTES
+    } else {
+        CARD_ROUTE_RUN_TOKEN_BYTES
+    };
+    past.saturating_mul(token)
+}
+
+/// Where a plan puts each tensor: each row's pieces as their device,
+/// format and experts ([`placement::Segment`]), in the plan's row order.
+pub type TensorPlaces = Vec<Vec<(Device, Format, Option<ExpertList>)>>;
+
+/// [`TensorPlaces`] of `plan`.
+#[must_use]
+pub fn tensor_places(plan: &Plan<'_>) -> TensorPlaces {
+    plan.rows
+        .iter()
+        .map(|r| {
+            r.segments
+                .iter()
+                .map(|s| (s.device, s.format, s.experts.clone()))
+                .collect()
+        })
+        .collect()
+}
+
+/// `machine`, a qwen4exp machine for ubatches of up to `ubatch` positions
+/// ([`machine_for_experts`], [`machine_bp_on`]) whose card route runs in
+/// runs of [`CARD_ROUTE_ROWS`] tokens, with that run widened to the whole
+/// ubatch when nothing the plan places moves for it: its stage card then
+/// reserves [`route_unit_bytes`] as [`ROUTE_UNIT_RESERVE`], and a ubatch
+/// walk reads each card expert's weights once instead of once a run.
+/// `plan` is the caller's plan of a machine ([`PlanInputs::plan_target`]),
+/// as where it puts each tensor ([`tensor_places`]): the run is widened
+/// when the stage card holds a routed expert and the plan of the widened
+/// machine places every tensor where the plan of `machine` does, so the
+/// wider run takes only room no expert, table or tier would use (on a
+/// unified pool the host's room shrinks with the card's reserves). The
+/// reserve is the one difference between the two machines, so a plan of the
+/// widened one that fails is the reserve not fitting, and keeps the runs.
+/// Refused as `plan` refuses `machine`.
+pub fn widen_card_route(
+    mut machine: Machine,
+    ubatch: u64,
+    plan: impl Fn(&Machine) -> Result<TensorPlaces, PlaceError>,
+) -> Result<Machine, PlaceError> {
+    let held = plan(&machine)?;
+    let bytes = route_unit_bytes(ubatch, !machine.tiers.is_empty());
+    let stage_expert = held.iter().flatten().any(|(device, _, experts)| {
+        *device == Device::Card(0) && experts.as_ref().is_some_and(|e| !e.is_empty())
+    });
+    if bytes == 0 || !stage_expert {
+        return Ok(machine);
+    }
+    let Some(stage) = machine.cards.first_mut() else {
+        return Ok(machine);
+    };
+    stage.reserves.push((ROUTE_UNIT_RESERVE.to_string(), bytes));
+    if !plan(&machine).is_ok_and(|wide| wide == held) {
+        machine.cards[0].reserves.pop();
+    }
+    Ok(machine)
+}
+
+/// The tokens one run of a load's card route takes at ubatches of up to `u`
+/// positions on `card`, the stage card of its plan's machine (`tiered`, a
+/// machine with an expert tier), and the card bytes its ubatch walk may hold
+/// past the m = 1 scratch: the whole ubatch with the run's reserve beside
+/// [`workstation::counted_arena_bytes`] on a card that holds
+/// [`ROUTE_UNIT_RESERVE`] ([`widen_card_route`]), else at most
+/// [`CARD_ROUTE_ROWS`] and the counted bytes alone. Refused by name: more
+/// than one such reserve, or one of other than [`route_unit_bytes`]'s
+/// bytes (none for a ubatch of one run).
+pub fn card_route_run(card: &Card, u: u64, tiered: bool) -> Result<(u64, u64), PlaceError> {
+    let counted = workstation::counted_arena_bytes(card);
+    let got = reserve_rows(card, ROUTE_UNIT_RESERVE);
+    let want = route_unit_bytes(u, tiered);
+    match *got.as_slice() {
+        [] => return Ok((u.min(CARD_ROUTE_ROWS), counted)),
+        [b] if b == want && want > 0 => return Ok((u, counted.saturating_add(b))),
+        _ => {}
+    }
+    Err(PlaceError::RouteUnitReserve {
+        card: card.name.clone(),
+        got,
+        u,
+        want,
+    })
 }
 
 /// Tier-card bytes a run token of the tier's block route holds
@@ -1362,17 +1512,21 @@ pub fn machine_bp_on(
     m
 }
 
+/// The bytes of each of `card`'s reserves named `name`, in order.
+fn reserve_rows(card: &Card, name: &str) -> Vec<u64> {
+    card.reserves
+        .iter()
+        .filter(|(n, _)| n == name)
+        .map(|&(_, b)| b)
+        .collect()
+}
+
 /// The stage cards' [`MTP_RESERVE`] rows against `want`: none for `None`,
 /// exactly one of `want` bytes on the one stage card for `Some`; anything
 /// else is refused by name ([`PlaceError::DraftReserve`]).
 fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), PlaceError> {
     for (i, card) in machine.cards.iter().enumerate() {
-        let got: Vec<u64> = card
-            .reserves
-            .iter()
-            .filter(|(name, _)| name == MTP_RESERVE)
-            .map(|&(_, b)| b)
-            .collect();
+        let got = reserve_rows(card, MTP_RESERVE);
         let ok = match want {
             Some(b) if i == 0 => got == [b],
             _ => got.is_empty(),
@@ -3214,8 +3368,9 @@ mod tests {
         use models::{Arch, ChatSpec, ModelSpec};
 
         use super::super::{
-            Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, draft_card_bytes,
-            machine_bp, slot_resident_bytes, tier_batch_of,
+            Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, ROUTE_UNIT_RESERVE,
+            card_route_run, draft_card_bytes, machine_bp, route_unit_bytes, slot_resident_bytes,
+            tensor_places, tier_batch_of, widen_card_route,
         };
         use super::mtp::{draft, file};
         use crate::arch::qwen35moe::hparams::{
@@ -3457,8 +3612,11 @@ mod tests {
 
         /// At 1, 2 and 4 slots, the plain plan and the drafted plan's target
         /// and draft are the plans of each layer's bytes times the slots and
-        /// the bytes beside the stores times the slots past the first; and
-        /// each plan's kv classes are `SeqTerms::plan_kv` of the slots.
+        /// the bytes beside the stores times the slots past the first, the
+        /// target plan without and with the draft
+        /// ([`PlanInputs::plan_target`]) being the plain plan and the
+        /// drafted plan's target; and each plan's kv classes are
+        /// `SeqTerms::plan_kv` of the slots.
         #[test]
         fn slot_plans_count_every_term_per_slot() {
             let (inputs, machine) = (inputs(), machine());
@@ -3472,6 +3630,10 @@ mod tests {
                     .expect("the plan");
                 let want = target(&inputs, &machine, slots, 0);
                 assert_eq!(view(&plain), view(&want), "{n} slots");
+                let got = inputs
+                    .plan_target(&machine, CTX, &levers, Experts::Host, None, n)
+                    .expect("the target plan");
+                assert_eq!(view(&got), view(&want), "{n} slots: the target plan");
                 assert_eq!(
                     plain.cards[0].kv_bytes,
                     inputs.seq_terms(None).plan_kv(CTX, slots),
@@ -3485,6 +3647,14 @@ mod tests {
                 let mut want = target(&inputs, &machine, slots, reserve);
                 want.host.arena_columns = columns;
                 assert_eq!(view(&drafted.plan), view(&want), "{n} slots");
+                let got = inputs
+                    .plan_target(&machine, CTX, &levers, Experts::Host, Some(&mtp), n)
+                    .expect("the drafted target plan");
+                assert_eq!(
+                    view(&got),
+                    view(&want),
+                    "{n} slots: the drafted target plan"
+                );
                 assert_eq!(
                     drafted.plan.cards[0].kv_bytes + drafted.draft.cards[0].kv_bytes,
                     inputs.seq_terms(Some(&mtp)).plan_kv(CTX, slots),
@@ -4001,6 +4171,141 @@ mod tests {
                 }
                 other => panic!("want the draft reserve refused: {:?}", other.err()),
             }
+        }
+
+        /// The card route's run over the synthetic file's routed stacks
+        /// ([`routed`]: 35,389,440 B an expert): on a card that holds every
+        /// expert the plan widens it to a ubatch of 4,096 positions,
+        /// reserving 2,048 run tokens more of 170,360 B, which a load reads
+        /// back as its run and arena bytes; on a 40 GiB card the experts
+        /// fill, that reserve would take experts, so the card keeps runs of
+        /// 2,048 tokens, as do a host-routed plan and a ubatch of one run. On
+        /// one pool the card's reserves take the host's room too: at the
+        /// least room that keeps a 1 GiB PLE table on the host with every
+        /// expert on the card, the reserve would page the table from the
+        /// NVMe tier, so the card keeps its runs; a run's bytes more room
+        /// widens it. A load refuses by name a reserve of other bytes (a
+        /// tiered load's run holds 2,048 · (170,360 − 102,440) B more, the
+        /// join keeping the down rows and places), two of them, or one beside
+        /// a ubatch of one run, even of 0 B.
+        #[test]
+        fn the_card_route_runs_the_whole_ubatch_where_nothing_moves_for_it() {
+            let inputs = routed(inputs());
+            let levers = PlanLevers::default();
+            let widen_by = |inputs: &PlanInputs, machine: Machine, ub: u64, experts: Experts| {
+                widen_card_route(machine, ub, |m| {
+                    inputs
+                        .plan_with(m, CTX, &levers, experts)
+                        .map(|p| tensor_places(&p))
+                })
+                .expect("the plan")
+            };
+            let widen = |machine: Machine, ub: u64, experts: Experts| {
+                widen_by(&inputs, machine, ub, experts)
+            };
+            let unit = route_unit_bytes(4096, false);
+            assert_eq!(
+                (unit, route_unit_bytes(4096, true)),
+                (348_897_280, 139_100_160)
+            );
+            let whole = widen(machine(), 4096, Experts::Card);
+            assert_eq!(
+                whole.cards[0].reserves,
+                vec![(ROUTE_UNIT_RESERVE.to_string(), unit)]
+            );
+            let plan = inputs
+                .plan_with(&whole, CTX, &levers, Experts::Card)
+                .expect("the widened plan");
+            assert_eq!(plan.n_l, vec![512; LAYERS]);
+            assert_eq!(
+                card_route_run(&whole.cards[0], 4096, false).expect("the run"),
+                (4096, unit)
+            );
+            let mut filled = machine();
+            filled.cards[0].usable_bytes = 40 << 30;
+            let n_l = inputs
+                .plan_with(&filled, CTX, &levers, Experts::Card)
+                .expect("the plan")
+                .n_l;
+            assert!(n_l.iter().all(|&n| 0 < n && n < 512), "{n_l:?}");
+            for (m, ub, experts) in [
+                (filled, 4096, Experts::Card),
+                (machine(), 4096, Experts::Host),
+                (machine(), 2048, Experts::Card),
+            ] {
+                let kept = widen(m, ub, experts);
+                assert!(kept.cards[0].reserves.is_empty(), "{ub} {experts:?}");
+                assert_eq!(
+                    card_route_run(&kept.cards[0], ub, false).expect("the run"),
+                    (2048, 0)
+                );
+            }
+            let mut tabled = routed(self::inputs());
+            tabled.model.tensors.push(ModelTensor {
+                name: "blk.1.ple.table.weight".into(),
+                shard: 0,
+                layer: Some(1),
+                role: Role::EngramTable,
+                ty: GgmlType::F32,
+                dims: vec![256, 1 << 20],
+                file_bytes: 1 << 30,
+                gathered_rows: Some(3),
+            });
+            let pool: u64 = 1 << 40;
+            let mut pooled = machine();
+            pooled.cards[0].free_bytes = Some(pool);
+            *pooled.host_mut() = Host {
+                usable_bytes: pool,
+                reserves: Vec::new(),
+            };
+            *pooled.unified_mut() = Some(UnifiedPool { bytes: pool });
+            let table_on_host = |inputs: &PlanInputs, m: &Machine| {
+                inputs
+                    .plan_with(m, CTX, &levers, Experts::Card)
+                    .is_ok_and(|p| {
+                        p.n_l == vec![512; LAYERS]
+                            && p.row_tier().ok() == Some(Some(placement::Device::Host))
+                    })
+            };
+            let (mut lo, mut hi) = (0, pool);
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                tabled.room = (mid, HostRead::Given);
+                if table_on_host(&tabled, &pooled) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            tabled.room = (hi, HostRead::Given);
+            assert!(table_on_host(&tabled, &pooled), "the least room: {hi} B");
+            let kept = widen_by(&tabled, pooled.clone(), 4096, Experts::Card);
+            assert!(kept.cards[0].reserves.is_empty(), "{hi} B of room");
+            tabled.room = (hi + unit, HostRead::Given);
+            let wide = widen_by(&tabled, pooled, 4096, Experts::Card);
+            assert_eq!(
+                wide.cards[0].reserves,
+                vec![(ROUTE_UNIT_RESERVE.to_string(), unit)]
+            );
+            assert!(table_on_host(&tabled, &wide), "{} B of room", hi + unit);
+            let refused = |rows: Vec<u64>, ub: u64, tiered: bool| {
+                let mut card = whole.cards[0].clone();
+                card.reserves = rows
+                    .iter()
+                    .map(|&b| (ROUTE_UNIT_RESERVE.to_string(), b))
+                    .collect();
+                match card_route_run(&card, ub, tiered) {
+                    Err(PlaceError::RouteUnitReserve { got, u, want, .. }) => {
+                        assert_eq!((got, u, want), (rows, ub, route_unit_bytes(ub, tiered)));
+                    }
+                    other => panic!("{rows:?} at {ub}: not refused: {other:?}"),
+                }
+            };
+            refused(vec![unit], 4096, true);
+            refused(vec![unit + 1], 4096, false);
+            refused(vec![unit, unit], 4096, false);
+            refused(vec![unit], 2048, false);
+            refused(vec![0], 2048, false);
         }
     }
 

@@ -399,7 +399,8 @@ use gguf::Split;
 use model::arch::models::Mixer;
 use model::arch::qwen35moe::head_list::{HeadPick, head_rows_of};
 use model::arch::qwen35moe::place::{
-    Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx, tier_batch,
+    Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx, tensor_places,
+    tier_batch, widen_card_route,
 };
 use model::placement::churn::ChurnPool;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
@@ -602,12 +603,15 @@ impl Place38 {
     /// ([`POINT_ROWS_RESERVE`], one row a point, [`point_row_budget38`]), which the plan's host need, the NVMe tier's
     /// floor and its arena then count. The stage card carries the side model's reserve, the
     /// image encoder's when its tower sits there and, on a media load, a rotation table of `ctx`
-    /// rows for every slot ([`vision_seat::TABLES_RESERVE`]).
+    /// rows for every slot ([`vision_seat::TABLES_RESERVE`]). Its card route runs the whole
+    /// ubatch at once when the plan under `levers` keeps every card expert by it
+    /// ([`widen_card_route`]).
     fn machine(
         self,
         inputs: &PlanInputs,
         (ctx, ub): (u64, u64),
         experts: Experts,
+        levers: &PlanLevers,
         mtp: Option<&MtpInputs>,
         slots: usize,
     ) -> Result<Machine, GateError> {
@@ -641,7 +645,11 @@ impl Place38 {
                 .reserves
                 .push((POINT_ROWS_RESERVE.to_owned(), pinned(slots, bytes)));
         }
-        Ok(machine)
+        Ok(widen_card_route(machine, ub, |m| {
+            inputs
+                .plan_target(m, ctx, levers, experts, mtp, slots)
+                .map(|p| tensor_places(&p))
+        })?)
     }
 }
 
@@ -981,7 +989,7 @@ fn residency38_at(
 /// The plans the seat can load, by context: the file's inputs at `place`
 /// under the expert rule, the placement levers and the draft, every
 /// per-sequence term counted `slots` times
-/// ([`PlanInputs::plan_with_slots`]).
+/// ([`PlanInputs::plan_target`]).
 struct Plans<'a> {
     inputs: &'a PlanInputs,
     place: Place38,
@@ -1005,30 +1013,18 @@ impl Plans<'_> {
             self.inputs,
             (ctx, u64::try_from(ub)?),
             self.experts,
+            self.levers,
             self.mtp,
             self.slots,
         )?;
-        match self.mtp {
-            None => {
-                self.inputs.plan_with_slots(
-                    &machine,
-                    ctx,
-                    self.levers,
-                    self.experts,
-                    self.slots,
-                )?;
-            }
-            Some(mi) => {
-                self.inputs.plan_mtp_with_slots(
-                    &machine,
-                    ctx,
-                    self.levers,
-                    mi,
-                    self.experts,
-                    self.slots,
-                )?;
-            }
-        }
+        self.inputs.plan_target(
+            &machine,
+            ctx,
+            self.levers,
+            self.experts,
+            self.mtp,
+            self.slots,
+        )?;
         Ok(())
     }
 
@@ -1053,20 +1049,18 @@ impl Plans<'_> {
             self.inputs,
             (c, u64::try_from(ub)?),
             self.experts,
+            self.levers,
             self.mtp,
             self.slots,
         )?;
-        let plan = match self.mtp {
-            None => {
-                self.inputs
-                    .plan_with_slots(&machine, c, self.levers, self.experts, self.slots)?
-            }
-            Some(mi) => {
-                self.inputs
-                    .plan_mtp_with_slots(&machine, c, self.levers, mi, self.experts, self.slots)?
-                    .plan
-            }
-        };
+        let plan = self.inputs.plan_target(
+            &machine,
+            c,
+            self.levers,
+            self.experts,
+            self.mtp,
+            self.slots,
+        )?;
         let lever = match set {
             Some((r, word)) => Lever38::Set(r, word),
             None => Lever38::Unset(residency38_unset(self.feed.residency_at(self.place))),
@@ -1537,7 +1531,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         let ctx = ctx38(&plans, a.ctx)?.ctx;
         let at = u64::try_from(ctx)?;
         let ub = u64::try_from(ubatch_for(ctx)?)?;
-        let machine = place.machine(&inputs, (at, ub), experts, None, slots)?;
+        let machine = place.machine(&inputs, (at, ub), experts, &plan_levers, None, slots)?;
         let plan = inputs.plan_with_slots(&machine, at, &plan_levers, experts, slots)?;
         Ok(vision_seat::Cost::of(&plan, at))
     })?;
@@ -1744,6 +1738,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &inputs,
         (u64::try_from(ctx)?, u64::try_from(ub)?),
         experts,
+        &plan_levers,
         mtp_inputs.as_ref(),
         slots,
     )?;
@@ -2148,7 +2143,9 @@ impl Q38 {
         let opened: Duration;
         let mut m = match a.mtp {
             false => {
-                let machine = a.place.machine(&inputs, ctx_ub, a.experts, None, a.slots)?;
+                let machine =
+                    a.place
+                        .machine(&inputs, ctx_ub, a.experts, &a.plan_levers, None, a.slots)?;
                 check_reserve(&machine, a.slots, ckpt)?;
                 let plan = inputs.plan_with_slots(
                     &machine,
@@ -2178,9 +2175,14 @@ impl Q38 {
                     .ok_or("a drafted load with no head picked")?;
                 let draft = open_draft(&a.draft_path, a.draft_from)?;
                 let mtp = MtpInputs::read(&draft, model.header(), &inputs, head.rows.clone())?;
-                let machine = a
-                    .place
-                    .machine(&inputs, ctx_ub, a.experts, Some(&mtp), a.slots)?;
+                let machine = a.place.machine(
+                    &inputs,
+                    ctx_ub,
+                    a.experts,
+                    &a.plan_levers,
+                    Some(&mtp),
+                    a.slots,
+                )?;
                 check_reserve(&machine, a.slots, ckpt)?;
                 let plan = inputs.plan_mtp_with_slots(
                     &machine,

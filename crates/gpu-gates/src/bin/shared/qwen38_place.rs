@@ -77,7 +77,7 @@ pub fn machine_bp38(
 /// the load declares (`residency38::reserve_checkpoints` at `ctx`, as the
 /// load's own machine does) — the unset rule's `tier_of`. The machine and
 /// the plan are the loads' own ([`machine_bp38`],
-/// `PlanInputs::plan_with_slots`/`plan_mtp_with_slots`); a plan that refuses
+/// `PlanInputs::plan_target`); a plan that refuses
 /// (a host expert rule on a tier machine, an idle tier card, a context past
 /// the card's, a host room under the NVMe tier's floor) is the caller's
 /// error, which `Place::choose` answers with `a`. The stage card takes `held`'s named
@@ -101,14 +101,7 @@ pub fn tier_experts(
     )?;
     beside::reserve_on(&mut machine, held);
     reserve_checkpoints(&mut machine, seqs, ctx)?;
-    let plan = match mtp {
-        None => inputs.plan_with_slots(&machine, ctx, levers, experts, slots)?,
-        Some(mi) => {
-            inputs
-                .plan_mtp_with_slots(&machine, ctx, levers, mi, experts, slots)?
-                .plan
-        }
-    };
+    let plan = inputs.plan_target(&machine, ctx, levers, experts, mtp, slots)?;
     Ok(plan.tier_n_l.iter().flatten().sum())
 }
 

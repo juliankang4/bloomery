@@ -115,8 +115,8 @@ pub fn ubatch_for(ctx: usize) -> Result<usize, GpuError> {
 }
 
 // The default ubatch at nine slots a token (eight routed experts and the
-// shared one) fills one GEMM route.
-const _: () = assert!(UBATCH * 9 == GEMM_MAX_SLOTS);
+// shared one) fits one GEMM route.
+const _: () = assert!(UBATCH * 9 <= GEMM_MAX_SLOTS);
 
 /// The GEMM's type for a qwen3moe projection, a K-quant (the qwen3moe load
 /// admits no other); another type is refused by name.

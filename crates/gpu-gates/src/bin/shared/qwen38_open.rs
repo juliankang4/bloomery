@@ -1,5 +1,6 @@
 //! The plan-then-open of a Qwen3.8 (`qwen4exp`) gate's load: the file described, the host's room
-//! read or given, the machine for where the routed experts sit, the plan for the resident slots
+//! read or given, the machine for where the routed experts sit (its card route's run widened to
+//! the whole ubatch when the plan keeps every card expert by it), the plan for the resident slots
 //! ([`Open38::plan`]), then the body opened by it and its steps captured as graphs
 //! ([`Planned38::open`]). What a gate prints of the plan and of the load stays in the gate: it
 //! prints [`PlanFacts`] between the two calls, where the load's own lines to stderr follow it, and
@@ -17,7 +18,10 @@ use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
 use bloomery_levers::HostCfg;
 use gguf::Split;
-use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
+use model::arch::qwen35moe::place::{
+    Experts, PlaceError, PlanInputs, card_route_run, machine_for_experts, tensor_places,
+    widen_card_route,
+};
 use model::placement::workstation::{CardSpec, HostNeed, HostRead};
 use model::placement::{Device, Machine, Plan, PlanLevers};
 
@@ -77,6 +81,8 @@ pub struct PlanFacts {
     pub row_reserve_bytes: u64,
     /// What the plan asks of the host's available bytes, with nothing held beside the host set.
     pub host_need: HostNeed,
+    /// The tokens one run of the load's card route takes ([`card_route_run`]).
+    pub route_run: u64,
 }
 
 /// A load made: the model, in graph step mode, and the plan facts it was made by.
@@ -106,12 +112,12 @@ impl<'a> Open38<'a> {
         if let Some(r) = self.room {
             inputs.room = (r, HostRead::Given);
         }
-        let machine = machine_for_experts(
-            self.card,
-            inputs.spec.layers.len(),
-            u64::try_from(self.ub)?,
-            self.experts,
-        );
+        let ub = u64::try_from(self.ub)?;
+        let machine = widen_card_route(
+            machine_for_experts(self.card, inputs.spec.layers.len(), ub, self.experts),
+            ub,
+            |m| self.plan_of(&inputs, m).map(|p| tensor_places(&p)),
+        )?;
         let plan = self.plan_of(&inputs, &machine)?;
         let facts = PlanFacts {
             ctx_max: plan.ctx_max,
@@ -123,6 +129,7 @@ impl<'a> Open38<'a> {
             room: inputs.room.clone(),
             row_reserve_bytes: plan.host.row_reserve_bytes,
             host_need: HostNeed::of(&plan, 0),
+            route_run: card_route_run(&machine.cards[0], ub, !machine.tiers.is_empty())?.0,
         };
         drop(plan);
         Ok(Planned38 {
@@ -139,14 +146,14 @@ impl<'a> Open38<'a> {
         &self,
         inputs: &'p PlanInputs,
         machine: &'p Machine,
-    ) -> Result<Plan<'p>, GateError> {
-        Ok(inputs.plan_with_slots(
+    ) -> Result<Plan<'p>, PlaceError> {
+        inputs.plan_with_slots(
             machine,
             self.ctx as u64,
             self.plan_levers,
             self.experts,
             self.slots,
-        )?)
+        )
     }
 }
 

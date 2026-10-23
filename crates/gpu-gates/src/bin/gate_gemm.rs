@@ -21,8 +21,8 @@
 //! of 640 rows, K 2560, top-10, every slot its token's column; the blocks
 //! cycled from the ref-synth dump) and an IQ3_XXS stack of 400 rows an
 //! expert, each under the four routings — at T ∈ {1, 15, 16, 17, 64, 511,
-//! 512, 3686} for the top-10 cases, ten slots a token capping the route
-//! table at 36,864 slots — with the same checks, the T = 1 outputs against
+//! 512, 4096} for the top-10 cases, the card route's run of a whole ubatch
+//! at the route table's 40,960-slot cap — with the same checks, the T = 1 outputs against
 //! the i-quant row cores (`iq3_xxs_rows`, `iq4_xs_rows`) over the repacked
 //! stack as a diagnostic, a NaN `d` super-block's outputs NaN, and
 //! `from_ggml`'s acceptance of the two types beside its refusal of IQ2_XS.
@@ -88,8 +88,9 @@
 //! ∈ {1, 17, 512, 1000, 4095, 4096} tokens under the four routings, on a
 //! Qwen3 stack's shape (128 experts, top-8: up to 32,768 slots), a Qwen3.6
 //! one's (257 experts — the shared expert joined as the last — and nine
-//! slots a token: up to 36,864 slots, the route's cap, in 31 chunks) and a
-//! V4.1 one's (384 experts, top-6), and the dense table (`enqueue_route_dense`)
+//! slots a token: up to 36,864 slots in 31 chunks), a Qwen3.8 card route's
+//! (512 experts, ten slots a token: up to 40,960 slots, the route's cap, in
+//! 16 chunks) and a V4.1 one's (384 experts, top-6), and the dense table (`enqueue_route_dense`)
 //! at the same counts: the slot list and the tiles bit for bit the host's
 //! stable grouping — experts ascending, each expert's slots ascending, runs
 //! cut into tiles of at most `GEMM_BN`. Then at 32,768 slots: three ids past
@@ -860,7 +861,7 @@ mod gate {
         }
 
         /// [`Self::resident`] for a case whose largest run is `max_slots`
-        /// slots (the Qwen3.8 top-10 cases stop below TOKENS' last count).
+        /// slots.
         fn resident_at(&self, st: &Stack<'_>, max_slots: usize) -> Result<Resident, GateError> {
             let stream = self.gpu.stream();
             let n_rows = st.n_exp * st.rows;
@@ -1216,27 +1217,15 @@ mod gate {
 
     /// Every case: T × routing runs, then the rerun and graph checks.
     fn run_case(dev: &Dev<'_>, st: &Stack<'_>, seed: u64) -> Result<bool, GateError> {
-        run_case_at(dev, st, seed, &TOKENS)
-    }
-
-    /// [`run_case`] at a case's own token counts: ten slots a token (the
-    /// Qwen3.8 gate) would take TOKENS' last count past the route table's
-    /// 36,864-slot cap, so those cases stop at 3686 tokens.
-    fn run_case_at(
-        dev: &Dev<'_>,
-        st: &Stack<'_>,
-        seed: u64,
-        tokens: &[usize],
-    ) -> Result<bool, GateError> {
         if !wanted(&st.name) {
             return Ok(true);
         }
         let t0 = std::time::Instant::now();
         let stream = dev.gpu.stream();
-        let mut res = dev.resident_at(st, tokens[tokens.len() - 1] * st.input.top_k())?;
+        let mut res = dev.resident(st)?;
         let top_k = st.input.top_k();
         let mut ok = true;
-        for &n_tok in tokens {
+        for &n_tok in &TOKENS {
             for (ri, &r) in ROUTINGS.iter().enumerate() {
                 let n_slots = n_tok * top_k;
                 let ids = route_ids(
@@ -1891,6 +1880,7 @@ mod gate {
         for (stack, n_exp, top_k) in [
             ("qwen3", q3.experts(), q3.slots()),
             ("qwen35", q35.logits(), q35.slots()),
+            ("qwen38", 512usize, 10usize),
             ("v41", 384usize, 6usize),
         ] {
             let max_slots = max_tok * top_k;
@@ -2564,10 +2554,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// Token counts of the Qwen3.8 i-quant cases: ten slots a token cap the
-    /// route table at 36,864 slots, so the largest count is 3686 tokens.
-    const Q38_TOKENS: [usize; 8] = [1, 15, 16, 17, 64, 511, 512, 3686];
-
     /// The q8_1 quantizer's Q4_K slot of value-order word `v` (gate_iq's
     /// helper): the i-quant row kernels read their columns in that
     /// permutation.
@@ -2675,7 +2661,7 @@ mod gate {
     /// 64 experts of 640 rows, K 2560, top-10, every slot its token's column,
     /// the blocks cycled from the ref-synth dump — and an IQ3_XXS stack of
     /// 400 rows an expert (a partial 128-row slab). Each runs the four
-    /// routings at [`Q38_TOKENS`] through [`run_case_at`], the T = 1 outputs
+    /// routings at [`TOKENS`] through [`run_case`], the T = 1 outputs
     /// against the i-quant row cores, a NaN `d` super-block's outputs NaN,
     /// `from_ggml`'s acceptance of the two types, and the host API's refusal
     /// of the other i-quant type's stack.
@@ -2716,8 +2702,8 @@ mod gate {
                 k,
                 input: Input::Shared(top_k),
             };
-            let mut res = dev.resident_at(&st, Q38_TOKENS[Q38_TOKENS.len() - 1] * top_k)?;
-            ok &= run_case_at(dev, &st, seed ^ 0x61, &Q38_TOKENS)?;
+            let mut res = dev.resident(&st)?;
+            ok &= run_case(dev, &st, seed ^ 0x61)?;
             let diag = iq_rows_diag(dev, &st, &mut res, seed)?;
             println!("gemm case={name} rows_diag_max_rel_diff_vs_iq_rows={diag:.3e} (diagnostic)");
             ok &= iq_nan_d(dev, &st, seed)?;
@@ -2759,7 +2745,7 @@ mod gate {
                 k,
                 input: Input::Shared(4),
             };
-            ok &= run_case_at(dev, &st, 0x73, &TOKENS)?;
+            ok &= run_case(dev, &st, 0x73)?;
         }
         Ok(ok)
     }
@@ -3117,9 +3103,8 @@ mod gate {
         /// route's shapes (`gate_gemm`'s q38 cases): the routed gate — 64
         /// experts of 640 × 2560, top-10's shape — for IQ3_XXS, IQ3_S and IQ4_XS, and
         /// the routed down — 64 experts of 2560 rows × K 640, each slot its
-        /// own column — for IQ4_NL. Ten slots a token pass the route table's
-        /// 36,864-slot cap at 4096 tokens, so every arm runs 4096 tokens of
-        /// nine slots: the table's cap, the heaviest launch of the shape.
+        /// own column — for IQ4_NL. Every arm runs 4096 tokens of ten slots:
+        /// the route table's cap, the heaviest launch of the shape.
         /// `only` keeps the one arm of that name; the return says whether any
         /// arm ran.
         fn iq_gemm_arms(gpu: &bloomery_gpu::Gpu, only: Option<&str>) -> Result<bool, GateError> {
@@ -3145,7 +3130,7 @@ mod gate {
                     continue;
                 }
                 ran = true;
-                let (n_exp, top_k, rows, k, t) = (64usize, 9usize, 640usize, 2560usize, 4096usize);
+                let (n_exp, top_k, rows, k, t) = (64usize, 10usize, 640usize, 2560usize, 4096usize);
                 let n_rows = n_exp * rows;
                 let w = DeviceTensor::<u32>::upload(
                     stream,
@@ -3201,7 +3186,7 @@ mod gate {
                 }
                 ran = true;
                 let g32 = Gemm32Kernels::load(gpu.context())?;
-                let (n_exp, top_k, rows, k, t) = (64usize, 9usize, 2560usize, 640usize, 4096usize);
+                let (n_exp, top_k, rows, k, t) = (64usize, 10usize, 2560usize, 640usize, 4096usize);
                 let n_rows = n_exp * rows;
                 // 18 bytes a block, 20 blocks: 360 bytes = 90 words a row.
                 let w =

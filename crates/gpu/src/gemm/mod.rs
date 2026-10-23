@@ -77,9 +77,9 @@ pub use kernels::GemmKernels;
 pub use kernels32::Gemm32Kernels;
 pub use route::{GemmRoute, GemmTile};
 
-/// Slots one route and one GEMM take: a 4096-token ubatch at nine slots a
-/// token (eight routed experts and the shared one).
-pub const GEMM_MAX_SLOTS: usize = 36_864;
+/// Slots one route and one GEMM take: a 4096-token ubatch at ten slots a
+/// token (ten routed experts, or nine and the shared one).
+pub const GEMM_MAX_SLOTS: usize = 40_960;
 /// Columns (slots) one tile holds: eight n-tiles of eight.
 pub const GEMM_BN: usize = 64;
 /// Values one step of the 32-value family's K walk covers: two blocks. A
