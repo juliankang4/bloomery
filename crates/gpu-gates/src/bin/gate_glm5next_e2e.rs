@@ -4390,6 +4390,7 @@ mod gate {
 
     /// (h1)'s drafted rounds a slot: (sd)'s first group's passes.
     const H_ROUNDS: usize = SLOT_PASSES;
+    const H_SLOTS: usize = 4;
 
     /// (h2)'s forced kept rows a round, slot 0's and slot 1's: every pair of
     /// one and two rows.
@@ -5105,18 +5106,18 @@ mod gate {
     /// Four drafted windows use legal passes and return the same ids as
     /// each window run independently.
     fn h5_round_limits(s: &mut Session<Body>, prompts: [&[u32]; 2]) -> Result<bool, GateError> {
-        s.add_slots(4)?;
+        s.add_slots(H_SLOTS)?;
         let mut ok = true;
         for mode in [StepMode::Eager, StepMode::Graph] {
             s.model_mut().set_mode(mode);
             let mut expected = Vec::new();
-            for slot in 0..4 {
+            for slot in 0..H_SLOTS {
                 let r = h_solo(s, prompts[slot % prompts.len()], &[None])?;
                 expected.push(r.ids[1..r.ids.len() - 1].to_vec());
             }
             let mut drafts = Vec::new();
             let mut lasts = Vec::new();
-            for slot in 0..4 {
+            for slot in 0..H_SLOTS {
                 let mut d = d_open(s)?;
                 let r = d_start(s, &mut d, slot, prompts[slot % prompts.len()])?;
                 lasts.push(r.last()?);
@@ -5432,23 +5433,33 @@ mod gate {
     fn hostless_open(
         path: &std::path::Path,
         host: bloomery_levers::HostCfg,
+        slots: usize,
         ids: &[u32],
         mode: Option<StepMode>,
     ) -> Result<(bool, Glm5nextModel, PlanInputs), GateError> {
         let file = Split::open(path)?;
         let inputs = PlanInputs::read(&file)?;
-        let machine = slot_machine(&inputs, 1)?;
+        let machine = slot_machine(&inputs, slots)?;
         let plan = inputs.plan_slots(
             &machine,
             SLOT_CTX as u64,
             &PlanLevers::default(),
             KdaLanes::One,
-            1,
+            slots,
         )?;
         if plan.host.experts != 0 || plan.n_l != [288] {
             return Err("hostless: the fixture must hold every routed expert on the card".into());
         }
-        let mut m = Body::open_placed(file, &plan, &inputs, 0, host)?;
+        let mut m = Body::open_placed_slots(
+            file,
+            &plan,
+            &inputs,
+            0,
+            host,
+            Residency::Off,
+            KdaLanes::One,
+            slots,
+        )?;
         let no_views = {
             let (_, _, body) = m.body_parts("hostless")?;
             body.hybrid_mut().host_mut().is_empty()
@@ -5476,6 +5487,7 @@ mod gate {
                 route_trace: true,
                 ..host
             },
+            1,
             ids,
             None,
         )?;
@@ -5511,7 +5523,7 @@ mod gate {
         tier::sc("hostless NVFP4 placed load and generation")?;
         let path = hostless_fixture(GgmlType::NVFP4)?;
         let ids = [1, 2, 3, 4];
-        let (no_views, mut m, inputs) = hostless_open(&path, levers.host(), &ids, None)?;
+        let (no_views, mut m, inputs) = hostless_open(&path, levers.host(), 3, &ids, None)?;
         let mut outputs = Vec::new();
         for mode in [StepMode::Eager, StepMode::Graph] {
             m.reset()?;
@@ -5539,7 +5551,7 @@ mod gate {
             "hostless: nvfp4 no_host_views={no_views} host_memops={host_ops} eager=graph=batch finite logits tokens={token},{next} {}",
             verdict(ok && generated)
         );
-        m.add_slots(4)?;
+        m.add_slots(3)?;
         let rows = [(0, &ids[..1]), (1, &ids[..1]), (2, &ids[..1])];
         let captures = m.capture_slots(&[(0, 1), (1, 1), (2, 1)]);
         let steps = m.step_slots(&rows);
@@ -5586,7 +5598,7 @@ mod gate {
         let eager = Some(StepMode::Eager);
         let mut trace_ok = true;
         for (routed, path) in [(GgmlType::NVFP4, &path), (GgmlType::Q4_K, &q4k)] {
-            let (bare, m, _) = hostless_open(path, levers.host(), &ids, eager)?;
+            let (bare, m, _) = hostless_open(path, levers.host(), 1, &ids, eager)?;
             let want = m.logits()?;
             drop(m);
             let (viewless, m, set) = match traced_open(path, levers.host(), &ids) {
@@ -5718,7 +5730,7 @@ mod gate {
                 nextn,
                 prompts: [a, b],
             };
-            let mut s = Session::from_model(body.open(SLOTS)?, u32::try_from(SLOT_CTX)?);
+            let mut s = Session::from_model(body.open(H_SLOTS)?, u32::try_from(SLOT_CTX)?);
             s.model_mut().set_mode(StepMode::Graph);
             s.add_slots(SLOTS)?;
             let t = Instant::now();
