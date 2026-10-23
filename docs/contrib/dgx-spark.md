@@ -316,9 +316,9 @@ The card runs the tree's `sm_86` PTX through the driver's JIT. `sm_121` PTX was 
   `tools/ptx-spill-check.sh` reads each binary against the one its scan's banner names (`arch=`, `jit-cc=`). On cc 12.1 the JIT keeps more local memory than on
   cc 8.6 for 23 rows, 22 of which have none on cc 8.6 (14 rows of `generate_ds41`, 9 of `gate_e2e`; the largest is
   `q4k_gemv_tiles`, 184 bytes a thread). The two arches give these rows the same `jit_local`, and at `sm_121` ptxas also spills on them; each nonzero
-  row carries a PIN line. A kernel added on a cc 8.6 card gets its
-  cc 12.1 rows from a scan on a Spark; until then `gate-ptx-spill` on a Spark names it unpinned, and
-  `tools/check-ptx-names.py` reads the cc 12.1 tables for stale rows only. `tools/ptx-scan.sh`'s blk/SM column takes
+  row carries a PIN line. A new kernel needs measured rows for every table whose target emits it, including
+  cc 12.1 rows from a scan on a Spark. `tools/check-ptx-names.py` checks every table for missing and stale rows;
+  target-only entries belong to the tables whose `# cfg:` matches their module guard. `tools/ptx-scan.sh`'s blk/SM column takes
   cc 12.x's limits for `sm_120` and `sm_121` (24 resident blocks an SM, where 8.6 has 16); on GB10 it equals the
   driver's `cuOccupancyMaxActiveBlocksPerMultiprocessor` for all 551 entries of the three binaries at `sm_121`.
 - **Bit gates.** The memo concludes the bit gates have no generation dependence by structure (they compare against oracle
