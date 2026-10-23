@@ -1445,6 +1445,75 @@ mod tests {
         assert!(!left.exists(), "{} is left behind", left.display());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_a_decoder_stalled_inside_a_frame_is_killed_and_reaped() {
+        let meta = ClipMeta {
+            frames: 1,
+            fps: (1, 1),
+            width: 2,
+            height: 1,
+        };
+        let clip = Clip::new(b"not read".to_vec(), None);
+        let ffmpeg = fake_tool("ffmpeg", "echo $$ >&2\nhead -c 2 /dev/zero\nexec sleep 2");
+        let ffprobe = fake_tool("ffprobe", "exit 99");
+        let mut decoder = fake_decoder(&ffmpeg, &ffprobe, Duration::from_millis(100));
+        decoder.exit_limit = Duration::from_millis(100);
+        let start = Instant::now();
+        let error = decoder
+            .decode(&clip, &meta, &[0], 0, &mut |_, _| panic!("partial frame"))
+            .expect_err("stalled frame")
+            .to_string();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "frame read stalled {:?}: {error}",
+            start.elapsed()
+        );
+        assert!(
+            error.contains("frame") && error.contains("100ms"),
+            "{error}"
+        );
+        let pid = error
+            .split_whitespace()
+            .find_map(|s| s.parse::<u32>().ok())
+            .expect("decoder pid in stderr");
+        let status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .expect("check decoder");
+        assert!(!status.success(), "decoder {pid} still exists");
+        assert!(!clip.path().unwrap().with_extension("log").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_frame_reader_cleans_up_a_stopped_or_panicked_callback() {
+        let meta = ClipMeta {
+            frames: 2,
+            fps: (1, 1),
+            width: 2,
+            height: 1,
+        };
+        let clip = Clip::new(b"not read".to_vec(), None);
+        let ffmpeg = fake_tool("ffmpeg", "head -c 6 /dev/zero\nexec sleep 2");
+        let ffprobe = fake_tool("ffprobe", "exit 99");
+        let decoder = fake_decoder(&ffmpeg, &ffprobe, PROBE_LIMIT);
+        let started = Instant::now();
+        assert!(
+            decoder
+                .decode(&clip, &meta, &[0, 1], 0, &mut |_, _| false)
+                .is_ok()
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decoder.decode(&clip, &meta, &[0, 1], 0, &mut |_, _| panic!("callback"))
+        }));
+        assert!(panic.is_err(), "callback panic was swallowed");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the frame reader was left blocked"
+        );
+    }
+
     /// An ffprobe that runs past its limit is killed and the clip refused by name, whether it was
     /// reading the file or counting the stream's frames; one that ends within it is taken.
     #[cfg(unix)]

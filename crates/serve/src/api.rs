@@ -6245,6 +6245,7 @@ mod tests {
             inner: MockEngine,
             calls: Arc<AtomicUsize>,
             permits: mpsc::Receiver<()>,
+            prefilled: Arc<AtomicUsize>,
         }
 
         impl Engine for Gated {
@@ -6252,6 +6253,7 @@ mod tests {
                 self.inner.tokenizer()
             }
             fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+                self.prefilled.fetch_add(1, Ordering::SeqCst);
                 self.inner.prefill(ids)
             }
             fn next(
@@ -6274,6 +6276,206 @@ mod tests {
             fn describe(&self) -> String {
                 "the gated mock".to_owned()
             }
+        }
+
+        #[cfg(unix)]
+        fn reset(client: TcpStream) {
+            use std::os::fd::AsRawFd;
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: the socket is live and linger points to a value of the stated size.
+            let rc = unsafe {
+                libc::setsockopt(
+                    client.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&linger as *const libc::linger).cast(),
+                    std::mem::size_of_val(&linger) as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "linger: {}", io::Error::last_os_error());
+            drop(client);
+        }
+
+        #[test]
+        fn lifecycle_half_closed_request_receives_its_whole_answer() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (permit, permits) = mpsc::channel();
+            let (addr, _state, _ended) = testserve::spawn(
+                Box::new(Gated {
+                    inner: MockEngine::new(1024),
+                    calls: Arc::clone(&calls),
+                    permits,
+                    prefilled: Arc::new(AtomicUsize::new(0)),
+                }),
+                testserve::mock_config(),
+            );
+            let mut client = testserve::send_request(
+                addr,
+                "POST",
+                "/completion",
+                &[],
+                r#"{"prompt":"abab","temperature":0,"n_predict":1}"#,
+            );
+            wait_for("the first step", || calls.load(Ordering::SeqCst) == 1);
+            client
+                .shutdown(std::net::Shutdown::Write)
+                .expect("half close");
+            permit.send(()).expect("release");
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("timeout");
+            let mut raw = String::new();
+            client.read_to_string(&mut raw).expect("answer");
+            assert!(raw.starts_with("HTTP/1.0 200"), "{raw}");
+            let body: serde_json::Value =
+                serde_json::from_str(raw.split_once("\r\n\r\n").expect("head").1).expect("JSON");
+            assert_eq!(body["content"], "a");
+            assert_eq!(body["tokens_predicted"], 1);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn lifecycle_reset_while_queued_never_prefills() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let prefilled = Arc::new(AtomicUsize::new(0));
+            let (permit, permits) = mpsc::channel();
+            let (addr, state, _ended) = testserve::spawn(
+                Box::new(Gated {
+                    inner: MockEngine::new(1024),
+                    calls: Arc::clone(&calls),
+                    permits,
+                    prefilled: Arc::clone(&prefilled),
+                }),
+                testserve::mock_config(),
+            );
+            let mut first = testserve::send_request(
+                addr,
+                "POST",
+                "/completion",
+                &[],
+                r#"{"prompt":"abab","temperature":0,"n_predict":1}"#,
+            );
+            wait_for("the first request", || calls.load(Ordering::SeqCst) == 1);
+            let second = testserve::send_request(
+                addr,
+                "POST",
+                "/completion",
+                &[],
+                r#"{"prompt":"cdcd","temperature":0,"n_predict":1}"#,
+            );
+            wait_for("the queued request", || {
+                relock(&state.shared.board).waiting() == 1
+            });
+            reset(second);
+            wait_for("the queued connection's release", || {
+                state.shared.answers.in_flight() == 1
+            });
+            permit.send(()).expect("release first");
+            first
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("timeout");
+            first.read_to_end(&mut Vec::new()).expect("first answer");
+            // A third request is the barrier proving the queued request was considered.
+            let mut third = testserve::send_request(
+                addr,
+                "POST",
+                "/completion",
+                &[],
+                r#"{"prompt":"efef","temperature":0,"n_predict":1}"#,
+            );
+            wait_for("the next live request", || {
+                calls.load(Ordering::SeqCst) == 2
+            });
+            permit.send(()).expect("release next");
+            permit
+                .send(())
+                .expect("release a stale queued request if present");
+            third
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("timeout");
+            let mut raw = String::new();
+            third.read_to_string(&mut raw).expect("next answer");
+            assert!(raw.starts_with("HTTP/1.0 200"), "{raw}");
+            assert_eq!(
+                prefilled.load(Ordering::SeqCst),
+                2,
+                "a reset request reached prefill"
+            );
+        }
+
+        #[test]
+        fn lifecycle_stalled_writers_release_their_connection() {
+            for streaming in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+                let mut client =
+                    TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+                let (server, _) = listener.accept().expect("accept");
+                let live = Arc::new(AtomicUsize::new(0));
+                let permit = super::super::Permit::take(&live).expect("permit");
+                let (done, completed) = mpsc::channel();
+                let thread = std::thread::spawn(move || {
+                    let _permit = permit;
+                    super::super::keep_alive(
+                        server,
+                        &Default::default(),
+                        &Default::default(),
+                        |req, w| {
+                            assert!(
+                                w.write_timeout()?.is_some(),
+                                "response writes have no timeout"
+                            );
+                            w.set_write_timeout(Some(Duration::from_millis(100)))?;
+                            let body = vec![b'x'; 16 << 20];
+                            let result = if streaming {
+                                super::super::http::EventStream::start(
+                                    w,
+                                    req,
+                                    200,
+                                    "text/event-stream",
+                                )?
+                                .send(&body)
+                            } else {
+                                super::super::http::respond(w, req, 200, "text/plain", &[], &body)
+                            };
+                            let kind = result.expect_err("the reader made no progress").kind();
+                            assert!(
+                                matches!(kind, io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+                                "{kind:?}"
+                            );
+                            Ok(false)
+                        },
+                    );
+                    done.send(()).expect("done");
+                });
+                client
+                    .write_all(b"GET /health HTTP/1.0\r\n\r\n")
+                    .expect("request");
+                let result = completed.recv_timeout(Duration::from_secs(3));
+                drop(client);
+                thread.join().expect("writer");
+                result.expect("the stalled writer did not finish");
+                assert_eq!(live.load(Ordering::SeqCst), 0, "permit retained");
+            }
+        }
+
+        #[test]
+        fn lifecycle_refusal_does_not_block_admission() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let _client =
+                TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+            let (server, _) = listener.accept().expect("accept");
+            let live = Arc::new(AtomicUsize::new(super::super::MAX_CONNECTIONS));
+            let serve = Arc::new(|_: TcpStream| panic!("over limit"));
+            let start = Instant::now();
+            super::super::admit(&serve, &live, 0, server);
+            assert!(
+                start.elapsed() < super::super::REFUSE_DRAIN / 2,
+                "accept waited {:?} for a refusal",
+                start.elapsed()
+            );
         }
 
         /// Polls `ok` until it holds; a test that waits on a thread that never
@@ -6345,6 +6547,7 @@ mod tests {
                 inner: MockEngine::new(1 << 16),
                 calls: Arc::clone(&calls),
                 permits,
+                prefilled: Arc::new(AtomicUsize::new(0)),
             };
             let (addr, state, _ended) =
                 testserve::spawn(Box::new(engine), testserve::mock_config());
