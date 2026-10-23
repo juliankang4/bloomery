@@ -1837,6 +1837,152 @@ mod tests {
         assert_eq!(render(&start, TRUE), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn terminal_viewport() {
+        use std::io::{BufRead, Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::process::{Command, Stdio};
+
+        if let Ok(fixture) = std::env::var("SCREEN_PTY_CHILD") {
+            assert!(!super::arm(false));
+            let armed = super::arm(true);
+            println!("screen armed={armed}");
+            std::io::stdout().flush().unwrap();
+            for line in lines(if fixture == "qwen38" { START38 } else { START }) {
+                super::note(line);
+            }
+            if armed {
+                std::io::stdin().read_exact(&mut [0]).unwrap();
+            }
+            super::draw();
+            super::draw();
+            return;
+        }
+
+        let command = |fixture: &str, term: &str, color: &str| {
+            let mut cmd = Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "screen::tests::terminal_viewport", "--nocapture"])
+                .env("SCREEN_PTY_CHILD", fixture)
+                .env("TERM", term)
+                .env("NO_COLOR", color)
+                .env("COLORTERM", "truecolor")
+                .env("LC_ALL", "ko_KR.UTF-8");
+            cmd
+        };
+        let piped = command("v41", "xterm", "").output().unwrap();
+        assert!(piped.status.success());
+        assert!(piped.stderr.is_empty(), "piped stderr drew a screen");
+        assert!(
+            String::from_utf8(piped.stdout)
+                .unwrap()
+                .contains("screen armed=false")
+        );
+
+        for (cols, resized) in [
+            (80, 80),
+            (97, 97),
+            (98, 98),
+            (99, 99),
+            (120, 120),
+            (98, 80),
+            (80, 98),
+        ] {
+            for fixture in ["v41", "qwen38"] {
+                for (term, color) in [("xterm", ""), ("xterm", "1"), ("dumb", "")] {
+                    let mut size = libc::winsize {
+                        ws_row: 100,
+                        ws_col: cols,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    };
+                    let (mut master, mut slave) = (-1, -1);
+                    // SAFETY: both fd outputs and the initialized window size live through the call; the other pointers are null.
+                    assert_eq!(
+                        unsafe {
+                            libc::openpty(
+                                &mut master,
+                                &mut slave,
+                                std::ptr::null_mut(),
+                                std::ptr::null(),
+                                &size,
+                            )
+                        },
+                        0
+                    );
+                    // SAFETY: openpty succeeded and transferred ownership of this distinct master fd.
+                    let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+                    // SAFETY: openpty succeeded and transferred ownership of this distinct slave fd.
+                    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+                    let mut child = command(fixture, term, color)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(slave.try_clone().unwrap())
+                        .spawn()
+                        .unwrap();
+                    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+                    let mut line = String::new();
+                    loop {
+                        assert!(
+                            stdout.read_line(&mut line).unwrap() > 0,
+                            "child never armed: {line}"
+                        );
+                        if line.contains("screen armed=true") {
+                            break;
+                        }
+                    }
+                    size.ws_col = resized;
+                    // SAFETY: slave is an open PTY fd and size is an initialized winsize for this ioctl.
+                    assert_eq!(
+                        unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+                        0
+                    );
+                    drop(slave);
+                    child.stdin.take().unwrap().write_all(b"x").unwrap();
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut buf = [0; 8192];
+                        match master.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                            Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                            Err(e) => panic!("PTY read: {e}"),
+                        }
+                    }
+                    assert!(child.wait().unwrap().success());
+                    let got = String::from_utf8(bytes).unwrap().replace("\r\n", "\n");
+                    let plain = strip_escapes(&got);
+                    assert_eq!(plain.matches(" READY ").count(), 1, "{plain}");
+                    for line in plain.lines() {
+                        assert!(
+                            width(line) <= usize::from(resized),
+                            "{cols}->{resized} {fixture} {term}: {} columns in {line:?}\n{plain}",
+                            width(line)
+                        );
+                    }
+                    for fact in [
+                        "placement",
+                        "serving",
+                        "experts",
+                        "context",
+                        "cache",
+                        "Ctrl+C",
+                        "BLOOMERY_SCREEN=off",
+                        "Hello!",
+                    ] {
+                        assert!(plain.contains(fact), "missing {fact}:\n{plain}");
+                    }
+                    if resized >= 98 && fixture == "v41" && color == "1" {
+                        assert_eq!(plain, read_golden("screen-utf8.txt"));
+                    }
+                    if cols == 80 && resized == 80 && fixture == "qwen38" && color == "1" {
+                        println!("80-column PTY:\n{plain}");
+                    }
+                }
+            }
+        }
+    }
+
     /// The terminal's variables: `NO_COLOR` set and not empty, or
     /// `TERM=dumb`, turn colour off; `COLORTERM` of `truecolor` or `24bit`
     /// draws 24-bit colour when there is colour; the first non-empty locale

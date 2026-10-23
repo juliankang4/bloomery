@@ -47,6 +47,7 @@ crates/gpu-gates/src/bin/soak_ds41_serve.rs	CUDA_VISIBLE_DEVICES	stays: the driv
 crates/gpu-gates/src/record.rs	CUDA_DEVICE_ORDER	stays: the driver's ordinal order, which the plan record prints beside the ordinals
 crates/serve/src/screen.rs	NO_COLOR,TERM,COLORTERM,LC_ALL,LC_CTYPE,LANG	stays: the terminal's own conventions, which the start screen honours (no colour, a dumb terminal, 24-bit colour, a locale without UTF-8)
 crates/serve/src/screen.rs	SCREEN_BLESS	stays: the golden screens' regenerator, cfg(test) only (SCREEN_BLESS=1 rewrites tests/fixtures/screen-*.txt)
+crates/serve/src/screen.rs	SCREEN_PTY_CHILD	stays: the terminal viewport test's handshake with the child it runs, cfg(test) only
 crates/gpu/src/checkpoint.rs	RUST_TEST_THREADS	stays: libtest's own thread count, which a test that holds a stream needs to be 1 (cfg(test) only)
 crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs	BLOOMERY_CHAIN_ATTN_MUTATE,BLOOMERY_CHAIN_ATTN_LAYERS	stays: the gate's FAIL-first tool
 # Harness and data paths — stay: a test binary's or a build script's own reads.
