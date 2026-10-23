@@ -6052,7 +6052,11 @@ mod tests {
                     .map(|rank| Card {
                         head: rank + 1 == ranks,
                         token_embedding: rank == 0,
-                        ..bytes_card(&format!("pool-{rank}"), 1 << 30, rank * 4 / ranks..(rank + 1) * 4 / ranks)
+                        ..bytes_card(
+                            &format!("pool-{rank}"),
+                            1 << 30,
+                            rank * 4 / ranks..(rank + 1) * 4 / ranks,
+                        )
                     })
                     .collect(),
                 tiers: Vec::new(),
