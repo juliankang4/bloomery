@@ -45,7 +45,7 @@ use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0, pack_q5_1, q5_0_row_wor
 #[cfg(feature = "gpu")]
 use bloomery_gpu::q8f32::Q8F32Kernels;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::weights::{DevWeight, Q8Block, Weights, resident_size};
+use bloomery_gpu::weights::{DevWeight, Q8Block, Weights, part_format, resident_size};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
@@ -104,17 +104,15 @@ fn run() -> Result<(), GateError> {
     for t in gguf.iter_tensors() {
         n_tensors += 1;
         file_total += t.nbytes;
-        let k = t.dims[0] as usize;
-        let rows = tensor_rows(&t.dims);
-        match resident_size(t.ty, k, rows) {
-            Some(r) => {
+        match part_format(t) {
+            Ok((_, r)) => {
                 let e = per_ty.entry(t.ty).or_default();
                 e.0 += 1;
                 e.1 += t.nbytes;
                 e.2 += r as u64;
                 res_total += r as u64;
             }
-            None => unknown.push((t.name.clone(), t.ty)),
+            Err(_) => unknown.push((t.name.clone(), t.ty)),
         }
     }
     for (ty, (c, fb, rb)) in &per_ty {

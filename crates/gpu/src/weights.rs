@@ -1112,12 +1112,9 @@ fn tensor_rows(t: &TensorInfo) -> usize {
     t.dims[1..].iter().product::<u64>() as usize
 }
 
-/// Resident device bytes a file tensor of this type and shape takes in the
-/// formats above (`rows` as [`tensor_rows`] counts them); `None` when the
-/// type has no device format or the shape has no layout in it. The uploads
-/// refuse and check by the same arithmetic ([`CardFormat::resident_bytes`]),
-/// so a census totals check against a loaded `Weights::resident_bytes` pins
-/// the two together.
+/// Resident bytes in the type's default card format, with `rows` rows of
+/// `k` values; `None` when the type or shape has no layout. A file tensor's
+/// name can select another format: its census uses [`part_format`].
 #[must_use]
 pub fn resident_size(ty: GgmlType, k: usize, rows: usize) -> Option<usize> {
     let (k, rows) = (u64::try_from(k).ok()?, u64::try_from(rows).ok()?);
@@ -1391,15 +1388,13 @@ pub(crate) fn tensor_scales<'g>(
 }
 
 /// The bytes `t`'s upload moves, for sizing a load's staging ring: its
-/// resident size where its type has a device layout, its file bytes
-/// otherwise — a sizing hint, never a contract (the uploads check their own
-/// lengths).
+/// resident size in its named file format, its file bytes otherwise. This
+/// is a sizing hint, never a contract: the uploads check their own lengths.
 fn upload_budget(t: &TensorInfo) -> usize {
-    usize::try_from(t.dims[0])
-        .ok()
-        .and_then(|k| resident_size(t.ty, k, tensor_rows(t)))
-        .or_else(|| usize::try_from(t.nbytes).ok())
-        .unwrap_or(usize::MAX)
+    part_format(t).map_or_else(
+        |_| usize::try_from(t.nbytes).unwrap_or(usize::MAX),
+        |(_, bytes)| bytes,
+    )
 }
 
 /// Pack `rows` rows of file tensor `t` — all of them, or an expert stack's
@@ -1709,8 +1704,8 @@ pub fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        HEAD_TENSOR, TensorPart, derived_slot_free, file_slot, head_tensor, part_format, part_formats,
-        upload_budget,
+        HEAD_TENSOR, TensorPart, derived_slot_free, file_slot, head_tensor, part_format,
+        part_formats, upload_budget,
     };
     use gguf::Split;
     use gguf::write::{Layout, TensorDecl, Writer};

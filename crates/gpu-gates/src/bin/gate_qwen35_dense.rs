@@ -7,7 +7,7 @@
 //!
 //! What is asserted:
 //! - (a) load: the whole-fit verdict's weights term, the buffers the load uploaded and the header derivation
-//!   (`weights::resident_size` of every tensor but `blk.64.*`) are the same bytes; no `blk.64` tensor is resident;
+//!   (`weights::part_format` of every tensor but `blk.64.*`) are the same bytes; no `blk.64` tensor is resident;
 //!   the verdict's cache term and the body's store bytes are their derivation from the header's geometry.
 //! - (b) oracle: for each set (the 64- and 4,096-id prompts, 32 teacher-forced rows each) the prompt call and the
 //!   forced decode steps' logits rows against mainline's CUDA rows: each row's relative L2 within [`REL_BAND`],
@@ -49,7 +49,7 @@ mod gate {
     use super::qwen35_open;
     use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel};
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::weights::resident_size;
+    use bloomery_gpu::weights::part_format;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{
         GateError, checks_failed, data_dir, gpu_census, kld, quantile, ref_model_path, verdict,
@@ -244,17 +244,16 @@ mod gate {
         }
     }
 
-    /// Tensors of the header but `blk.64.*`: `(name, resident bytes)` by `weights::resident_size`.
+    /// Tensors of the header but `blk.64.*`: `(name, resident bytes)` by `weights::part_format`.
     fn derived_weights(split: &Split) -> Result<Vec<(String, usize)>, GateError> {
         split
             .iter_tensors()
             .map(|(_, t)| t)
             .filter(|t| !t.name.starts_with(UNUSED_BLOCK))
             .map(|t| {
-                let rows = t.dims[1..].iter().product::<u64>() as usize;
-                resident_size(t.ty, t.dims[0] as usize, rows)
-                    .map(|b| (t.name.clone(), b))
-                    .ok_or_else(|| format!("{}: no device format for {:?}", t.name, t.ty).into())
+                part_format(t)
+                    .map(|(_, bytes)| (t.name.clone(), bytes))
+                    .map_err(Into::into)
             })
             .collect()
     }
@@ -272,11 +271,7 @@ mod gate {
         let derived: usize = derived_weights(&split)?.iter().map(|d| d.1).sum();
         let all: usize = split
             .iter_tensors()
-            .map(|(_, t)| {
-                let rows = t.dims[1..].iter().product::<u64>() as usize;
-                resident_size(t.ty, t.dims[0] as usize, rows)
-                    .unwrap_or_else(|| panic!("{}: no device format for {:?}", t.name, t.ty))
-            })
+            .map(|(_, t)| part_format(t).unwrap_or_else(|e| panic!("{e}")).1)
             .sum();
         let kv = geom.store_bytes(CTX) as u64;
         let ok = need.weights_unrounded == derived as u64 && need.kv == kv && all > derived;
