@@ -1079,6 +1079,10 @@ pub trait Seat: 'static {
     /// one step per id), the draft fed as the call hands its rows over; the
     /// argmax after the last.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError>;
+    /// Prompt positions whose output is unused. A batched seat can omit its head.
+    fn prefill_only(&mut self, ids: &[u32]) -> Result<(), GateError> {
+        self.prefill(ids).map(|_| ())
+    }
     /// [`Seat::prefill`] where the slice carries images
     /// ([`Engine::prefill_media`]'s contract): each feed's `at` is its span's
     /// first position in `ids`, every span lies whole inside the slice, and
@@ -2113,9 +2117,11 @@ fn serve_cmd<S: Seat>(
         Cmd::Prefill(ids) => {
             let refuse =
                 |e: String| format!("prefill of {} ids from position {at}: {e}", ids.len());
-            check_feed(g, ids.len())
-                .map_err(refuse)
-                .and_then(|()| g.prefill(&ids).map_err(|e| refuse(e.to_string())))
+            check_feed(g, ids.len()).map_err(refuse).and_then(|()| {
+                g.prefill_only(&ids)
+                    .map(|()| 0)
+                    .map_err(|e| refuse(e.to_string()))
+            })
         }
         Cmd::PrefillMedia(ids, feeds) => {
             let refuse = |e: String| {
@@ -2200,7 +2206,7 @@ fn next_row<S: Seat>(
     next_lent_row(g, last, row)
 }
 
-/// [`Seat::prefill_row`]'s default: [`Seat::prefill`] of all but the last of
+/// [`Seat::prefill_row`]'s default: [`Seat::prefill_only`] of all but the last of
 /// `ids` (none for one id) and [`Seat::step`], or [`Seat::step_row`] into
 /// `row`, of the last.
 pub fn prefill_then_step<S: Seat + ?Sized>(
@@ -2212,7 +2218,7 @@ pub fn prefill_then_step<S: Seat + ?Sized>(
         return Err("a prefill and its step of no ids".into());
     };
     if !run.is_empty() {
-        g.prefill(run)?;
+        g.prefill_only(run)?;
     }
     match row {
         Some(row) => g.step_row(last, row),

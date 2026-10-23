@@ -226,6 +226,16 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
         sink: Option<&mut UnitSink<'_, Self>>,
     ) -> Result<u32, GpuError>;
 
+    /// A prompt call whose token is unused, with the same hidden-row sink.
+    fn prefill_with(
+        m: &mut GpuModel<Self>,
+        ids: &[u32],
+        path: Self::Path,
+        sink: Option<&mut UnitSink<'_, Self>>,
+    ) -> Result<(), GpuError> {
+        Self::prompt_with(m, ids, path, sink).map(|_| ())
+    }
+
     /// [`MtpBody::prompt_with`] of `ids` with `spans` spliced in ([`MediaBody::prefill_media`]):
     /// a span's rows stand in for its positions' token embeddings in the target, and `sink` is
     /// called after each unit as it is on a text prompt, with the target's hidden rows of the
@@ -509,7 +519,21 @@ impl<B: MtpBody> Exec<B::Arena> for Gather<'_, B> {
     }
 }
 
+impl<B: MtpBody> Session<B> {
+    /// Feed a prompt without producing a token, retaining the session's idle check.
+    pub fn prefill(&mut self, ids: &[u32], path: B::Path) -> Result<(), SessionError> {
+        self.idle("prefill")?;
+        let _busy = self.model().prompt_busy();
+        Ok(B::prefill_with(self.model_mut(), ids, path, None)?)
+    }
+}
+
 impl<B: MtpBody> MtpDraft<B> {
+    /// Feed prompt positions without requesting the target's head.
+    pub fn prefill(&mut self, t: &mut Session<B>, ids: &[u32]) -> Result<(), SessionError> {
+        let path = self.path;
+        self.prompt_joined(t, ids, None, |m, sink| B::prefill_with(m, ids, path, sink))
+    }
     /// The draft over the model `m` loaded beside its target: the head the
     /// load opened (a row list or the full vocabulary), the prompt fed by
     /// `path`, the chains run in `mode`. Load-time only.
@@ -906,13 +930,13 @@ impl<B: MtpBody> MtpDraft<B> {
     /// each unit as it completes, or `None` when the draft cannot join and the call is the
     /// target's alone. `media` is the call's span rows ([`CallRows`], `None` on a text call):
     /// the join's walk and every unit's walk read it.
-    fn prompt_joined(
+    fn prompt_joined<R>(
         &mut self,
         t: &mut Session<B>,
         ids: &[u32],
         media: Option<&CallRows<'_>>,
-        call: impl FnOnce(&mut GpuModel<B>, Option<&mut UnitSink<'_, B>>) -> Result<u32, GpuError>,
-    ) -> Result<u32, SessionError> {
+        call: impl FnOnce(&mut GpuModel<B>, Option<&mut UnitSink<'_, B>>) -> Result<R, GpuError>,
+    ) -> Result<R, SessionError> {
         let head = self.head;
         let start = t.pos();
         let _busy = t.model().prompt_busy();

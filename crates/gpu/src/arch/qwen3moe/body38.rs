@@ -3950,6 +3950,26 @@ impl GpuModel<Body38> {
         path: Prompt38,
         sink: Option<&mut Prompt38Sink<'_>>,
     ) -> Result<u32, GpuError> {
+        self.prompt38_read(tokens, path, sink, true)
+    }
+
+    /// Feed prompt positions and hidden-row taps without producing a token.
+    pub fn prefill38_with(
+        &mut self,
+        tokens: &[u32],
+        path: Prompt38,
+        sink: Option<&mut Prompt38Sink<'_>>,
+    ) -> Result<(), GpuError> {
+        self.prompt38_read(tokens, path, sink, false).map(|_| ())
+    }
+
+    fn prompt38_read(
+        &mut self,
+        tokens: &[u32],
+        path: Prompt38,
+        sink: Option<&mut Prompt38Sink<'_>>,
+        head: bool,
+    ) -> Result<u32, GpuError> {
         let resolved = self.prompt38_checked(tokens, path)?;
         // The steps feed is no pass of its own: each id is a step with its
         // boundary and its kept row, so none is opened around them.
@@ -3957,7 +3977,7 @@ impl GpuModel<Body38> {
         if one_pass {
             self.pass_boundary()?;
         }
-        let fed = self.prompt38_fed(tokens, resolved, sink);
+        let fed = self.prompt38_fed(tokens, resolved, sink, head);
         let kept = match one_pass {
             true => self.keep_rows(KeptRows::prefix(0), PassKind::Prompt),
             false => Ok(()),
@@ -3976,7 +3996,7 @@ impl GpuModel<Body38> {
     /// kept count after it.
     fn prompt38_in_pass(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
         let resolved = self.prompt38_checked(tokens, Prompt38::Gemm)?;
-        self.prompt38_fed(tokens, resolved, None)
+        self.prompt38_fed(tokens, resolved, None, true)
     }
 
     /// [`GpuModel::prompt38_with`]'s checks, all before any launch: the
@@ -4026,6 +4046,7 @@ impl GpuModel<Body38> {
         tokens: &[u32],
         resolved: Prompt38,
         sink: Option<&mut Prompt38Sink<'_>>,
+        head: bool,
     ) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen4exp prompt";
         // A successful call before a decode history ends with each layer
@@ -4040,7 +4061,7 @@ impl GpuModel<Body38> {
         let history = self.body(WHAT_P)?.hybrid().call_history();
         let r = self
             .stream_begin(resolved, tokens.len(), history)
-            .and_then(|()| self.feed_marked(tokens, resolved, sink));
+            .and_then(|()| self.feed_marked(tokens, resolved, sink, head));
         // The call's own error first: an end refused after a failed call is
         // its echo. A failed call's streaming ends with each layer back at
         // the set it started with too.
@@ -4105,6 +4126,7 @@ impl GpuModel<Body38> {
         tokens: &[u32],
         path: Prompt38,
         mut sink: Option<&mut Prompt38Sink<'_>>,
+        head: bool,
     ) -> Result<u32, GpuError> {
         const WHAT_M: &str = "qwen4exp prompt checkpoints";
         let from = self.pos();
@@ -4118,7 +4140,7 @@ impl GpuModel<Body38> {
             false => Vec::new(),
         };
         if path != Prompt38::Step {
-            return self.feed38(tokens, path, &marks, sink);
+            return self.feed38(tokens, path, &marks, sink, head);
         }
         if marks.is_empty() {
             return self.feed_steps(tokens, sink);
@@ -4168,7 +4190,8 @@ impl GpuModel<Body38> {
     /// [`GpuModel::prompt38_with`]'s passes or ubatches once its checks have
     /// passed, its path resolved and its residency pass open: the call's
     /// units ([`call_units`]), a checkpoint taken at each of `marks`
-    /// ([`GpuModel::feed_marked`]), and the head after the last unit alone.
+    /// ([`GpuModel::feed_marked`]), and the head after the last unit alone
+    /// when `head` asks for it.
     /// A unit a checkpoint follows inside the call ends without the head: the
     /// last layer's combine over its last row when the checkpoint keeps it
     /// (the draft's point row, [`Body38::take_mark`]), over every row when the
@@ -4181,6 +4204,7 @@ impl GpuModel<Body38> {
         path: Prompt38,
         marks: &[u32],
         mut sink: Option<&mut Prompt38Sink<'_>>,
+        head: bool,
     ) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen4exp prompt";
         let tapped = sink.is_some();
@@ -4216,9 +4240,10 @@ impl GpuModel<Body38> {
             at += m;
             let last = i + 1 == units.len();
             let point = marked && !last;
+            let headed = last && head;
             let read = match tapped {
                 true => m,
-                false => usize::from(last || point && point_row),
+                false => usize::from(headed || marked && point_row),
             };
             let pos = self.pos();
             {
@@ -4229,18 +4254,20 @@ impl GpuModel<Body38> {
                 }
             }
             next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
-                let head = last.then_some(head);
+                let out = headed.then_some(head);
                 match path {
                     Prompt38::Gemm => {
-                        body.walk_gemm(gpu, w, m, pos, head, read)?;
+                        body.walk_gemm(gpu, w, m, pos, out, read)?;
                         body.stream.walk_done();
                     }
-                    _ => body.walk_pass(gpu, w, m, pos, head, read > usize::from(last))?,
+                    _ => body.walk_pass(gpu, w, m, pos, out, read > usize::from(headed))?,
                 }
-                if point && let Some(f) = gpu.fault()? {
+                if (point || last && !headed)
+                    && let Some(f) = gpu.fault()?
+                {
                     return Err(GpuError::fault(WHAT_P, f));
                 }
-                Ok(last)
+                Ok(headed)
             })?;
             if let Some(f) = sink.as_deref_mut() {
                 f(self, walk, pos, m)?;
@@ -4248,6 +4275,9 @@ impl GpuModel<Body38> {
             if marked {
                 self.mark_here(WHAT_P)?;
             }
+        }
+        if !head {
+            return Ok(0);
         }
         next.ok_or(GpuError::state(
             WHAT_P,

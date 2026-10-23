@@ -589,6 +589,30 @@ where
         )
     }
 
+    /// The same prompt and draft-store walk without the target's head.
+    pub(crate) fn prefill_only(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        ids: &[u32],
+        path: B::Path,
+    ) -> Result<(), GateError> {
+        self.prefill_by(
+            s,
+            slot,
+            ids,
+            |s| {
+                s.prefill(ids, path)?;
+                Ok(0)
+            },
+            |spec, s| {
+                spec.draft_mut().prompt_by(|d| d.prefill(s, ids))?;
+                Ok(0)
+            },
+        )
+        .map(|_| ())
+    }
+
     /// [`SlotDrafts::prefill`] of a prompt that holds an image: `spans` are the
     /// body's spans of the image's rows, spliced in place of their positions'
     /// embeddings. Under the draft the draft's own media prompt call

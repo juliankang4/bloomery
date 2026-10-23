@@ -2732,6 +2732,18 @@ impl Seat for Q38 {
         Ok(next)
     }
 
+    fn prefill_only(&mut self, ids: &[u32]) -> Result<(), GateError> {
+        self.before_call();
+        let sel = self.s.selected();
+        if self.feed == Prompt38::Step {
+            self.prefill_steps(ids)?;
+        } else {
+            self.drafts.prefill_only(&mut self.s, sel, ids, self.feed)?;
+        }
+        self.print_passes()?;
+        Ok(())
+    }
+
     /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
     /// without `--mmproj`, a seat that takes no image.
     #[cfg(feature = "vision")]

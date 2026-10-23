@@ -56,6 +56,15 @@ impl MtpBody for Body38 {
         m.prompt38_with(ids, path, sink)
     }
 
+    fn prefill_with(
+        m: &mut Qwen38Model,
+        ids: &[u32],
+        path: Prompt38,
+        sink: Option<&mut UnitSink<'_, Body38>>,
+    ) -> Result<(), GpuError> {
+        m.prefill38_with(ids, path, sink)
+    }
+
     fn walk(
         m: &mut Qwen38Model,
         feed: Feed<'_, TargetRows>,
