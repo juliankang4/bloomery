@@ -39,6 +39,8 @@
 //! rows; a first step that feeds the next id does the same before the step
 //! overwrites the step's arena ([`MtpDraft::before_step`]), and so does the
 //! width chooser before each pass it holds back ([`Draft::before_plain`]).
+//! Those walks run through the store's append alone ([`WalkMode::Store`]):
+//! no head reads them, the next chain walking its own refresh.
 //! When no such rows
 //! wait, or the store does not hold the positions below them, the draft
 //! skips: it proposes nothing, every pass a plain step, until a prompt call
@@ -164,14 +166,15 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
 
     /// Holds when the widths fit together: at least one id a proposal, a
     /// verify the body's passes take ([`Rows::MAX_ROWS`]), a refresh one
-    /// walk. The window reads it, so a body that breaks it fails to compile
-    /// where it is drafted.
+    /// walk and one store walk. The window reads it, so a body that breaks it
+    /// fails to compile where it is drafted.
     const FITS: () = assert!(
         Self::WIDTH >= 1
             && Self::VERIFY_ROWS == Self::WIDTH + 1
             && Self::VERIFY_ROWS <= <Self as Rows>::MAX_ROWS
-            && Self::VERIFY_ROWS <= Self::WALK_ROWS,
-        "an MTP body's WIDTH + 1 rows must fit one verify and one walk"
+            && Self::VERIFY_ROWS <= Self::WALK_ROWS
+            && Self::VERIFY_ROWS <= Self::STORE_ROWS,
+        "an MTP body's WIDTH + 1 rows must fit one verify, one walk and one store walk"
     );
 
     /// A target arena whose final hidden rows a walk reads: where a step, a
@@ -382,8 +385,7 @@ impl<B: MtpBody> Exec<B::Arena> for Card<'_, B> {
 impl<B: MtpBody> MtpDraft<B> {
     /// The draft over the model `m` loaded beside its target: the head the
     /// load opened (a row list or the full vocabulary), the prompt fed by
-    /// `path`, the walks with a head and the chains run in `mode`.
-    /// Load-time only.
+    /// `path`, the chains run in `mode`. Load-time only.
     pub fn open(m: &GpuModel<B>, path: B::Path, mode: StepMode) -> Result<Self, SessionError> {
         let () = B::FITS;
         let head = B::head(m)?;

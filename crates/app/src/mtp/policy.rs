@@ -2,7 +2,8 @@
 //! window knows between two calls (the rows waiting for the draft's next
 //! walk, the last prompt unit, why the draft skips, the last join) and decides
 //! every call from positions, the context, token ids and arena kinds alone —
-//! which waiting rows a call walks and in which mode, the anchor a step
+//! which waiting rows a call walks (a chain's refresh in the chain's mode,
+//! every other walk through the store's append alone), the anchor a step
 //! records, the join checks, the refusals and the sequence a park keeps.
 //!
 //! The walks themselves are the executor's ([`Exec`]): a call issues them one
@@ -78,7 +79,8 @@ pub(super) struct Shape<A> {
     pub(super) step: A,
     /// The arena a verify leaves its rows in.
     pub(super) verify: A,
-    /// How the walks with a head and the chains run.
+    /// How the chains run. Every other walk runs through the store's append
+    /// alone ([`WalkMode::Store`]): only a chain reads a head.
     pub(super) mode: WalkMode,
     /// The most ids a proposal holds.
     pub(super) width: usize,
@@ -314,7 +316,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
         if let Some(l) = r.tokens.last_mut() {
             *l = token;
         }
-        x.walk(&r.as_walk(self.shape.mode))?;
+        x.walk(&r.as_walk(WalkMode::Store))?;
         Ok(Ok(r.tokens.len()))
     }
 
@@ -599,7 +601,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
                         tokens: &[last],
                         pos0: 0,
                         hidden: Hidden::Host(&self.zeros),
-                        mode: self.shape.mode,
+                        mode: WalkMode::Store,
                     })
                     .map_err(Fail::Exec)?;
                 }
@@ -614,7 +616,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
                     r.pos0
                 ))));
             }
-            x.walk(&r.as_walk(self.shape.mode)).map_err(Fail::Exec)?;
+            x.walk(&r.as_walk(WalkMode::Store)).map_err(Fail::Exec)?;
         }
         self.next = Some(Refresh {
             tokens: vec![next],
@@ -1005,9 +1007,9 @@ mod tests {
         rig.drafted_pass(None).unwrap_or_else(|e| panic!("{e}"));
         let drafted = rig.c.take();
 
-        assert_eq!(cut, [seen(HEAD, 9, &[1009], rows_of(Ar::Ubatch, 0))]);
+        assert_eq!(cut, [seen(STORE, 9, &[1009], rows_of(Ar::Ubatch, 0))]);
         assert_eq!((anchor.pos0, anchor.walk), (10, Ar::Step));
-        assert_eq!(held, [seen(HEAD, 10, &[1010], rows_of(Ar::Step, 0))]);
+        assert_eq!(held, [seen(STORE, 10, &[1010], rows_of(Ar::Step, 0))]);
         assert_eq!(drafted, [seen(HEAD, 11, &[1011], rows_of(Ar::Step, 0))]);
     }
 
@@ -1078,7 +1080,7 @@ mod tests {
         rig.plain_step().unwrap();
         assert_eq!(
             rig.c.take(),
-            [seen(HEAD, 10, &[1010], rows_of(Ar::Step, 0))]
+            [seen(STORE, 10, &[1010], rows_of(Ar::Step, 0))]
         );
         assert_eq!(
             (rig.next().pos0, rig.next().walk, rig.c.store, rig.c.pos),
@@ -1099,12 +1101,17 @@ mod tests {
         rig.plain_step().unwrap();
         assert_eq!(
             rig.c.take(),
-            [seen(HEAD, 10, &[500, 501, 502, 2003], rows_of(Ar::Pass, 0))]
+            [seen(
+                STORE,
+                10,
+                &[500, 501, 502, 2003],
+                rows_of(Ar::Pass, 0)
+            )]
         );
         rig.plain_step().unwrap();
         assert_eq!(
             rig.c.take(),
-            [seen(HEAD, 14, &[1014], rows_of(Ar::Step, 0))]
+            [seen(STORE, 14, &[1014], rows_of(Ar::Step, 0))]
         );
         rig.drafted_pass(None).unwrap();
     }
@@ -1154,13 +1161,13 @@ mod tests {
         rig.plain_step().unwrap();
         assert_eq!(
             rig.c.take(),
-            [seen(HEAD, 9, &[1009], rows_of(Ar::Ubatch, 0))]
+            [seen(STORE, 9, &[1009], rows_of(Ar::Ubatch, 0))]
         );
         rig.plain_step().unwrap();
         assert_eq!(rig.c.pos, 11);
         assert_eq!(
             rig.c.take(),
-            [seen(HEAD, 10, &[1010], rows_of(Ar::Step, 0))]
+            [seen(STORE, 10, &[1010], rows_of(Ar::Step, 0))]
         );
         let r = rig.next();
         assert_eq!((r.pos0, r.walk), (11, Ar::Step));
@@ -1224,7 +1231,7 @@ mod tests {
         assert_eq!(
             rig.c.take(),
             [
-                seen(HEAD, 10, &[20], rows_of(Ar::Step, 0)),
+                seen(STORE, 10, &[20], rows_of(Ar::Step, 0)),
                 seen(STORE, 11, &[21, 22], rows_of(Ar::Ubatch, 0)),
             ]
         );
@@ -1286,7 +1293,7 @@ mod tests {
         assert_eq!(
             rig.c.take(),
             [
-                seen(HEAD, 9, &[30], rows_of(Ar::Step, 0)),
+                seen(STORE, 9, &[30], rows_of(Ar::Step, 0)),
                 seen(STORE, 10, &[31], rows_of(Ar::Ubatch, 0)),
             ]
         );
@@ -1313,7 +1320,7 @@ mod tests {
         rig.c.take();
         rig.last = 40;
         rig.plain_step().unwrap();
-        assert_eq!(rig.c.take(), [seen(HEAD, 9, &[40], rows_of(Ar::Step, 0))]);
+        assert_eq!(rig.c.take(), [seen(STORE, 9, &[40], rows_of(Ar::Step, 0))]);
         assert_eq!((rig.c.store, rig.c.pos), (10, 10));
         assert!(rig.p.take_joined().is_none());
 
@@ -1328,7 +1335,7 @@ mod tests {
         assert!(!rig.p.skipping());
         rig.c.take();
         rig.prompt(&[30], 1, Ar::Ubatch).unwrap();
-        assert_eq!(rig.c.take(), [seen(HEAD, 9, &[30], rows_of(Ar::Step, 0))]);
+        assert_eq!(rig.c.take(), [seen(STORE, 9, &[30], rows_of(Ar::Step, 0))]);
     }
 
     /// The chain takes the refresh with its last row the token at the
