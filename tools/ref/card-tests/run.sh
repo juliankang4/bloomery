@@ -886,11 +886,11 @@ for bad in sm121 '' SM_86 sm_8; do
   run "box.sh: BLOOMERY_ARCH='$bad' is refused" 64 "BLOOMERY_ARCH is a CUDA arch.*got '$bad'" box env BLOOMERY_ARCH="$bad" "$B/tools/box.sh" true
   if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail "box.sh: the refused BLOOMERY_ARCH='$bad' reached ssh or rsync" 'something ran' "$tmp/ssh.log"; else pass "box.sh: the refused BLOOMERY_ARCH='$bad' reached no ssh or rsync"; fi
 done
-run 'box.sh: BLOOMERY_ARCH and a different BLOOMERY_BOX_ENV entry are refused' 64 "BLOOMERY_ARCH is 'sm_86' in BLOOMERY_BOX_ENV and 'sm_121' in the environment \(unset: sm_86\): name it in the environment" \
+run 'box.sh: BLOOMERY_ARCH and a different BLOOMERY_BOX_ENV entry are refused' 64 "BLOOMERY_ARCH is 'sm_86' in BLOOMERY_BOX_ENV and 'sm_121' in the environment \(unset: the tools/arch.sh selection\): name it in the environment" \
   box env BLOOMERY_ARCH=sm_121 BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_86 "$B/tools/box.sh" true
 if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail 'box.sh: the contradicting BLOOMERY_ARCH reached ssh or rsync' 'something ran' "$tmp/ssh.log"; else pass 'box.sh: the contradicting BLOOMERY_ARCH reached no ssh or rsync'; fi
 # An entry with the environment unset is measured against the default: the recipes expanded --arch sm_86 on this side.
-run 'box.sh: a BLOOMERY_BOX_ENV arch entry that is not the default, with BLOOMERY_ARCH unset, is refused' 64 "BLOOMERY_ARCH is 'sm_121' in BLOOMERY_BOX_ENV and 'sm_86' in the environment \(unset: sm_86\)" \
+run 'box.sh: a BLOOMERY_BOX_ENV arch entry that is not the default, with BLOOMERY_ARCH unset, is refused' 64 "BLOOMERY_ARCH is 'sm_121' in BLOOMERY_BOX_ENV and 'sm_86' in the environment \(unset: the tools/arch.sh selection\)" \
   box env BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_121 "$B/tools/box.sh" true
 if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail 'box.sh: the unset-environment BLOOMERY_ARCH entry reached ssh or rsync' 'something ran' "$tmp/ssh.log"; else pass 'box.sh: the unset-environment BLOOMERY_ARCH entry reached no ssh or rsync'; fi
 rc_is 'box.sh: a BLOOMERY_BOX_ENV arch entry equal to the default runs' 0 box env BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_86 "$B/tools/box.sh" true

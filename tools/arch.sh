@@ -8,7 +8,7 @@
 # Which archs a tool supports is the tool's own refusal, after this one (the shape pins hold sm_86 and sm_121
 # tables, the occupancy column sm_86's and sm_120/sm_121's limits; narrow-scan and the release archive are sm_86's).
 #
-#   bloomery_arch <tool>   ARCH=<the value>, or the refusal on stderr and 64
+#   bloomery_arch <tool>   ARCH and exported BLOOMERY_ARCH, or the refusal on stderr and 64
 #   bash tools/arch.sh     print that value for the justfile
 #   ARCH_SHAPE             the value's shape, for a tool that reads an arch elsewhere (a ptx-shapes table's `# arch:`)
 ARCH_SHAPE='^sm_[1-9][0-9]{1,2}[af]?$'
@@ -31,6 +31,7 @@ bloomery_arch() {
   fi
   # shellcheck disable=SC2034 # the sourcing tool reads it
   ARCH=$v
+  export BLOOMERY_ARCH=$v
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   bloomery_arch arch.sh || exit $?

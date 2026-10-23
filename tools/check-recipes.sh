@@ -937,7 +937,8 @@ for capability, override, want, rc in cases:
     if override is not None:
         case['BLOOMERY_ARCH'] = override
     for command in ([bash, str(script)],
-                    [bash, '-c', '. "$1"; bloomery_arch fixture || exit $?; printf "%s\\n" "$ARCH"', 'bash', str(script)]):
+                    [bash, '-c', '. "$1"; bloomery_arch fixture || exit $?; "$2" -c \'printf "%s\\n" "$BLOOMERY_ARCH"\'',
+                     'bash', str(script), bash]):
         got = subprocess.run(command, env=case, text=True, capture_output=True, timeout=10)
         if got.returncode != rc or got.stdout.strip() != want:
             sys.exit(f'check-recipes: arch selection {capability=} {override=}: {got.returncode=} {got.stdout=} {got.stderr=}')

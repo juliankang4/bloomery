@@ -40,13 +40,14 @@
 #                             BLOOMERY_BOX_ENV entry, before the profile, for the same reason; only under BLOOMERY_TIER=fixture (the
 #                             real tier has no variant: 64), and both set to different tags is 64. ref-paths.sh resolves the file
 #                             and refuses a tag the table does not name.
-#   BLOOMERY_ARCH=<sm_NN>     the CUDA arch (tools/arch.sh; the justfile's `arch` variable reads the same name, sm_86
-#                             unset). Set, it is checked here before anything is synced and exported into the command, so a
+#   BLOOMERY_ARCH=<sm_NN>     the CUDA arch (tools/arch.sh, which the justfile's `arch` variable runs and exports).
+#                             Set, it is checked here before anything is synced and exported into the command, so a
 #                             tool that runs on the box (tools/gate.sh, the scans, tools/release/build.sh) reads what the
 #                             recipe's `--arch {{arch}}` expanded to on this side. A value that is no arch is 64, and so is a
-#                             BLOOMERY_ARCH entry of BLOOMERY_BOX_ENV that is not this side's value (the default when it is
-#                             unset): the arch is named in the environment, where the recipes read it. Unset with no such
-#                             entry: every byte of the remote command as before, and tools/arch.sh is not read.
+#                             BLOOMERY_ARCH entry of BLOOMERY_BOX_ENV that is not this side's value (tools/arch.sh's
+#                             selection when it is unset): the arch is named in the environment, where the recipes read it.
+#                             Unset with no such entry: every byte of the remote command as before, and tools/arch.sh is
+#                             not read.
 #   BLOOMERY_BOX_READONLY=1   a read — ps, cat, tail, ls, nvidia-smi, a status probe — runs without the
 #                             guard and the hold on this side: the way to read a sitting's log, the owner's own
 #                             included, while it runs. Refused (64) when the command names cargo, just, make, cmake, ninja
@@ -850,13 +851,15 @@ for kv in ${box_env[@]+"${box_env[@]}"}; do
   fi
 done
 if [ -n "${BLOOMERY_ARCH+x}" ] || [ "$ARCH_SEEN" = 1 ]; then
+  # bloomery_arch exports its value, so whether the caller named the arch is read before it runs.
+  ARCH_NAMED=${BLOOMERY_ARCH+x}
   # shellcheck source=tools/arch.sh
   source "$HERE/tools/arch.sh"
   bloomery_arch box.sh || exit $?
   RECIPE_ARCH=$ARCH
-  [ -z "${BLOOMERY_ARCH+x}" ] || ARCHX="export BLOOMERY_ARCH=$ARCH && "
+  if [ -n "$ARCH_NAMED" ]; then ARCHX="export BLOOMERY_ARCH=$ARCH && "; else unset BLOOMERY_ARCH; fi
   if [ "$ARCH_SEEN" = 1 ] && [ "$ARCH_ENTRY" != "$ARCH" ]; then
-    echo "box.sh: BLOOMERY_ARCH is '$ARCH_ENTRY' in BLOOMERY_BOX_ENV and '$ARCH' in the environment (unset: sm_86): name it in the environment, where the recipes read it" >&2
+    echo "box.sh: BLOOMERY_ARCH is '$ARCH_ENTRY' in BLOOMERY_BOX_ENV and '$ARCH' in the environment (unset: the tools/arch.sh selection): name it in the environment, where the recipes read it" >&2
     exit 64
   fi
 fi
