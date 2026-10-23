@@ -1510,7 +1510,7 @@ mod tests {
         use crate::placement::workstation::{HostNeed, HostRead};
         use crate::placement::{
             Card, Host, Machine, ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers,
-            PoolNeed, Role, UnifiedPool, Violation,
+            PoolNeed, Role, UnifiedPool,
         };
 
         const LAYERS: usize = 4;
