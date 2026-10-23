@@ -970,21 +970,11 @@ fn plain<'a>(
     let raw = get(name)?;
     let dims: Vec<u64> = raw.shape.iter().rev().map(|&d| d as u64).collect();
     if placed.format == Format::Fp8Tensor {
-        let (scale, scale_name) = fp8_rows_scale(&get, name, placed)?;
+        let (scale, _) = fp8_rows_scale(&get, name, placed)?;
         let decoder = E4m3Rows::new(scale);
-        let mut values = [0.0; 256];
-        for (chunk, bytes) in raw.bytes.chunks(values.len()).enumerate() {
-            let values = &mut values[..bytes.len()];
-            decoder
-                .decode(bytes, values)
-                .map_err(|e| refuse(e.to_string()))?;
-            if let Some(at) = values.iter().position(|v| !v.is_finite()) {
-                return Err(refuse(format!(
-                    "value {} times scale {scale_name} is not finite",
-                    chunk * 256 + at
-                )));
-            }
-        }
+        decoder
+            .check(raw.bytes)
+            .map_err(|e| refuse(e.to_string()))?;
         return Ok(Normal {
             type_id,
             dims,

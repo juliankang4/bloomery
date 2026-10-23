@@ -324,6 +324,9 @@ pub enum QuantError {
     /// the span.
     #[error("f8_e4m3 value {at} is byte {byte:#04x}, E4M3's NaN")]
     E4m3Nan { at: usize, byte: u8 },
+    /// An F8_E4M3 value whose product with the tensor scale is not finite.
+    #[error("f8_e4m3 value {at} is byte {byte:#04x}, its scaled value is not finite")]
+    E4m3NonFinite { at: usize, byte: u8 },
 }
 
 /// Dequantize `n = dst.len()` values of one contiguous span of type `ty`.
@@ -955,10 +958,11 @@ fn ue4m3(byte: u8) -> Result<f32, &'static str> {
 /// Rows of bloomery's F8 type ([`GgmlType::F8E4M3_ROWS`], one byte a value) decoded: each byte an
 /// F8_E4M3 value (OCP E4M3FN: a sign bit, four exponent bits of bias 7, three
 /// mantissa bits, `m · 2^-9` at exponent 0) times the tensor's scale, the one
-/// rounding of the exact value's product with the scale. 0x7F and 0xFF,
-/// E4M3's NaNs, hold no value: a span holding one is refused by name.
+/// rounding of the exact value's product with the scale. A span holding
+/// 0x7F or 0xFF (E4M3's NaNs), or a scaled value that is not finite, is
+/// refused by name before any value is written.
 pub struct E4m3Rows {
-    /// Each byte's value times the scale; a NaN byte's entry is never read.
+    /// Each byte's value times the scale, including non-finite results.
     table: [f32; 256],
 }
 
@@ -978,13 +982,35 @@ impl E4m3Rows {
         E4m3Rows { table }
     }
 
+    /// Whether every byte in `src` has a finite value at the tensor's scale.
+    ///
+    /// # Errors
+    ///
+    /// The first non-finite scaled value, [`QuantError::E4m3Nan`] for a NaN
+    /// byte or [`QuantError::E4m3NonFinite`] otherwise, naming its index.
+    pub fn check(&self, src: &[u8]) -> Result<(), QuantError> {
+        if let Some(at) = src
+            .iter()
+            .position(|&b| !self.table[usize::from(b)].is_finite())
+        {
+            let byte = src[at];
+            return Err(if byte & 0x7F == 0x7F {
+                QuantError::E4m3Nan { at, byte }
+            } else {
+                QuantError::E4m3NonFinite { at, byte }
+            });
+        }
+        Ok(())
+    }
+
     /// `src`'s bytes decoded into `dst`, one value a byte.
     ///
     /// # Errors
     ///
     /// [`QuantError::ShortSrc`] when `src` holds fewer bytes than `dst`
-    /// values, and [`QuantError::E4m3Nan`] for the first NaN byte, before any
-    /// value of the span is written.
+    /// values. The first byte whose scaled value is not finite is
+    /// [`QuantError::E4m3Nan`] for a NaN byte or [`QuantError::E4m3NonFinite`]
+    /// otherwise, before any value of the span is written.
     pub fn decode(&self, src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
         let src = src.get(..dst.len()).ok_or(QuantError::ShortSrc {
             ty: GgmlType::F8E4M3_ROWS,
@@ -992,9 +1018,7 @@ impl E4m3Rows {
             need: dst.len(),
             n: dst.len(),
         })?;
-        if let Some(at) = src.iter().position(|&b| b & 0x7F == 0x7F) {
-            return Err(QuantError::E4m3Nan { at, byte: src[at] });
-        }
+        self.check(src)?;
         for (o, &b) in dst.iter_mut().zip(src) {
             *o = self.table[usize::from(b)];
         }
