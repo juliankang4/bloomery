@@ -1785,7 +1785,7 @@ for faults in load timed legacy; do
     *) whole=100000; timed=0; cold='' ;;
   esac
   arms=("bin:$BASEBIN:6@mem=29G")
-  [ "$faults" = legacy ] || arms+=("6@mem=29G")
+  arms+=("6@mem=29G")
   stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_LOAD_FAULTS=100000 "${extra[@]}" -- "${arms[@]}"
   if [ "$RC" != 0 ]; then
     fail "mem-faults-$faults" "rc $RC, want 0" "$L"

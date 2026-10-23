@@ -2120,13 +2120,13 @@ if [ -z "$DRY" ]; then
 fi
 # A missing --arm value is refused before any file or card opens. Only a binary that names that
 # parser error uses its post-load prompt marker; an unrecognized response keeps the conservative
-# --tokens path. Our binary already runs --arm lists through the load driver.
+# --tokens path. Grouped arms already use --arm through the load driver.
 A_INPUT=()
 for i in "${!ARMS[@]}"; do
   A_INPUT[i]=--tokens
+  lg_grouped "$i" && continue
   case ${A_KIND[$i]} in
-    ours) A_INPUT[i]=--arm ;;
-    bin)
+    ours | bin)
       [ -z "$DRY" ] || continue
       arm_envs "$i"
       probe_rc=0
