@@ -118,7 +118,8 @@ pub type NemotronHModel = GpuModel<arch::nemotron_h::Body>;
 /// The nemotron_h_moe engine: the whole model on one card.
 pub type NemotronHMoeModel = GpuModel<arch::nemotron_h_moe::Body>;
 pub use tensor::{
-    DeviceTensor, PartedBuffer, Pitched, Q8Act, TensorWindow, Window, WindowMut, dtod_2d, window,
+    DeviceTensor, HostFill, PartedBuffer, Pitched, Q8Act, TensorWindow, Window, WindowMut, dtod_2d,
+    host_filled, to_host, window,
 };
 
 /// Host-side failure: context creation, module loading, device allocation,

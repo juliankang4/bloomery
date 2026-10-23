@@ -10,7 +10,7 @@ use bloomery_gpu::rope_neox::{HEAD_256, PartialNeoxArgs};
 use bloomery_gpu::rope_table::RopeRows;
 use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError};
+use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError, Window, to_host};
 use cuda_core::DeviceBuffer;
 use model::arch::gemma_embedding2::hparams::key_bounds;
 use model::arch::gemma_embedding2::names;
@@ -20,11 +20,9 @@ use crate::{Attn, Consts, Encoder, Kernels, Scratch, decode_rows, reaches};
 /// The refusal `what` of a pass.
 const PASS: &str = "Encoder::pass";
 
-/// One pass's rows read back: the `output` projection of every position
-/// (`result_embd`, `n · n_out` f32, token-major), their mean (`pooled`,
-/// `n_out` f32), and the taps when asked.
+/// One pass read back: the mean of every position's `output` projection
+/// (`pooled`, `n_out` f32), and the taps when asked.
 pub struct Pass {
-    pub rows: Vec<f32>,
     pub pooled: Vec<f32>,
     pub taps: Option<Taps>,
 }
@@ -40,6 +38,8 @@ pub struct Taps {
     pub l_out: Vec<Vec<f32>>,
     /// The output norm's rows, `n · hidden`.
     pub result_norm: Vec<f32>,
+    /// The `output` projection of every position, `n · n_out`.
+    pub result_embd: Vec<f32>,
 }
 
 /// What a projection reads besides its input: the card, the kernels, the
@@ -422,10 +422,9 @@ impl Encoder {
     }
 
     /// One pass over `ids` (1 to [`Encoder::ctx`] of them, else refused by
-    /// name): every position's `output` row and their mean, and with `taps`
-    /// the rows the reference names on the way. A fault any launch raised is
-    /// the error, and so is an output value that is not finite, by its
-    /// position.
+    /// name): the mean of every position's `output` row, and with `taps` the
+    /// rows the reference names on the way. A fault any launch raised is the
+    /// error, and so is an output value that is not finite, by its position.
     pub fn pass(&mut self, ids: &[u32], taps: bool) -> Result<Pass, GpuError> {
         self.pass_media(ids, &[], taps)
     }
@@ -525,6 +524,7 @@ impl Encoder {
             consts,
             s,
             ctx,
+            readback,
             ..
         } = self;
         let stream = gpu.stream();
@@ -550,6 +550,7 @@ impl Encoder {
             inp_per_layer: vec![0.0; n * hp.n_layer * hp.per_layer],
             l_out: Vec::new(),
             result_norm: Vec::new(),
+            result_embd: Vec::new(),
         });
         let mut replay_input = Vec::new();
         if layer_inputs.is_some() {
@@ -586,7 +587,8 @@ impl Encoder {
                 std::mem::swap(&mut s.x, &mut s.c);
             }
             if let Some(t) = &mut tapped {
-                t.l_out.push(s.x.to_host_vec(stream)?[..n * e].to_vec());
+                let x = Window::<f32>::of(&s.x, 0, n * e)?;
+                t.l_out.push(to_host(stream, &x)?);
             }
         }
         let sink = gpu.unlabelled_sink();
@@ -607,7 +609,11 @@ impl Encoder {
         } else {
             cx.proj(&s.acts, &names::output(), (e, n_out), n, &mut out)?;
         }
-        let rows = out.to_host_vec(stream)?;
+        if readback.len() < out.len() {
+            *readback = bloomery_gpu::host_filled(out.len());
+        }
+        let rows = &mut readback[..out.len()];
+        out.copy_to_host(stream, rows)?;
         let pooled = if let Some(head) = hp.dense {
             let weights = DeviceBuffer::from_host(stream, &vec![1.0 / n as f32; n])?;
             let count = u32::try_from(n)
@@ -618,12 +624,15 @@ impl Encoder {
             let cx = st.cx(&s.route);
             cx.quantize(&mut s.acts, &s.a, e, 1, sink)?;
             cx.dense(&mut s.acts, &mut s.dense, (e, head, n_out), 1, &mut out)?;
-            out.to_host_vec(stream)?[..n_out].to_vec()
+            let pooled = Window::<f32>::of(&out, 0, n_out)?;
+            to_host(stream, &pooled)?
         } else {
-            embed::mean(&rows, n_out)
+            embed::mean(rows, n_out)
         };
         if let Some(t) = &mut tapped {
-            t.result_norm = s.xn.to_host_vec(stream)?[..n * e].to_vec();
+            let xn = Window::<f32>::of(&s.xn, 0, n * e)?;
+            t.result_norm = to_host(stream, &xn)?;
+            t.result_embd = rows.to_vec();
         }
         if let Some(f) = gpu.take_fault()? {
             return Err(GpuError::fault(PASS, f));
@@ -646,7 +655,6 @@ impl Encoder {
             ));
         }
         Ok(Pass {
-            rows,
             pooled,
             taps: tapped,
         })
@@ -656,6 +664,35 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_a_readback_keeps_its_memory_and_returns_each_read_whole() {
+        crate::tests::with_model(64, 2048, |split, hp| -> Result<(), GpuError> {
+            let mut enc = Encoder::open(split, hp.n_ctx, Gpu::new()?)?;
+            assert!(enc.readback.is_empty());
+            enc.pass(&[0, 1], true)?;
+            assert_eq!(enc.readback.len(), 2 * hp.n_out);
+            let at = enc.readback.as_ptr();
+            let pass = enc.pass(&[1], true)?;
+            let rows = pass.taps.unwrap().result_embd;
+            assert_eq!(rows.len(), hp.n_out);
+            assert_eq!(rows, enc.readback[..hp.n_out]);
+            assert_eq!(
+                enc.readback.as_ptr(),
+                at,
+                "the shorter pass reuses its memory"
+            );
+            enc.pass(&[1, 0], false)?;
+            assert_eq!(
+                enc.readback.as_ptr(),
+                at,
+                "the equal pass reuses its memory"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     #[ignore = "needs a CUDA card"]

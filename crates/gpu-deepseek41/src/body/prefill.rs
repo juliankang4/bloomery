@@ -1662,7 +1662,7 @@ impl Body {
             rows: self.rows.prompt_rows(T_MAX),
             sets: sets_made,
             staging,
-            taps_host: vec![0.0; T_MAX * tap_width],
+            taps_host: bloomery_gpu::host_filled(T_MAX * tap_width),
             stats: PrefillStats::default(),
             card_timing: false,
             card_marks,

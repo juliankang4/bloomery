@@ -121,7 +121,7 @@ use crate::model::{
 };
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, Order, file_site};
-use crate::tensor::WindowMut;
+use crate::tensor::{WindowMut, host_filled};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
 use bloomery_levers::{ChurnHosting, HostCfg};
@@ -2397,15 +2397,20 @@ impl GpuModel<Body35> {
             body.img.write(gpu.stream(), tokens, pos0)?;
             body.u.dims.hidden
         };
-        let mut out = Vec::with_capacity(tokens.len() * hidden);
+        let mut out = host_filled::<f32>(tokens.len() * hidden);
         let mut at = 0usize;
         for &step in &plan.steps {
             let t = match step {
                 PrefillStep::Ubatch(t) | PrefillStep::Pass(t) => t,
             };
             let unit = at..at + t;
+            let out = out.get_mut(at * hidden..(at + t) * hidden).ok_or_else(|| {
+                GpuError::shape(
+                    WHAT_H,
+                    format!("a unit of {t} positions at {at} of {}", tokens.len()),
+                )
+            })?;
             at += t;
-            let out = &mut out;
             self.run_rows(t, WHAT_H, |gpu, w, body, _, pos| {
                 body.walk_unit(gpu, w, unit, pos, UnitEnd::Hidden)?;
                 if let Some(f) = gpu.fault()? {
@@ -2415,7 +2420,7 @@ impl GpuModel<Body35> {
                 // inside it (`rows · hidden`, `t <= rows` by the walk's
                 // refusal), and the arena stays in place for the copy.
                 let rows = unsafe { super::scratch::f32_view(&body.u.normed, 0, t * hidden) };
-                out.extend_from_slice(&rows.to_host_vec(gpu.stream())?);
+                rows.copy_to_host(gpu.stream(), out)?;
                 Ok(false)
             })?;
         }

@@ -836,11 +836,7 @@ fn span_rows<'a, T: bloomery_gpu_vision::Tower + ?Sized, K>(
         width,
         |patches| {
             let encoded = tower.encode(patches).map_err(|e| e.to_string())?;
-            encoded
-                .rows
-                .buf()
-                .to_host_vec(stream)
-                .map_err(|e| e.to_string())
+            bloomery_gpu::to_host(stream, encoded.rows.buf()).map_err(|e| e.to_string())
         },
         splice,
     )
@@ -1210,11 +1206,7 @@ pub fn group_rows<T: bloomery_gpu_vision::Tower + ?Sized>(
     let (width, separators) = (tower.out_dim(), tower.separators().map(<[f32]>::to_vec));
     group_rows_of(group, width, separators.as_deref(), |patches| {
         let encoded = tower.encode(patches).map_err(|e| e.to_string())?;
-        encoded
-            .rows
-            .buf()
-            .to_host_vec(stream)
-            .map_err(|e| e.to_string())
+        bloomery_gpu::to_host(stream, encoded.rows.buf()).map_err(|e| e.to_string())
     })
 }
 

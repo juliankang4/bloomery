@@ -316,15 +316,50 @@ impl Pitched {
     }
 }
 
+/// The value host memory holds before a device-to-host copy lands in it
+/// ([`host_filled`]). Never zero: a zero fill comes back from the allocator
+/// as pages nothing has written yet. A value no copy overwrote reads as this,
+/// not as a plausible zero.
+pub trait HostFill: DeviceCopy + Copy {
+    const FILL: Self;
+}
+
+impl HostFill for f32 {
+    const FILL: f32 = f32::NAN;
+}
+
+impl HostFill for u16 {
+    const FILL: u16 = u16::MAX;
+}
+
+/// `n` [`HostFill::FILL`] values in host memory whose every page the host has
+/// written: the pageable destination of a device-to-host copy. A card that
+/// reaches pageable memory through the host's page tables (GB10's unified
+/// memory) faults on each page a copy is the first to write, one page at a
+/// time; a new allocation nothing has written is such pages.
+#[must_use]
+pub fn host_filled<T: HostFill>(n: usize) -> Vec<T> {
+    vec![T::FILL; n]
+}
+
+/// `src` read back into a new [`host_filled`] `Vec`: a readback the caller
+/// keeps. Blocking.
+pub fn to_host<T: HostFill>(
+    stream: &CudaStream,
+    src: &DeviceBuffer<T>,
+) -> Result<Vec<T>, GpuError> {
+    let mut host = host_filled(src.len());
+    src.copy_to_host(stream, &mut host)?;
+    Ok(host)
+}
+
 /// Enqueue the 2-D copy `shape` from `dev` (from byte `dev_off`) to the host
 /// memory at `host`, `host_len` bytes of it: one call for a strided store.
 /// Refused by name, nothing enqueued, when either span leaves its buffer.
 ///
 /// The destination that costs only the copy is page-locked memory of `dev`'s
 /// context (a pinned buffer or an extent of one). A pageable one costs its
-/// pages too: a card that reads the host's page tables (unified memory)
-/// faults on each page the copy is the first to write, one page at a time,
-/// so a pageable destination has every page written by the host first.
+/// pages too, so it is [`host_filled`] first.
 ///
 /// # Safety
 ///
@@ -971,6 +1006,24 @@ mod tests {
         .expect("a 2-D read from an offset");
         stream.synchronize().expect("the read lands");
         assert_eq!(tail.as_slice(), &by_plane[2 * width..], "planes 2 and 3");
+    }
+
+    /// Host memory a copy lands in holds the fill, not zero: a zero fill comes
+    /// back from the allocator as pages nothing has written.
+    #[test]
+    fn host_filled_memory_holds_the_fill_not_zero() {
+        assert!(host_filled::<f32>(5).iter().all(|v| v.is_nan()));
+        assert_eq!(host_filled::<u16>(5), [u16::MAX; 5]);
+    }
+
+    /// An owned readback returns every value of the device buffer.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_an_owned_readback_returns_each_read_whole() {
+        let (_ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let values: Vec<f32> = (0..4096u16).map(f32::from).collect();
+        let on_card = DeviceBuffer::from_host(&stream, &values).expect("a buffer");
+        assert_eq!(to_host(&stream, &on_card).expect("an owned read"), values);
     }
 
     /// A 2-D copy leaves by name, with nothing enqueued, when a side's span

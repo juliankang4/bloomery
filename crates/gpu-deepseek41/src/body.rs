@@ -2286,7 +2286,7 @@ impl FeatureTap {
             after,
             n_embd,
             dev: PartedBuffer::zeroed(gpu.stream(), [width; PAIR_ROWS])?,
-            host: vec![0.0; PAIR_ROWS * width],
+            host: bloomery_gpu::host_filled(PAIR_ROWS * width),
             pos: [None; PAIR_ROWS],
         })
     }

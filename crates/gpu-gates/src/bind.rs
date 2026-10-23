@@ -1828,7 +1828,7 @@ impl SeatEngine {
             link: Link {
                 tx: Some(tx),
                 rx,
-                logits: vec![0.0; n_vocab],
+                logits: bloomery_gpu::host_filled(n_vocab),
                 scratch: Vec::new(),
             },
             worker: Some(worker),

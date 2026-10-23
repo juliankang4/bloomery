@@ -9,7 +9,9 @@ use self::attention::kernels as attention_kernels;
 use self::attention::{HEAD, HEADS, RPE, WIDTH};
 use self::weights::{FF, Ffn, Linear, OUT, TEXT, Weights};
 use crate::ops::{Ops, config};
-use bloomery_gpu::{Gpu, GpuError, Window, WindowMut, elem::ElemKernels, gemm::Gemm32Kernels};
+use bloomery_gpu::{
+    Gpu, GpuError, Window, WindowMut, elem::ElemKernels, gemm::Gemm32Kernels, to_host,
+};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Gguf;
 use std::sync::Arc;
@@ -336,7 +338,8 @@ impl Encoder {
         if let Some(fault) = bloomery_gpu::fault::read(&p.ops.fault)? {
             return Err(GpuError::fault("gemma4a output", fault));
         }
-        let values = Window::<f32>::of(&s.c, 0, n * TEXT)?.to_host_vec(stream)?;
+        let soft = Window::<f32>::of(&s.c, 0, n * TEXT)?;
+        let values = to_host(stream, &soft)?;
         if values.iter().any(|v| !v.is_finite()) {
             return Err(GpuError::Shape {
                 what: "gemma4a output",

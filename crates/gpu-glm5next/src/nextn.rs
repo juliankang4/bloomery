@@ -63,7 +63,7 @@ use bloomery_gpu::latent::{
 use bloomery_gpu::media::widen_bf16;
 use bloomery_gpu::site;
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel};
+use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel, host_filled};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockPlan, enqueue_block};
 use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use bloomery_gpu_deepseek41::span::{span, span_mut};
@@ -824,9 +824,9 @@ fn read_rows(
             rows.len()
         ))
     })?;
-    let mut v = Vec::with_capacity(r * wide);
-    for b in bufs {
-        v.extend(span(WHAT, b, 0, wide)?.to_host_vec(stream)?);
+    let mut v = host_filled(r * wide);
+    for (b, row) in bufs.iter().zip(v.chunks_exact_mut(wide)) {
+        span(WHAT, b, 0, wide)?.copy_to_host(stream, row)?;
     }
     Ok((held, v))
 }

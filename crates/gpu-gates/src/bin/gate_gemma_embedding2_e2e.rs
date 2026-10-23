@@ -20,8 +20,8 @@
 //!    layer's reach plus one catches a dropped window; a set with no such case fails by name. The host test
 //!    `key_bounds_are_the_symmetric_mask` holds the exact key edges; every
 //!    case holds the global layers.
-//! 2. (d) The longest case run again with no taps is bit for bit the first
-//!    run's rows.
+//! 2. (d) The longest case run again is bit for bit the first run: with no
+//!    taps its pooled vector, with taps every position's row.
 //! 3. (i) V2's image-only and `mix_free-448x448` inputs assembled by the serving helper,
 //!    pooled and normalized against the server card set and its CPU twin.
 //! 4. (r) Refused by name, the load untouched after each: a pass of no ids,
@@ -228,7 +228,7 @@ mod gate {
         lines.push(worst.1);
         for (what, ours) in [
             ("result_norm", &taps.result_norm),
-            ("embd", &pass.rows),
+            ("embd", &taps.result_embd),
             ("pooled", &pass.pooled),
         ] {
             let h = held(what, ours)?;
@@ -244,6 +244,28 @@ mod gate {
             verdict(ok)
         );
         Ok((ok, pass))
+    }
+
+    /// Every position's `output` row of a pass with taps.
+    fn rows(pass: &Pass) -> Result<&[f32], GateError> {
+        let taps = pass.taps.as_ref().ok_or("a pass with taps returned none")?;
+        Ok(&taps.result_embd)
+    }
+
+    /// Clause (d): `c` run again is bit for bit `first`, a pass with taps:
+    /// with no taps its pooled vector, with taps its rows.
+    fn rerun(enc: &mut Encoder, c: &Case, first: &Pass) -> Result<bool, GateError> {
+        let plain = enc.pass(&c.ids, false)?;
+        let tapped = enc.pass(&c.ids, true)?;
+        let same =
+            same_bits(&plain.pooled, &first.pooled) && same_bits(rows(&tapped)?, rows(first)?);
+        println!(
+            "(d) {}: {} ids, a rerun's pooled vector and rows bit for bit {}",
+            c.id,
+            c.ids.len(),
+            verdict(same)
+        );
+        Ok(same)
     }
 
     /// A case long enough for a dropped window to leave the tap bands:
@@ -264,11 +286,11 @@ mod gate {
     }
 
     /// Clause (r): each refusal by its words, and a pass after them the
-    /// first one's bits.
+    /// first one's rows (`first`) bit for bit.
     fn refusals(
         enc: &mut Encoder,
         c: &Case,
-        rows: &[f32],
+        first: &[f32],
         vocab: usize,
     ) -> Result<bool, GateError> {
         const PASS: &str = "Encoder::pass";
@@ -295,8 +317,8 @@ mod gate {
             ok &= refused;
         }
         enc.pass(&vec![c.ids[0]; enc.ctx()], false)?;
-        let again = enc.pass(&c.ids, false)?;
-        let same = same_bits(&again.rows, rows);
+        let again = enc.pass(&c.ids, true)?;
+        let same = same_bits(rows(&again)?, first);
         println!(
             "(r) {}: after the refusals the rows bit for bit {}",
             c.id,
@@ -745,26 +767,14 @@ mod gate {
         }
         if let Some((i, first)) = longest {
             let c = &cases[i];
-            ok &= clause(
-                "(d)",
-                &c.id,
-                enc.pass(&c.ids, false)
-                    .map_err(GateError::from)
-                    .map(|again| {
-                        let same = same_bits(&again.rows, &first.rows);
-                        println!(
-                            "(d) {}: {} ids, a rerun's rows bit for bit {}",
-                            c.id,
-                            c.ids.len(),
-                            verdict(same)
-                        );
-                        same
-                    }),
-            );
+            // PIN(2026-10-24): a pass without taps no longer returns every
+            // position's row; (d) holds its pooled vector and a rerun with taps
+            // the rows, and (r) compares a rerun with taps.
+            ok &= clause("(d)", &c.id, rerun(&mut enc, c, &first));
             ok &= clause(
                 "(r)",
                 "refusals",
-                refusals(&mut enc, c, &first.rows, read.spec.vocab as usize),
+                rows(&first).and_then(|rows| refusals(&mut enc, c, rows, read.spec.vocab as usize)),
             );
         }
         if !v1 {

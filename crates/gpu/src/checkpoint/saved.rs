@@ -41,7 +41,7 @@
 //! rows the copy reads are not cut, reset or replaced before then.
 //!
 //! The host memory of a state taken by [`SeqState::save`] is pageable, every
-//! page written by the host before the copies ([`crate::tensor::dtoh_2d`]):
+//! page written by the host before the copies ([`crate::tensor::host_filled`]):
 //! each copy runs on the engine stream, one synchronize at the end.
 
 use std::fmt;
@@ -54,7 +54,7 @@ use runtime::savemap::{Per, Run, Strip, plan_prefix, plan_whole};
 use super::Checkpoints;
 use super::staging::{NoRoom, Staged, Staging};
 use crate::GpuError;
-use crate::tensor::{Pitched, dtoh_2d, htod_2d};
+use crate::tensor::{Pitched, dtoh_2d, host_filled, htod_2d};
 
 const WHAT: &str = "sequence state";
 
@@ -588,11 +588,8 @@ impl<T> SeqState<T> {
         let runs = lent.runs();
         let strips = plan_whole(&runs).map_err(|e| shape(e.to_string()))?;
         let one: usize = lens.iter().sum();
-        // Filled before the copies overwrite them, so that the host has
-        // written every page (`dtoh_2d`); a zero fill would come back from
-        // the allocator as pages nothing has written yet.
-        let mut rows = vec![u16::MAX; runs.iter().map(Run::values).sum()];
-        let mut recurrent = vec![f32::NAN; one * (1 + points.len())];
+        let mut rows = host_filled::<u16>(runs.iter().map(Run::values).sum());
+        let mut recurrent = host_filled::<f32>(one * (1 + points.len()));
         let (rows_at, rows_len) = (rows.as_mut_ptr().cast::<u8>(), rows.len() * 2);
         let rec_at = recurrent.as_mut_ptr().cast::<u8>();
         // SAFETY: both vectors are neither read nor freed before the

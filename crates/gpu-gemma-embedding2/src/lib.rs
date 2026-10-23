@@ -456,6 +456,8 @@ pub struct Encoder {
     pub(crate) consts: Consts,
     pub(crate) s: Scratch,
     pub(crate) ctx: usize,
+    /// The host memory a pass's output rows land in, kept across passes.
+    pub(crate) readback: Vec<f32>,
 }
 
 impl Encoder {
@@ -535,6 +537,7 @@ impl Encoder {
             consts,
             s,
             ctx,
+            readback: Vec::new(),
         })
     }
 

@@ -159,7 +159,7 @@ use crate::model::{
 };
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
-use crate::tensor::WindowMut;
+use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
 use crate::{Branch, DeviceTensor, Gpu, GpuError, launch_u32, ple};
 use bloomery_levers::{ChurnHosting, HostCfg};
@@ -2807,7 +2807,7 @@ impl Body38 {
                 ));
             }
             let v = crate::tensor::Window::<f32>::of(buf, at * size_of::<f32>(), wide)?;
-            return Ok(Some(v.to_host_vec(stream)?));
+            return Ok(Some(to_host(stream, &v)?));
         }
         Ok(None)
     }
@@ -3096,8 +3096,14 @@ impl Body38 {
                     ),
                 ));
             }
-            let mut v = self.final_streams(walk).to_host_vec(stream)?;
-            v.truncate(n * wide);
+            let v = match n * wide {
+                0 => Vec::new(),
+                len => {
+                    let window =
+                        crate::tensor::Window::<f32>::of(self.final_streams(walk), 0, len)?;
+                    to_host(stream, &window)?
+                }
+            };
             Ok((Held38::at(first, u32::try_from(n).unwrap_or(u32::MAX)), v))
         };
         let step = rows(TargetRows::Step, 1)?;

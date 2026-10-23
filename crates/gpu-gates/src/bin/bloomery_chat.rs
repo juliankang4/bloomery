@@ -476,7 +476,7 @@ mod drive {
         let mut dec = Decoder::new(tok, true);
         let mut stdout = std::io::stdout().lock();
         // One row for every token: the head refuses a row of another length.
-        let mut logits = vec![0.0f32; tok.n_vocab()];
+        let mut logits = bloomery_gpu::host_filled(tok.n_vocab());
         let stop = loop {
             g.model().logits_into(&mut logits)?;
             let next = sampler.sample(&logits, &history);
