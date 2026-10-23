@@ -5098,6 +5098,66 @@ mod gate {
         ok &= clause_timed("slots", "(h2) forced keeps", || h2_kept(s, (a, b)));
         ok &= clause_timed("slots", "(h3) refusals", || h3_refusals(s, inputs, (a, b)));
         ok &= clause_timed("slots", "(h4) walk", || h4_walk(s, (a, b)));
+        ok &= clause_timed("slots", "(h5) round limits", || h5_round_limits(s, [a, b]));
+        Ok(ok)
+    }
+
+    /// Plain, drafted and mixed windows of four slots use legal passes and
+    /// return the same ids as each window run independently.
+    fn h5_round_limits(s: &mut Session<Body>, prompts: [&[u32]; 2]) -> Result<bool, GateError> {
+        s.add_slots(4)?;
+        let mut ok = true;
+        for mode in [StepMode::Eager, StepMode::Graph] {
+            s.model_mut().set_mode(mode);
+            for depths in [[0; 4], [1; 4], [0, 1, 0, 1]] {
+                let mut expected = Vec::new();
+                for (i, &depth) in depths.iter().enumerate() {
+                    let prompt = prompts[i % prompts.len()];
+                    if depth == 1 {
+                        let r = h_solo(s, prompt, &[None])?;
+                        expected.push(r.ids[1..r.ids.len() - 1].to_vec());
+                    } else {
+                        let mut d = d_open(s)?;
+                        let mut r = d_start(s, &mut d, 0, prompt)?;
+                        let last = r.last()?;
+                        d_step(s, &mut d, &mut r, last, false)?;
+                        expected.push(vec![r.last()?]);
+                    }
+                }
+                let mut drafts = Vec::new();
+                let mut lasts = Vec::new();
+                for slot in 0..depths.len() {
+                    let mut d = d_open(s)?;
+                    let r = d_start(s, &mut d, slot, prompts[slot % prompts.len()])?;
+                    lasts.push(r.last()?);
+                    drafts.push(d);
+                }
+                let mut outs = vec![Vec::new(); depths.len()];
+                let mut windows: Vec<_> = drafts
+                    .iter_mut()
+                    .zip(&mut outs)
+                    .enumerate()
+                    .map(|(slot, (draft, out))| app::mtp::SlotWindow {
+                        slot,
+                        last: lasts[slot],
+                        depth: depths[slot],
+                        draft,
+                        out,
+                    })
+                    .collect();
+                let (commits, passes) = app::mtp::pass_slots(s, &mut windows)?;
+                let same = outs == expected
+                    && passes == 2
+                    && s.selected() == 0
+                    && commits.len() == depths.len();
+                println!(
+                    "stagger-draft (h5) {mode:?} depths={depths:?} passes={passes} solo_ids={} {}",
+                    outs == expected,
+                    verdict(same)
+                );
+                ok &= same;
+            }
+        }
         Ok(ok)
     }
 
