@@ -181,6 +181,8 @@ basepid=$!
 wait "$newpid"; wait "$basepid"
 for arm in base new; do
   cp "$WORK/$arm.rc" "$OUT/$arm.rc"
+done
+for arm in base new; do
   rc=$(cat "$WORK/$arm.rc")
   [ "$rc" = 0 ] || { echo "batch-replay: the $arm arm ended rc=$rc:" >&2; tail -5 "$OUT/$arm.log" >&2; exit 70; }
 done
