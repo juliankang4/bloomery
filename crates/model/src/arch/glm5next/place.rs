@@ -1510,7 +1510,7 @@ mod tests {
         use crate::placement::workstation::{HostNeed, HostRead};
         use crate::placement::{
             Card, Host, Machine, ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers,
-            Role, UnifiedPool, Violation,
+            PoolNeed, Role, UnifiedPool, Violation,
         };
 
         const LAYERS: usize = 4;
@@ -1930,27 +1930,42 @@ mod tests {
         /// next-token layer's card bytes and arena, its routed experts on the
         /// host and the front on a plan with it. A pool of exactly the need the
         /// plan's host headroom counts plans clean, and one byte under it is
-        /// refused once, by the pool's bound, naming those bytes beside the
-        /// plan.
+        /// refused by the host floor before pool validation.
+        // PIN(2026-10-23): capped tier rooms refuse at the host floor before pool validation.
         #[test]
         fn slot_plans_on_one_pool_count_the_bytes_beside_once() {
             let (inputs, nextn) = (inputs(), nextn());
             let levers = PlanLevers::default();
             let front = prompt_reserve_bytes(&inputs, CTX, false);
             let ample: u64 = 1 << 40;
-            let check = |at: &str, plan: &dyn Fn(u64) -> Result<i128, PlaceError>, beside: u64| {
-                let room = plan(ample).unwrap_or_else(|e| panic!("{at}, an ample pool: {e}"));
+            let check = |at: &str,
+                         plan: &dyn Fn(u64) -> Result<(i128, PoolNeed), PlaceError>,
+                         beside: u64| {
+                let (room, pool) =
+                    plan(ample).unwrap_or_else(|e| panic!("{at}, an ample pool: {e}"));
                 let need = ample - u64::try_from(room).expect("a headroom within the pool");
+                let physical = i128::from(ample)
+                    + i128::from(pool.cards)
+                    + i128::from(pool.host)
+                    + i128::from(beside)
+                    - i128::from(pool.pool);
+                assert_eq!(
+                    i128::from(need),
+                    physical,
+                    "{at}: every beside byte counted once"
+                );
                 if let Err(e) = plan(need) {
                     panic!("{at}, a pool of the host's need {need} B: {e}");
                 }
                 match plan(need - 1) {
-                    Err(PlaceError::Broken(v)) => match v.as_slice() {
-                        [Violation::PoolOver { beside: b, .. }] => {
-                            assert_eq!(*b, beside, "{at}: the bytes beside the plan");
+                    Err(PlaceError::Placement(PlacementError::PoolBudget { last, .. })) => {
+                        match *last {
+                            PlacementError::HostRoomFloor { room, floor, .. } => {
+                                assert_eq!(floor - room, 1, "{at}: the exact one-byte shortfall");
+                            }
+                            e => panic!("{at}: {e:?}, not the host floor"),
                         }
-                        v => panic!("{at}: {v:?}, not one PoolOver"),
-                    },
+                    }
                     other => panic!("{at}, a pool one byte under the need: {other:?}"),
                 }
             };
@@ -1960,7 +1975,12 @@ mod tests {
                     &|pool| {
                         inputs
                             .plan_slots(&unified(pool), CTX, &levers, KdaLanes::One, n)
-                            .map(|p| p.host.headroom_bytes)
+                            .map(|p| {
+                                (
+                                    p.host.headroom_bytes,
+                                    p.pool_need().expect("a unified pool"),
+                                )
+                            })
                     },
                     front,
                 );
@@ -1981,7 +2001,12 @@ mod tests {
                     &|pool| {
                         inputs
                             .plan_nextn_slots(&unified(pool), CTX, &levers, &nextn, n)
-                            .map(|p| p.host_headroom_bytes)
+                            .map(|p| {
+                                (
+                                    p.host_headroom_bytes,
+                                    p.plan.pool_need().expect("a unified pool"),
+                                )
+                            })
                     },
                     beside,
                 );
