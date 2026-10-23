@@ -52,9 +52,10 @@
 //!   card, and returns no token from the rows node 1 served after it.
 //!
 //! `--host` lowers an equal partition of expert ids into the loaded map.
-//! Its loopback server has 20 GiB of host room through the existing room
-//! lever. The same plan's local CPU tier is the byte oracle; the node must
-//! have no resident device weights and must report nonzero NVMe fills.
+//! The functional gate's loopback server has 20 GiB of host room; measurements
+//! use the caller's host room. The same plan's local CPU tier is the byte
+//! oracle; the node must have no resident device weights and must report
+//! nonzero NVMe fills.
 //! `--history <gib> <out>` saves a history for an off-host comparison.
 //!
 //! Node 0 runs as a child of this binary (`--node0`, `--hold0`) with the
@@ -127,6 +128,7 @@ mod gate {
     /// and node 1's tier share this machine's first card, so two budgets
     /// must fit that device; smaller cards search lower budgets.
     const TOP_GIB: u64 = 16;
+    const GATE_HOST_ROOM: u64 = 20 << 30;
     /// The go deadline and the grace a lost node is named within, plus room;
     /// for a lost node 0, node 1's drain deadline too.
     const LOST_BOUND_S: f64 = 45.0;
@@ -604,9 +606,7 @@ mod gate {
         }
     }
 
-    /// Node 1: a tier server on a free loopback port, serving `model` when
-    /// one is given, and its address.
-    fn node1(model: Option<&Path>, host: bool) -> Result<(Proc, SocketAddr), GateError> {
+    fn node1_command(model: Option<&Path>, host_room: Option<u64>) -> Result<Command, GateError> {
         let mut cmd = Command::new(beside("tier_server")?);
         cmd.args(["--listen", "127.0.0.1:0"])
             .env_remove(TIER_NODES)
@@ -614,13 +614,22 @@ mod gate {
             .env_remove(HOST_POPULATE)
             .env_remove(HOST_LOCK)
             .env_remove(CARD_DONTNEED);
-        if host {
-            cmd.env(bloomery_levers::HOST_ROOM, "20G");
+        if let Some(room) = host_room {
+            cmd.env(bloomery_levers::HOST_ROOM, room.to_string());
         }
         if let Some(m) = model {
             cmd.arg("-m").arg(m);
         }
-        let p = Proc::spawn(cmd, "node 1")?;
+        Ok(cmd)
+    }
+
+    /// Node 1: a tier server on a free loopback port, serving `model` when
+    /// one is given, and its address.
+    fn node1(
+        model: Option<&Path>,
+        host_room: Option<u64>,
+    ) -> Result<(Proc, SocketAddr), GateError> {
+        let p = Proc::spawn(node1_command(model, host_room)?, "node 1")?;
         let line = p.wait_line("listening on ", Duration::from_secs(120))?;
         let addr = line["listening on ".len()..].parse()?;
         Ok((p, addr))
@@ -903,7 +912,7 @@ mod gate {
             1,
             usize::try_from(model::arch::qwen35moe::place::tier_route_scratch_bytes(1))?,
         );
-        let (mut n1, addr) = node1(None, c.node_host)?;
+        let (mut n1, addr) = node1(None, c.node_host.then_some(GATE_HOST_ROOM))?;
         open.project(plan, &TierNode::census_of(addr)?)?;
         let target = std::env::temp_dir().join(format!("{NAME}-{}.target", std::process::id()));
         let alias =
@@ -1047,7 +1056,7 @@ mod gate {
                 .ok_or_else(|| "a file of no shard".into())
         })();
         let r = made.and_then(|copy| {
-            let (_n1, addr) = node1(Some(&copy), host)?;
+            let (_n1, addr) = node1(Some(&copy), host.then_some(GATE_HOST_ROOM))?;
             Ok(TierNode::open(addr, &open).map(drop))
         });
         let r = remove_open_copy(&dir, r)?;
@@ -1354,7 +1363,7 @@ mod gate {
     /// forwarded: node 1 exits within the bound, naming the loss, its go
     /// words released and its stream drained.
     fn lost_node0(gib: u64, sig: &str, what: &str, host: bool) -> Result<bool, GateError> {
-        let (mut n1, addr) = node1(None, host)?;
+        let (mut n1, addr) = node1(None, host.then_some(GATE_HOST_ROOM))?;
         let relay = Relay::start(addr)?;
         let mut n0 = node0(&["--hold0".to_string(), gib.to_string()], relay.addr, host)?;
         n0.wait_line(ARMED, Duration::from_secs(600))?;
@@ -1414,7 +1423,7 @@ mod gate {
     /// exits within the bound, naming the loss, its words released and its
     /// stream drained.
     fn stopped_node1(gib: u64, host: bool) -> Result<bool, GateError> {
-        let (mut n1, addr) = node1(None, host)?;
+        let (mut n1, addr) = node1(None, host.then_some(GATE_HOST_ROOM))?;
         let mut n0 = node0(&["--hold0".to_string(), gib.to_string()], addr, host)?;
         n0.wait_line(ARMED, Duration::from_secs(600))?;
         n1.signal("-STOP")?;
@@ -1462,7 +1471,7 @@ mod gate {
     fn gate(c: &Common) -> Result<(), GateError> {
         let mut pass = true;
         tier::sc("census: node 1's census over the channel is the plan's tier card")?;
-        let (mut n1, addr) = node1(None, c.node_host)?;
+        let (mut n1, addr) = node1(None, c.node_host.then_some(GATE_HOST_ROOM))?;
         let mut machine = None;
         let (plan, gib, census_ok) = census_plan(c, &mut machine, addr)?;
         pass &= census_ok;
@@ -1740,7 +1749,8 @@ mod gate {
                 if arm == "local" {
                     measure(&c, gib, None)
                 } else {
-                    let (_server, addr) = node1(None, c.node_host)?;
+                    let room = bloomery_levers::nvtier_levers()?.host_room;
+                    let (_server, addr) = node1(None, room)?;
                     let mut child = node0(
                         &["--measure-node0".into(), gib.to_string()],
                         addr,
@@ -1766,6 +1776,19 @@ mod gate {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn node_host_room_is_explicit_or_inherited() {
+            for room in [None, Some(0), Some(super::GATE_HOST_ROOM), Some(32 << 30)] {
+                let cmd = super::node1_command(None, room).unwrap();
+                let actual = cmd
+                    .get_envs()
+                    .find(|(name, _)| *name == bloomery_levers::HOST_ROOM)
+                    .map(|(_, value)| value.unwrap().to_str().unwrap());
+                let expected = room.map(|bytes| bytes.to_string());
+                assert_eq!(actual, expected.as_deref());
+            }
+        }
+
         #[test]
         fn host_modes_never_ignore_the_requested_tier() {
             for args in [
