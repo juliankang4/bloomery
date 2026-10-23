@@ -145,3 +145,158 @@ fn out_dim(split: &Split, name: &str) -> Result<u64, PlacementError> {
         .copied()
         .ok_or_else(|| refuse(format!("has dims {:?}, no output width", t.dims)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::deepseek41::hparams::{
+        Collapse, Experts, HyperConnections, Indexer, Model, RowTypes, Score,
+    };
+    use crate::arch::deepseek41::place::PlanInputs;
+    use crate::placement::{
+        Card, Host, Machine, ModelTensor, ModelTensors, Node, PlanLevers, Role, UnifiedPool,
+        workstation::HostRead,
+    };
+    use gguf::GgmlType;
+    use models::{Arch, ChatSpec, ModelSpec};
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn nvme_room_is_capped_by_the_unified_pool() {
+        let pool = 26 << 20;
+        let mut inputs = PlanInputs {
+            hp: Hparams {
+                model: Model::Deepseek4,
+                n_layer: 4,
+                n_embd: 256,
+                n_head: 1,
+                n_head_kv: 1,
+                head_dim: 256,
+                q_lora_rank: 256,
+                o_groups: 1,
+                o_lora_rank: 256,
+                rope_dims: 64,
+                window: 128,
+                rms_eps: 1e-6,
+                q_head_norm: true,
+                n_vocab: 1,
+                n_ctx_train: 128,
+                csa_ratio: 1,
+                hca_ratio: 1,
+                indexer: Indexer {
+                    n_head: 1,
+                    head_dim: 128,
+                    top_k: 1,
+                },
+                candidates: None,
+                hc: HyperConnections {
+                    streams: 4,
+                    sinkhorn_iters: 20,
+                    eps: 1e-6,
+                },
+                collapse: Collapse::Head,
+                experts: Experts {
+                    n_expert: 64,
+                    n_used: 2,
+                    n_shared: 1,
+                    ff: 256,
+                    routed_scale: 1.0,
+                    weights_norm: true,
+                    score: Score::SqrtSoftplus,
+                    dense_lead: 0,
+                    hash_layers: 0,
+                },
+                engram: None,
+                rows: RowTypes {
+                    token_embd: GgmlType::F32,
+                    engram: None,
+                },
+                layers: Vec::new(),
+            },
+            model: ModelTensors {
+                tensors: (0..4)
+                    .flat_map(|l| {
+                        ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|stem| ModelTensor {
+                            name: format!("blk.{l}.{stem}.weight"),
+                            shard: 0,
+                            layer: Some(l),
+                            role: Role::RoutedExperts,
+                            ty: GgmlType::Q4_K,
+                            dims: vec![256, 256, 64],
+                            file_bytes: 256 * 256 * 64 / 256 * 144,
+                            gathered_rows: None,
+                        })
+                    })
+                    .collect(),
+                layers: 4,
+                experts: 64,
+                experts_used: 2,
+                bf16_words: |_| false,
+            },
+            spec: ModelSpec {
+                arch: Arch::Deepseek4,
+                hidden: 256,
+                vocab: 1,
+                ctx_train: 128,
+                rms_eps: 1e-6,
+                layers: Vec::new(),
+                mtp: Vec::new(),
+                hc: None,
+                engram: None,
+                encoder: None,
+                chat: ChatSpec {
+                    pre: String::new(),
+                    template: None,
+                    tools: None,
+                    reasoning: None,
+                },
+            },
+            kv: KvLayout {
+                window: 128,
+                latent: 256,
+                sources: vec![None; 4],
+            },
+            room: (pool, HostRead::Given),
+            arena: None,
+        };
+        let machine = Machine {
+            cards: vec![Card {
+                name: "pool".into(),
+                device: None,
+                usable_bytes: pool,
+                context_bytes: 0,
+                scratch_bytes: 0,
+                margin_bytes: 0,
+                granule_bytes: NonZeroU64::MIN,
+                free_bytes: Some(pool),
+                held_by: None,
+                layers: 0..4,
+                head: true,
+                token_embedding: false,
+                reserves: Vec::new(),
+            }],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: Host {
+                    usable_bytes: pool,
+                    reserves: Vec::new(),
+                },
+                unified: Some(UnifiedPool { bytes: pool }),
+            }],
+        };
+        let levers = PlanLevers {
+            card_budget_bytes: Some(2 << 20),
+        };
+        let expected = inputs
+            .plan(&machine, 64, &levers)
+            .expect("the pool fits with NVMe");
+        let expected_rows = format!("{:?}", expected.rows);
+        assert!(expected.host.nvme_expert_bytes > 0);
+        inputs.room.0 += 16 << 20;
+        let plan = inputs
+            .plan(&machine, 64, &levers)
+            .expect("a larger host reading keeps the same pool budget");
+        assert_eq!(format!("{:?}", plan.rows), expected_rows);
+        assert!(plan.violations().is_empty());
+    }
+}

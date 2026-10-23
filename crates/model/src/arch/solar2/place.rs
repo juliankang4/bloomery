@@ -244,6 +244,39 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unified_room_still_refuses_an_unserved_nvme_tier() {
+        use crate::placement::{Role, UnifiedPool};
+        let mut inputs = described("so2-place-pool-room");
+        for tensor in &mut inputs.model.tensors {
+            if tensor.role == Role::RoutedExperts {
+                tensor.dims[1] *= 1024;
+                tensor.file_bytes *= 1024;
+            }
+        }
+        let mut machine = workstation::plan_gate(LAYERS);
+        machine.cards[0].context_bytes = 0;
+        machine.cards[0].scratch_bytes = 0;
+        machine.cards[0].margin_bytes = 0;
+        machine.cards[0].reserves.clear();
+        let levers = PlanLevers::default();
+        inputs.room = (u64::MAX, workstation::HostRead::Given);
+        let whole = inputs
+            .plan(&machine, 64, &levers)
+            .expect("the ample host fits");
+        let pool = whole.cards[0].bytes()
+            + inputs.prompt_reserve
+            + workstation::HostNeed::of(&whole, 0).bytes()
+            - 1;
+        machine.host_mut().usable_bytes = pool;
+        machine.host_mut().reserves.clear();
+        *machine.unified_mut() = Some(UnifiedPool { bytes: pool });
+        match inputs.plan(&machine, 64, &levers) {
+            Err(PlaceError::NoNvmeTier { paged, .. }) => assert!(paged > 0),
+            other => panic!("the unserved tier must be refused by name: {other:?}"),
+        }
+    }
+
     /// A machine that names an expert tier card is planned, the stage card keeping the tier's
     /// places of the prompt batch beside its prompt reserve: the reserve a tiered load makes is
     /// the plain one plus the places, join places and join weights of `PROMPT_ROWS` rows of the

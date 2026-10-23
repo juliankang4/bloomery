@@ -992,8 +992,8 @@ pub struct HostTotals {
     /// plan's host need, since the room binds there.
     pub headroom_bytes: i128,
     /// The host room the plan was made at: the reading it took and the
-    /// room it was held to ([`workstation::plan_room`], the reading less
-    /// [`workstation::HOST_DRIFT`]); `None` for a plan made without one.
+    /// room it was held to ([`Plan::plan_at`], including the machine caps);
+    /// `None` for a plan made without one.
     pub room: Option<(u64, u64)>,
 }
 
@@ -3854,31 +3854,25 @@ fn card_total(card: &Card, totals: &CardTotals, heap: &Heap) -> u64 {
 }
 
 impl Plan<'_> {
-    /// The room a plan with the host room `room` is made at, which this
-    /// plan then names ([`HostTotals::room`]): the one caller of
-    /// [`workstation::plan_room`] for a plan's tiers, and the one place a
-    /// stated room reaches the plan's host headroom before a tier reads it.
+    /// The room the plan's tiers use: [`workstation::plan_room`], capped by
+    /// the machine's host room and its unified pool. The pool's reading already
+    /// leaves out the cards' context self cost; [`workstation::HostNeed`] counts
+    /// the cards and the bytes reserved beside the plan, so none is subtracted
+    /// from the room again. The reading and effective room are recorded in
+    /// [`HostTotals::room`].
     ///
-    /// A [`workstation::HostRead::Given`] room is the caller's statement of
-    /// the host's room, so the plan's headroom is the tighter of it and the
-    /// machine's figure ([`workstation::HostNeed::machine_room`]) past the
-    /// plan's host terms ([`workstation::HostNeed::headroom`]), the same term
-    /// a split plan takes ([`expert_nvme_tier`]) — a churn pool beside a
-    /// plan that fits the room and not the pool is then refused by name
-    /// ([`churn::OverHost`]), not by the load's host check. A stated room
-    /// past the figure leaves the figure, which holds the plan whatever the
-    /// room ([`Plan::violations`]). A room that was read leaves the
-    /// headroom as it is, the machine's figure: a reading moves between a
-    /// plan and its load and is held at the load
-    /// ([`workstation::HostNeed::check`]). Naming a room again recomputes
-    /// the headroom from the plan's terms.
+    /// A [`workstation::HostRead::Given`] room also sets the host headroom from
+    /// the plan's terms at that room. A read room keeps the headroom at the
+    /// machine's figure until a tier splits the plan: the reading can move
+    /// between the plan and its load, where [`workstation::HostNeed::check`]
+    /// holds it. A split plan's headroom is what its effective room leaves.
     pub fn plan_at(&mut self, room: &(u64, workstation::HostRead)) -> u64 {
-        let planned = workstation::plan_room(room);
+        let figure = workstation::HostNeed::machine_room(self.machine.host());
+        let pool = self.machine.unified().map_or(u64::MAX, |pool| pool.bytes);
+        let planned = workstation::plan_room(room).min(figure).min(pool);
         self.host.room = Some((room.0, planned));
         if room.1 == workstation::HostRead::Given {
-            let figure = workstation::HostNeed::machine_room(self.machine.host());
-            self.host.headroom_bytes =
-                workstation::HostNeed::of(self, 0).headroom(planned.min(figure));
+            self.host.headroom_bytes = workstation::HostNeed::of(self, 0).headroom(planned);
         }
         planned
     }
@@ -5991,6 +5985,47 @@ mod tests {
                 v => panic!(
                     "context {context}, {experts} experts on the card: {v:?}, not one PoolOver"
                 ),
+            }
+        }
+    }
+
+    #[test]
+    fn plan_room_uses_the_host_and_unified_limits_once() {
+        use workstation::{HOST_DRIFT, HostNeed, HostRead, OS_RESERVE};
+        let model = layered(3);
+        let pool = 1 << 30;
+        for context in [1_000, workstation::CONTEXT] {
+            for host_room in [pool - 100, pool + 100] {
+                let machine = Machine {
+                    cards: vec![Card {
+                        context_bytes: context,
+                        free_bytes: Some(pool),
+                        ..bytes_card("pool", 2 * pool, 0..3)
+                    }],
+                    tiers: Vec::new(),
+                    nodes: vec![Node {
+                        host: Host {
+                            usable_bytes: host_room + 64,
+                            reserves: vec![(OS_RESERVE.into(), 64)],
+                        },
+                        unified: Some(UnifiedPool { bytes: pool }),
+                    }],
+                };
+                let mut plan = plan_with(&model, &machine, 4096, &NoKv, None).unwrap();
+                for read in [HostRead::Given, HostRead::MemAvailable] {
+                    for room in [pool - 200, pool + HOST_DRIFT + 200] {
+                        let reading = (room, read.clone());
+                        let want = workstation::plan_room(&reading).min(host_room).min(pool);
+                        assert_eq!(plan.plan_at(&reading), want);
+                        assert_eq!(plan.host.room, Some((room, want)));
+                        if read == HostRead::Given {
+                            assert_eq!(
+                                plan.host.headroom_bytes,
+                                HostNeed::of(&plan, 0).headroom(want)
+                            );
+                        }
+                    }
+                }
             }
         }
     }

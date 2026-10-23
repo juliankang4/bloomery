@@ -186,8 +186,8 @@ pub struct PlanInputs {
     /// of its own sets it, read [`HostRead::Given`]. Part-source tables stay
     /// on NVMe regardless of this room ([`PlanInputs::row_source`]).
     ///
-    /// The plan is made at [`workstation::plan_room`]: a read room less
-    /// [`workstation::HOST_DRIFT`], a given room as given.
+    /// The effective room is [`Plan::plan_at`]'s: the reading's plan room,
+    /// capped by the machine's host room and unified pool.
     pub room: (u64, HostRead),
     /// A part source's rows stay on NVMe, with room for each stored plane.
     pub row_source: placement::RowTableSource,
@@ -3623,6 +3623,83 @@ mod tests {
                     "the all-host rule: not the floor's refusal: {:?}",
                     other.err()
                 ),
+            }
+        }
+
+        #[test]
+        fn nvme_room_is_capped_by_the_unified_pool() {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(1 << 30),
+            };
+            let mut inputs = routed(inputs());
+            for slots in [1, 2, 4] {
+                let mut machine = machine();
+                let ample = 1 << 40;
+                machine.host_mut().usable_bytes = ample;
+                *machine.unified_mut() = Some(UnifiedPool { bytes: ample });
+                inputs.room = (ample, HostRead::Given);
+                let whole = inputs
+                    .plan_with_slots(&machine, CTX, &levers, Experts::Card, slots)
+                    .unwrap();
+                let pool = placement::workstation::HostNeed::of(&whole, 0).bytes() - 1;
+                machine.cards[0].free_bytes = Some(pool);
+                machine.host_mut().usable_bytes = pool;
+                *machine.unified_mut() = Some(UnifiedPool { bytes: pool });
+                inputs.room = (pool, HostRead::Given);
+                let expected = inputs
+                    .plan_with_slots(&machine, CTX, &levers, Experts::Card, slots)
+                    .expect("the pool fits with NVMe");
+                let expected_rows = format!("{:?}", expected.rows);
+                let expected_counts = expected.n_l.clone();
+                let expected_headroom = expected.host.headroom_bytes;
+                inputs.room = (ample, HostRead::Given);
+                let plan = inputs
+                    .plan_with_slots(&machine, CTX, &levers, Experts::Card, slots)
+                    .expect("a larger host reading keeps the same pool budget");
+                assert!(plan.host.nvme_expert_bytes > 0);
+                assert_eq!(plan.n_l, expected_counts);
+                assert_eq!(format!("{:?}", plan.rows), expected_rows);
+                assert_eq!(plan.host.headroom_bytes, expected_headroom);
+            }
+        }
+
+        #[test]
+        fn node_nvme_room_is_capped_by_the_unified_pool() {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(1 << 30),
+            };
+            let mut inputs = routed(inputs());
+            for ranks in [1, 2, 4] {
+                let owned = vec![inputs.model.experts / ranks; ranks as usize];
+                let ample = 1 << 40;
+                let mut m = machine();
+                m.host_mut().usable_bytes = ample;
+                *m.unified_mut() = Some(UnifiedPool { bytes: ample });
+                for _ in 1..ranks {
+                    let mut tier = m.cards[0].clone();
+                    tier.head = false;
+                    tier.layers = 0..0;
+                    m.tiers.push(tier);
+                    m.nodes.push(m.nodes[0].clone());
+                }
+                inputs.room = (ample, HostRead::Given);
+                let whole = inputs.plan_nodes(&m, CTX, &levers, &owned).unwrap();
+                let pool = placement::workstation::HostNeed::of(&whole, 0).bytes() - 1;
+                m.cards[0].free_bytes = Some(pool);
+                m.host_mut().usable_bytes = pool;
+                *m.unified_mut() = Some(UnifiedPool { bytes: pool });
+                inputs.room = (pool, HostRead::Given);
+                let expected = inputs
+                    .plan_nodes(&m, CTX, &levers, &owned)
+                    .expect("the node-owned experts fit with NVMe");
+                let expected_rows = format!("{:?}", expected.rows);
+                inputs.room = (ample, HostRead::Given);
+                let plan = inputs
+                    .plan_nodes(&m, CTX, &levers, &owned)
+                    .expect("each rank keeps the same local pool budget");
+                assert!(plan.host.nvme_expert_bytes > 0, "{ranks} ranks");
+                assert_eq!(plan.tier_n_l.len(), ranks as usize - 1);
+                assert_eq!(format!("{:?}", plan.rows), expected_rows);
             }
         }
 

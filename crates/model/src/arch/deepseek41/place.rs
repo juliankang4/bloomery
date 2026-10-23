@@ -48,8 +48,8 @@ pub struct PlanInputs {
     /// gate that plans an arm by a room of its own sets it, read
     /// [`HostRead::Given`].
     ///
-    /// The plan is made at [`workstation::plan_room`]: a read room less
-    /// [`workstation::HOST_DRIFT`], a given room as given.
+    /// The effective room is [`Plan::plan_at`]'s: the reading's plan room,
+    /// capped by the machine's host room and unified pool.
     pub room: (u64, HostRead),
     /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
