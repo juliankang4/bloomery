@@ -78,12 +78,12 @@ pub fn anchor(pos: u32, every: u32) -> bool {
 /// The points a save at `pos` carries, ascending, of the `held` points a
 /// ledger spaced `every` positions holds: the first point, every anchor
 /// ([`anchor`]) below `pos`, and the last point below `pos`. A request that
-/// shares only the first `n` positions of the saved prompt restores at the nearest carried
-/// point at or below `n`. When the ledger retains every anchor, that point
-/// is within a factor of 2 of `n` once `n` reaches the first anchor. For
-/// nonzero spacing the save carries at most log2(`pos` / `every`) + 3
-/// points, including its first and last. A position the ledger does not hold is skipped,
-/// never made up. `held` is ascending.
+/// shares only the first `n` positions of the saved prompt restores at the
+/// nearest carried point at or below `n`. When the ledger retains every
+/// anchor, that point is within a factor of 2 of `n` once `n` reaches the
+/// first anchor. The save carries at most two points besides the anchors.
+/// A position the ledger does not hold is skipped, never made up. `held` is
+/// ascending.
 #[must_use]
 pub fn save_points(held: &[u32], pos: u32, every: u32) -> Vec<u32> {
     let below = held.partition_point(|&p| p < pos);
