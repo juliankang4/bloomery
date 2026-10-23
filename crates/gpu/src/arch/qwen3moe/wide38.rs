@@ -149,6 +149,7 @@ use super::card38::Card38;
 use super::image::MediaRows;
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
 use super::program38::{Ctx38, beta_alpha_mut, beta_alpha_rows};
+use super::router::gated;
 use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
 use super::scratch38::{Arena38, ROUTE_ROWS, SELECT_ROWS, Store38};
 use super::tier38::TierSide38;
@@ -1879,7 +1880,7 @@ impl WideParts<'_> {
         let sink = self.c.gpu.layer_sink(l)?;
         let stream = self.c.gpu.stream();
         let (s, x, m) = (&mut *self.s, &mut *self.x, u.m);
-        let router = f32_tensor(self.c.w, &p.ffn.router)?;
+        let router = gated::RouterWeight::of(self.c.w, WHAT, &p.ffn.router)?;
         let slots = geo::N_USED + 1;
         let width = s.route.dims().logits();
         let mut c0 = 0;

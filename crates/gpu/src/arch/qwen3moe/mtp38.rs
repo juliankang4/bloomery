@@ -98,7 +98,7 @@
 use super::body::ATTN_SCALE_256;
 use super::plan38::{HcSite, geo, router};
 use super::program38::{Ctx38, Kernels38, MMA};
-use super::router::{RouterDims, RouterOut};
+use super::router::{RouterDims, RouterOut, gated};
 use super::scratch::{IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put_input};
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
 use crate::card_slots::CardAcc;
@@ -2024,7 +2024,7 @@ impl Mtp38 {
         }
         k.router.enqueue_fused(
             stream,
-            f32_tensor(w, &n.router)?,
+            gated::RouterWeight::of(w, WHAT, &n.router)?,
             &a.ffn_x,
             m,
             sink,

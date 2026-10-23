@@ -610,7 +610,7 @@ impl Parts38<'_> {
         let x = x.unwrap_or(&s.ffn_x);
         self.c.k.router.enqueue_fused(
             stream,
-            f32_tensor(self.c.w, &p.ffn.router)?,
+            gated::RouterWeight::of(self.c.w, WHAT, &p.ffn.router)?,
             x,
             self.m,
             sink,

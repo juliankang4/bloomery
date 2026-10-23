@@ -108,12 +108,13 @@ pub struct ModelTensors {
     /// one token uses.
     pub experts: u64,
     pub experts_used: u64,
-    /// Whether its program reads bf16 matrix `t` of a dense role in its words
-    /// ([`CardFormat::Bf16Raw`], [`ModelTensors::card_format`]): the
-    /// architecture's classifier names each tensor a bf16 site, head or
-    /// embedding lookup reads (qwen4exp's projections); a tensor of the same
-    /// role its program reads as f32 values (a conv, an inject, the parts of
-    /// a joined stack) is not one. `|_| false` loads every bf16 tensor as f32
+    /// Whether its program reads bf16 tensor `t` of a dense role or the
+    /// router in its words ([`CardFormat::Bf16Raw`],
+    /// [`ModelTensors::card_format`]): the architecture's classifier names
+    /// each tensor a bf16 site, head, embedding lookup or router reads
+    /// (qwen4exp's projections and router); a tensor of the same role its
+    /// program reads as f32 values (a conv, an inject, the parts of a joined
+    /// stack) is not one. `|_| false` loads every bf16 tensor as f32
     /// values ([`CardFormat::Bf16AsF32`]).
     pub bf16_words: fn(&ModelTensor) -> bool,
 }
@@ -135,15 +136,16 @@ impl ModelTensors {
     /// [`CardFormat::of`] of its type, except
     /// - an engram gain, which the card reads as f32 values whatever its
     ///   type: a K-quant one is decoded at load;
-    /// - a bf16 matrix (two or more dims) [`ModelTensors::bf16_words`] names,
-    ///   of a role whose matrices the bf16 dense site, head and embedding
-    ///   lookup read (attention, a hyper-connection, a shared expert, a dense
-    ///   FFN, an engram's dense projections, the head, the token embedding):
-    ///   [`CardFormat::Bf16Raw`], which those kernels widen as they read it
-    ///   (`crate::kernels`' `SiteEntry::Bf16`, `HeadEntry::Bf16`,
-    ///   `EmbedEntry::Bf16`). Every other bf16 tensor (a vector, a router, a
-    ///   norm, a matrix it does not name) stays [`CardFormat::Bf16AsF32`]:
-    ///   the kernels that read those read f32 values.
+    /// - a bf16 tensor [`ModelTensors::bf16_words`] names, of a role whose
+    ///   tensors the bf16 dense site, head, embedding lookup and router read
+    ///   (attention, a hyper-connection, a shared expert with its gate, a
+    ///   dense FFN, an engram's dense projections, the head, the token
+    ///   embedding, the router): [`CardFormat::Bf16Raw`], which those kernels
+    ///   widen as they read it (`crate::kernels`' `SiteEntry::Bf16`,
+    ///   `HeadEntry::Bf16`, `EmbedEntry::Bf16`, the router's bf16 entries).
+    ///   Every other bf16 tensor (a norm, a tensor it does not name) stays
+    ///   [`CardFormat::Bf16AsF32`]: the kernels that read those read f32
+    ///   values.
     #[must_use]
     pub fn card_format(&self, t: &ModelTensor) -> Option<CardFormat> {
         if t.role == Role::Head && t.name == HEAD_TENSOR {
@@ -157,11 +159,10 @@ impl ModelTensors {
                 | Role::DenseFfn
                 | Role::EngramDense
                 | Role::Head
-                | Role::TokenEmbedding,
+                | Role::TokenEmbedding
+                | Role::Router,
                 Some(CardFormat::Bf16AsF32),
-            ) if (self.bf16_words)(t) && t.ty == GgmlType::BF16 && t.dims.len() >= 2 => {
-                Some(CardFormat::Bf16Raw)
-            }
+            ) if (self.bf16_words)(t) && t.ty == GgmlType::BF16 => Some(CardFormat::Bf16Raw),
             (_, f) => f,
         }
     }
@@ -4575,15 +4576,15 @@ mod tests {
     const EXPERT: u64 = 576;
 
     /// A model of 4 layers with every role's bf16 tensor (an attention
-    /// matrix, a hyper-connection, a shared expert, a router, an FFN norm,
-    /// the head and the token embedding, 256-value rows) beside a routed
-    /// q4_K stack, its readers' choice `bf16_words`, planned on `n` cards of
-    /// `4 / n` layers each: every bf16 tensor's card segment is on the card
-    /// that runs it, in the format `ModelTensors::card_format` names, at its
-    /// format's bytes. With `bf16_words` the matrices of the dense roles keep
-    /// their words (the file's bytes); the router and the norm, and every
-    /// tensor without it, are f32 values (twice the file's bytes): the plan
-    /// of a model that does not set it is the one it was.
+    /// matrix, a hyper-connection, a shared expert and its one-row gate, a
+    /// router, an FFN norm, the head and the token embedding, 256-value rows)
+    /// beside a routed q4_K stack, its readers' choice `bf16_words`, planned
+    /// on `n` cards of `4 / n` layers each: every bf16 tensor's card segment
+    /// is on the card that runs it, in the format `ModelTensors::card_format`
+    /// names, at its format's bytes. With `bf16_words` the tensors of the
+    /// dense roles and the router keep their words (the file's bytes); the
+    /// norm, and every tensor without it, are f32 values (twice the file's
+    /// bytes): the plan of a model that does not set it is the one it was.
     #[test]
     fn a_bf16_matrix_keeps_its_words_where_its_readers_read_them() {
         let bf16 = |name: String, layer, role, rows: &[u64]| {
@@ -4618,6 +4619,7 @@ mod tests {
             Role::SharedExpert,
             Role::Head,
             Role::TokenEmbedding,
+            Role::Router,
         ];
         for bf16_words in [false, true] {
             for n in [1usize, 2, 4] {
@@ -4628,6 +4630,7 @@ mod tests {
                         ("attn", Role::Attention, &[16][..]),
                         ("hc", Role::HyperConnection, &[4]),
                         ("shexp", Role::SharedExpert, &[8]),
+                        ("shexp gate", Role::SharedExpert, &[]),
                         ("router", Role::Router, &[9]),
                         ("norm", Role::FfnNorm, &[]),
                     ] {
@@ -4700,7 +4703,7 @@ mod tests {
                         t.name
                     );
                 }
-                assert_eq!(seen, 4 * 5 + 3, "n={n}");
+                assert_eq!(seen, 4 * 6 + 3, "n={n}");
             }
         }
     }

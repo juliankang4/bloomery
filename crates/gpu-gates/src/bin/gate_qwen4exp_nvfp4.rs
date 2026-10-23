@@ -423,9 +423,10 @@ mod gate {
     /// The dense form of the loaded dense projections of `model`: the head's
     /// type, BF16 as the checkpoint stores it (what `prepare` writes by default, judged by the
     /// `_bf16` sets) or Q8_0 (what `BLOOMERY_PREPARE_Q8=1` writes, or another converter, judged by
-    /// the others). Every other BF16 or Q8_0 tensor but the indexer's projections, which `prepare`
-    /// keeps in BF16 beside either form, must be of the head's type: the sets hold one form or the
-    /// other. This picks the reference sets only; the model loader refuses Q8_0 indexer projections.
+    /// the others). Every other BF16 or Q8_0 tensor but the indexer's projections and the router
+    /// with its shared gate, which `prepare` keeps in BF16 beside either form, must be of the
+    /// head's type: the sets hold one form or the other. This picks the reference sets only; the
+    /// model loader refuses Q8_0 indexer projections.
     /// A head of another type or none, and a mixed split, are refused by name.
     fn dense_of(model: &ModelTensors) -> Result<Dense, String> {
         let tensors: Vec<(&str, GgmlType)> = model
@@ -444,10 +445,13 @@ mod gate {
         let indexer: Vec<String> = (0..model.layers)
             .flat_map(|l| [names::indexer_q_proj(l), names::indexer_k_proj(l)])
             .collect();
+        let router: Vec<String> = (0..model.layers)
+            .flat_map(|l| [names::ffn_gate_inp(l), names::ffn_gate_inp_shexp(l)])
+            .collect();
         if let Some((name, other)) = tensors.iter().find(|(n, t)| {
             matches!(t, GgmlType::BF16 | GgmlType::Q8_0)
                 && *t != ty
-                && !indexer.iter().any(|i| i == n)
+                && !indexer.iter().chain(&router).any(|i| i == n)
         }) {
             return Err(format!(
                 "{name} is {other:?} beside a {ty:?} {head}, a dense form no pair of sets holds"
@@ -666,9 +670,10 @@ mod gate {
         /// The sets follow the split's dense form: `prepare`'s default split (every dense matrix
         /// BF16) the `_bf16` pair; its `BLOOMERY_PREPARE_Q8=1` split (Q8_0, the indexer's
         /// projections BF16) and a Q8_0 split another converter wrote (the indexer Q8_0 too) the
-        /// Q8_0 pair; a projection of the other form, a head of a third type and no head are
-        /// refused by name. Mutants: the form read as one type whatever the head, the pairs
-        /// swapped, the mixed check dropped, the indexer not exempt.
+        /// Q8_0 pair, the router BF16 beside either; a projection of the other form, a head of a
+        /// third type and no head are refused by name. Mutants: the form read as one type
+        /// whatever the head, the pairs swapped, the mixed check dropped, the indexer or the
+        /// router not exempt.
         #[test]
         fn a_split_is_judged_by_the_sets_of_its_dense_form() {
             let split = |dense, indexer| -> Vec<(String, GgmlType)> {
@@ -707,7 +712,7 @@ mod gate {
                     layers: 4,
                     experts: 1,
                     experts_used: 1,
-                    bf16_words: |t| t.name != names::ffn_gate_inp(0),
+                    bf16_words: |_| true,
                 })
             };
             let (bf16, q8) = (GgmlType::BF16, GgmlType::Q8_0);

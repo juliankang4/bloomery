@@ -97,7 +97,7 @@ pub(crate) trait TileRows: Copy {
 
 /// An F32 weight's values, copied as they are.
 #[derive(Clone, Copy)]
-pub(super) struct F32Rows<'a>(pub &'a [f32]);
+pub(crate) struct F32Rows<'a>(pub &'a [f32]);
 
 impl TileRows for F32Rows<'_> {
     #[inline(always)]

@@ -103,8 +103,10 @@
 //!   2560: the one-column walk's 32-chunk trip with an 8-chunk tail): the
 //!   fused launch at m = 1, 5, 8 against `f32_gemv` over 513 rows then the
 //!   routing alone, and the ubatch pair over 70 against the fused launch
-//!   per token, all BIT-EQUAL.
-//! - `shape`: the seven entries compile with no local depot.
+//!   per token, all BIT-EQUAL. Then a BF16 weight's words (LCG values cut
+//!   to BF16): the fused launch at m = 1, 5, 8 and the ubatch pair over 70
+//!   BIT-EQUAL to the F32 entries over the same values widened.
+//! - `shape`: the nine entries compile with no local depot.
 //!
 //! Tiers (`BLOOMERY_TIER`): `shape`, `wide512`, `picks`, `join` and `routing`'s constructed ties read no set of ik's
 //! and run on either file (`tier::sc`). Every other case takes its inputs from ik's sets (the logits, `ffn_inp_normed`,
@@ -132,7 +134,9 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::arch::qwen3moe::experts::{CombineArgs, ExpertKernels, GateUpArgs};
-    use bloomery_gpu::arch::qwen3moe::router::gated::{ROW, ROW_WIDE, RouterKernels, RouterOut};
+    use bloomery_gpu::arch::qwen3moe::router::gated::{
+        ROW, ROW_WIDE, RouterKernels, RouterOut, RouterWeight,
+    };
     use bloomery_gpu::arch::qwen3moe::router::{MAX_TOKENS, RouterDims};
     use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
     use bloomery_gpu::gemm::{GemmAct, GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmWeight};
@@ -1265,6 +1269,186 @@ mod gate {
 
         ok &= wide_fault(c, &wh, &w, &cols, &want)?;
         ok &= wide_order(c)?;
+        ok &= wide_bf16(c)?;
+        Ok(ok)
+    }
+
+    /// The wide instance over a BF16 joined router weight, as Qwen3.8's
+    /// checkpoint stores it and the card holds it (`DevWeight::Bf16`'s
+    /// words): LCG values cut to BF16, full mantissas, against the F32
+    /// entries over the same values widened. The fused launch at m = 1, 5, 8
+    /// and the ubatch pair over [`WIDE_UB`] tokens: logits, probabilities,
+    /// ids and weights BIT-EQUAL, the fused ticket count zero. Both launchers
+    /// refuse an activation row with only half the weight's values.
+    fn wide_bf16(c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.stream();
+        let sink = c.gpu.unlabelled_sink();
+        let mut s = 0x0b16_0512_u64;
+        let mut val = |scale: f32| ((lcg(&mut s) % 4001) as f32 - 2000.0) * scale;
+        let halves: Vec<u32> = (0..WIDE_ROWS * WIDE_K)
+            .map(|_| val(1.3e-5).to_bits() >> 16)
+            .collect();
+        let wh: Vec<f32> = halves.iter().map(|&h| f32::from_bits(h << 16)).collect();
+        let words: Vec<u32> = halves
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[lo, hi]| lo | hi << 16)
+            .collect();
+        let cols: Vec<f32> = (0..WIDE_UB * WIDE_K).map(|_| val(7.1e-4)).collect();
+        let w = DeviceTensor::upload(stream, &wh, WIDE_ROWS, WIDE_K)?;
+        let wb = DeviceTensor::upload(stream, &words, WIDE_ROWS, WIDE_K / 2)?;
+        let bf = RouterWeight::Bf16 { w: &wb };
+        let mut want = RouterOut::with_tokens(stream, wide()?, MAX_TOKENS)?;
+        let mut got = RouterOut::with_tokens(stream, wide()?, MAX_TOKENS)?;
+        let short = DeviceBuffer::from_host(stream, &cols[..WIDE_K / 2])?;
+        let fused = c
+            .router
+            .enqueue_fused(stream, bf, &short, 1, sink, &mut got);
+        let ubatch = c
+            .router
+            .enqueue_ubatch(stream, bf, &short, 1, sink, &mut got);
+        let named = |e: &bloomery_gpu::GpuError| e.to_string().contains("x.len()");
+        let refused = fused.is_err_and(|e| named(&e)) && ubatch.is_err_and(|e| named(&e));
+        println!(
+            "wide512 bf16 short activation row: fused and ubatch refused {}",
+            verdict(refused)
+        );
+        let mut ok = refused;
+        for m in [1usize, 5, MAX_TOKENS] {
+            let x = DeviceBuffer::from_host(stream, &cols[..m * WIDE_K])?;
+            c.router.enqueue_fused(stream, &w, &x, m, sink, &mut want)?;
+            c.router.enqueue_fused(stream, bf, &x, m, sink, &mut got)?;
+            stream.synchronize()?;
+            let (a, b) = (read_wide(stream, &got)?, read_wide(stream, &want)?);
+            let tickets = got.tickets(stream)?;
+            let same = (0..m)
+                .filter(|&t| routed_equal(&wide_token(&a, t), &wide_token(&b, t)))
+                .count();
+            let pass = same == m && tickets == 0;
+            println!(
+                "wide512 bf16 fused m={m} vs the f32 weight widened: {same}/{m} tokens \
+                 bit-identical tickets={tickets} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        let x = DeviceBuffer::from_host(stream, &cols)?;
+        let mut want = RouterOut::for_ubatch(stream, wide()?, WIDE_UB)?;
+        let mut got = RouterOut::for_ubatch(stream, wide()?, WIDE_UB)?;
+        c.router
+            .enqueue_ubatch(stream, &w, &x, WIDE_UB, sink, &mut want)?;
+        c.router
+            .enqueue_ubatch(stream, bf, &x, WIDE_UB, sink, &mut got)?;
+        stream.synchronize()?;
+        let (a, b) = (read_wide(stream, &got)?, read_wide(stream, &want)?);
+        let same = (0..WIDE_UB)
+            .filter(|&t| routed_equal(&wide_token(&a, t), &wide_token(&b, t)))
+            .count();
+        let pass = same == WIDE_UB;
+        println!(
+            "wide512 bf16 ubatch n={WIDE_UB} vs the f32 weight widened: {same}/{WIDE_UB} \
+             bit-identical {}",
+            verdict(pass)
+        );
+        ok &= pass;
+        ok &= wide_load(c)?;
+        Ok(ok)
+    }
+
+    /// Mixed router and shared-gate file types use one F32 resident format
+    /// on every layer, with the widened bytes counted before loading.
+    fn wide_load(c: &Ctx) -> Result<bool, GateError> {
+        use model::arch::qwen35moe::{hparams::Variant, names, roles};
+        use model::placement::{self, CardFormat, Format};
+
+        let mut hp = Hparams::read(&c.split)?;
+        hp.variant = Variant::Qwen4Exp;
+        hp.n_layer = 2;
+        hp.n_trunk = 2;
+        let path = std::env::temp_dir().join(format!("qwen38-router-{}.gguf", std::process::id()));
+        let result = (|| -> Result<bool, GateError> {
+            let mut ok = true;
+            for (r, sh) in [
+                (GgmlType::BF16, GgmlType::F32),
+                (GgmlType::F32, GgmlType::BF16),
+            ] {
+                let mut decls = Vec::new();
+                for l in 0..2 {
+                    for (name, rows, ty) in [
+                        (
+                            names::ffn_gate_inp(l),
+                            WIDE_EXPERT,
+                            if l == 0 { GgmlType::BF16 } else { r },
+                        ),
+                        (
+                            names::ffn_gate_inp_shexp(l),
+                            1,
+                            if l == 0 { GgmlType::BF16 } else { sh },
+                        ),
+                    ] {
+                        let value = 0.125f32;
+                        let bytes = match ty {
+                            GgmlType::BF16 => {
+                                ((value.to_bits() >> 16) as u16).to_le_bytes().to_vec()
+                            }
+                            _ => value.to_le_bytes().to_vec(),
+                        };
+                        decls.push((name, vec![128, rows as u64], ty, bytes.repeat(rows * 128)));
+                    }
+                }
+                bloomery_gpu_gates::write_gguf(&path, &[], &decls)?;
+                let split = Split::open(&path)?;
+                let model = roles::classify(&split, &hp)?;
+                let rows = model
+                    .tensors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| placement::whole_on_card(i, t, 0, &model))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let counted: u64 = rows
+                    .iter()
+                    .flat_map(|r| &r.segments)
+                    .map(|s| s.resident_bytes)
+                    .sum();
+                let mut w = Weights::load_rows(c.stream(), &split, &model, &rows, 0)?;
+                for l in 0..2 {
+                    w.join_rows(
+                        c.stream(),
+                        &[&names::ffn_gate_inp(l), &names::ffn_gate_inp_shexp(l)],
+                        format!("derived.router.{l}"),
+                    )
+                    .expect("mixed router parts load and join in one resident format");
+                }
+                let mut pass = counted == (2 * WIDE_ROWS * 128 * 4) as u64
+                    && rows.iter().flat_map(|r| &r.segments).all(|s| {
+                        matches!(
+                            s.format,
+                            Format::Card(CardFormat::F32 | CardFormat::Bf16AsF32)
+                        )
+                    });
+                for l in 0..2 {
+                    let joined =
+                        w.f32_tensor("wide512 mixed load", &format!("derived.router.{l}"))?;
+                    pass &= joined.rows() == WIDE_ROWS
+                        && joined.cols() == 128
+                        && joined
+                            .buf()
+                            .to_host_vec(c.stream())?
+                            .iter()
+                            .all(|&v| v == 0.125);
+                }
+                println!(
+                    "wide512 mixed load router={r:?} shared={sh:?} bytes={counted} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            Ok(ok)
+        })();
+        let cleanup = std::fs::remove_file(&path);
+        let ok = result?;
+        cleanup?;
         Ok(ok)
     }
 
@@ -2986,7 +3170,7 @@ mod gate {
         ok &= tier::witness("LAYERS", c.layers, REAL_LAYERS);
         ok &= tier::witness("FAULT_LAYER", c.fault_layer(), REAL_FAULT_LAYER);
         if c.want("shape") {
-            tier::sc("shape: the seven entries compile with no local depot")?;
+            tier::sc("shape: the nine entries compile with no local depot")?;
             ok &= no_local_depot(&[
                 "qwen35moe_router_fused",
                 "qwen35moe_router_norm",
@@ -2995,6 +3179,8 @@ mod gate {
                 "qwen35moe_router_fused_512",
                 "qwen35moe_router_logits_512",
                 "qwen35moe_router_route_512",
+                "qwen35moe_router_fused_512_bf16",
+                "qwen35moe_router_logits_512_bf16",
             ])?;
         }
         if c.want("routing") {

@@ -1277,11 +1277,11 @@ pub(super) mod tests {
     /// Every classified qwen4exp tensor as a BF16 matrix: the independent
     /// head, its rows a multiple of 128 values wide, occupies MXFP8 planes;
     /// the others a BF16 reader takes (the dense site's projections, the
-    /// indexer's and the embedding) keep their words; every one body38 reads
-    /// as F32 values (the `f32_len` and `f32_shape` checks of
-    /// `plan38::plans`, and the parts of its joined β·α stack and router) is
-    /// widened, the conv and the injects at their own shapes. A tensor in
-    /// neither list fails.
+    /// indexer's, the embedding, the router and its shared gate) keep their
+    /// words; every one body38 reads as F32 values (the `f32_len` and
+    /// `f32_shape` checks of `plan38::plans`, and the parts of its joined β·α
+    /// stack) is widened, the conv and the injects at their own shapes. A
+    /// tensor in neither list fails.
     #[test]
     fn a_qwen4exp_bf16_matrix_keeps_its_words_only_for_a_word_reader() {
         use crate::placement::CardFormat;
@@ -1306,6 +1306,8 @@ pub(super) mod tests {
             "ffn_gate_shexp.weight",
             "ffn_up_shexp.weight",
             "ffn_down_shexp.weight",
+            "ffn_gate_inp.weight",
+            "ffn_gate_inp_shexp.weight",
             "ple_key.weight",
             "ple_value.weight",
         ];
@@ -1325,8 +1327,6 @@ pub(super) mod tests {
             "attn_k_norm.weight",
             "indexer.q_norm.weight",
             "indexer.k_norm.weight",
-            "ffn_gate_inp.weight",
-            "ffn_gate_inp_shexp.weight",
             "ple_norm_key.weight",
             "ple_norm_query.weight",
             "ple_norm_conv.weight",
@@ -1371,6 +1371,87 @@ pub(super) mod tests {
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
         assert_eq!(seen, model.tensors.len() - 1 - 4 * 3, "every other tensor");
+    }
+
+    /// One mixed pair widens every router pair before placement; other
+    /// BF16 projections retain their word readers.
+    #[test]
+    fn qwen4exp_router_pairs_choose_one_resident_format_before_placement() {
+        use super::super::names;
+        use crate::arch::synthetic::{Ty, header_typed};
+        use crate::placement::{self, CardFormat};
+
+        for layer in [0, 3] {
+            for (r, sh) in [
+                (Ty::Bf16, Ty::F32),
+                (Ty::F32, Ty::Bf16),
+                (Ty::Bf16, Ty::Bf16),
+                (Ty::F32, Ty::F32),
+            ] {
+                let typed: Vec<_> = tensors()
+                    .into_iter()
+                    .map(|(n, d)| {
+                        let (dims, ty) = if n.ends_with(".ffn_gate_inp.weight") {
+                            (
+                                vec![64, 8],
+                                if n == names::ffn_gate_inp(layer) {
+                                    r
+                                } else {
+                                    Ty::Bf16
+                                },
+                            )
+                        } else if n.ends_with(".ffn_gate_inp_shexp.weight") {
+                            (
+                                vec![64],
+                                if n == names::ffn_gate_inp_shexp(layer) {
+                                    sh
+                                } else {
+                                    Ty::Bf16
+                                },
+                            )
+                        } else if n == names::attn_qkv(0) {
+                            (vec![64, 16], Ty::Bf16)
+                        } else {
+                            (d, Ty::F32)
+                        };
+                        (n, dims, ty)
+                    })
+                    .collect();
+                let path = header_typed("q4x-router-pairs", "qwen4exp", &keys(), &[], &typed);
+                let split = gguf::Split::open(&path).expect("the synthetic header opens");
+                let hp = Hparams::read(&split).expect("mixed router types are admitted");
+                let model = roles::classify(&split, &hp).expect("every tensor has a role");
+                std::fs::remove_file(&path).expect("the synthetic header is removed");
+                for (i, t) in model.tensors.iter().enumerate() {
+                    if t.role == Role::Router || t.name.ends_with(".ffn_gate_inp_shexp.weight") {
+                        let raw = r == sh;
+                        assert_eq!(
+                            (model.bf16_words)(t),
+                            raw,
+                            "{}: layer {layer} {r:?}/{sh:?}",
+                            t.name
+                        );
+                        let want = match (t.ty, raw) {
+                            (gguf::GgmlType::BF16, true) => CardFormat::Bf16Raw,
+                            (gguf::GgmlType::BF16, false) => CardFormat::Bf16AsF32,
+                            _ => CardFormat::F32,
+                        };
+                        assert_eq!(model.card_format(t), Some(want), "{}", t.name);
+                        let row =
+                            placement::whole_on_card(i, t, 0, &model).expect("the pair is placed");
+                        let per = if want == CardFormat::Bf16Raw { 2 } else { 4 };
+                        assert_eq!(
+                            row.segments[0].resident_bytes,
+                            t.dims.iter().product::<u64>() * per,
+                            "{}",
+                            t.name
+                        );
+                    } else if t.name == names::attn_qkv(0) {
+                        assert_eq!(model.card_format(t), Some(CardFormat::Bf16Raw));
+                    }
+                }
+            }
+        }
     }
 
     /// The qwen4exp stems are not qwen35moe's: a Qwen3.6 file carrying a

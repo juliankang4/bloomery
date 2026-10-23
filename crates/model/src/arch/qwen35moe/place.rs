@@ -1973,6 +1973,8 @@ impl MtpInputs {
                 {
                     *ty = f.ty
                 }
+                (GgmlType::F32, GgmlType::BF16, MtpLoad::Card(Role::Router))
+                | (GgmlType::F32, GgmlType::BF16, MtpLoad::Card(Role::SharedExpert)) => *ty = f.ty,
                 (GgmlType::Q8_0, GgmlType::FP8_B128, MtpLoad::Card(Role::RoutedExperts)) => {
                     *ty = f.ty
                 }

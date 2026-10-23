@@ -404,8 +404,9 @@ fn gqa_fits(g: &Gqa) -> bool {
 /// indexer's two and the joined β·α stack among them, is of a type the
 /// common site launches by name (`site::BY_NAME`), each tensor's own: the
 /// walks pick its launch by the resident form. An HC matrix is one
-/// `HcMatrix::of` reads. The gains, the conv, the injects and the router are
-/// F32 (the load widens a BF16 one, `ModelTensors::bf16_words`).
+/// `HcMatrix::of` reads. The gains, the conv and the injects are F32 (the
+/// load widens a BF16 one, `ModelTensors::bf16_words`); the router is F32 or
+/// a BF16 one's words, which its kernels read either way.
 pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Layer38>, GpuError> {
     use geo::{ATTN, EXPERTS, FF, HEAD, HIDDEN, IDX_DIM, IDX_HEADS, KV, Q_ROWS, RANK, STREAMS};
     let wide = STREAMS * HIDDEN;
@@ -478,7 +479,13 @@ pub(super) fn plans(w: &Weights, kinds: &[Kind38], ple: usize) -> Result<Vec<Lay
                 up_sh: model::arch::qwen35moe::names::ffn_up_shexp(l),
                 down_sh: model::arch::qwen35moe::names::ffn_down_shexp(l),
             };
-            f32_shape(w, &ffn.router, EXPERTS + 1, HIDDEN)?;
+            dense::resident_site(
+                w,
+                WHAT,
+                &ffn.router,
+                (EXPERTS + 1, HIDDEN),
+                &[SiteTy::F32, SiteTy::Bf16],
+            )?;
             dense_shape(w, &ffn.gate_sh, FF, HIDDEN)?;
             dense_shape(w, &ffn.up_sh, FF, HIDDEN)?;
             dense_shape(w, &ffn.down_sh, HIDDEN, FF)?;

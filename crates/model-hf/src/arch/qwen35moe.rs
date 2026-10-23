@@ -1210,11 +1210,11 @@ fn layer(
                 (names::indexer_k_proj(l), part(g.indexer_q..rows)),
             ])
         }
-        "mlp.gate.weight" => one(names::ffn_gate_inp(l), Plain::F32, vec![]),
+        "mlp.gate.weight" => one(names::ffn_gate_inp(l), Plain::Bf16, vec![]),
         "mlp.shared_expert_gate.weight" => match *shape {
             [1, n] => Ok(vec![(
                 names::ffn_gate_inp_shexp(l),
-                mapped(Plain::F32, vec![], vec![n as u64]),
+                mapped(Plain::Bf16, vec![], vec![n as u64]),
             )]),
             _ => Err(refuse(name, format!("{shape:?} is not one gate row"))),
         },
@@ -1500,8 +1500,9 @@ mod tests {
     /// Layers 0, 1 (the PLE site) and 3 (attention) and every unlayered text tensor of
     /// nvidia/Qwen3.8-Flash-Next-NVFP4, placed by its quantization config, map to exactly the
     /// names and ggml dims unsloth's UD-Q4_K_XL holds for them, and every tensor that file keeps
-    /// in Q8_0, F32 or BF16 gets that type from the table; the routed stacks are NVFP4 with one
-    /// scale an expert and the PLE table F8 rows.
+    /// in Q8_0, F32 or BF16 gets that type from the table, but the router and the shared expert's
+    /// gate, which keep the checkpoint's BF16 where that file widens them to F32; the routed
+    /// stacks are NVFP4 with one scale an expert and the PLE table F8 rows.
     #[test]
     fn layers_map_to_unsloth_s_names_dims_and_types() {
         let header =
@@ -1554,7 +1555,10 @@ mod tests {
             assert_eq!(&m.dims, dims, "{name}");
             let format = modelopt::format_of(&m.placed(&p).unwrap()).unwrap();
             let ours = modelopt::type_of(format, m.role).unwrap();
+            let router = name.ends_with(".ffn_gate_inp.weight")
+                || name.ends_with(".ffn_gate_inp_shexp.weight");
             let expect = match ty {
+                0 if router => 30,
                 0 | 8 | 30 => *ty,
                 _ if name.ends_with("_exps.weight") => 40,
                 _ => gguf::GgmlType::F8E4M3_ROWS.as_u32(),

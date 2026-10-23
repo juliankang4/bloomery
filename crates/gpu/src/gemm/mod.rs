@@ -67,7 +67,7 @@ pub use act::GemmAct;
 pub use act32::GemmAct32;
 pub use f32tile::LINE as F32_TILE_LINE;
 pub(crate) use f32tile::{
-    Bf16Rows, F32T_THREADS_U32, MMA_CELLS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS,
+    Bf16Rows, F32Rows, F32T_THREADS_U32, MMA_CELLS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS,
     MMA_WARP_SCRATCH, MmaRows, MmaTile, STAGE_FLOATS, STAGES, TileRows, bf16_mma_body,
     bf16_mma_launch, bf16_mma_tile, f32_tile_body, tile_launch,
 };

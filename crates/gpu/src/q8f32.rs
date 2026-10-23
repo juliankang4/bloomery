@@ -476,16 +476,17 @@ const _: () = assert!(LANE_UNROLL_W32 == 32 && LANE_UNROLL_W32.is_multiple_of(LA
 /// `Σ_it fma(w[row·k + 32·it + lane], x[32·it + lane])`, accumulated
 /// sequentially in `it`, so the result is that function's bit for bit. The
 /// chunks past the last whole 32-chunk trip run through the 8-wide trip and
-/// then one at a time, continuing the same sum in the same order.
+/// then one at a time, continuing the same sum in the same order. A BF16
+/// weight's words ([`Bf16Words`]) give the F32 walk of its widened values.
 ///
 /// # Safety
 ///
-/// [`f32_lane_partial_1col`]'s contract: `w.len() >= (row + 1) * k`,
-/// `x.len() >= k`, `k` a positive multiple of 32, `lane < 32`. The body
-/// reads `w` and `x` unchecked within those bounds.
+/// [`f32_lane_partial_1col`]'s contract: `w` holds at least `(row + 1) * k`
+/// values, `x.len() >= k`, `k` a positive multiple of 32, `lane < 32`. The
+/// body reads `w` and `x` unchecked within those bounds.
 #[inline(always)]
-pub unsafe fn f32_lane_partial_1col_w32(
-    w: &[f32],
+pub unsafe fn f32_lane_partial_1col_w32<W: RowValues>(
+    w: W,
     x: &[f32],
     k: u32,
     row: usize,
@@ -569,38 +570,38 @@ pub unsafe fn f32_lane_partial_1col_w32(
             x31,
         ) = unsafe {
             (
-                *w.get_unchecked(w_row + kk),
-                *w.get_unchecked(w_row + kk + 32),
-                *w.get_unchecked(w_row + kk + 64),
-                *w.get_unchecked(w_row + kk + 96),
-                *w.get_unchecked(w_row + kk + 128),
-                *w.get_unchecked(w_row + kk + 160),
-                *w.get_unchecked(w_row + kk + 192),
-                *w.get_unchecked(w_row + kk + 224),
-                *w.get_unchecked(w_row + kk + 256),
-                *w.get_unchecked(w_row + kk + 288),
-                *w.get_unchecked(w_row + kk + 320),
-                *w.get_unchecked(w_row + kk + 352),
-                *w.get_unchecked(w_row + kk + 384),
-                *w.get_unchecked(w_row + kk + 416),
-                *w.get_unchecked(w_row + kk + 448),
-                *w.get_unchecked(w_row + kk + 480),
-                *w.get_unchecked(w_row + kk + 512),
-                *w.get_unchecked(w_row + kk + 544),
-                *w.get_unchecked(w_row + kk + 576),
-                *w.get_unchecked(w_row + kk + 608),
-                *w.get_unchecked(w_row + kk + 640),
-                *w.get_unchecked(w_row + kk + 672),
-                *w.get_unchecked(w_row + kk + 704),
-                *w.get_unchecked(w_row + kk + 736),
-                *w.get_unchecked(w_row + kk + 768),
-                *w.get_unchecked(w_row + kk + 800),
-                *w.get_unchecked(w_row + kk + 832),
-                *w.get_unchecked(w_row + kk + 864),
-                *w.get_unchecked(w_row + kk + 896),
-                *w.get_unchecked(w_row + kk + 928),
-                *w.get_unchecked(w_row + kk + 960),
-                *w.get_unchecked(w_row + kk + 992),
+                w.at(w_row + kk),
+                w.at(w_row + kk + 32),
+                w.at(w_row + kk + 64),
+                w.at(w_row + kk + 96),
+                w.at(w_row + kk + 128),
+                w.at(w_row + kk + 160),
+                w.at(w_row + kk + 192),
+                w.at(w_row + kk + 224),
+                w.at(w_row + kk + 256),
+                w.at(w_row + kk + 288),
+                w.at(w_row + kk + 320),
+                w.at(w_row + kk + 352),
+                w.at(w_row + kk + 384),
+                w.at(w_row + kk + 416),
+                w.at(w_row + kk + 448),
+                w.at(w_row + kk + 480),
+                w.at(w_row + kk + 512),
+                w.at(w_row + kk + 544),
+                w.at(w_row + kk + 576),
+                w.at(w_row + kk + 608),
+                w.at(w_row + kk + 640),
+                w.at(w_row + kk + 672),
+                w.at(w_row + kk + 704),
+                w.at(w_row + kk + 736),
+                w.at(w_row + kk + 768),
+                w.at(w_row + kk + 800),
+                w.at(w_row + kk + 832),
+                w.at(w_row + kk + 864),
+                w.at(w_row + kk + 896),
+                w.at(w_row + kk + 928),
+                w.at(w_row + kk + 960),
+                w.at(w_row + kk + 992),
                 *x.get_unchecked(kk),
                 *x.get_unchecked(kk + 32),
                 *x.get_unchecked(kk + 64),
@@ -683,7 +684,7 @@ pub unsafe fn f32_lane_partial_1col_w32(
         let kk = it * 32 + lane;
         // SAFETY: kk < k by the loop guard, so both reads are inside
         // w[w_row .. w_row + k] and x[0 .. k] by the caller contract.
-        let (wv, xv) = unsafe { (*w.get_unchecked(w_row + kk), *x.get_unchecked(kk)) };
+        let (wv, xv) = unsafe { (w.at(w_row + kk), *x.get_unchecked(kk)) };
         f = f32::mul_add(wv, xv, f);
         it += 1;
     }
@@ -4175,8 +4176,9 @@ mod tests {
                         if m == 1 {
                             // SAFETY: w covers row r and x covers k values;
                             // k is a positive multiple of 32 and lane < 32.
-                            let w32 =
-                                unsafe { f32_lane_partial_1col_w32(&w, &x, k as u32, r, lane) };
+                            let w32 = unsafe {
+                                f32_lane_partial_1col_w32(w.as_slice(), &x, k as u32, r, lane)
+                            };
                             assert_eq!(
                                 w32.to_bits(),
                                 got[0].to_bits(),
