@@ -4121,6 +4121,7 @@ mod tests {
         use super::super::{
             Cached, Cmd, Extra, Landing, Link, PIPE_CHUNK, PutBack, Reply, Seat, begin, begin_of,
             put_back, restore_from, resume_of, resume_prefix_of, save_into, settle, snapshot_of,
+            snapshot_size_of,
         };
         use crate::GateError;
 
