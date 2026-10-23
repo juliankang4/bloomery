@@ -24,8 +24,8 @@
 #   rotate-dry   6 lcpp:6 512 lcpppp:512 under BLOOMERY_DRY=1: our arm's command line and each round's
 #                order and loads as they were, and no warm-up line.
 #   majflt       the rotate run: every row ends in its majflt column — ours timed from its prompt_ids
-#                line, lcpp, lcpppp, mrs and mrspp timed from their progress lines, ik and the bin: arm
-#                the whole process — and the ours and bin: rows then carry ` | drive_read_bytes <n> (<dev>)`
+#                line, the bin: arm from its post-load prompt, lcpp, lcpppp, mrs and mrspp timed from
+#                their progress lines, ik the whole process; ours and bin: then carry ` | drive_read_bytes <n> (<dev>)`
 #                before the cold tag, the others no such column; the closing summary counts the cold rows
 #                and the means line carries the cold and probe-off counts.
 #   mrs-noiter   a mistralrs that prints no `Iteration 1/1...`: the row names it (`timed ? (no progress
@@ -711,7 +711,7 @@ if want majflt "$L" 14 "$END" &&
   want majflt "$L" 4 "^ROW r[12] lcpp(pp)? [dp]=[46] .*${MAJ}timed [0-9]+; " &&
   want majflt "$L" 4 "^ROW r[12] mrs(pp)? [dp]=[46] .*${MAJ}timed [0-9]+; " &&
   want majflt "$L" 2 "^ROW r[12] ik d=6 .*${MAJ}whole process; ≤ [0-9.]+ % of W 0.2000 s\)" &&
-  want majflt "$L" 2 "^ROW r[12] bin:base d=6 .*${MAJ}timed \? \(a one-arm run prints its prompt ids before its load: the whole process\); ≤ [0-9.]+ % of W 0.1200 s\)${DRV}( \[cold\])?$" &&
+  want majflt "$L" 2 "^ROW r[12] bin:base d=6 .*${MAJ}timed 0; ≤ [0-9.]+ % of W 0.1200 s\)${DRV}( \[cold\])?$" &&
   want majflt "$L" 2 "^ROW r[12] mrs d=6 .*of W 0.0600 s\)" &&
   want majflt "$L" 4 '^ROW .*\| drive_read_bytes ' &&
   want majflt "$L" 1 '^cold rows: [0-9]+ of 14 ' &&
@@ -1799,7 +1799,8 @@ if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
     "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log "$tmp"/ref-fail.log \
     "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/probe-*.log "$tmp"/refused-*.log "$tmp"/group-fail.log "$tmp"/twocard*.log \
     "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp*.log "$tmp"/slots*.log "$tmp"/bin-slots.log "$tmp"/bin-mem.log \
-    "$tmp"/evict*.log "$tmp"/cpu-guard.log "$tmp"/warm.log "$tmp"/local*.log; do
+    "$tmp"/evict*.log "$tmp"/cpu-guard.log "$tmp"/warm.log "$tmp"/local*.log \
+    "$tmp"/bin-load-faults.log "$tmp"/bin-timed-faults.log "$tmp"/bin-fallback-*.log "$tmp"/mem-faults-*.log; do
     echo "--- ${L##*/}"
     cat "$L"
   done

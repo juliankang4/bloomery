@@ -308,8 +308,9 @@
 # repetition's clock starts: tools/llama-bench/llama-bench.cpp:2437, 2447 at 53ed051ce), mrs from its
 # `Iteration 1/1...` log line (mistralrs-cli src/commands/bench.rs:263, printed before the timed
 # request is sent). ik's llama-bench has no --progress, so an ik row counts its whole process, and a
-# bin: arm's one-arm command line prints its prompt ids before its load, so it counts the whole process
-# too; the column says which. W is the row's timed window: P / tok/s for a pp row, N / tok/s for a
+# bin: or mem= arm uses --arm when its binary supports it, so its prompt ids open the timed window
+# after the load too. An older binary uses --tokens and counts the whole process; the column says
+# which. W is the row's timed window: P / tok/s for a pp row, N / tok/s for a
 # llama-bench decode row, (N - 1) / tok/s for a mrs decode row (its clock spans N - 1 intervals), the
 # prompt's ms plus N × mean ms for ours. A row whose count × COLD_US could be COLD_PCT % of W or more
 # ends in ` [cold]`. The column is appended after the row's `wall` field and its [other-busy] tag, so
@@ -2117,6 +2118,26 @@ if [ -z "$DRY" ]; then
     }
   done
 fi
+# A missing --arm value is refused before any file or card opens. Only a binary that names that
+# parser error uses its post-load prompt marker; an unrecognized response keeps the conservative
+# --tokens path. Our binary already runs --arm lists through the load driver.
+A_INPUT=()
+for i in "${!ARMS[@]}"; do
+  A_INPUT[i]=--tokens
+  case ${A_KIND[$i]} in
+    ours) A_INPUT[i]=--arm ;;
+    bin)
+      [ -z "$DRY" ] || continue
+      arm_envs "$i"
+      probe_rc=0
+      lease_capture 60 env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} CUDA_VISIBLE_DEVICES=-1 \
+        "${A_BIN[$i]}" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --arm || probe_rc=$?
+      if [ "$probe_rc" -ne 0 ] && [ "${LEASE_OUT##*$'\n'}" = 'generate_qwen3moe: --arm needs a value' ]; then
+        A_INPUT[i]=--arm
+      fi
+      ;;
+  esac
+done
 ref_witness() {
   [ -z "$IK_LINE" ] || echo "    ik: $IK_LINE"
   [ -z "$LCPP_LINE" ] || echo "    lcpp: $LCPP_LINE"
@@ -2389,11 +2410,12 @@ exit $rc
 '
 # One arm of a generate_qwen3moe in a process of its own with the one-arm command line: a second
 # binary (bin:), which may know no --arm, or an ours arm that runs under a mem= scope (its process
-# of its own: no load key). The row and the sum under the arm's label. Its prompt ids
-# print before its load, so its fault count is the whole process's (MAJ_TIMED empty).
+# of its own: no load key). A supported --arm prompt opens its timed fault window after the load;
+# without that marker the row names its whole-process fallback.
 # ours_arm <index> <round>
 ours_arm() {
-  local i=$1 r=$2 out rc t0 t1 f0 f1
+  local i=$1 r=$2 out rc t0 t1 f0 f1 markf mark re=''
+  local -a cmd
   ours_pre "$i" "$r"
   # A capped arm's model file is evicted first (the header's Mem); a page still resident fails the arm unrun.
   if [ -n "${A_MEM[$i]}" ] && ! evict_arm "$i"; then
@@ -2401,22 +2423,27 @@ ours_arm() {
     return 0
   fi
   arm_envs "$i"
+  cmd=("${A_BIN[$i]}" "${A_INPUT[$i]}" "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} ${A_PREFILL[$i]:+--prefill "${A_PREFILL[$i]}"} --time ${WARM:+--warm "$WARM"})
+  if [ -n "${A_MEM[$i]}" ]; then
+    cmd=(systemd-run --scope --quiet -p "MemoryMax=${A_MEM[$i]}G" -p MemorySwapMax=0 \
+      env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} BOUND_LIB="$LEASE_TREE/tools/gate-bound.sh" bash -c "$MEM_SCOPE_SCRIPT" -- "${cmd[@]}")
+  else
+    cmd=(env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} "${cmd[@]}")
+  fi
+  [ "${A_INPUT[$i]}" != --arm ] || re=$LG_FED_RE
+  lease_out_init || exit 70
+  markf=$LEASE_OUT_DIR/majflt
+  : > "$markf" || exit 70
   t0=$(date +%s)
   f0=$(majflt_now)
   rc=0
-  if [ -n "${A_MEM[$i]}" ]; then
-    lease_capture "$BOUND" systemd-run --scope --quiet \
-      -p "MemoryMax=${A_MEM[$i]}G" -p MemorySwapMax=0 \
-      env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} BOUND_LIB="$LEASE_TREE/tools/gate-bound.sh" bash -c "$MEM_SCOPE_SCRIPT" -- \
-      "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" \
-      ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} ${A_PREFILL[$i]:+--prefill "${A_PREFILL[$i]}"} --time ${WARM:+--warm "$WARM"} || rc=$?
-  else
-    lease_capture "$BOUND" env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} ${A_PREFILL[$i]:+--prefill "${A_PREFILL[$i]}"} --time ${WARM:+--warm "$WARM"} || rc=$?
-  fi
-  out=$LEASE_OUT
+  lease_filter "$BOUND" stdout "$LEASE_OUT_FILE" majflt_mark "$markf" "$re" -- "${cmd[@]}" || rc=$?
+  out=$(< "$LEASE_OUT_FILE")
   f1=$(majflt_now)
   t1=$(date +%s)
+  mark=$(cat "$markf") || exit 70
   MAJ_WHOLE=$((f1 - f0)) MAJ_TIMED=
+  [ -z "$mark" ] || MAJ_TIMED=$((f1 - mark))
   ours_post "$i" "$r" "$rc" "$out" "$((t1 - t0))"
 }
 # ours_pre <index> <round>: the witness block before an ours or bin arm.
@@ -2583,7 +2610,7 @@ ours_post() {
   elif [ -n "$a" ]; then
     timed='? (no prompt_ids line: the whole arm)'
   else
-    timed='? (a one-arm run prints its prompt ids before its load: the whole process)'
+    timed='? (no timed prompt_ids line: the whole process)'
   fi
   cold_verdict "$r" "$label" "d=$dep" "${MAJ_TIMED:-$MAJ_WHOLE}" "$win" || return 0
   # The load's probe and the prompt call's admits (the header's probe tag): the load's lines are the
@@ -2858,7 +2885,7 @@ echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}${PLACE:+ --place
 echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 [ -z "$PROSE_N" ] || echo "[config] prose: the first P ids of $(corpus_file) (${PROSE_N} ids), in prose's own tables"
 blocks_config
-echo "[config] cold tag: majflt in the row's measured window (ours: from its prompt_ids line; lcpp: from its --progress line; mrs: from its Iteration line; ik and bin: the whole process) × ${COLD_US} µs ≥ ${COLD_PCT} % of that window"
+echo "[config] cold tag: majflt in the row's measured window (ours and supported bin: from the post-load prompt_ids line; lcpp: from its --progress line; mrs: from its Iteration line; ik and older bin: the whole process) × ${COLD_US} µs ≥ ${COLD_PCT} % of that window"
 # Each engine's line only when it has arms: a profile names only the engines it runs (qwen35moe.sh).
 [ "$ik" = 0 ] || echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS ikdef flags=$IK_GPU_DEFAULT_FLAGS"
 [ "$lcpp" = 0 ] || echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS (lcpp and lcpppp: --progress)"
