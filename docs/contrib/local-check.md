@@ -88,7 +88,7 @@ nightly sets `x86-64-v3` for its own machine (`tools/nightly/run.sh:55`), and bo
 
 Output: a header (commit, host, CPU features, toolchain, `RUSTFLAGS`, bound, log directory), one line per unit,
 `<name> rc=<n> <seconds>s`, under a red one its failing tests or first red lines and its log path, then
-`DONE tier=… total=… red=… wall=…s`. Each unit's log is in `target/contrib-check/<time>/<name>.log`. Every unit, in
+`DONE tier=… total=… red=… wall=…s`. Each unit's log is in `target/contrib-check/<time>.<unique>/<name>.log`. Every unit, in
 both tiers, runs under a bound of `CONTRIB_UNIT_BOUND` seconds (default 1200) through GNU `timeout`, or `gtimeout` when
 only that is installed; a host with neither (macOS as shipped) runs units unbounded, and the header says so. Exit: 0
 every unit green, 1 a unit red, 64 usage, 69 a prerequisite is missing (named, with how it is made), 70 a list the

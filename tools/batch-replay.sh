@@ -6,7 +6,7 @@
 # item's measured seconds from a run.log, divided by a scale, and logs `start end item card chain`
 # per item. It prints both walls × scale, their difference, the chain's total and its gaps, and
 # asserts from its own log that no two chain items overlapped.
-#   tools/batch-replay.sh [--scale N] [--base REV] LIST RUNLOG
+#   tools/batch-replay.sh [--scale N] [--base REV] [--out DIR] LIST RUNLOG
 # LIST is a --list file of items (the raw `just affected` output or one item per line); RUNLOG is
 # the measured batch's run.log (`NAME rc=0 Ns try=… lane=…`). What the stub does not model, its
 # report says: no builds (the real lanes share one cargo lock), no box.sh guard waits, and sleeps
@@ -32,10 +32,18 @@ LIST=$1 RUNLOG=$2
 [ -f "$RUNLOG" ] || { echo "batch-replay: $RUNLOG: not a file" >&2; exit 64; }
 command -v just > /dev/null || { echo "batch-replay: just is not on PATH" >&2; exit 64; }
 command -v python3 > /dev/null || { echo "batch-replay: python3 is not on PATH" >&2; exit 64; }
+# shellcheck source=tools/nightly/units.sh
+source "$ROOT/tools/nightly/units.sh"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/batch-replay.XXXXXX") || exit 70
-trap 'rm -rf "$WORK"' EXIT
+trap 'rc=$?; output_dir_drop || rc=$?; rm -rf "$WORK" || rc=$?; exit "$rc"' EXIT
 [ -n "$OUT" ] || OUT=$WORK/out
-mkdir -p "$OUT"
+case "$OUT" in /*) ;; *) OUT=$PWD/$OUT ;; esac
+output_dir_take "$OUT" || exit $?
+for arm in base new; do
+  for file in "$OUT/$arm" "$OUT/$arm.log" "$OUT/$arm.rc"; do
+    [ ! -e "$file" ] && [ ! -L "$file" ] || { echo "batch-replay: $file already exists; use a new --out directory" >&2; exit 73; }
+  done
+done
 
 # The measured seconds, lane and card per item, and the two arms' trees: BASE from git objects
 # (its runner refuses any group outside its own closed set, so it cannot read the new justfile),
@@ -55,7 +63,8 @@ with open(sys.argv[2], "w", encoding="utf-8") as out:
 print(f"batch-replay: {len(rows)} measured items from {sys.argv[1]}")
 PY
 for arm in base new; do
-  mkdir -p "$WORK/$arm/tools/ref"
+  mkdir -p "$WORK/$arm/tools/ref" "$WORK/$arm/tools/nightly"
+  cp "$ROOT/tools/nightly/units.sh" "$WORK/$arm/tools/nightly/units.sh"
   if [ "$arm" = base ]; then
     git -C "$ROOT" show "$BASE_REV:tools/gate-batch.sh" > "$WORK/$arm/tools/gate-batch.sh"
     git -C "$ROOT" show "$BASE_REV:justfile" > "$WORK/$arm/justfile"
@@ -159,7 +168,7 @@ run_arm() { # $1 = arm label, $2.. = the batch's own flags
   shift
   ( cd "$WORK/$arm" && BLOOMERY_GATE_TIMES="$WORK/$arm/times.tsv" \
     bash "$WORK/$arm/tools/gate-batch.sh" --out "$OUT/$arm" --list "$LIST" "$@" ) > "$OUT/$arm.log" 2>&1 || rc=$?
-  printf '%s' "$rc" > "$OUT/$arm.rc"
+  printf '%s' "$rc" > "$WORK/$arm.rc"
 }
 # A base with the budget refusal (a32023da and later) needs --over-budget-ok as much as the new arm;
 # one without the flag would refuse the unknown option, so it is passed only where it exists.
@@ -171,7 +180,8 @@ if [ -n "$BASE_BUDGET_OK" ]; then run_arm base --over-budget-ok; else run_arm ba
 basepid=$!
 wait "$newpid"; wait "$basepid"
 for arm in base new; do
-  rc=$(cat "$OUT/$arm.rc")
+  cp "$WORK/$arm.rc" "$OUT/$arm.rc"
+  rc=$(cat "$WORK/$arm.rc")
   [ "$rc" = 0 ] || { echo "batch-replay: the $arm arm ended rc=$rc:" >&2; tail -5 "$OUT/$arm.log" >&2; exit 70; }
 done
 

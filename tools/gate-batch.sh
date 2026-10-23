@@ -6003,6 +6003,7 @@ ledger_record() { # $1 = plan index, $2 = final rc: record a green item whose ke
 }
 
 if [ -z "$OUT" ]; then
+  OUT_AUTO=1
   OUT="$HOME/.cache/bloomery/batches/$(basename "$ROOT")/$(date +%Y%m%d-%H%M%S)"
 fi
 case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
@@ -6024,9 +6025,15 @@ if [ "${below:-0}" = 1 ]; then
 fi
 
 if [ "$DRY" = 0 ]; then
-  mkdir -p "$OUT" || RC=73 die "cannot create the log directory $OUT"
-  [ -d "$OUT" ] && [ -w "$OUT" ] || RC=73 die "the log directory $OUT is not a writable directory"
-  [ ! -e "$OUT/run.log" ] || RC=73 die "$OUT already holds a batch (run.log) — give --out a new directory"
+  if [ "${OUT_AUTO:-0}" = 1 ]; then
+    mkdir -p "$(dirname "$OUT")" || RC=73 die "cannot create the log parent directory"
+    OUT=$(mktemp -d "$OUT.XXXXXX") || RC=73 die "cannot create a private log directory"
+  fi
+  # shellcheck source=tools/nightly/units.sh
+  source "$ROOT/tools/nightly/units.sh" || RC=70 die "cannot read the output directory owner"
+  output_dir_take "$OUT" || exit $?
+  trap 'rc=$?; output_dir_drop || rc=$?; exit "$rc"' EXIT
+  [ ! -e "$OUT/run.log" ] && [ ! -L "$OUT/run.log" ] || RC=73 die "$OUT already holds a batch (run.log) — give --out a new directory"
 fi
 RUNLOG=$OUT/run.log
 
@@ -6423,7 +6430,7 @@ fi
 # refusal here leaves no run.log, as the start check's does. Every exit from here on — the end, a red batch, die, INT/TERM (stop) —
 # takes it down through the EXIT trap.
 trap stop INT TERM
-trap hold_down EXIT
+trap 'rc=$?; hold_down; output_dir_drop || rc=$?; exit "$rc"' EXIT
 if [ "$HOLD_ON" = 1 ] && [ "$SKIP_N" -lt "$N" ]; then
   hold_up
   hold_beat_loop &

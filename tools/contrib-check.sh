@@ -34,7 +34,7 @@
 # Output: a header (commit, host, CPU features, toolchain, RUSTFLAGS), one line per unit `<name> rc=<N> <secs>s` (a red unit then names its
 # failing tests and its first red lines, then prints that unit's log whole — the CI step keeps this stdout, and the file
 # under target/ is not uploaded), a `DONE tier=… total=… red=… wall=…s` line; each unit's full log is also in
-# target/contrib-check/<time>/<name>.log. A host without GNU `timeout` (macOS) runs units unbounded, and the header says so;
+# target/contrib-check/<time>.<unique>/<name>.log. A host without GNU `timeout` (macOS) runs units unbounded, and the header says so;
 # the bound elsewhere is CONTRIB_UNIT_BOUND seconds a unit (default 1200), BLOOMERY_GATE_BOUND for tools/gate.sh.
 # CONTRIB_INJECT_FAIL=1 adds one deliberately failing unit, `inject-fail`: the red path end to end.
 #
@@ -171,8 +171,8 @@ unset BLOOMERY_BOX_ENV BLOOMERY_DATA
 
 # ---- the units: lists from their owners, never copied ----
 STAMP=$(date +%Y%m%d-%H%M%S)
-LOGDIR=$ROOT/target/contrib-check/$STAMP
-mkdir -p "$LOGDIR" || { say "contrib-check: cannot make $LOGDIR"; exit 69; }
+mkdir -p "$ROOT/target/contrib-check" || { say "contrib-check: cannot make the log parent directory"; exit 69; }
+LOGDIR=$(mktemp -d "$ROOT/target/contrib-check/$STAMP.XXXXXX") || { say "contrib-check: cannot make a private log directory"; exit 69; }
 PLAN=$LOGDIR/plan.tsv
 : > "$PLAN"
 add() { printf '%s\t%s\n' "$1" "$2" >> "$PLAN"; }

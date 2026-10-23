@@ -52,6 +52,28 @@
 # shellcheck disable=SC2034  # the UNIT_*, TREE_* and ARCHIVE_* variables are this library's result interface, read by the sourcing script
 UNIT_TIMEOUT=${UNIT_TIMEOUT-timeout}
 
+# output_dir_take DIR reserves a caller's output namespace until output_dir_drop.
+# A marker left by an interrupted owner is refused rather than guessed stale.
+output_dir_take() {
+  local dir=$1
+  OUTPUT_DIR_LOCK=
+  mkdir -p "$dir" && [ -d "$dir" ] && [ -w "$dir" ] || {
+    echo "output directory: cannot write $dir" >&2
+    return 73
+  }
+  mkdir "$dir/.run-owner" 2> /dev/null || {
+    echo "output directory: $dir already has an owner (.run-owner)" >&2
+    return 73
+  }
+  OUTPUT_DIR_LOCK=$dir/.run-owner
+}
+
+output_dir_drop() {
+  [ -n "${OUTPUT_DIR_LOCK:-}" ] || return 0
+  rmdir "$OUTPUT_DIR_LOCK" || return 73
+  OUTPUT_DIR_LOCK=
+}
+
 run_unit() {
   local cmd=$1 log=$2 bound=$3 mode=${4:-} t0=$SECONDS rc
   local -a bounded=()

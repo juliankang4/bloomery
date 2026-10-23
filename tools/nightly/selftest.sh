@@ -19,6 +19,81 @@ ROOT=$(cd "$HERE/../.." && pwd)
 # shellcheck source=tools/nightly/units.sh
 source "$HERE/units.sh"
 
+if [ "${2:-}" = --output-only ]; then
+  python3 - "${OUTPUT_TEST_ROOT:-$ROOT}" << 'PY'
+import pathlib, subprocess, sys, tempfile
+
+root = pathlib.Path(sys.argv[1]).resolve()
+bad = checks = 0
+def check(name, ok, detail):
+    global bad, checks
+    print(f"{'ok' if ok else 'FAIL'} {name}: {detail}")
+    checks += 1
+    bad += not ok
+
+with tempfile.TemporaryDirectory(prefix="output-owner-") as tmp:
+    t = pathlib.Path(tmp)
+    def run(body, *args):
+        return subprocess.run(["bash", "-c", body, "_", *map(str, args)],
+                              capture_output=True, text=True, timeout=10)
+    common = 'set -euo pipefail; ROOT=$1; OUT=$2; DRY=0; RC=73; die() { echo "$*" >&2; exit "$RC"; }; '
+    contrib = (root / "tools/contrib-check.sh").read_text()
+    allocation = contrib[contrib.index('STAMP=$(date '):contrib.index("add fmt ")]
+    body = common + 'date() { echo same-second; }; ' + allocation + '\nprintf "%s\\n" "$LOGDIR"'
+    a, b = (run(body, t, t / "unused") for _ in range(2))
+    check("contrib-check same-second plans stay private",
+          a.returncode == b.returncode == 0 and a.stdout != b.stdout, (a.stdout + b.stdout).strip())
+
+    gate = (root / "tools/gate-batch.sh").read_text()
+    end = gate.index('RUNLOG=$OUT/run.log')
+    gate = gate[gate.rfind('if [ "$DRY" = 0 ]; then', 0, end):end]
+    replay = (root / "tools/batch-replay.sh").read_text()
+    begin = replay.index('WORK=$(mktemp ')
+    replay_out = replay[begin:replay.index('# The measured seconds,')]
+    for name, allocation in (("gate-batch", gate), ("batch-replay", replay_out)):
+        out = t / name
+        body = common + 'source "$ROOT/tools/nightly/units.sh"; ' + allocation
+        owner = subprocess.Popen(["bash", "-c", body + '\necho ready; read -r release', "_", str(root), str(out)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            ready = owner.stdout.readline().strip()
+            rival = run(body, root, out)
+            owner.stdin.write("release\n")
+            owner.stdin.flush()
+            stdout, stderr = owner.communicate(timeout=10)
+            check(f"{name} has one output owner before any log",
+                  ready == "ready" and rival.returncode == 73 and owner.returncode == 0,
+                  f"owner={owner.returncode} rival={rival.returncode} {rival.stderr.strip()} {stderr.strip()}")
+            retry = run(body, root, out)
+            check(f"{name} releases an unused output directory", retry.returncode == 0, retry.stderr.strip())
+            artifact = out / ("run.log" if name == "gate-batch" else "new.rc")
+            artifact.write_text("saved\n")
+            retry = run(body, root, out)
+            check(f"{name} preserves existing output", retry.returncode == 73 and artifact.read_text() == "saved\n",
+                  retry.stderr.strip())
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+                owner.communicate()
+
+    work, out = t / "work", t / "receipts"
+    out.mkdir()
+    for arm, rc in (("base", 0), ("new", 1)):
+        (work / arm / "tools").mkdir(parents=True)
+        (work / arm / "tools/gate-batch.sh").write_text(f"exit {rc}\n")
+    arm_fn = replay[replay.index('run_arm() {'):replay.index('# A base with the budget refusal')]
+    end_check = replay[replay.index('for arm in base new; do', replay.index('wait "$newpid"')):replay.index('# Both walls')]
+    body = 'set -euo pipefail; WORK=$1; OUT=$2; LIST=/dev/null; ' + arm_fn
+    body += '\nrun_arm base; run_arm new; printf 0 > "$OUT/base.rc"; printf 0 > "$OUT/new.rc";\n' + end_check
+    result = run(body, work, out)
+    check("batch-replay refuses its own failed arm despite foreign rc files",
+          result.returncode == 70 and "new arm ended rc=1" in result.stderr, result.stderr.strip())
+print(f"output-owner self-test: {checks - bad} of {checks} ok")
+sys.exit(bool(bad))
+PY
+  exit $?
+fi
+
 # An empty T would put every repository, fixture and nightly state below at the filesystem root.
 T=$(mktemp -d "${TMPDIR:-/tmp}/tree-commit.XXXXXX") || {
   echo "tree-commit self-test: cannot create a scratch directory under ${TMPDIR:-/tmp}: nothing was checked" >&2
@@ -44,6 +119,8 @@ has() {
 }
 
 g() { git -c user.email=t@t -c user.name=t -c commit.gpgsign=false "$@"; }
+bash "$HERE/selftest.sh" --self-test --output-only
+check output-directory-contracts "$?" 0
 # mkrepo DIR: a repository with one commit and one tracked file.
 mkrepo() {
   git init -q --template= "$1" && echo a > "$1/f" && g -C "$1" add f && g -C "$1" commit -q -m one
