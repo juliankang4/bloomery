@@ -247,14 +247,15 @@
 //!   chunks of up to eight columns at 96, 100, 128 and 512 rows, up to 4095
 //!   columns, nothing written past its output.
 //! - `dense_mma`: GB10's dense prompt MMA for BF16, MXFP8 and FP8_B128
-//!   weights (`enqueue_bf16_mma`, `enqueue_e4m3_mma`) at ragged shapes and
-//!   range edges: every output within the BF16 operand band, the cells of an
-//!   edge's row and column the exact tile's bits, nothing written past the
-//!   output and a graph replay the eager bits. At 130 × 130 outputs of K 128,
-//!   unit weights against activations of 1 + 2^-10: every cell K, and with a
-//!   subnormal activation in one column, then also weights of 2^60 in one row,
-//!   that column's and row's cells the exact tile's bits and every other cell
-//!   still K. A BF16 weight off a 16-byte boundary is refused by name.
+//!   weights (`enqueue_bf16_mma`, `enqueue_e4m3_mma`) at ragged shapes (one
+//!   with columns past a raster group) and range edges: every output within
+//!   the BF16 operand band, the cells of an edge's row and column the exact
+//!   tile's bits, nothing written past the output and a graph replay the
+//!   eager bits. At 130 × 130 outputs of K 128, unit weights against
+//!   activations of 1 + 2^-10: every cell K, and with a subnormal activation
+//!   in one column, then also weights of 2^60 in one row, that column's and
+//!   row's cells the exact tile's bits and every other cell still K. A BF16
+//!   weight off a 16-byte boundary is refused by name.
 //! - `g32_refuse`: the host API's refusals, each an error holding its own
 //!   message (another check refusing first does not pass): the scratch's
 //!   K and columns, the quantizer's input and columns, an unfilled table,
@@ -6713,6 +6714,7 @@ mod gate {
                 (33, 2560, 33, 0, 0, None),
                 (100, 256, 65, 0, 0, None),
                 (33, 640, 513, 0, 0, None),
+                (33, 64, 1100, 0, 0, None),
                 (1, 128, 1, 0, 0, Some(OVERFLOW)),
                 (1, 128, 1, 0, 0, Some(CANCEL)),
                 (

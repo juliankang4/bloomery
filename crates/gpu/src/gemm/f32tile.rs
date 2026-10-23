@@ -473,6 +473,19 @@ pub(crate) trait MmaRows: TileRows {
     /// [`Self::land`].
     type Piece: Copy + Default;
 
+    /// Whether [`Self::fetch`] is an asynchronous copy, so a thread holds no
+    /// piece in registers across the products. The tile then runs the stages
+    /// that fetch as their own loop, with no branch around the fetches; a
+    /// weight that holds its pieces keeps one loop, where the compiler's
+    /// hoisting of the next pieces' loads would spill.
+    const COPIED: bool = true;
+
+    /// Column tiles of one raster group ([`raster32`]). A wave of resident
+    /// blocks reads the weight slabs of its rows and the F32 activations of
+    /// its columns; for a BF16 weight, half an activation's bytes a value,
+    /// eight tiles balance the two on GB10's 96 resident blocks.
+    const GROUP: usize = 8;
+
     /// Starts moving values `at .. at + 8` (`at` a multiple of 8) to the 16
     /// bytes at `dst`: an asynchronous copy completed by this thread's
     /// `cp_async_wait_group` for its committed group, or loads [`Self::land`]
@@ -528,6 +541,10 @@ impl MmaRows for Bf16Rows<'_> {
 impl<F: ByteBlocks<Scale = u32>> MmaRows for ByteRows<'_, F> {
     /// The piece's two value words and its block's scale element.
     type Piece = (u32, u32, u32);
+    const COPIED: bool = false;
+    /// The F32 tiles' column span: a byte weight is a quarter of an
+    /// activation's bytes a value.
+    const GROUP: usize = GEMM32_GROUP * TILE_COLS / MMA_COLS;
 
     #[inline(always)]
     unsafe fn fetch(self, _: *mut u32, at: usize) -> (u32, u32, u32) {
@@ -830,8 +847,7 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows>(
     let (rows, kk, n) = (rows as usize, k as usize, n as usize);
     let row_blocks = rows.div_ceil(MMA_ROWS);
     let block = thread::blockIdx_x() as usize;
-    let group_size = GEMM32_GROUP * TILE_COLS / MMA_COLS;
-    let Some((col_tile, row_tile)) = raster32(block, row_blocks, n.div_ceil(MMA_COLS), group_size)
+    let Some((col_tile, row_tile)) = raster32(block, row_blocks, n.div_ceil(MMA_COLS), W::GROUP)
     else {
         return None;
     };
@@ -906,71 +922,90 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows>(
     // line pick the permutation, and the warp's line offsets keep them.
     let a_lane = mma_piece_at(lane % 16, lane / 16);
     let b_lane = mma_piece_at(lane % 8 + 8 * (lane / 16), (lane / 8) % 2);
-    for s in 0..stages {
-        let buf = s % STAGES;
-        // SAFETY: two groups precede this wait; the oldest is stage s.
-        unsafe { cp_async_wait_group(1) };
-        for i in 0..2 {
-            thread::__unroll_config::<0>();
-            // SAFETY: the wait completed this thread's copies of stage s.
-            let fits = unsafe { W::landed_fits(words.add(buf * STAGE_FLOATS + w_dst[i])) };
-            bad |= u32::from(!fits) << i;
-        }
-        thread::sync_threads();
-        // Stage s + 2 goes to the buffer every warp finished reading before
-        // the barrier above: piece `step` of each operand is fetched before
-        // MMA step `step` and landed after it, so a thread holds one piece
-        // of each in flight.
-        let ahead = s + 2 < stages;
-        let next = words.wrapping_add(((s + 2) % STAGES) * STAGE_FLOATS);
-        let stage = shared + (4 * buf * STAGE_FLOATS) as u32;
-        for step in 0..2 {
-            thread::__unroll_config::<0>();
-            let at = w_src[step] + (s + 2) * MMA_LINE;
-            let mut piece = W::Piece::default();
-            let mut xs = [0.0; 8];
-            if ahead {
-                // SAFETY: stage s + 2 lies inside K; the piece is this thread's.
-                piece = unsafe { w.fetch(next.wrapping_add(w_dst[step]), at) };
-                xs = fetch_x(s + 2, step);
-            }
-            if step == 1 {
-                // SAFETY: commits this pass's copies as one group, empty near the end.
-                unsafe { cp_async_commit_group() };
-            }
-            let half = 8 * step;
-            // Both column fragments first; then one row fragment at a time,
-            // so the warp holds twelve fragment words, not twenty.
-            let mut b = [[0u32; 4]; 2];
-            for nj in 0..2 {
+    // Stage s's products; with `ahead`, stage s + 2 goes to the buffer every
+    // warp finished reading before this pass's barrier: piece `step` of each
+    // operand is fetched before MMA step `step` and landed after it, so a
+    // thread holds one piece of each in flight. A copied weight's stages that
+    // fetch run as their own loop ([`MmaRows::COPIED`]).
+    macro_rules! stage_pass {
+        ($s:expr, $ahead:expr) => {{
+            let (s, ahead) = ($s, $ahead);
+            let buf = s % STAGES;
+            // SAFETY: two groups precede this wait; the oldest is stage s.
+            unsafe { cp_async_wait_group(1) };
+            thread::sync_threads();
+            let next = words.wrapping_add(((s + 2) % STAGES) * STAGE_FLOATS);
+            let stage = shared + (4 * buf * STAGE_FLOATS) as u32;
+            for step in 0..2 {
                 thread::__unroll_config::<0>();
-                let at = MMA_COLS_AT + (wc + 16 * nj) * MMA_LINE_WORDS + (b_lane ^ half);
-                // SAFETY: the warp is converged; each lane's 16-byte row lies
-                // in this published stage's column lines.
-                b[nj] = unsafe { ldmatrix_x4_shared_u32(stage + (4 * at) as u32) };
-            }
-            for mi in 0..4 {
-                thread::__unroll_config::<0>();
-                let at = (wr + 16 * mi) * MMA_LINE_WORDS + (a_lane ^ half);
-                // SAFETY: as above, in the stage's row lines.
-                let a = unsafe { ldmatrix_x4_shared_u32(stage + (4 * at) as u32) };
-                for j in 0..4 {
+                let at = w_src[step] + (s + 2) * MMA_LINE;
+                let mut piece = W::Piece::default();
+                let mut xs = [0.0; 8];
+                if ahead {
+                    // SAFETY: stage s + 2 lies inside K; the piece is this thread's.
+                    piece = unsafe { w.fetch(next.wrapping_add(w_dst[step]), at) };
+                    xs = fetch_x(s + 2, step);
+                }
+                if step == 1 {
+                    // SAFETY: commits this pass's copies as one group, empty near the end.
+                    unsafe { cp_async_commit_group() };
+                }
+                let half = 8 * step;
+                // Both column fragments first; then one row fragment at a time,
+                // so the warp holds twelve fragment words, not twenty.
+                let mut b = [[0u32; 4]; 2];
+                for nj in 0..2 {
                     thread::__unroll_config::<0>();
-                    let b = [b[j / 2][2 * (j % 2)], b[j / 2][2 * (j % 2) + 1]];
-                    // SAFETY: the whole warp is converged; A is row-major and
-                    // B column-major in the m16n8k16 fragment layout.
-                    acc[mi][j] = unsafe { mma_m16n8k16_f32_bf16(acc[mi][j], a, b) };
+                    let at = MMA_COLS_AT + (wc + 16 * nj) * MMA_LINE_WORDS + (b_lane ^ half);
+                    // SAFETY: the warp is converged; each lane's 16-byte row lies
+                    // in this published stage's column lines.
+                    b[nj] = unsafe { ldmatrix_x4_shared_u32(stage + (4 * at) as u32) };
+                }
+                for mi in 0..4 {
+                    thread::__unroll_config::<0>();
+                    let at = (wr + 16 * mi) * MMA_LINE_WORDS + (a_lane ^ half);
+                    // SAFETY: as above, in the stage's row lines.
+                    let a = unsafe { ldmatrix_x4_shared_u32(stage + (4 * at) as u32) };
+                    for j in 0..4 {
+                        thread::__unroll_config::<0>();
+                        let b = [b[j / 2][2 * (j % 2)], b[j / 2][2 * (j % 2) + 1]];
+                        // SAFETY: the whole warp is converged; A is row-major and
+                        // B column-major in the m16n8k16 fragment layout.
+                        acc[mi][j] = unsafe { mma_m16n8k16_f32_bf16(acc[mi][j], a, b) };
+                    }
+                }
+                if step == 1 {
+                    for i in 0..2 {
+                        thread::__unroll_config::<0>();
+                        let fits =
+                            // SAFETY: the wait completed this thread's copies of stage
+                            // s, which no warp overwrites before the next pass's barrier.
+                            unsafe { W::landed_fits(words.add(buf * STAGE_FLOATS + w_dst[i])) };
+                        bad |= u32::from(!fits) << i;
+                    }
+                }
+                if ahead {
+                    // SAFETY: this thread's own aligned activation piece of stage
+                    // s + 2, which no warp reads before the next pass's barrier.
+                    let fits = unsafe { land_values(xs, next.wrapping_add(x_dst[step])) };
+                    bad |= u32::from(!fits) << (2 + step);
+                    // SAFETY: this step's fetch of stage s + 2, into its piece, as above.
+                    let fits = unsafe { W::land(piece, next.wrapping_add(w_dst[step]), at) };
+                    bad |= u32::from(!fits) << step;
                 }
             }
-            if ahead {
-                // SAFETY: this thread's own aligned activation piece of stage
-                // s + 2, which no warp reads before the next pass's barrier.
-                let fits = unsafe { land_values(xs, next.wrapping_add(x_dst[step])) };
-                bad |= u32::from(!fits) << (2 + step);
-                // SAFETY: this step's fetch of stage s + 2, into its piece, as above.
-                let fits = unsafe { W::land(piece, next.wrapping_add(w_dst[step]), at) };
-                bad |= u32::from(!fits) << step;
-            }
+        }};
+    }
+    if W::COPIED {
+        for s in 0..stages - 2 {
+            stage_pass!(s, true);
+        }
+        for s in stages - 2..stages {
+            stage_pass!(s, false);
+        }
+    } else {
+        for s in 0..stages {
+            stage_pass!(s, s + 2 < stages);
         }
     }
     Some(MmaTile {
