@@ -11765,8 +11765,36 @@ def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = 
     return out, times
 
 
+def profile_inputs_self_test(expect, side: Side) -> None:
+    for value, profile in (("deepseek41", "deepseek41"), ("${BLOOMERY_MODEL:-deepseek41}", "deepseek41")):
+        recipes = {"x": Recipe("x", [f"BLOOMERY_MODEL={value} ./tools/box.sh 'true'", "BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'true'"], [], "")}
+        probe = Side(side.tree, recipes, Graph(side.tree, recipes))
+        inputs = probe.graph.inputs("x")
+        paths = {f"tools/ref/models/{profile}.sh", "tools/ref/models/qwen3moe.sh"}
+        expect(paths <= inputs.files.keys() and not inputs.errors, f"profile inputs: {value}: {inputs.files}, {inputs.errors}")
+        expect(all("$" not in p for p in inputs.files), f"profile inputs: shell expression used as a path: {inputs.files}")
+        for env in ({}, {"BLOOMERY_MODEL": ""}, {"BLOOMERY_MODEL": "glm5next"}):
+            context = KeyContext(probe, None, environ=env)
+            selected = "glm5next" if value.startswith("$") and env.get("BLOOMERY_MODEL") else profile
+            path = f"tools/ref/models/{selected}.sh"
+            expect(path in context.run_scripts(["x"]), f"profile scripts: {value}, {env}: missing {path}")
+            if value.startswith("$"):
+                parts, err, _, _ = context._parts("x", ["x"], inputs, [], [])
+                expect(any(p.startswith(f"file\t{path}\t") for p in parts), f"profile key: {value}, {env}: {err}, missing {path}")
+    for value in ("${OTHER:-deepseek41}", "$BLOOMERY_MODEL", "../deepseek41"):
+        recipes = {"x": Recipe("x", [f"BLOOMERY_MODEL={value} ./tools/box.sh 'true'"], [], "")}
+        inputs = Graph(side.tree, recipes).inputs("x")
+        expect(any("BLOOMERY_MODEL" in e and value in e for e in inputs.errors), f"profile inputs: unresolved {value!r} not refused: {inputs.errors}")
+    for name in ("bench-cpu-v41-host-check", "measure-cpu-v41-host", "depth-gpu-qwen3moe"):
+        if name in side.recipes:
+            inputs = side.graph.inputs(name)
+            expect(not inputs.errors and all("$" not in p for p in inputs.files), f"profile inputs: {name}: {inputs.errors}")
+
+
 def _st_basics(fails: list[str], side: Side) -> None:
     expect = _expecting(fails)
+
+    profile_inputs_self_test(expect, side)
 
     # shell splitting and the four command shapes
     rc = recipe_commands(
