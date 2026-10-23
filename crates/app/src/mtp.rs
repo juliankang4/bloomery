@@ -748,7 +748,8 @@ pub struct SlotWindow<'a, B: MtpBody> {
 ///   before any pass: a pass may write the arena whose rows a draft walks;
 /// - the windows' rows — the token at its slot's position, then the
 ///   proposal — cut between windows into passes of at most
-///   [`SlotRows::MAX_ROWS`] rows, the pass that holds slot 0 last
+///   [`SlotRows::MAX_ROWS`] rows and [`SlotRows::MAX_SLOTS`] sequences,
+///   the pass that holds slot 0 last
 ///   (`round_passes`), each pass run as one
 ///   ([`Session::verify_slots`]), each row bit for bit its step;
 /// - each window's kept rows by the runtime's rule (row 0, then while the

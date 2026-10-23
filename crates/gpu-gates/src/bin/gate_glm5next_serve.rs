@@ -110,7 +110,7 @@
 //!   and four requests of two rendered turns ([`TURN_A`], [`TURN_C`]), each run alone for
 //!   [`SLOTS_PREDICT`] greedy ids (`cache_prompt` off), then both posted at
 //!   once, answer each one's alone ids, every `slots round` record of the
-//!   together window reading `cmd=step`, `slots=2`, `rows=2` and
+//!   together window reading `cmd=step`, `slots=4`, `rows` from 2 to 4 and
 //!   `passes=ceil(rows/2)` — the body's two-sequence bound (FAIL-first: the seat
 //!   left on the fallback loop prints `passes=rows`);
 //! - a fifth load, the seat as a user starts it ([`unset_load`]: no
@@ -2408,8 +2408,8 @@ mod gate {
             && window.iter().all(|r| {
                 let rows = r.u64("rows");
                 r.word("cmd") == Ok("step")
-                    && r.u64("slots").is_ok_and(|n| (2..=4).contains(&n))
-                    && rows == r.u64("slots")
+                    && r.u64("slots") == Ok(4)
+                    && rows.is_ok_and(|n| (2..=4).contains(&n))
                     && r.u64("passes") == rows.map(|n| n.div_ceil(2))
             });
         println!(
@@ -2433,7 +2433,7 @@ mod gate {
         check(
             &mut ok,
             "plain_slots_four_requests_overlap",
-            window.iter().any(|r| r.u64("slots") == Ok(4)),
+            window.iter().any(|r| r.u64("rows") == Ok(4)),
         );
         println!("plain slots server stopped: {}", served.stop()?);
         Ok(ok)

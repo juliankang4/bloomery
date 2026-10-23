@@ -1085,6 +1085,7 @@ const fn slots_fit<B: SlotRows>() {
 /// than the arena takes no slot.
 #[must_use]
 pub const fn slots_a_pass<B: SlotRows>(rows: usize) -> usize {
+    slots_fit::<B>();
     let Some(fit) = B::MAX_ROWS.checked_div(rows) else {
         return 0;
     };

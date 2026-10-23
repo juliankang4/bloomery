@@ -780,7 +780,7 @@ pub(crate) fn round_passes(
 
 /// What [`Session::step_slots_rounds`] ran: each row's greedy next token in
 /// row order, the passes the round took (one a cut at the body's
-/// [`SlotRows::MAX_ROWS`] bound), and every row's logits when the caller
+/// row and sequence bounds), and every row's logits when the caller
 /// asked for them, each pass's rows in the round's row order — the
 /// session's own buffer, lent until its next call.
 #[derive(Clone, Debug, PartialEq)]

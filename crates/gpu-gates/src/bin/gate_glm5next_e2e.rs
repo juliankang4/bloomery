@@ -4138,8 +4138,8 @@ mod gate {
     /// whose missing refusal would move a slot last.
     #[derive(Clone, Copy, Debug)]
     enum G5 {
-        /// Three rows in one pass, a row a slot: the body's refusal naming
-        /// the points its walk lays.
+        /// Three rows in one pass, a row a slot: the common owner's sequence
+        /// limit refuses it before the body runs.
         Bound,
         /// The taps armed.
         Taps,
@@ -4155,7 +4155,7 @@ mod gate {
     impl G5 {
         fn says(self) -> &'static str {
             match self {
-                G5::Bound => "a pass of three slots' rows (naming the points the walk lays)",
+                G5::Bound => "a pass of three slots' rows (naming the sequence limit)",
                 G5::Taps => "a pass with the taps armed",
                 G5::Held => "a pass beside slot 1's step failed past its launch",
                 G5::Two => "a pass of slot 0's two rows",
@@ -4234,12 +4234,10 @@ mod gate {
         let both: [(usize, &[u32]); 2] = [(0, &[t0]), (1, &[t1])];
         let mut before = slot_positions(m)?;
         let named = match case {
-            // The owner's bound holds four rows, so three reach the body,
-            // whose walk lays no point for them.
             G5::Bound => refused_by(
                 &m.step_slots(&[(0, &[t0]), (1, &[t1]), (2, &[t1])]),
-                GLM_BODY,
-                "the walk lays",
+                "GpuModel::step_slots",
+                "SlotRows::MAX_SLOTS",
             ),
             G5::Taps => {
                 set_taps(m, true)?;

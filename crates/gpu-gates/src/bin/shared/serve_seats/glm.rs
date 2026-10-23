@@ -118,8 +118,9 @@
 //! `--parallel 1` is the one-sequence server and `--parallel 0` is refused
 //! by name. `--parallel` naming no count, the seat serves one slot; a count
 //! the flags set is never lowered. The round's shape the open decided once, from the load and the
-//! body's row and sequence limits (`SlotRows::MAX_ROWS`, `SlotRows::MAX_SLOTS`): a plain load (no NextN draft) runs a round of
-//! steps as one pass of the busy rows
+//! body's row and sequence limits (`SlotRows::MAX_ROWS`, `SlotRows::MAX_SLOTS`):
+//! a plain load (no NextN draft) runs a round of
+//! steps as passes of the busy rows
 //! (`serve_seats::rounds::step_rows_one_pass`, cut at that bound); a NextN
 //! load runs a round of drafted passes as one pass of the busy slots'
 //! windows (`serve_seats::rounds::pass_rows_one_pass`, each slot's window

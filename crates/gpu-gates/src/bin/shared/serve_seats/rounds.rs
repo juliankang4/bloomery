@@ -220,7 +220,8 @@ where
 /// Rows are laid in slot order ([`slot_order`]), each row's kept ids and
 /// counts back to that row; each slot's rows are bit for bit its own
 /// wherever they sit in the pass. A round whose windows' rows
-/// pass the body's [`SlotRows::MAX_ROWS`] runs as more than one pass, cut
+/// pass the body's [`SlotRows::MAX_ROWS`] or [`SlotRows::MAX_SLOTS`] limit
+/// runs as more than one pass, cut
 /// between windows by their proposals' rows, every window's proposal made
 /// first and the pass that holds slot 0 last ([`pass_slots`]) — a window
 /// is never split: its rows are one verify of its sequence — every pass
