@@ -156,6 +156,9 @@ lds-scan bin=target/release/gate_x sass-lines-unread=up_mix_4x320 scan=failed"
   rc=0; SCAN_STUBS=1 SCAN_FIX=$t/fix-wc scan gate_x down || rc=$?
   case_ ptx-count-unread 1 "$banner entries=7 filter=down
 lds-scan bin=target/release/gate_x lines-unread=up_down scan=failed"
+  printf '#!/bin/sh\ncat > /dev/null\nexit 1\n' > "$t/stubs/wc"
+  rc=0; SCAN_STUBS=1 scan gate_x mix || rc=$?
+  case_ entry-count-unread 1 "lds-scan bin=target/release/gate_x entries=unread scan=failed"
   SCAN_STUBS= SCAN_FIX=
   echo "lds-scan: self-test $([ "$bad" = 0 ] && echo ok || echo FAIL) ($n cases, $bad failed)"
   [ "$bad" = 0 ]
