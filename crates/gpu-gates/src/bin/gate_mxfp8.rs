@@ -37,7 +37,11 @@
 //! and `bits` equal to the F32 tile's rule `card::f32_dot` over the host
 //! dequant (lane `L` the values `32i + L` in increasing `i`, one fused
 //! multiply-add each, the butterfly), since its values are decoded exactly as
-//! they are staged.
+//! they are staged. On GB10 `site::gemm` runs the BF16-operand MMA product
+//! instead: its outputs are held to the operand band, and a subnormal first
+//! activation in column 1 leaves every other column's outputs their bits
+//! (`mma.neighbours`, `shared/dense_file.rs`); the clauses above then read
+//! the exact tile's outputs.
 //!
 //! Three 8-row, 128-value tensors of each type also exercise the scale's
 //! ends through the gemv at one and three columns and the tile at 64 columns:
@@ -107,7 +111,7 @@ fn main() -> std::process::ExitCode {
 }
 
 mod gate {
-    use crate::dense_file::{by_name, check, columns, decl, host_rows, q8_0_bytes};
+    use crate::dense_file::{by_name, check, columns, decl, host_rows, mma_neighbours, q8_0_bytes};
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::head::{Head, HeadNorm};
     use bloomery_gpu::q8f32::{
@@ -873,6 +877,7 @@ mod gate {
             let (x, x_dev, mut y_dev) =
                 columns(gpu, (m, k, rows), s.seed ^ (0x1000 + i as u64), x_scale)?;
             let wide = m == WIDE;
+            let shown = format!("shape={} rows={rows} k={k} m={m}", s.stem);
             if wide {
                 let x_in = WideIn {
                     q128: None,
@@ -890,6 +895,7 @@ mod gate {
                     stream.synchronize()?;
                     let mma = y_dev.to_host_vec(stream)?;
                     ok &= check_mma(&name, (&mma, &x, k), &wf);
+                    ok &= mma_neighbours(gpu, &k32, (src, route), (&x, k, rows), (tag, &shown))?;
                     // PIN(2026-10-22): GB10 BF16 operand rounding replaces the site's F32 bit
                     // contract with the band/KL check above; the exact tile's output replaces
                     // the site's here, so the bit checks below hold for the exact tile only.
@@ -908,7 +914,6 @@ mod gate {
             let y = y_dev.to_host_vec(stream)?;
             let walk = |r: usize, c: usize| byte_rule(&wf[r], &x[c * k..][..k]);
             let tile = |r: usize, c: usize| tile_rule(&wf[r], &x[c * k..][..k]);
-            let shown = format!("shape={} rows={rows} k={k} m={m}", s.stem);
             ok &= if wide {
                 check(
                     (tag, "tile"),

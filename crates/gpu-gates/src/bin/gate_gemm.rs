@@ -245,6 +245,15 @@
 //! - `g32_f32tile`: `enqueue_f32_tile` bit for bit `enqueue_f32_gemv` over
 //!   chunks of up to eight columns at 96, 100, 128 and 512 rows, up to 4095
 //!   columns, nothing written past its output.
+//! - `dense_mma`: GB10's dense prompt MMA for BF16, MXFP8 and FP8_B128
+//!   weights (`enqueue_bf16_mma`, `enqueue_e4m3_mma`) at ragged shapes and
+//!   range edges: every output within the BF16 operand band, the cells of an
+//!   edge's row and column the exact tile's bits, nothing written past the
+//!   output and a graph replay the eager bits. At 130 × 130 outputs of K 128,
+//!   unit weights against activations of 1 + 2^-10: every cell K, and with a
+//!   subnormal activation in one column, then also weights of 2^60 in one row,
+//!   that column's and row's cells the exact tile's bits and every other cell
+//!   still K. A BF16 weight off a 16-byte boundary is refused by name.
 //! - `g32_refuse`: the host API's refusals, each an error holding its own
 //!   message (another check refusing first does not pass): the scratch's
 //!   K and columns, the quantizer's input and columns, an unfilled table,
@@ -6883,10 +6892,16 @@ mod gate {
                         let mut exact = DeviceBuffer::from_host(stream, &vec![SENT; y.len()])?;
                         enqueue(stream, true, &mut exact)?;
                         let exact = exact.to_host_vec(stream)?;
-                        let same = eager
+                        // The edge's row and column hold the exceptional operands, so
+                        // their cells are the exact tile's.
+                        let same = eager[..rows * n]
                             .iter()
                             .zip(&exact)
-                            .all(|(a, b)| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()));
+                            .enumerate()
+                            .filter(|(i, _)| i % rows == r || i / rows == c)
+                            .all(|(_, (a, b))| {
+                                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+                            });
                         println!("dense_mma {tag} exact_tile_bits={same}");
                         let finite_quality = !f32::from_bits(want.unwrap()).is_finite()
                             || bloomery_gpu_gates::rounding::check_mma(
@@ -6920,6 +6935,92 @@ mod gate {
                         verdict(range && tail && same && quality)
                     );
                     ok &= quality && range && tail && same;
+                }
+            }
+            // Each cell's path, visible with unit weights against activations
+            // one bit below BF16 (1 + 2^-10): K on the tensor cores and
+            // K·(1 + 2^-10) on the exact owner. A subnormal activation in one
+            // column, then also weights of 2^60 in one row, send that column's
+            // and that row's cells to the exact tile's bits and leave every
+            // other cell of their tiles at K.
+            {
+                use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight};
+                let (rows, k, n, odd_row, odd_col) = (130, 128, 130, 64, 129);
+                let x_of = |odd: bool| {
+                    let mut x = vec![f32::from_bits(0x3f80_2000); n * k];
+                    if odd {
+                        x[odd_col * k] = f32::from_bits(0x200);
+                    }
+                    DeviceBuffer::from_host(stream, &x)
+                };
+                // A row's words, its MXFP8 and its FP8_B128 scale words: 1 or 2^60.
+                let planes = |odd: bool| {
+                    let row = |r| odd && r == odd_row;
+                    let of = |normal: u32, big: u32, cols: usize| {
+                        let v: Vec<u32> = (0..rows)
+                            .flat_map(|r| {
+                                std::iter::repeat_n(if row(r) { big } else { normal }, cols)
+                            })
+                            .collect();
+                        DeviceTensor::upload(stream, &v, rows, cols)
+                    };
+                    Ok::<_, GpuError>((
+                        of(0x3f80_3f80, 0x5d80_5d80, k / 2)?,
+                        DeviceTensor::upload(
+                            stream,
+                            &vec![0x3838_3838u32; rows * k / 4],
+                            rows,
+                            k / 4,
+                        )?,
+                        of(0x7f7f_7f7f, 0xbbbb_bbbb, k / 128)?,
+                        of(0x3f80_0000, 0x5d80_0000, k / 128)?,
+                    ))
+                };
+                for (odd_r, odd_c) in [(false, false), (false, true), (true, true)] {
+                    let x = x_of(odd_c)?;
+                    let (w, qs, mx, fp) = planes(odd_r)?;
+                    for (format, scales) in [
+                        ("bf16", None),
+                        ("mxfp8", Some((&mx, E4m3Scales::Mxfp8))),
+                        ("fp8_b128", Some((&fp, E4m3Scales::Fp8B128))),
+                    ] {
+                        let run = |exact: bool| {
+                            let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n])?;
+                            match scales {
+                                None if exact => {
+                                    gpu.q8f32().enqueue_bf16_tile(stream, &w, &x, n, &mut y)?
+                                }
+                                None => gpu
+                                    .q8f32()
+                                    .enqueue_bf16_mma::<false>(stream, &w, &x, n, &mut y)?,
+                                Some((e, scales)) => {
+                                    let weight = E4m3Weight { qs: &qs, e, scales };
+                                    if exact {
+                                        dev.g32.enqueue_e4m3_tile(stream, weight, &x, n, &mut y)?
+                                    } else {
+                                        dev.g32.enqueue_e4m3_mma(stream, weight, &x, n, &mut y)?
+                                    }
+                                }
+                            }
+                            Ok::<_, GpuError>(y.to_host_vec(stream)?)
+                        };
+                        let (mma, exact) = (run(false)?, run(true)?);
+                        let odd = |i: usize| {
+                            (odd_r && i % rows == odd_row) || (odd_c && i / rows == odd_col)
+                        };
+                        let kept = (0..rows * n)
+                            .filter(|&i| !odd(i))
+                            .all(|i| mma[i].to_bits() == (k as f32).to_bits());
+                        let replayed = (0..rows * n)
+                            .filter(|&i| odd(i))
+                            .all(|i| mma[i].to_bits() == exact[i].to_bits());
+                        println!(
+                            "dense_mma {format} cells rows={rows} K={k} n={n} row{odd_row}_odd={odd_r} \
+                             col{odd_col}_odd={odd_c} others_kept_k={kept} odd_lines_exact={replayed} {}",
+                            verdict(kept && replayed)
+                        );
+                        ok &= kept && replayed;
+                    }
                 }
             }
             // The tile copies a BF16 weight's words in 16-byte pieces, so a

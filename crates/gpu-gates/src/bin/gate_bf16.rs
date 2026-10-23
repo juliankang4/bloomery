@@ -20,6 +20,10 @@
 //!    1,024 × 128), plus a 19 × 128 tail, through `site::gemv` at every
 //!    width in 1..=8 (the token-major gemv), `site::resident_gemv` at one
 //!    (the call GLM's `body::gemv` is) and `site::gemm` at 64 columns (the tile).
+//!    On GB10 that `site::gemm` runs the BF16-operand MMA product: its outputs
+//!    are held to the operand band, and a subnormal first activation in column
+//!    1 leaves every other column's outputs their bits (`mma.neighbours`,
+//!    `shared/dense_file.rs`); the bit checks then read the exact tile's outputs.
 //! 2. f32: the same tensors loaded as f32 values (`Weights::load_where`,
 //!    `CardFormat::Bf16AsF32`, the load of every body that does not set
 //!    `bf16_words`) through the F32 site at 1..=8 and 64 columns: bit for bit
@@ -64,7 +68,9 @@ fn main() -> std::process::ExitCode {
 }
 
 mod gate {
-    use crate::dense_file::{Decl, by_name, check, columns, decl, host_rows, q8_0_bytes};
+    use crate::dense_file::{
+        Decl, by_name, check, columns, decl, host_rows, mma_neighbours, q8_0_bytes,
+    };
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::head::{Head, HeadNorm};
     use bloomery_gpu::q8f32::Bf16GemvIdsArgs;
@@ -342,6 +348,14 @@ mod gate {
                         stream.synchronize()?;
                         let mma = y_dev.to_host_vec(stream)?;
                         ok &= check_mma(name, (&mma, &x, k), wf);
+                        let tag = format!("shape={name} rows={rows} k={k} m={m}");
+                        ok &= mma_neighbours(
+                            gpu,
+                            &kernels,
+                            (src, route),
+                            (&x, k, rows),
+                            ("bf16", &tag),
+                        )?;
                         // PIN(2026-10-22): GB10 BF16 operand rounding replaces the site's F32 bit
                         // contract with the band/KL check above; the exact tile's output replaces
                         // the site's here, so the bit checks below hold for the exact tile only.

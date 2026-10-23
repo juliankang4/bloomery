@@ -1,8 +1,8 @@
 //! Synthetic weight files and activation columns for dense-format gates.
 
 use bloomery_gpu::Gpu;
-use bloomery_gpu::gemm::{Gemm32Kernels, GemmAct32, GemmKernels, GemmRoute};
-use bloomery_gpu::site::{self, WideIn, WideKernels};
+use bloomery_gpu::gemm::{Gemm32Kernels, GemmAct32, GemmInput, GemmKernels, GemmRoute};
+use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu_gates::{GateError, GateRng, bits_equal, par_map, verdict};
 use cuda_core::DeviceBuffer;
@@ -104,6 +104,46 @@ pub(crate) fn columns(
     let x_dev = DeviceBuffer::from_host(gpu.stream(), &x)?;
     let y_dev = DeviceBuffer::from_host(gpu.stream(), &vec![f32::NAN; m * rows])?;
     Ok((x, x_dev, y_dev))
+}
+
+/// GB10's dense prompt product through `site::gemm` (`src`, `rows` rows,
+/// over `route` filled for the columns of `x`) keeps each column's bits
+/// whatever another column of its tile holds: with a subnormal first value in
+/// column 1, which the tensor cores refuse, every other column's outputs equal
+/// the run without it. Prints the clause `mma.neighbours`.
+pub(crate) fn mma_neighbours(
+    gpu: &Gpu,
+    kernels: &WideKernels<'_>,
+    (src, route): ((SiteTy, &Weights, SiteWeight<'_>), &GemmRoute),
+    (x, k, rows): (&[f32], usize, usize),
+    (ty, tag): (&str, &str),
+) -> Result<bool, GateError> {
+    let stream = gpu.stream();
+    let m = x.len() / k;
+    let run = |x: &[f32]| -> Result<Vec<f32>, GateError> {
+        let x_dev = DeviceBuffer::from_host(stream, x)?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![f32::NAN; m * rows])?;
+        let x_in = WideIn {
+            q128: None,
+            q32: None,
+            f32: Some(&x_dev),
+        };
+        let table = (route, GemmInput::PerSlot);
+        site::gemm(gpu, kernels, src, rows, &x_in, table, m, &mut y)?;
+        Ok(y.to_host_vec(stream)?)
+    };
+    let plain = run(x)?;
+    let mut odd = x.to_vec();
+    odd[k] = f32::from_bits(0x200);
+    let beside = run(&odd)?;
+    let kept = (0..m)
+        .filter(|&c| c != 1)
+        .all(|c| bits_equal(&plain[c * rows..][..rows], &beside[c * rows..][..rows]));
+    println!(
+        "{ty} clause=mma.neighbours {tag} subnormal_column=1 other_columns_bits={kept} {}",
+        verdict(kept)
+    );
+    Ok(kept)
 }
 
 /// The dense calls by name over the resident weight `name`, `rows` rows of
