@@ -126,8 +126,9 @@ pub(crate) fn global_addr<T>(p: *const T) -> u64 {
 /// `byte0` on, one line per lane per pass of the warp. A gemv warp walks its
 /// row with few loads in flight per lane; issuing the row's lines first lets
 /// the walk's loads hit L2. A hint only: it reads nothing into registers and
-/// changes no value. Only the `_prefetch` entries call it, the ones an
-/// integrated device launches ([`crate::row_prefetch`]).
+/// changes no value. Only entries an integrated device launches call it: the
+/// `_prefetch` gemvs ([`crate::row_prefetch`]) and the fused HC up and mix,
+/// which asks for the normed streams its mix reads while its MMA runs.
 ///
 /// The caller keeps the range inside `w`. The first line can start before
 /// `byte0`, and before `w` itself when `w` is a window into a larger buffer;

@@ -417,8 +417,9 @@ unsafe fn f32_tile_at<W: TileRows, const THREADS: usize, const MARKED: bool>(
 pub(crate) const MMA_THREADS: u32 = 256;
 /// Lanes that hold one fragment row's cells.
 const MMA_ROW_LANES: usize = 4;
-const MMA_ROWS: usize = 128;
-const MMA_COLS: usize = 128;
+/// Rows and columns of a block's outputs.
+pub(crate) const MMA_ROWS: usize = 128;
+pub(crate) const MMA_COLS: usize = 128;
 /// K values one stage holds of every row and column: two 16-value MMA steps.
 const MMA_LINE: usize = 32;
 /// 16-byte pieces of BF16 values in one staged line.
@@ -610,6 +611,26 @@ unsafe fn land_values(v: [f32; 8], dst: *mut u32) -> bool {
     // SAFETY: dst is this thread's own aligned 16 bytes (this fn's contract).
     unsafe { *dst.cast::<U32x4>() = words };
     fits
+}
+
+/// Row and column of the first output of this block's tile among `rows` by
+/// `n` outputs, in the raster used by `bf16_mma_tile`; `None` for a block
+/// past the last tile.
+#[inline(always)]
+#[allow(
+    clippy::question_mark,
+    reason = "the let-else of bf16_mma_tile's raster, where a `?` moves the PTX"
+)]
+pub(crate) fn mma_tile_origin<W: MmaRows>(rows: usize, n: usize) -> Option<(usize, usize)> {
+    let row_blocks = rows.div_ceil(MMA_ROWS);
+    let block = thread::blockIdx_x() as usize;
+    let Some((col_tile, row_tile)) = raster32(block, row_blocks, n.div_ceil(MMA_COLS), W::GROUP)
+    else {
+        return None;
+    };
+    let row0 = row_tile * MMA_ROWS;
+    let col0 = col_tile * MMA_COLS;
+    Some((row0, col0))
 }
 
 /// Cells of a thread's MMA fragments: four row by four column tiles of four.
@@ -845,14 +866,9 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows>(
     sh: *mut f32,
 ) -> Option<MmaTile> {
     let (rows, kk, n) = (rows as usize, k as usize, n as usize);
-    let row_blocks = rows.div_ceil(MMA_ROWS);
-    let block = thread::blockIdx_x() as usize;
-    let Some((col_tile, row_tile)) = raster32(block, row_blocks, n.div_ceil(MMA_COLS), W::GROUP)
-    else {
+    let Some((row0, col0)) = mma_tile_origin::<W>(rows, n) else {
         return None;
     };
-    let row0 = row_tile * MMA_ROWS;
-    let col0 = col_tile * MMA_COLS;
     let tid = thread::threadIdx_x() as usize;
     let lane = warp::lane_id() as usize;
     let warp = tid / 32;

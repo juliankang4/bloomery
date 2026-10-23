@@ -66,12 +66,13 @@
 //! GB10. The gate checks their error bands, not bit equality between arms.
 //! The same values raise [`SITE`].
 
+use crate::cores::l2_prefetch;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
     Bf16Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmRoute, MMA_CELLS,
-    MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaRows, MmaTile, STAGE_FLOATS,
-    STAGES, TileRows, bf16_mma_launch, bf16_mma_tile,
+    MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaRows,
+    MmaTile, STAGE_FLOATS, STAGES, TileRows, bf16_mma_launch, bf16_mma_tile, mma_tile_origin,
 };
 use crate::linear::{sigmoid, silu};
 use crate::q8f32::{
@@ -1697,6 +1698,10 @@ const MIX_HIDDEN: usize = MIX_ROWS / STREAMS;
 const MIX_STEP_COLS: usize = 32 / MIX_HIDDEN;
 const _: () = assert!(MIX_ROWS == 32 && MIX_ROWS.is_multiple_of(STREAMS));
 const _: () = assert!(MIX_HIDDEN * MIX_STEP_COLS == 32 && MMA_WARP_COLS == 32);
+/// Lines of `xn` one tile's mix reads: each holds the tile's hidden indices
+/// of one stream of one column, 128 bytes.
+const XN_LINES: usize = MMA_COLS * STREAMS;
+const _: () = assert!(XN_LINES == 2 * MMA_THREADS as usize && MMA_ROWS / STREAMS * 4 == 128);
 
 /// Scratch slot of the gate in pass row `row` and warp column `col`: rows of
 /// [`MMA_WARP_COLS`], each row's columns permuted by its hidden index, so a
@@ -1827,6 +1832,24 @@ mod hc_wide_kernels {
             words: w,
             hidden: hid,
         };
+        // Ask L2 for the tile's XN_LINES lines of xn, thread `tid` lines `tid`
+        // and `tid + MMA_THREADS`, so the mix after the MMA finds them there.
+        // A hint: it reads nothing into registers and changes no value.
+        if let Some((row0, col0)) = mma_tile_origin::<HcUpRows<'_>>(wide, m as usize) {
+            let h0 = row0 / STREAMS;
+            let bytes = 4 * (hid - h0).min(MMA_ROWS / STREAMS);
+            let tid = thread::threadIdx_x() as usize;
+            for k in 0..XN_LINES / MMA_THREADS as usize {
+                thread::__unroll_config::<0>();
+                let line = tid + k * MMA_THREADS as usize;
+                let (col, s) = (col0 + line / STREAMS, line % STREAMS);
+                if col < m as usize {
+                    // Hidden indices h0 .. h0 + bytes / 4 of stream s of a live
+                    // column: inside xn.
+                    l2_prefetch(xn, 4 * (col * wide + s * hid + h0), bytes, 0);
+                }
+            }
+        }
         // SAFETY: the checked launch supplies the shared allocation, 256 threads,
         // the MMA grid, aligned bottleneck columns and the complete BF16 weight.
         let Some(mut tile) = (unsafe { bf16_mma_tile(rows, lo, wide as u32, RANK as u32, m, sh) })
