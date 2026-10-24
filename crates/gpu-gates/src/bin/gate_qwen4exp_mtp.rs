@@ -6161,7 +6161,7 @@ mod gate {
         // `extra` (the stage card's own headroom does not see R);
         // its partner is the plain plan's stage-card headroom at the same lever. The
         // expected relation, term by term: both stage cards hold the same fixed terms; the
-        // planner's identity `MtpPlan::headroom = T.headroom + T.reserves - R` holds; the expert
+        // planner's identity `MtpPlan::headroom = T.headroom - R` holds; the expert
         // rule took `moved` bytes (experts and their rounding) off the card to make room for R,
         // and the remainder R - moved is the slack of a rule that moves whole experts: under one
         // expert's card bytes plus a granule for each of a layer's three routed stacks. The
@@ -6180,8 +6180,7 @@ mod gate {
             )
         };
         let same_terms = fixed(p) == fixed(t);
-        let identity =
-            plan.headroom_bytes == t.headroom_bytes + i128::from(t.reserve_bytes) - i128::from(r);
+        let identity = plan.headroom_bytes == t.headroom_bytes - i128::from(r);
         let moved = i128::from(p.expert_bytes + p.rounding_bytes)
             - i128::from(t.expert_bytes + t.rounding_bytes);
         let remainder = i128::from(r) - moved;

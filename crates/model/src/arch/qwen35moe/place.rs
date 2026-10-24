@@ -844,18 +844,12 @@ impl PlanInputs {
         // The draft's term is the reserve the expert rule spread within, so
         // the bound and the budget count one number. The stage rope rows are
         // the target card's, beside the cache.
-        let total = [
-            t.dense_bytes,
-            t.expert_bytes,
-            t.rounding_bytes,
-            t.kv_bytes,
-            t.stage_rows_bytes,
-            t.scratch_bytes,
-            t.context_bytes,
-            reserve,
-        ]
-        .iter()
-        .sum::<u64>();
+        let total =
+            t.bytes()
+                .checked_add(reserve)
+                .ok_or_else(|| PlacementError::CardBytesPastU64 {
+                    card: card.name.clone(),
+                })?;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let mut broken: Vec<Violation> = plan
@@ -961,18 +955,12 @@ impl PlanInputs {
         // As in [`PlanInputs::plan_mtp_with`]: the draft's term is the
         // reserve the expert rule spread within, and the stage rope rows are
         // the target card's.
-        let total = [
-            t.dense_bytes,
-            t.expert_bytes,
-            t.rounding_bytes,
-            t.kv_bytes,
-            t.stage_rows_bytes,
-            t.scratch_bytes,
-            t.context_bytes,
-            reserve,
-        ]
-        .iter()
-        .sum::<u64>();
+        let total =
+            t.bytes()
+                .checked_add(reserve)
+                .ok_or_else(|| PlacementError::CardBytesPastU64 {
+                    card: card.name.clone(),
+                })?;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let mut broken: Vec<Violation> = plan
@@ -3825,6 +3813,70 @@ mod tests {
                     assert_eq!(drafted.plan.host.nvme_arena_bytes, arena);
                     assert!(drafted.plan.host.nvme_expert_bytes > 0);
                 }
+            }
+        }
+
+        /// A stage card with a named reserve (an integrated card's
+        /// activation forms): the drafted plan's headroom is the card's usable
+        /// bytes less every term the plan counts, the reserve and the draft's
+        /// bytes included, for one slot and for several.
+        #[test]
+        fn drafted_headroom_counts_the_stage_cards_reserves() {
+            let (inputs, mut machine) = (inputs(), machine());
+            machine.cards[0].reserves.push((
+                crate::arch::qwen35moe::place::ACT_FORMS_RESERVE.to_string(),
+                64 << 20,
+            ));
+            let mtp =
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            for n in [1usize, 2] {
+                let drafted = inputs
+                    .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n)
+                    .expect("the drafted plan");
+                let (_, reserve) = draft_of(&mtp, n as u64);
+                let t = &drafted.plan.cards[0];
+                assert_eq!(t.reserve_bytes, 64 << 20, "{n} slots");
+                assert_eq!(
+                    drafted.headroom_bytes,
+                    i128::from(drafted.plan.usable_bytes(&machine.cards[0]))
+                        - i128::from(t.bytes())
+                        - i128::from(reserve),
+                    "{n} slots"
+                );
+            }
+        }
+
+        /// A named reserve that makes the target fit a card of `u64::MAX`
+        /// bytes exactly leaves no room for the draft's reserve: the sum past
+        /// the bound is refused by name, for one slot and for several, and not
+        /// saturated into a plan with no headroom.
+        #[test]
+        fn a_draft_reserve_past_u64_is_refused_by_name() {
+            let (inputs, mut machine) = (inputs(), machine());
+            machine.cards[0].usable_bytes = u64::MAX;
+            let mtp =
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            for n in [1usize, 2] {
+                let reserve = crate::arch::qwen35moe::place::ACT_FORMS_RESERVE.to_string();
+                machine.cards[0].reserves = vec![(reserve.clone(), 0)];
+                let others = inputs
+                    .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n)
+                    .expect("the plan")
+                    .plan
+                    .cards[0]
+                    .bytes();
+                machine.cards[0].reserves = vec![(reserve, u64::MAX - others)];
+                assert!(
+                    matches!(
+                        inputs.plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n),
+                        Err(PlaceError::Placement(
+                            PlacementError::CardBytesPastU64 { .. }
+                        ))
+                    ),
+                    "{n} slots"
+                );
             }
         }
 
