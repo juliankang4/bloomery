@@ -170,7 +170,9 @@ generate_ds41   gemm_route_remap                         0           0
 generate_ds41   gemm_swiglu_quant                        0           0
 generate_ds41   glm5next_router                          0           0
 generate_ds41   glm5next_router_pick                     0           0
-generate_ds41   gqa_flash_fold_mma_256_p12_sel           0           0
+# PIN(2026-10-24): 0 -> 16 spill bytes, 0 -> 8 JIT local bytes (ptxas 13.3.73 at sm_121, GB10 cc 12.1, driver
+# 595.84), measured; this entry's PTX is the same before and after the dense MMA tile's activation source.
+generate_ds41   gqa_flash_fold_mma_256_p12_sel          16           8
 generate_ds41   gqa_flash_merge                          0           0
 generate_ds41   gqa_flash_merge_256                      0           0
 generate_ds41   gqa_flash_merge_sink                     0           0
