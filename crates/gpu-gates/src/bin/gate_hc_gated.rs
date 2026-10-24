@@ -1050,6 +1050,7 @@ mod gate {
         down: Vec<f32>,
         inj: Vec<f32>,
         lo: Vec<f32>,
+        lo_refused: Vec<u32>,
         g: Vec<f32>,
         wgt: Vec<f32>,
         mixed: Vec<f32>,
@@ -1106,15 +1107,30 @@ mod gate {
         let found_fault = if m > MAX_COLS && matches!(pre, Pre::Plain) {
             let eager = mixed_d.to_host_vec(st)?;
             let eager_wgt = w.scratch.wgt.to_host_vec(st)?;
+            let eager_lo = w.scratch.lo.to_host_vec(st)?;
+            let eager_words = w.scratch.lo_words.to_host_vec(st)?;
+            let eager_refused = w.scratch.lo_refused.to_host_vec(st)?;
             let eager_fault = c.gpu.take_fault()?;
             res_d.copy_from_host(st, res)?;
             mixed_d.copy_from_host(st, &vec![f32::NAN; z.mixed])?;
             let graph = c
                 .gpu
                 .capture(|st| enqueue(st, &mut res_d, &mut mixed_d, &mut w.scratch))?;
+            w.scratch
+                .lo
+                .copy_from_host(st, &vec![f32::NAN; eager_lo.len()])?;
+            w.scratch
+                .lo_words
+                .copy_from_host(st, &vec![0xdead_beef; eager_words.len()])?;
+            w.scratch
+                .lo_refused
+                .copy_from_host(st, &vec![u32::MAX; eager_refused.len()])?;
             graph.launch(st)?;
             let same = bits_equal(&eager, &mixed_d.to_host_vec(st)?)
-                && bits_equal(&eager_wgt, &w.scratch.wgt.to_host_vec(st)?);
+                && bits_equal(&eager_wgt, &w.scratch.wgt.to_host_vec(st)?)
+                && bits_equal(&eager_lo[..z.lo], &w.scratch.lo.to_host_vec(st)?[..z.lo])
+                && eager_words[..z.lo / 2] == w.scratch.lo_words.to_host_vec(st)?[..z.lo / 2]
+                && eager_refused[..m] == w.scratch.lo_refused.to_host_vec(st)?[..m];
             let graph_fault = c.gpu.take_fault()?;
             let same = same && eager_fault == graph_fault;
             println!(
@@ -1135,6 +1151,23 @@ mod gate {
             c.q8.enqueue_bf16_prompt(st, up, &w.scratch.lo, m, &mut w.scratch.g)?;
         }
         let s = &w.scratch;
+        let lo = s.lo.to_host_vec(st)?[..z.lo].to_vec();
+        let words = s.lo_words.to_host_vec(st)?;
+        let pairs = lo.iter().enumerate().all(|(i, &value)| {
+            let bits = (words[i / 2] >> (16 * (i % 2))) as u16;
+            if value.is_nan() {
+                bf16_bits_to_f32(bits).is_nan()
+            } else {
+                bits == fp32_to_bf16_bits(value)
+            }
+        });
+        println!(
+            "wide[lo_bf16] m={m} rounded_pairs={pairs} {}",
+            verdict(pairs)
+        );
+        if !pairs {
+            return Err("HC bottleneck BF16 words differ from the F32 bottleneck".into());
+        }
         let dots = s.down.to_host_vec(st)?;
         let (down, inj) = if packs(c, site, inject)? {
             let cols = dots[..m * (R + S)].as_chunks::<{ R + S }>().0;
@@ -1150,7 +1183,8 @@ mod gate {
             xn: s.xn.to_host_vec(st)?[..z.xn].to_vec(),
             down,
             inj,
-            lo: s.lo.to_host_vec(st)?[..z.lo].to_vec(),
+            lo,
+            lo_refused: s.lo_refused.to_host_vec(st)?[..m].to_vec(),
             g: s.g.to_host_vec(st)?[..z.xn].to_vec(),
             wgt: s.wgt.to_host_vec(st)?[..z.wgt].to_vec(),
             mixed: mixed_d.to_host_vec(st)?,
@@ -1288,6 +1322,7 @@ mod gate {
             .collect();
         let glue = [
             ("lo", bits_equal(&o.lo, &lo)),
+            ("lo_refused", o.lo_refused.iter().all(|&word| word == 0)),
             ("wgt", bits_equal(&o.wgt, &wgt)),
             ("mixed", bits_equal(&o.mixed, &mixed)),
         ];
@@ -1518,7 +1553,12 @@ mod gate {
             bits_equal(col(&o2.mixed, D, k), col(&o.mixed, D, k))
                 && bits_equal(col(&o2.wgt, S, k), col(&o.wgt, S, k))
         });
-        let p = o2.fault == want && others;
+        let refused = o2
+            .lo_refused
+            .iter()
+            .enumerate()
+            .all(|(k, &word)| word == u32::from(k == 2));
+        let p = o2.fault == want && others && refused;
         ok &= p;
         println!(
             "wide[fault] fault=\"{}\" want=\"{}\" the other columns clean={others} {}",
@@ -1539,7 +1579,17 @@ mod gate {
                 && bits_equal(col(&many.wgt, S, 2), &one.wgt)
                 && bits_equal(col(&many.lo, R, 2), &one.lo)
                 && bits_equal(col(&many.down, R, 2), &one.down);
-            let p = others && same && many.fault.is_none() && one.fault.is_none();
+            let refused = many
+                .lo_refused
+                .iter()
+                .enumerate()
+                .all(|(k, &word)| word == u32::from(k == 2));
+            let p = others
+                && same
+                && refused
+                && one.lo_refused == [1]
+                && many.fault.is_none()
+                && one.fault.is_none();
             ok &= p;
             println!(
                 "wide[subnormal_columns] other_columns_clean={others} one_column_bits={same} {}",

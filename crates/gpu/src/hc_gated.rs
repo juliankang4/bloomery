@@ -73,10 +73,11 @@ use crate::cores::l2_prefetch;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
-    Bf16Rows, F32Cols, F32Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput,
-    GemmRoute, MMA_CELLS, MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS,
+    Bf16Cols, Bf16Rows, F32Cols, F32Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32,
+    GemmInput, GemmRoute, MMA_CELLS, MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS,
     MMA_WARP_SCRATCH, MmaCols, MmaRows, MmaTile, STAGE_FLOATS, STAGES, TileRows, bf16_mma_body,
-    bf16_mma_launch, bf16_mma_tile, land_values, mma_launch, mma_tile_origin,
+    bf16_mma_launch, bf16_mma_tile, form_col, land_values, mma_launch, mma_tile_origin,
+    store_refused,
 };
 use crate::linear::{sigmoid, silu};
 use crate::q8f32::{
@@ -1865,6 +1866,8 @@ mod hc_wide_kernels {
             hidden > 0, m > 8,
             w.len() >= 4 * hidden * 160,
             lo.len() >= m * 320,
+            lo_words.len() >= m * 160,
+            lo_refused.len() >= m,
             xn.len() >= m * 4 * hidden,
             g.len() >= m * 4 * hidden,
             mixed.len() >= m * hidden
@@ -1877,6 +1880,8 @@ mod hc_wide_kernels {
     pub fn hc_gated_up_mma_mix_4(
         w: &[u32],
         lo: &[f32],
+        lo_words: &[u32],
+        lo_refused: &[u32],
         xn: &[f32],
         hidden: u32,
         m: u32,
@@ -1911,10 +1916,15 @@ mod hc_wide_kernels {
                 }
             }
         }
+        let cols = Bf16Cols {
+            words: lo_words,
+            refused: lo_refused,
+            exact: lo,
+        };
         // SAFETY: the checked launch supplies the shared allocation, 256 threads,
         // the MMA grid, aligned bottleneck columns and the complete BF16 weight.
         let Some(mut tile) =
-            (unsafe { bf16_mma_tile(rows, F32Cols(lo), wide as u32, RANK as u32, m, sh) })
+            (unsafe { bf16_mma_tile(rows, cols, wide as u32, RANK as u32, m, sh) })
         else {
             return;
         };
@@ -2032,13 +2042,10 @@ mod hc_wide_kernels {
         }
     }
 
-    /// The bottleneck and the combine's weights of `m` columns: thread `i <
-    /// m·320` writes `lo[i] = silu(d·¼)`, `d` down row `i % 320`'s dot of
-    /// column `i / 320`; with `inject` 1, thread `m·320 + j` writes `wgt[j] =
-    /// 2·σ(v·¼)`, `v` inject row `j % 4`'s dot of column `j / 4`. The dots
-    /// are `[m][320]`, then `[m][4]` with `inject`; with `packed` (the one
-    /// product of `hc_gated_down_mma_4`) `[m][324]`, a column's inject dots
-    /// after its down dots.
+    /// One warp per column writes the F32 bottleneck, its BF16 words and
+    /// tensor-core refusal, and the inject's combine weights. Dots are
+    /// `[m][320]`, then `[m][4]` with `inject`; with `packed` they are
+    /// `[m][324]`, a column's inject dots after its down dots.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -2049,8 +2056,18 @@ mod hc_wide_kernels {
             packed <= inject,
             dots.len() >= m * (320 + 4 * inject),
             lo.len() >= m * 320,
+            lo_words.len() >= m * 160,
+            lo_refused.len() >= m,
             wgt.len() >= inject * m * 4
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
     )]
     pub fn hc_gated_lo_4x320(
         dots: &[f32],
@@ -2059,42 +2076,55 @@ mod hc_wide_kernels {
         packed: u32,
         fault: FaultSink,
         mut lo: DisjointSlice<f32>,
+        mut lo_words: DisjointSlice<u32>,
+        mut lo_refused: DisjointSlice<u32>,
         mut wgt: DisjointSlice<f32>,
     ) {
-        let i = thread::index_1d().get();
-        let n = m as usize * RANK;
+        let c = form_col();
+        let lane = warp::lane_id() as usize;
         let stride = RANK + packed as usize * STREAMS;
-        if i < n {
-            // SAFETY: the `requires` above were launcher-checked; column
-            // `i / 320 < m` and row `i % 320 < 320 <= stride`, so the index
-            // is below `m·stride <= dots.len()`.
-            let d = unsafe { *dots.get_unchecked((i / RANK) * stride + i % RANK) };
-            let l = if d.is_finite() {
-                silu(d * INV)
-            } else {
-                f32::NAN
-            };
-            if !l.is_finite() {
-                fault.raise(SITE);
+        let mut fits = true;
+        if c < m as usize {
+            let mut piece = lane;
+            while piece < RANK / 8 {
+                let at = c * RANK + 8 * piece;
+                // SAFETY: this piece's eight dots lie in column c, aligned
+                // to 16 bytes for both the 320- and 324-value strides.
+                let mut v =
+                    unsafe { F32Cols(dots).fetch(core::ptr::null_mut(), c * stride + 8 * piece) };
+                for j in 0..8 {
+                    thread::__unroll_config::<8>();
+                    let d = v[j];
+                    let l = if d.is_finite() {
+                        silu(d * INV)
+                    } else {
+                        f32::NAN
+                    };
+                    if !l.is_finite() {
+                        fault.raise(SITE);
+                    }
+                    v[j] = l;
+                    // SAFETY: this lane alone owns these eight values of
+                    // live column c, inside the checked bottleneck span.
+                    unsafe { *lo.get_unchecked_mut(at + j) = l };
+                }
+                // SAFETY: this lane owns four aligned words of column c.
+                fits &= unsafe { land_values(v, lo_words.as_mut_ptr().add(at / 2)) };
+                piece += 32;
             }
-            // SAFETY: `i < m·320 <= lo.len()` (`requires`), and `i` is this
-            // thread's own `index_1d` in the contract's exact 1-D block of a
-            // `domain = 1` launch, so no other thread writes `lo[i]`.
-            unsafe { *lo.get_unchecked_mut(i) = l };
+        }
+        // SAFETY: all lanes participate, and this warp owns column c.
+        unsafe { store_refused(&mut lo_refused, c, m as usize, fits) };
+        if c >= m as usize || inject == 0 || lane >= STREAMS {
             return;
         }
-        let j = i - n;
-        if inject == 0 || j >= m as usize * STREAMS {
-            return;
-        }
+        let j = c * STREAMS + lane;
         let at = if packed == 1 {
-            (j / STREAMS) * stride + RANK + j % STREAMS
+            c * stride + RANK + lane
         } else {
-            n + j
+            m as usize * RANK + j
         };
-        // SAFETY: with `inject` 1, `dots.len() >= m·324` (`requires`):
-        // packed, column `j / 4 < m` and row `320 + j % 4 < 324 = stride`;
-        // otherwise `m·320 + j < m·324`.
+        // SAFETY: this live column's inject dot lies in the checked span.
         let v = unsafe { *dots.get_unchecked(at) };
         let w = if v.is_finite() {
             2.0 * sigmoid(v * INV)
@@ -2104,9 +2134,7 @@ mod hc_wide_kernels {
         if !w.is_finite() {
             fault.raise(SITE);
         }
-        // SAFETY: `j < m·4 <= wgt.len()` with `inject` 1 (`requires`), and `j`
-        // is this thread's `index_1d` less the grid-uniform `n` in the
-        // contract's exact 1-D block, so no other thread writes `wgt[j]`.
+        // SAFETY: this lane alone writes its live column's inject weight.
         unsafe { *wgt.get_unchecked_mut(j) = w };
     }
 
@@ -2222,6 +2250,9 @@ pub struct HcWideScratch {
     pub down: DeviceBuffer<f32>,
     /// `[m][RANK]`: the bottleneck after its silu.
     pub lo: DeviceBuffer<f32>,
+    /// BF16 bottleneck pairs and one tensor-core refusal word per column.
+    pub lo_words: DeviceBuffer<u32>,
+    pub lo_refused: DeviceBuffer<u32>,
     pub loq: GemmAct32,
     /// `[m][streams·hidden]`: the up's rows.
     pub g: DeviceBuffer<f32>,
@@ -2241,6 +2272,8 @@ impl HcWideScratch {
             xq: GemmAct32::new(stream, cols, geo.wide())?,
             down: DeviceBuffer::zeroed(stream, z.lo + z.wgt)?,
             lo: DeviceBuffer::zeroed(stream, z.lo)?,
+            lo_words: DeviceBuffer::zeroed(stream, z.lo / 2)?,
+            lo_refused: DeviceBuffer::zeroed(stream, cols)?,
             loq: GemmAct32::new(stream, cols, geo.r())?,
             g: DeviceBuffer::zeroed(stream, z.xn)?,
             wgt: DeviceBuffer::zeroed(stream, z.wgt)?,
@@ -2264,6 +2297,8 @@ impl HcWideScratch {
             .sum::<usize>()
             + self.xq.bytes()
             + self.loq.bytes()
+            + self.lo_words.num_bytes()
+            + self.lo_refused.num_bytes()
     }
 }
 
@@ -2436,16 +2471,25 @@ impl HcWideKernels {
                 a.gemm.enqueue_f32_tile(stream, inj, &s.xn, m, &mut dots)?;
             }
         }
-        let n_lo = m * r + if inject == 1 { m * STREAMS } else { 0 };
         let prep = self.module.prepare_hc_gated_lo_4x320(LaunchConfig1D::new(
-            launch_u32(what, "lo grid", n_lo.div_ceil(GLUE_THREADS as usize))?,
+            launch_u32(what, "lo grid", m.div_ceil(GLUE_THREADS as usize / 32))?,
             GLUE_THREADS,
             0,
         ))?;
         // Without an inject the launch writes no `wgt`: the scratch's own
         // stands in, its length untested.
         self.module.hc_gated_lo_4x320(
-            stream, &prep, &s.down, mu, inject, packed, a.fault, &mut s.lo, &mut s.wgt,
+            stream,
+            &prep,
+            &s.down,
+            mu,
+            inject,
+            packed,
+            a.fault,
+            &mut s.lo,
+            &mut s.lo_words,
+            &mut s.lo_refused,
+            &mut s.wgt,
         )?;
         if let Some((w, t)) = fused {
             let prep = self
@@ -2456,6 +2500,8 @@ impl HcWideKernels {
                 &prep,
                 w.buf(),
                 &s.lo,
+                &s.lo_words,
+                &s.lo_refused,
                 &s.xn,
                 hidden,
                 mu,

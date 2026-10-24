@@ -1033,20 +1033,21 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 /// `vocab` f32; the readback 18 u32, its ticket count, the stand-in map word
 /// and the chain's 10 words; the taps none (the engine's walk arms none) —
 /// 1,212,160 + 8 · `vocab` f32 and 793 u32; then the store walk's arena for 64
-/// rows, 5,039,634 values: the hidden rows 655,360, the embedding 163,840 and
+/// rows, 5,049,938 values: the hidden rows 655,360, the embedding 163,840 and
 /// its positions and key counts 128, the pack 1,310,720 and its 32-value q8
 /// blocks over 256 columns of 5,120 (codes, scales and sums, 20 words a
 /// 64-value step) 409,600, the streams 655,360, the wide mix's scratch
-/// 1,563,392 (the normed streams and the up's rows 655,360 each, the q8 of the
+/// 1,573,696 (the normed streams and the up's rows 655,360 each, the q8 of the
 /// normed streams 204,800, the down's dots and the bottleneck 20,480 each, its
-/// q8 6,400, the inject's dots and the weights 256 each), the mix 163,840 and
+/// q8 6,400, its BF16 pairs 10,240 and refusals 64, the inject's dots and
+/// the weights 256 each), the mix 163,840 and
 /// its q8 51,200, the keys and values 65,536, and the two one-expert tables
 /// of 256 and 64 slots, 524 and 134 words — four bytes a value].
 ///
 /// [`MtpArena::new`]: bloomery_gpu::arch::qwen3moe::Mtp38
 #[must_use]
 pub fn mtp_arena_bytes(vocab: u64) -> u64 {
-    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 5_039_634)
+    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 5_049_938)
 }
 
 /// The decode flash's segments a row of the MTP program's arena holds
@@ -1129,14 +1130,16 @@ pub const UBATCH_PLANNED: u64 = 4096;
 /// embedding, the two stream buffers, the mix and sub-layer outputs, the
 /// attention and flash rows, the delta layer's, the selecting layer's and the
 /// PLE site's intermediates, the shared expert's — 548,032 B; the walk's own
-/// buffers, 110,000.125 B — the 32-value activations of the model-width, the
+/// buffers, 110,644.125 B — the 32-value activations of the model-width, the
 /// attention-width and the SwiGLU rows (3,200, 7,680 and 800 B), the wide
-/// mixes' scratch (97,712 B: the normed streams and the up's rows at 40,960 B
+/// mixes' scratch (98,356 B: the normed streams and the up's rows at 40,960 B
 /// each, their activations, the down's and inject's dots, the bottleneck and
-/// its activations, the weights), the indexer keys, the slots and the
-/// one-expert table; the record's id word and the host sums (10,244 B);
+/// its Q8 activations, BF16 pairs and refusal, the weights), the indexer
+/// keys, the slots and the one-expert table; the record's id word and the
+/// host sums (10,244 B);
 /// rounded up].
-pub const UBATCH_TOKEN_BYTES: u64 = 668_277;
+// PIN(2026-10-24): the HC bottleneck adds 320 BF16 values and one refusal word per column, 644 B.
+pub const UBATCH_TOKEN_BYTES: u64 = 668_921;
 
 /// Card bytes a qwen4exp ubatch walk's selection holds for one run of its
 /// selecting rows: the walk takes as many rows a run as these bytes hold at
@@ -3046,12 +3049,13 @@ mod tests {
         // PIN(2026-10-24): the store walk holds no query rows or turned
         // queries, 4,718,592 B fewer [derived: 64 rows · (12,288 + 6,144) f32
         // · 4 B; 53,526,700 - 4,718,592 = 48,808,108 B].
+        // PIN(2026-10-24): the HC bottleneck's BF16 pairs and refusal add 64 · 644 = 41,216 B.
         #[test]
         fn the_mtp_arena_formula() {
-            assert_eq!(mtp_arena_bytes(248_320), 48_808_108);
+            assert_eq!(mtp_arena_bytes(248_320), 48_849_324);
             assert_eq!(
                 mtp_arena_bytes(248_320),
-                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 5_039_634)
+                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 5_049_938)
             );
             assert_eq!(mtp_arena_bytes(248_321) - mtp_arena_bytes(248_320), 4 * 8);
         }

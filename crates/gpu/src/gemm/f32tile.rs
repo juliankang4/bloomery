@@ -894,7 +894,7 @@ pub(crate) unsafe fn bf16_cols_body(
 
 /// The column a form block's warp writes: block `b`'s warp `w`, `8b + w`.
 #[inline(always)]
-pub(super) fn form_col() -> usize {
+pub(crate) fn form_col() -> usize {
     thread::blockIdx_x() as usize * (FORM_THREADS as usize / 32)
         + thread::threadIdx_x() as usize / 32
 }
@@ -906,7 +906,7 @@ pub(super) fn form_col() -> usize {
 ///
 /// `refused` holds `n` words, and `c` is this warp's column.
 #[inline(always)]
-pub(super) unsafe fn store_refused(
+pub(crate) unsafe fn store_refused(
     refused: &mut DisjointSlice<u32>,
     c: usize,
     n: usize,

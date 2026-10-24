@@ -68,10 +68,10 @@ pub use act32::{GemmAct32, MmaForm};
 pub use f32tile::LINE as F32_TILE_LINE;
 pub(crate) use f32tile::mxfp8_w8a8_reads;
 pub(crate) use f32tile::{
-    Bf16Rows, F32Cols, F32Rows, F32T_THREADS_U32, MMA_CELLS, MMA_COLS, MMA_ROWS, MMA_THREADS,
-    MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaCols, MmaRows, MmaTile, STAGE_FLOATS,
-    STAGES, TileRows, bf16_mma_body, bf16_mma_launch, bf16_mma_tile, f32_tile_body, land_values,
-    mma_launch, mma_tile_origin, tile_launch,
+    Bf16Cols, Bf16Rows, F32Cols, F32Rows, F32T_THREADS_U32, MMA_CELLS, MMA_COLS, MMA_ROWS,
+    MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaCols, MmaRows, MmaTile,
+    STAGE_FLOATS, STAGES, TileRows, bf16_mma_body, bf16_mma_launch, bf16_mma_tile, f32_tile_body,
+    form_col, land_values, mma_launch, mma_tile_origin, store_refused, tile_launch,
 };
 pub use gemm32::{GateUp32Args, Gemm32Args, Gemm32Weight};
 pub use grouped::{GemmArgs, GemmInput, GemmWeight};

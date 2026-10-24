@@ -211,13 +211,16 @@ const KV_AT: [(u64, u64); 2] = [(4096, 586_293_824), (32_768, 1_401_037_376)];
 // PIN(2026-10-21): the dense and rounding bytes fall 37,748,736 B (CARD_DENSE), so the room is
 // 40,128,384,448 (A6000) and 14,526,352,832 (3090) over 28,672: 1,399,566 and 506,638; the pin is
 // one fewer.
-const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_399_565), ("3090", 506_637)];
+// PIN(2026-10-24): HC's BF16 bottleneck adds 4,096 · 644 = 2,637,824 B to scratch.
+// The rooms 40,125,746,624 and 14,523,715,008 over 28,672 give these one-fewer boundaries.
+const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_399_473), ("3090", 506_545)];
 // PIN(2026-09-28): the card's scratch, the m = 1 scratch and the ubatch walk's at 4,096
 // positions [derived: 64 MiB + place::ubatch_scratch_bytes(4096) = 67,108,864 + 4,096 ·
 // 668,277 + 32 MiB].
 // PIN(2026-09-28): and at the U the load runs, which `place::machine` now takes: at 512 positions
 // [derived: 67,108,864 + 512 · 668,277 + 33,554,432 = 442,821,120].
-const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_837_925_888), (512, 442_821_120)];
+// PIN(2026-10-24): HC's BF16 bottleneck and refusal add 644 B per ubatch position.
+const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_840_563_712), (512, 443_150_848)];
 
 // PIN(2026-09-29): the card scratch of a card-experts machine
 // (`place::machine_for_experts` under `Experts::Card`): the host rows' plus
@@ -226,7 +229,8 @@ const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_837_925_888), (512, 442_821_120)
 // 2,048 · 170,360 + 4,096 · 10,240 = 390,840,320; at 512
 // 512 · 170,360 + 512 · 10,240 = 92,467,200 — the run-token bound's
 // derivation is `place::CARD_ROUTE_RUN_TOKEN_BYTES`'s].
-const CARD_ROUTE_SCRATCH: [(u64, u64); 2] = [(4096, 3_228_766_208), (512, 535_288_320)];
+// PIN(2026-10-24): the wide HC scratch adds the same 644 B per ubatch position.
+const CARD_ROUTE_SCRATCH: [(u64, u64); 2] = [(4096, 3_231_404_032), (512, 535_618_048)];
 
 /// The card scratch [`CARD_SCRATCH`] pins at ubatch `u` (a host-routed plan).
 fn scratch_at(u: u64) -> u64 {
@@ -693,6 +697,8 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // A6000's 4k U 4,096 row 11,690 -> 11,691), the rounding moving with the counts' granules [the
 // box's planner on this tree: the old pins red on exactly the eight draft rows, green before the
 // arena change].
+// PIN(2026-10-24): HC's BF16 bottleneck and refusal add 644 B per position; the smaller
+// expert budget changes these counts and their layer granules, with unchanged placement rules.
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -700,10 +706,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         4_096,
         262,
-        46,
+        45,
         261,
-        39_404_339_200,
-        615_051_776,
+        39_401_267_200,
+        611_832_320,
     ),
     (
         "A6000",
@@ -744,10 +750,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         4_096,
         258,
-        13,
+        12,
         257,
-        38_700_748_800,
-        496_558_592,
+        38_697_676_800,
+        493_339_136,
     ),
     (
         "A6000",
@@ -766,10 +772,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         238,
-        28,
+        27,
         237,
-        35_738_316_800,
-        556_532_224,
+        35_735_244_800,
+        557_507_072,
     ),
     (
         "A6000",
@@ -788,10 +794,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         4_096,
         93,
-        23,
+        22,
         92,
-        13_911_244_800,
-        506_114_560,
+        13_908_172_800,
+        507_089_408,
     ),
     (
         "3090",
@@ -810,10 +816,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         73,
-        45,
+        44,
         72,
-        10_970_828_800,
-        602_792_448,
+        10_967_756_800,
+        601_670_144,
     ),
     (
         "3090",
@@ -832,10 +838,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         4_096,
         87,
-        36,
+        35,
         86,
-        13_049_139_200,
-        546_136_576,
+        13_046_067_200,
+        545_014_272,
     ),
     (
         "3090",
@@ -854,10 +860,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         69,
-        3,
+        2,
         68,
-        10_239_078_400,
-        453_739_008,
+        10_235_084_800,
+        451_441_152,
     ),
     (
         "3090",
@@ -1143,6 +1149,8 @@ const CARD_ROUNDING_Q3: u64 = 398_764_544;
 // PIN(2026-10-24): the drafted rows re-pinned for the store walk's arena, as CARD_PLANS: one or
 // two experts onto six of the eight drafted rows, the 3090's 32k U 4,096 and the A6000's 32k U 512
 // rows unmoved within their granules' slack [the box's planner on this tree].
+// PIN(2026-10-24): HC's BF16 bottleneck and refusal add 644 B per position; the smaller
+// expert budget changes these counts and their layer granules, with unchanged placement rules.
 const CARD_PLANS_Q3: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -1194,10 +1202,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         4_096,
         355,
-        46,
+        45,
         354,
-        38_699_801_600,
-        651_464_192,
+        38_697_625_600,
+        647_348_736,
     ),
     (
         "A6000",
@@ -1216,10 +1224,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         330,
-        7,
+        6,
         329,
-        35_888_358_400,
-        560_449_024,
+        35_886_182_400,
+        560_527_872,
     ),
     (
         "A6000",
@@ -1260,10 +1268,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         103,
-        42,
+        41,
         102,
-        11_215_436_800,
-        512_142_848,
+        11_213_260_800,
+        512_221_696,
     ),
     (
         "3090",

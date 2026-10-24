@@ -168,8 +168,8 @@ const DRAFT_MAP: u64 = 993_280;
 const LIST_ROWS: u32 = 40_960;
 // The largest context each card holds with the draft (full head), as predicted [derived: the plan
 // test's room after its fixed terms, less the draft granules 2,785,017,856 B, the map 993,280 B
-// and the arena 48,808,108 B, over 30,720 B a position — the cache's 28,416, the draft store's
-// 2,048 and the stage rope table's 256 — the last pool counted whole, then one fewer]. The clause
+// and the arena 48,849,324 B, over 30,720 B a position (the cache's 28,416, the draft store's
+// 2,048 and the stage rope table's 256), the last pool counted whole, then one fewer]. The clause
 // holds the boundary to this prediction plus one, as well as checking both sides of the boundary.
 // PIN(2026-10-15): the arena stays one fixed addend (mtp_arena_bytes at vocab 248,320). Room
 // 37,251,097,876 (A6000) and 11,649,066,260 (3090) over 30,720 is 1,212,600 and 379,201; the pin
@@ -180,7 +180,9 @@ const LIST_ROWS: u32 = 40_960;
 // PIN(2026-10-24): the arena falls 4,718,592 B (the store walk's query rows and turned queries),
 // so the room is 37,293,565,204 (A6000) and 11,691,533,588 (3090) over 30,720: 1,213,983 and
 // 380,583; the pin is one fewer.
-const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_213_982), ("3090", 380_582)];
+// PIN(2026-10-24): HC's BF16 bottleneck adds (4,096 + 64) · 644 = 2,679,040 B to the target
+// scratch and draft arena. Rooms 37,290,886,164 and 11,688,854,548 over 30,720 give these boundaries.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_213_895), ("3090", 380_495)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
@@ -485,8 +487,10 @@ fn hw_qwen4exp_mtp_plan() {
 // (`place::mtp_arena_bytes`, 4,718,592 B less): plan (a)'s drafted row gains 2 experts, both cards'
 // totals the same 2, and the tier keeps its 7,236 experts on other layers [the box's planner on
 // this tree printed this row].
+// PIN(2026-10-24): HC's BF16 bottleneck and refusal narrow the A6000's split by one layer;
+// the tier keeps 7,236 experts, with their types and granules moving with the split.
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (243, 5, 242, 393, 41, 7_236, 22_674_944_000, 148_361_216);
+    (243, 4, 242, 393, 40, 7_236, 22_675_456_000, 147_849_216);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`
