@@ -1176,6 +1176,50 @@ pub fn resident_gemm(
     wide_by_name(gpu, k, (w, src, rows), x, route, m, y)
 }
 
+/// A resident gate projection followed by the shared sigmoid norm. BF16
+/// tensor-core sites finish the norm in their product's store epilogue.
+pub(crate) fn resident_gemm_norm_gate(
+    gpu: &Gpu,
+    k: &WideKernels<'_>,
+    (w, name): (&Weights, &str),
+    x: &WideIn<'_>,
+    route: &GemmRoute,
+    m: usize,
+    (norm, z, tail): (
+        &crate::linear::norm_gate::NormGateKernels,
+        &mut DeviceBuffer<f32>,
+        crate::linear::norm_gate::NormGateTail<'_>,
+    ),
+) -> Result<(), GpuError> {
+    use crate::linear::norm_gate::NormGateArgs;
+    let what = "site::resident_gemm_norm_gate";
+    let weight = w.resident(what, name)?;
+    let rows = weight.rows();
+    if let (DevWeight::Bf16 { w: packed, .. }, Some(act), Some(input)) = (weight, x.q32, x.f32)
+        && gpu.q8f32().dense_mma
+        && act.holds(MmaForm::Bf16, input, m)
+    {
+        return k
+            .g32(what, "the BF16 prompt kernels")?
+            .enqueue_bf16_mma_norm_gate(gpu.stream(), packed, input, act, m, z, tail);
+    }
+    tail.check_rows(what, rows, m, z.len())?;
+    resident_gemm(gpu, k, (w, name), x, route, m, z)?;
+    norm.enqueue_norm_gate_sigmoid(
+        gpu.stream(),
+        NormGateArgs {
+            o: tail.o,
+            z,
+            w: tail.w,
+            eps: tail.eps,
+            n_v: rows / crate::linear::HEAD,
+            m,
+            fault: tail.fault,
+            y: tail.y,
+        },
+    )
+}
+
 /// [`resident_gemm`] over rows `at .. at + n` of the resident weight `name`
 /// alone ([`SiteWeight::Part`]), their `n` outputs of each slot token-major
 /// into `y`, each bit for bit the whole weight's for its row and slot.

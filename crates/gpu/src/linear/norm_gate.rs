@@ -48,8 +48,7 @@ fn act<const ACT: u32>(z: f32) -> f32 {
 }
 
 /// One warp's gated norm (module doc) with the gate `ACT`: head `wi` of
-/// the `[m][n_v]` order. `gdn_norm_gate_sigmoid`'s; `gdn_norm_gate` keeps its
-/// own body.
+/// the `[m][n_v]` order.
 ///
 /// # Safety
 ///
@@ -79,20 +78,42 @@ unsafe fn norm_gate_body<const ACT: u32>(
     let mut ov = [0.0f32; 4];
     let mut zv = [0.0f32; 4];
     let mut wv = [0.0f32; 4];
-    let mut sumsq = 0.0f64;
     for i in 0usize..4 {
         cuda_device::thread::__unroll_config::<0>();
         let at = lane + 32 * i;
-        // SAFETY: base + at < (wi + 1)·128 <= m·n_v·128, inside o and z
-        // by the contract; at < 128 <= w.len().
-        unsafe {
-            ov[i] = *o.get_unchecked(base + at);
-            zv[i] = *z.get_unchecked(base + at);
-            wv[i] = *w.get_unchecked(at);
-        }
-        sumsq += f64::from(mul_rn_f32(ov[i], ov[i]));
+        // SAFETY: wi is live and at < HEAD, inside o's checked span.
+        ov[i] = unsafe { *o.get_unchecked(base + at) };
+        // SAFETY: wi is live and at < HEAD, inside z's checked span, which is o's.
+        zv[i] = unsafe { *z.get_unchecked(base + at) };
+        // SAFETY: at < HEAD <= w.len().
+        wv[i] = unsafe { *w.get_unchecked(at) };
     }
-    let mut acc = sumsq;
+    let values = norm_gate_values::<ACT>(ov, zv, wv, eps, fault);
+    for i in 0usize..4 {
+        cuda_device::thread::__unroll_config::<0>();
+        // SAFETY: this lane owns these four values of the live head.
+        unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = values[i] };
+    }
+}
+
+/// The four values of one lane of a head, called by all 32 lanes together.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "the CUDA unroller needs indexed fixed-size arrays"
+)]
+pub(crate) fn norm_gate_values<const ACT: u32>(
+    ov: [f32; 4],
+    zv: [f32; 4],
+    wv: [f32; 4],
+    eps: f32,
+    fault: FaultSink,
+) -> [f32; 4] {
+    let mut acc = 0.0f64;
+    for i in 0usize..4 {
+        thread::__unroll_config::<0>();
+        acc += f64::from(mul_rn_f32(ov[i], ov[i]));
+    }
     acc += warp::shuffle_xor_f64(acc, 16);
     acc += warp::shuffle_xor_f64(acc, 8);
     acc += warp::shuffle_xor_f64(acc, 4);
@@ -109,18 +130,18 @@ unsafe fn norm_gate_body<const ACT: u32>(
         & crate::fault::quad_finite(ov)
         & crate::fault::quad_finite(zv)
         & crate::fault::quad_finite(wv);
+    let mut values = [0.0f32; 4];
     for i in 0usize..4 {
         cuda_device::thread::__unroll_config::<0>();
-        let v = mul_rn_f32(
+        values[i] = mul_rn_f32(
             mul_rn_f32(mul_rn_f32(ov[i], scale), wv[i]),
             act::<ACT>(zv[i]),
         );
-        // SAFETY: as the reads above; one lane per value.
-        unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = v };
     }
     if !ok {
         fault.raise(FaultSite::LinearGate);
     }
+    values
 }
 
 #[cuda_module]
@@ -160,53 +181,9 @@ mod norm_gate_kernels {
         if wi >= m as usize * n_v as usize {
             return; // warp-uniform
         }
-        let lane = tid % 32;
-        let base = wi * HEAD;
-        let mut ov = [0.0f32; 4];
-        let mut zv = [0.0f32; 4];
-        let mut wv = [0.0f32; 4];
-        let mut sumsq = 0.0f64;
-        #[unroll]
-        for i in 0usize..4 {
-            let at = lane + 32 * i;
-            // SAFETY: base + at < (wi + 1)·128 <= m·n_v·128, inside o and z
-            // by the contract; at < 128 <= w.len().
-            unsafe {
-                ov[i] = *o.get_unchecked(base + at);
-                zv[i] = *z.get_unchecked(base + at);
-                wv[i] = *w.get_unchecked(at);
-            }
-            sumsq += f64::from(mul_rn_f32(ov[i], ov[i]));
-        }
-        let mut acc = sumsq;
-        acc += warp::shuffle_xor_f64(acc, 16);
-        acc += warp::shuffle_xor_f64(acc, 8);
-        acc += warp::shuffle_xor_f64(acc, 4);
-        acc += warp::shuffle_xor_f64(acc, 2);
-        acc += warp::shuffle_xor_f64(acc, 1);
-        let mean = (acc / HEAD as f64) as f32;
-        let fin = mean.is_finite();
-        let scale = if fin {
-            1.0 / (mean + eps).sqrt()
-        } else {
-            f32::NAN
-        };
-        let ok = fin
-            & crate::fault::quad_finite(ov)
-            & crate::fault::quad_finite(zv)
-            & crate::fault::quad_finite(wv);
-        #[unroll]
-        for i in 0usize..4 {
-            let v = mul_rn_f32(
-                mul_rn_f32(mul_rn_f32(ov[i], scale), wv[i]),
-                act::<GATE_SILU>(zv[i]),
-            );
-            // SAFETY: as the reads above; one lane per value.
-            unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = v };
-        }
-        if !ok {
-            fault.raise(FaultSite::LinearGate);
-        }
+        // SAFETY: wi < m·n_v by the guard, lane < 32; the launch contract's
+        // lengths cover o, z, w and y; head wi of y is this warp's.
+        unsafe { norm_gate_body::<GATE_SILU>(wi, tid % 32, o, z, w, eps, fault, &mut y) };
     }
 
     /// [`gdn_norm_gate`] with the sigmoid gate: Qwen3.8's Gated DeltaNet and
@@ -263,6 +240,65 @@ pub struct NormGateArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
+/// The norm and gate operands consumed by a product's final store.
+pub struct NormGateTail<'a> {
+    pub o: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub eps: f32,
+    pub fault: FaultSink,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+impl NormGateTail<'_> {
+    pub(crate) fn check_rows(
+        &self,
+        what: &'static str,
+        rows: usize,
+        m: usize,
+        z_len: usize,
+    ) -> Result<(), GpuError> {
+        if !rows.is_multiple_of(HEAD) {
+            return Err(GpuError::shape(
+                what,
+                "weight rows must be whole 128-value heads",
+            ));
+        }
+        self.check(what, rows / HEAD, m, z_len)
+    }
+
+    pub(crate) fn check(
+        &self,
+        what: &'static str,
+        n_v: usize,
+        m: usize,
+        z_len: usize,
+    ) -> Result<(), GpuError> {
+        if n_v == 0 || m == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("need n_v, m >= 1, got n_v={n_v} m={m}"),
+            ));
+        }
+        let values = m
+            .checked_mul(n_v)
+            .and_then(|v| v.checked_mul(HEAD))
+            .ok_or_else(|| GpuError::shape(what, "m * n_v * HEAD overflows"))?;
+        let lens = [
+            ("o", self.o.len(), values),
+            ("z", z_len, values),
+            ("w", self.w.len(), HEAD),
+            ("y", self.y.len(), values),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct NormGateKernels {
     module: norm_gate_kernels::LoadedModule,
@@ -313,24 +349,14 @@ impl NormGateKernels {
             fault,
             y,
         } = args;
-        if n_v == 0 || m == 0 {
-            return Err(GpuError::shape(
-                what,
-                format!("need n_v, m >= 1, got n_v={n_v} m={m}"),
-            ));
+        NormGateTail {
+            o,
+            w,
+            eps,
+            fault,
+            y: &mut *y,
         }
-        let lens = [
-            ("o", o.len(), m * n_v * HEAD),
-            ("z", z.len(), m * n_v * HEAD),
-            ("w", w.len(), HEAD),
-            ("y", y.len(), m * n_v * HEAD),
-        ];
-        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
-            return Err(GpuError::shape(
-                what,
-                format!("{name}.len() {got} < {need}"),
-            ));
-        }
+        .check(what, n_v, m, z.len())?;
         let grid = launch_u32(what, "grid", (m * n_v).div_ceil(4))?;
         let n_v = launch_u32(what, "n_v", n_v)?;
         let m = launch_u32(what, "m", m)?;

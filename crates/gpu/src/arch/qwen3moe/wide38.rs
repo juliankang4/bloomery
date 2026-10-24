@@ -179,7 +179,6 @@ use crate::host::xstream::{GROUP_WALK_ORDER, LandBatch, RingLayer};
 use crate::kquant::Act;
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
-use crate::linear::norm_gate::NormGateArgs;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs};
 use crate::prompt_timing::Mark;
@@ -2286,7 +2285,6 @@ fn gdn(
     let dense = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
     dense_gemm(c, &gp.qkv, act, dense, &mut g.x)?;
-    dense_gemm(c, &gp.z, act, dense, &mut g.z)?;
     // The joined stack is `2·nv` rows (`plan38::plans` refuses another shape
     // at load), β's rows first and α's next.
     let (k, x_in) = (dense_kernels(c), wide_in(mixed, &x.act_hid));
@@ -2345,18 +2343,24 @@ fn gdn(
         carry,
         &mut work,
     )?;
-    lin.norm_gate.enqueue_norm_gate_sigmoid(
-        stream,
-        NormGateArgs {
-            o: &g.o,
-            z: &g.z,
-            w: f32_gain(w, &gp.ssm_norm)?,
-            eps: c.eps,
-            n_v: nv,
-            m,
-            fault: sink,
-            y: &mut *attn,
-        },
+    site::resident_gemm_norm_gate(
+        c.gpu,
+        &k,
+        (w, &gp.z),
+        &x_in,
+        dense,
+        m,
+        (
+            &lin.norm_gate,
+            &mut g.z,
+            crate::linear::norm_gate::NormGateTail {
+                o: &g.o,
+                w: f32_gain(w, &gp.ssm_norm)?,
+                eps: c.eps,
+                fault: sink,
+                y: &mut *attn,
+            },
+        ),
     )?;
     quantize_for(c, &[&gp.ssm_out], (attn, m), &mut x.act_attn, sink)?;
     dense_gemm(c, &gp.ssm_out, (attn, &x.act_attn, m), dense, &mut u.y)

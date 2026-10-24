@@ -1600,7 +1600,7 @@ gate-gpu-qwen3moe-head:
 # fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터. `--bench-kernels`는 판정 대신 런치 값을 잰다
 # (리드 전용, `bench-gpu-kernels`). relu² 접힌 32값 블록 양자화기(`g32_relu_sqr`)는 relu_sqr 다음 quantize_gemm32와 비트 동일.
 gate-gpu-gemm *ARGS:
-    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gpu --bin gate_gemm -- workers_must_complete kquant_contract_keeps_a_subnormal_step_exact'
+    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gpu --bin gate_gemm -- workers_must_complete kquant_contract_keeps_a_subnormal_step_exact nan_bits_equal_takes_the_length_and_any_nan'
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
 
 # 선형 어텐션(Gated DeltaNet) 카드 커널 셋 — conv+준비, delta 스텝, 게이트 노름 — 을 호스트 규칙과 비트로 맞춘다.

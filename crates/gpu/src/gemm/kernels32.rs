@@ -11,7 +11,7 @@
 use super::act32::quant32_group;
 use super::f32tile::{
     Bf16Cols, Bf16Rows, ByteRows, F32Cols, F32Rows, STAGE_FLOATS, STAGES, bf16_cols_body,
-    bf16_mma_body, f32_tile_body,
+    bf16_mma_body, bf16_mma_norm_gate_body, f32_tile_body,
 };
 use super::gemm32::{
     B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, GEMM32_GROUP, GEMM32_RASTER_BYTES,
@@ -1342,6 +1342,58 @@ mod gemm32_kernels {
         // SAFETY: the checked launch supplies 256 converged threads, the grid,
         // aligned weight and activation words and the spans in the contract.
         unsafe { bf16_mma_body(Bf16Rows(w), cols, rows, k, n, &mut y, sh) };
+    }
+
+    /// BF16 prompt gate projection with a shared sigmoid norm at its store.
+    #[allow(clippy::too_many_arguments, reason = "flat kernel ABI")]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            rows >= 128,
+            n >= 1,
+            2 * w.len() >= rows * k,
+            x.len() >= n * k,
+            2 * xb.len() >= n * k,
+            refused.len() >= n,
+            o.len() >= rows * n,
+            gain.len() >= 128,
+            z.len() >= rows * n,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn bf16_mma_norm_gate(
+        w: &[u32],
+        x: &[f32],
+        xb: &[u32],
+        refused: &[u32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        o: &[f32],
+        gain: &[f32],
+        eps: f32,
+        fault: FaultSink,
+        mut z: DisjointSlice<f32>,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        let cols = Bf16Cols {
+            words: xb,
+            refused,
+            exact: x,
+        };
+        // SAFETY: the checked launch gives 256 converged threads and the BF16 MMA
+        // grid, rows a multiple of HEAD, k a multiple of 64, 16-byte-aligned w and
+        // xb, the contract's spans of w, x, xb, refused, o, gain, z and y, and sh
+        // this block's aligned STAGES·STAGE_FLOATS floats.
+        unsafe {
+            bf16_mma_norm_gate_body(w, cols, rows, k, n, o, gain, eps, fault, &mut z, &mut y, sh)
+        };
     }
 
     /// Dense prompt product with BF16 operands and F32 accumulation.

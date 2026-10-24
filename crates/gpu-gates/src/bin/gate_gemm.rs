@@ -288,6 +288,11 @@
 //!   the eager bits, an input value or a weight scale byte the tensor cores
 //!   cannot take sending its column or row to the exact tile, and stale or
 //!   misplaced forms refused by name.
+//! - `zgate`: the BF16 projection's sigmoid norm epilogue against the separate
+//!   product and norm, bit for bit at M=1/8/9/129/4095, including exact replay,
+//!   non-finite inputs, graph replay, sentinel tails and a token-unit cut.
+//!   `--bench-kernels --bench-arm zgate` prices both arms at 48 heads of 128,
+//!   K=2560 and M=4095 through the shared burst and graph timing owner.
 //! - `g32_refuse`: the host API's refusals, each an error holding its own
 //!   message (another check refusing first does not pass): the scratch's
 //!   K and columns, the quantizer's input and columns, an unfilled table,
@@ -2401,7 +2406,14 @@ mod gate {
 
         if matches!(
             case_filter().as_deref(),
-            Some("dense_mma" | "mxfp8_w8a8" | "nvfp4_native" | "nvfp4_swiglu" | "nvfp4_gate_up")
+            Some(
+                "dense_mma"
+                    | "mxfp8_w8a8"
+                    | "nvfp4_native"
+                    | "nvfp4_swiglu"
+                    | "nvfp4_gate_up"
+                    | "zgate"
+            )
         ) {
             return if g32::run(&gpu, &dev.gk)? {
                 Ok(())
@@ -3003,6 +3015,13 @@ mod gate {
                         )?),
                     }
                 };
+            if only.as_deref() == Some("zgate") {
+                return if super::g32::norm_gate_case(gpu, true)? {
+                    Ok(())
+                } else {
+                    Err(super::checks_failed())
+                };
+            }
             if let Some(arm) = only.as_deref() {
                 return if gemm_arms(gpu, Some(arm))?
                     || iq_gemm_arms(gpu, Some(arm))?
@@ -3957,13 +3976,13 @@ mod gate {
             let d = act.d().to_host_vec(stream)?;
             let s = act.s().to_host_vec(stream)?;
             Ok(q[..n * 16 * st] == want.0[..]
-                && scales_equal(&d[..n * 2 * st], &want.1)
+                && nan_bits_equal(&d[..n * 2 * st], &want.1)
                 && s[..n * 2 * st] == want.2[..])
         }
 
-        /// Two scale planes equal: each pair the same bits, or both NaN (a
-        /// refused block's scale, whatever its payload).
-        fn scales_equal(a: &[f32], b: &[f32]) -> bool {
+        /// Two planes equal: each pair the same bits, or both NaN (a refused
+        /// block's scale or output, whatever its payload).
+        fn nan_bits_equal(a: &[f32], b: &[f32]) -> bool {
             a.len() == b.len()
                 && a.iter()
                     .zip(b)
@@ -4388,7 +4407,7 @@ mod gate {
                     let st = fused.steps();
                     let same = fused.q().to_host_vec(stream)?[..n * 16 * st]
                         == split.q().to_host_vec(stream)?[..n * 16 * st]
-                        && scales_equal(
+                        && nan_bits_equal(
                             &fused.d().to_host_vec(stream)?[..n * 2 * st],
                             &split.d().to_host_vec(stream)?[..n * 2 * st],
                         )
@@ -5825,7 +5844,7 @@ mod gate {
             let max_t = NV_MS[NV_MS.len() - 1];
             let max_slots = max_t * top_k;
             let same =
-                |a: &Planes32, b: &Planes32| a.0 == b.0 && scales_equal(&a.1, &b.1) && a.2 == b.2;
+                |a: &Planes32, b: &Planes32| a.0 == b.0 && nan_bits_equal(&a.1, &b.1) && a.2 == b.2;
             for rows in [640usize, 160] {
                 let n_rows = n_card * rows;
                 let (w, _) = weights_nvfp4(n_rows, k, 0x5100 + rows as u64)?;
@@ -7225,6 +7244,248 @@ mod gate {
                 verdict(all)
             );
             Ok(all)
+        }
+
+        /// The product epilogue equals the separate projection and norm,
+        /// including exact replay, faults, graph replay and token-unit cuts.
+        pub(super) fn norm_gate_case(gpu: &Gpu, timed: bool) -> Result<bool, GateError> {
+            if !timed && !wanted("zgate") {
+                return Ok(true);
+            }
+            use crate::bench_arm::{N, burst, print_arm, replay};
+            use bloomery_gpu::linear::norm_gate::{NormGateArgs, NormGateKernels, NormGateTail};
+            use gguf::quant::fp32_to_bf16_bits;
+            let stream = gpu.stream();
+            let g32 = Gemm32Kernels::load(gpu.context())?;
+            let norm = NormGateKernels::load(gpu.context())?;
+            let sink = gpu.unlabelled_sink();
+            let mut ok = true;
+            let cases: &[(usize, usize, usize, &str)] = if timed {
+                &[(6144, 2560, 4095, "normal")]
+            } else {
+                &[
+                    (128, 64, 1, "normal"),
+                    (256, 128, 8, "normal"),
+                    (256, 128, 9, "normal"),
+                    (256, 192, 129, "normal"),
+                    (6144, 2560, 4095, "normal"),
+                    (256, 128, 9, "nan_x"),
+                    (256, 128, 9, "range_x"),
+                    (256, 128, 9, "overflow_z"),
+                    (256, 128, 9, "nan_o"),
+                    (256, 128, 9, "square_overflow"),
+                    (256, 128, 9, "nan_gain"),
+                ]
+            };
+            for &(rows, k, n, edge) in cases {
+                let mut bits: Vec<u16> = activations(k, rows, 1101)
+                    .into_iter()
+                    .map(fp32_to_bf16_bits)
+                    .collect();
+                if edge == "overflow_z" {
+                    bits[..k].fill(0);
+                    bits[0] = 0x7f00;
+                    bits[1] = 0x7f00;
+                }
+                let words: Vec<u32> = bits
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| u32::from(p[0]) | (u32::from(p[1]) << 16))
+                    .collect();
+                let w = DeviceTensor::upload(stream, &words, rows, k / 2)?;
+                let mut xh = activations(k, n, 1102);
+                let mut oh = activations(rows, n, 1103);
+                let mut gh = activations(128, 1, 1104);
+                match edge {
+                    "nan_x" => xh[8 * k + 31] = f32::NAN,
+                    "range_x" => xh[8 * k + 31] = f32::from_bits(0x200),
+                    "overflow_z" => {
+                        xh[8 * k] = 1.0;
+                        xh[8 * k + 1] = 1.0;
+                    }
+                    "nan_o" => oh[8 * rows + 127] = f32::NAN,
+                    "square_overflow" => oh[8 * rows + 127] = f32::MAX,
+                    "nan_gain" => gh[127] = f32::NAN,
+                    _ => {}
+                }
+                let x = DeviceBuffer::from_host(stream, &xh)?;
+                let o = DeviceBuffer::from_host(stream, &oh)?;
+                let gain = DeviceBuffer::from_host(stream, &gh)?;
+                let mut act = GemmAct32::new(stream, n, k)?
+                    .with_form(stream, bloomery_gpu::gemm::MmaForm::Bf16)?;
+                g32.enqueue_bf16_cols(stream, &x, n, &mut act)?;
+                let mut z = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 32])?;
+                let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 32])?;
+                let mut split = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 32])?;
+                gpu.clear_fault()?;
+                g32.enqueue_bf16_mma_cols(stream, &w, &x, &act, n, &mut z)?;
+                norm.enqueue_norm_gate_sigmoid(
+                    stream,
+                    NormGateArgs {
+                        o: &o,
+                        z: &z,
+                        w: &gain,
+                        eps: 1e-6,
+                        n_v: rows / 128,
+                        m: n,
+                        fault: sink,
+                        y: &mut split,
+                    },
+                )?;
+                stream.synchronize()?;
+                let expected_fault = gpu.take_fault()?;
+                let expected = split.to_host_vec(stream)?;
+                let overflow_reached =
+                    edge != "overflow_z" || z.to_host_vec(stream)?[8 * rows].is_infinite();
+                z.copy_from_host(stream, &vec![SENT; z.len()])?;
+                let enqueue = |s: &cuda_core::CudaStream,
+                               z: &mut DeviceBuffer<f32>,
+                               y: &mut DeviceBuffer<f32>| {
+                    g32.enqueue_bf16_mma_norm_gate(
+                        s,
+                        &w,
+                        &x,
+                        &act,
+                        n,
+                        z,
+                        NormGateTail {
+                            o: &o,
+                            w: &gain,
+                            eps: 1e-6,
+                            fault: sink,
+                            y,
+                        },
+                    )
+                };
+                gpu.clear_fault()?;
+                enqueue(stream, &mut z, &mut y)?;
+                stream.synchronize()?;
+                let fault = gpu.take_fault()?;
+                let eager = y.to_host_vec(stream)?;
+                let same = nan_bits_equal(&eager, &expected);
+                let scratch_kept = edge == "nan_x"
+                    || edge == "range_x"
+                    || edge == "overflow_z"
+                    || z.to_host_vec(stream)?
+                        .iter()
+                        .all(|v| v.to_bits() == SENT.to_bits());
+                let graph = gpu.capture(|s| enqueue(s, &mut z, &mut y))?;
+                y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                graph.launch(stream)?;
+                stream.synchronize()?;
+                let graph_bits = bits_equal(&eager, &y.to_host_vec(stream)?);
+                let mut cut_bits = true;
+                if n == 9 && edge == "normal" {
+                    let mut cut = Vec::new();
+                    for (start, count) in [(0, 1), (1, 8)] {
+                        let xx =
+                            DeviceBuffer::from_host(stream, &xh[start * k..(start + count) * k])?;
+                        let oo = DeviceBuffer::from_host(
+                            stream,
+                            &oh[start * rows..(start + count) * rows],
+                        )?;
+                        let mut aa = GemmAct32::new(stream, count, k)?
+                            .with_form(stream, bloomery_gpu::gemm::MmaForm::Bf16)?;
+                        g32.enqueue_bf16_cols(stream, &xx, count, &mut aa)?;
+                        let mut zz = DeviceBuffer::<f32>::zeroed(stream, rows * count)?;
+                        let mut yy = DeviceBuffer::<f32>::zeroed(stream, rows * count)?;
+                        g32.enqueue_bf16_mma_norm_gate(
+                            stream,
+                            &w,
+                            &xx,
+                            &aa,
+                            count,
+                            &mut zz,
+                            NormGateTail {
+                                o: &oo,
+                                w: &gain,
+                                eps: 1e-6,
+                                fault: sink,
+                                y: &mut yy,
+                            },
+                        )?;
+                        cut.extend(yy.to_host_vec(stream)?);
+                    }
+                    cut_bits = bits_equal(&cut, &eager[..rows * n]);
+                }
+                let fault_expected = matches!(
+                    edge,
+                    "nan_x" | "overflow_z" | "nan_o" | "square_overflow" | "nan_gain"
+                );
+                let fault_ok = fault == expected_fault
+                    && fault
+                        == fault_expected.then(|| Fault::at(LAYER_NONE, FaultSite::LinearGate));
+                let pass =
+                    same && graph_bits && scratch_kept && cut_bits && fault_ok && overflow_reached;
+                println!(
+                    "zgate rows={rows} K={k} M={n} edge={edge} split_bits={same} eager_graph={graph_bits} scratch_kept={scratch_kept} unit_cut={cut_bits} fault_ok={fault_ok} overflow_reached={overflow_reached} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+                if timed {
+                    for fused in [false, true] {
+                        let mut enq = |s: &cuda_core::CudaStream| {
+                            if fused {
+                                enqueue(s, &mut z, &mut y)
+                            } else {
+                                g32.enqueue_bf16_mma_cols(s, &w, &x, &act, n, &mut z)?;
+                                norm.enqueue_norm_gate_sigmoid(
+                                    s,
+                                    NormGateArgs {
+                                        o: &o,
+                                        z: &z,
+                                        w: &gain,
+                                        eps: 1e-6,
+                                        n_v: rows / 128,
+                                        m: n,
+                                        fault: sink,
+                                        y: &mut y,
+                                    },
+                                )
+                            }
+                        };
+                        let eager = burst(stream, &mut enq)?;
+                        let graph = gpu.capture(|s| {
+                            for _ in 0..N {
+                                enq(s)?;
+                            }
+                            Ok(())
+                        })?;
+                        let graph = replay(stream, &graph)?;
+                        print_arm(
+                            if fused { "zgate_fused" } else { "zgate_split" },
+                            n,
+                            0,
+                            if fused { 1 } else { 2 },
+                            eager,
+                            graph,
+                        );
+                    }
+                }
+            }
+            let x = DeviceBuffer::from_host(stream, &vec![1.0f32; 64])?;
+            let o = DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?;
+            let gain = DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?;
+            let mut z = DeviceBuffer::<f32>::zeroed(stream, 128)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, 128)?;
+            let mut act = GemmAct32::new(stream, 1, 64)?
+                .with_form(stream, bloomery_gpu::gemm::MmaForm::Bf16)?;
+            g32.enqueue_bf16_cols(stream, &x, 1, &mut act)?;
+            let w = DeviceTensor::upload(stream, &vec![0x3f80_3f80u32; 127 * 32], 127, 32)?;
+            let partial_head = matches!(g32.enqueue_bf16_mma_norm_gate(
+                stream, &w, &x, &act, 1, &mut z, NormGateTail {
+                    o: &o, w: &gain, eps: 1e-6, fault: sink, y: &mut y,
+                }), Err(e) if e.to_string().contains("whole 128-value heads"));
+            let overflow = matches!(norm.enqueue_norm_gate_sigmoid(stream, NormGateArgs {
+                o: &o, z: &z, w: &gain, eps: 1e-6, n_v: 2, m: usize::MAX,
+                fault: sink, y: &mut y,
+            }), Err(e) if e.to_string().contains("overflows"));
+            println!(
+                "zgate partial_head_refused={partial_head} size_overflow_refused={overflow} {}",
+                verdict(partial_head && overflow)
+            );
+            Ok(ok && partial_head && overflow)
         }
 
         /// Ragged dense MMA tiles, tails, repeatability and graph replay.
@@ -8683,6 +8944,7 @@ mod gate {
             ok &= remap_case(&dev)?;
             ok &= f32tile_case(&dev)?;
             ok &= dense_mma_case(&dev)?;
+            ok &= norm_gate_case(gpu, false)?;
             ok &= mxfp8_w8a8_case(&dev)?;
             ok &= refusals(&dev)?;
             println!("gemm32 wall_s={:.1}", t0.elapsed().as_secs_f64());
@@ -8833,6 +9095,18 @@ mod gate {
                 a[0] = 1;
                 let contract = dot_ref(&dec, &a, &[f32::from_bits(1)]).2;
                 assert_eq!(contract.to_bits(), 1);
+            }
+
+            /// The scale and norm-gate checks lean on [`nan_bits_equal`]: a
+            /// shorter side is a difference, `-0.0` is not `0.0`, and any NaN
+            /// matches any NaN.
+            #[test]
+            fn nan_bits_equal_takes_the_length_and_any_nan() {
+                let nan = f32::from_bits(0x7fc0_0001);
+                assert!(nan_bits_equal(&[1.0, -0.0, nan], &[1.0, -0.0, f32::NAN]));
+                assert!(!nan_bits_equal(&[1.0, nan], &[1.0]));
+                assert!(!nan_bits_equal(&[1.0], &[1.0, nan]));
+                assert!(!nan_bits_equal(&[-0.0], &[0.0]));
             }
         }
     }

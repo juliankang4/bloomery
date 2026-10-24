@@ -56,6 +56,9 @@ use super::act32::ColsForm;
 use super::gemm32::{GEMM32_GROUP, raster32};
 use super::kernels32::Gemm32Kernels;
 use super::{GemmAct32, MmaForm};
+use crate::fault::FaultSink;
+use crate::linear::norm_gate::{NormGateTail, norm_gate_values};
+use crate::linear::{GATE_SIGMOID, HEAD};
 use crate::q8f32::{Bf16Words, ByteBlocks, E4m3Scales, E4m3Weight};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
@@ -1670,6 +1673,114 @@ pub(crate) unsafe fn bf16_mma_narrow(
     }
 }
 
+/// BF16 product followed by the shared sigmoid norm. Normal tiles exchange
+/// z through the retired staging allocation; exceptional tiles finish through
+/// the exact product owner first.
+///
+/// # Safety
+///
+/// A block has 256 converged threads and the BF16 MMA raster's grid. rows is
+/// a positive multiple of HEAD, n is positive and k a positive multiple of 64.
+/// w and x.words are 16-byte aligned and hold rows*k/2 and n*k/2 words;
+/// x.exact holds n*k values and x.refused n flags. o, z and y hold rows*n
+/// values, gain holds HEAD. sh is this block's 16-byte-aligned allocation of
+/// STAGES*STAGE_FLOATS floats. Output and scratch cells belong to this block.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    reason = "flat device operands and indexed CUDA-unrolled arrays"
+)]
+pub(crate) unsafe fn bf16_mma_norm_gate_body(
+    w: &[u32],
+    x: Bf16Cols<'_>,
+    rows: u32,
+    k: u32,
+    n: u32,
+    o: &[f32],
+    gain: &[f32],
+    eps: f32,
+    fault: FaultSink,
+    z: &mut DisjointSlice<f32>,
+    y: &mut DisjointSlice<f32>,
+    sh: *mut f32,
+) {
+    const {
+        assert!(MMA_ROWS == HEAD && MMA_COLS == 128);
+        assert!(MMA_WARP_COLS * HEAD <= STAGES * STAGE_FLOATS);
+    };
+    // SAFETY: the entry supplies the checked MMA launch and staging allocation.
+    let Some(mut tile) = (unsafe { bf16_mma_tile(Bf16Rows(w), x, rows, k, n, sh) }) else {
+        return;
+    };
+    let (rows, k, n) = (rows as usize, k as usize, n as usize);
+    // SAFETY: the tile's original staging allocation and K are unchanged.
+    let replay = unsafe { tile.needs_replay(sh, k) };
+    // Retire every vote and flag reader before reusing the staging allocation.
+    thread::sync_threads();
+    if replay {
+        // SAFETY: each marked output cell belongs to this tile.
+        unsafe { tile.store::<true>(z, rows, n) };
+        thread::sync_threads();
+        // SAFETY: all 256 threads reach this converged with the tile's checked spans and its
+        // staging allocation sh; the barrier above retired the store and every shared reader.
+        unsafe { tile.replay(Bf16Rows(w), x.exact(), (rows, k, n), z, sh) };
+        thread::sync_threads();
+    }
+    let lane = warp::lane_id() as usize;
+    let warp = thread::threadIdx_x() as usize / 32;
+    for pass in 0..MMA_COLS / MMA_WARP_COLS {
+        let start = tile.col0 + pass * MMA_WARP_COLS;
+        if !replay {
+            if warp % (MMA_COLS / MMA_WARP_COLS) == pass {
+                for cell in 0..MMA_CELLS {
+                    thread::__unroll_config::<0>();
+                    let (r, c) = tile.coordinates(cell);
+                    if c < n {
+                        let at = (c - start) * HEAD + r - tile.row0;
+                        // SAFETY: this warp owns the slab's column range, each
+                        // fragment a disjoint cell in its shared 32-column head.
+                        unsafe { *sh.add(at) = tile.value(cell) };
+                    }
+                }
+            }
+            thread::sync_threads();
+        }
+        for token in 0..MMA_WARP_COLS / (MMA_THREADS as usize / 32) {
+            let c = start + warp + token * (MMA_THREADS as usize / 32);
+            if c < n {
+                let base = c * rows + tile.row0;
+                let mut ov = [0.0f32; 4];
+                let mut zv = [0.0f32; 4];
+                let mut wv = [0.0f32; 4];
+                for i in 0..4 {
+                    thread::__unroll_config::<0>();
+                    let at = lane + 32 * i;
+                    // SAFETY: c is live and the tile owns one complete head.
+                    ov[i] = unsafe { *o.get_unchecked(base + at) };
+                    // SAFETY: at < HEAD <= gain.len().
+                    wv[i] = unsafe { *gain.get_unchecked(at) };
+                    zv[i] = if replay {
+                        // SAFETY: the exact owner published this live z cell.
+                        unsafe { *z.get_unchecked_mut(base + at) }
+                    } else {
+                        // SAFETY: the preceding barrier published this slab.
+                        unsafe { *sh.add((c - start) * HEAD + at) }
+                    };
+                }
+                let values = norm_gate_values::<GATE_SIGMOID>(ov, zv, wv, eps, fault);
+                for i in 0..4 {
+                    thread::__unroll_config::<0>();
+                    // SAFETY: this warp owns c, each lane four disjoint values.
+                    unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = values[i] };
+                }
+            }
+        }
+        // Retire the readers before the next slab overwrites shared memory.
+        thread::sync_threads();
+    }
+}
+
 impl Gemm32Kernels {
     /// Enqueue `y[c · rows + r] = Σ_k w[r·k + k'] · x[c·k + k']` for the
     /// first `n` columns of `x`, `w` an F32 weight of `rows × k` (module
@@ -1806,6 +1917,49 @@ impl Gemm32Kernels {
             t.k,
             t.n,
             y,
+        )?;
+        Ok(())
+    }
+
+    /// The BF16 prompt product and shared sigmoid norm in one launch. z is
+    /// scratch for exceptional exact replay only; ordinary tiles never write it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "product operands and its norm tail"
+    )]
+    pub fn enqueue_bf16_mma_norm_gate(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        x: &DeviceBuffer<f32>,
+        act: &GemmAct32,
+        n: usize,
+        z: &mut DeviceBuffer<f32>,
+        tail: NormGateTail<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_bf16_mma_norm_gate";
+        let t = bf16_mma_launch(what, w, x, n, z)?;
+        tail.check_rows(what, w.rows(), n, z.len())?;
+        let form = held_form(what, act, MmaForm::Bf16, x, &t)?;
+        let prep =
+            self.module
+                .prepare_bf16_mma_norm_gate(LaunchConfig1D::new(t.grid, MMA_THREADS, 0))?;
+        self.module.bf16_mma_norm_gate(
+            stream,
+            &prep,
+            w.buf(),
+            x,
+            &form.words,
+            &form.refused,
+            t.rows,
+            t.k,
+            t.n,
+            tail.o,
+            tail.w,
+            tail.eps,
+            tail.fault,
+            z,
+            tail.y,
         )?;
         Ok(())
     }
