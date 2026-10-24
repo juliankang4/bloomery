@@ -10208,7 +10208,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
     """Independent key contracts, each on its own scratch tree and manifest."""
     from unittest.mock import patch
 
-    assert section in (None, "inputs", "fixtures", "variants", "scope"), section
+    assert section in (None, "inputs", "globals", "fixtures", "variants", "scope"), section
     meta = cargo_metadata(ROOT)
     settings = justfile_settings(os.path.join(ROOT, "justfile"))
     with tempfile.TemporaryDirectory(prefix="recipes-keytest-") as tmp, patch.dict(os.environ, {"HOME": tmp}):
@@ -10307,9 +10307,11 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             cpu_lib = sorted(f for f in sa.graph.inputs("gate-sampler").files if f.startswith("crates/sampler/src/"))
             m = edit(cpu_lib[0], append("\n// key probe\n"))
             expect({"cpu", "mac", "fmt"} <= m and "gpu" not in m, f"{cpu_lib[0]} moves {sorted(m)}")
+        if section is None or section == "globals":
             for g in KEY_GLOBALS:
                 m = edit(g, append("\n# key probe\n"))
                 expect(m == set(items), f"{g} moves {sorted(m)}, not every key")
+        if section is None or section == "inputs":
             m = edit("justfile", append("\n# key probe\n"), side_fresh=True)
             expect(m == {"mac", "fmt"}, f"a justfile comment moves {sorted(m)}")
             m = edit("justfile", lambda s: s.replace("bash tools/gpu-gate.sh gate_q4k_sel'", "bash tools/gpu-gate.sh gate_q4k_sel '", 1), side_fresh=True)
@@ -13551,7 +13553,7 @@ def self_test(serial: bool = False) -> int:
         ("small tools", small),
         ("key detectors", lambda f: key_detectors_self_test(_expecting(f), side)),
         *[(f"key {section}", lambda f, section=section: key_self_test(_expecting(f), side, section))
-          for section in ("inputs", "fixtures", "variants", "scope")],
+          for section in ("inputs", "globals", "fixtures", "variants", "scope")],
         ("key reach", lambda f: key_reach_self_test(_expecting(f), side)),
     ]
     fails, times = _forked(jobs, serial)
