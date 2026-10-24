@@ -4,11 +4,14 @@
 //! card-slots-only form over a remapped route (`swiglu_quant32_sel`), its
 //! form under a gate·up rule of `kquant::act`, ik's clamped SwiGLU among
 //! them (`swiglu_act_quant32`), and the squared-ReLU quantizer between a
-//! relu² expert's up and its down (`relu_sqr_quant32`); and the BF16 form of
-//! the same columns a BF16 site on the dense MMA tile reads (`bf16_cols`).
-//! All entries are declared in `kernels32.rs`.
+//! relu² expert's up and its down (`relu_sqr_quant32`); and the forms of
+//! the same columns a site on the dense MMA tile reads ([`MmaForm`]: BF16,
+//! `bf16_cols`; MXFP8, `mxfp8_cols`). The entries are declared in
+//! `kernels32.rs`, the native MXFP8 one in `nvfp4mma.rs`.
 
-use super::f32tile::BF16_COLS_THREADS;
+use super::f32tile::FORM_THREADS;
+#[cfg(not(bloomery_nvfp4_mma))]
+use super::f32tile::NATIVE_BUILD;
 use super::kernels32::Gemm32Kernels;
 use super::{GEMM_MAX_SLOTS, GEMM32_STEP};
 use crate::fault::FaultSink;
@@ -39,9 +42,9 @@ use gguf::GgmlType;
 /// ([`GemmAct32::filled`]): a GEMM that would read a column past them is
 /// refused by name rather than reading another call's bytes.
 ///
-/// A scratch made [`GemmAct32::with_bf16`] also holds room for its columns
-/// rounded to BF16 ([`Bf16Form`]), which a BF16 site on GB10's dense MMA
-/// tile copies instead of rounding the f32 rows itself.
+/// A scratch made [`GemmAct32::with_form`] also holds room for its columns
+/// in a [`MmaForm`], which a site on GB10's dense MMA tile copies instead of
+/// converting the f32 rows in each tile.
 pub struct GemmAct32 {
     #[cfg(bloomery_nvfp4_mma)]
     pub(super) native: Option<super::nvfp4mma::Act>,
@@ -52,18 +55,33 @@ pub struct GemmAct32 {
     pub(super) k: usize,
     /// The column count of the last enqueued quantizer launch; 0 before one.
     filled: usize,
-    pub(super) bf16: Option<Bf16Form>,
+    /// Room for each [`MmaForm`], at its index.
+    forms: [Option<ColsForm>; 2],
 }
 
-/// The BF16 form of a [`GemmAct32`]'s columns (`f32tile::Bf16Cols`): `k / 2`
-/// words a column, two values a word in increasing order, and a word a
-/// column that is nonzero when one of its f32 values falls outside the
-/// tensor cores' range.
-pub(super) struct Bf16Form {
+/// A form of a [`GemmAct32`]'s columns that a site on GB10's dense MMA tile
+/// copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmaForm {
+    /// BF16 words, two values a word in increasing order, each value rounded
+    /// as the tile rounds it (`f32tile::Bf16Cols`): a BF16 site's.
+    Bf16,
+    /// E4M3 codes, four values a word in increasing order, with one UE8M0
+    /// scale a 32-value block, four a word (`nvfp4mma::Mxfp8Cols`): an MXFP8
+    /// site's on the native W8A8 product.
+    Mxfp8,
+}
+
+/// A [`MmaForm`] of a [`GemmAct32`]'s columns: `words`, `k / 2` (BF16) or
+/// `k / 4` (MXFP8) a column; `scales`, MXFP8's `k / 128` a column and empty
+/// for BF16; and a word a column that is nonzero when one of its f32 values
+/// falls outside the tensor cores' range.
+pub(super) struct ColsForm {
     pub(super) words: DeviceBuffer<u32>,
+    pub(super) scales: DeviceBuffer<u32>,
     pub(super) refused: DeviceBuffer<u32>,
-    /// The f32 rows' address and the columns the last rounding launch read;
-    /// `None` before one and after a quantizer launch that rounded none.
+    /// The f32 rows' address and the columns the last launch of this form
+    /// read; `None` before one and after a quantizer launch.
     pub(super) of: Option<(u64, usize)>,
 }
 
@@ -94,57 +112,75 @@ impl GemmAct32 {
             cols,
             k,
             filled: 0,
-            bf16: None,
+            forms: [None, None],
         })
     }
 
-    /// This scratch with room for its columns rounded to BF16 as well
-    /// ([`Gemm32Kernels::enqueue_bf16_cols`]). Load-time only.
-    pub fn with_bf16(mut self, stream: &CudaStream) -> Result<GemmAct32, GpuError> {
-        self.bf16 = Some(Bf16Form {
-            words: DeviceBuffer::zeroed(stream, self.cols * self.k / 2)?,
-            refused: DeviceBuffer::zeroed(stream, self.cols)?,
+    /// This scratch with room for its columns in `form` as well
+    /// ([`Gemm32Kernels::enqueue_bf16_cols`], `enqueue_mxfp8_cols`). MXFP8
+    /// takes `k` a multiple of 128 (its scale words); another is a named
+    /// `Shape` error. Load-time only.
+    pub fn with_form(mut self, stream: &CudaStream, form: MmaForm) -> Result<GemmAct32, GpuError> {
+        let (cols, k) = (self.cols, self.k);
+        let (words, scales) = match form {
+            MmaForm::Bf16 => (cols * k / 2, 0),
+            MmaForm::Mxfp8 if k.is_multiple_of(128) => (cols * k / 4, cols * k / 128),
+            MmaForm::Mxfp8 => {
+                return Err(GpuError::shape(
+                    "GemmAct32::with_form",
+                    format!("an MXFP8 form takes k a multiple of 128, got {k}"),
+                ));
+            }
+        };
+        self.forms[form as usize] = Some(ColsForm {
+            words: DeviceBuffer::zeroed(stream, words)?,
+            scales: DeviceBuffer::zeroed(stream, scales)?,
+            refused: DeviceBuffer::zeroed(stream, cols)?,
             of: None,
         });
         Ok(self)
     }
 
-    /// The BF16 form when the last rounding launch read the first `n`
-    /// columns or more of the f32 rows `x` and no quantizer launch came
-    /// after it.
-    pub(super) fn bf16_of(&self, x: &DeviceBuffer<f32>, n: usize) -> Option<&Bf16Form> {
-        self.bf16
+    /// `form` when its last launch read the first `n` columns or more of the
+    /// f32 rows `x` and no quantizer launch came after it.
+    pub(super) fn form_of(
+        &self,
+        form: MmaForm,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+    ) -> Option<&ColsForm> {
+        self.forms[form as usize]
             .as_ref()
             .filter(|f| f.of.is_some_and(|(at, m)| at == x.cu_deviceptr() && n <= m))
     }
 
-    /// Whether a BF16 site can read the BF16 form of the first `n` columns
-    /// of `x` ([`GemmAct32::bf16_of`]).
+    /// Whether a site can read `form` of the first `n` columns of `x`
+    /// ([`GemmAct32::form_of`]).
     #[must_use]
-    pub(crate) fn holds_bf16(&self, x: &DeviceBuffer<f32>, n: usize) -> bool {
-        self.bf16_of(x, n).is_some()
+    pub(crate) fn holds(&self, form: MmaForm, x: &DeviceBuffer<f32>, n: usize) -> bool {
+        self.form_of(form, x, n).is_some()
     }
 
-    /// Whether this scratch holds room for a BF16 form
-    /// ([`GemmAct32::with_bf16`]).
+    /// Whether this scratch holds room for `form` ([`GemmAct32::with_form`]).
     #[must_use]
-    pub(crate) fn has_bf16(&self) -> bool {
-        self.bf16.is_some()
+    pub(crate) fn has(&self, form: MmaForm) -> bool {
+        self.forms[form as usize].is_some()
     }
 
-    /// Marks the BF16 form as no rows' (its columns stay as they are), so no
-    /// site reads it until the next rounding launch.
-    pub(crate) fn forget_bf16(&mut self) {
-        if let Some(f) = &mut self.bf16 {
+    /// Marks `form` as no rows' (its columns stay as they are), so no site
+    /// reads it until its next launch.
+    pub(crate) fn forget(&mut self, form: MmaForm) {
+        if let Some(f) = &mut self.forms[form as usize] {
             f.of = None;
         }
     }
 
-    /// Records a quantizer launch of `n_cols` columns, which leaves the BF16
+    /// Records a quantizer launch of `n_cols` columns, which leaves every
     /// form of other rows.
     pub(super) fn fill(&mut self, n_cols: usize) {
         self.filled = n_cols;
-        self.forget_bf16();
+        self.forget(MmaForm::Bf16);
+        self.forget(MmaForm::Mxfp8);
     }
 
     /// Routed columns, including the native FP4 representation when the build supports it.
@@ -232,9 +268,11 @@ impl GemmAct32 {
             + self.d.num_bytes()
             + self.s.num_bytes()
             + self
-                .bf16
-                .as_ref()
-                .map_or(0, |f| f.words.num_bytes() + f.refused.num_bytes());
+                .forms
+                .iter()
+                .flatten()
+                .map(|f| f.words.num_bytes() + f.scales.num_bytes() + f.refused.num_bytes())
+                .sum::<usize>();
         #[cfg(bloomery_nvfp4_mma)]
         let bytes = bytes + self.native.as_ref().map_or(0, super::nvfp4mma::Act::bytes);
         bytes
@@ -266,12 +304,49 @@ impl GemmAct32 {
     }
 }
 
+/// The checks a form launch over the first `n_cols` columns of `x` into
+/// `act`'s `form` shares, as `what`'s: the columns, `x`'s length and
+/// 16-byte alignment, and room for the form; then the launch (a warp a
+/// column) and its `k` and `n_cols` as the kernel's u32.
+fn form_launch<'a>(
+    what: &'static str,
+    x: &DeviceBuffer<f32>,
+    n_cols: usize,
+    act: &'a mut GemmAct32,
+    form: MmaForm,
+) -> Result<(LaunchConfig1D, u32, u32, &'a mut ColsForm), GpuError> {
+    if n_cols == 0 || n_cols > act.cols {
+        return Err(GpuError::shape(
+            what,
+            format!("1 <= n_cols <= act.cols() = {}, got {n_cols}", act.cols),
+        ));
+    }
+    if x.len() < n_cols * act.k {
+        return Err(GpuError::shape(
+            what,
+            format!("x.len() {} < n_cols*k = {n_cols}*{}", x.len(), act.k),
+        ));
+    }
+    crate::tensor::check_alignment::<U32x4, _>(what, "x", x)?;
+    let k = launch_u32(what, "k", act.k)?;
+    let n = launch_u32(what, "n_cols", n_cols)?;
+    let warps = (FORM_THREADS / 32) as usize;
+    let grid = launch_u32(what, "grid", n_cols.div_ceil(warps))?;
+    let Some(f) = &mut act.forms[form as usize] else {
+        return Err(GpuError::state(
+            what,
+            "a scratch made with_form for this form",
+        ));
+    };
+    Ok((LaunchConfig1D::new(grid, FORM_THREADS, 0), k, n, f))
+}
+
 impl Gemm32Kernels {
     /// Enqueue the BF16 form of the first `n_cols` columns of `x` (`act.k()`
-    /// f32 each, column after column) into `act`, made [`GemmAct32::with_bf16`]:
-    /// each value rounded to nearest even as the dense MMA tile rounds it, and
-    /// each column's refusal word. The q8 blocks stay as they are.
-    /// Asynchronous, allocation-free, capturable.
+    /// f32 each, column after column) into `act`, made with room for it
+    /// ([`GemmAct32::with_form`]): each value rounded to nearest even as the
+    /// dense MMA tile rounds it, and each column's refusal word. The q8
+    /// blocks stay as they are. Asynchronous, allocation-free, capturable.
     pub fn enqueue_bf16_cols(
         &self,
         stream: &CudaStream,
@@ -280,33 +355,43 @@ impl Gemm32Kernels {
         act: &mut GemmAct32,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_bf16_cols";
-        if n_cols == 0 || n_cols > act.cols {
-            return Err(GpuError::shape(
-                what,
-                format!("1 <= n_cols <= act.cols() = {}, got {n_cols}", act.cols),
-            ));
-        }
-        if x.len() < n_cols * act.k {
-            return Err(GpuError::shape(
-                what,
-                format!("x.len() {} < n_cols*k = {n_cols}*{}", x.len(), act.k),
-            ));
-        }
-        crate::tensor::check_alignment::<U32x4, _>(what, "x", x)?;
-        let k = launch_u32(what, "k", act.k)?;
-        let Some(form) = &mut act.bf16 else {
-            return Err(GpuError::state(what, "a scratch made with_bf16"));
-        };
-        let warps = (BF16_COLS_THREADS / 32) as usize;
-        let grid = launch_u32(what, "grid", n_cols.div_ceil(warps))?;
-        let prep =
-            self.module
-                .prepare_bf16_cols(LaunchConfig1D::new(grid, BF16_COLS_THREADS, 0))?;
-        let n = launch_u32(what, "n_cols", n_cols)?;
+        let (cfg, k, n, form) = form_launch(what, x, n_cols, act, MmaForm::Bf16)?;
+        let prep = self.module.prepare_bf16_cols(cfg)?;
         self.module
             .bf16_cols(stream, &prep, x, k, n, &mut form.words, &mut form.refused)?;
         form.of = Some((x.cu_deviceptr(), n_cols));
         Ok(())
+    }
+
+    /// Enqueue the MXFP8 form of the first `n_cols` columns of `x` (`act.k()`
+    /// f32 each, column after column) into `act`, made with room for it
+    /// ([`GemmAct32::with_form`]): each 32-value block's scale
+    /// `2^ceil(log2(amax / 448))` as a UE8M0 byte, its values over that scale
+    /// as E4M3 rounded to nearest even and saturated, and each column's
+    /// refusal word. The q8 blocks stay as they are. A build without the
+    /// native block-scaled kernels refuses it by name. Asynchronous,
+    /// allocation-free, capturable.
+    #[cfg_attr(
+        not(bloomery_nvfp4_mma),
+        allow(unused_variables, reason = "the native build's launch reads them")
+    )]
+    pub fn enqueue_mxfp8_cols(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        n_cols: usize,
+        act: &mut GemmAct32,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_mxfp8_cols";
+        let (cfg, k, n, form) = form_launch(what, x, n_cols, act, MmaForm::Mxfp8)?;
+        #[cfg(bloomery_nvfp4_mma)]
+        {
+            self.native.mxfp8_cols(stream, cfg, x, (k, n), form)?;
+            form.of = Some((x.cu_deviceptr(), n_cols));
+            Ok(())
+        }
+        #[cfg(not(bloomery_nvfp4_mma))]
+        Err(GpuError::state(what, NATIVE_BUILD))
     }
 
     /// Enqueue the 32-value quantization of the first `n_cols` columns of `x`

@@ -68,7 +68,7 @@
 
 use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
-    GemmRoute, GemmWeight,
+    GemmRoute, GemmWeight, MmaForm,
 };
 use crate::kquant::{Act, SelDown};
 use crate::mxfp4::Nvfp4Kernels;
@@ -1045,12 +1045,17 @@ pub fn gemm(
                     },
                 ),
                 Planes::F32(t) => g32()?.enqueue_f32_tile(stream, t, f32_rows()?, m, y),
-                Planes::E4m3(t) if gpu.q8f32().dense_mma => {
-                    g32()?.enqueue_e4m3_mma(stream, t, f32_rows()?, m, y)
-                }
+                Planes::E4m3(t) if gpu.q8f32().dense_mma => match (x.q32, f32_rows()?) {
+                    (Some(act), rows) if crate::gemm::mxfp8_w8a8_reads(&t, act, rows, m) => {
+                        g32()?.enqueue_mxfp8_w8a8(stream, t, rows, act, m, y)
+                    }
+                    (_, rows) => g32()?.enqueue_e4m3_mma(stream, t, rows, m, y),
+                },
                 Planes::E4m3(t) => g32()?.enqueue_e4m3_tile(stream, t, f32_rows()?, m, y),
                 Planes::Bf16(t) => match (x.q32, f32_rows()?) {
-                    (Some(act), rows) if gpu.q8f32().dense_mma && act.holds_bf16(rows, m) => {
+                    (Some(act), rows)
+                        if gpu.q8f32().dense_mma && act.holds(MmaForm::Bf16, rows, m) =>
+                    {
                         g32()?.enqueue_bf16_mma_cols(stream, t, rows, act, m, y)
                     }
                     (_, rows) => gpu.q8f32().enqueue_bf16_prompt(stream, t, rows, m, y),
@@ -1138,23 +1143,35 @@ fn wide_by_name(
     gemm(gpu, k, (ty, w, src), rows, x, table, m, y)
 }
 
-/// Whether a site of one of the resident weights `names` is BF16 on GB10's
-/// dense MMA tile, which copies its input's BF16 form when the input holds
-/// it ([`GemmAct32::with_bf16`]).
+/// Whether a site of type `ty` copies its input's `form` on GB10's dense MMA
+/// tile when the input holds it ([`GemmAct32::with_form`]): a BF16 site the
+/// BF16 form; on a native block-scaled build an MXFP8 site the MXFP8 form.
+fn copies_form(gpu: &Gpu, ty: SiteTy, form: MmaForm) -> bool {
+    let reader = match form {
+        MmaForm::Bf16 => SiteTy::Bf16,
+        MmaForm::Mxfp8 if cfg!(bloomery_nvfp4_mma) => SiteTy::Mxfp8,
+        MmaForm::Mxfp8 => return false,
+    };
+    gpu.q8f32().dense_mma && ty == reader
+}
+
+/// Whether a site of one of the resident weights `names` copies `form`
+/// ([`copies_form`] of its resident type).
 #[must_use]
-pub(crate) fn reads_bf16_cols(gpu: &Gpu, w: &Weights, names: &[&str]) -> bool {
-    gpu.q8f32().dense_mma
-        && names
-            .iter()
-            .any(|n| w.get(n).and_then(of_resident) == Some(SiteTy::Bf16))
+pub(crate) fn reads_form(gpu: &Gpu, w: &Weights, names: &[&str], form: MmaForm) -> bool {
+    names.iter().any(|n| {
+        w.get(n)
+            .and_then(of_resident)
+            .is_some_and(|ty| copies_form(gpu, ty, form))
+    })
 }
 
 /// The forms of the first `m` columns of the f32 rows `x` that a site of one
 /// of the resident weights `names` reads into `q32`: the q8 blocks of 32
 /// ([`WideActs::wants`] of its type, [`of_resident`]), what [`resident_gemm`]
-/// reads for a Q8_0 or Q5_0 site; and the BF16 form ([`reads_bf16_cols`])
-/// when `q32` holds room for it. A BF16 form no site reads is left marked as
-/// another rows', so no later site reads it.
+/// reads for a Q8_0 or Q5_0 site; and each [`MmaForm`] that `q32` holds room
+/// for and a site reads ([`reads_form`], [`write_forms`]). A form no site
+/// reads is left marked as another rows', so no later site reads it.
 pub fn resident_quantize(
     gpu: &Gpu,
     k: &WideKernels<'_>,
@@ -1175,15 +1192,36 @@ pub fn resident_quantize(
         )?
         .enqueue_quantize_gemm32(gpu.stream(), x, m, q32, sink)?;
     }
-    if q32.has_bf16() {
-        if reads_bf16_cols(gpu, w, names) {
-            k.g32(
-                "site::resident_quantize",
-                "the 32-value kernels a site's BF16 form is rounded by",
-            )?
-            .enqueue_bf16_cols(gpu.stream(), x, m, q32)?;
-        } else {
-            q32.forget_bf16();
+    write_forms(k, gpu.stream(), (x, m), q32, |f| {
+        reads_form(gpu, w, names, f)
+    })
+}
+
+/// Each form `q32` holds room for of the first `m` columns of the f32 rows
+/// `x`: written (`enqueue_bf16_cols`, `enqueue_mxfp8_cols`) when a site reads
+/// it (`reads`), else marked as another rows'.
+fn write_forms(
+    k: &WideKernels<'_>,
+    stream: &cuda_core::CudaStream,
+    (x, m): (&DeviceBuffer<f32>, usize),
+    q32: &mut GemmAct32,
+    reads: impl Fn(MmaForm) -> bool,
+) -> Result<(), GpuError> {
+    for form in [MmaForm::Bf16, MmaForm::Mxfp8] {
+        if !q32.has(form) {
+            continue;
+        }
+        if !reads(form) {
+            q32.forget(form);
+            continue;
+        }
+        let g32 = k.g32(
+            "site::write_forms",
+            "the 32-value kernels a site's MMA form is written by",
+        )?;
+        match form {
+            MmaForm::Bf16 => g32.enqueue_bf16_cols(stream, x, m, q32)?,
+            MmaForm::Mxfp8 => g32.enqueue_mxfp8_cols(stream, x, m, q32)?,
         }
     }
     Ok(())
@@ -1366,7 +1404,8 @@ fn swiglu_launch((ty, name): (SiteTy, &str), rule: Act) -> Result<SwigluLaunch, 
 
 /// The rule's SwiGLU of the first `cols` columns of the gate and up rows
 /// (`blk.ff` values each) into `rows`, in the form `blk`'s down reads: one
-/// launch with the quantizer for a q8 form, the f32 rows otherwise.
+/// launch with the quantizer for a q8 form, the f32 rows otherwise, then the
+/// [`MmaForm`] of them the down copies when `rows.q32` holds room for it.
 fn swiglu(
     gpu: &Gpu,
     k: &WideKernels<'_>,
@@ -1419,7 +1458,11 @@ fn swiglu(
         }
         SwigluLaunch::F32 => {
             let y = rows.f32.as_deref_mut().ok_or_else(|| lacks("f32 rows"))?;
-            gpu.elem().enqueue_swiglu(stream, g, u, cols * blk.ff, y)
+            gpu.elem().enqueue_swiglu(stream, g, u, cols * blk.ff, y)?;
+            match rows.q32.as_deref_mut() {
+                Some(q32) => write_forms(k, stream, (&*y, cols), q32, |f| copies_form(gpu, ty, f)),
+                None => Ok(()),
+            }
         }
     }
 }

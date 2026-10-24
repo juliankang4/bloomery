@@ -274,11 +274,20 @@
 //!   with columns past a raster group) and range edges: every output within
 //!   the BF16 operand band, the cells of an edge's row and column the exact
 //!   tile's bits, nothing written past the output and a graph replay the
-//!   eager bits. At 130 × 130 outputs of K 128, unit weights against
-//!   activations of 1 + 2^-10: every cell K, and with a subnormal activation
-//!   in one column, then also weights of 2^60 in one row, that column's and
-//!   row's cells the exact tile's bits and every other cell still K. A BF16
-//!   weight off a 16-byte boundary is refused by name.
+//!   eager bits; the BF16 form's product the same bits eager and replayed
+//!   over a form rewritten from zeros after the capture. At 130 × 130
+//!   outputs of K 128, unit weights against activations of 1 + 2^-10: every
+//!   cell K, and with a subnormal activation in one column, then also weights
+//!   of 2^60 in one row, that column's and row's cells the exact tile's bits
+//!   and every other cell still K. A BF16 weight off a 16-byte boundary is
+//!   refused by name.
+//! - `mxfp8_w8a8`: the native W8A8 MXFP8 product over the activations' MXFP8
+//!   form (`enqueue_mxfp8_cols`, `enqueue_mxfp8_w8a8`): the form against a
+//!   host quantizer, the product against an f64 oracle at ragged shapes, a
+//!   graph replay over a form rewritten from zeros after the capture equal to
+//!   the eager bits, an input value or a weight scale byte the tensor cores
+//!   cannot take sending its column or row to the exact tile, and stale or
+//!   misplaced forms refused by name.
 //! - `g32_refuse`: the host API's refusals, each an error holding its own
 //!   message (another check refusing first does not pass): the scratch's
 //!   K and columns, the quantizer's input and columns, an unfilled table,
@@ -2392,7 +2401,7 @@ mod gate {
 
         if matches!(
             case_filter().as_deref(),
-            Some("dense_mma" | "nvfp4_native" | "nvfp4_swiglu" | "nvfp4_gate_up")
+            Some("dense_mma" | "mxfp8_w8a8" | "nvfp4_native" | "nvfp4_swiglu" | "nvfp4_gate_up")
         ) {
             return if g32::run(&gpu, &dev.gk)? {
                 Ok(())
@@ -7494,19 +7503,24 @@ mod gate {
                     );
                     ok &= quality && range && tail && same;
                     if format == 0 {
-                        // The columns' BF16 form gives the same bits, eager and replayed.
+                        // The columns' BF16 form gives the same bits, eager and
+                        // replayed over a form rewritten from zeros after the
+                        // capture, so the replay's own form launch counts.
                         let cols = |s: &cuda_core::CudaStream,
                                     act: &mut GemmAct32,
                                     y: &mut DeviceBuffer<f32>| {
                             dev.g32.enqueue_bf16_cols(s, &x, n, act)?;
                             dev.g32.enqueue_bf16_mma_cols(s, &w, &x, act, n, y)
                         };
-                        let mut act = GemmAct32::new(stream, n, k)?.with_bf16(stream)?;
+                        let mut act = GemmAct32::new(stream, n, k)?
+                            .with_form(stream, bloomery_gpu::gemm::MmaForm::Bf16)?;
                         y.copy_from_host(stream, &vec![SENT; y.len()])?;
                         cols(stream, &mut act, &mut y)?;
                         let got = y.to_host_vec(stream)?;
                         y.copy_from_host(stream, &vec![SENT; y.len()])?;
                         let graph = gpu.capture(|s| cols(s, &mut act, &mut y))?;
+                        let zeros = DeviceBuffer::from_host(stream, &vec![0.0f32; n * k])?;
+                        dev.g32.enqueue_bf16_cols(stream, &zeros, n, &mut act)?;
                         graph.launch(stream)?;
                         stream.synchronize()?;
                         let replay = y.to_host_vec(stream)?;
@@ -7593,7 +7607,8 @@ mod gate {
                         let (mma, exact) = (run(false)?, run(true)?);
                         // A BF16 weight's site over the columns' BF16 form: the same bits.
                         let cols_bits = scales.is_some() || {
-                            let mut act = GemmAct32::new(stream, n, k)?.with_bf16(stream)?;
+                            let mut act = GemmAct32::new(stream, n, k)?
+                                .with_form(stream, bloomery_gpu::gemm::MmaForm::Bf16)?;
                             dev.g32.enqueue_bf16_cols(stream, &x, n, &mut act)?;
                             let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n])?;
                             dev.g32
@@ -7644,7 +7659,8 @@ mod gate {
                 DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?,
                 DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?,
             );
-            let mut act = GemmAct32::new(stream, 2, 64)?.with_bf16(stream)?;
+            let mut act = GemmAct32::new(stream, 2, 64)?
+                .with_form(stream, bloomery_gpu::gemm::MmaForm::Bf16)?;
             dev.g32.enqueue_bf16_cols(stream, &one, 1, &mut act)?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, 128)?;
             let stale = |r: Result<(), GpuError>| matches!(r, Err(e) if e.to_string().contains("BF16 form"));
@@ -7670,6 +7686,338 @@ mod gate {
             println!(
                 "dense_mma bf16_cols stale_refused other_rows={other_rows} more_cols={more_cols} \
                  fresh_read={fresh} after_quantize={requantized} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+            Ok(ok)
+        }
+
+        /// `enqueue_mxfp8_cols`'s values of one column, on the host: each
+        /// 32-value block's scale `2^(exp - 127)`, `exp` the biased exponent of
+        /// `amax · (1 / 448)` rounded up and held to 1..=254, and each value
+        /// over that scale as E4M3 (nearest, ties to even, saturated at 448)
+        /// times the scale.
+        fn mxfp8_reference(col: &[f32]) -> Vec<f32> {
+            let e4m3 = |v: f64| {
+                let a = v.abs().min(448.0);
+                let exp = ((a.to_bits() >> 52) as i32 - 1023).max(-6);
+                let step = 2.0f64.powi(exp - 3);
+                ((a / step).round_ties_even() * step).min(448.0).copysign(v)
+            };
+            col.as_chunks::<32>()
+                .0
+                .iter()
+                .flat_map(|block| {
+                    let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                    let bits = (amax * (1.0 / 448.0)).to_bits();
+                    let exp = ((bits >> 23) + u32::from(bits & 0x7f_ffff != 0)).clamp(1, 254);
+                    let scale = 2.0f64.powi(exp as i32 - 127);
+                    block
+                        .iter()
+                        .map(move |&v| (e4m3(f64::from(v) / scale) * scale) as f32)
+                })
+                .collect()
+        }
+
+        /// The native W8A8 MXFP8 product over the activations' MXFP8 form:
+        /// the form's values, block scales on both operands, tile tails,
+        /// eager against graph, the cells the exact owner replays, and the
+        /// stale and misplaced forms refused by name.
+        fn mxfp8_w8a8_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("dense_mma_mxfp8_w8a8") {
+                return Ok(true);
+            }
+            use bloomery_gpu::gemm::MmaForm;
+            use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight};
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let g32 = &dev.g32;
+            fn mxfp8<'a>(qs: &'a DeviceTensor<u32>, e: &'a DeviceTensor<u32>) -> E4m3Weight<'a> {
+                E4m3Weight {
+                    qs,
+                    e,
+                    scales: E4m3Scales::Mxfp8,
+                }
+            }
+            let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
+            let native = bloomery_gpu_gates::ptx::modules(&bundles)?.iter().any(|m| {
+                bloomery_gpu_gates::ptx::body(std::slice::from_ref(m), "mxfp8_w8a8_gemm").is_some()
+            });
+            if !native {
+                if super::case_filter().as_deref() == Some("mxfp8_w8a8") {
+                    return Err("mxfp8_w8a8 requires the native block-scaled build".into());
+                }
+                // Without the native kernels the form is refused by name.
+                let x = DeviceBuffer::from_host(stream, &[1.0f32; 128])?;
+                let mut act = GemmAct32::new(stream, 1, 128)?.with_form(stream, MmaForm::Mxfp8)?;
+                let refused = matches!(
+                    g32.enqueue_mxfp8_cols(stream, &x, 1, &mut act),
+                    Err(e) if e.to_string().contains("native block-scaled build")
+                );
+                println!(
+                    "gemm32 case=mxfp8_w8a8 native=false refused={refused} {}",
+                    verdict(refused)
+                );
+                return Ok(refused);
+            }
+            let mut ok = true;
+            // Unit weights pick one activation each: every cell is one value of
+            // the form, against the host's quantizer, over blocks of every
+            // magnitude, rounding ties, E4M3 subnormals, zero blocks and amax on
+            // a power of two times 448.
+            {
+                let (k, n) = (256usize, 133usize);
+                let mut rng = bloomery_gpu_gates::GateRng(0x6d78_3861);
+                let mut xh = vec![0.0f32; n * k];
+                for (b, block) in xh.as_chunks_mut::<32>().0.iter_mut().enumerate() {
+                    let mag = 2.0f32.powi(rng.below(41) as i32 - 20);
+                    match b % 9 {
+                        0 => {}
+                        1 => {
+                            let ties = [1.0625f32, 1.1875, 17.0, -17.0, 0.75 / 512.0, 0.25 / 512.0];
+                            for (z, v) in block.iter_mut().enumerate() {
+                                *v = mag * ties[z % ties.len()];
+                            }
+                            block[31] = mag * 448.0;
+                        }
+                        _ => {
+                            for v in block.iter_mut() {
+                                *v =
+                                    mag * rng.uni(-1.0, 1.0) * 2.0f32.powi(-(rng.below(13) as i32));
+                            }
+                        }
+                    }
+                }
+                let rows = k;
+                let qh: Vec<u32> = (0..rows * k / 4)
+                    .map(|w| {
+                        let (r, z) = (4 * w / k, 4 * w % k);
+                        if r / 4 == z / 4 {
+                            0x38 << (8 * (r % 4))
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                let qs = DeviceTensor::upload(stream, &qh, rows, k / 4)?;
+                let e = DeviceTensor::upload(
+                    stream,
+                    &vec![0x7f7f_7f7fu32; rows * k / 128],
+                    rows,
+                    k / 128,
+                )?;
+                let x = DeviceBuffer::from_host(stream, &xh)?;
+                let mut act = GemmAct32::new(stream, n, k)?.with_form(stream, MmaForm::Mxfp8)?;
+                let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n])?;
+                g32.enqueue_mxfp8_cols(stream, &x, n, &mut act)?;
+                g32.enqueue_mxfp8_w8a8(stream, mxfp8(&qs, &e), &x, &act, n, &mut y)?;
+                let got = y.to_host_vec(stream)?;
+                let want: Vec<f32> = xh.chunks_exact(k).flat_map(mxfp8_reference).collect();
+                let bad = (0..rows * n).filter(|&at| got[at] != want[at]).count();
+                println!(
+                    "gemm32 case=mxfp8_w8a8_form K={k} n={n} cells_off_reference={bad} {}",
+                    verdict(bad == 0)
+                );
+                ok &= bad == 0;
+            }
+            for (rows, k, n) in [
+                (129, 128, 127),
+                (129, 128, 128),
+                (129, 256, 129),
+                (257, 128, 257),
+                (128, 640, 129),
+                (17, 640, 3),
+            ] {
+                // Weights of three binary digits on per-block scales 2^-3 to
+                // 2^3, activations whose E4M3 values carry three: every
+                // product and partial sum is exact in f32.
+                let mut qh = vec![0u32; rows * k / 4];
+                let mut eh = vec![0u32; rows * k / 128];
+                let mut wh = vec![0.0f32; rows * k];
+                for r in 0..rows {
+                    for b in 0..k / 32 {
+                        let exp = 124 + (r + b) % 7;
+                        eh[r * k / 128 + b / 4] |= (exp as u32) << (8 * (b % 4));
+                        for z in 0..32 {
+                            let (code, value) = [
+                                (0x38u32, 1.0f32),
+                                (0xb8, -1.0),
+                                (0x30, 0.5),
+                                (0x40, 2.0),
+                                (0x40, 2.0),
+                                (0x30, 0.5),
+                                (0xb8, -1.0),
+                                (0x38, 1.0),
+                            ][(z + r + z / 8) % 8];
+                            let at = r * k + 32 * b + z;
+                            qh[at / 4] |= code << (8 * (at % 4));
+                            wh[at] = value * 2.0f32.powi(exp as i32 - 127);
+                        }
+                    }
+                }
+                let mut xh = vec![0.0f32; n * k];
+                for c in 0..n {
+                    for b in 0..k / 32 {
+                        let scale = 2.0f32.powi(((c + b) % 5) as i32 - 2);
+                        for z in 0..32 {
+                            let j = (z + c + b) % 8;
+                            xh[c * k + b * 32 + z] =
+                                [0.0, 1.0625, 1.1875, 1.5, 1.75, -1.0625, -1.1875, -1.5][j]
+                                    * scale
+                                    * [1.0, 0.5, 0.25, 0.125][z / 8];
+                        }
+                    }
+                }
+                let xq: Vec<f32> = xh.chunks_exact(k).flat_map(mxfp8_reference).collect();
+                let qs = DeviceTensor::upload(stream, &qh, rows, k / 4)?;
+                let e = DeviceTensor::upload(stream, &eh, rows, k / 128)?;
+                let x = DeviceBuffer::from_host(stream, &xh)?;
+                let mut act = GemmAct32::new(stream, n, k)?.with_form(stream, MmaForm::Mxfp8)?;
+                let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n + 16])?;
+                let mut enqueue = |s: &cuda_core::CudaStream,
+                                   x: &DeviceBuffer<f32>,
+                                   e: &DeviceTensor<u32>,
+                                   y: &mut DeviceBuffer<f32>| {
+                    g32.enqueue_mxfp8_cols(s, x, n, &mut act)?;
+                    g32.enqueue_mxfp8_w8a8(s, mxfp8(&qs, e), x, &act, n, y)
+                };
+                enqueue(stream, &x, &e, &mut y)?;
+                let eager = y.to_host_vec(stream)?;
+                // The replay runs over a form rewritten from zeros after the
+                // capture, so its own form launch counts.
+                let graph = gpu.capture(|s| enqueue(s, &x, &e, &mut y))?;
+                enqueue(
+                    stream,
+                    &DeviceBuffer::from_host(stream, &vec![0.0f32; n * k])?,
+                    &e,
+                    &mut y,
+                )?;
+                y.copy_from_host(stream, &vec![SENT; y.len()])?;
+                graph.launch(stream)?;
+                let replay = y.to_host_vec(stream)?;
+                let mut off = 0usize;
+                for c in 0..n {
+                    for r in 0..rows {
+                        let want = (0..k)
+                            .map(|z| f64::from(wh[r * k + z]) * f64::from(xq[c * k + z]))
+                            .sum::<f64>() as f32;
+                        off += usize::from(eager[c * rows + r] != want);
+                    }
+                }
+                let graph_equal = bits_equal(&eager, &replay);
+                let guard = eager[rows * n..].iter().all(|v| *v == SENT);
+                let pass = off == 0 && graph_equal && guard;
+                println!(
+                    "gemm32 case=mxfp8_w8a8 rows={rows} K={k} n={n} cells_off_oracle={off} eager_graph_eq={graph_equal} guard={guard} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+                // A value the tensor cores cannot take sends its column to
+                // the exact owner; a scale byte out of 10..=165 its row.
+                // Every other cell keeps its W8A8 bits.
+                let exact = |x: &DeviceBuffer<f32>, e: &DeviceTensor<u32>| {
+                    let mut y = DeviceBuffer::from_host(stream, &vec![SENT; rows * n])?;
+                    g32.enqueue_e4m3_tile(stream, mxfp8(&qs, e), x, n, &mut y)?;
+                    Ok::<_, GateError>(y.to_host_vec(stream)?)
+                };
+                let same =
+                    |a: f32, b: f32| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+                let c = n.min(64) - 1;
+                for odd in [f32::from_bits(0x200), f32::from_bits(0x5780_0000), f32::NAN] {
+                    let mut dirty = xh.clone();
+                    dirty[c * k + 1] = odd;
+                    let dirty = DeviceBuffer::from_host(stream, &dirty)?;
+                    enqueue(stream, &dirty, &e, &mut y)?;
+                    let got = y.to_host_vec(stream)?;
+                    let exact = exact(&dirty, &e)?;
+                    let cells = (0..rows * n).all(|at| {
+                        same(got[at], if at / rows == c { exact[at] } else { eager[at] })
+                    });
+                    println!(
+                        "gemm32 case=mxfp8_w8a8_neighbours rows={rows} K={k} n={n} col={c} odd={:08x} cells={cells} {}",
+                        odd.to_bits(),
+                        verdict(cells)
+                    );
+                    ok &= cells;
+                }
+                let mut edges = eh.clone();
+                let per_row = k / 128;
+                for (r, byte) in [(0, 9u32), (1, 166), (2, 10), (3, 165)] {
+                    edges[r * per_row] = (edges[r * per_row] & !255) | byte;
+                }
+                let edges = DeviceTensor::upload(stream, &edges, rows, per_row)?;
+                enqueue(stream, &x, &edges, &mut y)?;
+                let got = y.to_host_vec(stream)?;
+                let exact = exact(&x, &edges)?;
+                let line = |r: usize| (0..n).map(move |c| c * rows + r);
+                let replayed = line(0).chain(line(1)).all(|at| same(got[at], exact[at]));
+                let kept = [2, 3]
+                    .iter()
+                    .all(|&r| line(r).any(|at| !same(got[at], exact[at])));
+                let others = (0..rows * n)
+                    .filter(|at| at % rows > 3)
+                    .all(|at| same(got[at], eager[at]));
+                let pass = replayed && kept && others;
+                println!(
+                    "gemm32 case=mxfp8_w8a8_scale_edges rows={rows} K={k} n={n} bytes_9_166_exact={replayed} \
+                     bytes_10_165_mma={kept} others_kept={others} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            // The form is read only for the rows and the columns it was made
+            // from, until the next quantizer launch; a weight's planes
+            // are read 16-byte aligned; an MXFP8 form takes K a multiple of 128.
+            let (rows, k) = (64usize, 128usize);
+            let qs =
+                DeviceTensor::upload(stream, &vec![0x3838_3838u32; rows * k / 4], rows, k / 4)?;
+            let e =
+                DeviceTensor::upload(stream, &vec![0x7f7f_7f7fu32; rows * k / 128], rows, k / 128)?;
+            let (one, two) = (
+                DeviceBuffer::from_host(stream, &vec![1.0f32; 2 * k])?,
+                DeviceBuffer::from_host(stream, &vec![1.0f32; 2 * k])?,
+            );
+            let mut act = GemmAct32::new(stream, 2, k)?.with_form(stream, MmaForm::Mxfp8)?;
+            g32.enqueue_mxfp8_cols(stream, &one, 1, &mut act)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, 2 * rows)?;
+            let stale = |r: Result<(), GpuError>| matches!(r, Err(e) if e.to_string().contains("MXFP8 form"));
+            let other_rows =
+                stale(g32.enqueue_mxfp8_w8a8(stream, mxfp8(&qs, &e), &two, &act, 1, &mut y));
+            let more_cols =
+                stale(g32.enqueue_mxfp8_w8a8(stream, mxfp8(&qs, &e), &one, &act, 2, &mut y));
+            let bf16_only = {
+                let mut bf16 = GemmAct32::new(stream, 1, k)?.with_form(stream, MmaForm::Bf16)?;
+                g32.enqueue_bf16_cols(stream, &one, 1, &mut bf16)?;
+                stale(g32.enqueue_mxfp8_w8a8(stream, mxfp8(&qs, &e), &one, &bf16, 1, &mut y))
+            };
+            let fresh = g32
+                .enqueue_mxfp8_w8a8(stream, mxfp8(&qs, &e), &one, &act, 1, &mut y)
+                .is_ok();
+            g32.enqueue_quantize_gemm32(stream, &two, 1, &mut act, gpu.unlabelled_sink())?;
+            let requantized =
+                stale(g32.enqueue_mxfp8_w8a8(stream, mxfp8(&qs, &e), &one, &act, 1, &mut y));
+            let words = DeviceBuffer::from_host(stream, &vec![0x3838_3838u32; rows * k / 4 + 1])?;
+            let shifted = DeviceTensor::<u32>::window_of(&words, 4, rows, k / 4)?;
+            g32.enqueue_mxfp8_cols(stream, &one, 1, &mut act)?;
+            let unaligned = matches!(
+                g32.enqueue_mxfp8_w8a8(stream, mxfp8(&shifted, &e), &one, &act, 1, &mut y),
+                Err(e) if e.to_string().contains("is not 16-byte aligned")
+            );
+            let short_k = matches!(
+                GemmAct32::new(stream, 1, 64)?.with_form(stream, MmaForm::Mxfp8),
+                Err(e) if e.to_string().contains("multiple of 128")
+            );
+            let pass = other_rows
+                && more_cols
+                && bf16_only
+                && fresh
+                && requantized
+                && unaligned
+                && short_k;
+            println!(
+                "gemm32 case=mxfp8_w8a8_refused other_rows={other_rows} more_cols={more_cols} \
+                 bf16_form_only={bf16_only} fresh_read={fresh} after_quantize={requantized} \
+                 unaligned_weight={unaligned} k_not_128={short_k} {}",
                 verdict(pass)
             );
             ok &= pass;
@@ -8330,6 +8678,7 @@ mod gate {
             ok &= remap_case(&dev)?;
             ok &= f32tile_case(&dev)?;
             ok &= dense_mma_case(&dev)?;
+            ok &= mxfp8_w8a8_case(&dev)?;
             ok &= refusals(&dev)?;
             println!("gemm32 wall_s={:.1}", t0.elapsed().as_secs_f64());
             Ok(ok)

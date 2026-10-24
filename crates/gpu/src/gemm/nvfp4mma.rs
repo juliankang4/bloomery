@@ -1,9 +1,20 @@
-//! FP4 tensor-core products over routed NVFP4 planes.
+//! Native block-scaled tensor-core products (sm_120a, sm_121a): FP4 over
+//! routed NVFP4 planes, and the dense MXFP8 W8A8 product over the
+//! activations' MXFP8 form on the shared MMA tile (`f32tile.rs`).
 
+use super::act32::ColsForm;
+use super::f32tile::{
+    Bf16Cols, Bf16Rows, ByteRows, MMA_THREADS, MmaCols, MmaRows, STAGE_FLOATS, STAGES, TileLaunch,
+    TileRows, bf16_mma_body, form_col, mma_fits, store_refused,
+};
 use super::{GemmAct32, GemmRoute};
 use crate::GpuError;
+use crate::q8f32::{E4m3Weight, Mxfp8Bytes};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, ptx_asm, thread, warp};
+use cuda_device::vector::F32x4;
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, ptx_asm, thread, warp,
+};
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
@@ -396,6 +407,216 @@ macro_rules! nvfp4_walk {
             step += 1;
         }
     }};
+}
+
+/// An MXFP8 weight's planes, staged as stored for the native W8A8 tile. Its
+/// units are E4M3 value pairs, so a 16-byte piece copies sixteen values as a
+/// BF16 weight's words are copied; the exact owner decodes them as
+/// [`ByteRows`] does.
+#[derive(Clone, Copy)]
+struct Mxfp8Rows<'a> {
+    qs: &'a [u32],
+    e: &'a [u32],
+}
+
+impl TileRows for Mxfp8Rows<'_> {
+    #[inline(always)]
+    unsafe fn stage(self, dst: *mut f32, at: usize) {
+        // SAFETY: this fn's contract is ByteRows::stage's over the same planes.
+        unsafe { ByteRows::<Mxfp8Bytes>::new(self.qs, self.e).stage(dst, at) };
+    }
+}
+
+/// The scale word a piece checks when it does not start its row's 64-unit
+/// span: every byte in range.
+const UE8M0_FITS: u32 = 0x7f7f_7f7f;
+
+/// Whether every UE8M0 byte of `word` keeps each nonzero E4M3 value it
+/// scales normal and at most `2^47` ([`mma_fits`]): 10 to 165.
+#[inline(always)]
+fn ue8m0_fits(word: u32) -> bool {
+    (word & 255).wrapping_sub(10) <= 155
+        && ((word >> 8) & 255).wrapping_sub(10) <= 155
+        && ((word >> 16) & 255).wrapping_sub(10) <= 155
+        && (word >> 24).wrapping_sub(10) <= 155
+}
+
+impl MmaRows for Mxfp8Rows<'_> {
+    /// The scale word of the row's 64-unit span a piece starts, which
+    /// [`Self::land`] checks; [`UE8M0_FITS`] for the other pieces.
+    type Piece = u32;
+    const SCALED: bool = true;
+
+    #[inline(always)]
+    unsafe fn fetch(self, dst: *mut u32, at: usize) -> u32 {
+        // SAFETY: units at .. at + 8 are words at / 2 .. at / 2 + 4 of the
+        // value plane, laid out as a BF16 weight's (this fn's contract).
+        unsafe { Bf16Rows(self.qs).fetch(dst, at) };
+        if at.is_multiple_of(64) {
+            // SAFETY: the span starts inside the weight's rows.
+            unsafe { self.scale_word(at) }
+        } else {
+            UE8M0_FITS
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn land(word: u32, _: *mut u32, _: usize) -> bool {
+        ue8m0_fits(word)
+    }
+
+    #[inline(always)]
+    unsafe fn landed_fits(_: *const u32) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    unsafe fn scale_word(self, at: usize) -> u32 {
+        // SAFETY: a row of K values holds K / 128 scale words, the 64-unit
+        // span at / 64's among them (this fn's contract).
+        unsafe { *self.e.get_unchecked(at / 64) }
+    }
+
+    #[inline(always)]
+    unsafe fn mma(
+        acc: [f32; 4],
+        a: [u32; 4],
+        b: [u32; 2],
+        sa: u32,
+        sb: u32,
+        ta: usize,
+        tb: usize,
+    ) -> [f32; 4] {
+        let (d0, d1, d2, d3): (f32, f32, f32, f32);
+        // The selectors are immediates: one instruction a pair of quad lanes,
+        // `ta` and `tb` constants where the tile unrolls its calls.
+        macro_rules! selected {
+            ($($sel:pat => $ta:literal $tb:literal),*) => {
+                match (ta & 1, tb & 3) {
+                    // SAFETY: every lane of the converged warp executes this
+                    // register-only instruction (this fn's contract).
+                    $($sel => unsafe {
+                        ptx_asm!(
+                            "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3.f32.ue8m0 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14, {0,%16}, %15, {0,%17};",
+                            out("=f") d0, out("=f") d1, out("=f") d2, out("=f") d3,
+                            in("r") a[0], in("r") a[1], in("r") a[2], in("r") a[3],
+                            in("r") b[0], in("r") b[1],
+                            in("f") acc[0], in("f") acc[1], in("f") acc[2], in("f") acc[3],
+                            in("r") sa, in("r") sb, in("C") $ta, in("C") $tb,
+                        );
+                    },)*
+                }
+            };
+        }
+        selected!(
+            (0, 0) => b"0\0" b"0\0", (0, 1) => b"0\0" b"1\0", (0, 2) => b"0\0" b"2\0", (0, 3) => b"0\0" b"3\0",
+            (1, 0) => b"1\0" b"0\0", (1, 1) => b"1\0" b"1\0", (1, 2) => b"1\0" b"2\0", _ => b"1\0" b"3\0"
+        );
+        [d0, d1, d2, d3]
+    }
+}
+
+/// The activations' MXFP8 form (`mxfp8_cols_body`): the E4M3 value pairs
+/// staged as [`Bf16Cols`]' words are, with its refusal words and the f32
+/// columns the replay reads, and the UE8M0 scale words, `K / 128` a column.
+#[derive(Clone, Copy)]
+struct Mxfp8Cols<'a> {
+    pairs: Bf16Cols<'a>,
+    e: &'a [u32],
+}
+
+impl MmaCols for Mxfp8Cols<'_> {
+    type Piece = ();
+    const SCALED: bool = true;
+
+    #[inline(always)]
+    fn exact(&self) -> &[f32] {
+        self.pairs.exact
+    }
+
+    #[inline(always)]
+    unsafe fn refused(self, c: usize) -> bool {
+        // SAFETY: this fn's contract.
+        unsafe { self.pairs.refused(c) }
+    }
+
+    #[inline(always)]
+    unsafe fn fetch(self, dst: *mut u32, at: usize) {
+        // SAFETY: this fn's contract, over the pairs' words.
+        unsafe { self.pairs.fetch(dst, at) };
+    }
+
+    #[inline(always)]
+    unsafe fn land(_: (), _: *mut u32) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    unsafe fn scale_word(self, at: usize) -> u32 {
+        // SAFETY: a column of K values holds K / 128 scale words, the 64-unit
+        // span at / 64's among them (this fn's contract).
+        unsafe { *self.e.get_unchecked(at / 64) }
+    }
+}
+
+/// The first `n` columns of `k` f32 values (`k` a multiple of 128) as
+/// [`Mxfp8Cols`]' planes: each 32-value block's scale exponent
+/// `ceil(log2(amax / 448))` as a UE8M0 byte, the block's values over that
+/// scale as E4M3 rounded to nearest even and saturated, and each column's
+/// refusal word ([`mma_fits`]). A warp walks its column 128 values at a
+/// time, eight lanes a block.
+///
+/// # Safety
+///
+/// x holds n aligned K-value columns, qs n·K/4 words, e n·K/128 and
+/// refused n.
+#[inline(always)]
+unsafe fn mxfp8_cols_body(
+    x: &[f32],
+    k: u32,
+    n: u32,
+    qs: &mut DisjointSlice<u32>,
+    e: &mut DisjointSlice<u32>,
+    refused: &mut DisjointSlice<u32>,
+) {
+    use cuda_device::convert::cvt_rn_satfinite_e4m3x2_f32;
+    let (k, n) = (k as usize, n as usize);
+    let c = form_col();
+    let lane = warp::lane_id() as usize;
+    let mut fits = true;
+    if c < n {
+        let mut span = 0;
+        while span < k / 128 {
+            let at = c * k + 128 * span + 4 * lane;
+            // SAFETY: values at .. at + 4 lie in column c of x, 16-byte
+            // aligned (this fn's contract).
+            let v = unsafe { (*x.as_ptr().add(at).cast::<F32x4>()).0 };
+            fits &= mma_fits(v[0]) & mma_fits(v[1]) & mma_fits(v[2]) & mma_fits(v[3]);
+            let mut amax = v[0].abs().max(v[1].abs()).max(v[2].abs()).max(v[3].abs());
+            amax = amax.max(warp::shuffle_xor_f32(amax, 1));
+            amax = amax.max(warp::shuffle_xor_f32(amax, 2));
+            amax = amax.max(warp::shuffle_xor_f32(amax, 4));
+            let bits = (amax * (1.0 / 448.0)).to_bits();
+            let exp = ((bits >> 23) + u32::from(bits & 0x7f_ffff != 0)).clamp(1, 254);
+            let inv = f32::from_bits((254 - exp) << 23);
+            let lo = u32::from(cvt_rn_satfinite_e4m3x2_f32(v[0] * inv, v[1] * inv));
+            let hi = u32::from(cvt_rn_satfinite_e4m3x2_f32(v[2] * inv, v[3] * inv));
+            // SAFETY: word at / 4 is this lane's own.
+            unsafe { *qs.get_unchecked_mut(at / 4) = lo | (hi << 16) };
+            // Lanes 0, 8, 16 and 24 hold the span's four block scales.
+            let word = warp::shuffle(exp, 0)
+                | (warp::shuffle(exp, 8) << 8)
+                | (warp::shuffle(exp, 16) << 16)
+                | (warp::shuffle(exp, 24) << 24);
+            if lane == 0 {
+                // SAFETY: lane 0 of column c's warp is the span's only writer.
+                unsafe { *e.get_unchecked_mut(at / 128) = word };
+            }
+            span += 1;
+        }
+    }
+    // SAFETY: c is this warp's column (this fn's contract).
+    unsafe { store_refused(refused, c, n, fits) };
 }
 
 #[cuda_module]
@@ -947,6 +1168,89 @@ mod native {
             item += 32;
         }
     }
+
+    /// The MXFP8 form of `n` f32 columns of `k` values (`act32.rs`'s
+    /// `enqueue_mxfp8_cols`): their E4M3 codes, UE8M0 scale words and
+    /// refusal words.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            n >= 1,
+            x.len() >= n * k,
+            4 * qs.len() >= n * k,
+            128 * e.len() >= n * k,
+            refused.len() >= n
+        )
+    )]
+    pub fn mxfp8_cols(
+        x: &[f32],
+        k: u32,
+        n: u32,
+        mut qs: DisjointSlice<u32>,
+        mut e: DisjointSlice<u32>,
+        mut refused: DisjointSlice<u32>,
+    ) {
+        // SAFETY: the checked launch supplies aligned columns, K a multiple
+        // of 128 (the form's room) and the spans in the contract.
+        unsafe { mxfp8_cols_body(x, k, n, &mut qs, &mut e, &mut refused) };
+    }
+
+    /// Dense MXFP8 prompt product, W8A8 on block-scaled tensor cores: the
+    /// weight's planes `qs` and `e` as stored against the activations' MXFP8
+    /// form (`xq`, `xe` and `refused`, [`mxfp8_cols`]), with the f32 columns
+    /// `x` the replay reads.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            rows >= 1,
+            n >= 1,
+            4 * qs.len() >= rows * k,
+            128 * e.len() >= rows * k,
+            x.len() >= n * k,
+            4 * xq.len() >= n * k,
+            128 * xe.len() >= n * k,
+            refused.len() >= n,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn mxfp8_w8a8_gemm(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        xq: &[u32],
+        xe: &[u32],
+        refused: &[u32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        let cols = Mxfp8Cols {
+            pairs: Bf16Cols {
+                words: xq,
+                refused,
+                exact: x,
+            },
+            e: xe,
+        };
+        // SAFETY: the checked launch supplies 256 converged threads, the grid,
+        // K a multiple of 128, 16-byte aligned planes and activation words and
+        // the spans in the contract.
+        unsafe { bf16_mma_body(Mxfp8Rows { qs, e }, cols, rows, k, n, &mut y, sh) };
+    }
 }
 
 pub(super) struct Kernels {
@@ -1181,6 +1485,45 @@ impl Kernels {
             slot_div,
             rt,
             y,
+        )?;
+        Ok(())
+    }
+
+    /// The MXFP8 form of `n` f32 columns of `k` values of `x` into `form`
+    /// ([`native::mxfp8_cols`]) over the checked launch `cfg`.
+    pub(super) fn mxfp8_cols(
+        &self,
+        stream: &CudaStream,
+        cfg: LaunchConfig1D,
+        x: &DeviceBuffer<f32>,
+        (k, n): (u32, u32),
+        form: &mut ColsForm,
+    ) -> Result<(), GpuError> {
+        let prep = self.module.prepare_mxfp8_cols(cfg)?;
+        let (qs, e) = (&mut form.words, &mut form.scales);
+        self.module
+            .mxfp8_cols(stream, &prep, x, k, n, qs, e, &mut form.refused)?;
+        Ok(())
+    }
+
+    /// The W8A8 product of the MXFP8 weight `w` and `form`, the MXFP8 form of
+    /// `x`'s columns, over the checked tile launch `t`
+    /// ([`native::mxfp8_w8a8_gemm`]).
+    pub(super) fn mxfp8_w8a8(
+        &self,
+        stream: &CudaStream,
+        w: E4m3Weight<'_>,
+        x: &DeviceBuffer<f32>,
+        form: &ColsForm,
+        t: &TileLaunch,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
+        let prep = self.module.prepare_mxfp8_w8a8_gemm(cfg)?;
+        let (qs, e) = (w.qs.buf(), w.e.buf());
+        let (xq, xe, refused) = (&form.words, &form.scales, &form.refused);
+        self.module.mxfp8_w8a8_gemm(
+            stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, y,
         )?;
         Ok(())
     }

@@ -167,7 +167,7 @@ use crate::flash_gqa::GqaFoldArgs;
 use crate::flash_gqa_prefill::GqaPrefillArgs;
 use crate::gemm::{
     GateUp32Args, Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute,
-    GemmWeight,
+    GemmWeight, MmaForm,
 };
 use crate::hc_gated::{Before, HcMatrix, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::head::Head;
@@ -794,8 +794,8 @@ pub(super) fn down_weight<'a>(
 /// GEMM's where that GEMM reads the card gate and up. The plan counts a run
 /// of the q8_1 form, the larger (`place::CARD_ROUTE_RUN_TOKEN_BYTES`).
 enum RouteX {
-    Q8_1(GemmAct),
-    Blocks32(GemmAct32),
+    Q8_1(Box<GemmAct>),
+    Blocks32(Box<GemmAct32>),
 }
 
 /// A layer's gate and up as the route's GEMMs read them ([`StackW::route`]),
@@ -953,14 +953,14 @@ impl CardRoute38 {
             ids: DeviceBuffer::zeroed(stream, slots)?,
             sel: DeviceBuffer::zeroed(stream, kept)?,
             x: if card.blocks32_gate_up() {
-                RouteX::Blocks32(GemmAct32::new_routed_for(
+                RouteX::Blocks32(Box::new(GemmAct32::new_routed_for(
                     stream,
                     run,
                     geo::HIDDEN,
                     card.routed_types().map(|(gate, _)| gate),
-                )?)
+                )?))
             } else {
-                RouteX::Q8_1(GemmAct::new(stream, run, geo::HIDDEN)?)
+                RouteX::Q8_1(Box::new(GemmAct::new(stream, run, geo::HIDDEN)?))
             },
             g: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
             u: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
@@ -1443,9 +1443,9 @@ pub(super) struct Wide38 {
     /// split walk, at most half of them.
     dense: Vec<GemmRoute>,
     /// q8 of the model-width rows (a mix's output, the PLE rows, the shared
-    /// expert's input), with their BF16 form when a BF16 site on the dense
-    /// MMA tile reads them, of the attention-width rows (the output
-    /// projections' input), and of the shared expert's SwiGLU.
+    /// expert's input), of the attention-width rows (the output projections'
+    /// input), and of the shared expert's SwiGLU, each with room for the
+    /// [`WideForms`] its sites read.
     act_hid: GemmAct32,
     act_attn: GemmAct32,
     act_ff: GemmAct32,
@@ -1475,12 +1475,59 @@ pub(super) struct Wide38 {
     split_costs: SplitCosts,
 }
 
+/// The [`MmaForm`]s the walk's model-width, attention-width and SwiGLU rows
+/// hold room for ([`Wide38::new`]): on a card that reserves them, those a
+/// site that reads the rows copies on the dense MMA tile
+/// ([`site::reads_form`]). The BF16 form is the model-width rows' alone,
+/// whose rounding the ubatch's BF16 sites share; an MXFP8 site's W8A8
+/// product reads its rows' MXFP8 form wherever they are.
+pub(super) struct WideForms {
+    hid: Vec<MmaForm>,
+    attn: Vec<MmaForm>,
+    ff: Vec<MmaForm>,
+}
+
+impl WideForms {
+    /// The forms the sites of `plans` read in `w`, none unless `reserved`.
+    pub(super) fn of(
+        gpu: &crate::Gpu,
+        w: &crate::weights::Weights,
+        plans: &[Layer38],
+        reserved: bool,
+    ) -> WideForms {
+        let read = |sites: &[&str], forms: &[MmaForm]| -> Vec<MmaForm> {
+            let read = |f: &MmaForm| reserved && site::reads_form(gpu, w, sites, *f);
+            forms.iter().copied().filter(read).collect()
+        };
+        let hid: Vec<&str> = plans.iter().flat_map(Layer38::hidden_sites).collect();
+        let attn: Vec<&str> = plans.iter().map(Layer38::attn_site).collect();
+        let ff: Vec<&str> = plans.iter().map(|p| &*p.ffn.down_sh).collect();
+        WideForms {
+            hid: read(&hid, &[MmaForm::Bf16, MmaForm::Mxfp8]),
+            attn: read(&attn, &[MmaForm::Mxfp8]),
+            ff: read(&ff, &[MmaForm::Mxfp8]),
+        }
+    }
+}
+
+/// A [`GemmAct32`] of `cols` columns of `k` values with room for `forms`.
+fn act_with(
+    stream: &CudaStream,
+    (cols, k): (usize, usize),
+    forms: &[MmaForm],
+) -> Result<GemmAct32, GpuError> {
+    forms
+        .iter()
+        .try_fold(GemmAct32::new(stream, cols, k)?, |act, &f| {
+            act.with_form(stream, f)
+        })
+}
+
 impl Wide38 {
     /// The walk's own buffers for units of up to `rows` rows over `card`'s
-    /// card experts, the model-width rows' BF16 form with `bf16_hid`: the
-    /// card route's buffers for runs of `route_run` tokens beside them when a
-    /// layer has card experts, made for an expert tier's join when `tiered`;
-    /// the walks
+    /// card experts, the activations' room for `forms`: the card route's
+    /// buffers for runs of `route_run` tokens beside them when a layer has
+    /// card experts, made for an expert tier's join when `tiered`; the walks
     /// cut by the width rule on a load with no expert tier, as one unit on
     /// one with it ([`Wide38::paged`] for an NVMe-paged plan). Load-time
     /// only.
@@ -1490,7 +1537,7 @@ impl Wide38 {
         route_run: usize,
         card: &Card38,
         tiered: bool,
-        bf16_hid: bool,
+        forms: &WideForms,
     ) -> Result<Wide38, GpuError> {
         let geometry = Geometry::new(geo::STREAMS as u32, geo::RANK as u32, geo::HIDDEN as u32)
             .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
@@ -1511,12 +1558,9 @@ impl Wide38 {
         Ok(Wide38 {
             rows,
             dense,
-            act_hid: match GemmAct32::new(stream, rows, geo::HIDDEN)? {
-                act if bf16_hid => act.with_bf16(stream)?,
-                act => act,
-            },
-            act_attn: GemmAct32::new(stream, rows, geo::ATTN)?,
-            act_ff: GemmAct32::new(stream, rows, geo::FF)?,
+            act_hid: act_with(stream, (rows, geo::HIDDEN), &forms.hid)?,
+            act_attn: act_with(stream, (rows, geo::ATTN), &forms.attn)?,
+            act_ff: act_with(stream, (rows, geo::FF), &forms.ff)?,
             hc: HcWideScratch::new(stream, geometry, rows)?,
             ids: DeviceBuffer::zeroed(stream, rows * slots)?,
             weights: DeviceBuffer::zeroed(stream, rows * slots)?,
@@ -1635,8 +1679,8 @@ fn dense_kernels<'a>(c: &Ctx38<'a>) -> WideKernels<'a> {
 }
 
 /// The forms of the first `m` columns of the f32 rows `rows` that any of
-/// `names` reads into `act`: the q8 for Q8_0 planes, the BF16 form for a BF16
-/// site on the dense MMA tile ([`site::resident_quantize`]).
+/// `names` reads into `act`: the q8 for Q8_0 planes, a [`MmaForm`] for a site
+/// on the dense MMA tile ([`site::resident_quantize`]).
 fn quantize_for(
     c: &Ctx38<'_>,
     names: &[&str],

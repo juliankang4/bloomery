@@ -279,14 +279,14 @@ pub enum PlaceError {
         u: u64,
         want: u64,
     },
-    /// The stage card's reserve for the model-width rows' BF16 form
-    /// ([`BF16_FORM_RESERVE`]) is not the one a load of ubatches of up to `u`
-    /// positions reads ([`bf16_form_bytes`]).
+    /// The stage card's reserve for the activations' MMA forms
+    /// ([`ACT_FORMS_RESERVE`]) is not the one a load of ubatches of up to `u`
+    /// positions reads ([`act_forms_bytes`]).
     #[error(
-        "card {card} reserves {got:?} B as \"{BF16_FORM_RESERVE}\"; a load of ubatches of up to \
+        "card {card} reserves {got:?} B as \"{ACT_FORMS_RESERVE}\"; a load of ubatches of up to \
          {u} positions reads no such row or one of at least {want} B"
     )]
-    Bf16FormReserve {
+    ActFormsReserve {
         card: String,
         got: Vec<u64>,
         u: u64,
@@ -1353,29 +1353,32 @@ pub fn card_route_run(card: &Card, u: u64, tiered: bool) -> Result<(u64, u64), P
     })
 }
 
-/// What a stage card's reserve for the ubatch walk's model-width rows in
-/// BF16 is called ([`machine_for_experts`]): the form a load on GB10's dense
-/// MMA tile rounds once for its BF16 sites. A load reads it from the row
-/// ([`bf16_form_bytes`]).
-const BF16_FORM_RESERVE: &str = "model-width rows' BF16 form";
+/// What a stage card's reserve for the ubatch walk's activations in the
+/// forms GB10's dense MMA tile copies is called ([`machine_for_experts`]):
+/// the model-width rows rounded once to BF16 for their BF16 sites, and the
+/// model-width, attention-width and SwiGLU rows in MXFP8 for their MXFP8
+/// sites' W8A8 products. A load reads it from the row ([`act_forms_bytes`]).
+const ACT_FORMS_RESERVE: &str = "activations' MMA forms";
 
-/// Card bytes a position of the ubatch walk's model-width rows holds in
-/// [`BF16_FORM_RESERVE`] [derived: 2,560 BF16 values, 5,120 B, and a refusal
-/// word].
-const BF16_FORM_TOKEN_BYTES: u64 = 5_124;
+/// Card bytes a position of the ubatch walk holds in [`ACT_FORMS_RESERVE`]
+/// [derived: the model-width row's BF16 form, 2,560 values at 2 B and a
+/// refusal word, 5,124 B; the MXFP8 forms of the model-width, attention-width
+/// and SwiGLU rows, 2,560, 6,144 and 640 values at a byte, a scale byte per
+/// 32 values and a refusal word each, 2,644, 6,340 and 664 B].
+const ACT_FORMS_TOKEN_BYTES: u64 = 5_124 + 2_644 + 6_340 + 664;
 
 /// The bytes `card`, the stage card of a load's plan, sets aside for the
-/// model-width rows' BF16 form of ubatches of up to `u` positions: its
-/// [`BF16_FORM_RESERVE`] row, or 0 on a card without one, whose load
-/// rounds the rows in each tile instead. Refused by name: more than one such
-/// row, or one of fewer than `u` · [`BF16_FORM_TOKEN_BYTES`].
-pub fn bf16_form_bytes(card: &Card, u: u64) -> Result<u64, PlaceError> {
-    let got = reserve_rows(card, BF16_FORM_RESERVE);
-    let want = u * BF16_FORM_TOKEN_BYTES;
+/// activations' MMA forms of ubatches of up to `u` positions: its
+/// [`ACT_FORMS_RESERVE`] row, or 0 on a card without one, whose load
+/// converts the f32 rows in each tile instead. Refused by name: more than
+/// one such row, or one of fewer than `u` · [`ACT_FORMS_TOKEN_BYTES`].
+pub fn act_forms_bytes(card: &Card, u: u64) -> Result<u64, PlaceError> {
+    let got = reserve_rows(card, ACT_FORMS_RESERVE);
+    let want = u * ACT_FORMS_TOKEN_BYTES;
     match *got.as_slice() {
         [] => Ok(0),
         [b] if b >= want => Ok(b),
-        _ => Err(PlaceError::Bf16FormReserve {
+        _ => Err(PlaceError::ActFormsReserve {
             card: card.name.clone(),
             got,
             u,
@@ -1443,10 +1446,11 @@ pub fn machine(card: CardSpec, layers: usize, ubatch: u64) -> Machine {
 /// [`Experts::Card`] the ubatch walk's card route scratch
 /// ([`card_route_scratch_bytes`]) is counted beside the ubatch's — the walk
 /// holds those buffers when the plan puts experts on the card. A unified
-/// card's stage reserves the model-width rows' BF16 form
-/// ([`BF16_FORM_RESERVE`]): GB10's dense MMA tile reads it, and the plan sees
-/// the pool, not the compute capability, so another unified card's load
-/// leaves the row unread. A discrete card reserves none.
+/// card's stage reserves the activations' MMA forms
+/// ([`ACT_FORMS_RESERVE`]): GB10's dense MMA tile reads them, and the plan
+/// sees the pool, not the compute capability or the sites' formats, so
+/// another unified card's load, or a load with no site of a form, leaves
+/// those bytes unread. A discrete card reserves none.
 #[must_use]
 pub fn machine_for_experts(
     card: CardSpec,
@@ -1461,8 +1465,8 @@ pub fn machine_for_experts(
     let mut machine = workstation::placed_on(card, layers, card_scratch_bytes(ubatch) + route);
     if card.integrated {
         machine.cards[0].reserves.push((
-            BF16_FORM_RESERVE.to_string(),
-            ubatch * BF16_FORM_TOKEN_BYTES,
+            ACT_FORMS_RESERVE.to_string(),
+            ubatch * ACT_FORMS_TOKEN_BYTES,
         ));
     }
     machine
@@ -4522,13 +4526,15 @@ mod tests {
         }
     }
 
-    /// A unified card's stage reserves the model-width rows' BF16 form for
-    /// the ubatch its machine is made for, 5,124 B a position, which a load
+    /// A unified card's stage reserves the activations' MMA forms for the
+    /// ubatch its machine is made for, 14,772 B a position, which a load
     /// reads at that ubatch or a smaller one; a discrete card reserves none,
     /// and its load reads 0. A short row and two rows are refused by name.
+    // PIN(2026-10-24): replaces a_unified_stage_reserves_the_bf16_form; the
+    // reserve now holds the MXFP8 forms beside the BF16 one.
     #[test]
-    fn a_unified_stage_reserves_the_bf16_form() {
-        use super::{BF16_FORM_RESERVE, Experts, PlaceError, bf16_form_bytes, machine_for_experts};
+    fn a_unified_stage_reserves_the_act_forms() {
+        use super::{ACT_FORMS_RESERVE, Experts, PlaceError, act_forms_bytes, machine_for_experts};
         use crate::placement::workstation::{A6000, CardSpec};
 
         let unified = CardSpec {
@@ -4540,24 +4546,24 @@ mod tests {
             let stage = machine_for_experts(unified, 48, ub, Experts::Card).cards[0].clone();
             assert_eq!(
                 stage.reserves,
-                vec![(BF16_FORM_RESERVE.to_string(), ub * 5_124)]
+                vec![(ACT_FORMS_RESERVE.to_string(), ub * 14_772)]
             );
             for at in [ub, ub / 2] {
-                assert_eq!(bf16_form_bytes(&stage, at).expect("the form"), ub * 5_124);
+                assert_eq!(act_forms_bytes(&stage, at).expect("the form"), ub * 14_772);
             }
             let discrete = machine_for_experts(A6000, 48, ub, Experts::Card).cards[0].clone();
             assert!(discrete.reserves.is_empty(), "{:?}", discrete.reserves);
-            assert_eq!(bf16_form_bytes(&discrete, ub).expect("no form"), 0);
+            assert_eq!(act_forms_bytes(&discrete, ub).expect("no form"), 0);
         }
         let mut card = machine_for_experts(unified, 48, 512, Experts::Card).cards[0].clone();
-        for rows in [vec![512 * 5_124 - 1], vec![512 * 5_124; 2]] {
+        for rows in [vec![512 * 14_772 - 1], vec![512 * 14_772; 2]] {
             card.reserves = rows
                 .iter()
-                .map(|&b| (BF16_FORM_RESERVE.to_string(), b))
+                .map(|&b| (ACT_FORMS_RESERVE.to_string(), b))
                 .collect();
-            match bf16_form_bytes(&card, 512) {
-                Err(PlaceError::Bf16FormReserve { got, u, want, .. }) => {
-                    assert_eq!((got, u, want), (rows, 512, 512 * 5_124));
+            match act_forms_bytes(&card, 512) {
+                Err(PlaceError::ActFormsReserve { got, u, want, .. }) => {
+                    assert_eq!((got, u, want), (rows, 512, 512 * 14_772));
                 }
                 other => panic!("{rows:?}: not refused: {other:?}"),
             }

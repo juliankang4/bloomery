@@ -208,6 +208,15 @@ impl Layer38 {
         sites.extend(self.ple.iter().flat_map(PlePlan::input_sites));
         sites
     }
+
+    /// The layer's site that reads attention-width rows: the mixer's output
+    /// projection.
+    pub(super) fn attn_site(&self) -> &str {
+        match &self.mixer {
+            Mixer38::Gdn(p) => &p.ssm_out,
+            Mixer38::Qsa(p) => &p.out,
+        }
+    }
 }
 
 /// The joined name of layer `l`'s β and α stack.

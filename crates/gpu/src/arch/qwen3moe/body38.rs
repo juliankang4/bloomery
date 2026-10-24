@@ -132,8 +132,8 @@ use super::swap38::{self, DEADLINE, LIVE_DELAY};
 use super::tier38::{TierSide38, open_tier};
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
-    Gemm38, PleRowsIn, STREAM_FLOOR, SplitWalk, Wide38, WideForce, WideParts, WideTaps, dense_rows,
-    route_taps_host,
+    Gemm38, PleRowsIn, STREAM_FLOOR, SplitWalk, Wide38, WideForce, WideForms, WideParts, WideTaps,
+    dense_rows, route_taps_host,
 };
 use crate::checkpoint::saved::{
     Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams,
@@ -1394,13 +1394,14 @@ impl Body38 {
     /// layer or a width the kernels do not take, a `ubatch` outside
     /// `1..=min(UBATCH, ctx)`, a ubatch arena past what the plan's
     /// scratch and reserves count, and a stage card reserve for the card
-    /// route's run or the model-width rows' BF16 form that the ubatch does
-    /// not read (`place::card_route_run`, `place::bf16_form_bytes`). The card
+    /// route's run or the activations' MMA forms that the ubatch does not
+    /// read (`place::card_route_run`, `place::act_forms_bytes`). The card
     /// route runs the whole ubatch at once on a card that reserves that run
-    /// (`place::widen_card_route`), else in runs of `ROUTE_ROWS` tokens. The
-    /// model-width rows' BF16 sites read the rows rounded once on a card that
-    /// reserves their form (`place::machine_for_experts`), else round them in
-    /// each tile.
+    /// (`place::widen_card_route`), else in runs of `ROUTE_ROWS` tokens. On a
+    /// card that reserves the activations' MMA forms
+    /// (`place::machine_for_experts`) the model-width rows' BF16 sites read
+    /// the rows rounded once and the MXFP8 sites their rows' MXFP8 form
+    /// ([`WideForms`]), else each tile converts the f32 rows.
     /// `file` is a GGUF split or a checkpoint folder ([`Model38`]); a
     /// folder's load is refused by name under a residency machine or with an
     /// MTP draft ([`Folder38`]).
@@ -1877,16 +1878,15 @@ impl Body38 {
         let tier = (!tiers.is_empty())
             .then(|| TierSide38::new(gpu, &map, cols))
             .transpose()?;
-        // The model-width rows' BF16 form takes the stage card's reserve for it.
-        let form = plan.machine.cards.first().map_or(Ok(0), |c| {
-            model::arch::qwen35moe::place::bf16_form_bytes(c, ub as u64)
+        // The activations' MMA forms take the stage card's reserve for them.
+        let forms = plan.machine.cards.first().map_or(Ok(0), |c| {
+            model::arch::qwen35moe::place::act_forms_bytes(c, ub as u64)
                 .map_err(|e| GpuError::shape(WHAT, e.to_string()))
         })?;
-        let hidden_sites: Vec<&str> = plans.iter().flat_map(Layer38::hidden_sites).collect();
-        let bf16_hid = form > 0 && crate::site::reads_bf16_cols(gpu, w, &hidden_sites);
-        let mut wide = Wide38::new(stream, ub, route_run, &card, tier.is_some(), bf16_hid)?;
+        let wide_forms = WideForms::of(gpu, w, &plans, forms > 0);
+        let mut wide = Wide38::new(stream, ub, route_run, &card, tier.is_some(), &wide_forms)?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
-        let counted = counted + form;
+        let counted = counted + forms;
         if wide_bytes > counted {
             return Err(GpuError::shape(
                 WHAT,

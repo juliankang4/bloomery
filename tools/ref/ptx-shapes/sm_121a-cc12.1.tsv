@@ -292,11 +292,13 @@ generate_ds41 moe_combine 0 0
 generate_ds41 mtp_input 0 0
 generate_ds41 mxfp4_gate_up_sel 0 0
 generate_ds41 mxfp4_gemv_sel 0 0
+generate_ds41 mxfp8_cols 0 0
 generate_ds41 mxfp8_gemv 0 0
 generate_ds41 mxfp8_gemv_ids 0 0
 generate_ds41 mxfp8_gemv_mcol 0 0
 generate_ds41 mxfp8_mma_gemm 0 0
 generate_ds41 mxfp8_tile_gemm 0 0
+generate_ds41 mxfp8_w8a8_gemm 0 0
 generate_ds41 nemotron_moe_router_240 0 0
 generate_ds41 nemotron_moe_router_240_pick 0 0
 generate_ds41 nemotron_moe_router_304 0 0

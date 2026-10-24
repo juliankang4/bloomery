@@ -60,9 +60,11 @@ cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,cl
 ```
 
 Recipes select `sm_121a` on a GB10 when `BLOOMERY_ARCH` is unset. This enables the existing native FP4 routed prompt
-path for NVFP4 and FP4-Local weights: both weights and activations use FP4 tensor cores. Other routed formats keep
-their activation format, and decode is unchanged. An explicit `BLOOMERY_ARCH` still overrides the detected target;
-set it when invoking recipes from a machine without the target GPU. Other machines keep the `sm_86` default.
+path for NVFP4 and FP4-Local weights: both weights and activations use FP4 tensor cores. Dense MXFP8 prompt products
+use FP8 tensor cores the same way: each block of 32 activation values is rounded once to E4M3 with a shared
+power-of-two scale. Other routed formats keep their activation format, and decode is unchanged. An explicit
+`BLOOMERY_ARCH` still overrides the detected target; set it when invoking recipes from a machine without the target
+GPU. Other machines keep the `sm_86` default.
 
 **Smallest first placement: everything on the card, no host tier, no NVMe tier.** Two ways in, both generic already:
 `--place a` is `Pick::Rank(0)`, "the largest visible card" (`crates/placement/src/placement/devices.rs:236-243`), and an

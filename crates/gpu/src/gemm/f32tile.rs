@@ -37,17 +37,22 @@
 //! GB10 prompt sites select [`bf16_mma_body`] for BF16 and E4M3 weights.
 //! It rounds activations and decoded weights to BF16 and accumulates in F32.
 //! A BF16 site whose input holds its columns already rounded
-//! ([`bf16_cols_body`], `GemmAct32::with_bf16`) copies those words instead,
-//! with the same bits.
+//! ([`bf16_cols_body`], `GemmAct32::with_form`) copies those words instead,
+//! with the same bits. On a native block-scaled build an MXFP8 site whose
+//! input holds its columns as E4M3 with UE8M0 scales a 32-value block runs
+//! the same tile on the planes as stored, W8A8 on the block-scaled MMA, and
+//! accumulates in F32 (`nvfp4mma.rs`: `mxfp8_cols_body`, `Mxfp8Rows`,
+//! `Mxfp8Cols`).
 //! A cell whose row or column stages an operand outside the tensor cores'
 //! range is recomputed by the exact F32 owner, in its exponent range and
 //! reduction order; every other cell keeps its MMA value, so a cell's bits
 //! depend on its own row and column alone. The exact tile entries stay
 //! available.
 
-use super::GemmAct32;
+use super::act32::ColsForm;
 use super::gemm32::{GEMM32_GROUP, raster32};
 use super::kernels32::Gemm32Kernels;
+use super::{GemmAct32, MmaForm};
 use crate::q8f32::{Bf16Words, ByteBlocks, E4m3Scales, E4m3Weight};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
@@ -497,7 +502,7 @@ fn mma_piece_at(line: usize, slot: usize) -> usize {
     clippy::manual_range_contains,
     reason = "the kernel's two compares on the bits; a RangeInclusive would move its PTX"
 )]
-fn mma_fits(v: f32) -> bool {
+pub(super) fn mma_fits(v: f32) -> bool {
     let bits = v.to_bits() & 0x7fff_ffff;
     bits == 0 || (bits >= 0x0080_0000 && bits <= 0x5700_0000)
 }
@@ -573,6 +578,47 @@ pub(crate) trait MmaRows: TileRows {
         // SAFETY: this fn's contract.
         let [a, b, c, d] = unsafe { (*dst.cast::<U32x4>()).0 };
         mma_fits_bf16x2(a) & mma_fits_bf16x2(b) & mma_fits_bf16x2(c) & mma_fits_bf16x2(d)
+    }
+
+    /// Whether the tile's staged 16-bit units are E4M3 value pairs with one
+    /// UE8M0 scale a 32-value block ([`Self::scale_word`], [`Self::mma`]),
+    /// not BF16 values. The activations' [`MmaCols::SCALED`] must agree.
+    const SCALED: bool = false;
+
+    /// For a scaled weight, the word holding the four block scales of the
+    /// 64 units (128 values) of a row that start at unit `at`, a multiple of
+    /// 64; 0 otherwise.
+    ///
+    /// # Safety
+    ///
+    /// The units lie inside the weight's rows.
+    #[inline(always)]
+    unsafe fn scale_word(self, _at: usize) -> u32 {
+        0
+    }
+
+    /// One tensor-core step on a row fragment `a` and a column fragment `b`
+    /// of 16 units each: BF16 `m16n8k16`, or for a scaled weight E4M3
+    /// `m16n8k32` whose block scales are the low bytes of `sa` and `sb` in
+    /// the lanes of each quad that `ta` (A: lanes `2·ta` and `2·ta + 1`, rows
+    /// g and g + 8) and `tb` (B: lane `tb`, column g) name.
+    ///
+    /// # Safety
+    ///
+    /// Every lane of the warp calls it converged, `a` row-major and `b`
+    /// column-major in the instruction's fragment layout.
+    #[inline(always)]
+    unsafe fn mma(
+        acc: [f32; 4],
+        a: [u32; 4],
+        b: [u32; 2],
+        _sa: u32,
+        _sb: u32,
+        _ta: usize,
+        _tb: usize,
+    ) -> [f32; 4] {
+        // SAFETY: this fn's contract.
+        unsafe { mma_m16n8k16_f32_bf16(acc, a, b) }
     }
 }
 
@@ -716,6 +762,23 @@ pub(crate) trait MmaCols: Copy {
     ///
     /// `piece` is one [`Self::fetch`]'s, and `dst` is its 16 bytes.
     unsafe fn land(piece: Self::Piece, dst: *mut u32) -> bool;
+
+    /// Whether the staged units are E4M3 value pairs with one UE8M0 scale a
+    /// 32-value block ([`Self::scale_word`]); the weight's
+    /// [`MmaRows::SCALED`] must agree.
+    const SCALED: bool = false;
+
+    /// For scaled columns, the word holding the four block scales of the 64
+    /// units (128 values) of a column that start at unit `at`, a multiple of
+    /// 64; 0 otherwise.
+    ///
+    /// # Safety
+    ///
+    /// The units lie inside a live column.
+    #[inline(always)]
+    unsafe fn scale_word(self, _at: usize) -> u32 {
+        0
+    }
 }
 
 /// F32 activations, loaded a piece at a time and rounded as they are staged.
@@ -790,8 +853,9 @@ impl MmaCols for Bf16Cols<'_> {
     }
 }
 
-/// Threads of a [`bf16_cols_body`] block: a warp a column.
-pub(crate) const BF16_COLS_THREADS: u32 = 256;
+/// Threads of a [`bf16_cols_body`] or `nvfp4mma::mxfp8_cols_body` block: a
+/// warp a column.
+pub(crate) const FORM_THREADS: u32 = 256;
 
 /// The first `n` columns of `k` f32 values (`k` a multiple of 8) as
 /// [`Bf16Cols`]' words, each value rounded exactly as [`land_values`] rounds
@@ -810,8 +874,7 @@ pub(crate) unsafe fn bf16_cols_body(
     refused: &mut DisjointSlice<u32>,
 ) {
     let (k, n) = (k as usize, n as usize);
-    let c = thread::blockIdx_x() as usize * (BF16_COLS_THREADS as usize / 32)
-        + thread::threadIdx_x() as usize / 32;
+    let c = form_col();
     let lane = warp::lane_id() as usize;
     let mut fits = true;
     if c < n {
@@ -825,8 +888,32 @@ pub(crate) unsafe fn bf16_cols_body(
             piece += 32;
         }
     }
+    // SAFETY: c is this warp's column (this fn's contract).
+    unsafe { store_refused(refused, c, n, fits) };
+}
+
+/// The column a form block's warp writes: block `b`'s warp `w`, `8b + w`.
+#[inline(always)]
+pub(super) fn form_col() -> usize {
+    thread::blockIdx_x() as usize * (FORM_THREADS as usize / 32)
+        + thread::threadIdx_x() as usize / 32
+}
+
+/// Column `c`'s refusal word: nonzero when a lane of its warp saw a value
+/// [`mma_fits`] refuses (`fits` false). Every lane of the warp calls it.
+///
+/// # Safety
+///
+/// `refused` holds `n` words, and `c` is this warp's column.
+#[inline(always)]
+pub(super) unsafe fn store_refused(
+    refused: &mut DisjointSlice<u32>,
+    c: usize,
+    n: usize,
+    fits: bool,
+) {
     let refuse = warp::any(!fits);
-    if c < n && lane == 0 {
+    if c < n && warp::lane_id() == 0 {
         // SAFETY: lane 0 of column c's warp is its word's only writer.
         unsafe { *refused.get_unchecked_mut(c) = u32::from(refuse) };
     }
@@ -1042,12 +1129,18 @@ impl MmaTile {
 /// refuses; [`MmaTile::needs_replay`] marks the cells of those rows and
 /// columns for the exact owner.
 ///
+/// The tile counts K in 16-bit units: BF16 values, or for scaled operands
+/// ([`MmaRows::SCALED`]) E4M3 value pairs, whose steps are block-scaled
+/// `m16n8k32` products ([`MmaRows::mma`]) and whose threads hold, a stage
+/// pair at a time, the scale words of the rows and columns their fragments
+/// supply scales for.
+///
 /// # Safety
 ///
-/// All 256 threads call converged. Rows and n are positive, K is a positive
-/// multiple of 64, x holds n aligned K-value columns and w holds rows*K values
-/// ([`MmaRows::fetch`]'s bound). The grid covers 128 by 128 output tiles. sh
-/// holds STAGES*STAGE_FLOATS aligned shared values.
+/// All 256 threads call converged. Rows and n are positive, K (in units) is a
+/// positive multiple of 64, x holds n aligned K-unit columns and w holds
+/// rows*K units ([`MmaRows::fetch`]'s bound). The grid covers 128 by 128
+/// output tiles. sh holds STAGES*STAGE_FLOATS aligned shared values.
 #[inline(always)]
 #[allow(
     clippy::needless_range_loop,
@@ -1069,6 +1162,7 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
     let Some((row0, col0)) = mma_tile_origin::<W>(rows, n) else {
         return None;
     };
+    const { assert!(W::SCALED == X::SCALED) };
     let tid = thread::threadIdx_x() as usize;
     let lane = warp::lane_id() as usize;
     let warp = tid / 32;
@@ -1097,6 +1191,34 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
         mma_piece_at(line + MMA_PASS_LINES, slot),
     ];
     let x_dst = [MMA_COLS_AT + w_dst[0], MMA_COLS_AT + w_dst[1]];
+
+    // A scaled step's block scales, from the quad lane each MMA's selectors
+    // name (MmaRows::mma): lane q of a quad holds in `sa[p]` the scale word
+    // of row g + 8(q % 2) of 16-row tile 2p + q / 2, and in `sb` that of
+    // column g of 8-column tile q. One word a row or column holds the four
+    // blocks of a stage pair, loaded after the products of the pair before it.
+    let g = lane / MMA_ROW_LANES;
+    let q = lane % MMA_ROW_LANES;
+    let mut sa = [0u32; 2];
+    let mut sb = 0u32;
+    macro_rules! scale_words {
+        ($s:expr) => {{
+            if W::SCALED {
+                for p in 0..2 {
+                    thread::__unroll_config::<0>();
+                    let r = (row0 + wr + 16 * (2 * p + q / 2) + g + 8 * (q % 2)).min(rows - 1);
+                    // SAFETY: stage $s < stages starts a stage pair of the
+                    // clamped row, inside the operands.
+                    sa[p] = unsafe { w.scale_word(r * kk + $s * MMA_LINE) };
+                }
+                let c = (col0 + wc + 8 * q + g).min(n - 1);
+                // SAFETY: stage $s < stages starts a stage pair of the
+                // clamped live column, inside the activations.
+                sb = unsafe { x.scale_word(c * kk + $s * MMA_LINE) };
+            }
+        }};
+    }
+    scale_words!(0);
 
     // Bit i (2 + i) is set once this thread stages a value of its weight
     // (activation) line i that fails mma_fits.
@@ -1166,6 +1288,8 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
                     unsafe { cp_async_commit_group() };
                 }
                 let half = 8 * step;
+                // A scaled step's block, 2s + step, is this byte of the pair's words.
+                let shift = (8 * (2 * (s % 2) + step)) as u32;
                 // Both column fragments first; then one row fragment at a time,
                 // so the warp holds twelve fragment words, not twenty.
                 let mut b = [[0u32; 4]; 2];
@@ -1184,9 +1308,11 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
                     for j in 0..4 {
                         thread::__unroll_config::<0>();
                         let b = [b[j / 2][2 * (j % 2)], b[j / 2][2 * (j % 2) + 1]];
+                        let (sa, sb) = (sa[mi / 2] >> shift, sb >> shift);
                         // SAFETY: the whole warp is converged; A is row-major and
-                        // B column-major in the m16n8k16 fragment layout.
-                        acc[mi][j] = unsafe { mma_m16n8k16_f32_bf16(acc[mi][j], a, b) };
+                        // B column-major in the step's fragment layout, and lanes
+                        // mi % 2 (A) and j (B) of each quad hold their scales.
+                        acc[mi][j] = unsafe { W::mma(acc[mi][j], a, b, sa, sb, mi % 2, j) };
                     }
                 }
                 if step == 1 {
@@ -1208,6 +1334,9 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
                     let fits = unsafe { W::land(piece, next.wrapping_add(w_dst[step]), at) };
                     bad |= u32::from(!fits) << step;
                 }
+            }
+            if s % 2 == 1 && s + 1 < stages {
+                scale_words!(s + 1);
             }
         }};
     }
@@ -1235,7 +1364,7 @@ pub(crate) unsafe fn bf16_mma_tile<W: MmaRows, X: MmaCols>(
 }
 
 /// Dense prompt product whose cells of an exceptional row or column replay on
-/// the exact owner.
+/// the exact owner. K counts values; a scaled tile's units are value pairs.
 ///
 /// # Safety
 /// The checked launch supplies 256 converged threads, aligned stages and x,
@@ -1250,13 +1379,14 @@ pub(crate) unsafe fn bf16_mma_body<W: MmaRows, X: MmaCols>(
     y: &mut DisjointSlice<f32>,
     sh: *mut f32,
 ) {
+    let units = if W::SCALED { k / 2 } else { k };
     // SAFETY: the wrapper's spans and launch satisfy the tile's contract.
-    let Some(mut tile) = (unsafe { bf16_mma_tile(w, x, rows, k, n, sh) }) else {
+    let Some(mut tile) = (unsafe { bf16_mma_tile(w, x, rows, units, n, sh) }) else {
         return;
     };
     let (rows, k, n) = (rows as usize, k as usize, n as usize);
     // SAFETY: all threads share the original staging allocation and K.
-    if unsafe { tile.needs_replay(sh, k) } {
+    if unsafe { tile.needs_replay(sh, units as usize) } {
         // SAFETY: the checked output belongs to this tile.
         unsafe { tile.store::<true>(y, rows, n) };
         // Publishes the marked stores and retires the flags' readers.
@@ -1389,16 +1519,7 @@ impl Gemm32Kernels {
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_bf16_mma_cols";
         let t = bf16_mma_launch(what, w, x, n, y)?;
-        if act.k() != t.k as usize {
-            return Err(GpuError::shape(
-                what,
-                format!("act holds {} values a column, the weight {}", act.k(), t.k),
-            ));
-        }
-        let form = act.bf16_of(x, n).ok_or(GpuError::state(
-            what,
-            "act's BF16 form of x's first n columns (Gemm32Kernels::enqueue_bf16_cols)",
-        ))?;
+        let form = held_form(what, act, MmaForm::Bf16, x, &t)?;
         let prep =
             self.module
                 .prepare_bf16_mma_cols_gemm(LaunchConfig1D::new(t.grid, MMA_THREADS, 0))?;
@@ -1417,6 +1538,93 @@ impl Gemm32Kernels {
         )?;
         Ok(())
     }
+
+    /// The W8A8 product of an MXFP8 weight's planes as stored over the MXFP8
+    /// form `act` holds of the first `n` columns of `x`
+    /// ([`Self::enqueue_mxfp8_cols`]): E4M3 operands with their UE8M0 block
+    /// scales on the block-scaled tensor cores, F32 accumulation, each
+    /// output's 32-value steps in increasing K. The cells of a row or column
+    /// that holds an operand outside the tensor cores' range replay on the
+    /// exact owner over `x`, as [`Self::enqueue_e4m3_mma`]'s do. The planes
+    /// must be MXFP8 and 16-byte aligned ([`mxfp8_w8a8_reads`]); another, or a
+    /// form of other rows or of fewer columns, is a named error, and so is a
+    /// build without the native block-scaled kernels. Asynchronous,
+    /// allocation-free, capturable.
+    #[cfg_attr(
+        not(bloomery_nvfp4_mma),
+        allow(unused_variables, reason = "the native build's launch reads them")
+    )]
+    pub fn enqueue_mxfp8_w8a8(
+        &self,
+        stream: &CudaStream,
+        w: E4m3Weight<'_>,
+        x: &DeviceBuffer<f32>,
+        act: &GemmAct32,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_mxfp8_w8a8";
+        let (rows, k) = w.dimensions(what)?;
+        if w.scales != E4m3Scales::Mxfp8 {
+            return Err(GpuError::shape(
+                what,
+                format!("the weight's scales are {:?}, not MXFP8's", w.scales),
+            ));
+        }
+        crate::tensor::check_alignment::<U32x4, _>(what, "w.qs", w.qs.buf())?;
+        let t = mma_launch(what, rows, k, x, n, y)?;
+        let form = held_form(what, act, MmaForm::Mxfp8, x, &t)?;
+        #[cfg(bloomery_nvfp4_mma)]
+        return self.native.mxfp8_w8a8(stream, w, x, form, &t, y);
+        #[cfg(not(bloomery_nvfp4_mma))]
+        Err(GpuError::state(what, NATIVE_BUILD))
+    }
+}
+
+/// What a build without the native block-scaled kernels lacks for an MXFP8
+/// form or a W8A8 product.
+#[cfg(not(bloomery_nvfp4_mma))]
+pub(super) const NATIVE_BUILD: &str = "a native block-scaled build (sm_120a or sm_121a)";
+
+/// Whether an MXFP8 site's product runs on the native W8A8 tile
+/// ([`Gemm32Kernels::enqueue_mxfp8_w8a8`]): `w`'s planes are MXFP8 and
+/// 16-byte aligned, and `act` holds the MXFP8 form of the first `n` columns
+/// of `x`.
+#[must_use]
+pub(crate) fn mxfp8_w8a8_reads(
+    w: &E4m3Weight<'_>,
+    act: &GemmAct32,
+    x: &DeviceBuffer<f32>,
+    n: usize,
+) -> bool {
+    w.scales == E4m3Scales::Mxfp8
+        && w.qs.buf().cu_deviceptr().is_multiple_of(16)
+        && act.holds(MmaForm::Mxfp8, x, n)
+}
+
+/// `form` of `act` for a tile launch `t` over the first `t.n` columns of `x`:
+/// a scratch of another K is a named `Shape` error, a form of other rows or
+/// of fewer columns a named `State` error, as `what`'s.
+fn held_form<'a>(
+    what: &'static str,
+    act: &'a GemmAct32,
+    form: MmaForm,
+    x: &DeviceBuffer<f32>,
+    t: &TileLaunch,
+) -> Result<&'a ColsForm, GpuError> {
+    if act.k() != t.k as usize {
+        return Err(GpuError::shape(
+            what,
+            format!("act holds {} values a column, the weight {}", act.k(), t.k),
+        ));
+    }
+    act.form_of(form, x, t.n as usize).ok_or(GpuError::state(
+        what,
+        match form {
+            MmaForm::Bf16 => "act's BF16 form of x's first n columns (enqueue_bf16_cols)",
+            MmaForm::Mxfp8 => "act's MXFP8 form of x's first n columns (enqueue_mxfp8_cols)",
+        },
+    ))
 }
 
 /// Checked spans shared with the exact tile, with the MMA tile's grid.
