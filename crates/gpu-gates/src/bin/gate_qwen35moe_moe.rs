@@ -104,9 +104,12 @@
 //!   fused launch at m = 1, 5, 8 against `f32_gemv` over 513 rows then the
 //!   routing alone, and the ubatch pair over 70 against the fused launch
 //!   per token, all BIT-EQUAL. Then a BF16 weight's words (LCG values cut
-//!   to BF16): the fused launch at m = 1, 5, 8 and the ubatch pair over 70
-//!   BIT-EQUAL to the F32 entries over the same values widened.
-//! - `shape`: the nine entries compile with no local depot.
+//!   to BF16, a subnormal in one row and in one token's activations): the
+//!   fused launch at m = 1, 5, 8 and the ubatch pair over 70 BIT-EQUAL to
+//!   the F32 entries over the same values widened, or on a cc 12.1 device
+//!   to the dense MMA tile over the same words then the routing alone; the
+//!   ubatch pair BIT-EQUAL to the fused launch per token.
+//! - `shape`: the eleven entries compile with no local depot.
 //!
 //! Tiers (`BLOOMERY_TIER`): `shape`, `wide512`, `picks`, `join` and `routing`'s constructed ties read no set of ik's
 //! and run on either file (`tier::sc`). Every other case takes its inputs from ik's sets (the logits, `ffn_inp_normed`,
@@ -1275,19 +1278,33 @@ mod gate {
 
     /// The wide instance over a BF16 joined router weight, as Qwen3.8's
     /// checkpoint stores it and the card holds it (`DevWeight::Bf16`'s
-    /// words): LCG values cut to BF16, full mantissas, against the F32
-    /// entries over the same values widened. The fused launch at m = 1, 5, 8
-    /// and the ubatch pair over [`WIDE_UB`] tokens: logits, probabilities,
-    /// ids and weights BIT-EQUAL, the fused ticket count zero. Both launchers
-    /// refuse an activation row with only half the weight's values.
+    /// words): LCG values cut to BF16, full mantissas, with a subnormal in
+    /// router row 300 and in token 3's activations, values the tensor cores
+    /// refuse. The reference: on a device whose dense prompt products run on
+    /// BF16 tensor cores (compute capability 12.1) the dense MMA tile
+    /// (`enqueue_bf16_mma`, its refused row and column replayed on the exact
+    /// owner) over the same words and activations, then the routing alone
+    /// per token; on any other device the F32 entries over the same values
+    /// widened. The fused launch at m = 1, 5, 8 and the ubatch pair over
+    /// [`WIDE_UB`] tokens against it, and the ubatch pair against the fused
+    /// launch per token: logits, probabilities, ids and weights BIT-EQUAL,
+    /// the fused ticket count zero. Both launchers refuse an activation row
+    /// with only half the weight's values.
     fn wide_bf16(c: &Ctx) -> Result<bool, GateError> {
         let stream = c.stream();
         let sink = c.gpu.unlabelled_sink();
+        // PIN(2026-10-24): on a cc 12.1 device the BF16 entries run the dense
+        // MMA tile's arithmetic (activations rounded to BF16), so there the
+        // fused launch and the ubatch pair are held to that tile then the
+        // routing alone, not to the F32 entries over the widened values,
+        // which other devices keep.
+        let mma = bloomery_gpu::dense_mma(c.gpu.context())?;
         let mut s = 0x0b16_0512_u64;
         let mut val = |scale: f32| ((lcg(&mut s) % 4001) as f32 - 2000.0) * scale;
-        let halves: Vec<u32> = (0..WIDE_ROWS * WIDE_K)
+        let mut halves: Vec<u32> = (0..WIDE_ROWS * WIDE_K)
             .map(|_| val(1.3e-5).to_bits() >> 16)
             .collect();
+        halves[300 * WIDE_K + 7] = 0x0001;
         let wh: Vec<f32> = halves.iter().map(|&h| f32::from_bits(h << 16)).collect();
         let words: Vec<u32> = halves
             .as_chunks::<2>()
@@ -1295,19 +1312,23 @@ mod gate {
             .iter()
             .map(|[lo, hi]| lo | hi << 16)
             .collect();
-        let cols: Vec<f32> = (0..WIDE_UB * WIDE_K).map(|_| val(7.1e-4)).collect();
+        let mut cols: Vec<f32> = (0..WIDE_UB * WIDE_K).map(|_| val(7.1e-4)).collect();
+        cols[3 * WIDE_K + 11] = f32::from_bits(0x0000_1234);
         let w = DeviceTensor::upload(stream, &wh, WIDE_ROWS, WIDE_K)?;
         let wb = DeviceTensor::upload(stream, &words, WIDE_ROWS, WIDE_K / 2)?;
         let bf = RouterWeight::Bf16 { w: &wb };
+        let mut one = RouterOut::with_tokens(stream, wide()?, 1)?;
         let mut want = RouterOut::with_tokens(stream, wide()?, MAX_TOKENS)?;
         let mut got = RouterOut::with_tokens(stream, wide()?, MAX_TOKENS)?;
+        let mut ub_want = RouterOut::for_ubatch(stream, wide()?, WIDE_UB)?;
+        let mut ub_got = RouterOut::for_ubatch(stream, wide()?, WIDE_UB)?;
         let short = DeviceBuffer::from_host(stream, &cols[..WIDE_K / 2])?;
         let fused = c
             .router
             .enqueue_fused(stream, bf, &short, 1, sink, &mut got);
         let ubatch = c
             .router
-            .enqueue_ubatch(stream, bf, &short, 1, sink, &mut got);
+            .enqueue_ubatch(stream, bf, &short, 1, sink, &mut ub_got);
         let named = |e: &bloomery_gpu::GpuError| e.to_string().contains("x.len()");
         let refused = fused.is_err_and(|e| named(&e)) && ubatch.is_err_and(|e| named(&e));
         println!(
@@ -1315,39 +1336,81 @@ mod gate {
             verdict(refused)
         );
         let mut ok = refused;
+        let reference = if mma {
+            "the dense MMA tile + route_512"
+        } else {
+            "the f32 weight widened"
+        };
+        // The reference's routing of the first n tokens of x, one Routed a token.
+        let mut expect = |x: &DeviceBuffer<f32>, n: usize| -> Result<Vec<Routed>, GateError> {
+            if mma {
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, WIDE_ROWS * n)?;
+                c.gpu.q8f32().enqueue_bf16_mma(stream, &wb, x, n, &mut y)?;
+                stream.synchronize()?;
+                let y = y.to_host_vec(stream)?;
+                return (0..n)
+                    .map(|t| {
+                        let col = &y[t * WIDE_ROWS..(t + 1) * WIDE_ROWS];
+                        Ok(wide_token(&wide_route(c, col, 1, sink, &mut one)?, 0))
+                    })
+                    .collect();
+            }
+            let out = if n <= MAX_TOKENS {
+                c.router.enqueue_fused(stream, &w, x, n, sink, &mut want)?;
+                &want
+            } else {
+                c.router
+                    .enqueue_ubatch(stream, &w, x, n, sink, &mut ub_want)?;
+                &ub_want
+            };
+            stream.synchronize()?;
+            let all = read_wide(stream, out)?;
+            Ok((0..n).map(|t| wide_token(&all, t)).collect())
+        };
         for m in [1usize, 5, MAX_TOKENS] {
             let x = DeviceBuffer::from_host(stream, &cols[..m * WIDE_K])?;
-            c.router.enqueue_fused(stream, &w, &x, m, sink, &mut want)?;
             c.router.enqueue_fused(stream, bf, &x, m, sink, &mut got)?;
             stream.synchronize()?;
-            let (a, b) = (read_wide(stream, &got)?, read_wide(stream, &want)?);
+            let a = read_wide(stream, &got)?;
             let tickets = got.tickets(stream)?;
+            let b = expect(&x, m)?;
             let same = (0..m)
-                .filter(|&t| routed_equal(&wide_token(&a, t), &wide_token(&b, t)))
+                .filter(|&t| routed_equal(&wide_token(&a, t), &b[t]))
                 .count();
             let pass = same == m && tickets == 0;
             println!(
-                "wide512 bf16 fused m={m} vs the f32 weight widened: {same}/{m} tokens \
-                 bit-identical tickets={tickets} {}",
+                "wide512 bf16 fused m={m} vs {reference}: {same}/{m} tokens bit-identical \
+                 tickets={tickets} {}",
                 verdict(pass)
             );
             ok &= pass;
         }
         let x = DeviceBuffer::from_host(stream, &cols)?;
-        let mut want = RouterOut::for_ubatch(stream, wide()?, WIDE_UB)?;
-        let mut got = RouterOut::for_ubatch(stream, wide()?, WIDE_UB)?;
         c.router
-            .enqueue_ubatch(stream, &w, &x, WIDE_UB, sink, &mut want)?;
-        c.router
-            .enqueue_ubatch(stream, bf, &x, WIDE_UB, sink, &mut got)?;
+            .enqueue_ubatch(stream, bf, &x, WIDE_UB, sink, &mut ub_got)?;
         stream.synchronize()?;
-        let (a, b) = (read_wide(stream, &got)?, read_wide(stream, &want)?);
+        let a = read_wide(stream, &ub_got)?;
+        let b = expect(&x, WIDE_UB)?;
         let same = (0..WIDE_UB)
-            .filter(|&t| routed_equal(&wide_token(&a, t), &wide_token(&b, t)))
+            .filter(|&t| routed_equal(&wide_token(&a, t), &b[t]))
             .count();
         let pass = same == WIDE_UB;
         println!(
-            "wide512 bf16 ubatch n={WIDE_UB} vs the f32 weight widened: {same}/{WIDE_UB} \
+            "wide512 bf16 ubatch n={WIDE_UB} vs {reference}: {same}/{WIDE_UB} bit-identical {}",
+            verdict(pass)
+        );
+        ok &= pass;
+        let mut same = 0usize;
+        for t in 0..WIDE_UB {
+            let xt = DeviceBuffer::from_host(stream, &cols[t * WIDE_K..(t + 1) * WIDE_K])?;
+            c.router.enqueue_fused(stream, bf, &xt, 1, sink, &mut one)?;
+            stream.synchronize()?;
+            let fused = wide_token(&read_wide(stream, &one)?, 0);
+            same += usize::from(routed_equal(&wide_token(&a, t), &fused));
+        }
+        let pass = same == WIDE_UB;
+        println!(
+            "wide512 bf16 ubatch n={WIDE_UB} vs the fused launch per token: {same}/{WIDE_UB} \
              bit-identical {}",
             verdict(pass)
         );
@@ -3170,7 +3233,7 @@ mod gate {
         ok &= tier::witness("LAYERS", c.layers, REAL_LAYERS);
         ok &= tier::witness("FAULT_LAYER", c.fault_layer(), REAL_FAULT_LAYER);
         if c.want("shape") {
-            tier::sc("shape: the nine entries compile with no local depot")?;
+            tier::sc("shape: the eleven entries compile with no local depot")?;
             ok &= no_local_depot(&[
                 "qwen35moe_router_fused",
                 "qwen35moe_router_norm",
@@ -3181,6 +3244,8 @@ mod gate {
                 "qwen35moe_router_route_512",
                 "qwen35moe_router_fused_512_bf16",
                 "qwen35moe_router_logits_512_bf16",
+                "qwen35moe_router_fused_512_bf16_mma",
+                "qwen35moe_router_logits_512_bf16_mma",
             ])?;
         }
         if c.want("routing") {

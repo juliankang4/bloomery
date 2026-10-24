@@ -344,7 +344,7 @@ mod gate {
                     let src = (ty, w, SiteWeight::Resident(name));
                     let table = (route, GemmInput::PerSlot);
                     site::gemm(gpu, &kernels, src, rows, &x_in, table, m, &mut y_dev)?;
-                    if gpu.context().compute_capability()? == (12, 1) {
+                    if bloomery_gpu::dense_mma(gpu.context())? {
                         stream.synchronize()?;
                         let mma = y_dev.to_host_vec(stream)?;
                         ok &= check_mma(name, (&mma, &x, k), wf);

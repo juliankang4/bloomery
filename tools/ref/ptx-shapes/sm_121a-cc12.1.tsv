@@ -387,9 +387,11 @@ generate_ds41 quantize_nvfp4_32 0 0
 generate_ds41 qwen35moe_router_fused 0 0
 generate_ds41 qwen35moe_router_fused_512 0 0
 generate_ds41 qwen35moe_router_fused_512_bf16 0 0
+generate_ds41 qwen35moe_router_fused_512_bf16_mma 0 0
 generate_ds41 qwen35moe_router_logits 0 0
 generate_ds41 qwen35moe_router_logits_512 0 0
 generate_ds41 qwen35moe_router_logits_512_bf16 0 0
+generate_ds41 qwen35moe_router_logits_512_bf16_mma 0 0
 generate_ds41 qwen35moe_router_norm 0 0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives qwen35moe_router_norm_m 64 registers (.minnctapersm 4: 4 blocks of 256 threads an SM) and keeps 8 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv); ptxas -arch=sm_121 assembles it at the same registers and spills 32 bytes.
 # PIN(2026-10-24): 32 -> 0 spill bytes, 8 -> 0 driver-JIT local bytes (ptxas 13.3.73 sm_121a, GB10 driver

@@ -2629,7 +2629,7 @@ impl Q8F32Kernels {
         let module = unsafe { crate::shared_module!(q8f32_kernels, ctx)? };
         Ok(Q8F32Kernels {
             module,
-            dense_mma: ctx.compute_capability()? == (12, 1),
+            dense_mma: crate::dense_mma(ctx)?,
         })
     }
 

@@ -57,10 +57,13 @@ use crate::cores::l2_prefetch;
 use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree};
 use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::gemm::{
-    F32Rows, F32T_THREADS_U32, GEMM_MAX_SLOTS, STAGE_FLOATS, STAGES, f32_tile_body, tile_launch,
+    F32Rows, F32T_THREADS_U32, GEMM_MAX_SLOTS, NARROW_ROWS, STAGE_FLOATS, STAGES, bf16_mma_narrow,
+    f32_tile_body, tile_launch,
 };
 use crate::q8_1_quant_vals;
-use crate::q8f32::{RowValues, f32_lane_partial_1col_w32, f32_lane_partials, gemv_lane_sums};
+use crate::q8f32::{
+    Bf16Words, RowValues, f32_lane_partial_1col_w32, f32_lane_partials, gemv_lane_sums,
+};
 use crate::route_core::{sigmoid, take};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::{GpuError, launch_u32};
@@ -767,18 +770,10 @@ unsafe fn gated_fused_body<const PER_LANE: usize, W: RowValues>(
     // ticket.
     let row = thread::blockIdx_x() as usize;
     if wi == 0 && row < rows {
-        let partials = if m == 1 {
-            // SAFETY: row < rows, so w holds rows·k >= (row + 1)·k values, and
-            // x.len() >= k (this fn's contract); k a positive multiple of 32;
-            // lane < 32.
-            let f0 = unsafe { f32_lane_partial_1col_w32(w, x, k, row, lane) };
-            [f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        } else {
-            // SAFETY: as above, with x.len() >= m_cols·k and m_cols in
-            // 1..=8.
-            unsafe { f32_lane_partials(w, x, k, row, m_cols, lane) }
-        };
-        let sums = gemv_lane_sums(partials, m_cols);
+        // SAFETY: row < rows, so w holds rows·k >= (row + 1)·k values;
+        // x.len() >= m_cols·k, k a positive multiple of 32, m_cols in 1..=8
+        // (this fn's contract); the whole warp is here, converged.
+        let sums = unsafe { fused_row_sums(w, x, k, row, m_cols, lane) };
         if lane == 0 {
             // SAFETY: row < rows and 1 <= m <= 8, so the slots c·rows + row
             // (c < m) lie inside logits (this fn's contract); lane 0 of the
@@ -793,6 +788,142 @@ unsafe fn gated_fused_body<const PER_LANE: usize, W: RowValues>(
             used as usize,
             last,
             p,
+            logits,
+            probs,
+            ids,
+            weights,
+            done,
+            fault,
+        );
+    }
+}
+
+/// Row `row`'s logit of each of the first `m_cols` tokens by one warp, the
+/// fused entries' row body: `f32_gemv`'s lane sums (at one token through
+/// [`f32_lane_partial_1col_w32`], which keeps 32 chunks' loads in flight)
+/// and its warp tree. Every lane returns the sums; columns past `m_cols` are
+/// 0.0.
+///
+/// # Safety
+///
+/// All 32 lanes of the warp call it, converged, with the same arguments but
+/// `lane`; `w` holds at least `(row + 1)·k` values, `x.len() >= m_cols·k`,
+/// `k` a positive multiple of 32, `m_cols` in 1..=8.
+#[inline(always)]
+unsafe fn fused_row_sums<W: RowValues>(
+    w: W,
+    x: &[f32],
+    k: u32,
+    row: usize,
+    m_cols: u32,
+    lane: usize,
+) -> [f32; 8] {
+    let partials = if m_cols == 1 {
+        // SAFETY: m_cols == 1, so this fn's contract gives w (row + 1)·k values, x.len() >= k, k a
+        // positive multiple of 32, and lane < 32.
+        let f0 = unsafe { f32_lane_partial_1col_w32(w, x, k, row, lane) };
+        [f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    } else {
+        // SAFETY: this fn's contract gives w (row + 1)·k values, x.len() >= m_cols·k, k a positive
+        // multiple of 32, m_cols in 1..=8 and lane < 32.
+        unsafe { f32_lane_partials(w, x, k, row, m_cols, lane) }
+    };
+    gemv_lane_sums(partials, m_cols)
+}
+
+/// [`gated_fused_body`] on the dense MMA tile's arithmetic, for a BF16
+/// weight's words on a device whose ubatch logits run that tile: block `b`
+/// computes rows `16·b ..` of every token as [`bf16_mma_narrow`] does, so
+/// each logit is the ubatch launch's bits for its token. A cell the narrow
+/// block leaves to the exact owner (its row or its token holds an operand
+/// outside the tensor cores' range) takes the fused entry's row sum
+/// ([`fused_row_sums`], `f32_gemv`'s bits over the widened weight), the
+/// exact tile's bits that the ubatch launch's replay leaves: warp `w` sums
+/// the block's rows `2w` and `2w + 1` when one of their cells replays. Then
+/// [`publish_route_gated`], over the stages' memory.
+///
+/// # Safety
+///
+/// Every thread of the block calls it, converged; the grid is `⌈(n + 1) /
+/// 16⌉` blocks of [`FUSED_THREADS`]; `last` is one block-shared word and
+/// `sh` the narrow block's `gemm::NARROW_WORDS` 16-byte aligned shared words,
+/// which nothing else touches; `1 <= m_cols <= MAX_TOKENS`, `1 <= used <=
+/// 32`, `k` a positive multiple of 32; `w` holds `(n + 1)·k / 2` words and
+/// `x` `m_cols·k` values, both 16-byte aligned; the outputs sized as
+/// [`publish_route_gated`] takes them for `m_cols` tokens, and `done[0]`
+/// zero before the launch.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+#[inline(always)]
+unsafe fn gated_mma_fused_body<const PER_LANE: usize>(
+    w: &[u32],
+    x: &[f32],
+    k: u32,
+    m_cols: u32,
+    used: u32,
+    last: *mut u32,
+    sh: *mut u32,
+    logits: &mut DisjointSlice<f32>,
+    probs: &mut DisjointSlice<f32>,
+    ids: &mut DisjointSlice<u32>,
+    weights: &mut DisjointSlice<f32>,
+    done: &mut DisjointSlice<u32>,
+    fault: FaultSink,
+) {
+    let rows = 32 * PER_LANE + 1;
+    let m = m_cols as usize;
+    let row0 = thread::blockIdx_x() as usize * NARROW_ROWS;
+    let wi = thread::threadIdx_x() as usize / 32;
+    let lane = warp::lane_id() as usize;
+    // SAFETY: all FUSED_THREADS = 256 threads are here, converged; row0 < rows (the grid's last
+    // block starts below rows), n = m_cols <= MAX_TOKENS = NARROW_COLS, k a positive multiple of
+    // 32, w holds rows·k/2 words and x m_cols·k values, both 16-byte aligned, and sh is the
+    // block's NARROW_WORDS aligned shared words, by this fn's contract.
+    let tile = unsafe { bf16_mma_narrow(w, x, (rows, k as usize, m), row0, sh) };
+    if wi == 0 {
+        // SAFETY: warp 0; logits holds rows·m_cols outputs and this block
+        // alone writes its rows.
+        unsafe { tile.store(logits, (rows, m), row0) };
+    }
+    let mut i = 0usize;
+    while i < NARROW_ROWS / FUSED_WARPS {
+        let r = (NARROW_ROWS / FUSED_WARPS) * wi + i;
+        // Warp-uniform: the replay flags are the block's.
+        if row0 + r < rows && tile.replays_row(r, m) {
+            // SAFETY: row row0 + r < rows, so the words hold its k values;
+            // x.len() >= m_cols·k, k a positive multiple of 32, m_cols in
+            // 1..=8; the whole warp is here, converged.
+            let sums = unsafe { fused_row_sums(Bf16Words(w), x, k, row0 + r, m_cols, lane) };
+            if lane == 0 {
+                // Unrolled, so each column reads `sums` at a constant index.
+                for c in 0..MAX_TOKENS {
+                    thread::__unroll_config::<0>();
+                    if c < m && tile.replays(r, c) {
+                        // SAFETY: column c < m_cols and row row0 + r < rows lie
+                        // inside logits; lane 0 of the row's warp is the
+                        // replayed cell's only writer.
+                        unsafe { *logits.get_unchecked_mut(c * rows + row0 + r) = sums[c] };
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    // SAFETY: the stages' memory holds NARROW_WORDS >= MAX_TOKENS · n words
+    // (const assert beside the entry), and nothing reads it after the narrow
+    // block's last barrier; the rest is this fn's contract for m tokens.
+    unsafe {
+        publish_route_gated::<PER_LANE>(
+            m,
+            used as usize,
+            last,
+            sh.cast::<f32>(),
             logits,
             probs,
             ids,
@@ -2280,24 +2411,32 @@ impl RouterKernels {
 /// alone) — and [`ROW_WIDE`] (512 experts) with the three of them that are
 /// not norm-fused, `qwen35moe_router_*_512`, whose router reads the
 /// hyper-connection mix with no norm in front of it. The launchers pick the
-/// entry from the buffers' instance. A token with a non-finite value among its `n + 1`
+/// entry from the buffers' instance. A BF16 weight at the wide instance runs
+/// `qwen35moe_router_{fused,logits}_512_bf16`, the F32 entries' bits over
+/// its values widened; on a device whose dense prompt products run on BF16
+/// tensor cores ([`crate::dense_mma`]) it runs the `_bf16_mma` pair instead,
+/// both on the dense MMA tile's arithmetic (activations rounded once to BF16,
+/// F32 accumulation), so there too the two ubatch launches leave each token
+/// the fused launch's bits. A token with a non-finite value among its `n + 1`
 /// logits raises [`FaultSite::Router`], gets NaN probabilities and NaN
 /// weights in all `k + 1` slots, and keeps its ids.
 pub mod gated {
     use super::{
         FUSED_THREADS_U32, FUSED_WARPS, MAX_TOKENS, NORM_K, RMS_WARPS, RouterBufs,
-        gated_fused_body, gated_route_body, norm_row_body, publish_route_gated,
+        gated_fused_body, gated_mma_fused_body, gated_route_body, norm_row_body,
+        publish_route_gated,
     };
     use crate::fault::FaultSink;
     use crate::gemm::{
-        Bf16Rows, F32_TILE_LINE, F32Rows, F32T_THREADS_U32, STAGE_FLOATS, STAGES, f32_tile_body,
-        tile_launch,
+        Bf16Rows, F32_TILE_LINE, F32Cols, F32Rows, F32T_THREADS_U32, MMA_THREADS, NARROW_ROWS,
+        NARROW_WORDS, STAGE_FLOATS, STAGES, bf16_mma_body, f32_tile_body, mma_launch, tile_launch,
     };
     use crate::q8f32::Bf16Words;
-    use crate::tensor::{DeviceTensor, Q8Act};
+    use crate::tensor::{DeviceTensor, Q8Act, check_alignment};
     use crate::weights::{DevWeight, Weights};
     use crate::{GpuError, launch_u32};
     use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+    use cuda_device::vector::U32x4;
     use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract};
     use cuda_host::cuda_module;
     use model::arch::models::shape::{self, RouterBody, RouterInst, rules};
@@ -2353,6 +2492,11 @@ pub mod gated {
     // block may declare: `P` for eight tokens, and the ticket.
     const _: () = assert!((MAX_TOKENS * EXPERTS_WIDE + 1) * 4 <= 48 * 1024);
     const _: () = assert!(FUSED_WARPS * EXPERTS_WIDE * 4 <= 48 * 1024);
+    // The narrow MMA entry routes over its stages' memory, and its replay
+    // gives each warp the same number of the block's rows.
+    const _: () = assert!(MAX_TOKENS * EXPERTS_WIDE <= NARROW_WORDS);
+    const _: () =
+        assert!(NARROW_ROWS.is_multiple_of(FUSED_WARPS) && FUSED_THREADS_U32 == MMA_THREADS);
 
     #[cuda_module]
     mod qwen35moe_router_kernels {
@@ -3126,6 +3270,77 @@ pub mod gated {
             }
         }
 
+        /// `qwen35moe_router_fused_512_bf16` on the dense MMA tile's
+        /// arithmetic, the entry a device launches whose ubatch logits run
+        /// `qwen35moe_router_logits_512_bf16_mma`: grid `⌈ROWS_WIDE / 16⌉`
+        /// blocks of 256, block `b` the rows `16·b ..` of every token
+        /// ([`gated_mma_fused_body`]), so each logit is that entry's bits for
+        /// its token. `k` a positive multiple of 32, `w` and `x` 16-byte
+        /// aligned (host-checked).
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+        )]
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(
+            domain = 1,
+            block = (256, 1, 1),
+            requires = (
+                m_cols >= 1,
+                m_cols <= 8,
+                used >= 1,
+                used <= 32,
+                2 * w.len() >= ROWS_WIDE * k,
+                x.len() >= m_cols * k,
+                logits.len() >= ROWS_WIDE * m_cols,
+                probs.len() >= EXPERTS_WIDE * m_cols,
+                ids.len() >= (used + 1) * m_cols,
+                weights.len() >= (used + 1) * m_cols,
+                done.len() >= 1
+            )
+        )]
+        pub fn qwen35moe_router_fused_512_bf16_mma(
+            w: &[u32],
+            x: &[f32],
+            k: u32,
+            m_cols: u32,
+            used: u32,
+            mut logits: DisjointSlice<f32>,
+            mut probs: DisjointSlice<f32>,
+            mut ids: DisjointSlice<u32>,
+            mut weights: DisjointSlice<f32>,
+            mut done: DisjointSlice<u32>,
+            fault: FaultSink,
+        ) {
+            static mut STAGE: SharedArray<u32, NARROW_WORDS, 16> = SharedArray::UNINIT;
+            static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+            // SAFETY: STAGE and LAST are this block's own shared allocations
+            // (the raw form reaches each `static mut` without a reference),
+            // STAGE 16-byte aligned; every thread arrives converged on the
+            // launcher's grid of ⌈ROWS_WIDE / 16⌉ blocks of 256; the launcher
+            // checks k a positive multiple of 32 and both alignments, the
+            // launch contract bounds m_cols, used and every slice, and
+            // `done[0]` is zero before the launch.
+            unsafe {
+                gated_mma_fused_body::<PER_LANE_WIDE>(
+                    w,
+                    x,
+                    k,
+                    m_cols,
+                    used,
+                    SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                    SharedArray::as_raw_mut_ptr(&raw mut STAGE),
+                    &mut logits,
+                    &mut probs,
+                    &mut ids,
+                    &mut weights,
+                    &mut done,
+                    fault,
+                );
+            }
+        }
+
         /// The router logits of `n_tok` tokens at the wide instance, a
         /// ubatch's first router launch: the wide F32 product's tiles
         /// ([`f32_tile_body`]) over [`ROWS_WIDE`] rows, `⌈ROWS_WIDE / 32⌉`
@@ -3209,6 +3424,55 @@ pub mod gated {
                     SharedArray::as_raw_mut_ptr(&raw mut STAGE),
                 );
             }
+        }
+
+        /// `qwen35moe_router_logits_512_bf16` on the dense MMA tile
+        /// ([`bf16_mma_body`]: the weight's words and the activations rounded
+        /// to BF16, F32 accumulation, a cell whose row or token holds an
+        /// operand outside the tensor cores' range replayed on the exact
+        /// tile), the entry a dense-MMA device launches. Grid `⌈n_tok / 128⌉ ·
+        /// ⌈ROWS_WIDE / 128⌉` blocks of 256; each logit is
+        /// `qwen35moe_router_fused_512_bf16_mma`'s bits for its token. `k` a
+        /// positive multiple of 64, `w` and `x` 16-byte aligned
+        /// (host-checked).
+        #[kernel]
+        #[launch_bounds(256)]
+        #[launch_contract(
+            domain = 1,
+            block = (256, 1, 1),
+            requires = (
+                n_tok >= 1,
+                2 * w.len() >= ROWS_WIDE * k,
+                x.len() >= n_tok * k,
+                logits.len() >= ROWS_WIDE * n_tok
+            )
+        )]
+        pub fn qwen35moe_router_logits_512_bf16_mma(
+            w: &[u32],
+            x: &[f32],
+            k: u32,
+            n_tok: u32,
+            mut logits: DisjointSlice<f32>,
+        ) {
+            static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+            // SAFETY: STAGE is this block's own shared allocation of STAGES ·
+            // STAGE_FLOATS values, 16-byte aligned; the raw form reaches the
+            // `static mut` without a reference.
+            let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+            // SAFETY: every thread of the 256-wide block calls it converged;
+            // the launcher sized the MMA grid and checked k and both
+            // alignments; the launch contract bounds the words, x and logits.
+            unsafe {
+                bf16_mma_body(
+                    Bf16Rows(w),
+                    F32Cols(x),
+                    ROWS_WIDE as u32,
+                    k,
+                    n_tok,
+                    &mut logits,
+                    sh,
+                )
+            };
         }
 
         /// The routing of `n_tok` tokens at the wide instance from their
@@ -3385,13 +3649,15 @@ pub mod gated {
     }
 
     /// A ubatch logits launch's `(k, n_tok, grid)` for `n` tokens of `x`
-    /// through `w` into `out`; its refusal named `what`.
+    /// through `w` into `out`, the grid the MMA tile's with `mma`; its
+    /// refusal named `what`.
     fn ubatch_dims(
         what: &'static str,
         w: RouterWeight<'_>,
         x: &DeviceBuffer<f32>,
         n: usize,
-        out: &RouterBufs,
+        out: &mut RouterBufs,
+        mma: bool,
     ) -> Result<(u32, u32, u32), GpuError> {
         let rows = out.dims().logits();
         let k = router_width(what, w.shape(), rows, F32_TILE_LINE, usize::MAX)?;
@@ -3408,7 +3674,11 @@ pub mod gated {
                 format!("router weight at {w_at:#x} must be 16-byte aligned"),
             ));
         }
-        let t = tile_launch(what, rows, k, x, n, &out.logits)?;
+        let t = if mma {
+            mma_launch(what, rows, k, x, n, &mut out.logits)?
+        } else {
+            tile_launch(what, rows, k, x, n, &out.logits)?
+        };
         Ok((t.k, t.n, t.grid))
     }
 
@@ -3444,6 +3714,10 @@ pub mod gated {
         module: qwen35moe_router_kernels::LoadedModule,
         /// [`crate::row_prefetch`] of the context's device.
         row_prefetch: bool,
+        /// [`crate::dense_mma`] of the context's device: a BF16 weight at the
+        /// wide instance runs the `_bf16_mma` entries, every other weight
+        /// and device the exact ones.
+        mma: bool,
     }
 
     impl RouterKernels {
@@ -3455,6 +3729,7 @@ pub mod gated {
             Ok(RouterKernels {
                 module,
                 row_prefetch: crate::row_prefetch(ctx)?,
+                mma: crate::dense_mma(ctx)?,
             })
         }
 
@@ -3520,6 +3795,30 @@ pub mod gated {
                         fault,
                     )?;
                 }
+                (Width::Wide, RouterWeight::Bf16 { w, .. }) if self.mma => {
+                    check_alignment::<U32x4, _>(what, "router weight", w.buf())?;
+                    check_alignment::<U32x4, _>(what, "x", x)?;
+                    let grid = launch_u32(what, "grid", out.dims().logits().div_ceil(NARROW_ROWS))?;
+                    let cfg = LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0);
+                    let prep = self
+                        .module
+                        .prepare_qwen35moe_router_fused_512_bf16_mma(cfg)?;
+                    self.module.qwen35moe_router_fused_512_bf16_mma(
+                        stream,
+                        &prep,
+                        w.buf(),
+                        x,
+                        k,
+                        m,
+                        used,
+                        &mut out.logits,
+                        &mut out.probs,
+                        &mut out.ids,
+                        &mut out.weights,
+                        &mut out.done,
+                        fault,
+                    )?;
+                }
                 (Width::Wide, RouterWeight::Bf16 { w, .. }) => {
                     let prep = self.module.prepare_qwen35moe_router_fused_512_bf16(cfg)?;
                     self.module.qwen35moe_router_fused_512_bf16(
@@ -3563,7 +3862,8 @@ pub mod gated {
             let what = "qwen3moe::router::gated::enqueue_ubatch";
             let (width, _) = width(what, out)?;
             let w = w.into();
-            let (k, n_tok, grid) = ubatch_dims(what, w, x, n, out)?;
+            let mma = self.mma && matches!((width, w), (Width::Wide, RouterWeight::Bf16 { .. }));
+            let (k, n_tok, grid) = ubatch_dims(what, w, x, n, out, mma)?;
             let cfg = LaunchConfig1D::new(grid, F32T_THREADS_U32, 0);
             match (width, w) {
                 (Width::Narrow, RouterWeight::Bf16 { .. }) => {
@@ -3584,6 +3884,21 @@ pub mod gated {
                 (Width::Wide, RouterWeight::F32(w)) => {
                     let prep = self.module.prepare_qwen35moe_router_logits_512(cfg)?;
                     self.module.qwen35moe_router_logits_512(
+                        stream,
+                        &prep,
+                        w.buf(),
+                        x,
+                        k,
+                        n_tok,
+                        &mut out.logits,
+                    )?;
+                }
+                (Width::Wide, RouterWeight::Bf16 { w, .. }) if mma => {
+                    let cfg = LaunchConfig1D::new(grid, MMA_THREADS, 0);
+                    let prep = self
+                        .module
+                        .prepare_qwen35moe_router_logits_512_bf16_mma(cfg)?;
+                    self.module.qwen35moe_router_logits_512_bf16_mma(
                         stream,
                         &prep,
                         w.buf(),

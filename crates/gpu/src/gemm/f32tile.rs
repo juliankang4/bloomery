@@ -47,7 +47,10 @@
 //! range is recomputed by the exact F32 owner, in its exponent range and
 //! reduction order; every other cell keeps its MMA value, so a cell's bits
 //! depend on its own row and column alone. The exact tile entries stay
-//! available.
+//! available. A narrow block ([`bf16_mma_narrow`]: sixteen rows of a BF16
+//! weight against up to eight columns, one fragment) runs the same
+//! arithmetic, so its cells are the tile's bits; a decode launch that must
+//! match a prompt launch per token uses it.
 
 use super::act32::ColsForm;
 use super::gemm32::{GEMM32_GROUP, raster32};
@@ -954,15 +957,22 @@ pub(crate) struct MmaTile {
     bad: u64,
 }
 
+/// Row and column of value `i` (< 4) of an m16n8 accumulator fragment in
+/// lane `lane`, at the fragment's origin `(r0, c0)`.
+#[inline(always)]
+fn fragment_cell((r0, c0): (usize, usize), lane: usize, i: usize) -> (usize, usize) {
+    (
+        r0 + lane / MMA_ROW_LANES + (i / 2) * 8,
+        c0 + 2 * (lane % MMA_ROW_LANES) + i % 2,
+    )
+}
+
 impl MmaTile {
     #[inline(always)]
     pub(crate) fn coordinates(&self, cell: usize) -> (usize, usize) {
         let (mi, j, i) = (cell / 16, (cell / 4) % 4, cell % 4);
         let (r0, c0) = self.warp_origin();
-        (
-            r0 + mi * 16 + self.lane / MMA_ROW_LANES + (i / 2) * 8,
-            c0 + j * 8 + 2 * (self.lane % MMA_ROW_LANES) + i % 2,
-        )
+        fragment_cell((r0 + mi * 16, c0 + j * 8), self.lane, i)
     }
 
     /// The accumulated value of `cell` (< [`MMA_CELLS`]). Cells
@@ -1396,6 +1406,267 @@ pub(crate) unsafe fn bf16_mma_body<W: MmaRows, X: MmaCols>(
     } else {
         // SAFETY: the checked output belongs to this tile.
         unsafe { tile.store::<false>(y, rows, n) };
+    }
+}
+
+/// Rows of a narrow MMA block ([`bf16_mma_narrow`]): one m16 fragment.
+pub(crate) const NARROW_ROWS: usize = 16;
+/// Columns of a narrow MMA block: one n8 fragment.
+pub(crate) const NARROW_COLS: usize = 8;
+/// 32-value chunks of every row and column one narrow stage holds.
+const NARROW_CHUNKS: usize = 4;
+/// Narrow stages in shared memory: the one warp 0 reads and three being
+/// copied in.
+const NARROW_STAGES: usize = 4;
+/// Words of a narrow stage's rows: per chunk, [`NARROW_ROWS`] lines laid out
+/// as the tile's ([`mma_piece_at`]).
+const NARROW_ROW_WORDS: usize = NARROW_CHUNKS * NARROW_ROWS * MMA_LINE_WORDS;
+/// f32 values from one column of a narrow stage to the next: the stage's
+/// values and eight more, so the eight columns one fragment read takes fall
+/// in two rounds of the 32 banks.
+const NARROW_COL_PITCH: usize = NARROW_CHUNKS * 32 + 8;
+/// Words of one narrow stage: the rows' BF16 lines, then the columns' f32
+/// values.
+const NARROW_STAGE_WORDS: usize = NARROW_ROW_WORDS + NARROW_COLS * NARROW_COL_PITCH;
+/// Shared words a narrow block takes.
+pub(crate) const NARROW_WORDS: usize = NARROW_STAGES * NARROW_STAGE_WORDS;
+// Each thread copies one 16-byte piece of the rows and one of the columns a
+// stage; the pipeline's wait leaves the two newest stages' groups pending.
+const _: () = assert!(NARROW_CHUNKS * NARROW_ROWS * MMA_PIECES == MMA_THREADS as usize);
+const _: () = assert!(NARROW_COLS * NARROW_CHUNKS * 8 == MMA_THREADS as usize);
+const _: () = assert!(NARROW_STAGES == 4 && NARROW_ROWS == 16 && NARROW_COLS == 8);
+// Stages and column lines start 16-byte aligned.
+const _: () = assert!(
+    NARROW_ROW_WORDS.is_multiple_of(4)
+        && NARROW_COL_PITCH.is_multiple_of(4)
+        && NARROW_STAGE_WORDS.is_multiple_of(4)
+);
+
+/// Warp 0's fragment of a narrow block ([`bf16_mma_narrow`]), and the cells
+/// of the block the exact owner replays: those whose row or column held an
+/// operand [`mma_fits`] refuses, the cells [`MmaTile::needs_replay`] marks.
+pub(crate) struct NarrowTile {
+    values: [f32; 4],
+    lane: usize,
+    /// Bit `i` (`16 + c`): row offset `i` (column `c`) held an operand
+    /// [`mma_fits`] refuses. The same in every thread of the block.
+    refused: u32,
+}
+
+impl NarrowTile {
+    /// Whether the exact owner replays the cell at row offset `r` and column
+    /// `c`.
+    #[inline(always)]
+    pub(crate) fn replays(&self, r: usize, c: usize) -> bool {
+        self.refused & (1 << r | 1 << (16 + c)) != 0
+    }
+
+    /// Whether the exact owner replays a cell of row offset `r` among the
+    /// first `n` columns.
+    #[inline(always)]
+    pub(crate) fn replays_row(&self, r: usize, n: usize) -> bool {
+        self.refused & (1 << r | ((1 << n) - 1) << 16) != 0
+    }
+
+    /// Warp 0 stores the cells it keeps of the rows `row0 + r` below `rows`
+    /// and of the first `n` columns, at `y[c · rows + row0 + r]`.
+    ///
+    /// # Safety
+    /// Warp 0 of the block calls it; `y` holds `rows · n` outputs, and no other
+    /// block writes rows `row0 .. row0 + NARROW_ROWS`.
+    #[inline(always)]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+    )]
+    pub(crate) unsafe fn store(
+        &self,
+        y: &mut DisjointSlice<f32>,
+        (rows, n): (usize, usize),
+        row0: usize,
+    ) {
+        for i in 0..4 {
+            thread::__unroll_config::<0>();
+            let (r, c) = fragment_cell((0, 0), self.lane, i);
+            if row0 + r < rows && c < n && !self.replays(r, c) {
+                // SAFETY: row row0 + r < rows and column c < n lie inside y;
+                // this lane holds the fragment's only copy of the cell.
+                unsafe { *y.get_unchecked_mut(c * rows + row0 + r) = self.values[i] };
+            }
+        }
+    }
+}
+
+/// The dense MMA tile's products ([`bf16_mma_tile`]) of a narrow block: rows
+/// `row0 .. row0 + NARROW_ROWS` of a BF16 weight's words against the first
+/// `n` f32 columns of `x`, each output the tile's bits for its row and
+/// column. The operands are what the tile stages (the weight's words as they
+/// are, each activation rounded to BF16 by `cvt.rn`), and the fragment runs
+/// one m16n8k16 chain from zero over K's 16-value steps in increasing order,
+/// as each of the tile's fragments does. Every thread of the block copies
+/// one row piece and one column piece of each stage with `cp.async`,
+/// [`NARROW_STAGES`] deep, a row past the last copied as the last; warp 0
+/// reads the rows with `ldmatrix` and its columns from their f32 lines, a
+/// column past the last read as the last. Returns warp 0's fragment and, in
+/// every thread, the rows and columns that held an operand [`mma_fits`]
+/// refuses.
+///
+/// # Safety
+///
+/// All 256 threads call converged. `rows >= 1`, `row0 < rows`, `1 <= n <=
+/// NARROW_COLS`, `k` a positive multiple of 32; `w` holds `rows · k / 2`
+/// words and `x` `n · k` values, both 16-byte aligned; `sh` is the block's
+/// own [`NARROW_WORDS`] shared words, 16-byte aligned.
+#[inline(always)]
+pub(crate) unsafe fn bf16_mma_narrow(
+    w: &[u32],
+    x: &[f32],
+    (rows, k, n): (usize, usize, usize),
+    row0: usize,
+    sh: *mut u32,
+) -> NarrowTile {
+    let tid = thread::threadIdx_x() as usize;
+    let lane = warp::lane_id() as usize;
+    let chunks = k / 32;
+    let stages = chunks.div_ceil(NARROW_CHUNKS);
+    // This thread's row piece: slot `rs` of line `rl` of chunk `rc` of each
+    // stage. And its column piece: values `xv .. xv + 4` of column `xc`'s
+    // stage values.
+    let (rc, rl, rs) = (
+        tid / (NARROW_ROWS * MMA_PIECES),
+        (tid / MMA_PIECES) % NARROW_ROWS,
+        tid % MMA_PIECES,
+    );
+    let r_src = (row0 + rl).min(rows - 1) * (k / 2) + rc * MMA_LINE_WORDS + 4 * rs;
+    let r_dst = rc * NARROW_ROWS * MMA_LINE_WORDS + mma_piece_at(rl, rs);
+    let (xc, xv) = (tid / (NARROW_CHUNKS * 8), 4 * (tid % (NARROW_CHUNKS * 8)));
+    let x_src = xc * k + xv;
+    let x_dst = NARROW_ROW_WORDS + xc * NARROW_COL_PITCH + xv;
+    let copy = |s: usize| {
+        let stage = sh.wrapping_add((s % NARROW_STAGES) * NARROW_STAGE_WORDS);
+        if s * NARROW_CHUNKS + rc < chunks {
+            // SAFETY: the row's chunk lies inside w (a live chunk of a row
+            // below rows), 16-byte aligned (k / 2 a multiple of 16 words, w
+            // aligned); the destination is this thread's own aligned piece of
+            // the stage, which no warp reads before the wait and barrier that
+            // complete it.
+            unsafe {
+                cp_async_cg_16(
+                    stage.wrapping_add(r_dst),
+                    w.as_ptr().add(r_src + s * NARROW_CHUNKS * MMA_LINE_WORDS),
+                )
+            };
+        }
+        if xc < n && s * NARROW_CHUNKS + xv / 32 < chunks {
+            // SAFETY: the four values lie in live column xc inside x, 16-byte
+            // aligned (k a multiple of 32, x aligned); the destination is this
+            // thread's own 16-byte aligned piece of the stage, which no warp
+            // reads before the wait and barrier that complete it.
+            unsafe {
+                cp_async_cg_16(
+                    stage.wrapping_add(x_dst),
+                    x.as_ptr().add(x_src + s * NARROW_CHUNKS * 32).cast::<u32>(),
+                )
+            };
+        }
+    };
+    for s in 0..NARROW_STAGES - 1 {
+        if s < stages {
+            copy(s);
+        }
+        // SAFETY: commits this thread's copies of stage s as one group,
+        // empty past the last stage.
+        unsafe { cp_async_commit_group() };
+    }
+
+    let warp0 = tid < 32;
+    let (g, t) = (lane / MMA_ROW_LANES, lane % MMA_ROW_LANES);
+    let a_lane = mma_piece_at(lane % 16, lane / 16);
+    let col = g.min(n - 1);
+    // SAFETY: sh is this block's shared allocation (this fn's contract).
+    let shared = unsafe { cvta_generic_to_shared_u32(sh.cast_const().cast::<u8>()) };
+    let mut acc = [0.0f32; 4];
+    // Bit 0 (1): a value of row g (g + 8) failed mma_fits; bit 2: a value of
+    // column `col`.
+    let mut bad = 0u32;
+    for s in 0..stages {
+        // SAFETY: NARROW_STAGES − 1 groups precede the loop and one each
+        // pass, so leaving the two newest pending completes stage s's. The
+        // barrier then publishes every thread's copies of it, and tells that
+        // warp 0 is done reading stage s − 1, whose buffer the copy below
+        // refills.
+        unsafe { cp_async_wait_group(2) };
+        thread::sync_threads();
+        if s + NARROW_STAGES - 1 < stages {
+            copy(s + NARROW_STAGES - 1);
+        }
+        // SAFETY: one group per pass, empty near the end.
+        unsafe { cp_async_commit_group() };
+        if warp0 {
+            let buf = (s % NARROW_STAGES) * NARROW_STAGE_WORDS;
+            let rows_at = shared + (4 * buf) as u32;
+            let cols = sh
+                .wrapping_add(buf + NARROW_ROW_WORDS + col * NARROW_COL_PITCH + 2 * t)
+                .cast::<F32x2>();
+            for c in 0..NARROW_CHUNKS {
+                thread::__unroll_config::<0>();
+                if s * NARROW_CHUNKS + c < chunks {
+                    for step in 0..2 {
+                        thread::__unroll_config::<0>();
+                        let at = c * NARROW_ROWS * MMA_LINE_WORDS + (a_lane ^ (8 * step));
+                        // SAFETY: the warp is converged; each lane's 16-byte
+                        // row lies in this published stage's row lines.
+                        let a = unsafe { ldmatrix_x4_shared_u32(rows_at + (4 * at) as u32) };
+                        let xp = cols.wrapping_add(16 * c + 8 * step);
+                        // SAFETY: values 2t and 2t + 1 of the step's first
+                        // eight of column `col`, 8-byte aligned, published by
+                        // the barrier.
+                        let F32x2([x0, x1]) = unsafe { *xp };
+                        // SAFETY: values 8 + 2t and 9 + 2t of the step's sixteen of column
+                        // `col`, 8-byte aligned, published by the barrier.
+                        let F32x2([x2, x3]) = unsafe { *xp.add(4) };
+                        bad |= u32::from(!(mma_fits_bf16x2(a[0]) & mma_fits_bf16x2(a[2])));
+                        bad |= u32::from(!(mma_fits_bf16x2(a[1]) & mma_fits_bf16x2(a[3]))) << 1;
+                        let fits = mma_fits(x0) & mma_fits(x1) & mma_fits(x2) & mma_fits(x3);
+                        bad |= u32::from(!fits) << 2;
+                        let b = [cvt_bf16x2_f32(x0, x1), cvt_bf16x2_f32(x2, x3)];
+                        // SAFETY: the whole warp is converged; A is row-major
+                        // and B column-major in the m16n8k16 fragment layout.
+                        acc = unsafe { mma_m16n8k16_f32_bf16(acc, a, b) };
+                    }
+                }
+            }
+        }
+    }
+
+    // The votes go through the stage the pipeline left unread: the copies
+    // still pending are empty, and warp 0 last read another buffer.
+    let flag = sh.wrapping_add((stages % NARROW_STAGES) * NARROW_STAGE_WORDS);
+    if warp0 {
+        let (lo, hi, cols) = (
+            warp::ballot(bad & 1 != 0),
+            warp::ballot(bad & 2 != 0),
+            warp::ballot(bad & 4 != 0),
+        );
+        if lane == 0 {
+            // Lanes 4g .. 4g + 3 hold row g's, row g + 8's and column g's votes.
+            let quad = |v: u32, g: usize| u32::from((v >> (MMA_ROW_LANES * g)) & 0xf != 0);
+            let mut refused = 0u32;
+            for g in 0..8 {
+                thread::__unroll_config::<0>();
+                refused |= quad(lo, g) << g | quad(hi, g) << (8 + g) | quad(cols, g) << (16 + g);
+            }
+            // SAFETY: lane 0 of warp 0 is the vote word's only writer.
+            unsafe { *flag = refused };
+        }
+    }
+    thread::sync_threads();
+    // SAFETY: the barrier published the vote word.
+    let refused = unsafe { *flag };
+    NarrowTile {
+        values: acc,
+        lane,
+        refused,
     }
 }
 

@@ -408,9 +408,11 @@ generate_ds41   quantize_gemm32                          0           0
 generate_ds41   qwen35moe_router_fused                   0           0
 generate_ds41   qwen35moe_router_fused_512               0           0
 generate_ds41   qwen35moe_router_fused_512_bf16          0           0
+generate_ds41   qwen35moe_router_fused_512_bf16_mma      0           0
 generate_ds41   qwen35moe_router_logits                  0           0
 generate_ds41   qwen35moe_router_logits_512              0           0
 generate_ds41   qwen35moe_router_logits_512_bf16         0           0
+generate_ds41   qwen35moe_router_logits_512_bf16_mma     0           0
 generate_ds41   qwen35moe_router_norm                    0           0
 generate_ds41   qwen35moe_router_norm_m                  0           0
 generate_ds41   qwen35moe_router_norm_m_prefetch         0           0

@@ -2179,6 +2179,13 @@ pub(crate) fn row_prefetch(ctx: &CudaContext) -> Result<bool, GpuError> {
     raw_device_integrated(ctx.cu_device())
 }
 
+/// Whether `ctx`'s device runs the dense prompt sites and the wide BF16
+/// router on the BF16 tensor-core tile (`gemm::bf16_mma_body`): GB10, compute
+/// capability 12.1. Other devices keep the exact F32 products. Load-time only.
+pub fn dense_mma(ctx: &CudaContext) -> Result<bool, GpuError> {
+    Ok(ctx.compute_capability()? == (12, 1))
+}
+
 /// The room a device allocation can take on an integrated device: the
 /// host's ([`::model::placement::workstation::host_available`]), since
 /// `cuMemGetInfo` there leaves out the page cache the kernel gives back to a

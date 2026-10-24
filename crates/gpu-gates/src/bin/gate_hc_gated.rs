@@ -1198,7 +1198,7 @@ mod gate {
     fn packs(c: &Ctx, site: &Site, inject: bool) -> Result<bool, GateError> {
         Ok(inject
             && matches!(site.planes, Planes::Bf16 { .. })
-            && c.gpu.context().compute_capability()? == (12, 1))
+            && bloomery_gpu::dense_mma(c.gpu.context())?)
     }
 
     /// One wide mix of `m` columns after a combine, the one-expert table
