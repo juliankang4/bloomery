@@ -9091,6 +9091,7 @@ unsafe fn nvfp4_group_sums(p0: __m256i, p1: __m256i, p2: __m256i, p3: __m256i) -
 }
 
 /// The offset that makes the doubled E2M1 values maddubs' unsigned side ([`KVALUES_MXFP4_U`]).
+#[cfg(target_arch = "x86_64")]
 const NVFP4_OFFSET: i8 = 12;
 
 /// One column's share of the NVFP4 tile for one x4 group, built once for every row a run of rows
