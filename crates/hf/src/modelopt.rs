@@ -1313,6 +1313,8 @@ fn append<'a>(
         .try_reserve(bytes)
         .map_err(|e| shape(&wname, format!("cannot reserve {bytes} NVFP4 bytes: {e}")))?;
     os::advise_huge_within(out.blocks.spare_capacity_mut());
+    // Each scale byte's half value, worked out once; a byte that is no scale is refused below.
+    let halves: [Option<f32>; 256] = std::array::from_fn(|b| ue4m3_to_f32_half(b as u8).ok());
     for (row, (w, s)) in w
         .bytes
         .chunks_exact(half)
@@ -1327,12 +1329,14 @@ fn append<'a>(
             .enumerate()
         {
             for (sub, &byte) in d.iter().enumerate() {
-                let half_scale = ue4m3_to_f32_half(byte).map_err(|source| Error::Scale {
-                    name: sname.clone(),
-                    row,
-                    group: 4 * block + sub,
-                    source,
-                })?;
+                let half_scale = halves[usize::from(byte)]
+                    .map_or_else(|| ue4m3_to_f32_half(byte), Ok)
+                    .map_err(|source| Error::Scale {
+                        name: sname.clone(),
+                        row,
+                        group: 4 * block + sub,
+                        source,
+                    })?;
                 if !(half_scale * 12.0 * scale).is_finite()
                     && w[sub * 8..][..8]
                         .iter()
@@ -1348,15 +1352,24 @@ fn append<'a>(
                     ));
                 }
             }
-            out.blocks.extend_from_slice(d);
-            for g in w.as_chunks::<8>().0 {
-                out.blocks.extend(nvfp4_group_to_block(g));
+            let mut blocks = [0u8; 36];
+            blocks[..4].copy_from_slice(d);
+            for (g, o) in w
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .zip(blocks[4..].as_chunks_mut::<8>().0)
+            {
+                *o = nvfp4_group_to_block(g);
             }
+            out.blocks.extend_from_slice(&blocks);
         }
     }
     out.scale.push(scale);
     Ok([rows, k])
 }
+
+
 
 /// The stored tensor `name` of dtype `want` whose bytes fill its shape; bytes that do not are
 /// `unfilled`'s refusal of the tensor, with what is wrong.

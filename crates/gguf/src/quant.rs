@@ -907,11 +907,16 @@ pub fn fp4_pair(byte: u8) -> [i8; 2] {
 /// plane runs it, and qdot's AVX2 body is held to it bit for bit.
 #[inline]
 #[must_use]
+#[inline]
 pub fn nvfp4_group_to_block(g: &[u8; 8]) -> [u8; 8] {
-    std::array::from_fn(|j| {
-        let nib = |x: u8| (x >> (4 * (j % 2))) & 0x0f;
-        nib(g[j / 2]) | (nib(g[4 + j / 2]) << 4)
-    })
+    let spread = |half: [u8; 4]| {
+        let x = u64::from(u32::from_le_bytes(half));
+        let x = (x | x << 16) & 0x0000_ffff_0000_ffff;
+        let x = (x | x << 8) & 0x00ff_00ff_00ff_00ff;
+        (x | x << 4) & 0x0f0f_0f0f_0f0f_0f0f
+    };
+    let [a, b, c, d, e, f, h, i] = *g;
+    (spread([a, b, c, d]) | spread([e, f, h, i]) << 4).to_le_bytes()
 }
 
 /// The block scale of an MXFP4 block, `ggml_e8m0_to_fp32_half` (ggml-impl.h:40-45):
