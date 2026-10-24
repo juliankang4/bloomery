@@ -37,7 +37,7 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds
-ARCH=sm_86 # the ptx scan is sm_86's (tools/scan-args.sh refuses another BLOOMERY_ARCH before this runs)
+ARCH=sm_86 # the comparison builds at sm_86; a different exported BLOOMERY_ARCH is refused below, before any build
 USAGE="usage: ptx-compare.sh BASE BIN [--features F] [--base-only] [--no-cache] | --self-test"
 
 die() { # die <rc> <message>
@@ -165,6 +165,7 @@ run_compare() {
 # --- the self-test: both sides on stub box.sh and ptx-scan.sh in a temp git repo, the table through the real recipes.py
 self_test() {
   local t n=0 bad=0 rc out base_sha cases
+  unset BLOOMERY_ARCH
   t=$(mktemp -d "${TMPDIR:-/tmp}/ptx-compare-test.XXXXXX") || die 70 "self-test: no temporary directory"
   # shellcheck disable=SC2064 # the path is fixed now
   trap "rm -rf '$t'" EXIT
@@ -325,6 +326,10 @@ STUB
   [ "$rc" = 64 ] && has "is no cargo feature list"; ok "a feature list that is none: 64" $?
   run -- "$base_sha"
   [ "$rc" = 64 ] && has "usage:"; ok "a missing bin: usage, 64" $?
+  run BLOOMERY_ARCH=sm_121a -- "$base_sha" gx --features gpu
+  [ "$rc" = 64 ] && has "BLOOMERY_ARCH is 'sm_121a': comparisons build at sm_86" && [ "$(calls base)$(calls head)" = 00 ]; ok "an exported BLOOMERY_ARCH other than the build's: refused by name (64), nothing ran" $?
+  run BLOOMERY_ARCH=sm_86 -- "$base_sha" gx --features gpu
+  [ "$rc" = 0 ]; ok "BLOOMERY_ARCH=sm_86: accepted" $?
   # 9. the build lines are the ptx-scan recipe's (a drift here means the head side scans something the recipe does not)
   recipe=$(awk '/^ptx-scan /{f=1; next} f && /^[^ ]/{exit} f' "$ROOT/justfile")
   case $recipe in
@@ -342,6 +347,8 @@ STUB
 case ${1:-} in
   --self-test) self_test; exit ;;
 esac
+[ "${BLOOMERY_ARCH-$ARCH}" = "$ARCH" ] ||
+  die 64 "BLOOMERY_ARCH is '${BLOOMERY_ARCH-}': comparisons build at $ARCH; set BLOOMERY_ARCH=$ARCH explicitly"
 [ $# -ge 2 ] || die 64 "$USAGE"
 REV=$1 BIN=$2
 shift 2
