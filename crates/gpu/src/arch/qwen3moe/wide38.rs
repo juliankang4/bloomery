@@ -23,7 +23,9 @@
 //!   GEMMs the kernel table names for the layer's type
 //!   (`crate::card_leg::StackW::route`: Q4_K, Q5_K, IQ3_XXS or IQ4_XS over
 //!   the run's q8_1 rows; NVFP4's planes over its 32-value rows), the card
-//!   slots' SwiGLU (`swiglu_quant32_sel`), the down GEMM of its type (the
+//!   slots' SwiGLU (`swiglu_quant32_sel`; with NVFP4's planes on a native
+//!   FP4 build the gate, the up and the SwiGLU are one launch,
+//!   `Gemm32Kernels::enqueue_gate_up_sel32`), the down GEMM of its type (the
 //!   file's Q5_1, Q8_0 or IQ4_NL blocks, or NVFP4's planes) and the card sum
 //!   into the unit's acc — the host tier
 //!   serves the rest of the slots, and the back adds the card sum on a
@@ -164,7 +166,8 @@ use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaFoldArgs;
 use crate::flash_gqa_prefill::GqaPrefillArgs;
 use crate::gemm::{
-    Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute, GemmWeight,
+    GateUp32Args, Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute,
+    GemmWeight,
 };
 use crate::hc_gated::{Before, HcMatrix, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::head::Head;
@@ -812,11 +815,12 @@ enum GateUp<'a> {
 /// batch nothing lands in): the places into `sel`, the route table over the
 /// map, the gate and up GEMMs, the SwiGLU over `sel` (every place below
 /// `n_places` a column it writes; the 32-value GEMM's NVFP4 up folds it into
-/// its own launch, `Gemm32Kernels::enqueue_up_swiglu32`) and the down GEMM
-/// into the run's `down_y` rows. Six launches, five with the fold; only the
-/// batch's slots are touched, so a pass's batches write the rows the whole
-/// pass always wrote, the same values in the same order — the bits do not
-/// move.
+/// its own launch, `Gemm32Kernels::enqueue_up_swiglu32`, and on a native FP4
+/// build the gate joins them, `Gemm32Kernels::enqueue_gate_up_sel32`) and the
+/// down GEMM into the run's `down_y` rows. Six launches, five with the fold;
+/// only the batch's slots are touched, so a pass's batches write the rows the
+/// whole pass always wrote, the same values in the same order — the bits do
+/// not move.
 #[allow(
     clippy::too_many_arguments,
     reason = "the batch's context, wait, ids, map, weights, width, places bound, sink, run rows and buffers (rust-quality R8)"
@@ -885,35 +889,22 @@ fn enqueue_gemm_batch(
                 sink,
             )?;
         }
-        GateUp::Blocks32([gate, up], x) => {
-            c.k.g32.enqueue_gemm32(
-                stream,
-                Gemm32Args {
-                    w: gate,
-                    rows_per_expert: geo::FF,
-                    act: x,
-                    route,
-                    input,
-                    y: g,
-                },
-            )?;
-            c.k.g32.enqueue_up_swiglu32(
-                stream,
-                Gemm32Args {
-                    w: up,
-                    rows_per_expert: geo::FF,
-                    act: x,
-                    route,
-                    input,
-                    y: u,
-                },
-                g,
+        GateUp::Blocks32(w, x) => c.k.g32.enqueue_gate_up_sel32(
+            stream,
+            GateUp32Args {
+                w,
+                rows_per_expert: geo::FF,
+                x,
+                route,
+                input,
                 sel,
-                n_places,
+                n_card: n_places,
+                g,
+                u,
                 act,
-                sink,
-            )?;
-        }
+            },
+            sink,
+        )?,
     }
     c.k.g32.enqueue_gemm32(
         stream,

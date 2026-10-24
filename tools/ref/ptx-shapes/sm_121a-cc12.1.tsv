@@ -148,6 +148,7 @@ generate_ds41 fp8_b128_tile_gemm 0 0
 generate_ds41 gap_coop 0 0
 generate_ds41 gap_coop_sync 0 0
 generate_ds41 gap_plain 0 0
+generate_ds41 gate_up_nvfp4_mma 0 0
 generate_ds41 gate_up_swiglu_q3k 0 0
 generate_ds41 gather_pairs 0 0
 generate_ds41 gdn_conv_prep 0 0

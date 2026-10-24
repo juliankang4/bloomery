@@ -1487,6 +1487,24 @@ pub struct Gemm32Args<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
+/// [`Gemm32Kernels::enqueue_gate_up_sel32`]'s arguments: a routed block's
+/// gate and up stacks `w` of `rows_per_expert` rows each over the activations
+/// `x` (read per `input`) through `route`'s last fill, the slots' places
+/// `sel` (those below `n_card` are the card's), the products' scratch `g` and
+/// `u` (`Gemm32Args::y`'s layout), and the down's activations `act`.
+pub struct GateUp32Args<'a> {
+    pub w: [Gemm32Weight<'a>; 2],
+    pub rows_per_expert: usize,
+    pub x: &'a GemmAct32,
+    pub route: &'a GemmRoute,
+    pub input: GemmInput,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n_card: usize,
+    pub g: &'a mut DeviceBuffer<f32>,
+    pub u: &'a mut DeviceBuffer<f32>,
+    pub act: &'a mut GemmAct32,
+}
+
 impl GemmRoute {
     /// The slot count of the last enqueued fill; `None` before one. A caller
     /// that owns a table for a known count holds its launches to it.
@@ -1917,5 +1935,106 @@ impl Gemm32Kernels {
         )?;
         act.fill(n_slots);
         Ok(())
+    }
+
+    /// Enqueue `act = q8_1_32(silu(gate · x) · (up · x))` over the slots of
+    /// the last fill of `route` ([`GateUp32Args`]): the gate GEMM
+    /// ([`Gemm32Kernels::enqueue_gemm32`]) into `g`, then
+    /// [`Gemm32Kernels::enqueue_up_swiglu32`] — or, on a native FP4 build with
+    /// both stacks in NVFP4 planes and `x` and `act` in the native form, one
+    /// launch that holds each tile's gate and up rows in the block and stores
+    /// the same Q8 bytes for every slot the route lists (`g`, `u` and `sel`
+    /// untouched), then `act`'s FP4 from them. Either way a GEMM over the same
+    /// route reads the same activations. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_gate_up_sel32(
+        &self,
+        stream: &CudaStream,
+        a: GateUp32Args<'_>,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let GateUp32Args {
+            w: [gate, up],
+            rows_per_expert,
+            x,
+            route,
+            input,
+            sel,
+            n_card,
+            g,
+            u,
+            act,
+        } = a;
+        #[cfg(bloomery_nvfp4_mma)]
+        if let (Gemm32Weight::Nvfp4Planes(gp), Gemm32Weight::Nvfp4Planes(upp)) = (gate, up)
+            && x.native.is_some()
+            && act.native.is_some()
+        {
+            const WHAT: &str = "Gemm32Kernels::enqueue_gate_up_sel32";
+            let l = Gemm32Launch::check(
+                WHAT,
+                &Gemm32Args {
+                    w: gate,
+                    rows_per_expert,
+                    act: x,
+                    route,
+                    input,
+                    y: g,
+                },
+            )?;
+            Gemm32Launch::check(
+                WHAT,
+                &Gemm32Args {
+                    w: up,
+                    rows_per_expert,
+                    act: x,
+                    route,
+                    input,
+                    y: u,
+                },
+            )?;
+            act.quant_launch(WHAT, l.n_slots as usize)?;
+            return self.native.gate_up(
+                stream,
+                super::nvfp4mma::GateUpArgs {
+                    w: [gp, upp],
+                    x,
+                    route,
+                    rows: l.rows,
+                    max_tiles: l.max_tiles,
+                    slot_div: l.slot_div,
+                    n_cols: l.n_slots as usize,
+                    act,
+                },
+                fault,
+            );
+        }
+        self.enqueue_gemm32(
+            stream,
+            Gemm32Args {
+                w: gate,
+                rows_per_expert,
+                act: x,
+                route,
+                input,
+                y: &mut *g,
+            },
+        )?;
+        self.enqueue_up_swiglu32(
+            stream,
+            Gemm32Args {
+                w: up,
+                rows_per_expert,
+                act: x,
+                route,
+                input,
+                y: u,
+            },
+            g,
+            sel,
+            n_card,
+            act,
+            fault,
+        )
     }
 }

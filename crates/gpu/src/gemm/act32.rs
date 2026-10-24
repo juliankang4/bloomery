@@ -592,27 +592,9 @@ pub(super) unsafe fn quant32_group(
     d: &mut cuda_device::DisjointSlice<f32>,
     s: &mut cuda_device::DisjointSlice<i32>,
 ) -> bool {
-    use cuda_device::warp;
-    let oct = lane >> 3;
     let i = lane & 7;
-    let b = 4 * g + oct;
-    let bad = warp::ballot(!crate::fault::quad_finite(v));
-    let refused = (bad >> (8 * oct)) & 0xff != 0;
-    let mut amax = v[0].abs().max(v[1].abs()).max(v[2].abs()).max(v[3].abs());
-    amax = amax.max(warp::shuffle_xor_f32(amax, 1));
-    amax = amax.max(warp::shuffle_xor_f32(amax, 2));
-    amax = amax.max(warp::shuffle_xor_f32(amax, 4));
-    let dv = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-    let (word, quad) = crate::cores::q8_quad(v, dv);
-    let mut sum = quad;
-    sum += warp::shuffle_xor(sum as u32, 1) as i32;
-    sum += warp::shuffle_xor(sum as u32, 2) as i32;
-    sum += warp::shuffle_xor(sum as u32, 4) as i32;
-    let (word, sum, dv) = if refused {
-        (0, 0, f32::NAN)
-    } else {
-        (word, sum, dv)
-    };
+    let b = 4 * g + (lane >> 3);
+    let (word, sum, dv, refused) = quant32_lane(v, lane);
     if b < blocks {
         // SAFETY: b < blocks <= 2·steps, so word 8b + i < 16·steps and entry
         // b < 2·steps of column col, inside the planes by this fn's contract;
@@ -626,4 +608,32 @@ pub(super) unsafe fn quant32_group(
         }
     }
     refused && b < blocks
+}
+
+/// Lane ℓ's share of its octet's 32-value block, the four values `v` of
+/// word `ℓ & 7`: the block's rule as [`quant32_group`] states it, returned
+/// as `(word, sum, d, refused)` — the lane's code word, the block's code sum
+/// and scale (the same on every lane of the octet) and whether the block
+/// holds a non-finite value (then `(0, 0, NaN, true)`). All 32 lanes of the
+/// warp call it; each octet is one block.
+#[inline(always)]
+pub(super) fn quant32_lane(v: [f32; 4], lane: usize) -> (u32, i32, f32, bool) {
+    use cuda_device::warp;
+    let bad = warp::ballot(!crate::fault::quad_finite(v));
+    let refused = (bad >> (8 * (lane >> 3))) & 0xff != 0;
+    let mut amax = v[0].abs().max(v[1].abs()).max(v[2].abs()).max(v[3].abs());
+    amax = amax.max(warp::shuffle_xor_f32(amax, 1));
+    amax = amax.max(warp::shuffle_xor_f32(amax, 2));
+    amax = amax.max(warp::shuffle_xor_f32(amax, 4));
+    let dv = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+    let (word, quad) = crate::cores::q8_quad(v, dv);
+    let mut sum = quad;
+    sum += warp::shuffle_xor(sum as u32, 1) as i32;
+    sum += warp::shuffle_xor(sum as u32, 2) as i32;
+    sum += warp::shuffle_xor(sum as u32, 4) as i32;
+    if refused {
+        (0, 0, f32::NAN, true)
+    } else {
+        (word, sum, dv, false)
+    }
 }

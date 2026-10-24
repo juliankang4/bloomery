@@ -72,7 +72,7 @@ pub(crate) use f32tile::{
     STAGES, TileRows, bf16_mma_body, bf16_mma_launch, bf16_mma_tile, f32_tile_body, land_values,
     mma_launch, mma_tile_origin, tile_launch,
 };
-pub use gemm32::{Gemm32Args, Gemm32Weight};
+pub use gemm32::{GateUp32Args, Gemm32Args, Gemm32Weight};
 pub use grouped::{GemmArgs, GemmInput, GemmWeight};
 pub use kernels::GemmKernels;
 pub use kernels32::Gemm32Kernels;
