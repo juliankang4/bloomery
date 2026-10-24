@@ -11,7 +11,10 @@
 # columns' addresses live beside the tile's waiting cells.
 # PIN(2026-10-24): 468 -> 492 spill bytes (sm_121a ptxas 13.3.73, GB10 driver 595.84) with the
 # weight-owned raster and split copied-stage loop. JIT local bytes remain unchanged.
-generate_ds41 hc_gated_up_mma_mix_4 492 176
+# PIN(2026-10-24): 492 -> 364 spill bytes, 176 -> 88 JIT local bytes (ptxas 13.3.73 sm_121a, GB10
+# driver 595.84): the exact-tile replay it inlines now sums two rows a thread a pass over the shared
+# two-lanes-a-thread tile body.
+generate_ds41 hc_gated_up_mma_mix_4 364 88
 generate_ds41 mamba2_steps 0 0
 generate_ds41 nvfp4_gemv_sel_f32 0 0
 # PIN(2026-10-23): measured on sm_121a, GB10, driver 595.84, CUDA 13.3.1. Shared GEMM epilogues retain exceptional range; the native 4K pair showed no throughput loss.

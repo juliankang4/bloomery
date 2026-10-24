@@ -234,7 +234,10 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # PIN(2026-10-24): 1112 -> 1352 spill bytes (sm_86 ptxas 13.3.73, GB10 build) with the weight-owned
 # raster and split copied-stage loop. The stack-frame pin is unchanged; the cc8.6 JIT and the new
 # stack frame were not measured.
-generate_ds41   hc_gated_up_mma_mix_4                 1352         176
+# PIN(2026-10-24): 1352 -> 484 spill bytes (sm_86 ptxas 13.3.73, read on GB10; the cc8.6 JIT and the
+# stack frame were not measured, so jit_local keeps its pin): the exact-tile replay it inlines now sums two
+# rows a thread a pass over the shared two-lanes-a-thread tile body.
+generate_ds41   hc_gated_up_mma_mix_4                  484         176
 generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
