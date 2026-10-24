@@ -417,7 +417,12 @@ impl NodeOpen {
                     None => {
                         Weights::load_placed(gpu.stream(), file, plan, self.card, card_dontneed)?
                     }
-                    Some(load) => load(gpu.stream(), plan, self.card, card_dontneed)?,
+                    Some(load) => {
+                        let available =
+                            workstation::host_available().map_err(|e| GpuError::plan(WHAT, e))?;
+                        let room = load.host_bytes(plan, self.card, available)?;
+                        load.load(gpu.stream(), plan, self.card, card_dontneed, room)?
+                    }
                 };
                 let experts = (family.experts)(&gpu, file, &tensors, &w, &self)?;
                 (w, experts)

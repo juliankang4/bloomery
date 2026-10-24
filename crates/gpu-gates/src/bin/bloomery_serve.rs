@@ -358,42 +358,43 @@ models (the --model word is optional with a model file: the file's architecture 
     /// the seat words. A qwen35moe file (Qwen3.6) is the qwen3 seat's.
     fn seat_of_file(generative: bool) -> Result<(Model, String), GateError> {
         let path = ref_model_path()?;
-        let split = model_file::header(&path)?;
-        let (seat, arch) = match split.architecture() {
-            Some(a) if side_seat::row(a).is_some() => {
-                return Err(format!(
-                    "{} is a {a} file, an embedding model: serve it beside a chat model with \
+        model_file::with_header(&path, |split| {
+            let (seat, arch) = match split.architecture() {
+                Some(a) if side_seat::row(a).is_some() => {
+                    return Err(format!(
+                        "{} is a {a} file, an embedding model: serve it beside a chat model with \
                      --embd-model",
-                    path.display()
-                )
-                .into());
-            }
-            Some(a) if !generative && decide::ROWS.iter().any(|r| r.backbones.contains(&a)) => {
-                return Err(format!(
-                    "{}: {}",
-                    path.display(),
-                    serve::decide::no_head(a, decide::ROWS)
-                )
-                .into());
-            }
-            Some(a) => (
-                Model::ALL
-                    .iter()
-                    .copied()
-                    .find(|m| m.serves(a))
-                    .ok_or_else(|| no_seat(&path, &split, a))?,
-                a.to_owned(),
-            ),
-            None => {
-                return Err(format!(
-                    "{}: the first shard names no architecture; the seats are --model {}",
-                    path.display(),
-                    seat_words()
-                )
-                .into());
-            }
-        };
-        Ok((seat, arch))
+                        path.display()
+                    )
+                    .into());
+                }
+                Some(a) if !generative && decide::ROWS.iter().any(|r| r.backbones.contains(&a)) => {
+                    return Err(format!(
+                        "{}: {}",
+                        path.display(),
+                        serve::decide::no_head(a, decide::ROWS)
+                    )
+                    .into());
+                }
+                Some(a) => (
+                    Model::ALL
+                        .iter()
+                        .copied()
+                        .find(|m| m.serves(a))
+                        .ok_or_else(|| no_seat(&path, split, a))?,
+                    a.to_owned(),
+                ),
+                None => {
+                    return Err(format!(
+                        "{}: the first shard names no architecture; the seats are --model {}",
+                        path.display(),
+                        seat_words()
+                    )
+                    .into());
+                }
+            };
+            Ok((seat, arch))
+        })?
     }
 
     /// The refusal of a file of architecture `a` that no seat serves: what no
@@ -425,12 +426,13 @@ models (the --model word is optional with a model file: the file's architecture 
     /// ([`ref_model_path`]) and its `<arch>.decision.type`, when it has one.
     fn file_facts() -> Result<(String, Option<String>), GateError> {
         let path = ref_model_path()?;
-        let split = model_file::header(&path)?;
-        let decision = bloomery_gpu_gates::model_file::decision_type(&split)?.map(str::to_owned);
-        Ok((
-            split.architecture().unwrap_or("<missing>").to_owned(),
-            decision,
-        ))
+        model_file::with_header(&path, |split| {
+            let decision = model_file::decision_type(split)?.map(str::to_owned);
+            Ok((
+                split.architecture().unwrap_or("<missing>").to_owned(),
+                decision,
+            ))
+        })?
     }
 
     /// The head the arguments name ([`serve::decide::pick`]) and the rest:

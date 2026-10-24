@@ -32,8 +32,7 @@ pub struct Opened {
 /// body does not read), is refused by name.
 #[cfg(feature = "checkpoint")]
 pub fn open(dir: &Path) -> Result<Opened, GateError> {
-    let f = model_hf::folder::open(dir)
-        .map_err(|e| format!("checkpoint folder {}: {e}", dir.display()))?;
+    let f = bloomery_gpu_gates::model_file::open_folder(dir)?;
     let arch = refset::arch::minimaxm3::ARCH;
     if f.header.architecture() != Some(arch) {
         return Err(format!(

@@ -2859,7 +2859,7 @@ fn resolve_shares(
         };
         let own = eligible(layers, stacks, model, routed)?;
         let uploads = card_uploads(model, c, rows, &own, routed)?;
-        let dense = footprint(card.granule_bytes, &uploads, &zeros)?;
+        let dense = Footprint::new(card.granule_bytes, &uploads).at(&zeros)?;
         let kv = kv_card.saturating_add(stage_rows);
         let floor = plan_floor(card, dense, kv, reserve);
         let cap = capped(card, None);
@@ -2898,7 +2898,7 @@ fn resolve_shares(
     let routable = eligible(0..model.layers, stacks, model, routed)?;
     let caps: Vec<u64> = (0..model.layers).map(|l| model.layer_experts(l)).collect();
     let experts = card_uploads(model, cards.len(), rows, &routable, routed)?;
-    let total = footprint(cards[0].granule_bytes, &experts, &caps)?;
+    let total = Footprint::new(cards[0].granule_bytes, &experts).at(&caps)?;
     let per = named
         .iter()
         .zip(card_budget::split(&parts, total))
@@ -6422,6 +6422,13 @@ mod tests {
                 need.bytes(),
                 "{how:?}: the classes sum to the need"
             );
+            let reading = HostNeed {
+                read_ahead: 17,
+                ..need
+            };
+            let with_reads = reading.classes(&plan, how).expect("a load's read reserve");
+            assert_eq!(with_reads.anon, got.anon + 17);
+            assert_eq!(with_reads.bytes(), reading.bytes());
         }
         // The table: each term's class under both holdings.
         let locked = Hosting {
@@ -6445,6 +6452,7 @@ mod tests {
                 (PageClass::Cache, PageClass::Cache),
                 (PageClass::Cache, PageClass::Cache),
                 (PageClass::Cache, PageClass::Locked),
+                (PageClass::Anon, PageClass::Anon),
                 (PageClass::Anon, PageClass::Pinned),
                 (PageClass::Unified, PageClass::Unified),
             ]

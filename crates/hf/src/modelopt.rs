@@ -1369,8 +1369,6 @@ fn append<'a>(
     Ok([rows, k])
 }
 
-
-
 /// The stored tensor `name` of dtype `want` whose bytes fill its shape; bytes that do not are
 /// `unfilled`'s refusal of the tensor, with what is wrong.
 fn stored<'a>(

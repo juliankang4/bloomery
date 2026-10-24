@@ -24,8 +24,7 @@ pub struct Opened {
 /// architecture is refused by name.
 #[cfg(feature = "checkpoint")]
 pub fn open(path: &Path) -> Result<Opened, GateError> {
-    let mut f = model_hf::folder::open(path)
-        .map_err(|e| format!("checkpoint folder {}: {e}", path.display()))?;
+    let mut f = bloomery_gpu_gates::model_file::open_folder(path)?;
     if f.header.architecture() != Some("qwen4exp") {
         return Err(format!(
             "checkpoint folder {}: a {} model, where this seat serves qwen4exp",

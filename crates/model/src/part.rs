@@ -159,6 +159,37 @@ pub struct Planned {
     pub info: TensorInfo,
 }
 
+/// One read's leading parts, bounded by normalized payload and owned host room. An oversized
+/// first part runs alone; the caller checks its returned peak before allocating it.
+/// `costs` holds each already-checked part's owned read and packing bytes.
+pub fn read_ahead(planned: &[Planned], costs: &[u64], room: u64) -> Result<(usize, u64), Error> {
+    const PAYLOAD: u64 = 8 << 30;
+    if planned.len() != costs.len() {
+        return Err(refuse(
+            "read-ahead",
+            "the parts and their costs differ in length",
+        ));
+    }
+    let (mut n, mut bytes, mut payload) = (0, 0u64, 0u64);
+    for (p, &cost) in planned.iter().zip(costs) {
+        let next = bytes
+            .checked_add(cost)
+            .ok_or_else(|| refuse(&p.info.name, "read-ahead bytes pass u64"))?;
+        let more = payload
+            .checked_add(p.info.nbytes)
+            .ok_or_else(|| refuse(&p.info.name, "read-ahead payload passes u64"))?;
+        if n > 0 && (more > PAYLOAD || next > room) {
+            break;
+        }
+        (bytes, payload) = (next, more);
+        n += 1;
+        if payload > PAYLOAD || bytes > room {
+            break;
+        }
+    }
+    Ok((n, bytes))
+}
+
 /// A part's bytes in its card type ([`Source::read`]), with its header entry and the tensor
 /// scales its type reads.
 pub struct Part<'s> {
@@ -226,6 +257,11 @@ pub trait Source {
         rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
     ) -> Result<Vec<Planned>, Self::Error>;
 
+    /// An upper bound on the owned payload bytes a read of `p` holds, including its result,
+    /// normalization scratch, stored inputs and a contiguous copy for a packed upload.
+    /// Borrowed file pages are not owned bytes.
+    fn read_bytes(&self, p: &Planned) -> Result<u64, Self::Error>;
+
     /// The bytes of the part `p` planned ([`Source::plan`]) and the tensor scales its type reads;
     /// a tensor no longer in the source is refused by name.
     fn read(&self, p: &Planned) -> Result<Part<'_>, Self::Error>;
@@ -261,6 +297,10 @@ impl<S: Source, F: Fn(&str) -> bool> Source for Filtered<'_, S, F> {
         })
     }
 
+    fn read_bytes(&self, p: &Planned) -> Result<u64, Self::Error> {
+        self.source.read_bytes(p)
+    }
+
     fn read(&self, p: &Planned) -> Result<Part<'_>, Self::Error> {
         self.source.read(p)
     }
@@ -289,6 +329,29 @@ impl Source for Split {
             }
         }
         Ok(out)
+    }
+
+    fn read_bytes(&self, p: &Planned) -> Result<u64, Error> {
+        let name = &p.info.name;
+        let (_, t) = self
+            .find(name)
+            .ok_or_else(|| refuse(name, "is not in the file"))?;
+        // A noncontiguous rank cut needs a contiguous copy when its upload packs planes.
+        // tensor_scales may also hold the whole scale vector beside a rank's cut of it.
+        let scales = if t.ty.reads_scale() {
+            t.dims
+                .last()
+                .copied()
+                .unwrap_or(1)
+                .checked_mul(8)
+                .ok_or_else(|| refuse(name, "scale read bytes pass u64"))?
+        } else {
+            0
+        };
+        p.info
+            .nbytes
+            .checked_add(scales)
+            .ok_or_else(|| refuse(name, "row copy and scale read bytes pass u64"))
     }
 
     /// A scale the file lacks or does not hold as its type reads it is refused by name.
@@ -323,6 +386,52 @@ mod tests {
     use gguf::write::{Layout, TensorDecl};
 
     #[test]
+    fn a_read_takes_the_parts_that_fit_and_at_least_one() {
+        let part = |nbytes| Planned {
+            at: None,
+            info: TensorInfo {
+                name: "p".into(),
+                dims: vec![1],
+                ty: GgmlType::F32,
+                offset: 0,
+                nbytes,
+            },
+        };
+        let gib = 1u64 << 30;
+        let parts = [part(3 * gib), part(5 * gib), part(4)];
+        assert_eq!(
+            read_ahead(&parts, &[6 * gib, 10 * gib, 8], 16 * gib).unwrap(),
+            (2, 16 * gib)
+        );
+        assert_eq!(
+            read_ahead(&parts, &[6 * gib, 10 * gib, 8], 16 * gib - 1).unwrap(),
+            (1, 6 * gib)
+        );
+        assert_eq!(
+            read_ahead(&[part(9 * gib), part(4)], &[9 * gib, 4], 20 * gib).unwrap(),
+            (1, 9 * gib)
+        );
+        assert_eq!(
+            read_ahead(&[part(gib)], &[2 * gib], gib).unwrap(),
+            (1, 2 * gib)
+        );
+        assert_eq!(read_ahead(&[], &[], 0).unwrap(), (0, 0));
+        let small = vec![part(32 << 20); 256];
+        let costs = vec![192 << 20; 256];
+        assert_eq!(
+            read_ahead(&small, &costs, (1024 - 96) << 20).unwrap(),
+            (4, 768 << 20)
+        );
+        assert_eq!(
+            read_ahead(&small, &costs, 48 * gib).unwrap(),
+            (256, 48 * gib)
+        );
+        assert!(read_ahead(&parts, &[], gib).is_err());
+        assert!(read_ahead(&[part(4), part(4)], &[1, u64::MAX], u64::MAX).is_err());
+        assert!(read_ahead(&[part(4), part(u64::MAX)], &[1, 1], u64::MAX).is_err());
+    }
+
+    #[test]
     fn shared_parts_are_planned_only_for_the_selected_component() {
         let names = ["target.weight", "draft.weight"];
         let layout = Layout::new(
@@ -347,6 +456,8 @@ mod tests {
             let parts = selected
                 .plan(|_, _, _| Ok::<_, std::convert::Infallible>(Take::Whole))
                 .unwrap();
+            assert_eq!(source.read_bytes(&parts[0]).unwrap(), 4);
+            assert_eq!(selected.read_bytes(&parts[0]).unwrap(), 4);
             assert_eq!(
                 parts
                     .iter()

@@ -1,8 +1,8 @@
 //! The one load of a part source onto a card (`model::part::Source`: a GGUF file or a
 //! checkpoint folder). The caller's rule says which tensors the card holds, whole, the part of
 //! a rank, or a stack's listed experts, as the source plans them; every planned part's card
-//! format is checked before any is read; then each part is read and staged in turn through one
-//! staging ring, which one synchronize ends ([`load`]). A rank of a tensor-parallel load of N
+//! format is checked before any is read; then parts are read a run at a time over the pool and
+//! staged in order through one staging ring, which one synchronize ends ([`load`]). A rank of a tensor-parallel load of N
 //! ranks passes its family's cut; a one-card load passes its placement plan's card
 //! ([`OnCard`]), and a folder whose host reads tensors where its located header holds them
 //! passes those ([`InPlace`]): the card takes its share of a stack the plan splits between it
@@ -12,63 +12,225 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cuda_core::CudaStream;
 use gguf::{GgmlType, Place, Split, TensorInfo};
-use model::part::{Source, Take};
+use model::part::{Planned, Source, Take, read_ahead};
 use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan, Segment};
 
 use crate::GpuError;
-use crate::upload::UploadRing;
+use crate::upload::{UploadRing, pool_map};
 use crate::weights::{TensorPart, Weights, part_format, stage_parts};
 
 /// What the errors name.
 const WHAT: &str = "parts::load";
 
-/// The parts of `source` that `rule` takes, each read and uploaded to the card of `stream` in
-/// the card format `card` names for it, else its type's ([`part_format`]). Every part is planned
-/// and its format checked, and refused by name, before any is read; then one part at a time is
-/// read and staged, so the load holds one part's bytes of its own beside the card (a file's
-/// parts are its mapping's and hold none). The weights are the caller's only once every copy
-/// has ended: a refusal at any part drops what was staged. Under `release` each part's file
-/// pages are dropped once it is staged ([`Source::release`]), as a split's placed load drops its
-/// card segments' (`BLOOMERY_CARD_DONTNEED`).
-pub fn load<S: Source, E: std::fmt::Display>(
+/// The parts selected by `rule`, read over the pool in runs bounded by owned read and packing
+/// bytes, then staged in plan order. Oversized parts run alone. The placed caller reserves
+/// `LoadPlan::host_bytes` in its host need; standalone loads check the live host reading.
+/// A refusal drains pending copies before freeing device buffers. Under `release`, each
+/// run's source pages are dropped after staging.
+pub fn load<S: Source + Sync, E: std::fmt::Display>(
     stream: &CudaStream,
     source: &S,
     rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
     card: impl Fn(&TensorInfo) -> Option<CardFormat>,
     release: bool,
 ) -> Result<Weights, GpuError> {
-    let planned = source.plan(rule).map_err(|e| refused(e.to_string()))?;
-    let mut budget = 0usize;
-    for p in &planned {
-        budget = budget
-            .checked_add(part_format(&p.info)?.1)
-            .ok_or_else(|| refused("the parts' staging bytes pass usize".into()))?;
+    let available =
+        model::placement::workstation::host_available().map_err(|e| refused(e.to_string()))?;
+    let plan = LoadPlan::new(source, rule, available)?;
+    load_plan(stream, source, &plan, card, release, available)
+}
+
+fn load_plan<S: Source + Sync>(
+    stream: &CudaStream,
+    source: &S,
+    plan: &LoadPlan,
+    card: impl Fn(&TensorInfo) -> Option<CardFormat>,
+    release: bool,
+    available: u64,
+) -> Result<Weights, GpuError> {
+    plan.check(available)?;
+    for p in &plan.parts {
         if let Some(format) = card(&p.info) {
             card_layout(&p.info, format)?;
         }
     }
     stream.context().bind_to_thread()?;
     let mut staged = BTreeMap::new();
-    // Made after `staged` and dropped before it: its drop drains the copies, so no buffer of a
-    // refused load is freed while a copy still writes it.
-    let mut ring = UploadRing::new(stream, budget)?;
-    for p in &planned {
-        let part = source.read(p).map_err(|e| refused(e.to_string()))?;
-        let one = TensorPart {
-            info: part.info.clone(),
-            spans: part.spans(),
-            scale: part.scale.clone(),
-        };
-        let held = |name: &str| staged.contains_key(name);
-        let added = stage_parts(stream, &mut ring, &[one], held, &card)?;
-        staged.extend(added);
-        drop(part);
-        if release {
-            source.release(p).map_err(|e| refused(e.to_string()))?;
+    // Dropped before the staged device buffers: draining the ring protects refused loads.
+    let mut ring = UploadRing::new(stream, plan.upload_bytes)?;
+    for run in plan.checked_runs(|| {
+        model::placement::workstation::host_available().map_err(|e| refused(e.to_string()))
+    }) {
+        let run = run?;
+        let parts = pool_map(run.iter().collect(), |p| {
+            source.read(p).map_err(|e| e.to_string())
+        });
+        let mut done = Vec::with_capacity(run.len());
+        for (p, part) in run.iter().zip(parts) {
+            let part = part.map_err(refused)?;
+            let one = TensorPart {
+                info: part.info.clone(),
+                spans: part.spans(),
+                scale: part.scale.clone(),
+            };
+            let held = |name: &str| staged.contains_key(name);
+            let added = stage_parts(stream, &mut ring, &[one], held, &card)?;
+            staged.extend(added);
+            done.push((p, part));
         }
+        let released = pool_map(done, |(p, part)| {
+            drop(part);
+            match release {
+                true => source.release(p).map_err(|e| e.to_string()),
+                false => Ok(()),
+            }
+        });
+        released
+            .into_iter()
+            .collect::<Result<(), _>>()
+            .map_err(refused)?;
     }
     ring.finish(stream)?;
     Ok(Weights::of_staged(staged))
+}
+
+/// A placed source shares one admission and upload implementation across model components.
+pub(crate) struct PlacedSource<S> {
+    pub(crate) source: S,
+    pub(crate) in_place: InPlace,
+}
+
+impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
+    fn host_bytes(&self, plan: &Plan<'_>, card: usize, room: u64) -> Result<u64, GpuError> {
+        Ok(
+            LoadPlan::placed(&self.source, plan, card, &self.in_place, room)?
+                .1
+                .host_bytes,
+        )
+    }
+
+    fn load(
+        &self,
+        stream: &CudaStream,
+        plan: &Plan<'_>,
+        card: usize,
+        release: bool,
+        room: u64,
+    ) -> Result<Weights, GpuError> {
+        load_placed_in_place(
+            stream,
+            &self.source,
+            plan,
+            card,
+            release,
+            &self.in_place,
+            room,
+        )
+    }
+}
+
+/// Parts, their bounded parallel reads and the peak owned host bytes reserved before loading.
+struct LoadPlan {
+    parts: Vec<Planned>,
+    runs: Vec<(std::ops::Range<usize>, u64)>,
+    host_bytes: u64,
+    upload_bytes: usize,
+}
+
+impl LoadPlan {
+    fn checked_runs<'a>(
+        &'a self,
+        mut available: impl FnMut() -> Result<u64, GpuError> + 'a,
+    ) -> impl Iterator<Item = Result<&'a [Planned], GpuError>> + 'a {
+        self.runs.iter().map(move |(range, bytes)| {
+            // The ring is already paid for in the live reading.
+            let live = available()?;
+            if *bytes > live {
+                return Err(refused(format!(
+                    "part read-ahead needs {bytes} B, the host has {live} B available"
+                )));
+            }
+            Ok(&self.parts[range.clone()])
+        })
+    }
+
+    fn check(&self, available: u64) -> Result<(), GpuError> {
+        if self.host_bytes > available {
+            return Err(refused(format!(
+                "part read-ahead needs {} B, the host has {available} B available",
+                self.host_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn new<S: Source, E: std::fmt::Display>(
+        source: &S,
+        rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
+        room: u64,
+    ) -> Result<Self, GpuError> {
+        let parts = source.plan(rule).map_err(|e| refused(e.to_string()))?;
+        let mut upload_bytes = 0usize;
+        let mut costs = Vec::with_capacity(parts.len());
+        for p in &parts {
+            let staged = part_format(&p.info)?.1;
+            upload_bytes = upload_bytes
+                .checked_add(staged)
+                .ok_or_else(|| refused("the parts' staging bytes pass usize".into()))?;
+            // Packing capacity and scale copies coexist with the entire run's read results.
+            let cost = source
+                .read_bytes(p)
+                .map_err(|e| refused(e.to_string()))?
+                .checked_add(
+                    (staged as u64).checked_mul(2).ok_or_else(|| {
+                        refused(format!("{}: packing bytes pass u64", p.info.name))
+                    })?,
+                )
+                .ok_or_else(|| refused(format!("{}: read-ahead bytes pass u64", p.info.name)))?;
+            costs.push(cost);
+        }
+        let mut runs = Vec::new();
+        let mut host_bytes = 0;
+        let mut at = 0;
+        while at < parts.len() {
+            let (n, bytes) = read_ahead(
+                &parts[at..],
+                &costs[at..],
+                room.saturating_sub(UploadRing::HOST_MAX),
+            )
+            .map_err(|e| refused(e.to_string()))?;
+            runs.push((at..at + n, bytes));
+            host_bytes = host_bytes.max(bytes);
+            at += n;
+        }
+        if host_bytes > 0 {
+            host_bytes = host_bytes
+                .checked_add(UploadRing::HOST_MAX)
+                .ok_or_else(|| refused("the parts' read-ahead and ring bytes pass u64".into()))?;
+        }
+        Ok(Self {
+            parts,
+            runs,
+            host_bytes,
+            upload_bytes,
+        })
+    }
+
+    fn placed<S: Source>(
+        source: &S,
+        plan: &Plan<'_>,
+        card: usize,
+        in_place: &InPlace,
+        room: u64,
+    ) -> Result<(OnCard, Self), GpuError> {
+        let on = OnCard::of_in_place(plan, card, in_place)?;
+        let selected = model::part::Filtered {
+            source,
+            keep: |name: &str| plan.model.tensors.iter().any(|t| t.name == name),
+        };
+        let read = Self::new(&selected, |name, _, _| on.take(name), room)?;
+        Ok((on, read))
+    }
 }
 
 /// The tensors a located header holds in place (`gguf::Place::File` or `gguf::Place::Stack`),
@@ -293,21 +455,25 @@ impl OnCard {
 /// Card `card` of `plan` from `source` ([`OnCard::of_in_place`], [`load`], each part's pages
 /// released under `release`), checked against the plan; the host reads the tensors `in_place`
 /// names where they are stored.
-pub fn load_placed_in_place<S: Source>(
+pub fn load_placed_in_place<S: Source + Sync>(
     stream: &CudaStream,
     source: &S,
     plan: &Plan<'_>,
     card: usize,
     release: bool,
     in_place: &InPlace,
+    room: u64,
 ) -> Result<Weights, GpuError> {
-    let on = OnCard::of_in_place(plan, card, in_place)?;
-    let w = load(
+    let (on, read) = LoadPlan::placed(source, plan, card, in_place, room)?;
+    let available =
+        model::placement::workstation::host_available().map_err(|e| refused(e.to_string()))?;
+    let w = load_plan(
         stream,
         source,
-        |name, _, _| on.take(name),
+        &read,
         |t| on.format(t),
         release,
+        available.min(room),
     )?;
     on.check(&w)?;
     Ok(w)
@@ -395,6 +561,95 @@ fn refused(detail: String) -> GpuError {
 mod tests {
     use super::*;
     use model::placement::Role;
+
+    #[test]
+    fn later_reads_use_their_own_peak_under_a_falling_host_room() {
+        let mib = 1u64 << 20;
+        let decls = [64, 8]
+            .into_iter()
+            .map(|n| gguf::write::TensorDecl {
+                name: format!("p{n}.weight"),
+                dims: vec![64, n * mib / 256],
+                type_id: GgmlType::F32.as_u32(),
+                nbytes: n * mib,
+            })
+            .collect();
+        let layout = gguf::write::Layout::new(&[], decls).unwrap();
+        let source =
+            Split::header_only(std::path::PathBuf::from("/synthetic/falling-room"), &layout)
+                .unwrap();
+        let plan =
+            LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 300 * mib).unwrap();
+        assert_eq!(plan.runs, [(0..1, 192 * mib), (1..2, 24 * mib)]);
+        assert_eq!(plan.host_bytes, 288 * mib);
+        plan.check(300 * mib).unwrap();
+        assert!(plan.check(288 * mib - 1).is_err());
+        for readings in [[228, 164], [192, 24]] {
+            let mut rooms = readings.into_iter();
+            let runs = plan
+                .checked_runs(|| Ok(rooms.next().unwrap() * mib))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("each remaining run fits its live room");
+            assert_eq!(
+                runs.iter()
+                    .map(|r| r[0].info.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["p64.weight", "p8.weight"]
+            );
+        }
+        let mut rooms = [228, 23].into_iter();
+        let mut runs = plan.checked_runs(|| Ok(rooms.next().unwrap() * mib));
+        assert!(runs.next().unwrap().is_ok());
+        let error = runs.next().unwrap().unwrap_err().to_string();
+        assert!(error.contains("needs 25165824 B"), "{error}");
+        assert!(error.contains("24117248 B available"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_a_parts_load_refuses_a_short_host_before_reading() {
+        struct Owned;
+        impl Source for Owned {
+            type Error = std::io::Error;
+            fn plan<E: std::fmt::Display>(
+                &self,
+                rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
+            ) -> Result<Vec<Planned>, Self::Error> {
+                let info = TensorInfo {
+                    name: "owned.weight".into(),
+                    ty: GgmlType::BF16,
+                    dims: vec![64, 262144],
+                    offset: 0,
+                    nbytes: 32 << 20,
+                };
+                rule(&info.name, info.ty, &info.dims)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Ok(vec![Planned { at: None, info }; 256])
+            }
+            fn read_bytes(&self, p: &Planned) -> Result<u64, Self::Error> {
+                Ok(p.info.nbytes * 2)
+            }
+            fn read(&self, _: &Planned) -> Result<model::part::Part<'_>, Self::Error> {
+                Err(std::io::Error::other("read before host admission"))
+            }
+        }
+        let plan =
+            LoadPlan::new(&Owned, |_, _, _| Ok::<_, String>(Take::Whole), 128 << 20).unwrap();
+        assert_eq!(plan.runs.len(), 256);
+        assert_eq!(plan.host_bytes, (192 + 3 * 32) << 20);
+        let gpu = crate::Gpu::with_device(0).unwrap();
+        let error = load_plan(gpu.stream(), &Owned, &plan, |_| None, false, 128 << 20)
+            .err()
+            .expect("a short host must refuse the load")
+            .to_string();
+        assert!(
+            error.contains("part read-ahead needs 301989888 B"),
+            "{error}"
+        );
+        assert!(error.contains("134217728 B available"), "{error}");
+        assert!(plan.check(plan.host_bytes).is_ok());
+        assert!(plan.check(plan.host_bytes - 1).is_err());
+    }
 
     /// The rule a load from a part source plans by: a tensor whole on the card is taken in the
     /// plan's card format, an unused tensor, a row-gathered table on the NVMe tier and a tensor

@@ -19,7 +19,7 @@ use hf::modelopt::{self, Normal, Use};
 use hf::quant_config::{Placed, Plan};
 use model::part::{self, At, Part, Planned, Source, Take};
 use model::placement::ExpertList;
-use model::placement::tp::{TpError, part_of};
+use model::placement::tp::TpError;
 use safetensors::{Dtype, Folder, Raw};
 
 /// Why a part was refused.
@@ -215,6 +215,56 @@ impl Source for Checkpoint {
             out.push(Planned { at, info });
         }
         Ok(out)
+    }
+
+    fn read_bytes(&self, p: &Planned) -> Result<u64, Error> {
+        let name = &p.info.name;
+        let m = self
+            .made
+            .get(name)
+            .ok_or_else(|| refuse(name, "is not one the map makes"))?;
+        let placed = self.placed(m);
+        let ty = self.card_type(name, m)?;
+        let whole = whole(name, ty, &m.dims)?;
+        let cut = p.at.is_some() && m.step.is_none();
+        let format = modelopt::format_of(&placed)?;
+        let compressed = matches!(
+            format,
+            hf::quant_config::Format::Nvfp4Csf | hf::quant_config::Format::Nvfp4Csf32
+        );
+        let plain = matches!(
+            format,
+            hf::quant_config::Format::Bf16 | hf::quant_config::Format::F32
+        );
+        // Direct inputs, or growing cut buffers; decoded companion words and widened plain
+        // values coexist with them. A step may shrink the tensor, so its pre-step output is
+        // bounded from the stored bytes too. Output capacity can grow to twice its length.
+        let mut bytes = 0u64;
+        for n in stored(&placed) {
+            let companion = !m.sources.iter().any(|source| source == n);
+            let factor = if cut { 2u64 } else { 1 }
+                + u64::from(compressed) * 2
+                + u64::from(m.step.is_some()) * 3
+                + u64::from(plain || companion) * 4;
+            let (_, range) = self.folder.file_range(n)?;
+            bytes = range
+                .end
+                .checked_sub(range.start)
+                .and_then(|n| n.checked_mul(factor))
+                .and_then(|n| n.checked_add((2 * DIRECT_ALIGN) as u64))
+                .and_then(|n| bytes.checked_add(n))
+                .ok_or_else(|| refuse(name, "stored read bytes pass u64"))?;
+        }
+        let normal = if cut { p.info.nbytes } else { whole.nbytes };
+        let moved = if m.step.is_some() { whole.nbytes } else { 0 };
+        normal
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(moved))
+            .and_then(|n| n.checked_add(p.info.nbytes))
+            .and_then(|n| n.checked_add(if compressed { whole.nbytes } else { 0 }))
+            .and_then(|n| n.checked_add((m.sources.len() as u64).checked_mul(8)?))
+            .and_then(|n| bytes.checked_add(n))
+            .ok_or_else(|| refuse(name, "normalized read bytes pass u64"))
     }
 
     /// A tensor its format refuses, or that does not normalize into the planned type and bytes,
@@ -1050,6 +1100,52 @@ pub(crate) mod tests {
                 Take::Skip
             })
         }
+    }
+
+    #[test]
+    fn read_peaks_cover_the_owned_inputs_and_results() {
+        let dir = temp_dir("read-peak");
+        let mut c = checkpoint(&dir);
+        let shrinking = c.made.get_mut("mx.weight").unwrap();
+        shrinking.dims[1] = 1;
+        shrinking.step = Some(Box::new(|n| {
+            let row = n.bytes.len() / n.dims[1] as usize;
+            n.bytes.truncate(row);
+            n.dims[1] = 1;
+            Ok(())
+        }));
+        let planned = c.plan(|_, _, _| Ok::<_, String>(Take::Whole)).unwrap();
+        for p in &planned {
+            let read_bytes = c.read_bytes(p).unwrap();
+            let part = c.read(p).unwrap();
+            let output: u64 = part.spans().iter().map(|s| s.len() as u64).sum();
+            let made = &c.made[&p.info.name];
+            let placed = c.placed(made);
+            let before = modelopt::normalize(|n| c.folder.raw(n), &placed, made.role).unwrap();
+            let output = output.max(before.bytes.capacity() as u64);
+            let stored: u64 = stored(&placed)
+                .map(|n| {
+                    let (_, r) = c.folder.file_range(n).unwrap();
+                    let (_, span, _) = aligned_span(r.start, r.end - r.start);
+                    (span + DIRECT_ALIGN) as u64
+                })
+                .sum();
+            assert!(
+                read_bytes >= stored + output,
+                "{}: {read_bytes} < {}",
+                p.info.name,
+                stored + output
+            );
+        }
+        let p = planned.iter().find(|p| p.info.name == "v.weight").unwrap();
+        c.made.get_mut("v.weight").unwrap().dims = vec![u64::MAX, 2];
+        assert!(
+            c.read_bytes(p)
+                .unwrap_err()
+                .to_string()
+                .contains("v.weight")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -260,7 +260,7 @@ impl Mtp38 {
     pub fn open(
         gpu: &Gpu,
         target_w: &Weights,
-        (draft_file, parts): (&Split, Option<&crate::model::PartsLoad<'_>>),
+        (draft_file, parts): (&Split, Option<&dyn crate::model::PartsLoad>),
         mtp: &model::arch::qwen35moe::place::MtpInputs,
         plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
         card_dontneed: bool,
@@ -309,7 +309,13 @@ impl Mtp38 {
         )?;
         let rows = file_rows(&plan.draft);
         let mut w = match parts {
-            Some(load) => load(stream, &rows, 0, card_dontneed)?,
+            Some(parts) => {
+                let available = model::placement::workstation::host_available()
+                    .map_err(|e| GpuError::plan(WHAT, e))?;
+                let (need, room) = parts.host_need(&rows, 0, 0, available)?;
+                need.check(available).map_err(|e| GpuError::plan(WHAT, e))?;
+                parts.load(stream, &rows, 0, card_dontneed, room)?
+            }
             None => Weights::load_placed(stream, draft_file, &rows, 0, card_dontneed)?,
         };
         for t in &mtp.tensors {

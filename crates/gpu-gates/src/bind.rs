@@ -3597,6 +3597,7 @@ mod tests {
                 shadows: 0,
                 reserves: 0,
                 extra: 0,
+                read_ahead: 0,
                 arena: 0,
                 cards: 0,
                 os: 0,

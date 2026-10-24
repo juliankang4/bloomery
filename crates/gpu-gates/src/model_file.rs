@@ -29,6 +29,47 @@ pub use fetch::{
 pub(crate) const NONE: &str = "no model file: pass -m PATH (the first shard, or a checkpoint folder) \
                                or --hf <repo>[:<quant>], or set BLOOMERY_REF_MODEL";
 
+#[cfg(feature = "checkpoint")]
+static KEPT: std::sync::Mutex<Option<(PathBuf, model_hf::folder::Opened)>> =
+    std::sync::Mutex::new(None);
+
+/// The folder at `path`, reusing the open whose header selected its server seat.
+#[cfg(feature = "checkpoint")]
+pub fn open_folder(path: &Path) -> Result<model_hf::folder::Opened, GateError> {
+    let kept = KEPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    match kept {
+        Some((p, opened)) if p == path => Ok(opened),
+        _ => read_folder(path),
+    }
+}
+
+#[cfg(feature = "checkpoint")]
+fn read_folder(path: &Path) -> Result<model_hf::folder::Opened, GateError> {
+    model_hf::folder::open(path)
+        .map_err(|e| format!("checkpoint folder {}: {e}", path.display()).into())
+}
+
+/// `f` of the model's header, keeping a checkpoint folder for its seat's open.
+pub fn with_header<R>(path: &Path, f: impl FnOnce(&Split) -> R) -> Result<R, GateError> {
+    #[cfg(feature = "checkpoint")]
+    if path.is_dir() {
+        let mut kept = KEPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let opened = match kept.take() {
+            Some((p, opened)) if p == path => opened,
+            _ => read_folder(path)?,
+        };
+        let result = f(&opened.header);
+        *kept = Some((path.to_path_buf(), opened));
+        return Ok(result);
+    }
+    header(path).map(|header| f(&header))
+}
+
 /// The header of the model at `path`, which a server seats it by and `-ngl N` is compared with:
 /// its GGUF split's first shard, or a checkpoint folder's when `path` is a directory, which the
 /// map its config names reads (`model_hf::folder::open`), so the seat is chosen from the header's
@@ -43,9 +84,7 @@ pub fn header(path: &Path) -> Result<Split, GateError> {
 /// The header of the checkpoint folder `path`.
 #[cfg(feature = "checkpoint")]
 fn folder_header(path: &Path) -> Result<Split, GateError> {
-    model_hf::folder::open(path)
-        .map(|f| f.header)
-        .map_err(|e| format!("checkpoint folder {}: {e}", path.display()).into())
+    read_folder(path).map(|f| f.header)
 }
 
 /// A checkpoint folder in a build without the `checkpoint` feature, refused by name.

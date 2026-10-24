@@ -907,7 +907,6 @@ pub fn fp4_pair(byte: u8) -> [i8; 2] {
 /// plane runs it, and qdot's AVX2 body is held to it bit for bit.
 #[inline]
 #[must_use]
-#[inline]
 pub fn nvfp4_group_to_block(g: &[u8; 8]) -> [u8; 8] {
     let spread = |half: [u8; 4]| {
         let x = u64::from(u32::from_le_bytes(half));

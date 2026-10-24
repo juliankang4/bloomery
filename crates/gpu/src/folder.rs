@@ -11,23 +11,18 @@
 //! machine's source reads the experts where the folder stores them, through the located header
 //! (`crate::host::swap_source::FileSwap`).
 
-use cuda_core::CudaStream;
 use gguf::Split;
 use model::part::Source;
-use model::placement::Plan;
 
 use crate::GpuError;
 use crate::host::swap::Residency;
 use crate::model::CardBytes;
-use crate::parts::{InPlace, load_placed_in_place};
-use crate::weights::Weights;
+use crate::parts::{InPlace, PlacedSource};
 
 /// What the errors name.
 const WHAT: &str = "folder::Model::into_origin";
 
-/// The card's tensors of a plan from a part source ([`load_placed_in_place`]).
-type CardParts =
-    Box<dyn Fn(&CudaStream, &Plan<'_>, usize, bool) -> Result<Weights, GpuError> + Send>;
+type CardParts = Box<dyn crate::model::PartsLoad>;
 
 /// The model a load reads: a GGUF split, or a checkpoint folder ([`Folder`]). `X` is what the
 /// folder's architecture carries beside the folder's parts.
@@ -91,7 +86,7 @@ impl<X> From<Folder<X>> for Model<X> {
 /// `gguf::Split::header_only` for a folder whose host reads nothing where the folder stores it),
 /// the header its plan is made from, whose in-place tensors the host reads where the folder
 /// stores them ([`InPlace`]), and its card tensors through its part source
-/// ([`load_placed_in_place`]). `X` is the architecture's own addition to the load, `()` for
+/// ([`crate::parts::load_placed_in_place`]). `X` is the architecture's own addition to the load, `()` for
 /// none.
 pub struct Folder<X = ()> {
     header: Split,
@@ -103,17 +98,15 @@ impl<X> Folder<X> {
     /// The folder of header `header`, its card tensors read from `source`, with the
     /// architecture's `extra`. A load reads only its plan's tensors of the source, so the source
     /// may also hold another plan's (a draft's, which loads through [`Origin::bytes`] too).
-    pub fn with<S: Source + Send + 'static>(header: Split, source: S, extra: X) -> Folder<X> {
+    pub fn with<S: Source + Send + Sync + 'static>(
+        header: Split,
+        source: S,
+        extra: X,
+    ) -> Folder<X> {
         let in_place = InPlace::of(&header);
         Folder {
             header,
-            parts: Box::new(move |stream, plan, card, release| {
-                let selected = model::part::Filtered {
-                    source: &source,
-                    keep: |name: &str| plan.model.tensors.iter().any(|t| t.name == name),
-                };
-                load_placed_in_place(stream, &selected, plan, card, release, &in_place)
-            }),
+            parts: Box::new(PlacedSource { source, in_place }),
             extra,
         }
     }
@@ -121,7 +114,7 @@ impl<X> Folder<X> {
 
 impl Folder {
     /// The folder of header `header`, its card tensors read from `source`.
-    pub fn new<S: Source + Send + 'static>(header: Split, source: S) -> Folder {
+    pub fn new<S: Source + Send + Sync + 'static>(header: Split, source: S) -> Folder {
         Folder::with(header, source, ())
     }
 }
@@ -172,6 +165,10 @@ mod tests {
             &self,
             _: impl Fn(&str, gguf::GgmlType, &[u64]) -> Result<Take, E>,
         ) -> Result<Vec<Planned>, Self::Error> {
+            Err(std::fmt::Error)
+        }
+
+        fn read_bytes(&self, _: &Planned) -> Result<u64, Self::Error> {
             Err(std::fmt::Error)
         }
 

@@ -2162,13 +2162,47 @@ pub enum CardBytes<'a> {
     /// A part source's, for a file that is a checkpoint folder's header
     /// (`gguf::Split::header_only`): card `card` of `plan` loaded on the stream, each part's file
     /// pages released when the host config's `card_dontneed` asks (`crate::parts::load_placed_in_place`).
-    Parts(&'a PartsLoad<'a>),
+    Parts(&'a dyn PartsLoad),
 }
 
-/// A part source's load of card `card` of `plan` on the stream, `bool` the host config's
-/// `card_dontneed` ([`CardBytes::Parts`]).
-pub type PartsLoad<'a> =
-    dyn Fn(&CudaStream, &Plan<'_>, usize, bool) -> Result<Weights, GpuError> + 'a;
+/// A part source's host reservation and load of card `card` of `plan`.
+pub trait PartsLoad: Send {
+    /// Plan within offered host room, including pinned upload staging.
+    fn host_bytes(&self, plan: &Plan<'_>, card: usize, room: u64) -> Result<u64, GpuError>;
+    /// Load within the checked peak returned by host_bytes.
+    fn load(
+        &self,
+        stream: &CudaStream,
+        plan: &Plan<'_>,
+        card: usize,
+        release: bool,
+        room: u64,
+    ) -> Result<Weights, GpuError>;
+
+    /// The host admission and exact read peak to pass to load.
+    fn host_need(
+        &self,
+        plan: &Plan<'_>,
+        card: usize,
+        extra: u64,
+        available: u64,
+    ) -> Result<(HostNeed, u64), GpuError> {
+        let mut need = HostNeed::of(plan, extra);
+        let room = available.saturating_sub(need.bytes());
+        let peak = self.host_bytes(plan, card, room)?;
+        if peak > 0 {
+            let ring = crate::upload::UploadRing::HOST_MAX;
+            need.read_ahead = peak.checked_sub(ring).ok_or_else(|| {
+                GpuError::shape("PartsLoad", "read peak is under its staging ring")
+            })?;
+            need.shadows = need
+                .shadows
+                .checked_add(ring)
+                .ok_or_else(|| GpuError::shape("PartsLoad", "pinned ring bytes pass u64"))?;
+        }
+        Ok((need, peak))
+    }
+}
 
 /// The steps of a placed load before its body: the plan's card and context
 /// budget, the card, the host's memory against the plan's host need, the
@@ -2226,7 +2260,11 @@ fn placed_pre(
     } else {
         0
     };
-    let grant = HostNeed::of(plan, extra_bytes)
+    let (need, room) = match &bytes {
+        CardBytes::File => (HostNeed::of(plan, extra_bytes), 0),
+        CardBytes::Parts(parts) => parts.host_need(plan, card, extra_bytes, available)?,
+    };
+    let grant = need
         .grant(available, least)
         .map_err(|e| GpuError::plan(what, format!("{e}{}", plan.host.room_clause())))?;
     let t = Instant::now();
@@ -2234,7 +2272,9 @@ fn placed_pre(
         CardBytes::File => {
             Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?
         }
-        CardBytes::Parts(load) => load(gpu.stream(), plan, card, host.card_dontneed)?,
+        CardBytes::Parts(parts) => {
+            parts.load(gpu.stream(), plan, card, host.card_dontneed, room)?
+        }
     };
     let upload = t.elapsed();
     let t = Instant::now();

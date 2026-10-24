@@ -62,6 +62,9 @@ pub(crate) struct Stage<'a> {
 }
 
 impl UploadRing {
+    /// Upper bound on this ring's pinned host bytes, including small loads.
+    pub(crate) const HOST_MAX: u64 = (SLOTS * SLOT_MAX) as u64;
+
     /// A ring for a load of `budget` upload bytes: [`SLOTS`] slots of the
     /// budget's share, each between [`SLOT_MIN`] and [`SLOT_MAX`]; a load of
     /// nothing takes no slots. `stream`'s context must be current (the
