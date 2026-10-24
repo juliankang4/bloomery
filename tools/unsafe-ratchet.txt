@@ -514,7 +514,10 @@ gguf 7 2 0
 # place of its F32 load and two landings, the BF16 form's rounding body (`bf16_cols_body`, an unsafe fn: its load, its
 # landing and its refusal store), and the kernel entries (kernels32.rs: bf16_cols' body call, bf16_mma_cols_gemm's
 # shared-memory view and body call). Each block has its SAFETY line.
-gpu 2314 295 10
+# PIN(2026-10-24): gpu 2314 -> 2297 blocks, 295 -> 291 fns, shared code: the routers' prompt logits run
+# the wide F32 product's tile body (f32tile.rs), so the router's own copy of that body (logits_body, the
+# qwen3moe entry's inline copy, store_rows, store_rows_live) and q8f32's f32_tile_chunk leave with their blocks.
+gpu 2297 291 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
