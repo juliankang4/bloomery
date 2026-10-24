@@ -236,9 +236,10 @@ def run(args: argparse.Namespace) -> int:
         handlers = {s: signal.signal(s, lambda sig, _frame: deferred.append(sig)) for s in STOP_SIGNALS}
         try:
             with open(os.path.join(out, f"{j.name}.log"), "wb") as log:
+                st = time.monotonic()
                 p = subprocess.Popen(["bash", "-c", j.command], stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                      start_new_session=True)
-            running[p.pid] = (j, p, time.monotonic())
+            running[p.pid] = (j, p, st)
             append_line(os.path.join(out, "pids"), f"{j.name} {p.pid}\n")
         finally:
             for sig, handler in handlers.items():
@@ -350,6 +351,26 @@ def self_test() -> int:
         expect(all(rd(f"o1/{n}.rc") == "0" for n in names), "every job wrote rc 0")
         expect(max(seen(n) for n in names) <= 2, f"two slots: a job saw at most 2 running (saw {max(seen(n) for n in names)})")
         expect(len(rd("o1/pids").split("\n")) == 6, "every started job's pid is in DIR/pids")
+        # A child can run while Popen's caller is descheduled; launch latency belongs to its wall.
+        delayed = os.path.join(d, "delayed.py")
+        write(delayed, 'import runpy, sys, time\n'
+                       'module = runpy.run_path(sys.argv[1])\n'
+                       'spawn = module["subprocess"].Popen\n'
+                       'def late(*args, **kwargs):\n'
+                       '    child = spawn(*args, **kwargs)\n'
+                       '    time.sleep(1)\n'
+                       '    return child\n'
+                       'module["subprocess"].Popen = late\n'
+                       'sys.exit(module["main"](sys.argv[2:]))\n')
+        delayed_jobs = os.path.join(d, "delayed-jobs.tsv")
+        write(delayed_jobs, "slow\t-\t-\tsleep 3\n")
+        out = os.path.join(d, "delayed")
+        times = os.path.join(d, "delayed-times.tsv")
+        result = subprocess.run([sys.executable, delayed, me, "run", "--out", out, "--times", times, delayed_jobs],
+                                capture_output=True, text=True, timeout=20, check=False)
+        expect(result.returncode == 0, f"a delayed spawn ends 0 (got {result.returncode}: {result.stderr})")
+        expect(int(rd("delayed/slow.wall")) >= 3, "a delayed spawn keeps the child's full wall")
+        expect(float(rd("delayed-times.tsv").split("\t")[1]) >= 3, "the recorded time includes the child's start")
         # the same jobs on six slots overlap (the witness sees more than one): the bound above is the scheduler's
         reset()
         rc = sched(["--out", os.path.join(d, "o2"), "--max", "6", jf])
