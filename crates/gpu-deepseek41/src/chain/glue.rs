@@ -1257,6 +1257,7 @@ impl StepRows {
                         mode: FillMode::Touch,
                         cpu: caller_sibling(),
                         classify: levers.stats,
+                        workers: 1,
                     },
                 )
             })

@@ -27,13 +27,20 @@
 //! more than the read it saves. [`caller_sibling`] names the one slot that is
 //! free by construction for an owner that blocks on [`Prefetcher::wait`]: the
 //! SMT sibling of the owner's own pinned core, idle while the owner waits.
+//!
+//! A floating helper may split a large token over more threads
+//! ([`HelperOptions::workers`]): each takes one part of every site's rows and
+//! advises, fills and copies them into its own part of the buffer, so the
+//! advice syscalls and the faults of a prompt's thousands of rows run side by
+//! side. A token too small to split, and every token of a pinned helper, is
+//! read on the helper alone.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::{Engram, EngramError, RowTable, RowTables, faults_thread};
+use crate::{Engram, EngramError, Faults, RowTable, RowTables, faults_thread};
 
 /// How [`Prefetcher::with_options`] starts its helper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,7 +52,17 @@ pub struct HelperOptions {
     /// the advise ([`crate::Site::resident_rows`], one `mincore` per row).
     /// Off, the helper makes no such call.
     pub classify: bool,
+    /// Threads a floating helper (`cpu` `None`) splits a token over, itself
+    /// included, as many as give every part at least `PART_ROWS` rows of the
+    /// token's largest site; 1, or a `cpu` to pin to, reads every token on
+    /// the helper alone.
+    pub workers: usize,
 }
+
+/// Rows of a token's largest site one part of a split read takes at least
+/// ([`HelperOptions::workers`]): a decode step's few rows stay on the helper,
+/// where a thread's start would cost more than its share of the read.
+const PART_ROWS: usize = 1024;
 
 impl HelperOptions {
     /// A floating helper that classifies nothing.
@@ -55,6 +72,7 @@ impl HelperOptions {
             mode,
             cpu: None,
             classify: false,
+            workers: 1,
         }
     }
 }
@@ -93,7 +111,9 @@ struct Filled {
 }
 
 /// What the helper spent on the token [`Prefetcher::wait`] just returned, and
-/// the faults it has taken since it started.
+/// the faults it has taken since it started. A token read in parts
+/// ([`HelperOptions::workers`]) takes each time from its slowest part, and
+/// counts every part's faults.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HelperTimes {
     pub submit_ns: u64,
@@ -182,6 +202,9 @@ impl Prefetcher {
             return Err(EngramError::Prefetch(
                 "max_rows_per_site must have one entry per site",
             ));
+        }
+        if options.workers == 0 {
+            return Err(EngramError::Prefetch("a helper of no workers"));
         }
         let row_bytes: Vec<usize> = (0..tables.count())
             .map(|i| table_of(tables.as_ref(), i).map(|t| t.row_bytes() as usize))
@@ -385,7 +408,8 @@ impl Drop for Prefetcher {
     }
 }
 
-/// Advise, fill and copy one token at a time until the job channel closes.
+/// Advise, fill and copy one token at a time until the job channel closes, a
+/// token of enough rows in parts ([`HelperOptions::workers`]).
 ///
 /// Errors travel back with the buffer rather than ending the helper: the owner
 /// is blocked in `wait` and has to be told, and the next token may well be
@@ -397,7 +421,15 @@ fn helper(
     done: &Sender<Filled>,
 ) {
     let HelperOptions { mode, classify, .. } = options;
+    // A pinned helper's part threads would inherit its one cpu.
+    let workers = if options.cpu.is_some() {
+        1
+    } else {
+        options.workers
+    };
     let base = faults_thread();
+    // Faults the parts' own threads took: the helper's own count none of them.
+    let mut parts_faults = Faults::default();
     // The sizing checked every table at `over`, so each index here names one.
     let sites: Vec<&dyn RowTable> = (0..tables.count())
         .filter_map(|i| tables.table(i))
@@ -423,65 +455,195 @@ fn helper(
             classify_ns = tc.elapsed().as_nanos() as u64;
         }
 
-        // WILLNEED over every row: one batch at the drive's queue depth.
-        let t0 = Instant::now();
-        for (site, ids) in sites.iter().zip(&job.ids) {
-            if err.is_some() {
-                break;
+        let widest = job.ids.iter().map(Vec::len).max().unwrap_or(0);
+        let parts = workers.min(widest / PART_ROWS).max(1);
+        let read = match err {
+            Some(e) => Read {
+                err: Some(e),
+                ..Read::default()
+            },
+            None if parts == 1 => {
+                let mut rest = &mut job.buf[..];
+                let slots = sites
+                    .iter()
+                    .zip(&job.ids)
+                    .map(|(site, ids)| take_slot(&mut rest, ids.len() * site.row_bytes() as usize));
+                read_part(&sites, mode, &job.ids, slots)
             }
-            if let Err(e) = site.prefetch(ids) {
-                err = Some(e);
-                break;
+            None => {
+                let read = read_parts(&sites, mode, &job.ids, &mut job.buf, parts);
+                parts_faults.major += read.faults.major;
+                parts_faults.minor += read.faults.minor;
+                read
             }
-        }
-        let submit_ns = t0.elapsed().as_nanos() as u64;
-
-        let t1 = Instant::now();
-        if err.is_none() && mode == FillMode::Populate {
-            for (site, ids) in sites.iter().zip(&job.ids) {
-                if let Err(e) = site.populate(ids) {
-                    err = Some(e);
-                    break;
-                }
-            }
-        }
-        let fill_ns = t1.elapsed().as_nanos() as u64;
-
-        let t2 = Instant::now();
-        if err.is_none() {
-            let mut at = 0usize;
-            for (site, ids) in sites.iter().zip(&job.ids) {
-                let n = ids.len() * site.row_bytes() as usize;
-                let Some(slot) = job.buf.get_mut(at..at + n) else {
-                    err = Some(EngramError::Prefetch(
-                        "token wants more bytes than the buffer",
-                    ));
-                    break;
-                };
-                if let Err(e) = site.copy_rows(ids, slot) {
-                    err = Some(e);
-                    break;
-                }
-                at += n;
-            }
-        }
-        let copy_ns = t2.elapsed().as_nanos() as u64;
-
+        };
         let now = faults_thread();
         let times = HelperTimes {
-            submit_ns,
-            fill_ns,
-            copy_ns,
-            major_faults: now.major.saturating_sub(base.major),
-            minor_faults: now.minor.saturating_sub(base.minor),
+            submit_ns: read.submit_ns,
+            fill_ns: read.fill_ns,
+            copy_ns: read.copy_ns,
+            major_faults: now.major.saturating_sub(base.major) + parts_faults.major,
+            minor_faults: now.minor.saturating_sub(base.minor) + parts_faults.minor,
             rows,
             resident_rows,
             classify_ns,
         };
+        let err = read.err;
         if done.send(Filled { job, err, times }).is_err() {
             break;
         }
     }
+}
+
+/// A token's read, or one part of it ([`read_part`]): its times, the faults
+/// its thread took, and its first refusal.
+#[derive(Default)]
+struct Read {
+    submit_ns: u64,
+    fill_ns: u64,
+    copy_ns: u64,
+    faults: Faults,
+    err: Option<EngramError>,
+}
+
+/// `ids[s]`, rows of site `s`, advised (`WILLNEED`, one batch at the drive's
+/// queue depth), filled by `mode` and copied into the slot `slots` yields for
+/// that site, in site order; a slot the buffer cannot hold is refused by name.
+fn read_part<'b, I: AsRef<[u32]>>(
+    sites: &[&dyn RowTable],
+    mode: FillMode,
+    ids: &[I],
+    slots: impl Iterator<Item = Option<&'b mut [u8]>>,
+) -> Read {
+    let mut err = None;
+    let t0 = Instant::now();
+    for (site, ids) in sites.iter().zip(ids) {
+        if let Err(e) = site.prefetch(ids.as_ref()) {
+            err = Some(e);
+            break;
+        }
+    }
+    let submit_ns = t0.elapsed().as_nanos() as u64;
+
+    let t1 = Instant::now();
+    if err.is_none() && mode == FillMode::Populate {
+        for (site, ids) in sites.iter().zip(ids) {
+            if let Err(e) = site.populate(ids.as_ref()) {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    let fill_ns = t1.elapsed().as_nanos() as u64;
+
+    let t2 = Instant::now();
+    if err.is_none() {
+        for ((site, ids), slot) in sites.iter().zip(ids).zip(slots) {
+            let Some(slot) = slot else {
+                err = Some(EngramError::Prefetch(
+                    "token wants more bytes than the buffer",
+                ));
+                break;
+            };
+            if let Err(e) = site.copy_rows(ids.as_ref(), slot) {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    let copy_ns = t2.elapsed().as_nanos() as u64;
+    Read {
+        submit_ns,
+        fill_ns,
+        copy_ns,
+        faults: Faults::default(),
+        err,
+    }
+}
+
+/// The next `n` bytes of `rest`, taken off its front; `None`, leaving it
+/// empty, when it holds fewer.
+fn take_slot<'b>(rest: &mut &'b mut [u8], n: usize) -> Option<&'b mut [u8]> {
+    let (slot, tail) = std::mem::take(rest).split_at_mut_checked(n)?;
+    *rest = tail;
+    Some(slot)
+}
+
+/// A token read in `parts` parts: each site's ids cut into `parts` runs in
+/// order ([`threads::chunk_bounds`]), part `p` taking run `p` of every site
+/// into its own slots of `buf` (the sites' rows in site order, as one read
+/// lays them out). The helper reads part 0 and a thread of its own each
+/// other part; the result takes each time from the slowest part, the faults
+/// of the parts' own threads and the first refusal in part order. A thread
+/// the system will not start is refused by name.
+fn read_parts(
+    sites: &[&dyn RowTable],
+    mode: FillMode,
+    ids: &[Vec<u32>],
+    buf: &mut [u8],
+    parts: usize,
+) -> Read {
+    let mut cut: Vec<_> = (0..parts)
+        .map(|_| {
+            (
+                Vec::with_capacity(sites.len()),
+                Vec::with_capacity(sites.len()),
+            )
+        })
+        .collect();
+    let mut rest = buf;
+    for (site, ids) in sites.iter().zip(ids) {
+        let rb = site.row_bytes() as usize;
+        for (p, (part_ids, slots)) in cut.iter_mut().enumerate() {
+            let (start, end) = threads::chunk_bounds(ids.len(), parts, p);
+            let run = &ids[start..end];
+            part_ids.push(run);
+            slots.push(take_slot(&mut rest, run.len() * rb));
+        }
+    }
+    std::thread::scope(|s| {
+        let mut cut = cut.into_iter();
+        let first = cut.next();
+        let started: Vec<_> = cut
+            .map(|(ids, slots)| {
+                std::thread::Builder::new()
+                    .name("engram-prefetch-part".into())
+                    .spawn_scoped(s, move || {
+                        let base = faults_thread();
+                        let mut read = read_part(sites, mode, &ids, slots.into_iter());
+                        let now = faults_thread();
+                        read.faults = Faults {
+                            major: now.major.saturating_sub(base.major),
+                            minor: now.minor.saturating_sub(base.minor),
+                        };
+                        read
+                    })
+            })
+            .collect();
+        // The helper's own part: its faults are on the helper's count.
+        let mut out = match first {
+            Some((ids, slots)) => read_part(sites, mode, &ids, slots.into_iter()),
+            None => Read::default(),
+        };
+        for h in started {
+            let r = match h {
+                Ok(h) => h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                Err(e) => Read {
+                    err: Some(EngramError::Io(e)),
+                    ..Read::default()
+                },
+            };
+            out.submit_ns = out.submit_ns.max(r.submit_ns);
+            out.fill_ns = out.fill_ns.max(r.fill_ns);
+            out.copy_ns = out.copy_ns.max(r.copy_ns);
+            out.faults.major += r.faults.major;
+            out.faults.minor += r.faults.minor;
+            if out.err.is_none() {
+                out.err = r.err;
+            }
+        }
+        out
+    })
 }
 
 /// The SMT sibling of the core the calling thread is pinned to; `None` for a
@@ -495,4 +657,77 @@ fn table_of(tables: &dyn RowTables, i: usize) -> Result<&dyn RowTable, EngramErr
     tables.table(i).ok_or(EngramError::Prefetch(
         "the row source counts a table it does not hold",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FillMode, HelperOptions, PART_ROWS, Prefetcher};
+    use crate::EngramError;
+    use crate::rows::{PageAdvice, RunTable};
+    use std::sync::Arc;
+
+    /// A token of enough rows read in parts fills the buffer as one read
+    /// does: every site's rows in the token's order, in site order, its rows
+    /// counted once; a token too small to split fills the same way. Each
+    /// part's own run of ids and its own slot are what make the bytes land
+    /// where one read puts them. A helper of no workers is refused by name.
+    #[test]
+    fn a_token_read_in_parts_fills_as_one_read() {
+        let dir = std::env::temp_dir().join(format!("engram-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two tables of 4,096 rows, 24 and 8 bytes a row.
+        let (mut tables, mut bytes) = (Vec::new(), Vec::new());
+        for (t, rb) in [(0u32, 24u64), (1, 8)] {
+            let path = dir.join(format!("t{t}"));
+            let b: Vec<u8> = (0..4096 * rb as u32)
+                .map(|i| (i.wrapping_mul(31) ^ (t * 101)) as u8)
+                .collect();
+            std::fs::write(&path, &b).unwrap();
+            let runs = [(path, 0..b.len() as u64)];
+            tables.push(RunTable::open("t", rb, &runs, PageAdvice::Random).unwrap());
+            bytes.push((b, rb as usize));
+        }
+        let want = |ids: &[Vec<u32>]| -> Vec<u8> {
+            bytes
+                .iter()
+                .zip(ids)
+                .flat_map(|((b, rb), ids)| {
+                    ids.iter()
+                        .flat_map(move |&i| &b[i as usize * rb..][..*rb])
+                        .copied()
+                })
+                .collect()
+        };
+        let options = HelperOptions {
+            workers: 4,
+            ..HelperOptions::of(FillMode::Touch)
+        };
+        let max = 3 * PART_ROWS + 5;
+        let tables: Arc<Vec<RunTable>> = Arc::new(tables);
+        let none = HelperOptions {
+            workers: 0,
+            ..options
+        };
+        assert!(matches!(
+            Prefetcher::over(tables.clone(), &[max, max], none),
+            Err(EngramError::Prefetch("a helper of no workers"))
+        ));
+        let mut pf = Prefetcher::over(tables, &[max, max], options).unwrap();
+        // 3,077 and 2,500 rows: three parts, each site cut into three runs
+        // of its own; then a token of one part.
+        let big = vec![
+            (0..max as u32).map(|i| i * 7 % 4096).collect::<Vec<_>>(),
+            (0..2500u32).map(|i| 4095 - i * 13 % 4096).collect(),
+        ];
+        let small = vec![vec![9u32, 4000, 9], vec![3u32]];
+        for ids in [&big, &small] {
+            pf.submit(ids.iter()).unwrap();
+            pf.wait().unwrap();
+            assert!(pf.filled() == want(ids), "rows {}", ids[0].len());
+            let rows: usize = ids.iter().map(Vec::len).sum();
+            assert_eq!(pf.last().rows, rows as u64);
+        }
+        drop(pf);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

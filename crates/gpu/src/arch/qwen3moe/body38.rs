@@ -478,9 +478,10 @@ struct PleHost {
 /// The PLE table's reads from the NVMe tier: engram's prefetcher over the
 /// table in the split's own mapping ([`SplitTable`]), whose helper advises
 /// a fill's rows and copies them, so the step thread takes neither the
-/// advice nor a fault. A fill nothing read ahead waits for its own rows; a
-/// prompt call's later ubatches are read one ahead while the ubatch before
-/// them computes ([`PleHost::prompt_start`]).
+/// advice nor a fault; a ubatch's rows (16 a position, at hashed places in
+/// the table) in [`PLE_WORKERS`] parts side by side. A fill nothing read
+/// ahead waits for its own rows; a prompt call's later ubatches are read one
+/// ahead while the ubatch before them computes ([`PleHost::prompt_start`]).
 struct PleRead {
     rows: Prefetcher,
     planes: usize,
@@ -489,6 +490,12 @@ struct PleRead {
     ahead: VecDeque<PleBatch>,
     flight: bool,
 }
+
+/// Threads the PLE reader's helper reads a ubatch's rows over
+/// ([`HelperOptions::workers`]): a 4,096-position ubatch names 65,536 rows,
+/// up to one advice call and one page fault a row on each plane, and the
+/// read runs under the layer before the PLE site alone.
+const PLE_WORKERS: usize = 12;
 
 /// One ubatch of a prompt call as [`PleHost::prompt_start`] reads it ahead:
 /// its first position, its positions and its row ids.
@@ -545,6 +552,7 @@ impl PleRead {
                 mode: FillMode::Touch,
                 cpu: caller_sibling(),
                 classify: false,
+                workers: PLE_WORKERS,
             },
         )
         .map_err(|e| GpuError::plan(WHAT, e))?;
