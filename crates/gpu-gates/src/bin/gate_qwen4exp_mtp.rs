@@ -2795,9 +2795,11 @@ mod gate {
     /// (kp-draft) the store behind the point: a cut to a point the draft's store does not reach
     /// keeps the draft off there. A drafted run, then `K` ids by a prompt call without the
     /// draft (a point at its end, the target's row before it in the ubatch arena, the draft's
-    /// store still at the drafted run's end), `K` more the same way, then `rollback` to the
-    /// first call's end: the draft's store is forgotten (`held` 0) and the model stands at the
-    /// point. Mutant: the rejoin without its store condition (`held` the drafted run's).
+    /// store still at the drafted run's end), `K` more the same way without checkpoints, then
+    /// `rollback` to the first call's end: the draft's store is forgotten (`held` 0) and the
+    /// model stands at the point. The second call takes no point because a full ledger keeps
+    /// the drafted run's first point and would evict the one the cut needs. Mutant: the rejoin
+    /// without its store condition (`held` the drafted run's).
     fn store_behind(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
         const N: usize = 6;
         const K: usize = 16;
@@ -2805,11 +2807,11 @@ mod gate {
         let (end, before) = (m.pos(), held_of(&m)?);
         m.prompt38(&prompt[..K], Prompt38::Auto)?;
         let at = m.pos();
+        m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
         m.prompt38(&prompt[K..2 * K], Prompt38::Auto)?;
         let past = m.pos();
         let cut = m.rollback(at);
         let (held, pos) = (held_of(&m)?, m.pos());
-        m.body_parts("(kp-draft)")?.2.set_checkpoints(false);
         m.reset()?;
         let behind = before < at as usize;
         let ok = behind && cut.is_ok() && pos == at && held == 0;
@@ -5117,8 +5119,9 @@ mod gate {
 
     /// Slot 0 of the off slot clause from its reset, through `d`: the prompt call of `l` ids
     /// of `ids` with checkpoints on and its first plain step, two calls of [`KP_MORE`] ids
-    /// without the draft, a cut back to the first's end (the draft's store behind the point
-    /// there, so the cut forgets it), then a continuing prompt call of [`KP_MORE`] ids, which
+    /// without the draft, the second without checkpoints so a full ledger keeps the point the
+    /// cut needs, a cut back to the first's end (the draft's store behind the point there, so
+    /// the cut forgets it), then a continuing prompt call of [`KP_MORE`] ids, which
     /// the draft skips, and its first plain step. Returns the ids from that call on and the
     /// draft's store count after the cut.
     fn off_slot(
@@ -5133,7 +5136,9 @@ mod gate {
         let at = s.model().pos();
         s.model_mut()
             .prompt38(&ids[l..l + KP_MORE], Prompt38::Auto)?;
+        set_marks(s, false)?;
         s.model_mut().prompt38(&ids[..KP_MORE], Prompt38::Auto)?;
+        set_marks(s, true)?;
         s.model_mut().rollback(at + u32::try_from(KP_MORE)?)?;
         let held = held_of(s.model())?;
         let first = Draft::prompt(d, s, &ids[l + KP_MORE..l + 2 * KP_MORE])?;
