@@ -3487,7 +3487,9 @@ mod gate {
                 .sum::<f64>()
                 .sqrt();
             println!(
-                "bench op={arm} slots={slots} k={k} experts={experts} invalid={invalid} l2={norm:.9} sample={:?}",
+                "bench op={arm} slots={slots} k={k} experts={experts} invalid={invalid} l2={norm:.9} \
+                 y_fnv={:016x} sample={:?}",
+                bloomery_gpu_gates::Fnv1a64::default().f32s(&out).value(),
                 &out[..8]
             );
             if invalid != 0 || gpu.take_fault()?.is_some() {
@@ -3501,7 +3503,7 @@ mod gate {
         /// gate and up GEMMs and `swiglu_quant32_sel`, the other
         /// `enqueue_gate_up_sel32` (one launch and the FP4 pack on a native
         /// build). Both arms first run both forms once and print whether their
-        /// Q8 bytes agree.
+        /// Q8 bytes agree, and the bytes' hash.
         fn nvfp4_gate_up_arm(gpu: &bloomery_gpu::Gpu, arm: &str) -> Result<bool, GateError> {
             use bloomery_gpu::gemm::{
                 GateUp32Args, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput,
@@ -3603,7 +3605,10 @@ mod gate {
                 (2 * experts * rows * k * 9 / 16 + tokens * k + slots * rows * 5 / 4) as u64;
             print_arm(arm, rows, bytes, graph.node_count(), eager, timed);
             let q8_eq = q8[0] == q8[1];
-            println!("bench op={arm} slots={slots} k={k} experts={experts} q8_eq={q8_eq}");
+            println!(
+                "bench op={arm} slots={slots} k={k} experts={experts} q8_eq={q8_eq} q8_fnv={:016x}",
+                bloomery_gpu_gates::Fnv1a64::default().u32s(&q8[0]).value()
+            );
             if !q8_eq || gpu.take_fault()?.is_some() {
                 return Err("NVFP4 gate and up benchmark forms disagree".into());
             }

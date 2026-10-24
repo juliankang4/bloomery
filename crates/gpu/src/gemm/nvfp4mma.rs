@@ -4,8 +4,8 @@
 
 use super::act32::ColsForm;
 use super::f32tile::{
-    Bf16Cols, Bf16Rows, ByteRows, MMA_THREADS, MmaCols, MmaRows, STAGE_FLOATS, STAGES, TileLaunch,
-    TileRows, bf16_mma_body, form_col, mma_fits, store_refused,
+    Bf16Cols, Bf16Rows, ByteRows, MMA_THREADS, MmaCols, MmaRows, STAGE_FLOATS,
+    STAGES as MMA_STAGES, TileLaunch, TileRows, bf16_mma_body, form_col, mma_fits, store_refused,
 };
 use super::{GemmAct32, GemmRoute};
 use crate::GpuError;
@@ -318,13 +318,91 @@ fn mma(c: [f32; 4], a: [u32; 4], b: [u32; 2], sa: u32, sb: u32) -> [f32; 4] {
     [d0, d1, d2, d3]
 }
 
-/// The K walk both native kernels share, over two shared stages of
-/// [`TILE_ROWS`] weight rows and 64 activation rows: each thread stages half
+/// u32 words of one K-walk stage's weight rows: [`TILE_ROWS`] rows of a
+/// step's eight code words and four of pad, so the eight rows one `ldmatrix`
+/// phase reads meet no bank twice.
+const W_STAGE: usize = TILE_ROWS * 12;
+/// u32 words of one stage's 64 activation rows, the weight rows' pitch.
+const B_STAGE: usize = 64 * 12;
+/// u32 words of one stage's scale words: the weight rows', then the
+/// activation rows'.
+const S_STAGE: usize = TILE_ROWS + 64;
+/// The K walk's shared stages: a step's planes land two steps ahead.
+const STAGES: usize = 3;
+const _: () =
+    assert!(STAGES * (W_STAGE + B_STAGE + S_STAGE) * 4 + 64 * PAIR_PITCH * 4 <= 48 * 1024);
+
+/// One thread's `cp.async` copies of step `$s` into stage `$s % STAGES` of
+/// `nvfp4_walk!`'s shared arrays `$wp`, `$bp`, `$sp` (its arguments): half
+/// `$half` of weight row `$wrow`'s codes and, for `$sr < 64`, of activation
+/// column `$col`'s, into shared row `$sr`; from the row's first thread also
+/// the step's scale words. One group, empty for a step past the last.
+macro_rules! nvfp4_copy {
+    (
+        $s:expr,
+        ($wq:ident, $we:ident, $wrow:ident),
+        ($aq:ident, $ae:ident, $col:ident),
+        ($steps:ident, $sr:ident, $half:ident),
+        ($wp:ident, $bp:ident, $sp:ident)
+    ) => {{
+        let s: usize = $s;
+        if s < $steps {
+            let st = s % STAGES;
+            let at = $sr * 12 + 4 * $half;
+            // SAFETY: the weight row's aligned half of step s is in the checked plane (K divides
+            // 64); the destination is this thread's own chunk of stage st, read by no other thread
+            // before the barrier after the wait that completes it.
+            unsafe {
+                cuda_device::async_copy::cp_async_cg_16(
+                    $wp.add(st * W_STAGE + at),
+                    $wq.as_ptr().add(($wrow * $steps + s) * 8 + 4 * $half),
+                )
+            };
+            if $sr < 64 {
+                // SAFETY: col is a live column whose aligned half of step s is in the plane; the
+                // destination is this thread's own chunk of stage st, as the weight half's.
+                unsafe {
+                    cuda_device::async_copy::cp_async_cg_16(
+                        $bp.add(st * B_STAGE + at),
+                        $aq.as_ptr().add(($col * $steps + s) * 8 + 4 * $half),
+                    )
+                };
+            }
+            if $half == 0 {
+                // SAFETY: the weight row's scale word of step s is in the plane; the row's first
+                // thread owns its word of stage st.
+                unsafe {
+                    cuda_device::async_copy::cp_async_ca_4(
+                        $sp.add(st * S_STAGE + $sr),
+                        $we.as_ptr().add($wrow * $steps + s),
+                    )
+                };
+                if $sr < 64 {
+                    // SAFETY: the live column's scale word of step s is in the plane; the row's
+                    // first thread owns its word of stage st.
+                    unsafe {
+                        cuda_device::async_copy::cp_async_ca_4(
+                            $sp.add(st * S_STAGE + TILE_ROWS + $sr),
+                            $ae.as_ptr().add($col * $steps + s),
+                        )
+                    };
+                }
+            }
+        }
+        // SAFETY: commits only this thread's copies of the step as one group.
+        unsafe { cuda_device::async_copy::cp_async_commit_group() };
+    }};
+}
+
+/// The K walk both native kernels share, over [`STAGES`] shared stages of
+/// [`TILE_ROWS`] weight rows and 64 activation rows: each thread copies half
 /// `$half` of shared row `$sr` from weight row `$wrow` (`$wq` codes, `$we`
-/// scales) and, for `$sr < 64`, from activation column `$col` (`$aq`, `$ae`),
-/// the next step's words held in registers across the barrier; then `$body`
-/// reads the step's stage through `$wp`, `$bp` and `$sp`. Every thread of
-/// the block runs it, `$steps` steps of 64 values.
+/// scales) and, for `$sr < 64`, from activation column `$col` (`$aq`, `$ae`)
+/// two steps ahead ([`nvfp4_copy`]), and before a step's barrier turns its
+/// own weight half of the step's stage into the MMA's nibble order
+/// ([`packed_pair`]); then `$body` reads the step's stage through `$wp`,
+/// `$bp` and `$sp`. Every thread of the block runs it, `$steps` steps of 64
+/// values.
 macro_rules! nvfp4_walk {
     (
         ($wq:ident, $we:ident, $wrow:ident),
@@ -333,77 +411,44 @@ macro_rules! nvfp4_walk {
         ($wp:ident, $bp:ident, $sp:ident),
         $body:block
     ) => {{
-        let wi = $wrow * $steps * 8 + 4 * $half;
-        // SAFETY: K is positive and divides 64; the weight row and both aligned halves are in the checked plane.
-        let mut w = unsafe { (*$wq.as_ptr().add(wi).cast::<cuda_device::vector::U32x4>()).0 };
-        let mut av = cuda_device::vector::U32x4::new([0; 4]);
-        if $sr < 64 {
-            // SAFETY: col is a live column and each half is an aligned four-word vector.
-            av = unsafe {
-                *$aq.as_ptr()
-                    .add($col * $steps * 8 + 4 * $half)
-                    .cast::<cuda_device::vector::U32x4>()
-            };
-        }
-        let mut sw = if $half == 0 { $we[$wrow * $steps] } else { 0 };
-        let mut sb = if $half == 0 && $sr < 64 {
-            $ae[$col * $steps]
-        } else {
-            0
-        };
+        nvfp4_copy!(0, ($wq, $we, $wrow), ($aq, $ae, $col), ($steps, $sr, $half), ($wp, $bp, $sp));
+        nvfp4_copy!(1, ($wq, $we, $wrow), ($aq, $ae, $col), ($steps, $sr, $half), ($wp, $bp, $sp));
+        let own = $sr * 12 + 4 * $half;
+        let mut st = 0;
         let mut step = 0;
         while step < $steps {
-            // SAFETY: this selects one of W's two disjoint stages.
-            let $wp = unsafe { $wp.add((step & 1) * 1536) };
-            // SAFETY: this selects one of B's two disjoint stages.
-            let $bp = unsafe { $bp.add((step & 1) * 768) };
-            // SAFETY: this selects one of S's two disjoint stages.
-            let $sp = unsafe { $sp.add((step & 1) * 192) };
+            // SAFETY: each step commits one group, so the newest is step + 1's and waiting for all
+            // but one completes this thread's copies of this step.
+            unsafe { cuda_device::async_copy::cp_async_wait_group(1) };
+            // SAFETY: st < STAGES, so stage st starts inside the STAGES·W_STAGE words of W.
+            let ws = unsafe { $wp.add(st * W_STAGE) };
+            // SAFETY: st < STAGES, so stage st starts inside the STAGES·B_STAGE words of B.
+            let bs = unsafe { $bp.add(st * B_STAGE) };
+            // SAFETY: st < STAGES, so stage st starts inside the STAGES·S_STAGE words of S.
+            let ss = unsafe { $sp.add(st * S_STAGE) };
+            // SAFETY: this thread's own weight half of the stage, completed by the wait above.
+            let w = unsafe { (*ws.add(own).cast::<cuda_device::vector::U32x4>()).0 };
             let p0 = packed_pair(w[0], w[1]);
             let p1 = packed_pair(w[2], w[3]);
-            let packed = cuda_device::vector::U32x4::new([p0[0], p0[1], p1[0], p1[1]]);
-            // SAFETY: each thread owns one aligned four-word half of its shared row.
+            // SAFETY: word own of stage st is this thread's own weight half, read by no other thread
+            // before the barrier below.
             unsafe {
-                *$wp.add($sr * 12 + 4 * $half)
-                    .cast::<cuda_device::vector::U32x4>() = packed;
+                *ws.add(own).cast::<cuda_device::vector::U32x4>() =
+                    cuda_device::vector::U32x4::new([p0[0], p0[1], p1[0], p1[1]]);
             }
-            if $sr < 64 {
-                // SAFETY: each thread owns one aligned four-word half of its shared activation row.
-                unsafe {
-                    *$bp.add($sr * 12 + 4 * $half)
-                        .cast::<cuda_device::vector::U32x4>() = av;
-                }
-            }
-            if $half == 0 {
-                // SAFETY: the first thread of each row owns its weight scale word.
-                unsafe {
-                    *$sp.add($sr) = sw;
-                }
-                if $sr < 64 {
-                    // SAFETY: the first thread of each live activation row owns its scale word.
-                    unsafe {
-                        *$sp.add(TILE_ROWS + $sr) = sb;
-                    }
-                }
-            }
+            // Publishes the stage and tells that every thread is done with step - 1's, which the
+            // copies of step + 2 refill.
             thread::sync_threads();
-            if step + 1 < $steps {
-                let wi = $wrow * $steps * 8 + (step + 1) * 8 + 4 * $half;
-                // SAFETY: the next step is in the same aligned live weight row.
-                w = unsafe { (*$wq.as_ptr().add(wi).cast::<cuda_device::vector::U32x4>()).0 };
-                if $sr < 64 {
-                    let ai = $col * $steps * 8 + (step + 1) * 8 + 4 * $half;
-                    // SAFETY: the next step is in this aligned live activation column.
-                    av = unsafe { *$aq.as_ptr().add(ai).cast::<cuda_device::vector::U32x4>() };
-                }
-                if $half == 0 {
-                    sw = $we[$wrow * $steps + step + 1];
-                    if $sr < 64 {
-                        sb = $ae[$col * $steps + step + 1];
-                    }
-                }
-            }
+            nvfp4_copy!(
+                step + 2,
+                ($wq, $we, $wrow),
+                ($aq, $ae, $col),
+                ($steps, $sr, $half),
+                ($wp, $bp, $sp)
+            );
+            let ($wp, $bp, $sp) = (ws, bs, ss);
             $body
+            st = if st + 1 == STAGES { 0 } else { st + 1 };
             step += 1;
         }
     }};
@@ -822,9 +867,12 @@ mod native {
         let expert = tiles[2 * tile] as usize;
         let (start, len) = super::super::route::tile_parts(tiles[2 * tile + 1]);
         let (start, len) = (start as usize, len as usize);
-        static mut W: cuda_device::SharedArray<u32, 3072, 16> = cuda_device::SharedArray::UNINIT;
-        static mut B: cuda_device::SharedArray<u32, 1536, 16> = cuda_device::SharedArray::UNINIT;
-        static mut S: cuda_device::SharedArray<u32, 384, 16> = cuda_device::SharedArray::UNINIT;
+        static mut W: cuda_device::SharedArray<u32, { STAGES * W_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut B: cuda_device::SharedArray<u32, { STAGES * B_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut S: cuda_device::SharedArray<u32, { STAGES * S_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
         // SAFETY: W is this block's shared weight allocation.
         let wp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W) };
         // SAFETY: B is this block's shared activation allocation.
@@ -983,9 +1031,12 @@ mod native {
         let expert = tiles[2 * tile] as usize;
         let (start, len) = super::super::route::tile_parts(tiles[2 * tile + 1]);
         let (start, len) = (start as usize, len as usize);
-        static mut W: cuda_device::SharedArray<u32, 3072, 16> = cuda_device::SharedArray::UNINIT;
-        static mut B: cuda_device::SharedArray<u32, 1536, 16> = cuda_device::SharedArray::UNINIT;
-        static mut S: cuda_device::SharedArray<u32, 384, 16> = cuda_device::SharedArray::UNINIT;
+        static mut W: cuda_device::SharedArray<u32, { STAGES * W_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut B: cuda_device::SharedArray<u32, { STAGES * B_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
+        static mut S: cuda_device::SharedArray<u32, { STAGES * S_STAGE }, 16> =
+            cuda_device::SharedArray::UNINIT;
         static mut V: cuda_device::SharedArray<f32, { 64 * PAIR_PITCH }, 16> =
             cuda_device::SharedArray::UNINIT;
         // SAFETY: W is this block's shared weight allocation.
@@ -1235,7 +1286,7 @@ mod native {
         n: u32,
         mut y: DisjointSlice<f32>,
     ) {
-        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        static mut STAGE: SharedArray<f32, { MMA_STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
         // SAFETY: this block's aligned shared allocation, accessed without a reference.
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
         let cols = Mxfp8Cols {
