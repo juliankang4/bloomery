@@ -393,6 +393,10 @@ run 'check non-finite margin' 65 'refused CARD_MALFORMED' \
   python3 "$T/tools/ref/card.py" check "$T/docs/cards/margin.card"
 run 'verdict non-finite margin' 65 'refused CARD_MALFORMED' \
   python3 "$T/tools/ref/card.py" verdict "$T/docs/cards/margin.card" 0.01 0.01 0.01 0.01 0.01 0.01
+sed "/^rounds:/a\\
+sd: $margin % overflow fixture" "$HERE/noninf-valid.card" > "$T/docs/cards/sd.card"
+run 'check non-finite sd' 65 'refused CARD_MALFORMED' \
+  python3 "$T/tools/ref/card.py" check "$T/docs/cards/sd.card"
 card dup-key.card 65 "line 8: 'predict' again \(first on line 6\)"
 card ab-unit.card 65 'an ab card predicts its effect in percent'
 card continuation.card 0 'ok kind=ab'
