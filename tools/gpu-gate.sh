@@ -1650,7 +1650,9 @@ if "hw_held_" in sys.argv and os.environ.get("RUST_TEST_THREADS") != "1":
     sys.exit(97)
 with open(os.environ["LIB_STARTED"], "w", encoding="utf-8") as stream:
     stream.write(str(os.getpid()))
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(int(os.environ.get("LIB_TERM", "143"))))
+# GNU timeout sends its TERM to the child and again to its group: os._exit ends at once, where sys.exit's shutdown puts the
+# default action back and a late second TERM would end the test with 143 in place of LIB_TERM.
+signal.signal(signal.SIGTERM, lambda *_: os._exit(int(os.environ.get("LIB_TERM", "143"))))
 if os.environ.get("LIB_IGNORE_TERM"):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if os.environ.get("LIB_READY"):
