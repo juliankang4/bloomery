@@ -981,10 +981,7 @@ pub fn header_budget(split: &Split) -> Result<Option<HeaderBudget>, GateError> {
                 )
             })?;
         if let model::fixture::CardBudget::Planned(planner) = spec.card_budget {
-            model::fixture::check_budget(&planner, split, recorded)
-                .map_err(|e| fixture_budget_error(path, recorded, e))?;
-            card_set_aside =
-                on_fixture_card(&planner, split).map_err(|e| format!("{}: {e}", path.display()))?;
+            card_set_aside = planned(&planner, split, path, recorded)?;
         }
     }
     Ok(Some(HeaderBudget {
@@ -1009,15 +1006,24 @@ fn on_fixture_card(_: &model::fixture::Budget, _: &Split) -> Result<u64, GateErr
     Ok(0)
 }
 
-fn fixture_budget_error(path: &Path, budget: u64, error: model::fixture::FixtureError) -> String {
-    match error {
+/// A planned family's `recorded` budget of `split` (first shard `path`) re-planned
+/// ([`model::fixture::check_budget`]), a stale one named with the regeneration step, and what the
+/// fixture tier's card sets aside past the family's ([`on_fixture_card`]).
+fn planned(
+    planner: &model::fixture::Budget,
+    split: &Split,
+    path: &Path,
+    recorded: u64,
+) -> Result<u64, GateError> {
+    model::fixture::check_budget(planner, split, recorded).map_err(|error| match error {
         model::fixture::FixtureError::BudgetMismatch(_) => format!(
-            "{}: stale recorded fixture budget {budget}: {error}; regenerate the fixture using \
+            "{}: stale recorded fixture budget {recorded}: {error}; regenerate the fixture using \
              docs/contrib/local-check.md, 'When a recorded fixture budget is stale'",
             path.display()
         ),
         _ => format!("{}: {error}", path.display()),
-    }
+    })?;
+    Ok(on_fixture_card(planner, split).map_err(|e| format!("{}: {e}", path.display()))?)
 }
 
 /// The plan's levers: the real tier's are the caller's (`BLOOMERY_CARD_BUDGET`, unset: none, as
@@ -1756,6 +1762,9 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A stale budget's error through `planned`, the re-plan `header_budget` makes: the file,
+    /// the recorded budget, the counts and the regeneration step. Mutant: the mismatch mapped to
+    /// the generic path-and-error text, or the card set-aside read off a family that names none.
     #[test]
     fn a_budget_mismatch_names_the_file_and_regeneration_step() {
         use model::fixture::{Budget, CardExperts};
@@ -1774,9 +1783,8 @@ mod tests {
             },
             card_set_aside: None,
         };
-        model::fixture::check_budget(&planner, &split, 4).unwrap();
-        let mismatch = model::fixture::check_budget(&planner, &split, 3).unwrap_err();
-        let error = fixture_budget_error(&path, 3, mismatch);
+        assert_eq!(planned(&planner, &split, &path, 4).unwrap(), 0);
+        let error = planned(&planner, &split, &path, 3).unwrap_err().to_string();
         assert!(error.contains(&path.display().to_string()), "{error}");
         assert!(error.contains("stale recorded fixture budget 3"), "{error}");
         assert!(error.contains("not [4]"), "{error}");
