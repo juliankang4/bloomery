@@ -10355,7 +10355,8 @@ def key_self_test(expect, real: Side) -> None:
         expect(not any(v.startswith("error") for v in fix_file.values()) and all(fix_file[k] != fix_before[k] for k in items),
                "a fixture file's manifest row did not move every fixture-tier key of the family whose directory it is in")
         write_manifest(fixture_free + [fx_file.replace("\t100\t", "\t101\t"), "# end"])
-        expect(all(keys(sa, environ=fx4)[k] != fix_file[k] for k in items), "a fixture file rewritten (its size) moved no fixture-tier key")
+        rewritten_keys = keys(sa, environ=fx4)
+        expect(all(rewritten_keys[k] != fix_file[k] for k in items), "a fixture file rewritten (its size) moved no fixture-tier key")
         write_manifest(manifest)
         expect(keys(sa) == base, "the base manifest, restored, keys another way")
         # A fixture-tier item's key holds its family's fixture directory, from the family's row of the fixture directory table (FIXTURE_DIRS, the
@@ -10399,13 +10400,17 @@ def key_self_test(expect, real: Side) -> None:
         m = rewritten(bump("qwen35moe"))
         expect("q4" not in m, f"a file under {FIXTURE_ROOT}/qwen35moe moved the key of a qwen4exp item")  # (a)
         expect(m == {"q35"} | open_keys, f"a file under qwen35moe moved {sorted(m)}, not its item and the unknown-family ones")  # (b)
-        expect(rewritten(bump("qwen38")) == {"q4"} | open_keys, f"a file under qwen38 moved {sorted(rewritten(bump('qwen38')))}: the qwen4exp item and the unknown-family ones")  # (c)
-        expect(rewritten(bump("glm5next")) == {"glm"} | open_keys, f"a file under glm5next moved {sorted(rewritten(bump('glm5next')))}")
-        expect(rewritten(bump("v41")) == {"ds41"} | open_keys, f"a file under v41 moved {sorted(rewritten(bump('v41')))}")
+        m = rewritten(bump("qwen38"))
+        expect(m == {"q4"} | open_keys, f"a file under qwen38 moved {sorted(m)}: the qwen4exp item and the unknown-family ones")  # (c)
+        m = rewritten(bump("glm5next"))
+        expect(m == {"glm"} | open_keys, f"a file under glm5next moved {sorted(m)}")
+        m = rewritten(bump("v41"))
+        expect(m == {"ds41"} | open_keys, f"a file under v41 moved {sorted(m)}")
         expect(rewritten([r.replace("d.gguf\t51", "d.gguf\t52") for r in fx_rows(sizes)]) == {"ds41"} | open_keys, "v41's draft/ file (one level down) did not move exactly the deepseek41 item")
         # (d) an item whose family cannot be told keeps every row: any file, a new family's directory included, moves it
         newfam = fx_rows(sizes) + [f"model\t{FIXTURE_ROOT}/qwen38-old\tdir", f"model\t{FIXTURE_ROOT}/qwen38-old/n.gguf\t1\t1\t2\t3"]
-        expect(rewritten(newfam) == open_keys, f"a new directory (qwen38-old) moved {sorted(rewritten(newfam))}, not exactly the items whose family cannot be told")
+        m = rewritten(newfam)
+        expect(m == open_keys, f"a new directory (qwen38-old) moved {sorted(m)}, not exactly the items whose family cannot be told")
         # the root with no other family's directory, or with none, keys a told item the same: the root's own row is nobody's
         only35 = fam_keys(fx_rows({"qwen35moe": 20}))
         expect(not any(v.startswith("error") for v in only35.values()), f"a manifest with another family's directory only (no qwen38/): {only35}")
@@ -10498,7 +10503,8 @@ def key_self_test(expect, real: Side) -> None:
             expect(not any(v.startswith("error") for v in with_files.values()), f"an item under a variant: {with_files}")
             expect(all(with_files[k] != fix_plain[k] for k in items), "an item under a variant keys like the fixture tier's item")
             write_manifest([ln.replace(f"iq4xs/glm5next/g-00001-of-00001.gguf\t100", f"iq4xs/glm5next/g-00001-of-00001.gguf\t101") for ln in both])
-            expect(all(keys(sa, environ=venv)[k] != with_files[k] for k in items), "a variant file rewritten (its size) moved no key of the item under its tag")
+            rewritten_keys = keys(sa, environ=venv)
+            expect(all(rewritten_keys[k] != with_files[k] for k in items), "a variant file rewritten (its size) moved no key of the item under its tag")
             write_manifest([ln.replace(f"other/glm5next/g-00001-of-00001.gguf\t100", f"other/glm5next/g-00001-of-00001.gguf\t101") for ln in both])
             expect(keys(sa, environ=venv) == with_files and keys(sa) == real_plain and keys(sa, environ=fx_env) == fix_plain,
                    "another variant's file rewritten moved a key that does not run under it")
@@ -10540,18 +10546,21 @@ def key_self_test(expect, real: Side) -> None:
         # in the recipe's text: with no card forced the item never skips; forced, it can.
         for n in ("gate-ptx-spill",):
             expect(c.parts(n)[2] is not None, f"{n} with no card forced was skippable: its script's any-card call picks the card at run time")
-            expect(c.parts(f"{n}@BLOOMERY_GATE_CARD=a6000")[2] is None, f"{n} with the A6000 forced never skips: {c.parts(n + '@BLOOMERY_GATE_CARD=a6000')[2]}")
+            reason = c.parts(f"{n}@BLOOMERY_GATE_CARD=a6000")[2]
+            expect(reason is None, f"{n} with the A6000 forced never skips: {reason}")
         expect(c.parts("gate-sampler@BLOOMERY_REF_MODEL=/models/small/x.gguf")[2] is not None, "an item env naming a path was skippable")
         c2 = KeyContext(sa, mf, "BLOOMERY_KLD_FILE=/root/x.kld", {}, settings=settings)
         expect(c2.parts(items["cpu"])[2] is not None, "a caller env path outside data and /models was skippable")
         c3 = KeyContext(sa, mf, "BLOOMERY_DATA=/root/bloomery-data", {}, settings=settings)
         expect(c3.parts(items["cpu"])[2] is None, "the data directory itself made an item never-skip")
         expect(c.parts("gate-1-1")[2] is not None, "an ik-reading gate was skippable")
-        expect(c.parts("gate-tokenizer")[2] is None, f"gate-tokenizer reads its sets, no reference tree, and was never-skip: {c.parts('gate-tokenizer')[2]}")
+        reason = c.parts("gate-tokenizer")[2]
+        expect(reason is None, f"gate-tokenizer reads its sets, no reference tree, and was never-skip: {reason}")
         expect(c.parts("smoke")[2] is not None, "smoke (a batch in a batch) was skippable")
         # The cancellation fixtures name Clefvis and the tokenizer oracle's self-test runs oracle.sh: both scripts read a
         # reference tree, so check-recipes is never skipped (the reason names the first one the closure reaches).
-        expect("reads a reference tree" in (c.parts("check-recipes")[2] or ""), f"check-recipes did not name a reference-tree read: {c.parts('check-recipes')[2]}")
+        reason = c.parts("check-recipes")[2]
+        expect("reads a reference tree" in (reason or ""), f"check-recipes did not name a reference-tree read: {reason}")
         expect(c.parts("gate-gpu-e2e")[2] is not None, "an `any`-card recipe with no card forced was skippable")
         expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in /root/x.bin")[2] is not None, "an absolute path in ARGS was skippable")
         argpath = "gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in docs/HARDWARE.md"
@@ -11223,10 +11232,12 @@ def key_reach_self_test(expect, side: Side) -> None:
         gap = key_reach_gap(side, crate)
         expect(not gap, f"{crate} ({reason}): {len(gap)} recipes key it without reaching it: {' '.join(gap[:8])}")
     # why --recipe: a recipe that links the crate names the chain from its target, one that does not names none
-    expect(why_chains(side, "gate-gpu-p1", "crates/hf/src/lib.rs") == [], f"why: gate-gpu-p1 links hf: {why_chains(side, 'gate-gpu-p1', 'crates/hf/src/lib.rs')}")
+    chain = why_chains(side, "gate-gpu-p1", "crates/hf/src/lib.rs")
+    expect(chain == [], f"why: gate-gpu-p1 links hf: {chain}")
     chain = why_chains(side, "gate-gpu-glm5next-twocard", "crates/hf/src/lib.rs")
     expect(any(c.endswith("generate_glm5next: bloomery-gpu-gates -> bloomery-hf") for c in chain), f"why: gate-gpu-glm5next-twocard's chain to hf is {chain}")
-    expect(why_chains(side, "gate-hf", "crates/hf/src/lib.rs") == ["bloomery-hf libtest: its own package"], f"why: gate-hf's chain to hf is {why_chains(side, 'gate-hf', 'crates/hf/src/lib.rs')}")
+    chain = why_chains(side, "gate-hf", "crates/hf/src/lib.rs")
+    expect(chain == ["bloomery-hf libtest: its own package"], f"why: gate-hf's chain to hf is {chain}")
     for name in ("gate-decision-clef", "gate-decision-lev"):
         expect(side.graph.inputs(name).match("crates/hf/src/lib.rs") is None, f"{name} keys unrelated hub code")
     expect(
