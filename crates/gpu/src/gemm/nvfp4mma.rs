@@ -31,6 +31,10 @@ impl Act {
 }
 
 #[cuda_device::device]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
 fn nvfp4_pack_q8(words: [u32; 4], d: f32, gs: f32) -> ([u32; 2], u32) {
     let mut values = [0.0f32; 16];
     #[unroll]
@@ -116,136 +120,145 @@ unsafe fn act_quad(g: &[f32], u: &[f32], base: usize, code: u32, limit: f32) -> 
     }
 }
 
-#[cuda_device::device]
-fn fused_swiglu(
-    g: &[f32],
-    u: &[f32],
-    code: u32,
-    limit: f32,
-    k: u32,
-    mut q: DisjointSlice<u32>,
-    mut d: DisjointSlice<f32>,
-    mut sums: DisjointSlice<i32>,
-    mut out: DisjointSlice<u32>,
-    mut scales: DisjointSlice<u32>,
-    mut global: DisjointSlice<f32>,
-    fault: crate::fault::FaultSink,
-) {
-    let col = thread::blockIdx_x() as usize;
-    let tid = thread::threadIdx_x() as usize;
-    let lane = warp::lane_id() as usize;
-    let k = k as usize;
-    let cached = k.min(ACT_CACHE_VALUES);
-    let cache = cuda_device::DynamicSharedArray::<f32>::get();
-    let mut largest = 0.0f32;
-    let mut at = 4 * tid;
-    while at < k {
-        // SAFETY: K divides 64; the loop's aligned quad is inside both checked input columns.
-        let v = unsafe { act_quad(g, u, col * k + at, code, limit) };
-        if at < cached {
-            // SAFETY: this thread owns the aligned quad inside the allocated shared prefix.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed the SwiGLU kernel entries' flat arguments, and the device macro's same-name wrapper repeats them (rust-quality R8)"
+)]
+mod swiglu {
+    use super::*;
+
+    #[cuda_device::device]
+    pub(super) fn fused_swiglu(
+        g: &[f32],
+        u: &[f32],
+        code: u32,
+        limit: f32,
+        k: u32,
+        mut q: DisjointSlice<u32>,
+        mut d: DisjointSlice<f32>,
+        mut sums: DisjointSlice<i32>,
+        mut out: DisjointSlice<u32>,
+        mut scales: DisjointSlice<u32>,
+        mut global: DisjointSlice<f32>,
+        fault: crate::fault::FaultSink,
+    ) {
+        let col = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let k = k as usize;
+        let cached = k.min(ACT_CACHE_VALUES);
+        let cache = cuda_device::DynamicSharedArray::<f32>::get();
+        let mut largest = 0.0f32;
+        let mut at = 4 * tid;
+        while at < k {
+            // SAFETY: K divides 64; the loop's aligned quad is inside both checked input columns.
+            let v = unsafe { act_quad(g, u, col * k + at, code, limit) };
+            if at < cached {
+                // SAFETY: this thread owns the aligned quad inside the allocated shared prefix.
+                unsafe {
+                    *cache.add(at).cast::<cuda_device::vector::F32x4>() =
+                        cuda_device::vector::F32x4::new(v);
+                }
+            }
+            largest = if crate::fault::quad_finite(v) {
+                largest
+                    .max(v[0].abs())
+                    .max(v[1].abs())
+                    .max(v[2].abs())
+                    .max(v[3].abs())
+            } else {
+                f32::INFINITY
+            };
+            at += 256;
+        }
+        let mut delta = 16;
+        while delta > 0 {
+            largest = largest.max(warp::shuffle_xor_f32(largest, delta));
+            delta /= 2;
+        }
+        if lane == 0 {
+            // SAFETY: each warp owns one of the two shared reduction words after the cached prefix.
             unsafe {
-                *cache.add(at).cast::<cuda_device::vector::F32x4>() =
-                    cuda_device::vector::F32x4::new(v);
+                *cache.add(cached + tid / 32) = largest;
             }
         }
-        largest = if crate::fault::quad_finite(v) {
-            largest
-                .max(v[0].abs())
-                .max(v[1].abs())
-                .max(v[2].abs())
-                .max(v[3].abs())
+        thread::sync_threads();
+        // SAFETY: the first warp published its maximum in the first reduction word.
+        let first = unsafe { *cache.add(cached) };
+        // SAFETY: the second warp published its maximum in the second reduction word.
+        let second = unsafe { *cache.add(cached + 1) };
+        let largest = first.max(second);
+        let gs = if !largest.is_finite() {
+            f32::NAN
+        } else if largest > 0.0 {
+            (largest / 127.0) * (127.0 / 6.0)
         } else {
-            f32::INFINITY
+            1.0
         };
-        at += 256;
-    }
-    let mut delta = 16;
-    while delta > 0 {
-        largest = largest.max(warp::shuffle_xor_f32(largest, delta));
-        delta /= 2;
-    }
-    if lane == 0 {
-        // SAFETY: each warp owns one of the two shared reduction words after the cached prefix.
-        unsafe {
-            *cache.add(cached + tid / 32) = largest;
-        }
-    }
-    thread::sync_threads();
-    // SAFETY: the first warp published its maximum in the first reduction word.
-    let first = unsafe { *cache.add(cached) };
-    // SAFETY: the second warp published its maximum in the second reduction word.
-    let second = unsafe { *cache.add(cached + 1) };
-    let largest = first.max(second);
-    let gs = if !largest.is_finite() {
-        f32::NAN
-    } else if largest > 0.0 {
-        (largest / 127.0) * (127.0 / 6.0)
-    } else {
-        1.0
-    };
-    if tid == 0 {
-        // SAFETY: this block owns the live column's global scale.
-        unsafe {
-            *global.get_unchecked_mut(col) = gs;
-        }
-    }
-    let blocks = k / 32;
-    let steps = k / 64;
-    let mut group = tid / 32;
-    while group < blocks.div_ceil(4) {
-        let block = (4 * group + (lane >> 3)).min(blocks - 1);
-        let at = 32 * block + 4 * (lane & 7);
-        let v = if at < cached {
-            // SAFETY: this aligned quad is inside the published shared prefix.
-            unsafe { (*cache.add(at).cast::<cuda_device::vector::F32x4>()).0 }
-        } else {
-            // SAFETY: this aligned quad is inside both checked input columns.
-            unsafe { act_quad(g, u, col * k + at, code, limit) }
-        };
-        // SAFETY: each warp owns one group of four 32-value blocks in this checked column.
-        let refused = unsafe {
-            super::act32::quant32_group(
-                v, col, group, blocks, steps, lane, &mut q, &mut d, &mut sums,
-            )
-        };
-        if refused && lane & 7 == 0 {
-            fault.raise(crate::FaultSite::QuantColumn);
-        }
-        group += 2;
-    }
-    thread::sync_threads();
-    let mut block = tid;
-    while block - lane < k / 16 {
-        let source = block.min(k / 16 - 1);
-        let at = col * steps * 16 + source * 4;
-        // SAFETY: this aligned four-word block is in the column's published Q8 plane.
-        let words = unsafe { (*q.as_mut_ptr().add(at).cast::<cuda_device::vector::U32x4>()).0 };
-        // SAFETY: the block barrier published this checked column's Q8 scales.
-        let dx = unsafe { *d.as_mut_ptr().add(col * 2 * steps + source / 2) };
-        let (packed, scale) = nvfp4_pack_q8(words, dx, gs);
-        if block < k / 16 {
-            // SAFETY: this lane owns the first word of the live 16-value sub-block.
+        if tid == 0 {
+            // SAFETY: this block owns the live column's global scale.
             unsafe {
-                *out.get_unchecked_mut(col * k / 8 + 2 * block) = packed[0];
-            }
-            // SAFETY: this lane owns the second word of the live 16-value sub-block.
-            unsafe {
-                *out.get_unchecked_mut(col * k / 8 + 2 * block + 1) = packed[1];
+                *global.get_unchecked_mut(col) = gs;
             }
         }
-        let mut word = scale << (8 * (lane & 3));
-        word |= warp::shuffle_xor(word, 1);
-        word |= warp::shuffle_xor(word, 2);
-        if block < k / 16 && lane & 3 == 0 {
-            // SAFETY: one lane per quad owns these four packed scales.
-            unsafe {
-                *scales.get_unchecked_mut(col * steps + block / 4) = word;
+        let blocks = k / 32;
+        let steps = k / 64;
+        let mut group = tid / 32;
+        while group < blocks.div_ceil(4) {
+            let block = (4 * group + (lane >> 3)).min(blocks - 1);
+            let at = 32 * block + 4 * (lane & 7);
+            let v = if at < cached {
+                // SAFETY: this aligned quad is inside the published shared prefix.
+                unsafe { (*cache.add(at).cast::<cuda_device::vector::F32x4>()).0 }
+            } else {
+                // SAFETY: this aligned quad is inside both checked input columns.
+                unsafe { act_quad(g, u, col * k + at, code, limit) }
+            };
+            // SAFETY: each warp owns one group of four 32-value blocks in this checked column.
+            let refused = unsafe {
+                crate::gemm::act32::quant32_group(
+                    v, col, group, blocks, steps, lane, &mut q, &mut d, &mut sums,
+                )
+            };
+            if refused && lane & 7 == 0 {
+                fault.raise(crate::FaultSite::QuantColumn);
             }
+            group += 2;
         }
-        block += 64;
+        thread::sync_threads();
+        let mut block = tid;
+        while block - lane < k / 16 {
+            let source = block.min(k / 16 - 1);
+            let at = col * steps * 16 + source * 4;
+            // SAFETY: this aligned four-word block is in the column's published Q8 plane.
+            let words = unsafe { (*q.as_mut_ptr().add(at).cast::<cuda_device::vector::U32x4>()).0 };
+            // SAFETY: the block barrier published this checked column's Q8 scales.
+            let dx = unsafe { *d.as_mut_ptr().add(col * 2 * steps + source / 2) };
+            let (packed, scale) = nvfp4_pack_q8(words, dx, gs);
+            if block < k / 16 {
+                // SAFETY: this lane owns the first word of the live 16-value sub-block.
+                unsafe {
+                    *out.get_unchecked_mut(col * k / 8 + 2 * block) = packed[0];
+                }
+                // SAFETY: this lane owns the second word of the live 16-value sub-block.
+                unsafe {
+                    *out.get_unchecked_mut(col * k / 8 + 2 * block + 1) = packed[1];
+                }
+            }
+            let mut word = scale << (8 * (lane & 3));
+            word |= warp::shuffle_xor(word, 1);
+            word |= warp::shuffle_xor(word, 2);
+            if block < k / 16 && lane & 3 == 0 {
+                // SAFETY: one lane per quad owns these four packed scales.
+                unsafe {
+                    *scales.get_unchecked_mut(col * steps + block / 4) = word;
+                }
+            }
+            block += 64;
+        }
     }
 }
+use swiglu::fused_swiglu;
 
 #[inline(always)]
 fn packed_pair(a: u32, b: u32) -> [u32; 2] {
@@ -291,6 +304,10 @@ mod native {
     use cuda_device::shared::cvta_generic_to_shared_u32;
     use cuda_device::wmma::{ldmatrix_x2_shared_u32, ldmatrix_x4_shared_u32};
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(64)]
     #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (264, 32776))]
@@ -311,6 +328,10 @@ mod native {
         fused_swiglu(g, u, code, limit, k, q, d, sums, out, scales, global, fault);
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(64)]
     #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (264, 32776))]
@@ -427,6 +448,10 @@ mod native {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(domain = 1, block = (256, 1, 1))]
@@ -660,9 +685,8 @@ pub(super) struct Kernels {
 impl Kernels {
     pub(super) fn load(ctx: &Arc<CudaContext>) -> Result<Self, GpuError> {
         // SAFETY: this package owns the embedded device module.
-        Ok(Self {
-            module: unsafe { crate::shared_module!(native, ctx)? },
-        })
+        let module = unsafe { crate::shared_module!(native, ctx)? };
+        Ok(Self { module })
     }
 
     pub(super) fn quantize(
