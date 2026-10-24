@@ -10204,12 +10204,14 @@ def key_detectors_self_test(expect, real: Side) -> None:
         expect(hit is None, f"the walk detector flags {hit}: every gate that runs it would be keyed on the whole tree")
 
 
-def key_self_test(expect, real: Side) -> None:
-    """The ledger key on a scratch copy where each input class is changed in turn — the same inputs give the
-    same key, each change moves exactly the keys that read it."""
+def key_self_test(expect, real: Side, section: str | None = None) -> None:
+    """Independent key contracts, each on its own scratch tree and manifest."""
+    from unittest.mock import patch
+
+    assert section in (None, "inputs", "fixtures", "variants", "scope"), section
     meta = cargo_metadata(ROOT)
     settings = justfile_settings(os.path.join(ROOT, "justfile"))
-    with tempfile.TemporaryDirectory(prefix="recipes-keytest-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="recipes-keytest-") as tmp, patch.dict(os.environ, {"HOME": tmp}):
         roots = [os.path.join(tmp, "a")]
         for rel in shipped_files(ROOT):
             src, dst = os.path.join(ROOT, rel), os.path.join(roots[0], rel)
@@ -10260,17 +10262,6 @@ def key_self_test(expect, real: Side) -> None:
 
         base = keys(sa)
         expect(not any(v.startswith("error") for v in base.values()), f"base keys: {base}")
-        expect(keys(sa) == base, "the same inputs gave another key")
-        # The same tree at a second absolute path: the copy renamed there and back (a symlink would not
-        # do — Tree takes the realpath).
-        other = os.path.join(tmp, "b")
-        os.rename(roots[0], other)
-        try:
-            elsewhere = keys(side_at(other, meta))
-        finally:
-            os.rename(other, roots[0])
-        expect(elsewhere == base, "a second checkout at another path gives other keys (a path is not relative)")
-
         def moved(after: dict[str, str]) -> set[str]:
             return {k for k in after if after[k] != base[k]}
 
@@ -10289,343 +10280,359 @@ def key_self_test(expect, real: Side) -> None:
         def append(text: str):
             return lambda s: s + text
 
-        m = edit("crates/gpu-gates/src/bin/gate_q4k_sel.rs", append("\n// key probe\n"))
-        expect(m == {"gpu", "mac", "fmt"}, f"gate_q4k_sel.rs moves {sorted(m)}, not gpu mac fmt")
-        m = edit("tools/gpu-gate.sh", append("\n# key probe\n"))
-        expect(m == {"gpu", "cpu", "args", "mac", "fmt"}, f"tools/gpu-gate.sh moves {sorted(m)}")
-        m = edit("docs/HARDWARE.md", append("\nkey probe\n"))
-        expect(m == {"mac", "fmt"}, f"docs/HARDWARE.md moves {sorted(m)}, not only the whole-tree keys")
-        cpu_lib = sorted(f for f in sa.graph.inputs("gate-sampler").files if f.startswith("crates/sampler/src/"))
-        m = edit(cpu_lib[0], append("\n// key probe\n"))
-        expect({"cpu", "mac", "fmt"} <= m and "gpu" not in m, f"{cpu_lib[0]} moves {sorted(m)}")
-        for g in KEY_GLOBALS:
-            m = edit(g, append("\n# key probe\n"))
-            expect(m == set(items), f"{g} moves {sorted(m)}, not every key")
         two = {k: items[k] for k in ("gpu", "mac")}
-        m = edit("justfile", append("\n# key probe\n"), side_fresh=True)
-        expect(m == {"mac", "fmt"}, f"a justfile comment moves {sorted(m)}")
-        m = edit("justfile", lambda s: s.replace("bash tools/gpu-gate.sh gate_q4k_sel'", "bash tools/gpu-gate.sh gate_q4k_sel '", 1), side_fresh=True)
-        expect("gpu" in m and "cpu" not in m and "args" not in m, f"gate-gpu-q4k-sel's recipe text moves {sorted(m)}")
-
         one = lambda it: keys(sa, only={"x": it})["x"]  # noqa: E731
-        expect(one("gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=3090,X=1") != base["gpu"], "an item env entry does not move the key")
-        expect(one("gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=a6000") != base["gpu"], "the lane's card does not move the key")
-        expect(one("gate-gpu-q4k-sel") != base["gpu"], "no card (--lanes 1) gives the 3090 lane's key")
-        expect(one("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--y") != base["args"], "ARGS do not move the key")
-        expect(moved(keys(sa, box_env="BLOOMERY_X=1")) == set(items), "the caller's BLOOMERY_BOX_ENV does not move every key")
-        expect(moved(keys(sa, environ={"BLOOMERY_DATA": "/x"})) == set(items), "the Mac's BLOOMERY_DATA does not move every key")
-        # The tier: one item under the real tier and under the fixture tier is two keys, whichever way the tier is named, and unset
-        # and `real` are one — a fixture green must never stand for the real file's, nor `--tier real` split the real greens.
         fx_env = {"BLOOMERY_TIER": "fixture"}
-        expect(moved(keys(sa, environ=fx_env)) == set(items), "the Mac's BLOOMERY_TIER=fixture does not move every key")
-        expect(moved(keys(sa, box_env="BLOOMERY_TIER=fixture")) == set(items), "a BLOOMERY_TIER entry of the box env does not move every key")
-        expect(not moved(keys(sa, environ={"BLOOMERY_TIER": "real"})), "BLOOMERY_TIER=real moves a key: it is the unset value")
-        expect(not moved(keys(sa, environ={"BLOOMERY_TIER": ""})), "an empty BLOOMERY_TIER moves a key: it is the unset value")
-        expect(keys(sa, environ=fx_env) != keys(sa, environ={"BLOOMERY_TIER": "bad"}), "an unnamed tier keys like the fixture tier")
-        # The Mac-env part itself (a fixture tier's manifest rows move the key as well, so a moved key alone would not show a lost part).
-        mac_row = lambda e: [r for r in KeyContext(sa, mf, environ=e).mac if r.startswith("mac-env\tBLOOMERY_TIER\t")]  # noqa: E731
-        expect("BLOOMERY_TIER" in MAC_ENV, "BLOOMERY_TIER is not in MAC_ENV")
-        expect(mac_row(fx_env) == ["mac-env\tBLOOMERY_TIER\tfixture"], f"the Mac's BLOOMERY_TIER=fixture is not a key part: {mac_row(fx_env)}")
-        expect(mac_row({}) == mac_row({"BLOOMERY_TIER": "real"}) == mac_row({"BLOOMERY_TIER": ""}) == ["mac-env\tBLOOMERY_TIER\treal"],
-               f"unset, empty and `real` are not one key part: {mac_row({})} {mac_row({'BLOOMERY_TIER': 'real'})} {mac_row({'BLOOMERY_TIER': ''})}")
-        # ... and the ledger reader: a green recorded at the fixture key does not skip the real item, and skips the fixture one.
-        k_real, k_fix = (keys(sa, environ=e, only={"x": items["gpu"]})["x"] for e in ({}, fx_env))
-        with tempfile.TemporaryDirectory(prefix="recipes-tier-ledger-") as ld:
-            lp = os.path.join(ld, "ledger.tsv")
-            with open(lp, "w", encoding="utf-8") as fh:
-                fh.write(f"{k_fix}\tgate-gpu-q4k-sel\t{items['gpu']}\tc1\t2026-10-07T09:00:00+0900\t/t/fx\n")
-            st_real, _ = ledger_status(k_real, "gate-gpu-q4k-sel", items["gpu"], [], [Ledger(lp)])
-            st_fix, _ = ledger_status(k_fix, "gate-gpu-q4k-sel", items["gpu"], [], [Ledger(lp)])
-        expect(st_real == "run" and st_fix == "skip", f"a fixture-tier green and the ledger: the real item {st_real}, the fixture one {st_fix}")
-        # The fixture directory's rows belong to the fixture tier's keys alone: a real key does not move with them, a fixture key
-        # does, and the row of a file inside a family's directory is one (the manifest lists below a subdirectory there).
         fx_file = f"model\t{FIXTURE_ROOT}/qwen38/q-00001-of-00001.gguf\t100\t1\t2\t3"
         fixture_free = [ln for ln in manifest[:-1] if not ln.startswith(f"model-dir\t{FIXTURE_ROOT}\t")]
-        # PIN(2026-10-13): re-pinned, not loosened — a key holds its family's fixture directory (KeyContext.fixture_dirs), so a
-        # fixture file moves the items of its family only; these items run under qwen4exp (no recipe of `items` names a
-        # BLOOMERY_MODEL), and a Mac-run item, whose family cannot be told, keeps every row. The base is the manifest with the root
-        # present, so every key is a key and not an error string. FAIL-first: the family clauses below fail on b1f2c3d1's code.
-        fx4 = {"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": "qwen4exp"}
-        write_manifest(manifest)
-        real_before, fix_before = keys(sa), keys(sa, environ=fx4)
-        expect(not any(v.startswith("error") for v in fix_before.values()), f"the fixture-tier keys on the base manifest: {fix_before}")
-        write_manifest(fixture_free + [fx_file, "# end"])
-        expect(not moved(keys(sa)), "a fixture file's manifest row moved a real-tier key")
-        fix_file = keys(sa, environ=fx4)
-        expect(not any(v.startswith("error") for v in fix_file.values()) and all(fix_file[k] != fix_before[k] for k in items),
-               "a fixture file's manifest row did not move every fixture-tier key of the family whose directory it is in")
-        write_manifest(fixture_free + [fx_file.replace("\t100\t", "\t101\t"), "# end"])
-        rewritten_keys = keys(sa, environ=fx4)
-        expect(all(rewritten_keys[k] != fix_file[k] for k in items), "a fixture file rewritten (its size) moved no fixture-tier key")
-        write_manifest(manifest)
-        expect(keys(sa) == base, "the base manifest, restored, keys another way")
-        # A fixture-tier item's key holds its family's fixture directory, from the family's row of the fixture directory table (FIXTURE_DIRS, the
-        # one owner), as a variant's below holds its tag's: a file in a directory no family of the item maps to moves nothing of it.
-        rows, default = fixture_table(sa.tree.read(FIXTURE_DIRS), sa.tree.read(REF_PATHS))
-        expect(default == DEFAULT_PROFILE, f"ref-paths.sh's default profile {default} is not DEFAULT_PROFILE {DEFAULT_PROFILE}")
-        expect([rows.get(f) for f in ("qwen4exp", "deepseek41", "glm5next", "qwen35moe", "deepseek2")] == ["qwen38", "v41", "glm5next", "qwen35moe", "self"]
-               and "mimo2" not in rows and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
-        fam = {
-            "q4": "gate-gpu-qwen4exp-e2e",  # BLOOMERY_MODEL=qwen4exp: qwen38
-            "glm": "gate-gpu-glm-sel",  # glm5next: glm5next
-            "ds41": "gate-gpu-ds41-hc",  # deepseek41: v41, its draft/ below it
-            "q35": "gate-gpu-qwen35moe-moe",  # qwen35moe: its own directory
-            "mimo": "gate-gpu-mimo2-flash",  # mimo2: no row, `none`
-            "envm": "gate-gpu-glm-sel@BLOOMERY_MODEL=qwen4exp",  # a BLOOMERY_MODEL in the item's env: no telling
-            "mac": "check-comments",  # a command run on the Mac: no telling
-        }
-        open_keys = {"envm", "mac"}
 
-        def fx_rows(sizes: dict[str, int]) -> list[str]:
-            out: list[str] = []
-            for d, size in sizes.items():
-                out += [f"model\t{FIXTURE_ROOT}/{d}\tdir", f"model\t{FIXTURE_ROOT}/{d}/{d}-00001-of-00001.gguf\t{size}\t1\t2\t3"]
-                if d == "v41":
-                    out += [f"model\t{FIXTURE_ROOT}/v41/draft\tdir", f"model\t{FIXTURE_ROOT}/v41/draft/d.gguf\t{size + 1}\t1\t2\t3"]
-            return out
-
-        def fam_keys(rows_: list[str], env: dict | None = None) -> dict[str, str]:
-            write_manifest(fixture_free + rows_ + ["# end"])
-            return keys(sa, environ=fx_env if env is None else env, only=fam)
-
-        sizes = {"qwen38": 30, "glm5next": 10, "v41": 50, "qwen35moe": 20}
-        kf = fam_keys(fx_rows(sizes))
-        expect(not any(v.startswith("error") for v in kf.values()), f"the family items under the fixture tier: {kf}")
-
-        def rewritten(rows_: list[str], env: dict | None = None, base_: dict[str, str] | None = None) -> set[str]:
-            now = fam_keys(rows_, env)
-            return {k for k in fam if now[k] != (kf if base_ is None else base_)[k]}
-
-        bump = lambda d: fx_rows({**sizes, d: sizes[d] + 1})  # noqa: E731
-        m = rewritten(bump("qwen35moe"))
-        expect("q4" not in m, f"a file under {FIXTURE_ROOT}/qwen35moe moved the key of a qwen4exp item")  # (a)
-        expect(m == {"q35"} | open_keys, f"a file under qwen35moe moved {sorted(m)}, not its item and the unknown-family ones")  # (b)
-        m = rewritten(bump("qwen38"))
-        expect(m == {"q4"} | open_keys, f"a file under qwen38 moved {sorted(m)}: the qwen4exp item and the unknown-family ones")  # (c)
-        m = rewritten(bump("glm5next"))
-        expect(m == {"glm"} | open_keys, f"a file under glm5next moved {sorted(m)}")
-        m = rewritten(bump("v41"))
-        expect(m == {"ds41"} | open_keys, f"a file under v41 moved {sorted(m)}")
-        expect(rewritten([r.replace("d.gguf\t51", "d.gguf\t52") for r in fx_rows(sizes)]) == {"ds41"} | open_keys, "v41's draft/ file (one level down) did not move exactly the deepseek41 item")
-        # (d) an item whose family cannot be told keeps every row: any file, a new family's directory included, moves it
-        newfam = fx_rows(sizes) + [f"model\t{FIXTURE_ROOT}/qwen38-old\tdir", f"model\t{FIXTURE_ROOT}/qwen38-old/n.gguf\t1\t1\t2\t3"]
-        m = rewritten(newfam)
-        expect(m == open_keys, f"a new directory (qwen38-old) moved {sorted(m)}, not exactly the items whose family cannot be told")
-        # the root with no other family's directory, or with none, keys a told item the same: the root's own row is nobody's
-        only35 = fam_keys(fx_rows({"qwen35moe": 20}))
-        expect(not any(v.startswith("error") for v in only35.values()), f"a manifest with another family's directory only (no qwen38/): {only35}")
-        empty = fam_keys([f"model-dir\t{FIXTURE_ROOT}\tempty"])
-        expect(only35["q4"] == empty["q4"] and only35["mimo"] == empty["mimo"] and only35["mac"] != empty["mac"],
-               "a fixture root holding another family's directory only keys a told item another way than an empty root")
-        # the Mac's BLOOMERY_MODEL is the family of an item whose recipes name none (fmt-check: a box call with no BLOOMERY_MODEL)
-        def fmt_moved(name: str) -> bool:
-            env = {"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": name}
-            write_manifest(fixture_free + fx_rows(sizes) + ["# end"])
-            before = keys(sa, environ=env, only={"fmt": items["fmt"]})["fmt"]
-            write_manifest(fixture_free + bump("qwen38") + ["# end"])
-            return keys(sa, environ=env, only={"fmt": items["fmt"]})["fmt"] != before
-
-        got = {n: fmt_moved(n) for n in ("qwen4exp", "glm5next", "qwen35moe")}
-        expect(got == {"qwen4exp": True, "glm5next": False, "qwen35moe": False}, f"fmt-check, a qwen38 file rewritten, under the Mac's BLOOMERY_MODEL: moved {got}")
-        _, err, _, _ = KeyContext(sa, mf, environ={"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": "a b"}, settings=settings).parts(items["fmt"])
-        expect(err is not None and "BLOOMERY_MODEL='a b': cannot resolve model profile" in err, f"fmt-check: invalid inherited profile not refused by name: {err}")
-        # (e) the real tier holds no fixture row: no rewrite moves a key
-        real_f = fam_keys(fx_rows(sizes), {})
-        expect(all(rewritten(bump(d), {}, real_f) == set() for d in sizes), "a fixture file's rewrite moved a real-tier key")
-        # the key part names what the fixture rows were taken from: the debuggability of "moved since"
-        fparts = lambda it, env: [p for p in KeyContext(sa, mf, "", env, settings=settings).parts(it)[0] if p.startswith("fixture\t")]  # noqa: E731
-        write_manifest(fixture_free + fx_rows(sizes) + ["# end"])
-        expect([fparts(fam[k], fx_env) for k in ("q4", "ds41", "q35", "envm")] == [["fixture\tdirs\tqwen38"], ["fixture\tdirs\tv41"], ["fixture\tdirs\tqwen35moe"], ["fixture\tdirs\t*"]]
-               and fparts(fam["q4"], {}) == [], "the fixture key part does not name the directories the key holds")
-        # (f) the table is tools/fixture-dirs.tsv's. qwen35moe already names its own directory. Pointing that row back at
-        # `self` edits the file, so it moves the keys of the box items (the file is a key part of every one of
-        # them). Against that table a file under the qwen35moe directory is a directory no family maps to.
-        rp = os.path.join(roots[0], FIXTURE_DIRS)
-        with open(rp, encoding="utf-8") as fh:
-            rp_old = fh.read()
-        own = "qwen35moe\tqwen35moe\n"
-        selfrow = "qwen35moe\tself\n"
-        refused = [
-            (rp_old + "qwen35moe\tself\n", "in the table twice"),
-            (rp_old.replace("qwen4exp\tqwen38\n", "qwen4exp\tqwen38\tx\n"), "is not `<family><TAB><dir>`"),
-            (rp_old.replace("qwen4exp\tqwen38\n", "qwen4*\tqwen38\n"), "is not `<family><TAB><dir>`"),
-            (rp_old.replace("qwen4exp\tqwen38\n", "qwen4exp\tnone\n"), "never `none`"),
-            (rp_old.replace("qwen4exp\tqwen38\n", "qwen4exp\tQwen38\n"), "is not `<family><TAB><dir>`"),
-            ("# no rows\n", "no row"),
-        ]
-        try:
-            expect(own in rp_old and selfrow not in rp_old, f"{FIXTURE_DIRS}'s qwen35moe row is not the one this clause edits")
-            edited = rp_old.replace(own, selfrow)
-            expect(edited != rp_old and selfrow in edited and own not in edited, "pointing qwen35moe back at self did not edit the table")
-            with open(rp, "w", encoding="utf-8") as fh:
-                fh.write(edited)
-            kf_row = fam_keys(fx_rows(sizes))
-            expect(kf_row["q4"] != kf["q4"] and kf_row["q35"] != kf["q35"] and kf_row["glm"] != kf["glm"], f"an edit of {FIXTURE_DIRS} moved no key of a box item")
-            m = rewritten(bump("qwen35moe"), None, kf_row)
-            expect(m == open_keys, f"qwen35moe pointed back at self: a file under its directory moved {sorted(m)}, not only the items whose family cannot be told {sorted(open_keys)}")
-            for text, why in refused:
-                with open(rp, "w", encoding="utf-8") as fh:
-                    fh.write(text)
-                got = fam_keys(fx_rows(sizes))["q4"]
-                expect(got.startswith("error") and why in got, f"a fixture table this reader does not understand ({why}) was keyed: {got}")
-        finally:
-            with open(rp, "w", encoding="utf-8") as fh:
-                fh.write(rp_old)
-        expect(fam_keys(fx_rows(sizes)) == kf, f"{FIXTURE_DIRS} restored keys another way")
-        write_manifest(manifest)
-        expect(keys(sa) == base, "the base manifest, restored after the family clauses, keys another way")
-        # A fixture variant's files (VARIANT_ROOT, beside FIXTURE_ROOT) belong to the keys of the items that run under its tag: no other
-        # item's key moves with them, an item under the tag moves with its own directory's rows and its table row, and not with another tag's.
-        vdirs = lambda tag: [f"model\t{VARIANT_ROOT}/{tag}\tdir", f"model\t{VARIANT_ROOT}/{tag}/glm5next\tdir"]  # noqa: E731
-        vfile = lambda tag, size: f"model\t{VARIANT_ROOT}/{tag}/glm5next/g-00001-of-00001.gguf\t{size}\t1\t2\t3"  # noqa: E731
-        vtable = os.path.join(roots[0], VARIANT_TABLE)
-        with open(vtable, encoding="utf-8") as fh:
-            vtable_old = fh.read()
-        row_a = "iq4xs\tglm5next\ttrunk\tffn_up_exps=iq3_s\tgate-gpu-q4k-sel\tprobe"
-        row_b = "other\tglm5next\ttrunk\tffn_up_exps=iq3_s\tgate-gpu-q4k-sel\tprobe"
-        venv = {"BLOOMERY_TIER": "fixture", "BLOOMERY_FIXTURE_VARIANT": "iq4xs"}
-        vparts = lambda e, box="": [p for p in KeyContext(sa, mf, box, e, settings=settings).parts(items["gpu"])[0] if p.startswith("variant\t")]  # noqa: E731
-        variant_free = [ln for ln in fixture_free if not ln.startswith(f"model-dir\t{VARIANT_ROOT}\t")]
-        try:
-            with open(vtable, "w", encoding="utf-8") as fh:
-                fh.write(f"# probe\n{row_a}\n{row_b}\n")
-            # The table is a file of the tree (a tree-scope key holds it): the probe table moves those keys, so the clauses below compare
-            # against the keys taken with the probe table in place and no variant rows in the manifest.
-            write_manifest(variant_free + [fx_file, "# end"])
-            real_plain, fix_plain = keys(sa), keys(sa, environ=fx_env)
-            err = keys(sa, environ=venv)["gpu"]
-            expect(err.startswith("error") and VARIANT_ROOT in err, f"an item under a variant keyed with no row for {VARIANT_ROOT}: {err}")
-            both = variant_free + [fx_file] + vdirs("iq4xs") + [vfile("iq4xs", 100)] + vdirs("other") + [vfile("other", 100), "# end"]
-            write_manifest(both)
-            expect(keys(sa) == real_plain, "a variant's files moved a key of a real-tier item")
-            expect(keys(sa, environ=fx_env) == fix_plain, "a variant's files moved a key of a fixture-tier item that runs under no variant")
-            with_files = keys(sa, environ=venv)
-            expect(not any(v.startswith("error") for v in with_files.values()), f"an item under a variant: {with_files}")
-            expect(all(with_files[k] != fix_plain[k] for k in items), "an item under a variant keys like the fixture tier's item")
-            write_manifest([ln.replace(f"iq4xs/glm5next/g-00001-of-00001.gguf\t100", f"iq4xs/glm5next/g-00001-of-00001.gguf\t101") for ln in both])
-            rewritten_keys = keys(sa, environ=venv)
-            expect(all(rewritten_keys[k] != with_files[k] for k in items), "a variant file rewritten (its size) moved no key of the item under its tag")
-            write_manifest([ln.replace(f"other/glm5next/g-00001-of-00001.gguf\t100", f"other/glm5next/g-00001-of-00001.gguf\t101") for ln in both])
-            expect(keys(sa, environ=venv) == with_files and keys(sa) == real_plain and keys(sa, environ=fx_env) == fix_plain,
-                   "another variant's file rewritten moved a key that does not run under it")
-            row = vparts(venv)
-            expect(len(row) == 1 and row[0] == f"variant\tiq4xs\t{sha256_text(row_a)}", f"the item under a variant holds its table row as a key part: {row}")
-            expect(vparts(fx_env) == [] and vparts({}) == [], "an item under no variant holds a variant part")
-            expect(vparts({}, "BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=iq4xs") == row, "a BLOOMERY_BOX_ENV entry names the variant as the Mac's does")
-            with open(vtable, "w", encoding="utf-8") as fh:
-                fh.write(f"# probe\n{row_a} edited\n{row_b}\n")
-            expect(vparts(venv) != row, "an edit of the variant's table row moved no key part")
-            with open(vtable, "w", encoding="utf-8") as fh:
-                fh.write(f"# probe\n{row_b}\n")
-            err = keys(sa, environ=venv)["gpu"]
-            expect(err.startswith("error") and "names no variant 'iq4xs'" in err, f"a variant the table does not name was keyed: {err}")
-        finally:
-            with open(vtable, "w", encoding="utf-8") as fh:
-                fh.write(vtable_old)
-            write_manifest(manifest)
-        expect(keys(sa) == base, "the base manifest, restored after the variant clauses, keys another way")
-        for i in range(1, nfixed - 1):
-            mut = list(manifest)
-            mut[i] = mut[i] + "x"
-            write_manifest(mut)
-            m = moved(keys(sa, only=two))
-            expect(m == set(two), f"manifest line {manifest[i].split(chr(9))[0]} moves {sorted(m)}")
-        mut = list(manifest)
-        mut[0] = mut[0] + " took=9s"
-        write_manifest(mut)
-        expect(not moved(keys(sa, only=two)), "the manifest's comment line moves a key")
-        write_manifest(manifest[:-1])
-        expect(all(v.startswith("error") for v in keys(sa).values()), "a truncated manifest (no `# end`) keyed an item")
-        write_manifest(manifest)
-        expect(all(v.startswith("error") for v in keys(sa, manifest_path=os.path.join(tmp, "absent")).values()), "a missing manifest keyed an item")
-        c = KeyContext(sa, mf, "", {}, manifest_error="ssh failed", settings=settings)
-        expect(c.parts(items["gpu"])[1] is not None, "a failed manifest fetch keyed an item")
-        c = KeyContext(sa, mf, "", {}, settings=settings)
-        expect(c.parts("gate gpu")[1] is not None and c.parts("gate-nope")[1] is not None, "a malformed or unknown item was keyed")
-        # The `any` card in a script the recipe runs (ptx-scan.sh's JIT) picks the card at run time as it does
-        # in the recipe's text: with no card forced the item never skips; forced, it can.
-        for n in ("gate-ptx-spill",):
-            expect(c.parts(n)[2] is not None, f"{n} with no card forced was skippable: its script's any-card call picks the card at run time")
-            reason = c.parts(f"{n}@BLOOMERY_GATE_CARD=a6000")[2]
-            expect(reason is None, f"{n} with the A6000 forced never skips: {reason}")
-        expect(c.parts("gate-sampler@BLOOMERY_REF_MODEL=/models/small/x.gguf")[2] is not None, "an item env naming a path was skippable")
-        c2 = KeyContext(sa, mf, "BLOOMERY_KLD_FILE=/root/x.kld", {}, settings=settings)
-        expect(c2.parts(items["cpu"])[2] is not None, "a caller env path outside data and /models was skippable")
-        c3 = KeyContext(sa, mf, "BLOOMERY_DATA=/root/bloomery-data", {}, settings=settings)
-        expect(c3.parts(items["cpu"])[2] is None, "the data directory itself made an item never-skip")
-        expect(c.parts("gate-1-1")[2] is not None, "an ik-reading gate was skippable")
-        reason = c.parts("gate-tokenizer")[2]
-        expect(reason is None, f"gate-tokenizer reads its sets, no reference tree, and was never-skip: {reason}")
-        expect(c.parts("smoke")[2] is not None, "smoke (a batch in a batch) was skippable")
-        # The cancellation fixtures name Clefvis and the tokenizer oracle's self-test runs oracle.sh: both scripts read a
-        # reference tree, so check-recipes is never skipped (the reason names the first one the closure reaches).
-        reason = c.parts("check-recipes")[2]
-        expect("reads a reference tree" in (reason or ""), f"check-recipes did not name a reference-tree read: {reason}")
-        expect(c.parts("gate-gpu-e2e")[2] is not None, "an `any`-card recipe with no card forced was skippable")
-        expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in /root/x.bin")[2] is not None, "an absolute path in ARGS was skippable")
-        argpath = "gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in docs/HARDWARE.md"
-        plan = os.path.join(roots[0], "docs/HARDWARE.md")
-        with open(plan, encoding="utf-8") as fh:
-            plan_text = fh.read()
-        before = one(argpath)
-        with open(plan, "w", encoding="utf-8") as fh:
-            fh.write(plan_text + "\nkey probe\n")
-        after = one(argpath)
-        with open(plan, "w", encoding="utf-8") as fh:
-            fh.write(plan_text)
-        expect(not before.startswith("error") and before != after, "a tree file named in ARGS is not in the key")
-        expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000")[2] is None and c.parts("gate-gpu-hybrid")[2] is None, "a card-determined item was never-skip")
-        expect(c.parts("ptx-scan@BLOOMERY_GATE_CARD=a6000:generate_ds41 --features gpu,deepseek41")[2] is not None,
-               "an item whose cargo selector is a recipe parameter was skippable")
-        # a module file the walk reaches through `mod` (not a target root): gone, the item is an error
-        roots_src = {t.src for pkg in sa.tree.packages.values() for t in pkg.targets}
-        for which in ("cpu", "gpu"):
-            name = items[which].split("@")[0]
-            mods = sorted(f for f in sa.graph.inputs(name).files if f.endswith(".rs") and f not in roots_src and f.startswith("crates/"))
-            if mods:
-                break
-        victim = os.path.join(roots[0], mods[0])
-        hold = victim + ".held"
-        os.rename(victim, hold)
-        try:
-            gone = keys(side_at(roots[0], meta), only={which: items[which]})
-            expect(gone[which].startswith("error"), f"with {mods[0]} missing, {items[which]} was keyed: {gone[which]}")
-        finally:
-            os.rename(hold, victim)
-        model_scope_self_test(expect, roots[0], sa, settings, manifest, os.path.join(tmp, "scope-manifest.txt"))
-        # New-code clauses (no base to fail on): a directory the item names with no manifest row is an
-        # error; the manifest's union reaches a whole-tree item; every profile spells what it defines.
-        write_manifest([ln for ln in manifest if not ln.startswith("model-dir\t/models/DeepSeek-V4.1-Flash-1017-Q3_K_M\t")])
-        miss = keys(sa, only={"gpu": items["gpu"]})["gpu"]
-        expect(miss.startswith("error") and "/models/DeepSeek-V4.1-Flash-1017-Q3_K_M" in miss, f"a directory the item opens, missing from the manifest, was keyed: {miss}")
-        write_manifest(manifest)
-        c = KeyContext(sa, mf, "", {}, settings=settings)
-        rows = [p for p in c.parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]
-        all_rows = [ln for ln in manifest if ln.startswith(("model\t", "model-dir\t"))]
-        tier_rows = [ln for ln in all_rows if model_dir_of(ln.split("\t")[1]) == FIXTURE_ROOT]
-        variant_rows = [ln for ln in all_rows if model_dir_of(ln.split("\t")[1]) == VARIANT_ROOT]
-        expect(len(rows) == len(all_rows) - len(tier_rows) - len(variant_rows),
-               f"a whole-tree item holds {len(rows)} model rows, not the manifest's all but the fixture tier's {len(tier_rows)} and the variants' {len(variant_rows)}")
-        fx_rows = [p for p in KeyContext(sa, mf, "BLOOMERY_TIER=fixture", {}, settings=settings).parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]
-        expect(len(fx_rows) == len(all_rows) - len(variant_rows),
-               f"a whole-tree item of the fixture tier holds {len(fx_rows)} model rows, not the manifest's all but the variants' {len(variant_rows)}")
-        penv = {k: v for k, v in os.environ.items() if k not in ("BLOOMERY_REF_MODEL", "BLOOMERY_V41_MODEL", "BLOOMERY_DSPARK_MODEL")}
-        for prof in sorted(glob.glob(os.path.join(roots[0], "tools/ref/models/*.sh"))):
-            rel = os.path.relpath(prof, roots[0])
+        if section is None or section == "inputs":
+            expect(keys(sa) == base, "the same inputs gave another key")
+            # The same tree at a second absolute path: the copy renamed there and back (a symlink would not
+            # do — Tree takes the realpath).
+            other = os.path.join(tmp, "b")
+            os.rename(roots[0], other)
             try:
-                expect(bool(profile_dirs(roots[0], rel, penv)), f"{rel} defines no /models directory")
+                elsewhere = keys(side_at(other, meta))
+            finally:
+                os.rename(other, roots[0])
+            expect(elsewhere == base, "a second checkout at another path gives other keys (a path is not relative)")
+
+            m = edit("crates/gpu-gates/src/bin/gate_q4k_sel.rs", append("\n// key probe\n"))
+            expect(m == {"gpu", "mac", "fmt"}, f"gate_q4k_sel.rs moves {sorted(m)}, not gpu mac fmt")
+            m = edit("tools/gpu-gate.sh", append("\n# key probe\n"))
+            expect(m == {"gpu", "cpu", "args", "mac", "fmt"}, f"tools/gpu-gate.sh moves {sorted(m)}")
+            m = edit("docs/HARDWARE.md", append("\nkey probe\n"))
+            expect(m == {"mac", "fmt"}, f"docs/HARDWARE.md moves {sorted(m)}, not only the whole-tree keys")
+            cpu_lib = sorted(f for f in sa.graph.inputs("gate-sampler").files if f.startswith("crates/sampler/src/"))
+            m = edit(cpu_lib[0], append("\n// key probe\n"))
+            expect({"cpu", "mac", "fmt"} <= m and "gpu" not in m, f"{cpu_lib[0]} moves {sorted(m)}")
+            for g in KEY_GLOBALS:
+                m = edit(g, append("\n# key probe\n"))
+                expect(m == set(items), f"{g} moves {sorted(m)}, not every key")
+            m = edit("justfile", append("\n# key probe\n"), side_fresh=True)
+            expect(m == {"mac", "fmt"}, f"a justfile comment moves {sorted(m)}")
+            m = edit("justfile", lambda s: s.replace("bash tools/gpu-gate.sh gate_q4k_sel'", "bash tools/gpu-gate.sh gate_q4k_sel '", 1), side_fresh=True)
+            expect("gpu" in m and "cpu" not in m and "args" not in m, f"gate-gpu-q4k-sel's recipe text moves {sorted(m)}")
+
+            expect(one("gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=3090,X=1") != base["gpu"], "an item env entry does not move the key")
+            expect(one("gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=a6000") != base["gpu"], "the lane's card does not move the key")
+            expect(one("gate-gpu-q4k-sel") != base["gpu"], "no card (--lanes 1) gives the 3090 lane's key")
+            expect(one("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--y") != base["args"], "ARGS do not move the key")
+            expect(moved(keys(sa, box_env="BLOOMERY_X=1")) == set(items), "the caller's BLOOMERY_BOX_ENV does not move every key")
+            expect(moved(keys(sa, environ={"BLOOMERY_DATA": "/x"})) == set(items), "the Mac's BLOOMERY_DATA does not move every key")
+            # The tier: one item under the real tier and under the fixture tier is two keys, whichever way the tier is named, and unset
+            # and `real` are one — a fixture green must never stand for the real file's, nor `--tier real` split the real greens.
+            expect(moved(keys(sa, environ=fx_env)) == set(items), "the Mac's BLOOMERY_TIER=fixture does not move every key")
+            expect(moved(keys(sa, box_env="BLOOMERY_TIER=fixture")) == set(items), "a BLOOMERY_TIER entry of the box env does not move every key")
+            expect(not moved(keys(sa, environ={"BLOOMERY_TIER": "real"})), "BLOOMERY_TIER=real moves a key: it is the unset value")
+            expect(not moved(keys(sa, environ={"BLOOMERY_TIER": ""})), "an empty BLOOMERY_TIER moves a key: it is the unset value")
+            expect(keys(sa, environ=fx_env) != keys(sa, environ={"BLOOMERY_TIER": "bad"}), "an unnamed tier keys like the fixture tier")
+            # The Mac-env part itself (a fixture tier's manifest rows move the key as well, so a moved key alone would not show a lost part).
+            mac_row = lambda e: [r for r in KeyContext(sa, mf, environ=e).mac if r.startswith("mac-env\tBLOOMERY_TIER\t")]  # noqa: E731
+            expect("BLOOMERY_TIER" in MAC_ENV, "BLOOMERY_TIER is not in MAC_ENV")
+            expect(mac_row(fx_env) == ["mac-env\tBLOOMERY_TIER\tfixture"], f"the Mac's BLOOMERY_TIER=fixture is not a key part: {mac_row(fx_env)}")
+            expect(mac_row({}) == mac_row({"BLOOMERY_TIER": "real"}) == mac_row({"BLOOMERY_TIER": ""}) == ["mac-env\tBLOOMERY_TIER\treal"],
+                   f"unset, empty and `real` are not one key part: {mac_row({})} {mac_row({'BLOOMERY_TIER': 'real'})} {mac_row({'BLOOMERY_TIER': ''})}")
+            # ... and the ledger reader: a green recorded at the fixture key does not skip the real item, and skips the fixture one.
+            k_real, k_fix = (keys(sa, environ=e, only={"x": items["gpu"]})["x"] for e in ({}, fx_env))
+            with tempfile.TemporaryDirectory(prefix="recipes-tier-ledger-") as ld:
+                lp = os.path.join(ld, "ledger.tsv")
+                with open(lp, "w", encoding="utf-8") as fh:
+                    fh.write(f"{k_fix}\tgate-gpu-q4k-sel\t{items['gpu']}\tc1\t2026-10-07T09:00:00+0900\t/t/fx\n")
+                st_real, _ = ledger_status(k_real, "gate-gpu-q4k-sel", items["gpu"], [], [Ledger(lp)])
+                st_fix, _ = ledger_status(k_fix, "gate-gpu-q4k-sel", items["gpu"], [], [Ledger(lp)])
+            expect(st_real == "run" and st_fix == "skip", f"a fixture-tier green and the ledger: the real item {st_real}, the fixture one {st_fix}")
+        if section is None or section == "fixtures":
+            # The fixture directory's rows belong to the fixture tier's keys alone: a real key does not move with them, a fixture key
+            # does, and the row of a file inside a family's directory is one (the manifest lists below a subdirectory there).
+            # PIN(2026-10-13): re-pinned, not loosened — a key holds its family's fixture directory (KeyContext.fixture_dirs), so a
+            # fixture file moves the items of its family only; these items run under qwen4exp (no recipe of `items` names a
+            # BLOOMERY_MODEL), and a Mac-run item, whose family cannot be told, keeps every row. The base is the manifest with the root
+            # present, so every key is a key and not an error string. FAIL-first: the family clauses below fail on b1f2c3d1's code.
+            fx4 = {"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": "qwen4exp"}
+            write_manifest(manifest)
+            real_before, fix_before = keys(sa), keys(sa, environ=fx4)
+            expect(not any(v.startswith("error") for v in fix_before.values()), f"the fixture-tier keys on the base manifest: {fix_before}")
+            write_manifest(fixture_free + [fx_file, "# end"])
+            expect(not moved(keys(sa)), "a fixture file's manifest row moved a real-tier key")
+            fix_file = keys(sa, environ=fx4)
+            expect(not any(v.startswith("error") for v in fix_file.values()) and all(fix_file[k] != fix_before[k] for k in items),
+                   "a fixture file's manifest row did not move every fixture-tier key of the family whose directory it is in")
+            write_manifest(fixture_free + [fx_file.replace("\t100\t", "\t101\t"), "# end"])
+            rewritten_keys = keys(sa, environ=fx4)
+            expect(all(rewritten_keys[k] != fix_file[k] for k in items), "a fixture file rewritten (its size) moved no fixture-tier key")
+            write_manifest(manifest)
+            expect(keys(sa) == base, "the base manifest, restored, keys another way")
+            # A fixture-tier item's key holds its family's fixture directory, from the family's row of the fixture directory table (FIXTURE_DIRS, the
+            # one owner), as a variant's below holds its tag's: a file in a directory no family of the item maps to moves nothing of it.
+            rows, default = fixture_table(sa.tree.read(FIXTURE_DIRS), sa.tree.read(REF_PATHS))
+            expect(default == DEFAULT_PROFILE, f"ref-paths.sh's default profile {default} is not DEFAULT_PROFILE {DEFAULT_PROFILE}")
+            expect([rows.get(f) for f in ("qwen4exp", "deepseek41", "glm5next", "qwen35moe", "deepseek2")] == ["qwen38", "v41", "glm5next", "qwen35moe", "self"]
+                   and "mimo2" not in rows and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
+            fam = {
+                "q4": "gate-gpu-qwen4exp-e2e",  # BLOOMERY_MODEL=qwen4exp: qwen38
+                "glm": "gate-gpu-glm-sel",  # glm5next: glm5next
+                "ds41": "gate-gpu-ds41-hc",  # deepseek41: v41, its draft/ below it
+                "q35": "gate-gpu-qwen35moe-moe",  # qwen35moe: its own directory
+                "mimo": "gate-gpu-mimo2-flash",  # mimo2: no row, `none`
+                "envm": "gate-gpu-glm-sel@BLOOMERY_MODEL=qwen4exp",  # a BLOOMERY_MODEL in the item's env: no telling
+                "mac": "check-comments",  # a command run on the Mac: no telling
+            }
+            open_keys = {"envm", "mac"}
+
+            def fx_rows(sizes: dict[str, int]) -> list[str]:
+                out: list[str] = []
+                for d, size in sizes.items():
+                    out += [f"model\t{FIXTURE_ROOT}/{d}\tdir", f"model\t{FIXTURE_ROOT}/{d}/{d}-00001-of-00001.gguf\t{size}\t1\t2\t3"]
+                    if d == "v41":
+                        out += [f"model\t{FIXTURE_ROOT}/v41/draft\tdir", f"model\t{FIXTURE_ROOT}/v41/draft/d.gguf\t{size + 1}\t1\t2\t3"]
+                return out
+
+            def fam_keys(rows_: list[str], env: dict | None = None) -> dict[str, str]:
+                write_manifest(fixture_free + rows_ + ["# end"])
+                return keys(sa, environ=fx_env if env is None else env, only=fam)
+
+            sizes = {"qwen38": 30, "glm5next": 10, "v41": 50, "qwen35moe": 20}
+            kf = fam_keys(fx_rows(sizes))
+            expect(not any(v.startswith("error") for v in kf.values()), f"the family items under the fixture tier: {kf}")
+
+            def rewritten(rows_: list[str], env: dict | None = None, base_: dict[str, str] | None = None) -> set[str]:
+                now = fam_keys(rows_, env)
+                return {k for k in fam if now[k] != (kf if base_ is None else base_)[k]}
+
+            bump = lambda d: fx_rows({**sizes, d: sizes[d] + 1})  # noqa: E731
+            m = rewritten(bump("qwen35moe"))
+            expect("q4" not in m, f"a file under {FIXTURE_ROOT}/qwen35moe moved the key of a qwen4exp item")  # (a)
+            expect(m == {"q35"} | open_keys, f"a file under qwen35moe moved {sorted(m)}, not its item and the unknown-family ones")  # (b)
+            m = rewritten(bump("qwen38"))
+            expect(m == {"q4"} | open_keys, f"a file under qwen38 moved {sorted(m)}: the qwen4exp item and the unknown-family ones")  # (c)
+            m = rewritten(bump("glm5next"))
+            expect(m == {"glm"} | open_keys, f"a file under glm5next moved {sorted(m)}")
+            m = rewritten(bump("v41"))
+            expect(m == {"ds41"} | open_keys, f"a file under v41 moved {sorted(m)}")
+            expect(rewritten([r.replace("d.gguf\t51", "d.gguf\t52") for r in fx_rows(sizes)]) == {"ds41"} | open_keys, "v41's draft/ file (one level down) did not move exactly the deepseek41 item")
+            # (d) an item whose family cannot be told keeps every row: any file, a new family's directory included, moves it
+            newfam = fx_rows(sizes) + [f"model\t{FIXTURE_ROOT}/qwen38-old\tdir", f"model\t{FIXTURE_ROOT}/qwen38-old/n.gguf\t1\t1\t2\t3"]
+            m = rewritten(newfam)
+            expect(m == open_keys, f"a new directory (qwen38-old) moved {sorted(m)}, not exactly the items whose family cannot be told")
+            # the root with no other family's directory, or with none, keys a told item the same: the root's own row is nobody's
+            only35 = fam_keys(fx_rows({"qwen35moe": 20}))
+            expect(not any(v.startswith("error") for v in only35.values()), f"a manifest with another family's directory only (no qwen38/): {only35}")
+            empty = fam_keys([f"model-dir\t{FIXTURE_ROOT}\tempty"])
+            expect(only35["q4"] == empty["q4"] and only35["mimo"] == empty["mimo"] and only35["mac"] != empty["mac"],
+                   "a fixture root holding another family's directory only keys a told item another way than an empty root")
+            # the Mac's BLOOMERY_MODEL is the family of an item whose recipes name none (fmt-check: a box call with no BLOOMERY_MODEL)
+            def fmt_moved(name: str) -> bool:
+                env = {"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": name}
+                write_manifest(fixture_free + fx_rows(sizes) + ["# end"])
+                before = keys(sa, environ=env, only={"fmt": items["fmt"]})["fmt"]
+                write_manifest(fixture_free + bump("qwen38") + ["# end"])
+                return keys(sa, environ=env, only={"fmt": items["fmt"]})["fmt"] != before
+
+            got = {n: fmt_moved(n) for n in ("qwen4exp", "glm5next", "qwen35moe")}
+            expect(got == {"qwen4exp": True, "glm5next": False, "qwen35moe": False}, f"fmt-check, a qwen38 file rewritten, under the Mac's BLOOMERY_MODEL: moved {got}")
+            _, err, _, _ = KeyContext(sa, mf, environ={"BLOOMERY_TIER": "fixture", "BLOOMERY_MODEL": "a b"}, settings=settings).parts(items["fmt"])
+            expect(err is not None and "BLOOMERY_MODEL='a b': cannot resolve model profile" in err, f"fmt-check: invalid inherited profile not refused by name: {err}")
+            # (e) the real tier holds no fixture row: no rewrite moves a key
+            real_f = fam_keys(fx_rows(sizes), {})
+            expect(all(rewritten(bump(d), {}, real_f) == set() for d in sizes), "a fixture file's rewrite moved a real-tier key")
+            # the key part names what the fixture rows were taken from: the debuggability of "moved since"
+            fparts = lambda it, env: [p for p in KeyContext(sa, mf, "", env, settings=settings).parts(it)[0] if p.startswith("fixture\t")]  # noqa: E731
+            write_manifest(fixture_free + fx_rows(sizes) + ["# end"])
+            expect([fparts(fam[k], fx_env) for k in ("q4", "ds41", "q35", "envm")] == [["fixture\tdirs\tqwen38"], ["fixture\tdirs\tv41"], ["fixture\tdirs\tqwen35moe"], ["fixture\tdirs\t*"]]
+                   and fparts(fam["q4"], {}) == [], "the fixture key part does not name the directories the key holds")
+            # (f) the table is tools/fixture-dirs.tsv's. qwen35moe already names its own directory. Pointing that row back at
+            # `self` edits the file, so it moves the keys of the box items (the file is a key part of every one of
+            # them). Against that table a file under the qwen35moe directory is a directory no family maps to.
+            rp = os.path.join(roots[0], FIXTURE_DIRS)
+            with open(rp, encoding="utf-8") as fh:
+                rp_old = fh.read()
+            own = "qwen35moe\tqwen35moe\n"
+            selfrow = "qwen35moe\tself\n"
+            refused = [
+                (rp_old + "qwen35moe\tself\n", "in the table twice"),
+                (rp_old.replace("qwen4exp\tqwen38\n", "qwen4exp\tqwen38\tx\n"), "is not `<family><TAB><dir>`"),
+                (rp_old.replace("qwen4exp\tqwen38\n", "qwen4*\tqwen38\n"), "is not `<family><TAB><dir>`"),
+                (rp_old.replace("qwen4exp\tqwen38\n", "qwen4exp\tnone\n"), "never `none`"),
+                (rp_old.replace("qwen4exp\tqwen38\n", "qwen4exp\tQwen38\n"), "is not `<family><TAB><dir>`"),
+                ("# no rows\n", "no row"),
+            ]
+            try:
+                expect(own in rp_old and selfrow not in rp_old, f"{FIXTURE_DIRS}'s qwen35moe row is not the one this clause edits")
+                edited = rp_old.replace(own, selfrow)
+                expect(edited != rp_old and selfrow in edited and own not in edited, "pointing qwen35moe back at self did not edit the table")
+                with open(rp, "w", encoding="utf-8") as fh:
+                    fh.write(edited)
+                kf_row = fam_keys(fx_rows(sizes))
+                expect(kf_row["q4"] != kf["q4"] and kf_row["q35"] != kf["q35"] and kf_row["glm"] != kf["glm"], f"an edit of {FIXTURE_DIRS} moved no key of a box item")
+                m = rewritten(bump("qwen35moe"), None, kf_row)
+                expect(m == open_keys, f"qwen35moe pointed back at self: a file under its directory moved {sorted(m)}, not only the items whose family cannot be told {sorted(open_keys)}")
+                for text, why in refused:
+                    with open(rp, "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                    got = fam_keys(fx_rows(sizes))["q4"]
+                    expect(got.startswith("error") and why in got, f"a fixture table this reader does not understand ({why}) was keyed: {got}")
+            finally:
+                with open(rp, "w", encoding="utf-8") as fh:
+                    fh.write(rp_old)
+            expect(fam_keys(fx_rows(sizes)) == kf, f"{FIXTURE_DIRS} restored keys another way")
+            write_manifest(manifest)
+            expect(keys(sa) == base, "the base manifest, restored after the family clauses, keys another way")
+        if section is None or section == "variants":
+            # A fixture variant's files (VARIANT_ROOT, beside FIXTURE_ROOT) belong to the keys of the items that run under its tag: no other
+            # item's key moves with them, an item under the tag moves with its own directory's rows and its table row, and not with another tag's.
+            vdirs = lambda tag: [f"model\t{VARIANT_ROOT}/{tag}\tdir", f"model\t{VARIANT_ROOT}/{tag}/glm5next\tdir"]  # noqa: E731
+            vfile = lambda tag, size: f"model\t{VARIANT_ROOT}/{tag}/glm5next/g-00001-of-00001.gguf\t{size}\t1\t2\t3"  # noqa: E731
+            vtable = os.path.join(roots[0], VARIANT_TABLE)
+            with open(vtable, encoding="utf-8") as fh:
+                vtable_old = fh.read()
+            row_a = "iq4xs\tglm5next\ttrunk\tffn_up_exps=iq3_s\tgate-gpu-q4k-sel\tprobe"
+            row_b = "other\tglm5next\ttrunk\tffn_up_exps=iq3_s\tgate-gpu-q4k-sel\tprobe"
+            venv = {"BLOOMERY_TIER": "fixture", "BLOOMERY_FIXTURE_VARIANT": "iq4xs"}
+            vparts = lambda e, box="": [p for p in KeyContext(sa, mf, box, e, settings=settings).parts(items["gpu"])[0] if p.startswith("variant\t")]  # noqa: E731
+            variant_free = [ln for ln in fixture_free if not ln.startswith(f"model-dir\t{VARIANT_ROOT}\t")]
+            try:
+                with open(vtable, "w", encoding="utf-8") as fh:
+                    fh.write(f"# probe\n{row_a}\n{row_b}\n")
+                # The table is a file of the tree (a tree-scope key holds it): the probe table moves those keys, so the clauses below compare
+                # against the keys taken with the probe table in place and no variant rows in the manifest.
+                write_manifest(variant_free + [fx_file, "# end"])
+                real_plain, fix_plain = keys(sa), keys(sa, environ=fx_env)
+                err = keys(sa, environ=venv)["gpu"]
+                expect(err.startswith("error") and VARIANT_ROOT in err, f"an item under a variant keyed with no row for {VARIANT_ROOT}: {err}")
+                both = variant_free + [fx_file] + vdirs("iq4xs") + [vfile("iq4xs", 100)] + vdirs("other") + [vfile("other", 100), "# end"]
+                write_manifest(both)
+                expect(keys(sa) == real_plain, "a variant's files moved a key of a real-tier item")
+                expect(keys(sa, environ=fx_env) == fix_plain, "a variant's files moved a key of a fixture-tier item that runs under no variant")
+                with_files = keys(sa, environ=venv)
+                expect(not any(v.startswith("error") for v in with_files.values()), f"an item under a variant: {with_files}")
+                expect(all(with_files[k] != fix_plain[k] for k in items), "an item under a variant keys like the fixture tier's item")
+                write_manifest([ln.replace(f"iq4xs/glm5next/g-00001-of-00001.gguf\t100", f"iq4xs/glm5next/g-00001-of-00001.gguf\t101") for ln in both])
+                rewritten_keys = keys(sa, environ=venv)
+                expect(all(rewritten_keys[k] != with_files[k] for k in items), "a variant file rewritten (its size) moved no key of the item under its tag")
+                write_manifest([ln.replace(f"other/glm5next/g-00001-of-00001.gguf\t100", f"other/glm5next/g-00001-of-00001.gguf\t101") for ln in both])
+                expect(keys(sa, environ=venv) == with_files and keys(sa) == real_plain and keys(sa, environ=fx_env) == fix_plain,
+                       "another variant's file rewritten moved a key that does not run under it")
+                row = vparts(venv)
+                expect(len(row) == 1 and row[0] == f"variant\tiq4xs\t{sha256_text(row_a)}", f"the item under a variant holds its table row as a key part: {row}")
+                expect(vparts(fx_env) == [] and vparts({}) == [], "an item under no variant holds a variant part")
+                expect(vparts({}, "BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=iq4xs") == row, "a BLOOMERY_BOX_ENV entry names the variant as the Mac's does")
+                with open(vtable, "w", encoding="utf-8") as fh:
+                    fh.write(f"# probe\n{row_a} edited\n{row_b}\n")
+                expect(vparts(venv) != row, "an edit of the variant's table row moved no key part")
+                with open(vtable, "w", encoding="utf-8") as fh:
+                    fh.write(f"# probe\n{row_b}\n")
+                err = keys(sa, environ=venv)["gpu"]
+                expect(err.startswith("error") and "names no variant 'iq4xs'" in err, f"a variant the table does not name was keyed: {err}")
+            finally:
+                with open(vtable, "w", encoding="utf-8") as fh:
+                    fh.write(vtable_old)
+                write_manifest(manifest)
+            expect(keys(sa) == base, "the base manifest, restored after the variant clauses, keys another way")
+        if section is None or section == "scope":
+            for i in range(1, nfixed - 1):
+                mut = list(manifest)
+                mut[i] = mut[i] + "x"
+                write_manifest(mut)
+                m = moved(keys(sa, only=two))
+                expect(m == set(two), f"manifest line {manifest[i].split(chr(9))[0]} moves {sorted(m)}")
+            mut = list(manifest)
+            mut[0] = mut[0] + " took=9s"
+            write_manifest(mut)
+            expect(not moved(keys(sa, only=two)), "the manifest's comment line moves a key")
+            write_manifest(manifest[:-1])
+            expect(all(v.startswith("error") for v in keys(sa).values()), "a truncated manifest (no `# end`) keyed an item")
+            write_manifest(manifest)
+            expect(all(v.startswith("error") for v in keys(sa, manifest_path=os.path.join(tmp, "absent")).values()), "a missing manifest keyed an item")
+            c = KeyContext(sa, mf, "", {}, manifest_error="ssh failed", settings=settings)
+            expect(c.parts(items["gpu"])[1] is not None, "a failed manifest fetch keyed an item")
+            c = KeyContext(sa, mf, "", {}, settings=settings)
+            expect(c.parts("gate gpu")[1] is not None and c.parts("gate-nope")[1] is not None, "a malformed or unknown item was keyed")
+            # The `any` card in a script the recipe runs (ptx-scan.sh's JIT) picks the card at run time as it does
+            # in the recipe's text: with no card forced the item never skips; forced, it can.
+            for n in ("gate-ptx-spill",):
+                expect(c.parts(n)[2] is not None, f"{n} with no card forced was skippable: its script's any-card call picks the card at run time")
+                reason = c.parts(f"{n}@BLOOMERY_GATE_CARD=a6000")[2]
+                expect(reason is None, f"{n} with the A6000 forced never skips: {reason}")
+            expect(c.parts("gate-sampler@BLOOMERY_REF_MODEL=/models/small/x.gguf")[2] is not None, "an item env naming a path was skippable")
+            c2 = KeyContext(sa, mf, "BLOOMERY_KLD_FILE=/root/x.kld", {}, settings=settings)
+            expect(c2.parts(items["cpu"])[2] is not None, "a caller env path outside data and /models was skippable")
+            c3 = KeyContext(sa, mf, "BLOOMERY_DATA=/root/bloomery-data", {}, settings=settings)
+            expect(c3.parts(items["cpu"])[2] is None, "the data directory itself made an item never-skip")
+            expect(c.parts("gate-1-1")[2] is not None, "an ik-reading gate was skippable")
+            reason = c.parts("gate-tokenizer")[2]
+            expect(reason is None, f"gate-tokenizer reads its sets, no reference tree, and was never-skip: {reason}")
+            expect(c.parts("smoke")[2] is not None, "smoke (a batch in a batch) was skippable")
+            # The cancellation fixtures name Clefvis and the tokenizer oracle's self-test runs oracle.sh: both scripts read a
+            # reference tree, so check-recipes is never skipped (the reason names the first one the closure reaches).
+            reason = c.parts("check-recipes")[2]
+            expect("reads a reference tree" in (reason or ""), f"check-recipes did not name a reference-tree read: {reason}")
+            expect(c.parts("gate-gpu-e2e")[2] is not None, "an `any`-card recipe with no card forced was skippable")
+            expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in /root/x.bin")[2] is not None, "an absolute path in ARGS was skippable")
+            argpath = "gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in docs/HARDWARE.md"
+            plan = os.path.join(roots[0], "docs/HARDWARE.md")
+            with open(plan, encoding="utf-8") as fh:
+                plan_text = fh.read()
+            before = one(argpath)
+            with open(plan, "w", encoding="utf-8") as fh:
+                fh.write(plan_text + "\nkey probe\n")
+            after = one(argpath)
+            with open(plan, "w", encoding="utf-8") as fh:
+                fh.write(plan_text)
+            expect(not before.startswith("error") and before != after, "a tree file named in ARGS is not in the key")
+            expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000")[2] is None and c.parts("gate-gpu-hybrid")[2] is None, "a card-determined item was never-skip")
+            expect(c.parts("ptx-scan@BLOOMERY_GATE_CARD=a6000:generate_ds41 --features gpu,deepseek41")[2] is not None,
+                   "an item whose cargo selector is a recipe parameter was skippable")
+            # a module file the walk reaches through `mod` (not a target root): gone, the item is an error
+            roots_src = {t.src for pkg in sa.tree.packages.values() for t in pkg.targets}
+            for which in ("cpu", "gpu"):
+                name = items[which].split("@")[0]
+                mods = sorted(f for f in sa.graph.inputs(name).files if f.endswith(".rs") and f not in roots_src and f.startswith("crates/"))
+                if mods:
+                    break
+            victim = os.path.join(roots[0], mods[0])
+            hold = victim + ".held"
+            os.rename(victim, hold)
+            try:
+                gone = keys(side_at(roots[0], meta), only={which: items[which]})
+                expect(gone[which].startswith("error"), f"with {mods[0]} missing, {items[which]} was keyed: {gone[which]}")
+            finally:
+                os.rename(hold, victim)
+            model_scope_self_test(expect, roots[0], sa, settings, manifest, os.path.join(tmp, "scope-manifest.txt"))
+            # New-code clauses (no base to fail on): a directory the item names with no manifest row is an
+            # error; the manifest's union reaches a whole-tree item; every profile spells what it defines.
+            write_manifest([ln for ln in manifest if not ln.startswith("model-dir\t/models/DeepSeek-V4.1-Flash-1017-Q3_K_M\t")])
+            miss = keys(sa, only={"gpu": items["gpu"]})["gpu"]
+            expect(miss.startswith("error") and "/models/DeepSeek-V4.1-Flash-1017-Q3_K_M" in miss, f"a directory the item opens, missing from the manifest, was keyed: {miss}")
+            write_manifest(manifest)
+            c = KeyContext(sa, mf, "", {}, settings=settings)
+            rows = [p for p in c.parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]
+            all_rows = [ln for ln in manifest if ln.startswith(("model\t", "model-dir\t"))]
+            tier_rows = [ln for ln in all_rows if model_dir_of(ln.split("\t")[1]) == FIXTURE_ROOT]
+            variant_rows = [ln for ln in all_rows if model_dir_of(ln.split("\t")[1]) == VARIANT_ROOT]
+            expect(len(rows) == len(all_rows) - len(tier_rows) - len(variant_rows),
+                   f"a whole-tree item holds {len(rows)} model rows, not the manifest's all but the fixture tier's {len(tier_rows)} and the variants' {len(variant_rows)}")
+            fx_rows = [p for p in KeyContext(sa, mf, "BLOOMERY_TIER=fixture", {}, settings=settings).parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]
+            expect(len(fx_rows) == len(all_rows) - len(variant_rows),
+                   f"a whole-tree item of the fixture tier holds {len(fx_rows)} model rows, not the manifest's all but the variants' {len(variant_rows)}")
+            penv = {k: v for k, v in os.environ.items() if k not in ("BLOOMERY_REF_MODEL", "BLOOMERY_V41_MODEL", "BLOOMERY_DSPARK_MODEL")}
+            for prof in sorted(glob.glob(os.path.join(roots[0], "tools/ref/models/*.sh"))):
+                rel = os.path.relpath(prof, roots[0])
+                try:
+                    expect(bool(profile_dirs(roots[0], rel, penv)), f"{rel} defines no /models directory")
+                except RecipeError as err:
+                    expect(False, f"profile_dirs: {err}")
+            dyn = os.path.join(roots[0], "tools/ref/models/zz-dynamic.sh")
+            with open(dyn, "w", encoding="utf-8") as fh:
+                fh.write("N=Dyn\nMODEL=/models/$N/x.gguf\n")
+            try:
+                profile_dirs(roots[0], "tools/ref/models/zz-dynamic.sh", penv)
+                expect(False, "a profile building a /models path no literal names was accepted")
             except RecipeError as err:
-                expect(False, f"profile_dirs: {err}")
-        dyn = os.path.join(roots[0], "tools/ref/models/zz-dynamic.sh")
-        with open(dyn, "w", encoding="utf-8") as fh:
-            fh.write("N=Dyn\nMODEL=/models/$N/x.gguf\n")
-        try:
-            profile_dirs(roots[0], "tools/ref/models/zz-dynamic.sh", penv)
-            expect(False, "a profile building a /models path no literal names was accepted")
-        except RecipeError as err:
-            expect("/mod" "els/Dyn" in str(err), f"the dynamic profile's error does not name the directory: {err}")
-        finally:
-            os.remove(dyn)
+                expect("/mod" "els/Dyn" in str(err), f"the dynamic profile's error does not name the directory: {err}")
+            finally:
+                os.remove(dyn)
 
 
 def model_scope_self_test(expect, root: str, side: Side, settings: dict, manifest: list[str], mf: str) -> None:
@@ -13543,13 +13550,15 @@ def self_test(serial: bool = False) -> int:
         ("class stage", lambda f: class_stage_self_test(f)),
         ("small tools", small),
         ("key detectors", lambda f: key_detectors_self_test(_expecting(f), side)),
-        ("key", lambda f: key_self_test(_expecting(f), side)),
+        *[(f"key {section}", lambda f, section=section: key_self_test(_expecting(f), side, section))
+          for section in ("inputs", "fixtures", "variants", "scope")],
         ("key reach", lambda f: key_reach_self_test(_expecting(f), side)),
     ]
     fails, times = _forked(jobs, serial)
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
     print("self-test: slowest sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in sorted(times, key=lambda x: -x[1])[:3]))
+    print("self-test: key sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in times if n.startswith("key")))
     print(f"self-test: {'FAIL' if fails else 'ok'} ({len(gates)} gate recipes, {len(fails)} failures)")
     return 1 if fails else 0
 
