@@ -53,7 +53,7 @@ use crate::fixture::{
     Budget, CardBudget, CardExperts, DEFAULT_SHARD_BYTES, DraftRules, DraftSpec, Family,
     FixtureError, FixtureSpec, KeyRule, Kvs, Tables, Window, int_like, items, meta, unsigned,
 };
-use crate::placement::workstation::RTX_3090;
+use crate::placement::workstation::{CardSpec, RTX_3090};
 use crate::placement::{Machine, Plan, PlanLevers};
 
 pub mod qwen35moe;
@@ -154,6 +154,7 @@ pub fn spec() -> FixtureSpec {
         card_budget: CardBudget::Planned(Budget {
             ctx: BUDGET_CTX,
             card_experts,
+            card_set_aside: Some(card_set_aside),
         }),
         window: Window::new(D_MIN, D_MAX).expect("[2^-14, 2^-6] is inside the normal f16 values"),
         ff: None,
@@ -300,26 +301,49 @@ fn card_experts_with(
     })
 }
 
+/// The machine the Qwen3.8 gates plan a file on at [`BUDGET_CTX`]
+/// positions: `card` laid out by `machine_for_experts` with the ubatch such a
+/// load runs, the routed experts where [`place::Experts::Card`] says.
+fn budget_machine(card: CardSpec, inputs: &place::PlanInputs) -> Machine {
+    place::machine_for_experts(
+        card,
+        inputs.spec.layers.len(),
+        place::UBATCH_PLANNED.min(BUDGET_CTX),
+        place::Experts::Card,
+    )
+}
+
 /// The Qwen3.8 file's [`card_experts_with`]: on the 3090's spec
-/// (`machine_for_experts` with the ubatch a [`BUDGET_CTX`]-position load runs),
-/// the routed experts where [`place::Experts::Card`] says — the plan the
-/// qwen4exp gates make of a file they open at that context.
+/// ([`budget_machine`]), the plan the qwen4exp gates make of a file they open
+/// at that context.
 fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, FixtureError> {
     card_experts_with(
         split,
         budget,
-        |inputs| {
-            place::machine_for_experts(
-                RTX_3090,
-                inputs.spec.layers.len(),
-                place::UBATCH_PLANNED.min(BUDGET_CTX),
-                place::Experts::Card,
-            )
-        },
+        |inputs| budget_machine(RTX_3090, inputs),
         |inputs, machine, levers| {
             inputs.plan_with(machine, BUDGET_CTX, levers, place::Experts::Card)
         },
     )
+}
+
+/// The bytes [`budget_machine`]'s stage sets aside on `card` past the 3090's:
+/// on a unified card, the activations' MMA forms its stage reserves.
+fn card_set_aside(split: &Split, card: CardSpec) -> Result<u64, FixtureError> {
+    let inputs = place::PlanInputs::describe(split)?;
+    let set_aside = |c: CardSpec| {
+        budget_machine(c, &inputs).cards[0]
+            .set_aside_bytes()
+            .ok_or_else(|| FixtureError::Budget(format!("card {}: set-aside past u64", c.name)))
+    };
+    let (on, own) = (set_aside(card)?, set_aside(RTX_3090)?);
+    on.checked_sub(own).ok_or_else(|| {
+        FixtureError::Budget(format!(
+            "card {} sets aside {on} B, below the 3090's {own} B the recorded budget was planned \
+             beside",
+            card.name
+        ))
+    })
 }
 
 /// Qwen3.8's rules.

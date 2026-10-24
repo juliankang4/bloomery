@@ -77,8 +77,8 @@ pub(crate) use plan::{int_like, items, split_layer, unsigned};
 pub use sidecar::{SidecarStat, path_of as sidecar_path};
 pub(crate) use spec::NoTables;
 pub use spec::{
-    Budget, CardBudget, CardExperts, DraftRules, DraftSpec, Family, FixtureSpec, KeyRule, Options,
-    SidecarSpec, Tables,
+    Budget, CardBudget, CardExperts, CardSetAside, DraftRules, DraftSpec, Family, FixtureSpec,
+    KeyRule, Options, SidecarSpec, Tables,
 };
 pub use variant::{
     CheckStats, Retype, Row as VariantRow, Scope as VariantScope, TABLE as VARIANT_TABLE,

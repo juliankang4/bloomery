@@ -4,6 +4,7 @@
 use gguf::{Split, Value};
 
 use super::{DEFAULT_SEED, FixtureError, Kvs, Window, meta};
+use crate::placement::workstation::CardSpec;
 
 /// A family's fixture. Its facts are values, so a variant — a smaller map
 /// for a smaller host, a narrower ff — is the same spec with fields replaced
@@ -89,7 +90,16 @@ pub struct Budget {
     /// expert count a layer's share is half of; a planner refusal is the
     /// error.
     pub card_experts: fn(&Split, Option<u64>) -> Result<CardExperts, FixtureError>,
+    /// The bytes the family's plan of the written file sets aside on
+    /// `card`'s stage (its context, scratch and reserves) past what it sets
+    /// aside on the card [`Budget::card_experts`] plans on: what a plan on
+    /// `card` holds beside the recorded cap to keep the same experts on the
+    /// card. `None`: the family's plan sets aside the same on every card.
+    pub card_set_aside: Option<CardSetAside>,
 }
+
+/// [`Budget::card_set_aside`]: what the family's plan of the written file sets aside on a card.
+pub type CardSetAside = fn(&Split, CardSpec) -> Result<u64, FixtureError>;
 
 /// What [`Budget::card_experts`] returns.
 #[derive(Clone, Debug, PartialEq, Eq)]

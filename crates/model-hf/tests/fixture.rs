@@ -42,7 +42,9 @@
 //! 10. the card budget: the plan of the written file under its recorded budget holds half of the
 //!     experts (256) on every layer `routed_rule` admits and none on the others, its budgetless
 //!     plan all of them; a budget one step either side of the recorded one is refused by name, and
-//!     `verify` refuses a header whose recorded budget is not the plan's;
+//!     `verify` refuses a header whose recorded budget is not the plan's; on a unified card, whose
+//!     stage sets aside the activations' MMA forms, the recorded budget alone holds fewer, and the
+//!     recorded budget plus the family's set-aside on that card holds the same half;
 //! 11. the silent traps of ik's reader: a per-layer array one short, a missing `ple.layers`, and
 //!     a missing `full_attention_interval` are refused by name, in the source and in the written
 //!     file, as is a draft's ratios array one short of its layers.
@@ -187,7 +189,7 @@ use model::fixture::{
     Window, rule_for,
 };
 use model::placement::PlanLevers;
-use model::placement::workstation::{self, HostRead, RTX_3090};
+use model::placement::workstation::{self, CardSpec, HostRead, RTX_3090};
 use sha2::{Digest, Sha256};
 
 const ARCH: &str = "deepseek41";
@@ -2716,13 +2718,13 @@ fn hw_fixture_q38_budget() {
             .iter()
             .map(|h| h.layer)
             .collect();
-    let machine = machine_for_experts(
-        RTX_3090,
-        layers,
-        UBATCH_PLANNED.min(q38::BUDGET_CTX),
-        Experts::Card,
-    );
-    let at = |budget: Option<u64>| -> Vec<u64> {
+    let at = |card: CardSpec, budget: Option<u64>| -> Vec<u64> {
+        let machine = machine_for_experts(
+            card,
+            layers,
+            UBATCH_PLANNED.min(q38::BUDGET_CTX),
+            Experts::Card,
+        );
         let levers = PlanLevers {
             card_budget_bytes: budget,
         };
@@ -2738,23 +2740,60 @@ fn hw_fixture_q38_budget() {
             .collect()
     };
     assert_eq!(
-        at(None),
+        at(RTX_3090, None),
         want(experts),
         "the budgetless plan holds every expert it can"
     );
     assert_eq!(
-        at(Some(recorded)),
+        at(RTX_3090, Some(recorded)),
         want(experts / 2),
         "the plan under {recorded}"
+    );
+
+    // A DGX Spark's card as its census gives it: its stage reserves the activations' MMA forms
+    // beside the 3090's terms, so the recorded budget alone leaves it short; the family's
+    // set-aside on it, held beside the budget as the fixture tier does, keeps the half.
+    let unified = CardSpec {
+        name: "GB10",
+        total_bytes: 130_661_765_120,
+        driver_reserve_bytes: 806_912,
+        free_bytes: Some(124_626_137_088),
+        integrated: true,
+        ..RTX_3090
+    };
+    let CardBudget::Planned(planner) = spec.card_budget else {
+        panic!("the q38 spec plans its card budget");
+    };
+    let set_aside = planner
+        .card_set_aside
+        .expect("the q38 spec names what a card sets aside")(&fx, unified)
+    .unwrap();
+    assert_eq!(
+        (planner.card_set_aside.unwrap())(&fx, RTX_3090).unwrap(),
+        0,
+        "the 3090 sets aside what the recorded budget was planned beside"
+    );
+    assert_ne!(
+        at(unified, Some(recorded)),
+        want(experts / 2),
+        "the recorded budget alone on a unified card"
+    );
+    assert_eq!(
+        at(unified, Some(recorded + set_aside)),
+        want(experts / 2),
+        "the plan on a unified card under {recorded} + {set_aside}"
     );
 
     let bad = budget_round_trip("q38", &spec, &src, &p, &fx);
     println!(
         "q38 budget: recorded {recorded} B ({} MiB); layers {layers}; host-only {host_only:?}; \
-         unbounded {:?}; recorded {:?}",
+         unbounded {:?}; recorded {:?}; a unified card sets aside {set_aside} B more: {:?} \
+         under the recorded budget alone, {:?} beside it",
         recorded / (1 << 20),
-        at(None),
-        at(Some(recorded)),
+        at(RTX_3090, None),
+        at(RTX_3090, Some(recorded)),
+        at(unified, Some(recorded)),
+        at(unified, Some(recorded + set_aside)),
     );
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }

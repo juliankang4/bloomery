@@ -196,7 +196,7 @@ impl Shape {
 /// its shape.
 struct Facts {
     path: String,
-    budget: Option<u64>,
+    budget: Option<tier::HeaderBudget>,
     hp: Hparams,
     shape: Shape,
 }

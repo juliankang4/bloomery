@@ -229,6 +229,7 @@ mod tests {
                     experts: 8,
                 })
             },
+            card_set_aside: None,
         };
         assert_eq!(check(&planner, &split, 4).unwrap().per_layer, [4, 0, 4]);
         for budget in [3, 5] {

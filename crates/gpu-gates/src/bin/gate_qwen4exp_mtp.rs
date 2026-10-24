@@ -323,7 +323,7 @@ mod gate {
         path: std::path::PathBuf,
         draft: std::path::PathBuf,
         host: HostCfg,
-        header_budget: Option<u64>,
+        header_budget: Option<tier::HeaderBudget>,
         lever_budget: Option<u64>,
         shape: Shape,
         n_expert: usize,
@@ -390,7 +390,8 @@ mod gate {
 
     /// The plan's levers for a load that reserves `extra` card bytes for the
     /// draft out of the same budget (0: the target alone): the real tier's
-    /// lever, or the header's budget plus `extra` (`tier::budget_levers`).
+    /// lever, or the header's budget on the fixture tier's card plus `extra`
+    /// (`tier::budget_levers`).
     fn plan_levers(extra: u64) -> Result<PlanLevers, GateError> {
         tier::budget_levers(
             Tier::from_env()?,

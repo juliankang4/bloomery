@@ -91,6 +91,7 @@ pub fn spec() -> FixtureSpec {
         card_budget: CardBudget::Planned(Budget {
             ctx: BUDGET_CTX,
             card_experts,
+            card_set_aside: None,
         }),
         window: Window::new(D_MIN, D_MAX).expect("[2^-14, 2^-6] is inside the normal f16 values"),
         ff: None,
