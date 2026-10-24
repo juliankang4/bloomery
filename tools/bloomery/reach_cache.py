@@ -10,7 +10,6 @@ import dataclasses
 import hashlib
 import functools
 import json
-import marshal
 import os
 import stat
 import sys
@@ -96,10 +95,9 @@ def _linked(root):
 
 
 @functools.lru_cache(maxsize=16)
-def _disk_code_digest(data, filename, optimize):
+def _disk_code(data, filename, optimize):
     """Memoize compilation by exact bytes, never file timestamps or a prior disk identity."""
-    code = compile(data, filename, "exec", dont_inherit=True, optimize=optimize)
-    return _digest(marshal.dumps(code, 2))
+    return compile(data, filename, "exec", dont_inherit=True, optimize=optimize)
 
 
 def _code_identity(module, error):
@@ -109,15 +107,15 @@ def _code_identity(module, error):
     data = _bytes(path)
     message = "analysis code changed after import: " + path + "; request a fresh process"
     try:
-        disk = _disk_code_digest(data, loaded.co_filename, sys.flags.optimize)
+        disk = _disk_code(data, loaded.co_filename, sys.flags.optimize)
     except (SyntaxError, ValueError, OverflowError) as exc:
         raise error(message) from exc
-    # Version 2 omits marshal's object-sharing flags: runtime references to constants must not
-    # distinguish imported code from the equivalent newly compiled code. Only internal code is dumped.
-    running = _digest(marshal.dumps(loaded, 2))
-    if disk != running:
+    # Code equality compares bytecode, constants, names and line tables recursively and ignores runtime
+    # specialization. Marshal output depends on object sharing, and its older formats cannot hold every
+    # constant the compiler folds (slices).
+    if disk != loaded:
         raise error(message)
-    return [os.path.realpath(path), _digest(data), running]
+    return [os.path.realpath(path), _digest(data)]
 
 
 def _identity(tree):
@@ -127,7 +125,7 @@ def _identity(tree):
     fixture = sys.modules.get("bloomery.fixture_dirs")
     if fixture is not None:
         code.append(_code_identity(fixture, module.RecipeError))
-    return _digest(_json([VERSION, tree.root, code, tree.metadata,
+    return _digest(_json([VERSION, sys.version, tree.root, code, tree.metadata,
                          {n: dataclasses.asdict(p) for n, p in tree.packages.items()}]))
 
 
