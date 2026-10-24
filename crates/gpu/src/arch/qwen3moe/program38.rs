@@ -1153,7 +1153,13 @@ fn gdn_seq(
             ring: &mut r.ring,
         },
     )?;
-    lin.delta.enqueue_delta_lanes(
+    let enqueue = if each {
+        crate::linear::delta::DeltaKernels::enqueue_delta_recovery
+    } else {
+        crate::linear::delta::DeltaKernels::enqueue_delta_lanes
+    };
+    enqueue(
+        &lin.delta,
         stream,
         DeltaLanesArgs {
             delta: DeltaArgs {

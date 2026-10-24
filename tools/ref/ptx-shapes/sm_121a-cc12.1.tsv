@@ -158,6 +158,7 @@ generate_ds41 gdn_chunk_prepare 0 0
 generate_ds41 gdn_conv_prep 0 0
 generate_ds41 gdn_delta 0 0
 generate_ds41 gdn_delta_lanes 0 0
+generate_ds41 gdn_delta_recovery 0 0
 generate_ds41 gdn_delta_prepared 0 0
 generate_ds41 gdn_norm_gate 0 0
 generate_ds41 gdn_norm_gate_sigmoid 0 0

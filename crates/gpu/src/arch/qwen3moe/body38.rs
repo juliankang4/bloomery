@@ -154,7 +154,7 @@ use crate::host::tier::TierOpen;
 use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
-use crate::linear::delta::carry_fold_host;
+use crate::linear::delta::{DeltaArgs, DeltaLanesArgs, carry_fold_host};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::slots::slot_twice;
 use crate::model::{
@@ -2624,8 +2624,9 @@ impl Body38 {
 
     /// What a cut to at most `n` positions of a model standing at `pos`
     /// keeps, and why: with a verify waiting, `n` when it lies past the
-    /// verify's first position (`Rule`: its commit moves the lane word and
-    /// copies nothing) and every position when `n` reaches them (`Current`);
+    /// verify's first position (`Rule`: its commit replays the accepted
+    /// recovery records and moves the lane word) and every position when
+    /// `n` reaches them (`Current`);
     /// else the checkpoints' rule ([`Checkpoints::kept`]): every position, the
     /// empty model at 0, or the nearest point at or below `n`, nothing
     /// (`Missed`) when none lies there — a delta layer keeps no earlier state
@@ -5334,7 +5335,8 @@ impl Body38 {
     }
 
     /// Keep the first `pos − pos0` rows of the verify waiting for its commit
-    /// and take the rest back: the lane word to the last kept row's lane
+    /// and take the rest back: replay the accepted recovery records into
+    /// the last kept row's state lane and move the lane word there
     /// ([`LaneWord::keep`]), the PLE history over the kept rows, and the MTP
     /// draft's records — the arenas' held rows and the store's held
     /// positions — cut to `pos`, the rejected rows no longer any walk's to
@@ -5367,6 +5369,34 @@ impl Body38 {
         };
         let kept = (pos - p.pos0) as usize;
         let stream = gpu.stream();
+        let io = self.rp.io(rows)?;
+        let g = &mut self.a.gdn;
+        for (l, store) in self.stores.iter_mut().enumerate() {
+            if let Store38::Rec { rec, stamp } = store {
+                self.k.linear.delta.enqueue_delta_recovery(
+                    stream,
+                    DeltaLanesArgs {
+                        delta: DeltaArgs {
+                            qkv: &g.conv,
+                            beta: &g.beta,
+                            decay: &g.decay,
+                            lane: self.lane.word(),
+                            lane_at: 0,
+                            lanes: rec.lanes,
+                            shape: GDN,
+                            m: kept,
+                            fault: gpu.layer_sink(l)?,
+                            o: &mut g.o,
+                            state: &mut rec.state,
+                        },
+                        each: false,
+                        pos: io.pos0,
+                        stamp,
+                    },
+                    rec.carry.as_ref(),
+                )?;
+            }
+        }
         self.lane.keep(stream, kept)?;
         if kept < rows {
             self.ple.keep(p.hist, p.pos0, &p.tokens[..kept])?;

@@ -26,6 +26,16 @@
 //! lanes` and copies nothing. Each token's `o` and each state are the bits
 //! `gdn_delta` writes: the loop is its loop, the stores placed per row.
 //!
+//! A GDN verify can instead use [`DeltaKernels::enqueue_delta_recovery`].
+//! Row mode leaves the committed state and stamps untouched and records each
+//! row's key, rounded update scalar and head decay in two spare state lanes.
+//! An accepted prefix is replayed from the committed state using the same
+//! rounded decay and fused update, without recomputing its dot products or
+//! outputs. Its last row's lane receives the only full state store and its
+//! stamp. Two record banks let replay read outside that destination lane,
+//! even when it coincides with a spare lane. A discarded verify leaves its
+//! committed state intact. Both calls first fold the same prompt carry.
+//!
 //! `kda_delta_lanes` is `kda_delta` over stamped lanes by the same rule, with
 //! one more launch value, the row base `row`: the call's first token is row
 //! `row` of a verify whose rows before it an earlier launch of the same verify
@@ -121,9 +131,11 @@ use crate::GpuError;
 use crate::cores::global_addr;
 use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::launch_u32;
+use crate::tensor::check_alignment;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::convert::cvt_bf16x2_f32 as chunk_pair;
 use cuda_device::float::{fma_rn_f32, mul_rn_f32};
+use cuda_device::vector::U32x4;
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, ptx_asm, thread, warp,
 };
@@ -243,22 +255,56 @@ fn column_sum(x: f32) -> f32 {
 /// `DECAY_HEAD`, else by its own `dk`), then `u = (v − S'ᵀk)·β` and `S =
 /// fma(k, u, S')`.
 #[inline(always)]
-#[allow(
-    clippy::needless_range_loop,
-    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
-)]
 fn rule_row<const DECAY: u32>(
-    mut s: [f32; KEYS_PER_LANE],
+    s: [f32; KEYS_PER_LANE],
     k: [f32; KEYS_PER_LANE],
     dk: [f32; KEYS_PER_LANE],
     dh: f32,
     (v, b): (f32, f32),
 ) -> [f32; KEYS_PER_LANE] {
+    rule_update::<DECAY>(s, k, dk, dh, (v, b)).0
+}
+
+#[inline(always)]
+fn rule_update<const DECAY: u32>(
+    s: [f32; KEYS_PER_LANE],
+    k: [f32; KEYS_PER_LANE],
+    dk: [f32; KEYS_PER_LANE],
+    dh: f32,
+    (v, b): (f32, f32),
+) -> ([f32; KEYS_PER_LANE], f32) {
+    let s = decay_row::<DECAY>(s, dk, dh);
+    let u = mul_rn_f32(v - column_sum(lane_dot(s, k)), b);
+    (update_row(s, k, u), u)
+}
+
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+fn decay_row<const DECAY: u32>(
+    mut s: [f32; KEYS_PER_LANE],
+    dk: [f32; KEYS_PER_LANE],
+    dh: f32,
+) -> [f32; KEYS_PER_LANE] {
     for i in 0..KEYS_PER_LANE {
         cuda_device::thread::__unroll_config::<0>();
         s[i] = mul_rn_f32(s[i], if DECAY == DECAY_HEAD { dh } else { dk[i] });
     }
-    let u = mul_rn_f32(v - column_sum(lane_dot(s, k)), b);
+    s
+}
+
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+fn update_row(
+    mut s: [f32; KEYS_PER_LANE],
+    k: [f32; KEYS_PER_LANE],
+    u: f32,
+) -> [f32; KEYS_PER_LANE] {
     for i in 0..KEYS_PER_LANE {
         cuda_device::thread::__unroll_config::<0>();
         s[i] = fma_rn_f32(k[i], u, s[i]);
@@ -627,13 +673,26 @@ pub fn prompt_work_len(shape: LinearShape, m: usize) -> usize {
     (m + CARRY_ROWS).div_ceil(CHUNK) * shape.n_v * CHUNK_WORDS + 1
 }
 
+/// Refuse by name a `qkv`, `state` or `carry` the kernels' 128-bit loads
+/// ([`ld4`]) cannot read: each base must be 16-byte aligned. A window into a
+/// larger buffer can start anywhere a whole f32 does.
+fn check_vector_bases(
+    what: &'static str,
+    qkv: &DeviceBuffer<f32>,
+    state: &DeviceBuffer<f32>,
+    carry: Option<&DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
+    check_alignment::<U32x4, _>(what, "qkv", qkv)?;
+    check_alignment::<U32x4, _>(what, "state", state)?;
+    carry.map_or(Ok(()), |c| check_alignment::<U32x4, _>(what, "carry", c))
+}
+
 /// Refuse by name what `gdn_delta_lanes` and the prompt form cannot launch
-/// with a carry of `carry` f32s ([`DeltaKernels::enqueue_delta_lanes`]'s
-/// list).
+/// with `carry` ([`DeltaKernels::enqueue_delta_lanes`]'s list).
 fn check_gdn_lanes(
     what: &'static str,
     args: &DeltaLanesArgs<'_>,
-    carry: Option<usize>,
+    carry: Option<&DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
     let DeltaLanesArgs {
         delta: d,
@@ -654,17 +713,33 @@ fn check_gdn_lanes(
         ));
     }
     let nv = d.shape.n_v;
+    let overflow = || GpuError::shape(what, "GDN launch size overflows usize");
+    let channels = d
+        .shape
+        .n_k
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(nv))
+        .and_then(|n| n.checked_mul(HEAD))
+        .ok_or_else(&overflow)?;
+    let qkv = m.checked_mul(channels).ok_or_else(&overflow)?;
+    let heads = m.checked_mul(nv).ok_or_else(&overflow)?;
+    let output = heads.checked_mul(HEAD).ok_or_else(&overflow)?;
+    let state = lanes
+        .checked_mul(nv)
+        .and_then(|n| n.checked_mul(HEAD * HEAD))
+        .ok_or_else(&overflow)?;
+    let lane = d.lane_at.checked_add(1).ok_or_else(&overflow)?;
     let lens = [
-        ("qkv", d.qkv.len(), m * d.shape.channels()),
-        ("beta", d.beta.len(), m * nv),
-        ("decay", d.decay.len(), m * nv),
-        ("lane", d.lane.len(), d.lane_at + 1),
+        ("qkv", d.qkv.len(), qkv),
+        ("beta", d.beta.len(), heads),
+        ("decay", d.decay.len(), heads),
+        ("lane", d.lane.len(), lane),
         ("pos", pos.len(), 1),
-        ("o", d.o.len(), m * nv * HEAD),
-        ("state", d.state.len(), lanes * d.shape.state_len()),
+        ("o", d.o.len(), output),
+        ("state", d.state.len(), state),
         ("stamp", stamp.len(), lanes),
     ];
-    let carried = carry.map(|len| ("carry", len, d.shape.carry_len()));
+    let carried = carry.map(|c| ("carry", c.len(), d.shape.carry_len()));
     if let Some((name, got, need)) = lens
         .into_iter()
         .chain(carried)
@@ -675,7 +750,7 @@ fn check_gdn_lanes(
             format!("{name}.len() {got} < {need}"),
         ));
     }
-    Ok(())
+    check_vector_bases(what, d.qkv, d.state, carry)
 }
 
 #[cuda_module]
@@ -839,7 +914,81 @@ mod delta_kernels {
         // divides n_v, `m <= lanes` in row mode, a carried launch's whole
         // carry, the block width and the grid.
         unsafe {
-            delta_lanes_body::<DECAY_HEAD>(
+            delta_lanes_body::<DECAY_HEAD, false>(
+                qkv,
+                beta,
+                decay,
+                lane,
+                lane_at,
+                lanes,
+                n_k,
+                n_v,
+                grouped,
+                (m, each, 0),
+                pos,
+                (carry, carried),
+                fault,
+                o,
+                state,
+                stamp,
+            );
+        }
+    }
+
+    /// A verify's compact records, or their accepted prefix replay.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            qkv.len() >= m * (2 * n_k + n_v) * 128,
+            beta.len() >= m * n_v,
+            decay.len() >= m * n_v,
+            lane.len() >= lane_at + 1,
+            lanes >= 3,
+            m * 3 <= 128,
+            pos.len() >= 1,
+            o.len() >= m * n_v * 128,
+            state.len() >= lanes * n_v * 16384,
+            stamp.len() >= lanes,
+            carry.len() >= 4
+        )
+    )]
+    pub fn gdn_delta_recovery(
+        qkv: &[f32],
+        beta: &[f32],
+        decay: &[f32],
+        lane: &[u32],
+        lane_at: u32,
+        lanes: u32,
+        n_k: u32,
+        n_v: u32,
+        grouped: u32,
+        m: u32,
+        each: u32,
+        pos: &[u32],
+        carry: &[f32],
+        carried: u32,
+        fault: FaultSink,
+        mut o: DisjointSlice<f32>,
+        mut state: DisjointSlice<f32>,
+        mut stamp: DisjointSlice<u32>,
+    ) {
+        let o = o.as_mut_ptr();
+        let state = state.as_mut_ptr();
+        let stamp = stamp.as_mut_ptr();
+        // SAFETY: the launcher checks three or more lanes, m <= lanes and
+        // m * 3 <= HEAD, so both record banks fit outside the input state.
+        // Each record word has one writer; replay reads a bank outside its
+        // destination. The launch contract bounds every input and output;
+        // block zero's thread zero alone reads and writes the stamps.
+        unsafe {
+            delta_lanes_body::<DECAY_HEAD, true>(
                 qkv,
                 beta,
                 decay,
@@ -1651,7 +1800,7 @@ mod delta_kernels {
         // (the body's doc); the launcher checks n_k divides n_v, `row <
         // lanes`, row 0 in place mode and `row + m <= lanes` in row mode.
         unsafe {
-            delta_lanes_body::<DECAY_KEY>(
+            delta_lanes_body::<DECAY_KEY, false>(
                 qkv,
                 beta,
                 decay,
@@ -1786,6 +1935,7 @@ impl DeltaKernels {
                 format!("{name}.len() {got} < {need}"),
             ));
         }
+        check_vector_bases(what, qkv, state, None)?;
         let grid = launch_u32(what, "grid", nv * (HEAD / COLUMNS_PER_BLOCK))?;
         let n_k = launch_u32(what, "n_k", shape.n_k)?;
         let n_v = launch_u32(what, "n_v", nv)?;
@@ -2054,7 +2204,7 @@ pub const fn read_lane(c: u32, row: u32, lanes: u32) -> u32 {
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn delta_lanes_body<const DECAY: u32>(
+unsafe fn delta_lanes_body<const DECAY: u32, const RECOVERY: bool>(
     qkv: &[f32],
     beta: &[f32],
     decay: &[f32],
@@ -2079,40 +2229,78 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
     let blocks_per_head = HEAD / COLUMNS_PER_BLOCK;
     let h = b / blocks_per_head;
     let (n_k, n_v, m) = (n_k as usize, n_v as usize, m as usize);
-    // SAFETY: lane_at < lane_word.len() and pos holds a word, by the
-    // contract.
-    let (word, p0) = unsafe {
-        (
-            *lane_word.get_unchecked(lane_at as usize),
-            *pos.get_unchecked(0),
-        )
-    };
+    // SAFETY: lane_at < lane_word.len(), checked by the launcher.
+    let word = unsafe { *lane_word.get_unchecked(lane_at as usize) };
     if word >= lanes && tid == 0 {
         fault.raise(FaultSite::DeltaLane);
     }
     let c = word % lanes;
-    let rin = if row == 0 { c } else { (c + row - 1) % lanes };
-    if b == 0 && tid == 0 {
-        // SAFETY: rin < lanes and every (c + row + t) mod lanes < lanes:
-        // inside the `lanes` stamps; block 0's thread 0 is their only reader
-        // and writer in the launch, and it reads stamp rin before it writes
-        // any. The carry's header, by the contract.
-        unsafe {
-            if *stamp.add(rin as usize) != p0 {
+    let target = if RECOVERY && each == 0 {
+        row_lane(c, m as u32 - 1, lanes)
+    } else {
+        c
+    };
+    let record_lane = if RECOVERY && each == 0 && target == row_lane(c, 1, lanes) {
+        row_lane(c, 2, lanes)
+    } else {
+        row_lane(c, 1, lanes)
+    };
+    let lane_len = n_v * HEAD * HEAD;
+    let recovery_at = record_lane as usize * lane_len;
+    let p0 = if RECOVERY && each == 0 {
+        // SAFETY: the first record's unused decay words hold its position
+        // and row count, written once before replay on this stream.
+        let p = unsafe { *state.add(recovery_at + 2 * HEAD + 1).cast::<u32>() };
+        // SAFETY: record_lane < lanes and 2·HEAD + 2 < lane_len put the first record's count word
+        // inside the state; it was written once before replay on this stream.
+        let rows = unsafe { *state.add(recovery_at + 2 * HEAD + 2).cast::<u32>() };
+        if rows == 0 || rows as usize > HEAD / 3 || m > rows as usize {
+            if tid == 0 {
                 fault.raise(FaultSite::DeltaStamp);
             }
+            return;
+        }
+        p
+    } else {
+        // SAFETY: pos holds at least one word, checked by the launcher.
+        unsafe { *pos.get_unchecked(0) }
+    };
+    if RECOVERY && each != 0 && b == 0 && tid == 0 {
+        for bank in 1..=2 {
+            let at = row_lane(c, bank, lanes) as usize * lane_len + 2 * HEAD;
+            // SAFETY: the first record's position word, outside its key,
+            // update and head decay words; only this thread writes it.
+            unsafe { *state.add(at + 1).cast::<u32>() = p0 };
+            // SAFETY: the bank's lane < lanes and 2·HEAD + 2 < lane_len put the first record's
+            // count word inside the state; only this thread writes it.
+            unsafe { *state.add(at + 2).cast::<u32>() = m as u32 };
+        }
+    }
+    let rin = if row == 0 { c } else { (c + row - 1) % lanes };
+    if b == 0 && tid == 0 {
+        // SAFETY: rin < lanes, inside the stamps; only this thread reads
+        // or writes stamps, and it reads the input before writing.
+        let stamped = unsafe { *stamp.add(rin as usize) };
+        if stamped != p0 {
+            fault.raise(FaultSite::DeltaStamp);
+        }
+        if !RECOVERY || each == 0 {
             if each != 0 {
                 let mut t = 0u32;
                 while (t as usize) < m {
-                    *stamp.add(((c + row + t) % lanes) as usize) = p0.wrapping_add(t + 1);
+                    let at = (c + row + t) % lanes;
+                    // SAFETY: at < lanes, and this thread owns the stamps.
+                    unsafe { *stamp.add(at as usize) = p0.wrapping_add(t + 1) };
                     t += 1;
                 }
             } else {
-                *stamp.add(c as usize) = p0.wrapping_add(m as u32);
+                // SAFETY: target < lanes, and this thread owns the stamps.
+                unsafe { *stamp.add(target as usize) = p0.wrapping_add(m as u32) };
             }
-            // The header is the launch's: this thread alone faults an
-            // invalid count, which every thread then takes as no rows.
-            if DECAY == DECAY_HEAD && carried != 0 && carried_rows(carry, p0).is_none() {
+        }
+        if DECAY == DECAY_HEAD && carried != 0 {
+            // SAFETY: the carry holds the launch-wide header checked by the launcher.
+            if unsafe { carried_rows(carry, p0) }.is_none() {
                 fault.raise(FaultSite::LinearDelta);
             }
         }
@@ -2130,7 +2318,6 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
     let q_at = kh * HEAD;
     let k_at = (n_k + kh) * HEAD;
     let v_at = 2 * n_k * HEAD + h * HEAD + col;
-    let lane_len = n_v * HEAD * HEAD;
     let col_at = (b * COLUMNS_PER_BLOCK + tid / LANES_PER_COLUMN) * HEAD;
     let s_at = rin as usize * lane_len + col_at;
 
@@ -2153,14 +2340,12 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
             // keys of key head kh, 16-byte aligned.
             let k = unsafe { lane_keys::<true>(carry_g + 4 * (at + kh * HEAD) as u64, j) };
             let b_at = carry_beta(t, h, kv, n_v);
-            // SAFETY: the row's value column, β and decay, inside the carry.
-            let (vt, bt, dh) = unsafe {
-                (
-                    *carry.get_unchecked(at + n_k * HEAD + h * HEAD + col),
-                    *carry.get_unchecked(b_at),
-                    *carry.get_unchecked(b_at + CARRY_ROWS * n_v),
-                )
-            };
+            // SAFETY: this row's value column is inside the carry.
+            let vt = unsafe { *carry.get_unchecked(at + n_k * HEAD + h * HEAD + col) };
+            // SAFETY: b_at addresses this head's beta inside the carry.
+            let bt = unsafe { *carry.get_unchecked(b_at) };
+            // SAFETY: this head's decay lies after the carry's beta plane.
+            let dh = unsafe { *carry.get_unchecked(b_at + CARRY_ROWS * n_v) };
             s = rule_row::<DECAY_HEAD>(s, k, [0.0; KEYS_PER_LANE], dh, (vt, bt));
             t += 1;
         }
@@ -2168,14 +2353,24 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
     let mut raised = false;
     let mut t = 0usize;
     while t < m {
+        let rec = recovery_at + (t * n_v + h) * 3 * HEAD;
+        if RECOVERY && each == 0 {
+            // SAFETY: the aligned key head is inside the spare lane; the
+            // recording launch finished before this launch.
+            let k = unsafe { lane_keys::<false>(state_g + 4 * rec as u64, j) };
+            // SAFETY: col < HEAD, inside this record's update vector.
+            let u = unsafe { *state.add(rec + HEAD + col) };
+            // SAFETY: the head decay is the first word of the record's tail.
+            let dh = unsafe { *state.add(rec + 2 * HEAD) };
+            s = update_row(decay_row::<DECAY_HEAD>(s, [0.0; KEYS_PER_LANE], dh), k, u);
+            t += 1;
+            continue;
+        }
         let row_at = t * ch;
-        // SAFETY: whole heads inside qkv, as in `delta_body`.
-        let (k, q) = unsafe {
-            (
-                lane_keys::<true>(qkv_g + 4 * (row_at + k_at) as u64, j),
-                lane_keys::<true>(qkv_g + 4 * (row_at + q_at) as u64, j),
-            )
-        };
+        // SAFETY: this aligned key head lies inside qkv's row t < m.
+        let k = unsafe { lane_keys::<true>(qkv_g + 4 * (row_at + k_at) as u64, j) };
+        // SAFETY: this aligned query head lies inside qkv's row t < m.
+        let q = unsafe { lane_keys::<true>(qkv_g + 4 * (row_at + q_at) as u64, j) };
         let dk = if DECAY == DECAY_HEAD {
             [0.0f32; KEYS_PER_LANE]
         } else {
@@ -2190,20 +2385,18 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
                 )
             }
         };
-        // SAFETY: row_at + v_at < m·ch; t·n_v + h < m·n_v <= the lengths of
-        // beta and (per head) decay.
-        let (vt, bt, dh) = unsafe {
-            (
-                *qkv.get_unchecked(row_at + v_at),
-                *beta.get_unchecked(t * n_v + h),
-                if DECAY == DECAY_HEAD {
-                    *decay.get_unchecked(t * n_v + h)
-                } else {
-                    0.0
-                },
-            )
+        // SAFETY: row_at + v_at < m * ch, inside qkv.
+        let vt = unsafe { *qkv.get_unchecked(row_at + v_at) };
+        // SAFETY: t * n_v + h < m * n_v, inside beta.
+        let bt = unsafe { *beta.get_unchecked(t * n_v + h) };
+        let dh = if DECAY == DECAY_HEAD {
+            // SAFETY: t * n_v + h < m * n_v, inside per-head decay.
+            unsafe { *decay.get_unchecked(t * n_v + h) }
+        } else {
+            0.0
         };
-        s = rule_row::<DECAY>(s, k, dk, dh, (vt, bt));
+        let (next, u) = rule_update::<DECAY>(s, k, dk, dh, (vt, bt));
+        s = next;
         let y = column_sum(lane_dot(s, q));
         if !y.is_finite() && !raised {
             fault.raise(FaultSite::LinearDelta);
@@ -2214,7 +2407,27 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
             // lane per (token, column).
             unsafe { *o.add((t * n_v + h) * HEAD + col) = y };
         }
-        if each != 0 {
+        if RECOVERY {
+            for bank in 1..=2 {
+                let rec = row_lane(c, bank, lanes) as usize * lane_len + (t * n_v + h) * 3 * HEAD;
+                if col == 0 {
+                    for i in 0..KEYS_PER_LANE {
+                        cuda_device::thread::__unroll_config::<0>();
+                        // SAFETY: column zero's lanes own the aligned record's
+                        // keys, each written once inside the spare lane.
+                        unsafe { *state.add(rec + key_of(j, i)) = k[i] };
+                    }
+                    if j == 0 {
+                        // SAFETY: one thread writes the record's head decay.
+                        unsafe { *state.add(rec + 2 * HEAD) = dh };
+                    }
+                }
+                if j == 0 {
+                    // SAFETY: each value column writes its own update scalar.
+                    unsafe { *state.add(rec + HEAD + col) = u };
+                }
+            }
+        } else if each != 0 {
             let at = ((c as usize + row as usize + t) % lanes as usize) * lane_len + col_at;
             for i in 0..KEYS_PER_LANE {
                 cuda_device::thread::__unroll_config::<0>();
@@ -2227,11 +2440,12 @@ unsafe fn delta_lanes_body<const DECAY: u32>(
         t += 1;
     }
     if each == 0 {
+        let out_at = target as usize * lane_len + col_at;
         for i in 0..KEYS_PER_LANE {
             cuda_device::thread::__unroll_config::<0>();
-            // SAFETY: the sixteen keys this lane read from lane rin above
-            // (lane c: in place mode is row 0).
-            unsafe { *state.add(s_at + key_of(j, i)) = s[i] };
+            // SAFETY: target < lanes; this thread owns these keys of its
+            // column, and the record bank lies outside the target lane.
+            unsafe { *state.add(out_at + key_of(j, i)) = s[i] };
         }
     }
 }
@@ -2282,7 +2496,7 @@ impl DeltaKernels {
                 "row mode: the prompt form runs a call in place",
             ));
         }
-        check_gdn_lanes(WHAT, &args, Some(carry.len()))?;
+        check_gdn_lanes(WHAT, &args, Some(&*carry))?;
         let DeltaLanesArgs {
             delta:
                 DeltaArgs {
@@ -2368,8 +2582,48 @@ impl DeltaKernels {
         args: DeltaLanesArgs<'_>,
         carry: Option<&DeviceBuffer<f32>>,
     ) -> Result<(), GpuError> {
+        self.enqueue_lanes(stream, args, carry, false)
+    }
+
+    /// Record a verify (`each`) without changing its committed lane, or
+    /// replay its first `m` records into the last kept row's lane (`!each`).
+    /// Records occupy the next two state lanes, with aligned key, update
+    /// and decay planes per (row, value head). Replay reads the bank outside its destination lane,
+    /// so no block can overwrite another block's unread records. The caller
+    /// moves the lane word to the last kept row after replay. Replay reads
+    /// the recorded position, not another slot's current parameter word;
+    /// both calls take the same carry. Allocation-free and capturable; refuses
+    /// fewer than three lanes or records past a lane.
+    pub fn enqueue_delta_recovery(
+        &self,
+        stream: &CudaStream,
+        args: DeltaLanesArgs<'_>,
+        carry: Option<&DeviceBuffer<f32>>,
+    ) -> Result<(), GpuError> {
+        let d = &args.delta;
+        if d.lanes < 3 || d.m > d.lanes || d.m > HEAD / 3 {
+            return Err(GpuError::shape(
+                "enqueue_delta_recovery",
+                format!(
+                    "{} rows over {} lanes: need 3 or more lanes and rows <= min(lanes, {})",
+                    d.m,
+                    d.lanes,
+                    HEAD / 3
+                ),
+            ));
+        }
+        self.enqueue_lanes(stream, args, carry, true)
+    }
+
+    fn enqueue_lanes(
+        &self,
+        stream: &CudaStream,
+        args: DeltaLanesArgs<'_>,
+        carry: Option<&DeviceBuffer<f32>>,
+        recovery: bool,
+    ) -> Result<(), GpuError> {
         const WHAT: &str = "enqueue_delta_lanes";
-        check_gdn_lanes(WHAT, &args, carry.map(DeviceBuffer::len))?;
+        check_gdn_lanes(WHAT, &args, carry)?;
         let DeltaLanesArgs {
             delta:
                 DeltaArgs {
@@ -2392,29 +2646,55 @@ impl DeltaKernels {
         let nv = shape.n_v;
         let grid = launch_u32(WHAT, "grid", nv * (HEAD / COLUMNS_PER_BLOCK))?;
         let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
-        let prep = self.module.prepare_gdn_delta_lanes(cfg)?;
-        self.module.gdn_delta_lanes(
-            stream,
-            &prep,
-            qkv,
-            beta,
-            decay,
-            lane,
-            launch_u32(WHAT, "lane_at", lane_at)?,
-            launch_u32(WHAT, "lanes", lanes)?,
-            launch_u32(WHAT, "n_k", shape.n_k)?,
-            launch_u32(WHAT, "n_v", nv)?,
-            grouped_arg(shape.map),
-            launch_u32(WHAT, "m", m)?,
-            u32::from(each),
-            pos,
-            carry.unwrap_or(qkv),
-            u32::from(carry.is_some()),
-            fault,
-            o,
-            state,
-            stamp,
-        )?;
+        if recovery {
+            let prep = self.module.prepare_gdn_delta_recovery(cfg)?;
+            self.module.gdn_delta_recovery(
+                stream,
+                &prep,
+                qkv,
+                beta,
+                decay,
+                lane,
+                launch_u32(WHAT, "lane_at", lane_at)?,
+                launch_u32(WHAT, "lanes", lanes)?,
+                launch_u32(WHAT, "n_k", shape.n_k)?,
+                launch_u32(WHAT, "n_v", nv)?,
+                grouped_arg(shape.map),
+                launch_u32(WHAT, "m", m)?,
+                u32::from(each),
+                pos,
+                carry.unwrap_or(qkv),
+                u32::from(carry.is_some()),
+                fault,
+                o,
+                state,
+                stamp,
+            )?;
+        } else {
+            let prep = self.module.prepare_gdn_delta_lanes(cfg)?;
+            self.module.gdn_delta_lanes(
+                stream,
+                &prep,
+                qkv,
+                beta,
+                decay,
+                lane,
+                launch_u32(WHAT, "lane_at", lane_at)?,
+                launch_u32(WHAT, "lanes", lanes)?,
+                launch_u32(WHAT, "n_k", shape.n_k)?,
+                launch_u32(WHAT, "n_v", nv)?,
+                grouped_arg(shape.map),
+                launch_u32(WHAT, "m", m)?,
+                u32::from(each),
+                pos,
+                carry.unwrap_or(qkv),
+                u32::from(carry.is_some()),
+                fault,
+                o,
+                state,
+                stamp,
+            )?;
+        }
         Ok(())
     }
 
