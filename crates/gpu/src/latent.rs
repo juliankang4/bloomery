@@ -110,7 +110,7 @@ const _: () = assert!(PER_THREAD == 4 && PER_LANE == 4 && BLOCK == 128 && POOL =
 /// The xor butterfly (16, 8, 4, 2, 1) over a warp in f64: every lane ends
 /// with the same sum.
 #[inline(always)]
-fn warp_sum_f64(v: f64) -> f64 {
+pub(crate) fn warp_sum_f64(v: f64) -> f64 {
     let mut acc = v;
     acc += warp::shuffle_xor_f64(acc, 16);
     acc += warp::shuffle_xor_f64(acc, 8);

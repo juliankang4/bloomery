@@ -59,7 +59,7 @@
 //! one.
 
 use crate::fault::{FaultSink, FaultSite};
-use crate::{GpuError, launch_u32};
+use crate::{GpuError, launch_u32, short};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicU32};
 use cuda_device::{
@@ -1152,17 +1152,6 @@ pub struct RemapArgs<'a> {
 /// The loaded module. Owns no stream: each enqueue takes the caller's.
 pub struct CandKernels {
     module: cand_kernels::LoadedModule,
-}
-
-/// The first of `lens` shorter than it needs, as the error `what` names.
-fn short(what: &'static str, lens: &[(&str, usize, usize)]) -> Result<(), GpuError> {
-    match lens.iter().find(|(_, have, want)| have < want) {
-        Some((name, have, want)) => Err(GpuError::shape(
-            what,
-            format!("{name} holds {have}, want >= {want}"),
-        )),
-        None => Ok(()),
-    }
 }
 
 /// `tokens`, `rows` and `kstride` checked against `shape`.

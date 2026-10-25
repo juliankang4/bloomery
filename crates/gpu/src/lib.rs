@@ -332,6 +332,18 @@ pub fn launch_u32(what: &'static str, name: &'static str, v: usize) -> Result<u3
         .map_err(|_| GpuError::shape(what, format!("{name} = {v} does not fit the kernel's u32")))
 }
 
+/// The first of `lens`' `(name, len, need)` buffers shorter than a launch
+/// reads or writes, as a `Shape` error of the entry point `what`.
+pub(crate) fn short(what: &'static str, lens: &[(&str, usize, usize)]) -> Result<(), GpuError> {
+    match lens.iter().find(|(_, got, need)| got < need) {
+        Some((name, got, need)) => Err(GpuError::shape(
+            what,
+            format!("{name}.len() {got} < {need}"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Columns a group of [`ColGroups`] holds at most: the m-column cores'.
 pub const COL_GROUP: usize = 8;
 

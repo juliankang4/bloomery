@@ -111,6 +111,13 @@
 //! warps (`prefill_256_sel`, its section). Over the list `0 .. n` a row's bits
 //! are the `_p4` entry's at count `n`.
 //!
+//! [`FlashGqaPrefill::enqueue_256_p4_gated`] and
+//! [`FlashGqaPrefill::enqueue_256_p12_sel_gated`] are Qwen3.8's prompt form of
+//! the `_p4` and `_p12_sel` walks: the query rows normalized and turned in the
+//! staging from the `[q | gate]` rows (`NormedRows`) and each output value
+//! stored under its sigmoid gate (`SigmoidGate`), the bits of `rope_neox`'s
+//! query norm, the plain walk and `q38`'s out gate in turn.
+//!
 //! The `_q8` entries ([`FlashGqaPrefill::enqueue_q8`] and its eight-head
 //! `_256` kin; no packed q8 entry exists) run the same walks over the Q8_0
 //! cache the quantizing appends write (`rope_neox`'s two-plane layout: a
@@ -159,10 +166,10 @@ use crate::flash_gqa::{
     F16Kv, GROUP, GROUP_7, GqaListArgs, HEAD, KvSrc, PACK_2, PACK_4, PACK_12, Q8Kv, SEL_NAN4,
     check_listed_256, q8_word_values, real_head,
 };
-use crate::rope_neox::q8_plane_lens;
+use crate::rope_neox::{ROT_256 as ROPE_256, q8_plane_lens, query_scale_256, query_value_256};
 use crate::route_core::sigmoid;
 use crate::tensor::{Pitched, dtod_2d};
-use crate::{GpuError, launch_u32};
+use crate::{GpuError, launch_u32, short};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::async_copy::{
     cp_async_ca_8, cp_async_cg_16, cp_async_commit_group, cp_async_wait_group,
@@ -508,6 +515,101 @@ impl OutGate for SigmoidGate<'_> {
             self.fault.raise(FaultSite::F32Product);
         }
         out
+    }
+}
+
+/// Where a body's staging takes its query rows from: as stored in `q`
+/// ([`Stored`]), or normalized and turned from the query projection's raw
+/// rows as `rope_neox`'s query norm writes them ([`NormedRows`]).
+pub(crate) trait QueryRows: Copy {
+    /// The staging reads [`QueryRows::head`] and [`QueryRows::value`]
+    /// rather than `q`.
+    const RAW: bool;
+
+    /// The scale and position of query row `row` (a token's query head,
+    /// `t·n_head + head`) of token `t`, every lane of the calling warp
+    /// holding them.
+    ///
+    /// # Safety
+    /// `t` is below the launch's rows and `row` below its `t_rows·n_head`,
+    /// every lane of the warp calls it, and the entry's launch contract
+    /// holds.
+    unsafe fn head(&self, t: usize, row: usize) -> (f32, u32);
+
+    /// Value `d` of query row `row` at the scale and position
+    /// [`QueryRows::head`] gave.
+    ///
+    /// # Safety
+    /// As [`QueryRows::head`], and `d` is below the head.
+    unsafe fn value(&self, row: usize, d: usize, scale: f32, p: u32) -> f32;
+}
+
+/// The query rows as stored in the entry's `q`.
+#[derive(Clone, Copy)]
+pub(crate) struct Stored;
+
+impl QueryRows for Stored {
+    const RAW: bool = false;
+
+    #[inline(always)]
+    unsafe fn head(&self, _: usize, _: usize) -> (f32, u32) {
+        (0.0, 0)
+    }
+
+    #[inline(always)]
+    unsafe fn value(&self, _: usize, _: usize, _: f32, _: u32) -> f32 {
+        0.0
+    }
+}
+
+/// Qwen3.8's query rows from the `[q | gate]` rows `qg` (row `row`'s query
+/// at `qg[row·2·HEAD_256 ..]`): the head's RMS norm by `gain` and the NEOX
+/// turn of its first `ROT_256` values by row `pos[t]` of `table`
+/// (`rope_neox::query_scale_256` and `query_value_256`, the values
+/// `head_norm_neox_append_256` writes). A position at or past `ctx` gives the
+/// row NaN, as that launch writes it.
+#[derive(Clone, Copy)]
+pub(crate) struct NormedRows<'a> {
+    pub(crate) qg: &'a [f32],
+    pub(crate) gain: &'a [f32],
+    pub(crate) table: &'a [f32],
+    pub(crate) pos: &'a [u32],
+    pub(crate) eps: f32,
+    pub(crate) ctx: u32,
+    pub(crate) fault: FaultSink,
+}
+
+impl QueryRows for NormedRows<'_> {
+    const RAW: bool = true;
+
+    #[inline(always)]
+    unsafe fn head(&self, t: usize, row: usize) -> (f32, u32) {
+        // SAFETY: t is below the launch's rows <= pos.len() (the gated
+        // entries' launch contract).
+        let p = unsafe { *self.pos.get_unchecked(t) };
+        // SAFETY: row < t_rows·n_head, so its query lies inside qg (the
+        // gated entries' launch contract); the whole warp calls it.
+        let scale = unsafe { query_scale_256(self.qg, row * 2 * HEAD_256, self.eps, self.fault) };
+        (scale, p)
+    }
+
+    #[inline(always)]
+    unsafe fn value(&self, row: usize, d: usize, scale: f32, p: u32) -> f32 {
+        if p >= self.ctx {
+            return f32::NAN;
+        }
+        // SAFETY: the query lies inside qg, d < HEAD_256 <= gain.len(), and p
+        // < ctx puts row p inside the table's ctx rows of ROT_256 (the gated
+        // entries' launch contract).
+        unsafe {
+            query_value_256(
+                (self.qg, row * 2 * HEAD_256),
+                d,
+                scale,
+                self.gain,
+                (self.table, p as usize),
+            )
+        }
     }
 }
 
@@ -996,8 +1098,10 @@ unsafe fn prefill_256_p<
     const LOWER: bool,
     S: KvSrc,
     G: OutGate,
+    Q: QueryRows,
 >(
     q: &[f32],
+    qrows: Q,
     src: S,
     n_keys_buf: &[u32],
     k_first_buf: &[u32],
@@ -1095,7 +1199,51 @@ unsafe fn prefill_256_p<
     let q_pos = n_head * Q_PAIRS_256;
     let q64 = q.as_ptr().cast::<u64>();
     let mut raw = [0u64; Q_WORDS_256];
-    if PACK == 1 {
+    if Q::RAW {
+        // Each staged row's scale and position, a warp a row, into the
+        // exchange (free until the walk), then each pass's word from them.
+        let exu = ex.cast::<u32>();
+        for i in 0..Q_ROWS_256 / WARPS_256 {
+            cuda_device::thread::__unroll_config::<0>();
+            let sr = wid + WARPS_256 * i;
+            let t = t0 + sr / PACK;
+            if t < rows {
+                // SAFETY: t < t_rows and head0 + sr % PACK < n_head; the
+                // whole warp takes this branch (sr is the warp's).
+                let (scale, p) = unsafe { qrows.head(t, t * n_head + head0 + sr % PACK) };
+                if lane == 0 {
+                    // SAFETY: sr < Q_ROWS_256 <= the exchange's floats; one
+                    // lane per staged row writes its slot.
+                    unsafe { *ex.add(sr) = scale };
+                    // SAFETY: Q_ROWS_256 + sr < 2·Q_ROWS_256 <= the
+                    // exchange's words; one lane per staged row writes its
+                    // slot.
+                    unsafe { *exu.add(Q_ROWS_256 + sr) = p };
+                }
+            }
+        }
+        thread::sync_threads();
+        for e in 0..Q_WORDS_256 {
+            cuda_device::thread::__unroll_config::<0>();
+            let sr = Q_ROW_STEP_256 * e + r0;
+            let t = t0 + sr / PACK;
+            if t < rows {
+                // SAFETY: slot sr, written before the barrier above.
+                let scale = unsafe { *ex.add(sr) };
+                // SAFETY: Q_ROWS_256 + sr < 2·Q_ROWS_256 <= the exchange's
+                // words, written before the barrier above.
+                let p = unsafe { *exu.add(Q_ROWS_256 + sr) };
+                let row = t * n_head + head0 + sr % PACK;
+                // SAFETY: t < t_rows, row < t_rows·n_head and 2·wd + 1 <
+                // HEAD_256.
+                let v0 = unsafe { qrows.value(row, 2 * wd, scale, p) };
+                // SAFETY: t < t_rows, row < t_rows·n_head and 2·wd + 1 <
+                // HEAD_256.
+                let v1 = unsafe { qrows.value(row, 2 * wd + 1, scale, p) };
+                raw[e] = u64::from(v0.to_bits()) | (u64::from(v1.to_bits()) << 32);
+            }
+        }
+    } else if PACK == 1 {
         for e in 0..Q_WORDS_256 {
             cuda_device::thread::__unroll_config::<0>();
             let t = t0 + Q_ROW_STEP_256 * e + r0;
@@ -1585,8 +1733,9 @@ const _: () = assert!(SEL_QUARTERS * 2 == KEY_NT && SEL_DIM_PAIRS == 2);
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn prefill_256_sel<G: OutGate>(
+unsafe fn prefill_256_sel<G: OutGate, Q: QueryRows>(
     q: &[f32],
+    qrows: Q,
     kc: &[u16],
     vc: &[u16],
     list: &[u32],
@@ -1648,14 +1797,55 @@ unsafe fn prefill_256_sel<G: OutGate>(
     let r0 = tid / Q_PAIRS_256;
     let q64 = q.as_ptr().cast::<u64>();
     let mut raw = [0u64; SEL_Q_PASSES];
-    for e in 0..SEL_Q_PASSES {
-        cuda_device::thread::__unroll_config::<0>();
-        let row = Q_ROW_STEP_256 * e + r0;
-        if row < PACK {
-            // SAFETY: t < m and head0 + row < head0 + 12 <= n_head, so the
-            // head lies inside q (launch contract); a head is 128 u64 and q
-            // starts 8-byte aligned (host-checked).
-            raw[e] = unsafe { *q64.add((t * n_head + head0 + row) * Q_PAIRS_256 + wd) };
+    if Q::RAW {
+        // Each head's scale and position, a warp a head, into the exchange
+        // (free until the walk), then each pass's word from them.
+        let exu = ex.cast::<u32>();
+        for i in 0..PACK.div_ceil(WARPS_256) {
+            cuda_device::thread::__unroll_config::<0>();
+            let j = wid + WARPS_256 * i;
+            if j < PACK {
+                // SAFETY: t < m and head0 + j < head0 + 12 <= n_head; the
+                // whole warp takes this branch (j is the warp's).
+                let (scale, p) = unsafe { qrows.head(t, t * n_head + head0 + j) };
+                if lane == 0 {
+                    // SAFETY: j < PACK <= the exchange's floats; one lane
+                    // per head writes its slot.
+                    unsafe { *ex.add(j) = scale };
+                    // SAFETY: PACK + j < 2·PACK <= the exchange's words;
+                    // one lane per head writes its slot.
+                    unsafe { *exu.add(PACK + j) = p };
+                }
+            }
+        }
+        thread::sync_threads();
+        for e in 0..SEL_Q_PASSES {
+            cuda_device::thread::__unroll_config::<0>();
+            let row = Q_ROW_STEP_256 * e + r0;
+            if row < PACK {
+                // SAFETY: slot row, written before the barrier above.
+                let scale = unsafe { *ex.add(row) };
+                // SAFETY: PACK + row < 2·PACK <= the exchange's words,
+                // written before the barrier above.
+                let p = unsafe { *exu.add(PACK + row) };
+                let at = t * n_head + head0 + row;
+                // SAFETY: t < m, at < m·n_head and 2·wd + 1 < HEAD_256.
+                let v0 = unsafe { qrows.value(at, 2 * wd, scale, p) };
+                // SAFETY: t < m, at < m·n_head and 2·wd + 1 < HEAD_256.
+                let v1 = unsafe { qrows.value(at, 2 * wd + 1, scale, p) };
+                raw[e] = u64::from(v0.to_bits()) | (u64::from(v1.to_bits()) << 32);
+            }
+        }
+    } else {
+        for e in 0..SEL_Q_PASSES {
+            cuda_device::thread::__unroll_config::<0>();
+            let row = Q_ROW_STEP_256 * e + r0;
+            if row < PACK {
+                // SAFETY: t < m and head0 + row < head0 + 12 <= n_head, so the
+                // head lies inside q (launch contract); a head is 128 u64 and q
+                // starts 8-byte aligned (host-checked).
+                raw[e] = unsafe { *q64.add((t * n_head + head0 + row) * Q_PAIRS_256 + wd) };
+            }
         }
     }
     for e in 0..SEL_Q_PASSES {
@@ -3201,8 +3391,9 @@ mod flash_gqa_prefill_kernels {
         // heads per key head, and the block is THREADS_256 threads with
         // DYN_BYTES_256 bytes of dynamic shared memory.
         unsafe {
-            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, false, _, _>(
+            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, false, _, _, _>(
                 q,
+                Stored,
                 F16Kv { k: kc, v: vc },
                 n_keys_buf,
                 n_keys_buf,
@@ -3260,14 +3451,16 @@ mod flash_gqa_prefill_kernels {
         // memory.
         unsafe {
             prefill_256_sel(
-                q, kc, vc, list, n_sel, scale, n_kv, ctx, width, m, fault, Ungated, y,
+                q, Stored, kc, vc, list, n_sel, scale, n_kv, ctx, width, m, fault, Ungated, y,
             )
         };
     }
 
-    /// [`gqa_prefill_flash_256_p4`] with each value stored under its
-    /// sigmoid gate ([`SigmoidGate`]), `qg` the rows' `[q | gate]`
-    /// projection: `q38`'s out gate over the flash's output, in its store.
+    /// Qwen3.8's prompt attention over [`gqa_prefill_flash_256_p4`]'s walk:
+    /// the query rows normalized and turned in the staging from the `[q |
+    /// gate]` rows `qg` (`NormedRows`: by `gain` and row `pos[t]` of `table`)
+    /// and each value stored under its sigmoid gate (`SigmoidGate`): the
+    /// query norm, the flash and `q38`'s out gate in one launch.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -3280,16 +3473,21 @@ mod flash_gqa_prefill_kernels {
         dynamic_shared = 98304,
         requires = (
             n_keys_buf.len() >= t_rows,
-            q.len() >= t_rows * n_kv * packs * 4 * 256,
+            pos.len() >= t_rows,
             qg.len() >= t_rows * n_kv * packs * 4 * 512,
+            gain.len() >= 256,
+            table.len() >= ctx * 64,
             kc.len() >= n_kv * ctx * 256,
             vc.len() >= n_kv * ctx * 256,
             y.len() >= t_rows * n_kv * packs * 4 * 256
         )
     )]
     pub fn gqa_prefill_flash_256_p4_gated(
-        q: &[f32],
         qg: &[f32],
+        gain: &[f32],
+        table: &[f32],
+        pos: &[u32],
+        eps: f32,
         kc: &[u16],
         vc: &[u16],
         n_keys_buf: &[u32],
@@ -3301,13 +3499,25 @@ mod flash_gqa_prefill_kernels {
         fault: FaultSink,
         y: DisjointSlice<f32>,
     ) {
+        let rows = NormedRows {
+            qg,
+            gain,
+            table,
+            pos,
+            eps,
+            ctx,
+            fault,
+        };
         // SAFETY: the launch contract is `prefill_256_p`'s at `packs · PACK_4`
-        // heads per key head, with qg holding 2·256 gate values for each of the
-        // t_rows·n_head rows (SigmoidGate's), and the block is THREADS_256
-        // threads with DYN_BYTES_256 bytes of dynamic shared memory.
+        // heads per key head, with qg holding each of the t_rows·n_head rows'
+        // query and gate (NormedRows's and SigmoidGate's), pos t_rows positions,
+        // gain a head and table ctx rows of ROT_256, and the block is
+        // THREADS_256 threads with DYN_BYTES_256 bytes of dynamic shared
+        // memory.
         unsafe {
-            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, false, _, _>(
-                q,
+            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, false, _, _, _>(
+                qg,
+                rows,
                 F16Kv { k: kc, v: vc },
                 n_keys_buf,
                 n_keys_buf,
@@ -3323,8 +3533,8 @@ mod flash_gqa_prefill_kernels {
         };
     }
 
-    /// [`gqa_prefill_flash_256_p12_sel`] with each value stored under its
-    /// sigmoid gate ([`SigmoidGate`]), as `gqa_prefill_flash_256_p4_gated`.
+    /// [`gqa_prefill_flash_256_p12_sel`]'s walk with the query rows and the
+    /// store of `gqa_prefill_flash_256_p4_gated`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -3337,17 +3547,22 @@ mod flash_gqa_prefill_kernels {
         dynamic_shared = 73728,
         requires = (
             n_sel.len() >= m,
+            pos.len() >= m,
             list.len() >= m * width,
-            q.len() >= m * n_kv * 12 * 256,
             qg.len() >= m * n_kv * 12 * 512,
+            gain.len() >= 256,
+            table.len() >= ctx * 64,
             kc.len() >= n_kv * ctx * 256,
             vc.len() >= n_kv * ctx * 256,
             y.len() >= m * n_kv * 12 * 256
         )
     )]
     pub fn gqa_prefill_flash_256_p12_sel_gated(
-        q: &[f32],
         qg: &[f32],
+        gain: &[f32],
+        table: &[f32],
+        pos: &[u32],
+        eps: f32,
         kc: &[u16],
         vc: &[u16],
         list: &[u32],
@@ -3360,13 +3575,23 @@ mod flash_gqa_prefill_kernels {
         fault: FaultSink,
         y: DisjointSlice<f32>,
     ) {
-        // SAFETY: the launch contract is `prefill_256_sel`'s, with qg holding
-        // 2·256 gate values for each of the m·n_head rows (SigmoidGate's), and
-        // the block is THREADS_256 threads with DYN_BYTES_SEL bytes of dynamic
-        // shared memory.
+        let rows = NormedRows {
+            qg,
+            gain,
+            table,
+            pos,
+            eps,
+            ctx,
+            fault,
+        };
+        // SAFETY: the launch contract is `prefill_256_sel`'s, with qg, pos,
+        // gain and table as `gqa_prefill_flash_256_p4_gated`'s, and the block
+        // is THREADS_256 threads with DYN_BYTES_SEL bytes of dynamic shared
+        // memory.
         unsafe {
             prefill_256_sel(
-                q,
+                qg,
+                rows,
                 kc,
                 vc,
                 list,
@@ -3421,8 +3646,9 @@ mod flash_gqa_prefill_kernels {
         // heads per key head, and the block is THREADS_256 threads with
         // DYN_BYTES_256 bytes of dynamic shared memory.
         unsafe {
-            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }, false, _, _>(
+            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }, false, _, _, _>(
                 q,
+                Stored,
                 F16Kv { k: kc, v: vc },
                 n_keys_buf,
                 n_keys_buf,
@@ -3479,8 +3705,9 @@ mod flash_gqa_prefill_kernels {
         // block is THREADS_256 threads with DYN_BYTES_256 bytes of dynamic
         // shared memory.
         unsafe {
-            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }, true, _, _>(
+            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }, true, _, _, _>(
                 q,
+                Stored,
                 F16Kv { k: kc, v: vc },
                 n_keys_buf,
                 k_first_buf,
@@ -3533,8 +3760,9 @@ mod flash_gqa_prefill_kernels {
         // SAFETY: the launch contract supplies every plane and count at
         // PACK = 1, THREADS_256 threads and DYN_BYTES_256 shared bytes.
         unsafe {
-            prefill_256_p::<1, SLICE_ROWS, true, _, _>(
+            prefill_256_p::<1, SLICE_ROWS, true, _, _, _>(
                 q,
+                Stored,
                 F16Kv { k: kc, v: vc },
                 n_keys_buf,
                 k_first_buf,
@@ -3592,8 +3820,9 @@ mod flash_gqa_prefill_kernels {
         // THREADS_256 threads with DYN_BYTES_256_Q8 bytes of dynamic shared
         // memory.
         unsafe {
-            prefill_256_p::<GROUP, { SLICE_ROWS / GROUP }, false, _, _>(
+            prefill_256_p::<GROUP, { SLICE_ROWS / GROUP }, false, _, _, _>(
                 q,
+                Stored,
                 Q8Kv { kq, kd, vq, vd },
                 n_keys_buf,
                 n_keys_buf,
@@ -3813,17 +4042,37 @@ mod flash_gqa_prefill_kernels {
     }
 }
 
-/// A gated entry's `[q | gate]` rows over `rows` output rows (a token's query
-/// head each): `2·rows·HEAD_256` values, refused by name when shorter.
-fn gate_holds(what: &'static str, qg: &DeviceBuffer<f32>, rows: usize) -> Result<(), GpuError> {
-    let need = rows * 2 * HEAD_256;
-    if qg.len() < need {
-        return Err(GpuError::shape(
+/// The query norm a gated entry runs in its staging (`NormedRows`): the
+/// query norm's gain (a head of [`HEAD_256`]), the rope table (`ROT_256` f32
+/// a position, at least `ctx` rows), the rows' positions and the norm's eps.
+#[derive(Clone, Copy)]
+pub(crate) struct QueryNorm<'a> {
+    pub gain: &'a DeviceBuffer<f32>,
+    pub table: &'a DeviceBuffer<f32>,
+    pub pos: &'a DeviceBuffer<u32>,
+    pub eps: f32,
+}
+
+impl QueryNorm<'_> {
+    /// A gated launch of `rows` tokens of `n_head` heads over a cache of
+    /// `ctx` rows: the `[q | gate]` rows `qg`, the gain, the table and the
+    /// positions refused by name when short.
+    fn holds(
+        &self,
+        what: &'static str,
+        qg: &DeviceBuffer<f32>,
+        (rows, n_head, ctx): (usize, usize, usize),
+    ) -> Result<(), GpuError> {
+        short(
             what,
-            format!("qg.len() {} < {need}", qg.len()),
-        ));
+            &[
+                ("qg", qg.len(), rows * n_head * 2 * HEAD_256),
+                ("gain", self.gain.len(), HEAD_256),
+                ("table", self.table.len(), ctx * ROPE_256),
+                ("pos", self.pos.len(), rows),
+            ],
+        )
     }
-    Ok(())
 }
 
 /// [`FlashGqaPrefill::enqueue`]'s arguments: `t` rows of `n_head` query heads
@@ -4301,22 +4550,27 @@ impl FlashGqaPrefill {
         )
     }
 
-    /// [`FlashGqaPrefill::enqueue_256_p4`] with row `t`'s head `h` stored
-    /// as `y = o · σ(gate)` (`gqa_prefill_flash_256_p4_gated`), the gate
-    /// at `qg[(t·n_head + h)·2·256 + 256 ..]` of the query projection's
-    /// `[q | gate]` rows: the flash and `q38`'s out gate in one launch, the
-    /// same bits. `qg` shorter than `2·t·n_head·256` is refused by name;
-    /// a non-finite value, gate or product raises
-    /// [`FaultSite::F32Product`]. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_256_p4_gated(
+    /// [`FlashGqaPrefill::enqueue_256_p4`] for Qwen3.8's prompt
+    /// (`gqa_prefill_flash_256_p4_gated`): `args.q` is the query
+    /// projection's `[q | gate]` rows (head `h` of row `t` at `(t·n_head +
+    /// h)·2·256`, the query and then its gate), each query normalized and
+    /// turned in the staging ([`QueryNorm`]) and each output value stored as `o
+    /// · σ(gate)`: `rope_neox`'s query norm, the flash and `q38`'s out gate in
+    /// one launch, with their bits. `args.q` shorter than `2·t·n_head·256`, and
+    /// `query`'s buffers short of a head's gain, `t` positions or `ctx` table
+    /// rows, are refused by name; a non-finite value, gate or product, or a
+    /// refused norm, raises [`FaultSite::F32Product`], and a position at or
+    /// past `ctx` leaves its row NaN (the key norm's launch raises it).
+    /// Asynchronous, allocation-free, capturable.
+    pub(crate) fn enqueue_256_p4_gated(
         &self,
         stream: &CudaStream,
         args: GqaPrefillArgs<'_>,
-        qg: &DeviceBuffer<f32>,
+        query: QueryNorm<'_>,
     ) -> Result<(), GpuError> {
         let what = "flash_gqa_prefill::enqueue_256_p4_gated";
-        gate_holds(what, qg, args.t * args.n_head)?;
-        self.enqueue_packed(what, stream, args, PACK_4, None, Some(qg))
+        query.holds(what, args.q, (args.t, args.n_head, args.ctx))?;
+        self.enqueue_packed(what, stream, args, PACK_4, None, Some(query))
     }
 
     /// [`FlashGqaPrefill::enqueue_256_p4`]'s attention for `m` rows over the
@@ -4345,33 +4599,33 @@ impl FlashGqaPrefill {
         )
     }
 
-    /// [`FlashGqaPrefill::enqueue_256_p12_sel`] with each value stored under
-    /// its sigmoid gate (`gqa_prefill_flash_256_p12_sel_gated`), `qg` as
-    /// [`FlashGqaPrefill::enqueue_256_p4_gated`]'s over the `m` rows: the
-    /// same bits as the flash and `q38`'s out gate after it. Asynchronous,
-    /// allocation-free, capturable.
-    pub fn enqueue_256_p12_sel_gated(
+    /// [`FlashGqaPrefill::enqueue_256_p12_sel`] for Qwen3.8's prompt
+    /// (`gqa_prefill_flash_256_p12_sel_gated`): `args.q` and `query` as
+    /// [`FlashGqaPrefill::enqueue_256_p4_gated`]'s over the `m` rows, the
+    /// same bits as the query norm, the listed flash and `q38`'s out gate.
+    /// Asynchronous, allocation-free, capturable.
+    pub(crate) fn enqueue_256_p12_sel_gated(
         &self,
         stream: &CudaStream,
         args: GqaListArgs<'_>,
         n_head: usize,
-        qg: &DeviceBuffer<f32>,
+        query: QueryNorm<'_>,
     ) -> Result<(), GpuError> {
         let what = "flash_gqa_prefill::enqueue_256_p12_sel_gated";
-        gate_holds(what, qg, args.m * n_head)?;
-        self.enqueue_listed(what, stream, args, n_head, Some(qg))
+        query.holds(what, args.q, (args.m, n_head, args.ctx))?;
+        self.enqueue_listed(what, stream, args, n_head, Some(query))
     }
 
     /// The listed entries' one launcher: the checks of
     /// [`FlashGqaPrefill::enqueue_256_p12_sel`], then its entry, the gated
-    /// one when `qg` is given.
+    /// one when `query` is given.
     fn enqueue_listed(
         &self,
         what: &'static str,
         stream: &CudaStream,
         args: GqaListArgs<'_>,
         n_head: usize,
-        qg: Option<&DeviceBuffer<f32>>,
+        query: Option<QueryNorm<'_>>,
     ) -> Result<(), GpuError> {
         check_listed_256(what, &args, n_head)?;
         let GqaListArgs {
@@ -4405,19 +4659,25 @@ impl FlashGqaPrefill {
         let width = launch_u32(what, "width", width)?;
         let m = launch_u32(what, "m", m)?;
         let cfg = LaunchConfig1D::new(grid, THREADS_256_U32, DYN_BYTES_SEL_U32);
-        match qg {
+        match query {
             None => {
                 let prep = self.module.prepare_gqa_prefill_flash_256_p12_sel(cfg)?;
                 self.module.gqa_prefill_flash_256_p12_sel(
                     stream, &prep, q, kc, vc, list, n_sel, scale, n_kv, ctx, width, m, fault, y,
                 )?;
             }
-            Some(qg) => {
+            Some(QueryNorm {
+                gain,
+                table,
+                pos,
+                eps,
+            }) => {
                 let prep = self
                     .module
                     .prepare_gqa_prefill_flash_256_p12_sel_gated(cfg)?;
                 self.module.gqa_prefill_flash_256_p12_sel_gated(
-                    stream, &prep, q, qg, kc, vc, list, n_sel, scale, n_kv, ctx, width, m, fault, y,
+                    stream, &prep, q, gain, table, pos, eps, kc, vc, list, n_sel, scale, n_kv, ctx,
+                    width, m, fault, y,
                 )?;
             }
         }
@@ -4486,7 +4746,7 @@ impl FlashGqaPrefill {
     /// The packed entries' one launcher: the group refused unless a nonzero
     /// multiple of `pack` (1, [`PACK_4`] or [`PACK_2`]), the buffers and their
     /// alignment checked, then that pack's entry, its lower-bound form when
-    /// `k_first` is given, its gated form when `qg` is.
+    /// `k_first` is given, its Qwen3.8 form ([`QueryNorm`]) when `query` is.
     fn enqueue_packed(
         &self,
         what: &'static str,
@@ -4494,7 +4754,7 @@ impl FlashGqaPrefill {
         args: GqaPrefillArgs<'_>,
         pack: usize,
         k_first: Option<&DeviceBuffer<u32>>,
-        qg: Option<&DeviceBuffer<f32>>,
+        query: Option<QueryNorm<'_>>,
     ) -> Result<(), GpuError> {
         let packs = checked_packed(what, &args, (HEAD_256, KEY_TILE, pack))?;
         let GqaPrefillArgs {
@@ -4524,7 +4784,7 @@ impl FlashGqaPrefill {
         let ctx = launch_u32(what, "ctx", ctx)?;
         let t = launch_u32(what, "t", t)?;
         let cfg = LaunchConfig1D::new(grid, THREADS_256_U32, DYN_BYTES_256_U32);
-        match (pack, k_first, qg) {
+        match (pack, k_first, query) {
             (1, Some(k_first), None) => {
                 let prep = self.module.prepare_gqa_prefill_flash_256_p1_lower(cfg)?;
                 self.module.gqa_prefill_flash_256_p1_lower(
@@ -4549,10 +4809,20 @@ impl FlashGqaPrefill {
                     stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
                 )?;
             }
-            (PACK_4, None, Some(qg)) => {
+            (
+                PACK_4,
+                None,
+                Some(QueryNorm {
+                    gain,
+                    table,
+                    pos,
+                    eps,
+                }),
+            ) => {
                 let prep = self.module.prepare_gqa_prefill_flash_256_p4_gated(cfg)?;
                 self.module.gqa_prefill_flash_256_p4_gated(
-                    stream, &prep, q, qg, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
+                    stream, &prep, q, gain, table, pos, eps, kc, vc, n_keys, scale, n_kv, ctx, t,
+                    packs, fault, y,
                 )?;
             }
             _ => {
@@ -4565,7 +4835,11 @@ impl FlashGqaPrefill {
                         } else {
                             ""
                         },
-                        if qg.is_some() { " under a gate" } else { "" },
+                        if query.is_some() {
+                            " with a query norm"
+                        } else {
+                            ""
+                        },
                     ),
                 ));
             }
@@ -5302,75 +5576,138 @@ mod tests {
     const G_KV: usize = 2;
     const G_HEAD: usize = 24;
     const G_ROW: usize = G_HEAD * HEAD_256;
+    const G_EPS: f32 = 1.0e-6;
 
-    /// One gated launch and its plain launch with `q38`'s out gate after it, through the
-    /// pack-of-four entry or (`listed`) the listed one over `list`; each launch's fault taken
-    /// after it. Returns (the out gate's output and fault, the gated output and fault).
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the card, both modules, the entry, the attention inputs, the gates and the sink"
-    )]
+    /// One case of the gated entries: the `[q | gate]` rows, the query norm's
+    /// inputs, the cache and its counts, and the lists (every key below the
+    /// row's count).
+    struct Gated<'a> {
+        qg: &'a DeviceBuffer<f32>,
+        query: QueryNorm<'a>,
+        kc: &'a DeviceBuffer<u16>,
+        vc: &'a DeviceBuffer<u16>,
+        n_keys: &'a DeviceBuffer<u32>,
+        list: &'a DeviceBuffer<u32>,
+        ctx: usize,
+    }
+
+    fn gated_launch(
+        gpu: &Gpu,
+        k: &FlashGqaPrefill,
+        listed: bool,
+        c: &Gated<'_>,
+        (q, query): (&DeviceBuffer<f32>, Option<QueryNorm<'_>>),
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let s = gpu.stream();
+        let m = c.n_keys.len();
+        if listed {
+            let args = GqaListArgs {
+                q,
+                kc: c.kc,
+                vc: c.vc,
+                list: c.list,
+                n_sel: c.n_keys,
+                width: c.ctx,
+                scale: 0.0625,
+                n_kv: G_KV,
+                ctx: c.ctx,
+                m,
+                fault,
+                y,
+            };
+            match query {
+                Some(qr) => k.enqueue_256_p12_sel_gated(s, args, G_HEAD, qr),
+                None => k.enqueue_256_p12_sel(s, args, G_HEAD),
+            }
+        } else {
+            let args = GqaPrefillArgs {
+                q,
+                kc: c.kc,
+                vc: c.vc,
+                n_keys: c.n_keys,
+                scale: 0.0625,
+                n_head: G_HEAD,
+                n_kv: G_KV,
+                ctx: c.ctx,
+                t: m,
+                fault,
+                y,
+            };
+            match query {
+                Some(qr) => k.enqueue_256_p4_gated(s, args, qr),
+                None => k.enqueue_256_p4(s, args),
+            }
+        }
+    }
+
+    /// The gated launch through the pack-of-four entry or (`listed`) the
+    /// listed one, and the chain it replaces: `rope_neox`'s query norm into
+    /// stored rows, the plain entry over them, `q38`'s out gate. Each side's
+    /// fault is taken after it. Returns (the chain's output and fault, the
+    /// gated output and fault).
     fn gated_pair(
         gpu: &Gpu,
-        (k, q38): (&FlashGqaPrefill, &crate::q38::Q38Kernels),
+        k: &FlashGqaPrefill,
         listed: bool,
-        (q, kc, vc): (&DeviceBuffer<f32>, &DeviceBuffer<u16>, &DeviceBuffer<u16>),
-        (n_keys, list, ctx): (&DeviceBuffer<u32>, &DeviceBuffer<u32>, usize),
-        qg: &DeviceBuffer<f32>,
+        c: &Gated<'_>,
         sink: FaultSink,
     ) -> [(Vec<f32>, Option<crate::fault::Fault>); 2] {
         let s = gpu.stream();
-        let m = n_keys.len();
-        let launch =
-            |fault: FaultSink, y: &mut DeviceBuffer<f32>, gate: Option<&DeviceBuffer<f32>>| {
-                let r = if listed {
-                    let args = GqaListArgs {
-                        q,
-                        kc,
-                        vc,
-                        list,
-                        n_sel: n_keys,
-                        width: ctx,
-                        scale: 0.0625,
-                        n_kv: G_KV,
-                        ctx,
-                        m,
-                        fault,
-                        y,
-                    };
-                    match gate {
-                        Some(g) => k.enqueue_256_p12_sel_gated(s, args, G_HEAD, g),
-                        None => k.enqueue_256_p12_sel(s, args, G_HEAD),
-                    }
-                } else {
-                    let args = GqaPrefillArgs {
-                        q,
-                        kc,
-                        vc,
-                        n_keys,
-                        scale: 0.0625,
-                        n_head: G_HEAD,
-                        n_kv: G_KV,
-                        ctx,
-                        t: m,
-                        fault,
-                        y,
-                    };
-                    match gate {
-                        Some(g) => k.enqueue_256_p4_gated(s, args, g),
-                        None => k.enqueue_256_p4(s, args),
-                    }
-                };
-                r.expect("a flash launch");
-            };
-        let mut plain = DeviceBuffer::<f32>::zeroed(s, m * G_ROW).expect("plain rows");
-        launch(gpu.unlabelled_sink(), &mut plain, None);
-        let mut want = DeviceBuffer::<f32>::zeroed(s, m * G_ROW).expect("gated rows");
+        let m = c.n_keys.len();
+        let rope = crate::rope_neox::RopeNeoxKernels::load(gpu.context()).expect("rope");
+        let q38 = crate::q38::Q38Kernels::load(gpu.context()).expect("the q38 module");
+        let zeros = |n: usize| DeviceBuffer::<f32>::zeroed(s, n).expect("scratch");
+        let (mut q, mut kh, v) = (
+            zeros(m * G_ROW),
+            zeros(m * G_KV * HEAD_256),
+            zeros(m * G_KV * HEAD_256),
+        );
+        let plane = || DeviceBuffer::<u16>::zeroed(s, G_KV * c.ctx * HEAD_256).expect("a plane");
+        let (mut pk, mut pv) = (plane(), plane());
+        // SAFETY: the case's positions below ctx are distinct.
+        unsafe {
+            rope.enqueue_head_norm_neox_append_256(
+                s,
+                crate::rope_neox::PartialNeoxArgs {
+                    qg: c.qg,
+                    q: &mut q,
+                    k: &mut kh,
+                    v: &v,
+                    gq: c.query.gain,
+                    gk: c.query.gain,
+                    table: c.query.table,
+                    pos: c.query.pos,
+                    eps: c.query.eps,
+                    n_head: G_HEAD,
+                    n_kv: G_KV,
+                    ctx: c.ctx,
+                    m,
+                    fault: sink,
+                    cache_k: &mut pk,
+                    cache_v: &mut pv,
+                },
+            )
+        }
+        .expect("the query norm");
+        let mut plain = zeros(m * G_ROW);
+        gated_launch(
+            gpu,
+            k,
+            listed,
+            c,
+            (&q, None),
+            gpu.unlabelled_sink(),
+            &mut plain,
+        )
+        .expect("a flash launch");
+        let mut want = zeros(m * G_ROW);
         q38.enqueue_out_gate(
             s,
             crate::q38::OutGateArgs {
                 attn: &plain,
-                qg,
+                qg: c.qg,
                 n_head: G_HEAD,
                 m,
                 fault: sink,
@@ -5378,10 +5715,11 @@ mod tests {
             },
         )
         .expect("the out gate");
-        s.synchronize().expect("the out gate's sync");
+        s.synchronize().expect("the chain's sync");
         let want_fault = gpu.take_fault().expect("the fault word");
-        let mut got = DeviceBuffer::<f32>::zeroed(s, m * G_ROW).expect("gated rows");
-        launch(sink, &mut got, Some(qg));
+        let mut got = zeros(m * G_ROW);
+        gated_launch(gpu, k, listed, c, (c.qg, Some(c.query)), sink, &mut got)
+            .expect("a flash launch");
         s.synchronize().expect("the gated flash's sync");
         let got_fault = gpu.take_fault().expect("the fault word");
         [
@@ -5390,22 +5728,29 @@ mod tests {
         ]
     }
 
-    /// The gated entries against their plain entry with `q38`'s out gate after it, over 40 rows
-    /// (three blocks of 16 positions, the last short) at counts across 300 keys, gates in
-    /// [-8, 8) and query halves of 1e6, which the gated store must not read: the `_p4` and the
-    /// `_p12_sel` (each row's list the keys below its count) gated outputs bit for bit the out
-    /// gate's; a NaN gate raises `f32_product` at the launch's layer in both, its value NaN and
-    /// every other bit the same; a short `qg` refused by name.
+    /// The gated entries against the chain they replace (the query norm, the
+    /// plain entry, `q38`'s out gate) over 40 rows (three blocks of 16
+    /// positions, the last short) at counts across 300 keys, raw queries in
+    /// [-2, 2) and gates in [-8, 8): the `_p4` and `_p12_sel` (each row's
+    /// list the keys below its count) gated outputs bit for bit the chain's;
+    /// a NaN gate raises `f32_product` at the launch's layer on both sides,
+    /// every bit the same; a position at or past the cache's height leaves
+    /// that row NaN and every other bit the same; a short `[q | gate]` buffer
+    /// refused by name.
+    // PIN(2026-10-26): `hw_gated_entries_are_the_flash_under_the_out_gate`
+    // became this test when the gated entries took the query norm: its
+    // chain gained the query norm, and the gate half's read is held by the
+    // bit comparison over query and gate values of different ranges.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
-    fn hw_gated_entries_are_the_flash_under_the_out_gate() {
+    fn hw_gated_entries_are_the_query_norm_flash_and_out_gate() {
         const LAYER: usize = 11;
         const M: usize = 40;
         const CTX: usize = 300;
         let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
         let s = gpu.stream();
         let k = FlashGqaPrefill::load(gpu.context()).expect("the prefill module");
-        let q38 = crate::q38::Q38Kernels::load(gpu.context()).expect("the q38 module");
+        let up = |v: &[f32]| DeviceBuffer::from_host(s, v).expect("an upload");
         // Multiples of 1/512 in [−1, 1): exact in f16.
         let plane = |mul: usize| -> DeviceBuffer<u16> {
             let p: Vec<u16> = (0..G_KV * CTX * HEAD_256)
@@ -5414,53 +5759,70 @@ mod tests {
             DeviceBuffer::from_host(s, &p).expect("a plane")
         };
         let (kc, vc) = (plane(37), plane(91));
-        let q: Vec<f32> = (0..M * G_ROW)
-            .map(|i| ((i * 53) % 1000) as f32 / 250.0 - 2.0)
+        let mut rows = vec![0.0f32; M * G_ROW * 2];
+        for r in 0..M * G_HEAD {
+            for d in 0..HEAD_256 {
+                let at = r * 2 * HEAD_256 + d;
+                rows[at] = ((r * 53 + d * 29) % 1000) as f32 / 250.0 - 2.0;
+                rows[at + HEAD_256] = ((r * 31 + d * 17) % 1024) as f32 / 64.0 - 8.0;
+            }
+        }
+        let gain: Vec<f32> = (0..HEAD_256).map(|d| 0.5 + (d % 7) as f32 / 7.0).collect();
+        let table: Vec<f32> = (0..CTX * ROPE_256)
+            .map(|i| ((i * 43) % 1000) as f32 / 500.0 - 1.0)
             .collect();
-        let q = DeviceBuffer::from_host(s, &q).expect("queries");
+        let (gain, table) = (up(&gain), up(&table));
         let counts: Vec<u32> = (0..M).map(|t| (1 + (t * 71) % CTX) as u32).collect();
         let nk = DeviceBuffer::from_host(s, &counts).expect("counts");
         let list: Vec<u32> = (0..M).flat_map(|_| 0..CTX as u32).collect();
         let list = DeviceBuffer::from_host(s, &list).expect("lists");
-        let mut gates = vec![1.0e6f32; M * G_ROW * 2];
-        for r in 0..M * G_HEAD {
-            for d in 0..HEAD_256 {
-                gates[r * 2 * HEAD_256 + HEAD_256 + d] =
-                    ((r * 31 + d * 17) % 1024) as f32 / 64.0 - 8.0;
-            }
-        }
-        let clean = DeviceBuffer::from_host(s, &gates).expect("gates");
+        let mut pos: Vec<u32> = (0..M).map(|t| ((t * 7) % CTX) as u32).collect();
+        let clean_pos = DeviceBuffer::from_host(s, &pos).expect("positions");
+        pos[9] = CTX as u32;
+        let bad_pos = DeviceBuffer::from_host(s, &pos).expect("positions");
+        let clean = up(&rows);
         // Row 5's head 3, value 7.
         let bad_at = (5 * G_HEAD + 3) * HEAD_256 + 7;
-        gates[(5 * G_HEAD + 3) * 2 * HEAD_256 + HEAD_256 + 7] = f32::NAN;
-        let bad = DeviceBuffer::from_host(s, &gates).expect("gates");
+        rows[(5 * G_HEAD + 3) * 2 * HEAD_256 + HEAD_256 + 7] = f32::NAN;
+        let nan_gate = up(&rows);
         let sink = gpu.layer_sink(LAYER).expect("a sink");
+        let base = Gated {
+            qg: &clean,
+            query: QueryNorm {
+                gain: &gain,
+                table: &table,
+                pos: &clean_pos,
+                eps: G_EPS,
+            },
+            kc: &kc,
+            vc: &vc,
+            n_keys: &nk,
+            list: &list,
+            ctx: CTX,
+        };
+        let nan_case = Gated {
+            qg: &nan_gate,
+            ..base
+        };
+        let pos_case = Gated {
+            query: QueryNorm {
+                pos: &bad_pos,
+                ..base.query
+            },
+            ..base
+        };
         for listed in [false, true] {
-            let at = |qg: &DeviceBuffer<f32>| {
-                gated_pair(
-                    &gpu,
-                    (&k, &q38),
-                    listed,
-                    (&q, &kc, &vc),
-                    (&nk, &list, CTX),
-                    qg,
-                    sink,
-                )
-            };
-            let [(want, wf), (got, gf)] = at(&clean);
+            let [(want, wf), (got, gf)] = gated_pair(&gpu, &k, listed, &base, sink);
             assert!(
                 wf.is_none() && gf.is_none(),
-                "listed={listed}: clean gates raised {wf:?} {gf:?}"
+                "listed={listed}: clean inputs raised {wf:?} {gf:?}"
             );
             assert!(
                 want.iter().all(|v| v.is_finite()),
                 "listed={listed}: a non-finite output"
             );
-            assert!(
-                same(&want, &got),
-                "listed={listed}: not the out gate's bits"
-            );
-            let [(want, wf), (got, gf)] = at(&bad);
+            assert!(same(&want, &got), "listed={listed}: not the chain's bits");
+            let [(want, wf), (got, gf)] = gated_pair(&gpu, &k, listed, &nan_case, sink);
             for f in [wf, gf] {
                 let f = f.expect("a NaN gate raises a fault");
                 assert!(
@@ -5476,32 +5838,65 @@ mod tests {
                 same(&want, &got),
                 "listed={listed}: a NaN gate moved another bit"
             );
+            let [(want, _), (got, _)] = gated_pair(&gpu, &k, listed, &pos_case, sink);
+            assert!(
+                got[9 * G_ROW..10 * G_ROW].iter().all(|v| v.is_nan()),
+                "listed={listed}: a position past the cache, not NaN"
+            );
+            assert!(
+                same(&want, &got),
+                "listed={listed}: a bad position moved another bit"
+            );
         }
-        let short = DeviceBuffer::<f32>::zeroed(s, M * G_ROW * 2 - 1).expect("short gates");
-        let mut y = DeviceBuffer::<f32>::zeroed(s, M * G_ROW).expect("rows");
-        let e = k
-            .enqueue_256_p4_gated(
-                s,
-                GqaPrefillArgs {
-                    q: &q,
-                    kc: &kc,
-                    vc: &vc,
-                    n_keys: &nk,
-                    scale: 0.0625,
-                    n_head: G_HEAD,
-                    n_kv: G_KV,
-                    ctx: CTX,
-                    t: M,
-                    fault: gpu.unlabelled_sink(),
-                    y: &mut y,
+        // Each of the gated launch's inputs one value short, refused by name
+        // before any launch by both entries.
+        let short = |n: usize| DeviceBuffer::<f32>::zeroed(s, n - 1).expect("a short buffer");
+        let short_qg = short(M * G_ROW * 2);
+        let (short_gain, short_table) = (short(HEAD_256), short(CTX * ROPE_256));
+        let short_pos = DeviceBuffer::<u32>::zeroed(s, M - 1).expect("short positions");
+        let cases = [
+            ("qg", &short_qg, base.query),
+            (
+                "gain",
+                &clean,
+                QueryNorm {
+                    gain: &short_gain,
+                    ..base.query
                 },
-                &short,
-            )
-            .expect_err("a short qg");
-        let e = e.to_string();
-        assert!(
-            e.contains("enqueue_256_p4_gated") && e.contains("qg"),
-            "a short qg: {e}"
-        );
+            ),
+            (
+                "table",
+                &clean,
+                QueryNorm {
+                    table: &short_table,
+                    ..base.query
+                },
+            ),
+            (
+                "pos",
+                &clean,
+                QueryNorm {
+                    pos: &short_pos,
+                    ..base.query
+                },
+            ),
+        ];
+        let mut y = DeviceBuffer::<f32>::zeroed(s, M * G_ROW).expect("rows");
+        for (name, qg, query) in cases {
+            for listed in [false, true] {
+                let fault = gpu.unlabelled_sink();
+                let r = gated_launch(&gpu, &k, listed, &base, (qg, Some(query)), fault, &mut y);
+                let e = r.expect_err("a short input").to_string();
+                let entry = if listed {
+                    "enqueue_256_p12_sel_gated"
+                } else {
+                    "enqueue_256_p4_gated"
+                };
+                assert!(
+                    e.contains(entry) && e.contains(&format!("{name}.len()")),
+                    "listed={listed}: short {name}: {e}"
+                );
+            }
+        }
     }
 }

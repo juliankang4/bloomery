@@ -186,7 +186,8 @@ pub(super) struct Qsa38 {
     pub(super) qg: DeviceBuffer<f32>,
     pub(super) k: DeviceBuffer<f32>,
     pub(super) v: DeviceBuffer<f32>,
-    /// The normed and turned queries.
+    /// The normed and turned queries: a pass's rows, none in a ubatch walk's
+    /// arena (its flashes norm and turn the queries they read).
     pub(super) q: DeviceBuffer<f32>,
     /// The flash's partials, over a list's width: a pass's rows, none in a
     /// ubatch walk's arena (its listed prefill flash takes none).
@@ -273,8 +274,8 @@ impl Arena38 {
     /// A ubatch walk's arena for up to `rows` (1..=`most`) tokens over caches
     /// of `ctx` positions: every token-major buffer for `rows` tokens, the
     /// selection's scratch for a run of [`select_run`] rows (its selecting
-    /// rows run in runs of that many) and no selected-flash partials or
-    /// output, the router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
+    /// rows run in runs of that many) and no selected-flash queries, partials
+    /// or output, the router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
     /// Load-time only.
     pub(super) fn wide(
         stream: &CudaStream,
@@ -302,7 +303,8 @@ impl Arena38 {
     }
 
     /// The buffers for `rows` tokens, the selection's for `sel` rows and the
-    /// selected flash's partials and output for `parts`, the router's `route`.
+    /// selected flash's queries, partials and output for `parts`, the
+    /// router's `route`.
     fn alloc(
         stream: &CudaStream,
         rows: usize,
@@ -341,7 +343,7 @@ impl Arena38 {
                 qg: f(geo::Q_ROWS)?,
                 k: f(geo::KV)?,
                 v: f(geo::KV)?,
-                q: f(geo::ATTN)?,
+                q: DeviceBuffer::zeroed(stream, parts * geo::ATTN)?,
                 part_v: DeviceBuffer::zeroed(
                     stream,
                     listed_partials_v_len_256(parts, geo::N_HEAD, width),

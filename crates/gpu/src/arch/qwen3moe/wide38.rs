@@ -177,7 +177,7 @@ use crate::card_leg::{RouteW, StackW};
 use crate::card_slots::CardAcc;
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaListArgs;
-use crate::flash_gqa_prefill::GqaPrefillArgs;
+use crate::flash_gqa_prefill::{GqaPrefillArgs, QueryNorm};
 use crate::gemm::{
     GateUp32Args, Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute,
     GemmWeight, MmaForm,
@@ -2563,7 +2563,9 @@ fn qsa(
     )?;
     dense_gemm(c, &qp.idx_q, act, table, &mut q.qi)?;
     // The selecting store is f16 (the qwen38 family's stores carry no q8_0
-    // form), so the family's shared append runs its f16 arm.
+    // form), so the family's shared append runs its f16 arm, over the key
+    // heads alone: the flashes norm and turn the query heads they read
+    // (`QueryNorm`).
     let (kcache, vcache) = kv.f16_mut("qwen38::wide")?;
     // SAFETY: the per-sequence embedding supplies distinct cache-valid positions.
     unsafe {
@@ -2579,7 +2581,7 @@ fn qsa(
                 table: c.table,
                 pos: &u.pos,
                 eps: c.eps,
-                n_head: geo::N_HEAD,
+                n_head: 0,
                 n_kv: geo::N_KV,
                 ctx,
                 m,
@@ -2590,9 +2592,10 @@ fn qsa(
         )
     }?;
     let (kcache, vcache) = kv.f16("qwen38::wide")?;
-    // The arena's queries hold the unit's row `r` at their row `r`; the cut
-    // unit's row `r` is the unit's row `t0 + r`, and the gated flash writes
-    // it at row `r` of `attn`, the output projection's input.
+    let gq = f32_gain(w, &qp.q_norm)?;
+    // The arena's `[q | gate]` rows hold the unit's row `r` at their row
+    // `r`; the cut unit's row `r` is the unit's row `t0 + r`, and the gated
+    // flash writes it at row `r` of `attn`, the output projection's input.
     let t0 = m
         .checked_sub(keep)
         .ok_or_else(|| GpuError::shape(WHAT, format!("a unit of {m} rows keeping {keep}")))?;
@@ -2603,21 +2606,21 @@ fn qsa(
     }
     if dense > 0 {
         // SAFETY: rows t0 .. t0 + dense <= t0 + m (the unit's rows before the
-        // cut) of the queries and their `[q | gate]` rows (`rows` rows each),
-        // and rows 0 .. dense of the cut unit's counts and of `attn` (`m`
-        // rows); they stay in place for the launch.
-        let (qw, gw, nw, mut yw) = unsafe {
+        // cut) of the `[q | gate]` rows (`rows` rows), and rows 0 .. dense of
+        // the cut unit's counts, positions and `attn` (`m` rows); they stay
+        // in place for the launch.
+        let (gw, nw, pw, mut yw) = unsafe {
             (
-                f32_view(&q.q, t0 * geo::ATTN, dense * geo::ATTN),
                 f32_view(&q.qg, t0 * geo::Q_ROWS, dense * geo::Q_ROWS),
                 param_view::<u32>(&u.n_keys, 0, dense),
+                param_view::<u32>(&u.pos, 0, dense),
                 f32_view(attn, 0, dense * geo::ATTN),
             )
         };
         c.k.prefill.enqueue_256_p4_gated(
             stream,
             GqaPrefillArgs {
-                q: &qw,
+                q: &gw,
                 kc: kcache,
                 vc: vcache,
                 n_keys: &nw,
@@ -2629,7 +2632,12 @@ fn qsa(
                 fault: sink,
                 y: &mut yw,
             },
-            &gw,
+            QueryNorm {
+                gain: gq,
+                table: c.table,
+                pos: &pw,
+                eps: c.eps,
+            },
         )?;
     }
     let (width, run) = (q.sel.width(), q.sel.rows());
@@ -2639,16 +2647,15 @@ fn qsa(
         let n = run.min(m - r);
         let at = t0 + r;
         // SAFETY: rows at .. at + n <= t0 + m (the unit's rows before the
-        // cut) of the indexer queries, the queries and their `[q | gate]`
-        // rows (`rows` rows each), and rows r .. r + n <= m of the cut unit's
-        // counts and of `attn` (`m` rows); they stay in place for this run's
-        // launches.
-        let (qi, nw, qw, gw, mut yw) = unsafe {
+        // cut) of the indexer queries and the `[q | gate]` rows (`rows` rows
+        // each), and rows r .. r + n <= m of the cut unit's counts, positions
+        // and `attn` (`m` rows); they stay in place for this run's launches.
+        let (qi, nw, gw, pw, mut yw) = unsafe {
             (
                 f32_view(&q.qi, at * idx, n * idx),
                 param_view::<u32>(&u.n_keys, r, n),
-                f32_view(&q.q, at * geo::ATTN, n * geo::ATTN),
                 f32_view(&q.qg, at * geo::Q_ROWS, n * geo::Q_ROWS),
+                param_view::<u32>(&u.pos, r, n),
                 f32_view(attn, r * geo::ATTN, n * geo::ATTN),
             )
         };
@@ -2671,7 +2678,7 @@ fn qsa(
         c.k.prefill.enqueue_256_p12_sel_gated(
             stream,
             GqaListArgs {
-                q: &qw,
+                q: &gw,
                 kc: kcache,
                 vc: vcache,
                 list: &q.sel.list,
@@ -2685,7 +2692,12 @@ fn qsa(
                 y: &mut yw,
             },
             geo::N_HEAD,
-            &gw,
+            QueryNorm {
+                gain: gq,
+                table: c.table,
+                pos: &pw,
+                eps: c.eps,
+            },
         )?;
         r += n;
     }

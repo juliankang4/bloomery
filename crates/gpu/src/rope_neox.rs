@@ -379,6 +379,70 @@ unsafe fn norm_partial_append<
     };
 }
 
+/// The scale `norm_partial_append` takes for a query head at (`HEAD_256`,
+/// `ROT_256`), worked by one warp: the head's values start at `x[src]`, and
+/// the warp stands in for the block's `WARPS_256` warps in turn, lane `l`
+/// squaring the pair thread `32·w + l` owns ([`owned_pair`]), each warp's
+/// sum by the same butterfly and the sums added in warp order, so the scale
+/// is that block's bit for bit and every lane holds it. A refused scale
+/// raises [`FaultSite::F32Product`] from lane 0, as the block's thread 0.
+///
+/// SAFETY: `src + HEAD_256 <= x.len()`, and every lane of the warp calls it.
+#[inline(always)]
+pub(crate) unsafe fn query_scale_256(x: &[f32], src: usize, eps: f32, fault: FaultSink) -> f32 {
+    let lane = warp::lane_id() as usize;
+    let mut sum = 0.0f64;
+    for w in 0..WARPS_256 {
+        cuda_device::thread::__unroll_config::<0>();
+        let (i0, i1) = owned_pair(HEAD_256, ROT_256, 32 * w + lane);
+        // SAFETY: i0 < HEAD_256 and src + HEAD_256 <= x.len() (the caller's).
+        let x0 = unsafe { *x.get_unchecked(src + i0) };
+        // SAFETY: i1 < HEAD_256, as i0.
+        let x1 = unsafe { *x.get_unchecked(src + i1) };
+        let acc = crate::latent::warp_sum_f64(f64::from(x0 * x0) + f64::from(x1 * x1));
+        sum = if w == 0 { acc } else { sum + acc };
+    }
+    let mean = (sum / HEAD_256 as f64) as f32;
+    rms_scale_of_mean_checked(mean, eps, fault, lane == 0)
+}
+
+/// Value `d` that `norm_partial_append` writes for the query head whose
+/// values start at `x[src]`, under its scale ([`query_scale_256`]): `(scale
+/// · gain[d]) · x[d]`, and below `ROT_256` the member of its NEOX pair `(i,
+/// i + ROT_256/2)` that [`neox_pair`] turns by pair `i` of the table's row
+/// `p`.
+///
+/// SAFETY: `src + HEAD_256 <= x.len()`, `d < HEAD_256 <= gain.len()`, and
+/// `(p + 1)·ROT_256 <= table.len()`.
+#[inline(always)]
+pub(crate) unsafe fn query_value_256(
+    (x, src): (&[f32], usize),
+    d: usize,
+    scale: f32,
+    gain: &[f32],
+    (table, p): (&[f32], usize),
+) -> f32 {
+    const HALF: usize = ROT_256 / 2;
+    let normed = |i: usize| {
+        // SAFETY: i < HEAD_256 <= gain.len() (the caller's).
+        let g = unsafe { *gain.get_unchecked(i) };
+        // SAFETY: i < HEAD_256 and src + HEAD_256 <= x.len() (the caller's).
+        let v = unsafe { *x.get_unchecked(src + i) };
+        (scale * g) * v
+    };
+    if d >= ROT_256 {
+        return normed(d);
+    }
+    let i = d % HALF;
+    // SAFETY: 2·i + 1 < ROT_256: inside row p of the table (the caller's).
+    let c = unsafe { *table.get_unchecked(p * ROT_256 + 2 * i) };
+    // SAFETY: p·ROT_256 + 2·i + 1 < (p + 1)·ROT_256 <= table.len() (the
+    // caller's).
+    let s = unsafe { *table.get_unchecked(p * ROT_256 + 2 * i + 1) };
+    let (y0, y1) = neox_pair(normed(i), normed(i + HALF), c, s);
+    if d < HALF { y0 } else { y1 }
+}
+
 /// The norm, NEOX turn and append of [`rope_neox_kernels::head_norm_neox_append`]
 /// into a cache in the format `S`: that entry's block geometry (block
 /// `b = t·(n_head + n_kv) + h` of `HEAD/2` threads), numeric contract,

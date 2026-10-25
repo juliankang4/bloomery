@@ -82,7 +82,7 @@ use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
 use crate::hybrid::HOST;
 use crate::q8f32::{Bf16Words, RowValues};
 use crate::route_core::sigmoid;
-use crate::{GpuError, launch_u32};
+use crate::{GpuError, launch_u32, short};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
 use cuda_device::{
@@ -1089,17 +1089,6 @@ pub struct KeyAppendArgs<'a> {
     pub ctx: usize,
     pub fault: FaultSink,
     pub raw: &'a mut DeviceBuffer<u16>,
-}
-
-/// A buffer shorter than a launch reads or writes, named.
-fn short(what: &'static str, lens: &[(&str, usize, usize)]) -> Result<(), GpuError> {
-    match lens.iter().find(|(_, got, need)| got < need) {
-        Some((name, got, need)) => Err(GpuError::shape(
-            what,
-            format!("{name}.len() {got} < {need}"),
-        )),
-        None => Ok(()),
-    }
 }
 
 /// A launch of `n` threads in blocks of [`THREADS`].
