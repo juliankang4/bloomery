@@ -178,16 +178,11 @@ impl LoadPlan {
                 .checked_add(staged)
                 .ok_or_else(|| refused("the parts' staging bytes pass usize".into()))?;
             // Packing capacity and scale copies coexist with the entire run's read results.
-            let cost = source
-                .read_bytes(p)
-                .map_err(|e| refused(e.to_string()))?
-                .checked_add(
-                    (staged as u64).checked_mul(2).ok_or_else(|| {
-                        refused(format!("{}: packing bytes pass u64", p.info.name))
-                    })?,
-                )
-                .ok_or_else(|| refused(format!("{}: read-ahead bytes pass u64", p.info.name)))?;
-            costs.push(cost);
+            let read = source.read_bytes(p).map_err(|e| refused(e.to_string()))?;
+            let packing = (staged as u64)
+                .checked_mul(2)
+                .ok_or_else(|| refused(format!("{}: packing bytes pass u64", p.info.name)))?;
+            costs.push((read, packing));
         }
         let mut runs = Vec::new();
         let mut host_bytes = 0;
@@ -578,8 +573,28 @@ mod tests {
         let source =
             Split::header_only(std::path::PathBuf::from("/synthetic/falling-room"), &layout)
                 .unwrap();
+        let shared =
+            LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 296 * mib).unwrap();
+        assert_eq!(shared.runs, [(0..2, 200 * mib)]);
+        assert_eq!(shared.host_bytes, 296 * mib);
+        shared.check(296 * mib).unwrap();
+        assert!(shared.check(296 * mib - 1).is_err());
+        assert!(
+            shared
+                .checked_runs(|| Ok(200 * mib))
+                .next()
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            shared
+                .checked_runs(|| Ok(200 * mib - 1))
+                .next()
+                .unwrap()
+                .is_err()
+        );
         let plan =
-            LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 300 * mib).unwrap();
+            LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 288 * mib).unwrap();
         assert_eq!(plan.runs, [(0..1, 192 * mib), (1..2, 24 * mib)]);
         assert_eq!(plan.host_bytes, 288 * mib);
         plan.check(300 * mib).unwrap();

@@ -161,8 +161,13 @@ pub struct Planned {
 
 /// One read's leading parts, bounded by normalized payload and owned host room. An oversized
 /// first part runs alone; the caller checks its returned peak before allocating it.
-/// `costs` holds each already-checked part's owned read and packing bytes.
-pub fn read_ahead(planned: &[Planned], costs: &[u64], room: u64) -> Result<(usize, u64), Error> {
+/// `costs` holds each part's owned read peak and serial packing peak. Reads coexist;
+/// packing holds only one part's buffers at a time.
+pub fn read_ahead(
+    planned: &[Planned],
+    costs: &[(u64, u64)],
+    room: u64,
+) -> Result<(usize, u64), Error> {
     const PAYLOAD: u64 = 8 << 30;
     if planned.len() != costs.len() {
         return Err(refuse(
@@ -171,9 +176,14 @@ pub fn read_ahead(planned: &[Planned], costs: &[u64], room: u64) -> Result<(usiz
         ));
     }
     let (mut n, mut bytes, mut payload) = (0, 0u64, 0u64);
-    for (p, &cost) in planned.iter().zip(costs) {
-        let next = bytes
-            .checked_add(cost)
+    let (mut reads, mut packing) = (0u64, 0u64);
+    for (p, &(read, pack)) in planned.iter().zip(costs) {
+        let next_reads = reads
+            .checked_add(read)
+            .ok_or_else(|| refuse(&p.info.name, "read-ahead bytes pass u64"))?;
+        let next_packing = packing.max(pack);
+        let next = next_reads
+            .checked_add(next_packing)
             .ok_or_else(|| refuse(&p.info.name, "read-ahead bytes pass u64"))?;
         let more = payload
             .checked_add(p.info.nbytes)
@@ -181,7 +191,7 @@ pub fn read_ahead(planned: &[Planned], costs: &[u64], room: u64) -> Result<(usiz
         if n > 0 && (more > PAYLOAD || next > room) {
             break;
         }
-        (bytes, payload) = (next, more);
+        (reads, packing, bytes, payload) = (next_reads, next_packing, next, more);
         n += 1;
         if payload > PAYLOAD || bytes > room {
             break;
@@ -400,35 +410,40 @@ mod tests {
         let gib = 1u64 << 30;
         let parts = [part(3 * gib), part(5 * gib), part(4)];
         assert_eq!(
-            read_ahead(&parts, &[6 * gib, 10 * gib, 8], 16 * gib).unwrap(),
+            read_ahead(&parts, &[(6 * gib, 0), (10 * gib, 0), (8, 0)], 16 * gib).unwrap(),
             (2, 16 * gib)
         );
         assert_eq!(
-            read_ahead(&parts, &[6 * gib, 10 * gib, 8], 16 * gib - 1).unwrap(),
+            read_ahead(&parts, &[(6 * gib, 0), (10 * gib, 0), (8, 0)], 16 * gib - 1).unwrap(),
             (1, 6 * gib)
         );
         assert_eq!(
-            read_ahead(&[part(9 * gib), part(4)], &[9 * gib, 4], 20 * gib).unwrap(),
+            read_ahead(&[part(9 * gib), part(4)], &[(9 * gib, 0), (4, 0)], 20 * gib).unwrap(),
             (1, 9 * gib)
         );
         assert_eq!(
-            read_ahead(&[part(gib)], &[2 * gib], gib).unwrap(),
+            read_ahead(&[part(gib)], &[(gib, gib)], gib).unwrap(),
             (1, 2 * gib)
         );
         assert_eq!(read_ahead(&[], &[], 0).unwrap(), (0, 0));
         let small = vec![part(32 << 20); 256];
-        let costs = vec![192 << 20; 256];
+        let costs = vec![(128 << 20, 64 << 20); 256];
         assert_eq!(
             read_ahead(&small, &costs, (1024 - 96) << 20).unwrap(),
-            (4, 768 << 20)
+            (6, 832 << 20)
         );
         assert_eq!(
             read_ahead(&small, &costs, 48 * gib).unwrap(),
-            (256, 48 * gib)
+            (256, 32 * gib + (64 << 20))
         );
         assert!(read_ahead(&parts, &[], gib).is_err());
-        assert!(read_ahead(&[part(4), part(4)], &[1, u64::MAX], u64::MAX).is_err());
-        assert!(read_ahead(&[part(4), part(u64::MAX)], &[1, 1], u64::MAX).is_err());
+        let small = [part(4), part(4), part(4)];
+        let costs = [(1, 2), (1, 8), (1, 4)];
+        assert_eq!(read_ahead(&small, &costs, 10).unwrap(), (2, 10));
+        assert_eq!(read_ahead(&small, &costs, 9).unwrap(), (1, 3));
+        assert!(read_ahead(&small[..2], &[(1, 0), (u64::MAX, 0)], u64::MAX).is_err());
+        assert!(read_ahead(&small[..1], &[(1, u64::MAX)], u64::MAX).is_err());
+        assert!(read_ahead(&[part(4), part(u64::MAX)], &[(1, 0), (1, 0)], u64::MAX).is_err());
     }
 
     #[test]
