@@ -8678,6 +8678,7 @@ mod gate {
                 (16, 14, 64, Native::Tiny),
                 (16, 14, 64, Native::Varied),
                 (16, 14, 192, Native::Varied),
+                (16, 14, 448, Native::Varied),
                 (16, 3, 64, Native::Refused),
                 (
                     16,
@@ -9008,6 +9009,7 @@ mod gate {
                 (64usize, 64usize, 9usize, false, None),
                 (128, 128, 50, true, None),
                 (64, 192, 23, false, None),
+                (64, 448, 23, false, None),
                 (192, 256, 37, false, Some(5usize)),
                 (640, 2560, 131, false, None),
             ] {
