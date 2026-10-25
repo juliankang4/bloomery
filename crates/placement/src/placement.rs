@@ -2664,10 +2664,6 @@ fn plan_rule<'a>(
     let mut rows: Vec<Option<Row>> = vec![None; model.tensors.len()];
     let mut stacks: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
     for (i, t) in model.tensors.iter().enumerate() {
-        // A never-loaded tensor's shape is nothing a card must take.
-        if let Some(format) = model.card_format(t).filter(|_| t.role != Role::Unused) {
-            card_bytes(t, format, rows_of(t))?;
-        }
         if t.role == Role::RoutedExperts {
             stacks[layer_of(t, model.layers)?].push(i);
         } else {
@@ -5167,6 +5163,84 @@ mod tests {
                 "{n_l:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_card_uploads_require_the_card_layout() {
+        for width in [64, 160] {
+            for (role, embedding, device) in [
+                (Role::EngramTable, false, Device::Nvme),
+                (Role::HashTable, false, Device::Host),
+                (Role::TokenEmbedding, false, Device::Host),
+                (Role::Unread, false, Device::Unused),
+                (Role::Unused, false, Device::Unused),
+                (Role::Attention, false, Device::Card(0)),
+                (Role::TokenEmbedding, true, Device::Card(0)),
+            ] {
+                let mut model = layered(1);
+                model.tensors[0] = ModelTensor {
+                    name: "rows.weight".into(),
+                    shard: 0,
+                    layer: (role != Role::TokenEmbedding).then_some(0),
+                    role,
+                    ty: GgmlType::NVFP4_ROWS,
+                    dims: vec![width, 5],
+                    file_bytes: width / 16 * 9 * 5,
+                    gathered_rows: Some(1),
+                };
+                let machine = Machine {
+                    cards: vec![Card {
+                        usable_bytes: 1 << 30,
+                        ..card("card", 0..1, true, embedding)
+                    }],
+                    tiers: Vec::new(),
+                    nodes: vec![Node {
+                        host: host(),
+                        unified: None,
+                    }],
+                };
+                let planned = plan_with(&model, &machine, 4096, &NoKv, None);
+                if width == 160 && device == Device::Card(0) {
+                    let error = planned
+                        .expect_err("the upload needs whole card blocks")
+                        .to_string();
+                    assert!(error.contains("rows.weight"), "{error}");
+                    assert!(error.contains("Nvfp4Planes upload refuses"), "{error}");
+                } else {
+                    let plan = planned.unwrap_or_else(|e| panic!("{role:?} {width}: {e}"));
+                    assert_eq!(plan.rows[0].segments[0].device, device);
+                }
+            }
+        }
+        // A routed stack the host planner keeps whole on the host takes no
+        // card layout, while the expert rule's card segments of it are refused.
+        let mut model = layered(1);
+        model.tensors[1] = ModelTensor {
+            ty: GgmlType::NVFP4_ROWS,
+            dims: vec![160, 4, 8],
+            file_bytes: 160 / 16 * 9 * 4 * 8,
+            ..model.tensors[1].clone()
+        };
+        let machine = Machine {
+            cards: vec![Card {
+                usable_bytes: 1 << 30,
+                ..card("card", 0..1, true, true)
+            }],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
+        };
+        let plan = plan_host_routed(&model, &machine, 4096, &NoKv, &PlanLevers::default())
+            .unwrap_or_else(|e| panic!("host-routed 160: {e}"));
+        let devices: Vec<Device> = plan.rows[1].segments.iter().map(|s| s.device).collect();
+        assert_eq!(devices, vec![Device::Host]);
+        let error = plan_with(&model, &machine, 4096, &NoKv, None)
+            .expect_err("card experts need whole card blocks")
+            .to_string();
+        assert!(error.contains("experts 0"), "{error}");
+        assert!(error.contains("Nvfp4Planes upload refuses"), "{error}");
     }
 
     /// A model of 4 layers with every role's bf16 tensor (an attention
