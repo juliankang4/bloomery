@@ -7734,11 +7734,11 @@ mod tests {
     }
 
     /// The row room counts the pages a row sits on, in the host's base page:
-    /// a 90 B row sits on two pages of 4,096 B and on two of 16,384 B (it
-    /// straddles a page boundary in both), so the room of a call of 4,096
-    /// positions reading 16 rows a position is 4,096 · 16 · 2 · page —
+    /// a 90 B row can straddle a page boundary at 4, 16 or 64 KiB, so the
+    /// room of a call of 4,096 positions reading 16 rows a position is
+    /// 4,096 · 16 · 2 · page —
     /// 536,870,912 B on this workstation's page and 2,147,483,648 B on the
-    /// 16 KiB one.
+    /// 16 KiB one, and 8,589,934,592 B on the 64 KiB one.
     #[test]
     fn the_row_room_counts_the_hosts_base_page() {
         let model = ModelTensors {
@@ -7761,6 +7761,7 @@ mod tests {
             let room = |page| row_room(&model, 4096, page, source).expect("the row room");
             assert_eq!(room(4096), 536_870_912);
             assert_eq!(room(16384), 2_147_483_648);
+            assert_eq!(room(65536), 8_589_934_592);
         }
 
         let mut model = model;
@@ -7788,7 +7789,7 @@ mod tests {
             (RowTableSource::Split, 536_870_912),
             (RowTableSource::Parts, 1_073_741_824),
         ] {
-            for page in [4096, 16384] {
+            for page in [4096, 16384, 65536] {
                 assert_eq!(
                     row_room(&model, 4096, page, source).unwrap(),
                     want * (page / 4096)

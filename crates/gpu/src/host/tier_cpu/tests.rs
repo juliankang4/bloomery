@@ -17,7 +17,9 @@ use model::placement::{
 #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
 fn hw_held_node_nvme_host_run_keeps_eager_and_captured_rows() {
     for act in [TierAct::F32, TierAct::Q8] {
-        node_nvme_host_run(crate::census().unwrap(), true, act);
+        for evict in [NvTierEvict::Tick, NvTierEvict::Heat] {
+            node_nvme_host_run(crate::census().unwrap(), true, act, evict);
+        }
     }
 }
 
@@ -37,6 +39,7 @@ fn node_nvme_host_budget_keeps_the_os_reserve() {
         }],
         false,
         TierAct::F32,
+        NvTierEvict::Tick,
     );
 }
 
@@ -44,6 +47,7 @@ fn node_nvme_host_run(
     census: Vec<model::placement::devices::DeviceInfo>,
     hardware: bool,
     act: TierAct,
+    evict: NvTierEvict,
 ) {
     const WIDTH: usize = 256;
     const ROW_BYTES: usize = 34 * WIDTH / 32;
@@ -259,7 +263,7 @@ fn node_nvme_host_run(
                     false,
                     paging.arena,
                     ArenaKind::Anon,
-                    NvTierEvict::Tick,
+                    evict,
                 )
                 .unwrap()
                 .unwrap(),
@@ -311,7 +315,12 @@ fn node_nvme_host_run(
                     * (1u32 << (i / 128)) as f32
             })
             .collect();
-        let selected = [0, 1, (EXPERTS - 2) as u32, super::super::slots::HOST];
+        let selected = [
+            0,
+            (EXPERTS - 2) as u32,
+            (EXPERTS - 2) as u32,
+            super::super::slots::HOST,
+        ];
         let mut expected = vec![123.0f32; 4 * WIDTH];
         for col in 0..2 {
             let x = Tensor2 {
@@ -402,12 +411,45 @@ fn node_nvme_host_run(
                 },
             )
         };
+        enqueue().unwrap();
+        gpu.stream().synchronize().unwrap();
+        let check_counts = |counts: [(u32, f64); 3]| {
+            for (id, want) in counts {
+                match (evict, tier.route_count(0, id)) {
+                    (NvTierEvict::Heat, Some(actual)) => assert!(
+                        (actual - want).abs() <= 1e-12 * want.abs(),
+                        "{act:?} {evict:?}: expert {id}: {actual} != {want}"
+                    ),
+                    (NvTierEvict::Tick, None) => {}
+                    (_, count) => panic!("{evict:?}: unexpected routing count {count:?}"),
+                }
+            }
+        };
+        let decay = (-1.0f64 / 32.0).exp2();
+        check_counts([(1, 0.0), (2, 0.0), (127, 1.0 + decay)]);
         for _ in 0..64 {
             enqueue().unwrap();
         }
         gpu.stream().synchronize().unwrap();
         let graph = Graph::capture(gpu.stream(), |_| enqueue()).unwrap();
         drop(enqueue);
+        let before = [1, 2, 127].map(|id| (id, tier.route_count(0, id).unwrap_or(0.0)));
+        experts
+            .enqueue_layer(
+                &gpu,
+                &weights,
+                0,
+                TierIo {
+                    act: input_view,
+                    sel: &host,
+                    rows: &mut out,
+                    cols: 2,
+                },
+            )
+            .unwrap();
+        gpu.stream().synchronize().unwrap();
+        experts.check().unwrap();
+        check_counts(before.map(|(id, count)| (id, count * (-2.0f64 / 32.0).exp2())));
         for round in 0..3 {
             if round != 0 {
                 assert!(tier.release(0, (EXPERTS - 1) as u32).unwrap() > 0);

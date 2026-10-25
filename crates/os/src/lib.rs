@@ -1291,6 +1291,7 @@ mod tests {
         // A page the row room cannot count in is refused by name.
         assert_eq!(super::counted_page(4096).expect("4 KiB counts"), 4096);
         assert_eq!(super::counted_page(16384).expect("16 KiB counts"), 16384);
+        assert_eq!(super::counted_page(65536).expect("64 KiB counts"), 65536);
         for bad in [0u64, 1, 3000, 4095, 5000] {
             let why = super::counted_page(bad).expect_err("the page cannot be counted in");
             assert!(why.to_string().contains(&bad.to_string()), "{why}");
