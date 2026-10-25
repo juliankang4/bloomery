@@ -38,10 +38,12 @@
 //!   prefill flash over each row's list in runs of the arena's selection rows
 //!   (`scratch38::select_run`: as many as the plan's selection bytes hold at
 //!   the load's cache) from the first row that selects; the pool pass over every row first, so a pool some row of the
-//!   unit completes is written before any row selects;
+//!   unit completes is written before any row selects; both flashes store
+//!   each value under its sigmoid gate (the `_gated` entries, the out gate
+//!   in the flash's store);
 //! - the conv, the delta step (the committed lane, in place), the gated
 //!   norm, the PLE gate and conv, the key append, the rope with the cache
-//!   append, the out gate and the gated sum the launches the other walks
+//!   append and the gated sum the launches the other walks
 //!   run, which take any row count;
 //! - every routed expert the host union over the unit's columns.
 //!
@@ -195,7 +197,7 @@ use crate::ple::{PleConvArgs, PleGateArgs};
 use crate::prompt_timing::Mark;
 use crate::q38::{
     CardSharedAddArgs, CardSumSharedAddArgs, CardTierAccArgs, EmbedArgs, EmbedRows, KeyAppendArgs,
-    OutGateArgs, SLOTS, SharedAddArgs, W_PITCH,
+    SLOTS, SharedAddArgs, W_PITCH,
 };
 use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
@@ -2493,7 +2495,6 @@ fn qsa(
     let Arena38 {
         mixed,
         qsa: q,
-        flash,
         attn,
         ..
     } = s;
@@ -2558,8 +2559,9 @@ fn qsa(
         )
     }?;
     let (kcache, vcache) = kv.f16("qwen38::wide")?;
-    // The arena's queries and the flash's output hold the unit's row `r` at
-    // their row `r`; the cut unit's row `r` is the unit's row `t0 + r`.
+    // The arena's queries hold the unit's row `r` at their row `r`; the cut
+    // unit's row `r` is the unit's row `t0 + r`, and the gated flash writes
+    // it at row `r` of `attn`, the output projection's input.
     let t0 = m
         .checked_sub(keep)
         .ok_or_else(|| GpuError::shape(WHAT, format!("a unit of {m} rows keeping {keep}")))?;
@@ -2570,17 +2572,18 @@ fn qsa(
     }
     if dense > 0 {
         // SAFETY: rows t0 .. t0 + dense <= t0 + m (the unit's rows before the
-        // cut) of the queries and the flash's output (`rows` rows each) and
-        // rows 0 .. dense of the cut unit's counts (`m` rows); they stay in
-        // place for the launch.
-        let (qw, nw, mut yw) = unsafe {
+        // cut) of the queries and their `[q | gate]` rows (`rows` rows each),
+        // and rows 0 .. dense of the cut unit's counts and of `attn` (`m`
+        // rows); they stay in place for the launch.
+        let (qw, gw, nw, mut yw) = unsafe {
             (
                 f32_view(&q.q, t0 * geo::ATTN, dense * geo::ATTN),
+                f32_view(&q.qg, t0 * geo::Q_ROWS, dense * geo::Q_ROWS),
                 param_view::<u32>(&u.n_keys, 0, dense),
-                f32_view(flash, t0 * geo::ATTN, dense * geo::ATTN),
+                f32_view(attn, 0, dense * geo::ATTN),
             )
         };
-        c.k.prefill.enqueue_256_p4(
+        c.k.prefill.enqueue_256_p4_gated(
             stream,
             GqaPrefillArgs {
                 q: &qw,
@@ -2595,6 +2598,7 @@ fn qsa(
                 fault: sink,
                 y: &mut yw,
             },
+            &gw,
         )?;
     }
     let (width, run) = (q.sel.width(), q.sel.rows());
@@ -2604,15 +2608,17 @@ fn qsa(
         let n = run.min(m - r);
         let at = t0 + r;
         // SAFETY: rows at .. at + n <= t0 + m (the unit's rows before the
-        // cut) of the indexer queries, the queries and the flash's output
-        // (`rows` rows each) and rows r .. r + n <= m of the cut unit's
-        // counts (`m` rows); they stay in place for this run's launches.
-        let (qi, nw, qw, mut yw) = unsafe {
+        // cut) of the indexer queries, the queries and their `[q | gate]`
+        // rows (`rows` rows each), and rows r .. r + n <= m of the cut unit's
+        // counts and of `attn` (`m` rows); they stay in place for this run's
+        // launches.
+        let (qi, nw, qw, gw, mut yw) = unsafe {
             (
                 f32_view(&q.qi, at * idx, n * idx),
                 param_view::<u32>(&u.n_keys, r, n),
                 f32_view(&q.q, at * geo::ATTN, n * geo::ATTN),
-                f32_view(flash, at * geo::ATTN, n * geo::ATTN),
+                f32_view(&q.qg, at * geo::Q_ROWS, n * geo::Q_ROWS),
+                f32_view(attn, r * geo::ATTN, n * geo::ATTN),
             )
         };
         c.k.qsa.enqueue_select(
@@ -2631,7 +2637,7 @@ fn qsa(
                 scratch: &mut q.sel,
             },
         )?;
-        c.k.prefill.enqueue_256_p12_sel(
+        c.k.prefill.enqueue_256_p12_sel_gated(
             stream,
             GqaListArgs {
                 q: &qw,
@@ -2648,23 +2654,10 @@ fn qsa(
                 y: &mut yw,
             },
             geo::N_HEAD,
+            &gw,
         )?;
         r += n;
     }
-    let f32s = size_of::<f32>();
-    let rows = Window::<f32>::of(flash, t0 * geo::ATTN * f32s, m * geo::ATTN)?;
-    let qg = Window::<f32>::of(&q.qg, t0 * geo::Q_ROWS * f32s, m * geo::Q_ROWS)?;
-    c.k.q38.enqueue_out_gate(
-        stream,
-        OutGateArgs {
-            attn: &rows,
-            qg: &qg,
-            n_head: geo::N_HEAD,
-            m,
-            fault: sink,
-            y: &mut *attn,
-        },
-    )?;
     quantize_for(c, &[&qp.out], (attn, m), &mut x.act_attn, sink)?;
     let table = &x.dense[u.route];
     dense_gemm(c, &qp.out, (attn, &x.act_attn, m), table, &mut u.y)?;

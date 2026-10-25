@@ -230,7 +230,9 @@ pub(super) struct Arena38 {
     /// The mixer's rows before the output projection: the gated norm's, or
     /// the attention's under its gate.
     pub(super) attn: DeviceBuffer<f32>,
-    /// The flash's output.
+    /// The selected flash's output before its gate: a pass's rows, none in a
+    /// ubatch walk's arena (its prefill flash stores into `attn` under the
+    /// gate).
     pub(super) flash: DeviceBuffer<f32>,
     pub(super) gdn: Gdn38,
     pub(super) qsa: Qsa38,
@@ -271,8 +273,8 @@ impl Arena38 {
     /// A ubatch walk's arena for up to `rows` (1..=`most`) tokens over caches
     /// of `ctx` positions: every token-major buffer for `rows` tokens, the
     /// selection's scratch for a run of [`select_run`] rows (its selecting
-    /// rows run in runs of that many) and no selected-flash partials, the
-    /// router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
+    /// rows run in runs of that many) and no selected-flash partials or
+    /// output, the router's buffers for [`ROUTE_ROWS`] (it routes in runs of that many).
     /// Load-time only.
     pub(super) fn wide(
         stream: &CudaStream,
@@ -300,7 +302,7 @@ impl Arena38 {
     }
 
     /// The buffers for `rows` tokens, the selection's for `sel` rows and the
-    /// selected flash's partials for `parts`, the router's `route`.
+    /// selected flash's partials and output for `parts`, the router's `route`.
     fn alloc(
         stream: &CudaStream,
         rows: usize,
@@ -325,7 +327,7 @@ impl Arena38 {
             y: f(h)?,
             hc: HcScratch::new(stream, geometry)?,
             attn: f(geo::ATTN)?,
-            flash: f(geo::ATTN)?,
+            flash: DeviceBuffer::zeroed(stream, parts * geo::ATTN)?,
             gdn: Gdn38 {
                 x: f(s.channels())?,
                 z: f(s.n_v * linear::HEAD)?,

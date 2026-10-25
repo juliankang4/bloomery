@@ -204,7 +204,9 @@ generate_ds41   gqa_prefill_flash_256_p2                 0           0
 generate_ds41   gqa_prefill_flash_256_p2_lower           0           0
 generate_ds41   gqa_prefill_flash_256_p1_lower           0           0
 generate_ds41   gqa_prefill_flash_256_p12_sel            0           0
+generate_ds41   gqa_prefill_flash_256_p12_sel_gated      0           0
 generate_ds41   gqa_prefill_flash_256_p4                 0           0
+generate_ds41   gqa_prefill_flash_256_p4_gated           0           0
 generate_ds41   gqa_prefill_flash_256_q8                 0           0
 generate_ds41   gqa_prefill_flash_512_p4                 0           0
 generate_ds41   gqa_prefill_flash_q8                     0           0

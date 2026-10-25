@@ -253,10 +253,10 @@ fn stage(spec: CardSpec) -> Card {
         device: spec.device,
         usable_bytes: spec.usable_bytes(),
         context_bytes: CONTEXT,
-        // PIN(2026-10-25): the box gate's `CARD_ROUTE_SCRATCH` row at 4,096 positions, 3,231,404,032 B
-        // (was 3,228,766,208): HC's BF16 bottleneck and refusal add 644 B per ubatch position
-        // [derived: 4,096 · 644 = 2,637,824].
-        scratch_bytes: 3_231_404_032,
+        // PIN(2026-10-25): the box gate's `CARD_ROUTE_SCRATCH` row at 4,096 positions, 3,130,740,736 B
+        // (was 3,228,766,208): HC's BF16 bottleneck and refusal add 644 B per ubatch position and the
+        // ubatch arena's flash rows leave 24,576 [derived: 4,096 · (644 − 24,576) = −98,025,472].
+        scratch_bytes: 3_130_740_736,
         margin_bytes: spec.margin(),
         granule_bytes: GRANULE,
         free_bytes: spec.free_bytes,
@@ -471,10 +471,10 @@ const ROW_ROOM: u64 = 536_870_912;
 /// host serves none and the host need is the PLE table alone; the unset
 /// residency rule is `off`, no churn pool beside it: no
 /// host expert is left to move to the card. The restated terms first give
-/// an A6000 plan at the box gate's context and ubatch: 262 experts on the
-/// first 43 layers, 261 on the rest, 39,395,123,200 B, one expert more than
-/// the box gate's `CARD_PLANS` row (262 on the first 42 layers,
-/// 39,392,051,200 B), so these terms leave the card under 3,072,000 B more
+/// an A6000 plan at the box gate's context and ubatch: 263 experts on the
+/// first 31 layers, 262 on the rest, 39,508,684,800 B, one expert more than
+/// the box gate's `CARD_PLANS` row (263 on the first 30 layers,
+/// 39,505,100,800 B), so these terms leave the card under 3,584,000 B more
 /// room than the engine's plan.
 #[test]
 fn q4_on_one_96gb_card_holds_every_routed_expert() {
@@ -497,12 +497,16 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
     // (`runtime::stores::delta_carry_bytes`), 17,902,656 B of the card, which the spread takes from 3
     // experts of 3,072,000 B and their granules [derived: the box gate's CARD_PLANS row].
     // PIN(2026-10-25): unchanged by the stage's HC scratch, 2,637,824 B at 4,096 [derived: this plan].
+    // PIN(2026-10-25): 263 on the first 31 layers and 262 on the rest, 39,508,684,800 B; was 262 on the
+    // first 43 and 39,395,123,200 B. The ubatch arena's flash rows leave the stage's scratch,
+    // 100,663,296 B at 4,096, which the spread fills with experts and their granules [derived: this
+    // plan].
     let want: Vec<u64> = (0..LAYERS)
-        .map(|l| if l < 43 { 262 } else { 261 })
+        .map(|l| if l < 31 { 263 } else { 262 })
         .collect();
     assert_eq!(
         (&a6000.n_l, a6000.cards[0].expert_bytes),
-        (&want, 39_395_123_200)
+        (&want, 39_508_684_800)
     );
 
     let one = picked("a", &census_96(1))[0];
@@ -642,9 +646,12 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     // PIN(2026-10-25): 1 expert of 2,176,000 B fewer on the card, onto the host and both needs; was
     // 41,918,003,200, 70,718,141,440 and 42,454,874,112 B. The stage's scratch holds HC's 644 B per
     // ubatch position, 2,637,824 B at 4,096 [derived: the same spread].
+    // PIN(2026-10-25): 35,635,200 B more experts on the card, off the host and both needs; was
+    // 41,920,179,200, 70,720,317,440 and 42,457,050,112 B. The ubatch arena's flash rows leave the
+    // stage's scratch, 100,663,296 B at 4,096 [derived: the same spread].
     assert_eq!(
         (host.host.expert_bytes, host_need, nvme_need),
-        (41_920_179_200, 70_720_317_440, 42_457_050_112)
+        (41_884_544_000, 70_684_682_240, 42_421_414_912)
     );
     assert_eq!(nvme_need + PLE_TABLE, host_need + ROW_ROOM);
     assert!(nvme_need <= SCOPE_61G && SCOPE_61G < host_need);
@@ -741,7 +748,7 @@ fn two_slots_at_4096_hold_every_routed_expert() {
     assert_eq!((bytes, n_l, host), (Q4_ROUTED, vec![EXPERTS; LAYERS], 0));
 }
 
-/// 252,416 positions a slot on one such card, two sequences and no draft,
+/// 254,208 positions a slot on one such card, two sequences and no draft,
 /// is the last step of 256 whose plan holds at most the plan's margin fewer
 /// card expert bytes than the plan at 4,096
 /// ([`two_slots_at_4096_hold_every_routed_expert`]: every routed byte); the
@@ -760,11 +767,15 @@ fn two_slots_at_4096_hold_every_routed_expert() {
 // PIN(2026-10-25): 504 or 505 experts a layer with 46 at 505 and 338 on the host (was 505 on every
 // layer and 336). The stage's scratch holds HC's 644 B per ubatch position, 2,637,824 B at 4,096,
 // and the boundary stays at 252,416 [derived: the plan's own counts].
+// PIN(2026-10-25): 254,208 positions (was 252,416), the same 504 or 505 experts a layer with 46 at
+// 505 and 338 on the host. The ubatch arena's flash rows leave the stage's scratch, 100,663,296 B at
+// 4,096, and the boundary moved seven steps of 256 within the granules [derived: the plan's own
+// boundary, 254,208 − 252,416 = 1,792].
 #[test]
 fn two_slots_at_252416_stay_within_the_margin() {
-    let (at, n_l, host) = two_slots(252_416);
+    let (at, n_l, host) = two_slots(254_208);
     assert!(Q4_ROUTED - at <= MARGIN);
-    let (next, _, _) = two_slots(252_416 + 256);
+    let (next, _, _) = two_slots(254_208 + 256);
     assert!(Q4_ROUTED - next > MARGIN);
     let (lo, hi) = (
         *n_l.iter().min().expect("layers"),
@@ -1295,11 +1306,14 @@ fn a_paged_stack_adds_nothing_to_the_churn_pool() {
             // experts a layer (the 3090 gate plan at ctx 4096 and 27 GiB:
             // P 0 needs the pool empty, the headroom at least 0 and fewest
             // at least 2, the spares and one that moves).
+            // PIN(2026-10-25): 93 (was 92): the ubatch arena's flash rows
+            // leave the stage's scratch, 100,663,296 B at 4,096 [derived:
+            // this plan].
             assert_eq!(
                 pick,
                 Residency38Pick {
                     pinned: Some(0),
-                    why: Residency38Why::PlanA { fewest: 92 },
+                    why: Residency38Why::PlanA { fewest: 93 },
                 },
                 "room {room}: the unset rule on the plan that pages through an arena"
             );

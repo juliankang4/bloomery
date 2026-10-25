@@ -219,14 +219,19 @@ const KV_AT: [(u64, u64); 2] = [(4096, 604_196_480), (32_768, 1_418_940_032)];
 // PIN(2026-10-24): the GDN layers' carries take 17,902,656 B of the room (KV_AT), 624.4 positions at
 // 28,672 B: 1,399,565 and 506,637 were the pins.
 // PIN(2026-10-25): HC and carry terms leave 40,107,843,968 and 14,505,812,352 B over 28,672 B.
-const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_398_849), ("3090", 505_921)];
+// PIN(2026-10-25): the ubatch arena's flash rows leave the scratch, 100,663,296 B at 4,096 positions:
+// rooms 40,208,507,264 and 14,606,475,648 over 28,672 give 1,402,361 and 509,433; the pin is one
+// fewer.
+const CARD_MAX_CTX: [(&str, u64); 2] = [("A6000", 1_402_360), ("3090", 509_432)];
 // PIN(2026-09-28): the card's scratch, the m = 1 scratch and the ubatch walk's at 4,096
 // positions [derived: 64 MiB + place::ubatch_scratch_bytes(4096) = 67,108,864 + 4,096 ·
 // 668,277 + 32 MiB].
 // PIN(2026-09-28): and at the U the load runs, which `place::machine` now takes: at 512 positions
 // [derived: 67,108,864 + 512 · 668,277 + 33,554,432 = 442,821,120].
 // PIN(2026-10-24): HC's BF16 bottleneck and refusal add 644 B per ubatch position.
-const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_840_563_712), (512, 443_150_848)];
+// PIN(2026-10-25): the ubatch arena holds no flash rows, 24,576 B fewer per ubatch position
+// [derived: 2,840,563,712 − 4,096 · 24,576 and 443,150,848 − 512 · 24,576].
+const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_739_900_416), (512, 430_567_936)];
 
 // PIN(2026-09-29): the card scratch of a card-experts machine
 // (`place::machine_for_experts` under `Experts::Card`): the host rows' plus
@@ -236,7 +241,8 @@ const CARD_SCRATCH: [(u64, u64); 2] = [(4096, 2_840_563_712), (512, 443_150_848)
 // 512 · 170,360 + 512 · 10,240 = 92,467,200 — the run-token bound's
 // derivation is `place::CARD_ROUTE_RUN_TOKEN_BYTES`'s].
 // PIN(2026-10-24): the wide HC scratch adds the same 644 B per ubatch position.
-const CARD_ROUTE_SCRATCH: [(u64, u64); 2] = [(4096, 3_231_404_032), (512, 535_618_048)];
+// PIN(2026-10-25): and the ubatch arena's flash rows leave the same 24,576 B per ubatch position.
+const CARD_ROUTE_SCRATCH: [(u64, u64); 2] = [(4096, 3_130_740_736), (512, 523_035_136)];
 
 /// The card scratch [`CARD_SCRATCH`] pins at ubatch `u` (a host-routed plan).
 fn scratch_at(u: u64) -> u64 {
@@ -712,17 +718,21 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // table (its headers) printed the sixteen rows; the counts, expert bytes and rounding are its].
 // PIN(2026-10-25): HC adds 644 B per prompt row and draft row beside the GDN carries.
 // The planner on the pinned Q4 headers supplies these combined counts and granule bytes.
+// PIN(2026-10-25): every row re-pinned for the ubatch arena's flash rows, which leave the card's
+// scratch (24,576 B a ubatch position, CARD_SCRATCH): the spread fills the room with experts and
+// their granules [derived: the planner on this tree over the pinned Q4 headers printed the sixteen
+// rows; the counts, expert bytes and rounding are its].
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
         4_096,
         false,
         4_096,
+        263,
+        30,
         262,
-        42,
-        261,
-        39_392_051_200,
-        602_173_952,
+        39_505_100_800,
+        593_981_952,
     ),
     (
         "A6000",
@@ -730,10 +740,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         512,
         280,
-        31,
+        33,
         279,
-        42_065_920_000,
-        627_339_776,
+        42_072_064_000,
+        633_778_688,
     ),
     (
         "A6000",
@@ -741,10 +751,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         244,
-        22,
+        46,
         243,
-        36_622_438_400,
-        530_145_792,
+        36_696_678_400,
+        558_666_240,
     ),
     (
         "A6000",
@@ -752,10 +762,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         262,
-        19,
+        21,
         261,
-        39_320_883_200,
-        528_638_464,
+        39_327_027_200,
+        535_077_376,
     ),
     (
         "A6000",
@@ -763,10 +773,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         4_096,
         258,
-        9,
+        25,
         257,
-        38_688_460_800,
-        483_680_768,
+        38_737_612_800,
+        535_192_064,
     ),
     (
         "A6000",
@@ -774,21 +784,21 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         512,
         275,
-        42,
+        48,
         274,
-        41_347_584_000,
-        523_592_192,
+        41_367_040_000,
+        516_719_104,
     ),
     (
         "A6000",
         32_768,
         true,
         4_096,
+        239,
+        6,
         238,
-        18,
-        237,
-        35_707_596_800,
-        566_280_704,
+        35_821_158_400,
+        553_382_400,
     ),
     (
         "A6000",
@@ -796,21 +806,21 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         255,
-        43,
+        45,
         254,
-        38_342_144_000,
-        626_573_824,
+        38_348_288_000,
+        633_012_736,
     ),
     (
         "3090",
         4_096,
         false,
         4_096,
+        94,
+        4,
         93,
-        13,
-        92,
-        13_880_524_800,
-        515_863_040,
+        14_002_790_400,
+        492_163_584,
     ),
     (
         "3090",
@@ -818,21 +828,21 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         512,
         110,
-        40,
+        42,
         109,
-        16_521_216_000,
-        565_817_856,
+        16_527_360_000,
+        572_256_768,
     ),
     (
         "3090",
         4_096,
         true,
         4_096,
+        74,
+        30,
         73,
-        40,
-        72,
-        10_955_468_800,
-        597_180_928,
+        11_074_662_400,
+        578_650_624,
     ),
     (
         "3090",
@@ -840,21 +850,21 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         92,
-        21,
+        24,
         91,
-        13_754_675_200,
-        494_912_000,
+        13_763_891_200,
+        498_278_912,
     ),
     (
         "3090",
         32_768,
         false,
         4_096,
+        88,
+        10,
         87,
-        31,
-        86,
-        13_033_779_200,
-        540_525_056,
+        13_119_180_800,
+        555_786_752,
     ),
     (
         "3090",
@@ -862,21 +872,21 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         false,
         512,
         105,
-        24,
+        26,
         104,
-        15_719_424_000,
-        547_623_424,
+        15_725_568_000,
+        554_062_336,
     ),
     (
         "3090",
         32_768,
         true,
         4_096,
+        69,
+        15,
         68,
-        47,
-        67,
-        10_225_356_800,
-        446_489_088,
+        10_276_454_400,
+        491_860_480,
     ),
     (
         "3090",
@@ -884,10 +894,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         86,
-        13,
+        19,
         85,
-        12_827_545_600,
-        541_237_760,
+        12_845_977_600,
+        535_388_672,
     ),
 ];
 // PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their
@@ -1172,6 +1182,9 @@ const CARD_ROUNDING_Q3: u64 = 398_764_544;
 // PIN(2026-10-25): the combined HC and carry terms remove 36 more experts across eight rows;
 // the A6000 32k drafted U 4,096 row loses 28 at its rounding boundary [derived: all sixteen
 // planner rows over the pinned Q3 headers, with each layer's count and both byte columns].
+// PIN(2026-10-25): every row re-pinned for the ubatch arena's flash rows, 24,576 B a ubatch
+// position off the card's scratch (CARD_ROUTE_SCRATCH) [derived: the planner on this tree over the
+// pinned Q3 headers printed the sixteen rows].
 const CARD_PLANS_Q3: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -1179,10 +1192,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         4_096,
         365,
-        5,
+        21,
         364,
-        39_700_070_400,
-        452_307_456,
+        39_734_886_400,
+        518_154_752,
     ),
     (
         "A6000",
@@ -1190,10 +1203,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         512,
         388,
-        25,
+        28,
         387,
-        42_251_289_600,
-        595_928_576,
+        42_257_817_600,
+        601_983_488,
     ),
     (
         "A6000",
@@ -1201,10 +1214,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         338,
-        8,
+        32,
         337,
-        36_762_777_600,
-        543_764_992,
+        36_815_820_800,
+        593_482_240,
     ),
     (
         "A6000",
@@ -1212,21 +1225,21 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         362,
-        32,
+        34,
         361,
-        39_432_550_400,
-        570_929_664,
+        39_436_902_400,
+        579_160_576,
     ),
     (
         "A6000",
         32_768,
         false,
         4_096,
-        355,
-        42,
-        354,
-        38_691_097_600,
-        635_002_368,
+        358,
+        7,
+        357,
+        38_941_209_600,
+        487_650_816,
     ),
     (
         "A6000",
@@ -1234,21 +1247,21 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         512,
         382,
-        3,
+        6,
         381,
-        41_548_416_000,
-        474_621_440,
+        41_555_763_200,
+        481_954_304,
     ),
     (
         "A6000",
         32_768,
         true,
         4_096,
-        329,
+        331,
         2,
-        328,
-        35_766_323_200,
-        661_512_704,
+        330,
+        35_984_384_000,
+        544_115_200,
     ),
     (
         "A6000",
@@ -1256,21 +1269,21 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         355,
-        10,
+        12,
         354,
-        38_620_646_400,
-        504_126_976,
+        38_624_998_400,
+        512_357_888,
     ),
     (
         "3090",
         4_096,
         false,
         4_096,
-        128,
-        44,
-        127,
-        13_945_548_800,
-        604_797_440,
+        130,
+        34,
+        129,
+        14_141_849_600,
+        509_159_936,
     ),
     (
         "3090",
@@ -1278,21 +1291,21 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         512,
         154,
-        9,
+        12,
         153,
-        16_703_360_000,
-        539_729_408,
+        16_709_888_000,
+        545_784_320,
     ),
     (
         "3090",
         4_096,
         true,
         4_096,
+        104,
+        15,
         103,
-        32,
-        102,
-        11_193_676_800,
-        512_931_328,
+        11_264_896_000,
+        542_375_424,
     ),
     (
         "3090",
@@ -1300,10 +1313,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         128,
-        20,
+        22,
         127,
-        13_892_505_600,
-        506_845_696,
+        13_896_857_600,
+        515_076_608,
     ),
     (
         "3090",
@@ -1311,10 +1324,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         4_096,
         121,
-        31,
+        47,
         120,
-        13_154_048_000,
-        574_214_656,
+        13_189_683_200,
+        639_242_752,
     ),
     (
         "3090",
@@ -1322,21 +1335,21 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         false,
         512,
         146,
-        26,
+        32,
         145,
-        15_868_108_800,
-        554_994_176,
+        15_881_984_000,
+        553_701_888,
     ),
     (
         "3090",
         32_768,
         true,
         4_096,
-        94,
-        36,
-        93,
-        10_221_107_200,
-        602_599_936,
+        96,
+        13,
+        95,
+        10_388_300_800,
+        538_166_784,
     ),
     (
         "3090",
@@ -1344,10 +1357,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         120,
-        2,
+        48,
         119,
-        12_978_969_600,
-        543_772_160,
+        13_083_648_000,
+        449_579_520,
     ),
 ];
 
@@ -1599,7 +1612,12 @@ type BpRow = (u64, usize, u64, u64, usize, u64, u64, u64);
 // The GDN layers' carries (17,902,656 B of kv, KV_AT) take 3 experts off plan (a)'s row and both
 // cards' totals lose the same 3: the tier keeps its 7,236 experts, on other layers [derived: the box's
 // planner on this tree, the file's tensor table on a DGX Spark, printed this row].
-const BP_PLAIN: BpRow = (262, 9, 261, 412, 45, 7_236, 22_674_944_000, 148_361_216);
+// PIN(2026-10-25): the A6000 262 on the first 25 layers (was 9), both cards 413 on the first 13 layers
+// (was 412 on the first 45), the tier's 22,677,401,600 B of experts (was 22,674,944,000) and
+// 145,903,616 B of rounding (was 148,361,216). The ubatch arena's flash rows leave the stage's
+// scratch, 100,663,296 B at 4,096 positions; the tier keeps its 7,236 experts, on other layers
+// [derived: the planner on this tree over the pinned Q4 headers printed this row].
+const BP_PLAIN: BpRow = (262, 25, 261, 413, 13, 7_236, 22_677_401_600, 145_903_616);
 
 /// Plan (b′) of the Qwen3.8 file without the draft (`place::machine_bp`,
 /// `plan_with` under `Experts::Card`): the A6000's counts and card bytes

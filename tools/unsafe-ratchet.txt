@@ -580,7 +580,11 @@ gguf 7 2 0
 # PIN(2026-10-25): gpu 2433 -> 2601 blocks, 312 -> 321 fns, new code, not old code relaxed:
 # integrated native NVFP4 staging, HC BF16 form, router MMA, chunked GDN, recovery, listed attention
 # and the BF16 norm epilogue; counted by tools/check-unsafe.sh. Each new block has its SAFETY invariant.
-gpu 2601 321 10
+# PIN(2026-10-25): gpu 2601 -> 2605 blocks, 321 -> 324 fns, new code, not old code relaxed: the prefill
+# flash's store gate (flash_gqa_prefill.rs: `OutGate::apply` declared and its two impls, the sigmoid gate's
+# read of its gate value, the store's call of it, and the two gated entries' calls of their bodies), counted
+# by tools/check-unsafe.sh. Each new block has its SAFETY line.
+gpu 2605 324 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

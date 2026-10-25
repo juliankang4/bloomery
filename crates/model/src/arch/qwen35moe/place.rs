@@ -1126,10 +1126,10 @@ impl MtpPlan<'_> {
 pub const UBATCH_PLANNED: u64 = 4096;
 
 /// Card bytes a qwen4exp ubatch walk holds a position [derived: the ubatch
-/// arena's token-major rows, 136,996 f32 and 12 u32 a position — the
+/// arena's token-major rows, 130,852 f32 and 12 u32 a position — the
 /// embedding, the two stream buffers, the mix and sub-layer outputs, the
-/// attention and flash rows, the delta layer's, the selecting layer's and the
-/// PLE site's intermediates, the shared expert's — 548,032 B; the walk's own
+/// attention rows, the delta layer's, the selecting layer's and the PLE
+/// site's intermediates, the shared expert's — 523,456 B; the walk's own
 /// buffers, 110,644.125 B — the 32-value activations of the model-width, the
 /// attention-width and the SwiGLU rows (3,200, 7,680 and 800 B), the wide
 /// mixes' scratch (98,356 B: the normed streams and the up's rows at 40,960 B
@@ -1139,7 +1139,9 @@ pub const UBATCH_PLANNED: u64 = 4096;
 /// host sums (10,244 B);
 /// rounded up].
 // PIN(2026-10-24): the HC bottleneck adds 320 BF16 values and one refusal word per column, 644 B.
-pub const UBATCH_TOKEN_BYTES: u64 = 668_921;
+// PIN(2026-10-25): 644,345 (was 668,921): the prefill flash stores the selecting layer's rows
+// under their gate, so the arena holds no flash rows, 6,144 f32 a position.
+pub const UBATCH_TOKEN_BYTES: u64 = 644_345;
 
 /// Card bytes a qwen4exp ubatch walk's selection holds for one run of its
 /// selecting rows: the walk takes as many rows a run as these bytes hold at
