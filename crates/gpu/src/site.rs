@@ -1176,8 +1176,9 @@ pub fn resident_gemm(
     wide_by_name(gpu, k, (w, src, rows), x, route, m, y)
 }
 
-/// A resident gate projection followed by the shared sigmoid norm. BF16
-/// tensor-core sites finish the norm in their product's store epilogue.
+/// A resident gate projection followed by the shared sigmoid norm. BF16 and
+/// native W8A8 MXFP8 tensor-core sites finish the norm in their product's
+/// store epilogue.
 pub(crate) fn resident_gemm_norm_gate(
     gpu: &Gpu,
     k: &WideKernels<'_>,
@@ -1202,6 +1203,16 @@ pub(crate) fn resident_gemm_norm_gate(
         return k
             .g32(what, "the BF16 prompt kernels")?
             .enqueue_bf16_mma_norm_gate(gpu.stream(), packed, input, act, m, z, tail);
+    }
+    if let (DevWeight::Mxfp8 { .. }, Some(act), Some(input)) = (weight, x.q32, x.f32)
+        && gpu.q8f32().dense_mma
+    {
+        let planes = w.e4m3(what, name)?;
+        if crate::gemm::mxfp8_w8a8_reads(&planes, act, input, m) {
+            return k
+                .g32(what, "the MXFP8 prompt kernels")?
+                .enqueue_mxfp8_w8a8_norm_gate(gpu.stream(), planes, input, act, m, z, tail);
+        }
     }
     tail.check_rows(what, rows, m, z.len())?;
     resident_gemm(gpu, k, (w, name), x, route, m, z)?;

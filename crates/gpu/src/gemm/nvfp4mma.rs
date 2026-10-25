@@ -5,10 +5,12 @@
 use super::act32::ColsForm;
 use super::f32tile::{
     Bf16Cols, Bf16Rows, ByteRows, MMA_THREADS, MmaCols, MmaRows, STAGE_FLOATS,
-    STAGES as MMA_STAGES, TileLaunch, TileRows, bf16_mma_body, form_col, mma_fits, store_refused,
+    STAGES as MMA_STAGES, TileLaunch, TileRows, bf16_mma_body, bf16_mma_norm_gate_body, form_col,
+    mma_fits, store_refused,
 };
 use super::{GemmAct32, GemmRoute};
 use crate::GpuError;
+use crate::linear::norm_gate::NormGateTail;
 use crate::q8f32::{E4m3Weight, Mxfp8Bytes};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::vector::F32x4;
@@ -1302,6 +1304,65 @@ mod native {
         // the spans in the contract.
         unsafe { bf16_mma_body(Mxfp8Rows { qs, e }, cols, rows, k, n, &mut y, sh) };
     }
+
+    /// [`mxfp8_w8a8_gemm`] as a gate projection with the shared sigmoid norm
+    /// at its store (`f32tile.rs`'s `bf16_mma_norm_gate_body`).
+    #[allow(clippy::too_many_arguments, reason = "flat kernel ABI")]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            rows >= 128,
+            n >= 1,
+            4 * qs.len() >= rows * k,
+            128 * e.len() >= rows * k,
+            x.len() >= n * k,
+            4 * xq.len() >= n * k,
+            128 * xe.len() >= n * k,
+            refused.len() >= n,
+            o.len() >= rows * n,
+            gain.len() >= 128,
+            z.len() >= rows * n,
+            y.len() >= rows * n
+        )
+    )]
+    pub fn mxfp8_w8a8_norm_gate(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        xq: &[u32],
+        xe: &[u32],
+        refused: &[u32],
+        rows: u32,
+        k: u32,
+        n: u32,
+        o: &[f32],
+        gain: &[f32],
+        eps: f32,
+        fault: crate::fault::FaultSink,
+        mut z: DisjointSlice<f32>,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { MMA_STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        let cols = Mxfp8Cols {
+            pairs: Bf16Cols {
+                words: xq,
+                refused,
+                exact: x,
+            },
+            e: xe,
+        };
+        let w = Mxfp8Rows { qs, e };
+        // SAFETY: 256 converged threads and the checked complete-head spans,
+        // K a multiple of 128 and aligned planes satisfy the body's contract.
+        unsafe {
+            bf16_mma_norm_gate_body(w, cols, rows, k, n, o, gain, eps, fault, &mut z, &mut y, sh)
+        };
+    }
 }
 
 pub(super) struct Kernels {
@@ -1597,6 +1658,33 @@ impl Kernels {
         let (xq, xe, refused) = (&form.words, &form.scales, &form.refused);
         self.module.mxfp8_w8a8_gemm(
             stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, y,
+        )?;
+        Ok(())
+    }
+
+    /// [`Self::mxfp8_w8a8`] with the shared sigmoid norm `tail` at its store
+    /// ([`native::mxfp8_w8a8_norm_gate`]); z is the exact replay's scratch.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "product operands and its norm tail"
+    )]
+    pub(super) fn mxfp8_w8a8_norm_gate(
+        &self,
+        stream: &CudaStream,
+        w: E4m3Weight<'_>,
+        x: &DeviceBuffer<f32>,
+        form: &ColsForm,
+        t: &TileLaunch,
+        z: &mut DeviceBuffer<f32>,
+        tail: NormGateTail<'_>,
+    ) -> Result<(), GpuError> {
+        let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
+        let prep = self.module.prepare_mxfp8_w8a8_norm_gate(cfg)?;
+        let (qs, e) = (w.qs.buf(), w.e.buf());
+        let (xq, xe, refused) = (&form.words, &form.scales, &form.refused);
+        self.module.mxfp8_w8a8_norm_gate(
+            stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, tail.o, tail.w, tail.eps,
+            tail.fault, z, tail.y,
         )?;
         Ok(())
     }

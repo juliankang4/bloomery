@@ -1387,6 +1387,7 @@ mod gemm32_kernels {
             refused,
             exact: x,
         };
+        let w = Bf16Rows(w);
         // SAFETY: the checked launch gives 256 converged threads and the BF16 MMA
         // grid, rows a multiple of HEAD, k a multiple of 64, 16-byte-aligned w and
         // xb, the contract's spans of w, x, xb, refused, o, gain, z and y, and sh

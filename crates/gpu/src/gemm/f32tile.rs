@@ -1673,27 +1673,30 @@ pub(crate) unsafe fn bf16_mma_narrow(
     }
 }
 
-/// BF16 product followed by the shared sigmoid norm. Normal tiles exchange
-/// z through the retired staging allocation; exceptional tiles finish through
-/// the exact product owner first.
+/// Dense prompt product ([`bf16_mma_body`]'s, BF16 or block-scaled E4M3)
+/// followed by the shared sigmoid norm. Normal tiles exchange z through the
+/// retired staging allocation; exceptional tiles finish through the exact
+/// product owner first. K counts values; a scaled tile's units are value
+/// pairs.
 ///
 /// # Safety
 ///
-/// A block has 256 converged threads and the BF16 MMA raster's grid. rows is
-/// a positive multiple of HEAD, n is positive and k a positive multiple of 64.
-/// w and x.words are 16-byte aligned and hold rows*k/2 and n*k/2 words;
-/// x.exact holds n*k values and x.refused n flags. o, z and y hold rows*n
-/// values, gain holds HEAD. sh is this block's 16-byte-aligned allocation of
-/// STAGES*STAGE_FLOATS floats. Output and scratch cells belong to this block.
+/// A block has 256 converged threads and the MMA raster's grid. rows is a
+/// positive multiple of HEAD, n is positive and k a positive multiple of 64
+/// (128 for a scaled tile). w and x meet [`bf16_mma_tile`]'s contract for
+/// rows*k weight values and n*k activations; x.exact holds n*k values. o, z
+/// and y hold rows*n values, gain holds HEAD. sh is this block's
+/// 16-byte-aligned allocation of STAGES*STAGE_FLOATS floats. Output and
+/// scratch cells belong to this block.
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
     clippy::needless_range_loop,
     reason = "flat device operands and indexed CUDA-unrolled arrays"
 )]
-pub(crate) unsafe fn bf16_mma_norm_gate_body(
-    w: &[u32],
-    x: Bf16Cols<'_>,
+pub(crate) unsafe fn bf16_mma_norm_gate_body<W: MmaRows, X: MmaCols>(
+    w: W,
+    x: X,
     rows: u32,
     k: u32,
     n: u32,
@@ -1709,13 +1712,14 @@ pub(crate) unsafe fn bf16_mma_norm_gate_body(
         assert!(MMA_ROWS == HEAD && MMA_COLS == 128);
         assert!(MMA_WARP_COLS * HEAD <= STAGES * STAGE_FLOATS);
     };
+    let units = if W::SCALED { k / 2 } else { k };
     // SAFETY: the entry supplies the checked MMA launch and staging allocation.
-    let Some(mut tile) = (unsafe { bf16_mma_tile(Bf16Rows(w), x, rows, k, n, sh) }) else {
+    let Some(mut tile) = (unsafe { bf16_mma_tile(w, x, rows, units, n, sh) }) else {
         return;
     };
     let (rows, k, n) = (rows as usize, k as usize, n as usize);
     // SAFETY: the tile's original staging allocation and K are unchanged.
-    let replay = unsafe { tile.needs_replay(sh, k) };
+    let replay = unsafe { tile.needs_replay(sh, units as usize) };
     // Retire every vote and flag reader before reusing the staging allocation.
     thread::sync_threads();
     if replay {
@@ -1724,7 +1728,7 @@ pub(crate) unsafe fn bf16_mma_norm_gate_body(
         thread::sync_threads();
         // SAFETY: all 256 threads reach this converged with the tile's checked spans and its
         // staging allocation sh; the barrier above retired the store and every shared reader.
-        unsafe { tile.replay(Bf16Rows(w), x.exact(), (rows, k, n), z, sh) };
+        unsafe { tile.replay(w, x.exact(), (rows, k, n), z, sh) };
         thread::sync_threads();
     }
     let lane = warp::lane_id() as usize;
@@ -1989,18 +1993,43 @@ impl Gemm32Kernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_mxfp8_w8a8";
-        let (rows, k) = w.dimensions(what)?;
-        if w.scales != E4m3Scales::Mxfp8 {
-            return Err(GpuError::shape(
-                what,
-                format!("the weight's scales are {:?}, not MXFP8's", w.scales),
-            ));
-        }
-        crate::tensor::check_alignment::<U32x4, _>(what, "w.qs", w.qs.buf())?;
-        let t = mma_launch(what, rows, k, x, n, y)?;
+        let t = mxfp8_mma_launch(what, w, x, n, y)?;
         let form = held_form(what, act, MmaForm::Mxfp8, x, &t)?;
         #[cfg(bloomery_nvfp4_mma)]
         return self.native.mxfp8_w8a8(stream, w, x, form, &t, y);
+        #[cfg(not(bloomery_nvfp4_mma))]
+        Err(GpuError::state(what, NATIVE_BUILD))
+    }
+
+    /// [`Self::enqueue_mxfp8_w8a8`] and the shared sigmoid norm in one
+    /// launch, as [`Self::enqueue_bf16_mma_norm_gate`] finishes a BF16
+    /// product: z is scratch for exceptional exact replay only.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "product operands and its norm tail"
+    )]
+    #[cfg_attr(
+        not(bloomery_nvfp4_mma),
+        allow(unused_variables, reason = "the native build's launch reads them")
+    )]
+    pub fn enqueue_mxfp8_w8a8_norm_gate(
+        &self,
+        stream: &CudaStream,
+        w: E4m3Weight<'_>,
+        x: &DeviceBuffer<f32>,
+        act: &GemmAct32,
+        n: usize,
+        z: &mut DeviceBuffer<f32>,
+        tail: NormGateTail<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_mxfp8_w8a8_norm_gate";
+        let t = mxfp8_mma_launch(what, w, x, n, z)?;
+        tail.check_rows(what, t.rows as usize, n, z.len())?;
+        let form = held_form(what, act, MmaForm::Mxfp8, x, &t)?;
+        #[cfg(bloomery_nvfp4_mma)]
+        return self
+            .native
+            .mxfp8_w8a8_norm_gate(stream, w, x, form, &t, z, tail);
         #[cfg(not(bloomery_nvfp4_mma))]
         Err(GpuError::state(what, NATIVE_BUILD))
     }
@@ -2050,6 +2079,27 @@ fn held_form<'a>(
             MmaForm::Mxfp8 => "act's MXFP8 form of x's first n columns (enqueue_mxfp8_cols)",
         },
     ))
+}
+
+/// [`mma_launch`] for an MXFP8 weight's planes as stored. The tile copies
+/// the value plane in 16-byte pieces; other scales or alignment are a named
+/// `Shape` error.
+fn mxfp8_mma_launch(
+    what: &'static str,
+    w: E4m3Weight<'_>,
+    x: &DeviceBuffer<f32>,
+    n: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<TileLaunch, GpuError> {
+    let (rows, k) = w.dimensions(what)?;
+    if w.scales != E4m3Scales::Mxfp8 {
+        return Err(GpuError::shape(
+            what,
+            format!("the weight's scales are {:?}, not MXFP8's", w.scales),
+        ));
+    }
+    crate::tensor::check_alignment::<U32x4, _>(what, "w.qs", w.qs.buf())?;
+    mma_launch(what, rows, k, x, n, y)
 }
 
 /// Checked spans shared with the exact tile, with the MMA tile's grid.
