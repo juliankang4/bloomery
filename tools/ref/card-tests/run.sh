@@ -1242,6 +1242,8 @@ else
   has 'box.sh: local mode runs it in the tree, the card local, the locks and data passed, no oxide backend and no build jobs set' \
     "^pwd=$B card=local locks=$L oxide=unset data=$tmp/data jobs=unset\$"
   unreached 'box.sh: local mode reaches no ssh and no rsync'
+  run 'lock-back.sh: local mode brings nothing back and succeeds' 0 '^lock-back-done$' boxl bash -c "\"$ROOT/tools/lock-back.sh\" && echo lock-back-done"
+  unreached 'lock-back.sh: local mode reached no ssh'
   if [ -d "$L" ]; then pass 'box.sh: local mode made its lock directory'; else fail 'box.sh: local mode made its lock directory' "no $L"; fi
   printf 'export CUDA_OXIDE_BACKEND=/x/backend.so\n' > "$tmp/oxide-env.sh"
   # A cargo oxide command still takes the installed cargo-oxide check in local mode: a stub cargo-oxide and a stub cargo

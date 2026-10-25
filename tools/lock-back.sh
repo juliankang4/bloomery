@@ -7,7 +7,9 @@
 # older than its sources (the lock's box-side mtime keeps moving). `just check`
 # calls this last, so the refreshed lock lands in the worktree and in the round's
 # diff. Prints one line when the lock changed; silent when it did not.
+# Under BLOOMERY_BOX_LOCAL=1 (box.sh's local mode) cargo ran in this tree, so there is nothing to bring back.
 set -euo pipefail
+[ "${BLOOMERY_BOX_LOCAL:-0}" != 1 ] || exit 0
 HOST=${BLOOMERY_BOX:-ws}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 REMOTE=${BLOOMERY_REMOTE:-"~/repo/$(basename "$HERE")"}
