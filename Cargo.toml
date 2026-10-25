@@ -42,12 +42,13 @@ dispatch2 = { version = "=0.3.0", default-features = false, features = ["alloc"]
 
 # The declarations above name the NVIDIA/cuda-rust rev (cuda-oxide lives under cuda-oxide/ there, cuda-core at the
 # root); the source comes from our fork (midagedev/cuda-oxide), branch `bloomery` = that rev + the patches meant for
-# upstream (listed in THIRD_PARTY_NOTICES.md). With no patch left this section goes. A rev move here needs the box's
-# backend rebuilt for that rev (tools/box.sh, CUDA_OXIDE_BACKEND).
+# upstream (listed in THIRD_PARTY_NOTICES.md), including the merged call-argument cast backport.
+# With no patch left this section goes. A rev move here needs the box's backend rebuilt for that rev
+# (tools/box.sh, CUDA_OXIDE_BACKEND).
 [patch."https://github.com/NVIDIA/cuda-rust.git"]
-cuda-device = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "87bc951864b79f723b4da9c11fa229f5600aefcb" }
-cuda-host = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "87bc951864b79f723b4da9c11fa229f5600aefcb" }
-cuda-core = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "87bc951864b79f723b4da9c11fa229f5600aefcb" }
+cuda-device = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "466ee1605a65936df4a49ceb3b6870f5b911a60d" }
+cuda-host = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "466ee1605a65936df4a49ceb3b6870f5b911a60d" }
+cuda-core = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "466ee1605a65936df4a49ceb3b6870f5b911a60d" }
 
 # 값은 2026-09-19에 박스에서 실측한 적중 수를 근거로 정했다. 0건인 것만 deny로 올린다.
 [workspace.lints.rust]

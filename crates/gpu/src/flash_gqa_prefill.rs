@@ -530,11 +530,9 @@ pub(crate) const fn staged_off(xor: usize, w: usize) -> usize {
     staged!(@offset xor, w)
 }
 
-/// One staged row's in-place widening, as a macro: a pointer into the
-/// dynamic shared window, which the 256 body's tiles are, cannot be passed
-/// to a device helper fn (the toolchain types it in the shared address
-/// space and the helper's parameter in the generic one), so the body expands
-/// at each call site — the file's own `stage!` shape.
+/// One staged row's in-place widening. Inline helper extraction changes the
+/// entries' PTX and register allocation (docs/upstream/nvlabs-ledger.md,
+/// row 39), so staging expands in the kernel body.
 /// Lane `$lane` reads the row's raw code words `$lane + 32·i` (`i < NW` — the
 /// row's `NW·32` words, its low half, landed by the copies) and its scale
 /// `lane/8 + 4·i`, the warp syncs — a row's staged writes may land on its
@@ -574,8 +572,8 @@ macro_rules! dequant_row {
     }};
 }
 
-/// A staged row's zero words, the dead key's form, as a macro (the same
-/// boundary as `dequant_row!`'s): lane `$lane` writes the row's staged
+/// A staged row's zero words, expanded in the kernel body with
+/// `dequant_row!`: lane `$lane` writes the row's staged
 /// words `$lane + 32·j` (`j < 2·NW`) as zero — the f16 walk's own zeros for
 /// a key at or past the block's largest count, so a padded row's NaN scale
 /// reaches no result.
@@ -594,8 +592,8 @@ macro_rules! zero_row {
 }
 
 /// The online softmax of the module doc's step 2 over one key tile's scores,
-/// written once for every prefill body and expanded in each, as
-/// `dequant_row!` is: the body's locals are the arguments. A warp whose tile
+/// written once for every prefill body and expanded in each with the body's
+/// locals as arguments. A warp whose tile
 /// is inside every row's bounds (`unmasked`) takes the expansion without
 /// the per-key mask, every other one the masked expansion; on such a
 /// tile both evaluate the same expressions. `key0` is the lane's first key
@@ -705,7 +703,7 @@ macro_rules! prefill_softmax {
 pub(crate) use prefill_softmax;
 
 /// The row counts a PACK-generic body's walk uses, written once and expanded
-/// in each, as `dequant_row!` is: it binds the `out` names in the caller. Slice `s` is
+/// in each: it binds the `out` names in the caller. Slice `s` is
 /// positions `t0 + s·slice_pos ..` of the block; both loop bounds are
 /// constants, so every copy's `s` and `i` are literals and no count is kept
 /// in an array indexed at run time. A row below `rows` reads its count from
@@ -791,7 +789,7 @@ macro_rules! prefill_pack_counts {
 pub(crate) use prefill_pack_counts;
 
 /// The end of a PACK-generic body's walk, written once and expanded in each,
-/// as `dequant_row!` is: each row's sum over its four lanes `(l + l^1) +
+/// at each call site: each row's sum over its four lanes `(l + l^1) +
 /// l^2`, then `o · (1/l)` into `y`, NaN for a refused row (`bad`). The lane's
 /// value `j` of n8 tile `nd` (`nd < dims`, the accumulator's tiles) is row
 /// half `j / 2`, position `row0 + row_pos(g, j / 2)` and head `head0 +

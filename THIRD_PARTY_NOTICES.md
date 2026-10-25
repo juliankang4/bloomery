@@ -87,8 +87,10 @@ Apache-2.0 headers from cuda-oxide. The GPU crates depend on cuda-oxide (Apache-
 `Cargo.toml` declares the dependency on [NVIDIA/cuda-rust](https://github.com/NVIDIA/cuda-rust) (cuda-oxide lives under
 `cuda-oxide/` there) at revision `1691162ab9204ef21b0329c2e8059815420dfd5a`
 and a `[patch]` section takes the source from our fork, [midagedev/cuda-oxide](https://github.com/midagedev/cuda-oxide),
-branch `bloomery`: that revision plus the patches below. Every patch is meant for upstream and leaves the fork once
-upstream has it; with none left, the `[patch]` section goes away.
+branch `bloomery`: that revision plus the patches below. The source pin is
+[`466ee160`](https://github.com/midagedev/cuda-oxide/commit/466ee1605a65936df4a49ceb3b6870f5b911a60d),
+merged by [midagedev/cuda-oxide#3](https://github.com/midagedev/cuda-oxide/pull/3).
+Every patch is meant for upstream and leaves the fork once upstream has it; with none left, the `[patch]` section goes away.
 
 | Patch | Upstream |
 |---|---|
@@ -97,6 +99,7 @@ upstream has it; with none left, the `[patch]` section goes away.
 | [`e5eddb3b`](https://github.com/midagedev/cuda-oxide/commit/e5eddb3bf8a9cf8f26b9d32201af9c9a730cfc83) feat(unroll): recognize range `for` loops | proposed upstream as [NVIDIA/cuda-rust#1346](https://github.com/NVIDIA/cuda-rust/pull/1346) (open) |
 | [`4da6c138`](https://github.com/midagedev/cuda-oxide/commit/4da6c138448538ca12218cb80924c070417ab419) fix(mir-lower): give an aggregate niche payload's leaves typed slots | not yet proposed |
 | [`87bc9518`](https://github.com/midagedev/cuda-oxide/commit/87bc951864b79f723b4da9c11fa229f5600aefcb) feat(cargo-oxide): select extra-rustflags by target triple | not yet proposed |
+| [`466ee160`](https://github.com/midagedev/cuda-oxide/commit/466ee1605a65936df4a49ceb3b6870f5b911a60d) fix(mir-importer): adapt shared pointers at ordinary call boundaries | backported from [NVIDIA/cuda-rust#1598](https://github.com/NVIDIA/cuda-rust/pull/1598), commit `927d462eebe1ca2dde13439ef37c44184eadbb13` |
 
 ## cuda-core (cutile-rs)
 
