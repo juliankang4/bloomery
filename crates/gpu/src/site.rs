@@ -1181,8 +1181,7 @@ pub fn resident_gemm(
 /// `out` ([`resident_quantize`]). BF16 and native W8A8 MXFP8 tensor-core
 /// sites finish the norm in their product's store epilogue. The MXFP8
 /// epilogue also writes the output's MXFP8 form, so it runs only when that
-/// form is all the readers take from `out`: a reader reads it, and none
-/// reads the q8 blocks of 32 or another form `out` holds room for.
+/// form is all the readers take from `out` ([`only_form`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "the projection's operands, its norm tail and the output's readers"
@@ -1232,10 +1231,7 @@ pub(crate) fn resident_gemm_norm_gate(
         }
         (_, Some(planes), Some(act), Some(input))
             if gpu.q8f32().dense_mma
-                && out.has(MmaForm::Mxfp8)
-                && reads_form(gpu, w, readers, MmaForm::Mxfp8)
-                && !reads_q32(w, readers)
-                && !(out.has(MmaForm::Bf16) && reads_form(gpu, w, readers, MmaForm::Bf16))
+                && only_form(gpu, w, readers, out) == Some(MmaForm::Mxfp8)
                 && crate::gemm::mxfp8_w8a8_reads(&planes, act, input, m) =>
         {
             return k
@@ -1355,6 +1351,28 @@ pub fn resident_quantize(
     })
 }
 
+/// The one [`MmaForm`] the sites of the resident weights `readers` take
+/// from `act`, when it is all they take: a reader copies it
+/// ([`reads_form`]), and none reads the q8 blocks of 32 or another form
+/// `act` holds room for. An epilogue that writes this form beside its f32
+/// rows leaves the readers nothing to quantize.
+#[must_use]
+pub(crate) fn only_form(
+    gpu: &Gpu,
+    w: &Weights,
+    readers: &[&str],
+    act: &GemmAct32,
+) -> Option<MmaForm> {
+    if reads_q32(w, readers) {
+        return None;
+    }
+    let mut read = [MmaForm::Bf16, MmaForm::Mxfp8]
+        .into_iter()
+        .filter(|&f| act.has(f) && reads_form(gpu, w, readers, f));
+    let form = read.next()?;
+    read.next().is_none().then_some(form)
+}
+
 /// Whether a site of one of the resident weights `names` reads the q8
 /// blocks of 32 ([`WideActs::wants`] of its resident type).
 fn reads_q32(w: &Weights, names: &[&str]) -> bool {
@@ -1366,8 +1384,8 @@ fn reads_q32(w: &Weights, names: &[&str]) -> bool {
 }
 
 /// Each form `q32` holds room for of the first `m` columns of the f32 rows
-/// `x`: written (`enqueue_bf16_cols`, `enqueue_mxfp8_cols`) when a site reads
-/// it (`reads`), else marked as another rows'.
+/// `x`: written (`enqueue_form_cols`) when a site reads it (`reads`), else
+/// marked as another rows'.
 fn write_forms(
     k: &WideKernels<'_>,
     stream: &cuda_core::CudaStream,
@@ -1383,14 +1401,11 @@ fn write_forms(
             q32.forget(form);
             continue;
         }
-        let g32 = k.g32(
+        k.g32(
             "site::write_forms",
             "the 32-value kernels a site's MMA form is written by",
-        )?;
-        match form {
-            MmaForm::Bf16 => g32.enqueue_bf16_cols(stream, x, m, q32)?,
-            MmaForm::Mxfp8 => g32.enqueue_mxfp8_cols(stream, x, m, q32)?,
-        }
+        )?
+        .enqueue_form_cols(stream, form, x, m, q32)?;
     }
     Ok(())
 }

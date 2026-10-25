@@ -4,9 +4,9 @@
 
 use super::act32::ColsForm;
 use super::f32tile::{
-    Bf16Cols, Bf16Rows, ByteRows, MMA_THREADS, MmaCols, MmaRows, NormForm, STAGE_FLOATS,
-    STAGES as MMA_STAGES, TileLaunch, TileRows, bf16_mma_body, bf16_mma_norm_gate_body, form_col,
-    mma_fits, store_refused,
+    Bf16Cols, Bf16Rows, ByteRows, HcUpMixArgs, MMA_THREADS, MmaCols, MmaRows, OutForm,
+    STAGE_FLOATS, STAGES as MMA_STAGES, TileLaunch, TileRows, bf16_mma_body,
+    bf16_mma_norm_gate_body, form_col, mma_fits, refuse_or, store_refused,
 };
 use super::{GemmAct32, GemmRoute};
 use crate::GpuError;
@@ -699,10 +699,10 @@ fn ue8m0_block(amax: f32) -> (u32, f32) {
     (exp, f32::from_bits((254 - exp) << 23))
 }
 
-/// [`Mxfp8Cols`]' planes of a norm-gate epilogue's output columns
-/// (`bf16_mma_norm_gate_body`), a 128-value head at a time, with
-/// `mxfp8_cols_body`'s bits: the head's E4M3 words and scale word, and each
-/// column's refusal word, zero before the launch and ORed by its heads.
+/// [`Mxfp8Cols`]' planes of an epilogue's output columns ([`OutForm`]), with
+/// `mxfp8_cols_body`'s bits: each 32-value block's E4M3 words and its scale
+/// byte, and each column's refusal word, zero before the launch and ORed by
+/// its pieces.
 #[derive(Clone, Copy)]
 struct Mxfp8Out {
     qs: *mut u32,
@@ -710,51 +710,73 @@ struct Mxfp8Out {
     refused: *mut u32,
 }
 
-impl NormForm for Mxfp8Out {
+impl Mxfp8Out {
+    /// Writes the E4M3 words of the 32-value block from value `at` (a
+    /// multiple of 32) that lane `l`'s `v` is value `at + l` of, lane 4q's
+    /// word values 4q .. 4q + 3 as `mxfp8_cols_body`'s lane q writes them;
+    /// the block's UE8M0 exponent, the same in every lane.
+    ///
+    /// # Safety
+    ///
+    /// The whole warp calls converged, and the block's 8 words lie inside the
+    /// form.
     #[inline(always)]
-    #[allow(clippy::needless_range_loop, reason = "indexed CUDA-unrolled arrays")]
-    unsafe fn store(self, v: [f32; 4], c: usize, row0: usize, k: usize) {
-        use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+    unsafe fn block(self, v: f32, at: usize) -> u32 {
         use cuda_device::convert::cvt_rn_satfinite_e4m3x2_f32;
         let lane = warp::lane_id() as usize;
+        let mut amax = v.abs();
+        amax = amax.max(warp::shuffle_xor_f32(amax, 1));
+        amax = amax.max(warp::shuffle_xor_f32(amax, 2));
+        amax = amax.max(warp::shuffle_xor_f32(amax, 4));
+        amax = amax.max(warp::shuffle_xor_f32(amax, 8));
+        amax = amax.max(warp::shuffle_xor_f32(amax, 16));
+        let (exp, inv) = ue8m0_block(amax);
+        let scaled = v * inv;
+        let pair = u32::from(cvt_rn_satfinite_e4m3x2_f32(
+            scaled,
+            warp::shuffle_xor_f32(scaled, 1),
+        ));
+        let word = pair | (warp::shuffle_xor(pair, 2) << 16);
+        if lane.is_multiple_of(4) {
+            // SAFETY: word (at + lane) / 4 is this lane's own (this fn's
+            // contract).
+            unsafe { *self.qs.add((at + lane) / 4) = word };
+        }
+        exp
+    }
+}
+
+impl OutForm for Mxfp8Out {
+    const WRITES: bool = true;
+
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop, reason = "indexed CUDA-unrolled arrays")]
+    unsafe fn store<const N: usize>(self, v: [f32; N], c: usize, row0: usize, k: usize) {
+        const { assert!(N == 1 || N == 4) };
+        let at = c * k + row0;
         let mut fits = true;
         let mut scales = 0u32;
-        // Block b is v[b] of the 32 lanes; lane 4q's word holds values
-        // 4q .. 4q + 3 of it, as mxfp8_cols_body's lane q does.
-        for b in 0..4 {
+        for b in 0..N {
             thread::__unroll_config::<0>();
             fits &= mma_fits(v[b]);
-            let mut amax = v[b].abs();
-            for step in 0..5 {
-                thread::__unroll_config::<0>();
-                amax = amax.max(warp::shuffle_xor_f32(amax, 1 << step));
+            // SAFETY: block b lies inside column c's values (this fn's
+            // contract).
+            scales |= unsafe { self.block(v[b], at + 32 * b) } << (8 * b);
+        }
+        if warp::lane_id() == 0 {
+            if N == 1 {
+                // SAFETY: byte at / 32 is the block's byte of its scale word,
+                // inside the form's scale words; lane 0 of this warp is its
+                // only writer.
+                unsafe { *self.e.cast::<u8>().add(at / 32) = scales as u8 };
+            } else {
+                // SAFETY: word at / 128 is the head's scale word inside the
+                // form's scale words; lane 0 of this warp is its only writer.
+                unsafe { *self.e.add(at / 128) = scales };
             }
-            let (exp, inv) = ue8m0_block(amax);
-            let scaled = v[b] * inv;
-            let pair = u32::from(cvt_rn_satfinite_e4m3x2_f32(
-                scaled,
-                warp::shuffle_xor_f32(scaled, 1),
-            ));
-            let word = pair | (warp::shuffle_xor(pair, 2) << 16);
-            if lane.is_multiple_of(4) {
-                // SAFETY: lane 4q writes word (c·k + row0 + 32b) / 4 + q of
-                // column c's head, inside the form's words (this fn's
-                // contract); no other lane or head writes it.
-                unsafe { *self.qs.add((c * k + row0 + 32 * b + lane) / 4) = word };
-            }
-            scales |= exp << (8 * b);
         }
-        if lane == 0 {
-            // SAFETY: word (c·k + row0) / 128 is the head's scale word inside
-            // the form's scale words; lane 0 of this warp is its only writer.
-            unsafe { *self.e.add((c * k + row0) / 128) = scales };
-        }
-        if warp::any(!fits) && lane == 0 {
-            // SAFETY: c is a live column, so word c lies inside the form's
-            // refusal words, 4-byte aligned; this launch only ORs it atomically.
-            let refused = unsafe { DeviceAtomicU32::from_ptr(self.refused.add(c)) };
-            refused.fetch_or(1, AtomicOrdering::Relaxed);
-        }
+        // SAFETY: c is a live column the form holds (this fn's contract).
+        unsafe { refuse_or(self.refused, c, fits) };
     }
 }
 
@@ -1565,6 +1587,64 @@ mod native {
             )
         };
     }
+
+    /// `hc_gated_up_mma_mix_4`, also writing `mixed`'s MXFP8 form: its
+    /// E4M3 words and scale words and each column's refusal word, zero
+    /// before the launch.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            hidden > 0, m > 8,
+            w.len() >= 4 * hidden * 160,
+            lo.len() >= m * 320,
+            lo_words.len() >= m * 160,
+            lo_refused.len() >= m,
+            xn.len() >= m * 4 * hidden,
+            g.len() >= m * 4 * hidden,
+            mixed.len() >= m * hidden,
+            4 * qs.len() >= m * hidden,
+            128 * e.len() >= m * hidden,
+            refused.len() >= m
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn hc_gated_up_mma_mix_4_mxfp8(
+        w: &[u32],
+        lo: &[f32],
+        lo_words: &[u32],
+        lo_refused: &[u32],
+        xn: &[f32],
+        hidden: u32,
+        m: u32,
+        fault: crate::fault::FaultSink,
+        mut g: DisjointSlice<f32>,
+        mut mixed: DisjointSlice<f32>,
+        mut qs: DisjointSlice<u32>,
+        mut e: DisjointSlice<u32>,
+        mut refused: DisjointSlice<u32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { MMA_STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, accessed without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        let x = (lo, lo_words, lo_refused, xn);
+        let form = Mxfp8Out {
+            qs: qs.as_mut_ptr(),
+            e: e.as_mut_ptr(),
+            refused: refused.as_mut_ptr(),
+        };
+        // SAFETY: the checked launch gives 256 converged threads, the MMA grid
+        // and the spans above, the form's planes for the m columns of `hidden`
+        // values, `hidden` a multiple of 128; sh is this block's allocation.
+        unsafe {
+            crate::hc_gated::up_mma_mix_body(w, x, (hidden, m), fault, &mut g, &mut mixed, form, sh)
+        };
+    }
 }
 
 pub(super) struct Kernels {
@@ -1597,7 +1677,8 @@ pub(super) struct SwigluArgs<'a> {
 
 /// [`Kernels::mxfp8_w8a8_norm_gate`]'s arguments: the weight `w` over the
 /// MXFP8 `form` of `x`, the checked launch `t`, the exact replay's scratch
-/// `z`, the norm and gate operands `tail`, and the output form `out`.
+/// `z`, the norm and gate operands `tail`, and the output form's words,
+/// scale words and zeroed refusal words `out` ([`GemmAct32::out_planes`]).
 pub(super) struct NativeNormGateArgs<'a> {
     pub(super) w: E4m3Weight<'a>,
     pub(super) x: &'a DeviceBuffer<f32>,
@@ -1605,7 +1686,7 @@ pub(super) struct NativeNormGateArgs<'a> {
     pub(super) t: &'a TileLaunch,
     pub(super) z: &'a mut DeviceBuffer<f32>,
     pub(super) tail: NormGateTail<'a>,
-    pub(super) out: &'a mut ColsForm,
+    pub(super) out: [&'a mut DeviceBuffer<u32>; 3],
 }
 
 pub(super) struct ProductArgs<'a> {
@@ -1893,35 +1974,45 @@ impl Kernels {
             t,
             z,
             tail,
-            out,
+            out: [yq, ye, yrefused],
         } = a;
         let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
         let prep = self.module.prepare_mxfp8_w8a8_norm_gate(cfg)?;
         let (qs, e) = (w.qs.buf(), w.e.buf());
         let (xq, xe, refused) = (&form.words, &form.scales, &form.refused);
-        // The heads of a column OR its refusal word.
-        out.refused.zero_async(stream)?;
         self.module.mxfp8_w8a8_norm_gate(
-            stream,
-            &prep,
-            qs,
-            e,
-            x,
-            xq,
-            xe,
+            stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, tail.o, tail.w, tail.eps,
+            tail.fault, z, tail.y, yq, ye, yrefused,
+        )?;
+        Ok(())
+    }
+
+    /// `hc_gated_up_mma_mix_4` over the checked launch `a.cfg`, also writing
+    /// `mixed`'s MXFP8 form into `a.planes`
+    /// ([`native::hc_gated_up_mma_mix_4_mxfp8`]).
+    pub(super) fn hc_up_mix_mxfp8(
+        &self,
+        stream: &CudaStream,
+        a: HcUpMixArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let HcUpMixArgs {
+            cfg,
+            w,
+            lo,
+            lo_words,
+            lo_refused,
+            xn,
+            hidden,
+            m,
+            fault,
+            g,
+            mixed,
+            planes: [qs, e, refused],
+        } = a;
+        let prep = self.module.prepare_hc_gated_up_mma_mix_4_mxfp8(cfg)?;
+        self.module.hc_gated_up_mma_mix_4_mxfp8(
+            stream, &prep, w, lo, lo_words, lo_refused, xn, hidden, m, fault, g, mixed, qs, e,
             refused,
-            t.rows,
-            t.k,
-            t.n,
-            tail.o,
-            tail.w,
-            tail.eps,
-            tail.fault,
-            z,
-            tail.y,
-            &mut out.words,
-            &mut out.scales,
-            &mut out.refused,
         )?;
         Ok(())
     }

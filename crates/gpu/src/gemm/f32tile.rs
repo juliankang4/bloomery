@@ -1673,24 +1673,95 @@ pub(crate) unsafe fn bf16_mma_narrow(
     }
 }
 
-/// What a norm-gate epilogue ([`bf16_mma_norm_gate_body`]) writes of its
-/// output columns beside their f32 values: nothing, or the MMA form the next
-/// site reads (`nvfp4mma.rs`'s `Mxfp8Out`).
-pub(crate) trait NormForm: Copy {
-    /// Writes the form of the 128 values of column `c` from row `row0`, `k`
-    /// values a column, that one warp holds: lane `l`'s `v[i]` is row
-    /// `row0 + l + 32·i`'s.
+/// What an epilogue writes of its output columns beside their f32 values
+/// (a norm gate's [`bf16_mma_norm_gate_body`], the HC mix's
+/// `hc_gated::up_mma_mix_body`): nothing, or the MMA form the next site
+/// reads ([`Bf16Out`], `nvfp4mma.rs`'s `Mxfp8Out`), each column's refusal
+/// word zero before the launch and ORed by its pieces.
+pub(crate) trait OutForm: Copy {
+    /// Whether the epilogue writes anything.
+    const WRITES: bool;
+
+    /// Writes the form of the `N` 32-value blocks (`N` 1 or 4) of column `c`
+    /// from row `row0`, `k` values a column, that one warp holds: lane `l`'s
+    /// `v[i]` is row `row0 + l + 32·i`'s, `row0` a multiple of `32·N`.
     ///
     /// # Safety
     ///
     /// The whole warp calls converged on a live column the form holds room
-    /// for, and the head lies inside its `k` values.
-    unsafe fn store(self, v: [f32; 4], c: usize, row0: usize, k: usize);
+    /// for, and the blocks lie inside its `k` values.
+    unsafe fn store<const N: usize>(self, v: [f32; N], c: usize, row0: usize, k: usize);
 }
 
-impl NormForm for () {
+impl OutForm for () {
+    const WRITES: bool = false;
+
     #[inline(always)]
-    unsafe fn store(self, _: [f32; 4], _: usize, _: usize, _: usize) {}
+    unsafe fn store<const N: usize>(self, _: [f32; N], _: usize, _: usize, _: usize) {}
+}
+
+/// [`Bf16Cols`]' words and refusal words of an epilogue's output columns,
+/// with [`bf16_cols_body`]'s bits: each value rounded to nearest even, the
+/// even lane of a pair writing their word.
+#[derive(Clone, Copy)]
+pub(crate) struct Bf16Out {
+    pub(crate) words: *mut u32,
+    pub(crate) refused: *mut u32,
+}
+
+impl OutForm for Bf16Out {
+    const WRITES: bool = true;
+
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop, reason = "indexed CUDA-unrolled arrays")]
+    unsafe fn store<const N: usize>(self, v: [f32; N], c: usize, row0: usize, k: usize) {
+        let mut fits = true;
+        for i in 0..N {
+            thread::__unroll_config::<0>();
+            // SAFETY: rows row0 + 32i .. + 32 lie in the blocks (this fn's
+            // contract).
+            fits &= unsafe { self.pair(v[i], c * k + row0 + 32 * i) };
+        }
+        // SAFETY: c is a live column the form holds (this fn's contract).
+        unsafe { refuse_or(self.refused, c, fits) };
+    }
+}
+
+impl Bf16Out {
+    /// Writes the words of the 32 values from value `at` (a multiple of 32)
+    /// that lane `l`'s `v` is value `at + l` of; whether `v` fits.
+    ///
+    /// # Safety
+    ///
+    /// The whole warp calls converged, and the 16 words lie inside the form.
+    #[inline(always)]
+    unsafe fn pair(self, v: f32, at: usize) -> bool {
+        let lane = warp::lane_id() as usize;
+        let word = cvt_bf16x2_f32(v, warp::shuffle_xor_f32(v, 1));
+        if lane.is_multiple_of(2) {
+            // SAFETY: word (at + lane) / 2 is this even lane's own (this fn's
+            // contract).
+            unsafe { *self.words.add((at + lane) / 2) = word };
+        }
+        mma_fits(v)
+    }
+}
+
+/// ORs 1 into column `c`'s refusal word when a lane of the warp saw a value
+/// [`mma_fits`] refuses (`fits` false). Every lane of the warp calls it.
+///
+/// # Safety
+///
+/// `refused` holds a live word for column `c`, which this launch only ORs.
+#[inline(always)]
+pub(crate) unsafe fn refuse_or(refused: *mut u32, c: usize, fits: bool) {
+    use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+    if warp::any(!fits) && warp::lane_id() == 0 {
+        // SAFETY: word c is live and 4-byte aligned (this fn's contract); the
+        // launch only ORs it atomically.
+        let word = unsafe { DeviceAtomicU32::from_ptr(refused.add(c)) };
+        word.fetch_or(1, AtomicOrdering::Relaxed);
+    }
 }
 
 /// Dense prompt product ([`bf16_mma_body`]'s, BF16 or block-scaled E4M3)
@@ -1715,7 +1786,7 @@ impl NormForm for () {
     clippy::needless_range_loop,
     reason = "flat device operands and indexed CUDA-unrolled arrays"
 )]
-pub(crate) unsafe fn bf16_mma_norm_gate_body<W: MmaRows, X: MmaCols, F: NormForm>(
+pub(crate) unsafe fn bf16_mma_norm_gate_body<W: MmaRows, X: MmaCols, F: OutForm>(
     w: W,
     x: X,
     rows: u32,
@@ -2059,7 +2130,7 @@ impl Gemm32Kernels {
         tail.check_rows(what, t.rows as usize, n, z.len())?;
         let form = held_form(what, act, MmaForm::Mxfp8, x, &t)?;
         let y = tail.y.cu_deviceptr();
-        let into = out.room(what, MmaForm::Mxfp8, t.rows as usize, n)?;
+        let into = out.out_planes(stream, what, MmaForm::Mxfp8, (t.rows as usize, n))?;
         #[cfg(bloomery_nvfp4_mma)]
         {
             self.native.mxfp8_w8a8_norm_gate(
@@ -2071,15 +2142,38 @@ impl Gemm32Kernels {
                     t: &t,
                     z,
                     tail,
-                    out: &mut *into,
+                    out: into,
                 },
             )?;
-            into.of = Some((y, n));
-            out.forget(MmaForm::Bf16);
+            out.wrote(MmaForm::Mxfp8, y, n);
             Ok(())
         }
         #[cfg(not(bloomery_nvfp4_mma))]
         Err(GpuError::state(what, NATIVE_BUILD))
+    }
+
+    /// The wide HC up/mix launch (`hc_gated::up_mma_mix_body`) that also
+    /// writes the MXFP8 form of `mixed`'s columns into `a.planes`
+    /// ([`HcUpMixArgs`]). A build without the native block-scaled kernels
+    /// refuses it by name.
+    #[cfg_attr(
+        not(bloomery_nvfp4_mma),
+        allow(unused_variables, reason = "the native build's launch reads them")
+    )]
+    pub(crate) fn enqueue_hc_up_mix_mxfp8(
+        &self,
+        stream: &CudaStream,
+        a: HcUpMixArgs<'_>,
+    ) -> Result<(), GpuError> {
+        #[cfg(bloomery_nvfp4_mma)]
+        {
+            self.native.hc_up_mix_mxfp8(stream, a)
+        }
+        #[cfg(not(bloomery_nvfp4_mma))]
+        Err(GpuError::state(
+            "Gemm32Kernels::enqueue_hc_up_mix_mxfp8",
+            NATIVE_BUILD,
+        ))
     }
 }
 
@@ -2196,6 +2290,32 @@ pub struct Mxfp8NormGateArgs<'a> {
     pub z: &'a mut DeviceBuffer<f32>,
     pub tail: NormGateTail<'a>,
     pub out: &'a mut GemmAct32,
+}
+
+/// [`Gemm32Kernels::enqueue_hc_up_mix_mxfp8`]'s arguments, as
+/// `hc_gated::HcWideKernels::enqueue_mix` checked them: the launch `cfg`
+/// over the BF16 up weight `w`, the bottleneck `lo` with its BF16 words
+/// `lo_words` and refusal words `lo_refused`, the normed rows `xn`, `m`
+/// columns of `hidden` values, the fault sink, the outputs `g` and `mixed`,
+/// and `planes`, the words, scale words and zeroed refusal words of
+/// `mixed`'s MXFP8 form ([`GemmAct32::out_planes`]).
+#[cfg_attr(
+    not(bloomery_nvfp4_mma),
+    allow(dead_code, reason = "the native build's launch reads them")
+)]
+pub(crate) struct HcUpMixArgs<'a> {
+    pub(crate) cfg: LaunchConfig1D,
+    pub(crate) w: &'a DeviceBuffer<u32>,
+    pub(crate) lo: &'a DeviceBuffer<f32>,
+    pub(crate) lo_words: &'a DeviceBuffer<u32>,
+    pub(crate) lo_refused: &'a DeviceBuffer<u32>,
+    pub(crate) xn: &'a DeviceBuffer<f32>,
+    pub(crate) hidden: u32,
+    pub(crate) m: u32,
+    pub(crate) fault: FaultSink,
+    pub(crate) g: &'a mut DeviceBuffer<f32>,
+    pub(crate) mixed: &'a mut DeviceBuffer<f32>,
+    pub(crate) planes: [&'a mut DeviceBuffer<u32>; 3],
 }
 
 /// A tile launch's grid and its `u32` arguments.

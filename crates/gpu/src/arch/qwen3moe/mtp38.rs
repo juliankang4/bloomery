@@ -2451,6 +2451,7 @@ impl Mtp38 {
                 q8f32: gpu.q8f32(),
                 dense: &s.rows,
                 mixed: &mut s.mixed,
+                out: None,
             },
         )?;
         site::resident_quantize(

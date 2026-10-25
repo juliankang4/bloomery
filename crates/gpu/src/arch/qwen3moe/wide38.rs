@@ -1758,6 +1758,22 @@ fn quantize_for(
     site::resident_quantize(c.gpu, &dense_kernels(c), (c.w, names), rows, act, sink)
 }
 
+/// [`quantize_for`] unless `act` already holds the one form `names` read of
+/// the first `m` columns of `rows` ([`site::only_form`]): the mix that wrote
+/// the rows writes that form beside them or marks it no rows' ([`mix`]).
+fn quantize_unheld(
+    c: &Ctx38<'_>,
+    names: &[&str],
+    (rows, m): (&DeviceBuffer<f32>, usize),
+    act: &mut GemmAct32,
+    sink: FaultSink,
+) -> Result<(), GpuError> {
+    if site::only_form(c.gpu, c.w, names, act).is_some_and(|f| act.holds(f, rows, m)) {
+        return Ok(());
+    }
+    quantize_for(c, names, (rows, m), act, sink)
+}
+
 /// `y = W · rows` for the dense weight `name` over the first `m` columns by
 /// its resident form, token-major, on the walk's one-expert table `dense`
 /// ([`site::resident_gemm`]): Q8_0 over `act`, the q8 of `rows`
@@ -1784,7 +1800,9 @@ fn wide_in<'a>(rows: &'a DeviceBuffer<f32>, act: &'a GemmAct32) -> WideIn<'a> {
 
 /// The wide mix of `site` over `m` columns of `res`, after `before`, into
 /// `mixed`, the scratch's combine weights on the unit's rows `wgt`
-/// ([`UnitHc`]).
+/// ([`UnitHc`]). When the sites `readers` read one form of `mixed` alone
+/// ([`site::only_form`]), the mix writes it into `act` or marks it no rows'
+/// ([`quantize_unheld`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "one site's streams, rule, width, sink, scratch, table and output (rust-quality R8)"
@@ -1797,8 +1815,9 @@ fn mix(
     m: usize,
     fault: FaultSink,
     (scratch, wgt, dense): (&mut HcWideScratch, Span, &GemmRoute),
-    mixed: &mut DeviceBuffer<f32>,
+    (mixed, readers, act): (&mut DeviceBuffer<f32>, &[&str], &mut GemmAct32),
 ) -> Result<(), GpuError> {
+    let form = site::only_form(c.gpu, c.w, readers, act);
     let hc = UnitHc::on(scratch, wgt)?;
     let w = c.w;
     let inject = match &site.inject {
@@ -1824,6 +1843,7 @@ fn mix(
             q8f32: c.gpu.q8f32(),
             dense,
             mixed,
+            out: form.map(|f| (f, act)),
         },
     )
 }
@@ -1889,6 +1909,17 @@ impl WideParts<'_> {
         let c = &self.c;
         let s = &mut *self.s;
         let x = &mut *self.x;
+        let (gdn_in, qsa_in);
+        let readers: &[&str] = match &p.mixer {
+            Mixer38::Gdn(g) => {
+                gdn_in = g.input_sites();
+                &gdn_in
+            }
+            Mixer38::Qsa(q) => {
+                qsa_in = q.input_sites();
+                &qsa_in
+            }
+        };
         if l == 0 {
             let table = EmbedRows::of(
                 c.w,
@@ -1920,7 +1951,7 @@ impl WideParts<'_> {
                 m,
                 sink,
                 (&mut x.hc, u.wgt, &x.dense[u.route]),
-                &mut s.mixed,
+                (&mut s.mixed, readers, &mut x.act_hid),
             )?;
         } else if let Some(pp) = &p.ple {
             if let Some(rows_in) = self.ple_rows.take() {
@@ -1985,7 +2016,7 @@ impl WideParts<'_> {
                 m,
                 sink,
                 (&mut x.hc, u.wgt, dense),
-                &mut s.mixed,
+                (&mut s.mixed, readers, &mut x.act_hid),
             )?;
         } else {
             mix(
@@ -1996,7 +2027,7 @@ impl WideParts<'_> {
                 m,
                 sink,
                 (&mut x.hc, u.wgt, &x.dense[u.route]),
-                &mut s.mixed,
+                (&mut s.mixed, readers, &mut x.act_hid),
             )?;
         }
         let store = self
@@ -2038,7 +2069,7 @@ impl WideParts<'_> {
             u.m,
             sink,
             (&mut x.hc, u.wgt, &x.dense[u.route]),
-            &mut u.ffn_x,
+            (&mut u.ffn_x, &p.ffn.shared_inputs(), &mut x.act_hid),
         )
     }
 
@@ -2149,7 +2180,7 @@ impl WideParts<'_> {
         let (c, m) = (&self.c, u.m);
         let (s, x) = (&mut *self.s, &mut *self.x);
         let f = &p.ffn;
-        quantize_for(c, &f.shared_inputs(), (&*u.ffn_x, m), &mut x.act_hid, sink)?;
+        quantize_unheld(c, &f.shared_inputs(), (&*u.ffn_x, m), &mut x.act_hid, sink)?;
         let site = |name| -> Result<_, GpuError> {
             let ty = site::resident_type(c.w, "qwen38::wide shared", name)?;
             Ok((ty, SiteWeight::Resident(name)))
@@ -2384,7 +2415,7 @@ fn gdn(
         attn,
         ..
     } = s;
-    quantize_for(c, &gp.input_sites(), (mixed, m), &mut x.act_hid, sink)?;
+    quantize_unheld(c, &gp.input_sites(), (mixed, m), &mut x.act_hid, sink)?;
     let dense = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
     dense_gemm(c, &gp.qkv, act, dense, &mut g.x)?;
@@ -2498,7 +2529,7 @@ fn qsa(
         attn,
         ..
     } = s;
-    quantize_for(c, &qp.input_sites(), (mixed, m), &mut x.act_hid, sink)?;
+    quantize_unheld(c, &qp.input_sites(), (mixed, m), &mut x.act_hid, sink)?;
     let table = &x.dense[u.route];
     let act = (&*mixed, &x.act_hid, m);
     dense_gemm(c, &qp.q, act, table, &mut q.qg)?;
@@ -2832,7 +2863,11 @@ impl<'a> Gemm38<'a> {
         let fault = gpu.fault_sink(LAYER_HEAD);
         let s = &mut *self.p.s;
         let Wide38 {
-            units, hc, dense, ..
+            units,
+            hc,
+            dense,
+            act_hid,
+            ..
         } = &mut *self.p.x;
         let u = units
             .last_mut()
@@ -2852,7 +2887,7 @@ impl<'a> Gemm38<'a> {
             m,
             fault,
             (hc, u.wgt, &dense[u.route]),
-            &mut s.mixed,
+            (&mut s.mixed, &[], act_hid),
         )?;
         // Row m − 1 of `mixed` (1 <= m <= rows, the walk refused anything
         // else).

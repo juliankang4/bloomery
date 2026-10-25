@@ -16,6 +16,10 @@
 # two-lanes-a-thread tile body.
 # PIN(2026-10-25): HC up BF16 input: sm_86 spill 484 -> 608 B, GB10 JIT local unchanged at 88 B; native sm_121/sm_121a spill 364 -> 332 B; deferred flags and u32 columns each measured 532 B spill / 96 B JIT local.
 generate_ds41 hc_gated_up_mma_mix_4 332 88
+# PIN(2026-10-25): the HC up/mix entries that also write mixed's BF16 or MXFP8 form, spill and GB10 JIT local
+# measured with ptxas 13.3.73, driver 595.84, sm_121a.
+generate_ds41 hc_gated_up_mma_mix_4_bf16 348 88
+generate_ds41 hc_gated_up_mma_mix_4_mxfp8 348 88
 generate_ds41 mamba2_steps 0 0
 generate_ds41 nvfp4_gemv_sel_f32 0 0
 # PIN(2026-10-23): measured on sm_121a, GB10, driver 595.84, CUDA 13.3.1. Shared GEMM epilogues retain exceptional range; the native 4K pair showed no throughput loss.

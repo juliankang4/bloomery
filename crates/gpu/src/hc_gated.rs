@@ -73,11 +73,11 @@ use crate::cores::l2_prefetch;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
-    Bf16Cols, Bf16Rows, F32Cols, F32Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32,
-    GemmInput, GemmRoute, MMA_CELLS, MMA_COLS, MMA_ROWS, MMA_THREADS, MMA_WARP_COLS, MMA_WARP_ROWS,
-    MMA_WARP_SCRATCH, MmaCols, MmaRows, MmaTile, STAGE_FLOATS, STAGES, TileRows, bf16_mma_body,
-    bf16_mma_launch, bf16_mma_tile, form_col, land_values, mma_launch, mma_tile_origin,
-    store_refused,
+    Bf16Cols, Bf16Out, Bf16Rows, F32Cols, F32Rows, Gemm32Args, Gemm32Kernels, Gemm32Weight,
+    GemmAct32, GemmInput, GemmRoute, HcUpMixArgs, MMA_CELLS, MMA_COLS, MMA_ROWS, MMA_THREADS,
+    MMA_WARP_COLS, MMA_WARP_ROWS, MMA_WARP_SCRATCH, MmaCols, MmaForm, MmaRows, MmaTile, OutForm,
+    STAGE_FLOATS, STAGES, TileRows, bf16_mma_body, bf16_mma_launch, bf16_mma_tile, form_col,
+    land_values, mma_launch, mma_tile_origin, store_refused,
 };
 use crate::linear::{sigmoid, silu};
 use crate::q8f32::{
@@ -1852,6 +1852,104 @@ unsafe fn mma_mix<const FROM_G: bool>(
     }
 }
 
+/// The wide arm's up product of the BF16 up rows `w` over the bottleneck
+/// (`lo` and its BF16 words and refusal words), its gates mixed with `xn` in
+/// the MMA epilogue ([`mma_mix`]) into `mixed`, and `form` of `mixed`: once
+/// the block's stores are published, warp `w` reads back the tile's 32
+/// hidden values of its columns `w, w + 8, ...` and writes their form.
+///
+/// # Safety
+/// All 256 threads of a block call converged on the checked launch of
+/// `hc_gated_up_mma_mix_4` (its spans, `m > 8` and the MMA grid), `hidden` a
+/// multiple of 32; `form` holds room for the `m` columns of `hidden` values,
+/// and `sh` is the block's aligned allocation of `STAGES * STAGE_FLOATS`
+/// floats.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the kernel's operands, sizes, outputs and form, as its entries pass them"
+)]
+pub(crate) unsafe fn up_mma_mix_body<F: OutForm>(
+    w: &[u32],
+    (lo, lo_words, lo_refused, xn): (&[f32], &[u32], &[u32], &[f32]),
+    (hidden, m): (u32, u32),
+    fault: FaultSink,
+    g: &mut DisjointSlice<f32>,
+    mixed: &mut DisjointSlice<f32>,
+    form: F,
+    sh: *mut f32,
+) {
+    let hid = hidden as usize;
+    let wide = STREAMS * hid;
+    let rows = HcUpRows {
+        words: w,
+        hidden: hid,
+    };
+    let origin = mma_tile_origin::<HcUpRows<'_>>(wide, m as usize);
+    // Ask L2 for the tile's XN_LINES lines of xn, thread `tid` lines `tid`
+    // and `tid + MMA_THREADS`, so the mix after the MMA finds them there.
+    // A hint: it reads nothing into registers and changes no value.
+    if let Some((row0, col0)) = origin {
+        let h0 = row0 / STREAMS;
+        let bytes = 4 * (hid - h0).min(MMA_ROWS / STREAMS);
+        let tid = thread::threadIdx_x() as usize;
+        for k in 0..XN_LINES / MMA_THREADS as usize {
+            thread::__unroll_config::<0>();
+            let line = tid + k * MMA_THREADS as usize;
+            let (col, s) = (col0 + line / STREAMS, line % STREAMS);
+            if col < m as usize {
+                // Hidden indices h0 .. h0 + bytes / 4 of stream s of a live
+                // column: inside xn.
+                l2_prefetch(xn, 4 * (col * wide + s * hid + h0), bytes, 0);
+            }
+        }
+    }
+    let cols = Bf16Cols {
+        words: lo_words,
+        refused: lo_refused,
+        exact: lo,
+    };
+    // SAFETY: the checked launch supplies the shared allocation, 256 threads,
+    // the MMA grid, aligned bottleneck columns and the complete BF16 weight.
+    let Some(mut tile) = (unsafe { bf16_mma_tile(rows, cols, wide as u32, RANK as u32, m, sh) })
+    else {
+        return;
+    };
+    let scratch = tile.warp_scratch(sh, RANK);
+    // SAFETY: every thread shares this checked tile's allocation and K.
+    if unsafe { tile.needs_replay(sh, RANK) } {
+        // SAFETY: g covers the logical output tile, with one writer per cell.
+        unsafe { tile.store::<true>(g, wide, m as usize) };
+        thread::sync_threads();
+        // SAFETY: stores are published and the exact owner uses the same spans.
+        unsafe { tile.replay(rows, lo, (wide, RANK, m as usize), g, sh) };
+        // SAFETY: replay finished; g, xn and mixed cover this tile.
+        unsafe { mma_mix::<true>(&tile, xn, g, hid, m, fault, mixed, scratch) };
+    } else {
+        // SAFETY: no replay is needed; the checked live cells remain in registers.
+        unsafe { mma_mix::<false>(&tile, xn, g, hid, m, fault, mixed, scratch) };
+    }
+    if F::WRITES
+        && let Some((row0, col0)) = origin
+    {
+        // Publish every warp's mixed stores before the warps read them back.
+        thread::sync_threads();
+        let h0 = row0 / STREAMS;
+        let lane = warp::lane_id() as usize;
+        let warps = MMA_THREADS as usize / 32;
+        let mut c = col0 + thread::threadIdx_x() as usize / 32;
+        while c < (col0 + MMA_COLS).min(m as usize) {
+            // SAFETY: the barrier above published this tile's value (c, h0 +
+            // lane), inside mixed: c < m and h0 + 32 <= hidden.
+            let v = unsafe { *mixed.as_mut_ptr().add(c * hid + h0 + lane) };
+            // SAFETY: c < m is warp-uniform, so the warp is converged on a live
+            // column, and the 32 values lie in it (this fn's contract).
+            unsafe { form.store([v], c, h0, hid) };
+            c += warps;
+        }
+    }
+}
+
 #[cuda_module]
 mod hc_wide_kernels {
     use super::*;
@@ -1892,56 +1990,62 @@ mod hc_wide_kernels {
         static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
         // SAFETY: this block's aligned shared allocation, without a reference.
         let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
-        let hid = hidden as usize;
-        let wide = STREAMS * hid;
-        let rows = HcUpRows {
-            words: w,
-            hidden: hid,
+        let x = (lo, lo_words, lo_refused, xn);
+        // SAFETY: the checked launch gives 256 converged threads, the MMA grid
+        // and the spans above; sh is this block's allocation.
+        unsafe { up_mma_mix_body(w, x, (hidden, m), fault, &mut g, &mut mixed, (), sh) };
+    }
+
+    /// [`hc_gated_up_mma_mix_4`], also writing `mixed`'s BF16 form: its
+    /// words and each column's refusal word, zero before the launch.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            hidden > 0, m > 8,
+            w.len() >= 4 * hidden * 160,
+            lo.len() >= m * 320,
+            lo_words.len() >= m * 160,
+            lo_refused.len() >= m,
+            xn.len() >= m * 4 * hidden,
+            g.len() >= m * 4 * hidden,
+            mixed.len() >= m * hidden,
+            2 * words.len() >= m * hidden,
+            refused.len() >= m
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn hc_gated_up_mma_mix_4_bf16(
+        w: &[u32],
+        lo: &[f32],
+        lo_words: &[u32],
+        lo_refused: &[u32],
+        xn: &[f32],
+        hidden: u32,
+        m: u32,
+        fault: FaultSink,
+        mut g: DisjointSlice<f32>,
+        mut mixed: DisjointSlice<f32>,
+        mut words: DisjointSlice<u32>,
+        mut refused: DisjointSlice<u32>,
+    ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+        // SAFETY: this block's aligned shared allocation, without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+        let x = (lo, lo_words, lo_refused, xn);
+        let form = Bf16Out {
+            words: words.as_mut_ptr(),
+            refused: refused.as_mut_ptr(),
         };
-        // Ask L2 for the tile's XN_LINES lines of xn, thread `tid` lines `tid`
-        // and `tid + MMA_THREADS`, so the mix after the MMA finds them there.
-        // A hint: it reads nothing into registers and changes no value.
-        if let Some((row0, col0)) = mma_tile_origin::<HcUpRows<'_>>(wide, m as usize) {
-            let h0 = row0 / STREAMS;
-            let bytes = 4 * (hid - h0).min(MMA_ROWS / STREAMS);
-            let tid = thread::threadIdx_x() as usize;
-            for k in 0..XN_LINES / MMA_THREADS as usize {
-                thread::__unroll_config::<0>();
-                let line = tid + k * MMA_THREADS as usize;
-                let (col, s) = (col0 + line / STREAMS, line % STREAMS);
-                if col < m as usize {
-                    // Hidden indices h0 .. h0 + bytes / 4 of stream s of a live
-                    // column: inside xn.
-                    l2_prefetch(xn, 4 * (col * wide + s * hid + h0), bytes, 0);
-                }
-            }
-        }
-        let cols = Bf16Cols {
-            words: lo_words,
-            refused: lo_refused,
-            exact: lo,
-        };
-        // SAFETY: the checked launch supplies the shared allocation, 256 threads,
-        // the MMA grid, aligned bottleneck columns and the complete BF16 weight.
-        let Some(mut tile) =
-            (unsafe { bf16_mma_tile(rows, cols, wide as u32, RANK as u32, m, sh) })
-        else {
-            return;
-        };
-        let scratch = tile.warp_scratch(sh, RANK);
-        // SAFETY: every thread shares this checked tile's allocation and K.
-        if unsafe { tile.needs_replay(sh, RANK) } {
-            // SAFETY: g covers the logical output tile, with one writer per cell.
-            unsafe { tile.store::<true>(&mut g, wide, m as usize) };
-            thread::sync_threads();
-            // SAFETY: stores are published and the exact owner uses the same spans.
-            unsafe { tile.replay(rows, lo, (wide, RANK, m as usize), &mut g, sh) };
-            // SAFETY: replay finished; g, xn and mixed cover this tile.
-            unsafe { mma_mix::<true>(&tile, xn, &mut g, hid, m, fault, &mut mixed, scratch) };
-        } else {
-            // SAFETY: no replay is needed; the checked live cells remain in registers.
-            unsafe { mma_mix::<false>(&tile, xn, &mut g, hid, m, fault, &mut mixed, scratch) };
-        }
+        // SAFETY: the checked launch gives 256 converged threads, the MMA grid
+        // and the spans above, the form's words and refusal words for the m
+        // columns of `hidden` values; sh is this block's allocation.
+        unsafe { up_mma_mix_body(w, x, (hidden, m), fault, &mut g, &mut mixed, form, sh) };
     }
 
     /// [`hc_kernels::hc_gated_norm_4`] over any number of columns: block `b`
@@ -2320,6 +2424,10 @@ pub struct WideMixArgs<'a> {
     pub q8f32: &'a Q8F32Kernels,
     pub dense: &'a GemmRoute,
     pub mixed: &'a mut DeviceBuffer<f32>,
+    /// A form of `mixed` for the scratch beside it: written by the up/mix
+    /// launch when the up and the mix run as one MMA product, else marked as
+    /// no rows' ([`GemmAct32::holds`] tells which).
+    pub out: Option<(MmaForm, &'a mut GemmAct32)>,
 }
 
 /// The wide arm's loaded module. Owns no stream: each enqueue takes the
@@ -2346,9 +2454,10 @@ impl HcWideKernels {
     /// separate up and mix launches. An inject site leaves its combine weights
     /// in the scratch for the next site's [`Before::Combine`]. `m` outside
     /// `1..=scratch.cols()`, a short buffer, planes of another shape
-    /// (the narrow arm's check, `check_mix`) or a table filled for another
-    /// count are refused by name before any launch. Asynchronous,
-    /// allocation-free.
+    /// (the narrow arm's check, `check_mix`), a table filled for another
+    /// count or, when the up and the mix run as one product, an `out`
+    /// without room for its form of `mixed` are refused by name before any
+    /// launch. Asynchronous, allocation-free.
     pub fn enqueue_mix(&self, stream: &CudaStream, a: WideMixArgs<'_>) -> Result<(), GpuError> {
         let what = "hc_gated::enqueue_mix_wide";
         let geo = a.scratch.geo;
@@ -2405,6 +2514,15 @@ impl HcWideKernels {
             ))
         } else {
             None
+        };
+        // The fused up/mix writes `mixed`'s form: its room is checked, and its
+        // refusal words zeroed, before any launch.
+        let mut out = a.out;
+        let planes = match (&fused, &mut out) {
+            (Some(_), Some((form, act))) => {
+                Some((*form, act.out_planes(stream, what, *form, (geo.d(), m))?))
+            }
+            _ => None,
         };
         let s = &mut *a.scratch;
         let prep = self.module.prepare_hc_gated_norm_4w(LaunchConfig1D::new(
@@ -2492,24 +2610,72 @@ impl HcWideKernels {
             &mut s.wgt,
         )?;
         if let Some((w, t)) = fused {
-            let prep = self
-                .module
-                .prepare_hc_gated_up_mma_mix_4(LaunchConfig1D::new(t.grid, MMA_THREADS, 0))?;
-            self.module.hc_gated_up_mma_mix_4(
-                stream,
-                &prep,
-                w.buf(),
-                &s.lo,
-                &s.lo_words,
-                &s.lo_refused,
-                &s.xn,
-                hidden,
-                mu,
-                a.fault,
-                &mut s.g,
-                a.mixed,
-            )?;
+            let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
+            let at = a.mixed.cu_deviceptr();
+            match planes {
+                None => {
+                    let prep = self.module.prepare_hc_gated_up_mma_mix_4(cfg)?;
+                    self.module.hc_gated_up_mma_mix_4(
+                        stream,
+                        &prep,
+                        w.buf(),
+                        &s.lo,
+                        &s.lo_words,
+                        &s.lo_refused,
+                        &s.xn,
+                        hidden,
+                        mu,
+                        a.fault,
+                        &mut s.g,
+                        a.mixed,
+                    )?;
+                }
+                Some((MmaForm::Bf16, [words, _, refused])) => {
+                    let prep = self.module.prepare_hc_gated_up_mma_mix_4_bf16(cfg)?;
+                    self.module.hc_gated_up_mma_mix_4_bf16(
+                        stream,
+                        &prep,
+                        w.buf(),
+                        &s.lo,
+                        &s.lo_words,
+                        &s.lo_refused,
+                        &s.xn,
+                        hidden,
+                        mu,
+                        a.fault,
+                        &mut s.g,
+                        a.mixed,
+                        words,
+                        refused,
+                    )?;
+                }
+                Some((MmaForm::Mxfp8, planes)) => {
+                    a.gemm.enqueue_hc_up_mix_mxfp8(
+                        stream,
+                        HcUpMixArgs {
+                            cfg,
+                            w: w.buf(),
+                            lo: &s.lo,
+                            lo_words: &s.lo_words,
+                            lo_refused: &s.lo_refused,
+                            xn: &s.xn,
+                            hidden,
+                            m: mu,
+                            fault: a.fault,
+                            g: &mut s.g,
+                            mixed: a.mixed,
+                            planes,
+                        },
+                    )?;
+                }
+            }
+            if let Some((form, act)) = out {
+                act.wrote(form, at, m);
+            }
             return Ok(());
+        }
+        if let Some((form, act)) = out {
+            act.forget(form);
         }
         match a.w.up {
             HcMatrix::Q8_0 { qs, d } => {

@@ -181,6 +181,36 @@ impl GemmAct32 {
             .ok_or_else(|| GpuError::state(what, "a scratch made with_form for this form"))
     }
 
+    /// `form`'s words, scale words and refusal words for an epilogue that
+    /// writes it of the first `n` columns of `k` values ([`Self::room`]'s
+    /// checks, as `what`'s), the refusal words zeroed on `stream` for the
+    /// epilogue's pieces to OR. The form holds no rows' until
+    /// [`Self::wrote`] marks it after the launch.
+    pub(crate) fn out_planes(
+        &mut self,
+        stream: &CudaStream,
+        what: &'static str,
+        form: MmaForm,
+        (k, n): (usize, usize),
+    ) -> Result<[&mut DeviceBuffer<u32>; 3], GpuError> {
+        let f = self.room(what, form, k, n)?;
+        f.of = None;
+        f.refused.zero_async(stream)?;
+        Ok([&mut f.words, &mut f.scales, &mut f.refused])
+    }
+
+    /// Marks `form` as an epilogue's of the first `n` columns of the f32 rows
+    /// at device address `at`, and the other form as another rows'.
+    pub(crate) fn wrote(&mut self, form: MmaForm, at: u64, n: usize) {
+        if let Some(f) = &mut self.forms[form as usize] {
+            f.of = Some((at, n));
+        }
+        self.forget(match form {
+            MmaForm::Bf16 => MmaForm::Mxfp8,
+            MmaForm::Mxfp8 => MmaForm::Bf16,
+        });
+    }
+
     /// Whether a site can read `form` of the first `n` columns of `x`
     /// ([`GemmAct32::form_of`]).
     #[must_use]
@@ -409,6 +439,22 @@ impl Gemm32Kernels {
         }
         #[cfg(not(bloomery_nvfp4_mma))]
         Err(GpuError::state(what, NATIVE_BUILD))
+    }
+
+    /// Enqueue `form` of the first `n_cols` columns of `x` into `act`:
+    /// [`Self::enqueue_bf16_cols`] or [`Self::enqueue_mxfp8_cols`].
+    pub fn enqueue_form_cols(
+        &self,
+        stream: &CudaStream,
+        form: MmaForm,
+        x: &DeviceBuffer<f32>,
+        n_cols: usize,
+        act: &mut GemmAct32,
+    ) -> Result<(), GpuError> {
+        match form {
+            MmaForm::Bf16 => self.enqueue_bf16_cols(stream, x, n_cols, act),
+            MmaForm::Mxfp8 => self.enqueue_mxfp8_cols(stream, x, n_cols, act),
+        }
     }
 
     /// Enqueue the 32-value quantization of the first `n_cols` columns of `x`

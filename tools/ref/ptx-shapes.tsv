@@ -265,6 +265,9 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # PIN(2026-10-25): HC up BF16 input: sm_86 spill 484 -> 608 B, GB10 JIT local unchanged at 88 B; native sm_121/sm_121a spill 364 -> 332 B; deferred flags and u32 columns each measured 532 B spill / 96 B JIT local.
 # The cc 8.6 JIT was not measured; its historical 104 B pin is retained.
 generate_ds41   hc_gated_up_mma_mix_4                  608         104
+# PIN(2026-10-25): the new entry uses sm_86 ptxas 13.3.73 spill/stack (676/192). The cc 8.6 JIT was not measured (the
+# GB10 JIT reads 88 B of local for this PTX); this new entry's jit_local pin uses the measured ptxas stack frame.
+generate_ds41   hc_gated_up_mma_mix_4_bf16             676         192
 generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0

@@ -47,6 +47,19 @@
 //!    38 columns on a 37-column scratch refused by name, and — before any
 //!    launch, the streams as they went in — planes of another shape and a
 //!    one-expert table filled for fewer slots than the mix's columns.
+//! 9. form: on a dense MMA card the BF16 site's wide mix over 37 columns,
+//!    asked for the BF16 form of `mixed` and, on a native block-scaled
+//!    build, its MXFP8 form, into a scratch whose every column an earlier
+//!    form refused, leaves `mixed` and the fault the mix's without a form,
+//!    bit for bit, and a next product over the form the one over the
+//!    quantizer's form of the same rows, also with a NaN in one column,
+//!    with one column of subnormal values (the form refuses that column,
+//!    so the next product replays it exact) and after a graph replay over
+//!    another mix's form; on a native build the other form of the rows
+//!    from before the mix is left unread; over 3 columns, where the up and the mix run apart, a
+//!    form of the rows from before the mix is left unread; an output
+//!    scratch of another K is refused by name before any launch, the
+//!    streams as they went in.
 //!
 //! A BF16 site (down and up in their words, `HcMatrix::Bf16`, values on
 //! the Q8_0 site's ranges) runs clauses 1, 2, 3 and 8 again: its down and
@@ -70,7 +83,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::gemm::{Gemm32Kernels, GemmKernels, GemmRoute};
+    use bloomery_gpu::gemm::{Gemm32Kernels, GemmAct32, GemmKernels, GemmRoute, MmaForm};
     use bloomery_gpu::hc_gated::{
         Before, HcGatedKernels, HcMatrix, HcScratch, HcWideKernels, HcWideScratch, MixArgs, SITE,
         SiteWeights, WideMixArgs, check_types,
@@ -451,6 +464,7 @@ mod gate {
         ok &= check_stages(&mut c, &bf16)?;
         ok &= check_cols(&mut c, &bf16)?;
         ok &= check_wide(&mut c, &bf16)?;
+        ok &= check_wide_forms(&mut c, &bf16)?;
         ok &= check_overflow(&mut c)?;
         ok &= no_local_depot(&[
             "hc_gated_norm_4",
@@ -464,6 +478,7 @@ mod gate {
             "hc_gated_lo_4x320",
             "hc_gated_mix_4",
             "hc_gated_up_mma_mix_4",
+            "hc_gated_up_mma_mix_4_bf16",
             "hc_gated_down_mma_4",
             // PIN(2026-10-23): bf16_mma_gemm_columns is gone: bf16_mma_gemm keeps every
             // cell to its own row and column, so the HC prompt products run it.
@@ -1100,6 +1115,7 @@ mod gate {
                     q8f32: &c.q8,
                     dense: route,
                     mixed,
+                    out: None,
                 },
             )
         };
@@ -1202,20 +1218,25 @@ mod gate {
     }
 
     /// One wide mix of `m` columns after a combine, the one-expert table
-    /// filled for `fill` slots and `weights` in place of the site's: the
-    /// call's result, and whether the streams came back as they went in.
+    /// filled for `fill` slots, `weights` in place of the site's and `out`
+    /// for the form of `mixed`: the call's result, and whether the streams
+    /// came back as they went in.
     fn wide_try(
         c: &mut Ctx,
         w: &mut Wide,
         weights: SiteWeights<'_>,
-        fill: usize,
-        m: usize,
+        (fill, m): (usize, usize),
+        out: Option<(MmaForm, &mut GemmAct32)>,
     ) -> Result<(Result<(), GpuError>, bool), GateError> {
         let st = c.gpu.stream();
         let res = activations(WIDE, m, 0x3a05);
         let mut res_d = DeviceBuffer::from_host(st, &res)?;
         let y_d = DeviceBuffer::from_host(st, &activations(D, m, 0x3a06))?;
         let mut mixed_d = DeviceBuffer::from_host(st, &vec![f32::NAN; c.geo.sizes(m).mixed])?;
+        // Combine weights of one, so a norm launched before a refusal would
+        // change the streams.
+        let ones = vec![1.0f32; w.scratch.wgt.len()];
+        w.scratch.wgt.copy_from_host(st, &ones)?;
         w.gemm
             .enqueue_route_dense(st, fill, &mut w.route, c.gpu.unlabelled_sink())?;
         let got = w.hcw.enqueue_mix(
@@ -1232,6 +1253,7 @@ mod gate {
                 q8f32: &c.q8,
                 dense: &w.route,
                 mixed: &mut mixed_d,
+                out,
             },
         );
         let kept = bits_equal(&res_d.to_host_vec(st)?, &res);
@@ -1251,6 +1273,224 @@ mod gate {
         }
         let r = (num / den.max(f64::MIN_POSITIVE)).sqrt();
         if r.is_nan() { f64::INFINITY } else { r }
+    }
+
+    /// Clause 9 (module doc).
+    fn check_wide_forms(c: &mut Ctx, site: &Site) -> Result<bool, GateError> {
+        use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight};
+        if !bloomery_gpu::dense_mma(c.gpu.context())? {
+            println!("wide[form] skipped: no dense MMA tile on this card");
+            return Ok(true);
+        }
+        let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
+        let native = bloomery_gpu_gates::ptx::modules(&bundles)?.iter().any(|m| {
+            bloomery_gpu_gates::ptx::body(std::slice::from_ref(m), "hc_gated_up_mma_mix_4_mxfp8")
+                .is_some()
+        });
+        let forms: &[MmaForm] = if native {
+            &[MmaForm::Bf16, MmaForm::Mxfp8]
+        } else {
+            &[MmaForm::Bf16]
+        };
+        let mut w = Wide::new(c)?;
+        let st = c.gpu.stream();
+        // The next sites' weights, 128 rows over the mix's D values: BF16
+        // words of 1/8 .. 1/4, and E4M3 codes (no NaN code) on scales 2^-7 ..
+        // 2^0.
+        let next_bf16: Vec<u32> = (0..128 * D / 2)
+            .map(|i| 0x3e00_3e00u32 | ((i as u32).wrapping_mul(2_654_435_761) & 0x007f_007f))
+            .collect();
+        let next_bf16 = DeviceTensor::upload(st, &next_bf16, 128, D / 2)?;
+        let codes: Vec<u32> = (0..128 * D / 4)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761) & 0xfefe_fefe)
+            .collect();
+        let scales: Vec<u32> = (0..128 * D / 128)
+            .map(|i| 0x7879_7a7b + (i as u32 % 4))
+            .collect();
+        let (qs, e) = (
+            DeviceTensor::upload(st, &codes, 128, D / 4)?,
+            DeviceTensor::upload(st, &scales, 128, D / 128)?,
+        );
+        let next_mx = E4m3Weight {
+            qs: &qs,
+            e: &e,
+            scales: E4m3Scales::Mxfp8,
+        };
+        let mut ok = true;
+        for &form in forms {
+            // An `out` of another K, refused before any launch.
+            let m = WIDE_COLS;
+            let mut other_k =
+                GemmAct32::new(c.gpu.stream(), m, D + 128)?.with_form(c.gpu.stream(), form)?;
+            let weights = site.weights(true);
+            let (got, kept) = wide_try(c, &mut w, weights, (m, m), Some((form, &mut other_k)))?;
+            let named = matches!(&got, Err(e) if e.to_string().contains(&format!("not {D}")));
+            ok &= named && kept;
+            println!(
+                "wide[form] form={form:?} m={m} edge=out_k refused={named} streams_kept={kept} {}",
+                verdict(named && kept)
+            );
+            let edges = [
+                (WIDE_COLS, "normal"),
+                (WIDE_COLS, "nan"),
+                (WIDE_COLS, "tiny"),
+                (3, "apart"),
+                (WIDE_COLS, "other"),
+            ];
+            for (m, edge) in edges.into_iter().filter(|&(_, e)| native || e != "other") {
+                let st = c.gpu.stream();
+                let mut res = activations(WIDE, m, 0x3a21);
+                match edge {
+                    "nan" => res[2 * WIDE + D + 11] = f32::NAN,
+                    // Column 2 subnormal in every stream: its norm scale is
+                    // the eps's, so its mixed values stay subnormal, a range
+                    // the form refuses.
+                    "tiny" => res[2 * WIDE..3 * WIDE].fill(f32::from_bits(0x200)),
+                    _ => {}
+                }
+                w.gemm
+                    .enqueue_route_dense(st, m, &mut w.route, c.gpu.unlabelled_sink())?;
+                let mut res_d = DeviceBuffer::from_host(st, &res)?;
+                let blank = vec![f32::NAN; m * D];
+                let mut mixed_d = DeviceBuffer::from_host(st, &blank)?;
+                let other = match form {
+                    MmaForm::Bf16 => MmaForm::Mxfp8,
+                    MmaForm::Mxfp8 => MmaForm::Bf16,
+                };
+                let mut act = GemmAct32::new(st, m, D)?.with_form(st, form)?;
+                if edge == "other" {
+                    act = act.with_form(st, other)?;
+                }
+                let (hcw, g32, route) = (&w.hcw, &w.g32, &w.route);
+                let enqueue =
+                    |st: &CudaStream,
+                     res: &mut DeviceBuffer<f32>,
+                     mixed: &mut DeviceBuffer<f32>,
+                     scratch: &mut HcWideScratch,
+                     out: Option<(MmaForm, &mut GemmAct32)>| {
+                        hcw.enqueue_mix(
+                            st,
+                            WideMixArgs {
+                                res,
+                                before: Before::Plain,
+                                w: site.weights(true),
+                                eps: EPS,
+                                m,
+                                fault: c.gpu.unlabelled_sink(),
+                                scratch,
+                                gemm: g32,
+                                q8f32: &c.q8,
+                                dense: route,
+                                mixed,
+                                out,
+                            },
+                        )
+                    };
+                // The next product over `form` of `x` in `act`; `None` when it
+                // refuses a form of other rows, which `act` no longer holds.
+                let next = |st: &CudaStream,
+                            form: MmaForm,
+                            x: &DeviceBuffer<f32>,
+                            act: &GemmAct32|
+                 -> Result<Option<Vec<f32>>, GateError> {
+                    let mut y = DeviceBuffer::from_host(st, &vec![f32::NAN; 128 * m])?;
+                    let r = match form {
+                        MmaForm::Bf16 => {
+                            g32.enqueue_bf16_mma_cols(st, &next_bf16, x, act, m, &mut y)
+                        }
+                        MmaForm::Mxfp8 => g32.enqueue_mxfp8_w8a8(st, next_mx, x, act, m, &mut y),
+                    };
+                    match r {
+                        Ok(()) => Ok(Some(y.to_host_vec(st)?)),
+                        Err(GpuError::State { missing, .. })
+                            if missing.contains("form of x's first n columns") =>
+                        {
+                            Ok(None)
+                        }
+                        Err(e) => Err(e.into()),
+                    }
+                };
+                enqueue(st, &mut res_d, &mut mixed_d, &mut w.scratch, None)?;
+                let plain = mixed_d.to_host_vec(st)?;
+                let plain_fault = c.gpu.take_fault()?;
+                // The quantizer's form of the rows `x`.
+                let quantize = |form: MmaForm, x: &DeviceBuffer<f32>, act: &mut GemmAct32| {
+                    g32.enqueue_form_cols(st, form, x, m, act)
+                };
+                let mut quantized = GemmAct32::new(st, m, D)?.with_form(st, form)?;
+                quantize(form, &mixed_d, &mut quantized)?;
+                let want = next(st, form, &mixed_d, &quantized)?;
+                // Every column of the scratch refused by subnormal rows
+                // before, which the mix's form clears.
+                let tiny_d = DeviceBuffer::from_host(st, &vec![f32::from_bits(0x200); m * D])?;
+                quantize(form, &tiny_d, &mut act)?;
+                mixed_d.copy_from_host(st, &blank)?;
+                match edge {
+                    // A form of these rows from before the mix, which the
+                    // mix that does not write it must leave unread.
+                    "apart" => quantize(form, &mixed_d, &mut act)?,
+                    // The other form of these rows from before the mix,
+                    // which the mix that writes `form` must leave unread.
+                    "other" => quantize(other, &mixed_d, &mut act)?,
+                    _ => {}
+                }
+                enqueue(
+                    st,
+                    &mut res_d,
+                    &mut mixed_d,
+                    &mut w.scratch,
+                    Some((form, &mut act)),
+                )?;
+                let mixed = mixed_d.to_host_vec(st)?;
+                let fault = c.gpu.take_fault()?;
+                let got = next(st, form, &mixed_d, &act)?;
+                let same = bits_equal(&mixed, &plain) && fault == plain_fault;
+                let wanted = |y: &Option<Vec<f32>>| match (y, &want) {
+                    (Some(a), Some(b)) => bits_equal(a, b),
+                    _ => false,
+                };
+                let (form_bits, graph_bits) = if edge == "apart" {
+                    (got.is_none() && want.is_some(), true)
+                } else if edge == "other" {
+                    let stale = next(st, other, &mixed_d, &act)?.is_none();
+                    (wanted(&got) && stale, true)
+                } else {
+                    let form_bits = wanted(&got);
+                    // A graph replay writes the form again over another
+                    // mix's form of the same rows.
+                    let graph = c.gpu.capture(|st| {
+                        enqueue(
+                            st,
+                            &mut res_d,
+                            &mut mixed_d,
+                            &mut w.scratch,
+                            Some((form, &mut act)),
+                        )
+                    })?;
+                    res_d.copy_from_host(st, &activations(WIDE, m, 0x3a22))?;
+                    enqueue(
+                        st,
+                        &mut res_d,
+                        &mut mixed_d,
+                        &mut w.scratch,
+                        Some((form, &mut act)),
+                    )?;
+                    res_d.copy_from_host(st, &res)?;
+                    graph.launch(st)?;
+                    let replayed = next(st, form, &mixed_d, &act)?;
+                    c.gpu.take_fault()?;
+                    (form_bits, wanted(&replayed))
+                };
+                let pass = same && form_bits && graph_bits;
+                ok &= pass;
+                println!(
+                    "wide[form] form={form:?} m={m} edge={edge} mixed_bits={same} \
+                     next_product_bits={form_bits} eager_graph={graph_bits} {}",
+                    verdict(pass)
+                );
+            }
+        }
+        Ok(ok)
     }
 
     /// Clause 8 (module doc).
@@ -1370,7 +1610,7 @@ mod gate {
                 inject: Some(&odd_d),
                 ..site.weights(true)
             };
-            let (got, _) = wide_try(c, &mut w, weights, m, m)?;
+            let (got, _) = wide_try(c, &mut w, weights, (m, m), None)?;
             got?;
             let st = c.gpu.stream();
             let mut want = DeviceBuffer::from_host(st, &vec![f32::NAN; m * S])?;
@@ -1633,7 +1873,7 @@ mod gate {
             ),
         ];
         for (name, weights, fill, want) in cases {
-            let (got, kept) = wide_try(c, &mut w, weights, fill, m)?;
+            let (got, kept) = wide_try(c, &mut w, weights, (fill, m), None)?;
             let named = matches!(&got, Err(e) if e.to_string().contains(want));
             let p = named && kept;
             ok &= p;

@@ -7383,10 +7383,7 @@ mod gate {
                                   count: usize|
                      -> Result<GemmAct32, GateError> {
                         let mut aa = GemmAct32::new(stream, count, k)?.with_form(stream, form)?;
-                        match form {
-                            MmaForm::Bf16 => g32.enqueue_bf16_cols(stream, xx, count, &mut aa)?,
-                            MmaForm::Mxfp8 => g32.enqueue_mxfp8_cols(stream, xx, count, &mut aa)?,
-                        }
+                        g32.enqueue_form_cols(stream, form, xx, count, &mut aa)?;
                         Ok(aa)
                     };
                     let act = formed(&x, n)?;
@@ -7644,10 +7641,8 @@ mod gate {
             // and a scratch without the form are refused; all of its columns
             // pass.
             let cols_refused = |form: MmaForm| -> Result<bool, GateError> {
-                let quantize = |act: &mut GemmAct32, n: usize| match form {
-                    MmaForm::Bf16 => g32.enqueue_bf16_cols(stream, &x, n, act),
-                    MmaForm::Mxfp8 => g32.enqueue_mxfp8_cols(stream, &x, n, act),
-                };
+                let quantize =
+                    |act: &mut GemmAct32, n: usize| g32.enqueue_form_cols(stream, form, &x, n, act);
                 let mut act = GemmAct32::new(stream, 1, 128)?.with_form(stream, form)?;
                 let none = says(quantize(&mut act, 0), "got 0");
                 let past = says(quantize(&mut act, 2), "act.cols() = 1, got 2");
