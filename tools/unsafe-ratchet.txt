@@ -584,7 +584,10 @@ gguf 7 2 0
 # flash's store gate (flash_gqa_prefill.rs: `OutGate::apply` declared and its two impls, the sigmoid gate's
 # read of its gate value, the store's call of it, and the two gated entries' calls of their bodies), counted
 # by tools/check-unsafe.sh. Each new block has its SAFETY line.
-gpu 2605 324 10
+# PIN(2026-10-25): gpu 2605 -> 2621 blocks, 324 -> 326 fns: the GDN split-operand
+# product and keys-by-time transpose, residual record/staging planes and retained projections.
+# Each block has its SAFETY invariant; the two new unsafe fns state their tile contracts.
+gpu 2621 326 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

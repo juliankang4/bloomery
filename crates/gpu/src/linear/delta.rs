@@ -95,10 +95,12 @@
 //! `(Dₜ/Dⱼ)·qₜ·kⱼ` (`j ≤ t`) and the decays. `gdn_delta_prepared`, two blocks
 //! a value head of 64 columns each, walks the chunks in order with its
 //! columns' state in f32 registers, read once and written once, under
-//! `gdn_delta_lanes`'s lane and stamp rules. q, k, the state, the solved rows
-//! and the records' matrices are rounded to BF16 for the tensor cores, so
-//! the bits are not `gdn_delta_lanes`'s: `gate_linear`'s `prompt` clause
-//! holds `o` and the state within a band of [`delta_host`]. A non-finite `o`
+//! `gdn_delta_lanes`'s lane and stamp rules. Each F32 operand is represented
+//! by a BF16 high part and BF16 residual. Products accumulate high-high and
+//! both cross terms in F32, retaining low bits in the solved updates and in
+//! `v − Dₜ·Sᵀkₜ`. The sum order differs from `gdn_delta_lanes`:
+//! `gate_linear`'s `prompt` clause holds `o` and the state within a band of
+//! [`delta_host`]. A non-finite `o`
 //! or state value raises [`FaultSite::LinearDelta`] once per thread; a
 //! non-finite `v` reaches its column of `o` from its chunk's first row on
 //! (the tensor cores' `0·∞`) and that column of the state.
@@ -445,11 +447,12 @@ unsafe fn delta_body<const DECAY: u32>(
 }
 
 /// u32 words of one (chunk, value head) record `gdn_chunk_prepare` writes
-/// and `gdn_delta_prepared` reads: the BF16 pairs of the inverse and of the
-/// causal product, row-major, eight words a row; then the cumulative decays
+/// and `gdn_delta_prepared` reads: the BF16 high pairs of the inverse and of
+/// the causal product, then their BF16 residual pairs, each row-major with
+/// eight words a row; then the cumulative decays
 /// `Dₜ`, the β values and the factors `D/Dₜ` (`D` the chunk's last row's),
 /// sixteen f32 bits each.
-const CHUNK_WORDS: usize = 2 * CHUNK * CHUNK / 2 + 3 * CHUNK;
+const CHUNK_WORDS: usize = 4 * CHUNK * CHUNK / 2 + 3 * CHUNK;
 
 /// Value columns of one `gdn_delta_prepared` block: four warps of two
 /// eight-column tiles.
@@ -590,6 +593,40 @@ unsafe fn chunk_mma<const K: usize>(a: *const u32, b: *const u32, mut c: [f32; 4
     c
 }
 
+/// BF16 residual pairs after rounding two F32 operands to BF16.
+#[inline(always)]
+fn chunk_pair_low(a: f32, b: f32) -> u32 {
+    let high = chunk_pair(a, b);
+    chunk_pair(
+        a - f32::from_bits(high << 16),
+        b - f32::from_bits(high & 0xffff_0000),
+    )
+}
+
+/// The high-high and two cross products of split BF16 operands.
+///
+/// # Safety
+///
+/// Each pointer addresses initialized shared memory: A is sixteen rows of
+/// K BF16 values, B eight columns of K values, with stride PSTRIDE pairs
+/// for K = HEAD and K / 2 otherwise. Every warp lane executes the call.
+#[inline(always)]
+unsafe fn chunk_product<const K: usize>(
+    a: (*const u32, *const u32),
+    b: (*const u32, *const u32),
+    c: [f32; 4],
+) -> [f32; 4] {
+    // SAFETY: a.1 (A's residual) and b.0 (B's high) are initialized sixteen-row and eight-column
+    // tiles of K BF16 values at the contract's stride; every lane executes the call.
+    let c = unsafe { chunk_mma::<K>(a.1, b.0, c) };
+    // SAFETY: a.0 (A's high) and b.1 (B's residual) are initialized tiles of the same shapes and
+    // stride; every lane executes the call.
+    let c = unsafe { chunk_mma::<K>(a.0, b.1, c) };
+    // SAFETY: a.0 and b.0 are the initialized high tiles of the same shapes and stride; every lane
+    // executes all three products.
+    unsafe { chunk_mma::<K>(a.0, b.0, c) }
+}
+
 /// One thread's eight 4-key pieces of a chunk's query rows (the first four)
 /// and key rows of key head `kh`, the chunk's rows `start ..` of `rows`, all
 /// loads issued before any is used; rows at or past `count`, and a carried
@@ -629,8 +666,8 @@ unsafe fn chunk_qk_regs(
     v
 }
 
-/// Store [`chunk_qk_regs`]'s pieces as BF16 pairs: the Q tile at `packed`,
-/// the K tile [`PTILE`] words on.
+/// Store [`chunk_qk_regs`]'s pieces as BF16 pairs (the residual when `low`):
+/// the Q tile at `packed`, the K tile [`PTILE`] words on.
 ///
 /// # Safety
 ///
@@ -641,25 +678,69 @@ unsafe fn chunk_qk_regs(
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn chunk_qk_store(packed: *mut u32, v: [[f32; 4]; 8]) {
+unsafe fn chunk_qk_store(packed: *mut u32, v: [[f32; 4]; 8], low: bool) {
     let tid = thread::threadIdx_x() as usize;
     for i in 0usize..8 {
         cuda_device::thread::__unroll_config::<0>();
         let t = tid / 32 + 4 * (i % 4);
         let at = if i < 4 { 0 } else { PTILE } + t * PSTRIDE + 2 * (tid % 32);
+        let p0 = if low {
+            chunk_pair_low(v[i][0], v[i][1])
+        } else {
+            chunk_pair(v[i][0], v[i][1])
+        };
+        let p1 = if low {
+            chunk_pair_low(v[i][2], v[i][3])
+        } else {
+            chunk_pair(v[i][2], v[i][3])
+        };
         // SAFETY: tid < 128 gives t < CHUNK and 2*(tid%32) < PSTRIDE; this thread owns this pair
         // inside the two tiles.
-        unsafe { *packed.add(at) = chunk_pair(v[i][0], v[i][1]) };
+        unsafe { *packed.add(at) = p0 };
         // SAFETY: tid < 128 gives t < CHUNK and 2*(tid%32)+1 < PSTRIDE; this thread owns this pair
         // inside the two tiles.
-        unsafe { *packed.add(at + 1) = chunk_pair(v[i][2], v[i][3]) };
+        unsafe { *packed.add(at + 1) = p1 };
     }
 }
 
-/// Shared words of `gdn_delta_prepared`: the Q and K tiles, the keys by time,
-/// the state tile, the residuals by time, the inverse and causal product.
+/// Transpose the complete K tile into pairs of consecutive time rows.
+///
+/// # Safety
+///
+/// `packed` holds two complete PTILE-word tiles with K at offset PTILE.
+/// `dst .. dst + HEAD * 8` is writable shared memory disjoint from K, and
+/// no thread reads the destination until the next block barrier.
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn chunk_keys_by_time(packed: *mut u32, dst: usize) {
+    let tid = thread::threadIdx_x() as usize;
+    for i in 0usize..4 {
+        cuda_device::thread::__unroll_config::<0>();
+        let f = tid + 128 * i;
+        let (kp, p) = (f % 64, f / 64);
+        // SAFETY: f < 512 gives kp < 64 < PSTRIDE and p < 8, so row 2p < CHUNK: key pair kp of
+        // that row of the complete K tile at PTILE.
+        let w0 = unsafe { *packed.add(PTILE + 2 * p * PSTRIDE + kp) };
+        // SAFETY: p < 8 gives row 2p + 1 < CHUNK and kp < 64 < PSTRIDE: key pair kp of that row of
+        // the complete K tile at PTILE.
+        let w1 = unsafe { *packed.add(PTILE + (2 * p + 1) * PSTRIDE + kp) };
+        // SAFETY: kp < 64 and p < 8 bound this word of key 2kp within dst .. dst + HEAD*8, disjoint
+        // from K; this thread alone writes it.
+        unsafe { *packed.add(dst + 2 * kp * 8 + p) = (w0 & 0xffff) | (w1 << 16) };
+        // SAFETY: kp < 64 and p < 8 bound this word of key 2kp + 1 within dst .. dst + HEAD*8,
+        // disjoint from K; this thread alone writes it.
+        unsafe { *packed.add(dst + (2 * kp + 1) * 8 + p) = (w0 >> 16) | (w1 & 0xffff_0000) };
+    }
+}
+
+/// Shared words of `gdn_delta_prepared`: Q and K, the high keys by time,
+/// the state tile, and high/residual planes of solved rows and both matrices.
+/// The Q tile holds the residual keys by time after the state projections.
 const PREPARED_WORDS: usize =
-    2 * PTILE + HEAD * 8 + PREPARED_COLUMNS * PSTRIDE + PREPARED_COLUMNS * 8 + 2 * 128;
+    2 * PTILE + HEAD * 8 + PREPARED_COLUMNS * PSTRIDE + 2 * PREPARED_COLUMNS * 8 + 4 * 128;
 
 /// Shared f32s of `gdn_delta_prepared`: the key and query projections and the
 /// values, `[CHUNK][PREPARED_COLUMNS]` each, then D, β and the final factors.
@@ -1035,7 +1116,7 @@ mod delta_kernels {
             decay.len() >= m * n_v,
             carry.len() >= 4 + 15 * ((n_k + n_v) * 128 + 2 * n_v),
             pos.len() >= 1,
-            work.len() >= chunks * n_v * 304 + 1,
+            work.len() >= chunks * n_v * 560 + 1,
             chunks * 16 >= m + 15
         )
     )]
@@ -1063,7 +1144,7 @@ mod delta_kernels {
         const D: usize = G + CHUNK * CHUNK;
         const B: usize = D + CHUNK;
         const DR: usize = B + CHUNK;
-        static mut PACKED: SharedArray<u32, { 2 * PTILE }> = SharedArray::UNINIT;
+        static mut PACKED: SharedArray<u32, { 4 * PTILE }> = SharedArray::UNINIT;
         static mut SCRATCH: SharedArray<f32, { DR + CHUNK }> = SharedArray::UNINIT;
         let tid = thread::threadIdx_x() as usize;
         let warp = tid / 32;
@@ -1111,8 +1192,12 @@ mod delta_kernels {
         let sm = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SCRATCH) };
         // SAFETY: the chunk's rows of the carry and qkv, by the contract.
         let qk = unsafe { chunk_qk_regs(rows, (start, count), kh) };
-        // SAFETY: the block's two packed tiles, read by no thread yet.
-        unsafe { chunk_qk_store(packed, qk) };
+        // SAFETY: the high Q and K tiles at 0 .. 2*PTILE of PACKED's 4*PTILE words, read by no
+        // thread before the following barrier.
+        unsafe { chunk_qk_store(packed, qk, false) };
+        // SAFETY: the residual Q and K tiles at 2*PTILE .. 4*PTILE of PACKED's 4*PTILE words, read
+        // by no thread before the following barrier.
+        unsafe { chunk_qk_store(packed.add(2 * PTILE), qk, true) };
         if tid < CHUNK {
             let r = start + tid;
             let (d, b) = if tid >= count {
@@ -1159,7 +1244,14 @@ mod delta_kernels {
         let half = warp % 2 * 8;
         // SAFETY: the complete Q and K tiles.
         let dots = unsafe {
-            chunk_mma::<HEAD>(packed.add(a), packed.add(PTILE + half * PSTRIDE), [0.0; 4])
+            chunk_product::<HEAD>(
+                (packed.add(a), packed.add(2 * PTILE + a)),
+                (
+                    packed.add(PTILE + half * PSTRIDE),
+                    packed.add(3 * PTILE + half * PSTRIDE),
+                ),
+                [0.0; 4],
+            )
         };
         for i in 0..4 {
             let row = r + i / 2 * 8;
@@ -1200,10 +1292,10 @@ mod delta_kernels {
         // SAFETY: t < CHUNK and j+1 < CHUNK bound this G cell; the preceding barrier published the
         // decay factors.
         let g1 = unsafe { *sm.add(G + t * CHUNK + j + 1) };
-        let p = chunk_pair(
+        let p = [
             if j <= t { p0 * g0 } else { 0.0 },
             if j < t { p1 * g1 } else { 0.0 },
-        );
+        ];
         thread::sync_threads();
         // (I − L)⁻¹ by forward substitution in f32, column tid by thread tid.
         if tid < CHUNK {
@@ -1236,8 +1328,14 @@ mod delta_kernels {
         // tid alone writes this inverse word.
         unsafe { *work.add(base + tid) = chunk_pair(i0, i1) };
         // SAFETY: block owns this record and 128+tid < CHUNK_WORDS; thread tid alone writes this
-        // product word.
-        unsafe { *work.add(base + 128 + tid) = p };
+        // causal product word.
+        unsafe { *work.add(base + 128 + tid) = chunk_pair(p[0], p[1]) };
+        // SAFETY: block owns this record and 256+tid < CHUNK_WORDS; thread tid alone writes this
+        // inverse residual word.
+        unsafe { *work.add(base + 256 + tid) = chunk_pair_low(i0, i1) };
+        // SAFETY: block owns this record and 384+tid < CHUNK_WORDS; thread tid alone writes this
+        // causal residual word.
+        unsafe { *work.add(base + 384 + tid) = chunk_pair_low(p[0], p[1]) };
         if tid < CHUNK {
             // SAFETY: tid < CHUNK bounds this D row; the preceding barriers published D.
             let d = unsafe { *sm.add(D + tid) };
@@ -1246,15 +1344,15 @@ mod delta_kernels {
             // SAFETY: 1 <= count <= CHUNK and tid < CHUNK bound this G cell of row count − 1; the
             // preceding barriers published G.
             let end = unsafe { *sm.add(G + (count - 1) * CHUNK + tid) };
-            // SAFETY: block owns this record and 256+tid < CHUNK_WORDS; thread tid alone writes
+            // SAFETY: block owns this record and 512+tid < CHUNK_WORDS; thread tid alone writes
             // this decay word.
-            unsafe { *work.add(base + 256 + tid) = d.to_bits() };
-            // SAFETY: block owns this record and 272+tid < CHUNK_WORDS; thread tid alone writes
+            unsafe { *work.add(base + 512 + tid) = d.to_bits() };
+            // SAFETY: block owns this record and 528+tid < CHUNK_WORDS; thread tid alone writes
             // this beta word.
-            unsafe { *work.add(base + 272 + tid) = b.to_bits() };
-            // SAFETY: block owns this record and 288+tid < CHUNK_WORDS; thread tid alone writes
+            unsafe { *work.add(base + 528 + tid) = b.to_bits() };
+            // SAFETY: block owns this record and 544+tid < CHUNK_WORDS; thread tid alone writes
             // this factor word.
-            unsafe { *work.add(base + 288 + tid) = end.to_bits() };
+            unsafe { *work.add(base + 544 + tid) = end.to_bits() };
         }
     }
 
@@ -1282,7 +1380,7 @@ mod delta_kernels {
         requires = (
             qkv.len() >= m * (2 * n_k + n_v) * 128,
             carry.len() >= 4 + 15 * ((n_k + n_v) * 128 + 2 * n_v),
-            work.len() >= chunks * n_v * 304 + 1,
+            work.len() >= chunks * n_v * 560 + 1,
             chunks * 16 >= m + 15,
             lane.len() >= lane_at + 1,
             lanes >= 1,
@@ -1319,6 +1417,8 @@ mod delta_kernels {
         const S_TILE: usize = KT + HEAD * 8;
         const UB: usize = S_TILE + COLS * PSTRIDE;
         const IP: usize = UB + COLS * 8;
+        const UB_LOW: usize = IP + 256;
+        const IP_LOW: usize = UB_LOW + COLS * 8;
         const KS: usize = 0;
         const QS: usize = CHUNK * COLS;
         const U: usize = 2 * CHUNK * COLS;
@@ -1406,20 +1506,28 @@ mod delta_kernels {
             }
             let inv = work[rec + tid];
             let prod = work[rec + 128 + tid];
+            let inv_low = work[rec + 256 + tid];
+            let prod_low = work[rec + 384 + tid];
             let meta = if tid < 3 * CHUNK {
-                work[rec + 256 + tid]
+                work[rec + 512 + tid]
             } else {
                 0
             };
             thread::sync_threads();
             // SAFETY: past the barrier no thread reads the previous chunk's tiles.
-            unsafe { chunk_qk_store(packed, qk) };
+            unsafe { chunk_qk_store(packed, qk, false) };
             // SAFETY: IP+tid < PREPARED_WORDS; thread tid owns this inverse word, read only after
             // the following barrier.
             unsafe { *packed.add(IP + tid) = inv };
             // SAFETY: IP+128+tid < PREPARED_WORDS; thread tid owns this product word, read only
             // after the following barrier.
             unsafe { *packed.add(IP + 128 + tid) = prod };
+            // SAFETY: IP_LOW+tid < PREPARED_WORDS; thread tid owns this inverse residual word, read
+            // only after the following barrier.
+            unsafe { *packed.add(IP_LOW + tid) = inv_low };
+            // SAFETY: IP_LOW+128+tid < PREPARED_WORDS; thread tid owns this causal residual word,
+            // read only after the following barrier.
+            unsafe { *packed.add(IP_LOW + 128 + tid) = prod_low };
             if tid < 3 * CHUNK {
                 // SAFETY: D, β and the final factors follow one another in sm.
                 unsafe { *sm.add(D + tid) = f32::from_bits(meta) };
@@ -1433,61 +1541,87 @@ mod delta_kernels {
                     unsafe { *sm.add(U + f / 16 * COLS + 4 * (f % 16) + e) = vr[i][e] };
                 }
             }
-            for tile in 0usize..8 {
+            // The three products share the Q/K and state staging tiles.
+            for part in 0usize..3 {
                 cuda_device::thread::__unroll_config::<0>();
-                for n in 0usize..2 {
+                if part != 0 {
+                    thread::sync_threads();
+                }
+                if part == 2 {
+                    // SAFETY: the barrier above ended the earlier parts' reads of the Q and K
+                    // tiles at 0 .. 2*PTILE; this thread owns its pairs, read only after the next
+                    // barrier.
+                    unsafe { chunk_qk_store(packed, qk, true) };
+                }
+                for tile in 0usize..8 {
                     cuda_device::thread::__unroll_config::<0>();
-                    for i in 0usize..4 {
+                    for n in 0usize..2 {
                         cuda_device::thread::__unroll_config::<0>();
-                        let key = tile * 16 + r + i / 2 * 8;
-                        let col = wc + n * 8 + c + i % 2;
-                        let next = warp::shuffle_xor_f32(st[tile][n][i], 4);
-                        if r.is_multiple_of(2) {
-                            // SAFETY: the even key row owns the pair (key, key + 1).
-                            unsafe {
-                                *packed.add(S_TILE + col * PSTRIDE + key / 2) =
-                                    chunk_pair(st[tile][n][i], next);
+                        for i in 0usize..4 {
+                            cuda_device::thread::__unroll_config::<0>();
+                            let key = tile * 16 + r + i / 2 * 8;
+                            let col = wc + n * 8 + c + i % 2;
+                            let v = st[tile][n][i];
+                            let next = warp::shuffle_xor_f32(v, 4);
+                            let pair = if part == 1 {
+                                chunk_pair_low(v, next)
+                            } else {
+                                chunk_pair(v, next)
+                            };
+                            if r.is_multiple_of(2) {
+                                // SAFETY: the even key row owns the pair (key, key + 1).
+                                unsafe {
+                                    *packed.add(S_TILE + col * PSTRIDE + key / 2) = pair;
+                                }
                             }
                         }
                     }
                 }
-            }
-            thread::sync_threads();
-            // The keys by time from the K tile: word (key, p) holds rows 2p and 2p + 1.
-            for i in 0usize..4 {
-                cuda_device::thread::__unroll_config::<0>();
-                let f = tid + 128 * i;
-                let (kp, p) = (f % 64, f / 64);
-                // SAFETY: key pair kp of row 2p of the complete K tile.
-                let w0 = unsafe { *packed.add(PTILE + 2 * p * PSTRIDE + kp) };
-                // SAFETY: p < 8 gives row 2p + 1 < CHUNK and kp < 64 < PSTRIDE: key pair kp of
-                // that row of the K tile, published by the preceding barrier.
-                let w1 = unsafe { *packed.add(PTILE + (2 * p + 1) * PSTRIDE + kp) };
-                // SAFETY: kp < 64 and p < 8 bound this KT word of key 2kp within HEAD*8 words;
-                // this thread alone writes it.
-                unsafe { *packed.add(KT + 2 * kp * 8 + p) = (w0 & 0xffff) | (w1 << 16) };
-                // SAFETY: kp < 64 and p < 8 bound this KT word of key 2kp + 1 within HEAD*8 words;
-                // this thread alone writes it.
-                unsafe { *packed.add(KT + (2 * kp + 1) * 8 + p) = (w0 >> 16) | (w1 & 0xffff_0000) };
-            }
-            for n in 0usize..2 {
-                cuda_device::thread::__unroll_config::<0>();
-                let sb = S_TILE + (wc + n * 8) * PSTRIDE;
-                // SAFETY: the complete K and state tiles.
-                let kp = unsafe { chunk_mma::<HEAD>(packed.add(PTILE), packed.add(sb), [0.0; 4]) };
-                // SAFETY: the complete Q and state tiles.
-                let qp = unsafe { chunk_mma::<HEAD>(packed, packed.add(sb), [0.0; 4]) };
-                for i in 0usize..4 {
+                thread::sync_threads();
+                if part == 0 {
+                    // SAFETY: the preceding barrier completed the K tile, and KT .. KT+HEAD*8
+                    // lies past both PTILE-word tiles; no warp reads KT before the block's final
+                    // barrier.
+                    unsafe { chunk_keys_by_time(packed, KT) };
+                }
+                for n in 0usize..2 {
                     cuda_device::thread::__unroll_config::<0>();
-                    let at = (r + i / 2 * 8) * COLS + wc + n * 8 + c + i % 2;
-                    // SAFETY: at < CHUNK*COLS bounds this KS cell; this lane alone writes it
-                    // before the following barrier.
-                    unsafe { *sm.add(KS + at) = kp[i] };
-                    // SAFETY: at < CHUNK*COLS bounds this QS cell; this lane alone writes it
-                    // before the following barrier.
-                    unsafe { *sm.add(QS + at) = qp[i] };
+                    let sb = S_TILE + (wc + n * 8) * PSTRIDE;
+                    let mut kp = [0.0; 4];
+                    let mut qp = [0.0; 4];
+                    if part != 0 {
+                        for i in 0usize..4 {
+                            cuda_device::thread::__unroll_config::<0>();
+                            let at = (r + i / 2 * 8) * COLS + wc + n * 8 + c + i % 2;
+                            // SAFETY: at < CHUNK*COLS bounds this KS cell; this lane alone wrote
+                            // it in the preceding part.
+                            kp[i] = unsafe { *sm.add(KS + at) };
+                            // SAFETY: at < CHUNK*COLS bounds this QS cell; this lane alone wrote
+                            // it in the preceding part.
+                            qp[i] = unsafe { *sm.add(QS + at) };
+                        }
+                    }
+                    // SAFETY: the complete K and state tiles.
+                    let kp = unsafe { chunk_mma::<HEAD>(packed.add(PTILE), packed.add(sb), kp) };
+                    // SAFETY: the complete Q and state tiles.
+                    let qp = unsafe { chunk_mma::<HEAD>(packed, packed.add(sb), qp) };
+                    for i in 0usize..4 {
+                        cuda_device::thread::__unroll_config::<0>();
+                        let at = (r + i / 2 * 8) * COLS + wc + n * 8 + c + i % 2;
+                        // SAFETY: at < CHUNK*COLS bounds this KS cell; this lane alone writes it
+                        // before the following barrier.
+                        unsafe { *sm.add(KS + at) = kp[i] };
+                        // SAFETY: at < CHUNK*COLS bounds this QS cell; this lane alone writes it
+                        // before the following barrier.
+                        unsafe { *sm.add(QS + at) = qp[i] };
+                    }
                 }
             }
+            thread::sync_threads();
+            // SAFETY: the barrier above ended the state projections; K at PTILE holds its
+            // residual, and 0 .. HEAD*8 lies inside the Q tile (HEAD*8 <= PTILE), which no thread
+            // reads before the next barrier.
+            unsafe { chunk_keys_by_time(packed, 0) };
             thread::sync_threads();
             // From here a warp reads and writes only its own sixteen columns.
             for i in 0usize..4 {
@@ -1510,13 +1644,23 @@ mod delta_kernels {
                 }
                 // SAFETY: the warp's own packed column.
                 unsafe { *packed.add(UB + cb * 8 + p) = chunk_pair(pair[0], pair[1]) };
+                // SAFETY: cb < COLS and p < 8 bound this UB_LOW word within COLS*8; the warp owns
+                // column cb, read only after the following warp sync.
+                unsafe { *packed.add(UB_LOW + cb * 8 + p) = chunk_pair_low(pair[0], pair[1]) };
             }
             warp::sync_mask(u32::MAX);
             for n in 0usize..2 {
                 cuda_device::thread::__unroll_config::<0>();
                 // SAFETY: the inverse and the warp's packed residuals.
                 let u = unsafe {
-                    chunk_mma::<16>(packed.add(IP), packed.add(UB + (wc + n * 8) * 8), [0.0; 4])
+                    chunk_product::<16>(
+                        (packed.add(IP), packed.add(IP_LOW)),
+                        (
+                            packed.add(UB + (wc + n * 8) * 8),
+                            packed.add(UB_LOW + (wc + n * 8) * 8),
+                        ),
+                        [0.0; 4],
+                    )
                 };
                 for i in 0usize..4 {
                     cuda_device::thread::__unroll_config::<0>();
@@ -1538,6 +1682,9 @@ mod delta_kernels {
                 let u1 = unsafe { *sm.add(U + (2 * p + 1) * COLS + cb) };
                 // SAFETY: the warp's own packed column.
                 unsafe { *packed.add(UB + cb * 8 + p) = chunk_pair(u0, u1) };
+                // SAFETY: cb < COLS and p < 8 bound this UB_LOW word within COLS*8; the warp owns
+                // column cb, read only after the following warp sync.
+                unsafe { *packed.add(UB_LOW + cb * 8 + p) = chunk_pair_low(u0, u1) };
             }
             warp::sync_mask(u32::MAX);
             for n in 0usize..2 {
@@ -1554,7 +1701,14 @@ mod delta_kernels {
                 }
                 // SAFETY: the causal product and the warp's packed solved rows.
                 let y = unsafe {
-                    chunk_mma::<16>(packed.add(IP + 128), packed.add(UB + (wc + n * 8) * 8), acc)
+                    chunk_product::<16>(
+                        (packed.add(IP + 128), packed.add(IP_LOW + 128)),
+                        (
+                            packed.add(UB + (wc + n * 8) * 8),
+                            packed.add(UB_LOW + (wc + n * 8) * 8),
+                        ),
+                        acc,
+                    )
                 };
                 for i in 0usize..4 {
                     cuda_device::thread::__unroll_config::<0>();
@@ -1599,6 +1753,9 @@ mod delta_kernels {
                 let (u0, u1) = (u0 * e0, u1 * e1);
                 // SAFETY: the warp's own packed column, read by no MMA in flight.
                 unsafe { *packed.add(UB + cb * 8 + p) = chunk_pair(u0, u1) };
+                // SAFETY: cb < COLS and p < 8 bound this UB_LOW word within COLS*8; the warp owns
+                // column cb, and no MMA in flight reads it.
+                unsafe { *packed.add(UB_LOW + cb * 8 + p) = chunk_pair_low(u0, u1) };
             }
             warp::sync_mask(u32::MAX);
             // SAFETY: the chunk's last row of D.
@@ -1613,9 +1770,12 @@ mod delta_kernels {
                     }
                     // SAFETY: the keys by time and the warp's decayed rows.
                     st[tile][n] = unsafe {
-                        chunk_mma::<16>(
-                            packed.add(KT + tile * 16 * 8),
-                            packed.add(UB + (wc + n * 8) * 8),
+                        chunk_product::<16>(
+                            (packed.add(KT + tile * 16 * 8), packed.add(tile * 16 * 8)),
+                            (
+                                packed.add(UB + (wc + n * 8) * 8),
+                                packed.add(UB_LOW + (wc + n * 8) * 8),
+                            ),
                             st[tile][n],
                         )
                     };
@@ -1663,7 +1823,7 @@ mod delta_kernels {
             qkv.len() >= m * (2 * n_k + n_v) * 128,
             beta.len() >= m * n_v,
             decay.len() >= m * n_v,
-            work.len() >= chunks * n_v * 304 + 1,
+            work.len() >= chunks * n_v * 560 + 1,
             chunks * 16 >= m + 15,
             pos.len() >= 1,
             carry.len() >= 4 + 15 * ((n_k + n_v) * 128 + 2 * n_v)

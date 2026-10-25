@@ -292,8 +292,8 @@ impl Arena38 {
         let route = RouterOut::for_ubatch(stream, router, rows.min(ROUTE_ROWS))?;
         let mut a = Arena38::alloc(stream, rows, (select_run(rows, ctx), 0), route, ctx)?;
         // The prompt form's records take the q·k·v rows' room once the conv
-        // has read them (`wide38::gdn`); a walk of one or two rows needs a
-        // little more than the rows.
+        // has read them (`wide38::gdn`); a short walk needs a little more
+        // than the rows.
         let work = linear::delta::prompt_work_len(GDN, rows);
         if a.gdn.x.len() < work {
             a.gdn.x = DeviceBuffer::zeroed(stream, work)?;

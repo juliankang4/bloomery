@@ -3012,6 +3012,44 @@ mod gate {
             out.push(pass);
         }
 
+        // A fixed point of the delta rule must retain the state between BF16 values.
+        let mut fixed = st.slice(0, CHUNK_ROWS);
+        fixed.qkv.fill(0.0);
+        fixed.beta.fill(1.0);
+        fixed.decay.fill(1.0);
+        let value = 1.003_906_3f32;
+        let mut fixed_lanes = vec![0.0; ROW_LANES * len];
+        for row in fixed.qkv.chunks_mut(ch) {
+            for kh in 0..K1_SHAPE.n_k {
+                row[kh * HEAD] = 1.0;
+                row[(K1_SHAPE.n_k + kh) * HEAD] = 1.0;
+            }
+            row[2 * K1_SHAPE.n_k * HEAD..].fill(value);
+        }
+        for column in fixed_lanes[c * len..(c + 1) * len].chunks_mut(HEAD) {
+            column[0] = value;
+        }
+        let want = lane_of(&fixed_lanes, c);
+        for from in [value, 0.0] {
+            if from == 0.0 {
+                fixed_lanes.fill(0.0);
+            }
+            let (d, _) = cx.delta_lanes(
+                unl,
+                &fixed,
+                (&fixed_lanes, &stamps),
+                prompt(CHUNK_ROWS),
+                CHUNK_ROWS,
+            )?;
+            let error = rel_l2(&lane_of(&d.state, c), &want);
+            let pass = error < 1e-5;
+            println!(
+                "prompt fixed point between BF16 values from {from}: state rel_l2 {error:.3e} {}",
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+
         out.extend(cut_clauses(cx, &st, (&lanes, stamps), call)?);
 
         // Lane 2's stamp one past the call's position, then a NaN value of

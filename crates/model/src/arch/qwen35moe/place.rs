@@ -1156,8 +1156,8 @@ pub const SELECT_RUN_BYTES: u64 = 22_000_000;
 /// for 2,048 tokens, 8,577,028 B; the eight-column mix scratch, 379,520 B;
 /// the selection's run, at most [`SELECT_RUN_BYTES`] (the least run, eight
 /// rows, holds 16,082,048 B at 2,000,000); the delta layers' chunk records
-/// past the q·k·v rows of a walk of one or two positions, at most 34,820 B;
-/// 30,991,368 B, rounded up to 32 MiB]. A load whose ubatch arena passes it refuses the arena by name.
+/// past the q·k·v rows of a walk of up to five positions, at most 133,124 B;
+/// 31,089,672 B, rounded up to 32 MiB]. A load whose ubatch arena passes it refuses the arena by name.
 pub const UBATCH_FIXED_BYTES: u64 = 32 << 20;
 
 /// The card bytes a qwen4exp ubatch walk of up to `u` positions holds: what
