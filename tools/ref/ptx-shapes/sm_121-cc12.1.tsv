@@ -296,7 +296,9 @@ generate_ds41   neox_append_k192                         0           0
 generate_ds41   neox_append_k192_ring                    0           0
 generate_ds41   norm_quant                               0           0
 generate_ds41   nvfp4_gate_up_sel                        0           0
+generate_ds41   nvfp4_gate_up_sel_cols                   0           0
 generate_ds41   nvfp4_gemv_sel32                         0           0
+generate_ds41   nvfp4_gemv_sel32_cols                    0           0
 generate_ds41   ple_conv                                 0           0
 generate_ds41   ple_gate                                 0           0
 generate_ds41   q2_k_rows                                0           0

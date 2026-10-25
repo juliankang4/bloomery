@@ -1174,6 +1174,7 @@ impl CardLeg {
                     sel,
                     n_slots: slots,
                     rows_per_expert,
+                    slots_per_col,
                 };
                 self.nvfp4.enqueue_down(stream, &d, fault, down)?;
             }
@@ -2488,6 +2489,7 @@ pub(crate) mod tests {
                 sel: &sel,
                 n_slots: slots,
                 rows_per_expert: N,
+                slots_per_col: SPC,
             };
             nv.enqueue_down(stream, &d, sink, &mut want)
                 .unwrap_or_else(|e| panic!("{case}: the down: {e}"));
@@ -2543,6 +2545,10 @@ pub(crate) mod tests {
         (GgmlType::IQ4_XS, GgmlType::IQ4_NL),
         (GgmlType::Q5_K, GgmlType::Q6_K),
     ];
+    /// The wide test's case of a stack in its planes (`kernels::card_planes_runs`):
+    /// NVFP4, whose runs of more than one token run each expert's rows on the
+    /// warp of the first slot that names it, for every slot that names it.
+    const WIDE_PLANES: [(GgmlType, GgmlType); 1] = [(GgmlType::NVFP4, GgmlType::NVFP4)];
 
     /// Token `t`'s normed row: a function of `t` alone, so a column holds the
     /// same values at every `m`.
@@ -2673,7 +2679,8 @@ pub(crate) mod tests {
 
     /// A slot's rows are what a one-token run writes for it, whatever `m`
     /// (the module doc), for every type [`kernels::card_gate_up_runs`] and
-    /// [`kernels::card_down_runs`] admit, in twelve cases (`WIDE_CASES`). Runs of
+    /// [`kernels::card_down_runs`] admit, in twelve cases (`WIDE_CASES`), and for
+    /// NVFP4's planes (`WIDE_PLANES`). Runs of
     /// `m` in `WIDE_RUNS` tokens of eight slots go through fresh buffers of
     /// `WIDE_CAP` tokens, so the run's columns beyond the eighth, and beyond a
     /// warp's 32, are read through the leg's own quantize steps and buffers;
@@ -2728,7 +2735,17 @@ pub(crate) mod tests {
         let mut tys: Vec<GgmlType> = WIDE_CASES.iter().flat_map(|&(g, d)| [g, d]).collect();
         tys.sort_by_key(|ty| ty.as_u32());
         tys.dedup();
-        let w = weights(&gpu, WIDE_SHAPE, &tys);
+        let mut w = weights(&gpu, WIDE_SHAPE, &tys);
+        for (gu, _) in WIDE_PLANES {
+            assert!(kernels::card_planes_runs(gu), "{gu} is not a planes type");
+            for (role, rows, k, seed) in [
+                ("gate", WIDE_FF, WIDE_N, 0x41),
+                ("up", WIDE_FF, WIDE_N, 0x42),
+                ("down", WIDE_N, WIDE_FF, 0x43),
+            ] {
+                nvfp4_stack(&gpu, &mut w, &stack_name(role, gu), rows, k, seed);
+            }
+        }
         let host_normed: Vec<f32> = (0..WIDE_CAP).flat_map(wide_row).collect();
         let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
         let sel = DeviceBuffer::from_host(stream, &sel_all).expect("the places");
@@ -2738,7 +2755,7 @@ pub(crate) mod tests {
         };
 
         let mut failures = Vec::new();
-        for (gu, dn) in WIDE_CASES {
+        for (gu, dn) in WIDE_CASES.into_iter().chain(WIDE_PLANES) {
             let names = [
                 stack_name("gate", gu),
                 stack_name("up", gu),

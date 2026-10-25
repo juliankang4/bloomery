@@ -68,6 +68,12 @@
 //!   one scale a 32-value unit), times the stack's scale of expert `sel[s]`.
 //!   The 32-value form takes any row width the format does (a multiple of
 //!   64), where a `Q8Act` takes whole 256-value super-blocks only.
+//! - `nvfp4_gate_up_sel_cols` and `nvfp4_gemv_sel32_cols`: the same two
+//!   for a run of more than one token (`n_slots > slots_per_col`), where the
+//!   tokens' slots can name one expert (a verify's rows of one sequence). The
+//!   first slot that names an expert reads its rows for every slot that
+//!   names it, one slot after the other, and the other slots' warps load no
+//!   weight; every slot's row is the one-token entry's bit for bit.
 //!
 //! The rule of a dot is the FP4 owner's under [`Nvfp4`], then the warp
 //! butterfly, then one multiply by the expert's scale: the dense gemv's
@@ -161,6 +167,27 @@ unsafe fn slot_weight(route: &[u32], wts: &[f32], j: u32, c: usize) -> f32 {
         u += 1;
     }
     w
+}
+
+/// Whether a slot before `slot` names `id`. Warp-collective: every lane
+/// passes the same `sel`, `id` and `slot` and its own `lane`, and all get the
+/// answer.
+///
+/// # Safety
+///
+/// `slot <= sel.len()` and `lane < 32`.
+#[inline(always)]
+unsafe fn names_before(sel: &[u32], id: u32, slot: usize, lane: usize) -> bool {
+    let mut i0 = 0;
+    while i0 < slot {
+        let i = i0 + lane;
+        // SAFETY: i < slot <= sel.len() by this fn's contract.
+        if warp::any(i < slot && unsafe { *sel.get_unchecked(i) } == id) {
+            return true;
+        }
+        i0 += 32;
+    }
+    false
 }
 
 #[cuda_module]
@@ -1306,6 +1333,159 @@ mod nvfp4_sel_kernels {
         }
     }
 
+    /// `nvfp4_gate_up_sel` over slots of more than one column: thread row
+    /// `n = slot · rows_per_expert + r`. The warp of the first slot that names
+    /// an expert dots row `r` of the expert's gate and up stacks with the
+    /// activation column of each slot that names it, one slot after the
+    /// other, and writes each one's row of `h`; the other slots' warps return
+    /// before any weight load. A slot's row is `nvfp4_gate_up_sel`'s bit for
+    /// bit. Ids: module doc.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            gq.len() >= n_experts * rows_per_expert * 32 * n_sb,
+            ge.len() >= n_experts * rows_per_expert * 4 * n_sb,
+            gs.len() >= n_experts,
+            uq.len() >= n_experts * rows_per_expert * 32 * n_sb,
+            ue.len() >= n_experts * rows_per_expert * 4 * n_sb,
+            us.len() >= n_experts,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            4 * iters >= n_sb,
+            q.len() >= m_cols * 256 * iters,
+            d8.len() >= m_cols * 2 * n_sb,
+            sel.len() >= n_slots,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn nvfp4_gate_up_sel_cols(
+        gq: &[u32],
+        ge: &[u32],
+        gs: &[f32],
+        uq: &[u32],
+        ue: &[u32],
+        us: &[f32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        iters: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        let _ = m_cols;
+        let t = thread::index_1d().get() % BLOCK as usize;
+        let row = (thread::index_1d().get() / BLOCK as usize) * ROWS_PER_BLOCK + t / 32;
+        let rpe = rows_per_expert as usize;
+        if row >= n_slots as usize * rpe {
+            return;
+        }
+        let slot = row / rpe;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform, so the returns below never diverge a warp.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+                // SAFETY: row < n_slots · rows_per_expert <= h.len() by the
+                // launch contract; only lane 0 of the warp writes h[row].
+                unsafe { *h.get_unchecked_mut(row) = f32::NAN };
+            }
+            return;
+        }
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; every
+        // lane reads the same `id` and `slot`.
+        if unsafe { names_before(sel, id, slot, lane) } {
+            return;
+        }
+        // The launcher checks 16-byte bases and whole vectors (`k / 8`
+        // words a row, a multiple of 32), so the views exist.
+        let (Some(gv), Some(uv)) = (as_vectors::<U32x4>(gq), as_vectors::<U32x4>(uq)) else {
+            return;
+        };
+        let row_abs = id as usize * rpe + row % rpe;
+        let (n_slots, spc, n_sb) = (n_slots as usize, slots_per_col as usize, n_sb as usize);
+        // SAFETY: id < n_experts <= gs.len() by the launch contract.
+        let sg = unsafe { *gs.get_unchecked(id as usize) };
+        // SAFETY: id < n_experts <= us.len() by the launch contract.
+        let su = unsafe { *us.get_unchecked(id as usize) };
+        let mut i0 = slot;
+        while i0 < n_slots {
+            let i = i0 + lane;
+            // SAFETY: i < n_slots <= sel.len() by the launch contract.
+            let mut hits = warp::ballot(i < n_slots && unsafe { *sel.get_unchecked(i) } == id);
+            while hits != 0 {
+                let at = i0 + hits.trailing_zeros() as usize;
+                hits &= hits - 1;
+                let col = at / spc;
+                let (q0, d0) = (col * 256 * iters as usize, col * 2 * n_sb);
+                // SAFETY: nvfp4_gate_up_sel's bounds for slot `at` < n_slots:
+                // the row's 8·n_sb vectors and 4·n_sb scale words inside both
+                // stacks, column col < m_cols with its q words at q0 and its
+                // scales at d0 inside q and d8; lane < 32.
+                let fg = unsafe {
+                    lane_partials::<1, Nvfp4, 2>(
+                        gv,
+                        ge,
+                        row_abs,
+                        8 * n_sb,
+                        q,
+                        d8,
+                        q0,
+                        0,
+                        d0,
+                        0,
+                        1,
+                        lane,
+                    )
+                }[0];
+                // SAFETY: the same bounds for the up stack's row.
+                let fu = unsafe {
+                    lane_partials::<1, Nvfp4, 2>(
+                        uv,
+                        ue,
+                        row_abs,
+                        8 * n_sb,
+                        q,
+                        d8,
+                        q0,
+                        0,
+                        d0,
+                        0,
+                        1,
+                        lane,
+                    )
+                }[0];
+                let g = warp::reduce_sum_f32(fg);
+                let u = warp::reduce_sum_f32(fu);
+                if lane == 0 {
+                    let v = act::apply_checked(act, limit, g * sg, u * su, fault);
+                    // SAFETY: at · rpe + r < n_slots · rows_per_expert <=
+                    // h.len() by the launch contract; slot `at` names this
+                    // warp's expert and this warp is its first slot, so lane
+                    // 0 here is the row's only writer.
+                    unsafe { *h.get_unchecked_mut(at * rpe + row % rpe) = v };
+                }
+            }
+            i0 += 32;
+        }
+    }
+
     /// The NVFP4 down `_sel` over the 32-value q8_1 form: thread row `n =
     /// slot · rows_per_expert + r` stores `y[n]`, the dot of row `sel[slot] ·
     /// rows_per_expert + r` of the stack ([`lane_partials`], a scale a unit) with
@@ -1404,6 +1584,122 @@ mod nvfp4_sel_kernels {
             unsafe { *y.get_unchecked_mut(row) = sum * scale };
         }
     }
+
+    /// `nvfp4_gemv_sel32` over slots of more than one token: thread row `n =
+    /// slot · rows_per_expert + r`. The warp of the first slot that names an
+    /// expert dots row `r` of the expert with the activation column of each
+    /// slot that names it, one slot after the other, and writes each one's
+    /// `y`; the other slots' warps return before any weight load. A slot's
+    /// row is `nvfp4_gemv_sel32`'s bit for bit. Ids: module doc.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 4)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            qs.len() >= n_experts * rows_per_expert * 8 * n_blk,
+            e.len() >= n_experts * rows_per_expert * n_blk,
+            s.len() >= n_experts,
+            16 * iters >= n_blk,
+            q_stride >= 256 * iters,
+            q.len() >= n_slots * q_stride,
+            d8.len() >= n_slots * 2 * n_blk,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn nvfp4_gemv_sel32_cols(
+        qs: &[u32],
+        e: &[u32],
+        s: &[f32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_blk: u32,
+        iters: u32,
+        q_stride: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let _ = iters;
+        let t = thread::index_1d().get() % BLOCK as usize;
+        let row = (thread::index_1d().get() / BLOCK as usize) * ROWS_PER_BLOCK + t / 32;
+        let rpe = rows_per_expert as usize;
+        let n_slots = n_slots as usize;
+        if row >= n_slots * rpe {
+            return;
+        }
+        let slot = row / rpe;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform, so the returns below never diverge a warp.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        }
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; every
+        // lane reads the same `id` and `slot`.
+        if unsafe { names_before(sel, id, slot, lane) } {
+            return;
+        }
+        // The launcher checks a 16-byte base and whole vectors.
+        let Some(qv) = as_vectors::<U32x4>(qs) else {
+            return;
+        };
+        let row_abs = id as usize * rpe + row % rpe;
+        let n_units = 2 * n_blk as usize;
+        // SAFETY: id < n_experts <= s.len() by the launch contract.
+        let scale = unsafe { *s.get_unchecked(id as usize) };
+        let mut i0 = slot;
+        while i0 < n_slots {
+            let i = i0 + lane;
+            // SAFETY: i < n_slots <= sel.len() by the launch contract.
+            let mut hits = warp::ballot(i < n_slots && unsafe { *sel.get_unchecked(i) } == id);
+            while hits != 0 {
+                let at = i0 + hits.trailing_zeros() as usize;
+                hits &= hits - 1;
+                // SAFETY: nvfp4_gemv_sel32's bounds for slot `at` < n_slots:
+                // the row's n_units vectors and n_blk scale words inside qs
+                // and e, column `at` at at · q_stride and its n_units scales
+                // at at · n_units inside q and d8; lane < 32.
+                let f = unsafe {
+                    lane_partials::<1, Nvfp4, 0>(
+                        qv,
+                        e,
+                        row_abs,
+                        n_units,
+                        q,
+                        d8,
+                        at * q_stride as usize,
+                        0,
+                        at * n_units,
+                        0,
+                        1,
+                        lane,
+                    )
+                }[0];
+                let sum = warp::reduce_sum_f32(f);
+                if lane == 0 {
+                    // SAFETY: at · rpe + r < n_slots · rows_per_expert <=
+                    // y.len() by the launch contract; slot `at` names this
+                    // warp's expert and this warp is its first slot, so lane
+                    // 0 here is the row's only writer.
+                    unsafe { *y.get_unchecked_mut(at * rpe + row % rpe) = sum * scale };
+                }
+            }
+            i0 += 32;
+        }
+    }
 }
 
 /// A resident routed NVFP4 stack: the planes of its `n_experts ·
@@ -1484,6 +1780,9 @@ pub struct Nvfp4Down<'a> {
     pub sel: &'a DeviceBuffer<u32>,
     pub n_slots: usize,
     pub rows_per_expert: usize,
+    /// Slots per token. Multi-token runs compute matching slots' dots
+    /// serially in the first matching slot's warp for each expert row.
+    pub slots_per_col: usize,
 }
 
 /// The loaded NVFP4 pair and its launchers. Owns no stream: every enqueue
@@ -1551,33 +1850,42 @@ impl Nvfp4SelKernels {
             &common,
             h.len(),
         )?;
-        let prep = self
-            .module
-            .prepare_nvfp4_gate_up_sel(LaunchConfig1D::new(d.grid, BLOCK, 0))?;
-        self.module.nvfp4_gate_up_sel(
-            stream,
-            &prep,
-            a.gate.qs.buf(),
-            a.gate.e.buf(),
-            a.gate.scales.buf(),
-            a.up.qs.buf(),
-            a.up.e.buf(),
-            a.up.scales.buf(),
-            &a.act.q4,
-            &a.act.d8,
-            a.sel,
-            d.n_experts,
-            d.rows_per_expert,
-            d.n_slots,
-            d.m_cols,
-            d.slots_per_col,
-            d.n_sb,
-            d.iters,
-            d.act,
-            d.limit,
-            fault,
-            h,
-        )?;
+        macro_rules! launch {
+            ($prepare:ident, $entry:ident) => {{
+                let prep = self
+                    .module
+                    .$prepare(LaunchConfig1D::new(d.grid, BLOCK, 0))?;
+                self.module.$entry(
+                    stream,
+                    &prep,
+                    a.gate.qs.buf(),
+                    a.gate.e.buf(),
+                    a.gate.scales.buf(),
+                    a.up.qs.buf(),
+                    a.up.e.buf(),
+                    a.up.scales.buf(),
+                    &a.act.q4,
+                    &a.act.d8,
+                    a.sel,
+                    d.n_experts,
+                    d.rows_per_expert,
+                    d.n_slots,
+                    d.m_cols,
+                    d.slots_per_col,
+                    d.n_sb,
+                    d.iters,
+                    d.act,
+                    d.limit,
+                    fault,
+                    h,
+                )?
+            }};
+        }
+        if a.n_slots > a.slots_per_col {
+            launch!(prepare_nvfp4_gate_up_sel_cols, nvfp4_gate_up_sel_cols);
+        } else {
+            launch!(prepare_nvfp4_gate_up_sel, nvfp4_gate_up_sel);
+        }
         Ok(())
     }
 
@@ -1594,6 +1902,12 @@ impl Nvfp4SelKernels {
     ) -> Result<(), GpuError> {
         let what = "Nvfp4SelKernels::enqueue_down";
         let (n_slots, rpe, k) = (a.n_slots, a.rows_per_expert, a.act.k());
+        if a.slots_per_col == 0 {
+            return Err(GpuError::shape(
+                what,
+                "slots_per_col 0: a token has at least one slot",
+            ));
+        }
         let n_experts = a.w.experts(what, k, rpe)?;
         let slot_rows = crate::kquant::sel::check_down_slots(
             what,
@@ -1605,27 +1919,34 @@ impl Nvfp4SelKernels {
         )?;
         let n_blk = k / NV_BLOCK_VALUES;
         let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
-        let prep = self
-            .module
-            .prepare_nvfp4_gemv_sel32(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        self.module.nvfp4_gemv_sel32(
-            stream,
-            &prep,
-            a.w.qs.buf(),
-            a.w.e.buf(),
-            a.w.scales.buf(),
-            &a.act.q,
-            &a.act.d8,
-            a.sel,
-            launch_u32(what, "n_experts", n_experts)?,
-            launch_u32(what, "rows_per_expert", rpe)?,
-            launch_u32(what, "n_slots", n_slots)?,
-            launch_u32(what, "n_blk", n_blk)?,
-            launch_u32(what, "iters", n_blk.div_ceil(16))?,
-            launch_u32(what, "q_stride", a.act.q_stride())?,
-            fault,
-            y,
-        )?;
+        macro_rules! launch {
+            ($prepare:ident, $entry:ident) => {{
+                let prep = self.module.$prepare(LaunchConfig1D::new(grid, BLOCK, 0))?;
+                self.module.$entry(
+                    stream,
+                    &prep,
+                    a.w.qs.buf(),
+                    a.w.e.buf(),
+                    a.w.scales.buf(),
+                    &a.act.q,
+                    &a.act.d8,
+                    a.sel,
+                    launch_u32(what, "n_experts", n_experts)?,
+                    launch_u32(what, "rows_per_expert", rpe)?,
+                    launch_u32(what, "n_slots", n_slots)?,
+                    launch_u32(what, "n_blk", n_blk)?,
+                    launch_u32(what, "iters", n_blk.div_ceil(16))?,
+                    launch_u32(what, "q_stride", a.act.q_stride())?,
+                    fault,
+                    y,
+                )?
+            }};
+        }
+        if n_slots > a.slots_per_col {
+            launch!(prepare_nvfp4_gemv_sel32_cols, nvfp4_gemv_sel32_cols);
+        } else {
+            launch!(prepare_nvfp4_gemv_sel32, nvfp4_gemv_sel32);
+        }
         Ok(())
     }
 }
@@ -1895,6 +2216,7 @@ mod tests {
                 sel: &sel,
                 n_slots: 1,
                 rows_per_expert: 1,
+                slots_per_col: 1,
             },
             fault,
             &mut out,
@@ -1905,6 +2227,23 @@ mod tests {
                 Err(GpuError::Shape { detail, .. }) if detail.contains("16-byte aligned")
             )),
             "gate, up and down refusals: {refusals:?}"
+        );
+        let zero = kernels.enqueue_down(
+            stream,
+            &Nvfp4Down {
+                w: stack(&qs),
+                act: &down,
+                sel: &sel,
+                n_slots: 1,
+                rows_per_expert: 1,
+                slots_per_col: 0,
+            },
+            fault,
+            &mut out,
+        );
+        assert!(
+            matches!(&zero, Err(GpuError::Shape { detail, .. }) if detail.contains("slots_per_col 0")),
+            "a down of no slots a token: {zero:?}"
         );
     }
 

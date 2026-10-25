@@ -801,6 +801,7 @@ mod gate {
                 sel: &sel,
                 n_slots,
                 rows_per_expert: ROUTED_N,
+                slots_per_col: SPC,
             };
             nv.enqueue_down(stream, &d, gpu.unlabelled_sink(), &mut y_dev)?;
             let y = y_dev.to_host_vec(stream)?;
@@ -841,6 +842,7 @@ mod gate {
                 sel: &bad,
                 n_slots: SPC,
                 rows_per_expert: ROUTED_N,
+                slots_per_col: SPC,
             };
             nv.enqueue_down(stream, &d, gpu.unlabelled_sink(), &mut y_bad)?;
             let y_bad = y_bad.to_host_vec(stream)?;
@@ -1093,6 +1095,7 @@ mod gate {
                         sel: &sels[i % sels.len()],
                         n_slots: SLOTS,
                         rows_per_expert: ROUTED_N,
+                        slots_per_col: SLOTS,
                     };
                     i += 1;
                     nv.enqueue_down(st, &d, sink, &mut y)

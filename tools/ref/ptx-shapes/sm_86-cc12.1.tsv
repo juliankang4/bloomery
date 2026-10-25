@@ -480,8 +480,10 @@ generate_ds41     nemotron_moe_router_432_pick                 0           0
 generate_ds41     nemotron_moe_router_496                      0           0
 generate_ds41     nemotron_moe_router_496_pick                 0           0
 generate_ds41     nvfp4_gate_up_sel                            0           0
+generate_ds41     nvfp4_gate_up_sel_cols                       0           0
 generate_ds41     nvfp4_gemv                                   0           0
 generate_ds41     nvfp4_gemv_sel32                             0           0
+generate_ds41     nvfp4_gemv_sel32_cols                        0           0
 generate_ds41     nvfp4_gemv_sel_f32                           0           0
 generate_ds41     relu_sqr                                     0           0
 # PIN(2026-10-24): 0.3.9's generate_ds41 entries carry the cc 8.6 scan's values; no cc 12.1 scan has run on them yet.
