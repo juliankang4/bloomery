@@ -587,10 +587,10 @@ gguf 7 2 0
 # PIN(2026-10-25): gpu 2605 -> 2621 blocks, 324 -> 326 fns: the GDN split-operand
 # product and keys-by-time transpose, residual record/staging planes and retained projections.
 # Each block has its SAFETY invariant; the two new unsafe fns state their tile contracts.
-# PIN(2026-10-25): gpu 2621 -> 2623 blocks, new code, not old code relaxed: the MXFP8 W8A8 gate projection's
+# PIN(2026-10-25): gpu 2621 -> 2627 blocks, new code, not old code relaxed: the MXFP8 W8A8 gate projection's
 # kernel (nvfp4mma.rs `mxfp8_w8a8_norm_gate`: its shared allocation and its call of the shared norm-epilogue
 # body), counted by tools/check-unsafe.sh. Each new block has its SAFETY line.
-# PIN(2026-10-25): gpu 2623 -> 2627 blocks, 326 -> 329 fns, new code, not old code relaxed: the norm epilogue's
+# PIN(2026-10-25): gpu 2621 -> 2627 blocks, 326 -> 329 fns, new code, not old code relaxed: the norm epilogue's
 # output form (f32tile.rs `NormForm::store`, its empty impl and nvfp4mma.rs `Mxfp8Out`'s, which writes the
 # MXFP8 gate projection's output words, scale word and refusal OR; and the epilogue body's call of it),
 # counted by tools/check-unsafe.sh. Each new block has its SAFETY line.
