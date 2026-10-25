@@ -7251,13 +7251,15 @@ mod gate {
         /// The product epilogue equals the separate projection and norm,
         /// including exact replay, faults, graph replay and token-unit cuts,
         /// for a BF16 weight and, on a native block-scaled build, an MXFP8
-        /// weight's planes as stored.
+        /// weight's planes as stored, whose epilogue also writes the
+        /// output's MXFP8 form: a next MXFP8 product reads it bit for bit as
+        /// it reads `enqueue_mxfp8_cols`' form of the split output.
         pub(super) fn norm_gate_case(gpu: &Gpu, timed: bool) -> Result<bool, GateError> {
             if !timed && !wanted("zgate") {
                 return Ok(true);
             }
             use crate::bench_arm::{N, burst, print_arm, replay};
-            use bloomery_gpu::gemm::MmaForm;
+            use bloomery_gpu::gemm::{MmaForm, Mxfp8NormGateArgs};
             use bloomery_gpu::linear::norm_gate::{NormGateArgs, NormGateKernels, NormGateTail};
             use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight};
             use gguf::quant::fp32_to_bf16_bits;
@@ -7293,6 +7295,7 @@ mod gate {
                         (256, 128, 9, "nan_o"),
                         (256, 128, 9, "square_overflow"),
                         (256, 128, 9, "nan_gain"),
+                        (256, 128, 9, "big_gain"),
                     ]
                 };
                 for &(rows, k, n, edge) in cases {
@@ -7301,7 +7304,10 @@ mod gate {
                     // MXFP8: random E4M3 codes (no NaN code) on block scales
                     // 2^-7 .. 2^0; overflow_z puts row 0's first block past the
                     // tensor cores' range, so the row replays to an infinite z.
-                    let (w, e) = if mx {
+                    let mx_planes = |rows: usize,
+                                     k: usize,
+                                     edit: &dyn Fn(&mut [u8], &mut [u8])|
+                     -> Result<_, GateError> {
                         let mut rng = bloomery_gpu_gates::GateRng(0x7a67_6174 + (rows * k) as u64);
                         let mut codes: Vec<u8> = (0..rows * k)
                             .map(|_| (rng.below(0x7f) as u8) | ((rng.below(2) as u8) << 7))
@@ -7309,16 +7315,21 @@ mod gate {
                         let mut scales: Vec<u8> = (0..rows * k / 32)
                             .map(|_| 120 + rng.below(8) as u8)
                             .collect();
-                        if edge == "overflow_z" {
-                            codes[..k].fill(0);
-                            codes[0] = 0x7e;
-                            codes[1] = 0x7e;
-                            scales[0] = 254;
-                        }
-                        let qs =
-                            DeviceTensor::upload(stream, &bytes_to_words(&codes), rows, k / 4)?;
-                        let e =
-                            DeviceTensor::upload(stream, &bytes_to_words(&scales), rows, k / 128)?;
+                        edit(&mut codes, &mut scales);
+                        Ok((
+                            DeviceTensor::upload(stream, &bytes_to_words(&codes), rows, k / 4)?,
+                            DeviceTensor::upload(stream, &bytes_to_words(&scales), rows, k / 128)?,
+                        ))
+                    };
+                    let (w, e) = if mx {
+                        let (qs, e) = mx_planes(rows, k, &|codes, scales| {
+                            if edge == "overflow_z" {
+                                codes[..k].fill(0);
+                                codes[0] = 0x7e;
+                                codes[1] = 0x7e;
+                                scales[0] = 254;
+                            }
+                        })?;
                         (qs, Some(e))
                     } else {
                         let mut bits: Vec<u16> = activations(k, rows, 1101)
@@ -7356,6 +7367,13 @@ mod gate {
                         "nan_o" => oh[8 * rows + 127] = f32::NAN,
                         "square_overflow" => oh[8 * rows + 127] = f32::MAX,
                         "nan_gain" => gh[127] = f32::NAN,
+                        // Row 0 of every head leaves the tensor cores' range
+                        // except column 8's first head, so its output form
+                        // refuses each column by its other heads.
+                        "big_gain" => {
+                            gh[0] = 2f32.powi(60);
+                            oh[8 * rows] = 0.0;
+                        }
                         _ => {}
                     }
                     let x = DeviceBuffer::from_host(stream, &xh)?;
@@ -7377,11 +7395,17 @@ mod gate {
                             Some(p) => g32.enqueue_mxfp8_w8a8(s, p, &x, &act, n, z),
                             None => g32.enqueue_bf16_mma_cols(s, &w, &x, &act, n, z),
                         };
+                    // The output's MXFP8 form, which only the MXFP8 entry writes.
+                    let room = |count: usize| -> Result<GemmAct32, GateError> {
+                        Ok(GemmAct32::new(stream, count, rows)?
+                            .with_form(stream, MmaForm::Mxfp8)?)
+                    };
                     let fused = |s: &cuda_core::CudaStream,
                                  (xx, aa, count): (&DeviceBuffer<f32>, &GemmAct32, usize),
                                  o: &DeviceBuffer<f32>,
                                  z: &mut DeviceBuffer<f32>,
-                                 y: &mut DeviceBuffer<f32>| {
+                                 y: &mut DeviceBuffer<f32>,
+                                 out: &mut GemmAct32| {
                         let tail = NormGateTail {
                             o,
                             w: &gain,
@@ -7390,9 +7414,18 @@ mod gate {
                             y,
                         };
                         match planes {
-                            Some(p) => {
-                                g32.enqueue_mxfp8_w8a8_norm_gate(s, p, xx, aa, count, z, tail)
-                            }
+                            Some(w) => g32.enqueue_mxfp8_w8a8_norm_gate(
+                                s,
+                                Mxfp8NormGateArgs {
+                                    w,
+                                    x: xx,
+                                    act: aa,
+                                    n_cols: count,
+                                    z,
+                                    tail,
+                                    out,
+                                },
+                            ),
                             None => g32.enqueue_bf16_mma_norm_gate(s, &w, xx, aa, count, z, tail),
                         }
                     };
@@ -7420,24 +7453,61 @@ mod gate {
                     let overflow_reached =
                         edge != "overflow_z" || z.to_host_vec(stream)?[8 * rows].is_infinite();
                     z.copy_from_host(stream, &vec![SENT; z.len()])?;
+                    let mut out = room(n)?;
                     let enqueue = |s: &cuda_core::CudaStream,
                                    z: &mut DeviceBuffer<f32>,
-                                   y: &mut DeviceBuffer<f32>| {
-                        fused(s, (&x, &act, n), &o, z, y)
+                                   y: &mut DeviceBuffer<f32>,
+                                   out: &mut GemmAct32| {
+                        fused(s, (&x, &act, n), &o, z, y, out)
                     };
                     gpu.clear_fault()?;
-                    enqueue(stream, &mut z, &mut y)?;
+                    enqueue(stream, &mut z, &mut y, &mut out)?;
                     stream.synchronize()?;
                     let fault = gpu.take_fault()?;
                     let eager = y.to_host_vec(stream)?;
                     let same = nan_bits_equal(&eager, &expected);
+                    // The next MXFP8 product over an epilogue's form against
+                    // the one over the split output's quantizer form.
+                    let next = if mx {
+                        let (qs2, e2) = mx_planes(128, rows, &|_, _| {})?;
+                        let mut quantized = room(n)?;
+                        g32.enqueue_mxfp8_cols(stream, &split, n, &mut quantized)?;
+                        let mut want = DeviceBuffer::from_host(stream, &vec![SENT; 128 * n])?;
+                        let w = E4m3Weight {
+                            qs: &qs2,
+                            e: &e2,
+                            scales: E4m3Scales::Mxfp8,
+                        };
+                        g32.enqueue_mxfp8_w8a8(stream, w, &split, &quantized, n, &mut want)?;
+                        let want = want.to_host_vec(stream)?;
+                        Some((qs2, e2, want))
+                    } else {
+                        None
+                    };
+                    let next_bits =
+                        |y: &DeviceBuffer<f32>, out: &GemmAct32| -> Result<bool, GateError> {
+                            let Some((qs, e, want)) = &next else {
+                                return Ok(true);
+                            };
+                            let w = E4m3Weight {
+                                qs,
+                                e,
+                                scales: E4m3Scales::Mxfp8,
+                            };
+                            let mut got = DeviceBuffer::from_host(stream, &vec![SENT; 128 * n])?;
+                            Ok(g32
+                                .enqueue_mxfp8_w8a8(stream, w, y, out, n, &mut got)
+                                .is_ok()
+                                && nan_bits_equal(&got.to_host_vec(stream)?, want))
+                        };
+                    let form_bits = next_bits(&y, &out)?;
                     let scratch_kept = edge == "nan_x"
                         || edge == "range_x"
                         || edge == "overflow_z"
                         || z.to_host_vec(stream)?
                             .iter()
                             .all(|v| v.to_bits() == SENT.to_bits());
-                    let graph = gpu.capture(|s| enqueue(s, &mut z, &mut y))?;
+                    let graph = gpu.capture(|s| enqueue(s, &mut z, &mut y, &mut out))?;
                     y.copy_from_host(stream, &vec![SENT; y.len()])?;
                     graph.launch(stream)?;
                     stream.synchronize()?;
@@ -7457,10 +7527,34 @@ mod gate {
                             let aa = formed(&xx, count)?;
                             let mut zz = DeviceBuffer::<f32>::zeroed(stream, rows * count)?;
                             let mut yy = DeviceBuffer::<f32>::zeroed(stream, rows * count)?;
-                            fused(stream, (&xx, &aa, count), &oo, &mut zz, &mut yy)?;
+                            let mut out = room(count)?;
+                            fused(stream, (&xx, &aa, count), &oo, &mut zz, &mut yy, &mut out)?;
                             cut.extend(yy.to_host_vec(stream)?);
                         }
                         cut_bits = bits_equal(&cut, &eager[..rows * n]);
+                    }
+                    // One output scratch through a launch whose subnormal
+                    // outputs refuse its columns and then this case's launch,
+                    // eagerly and replayed: the scratch holds the second
+                    // launch's form alone.
+                    let mut reuse_bits = true;
+                    if mx && n == 9 && edge == "normal" {
+                        let tiny = DeviceBuffer::from_host(stream, &vec![1e-42f32; rows * n])?;
+                        let mut reused = room(n)?;
+                        let both = |s: &cuda_core::CudaStream,
+                                    z: &mut DeviceBuffer<f32>,
+                                    y: &mut DeviceBuffer<f32>,
+                                    out: &mut GemmAct32| {
+                            fused(s, (&x, &act, n), &tiny, z, y, out)?;
+                            fused(s, (&x, &act, n), &o, z, y, out)
+                        };
+                        both(stream, &mut z, &mut y, &mut reused)?;
+                        stream.synchronize()?;
+                        reuse_bits = next_bits(&y, &reused)?;
+                        let graph = gpu.capture(|s| both(s, &mut z, &mut y, &mut reused))?;
+                        graph.launch(stream)?;
+                        stream.synchronize()?;
+                        reuse_bits &= next_bits(&y, &reused)?;
                     }
                     let fault_expected = matches!(
                         edge,
@@ -7470,21 +7564,25 @@ mod gate {
                         && fault
                             == fault_expected.then(|| Fault::at(LAYER_NONE, FaultSite::LinearGate));
                     let pass = same
+                        && form_bits
                         && graph_bits
                         && scratch_kept
                         && cut_bits
+                        && reuse_bits
                         && fault_ok
                         && overflow_reached;
                     println!(
-                        "zgate form={form:?} rows={rows} K={k} M={n} edge={edge} split_bits={same} eager_graph={graph_bits} scratch_kept={scratch_kept} unit_cut={cut_bits} fault_ok={fault_ok} overflow_reached={overflow_reached} {}",
+                        "zgate form={form:?} rows={rows} K={k} M={n} edge={edge} split_bits={same} out_form_bits={form_bits} eager_graph={graph_bits} scratch_kept={scratch_kept} unit_cut={cut_bits} scratch_reuse={reuse_bits} fault_ok={fault_ok} overflow_reached={overflow_reached} {}",
                         verdict(pass)
                     );
                     ok &= pass;
                     if timed {
                         for joined in [false, true] {
+                            // The split MXFP8 arm also quantizes the output
+                            // for the next site, which the epilogue writes.
                             let mut enq = |s: &cuda_core::CudaStream| {
                                 if joined {
-                                    enqueue(s, &mut z, &mut y)
+                                    enqueue(s, &mut z, &mut y, &mut out)
                                 } else {
                                     product(s, &mut z)?;
                                     norm.enqueue_norm_gate_sigmoid(
@@ -7499,7 +7597,11 @@ mod gate {
                                             fault: sink,
                                             y: &mut y,
                                         },
-                                    )
+                                    )?;
+                                    if mx {
+                                        g32.enqueue_mxfp8_cols(s, &y, n, &mut out)?;
+                                    }
+                                    Ok(())
                                 }
                             };
                             let eager = burst(stream, &mut enq)?;
@@ -7516,7 +7618,14 @@ mod gate {
                                 (true, false) => "zgate_mxfp8_split",
                                 (true, true) => "zgate_mxfp8_fused",
                             };
-                            print_arm(arm, n, 0, if joined { 1 } else { 2 }, eager, graph);
+                            // Graph nodes: the MXFP8 epilogue's refusal
+                            // memset precedes its kernel.
+                            let nodes = match (mx, joined) {
+                                (false, true) => 1,
+                                (true, true) | (false, false) => 2,
+                                (true, false) => 3,
+                            };
+                            print_arm(arm, n, 0, nodes, eager, graph);
                         }
                     }
                 }
@@ -7526,9 +7635,35 @@ mod gate {
             let gain = DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?;
             let mut z = DeviceBuffer::<f32>::zeroed(stream, 128)?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, 128)?;
-            let partial = |r: Result<(), GpuError>| {
-                r.is_err_and(|e| e.to_string().contains("whole 128-value heads"))
+            let says = |r: Result<(), GpuError>, need: &str| {
+                r.is_err_and(|e| e.to_string().contains(need))
             };
+            let partial = |r: Result<(), GpuError>| says(r, "whole 128-value heads");
+            // The column and room checks `GemmAct32::room` owns, as each
+            // quantizer reaches them: no columns, more than the scratch holds
+            // and a scratch without the form are refused; all of its columns
+            // pass.
+            let cols_refused = |form: MmaForm| -> Result<bool, GateError> {
+                let quantize = |act: &mut GemmAct32, n: usize| match form {
+                    MmaForm::Bf16 => g32.enqueue_bf16_cols(stream, &x, n, act),
+                    MmaForm::Mxfp8 => g32.enqueue_mxfp8_cols(stream, &x, n, act),
+                };
+                let mut act = GemmAct32::new(stream, 1, 128)?.with_form(stream, form)?;
+                let none = says(quantize(&mut act, 0), "got 0");
+                let past = says(quantize(&mut act, 2), "act.cols() = 1, got 2");
+                let no_room = says(
+                    quantize(&mut GemmAct32::new(stream, 1, 128)?, 1),
+                    "with_form",
+                );
+                let all = quantize(&mut act, 1).is_ok();
+                let pass = none && past && no_room && all;
+                println!(
+                    "zgate case=cols_refused form={form:?} no_cols={none} past_cols={past} no_room={no_room} all_cols={all} {}",
+                    verdict(pass)
+                );
+                Ok(pass)
+            };
+            let mut cols_ok = cols_refused(MmaForm::Bf16)?;
             let mut act = GemmAct32::new(stream, 1, 64)?.with_form(stream, MmaForm::Bf16)?;
             g32.enqueue_bf16_cols(stream, &x, 1, &mut act)?;
             let w = DeviceTensor::upload(stream, &vec![0x3f80_3f80u32; 127 * 32], 127, 32)?;
@@ -7548,7 +7683,8 @@ mod gate {
                 },
             ));
             // The MXFP8 entry refuses as the product entry does: a partial
-            // head, a misaligned value plane, other scales and a stale form.
+            // head, a misaligned value plane, other scales and a stale form;
+            // and an output scratch of another K or without the MXFP8 form.
             let mut mx_refused = true;
             if native {
                 let mut act = GemmAct32::new(stream, 1, 128)?.with_form(stream, MmaForm::Mxfp8)?;
@@ -7565,42 +7701,98 @@ mod gate {
                 let (qs, e) = upload(128)?;
                 let words = DeviceBuffer::from_host(stream, &vec![0x3838_3838u32; 128 * 32 + 1])?;
                 let shifted = DeviceTensor::<u32>::window_of(&words, 4, 128, 32)?;
+                let mut out = GemmAct32::new(stream, 1, 128)?.with_form(stream, MmaForm::Mxfp8)?;
+                let mut out_k =
+                    GemmAct32::new(stream, 1, 256)?.with_form(stream, MmaForm::Mxfp8)?;
+                let mut out_bf16 =
+                    GemmAct32::new(stream, 1, 128)?.with_form(stream, MmaForm::Bf16)?;
                 let mut run = |qs: &DeviceTensor<u32>,
                                e: &DeviceTensor<u32>,
                                scales: E4m3Scales,
-                               act: &GemmAct32| {
+                               act: &GemmAct32,
+                               out: &mut GemmAct32| {
                     g32.enqueue_mxfp8_w8a8_norm_gate(
                         stream,
-                        E4m3Weight { qs, e, scales },
-                        &x,
-                        act,
-                        1,
-                        &mut z,
-                        NormGateTail {
-                            o: &o,
-                            w: &gain,
-                            eps: 1e-6,
-                            fault: sink,
-                            y: &mut y,
+                        Mxfp8NormGateArgs {
+                            w: E4m3Weight { qs, e, scales },
+                            x: &x,
+                            act,
+                            n_cols: 1,
+                            z: &mut z,
+                            tail: NormGateTail {
+                                o: &o,
+                                w: &gain,
+                                eps: 1e-6,
+                                fault: sink,
+                                y: &mut y,
+                            },
+                            out,
                         },
                     )
                 };
-                let says = |r: Result<(), GpuError>, need: &str| {
-                    r.is_err_and(|e| e.to_string().contains(need))
-                };
-                partial_head &= partial(run(&qs127, &e127, E4m3Scales::Mxfp8, &act));
+                let mx = E4m3Scales::Mxfp8;
+                partial_head &= partial(run(&qs127, &e127, mx, &act, &mut out));
                 let unaligned = says(
-                    run(&shifted, &e, E4m3Scales::Mxfp8, &act),
+                    run(&shifted, &e, mx, &act, &mut out),
                     "is not 16-byte aligned",
                 );
-                let other_scales = says(run(&qs, &e, E4m3Scales::Fp8B128, &act), "not MXFP8's");
-                let stale = says(run(&qs, &e, E4m3Scales::Mxfp8, &bf16), "MXFP8 form");
-                let fresh = run(&qs, &e, E4m3Scales::Mxfp8, &act).is_ok();
-                mx_refused = unaligned && other_scales && stale && fresh;
+                let other_scales = says(
+                    run(&qs, &e, E4m3Scales::Fp8B128, &act, &mut out),
+                    "not MXFP8's",
+                );
+                let stale = says(run(&qs, &e, mx, &bf16, &mut out), "MXFP8 form");
+                let other_k = says(run(&qs, &e, mx, &act, &mut out_k), "not 128");
+                let no_room = says(run(&qs, &e, mx, &act, &mut out_bf16), "with_form");
+                let fresh = run(&qs, &e, mx, &act, &mut out).is_ok();
+                // An output scratch of fewer columns than the product's, with
+                // the input, z, o and y room for all of them; the scratch of
+                // all of them passes.
+                let x2 = DeviceBuffer::from_host(stream, &vec![1.0f32; 256])?;
+                let o2 = DeviceBuffer::from_host(stream, &vec![1.0f32; 256])?;
+                let mut z2 = DeviceBuffer::<f32>::zeroed(stream, 256)?;
+                let mut y2 = DeviceBuffer::<f32>::zeroed(stream, 256)?;
+                let mut act2 = GemmAct32::new(stream, 2, 128)?.with_form(stream, MmaForm::Mxfp8)?;
+                g32.enqueue_mxfp8_cols(stream, &x2, 2, &mut act2)?;
+                let mut out2 = GemmAct32::new(stream, 2, 128)?.with_form(stream, MmaForm::Mxfp8)?;
+                let mut run2 = |out: &mut GemmAct32| {
+                    g32.enqueue_mxfp8_w8a8_norm_gate(
+                        stream,
+                        Mxfp8NormGateArgs {
+                            w: E4m3Weight {
+                                qs: &qs,
+                                e: &e,
+                                scales: mx,
+                            },
+                            x: &x2,
+                            act: &act2,
+                            n_cols: 2,
+                            z: &mut z2,
+                            tail: NormGateTail {
+                                o: &o2,
+                                w: &gain,
+                                eps: 1e-6,
+                                fault: sink,
+                                y: &mut y2,
+                            },
+                            out,
+                        },
+                    )
+                };
+                let out_cols = says(run2(&mut out), "act.cols() = 1, got 2");
+                let out_all = run2(&mut out2).is_ok();
+                mx_refused = unaligned
+                    && other_scales
+                    && stale
+                    && other_k
+                    && no_room
+                    && fresh
+                    && out_cols
+                    && out_all;
                 println!(
-                    "zgate case=mxfp8_refused unaligned_weight={unaligned} other_scales={other_scales} stale_form={stale} fresh_read={fresh} {}",
+                    "zgate case=mxfp8_refused unaligned_weight={unaligned} other_scales={other_scales} stale_form={stale} out_other_k={other_k} out_no_room={no_room} fresh_read={fresh} out_past_cols={out_cols} out_all_cols={out_all} {}",
                     verdict(mx_refused)
                 );
+                cols_ok &= cols_refused(MmaForm::Mxfp8)?;
             }
             let overflow = matches!(norm.enqueue_norm_gate_sigmoid(stream, NormGateArgs {
                 o: &o, z: &z, w: &gain, eps: 1e-6, n_v: 2, m: usize::MAX,
@@ -7610,7 +7802,7 @@ mod gate {
                 "zgate native={native} partial_head_refused={partial_head} size_overflow_refused={overflow} {}",
                 verdict(partial_head && overflow)
             );
-            Ok(ok && partial_head && overflow && mx_refused)
+            Ok(ok && partial_head && overflow && mx_refused && cols_ok)
         }
 
         /// Ragged dense MMA tiles, tails, repeatability and graph replay.

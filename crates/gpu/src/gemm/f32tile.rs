@@ -1673,11 +1673,31 @@ pub(crate) unsafe fn bf16_mma_narrow(
     }
 }
 
+/// What a norm-gate epilogue ([`bf16_mma_norm_gate_body`]) writes of its
+/// output columns beside their f32 values: nothing, or the MMA form the next
+/// site reads (`nvfp4mma.rs`'s `Mxfp8Out`).
+pub(crate) trait NormForm: Copy {
+    /// Writes the form of the 128 values of column `c` from row `row0`, `k`
+    /// values a column, that one warp holds: lane `l`'s `v[i]` is row
+    /// `row0 + l + 32·i`'s.
+    ///
+    /// # Safety
+    ///
+    /// The whole warp calls converged on a live column the form holds room
+    /// for, and the head lies inside its `k` values.
+    unsafe fn store(self, v: [f32; 4], c: usize, row0: usize, k: usize);
+}
+
+impl NormForm for () {
+    #[inline(always)]
+    unsafe fn store(self, _: [f32; 4], _: usize, _: usize, _: usize) {}
+}
+
 /// Dense prompt product ([`bf16_mma_body`]'s, BF16 or block-scaled E4M3)
-/// followed by the shared sigmoid norm. Normal tiles exchange z through the
-/// retired staging allocation; exceptional tiles finish through the exact
-/// product owner first. K counts values; a scaled tile's units are value
-/// pairs.
+/// followed by the shared sigmoid norm, its output also in `form`. Normal
+/// tiles exchange z through the retired staging allocation; exceptional
+/// tiles finish through the exact product owner first. K counts values; a
+/// scaled tile's units are value pairs.
 ///
 /// # Safety
 ///
@@ -1687,14 +1707,15 @@ pub(crate) unsafe fn bf16_mma_narrow(
 /// rows*k weight values and n*k activations; x.exact holds n*k values. o, z
 /// and y hold rows*n values, gain holds HEAD. sh is this block's
 /// 16-byte-aligned allocation of STAGES*STAGE_FLOATS floats. Output and
-/// scratch cells belong to this block.
+/// scratch cells belong to this block; `form` holds room for the n columns
+/// of rows values.
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
     clippy::needless_range_loop,
     reason = "flat device operands and indexed CUDA-unrolled arrays"
 )]
-pub(crate) unsafe fn bf16_mma_norm_gate_body<W: MmaRows, X: MmaCols>(
+pub(crate) unsafe fn bf16_mma_norm_gate_body<W: MmaRows, X: MmaCols, F: NormForm>(
     w: W,
     x: X,
     rows: u32,
@@ -1706,6 +1727,7 @@ pub(crate) unsafe fn bf16_mma_norm_gate_body<W: MmaRows, X: MmaCols>(
     fault: FaultSink,
     z: &mut DisjointSlice<f32>,
     y: &mut DisjointSlice<f32>,
+    form: F,
     sh: *mut f32,
 ) {
     const {
@@ -1778,6 +1800,10 @@ pub(crate) unsafe fn bf16_mma_norm_gate_body<W: MmaRows, X: MmaCols>(
                     // SAFETY: this warp owns c, each lane four disjoint values.
                     unsafe { *y.get_unchecked_mut(base + lane + 32 * i) = values[i] };
                 }
+                // SAFETY: c < n is warp-uniform, so the warp is converged on a
+                // live column; this tile owns its head at row0, and form holds
+                // room for the n columns of rows values (this fn's contract).
+                unsafe { form.store(values, c, tile.row0, rows) };
             }
         }
         // Retire the readers before the next slab overwrites shared memory.
@@ -2002,12 +2028,14 @@ impl Gemm32Kernels {
     }
 
     /// [`Self::enqueue_mxfp8_w8a8`] and the shared sigmoid norm in one
-    /// launch, as [`Self::enqueue_bf16_mma_norm_gate`] finishes a BF16
-    /// product: z is scratch for exceptional exact replay only.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "product operands and its norm tail"
-    )]
+    /// kernel launch, as [`Self::enqueue_bf16_mma_norm_gate`] finishes a BF16
+    /// product: z is scratch for exceptional exact replay only. The kernel
+    /// also writes the MXFP8 form of the norm's output `tail.y` into `out`,
+    /// a scratch of `k` = the weight's rows made with room for it, bit for
+    /// bit [`Self::enqueue_mxfp8_cols`]'s, so the next MXFP8 site reads it
+    /// without a quantizer launch; `out`'s other form is left as another
+    /// rows'. A memset of `out`'s refusal words, which the kernel's heads OR,
+    /// comes first: two graph nodes.
     #[cfg_attr(
         not(bloomery_nvfp4_mma),
         allow(unused_variables, reason = "the native build's launch reads them")
@@ -2015,21 +2043,41 @@ impl Gemm32Kernels {
     pub fn enqueue_mxfp8_w8a8_norm_gate(
         &self,
         stream: &CudaStream,
-        w: E4m3Weight<'_>,
-        x: &DeviceBuffer<f32>,
-        act: &GemmAct32,
-        n: usize,
-        z: &mut DeviceBuffer<f32>,
-        tail: NormGateTail<'_>,
+        a: Mxfp8NormGateArgs<'_>,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_mxfp8_w8a8_norm_gate";
+        let Mxfp8NormGateArgs {
+            w,
+            x,
+            act,
+            n_cols: n,
+            z,
+            tail,
+            out,
+        } = a;
         let t = mxfp8_mma_launch(what, w, x, n, z)?;
         tail.check_rows(what, t.rows as usize, n, z.len())?;
         let form = held_form(what, act, MmaForm::Mxfp8, x, &t)?;
+        let y = tail.y.cu_deviceptr();
+        let into = out.room(what, MmaForm::Mxfp8, t.rows as usize, n)?;
         #[cfg(bloomery_nvfp4_mma)]
-        return self
-            .native
-            .mxfp8_w8a8_norm_gate(stream, w, x, form, &t, z, tail);
+        {
+            self.native.mxfp8_w8a8_norm_gate(
+                stream,
+                super::nvfp4mma::NativeNormGateArgs {
+                    w,
+                    x,
+                    form,
+                    t: &t,
+                    z,
+                    tail,
+                    out: &mut *into,
+                },
+            )?;
+            into.of = Some((y, n));
+            out.forget(MmaForm::Bf16);
+            Ok(())
+        }
         #[cfg(not(bloomery_nvfp4_mma))]
         Err(GpuError::state(what, NATIVE_BUILD))
     }
@@ -2133,6 +2181,21 @@ pub(crate) fn bf16_mma_launch(
     let launch = mma_launch(what, w.rows(), k, x, n, y)?;
     crate::tensor::check_alignment::<U32x4, _>(what, "w", w.buf())?;
     Ok(launch)
+}
+
+/// [`Gemm32Kernels::enqueue_mxfp8_w8a8_norm_gate`]'s arguments: the MXFP8
+/// weight `w` over the MXFP8 form `act` holds of the first `n_cols` columns
+/// of `x`, the exact replay's scratch `z` (`[n_cols][rows]`), the norm and
+/// gate operands `tail`, and `out`, the scratch the output's MXFP8 form goes
+/// into.
+pub struct Mxfp8NormGateArgs<'a> {
+    pub w: E4m3Weight<'a>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub act: &'a GemmAct32,
+    pub n_cols: usize,
+    pub z: &'a mut DeviceBuffer<f32>,
+    pub tail: NormGateTail<'a>,
+    pub out: &'a mut GemmAct32,
 }
 
 /// A tile launch's grid and its `u32` arguments.

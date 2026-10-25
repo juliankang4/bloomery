@@ -1393,7 +1393,21 @@ mod gemm32_kernels {
         // xb, the contract's spans of w, x, xb, refused, o, gain, z and y, and sh
         // this block's aligned STAGES·STAGE_FLOATS floats.
         unsafe {
-            bf16_mma_norm_gate_body(w, cols, rows, k, n, o, gain, eps, fault, &mut z, &mut y, sh)
+            bf16_mma_norm_gate_body(
+                w,
+                cols,
+                rows,
+                k,
+                n,
+                o,
+                gain,
+                eps,
+                fault,
+                &mut z,
+                &mut y,
+                (),
+                sh,
+            )
         };
     }
 

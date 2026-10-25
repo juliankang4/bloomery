@@ -309,7 +309,9 @@ generate_ds41 mxfp8_mma_gemm 0 0
 generate_ds41 mxfp8_tile_gemm 0 0
 generate_ds41 mxfp8_w8a8_gemm 0 0
 # PIN(2026-10-25): MXFP8 W8A8 norm-gate spill and GB10 JIT local measured with ptxas 13.3.73, driver 595.84, sm_121a.
-generate_ds41 mxfp8_w8a8_norm_gate 376 64
+# PIN(2026-10-25): 376 -> 364 spill bytes (ptxas 13.3.73 sm_121a, GB10 driver 595.84) when the epilogue also writes
+# the output's MXFP8 form. JIT local bytes remain unchanged.
+generate_ds41 mxfp8_w8a8_norm_gate 364 64
 generate_ds41 nemotron_moe_router_240 0 0
 generate_ds41 nemotron_moe_router_240_pick 0 0
 generate_ds41 nemotron_moe_router_304 0 0

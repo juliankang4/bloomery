@@ -4,7 +4,7 @@
 
 use super::act32::ColsForm;
 use super::f32tile::{
-    Bf16Cols, Bf16Rows, ByteRows, MMA_THREADS, MmaCols, MmaRows, STAGE_FLOATS,
+    Bf16Cols, Bf16Rows, ByteRows, MMA_THREADS, MmaCols, MmaRows, NormForm, STAGE_FLOATS,
     STAGES as MMA_STAGES, TileLaunch, TileRows, bf16_mma_body, bf16_mma_norm_gate_body, form_col,
     mma_fits, store_refused,
 };
@@ -606,6 +606,75 @@ impl MmaCols for Mxfp8Cols<'_> {
     }
 }
 
+/// A 32-value block's UE8M0 scale byte for its largest magnitude `amax`,
+/// `ceil(log2(amax / 448))` biased and clamped to 1..=254, and the inverse
+/// scale its values are multiplied by before E4M3 rounding.
+#[inline(always)]
+fn ue8m0_block(amax: f32) -> (u32, f32) {
+    let bits = (amax * (1.0 / 448.0)).to_bits();
+    let exp = ((bits >> 23) + u32::from(bits & 0x7f_ffff != 0)).clamp(1, 254);
+    (exp, f32::from_bits((254 - exp) << 23))
+}
+
+/// [`Mxfp8Cols`]' planes of a norm-gate epilogue's output columns
+/// (`bf16_mma_norm_gate_body`), a 128-value head at a time, with
+/// `mxfp8_cols_body`'s bits: the head's E4M3 words and scale word, and each
+/// column's refusal word, zero before the launch and ORed by its heads.
+#[derive(Clone, Copy)]
+struct Mxfp8Out {
+    qs: *mut u32,
+    e: *mut u32,
+    refused: *mut u32,
+}
+
+impl NormForm for Mxfp8Out {
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop, reason = "indexed CUDA-unrolled arrays")]
+    unsafe fn store(self, v: [f32; 4], c: usize, row0: usize, k: usize) {
+        use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+        use cuda_device::convert::cvt_rn_satfinite_e4m3x2_f32;
+        let lane = warp::lane_id() as usize;
+        let mut fits = true;
+        let mut scales = 0u32;
+        // Block b is v[b] of the 32 lanes; lane 4q's word holds values
+        // 4q .. 4q + 3 of it, as mxfp8_cols_body's lane q does.
+        for b in 0..4 {
+            thread::__unroll_config::<0>();
+            fits &= mma_fits(v[b]);
+            let mut amax = v[b].abs();
+            for step in 0..5 {
+                thread::__unroll_config::<0>();
+                amax = amax.max(warp::shuffle_xor_f32(amax, 1 << step));
+            }
+            let (exp, inv) = ue8m0_block(amax);
+            let scaled = v[b] * inv;
+            let pair = u32::from(cvt_rn_satfinite_e4m3x2_f32(
+                scaled,
+                warp::shuffle_xor_f32(scaled, 1),
+            ));
+            let word = pair | (warp::shuffle_xor(pair, 2) << 16);
+            if lane.is_multiple_of(4) {
+                // SAFETY: lane 4q writes word (c·k + row0 + 32b) / 4 + q of
+                // column c's head, inside the form's words (this fn's
+                // contract); no other lane or head writes it.
+                unsafe { *self.qs.add((c * k + row0 + 32 * b + lane) / 4) = word };
+            }
+            scales |= exp << (8 * b);
+        }
+        if lane == 0 {
+            // SAFETY: word (c·k + row0) / 128 is the head's scale word inside
+            // the form's scale words; lane 0 of this warp is its only writer.
+            unsafe { *self.e.add((c * k + row0) / 128) = scales };
+        }
+        if warp::any(!fits) && lane == 0 {
+            // SAFETY: c is a live column, so word c lies inside the form's
+            // refusal words, 4-byte aligned; this launch only ORs it atomically.
+            let refused = unsafe { DeviceAtomicU32::from_ptr(self.refused.add(c)) };
+            refused.fetch_or(1, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
 /// The first `n` columns of `k` f32 values (`k` a multiple of 128) as
 /// [`Mxfp8Cols`]' planes: each 32-value block's scale exponent
 /// `ceil(log2(amax / 448))` as a UE8M0 byte, the block's values over that
@@ -643,9 +712,7 @@ unsafe fn mxfp8_cols_body(
             amax = amax.max(warp::shuffle_xor_f32(amax, 1));
             amax = amax.max(warp::shuffle_xor_f32(amax, 2));
             amax = amax.max(warp::shuffle_xor_f32(amax, 4));
-            let bits = (amax * (1.0 / 448.0)).to_bits();
-            let exp = ((bits >> 23) + u32::from(bits & 0x7f_ffff != 0)).clamp(1, 254);
-            let inv = f32::from_bits((254 - exp) << 23);
+            let (exp, inv) = ue8m0_block(amax);
             let lo = u32::from(cvt_rn_satfinite_e4m3x2_f32(v[0] * inv, v[1] * inv));
             let hi = u32::from(cvt_rn_satfinite_e4m3x2_f32(v[2] * inv, v[3] * inv));
             // SAFETY: word at / 4 is this lane's own.
@@ -1306,7 +1373,9 @@ mod native {
     }
 
     /// [`mxfp8_w8a8_gemm`] as a gate projection with the shared sigmoid norm
-    /// at its store (`f32tile.rs`'s `bf16_mma_norm_gate_body`).
+    /// at its store (`f32tile.rs`'s `bf16_mma_norm_gate_body`), which also
+    /// writes the output's MXFP8 form (`yq`, `ye`, `yrefused` zero before
+    /// the launch) for the site that reads it.
     #[allow(clippy::too_many_arguments, reason = "flat kernel ABI")]
     #[kernel]
     #[launch_bounds(256, 2)]
@@ -1325,7 +1394,10 @@ mod native {
             o.len() >= rows * n,
             gain.len() >= 128,
             z.len() >= rows * n,
-            y.len() >= rows * n
+            y.len() >= rows * n,
+            4 * yq.len() >= rows * n,
+            128 * ye.len() >= rows * n,
+            yrefused.len() >= n
         )
     )]
     pub fn mxfp8_w8a8_norm_gate(
@@ -1344,6 +1416,9 @@ mod native {
         fault: crate::fault::FaultSink,
         mut z: DisjointSlice<f32>,
         mut y: DisjointSlice<f32>,
+        mut yq: DisjointSlice<u32>,
+        mut ye: DisjointSlice<u32>,
+        mut yrefused: DisjointSlice<u32>,
     ) {
         static mut STAGE: SharedArray<f32, { MMA_STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
         // SAFETY: this block's aligned shared allocation, accessed without a reference.
@@ -1357,10 +1432,20 @@ mod native {
             e: xe,
         };
         let w = Mxfp8Rows { qs, e };
-        // SAFETY: 256 converged threads and the checked complete-head spans,
-        // K a multiple of 128 and aligned planes satisfy the body's contract.
+        let form = Mxfp8Out {
+            qs: yq.as_mut_ptr(),
+            e: ye.as_mut_ptr(),
+            refused: yrefused.as_mut_ptr(),
+        };
+        // SAFETY: the checked launch gives 256 converged threads and the MMA
+        // grid, rows a multiple of HEAD, k a multiple of 128, 16-byte-aligned
+        // qs and xq, the contract's spans of qs, e, x, xq, xe, refused, o,
+        // gain, z, y and the output form's yq, ye and yrefused, and sh this
+        // block's aligned MMA_STAGES·STAGE_FLOATS floats.
         unsafe {
-            bf16_mma_norm_gate_body(w, cols, rows, k, n, o, gain, eps, fault, &mut z, &mut y, sh)
+            bf16_mma_norm_gate_body(
+                w, cols, rows, k, n, o, gain, eps, fault, &mut z, &mut y, form, sh,
+            )
         };
     }
 }
@@ -1391,6 +1476,19 @@ pub(super) struct SwigluArgs<'a> {
     pub(super) rule: crate::kquant::Act,
     pub(super) cols: u32,
     pub(super) act: &'a mut GemmAct32,
+}
+
+/// [`Kernels::mxfp8_w8a8_norm_gate`]'s arguments: the weight `w` over the
+/// MXFP8 `form` of `x`, the checked launch `t`, the exact replay's scratch
+/// `z`, the norm and gate operands `tail`, and the output form `out`.
+pub(super) struct NativeNormGateArgs<'a> {
+    pub(super) w: E4m3Weight<'a>,
+    pub(super) x: &'a DeviceBuffer<f32>,
+    pub(super) form: &'a ColsForm,
+    pub(super) t: &'a TileLaunch,
+    pub(super) z: &'a mut DeviceBuffer<f32>,
+    pub(super) tail: NormGateTail<'a>,
+    pub(super) out: &'a mut ColsForm,
 }
 
 pub(super) struct ProductArgs<'a> {
@@ -1662,29 +1760,51 @@ impl Kernels {
         Ok(())
     }
 
-    /// [`Self::mxfp8_w8a8`] with the shared sigmoid norm `tail` at its store
-    /// ([`native::mxfp8_w8a8_norm_gate`]); z is the exact replay's scratch.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "product operands and its norm tail"
-    )]
+    /// [`Self::mxfp8_w8a8`] with the shared sigmoid norm `a.tail` at its
+    /// store and the MXFP8 form of its output into `a.out`, which has room
+    /// for it ([`native::mxfp8_w8a8_norm_gate`]); `a.z` is the exact
+    /// replay's scratch.
     pub(super) fn mxfp8_w8a8_norm_gate(
         &self,
         stream: &CudaStream,
-        w: E4m3Weight<'_>,
-        x: &DeviceBuffer<f32>,
-        form: &ColsForm,
-        t: &TileLaunch,
-        z: &mut DeviceBuffer<f32>,
-        tail: NormGateTail<'_>,
+        a: NativeNormGateArgs<'_>,
     ) -> Result<(), GpuError> {
+        let NativeNormGateArgs {
+            w,
+            x,
+            form,
+            t,
+            z,
+            tail,
+            out,
+        } = a;
         let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
         let prep = self.module.prepare_mxfp8_w8a8_norm_gate(cfg)?;
         let (qs, e) = (w.qs.buf(), w.e.buf());
         let (xq, xe, refused) = (&form.words, &form.scales, &form.refused);
+        // The heads of a column OR its refusal word.
+        out.refused.zero_async(stream)?;
         self.module.mxfp8_w8a8_norm_gate(
-            stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, tail.o, tail.w, tail.eps,
-            tail.fault, z, tail.y,
+            stream,
+            &prep,
+            qs,
+            e,
+            x,
+            xq,
+            xe,
+            refused,
+            t.rows,
+            t.k,
+            t.n,
+            tail.o,
+            tail.w,
+            tail.eps,
+            tail.fault,
+            z,
+            tail.y,
+            &mut out.words,
+            &mut out.scales,
+            &mut out.refused,
         )?;
         Ok(())
     }

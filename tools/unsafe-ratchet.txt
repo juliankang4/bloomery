@@ -590,7 +590,11 @@ gguf 7 2 0
 # PIN(2026-10-25): gpu 2621 -> 2623 blocks, new code, not old code relaxed: the MXFP8 W8A8 gate projection's
 # kernel (nvfp4mma.rs `mxfp8_w8a8_norm_gate`: its shared allocation and its call of the shared norm-epilogue
 # body), counted by tools/check-unsafe.sh. Each new block has its SAFETY line.
-gpu 2623 326 10
+# PIN(2026-10-25): gpu 2623 -> 2627 blocks, 326 -> 329 fns, new code, not old code relaxed: the norm epilogue's
+# output form (f32tile.rs `NormForm::store`, its empty impl and nvfp4mma.rs `Mxfp8Out`'s, which writes the
+# MXFP8 gate projection's output words, scale word and refusal OR; and the epilogue body's call of it),
+# counted by tools/check-unsafe.sh. Each new block has its SAFETY line.
+gpu 2627 329 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

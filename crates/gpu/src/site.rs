@@ -1176,9 +1176,17 @@ pub fn resident_gemm(
     wide_by_name(gpu, k, (w, src, rows), x, route, m, y)
 }
 
-/// A resident gate projection followed by the shared sigmoid norm. BF16 and
-/// native W8A8 MXFP8 tensor-core sites finish the norm in their product's
-/// store epilogue.
+/// A resident gate projection followed by the shared sigmoid norm, its
+/// output `tail.y` then quantized for the resident sites `readers` into
+/// `out` ([`resident_quantize`]). BF16 and native W8A8 MXFP8 tensor-core
+/// sites finish the norm in their product's store epilogue. The MXFP8
+/// epilogue also writes the output's MXFP8 form, so it runs only when that
+/// form is all the readers take from `out`: a reader reads it, and none
+/// reads the q8 blocks of 32 or another form `out` holds room for.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the projection's operands, its norm tail and the output's readers"
+)]
 pub(crate) fn resident_gemm_norm_gate(
     gpu: &Gpu,
     k: &WideKernels<'_>,
@@ -1191,44 +1199,79 @@ pub(crate) fn resident_gemm_norm_gate(
         &mut DeviceBuffer<f32>,
         crate::linear::norm_gate::NormGateTail<'_>,
     ),
+    (readers, out): (&[&str], &mut GemmAct32),
 ) -> Result<(), GpuError> {
-    use crate::linear::norm_gate::NormGateArgs;
+    use crate::linear::norm_gate::{NormGateArgs, NormGateTail};
     let what = "site::resident_gemm_norm_gate";
     let weight = w.resident(what, name)?;
     let rows = weight.rows();
-    if let (DevWeight::Bf16 { w: packed, .. }, Some(act), Some(input)) = (weight, x.q32, x.f32)
-        && gpu.q8f32().dense_mma
-        && act.holds(MmaForm::Bf16, input, m)
-    {
-        return k
-            .g32(what, "the BF16 prompt kernels")?
-            .enqueue_bf16_mma_norm_gate(gpu.stream(), packed, input, act, m, z, tail);
-    }
-    if let (DevWeight::Mxfp8 { .. }, Some(act), Some(input)) = (weight, x.q32, x.f32)
-        && gpu.q8f32().dense_mma
-    {
-        let planes = w.e4m3(what, name)?;
-        if crate::gemm::mxfp8_w8a8_reads(&planes, act, input, m) {
+    let NormGateTail {
+        o,
+        w: gain,
+        eps,
+        fault,
+        y,
+    } = tail;
+    let tail = NormGateTail {
+        o,
+        w: gain,
+        eps,
+        fault,
+        y: &mut *y,
+    };
+    let mxfp8 = match weight {
+        DevWeight::Mxfp8 { .. } => Some(w.e4m3(what, name)?),
+        _ => None,
+    };
+    match (weight, mxfp8, x.q32, x.f32) {
+        (DevWeight::Bf16 { w: packed, .. }, _, Some(act), Some(input))
+            if gpu.q8f32().dense_mma && act.holds(MmaForm::Bf16, input, m) =>
+        {
+            k.g32(what, "the BF16 prompt kernels")?
+                .enqueue_bf16_mma_norm_gate(gpu.stream(), packed, input, act, m, z, tail)?;
+        }
+        (_, Some(planes), Some(act), Some(input))
+            if gpu.q8f32().dense_mma
+                && out.has(MmaForm::Mxfp8)
+                && reads_form(gpu, w, readers, MmaForm::Mxfp8)
+                && !reads_q32(w, readers)
+                && !(out.has(MmaForm::Bf16) && reads_form(gpu, w, readers, MmaForm::Bf16))
+                && crate::gemm::mxfp8_w8a8_reads(&planes, act, input, m) =>
+        {
             return k
                 .g32(what, "the MXFP8 prompt kernels")?
-                .enqueue_mxfp8_w8a8_norm_gate(gpu.stream(), planes, input, act, m, z, tail);
+                .enqueue_mxfp8_w8a8_norm_gate(
+                    gpu.stream(),
+                    crate::gemm::Mxfp8NormGateArgs {
+                        w: planes,
+                        x: input,
+                        act,
+                        n_cols: m,
+                        z,
+                        tail,
+                        out,
+                    },
+                );
+        }
+        _ => {
+            tail.check_rows(what, rows, m, z.len())?;
+            resident_gemm(gpu, k, (w, name), x, route, m, z)?;
+            norm.enqueue_norm_gate_sigmoid(
+                gpu.stream(),
+                NormGateArgs {
+                    o,
+                    z,
+                    w: gain,
+                    eps,
+                    n_v: rows / crate::linear::HEAD,
+                    m,
+                    fault,
+                    y: tail.y,
+                },
+            )?;
         }
     }
-    tail.check_rows(what, rows, m, z.len())?;
-    resident_gemm(gpu, k, (w, name), x, route, m, z)?;
-    norm.enqueue_norm_gate_sigmoid(
-        gpu.stream(),
-        NormGateArgs {
-            o: tail.o,
-            z,
-            w: tail.w,
-            eps: tail.eps,
-            n_v: rows / crate::linear::HEAD,
-            m,
-            fault: tail.fault,
-            y: tail.y,
-        },
-    )
+    resident_quantize(gpu, k, (w, readers), (&*y, m), out, fault)
 }
 
 /// [`resident_gemm`] over rows `at .. at + n` of the resident weight `name`
@@ -1300,12 +1343,7 @@ pub fn resident_quantize(
     q32: &mut GemmAct32,
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    let reads_q32 = |n: &&str| {
-        w.get(n)
-            .and_then(of_resident)
-            .is_some_and(|ty| WideActs::wants(ty).q32)
-    };
-    if names.iter().any(reads_q32) {
+    if reads_q32(w, names) {
         k.g32(
             "site::resident_quantize",
             "the 32-value kernels a site's q8 blocks of 32 are quantized by",
@@ -1314,6 +1352,16 @@ pub fn resident_quantize(
     }
     write_forms(k, gpu.stream(), (x, m), q32, |f| {
         reads_form(gpu, w, names, f)
+    })
+}
+
+/// Whether a site of one of the resident weights `names` reads the q8
+/// blocks of 32 ([`WideActs::wants`] of its resident type).
+fn reads_q32(w: &Weights, names: &[&str]) -> bool {
+    names.iter().any(|n| {
+        w.get(n)
+            .and_then(of_resident)
+            .is_some_and(|ty| WideActs::wants(ty).q32)
     })
 }
 

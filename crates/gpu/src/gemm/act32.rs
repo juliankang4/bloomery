@@ -154,6 +154,33 @@ impl GemmAct32 {
             .filter(|f| f.of.is_some_and(|(at, m)| at == x.cu_deviceptr() && n <= m))
     }
 
+    /// `form`'s room for the first `n` columns of `k` values, as `what`'s: a
+    /// scratch of another K or fewer columns is a named `Shape` error, one
+    /// made without room for `form` a named `State` error.
+    pub(super) fn room(
+        &mut self,
+        what: &'static str,
+        form: MmaForm,
+        k: usize,
+        n: usize,
+    ) -> Result<&mut ColsForm, GpuError> {
+        if k != self.k {
+            return Err(GpuError::shape(
+                what,
+                format!("the scratch holds columns of {} values, not {k}", self.k),
+            ));
+        }
+        if n == 0 || n > self.cols {
+            return Err(GpuError::shape(
+                what,
+                format!("1 <= n_cols <= act.cols() = {}, got {n}", self.cols),
+            ));
+        }
+        self.forms[form as usize]
+            .as_mut()
+            .ok_or_else(|| GpuError::state(what, "a scratch made with_form for this form"))
+    }
+
     /// Whether a site can read `form` of the first `n` columns of `x`
     /// ([`GemmAct32::form_of`]).
     #[must_use]
@@ -315,29 +342,19 @@ fn form_launch<'a>(
     act: &'a mut GemmAct32,
     form: MmaForm,
 ) -> Result<(LaunchConfig1D, u32, u32, &'a mut ColsForm), GpuError> {
-    if n_cols == 0 || n_cols > act.cols {
+    let k_values = act.k;
+    let f = act.room(what, form, k_values, n_cols)?;
+    if x.len() < n_cols * k_values {
         return Err(GpuError::shape(
             what,
-            format!("1 <= n_cols <= act.cols() = {}, got {n_cols}", act.cols),
-        ));
-    }
-    if x.len() < n_cols * act.k {
-        return Err(GpuError::shape(
-            what,
-            format!("x.len() {} < n_cols*k = {n_cols}*{}", x.len(), act.k),
+            format!("x.len() {} < n_cols*k = {n_cols}*{k_values}", x.len()),
         ));
     }
     crate::tensor::check_alignment::<U32x4, _>(what, "x", x)?;
-    let k = launch_u32(what, "k", act.k)?;
+    let k = launch_u32(what, "k", k_values)?;
     let n = launch_u32(what, "n_cols", n_cols)?;
     let warps = (FORM_THREADS / 32) as usize;
     let grid = launch_u32(what, "grid", n_cols.div_ceil(warps))?;
-    let Some(f) = &mut act.forms[form as usize] else {
-        return Err(GpuError::state(
-            what,
-            "a scratch made with_form for this form",
-        ));
-    };
     Ok((LaunchConfig1D::new(grid, FORM_THREADS, 0), k, n, f))
 }
 

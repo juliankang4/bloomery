@@ -66,6 +66,7 @@ mod kernels32;
 pub use act::GemmAct;
 pub use act32::{GemmAct32, MmaForm};
 pub use f32tile::LINE as F32_TILE_LINE;
+pub use f32tile::Mxfp8NormGateArgs;
 pub(crate) use f32tile::mxfp8_w8a8_reads;
 pub(crate) use f32tile::{
     Bf16Cols, Bf16Rows, F32Cols, F32Rows, F32T_THREADS_U32, MMA_CELLS, MMA_COLS, MMA_ROWS,

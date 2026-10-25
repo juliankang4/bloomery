@@ -2464,8 +2464,8 @@ fn gdn(
                 y: &mut *attn,
             },
         ),
+        (&[&gp.ssm_out], &mut x.act_attn),
     )?;
-    quantize_for(c, &[&gp.ssm_out], (attn, m), &mut x.act_attn, sink)?;
     dense_gemm(c, &gp.ssm_out, (attn, &x.act_attn, m), dense, &mut u.y)
 }
 
