@@ -1090,39 +1090,51 @@ mod native {
             return;
         }
         let weight_scale = ws[expert];
+        // The lane's sixteen columns, fragment n's column j at i = 2n + j: their
+        // slots and input scales are all read before the first store, so the
+        // loads overlap instead of each waiting behind the last column's.
+        let column_of = |i: usize| 8 * (i / 2) + 2 * t + (i & 1);
+        let mut slot = [0usize; 16];
         #[unroll]
-        for n in 0..8 {
-            #[unroll]
-            for j in 0..2 {
-                let c = n * 8 + 2 * t + j;
-                if c < len {
-                    let slot = cols[start + c] as usize;
-                    let column = if slot_div == 1 {
-                        slot
-                    } else {
-                        slot / slot_div as usize
-                    };
-                    let input_scale = ag[column];
-                    // SAFETY: this lane owns the first row of this live column; row counts divide 16.
-                    unsafe {
-                        *y.get_unchecked_mut(slot * rows + row + g) =
-                            crate::gemm::grouped::scaled_sum(
-                                [f64::from(acc[n * 4 + j]), 0.0],
-                                [weight_scale, 0.0],
-                                input_scale,
-                                0.0,
-                            ) as f32;
-                    }
-                    // SAFETY: this lane owns the row eight positions later in the same live column.
-                    unsafe {
-                        *y.get_unchecked_mut(slot * rows + row + g + 8) =
-                            crate::gemm::grouped::scaled_sum(
-                                [f64::from(acc[n * 4 + j + 2]), 0.0],
-                                [weight_scale, 0.0],
-                                input_scale,
-                                0.0,
-                            ) as f32;
-                    }
+        for i in 0..16 {
+            if column_of(i) < len {
+                slot[i] = cols[start + column_of(i)] as usize;
+            }
+        }
+        let mut input_scale = [0.0f32; 16];
+        #[unroll]
+        for i in 0..16 {
+            if column_of(i) < len {
+                input_scale[i] = ag[if slot_div == 1 {
+                    slot[i]
+                } else {
+                    slot[i] / slot_div as usize
+                }];
+            }
+        }
+        #[unroll]
+        for i in 0..16 {
+            if column_of(i) < len {
+                let (n, j) = (i / 2, i & 1);
+                // SAFETY: this lane owns the first row of this live column; row counts divide 16.
+                unsafe {
+                    *y.get_unchecked_mut(slot[i] * rows + row + g) =
+                        crate::gemm::grouped::scaled_sum(
+                            [f64::from(acc[n * 4 + j]), 0.0],
+                            [weight_scale, 0.0],
+                            input_scale[i],
+                            0.0,
+                        ) as f32;
+                }
+                // SAFETY: this lane owns the row eight positions later in the same live column.
+                unsafe {
+                    *y.get_unchecked_mut(slot[i] * rows + row + g + 8) =
+                        crate::gemm::grouped::scaled_sum(
+                            [f64::from(acc[n * 4 + j + 2]), 0.0],
+                            [weight_scale, 0.0],
+                            input_scale[i],
+                            0.0,
+                        ) as f32;
                 }
             }
         }
@@ -1291,29 +1303,45 @@ mod native {
         );
         thread::sync_threads();
         let (gate_scale, up_scale) = (gw[expert], uw[expert]);
+        // The lane's eight columns, fragment n's column j & 1 at i = 2n + (j & 1):
+        // their input scales are all read before the first store, so the loads
+        // overlap instead of each waiting behind the last column's.
+        let column_of = |i: usize| (4 * wc + i / 2) * 8 + 2 * t + (i & 1);
+        let mut slot = [0usize; 8];
+        #[unroll]
+        for i in 0..8 {
+            if column_of(i) < len {
+                slot[i] = cols[start + column_of(i)] as usize;
+            }
+        }
+        let mut input_scale = [0.0f32; 8];
+        #[unroll]
+        for i in 0..8 {
+            if column_of(i) < len {
+                input_scale[i] = ag[if slot_div == 1 {
+                    slot[i]
+                } else {
+                    slot[i] / slot_div as usize
+                }];
+            }
+        }
         #[unroll]
         for n in 0..4 {
             #[unroll]
             for j in 0..4 {
-                let c = (4 * wc + n) * 8 + 2 * t + (j & 1);
+                let i = 2 * n + (j & 1);
+                let c = column_of(i);
                 if c < len {
-                    let slot = cols[start + c] as usize;
-                    let column = if slot_div == 1 {
-                        slot
-                    } else {
-                        slot / slot_div as usize
-                    };
-                    let input_scale = ag[column];
                     let gv = crate::gemm::grouped::scaled_sum(
                         [f64::from(gacc[n * 4 + j]), 0.0],
                         [gate_scale, 0.0],
-                        input_scale,
+                        input_scale[i],
                         0.0,
                     ) as f32;
                     let uv = crate::gemm::grouped::scaled_sum(
                         [f64::from(uacc[n * 4 + j]), 0.0],
                         [up_scale, 0.0],
-                        input_scale,
+                        input_scale[i],
                         0.0,
                     ) as f32;
                     let v = if gv.is_finite() && uv.is_finite() {
@@ -1335,6 +1363,8 @@ mod native {
         let mut item = 4 * wi + (lane >> 3);
         while item - (lane >> 3) < 2 * 64 {
             let (c, blk) = (item / 2, item & 1);
+            // Read ahead of the quantization, whose shuffles cover the load.
+            let slot = (c < len).then(|| cols[start + c] as usize);
             let v = if c < len {
                 // SAFETY: the barrier published this live column's aligned quad.
                 unsafe {
@@ -1346,8 +1376,7 @@ mod native {
                 [0.0; 4]
             };
             let (word, sum, dv, refused) = super::super::act32::quant32_lane(v, lane);
-            if c < len {
-                let slot = cols[start + c] as usize;
+            if let Some(slot) = slot {
                 let b = 2 * rt + blk;
                 // SAFETY: one lane owns word i of block b < 2·osteps of this live slot's column.
                 unsafe {
