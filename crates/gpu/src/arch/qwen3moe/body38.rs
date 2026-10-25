@@ -2381,6 +2381,15 @@ impl Body38 {
         self.wide.walked_units()
     }
 
+    /// The rows the last ubatch walk's last layer ran past its mixer's store
+    /// writes: the walk's rows something reads after it on a last layer
+    /// without a host leg, every row otherwise; 0 before a walk since the
+    /// load. Gate use.
+    #[must_use]
+    pub fn ubatch_last_rows(&self) -> usize {
+        self.wide.last_rows()
+    }
+
     /// The tokens one run of the ubatch walk's card route takes
     /// (`place::card_route_run`); `None` on a load whose slot map puts no
     /// routed expert on the card. Gate use.
@@ -3561,11 +3570,14 @@ impl Body38 {
     }
 
     /// Launch the planned ubatch of `m` rows from `pos` through the batch
-    /// port at its width, then the head of its last row into `head` when
-    /// given; with `finals` (a reader of the walk's final rows: the call's
-    /// tap, or the checkpoint after it, [`Body38::take_mark`]) the last
-    /// layer's combine alone first, over every unit the head's mix leaves
-    /// ([`Gemm38::finals`]).
+    /// port at its width, its last `read` rows final after it (the head's
+    /// row, the point row the checkpoint after it keeps, [`Body38::take_mark`],
+    /// or every row the call's tap reads; the last layer runs the others only
+    /// as far as the stores need, `WideParts::kept`), then the head of its
+    /// last row into `head` when given; with a row past the head's read, the
+    /// last layer's combine alone first, over every unit the head's mix
+    /// leaves ([`Gemm38::finals`]). Refused by name past the arena's rows, and
+    /// with the head and no row read.
     fn walk_gemm(
         &mut self,
         gpu: &Gpu,
@@ -3573,12 +3585,19 @@ impl Body38 {
         m: usize,
         pos: u32,
         head: Option<&mut Head>,
-        finals: bool,
+        read: usize,
     ) -> Result<(), GpuError> {
         if !(1..=self.wide.rows).contains(&m) {
             return Err(GpuError::shape(
                 WHAT,
                 format!("a ubatch of {m} rows on an arena of {}", self.wide.rows),
+            ));
+        }
+        let heads = usize::from(head.is_some());
+        if read < heads || read > m {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a ubatch of {m} rows read at its last {read}, the head at {heads}"),
             ));
         }
         let dense = dense_rows(pos as usize, m, self.ctx)?;
@@ -3639,6 +3658,7 @@ impl Body38 {
                 pos0: pos as usize,
                 dense,
                 cur: 0,
+                read,
                 stream,
                 media: media.as_mut(),
                 ple_rows: late.then_some(&mut rows_in as &mut PleRowsIn<'_>),
@@ -3655,7 +3675,7 @@ impl Body38 {
             ));
         }
         planted(plant, Plant::AfterLaunch)?;
-        if finals {
+        if read > heads {
             prog.finals(head.is_some())?;
         }
         match head {
@@ -3724,8 +3744,8 @@ impl Body38 {
         self.card.card_stacks()
     }
 
-    /// The last ubatch walk's rows of each selecting layer: those the
-    /// prefill flash ran (selecting nothing) and those the selection did;
+    /// The last ubatch walk's rows of each selecting layer: those that
+    /// select nothing (the prefill flash's) and those that select;
     /// `None` before a walk reached a selecting layer since the load or the
     /// last reset. Gate use.
     #[must_use]
@@ -4142,9 +4162,11 @@ impl GpuModel<Body38> {
     /// units ([`call_units`]), a checkpoint taken at each of `marks`
     /// ([`GpuModel::feed_marked`]), and the head after the last unit alone.
     /// A unit a checkpoint follows inside the call ends without the head: the
-    /// last layer's combine over its rows when the checkpoint keeps the last
-    /// one (the draft's point row, [`Body38::take_mark`]) or the tap reads
-    /// them, and the fault word read before the checkpoint copies a store.
+    /// last layer's combine over its last row when the checkpoint keeps it
+    /// (the draft's point row, [`Body38::take_mark`]), over every row when the
+    /// tap reads them, and the fault word read before the checkpoint copies a
+    /// store. Each unit reads the rows those readers name and no other
+    /// ([`Body38::walk_gemm`]'s `read`).
     fn feed38(
         &mut self,
         tokens: &[u32],
@@ -4186,7 +4208,10 @@ impl GpuModel<Body38> {
             at += m;
             let last = i + 1 == units.len();
             let point = marked && !last;
-            let finals = tapped || point && point_row;
+            let read = match tapped {
+                true => m,
+                false => usize::from(last || point && point_row),
+            };
             let pos = self.pos();
             {
                 let (gpu, _, body) = self.body_parts(WHAT_P)?;
@@ -4199,10 +4224,10 @@ impl GpuModel<Body38> {
                 let head = last.then_some(head);
                 match path {
                     Prompt38::Gemm => {
-                        body.walk_gemm(gpu, w, m, pos, head, finals)?;
+                        body.walk_gemm(gpu, w, m, pos, head, read)?;
                         body.stream.walk_done();
                     }
-                    _ => body.walk_pass(gpu, w, m, pos, head, finals)?,
+                    _ => body.walk_pass(gpu, w, m, pos, head, read > usize::from(last))?,
                 }
                 if point && let Some(f) = gpu.fault()? {
                     return Err(GpuError::fault(WHAT_P, f));

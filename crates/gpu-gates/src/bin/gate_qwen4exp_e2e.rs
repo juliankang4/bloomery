@@ -4085,7 +4085,8 @@ mod gate {
     /// (`place::widen_card_route`; the real tier prints its run and does not
     /// require it), the loaded route runs the plan's run
     /// (`Body38::card_route_run`), and D3K's prefill in one run of it is its
-    /// cut walk bit for bit ([`d3k_cut`]).
+    /// cut walk bit for bit ([`d3k_cut`]) and its walk with every row through
+    /// the last layer ([`d3k_read`]).
     fn whole_run(
         m: &mut Qwen38Model,
         plan: &PlanFacts,
@@ -4107,7 +4108,67 @@ mod gate {
             },
             verdict(premise)
         );
-        Ok(premise && d3k_cut(m, "whole plan")?)
+        Ok(premise && d3k_cut(m, "whole plan")? & d3k_read(m, plan, "whole plan")?)
+    }
+
+    /// D3K's prefill by ubatches under `what` the plan's name: where `plan`
+    /// runs the last layer without the host leg ([`hostless`]), the last
+    /// walk's last layer runs the head's row alone past its store writes
+    /// (`Body38::ubatch_last_rows` 1; every row of the walk otherwise), and
+    /// the last token, logits row and every store are, bit for bit, those of
+    /// the same call with the route taps armed, which record every row and so
+    /// keep every row of the last layer (the last walk's rows).
+    fn d3k_read(
+        m: &mut Qwen38Model,
+        plan: &PlanFacts,
+        what: &'static str,
+    ) -> Result<bool, GateError> {
+        let (man, d3k) = input_manifest(D3K)?;
+        let (_, _, prefill) = man.step()?;
+        let prefill = prefill.to_vec();
+        let walk = |m: &mut Qwen38Model, taps: usize| -> Result<(Run, usize), GateError> {
+            fresh(m)?;
+            let (gpu, _, b) = m.body_parts(what)?;
+            b.set_ubatch_route_taps(gpu, taps)?;
+            let last = m.prompt38(&prefill, Prompt38::Gemm);
+            gemm_taps_off(m)?;
+            let last = last?;
+            let rows = m.body(what)?.ubatch_last_rows();
+            let (stores, ple_ring) = stores(m)?;
+            let run = Run {
+                tokens: vec![last],
+                logits: vec![m.logits()?],
+                taps: Vec::new(),
+                routes: Vec::new(),
+                stores,
+                ple_ring,
+            };
+            Ok((run, rows))
+        };
+        let cut: Vec<usize> = m.body(what)?.ubatch_cut(prefill.len()).collect();
+        let (widest, walked) = (cut.iter().copied().max(), cut.last().copied());
+        let cuts = plan.n_l.last() == Some(&(cfg().n_expert as u64));
+        let want = if cuts { Some(1) } else { walked };
+        let (read, read_rows) = walk(m, 0)?;
+        let (every, every_rows) = walk(m, widest.ok_or("D3K's prefill of no ids")?)?;
+        let rows_ok = Some(read_rows) == want && Some(every_rows) == walked;
+        println!(
+            "{what}: {d3k}'s prefill: the last walk's last layer ran {read_rows} row(s) (want \
+             {want:?}: {}), with the route taps armed {every_rows} (want the walk's {walked:?}) {}",
+            if cuts {
+                "the head's, the layer has no host leg"
+            } else {
+                "every row, the layer keeps its host leg"
+            },
+            verdict(rows_ok)
+        );
+        let bits_ok = same_run(
+            &format!("{what}: {d3k} with the last layer over the head's row vs every row"),
+            &read,
+            &every,
+            true,
+        );
+        Ok(rows_ok && bits_ok)
     }
 
     /// (k) (iv)'s refusals on a load that runs a layer without the host leg:

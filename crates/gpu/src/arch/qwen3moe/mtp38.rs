@@ -813,7 +813,9 @@ pub fn walk_launches(m: usize, q6k_head: bool) -> usize {
 /// walk must have left them final, the last layer's combine applied: the
 /// head's mix applies it over the rows it covers (a step, a verify, a
 /// prompt's last pass or ubatch, a split walk's last unit), and a prompt
-/// call with a tap applies it alone to every other row it walks.
+/// call with a tap applies it alone to every other row it walks. A prompt
+/// call without a tap leaves a ubatch's last row alone final where the
+/// last layer runs without a host leg (`wide38`'s `WideParts::kept`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetRows {
     /// The step's one row.
