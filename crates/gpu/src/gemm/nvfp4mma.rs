@@ -340,14 +340,18 @@ const _: () = assert!(
 );
 
 /// The u32 word where 16-byte chunk `q` of a stage row starts, half `q / 2`'s
-/// chunk `q % 2`: the chunks of a row turn by bits 1 and 2 of its index, so
-/// the eight rows one `ldmatrix` phase reads at one chunk meet no bank twice.
+/// chunk `q % 2`. The chunk number is XORed with bit 1 of the row index (onto
+/// its bit 1) and bit 2 (onto its bit 0), so neither the eight rows one
+/// `ldmatrix` phase reads at one chunk nor the four rows' two chunks of one
+/// half that eight threads copy and pack at a time meet a bank twice.
 #[inline(always)]
 const fn chunk(row: usize, q: usize) -> usize {
-    row * ROW_W + 4 * (q ^ ((row >> 1) & 3))
+    row * ROW_W + 4 * (q ^ ((row & 2) | ((row >> 2) & 1)))
 }
-// Every row's chunks are aligned, inside the row and distinct, and the eight
-// rows one `ldmatrix` phase reads at one chunk cover the 32 banks once.
+// Every row's chunks are aligned, inside the row and distinct; the eight rows
+// one `ldmatrix` phase reads at one chunk, and the four rows' two chunks of
+// one half that eight threads (`sr = tid / 2`, `half = tid & 1`) copy and pack
+// at a time, cover the 32 banks once.
 const _: () = {
     use cuda_device::swizzle::{WARP_LANES, conflict_degree};
     let mut row = 0;
@@ -359,12 +363,14 @@ const _: () = {
             assert!(at.is_multiple_of(4) && row * ROW_W <= at && at + 4 <= (row + 1) * ROW_W);
             seen |= 1 << ((at - row * ROW_W) / 4);
             let mut ldmatrix = [0; WARP_LANES];
+            let mut copy = [0; WARP_LANES];
             let mut i = 0;
             while i < WARP_LANES {
                 ldmatrix[i] = chunk(row / 8 * 8 + i / 4, q) + i % 4;
+                copy[i] = chunk(row / 4 * 4 + i / 8, q / 2 * 2 + i / 4 % 2) + i % 4;
                 i += 1;
             }
-            assert!(conflict_degree(&ldmatrix, 4) == 1);
+            assert!(conflict_degree(&ldmatrix, 4) == 1 && conflict_degree(&copy, 4) == 1);
             q += 1;
         }
         assert!(seen == (1 << (2 * HALVES)) - 1);
