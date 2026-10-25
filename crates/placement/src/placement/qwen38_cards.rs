@@ -200,7 +200,8 @@ fn indexer_projection(t: &ModelTensor) -> bool {
 /// 10,240 f32 and its carry of 124,324 f32, 13,530,784 B; the PLE layer's
 /// ring beside it, 17 rows of 4 · 2,560 f32; a selecting layer, every
 /// fourth, its K, V and raw index key, 2,304 B a position, and a pooled key,
-/// 256 B a pool of four.
+/// 256 B a pool of four; and beside the cache the stage's rope rows, the
+/// file's 64 rope dims of f32 a position.
 struct Kv38;
 
 impl KvBytes for Kv38 {
@@ -212,6 +213,10 @@ impl KvBytes for Kv38 {
             13_530_784
         };
         own + ple
+    }
+
+    fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+        ctx_max * 64 * 4
     }
 }
 
@@ -471,11 +476,9 @@ const ROW_ROOM: u64 = 536_870_912;
 /// host serves none and the host need is the PLE table alone; the unset
 /// residency rule is `off`, no churn pool beside it: no
 /// host expert is left to move to the card. The restated terms first give
-/// an A6000 plan at the box gate's context and ubatch: 263 experts on the
-/// first 31 layers, 262 on the rest, 39,508,684,800 B, one expert more than
-/// the box gate's `CARD_PLANS` row (263 on the first 30 layers,
-/// 39,505,100,800 B), so these terms leave the card under 3,584,000 B more
-/// room than the engine's plan.
+/// an A6000 plan at the box gate's context and ubatch, its `CARD_PLANS` row:
+/// 263 experts on the first 30 layers, 262 on the rest, 39,505,100,800 B of
+/// experts and 593,981,952 B of rounding.
 #[test]
 fn q4_on_one_96gb_card_holds_every_routed_expert() {
     let q4 = model(false);
@@ -501,12 +504,20 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
     // first 43 and 39,395,123,200 B. The ubatch arena's flash rows leave the stage's scratch,
     // 100,663,296 B at 4,096, which the spread fills with experts and their granules [derived: this
     // plan].
+    // PIN(2026-10-26): 263 on the first 30 layers, 39,505,100,800 B and 593,981,952 B of rounding,
+    // the box gate's CARD_PLANS row; was 263 on the first 31 and 39,508,684,800 B. The stage's rope
+    // rows (`Kv38::stage_position_bytes`, 1,048,576 B at 4,096) leave the expert budget, so layer
+    // 30 gives up one expert of 3,584,000 B [derived: this plan].
     let want: Vec<u64> = (0..LAYERS)
-        .map(|l| if l < 31 { 263 } else { 262 })
+        .map(|l| if l < 30 { 263 } else { 262 })
         .collect();
     assert_eq!(
-        (&a6000.n_l, a6000.cards[0].expert_bytes),
-        (&want, 39_508_684_800)
+        (
+            &a6000.n_l,
+            a6000.cards[0].expert_bytes,
+            a6000.cards[0].rounding_bytes
+        ),
+        (&want, 39_505_100_800, 593_981_952)
     );
 
     let one = picked("a", &census_96(1))[0];
@@ -748,12 +759,12 @@ fn two_slots_at_4096_hold_every_routed_expert() {
     assert_eq!((bytes, n_l, host), (Q4_ROUTED, vec![EXPERTS; LAYERS], 0));
 }
 
-/// 254,208 positions a slot on one such card, two sequences and no draft,
+/// 252,928 positions a slot on one such card, two sequences and no draft,
 /// is the last step of 256 whose plan holds at most the plan's margin fewer
 /// card expert bytes than the plan at 4,096
 /// ([`two_slots_at_4096_hold_every_routed_expert`]: every routed byte); the
-/// next step passes it. There 504 or 505 experts a layer stay on the card
-/// and 338 go to the host.
+/// next step passes it. There 505 experts a layer stay on the card and 336
+/// go to the host.
 // PIN(2026-10-21): 252,928 positions (was 252,416), 505 or 506 experts a layer with one at 506 and
 // 335 on the host (was 504 or 505 with 47 at 505 and 337). The card keeps the 24 indexer
 // projections in their words (`indexer_projection`): 37,748,736 B of room, 664 positions of the two
@@ -771,11 +782,16 @@ fn two_slots_at_4096_hold_every_routed_expert() {
 // 505 and 338 on the host. The ubatch arena's flash rows leave the stage's scratch, 100,663,296 B at
 // 4,096, and the boundary moved seven steps of 256 within the granules [derived: the plan's own
 // boundary, 254,208 − 252,416 = 1,792].
+// PIN(2026-10-26): 252,928 positions (was 254,208), 505 experts on every layer and 336 on the host
+// (was 504 or 505 with 46 at 505 and 338). The stage keeps its rope rows
+// (`Kv38::stage_position_bytes`, 256 B a position, one copy for both slots): 65,077,248 B at
+// 254,208, 1,140 positions of the two slots' 57,088 B, and the boundary moved five steps of 256
+// within the granules [derived: the plan's own boundary, 254,208 − 252,928 = 1,280].
 #[test]
 fn two_slots_at_252416_stay_within_the_margin() {
-    let (at, n_l, host) = two_slots(254_208);
+    let (at, n_l, host) = two_slots(252_928);
     assert!(Q4_ROUTED - at <= MARGIN);
-    let (next, _, _) = two_slots(254_208 + 256);
+    let (next, _, _) = two_slots(252_928 + 256);
     assert!(Q4_ROUTED - next > MARGIN);
     let (lo, hi) = (
         *n_l.iter().min().expect("layers"),
@@ -783,7 +799,7 @@ fn two_slots_at_252416_stay_within_the_margin() {
     );
     assert_eq!(
         (lo, hi, n_l.iter().filter(|&&n| n == hi).count(), host),
-        (504, 505, 46, 338)
+        (505, 505, 48, 336)
     );
 }
 
