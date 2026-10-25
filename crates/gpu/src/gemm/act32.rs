@@ -497,8 +497,18 @@ impl Gemm32Kernels {
         }
         #[cfg(bloomery_nvfp4_mma)]
         if act.native.is_some() {
-            self.native
-                .swiglu(stream, g, u, None, Act::SiluMul, m, act, fault)?;
+            self.native.swiglu(
+                stream,
+                super::nvfp4mma::SwigluArgs {
+                    g,
+                    u,
+                    selected: None,
+                    rule: Act::SiluMul,
+                    cols: m,
+                    act,
+                },
+                fault,
+            )?;
             act.fill(n_cols);
             return Ok(());
         }
@@ -555,8 +565,18 @@ impl Gemm32Kernels {
         let (code, limit) = rule.code(what)?;
         #[cfg(bloomery_nvfp4_mma)]
         if act.native.is_some() {
-            self.native
-                .swiglu(stream, g, u, None, rule, m, act, fault)?;
+            self.native.swiglu(
+                stream,
+                super::nvfp4mma::SwigluArgs {
+                    g,
+                    u,
+                    selected: None,
+                    rule,
+                    cols: m,
+                    act,
+                },
+                fault,
+            )?;
             act.fill(n_cols);
             return Ok(());
         }
@@ -622,12 +642,14 @@ impl Gemm32Kernels {
         if act.native.is_some() {
             self.native.swiglu(
                 stream,
-                g,
-                u,
-                Some((sel, n_card)),
-                Act::SiluMul,
-                m,
-                act,
+                super::nvfp4mma::SwigluArgs {
+                    g,
+                    u,
+                    selected: Some((sel, n_card)),
+                    rule: Act::SiluMul,
+                    cols: m,
+                    act,
+                },
                 fault,
             )?;
             act.fill(n_cols);

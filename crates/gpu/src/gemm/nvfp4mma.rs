@@ -1272,6 +1272,26 @@ pub(super) struct GateUpArgs<'a> {
     pub(super) act: &'a mut GemmAct32,
 }
 
+pub(super) struct SwigluArgs<'a> {
+    pub(super) g: &'a DeviceBuffer<f32>,
+    pub(super) u: &'a DeviceBuffer<f32>,
+    pub(super) selected: Option<(&'a DeviceBuffer<u32>, u32)>,
+    pub(super) rule: crate::kquant::Act,
+    pub(super) cols: u32,
+    pub(super) act: &'a mut GemmAct32,
+}
+
+pub(super) struct ProductArgs<'a> {
+    pub(super) w: crate::mxfp4_sel::Nvfp4Stack<'a>,
+    pub(super) act: &'a GemmAct32,
+    pub(super) route: &'a GemmRoute,
+    pub(super) rows: u32,
+    pub(super) slots: u32,
+    pub(super) max_tiles: u32,
+    pub(super) slot_div: u32,
+    pub(super) y: &'a mut DeviceBuffer<f32>,
+}
+
 impl Kernels {
     pub(super) fn load(ctx: &Arc<CudaContext>) -> Result<Self, GpuError> {
         // SAFETY: this package owns the embedded device module.
@@ -1306,14 +1326,17 @@ impl Kernels {
     pub(super) fn swiglu(
         &self,
         stream: &CudaStream,
-        g: &DeviceBuffer<f32>,
-        u: &DeviceBuffer<f32>,
-        selected: Option<(&DeviceBuffer<u32>, u32)>,
-        rule: crate::kquant::Act,
-        cols: u32,
-        act: &mut GemmAct32,
+        a: SwigluArgs<'_>,
         fault: crate::fault::FaultSink,
     ) -> Result<(), GpuError> {
+        let SwigluArgs {
+            g,
+            u,
+            selected,
+            rule,
+            cols,
+            act,
+        } = a;
         let (code, limit) = rule.code("NVFP4 activation")?;
         crate::tensor::check_alignment::<cuda_device::vector::F32x4, _>(
             "NVFP4 activation",
@@ -1444,18 +1467,17 @@ impl Kernels {
         self.quantize(stream, act)
     }
 
-    pub(super) fn product(
-        &self,
-        stream: &CudaStream,
-        w: crate::mxfp4_sel::Nvfp4Stack<'_>,
-        act: &GemmAct32,
-        route: &GemmRoute,
-        rows: u32,
-        slots: u32,
-        max_tiles: u32,
-        slot_div: u32,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
+    pub(super) fn product(&self, stream: &CudaStream, a: ProductArgs<'_>) -> Result<(), GpuError> {
+        let ProductArgs {
+            w,
+            act,
+            route,
+            rows,
+            slots,
+            max_tiles,
+            slot_div,
+            y,
+        } = a;
         let a = act
             .native
             .as_ref()

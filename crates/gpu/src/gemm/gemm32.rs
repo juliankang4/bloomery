@@ -1796,14 +1796,16 @@ impl Gemm32Kernels {
                 if act.native.is_some() {
                     return self.native.product(
                         stream,
-                        Nvfp4Stack { qs, e, scales },
-                        act,
-                        route,
-                        g.rows,
-                        g.n_slots,
-                        g.max_tiles,
-                        g.slot_div,
-                        y,
+                        super::nvfp4mma::ProductArgs {
+                            w: Nvfp4Stack { qs, e, scales },
+                            act,
+                            route,
+                            rows: g.rows,
+                            slots: g.n_slots,
+                            max_tiles: g.max_tiles,
+                            slot_div: g.slot_div,
+                            y,
+                        },
                     );
                 }
                 launch!(
