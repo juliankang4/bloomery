@@ -320,25 +320,32 @@ fn mma(c: [f32; 4], a: [u32; 4], b: [u32; 2], sa: u32, sb: u32) -> [f32; 4] {
     [d0, d1, d2, d3]
 }
 
-/// u32 words of one K-walk stage's weight rows: [`TILE_ROWS`] rows of a
-/// step's eight code words and four of pad, so the eight rows one `ldmatrix`
-/// phase reads meet no bank twice.
-const W_STAGE: usize = TILE_ROWS * 12;
+/// 64-value halves of one K-walk step: each takes one MMA per fragment, so a
+/// step's barrier and copies serve two.
+const HALVES: usize = 2;
+/// u32 words of one K-walk stage row: each half's eight code words and four
+/// of pad, so the eight rows one `ldmatrix` phase reads meet no bank twice.
+const ROW_W: usize = HALVES * 8 + 4;
+/// u32 words of one stage's [`TILE_ROWS`] weight rows.
+const W_STAGE: usize = TILE_ROWS * ROW_W;
 /// u32 words of one stage's 64 activation rows, the weight rows' pitch.
-const B_STAGE: usize = 64 * 12;
-/// u32 words of one stage's scale words: the weight rows', then the
+const B_STAGE: usize = 64 * ROW_W;
+/// u32 words of one half's scale words: the weight rows', then the
 /// activation rows'.
-const S_STAGE: usize = TILE_ROWS + 64;
-/// The K walk's shared stages: a step's planes land two steps ahead.
-const STAGES: usize = 3;
-const _: () =
-    assert!(STAGES * (W_STAGE + B_STAGE + S_STAGE) * 4 + 64 * PAIR_PITCH * 4 <= 48 * 1024);
+const S_HALF: usize = TILE_ROWS + 64;
+const S_STAGE: usize = HALVES * S_HALF;
+/// The K walk's shared stages: a step's planes land one step ahead.
+const STAGES: usize = 2;
+const _: () = assert!(
+    STAGES * (W_STAGE + B_STAGE + S_STAGE) * 4 <= 48 * 1024 && 64 * PAIR_PITCH <= STAGES * W_STAGE
+);
 
-/// One thread's `cp.async` copies of step `$s` into stage `$s % STAGES` of
-/// `nvfp4_walk!`'s shared arrays `$wp`, `$bp`, `$sp` (its arguments): half
-/// `$half` of weight row `$wrow`'s codes and, for `$sr < 64`, of activation
-/// column `$col`'s, into shared row `$sr`; from the row's first thread also
-/// the step's scale words. One group, empty for a step past the last.
+/// One thread's `cp.async` copies of step `$s` (64-value steps `HALVES * $s`
+/// on, below `$steps`) into stage `$s % STAGES` of `nvfp4_walk!`'s shared
+/// arrays `$wp`, `$bp`, `$sp` (its arguments): of each half, half `$half` of
+/// weight row `$wrow`'s codes and, for `$sr < 64`, of activation column
+/// `$col`'s, into shared row `$sr`; and half `$half`'s scale words. One
+/// group, empty for a step past the last.
 macro_rules! nvfp4_copy {
     (
         $s:expr,
@@ -348,47 +355,55 @@ macro_rules! nvfp4_copy {
         ($wp:ident, $bp:ident, $sp:ident)
     ) => {{
         let s: usize = $s;
-        if s < $steps {
-            let st = s % STAGES;
-            let at = $sr * 12 + 4 * $half;
-            // SAFETY: the weight row's aligned half of step s is in the checked plane (K divides
-            // 64); the destination is this thread's own chunk of stage st, read by no other thread
-            // before the barrier after the wait that completes it.
-            unsafe {
-                cuda_device::async_copy::cp_async_cg_16(
-                    $wp.add(st * W_STAGE + at),
-                    $wq.as_ptr().add(($wrow * $steps + s) * 8 + 4 * $half),
-                )
-            };
-            if $sr < 64 {
-                // SAFETY: col is a live column whose aligned half of step s is in the plane; the
-                // destination is this thread's own chunk of stage st, as the weight half's.
+        let st = s % STAGES;
+        for h in 0..HALVES {
+            ::cuda_device::thread::__unroll_config::<0>();
+            let k = HALVES * s + h;
+            if k < $steps {
+                let at = $sr * ROW_W + 8 * h + 4 * $half;
+                // SAFETY: the weight row's aligned half of 64-value step k is in the checked plane
+                // (K divides 64); sr < TILE_ROWS, h < HALVES and half < 2 put at, this thread's
+                // own aligned four-word chunk, inside row sr of stage st of W, read by no other
+                // thread before the barrier after the wait that completes it.
                 unsafe {
                     cuda_device::async_copy::cp_async_cg_16(
-                        $bp.add(st * B_STAGE + at),
-                        $aq.as_ptr().add(($col * $steps + s) * 8 + 4 * $half),
-                    )
-                };
-            }
-            if $half == 0 {
-                // SAFETY: the weight row's scale word of step s is in the plane; the row's first
-                // thread owns its word of stage st.
-                unsafe {
-                    cuda_device::async_copy::cp_async_ca_4(
-                        $sp.add(st * S_STAGE + $sr),
-                        $we.as_ptr().add($wrow * $steps + s),
+                        $wp.add(st * W_STAGE + at),
+                        $wq.as_ptr().add(($wrow * $steps + k) * 8 + 4 * $half),
                     )
                 };
                 if $sr < 64 {
-                    // SAFETY: the live column's scale word of step s is in the plane; the row's
-                    // first thread owns its word of stage st.
+                    // SAFETY: col is a live column whose aligned half of step k is in the plane;
+                    // sr < 64, h < HALVES and half < 2 put at, this thread's own aligned four-word
+                    // chunk, inside row sr of stage st of B, read by no other thread before the
+                    // barrier after the wait that completes it.
                     unsafe {
-                        cuda_device::async_copy::cp_async_ca_4(
-                            $sp.add(st * S_STAGE + TILE_ROWS + $sr),
-                            $ae.as_ptr().add($col * $steps + s),
+                        cuda_device::async_copy::cp_async_cg_16(
+                            $bp.add(st * B_STAGE + at),
+                            $aq.as_ptr().add(($col * $steps + k) * 8 + 4 * $half),
                         )
                     };
                 }
+            }
+        }
+        let k = HALVES * s + $half;
+        if k < $steps {
+            // SAFETY: the weight row's scale word of step k is in the plane; this thread owns
+            // that half's word of the row in stage st.
+            unsafe {
+                cuda_device::async_copy::cp_async_ca_4(
+                    $sp.add(st * S_STAGE + $half * S_HALF + $sr),
+                    $we.as_ptr().add($wrow * $steps + k),
+                )
+            };
+            if $sr < 64 {
+                // SAFETY: the live column's scale word of step k is in the plane; this thread
+                // owns that half's word of the column in stage st.
+                unsafe {
+                    cuda_device::async_copy::cp_async_ca_4(
+                        $sp.add(st * S_STAGE + $half * S_HALF + TILE_ROWS + $sr),
+                        $ae.as_ptr().add($col * $steps + k),
+                    )
+                };
             }
         }
         // SAFETY: commits only this thread's copies of the step as one group.
@@ -397,14 +412,14 @@ macro_rules! nvfp4_copy {
 }
 
 /// The K walk both native kernels share, over [`STAGES`] shared stages of
-/// [`TILE_ROWS`] weight rows and 64 activation rows: each thread copies half
-/// `$half` of shared row `$sr` from weight row `$wrow` (`$wq` codes, `$we`
-/// scales) and, for `$sr < 64`, from activation column `$col` (`$aq`, `$ae`)
-/// two steps ahead ([`nvfp4_copy`]), and before a step's barrier turns its
-/// own weight half of the step's stage into the MMA's nibble order
-/// ([`packed_pair`]); then `$body` reads the step's stage through `$wp`,
-/// `$bp` and `$sp`. Every thread of the block runs it, `$steps` steps of 64
-/// values.
+/// [`TILE_ROWS`] weight rows and 64 activation rows, [`HALVES`] 64-value
+/// halves a step: each thread copies half `$half` of shared row `$sr` from
+/// weight row `$wrow` (`$wq` codes, `$we` scales) and, for `$sr < 64`, from
+/// activation column `$col` (`$aq`, `$ae`) one step ahead ([`nvfp4_copy`]),
+/// and before a step's barrier turns its own weight halves of the step's
+/// stage into the MMA's nibble order ([`packed_pair`]); then `$body` reads
+/// each live half of the stage through `$wp`, `$bp` and `$sp`, in K order.
+/// Every thread of the block runs it, `$steps` 64-value steps in all.
 macro_rules! nvfp4_walk {
     (
         ($wq:ident, $we:ident, $wrow:ident),
@@ -414,42 +429,58 @@ macro_rules! nvfp4_walk {
         $body:block
     ) => {{
         nvfp4_copy!(0, ($wq, $we, $wrow), ($aq, $ae, $col), ($steps, $sr, $half), ($wp, $bp, $sp));
-        nvfp4_copy!(1, ($wq, $we, $wrow), ($aq, $ae, $col), ($steps, $sr, $half), ($wp, $bp, $sp));
-        let own = $sr * 12 + 4 * $half;
         let mut st = 0;
         let mut step = 0;
-        while step < $steps {
-            // SAFETY: each step commits one group, so the newest is step + 1's and waiting for all
-            // but one completes this thread's copies of this step.
-            unsafe { cuda_device::async_copy::cp_async_wait_group(1) };
+        while HALVES * step < $steps {
+            let halves = ($steps - HALVES * step).min(HALVES);
+            // SAFETY: each step commits one group and the newest is this step's, so waiting for
+            // all completes this thread's copies of it.
+            unsafe { cuda_device::async_copy::cp_async_wait_group(0) };
             // SAFETY: st < STAGES, so stage st starts inside the STAGES·W_STAGE words of W.
             let ws = unsafe { $wp.add(st * W_STAGE) };
             // SAFETY: st < STAGES, so stage st starts inside the STAGES·B_STAGE words of B.
             let bs = unsafe { $bp.add(st * B_STAGE) };
             // SAFETY: st < STAGES, so stage st starts inside the STAGES·S_STAGE words of S.
             let ss = unsafe { $sp.add(st * S_STAGE) };
-            // SAFETY: this thread's own weight half of the stage, completed by the wait above.
-            let w = unsafe { (*ws.add(own).cast::<cuda_device::vector::U32x4>()).0 };
-            let p0 = packed_pair(w[0], w[1]);
-            let p1 = packed_pair(w[2], w[3]);
-            // SAFETY: word own of stage st is this thread's own weight half, read by no other thread
-            // before the barrier below.
-            unsafe {
-                *ws.add(own).cast::<cuda_device::vector::U32x4>() =
-                    cuda_device::vector::U32x4::new([p0[0], p0[1], p1[0], p1[1]]);
+            let mut h = 0;
+            while h < halves {
+                let own = $sr * ROW_W + 8 * h + 4 * $half;
+                // SAFETY: this thread's own weight half of the stage, completed by the wait above.
+                let w = unsafe { (*ws.add(own).cast::<cuda_device::vector::U32x4>()).0 };
+                let p0 = packed_pair(w[0], w[1]);
+                let p1 = packed_pair(w[2], w[3]);
+                // SAFETY: word own of stage st is this thread's own weight half, read by no other
+                // thread before the barrier below.
+                unsafe {
+                    *ws.add(own).cast::<cuda_device::vector::U32x4>() =
+                        cuda_device::vector::U32x4::new([p0[0], p0[1], p1[0], p1[1]]);
+                }
+                h += 1;
             }
             // Publishes the stage and tells that every thread is done with step - 1's, which the
-            // copies of step + 2 refill.
+            // copies of step + 1 refill.
             thread::sync_threads();
             nvfp4_copy!(
-                step + 2,
+                step + 1,
                 ($wq, $we, $wrow),
                 ($aq, $ae, $col),
                 ($steps, $sr, $half),
                 ($wp, $bp, $sp)
             );
-            let ($wp, $bp, $sp) = (ws, bs, ss);
-            $body
+            let mut h = 0;
+            while h < halves {
+                // SAFETY: h < halves <= HALVES, so half h's eight code words lie inside each
+                // ROW_W-word row of stage st of W.
+                let $wp = unsafe { ws.add(8 * h) };
+                // SAFETY: h < halves <= HALVES, so half h's eight code words lie inside each
+                // ROW_W-word row of stage st of B.
+                let $bp = unsafe { bs.add(8 * h) };
+                // SAFETY: h < halves <= HALVES, so half h's S_HALF scale words lie inside the
+                // S_STAGE words of stage st of S.
+                let $sp = unsafe { ss.add(h * S_HALF) };
+                $body
+                h += 1;
+            }
             st = if st + 1 == STAGES { 0 } else { st + 1 };
             step += 1;
         }
@@ -888,7 +919,7 @@ mod native {
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(256, 2)]
     #[launch_contract(domain = 1, block = (256, 1, 1))]
     pub fn gemm_nvfp4_mma(
         wq: &[u32],
@@ -970,7 +1001,7 @@ mod native {
             {
                 if row < rows {
                     let r = 16 * (tid / 32) + g;
-                    let a_off = (16 * (tid / 32) + (lane & 15)) * 12 + 4 * (lane >> 4);
+                    let a_off = (16 * (tid / 32) + (lane & 15)) * ROW_W + 4 * (lane >> 4);
                     // SAFETY: all lanes issue the load; its four sets of eight aligned rows lie in the live shared stage.
                     let a = unsafe {
                         ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
@@ -985,14 +1016,14 @@ mod native {
                             continue;
                         }
                         let br = n * 8 + g;
-                        let b_off = (n * 8 + (lane & 7)) * 12 + 4 * ((lane >> 3) & 1);
+                        let b_off = (n * 8 + (lane & 7)) * ROW_W + 4 * ((lane >> 3) & 1);
                         // SAFETY: the whole warp loads two sets of eight aligned rows within this activation stage.
                         let b = unsafe {
                             ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
                                 bp.add(b_off).cast_const().cast::<u8>(),
                             ))
                         };
-                        // SAFETY: the activation scale follows the weight scales in this 192-word stage.
+                        // SAFETY: the activation scale follows the weight scales in this half's scale words.
                         let sb = unsafe { *sp.add(TILE_ROWS + br) };
                         let c = mma(
                             [acc[n * 4], acc[n * 4 + 1], acc[n * 4 + 2], acc[n * 4 + 3]],
@@ -1063,7 +1094,7 @@ mod native {
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(256, 2)]
     #[launch_contract(domain = 1, block = (256, 1, 1))]
     pub fn gate_up_nvfp4_mma(
         gq: &[u32],
@@ -1106,16 +1137,14 @@ mod native {
             cuda_device::SharedArray::UNINIT;
         static mut S: cuda_device::SharedArray<u32, { STAGES * S_STAGE }, 16> =
             cuda_device::SharedArray::UNINIT;
-        static mut V: cuda_device::SharedArray<f32, { 64 * PAIR_PITCH }, 16> =
-            cuda_device::SharedArray::UNINIT;
         // SAFETY: W is this block's shared weight allocation.
         let wp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W) };
         // SAFETY: B is this block's shared activation allocation.
         let bp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B) };
         // SAFETY: S is this block's shared scale allocation.
         let sp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S) };
-        // SAFETY: V is this block's shared SwiGLU tile.
-        let vp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut V) };
+        // The SwiGLU tile reuses W once every warp has finished the walk.
+        let vp = wp.cast::<f32>();
         let wi = tid / 32;
         let (wr, wc) = (wi & 3, wi >> 2);
         let g = lane / 4;
@@ -1140,23 +1169,26 @@ mod native {
             (steps, sr, half),
             (wp, bp, sp),
             {
-                let a_off = (16 * wr + (lane & 15)) * 12 + 4 * (lane >> 4);
+                let a_off = (16 * wr + (lane & 15)) * ROW_W + 4 * (lane >> 4);
                 // SAFETY: all lanes issue the load; its four sets of eight aligned gate rows lie in the live stage.
                 let a_gate = unsafe {
                     ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
                         wp.add(a_off).cast_const().cast::<u8>(),
                     ))
                 };
-                // SAFETY: as the gate's, PAIR_ROWS shared rows later: the up's rows.
+                // SAFETY: all lanes issue the load; its four sets of eight aligned rows are the
+                // gate's rows 16 * wr + (lane & 15) < PAIR_ROWS (wr < 4) moved PAIR_ROWS rows on,
+                // the up's rows, inside the TILE_ROWS rows of the live stage.
                 let a_up = unsafe {
                     ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
-                        wp.add(a_off + PAIR_ROWS * 12).cast_const().cast::<u8>(),
+                        wp.add(a_off + PAIR_ROWS * ROW_W).cast_const().cast::<u8>(),
                     ))
                 };
                 let r = 16 * wr + g + 8 * (t & 1);
                 // SAFETY: each pair of lanes reads the gate scale row selected by the MMA layout.
                 let sa_gate = unsafe { *sp.add(r) };
-                // SAFETY: the up's scale row, PAIR_ROWS words after the gate's.
+                // SAFETY: r < PAIR_ROWS, so PAIR_ROWS + r < TILE_ROWS is the up's scale row in this
+                // half's scale words.
                 let sa_up = unsafe { *sp.add(PAIR_ROWS + r) };
                 for n in 0..4 {
                     ::cuda_device::thread::__unroll_config::<0>();
@@ -1164,14 +1196,14 @@ mod native {
                     if nn >= nt {
                         continue;
                     }
-                    let b_off = (nn * 8 + (lane & 7)) * 12 + 4 * ((lane >> 3) & 1);
+                    let b_off = (nn * 8 + (lane & 7)) * ROW_W + 4 * ((lane >> 3) & 1);
                     // SAFETY: the whole warp loads two sets of eight aligned rows within this activation stage.
                     let b = unsafe {
                         ldmatrix_x2_shared_u32(cvta_generic_to_shared_u32(
                             bp.add(b_off).cast_const().cast::<u8>(),
                         ))
                     };
-                    // SAFETY: the activation scale follows the weight scales in this 192-word stage.
+                    // SAFETY: the activation scale follows the weight scales in this half's scale words.
                     let sb = unsafe { *sp.add(TILE_ROWS + nn * 8 + g) };
                     let c = mma(
                         [
@@ -1208,6 +1240,7 @@ mod native {
                 }
             }
         );
+        thread::sync_threads();
         let (gate_scale, up_scale) = (gw[expert], uw[expert]);
         #[unroll]
         for n in 0..4 {

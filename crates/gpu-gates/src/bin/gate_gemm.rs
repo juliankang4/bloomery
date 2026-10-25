@@ -8677,6 +8677,7 @@ mod gate {
                 (16, 14, 20_480, Native::Pattern),
                 (16, 14, 64, Native::Tiny),
                 (16, 14, 64, Native::Varied),
+                (16, 14, 192, Native::Varied),
                 (16, 3, 64, Native::Refused),
                 (
                     16,
@@ -9006,6 +9007,7 @@ mod gate {
             for (rows, k, tokens, refused, poison) in [
                 (64usize, 64usize, 9usize, false, None),
                 (128, 128, 50, true, None),
+                (64, 192, 23, false, None),
                 (192, 256, 37, false, Some(5usize)),
                 (640, 2560, 131, false, None),
             ] {
