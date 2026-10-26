@@ -610,7 +610,20 @@ gguf 7 2 0
 # and the head-128 prompt walk is one macro body (prefill_128) each entry expands, the two static entries one block
 # each for their tiles (+2); the NORM rope append and its q8 twin hold one unsafe fn (rope_norm.rs, +1). Each block
 # has its SAFETY line.
-gpu 2655 336 10
+# PIN(2026-10-26): gpu 2655 -> 2691 blocks, 336 -> 346 fns, new code, not old code relaxed: the prefill
+# flash's raw query rows (flash_gqa_prefill.rs: `QueryRows::head` and `value` declared with their two impls,
+# the pack-of-four and listed bodies' scale and position slots and their reads and value calls, the gated
+# entries' norm reads, the hw test's query norm launch) and rope_neox.rs's one-warp query norm
+# (`query_scale_256`, `query_value_256` and their reads), counted by tools/check-unsafe.sh. Each new block has
+# its SAFETY line.
+# PIN(2026-10-26): gpu 2655 -> 2691 blocks, new code, not old code relaxed: the HC norm's read of its gains
+# ahead of the sum for a stream of one chunk a thread (hc_gated.rs `norm_stream`), counted by
+# tools/check-unsafe.sh. The block has its SAFETY line.
+# PIN(2026-10-26): gpu 2655 -> 2691 blocks, 336 -> 346 fns, new code, not old code relaxed: a native NVFP4
+# route tile's column slots and input scales in shared memory (nvfp4mma.rs `TileColumns::put` and `get`, the two
+# kernels' column allocations, their writes ahead of the K walk and their epilogues' reads), counted by
+# tools/check-unsafe.sh. Each new block has its SAFETY line.
+gpu 2691 346 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
