@@ -1185,6 +1185,18 @@ mod tests {
         [STEP, VERIFY].map(|w| Some(w.as_secs_f64() * 1e3)).to_vec()
     }
 
+    /// A table of no draft runs every slot's pass as one plain step, none of
+    /// its slots off: the condition the Qwen3.8 seat reads a step's PLE rows
+    /// ahead on.
+    #[test]
+    fn a_table_of_no_draft_passes_one_row_on_every_slot() {
+        let none = SlotDrafts::<bloomery_gpu::arch::qwen3moe::Body38, 2>::none();
+        for slot in 0..3 {
+            assert_eq!(none.pass_rows(slot), 1, "slot {slot}");
+            assert!(!none.is_off(slot), "slot {slot}");
+        }
+    }
+
     #[test]
     fn lookup_prompt_discards_the_prior_last_token() {
         let clock = Rc::new(Cell::new(Duration::ZERO));

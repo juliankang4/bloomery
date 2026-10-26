@@ -2142,6 +2142,11 @@ struct Q38 {
     /// fallback loop: its contexts follow each step at the selected slot's
     /// position.
     step_pass: bool,
+    /// Whether a plain step reads the PLE rows of the id it answers ahead
+    /// ([`Q38::read_ahead`]): the body's next call is then that slot's, on
+    /// a load of one slot or one whose rounds run as one pass
+    /// ([`Pass::One`]); a round of turns steps another slot next.
+    reads_ahead: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
     /// The load's tier census as the last call left it, on a load whose plan
@@ -2432,6 +2437,7 @@ impl Q38 {
             break_even: a.mtp.then(|| break_even_of(a.place)),
             one_pass: pass_of_slots && a.mtp,
             step_pass: pass_of_slots && !a.lookup,
+            reads_ahead: a.pass == Pass::One,
             stats: a.stats,
             census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
@@ -2555,6 +2561,25 @@ impl Q38 {
                 .u("reply", b.reply)
                 .eprint();
         }
+    }
+
+    /// The PLE rows of `out`'s one id read ahead ([`Body38::prefetch_input`])
+    /// while the server takes the answer, where that id is the input of the
+    /// body's next call ([`Q38::reads_ahead`]), one plain step of the slot
+    /// ([`Seat::pass_rows`] 1: no draft, or the slot's draft off).
+    fn read_ahead(&mut self, out: &[u32]) -> Result<(), GateError> {
+        if let &[next] = out
+            && self.reads_ahead
+            && self.pass_rows() == 1
+        {
+            let pos = self.s.pos();
+            self.s
+                .model_mut()
+                .body_parts("bloomery-serve-qwen38")?
+                .2
+                .prefetch_input(next, pos)?;
+        }
+        Ok(())
     }
 
     /// The call's `tier census` record ([`Q38::print_census`]); then the
@@ -2782,6 +2807,7 @@ impl Seat for Q38 {
         self.before_call();
         let sel = self.s.selected();
         let next = self.drafts.step(&mut self.s, sel, last)?;
+        self.read_ahead(&[next])?;
         self.print_passes()?;
         Ok(next)
     }
@@ -2835,6 +2861,7 @@ impl Seat for Q38 {
         self.before_call();
         let sel = self.s.selected();
         let d = self.drafts.pass(&mut self.s, sel, last, out)?;
+        self.read_ahead(out)?;
         self.print_passes()?;
         Ok(d)
     }
@@ -2859,6 +2886,7 @@ impl Seat for Q38 {
         let d = self
             .drafts
             .pass_sampled(&mut self.s, sel, last, history, sampler, out)?;
+        self.read_ahead(out)?;
         self.print_passes()?;
         Ok(d)
     }

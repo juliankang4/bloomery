@@ -162,11 +162,26 @@ impl EosWindow {
 /// One sequence's raw-id history: its last `n_gram − 1` tokens, oldest
 /// first, and the position the next token takes. A new sequence starts from
 /// [`History::new`] (every slot `eos`, position 0). It is small and `Clone`:
-/// a caller that may roll a pass back keeps the copy from before the pass.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// a caller that may roll a pass back keeps the copy from before the pass,
+/// and `clone_from` copies into the caller's storage.
+#[derive(Debug, PartialEq, Eq)]
 pub struct History {
     prev: Vec<u32>,
     next: u64,
+}
+
+impl Clone for History {
+    fn clone(&self) -> Self {
+        History {
+            prev: self.prev.clone(),
+            next: self.next,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.prev.clone_from(&source.prev);
+        self.next = source.next;
+    }
 }
 
 impl History {
@@ -272,7 +287,8 @@ mod tests {
     }
 
     /// A fresh history is all EOS at position 0; pushes shift it oldest
-    /// first and count positions.
+    /// first and count positions; `clone_from` copies one into another's
+    /// storage.
     #[test]
     fn history_shifts_oldest_first() {
         let mut h = History::new(3, EOS);
@@ -281,6 +297,15 @@ mod tests {
         h.push(2);
         h.push(3);
         assert_eq!((h.tokens(), h.next_pos()), (&[2, 3][..], 3));
+        let mut scratch = History::new(3, EOS);
+        let storage = scratch.tokens().as_ptr();
+        scratch.clone_from(&h);
+        assert_eq!(scratch, h);
+        assert_eq!(
+            scratch.tokens().as_ptr(),
+            storage,
+            "copied into its own storage"
+        );
     }
 
     /// Order n folds the first n slots in wrapping `u64` and reduces by its

@@ -457,6 +457,9 @@ pub enum LayerKind38 {
 struct PleHost {
     hash: Hash,
     hist: History,
+    /// [`PleHost::prompt_start`]'s walk of the history ahead of the fills,
+    /// its storage kept from call to call.
+    ahead_hist: History,
     file: Arc<Split>,
     shard: usize,
     info: TensorInfo,
@@ -488,6 +491,10 @@ struct PleRead {
     /// A prompt call's ubatches not yet filled, in order; while `flight`
     /// holds, the front's rows are on the helper.
     ahead: VecDeque<PleBatch>,
+    /// The row ids of the batch last taken off `ahead`, the storage the next
+    /// [`PleHost::prompt_start`] fills first: a decode step's read ahead
+    /// ([`Body38::prefetch_input`]) allocates nothing.
+    spare_ids: Vec<u32>,
     flight: bool,
 }
 
@@ -516,6 +523,7 @@ impl PleRead {
         stored: Option<&StoredRows>,
         name: &str,
         max_rows: usize,
+        step_rows: usize,
         expected_rows: usize,
     ) -> Result<PleRead, GpuError> {
         let table: Arc<dyn RowTables> = match stored {
@@ -559,7 +567,8 @@ impl PleRead {
         Ok(PleRead {
             rows,
             planes,
-            ahead: VecDeque::new(),
+            ahead: VecDeque::with_capacity(1),
+            spare_ids: Vec::with_capacity(step_rows),
             flight: false,
         })
     }
@@ -573,6 +582,25 @@ impl PleRead {
         Ok(())
     }
 
+    /// The front batch off `ahead`, its row-id storage kept for the next
+    /// read ahead.
+    fn recycle_front(&mut self) {
+        if let Some(batch) = self.ahead.pop_front() {
+            self.spare_ids = batch.ids;
+        }
+    }
+
+    /// The front batch's rows on the helper, when there is one.
+    fn start_front(&mut self) -> Result<(), GpuError> {
+        if let Some(next) = self.ahead.front() {
+            self.rows
+                .submit(std::iter::repeat_n(next.ids.as_slice(), self.planes))
+                .map_err(|e| GpuError::plan(WHAT, e))?;
+            self.flight = true;
+        }
+        Ok(())
+    }
+
     /// `ids`, the rows of the fill of `n` positions at `pos`, on the helper:
     /// the batch read ahead when it is this fill's, else submitted now.
     /// [`PleRead::finish`] takes them.
@@ -582,9 +610,10 @@ impl PleRead {
             .front()
             .is_some_and(|b| b.pos == pos && b.n == n && b.ids == ids);
         if own {
-            self.ahead.pop_front();
+            self.recycle_front();
         } else {
             self.drain()?;
+            self.recycle_front();
             self.ahead.clear();
         }
         if !self.flight {
@@ -607,13 +636,7 @@ impl PleRead {
             ));
         }
         self.rows.wait().map_err(|e| GpuError::plan(WHAT, e))?;
-        if let Some(next) = self.ahead.front() {
-            self.rows
-                .submit(std::iter::repeat_n(next.ids.as_slice(), self.planes))
-                .map_err(|e| GpuError::plan(WHAT, e))?;
-            self.flight = true;
-        }
-        Ok(())
+        self.start_front()
     }
 }
 
@@ -733,7 +756,14 @@ impl PleHost {
                 ));
             }
             Device::Host => None,
-            Device::Nvme => Some(PleRead::open(&file, stored, &name, cap * per_token, rows)?),
+            Device::Nvme => Some(PleRead::open(
+                &file,
+                stored,
+                &name,
+                cap * per_token,
+                per_token,
+                rows,
+            )?),
             Device::Card(_) | Device::Unused => {
                 return Err(refuse(
                     "on the host or the NVMe tier, where the plan reads it",
@@ -742,6 +772,7 @@ impl PleHost {
         };
         Ok(PleHost {
             hash,
+            ahead_hist: hist.clone(),
             hist,
             file,
             shard,
@@ -907,20 +938,22 @@ impl PleHost {
             return Ok(());
         };
         read.drain()?;
+        read.recycle_front();
         read.ahead.clear();
         let per_token = geo::HIDDEN / self.width;
-        let mut hist = self.hist.clone();
+        self.ahead_hist.clone_from(&self.hist);
         let mut at = 0usize;
         for m in cut {
             let Some(p) = u32::try_from(at).ok().and_then(|a| pos.checked_add(a)) else {
                 break;
             };
-            let mut ids = vec![0u32; m * per_token];
+            let mut ids = std::mem::take(&mut read.spare_ids);
+            ids.resize(m * per_token, 0);
             let unit = window_spans(spans.iter().cloned(), &(p as usize..p as usize + m));
             if self
                 .hash
                 .ple_rows_media(
-                    &mut hist,
+                    &mut self.ahead_hist,
                     u64::from(p),
                     &tokens[at..at + m],
                     &unit,
@@ -933,6 +966,16 @@ impl PleHost {
             }
             read.ahead.push_back(PleBatch { pos: p, n: m, ids });
             at += m;
+        }
+        Ok(())
+    }
+
+    /// [`Body38::prefetch_input`]: `token` at `pos` read ahead as a prompt
+    /// call of one position whose read starts at once.
+    fn prefetch(&mut self, pos: u32, token: u32) -> Result<(), GpuError> {
+        self.prompt_start(pos, &[token], [1], &[])?;
+        if let Some(read) = &mut self.nvme {
+            read.start_front()?;
         }
         Ok(())
     }
@@ -2673,6 +2716,17 @@ impl Body38 {
     #[must_use]
     pub fn takes_checkpoints(&self) -> bool {
         self.marks
+    }
+
+    /// The PLE rows of `token` at `pos`, the input the next step is to take,
+    /// read ahead on the NVMe tier's helper while the caller hands the step's
+    /// answer on. The history and every device buffer stay as they are: the
+    /// next fill takes the rows when its position and row ids are these
+    /// ([`PleRead::start`]), and any other call drains them first. Nothing
+    /// on the host, at a position other than the history's next, or for a
+    /// token the hash refuses (its own fill refuses it by name).
+    pub fn prefetch_input(&mut self, token: u32, pos: u32) -> Result<(), GpuError> {
+        self.ple.prefetch(pos, token)
     }
 
     /// The waiting cut carried out ([`Checkpoints::apply`]): the committed
@@ -6090,7 +6144,7 @@ const _: () = assert!(VERIFY_ROWS <= PASS_ROWS);
 mod tests {
     use super::{
         Arc, Device, E4m3Rows, GgmlType, GpuError, Nvfp4Rows, PleHost, Split, checkpoint_budget38,
-        checkpoint_bytes, checkpoint_lens, checkpoint_price38, dequant_row, ple_takes,
+        checkpoint_bytes, checkpoint_lens, checkpoint_price38, dequant_row, geo, ple_takes,
     };
     use engram::hash::{EosWindow, Window};
 
@@ -6413,6 +6467,38 @@ mod tests {
                 i + 1 < units.len(),
                 "unit {i}: the next unit read ahead"
             );
+        }
+        // A step's rows read ahead ([`PleHost::prefetch`]) leave the history
+        // where it stands and reuse their storage: the next fill takes them
+        // when they are its own, drains a guess of another id, and a second
+        // guess replaces the first; each fill decodes the rows its own id names.
+        for (guess, actual, replace) in [(7, 7, false), (3, 9, false), (2, 1, true)] {
+            let pos = got.hist.next_pos() as u32;
+            let before = got.hist.clone();
+            let history_storage = got.ahead_hist.tokens().as_ptr();
+            got.prefetch(pos, guess).unwrap();
+            assert_eq!(got.hist, before, "{guess}: the history stands");
+            assert_eq!(got.ahead_hist.tokens().as_ptr(), history_storage);
+            let read = got.nvme.as_ref().unwrap();
+            assert!(read.flight, "{guess}: its read started");
+            let ids_storage = read.ahead[0].ids.as_ptr();
+            if replace {
+                got.prefetch(pos, actual).unwrap();
+            }
+            want.hist = want.fill(pos, &[actual]).unwrap();
+            got.hist = got.fill(pos, &[actual]).unwrap();
+            assert_eq!(got.hist, want.hist);
+            assert_eq!(got.ids[..got.named], want.ids[..want.named]);
+            assert!(
+                got.e[..geo::HIDDEN]
+                    .iter()
+                    .zip(&want.e)
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
+                "{guess} then {actual}: the rows of {actual}"
+            );
+            let read = got.nvme.as_ref().unwrap();
+            assert!(!read.flight && read.ahead.is_empty());
+            assert_eq!(read.spare_ids.as_ptr(), ids_storage, "{guess}: ids reused");
         }
         let mut wrong_width = stored.clone();
         wrong_width.block_scales.as_mut().unwrap().row_bytes = 9;
