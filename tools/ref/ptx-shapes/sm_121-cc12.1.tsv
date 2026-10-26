@@ -526,7 +526,8 @@ generate_ds41   softcap_rows                             0           0
 generate_ds41   swiglu_rule_rows                         0           0
 generate_ds41   gemm_iq1m                                0           0
 generate_ds41   gemm_iq1s                                0           0
-generate_ds41   gemm_iq2s                                0           0
+# PIN(2026-10-26): ptxas and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1. The bytes are the exact walk's, which runs only for a tile whose F32 walk leaves the F32 range: the same scan at sm_121a with that walk compiled out holds 0 and 0.
+generate_ds41   gemm_iq2s                               24           8
 generate_ds41   gemm_iq2xs                               0           0
 generate_ds41   iq1_m_gate_up_sel                        0           0
 generate_ds41   iq1_m_gemv_sel                           0           0
