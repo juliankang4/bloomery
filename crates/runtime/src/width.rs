@@ -45,15 +45,18 @@
 //!   gate's width, or another its profile rates above it by the margin.
 //!
 //! After [`Rule::probe_every`] passes the width read longest ago runs once,
-//! so no cost goes stale. While closed the period backs off: a close rests on
-//! drafted costs read before it, so its first probe comes after
-//! [`Rule::probe_every`] passes and each closed probe doubles the period, up
-//! to [`Rule::probe_closed`]. A closed probe whose reading, put in place of
-//! its width's median, would open the gate starts that width's readings
-//! over from it: the width runs again until it holds [`Rule::min_timings`]
-//! readings taken since, and the gate decides on their median. One fast
-//! reading cannot open the gate and one slow one cannot hold it closed, and
-//! one probe after a load step replaces a median read under the old load. A
+//! so no cost goes stale. A move of the gate rests on the readings of the
+//! width it left as they stood, so it starts the period over and its first
+//! probe re-reads that width. While closed the period backs off: each closed
+//! probe doubles it, up to [`Rule::probe_closed`]. A probe whose reading, put
+//! in place of its width's median, would move the gate starts that width's
+//! readings over from it: the width runs again until it holds
+//! [`Rule::min_timings`] readings taken since, and the gate decides on their
+//! median. A chain draft's width past an open gate's starts over at every
+//! probe, because no other pass reaches its positions past the gate's width,
+//! and those positions' means start over with it. One fast reading cannot
+//! move the gate and one slow one cannot hold a width out of it, and one
+//! probe after a load step replaces a median read under the old load. A
 //! proposal shorter than the room it was handed (the context's end) moves
 //! neither the mean nor the gate.
 //!
@@ -212,7 +215,8 @@ pub struct Rule {
     /// its gains alone, and the start of 1 says it keeps every id.
     pub prior: Option<f64>,
     /// Passes before the width read longest ago runs once, while open; and
-    /// a closed chooser's first probe after it closed.
+    /// the first probe after the gate moves, which re-reads the width it
+    /// left.
     pub probe_every: u32,
     /// The longest period while closed, when every probe is a drafted
     /// width's verify: each closed probe doubles the period up to it.
@@ -340,14 +344,6 @@ impl Timings {
         if self.ring.len() == self.cap {
             self.ring.pop_front();
         }
-        self.ring.push_back(ms);
-        Ok(())
-    }
-
-    /// The readings started over from `ms` alone.
-    fn restart(&mut self, ms: f64) -> Result<(), WidthError> {
-        let ms = positive(self.what, ms)?;
-        self.ring.clear();
         self.ring.push_back(ms);
         Ok(())
     }
@@ -702,8 +698,7 @@ struct Flight {
     /// The position the pass's accept or step left the target at; `None`
     /// until one came.
     ends: Option<u32>,
-    /// A closed chooser's probe: its reading may start its width's
-    /// readings over.
+    /// A probe: its reading may start its width's readings over.
     probe: bool,
     /// `E` of the width a verify runs over the window's own profile; 0 for a
     /// plain step.
@@ -864,14 +859,15 @@ pub struct Choosing<D, C = Wall> {
     /// Each width's median, refreshed as its readings land; `None` while a
     /// cost holds fewer than [`Rule::min_timings`] readings.
     medians: Vec<Option<f64>>,
-    /// The pass each width's cost was last read at.
+    /// The pass each width's cost was last read at; 0 for the width the gate
+    /// last left until a probe re-reads it.
     read_at: Vec<u64>,
     /// Readings of each width's cost since the gate last opened, and whether
     /// that open's dwell ([`Rule::dwell`]) is still running.
     fresh: Vec<usize>,
     dwelling: bool,
     /// The widths whose readings are not all in: the warm-up's rotation,
-    /// or a width a closed probe started over.
+    /// or a width a probe started over.
     warm: VecDeque<usize>,
     /// The draft's proposal and its probabilities, reused: a pass allocates
     /// nothing.
@@ -1130,13 +1126,11 @@ impl<D, C: Clock> Choosing<D, C> {
         }
         let k = f.width;
         let ms = positive(self.costs[k].what, ms)?;
-        if f.probe && self.width == 0 && self.opens_on(k, ms) {
+        if f.probe && self.moves_on(k, ms) {
             // The median read before gives way to readings from this one on.
-            self.costs[k].restart(ms)?;
-            self.warm.push_back(k);
-        } else {
-            self.costs[k].push(ms)?;
+            self.start_over(k);
         }
+        self.costs[k].push(ms)?;
         self.read_at[k] = self.passes;
         self.fresh[k] += 1;
         self.medians[k] = if self.costs[k].len() >= self.rule.min_timings {
@@ -1186,7 +1180,8 @@ impl<D, C: Clock> Choosing<D, C> {
     /// closed one opens when a drafted width beats the plain step by the
     /// margin, and an open one's width gives way to a rival that beats it by
     /// the margin. Nothing moves while the warm-up's readings are not all
-    /// in. A close starts the closed probes' period over.
+    /// in. A move starts the probe period over, its first probe the width it
+    /// left, and a close starts the closed probes' backoff over.
     fn gate(&mut self) {
         if !self.warm.is_empty() {
             return;
@@ -1194,8 +1189,9 @@ impl<D, C: Clock> Choosing<D, C> {
         if let Some(next) = self.decision()
             && next != self.width
         {
+            self.since_probe = 0;
+            self.read_at[self.width] = 0;
             if (next == 0) != (self.width == 0) {
-                self.since_probe = 0;
                 self.since_shadow = 0;
                 if next == 0 {
                     self.closed_period = self.rule.first_closed_probe();
@@ -1208,13 +1204,21 @@ impl<D, C: Clock> Choosing<D, C> {
         }
     }
 
-    /// Whether the closed gate opens with `ms` in place of width `k`'s
-    /// median, the rest as it stands.
-    fn opens_on(&mut self, k: usize, ms: f64) -> bool {
+    /// Whether the gate moves with `ms` in place of width `k`'s median, the
+    /// rest as it stands.
+    fn moves_on(&mut self, k: usize, ms: f64) -> bool {
         let held = self.medians[k].replace(ms);
-        let opens = self.decision().is_some_and(|w| w > 0);
+        let moves = self.decision().is_some_and(|w| w != self.width);
         self.medians[k] = held;
-        opens
+        moves
+    }
+
+    /// Width `k`'s readings started over: it runs until it holds
+    /// [`Rule::min_timings`] again, and nothing is decided meanwhile.
+    fn start_over(&mut self, k: usize) {
+        self.costs[k].ring.clear();
+        self.medians[k] = None;
+        self.warm.push_back(k);
     }
 
     /// The width the gate's rule picks on the mean profile and the costs as
@@ -1349,15 +1353,15 @@ impl<D, C: Clock> Choosing<D, C> {
         }
     }
 
-    /// This pass a plain step of `kind`.
-    fn plain(&mut self, kind: Kind, pos: u32, at: Duration) -> usize {
+    /// This pass a plain step of `kind`; `probe` a probe of the plain step.
+    fn plain(&mut self, kind: Kind, pos: u32, at: Duration, probe: bool) -> usize {
         self.flight = Some(Flight {
             kind,
             width: 0,
             pos,
             at,
             ends: None,
-            probe: false,
+            probe,
             predicted: 0.0,
         });
         self.turn = Some(Turn::Plain);
@@ -1367,7 +1371,7 @@ impl<D, C: Clock> Choosing<D, C> {
     /// This pass a verify of the proposal's front `k` ids, written to `out`,
     /// the draft having walked `walked` ids for it (`k` for a draft whose
     /// proposal costs its whole width whatever the pass verifies); `probe` a
-    /// closed chooser's probe.
+    /// probe whose reading may start the width over.
     fn verify(
         &mut self,
         out: &mut [u32],
@@ -1433,7 +1437,7 @@ where
         let room = out.len().min(D::WIDTH);
         if self.shadow.n > 0 {
             self.draft.before_plain(t, last)?;
-            return Ok(self.plain(Kind::Step, pos, at));
+            return Ok(self.plain(Kind::Step, pos, at, false));
         }
         let closed = self.width == 0;
         let period = if closed {
@@ -1451,7 +1455,15 @@ where
                     .saturating_mul(2)
                     .min(self.rule.probe_closed);
             }
-            (Some(self.stalest()), closed)
+            let k = self.stalest();
+            if D::CHAIN && !closed && k > self.width {
+                // No other pass reaches the positions past the gate's width.
+                self.start_over(k);
+                self.seen[self.width..k].fill(0);
+                (Some(k), false)
+            } else {
+                (Some(k), true)
+            }
         } else {
             (None, false)
         };
@@ -1462,21 +1474,21 @@ where
             };
             if !shadow {
                 self.draft.before_plain(t, last)?;
-                return Ok(self.plain(Kind::Step, pos, at));
+                return Ok(self.plain(Kind::Step, pos, at, probe));
             }
             self.since_shadow = 0;
             let n = self
                 .draft
                 .propose_p(t, last, &mut self.ids[..room], &mut self.p)?;
             if n == 0 {
-                return Ok(self.plain(Kind::Step, pos, at));
+                return Ok(self.plain(Kind::Step, pos, at, false));
             }
             check_p(&self.p[..n])?;
             self.shadow.ids[..n].copy_from_slice(&self.ids[..n]);
             self.shadow.p[..n].copy_from_slice(&self.p[..n]);
             (self.shadow.n, self.shadow.matched) = (n, 0);
             self.draft.unproposed();
-            return Ok(self.plain(Kind::Walked, pos, at));
+            return Ok(self.plain(Kind::Walked, pos, at, false));
         }
         let depth = if D::CHAIN {
             forced.unwrap_or(self.width).min(room)
@@ -1487,7 +1499,7 @@ where
             .draft
             .propose_p(t, last, &mut self.ids[..depth], &mut self.p)?;
         if n == 0 {
-            return Ok(self.plain(Kind::Step, pos, at));
+            return Ok(self.plain(Kind::Step, pos, at, false));
         }
         check_p(&self.p[..n])?;
         self.profile(n);
@@ -1506,7 +1518,7 @@ where
         };
         if k == 0 {
             self.draft.unproposed();
-            return Ok(self.plain(Kind::Walked, pos, at));
+            return Ok(self.plain(Kind::Walked, pos, at, false));
         }
         let walked = if D::CHAIN { n } else { k };
         Ok(self.verify(out, (k, walked), pos, at, probe))
@@ -2344,6 +2356,84 @@ mod tests {
             rate >= best * 0.98,
             "{:.4} of the best fixed width's rate",
             rate / best
+        );
+    }
+
+    /// Width 3's verify 20 % slow while `on`, the rig's walls otherwise.
+    fn slow_three<const C: bool>(r: &mut Rig<C>, on: bool) {
+        let mut walls = LINEAR;
+        if on {
+            walls[2] = walls[2] * 6 / 5;
+        }
+        r.clock.verify_rows(&walls);
+    }
+
+    /// The third id kept, and reported, at 0.30 while `on`, at 0.95
+    /// otherwise.
+    fn loses_three<const C: bool>(r: &mut Rig<C>, on: bool) {
+        let a = if on { [0.95, 0.90, 0.30] } else { [0.95; 3] };
+        r.acc.set(a);
+        r.choosing().draft().p.set(a.map(|a| a as f32));
+    }
+
+    /// The pass the gate leaves 3 and the pass it is back on it, within
+    /// 1 000 passes of a draft that keeps 0.95 of every id, settled on 3:
+    /// `bad` turns width 3 bad, and back as soon as the gate leaves it.
+    fn left_and_back<const C: bool>(bad: fn(&mut Rig<C>, bool)) -> (usize, Option<usize>) {
+        let sure = [0.95; 3];
+        let mut r = Rig::<C>::build(
+            sure,
+            sure.map(|a| a as f32),
+            &LINEAR,
+            Mode::Cost,
+            Rule::DEFAULT,
+        );
+        r.run(200);
+        assert_eq!(r.choosing().width(), 3, "settled elsewhere");
+        bad(&mut r, true);
+        let mut left = None;
+        for i in 1..=1_000 {
+            r.run(1);
+            match (left, r.choosing().width()) {
+                (None, 3) | (Some(_), 0..=2) => {}
+                (None, w) => {
+                    assert_eq!(w, 2, "the gate left 3 for {w}");
+                    bad(&mut r, false);
+                    left = Some(i);
+                }
+                (Some(l), _) => return (l, Some(i)),
+            }
+        }
+        (left.expect("the gate never left 3"), None)
+    }
+
+    /// A width the gate left comes back once it pays again. A draft whose
+    /// windows the rig's draws keep whole 19 times in 20 runs 3 (E 3.85, 9 %
+    /// past 2's rate on the rig's walls [derived]) until width 3 turns bad,
+    /// its verify 20 % slow or its third id kept at 0.30, and the gate moves
+    /// to 2. Width 3 restored as the gate leaves it, the probe a period after
+    /// the move re-reads it, its readings start over and the gate is back on
+    /// 3 once they hold `min_timings`: after the move + `probe_every`, by
+    /// that + `min_timings`. A draft that proposes its whole width hears its
+    /// third position every pass, so a third id kept again brings it back
+    /// sooner; no pass at 2 of a chain draft reaches it.
+    #[test]
+    fn a_width_the_gate_left_comes_back_once_it_pays() {
+        let rule = Rule::DEFAULT;
+        let probe = usize::try_from(rule.probe_every).unwrap();
+        let by = probe + rule.min_timings;
+        let runs = [
+            ("slow", probe, left_and_back::<false>(slow_three)),
+            ("slow, chain", probe, left_and_back::<true>(slow_three)),
+            ("losing", 1, left_and_back::<false>(loses_three)),
+            ("losing, chain", probe, left_and_back::<true>(loses_three)),
+        ];
+        assert!(
+            runs.iter().all(|&(_, after, (left, back))| {
+                back.is_some_and(|b| (left + after..=left + by).contains(&b))
+            }),
+            "the passes the gate left 3 and came back, each back no sooner than the passes \
+             named after it left and within {by}: {runs:?}"
         );
     }
 
