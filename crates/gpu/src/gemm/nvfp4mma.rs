@@ -1082,8 +1082,10 @@ mod native {
             source / slot_div as usize
         };
         let mut acc = [0.0f32; 32];
-        // A whole tile of an even K walk over whole row tiles, the common
-        // tile, runs without the walk's and the fragments' checks.
+        // An even K walk over whole row tiles runs without the walk's and the
+        // fragments' checks: a tile of fewer than 64 columns also runs its
+        // dead fragments, over copies of its last live column (`source`),
+        // which no store reads.
         macro_rules! walk {
             ($full:literal) => {
                 nvfp4_walk!(
@@ -1138,7 +1140,7 @@ mod native {
                 )
             };
         }
-        if len == 64 && steps.is_multiple_of(HALVES) && rows.is_multiple_of(TILE_ROWS) {
+        if steps.is_multiple_of(HALVES) && rows.is_multiple_of(TILE_ROWS) {
             walk!(true);
         } else {
             walk!(false);
@@ -1278,8 +1280,9 @@ mod native {
         };
         let mut gacc = [0.0f32; 16];
         let mut uacc = [0.0f32; 16];
-        // A whole tile of an even K walk, the common tile, runs without the
-        // walk's and the fragments' checks.
+        // An even K walk runs without the walk's and the fragments' checks: a
+        // tile of fewer than 64 columns also runs its dead fragments, over
+        // copies of its last live column (`source`), which no store reads.
         macro_rules! walk {
             ($full:literal) => {
                 nvfp4_walk!(
@@ -1366,7 +1369,7 @@ mod native {
                 )
             };
         }
-        if len == 64 && steps.is_multiple_of(HALVES) {
+        if steps.is_multiple_of(HALVES) {
             walk!(true);
         } else {
             walk!(false);
