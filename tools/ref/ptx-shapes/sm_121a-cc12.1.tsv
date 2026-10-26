@@ -68,7 +68,8 @@ generate_ds41 ds41_engram_gate 0 0
 generate_ds41 ds41_engram_key_norm 0 0
 generate_ds41 ds41_expert_gate_up 0 0
 # PIN(2026-10-23): measured on sm_121a, GB10, driver 595.84, CUDA 13.3.1. Shared GEMM epilogues retain exceptional range; the native 4K pair showed no throughput loss.
-generate_ds41 ds41_expert_gate_up_tiles 680 144
+# PIN(2026-10-26): spill 680 -> 676 B and cc 12.1 JIT local 144 -> 152 B (sm_121a ptxas 13.3.73, GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
+generate_ds41 ds41_expert_gate_up_tiles 676 152
 generate_ds41 ds41_ffn_card_acc 0 0
 generate_ds41 ds41_ffn_card_acc_10 0 0
 generate_ds41 ds41_ffn_card_acc_4 0 0
@@ -286,11 +287,13 @@ generate_ds41 kq_card_gather 0 0
 generate_ds41 kq_gate_up_act_q4k 0 0
 generate_ds41 kq_gate_up_act_q4k_at 0 0
 # PIN(2026-10-23): measured on sm_121a, GB10, driver 595.84, CUDA 13.3.1. Shared GEMM epilogues retain exceptional range; the native 4K pair showed no throughput loss.
-generate_ds41 kq_gate_up_act_q4k_tiles 752 136
+# PIN(2026-10-26): spill 752 -> 744 B and cc 12.1 JIT local 136 -> 128 B (sm_121a ptxas 13.3.73, GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
+generate_ds41 kq_gate_up_act_q4k_tiles 744 128
 generate_ds41 kq_gate_up_act_q5k 0 0
 generate_ds41 kq_gate_up_act_q5k_at 0 0
 # PIN(2026-10-23): measured on sm_121a, GB10, driver 595.84, CUDA 13.3.1. Shared GEMM epilogues retain exceptional range; the native 4K pair showed no throughput loss.
-generate_ds41 kq_gate_up_act_q5k_tiles 832 136
+# PIN(2026-10-26): spill 832 -> 848 B, cc 12.1 JIT local unchanged at 136 B (sm_121a ptxas 13.3.73, GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
+generate_ds41 kq_gate_up_act_q5k_tiles 848 136
 generate_ds41 kq_gate_up_act_q8_0 0 0
 generate_ds41 kv_append 0 0
 generate_ds41 kv_append_pos_buf 0 0
@@ -318,7 +321,8 @@ generate_ds41 mxfp8_w8a8_gemm 0 0
 # PIN(2026-10-25): MXFP8 W8A8 norm-gate spill and GB10 JIT local measured with ptxas 13.3.73, driver 595.84, sm_121a.
 # PIN(2026-10-25): 376 -> 364 spill bytes (ptxas 13.3.73 sm_121a, GB10 driver 595.84) when the epilogue also writes
 # the output's MXFP8 form. JIT local bytes remain unchanged.
-generate_ds41 mxfp8_w8a8_norm_gate 364 64
+# PIN(2026-10-26): spill unchanged at 364 B, cc 12.1 JIT local 64 -> 72 B (sm_121a ptxas 13.3.73, GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
+generate_ds41 mxfp8_w8a8_norm_gate 364 72
 generate_ds41 nemotron_moe_router_240 0 0
 generate_ds41 nemotron_moe_router_240_pick 0 0
 generate_ds41 nemotron_moe_router_304 0 0
@@ -360,7 +364,8 @@ generate_ds41 q4k_gemv_prefetch 0 0
 generate_ds41 q4k_gemv_sel 0 0
 generate_ds41 q4k_gemv_sel_prefetch 0 0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives q4k_gemv_tiles 48 registers (.minnctapersm 5: 5 blocks of 256 threads an SM) and keeps 184 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv); ptxas -arch=sm_121 assembles it at the same registers and spills 708 bytes.
-generate_ds41 q4k_gemv_tiles 708 184
+# PIN(2026-10-26): spill 708 -> 696 B, cc 12.1 JIT local unchanged at 184 B (sm_121a ptxas 13.3.73, GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
+generate_ds41 q4k_gemv_tiles 696 184
 generate_ds41 q5_0_gemv 0 0
 generate_ds41 q5_0_gemv_sel 0 0
 generate_ds41 q5_1_gemv 0 0
@@ -373,7 +378,8 @@ generate_ds41 q5_quantize_q8_sel_relu_sqr 0 0
 generate_ds41 q5k_gemv_sel 0 0
 generate_ds41 q5k_gemv_sel_at 0 0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives q5k_gemv_tiles 64 registers (.minnctapersm 4: 4 blocks of 256 threads an SM) and keeps 104 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv); ptxas -arch=sm_121 assembles it at the same registers and spills 412 bytes.
-generate_ds41 q5k_gemv_tiles 412 104
+# PIN(2026-10-26): spill 412 -> 420 B, cc 12.1 JIT local unchanged at 104 B (sm_121a ptxas 13.3.73, GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
+generate_ds41 q5k_gemv_tiles 420 104
 generate_ds41 q6k_gate_up_sel 0 0
 generate_ds41 q6k_gemv 0 0
 generate_ds41 q6k_gemv_ids 0 0
@@ -435,8 +441,9 @@ generate_ds41 qwen3moe_qkv_q4k_prefetch 0 0
 generate_ds41 qwen3moe_router_fused 0 0
 generate_ds41 qwen3moe_router_logits 0 0
 generate_ds41 qwen3moe_router_norm 0 0
-generate_ds41 qwen3moe_router_norm_m 0 0
-generate_ds41 qwen3moe_router_norm_m_prefetch 0 0
+# PIN(2026-10-26): qwen3moe_router_norm_m and qwen3moe_router_norm_m_prefetch: spill 0 -> 32 B and cc 12.1 JIT local 0 -> 8 B each (sm_121a ptxas 13.3.73, GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entries' PTX moved with it.
+generate_ds41 qwen3moe_router_norm_m 32 8
+generate_ds41 qwen3moe_router_norm_m_prefetch 32 8
 generate_ds41 qwen3moe_router_norm_prefetch 0 0
 generate_ds41 qwen3moe_router_route 0 0
 generate_ds41 qwen3moe_token_major 0 0
