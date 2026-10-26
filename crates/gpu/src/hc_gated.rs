@@ -677,6 +677,11 @@ unsafe fn up_bf16<const M: usize>(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
+// PIN(2026-10-27): retain indexed ranges because CUDA unrolling needs range loops.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
 unsafe fn norm_stream(
     y: &[f32],
     wgt: &[f32],
@@ -697,10 +702,14 @@ unsafe fn norm_stream(
         0.0
     };
     let reads_y = combine == 1 || init == 1;
+    // A stream of one chunk a thread keeps its values in `xv` across the
+    // sum, and loads its gains into `yv` before it, instead of reading both
+    // back after the sum.
+    let one = hid <= NORM_CHUNK * NORM_THREADS;
+    let (mut xv, mut yv) = ([0.0f32; NORM_CHUNK], [0.0f32; NORM_CHUNK]);
     let mut acc = 0.0f32;
     let mut i0 = tid;
     while i0 < hid {
-        let (mut xv, mut yv) = ([0.0f32; NORM_CHUNK], [0.0f32; NORM_CHUNK]);
         for j in 0..NORM_CHUNK {
             thread::__unroll_config::<0>();
             let i = i0 + j * NORM_THREADS;
@@ -731,10 +740,21 @@ unsafe fn norm_stream(
                     // thread's own value (# Safety).
                     unsafe { *res.get_unchecked_mut(base + i) = x };
                 }
+                xv[j] = x;
                 acc = f32::mul_add(x, x, acc);
             }
         }
         i0 += NORM_CHUNK * NORM_THREADS;
+    }
+    if one {
+        for j in 0..NORM_CHUNK {
+            thread::__unroll_config::<0>();
+            let i = tid + j * NORM_THREADS;
+            if i < hid {
+                // SAFETY: s * hidden + i < 4 * hidden <= gamma.len().
+                yv[j] = unsafe { *gamma.get_unchecked(s * hid + i) };
+            }
+        }
     }
     // SAFETY: every thread of the block is here, and `ws` is as
     // `block_sum` asks (# Safety).
@@ -750,17 +770,18 @@ unsafe fn norm_stream(
     };
     let mut i0 = tid;
     while i0 < hid {
-        let (mut xv, mut gv) = ([0.0f32; NORM_CHUNK], [0.0f32; NORM_CHUNK]);
-        for j in 0..NORM_CHUNK {
-            thread::__unroll_config::<0>();
-            let i = i0 + j * NORM_THREADS;
-            if i < hid {
-                // SAFETY: base + i < m * 4 * hidden <= res.len(), this
-                // thread's own value, which it wrote or read in the first
-                // pass (# Safety).
-                xv[j] = unsafe { *res.get_unchecked_mut(base + i) };
-                // SAFETY: s * hidden + i < 4 * hidden <= gamma.len().
-                gv[j] = unsafe { *gamma.get_unchecked(s * hid + i) };
+        if !one {
+            for j in 0..NORM_CHUNK {
+                thread::__unroll_config::<0>();
+                let i = i0 + j * NORM_THREADS;
+                if i < hid {
+                    // SAFETY: base + i < m * 4 * hidden <= res.len(), this
+                    // thread's own value, which it wrote or read in the
+                    // first pass (# Safety).
+                    xv[j] = unsafe { *res.get_unchecked_mut(base + i) };
+                    // SAFETY: s * hidden + i < 4 * hidden <= gamma.len().
+                    yv[j] = unsafe { *gamma.get_unchecked(s * hid + i) };
+                }
             }
         }
         for j in 0..NORM_CHUNK {
@@ -769,7 +790,7 @@ unsafe fn norm_stream(
             if i < hid {
                 // SAFETY: base + i < m * 4 * hidden <= xn.len(), this
                 // thread's own value (# Safety).
-                unsafe { *xn.get_unchecked_mut(base + i) = (xv[j] * r) * gv[j] };
+                unsafe { *xn.get_unchecked_mut(base + i) = (xv[j] * r) * yv[j] };
             }
         }
         i0 += NORM_CHUNK * NORM_THREADS;
