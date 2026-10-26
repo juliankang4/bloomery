@@ -590,11 +590,12 @@ struct DoneMark(AtomicUsize);
 /// itself by CCD — a row dispatch visiting a matrix CCD-major, a warm routine
 /// filling a CCD's L3 with the rows that CCD will compute. Participant `t`
 /// (`threads()` of them, the calling thread the last) runs on the CCD the
-/// rule [`Pool`] pins by places it on: over CCDs of equal cpu counts CCD
-/// `t % ccds()` as that CCD's `t / ccds()`-th participant, so a CCD holds
-/// `threads / ccds` participants and the first `threads % ccds` CCDs one
-/// more; over CCDs the process's mask left unequal, a CCD takes no further
-/// participant once its cpus are taken while another CCD has one free.
+/// rule [`Pool`] pins by places it on: over CCDs of equal core and cpu
+/// counts CCD `t % ccds()` as that CCD's `t / ccds()`-th participant, so a
+/// CCD holds `threads / ccds` participants and the first `threads % ccds`
+/// CCDs one more; over CCDs the process's mask left unequal, a CCD takes no
+/// further participant once its cores are taken while another CCD has one
+/// free, and no sibling while any allowed core is free.
 ///
 /// A value only answers by arithmetic: it is `Copy` and a call allocates
 /// nothing. The pool's own is [`Pool::ccd_map`]; [`CcdMap::new`] names a

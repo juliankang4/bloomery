@@ -344,8 +344,9 @@ fn ccd_spans_follow_the_participants_per_ccd() {
 
 /// The map against the machine: on the box every worker's pinned cpu is in
 /// the L3 group of the CCD the map names for it, the caller's too once it is
-/// pinned, no cpu holds two participants while the topology has a cpu for
-/// each (also under a mask that leaves its groups unequal), the L3 bytes are
+/// pinned, no core holds two participants while an allowed core is free and
+/// no cpu while the topology has a cpu for each (also under a mask that
+/// leaves its groups unequal in cores or cpus), the L3 bytes are
 /// read, and a spread over the pool's own groups is what the pool reports.
 /// An independent path from the rule's restatement above: the cpus come from
 /// `sched_setaffinity`'s arguments.
@@ -374,6 +375,22 @@ fn hw_ccd_map_matches_the_pins() {
         );
     }
     println!("hw_ccd_map: pins={pins:?} groups={topo:?}");
+    // A core by its lowest cpu, its SMT sibling's or its own.
+    let core = |c: &u32| {
+        let c = *c as usize;
+        threads::helper::sibling_of(c).map_or(c, |s| s.min(c))
+    };
+    let distinct = |cpus: &[u32]| {
+        let mut cores: Vec<usize> = cpus.iter().map(core).collect();
+        cores.sort_unstable();
+        cores.dedup();
+        cores.len()
+    };
+    assert_eq!(
+        distinct(&pins),
+        p.threads().min(distinct(&p.plan().allowed)),
+        "a core holds two participants while an allowed core is free"
+    );
     let cpus: usize = topo.iter().map(Vec::len).sum();
     pins.sort_unstable();
     pins.dedup();
