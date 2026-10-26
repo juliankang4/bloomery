@@ -344,9 +344,11 @@ fn ccd_spans_follow_the_participants_per_ccd() {
 
 /// The map against the machine: on the box every worker's pinned cpu is in
 /// the L3 group of the CCD the map names for it, the caller's too once it is
-/// pinned, the L3 bytes are read, and a spread over the pool's own groups is
-/// what the pool reports. An independent path from the rule's restatement
-/// above: the cpus come from `sched_setaffinity`'s arguments.
+/// pinned, no cpu holds two participants while the topology has a cpu for
+/// each (also under a mask that leaves its groups unequal), the L3 bytes are
+/// read, and a spread over the pool's own groups is what the pool reports.
+/// An independent path from the rule's restatement above: the cpus come from
+/// `sched_setaffinity`'s arguments.
 #[test]
 #[ignore = "hw: pins the calling thread and reads /sys/devices/system/cpu topology, meaningful on the box"]
 fn hw_ccd_map_matches_the_pins() {
@@ -356,12 +358,14 @@ fn hw_ccd_map_matches_the_pins() {
     let topo = p.topology();
     assert_eq!(map.threads(), p.threads());
     assert_eq!(map.ccds(), topo.len());
+    let mut pins = Vec::new();
     for t in 0..p.threads() {
         let cpu = if t + 1 < p.threads() {
             p.worker_cpu(t).expect("a pinned worker has a cpu") as u32
         } else {
             u32::try_from(p.caller_cpu()).unwrap()
         };
+        pins.push(cpu);
         assert!(
             topo[map.ccd_of(t)].contains(&cpu),
             "participant {t} is pinned to cpu {cpu}, outside CCD {} {:?}",
@@ -369,6 +373,15 @@ fn hw_ccd_map_matches_the_pins() {
             topo[map.ccd_of(t)]
         );
     }
+    println!("hw_ccd_map: pins={pins:?} groups={topo:?}");
+    let cpus: usize = topo.iter().map(Vec::len).sum();
+    pins.sort_unstable();
+    pins.dedup();
+    assert_eq!(
+        pins.len(),
+        p.threads().min(cpus),
+        "a cpu holds two participants"
+    );
     println!(
         "hw_ccd_map: threads={} ccds={} widths={:?} l3_bytes={}",
         map.threads(),

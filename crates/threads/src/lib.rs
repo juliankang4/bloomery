@@ -30,7 +30,7 @@ pub mod helper;
 mod topology;
 
 pub use topology::{Cut, PoolPlan};
-use topology::{Shape, ccd_slot, detect_topology};
+use topology::{Shape, Spread, ccd_slot, detect_topology};
 
 use std::any::Any;
 use std::cell::UnsafeCell;
@@ -289,13 +289,11 @@ impl Pool {
     /// unpinned participant is on no CCD in particular. A host with one L3 is
     /// one CCD.
     #[must_use]
-    pub fn ccd_map(&self) -> Option<CcdMap> {
+    pub fn ccd_map(&'static self) -> Option<CcdMap> {
         if self.pin_failed() || !self.caller_pinned() {
             return None;
         }
-        let map = CcdMap::new(self.nthreads, self.shape.topo.len(), 0);
-        let l3_bytes = self.shape.l3.iter().take(map.active()).sum();
-        Some(CcdMap { l3_bytes, ..map })
+        Some(self.shape.ccd_map())
     }
 
     /// Protocol counters since process start. Diagnostic only — nothing in
@@ -482,9 +480,9 @@ impl Pool {
         }
     }
 
-    /// Worker `t` is spread across CCDs ([`ccd_slot`]): slot `t / nccd` of
-    /// its CCD's cpu list (physical cores first). Beyond the allowed cpu
-    /// count the last slot is shared rather than panicking.
+    /// Worker `t` is spread across CCDs ([`ccd_slot`]), a cpu of its own
+    /// while the allowed cpus last. Beyond the allowed cpu count the last slot
+    /// of its CCD is shared rather than panicking.
     fn cpu_for(&self, t: usize) -> u32 {
         self.shape.cpu_for(t)
     }
@@ -591,10 +589,12 @@ struct DoneMark(AtomicUsize);
 /// How the pool's participants sit on the CCDs, for the work that places
 /// itself by CCD — a row dispatch visiting a matrix CCD-major, a warm routine
 /// filling a CCD's L3 with the rows that CCD will compute. Participant `t`
-/// (`threads()` of them, the calling thread the last) runs on CCD
-/// `t % ccds()` as that CCD's `t / ccds()`-th participant, the rule
-/// [`Pool`] pins by, so a CCD holds `threads / ccds` participants and the
-/// first `threads % ccds` CCDs one more.
+/// (`threads()` of them, the calling thread the last) runs on the CCD the
+/// rule [`Pool`] pins by places it on: over CCDs of equal cpu counts CCD
+/// `t % ccds()` as that CCD's `t / ccds()`-th participant, so a CCD holds
+/// `threads / ccds` participants and the first `threads % ccds` CCDs one
+/// more; over CCDs the process's mask left unequal, a CCD takes no further
+/// participant once its cpus are taken while another CCD has one free.
 ///
 /// A value only answers by arithmetic: it is `Copy` and a call allocates
 /// nothing. The pool's own is [`Pool::ccd_map`]; [`CcdMap::new`] names a
@@ -602,7 +602,7 @@ struct DoneMark(AtomicUsize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CcdMap {
     threads: usize,
-    ccds: usize,
+    spread: Spread<'static>,
     l3_bytes: u64,
 }
 
@@ -617,7 +617,7 @@ impl CcdMap {
         );
         CcdMap {
             threads,
-            ccds,
+            spread: Spread::Even(ccds),
             l3_bytes,
         }
     }
@@ -631,13 +631,13 @@ impl CcdMap {
     /// CCDs the participants are spread over (L3 groups of the topology).
     #[must_use]
     pub fn ccds(&self) -> usize {
-        self.ccds
+        self.spread.len()
     }
 
     /// CCDs that hold a participant: `min(ccds, threads)`, the first ones.
     #[must_use]
     pub fn active(&self) -> usize {
-        self.ccds.min(self.threads)
+        self.ccds().min(self.threads)
     }
 
     /// The L3 bytes of the active CCDs, summed; 0 when the topology does not
@@ -651,14 +651,14 @@ impl CcdMap {
     #[must_use]
     pub fn ccd_of(&self, t: usize) -> usize {
         assert!(t < self.threads, "participant {t} of {}", self.threads);
-        ccd_slot(t, self.ccds).0
+        ccd_slot(t, self.spread).0
     }
 
     /// Participant `t`'s rank among its CCD's participants.
     #[must_use]
     pub fn rank_of(&self, t: usize) -> usize {
         assert!(t < self.threads, "participant {t} of {}", self.threads);
-        ccd_slot(t, self.ccds).1
+        ccd_slot(t, self.spread).1
     }
 
     /// Participants on CCD `c`; 0 past the active CCDs.
@@ -672,9 +672,7 @@ impl CcdMap {
     /// `first_lane(ccds())` is `threads()`.
     #[must_use]
     pub fn first_lane(&self, c: usize) -> usize {
-        let c = c.min(self.ccds);
-        let (q, r) = (self.threads / self.ccds, self.threads % self.ccds);
-        q * c + c.min(r)
+        self.spread.first_lane(self.threads, c)
     }
 
     /// Participant `t`'s place in the CCD-major order.
@@ -906,7 +904,7 @@ mod tests {
     /// caller by `pin_caller`, the workers by their own pins.
     #[test]
     fn ccd_map_needs_every_participant_pinned() {
-        let p = Pool::build();
+        let p: &'static Pool = Box::leak(Box::new(Pool::build()));
         assert!(p.ccd_map().is_none(), "the caller has not pinned");
         p.caller_pinned.store(true, Ordering::Relaxed);
         let map = p.ccd_map().expect("a pinned caller and no failed pin");

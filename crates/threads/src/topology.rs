@@ -325,16 +325,17 @@ impl Shape {
     }
 
     /// Participants past the cpus there are: they share the last slot of
-    /// their CCD ([`Shape::cpu_for`]).
+    /// their CCD ([`Shape::cpu_for`]); below it every participant has a cpu of
+    /// its own.
     pub(crate) fn oversubscribed(&self) -> usize {
         self.threads.saturating_sub(self.cpus())
     }
 
-    /// Participant `t`'s CCD `t % ccds` and its slot `t / ccds` in that CCD's
-    /// cpu list (physical cores first). Beyond the cpus there are the last
-    /// slot is shared rather than panicking.
+    /// Participant `t`'s CCD and its slot in that CCD's cpu list (physical
+    /// cores first), by [`ccd_slot`]. Beyond the cpus there are the last slot
+    /// is shared rather than panicking.
     pub(crate) fn cpu_for(&self, t: usize) -> u32 {
-        let (ccd, slot) = ccd_slot(t, self.topo.len());
+        let (ccd, slot) = ccd_slot(t, Spread::of(&self.topo));
         let g = &self.topo[ccd];
         g[slot.min(g.len() - 1)]
     }
@@ -366,6 +367,18 @@ impl Shape {
         lines
     }
 
+    /// Where the participants of this shape sit by CCD ([`crate::CcdMap`]),
+    /// by the rule [`Shape::cpu_for`] pins by, with the active CCDs' L3 bytes.
+    pub(crate) fn ccd_map(&'static self) -> crate::CcdMap {
+        let map = crate::CcdMap {
+            threads: self.threads,
+            spread: Spread::of(&self.topo),
+            l3_bytes: 0,
+        };
+        let l3_bytes = self.l3.iter().take(map.active()).sum();
+        crate::CcdMap { l3_bytes, ..map }
+    }
+
     /// The shape as a plan prints it.
     pub(crate) fn plan(&self) -> PoolPlan {
         PoolPlan {
@@ -378,11 +391,95 @@ impl Shape {
     }
 }
 
-/// Participant `t`'s place when the pool spreads over `nccd` CCDs: its CCD
-/// `t % nccd` and its slot `t / nccd` in that CCD's cpu list. The one owner of
-/// the rule: the pool pins by it ([`crate::Pool`]) and [`crate::CcdMap`] answers by it.
-pub(crate) const fn ccd_slot(t: usize, nccd: usize) -> (usize, usize) {
-    (t % nccd, t / nccd)
+/// The CCDs a pool spreads over, as its placement rule ([`ccd_slot`]) reads
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Spread<'a> {
+    /// This many CCDs, each with a cpu for every participant it takes in
+    /// turn: CCDs of equal cpu counts, or a grouping a test names.
+    Even(usize),
+    /// CCDs of these cpus, whose counts differ.
+    Uneven(&'a [Vec<u32>]),
+}
+
+impl<'a> Spread<'a> {
+    /// The spread over `groups`, each CCD's cpus.
+    pub(crate) fn of(groups: &'a [Vec<u32>]) -> Spread<'a> {
+        if groups.windows(2).all(|w| w[0].len() == w[1].len()) {
+            Spread::Even(groups.len())
+        } else {
+            Spread::Uneven(groups)
+        }
+    }
+
+    /// The CCDs.
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Spread::Even(n) => n,
+            Spread::Uneven(groups) => groups.len(),
+        }
+    }
+
+    /// The participants of `threads` on the CCDs before `c` (all of them for
+    /// `c` at or past the last). Over [`Spread::Uneven`] CCDs the place
+    /// [`ccd_slot`] gives the next participant, `threads`, says which rounds
+    /// are complete and how far the open one has come.
+    pub(crate) fn first_lane(self, threads: usize, c: usize) -> usize {
+        let c = c.min(self.len());
+        match self {
+            Spread::Even(n) => {
+                let (q, r) = (threads / n, threads % n);
+                q * c + c.min(r)
+            }
+            Spread::Uneven(groups) => {
+                let (next, rank) = ccd_slot(threads, self);
+                if rank < groups[next].len() {
+                    groups[..c]
+                        .iter()
+                        .enumerate()
+                        .map(|(g, cpus)| {
+                            cpus.len().min(rank) + usize::from(g < next && cpus.len() > rank)
+                        })
+                        .sum()
+                } else {
+                    groups[..c].iter().map(Vec::len).sum::<usize>()
+                        + (rank - groups[next].len()) * c
+                        + c.min(next)
+                }
+            }
+        }
+    }
+}
+
+/// Participant `t`'s place when the pool spreads over `spread`: its CCD and
+/// its rank among that CCD's participants, the slot of the CCD's cpu list it
+/// takes. Round `r` hands one participant, in CCD order, to each CCD holding
+/// more than `r` cpus, so no cpu takes a second participant while another
+/// is free; once every cpu has one, each round goes over every CCD and its
+/// participants share their CCD's last slot. Over [`Spread::Even`] CCDs that
+/// is CCD `t % n` as its `t / n`-th. The one owner of the rule: the pool pins
+/// by it ([`crate::Pool`]) and [`crate::CcdMap`] answers by it.
+pub(crate) fn ccd_slot(t: usize, spread: Spread<'_>) -> (usize, usize) {
+    let groups = match spread {
+        Spread::Even(n) => return (t % n, t / n),
+        Spread::Uneven(groups) => groups,
+    };
+    let mut left = t;
+    // Round `r` hands a cpu of their own to the CCDs holding more than `r`.
+    let rounds = groups.iter().map(Vec::len).max().unwrap_or(0);
+    for r in 0..rounds {
+        let mut open = (0..groups.len()).filter(|&c| groups[c].len() > r);
+        let n = open.clone().count();
+        if left < n {
+            let c = open
+                .nth(left)
+                .expect("a round's participant is one of its open CCDs");
+            return (c, r);
+        }
+        left -= n;
+    }
+    let c = left % groups.len();
+    (c, groups[c].len() + left / groups.len())
 }
 
 /// Where the pool's threads sit, before or after it is built: what a plan
@@ -526,6 +623,63 @@ mod tests {
         assert_eq!(s.oversubscribed(), 0);
         // Zero threads is one: the pool always has a participant.
         assert_eq!(Shape::of(machine(1, 4), &mask, Some(0)).threads, 1);
+    }
+
+    /// A mask that leaves the L3 groups unequal (one cpu of the first, four
+    /// of the second) places a participant on every allowed cpu before any
+    /// cpu takes a second one, and only participants past the cpus share.
+    #[test]
+    fn unequal_groups_take_every_cpu_before_one_is_shared() {
+        let mask = [0, 4, 5, 6, 7];
+        let s = Shape::of(machine(2, 4), &mask, None);
+        assert_eq!(s.topo, vec![vec![0], vec![4, 5, 6, 7]]);
+        assert_eq!((s.threads, s.oversubscribed()), (5, 0));
+        let pins = |s: &Shape| {
+            let plan = s.plan();
+            plan.workers
+                .iter()
+                .copied()
+                .chain([plan.caller])
+                .collect::<Vec<u32>>()
+        };
+        assert_eq!(pins(&s), mask, "a participant on each allowed cpu");
+        let over = Shape::of(machine(2, 4), &mask, Some(7));
+        assert_eq!(over.oversubscribed(), 2);
+        assert_eq!(pins(&over), [0, 4, 5, 6, 7, 0, 7]);
+        // Groups of equal counts keep the round robin's closed form.
+        let even = Shape::of(machine(2, 4), &[0, 1, 4, 5], None);
+        assert_eq!(Spread::of(&even.topo), Spread::Even(2));
+        // The CCD map answers by the pins: over three groups cut to 1, 4 and
+        // 2 cpus and every thread count to past the cpus, each participant's
+        // CCD holds its cpu, no cpu is taken twice below the cpu count, and
+        // the widths and CCD-major lanes count the participants once each.
+        let mask = [0, 4, 5, 6, 7, 8, 9];
+        for threads in 1..=10 {
+            let s: &'static Shape =
+                Box::leak(Box::new(Shape::of(machine(3, 4), &mask, Some(threads))));
+            assert_eq!(s.topo, vec![vec![0], vec![4, 5, 6, 7], vec![8, 9]]);
+            let (map, pins) = (s.ccd_map(), pins(s));
+            let mut seen = vec![false; threads];
+            for (t, cpu) in pins.iter().enumerate() {
+                assert!(s.topo[map.ccd_of(t)].contains(cpu), "{threads}: {t} {cpu}");
+                assert!(map.rank_of(t) < map.width(map.ccd_of(t)));
+                assert!(!std::mem::replace(&mut seen[map.lane_of(t)], true));
+                assert_eq!(map.lane_ccd(map.lane_of(t)), map.ccd_of(t));
+            }
+            let mut distinct = pins.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                threads.min(mask.len()),
+                "{threads}: {pins:?}"
+            );
+            assert_eq!(map.first_lane(3), threads);
+            for c in 0..3 {
+                let on_c = (0..threads).filter(|&t| map.ccd_of(t) == c).count();
+                assert_eq!(map.width(c), on_c, "{threads}: CCD {c}");
+            }
+        }
     }
 
     /// A mask that shares no cpu with the topology (a topology that does not
