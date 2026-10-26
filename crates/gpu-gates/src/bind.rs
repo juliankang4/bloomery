@@ -57,6 +57,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::checkpoint::saved::{Pending as Saving, SeqView};
@@ -1453,7 +1454,7 @@ impl SeatEngine {
                 // seat's selection unspecified until the server selects again
                 // (`serve::Engine::step_slots`).
                 let mut selected = Some(0);
-                for cmd in cmds {
+                while let Ok(cmd) = receive_command(&cmds) {
                     let call = one_slot_call(&cmd);
                     let select = match &cmd {
                         Cmd::Select(slot) => Some(*slot),
@@ -1633,6 +1634,26 @@ impl SeatEngine {
     pub fn slots(&self) -> usize {
         self.slots
     }
+}
+
+/// How long the engine thread polls for the next command before it parks:
+/// a decode step's reply and the server's next call cross in less, and a
+/// parked thread's wake-up would sit on every token's path.
+const RECEIVE_SPIN: Duration = Duration::from_millis(1);
+
+/// The engine thread's next command: polled for until [`RECEIVE_SPIN`] has
+/// passed since the call, then waited for parked. Commands sent before the
+/// server's end are all received before the end is.
+fn receive_command(rx: &Receiver<Cmd>) -> Result<Cmd, mpsc::RecvError> {
+    let started = Instant::now();
+    while started.elapsed() < RECEIVE_SPIN {
+        match rx.try_recv() {
+            Ok(cmd) => return Ok(cmd),
+            Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
+            Err(mpsc::TryRecvError::Empty) => std::hint::spin_loop(),
+        }
+    }
+    rx.recv()
 }
 
 impl Link {
@@ -3127,7 +3148,8 @@ mod tests {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
         let worker = std::thread::spawn(move || {
-            for (at, cmd) in cmds.into_iter().enumerate() {
+            let received = std::iter::from_fn(|| super::receive_command(&cmds).ok());
+            for (at, cmd) in received.enumerate() {
                 let reply = match cmd {
                     Cmd::Next { last, mut logits } => {
                         if let Some(row) = logits.as_deref_mut() {
@@ -3183,6 +3205,48 @@ mod tests {
             scratch: Vec::new(),
         };
         (link, worker)
+    }
+
+    /// The engine thread's receiver ([`super::receive_command`]) takes a
+    /// command that arrives long after its poll has ended, parked meanwhile
+    /// (its thread's CPU time over a wait far longer than the poll stays
+    /// near the poll's), and every command sent before the sender's end
+    /// before it reports the end.
+    #[test]
+    fn the_command_receiver_parks_and_takes_every_command_before_the_end() {
+        let thread_cpu = || {
+            let stat = std::fs::read_to_string("/proc/thread-self/schedstat")
+                .expect("the thread's schedstat");
+            let ns = stat.split_whitespace().next().expect("its run time");
+            std::time::Duration::from_nanos(ns.parse().expect("a count of ns"))
+        };
+        let idle = std::time::Duration::from_millis(200);
+        let (tx, cmds) = mpsc::channel::<Cmd>();
+        let (done, ended) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let before = thread_cpu();
+            let mut taken = 0usize;
+            while let Ok(cmd) = super::receive_command(&cmds) {
+                assert!(matches!(cmd, Cmd::Reset), "the commands as sent");
+                taken += 1;
+            }
+            done.send((taken, thread_cpu() - before))
+                .expect("the test waits");
+        });
+        tx.send(Cmd::Reset).expect("the receiver runs");
+        std::thread::sleep(idle);
+        tx.send(Cmd::Reset).expect("the receiver runs");
+        tx.send(Cmd::Reset).expect("the receiver runs");
+        drop(tx);
+        let (taken, cpu) = ended
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the receiver reports the end");
+        worker.join().expect("the receiver thread");
+        assert_eq!(taken, 3, "every command before the end");
+        assert!(
+            cpu < idle / 4,
+            "the receiver parked through the wait: {cpu:?} of CPU over {idle:?}"
+        );
     }
 
     /// A round of several slots is one command whose reply sets each row's
