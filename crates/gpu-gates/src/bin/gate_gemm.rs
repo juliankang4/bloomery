@@ -8923,6 +8923,7 @@ mod gate {
                 (16usize, 14usize, 128usize, Native::Pattern),
                 (128, 73, 64, Native::Pattern),
                 (144, 129, 256, Native::Pattern),
+                (128, 129, 256, Native::Pattern),
                 (48, 73, 64, Native::OneHot),
                 (16, 14, 20_480, Native::Pattern),
                 (16, 14, 64, Native::Tiny),
