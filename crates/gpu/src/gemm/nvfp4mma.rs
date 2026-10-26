@@ -335,9 +335,53 @@ const S_HALF: usize = TILE_ROWS + 64;
 const S_STAGE: usize = HALVES * S_HALF;
 /// The K walk's shared stages: a step's planes land two steps ahead.
 const STAGES: usize = 3;
+/// u32 words of a route tile's [`TileColumns`]: each of its 64 columns' slot,
+/// then its input scale's bits.
+const COLUMN_WORDS: usize = 2 * 64;
 const _: () = assert!(
-    STAGES * (W_STAGE + B_STAGE + S_STAGE) * 4 <= 48 * 1024 && 64 * PAIR_PITCH <= STAGES * W_STAGE
+    (STAGES * (W_STAGE + B_STAGE + S_STAGE) + COLUMN_WORDS) * 4 <= 48 * 1024
+        && 64 * PAIR_PITCH <= STAGES * W_STAGE
 );
+
+/// A route tile's column slots and input scales in the block's
+/// [`COLUMN_WORDS`] shared words. The thread that copies column `sr < 64`
+/// (half 0 of shared row `sr`) writes its two before the K walk, whose
+/// first barrier publishes them, so the epilogue reads them without waiting
+/// on a global load; a dead column holds its tile's last live column's.
+#[derive(Clone, Copy)]
+struct TileColumns(*mut u32);
+
+impl TileColumns {
+    /// Column `sr`'s slot `slot` and input scale `ag[col]`, by half 0 of
+    /// shared row `sr < 64`.
+    ///
+    /// # Safety
+    /// `self` is the block's [`COLUMN_WORDS`] shared words, which no thread
+    /// reads before the walk's first barrier.
+    #[inline(always)]
+    unsafe fn put(self, (sr, half): (usize, usize), slot: usize, ag: &[f32], col: usize) {
+        if sr < 64 && half == 0 {
+            let scale = ag[col].to_bits();
+            // SAFETY: sr < 64, this thread's own slot word.
+            unsafe { *self.0.add(sr) = slot as u32 };
+            // SAFETY: 64 + sr < COLUMN_WORDS, this thread's own scale word.
+            unsafe { *self.0.add(64 + sr) = scale };
+        }
+    }
+
+    /// Column `c`'s slot and input scale.
+    ///
+    /// # Safety
+    /// `c < 64`, after the walk's first barrier.
+    #[inline(always)]
+    unsafe fn get(self, c: usize) -> (usize, f32) {
+        // SAFETY: c < 64, a slot word the barrier published.
+        let slot = unsafe { *self.0.add(c) } as usize;
+        // SAFETY: 64 + c < COLUMN_WORDS, its scale word.
+        let scale = f32::from_bits(unsafe { *self.0.add(64 + c) });
+        (slot, scale)
+    }
+}
 
 /// The u32 word where 16-byte chunk `q` of a stage row starts, half `q / 2`'s
 /// chunk `q % 2`. The chunk number is XORed with bit 1 of the row index (onto
@@ -1062,12 +1106,16 @@ mod native {
             cuda_device::SharedArray::UNINIT;
         static mut S: cuda_device::SharedArray<u32, { STAGES * S_STAGE }, 16> =
             cuda_device::SharedArray::UNINIT;
+        static mut C: cuda_device::SharedArray<u32, COLUMN_WORDS, 16> =
+            cuda_device::SharedArray::UNINIT;
         // SAFETY: W is this block's shared weight allocation.
         let wp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W) };
         // SAFETY: B is this block's shared activation allocation.
         let bp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B) };
         // SAFETY: S is this block's shared scale allocation.
         let sp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S) };
+        // SAFETY: C is this block's shared column allocation.
+        let columns = TileColumns(unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut C) });
         let row = rt * TILE_ROWS + 16 * (tid / 32);
         let g = lane / 4;
         let t = lane & 3;
@@ -1081,6 +1129,8 @@ mod native {
         } else {
             source / slot_div as usize
         };
+        // SAFETY: the block's column words, before the walk.
+        unsafe { columns.put((sr, half), source, ag, col) };
         let mut acc = [0.0f32; 32];
         // An even K walk over whole row tiles runs without the walk's and the
         // fragments' checks: a tile of fewer than 64 columns also runs its
@@ -1150,25 +1200,15 @@ mod native {
         }
         let weight_scale = ws[expert];
         // The lane's sixteen columns, fragment n's column j at i = 2n + j: their
-        // slots and input scales are all read before the first store, so the
-        // loads overlap instead of each waiting behind the last column's.
+        // slots and input scales are all read before the first store.
         let column_of = |i: usize| 8 * (i / 2) + 2 * t + (i & 1);
         let mut slot = [0usize; 16];
-        #[unroll]
-        for i in 0..16 {
-            if column_of(i) < len {
-                slot[i] = cols[start + column_of(i)] as usize;
-            }
-        }
         let mut input_scale = [0.0f32; 16];
         #[unroll]
         for i in 0..16 {
             if column_of(i) < len {
-                input_scale[i] = ag[if slot_div == 1 {
-                    slot[i]
-                } else {
-                    slot[i] / slot_div as usize
-                }];
+                // SAFETY: column_of(i) < len <= 64, after the walk's barriers.
+                (slot[i], input_scale[i]) = unsafe { columns.get(column_of(i)) };
             }
         }
         #[unroll]
@@ -1254,12 +1294,16 @@ mod native {
             cuda_device::SharedArray::UNINIT;
         static mut S: cuda_device::SharedArray<u32, { STAGES * S_STAGE }, 16> =
             cuda_device::SharedArray::UNINIT;
+        static mut C: cuda_device::SharedArray<u32, COLUMN_WORDS, 16> =
+            cuda_device::SharedArray::UNINIT;
         // SAFETY: W is this block's shared weight allocation.
         let wp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W) };
         // SAFETY: B is this block's shared activation allocation.
         let bp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B) };
         // SAFETY: S is this block's shared scale allocation.
         let sp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S) };
+        // SAFETY: C is this block's shared column allocation.
+        let columns = TileColumns(unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut C) });
         // The SwiGLU tile reuses W once every warp has finished the walk.
         let vp = wp.cast::<f32>();
         let wi = tid / 32;
@@ -1278,6 +1322,9 @@ mod native {
         } else {
             source / slot_div as usize
         };
+        // SAFETY: the block's column words, before the walk.
+        unsafe { columns.put((sr, half), source, ag, col) };
+        let (gate_scale, up_scale) = (gw[expert], uw[expert]);
         let mut gacc = [0.0f32; 16];
         let mut uacc = [0.0f32; 16];
         // An even K walk runs without the walk's and the fragments' checks: a
@@ -1375,27 +1422,15 @@ mod native {
             walk!(false);
         }
         thread::sync_threads();
-        let (gate_scale, up_scale) = (gw[expert], uw[expert]);
         // The lane's eight columns, fragment n's column j & 1 at i = 2n + (j & 1):
-        // their input scales are all read before the first store, so the loads
-        // overlap instead of each waiting behind the last column's.
+        // their input scales are all read before the first store.
         let column_of = |i: usize| (4 * wc + i / 2) * 8 + 2 * t + (i & 1);
-        let mut slot = [0usize; 8];
-        #[unroll]
-        for i in 0..8 {
-            if column_of(i) < len {
-                slot[i] = cols[start + column_of(i)] as usize;
-            }
-        }
         let mut input_scale = [0.0f32; 8];
         #[unroll]
         for i in 0..8 {
             if column_of(i) < len {
-                input_scale[i] = ag[if slot_div == 1 {
-                    slot[i]
-                } else {
-                    slot[i] / slot_div as usize
-                }];
+                // SAFETY: column_of(i) < len <= 64, after the walk's barriers.
+                input_scale[i] = unsafe { columns.get(column_of(i)) }.1;
             }
         }
         #[unroll]
@@ -1436,8 +1471,8 @@ mod native {
         let mut item = 4 * wi + (lane >> 3);
         while item - (lane >> 3) < 2 * 64 {
             let (c, blk) = (item / 2, item & 1);
-            // Read ahead of the quantization, whose shuffles cover the load.
-            let slot = (c < len).then(|| cols[start + c] as usize);
+            // SAFETY: c < len <= 64, after the walk's barriers.
+            let slot = (c < len).then(|| unsafe { columns.get(c) }.0);
             let v = if c < len {
                 // SAFETY: the barrier published this live column's aligned quad.
                 unsafe {
