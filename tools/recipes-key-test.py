@@ -702,6 +702,45 @@ raise SystemExit(module.main(["key", "--manifest", sys.argv[2], "--ledger", sys.
                     ws.assert_status(ws.keys("gate-called", "gate-linked", ledger=True),
                                      {"gate-called": "run", "gate-linked": "skip"})
 
+    def test_repeated_key_validation_reuses_stable_source_hashes(self):
+        ws = Workspace(self, runtime_files())
+        driver = r'''
+import builtins
+import importlib.util
+import os
+from pathlib import Path
+import sys
+from unittest.mock import patch
+sys.path.insert(0, str(Path.cwd() / "tools"))
+spec = importlib.util.spec_from_file_location("loaded_recipes", "tools/recipes.py")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.HashCache.RACY_NS = 0
+side = module.make_side(str(Path.cwd()))
+context = module.KeyContext(side, sys.argv[1])
+before, error, _, _ = context.parts("gate-called")
+assert before and error is None, error
+source = Path.cwd() / "crates/dep/src/used.rs"
+original = source.read_bytes()
+state = source.stat()
+read = builtins.open
+reads = []
+def counted(path, *args, **kwargs):
+    if str(path) == str(source):
+        reads.append(path)
+    return read(path, *args, **kwargs)
+with patch.object(builtins, "open", counted):
+    side.graph.key_inputs("gate-called")
+assert not reads, f"unchanged source rehashed during repeated key validation: {len(reads)} reads"
+source.write_bytes(original.replace(b"used1", b"used2"))
+os.utime(source, ns=(state.st_atime_ns, state.st_mtime_ns))
+after, error, _, _ = context.parts("gate-called")
+assert after and error is None and after != before, error
+print("stable source hash reused; same-size/mtime edit invalidated its consumer")
+'''
+        ws.run(sys.executable, "-c", driver, str(ws.manifest))
+
     def test_analysis_code_edited_after_import_never_emits_a_skippable_key(self):
         for relative in ("tools/recipes.py", "tools/bloomery/reach_cache.py", "tools/bloomery/fixture_dirs.py"):
             with self.subTest(analysis=relative):
