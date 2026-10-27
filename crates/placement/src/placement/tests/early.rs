@@ -149,9 +149,9 @@ fn a_unified_pool_lowers_the_card_budget_to_the_tiers_floor() {
             }],
         }
     };
-    let floor = |short: u64| PlacementError::HostRoomFloor {
-        room: ROOM,
-        floor: ROOM + short,
+    let floor = |room: u64, short: u64| PlacementError::HostRoomFloor {
+        room,
+        floor: room + short,
         base: 0,
         layer: 0,
         need: 0,
@@ -162,6 +162,7 @@ fn a_unified_pool_lowers_the_card_budget_to_the_tiers_floor() {
     // under `other_at`.
     let run = |m: &Machine, levers: &PlanLevers, short: &dyn Fn(u64) -> u64, other_at: u64| {
         let mut calls = Vec::new();
+        let full = capped(&m.cards[0], levers.card_budget_bytes.every());
         let got = plan_in_pool(m, levers, |l| {
             let budget = capped(&m.cards[0], l.card_budget_bytes.every());
             calls.push(l.card_budget_bytes.every());
@@ -170,7 +171,7 @@ fn a_unified_pool_lowers_the_card_budget_to_the_tiers_floor() {
             }
             match short(budget) {
                 0 => Ok(budget_plan(&model, m, budget)),
-                s => Err(floor(s)),
+                s => Err(floor(ROOM + full - budget, s)),
             }
         });
         (
@@ -233,25 +234,50 @@ fn a_unified_pool_lowers_the_card_budget_to_the_tiers_floor() {
             rounds,
             budget,
             last,
-        }) => (rounds, budget, *last),
+            room,
+            floor,
+        }) => (rounds, budget, *last, room, floor),
         other => panic!("not refused by name: {other:?}"),
     };
-    let (rounds, budget, last) = pooled(run(&on, &unset, &|_| 1 << 30, full - (1 << 30)).0);
+    let (rounds, budget, last, room, first_floor) =
+        pooled(run(&on, &unset, &|_| 1 << 30, full - (1 << 30)).0);
     assert_eq!((rounds, budget), (1, full - (1 << 30)));
+    assert_eq!((room, first_floor), (ROOM, ROOM + (1 << 30)));
     assert!(matches!(last, PlacementError::HostRoom(_)));
-    let (rounds, budget, last) = pooled(run(&on, &unset, &|b| b / 2 + 1, 0).0);
+    let (rounds, budget, last, room, first_floor) = pooled(run(&on, &unset, &|b| b / 2 + 1, 0).0);
     assert!(rounds > 1 && budget < full, "{rounds} {budget}");
-    assert!(matches!(last, PlacementError::HostRoomFloor { .. }));
+    assert_eq!((room, first_floor), (ROOM, ROOM + full / 2 + 1));
+    assert!(matches!(last,
+        PlacementError::HostRoomFloor { room: last_room, floor, .. }
+            if last_room > room && floor != first_floor
+    ));
     let (got, calls) = run(&on, &unset, &|_| 1, 0);
-    let (rounds, budget, last) = pooled(got);
+    let (rounds, budget, last, room, first_floor) = pooled(got);
     assert_eq!(rounds, POOL_ROUNDS);
     assert_eq!(budget, full - u64::from(POOL_ROUNDS) * granule);
     assert_eq!(calls.len(), 1 + POOL_ROUNDS as usize);
+    assert_eq!((room, first_floor), (ROOM, ROOM + 1));
     assert!(matches!(last, PlacementError::HostRoomFloor { .. }));
+    let (got, calls) = run(&on, &unset, &|b| b / 128 + 1, 0);
+    let (rounds, budget, last, room, first_floor) = pooled(got);
+    assert_eq!(rounds, POOL_ROUNDS);
+    assert_eq!(calls.len(), 1 + POOL_ROUNDS as usize);
+    assert_eq!((room, first_floor), (ROOM, ROOM + full / 128 + 1));
+    let mut want = full;
+    for _ in 0..POOL_ROUNDS {
+        want -= (want / 128 + 1).max(granule);
+    }
+    assert_eq!(budget, want);
+    assert!(matches!(last,
+        PlacementError::HostRoomFloor { room: last_room, floor, .. }
+            if last_room > room && floor != first_floor
+    ));
     let text = PlacementError::PoolBudget {
         rounds,
         budget,
         last: Box::new(last),
+        room,
+        floor: first_floor,
     }
     .to_string();
     assert!(text.contains("lowered 64 times"), "{text}");

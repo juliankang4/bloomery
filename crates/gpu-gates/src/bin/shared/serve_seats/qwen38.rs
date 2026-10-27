@@ -67,8 +67,8 @@
 //! a total a slot's share of which passes the limit is refused by name, and
 //! one whose N-slot plan the machine cannot hold is refused with the largest
 //! share it holds, before the load. Unset, a slot asks the target (256K under
-//! the limit) and halves while the plan is short of the card, down to the
-//! floor. An unset MTP draft yields to the context: when the drafted plan
+//! the limit) and halves while the plan is short of the card or of the unified
+//! pool the card shares with the host, down to the floor. An unset MTP draft yields to the context: when the drafted plan
 //! halves the context or holds not even the floor and the plain plan holds
 //! more, the draft goes off and a `draft yield` record names both. The
 //! prompt cache's budget never lowers the context: the `cache` line names

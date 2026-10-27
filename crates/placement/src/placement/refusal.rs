@@ -87,7 +87,8 @@ pub enum PlacementError {
     /// A unified machine's plan the NVMe expert tier's floor refused at the
     /// cards' full share, planned again under lowered card budgets
     /// ([`plan_in_pool`]) and refused at the last: the rounds, the last
-    /// budget and the last refusal.
+    /// budget and the last refusal, and the host room and the floor of the
+    /// first refusal.
     #[error(
         "on a unified pool the cards' share was lowered {rounds} times, to a card budget of \
          {budget} B, and the plan is still refused: {last}"
@@ -96,6 +97,8 @@ pub enum PlacementError {
         rounds: u32,
         budget: u64,
         last: Box<PlacementError>,
+        room: u64,
+        floor: u64,
     },
     /// An arena the lever `BLOOMERY_NVTIER_BYTES` names under the arena's
     /// floor ([`ArenaFloor`]): a call would name more distinct ids of a
