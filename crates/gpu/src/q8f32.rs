@@ -1419,6 +1419,153 @@ unsafe fn blocks_lane_partials_m<F: ByteBlocks>(
     })
 }
 
+/// The columns [`blocks_gemv_mcol_staged`] takes. Fewer columns keep
+/// [`blocks_lane_partials_mcol`]'s walk, which is as fast there on GB10.
+pub(crate) const STAGED_COLS: usize = 4;
+
+/// Quads of one stage of [`blocks_gemv_mcol_staged`]: one step's 128 values
+/// of each of its [`STAGED_COLS`] columns.
+const STAGE_QUADS: usize = STAGED_COLS * Q8_STEP / 4;
+
+/// Shared f32 values of [`blocks_gemv_mcol_staged`]'s two stages.
+pub(crate) const STAGED_SHARED: usize = 2 * 4 * STAGE_QUADS;
+
+/// The [`STAGED_COLS`]-column byte-plane gemv of a block of eight rows,
+/// warp `w` of block `b` owning row `8b + w`, with each step's activations
+/// read once a block into shared memory instead of once a row:
+/// [`blocks_lane_partials_mcol`]'s walk at `M` = [`STAGED_COLS`]. Before step
+/// `j`'s dots stage `j % 2` holds step `j`'s 128 values of every column.
+/// Thread `32c + q`, `c < M`, loads quad `q` of column `c` of step `j + 1`
+/// before the dots and stores it into the other stage after them, and one
+/// barrier a step orders those stores before step `j + 1`'s reads and step
+/// `j`'s reads before the stage is refilled. Each lane hoists
+/// [`Q8_STEP_UNROLL`] steps' code words as the unstaged walk does. Column
+/// c's word dots are the m = 1 walk's on column c, term for term and in the
+/// same order, so its sum is that walk's bit for bit; lane 0 stores it at
+/// `y[row · y_row + c · y_col]`.
+///
+/// # Safety
+///
+/// Every thread of the 256-wide block calls it converged; `sh` is the
+/// block's own [`STAGED_SHARED`] shared values, 16-byte aligned; `qs` holds
+/// `n_rows · k/4` words and `d` the scales of `n_rows · k/32` blocks; `k` a
+/// positive multiple of 512; `x` holds `M · k` values from a 16-byte aligned
+/// base; every `row · y_row + c · y_col` for `row < n_rows`, `c < M` inside
+/// `y`, no two the same.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+unsafe fn blocks_gemv_mcol_staged<F: ByteBlocks>(
+    qs: &[u32],
+    d: &[F::Scale],
+    x: &[f32],
+    n_rows: u32,
+    k: u32,
+    y_row: u32,
+    y_col: u32,
+    y: &mut DisjointSlice<f32>,
+    sh: *mut F32x4,
+) {
+    const M: usize = STAGED_COLS;
+    let k = k as usize;
+    let steps = k / Q8_STEP;
+    let tid = thread::threadIdx_x() as usize;
+    let lane = warp::lane_id() as usize;
+    let row = thread::blockIdx_x() as usize * 8 + tid / 32;
+    // Warp-uniform: a warp past the last row loads and waits with the block
+    // but walks no row.
+    let live = row < n_rows as usize;
+    let wq = row * (k >> 2) + lane;
+    let wd = row * (k >> 5) + (lane >> 3);
+    // SAFETY: x.len() >= M·k by this fn's contract.
+    let xs = unsafe { x.get_unchecked(0..M * k) };
+    // The base is 16-byte aligned and M·k a multiple of 4 by this fn's
+    // contract, so the view exists.
+    let Some(xq) = as_vectors::<F32x4>(xs) else {
+        return;
+    };
+    // Thread 32c + q, c < M, loads quad q of column c: step j's at src + 32j.
+    let loads = tid < 32 * M;
+    let src = (tid / 32) * (k >> 2) + tid % 32;
+    if loads {
+        // SAFETY: quad q < 32 of column c < M's step 0 is inside xq's M·k/4
+        // quads.
+        let first = unsafe { *xq.get_unchecked(src) };
+        // SAFETY: slot tid < 32·M of stage 0 is inside the block's stage.
+        unsafe { *sh.add(tid) = first };
+    }
+    thread::sync_threads();
+    let (mut f0, mut f1, mut f2, mut f3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    // Column $c's dot of the word against its quad of the stage at slot $at.
+    macro_rules! col {
+        ($f:ident, $c:literal, $q:ident, $dv:ident, $at:ident) => {
+            // SAFETY: slot $at + 32·$c of the step's stage is inside the
+            // block's stage; the barrier before the step ordered its store.
+            $f = word_dot::<F>($f, $q, $dv, unsafe { *sh.add($at + 32 * $c) });
+        };
+    }
+    let mut s = 0usize;
+    while s < steps {
+        macro_rules! code {
+            ($i:literal) => {
+                if live {
+                    // SAFETY: s + $i < steps, since steps is a multiple of
+                    // four: word 32(s + $i) + lane of the live row is below
+                    // k/4, block_code's bound.
+                    unsafe { block_code::<F>(qs, d, wq, wd, s + $i) }
+                } else {
+                    (0, 0.0)
+                }
+            };
+        }
+        let (w0, w1, w2, w3) = (code!(0), code!(1), code!(2), code!(3));
+        macro_rules! step {
+            ($i:literal, $w:ident) => {
+                let j = s + $i;
+                let more = loads && j + 1 < steps;
+                let next = if more {
+                    // SAFETY: step j + 1 < steps, so quad src + 32(j + 1) is
+                    // inside column c's k/4 quads, inside xq.
+                    unsafe { *xq.get_unchecked(src + 32 * (j + 1)) }
+                } else {
+                    F32x4::new([0.0; 4])
+                };
+                if live {
+                    let (q, dv) = $w;
+                    let at = (j & 1) * STAGE_QUADS + lane;
+                    col!(f0, 0, q, dv, at);
+                    col!(f1, 1, q, dv, at);
+                    col!(f2, 2, q, dv, at);
+                    col!(f3, 3, q, dv, at);
+                }
+                if more {
+                    // SAFETY: slot tid < 32·M of stage (j + 1) % 2 is inside
+                    // the block's stage; the barrier after step j - 1 ordered
+                    // its last reads.
+                    unsafe { *sh.add(((j + 1) & 1) * STAGE_QUADS + tid) = next };
+                }
+                thread::sync_threads();
+            };
+        }
+        step!(0, w0);
+        step!(1, w1);
+        step!(2, w2);
+        step!(3, w3);
+        s += Q8_STEP_UNROLL;
+    }
+    if !live {
+        return;
+    }
+    let sums = gemv_lane_sums([f0, f1, f2, f3, 0.0, 0.0, 0.0, 0.0], M as u32);
+    if lane == 0 {
+        // SAFETY: row < n_rows, so this row's M slots are inside y by this
+        // fn's contract; lane 0 of the row's warp alone writes them.
+        unsafe { store_sums(y, row * y_row as usize, y_col as usize, M, &sums) };
+    }
+}
+
 /// # Safety
 /// The caller validates both planes for F, ids for n_rows, x for k*m,
 /// and y for n_rows*m. k is positive and m is in 1..=8.
@@ -2095,6 +2242,52 @@ mod q8f32_kernels {
                 );
             }
         }
+    }
+
+    /// `mxfp8_gemv_mcol` for [`STAGED_COLS`] columns and `k` a multiple of
+    /// 512, each step's activations read once a block into shared memory
+    /// ([`blocks_gemv_mcol_staged`]): column c of `y` is bit for bit
+    /// `mxfp8_gemv`'s `m = 1` output on column c, row r's column c at
+    /// `y[r*y_row + c*y_col]`.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_rows * k,
+            128 * e.len() >= n_rows * k,
+            x.len() >= 4 * k,
+            y.len() >= n_rows * 4
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn mxfp8_gemv_mcol_staged(
+        qs: &[u32],
+        e: &[u32],
+        x: &[f32],
+        n_rows: u32,
+        k: u32,
+        y_row: u32,
+        y_col: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut STAGE: SharedArray<f32, STAGED_SHARED, 16> = SharedArray::UNINIT;
+        // SAFETY: STAGE is this block's own shared allocation of
+        // STAGED_SHARED values, 16-byte aligned; the raw form reaches the
+        // `static mut` without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) }.cast::<F32x4>();
+        // SAFETY: every thread of the 256-wide block calls it converged over
+        // the launcher's ceil(n_rows / 8) blocks; the launch contract bounds
+        // qs, e, x and y at STAGED_COLS columns; the launcher passes x from
+        // a 16-byte aligned base and k a multiple of 512, and its row-major
+        // or token-major strides keep every row's slots apart.
+        unsafe {
+            blocks_gemv_mcol_staged::<Mxfp8Bytes>(qs, e, x, n_rows, k, y_row, y_col, &mut y, sh)
+        };
     }
 
     /// `mxfp8_gemv` for an FP8_B128 weight in its two planes (module doc):
@@ -3000,9 +3193,11 @@ impl Q8F32Kernels {
     /// 4 · qs.cols()` values each, with the layout selected by `out`.
     /// `m = 1` runs `mxfp8_gemv` or `fp8_b128_gemv` as
     /// its scales say, `m > 1` the `_mcol` entry, whose column c is the
-    /// `m = 1` launch of column c bit for bit. `k` must be a multiple of 128
-    /// and `e` `k / 128` words a row over the same rows; another geometry is
-    /// a named error. Asynchronous, allocation-free, capturable.
+    /// `m = 1` launch of column c bit for bit; an MXFP8 weight at `m =`
+    /// [`STAGED_COLS`] with `k` a multiple of 512 and `x` from a 16-byte
+    /// aligned base runs `mxfp8_gemv_mcol_staged`, the same bits. `k` must be
+    /// a multiple of 128 and `e` `k / 128` words a row over the same rows;
+    /// another geometry is a named error. Asynchronous, allocation-free, capturable.
     pub fn enqueue_e4m3_gemv(
         &self,
         stream: &CudaStream,
@@ -3036,6 +3231,15 @@ impl Q8F32Kernels {
             GemvOut::TokenMajor => (1, n_rows),
         };
         match w.scales {
+            E4m3Scales::Mxfp8
+                if m as usize == STAGED_COLS
+                    && k.is_multiple_of(512)
+                    && x.cu_deviceptr().is_multiple_of(16) =>
+            {
+                let prep = module.prepare_mxfp8_gemv_mcol_staged(cfg)?;
+                module
+                    .mxfp8_gemv_mcol_staged(stream, &prep, qs, e, x, n_rows, k, y_row, y_col, y)?;
+            }
             E4m3Scales::Mxfp8 => {
                 let prep = module.prepare_mxfp8_gemv_mcol(cfg)?;
                 module.mxfp8_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y_row, y_col, y)?;

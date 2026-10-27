@@ -313,6 +313,8 @@ generate_ds41   mxfp8_gemv                               0           0
 # PIN(2026-10-26): spill 28 -> 60 B, cc 12.1 JIT local unchanged at 0 B (sm_86 ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
 generate_ds41   mxfp8_gemv_ids                          60           0
 generate_ds41   mxfp8_gemv_mcol                          0           0
+# PIN(2026-10-27): mxfp8_gemv_mcol_staged, a new entry, at the sm_121a GB10 scan's 0 spill and 0 JIT local bytes.
+generate_ds41   mxfp8_gemv_mcol_staged                   0           0
 generate_ds41   mxfp8_mma_gemm                           0           0
 generate_ds41   mxfp8_tile_gemm                          0           0
 generate_ds41   neox_append_k192                         0           0

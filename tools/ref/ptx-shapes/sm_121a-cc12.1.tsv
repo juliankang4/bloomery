@@ -317,6 +317,8 @@ generate_ds41 mxfp8_cols 0 0
 generate_ds41 mxfp8_gemv 0 0
 generate_ds41 mxfp8_gemv_ids 0 0
 generate_ds41 mxfp8_gemv_mcol 0 0
+# PIN(2026-10-27): mxfp8_gemv_mcol_staged, a new entry: 0 spill and 0 JIT local bytes (sm_121a ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill).
+generate_ds41 mxfp8_gemv_mcol_staged 0 0
 generate_ds41 mxfp8_mma_gemm 0 0
 generate_ds41 mxfp8_tile_gemm 0 0
 generate_ds41 mxfp8_w8a8_gemm 0 0
