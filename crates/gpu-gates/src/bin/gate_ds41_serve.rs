@@ -90,7 +90,7 @@
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. A server with no `--ctx` (`<dir>/ctx-default`, one slot)
-//! prints its one `ctx` line before its load: the seats' ladder, its word
+//! prints its one `ctx` line before its load: the seats' fit, its word
 //! held against this gate's own plans (`ctx_default_is_the_highest_rung_held`,
 //! [`ctx_default`]). A server asked for [`SLOTS_OVER`] slots of [`GATE_CTX`]
 //! each (`<dir>/slots-over`, `--ctx` their total), whose plan counts that many
@@ -182,10 +182,10 @@
 //! - a `--plan` run of [`BP_SERVER_ARGS`] without `--ctx`, with `--mmproj
 //!   <the vision set's encoder file>` and `BLOOMERY_RESIDENCY=off`: it prints
 //!   its `ctx` line and exits before the load. The line names the
-//!   encoder's reserve when that reserve lowers the rung
+//!   encoder's reserve when that reserve lowers the context
 //!   (`mmproj_a_dropped_rung_names_the_reserve`,
 //!   [`ctx_ladder::reserve_named`] against this gate's own `ctx_choice` with
-//!   the reserve and without it). The same rung adds nothing. Mutant: the
+//!   the reserve and without it). The same context adds nothing. Mutant: the
 //!   seat's `ctx` line omits the reserve sentence (this check);
 //! - the server of [`SERVER_ARGS`] with `--mmproj <the vision set's encoder
 //!   file>` (the one `gate-gpu-vision` and `gate-gpu-ds41-media` load): (a)
@@ -308,7 +308,7 @@ mod gate {
 
     use bloomery_gpu_gates::beside::Beside;
     use bloomery_gpu_gates::bind::nvidia_smi_index;
-    use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, rung_above};
+    use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
@@ -358,7 +358,7 @@ mod gate {
     ];
     /// The context a slot of every server here takes, named: the clauses
     /// count on `workstation::CTX_MAX` positions, and an unset `--ctx` is the
-    /// seats' ladder ([`ctx_default`]).
+    /// seats' fit ([`ctx_default`]).
     const GATE_CTX: &str = "32768";
     const _: () = assert!(workstation::CTX_MAX == 32_768);
     /// The server's arguments under `--place bp`, the plain engine pinned as
@@ -1299,8 +1299,8 @@ mod gate {
     /// model's limit (the trained context within [`KERNEL_POSITIONS`];
     /// `ctx_ladder::default_line_held`), and this gate's own one-slot plans
     /// at the server's free card bytes agree: the card holds the default, and
-    /// not the rung above it when it halved. Mutants: a ladder that starts a
-    /// rung low (the rung above holds); a default of two slots (the line
+    /// not the step above it when it fitted. Mutants: a default that starts a
+    /// step low (the step above holds); a default of two slots (the line
     /// names two).
     fn ctx_default(a: &Args, levers: &PlanLevers) -> Result<bool, GateError> {
         let dir = a.dir.join("ctx-default");
@@ -1346,10 +1346,10 @@ mod gate {
             Ok(inputs.plan(&machine, c, levers).is_ok())
         };
         let ctx = ctx_ladder::field(&line, "ctx").ok_or("the `ctx` line names no ctx")?;
-        let above = rung_above(limit.0, ctx);
+        let above = step_above(limit.0, ctx);
         let (at_ctx, at_above) = (at(ctx)?, above.map(at).transpose()?);
         println!(
-            "ctx: the gate's plans: at {ctx} {at_ctx}, at the rung above {above:?} {at_above:?}; \
+            "ctx: the gate's plans: at {ctx} {at_ctx}, at the step above {above:?} {at_above:?}; \
              the limit {limit:?}"
         );
         let mut ok = true;
@@ -1914,7 +1914,7 @@ mod gate {
     /// An unset `--ctx` under `--place bp` with the encoder (module header):
     /// a `--plan` run ([`plan_run`]), which prints the `ctx` line and exits
     /// before the load. The line names the reserve when this gate's own
-    /// `ctx_choice` (the seat's) gives a lower rung with the reserve than
+    /// `ctx_choice` (the seat's) gives a smaller context with the reserve than
     /// without it, and only then.
     /// Mutant: the seat's `ctx` line omits the reserve sentence (this check).
     fn ctx_reserve_names_the_drop(

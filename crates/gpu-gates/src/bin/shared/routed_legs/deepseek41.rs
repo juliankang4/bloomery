@@ -8,7 +8,7 @@
 //! `PlanInputs::plan` for one sequence at `workstation::CTX_MAX` positions
 //! (`Open::plan`); the seat's is `PlanInputs::plan_with_slots` for its
 //! default slots at the context its unset `--ctx` takes
-//! (`ds41_place::ctx_choice`, the seats' ladder), on a machine whose
+//! (`ds41_place::ctx_choice`, the seats' fit), on a machine whose
 //! checkpoint reserve is none (V4.1's body makes no checkpoints). The forced
 //! rooms go through the same call at the arm's context and slots.
 //!

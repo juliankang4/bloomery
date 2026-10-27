@@ -27,7 +27,7 @@
 //! the V4.1 and qwen3 seats serve, each one file a seat's per-model binary
 //! includes beside the seat. The seats' shared `--ctx` rules are one owner:
 //! the context an unset or set `--ctx` serves is `generate::choose_ctx` over
-//! `placement::ctx_ask::choose` (the ladder), and a set value's bound and the
+//! `placement::ctx_ask::choose` (the fit), and a set value's bound and the
 //! slot count it buys (one slot at the whole context while `--parallel` names
 //! none) are `placement::ctx`.
 

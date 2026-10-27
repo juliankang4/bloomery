@@ -70,9 +70,9 @@
 //! it is one request's context. The context comes first and the plan fills
 //! the machine around it (`generate::choose_ctx`, every seat's): a set share
 //! past the file's trained context stops by name, and a share the machine
-//! cannot hold stops with the largest it would hold. Unset, a slot asks
-//! 262,144 positions or the trained context where that is less, halved while
-//! the card cannot hold the stores and resident bytes, or while the host
+//! cannot hold stops with the largest it would hold. Unset, a slot asks the
+//! trained context and takes the largest context under it whose plan holds
+//! where the card cannot hold the stores and resident bytes, or the host
 //! cannot hold the routed experts the card then leaves it: the plan reads the
 //! host room (`BLOOMERY_HOST_ROOM` replaces the reading) and the body serves
 //! no NVMe expert tier (`PlaceError::NoNvmeTier`), so a shorter context, which
@@ -80,7 +80,7 @@
 //!
 //! The records on stderr, in order: `place unset` (word and why), one `ctx`
 //! line (`placement::ctx_ask::Chosen::line`: the rule — `set`, `target` or
-//! `halved`, with the memory a halving was short of —, a slot's context, the
+//! `fitted`, with the memory the context one step above was short of —, a slot's context, the
 //! slots, the total and the model's limit), the `plan`
 //! record (its `ctx_max` a slot's), the `cache` line (`bind::CacheRam::line`),
 //! the `parallel` line (`rule=slots

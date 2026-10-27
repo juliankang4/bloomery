@@ -304,14 +304,14 @@
 //! and the sampled rounds' one (above).
 //!
 //! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default's
-//!   one `ctx` line before its load (stopped there): the seats' ladder at
-//!   one slot, its word held against this gate's own plans (the default
-//!   held, the rung above not when it halved); one with `--ctx-size` set and
+//!   one `ctx` line before its load (stopped there): the seats' fit at one
+//!   slot, its word held against this gate's own plans (the default held,
+//!   the step above not when it fitted); one with `--ctx-size` set and
 //!   no `--parallel` takes one slot at the whole flag (`from=ctx` on its
 //!   `parallel` line, and the one-request note on stderr), and one asked a
 //!   position past the one-slot fit is refused by name before it listens
 //!   (with the share the card holds, or by the limit when the card holds
-//!   more). The ladder's own terms are held by
+//!   more). The fit's own terms are held by
 //!   `bloomery_placement::placement::ctx_ask`'s tests; these servers hold
 //!   the seat's composition and its lines;
 //! - `paged` ([`paged`], deferred by name in the fixture tier: its rooms
@@ -329,8 +329,8 @@
 //!   at 40 GiB, where the tier pages experts with no arena, `--parallel 2`
 //!   serves its two slots (`unpaged_parallel_serves_as_asked`). The small
 //!   card's case last: a server with no `--place` (the box pin's one card,
-//!   `a`) under the budget whose drafted one-slot plan halves to a rung the
-//!   plain plan holds more than, at 27 GiB — the unset draft yields to the
+//!   `a`) under the budget whose drafted one-slot plan fits a context the
+//!   plain plan holds twice of, at 27 GiB — the unset draft yields to the
 //!   context on that plan (`paged_small_card_yields_on_one_card`, the
 //!   premise), and the load runs the plain plan the yield was judged on, its
 //!   `load draft=off` record naming the yield
@@ -514,7 +514,7 @@ mod gate {
         Body38, CHECKPOINT_EVERY, checkpoint_budget38, seq38_bytes,
     };
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
-    use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, rung_above};
+    use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
         LookupCompletion, PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore,
@@ -3581,11 +3581,11 @@ mod gate {
     /// line holds its word under the model's limit (the trained context
     /// within `place::KERNEL_POSITIONS`; `ctx_ladder::default_line_held`),
     /// and this gate's own one-slot plans at the card's free bytes agree: the
-    /// card holds the default, and not the rung above it when it halved. A
+    /// card holds the default, and not the step above it when it fitted. A
     /// server asked one past the one-slot fit is refused by name before it
     /// listens: with the largest share the card holds when the card bounds
-    /// the fit, by the limit when the limit does. Mutants: a ladder that
-    /// starts a rung low (the rung above holds); a default of two slots (the
+    /// the fit, by the limit when the limit does. Mutants: a default that
+    /// starts a step low (the step above holds); a default of two slots (the
     /// `parallel` line names two); the refusal of a context past the card
     /// taken out (the load's own plan refuses it, not by the common words).
     // PIN(2026-10-14): the default is the seats' ladder at one slot (ctx-first: the
@@ -3656,7 +3656,7 @@ mod gate {
         let limit = limit38(&inputs)?;
         let at = |c: u64| card_at(&inputs, &plan_levers, experts, usize::try_from(c)?, free, 1);
         let ctx = ctx_ladder::field(&line, "ctx").ok_or("the `ctx` line names no ctx")?;
-        let above = rung_above(limit.0, ctx);
+        let above = step_above(limit.0, ctx);
         let (at_ctx, at_above) = (at(ctx)?, above.map(at).transpose()?);
         let parallel_ok = parallel_agrees(&parallel, None).unwrap_or(false)
             && pfield("slots") == Some(1)
@@ -3684,12 +3684,12 @@ mod gate {
                 && inputs.seq_state_bytes(p, Some(&mtp)) == seq38_bytes(gdn, qsa, n, true)
         });
         println!(
-            "ctx: the gate's plans: at {ctx} {at_ctx:?}, at the rung above {above:?} {at_above:?}; \
+            "ctx: the gate's plans: at {ctx} {at_ctx:?}, at the step above {above:?} {at_above:?}; \
              the limit {limit:?}"
         );
         let mut ok = true;
         // The line holds its word, and the gate's own plans agree: the card
-        // holds the default, and not the rung above it when it halved.
+        // holds the default, and not the step above it when it fitted.
         check(
             &mut ok,
             "ctx_default_is_the_highest_rung_held",
@@ -4541,7 +4541,7 @@ mod gate {
         // The small card's case: a flagless server — no `--place`, so the
         // box pin's one-card view runs `a` on the 3090, as
         // `slots_default_residency`'s does — under the budget whose drafted
-        // one-slot plan halves to a rung the plain plan holds more than
+        // one-slot plan fits a context the plain plan holds twice of
         // ([`small_card_budget`]), at 27 GiB. The unset draft yields to the
         // context on that plan, and the load runs the plain plan the yield
         // was judged on: its `load draft=off` record names the yield, the
@@ -4551,7 +4551,7 @@ mod gate {
         // overrode on the one-slot plan it fell to (`paged_small_card_load_names_the_rule`);
         // with one default slot (ctx-first, D2) the yield's plan is the load's, so its
         // record names the yield (`paged_small_card_load_names_the_yield`).
-        let (budget, rung) = small_card_budget(levers, free)?;
+        let (budget, fitted) = small_card_budget(levers, free)?;
         let budget_bytes = budget.to_string();
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::HOST_ROOM, "27G")
@@ -4609,15 +4609,15 @@ mod gate {
         }
         println!(
             "paged: small card, budget {budget} B: one card {one_card}, draft yield \
-             {yielded:?} (the gate's plan: the drafted choice takes {rung}); load draft=off ({})",
+             {yielded:?} (the gate's plan: the drafted choice takes {fitted}); load draft=off ({})",
             off.as_deref().unwrap_or("none")
         );
-        // The premise: the box's one-card view, and the yield at the rung the
-        // gate's plans put it.
+        // The premise: the box's one-card view, and the yield at the context
+        // the gate's plans put it.
         check(
             &mut ok,
             "paged_small_card_yields_on_one_card",
-            one_card && yielded.is_some_and(|y| y.with == rung),
+            one_card && yielded.is_some_and(|y| y.with == fitted),
         );
         let line = parallel_line(&err_log)?;
         let one = line.as_deref().is_some_and(|l| {
@@ -4734,12 +4734,13 @@ mod gate {
 
     /// The card budget under which the unset draft yields to the context on
     /// the 3090 (its free bytes `free`, the seat's census reading), to a
-    /// MiB, and the rung the drafted choice takes there: for each rung below
-    /// the target in turn ([`ctx_ladder::rungs`] under [`limit38`]), the
-    /// least budget under which the file's drafted one-slot plan holds the
-    /// rung, kept when the plain plan holds the rung above it there — the
-    /// drafted choice halves to the rung and the plain one holds more, as on
-    /// a 12 GB card. The plan is the small-card server's: the unset head and
+    /// MiB, and the context the drafted choice fits there: for each context
+    /// `c` from half the target down by halves to the floor
+    /// ([`ctx_ladder::target_of`] under [`limit38`]), the least budget under
+    /// which the file's drafted one-slot plan holds `c`, kept when the
+    /// drafted plan holds not the step above and the plain plan holds twice
+    /// `c` there — the drafted choice fits to `c` and the plain one holds at
+    /// least twice as much, as on a 12 GB card. The plan is the small-card server's: the unset head and
     /// the draft file beside the target (that server sets neither lever),
     /// the census's 3090 as `a` resolves it (`devices::spec_of_device`: the
     /// known spec with the census's free bytes) and no draft reserve in the
@@ -4785,33 +4786,37 @@ mod gate {
                 )
                 .is_ok())
         };
-        let rungs = ctx_ladder::rungs(limit38(&inputs)?.0);
-        for pair in rungs.windows(2) {
-            let (above, rung) = (pair[0], pair[1]);
+        let target = ctx_ladder::target_of(limit38(&inputs)?.0);
+        let mut tried = Vec::new();
+        let mut c = target / 2 / ctx_ladder::STEP * ctx_ladder::STEP;
+        while c >= ctx_ladder::FLOOR {
+            tried.push(c);
             let (mut lo, mut hi) = (1, free / MIB);
-            if !holds(hi * MIB, rung, true)? {
-                continue;
-            }
-            while lo + 1 < hi {
-                let mid = lo + (hi - lo) / 2;
-                if holds(mid * MIB, rung, true)? {
-                    hi = mid;
-                } else {
-                    lo = mid;
+            if holds(hi * MIB, c, true)? {
+                while lo + 1 < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if holds(mid * MIB, c, true)? {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                let budget = hi * MIB;
+                if !holds(budget, c + ctx_ladder::STEP, true)? && holds(budget, 2 * c, false)? {
+                    println!(
+                        "paged: the small card's budget {budget} B (the drafted plan fits {c}, \
+                         the plain plan holds {})",
+                        2 * c
+                    );
+                    return Ok((budget, c));
                 }
             }
-            let budget = hi * MIB;
-            if holds(budget, above, false)? && !holds(budget, above, true)? {
-                println!(
-                    "paged: the small card's budget {budget} B (the drafted plan holds {rung}, \
-                     the plain plan {above})"
-                );
-                return Ok((budget, rung));
-            }
+            c = c / 2 / ctx_ladder::STEP * ctx_ladder::STEP;
         }
         Err(format!(
             "the 3090's {free} free bytes give no budget under which the drafted one-slot plan \
-             halves a rung the plain plan holds ({rungs:?}): no budget makes the small card's case"
+             fits a context the plain plan holds twice of ({tried:?}): no budget makes the small \
+             card's case"
         )
         .into())
     }

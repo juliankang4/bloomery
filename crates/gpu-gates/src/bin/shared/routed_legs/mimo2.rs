@@ -3,7 +3,7 @@
 //! (`serve_seats/mimo2.rs`): no `generate_*` binary opens it, so the one arm
 //! is the seat's. It plans as the seat does: one default slot
 //! (`ctx_ask::DEFAULT_SLOTS`) at the context `generate::choose_ctx` takes
-//! (the seats' ladder; a host short is `PlaceError::NoNvmeTier`) and the plan
+//! (the seats' fit; a host short is `PlaceError::NoNvmeTier`) and the plan
 //! at that slot context (`PlanInputs::plan_with_slots`).
 //!
 //! The machine is the one card `a` names on a workstation whose largest card

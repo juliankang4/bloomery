@@ -1,4 +1,4 @@
-//! What a set `--ctx` is held to, and the bisection the ladder's set ask runs.
+//! What a set `--ctx` is held to, and the bisection the context choice runs.
 //!
 //! A context the flag names is checked per slot against the model's limit
 //! ([`CtxLimit`], [`check_slot_ctx`]) before any plan: past it the load
@@ -107,22 +107,29 @@ pub fn slots_of(
 }
 
 /// The largest `c` in `lo..=hi` for which `ok` holds, `ok(lo)` given: `ok`
-/// holds below a point and not above it.
+/// holds below a point and not above it. Each answer may name the point to
+/// ask next; a named point still open (above the largest that holds, at most
+/// the least that does not less one) is asked next, else the midpoint.
 ///
 /// # Errors
 /// The first error `ok` returns.
 pub fn largest<E>(
     mut lo: usize,
     mut hi: usize,
-    mut ok: impl FnMut(usize) -> Result<bool, E>,
+    mut ok: impl FnMut(usize) -> Result<(bool, Option<usize>), E>,
 ) -> Result<usize, E> {
+    let mut next = None;
     while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if ok(mid)? {
+        let mid = next
+            .filter(|n| (lo + 1..=hi).contains(n))
+            .unwrap_or(lo + (hi - lo).div_ceil(2));
+        let (holds, named) = ok(mid)?;
+        if holds {
             lo = mid;
         } else {
             hi = mid - 1;
         }
+        next = named;
     }
     Ok(lo)
 }
@@ -181,26 +188,47 @@ mod tests {
 
     /// The bisection finds the last context a monotone `ok` holds at, over a
     /// range, its ends and a one-point range, with `ok(lo)` given (never
-    /// probed) and no more probes than a halving takes.
+    /// probed) and no more probes than a halving takes; a named point is
+    /// asked next when it is still open, and one outside the open range
+    /// leaves the midpoint. Mutant: the named point never read, so the
+    /// named search takes a halving's probes.
     #[test]
     fn largest_rows() {
         for (lo, hi) in [(1usize, 1usize), (1, 2), (1, 3), (1, 4096), (4096, 262_144)] {
             for edge in [lo, lo + 1, (lo + hi) / 2, hi.saturating_sub(1).max(lo), hi] {
                 let edge = edge.clamp(lo, hi);
-                let probes = Count::new();
-                let got = largest(lo, hi, |c| {
-                    probes.take();
-                    assert_ne!(c, lo, "ok(lo) is given, never probed");
-                    Ok::<_, Infallible>(c <= edge)
-                })
-                .expect("infallible");
-                assert_eq!(got, edge, "range {lo}..={hi}, ok through {edge}");
                 let width = (hi - lo + 1) as u64;
-                assert!(
-                    probes.0.get() <= (width.ilog2() + 1) as usize,
-                    "range {lo}..={hi}: {} probes",
-                    probes.0.get()
-                );
+                let halving = (width.ilog2() + 1) as usize;
+                // No name, names never open, and a name that knows the edge:
+                // the points on either side of it.
+                type Name<'a> = (&'a str, &'a dyn Fn(bool) -> Option<usize>);
+                let names: [Name; 3] = [
+                    ("none", &|_| None),
+                    ("closed", &|_| Some(if lo % 2 == 0 { lo } else { hi + 1 })),
+                    ("edge", &|held| {
+                        Some(match (held, edge > lo) {
+                            (true, _) => (edge + 1).min(hi),
+                            (false, true) => edge,
+                            (false, false) => lo + 1,
+                        })
+                    }),
+                ];
+                for (word, name) in names {
+                    let probes = Count::new();
+                    let got = largest(lo, hi, |c| {
+                        probes.take();
+                        assert_ne!(c, lo, "ok(lo) is given, never probed");
+                        Ok::<_, Infallible>((c <= edge, name(c <= edge)))
+                    })
+                    .expect("infallible");
+                    assert_eq!(got, edge, "range {lo}..={hi}, ok through {edge}");
+                    let most = if word == "edge" { 3 } else { halving };
+                    assert!(
+                        probes.0.get() <= most,
+                        "range {lo}..={hi}, edge {edge}, names {word}: {} probes",
+                        probes.0.get()
+                    );
+                }
             }
         }
         let refused: Result<usize, &str> = largest(1, 8, |_| Err("refused"));

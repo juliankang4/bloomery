@@ -172,7 +172,7 @@ enum Outcome {
 }
 
 impl std::fmt::Display for Outcome {
-    /// The text of a refusal or a red outcome, where a ladder probe or the
+    /// The text of a refusal or a red outcome, where a context probe or the
     /// seat's slot fit reads it as an error.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1423,7 +1423,7 @@ fn view_of(plan: &Plan) -> PlanView {
     }
 }
 
-/// A seat default's slot context for an arm: the choice's, or the ladder's
+/// A seat default's slot context for an arm: the choice's, or the fit's
 /// floor where the machine holds not even that
 /// (`generate::FloorShort`), so the arm's plan there names the refusal
 /// itself; any other error stands.

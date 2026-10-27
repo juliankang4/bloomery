@@ -66,11 +66,13 @@
 //! within `place::KERNEL_POSITIONS` (YaRN scaling past it is not built). Set,
 //! a total a slot's share of which passes the limit is refused by name, and
 //! one whose N-slot plan the machine cannot hold is refused with the largest
-//! share it holds, before the load. Unset, a slot asks the target (256K under
-//! the limit) and halves while the plan is short of the card or of the unified
-//! pool the card shares with the host, down to the floor. An unset MTP draft yields to the context: when the drafted plan
-//! halves the context or holds not even the floor and the plain plan holds
-//! more, the draft goes off and a `draft yield` record names both. The
+//! share it holds, before the load. Unset, a slot asks the limit and, where
+//! that plan is short of the card or of the unified pool the card shares with
+//! the host, takes the largest context under it, a multiple of 1024 down to
+//! the floor, whose plan holds. An unset MTP draft yields to the context:
+//! when the drafted plan fits a context at most half the one the plain plan
+//! holds, or holds not even the floor, the draft goes off and a `draft
+//! yield` record names both. The
 //! prompt cache's budget never lowers the context: the `cache` line names
 //! when it holds no session there. The
 //! `load` line prints the stores' `ctx` (a slot's rows) with the slot count
@@ -78,9 +80,9 @@
 //! `verified`, the deepest context the reference sets hold our numbers to
 //! ik's at (`refset::arch::qwen4exp::VERIFIED_POSITIONS`, `/props`'
 //! `engine.ctx_verified`), which bounds nothing. One `ctx` line on stderr
-//! names the rule (`set`, `target` or `halved`, with the rung it halved from
-//! and the memory it was short of), the slot context, the slots, their
-//! total and the limit with its source.
+//! names the rule (`set`, `target` or `fitted`, with the target it fitted
+//! under and the memory the context one step above was short of), the slot
+//! context, the slots, their total and the limit with its source.
 //! `--plan` prints the records the decisions before the load make (the `ctx`
 //! line, the `plan` and `residency` records) and exits 0 before the route
 //! trace's directory is made or any model is loaded.
@@ -151,7 +153,7 @@
 //! `-np N` and no `-kvu`: the total (the `--ctx-size` the flags named, or
 //! the automatic choice when unset) is the slots' sum, each slot `total /
 //! N` positions rounded
-//! down, and the default's ladder runs over a slot's context, the plan
+//! down, and the default's fit runs over a slot's context, the plan
 //! counting every sequence ([`PlanInputs::plan_with_slots`]). An explicit
 //! `--ctx` a slot of whose N-slot plan the machine cannot hold is refused by
 //! name before the load, naming the split. Nothing parks: no slot ever waits for another
@@ -264,8 +266,8 @@
 //! every slot's draft over its row, one store walk beside the pass. Unset, the draft
 //! then yields to the context
 //! (`bloomery_levers::RungCost::of`, at [`ctx38`]'s caller): it goes off
-//! when the plan with it leaves a slot fewer positions than the plan
-//! without it, a set `--ctx-size` included, one `draft yield` record naming
+//! when the plan with it leaves a slot half the positions of the plan
+//! without it or fewer, a set `--ctx-size` included, one `draft yield` record naming
 //! its card bytes and the positions a slot gets either way, and the plain
 //! plan's `ctx` line following; `BLOOMERY_DRAFT=mtp` set never yields. `BLOOMERY_DRAFT=off` is the plain
 //! path with the same record; `mtp` drafts wherever the draft loads. The
@@ -1168,12 +1170,11 @@ fn seq38_state(inputs: &PlanInputs, positions: usize, drafts: bool) -> u64 {
 }
 
 /// The context the seat loads ([`ctx38`]): a slot's own, the stores' rows
-/// one sequence serves, and the choice's one `ctx` line.
+/// one sequence serves, the choice's one `ctx` line and what set it.
 struct Ctx38 {
     ctx: usize,
     line: String,
-    /// Whether the default halved from its target: the plan was short there.
-    halved: bool,
+    rule: Rule,
 }
 
 /// Whether a checkpoint folder's `plan` holds `reads`, the least of its
@@ -1201,7 +1202,7 @@ pub(crate) fn folder_holds(plan: &Plan<'_>, reads: u64) -> Result<(), GateError>
 /// (`q38place::ctx_choice`): a set `--ctx-size` (`set`, the total the slots
 /// split) whose share passes the limit stops by name, and one the machine
 /// cannot hold stops with the largest share it would hold; unset, a slot asks
-/// the target and halves while the plan of every slot is short
+/// the target and fits under it while the plan of every slot is short there
 /// ([`Plans::holds`]). A tier card the plan leaves idle is refused as itself:
 /// no context gives it an expert.
 fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
@@ -1211,7 +1212,7 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
     Ok(Ctx38 {
         ctx: usize::try_from(chosen.slot_ctx)?,
         line: chosen.line(),
-        halved: matches!(chosen.rule, Rule::Halved { .. }),
+        rule: chosen.rule,
     })
 }
 
@@ -1737,13 +1738,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         folder: folder.as_ref(),
     };
     // The unset draft's yield to the context (the module doc): the context
-    // comes first, so when the drafted load halved its context, or holds not
-    // even the floor, the plain load decides; it holds more, the draft goes
-    // off and one `draft yield` record names both. A set `--ctx-size` asks
-    // too; `BLOOMERY_DRAFT` never does.
+    // comes first, so when the drafted load fitted its context, or holds not
+    // even the floor, the plain load decides; it holds twice as much or more,
+    // the draft goes off and one `draft yield` record names both. A set
+    // `--ctx-size` asks too; `BLOOMERY_DRAFT` never does.
     let asks_yield = mtp && draft_off.is_none() && levers.draft().is_none();
     let (plans, mut rule, mtp, head, draft_off) = match ctx38(&drafted, a.ctx) {
-        Ok(r) if !r.halved => (drafted, r, mtp, head, draft_off),
+        Ok(r) if !matches!(r.rule, Rule::Fitted { .. }) => (drafted, r, mtp, head, draft_off),
         r if !asks_yield => (drafted, r?, mtp, head, draft_off),
         drafted_rule => {
             let plain_plans = Plans {
@@ -3299,12 +3300,13 @@ mod tests {
     /// grants (`HostNeed::grant`), and one byte past that room is refused.
     /// Where each card has memory of its own the refusal stands; on a unified
     /// pool it is short, so through the seat's context choice an unset
-    /// context halves to the rung that holds and a set one is refused.
+    /// context takes the largest step that holds and a set one is refused.
     #[test]
     fn a_folder_plan_holds_its_reads_on_the_arena_floor() {
+        const TRAINED: u64 = 262_144;
         use bloomery_gpu_gates::generate::{Place, short_in};
         use model::arch::qwen35moe::place::PlaceError;
-        use model::placement::ctx_ask::DEFAULT_TARGET;
+        use model::placement::ctx_ask::Rule;
         use model::placement::workstation::{self, HostNeed, HostRead};
         use model::placement::{
             ArenaFloor, KvBytes, ModelTensor, ModelTensors, PlanLevers, Role, plan_host_routed,
@@ -3394,7 +3396,7 @@ mod tests {
             arch: Arch::Qwen4Exp,
             hidden: 2560,
             vocab: 8,
-            ctx_train: u32::try_from(DEFAULT_TARGET).expect("context"),
+            ctx_train: u32::try_from(TRAINED).expect("context"),
             rms_eps: 1e-6,
             layers: vec![LayerSpec {
                 mixer: Mixer::Gqa(Gqa {
@@ -3466,26 +3468,12 @@ mod tests {
                 .expect("census"),
         );
         let levers = PlanLevers::default();
-        let half = usize::try_from(DEFAULT_TARGET / 2).expect("context");
+        let half = usize::try_from(TRAINED / 2).expect("context");
         let machine = place
-            .machine(
-                &inputs,
-                (DEFAULT_TARGET / 2, 1),
-                Experts::Host,
-                &levers,
-                None,
-                1,
-            )
+            .machine(&inputs, (TRAINED / 2, 1), Experts::Host, &levers, None, 1)
             .expect("the machine");
         let plan = inputs
-            .plan_target(
-                &machine,
-                DEFAULT_TARGET / 2,
-                &levers,
-                Experts::Host,
-                None,
-                1,
-            )
+            .plan_target(&machine, TRAINED / 2, &levers, Experts::Host, None, 1)
             .expect("the half-context plan");
         let reads = folder
             .least_reads(&plan, super::CARD38)
@@ -3511,7 +3499,7 @@ mod tests {
         plans
             .holds(half)
             .expect("exactly enough room for the folder");
-        let target = usize::try_from(DEFAULT_TARGET).expect("context");
+        let target = usize::try_from(TRAINED).expect("context");
         let e = plans
             .holds(target)
             .expect_err("the folder's reads do not fit");
@@ -3522,9 +3510,14 @@ mod tests {
         }
         .holds(target)
         .expect("the plan fits without part reads");
-        let unset = ctx38(&plans, None).expect("halves");
+        let unset = ctx38(&plans, None).expect("fits");
         assert_eq!(unset.ctx, half);
-        assert!(unset.halved);
+        // PIN(2026-10-28): fitted, not halved: an unset context takes the largest step that holds.
+        assert!(
+            matches!(unset.rule, Rule::Fitted { .. }),
+            "{:?}",
+            unset.rule
+        );
         assert!(ctx38(&plans, Some(target)).is_err());
     }
 }

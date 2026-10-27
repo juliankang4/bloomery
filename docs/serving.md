@@ -139,11 +139,11 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   twice; it also fetches the model's MTP draft when the repo publishes it, as unsloth's Qwen3.8-Flash-Next GGUFs
   do under `MTP/`, landing it beside the set, where the run picks it up), `--parallel/-np`, `--queue-depth`,
   `--cache-ram/-cram` (MiB; `0` turns the prompt cache off; llama-server's `-1`, no limit, is refused by name: the
-  cache is host memory beside the load), `--ctx/--ctx-size` (unset, every generative seat and the decide seat take one slot at the lesser of
-  262,144 and the file's limit, and halve that while the plan is short of the card — and of the host, where the body
-  keeps no tier past it, or of a unified pool no share of which between the card and the host fits, or that cannot
-  also hold a checkpoint folder's load reading its parts one at a time — down to 4,096;
-  one `ctx` line names the rule. A set value is the total the slots split, and
+  cache is host memory beside the load), `--ctx/--ctx-size` (unset, every generative seat and the decide seat take one slot at the model's limit and, where
+  that plan is short of the card — or of the host, where the body keeps no tier past it, or of a unified pool no share
+  of which between the card and the host fits, or that cannot also hold a checkpoint folder's load reading its parts
+  one at a time — the largest context under it whose plan holds, a multiple of 1,024 down to 4,096;
+  one `ctx` line names the rule, `target` or `fitted`. A set value is the total the slots split, and
   one that does not fit is refused, never cut. PIN(2026-10-14): `generate::choose_ctx` over `ctx_ask::choose`),
   `--cache-type-k f16|q8_0` (the qwen3
   seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the
@@ -454,7 +454,7 @@ lookup draft, Qwen3.8 under `--place bp` and MiniMax-M3 step their slots in turn
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
 llama-server splits it with `-np N` and no `-kvu`: a set `--ctx-size` is the total and each slot holds `total / N`
-rows, on V4.1 the same way; with no context named, each slot holds the ladder's choice and the total is that times N.
+rows, on V4.1 the same way; with no context named, each slot holds the default's choice (the largest context the plan of N slots holds) and the total is that times N.
 `--parallel 1` keeps one sequence with the whole context.
 The plan counts every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by
 name. A new request's prompt runs in one call between rounds, and the other streams wait for it.
@@ -526,8 +526,8 @@ Ornith-1.5) takes the same draft, and a reduced draft borrows nothing from the t
 is not a Q6_K projection serves it too. On the same seat, `BLOOMERY_DRAFT=lookup` serves the n-gram lookup draft
 on the same whole-card verifying load, one context a slot; a `qwen3moe` file has no multi-row pass and refuses it
 by name.
-Unset, the MTP draft yields to the context: it goes off when the plan with it would leave a slot fewer positions
-than the plan without it, a set `--ctx-size`/`--ctx` included, a `draft yield` record naming its
+Unset, the MTP draft yields to the context: it goes off when the plan with it would leave a slot half the positions
+of the plan without it or fewer, a set `--ctx-size`/`--ctx` included, a `draft yield` record naming its
 card bytes and the positions a slot gets either way, and the context line that follows is the plain plan's.
 `BLOOMERY_DRAFT=mtp` keeps it on whatever the context. On Qwen3.8 an unset MTP draft also stays off under
 `--parallel` above 1, from a GGUF draft file and a checkpoint folder alike: a drafted server runs a round of sampled or
@@ -642,7 +642,7 @@ and the model fits) states no need and consults no hook; a set hook is named on 
   aarch64 kernel runs through a scalar mirror there.
 - GLM-5.3 holds at most 16,384 positions a slot (`ORACLE_POSITIONS`): a `--ctx-size` whose share a slot passes it
   is refused at start, and a longer prompt with `exceed_context_size_error`. On a 12–16 GB card the split Qwen3 load's
-  unset context halves until the plan fits; the old rule's sitting there measured 2,048 positions a slot at
+  unset context fits to the largest the plan holds; the old rule's sitting there measured 2,048 positions a slot at
   `--parallel 2`, and that card has not been remeasured. Agent clients with long system prompts want the context to
   one request there (`--parallel 1`, or a set `--ctx-size` with no `--parallel`).
 - One model a server; one expert tier card at most (`--place bp`).

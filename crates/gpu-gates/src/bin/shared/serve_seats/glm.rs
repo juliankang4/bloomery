@@ -56,10 +56,11 @@
 //! the model's limit is the trained context (`context_length`) verified up
 //! to `place::ORACLE_POSITIONS`, a set share past it stops by name, and one
 //! the machine cannot hold stops with the largest it would hold. Unset, a
-//! slot asks the limit, halved while the plan of every slot is short of the
-//! card, never under 4096. A `ctx` line on stderr names the rule (`set`,
-//! `target` or `halved`, with the memory a halving was short of), the slot
-//! context, the slots, their total and the limit. Set, the flag
+//! slot asks the limit and, where the plan of every slot is short of the card
+//! there, takes the largest context under it, a multiple of 1024 never under
+//! 4096, whose plan holds. A `ctx` line on stderr names the rule (`set`,
+//! `target` or `fitted`, with the memory the context one step above was short
+//! of), the slot context, the slots, their total and the limit. Set, the flag
 //! is the total and each slot takes `total / N` positions rounded down
 //! (llama-server's `-np N` without `-kvu`) under a set `--parallel N` —
 //! alone it is one request's context, one slot at the whole of it
@@ -197,8 +198,8 @@
 //! next-token layer; the plain path under `--place gate`, on a file of other than one,
 //! and with stores too short for one window, never a refusal. Unset, the
 //! draft then yields to the context, set or not (`bloomery_levers::RungCost::of`,
-//! the one rule): when the drafted load halved its context, or holds not even
-//! the floor, and the plain load holds more, the draft goes off, one `draft
+//! the one rule): when the drafted load fitted its context, or holds not even
+//! the floor, and the plain load holds twice as much or more, the draft goes off, one `draft
 //! yield` record naming its card bytes and the positions a slot gets either
 //! way, the plain load's `ctx` line following. Set, refused by
 //! name: `mtp` with stores too short for one window (`--ctx` under 3: the
@@ -901,7 +902,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     } else {
         Some(lane_at(chosen.place)?)
     };
-    // An unset draft yields when the plain load serves more positions.
+    // An unset draft yields when the plain load serves twice the positions or more.
     // A set context can yield if only its plain plan holds; a set draft never yields.
     // The selected placement and slot count stay fixed.
     let drafted = plan_place(chosen.place, (a.ctx, slots));
@@ -909,7 +910,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // context comes first.
     let asks_yield = draft_off.is_none() && levers.draft().is_none();
     let (placed, draft_off, yield_record) = match drafted {
-        Ok(d) if !asks_yield || !d.line.starts_with("ctx rule=halved ") => (d, draft_off, None),
+        Ok(d) if !asks_yield || !d.line.starts_with("ctx rule=fitted ") => (d, draft_off, None),
         // A draft the levers set keeps its own refusal: it never yields.
         drafted if !asks_yield => (drafted?, draft_off, None),
         drafted => {

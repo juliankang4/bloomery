@@ -45,23 +45,24 @@
 //!
 //! Without a load:
 //!
-//! - `host_room_halves_the_default`: the host room halves the default as a
-//!   short card does. Every `--plan` child whose output a clause compares
+//! - `host_room_halves_the_default`: the host room fits the default under
+//!   its target as a short card does. Every `--plan` child whose output a clause compares
 //!   with another child's runs under `BLOOMERY_HOST_ROOM` = `PLAN_ROOM`, this
 //!   workstation's host room with nothing loaded, so no reading of the box's
 //!   available bytes enters a comparison. At that room the default's `ctx`
 //!   line and the plan's `ctx_max` equal `plan_only_names_its_default`'s, and
-//!   no host halved it. Under a room halfway between the host need of the
-//!   rung below the default and of the default (two plans made here at
-//!   `PLAN_ROOM`, `HostNeed::of`) the line is `ctx rule=halved` at that rung,
-//!   `host-short`, and the plan's `ctx_max` is that rung (the host needs are
+//!   no host fitted it. Under a room halfway between the host need of half
+//!   the default and of the default (two plans made here at `PLAN_ROOM`,
+//!   `HostNeed::of`) the line is `ctx rule=fitted` at a context from that
+//!   half up to under the default whose host need the room holds,
+//!   `host-short`, and the plan's `ctx_max` is that context (the host needs are
 //!   those of the placement the unset flag runs, [`unset_place`]): the body serves no
 //!   NVMe tier (`PlaceError::NoNvmeTier`), and a shorter context keeps more
 //!   experts on the card. Under a room a GiB under the floor's need the
 //!   process exits non-zero within [`REFUSE_WITHIN`] with the words of
 //!   `ctx_ask::AskError::FloorShort` on a host, and no `load` record is
 //!   printed. FAIL-first, by reading: on a seat that reads a host refusal as
-//!   its own error the middle room refuses the load instead of halving it,
+//!   its own error the middle room refuses the load instead of fitting it,
 //!   and the clause is red; on a seat whose plan reads no room
 //!   `BLOOMERY_HOST_ROOM` moves nothing and both halves are red.
 //! - `residency_default_is_the_machine`: `--plan` at [`CTX`] with no
@@ -81,13 +82,13 @@
 //!   `listening` record. The `parallel` line is the default's one slot:
 //!   `slots=1 slot_ctx=<ctx_max> total=<ctx_max> from=default pass=one`. The
 //!   one `ctx` line holds its word (`ctx_ladder::default_line_held`: `target`
-//!   or `halved`, a rung of the ladder from 262,144 or the trained context
-//!   down to 4096, the limit the trained context) and names the plan's
-//!   `ctx_max`; the plan at it stands (`--parallel 1 --ctx <ctx_max> --plan`
-//!   exits 0 with the same `ctx_max`); and the rung above it, when there is
-//!   one, does not (`--parallel 1 --ctx <rung above> --plan` is refused).
-//!   FAIL-first: a seat that defaults to 4096 regardless names a rung whose
-//!   rung above stands, and the hold is red; a seat on two default slots
+//!   or `fitted`, the trained context or a step of 1024 under it down to
+//!   4096, the limit the trained context) and names the plan's `ctx_max`;
+//!   the plan at it stands (`--parallel 1 --ctx <ctx_max> --plan` exits 0
+//!   with the same `ctx_max`); and the step above it, when there is one,
+//!   does not (`--parallel 1 --ctx <step above> --plan` is refused).
+//!   FAIL-first: a seat that defaults to 4096 regardless names a context
+//!   whose step above stands, and the hold is red; a seat on two default slots
 //!   prints `slots=2`, and the `parallel` line hold is red.
 //! - `refusals_before_any_load`: `--ctx 1 --parallel 2` — a split that
 //!   leaves a slot no position — exits non-zero within [`REFUSE_WITHIN`],
@@ -103,11 +104,11 @@
 //! - `slots_total_is_planned`: the plan counts every slot's positions. At
 //!   the one-slot default context `c` (`--parallel 1 --plan`), `--parallel 2
 //!   --ctx c --plan` exits 0 and its `parallel` line splits it (`slots=2
-//!   slot_ctx=⌊c/2⌋ pass=one`); `--parallel 2 --ctx <the rung above c>`, a total the
+//!   slot_ctx=⌊c/2⌋ pass=one`); `--parallel 2 --ctx <the step above c>`, a total the
 //!   one-slot plan refuses, exits non-zero within [`REFUSE_WITHIN`], its
 //!   stderr names the set total's refusal (`ctx_ask::AskError::DoesNotFit`)
-//!   and no `load` record is printed (a default that is the first rung has no
-//!   rung above and the second half is a named skip). FAIL-first: a seat whose plan counts one slot
+//!   and no `load` record is printed (a default that is the target has no
+//!   step above and the second half is a named skip). FAIL-first: a seat whose plan counts one slot
 //!   (`plan_with_slots` at one, over a slot's share) loads and is still
 //!   running at the bound; the refusal half is red.
 //!
@@ -280,7 +281,7 @@ mod gate {
     use std::time::{Duration, Instant};
 
     use bloomery_gpu_gates::ctx_ladder::{
-        ctx_line, default_line_held, field, rung_above, rungs, short_of,
+        STEP, ctx_line, default_line_held, field, floor_of, short_of, step_above,
     };
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Log};
@@ -817,11 +818,11 @@ mod gate {
                     Some(p) => p.u64("ctx_max")? == c,
                     None => false,
                 };
-            // The rung above it does not: the default halved only past a
-            // rung the machine could not hold.
-            let above_short = match rung_above(limit, c) {
+            // The step above it does not: the default fitted only under a
+            // context the machine could not hold.
+            let above_short = match step_above(limit, c) {
                 None => {
-                    println!("plan only: the default {c} is the first rung, none above it");
+                    println!("plan only: the default {c} is the target, none above it");
                     true
                 }
                 Some(above) => {
@@ -833,7 +834,7 @@ mod gate {
                         &["--parallel", "1", "--ctx", &above_arg],
                     )?;
                     let refused = st.is_some_and(|s| !s.success());
-                    println!("plan only: --ctx {above}, the rung above, is refused {refused}");
+                    println!("plan only: --ctx {above}, the step above, is refused {refused}");
                     refused
                 }
             };
@@ -918,7 +919,7 @@ mod gate {
             return Ok(());
         };
         // (i) At the plan room the default is the one
-        // `plan_only_names_its_default` printed, and no host halved it.
+        // `plan_only_names_its_default` printed, and no host fitted it.
         let (status, log, text) = plan_run(dir, "plan-room-default", file, &[])?;
         let line = ctx_line(&text);
         let ctx_max = match log.first(&record::PLAN)? {
@@ -931,30 +932,32 @@ mod gate {
             && ctx_max == Some(base.ctx_max);
         println!(
             "host room, at {PLAN_ROOM} B: the default {line:?} at ctx_max {ctx_max:?} is \
-             plan_only's {:?} at {} {same}; no host halved it {not_host}",
+             plan_only's {:?} at {} {same}; no host fitted it {not_host}",
             base.ctx_line, base.ctx_max
         );
         let limit = trained_ctx(file)?.ok_or("the file states no context_length")?;
-        let below = rungs(limit).into_iter().find(|&r| r < base.ctx_max);
-        let Some(below) = below else {
+        let floor = floor_of(limit);
+        let below = (base.ctx_max / 2 / STEP * STEP).max(floor);
+        if below >= base.ctx_max {
             println!(
-                "skip {NAME} (the halving and the refusal): the default {} is the last rung, no \
-                 shorter context for a room to halve to",
+                "skip {NAME} (the fit and the refusal): the default {} is the floor, no shorter \
+                 context for a room to fit to",
                 base.ctx_max
             );
             check(ok, NAME, same && not_host);
             return Ok(());
-        };
-        // (ii) A room between the host need of the rung below the default and
-        // the default's: the default's experts pass the room, the rung below's
-        // do not, so the default halves once, short of the host.
+        }
+        // (ii) A room between the host need of half the default and the
+        // default's: the default's experts pass the room, the half's do not,
+        // so the default fits under it, at least at the half, short of the
+        // host.
         let (need_below, need_default) = (
             default_plan_need(file, levers, (below, cards))?,
             default_plan_need(file, levers, (base.ctx_max, cards))?,
         );
         if need_default <= need_below {
             return Err(format!(
-                "the default's plan needs {need_default} B of host, not more than the rung \
+                "the default's plan needs {need_default} B of host, not more than the half \
                  below's {need_below} B: the model's host need no longer grows with the context"
             )
             .into());
@@ -965,27 +968,37 @@ mod gate {
             ..OFF
         };
         let (status, log, text) = plan_pinned(dir, "plan-room-between", file, &[], pins(between))?;
-        let halved = status.is_some_and(|s| s.success())
-            && ctx_line(&text).is_some_and(|l| {
-                l.starts_with("ctx rule=halved ")
-                    && field(l, "ctx") == Some(below)
-                    && short_of(l) == Some("host")
-            })
-            && match log.first(&record::PLAN)? {
-                Some(p) => p.u64("ctx_max")? == below,
-                None => false,
-            };
+        // PIN(2026-10-28): the default is fitted, not halved; the clause pins the largest context the room holds, not one context.
+        let fitted_to = ctx_line(&text)
+            .filter(|l| l.starts_with("ctx rule=fitted ") && short_of(l) == Some("host"))
+            .and_then(|l| field(l, "ctx"))
+            .filter(|&c| below <= c && c < base.ctx_max);
+        let planned = match log.first(&record::PLAN)? {
+            Some(p) => Some(p.u64("ctx_max")?),
+            None => None,
+        };
+        let need_fitted = fitted_to
+            .map(|c| default_plan_need(file, levers, (c, cards)))
+            .transpose()?;
+        let need_above = fitted_to
+            .map(|c| default_plan_need(file, levers, (c + STEP, cards)))
+            .transpose()?;
+        let fitted = status.is_some_and(|s| s.success())
+            && fitted_to.is_some()
+            && planned == fitted_to
+            && need_fitted.is_some_and(|n| n <= between)
+            && need_above.is_some_and(|n| n > between);
         println!(
-            "host room {between} B (the rung below's need {need_below} B, the default's \
-             {need_default} B): the line {:?} halves to {below}, host-short {halved}",
+            "host room {between} B (the half's need {need_below} B, the default's \
+             {need_default} B): the line {:?} fits to {fitted_to:?} from {below}, needing \
+             {need_fitted:?} B, host-short {fitted}",
             ctx_line(&text)
         );
-        if !halved {
+        if !fitted {
             println!("plan-room-between stderr:\n{text}");
         }
-        // (iii) A room a GiB under the floor's need holds no rung: refused by
-        // name before any load.
-        let floor = *rungs(limit).last().ok_or("no rung")?;
+        // (iii) A room a GiB under the floor's need holds no context: refused
+        // by name before any load.
         let short = default_plan_need(file, levers, (floor, cards))? - SHORT_OF_NEED;
         let refused = refusal_under(
             dir,
@@ -994,7 +1007,7 @@ mod gate {
             &["--plan"],
             (&[FLOOR_HOST_REFUSAL[0], FLOOR_HOST_REFUSAL[1]], pins(short)),
         )?;
-        check(ok, NAME, same && not_host && halved && refused);
+        check(ok, NAME, same && not_host && fitted && refused);
         Ok(())
     }
 
@@ -1192,10 +1205,10 @@ mod gate {
         println!(
             "two slots over the one-slot default context {c}: the parallel line {want:?} {split}"
         );
-        // The rung above the default the one-slot plan refused; two slots
+        // The step above the default the one-slot plan refused; two slots
         // plan the same total, so the refusal is the total's, not a slot's
         // share.
-        let above = trained.and_then(|t| rung_above(t, c));
+        let above = trained.and_then(|t| step_above(t, c));
         let refused = if let Some(above) = above {
             let next = above.to_string();
             refusal(
@@ -1208,7 +1221,7 @@ mod gate {
         } else {
             println!(
                 "skip slots_total_is_planned (refusal half): the one-slot default {c} is the \
-                 first rung, no total the one-slot plan refused"
+                 target, no total the one-slot plan refused"
             );
             true
         };

@@ -19,12 +19,12 @@
 //!   prints `place unset` (the word `a`), the plan record and the `parallel` line, in that order,
 //!   and no `load` or `listening` record. The `parallel` line is the default's one slot:
 //!   `slots=1 slot_ctx=<ctx_max> total=<ctx_max> from=default pass=one`. The one `ctx` line holds
-//!   its word (`ctx_ladder::default_line_held`: `target` or `halved`, a rung of the ladder from
-//!   262,144 or the trained context down to 4096, the limit the trained context) and names the
-//!   plan's `ctx_max`; the plan at it stands (`--ctx <ctx_max> --plan` exits 0 with the same
-//!   `ctx_max`); and the rung above it, when there is one, does not (`--ctx <rung above> --plan` is
-//!   refused). FAIL-first: a seat that defaults to 4096 regardless names a rung whose rung above
-//!   stands, and the hold is red.
+//!   its word (`ctx_ladder::default_line_held`: `target` or `fitted`, the trained context or a
+//!   step of 1024 under it down to 4096, the limit the trained context) and names the plan's
+//!   `ctx_max`; the plan at it stands (`--ctx <ctx_max> --plan` exits 0 with the same `ctx_max`);
+//!   and the step above it, when there is one, does not (`--ctx <step above> --plan` is refused).
+//!   FAIL-first: a seat that defaults to 4096 regardless names a context whose step above stands,
+//!   and the hold is red.
 //! - `parallel_above_one_is_refused`: `--parallel 2 --plan` exits non-zero, its stderr names the
 //!   body's one sequence, and no `plan` record is printed (the refusal comes before any plan).
 //!
@@ -74,7 +74,7 @@ mod gate {
 
     use bloomery_gpu::model::ChainBody;
     use bloomery_gpu::{Gpu, GpuError, GpuModel, NemotronHModel, NemotronHMoeModel};
-    use bloomery_gpu_gates::ctx_ladder::{ctx_line, default_line_held, field, rung_above};
+    use bloomery_gpu_gates::ctx_ladder::{ctx_line, default_line_held, field, step_above};
     use bloomery_gpu_gates::generate::{Place, SEAT_STEPS};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
@@ -195,9 +195,9 @@ mod gate {
                     None => false,
                 };
             println!("plan only: --ctx {c} stands {stands}");
-            let above_short = match rung_above(limit, c) {
+            let above_short = match step_above(limit, c) {
                 None => {
-                    println!("plan only: the default {c} is the first rung, none above it");
+                    println!("plan only: the default {c} is the target, none above it");
                     true
                 }
                 Some(above) => {
@@ -205,7 +205,7 @@ mod gate {
                     let (st, _, _) =
                         SEAT.plan(dir, "plan-past-default", file, &["--ctx", &above_arg])?;
                     println!(
-                        "plan only: --ctx {above}, the rung above, is refused {}",
+                        "plan only: --ctx {above}, the step above, is refused {}",
                         !st.success()
                     );
                     !st.success()

@@ -59,11 +59,11 @@
 //! `plan::KERNEL_POSITIONS`. Set, `--ctx` is the total the slots split (llama-server's
 //! `-np` without `-kvu`); a share past the limit is refused by name, and one
 //! the machine cannot hold is refused with the largest share it holds,
-//! before the load. Unset, a slot asks the ladder's target under the limit and
-//! halves while the plan is short of the card, down to the floor; one `ctx`
-//! line on stderr names the rule. The image encoder stays on, and when
-//! its reserve lowers that rung the same line names the positions a slot gets
-//! with the reserve and without it.
+//! before the load. Unset, a slot asks the limit and, where that plan is short
+//! of the card, takes the largest context under it whose plan holds, down to
+//! the floor; one `ctx` line on stderr names the rule. The image encoder stays
+//! on, and when its reserve lowers that context the same line names the
+//! positions a slot gets with the reserve and without it.
 //! `/props`' `engine.ctx_verified` is the
 //! deepest context the reference sets hold our numbers to ik's at
 //! (`refset::arch::deepseek41::VERIFIED_POSITIONS`), which bounds nothing.
@@ -635,8 +635,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let token = |id| vocab.tokenizer().text(id).map(str::to_owned);
     // A projector the `--hf` repo picked stays where the plan gives the text model the same
     // experts with its reserve as without ([`vision_seat::kept`]). Both costs are read at the
-    // plain rung, so a reserve that only lowers the ladder does not drop the encoder: the `ctx`
-    // line names that rung. A reserve the ladder places at no rung, or not at a set `--ctx`, is
+    // plain context, so a reserve that only lowers the context does not drop the encoder: the
+    // `ctx` line names it. A reserve the fit places at no context, or not at a set `--ctx`, is
     // a refused cost, and the projector goes as before.
     #[cfg(feature = "vision")]
     let vision = vision_seat::kept(
@@ -673,8 +673,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let vision_reserve = seated.and_then(|v| v.seat.reserve);
     let chosen = ctx_of(vision_reserve)?;
     let ctx = usize::try_from(chosen.slot_ctx)?;
-    // The encoder stays on. When its reserve lowers the rung, the `ctx` line
-    // names both rungs ([`bloomery_levers::RungCost`]). The same rung adds
+    // The encoder stays on. When its reserve lowers the context, the `ctx`
+    // line names both ([`bloomery_levers::RungCost`]). The same context adds
     // nothing.
     let mut ctx_line = chosen.line();
     if let Some(bytes) = vision_reserve {
