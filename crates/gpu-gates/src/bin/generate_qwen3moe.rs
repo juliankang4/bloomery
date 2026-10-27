@@ -1604,6 +1604,7 @@ mod cli {
             bloomery_levers::SPLIT_WALK,
             bloomery_levers::GEN_SLOTS,
             bloomery_levers::FORCE_IDS,
+            bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
         ];
         if options.has("--place") {
             acts_on.extend(q3place::PLACED_LEVERS);

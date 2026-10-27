@@ -650,7 +650,10 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[bloomery_levers::DRAFT])?;
+        let levers = bloomery_levers::at_main(&[
+            bloomery_levers::DRAFT,
+            bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
+        ])?;
         if let Some(word) = levers.draft()
             && !matches!(word, "off" | "mtp")
         {

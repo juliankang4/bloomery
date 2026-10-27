@@ -287,7 +287,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        bloomery_levers::at_main(&[])?;
+        bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
         let (cases, qwen3moe, root) = parse_args()?;
         std::fs::create_dir_all(&root)?;
         let mut ok = true;

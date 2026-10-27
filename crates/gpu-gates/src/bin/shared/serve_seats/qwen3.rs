@@ -207,7 +207,7 @@ use app::mtp::{MtpBody, MtpDraft};
 use q3place::Seqs;
 
 use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
-use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
+use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH_ENV, ubatch_size};
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Qwen35moeModel};
 use bloomery_gpu::dspark::DsparkBody;
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
@@ -2195,7 +2195,8 @@ fn lookup_refusal(arch: Family) -> String {
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     // A placed load (`--place`) acts on the placement's levers; set beside
-    // an unplaced one, they are refused by name.
+    // an unplaced one, they are refused by name. Every load reads its ubatch
+    // size in place.
     let placed = args.iter().any(|a| a == "--place");
     let mut acts_on = vec![
         bloomery_levers::DRAFT,
@@ -2204,6 +2205,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         bloomery_levers::STEP_STATS,
         bloomery_levers::SCREEN,
         bloomery_levers::SCHEMAJUMP,
+        UBATCH_ENV,
     ];
     if placed {
         acts_on.extend(q3place::PLACED_LEVERS);

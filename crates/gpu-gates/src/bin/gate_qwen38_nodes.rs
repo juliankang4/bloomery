@@ -1709,8 +1709,13 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers =
-            bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
+        let levers = bloomery_levers::at_main(&[
+            CARD_BUDGET,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
+        ])?;
         record::at_main(NAME, record::GATE_QWEN38_NODES);
         let (mode, host) = parse_args(&std::env::args().skip(1).collect::<Vec<_>>())?;
         let mut c = Common::new(&levers)?;
@@ -1839,6 +1844,7 @@ mod gate {
                 super::HOST_POPULATE,
                 super::HOST_LOCK,
                 super::CARD_DONTNEED,
+                bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
             ])?;
             let c = super::Common::new(&levers)?;
             let addr = super::lever_addr()?;
@@ -1903,6 +1909,7 @@ mod gate {
                 super::HOST_POPULATE,
                 super::HOST_LOCK,
                 super::CARD_DONTNEED,
+                bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
             ])?;
             let c = super::Common::new(&levers)?;
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("an address");

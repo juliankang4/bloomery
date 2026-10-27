@@ -1591,8 +1591,13 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers =
-            bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
+        let levers = bloomery_levers::at_main(&[
+            CARD_BUDGET,
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
+        ])?;
         let host = levers.host();
         let args = parse_args()?;
         let path_buf = ref_model_path()?;

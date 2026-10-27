@@ -144,7 +144,7 @@ V4.1: under `--place gate` adaptive residency is off (`BLOOMERY_RESIDENCY` unset
 
 ## Levers
 
-Runtime levers are `BLOOMERY_*` environment variables, the rows of `crates/levers/src/registry.rs`. Each binary reads them once at start and refuses by name a lever it does not act on, a value its kind does not take, and a `BLOOMERY_*` name no row names. So set a lever on the one command it is for, not with `export`. `<bin> --levers` prints what that binary parsed and exits; `just gate-levers` prints the whole table.
+Runtime levers are `BLOOMERY_*` environment variables, the rows of `crates/levers/src/registry.rs`. Each binary reads them once at start and refuses by name a lever it does not act on, a value its kind does not take, and a `BLOOMERY_*` name no row names. So set a lever on the one command it is for, not with `export`. A lever read in place by the code that uses it (the registry's "in place in" rows) has its value checked the same way, but one set beside a binary or a `bloomery-serve` seat that does not read it does not stop the start: a line on stderr says it is not applied and where it is read, since one environment may hold the levers of several models. `<bin> --levers` prints a line per lever, whether that binary (on `bloomery-serve`, the seat) applies it (`yes`, `no` or `refused`) and its value, and exits; with a refusal it ends with the refusal's lines and a nonzero code. `just gate-levers` prints the whole table.
 
 | Variable | Effect |
 |---|---|

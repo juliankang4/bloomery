@@ -519,6 +519,7 @@ mod gate {
             HOST_LOCK,
             CARD_DONTNEED,
             R8,
+            bloomery_gpu_gates::llama_place::DRAFT_CARD,
         ])?)?;
         let args = parse_args()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;

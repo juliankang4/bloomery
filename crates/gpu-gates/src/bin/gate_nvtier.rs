@@ -269,7 +269,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use app::Session;
-use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
+use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH_ENV, ubatch_for};
 use bloomery_gpu::arch::qwen3moe::{Body38, SplitWalk};
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats};
@@ -2149,9 +2149,15 @@ fn run() -> Result<(), GateError> {
     // for it; the gate itself leaves it unset.
     let role = child_role();
     let acts_on: &[&str] = if role.is_some() {
-        &[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, HOST_ROOM]
+        &[
+            HOST_POPULATE,
+            HOST_LOCK,
+            CARD_DONTNEED,
+            HOST_ROOM,
+            UBATCH_ENV,
+        ]
     } else {
-        &[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED]
+        &[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, UBATCH_ENV]
     };
     let levers = bloomery_levers::at_main(acts_on)?;
     record::at_main(NAME, record::GATE_NVTIER);

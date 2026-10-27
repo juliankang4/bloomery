@@ -16,9 +16,8 @@ use bloomery_levers::{
 /// statistics, whose rounds of several slots the seat counts, and which on
 /// this engine also keeps the step rows' engram fill statistics; the width
 /// a drafted window verifies; the start screen; how a structured-output
-/// request's fixed runs are fed. The draft's
-/// file and card (`BLOOMERY_DSPARK_MODEL`, `BLOOMERY_DSPARK_CARD`) are read
-/// where the draft opens, not here.
+/// request's fixed runs are fed; the DSpark draft's card, read in place
+/// where the draft opens (its file, `BLOOMERY_DSPARK_MODEL`, is no lever).
 pub const ACTS_ON: &[&str] = &[
     CED,
     PREFILL,
@@ -39,4 +38,5 @@ pub const ACTS_ON: &[&str] = &[
     STEP_STATS,
     SCREEN,
     SCHEMAJUMP,
+    bloomery_gpu_gates::llama_place::DRAFT_CARD,
 ];

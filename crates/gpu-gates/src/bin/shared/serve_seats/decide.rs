@@ -710,7 +710,7 @@ fn head_files(from: Pick) -> Result<HeadFiles, GateError> {
 /// carries why the server ended. `hf` is the repo (`owner/name`) the model
 /// file came from under `--hf`: the model's name, else its file name.
 pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, GateError> {
-    let levers = bloomery_levers::at_main(&[bloomery_levers::SCREEN])?;
+    let levers = bloomery_levers::at_main(&[bloomery_levers::SCREEN, ubatch_rule::UBATCH_ENV])?;
     record::at_main(WHAT, record::BLOOMERY_SERVE_DECIDE);
     arm_screen(levers.screen());
     let a = parse_args(args)?;
