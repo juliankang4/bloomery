@@ -427,7 +427,7 @@ the host polling inside a token [unverified]. The probes did not include them; t
 A/B: same binary, lever-on and lever-off arms plus an A/A arm (lever off against itself), 6 rounds on the M4. The ruler is the M4's
 own, not the box's 0.6 %: sd 0.42 % over 3 rounds (85.5, 85.3, 86.0; rig-log `docs/bloomery/mac-m4pro-xeng-2026-10-25.md`), which
 gives ±0.54 % at 6 rounds (t(0.975, 10) x 0.42 % x sqrt(2/6), `AGENTS.md`, "Know the ruler") [derived]. The A/A arm replaces that
-3-round sd with the sitting's own, the way the Spark's ruler comes from its A/A (`docs/contrib/dgx-spark.md:195-200`); the card's
+3-round sd with the sitting's own, the way the Spark's ruler comes from its A/A (`docs/contrib/dgx-spark.md` section 4, Timing); the card's
 `sd:` line names the xeng record as its source. The band's floor, -0.9 %, is 1.6x the interval; the point value, -1.1 %, 2x. Outcomes:
 - inside +0.1..+0.6 ms: the cut is priced; go on to the tier rounds with 40 x this cost as their chain term.
 - below +0.1 ms: no ruler resolves it (0.1 ms is 0.86 % against ±0.54 %; ±0.3 % takes 32 rounds, `AGENTS.md`). Decide by

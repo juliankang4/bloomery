@@ -1,26 +1,29 @@
 # Porting bloomery to the NVIDIA DGX Spark
 
 This is the map for a contributor who owns a DGX Spark (GB10: an Arm CPU and a Blackwell GPU on one unified memory) and
-wants to build, run or extend bloomery on it. It says where the port stands, how to build and check a change on a Spark
-today, and which work is left and whose it is. The work is cut into phases P0 to P5 (section 1). P0, P2 and P3 are
-done, and P1 is not finished.
+wants to build, run or extend bloomery on it. It says where the port stands, how to build and run a model on a Spark
+today, what was measured there, and which work is left and whose it is. The work is cut into phases P0 to P5
+(section 1). P0, P2 and P3 are done, P1 is not finished, and P4 and P5 are partly in.
 
-Today a Spark builds the tree from source, runs a model that fits its memory whole on the card, and runs the fixture-tier
-gates (the gates that run on small generated model files, section 4) in local mode, which runs a gate recipe on your own
-machine (sections 2 and 4). What a Spark's memory and card change, and what was measured on them, is in sections 3, 5,
-6 and 7.
+Today a Spark builds the tree from source for `sm_121a`, the target whose NVFP4 and FP4-Local prompt products run on
+the FP4 tensor cores (section 2.1). It runs a model that fits its memory whole on the card, NVIDIA's Qwen3.8 NVFP4 and
+FP4-Local checkpoint folders as downloaded among them; section 2.3 gives the commands for FP4-Local on one Spark and
+its measured decode, prefill and first-token numbers. It runs the fixture-tier gates (the gates that run on small
+generated model files, section 4) in local mode, which runs a gate recipe on your own machine. What a Spark's memory
+and card change, and what was measured on them, is in sections 3, 5, 6 and 7.
 
-The large work left is models larger than the memory pool (P4, section 8) and several linked Sparks (P5, section 9).
-Section 10 lists every open item, and section 11 holds the maintainers' decisions. To start: build and run a first
-model (section 2), then run the contributor gate list in local mode (section 4), and take an item marked for a
-contributor in section 10.
+The large work left is models larger than the memory pool (P4, section 8) and one model across several linked Sparks
+(P5, section 9). For P5 the node planner, the link, remote expert tiers and a tensor-parallel GLM-5.3-Flash plan and
+rank body are in; the engine's step across two machines is not. Section 10 lists every open item, and section 11 holds
+the maintainers' decisions. To start: build and run a first model (section 2), then run the contributor gate list in
+local mode (section 4), and take an item marked for a contributor in section 10.
 
 **How to read the numbers.** A claim about the code cites `path:line`. Lines are at main `6b630e5e` unless the text names
 another commit: the pool invariant (section 7.2) and section 8 were read at `61039d6e`, section 9 at `cce176c5`, and a
-line marked "at `b289130a`" was re-read for this revision. A thing that was not seen is marked `[unverified]`, and a
-number computed here is marked `[derived]`. "The contributor" is the one contributor who did the Spark work so far on
-two DGX Sparks; a reading of theirs is marked `[#13]` or links its comment, with its conditions. A number that a
-measurement proved wrong is struck through and stays in place, with the measured value and its comment beside it
+line marked "at `b289130a`" or "at `c21e3b81`" (0.3.10) was re-read at that commit. A thing that was not seen is marked
+`[unverified]`, and a number computed here is marked `[derived]`. "The contributor" is the one contributor who did the
+Spark work so far on two DGX Sparks; a reading of theirs is marked `[#13]` or links its comment, with its conditions.
+A number that a measurement proved wrong is struck through and stays in place, with the measured value and its comment beside it
 (`AGENTS.md`). The maintainers ran nothing on a Spark.
 
 Related documents: [`local-check.md`](local-check.md) (checking a change on your own machine: local mode and timing
@@ -32,56 +35,139 @@ budget solver.
 
 ## 1. Where the port stands
 
-| Phase | Done when | State (2026-10-13) | Left, and who |
+| Phase | Done when | State (0.3.10, `c21e3b81`) | Left, and who |
 |---|---|---|---|
 | **P0** compiles on aarch64 | `cargo check` of the host chain passes on aarch64 Linux, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | done: [#14](https://github.com/midagedev/bloomery/pull/14), `d95c7ec9` (design R: `qdot` refuses its host-tier types off x86, answer 1) | nothing (the site map is Appendix A) |
 | **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), `gate-engram`'s eviction clause (`86022f32`, answer 18). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the V4.1 DSpark draft fixture, still unpublished (only a draft reader refuses, [#159](https://github.com/midagedev/bloomery/pull/159)). `glm5next/corpus-prose.ids`, `engram/corpus-prose.ids` and `fx_ref_glm5next_vis_taps` are on the refset dataset since 2026-10-14 ([#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6168041480)). The first cc 12.1 pass is section 6 |
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
-| **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6) | nothing |
-| **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8). The card leg is in: on a pinned arena GLM-5.3-Flash's decode steps compute the arena's experts on the card from their slots (8.2) | an arena at serving defaults; V4.1 on the card leg, whose load attaches none yet (section 8) |
-| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words. Node 1's tier server, the load's plan from node 1's census, and both ends of a lost node run as two processes on one Spark over the loopback interface (9.5, items 5 and 6) | the placement half's engine side (contributor, answer 20): section 10 lists what is left; the protocol half, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828) (contributor): the `Link` seam, the counter relay (section 9.5, item 2) and the RDMA link on one machine (items 1, 3, 4 and 7) are in. Private IPv4 node binds connect independent RDMA ends (9.5, item 5), with no channel authentication. This map records no N = 2 engine rate, and the independent-capacity load adapter is left |
+| **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6). Since then: GB10 recipes build `sm_121a` by default ([#758](https://github.com/midagedev/bloomery/pull/758)), where routed NVFP4 and FP4-Local prompt products run W4A4 on the FP4 tensor cores ([#687](https://github.com/midagedev/bloomery/pull/687)) and MXFP8 prompt sites W8A8 ([#769](https://github.com/midagedev/bloomery/pull/769)); Qwen3.8's NVFP4 and FP4-Local folders serve as downloaded ([#635](https://github.com/midagedev/bloomery/pull/635), [#543](https://github.com/midagedev/bloomery/pull/543); section 2.3) | nothing |
+| **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8). The card leg is in: on a pinned arena a decode step's arena experts are computed on the card from their slots, for GLM-5.3-Flash and for the bodies that open through the common hosted hybrid (8.2) | an arena at serving defaults; V4.1 on the card leg, whose load attaches none yet (section 8) |
+| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words. Node 1's tier server, the load's plan from node 1's census, and both ends of a lost node run as two processes on one Spark over the loopback interface (9.5, items 5 and 6) | the placement half's engine side (contributor, answer 20): section 10 lists what is left; the protocol half, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828) (contributor): the `Link` seam, the counter relay (section 9.5, item 2) and the RDMA link on one machine (items 1, 3, 4 and 7) are in. Private IPv4 node binds connect independent RDMA ends (9.5, item 5), with no channel authentication. Tensor parallel for GLM-5.3-Flash: `--place tp` plans its checkpoint folder over N ranks, each in its own node's pool ([#519](https://github.com/midagedev/bloomery/pull/519)); a rank reads its parts from a GGUF file or a folder ([#618](https://github.com/midagedev/bloomery/pull/618)); the rank body and the head's merge run on one card with the parts carried over a loopback ([#589](https://github.com/midagedev/bloomery/pull/589)); the link's all-gather of row spans among N ranks is in ([#501](https://github.com/midagedev/bloomery/pull/501); 9.4). This map records no N = 2 engine rate. Left: the independent-capacity load adapter, and the ranks' step over the link between nodes, which `--place tp` refuses by name after rank 0's load (`crates/gpu-gates/src/bin/generate_glm5next.rs:519-525` at `c21e3b81`) |
 
 Files the open work touches: P1, the unpublished V4.1 DSpark draft fixture; P4, V4.1's attach of the card leg (`HostTier::attach_arena_leg` in
 `crates/gpu/src/host/mod.rs`, the leg in `crates/gpu/src/host/arena_leg.rs`); P5, `crates/placement` (`Machine`, `nodes_scale`),
-`crates/gpu/src/host/link.rs`, `link/pump.rs` and `link/rdma.rs` (the `Link` seam, the counter relay and the RDMA end)
-and the tier server (9.5, items 5 and 6).
+`crates/gpu/src/host/link.rs`, `link/pump.rs`, `link/rdma.rs` and `link/gather.rs` (the `Link` seam, the counter relay,
+the RDMA end and the all-gather), the tier server (9.5, items 5 and 6), and the tensor-parallel rank
+(`crates/placement/src/placement/tp.rs`, `crates/gpu-glm5next/src/tp/`).
 
 ## 2. Build and first run on a Spark
 
-**Build.** The contributor's builds run in the `nvidia/cuda:13.3.1-devel-ubuntu24.04` container (CUDA 13.3 for aarch64,
-the tested toolkit, answer 7) with LLVM 21.1.8's ARM64 release `llc` named by `CUDA_OXIDE_LLC` `[#13]`. Name it: without
-`CUDA_OXIDE_LLC`, cuda-oxide picks the Rust toolchain's `llc` (LLVM 23) first (section 6). The host driver needs CUDA 13.0 or later
-(`crates/serve/src/preflight.rs:16`). `.cargo/config.toml` carries `target-cpu=native` for
-`aarch64-unknown-linux-gnu` (`f0139df3`), and `tools/oxide-host.sh` writes the `cargo oxide` file from it, so a Spark needs no local flag. Run `tools/oxide-backend.sh` once (about a minute: it builds the backend with the patch this tree carries) and `tools/oxide-host.sh` before `cargo oxide`: it also refuses an unset or non-LLVM-21 `CUDA_OXIDE_LLC` by name, and a backend not built by `tools/oxide-backend.sh`. Device crates build with `cargo oxide` only,
-for example:
+A Spark builds from source (the release archive is x86-64 only), plans its one card against the unified pool, and
+serves any model that fits that pool whole on the card. 2.1 is the build, 2.2 the first placement and the models in
+the order to try them, and 2.3 the run path and the measured numbers for Qwen3.8 FP4-Local.
+
+### 2.1 Build
+
+The contributor's builds run in the `nvidia/cuda:13.3.1-devel-ubuntu24.04` container (CUDA 13.3 for aarch64, the tested
+toolkit, answer 7) with LLVM 21.1.8's ARM64 release `llc` named by `CUDA_OXIDE_LLC` `[#13]`. The host driver needs
+CUDA 13.0 or later (`crates/serve/src/preflight.rs:16`). `.cargo/config.toml` carries `target-cpu=native` for
+`aarch64-unknown-linux-gnu` (`f0139df3`), and `tools/oxide-host.sh` writes the `cargo oxide` file from it, so a Spark
+needs no local flag. Run `tools/oxide-backend.sh` once (about a minute: it builds the backend with the patch this tree
+carries) and `tools/oxide-host.sh` before `cargo oxide`. `tools/oxide-host.sh` refuses by name an unset
+`CUDA_OXIDE_LLC`, an `llc` of another LLVM major (`tools/oxide-host.sh:121` at `c21e3b81`) and a backend not built by
+`tools/oxide-backend.sh`, so the Rust toolchain's newer `llc` cannot make the PTX (section 6). Device crates build
+with `cargo oxide` only, for example:
 
 ```sh
 cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
 ```
 
-Recipes select `sm_121a` on a GB10 when `BLOOMERY_ARCH` is unset. This enables the existing native FP4 routed prompt
-path for NVFP4 and FP4-Local weights: both weights and activations use FP4 tensor cores. Dense MXFP8 prompt products
-use FP8 tensor cores the same way: each block of 32 activation values is rounded once to E4M3 with a shared
-power-of-two scale. Other routed formats keep their activation format, and decode is unchanged. An explicit
-`BLOOMERY_ARCH` still overrides the detected target; set it when invoking recipes from a machine without the target
-GPU. Other machines keep the `sm_86` default.
+Recipes select `sm_121a` on a GB10 when `BLOOMERY_ARCH` is unset (`tools/arch.sh:15-35` at `c21e3b81`). That target
+turns on the native FP4 routed prompt path for NVFP4 and FP4-Local weights (`crates/gpu/build.rs:4-9` at `c21e3b81`;
+plain `sm_121` does not build it): both weights and activations use FP4 tensor cores. Dense MXFP8 prompt products use
+FP8 tensor cores the same way: each block of 32 activation values is rounded once to E4M3 with a shared power-of-two
+scale. Other routed formats keep their activation format, and decode is unchanged. An explicit `BLOOMERY_ARCH` still
+overrides the detected target; set it when invoking recipes from a machine without the target GPU. Other machines keep
+the `sm_86` default.
+
+### 2.2 First placement and the models to try
 
 **Smallest first placement: everything on the card, no host tier, no NVMe tier.** Two ways in, both generic already:
-`--place a` is `Pick::Rank(0)`, "the largest visible card" (`crates/placement/src/placement/devices.rs:236-243`), and an
-unknown card takes the census path with its own total and free bytes (`devices.rs:98-123`); the Qwen3 and Qwen3.6 seat
-opens "CUDA device 0" (`crates/gpu/src/lib.rs:2124`; `docs/BUILD.md:100` at `b289130a`). `--place gate` plans the 3090's bytes on the
-smallest visible card with the room for them (`devices.rs:241`), which on a Spark is the GB10 with a 3090's share. The plan
-reads an integrated device's room from `MemAvailable` (section 7.2), so it no longer needs a `drop_caches` before the
-load, as the first run did (section 3).
+`--place a` is `Pick::Rank(0)`, "the largest visible card" (`crates/placement/src/placement/devices.rs:240-244` at
+`c21e3b81`), and an unknown card takes the census path with its own total and free bytes (`spec_of_device`,
+`devices.rs:105` at `c21e3b81`); `Gpu::new` opens CUDA device 0 (`crates/gpu/src/lib.rs:2264` at `c21e3b81`).
+`--place gate` plans the 3090's bytes on the smallest visible card with the room for them (`devices.rs:242` at
+`c21e3b81`), which on a Spark is the GB10 with a 3090's share. The plan reads an integrated device's room from
+`MemAvailable` (section 7.2), so it no longer needs a `drop_caches` before the load, as the first run did (section 3).
 
-Models by size, in the order to try them (`docs/models.md:12,31-34`, `docs/BUILD.md` table): Clef-Flash 4.8–9.7 GB,
-Qwen3-30B-A3B `Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M` 21.2 GB; then Qwen3.8 `UD-Q4_K_XL` 111.3 GB and GLM-5.3-Flash
-`UD-Q2_K_XL` 101.3 GiB (the size chosen "to fit a DGX Spark", https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L359) if the first `MemAvailable` reading
-allows. NVIDIA's own `nvidia/Qwen3.8-Flash-Next-NVFP4` checkpoint (132.7 GB on disk) serves from its folder as
-downloaded, `bloomery-serve -m <folder>`, with every routed expert on the GB10 and the PLE table read from the folder
-on the NVMe tier (`docs/serving.md`, the seats). Its gate, `gate-gpu-qwen4exp-nvfp4`, runs only on such a card: set
-`BLOOMERY_CARD_ALL_EXPERTS=1` there; a smaller card defers it by name. A 64 GB Spark (section 3; announced, not yet shipping) holds only the
-first three.
+Models by size, in the order to try them (`docs/models.md:45-52` at `c21e3b81`): Clef-Flash 4.8–9.7 GB, Qwen3-30B-A3B
+`Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M` 21.2 GB; then NVIDIA's Qwen3.8 checkpoint folders (2.3), Qwen3.8
+`UD-Q4_K_XL` 111.3 GB and GLM-5.3-Flash `UD-Q2_K_XL` 101.3 GiB (the size chosen "to fit a DGX Spark",
+https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L359) if the first `MemAvailable` reading
+allows. A 64 GB Spark (section 3; announced, not yet shipping) holds only the first three.
+
+### 2.3 Qwen3.8 FP4-Local on one Spark
+
+NVIDIA publishes Qwen3.8-Flash-Next in two checkpoint folders that a Spark serves as downloaded, with no conversion
+step: `nvidia/Qwen3.8-Flash-Next-NVFP4` (132.7 GB on disk) and `nvidia/Qwen3.8-Flash-Next-FP4-Local` (102.3 GB at
+revision `b9ce18a6`; NVFP4 experts with compressed block scales, MXFP8 and FP8 dense weights,
+[#543](https://github.com/midagedev/bloomery/pull/543)). `bloomery-serve -m <folder>` (a build with the `checkpoint`
+feature, 2.1) holds every routed expert on the GB10 and reads the PLE table from the folder on the NVMe tier
+([`serving.md`](../serving.md), the seats). On the `sm_121a` build the routed experts' prompt products run W4A4 and the
+MXFP8 sites W8A8 (2.1). The KV cache is f16: a Qwen3.8 load refuses the q8_0 cache by name
+(`crates/levers/src/registry.rs:1021-1022` at `c21e3b81`). The NVFP4 folder's gate, `gate-gpu-qwen4exp-nvfp4`, runs
+only on a card that holds every expert: set `BLOOMERY_CARD_ALL_EXPERTS=1` there; a smaller card defers it by name.
+
+The first run needs the folder alone:
+
+```sh
+target/release/bloomery-serve -m <FP4-Local folder>
+```
+
+With `BLOOMERY_MTP_DRAFT` unset, a folder target's MTP draft is the checkpoint's own MTP layer, loaded in its stored
+formats ([#682](https://github.com/midagedev/bloomery/pull/682); `draft_file`,
+`crates/refset/src/arch/qwen4exp/mtp.rs:33-38` at `c21e3b81`). An unset `BLOOMERY_DRAFT` drafts with it on one slot
+unless the load prints a `load draft=off` or `draft yield` record. The draft goes off under `--parallel` above 1,
+`--place gate` or `--mmproj`, with stores shorter than one window, on a plan that pages experts, and when its card
+bytes would leave a slot fewer context positions. `BLOOMERY_DRAFT=mtp` keeps it on under `--parallel` above 1 and never
+yields to the context (`crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs:28-31,162-171,236-238,246-264` at
+`c21e3b81`).
+
+The measurement below named a separate draft file instead: the shared Q8_0 draft that
+`unsloth/Qwen3.8-Flash-Next-GGUF` publishes, `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (revision `766911a6`), set
+by `BLOOMERY_MTP_DRAFT`. These are the servers the numbers below came from, one server per request count:
+
+```sh
+# drafting off
+BLOOMERY_DRAFT=off BLOOMERY_HOST_ROOM=100G \
+  target/release/bloomery-serve -m <FP4-Local folder> --parallel 1 --ctx-size 33024
+# MTP on (BLOOMERY_MTP_WIDTH is unset, which is `cost`)
+BLOOMERY_DRAFT=mtp BLOOMERY_MTP_DRAFT=<draft>/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  target/release/bloomery-serve -m <FP4-Local folder> --parallel 1 --ctx-size 33024
+# two and four requests at once: --parallel 2 --ctx-size 16896, --parallel 4 --ctx-size 17408
+```
+
+The load holds 78.4 to 79.2 GB on the card, by the context and slot count, and takes 44 to 52 s from the local NVMe
+drive (the server's `load` line). The client sends each request to `/v1/completions` with `prompt` as 4,096 token ids
+from a code corpus (`code-fn`) or an English prose corpus (`prose-en`), `max_tokens` 128, streaming with usage,
+`temperature` 0, `top_k` 1 and `cache_prompt` false; no two requests share a prompt. Decode is the median over
+requests of 1000 / TPOT (ms), prefill the median of prompt tokens / TTFT, and TTFT p50 the nearest-rank median. Total is the tokens generated after
+each request's first token, over the time from the phase's first first token to its last token. Each value is the
+median of three rounds; a round sends eight requests of each corpus one at a time, then runs the two- and
+four-request phases.
+
+Measured at main `cb8d92eb` on DGX Sparks (GB10, driver 595.84, CUDA 13.3 build, `sm_121a`), SM clock 2,424 to 2,476
+MHz just after each server's requests. Drafting off ran on one Spark with `BLOOMERY_HOST_ROOM=100G`, which sets the
+host room the plan reads instead of `MemAvailable` (at that commit the drafting-off load at `--ctx-size 33024` was
+refused at its part read-ahead by 0.6 GB without it; since [#870](https://github.com/midagedev/bloomery/pull/870) the
+load reads in smaller runs instead). MTP on ran on a second Spark of the same model with the room read from
+`MemAvailable`. The same drafting-off servers measured on two Sparks agreed within 1.5 % in every cell. tok/s
+unless named:
+
+| One request, 4,096-id prompt | Decode, off | Decode, MTP | TTFT p50 ms, off | TTFT p50 ms, MTP | Prefill, off | Prefill, MTP |
+|---|---:|---:|---:|---:|---:|---:|
+| `code-fn` | 30.4 | 55.7 | 1,916 | 2,003 | 2,135 | 2,045 |
+| `prose-en` | 30.1 | 39.1 | 1,881 | 1,967 | 2,176 | 2,082 |
+
+| Requests at once, 4,096-id prompts | Total, off | Total, MTP | Decode a request, off | Decode a request, MTP | TTFT p50 ms, off | TTFT p50 ms, MTP |
+|---|---:|---:|---:|---:|---:|---:|
+| 2, `code-fn` | 30.2 | 34.5 | 21.0 | 23.8 | 1,940 | 2,025 |
+| 2, `prose-en` | 30.7 | 31.7 | 21.1 | 21.1 | 1,863 | 1,928 |
+| 4, `code-fn` | 35.8 | 37.8 | 12.3 | 11.8 | 3,831 | 2,002 |
+| 4, `prose-en` | 36.6 | 36.4 | 12.6 | 11.5 | 3,763 | 1,948 |
+
+With MTP on and one request, a verify pass proposed 2.18 draft tokens on average and kept 58 % of them (both corpora).
+The greedy answers with MTP on and off were the same, character for character, in all 205 requests compared.
 
 ## 3. The machine
 
@@ -157,15 +243,17 @@ BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_BOUND
   two-card recipes (rc 64) ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Which
   fixture gates open on a card with no box name is in `local-check.md` section 3. `nvidia-smi` prints `[N/A]` for
   GB10's memory fields `[#13]`; the census reads the driver API (`gpu/src/lib.rs:1789`).
-- **`gate-ptx-spill`** runs on GB10 at `sm_86` and `sm_121`, against the cc 12.1 tables (section 6).
+- **`gate-ptx-spill`** runs on GB10 at `sm_86`, `sm_121` and `sm_121a`, against the cc 12.1 tables (section 6).
 
 **Fixtures.** A fixture is "a model file much smaller than the real one that keeps every
 per-layer shape" (`crates/model/src/fixture/mod.rs:1-4`) and "its bytes are a function of the seed and the source header
 alone" (`:29-32`), pinned by per-type digests (`fixture/digest.rs:1-10`). `fixture generate <real first shard> <out dir>`
-writes it (`crates/model-hf/src/bin/fixture.rs:4-5`). Three families have fixtures (`crates/refset/src/fixture.rs:33-37`:
-`qwen4exp`, `deepseek41`, `glm5next`); every other family is `self` in the table (`ref-paths.sh:75-79`) and its
-gates are deferred by name as real-file. So "P1 fixture gates" means those three families plus the host gates whose
-inputs are in process or published, not every `gate-*` recipe. A text classification of the `justfile` (not the batch
+writes it (`crates/model-hf/src/bin/fixture.rs:4-5`). The families with a fixture are the rows of
+`tools/fixture-dirs.tsv` that name a directory, ten at `c21e3b81` (`qwen4exp`, `deepseek41`, `glm5next`, `nemotron_h`,
+`nemotron_h_moe`, `qwen35moe`, `solar-open2`, `qwen3moe`, `muse-spark`, `minimax-m3`); a family whose row is `self` has
+none, and its gates are deferred by name as real-file. P1 was cut when only the first three had fixtures, so "P1
+fixture gates" means those three families plus the host gates whose inputs are in process or published, not every
+`gate-*` recipe. A text classification of the `justfile` (not the batch
 tool's): of 136 classified recipes, 44 are host-only and 60 take a card in both tiers, and 32 are real-tier only
 (`real-only.sh` or an inline exit 66); several host gates (`gate-qdot`) read harness dumps under `$BLOOMERY_DATA`.
 
@@ -190,8 +278,9 @@ shard 1 with the sha256 pinned as `FIXTURE_SHA256`. The generator copies the sou
 (`ref-paths.sh:33-35`), so the fixture gates run the **host tier**: `qdot`, the CPU attention, the card/host protocol. A
 Spark contributor therefore needs design S for `qdot` at P1 (scalar mirrors, correct bits, slow), not just design R.
 
-**Timing.** Two runners opt in to the timing mode today, `tools/ref/depth-qwen3moe.sh` and `tools/ref/depth-serve.sh`
-(`TIMING_LOCAL_RUNNER=1`, `tools/ref/timing-card.sh:34`); another runner refuses `BLOOMERY_BOX_CARD=local`. On GB10 the
+**Timing.** Four runners opt in to the timing mode at `c21e3b81`: `tools/ref/depth-qwen3moe.sh`,
+`tools/ref/depth-serve.sh`, `tools/ref/tier-cost.sh` (9.5) and `tools/ref/nsys-gpu.sh` (`TIMING_LOCAL_RUNNER=1`,
+`tools/ref/timing-card.sh:33`); another runner refuses `BLOOMERY_BOX_CARD=local`. On GB10 the
 witness reads `power.limit` as `[N/A]` and `scaling_cur_freq` from `cppc_cpufreq` `[#13]`. The Spark's own ruler comes
 from an A/A of one binary against itself, six rounds a sitting: decode 0.9987 ± 0.0065 at depth 6 and 1.0026 ± 0.0063 at
 depth 512, prefill 0.9971 ± 0.0024 at P = 512
@@ -278,22 +367,24 @@ is settled by reading.
 
 ## 6. The card
 
-GB10 recipes use the native FP4 build target described in section 2. The driver compiles its PTX at the first start.
+GB10 recipes build for `sm_121a`, the native FP4 target of section 2.1, and the driver compiles that PTX at the first
+start. The release archive and every other machine keep `sm_86`.
 
 - **Targets today.** Recipes pass `--arch {{arch}}` from `tools/arch.sh` and export the selected `BLOOMERY_ARCH` to
   their tools. `tools/gate.sh`, `tools/lds-scan.sh` and `tools/sass-scan.sh` use the same selector. `tools/ptx-scan.sh`
   accepts `sm_86`, `sm_120` and `sm_121`, including the Blackwell `a` and `f` suffixes; its occupancy columns and the
   spill tables follow the compiled target and the card's compute capability.
-- **Documented state.** `docs/cuda-oxide.md:5`: "Everything here runs on Ampere (sm_86) only." The toolchain ledger
-  (`docs/upstream/nvlabs-ledger.md`) has no `sm_121` or Blackwell row; its only Spark-related entry is row 32 (the flat
-  `extra-rustflags`). The GB10 runs below found no defect of the pinned cuda-oxide; the one gate they saw fail was decided by the
-  `llc` or libNVVM that made the code (the K-quant bullet).
-- **P0–P2 need no new target.** The binary carries `.target sm_86` PTX and the driver JIT-compiles it at load; the release
-  states it (`tools/release/README.release.md:15-16`: "the archive carries sm_86 PTX, which the driver compiles for the
-  card on first start"), and the loader says it for Blackwell: "A payload built for a standard pre-Blackwell target, such as
-  `sm_86`, may instead be converted to PTX and JIT-compiled by the driver on Blackwell"
-  (`cuda-host/src/embedded.rs:58-62` at fork rev `4da6c13`, `Cargo.toml:30`), and the first run on a Spark did it
-  (section 3 `[#13]`). The first JIT on the Arm cores, measured on one Spark (driver 595.84,
+- **Documented state.** `docs/cuda-oxide.md:5` names Ampere (`sm_86`) and the GB10 at `sm_121a`. The
+  toolchain ledger (`docs/upstream/nvlabs-ledger.md`) has no `sm_121` or Blackwell row; its Spark-related rows are 32
+  (the flat `extra-rustflags`) and 42 (the typed launch has no programmatic-dependent-launch form, found while reading
+  the GB10 decode step). The GB10 runs below found no defect of the pinned cuda-oxide; the one gate they saw fail was
+  decided by the `llc` or libNVVM that made the code (the K-quant bullet).
+- **P0–P2 needed no new target.** An `sm_86` binary carries `.target sm_86` PTX and the driver JIT-compiles it at load;
+  the release states it (`tools/release/README.release.md:16-17` at `c21e3b81`: "the archive carries sm_86 PTX, which
+  the driver compiles for the card on first start"), and the loader says it for Blackwell: "A payload built for a
+  standard pre-Blackwell target, such as `sm_86`, may instead be converted to PTX and JIT-compiled by the driver on
+  Blackwell" (`cuda-host/src/embedded.rs:58-62` at cuda-oxide rev `4da6c13`, the tree's pin then), and the first run
+  on a Spark did it (section 3 `[#13]`). The first JIT on the Arm cores, measured on one Spark (driver 595.84,
   [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6117747643)): a first start of `bloomery-serve`
   with Qwen3.6-35B-A3B `Q4_K_M` and an empty `CUDA_CACHE_PATH` took 10.5 to 11.8 s to `listening`, and a later start
   with the cache in place 4.1 s. The start without the cache minus the start with it, 6.4 to 7.7 s (median 6.5 s), is
@@ -303,17 +394,21 @@ GB10 recipes use the native FP4 build target described in section 2. The driver 
   with an empty cache, counting the file read, the context creation and the attribute reads, and 0.4 s with the cache
   in place; the difference, 8.3 to 8.4 s, is the JIT of every entry by the same subtraction `[derived]`. The first
   start is inside the 10 to 25 s measured on the box (`README.release.md`).
-- **`sm_121` for P3.** The fork's target table has `capability: 121` (`cuda-target-spec/src/lib.rs:382,417,447`) and its
-  selection tests name `sm_121a`/`sm_121f` (`cuda-oxide-codegen/src/target/tests/selection.rs:162-179`). ~~Whether LLVM 21's
+- **`sm_121` for P3, then `sm_121a`.** At cuda-oxide rev `4da6c13` the target table has `capability: 121`
+  (`cuda-target-spec/src/lib.rs:382,417,447`) and its selection tests name `sm_121a`/`sm_121f`
+  (`cuda-oxide-codegen/src/target/tests/selection.rs:162-179`). ~~Whether LLVM 21's
   NVPTX backend accepts `sm_121` is `[unverified]`~~ LLVM 21 emits `sm_121` PTX and the driver loads it; on GB10 the
   driver JIT gives the same SASS from `sm_86` and `sm_121` PTX for 213 of the 215 functions of `generate_qwen3moe`, the
-  generated ids are the same, and a timed sitting found no decode difference outside its margin ([#42](https://github.com/midagedev/bloomery/issues/42)); `cargo oxide doctor` passes on aarch64 `[#13]`. The fork's `tcgen05` path
+  generated ids are the same, and a timed sitting found no decode difference outside its margin ([#42](https://github.com/midagedev/bloomery/issues/42)); `cargo oxide doctor` passes on aarch64 `[#13]`. GB10
+  recipes now build `sm_121a` ([#758](https://github.com/midagedev/bloomery/pull/758)), which adds the native FP4
+  routed kernels that plain `sm_121` does not compile (section 2.1). cuda-oxide's `tcgen05` path
   is datacenter-Blackwell only (`rustc-codegen-cuda/README.md:107-108`: "need `sm_100a`, which a consumer `sm_120` lacks"),
   and we use no such instruction.
 - **Pins that follow the compute capability.** `gate-ptx-spill` reads one table per PTX arch and card capability,
   because `spill` follows the arch ptxas assembles for and `jit_local` the capability the driver JITs for.
-  `tools/ref/ptx-shapes.tsv` is `sm_86` on cc 8.6 (the RTX 3090). In `tools/ref/ptx-shapes/`, `sm_86-cc12.1.tsv` and
-  `sm_121-cc12.1.tsv` were pinned on GB10 (driver 595.84). The recipe names the base table and that directory, and
+  `tools/ref/ptx-shapes.tsv` is `sm_86` on cc 8.6 (the RTX 3090). In `tools/ref/ptx-shapes/`, `sm_86-cc12.1.tsv`,
+  `sm_121-cc12.1.tsv` and `sm_121a-cc12.1.tsv` were pinned on GB10 (driver 595.84); the `sm_121a` table also holds the
+  native FP4 entries its `# cfg: bloomery_nvfp4_mma` line names. The recipe names the base table and that directory, and
   `tools/ptx-spill-check.sh` reads each binary against the one its scan's banner names (`arch=`, `jit-cc=`). On cc 12.1 the JIT keeps more local memory than on
   cc 8.6 for 23 rows, 22 of which have none on cc 8.6 (14 rows of `generate_ds41`, 9 of `gate_e2e`; the largest is
   `q4k_gemv_tiles`, 184 bytes a thread). The two arches give these rows the same `jit_local`, and at `sm_121` ptxas also spills on them; each nonzero
@@ -345,14 +440,14 @@ GB10 recipes use the native FP4 build target described in section 2. The driver 
 - **K-quant bits and the `llc`.** `gate-gpu-kquant` failed when the PTX came from the Rust toolchain's `llc` (LLVM 23),
   which cuda-oxide picks ahead of LLVM 21, and passed under LLVM 21.1.8
   ([#54](https://github.com/midagedev/bloomery/issues/54)). [#63](https://github.com/midagedev/bloomery/pull/63)
-  (`0d3c28ab`) spells the one-column walk's rounding, so neither `llc` nor libNVVM decides its bits. Which `llc` a build
-  names is still #54's open item.
+  (`0d3c28ab`) spells the one-column walk's rounding, so neither `llc` nor libNVVM decides its bits. #54 is closed:
+  `tools/oxide-host.sh` refuses any `llc` but a named LLVM 21 one before a build (section 2.1).
 - **MXFP4 on Blackwell.** The block-scaled FP4 MMA `mma_m16n8k32_mxf8f6f4_f32_e2m1_e2m1` gives GGUF MXFP4's values bit
   for bit on GB10 at `sm_121a`, `sm_121f` and `sm_120f`, with the raw GGUF bytes and each e2m1 code in bits 5:2 of its
   byte. `sm_120a` PTX does not load on GB10 (`a PTX JIT compilation failed`; `ptxas` says a `sm_120a` program "cannot be
   compiled to future architecture"), so a Spark build names `sm_121a`, or `sm_120f` or `sm_121f` for a family build
-  ([#19](https://github.com/midagedev/bloomery/issues/19#issuecomment-6104507343)). GB10 recipes now select `sm_121a`
-  by default, enabling native W4A4 routed prompt products for NVFP4 and FP4-Local (section 2).
+  ([#19](https://github.com/midagedev/bloomery/issues/19#issuecomment-6104507343)). GB10 recipes select `sm_121a`
+  by default, enabling native W4A4 routed prompt products for NVFP4 and FP4-Local (section 2.1).
 
 ## 7. One pool
 
@@ -411,9 +506,8 @@ bytes to the NVMe tier's floor (section 8).
 A model larger than one Spark's pool keeps its overflow on the NVMe tier, and on one pool the card computes those
 experts from the tier's slots in place (answer 12). The read rates that choice rests on are measured (8.1). With S7 the
 arena on a Spark is write-combined pinned pages by default (`BLOOMERY_NVTIER_MEM` unset or `auto`; `anon` keeps the
-anonymous mapping), and GLM-5.3-Flash's card leg computes a decode step's arena experts from those pages on the card
-(8.2). P4 is done when GLM-5.3-Flash
-`UD-Q4_K_XL` or V4.1 `Q3_K_M` answers on one Spark with the card computing from the slots.
+anonymous mapping), and the card leg computes a decode step's arena experts from those pages on the card (8.2). P4 is
+done when GLM-5.3-Flash `UD-Q4_K_XL` or V4.1 `Q3_K_M` answers on one Spark with the card computing from the slots.
 
 **The load at serving defaults ([#100](https://github.com/midagedev/bloomery/pull/100)).** Both models load at serving defaults on one Spark and answer. The NVMe
 tier's floor is the least host room a plan with that tier needs, and on one pool the cards' share of the pool is one of
@@ -502,11 +596,14 @@ How a step runs ([`tierengine.md`](../research/tierengine.md) (h) item 1, `crate
    slots by then.
 
 When it runs: the arena gives the card an address (`BLOOMERY_NVTIER_MEM` is `pinned`, or `auto` on an integrated
-device), the family attaches it (GLM-5.3-Flash today), the page carries one column a row, the load has no expert tier
+device), the family attaches it, the page carries one column a row, the load has no expert tier
 card and starts no residency machine, and every covered layer's types have entries, its parts start on 4-byte words
 and it has a slot for each id a pass's rows hold at once (the rows times `n_used`). The `nvtier` record's `card_leg`
 says `on` or why the leg is off (`off_anon`, `off_expert_tier`, `off_cols`, `off_types`, `off_words`, `off_slots`,
-`off_residency`, `unattached`), and `card_ids` counts the ids the card read.
+`off_residency`, `unattached`), and `card_ids` counts the ids the card read. At `c21e3b81` GLM-5.3-Flash's load attaches
+the leg (`crates/gpu-glm5next/src/body.rs:1901`), and so does the common hosted-hybrid open
+(`crates/gpu/src/model.rs:2217`) that the MiniMax-M3, Muse Spark, Solar-Open2 and Flint bodies use; V4.1's load attaches
+none. Only GLM-5.3-Flash's gate runs the leg (below).
 
 The card quantizes the activation as q8_1 (an f32 scale per 128 values) where the host leg's K-quant dots take
 Q8_2X4 (a bf16 scale per 32), and it sums those experts in its own order, beside the host's sum, so the tokens can
@@ -524,7 +621,9 @@ P5 runs one model across N linked Sparks, N = 2 first, and no code may assume N 
 a read-only round (2026-10-11). Since then the fabric and the protocol probe ran on two Sparks with one direct cable
 (9.1, 9.6). The figures in 9.7 and 9.8 are still `[derived]` from section 5's cost model, the repo's byte counts and the
 assumptions stated once in 9.7. The engine's node Bind exchanges independent RDMA endpoints over its TCP
-control channel (9.5); no measured engine rate is claimed here.
+control channel (9.5); no measured engine rate is claimed here. Two ways to split a model are in the tree: remote expert
+tiers, the (a) of 9.3 (9.5, items 5 and 6), and tensor parallel for GLM-5.3-Flash, whose plan and rank body run on one
+machine and whose step across machines is not built (9.4).
 
 The work splits in two halves, as proposed in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134316241) and accepted in answer 20. The
 placement half needs no Arm protocol: `host` and `unified` into `nodes[0]`, the per-node shape of 9.2 and the unit gate
@@ -696,13 +795,29 @@ recomputed with the measured values.
 3. **(c) is left out.** Two stage cards that each run all layers for different requests and share experts are a replica
    kind, which the shape does not have.
 
-**Tensor parallel, TP = 2, is what NVIDIA documents** (9.1: vLLM `--tensor-parallel-size 2`, TRT-LLM `--tp_size 2`).
-`[derived]` `t = (A + Sh + R)/(2·BW) + L·m·λ` with m sync points a layer. At m = 2 on two nodes it reads GLM 25–36 tok/s
-and Qwen3.8 49–71 tok/s at one request, which beats (a) where A dominates. It shards every family's attention and dense
-kernels (an MLA latent cache replicated), changes the float sum order (a row-parallel all-reduce; column-only splits
-avoid that but take 2–4 gathers a layer), and needs an NCCL-class all-reduce every layer. It is the ceiling to remember,
-not the first step: a per-family rewrite against "Common code first". Whether to take it instead is the maintainers'
-decision.
+**Tensor parallel, (d).** NVIDIA's own multi-Spark guides run tensor parallel (9.1). `[derived]`
+`t = (A + Sh + R)/(2·BW) + L·m·λ` with m sync points a layer. At m = 2 on two nodes it reads GLM 25–36 tok/s and Qwen3.8
+49–71 tok/s at one request, which beats (a) where A dominates, because it also splits the attention bytes. It is now in
+the tree for GLM-5.3-Flash, written so that N, the rank count, is data and nothing names a pair:
+- **Plan.** `generate_glm5next --place tp` plans a checkpoint folder over N ranks, rank 0 on this process's card and
+  one rank on each node `BLOOMERY_TP_NODES` names, each against its own node's pool as that node's census reads it
+  ([#519](https://github.com/midagedev/bloomery/pull/519); `crates/placement/src/placement/tp.rs`). `--plan` prints one
+  `tp rank=` line a rank.
+- **Rank load.** A rank reads only its parts of each tensor, from a GGUF file or a checkpoint folder
+  ([#618](https://github.com/midagedev/bloomery/pull/618)). The cut is the family's rule: the attention runs the rank's
+  part of the heads, the dense blocks and experts their part of the inner width, the head its part of the vocabulary;
+  the router, the hyper-connection glue, the latent cache, the norms and the embedding stay whole on every rank
+  (`crates/gpu-glm5next/src/tp/mod.rs:1-11` at `c21e3b81`).
+- **Rank body.** Each sub-layer's output is a part of a sum; the ranks gather the parts and each adds them in rank
+  order, so every rank holds the same bits: two gathers a layer (`tp/mod.rs:13-20` at `c21e3b81`). The gather is the
+  link's all-gather of f32 row spans among N ranks over mirrored pages, carried as the counter relay carries a done
+  (9.5, item 2; `crates/gpu/src/host/link/gather.rs`, [#501](https://github.com/midagedev/bloomery/pull/501)).
+  `gate-gpu-glm5next-tp` runs the rank body on the fixture with each rank in its own context on one card, the parts
+  carried by a loopback, against the one-card body and the fixture's reference set
+  ([#589](https://github.com/midagedev/bloomery/pull/589)).
+- **Left.** Without `--plan`, rank 0 loads its parts and the run is refused by name: the ranks' step over the link
+  between nodes is not built (`crates/gpu-gates/src/bin/generate_glm5next.rs:519-525` at `c21e3b81`). The NextN draft
+  and a prompt batch do not run on the ranks yet.
 
 ### 9.5 Transport
 
@@ -1297,7 +1412,6 @@ Each open item; the owner is named where one is agreed. An item that a measureme
 **P1 and the card.**
 - The V4.1 DSpark draft fixture stays unpublished: no public file has its header. Only a gate that runs the draft
   refuses, after [#159](https://github.com/midagedev/bloomery/pull/159), so `gate-gpu-ds41-step` opens without it.
-- Which `llc` a build names ([#54](https://github.com/midagedev/bloomery/issues/54), section 6).
 
 **P4.**
 - An arena at serving defaults. The default plans of GLM-5.3-Flash and V4.1 on one Spark have none (section 8). A
@@ -1335,16 +1449,23 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   split; this does not yet lower the N-node planner's assignment. The node
   plans' card terms use the generic workstation card constants, not the program's `machine_for_experts` constants.
 - GLM's hit rates are assumptions; V4.1's come from a replay (9.7).
-- S₁ has a first reading on one Spark (9.7), at `v0.3.0` serving defaults with the MTP draft on.
+- S₁ has a first reading on one Spark (9.7), at `v0.3.0` serving defaults with the MTP draft on. For the FP4-Local
+  folder a 4,096-id prompt reads 2,135 and 2,176 tok/s with drafting off at `cb8d92eb` (2.3).
+- Tensor parallel's step across machines: GLM-5.3-Flash's ranks plan, load and run on one machine, and the step over
+  the link between nodes, the NextN draft and a prompt batch on the ranks are not built (9.4).
 - The switch hop: no switched Spark was measured (9.6).
 - Small-message (16 to 64 KB) bandwidth at the submitted head is `[unverified]`. The earlier cable reading in the
   closed list below is from `e8982d6a`, before every write was signaled and counted. Repeat `link_probe --size`,
   `ib_write_lat` and `ib_write_bw -t 128` across the cable in the same session, with strict ordering and one message
   in flight in the probe. Save the contributor evidence list from CONTRIBUTING: the `nvidia-smi` card and driver
   lines, both commit hashes, no model file (this probe uses synthetic messages), and the commands with their output.
-- Whether to take tensor parallel first instead of (a) is the maintainers' decision (9.4).
 
 **Closed.**
+- ~~Whether to take tensor parallel first instead of (a)~~: both are in the tree, (a) as remote expert tiers and
+  tensor parallel for GLM-5.3-Flash ([#519](https://github.com/midagedev/bloomery/pull/519),
+  [#589](https://github.com/midagedev/bloomery/pull/589); 9.4).
+- ~~Which `llc` a build names~~ ([#54](https://github.com/midagedev/bloomery/issues/54), closed): `tools/oxide-host.sh`
+  refuses an unset `CUDA_OXIDE_LLC` and any `llc` but LLVM 21 by name (section 2.1).
 - ~~A fill term in the node plans for rows read from the NVMe tier~~: `Terms::of` accepts row tables on that tier,
   and the node step charges their gathered file bytes over an explicit fill rate (9.7, 9.9 Terms). This is a serial
   byte-rate model with no table-cache hits, not a measured prediction for the V4.1 file.
@@ -1430,7 +1551,8 @@ answers came on 2026-10-10.
 7. **Toolkit:** CUDA 13.3 for aarch64 (sbsa) is the tested set, not DGX OS's 13.0. `sm_86` PTX through the JIT until P3;
    `sm_121` PTX is a P3 item (`BLOOMERY_ARCH=sm_121`, section 3.2).
    *Now: `sm_121` PTX was checked on GB10 ([#42](https://github.com/midagedev/bloomery/issues/42)), and both arches have
-   cc 12.1 `ptx-shapes` tables; section 6.*
+   cc 12.1 `ptx-shapes` tables. GB10 recipes build `sm_121a` by default since `42dd81bf1`
+   ([#758](https://github.com/midagedev/bloomery/pull/758)), whose table is pinned too; section 6.*
 8. **64 GB Spark:** best effort, for the models that fit; not a target.
    *Now: unchanged.*
 9. **An aarch64 release tarball:** P3 or later.
@@ -1461,7 +1583,7 @@ Added 2026-10-13 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecom
 15. **Numbers a measurement proved wrong:** strike them through, do not delete them, and put the corrected value and the
     measurement's comment beside them (`AGENTS.md`). The rows the maintainers said on #41 and #42 they would fix (the
     card section, the open list and the P/E row) may be fixed in the same rewrite, if the contributor wants.
-    *Now: done in this revision (sections 6 and 10, Appendix A).*
+    *Now: done (sections 6 and 10, Appendix A).*
 16. **The hit-rate rows:** the maintainers lean to showing both rows (the ranked fixed set and LRU); whoever read the
     trace decides.
     *Now: both rows (9.7).*
@@ -1504,7 +1626,7 @@ result bullets, lines 197 to 200). Their line numbers are stale; the citations h
 |---|---|---|
 | `sparkprep` S1: cfg guards on the x86 bodies | `qdot`, `deepseek2/attn`, one bin | done in [#14](https://github.com/midagedev/bloomery/pull/14) (P0): every AVX2 item under `cfg(target_arch = "x86_64")`, design R off it |
 | `sparkprep` S2: per-triple `extra-rustflags` | `tools/oxide-host.sh` | done: `.cargo/config.toml` carries `znver3` for x86_64 and `native` for aarch64; `tools/oxide-host.sh` writes the flat `.cargo/cuda-oxide.toml` cargo-oxide reads for the triple a build is for, and `tools/check-rustflags.sh` holds both triples (the fork patch that did this is gone with the fork) |
-| `sparkprep` S3 / `archkey`: one owner of `--arch` | 139 recipe lines | done: the justfile's `arch` variable reads `BLOOMERY_ARCH` (default `sm_86`; unset, every recipe expands as before), the tools that run on the box read it through `tools/arch.sh`, `tools/box.sh` forwards it, and `tools/check-recipes.sh` fails on an arch literal. `just narrow` and `release-build` refuse another arch by name; `ptx-scan` also takes `sm_120` and `sm_121`, and `gate-ptx-spill` reads a table per arch and card capability (section 6) |
+| `sparkprep` S3 / `archkey`: one owner of `--arch` | 139 recipe lines | done: the justfile's `arch` variable reads `BLOOMERY_ARCH` (unset: `sm_121a` on a GB10 and `sm_86` elsewhere), the tools that run on the box read it through `tools/arch.sh`, `tools/box.sh` forwards it, and `tools/check-recipes.sh` fails on an arch literal. `just narrow` and `release-build` refuse another arch by name; `ptx-scan` also takes `sm_120` and `sm_121`, and `gate-ptx-spill` reads a table per arch and card capability (section 6) |
 | `sparkprep` S4: tools for N cards | `cards.sh`, `timing-card.sh`, `gpu-gate.sh` | ~~not done: `tools/ref/cards.sh:31-35` names two cards~~ partly: local mode ([#38](https://github.com/midagedev/bloomery/pull/38)) and the single-card timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)) run on one local card; `tools/ref/cards.sh:33-34` still names the box's two |
 | `isarefuse`: CPU check at `main` | x86-64-v3 refusal | partly: `crates/serve/src/preflight.rs` and `crates/gpu-gates/src/bin/bloomery_serve.rs:70-71` (`cpu_gate`, x86-only); no other bin calls it |
 
