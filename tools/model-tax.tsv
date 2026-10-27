@@ -87,7 +87,7 @@ crates/gpu-gates/src/bin/shared/routed_legs.rs	gemma	4	baseline P 5: MK2 program
 crates/gpu-gates/src/bin/shared/routed_legs.rs	glm	7	baseline P 8: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	4	baseline P 5: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	nemotron	4	baseline P 6: MK2 program by body
-crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	21	baseline P 24: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	22	baseline P 24: MK2 program by body
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	clef	13	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	qwen	11	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/served.rs	qwen	1	baseline S 1: MK9 seat by program

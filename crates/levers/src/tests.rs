@@ -59,6 +59,19 @@ fn pool(r: &LeverSpec) -> bool {
         || r.name == TIER_NODES
 }
 
+/// The Direct rows `by` reads.
+fn direct(by: Readers) -> impl Iterator<Item = &'static LeverSpec> {
+    REGISTRY
+        .iter()
+        .filter(move |r| matches!(r.site, Site::Direct { by: b, .. } if b == by))
+}
+
+/// A binary's reading that names no lever.
+const NO_LEVER: Scope<'static> = Scope::Main {
+    bin: "b",
+    acts_on: &[],
+};
+
 /// Every file that reads a lever in place, with its round.
 fn in_place(site: Site) -> &'static [InPlace] {
     match site {
@@ -871,7 +884,7 @@ fn draft_row_takes_mtp_and_off() {
 
 /// `BLOOMERY_MTP_DRAFT` set to a path with nothing there, or to a
 /// directory, is refused saying why, beside what the kind takes
-/// (`parsed_levers_refuse_what_their_kind_does_not_take` holds the rest).
+/// (`levers_refuse_what_their_kind_does_not_take` holds the rest).
 #[test]
 fn mtp_draft_refusal_says_no_file_is_there() {
     for value in ["/no/such/draft.gguf", env!("CARGO_MANIFEST_DIR")] {
@@ -1987,36 +2000,57 @@ fn qwen38_experts_unset_is_card() {
     }
 }
 
-/// Every Parsed lever refuses, naming itself, each value its kind does not
-/// take and a value that is not UTF-8 — a number past `u64` saying so — in a
-/// binary's reading as in a harness's; a row that trims takes its value with
-/// spaces around it.
+/// Every Parsed and Direct lever refuses, naming itself, each value its kind
+/// does not take and a value that is not UTF-8 — a number past `u64` saying
+/// so — in a binary's reading whether it reads the lever or not, and a Parsed
+/// one in a harness's; a row that trims takes its value with spaces around
+/// it, and a [`Kind::Text`] value is its owner's to check, so it is taken as
+/// written. Mutant: a reading that leaves a Direct value to the reader in
+/// place, so `BLOOMERY_QWEN3_UBATCH=0` is taken and refused only once a load
+/// reads it.
 #[test]
-fn parsed_levers_refuse_what_their_kind_does_not_take() {
+fn levers_refuse_what_their_kind_does_not_take() {
     let raw = OsStr::from_bytes(b"o\xffn");
-    for r in parsed() {
-        let acts_on = [r.name];
-        let scopes = [
-            Scope::Every,
-            Scope::Main {
-                bin: "b",
-                acts_on: &acts_on,
+    for r in parsed()
+        .chain(direct(Readers::Every))
+        .chain(direct(Readers::Named))
+    {
+        let names = [r.name];
+        // An Every lever is read with no name in the list, which takes none.
+        let main = Scope::Main {
+            bin: "b",
+            acts_on: if not_named(&names).is_none() {
+                &names
+            } else {
+                &[]
             },
-        ];
-        let mut values: Vec<OsString> = garbage(r.kind).into_iter().map(OsString::from).collect();
-        values.push(raw.to_os_string());
-        for v in &values {
-            for scope in scopes {
-                let Err(e) = read(&env(&[(r.name, v)]), scope) else {
-                    panic!("{}={v:?} was taken", r.name);
+        };
+        let other = if matches!(r.site, Site::Parsed { .. }) {
+            Scope::Every
+        } else {
+            NO_LEVER
+        };
+        for scope in [main, other] {
+            if r.kind == Kind::Text {
+                for v in ["", "anything at all"] {
+                    let got = read(&env(&[(r.name, v)]), scope).unwrap_or_else(|e| panic!("{e}"));
+                    assert_eq!(got.entry(r.name).set.as_deref(), Some(v));
+                    assert_eq!(got.entry(r.name).value, None);
+                }
+                continue;
+            }
+            let mut values: Vec<OsString> =
+                garbage(r.kind).into_iter().map(OsString::from).collect();
+            values.push(raw.to_os_string());
+            for v in &values {
+                let e = read(&env(&[(r.name, v)]), scope).expect_err("invalid value");
+                let [f] = e.refused.as_slice() else {
+                    panic!("{e}")
                 };
-                let [refusal] = e.refused.as_slice() else {
-                    panic!("{}={v:?}: {e}", r.name);
+                let Why::Value(expected) = &f.why else {
+                    panic!("{e}")
                 };
-                let Why::Value(expected) = &refusal.why else {
-                    panic!("{}={v:?}: {e}", r.name);
-                };
-                assert_eq!(refusal.name, r.name, "{e}");
+                assert_eq!(f.name, r.name, "{e}");
                 assert!(expected.contains(&r.kind.takes()), "{e}");
                 if v.as_encoded_bytes().starts_with(b"1844674407370955161") || v == "17179869184G" {
                     assert!(expected.starts_with(OVERFLOW), "{e}");
@@ -2025,12 +2059,13 @@ fn parsed_levers_refuse_what_their_kind_does_not_take() {
                     assert!(expected.starts_with("not UTF-8"), "{e}");
                 }
             }
-        }
-        if let Kind::Count { trim: true, .. } = r.kind {
-            let padded = format!(" {} ", sample(r.kind));
-            let levers = read(&env(&[(r.name, padded.as_str())]), Scope::Every)
-                .unwrap_or_else(|e| panic!("{}={padded:?}: {e}", r.name));
-            assert_eq!(levers.entry(r.name).set.as_deref(), Some(padded.as_str()));
+            read(&env(&[(r.name, sample(r.kind))]), scope).unwrap_or_else(|e| panic!("{e}"));
+            if let Kind::Count { trim: true, .. } = r.kind {
+                let padded = format!(" {} ", sample(r.kind));
+                let got = read(&env(&[(r.name, padded.as_str())]), scope)
+                    .unwrap_or_else(|e| panic!("{e}"));
+                assert_eq!(got.entry(r.name).set.as_deref(), Some(padded.as_str()));
+            }
         }
     }
 }
@@ -2086,36 +2121,81 @@ fn a_binary_refuses_the_levers_it_does_not_act_on() {
             ),
         }
         let acts_on = [r.name];
-        let levers = read(
-            &set,
-            Scope::Main {
-                bin: "b",
-                acts_on: &acts_on,
-            },
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
-        let table = levers.table();
+        let main = Scope::Main {
+            bin: "b",
+            acts_on: &acts_on,
+        };
+        read(&set, main).unwrap_or_else(|e| panic!("{e}"));
+        let table = reading(&set, main).table();
         for p in parsed() {
             let line = table
                 .lines()
                 .find(|l| l.split_whitespace().next() == Some(p.name))
                 .unwrap_or_else(|| panic!("no line for {}", p.name));
-            let dash = line.split_whitespace().nth(4) == Some("-");
-            assert_eq!(dash, p.name != r.name && !pool(p), "{line}");
+            let cells: Vec<&str> = line.split_whitespace().collect();
+            let unread = p.name != r.name && !pool(p);
+            assert_eq!(cells[4] == "no" && cells[5] == "-", unread, "{line}");
         }
     }
-    let parsed_names: Vec<&str> = parsed().map(|r| r.name).collect();
-    assert_eq!(not_parsed(&parsed_names), None);
-    for r in REGISTRY
-        .iter()
-        .filter(|r| !matches!(r.site, Site::Parsed { .. }))
-    {
-        assert_eq!(not_parsed(&[parsed_names[0], r.name]), Some(r.name));
+    let named: Vec<&str> = parsed()
+        .chain(direct(Readers::Named))
+        .map(|r| r.name)
+        .collect();
+    assert_eq!(not_named(&named), None);
+    for r in REGISTRY.iter().filter(|r| !named.contains(&r.name)) {
+        assert_eq!(not_named(&[named[0], r.name]), Some(r.name));
     }
     assert_eq!(
-        not_parsed(&["BLOOMERY_NO_SUCH_NAME"]),
+        not_named(&["BLOOMERY_NO_SUCH_NAME"]),
         Some("BLOOMERY_NO_SUCH_NAME")
     );
+}
+
+/// A binary applies a Direct lever its path reads (one it names, or one
+/// every binary reads), and takes a well-formed Named one it leaves out
+/// without a refusal, since one environment may carry the levers of several
+/// models: that one is not applied, and its line names the binary, the
+/// lever and where it is read. A Parsed lever left out is still refused.
+/// Mutants: every Direct lever counted as read, so `BLOOMERY_WEIGHTS=anon`
+/// beside a server says nothing; a Named one refused, so a start with
+/// another model's lever set stops.
+#[test]
+fn a_binary_names_the_direct_levers_it_does_not_apply() {
+    for r in direct(Readers::Every) {
+        let set = env(&[(r.name, sample(r.kind))]);
+        let got = reading(&set, NO_LEVER);
+        assert!(got.unapplied("b").is_empty(), "{}", r.name);
+        got.levers().unwrap_or_else(|e| panic!("{e}"));
+    }
+    for r in direct(Readers::Named) {
+        let v = sample(r.kind);
+        let set = env(&[(r.name, v.as_str())]);
+        let got = reading(&set, NO_LEVER);
+        let [line] = got
+            .unapplied("b")
+            .try_into()
+            .unwrap_or_else(|l| panic!("{l:?}"));
+        let at = in_place(r.site)[0].file;
+        assert!(
+            line.starts_with(&format!(
+                "{}={v:?} is not applied: this binary (b) does not read it",
+                r.name
+            )) && line.contains(at),
+            "{line}"
+        );
+        let levers = got.levers().unwrap_or_else(|e| panic!("{e}"));
+        assert!(!levers.entry(r.name).acts, "{}", r.name);
+        let acts_on = [r.name];
+        let main = Scope::Main {
+            bin: "b",
+            acts_on: &acts_on,
+        };
+        let got = reading(&set, main);
+        assert!(got.unapplied("b").is_empty(), "{}", r.name);
+        let levers = got.levers().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(levers.entry(r.name).set.as_deref(), Some(v.as_str()));
+        assert!(levers.entry(r.name).acts, "{}", r.name);
+    }
 }
 
 /// A binary refuses a `BLOOMERY_*` name no row names, naming it and the row
@@ -2148,10 +2228,12 @@ fn a_binary_refuses_a_name_no_row_names() {
             assert!(read(&env(&[(typo, "x")]), scope).is_ok(), "{typo}");
         }
     }
-    let known: Vec<(&str, &str)> = REGISTRY
+    // PIN(2026-10-27): a Direct lever's value is checked by its kind now
+    // (levers_refuse_what_their_kind_does_not_take), so each takes a value of its kind.
+    let known: Vec<(&str, String)> = REGISTRY
         .iter()
         .filter(|r| matches!(r.site, Site::Direct { .. } | Site::Env { .. }))
-        .map(|r| (r.name, "x"))
+        .map(|r| (r.name, sample(r.kind)))
         .collect();
     let mut all = env(&known);
     all.push(("PATH".into(), "/bin".into()));
@@ -2436,50 +2518,128 @@ fn markdown_is_a_line_per_row() {
     println!("{md}");
 }
 
-/// `--levers` prints a line per lever with the phase and the reading's value:
-/// the phase as the row states it (`load`, `runtime`) or `-` for a retired
-/// row, which states none; the value as set, the default, or `-` for a lever
-/// the reading does not parse; a name that is no lever has no line.
+/// `--levers` prints a line per lever with the phase, whether the run applies
+/// it and the reading's value: the phase as the row states it (`load`,
+/// `runtime`) or `-` for a retired row, which states none; `yes` and the
+/// value as set or the default for a lever the binary reads, Parsed or
+/// Direct; `no` and the value as set for a Direct lever set that it does not
+/// read; `refused` and the value as set for a name it refuses (a retired
+/// one); `no` and `-` for the rest. A reading that refuses still prints
+/// every line. A name that is no lever has no line. Mutant: a table of the
+/// Parsed levers alone, so the Direct levers set beside them read `no -` and
+/// their values never show.
 #[test]
 fn table_is_a_line_per_lever() {
     let r = parsed().find(|r| !pool(r)).expect("a Parsed lever");
-    let v = sample(r.kind);
-    let acts_on = [r.name];
-    let t = read(
-        &env(&[(r.name, v.as_str())]),
+    let mut named = direct(Readers::Named).filter(|r| r.kind != Kind::Text);
+    let (unread, read_here) = (
+        named.next().expect("a Direct lever"),
+        named.next().expect("two"),
+    );
+    let gone = retired().next().expect("a retired row");
+    let set = [
+        (r.name, sample(r.kind)),
+        (unread.name, sample(unread.kind)),
+        (gone.name, "1".to_string()),
+    ];
+    let acts_on = [r.name, read_here.name];
+    let t = reading(
+        &env(&set),
         Scope::Main {
             bin: "b",
             acts_on: &acts_on,
         },
     )
-    .unwrap_or_else(|e| panic!("{e}"))
     .table();
     let levers: Vec<&LeverSpec> = REGISTRY.iter().filter(|r| r.is_lever()).collect();
     assert_eq!(t.lines().count(), levers.len(), "{t}");
     for (line, row) in t.lines().zip(levers) {
-        let mut cells = line.split_whitespace();
-        assert_eq!(cells.next(), Some(row.name), "{line}");
+        let cells: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(cells[0], row.name, "{line}");
         let phase = match row.site {
             Site::Parsed { phase, .. } | Site::Direct { phase, .. } => phase.word(),
             Site::Retired { .. } | Site::Env { .. } => "-",
         };
-        assert_eq!(cells.nth(2), Some(phase), "{line}");
-        let value = line
-            .split_whitespace()
-            .skip(4)
-            .collect::<Vec<_>>()
-            .join(" ");
-        let want = if row.name == r.name {
-            format!("set {v}")
-        } else if pool(row) {
-            match row.default {
-                Unset::Is(d) => format!("default {d}"),
-                Unset::Means(m) => format!("unset: {m}"),
-            }
-        } else {
-            "-".to_string()
+        assert_eq!(cells[3], phase, "{line}");
+        let default = || match row.default {
+            Unset::Is(d) => format!("default {d}"),
+            Unset::Means(m) => format!("unset: {m}"),
         };
-        assert!(value.starts_with(&want), "{line}");
+        let every = matches!(
+            row.site,
+            Site::Direct {
+                by: Readers::Every,
+                ..
+            }
+        );
+        let want = match set.iter().find(|(name, _)| *name == row.name) {
+            Some((_, v)) if row.name == r.name => format!("yes set {v}"),
+            Some((_, v)) if row.name == unread.name => format!("no set {v}"),
+            Some((_, v)) => format!("refused set {v}"),
+            None if row.name == read_here.name || pool(row) || every => {
+                format!("yes {}", default())
+            }
+            None => "no -".to_string(),
+        };
+        assert!(cells[4..].join(" ").starts_with(&want), "{line}");
+    }
+}
+
+#[test]
+fn cli_prints_the_table_before_refusing_a_direct_value() {
+    if std::env::var_os("LEVERS_CLI_CHILD").is_some() {
+        if let Err(error) = at_main(&[]) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        panic!("--levers returned without a refusal");
+    }
+    for (value, applies, success) in [("0", "refused", false), ("128", "no", true)] {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::cli_prints_the_table_before_refusing_a_direct_value",
+                "--nocapture",
+                "--",
+                "--levers",
+            ])
+            .env_clear()
+            .env("LEVERS_CLI_CHILD", "1")
+            .env("BLOOMERY_QWEN3_UBATCH", value)
+            .output()
+            .expect("run --levers");
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 table");
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 refusal");
+        assert_eq!(output.status.success(), success, "{stdout}\n{stderr}");
+        let rows: Vec<_> = stdout
+            .lines()
+            .filter(|line| line.starts_with("BLOOMERY_"))
+            .collect();
+        let levers: Vec<_> = REGISTRY.iter().filter(|row| row.is_lever()).collect();
+        assert_eq!(rows.len(), levers.len(), "{stdout}");
+        for (line, row) in rows.iter().zip(levers) {
+            assert_eq!(line.split_whitespace().next(), Some(row.name), "{line}");
+        }
+        let line = rows
+            .iter()
+            .find(|line| line.starts_with("BLOOMERY_QWEN3_UBATCH "))
+            .expect("ubatch row");
+        let cells: Vec<_> = line.split_whitespace().collect();
+        assert_eq!(&cells[4..7], &[applies, "set", value], "{line}");
+        let reason = if success {
+            "is not applied"
+        } else {
+            "is refused"
+        };
+        assert!(
+            stderr.contains(&format!("BLOOMERY_QWEN3_UBATCH={value:?} {reason}")),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.matches("is not applied").count(),
+            usize::from(success),
+            "{stderr}"
+        );
     }
 }
 

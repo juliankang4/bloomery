@@ -926,7 +926,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        bloomery_levers::at_main(&[])?;
+        bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
         record::at_main(
             "gate_gemma_embedding2_serve",
             record::GATE_GEMMA_EMBEDDING2_SERVE,

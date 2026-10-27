@@ -25,4 +25,5 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::STEP_STATS,
     bloomery_levers::SCREEN,
     bloomery_levers::SCHEMAJUMP,
+    bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
 ];

@@ -396,6 +396,12 @@ mod tests {
     /// The lever `PlanLevers::from_levers` reads for the seat's plans.
     const PLAN_READS: &[&str] = &[bloomery_levers::CARD_BUDGET];
 
+    /// Each call of the seat that reads a Direct lever in place, with the lever.
+    const DIRECT_READS: &[(&str, &str)] = &[(
+        "ubatch_rule(a.",
+        bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
+    )];
+
     #[test]
     fn the_levers_list_is_the_levers_the_seat_reads() {
         let src = include_str!("shared/serve_seats/qwen38.rs");
@@ -428,6 +434,13 @@ mod tests {
             );
         }
         read.extend(PLAN_READS.iter().copied());
+        for (call, lever) in DIRECT_READS {
+            assert!(
+                src.contains(call),
+                "the seat no longer calls {call}: drop {lever}"
+            );
+            read.insert(*lever);
+        }
         for lever in &read {
             assert!(
                 ACTS_ON.contains(lever),

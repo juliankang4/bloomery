@@ -4504,7 +4504,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        bloomery_levers::at_main(&[])?;
+        bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
         let a = parse_args()?;
         let mut ok = true;
         unplaced_card_is_the_largest(&mut ok);

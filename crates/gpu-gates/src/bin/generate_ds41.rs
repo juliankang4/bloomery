@@ -743,7 +743,8 @@ mod drive {
         }
     }
 
-    /// The Parsed levers the run acts on besides the pool's two.
+    /// The levers the run acts on besides the pool's two: the Parsed ones,
+    /// and the DSpark draft's card, read in place where the draft opens.
     const ACTS_ON: &[&str] = &[
         CED,
         PREFILL,
@@ -764,6 +765,7 @@ mod drive {
         HOSTSTREAM,
         GEN_SLOTS,
         WARM_PROFILE,
+        bloomery_gpu_gates::llama_place::DRAFT_CARD,
     ];
 
     pub fn run() -> Result<(), GateError> {

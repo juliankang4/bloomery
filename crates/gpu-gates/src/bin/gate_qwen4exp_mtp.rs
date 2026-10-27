@@ -411,7 +411,10 @@ mod gate {
     /// Read the headers once and print each derived value beside the real
     /// file's literal it replaced ([`tier::witness`]).
     fn init() -> Result<bool, GateError> {
-        let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
+        let levers = bloomery_levers::at_main(&[
+            CARD_BUDGET,
+            bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
+        ])?;
         let path = ref_model_path()?;
         let draft = draft_path(&levers, &path)?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;

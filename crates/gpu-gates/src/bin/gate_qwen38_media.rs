@@ -1321,7 +1321,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[])?;
+        let levers = bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
         let dir = dir_arg()?;
         let path = ref_model_path()?;
         if path != Path::new(MODEL) {

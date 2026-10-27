@@ -590,7 +590,7 @@ mod gate {
     /// The model placed on the gate card by its plan, the routed experts on the card's id prefix
     /// and the host beyond it (`Experts::Card`), under the plan's own machine: the e2e gate's open.
     fn open() -> Result<Qwen38Model, GateError> {
-        let levers = bloomery_levers::at_main(&[])?;
+        let levers = bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
         let file = crate::qwen38_open::open_split(Path::new(MODEL))?;
         let t = Instant::now();
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
@@ -640,7 +640,7 @@ mod gate {
     /// The engine child: the pool's width, the load, the 512-position prompt through the ubatch
     /// walk, 8 decode steps, every logit held finite, the walk's per-layer host slots and the dump.
     fn child(dump: &str) -> Result<(), GateError> {
-        bloomery_levers::at_main(&[])?;
+        bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
         println!("iqleg width={}", threads::pool().threads());
         crate::gate_card::init()?;
         let mut m = open()?;
@@ -846,7 +846,7 @@ mod gate {
             let dump = args.next().ok_or("--engine takes the dump path")?;
             return child(&dump);
         }
-        bloomery_levers::at_main(&[])?;
+        bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
         crate::gate_card::init()?;
         let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         let inv = Inventories::of(&split)?;

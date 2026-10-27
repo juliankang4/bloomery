@@ -523,7 +523,8 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
-        let host = bloomery_levers::at_main(&[])?.host();
+        let host =
+            bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?.host();
         let args: Vec<String> = std::env::args().collect();
         if let Some(tag) = word_after("--ppl") {
             let tag = tag.ok_or("--ppl needs a tag")?;

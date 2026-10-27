@@ -57,7 +57,8 @@ mod gate {
                                 gate·up, which the card kernel table names no entry for here";
 
     pub fn run() -> Result<(), GateError> {
-        let host = bloomery_levers::at_main(&[])?.host();
+        let host =
+            bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?.host();
         let types: Vec<GgmlType> = (0..64)
             .map(GgmlType::from_u32)
             .filter(|&t| !matches!(t, GgmlType::Unknown(_)) && qdot::supports(t))

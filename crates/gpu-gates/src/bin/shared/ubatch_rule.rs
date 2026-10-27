@@ -3,7 +3,7 @@
 //! loads (`qwen3moe_place`), the decide seat's backbone and the Qwen3.8 seat, each including this
 //! file. It lives beside the bins, not in the lib, because it reads the qwen3moe body's lever.
 
-use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH, UBATCH_ENV, ubatch_asked};
+pub(crate) use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH, UBATCH_ENV, ubatch_asked};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::ubatch_pick::Rule;
 

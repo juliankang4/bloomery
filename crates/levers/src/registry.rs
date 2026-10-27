@@ -8,7 +8,7 @@
 //! every `BLOOMERY_*` name under `tools/`, in the justfile and in `.cargo/` to
 //! a row.
 
-use crate::{Class, HostLanes, InPlace, Kind, LeverSpec, Phase, Site, Unset};
+use crate::{Class, HostLanes, InPlace, Kind, LeverSpec, Phase, Readers, Site, Unset};
 
 pub const THREADS: &str = "BLOOMERY_THREADS";
 pub const SPIN: &str = "BLOOMERY_SPIN";
@@ -1197,6 +1197,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: R03,
             }],
             phase: Phase::Load,
+            by: Readers::Every,
         },
     },
     LeverSpec {
@@ -1225,6 +1226,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: R03,
             }],
             phase: Phase::Load,
+            by: Readers::Every,
         },
     },
     LeverSpec {
@@ -1256,6 +1258,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: R03,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1281,6 +1284,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 },
             ],
             phase: Phase::Load,
+            by: Readers::Every,
         },
     },
     LeverSpec {
@@ -1296,6 +1300,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: V2FENCE,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1313,6 +1318,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: ISA_OWNER,
             }],
             phase: Phase::Load,
+            by: Readers::Every,
         },
     },
     LeverSpec {
@@ -1327,6 +1333,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: V2FENCE,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1345,6 +1352,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: V2FENCE,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1365,6 +1373,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: V2FENCE,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1380,6 +1389,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: V2FENCE,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1395,6 +1405,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: V2FENCE,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1410,6 +1421,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: V2FENCE,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1467,6 +1479,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: V2FENCE,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1511,6 +1524,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: R03,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1526,6 +1540,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: V2FENCE,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1542,6 +1557,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: V2FENCE,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {
@@ -1565,6 +1581,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                 round: SESSION,
             }],
             phase: Phase::Load,
+            by: Readers::Named,
         },
     },
     LeverSpec {

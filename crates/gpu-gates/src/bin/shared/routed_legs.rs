@@ -657,7 +657,7 @@ fn per_call(secs: f64, calls: u64) -> String {
 /// sweep holds a trap. The sets and the swept headers are planned on
 /// [`WORKERS`] threads and printed in the manifest's order.
 pub(super) fn run() -> Result<(), GateError> {
-    bloomery_levers::at_main(&[])?;
+    bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
     let (manifest, root) = args()?;
     let sets = Manifest::read(&manifest)
         .map_err(|e| format!("the census manifest {}: {e}", manifest.display()))?;

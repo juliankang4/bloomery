@@ -248,6 +248,16 @@ impl Kind {
         }
     }
 
+    /// `v` as a value of this kind for a reading that checks it: a
+    /// [`Kind::Text`] value is its owner's to check, taken as written
+    /// (`None`); any other is [`Kind::parse`]'s.
+    pub(crate) fn taken(self, v: &str) -> Result<Option<Value>, String> {
+        match self {
+            Kind::Text => Ok(None),
+            kind => kind.parse(v).map(Some),
+        }
+    }
+
     /// What the kind takes, as a refusal and the tables say it.
     pub(crate) fn takes(self) -> String {
         const DIGITS: &str = "base 10, no sign or leading zero";
@@ -602,10 +612,13 @@ pub(crate) enum Site {
         left: &'static [InPlace],
         phase: Phase,
     },
-    /// Read in place in the files of `at` only; no reading here parses it.
+    /// Read in place in the files of `at` only, by the binaries `by` says;
+    /// a binary's reading here checks its value by its kind, read or not,
+    /// and names it as not applied where the binary does not read it.
     Direct {
         at: &'static [InPlace],
         phase: Phase,
+        by: Readers,
     },
     /// Not a lever: every reading here refuses it when it is set, with any
     /// value, saying `why`. `left` names the files that refuse it in place
@@ -626,6 +639,19 @@ pub(crate) enum Site {
     },
 }
 
+/// Which binaries read a [`Site::Direct`] lever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Readers {
+    /// Every binary: the files read it below any binary's `main`, wherever
+    /// the host tier runs, as the pool reads its two; no `at_main` list names
+    /// it, and none refuses it.
+    Every,
+    /// The binaries whose `at_main` list names it, its files on their path;
+    /// every other binary takes it, set, as not applied and says so: one
+    /// environment may carry levers for several models.
+    Named,
+}
+
 impl Site {
     /// Who reads it, one line.
     pub(crate) fn describe(self) -> String {
@@ -639,6 +665,11 @@ impl Site {
         match self {
             Site::Parsed { left: [], .. } => "parsed".to_string(),
             Site::Parsed { left, .. } => format!("parsed; in place in {}", places(left)),
+            Site::Direct {
+                at,
+                by: Readers::Every,
+                ..
+            } => format!("in place in {}, by every binary", places(at)),
             Site::Direct { at, .. } => format!("in place in {}", places(at)),
             Site::Retired { why, left: [] } => format!("retired: {why}"),
             Site::Retired { why, left } => {
@@ -766,17 +797,20 @@ fn lossy(v: &OsStr) -> String {
     v.to_string_lossy().into_owned()
 }
 
-/// One Parsed lever as a reading found it.
+/// One lever as a reading found it: a Parsed lever, or a Direct one a
+/// binary's reading checks.
 #[derive(Clone, Debug)]
 struct Entry {
     row: &'static LeverSpec,
-    /// Whether the reading's binary acts on it; one it does not is unset
-    /// (set, it was refused) and holds the default.
+    /// Whether the reading's binary acts on it. A Parsed lever it does not
+    /// act on is unset (set, it was refused) and holds the default; a Direct
+    /// one holds what is set, which it does not apply.
     acts: bool,
     /// The text as set; `None` unset.
     set: Option<String>,
     /// The value: as set, else the default; `None` unset when unset is a
-    /// state of its own ([`Unset::Means`]).
+    /// state of its own ([`Unset::Means`]), and set for a [`Kind::Text`]
+    /// value, which its owner checks.
     value: Option<Value>,
 }
 
@@ -801,13 +835,13 @@ impl Entry {
         };
         let value = row
             .kind
-            .parse(text)
+            .taken(text)
             .map_err(|expected| refuse(text.to_string(), expected))?;
         Ok(Entry {
             row,
             acts,
             set: Some(text.to_string()),
-            value: Some(value),
+            value,
         })
     }
 }
@@ -817,8 +851,10 @@ impl Entry {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Scope<'a> {
     /// A binary's `main` ([`at_main`]): a Parsed lever set that is not in
-    /// `acts_on` — the pool's two always are — and a `BLOOMERY_*` name no
-    /// row names.
+    /// `acts_on` (the pool's two always are), and a `BLOOMERY_*` name no row
+    /// names; a Direct lever is checked by its kind, as a Parsed one is,
+    /// and a [`Readers::Named`] one that is not in `acts_on` is taken as not
+    /// applied ([`Reading::unapplied`]).
     Main {
         bin: &'a str,
         acts_on: &'a [&'a str],
@@ -853,13 +889,26 @@ pub(crate) enum Scope<'a> {
     CardBudget,
 }
 
+/// What one reading found: the levers it took and every variable it refused.
+#[derive(Debug)]
+pub(crate) struct Reading {
+    entries: Vec<Entry>,
+    refused: Vec<Refusal>,
+}
+
 /// The levers of `scope` over `env`, every name once — the last of a name
 /// given twice — and every refusal at once.
 pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Levers, LeverError> {
+    reading(env, scope).levers()
+}
+
+/// [`read`]'s reading, its refusals beside what it took: what `--levers`
+/// prints ([`Reading::table`]).
+pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading {
     if let Scope::Main { acts_on, .. } = scope
-        && let Some(name) = not_parsed(acts_on)
+        && let Some(name) = not_named(acts_on)
     {
-        panic!("{name} is not a lever this crate parses");
+        panic!("{name} is not a lever a binary names among those it acts on");
     }
     let get = |name: &str| {
         env.iter()
@@ -882,45 +931,31 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
     let mut entries = Vec::new();
     let mut refused = Vec::new();
     for row in REGISTRY {
-        match row.site {
-            Site::Parsed { .. } => {
-                let acts = match scope {
-                    Scope::Main { acts_on, .. } => {
-                        pool(row.name)
-                            || nvtier(row.name)
-                            || link(row.name)
-                            || nodes(row.name)
-                            || hook(row.name)
-                            || margin(row.name)
-                            || acts_on.contains(&row.name)
-                    }
-                    Scope::Every => true,
-                    Scope::Pool if pool(row.name) => true,
-                    Scope::Pool => continue,
-                    Scope::NvTier if nvtier(row.name) => true,
-                    Scope::NvTier => continue,
-                    Scope::Need if hook(row.name) || row.name == HOST_LOCK => true,
-                    Scope::Need => continue,
-                    Scope::TierLink if link(row.name) => true,
-                    Scope::TierLink => continue,
-                    Scope::TierNodes if nodes(row.name) || link(row.name) => true,
-                    Scope::TierNodes => continue,
-                    Scope::CardBudget if row.name == CARD_BUDGET || margin(row.name) => true,
-                    Scope::CardBudget => continue,
-                };
-                match (get(row.name), scope) {
-                    (Some(v), Scope::Main { bin, .. }) if !acts => refused.push(Refusal {
-                        name: row.name.to_string(),
-                        value: lossy(v),
-                        why: Why::NotActedOn(bin.to_string()),
-                    }),
-                    (raw, _) => match Entry::read(row, raw, acts) {
-                        Ok(e) => entries.push(e),
-                        Err(r) => refused.push(r),
-                    },
-                }
+        let acts = match (row.site, scope) {
+            (Site::Parsed { .. }, Scope::Main { acts_on, .. }) => {
+                pool(row.name)
+                    || nvtier(row.name)
+                    || link(row.name)
+                    || nodes(row.name)
+                    || hook(row.name)
+                    || margin(row.name)
+                    || acts_on.contains(&row.name)
             }
-            Site::Retired { why, .. } => {
+            (Site::Direct { by, .. }, Scope::Main { acts_on, .. }) => {
+                by == Readers::Every || acts_on.contains(&row.name)
+            }
+            (Site::Parsed { .. }, Scope::Every) => true,
+            (Site::Parsed { .. }, Scope::Pool) if pool(row.name) => true,
+            (Site::Parsed { .. }, Scope::NvTier) if nvtier(row.name) => true,
+            (Site::Parsed { .. }, Scope::Need) if hook(row.name) || row.name == HOST_LOCK => true,
+            (Site::Parsed { .. }, Scope::TierLink) if link(row.name) => true,
+            (Site::Parsed { .. }, Scope::TierNodes) if nodes(row.name) || link(row.name) => true,
+            (Site::Parsed { .. }, Scope::CardBudget)
+                if row.name == CARD_BUDGET || margin(row.name) =>
+            {
+                true
+            }
+            (Site::Retired { why, .. }, _) => {
                 if let Some(v) = get(row.name) {
                     refused.push(Refusal {
                         name: row.name.to_string(),
@@ -928,8 +963,21 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
                         why: Why::Retired(why),
                     });
                 }
+                continue;
             }
-            Site::Direct { .. } | Site::Env { .. } => {}
+            _ => continue,
+        };
+        let parsed = matches!(row.site, Site::Parsed { .. });
+        match (get(row.name), scope) {
+            (Some(v), Scope::Main { bin, .. }) if !acts && parsed => refused.push(Refusal {
+                name: row.name.to_string(),
+                value: lossy(v),
+                why: Why::NotActedOn(bin.to_string()),
+            }),
+            (raw, _) => match Entry::read(row, raw, acts) {
+                Ok(e) => entries.push(e),
+                Err(r) => refused.push(r),
+            },
         }
     }
     let rdma = entries
@@ -989,19 +1037,24 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
             });
         }
     }
-    if refused.is_empty() {
-        Ok(Levers { entries })
-    } else {
-        Err(LeverError { refused })
-    }
+    Reading { entries, refused }
 }
 
-/// The first of `names` that is not a Parsed lever's.
-fn not_parsed<'a>(names: &[&'a str]) -> Option<&'a str> {
-    names
-        .iter()
-        .copied()
-        .find(|&name| !spec(name).is_some_and(|r| matches!(r.site, Site::Parsed { .. })))
+/// The first of `names` that is no lever a binary names among those it acts
+/// on: a Parsed lever, or a [`Readers::Named`] Direct one.
+fn not_named<'a>(names: &[&'a str]) -> Option<&'a str> {
+    names.iter().copied().find(|&name| {
+        !spec(name).is_some_and(|r| {
+            matches!(
+                r.site,
+                Site::Parsed { .. }
+                    | Site::Direct {
+                        by: Readers::Named,
+                        ..
+                    }
+            )
+        })
+    })
 }
 
 /// The row name nearest `name` by edits (an insertion, a deletion or a
@@ -1405,23 +1458,42 @@ impl Levers {
             route_trace: self.route_trace().is_some(),
         }
     }
+}
 
-    /// Every lever row of [`REGISTRY`], one line each: the phase — `load`,
-    /// `runtime`, or `-` for a retired row, which states none — the value
-    /// this reading has — as set, or the default — or `-` for a lever it
-    /// does not parse or its binary does not act on, and who reads it. What
-    /// `--levers` prints ([`at_main`]); a name that is no lever has no line.
+impl Reading {
+    /// Every lever row of [`REGISTRY`], one line each, with four cells and who
+    /// reads it. The phase: `load`, `runtime`, or `-` for a retired row,
+    /// which states none. Whether this run applies it: `yes`, read at the
+    /// value shown; `no`, its binary does not read it ([`Reading::unapplied`]
+    /// says why when it is set); `refused`, set and refused, the reading's
+    /// refusal saying why. The value: as set, or the default, or `-` for an
+    /// unset lever its binary does not read. What `--levers` prints
+    /// ([`at_main`]); a name that is no lever has no line.
     pub(crate) fn table(&self) -> String {
         let mut out = String::new();
         for row in REGISTRY.iter().filter(|r| r.is_lever()) {
-            let value = match self.entries.iter().find(|e| std::ptr::eq(e.row, row)) {
-                Some(Entry { acts: false, .. }) | None => "-".to_string(),
-                Some(Entry {
-                    set: Some(text), ..
-                }) => format!("set {text}"),
-                Some(Entry { set: None, .. }) => match row.default {
-                    Unset::Is(d) => format!("default {d}"),
-                    Unset::Means(m) => format!("unset: {m}"),
+            let refusal = self.refused.iter().find(|f| f.name == row.name);
+            let entry = self.entries.iter().find(|e| std::ptr::eq(e.row, row));
+            let (applies, value) = match (refusal, entry) {
+                (Some(f), _) => ("refused", format!("set {}", f.value)),
+                (
+                    None,
+                    Some(Entry {
+                        acts: false,
+                        set: Some(text),
+                        ..
+                    }),
+                ) => ("no", format!("set {text}")),
+                (None, Some(Entry { acts: false, .. }) | None) => ("no", "-".to_string()),
+                (
+                    None,
+                    Some(Entry {
+                        set: Some(text), ..
+                    }),
+                ) => ("yes", format!("set {text}")),
+                (None, Some(Entry { set: None, .. })) => match row.default {
+                    Unset::Is(d) => ("yes", format!("default {d}")),
+                    Unset::Means(m) => ("yes", format!("unset: {m}")),
                 },
             };
             // A retired row is no lever to set; the phase cell is `-`.
@@ -1431,15 +1503,47 @@ impl Levers {
             };
             let _ = writeln!(
                 out,
-                "{:<26} {:<9} {:<8} {:<32} {}",
+                "{:<26} {:<9} {:<8} {:<7} {:<32} {}",
                 row.name,
                 row.class.describe(),
                 phase,
+                applies,
                 value,
                 row.site.describe()
             );
         }
         out
+    }
+
+    /// A line for each Direct lever set that the binary `bin` does not read:
+    /// it runs, and the value does nothing there. What a start prints on
+    /// stderr ([`at_main`]).
+    pub(crate) fn unapplied(&self, bin: &str) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| !e.acts)
+            .filter_map(|e| {
+                let set = e.set.as_deref()?;
+                Some(format!(
+                    "{}={set:?} is not applied: this binary ({bin}) does not read it; it is read {}",
+                    e.row.name,
+                    e.row.site.describe()
+                ))
+            })
+            .collect()
+    }
+
+    /// The levers, or every refusal at once ([`read`]).
+    fn levers(self) -> Result<Levers, LeverError> {
+        if self.refused.is_empty() {
+            Ok(Levers {
+                entries: self.entries,
+            })
+        } else {
+            Err(LeverError {
+                refused: self.refused,
+            })
+        }
     }
 }
 
@@ -2893,11 +2997,7 @@ fn checked_overrides(
             Site::Retired { why, .. } => Err(Why::Retired(why)),
             Site::Parsed { left: [], .. } => row.kind.parse(value).map(drop).map_err(Why::Value),
             Site::Direct { .. } if READ_WITH_OVERRIDE.contains(&row.name) => {
-                if row.kind == Kind::Text {
-                    Ok(())
-                } else {
-                    row.kind.parse(value).map(drop).map_err(Why::Value)
-                }
+                row.kind.taken(value).map(drop).map_err(Why::Value)
             }
             _ => Err(Why::Override(NO_OVERRIDE)),
         };
@@ -2955,16 +3055,21 @@ pub fn override_with(pairs: &[(&str, String)]) -> Result<Vec<String>, LeverError
 }
 
 /// A binary's one reading of the levers, first thing in `main`. `acts_on`
-/// names the Parsed levers its run acts on — the pool's two, [`THREADS`] and
-/// [`SPIN`], it always does — and a binary whose child inherits its
+/// names the levers its run acts on: the Parsed ones (the pool's two,
+/// [`THREADS`] and [`SPIN`], it always does) and the [`Readers::Named`]
+/// Direct ones its path reads in place; a binary whose child inherits its
 /// environment names the child's too. Refused, with every refusal at once: a
-/// Parsed lever set to a value its kind does not take, or set when `acts_on`
-/// leaves it out; a retired name that is set; a `BLOOMERY_*` name no row
-/// names. A name in `acts_on` that is not a Parsed lever panics by name — a
-/// caller's mistake. The environment it reads is the process's with the
-/// values of [`override_with`] over it. With `--levers` among the process's
-/// arguments it prints the reading's table — `-` for a lever the binary does
-/// not act on — on stdout and exits 0 instead.
+/// lever set to a value its kind does not take, read here or not; a Parsed
+/// lever set when `acts_on` leaves it out; a retired name that is set; a
+/// `BLOOMERY_*` name no row names. A Named Direct lever set when `acts_on`
+/// leaves it out is no refusal, since one environment may carry the levers
+/// of several models: it prints a line on stderr that it is not applied
+/// ([`Reading::unapplied`]). A name in `acts_on` that is neither panics by
+/// name: a caller's mistake. The environment it reads is the process's with
+/// the values of [`override_with`] over it. With `--levers` among the
+/// process's arguments it prints the reading's table on stdout (whether this
+/// run applies each lever, and at what value) and exits 0, or returns the
+/// reading's refusals after the table.
 pub fn at_main(acts_on: &[&str]) -> Result<Levers, LeverError> {
     at_main_with_flags(acts_on, |name| {
         std::env::args_os().skip(1).any(|a| a == name)
@@ -2984,12 +3089,17 @@ pub fn at_main_with_flags(
         .and_then(Path::file_name)
         .map_or_else(|| "unnamed".to_string(), lossy);
     let env = process_env();
-    let levers = read(&env, Scope::Main { bin: &bin, acts_on })?;
-    if has_flag("--levers") {
-        print!("{}", levers.table());
-        std::process::exit(0);
+    let reading = reading(&env, Scope::Main { bin: &bin, acts_on });
+    for line in reading.unapplied(&bin) {
+        eprintln!("{line}");
     }
-    Ok(levers)
+    if has_flag("--levers") {
+        print!("{}", reading.table());
+        if reading.refused.is_empty() {
+            std::process::exit(0);
+        }
+    }
+    reading.levers()
 }
 
 /// The worker pool's two levers ([`THREADS`], [`SPIN`]), read where the
