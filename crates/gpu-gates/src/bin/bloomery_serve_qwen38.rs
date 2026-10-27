@@ -79,7 +79,7 @@ mod tests {
 
     use super::qwen38::{
         ACTS_ON, Feed38, Kind38, Place38, draft_for_slots, draft_off_for, folder_draft_for,
-        prompt_cuts, refuse_feed, refuse_lookup_feed, refuse_media_feed,
+        prompt_cuts, refuse_feed, refuse_lookup_feed, refuse_media_feed, setup38,
     };
 
     const STEPS: Feed38 = Feed38 {
@@ -333,6 +333,49 @@ mod tests {
                 (true, None)
             );
         }
+    }
+
+    /// The `setup` line names the context's rule, and a draft a rule turned off with its reason:
+    /// the yield's card bytes and the positions a slot gets either way.
+    #[test]
+    fn setup_names_the_context_rule_and_why_the_draft_is_off() {
+        use bloomery_levers::{Reserve, RungCost};
+        use model::placement::ctx_ask::{Rule, Short, Side};
+        let fitted = Rule::Fitted {
+            from: 262_144,
+            short: Short {
+                on: Side::Card,
+                need: 9,
+                room: 8,
+            },
+        };
+        let y = RungCost::of(Reserve::Draft, 4096, 69_632, 2_842_413_228).expect("a yield");
+        let off = Draft38Off::Yield(y);
+        assert_eq!(
+            setup38((false, false, false), Some(&off), (1, 69_632, fitted)).line(),
+            "setup draft=off slots=1 ctx=69632 ctx_rule=fitted (the draft is off, unset: the \
+             draft's 2842413228 B on the card leave a slot 4096 positions; without the draft a \
+             slot takes 69632; BLOOMERY_DRAFT=mtp drafts with the MTP layer; --parallel N sets \
+             the slots and --ctx-size N their context)"
+        );
+        assert_eq!(
+            setup38(
+                (false, false, true),
+                Some(&Draft38Off::Slots { slots: 2 }),
+                (2, 262_144, Rule::Target)
+            )
+            .line(),
+            "setup draft=off slots=2 ctx=262144 ctx_rule=target (the draft is off, unset: \
+             --parallel 2; a drafted load also walks each slot's draft over every row of a \
+             sampled or id-banning request; set BLOOMERY_DRAFT=mtp to draft on 2 slots; \
+             --parallel N sets the slots and --ctx-size N their context)"
+        );
+        assert_eq!(
+            setup38((true, false, true), None, (1, 262_144, Rule::Target)).line(),
+            "setup draft=mtp draft_from=folder slots=1 ctx=262144 ctx_rule=target \
+             (BLOOMERY_DRAFT=off serves without the draft, BLOOMERY_MTP_DRAFT=FILE drafts from a \
+             draft file; --parallel N sets the slots and --ctx-size N their context)"
+        );
     }
 
     /// An unset draft, from a GGUF draft file or a checkpoint folder's MTP layer alike, drafts

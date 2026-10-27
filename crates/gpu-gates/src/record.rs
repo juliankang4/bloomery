@@ -1872,12 +1872,13 @@ pub static LISTENING38: Kind = Kind {
 pub static SETUP38: Kind = Kind {
     name: "setup38",
     head: "setup",
-    doc: "The Qwen3.8 server's setup as its rules chose it, printed before its address: the draft (mtp, lookup or off) and, drafting, where its MTP layer comes from (folder, a checkpoint folder; file, a draft file), the resident slots and the context each serves, then the settings that change them.",
+    doc: "The Qwen3.8 server's setup as its rules chose it, printed before its address: the draft (mtp, lookup or off) and, drafting, where its MTP layer comes from (folder, a checkpoint folder; file, a draft file), the resident slots and the context each serves with the rule that set it (set, the flag's; target, the model's limit; fitted, the largest under it the machine holds), then, the draft off by a rule, why, and the settings that change them.",
     parts: &[
         key("draft", Word, ""),
         opt("draft_from", Word, ""),
         key("slots", U64, ""),
         key("ctx", U64, "positions"),
+        key("ctx_rule", Word, ""),
         lit(" ("),
         pos("change", Text, ""),
         lit(")"),

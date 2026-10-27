@@ -129,7 +129,8 @@ yields to the context (`crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs:28
 `c21e3b81`). With no `--ctx-size`, each slot asks the trained 262,144 positions and, where the GB10's one memory pool cannot
 hold that plan, takes the largest context under it, a multiple of 1,024, whose plan holds, so `--parallel 2` and
 `--parallel 4` start without a context flag. Before its address the server prints one `setup` line with the draft and
-where it reads it, the slots, the context each serves, and the settings that change them.
+where it reads it (or, when a rule turned it off, why), the slots, the context each serves and whether it was the
+target or fitted, and the settings that change them.
 
 The measurement below named a separate draft file instead: the shared Q8_0 draft that
 `unsloth/Qwen3.8-Flash-Next-GGUF` publishes, `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (revision `766911a6`), set
