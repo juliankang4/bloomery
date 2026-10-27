@@ -97,7 +97,10 @@
 //! rows (`bench op=q8_0_<rows>`, 34 bytes a 32 values against MXFP8's 33),
 //! through `shared/bench.rs`'s burst and replay, cycling weight copies toward
 //! 512 MiB with at most 64 copies. The capped footprint alone does not establish
-//! DRAM traffic. `--bench-arm <op>` keeps arms whose name starts with `<op>`.
+//! DRAM traffic. It also prices the MXFP8 gemv at Qwen3.8's verify shapes
+//! (`bench op=mxfp8_v<rows>x<k>_m<m>`: the GDN output 2,560 x 6,144, the
+//! qkvz 10,240 x 2,560 and the attention query 12,288 x 2,560, at one to four
+//! columns). `--bench-arm <op>` keeps arms whose name starts with `<op>`.
 //! Nothing there asserts on a result.
 
 #[path = "shared/bench.rs"]
@@ -245,7 +248,8 @@ mod gate {
                 std::env::args(),
                 SHAPES
                     .iter()
-                    .flat_map(|s| [format!("mxfp8_{}", s.rows), format!("q8_0_{}", s.rows)]),
+                    .flat_map(|s| [format!("mxfp8_{}", s.rows), format!("q8_0_{}", s.rows)])
+                    .chain(bench::verify_arms()),
             )?
         } else {
             None
@@ -1037,6 +1041,72 @@ mod gate {
             (SPAN.div_ceil(bytes) as usize).clamp(1, N)
         }
 
+        /// Qwen3.8's MXFP8 dense verify shapes (rows, k) and the column counts
+        /// a verify pass runs them at.
+        const VERIFY: [(usize, usize); 3] = [(2560, 6144), (10_240, 2560), (12_288, 2560)];
+        const VERIFY_COLS: [usize; 4] = [1, 2, 3, 4];
+
+        pub(super) fn verify_arms() -> impl Iterator<Item = String> {
+            VERIFY.into_iter().flat_map(|(rows, k)| {
+                VERIFY_COLS
+                    .into_iter()
+                    .map(move |m| format!("mxfp8_v{rows}x{k}_m{m}"))
+            })
+        }
+
+        /// One MXFP8 arm: `rows` rows of `k` values against `m` columns,
+        /// token-major.
+        fn mxfp8_arm(
+            gpu: &Gpu,
+            op: &str,
+            rows: usize,
+            k: usize,
+            m: usize,
+            seed: u64,
+        ) -> Result<(), GateError> {
+            let stream = gpu.stream();
+            let q8 = gpu.q8f32();
+            let x = DeviceBuffer::from_host(stream, &fill_pattern_f32(m * k))?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, m * rows)?;
+            // The weight's bytes, the columns' f32 values, the outputs.
+            let io = (4 * m * k + 4 * m * rows) as u64;
+            let bytes = (rows * k / 32 * 33) as u64;
+            let bytes_in = mxfp8_bytes(rows, k, seed);
+            let (qs, e) = e4m3_planes(E4m3Scales::Mxfp8, &bytes_in, rows, k)?;
+            let ws = (0..copies(bytes))
+                .map(|_| {
+                    Ok((
+                        DeviceTensor::upload(stream, &qs, rows, k / 4)?,
+                        DeviceTensor::upload(stream, &e, rows, k / 128)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, GpuError>>()?;
+            let mut at = 0;
+            let mut enq = |st: &CudaStream| {
+                let (qs, e) = &ws[at % ws.len()];
+                at += 1;
+                q8.enqueue_e4m3_gemv(
+                    st,
+                    E4m3GemvArgs {
+                        w: E4m3Weight {
+                            qs,
+                            e,
+                            scales: E4m3Scales::Mxfp8,
+                        },
+                        x: &x,
+                        m,
+                        out: GemvOut::TokenMajor,
+                        y: &mut y,
+                    },
+                )
+            };
+            let eager = burst(stream, &mut enq)?;
+            let g = gpu.capture(|st| (0..N).try_for_each(|_| enq(st)))?;
+            let graph = replay(stream, &g)?;
+            print_arm(op, m * rows, bytes + io, g.node_count(), eager, graph);
+            Ok(())
+        }
+
         pub fn run(gpu: &Gpu, only: Option<&str>) -> Result<(), GateError> {
             println!("bench n_per_burst={N} rounds={ROUNDS} graph_launches_per_round={GREPS}");
             let stream = gpu.stream();
@@ -1049,40 +1119,7 @@ mod gate {
                 let io = (4 * k + 4 * rows) as u64;
                 let op = format!("mxfp8_{rows}");
                 if only.is_none_or(|o| op.starts_with(o)) {
-                    let bytes = (rows * k / 32 * 33) as u64;
-                    let bytes_in = mxfp8_bytes(rows, k, s.seed);
-                    let (qs, e) = e4m3_planes(E4m3Scales::Mxfp8, &bytes_in, rows, k)?;
-                    let ws = (0..copies(bytes))
-                        .map(|_| {
-                            Ok((
-                                DeviceTensor::upload(stream, &qs, rows, k / 4)?,
-                                DeviceTensor::upload(stream, &e, rows, k / 128)?,
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, GpuError>>()?;
-                    let mut at = 0;
-                    let mut enq = |st: &CudaStream| {
-                        let (qs, e) = &ws[at % ws.len()];
-                        at += 1;
-                        q8.enqueue_e4m3_gemv(
-                            st,
-                            E4m3GemvArgs {
-                                w: E4m3Weight {
-                                    qs,
-                                    e,
-                                    scales: E4m3Scales::Mxfp8,
-                                },
-                                x: &x,
-                                m: 1,
-                                out: GemvOut::TokenMajor,
-                                y: &mut y,
-                            },
-                        )
-                    };
-                    let eager = burst(stream, &mut enq)?;
-                    let g = gpu.capture(|st| (0..N).try_for_each(|_| enq(st)))?;
-                    let graph = replay(stream, &g)?;
-                    print_arm(&op, rows, bytes + io, g.node_count(), eager, graph);
+                    mxfp8_arm(gpu, &op, rows, k, 1, s.seed)?;
                 }
                 let op = format!("q8_0_{rows}");
                 if only.is_none_or(|o| op.starts_with(o)) {
@@ -1111,6 +1148,14 @@ mod gate {
                     let g = gpu.capture(|st| (0..N).try_for_each(|_| enq(st)))?;
                     let graph = replay(stream, &g)?;
                     print_arm(&op, rows, bytes + io, g.node_count(), eager, graph);
+                }
+            }
+            for (i, (rows, k)) in VERIFY.into_iter().enumerate() {
+                for m in VERIFY_COLS {
+                    let op = format!("mxfp8_v{rows}x{k}_m{m}");
+                    if only.is_none_or(|o| op.starts_with(o)) {
+                        mxfp8_arm(gpu, &op, rows, k, m, 0x5eed_0900 + i as u64)?;
+                    }
                 }
             }
             Ok(())

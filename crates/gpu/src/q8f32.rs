@@ -811,6 +811,18 @@ pub(crate) trait ByteBlocks {
     /// The value of the byte in the low eight bits of `q`, exact in f32.
     fn value(q: u32) -> f32;
 
+    /// The values of the four bytes of `q`, low byte first: [`ByteBlocks::value`]
+    /// of each.
+    #[inline(always)]
+    fn values(q: u32) -> [f32; 4] {
+        [
+            Self::value(q),
+            Self::value(q >> 8),
+            Self::value(q >> 16),
+            Self::value(q >> 24),
+        ]
+    }
+
     /// The element of the scale plane `d` that holds block `b`'s scale, its
     /// blocks counted from the plane's first, the rows back to back: a plain
     /// load, widened by [`ByteBlocks::scale`] once the step's loads are out.
@@ -865,6 +877,18 @@ impl ByteBlocks for Mxfp8Bytes {
         f32::from_bits(v.to_bits() | ((q & 0x80) << 24))
     }
 
+    /// Two bytes at a time by the hardware's E4M3 pair convert to f16, then
+    /// widened to f32: both steps exact for every byte the repack takes, so
+    /// each value is [`Mxfp8Bytes::value`]'s.
+    #[cfg(bloomery_e4m3_cvt)]
+    #[inline(always)]
+    fn values(q: u32) -> [f32; 4] {
+        use cuda_device::convert::{cvt_f32x2_f16x2, cvt_rn_f16x2_e4m3x2};
+        let (v0, v1) = cvt_f32x2_f16x2(cvt_rn_f16x2_e4m3x2(q as u16));
+        let (v2, v3) = cvt_f32x2_f16x2(cvt_rn_f16x2_e4m3x2((q >> 16) as u16));
+        [v0, v1, v2, v3]
+    }
+
     /// Word `b / 4`, which holds block `b`'s scale byte.
     #[inline(always)]
     unsafe fn scale_at(d: &[u32], b: usize) -> u32 {
@@ -894,6 +918,11 @@ impl ByteBlocks for Fp8B128Bytes {
     #[inline(always)]
     fn value(q: u32) -> f32 {
         Mxfp8Bytes::value(q)
+    }
+
+    #[inline(always)]
+    fn values(q: u32) -> [f32; 4] {
+        Mxfp8Bytes::values(q)
     }
 
     /// Word `b / 4`, the scale of the 128-value block that 32-value block `b`
@@ -993,16 +1022,17 @@ unsafe fn block_step<F: ByteBlocks>(
 }
 
 /// `f` plus one word's four terms, in byte order: `fma(v_j·d, x_j, f)` with
-/// `v_j` the value of byte `j` of `q` ([`ByteBlocks::value`]) and `x_j` lane
+/// `v_j` the value of byte `j` of `q` ([`ByteBlocks::values`]) and `x_j` lane
 /// `j` of `x`. The product `v_j·d` is exact in f32 for a Q8_0 block, and for
 /// an MXFP8 one whose product is a normal f32, so each term rounds once.
 #[inline(always)]
 fn word_dot<F: ByteBlocks>(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
     let [x0, x1, x2, x3] = x.to_array();
-    let f = f32::mul_add(d * F::value(q), x0, f);
-    let f = f32::mul_add(d * F::value(q >> 8), x1, f);
-    let f = f32::mul_add(d * F::value(q >> 16), x2, f);
-    f32::mul_add(d * F::value(q >> 24), x3, f)
+    let [v0, v1, v2, v3] = F::values(q);
+    let f = f32::mul_add(d * v0, x0, f);
+    let f = f32::mul_add(d * v1, x1, f);
+    let f = f32::mul_add(d * v2, x2, f);
+    f32::mul_add(d * v3, x3, f)
 }
 
 /// Lane `lane`'s partial sum for one row of 32-value byte blocks of format
