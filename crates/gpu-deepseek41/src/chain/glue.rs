@@ -50,10 +50,8 @@ use std::time::Instant;
 use bloomery_gpu::elem::{EmbedSb, Q3kRows, Q5kRows, iq4nl_embed_value, q3k_embed_value};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{Gpu, GpuError, HostFlags, Q8Act, launch_u32};
-use cuda_core::{
-    CudaContext, CudaStream, DeviceBuffer, IntoResult, LaunchConfig1D, PinnedHostBuffer, sys,
-};
+use bloomery_gpu::{Gpu, GpuError, Q8Act, StagedRows, launch_u32};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::convert::{cvt_f32_f16x2_hi, cvt_f32_f16x2_lo, cvt_f32x2_bf16x2};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
@@ -671,8 +669,8 @@ impl ShadowWork for EngramKv<'_> {
 }
 
 /// How a step's engram rows reach the card after its launch: per row of
-/// the pass, a page-locked staging copy of the rows section of that row's
-/// image and a host flag ([`HostFlags`]).
+/// the pass, the rows section of that row's image staged for its arrival
+/// ([`StagedRows`]: a page-locked staging and a host flag).
 ///
 /// The host clears row `r`'s flag before the launch ([`RowsArrival::clear`]),
 /// writes the rows into the staging once they are read and raises the flag
@@ -683,19 +681,16 @@ impl ShadowWork for EngramKv<'_> {
 /// the card computes up to the first site's token-only work while the host
 /// reads the rows, and never reads a row before the host wrote it.
 ///
-/// Contract: a launched arrival waits until its flag is raised, so the host
-/// raises it on every path after the launch, an error included — then the
-/// card runs that step on the rows the staging held before, and the caller
-/// condemns the step (the body refuses the next one until a reset). A
-/// row's staging is written only while its flag is lowered, after the
-/// refresh that lowered it synchronized the stream: no copy of it is in
-/// flight then, and the launched one waits.
+/// Contract: [`StagedRows`]'s. The host raises a row's flag on every path
+/// after the launch, an error included; the card then runs that step on the
+/// rows the staging held before, and the caller condemns the step (the body
+/// refuses the next one until a reset). A row's staging is written only
+/// while its flag is lowered, after the refresh that lowered it
+/// synchronized the stream.
 pub struct RowsArrival {
-    flags: HostFlags,
-    staging: PinnedHostBuffer<u32>,
-    /// Words of one row's rows section, the section's first word in the
-    /// image, and the bytes of rows it carries.
-    words: usize,
+    rows: StagedRows<u32>,
+    /// The rows section's first word in the image, and the bytes of rows it
+    /// carries.
     at: usize,
     bytes: usize,
 }
@@ -721,16 +716,13 @@ impl RowsArrival {
                 ),
             });
         }
-        let staging = PinnedHostBuffer::<u32>::zeroed(ctx, rows * words).map_err(|source| {
-            GpuError::Driver {
-                op: Some("cuMemAllocHost (the engram rows' staging)"),
-                source,
-            }
-        })?;
         Ok(RowsArrival {
-            flags: HostFlags::new(ctx, rows)?,
-            staging,
-            words,
+            rows: StagedRows::new(
+                ctx,
+                rows,
+                words,
+                "cuMemAllocHost (the engram rows' staging)",
+            )?,
             at,
             bytes,
         })
@@ -738,85 +730,45 @@ impl RowsArrival {
 
     /// Lower row `row`'s flag, before the launch whose arrival it gates.
     pub fn clear(&self, row: usize) -> Result<(), GpuError> {
-        self.flags.clear(row)
+        self.rows.clear(row)
     }
 
-    /// Write `rows` — the rows section's bytes, as [`StepRows::engram`] holds
-    /// them — into row `row`'s staging, four bytes to a little-endian word,
+    /// Write `rows`, the rows section's bytes as [`StepRows::engram`] holds
+    /// them, into row `row`'s staging, four bytes to a little-endian word,
     /// then raise its flag. The flag is raised on every path: a `rows` of
     /// the wrong length leaves the staging as it was and returns the error.
     pub fn deliver(&mut self, row: usize, rows: &[u8]) -> Result<(), GpuError> {
-        let staged = self.stage(row, rows);
-        let raised = self.flags.raise(row);
-        staged.and(raised)
-    }
-
-    /// Raise row `row`'s flag with the staging as it is.
-    pub fn raise(&self, row: usize) -> Result<(), GpuError> {
-        self.flags.raise(row)
-    }
-
-    fn stage(&mut self, row: usize, rows: &[u8]) -> Result<(), GpuError> {
-        let (words, bytes) = (self.words, self.bytes);
-        let staged = self.staging.len() / words.max(1);
-        let dst = self
-            .staging
-            .get_mut(row * words..(row + 1) * words)
-            .filter(|_| rows.len() == bytes)
-            .ok_or_else(|| GpuError::Shape {
-                what: "RowsArrival::deliver",
-                detail: format!(
-                    "{} bytes into row {row}'s staging: a row carries {bytes}, {staged} rows staged",
-                    rows.len()
-                ),
-            })?;
-        for (w, b) in dst.iter_mut().zip(rows.chunks(4)) {
-            let mut le = [0u8; 4];
-            le[..b.len()].copy_from_slice(b);
-            *w = u32::from_le_bytes(le);
-        }
-        Ok(())
+        let bytes = self.bytes;
+        self.rows.deliver(row, |dst| {
+            if rows.len() != bytes {
+                return Err(GpuError::Shape {
+                    what: "RowsArrival::deliver",
+                    detail: format!(
+                        "{} bytes into row {row}'s staging: a row carries {bytes}",
+                        rows.len()
+                    ),
+                });
+            }
+            for (w, b) in dst.iter_mut().zip(rows.chunks(4)) {
+                let mut le = [0u8; 4];
+                le[..b.len()].copy_from_slice(b);
+                *w = u32::from_le_bytes(le);
+            }
+            Ok(())
+        })
     }
 
     /// Enqueue row `row`'s arrival on `stream`: the wait on its flag, then the
     /// staging copied over the rows section of `params`, the row's image
-    /// copy. Two nodes when captured (a batch memory operation, a copy).
-    /// Asynchronous, allocation-free, capturable.
+    /// copy ([`StagedRows::enqueue`]). Asynchronous, allocation-free,
+    /// capturable.
     pub fn enqueue(
         &self,
         stream: &CudaStream,
         row: usize,
         params: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        const WHAT: &str = "RowsArrival::enqueue";
-        let words = self.words;
-        let src = self
-            .staging
-            .get(row * words..(row + 1) * words)
-            .ok_or_else(|| GpuError::Shape {
-                what: WHAT,
-                detail: format!("row {row} of {} staged", self.staging.len() / words.max(1)),
-            })?;
-        need(WHAT, "params", params.len(), self.at + words)?;
-        self.flags.enqueue_wait(stream, row)?;
-        // SAFETY: the destination is words `at .. at + words` of `params`
-        // (checked above), borrowed mutably for the enqueue; the source is
-        // page-locked memory this value owns — the engine drops its graphs
-        // before its body, so no graph that captured the copy outlives it —
-        // and the host writes it only while the copy waits on the lowered
-        // flag or none is in flight (the type's contract).
-        let rc = unsafe {
-            sys::cuMemcpyHtoDAsync_v2(
-                params.cu_deviceptr() + (4 * self.at) as u64,
-                src.as_ptr().cast(),
-                4 * words,
-                stream.cu_stream(),
-            )
-        };
-        rc.result().map_err(|source| GpuError::Driver {
-            op: Some("cuMemcpyHtoDAsync_v2 (the engram rows' arrival)"),
-            source,
-        })
+        self.rows.enqueue(stream, row, params, self.at)
     }
 }
 

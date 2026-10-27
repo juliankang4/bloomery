@@ -12,7 +12,10 @@
 //! replay is the common starting line, not an optimization to earn later.
 
 use crate::GpuError;
-use cuda_core::{CudaContext, CudaEvent, CudaStream, DriverError, sys};
+use cuda_core::{
+    CudaContext, CudaEvent, CudaStream, DeviceBuffer, DeviceCopy, DriverError, PinnedHostBuffer,
+    sys,
+};
 use std::ffi::c_void;
 use std::os::unix::fs::OpenOptionsExt;
 use std::ptr;
@@ -1030,6 +1033,127 @@ impl HostFlags {
     }
 }
 
+/// Rows the host writes after the launch of the graph that reads them: a
+/// page-locked staging of rows of `width` values and a host flag a row
+/// ([`HostFlags`]). The graph's first reader of a row enqueues its arrival
+/// ([`StagedRows::enqueue`]): the wait on the row's flag, then one copy of
+/// the row into a device buffer. So the card runs the work before that
+/// reader while the host writes the row, and never reads the row before the
+/// host wrote it.
+///
+/// Contract: the host lowers a row's flag before the launch whose arrival it
+/// gates ([`StagedRows::clear`]) and writes the row only while its flag is
+/// lowered and no copy of the row is in flight, that is after the stream
+/// synchronized past the launch before. It raises the flag on every path
+/// after the launch, an error included ([`StagedRows::deliver`]): a launched
+/// arrival waits until then, and the card then reads the row as the staging
+/// held it.
+pub struct StagedRows<T: DeviceCopy> {
+    flags: HostFlags,
+    staging: PinnedHostBuffer<T>,
+    width: usize,
+}
+
+impl<T: DeviceCopy> StagedRows<T> {
+    /// `rows` zeroed rows of `width` values in `ctx`, each with its flag
+    /// lowered; `op` names the staging's allocation in an error. Load-time
+    /// only.
+    pub fn new(
+        ctx: &Arc<CudaContext>,
+        rows: usize,
+        width: usize,
+        op: &'static str,
+    ) -> Result<StagedRows<T>, GpuError> {
+        let len = rows.checked_mul(width).ok_or_else(|| {
+            GpuError::shape("StagedRows::new", format!("{rows} rows of {width} values"))
+        })?;
+        let staging = PinnedHostBuffer::zeroed(ctx, len).map_err(|source| GpuError::Driver {
+            op: Some(op),
+            source,
+        })?;
+        Ok(StagedRows {
+            flags: HostFlags::new(ctx, rows)?,
+            staging,
+            width,
+        })
+    }
+
+    /// Lower row `row`'s flag, before the launch whose arrival it gates.
+    pub fn clear(&self, row: usize) -> Result<(), GpuError> {
+        self.flags.clear(row)
+    }
+
+    /// Row `row`'s staging written by `write`, then its flag raised. The
+    /// flag is raised on every path: a `write` that fails, or a row past the
+    /// staging, returns its error with the flag raised.
+    pub fn deliver(
+        &mut self,
+        row: usize,
+        write: impl FnOnce(&mut [T]) -> Result<(), GpuError>,
+    ) -> Result<(), GpuError> {
+        let (width, held) = (self.width, self.staging.len());
+        let staged = self
+            .staging
+            .get_mut(row * width..(row + 1) * width)
+            .ok_or_else(|| {
+                GpuError::shape(
+                    "StagedRows::deliver",
+                    format!("row {row} of {width} values in a staging of {held}"),
+                )
+            })
+            .and_then(write);
+        let raised = self.flags.raise(row);
+        staged.and(raised)
+    }
+
+    /// Enqueue row `row`'s arrival on `stream`: the wait on its flag, then
+    /// the row copied over `dst`'s values from value `at` on. Two nodes when
+    /// captured (a batch memory operation, a copy). Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue(
+        &self,
+        stream: &CudaStream,
+        row: usize,
+        dst: &mut DeviceBuffer<T>,
+        at: usize,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "StagedRows::enqueue";
+        let width = self.width;
+        let src = self
+            .staging
+            .get(row * width..(row + 1) * width)
+            .ok_or_else(|| {
+                let held = self.staging.len();
+                GpuError::shape(
+                    WHAT,
+                    format!("row {row} of {width} values in a staging of {held}"),
+                )
+            })?;
+        if at.checked_add(width).is_none_or(|end| end > dst.len()) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a row of {width} values at {at} of {}", dst.len()),
+            ));
+        }
+        self.flags.enqueue_wait(stream, row)?;
+        // SAFETY: the destination is values `at .. at + width` of `dst`
+        // (checked above), borrowed mutably for the enqueue; the source is
+        // the row in page-locked memory this value owns, whose owner drops
+        // the graphs that captured the copy before it, and the host writes
+        // the row only while the copy waits on its lowered flag or none is
+        // in flight (the type's contract).
+        let rc = unsafe {
+            sys::cuMemcpyHtoDAsync_v2(
+                dst.cu_deviceptr() + (at * size_of::<T>()) as u64,
+                src.as_ptr().cast(),
+                size_of_val(src),
+                stream.cu_stream(),
+            )
+        };
+        cu(rc, "cuMemcpyHtoDAsync_v2 (a staged row's arrival)")
+    }
+}
+
 /// One node of a captured graph as the driver reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeInfo {
@@ -1072,7 +1196,9 @@ impl Drop for Graph {
 
 #[cfg(test)]
 mod tests {
-    use super::{Branch, FLAG_WAIT_OPS, Graph, HostFlags, capturing, cu, in_place_flags};
+    use super::{
+        Branch, FLAG_WAIT_OPS, Graph, HostFlags, StagedRows, capturing, cu, in_place_flags,
+    };
     use crate::{DeviceTensor, Gpu, GpuError, Q8Act, capsync};
     use cuda_core::{DeviceBuffer, PinnedHostBuffer, sys};
     use std::ffi::c_void;
@@ -1153,6 +1279,78 @@ mod tests {
         }
         assert!(!flags.raised(0).expect("flag 0"), "flag 0 was never raised");
         assert_eq!(FLAG_WAIT_OPS, 1);
+    }
+
+    /// A row the host writes after the launch arrives where the graph reads
+    /// it: the captured arrival of row 1 of two (the wait, the copy to value
+    /// `AT` on) is launched, the host sleeps, then writes and delivers the
+    /// row, and the buffer holds what the host wrote after the launch from
+    /// `AT` on and nothing around it. A replay after a clear waits again. A
+    /// write that fails is returned and raises the flag all the same: the
+    /// replay ends. A row past the staging and a copy past the buffer are
+    /// refused by name before anything is enqueued. Without the wait the
+    /// copy reads the staging as it stood at the launch.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_staged_row_arrives_after_the_launch() {
+        const W: usize = 4096;
+        const AT: usize = 5;
+        let (ctx, stream) = capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let mut rows =
+            StagedRows::<f32>::new(&ctx, 2, W, "cuMemAllocHost (test)").expect("two staged rows");
+        let mut dst = DeviceBuffer::<f32>::zeroed(&stream, AT + W + 7).expect("a device buffer");
+        stream
+            .synchronize()
+            .expect("the allocation lands before capture");
+        let graph =
+            Graph::capture(&stream, |s| rows.enqueue(s, 1, &mut dst, AT)).expect("the capture");
+        for round in 1..=2usize {
+            rows.clear(1).expect("clear");
+            graph.launch(&stream).expect("a launch");
+            std::thread::sleep(Duration::from_millis(20));
+            let want: Vec<f32> = (0..W).map(|i| (round * W + i) as f32).collect();
+            rows.deliver(1, |row| {
+                row.copy_from_slice(&want);
+                Ok(())
+            })
+            .expect("the delivery");
+            stream.synchronize().expect("the replay");
+            let got = dst.to_host_vec(&stream).expect("readback");
+            let stale = got[AT..AT + W]
+                .iter()
+                .zip(&want)
+                .filter(|(g, w)| g != w)
+                .count();
+            assert_eq!(
+                stale, 0,
+                "round {round}: {stale} of {W} values are not what the host delivered after \
+                 the launch"
+            );
+            let around = got[..AT].iter().chain(&got[AT + W..]);
+            assert!(
+                around.copied().all(|v| v == 0.0),
+                "round {round}: around the row"
+            );
+        }
+        rows.clear(1).expect("clear");
+        graph.launch(&stream).expect("a launch");
+        let failed = rows.deliver(1, |_| {
+            Err(GpuError::state(
+                "hw_staged_row_arrives_after_the_launch",
+                "a failed write",
+            ))
+        });
+        assert!(failed.is_err(), "a failed write is returned");
+        stream
+            .synchronize()
+            .expect("the replay ends: the flag is raised on a failed write too");
+        assert!(rows.deliver(2, |_| Ok(())).is_err(), "row 2 of two");
+        assert!(
+            rows.enqueue(&stream, 1, &mut dst, AT + 8).is_err(),
+            "a copy past the buffer"
+        );
+        let nodes = graph.nodes().expect("the node list");
+        assert_eq!(nodes.len(), 2, "{nodes:?}");
     }
 
     /// The host function the test graph records. The graph is never

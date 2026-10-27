@@ -456,7 +456,10 @@ mod gate {
     /// no copy is left: at more than one row each delta layer adds one launch
     /// (the joined β·α projection as β's rows and α's rows) and a selecting
     /// layer none: 1151 + 36·1.
-    const REAL_NODES_VERIFY: usize = 1187;
+    /// PIN(2026-10-27): the verify's PLE rows arrive at its PLE site after
+    /// its launch: the wait on the host's flag and the rows' copy, two nodes
+    /// more: 1151 + 36·1 + 2.
+    const REAL_NODES_VERIFY: usize = 1189;
 
     /// PIN(2026-10-05): the nodes one more busy slot adds to a captured pass
     /// of several slots' rows, derived before the pass was built: the
@@ -491,8 +494,9 @@ mod gate {
     /// PIN(2026-10-01): over the 48 card layers, the same five launches on
     /// each whatever its types: 1151 + 5·48 and 1235 + 5·48.
     /// PIN(2026-10-22): the verify's [`REAL_NODES_VERIFY`]: 1187 + 5·48.
+    /// PIN(2026-10-27): the verify's [`REAL_NODES_VERIFY`]: 1189 + 5·48.
     const REAL_NODES_DECODE_CARD: usize = 1391;
-    const REAL_NODES_VERIFY_CARD: usize = 1427;
+    const REAL_NODES_VERIFY_CARD: usize = 1429;
 
     // PIN(2026-10-11): the split prompt walk moves none of the counts
     // above: it orders the eager ubatch walk's parts (`GROUP_WALK_ORDER`), and
@@ -1857,7 +1861,8 @@ mod gate {
     }
 
     /// The structure of the captured verify of `T` rows: the node count, its
-    /// batch mem ops, its argmax and handoff launches.
+    /// batch mem ops (the layers' `want_memops` and each PLE rows' arrival's
+    /// wait), its copies (each arrival's), its argmax and handoff launches.
     fn verify_structure<const T: usize>(
         m: &mut Qwen38Model,
         (want, want_memops): (usize, usize),
@@ -1877,18 +1882,21 @@ mod gate {
         let cols = named(&|n| n == "ds41_ffn_handoff_10_cols");
         let one = named(&|n| n == "ds41_ffn_handoff_10");
         let layers = n_layer();
+        let arrivals = shape().arrivals();
+        let want_memops = want_memops + arrivals;
         let ok = nodes == want
             && counted == want
             && b == want_memops
-            && other == 0
+            && other == arrivals
             && argmax == 1
             && cols == layers
             && one == 0;
         println!(
             "verify structure T={T}: graph_nodes={nodes} (want {want}; the program counts \
-             {counted}) batch_mem_op={b} (want {want_memops}) other={other}; argmax launches \
-             {argmax} (want 1: one head of {T} rows); ds41_ffn_handoff_10_cols {cols} (want \
-             {layers}), ds41_ffn_handoff_10 {one} (want 0) {}",
+             {counted}) batch_mem_op={b} (want {want_memops}) other={other} (want {arrivals}: \
+             the PLE rows' copy); argmax launches {argmax} (want 1: one head of {T} rows); \
+             ds41_ffn_handoff_10_cols {cols} (want {layers}), ds41_ffn_handoff_10 {one} (want 0) \
+             {}",
             verdict(ok)
         );
         Ok(ok)
