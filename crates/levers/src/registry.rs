@@ -2203,6 +2203,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          `tools/ref/timing-card.sh` times this machine's card.",
     ),
     runner(
+        "BLOOMERY_GB10_BOX",
+        Some("release/publish.sh"),
+        "Mac side: the ssh host of the GB10 that built the release's GB10 archive; \
+         `tools/release/publish.sh` verifies, fetches and uploads it from there. Unset: the \
+         release carries no GB10 archive.",
+    ),
+    runner(
         "BLOOMERY_GEN_CTX",
         Some("ref/depth-qwen3moe.sh"),
         "The Qwen3 depth, ncu and nsys runners: the context every arm of ours runs at.",
