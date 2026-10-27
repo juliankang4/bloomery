@@ -233,6 +233,133 @@ impl RowValues for Nvfp4Values<'_> {
     }
 }
 
+/// Code words of an NVFP4 row whose code, scale and activation loads
+/// [`nvfp4_lane_partial_1col`] issues before its first multiply-add: a word
+/// is ten registers of loaded data per lane (its codes, its scale word and
+/// two activation quads).
+const NV_WORD_UNROLL: usize = 4;
+const _: () = assert!(NV_WORD_UNROLL == 4);
+
+/// Word `w` of an NVFP4 row ([`Nvfp4Values`]' layout) as
+/// [`nvfp4_lane_partial_1col`] reads it: the code word, its sub-block's
+/// scale and the two activation quads its eight values meet. Word `w` holds
+/// sub-block `w / 2`'s values `4·(w % 2) .. + 4` in its low nibbles and
+/// `8 + 4·(w % 2) .. + 4` in its high ones, so its quads are `2w − w % 2`
+/// and two past it.
+///
+/// # Safety
+///
+/// `w` is below the row's `k / 8` words, `wq` and `we` are the row's first
+/// code and scale words, inside `qs` and `e` with the row's, and `xq` holds
+/// the row's `k / 4` activation quads.
+#[inline(always)]
+unsafe fn nv_word(
+    (qs, e, xq): (&[u32], &[u32], &[F32x4]),
+    (wq, we): (usize, usize),
+    w: usize,
+) -> (u32, f32, F32x4, F32x4) {
+    let quad = 2 * w - (w & 1);
+    // SAFETY: word w is the row's, inside qs by this fn's contract.
+    let q = unsafe { *qs.get_unchecked(wq + w) };
+    // SAFETY: the scale word of word w's sub-block is the row's, inside e.
+    let s = unsafe { *e.get_unchecked(we + w / 8) };
+    // SAFETY: quad 2w - w % 2 < k / 4 holds the word's low values, inside xq.
+    let lo = unsafe { *xq.get_unchecked(quad) };
+    // SAFETY: quad + 2 < k / 4 holds the word's high values, inside xq.
+    let hi = unsafe { *xq.get_unchecked(quad + 2) };
+    let s = crate::mxfp4::ue4m3_half((s >> (8 * ((w / 2) % 4))) & 255);
+    (q, s, lo, hi)
+}
+
+/// `f` plus the dot of one NVFP4 code word ([`nv_word`]) with its quads: each
+/// of the eight decoded codes times the sub-block's scale, the weight
+/// [`Nvfp4Values`] reads, against its activation, low nibbles first, in byte
+/// order, one multiply-add a value. The scale meets the code before the
+/// activation does, so a product is the weight's, finite wherever the
+/// weight times the activation is.
+#[inline(always)]
+fn nv_word_dot(f: f32, (q, s, lo, hi): (u32, f32, F32x4, F32x4)) -> f32 {
+    let (a, b) = crate::cores::table16_word(q, crate::mxfp4::E2M1);
+    let v = |c: u32, i: u32| ((c >> (8 * i)) as u8 as i8 as f32) * s;
+    let [x0, x1, x2, x3] = lo.to_array();
+    let [x4, x5, x6, x7] = hi.to_array();
+    f32_fold_values(
+        f,
+        |i| v(if i < 4 { a } else { b }, (i % 4) as u32),
+        &[x0, x1, x2, x3, x4, x5, x6, x7],
+    )
+}
+
+/// Lane `lane`'s partial sum for row `row` of an NVFP4 weight of `k` values
+/// a row ([`Nvfp4Values`]' layout, `k` a multiple of 64) against one f32
+/// activation column `x`: lane L owns whole code words, words `L, L + 32, …`
+/// below `k / 8`, in increasing order ([`nv_word_dot`]), with
+/// [`NV_WORD_UNROLL`] words' loads hoisted above their multiply-adds: the
+/// Q8_0 single-column body's walk ([`blocks_lane_partial_1col`]) over the
+/// FP4 words. Activations that are not 16-byte aligned use scalar loads
+/// in the same word and value order.
+///
+/// # Safety
+///
+/// `qs` holds the row's `k / 8` code words and `e` its `k / 64` scale words
+/// (`(row + 1)·k` values), `x.len() >= k`, `k` a positive multiple of 64,
+/// `lane < 32`.
+#[inline(always)]
+unsafe fn nvfp4_lane_partial_1col(
+    qs: &[u32],
+    e: &[u32],
+    x: &[f32],
+    k: u32,
+    row: usize,
+    lane: usize,
+) -> f32 {
+    let (kk, words) = (k as usize, k as usize / 8);
+    // SAFETY: x.len() >= k by the caller contract.
+    let xr = unsafe { x.get_unchecked(..kk) };
+    let Some(xq) = as_vectors::<F32x4>(xr) else {
+        let values = Nvfp4Values { qs, e };
+        let mut f = 0.0f32;
+        let mut w = lane;
+        while w < words {
+            let first = 16 * (w / 2) + 4 * (w % 2);
+            for off in 0..8 {
+                let i = first + off + 4 * (off / 4);
+                // SAFETY: w < k/8 puts i inside row, covered by both planes.
+                let weight = unsafe { values.at(row * kk + i) };
+                // SAFETY: i < kk == xr.len() by the word bound.
+                let activation = unsafe { *xr.get_unchecked(i) };
+                f = f32::mul_add(weight, activation, f);
+            }
+            w += 32;
+        }
+        return f;
+    };
+    let (planes, at) = ((qs, e, xq), (row * words, row * (kk / 64)));
+    let mut f = 0.0f32;
+    let mut w = lane;
+    while w + 32 * (NV_WORD_UNROLL - 1) < words {
+        // SAFETY: w + 96 < words, so word w is within the row.
+        let a = unsafe { nv_word(planes, at, w) };
+        // SAFETY: w + 96 < words, so word w + 32 is within the row.
+        let b = unsafe { nv_word(planes, at, w + 32) };
+        // SAFETY: w + 96 < words, so word w + 64 is within the row.
+        let c = unsafe { nv_word(planes, at, w + 64) };
+        // SAFETY: w + 96 < words is the loop guard.
+        let d = unsafe { nv_word(planes, at, w + 96) };
+        f = nv_word_dot(f, a);
+        f = nv_word_dot(f, b);
+        f = nv_word_dot(f, c);
+        f = nv_word_dot(f, d);
+        w += 32 * NV_WORD_UNROLL;
+    }
+    while w < words {
+        // SAFETY: w < words by the loop guard.
+        f = nv_word_dot(f, unsafe { nv_word(planes, at, w) });
+        w += 32;
+    }
+    f
+}
+
 impl Bf16Words<'_> {
     /// The f32 of the BF16 value in half `odd` of word `w`: its sixteen bits
     /// as the f32's high half, exact.
@@ -453,32 +580,32 @@ pub(crate) unsafe fn f32_lane_partials<W: RowValues>(
         let x0 = unsafe { x.chunks8(kk) };
         // SAFETY: m_cols > 1 here, so k + kk + 224 < 2*k <= x.len().
         let x1 = unsafe { x.chunks8(k + kk) };
-        f0 = f32_fold_values(f0, &wv, &x0);
-        f1 = f32_fold_values(f1, &wv, &x1);
+        f0 = f32_fold_values(f0, |i| wv[i], &x0);
+        f1 = f32_fold_values(f1, |i| wv[i], &x1);
         if m_cols > 2 {
             // SAFETY: 2*k + kk + 224 < 3*k <= x.len(), since m_cols > 2.
             let x2 = unsafe { x.chunks8(2 * k + kk) };
             // SAFETY: a3 is 3*k when m_cols > 3 and 0 otherwise, so
             // a3 + kk + 224 < m_cols*k <= x.len().
             let x3 = unsafe { x.chunks8(a3 + kk) };
-            f2 = f32_fold_values(f2, &wv, &x2);
-            f3 = f32_fold_values(f3, &wv, &x3);
+            f2 = f32_fold_values(f2, |i| wv[i], &x2);
+            f3 = f32_fold_values(f3, |i| wv[i], &x3);
         }
         if m_cols > 4 {
             // SAFETY: 4*k + kk + 224 < 5*k <= x.len(), since m_cols > 4.
             let x4 = unsafe { x.chunks8(4 * k + kk) };
             // SAFETY: a5 is 5*k when m_cols > 5 and 0 otherwise; as for a3.
             let x5 = unsafe { x.chunks8(a5 + kk) };
-            f4 = f32_fold_values(f4, &wv, &x4);
-            f5 = f32_fold_values(f5, &wv, &x5);
+            f4 = f32_fold_values(f4, |i| wv[i], &x4);
+            f5 = f32_fold_values(f5, |i| wv[i], &x5);
         }
         if m_cols > 6 {
             // SAFETY: 6*k + kk + 224 < 7*k <= x.len(), since m_cols > 6.
             let x6 = unsafe { x.chunks8(6 * k + kk) };
             // SAFETY: a7 is 7*k when m_cols > 7 and 0 otherwise; as for a3.
             let x7 = unsafe { x.chunks8(a7 + kk) };
-            f6 = f32_fold_values(f6, &wv, &x6);
-            f7 = f32_fold_values(f7, &wv, &x7);
+            f6 = f32_fold_values(f6, |i| wv[i], &x6);
+            f7 = f32_fold_values(f7, |i| wv[i], &x7);
         }
         it += LANE_UNROLL;
     }
@@ -537,22 +664,22 @@ pub(crate) unsafe fn f32_lane_partials<W: RowValues>(
 unsafe fn f32_fold_chunks(f: f32, w: &[f32; LANE_UNROLL], x: &[f32], at: usize) -> f32 {
     // SAFETY: at + 224 < x.len() by this fn's contract.
     let xv = unsafe { x.chunks8(at) };
-    f32_fold_values(f, w, &xv)
+    f32_fold_values(f, |i| w[i], &xv)
 }
 
 /// `f` with the [`LANE_UNROLL`] chunk products of one column added in
 /// order: `fma(w[i], x[i], ·)` for i = 0..8.
 #[inline(always)]
-fn f32_fold_values(f: f32, w: &[f32; LANE_UNROLL], x: &[f32; LANE_UNROLL]) -> f32 {
+fn f32_fold_values(f: f32, w: impl Fn(usize) -> f32, x: &[f32; LANE_UNROLL]) -> f32 {
     let [x0, x1, x2, x3, x4, x5, x6, x7] = *x;
-    let f = f32::mul_add(w[0], x0, f);
-    let f = f32::mul_add(w[1], x1, f);
-    let f = f32::mul_add(w[2], x2, f);
-    let f = f32::mul_add(w[3], x3, f);
-    let f = f32::mul_add(w[4], x4, f);
-    let f = f32::mul_add(w[5], x5, f);
-    let f = f32::mul_add(w[6], x6, f);
-    f32::mul_add(w[7], x7, f)
+    let f = f32::mul_add(w(0), x0, f);
+    let f = f32::mul_add(w(1), x1, f);
+    let f = f32::mul_add(w(2), x2, f);
+    let f = f32::mul_add(w(3), x3, f);
+    let f = f32::mul_add(w(4), x4, f);
+    let f = f32::mul_add(w(5), x5, f);
+    let f = f32::mul_add(w(6), x6, f);
+    f32::mul_add(w(7), x7, f)
 }
 
 /// Chunks whose loads the F32 single-column body issues before its first
@@ -2542,7 +2669,10 @@ mod q8f32_kernels {
         }
     }
 
-    /// NVFP4 selected rows over unquantized activations, with one tensor scale per expert.
+    /// NVFP4 selected rows over unquantized activations, with one tensor scale
+    /// per expert: a warp a row, each lane's share of it
+    /// [`nvfp4_lane_partial_1col`]'s whole code words, then the butterfly and
+    /// the expert's scale.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -2595,8 +2725,7 @@ mod q8f32_kernels {
             // SAFETY: col < m_cols, whose k-value columns the launch contract covers.
             let x = unsafe { x.get_unchecked(col * k as usize..) };
             // SAFETY: the launch contract covers the selected row and activation column.
-            let partial =
-                unsafe { f32_lane_partial_1col(Nvfp4Values { qs, e }, x, k, row_abs, lane) };
+            let partial = unsafe { nvfp4_lane_partial_1col(qs, e, x, k, row_abs, lane) };
             sum = warp::reduce_sum_f32(partial);
             // SAFETY: id < n_experts <= scales.len().
             let scale = unsafe { *scales.get_unchecked(id as usize) };
