@@ -641,7 +641,15 @@ gguf 7 2 0
 # replay launch over every delta store (linear/delta.rs `gdn_delta_recovery_layers`, its table row reads and
 # raw store views, `RecoveryTable::new`; fault.rs `FaultSink::at_layer`; body38.rs `recovery_table`), counted by
 # tools/check-unsafe.sh. Each new block and fn has its SAFETY line or Safety section.
-gpu 2764 353 10
+# PIN(2026-10-27): gpu 2764 -> 2772 blocks, 353 -> 355 fns, new code, not old code relaxed: the NVFP4 select's
+# word walk over f32 activations (q8f32.rs `nv_word`, one read a block of the code word, the scale word and the two
+# activation quads, and `nvfp4_lane_partial_1col`, its activation view, its value-walk fallback and its two word
+# loops), counted by tools/check-unsafe.sh. Each new block has its SAFETY line.
+# PIN(2026-10-28): gpu 2772 -> 2773 blocks: the NVFP4 scalar fallback reads each weight and activation
+# in separate blocks with their SAFETY invariants, preserving the aligned word reduction order.
+# PIN(2026-10-28): gpu 2773 -> 2776 blocks: each hoisted NVFP4 word load has its own
+# unsafe block and SAFETY invariant; the four independent calls keep their load order.
+gpu 2776 355 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

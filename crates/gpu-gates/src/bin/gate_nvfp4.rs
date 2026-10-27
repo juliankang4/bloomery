@@ -49,7 +49,17 @@
 //!   raises nothing, the down leaves its rows at the sentinel and writes the
 //!   other slots';
 //! - `routed_overflow`: a gate·up whose up sum overflows to NaN on finite
-//!   input raises `F32Product` and writes its rows NaN.
+//!   input raises `F32Product` and writes its rows NaN;
+//! - `routed_f32_finite_scaled_word`: the expert select over f32 rows
+//!   (`enqueue_nvfp4_gemv_sel_f32`, `site::resident_sel_f32`'s NVFP4 arm) of
+//!   one row of 64 values, code 7
+//!   under scale byte 0x01, against activations of 2^125: the weight times
+//!   the activation is finite, so the row is the f64 reference's f32 bits and
+//!   no fault is raised (a code times the activation before the scale is
+//!   past f32's range).
+//! - `routed_f32_alignment`: aligned and four-byte-offset activation rows
+//!   use the same word reduction: cancellation yields zero, and overflowing
+//!   lane sums raise `F32Product` and write NaN for either address.
 //!
 //! And the load's refusals, each by name: a scale that is NaN, a tensor with
 //! no `.scale` beside it, and a scale byte UE4M3 does not define (0x7F).
@@ -474,7 +484,7 @@ mod gate {
         use bloomery_gpu::mxfp4_sel::{Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels, Nvfp4Stack};
         use bloomery_gpu::q5::Q8Blocks32;
         use bloomery_gpu::weights::Weights;
-        use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
+        use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act, Window};
         use bloomery_gpu_gates::act_rule::{Q8_1_BLOCK, q8_1_codes};
         use bloomery_gpu_gates::{GateError, GateRng, par_map, verdict};
         use cuda_core::DeviceBuffer;
@@ -863,7 +873,114 @@ mod gate {
                 verdict(down_pass)
             );
             let over = overflow(gpu, &nv)?;
-            Ok(ok && pass && down_pass && over)
+            let scaled = finite_scaled_word(gpu)?;
+            let aligned = f32_alignment(gpu)?;
+            Ok(ok && pass && down_pass && over && scaled && aligned)
+        }
+
+        /// One expert-select launch of a one-row, one-expert NVFP4 stack over `x`:
+        /// the row's f32 and the fault the launch raised.
+        fn sel_f32(
+            gpu: &Gpu,
+            (qs, e, scales): (&DeviceTensor<u32>, &DeviceTensor<u32>, &DeviceTensor<f32>),
+            x: &DeviceBuffer<f32>,
+        ) -> Result<(f32, Option<bloomery_gpu::Fault>), GateError> {
+            let stream = gpu.stream();
+            let sel = DeviceBuffer::from_host(stream, &[0u32])?;
+            let mut y = DeviceBuffer::from_host(stream, &[SENT])?;
+            gpu.q8f32().enqueue_nvfp4_gemv_sel_f32(
+                stream,
+                Nvfp4Stack { qs, e, scales },
+                &bloomery_gpu::q8f32::SelArgs {
+                    x,
+                    sel: &sel,
+                    n_slots: 1,
+                    rows_per_expert: 1,
+                    slots_per_col: 1,
+                },
+                gpu.unlabelled_sink(),
+                &mut y,
+            )?;
+            Ok((y.to_host_vec(stream)?[0], gpu.take_fault()?))
+        }
+
+        /// Unit weights against cancellation and overflowing lane sums,
+        /// with identical activations at aligned and four-byte-offset bases.
+        fn f32_alignment(gpu: &Gpu) -> Result<bool, GateError> {
+            const K: usize = 64;
+            let stream = gpu.stream();
+            let row = [[0x38u8; 4].as_slice(), &[0x22u8; 32]].concat();
+            let Planes { qs, e } = repack::<Nvfp4>(&row, 1, K)?;
+            let qs = DeviceTensor::upload(stream, &qs, 1, K / 8)?;
+            let e = DeviceTensor::upload(stream, &e, 1, K / NV_BLOCK_VALUES)?;
+            let scales = DeviceTensor::upload(stream, &[1.0f32], 1, 1)?;
+            let mut ok = true;
+            for overflow in [false, true] {
+                let mut x = vec![0.0f32; K];
+                x[0] = if overflow { f32::MAX } else { 33554432.0 };
+                x[1] = if overflow { f32::MAX } else { 1.0 };
+                x[32] = -x[0];
+                x[33] = if overflow { -f32::MAX } else { 0.0 };
+                let mut padded = vec![0.0f32];
+                padded.extend_from_slice(&x);
+                let aligned = DeviceBuffer::from_host(stream, &x)?;
+                let parent = DeviceBuffer::from_host(stream, &padded)?;
+                let offset = Window::<f32>::of(&parent, size_of::<f32>(), K)?;
+                for (alignment, x) in [("aligned", &aligned), ("offset4", &*offset)] {
+                    let (got, fault) = sel_f32(gpu, (&qs, &e, &scales), x)?;
+                    let named = fault.is_some_and(|f| {
+                        GpuError::fault("gate_nvfp4", f)
+                            .to_string()
+                            .contains("f32_product")
+                    });
+                    let pass = if overflow {
+                        named && got.is_nan()
+                    } else {
+                        fault.is_none() && got.to_bits() == 0.0f32.to_bits()
+                    };
+                    ok &= pass;
+                    println!(
+                        "nvfp4 clause=routed_f32_alignment alignment={alignment} overflow={overflow} \
+                         got={got:e} fault_names_f32_product={named} {}",
+                        verdict(pass)
+                    );
+                }
+            }
+            Ok(ok)
+        }
+
+        /// The `routed_f32_finite_scaled_word` clause (module doc): one expert
+        /// of one row of 64 values, whose first code byte is 0x07 under scale
+        /// byte 0x01 on every sub-block and the other codes 0, against 64
+        /// activations of 2^125.
+        fn finite_scaled_word(gpu: &Gpu) -> Result<bool, GateError> {
+            const K: usize = 64;
+            let stream = gpu.stream();
+            let mut row = vec![0x01u8; 4];
+            row.extend([0u8; 32]);
+            row[4] = 0x07;
+            let Planes { qs, e } = repack::<Nvfp4>(&row, 1, K)?;
+            let (qs, e) = (
+                DeviceTensor::upload(stream, &qs, 1, K / 8)?,
+                DeviceTensor::upload(stream, &e, 1, K / NV_BLOCK_VALUES)?,
+            );
+            let scales = DeviceTensor::upload(stream, &[1.0f32], 1, 1)?;
+            let x = vec![f32::from_bits((127 + 125) << 23); K];
+            let want = dequant_rows(&row, 0..1, K)[0]
+                .iter()
+                .zip(&x)
+                .map(|(&w, &a)| f64::from(w) * f64::from(a))
+                .sum::<f64>() as f32;
+            let x = DeviceBuffer::from_host(stream, &x)?;
+            let (got, fault) = sel_f32(gpu, (&qs, &e, &scales), &x)?;
+            let clean = fault.is_none();
+            let pass = clean && want.is_finite() && got.to_bits() == want.to_bits();
+            println!(
+                "nvfp4 clause=routed_f32_finite_scaled_word got={got:e} want={want:e} \
+                 no_fault={clean} {}",
+                verdict(pass)
+            );
+            Ok(pass)
         }
 
         /// The `routed_overflow` clause (module doc): one expert of eight rows
