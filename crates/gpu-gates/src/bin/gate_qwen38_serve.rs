@@ -256,9 +256,10 @@
 //!   server's 501; a draft run with no chooser prints no `mtp width` record.
 //! - the width chooser's clause ([`width_cost`], a server of its own under
 //!   `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off` and
-//!   `BLOOMERY_MTP_WIDTH=cost`): one greedy request then a one-id flush,
-//!   its ids the plain run's, its draft counts carried, and the chooser's
-//!   `mtp width` record its own aggregate — windows the widths above 0,
+//!   `BLOOMERY_MTP_WIDTH=cost`): one greedy request then the server's
+//!   orderly stop, which prints the request's record; its ids the plain
+//!   run's, its draft counts carried, and the chooser's `mtp width` record
+//!   its own aggregate — windows the widths above 0,
 //!   E inside the window's rows, a width below the draft's own among the
 //!   passes. It is the one clause that runs the default chooser on a
 //!   loaded server and holds its tokens to the plain run: every other
@@ -709,6 +710,18 @@ mod gate {
         /// The server's path: `bloomery-serve-qwen38` beside this binary.
         fn exe() -> Result<PathBuf, GateError> {
             Ok(std::env::current_exe()?.with_file_name("bloomery-serve-qwen38"))
+        }
+
+        /// The child's exit status within `POLLS` seconds; `None` while it
+        /// still runs.
+        fn wait_exit(&mut self) -> Result<Option<std::process::ExitStatus>, GateError> {
+            for _ in 0..POLLS {
+                if let Some(status) = self.child.try_wait()? {
+                    return Ok(Some(status));
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Ok(None)
         }
 
         /// Starts `bloomery-serve-qwen38` beside this binary with `args` on
@@ -2623,14 +2636,7 @@ mod gate {
         let args: Vec<&str> = CHURN_ARGS.iter().copied().chain(["--plan"]).collect();
         let mut served = Served38::spawn_with(&args, own, &mut cmd)?;
         println!("churn-unhosted plan server pid {}", served.child.id());
-        let mut status = None;
-        for _ in 0..POLLS {
-            status = served.child.try_wait()?;
-            if status.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
+        let status = served.wait_exit()?;
         let Some(status) = status else {
             println!(
                 "churn-unhosted: the plan-only server stopped: {}",
@@ -3283,8 +3289,9 @@ mod gate {
 
     /// The width chooser's own server (the module header): the draft on,
     /// the residency off and `BLOOMERY_MTP_WIDTH=cost`, one greedy request
-    /// of the gate's prompt then a one-id flush — the chooser's `mtp width`
-    /// record prints at the slot's next prompt call — holding: the request's
+    /// of the gate's prompt then the server's orderly stop — the chooser's
+    /// `mtp width` record of the slot's last request prints there, with no
+    /// later request to close it out — holding: the request's
     /// ids the plain run's (the chooser changes which rows a pass runs,
     /// never a token), its draft counts carried, and the record the
     /// chooser's own: its windows the widths above 0 it names, E inside the
@@ -3349,19 +3356,21 @@ mod gate {
             d["draft_n"].as_u64().is_some_and(|n| n > 0)
                 && d["draft_n_accepted"].as_u64().is_some_and(|n| n > 0),
         );
-        // The flush: the chooser's record of the request above prints at
-        // this prompt call.
-        let flush = json!({
-            "prompt": prompt, "n_predict": 1, "temperature": 0, "return_tokens": true,
-        });
-        let (st, _) = curl(&url("/completion"), Some(&flush), false)?;
-        check(&mut ok, "width_cost_flush_ok", st == 200);
+        // PIN(2026-10-28): Replace width_cost_flush_ok with width_cost_stop_ok:
+        // a second prompt would hide a missing shutdown flush of the last request.
+        let (st, _) = curl(&url("/shutdown"), Some(&json!({})), false)?;
+        let exited = served.wait_exit()?;
+        println!("width-cost server stopped: {exited:?}");
+        check(
+            &mut ok,
+            "width_cost_stop_ok",
+            st == 200 && exited.is_some_and(|s| s.success()),
+        );
         let records = seat_log(&err_log)?.all(&record::MTP_WIDTH)?;
         println!("width-cost {records:?}");
         let Some(rec) = records.first() else {
             check(&mut ok, "width_cost_record_is_the_choosers", false);
             check(&mut ok, "width_cost_cut_a_window", false);
-            println!("width-cost server stopped: {}", served.stop()?);
             return Ok(ok);
         };
         let windows = rec.u64("windows")?;
@@ -3394,7 +3403,6 @@ mod gate {
             "width_cost_cut_a_window",
             widths.iter().take(3).any(|&n| n > 0),
         );
-        println!("width-cost server stopped: {}", served.stop()?);
         Ok(ok)
     }
 
@@ -3721,14 +3729,7 @@ mod gate {
             .chain(["--ctx-size", &over])
             .collect();
         let mut refused = spawn(&args)?;
-        let mut status = None;
-        for _ in 0..POLLS {
-            status = refused.child.try_wait()?;
-            if status.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
+        let status = refused.wait_exit()?;
         let text = std::fs::read_to_string(&err_log).unwrap_or_default();
         // The seats' common words: past the card, the share the card holds
         // (`ctx_ask::AskError::DoesNotFit`, its largest a step multiple at or

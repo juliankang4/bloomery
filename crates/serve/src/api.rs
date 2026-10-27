@@ -871,8 +871,8 @@ pub(crate) fn wait_end(ended: &mpsc::Receiver<End>, linger: Duration) -> Ended {
 /// one engine call has none of its own, so a long one can outlast it, and
 /// the process then exits with the engine thread still inside the call, its
 /// stop line saying so, as it says when answers were still being written.
-/// The loop's end comes after the engine's nodes are told the load ended, and
-/// nothing after it is waited for: the engine thread leaves the engine to the
+/// The loop's end comes after the engine is closed ([`crate::Engine::close`]),
+/// and nothing after it is waited for: the engine thread leaves the engine to the
 /// process exit ([`crate::worker::serve`]).
 const ENGINE_STOP: Duration = Duration::from_secs(5);
 
@@ -6954,7 +6954,7 @@ mod tests {
 
     /// The orderly stop's wait on the engine thread — what it waits for (the
     /// loop's end, between engine calls, every request the thread held
-    /// answered and the engine's nodes closed by then, and the answers in
+    /// answered and the engine closed by then, and the answers in
     /// flight written), and that the thread leaves the engine to the process
     /// exit — pinned at a small scale: [`ENGINE_STOP`]'s policy without
     /// spending its seconds. The servers start the way `run` starts them
@@ -6985,12 +6985,12 @@ mod tests {
         /// in is reported.
         const BOUND: Duration = Duration::from_millis(400);
 
-        /// How long the witness takes to close its nodes: a close made after
+        /// How long the witness takes to close: a close made after
         /// the loop's end is published still runs when the stop's wait wakes.
         const CLOSING: Duration = Duration::from_millis(100);
 
-        /// An engine whose Drop notes that it ran, and which counts the
-        /// closes of its nodes, each [`CLOSING`] long.
+        /// An engine whose Drop notes that it ran, and which counts its
+        /// closes, each [`CLOSING`] long.
         struct Witness {
             dropped: Arc<AtomicBool>,
             closed: Arc<AtomicUsize>,
@@ -7019,7 +7019,7 @@ mod tests {
             fn describe(&self) -> String {
                 "the witness mock".to_owned()
             }
-            fn close_nodes(&mut self) -> Result<(), crate::EngineError> {
+            fn close(&mut self) -> Result<(), crate::EngineError> {
                 std::thread::sleep(CLOSING);
                 self.closed.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -7092,9 +7092,9 @@ mod tests {
         /// Whatever ends the engine thread's loop ends the server, and the
         /// process exit reclaims the engine: the thread never drops it, so
         /// no driver call of the engine's Drop runs beside the exit's
-        /// teardown of the driver's libraries. What the Drop would tell the
-        /// engine's nodes the thread tells them once, before the loop's end
-        /// is published, so the stop's wait covers it. Pinned for each way
+        /// teardown of the driver's libraries. The thread closes the engine
+        /// once, before the loop's end is published, so the stop's wait
+        /// covers it. Pinned for each way
         /// the loop ends: the stop, which an idle thread leaves at once (the
         /// wait wakes on the loop's own leaving, not on the bound), an engine
         /// failure and a panic; and for the stop of slots that take the
@@ -7154,7 +7154,7 @@ mod tests {
                 closes
                     .iter()
                     .all(|&(_, at_end, after)| at_end == 1 && after == 1),
-                "the engine's nodes are closed once before the loop's end is published; \
+                "the engine is closed once before the loop's end is published; \
                  (loop ended by, closes at its end, closes after) {closes:?}"
             );
         }

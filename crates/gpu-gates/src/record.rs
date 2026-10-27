@@ -1762,8 +1762,9 @@ pub static MTP_WIDTH: Kind = Kind {
     name: "mtp_width",
     head: "mtp width",
     doc: "BLOOMERY_MTP_WIDTH=cost: the width chooser's passes over one request of a drafting \
-          server, printed at the slot's next prompt call: the passes that verified a proposal \
-          (windows), the windows by the rows they kept (one count a kept length, 1 to the \
+          server, printed at the slot's next prompt call, or at the server's stop for the slot's \
+          last request: the passes that verified a proposal (windows), the windows by the rows \
+          they kept (one count a kept length, 1 to the \
           draft's width + 1), every pass by the ids it verified (one count a width, 0 the plain \
           step: the gate closed, the warm-up's or a probe's plain turn, a shadow's pass), E, the \
           mean rows a window kept; then the chooser's state at the request's end (the gate's \

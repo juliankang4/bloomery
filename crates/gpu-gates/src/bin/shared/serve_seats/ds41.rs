@@ -1404,7 +1404,10 @@ impl Seat for V41 {
         }))
     }
 
-    fn close_nodes(&mut self) -> Result<(), GateError> {
+    /// The draft's record printed ([`ServedDraft::close`]), then the tier
+    /// nodes closed.
+    fn close(&mut self) -> Result<(), GateError> {
+        self.draft.close();
         Ok(self.s.model_mut().close_nodes()?)
     }
 

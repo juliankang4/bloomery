@@ -1292,6 +1292,12 @@ impl<B: Body3> Seat for Q3<B> {
         self.draft.reset(self.s.selected())
     }
 
+    /// The draft's record printed ([`ServedDraft::close`]).
+    fn close(&mut self) -> Result<(), GateError> {
+        self.draft.close();
+        Ok(())
+    }
+
     /// The session's cut (`app::Keep`), which takes only a position
     /// [`Seat::keep`] granted; any other is refused by name.
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
@@ -1549,6 +1555,12 @@ impl Seat for Q35Mtp {
     fn reset(&mut self) -> Result<(), GateError> {
         let sel = self.s.selected();
         self.drafted.reset(&mut self.s, sel)
+    }
+
+    /// The draft's record printed ([`SlotDrafts::close`]).
+    fn close(&mut self) -> Result<(), GateError> {
+        self.drafted.close();
+        Ok(())
     }
 
     /// The session's cut. A cut that moves the position turns the draft off

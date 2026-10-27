@@ -542,6 +542,14 @@ impl Seat for Raon1 {
         Ok(())
     }
 
+    /// The draft's record printed ([`ServedSpark::close`]).
+    fn close(&mut self) -> Result<(), GateError> {
+        if let Some(d) = &mut self.draft {
+            d.close();
+        }
+        Ok(())
+    }
+
     /// Never asked for a position other than the one the model stands at
     /// ([`Seat::keep`] grants no other); any other is refused by name.
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {

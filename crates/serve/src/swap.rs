@@ -173,8 +173,8 @@ impl Engine for SwapEngine {
     fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, EngineError> {
         self.inner.residency_reset()
     }
-    fn close_nodes(&mut self) -> Result<(), EngineError> {
-        self.inner.close_nodes()
+    fn close(&mut self) -> Result<(), EngineError> {
+        self.inner.close()
     }
     fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
         self.inner.snapshot()
