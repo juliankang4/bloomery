@@ -413,8 +413,8 @@ use model::arch::models::headpick::HeadSet;
 use model::arch::models::{Mixer, ModelSpec};
 use model::arch::qwen35moe::head_list::{HeadPick, head_rows_of};
 use model::arch::qwen35moe::place::{
-    Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx, tensor_places,
-    tier_batch, widen_card_route,
+    Experts, MtpInputs, PlaceError, PlanInputs, machine_for_experts, serve_ctx, tier_batch,
+    widen_card_route,
 };
 use model::placement::churn::ChurnPool;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
@@ -642,12 +642,27 @@ impl Place38 {
     fn machine(
         self,
         inputs: &PlanInputs,
-        (ctx, ub): (u64, u64),
+        ctx_ub: (u64, u64),
         experts: Experts,
         levers: &PlanLevers,
         mtp: Option<&MtpInputs>,
         slots: usize,
     ) -> Result<Machine, GateError> {
+        Ok(self
+            .machine_read(inputs, ctx_ub, (experts, levers, mtp, slots), |_| ())?
+            .0)
+    }
+
+    /// [`Self::machine`] and `read` of its plan ([`PlanInputs::plan_target`] at
+    /// `ctx`), which the machine's own choice made, so the caller plans it no
+    /// more.
+    fn machine_read<T>(
+        self,
+        inputs: &PlanInputs,
+        (ctx, ub): (u64, u64),
+        (experts, levers, mtp, slots): (Experts, &PlanLevers, Option<&MtpInputs>, usize),
+        read: impl Fn(&Plan<'_>) -> T,
+    ) -> Result<(Machine, T), GateError> {
         let layers = inputs.spec.layers.len();
         let mut machine = match self.kind {
             Kind38::A | Kind38::Gate => machine_for_experts(self.spec()?, layers, ub, experts),
@@ -682,11 +697,16 @@ impl Place38 {
                 .reserves
                 .push((POINT_ROWS_RESERVE.to_owned(), pinned(slots, bytes)));
         }
-        Ok(widen_card_route(machine, ub, |m| {
-            inputs
-                .plan_target(m, ctx, levers, experts, mtp, slots)
-                .map(|p| tensor_places(&p))
-        })?)
+        Ok(widen_card_route(
+            machine,
+            ub,
+            |m, on| {
+                inputs
+                    .plan_target(m, ctx, levers, experts, mtp, slots)
+                    .map(|p| on(&p))
+            },
+            read,
+        )?)
     }
 }
 
@@ -1076,28 +1096,13 @@ impl Plans<'_> {
     /// does. A folder's plan also holds the least of its parts' reads
     /// ([`Folder38::least_reads`], [`folder_holds`]).
     fn holds(&self, ctx: usize) -> Result<(), GateError> {
-        let ub = self.ubatch.min(ctx);
-        let ctx = u64::try_from(ctx)?;
-        let machine = self.place.machine(
-            self.inputs,
-            (ctx, u64::try_from(ub)?),
-            self.experts,
-            self.levers,
-            self.mtp,
-            self.slots,
-        )?;
-        let plan = self.inputs.plan_target(
-            &machine,
-            ctx,
-            self.levers,
-            self.experts,
-            self.mtp,
-            self.slots,
-        )?;
-        match self.folder {
-            Some(folder) => folder_holds(&plan, folder.least_reads(&plan, CARD38)?),
-            None => Ok(()),
-        }
+        self.read(ctx, |plan| -> Result<(), GateError> {
+            match self.folder {
+                Some(folder) => folder_holds(plan, folder.least_reads(plan, CARD38)?),
+                None => Ok(()),
+            }
+        })?
+        .1
     }
 
     /// The plan's host need (`HostNeed::bytes`, the NVMe expert tier's
@@ -1115,49 +1120,50 @@ impl Plans<'_> {
         ctx: usize,
         set: Option<(Residency, &str)>,
     ) -> Result<(u64, u64, u64, u64, u64), GateError> {
+        let (machine, read) = self.read(ctx, |plan| -> Result<_, GateError> {
+            let lever = match set {
+                Some((r, word)) => Lever38::Set(r, word),
+                None => Lever38::Unset(residency38_unset(self.feed.residency_at(self.place))),
+            };
+            // An unhosted pool takes no host bytes: the load only knows it.
+            let pool = match residency38(
+                <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+                plan,
+                lever,
+                |_| {},
+            )? {
+                (Residency::Mid { pinned, .. }, ChurnHosting::Hosted) => {
+                    ChurnPool::of(plan, CARD38, pinned)
+                        .map_err(|e| format!("the churn pool: {e}"))?
+                        .bytes
+                }
+                _ => 0,
+            };
+            Ok((
+                HostNeed::of(plan, 0).bytes(),
+                pool,
+                plan.host.nvme_arena_bytes,
+                plan.host.nvme_expert_bytes,
+            ))
+        })?;
+        let (need, pool, arena, nvme) = read?;
+        Ok((need, pool, arena, checkpoints_reserved(&machine), nvme))
+    }
+
+    /// The machine a load of `ctx` positions a sequence runs on
+    /// ([`Place38::machine`]) and `read` of its plan.
+    fn read<T>(
+        &self,
+        ctx: usize,
+        read: impl Fn(&Plan<'_>) -> T,
+    ) -> Result<(Machine, T), GateError> {
         let ub = self.ubatch.min(ctx);
-        let c = u64::try_from(ctx)?;
-        let machine = self.place.machine(
+        self.place.machine_read(
             self.inputs,
-            (c, u64::try_from(ub)?),
-            self.experts,
-            self.levers,
-            self.mtp,
-            self.slots,
-        )?;
-        let plan = self.inputs.plan_target(
-            &machine,
-            c,
-            self.levers,
-            self.experts,
-            self.mtp,
-            self.slots,
-        )?;
-        let lever = match set {
-            Some((r, word)) => Lever38::Set(r, word),
-            None => Lever38::Unset(residency38_unset(self.feed.residency_at(self.place))),
-        };
-        // An unhosted pool takes no host bytes: the load only knows it.
-        let pool = match residency38(
-            <Body38 as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
-            &plan,
-            lever,
-            |_| {},
-        )? {
-            (Residency::Mid { pinned, .. }, ChurnHosting::Hosted) => {
-                ChurnPool::of(&plan, CARD38, pinned)
-                    .map_err(|e| format!("the churn pool: {e}"))?
-                    .bytes
-            }
-            _ => 0,
-        };
-        Ok((
-            HostNeed::of(&plan, 0).bytes(),
-            pool,
-            plan.host.nvme_arena_bytes,
-            checkpoints_reserved(&machine),
-            plan.host.nvme_expert_bytes,
-        ))
+            (u64::try_from(ctx)?, u64::try_from(ub)?),
+            (self.experts, self.levers, self.mtp, self.slots),
+            read,
+        )
     }
 }
 

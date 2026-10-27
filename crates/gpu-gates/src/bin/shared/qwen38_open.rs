@@ -19,8 +19,7 @@ use bloomery_gpu_gates::GateError;
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::qwen35moe::place::{
-    Experts, PlaceError, PlanInputs, card_route_run, machine_for_experts, tensor_places,
-    widen_card_route,
+    Experts, PlaceError, PlanInputs, card_route_run, machine_for_experts, widen_card_route,
 };
 use model::placement::workstation::{CardSpec, HostNeed, HostRead};
 use model::placement::{Device, Machine, Plan, PlanLevers};
@@ -113,10 +112,11 @@ impl<'a> Open38<'a> {
             inputs.room = (r, HostRead::Given);
         }
         let ub = u64::try_from(self.ub)?;
-        let machine = widen_card_route(
+        let (machine, ()) = widen_card_route(
             machine_for_experts(self.card, inputs.spec.layers.len(), ub, self.experts),
             ub,
-            |m| self.plan_of(&inputs, m).map(|p| tensor_places(&p)),
+            |m, on| self.plan_of(&inputs, m).map(|p| on(&p)),
+            |_| (),
         )?;
         let plan = self.plan_of(&inputs, &machine)?;
         let facts = PlanFacts {

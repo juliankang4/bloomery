@@ -1327,36 +1327,53 @@ pub fn tensor_places(plan: &Plan<'_>) -> TensorPlaces {
 /// ubatch when nothing the plan places moves for it: its stage card then
 /// reserves [`route_unit_bytes`] as [`ROUTE_UNIT_RESERVE`], and a ubatch
 /// walk reads each card expert's weights once instead of once a run.
-/// `plan` is the caller's plan of a machine ([`PlanInputs::plan_target`]),
-/// as where it puts each tensor ([`tensor_places`]): the run is widened
-/// when the stage card holds a routed expert and the plan of the widened
-/// machine places every tensor where the plan of `machine` does, so the
+/// `plan` is the caller's plan of a machine ([`PlanInputs::plan_target`]):
+/// the run is widened when the stage card holds a routed expert and the plan
+/// of the widened machine places every tensor where the plan of `machine`
+/// does ([`tensor_places`]), so the
 /// wider run takes only room no expert, table or tier would use (on a
 /// unified pool the host's room shrinks with the card's reserves). The
 /// reserve is the one difference between the two machines, so a plan of the
 /// widened one that fails is the reserve not fitting, and keeps the runs.
-/// Refused as `plan` refuses `machine`.
-pub fn widen_card_route(
+/// `plan` hands each plan it makes to its second argument, which reads what
+/// the caller needs of it (`read`), so the caller does not plan the machine
+/// returned again: the plan of `machine` is read, and the plan of the widened
+/// one only when its places equal those, the one case that machine is
+/// returned. Returns the machine and the read of its plan. Refused as `plan`
+/// refuses `machine`.
+pub fn widen_card_route<T>(
     mut machine: Machine,
     ubatch: u64,
-    plan: impl Fn(&Machine) -> Result<TensorPlaces, PlaceError>,
-) -> Result<Machine, PlaceError> {
-    let held = plan(&machine)?;
+    plan: impl Fn(&Machine, &mut dyn FnMut(&Plan<'_>)) -> Result<(), PlaceError>,
+    read: impl Fn(&Plan<'_>) -> T,
+) -> Result<(Machine, T), PlaceError> {
+    let mut first = None;
+    plan(&machine, &mut |p| first = Some((tensor_places(p), read(p))))?;
+    let (held, held_read) = first.expect("widen_card_route: `plan` hands on the plan it made");
     let bytes = route_unit_bytes(ubatch, !machine.tiers.is_empty());
     let stage_expert = held.iter().flatten().any(|(device, _, experts)| {
         *device == Device::Card(0) && experts.as_ref().is_some_and(|e| !e.is_empty())
     });
     if bytes == 0 || !stage_expert {
-        return Ok(machine);
+        return Ok((machine, held_read));
     }
     let Some(stage) = machine.cards.first_mut() else {
-        return Ok(machine);
+        return Ok((machine, held_read));
     };
     stage.reserves.push((ROUTE_UNIT_RESERVE.to_string(), bytes));
-    if !plan(&machine).is_ok_and(|wide| wide == held) {
-        machine.cards[0].reserves.pop();
+    let mut wide = None;
+    let widened = plan(&machine, &mut |p| {
+        if tensor_places(p) == held {
+            wide = Some(read(p));
+        }
+    });
+    match (widened, wide) {
+        (Ok(()), Some(wide_read)) => Ok((machine, wide_read)),
+        _ => {
+            machine.cards[0].reserves.pop();
+            Ok((machine, held_read))
+        }
     }
-    Ok(machine)
 }
 
 /// The tokens one run of a load's card route takes at ubatches of up to `u`
@@ -3768,7 +3785,7 @@ mod tests {
         use super::super::{
             Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, ROUTE_UNIT_RESERVE,
             card_route_run, draft_card_bytes, machine_bp, route_unit_bytes, slot_resident_bytes,
-            tensor_places, tier_batch_of, widen_card_route,
+            tier_batch_of, widen_card_route,
         };
         use super::mtp::{draft, file};
         use crate::placement::workstation::HostRead;
@@ -4703,18 +4720,27 @@ mod tests {
         /// widens it. A load refuses by name a reserve of other bytes (a
         /// tiered load's run holds 2,048 · (170,360 − 102,440) B more, the
         /// join keeping the down rows and places), two of them, or one beside
-        /// a ubatch of one run, even of 0 B.
+        /// a ubatch of one run, even of 0 B. What the caller reads of a plan
+        /// is read of the plan of the machine returned, widened or not.
         #[test]
         fn the_card_route_runs_the_whole_ubatch_where_nothing_moves_for_it() {
             let inputs = routed(inputs());
             let levers = PlanLevers::default();
             let widen_by = |inputs: &PlanInputs, machine: Machine, ub: u64, experts: Experts| {
-                widen_card_route(machine, ub, |m| {
-                    inputs
-                        .plan_with(m, CTX, &levers, experts)
-                        .map(|p| tensor_places(&p))
-                })
-                .expect("the plan")
+                let (machine, read) = widen_card_route(
+                    machine,
+                    ub,
+                    |m, on| inputs.plan_with(m, CTX, &levers, experts).map(|p| on(&p)),
+                    |p| p.cards[0].reserve_bytes,
+                )
+                .expect("the plan");
+                let returned = inputs
+                    .plan_with(&machine, CTX, &levers, experts)
+                    .expect("the plan")
+                    .cards[0]
+                    .reserve_bytes;
+                assert_eq!(read, returned, "the read is of the machine returned");
+                machine
             };
             let widen = |machine: Machine, ub: u64, experts: Experts| {
                 widen_by(&inputs, machine, ub, experts)
