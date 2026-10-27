@@ -1,6 +1,7 @@
 # bloomery's server image: the prebuilt release on Ubuntu 24.04 (glibc 2.39, above the
 # release's 2.34 floor). The GPU comes from the host's NVIDIA Container Toolkit
 # (run with `--gpus all`); libcuda is injected by that runtime, never baked in.
+# linux/amd64 takes the x86-64 archive (SHA256), linux/arm64 the GB10 one (SHA256_ARM64).
 #
 # Build:  docker build --platform linux/amd64 -t ghcr.io/midagedev/bloomery:0.2.0 \
 #             --build-arg VERSION=0.2.0 \
@@ -13,13 +14,20 @@
 FROM ubuntu:24.04
 ARG VERSION=0.2.0
 ARG SHA256=cca1271b093cd2610660c700dd3d48b1ded272b7c8f377faa7dc5a93d2b13de8
+ARG SHA256_ARM64=
+ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 RUN set -eu; \
-    asset="bloomery-${VERSION}-linux-x86_64-cuda-sm86.tar.gz"; \
+    case "${TARGETARCH}" in \
+        amd64) asset="bloomery-${VERSION}-linux-x86_64-cuda-sm86.tar.gz" sha="${SHA256}" ;; \
+        arm64) asset="bloomery-${VERSION}-linux-aarch64-cuda-sm121a.tar.gz" sha="${SHA256_ARM64}" ;; \
+        *) echo "no bloomery release for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    [ -n "${sha}" ] || { echo "the ${TARGETARCH} image needs the archive's sha256 (--build-arg SHA256_ARM64)" >&2; exit 1; }; \
     curl -fsSL -o "/tmp/${asset}" "https://github.com/midagedev/bloomery/releases/download/v${VERSION}/${asset}"; \
-    echo "${SHA256}  /tmp/${asset}" | sha256sum -c -; \
+    echo "${sha}  /tmp/${asset}" | sha256sum -c -; \
     tar -xzf "/tmp/${asset}" -C /usr/local --strip-components=1; \
     rm "/tmp/${asset}"
 ENV CUDA_CACHE_PATH=/root/.cache/bloomery/nv
