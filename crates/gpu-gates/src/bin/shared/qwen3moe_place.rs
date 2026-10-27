@@ -1797,15 +1797,14 @@ pub fn checkpoints_fit(seqs: Seqs, slot_ctx: usize, placed: bool) -> Result<(), 
         eprintln!("{head}, counted in the placed plan's host reserves");
         return Ok(());
     }
-    let available = workstation::host_available()?;
+    let (available, read) = workstation::host_available_read()?;
     if pin > available {
         return Err(format!(
-            "{head}, past the {available} B the host has available (MemAvailable): give a smaller \
-             --parallel"
+            "{head}, past the host room of {available} B ({read}): give a smaller --parallel"
         )
         .into());
     }
-    eprintln!("{head}, of {available} B the host has available");
+    eprintln!("{head}, of the host room of {available} B ({read})");
     Ok(())
 }
 

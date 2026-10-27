@@ -4805,7 +4805,10 @@ impl Plan<'_> {
             cards: 0,
             ..workstation::HostNeed::of(self, 0)
         };
-        if let Err(short) = need.check(workstation::HostNeed::machine_room(host)) {
+        if let Err(short) = need.check(&(
+            workstation::HostNeed::machine_room(host),
+            workstation::HostRead::Given,
+        )) {
             out.push(Violation::HostOver {
                 total: short.need.bytes().saturating_add(short.need.os),
                 usable: host.usable_bytes,
@@ -5839,7 +5842,11 @@ mod tests {
                 usable: 1 << 40
             }]
         );
-        assert!(workstation::HostNeed::of(&plan, 0).check(u64::MAX).is_err());
+        assert!(
+            workstation::HostNeed::of(&plan, 0)
+                .check(&(u64::MAX, workstation::HostRead::Given))
+                .is_err()
+        );
     }
 
     /// A host that holds eight layers of eight 1 TiB experts each, with a

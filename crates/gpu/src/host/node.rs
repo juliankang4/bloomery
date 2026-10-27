@@ -454,9 +454,8 @@ impl NodeOpen {
             .nvme
             .as_ref()
             .ok_or_else(|| GpuError::shape(SERVER, "no node NVMe plan"))?;
-        let census = NodeCensus::here()?;
-        let device = census
-            .devices
+        let devices = crate::census()?;
+        let device = devices
             .iter()
             .find(|d| self.device.is_some_and(|id| id.uuid == d.uuid))
             .ok_or_else(|| {
@@ -471,8 +470,12 @@ impl NodeOpen {
                 .map_err(|e| GpuError::plan(SERVER, e))?
                 .bytes
         };
+        // The projection's room was this host's reading too, so the fresh
+        // reading names the room either way.
+        let (now, read) =
+            workstation::host_available_read().map_err(|e| GpuError::plan(SERVER, e))?;
         let mut arena = workstation::HostNeed::of(&plan, 0)
-            .grant(census.host_room.min(paging.room), floor)
+            .grant(&(now.min(paging.room), read), floor)
             .map_err(|e| GpuError::plan(SERVER, e))?;
         arena.granted = arena.granted.min(paging.arena.granted);
         let tier = crate::model::nvme_tier(gpu.context(), &plan, file, false, arena)?;

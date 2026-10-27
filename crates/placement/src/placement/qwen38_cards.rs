@@ -1115,7 +1115,7 @@ fn a_paged_plans_load_check_counts_the_arena() {
         need.plan_bytes()
     );
     let text = need
-        .check(shrunk)
+        .check(&(shrunk, HostRead::MemAvailable))
         .expect_err("the load refuses")
         .to_string();
     for part in [
@@ -1125,15 +1125,15 @@ fn a_paged_plans_load_check_counts_the_arena() {
     ] {
         assert!(text.contains(&part), "{part:?} in {text}");
     }
-    assert_eq!(need.check(need.bytes()), Ok(()));
+    assert_eq!(need.check(&(need.bytes(), HostRead::MemAvailable)), Ok(()));
     // A plan with no arena checks exactly as before: the two sums are one.
     let wide = plan_at(&q4, &gate, 4096, 1, 58 << 30).expect("the wide split plan");
     let need = HostNeed::of(&wide, 0);
     assert_eq!(need.arena, 0, "the wide room's dial gives no arena");
     assert_eq!(need.bytes(), need.plan_bytes());
-    assert_eq!(need.check(need.bytes()), Ok(()));
+    assert_eq!(need.check(&(need.bytes(), HostRead::MemAvailable)), Ok(()));
     let text = need
-        .check(need.bytes() - 1)
+        .check(&(need.bytes() - 1, HostRead::MemAvailable))
         .expect_err("one byte short")
         .to_string();
     assert!(!text.contains("NVMe tier arena"), "{text}");
@@ -1153,7 +1153,7 @@ fn a_read_rooms_plan_holds_at_a_lowered_reading() {
     let plan = plan_at(&q4, &gate, 16384, 1, room).expect("the deep split plan");
     let need = HostNeed::of(&plan, 0);
     assert!(need.arena > 0, "the room is a deep split's");
-    assert_eq!(need.check(LOWERED), Ok(()));
+    assert_eq!(need.check(&(LOWERED, HostRead::MemAvailable)), Ok(()));
 }
 
 /// A room the caller gave plans as given: the plan at [`plan_room`] of a
@@ -1201,7 +1201,12 @@ fn an_unpaged_plan_at_the_plan_room_ends_a_margin_under_the_reading() {
     );
     let filled = HostNeed::of(&at_reading, 0);
     assert_eq!(filled.bytes(), need);
-    assert!(filled.check(need - SHORT).is_err(), "no arena to shrink");
+    assert!(
+        filled
+            .check(&(need - SHORT, HostRead::MemAvailable))
+            .is_err(),
+        "no arena to shrink"
+    );
 
     // The plan at the reading's plan room pages, and its load passes the
     // lowered reading.
@@ -1212,7 +1217,10 @@ fn an_unpaged_plan_at_the_plan_room_ends_a_margin_under_the_reading() {
         kept.host.nvme_expert_bytes > 0,
         "the context passes the margin: it pages"
     );
-    assert_eq!(HostNeed::of(&kept, 0).check(need - SHORT), Ok(()));
+    assert_eq!(
+        HostNeed::of(&kept, 0).check(&(need - SHORT, HostRead::MemAvailable)),
+        Ok(())
+    );
 }
 
 /// A plan names the room it was made at: the reading and the plan room, a

@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use cuda_core::CudaStream;
 use gguf::{GgmlType, Place, Split, TensorInfo};
 use model::part::{Planned, Source, Take, read_ahead};
+use model::placement::workstation::{HostRead, host_available_read};
 use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan, Segment};
 
 use crate::GpuError;
@@ -35,10 +36,9 @@ pub fn load<S: Source + Sync, E: std::fmt::Display>(
     card: impl Fn(&TensorInfo) -> Option<CardFormat>,
     release: bool,
 ) -> Result<Weights, GpuError> {
-    let available =
-        model::placement::workstation::host_available().map_err(|e| refused(e.to_string()))?;
-    let plan = LoadPlan::new(source, rule, available)?;
-    load_plan(stream, source, &plan, card, release, available)
+    let reading = host_available_read().map_err(refused)?;
+    let plan = LoadPlan::new(source, rule, reading.0)?;
+    load_plan(stream, source, &plan, card, release, &reading)
 }
 
 fn load_plan<S: Source + Sync>(
@@ -47,9 +47,9 @@ fn load_plan<S: Source + Sync>(
     plan: &LoadPlan,
     card: impl Fn(&TensorInfo) -> Option<CardFormat>,
     release: bool,
-    available: u64,
+    room: &(u64, HostRead),
 ) -> Result<Weights, GpuError> {
-    plan.check(available)?;
+    plan.check(room)?;
     for p in &plan.parts {
         if let Some(format) = card(&p.info) {
             card_layout(&p.info, format)?;
@@ -59,9 +59,7 @@ fn load_plan<S: Source + Sync>(
     let mut staged = BTreeMap::new();
     // Dropped before the staged device buffers: draining the ring protects refused loads.
     let mut ring = UploadRing::new(stream, plan.upload_bytes)?;
-    for run in plan.checked_runs(|| {
-        model::placement::workstation::host_available().map_err(|e| refused(e.to_string()))
-    }) {
+    for run in plan.checked_runs(|| host_available_read().map_err(refused)) {
         let run = run?;
         let parts = pool_map(run.iter().collect(), |p| {
             source.read(p).map_err(|e| e.to_string())
@@ -144,7 +142,7 @@ struct LoadPlan {
 impl LoadPlan {
     fn checked_runs<'a>(
         &'a self,
-        mut available: impl FnMut() -> Result<u64, GpuError> + 'a,
+        mut available: impl FnMut() -> Result<(u64, HostRead), GpuError> + 'a,
     ) -> impl Iterator<Item = Result<&'a [Planned], GpuError>> + 'a {
         let mut runs = self.runs.iter();
         let mut left = 0..0;
@@ -155,19 +153,19 @@ impl LoadPlan {
                 (left, planned) = (range.clone(), Some(*bytes));
             }
             // The ring is already paid for in the live reading.
-            let run = available().and_then(|live| {
+            let run = available().and_then(|(live, read)| {
                 let (n, bytes) =
                     read_ahead(&self.parts[left.clone()], &self.costs[left.clone()], live)
                         .map_err(|e| refused(e.to_string()))?;
                 if bytes > live {
                     return Err(refused(format!(
-                        "part read-ahead needs {bytes} B, the host has {live} B available"
+                        "part read-ahead needs {bytes} B, the host room is {live} B ({read})"
                     )));
                 }
                 if let Some(planned) = planned.filter(|_| n < left.len()) {
                     eprintln!(
-                        "{WHAT}: a read-ahead run of {} parts needs {planned} B, the host has \
-                         {live} B available; it reads in smaller runs",
+                        "{WHAT}: a read-ahead run of {} parts needs {planned} B, the host room \
+                         is {live} B ({read}); it reads in smaller runs",
                         left.len()
                     );
                 }
@@ -179,12 +177,12 @@ impl LoadPlan {
         })
     }
 
-    /// Refused unless one part at a time fits `available`; [`Self::checked_runs`] shrinks the
-    /// planned runs to the live reading.
-    fn check(&self, available: u64) -> Result<(), GpuError> {
-        if self.serial_bytes > available {
+    /// Refused unless one part at a time fits the host room `room`, named by the reading that
+    /// gave it; [`Self::checked_runs`] shrinks the planned runs to the live reading.
+    fn check(&self, (available, read): &(u64, HostRead)) -> Result<(), GpuError> {
+        if self.serial_bytes > *available {
             return Err(refused(format!(
-                "part read-ahead needs {} B, the host has {available} B available",
+                "part read-ahead needs {} B, the host room is {available} B ({read})",
                 self.serial_bytes
             )));
         }
@@ -497,15 +495,14 @@ pub fn load_placed_in_place<S: Source + Sync>(
     room: u64,
 ) -> Result<Weights, GpuError> {
     let (on, read) = LoadPlan::placed(source, plan, card, in_place, room)?;
-    let available =
-        model::placement::workstation::host_available().map_err(|e| refused(e.to_string()))?;
+    let (available, reading) = host_available_read().map_err(refused)?;
     let w = load_plan(
         stream,
         source,
         &read,
         |t| on.format(t),
         release,
-        available.min(room),
+        &(available.min(room), reading),
     )?;
     on.check(&w)?;
     Ok(w)
@@ -614,14 +611,15 @@ mod tests {
             LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 296 * mib).unwrap();
         assert_eq!(shared.runs, [(0..2, 200 * mib)]);
         assert_eq!(shared.host_bytes, 296 * mib);
-        shared.check(288 * mib).unwrap();
-        assert!(shared.check(288 * mib - 1).is_err());
+        let read = |bytes: u64| (bytes, HostRead::MemAvailable);
+        shared.check(&read(288 * mib)).unwrap();
+        assert!(shared.check(&read(288 * mib - 1)).is_err());
         let plan =
             LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 288 * mib).unwrap();
         assert_eq!(plan.runs, [(0..1, 192 * mib), (1..2, 24 * mib)]);
         assert_eq!(plan.host_bytes, 288 * mib);
-        plan.check(300 * mib).unwrap();
-        assert!(plan.check(288 * mib - 1).is_err());
+        plan.check(&read(300 * mib)).unwrap();
+        assert!(plan.check(&read(288 * mib - 1)).is_err());
         for (load, readings, lens) in [
             (&shared, &[200][..], &[2][..]),
             (&shared, &[199, 199][..], &[1, 1][..]),
@@ -630,7 +628,7 @@ mod tests {
         ] {
             let mut rooms = readings.iter();
             let runs = load
-                .checked_runs(|| Ok(rooms.next().unwrap() * mib))
+                .checked_runs(|| Ok(read(rooms.next().unwrap() * mib)))
                 .collect::<Result<Vec<_>, _>>()
                 .expect("each run fits its live room, shrunk to it when over");
             assert_eq!(runs.iter().map(|r| r.len()).collect::<Vec<_>>(), lens);
@@ -642,12 +640,18 @@ mod tests {
                 ["p64.weight", "p8.weight"]
             );
         }
-        let mut rooms = [228, 23].into_iter();
-        let mut runs = plan.checked_runs(|| Ok(rooms.next().unwrap() * mib));
+        let mut rooms = [(228, HostRead::MemAvailable), (23, HostRead::Given)].into_iter();
+        let mut runs = plan.checked_runs(|| {
+            let (room, read) = rooms.next().unwrap();
+            Ok((room * mib, read))
+        });
         assert!(runs.next().unwrap().is_ok());
         let error = runs.next().unwrap().unwrap_err().to_string();
         assert!(error.contains("needs 25165824 B"), "{error}");
-        assert!(error.contains("24117248 B available"), "{error}");
+        assert!(
+            error.contains("the host room is 24117248 B (given by BLOOMERY_HOST_ROOM"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -683,7 +687,8 @@ mod tests {
         assert_eq!(plan.runs.len(), 256);
         assert_eq!(plan.host_bytes, (192 + 3 * 32) << 20);
         let gpu = crate::Gpu::with_device(0).unwrap();
-        let error = load_plan(gpu.stream(), &Owned, &plan, |_| None, false, 128 << 20)
+        let room = (128 << 20, HostRead::MemAvailable);
+        let error = load_plan(gpu.stream(), &Owned, &plan, |_| None, false, &room)
             .err()
             .expect("a short host must refuse the load")
             .to_string();
@@ -691,9 +696,12 @@ mod tests {
             error.contains("part read-ahead needs 301989888 B"),
             "{error}"
         );
-        assert!(error.contains("134217728 B available"), "{error}");
-        assert!(plan.check(plan.host_bytes).is_ok());
-        assert!(plan.check(plan.host_bytes - 1).is_err());
+        assert!(
+            error.contains("the host room is 134217728 B (MemAvailable"),
+            "{error}"
+        );
+        assert!(plan.check(&(plan.host_bytes, HostRead::Given)).is_ok());
+        assert!(plan.check(&(plan.host_bytes - 1, HostRead::Given)).is_err());
     }
 
     /// The rule a load from a part source plans by: a tensor whole on the card is taken in the
