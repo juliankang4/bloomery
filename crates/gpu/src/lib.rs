@@ -2501,8 +2501,9 @@ static BUNDLES: Mutex<Vec<Bundle>> = Mutex::new(Vec::new());
 /// family's entries, and loading it per family repeats the same JIT. `load`
 /// runs only for the first caller, on the device's anchor ([`anchor`]): the
 /// module outlives every `Gpu`, and the driver errors it records land on
-/// the anchor, never on a `Gpu`'s own handle. A `ctx` that is not its
-/// device's primary context is refused by name.
+/// the anchor, never on a `Gpu`'s own handle. A bundle whose compiled code
+/// the driver refuses loads from its PTX instead ([`load_or_ptx`]). A `ctx`
+/// that is not its device's primary context is refused by name.
 pub fn bundle_module(
     ctx: &Arc<CudaContext>,
     name: &'static str,
@@ -2539,9 +2540,85 @@ pub fn bundle_module(
         return Ok(Arc::clone(module));
     }
     state.loads += 1;
-    let loaded = load(&anchor)?;
+    let loaded = load_or_ptx(&anchor, name, load, |name| {
+        let exe = std::env::current_exe()
+            .map_err(|source| cuda_core::EmbeddedModuleError::CurrentExe { source })?;
+        file_ptx(&exe, name)
+    })?;
     state.module = Some(Arc::clone(&loaded));
     Ok(loaded)
+}
+
+/// The section a GB10 release binary keeps its bundles' PTX in once its
+/// `.oxart` carries their cubins (`tools/release/build.sh`).
+const PTX_SECTION: &str = ".oxart.ptx";
+
+/// What `load` makes of bundle `name` on `anchor`, unless the driver refuses
+/// that code as an image it cannot run ([`refuses_image`]) and `ptx` holds
+/// the bundle's PTX: then one line on stderr names the refusal and the PTX
+/// loads as cuda-core loads a PTX payload, compiled by the driver for the
+/// card. Any other failure, and a refusal with no PTX, is `load`'s error.
+fn load_or_ptx(
+    anchor: &Arc<CudaContext>,
+    name: &str,
+    load: impl FnOnce(&Arc<CudaContext>) -> Result<Arc<CudaModule>, cuda_host::EmbeddedModuleError>,
+    ptx: impl FnOnce(&str) -> Result<Option<Vec<u8>>, cuda_core::EmbeddedModuleError>,
+) -> Result<Arc<CudaModule>, GpuError> {
+    let refused = match load(anchor) {
+        Err(cuda_host::EmbeddedModuleError::Driver(e)) if refuses_image(e) => e,
+        loaded => return Ok(loaded?),
+    };
+    let Some(text) = ptx(name).map_err(cuda_host::EmbeddedModuleError::Core)? else {
+        return Err(cuda_host::EmbeddedModuleError::Driver(refused).into());
+    };
+    eprintln!(
+        "{name}: the driver refused the GPU code compiled for the card ({refused}); loading its \
+         PTX, which the driver compiles"
+    );
+    Ok(anchor
+        .load_module_from_image(&text)
+        .map_err(cuda_host::EmbeddedModuleError::Driver)?)
+}
+
+/// A driver's refusal of a module image as code it cannot run: compiled for
+/// another card or machine, or by a newer toolchain than the driver knows.
+fn refuses_image(e: cuda_core::DriverError) -> bool {
+    use cuda_core::sys;
+    matches!(
+        e.0,
+        sys::cudaError_enum_CUDA_ERROR_INVALID_IMAGE
+            | sys::cudaError_enum_CUDA_ERROR_NO_BINARY_FOR_GPU
+            | sys::cudaError_enum_CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+    )
+}
+
+/// The PTX of bundle `name` in the [`PTX_SECTION`] of executable `path`
+/// (the running one, the file cuda-core reads the bundles from); `None` when
+/// the executable has no such section or the section no such bundle.
+fn file_ptx(
+    path: &std::path::Path,
+    name: &str,
+) -> Result<Option<Vec<u8>>, cuda_core::EmbeddedModuleError> {
+    use cuda_core::EmbeddedModuleError as Read;
+    use object::{Object, ObjectSection};
+    use oxide_artifacts::{ArtifactError, ArtifactPayloadKind};
+
+    let bytes = std::fs::read(path).map_err(|source| Read::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let unreadable = |e: object::Error| Read::Artifacts(ArtifactError::Object(e.to_string()));
+    let file = object::File::parse(&*bytes).map_err(unreadable)?;
+    let Some(section) = file.section_by_name(PTX_SECTION) else {
+        return Ok(None);
+    };
+    let bundles = oxide_artifacts::parse_artifact_section(section.data().map_err(unreadable)?)
+        .map_err(Read::Artifacts)?;
+    Ok(bundles
+        .iter()
+        .find(|b| b.name == name)
+        .and_then(|b| b.payload(ArtifactPayloadKind::Ptx))
+        .map(<[u8]>::to_vec))
 }
 
 /// The bundle loads this process made for bundle `name` on device `device`
@@ -3738,5 +3815,94 @@ mod context_tests {
             Arc::ptr_eq(a.module.as_cuda_module(), b.module.as_cuda_module()),
             "two Gpus on device 0 hold two loads of the bundle"
         );
+    }
+
+    /// A bundle whose compiled code the driver refuses (the code a cubin for
+    /// another card gets) loads from the PTX a release binary keeps, and every
+    /// kernel entry of the bundle resolves in that module; a refusal with no
+    /// PTX beside it, and a failure that is no refusal, stay the load's own
+    /// error. The release binary is a copy of the test binary whose `.oxart`
+    /// is renamed as `tools/release/build.sh` renames it. Mutants: `load_or_ptx`
+    /// returning `load`'s result as it is fails the first load; `file_ptx`
+    /// reading another section finds no PTX in the copy.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_refused_cubin_loads_its_ptx() {
+        use cuda_core::{CudaContext, CudaModule};
+        use cuda_host::EmbeddedModuleError;
+        use oxide_artifacts::{ArtifactEntryKind, ArtifactPayloadKind};
+
+        let name = env!("CARGO_PKG_NAME");
+        let bundle = cuda_core::embedded::artifact_bundles_from_current_exe()
+            .expect("the test binary's bundles")
+            .into_iter()
+            .find(|b| b.name == name)
+            .expect("this crate's bundle");
+        let ptx = bundle.payload(ArtifactPayloadKind::Ptx).expect("its PTX");
+        let exe = std::env::current_exe().expect("the test binary");
+        let release = std::env::temp_dir().join(format!("bloomery-gpu-ptx-{}", std::process::id()));
+        let renamed = std::process::Command::new("objcopy")
+            .args(["--rename-section", ".oxart=.oxart.ptx"])
+            .arg(&exe)
+            .arg(&release)
+            .status()
+            .expect("objcopy");
+        assert!(renamed.success(), "objcopy: {renamed}");
+        assert_eq!(
+            super::file_ptx(&exe, name).expect("the test binary reads"),
+            None,
+            "a binary with no PTX section"
+        );
+        let kept = super::file_ptx(&release, name).expect("the copy reads");
+        std::fs::remove_file(&release).expect("the copy is removed");
+        assert!(
+            kept.as_deref() == Some(ptx),
+            "the copy's PTX of this bundle, {:?} bytes against {}",
+            kept.as_ref().map(Vec::len),
+            ptx.len()
+        );
+        let broken = |_: &Arc<CudaContext>| -> Result<Arc<CudaModule>, EmbeddedModuleError> {
+            Err(EmbeddedModuleError::Driver(DriverError(
+                sys::cudaError_enum_CUDA_ERROR_NO_BINARY_FOR_GPU,
+            )))
+        };
+        let anchor = super::anchor(0).expect("device 0's anchor");
+
+        let module = super::load_or_ptx(&anchor, name, broken, |asked| {
+            assert_eq!(asked, name);
+            Ok(kept)
+        })
+        .expect("the bundle's PTX loads after the refusal");
+        let kernels: Vec<&str> = bundle
+            .entries
+            .iter()
+            .filter(|e| e.kind == ArtifactEntryKind::Kernel)
+            .map(|e| e.symbol.as_str())
+            .collect();
+        assert!(!kernels.is_empty(), "the bundle names no kernel");
+        for k in kernels {
+            module
+                .load_function(k)
+                .unwrap_or_else(|e| panic!("{k} does not resolve: {e}"));
+        }
+
+        match super::load_or_ptx(&anchor, name, broken, |_| Ok(None)) {
+            Err(super::GpuError::Module(e)) => assert!(
+                matches!(*e, EmbeddedModuleError::Driver(d) if super::refuses_image(d)),
+                "{e}"
+            ),
+            other => panic!("a refusal with no PTX: {:?}", other.map(|_| ())),
+        }
+        let other = |_: &Arc<CudaContext>| -> Result<Arc<CudaModule>, EmbeddedModuleError> {
+            Err(EmbeddedModuleError::NoModules)
+        };
+        match super::load_or_ptx(&anchor, name, other, |_| {
+            panic!("the PTX was read after a failure that is no refusal")
+        }) {
+            Err(super::GpuError::Module(e)) => {
+                assert!(matches!(*e, EmbeddedModuleError::NoModules), "{e}");
+            }
+            other => panic!("a failure that is no refusal: {:?}", other.map(|_| ())),
+        }
     }
 }
