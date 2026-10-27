@@ -1908,8 +1908,8 @@ fn spark_holds(
 }
 
 /// The Qwen3.8 seat's default on a DGX Spark with no flag, both files at
-/// their own readings (the census's free pool, `MemAvailable`): the ladder's
-/// target, 262,144 positions for the one default slot, with the draft on —
+/// their own readings (the census's free pool, `MemAvailable`): the default's
+/// target, the trained 262,144 positions for the one default slot, with the draft on —
 /// the drafted plan holds the target, so the draft costs no position and does
 /// not yield. The prompt cache's budget does not lower it: the cache keeps
 /// what its budget holds at that context.

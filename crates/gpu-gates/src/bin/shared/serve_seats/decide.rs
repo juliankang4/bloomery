@@ -24,9 +24,9 @@
 //! is refused by name, listing the rows. The server takes `-m`/`--hf` out
 //! before this seat parses (its module doc); `--ctx-size` and `-c` are
 //! `--ctx` under llama-server's spellings. Unset, `--ctx` is the seats'
-//! ladder (`generate::choose_ctx`, one slot): the target under the file's
-//! trained context, halved while the whole load is short of the card, one
-//! `ctx` line naming the rule. A set value is that one context; a share past
+//! fit (`generate::choose_ctx`, one slot): the file's trained context, or the
+//! largest context under it whose whole load the card holds, one `ctx` line
+//! naming the rule. A set value is that one context; a share past
 //! the limit is refused by name before the load.
 //!
 //! The backbone is a dense whole load, so its prompt ubatch is part of the card's verdict
@@ -474,7 +474,7 @@ struct Load {
     width: u64,
     head: Option<(PathBuf, PathBuf)>,
     open: Open,
-    /// Set `--ctx`, the one context. `None` walks the seats' ladder.
+    /// Set `--ctx`, the one context. `None` takes the seats' fit.
     ctx: Option<usize>,
     /// `-ub`, the prompt ubatch the user names. `None` is `BLOOMERY_QWEN3_UBATCH`, else the card's room.
     ubatch: Option<usize>,
@@ -567,7 +567,7 @@ fn open_encoder(model: &CudaContext, at: &vision_seat::Opened) -> Result<image::
     Ok(tower)
 }
 
-/// Opens the head, checks its width, chooses the context (the seats' ladder,
+/// Opens the head, checks its width, chooses the context (the seats' fit,
 /// the encoder's reserve in the probe), opens the tokenizer and the backbone
 /// on this thread, and reports the open (the quant word and that context, or
 /// why not) on `ready`, then answers `jobs` until the server drops its sender.
@@ -589,7 +589,7 @@ fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiv
         if let Some(at) = &image {
             vision_seat::seat_record(at).eprint();
         }
-        // The ladder sees the encoder's reserve, which the later open counts too.
+        // The fit sees the encoder's reserve, which the later open counts too.
         let file = Split::open(&l.model).map_err(|e| format!("open {}: {e}", l.model.display()))?;
         let census = bloomery_gpu_gates::gpu_census::census()?;
         let card = Place::A.on(&census)?.card_specs()?[0];

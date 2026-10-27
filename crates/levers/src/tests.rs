@@ -1572,8 +1572,9 @@ fn draft38_unset_follows_the_place_and_the_file() {
 }
 
 /// The unset draft's yield to the context ([`RungCost::of`]): it fires
-/// when the drafted choice leaves a slot fewer positions than the plain one,
-/// and only then — a draft that denies no position stays on.
+/// when the drafted choice leaves a slot half the plain one's positions or
+/// fewer, and only then; a draft that costs the fitted context a few steps,
+/// or no position, stays on.
 ///
 /// The card figures [measured, the 0.2.8 candidate on a RTX 3060 12 GB at
 /// the serving defaults, logs sih-smoke028b (draft on: fit 702, the plan's
@@ -1607,12 +1608,24 @@ fn draft_yields_to_the_context_only_when_it_costs_positions() {
         RungCost::of(Reserve::Draft, 0, 4096, r).is_some(),
         "under the floor"
     );
+    // Half the positions yields; a few steps of a fitted context do not.
+    assert!(
+        RungCost::of(Reserve::Draft, 65_536, 131_072, r).is_some(),
+        "half"
+    );
+    assert!(
+        RungCost::of(Reserve::Draft, 65_537, 131_072, r).is_none(),
+        "past half"
+    );
+    assert!(
+        RungCost::of(Reserve::Draft, 254_976, 262_144, r).is_none(),
+        "a few steps"
+    );
 }
 
-/// The image encoder's reserve names itself on the `ctx` line only when it
-/// lowers the rung ([`RungCost::of`], the draft's comparison): a reserve
-/// that denies no position says nothing, and
-/// the encoder stays on either way.
+/// The image encoder's reserve names itself on the `ctx` line whenever it
+/// lowers the context ([`RungCost::of`]), by a step or more: a reserve
+/// that denies no position says nothing, and the encoder stays on either way.
 #[test]
 fn a_vision_reserve_names_itself_only_when_it_lowers_the_rung() {
     let bytes = 1_234_567_890_u64;
@@ -1631,6 +1644,10 @@ fn a_vision_reserve_names_itself_only_when_it_lowers_the_rung() {
         y.to_string(),
         "the image encoder's 1234567890 B on the card leave a slot 32768 positions; without the \
          encoder a slot takes 65536"
+    );
+    assert!(
+        RungCost::of(Reserve::ImageEncoder, 31_744, 32_768, bytes).is_some(),
+        "one step"
     );
     assert!(
         RungCost::of(Reserve::ImageEncoder, 32_768, 32_768, bytes).is_none(),

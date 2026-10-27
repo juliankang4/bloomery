@@ -1516,12 +1516,12 @@ pub fn serve_choice_lanes(
     Ok((chosen, Reads { censuses, probes }))
 }
 
-/// A short probe of a load whose ubatch the user named (`ask`), at the least context the ladder tries
+/// A short probe of a load whose ubatch the user named (`ask`), at the least context the choice tries
 /// (`c` positions a slot over `slots`): no smaller context helps, so the refusal is that size's
-/// ([`ubatch_pick::asked_short`]), where the context ladder's own words ask for fewer slots or a
+/// ([`ubatch_pick::asked_short`]), where the context choice's own words ask for fewer slots or a
 /// smaller file, with the largest size of the ladder that load holds at this context and slots
 /// (`fits(u)`: whether the load asked at the size `u` fits, [`ubatch_pick::largest_fit`]). A probe
-/// above the floor stays short, for the ladder to step down on.
+/// above the floor stays short, for the choice to search below.
 #[allow(
     dead_code,
     reason = "the serve seat, the routed legs and the types gate read it; the CLI and the e2e gates include the planner without it"
@@ -1878,7 +1878,7 @@ pub(super) mod tests {
         dead_code,
         reason = "`generate_qwen3moe`'s test calls it; every other bin that includes this file leaves it unused"
     )]
-    pub(crate) fn dense_shortage_halves_the_default_context() {
+    pub(crate) fn dense_shortage_fits_the_default_context() {
         const TARGET: u64 = 16_384;
         let model = ModelTensors {
             tensors: vec![ModelTensor {
@@ -1949,7 +1949,7 @@ pub(super) mod tests {
                     ),
                     (
                         lower.need,
-                        upper.need,
+                        need.need,
                         need.weights,
                         need.kv,
                         card.context_bytes,
@@ -1961,9 +1961,11 @@ pub(super) mod tests {
                 );
                 short_or(error)
             })
-            .unwrap_or_else(|e| panic!("dense default context must halve: {e}"));
+            .unwrap_or_else(|e| panic!("dense default context must fit: {e}"));
             assert_eq!(chosen.total, TARGET / 2);
-            assert_eq!(probes, [TARGET, TARGET / 2]);
+            // The target, the midpoint of the steps 4 to 15 under it, the step under that, and the
+            // fit their shortfalls' line names.
+            assert_eq!(probes, [TARGET, 10_240, 9216, 8192]);
         }
         let refused = Whole::Refused("unsupported tensor".into()).dense_refusal(TARGET as usize);
         assert!(short_or(refused).is_err());

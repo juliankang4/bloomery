@@ -46,13 +46,13 @@
 //!
 //! - the seat's `--ctx` choice ([`ctx`], on the gate card, one slot): the
 //!   default's one `ctx` line holds its word (`ctx_ladder::default_line_held`:
-//!   a rung of the ladder from the trained context verified to
-//!   `place::ORACLE_POSITIONS`, `target` or `halved`) and this gate's own
-//!   plans agree: the card holds the default, and not the rung above it when
-//!   it halved (`ctx_default_is_the_highest_rung_held`); the flag winning
-//!   below the floor; and a context past `place::ORACLE_POSITIONS` refused by
-//!   name before it listens. FAIL-first: a default that starts a rung low
-//!   names a rung whose rung above the card holds;
+//!   the trained context verified to `place::ORACLE_POSITIONS`, or a step
+//!   under it, `target` or `fitted`) and this gate's own plans agree: the
+//!   card holds the default, and not the step above it when it fitted
+//!   (`ctx_default_is_the_highest_rung_held`); the flag winning below the
+//!   floor; and a context past `place::ORACLE_POSITIONS` refused by name
+//!   before it listens. FAIL-first: a default that starts a step low names a
+//!   context whose step above the card holds;
 //!
 //! - the load prints `load draft=off (BLOOMERY_DRAFT=off)` and the word as a
 //!   `residency lever` record (`why=set`), no `residency host` and no verify
@@ -301,7 +301,7 @@ mod gate {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, rung_above};
+    use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
@@ -343,8 +343,8 @@ mod gate {
 
     /// The stores both engines size, the seat's floor and the CLI's default.
     const CTX: usize = 2048;
-    /// The flag arm's context, below the ladder's floor: a flag seen to win,
-    /// not to coincide with a default rung.
+    /// The flag arm's context, below the default's floor: a flag seen to
+    /// win, not to coincide with a default context.
     const FLAG_CTX: usize = 1536;
     /// A context past `ORACLE_POSITIONS`, the refusal the clause asks for.
     const OVER_CTX: usize = 99_999;
@@ -1075,10 +1075,10 @@ mod gate {
     /// there. Its one `ctx` line holds its word under the model's limit
     /// ([`glm_limit`], `ctx_ladder::default_line_held`), and this gate's own
     /// plans of the file at the card's free bytes agree: the default holds,
-    /// and the rung above it, when it halved, does not. A server asked for
-    /// [`FLAG_CTX`] takes it (below the floor, a value no default rung can
+    /// and the step above it, when it fitted, does not. A server asked for
+    /// [`FLAG_CTX`] takes it (below the floor, a value no default context can
     /// coincide with); one asked past the oracle is refused by name before it
-    /// listens. Mutants: a ladder that starts a rung low (the rung above
+    /// listens. Mutants: a default that starts a step low (the step above
     /// holds); a default that keeps the target whatever the card (the
     /// server's own plan refuses it by name before any line).
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
@@ -1137,15 +1137,15 @@ mod gate {
         let free = Some(server_card_free(&err_log)?);
         let at = |c: u64| card_at(&inputs, &plan_levers, usize::try_from(c)?, free);
         let ctx = ctx_ladder::field(&line, "ctx").ok_or("the `ctx` line names no ctx")?;
-        let above = rung_above(limit.0, ctx);
+        let above = step_above(limit.0, ctx);
         let (at_ctx, at_above) = (at(ctx)?, above.map(at).transpose()?);
         println!(
-            "ctx: the gate's plans: at {ctx} {at_ctx:?}, at the rung above {above:?} {at_above:?}; \
+            "ctx: the gate's plans: at {ctx} {at_ctx:?}, at the step above {above:?} {at_above:?}; \
              the limit {limit:?}"
         );
         let mut ok = true;
         // The line holds its word, and the gate's own plans agree: the card
-        // holds the default, and not the rung above it when it halved.
+        // holds the default, and not the step above it when it fitted.
         check(
             &mut ok,
             "ctx_default_is_the_highest_rung_held",

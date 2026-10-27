@@ -17,13 +17,14 @@
 //! (`generate::choose_ctx`, every seat's): a set `--ctx` is the total the slots
 //! split, planned once at its share, and a share the card cannot hold stops
 //! the load by name with the largest it would hold. Unset, a slot is planned
-//! at 262,144 positions or the file's trained context where that is less,
-//! halved only while the card cannot hold the load's resident bytes plus that
-//! context's sequence state, never below 4096. Each candidate is the load
+//! at the file's trained context and, only where the card cannot hold the
+//! load's resident bytes plus that context's sequence state, at the largest
+//! context under it that the card holds, a multiple of 1024 never below 4096.
+//! Each candidate is the load
 //! itself: the whole model on the card where the whole-fit verdict takes it,
 //! else the placed plan, under `--place` or the plan a run without it falls
 //! to, its routed experts on whatever the card has left. One `ctx` line on
-//! stderr names the rule (`set`, `target` or `halved`), the slot context,
+//! stderr names the rule (`set`, `target` or `fitted`), the slot context,
 //! the slots, their total and the model's limit. The model is opened as
 //! `generate_qwen3moe` opens it — qwen3moe through `Qwen3moeModel::open` at
 //! its levers' options, qwen35moe through `Qwen35moeModel::open` with the

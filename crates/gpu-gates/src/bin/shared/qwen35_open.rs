@@ -178,8 +178,8 @@ pub fn whole_verdict(
 /// The decide seat's context probe at the shape `shape` names, whole on `card` with `seat`'s bytes
 /// beside the backbone: the plan holds with the prompt ubatch `rule` settles ([`ubatch_pick::settle`],
 /// the card's room unless the user asked a size; one `ubatch` line on
-/// stderr; the caller prints the open's `whole fit` line), or it is short for the context ladder to
-/// step down on. At the least context the ladder tries, a size the user named that does not fit is
+/// stderr; the caller prints the open's `whole fit` line), or it is short for the context choice to
+/// search below. At the least context the choice tries, a size the user named that does not fit is
 /// refused as that size's ([`ubatch_pick::asked_short`]): no smaller context helps.
 #[allow(
     dead_code,

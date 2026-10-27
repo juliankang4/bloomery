@@ -2504,13 +2504,14 @@ pub fn draft38_unset(at: &Draft38At<'_>) -> Option<Draft38Off> {
     }
 }
 
-/// A reserve on the card that can cost the ladder a rung.
+/// A reserve on the card that can cost an unset context positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reserve {
-    /// An unset draft (Qwen3.8, GLM-5.3): it goes off when it costs a rung,
-    /// and the `load draft=off` record's why is the cost.
+    /// An unset draft (Qwen3.8, GLM-5.3): it goes off when it costs a slot
+    /// half the positions or more, and the `load draft=off` record's why is
+    /// the cost.
     Draft,
-    /// The image encoder (V4.1): it stays on, and the `ctx` line carries the
+    /// The image encoder (V4.1): it stays on, and the `ctx` line carries any
     /// cost.
     ImageEncoder,
 }
@@ -2518,12 +2519,12 @@ pub enum Reserve {
 /// What a reserve on the card cost the context: the positions a slot gets
 /// with the reserve and without it, and the reserve's card bytes at `with`.
 /// One owner of the comparison for every seat that weighs a reserve against
-/// the ladder; [`Reserve`] says what the seat does with it.
+/// an unset context; [`Reserve`] says what the seat does with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RungCost {
     pub reserve: Reserve,
     /// The positions a slot gets with the reserve, 0 when that plan holds
-    /// not even the ladder's floor.
+    /// not even the context's floor.
     pub with: u64,
     /// The positions a slot gets without it.
     pub without: u64,
@@ -2534,13 +2535,19 @@ pub struct RungCost {
 }
 
 impl RungCost {
-    /// `Some` when the plan with the reserve leaves a slot fewer positions
-    /// than the plan without it: `with` under `without`. The same rung or a
-    /// higher one costs nothing. A set `BLOOMERY_DRAFT=mtp` never asks: the
-    /// seat runs it as given.
+    /// `Some` when the reserve costs what its kind gives way to: the image
+    /// encoder any position (`with` under `without`), the draft half a
+    /// slot's positions or more (`with` at most half of `without`), so a
+    /// draft that costs the fitted context a few steps stays on. The same
+    /// context or a larger one costs nothing. A set `BLOOMERY_DRAFT=mtp`
+    /// never asks: the seat runs it as given.
     #[must_use]
     pub fn of(reserve: Reserve, with: u64, without: u64, card_bytes: u64) -> Option<RungCost> {
-        (with < without).then_some(RungCost {
+        let costs = match reserve {
+            Reserve::Draft => with.saturating_mul(2) <= without,
+            Reserve::ImageEncoder => true,
+        };
+        (with < without && costs).then_some(RungCost {
             reserve,
             with,
             without,

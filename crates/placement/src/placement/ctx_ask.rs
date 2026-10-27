@@ -6,14 +6,15 @@
 //! load either holds it or stops by name, with the largest share the card
 //! would hold ([`AskError::DoesNotFit`]). It is never cut.
 //!
-//! With no `--ctx`, a slot is planned at [`DEFAULT_TARGET`], or the model's
-//! limit where that is less. Only this default steps down, by halves, and
-//! only on a plan whose card cannot hold the load's resident bytes plus that
-//! context's sequence state, whose unified pool no card share fits, or whose
-//! host cannot hold what the card then leaves it where the body has no tier
-//! past the host ([`Probe::Short`]); any
-//! other refusal is the seat's error as it stands. Callers validate a set context against the
-//! model's limit; here it only caps the default target.
+//! With no `--ctx`, a slot is planned at the model's limit. Only this default
+//! is fitted: when that plan is short, the slot takes the largest context
+//! under it, a multiple of the step and no less than the floor, whose plan
+//! holds. A plan is short when its card cannot hold the load's resident bytes
+//! plus that context's sequence state, when its unified pool no card share
+//! fits, or when its host cannot hold what the card then leaves it where the
+//! body has no tier past the host ([`Probe::Short`]); any other refusal is
+//! the seat's error as it stands. Callers validate a set context against the
+//! model's limit; here it only sets the default.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -21,9 +22,6 @@ use std::num::NonZeroU64;
 
 use super::workstation::HostShort;
 use super::{PlacementError, Violation};
-
-/// The context a slot is planned at when `--ctx` is unset.
-pub const DEFAULT_TARGET: u64 = 262_144;
 
 /// The slots a load serves when `--parallel` is unset.
 pub const DEFAULT_SLOTS: usize = 1;
@@ -36,7 +34,7 @@ pub enum Ask {
         /// The positions asked over every slot.
         total: u64,
     },
-    /// `--ctx` unset: the default target.
+    /// `--ctx` unset: the model's limit, fitted to the machine.
     Default,
 }
 
@@ -49,13 +47,13 @@ pub struct Limit {
     pub source: &'static str,
 }
 
-/// The rungs the default steps down on, and the set ask's search: every rung
-/// is a multiple of `step`, none below `floor`.
+/// The contexts the default and a refused set ask search: every one a
+/// multiple of `step`, none below `floor`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Steps {
-    /// The least slot context the default tries.
+    /// The least slot context searched.
     pub floor: u64,
-    /// The rounding of every rung.
+    /// The rounding of every context searched.
     pub step: u64,
 }
 
@@ -64,7 +62,7 @@ pub enum Probe<P> {
     /// The plan holds.
     Holds(P),
     /// A smaller context is what the plan asks for ([`Short`]). Only this
-    /// outcome lets the default step down.
+    /// outcome lets the default search below.
     Short(Short),
 }
 
@@ -204,7 +202,7 @@ pub trait PlanRefusal {
 }
 
 /// A seat's plan outcome as a probe: a refusal that reads as a short memory
-/// ([`PlanRefusal::short`]) steps the default down; any other stays the
+/// ([`PlanRefusal::short`]) fits the default below; any other stays the
 /// seat's error.
 ///
 /// # Errors
@@ -221,14 +219,14 @@ pub fn probe_of<P, E: PlanRefusal>(planned: Result<P, E>) -> Result<Probe<P>, E>
 pub enum Rule {
     /// The user's `--ctx`.
     Set,
-    /// The default target.
+    /// The default: the model's limit held.
     Target,
-    /// The default stepped down from `from`: the rung above the one that
-    /// held was `short`.
-    Halved {
+    /// The default fitted under `from`: the largest context that holds,
+    /// the context one step above it `short`.
+    Fitted {
         /// The target the default began at.
         from: u64,
-        /// The last short plan.
+        /// The plan one step above the context chosen.
         short: Short,
     },
 }
@@ -249,20 +247,28 @@ pub struct Chosen<P> {
     pub plan: P,
 }
 
+impl Rule {
+    /// The rule's word on the `ctx` line.
+    #[must_use]
+    pub fn word(&self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Target => "target",
+            Self::Fitted { .. } => "fitted",
+        }
+    }
+}
+
 impl<P> Chosen<P> {
     /// The one stderr line that says why the load serves this context.
     pub fn line(&self) -> String {
-        let word = match self.rule {
-            Rule::Set => "set",
-            Rule::Target => "target",
-            Rule::Halved { .. } => "halved",
-        };
+        let word = self.rule.word();
         let line = format!(
             "ctx rule={word} ctx={} slots={} total={} limit={} ({})",
             self.slot_ctx, self.slots, self.total, self.limit.positions, self.limit.source
         );
         match self.rule {
-            Rule::Halved {
+            Rule::Fitted {
                 from,
                 short: Short { on, need, room },
             } => format!("{line} from={from} {on}-short need={need} room={room}"),
@@ -298,10 +304,10 @@ pub enum AskError<E> {
         /// The least share searched.
         floor: u64,
     },
-    /// The default stepped down to its floor and the machine still cannot
+    /// The default searched down to its floor and the machine still cannot
     /// hold it.
     FloorShort {
-        /// The least rung.
+        /// The least context searched.
         floor: u64,
         /// The slots.
         slots: usize,
@@ -407,7 +413,10 @@ pub fn choose<P, E>(
                 Probe::Holds(plan) => return Ok(chosen(slot_ctx, Rule::Set, plan)),
                 Probe::Short(s) => s,
             };
-            let largest = largest_held(steps, slot_ctx, &mut probe)?;
+            let largest = match largest_held(steps, (slot_ctx, short), &mut probe)? {
+                Below::Held { slot_ctx, .. } => Some(slot_ctx),
+                Below::Nothing { .. } => None,
+            };
             Err(AskError::DoesNotFit {
                 total,
                 slot_ctx,
@@ -418,37 +427,30 @@ pub fn choose<P, E>(
             })
         }
         Ask::Default => {
-            let cap = DEFAULT_TARGET.min(limit.positions);
+            let cap = limit.positions;
             let target = round_down(cap, steps.step).max(steps.floor.min(cap));
-            let mut rung = target;
-            let mut short = None;
-            loop {
-                match probe(rung)? {
-                    Probe::Holds(plan) => {
-                        let rule = match short {
-                            None => Rule::Target,
-                            Some(short) => Rule::Halved {
-                                from: target,
-                                short,
-                            },
-                        };
-                        return Ok(chosen(rung, rule, plan));
-                    }
-                    Probe::Short(s) => {
-                        short = Some(s);
-                        // The floor is a rung of its own: a target that is
-                        // no power of two halves past it otherwise.
-                        let next = round_down(rung / 2, steps.step).max(steps.floor.min(target));
-                        if next == rung {
-                            return Err(AskError::FloorShort {
-                                floor: rung,
-                                slots,
-                                short: s,
-                            });
-                        }
-                        rung = next;
-                    }
-                }
+            let short = match probe(target)? {
+                Probe::Holds(plan) => return Ok(chosen(target, Rule::Target, plan)),
+                Probe::Short(s) => s,
+            };
+            match largest_held(steps, (target, short), &mut probe)? {
+                Below::Held {
+                    slot_ctx,
+                    plan,
+                    above,
+                } => Ok(chosen(
+                    slot_ctx,
+                    Rule::Fitted {
+                        from: target,
+                        short: above,
+                    },
+                    plan,
+                )),
+                Below::Nothing { least, short } => Err(AskError::FloorShort {
+                    floor: least,
+                    slots,
+                    short,
+                }),
             }
         }
     }
@@ -459,28 +461,117 @@ fn round_down(c: u64, step: u64) -> u64 {
     c - c % step
 }
 
-/// The largest multiple of `steps.step` in `[steps.floor, short)` whose plan
-/// holds, by bisection (a plan holds below a point and not above it); `None`
-/// when the floor's does not. Each context is planned at most once.
+/// What the search under a short context found ([`largest_held`]).
+enum Below<P> {
+    /// The largest context that holds, its plan, and the plan of the least
+    /// context above it that was short.
+    Held {
+        slot_ctx: u64,
+        plan: P,
+        above: Short,
+    },
+    /// No context holds: the least one planned and its short plan.
+    Nothing { least: u64, short: Short },
+}
+
+/// The steps a search under a short context asks by its shortfalls' line
+/// ([`largest_held`]): the step under the first short plan, then on the
+/// line the step past the fit and the fit.
+const STEERED: usize = 3;
+
+/// The largest multiple of `steps.step` in `[steps.floor, ctx)` whose plan
+/// holds, `ctx` being a context whose plan is `short`, by bisection (a plan
+/// holds below a point and not above it) steered by the shortfalls: the
+/// first plan under `ctx` that is short has the step under it asked next,
+/// and once two plans under `ctx` are short on one memory, the context
+/// asked next is the step past the largest their line holds ([`fit_of`]),
+/// then that one, at most [`STEERED`] asks in all. `ctx`'s own shortfall is not on the line: on
+/// a unified pool its plan can be refused by the pool's share before the
+/// host's need the plans under it are short by. The floor is planned only
+/// when every context above it is short. Each context is planned at most
+/// once.
 fn largest_held<P, E>(
     steps: Steps,
-    short: u64,
+    (ctx, short): (u64, Short),
     probe: &mut impl FnMut(u64) -> Result<Probe<P>, AskError<E>>,
-) -> Result<Option<u64>, AskError<E>> {
-    let mut seen = BTreeSet::new();
-    let mut holds = |c: u64| -> Result<bool, AskError<E>> {
-        assert!(seen.insert(c), "ctx_ask: {c} planned twice");
-        Ok(matches!(probe(c)?, Probe::Holds(_)))
-    };
+) -> Result<Below<P>, AskError<E>> {
     let lo_k = steps.floor.div_ceil(steps.step);
-    let hi_k = (short - 1) / steps.step;
-    if lo_k > hi_k || !holds(lo_k * steps.step)? {
-        return Ok(None);
+    let hi_k = (ctx - 1) / steps.step;
+    if lo_k > hi_k {
+        return Ok(Below::Nothing { least: ctx, short });
     }
+    let mut seen = BTreeSet::new();
+    let mut held: Option<(u64, P)> = None;
+    let mut ask = |c: u64| -> Result<Option<Short>, AskError<E>> {
+        assert!(seen.insert(c), "ctx_ask: {c} planned twice");
+        Ok(match probe(c)? {
+            Probe::Holds(plan) => {
+                if held.as_ref().is_none_or(|(h, _)| c > *h) {
+                    held = Some((c, plan));
+                }
+                None
+            }
+            Probe::Short(s) => Some(s),
+        })
+    };
+    // The short plans by context, the least first and `ctx`'s last.
+    let mut shorts = vec![(ctx, short)];
     let lo = usize::try_from(lo_k).expect("supported hosts have 64-bit usize");
     let hi = usize::try_from(hi_k).expect("supported hosts have 64-bit usize");
-    let k = super::ctx::largest(lo, hi, |k| holds(k as u64 * steps.step))?;
-    Ok(Some(k as u64 * steps.step))
+    // The step named last, and the named steps asked.
+    let (mut named, mut steered) = (None, 0);
+    // The search takes its floor as held; it is planned here only when the
+    // search ends on it.
+    let k = super::ctx::largest(lo, hi, |k| {
+        let c = k as u64 * steps.step;
+        let short = ask(c)?;
+        if let Some(s) = short {
+            shorts.insert(shorts.partition_point(|&(h, _)| h < c), (c, s));
+        }
+        steered += usize::from(named == Some(k));
+        let under = &shorts[..shorts.len() - 1];
+        named = match fit_of(under, steps.step) {
+            _ if steered >= STEERED => None,
+            Some(fit) if under.iter().any(|&(h, _)| h == (fit + 1) * steps.step) => Some(fit),
+            Some(fit) => Some(fit + 1),
+            // One short plan under `ctx`: the step under it is the line's other point.
+            None if under.len() == 1 => Some(under[0].0 / steps.step - 1),
+            None => None,
+        }
+        .and_then(|n| usize::try_from(n).ok());
+        Ok((short.is_none(), named))
+    })?;
+    if k == lo
+        && let Some(s) = ask(lo_k * steps.step)?
+    {
+        shorts.insert(0, (lo_k * steps.step, s));
+    }
+    let (least, short) = shorts[0];
+    Ok(match held {
+        Some((slot_ctx, plan)) => Below::Held {
+            slot_ctx,
+            plan,
+            above: short,
+        },
+        None => Below::Nothing { least, short },
+    })
+}
+
+/// The steps in the largest context the line through the two least short
+/// plans on the least one's memory holds, each plan's shortfall (`need`
+/// past `room`) a point of it; `None` without such a pair or on a line
+/// that does not fall with the context.
+fn fit_of(shorts: &[(u64, Short)], step: u64) -> Option<u64> {
+    let gap = |s: &Short| u128::from(s.need.saturating_sub(s.room));
+    let (c1, s1) = shorts.first()?;
+    let (c2, s2) = shorts[1..].iter().find(|(_, s)| s.on == s1.on)?;
+    let (d1, d2) = (gap(s1), gap(s2));
+    if d2 <= d1 {
+        return None;
+    }
+    let back = (d1 * u128::from(c2 - c1)).div_ceil(d2 - d1);
+    let fit = u128::from(*c1).checked_sub(back)?;
+    u64::try_from(fit / u128::from(step)).ok()
 }
 
 #[cfg(test)]
@@ -543,6 +634,19 @@ mod tests {
         source: "trained",
     };
 
+    /// [`run`] of the default on one slot, each short plan's [`Short`] as
+    /// `short` reads it at its context; the context chosen.
+    fn run_with(card: &Card, short: impl Fn(u64, Short) -> Short) -> u64 {
+        choose(Ask::Default, 1, TRAINED, STEPS, |c| {
+            Ok::<_, String>(match card.plan(c)? {
+                Probe::Short(s) => Probe::Short(short(c, s)),
+                held => held,
+            })
+        })
+        .expect("holds")
+        .slot_ctx
+    }
+
     fn run(
         card: &Card,
         ask: Ask,
@@ -552,8 +656,8 @@ mod tests {
         choose(ask, slots, limit, STEPS, |c| card.plan(c))
     }
 
-    /// Unset, a slot is planned once at the target, the least of
-    /// [`DEFAULT_TARGET`] and the limit.
+    /// Unset, a slot is planned once at the target, the model's limit
+    /// down to a step.
     #[test]
     fn the_default_is_the_target_when_it_holds() {
         let card = Card::holding(u64::MAX / 20);
@@ -563,35 +667,130 @@ mod tests {
             (262_144, Rule::Target, 262_144)
         );
         assert_eq!(card.calls(), [262_144]);
-        let small = Limit {
-            positions: 32_768,
-            source: "trained",
-        };
-        let card = Card::holding(u64::MAX / 20);
-        let got = run(&card, Ask::Default, 1, small).expect("holds");
-        assert_eq!((got.slot_ctx, got.rule), (32_768, Rule::Target));
-        assert_eq!(card.calls(), [32_768]);
+        for (positions, target) in [
+            (32_768, 32_768),
+            (1_048_576, 1_048_576),
+            (40_960 + 7, 40_960),
+        ] {
+            let limit = Limit {
+                positions,
+                source: "trained",
+            };
+            let card = Card::holding(u64::MAX / 20);
+            let got = run(&card, Ask::Default, 1, limit).expect("holds");
+            assert_eq!((got.slot_ctx, got.rule), (target, Rule::Target));
+            assert_eq!(card.calls(), [target]);
+        }
     }
 
-    /// A short card halves the default, rung by rung, until a plan holds;
-    /// the rule names the target and the last short plan's bytes.
+    /// A short card fits the default to the largest step that holds, each
+    /// context planned once and at most a bisection's count; the rule names
+    /// the target and the plan one step above the context chosen.
+    ///
+    /// PIN(2026-10-27): replaces `a_short_card_halves_only_the_default`; an
+    /// unset context is fitted, not halved.
     #[test]
-    fn a_short_card_halves_only_the_default() {
-        let card = Card::holding(70_000);
-        let got = run(&card, Ask::Default, 1, TRAINED).expect("holds at 65,536");
-        assert_eq!(card.calls(), [262_144, 131_072, 65_536]);
-        assert_eq!(got.slot_ctx, 65_536);
-        assert_eq!(
-            got.rule,
-            Rule::Halved {
-                from: 262_144,
-                short: Short {
-                    on: Side::Card,
-                    need: 1000 + 131_072 * 10,
-                    room: card.room,
+    fn a_short_card_fits_only_the_default() {
+        for up_to in [70_000, 4096, 5119, 261_120, 262_143] {
+            let card = Card::holding(up_to);
+            let got = run(&card, Ask::Default, 1, TRAINED).expect("holds");
+            let want = up_to / 1024 * 1024;
+            assert_eq!((got.slot_ctx, got.plan), (want, want), "up to {up_to}");
+            assert_eq!(
+                got.rule,
+                Rule::Fitted {
+                    from: 262_144,
+                    short: Short {
+                        on: Side::Card,
+                        need: 1000 + (want + 1024) * 10,
+                        room: card.room,
+                    },
                 },
+                "up to {up_to}"
+            );
+            let calls = card.calls();
+            assert_eq!(calls[0], 262_144);
+            let distinct: BTreeSet<u64> = calls.iter().copied().collect();
+            assert_eq!(distinct.len(), calls.len(), "planned twice: {calls:?}");
+            // The target, then a bisection over the 252 steps under it; the
+            // first plan under the target that is short has the step under
+            // it asked, and the line through the two names the step past the
+            // fit and the fit itself (mutant: the short plans kept in the
+            // order asked, so the line runs through the wrong pair).
+            assert!(calls.len() <= 1 + 9, "{} plans: {calls:?}", calls.len());
+            if up_to < 133_120 {
+                assert!(calls.len() <= 5, "{calls:?}");
             }
-        );
+        }
+        // The target's shortfall stays off the line: a pool's share refused
+        // there by a shortfall off the card's line takes the same plans.
+        // Mutant: the target on the line, whose fit then is near 30,000.
+        let card = Card::holding(70_000);
+        let got = run_with(&card, |c, s| match c {
+            262_144 => Short {
+                need: 1000 + 133_120 * 10 + 789_760,
+                ..s
+            },
+            _ => s,
+        });
+        assert_eq!(got, 69_632);
+        assert_eq!(card.calls().len(), 5, "{:?}", card.calls());
+    }
+
+    /// Whatever the shortfalls' shape, the steered search ends on the
+    /// largest step that holds, plans each context once and takes at most
+    /// a bisection's plans and the steered ones. Mutant: the steered asks
+    /// uncapped, so a quartic shortfall's line walks down a step at a time.
+    #[test]
+    fn a_steered_search_ends_on_the_largest_step_whatever_the_shortfalls() {
+        type Need = fn(u64) -> u64;
+        let needs: [(&str, Need); 4] = [
+            ("line", |c| 1000 + c * 10),
+            ("quartic", |c| 1000 + (c / 1024).pow(4)),
+            ("concave", |c| 1000 + 300 * c.isqrt()),
+            ("stepped", |c| {
+                1000 + c * 10 + if c > 90_000 { 400_000 } else { 0 }
+            }),
+        ];
+        for (word, need) in needs {
+            // A fit at every third step, and one between steps.
+            let rooms = (4..256).step_by(3).map(|k| need(k * 1024));
+            for room in rooms.chain([need(50_000) + 7]) {
+                let calls = RefCell::new(Vec::new());
+                let got = choose(Ask::Default, 1, TRAINED, STEPS, |c| {
+                    calls.borrow_mut().push(c);
+                    let n = need(c);
+                    Ok::<_, String>(if n <= room {
+                        Probe::Holds(c)
+                    } else {
+                        Probe::Short(Short {
+                            on: Side::Host,
+                            need: n,
+                            room,
+                        })
+                    })
+                })
+                .expect("the floor holds");
+                let want = (4..256u64)
+                    .map(|k| k * 1024)
+                    .filter(|&c| need(c) <= room)
+                    .max()
+                    .expect("the floor holds");
+                let calls = calls.into_inner();
+                assert_eq!(got.slot_ctx, want, "{word} room {room}: {calls:?}");
+                let distinct: BTreeSet<u64> = calls.iter().copied().collect();
+                assert_eq!(
+                    distinct.len(),
+                    calls.len(),
+                    "{word}: planned twice: {calls:?}"
+                );
+                assert!(
+                    calls.len() <= 1 + 9 + STEERED,
+                    "{word}: {} plans: {calls:?}",
+                    calls.len()
+                );
+            }
+        }
     }
 
     /// The default stops at its floor, naming it and the bytes.
@@ -614,37 +813,47 @@ mod tests {
                 },
             }
         );
-        // A target that is no power of two steps onto the floor before it
-        // refuses: 24,576 halves to 12,288 and 6,144, whose half is under it.
+        // A target that is no power of two searches down to the floor too.
         let limit = Limit {
             positions: 24_576,
             source: "trained",
         };
         let card = Card::holding(4096);
         let got = run(&card, Ask::Default, 1, limit).expect("holds at the floor");
-        assert_eq!(card.calls(), [24_576, 12_288, 6_144, 4096]);
+        assert_eq!(*card.calls().last().expect("a call"), 4096);
         assert_eq!(got.slot_ctx, 4096);
         let card = Card::holding(4095);
         let err = run(&card, Ask::Default, 1, limit)
             .map(|c| c.slot_ctx)
             .expect_err("short at the floor");
-        assert_eq!(card.calls(), [24_576, 12_288, 6_144, 4096]);
+        assert_eq!(*card.calls().last().expect("a call"), 4096);
         assert!(matches!(err, AskError::FloorShort { floor: 4096, .. }));
+        // A limit under the floor is its own one context.
+        let limit = Limit {
+            positions: 2048,
+            source: "trained",
+        };
+        let err = run(&Card::holding(1000), Ask::Default, 1, limit)
+            .map(|c| c.slot_ctx)
+            .expect_err("short under the floor");
+        assert!(matches!(err, AskError::FloorShort { floor: 2048, .. }));
     }
 
     /// A seat's own refusal ends the default at once.
     #[test]
     fn a_seat_error_is_never_retried() {
         let mut card = Card::holding(70_000);
-        card.fails_at = Some(131_072);
+        // The search's first context under the target: the midpoint of the
+        // steps 4 to 255.
+        card.fails_at = Some(130 * 1024);
         let err = run(&card, Ask::Default, 1, TRAINED)
             .map(|c| c.slot_ctx)
             .expect_err("seat error");
         assert_eq!(
             err,
-            AskError::Plan("the seat's own refusal at 131072".to_string())
+            AskError::Plan("the seat's own refusal at 133120".to_string())
         );
-        assert_eq!(card.calls(), [262_144, 131_072]);
+        assert_eq!(card.calls(), [262_144, 133_120]);
     }
 
     /// A set total is split over the slots and planned once.
@@ -710,7 +919,8 @@ mod tests {
     }
 
     /// The line names the rule, the context, the slots, the total and the
-    /// limit with its source; a halved default adds its target and bytes.
+    /// limit with its source; a fitted default adds its target and the
+    /// bytes one step above.
     #[test]
     fn the_line_says_why() {
         let chosen = |rule| Chosen {
@@ -730,7 +940,7 @@ mod tests {
             "ctx rule=target ctx=65536 slots=1 total=65536 limit=262144 (trained)"
         );
         assert_eq!(
-            chosen(Rule::Halved {
+            chosen(Rule::Fitted {
                 from: 262_144,
                 short: Short {
                     on: Side::Card,
@@ -739,11 +949,11 @@ mod tests {
                 },
             })
             .line(),
-            "ctx rule=halved ctx=65536 slots=1 total=65536 limit=262144 (trained) from=262144 \
+            "ctx rule=fitted ctx=65536 slots=1 total=65536 limit=262144 (trained) from=262144 \
              card-short need=9 room=8"
         );
         assert_eq!(
-            chosen(Rule::Halved {
+            chosen(Rule::Fitted {
                 from: 262_144,
                 short: Short {
                     on: Side::Host,
@@ -752,7 +962,7 @@ mod tests {
                 },
             })
             .line(),
-            "ctx rule=halved ctx=65536 slots=1 total=65536 limit=262144 (trained) from=262144 \
+            "ctx rule=fitted ctx=65536 slots=1 total=65536 limit=262144 (trained) from=262144 \
              host-short need=9 room=8"
         );
     }
@@ -780,7 +990,7 @@ mod tests {
             card: "c".to_string(),
         };
         assert_eq!(short_of(&[over(110, 100), other]), None);
-        // A unified pool's shortage alone halves too: the cards, the host and
+        // A unified pool's shortage alone is short too: the cards, the host and
         // what sits beside them against the pool.
         let pool = Violation::PoolOver {
             cards: 70,
@@ -833,7 +1043,7 @@ mod tests {
                 room: 40
             })
         );
-        // A host need past the reading halves where the cards share the pool, and stops
+        // A host need past the reading is short where the cards share the pool, and stops
         // where each card has memory of its own.
         let need = HostNeed {
             experts: 0,

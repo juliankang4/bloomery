@@ -26,10 +26,9 @@
 //!   of its need picks, on the 3090, a Qwen3.6 context whose load the arena
 //!   check refuses;
 //! - `default_load_is_its_whole_fit`: the seat prints a whole-fit verdict
-//!   line at each rung its default asked, the last at the loaded context,
-//!   its terms named; that one says `fits` exactly when the load is the
-//!   whole-card one (no `plan` record), and every rung before it did not
-//!   fit;
+//!   line at each context its default asked, one at the loaded context, its
+//!   terms named; that one says `fits` exactly when the load is the
+//!   whole-card one (no `plan` record), and none at a larger context fits;
 //! - `default_load_counts_its_arena`: that line's arena and the reserve
 //!   past it are the pair the load's own `whole_load` hands the verdict for
 //!   the file (a qwen3moe file's line names the margin in their place). The
@@ -290,8 +289,8 @@
 //!   `ctx_default`'s placed arm, the servers whose `--ctx` is unset: each
 //!   `--ctx` choice the seat ran names its probes and its census readings on
 //!   one line, and every one read the census once for all its probes.
-//!   FAIL-first: a choice that resolves its placement per rung reads it once
-//!   a rung where the card is short of the target.
+//!   FAIL-first: a choice that resolves its placement per probe reads it
+//!   once a probe where the card is short of the target.
 //! - `ctx_flag_wins`, the whole-fit clause's server: `/props`' `n_ctx` is
 //!   the flagged context, not the seat's default.
 //! - `whole_fit_counts_the_planes_granules`: a server at a flagged `--ctx`
@@ -311,28 +310,27 @@
 //!   the f16 planes, and the common rule's `place unset` record names `a`,
 //!   its why one card (or two the body serves no tier card of), and no
 //!   break-even, basis or tier count; and `ctx_default_is_the_highest_rung_held`,
-//!   the same server, on either card: the default is a rung of the halving
-//!   ladder an unset `--ctx` asks — 262,144 or the file's trained context
-//!   (read by the seat's own `trained_ctx`), the lesser, then each half down
-//!   to a `CTX_GRAN` step, the base a slot (4096) the last — and either
-//!   the first rung or one under a rung whose whole load does not fit (the
-//!   placed plan there was short too, which the `ctx` line's `halved` word
-//!   holds). The fit is the seat's own whole-fit line at the default — the
-//!   census reading, its verdict, what the card had, the need term by term —
-//!   with its cache term moved to the rung above. FAIL-first: a ladder that
-//!   starts a rung under the target defaults to half the target where the
-//!   whole load fits the target.
+//!   the same server, on either card: the default is a context an unset
+//!   `--ctx` takes — the file's trained context (read by the seat's own
+//!   `trained_ctx`), or a `CTX_GRAN` step under it, the base a slot (4096)
+//!   the least — and either the target or one a step under a context whose
+//!   whole load does not fit (the placed plan there was short too, which the
+//!   `ctx` line's `fitted` word holds). The fit is the seat's own whole-fit
+//!   line at the default — the census reading, its verdict, what the card
+//!   had, the need term by term — with its cache term moved a step above.
+//!   FAIL-first: a default that starts a step under the target defaults
+//!   under the target where the whole load fits the target.
 //! - `default_ctx_line_names_its_rule`, on the main server's default arm
 //!   (`--parallel 1`) and `ctx_default`'s placed arm (`--parallel 2`): the
 //!   one `ctx` line of an unset `--ctx` (`placement::ctx_ask::Chosen::line`)
 //!   names a rule word and holds the relations the word claims: `target`
-//!   the first rung, `halved` a rung under it, its `from` the first rung and
-//!   its `need` past its `room` (the rung above was short); its slots are
+//!   the target, `fitted` a step under it, its `from` the target and its
+//!   `need` past its `room` (the step above was short); its slots are
 //!   the arm's, its `total` the slots' sum, its `limit` the file's trained
 //!   context. The answer is also what the server serves (`/props`' `n_ctx`
 //!   the slot context, the plan's `ctx_max` the total on the placed arm).
 //!   FAIL-first: a seat that prints no `ctx` line, two, or a context off the
-//!   ladder turns this red.
+//!   steps turns this red.
 //! - `ctx_past_the_trained_is_refused_by_name`: two `--plan` runs of a set
 //!   `--ctx` on `--place a`. One position past the file's trained context
 //!   on one slot exits non-zero with the shared limit's words
@@ -357,7 +355,7 @@
 //!   does not fit, but the whole-fit verdict reads the card's census, not the
 //!   budget, so a card that holds the file whole would print no plan; the
 //!   placed probes and the `ctx` line are the same either way. FAIL-first: a
-//!   default that keeps the card's experts before the context halves to the
+//!   default that keeps the card's experts before the context fits to the
 //!   floor and the clause is red.
 //! - `placed_slots_are_resident`, `ctx_default`'s placed arm (`--place a
 //!   --parallel 2`, no budget), on both arms: the placed load holds its two
@@ -451,7 +449,7 @@
 //!   clause reads nothing the model chose to reply. FAIL-first: a scanner that drops a call's
 //!   parameters answers `{}` and the clause is red.
 //! - `dense_below_its_floor_is_refused_by_name`, the dense file: `--plan` on `--place a` under
-//!   [`PLACED_BUDGET`] exits non-zero with the context ladder's refusal (the least the default
+//!   [`PLACED_BUDGET`] exits non-zero with the context choice's refusal (the least the default
 //!   tries takes more bytes than the budget's, `ask fewer slots or a smaller model file`) and
 //!   opens nothing: a dense backbone has no routed expert to move to the host tier. FAIL-first:
 //!   a budget over the file's floor plans and exits 0.
@@ -485,7 +483,7 @@
 //! `--ctx`).
 //!
 //! Held by another test, and not run here: the choice of `--ctx` — the
-//! target, the halving, the floor, a set total's share and the largest a
+//! target, the fit, the floor, a set total's share and the largest a
 //! short card would hold, the line's words — by
 //! `bloomery_placement::placement::ctx_ask`'s tests; a set share past the
 //! file's limit, by `bloomery_placement::placement::ctx`'s.
@@ -535,7 +533,8 @@ mod gate {
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu_gates::beside;
     use bloomery_gpu_gates::ctx_ladder::{
-        ctx_line, default_line_held, field as field_u64, rung_above, rungs, target_of,
+        ctx_line, default_line_held, field as field_u64, fits as default_fits, step_above,
+        target_of,
     };
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::qwen_seat::{self, decode_mma};
@@ -987,7 +986,7 @@ mod gate {
 
     /// `dense_below_its_floor_is_refused_by_name` (module header), on a dense
     /// file alone: `--plan` of two slots under [`PLACED_BUDGET`] on `--place a`
-    /// exits non-zero with the context ladder's refusal (the least the default
+    /// exits non-zero with the context choice's refusal (the least the default
     /// tries, `… take N bytes on a card that holds` the budget's bytes, `ask
     /// fewer slots or a smaller model file`) and prints no `load` or
     /// `listening` record. A dense backbone has no routed expert to move to the
@@ -1125,17 +1124,17 @@ mod gate {
     }
 
     /// The seat's `--ctx` against the file and this gate's card, beyond the
-    /// main server's own default arm ([`served`]: unset, the first rung of
-    /// the halving ladder the load holds,
+    /// main server's own default arm ([`served`]: unset, the largest step
+    /// under the target the load holds,
     /// `ctx_default_is_the_highest_rung_held`): a load under `--place` takes
-    /// the rung its plan holds, its two slots resident on either file
+    /// the context its plan holds, its two slots resident on either file
     /// (`placed_slots_are_resident`), and the q8_0 cache's load at the main
     /// server's context holds the planes' bytes — the whole-fit verdict's
     /// cache term — down by their saving, the freed bytes spent on more card
     /// experts where both loads are placed (a file whose head shape has no
     /// q8_0 flash is refused instead,
     /// [`q8_cache_is_refused_on_the_scalar_pair_flash`]).
-    /// The choice itself — the target, the halving, the floor and the set
+    /// The choice itself — the target, the fit, the floor and the set
     /// share — is held by `bloomery_placement::placement::ctx_ask`'s tests.
     /// FAIL-first: a choice that keeps the target whatever the card makes
     /// the placed arm's load a plan the card cannot hold (the spawn never
@@ -1264,8 +1263,8 @@ mod gate {
             .arch_get_u64("attention.key_length")
             .ok_or("no attention.key_length")?;
         let layers = split.arch_get_u64("block_count").ok_or("no block_count")?;
-        // The two loads compare at one context: the default ladder can take
-        // a higher rung under q8_0 than under f16 where the card is
+        // The two loads compare at one context: the default can take a
+        // larger context under q8_0 than under f16 where the card is
         // short at f16's, so the q8_0 server is held to the main server's
         // context by `--ctx`, started once the placed arm's server has
         // stopped (two loads do not fit one card).
@@ -1430,20 +1429,20 @@ mod gate {
 
     /// `ctx_default_is_the_highest_rung_held`, on the default arm's server
     /// (no `--ctx`, `--parallel 1`, its stderr `log`, its default `n`): the
-    /// default is the first rung of the halving ladder from the target
-    /// ([`rungs`]) the load holds. `n` is a rung; the seat's one whole-fit
+    /// default is the largest step under the target the load holds. `n` is a
+    /// context the default takes ([`default_fits`]); the seat's one whole-fit
     /// line at `n` — the census reading the load was decided on, its `fits`,
     /// what the card had and the need term by term — with the cache term
-    /// moved from `n` rows to the rung above `n` says the whole load did not
-    /// fit there, so the seat did not halve past a rung the card held whole
-    /// (the placed plan there was short too, which the `ctx` line's
-    /// `halved` word holds). The need is a sum (`Card::floor_bytes`) whose
+    /// moved from `n` rows to the step above `n` ([`step_above`]) says the
+    /// whole load did not fit there, so the seat did not fit under a context
+    /// the card held whole (the placed plan there was short too, which the
+    /// `ctx` line's `fitted` word holds). The need is a sum (`Card::floor_bytes`) whose
     /// other terms read no context at or past the floor, and the cache at a
     /// context is the allocator's bytes of [`cache_planes`] there, the list
     /// [`whole_fit_counts_the_planes_granules`] holds equal to the verdict's
     /// own. A line missing or without its terms is a named error.
-    /// FAIL-first: a ladder that starts a rung under the target defaults to
-    /// half the target where the whole load fits the target, red here.
+    /// FAIL-first: a default that starts a step under the target defaults
+    /// under the target where the whole load fits the target, red here.
     fn ctx_default_is_the_highest_rung_held(
         model: &Path,
         split: &Split,
@@ -1471,15 +1470,15 @@ mod gate {
             rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
                 .ok_or_else(|| format!("the whole load's need at {ctx} passes u64 bytes").into())
         };
-        let rungs = rungs(trained);
-        let above = rung_above(trained, n);
+        let target = target_of(trained);
+        let above = step_above(trained, n);
         let at_above = above.map(need_at).transpose()?;
         println!(
-            "default arm: the default {n} of the rungs {rungs:?} (the file's trained {trained}),              the whole load {} there; it needs {need} B at {n}, {at_above:?} B at the rung above              {above:?}, of {budget} B the card had ({census})",
+            "default arm: the default {n} under the target {target} (the file's trained {trained}),              the whole load {} there; it needs {need} B at {n}, {at_above:?} B at the step above              {above:?}, of {budget} B the card had ({census})",
             if whole { "fits" } else { "does not fit" },
         );
         let held =
-            rungs.contains(&n) && (n == target_of(trained) || at_above.is_some_and(|b| b > budget));
+            default_fits(trained, n) && (n == target || at_above.is_some_and(|b| b > budget));
         check(ok, "ctx_default_is_the_highest_rung_held", held);
         Ok(())
     }
@@ -2301,7 +2300,7 @@ mod gate {
     // the card holds. An unset `--ctx` now asks the target and halves only
     // on a short card (`placement::ctx_ask`), which a card may hold only
     // placed, so the whole arm sets its total and (b) and (c) left with the
-    // search; the halving's relations are `ctx_default_is_the_highest_rung_held`'s
+    // search; the fit's relations are `ctx_default_is_the_highest_rung_held`'s
     // and `default_ctx_line_names_its_rule`'s.
     fn slots_set_total_is_its_whole_fit(
         model: &Path,
@@ -3133,10 +3132,10 @@ mod gate {
             "unplaced_default_names_itself",
             load.is_some() && default_ok,
         );
-        // The whole-fit verdicts of the rungs the default asked, the last at
+        // The whole-fit verdicts of the contexts the default asked, one at
         // the loaded context: `fits` exactly when the load is the whole-card
-        // one (no `plan` record), and every rung before it did not fit (a
-        // rung whose whole load fits is taken). FAIL-first: a seat that
+        // one (no `plan` record), and none at a larger context fits (a
+        // context whose whole load fits holds). FAIL-first: a seat that
         // loads whole on a verdict that does not fit, or prints none, turns
         // this red.
         let verdicts: Vec<&str> = log
@@ -3151,20 +3150,31 @@ mod gate {
         check(
             ok,
             "default_load_is_its_whole_fit",
-            verdicts.split_last().is_some_and(|(last, before)| {
-                last.contains(": fits: ") == plans.is_empty()
-                    && loaded_ctx
-                        .is_some_and(|c| last.starts_with(&format!("whole fit at ctx {c}: ")))
-                    && before.iter().all(|v| !v.contains(": fits: "))
+            loaded_ctx.is_some_and(|c| {
+                let at = |v: &str| -> Option<u64> {
+                    v.strip_prefix("whole fit at ctx ")?
+                        .split(':')
+                        .next()?
+                        .parse()
+                        .ok()
+                };
+                let mut loaded = verdicts.iter().filter(|v| at(v) == Some(c));
+                loaded
+                    .next()
+                    .is_some_and(|v| v.contains(": fits: ") == plans.is_empty())
+                    && loaded.next().is_none()
+                    && verdicts
+                        .iter()
+                        .all(|v| at(v).is_some_and(|x| x <= c || !v.contains(": fits: ")))
             }),
         );
 
         // The seat's default `--ctx` on this server (no `--ctx`, `--parallel
-        // 1`): the first rung of the halving ladder from the target the load
-        // holds, on either card ([`ctx_default_is_the_highest_rung_held`]).
+        // 1`): the largest step under the target the load holds, on either
+        // card ([`ctx_default_is_the_highest_rung_held`]).
         // FAIL-first: a choice that keeps the target whatever the card
         // makes the load a plan the card cannot hold (the spawn never
-        // listens), and one that starts a rung low is red there.
+        // listens), and one that starts a step low is red there.
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
         let trained = bloomery_gpu_gates::generate::trained_ctx(&split)
             .ok_or_else(|| format!("{}: no context_length", model.display()))?;

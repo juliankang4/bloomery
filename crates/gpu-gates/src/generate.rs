@@ -134,8 +134,8 @@ const fn alias(i: usize) -> Place {
     }
 }
 
-/// The step every rung of the context ladder rounds to: a round power of two
-/// a cache row count stays readable in.
+/// The step every context an unset `--ctx` searches rounds to: a round power
+/// of two a cache row count stays readable in.
 pub const CTX_GRAN: usize = 1024;
 
 /// The file's trained context (`<arch>.context_length`), `None` when the
@@ -152,9 +152,9 @@ pub fn trained_ctx(file: &Split) -> Option<usize> {
 pub type SeatBounds = (Option<(u64, &'static str)>, Option<(u64, &'static str)>);
 
 /// The steps every serving seat's context moves in
-/// ([`placement::ctx_ask::choose`]): the base a slot, the least rung an unset
-/// `--ctx` asks and the least share searched after a set one is refused, and [`CTX_GRAN`], the
-/// rounding of every rung.
+/// ([`placement::ctx_ask::choose`]): the base a slot, the least context an
+/// unset `--ctx` searches and the least share searched after a set one is
+/// refused, and [`CTX_GRAN`], the rounding of every context searched.
 pub const SEAT_STEPS: placement::ctx_ask::Steps = placement::ctx_ask::Steps {
     floor: 4096,
     step: CTX_GRAN as u64,
@@ -167,8 +167,8 @@ pub const SEAT_STEPS: placement::ctx_ask::Steps = placement::ctx_ask::Steps {
 /// file's trained context and the bounds the seat names (`kernel`,
 /// `verified`; [`placement::ctx::CtxLimit`]): a set `--ctx` (`set`, the total
 /// the slots split) whose share passes it stops by name before any plan
-/// ([`placement::ctx::PastLimit`]), and an unset one asks the target capped
-/// to it. The caller prints the chosen line ([`placement::ctx_ask::Chosen::line`]).
+/// ([`placement::ctx::PastLimit`]), and an unset one asks the limit and fits
+/// under it. The caller prints the chosen line ([`placement::ctx_ask::Chosen::line`]).
 ///
 /// # Errors
 /// The file's missing `context_length`, [`placement::ctx::PastLimit`], the
@@ -219,7 +219,7 @@ pub fn choose_ctx_of<P, E: Into<GateError> + std::fmt::Display>(
 /// type so a caller can read the floor and plan there for the refusal itself.
 #[derive(Debug)]
 pub struct FloorShort {
-    /// The least rung the default asked.
+    /// The least context the default asked.
     pub floor: u64,
     text: String,
 }

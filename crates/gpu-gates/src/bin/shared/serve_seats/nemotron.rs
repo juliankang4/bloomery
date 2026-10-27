@@ -58,9 +58,9 @@
 //! comes first and the plan fills the machine around it
 //! (`generate::choose_ctx`, every seat's): a set value past the file's trained
 //! context stops by name, and one the card cannot hold stops with the largest
-//! it would hold. Unset, the slot asks 262,144 positions or the trained
-//! context where that is less, halved while the card cannot hold the stores
-//! and the resident bytes.
+//! it would hold. Unset, the slot asks the trained context and, where the card
+//! cannot hold the stores and the resident bytes there, the largest context
+//! under it that it holds.
 //!
 //! `--embd-model` is taken before this seat parses. The side model is seated
 //! before the plan, and the plan's stage card holds its bytes

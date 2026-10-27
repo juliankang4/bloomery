@@ -396,10 +396,12 @@ mod taps;
 #[path = "shared/qwen3moe_place.rs"]
 mod q3place;
 
+// PIN(2026-10-27): replaces `dense_shortage_halves_the_default_context`; an unset context is
+// fitted to the largest step that holds, not halved.
 #[cfg(all(test, feature = "gpu"))]
 #[test]
-fn dense_shortage_halves_the_default_context() {
-    q3place::tests::dense_shortage_halves_the_default_context();
+fn dense_shortage_fits_the_default_context() {
+    q3place::tests::dense_shortage_fits_the_default_context();
 }
 
 #[cfg(all(test, feature = "gpu"))]

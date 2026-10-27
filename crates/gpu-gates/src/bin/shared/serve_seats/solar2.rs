@@ -53,9 +53,9 @@
 //! context comes first and the plan fills the machine around it
 //! (`generate::choose_ctx`, every seat's): a set value past the file's
 //! trained context stops by name, and one the machine cannot hold stops with
-//! the largest it would hold. Unset, the slot asks 262,144 positions or the
-//! trained context where that is less, halved while the card cannot hold the
-//! stores and resident bytes, or while the host cannot hold the routed
+//! the largest it would hold. Unset, the slot asks the trained context, or the
+//! largest context under it whose plan holds where the card cannot hold the
+//! stores and resident bytes, or where the host cannot hold the routed
 //! experts the card then leaves it: the plan reads the host room
 //! (`BLOOMERY_HOST_ROOM` replaces the reading) and the body serves no NVMe
 //! expert tier (`PlaceError::NoNvmeTier`), so a shorter context, which keeps

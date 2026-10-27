@@ -7,7 +7,7 @@
 //! [`Experts::Card`] (`BLOOMERY_QWEN38_EXPERTS` unset) on the machine the
 //! load lays out: the CLI's at the CLI's 4096 for one sequence with no
 //! checkpoints (`machine38`'s one-card arm), the seat's at the context its
-//! unset `--ctx` takes (`q38place::ctx_choice`, the seats' ladder) for its
+//! unset `--ctx` takes (`q38place::ctx_choice`, the seats' fit) for its
 //! default slots, whose checkpoints are priced (`checkpoint_price38` of the
 //! file's delta layers) and reserved.
 //! Drafts are off in both (the draft levers unset).
