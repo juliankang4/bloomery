@@ -15,7 +15,7 @@ use std::ops::Range;
 use engram::EngramError;
 use engram::direct::{DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::{GgmlType, TensorInfo};
-use hf::modelopt::{self, Normal, Use};
+use hf::modelopt::{self, Normal, Plain, Use};
 use hf::quant_config::{Placed, Plan};
 use model::part::{self, At, Part, Planned, Source, Take};
 use model::placement::ExpertList;
@@ -236,6 +236,13 @@ impl Source for Checkpoint {
             format,
             hf::quant_config::Format::Bf16 | hf::quant_config::Format::F32
         );
+        // One BF16 matrix read whole is copied as stored (`modelopt::normalize`): no values widen.
+        let widened = plain
+            && !(matches!(format, hf::quant_config::Format::Bf16)
+                && m.role == Use::Matrix(Plain::Bf16)
+                && m.sources.len() == 1
+                && !cut
+                && m.step.is_none());
         // Direct inputs, or growing cut buffers; decoded companion words and widened plain
         // values coexist with them. A step may shrink the tensor, so its pre-step output is
         // bounded from the stored bytes too. Output capacity can grow to twice its length.
@@ -245,7 +252,7 @@ impl Source for Checkpoint {
             let factor = if cut { 2u64 } else { 1 }
                 + u64::from(compressed) * 2
                 + u64::from(m.step.is_some()) * 3
-                + u64::from(plain || companion) * 4;
+                + u64::from(widened || companion) * 4;
             let (_, range) = self.folder.file_range(n)?;
             bytes = range
                 .end
@@ -1137,6 +1144,13 @@ pub(crate) mod tests {
                 stored + output
             );
         }
+        // A BF16 matrix read whole holds its stored copy and its output, none widened.
+        let bf = planned.iter().find(|p| p.info.name == "bf.weight").unwrap();
+        let s = bf.info.nbytes;
+        assert_eq!(
+            c.read_bytes(bf).unwrap(),
+            4 * s + 2 * DIRECT_ALIGN as u64 + 8
+        );
         let p = planned.iter().find(|p| p.info.name == "v.weight").unwrap();
         c.made.get_mut("v.weight").unwrap().dims = vec![u64::MAX, 2];
         assert!(
