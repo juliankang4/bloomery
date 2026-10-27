@@ -633,7 +633,15 @@ gguf 7 2 0
 # after its host flag (graph.rs `StagedRows::enqueue`), the one owner of deepseek41's engram rows' arrival and
 # Qwen3.8's verify PLE rows' arrival, counted by tools/check-unsafe.sh; gpu-deepseek41 comes down by the same
 # block below. The block has its SAFETY line.
-gpu 2749 350 10
+# PIN(2026-10-27): gpu 2749 -> 2764 blocks, 350 -> 353 fns, new code, not old code relaxed: the staged
+# four-column MXFP8 gemv (q8f32.rs `blocks_gemv_mcol_staged`, the `mxfp8_gemv_mcol_staged` entry) reads each
+# step's activations into shared memory once a block, counted by tools/check-unsafe.sh. Each new block has its
+# SAFETY line.
+# PIN(2026-10-27): gpu 2749 -> 2764 blocks, 350 -> 353 fns, new code, not old code relaxed: the commit's one
+# replay launch over every delta store (linear/delta.rs `gdn_delta_recovery_layers`, its table row reads and
+# raw store views, `RecoveryTable::new`; fault.rs `FaultSink::at_layer`; body38.rs `recovery_table`), counted by
+# tools/check-unsafe.sh. Each new block and fn has its SAFETY line or Safety section.
+gpu 2764 353 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -735,7 +743,11 @@ gpu-flint 2 0 0
 # head-256 append at no query head over the rows rope_gate::run checks distinct, with its SAFETY line.
 # PIN(2026-10-24): gpu-gates 104 -> 106 blocks: ring-attention consumers launch
 # checked distinct positions and bounded chunks under their stated SAFETY invariants.
-gpu-gates 106 5 1
+# PIN(2026-10-27): gpu-gates 106 -> 109 blocks, new code, not old code relaxed: gate_linear's replay-table clause,
+# its refusals and its bench build their `RecoveryTable`s (three `unsafe` calls of its `new`), counted by
+# tools/check-unsafe.sh.
+# Each block has its SAFETY line.
+gpu-gates 109 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of
