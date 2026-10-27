@@ -1,7 +1,8 @@
 # Images the release: on a v* tag push (or a manual run naming one), waits for and downloads that
 # release's own tarball and .sha256 and builds tools/release/Dockerfile around them,
-# so the image's bytes are the release's bytes, checked. The first publish creates
-# the package private; make it public once in its package settings.
+# so the image's bytes are the release's bytes, checked: linux/amd64 from the x86-64
+# archive, and linux/arm64 from the GB10 archive when the release carries one. The first
+# publish creates the package private; make it public once in its package settings.
 name: Docker image
 
 on:
@@ -31,6 +32,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -57,19 +61,43 @@ jobs:
           [ -s rel.sha256 ] || { echo "the release's .sha256 never appeared at $base" >&2; exit 1; }
           sha=$(awk '{print $1}' rel.sha256)
           [ "${#sha}" = 64 ] || { echo "no digest in the release's .sha256" >&2; exit 1; }
+          # publish.sh uploads the GB10 archive before the x86-64 .sha256, so it is up by now when publish.sh carried it.
+          # One uploaded later is imaged by a manual run of this workflow naming the tag.
+          # Only a 404 means the release has no GB10 archive; any other failure stops before a tag is pushed.
+          platforms=linux/amd64 sha_arm64=
+          code=$(curl -sSL -o rel-arm64.sha256 -w '%{http_code}' \
+            "$base/bloomery-${v}-linux-aarch64-cuda-sm121a.tar.gz.sha256") \
+            || { echo "cannot fetch the GB10 archive's .sha256" >&2; exit 1; }
+          case "$code" in
+            200)
+              sha_arm64=$(awk '{print $1}' rel-arm64.sha256)
+              [ "${#sha_arm64}" = 64 ] || { echo "no digest in the GB10 archive's .sha256" >&2; exit 1; }
+              platforms=linux/amd64,linux/arm64
+              ;;
+            404)
+              echo "::notice::release ${tag} carries no GB10 archive yet; the image is linux/amd64 only (run this workflow again naming ${tag} once it is up)"
+              ;;
+            *)
+              echo "the GB10 archive's .sha256 returned HTTP $code" >&2
+              exit 1
+              ;;
+          esac
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "sha256_arm64=$sha_arm64" >> "$GITHUB_OUTPUT"
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
           echo "tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${v},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: tools/release
-          platforms: linux/amd64
+          platforms: ${{ steps.rel.outputs.platforms }}
           push: true
           tags: ${{ steps.rel.outputs.tags }}
           build-args: |
             VERSION=${{ steps.rel.outputs.version }}
             SHA256=${{ steps.rel.outputs.sha256 }}
+            SHA256_ARM64=${{ steps.rel.outputs.sha256_arm64 }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
