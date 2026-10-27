@@ -87,8 +87,9 @@ mod gate {
     use crate::e2e::walk;
     use crate::q3place::PlaceQ3;
     use crate::tier_twocard::{
-        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_3090, union_plan,
+        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_3090,
     };
+    use model::placement::union_plan;
 
     const NAME: &str = "gate_qwen3moe_twocard";
     /// The card budget both plans are made under in the real tier (module header).

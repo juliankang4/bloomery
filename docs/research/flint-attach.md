@@ -2,8 +2,9 @@
 
 Design snapshot: **`e53cabebbb9b16249c81b7c26a026da1670f7d9d`**, requested by
 [#632](https://github.com/midagedev/bloomery/issues/632). The source-gap observations below describe
-that snapshot. This component tree has a header-only reader, shared tier-handoff work, the ordinary
-IQ4_XS shared site and selected common-leg work, but no Flint body, app session or serve seat. Primitive GPU evidence is not Flint model admission.
+that snapshot. The integration adds an actual `gpu-flint` body, application session and shared
+HTTP seat, not just architecture admission. Sections 10–11 retain source-specific historical
+execution evidence; section 12 records the current existing-PR cutover and remaining acceptance.
 
 ## Six-slot handoff closure checks — 2026-10-26
 
@@ -37,15 +38,15 @@ It reuses the common metadata validators, tensor stems, classification and dimen
 GemmaEmbedding2's sliding mask: missing keys, scalars, wrong lengths and non-bool items are refused.
 Present `expert_weights_scale` uses `arch::finite_positive`; only an absent key defaults to 1,
 with that default recorded.
-The common needs walk emits q/k normalization even on NoPE layers. `program_of(Flint)` remains
-`None`; missing program, head128 sinks/SWA, NoPE normalization and 256/top6 bindings remain coverage
-refusals. `Router.norm` and `RouterRule.norm` distinguish no normalization, the existing selected-sum
-rule and Flint's selected-sum floor; the floor description does not supply a device implementation
-or activated-value scaling.
+The common needs walk emits q/k normalization even on NoPE layers. `program_of(Flint)` selects
+`FlintBody`, whose coverage names the operations its loader actually binds: head128/group8
+sink attention, independent NoPE/NeoX and SWA masks, and the real floor router.
+`Router.norm` and `RouterRule.norm` keep the old selected-sum rule distinct from Flint's floor.
+The activated-value protection and explicit residual association are loaded FFN policies.
 
 Fault formatting uses `bloomery_device::fault`'s shared layout/decoder and the
-`gpu::arch::step_order` registry. Flint's registry row uses neutral code order;
-it does not describe a runnable step.
+`gpu::arch::step_order` registry. The body delegates fault checks and captured execution to the
+common chain runtime; the architecture registry's neutral order is not numerical evidence.
 
 Run `BLOOMERY_BOX_ENV="BLOOMERY_MODEL=/absolute/path/flint-header.gguf" BLOOMERY_BOX_LOCAL=1 just gate-flint-meta`.
 Set `BLOOMERY_ENV_FILE` to the local toolchain environment file if it is not `~/bloomery-env.sh`.
@@ -67,25 +68,44 @@ remaining acceptance rows. This header gate is not an end-to-end model gate.
 ### Runtime handoff and host policy
 
 The design, common template support, tokenizer/four-EOG contract and reader (#676–#680) are merged.
-The existing header recipe was exercised on the exact 5,470,528-byte prefix above: four reader tests and
-the pinned-header test passed, still reporting the missing program and operation bindings.
-No full weights or GPU were needed for that check.
+The pinned-header consumer now also checks actual Program coverage and planning on the complete
+local GGUF: 779 tensors, 49 layers, 2 dense/47 routed, 49 head norms, 35 rotations and 49 sinks.
+This reads the header, not tensor contents; it does not prove CUDA execution.
 
-The maintainer [assigned the model port and offered card runs](https://github.com/midagedev/bloomery/issues/632#issuecomment-6352066886),
-and named a forthcoming head128 sink/SWA attention, QK RMS and sigmoid256/top6 train.
-Those complete contracts are not in this main snapshot or the inspected public heads of #726 (`1723485602c1`)
-and #747 (`f883e84f8d2c`). Existing ring and sink-merge ingredients do not establish the combined attention
-operation; `route_body` still lacks 256/top6 and its normalization-floor policy.
-Obtain the train's fetchable ref before duplicating those primitives.
+The maintainer [assigned the model port and offered card runs](https://github.com/midagedev/bloomery/issues/632#issuecomment-6352066886).
+The later public QK-RMS, sink/SWA and sigmoid train supplies reusable primitives. The new common
+`attention_h128` binding combines those with actual ring append/attention kernels; it is not an
+identity-RoPE substitute or a padded-head adaptation of another family.
 
-The router description/selection contract now distinguishes `RouterNorm::None`, `SelectedSum` and
-`SelectedSumFloor`. Flint requests `max(sum_selected, 2^-14)`; existing model descriptions and arithmetic
-keep their rules. Compiled rows, including boolean `norm_arg` bindings, refuse the floor policy rather
-than borrow an epsilon-added implementation. The absent-bias, 256/top6 and `Need::Program` refusals stay
-until real device bindings are supplied. Reconcile the policy interface with the pending train before device work.
-Then close shared IQ4_XS, selected card/tier down forms and six-slot F32 handoff in their existing common owners,
-followed by paging/resident slots, reference provenance and the body/app/seat.
-Each device slice needs its numerical/fault gates and the maintainer's offered hardware proof before admission.
+The common `route_body::sigmoid_floor_256_6` binding now supplies Flint's fixed
+`max(sum_selected, 2^-14)` rule. `RouterKernels::enqueue_router` and `enqueue_router_rows`
+take `Option<&DeviceBuffer<f32>>` for a real optional selection-only bias. The common
+`RouterEntry`/`RouteIn` consuming paths carry that option; `RouteBlock` allocates no zero-bias
+buffer for this binding. Absent bias borrows the existing router-weight slice only as an unused
+device ABI argument; no bias data is fabricated, copied or read. The floor policy is a compile-time
+specialization of the same score, publication and top-k bodies, not a per-step normalization flag.
+
+Both metadata bindings are `RouterBody::SigmoidFloor` at exactly 256/top6: sigmoid, no shared
+sigmoid gate, `SelectedSumFloor`, with or without selection bias. Bias changes only the ranking.
+The six selected unbiased scores are summed in f64 slot order, narrowed to f32, divided by the
+floored sum and then scaled. Equal selection keys choose larger expert ids. Nonfinite logits,
+selection keys or resulting weights raise `FaultSite::Router`; an invalid selection key poisons
+all six weights. Existing epsilon-added entries, launch ABIs and legacy norm-argument rules remain
+unchanged. A legacy `RouterEntry` given no required bias returns a named state error.
+
+`gate-flint-router` now consumes the actual floor binding through `RouterEntry` for planted and
+dense rows, both bias modes, active tiny-sum floors, zero sums, ties, nonfinite logits/bias/scale,
+one-token/batch bit equivalence and eager/captured replay. Its independent host weight expression
+uses the declared floor and rejects an epsilon-added or biased-weight implementation.
+The two entries (`sigmoid_floor_256_6_router` and
+`sigmoid_floor_256_6_router_pick`) need same-toolchain add-class PTX/JIT comparisons
+and measured resource pins; compiling an entry or running a numerical gate is not
+a resource census. No unmeasured pin is supplied.
+
+The loaded `FlintBody`, app session and serve seat now compose these common owners.
+Program coverage is present; it must not be confused with whole-model numerical
+acceptance. Paging/resident slots, reference provenance, eager/captured execution,
+HTTP behavior and affected common/tier consumers retain their own acceptance gates.
 Legacy metadata booleans share `RouterNorm::from_legacy_bool`: false keeps scores and true uses the
 existing epsilon-added selected sum. Flint's distinct floor mapping stays in its reader.
 
@@ -98,6 +118,9 @@ gated block selects a split gate/up and sizes the down's q8_1 scratch from the
 actual activation form. Its column walk and the shared wide-prompt owner use
 those same sites. IQ4_XS is not relabeled as a routed expert or requantized.
 
+A compiled public `file_site` consumer on the pinned header refused all three
+layer42 shared matrices before this change and accepts their IQ4_XS/Q8x128
+bindings after it. This reads no payload and proves neither loading nor arithmetic.
 `hw_iq4_shared_loads_and_runs_narrow_columns_and_wide_replay`, owned by
 `gate-gpu-ds41-lib`, covers real packed-weight loading, unchanged stored words,
 the ordinary `SharedExpert` layout, unequal matrix widths, one/eight-column block
@@ -112,10 +135,14 @@ reconciles its existing Qwen3.8 projected-site consumer: `site::PROJECTED` inclu
 IQ4_XS, and selected dispatch uses the supplied stream. Projected attention/shared
 sites are admitted; the K=640 shared down and unsupported types/shapes remain refused.
 This reuses the existing program and kernel, not a new model implementation.
+Flint's implemented Program separately binds the real ordinary dense/shared operations.
 
-The typed GGUF test `a_site_type_comes_from_the_header_and_a_type_with_no_launch_is_refused`
-reads an IQ4_XS shared site through `PROJECTED`, not merely `ALL`. It refuses IQ3_S, another
-shape and a type outside the allowed list by name. It is metadata-only and creates no CUDA context.
+At component source `b0fc05e5349330927ceb33ce6f30e584f25ecf4d`, the typed GGUF
+`iq4_sites_keep_shape_and_launch_admission_separate` consumer passed1 case,
+0 failed/ignored,430 filtered. Its successful arm uses `PROJECTED`, not merely
+`ALL`; this checks actual file admission rather than copying a metadata registry.
+The case is metadata-only and creates no CUDA context; oxide owns its linking.
+It is neither fresh NVIDIA stream/launch execution nor a run of this integration.
 
 Pinned upstream `95a483fc242d00dec7987efe4a05e24b5f651c1f` subsequently adds the
 split gate/up path that materializes f32 SwiGLU for a down that reads f32.
@@ -168,6 +195,11 @@ Host-only projections intentionally have no card totals: fixed reserves remain o
 Only a dynamic tier-leg descriptor requires the plan's selected card totals. The existing node paging
 budget regression exercises this distinction without a GPU, including OS reserve and constrained host room.
 
+The current-main cutover keeps reserve-only draft holders, per-card budgets and each
+family's activation contract. `LegTier` receives its activation converter at load;
+selected `Program` arms replace the redundant family arm hook. Share-budget floors
+use the same selected reserve calculation.
+
 `tier_leg_batch_bytes` and the explicit-form `try_tier_leg_batch_bytes_of` return
 `Result<TierBatchBytes, PlacementError>` and construct candidate-selected descriptors.
 An empty tier selects no down form, matching `LegTier`'s actual allocation instead of
@@ -183,6 +215,11 @@ Malformed geometry and overflow are refused rather than panicking; a dense Qwen3
 request for an expert tier is a named metadata refusal, not zero expert geometry.
 Separate tile/route-based fixed-reserve paths remain unchanged.
 
+`TierLegScratch::input_scales` names an optional physical f32 scale per chunk
+slot. Its checked byte formula includes `4 * chunk * n_used` when enabled,
+including an empty selected-down union; legacy descriptors leave it disabled.
+The same descriptor prices the loader's scale allocation without reserve padding.
+
 The planner's selected scratch calculation has one union/byte rule. Fill prepares
 per-layer forms once for dynamic tier-leg cards, including multiple forms in one
 layer, and reuses them with its cached footprint instead of rescanning tensors for
@@ -194,10 +231,10 @@ prompt reserve. With byte granules (no reusable dense padding), the exact dense-
 budget leaves no room for expert weights.
 The real mixed-wrapper hardware case also checks allocation of a configured empty tier.
 
-Historical exact-source proof at `3071a9f0d8ed4773692e0c040dece222b90f6bec`:
+Historical component proof at `3071a9f0d8ed4773692e0c040dece222b90f6bec`:
 GPU library418 passed plus10 held passed, verbs1 passed, and all1657 canonical entries
 identical to main15778e2c (4bins/8carriers, non-JIT rows equal).
-The repair at `c26025b1fb9fad1af399401d27cf709005736ba0` then executed the extended
+The component repair at `c26025b1fb9fad1af399401d27cf709005736ba0` then executed the extended
 real CUDA mixed/empty-tier consumer:1 passed,0 failed,0 ignored,427 filtered,24.18s.
 Its fresh4bin/8carrier canonical comparison again found all1657entries identical to main15778e2c,
 with non-JIT rows equal. Native formatting/Clippy passed (warning3=ratchet3); model557 and
@@ -213,32 +250,27 @@ chain23, GGUF67, model557 and placement202 (five model cases ignored,0 filtered)
 An exact-source7e37ef9a canonical comparison against main15778e2c found all1657
 entries identical across4bins/8carriers and non-JIT rows equal; it did not compare
 driver-JIT resource rows. The older full-library counts above remain historical,
-not a new full-library run of the review repairs.
+not a new full-library run of the review repairs or a run of this integration.
 
-The component subsequently merges pinned upstream `cb8d92ebddd1ce1a325a15450c06a01f57ecf88c`.
-That reconciliation retains upstream's GLM mixer-form consumers alongside this component's
-checked tier-byte API; the explicit-form API has no input-scale flag. The GPU results
-above belong to their named historical sources, not the merged source.
-
-At merged source `c38d603ca1d33c6c2bede63aba102199715fb9ef`, native formatting and
-all-target Clippy passed, as did chain23, GGUF67, model559 and placement202
+At component merged source `c38d603ca1d33c6c2bede63aba102199715fb9ef`, native formatting
+and all-target Clippy passed, as did chain23, GGUF67, model559 and placement202
 (five model cases ignored, zero failed/filtered). The actual oxide-linked
 `a_dense_header_plans_through_qwen35_on` frontend consumer passed1 case,
 0 failed/ignored,6 filtered, including the named expert-tier refusal.
-This is metadata-only host execution, not fresh NVIDIA execution of the merged source
-or a whole-model numerical result.
+This is metadata-only host execution, not fresh NVIDIA execution or a run of this integration.
 
-The host-only public planner consumer covers one-byte boundaries before the first resident layer
-and before adding another down form, plus descriptor overflow refusal. These and the CUDA consumer
-are not a whole-model oracle or every affected model/residency gate; canonical equality does not
-waive changed host/allocation consumers. Flint's `Program` admission and body/app/seat remain absent.
+The host-only planner covers one-byte boundaries before the first resident layer and another
+down form, plus descriptor overflow refusal. Neither this nor the component CUDA proof is a
+whole-model oracle or every affected model/residency gate; canonical equality does not waive
+changed host/allocation consumers. The integration's body/app/seat consume the selected forms.
+
 ### Six-slot F32 tier handoff implementation
 
 `HandoffKernels::enqueue_handoff_tier` now selects a genuine six-slot F32 entry
 beside the existing four- and eight-slot entries. Both host and tier layouts must have the
 same supported slot count and activation width; compressed tier images remain
 refused. The entry uses the existing copy/place/fault helpers and the existing
-subsequent go/publication protocol; no Flint router or Program is registered.
+subsequent go/publication protocol; the integration's configured routed block consumes it.
 
 `hw_f32_tier_handoffs_conserve_consumed_routes`, owned by
 `gate-gpu-ds41-lib`, consumes the four-, six- and eight-slot handoffs' weights and emitted
@@ -256,6 +288,7 @@ Actual six-slot body/tier and two-card completion remain integration work, not
 capabilities inferred from this primitive.
 `check-ptx-names` is green with those pinned rows; a GB10 scan replaces them with the
 observed spill/JIT-local measurements. Offline no-JIT scans cannot supply that column.
+
 
 
 
@@ -280,7 +313,10 @@ alignment padding, at byte **5,470,528**. Bytes after that boundary were ignored
 `fb0cc4b520f927f0b679193397ee0c36ca252426e7881283c5aa6de3e44a3a2b`.
 The existing Python header reader and Rust `gguf::inventory_of` agree on **779 tensors** and
 **25,049,218,176 encoded tensor bytes**. Shape products total **39,785,287,456 parameters** (derived).
-No full model was downloaded or executed.
+That initial design inspection fetched only the prefix. A later local CPU oracle run used the
+complete 25,054,688,704-byte GGUF (SHA-256
+`63c2ecc461ca545134b670c660e76fa20f47240f8d39b6510bfd21c4dd6e072f`).
+Mainline CPU completion is reference evidence, not execution of this CUDA body.
 
 The official repository says Apache-2.0; this exact GGUF header says `other` / `flint-preview`.
 The config/header shapes and the byte-identical 2,328-byte chat templates establish those contracts,
@@ -351,13 +387,12 @@ source of the gathered weights. The shared SwiGLU output is added without a shar
 
 Three numerical obligations must stay explicit:
 
-1. Current [common router normalization][route-core] uses `sum + 1e-20`, not the reference's floor.
+1. Legacy [common router normalization][route-core] uses `sum + 1e-20`, not the reference's floor.
    This is a semantic difference for tiny scores, not a width-instance problem or a measured GPU
-   failure. The existing `Router`/`RouterRule` contract now carries the explicit policy, and the
-   reader requests `SelectedSumFloor` for Flint. Selection refuses that policy on every current
-   router row; `norm_arg` serves only the two legacy policies. The device floor binding is still
-   missing. Add it in the common operation without changing the global divisor, existing model
-   arithmetic, or hiding the difference in a Flint-only wrapper.
+   failure. `Router`/`RouterRule` carries the explicit policy; the reader requests
+   `SelectedSumFloor` and the common `sigmoid_floor_256_6` binding implements it. Legacy instances
+   keep their exact arithmetic and `norm_arg` serves only the two legacy policies. The floor
+   gate checks active tiny sums independently; GPU numerical and resource evidence is still needed.
 2. Mainline [rescales Flint's activated expert input before down projection][ref-down] with
    `build_amax_src1_f16`, then restores its scale before router weighting. This protects F16/Q8
    headroom around a maximum magnitude of 1024; it is not an architectural activation clamp.
@@ -383,17 +418,17 @@ requires bias and derives width from a shared-count convention. Invalid mask typ
 norms/sinks/shared matrices, an out-of-range block, impossible KV grouping, zero dimensions,
 nonfinite epsilon/base, overflow and malformed optional bias all need named refusals.
 
-At this snapshot there is no Flint architecture reader or selected program. A reader-only landing
-must keep `program_of=None` and the existing **`Need::Program`** refusal in [coverage][coverage].
-Do not claim runtime support by adding the name to an enum or relaxing a shape/type row.
+The original reader-only landing retained `program_of=None` and `Need::Program` refusals.
+The integration now has actual operation consumers and Program admission; adding a name or
+loosening a type row alone would still not establish runtime support.
 
 ### Concrete common prerequisites
 
-| ID | Current limitation | Required common change before an executable attach |
+| ID | Original gap (design snapshot above) | Required common change / acceptance contract |
 |---|---|---|
 | G1 | NoPE normalization-need generation is present; the executable head128 norm-only binding is missing | Preserve the emitted normalization **or** rotation need; bind head128 normalization with `mode=None` truthfully. No identity-RoPE table. |
 | G2 | Existing head128/group8 attention lacks the complete sink/SWA contract; MiMo's window pass is K192/V128 | Complete the described head128 operation in `rope_neox` / `flash_gqa`, including genuine NoPE append, sink merge, window/ring positions, prompt and slot paths. Never pad heads to 192 or copy MiMo's body. |
-| G3 | The host description/selection policy is explicit; sigmoid256/top6 and its device floor binding are absent, and higher-level `shared_routed` admission requires bias | Add the real instance/floor operation; bind absent bias through `RouteLayer.bias=None`, which the lower `RouteBlock` already supports. Price/load the BF16 router through its supported F32 widening. |
+| G3 | Real common sigmoid256/top6 floor operation and both optional-bias metadata bindings are implemented; whole-program binding remains separate | Attach `sigmoid_floor_256_6` through `RouterEntry`, with `RouteLayer.bias=None` retaining genuine absence and no zero buffer. Price/load the BF16 router through its supported F32 widening. Run `gate-flint-router` and obtain genuine new-entry JIT pins on NVIDIA hardware. |
 | G4 | Layer42 shared IQ4_XS has routed/GEMM operations but no ordinary dense site, and `BlockPlan` rejects it | Extend the **common** dense/gated block's real layout, load, launch, scratch and prompt binding. Keep the role `SharedExpert`; do not relabel it as routed or silently requantize it. |
 | G5 | The common card wrapper uses Q8Act-only buffers and `LegStacks::of`; Q6_K/Q8_0 down do not both pass that path | Carry selected arms and actual down forms through `CardExperts`, `LegBufs::for_downs`, loader, planner, residency and tier. Existing Q6_K/Q8_0 arithmetic is not the missing piece. |
 | G6 | Common tier accumulation supports six slots, but F32 `enqueue_handoff_tier` accepts eight | Add the six-slot F32 handoff instance in the existing owner; preserve the eight-slot entry. A DeepSeek Q8_1 handoff is not an interchangeable input contract. |
@@ -646,6 +681,277 @@ PY
 The Python reader intentionally skips array values. Their recorded values came from
 `gguf::inventory_of(...).meta`, not `None` values treated as absent GGUF facts. The recipe above
 revalidates the **whole header hash**, including those arrays, without a second parser.
+
+## 10. Single-card NVIDIA acceptance and remaining numerical boundary
+
+The runtime at `313b9f0f88c90fcfae2365a4af53cd077762eb7c` was exercised on one RTX 3090,
+cc8.6, driver 595.91.07 (CUDA API 13.2), with nightly-2026-08-28, cuda-oxide `87bc9518`,
+LLVM 21.1.8 and CUDA toolkit 13.3.0 / ptxas 13.3.33. The complete 25,054,688,704-byte
+GGUF was downloaded separately on that runner and its full SHA-256 matched
+`63c2ecc461ca545134b670c660e76fa20f47240f8d39b6510bfd21c4dd6e072f`.
+
+- `just gate-gpu-flint-attn` and `just gate-gpu-flint-router`: exit 0, including loaded
+  NoPE/NeoX ring consumers, floor/optional-bias routing, capture/replay and named faults.
+- `just gate-gpu-flint-lib`: exit 0; the full-file capture/slots/reset/ring-boundary test
+  ran with **1 passed, 0 failed, 0 ignored**. Its bitwise consistency is not a mainline oracle.
+- The real HTTP seat loaded 49 layers and two resident slots, exposed the original template,
+  generated English and Korean turns to EOG 150003, split reasoning, parsed a required
+  `get_weather` call with `{"location":"Seoul"}`, and preserved messages under concurrent
+  requests. The four stop spellings tokenized to the four expected IDs; natural emission of
+  all four stop IDs was not tested.
+- A full `generate_ds41` scan and the pre-pin spill gate JITed all 436 entries without a
+  resource cache. The only ten violations were the new unpinned entries, each measured
+  `spill=0, jit_local=0`; the 26 vision entries passed. These observations supply only the
+  ten `sm_86`/cc8.6 rows. The three cc12.1 tables still need thirty genuine measurements.
+
+### Independent greedy comparison remains partly red
+
+The English raw continuation exactly matched pinned mainline CPU
+`a37cc46104eb50900d5ab4a9ba02a0abdac039db`. The Korean continuation did not: the first
+different generated ID is index 74, after the same 22 prompt IDs and 74 generated IDs
+(next absolute position 96). Mainline chooses 26007 (`라`); Bloomery chooses 29263 (` 정`).
+Both eventually answer `4`, which does not turn the comparison green.
+
+A standalone consumer linked to the preserved mainline library replayed that original
+prompt-then-single-token trajectory with zero preceding raw-argmax mismatches. Its complete
+150,144-logit rows at context 1024 and 2048 were bit-identical. At the divergence:
+
+| Observation | Margin `logit(26007) - logit(29263)` | Selected ID |
+|---|---:|---:|
+| Mainline CPU, original trajectory | +0.608115554 | 26007 |
+| Bloomery probability diagnostic, original trajectory | -0.018128157 | 29263 |
+| Bloomery, same 96 IDs supplied as one prefill | +0.361473739 | 26007 |
+
+The GPU margins are differences of reported pre-sampling log probabilities; the diagnostic
+reproduced the original first 75 generated IDs. Probability collection reads each row and
+uses plain per-token stepping, rather than establishing equality of every execution mode.
+
+This is not an exact tie or a demonstrated context-capacity defect. The common FFN owner
+explicitly uses F32-activation Q8_0 GEMV for narrow/decode rows and quantized-activation
+GEMM for wide prompt units (`shared_routed.rs`, `GATED_FROM=9`). Mainline also quantizes
+the output head's activations and BF16 router operands differently. These are source-backed
+numerical differences, not a proven localization of the Korean flip. No precision mode,
+compiler pin, tie rule, tolerance or acceptance criterion was changed to force matching text.
+Comparable follow-up traces must retain the original prompt/decode trajectory and can use
+the existing 49-layer `Body::taps` and mainline `l_out` callbacks.
+
+Keep the integration Draft. Korean numerical/oracle acceptance, cc12.1 resource rows,
+affected common-owner coverage beyond the exercised consumers, two-card operation, dynamic
+residency/NVMe, streamed HTTP and spontaneous tool selection are not established by this run.
+
+## 11. Current-main integration and trajectory instruments
+
+The first linear integration candidate, `4dadee0195fb652608be59ffecc033a4643ad1eb`,
+starts at main `43073091be21e48cda40d79fe6dae1dfcfd643d5`. The follow-up replay
+starts at main `af74ea46b7f3e47692c2afae09eb64fdddf71461`. At that stage neither replay
+replaced the published #799 head; section 12 describes the later history-preserving cutover.
+Fixed-source comparisons keep the original production and candidate images separate, and
+receipts name each image. Section 10 is not acceptance of either replay or the later cutover.
+The placement integration keeps both the cached upload `Footprint` and candidate-selected
+tier scratch/reserves. No compiler pin, numerical band or model admission was widened.
+
+### The common union must retain selected formats and recount its allocation
+
+`model::placement::union_plan` now owns the shared one-stage/one-tier reference transform.
+It retains the actual selected card format, refuses incompatible formats, preserves host
+assignments and KV, and recomputes expert bytes, upload-heap rounding, selected reserves and
+actual-stage headroom. The artificial budget that split the experts is not the reference's
+physical capacity. The old shared helper is removed and its consumers use the common owner.
+The standalone DS41 and Qwen3.8 transforms have different contracts and remain separate.
+
+A public host-only consumer over the complete pinned GGUF reproduced the former generic
+transform's `NoCardFormat` refusal on `blk.2.ffn_gate_exps.weight` (`IQ3_S`). The corrected
+transform preserves the program-selected format rather than admitting IQ3_S generically.
+With the workstation's 3090 stage/A6000 tier figures, 1024 context and an 8 GiB per-card
+planning budget, its union contains 5,197 experts and 9,959,514,112 expert bytes, equal to
+the assigned rows, with no plan violations. This is real-file planning, not device loading.
+The pure regression also covers mixed selected down forms, heap/reserve recounting,
+unchanged generic refusal, conflicting formats and insufficient union capacity.
+
+The common mixed card/tier hardware consumer stages its fixture through `Weights::load_rows`
+using `accepts::routed_rule(FAMILY.program)` and the shared segment buffer arithmetic.
+Neither `Weights::load_where` nor the generic `routed_row` admits selected-only IQ3_S:
+assigning a routed role alone is insufficient. The fixture keeps all mixed-format
+step/pass/batch/tier bit comparisons and byte conservation, without widening generic
+admission. The obsolete Solar2 Q6_K-down rejection is removed: the current selected owner
+already admits that arm. Mismatched gate/up rejection remains exercised.
+
+### CPU and GPU use one forced-ID diagnostic artifact layout
+
+`tools/ref/flint_trace.cpp` and the `bloomery-gpu-flint` example `trace_flint` consume exactly
+96 whitespace-separated decimal IDs. The original HTTP `Slot::close_call` in
+`crates/serve/src/genloop.rs` prefills the first 21 prompt IDs, then calls `next` for the
+22nd ID before the 74 forced continuation IDs. Both consumers reproduce that boundary.
+They do not retokenize, sample, or stop at an input EOG. The 75 observations save processed
+positions 21 through 95, predicting positions 22 through 96; the prefix itself is not an
+observation. `--prompt 22` names the complete prompt, not a 22-ID batched submission.
+
+The format is `flint-trajectory-v2`, not a reference-set family or accuracy gate.
+The former v1 consumer submitted all 22 prompt IDs as one batch: its controls remain
+historical evidence but do not reproduce the actual HTTP prompt/step boundary. Do not
+relabel v1 arrays or compare them as if the submission contracts matched.
+
+- `tokens.ids` and `steps.tsv`: exact inputs and each call's processed/predicted position
+  and raw argmax.
+- `logits.f32`: little-endian F32 `[75][150144]` in every arm.
+- With taps: `layers.f32` `[75][49][2048]` and `norm.f32` `[75][2048]`.
+  Untapped arms explicitly mark those tensors absent.
+- CPU `tensors.tsv` records actual node types, dimensions, strides and selected rows.
+  GPU artifacts retain the actual expert assignments, loaded slots, device/plan facts,
+  graph nodes and completion counters.
+- A new output directory is required. `MANIFEST.tsv` is published only after successful
+  capture; a partial run cannot masquerade as complete. External receipts identify the
+  model, source/diagnostic overlay, toolchain, libraries and binary hashes.
+
+Build the CPU consumer against the preserved mainline revision
+`a37cc46104eb50900d5ab4a9ba02a0abdac039db`, with shell variables naming its source,
+built library directory and the new diagnostic executable:
+
+```sh
+c++ -std=c++17 -O2 -I"$LLAMA_SRC/include" -I"$LLAMA_SRC/ggml/include" \
+  tools/ref/flint_trace.cpp -L"$LLAMA_LIB" -Wl,-rpath,"$LLAMA_LIB" \
+  -lllama -lggml -lggml-cpu -lggml-base -o "$CPU_TRACE"
+CUDA_VISIBLE_DEVICES= "$CPU_TRACE" -m "$MODEL" --ids "$IDS" \
+  --prompt 22 --ctx 1024 --out "$CPU_OUT"
+```
+
+The preserved **v1** CPU callback arm was actually run on the complete model: 75 calls, 3,675 layer vectors,
+zero preceding argmax mismatches, and final argmax 26007. Its complete final-logit SHA-256
+is `083c8aa95aab025c0183c2ee3c4788642499533d5a2ee4e280c1125302c23bf9`, bit-identical
+to the preserved callback-free original row. The model was rehashed in this round.
+The separate untapped control also ran: all 75 complete 150,144-logit rows are
+bit-identical to the callback arm, whole-file SHA-256
+`7f2e476bd7fbf33faf6548eedadbb89b1844c50e0a55d7fc8aa25b297fbaff4a`.
+These are results of the first candidate's CPU consumer, not new GPU results.
+
+The corrected **v2** CPU callback and callback-free consumers also ran on the complete
+model. Their 75 full-logit rows are bit-identical, SHA-256
+`4ef35ee7390341e640a6d38c39a010643f51a853fe743b29a5da989c7b8357b5`.
+At next position96 the argmax is26007 and its margin over29263 is+0.238318443.
+V1/v2 CPU arrays are not bit-identical; call16 has a different argmax. This is evidence
+that the submission boundary matters, not a GPU fix or permission to waive the oracle.
+
+The GPU build uses the pinned oxide toolchain. Actual capture runs belong inside an
+authorized runner configuration with its normal card locks and bounds; `TRACE` names
+the compiled example in that checkout's target directory:
+
+```sh
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-flint --release --example trace_flint
+bash tools/gpu-gate.sh --executable "$TRACE" -m "$MODEL" --ids "$IDS" \
+  --prompt 22 --ctx 1024 --slots 2 --mode graph --out "$GPU_OUT"
+```
+
+Use separate new output directories for all four mode/instrumentation combinations:
+Eager/untapped, Eager/tapped, Graph/untapped and Graph/tapped (`--taps`).
+Check full-logit neutrality within each mode as well as Eager/Graph agreement.
+Arming taps forces Eager; the consumer explicitly restores the requested mode afterwards,
+and Graph decode must actually capture. The instrument admits only the existing
+card-budget lever; do not assume other inherited levers were applied.
+Context 1024 is per slot, two slots total 2048, matching the original HTTP setup.
+Compare the actual per-layer placement, not just model identity or aggregate counts.
+The diagnostic's all-false `HostCfg` matches the original `r8=off` and `HOST_LOCK=0`
+settings, but page population/discard differ from the original HTTP defaults. Record that
+difference; it is neither an established numerical cause nor permission to skip direct-B
+boundary reproduction. `norm.f32` is the weighted RMS output before head activation
+quantization, not an RMS-only row or quantized activation bytes.
+
+Diagnose the original `313b9f0` production source with the separately recorded example
+overlay first; then bridge the same controls onto the integration candidate. A new binary
+on a larger card is not automatically the original 3090 trajectory. A control mismatch
+stops causal attribution. If layer outputs agree but the final norm/head does not, isolate
+that operation on matching inputs; intended quantization is neither a demonstrated bug
+nor automatic permission to waive the Korean flip.
+
+### Dedicated real two-card consumer
+
+`gate-gpu-flint-twocard` runs
+`two_card_tests::hw_two_card_full_file_union_capture_publication_fault_reset`.
+It requires the complete pinned GGUF in inner `BLOOMERY_MODEL`, two distinct visible
+devices, and actual expert assignments to both cards at every routed layer. It compares
+batched prompt and changed-input decode logits/layer rows with the same plan's one-card
+union, checks ranked six-slot publication and stage/tier capture/completion, then raises
+a real quantizer fault on the tier GPU while the stage is clean and checks propagation,
+poison, refusal, reset and refeed. No unsafe fault-injection API is added.
+
+The one-card library recipe keeps its exact original test filter. Both full-file recipes
+refuse the fixture tier. The two-card recipe takes the existing `both`/big-load runner
+path and has a derived host-resource ceiling, not a measured RSS claim. It does not prove
+dynamic residency/NVMe, loss/deadline recovery or a Korean oracle result.
+
+Require fresh NVIDIA evidence tied to each candidate's actual source, model, placement
+and executed hardware case; compiled/ignored tests are not such evidence. Preserve
+existing workloads unless their owner authorizes a separate window. Physical cc12.1
+resource values must be measured, never inferred from an sm_86 build or cc8.6 run.
+
+## 12. Shared-contract integration and same-input head probe — 2026-10-26
+
+The integrated contracts started from main
+`15778e2cb2dd7af428d2dd14259e6b0ea8ca6b89` and were reconciled with pinned main
+`cb8d92ebddd1ce1a325a15450c06a01f57ecf88c`'s projection and stream interfaces.
+They retain Rust1.99.1 and cuda-oxide9df9e7ce / repository backend patch31ab6a1d3f58,
+not a model-specific compiler override. Older nightly/87bc arrays remain evidence
+of their own source and toolchain only.
+
+Current-main's prequantized leg input and metadata-only `Common` remain separate.
+Both ordinary and prequantized entry points retain the loaded `AmaxF16` protection state.
+The already-activated card leg normalizes with `rule=None`: its second device ABI operand
+is unread, so it borrows the distinct existing down buffer rather than allocating or copying
+a fake input. A hardware regression compares ordinary input with prequantized captured replay,
+including changed amplitudes, Direct/AmaxF16, full/partial batches and skipped/tail canaries.
+Historical integration source `082cf7ffac3bb5b5d574b489062732735985feeb`
+passed native all-target Clippy and formatting, with three warning lines against ratchet three.
+Its host library run passed chain23, GGUF67, placement206 and model563 (five model tests
+ignored), with zero filtered tests. Common-name and unsafe ownership checks also passed.
+On RTX3090 cc8.6 / driver595.91.07, its protected-prequantized, mixed/empty-tier and
+complete-GGUF consumers each passed one hardware case, zero failed/ignored. Its attention
+and router executables also exited0. These are source-specific results, not execution
+of later ownership/API repairs or whole-model oracle acceptance.
+
+The current-main code reconciliation at `49b11b36d4a1de2e140010c5a2d2c9afc3e2671a`
+passed native formatting/all-target Clippy (zero warning lines against ratchet three),
+model565 and placement206, with five model cases ignored and zero filtered.
+The common-name check found1337 lines against the existing1400-line allowance;
+all39 unsafe ownership rows matched their pins. These are host checks, not NVIDIA execution.
+The merge retains IQ4_XS's selected `_sel` dispatch on the supplied stream and its
+q8_1 launch accounting. The Qwen3.8 admission fixture accepts its projected sites while
+retaining the K=640 shared-down refusal. IQ4 activation bands were not relaxed,
+and the removed source-text wiring guard was not restored.
+
+Every recipe that builds the shared `bloomery-serve` binary carries its required-feature
+union, including `flint`; this also applies to newly merged consumers such as
+`gate-gpu-llama-serve`. Recipe validation and actual model-fence opening must agree
+before a batch can schedule that consumer. This configuration check is not a GPU serve run.
+
+### Measured head/upstream separation, not a precision fix
+
+A throwaway probe used the preserved mainline CPU backend
+`a37cc46104eb50900d5ab4a9ba02a0abdac039db`, four threads, and the original complete
+Q8_0 output matrix (2048 × 150144). It evaluated both CPU and GPU final-normalization
+vectors from the matched-boundary v2 trajectory. Its CPU-input controls reproduce the
+original complete 150144-logit rows bit for bit at both calls; this validates the cross-input
+comparison rather than a dequantized/reduced-matrix approximation.
+
+Here `HC`/`HG` are the CPU/GPU head implementations and `xC`/`xG` their saved norm inputs.
+Each cell is the first named token's logit minus the second's:
+
+| Predicted position / token pair | HC(xC) | HC(xG) | HG(xG) | HG(xG) − HC(xG) | HC(xG) − HC(xC) |
+|---|---:|---:|---:|---:|---:|
+| 38 / 86671 − 55591 | +0.164879680 | −0.166242123 | −0.142640829 | +0.023601294 | −0.331121802 |
+| 96 / 26007 − 29263 | +0.238318443 | +0.005065918 | −0.018128157 | −0.023194075 | −0.233252525 |
+
+At position96, the CPU head on the GPU norm selects26007, whereas the actual GPU head
+selects29263. At position38 the CPU head on the GPU norm still selects55591. A head-only
+change therefore cannot resolve the whole trajectory. The columns separate head-implementation
+and upstream contributions; they do not identify the first upstream operation or attribute all
+head difference to one quantization step. No production precision, tolerance, tie rule or oracle
+criterion was changed, and no existing GPU arm was replayed for this CPU-only probe.
+
+These source-specific cross-input results are not a run of a later integration.
+Whole-model acceptance still requires exact-source runtime proof, disposition of
+the Korean numerical/oracle mismatch, genuine physical cc12.1 resource measurements
+and remaining affected common/residency/tier/NVMe coverage. Component proof is not
+whole-model admission, ROCm support or a performance result.
+
 
 [needs]: https://github.com/midagedev/bloomery/blob/e53cabebbb9b16249c81b7c26a026da1670f7d9d/crates/models/src/need.rs#L505-L531
 [stems]: https://github.com/midagedev/bloomery/blob/e53cabebbb9b16249c81b7c26a026da1670f7d9d/crates/model/src/arch/stems.rs#L61-L125

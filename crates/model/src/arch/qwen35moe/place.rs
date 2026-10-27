@@ -1511,6 +1511,7 @@ pub fn leg_tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementEr
         n_used,
         (LEG_TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
         leg_down_forms(Program::Qwen35Body, &inputs.model),
+        false,
     )
 }
 

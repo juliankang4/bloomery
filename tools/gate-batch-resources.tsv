@@ -36,6 +36,11 @@
 #              so the e2e's 187e9 bounds its host bytes [derived].
 #   qwen3moe-twocard: unmeasured ceiling, the qwen38-twocard row's figure (qwen4exp --place gate need, 92,054,154,240 B).
 #              The two loads run one after the other. Not a measurement of the Qwen3-30B or Qwen3.6 plan.
+#   flint-twocard: [derived] pinned GGUF, 1024 context, one sequence, residency/R8 off:
+#              HostNeed with every routed file tensor on the host is 24,168,079,360 B;
+#              four histories of 75 * (49 * 2048 + 150144) f32 bound retained readbacks and temporaries,
+#              300,595,200 B. Sequential model loads: total ceiling 24,468,674,560 B, not measured RSS.
+gate-gpu-flint-twocard	-	24468674560
 gate-gpu-ds41-callstream	-	237600000000
 gate-gpu-ds41-long	m	237600000000
 gate-gpu-ds41-twocard	-	237600000000

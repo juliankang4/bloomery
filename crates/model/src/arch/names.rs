@@ -37,6 +37,12 @@ pub fn attn_norm(l: usize) -> String {
     blk(l, "attn_norm.weight")
 }
 
+/// `blk.{l}.attn_sinks.weight` — one learned sink logit per query head.
+#[must_use]
+pub fn attn_sinks(l: usize) -> String {
+    blk(l, "attn_sinks.weight")
+}
+
 /// `blk.{l}.attn_q.weight` — the query projection, every head.
 #[must_use]
 pub fn attn_q(l: usize) -> String {

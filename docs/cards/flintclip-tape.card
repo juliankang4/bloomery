@@ -1,0 +1,28 @@
+# The Flint 40B-A2.5B UD-Q4_K_XL (unsloth GGUF) toktape, fourth sitting: one arm, `n6000b` (the P4 prompt, N 6000, so the answer can come
+# after the thought), greedy, two discarded warm-ups, a fresh load of the 25.05 GB file with both cards visible (RTX A6000 first, RTX 3090
+# at its 250 W cap), bloomery-serve -m <file> at the serving defaults (every BLOOMERY_* lever unset, --place unset, --ctx-size 16384, no
+# --parallel). The run waits for a CPU-quiet box first (loadavg1 < 4 and no compiler process for 60 s, polled every 30 s, at most 20 min,
+# then records anyway and says so); the lease is held while it waits, so no new box command starts beside it. After the server is up and warmed it also
+# waits until io pressure (some avg10) is under 2 for 30 s, at most 5 min, so the tape's start edge reads uncontended.
+# Why: the third sitting's tape (n6000) finished the answer but toktape marked it `contended: yes` (io pressure 7.98 > 5 at the start edge, this run's own
+# preheat and load); this re-record changes only that start condition. Before that: the first sitting (N 1500) and the second (N 4000, a peer's rustc/LLVM build beside it, loadavg 2 -> 16) never produced a finished answer;
+# the thought ran 3986 tokens and the answer had just begun at the 4000 cap.
+# Placement [read from the serve print]: `place=a`, A6000 only, 12032 of 12032 experts on the card, host_experts=0, slots=1, graph_nodes=1378.
+# Host DRAM, PCIe and NVMe carry nothing per token; the decode step is the card's node latency (inter-token median 12.4 ms in all three
+# earlier tapes against a 3.3 ms weight-byte floor), so wall = the card.
+# Measured inputs [lease runs, 2026-10-27]: median inter-token 12.36 / 12.45 / 12.37 ms; means 79.7 (N 1500, loadavg 4 -> 12), 75.8 and 76.4 (loadavg
+# 2 -> 16 and 10 -> 16); prefill 811 / 824 / 814 tok/s, TTFT 6607 / 6498 / 6575 ms at 5342 prompt tokens; the first 3986 tokens are thinking.
+# Predictions [derived]. Greedy, same prompt and sha: reasoning_n 3986 exactly (the n4000 tape's thought ended with `Let's final.`), content 150..350 tokens
+# (8 short bullets and 3 settings), finish stop at 4140..4340 tokens, well under 6000. Prefill 810..830 tok/s, TTFT 6.5..6.6 s. Decode on a quiet box: the
+# median 12.4 ms = 80.6 tok/s, less the KV growth (14 x 2048 B per extra row, 0.13 ms between depth 6.1K and 9.5K = 1 %), mean 78.5..80.3 tok/s;
+# if the box stays loaded the mean falls toward 76 as in the second sitting while the median stays 12.4 ms.
+# The third tape's figures repeat: decode 80.2 tok/s, prefill 823 tok/s, TTFT 6506 ms, reasoning 3986, content 277; the same greedy tokens are predicted again,
+# decode 79.5..80.5, prefill 815..830, TTFT 6.45..6.6 s, and `contended: no`. The one term the derivation cannot fix: how long the box takes to go quiet and
+# how long io pressure takes to fall after the load (a few seconds to minutes); the card pays it as hold minutes.
+# Wall [derived]: quiet wait 0..20 min + preheat 5..17 s + load 10..12 s + warm-ups ~4 s + the tape (TTFT 6.5 s + 4140..4340 tokens / 79 tok/s = 59..62 s)
+# + io wait 30 s..5 min + stop ~2 s + the publish dry-run ~3 s = about 2.1 min plus the waits: 2..27 minutes, under the script's 1700 s bound.
+kind: exclusive
+reason: the lead asked for a Flint clip whose answer completes (2026-10-27): the second tape's answer began at token 3987 and the cap cut it;
+  per-token times are the clip, so the box must be quiet (a build beside it moved the second sitting's means); the file is 25.05 GB, all of it on
+  the A6000, one fresh load and three requests
+minutes: 2..27

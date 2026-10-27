@@ -37,7 +37,7 @@
 //! The two-card arm (`--arm bp`, `just gate-gpu-minimaxm3-twocard` under `BLOOMERY_CARD=both`): plan (b′) (the A6000 the
 //! stage card, the 3090 an expert tier holding each layer's next ids after the stage's prefix, the host the rest), planned
 //! under one card budget no environment moves (`seat::TWO_BUDGET`), in the real tier only. Before the common clauses it holds, against the reference — the plan with every tier segment on the stage card
-//! (`tier_twocard::union_plan`), the A6000 alone, opened first and released:
+//! (`model::placement::union_plan`), the A6000 alone, opened first and released:
 //! - `two_card_load`: the plan puts experts on the tier, and the load's tier opened on the 3090 beside the stage card with
 //!   the plan's experts on each layer;
 //! - `two_card_first_tokens_are_union`: [`TWO_WALK`] decode steps of the walk read the reference's ids and logits rows bit
@@ -490,12 +490,7 @@ mod gate {
     ) -> Result<(), GateError> {
         // The walk's positions too: the reference and the two-card load hold the same cache rows.
         let ctx = ctx.max(TWO_WALK + 1);
-        let mut two = seat::two_card(
-            path,
-            (ctx, tier_now),
-            (TWO_WALK, crate::e2e::walk),
-            crate::tier_twocard::union_plan,
-        )?;
+        let mut two = seat::two_card(path, (ctx, tier_now), (TWO_WALK, crate::e2e::walk))?;
         let (pass, layers) = two_card_clauses(&mut two)?;
         let mut loaded = two.loaded;
         let dims = loaded.dims();

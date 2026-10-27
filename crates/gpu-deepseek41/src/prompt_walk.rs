@@ -214,7 +214,14 @@ impl BatchBufs {
         })?;
         let stream = gpu.stream();
         let sets = group_sets(group);
-        Ok(Self {
+        let expected = model::placement::kernels::ffn::PromptWalk {
+            hidden: embd as u64,
+            sets: sets as u64,
+        }
+        .bytes(t_max as u64)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| GpuError::shape("prompt batch buffers", "buffer geometry overflows"))?;
+        let buffers = Self {
             group,
             t_max,
             units: (0..sets)
@@ -225,7 +232,14 @@ impl BatchBufs {
             stream: PromptStream::default(),
             facts: None,
             timing: None,
-        })
+        };
+        if buffers.bytes() != expected {
+            return Err(GpuError::shape(
+                "prompt batch buffers",
+                format!("allocated {} bytes, planned {expected}", buffers.bytes()),
+            ));
+        }
+        Ok(buffers)
     }
 
     /// What the next prompt calls move (`BLOOMERY_XSTREAM`), behind the guards every family shares

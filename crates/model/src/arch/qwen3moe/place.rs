@@ -53,6 +53,7 @@ pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError>
         hp.experts.n_used as u64,
         (TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
         leg_down_forms(PROGRAM, &inputs.model),
+        false,
     )
 }
 

@@ -8,7 +8,9 @@
 use cuda_core::DeviceBuffer;
 use model::arch::place_hybrid::{RingForms, ring_pass_bytes_in};
 
+use crate::card_leg::ExpertInput;
 use crate::card_leg::{RouteBlock, RouteIo};
+use crate::expert_input::Protection;
 use crate::gemm::{Gemm32Kernels, GemmAct, GemmAct32, GemmKernels, GemmRoute};
 use crate::host::xstream::LandBatch;
 use crate::kquant::Act;
@@ -50,6 +52,8 @@ pub(crate) struct RingGemm {
     h: Rows,
     route: GemmRoute,
     cap: usize,
+    slots: usize,
+    protection: Option<Protection>,
 }
 
 impl RingGemm {
@@ -72,6 +76,8 @@ impl RingGemm {
             h: Rows::new(gpu, slots, ff, forms.down32)?,
             route: GemmRoute::new(stream, slots, half_slots)?,
             cap,
+            slots,
+            protection: None,
         };
         let want = ring_pass_bytes_in(cap, n_used, n, ff, half_slots, forms);
         if ring.bytes() != want {
@@ -87,6 +93,21 @@ impl RingGemm {
         Ok(ring)
     }
 
+    pub(crate) fn set_expert_input(
+        &mut self,
+        gpu: &Gpu,
+        policy: ExpertInput,
+    ) -> Result<(), GpuError> {
+        match policy {
+            ExpertInput::Direct => self.protection = None,
+            ExpertInput::AmaxF16 if self.protection.is_none() => {
+                self.protection = Some(Protection::new(gpu, self.slots)?);
+            }
+            ExpertInput::AmaxF16 => {}
+        }
+        Ok(())
+    }
+
     /// Device bytes of the buffers.
     pub(crate) fn bytes(&self) -> usize {
         self.x.bytes()
@@ -94,6 +115,7 @@ impl RingGemm {
             + self.u.num_bytes()
             + self.h.bytes()
             + self.route.bytes()
+            + self.protection.as_ref().map_or(0, Protection::bytes)
     }
 
     /// The slots of the half the buffers were made for.
@@ -148,7 +170,13 @@ impl RingGemm {
     ) -> Result<(), GpuError> {
         let stream = gpu.stream();
         let RingGemm {
-            x, g, u, h, route, ..
+            x,
+            g,
+            u,
+            h,
+            route,
+            protection,
+            ..
         } = self;
         batch.with_map(gpu.context(), n_expert, |row| {
             g32.enqueue_route_remap(stream, ids, row, n_slots, &mut *route, fault)
@@ -164,7 +192,7 @@ impl RingGemm {
             Rows::Q128(a) => (Some(&mut **a), None),
             Rows::Blocks32(a) => (None, Some(&mut **a)),
         };
-        blk.enqueue_rule(
+        blk.enqueue_input(
             gpu,
             (gemm, g32),
             (&*route, top_k),
@@ -181,6 +209,7 @@ impl RingGemm {
                 },
                 rule,
             ),
+            protection.as_mut(),
             fault,
         )
     }

@@ -56,7 +56,7 @@ the tested toolkit, answer 7) with LLVM 21.1.8's ARM64 release `llc` named by `C
 for example:
 
 ```sh
-cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
+cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
 ```
 
 Recipes select `sm_121a` on a GB10 when `BLOOMERY_ARCH` is unset. This enables the existing native FP4 routed prompt

@@ -83,6 +83,9 @@ pub enum RouterBody {
     /// `mimo2_router*`, `sigmoid_320_8_router*`, `sigmoid_128_4_router*`;
     /// `gpu/src/arch/nemotron_h_moe/router.rs` `nemotron_moe_router_*`.
     BiasedSigmoid,
+    /// `gpu/src/route_body.rs` `sigmoid_floor_256_6_router*`: sigmoid,
+    /// optional selection-only bias and a fixed `2^-14` selected-sum floor.
+    SigmoidFloor,
 }
 
 /// One compiled router instance.
@@ -159,6 +162,16 @@ const BIASED_SIGMOID: RouterRule = RouterRule {
     bias: true,
     norm: RouterNorm::SelectedSum,
     gated: false,
+};
+const SIGMOID_FLOOR: RouterRule = RouterRule {
+    score: Score::Sigmoid,
+    bias: false,
+    norm: RouterNorm::SelectedSumFloor,
+    gated: false,
+};
+const BIASED_SIGMOID_FLOOR: RouterRule = RouterRule {
+    bias: true,
+    ..SIGMOID_FLOOR
 };
 const BIASED_SQRT_SOFTPLUS: RouterRule = RouterRule {
     score: Score::SqrtSoftplus,
@@ -325,6 +338,24 @@ pub const ROUTERS: &[RouterInst] = &[
         top_k_min: 6,
         top_k_max: 6,
         at: "gpu/src/route_body.rs sigmoid_256_6_router*",
+    },
+    RouterInst {
+        body: RouterBody::SigmoidFloor,
+        rule: SIGMOID_FLOOR,
+        norm_arg: false,
+        experts: 256,
+        top_k_min: 6,
+        top_k_max: 6,
+        at: "gpu/src/route_body.rs sigmoid_floor_256_6_router*",
+    },
+    RouterInst {
+        body: RouterBody::SigmoidFloor,
+        rule: BIASED_SIGMOID_FLOOR,
+        norm_arg: false,
+        experts: 256,
+        top_k_min: 6,
+        top_k_max: 6,
+        at: "gpu/src/route_body.rs sigmoid_floor_256_6_router*",
     },
     // Muse Spark's fixture: 16 experts, the real file's top 8.
     RouterInst {
@@ -531,6 +562,31 @@ pub const fn router_row_k(body: RouterBody, experts: u32, top_k: u32) -> RouterI
     panic!("no router row for this body at this width and pick count")
 }
 
+/// A compiled binding whose body, rule, expert count and pick count all
+/// agree. Unlike [`router_row_k`], distinguishes optional-bias bindings.
+#[must_use]
+pub const fn router_row_rule(
+    body: RouterBody,
+    rule: RouterRule,
+    experts: u32,
+    top_k: u32,
+) -> RouterInst {
+    let mut i = 0;
+    while i < ROUTERS.len() {
+        let r = ROUTERS[i];
+        if body_eq(r.body, body)
+            && r.runs(rule)
+            && r.experts == experts
+            && r.top_k_min <= top_k
+            && top_k <= r.top_k_max
+        {
+            return r;
+        }
+        i += 1;
+    }
+    panic!("no router row for this body, rule, width and pick count")
+}
+
 /// Whether row `r` is body `body` at `per_lane`, with rule `rule` and the
 /// pick range `min..=max`: the whole of what a device crate compiled in.
 #[must_use]
@@ -564,6 +620,11 @@ pub mod rules {
     /// Sigmoid scores, a selection bias steering the choice only, the kept
     /// unbiased scores renormalized: GLM-5.3's and MiMo-V2's noaux_tc router.
     pub const BIASED_SIGMOID: RouterRule = super::BIASED_SIGMOID;
+    /// Sigmoid, no selection bias, selected scores divided by
+    /// `max(sum_selected, 2^-14)`.
+    pub const SIGMOID_FLOOR: RouterRule = super::SIGMOID_FLOOR;
+    /// [`SIGMOID_FLOOR`] with a bias steering selection only.
+    pub const BIASED_SIGMOID_FLOOR: RouterRule = super::BIASED_SIGMOID_FLOOR;
 }
 
 const fn norm_eq(a: RouterNorm, b: RouterNorm) -> bool {
@@ -890,8 +951,8 @@ pub const fn gqa_row(head: u32, group: u32) -> Option<GqaInst> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttnShape, GQA, GroupRule, LANE_PICKS, MoeShape, ROUTERS, Refusal, RouterInst, RouterRule,
-        Shape, gqa_row_v, router_row, router_row_is, router_row_k, rules, select_gqa,
+        AttnShape, GQA, GroupRule, LANE_PICKS, MoeShape, ROUTERS, Refusal, RouterBody, RouterInst,
+        RouterRule, Shape, gqa_row_v, router_row, router_row_is, router_row_k, rules, select_gqa,
         select_router,
     };
     use crate::{Act, Moe, Router, RouterNorm, Score, Shared};
@@ -954,66 +1015,74 @@ mod tests {
         assert!(matches!(e.why, Refusal::RouterWidth { ref served } if served == &[128]));
     }
 
+    /// Legacy rows retain their epsilon-added or unnormalized arithmetic;
+    /// only the real floor binding accepts the floor policy.
     #[test]
-    fn a_selected_sum_floor_is_not_a_legacy_device_policy() {
+    fn floor_bindings_are_distinct_from_legacy_policies() {
         for row in ROUTERS {
-            let rule = RouterRule {
-                norm: RouterNorm::SelectedSumFloor,
-                ..row.rule
-            };
             assert_eq!(
                 select_router(moe(row.rule, row.experts(), row.top_k_min)).unwrap(),
                 *row
             );
-            assert!(!row.runs(rule));
-            assert!(!router_row_is(
-                *row,
-                rule,
-                row.norm_arg,
-                (row.top_k_min, row.top_k_max)
-            ));
-            let shape = moe(rule, row.experts(), row.top_k_min);
-            let refusal = select_router(shape).expect_err("a legacy body bound the floor policy");
-            assert_eq!(refusal.shape, Shape::Moe(shape));
-            assert_eq!(refusal.why, Refusal::NoRouterRule);
+            if row.body == RouterBody::SigmoidFloor {
+                assert_eq!(row.rule.norm, RouterNorm::SelectedSumFloor);
+                assert!(!row.norm_arg);
+            } else {
+                assert!(!row.runs(RouterRule {
+                    norm: RouterNorm::SelectedSumFloor,
+                    ..row.rule
+                }));
+            }
         }
     }
 
-    /// Flint's sigmoid top-six is not the biased top-eight binding, and no
-    /// compiled body runs its rule: the 256-expert top-6 instance runs the
-    /// biased sigmoid with the epsilon-added `SelectedSum`, so every other
-    /// pair of bias and policy, Flint's `SelectedSumFloor` with or without a
-    /// selection bias among them, is refused by name.
-    // PIN(2026-10-25): the biased `SelectedSum` pair was refused as
-    // `TopK { min: 8, max: 8 }` while only MiMo's top-8 row held 256 experts;
-    // the `sigmoid_256_6` instance's row now serves exactly that pair
-    // (`sigmoid_256_6_router_is_its_row_beside_mimos_top_8` pins its identity).
-    // The other five pairs keep `NoRouterRule`.
     #[test]
-    fn flints_sigmoid_top_six_is_not_the_biased_top_eight_binding() {
+    fn floor_top_six_serves_both_bias_modes_and_only_its_shape() {
         for bias in [false, true] {
-            for norm in [
-                RouterNorm::None,
-                RouterNorm::SelectedSum,
-                RouterNorm::SelectedSumFloor,
-            ] {
-                let rule = RouterRule {
-                    bias,
-                    norm,
-                    ..rules::BIASED_SIGMOID
+            let rule = RouterRule {
+                bias,
+                ..rules::SIGMOID_FLOOR
+            };
+            let row = select_router(moe(rule, 256, 6)).unwrap();
+            assert_eq!(row.body, RouterBody::SigmoidFloor);
+            assert_eq!(row.rule, rule);
+            for top_k in [0, 5, 7, 8, 257] {
+                assert_eq!(
+                    select_router(moe(rule, 256, top_k)).unwrap_err().why,
+                    Refusal::TopK { min: 6, max: 6 }
+                );
+            }
+            assert!(matches!(
+                select_router(moe(rule, 128, 6)).unwrap_err().why,
+                Refusal::RouterWidth { ref served } if served == &[256]
+            ));
+            for (score, gated) in [(Score::Softmax, false), (Score::Sigmoid, true)] {
+                let wrong = RouterRule {
+                    score,
+                    gated,
+                    ..rule
                 };
-                let selected = select_router(moe(rule, 256, 6));
-                if bias && norm == RouterNorm::SelectedSum {
-                    assert!(
-                        selected.is_ok(),
-                        "the 256/6 instance's own rule: {selected:?}"
-                    );
-                    continue;
-                }
-                let refusal = selected.expect_err("a sigmoid top-six binding was fabricated");
-                assert_eq!(refusal.why, Refusal::NoRouterRule);
+                assert_eq!(
+                    select_router(moe(wrong, 256, 6)).unwrap_err().why,
+                    Refusal::NoRouterRule
+                );
             }
         }
+        let legacy = select_router(moe(rules::BIASED_SIGMOID, 256, 6)).unwrap();
+        assert_eq!(legacy.body, RouterBody::BiasedSigmoid);
+        assert_eq!(
+            select_router(moe(
+                RouterRule {
+                    norm: RouterNorm::SelectedSum,
+                    ..rules::SIGMOID_FLOOR
+                },
+                256,
+                6
+            ))
+            .unwrap_err()
+            .why,
+            Refusal::NoRouterRule
+        );
     }
 
     /// GLM-5.3-Flash (model/tests/glm5next_meta.rs:83, "router: sigmoid, 288
@@ -1275,9 +1344,7 @@ mod tests {
         assert_eq!(MoeShape::of(&m).rule, rules::SOFTMAX_NORM);
     }
 
-    /// Rows are distinct instances: no two rows run one rule at one width
-    /// and one pick count, and one body holds two rows at a width only by
-    /// disjoint pick ranges.
+    /// No two rows select the same rule, expert width and pick count.
     #[test]
     fn no_two_router_rows_overlap() {
         for (i, a) in ROUTERS.iter().enumerate() {
@@ -1285,12 +1352,6 @@ mod tests {
                 let picks = a.top_k_min <= b.top_k_max && b.top_k_min <= a.top_k_max;
                 let overlap = a.experts == b.experts && (a.runs(b.rule) || b.runs(a.rule)) && picks;
                 assert!(!overlap, "{} and {}", a.at, b.at);
-                assert!(
-                    !((a.body, a.experts) == (b.body, b.experts) && picks),
-                    "{} and {}",
-                    a.at,
-                    b.at
-                );
             }
             assert!(a.top_k_min >= 1 && a.top_k_min <= a.top_k_max, "{}", a.at);
             assert!(a.per_lane() >= 1 && a.per_lane() <= 32, "{}", a.at);

@@ -142,6 +142,7 @@ pub fn tier_batch(inputs: &PlanInputs, cols: u64) -> Result<TierBatchBytes, Plac
         hp.experts.n_used as u64,
         (TIER_CHUNK, cols),
         accepts::leg_down_forms(Program::MiniMaxM3Body, &inputs.model),
+        false,
     )
 }
 

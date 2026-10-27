@@ -30,6 +30,7 @@ use model::arch::models::{LayerSpec, Moe};
 use model::arch::musespark::place::{self, PlanInputs};
 use model::moe::HostLayer;
 use model::placement::ModelTensors;
+use model::placement::accepts::Program;
 use model::r8file::R8Source;
 
 use crate::card_slots::{CardAcc, CardSlotKernels, ColPlaces};
@@ -87,7 +88,7 @@ impl LegFamily for MuseSpark {
             n_used: hp.n_used,
             n_embd: hp.latent,
             ff: hp.expert_width(),
-            program: model::placement::accepts::Program::MuseSparkBody,
+            program: Program::MuseSparkBody,
         }
     }
 

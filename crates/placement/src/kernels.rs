@@ -16,6 +16,9 @@ pub use gguf::card::{
 };
 use models::Role;
 
+pub mod attention;
+pub mod ffn;
+
 /// The common card gate·up `_sel` entry that runs a stack of type `ty`.
 #[must_use]
 pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
@@ -984,7 +987,6 @@ mod tests {
             assert_eq!(held(f), [ty], "{f:?}");
         }
     }
-
     /// A card entry reads a layout the card loader can build: every type a
     /// row names has a [`CardFormat`] of its own, or is one of the file-block
     /// types a program's routed stack keeps as `KQuant`.

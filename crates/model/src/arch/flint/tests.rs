@@ -3,7 +3,7 @@ use crate::arch::synthetic::{V, header_shaped};
 use crate::placement::PlacementError;
 use models::{Ffn, Mixer, Need, RopeMode};
 
-fn keys() -> Vec<(&'static str, V)> {
+pub(super) fn keys() -> Vec<(&'static str, V)> {
     vec![
         ("block_count", V::U32(4)),
         ("embedding_length", V::U32(16)),
@@ -36,7 +36,7 @@ fn keys() -> Vec<(&'static str, V)> {
     ]
 }
 
-fn tensors() -> Vec<(String, Vec<u64>)> {
+pub(super) fn tensors() -> Vec<(String, Vec<u64>)> {
     let mut out = vec![
         ("token_embd.weight".into(), vec![16, 2]),
         ("output.weight".into(), vec![16, 2]),
@@ -76,7 +76,7 @@ fn tensors() -> Vec<(String, Vec<u64>)> {
     out
 }
 
-fn check(
+pub(super) fn check(
     tag: &str,
     keys: &[(&str, V)],
     tensors: &[(String, Vec<u64>)],
@@ -161,12 +161,6 @@ fn masks_are_independent_and_nope_still_requires_head_norm() {
             .filter(|(n, _)| matches!(n, Need::Gqa { sinks: true, .. }))
             .count(),
         4
-    );
-    assert!(crate::arch::coverage::program_of(r.spec.arch).is_none());
-    assert!(
-        crate::arch::coverage::check(&r.spec, &r.tensors)
-            .iter()
-            .any(|item| item.feature == Need::Program("flint").to_string())
     );
 }
 
@@ -283,10 +277,15 @@ fn normalization_policy_is_architecture_specific_and_bias_is_selection_only() {
                 let shape = models::shape::MoeShape::of(m);
                 assert_eq!(shape.rule.norm, expected);
                 assert_eq!(shape.rule.bias, bias);
-                assert_eq!(
-                    models::shape::select_router(shape).unwrap_err().why,
-                    models::shape::Refusal::NoRouterRule
-                );
+                let refusal = models::shape::select_router(shape).unwrap_err().why;
+                if norm {
+                    assert!(matches!(
+                        refusal,
+                        models::shape::Refusal::RouterWidth { ref served } if served == &[256]
+                    ));
+                } else {
+                    assert_eq!(refusal, models::shape::Refusal::NoRouterRule);
+                }
                 assert!(
                     uncovered
                         .iter()

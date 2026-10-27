@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use gguf::Split;
 use model::moe::{HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
-use model::ops::PostNorm;
+use model::ops::{ExpertInput, PostNorm};
 use model::r8file::{R8Pair, R8Source};
 use model::{Tensor2, Tensor2View};
 
@@ -174,6 +174,9 @@ impl HostRun {
                     scratch.len() - 1
                 }
             };
+            if view.expert_input() == ExpertInput::AmaxF16 {
+                scratch[scratch_of[l]].set_expert_input(ExpertInput::AmaxF16);
+            }
             layers[l] = Some(view);
         }
         Ok(HostRun {
@@ -257,13 +260,15 @@ impl HostRun {
             .scratch
             .iter()
             .map(|s| {
-                if cols <= UNION_MAX_COLS {
+                let mut union = if cols <= UNION_MAX_COLS {
                     UnionScratch::new_routed(embd, s.ff(), cols, n_used)
                 } else {
                     let groups = cols.div_ceil(UNION_MAX_COLS);
                     let slots = groups * UNION_MAX_COLS * n_used;
                     UnionScratch::new_tail(embd, s.ff(), groups, slots, n_used)
-                }
+                }?;
+                union.set_expert_input(s.expert_input());
+                Ok::<_, model::ModelError>(union)
             })
             .collect::<Result<_, _>>()?;
         Ok(())

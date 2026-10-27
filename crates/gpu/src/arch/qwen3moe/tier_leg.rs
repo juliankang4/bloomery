@@ -1,8 +1,7 @@
 //! The Qwen3-30B and Qwen3.6 expert tier: one card beside the stage card,
 //! hung through the common card leg ([`crate::host::leg_tier`]). What is
-//! Qwen's here is the node family — the file's reading, `silu(g)·u`, and the
-//! placed leg's arms — and the join of the tier's slots with the stage
-//! card's.
+//! Qwen's here is the node family — the file's reading and `silu(g)·u` —
+//! and the join of the tier's slots with the stage card's.
 //!
 //! The join is the host leg's combine (`hostleg`) with the tier's slots in
 //! the same slot order. A slot the stage card holds is the stage card's down;

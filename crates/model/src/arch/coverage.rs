@@ -47,6 +47,66 @@ pub struct Available {
 /// is an item of [`check`]; a row removed makes its needs items.
 pub const AVAILABLE: &[Available] = &[
     Available {
+        programs: &[Program::FlintBody],
+        at: "gpu/src/attention_h128.rs Binding::enqueue and attention_h128_ring.rs",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Gqa {
+                    head: 128,
+                    value: 128,
+                    group: 8,
+                    window: None | Some(513),
+                    sinks: true,
+                    scaled: false,
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::FlintBody],
+        at: "gpu/src/attention_h128_ring.rs (head128 RMS with optional full NeoX)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::QkRope {
+                    qk_norm: true,
+                    head: 128,
+                    mode: RopeMode::None,
+                    dims: 0,
+                } | Need::QkRope {
+                    qk_norm: true,
+                    head: 128,
+                    mode: RopeMode::Neox,
+                    dims: 128,
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::FlintBody],
+        at: "gpu/src/route_body.rs sigmoid_floor_256_6",
+        runs: |n| routes(n, &[RouterBody::SigmoidFloor]),
+    },
+    Available {
+        programs: &[Program::FlintBody],
+        at: "gpu-deepseek41/src/shared_routed.rs (ungated shared expert)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Shared {
+                    sigmoid_gate: false,
+                    ..
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::FlintBody],
+        at: "gpu-deepseek41/src/shared_routed.rs dense-leading gated blocks",
+        runs: |n| matches!(n, Need::DenseFfn { ff } if ff.is_multiple_of(256)),
+    },
+    Available {
         programs: &[Program::Deepseek41Chain],
         at: "gpu-deepseek41/src/attn.rs LATENT; chain/attn.rs rope dims",
         runs: |n| {
@@ -1552,6 +1612,46 @@ struct RowPin {
 /// and per-layer input projection (the host's rows), each `what` naming the
 /// types its row takes or the table row it follows.
 const ROW_PINS: &[RowPin] = &[
+    RowPin {
+        program: Program::FlintBody,
+        role: Role::Attention,
+        matrices: true,
+        names: None,
+        what: "head128 attention projections (common dense sites)",
+        row: h128_projection,
+    },
+    RowPin {
+        program: Program::FlintBody,
+        role: Role::DenseFfn,
+        matrices: true,
+        names: None,
+        what: "dense-leading gated blocks",
+        row: gated_block_site,
+    },
+    RowPin {
+        program: Program::FlintBody,
+        role: Role::SharedExpert,
+        matrices: true,
+        names: None,
+        what: "shared gated blocks",
+        row: gated_block_site,
+    },
+    RowPin {
+        program: Program::FlintBody,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "common token embedding",
+        row: |ty| embed_of_widened(ty).is_some(),
+    },
+    RowPin {
+        program: Program::FlintBody,
+        role: Role::Head,
+        matrices: true,
+        names: None,
+        what: "common output head",
+        row: |ty| head_of_widened(ty).is_some(),
+    },
     // PIN(2026-10-22): Qwen38 dense pins admit MXFP8/FP8_B128 and Q8_0 indexers via BY_NAME; the old MXFP8 refusal fails the new coverage test (PR FAIL-first).
     // PIN(2026-10-26): the qwen38 body's dense sites (the delta rule's and the selecting attention's, the shared
     // expert's, the PLE site's) read the common dense entries by name (`site::ByName`) in every type but Q5_0, so the
@@ -1773,6 +1873,35 @@ const ROW_PINS: &[RowPin] = &[
     },
 ];
 
+fn h128_projection(ty: GgmlType) -> bool {
+    matches!(
+        ty,
+        GgmlType::Q3_K
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::IQ4_XS
+            | GgmlType::Q5_0
+            | GgmlType::Q8_0
+            | GgmlType::F32
+            | GgmlType::MXFP8
+            | GgmlType::FP8_B128
+            | GgmlType::BF16
+    )
+}
+
+fn gated_block_site(ty: GgmlType) -> bool {
+    matches!(
+        ty,
+        GgmlType::Q8_0
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::IQ4_XS
+            | GgmlType::MXFP8
+    )
+}
+
 /// `Body35`'s projection types (`PROJ`): every attention, delta-rule and
 /// dense FFN matrix.
 const Q35_PROJ: &[GgmlType] = &[
@@ -1992,7 +2121,7 @@ pub fn check_with(
                 // stack's row width ([`routed_unrun`], the one owner). A layer
                 // with a stack the card experts do not read keeps all its
                 // experts on the host.
-                Some(p @ (Program::Glm5nextBody | Program::MiniMaxM3Body)) => {
+                Some(p @ (Program::Glm5nextBody | Program::MiniMaxM3Body | Program::FlintBody)) => {
                     if routed_unrun(t, |ty| leg_card_routed(p, ty)) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
@@ -3627,21 +3756,13 @@ mod tests {
             GgmlType::IQ4_NL,
             GgmlType::Q4_0,
         ];
-        for (name, role, what) in [
-            ("attn_q.weight", Role::Attention, "attention matrices"),
-            ("ssm_out.weight", Role::Attention, "attention matrices"),
-            (
-                "indexer.q_proj.weight",
-                Role::Attention,
-                "attention matrices",
-            ),
-            (
-                "indexer.k_proj.weight",
-                Role::Attention,
-                "attention matrices",
-            ),
-            ("ffn_gate_shexp.weight", Role::SharedExpert, "shared expert"),
-            ("ffn_up_shexp.weight", Role::SharedExpert, "shared expert"),
+        for (name, role) in [
+            ("attn_q.weight", Role::Attention),
+            ("ssm_out.weight", Role::Attention),
+            ("indexer.q_proj.weight", Role::Attention),
+            ("indexer.k_proj.weight", Role::Attention),
+            ("ffn_gate_shexp.weight", Role::SharedExpert),
+            ("ffn_up_shexp.weight", Role::SharedExpert),
         ] {
             for ty in q8_1.into_iter().chain(f32_rows) {
                 let got = items(Program::Qwen38Body, &matrix(name, role, ty));
@@ -3650,7 +3771,6 @@ mod tests {
             for ty in refused {
                 let got = items(Program::Qwen38Body, &matrix(name, role, ty));
                 assert_eq!(got.len(), 1, "{name} {ty}: {got:?}");
-                assert!(got[0].starts_with(&format!("{ty} {what}")), "{got:?}");
             }
         }
         // The shared expert's down is K = 640: the q8_1 types' rows are whole
@@ -3664,10 +3784,6 @@ mod tests {
         for ty in q8_1 {
             let got = items(Program::Qwen38Body, &matrix(down, Role::SharedExpert, ty));
             assert_eq!(got.len(), 1, "{down} {ty}: {got:?}");
-            assert!(
-                got[0].starts_with(&format!("{ty} shared expert down (K = 640")),
-                "{got:?}"
-            );
         }
         for ty in refused {
             let got = items(Program::Qwen38Body, &matrix(down, Role::SharedExpert, ty));

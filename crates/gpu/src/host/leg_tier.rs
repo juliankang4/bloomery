@@ -40,7 +40,7 @@ use super::run::{HostRun, HostWidths};
 use super::tier::{
     TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet, TierShape,
 };
-use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, STACK_ROLES};
+use crate::card_leg::{CardLeg, ExpertInput, LegBufs, LegRun, LegShape, LegStacks, STACK_ROLES};
 use crate::hybrid::{Hybrid, SlotMap};
 use crate::kquant::Act;
 use crate::model::CardBytes;
@@ -239,12 +239,11 @@ impl LegTier {
             };
             let stacks = LegStacks::of_arms(w, layer.names(), arms, STACK_ROLES)?;
             stacks.check(k, shape)?;
-            let (_, form) = kernels::down(stacks.down_ty()).ok_or_else(|| GpuError::Tensor {
-                what: WHAT,
-                name: layer.names[2].clone(),
-                need: "a down stack of a type the kernel table names a down entry for",
-            })?;
-            downs = downs.with(form);
+            let (_, act) = kernels::down(stacks.down_ty()).ok_or(GpuError::state(
+                WHAT,
+                "the selected tier down's activation form",
+            ))?;
+            downs = downs.with(act);
             cfg.push(Some(layer));
         }
         Ok(LegTier {
@@ -256,8 +255,12 @@ impl LegTier {
             arms,
         })
     }
-}
 
+    /// Select the loaded policy shared by stage-card and tier-card experts.
+    pub fn set_expert_input(&mut self, gpu: &Gpu, policy: ExpertInput) -> Result<(), GpuError> {
+        self.bufs.set_expert_input(gpu, policy)
+    }
+}
 /// Layer `layer`'s tier experts of `cfg` (the tier's layers from
 /// `layers.start`); a layer the tier holds none of is refused by name as
 /// `what`.
@@ -344,7 +347,6 @@ impl TierExperts for LegTier {
         io: TierIo<'_>,
     ) -> Result<(), GpuError> {
         const W: &str = "LegTier::enqueue_layer";
-        let arms = self.arms;
         let tl = layer_of(&self.layers, &self.cfg, layer, W)?;
         let TierInput::F32(x) = io.act else {
             return Err(GpuError::Shape {
@@ -353,7 +355,7 @@ impl TierExperts for LegTier {
                     .to_string(),
             });
         };
-        let stacks = LegStacks::of_arms(weights, tl.names(), arms, STACK_ROLES)?;
+        let stacks = LegStacks::of_arms(weights, tl.names(), self.arms, STACK_ROLES)?;
         let run = LegRun {
             layer,
             stacks: &stacks,
@@ -502,6 +504,11 @@ pub trait LegFamily {
     /// The file as the family's placement reads it.
     type Inputs;
 
+    /// The loaded down-input policy, shared with the stage card and host.
+    fn expert_input(_inputs: &Self::Inputs) -> ExpertInput {
+        ExpertInput::Direct
+    }
+
     /// `file` read as the family's placement reads it; its refusals are
     /// the family's.
     fn describe(file: &Split) -> Result<Self::Inputs, GpuError>;
@@ -592,7 +599,7 @@ fn node_experts<F: LegFamily>(
     let inputs = node_inputs::<F>(file, open)?;
     let widths = F::widths(&inputs);
     let shape = widths.shape(F::CHUNK);
-    Ok(Box::new(LegTier::new(
+    let mut tier = LegTier::new(
         gpu,
         F::layers(&inputs),
         &open.set,
@@ -600,7 +607,9 @@ fn node_experts<F: LegFamily>(
         shape,
         widths.program,
         F::tier_act,
-    )?))
+    )?;
+    tier.set_expert_input(gpu, F::expert_input(&inputs))?;
+    Ok(Box::new(tier))
 }
 
 fn node_host<F: LegFamily>(file: Arc<Split>, open: &NodeOpen) -> Result<HostRun, GpuError> {
@@ -618,8 +627,12 @@ fn node_host<F: LegFamily>(file: Arc<Split>, open: &NodeOpen) -> Result<HostRun,
             n_used: w.n_used,
         },
         |src| {
-            F::routed_views(src, &inputs, run)
-                .map_err(|e| GpuError::shape(F::WHAT, format!("the node host run's views: {e}")))
+            let mut views = F::routed_views(src, &inputs, run)
+                .map_err(|e| GpuError::shape(F::WHAT, format!("the node host run's views: {e}")))?;
+            for layer in &mut views {
+                layer.set_expert_input(F::expert_input(&inputs));
+            }
+            Ok::<_, GpuError>(views)
         },
     )
 }

@@ -626,7 +626,10 @@ gguf 7 2 0
 # PIN(2026-10-26): gpu 2691 -> 2693 blocks, the six-slot F32 tier entry adds two blocks:
 # ffn_handoff_6_tier calls handoff_at and handoff_tier_at under its checked launch contract;
 # both blocks state their per-thread bounds and disjoint-write SAFETY invariant.
-gpu 2693 346 10
+# PIN(2026-10-27): gpu 2693 -> 2748 blocks, 346 -> 350 fns: the existing Flint head128 ring
+# attention, floor router and expert-input scaling retain their checked SAFETY contracts over
+# main's new kernels; the six-slot entry is already included above. Counted by check-unsafe.sh.
+gpu 2748 350 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -653,7 +656,12 @@ gpu 2693 346 10
 # selector partials of dense.rs and experts.rs, `q5k_lane_partial`'s calls and their row stores) and the glue's Q5_K
 # token rows and IQ4_NL Engram rows (glue.rs: the value reads, the stream and input stores, the shared module), each
 # with its SAFETY line; counted by tools/check-unsafe.sh.
-gpu-deepseek41 395 44 0
+# PIN(2026-10-26): gpu-deepseek41 395 -> 397 blocks: the configured residual module load
+# and its checked row launch retain their SAFETY invariants over main's ISTA entries.
+gpu-deepseek41 397 44 0
+# PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
+# call the checked common attention binding with staged distinct positions, each with SAFETY.
+gpu-flint 2 0 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.
@@ -719,7 +727,9 @@ gpu-deepseek41 395 44 0
 # and the host flag's drop once the stream that waited on it is drained, each with its SAFETY line.
 # PIN(2026-10-24): gpu-gates 103 -> 104 blocks, new code, not old code relaxed: gate_qwen35moe_attn's launch of the
 # head-256 append at no query head over the rows rope_gate::run checks distinct, with its SAFETY line.
-gpu-gates 104 5 1
+# PIN(2026-10-24): gpu-gates 104 -> 106 blocks: ring-attention consumers launch
+# checked distinct positions and bounded chunks under their stated SAFETY invariants.
+gpu-gates 106 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of

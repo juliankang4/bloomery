@@ -27,7 +27,7 @@ use gguf::Split;
 use model::arch::minimaxm3::hparams::FfnKind;
 use model::arch::minimaxm3::place::PlanInputs;
 use model::placement::workstation::{self, HostRead, PLAN_ROOM};
-use model::placement::{Machine, Plan, PlanLevers};
+use model::placement::{Machine, PlanLevers};
 use refset::arch::minimaxm3;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -235,15 +235,11 @@ pub struct TwoCard {
     pub opened: std::time::Instant,
 }
 
-/// A plan's union on the stage card alone (the gate's `tier_twocard::union_plan`): every tier segment joined to the stage
-/// card's, `flat` the machine without the tier.
-pub type Union = for<'a, 'b> fn(&'b Plan<'a>, &'a Machine) -> Result<Plan<'a>, GateError>;
-
 /// The steps' token walk: `walk(steps, vocab)` gives the ids the reference decodes.
 pub type Walk = fn(usize, usize) -> Vec<u32>;
 
 /// The two-card arm's loads at `ctx` positions, one after the other: plan (b′) (`workstation::plan_bp`, the stage the A6000,
-/// the tier the 3090) under one card budget no environment moves ([`TWO_BUDGET`]); the reference, that plan's `union` on the A6000 alone, its ids and logits rows read over the walk
+/// the tier the 3090) under one card budget no environment moves ([`TWO_BUDGET`]); the reference, that plan's union on the A6000 alone, its ids and logits rows read over the walk
 /// `walk(steps, vocab)` and released; then plan (b′) itself. A budget the environment sets, a union past the A6000's usable
 /// bytes, a reference opened elsewhere or holding a tier, and the fixture tier (its cut's routed layers fit the stage card,
 /// so the tier would hold nothing) are refused by name.
@@ -251,7 +247,6 @@ pub fn two_card(
     file: &Path,
     (ctx, tier): (usize, Tier),
     (steps, walk): (usize, Walk),
-    union: Union,
 ) -> Result<TwoCard, GateError> {
     if tier == Tier::Fixture {
         return Err("the two-card arm runs in the real tier: the fixture cut's routed layers fit the stage card".into());
@@ -302,7 +297,7 @@ pub fn two_card(
     }
     let host = levers.host();
     let reference = {
-        let uplan = union(&plan, &flat)?;
+        let uplan = model::placement::union_plan(&plan, &flat)?;
         let mut r = Body::open_placed(minimaxm3_folder::model_at(file)?, &uplan, &inputs, 0, host)?;
         r.set_mode(StepMode::Graph);
         if !r.body("minimaxm3 seat")?.hybrid().tiers().is_empty() {

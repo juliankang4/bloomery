@@ -25,10 +25,12 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::attention_h128::Kernels as LoadedAttention;
     use bloomery_gpu::fault::{Fault, FaultSite};
     use bloomery_gpu::flash_gqa::{GROUP, HEAD, window_segments};
     use bloomery_gpu::flash_gqa_h128_swa::{H128SwaArgs, H128SwaKernels};
     use bloomery_gpu::qk_rms::{HEAD as RMS_HEAD, QkRmsArgs, QkRmsKernels};
+    use bloomery_gpu::rope_neox::NeoxArgs;
     use bloomery_gpu::{Gpu, GpuError, LAYER_NONE};
     use bloomery_gpu_gates::rounding::butterfly;
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
@@ -631,6 +633,315 @@ mod gate {
         Ok(ok)
     }
 
+    fn sample(pos: usize, head: usize, dim: usize, salt: usize) -> f32 {
+        ((pos * 17 + head * 13 + dim * 7 + salt) % 97) as f32 / 97.0 - 0.5
+    }
+
+    fn turn_at(values: &[f32], table: &[f32], pos: usize, rotate: bool) -> Vec<f32> {
+        let mut out = values.to_vec();
+        if rotate {
+            for d in 0..HEAD / 2 {
+                let (x, y) = (values[d], values[d + HEAD / 2]);
+                let (c, s) = (table[pos * HEAD + 2 * d], table[pos * HEAD + 2 * d + 1]);
+                out[d] = x.mul_add(c, -(y * s));
+                out[d + HEAD / 2] = x.mul_add(s, y * c);
+            }
+        }
+        out
+    }
+
+    /// Append across a wrap before a causal multirow pass. The full logical planes are the
+    /// independent oracle; only the device ring maps absolute rows modulo its capacity.
+    fn loaded_case(
+        gpu: &Gpu,
+        loaded: &LoadedAttention,
+        rotate: bool,
+        window: usize,
+        rows: usize,
+        m: usize,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let ctx = 3072usize;
+        let start = 2047usize;
+        let kv = 2;
+        let heads = kv * GROUP;
+        let gq_h: Vec<f32> = (0..HEAD).map(|d| 0.6 + d as f32 * 0.001).collect();
+        let gk_h: Vec<f32> = (0..HEAD).map(|d| 0.8 - d as f32 * 0.001).collect();
+        let mut table_h = vec![0.0f32; ctx * HEAD];
+        for p in 0..ctx {
+            for d in 0..HEAD / 2 {
+                let angle = p as f64 * 10000.0f64.powf(-((2 * d) as f64) / HEAD as f64);
+                table_h[p * HEAD + 2 * d] = angle.cos() as f32;
+                table_h[p * HEAD + 2 * d + 1] = angle.sin() as f32;
+            }
+        }
+        let mut logical_k = vec![0u16; kv * ctx * HEAD];
+        let mut logical_v = vec![0u16; kv * ctx * HEAD];
+        for kh in 0..kv {
+            for p in 0..start + m {
+                let raw: Vec<f32> = (0..HEAD).map(|d| sample(p, kh, d, 11)).collect();
+                let key = turn_at(&rms_head(&raw, &gk_h, EPS), &table_h, p, rotate);
+                for d in 0..HEAD {
+                    logical_k[(kh * ctx + p) * HEAD + d] = f32_to_f16_bits(key[d]);
+                    logical_v[(kh * ctx + p) * HEAD + d] =
+                        f32_to_f16_bits(sample(p, kh, d, 29) * 4.0);
+                }
+            }
+        }
+        let guard = 2 * HEAD;
+        let mut cache_k_h = vec![SENTINEL; kv * rows * HEAD + guard];
+        let mut cache_v_h = cache_k_h.clone();
+        for kh in 0..kv {
+            for p in start.saturating_sub(rows)..start {
+                let physical = (kh * rows + p % rows) * HEAD;
+                let logical = (kh * ctx + p) * HEAD;
+                cache_k_h[physical..physical + HEAD]
+                    .copy_from_slice(&logical_k[logical..logical + HEAD]);
+                cache_v_h[physical..physical + HEAD]
+                    .copy_from_slice(&logical_v[logical..logical + HEAD]);
+            }
+        }
+        let mut expect_k = cache_k_h.clone();
+        let mut expect_v = cache_v_h.clone();
+        let mut q_h = Vec::new();
+        let mut raw_k = Vec::new();
+        let mut raw_v = Vec::new();
+        let mut expect_q = Vec::new();
+        for t in 0..m {
+            let p = start + t;
+            for h in 0..heads {
+                let raw: Vec<f32> = (0..HEAD).map(|d| sample(p, h, d, 3)).collect();
+                expect_q.extend(turn_at(&rms_head(&raw, &gq_h, EPS), &table_h, p, rotate));
+                q_h.extend(raw);
+            }
+            for kh in 0..kv {
+                raw_k.extend((0..HEAD).map(|d| sample(p, kh, d, 11)));
+                raw_v.extend((0..HEAD).map(|d| sample(p, kh, d, 29) * 4.0));
+                let physical = (kh * rows + p % rows) * HEAD;
+                let logical = (kh * ctx + p) * HEAD;
+                expect_k[physical..physical + HEAD]
+                    .copy_from_slice(&logical_k[logical..logical + HEAD]);
+                expect_v[physical..physical + HEAD]
+                    .copy_from_slice(&logical_v[logical..logical + HEAD]);
+            }
+        }
+        let pos_h: Vec<u32> = (start..start + m).map(|p| p as u32).collect();
+        let counts_h: Vec<u32> = pos_h.iter().map(|p| p + 1).collect();
+        let mut q = DeviceBuffer::from_host(stream, &q_h)?;
+        let mut kd = DeviceBuffer::from_host(stream, &raw_k)?;
+        let v = DeviceBuffer::from_host(stream, &raw_v)?;
+        let gq = DeviceBuffer::from_host(stream, &gq_h)?;
+        let gk = DeviceBuffer::from_host(stream, &gk_h)?;
+        let table = DeviceBuffer::from_host(stream, &table_h)?;
+        let pos = DeviceBuffer::from_host(stream, &pos_h)?;
+        let counts = DeviceBuffer::from_host(stream, &counts_h)?;
+        let sinks_h: Vec<f32> = (0..heads).map(|h| 7.0 + h as f32 * 0.3).collect();
+        let sinks = DeviceBuffer::from_host(stream, &sinks_h)?;
+        let mut ck = DeviceBuffer::from_host(stream, &cache_k_h)?;
+        let mut cv = DeviceBuffer::from_host(stream, &cache_v_h)?;
+        let segs = window_segments(window);
+        let mut pv = DeviceBuffer::zeroed(stream, m * heads * segs * HEAD)?;
+        let mut pm = DeviceBuffer::zeroed(stream, m * heads * segs * 2)?;
+        let mut out = DeviceBuffer::from_host(stream, &vec![12345.0f32; m * heads * HEAD + HEAD])?;
+        gpu.take_fault()?;
+        // SAFETY: consecutive positions, distinct modulo rows, and m <= rows-window+1
+        // for rings. All readable historical keys above were initialized.
+        unsafe {
+            loaded.enqueue_append(
+                stream,
+                NeoxArgs {
+                    q: &mut q,
+                    k: &mut kd,
+                    v: &v,
+                    gq: &gq,
+                    gk: &gk,
+                    table: &table,
+                    pos: &pos,
+                    eps: EPS,
+                    n_head: heads,
+                    n_kv: kv,
+                    ctx,
+                    m,
+                    fault: gpu.unlabelled_sink(),
+                    cache_k: &mut ck,
+                    cache_v: &mut cv,
+                },
+                rows,
+                rotate,
+            )?;
+        }
+        loaded.enqueue_attention(
+            stream,
+            H128SwaArgs {
+                q: &q,
+                kc: &ck,
+                vc: &cv,
+                n_keys: &counts,
+                scale: score_scale(),
+                n_kv: kv,
+                ctx,
+                m,
+                window,
+                sinks: Some(&sinks),
+                part_v: &mut pv,
+                part_ms: &mut pm,
+                fault: gpu.unlabelled_sink(),
+                y: &mut out,
+            },
+            heads,
+            rows,
+        )?;
+        stream.synchronize()?;
+        let got_q = q.to_host_vec(stream)?;
+        let got = out.to_host_vec(stream)?;
+        let cache_same = ck.to_host_vec(stream)? == expect_k && cv.to_host_vec(stream)? == expect_v;
+        let query_same = bits_equal(&got_q, &expect_q);
+        let mut error = 0.0f32;
+        let mut no_sink_gap = 0.0f32;
+        for t in 0..m {
+            let end = start + t + 1;
+            for (h, &sink) in sinks_h.iter().enumerate() {
+                let b = (t * heads + h) * HEAD;
+                let base = (h / GROUP) * ctx * HEAD;
+                let keys = &logical_k[base..base + ctx * HEAD];
+                let values = &logical_v[base..base + ctx * HEAD];
+                let reference = attend(
+                    &expect_q[b..b + HEAD],
+                    keys,
+                    values,
+                    window_first(end, window),
+                    end,
+                    score_scale(),
+                    Some(sink),
+                );
+                error = error.max(max_abs(&got[b..b + HEAD], &reference));
+                if t == 0 && h == 0 {
+                    let no_sink = attend(
+                        &expect_q[b..b + HEAD],
+                        keys,
+                        values,
+                        window_first(end, window),
+                        end,
+                        score_scale(),
+                        None,
+                    );
+                    no_sink_gap = max_abs(&reference, &no_sink);
+                }
+            }
+        }
+        let canary = got[m * heads * HEAD..].iter().all(|x| *x == 12345.0);
+        let clean = gpu.take_fault()?.is_none();
+        let mut ok = clause(
+            "loaded attention logical/ring",
+            query_same && cache_same && canary && clean && error <= BAND,
+            &format!(
+                "rotate={rotate} window={window} rows={rows} m={m} q={query_same} cache={cache_same} canary={canary} clean={clean} max_abs={error:.3e}"
+            ),
+        );
+        ok &= clause(
+            "loaded attention sink witness",
+            no_sink_gap > 1e-5,
+            &format!("max_abs without sink={no_sink_gap:.3e}"),
+        );
+        if rows < ctx {
+            ok &= refused(
+                "ring unsafe append-then-attend chunk",
+                loaded.enqueue_attention(
+                    stream,
+                    H128SwaArgs {
+                        q: &q,
+                        kc: &ck,
+                        vc: &cv,
+                        n_keys: &counts,
+                        scale: score_scale(),
+                        n_kv: kv,
+                        ctx,
+                        m: rows - window + 2,
+                        window,
+                        sinks: Some(&sinks),
+                        part_v: &mut pv,
+                        part_ms: &mut pm,
+                        fault: gpu.unlabelled_sink(),
+                        y: &mut out,
+                    },
+                    heads,
+                    rows,
+                ),
+                "invalid ring geometry",
+            );
+            let bad_counts = DeviceBuffer::from_host(stream, &[0u32, ctx as u32 + 1])?;
+            loaded.enqueue_attention(
+                stream,
+                H128SwaArgs {
+                    q: &q,
+                    kc: &ck,
+                    vc: &cv,
+                    n_keys: &bad_counts,
+                    scale: score_scale(),
+                    n_kv: kv,
+                    ctx,
+                    m: 2,
+                    window,
+                    sinks: Some(&sinks),
+                    part_v: &mut pv,
+                    part_ms: &mut pm,
+                    fault: gpu.unlabelled_sink(),
+                    y: &mut out,
+                },
+                heads,
+                rows,
+            )?;
+            stream.synchronize()?;
+            let invalid = out.to_host_vec(stream)?;
+            ok &= clause(
+                "ring invalid logical count",
+                invalid[..2 * heads * HEAD].iter().all(|v| v.is_nan())
+                    && gpu.take_fault()? == Some(Fault::at(LAYER_NONE, FaultSite::KeyCount)),
+                "zero and count past logical ctx are NaN with key_count",
+            );
+            let invalid_pos = DeviceBuffer::from_host(stream, &[ctx as u32])?;
+            let before_k = ck.to_host_vec(stream)?;
+            let before_v = cv.to_host_vec(stream)?;
+            // SAFETY: the out-of-range position is never appended.
+            unsafe {
+                loaded.enqueue_append(
+                    stream,
+                    NeoxArgs {
+                        q: &mut q,
+                        k: &mut kd,
+                        v: &v,
+                        gq: &gq,
+                        gk: &gk,
+                        table: &table,
+                        pos: &invalid_pos,
+                        eps: EPS,
+                        n_head: heads,
+                        n_kv: kv,
+                        ctx,
+                        m: 1,
+                        fault: gpu.unlabelled_sink(),
+                        cache_k: &mut ck,
+                        cache_v: &mut cv,
+                    },
+                    rows,
+                    rotate,
+                )?;
+            }
+            stream.synchronize()?;
+            ok &= clause(
+                "ring invalid absolute position",
+                q.to_host_vec(stream)?[..heads * HEAD]
+                    .iter()
+                    .all(|v| v.is_nan())
+                    && ck.to_host_vec(stream)? == before_k
+                    && cv.to_host_vec(stream)? == before_v
+                    && gpu.take_fault()? == Some(Fault::at(LAYER_NONE, FaultSite::CachePos)),
+                "position at logical ctx is NaN and preserves all physical rows",
+            );
+        }
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let gpu = Gpu::new()?;
@@ -653,6 +964,13 @@ mod gate {
         ok &= flash_fault(&gpu, &flash, 9, 8, "flash count past ctx")?;
         ok &= flash_refusals(&gpu, &flash)?;
         ok &= rms_case(&gpu, &rms)?;
+        let loaded = LoadedAttention::load(&gpu)?;
+        for rotate in [false, true] {
+            ok &= loaded_case(&gpu, &loaded, rotate, WINDOW, 1024, 3)?;
+            ok &= loaded_case(&gpu, &loaded, rotate, WINDOW, 1024, 512)?;
+            ok &= loaded_case(&gpu, &loaded, rotate, 0, 3072, 3)?;
+            ok &= loaded_case(&gpu, &loaded, rotate, WINDOW, 3072, 3)?;
+        }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

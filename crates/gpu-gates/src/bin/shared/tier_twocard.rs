@@ -1,7 +1,7 @@
 //! What the two-card tier gates share (`gate_glm5next_twocard`, `gate_solar2_twocard`): plan (b′) against the same
 //! plan with every tier segment on the stage card, the legs' reads, and the per-layer counters of what the tier was sent.
 //! The reference of a two-card run is the stage card opened alone over the union of its experts and the tier's
-//! ([`union_plan`]): the tier's slots computed by the stage card's own launches, so the two-card run must read the same
+//! ([`model::placement::union_plan`]): the tier's slots computed by the stage card's own launches, so the two-card run must read the same
 //! tokens and logits rows bit for bit ([`same`]). A gate includes it by `#[path]`, with `#[allow(dead_code)]` for the
 //! helpers it does not read.
 
@@ -12,68 +12,6 @@ use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::Hybrid;
 use bloomery_gpu_gates::GateError;
 use model::placement::workstation;
-use model::placement::{self, Device, ExpertList, Machine, Plan, Role, Row};
-
-/// `plan` with each routed stack's tier segment joined to its stage-card
-/// segment on card 0 (`placement::routed_row` over the two lists), the
-/// host's segments as they are, on `flat` — the plan's machine with no
-/// tier card: the stage card holds the union, and no segment sits on a
-/// tier.
-pub fn union_plan<'a>(plan: &Plan<'a>, flat: &'a Machine) -> Result<Plan<'a>, GateError> {
-    let model = plan.model;
-    let tier = Device::Card(plan.machine.cards.len());
-    let mut out = plan.clone();
-    for row in &mut out.rows {
-        let t = &model.tensors[row.tensor];
-        if t.role != Role::RoutedExperts {
-            continue;
-        }
-        let ids = |d: Device| -> Vec<u32> {
-            row.segments
-                .iter()
-                .filter(|s| s.device == d)
-                .filter_map(|s| s.experts.as_ref())
-                .flat_map(|e| e.ids().iter().copied())
-                .collect()
-        };
-        let on_tier = ids(tier);
-        if on_tier.is_empty() {
-            continue;
-        }
-        let mut union = ids(Device::Card(0));
-        union.extend(on_tier);
-        let n = union.len();
-        let card = placement::routed_row(
-            row.tensor,
-            t,
-            0,
-            ExpertList::new(union, model.experts)?,
-            model,
-        )?;
-        let segments = card
-            .segments
-            .into_iter()
-            .filter(|s| s.device == Device::Card(0))
-            .chain(
-                row.segments
-                    .iter()
-                    .filter(|s| !matches!(s.device, Device::Card(_)))
-                    .cloned(),
-            )
-            .collect();
-        *row = Row {
-            segments,
-            ..row.clone()
-        };
-        if let Some(l) = t.layer.and_then(|l| out.n_l.get_mut(l)) {
-            *l = u64::try_from(n)?;
-        }
-    }
-    out.machine = flat;
-    out.cards.truncate(flat.cards.len());
-    out.tier_n_l.clear();
-    Ok(out)
-}
 
 /// Every token, kept count and logits row a leg read, in order.
 #[derive(Default)]

@@ -37,6 +37,8 @@ mod drafted;
 // DSpark draft, its slot rule and the draft word (`served::ServedDraft`).
 #[cfg(feature = "deepseek41")]
 pub mod ds41;
+#[cfg(all(feature = "deepseek41", feature = "flint"))]
+pub mod flint;
 #[cfg(feature = "glm5next")]
 pub mod glm;
 #[cfg(feature = "deepseek41")]
@@ -80,7 +82,7 @@ pub mod minimaxm3_folder;
 pub mod musespark;
 // The seat of a body that runs one chain on one card, fed in prompt batches
 // (`solar2`): its open, its load record, its calls and its think tags.
-#[cfg(all(feature = "deepseek41", feature = "solar2"))]
+#[cfg(all(feature = "deepseek41", any(feature = "solar2", feature = "flint")))]
 pub mod hybrid;
 // The nemotron seat sits behind `deepseek41` for the same reason: the server
 // surface it binds through is scoped to it, and it runs no V4.1 code. The

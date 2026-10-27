@@ -60,6 +60,7 @@ bloomery-gpu-mimo2 = { path = "../gpu-mimo2", optional = true }
 bloomery-gpu-solar2 = { path = "../gpu-solar2", optional = true }
 # The MiniMax-M3 program, reached only through the `minimaxm3` feature (its sparse-attention gate).
 bloomery-gpu-minimaxm3 = { path = "../gpu-minimaxm3", optional = true }
+bloomery-gpu-flint = { path = "../gpu-flint", optional = true }
 # The EmbeddingGemma 2 encoder, reached only through the `gemma-embedding2` feature (its end-to-end
 # gate).
 bloomery-gpu-gemma-embedding2 = { path = "../gpu-gemma-embedding2", optional = true }
@@ -152,6 +153,7 @@ glm5next = ["deepseek41", "dep:bloomery-gpu-glm5next", "bloomery-app/glm5next"]
 mimo2 = ["gpu", "dep:bloomery-gpu-mimo2", "bloomery-app/mimo2"]
 solar2 = ["gpu", "dep:bloomery-gpu-solar2", "bloomery-app/solar2"]
 minimaxm3 = ["gpu", "dep:bloomery-gpu-minimaxm3", "bloomery-app/minimaxm3"]
+flint = ["gpu", "dep:bloomery-gpu-flint", "bloomery-app/flint"]
 gemma-embedding2 = ["gpu", "gemma4a", "dep:bloomery-gpu-vision", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
 gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
 
@@ -171,7 +173,7 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "bloomery-serve"
 path = "src/bin/bloomery_serve.rs"
-required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "gemma-embedding2", "hf"]
+required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "bloomery-serve-ds41"

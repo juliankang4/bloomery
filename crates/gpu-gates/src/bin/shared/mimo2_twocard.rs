@@ -2,7 +2,7 @@
 //! `BLOOMERY_CARD=both`): plan (b′) (`workstation::plan_bp`: the A6000 the stage card, the 3090 an expert tier holding
 //! each routed layer's next ids after the stage's prefix, the host the rest), planned under one card budget no
 //! environment moves ([`TWO_BUDGET`]), against the reference — the same plan with every tier segment on the stage card
-//! (`tier_twocard::union_plan`), the A6000 alone, opened first and released. Its clauses:
+//! (`model::placement::union_plan`), the A6000 alone, opened first and released. Its clauses:
 //! - `two_card_load`: the plan puts experts on the tier, and the load's tier opened on the 3090 beside the stage card
 //!   with the plan's experts on each layer;
 //! - `two_card_first_tokens_are_union`: [`TWO_WALK`] decode steps of the walk read the reference's ids and logits rows
@@ -26,11 +26,9 @@ use bloomery_gpu_mimo2::{Body, Mimo2Model, T_MAX, prefill, set_prefill_group};
 use gguf::Split;
 use model::arch::mimo2::place::PlanInputs;
 use model::placement::workstation;
-use model::placement::{Machine, PlanLevers};
+use model::placement::{Machine, PlanLevers, union_plan};
 
-use crate::tier_twocard::{
-    Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_3090, union_plan,
-};
+use crate::tier_twocard::{Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_3090};
 
 /// What the arm's errors name.
 const WHAT: &str = "gate_mimo2_e2e two-card";

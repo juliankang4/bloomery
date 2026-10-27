@@ -182,7 +182,9 @@ mod dflash_kernels {
         // N_EXPERT = n_expert <= bias.len() by the launch contract; score and
         // sel_v are block-shared arrays of N_EXPERT entries; the barrier below
         // publishes them.
-        unsafe { publish_n::<N_EXPERT>(probs.as_mut_ptr(), bias, e0, score, sel_v, tid, fault) };
+        unsafe {
+            publish_n::<N_EXPERT>(probs.as_mut_ptr(), Some(bias), e0, score, sel_v, tid, fault)
+        };
         thread::sync_threads();
 
         if tid < 32 {

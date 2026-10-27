@@ -47,8 +47,9 @@ impl Open for Body {
         ctx: usize,
         cfg: &HybridCfg,
     ) -> Result<Plan<'a>, GpuError> {
+        <super::SingleSequence as super::SequenceSlots<Body>>::check(cfg.slots, WHAT)?;
         let ctx = one_card_ctx(WHAT, machine, ctx)?;
-        inputs.plan_at(machine, ctx, &cfg.place, WHAT)
+        inputs.plan_at(machine, ctx, &cfg.place, cfg.slots, WHAT)
     }
 
     /// The model resident by `plan`, on the plan's one card, under the
@@ -60,6 +61,7 @@ impl Open for Body {
         plan: &Plan<'_>,
         cfg: &HybridCfg,
     ) -> Result<GpuModel<Body>, GpuError> {
+        <super::SingleSequence as super::SequenceSlots<Body>>::check(cfg.slots, WHAT)?;
         GpuModel::<Body>::open_placed_with(file, plan, 0, cfg.host, cfg.residency)
     }
 

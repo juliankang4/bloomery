@@ -9,9 +9,9 @@
 //! forces: the keys it reads, the layers it refuses, the engine's name in the refusals that name it.
 //!
 //! The plan refuses by name a machine that hangs an expert tier card where the family's body serves
-//! none ([`PlanInputs::tier_reserve`]), a context of no position and a host room that cannot hold
-//! the host experts: the bodies this plans serve no NVMe expert tier, so a plan that pages one
-//! ([`PlaceError::NoNvmeTier`]) would load experts nothing serves.
+//! none ([`PlanInputs::tier_reserve`]), a context of no position and, unless the loader explicitly
+//! serves the common NVMe tier ([`PlanInputs::with_nvme_tier`]), a host room that pages any expert
+//! ([`PlaceError::NoNvmeTier`]).
 //!
 //! A body that makes buffers beside the plan's terms on its card (the prompt batch's rows) states
 //! their bytes in [`PlanInputs::prompt_reserve`]: the expert rule spreads within the card's budget
@@ -72,7 +72,10 @@ pub const fn wide_bytes(cols: usize, k: usize) -> usize {
 /// (a [`GEMM_TILE_COLS`] column tile each, and the expert's), the two counts and the all-zero ids.
 #[must_use]
 pub const fn route_bytes(cols: usize) -> usize {
-    4 * (cols + 2 * (cols / GEMM_TILE_COLS + 1) + 2 + cols)
+    match kernels::ffn::dense_route_bytes(cols as u64) {
+        Some(bytes) => bytes as usize,
+        None => panic!("route_bytes: route table bytes overflow u64"),
+    }
 }
 
 /// The forms a ring pass's route GEMMs read their rows in, by the stacks' file types: the gate's and
@@ -196,7 +199,10 @@ pub fn stream_ring_bytes(
 /// the copy of the slot's route weight, three four-byte words.
 #[must_use]
 pub const fn tier_places_bytes(rows: usize, n_used: usize) -> u64 {
-    3 * 4 * (rows * n_used) as u64
+    match kernels::ffn::tier_places_bytes(rows as u64, n_used as u64) {
+        Some(bytes) => bytes,
+        None => panic!("tier_places_bytes: slot bytes overflow u64"),
+    }
 }
 
 /// What a plan of a hybrid file is made from, read from its headers. `H` is the family's own
@@ -213,9 +219,9 @@ pub struct PlanInputs<H> {
     pub kv: KvLayout,
     /// The host's available bytes when the inputs were read, with the reading that decided
     /// ([`workstation::host_available_read`]): the routed experts the room cannot hold follow it to
-    /// the NVMe tier ([`placement::expert_nvme_tier`]), which these bodies do not serve, so such a
-    /// plan is refused ([`PlaceError::NoNvmeTier`]). A gate that plans an arm by a room of its own
-    /// sets it, read [`HostRead::Given`].
+    /// the NVMe tier ([`placement::expert_nvme_tier`]). A body without that loader contract refuses
+    /// a plan that pages experts ([`PlaceError::NoNvmeTier`]). A gate that plans an arm by a room of
+    /// its own sets it, read [`HostRead::Given`].
     ///
     /// The effective room is [`Plan::plan_at`]'s: the reading's plan room,
     /// capped by the machine's host room and unified pool.
@@ -233,6 +239,9 @@ pub struct PlanInputs<H> {
     /// keeps `bytes` more than [`PlanInputs::prompt_reserve`] on a machine that names a tier card,
     /// the buffers only a tiered load makes.
     pub tier_reserve: Option<u64>,
+    /// Whether the loader serves the common host-run NVMe arena. Opt-in only: a plan cannot
+    /// promise paging merely because the placement can split the expert stacks.
+    nvme_tier: bool,
     /// The engine the refusals that name one name.
     engine: &'static str,
 }
@@ -357,6 +366,7 @@ impl<H> PlanInputs<H> {
             arena,
             prompt_reserve: 0,
             tier_reserve: None,
+            nvme_tier: false,
             engine,
         })
     }
@@ -387,6 +397,16 @@ impl<H> PlanInputs<H> {
     pub fn with_tier_reserve(self, bytes: u64) -> PlanInputs<H> {
         PlanInputs {
             tier_reserve: Some(bytes),
+            ..self
+        }
+    }
+
+    /// `self` for a loader that serves the common host-run NVMe arena, with the same residency
+    /// identity and split as the plan. Existing loaders remain non-paging unless they opt in.
+    #[must_use]
+    pub fn with_nvme_tier(self) -> PlanInputs<H> {
+        PlanInputs {
+            nvme_tier: true,
             ..self
         }
     }
@@ -457,8 +477,8 @@ impl<H> PlanInputs<H> {
     ///
     /// The host experts are held to the room the inputs name ([`PlanInputs::room`]): a room under
     /// the host need runs the common NVMe tier split ([`placement::expert_nvme_tier`], which refuses
-    /// a room under the tier's floor by name), and a plan that comes out paging any routed expert is
-    /// refused ([`PlaceError::NoNvmeTier`]), for the body serves no such tier.
+    /// a room under the tier's floor by name). A plan paging any routed expert is refused
+    /// ([`PlaceError::NoNvmeTier`]) unless the loader serves it ([`PlanInputs::with_nvme_tier`]).
     pub fn plan_with_slots<'a>(
         &'a self,
         machine: &'a Machine,
@@ -485,7 +505,7 @@ impl<H> PlanInputs<H> {
         let need = HostNeed::of(&plan, 0).bytes();
         let room = plan.plan_at(&self.room);
         placement::expert_nvme_tier(&mut plan, room, self.arena)?;
-        if plan.host.nvme_expert_bytes > 0 {
+        if plan.host.nvme_expert_bytes > 0 && !self.nvme_tier {
             return Err(PlaceError::NoNvmeTier {
                 paged: plan.host.nvme_expert_bytes,
                 need,

@@ -2006,6 +2006,43 @@ pub static LISTENING_SOLAR2: Kind = Kind {
     ],
 };
 
+/// A common hybrid seat's loaded model and resident sequence stores.
+pub static LOAD_HYBRID: Kind = Kind {
+    name: "load_hybrid",
+    head: "load",
+    doc: "A hybrid seat's architecture, resident bytes, per-slot context, resident slots, layers, host and card expert counts, captured step nodes, prompt group, caller pin and load wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        key("host_experts", U64, "experts"),
+        key("card_experts", U64, "experts"),
+        key("graph_nodes", U64, ""),
+        key("group", U64, "batches"),
+        key("pin_main", Word, ""),
+        key("pinned", Bool, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The common hybrid seat's listening address.
+pub static LISTENING_HYBRID: Kind = Kind {
+    name: "listening_hybrid",
+    head: "bloomery-serve:",
+    doc: "A hybrid seat's placement, per-slot context, resident slots and listening address.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The MiniMax-M3 seat's load.
 pub static LOAD_MINIMAXM3: Kind = Kind {
     name: "load_minimaxm3",
@@ -3057,6 +3094,19 @@ pub static BLOOMERY_SERVE_SOLAR2: &[&Kind] = kinds![
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LANE, &LOAD_SOLAR2, &LOAD_PHASES, &LISTENING_SOLAR2],
+    groups::bind::CACHE,
+];
+
+/// The common hybrid seat's placement, residency, load, address and request records.
+pub static BLOOMERY_SERVE_HYBRID: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
+    groups::tiered::LEVER,
+    &[&PLACE_UNSET],
+    groups::tiered::RUN,
+    groups::residency38::HOST,
+    groups::fetch::FETCH,
+    groups::fetch::SET,
+    &[&LANE, &LOAD_HYBRID, &LOAD_PHASES, &LISTENING_HYBRID],
     groups::bind::CACHE,
 ];
 
@@ -4340,11 +4390,11 @@ mod tests {
     #[test]
     fn every_binary_registers_the_groups_its_entries_require() {
         use groups::{
-            bind, drafted, ds41_draft, ds41_split, fetch, host_stats, nvtier_family,
+            bind, drafted, ds41_draft, ds41_split, fetch, host_stats, hybrid, nvtier_family,
             qwen3moe_place, residency38, serve_client, side_seat, tiered, vision_seat,
         };
         type Group = &'static [&'static Kind];
-        let table: [(&str, Group, &[Group]); 17] = [
+        let table: [(&str, Group, &[Group]); 18] = [
             (
                 "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
                 BLOOMERY_SERVE_DS41,
@@ -4407,6 +4457,20 @@ mod tests {
                     side_seat::SEAT,
                     tiered::LEVER,
                     residency38::HOST,
+                    fetch::FETCH,
+                    fetch::SET,
+                    bind::CACHE,
+                ],
+            ),
+            (
+                "hybrid seat: residency_pick, settle_pick, hybrid::open_session, bind::spawn",
+                BLOOMERY_SERVE_HYBRID,
+                &[
+                    side_seat::SEAT,
+                    tiered::LEVER,
+                    tiered::RUN,
+                    residency38::HOST,
+                    hybrid::GROUP,
                     fetch::FETCH,
                     fetch::SET,
                     bind::CACHE,

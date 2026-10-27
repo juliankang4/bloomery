@@ -67,6 +67,8 @@ pub enum Program {
     /// gate·up and down `_sel` entries ([`MUSESPARK_LEG`]) and the rest on the
     /// host tier.
     MuseSparkBody,
+    /// The head128 sink/SWA body with floor-normalized top-six experts.
+    FlintBody,
 }
 
 /// The program that runs `arch`'s layers; `None` when none does.
@@ -85,7 +87,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::NemotronH => Some(Program::NemotronHBody),
         Arch::NemotronHMoe => Some(Program::NemotronHMoeBody),
         Arch::GemmaEmbedding | Arch::GemmaEmbedding2 => Some(Program::GemmaEmbedding2Body),
-        Arch::Flint => None,
+        Arch::Flint => Some(Program::FlintBody),
         Arch::MuseSpark => Some(Program::MuseSparkBody),
     }
 }
@@ -110,6 +112,7 @@ impl Program {
             Self::GemmaEmbedding2Body => "gemma-embedding2",
             Self::Raon1Body => "raon1",
             Self::MuseSparkBody => "musespark",
+            Self::FlintBody => "flint",
         }
     }
 }
@@ -481,7 +484,7 @@ pub struct LegArms {
 #[must_use]
 pub fn leg_arms(p: Program) -> Option<LegArms> {
     match p {
-        Program::Qwen3moeBody | Program::Qwen35Body => Some(LegArms {
+        Program::Qwen3moeBody | Program::Qwen35Body | Program::FlintBody => Some(LegArms {
             gate_up: prompt_leg_gate_up,
             down: prompt_leg_down,
         }),
@@ -588,7 +591,7 @@ pub fn leg_down_forms(p: Program, model: &crate::placement::ModelTensors) -> ker
 #[must_use]
 pub fn routed_rule(p: Program) -> RoutedRule {
     match p {
-        Program::Qwen3moeBody | Program::Qwen35Body => RoutedRule::Leg {
+        Program::Qwen3moeBody | Program::Qwen35Body | Program::FlintBody => RoutedRule::Leg {
             gate_up: |ty| prompt_leg_gate_up(ty).then(|| leg_card_format(ty)),
             down: |ty| prompt_leg_down(ty).then(|| leg_card_format(ty)),
             pair: leg_pair(p),
@@ -669,7 +672,7 @@ mod tests {
     use super::*;
     use crate::placement::{ModelTensor, ModelTensors, Role};
 
-    const PROGRAMS: [Program; 12] = [
+    const PROGRAMS: [Program; 13] = [
         Program::Deepseek41Chain,
         Program::Qwen3moeBody,
         Program::Qwen35Body,
@@ -682,6 +685,7 @@ mod tests {
         Program::NemotronHMoeBody,
         Program::Raon1Body,
         Program::MuseSparkBody,
+        Program::FlintBody,
     ];
 
     /// Every type the file format names.

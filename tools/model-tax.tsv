@@ -82,7 +82,7 @@ crates/gpu-gates/src/bin/shared/dspark_hf.rs	qwen	1	baseline O 1: own path: an a
 crates/gpu-gates/src/bin/shared/emb2_image.rs	gemma	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/route_trace38.rs	qwen	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/routed_legs.rs	deepseek	8	baseline P 9: MK2 program by body
-crates/gpu-gates/src/bin/shared/routed_legs.rs	flint	2	PIN(2026-10-23) flint: family_of and skip_of match every models::Arch exhaustively; the header-only reader has no program or routed-legs adapter
+crates/gpu-gates/src/bin/shared/routed_legs.rs	flint	2	PIN(2026-10-25) flint: family_of and skip_of match every models::Arch exhaustively; no common routed-legs adapter is registered, and the full-file body transitions have their own owning gate
 crates/gpu-gates/src/bin/shared/routed_legs.rs	gemma	4	baseline P 5: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	glm	7	baseline P 8: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	4	baseline P 5: MK2 program by body
@@ -165,7 +165,7 @@ crates/models/src/lib.rs	mimo	2	baseline A 2: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	nemotron	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	qwen	9	baseline A 9: MK1a/MK1b ArchRow registry
 crates/placement/src/accepts.rs	deepseek	14	PIN(2026-10-26) deepseek: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet; +4 are V4.1's leg arms (ds41_gate_up, ds41_down, ds41_pair and its routed_rule arm), held in the Program-keyed arm table beside qwen35's and qwen38's until a Program owns its arms
-crates/placement/src/accepts.rs	flint	1	PIN(2026-10-23) flint: program_of matches every models::Arch; the header-only reader must explicitly return no program until a body is registered
+crates/placement/src/accepts.rs	flint	5	PIN(2026-10-25) flint: the implemented body registers its Program variant, name, architecture selection, expert arms and routed rule in the existing exhaustive program owners
 crates/placement/src/accepts.rs	gemma	5	PIN(2026-10-21) gemma: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	glm	5	PIN(2026-10-21) glm: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	mimo	5	PIN(2026-10-21) mimo: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
@@ -218,6 +218,8 @@ crates/gpu-gates/src/record.rs	muse	4	PIN(2026-10-23) muse: MK12 per-bin Kind st
 crates/model/src/arch/coverage.rs	muse	25	PIN(2026-10-23) muse: the coverage rows, the type pins and the expert-stack match are keyed by Program, so each row the musespark body runs lists its variant; the program would own its rows instead of the list naming programs
 crates/hf/src/vocab.rs	minimax	3	PIN(2026-10-23) minimax: the minimax-m2 pre-tokenizer's name, regex and pipeline row; tokenizer programs are not yet described by ModelSpec
 crates/gpu-gates/src/prompts.rs	deepseek	1	PIN(2026-10-23) deepseek: the measured logit σ is named for the one family it was measured on (SIGMA_LOGIT_V41); other families carry it in their gate description until their own is measured
+crates/gpu-gates/src/bin/bloomery_serve.rs	flint	10	PIN(2026-10-25) flint: MK9 seat by program: the seat word, help/models list, architecture match and dispatch register the implemented shared hybrid seat until the description selects it
+crates/model/src/arch/coverage.rs	flint	11	PIN(2026-10-25) flint: the implemented Program selects its actual head128 attention, floor router, dense/shared sites, embedding/head and expert-stack capabilities in the existing coverage owners
 crates/gpu-gates/src/bin/shared/routed_legs.rs	llama	2	PIN(2026-10-26) llama: family_of and skip_of match every models::Arch exhaustively; the dense trunk has no routed-legs adapter
 crates/model/src/arch/mod.rs	llama	2	PIN(2026-10-26) llama: the family's module declaration (`pub mod llama;`) and the SentencePiece rule's tokenizer-model word; the module list is not a registry
 crates/models/src/lib.rs	llama	2	PIN(2026-10-26) llama: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead

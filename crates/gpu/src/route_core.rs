@@ -18,9 +18,9 @@
 //! [`Sigmoid`]). What a router stores is [`router_score`] of the logit, never
 //! the score alone.
 //!
-//! A weight stage that renormalizes its selected scores divides by
-//! [`renorm_divisor`] of their sum: the one guard every such stage and its
-//! host simulation share.
+//! A weight stage uses either [`renorm_divisor`] (the legacy epsilon-added
+//! policy) or [`floor_divisor`] (Flint's fixed selected-sum floor). The
+//! compiled instance chooses the policy, never a per-token launch flag.
 
 use crate::elem::argmax_take;
 
@@ -56,6 +56,12 @@ pub fn sqrt_softplus(x: f32) -> f32 {
 #[inline(always)]
 pub fn renorm_divisor(sum: f32) -> f32 {
     sum + 1e-20
+}
+
+/// Flint's selected-score divisor: the f32 sum floored at exactly `2^-14`.
+#[inline(always)]
+pub fn floor_divisor(sum: f32) -> f32 {
+    sum.max(1.0 / 16384.0)
 }
 
 /// The score a router stores for `logit`: `S::score(logit)`, or NaN for a

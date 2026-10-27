@@ -543,6 +543,19 @@ generate_ds41	swiglu_rule_rows	0	0
 # PIN(2026-09-25): ds41_attn_seg_stage is the staged prefix segment pass (prefill only, never on the decode path); its ring ⧺ staging source keeps a few registers more than ds41_attn_seg, which already sits at the 128-register cap of a 512-thread block, and ptxas spills 8 bytes. ds41_attn_seg_sel_stage fits in 112 with none.
 # PIN(2026-10-21): raon_hc_route (Raon's mHC route, one block a token and layer) keeps its 4x3 and 4x4 route matrices in per-thread arrays the while loops index at run time: hz 48 B + e 64 B = 112 B of JIT local; the rest of its work is shared memory. ptxas spills nothing.
 
+# PIN(2026-10-25): Flint entries measured at 313b9f0f88c90fcfae2365a4af53cd077762eb7c:
+# sm_86, ptxas 13.3.33, RTX 3090 cc8.6, driver 595.91.07 (CUDA API 13.2).
+# Full generate_ds41 JIT: 436 entries, cache off; each new entry has measured spill=0/jit_local=0.
+generate_ds41   gqa_flash_merge_h128_swa_ring             0           0
+generate_ds41   gqa_flash_seg_h128_swa_ring               0           0
+generate_ds41   head_norm_neox_append_ring               0           0
+generate_ds41   normalize                                0           0
+generate_ds41   qk_rms_append_ring                        0           0
+generate_ds41   restore                                  0           0
+generate_ds41   routed_shared_residual                   0           0
+generate_ds41   sigmoid_floor_256_6_router               0           0
+generate_ds41   sigmoid_floor_256_6_router_pick          0           0
+
 # gate_qwen3vl_tower (--features vision), the shared vision entries, including Gemma4 residual and post-norm precision.
 # PIN(2026-10-15): the seven Gemma4 entries have zero sm_86 ptxas spill; jit_local=0 is a derived cc8.6 ceiling,
 # not a cc8.6 driver measurement. Both sm_86 and sm_121 PTX have zero JIT local bytes on GB10 cc12.1.

@@ -8,10 +8,12 @@
 //! and the cut rule — and [`Batch`] holds the rest: the [`Open`] the placement
 //! plans by, the [`Prompt`] the batch runs and the [`Keep`] the cut follows.
 
+use std::num::NonZeroUsize;
+
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::model::{ChainBody, Rollback};
+use bloomery_gpu::model::{ChainBody, Rollback, Slots};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError, GpuModel};
 use bloomery_levers::HostCfg;
@@ -24,6 +26,8 @@ use crate::{Keep, Open, Prompt};
 
 #[cfg(feature = "deepseek41")]
 pub mod deepseek41;
+#[cfg(feature = "flint")]
+pub mod flint;
 #[cfg(feature = "glm5next")]
 pub mod glm5next;
 #[cfg(feature = "mimo2")]
@@ -56,6 +60,8 @@ pub struct HybridCfg {
     pub residency: Residency,
     /// The batches a prompt group runs layer by layer.
     pub group: usize,
+    /// The resident sequences charged by the plan before any allocation.
+    pub slots: NonZeroUsize,
 }
 
 /// The plan inputs of a hybrid body: the family's own hyperparameters under
@@ -71,6 +77,7 @@ pub trait HybridInputs {
         machine: &'a Machine,
         ctx: u64,
         levers: &PlanLevers,
+        slots: NonZeroUsize,
         what: &'static str,
     ) -> Result<Plan<'a>, GpuError>;
 }
@@ -85,9 +92,11 @@ impl<H> HybridInputs for PlanInputs<H> {
         machine: &'a Machine,
         ctx: u64,
         levers: &PlanLevers,
+        slots: NonZeroUsize,
         what: &'static str,
     ) -> Result<Plan<'a>, GpuError> {
-        PlanInputs::plan(self, machine, ctx, levers).map_err(|e| GpuError::plan(what, e))
+        self.plan_with_slots(machine, ctx, levers, slots)
+            .map_err(|e| GpuError::plan(what, e))
     }
 }
 
@@ -98,12 +107,19 @@ impl<H> HybridInputs for PlanInputs<H> {
 pub trait Batch: ChainBody + Rollback + Sized {
     /// The plan inputs the body is loaded by.
     type Inputs: HybridInputs;
+    /// The sequence capability the body actually implements.
+    type Sequences: SequenceSlots<Self>;
 
     /// The session's name in its refusals.
     const WHAT: &'static str;
 
     /// The plan inputs of `file`.
     fn read(file: &Split) -> Result<Self::Inputs, GpuError>;
+
+    /// Price configuration-dependent buffers before placement; unchanged for a fixed schedule.
+    fn configure(_inputs: &mut Self::Inputs, _cfg: &HybridCfg) -> Result<(), GpuError> {
+        Ok(())
+    }
 
     /// The body resident by `plan`, which `inputs` made: the layers the plan
     /// puts on the card, the host tier over the routed ones.
@@ -113,6 +129,7 @@ pub trait Batch: ChainBody + Rollback + Sized {
         inputs: &Self::Inputs,
         host: HostCfg,
         residency: Residency,
+        slots: NonZeroUsize,
     ) -> Result<GpuModel<Self>, GpuError>;
 
     /// The prompt batch of `ids` from `at`: the head's row after the last.
@@ -154,6 +171,10 @@ impl<B: Batch> Open for B {
         B::read(file)
     }
 
+    fn configure_inputs(inputs: &mut B::Inputs, cfg: &HybridCfg) -> Result<(), GpuError> {
+        B::configure(inputs, cfg)
+    }
+
     fn layer_count(inputs: &B::Inputs) -> usize {
         inputs.layers()
     }
@@ -169,8 +190,9 @@ impl<B: Batch> Open for B {
         ctx: usize,
         cfg: &HybridCfg,
     ) -> Result<Plan<'a>, GpuError> {
+        <B::Sequences as SequenceSlots<B>>::check(cfg.slots, B::WHAT)?;
         let ctx = one_card_ctx(B::WHAT, machine, ctx)?;
-        inputs.plan_at(machine, ctx, &cfg.place, B::WHAT)
+        inputs.plan_at(machine, ctx, &cfg.place, cfg.slots, B::WHAT)
     }
 
     fn open(
@@ -179,7 +201,8 @@ impl<B: Batch> Open for B {
         plan: &Plan<'_>,
         cfg: &HybridCfg,
     ) -> Result<GpuModel<B>, GpuError> {
-        B::open_placed(file, plan, inputs, cfg.host, cfg.residency)
+        <B::Sequences as SequenceSlots<B>>::check(cfg.slots, B::WHAT)?;
+        B::open_placed(file, plan, inputs, cfg.host, cfg.residency, cfg.slots)
     }
 
     /// The configuration's group; the units it needs are made here.
@@ -219,6 +242,81 @@ impl<B: Batch> Keep for B {
     /// [`Batch::cut`].
     fn cut(m: &mut GpuModel<B>, n: u32) -> Result<(), GpuError> {
         B::cut(m, n)
+    }
+}
+
+/// The sequence operations a common hybrid seat may offer.
+pub trait SequenceSlots<B: ChainBody> {
+    /// Whether several resident sequences are backed by body-owned stores.
+    const RESIDENT: bool;
+    /// Refuse an unsupported count before planning or allocation.
+    fn check(slots: NonZeroUsize, what: &'static str) -> Result<(), GpuError>;
+    /// Park the planned sequences through the session's actual slot operations.
+    fn add(s: &mut crate::Session<B>, slots: NonZeroUsize) -> Result<(), crate::SessionError>;
+    /// The number of resident sequences the session currently holds.
+    fn count(s: &crate::Session<B>) -> usize;
+    /// Select the actual sequence every following call acts on.
+    fn select(s: &mut crate::Session<B>, slot: usize) -> Result<(), crate::SessionError>;
+}
+
+/// A body that holds one sequence; other slots are refused, not simulated.
+pub struct SingleSequence;
+
+impl<B: ChainBody> SequenceSlots<B> for SingleSequence {
+    const RESIDENT: bool = false;
+
+    fn check(slots: NonZeroUsize, what: &'static str) -> Result<(), GpuError> {
+        if slots.get() != 1 {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "the body holds one sequence, not {} resident slots",
+                    slots.get()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn add(_s: &mut crate::Session<B>, slots: NonZeroUsize) -> Result<(), crate::SessionError> {
+        <Self as SequenceSlots<B>>::check(slots, "single-sequence session").map_err(Into::into)
+    }
+
+    fn count(_s: &crate::Session<B>) -> usize {
+        1
+    }
+
+    fn select(_s: &mut crate::Session<B>, slot: usize) -> Result<(), crate::SessionError> {
+        if slot == 0 {
+            Ok(())
+        } else {
+            Err(crate::SessionError::Refused(format!(
+                "select_slot {slot}: the body holds one sequence"
+            )))
+        }
+    }
+}
+
+/// Resident sequences backed by the body's actual parked stores.
+pub struct ResidentSequences;
+
+impl<B: Slots<Seq: 'static>> SequenceSlots<B> for ResidentSequences {
+    const RESIDENT: bool = true;
+
+    fn check(_slots: NonZeroUsize, _what: &'static str) -> Result<(), GpuError> {
+        Ok(())
+    }
+
+    fn add(s: &mut crate::Session<B>, slots: NonZeroUsize) -> Result<(), crate::SessionError> {
+        s.add_slots(slots.get())
+    }
+
+    fn count(s: &crate::Session<B>) -> usize {
+        s.slots()
+    }
+
+    fn select(s: &mut crate::Session<B>, slot: usize) -> Result<(), crate::SessionError> {
+        s.select_slot(slot)
     }
 }
 

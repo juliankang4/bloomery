@@ -22,7 +22,7 @@
 //! the weight type's and nothing else. `crate::ops::matmul_q` is that single owner.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
@@ -30,9 +30,9 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    self, DEFER_MAX_COLS, ExpertForm, ExpertStack, GroupClaims, GroupInput, Lanes, PostNorm,
-    R8Stack, RowLayout, ShardTensor, StackTier, Tensor2, Tensor2View, UnionCall, UnionPlanView,
-    UnionSlabs, UnionStack, WarmSpan, Weight, defers, matmul_q, matmul_q_group,
+    self, DEFER_MAX_COLS, ExpertForm, ExpertInput, ExpertStack, GroupClaims, GroupInput, Lanes,
+    PostNorm, R8Stack, RowLayout, ShardTensor, StackTier, Tensor2, Tensor2View, UnionCall,
+    UnionPlanView, UnionSlabs, UnionStack, WarmSpan, Weight, defers, matmul_q, matmul_q_group,
     matmul_q_group_into_on, matmul_q_group_swiglu, matmul_q_group_swiglu_into_on,
 };
 use crate::profile;
@@ -875,6 +875,8 @@ pub struct HostScratch {
     pars: Vec<Tensor2>,
     /// The down outputs, `{embd, 1}` each.
     downs: Vec<Tensor2>,
+    /// Per-expert activation scales, restored before weighting the down outputs.
+    scales: Vec<f32>,
     /// The call's gate and up matrices, interleaved; empty between calls.
     gu_w: Vec<Weight<'static>>,
     /// The call's down matrices; empty between calls.
@@ -910,12 +912,30 @@ impl HostScratch {
             gate_up: blocks(2 * n_used, ff),
             pars: blocks(n_used, ff),
             downs: blocks(n_used, embd),
+            scales: Vec::new(),
             gu_w: Vec::with_capacity(2 * n_used),
             down_w: Vec::with_capacity(n_used),
             xs: Vec::with_capacity(2 * n_used),
             srcs: Vec::with_capacity(n_used),
             tier_ids: Vec::new(),
         })
+    }
+
+    /// Allocate protection scales at load; direct quantization needs none.
+    pub fn set_expert_input(&mut self, policy: ExpertInput) {
+        match policy {
+            ExpertInput::Direct => self.scales = Vec::new(),
+            ExpertInput::AmaxF16 => self.scales.resize(self.n_used, 1.0),
+        }
+    }
+
+    /// The policy this scratch has load-allocated scale storage for.
+    pub fn expert_input(&self) -> ExpertInput {
+        if self.scales.is_empty() {
+            ExpertInput::Direct
+        } else {
+            ExpertInput::AmaxF16
+        }
     }
 
     fn fits(&self, embd: usize, ff: usize) -> bool {
@@ -961,6 +981,7 @@ impl HostScratch {
 #[derive(Clone, Copy)]
 struct LegRun<'n> {
     form: ExpertForm,
+    input: ExpertInput,
     lanes: Lanes,
     post: Option<&'n PostNorm>,
 }
@@ -971,6 +992,7 @@ impl LegRun<'_> {
     fn flat() -> LegRun<'static> {
         LegRun {
             form: ExpertForm::Gated { limit: 0.0 },
+            input: ExpertInput::Direct,
             lanes: Lanes::Flat,
             post: None,
         }
@@ -1042,11 +1064,18 @@ fn serve_resolved(
     s: &mut HostScratch,
 ) -> Result<(), ModelError> {
     let n = experts.len();
+    if run.input == ExpertInput::AmaxF16 && s.scales.len() < n {
+        return Err(ModelError::Metadata {
+            key: "host expert input".to_string(),
+            detail: "AmaxF16 requires HostScratch::set_expert_input at load".to_string(),
+        });
+    }
     let lvl = profile::level();
     let HostScratch {
         gate_up,
         pars,
         downs,
+        scales,
         xs,
         srcs,
         ..
@@ -1064,33 +1093,55 @@ fn serve_resolved(
     *xs = relist(xl);
     let gt = gt?;
     let mut sl: Vec<GroupInput<'_>> = relist(std::mem::take(srcs));
-    match run.form {
-        ExpertForm::Gated { limit } => {
-            for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
-                sl.push(GroupInput::SwigluClamp(gate, up, limit));
+    let dt = if run.input == ExpertInput::AmaxF16 {
+        for i in 0..n {
+            let (gate, up) = match run.form {
+                ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } => {
+                    (gate_up[2 * i].col(0), gate_up[2 * i + 1].col(0))
+                }
+                ExpertForm::Relu2 => (&[][..], gate_up[i].col(0)),
+            };
+            run.form.combine_into(gate, up, pars[i].col_mut(0));
+            scales[i] = run.input.protect(pars[i].col_mut(0));
+        }
+        sl.extend(pars[..n].iter().map(GroupInput::Ready));
+        matmul_q_group_swiglu_into_on(run.lanes, "host_down", down, &sl, &mut downs[..n], &mut [])
+    } else {
+        match run.form {
+            ExpertForm::Gated { limit } => {
+                for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
+                    sl.push(GroupInput::SwigluClamp(gate, up, limit));
+                }
+            }
+            ExpertForm::GatedOai { alpha, limit } => {
+                for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
+                    sl.push(GroupInput::SwigluOai(gate, up, alpha, limit));
+                }
+            }
+            ExpertForm::Relu2 => {
+                for up in &gate_up[..n] {
+                    sl.push(GroupInput::Relu2(up));
+                }
             }
         }
-        ExpertForm::GatedOai { alpha, limit } => {
-            for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
-                sl.push(GroupInput::SwigluOai(gate, up, alpha, limit));
-            }
-        }
-        ExpertForm::Relu2 => {
-            for up in &gate_up[..n] {
-                sl.push(GroupInput::Relu2(up));
+        matmul_q_group_swiglu_into_on(
+            run.lanes,
+            "host_down",
+            down,
+            &sl,
+            &mut downs[..n],
+            &mut pars[..n],
+        )
+    };
+    *srcs = relist(sl);
+    let dt = dt?;
+    if run.input == ExpertInput::AmaxF16 {
+        for (d, &scale) in downs[..n].iter_mut().zip(&scales[..n]) {
+            for v in d.col_mut(0) {
+                *v *= scale;
             }
         }
     }
-    let dt = matmul_q_group_swiglu_into_on(
-        run.lanes,
-        "host_down",
-        down,
-        &sl,
-        &mut downs[..n],
-        &mut pars[..n],
-    );
-    *srcs = relist(sl);
-    let dt = dt?;
     if let ExpertForm::Relu2 = run.form {
         // Back to back from the top: expert `i`'s up goes to slot `2 * i + 1`,
         // where `HostScratch::up` reads it, and no block moves twice.
@@ -1430,6 +1481,8 @@ pub struct UnionScratch {
     qc: Vec<u8>,
     /// Slot `q`'s down output at `store[q·embd..(q + 1)·embd]`.
     store: Vec<f32>,
+    /// Per-slot activation scales; claims publish them before the down reads.
+    scales: Vec<AtomicU32>,
     plan: UnionPlan,
     /// A narrow call's claim state per distinct expert:
     /// `min(max_cols, DEFER_MAX_COLS) · per_list`, every expert such a call
@@ -1550,6 +1603,7 @@ impl UnionScratch {
             gu: vec![0.0; 2 * slots * ff],
             qc: vec![0; slots * c_col],
             store: vec![0.0; slots * embd],
+            scales: Vec::new(),
             plan: UnionPlan::with_room(cols, per_list),
             claims: (0..cols.min(DEFER_MAX_COLS) * per_list)
                 .map(|_| AtomicU8::new(0))
@@ -1557,6 +1611,16 @@ impl UnionScratch {
             tier_ids: Vec::with_capacity(cols * per_list),
             batches: UnionBatches::with_room(slots),
         }
+    }
+
+    /// Allocate protection scales at load; direct quantization needs none.
+    pub fn set_expert_input(&mut self, policy: ExpertInput) {
+        self.scales = match policy {
+            ExpertInput::Direct => Vec::new(),
+            ExpertInput::AmaxF16 => (0..self.max_slots)
+                .map(|_| AtomicU32::new(1.0f32.to_bits()))
+                .collect(),
+        };
     }
 
     /// The most columns a call through this scratch takes.
@@ -1866,6 +1930,7 @@ fn serve_batched<'w>(
         gu,
         qc,
         store,
+        scales,
         passes,
         batches,
         ..
@@ -1886,7 +1951,8 @@ fn serve_batched<'w>(
     };
     let whole = UnionCall::new(plan.view(), stacks, x, run.form)?
         .spread_over(run.lanes)
-        .post_normed(run.post);
+        .post_normed(run.post)
+        .expert_input(run.input, scales)?;
     let mut xqs = whole.quantize_batched(xq, xq_up, passes);
     slot.clear();
     slot.resize(plan.n(), 0);
@@ -1927,7 +1993,8 @@ fn serve_batched<'w>(
         }
         let batch_call = UnionCall::new(sub.view(), stacks, x, run.form)?
             .spread_over(run.lanes)
-            .post_normed(run.post);
+            .post_normed(run.post)
+            .expert_input(run.input, scales)?;
         batch_call.run_batch(&mut xqs, gu, qc, &mut store[base * embd..], None, passes)?;
         base += sub.cols.len();
         drop(pin);
@@ -1982,6 +2049,7 @@ fn serve_step_split<'w>(
         gu,
         qc,
         store,
+        scales,
         passes,
         batches,
         claims,
@@ -1998,7 +2066,8 @@ fn serve_step_split<'w>(
     let (order, ids) = (&*order, &*ids);
     let whole = UnionCall::new(plan.view(), stacks, x, run.form)?
         .spread_over(run.lanes)
-        .post_normed(run.post);
+        .post_normed(run.post)
+        .expert_input(run.input, scales)?;
     let deferred = defers(x.ne1());
     let mut xqs = if deferred {
         whole.x_rooms(xq, xq_up)
@@ -2032,7 +2101,8 @@ fn serve_step_split<'w>(
         }
         let call = UnionCall::new(sub.view(), stacks, x, run.form)?
             .spread_over(run.lanes)
-            .post_normed(run.post);
+            .post_normed(run.post)
+            .expert_input(run.input, scales)?;
         let claim = deferred.then(|| GroupClaims {
             x: g == 0,
             states: &mut claims[..],
@@ -2069,7 +2139,8 @@ fn serve_planned(
     }
     let call = UnionCall::new(s.plan.view(), stacks, x, run.form)?
         .spread_over(run.lanes)
-        .post_normed(run.post);
+        .post_normed(run.post)
+        .expert_input(run.input, &s.scales)?;
     let slabs = UnionSlabs {
         xq: &mut s.xq,
         xq_up: &mut s.xq_up,
@@ -2637,6 +2708,7 @@ pub struct HostLayer {
     /// made for it ([`HostScratch::new`]).
     ff: usize,
     form: ExpertForm,
+    input: ExpertInput,
     tier: Option<LayerTier>,
     /// The norm each expert's down row takes before its weight
     /// ([`HostLayer::set_post_norm`]); `None`, the plain weighted sum.
@@ -2798,9 +2870,21 @@ impl HostLayer {
             n_expert,
             ff,
             form,
+            input: ExpertInput::Direct,
             tier: None,
             post: None,
         })
+    }
+
+    /// Select the activated expert input policy for every host serving path.
+    /// This is a load-time setting; the default preserves direct quantization.
+    pub fn set_expert_input(&mut self, policy: ExpertInput) {
+        self.input = policy;
+    }
+
+    /// The loaded activated-expert input policy.
+    pub fn expert_input(&self) -> ExpertInput {
+        self.input
     }
 
     /// Give the layer the norm each routed expert's down row takes before
@@ -3091,6 +3175,7 @@ impl HostLayer {
         };
         let run = LegRun {
             form: self.form,
+            input: self.input,
             lanes,
             post: self.post.as_ref(),
         };
@@ -3158,6 +3243,7 @@ impl HostLayer {
         tier.lend(&mut stacks);
         let run = LegRun {
             form: self.form,
+            input: self.input,
             lanes,
             post: self.post.as_ref(),
         };
@@ -3213,6 +3299,7 @@ impl HostLayer {
         )?;
         let run = LegRun {
             form: self.form,
+            input: self.input,
             lanes,
             post: self.post.as_ref(),
         };
@@ -3284,6 +3371,7 @@ impl HostLayer {
         let mut stacks = self.stacks_of(split)?;
         let run = LegRun {
             form: self.form,
+            input: self.input,
             lanes,
             post: self.post.as_ref(),
         };

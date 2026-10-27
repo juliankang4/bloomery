@@ -162,6 +162,7 @@ pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError>
         hp.n_used as u64,
         (TIER_CHUNK, crate::moe::UNION_MAX_COLS as u64),
         crate::placement::accepts::leg_down_forms(Program::Glm5nextBody, &inputs.model),
+        false,
     )
 }
 

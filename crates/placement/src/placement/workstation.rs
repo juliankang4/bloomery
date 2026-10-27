@@ -439,6 +439,8 @@ pub struct TierLegScratch {
     pub n_used: u64,
     pub chunk: u64,
     pub downs: DownForms,
+    /// One f32 input-restoration scale per slot of the leg's chunk.
+    pub input_scales: bool,
 }
 
 impl TierLegScratch {
@@ -462,7 +464,16 @@ impl TierLegScratch {
         {
             return Err(invalid());
         }
-        try_leg_bytes(self.chunk, self.n_used, self.n_embd, self.ff, downs).ok_or_else(invalid)
+        let counted = || {
+            let bytes = try_leg_bytes(self.chunk, self.n_used, self.n_embd, self.ff, downs)?;
+            let scales = if self.input_scales {
+                4u64.checked_mul(self.chunk)?.checked_mul(self.n_used)?
+            } else {
+                0
+            };
+            bytes.checked_add(scales)
+        };
+        counted().ok_or_else(invalid)
     }
 }
 
@@ -617,6 +628,7 @@ pub fn tier_leg_batch_bytes(
         n_used,
         (chunk, cols),
         DownForms::of(DownAct::Q8Act),
+        false,
     )
 }
 
@@ -628,6 +640,7 @@ pub fn try_tier_leg_batch_bytes_of(
     n_used: u64,
     (chunk, cols): (u64, u64),
     downs: DownForms,
+    input_scales: bool,
 ) -> Result<TierBatchBytes, PlacementError> {
     let leg = TierLegScratch {
         n_embd,
@@ -635,6 +648,7 @@ pub fn try_tier_leg_batch_bytes_of(
         n_used,
         chunk,
         downs,
+        input_scales,
     };
     let scratch = leg.bytes(downs)?;
     let counted = || -> Option<(u64, u64)> {
@@ -1745,6 +1759,41 @@ mod tests {
         placed_with_arena, plan_a, plan_a_draft, plan_bp, plan_gate, plan_holding, plan_node_tiers,
         plan_on, plan_room, plan_tiers, spec_of_device, tier_batch_bytes, unified_of,
     };
+
+    #[test]
+    fn tier_input_scales_cost_one_f32_per_chunk_slot() {
+        use crate::kernels::{DownAct, DownForms};
+
+        let both = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
+        for chunk in [1, 8, 16] {
+            for downs in [DownForms::NONE, DownForms::of(DownAct::Q8Act), both] {
+                let direct =
+                    super::try_tier_leg_batch_bytes_of(256, 256, 6, (chunk, 32), downs, false)
+                        .expect("direct descriptor");
+                let scaled =
+                    super::try_tier_leg_batch_bytes_of(256, 256, 6, (chunk, 32), downs, true)
+                        .expect("scaled descriptor");
+                assert_eq!(scaled.staging, direct.staging);
+                assert_eq!(scaled.host, direct.host);
+                assert_eq!(scaled.scratch, direct.scratch + 4 * chunk * 6);
+                assert_eq!(
+                    scaled.card().expect("scaled card"),
+                    direct.card().expect("direct card") + 4 * chunk * 6,
+                );
+                let leg = scaled.leg.expect("scaled leg");
+                assert!(leg.input_scales);
+                assert_eq!(
+                    leg.bytes(DownForms::NONE).expect("empty selected union"),
+                    direct
+                        .leg
+                        .expect("direct leg")
+                        .bytes(DownForms::NONE)
+                        .expect("empty union")
+                        + 4 * chunk * 6,
+                );
+            }
+        }
+    }
 
     /// One plan room: `tools/ref/plan-room.sh --room`, the room
     /// `records-refresh` makes V4.1's plans at, prints [`PLAN_ROOM`], and

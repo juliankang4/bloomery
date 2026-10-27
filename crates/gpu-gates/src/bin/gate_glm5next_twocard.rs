@@ -192,7 +192,8 @@ mod gate {
 
     use crate::glm5next_tier;
     use crate::quiet::Quiet;
-    use crate::tier_twocard::{self, Leg, Sent, plus, same, sent_between, sent_every, union_plan};
+    use crate::tier_twocard::{self, Leg, Sent, plus, same, sent_between, sent_every};
+    use model::placement::union_plan;
 
     const NAME: &str = "gate_glm5next_twocard";
     /// The card budget both plans are made under (module header: the union

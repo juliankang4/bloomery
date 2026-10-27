@@ -67,7 +67,7 @@ fn live_keys(count: u32, ctx: usize) -> usize {
     clippy::too_many_arguments,
     reason = "the tile step's state is the caller's registers, passed by reference"
 )]
-unsafe fn fold_tile(
+pub(crate) unsafe fn fold_tile(
     sc: f32,
     live: bool,
     mx: &mut f32,

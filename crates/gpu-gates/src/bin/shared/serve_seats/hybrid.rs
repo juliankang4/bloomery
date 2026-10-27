@@ -1,6 +1,6 @@
-//! The seat of a body that runs one chain on one card, fed in prompt batches:
-//! the one owner of the open, the load record, the seat's calls and the think
-//! tags, for the family whose body holds one sequence ([`solar2`](super::solar2)).
+//! A common hybrid HTTP seat over one chain on one card: opening, planning,
+//! resident sequence selection, load records and prompt calls. Its body's
+//! sequence capability preserves named refusals for single-sequence families.
 //!
 //! A seat gives its family the facts the run needs — the architectures it
 //! accepts, its plan inputs, the words its refusals name and the records it
@@ -13,8 +13,8 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use app::arch::HybridCfg;
-use app::{Keep, Loaded, OpenArgs, OpenLog, Prompt, Session, SessionError};
+use app::arch::{Batch, HybridCfg, SequenceSlots};
+use app::{Loaded, OpenArgs, OpenLog, Prompt, Session, SessionError};
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu_gates::GateError;
@@ -40,7 +40,7 @@ use super::tiered::{self, Open, Tiered};
 pub trait Family: Sized + 'static {
     /// The body the seat serves: one chain on one card, fed in prompt
     /// batches.
-    type Body: ChainBody + app::Open<Inputs = PlanInputs<Self::H>, Cfg = HybridCfg> + Prompt + Keep;
+    type Body: Batch<Inputs = PlanInputs<Self::H>>;
 
     /// The family's hyperparameters: what its plan inputs are read for.
     type H;
@@ -63,6 +63,11 @@ pub trait Family: Sized + 'static {
 
     /// The file's plan inputs, its own reading.
     fn read(split: &Split) -> Result<PlanInputs<Self::H>, PlacementError>;
+
+    /// Price the chosen prompt group before the common context probes.
+    fn configure(_inputs: &mut PlanInputs<Self::H>, _group: usize) -> Result<(), GateError> {
+        Ok(())
+    }
 
     /// The records the seat prints, registered once at `main`.
     fn register();
@@ -118,6 +123,7 @@ struct Log<F> {
     opened: Duration,
     ctx: usize,
     group: usize,
+    slots: usize,
     host_experts: u64,
     card_experts: u64,
     graph_nodes: usize,
@@ -160,7 +166,7 @@ impl<F: Family> OpenLog<F::Body> for Log<F> {
 }
 
 impl<F: Family> Log<F> {
-    /// The `load` record of `m`, the one slot ready.
+    /// The `load` record of `m`, with every planned slot ready.
     fn record(&self, m: &GpuModel<F::Body>) {
         if let Some((card, rate)) = &self.lane {
             record::lane(card, rate).eprint();
@@ -170,7 +176,7 @@ impl<F: Family> Log<F> {
             .w("arch", <F::Body as ChainBody>::arch().name())
             .u("resident_bytes", m.resident_bytes())
             .u("ctx", self.ctx)
-            .u("slots", 1)
+            .u("slots", self.slots)
             .u("layers", m.layers().len())
             .u("host_experts", self.host_experts)
             .u("card_experts", self.card_experts)
@@ -196,6 +202,7 @@ fn open_session<F: Family>(a: Open<()>) -> Result<Hybrid<F>, GateError> {
         opened: Duration::ZERO,
         ctx: a.ctx,
         group: a.group,
+        slots: a.slots.get(),
         pin_main: a.pin_main,
         pinned,
         host_experts: 0,
@@ -220,16 +227,26 @@ fn open_session<F: Family>(a: Open<()>) -> Result<Hybrid<F>, GateError> {
             host: a.host,
             residency: a.residency,
             group: a.group,
+            slots: a.slots,
         },
     };
-    let s = Loaded::<F::Body>::open(file, args, &mut log)?
+    let mut s = Loaded::<F::Body>::open(file, args, &mut log)?
         .ok_or("the open stopped at its plan")?
         .ready(&mut log)?;
+    <F::Body as Batch>::Sequences::add(&mut s, a.slots)?;
     log.record(s.model());
     Ok(Hybrid { s, ctx: a.ctx })
 }
 
 impl<F: Family> Seat for Hybrid<F> {
+    fn slots(&self) -> usize {
+        <F::Body as Batch>::Sequences::count(&self.s)
+    }
+
+    fn select(&mut self, slot: usize) -> Result<(), GateError> {
+        Ok(<F::Body as Batch>::Sequences::select(&mut self.s, slot)?)
+    }
+
     fn pos(&self) -> usize {
         self.s.model().pos() as usize
     }
@@ -309,7 +326,8 @@ impl<F: Family> Tiered for Hybrid<F> {
     const ALIAS: &'static str = F::ALIAS;
     const FAMILY: &'static str = F::FAMILY;
     const SERVES: &'static str = F::SERVES;
-    const RESIDENT: bool = false;
+    const RESIDENT: bool = <<F::Body as Batch>::Sequences as SequenceSlots<F::Body>>::RESIDENT;
+    const ONE_PASS: bool = false;
 
     fn accepts(arch: Arch) -> bool {
         F::accepts(arch)
@@ -317,6 +335,10 @@ impl<F: Family> Tiered for Hybrid<F> {
 
     fn read(split: &Split) -> Result<PlanInputs<F::H>, PlacementError> {
         F::read(split)
+    }
+
+    fn configure(inputs: &mut PlanInputs<Self::H>, group: usize) -> Result<(), GateError> {
+        F::configure(inputs, group)
     }
 
     fn flags(_flag: &str, _value: &str, _out: &mut ()) -> Result<bool, GateError> {

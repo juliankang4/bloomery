@@ -5116,6 +5116,52 @@ pub enum ExpertForm {
     Relu2,
 }
 
+/// How an activated routed expert enters its down projection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExpertInput {
+    /// Quantize the activation unchanged.
+    #[default]
+    Direct,
+    /// Rescale each expert/token activation for F16 activation-block sums,
+    /// then restore the down output before applying its router weight.
+    AmaxF16,
+}
+
+impl ExpertInput {
+    /// Divide one activated expert/token column by the oracle's scale.
+    /// The returned factor restores its down output.
+    pub(crate) fn protect(self, h: &mut [f32]) -> f32 {
+        match self {
+            ExpertInput::Direct => 1.0,
+            ExpertInput::AmaxF16 => {
+                let mut amax = 0.0f32;
+                for &v in h.iter() {
+                    assert!(v.is_finite(), "expert input: non-finite activation {v}");
+                    amax = amax.max(v.abs());
+                }
+                let exponent = ((amax / 1024.0).ln() * std::f32::consts::LOG2_E)
+                    .ceil()
+                    .clamp(0.0, 127.0);
+                let scale = (exponent * std::f32::consts::LN_2).exp();
+                for v in h {
+                    *v /= scale;
+                }
+                scale
+            }
+        }
+    }
+}
+
+impl ExpertForm {
+    pub(crate) fn combine_into(self, gate: &[f32], up: &[f32], out: &mut [f32]) {
+        match self {
+            ExpertForm::Gated { limit } => swiglu_into(gate, up, Some(limit), out),
+            ExpertForm::GatedOai { alpha, limit } => swiglu_oai_into(gate, up, alpha, limit, out),
+            ExpertForm::Relu2 => relu2_into(up, out),
+        }
+    }
+}
+
 /// A layer's norm of each routed expert's down row before the row's router
 /// weight applies: the row scaled by `gain`, then divided by the root of its
 /// mean square plus `eps` (the card's `gain_rms_norm`). An architecture whose
@@ -5375,6 +5421,7 @@ struct Combines<'c> {
     gu: &'c [f32],
     ff: usize,
     form: ExpertForm,
+    scales: Option<&'c [std::sync::atomic::AtomicU32]>,
     ty: GgmlType,
     qc: SharedQuantCols,
 }
@@ -5412,6 +5459,10 @@ impl Combines<'_> {
                     let up = &self.gu[q * self.ff..][..self.ff];
                     relu2_into(up, par);
                 }
+            }
+            if let Some(scales) = self.scales {
+                let scale = ExpertInput::AmaxF16.protect(par);
+                scales[q].store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
             }
             // SAFETY: the caller owns slot `q` of `qc`.
             unsafe { self.qc.quantize_into(self.ty, self.ff, par, q) };
@@ -5824,6 +5875,7 @@ pub(crate) struct UnionCall<'c, 'w> {
     /// The norm each down takes before its weight in the sums, when the
     /// layer has one.
     post: Option<&'c PostNorm>,
+    scales: Option<&'c [std::sync::atomic::AtomicU32]>,
 }
 
 impl<'c, 'w> UnionCall<'c, 'w> {
@@ -5861,6 +5913,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             down,
             spread: Lanes::Flat,
             post: None,
+            scales: None,
         })
     }
 
@@ -5875,6 +5928,28 @@ impl<'c, 'w> UnionCall<'c, 'w> {
     /// default).
     pub(crate) fn post_normed(self, post: Option<&'c PostNorm>) -> Self {
         UnionCall { post, ..self }
+    }
+
+    /// Apply the loaded activation policy, using load-allocated slot scales.
+    pub(crate) fn expert_input(
+        self,
+        input: ExpertInput,
+        scales: &'c [std::sync::atomic::AtomicU32],
+    ) -> Result<Self, crate::ModelError> {
+        let scales = match input {
+            ExpertInput::Direct => None,
+            ExpertInput::AmaxF16 => {
+                if scales.len() < self.plan.slots() {
+                    return Err(crate::ModelError::Metadata {
+                        key: "host union expert input".to_string(),
+                        detail: "AmaxF16 requires UnionScratch::set_expert_input at load"
+                            .to_string(),
+                    });
+                }
+                Some(scales)
+            }
+        };
+        Ok(UnionCall { scales, ..self })
     }
 
     /// The cells the gate/up pass writes: two columns a slot gated — the
@@ -6215,6 +6290,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
                 cb: self.down.cb,
                 ptr: qc.as_mut_ptr(),
             },
+            scales: self.scales,
         }
     }
 
@@ -6299,6 +6375,14 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         let mut pacc = profile::CallAcc::new();
         let t0 = if lvl > 0 { Some(Instant::now()) } else { None };
         run_row_pool(&set, lvl, &mut pacc, true, self.spread)?;
+        if let Some(scales) = self.scales {
+            for (row, scale) in store.chunks_exact_mut(self.down.n).zip(scales) {
+                let scale = f32::from_bits(scale.load(std::sync::atomic::Ordering::Relaxed));
+                for v in row {
+                    *v *= scale;
+                }
+            }
+        }
         let claim_ns = claims.claim_ns.into_inner();
         if let Some(t0) = t0 {
             let wall = t0.elapsed().as_nanos() as u64;
@@ -6756,6 +6840,35 @@ mod tests {
         unit_tile_cost,
     };
     use gguf::{GgmlType, Gguf};
+
+    #[test]
+    fn expert_range_protection_preserves_values_and_bounds_large_activated_inputs() {
+        use super::ExpertInput;
+        for peak in [0.0f32, 1024.0, 1024.125, 2048.0, 2048.25, 1.0e8] {
+            let original = [peak, -peak * 0.5, peak * 0.25];
+            let mut direct = original;
+            assert_eq!(ExpertInput::Direct.protect(&mut direct), 1.0);
+            assert_eq!(direct, original);
+            let mut protected = original;
+            let scale = ExpertInput::AmaxF16.protect(&mut protected);
+            assert!(
+                protected
+                    .iter()
+                    .all(|v| v.abs() <= 1024.0 * (1.0 + 4.0 * f32::EPSILON))
+            );
+            if peak <= 1024.0 {
+                assert_eq!(scale, 1.0);
+                assert_eq!(protected, original);
+            } else {
+                assert!(scale > 1.0);
+                for (actual, expected) in protected.into_iter().zip(original) {
+                    assert!(
+                        (actual * scale - expected).abs() <= expected.abs() * 2.0 * f32::EPSILON
+                    );
+                }
+            }
+        }
+    }
 
     /// A GGUF v3 file holding one `[k, 2]` tensor `w` of type `ty` over zero bytes —
     /// the least the strict reader opens.

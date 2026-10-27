@@ -4,20 +4,17 @@
 //! [`shadow`], [`back`]) or a unit's rows (the batch: [`Routed::front_rows`] and its three). Both feeds leave the same
 //! bits but the shared expert's rows of a unit of [`GATED_FROM`] rows or more, which its GEMMs write.
 //!
-//! Every layer is a routed layer with one shared expert, so the block has no dense arm. The router, the handoff, the
-//! go, the card experts' call and the wait and add around the host leg are the common routed block
-//! ([`bloomery_gpu::routed_block`]); this file holds the shared expert and the base the card sum is added to. Its
-//! parts around the host leg:
-//! - the front: `ffn_norm` RMS of the rows of the residual after the mixer `x1`, and the router over them: the
-//!   scores, the selection bias (the choice only), the top `R::N_USED`, the weights from the unbiased scores
-//!   normalized and scaled. The step goes on to the handoff into the host-mapped image and the go; four launches.
-//!   The batch downloads the rows, weights and ids to the host ([`Routed::download`]).
-//! - the shadow: while the host computes, the shared expert, its output summed into `x1` (`x1s`), then the card
-//!   experts the slot map puts on the card with `x1s` as the base their sum is added to; none of the latter on a
-//!   layer with no card experts. The base is `x1 + shared` before the card sum is added, in the step and the batch
-//!   alike.
-//! - the back: the wait, then the add of the host's routed sum and the shadow's `card + x1s` (`x1s` alone on a
-//!   layer with no card experts). One launch after the wait.
+//! Dense leading layers run the common dense block; routed layers have one ungated shared expert. The router,
+//! handoff, go, card experts and host wait are the common routed block ([`bloomery_gpu::routed_block`]).
+//! [`FfnConfig`] resolves the residual association and expert-input range protection once at load:
+//! - the front normalizes the attention residual, scores and selects through `R`'s normalization and bias
+//!   policy, then hands the normed row and picks to the host;
+//! - the shadow computes the shared expert and card experts while the host runs. The default saves
+//!   `residual + shared` as the base. [`ResidualOrder::RoutedSharedResidual`] keeps the residual separate;
+//! - the back joins the host and card routed sums. The default adds the host to the card-plus-base rows;
+//!   the other association computes `(routed + shared) + residual`, after the complete routed sum is ready.
+//!
+//! The step and prompt batch use the same loaded association, including tier-card joins.
 //!
 //! A load whose slot map names an expert tier card ([`TierSide`]) runs a layer the tier holds experts of as a tier
 //! layer: the front's handoff also writes the tier's image and each slot's tier place and the go is the host's and the
@@ -28,15 +25,15 @@
 //! [`Routed::join_rows`] (the host leg's [`bloomery_gpu::host::BatchLeg::join_tiered`] hands the tier's rows to the
 //! join, then [`Routed::back_rows`]).
 //!
-//! What a family fixes is its router instance, its [`CardFamily`] (stack names, counts) and what its description
-//! says: the routed experts' and the shared expert's activation ([`rule_of`]: a SwiGLU clamp or SwiGLU-OAI), the
-//! weights' scale and widths, which every layer agrees on ([`describe`]). The shared expert's down is Q6_K or Q4_K
-//! by layer, so its block plan is read per layer. The shared expert's Q8_0 pair kernel runs the clamp alone, so a
-//! SwiGLU-OAI shared expert on Q8_0 weights is refused by name at the first launch.
+//! What a family fixes is its router instance, its [`CardFamily`] (stack names, counts), the loaded arithmetic
+//! facts, and its description: the routed and shared activations ([`rule_of`]), scales and widths
+//! ([`describe`]). Shared and dense block plans are read per layer and support mixed sites, including IQ4_XS.
+//! A Q8_0 shared pair runs the clamp alone; a SwiGLU-OAI shared expert on it is refused before launch.
 
 use std::sync::Arc;
 
 use bloomery_gpu::card_experts::{CardBatch, CardExperts, CardFamily};
+use bloomery_gpu::card_leg::ExpertInput;
 use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
 use bloomery_gpu::host::leg_tier::TierSide;
 use bloomery_gpu::host::run::HostRun;
@@ -58,9 +55,13 @@ use crate::chain::ffn::FfnBatchKernels;
 use crate::experts::ExpertKernels;
 use crate::span::{span, span_mut};
 use crate::tier_join::{self, TierBatch, TierSlots};
-use cuda_core::{CudaStream, DeviceBuffer};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::float::add_rn_f32;
+use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
+use cuda_host::cuda_module;
 use gguf::Split;
 use model::arch::names;
+use model::placement::kernels::ffn;
 use models::{Act as ActRule, Ffn, LayerSpec, Score};
 
 /// What the refusals of this file name.
@@ -70,7 +71,125 @@ const WHAT: &str = "shared routed block";
 /// GEMM a site): below it `enqueue_block_cols` runs the step's gemvs on each
 /// column (at most 8 columns), so a unit of up to 8 rows writes the step's
 /// bits and from it a launch count of 6 replaces 4 a column.
-pub const GATED_FROM: usize = 9;
+pub const GATED_FROM: usize = ffn::GATED_FROM as usize;
+
+/// The association of a routed block's shared output and attention residual.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResidualOrder {
+    /// The shared output joins the residual before the routed sum.
+    #[default]
+    ResidualSharedRouted,
+    /// The complete routed sum joins the shared output before the residual.
+    RoutedSharedResidual,
+}
+
+/// Arithmetic facts resolved once when the routed block is loaded.
+#[derive(Clone, Copy, Debug)]
+pub struct FfnConfig {
+    pub residual: ResidualOrder,
+    pub expert_input: ExpertInput,
+}
+
+impl Default for FfnConfig {
+    fn default() -> Self {
+        Self {
+            residual: ResidualOrder::ResidualSharedRouted,
+            expert_input: ExpertInput::Direct,
+        }
+    }
+}
+
+#[cuda_module]
+mod residual_kernels {
+    use super::*;
+
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            host.len() >= n,
+            card.len() >= n,
+            shared.len() >= n,
+            residual.len() >= n,
+            dest.len() >= n
+        )
+    )]
+    pub fn routed_shared_residual(
+        host: &[f32],
+        card: &[f32],
+        shared: &[f32],
+        residual: &[f32],
+        has_card: u32,
+        n: u32,
+        mut dest: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: the launch bounds every input and output by n; i is guarded.
+        unsafe {
+            let mut routed = *host.get_unchecked(i);
+            if has_card != 0 {
+                routed = add_rn_f32(routed, *card.get_unchecked(i));
+            }
+            let ffn = add_rn_f32(routed, *shared.get_unchecked(i));
+            *dest.get_unchecked_mut(i) = add_rn_f32(ffn, *residual.get_unchecked(i));
+        }
+    }
+}
+
+struct ResidualKernels {
+    module: residual_kernels::LoadedModule,
+}
+
+impl ResidualKernels {
+    fn load(ctx: &Arc<CudaContext>) -> Result<Self, GpuError> {
+        // SAFETY: this package owns the embedded bundle; enqueue checks its contract.
+        let module = unsafe { bloomery_gpu::shared_module!(residual_kernels, ctx)? };
+        Ok(Self { module })
+    }
+
+    fn enqueue(
+        &self,
+        stream: &CudaStream,
+        (host, card): (&DeviceBuffer<f32>, Option<&DeviceBuffer<f32>>),
+        (shared, residual): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
+        n: usize,
+        dest: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        if n == 0
+            || host.len() < n
+            || card.is_some_and(|c| c.len() < n)
+            || shared.len() < n
+            || residual.len() < n
+            || dest.len() < n
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                "routed residual join outside its buffers",
+            ));
+        }
+        let n = bloomery_gpu::launch_u32(WHAT, "residual values", n)?;
+        let prep = self
+            .module
+            .prepare_routed_shared_residual(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.routed_shared_residual(
+            stream,
+            &prep,
+            host,
+            card.unwrap_or(host),
+            shared,
+            residual,
+            u32::from(card.is_some()),
+            n,
+            dest,
+        )?;
+        Ok(())
+    }
+}
 
 /// What the load takes of the model besides the description and the file.
 #[derive(Clone, Copy, Debug)]
@@ -146,16 +265,15 @@ impl DenseFfn {
     }
 }
 
-/// Layer `l`'s routed block for the common one: its norm, router and bias
-/// tensors (every layer has a bias) and its row in `map`.
-fn route_layer(map: &SlotMap, l: usize) -> Result<RouteLayer, GpuError> {
+/// Layer `l`'s norm, router, optional selection bias and row in `map`.
+fn route_layer(map: &SlotMap, l: usize, bias: bool) -> Result<RouteLayer, GpuError> {
     let row_off = map
         .row_offset(l)
         .ok_or_else(|| GpuError::shape(WHAT, format!("layer {l}: no row in the slot map")))?;
     Ok(RouteLayer {
         norm: names::ffn_norm(l),
         router: names::ffn_gate_inp(l),
-        bias: Some(names::exp_probs_b(l)),
+        bias: bias.then(|| names::exp_probs_b(l)),
         row_off,
     })
 }
@@ -169,6 +287,8 @@ struct Kernels {
     experts: ExpertKernels,
     /// The K-quant block's kernels: the shared expert is K-quant in this file.
     block: Option<KBlockKernels>,
+    /// Loaded only for the routed-plus-shared, then residual association.
+    residual: Option<ResidualKernels>,
 }
 
 /// The step's buffers: the router's outputs and each slot's place, and the
@@ -191,6 +311,31 @@ struct SharedWide {
     u: DeviceBuffer<f32>,
 }
 
+fn wide_layout(
+    (gate_up, down): (&[SiteTy], &[SiteTy]),
+    (embd, ff): (usize, usize),
+) -> ffn::WideBlock {
+    let forms = |types: &[SiteTy]| {
+        types.iter().fold(ffn::WideForms::default(), |forms, ty| {
+            forms.with(ty.reads())
+        })
+    };
+    ffn::WideBlock {
+        hidden: embd as u64,
+        ff: ff as u64,
+        input: forms(gate_up).without_f32(),
+        down: forms(down),
+    }
+}
+
+fn device_forms(forms: ffn::WideForms) -> site::WideForms {
+    site::WideForms {
+        q128: forms.quant.q128,
+        q32: forms.quant.q32,
+        f32: forms.f32,
+    }
+}
+
 impl SharedWide {
     /// Buffers for up to `cap` rows over a block of width `ff` on `embd` values, whose gate and up read
     /// the types `gate_up` and whose down reads the types `down`. Load-time only.
@@ -200,11 +345,12 @@ impl SharedWide {
         (cap, embd, ff): (usize, usize, usize),
     ) -> Result<SharedWide, GpuError> {
         let stream = gpu.stream();
+        let layout = wide_layout((gate_up, down), (embd, ff));
         Ok(SharedWide {
             gemm: GemmKernels::load(gpu.context())?,
             route: GemmRoute::new(stream, cap, 1)?,
-            x: WideActs::new(stream, WideActs::wants_of(gate_up).without_f32(), cap, embd)?,
-            h: WideActs::new(stream, WideActs::wants_of(down), cap, ff)?,
+            x: WideActs::new(stream, device_forms(layout.input), cap, embd)?,
+            h: WideActs::new(stream, device_forms(layout.down), cap, ff)?,
             g: DeviceBuffer::zeroed(stream, cap * ff)?,
             u: DeviceBuffer::zeroed(stream, cap * ff)?,
         })
@@ -325,7 +471,21 @@ impl BatchBufs {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let (shared_gate_up, shared_down) = block_types(per.iter().flatten().map(|l| &l.plan));
         let (dense_gate_up, dense_down) = block_types(dense.iter().flatten().map(|l| &l.plan));
-        Ok(BatchBufs {
+        let layout = ffn::RoutedBatch {
+            hidden: embd as u64,
+            experts: R::N_EXPERT as u64,
+            used: R::N_USED as u64,
+            shared: wide_layout((&shared_gate_up, &shared_down), (embd, ff)),
+            dense: (dense_ff > 0)
+                .then(|| wide_layout((&dense_gate_up, &dense_down), (embd, dense_ff))),
+            card: (card.any() || card.any_tier()).then(|| card.batch_layout(cap)),
+            tiered,
+        };
+        let expected = layout
+            .bytes(cap as u64)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| GpuError::shape(WHAT, "routed batch scratch byte overflow"))?;
+        let buffers = BatchBufs {
             cap,
             normed: z(cap * embd)?,
             probs: z(cap * R::N_EXPERT)?,
@@ -348,7 +508,14 @@ impl BatchBufs {
             tier: tiered
                 .then(|| TierBatch::new(stream, cap, R::N_USED))
                 .transpose()?,
-        })
+        };
+        if buffers.bytes() != expected {
+            return Err(GpuError::shape(
+                WHAT,
+                "routed batch allocation differs from its common scratch descriptor",
+            ));
+        }
+        Ok(buffers)
     }
 
     fn bytes(&self) -> usize {
@@ -448,8 +615,8 @@ struct Described {
 }
 
 /// The description of `layers` as the compiled router, handoff and shared
-/// block run it: `R`'s experts and picks, sigmoid scores with a bias and
-/// normalized weights, a SwiGLU or SwiGLU-OAI shared expert without a gate.
+/// block run it: `R`'s experts, picks, normalization and bias policy; sigmoid scores and a
+/// SwiGLU or SwiGLU-OAI shared expert without a gate.
 /// Anything else is refused by name with its layer.
 fn describe<R: RouterEntry>(layers: &[LayerSpec]) -> Result<Described, GpuError> {
     let (mut scale, mut expert_ff, mut shared_ff) = (None, None, None);
@@ -469,8 +636,8 @@ fn describe<R: RouterEntry>(layers: &[LayerSpec]) -> Result<Described, GpuError>
             || m.top_k as usize != R::N_USED
             || m.latent.is_some()
             || r.score != Score::Sigmoid
-            || !r.bias
-            || r.norm != models::RouterNorm::SelectedSum
+            || (!r.bias && !R::OPTIONAL_BIAS)
+            || r.norm != R::NORM
             || r.hash
             || shared.sigmoid_gate
         {
@@ -478,9 +645,11 @@ fn describe<R: RouterEntry>(layers: &[LayerSpec]) -> Result<Described, GpuError>
                 WHAT,
                 format!(
                     "layer {l}: {m:?} is not the {}-expert top-{} sigmoid router \
-                     with a bias, normalized weights and an ungated shared expert",
+                     with {:?} normalization, optional bias={} and an ungated shared expert",
                     R::N_EXPERT,
-                    R::N_USED
+                    R::N_USED,
+                    R::NORM,
+                    R::OPTIONAL_BIAS
                 ),
             ));
         }
@@ -531,6 +700,28 @@ impl<R: RouterEntry> Routed<R> {
         d: RoutedDims,
         card: CardFamily,
     ) -> Result<Routed<R>, GpuError> {
+        Self::new_configured(
+            gpu,
+            file,
+            w,
+            (layers, map, slots),
+            d,
+            card,
+            FfnConfig::default(),
+        )
+    }
+
+    /// Load the same common block with explicit arithmetic facts. The default keeps the legacy
+    /// association and expert input unchanged; the selected policies apply to every routed layer.
+    pub fn new_configured(
+        gpu: &Gpu,
+        file: &Split,
+        w: &Weights,
+        (layers, map, slots): (&[LayerSpec], &SlotMap, &Arc<DeviceTensor<u32>>),
+        d: RoutedDims,
+        card: CardFamily,
+        config: FfnConfig,
+    ) -> Result<Routed<R>, GpuError> {
         if (card.n_expert, card.n_used) != (R::N_EXPERT, R::N_USED) {
             return Err(GpuError::shape(
                 card.what,
@@ -564,7 +755,11 @@ impl<R: RouterEntry> Routed<R> {
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
         let routes = (0..layers.len())
-            .map(|l| routed(l).then(|| route_layer(map, l)).transpose())
+            .map(|l| {
+                moe_of(layers, l)
+                    .map(|m| route_layer(map, l, m.router.bias))
+                    .transpose()
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let route_dims = RouteDims {
             embd: d.embd,
@@ -577,6 +772,9 @@ impl<R: RouterEntry> Routed<R> {
         let k = Kernels {
             g32: Gemm32Kernels::load(ctx)?,
             experts: ExpertKernels::load(ctx)?,
+            residual: (config.residual == ResidualOrder::RoutedSharedResidual)
+                .then(|| ResidualKernels::load(ctx))
+                .transpose()?,
             block: per
                 .iter()
                 .flatten()
@@ -606,10 +804,12 @@ impl<R: RouterEntry> Routed<R> {
             })
             .transpose()?;
         let dims = (d.embd, desc.expert_ff);
-        let card = match tier {
+        let mut card = match tier {
             Some(_) => CardExperts::tiered(gpu, w, card, layers, map, dims, 1)?,
             None => CardExperts::new(gpu, w, card, layers, map, dims, 1)?,
         };
+        card.set_expert_input(gpu, config.expert_input)?;
+        card.set_add_base(config.residual == ResidualOrder::ResidualSharedRouted);
         let dense_ff = dense.iter().flatten().map(|l| l.ff).max().unwrap_or(0);
         let batch = (d.batch_rows > 1)
             .then(|| {
@@ -703,9 +903,8 @@ impl<R: RouterEntry> Routed<R> {
         self.step.route.ids()
     }
 
-    /// Layer `l`'s selection bias, the values the router adds to the scores
-    /// before it ranks them: the ranking a reference engine's picks are read
-    /// at.
+    /// Layer `l`'s selection bias for reference-pick inspection. A layer with no bias is refused by
+    /// name; execution handles it through the router's optional-bias policy.
     pub fn route_bias<'a>(
         &'a self,
         w: &'a Weights,
@@ -766,10 +965,8 @@ fn shared_launch<'a>(
     (kernels, blk)
 }
 
-/// Enqueue layer `l`'s shared expert and card experts of the step in its host
-/// leg's shadow, after its [`front`]: `x1s` is `x1` plus the shared expert's
-/// output, and the card sum plus `x1s` goes to the card experts' `pre` where
-/// the layer has any.
+/// Enqueue layer `l`'s shared and card experts after [`front`], while the host runs. `x1s` holds the
+/// legacy residual-plus-shared base, or the saved residual when the loaded association joins it last.
 pub fn shadow<R: RouterEntry>(
     gpu: &Gpu,
     w: &Weights,
@@ -786,8 +983,13 @@ pub fn shadow<R: RouterEntry>(
         y: &mut r.step.sh_y,
     };
     enqueue_block_act(gpu, w, &kernels, &mut r.block, (&blk, r.rules.1), io)?;
-    gpu.elem()
-        .enqueue_add(stream, x1, &r.step.sh_y, r.d.embd, &mut r.step.x1s)?;
+    if r.k.residual.is_some() {
+        span_mut(WHAT, &mut r.step.x1s, 0, r.d.embd)?
+            .copy_from_device_async(&*span(WHAT, x1, 0, r.d.embd)?, stream)?;
+    } else {
+        gpu.elem()
+            .enqueue_add(stream, x1, &r.step.sh_y, r.d.embd, &mut r.step.x1s)?;
+    }
     let rule = r.rules.0;
     r.route.shadow(
         (gpu, w),
@@ -812,6 +1014,19 @@ pub fn back<R: RouterEntry>(
 ) -> Result<(), GpuError> {
     let n_tier = r.card.tier_k(l);
     if n_tier == 0 {
+        if let Some(join) = &r.k.residual {
+            hybrid.boundary().enqueue_back_of(gpu.stream(), 0, l)?;
+            return join.enqueue(
+                gpu.stream(),
+                (
+                    hybrid.boundary().hsum_of(0)?,
+                    r.card.has(l).then(|| r.card.acc()),
+                ),
+                (&r.step.sh_y, &r.step.x1s),
+                r.d.embd,
+                dest,
+            );
+        }
         return r.route.back(gpu, hybrid, &r.card, l, (&r.step.x1s, dest));
     }
     const W: &str = "shared routed back (tier layer)";
@@ -827,6 +1042,22 @@ pub fn back<R: RouterEntry>(
         n_tier,
         n_used: R::N_USED,
     };
+    if let Some(residual) = &r.k.residual {
+        hybrid.enqueue_tier_back(gpu.stream(), l, 0)?;
+        let mut join = r.card.step_join(r.step.route.sel());
+        tier_join::enqueue_acc(
+            (gpu.stream(), kernels),
+            (&mut join, &slots),
+            (hybrid.tier_rows(0)?, 1),
+        )?;
+        return residual.enqueue(
+            gpu.stream(),
+            (hybrid.boundary().hsum_of(0)?, Some(join.acc)),
+            (&r.step.sh_y, &r.step.x1s),
+            r.d.embd,
+            dest,
+        );
+    }
     tier_join::enqueue_step_join(
         gpu,
         kernels,
@@ -961,10 +1192,8 @@ impl<R: RouterEntry> Routed<R> {
         self.card_rows(gw, lm, (&[], None))
     }
 
-    /// Layer `l`'s shared expert over the `m` rows [`Routed::front_rows`]
-    /// wrote: the shared expert's rows (per column below [`GATED_FROM`] rows,
-    /// on `site::gated` from it) and `x1s = x1 + shared`, the base
-    /// [`Routed::card_rows`] adds the card sum to.
+    /// Layer `l`'s shared expert over the `m` normed rows, per column below [`GATED_FROM`] and on
+    /// `site::gated` from it. Keep the residual-plus-shared base or the separate residual, as loaded.
     pub fn shared_rows(
         &mut self,
         (gpu, w): (&Gpu, &Weights),
@@ -1007,8 +1236,14 @@ impl<R: RouterEntry> Routed<R> {
                 (&b.normed, &mut b.sh),
             )?;
         }
-        gpu.elem()
-            .enqueue_add(gpu.stream(), x1, &b.sh, m * n, &mut b.x1s)
+        if k.residual.is_some() {
+            span_mut(WHAT, &mut b.x1s, 0, m * n)?
+                .copy_from_device_async(&*span(WHAT, x1, 0, m * n)?, gpu.stream())?;
+            Ok(())
+        } else {
+            gpu.elem()
+                .enqueue_add(gpu.stream(), x1, &b.sh, m * n, &mut b.x1s)
+        }
     }
 
     /// Layer `l`'s card experts, where the slot map puts any, over the `m`
@@ -1097,6 +1332,13 @@ impl<R: RouterEntry> Routed<R> {
             });
         };
         let slots = tb.slots(n, (n_card, n_tier, R::N_USED));
+        if self.k.residual.is_some() {
+            return tier_join::enqueue_acc(
+                (gpu.stream(), kernels),
+                (&mut cb.join(), &slots),
+                (trows, m),
+            );
+        }
         tier_join::enqueue_join(
             gpu,
             (gpu.stream(), kernels),
@@ -1106,10 +1348,8 @@ impl<R: RouterEntry> Routed<R> {
         )
     }
 
-    /// `x = hsum +` the shadow's rows (the card sum plus `x1s`, or `x1s` on a
-    /// layer with no card experts) over the unit's `m` rows, after
-    /// [`Routed::shadow_rows`] and the host sums' upload; on a tier layer after
-    /// [`Routed::join_rows`], which wrote the sum.
+    /// Join the uploaded host sums and shadow results over `m` rows with the loaded association.
+    /// On a tier layer, [`Routed::join_rows`] first forms the raw routed sum over both cards.
     pub fn back_rows(
         &self,
         gpu: &Gpu,
@@ -1118,6 +1358,20 @@ impl<R: RouterEntry> Routed<R> {
     ) -> Result<(), GpuError> {
         let b = self.batch.as_ref().ok_or_else(no_batch)?;
         b.check(l, m)?;
+        if let Some(join) = &self.k.residual {
+            let card = b
+                .card
+                .as_ref()
+                .filter(|_| self.card.sums(l))
+                .map(CardBatch::acc);
+            return join.enqueue(
+                gpu.stream(),
+                (hsum, card),
+                (&b.sh, &b.x1s),
+                m * self.d.embd,
+                x,
+            );
+        }
         let shadowed = match b.card.as_ref().filter(|_| self.card.sums(l)) {
             Some(cb) => cb.pre(),
             None => &b.x1s,

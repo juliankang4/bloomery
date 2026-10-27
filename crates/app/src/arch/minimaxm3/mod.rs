@@ -9,8 +9,8 @@
 //! every layer's key and value rows at those positions, every sparse layer's
 //! index keys, and the last position's logits. Every store is a plane of
 //! positions a later position never reads before it writes, so a cut keeps
-//! every held position. This session holds one sequence; the serve seat parks
-//! more ([`bloomery_gpu_minimaxm3`]'s `Slots`).
+//! every held position. The plan counts the configured resident sequences;
+//! [`crate::Session::add_slots`] parks them through the body's actual `Slots`.
 //!
 //! The session's shape is the common owner's ([`super::Batch`]): what the
 //! placement plans, how the prompt runs and how a cut is kept are shared with
@@ -37,6 +37,7 @@ const WHAT: &str = "minimaxm3 session";
 
 impl Batch for Body {
     type Inputs = PlanInputs;
+    type Sequences = super::ResidentSequences;
 
     const WHAT: &'static str = self::WHAT;
 
@@ -52,8 +53,9 @@ impl Batch for Body {
         inputs: &PlanInputs,
         host: HostCfg,
         residency: Residency,
+        slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed_slots(file, plan, inputs, 0, host, residency, NonZeroUsize::MIN)
+        Body::open_placed_slots(file, plan, inputs, 0, host, residency, slots)
     }
 
     fn batch(

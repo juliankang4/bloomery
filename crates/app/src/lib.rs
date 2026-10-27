@@ -161,6 +161,12 @@ pub trait Open: ChainBody + Sized {
     /// Read `file`'s headers.
     fn inputs(file: &Split) -> Result<Self::Inputs, GpuError>;
 
+    /// Apply load settings that change planned buffers, before the plan borrows its inputs.
+    /// Bodies with no configuration-dependent buffers keep the header-derived inputs.
+    fn configure_inputs(_inputs: &mut Self::Inputs, _cfg: &Self::Cfg) -> Result<(), GpuError> {
+        Ok(())
+    }
+
     /// The layer count a placement's machine is laid out for.
     fn layer_count(inputs: &Self::Inputs) -> usize;
 
@@ -303,7 +309,8 @@ impl<B: Open> Loaded<B> {
         log: &mut impl OpenLog<B>,
         edit: impl FnOnce(&B::Inputs, &mut Plan<'_>) -> Result<(), SessionError>,
     ) -> Result<Option<Loaded<B>>, SessionError> {
-        let inputs = B::inputs(&file)?;
+        let mut inputs = B::inputs(&file)?;
+        B::configure_inputs(&mut inputs, &args.cfg)?;
         let machine = (args.machine)(B::layer_count(&inputs));
         let mut plan = B::plan(&inputs, &machine, args.ctx, &args.cfg)?;
         edit(&inputs, &mut plan)?;

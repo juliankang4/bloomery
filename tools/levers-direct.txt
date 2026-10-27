@@ -65,6 +65,8 @@ crates/model/tests/deepseek4_meta.rs	BLOOMERY_REF_MODEL	stays: the model file th
 crates/model/tests/ds41_meta.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
 crates/model-hf/tests/fixture.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
 crates/model/tests/flint_meta.rs	BLOOMERY_MODEL	stays: the pinned model file or header prefix the harness opens
+crates/gpu-flint/src/tests.rs	BLOOMERY_MODEL	stays: cfg(test) full-file hardware consumer opens this exact local model path, not a production serving lever
+crates/gpu-flint/src/two_card_tests.rs	BLOOMERY_MODEL	stays: cfg(test) two-card full-file input, not a production serving lever
 crates/model/tests/gemma_embedding_meta.rs	BLOOMERY_MODEL	stays: the model file the harness opens
 crates/model/tests/gemma_embedding2_meta.rs	BLOOMERY_MODEL	stays: the model file the harness opens
 crates/model/tests/mt.rs	BLOOMERY_MT_CHILD_DUMP	stays: the gate's handshake with the child it runs

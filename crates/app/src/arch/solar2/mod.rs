@@ -40,6 +40,7 @@ const WHAT: &str = "solar2 session";
 
 impl Batch for Body {
     type Inputs = PlanInputs;
+    type Sequences = super::SingleSequence;
 
     const WHAT: &'static str = self::WHAT;
 
@@ -53,8 +54,9 @@ impl Batch for Body {
         inputs: &PlanInputs,
         host: HostCfg,
         residency: Residency,
+        slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed_slots(file, plan, inputs, 0, host, residency, NonZeroUsize::MIN)
+        Body::open_placed_slots(file, plan, inputs, 0, host, residency, slots)
     }
 
     fn batch(

@@ -114,7 +114,7 @@ tools/census/stubs.tsv	derive	the census manifest (refset::census::MANIFEST name
 # arch/coverage.rs and arch/qwen35moe/mtp.rs are carved out to their own rows below.
 crates/model/src/arch/{mod.rs,registry.rs,dspark.rs,classify.rs,stems.rs}	derive gate-head gate-r8 gate-ptx-spill	the dispatch's own files (Arch and spec, the registry, the shared architecture reads and the DSpark reader): every gate that links one, less the gguf-only kernel gates; the family modules behind the registry's rows are reached from them only by the gates that can open that family (tools/recipes.py, Reach)
 crates/model/src/arch/deepseek2/**	derive gate-head gate-r8	the V2-Lite engine's reader and forward: the gates whose targets name it or call what it calls from another module (qwen35moe/mod.rs embeds through deepseek2::forward), and the gates that open a V2-Lite file (its profile, the names of their targets, the /models paths they name)
-crates/model/src/arch/flint/**	derive	Flint's header-only reader and exact roles: its metadata gate and the common registry's architecture dispatch; no executable program or fixture
+crates/model/src/arch/flint/**	derive	Flint's validated reader, placement and host expert adapter: metadata and the actual head128 body/app/serve consumers; no redistributed fixture
 crates/model/src/arch/qwen3moe/**	derive	the Qwen3 reader and plan: the gates whose targets name it, call it from another crate, or open a qwen3moe file (their profile, the names of their targets, the /models paths they name)
 crates/model/src/arch/glm5next/**	derive	the GLM reader and plan: the gates whose targets name it, call it from another crate (the GLM body's chains), or open a glm5next file (their profile, the names of their targets, the /models paths they name)
 crates/model/src/arch/mimo2/**	derive weekly-gpu-mimo2-e2e weekly-gpu-mimo2-serve	MiMo-V2.6-Flash's reader and plan: the gates that open a mimo2 file (its meta test, its flash gate, bloomery-serve's mimo2 seat), and the gates whose code calls it	except gate-fixture: gate-fixture walks the registry's rows and runs no mimo2 reader on a file
@@ -139,6 +139,7 @@ crates/gpu/src/arch/qwen3moe/tier_leg.rs	derive	the Qwen3 and Qwen3.6 expert-tie
 crates/gpu/src/site.rs	derive gate-ds41-bind gate-gpu-gemm gate-gpu-nvtier gate-gpu-qwen35moe-moe gate-gpu-qwen38-residency gate-gpu-qwen3moe-experts gate-gpu-qwen3moe-head gate-gpu-qwen3moe-router gate-gpu-qwen4exp-e2e gate-gpu-qwen4exp-iqleg gate-gpu-qwen4exp-mtp	the weight sites' launches by type: read by the Qwen bodies and the Clef hidden gate, the bodies that read a site in more than one type
 crates/gpu/src/arch/deepseek2/**	derive gate-ds41-bind	the V2-Lite body: the V2-Lite GPU gates and AnyEngine (gate_e2e)
 crates/gpu/src/arch/musespark/**	derive	the muse-spark card body: the end-to-end gate names it, and every bin that links bloomery-gpu reaches it through the lib
+crates/gpu-flint/**	derive	Flint's head128 body, resident slots and actual single/two-card consumers; the two-card gate retains its independent runtime filter
 
 # Derived rows: each row's recipes are `python3 tools/recipes.py reach --row <files>` at the time of writing, the
 # gates whose targets can run code of the files through another lib (tools/recipes.py, Reach); files grouped only

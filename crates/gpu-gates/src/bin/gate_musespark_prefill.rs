@@ -83,7 +83,7 @@
 //!   ids and logits bits, every logit finite, and the walk sent every tier layer a routed slot (or the run proves nothing
 //!   there and fails by name);
 //! - `two_card_first_token_near_union`: the first token's layers against the reference — the plan with every tier
-//!   segment on the stage card ([`tier_twocard::union_plan`]), the A6000 alone, opened first and released — each layer
+//!   segment on the stage card ([`model::placement::union_plan`]), the A6000 alone, opened first and released — each layer
 //!   teacher-forced: the step runs that layer alone (`GpuModel::set_layer_span`) on the reference's `l_out` of the layer
 //!   before it (`GpuModel::set_input_override`; layer 0 reads the embedding), keeps the reference's picks and keeps
 //!   `ffn_moe_out` and `l_out` within [`TWO_STEP_BAND`]; the token sent the tier a slot on one of the tier's layers. The
@@ -155,9 +155,7 @@ mod gate {
     use crate::gate_card;
     use crate::lcpp_e2e::{self, Dims, Seat, fnv1a};
     use crate::prefill_clauses::{self, Case};
-    use crate::tier_twocard::{
-        Sent, sent_between, sent_every, tier_counts, tier_on_3090, union_plan,
-    };
+    use crate::tier_twocard::{Sent, sent_between, sent_every, tier_counts, tier_on_3090};
     use app::Prompt;
     use bloomery_gpu::arch::musespark::{Body, LayerNodes, LayerRoute};
     use bloomery_gpu::host::served::TierBody;
@@ -171,6 +169,7 @@ mod gate {
     use model::arch::Arch;
     use model::arch::musespark::hparams::Hparams;
     use model::arch::musespark::place::{self, PlanInputs};
+    use model::placement::union_plan;
     use model::placement::{Machine, Plan, PlanLevers, workstation};
 
     type Model = GpuModel<Body>;

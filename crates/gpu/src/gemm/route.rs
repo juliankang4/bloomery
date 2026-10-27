@@ -159,6 +159,11 @@ impl GemmRoute {
         self.n_experts
     }
 
+    /// The unique active-slot list and counters for per-slot expert operations.
+    pub(crate) fn expert_slots(&self) -> (&DeviceBuffer<u32>, &DeviceBuffer<u32>) {
+        (&self.cols, &self.n_tiles)
+    }
+
     /// Device bytes of the table.
     #[must_use]
     pub fn bytes(&self) -> usize {

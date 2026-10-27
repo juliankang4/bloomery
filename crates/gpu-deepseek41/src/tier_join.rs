@@ -54,6 +54,18 @@ pub fn enqueue_join(
     (trows, m): (&DeviceBuffer<f32>, usize),
     base: &DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
+    enqueue_acc((stream, kernels), (&mut *join, slots), (trows, m))?;
+    gpu.elem()
+        .enqueue_add(stream, join.acc, base, m * slots.n, join.pre)
+}
+
+/// Sum both cards' routed slots without adding a base. A caller whose shared output and residual
+/// join after the complete routed sum uses this result directly.
+pub fn enqueue_acc(
+    (stream, kernels): (&CudaStream, &FfnBatchKernels),
+    (join, slots): (&mut TierJoin<'_>, &TierSlots<'_>),
+    (trows, m): (&DeviceBuffer<f32>, usize),
+) -> Result<(), GpuError> {
     let a = CardAccTier {
         down: join.down,
         trows,
@@ -66,9 +78,7 @@ pub fn enqueue_join(
         n_tier: slots.n_tier,
         n_used: slots.n_used,
     };
-    kernels.enqueue_card_acc_tier(stream, &a, join.acc)?;
-    gpu.elem()
-        .enqueue_add(stream, join.acc, base, m * slots.n, join.pre)
+    kernels.enqueue_card_acc_tier(stream, &a, join.acc)
 }
 
 /// Layer `l`'s back of the step on a tier layer at the page's row `row`: the wait for the host and

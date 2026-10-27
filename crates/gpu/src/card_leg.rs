@@ -69,6 +69,7 @@
 //! down GEMM.
 
 use crate::card_slots::{CardAcc, CardSlotKernels, CardSlots};
+use crate::expert_input::{Protection, Slots};
 use crate::fault::FaultSink;
 use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
@@ -88,6 +89,7 @@ use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::GgmlType;
+pub use model::ops::ExpertInput;
 use model::placement::accepts::{self, LegArms};
 use model::placement::kernels::{self, DownAct, DownEntry, DownForms, GateUpEntry, GemmEntry};
 use std::sync::Arc;
@@ -154,6 +156,7 @@ pub struct LegBufs {
     h: DeviceBuffer<f32>,
     act_h: ActForms,
     down: DeviceBuffer<f32>,
+    protection: Option<Protection>,
 }
 
 impl LegBufs {
@@ -202,7 +205,20 @@ impl LegBufs {
             h: DeviceBuffer::zeroed(stream, slots * shape.ff)?,
             act_h,
             down: DeviceBuffer::zeroed(stream, slots * shape.n)?,
+            protection: None,
         })
+    }
+
+    /// Select the loaded down-input policy before capture or execution.
+    pub fn set_expert_input(&mut self, gpu: &Gpu, policy: ExpertInput) -> Result<(), GpuError> {
+        match policy {
+            ExpertInput::Direct => self.protection = None,
+            ExpertInput::AmaxF16 if self.protection.is_none() => {
+                self.protection = Some(Protection::new(gpu, self.shape.slots())?);
+            }
+            ExpertInput::AmaxF16 => {}
+        }
+        Ok(())
     }
 
     /// The shape the buffers were made for.
@@ -215,7 +231,11 @@ impl LegBufs {
     /// their shape and forms.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.act_x.device_bytes() + self.h.num_bytes() + self.act_h.bytes() + self.down.num_bytes()
+        self.act_x.device_bytes()
+            + self.h.num_bytes()
+            + self.act_h.bytes()
+            + self.down.num_bytes()
+            + self.protection.as_ref().map_or(0, Protection::bytes)
     }
 
     /// The down rows of the last run: `n` values a slot, slot-major, the
@@ -406,6 +426,29 @@ impl RouteBlock<'_> {
         (io, rule): (RouteIo<'_>, Act),
         fault: FaultSink,
     ) -> Result<(), GpuError> {
+        self.enqueue_input(
+            gpu,
+            (gemm, g32),
+            (route, top_k),
+            n_slots,
+            (io, rule),
+            None,
+            fault,
+        )
+    }
+
+    /// The routed block under its loaded expert-input policy.
+    #[allow(clippy::too_many_arguments, reason = "route execution contract")]
+    pub(crate) fn enqueue_input(
+        &self,
+        gpu: &Gpu,
+        (gemm, g32): (Option<&GemmKernels>, &Gemm32Kernels),
+        (route, top_k): (&GemmRoute, usize),
+        n_slots: usize,
+        (io, rule): (RouteIo<'_>, Act),
+        mut protection: Option<&mut Protection>,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
         const WHAT_B: &str = "card_leg::RouteBlock";
         let stream = gpu.stream();
         let RouteIo {
@@ -480,12 +523,34 @@ impl RouteBlock<'_> {
                 ));
             }
         }
+        let (ids, counts) = route.expert_slots();
+        let selected = Slots {
+            ids,
+            counts,
+            routed: true,
+            n_card: 0,
+            len: n_slots,
+        };
+        if let Some(p) = protection.as_deref_mut() {
+            p.kernels.normalize(
+                gpu,
+                (g, u, &mut p.scales),
+                &selected,
+                self.ff,
+                Some(rule),
+                fault,
+            )?;
+        }
         let per_slot = GemmInput::PerSlot;
         match self.down {
             RouteW::Grouped(ty, w) => {
                 let act = h128.ok_or_else(|| lacks("q8_1 blocks of 128 (the down)"))?;
                 let gemm = grouped_k()?;
-                gemm.enqueue_swiglu_act_quant(stream, g, u, rule, n_slots, act, fault)?;
+                if protection.is_some() {
+                    gpu.enqueue_quantize_gemm(g, n_slots, act, fault)?;
+                } else {
+                    gemm.enqueue_swiglu_act_quant(stream, g, u, rule, n_slots, act, fault)?;
+                }
                 gemm.enqueue_gemm(
                     stream,
                     GemmArgs {
@@ -497,15 +562,21 @@ impl RouteBlock<'_> {
                         input: per_slot,
                         y,
                     },
-                )
+                )?;
             }
             RouteW::Blocks32(w) => {
                 let act = h32.ok_or_else(|| lacks("q8 blocks of 32 (the down)"))?;
-                match rule {
-                    Act::SiluMul => {
-                        g32.enqueue_swiglu_quant32(stream, g, u, n_slots, act, fault)?
+                if protection.is_some() {
+                    g32.enqueue_quantize_gemm32(stream, g, n_slots, act, fault)?;
+                } else {
+                    match rule {
+                        Act::SiluMul => {
+                            g32.enqueue_swiglu_quant32(stream, g, u, n_slots, act, fault)?
+                        }
+                        _ => {
+                            g32.enqueue_swiglu_act_quant32(stream, g, u, rule, n_slots, act, fault)?
+                        }
                     }
-                    _ => g32.enqueue_swiglu_act_quant32(stream, g, u, rule, n_slots, act, fault)?,
                 }
                 g32.enqueue_gemm32(
                     stream,
@@ -517,9 +588,14 @@ impl RouteBlock<'_> {
                         input: per_slot,
                         y,
                     },
-                )
+                )?;
             }
         }
+        if let Some(p) = protection {
+            p.kernels
+                .restore(gpu, y, &p.scales, &selected, self.hidden)?;
+        }
+        Ok(())
     }
 }
 
@@ -959,6 +1035,7 @@ struct Scratch<'a> {
     act_x: &'a mut Q8Act,
     h: &'a mut DeviceBuffer<f32>,
     act_h: &'a mut ActForms,
+    protection: &'a mut Option<Protection>,
 }
 
 impl CardLeg {
@@ -1005,6 +1082,7 @@ impl CardLeg {
             h,
             act_h,
             down,
+            protection,
         } = bufs;
         let shape = *shape;
         if sum.is_some() {
@@ -1015,6 +1093,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
         };
         self.launch(
             gpu,
@@ -1053,6 +1132,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
             ..
         } = bufs;
         let scratch = Scratch {
@@ -1060,6 +1140,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
         };
         self.launch(
             gpu,
@@ -1090,6 +1171,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
             ..
         } = bufs;
         let scratch = Scratch {
@@ -1097,6 +1179,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
         };
         self.launch(
             gpu,
@@ -1161,6 +1244,7 @@ impl CardLeg {
             act_x,
             h,
             act_h,
+            protection,
         } = scratch;
         if run.m == 0 || run.m > cap {
             return Err(GpuError::Shape {
@@ -1254,6 +1338,24 @@ impl CardLeg {
                 self.quant.enqueue_gate_up(stream, &iq, fault, h)?;
             }
             _ => return Err(st.gate.unrun()),
+        }
+        let selected = Slots {
+            ids: run.sel,
+            counts: run.sel,
+            routed: false,
+            n_card: run.n_card,
+            len: slots,
+        };
+        if let Some(p) = protection {
+            p.kernels.normalize(
+                gpu,
+                // Gate/up already activated h; None leaves the second operand unread.
+                (h, &*down, &mut p.scales),
+                &selected,
+                ff,
+                None,
+                fault,
+            )?;
         }
         let q = QuantSel {
             x: h,
@@ -1368,6 +1470,9 @@ impl CardLeg {
                     .enqueue_gemv_sel_cols(stream, st.down.ty, &d, 1, fault, down)?;
             }
             _ => return Err(st.down.unrun()),
+        }
+        if let Some(p) = protection {
+            p.kernels.restore(gpu, down, &p.scales, &selected, n)?;
         }
         Ok(())
     }
@@ -2065,6 +2170,104 @@ pub(crate) mod tests {
                     "{case}"
                 );
                 assert_hand_rows(&case, &got, &want);
+            }
+        }
+    }
+
+    /// Prequantized inputs preserve the loaded protection policy and changed-input replay.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_prequantized_leg_preserves_protection_and_replay() {
+        let gpu = Gpu::new().expect("a GPU");
+        let stream = gpu.stream();
+        let leg = CardLeg::load(&gpu).expect("the leg");
+        let ty = GgmlType::Q5_K;
+        let weights = weights(&gpu, SHAPE, &[ty]);
+        let names = [
+            stack_name("gate", ty),
+            stack_name("up", ty),
+            stack_name("down", ty),
+        ];
+        let stacks =
+            LegStacks::of(&weights, [&names[0], &names[1], &names[2]]).expect("the stacks");
+        let mut ordinary = LegBufs::new(stream, SHAPE).expect("ordinary buffers");
+        let mut quantized = LegBufs::new(stream, SHAPE).expect("quantized buffers");
+        let mut host = vec![0.0f32; CAP * N];
+        let mut normed = DeviceBuffer::zeroed(stream, host.len()).expect("normed rows");
+        let mut act = Q8Act::with_tier_cols(stream, CAP, N).expect("quantized input");
+        let sel = DeviceBuffer::from_host(stream, &SEL).expect("places");
+        let sentinel = vec![SENT; CAP * SPC * N];
+        let mut expected = DeviceBuffer::from_host(stream, &sentinel).expect("ordinary output");
+        let mut actual = DeviceBuffer::from_host(stream, &sentinel).expect("quantized output");
+        for policy in [ExpertInput::Direct, ExpertInput::AmaxF16] {
+            ordinary
+                .set_expert_input(&gpu, policy)
+                .expect("ordinary policy");
+            quantized
+                .set_expert_input(&gpu, policy)
+                .expect("quantized policy");
+            for m in [CAP, CAP - 1] {
+                let graph = gpu
+                    .capture(|_| {
+                        gpu.enqueue_quantize_q8_1_cols(&normed, &mut act, m, 0)?;
+                        leg.enqueue_rows_quantized(
+                            &gpu,
+                            &mut quantized,
+                            &QuantRun {
+                                layer: 0,
+                                stacks: &stacks,
+                                act: &act,
+                                m,
+                                sel: &sel,
+                                n_card: N_CARD,
+                                rule: Act::SiluMul,
+                            },
+                            &mut actual,
+                        )
+                    })
+                    .expect("capture quantized input and protected leg");
+                let amplitudes = match policy {
+                    ExpertInput::Direct => [1.0f32, 2.0],
+                    ExpertInput::AmaxF16 => [1.0f32, 8192.0],
+                };
+                for amplitude in amplitudes {
+                    for (i, value) in host.iter_mut().enumerate() {
+                        *value = (((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0) * amplitude;
+                    }
+                    normed.copy_from_host(stream, &host).expect("changed input");
+                    expected
+                        .copy_from_host(stream, &sentinel)
+                        .expect("reference canaries");
+                    actual
+                        .copy_from_host(stream, &sentinel)
+                        .expect("replay canaries");
+                    leg.enqueue_rows(
+                        &gpu,
+                        &mut ordinary,
+                        &LegRun {
+                            layer: 0,
+                            stacks: &stacks,
+                            normed: &normed,
+                            m,
+                            sel: &sel,
+                            n_card: N_CARD,
+                            rule: Act::SiluMul,
+                        },
+                        &mut expected,
+                    )
+                    .expect("ordinary input with the same policy");
+                    graph.launch(stream).expect("changed-input replay");
+                    let want = expected.to_host_vec(stream).expect("ordinary rows");
+                    let got = actual.to_host_vec(stream).expect("quantized rows");
+                    assert!(gpu.take_fault().expect("fault word").is_none());
+                    let active = m * SPC * N;
+                    let case = format!("{policy:?}, {m} tokens, amplitude {amplitude}");
+                    assert_hand_rows(&case, &got[..active], &want[..active]);
+                    assert!(
+                        got[active..].iter().all(|&value| value == SENT),
+                        "{case}: tail"
+                    );
+                }
             }
         }
     }

@@ -106,32 +106,46 @@ fn hw_flint_header() {
         .filter(|(n, _)| matches!(n, Need::Gqa { sinks: true, .. }))
         .count();
     assert_eq!((norms, rotary, sinks), (49, 35, 49));
-    let coverage = model::arch::coverage::check(s, &r.tensors);
-    for (need, layer) in &needs {
+    for (need, _) in &needs {
         if let Need::Router(shape) = need {
+            let binding = model::arch::models::shape::select_router(*shape).unwrap();
             assert_eq!(
-                model::arch::models::shape::select_router(*shape)
-                    .unwrap_err()
-                    .why,
-                model::arch::models::shape::Refusal::NoRouterRule
+                binding.body,
+                model::arch::models::shape::RouterBody::SigmoidFloor
             );
-            assert!(coverage.iter().any(|u| {
-                u.layer == layer.map(|l| l as usize) && u.feature == need.to_string()
-            }));
+            assert_eq!(binding.rule, shape.rule);
+            assert_eq!(
+                (binding.experts(), binding.top_k_min, binding.top_k_max),
+                (256, 6, 6)
+            );
         }
     }
-    assert!(
-        coverage
-            .iter()
-            .any(|u| u.feature == Need::Program("flint").to_string())
-    );
-    assert!(model::arch::coverage::program_of(s.arch).is_none());
     let bytes: u64 = r.tensors.tensors.iter().map(|t| t.file_bytes).sum();
     assert_eq!(bytes, 25_049_218_176);
+    let mut inputs = model::arch::flint::place::PlanInputs::read(&split)
+        .expect("the validated header has genuine program and site bindings");
+    inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
+    let machine = model::placement::workstation::plan_gate(s.layers.len());
+    let levers = model::placement::PlanLevers::default();
+    for ctx in [512, 1024, 4096] {
+        for slots in [1, 3] {
+            let plan = inputs
+                .plan_with_slots(
+                    &machine,
+                    ctx,
+                    &levers,
+                    std::num::NonZeroUsize::new(slots).unwrap(),
+                )
+                .expect("the real mixed-quant header plans with resident slots");
+            let cache = slots as u64 * 2048 * (14 * ctx + 35 * ctx.min(1024));
+            assert_eq!(plan.cards.iter().map(|c| c.kv_bytes).sum::<u64>(), cache);
+            assert!(inputs.prompt_batch_bytes(&machine).unwrap() > 0);
+        }
+    }
+    let tier = model::arch::flint::place::tier_batch(&inputs).unwrap();
+    assert!(tier.leg.unwrap().input_scales);
+    assert!(tier.card().unwrap() > 0);
     println!(
         "flint header_sha={HEADER_SHA} tensors=779 layers=49 dense=2 routed=47 norms={norms} rotary={rotary} sinks={sinks} payload_bytes={bytes}"
     );
-    for item in coverage {
-        println!("unimplemented layer={:?} {}", item.layer, item.feature);
-    }
 }

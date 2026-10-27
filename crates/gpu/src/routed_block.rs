@@ -48,11 +48,11 @@ use crate::weights::Weights;
 use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
 
 /// What a router launch reads besides its activations: the layer's router
-/// weight and selection bias, the file's `expert_weights_scale` and the
-/// layer's fault sink.
+/// weight and optional selection bias, the file's `expert_weights_scale`
+/// and the layer's fault sink.
 pub struct RouteIn<'a> {
     pub w: &'a DeviceTensor<f32>,
-    pub bias: &'a DeviceBuffer<f32>,
+    pub bias: Option<&'a DeviceBuffer<f32>>,
     pub scale: f32,
     pub fault: FaultSink,
 }
@@ -72,6 +72,10 @@ pub trait RouterEntry: Sized {
     const N_EXPERT: usize;
     /// Experts each token routes to.
     const N_USED: usize;
+    /// Whether an absent selection bias is a native binding, not a zero buffer.
+    const OPTIONAL_BIAS: bool = false;
+    /// The selected-score normalization implemented by this compiled binding.
+    const NORM: model::arch::models::RouterNorm = model::arch::models::RouterNorm::SelectedSum;
     /// Where one token's launch leaves its results.
     type Out;
 
@@ -111,7 +115,7 @@ pub struct RouteLayer {
     pub norm: String,
     /// The router weight.
     pub router: String,
-    /// The selection bias; `None` routes with a zero bias.
+    /// The selection bias; `None` routes without a correction bias.
     pub bias: Option<String>,
     /// The layer's row in the slot map's card copy, as a word offset
     /// (`SlotMap::row_offset`).
@@ -141,7 +145,7 @@ pub struct RouteBlock<R: RouterEntry> {
     handoff: HandoffKernels,
     /// The wide F32 tile GEMM the rows router's scores run on.
     g32: Gemm32Kernels,
-    /// The zero selection bias of a layer the file gives none.
+    /// Legacy bindings' zero selection bias for a layer the file gives none.
     no_bias: Option<DeviceBuffer<f32>>,
 }
 
@@ -270,7 +274,7 @@ impl<R: RouterEntry> RouteBlock<R> {
                 Some(name) => {
                     w.f32_buf(what, name)?;
                 }
-                None => zero_bias = true,
+                None => zero_bias |= !R::OPTIONAL_BIAS,
             }
         }
         let ctx = gpu.context();
@@ -335,7 +339,11 @@ impl<R: RouterEntry> RouteBlock<R> {
         gpu: &Gpu,
     ) -> Result<RouteIn<'a>, GpuError> {
         let layer = self.layer(l)?;
-        let bias = self.bias_of(w, l)?;
+        let bias = if layer.bias.is_none() && R::OPTIONAL_BIAS {
+            None
+        } else {
+            Some(self.bias_of(w, l)?)
+        };
         Ok(RouteIn {
             w: w.f32_tensor(self.what, &layer.router)?,
             bias,
