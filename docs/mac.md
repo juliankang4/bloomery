@@ -56,9 +56,9 @@ cargo build --release -p bloomery-metal --bin bloomery-serve-metal --bin generat
 | [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507), Q4_K_M | runs on a build after 0.3.9, text only. Release 0.3.9 refuses it: architecture `qwen3moe` |
 | Qwen3.6 `UD-Q4_K_XL` | refused by name: it holds Q8_0, Q5_K and f32 tensors at sites a Metal session does not launch yet. Planned next |
 
-The mat-vec kernels run Q4_K, Q6_K and MLX 4-bit weights. The router and the shared-expert gate may be F32 or MLX 8-bit,
-which the open dequantizes. Any other type is refused when the file opens, and the error names the tensor. The evidence
-for each row is in [`contrib/mac.md`](contrib/mac.md), section 1.1.
+The mat-vec kernels run Q4_K, Q5_K, Q6_K, Q8_0 and MLX 4-bit weights. The router and the shared-expert gate may be F32
+or MLX 8-bit, which the open dequantizes. Any other type is refused when the file opens, and the error names the tensor.
+The evidence for each row is in [`contrib/mac.md`](contrib/mac.md), section 1.1.
 
 ## Get a model
 
