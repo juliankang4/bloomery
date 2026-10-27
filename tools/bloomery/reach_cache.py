@@ -14,6 +14,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import types
 import typing
 
@@ -46,8 +47,8 @@ def _bytes(path):
     return data
 
 
-def _file(path):
-    return [os.path.realpath(path), _digest(_bytes(path))]
+def _file(path, cache):
+    return [os.path.realpath(path), cache.sha(path)]
 
 
 def _corpus(tree):
@@ -56,6 +57,8 @@ def _corpus(tree):
     Cargo's output directory and git's object database are not source owners. Reads from either are still
     covered by the observed-read provenance. Directory entries (including symlinks) catch new target roots.
     """
+    cache = tree._reach_hashes
+    cache.t0_ns = time.time_ns()
     rows = []
     for base, dirs, files in os.walk(tree.root, followlinks=False):
         dirs[:] = sorted(d for d in dirs if d not in (".git", "target", "__pycache__"))
@@ -64,16 +67,16 @@ def _corpus(tree):
         for name in sorted(files):
             if name.endswith((".rs", ".toml", ".py")) or name == "Cargo.lock":
                 path = os.path.join(base, name)
-                rows.append([os.path.relpath(path, tree.root), _file(path)])
+                rows.append([os.path.relpath(path, tree.root), _file(path, cache)])
         # Walk symlinked source directories separately, following each real directory only once.
         for name in dirs[:]:
             path = os.path.join(base, name)
             if os.path.islink(path):
-                rows.append([os.path.relpath(path, tree.root), _linked(path)])
+                rows.append([os.path.relpath(path, tree.root), _linked(path, cache)])
     return _digest(_json(rows))
 
 
-def _linked(root):
+def _linked(root, cache):
     rows, seen = [], set()
     def visit(path, rel):
         real = os.path.realpath(path)
@@ -87,7 +90,7 @@ def _linked(root):
             for name in names:
                 visit(os.path.join(path, name), rel + "/" + name)
         elif os.path.isfile(path):
-            rows.append([rel, _file(path)])
+            rows.append([rel, _file(path, cache)])
         else:
             rows.append([rel, real, "absent"])
     visit(root, "")
@@ -159,7 +162,7 @@ def _holds(tree, rows):
             return False
         path = os.path.join(tree.root, rel)
         if kind == "r":
-            if _file(path) != was:
+            if _file(path, tree._reach_hashes) != was:
                 return False
         elif [(os.path.isfile(path) if kind == "f" else os.path.isdir(path)), os.path.realpath(path)] != was:
             return False

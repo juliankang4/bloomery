@@ -68,6 +68,8 @@ workspaces. Called-source edits must invalidate a recorded green result even whe
 Absolute paths and raw identifiers retain conservative owner/dependency bounds when structural resolution is
 uncertain; Cargo-selected roots and declared Rust modules are source regardless of their filename suffix.
 The persistent structural cache must preserve these inputs across fresh processes.
+Repeated input validation reuses stable source hashes within the process. Rewrites with the same size and
+modification time still invalidate their consumers; recently modified files are hashed again.
 The selected profiles of every box call remain inputs, including shell defaults and inherited model overrides.
 Changing a selected profile or called source invalidates its consumer; an unrelated private profile or source
 outside the retained input bound does not. Shared box inputs remain mandatory for every box command.

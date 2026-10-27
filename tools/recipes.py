@@ -1095,6 +1095,7 @@ class Tree:
         # (`_resolve_literals`); a .rs outside them (an excluded crate) stays an input.
         self.pkg_dirs = tuple(sorted(p.dir + "/" for p in self.packages.values() if p.dir not in ("", ".")))
         self._walk_cache: dict[tuple[str, frozenset[str] | None], ModuleTree] = {}
+        self._reach_hashes = HashCache("")
         self._saw: list[dict[tuple[str, str], object]] = []  # the open `memo` runs, innermost last
         self.unresolved: list[str] = []
         self.depinfo: dict[str, tuple[set[str], float]] = {}  # bin name -> (files, mtime)
