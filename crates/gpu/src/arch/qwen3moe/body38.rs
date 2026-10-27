@@ -483,9 +483,12 @@ struct PleHost {
 /// table in the split's own mapping ([`SplitTable`]), whose helper advises
 /// a fill's rows and copies them, so the step thread takes neither the
 /// advice nor a fault; a ubatch's rows (16 a position, at hashed places in
-/// the table) in [`PLE_WORKERS`] parts side by side. A fill nothing read
-/// ahead waits for its own rows; a prompt call's later ubatches are read one
-/// ahead while the ubatch before them computes ([`PleHost::prompt_start`]).
+/// the table) in [`PLE_WORKERS`] parts side by side. A prompt call's later
+/// ubatches are read one ahead while the ubatch before them computes
+/// ([`PleHost::prompt_start`]). A fill that waits for its rows at once and
+/// finds none read ahead (a verify's, a step's with no read ahead) reads
+/// them with [`Prefetcher::read_now`]: on the step thread when the helper
+/// would read them alone, so no thread wakes for them.
 struct PleRead {
     rows: Prefetcher,
     planes: usize,
@@ -497,6 +500,8 @@ struct PleRead {
     /// ([`Body38::prefetch_input`]) allocates nothing.
     spare_ids: Vec<u32>,
     flight: bool,
+    /// The started fill's rows already copied ([`PleRead::read_now`]).
+    read: bool,
 }
 
 /// Threads the PLE reader's helper reads a ubatch's rows over
@@ -571,6 +576,7 @@ impl PleRead {
             ahead: VecDeque::with_capacity(1),
             spare_ids: Vec::with_capacity(step_rows),
             flight: false,
+            read: false,
         })
     }
 
@@ -602,10 +608,11 @@ impl PleRead {
         Ok(())
     }
 
-    /// `ids`, the rows of the fill of `n` positions at `pos`, on the helper:
-    /// the batch read ahead when it is this fill's, else submitted now.
-    /// [`PleRead::finish`] takes them.
-    fn start(&mut self, pos: u32, n: usize, ids: &[u32]) -> Result<(), GpuError> {
+    /// The fill of `n` positions at `pos` naming `ids` taken in: the batch
+    /// read ahead when it is this fill's, else every batch read ahead
+    /// dropped. Whether the fill's rows are then on the helper.
+    fn take_in(&mut self, pos: u32, n: usize, ids: &[u32]) -> Result<bool, GpuError> {
+        self.read = false;
         let own = self
             .ahead
             .front()
@@ -617,7 +624,14 @@ impl PleRead {
             self.recycle_front();
             self.ahead.clear();
         }
-        if !self.flight {
+        Ok(self.flight)
+    }
+
+    /// `ids`, the rows of the fill of `n` positions at `pos`, on the helper:
+    /// the batch read ahead when it is this fill's, else submitted now.
+    /// [`PleRead::finish`] takes them.
+    fn start(&mut self, pos: u32, n: usize, ids: &[u32]) -> Result<(), GpuError> {
+        if !self.take_in(pos, n, ids)? {
             self.rows
                 .submit(std::iter::repeat_n(ids, self.planes))
                 .map_err(|e| GpuError::plan(WHAT, e))?;
@@ -626,17 +640,35 @@ impl PleRead {
         Ok(())
     }
 
-    /// The started fill's rows ([`PleRead::start`]) copied to
-    /// [`Prefetcher::filled`]; then the next ubatch read ahead goes to the
-    /// helper, to run while this one computes.
+    /// [`PleRead::start`] for a fill that waits for its rows at once: the
+    /// batch read ahead when it is this fill's, else the rows read now
+    /// ([`Prefetcher::read_now`]). [`PleRead::finish`] takes them.
+    fn read_now(&mut self, pos: u32, n: usize, ids: &[u32]) -> Result<(), GpuError> {
+        if !self.take_in(pos, n, ids)? {
+            self.rows
+                .read_now(std::iter::repeat_n(ids, self.planes))
+                .map_err(|e| GpuError::plan(WHAT, e))?;
+            self.read = true;
+        }
+        Ok(())
+    }
+
+    /// The started fill's rows ([`PleRead::start`], [`PleRead::read_now`])
+    /// copied to [`Prefetcher::filled`]; then the next ubatch read ahead
+    /// goes to the helper, to run while this one computes.
     fn finish(&mut self) -> Result<(), GpuError> {
-        if !std::mem::take(&mut self.flight) {
+        let (helper, read) = (
+            std::mem::take(&mut self.flight),
+            std::mem::take(&mut self.read),
+        );
+        if helper {
+            self.rows.wait().map_err(|e| GpuError::plan(WHAT, e))?;
+        } else if !read {
             return Err(GpuError::state(
                 WHAT,
                 "a PLE fill finished before it started",
             ));
         }
-        self.rows.wait().map_err(|e| GpuError::plan(WHAT, e))?;
         self.start_front()
     }
 }
@@ -805,23 +837,42 @@ impl PleHost {
     /// the unit's image spans as row ranges of `tokens`
     /// ([`Hash::ple_rows_media`]), inside which the image placeholder
     /// hashes like any id and the history takes it; outside them it is
-    /// refused as in `fill`. The rows named ([`PleHost::name_spanned`]),
-    /// then decoded ([`PleHost::decode`]).
+    /// refused as in `fill`. The rows named ([`PleHost::name_rows`]), on
+    /// the NVMe tier read now ([`PleRead::read_now`]), then decoded
+    /// ([`PleHost::decode`]).
     fn fill_spanned(
         &mut self,
         pos: u32,
         tokens: &[u32],
         spans: &[Range<usize>],
     ) -> Result<History, GpuError> {
-        let hist = self.name_spanned(pos, tokens, spans)?;
+        let hist = self.name_rows(pos, tokens, spans)?;
+        if let Some(read) = &mut self.nvme {
+            read.read_now(pos, tokens.len(), &self.ids[..self.named])?;
+        }
         self.decode()?;
         Ok(hist)
     }
 
-    /// [`PleHost::fill_spanned`]'s rows named and the history past them
-    /// returned, every refusal made; on the NVMe tier their read started
+    /// [`PleHost::fill_spanned`]'s rows named, for a walk that takes them
+    /// later: on the NVMe tier their read started on the helper
     /// ([`PleRead::start`]). [`PleHost::decode`] takes them.
     fn name_spanned(
+        &mut self,
+        pos: u32,
+        tokens: &[u32],
+        spans: &[Range<usize>],
+    ) -> Result<History, GpuError> {
+        let hist = self.name_rows(pos, tokens, spans)?;
+        if let Some(read) = &mut self.nvme {
+            read.start(pos, tokens.len(), &self.ids[..self.named])?;
+        }
+        Ok(hist)
+    }
+
+    /// The rows of `tokens` at `pos` named into `ids` and the history past
+    /// them returned, every refusal made.
+    fn name_rows(
         &mut self,
         pos: u32,
         tokens: &[u32],
@@ -844,9 +895,6 @@ impl PleHost {
                 WHAT,
                 format!("PLE row {r} past the table's {} rows", self.rows),
             ));
-        }
-        if let Some(read) = &mut self.nvme {
-            read.start(pos, n, &self.ids[..self.named])?;
         }
         Ok(hist)
     }
