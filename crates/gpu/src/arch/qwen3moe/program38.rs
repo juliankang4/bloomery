@@ -71,7 +71,7 @@ use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::{FlashGqaKernels, GqaListArgs, GqaSelArgs};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
-use crate::graph::Forked;
+use crate::graph::{Forked, StagedRows};
 use crate::hc_gated::{
     Before, HcGatedKernels, HcMatrix, HcScratch, HcWideKernels, MixArgs, SiteWeights,
 };
@@ -1725,12 +1725,22 @@ impl<'a> LayerProgram for Step38<'a> {
 /// into a lane of its own, then the head's mix over the `m` columns into
 /// `head`, a head of `m` rows (one projection and one argmax for every
 /// row), and each of `copies` after it. Each row is bit for bit its step.
+/// A verify's walk enqueues its PLE rows' `arrival` (one staged row of its
+/// rows' values) at its PLE site, over the arena's rows
+/// ([`StagedRows::enqueue`]); a pass of several slots has its rows in the
+/// arena before its launch.
 pub(super) struct Verify38<'a> {
     pub(super) branch: &'a mut Branch,
     pub(super) p: Parts38<'a>,
     pub(super) head: &'a mut Head,
     pub(super) copies: Vec<RowsCopy<'a>>,
+    pub(super) arrival: Option<&'a StagedRows<f32>>,
 }
+
+/// The nodes a verify's PLE arrival adds to its capture
+/// ([`StagedRows::enqueue`]): the flag's wait (one batch memory operation)
+/// and the rows' copy.
+pub(super) const PLE_ARRIVAL_NODES: usize = 2;
 
 /// A parked slot's rows of a pass of several slots copied, once the head's
 /// mix has made the walk's final streams, to the slot's own final-stream
@@ -1775,6 +1785,11 @@ impl<'a> LayerProgram for Verify38<'a> {
     /// in one launch and the go.
     fn front(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
+        if let Some(arrival) = self.arrival
+            && plan_of(self.p.plans, l)?.ple.is_some()
+        {
+            arrival.enqueue(self.p.c.gpu.stream(), 0, &mut self.p.s.ple.e, 0)?;
+        }
         self.p.front(self.branch, l)?;
         let hy = port.hybrid();
         self.p.ffn_mix(l, Some(hy.boundary_mut().normed_mut()))?;

@@ -120,8 +120,8 @@ use super::mtp38::{
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
-    Ctx38, Kernels38, Parts38, Pass38, RowsCopy, STEP_MEMOPS, Seqs38, SlotSeq38, Step38, Verify38,
-    seq_launches, step_launches, verify_launches,
+    Ctx38, Kernels38, PLE_ARRIVAL_NODES, Parts38, Pass38, RowsCopy, STEP_MEMOPS, Seqs38, SlotSeq38,
+    Step38, Verify38, seq_launches, step_launches, verify_launches,
 };
 use super::scratch::{Io, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, stamps_at};
 use super::scratch38::{
@@ -166,7 +166,7 @@ use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{BY_NAME_COLS, ByName};
 use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
-use crate::{Branch, DeviceTensor, Gpu, GpuError, launch_u32, ple};
+use crate::{Branch, DeviceTensor, Gpu, GpuError, StagedRows, launch_u32, ple};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use engram::hash::{History, Window};
@@ -837,9 +837,8 @@ impl PleHost {
     /// the unit's image spans as row ranges of `tokens`
     /// ([`Hash::ple_rows_media`]), inside which the image placeholder
     /// hashes like any id and the history takes it; outside them it is
-    /// refused as in `fill`. The rows named ([`PleHost::name_rows`]), on
-    /// the NVMe tier read now ([`PleRead::read_now`]), then decoded
-    /// ([`PleHost::decode`]).
+    /// refused as in `fill`. The rows named ([`PleHost::name_rows`]), then
+    /// read ([`PleHost::read_named`]).
     fn fill_spanned(
         &mut self,
         pos: u32,
@@ -847,11 +846,18 @@ impl PleHost {
         spans: &[Range<usize>],
     ) -> Result<History, GpuError> {
         let hist = self.name_rows(pos, tokens, spans)?;
-        if let Some(read) = &mut self.nvme {
-            read.read_now(pos, tokens.len(), &self.ids[..self.named])?;
-        }
-        self.decode()?;
+        self.read_named(pos, tokens.len())?;
         Ok(hist)
+    }
+
+    /// The rows [`PleHost::name_rows`] named for the fill of `n` positions
+    /// at `pos`: on the NVMe tier read now ([`PleRead::read_now`]), then
+    /// decoded ([`PleHost::decode`]).
+    fn read_named(&mut self, pos: u32, n: usize) -> Result<(), GpuError> {
+        if let Some(read) = &mut self.nvme {
+            read.read_now(pos, n, &self.ids[..self.named])?;
+        }
+        self.decode()
     }
 
     /// [`PleHost::fill_spanned`]'s rows named, for a walk that takes them
@@ -1152,11 +1158,13 @@ pub struct RouteTap {
 }
 
 /// A verify that waits for its commit: its first position, its tokens, and
-/// the PLE history as it stood before them.
+/// the PLE history as it stood before them; `ple_due` while its PLE rows'
+/// arrival is still to be delivered ([`Body38::deliver_ple`]).
 struct Pending38 {
     pos0: u32,
     tokens: Vec<u32>,
     hist: History,
+    ple_due: bool,
 }
 
 /// A call planned and not yet launched: its first position, its rows, the
@@ -1354,6 +1362,9 @@ pub struct Body38 {
     /// its commit.
     lane: LaneWord,
     pending: Option<Pending38>,
+    /// How a verify's PLE rows reach its walk after its launch: one staged
+    /// row of [`VERIFY_ROWS`] positions' values.
+    ple_arrival: StagedRows<f32>,
     /// Each layer's streams after it and its route, when a gate armed them.
     taps: Option<Taps38>,
     /// The launches the loaded `output`'s head records past its norm: the
@@ -2118,6 +2129,12 @@ impl Body38 {
             card_leg,
             lane: LaneWord::new(stream, LANES)?,
             pending: None,
+            ple_arrival: StagedRows::new(
+                gpu.context(),
+                1,
+                VERIFY_ROWS * geo::HIDDEN,
+                "cuMemAllocHost (a verify's PLE rows staging)",
+            )?,
             taps: None,
             eps: spec.rms_eps,
             vocab: spec.vocab as usize,
@@ -2710,11 +2727,14 @@ impl Body38 {
         self.lane.set(gpu.stream(), lane)
     }
 
-    /// The captured verify's launches at `m` rows ([`super::program38`]'s
-    /// count).
+    /// The captured verify's nodes at `m` rows: its walk's launches
+    /// ([`super::program38`]'s count) and its PLE rows' arrival
+    /// ([`PLE_ARRIVAL_NODES`]) at each PLE site.
     #[must_use]
     pub fn verify_launches(&self, m: usize) -> usize {
+        let sites = self.plans.iter().filter(|p| p.ple.is_some()).count();
         verify_launches(&self.plans, &self.card, self.tier.as_ref(), m, self.head)
+            + sites * PLE_ARRIVAL_NODES
     }
 
     /// Refused by name unless the stores hold `pos` positions: a call from
@@ -3488,9 +3508,42 @@ impl Body38 {
                 pos0: s.pos,
                 tokens,
                 hist: before,
+                ple_due: false,
             });
         }
         Ok(())
+    }
+
+    /// The waiting verify's PLE rows, when their arrival is due
+    /// ([`StagedRows`]): read on this thread and decoded
+    /// ([`PleHost::read_named`]), staged, and the arrival's flag raised on
+    /// every path, an error included.
+    fn deliver_ple(&mut self) -> Result<(), GpuError> {
+        let Some(p) = self.pending.as_mut().filter(|p| p.ple_due) else {
+            return Ok(());
+        };
+        p.ple_due = false;
+        let (pos, n) = (p.pos0, p.tokens.len());
+        let rows = self.ple.read_named(pos, n).and_then(|()| {
+            self.ple
+                .e
+                .get(..n * geo::HIDDEN)
+                .ok_or_else(|| GpuError::shape(WHAT, format!("{n} PLE positions at once")))
+        });
+        self.ple_arrival.deliver(0, |staging| {
+            let rows = rows?;
+            let held = staging.len();
+            staging
+                .get_mut(..rows.len())
+                .ok_or_else(|| {
+                    GpuError::shape(
+                        WHAT,
+                        format!("{} PLE values into a staging of {held}", rows.len()),
+                    )
+                })?
+                .copy_from_slice(rows);
+            Ok(())
+        })
     }
 
     /// The call's position `pos` is where the stores stand and `n` more fit
@@ -5389,18 +5442,26 @@ impl TierBody for Body38 {
         })
     }
 
+    /// A launched verify's PLE rows delivered first ([`Body38::deliver_ple`]):
+    /// the host legs its walk serves come after its PLE site.
     fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
-        self.hybrid.serve_captured_of(chain)?;
+        let delivered = self.deliver_ple();
+        let served = self.hybrid.serve_captured_of(chain);
+        delivered.and(served)?;
         planted(&mut self.plant, Plant::AfterLaunch)
     }
 }
 
 impl Body38 {
     /// Plan a verify of `tokens` (2..=[`VERIFY_ROWS`]) at `pos`, where the
-    /// stores stand: the ids checked as a prompt's are, the PLE rows, the
-    /// record and the rows' copy to the pass arena, then the verify launched
-    /// ([`Body38::launch`]) and left waiting for its commit — its graph's
-    /// launch follows this plan with no body call between. Refused by name
+    /// stores stand: the ids checked as a prompt's are, the PLE rows named,
+    /// the arrival's flag lowered, the record copied to the pass arena, then
+    /// the verify launched ([`Body38::launch`]) and left waiting for its
+    /// commit and for its PLE rows, which arrive at its PLE site
+    /// ([`StagedRows`]): the host reads and delivers them once the walk is
+    /// enqueued ([`Body38::deliver_ple`]), so their read runs under the
+    /// layers before the site. Its graph's launch follows this plan with no
+    /// body call between. Refused by name
     /// before anything moves: a slot map with a routed expert on a tier card
     /// ([`MapCheck::refuse`]), another row count, the taps armed, a verify
     /// already waiting, a position other than the stores' or past them, an
@@ -5432,13 +5493,17 @@ impl Body38 {
         super::refuse_past_vocab(WHAT_V, tokens, self.vocab)?;
         ple_takes(WHAT_V, self.ple.hash.window(), tokens, &[])?;
         self.settle(stream)?;
-        let hist = self.ple.fill(pos, tokens)?;
+        let hist = self.ple.name_rows(pos, tokens, &[])?;
         self.last_walk = TargetRows::Pass;
         self.rp.write(stream, tokens, pos)?;
-        self.ple.upload(stream, &mut self.a.ple.e, n)?;
+        self.ple_arrival.clear(0)?;
         self.stage(pos, n, hist, Some(tokens.to_vec()))?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
-        self.launch(pos, n)
+        self.launch(pos, n)?;
+        if let Some(p) = self.pending.as_mut() {
+            p.ple_due = true;
+        }
+        Ok(())
     }
 
     /// Enqueue the planned verify of `head.m()` rows through the step port
@@ -5448,11 +5513,16 @@ impl Body38 {
         const WHAT_V: &str = "qwen4exp verify";
         let m = head.m();
         let planned = self.pending.as_ref().map(|p| p.tokens.len());
-        if planned != Some(m) && !crate::capturing(gpu.stream())? {
-            return Err(GpuError::state(
-                WHAT_V,
-                "a verify planned for this head's rows (plan_rows before the pass)",
-            ));
+        if !crate::capturing(gpu.stream())? {
+            if planned != Some(m) {
+                return Err(GpuError::state(
+                    WHAT_V,
+                    "a verify planned for this head's rows (plan_rows before the pass)",
+                ));
+            }
+            // An eager walk serves its host legs as it enqueues them: its
+            // rows arrive before it.
+            self.deliver_ple()?;
         }
 
         let io = Io {
@@ -5464,6 +5534,7 @@ impl Body38 {
             plans,
             stores,
             ple_ring,
+            ple_arrival,
             rope,
             seq_rope,
             a,
@@ -5505,6 +5576,7 @@ impl Body38 {
             },
             head,
             copies: Vec::new(),
+            arrival: Some(&*ple_arrival),
         };
         let mut leg = StepLeg::new(gpu.stream(), hybrid);
         prog.walk(&mut leg)?;
@@ -6055,6 +6127,7 @@ impl Body38 {
             },
             head,
             copies,
+            arrival: None,
         };
         let mut leg = StepLeg::new(gpu.stream(), hybrid);
         prog.walk(&mut leg)?;
@@ -6076,15 +6149,16 @@ impl Body38 {
     }
 
     /// The captured pass of several slots' launches for the slots and row
-    /// counts of `key` (each `(slot, rows)`, in pass order): the verify's
-    /// at every row of the pass, each slot past the first's
+    /// counts of `key` (each `(slot, rows)`, in pass order): the verify
+    /// walk's at every row of the pass (no PLE arrival: the pass's rows are
+    /// in its arena before its launch), each slot past the first's
     /// sequence-bound launches ([`super::program38`]'s `seq_launches`), and
     /// the copy of each parked slot's rows.
     #[must_use]
     pub fn slots_launches(&self, key: &[(usize, usize)]) -> usize {
         let rows = key.iter().map(|&(_, m)| m).sum();
         let stand_in = key.first().is_some_and(|&(slot, _)| stands_in(slot));
-        self.verify_launches(rows)
+        verify_launches(&self.plans, &self.card, self.tier.as_ref(), rows, self.head)
             + key.len().saturating_sub(1) * seq_launches(&self.plans)
             + key.iter().filter(|&&(slot, _)| slot != 0).count()
             - usize::from(stand_in)
