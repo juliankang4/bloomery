@@ -45,7 +45,7 @@ const SPLIT: &[&str] = &["-sm", "--split-mode"];
 const TENSOR_SPLIT: &[&str] = &["-ts", "--tensor-split"];
 const MAIN_GPU: &[&str] = &["-mg", "--main-gpu"];
 const GPU_LAYERS: &[&str] = &["-ngl", "--gpu-layers", "--n-gpu-layers"];
-const CPU_MOE: &[&str] = &["-cmoe", "--cpu-moe"];
+pub(crate) const CPU_MOE: &[&str] = &["-cmoe", "--cpu-moe"];
 const N_CPU_MOE: &[&str] = &["-ncmoe", "--n-cpu-moe"];
 const OVERRIDE_TENSOR: &[&str] = &["-ot", "--override-tensor"];
 const FIT: &[&str] = &["-fit", "--fit"];
@@ -178,7 +178,7 @@ const NAMES_CARDS: [&[&str]; 4] = [DEVICE, SPLIT, TENSOR_SPLIT, MAIN_GPU];
 
 /// [`take_with_env`] with no environment: the command line alone.
 pub fn take(args: &[String]) -> Result<(Flags, Vec<String>), GateError> {
-    let (flags, rest, _) = take_with_env(args, &[])?;
+    let (flags, rest, _) = take_with_env(args, &[], &[])?;
     Ok((flags, rest))
 }
 
@@ -193,9 +193,12 @@ pub fn take(args: &[String]) -> Result<(Flags, Vec<String>), GateError> {
 /// names cards. The `--cpu-moe` variable is on for `on`, `enabled`, `true`, `1`, and off for `off`,
 /// `disabled`, `false`, `0`; the three variables that name the routed experts' place and the flags
 /// that name it are one place, named once. An argument that is no UTF-8 is not a flag and stays.
+/// The value of `--place` and of each flag of `seat` (the caller's seat flags) stays with its flag,
+/// so a value spelled like a placement flag is not read as one.
 pub fn take_with_env<A>(
     args: &[A],
     env: &[(String, String)],
+    seat: &[crate::llama_launch::EnvFlag],
 ) -> Result<(Flags, Vec<A>, Vec<String>), GateError>
 where
     A: AsRef<OsStr> + Clone,
@@ -203,6 +206,7 @@ where
     let mut flags = Flags::default();
     let mut rest = Vec::with_capacity(args.len());
     let mut typed: Vec<String> = Vec::new();
+    let mut place = false;
     let mut it = args.iter();
     while let Some(raw) = it.next() {
         let Some(arg) = raw.as_ref().to_str() else {
@@ -211,7 +215,14 @@ where
         };
         let name = spelled(arg);
         if !FLAGS.iter().any(|set| set.contains(&name.as_str())) {
+            place |= arg == "--place";
             rest.push(raw.clone());
+            let takes_value = arg == "--place"
+                || (seat.iter().any(|read| read.spelled.contains(&arg))
+                    && crate::llama_launch::serve_takes_value(arg));
+            if takes_value {
+                rest.extend(it.next().cloned());
+            }
             continue;
         }
         if CPU_MOE.contains(&name.as_str()) {
@@ -229,7 +240,6 @@ where
         }
         typed.push(name);
     }
-    let place = args.iter().any(|a| a.as_ref().to_str() == Some("--place"));
     if !flags.given.is_empty() && place {
         return Err(format!(
             "--place beside llama-server's placement flags ({}): name the cards one way",
@@ -797,7 +807,7 @@ fn once<T>(slot: &mut Option<T>, flag: &str, what: &str, value: T) -> Result<(),
 }
 
 /// `arg` as llama-server matches it: a long flag's `_` is `-`.
-fn spelled(arg: &str) -> String {
+pub(crate) fn spelled(arg: &str) -> String {
     if arg.starts_with("--") {
         arg.replace('_', "-")
     } else {
@@ -1059,14 +1069,14 @@ mod tests {
         let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
         let env = env_of(env);
         let (flags, _, notes) =
-            take_with_env(&args, &env).unwrap_or_else(|e| panic!("{line} {env:?}: {e}"));
+            take_with_env(&args, &env, &[]).unwrap_or_else(|e| panic!("{line} {env:?}: {e}"));
         (flags, notes)
     }
 
     fn env_refused(line: &str, env: &[(&str, &str)]) -> String {
         let args: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
         let env = env_of(env);
-        take_with_env(&args, &env).expect_err(line).to_string()
+        take_with_env(&args, &env, &[]).expect_err(line).to_string()
     }
 
     /// A target seat: the qwen38 seat has the experts lever, the ds41 seat the draft card, any
@@ -1374,12 +1384,28 @@ mod tests {
             OsString::from("-ngl"),
             OsString::from("all"),
         ];
-        let (f, rest, _) = take_with_env(&args, &[]).expect("a prompt of bytes");
+        let (f, rest, _) = take_with_env(&args, &[], &[]).expect("a prompt of bytes");
         assert_eq!(rest, [OsString::from("--prompt"), prompt]);
         assert_eq!(f.ngl, Some(Ngl::All));
         let bad = vec![OsString::from("-dev"), OsString::from_vec(vec![0xff])];
-        let e = take_with_env(&bad, &[]).expect_err("a value of bytes");
+        let e = take_with_env(&bad, &[], &[]).expect_err("a value of bytes");
         assert_eq!(e.to_string(), "-dev: the value is not UTF-8");
+    }
+
+    /// A seat flag's value stays with it only for a caller whose seat takes the flag: a generator's
+    /// prompt spelled `--ctx` leaves the placement flag after it to the placement.
+    #[test]
+    fn only_the_callers_seat_flags_keep_their_values() {
+        let args: Vec<String> = ["--prompt", "--ctx", "-ngl", "all", "-n", "1"]
+            .map(str::to_owned)
+            .to_vec();
+        let (f, rest, _) = take_with_env(&args, &[], &[]).expect("a generator's prompt");
+        assert_eq!(f.ngl, Some(Ngl::All));
+        assert_eq!(rest, ["--prompt", "--ctx", "-n", "1"]);
+        let (f, rest, _) =
+            take_with_env(&args, &[], crate::llama_launch::SEAT_FLAGS).expect("a server's context");
+        assert!(f.is_empty());
+        assert_eq!(rest, args);
     }
 
     /// `-dev` names CUDA devices once each: `none`, another backend's name, a repeat and a device

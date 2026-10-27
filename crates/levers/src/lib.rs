@@ -3089,6 +3089,25 @@ pub fn at_main_with_flags(
     acts_on: &[&str],
     has_flag: impl FnOnce(&str) -> bool,
 ) -> Result<Levers, LeverError> {
+    main_reading(acts_on, has_flag, false).0
+}
+
+/// Read the levers as [`at_main_with_flags`] does, for a run that prints the
+/// lines of the levers it does not apply later, once: they are handed back
+/// instead of printed, unless `--levers` prints them with its table.
+pub fn at_main_held(
+    acts_on: &[&str],
+    has_flag: impl FnOnce(&str) -> bool,
+) -> Result<(Levers, Vec<String>), LeverError> {
+    let (levers, notes) = main_reading(acts_on, has_flag, true);
+    Ok((levers?, notes))
+}
+
+fn main_reading(
+    acts_on: &[&str],
+    has_flag: impl FnOnce(&str) -> bool,
+    held: bool,
+) -> (Result<Levers, LeverError>, Vec<String>) {
     let bin = std::env::args_os()
         .next()
         .as_deref()
@@ -3097,16 +3116,20 @@ pub fn at_main_with_flags(
         .map_or_else(|| "unnamed".to_string(), lossy);
     let env = process_env();
     let reading = reading(&env, Scope::Main { bin: &bin, acts_on });
-    for line in reading.unapplied(&bin) {
-        eprintln!("{line}");
+    let notes = reading.unapplied(&bin);
+    let asked = has_flag("--levers");
+    if !held || asked {
+        for line in &notes {
+            eprintln!("{line}");
+        }
     }
-    if has_flag("--levers") {
+    if asked {
         print!("{}", reading.table());
         if reading.refused.is_empty() {
             std::process::exit(0);
         }
     }
-    reading.levers()
+    (reading.levers(), notes)
 }
 
 /// The worker pool's two levers ([`THREADS`], [`SPIN`]), read where the
