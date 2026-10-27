@@ -475,34 +475,37 @@ mod gate {
     fn pool(model: &Path, reserve: u64) -> Result<bool, GateError> {
         let split = Split::open(model)?;
         let census = gpu_census::census()?;
-        let q = PlaceQ3::qwen3_on(
-            &split,
-            Place::A,
-            &census,
-            CTX,
-            KvQ8::F16,
-            Beside {
-                image: None,
-                embedding: Some(reserve),
-            },
-        )?;
-        let p = q.plan(
-            CTX,
-            &PlanLevers {
-                card_budget_bytes: Some(BUDGET + reserve).into(),
-            },
-        )?;
-        let mut held = p.machine.clone();
-        // Exercise the pool formula on discrete cards too, keeping the real plan's rows and totals.
-        if held.nodes[0].unified.is_none() {
-            held.nodes[0].unified = Some(UnifiedPool {
-                bytes: held.host().usable_bytes,
-            });
-        }
-        let mut plain = held.clone();
-        plain.cards[0]
-            .reserves
-            .retain(|(name, _)| name != beside::EMBEDDING);
+        // The plain plan is planned, not edited: a plan's card totals carry its selected reserves.
+        let place = |embedding: Option<u64>| {
+            PlaceQ3::qwen3_on(
+                &split,
+                Place::A,
+                &census,
+                CTX,
+                KvQ8::F16,
+                Beside {
+                    image: None,
+                    embedding,
+                },
+            )
+        };
+        let levers = |budget: u64| PlanLevers {
+            card_budget_bytes: Some(budget).into(),
+        };
+        let (q, q0) = (place(Some(reserve))?, place(None)?);
+        let p = q.plan(CTX, &levers(BUDGET + reserve))?;
+        let p0 = q0.plan(CTX, &levers(BUDGET))?;
+        // Exercise the pool formula on discrete cards too, keeping the real plans' rows and totals.
+        let pooled = |plan: &Plan| {
+            let mut held = plan.machine.clone();
+            if held.nodes[0].unified.is_none() {
+                held.nodes[0].unified = Some(UnifiedPool {
+                    bytes: held.host().usable_bytes,
+                });
+            }
+            held
+        };
+        let (held, plain) = (pooled(&p), pooled(&p0));
         let with = Plan {
             machine: &held,
             ..p.clone()
@@ -511,7 +514,7 @@ mod gate {
         .ok_or("no pool term")?;
         let without = Plan {
             machine: &plain,
-            ..p.clone()
+            ..p0.clone()
         }
         .pool_need()
         .ok_or("no pool term")?;
