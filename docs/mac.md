@@ -17,8 +17,8 @@ Silicon build; building from source works too. The port's map and design are in 
   files of this shape ([below](#which-files-run)). The GPU working set Metal reports was 0.78 × RAM on the three Macs
   measured (24.96 GiB on an M1 Pro 32 GB, 37.44 GiB on an M4 Pro 48 GB); above 48 GB it is unverified.
 - To build from source: [rustup](https://rustup.rs), whose `cargo` comes first in `PATH` (Homebrew's `rust` builds
-  with its stable compiler and fails on the pinned crates). `rust-toolchain.toml` pins the nightly, and rustup installs
-  it on the first build. The Metal backend links no CUDA code, so plain `cargo` builds it. Xcode's Metal toolchain is
+  with its stable compiler and fails on the pinned crates). `rust-toolchain.toml` pins the toolchain (stable 1.99.1), and
+  rustup installs it on the first build. The Metal backend links no CUDA code, so plain `cargo` builds it. Xcode's Metal toolchain is
   optional: with `xcrun metal` the build writes a metallib, and without it the kernels compile from their embedded
   source when the binary starts (the release's binaries do this). Every number and gate here ran the source path;
   the metallib path builds, and its gates have not run on the maintainers' Macs. If you have the toolchain (`xcodebuild -downloadComponent MetalToolchain`),
@@ -35,7 +35,8 @@ curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/relea
 Both install `bloomery-serve-metal`, `generate_metal` and the converter as `bloomery-prepare`. The tarball
 `bloomery-<version>-macos-arm64-metal.tar.gz` on the [releases page](https://github.com/midagedev/bloomery/releases)
 holds the same three binaries under `bin/` (the converter as `prepare`). The commands below spell the source build's
-`target/release/` paths; an installed binary runs by its name.
+`target/release/` paths; a Homebrew binary runs by its name, and an installer one as `~/.local/bin/<name>` unless
+`~/.local/bin` is on your `PATH`.
 
 ## Build from source
 
@@ -60,6 +61,8 @@ cargo build --release -p bloomery-metal --bin bloomery-serve-metal --bin generat
 The mat-vec kernels run Q4_K, Q5_K, Q6_K, Q8_0 and MLX 4-bit weights, and f32 at the delta layers' `ssm_alpha` and
 `ssm_beta`. A shared expert may have another type than its routed stacks. The router and the shared-expert gate may be
 F32 or MLX 8-bit, which the open dequantizes. Any other type is refused when the file opens, and the error names the tensor.
+A file whose shapes the kernels take but no build has registered compiles its kernels when it opens, and the server
+says that no gate checked that shape.
 The evidence for each row is in [`contrib/mac.md`](contrib/mac.md), section 1.1.
 
 ## Get a model

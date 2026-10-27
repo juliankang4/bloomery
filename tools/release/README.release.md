@@ -76,7 +76,7 @@ Downloads go to `~/.cache/bloomery/hf` (`BLOOMERY_CACHE` overrides it). A gated 
 
 ## Cards
 
-Every generative seat takes `--parallel N` (two by default): the slots are resident sequences in the one model, and the busy ones advance together each round. A plan that cannot fit the card's free bytes is refused by name with its terms and the processes holding the card.
+A generative seat takes `--parallel N` (one by default): the slots are resident sequences in the one model, and the busy ones advance together each round. The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot and refuse `--parallel` above 1 by name. A plan that cannot fit the card's free bytes is refused by name with its terms and the processes holding the card.
 
 `--place` picks the cards for the models with CPU experts: `a` runs the model on the visible card with the most memory,
 `bp` adds the next card as an expert tier, and `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID` makes it `nvidia-smi`'s numbering). The single-card models run on

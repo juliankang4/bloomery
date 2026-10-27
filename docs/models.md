@@ -34,9 +34,8 @@ full vocabulary takes the target's head and embedding rows, for the latter.
 
 ## Hardware
 
-**Required of every host**: an NVIDIA GPU of compute capability 8.6 or newer and driver R580 or newer (CUDA 13); a CPU with AVX2
-and FMA (the prebuilt archive targets x86-64-v3; an aarch64 host builds from source, below); glibc 2.34+; Linux, or Windows through WSL2. NVMe is
-recommended — a load streams the file to the card, and V4.1 reads its engram table from disk as it runs.
+What each platform needs (the GPU, its driver, the CPU, glibc, the OS) is in the README's [Install](../README.md#install)
+section. NVMe is recommended: a load streams the file to the card, and V4.1 reads its engram table from disk as it runs.
 
 ### What each model needs
 
@@ -77,15 +76,16 @@ types with no card kernel are Q2_K, Q2_0, Q4_0, Q4_1, Q8_1, Q8_K, Q1_0, TQ1_0 an
 have a host matmul, so a `UD-Q2_K_XL` file loads. GLM-5.3's token embedding may be q4_K, q5_K or q6_K. On GLM-5.3 a
 layer whose down is Q6_K runs its experts on the card beside a card gate and up.
 
-**Recommended** (the configuration every number in the README ran on): a 32-core AVX2 CPU with 8 DDR4
+**Recommended** (the configuration the maintainers' numbers in the README ran on): a 32-core AVX2 CPU with 8 DDR4
 channels, 256 GB of RAM, an RTX A6000 48 GB, and an RTX 3090 24 GB beside it for `--place bp`. Cards are found
 by device, not by name; a list word such as `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID`
 matches `nvidia-smi`'s numbering; the qwen38 seat takes `a`, `gate` or `bp` only).
 
-A DGX Spark (GB10, aarch64, sm_121) builds and runs from source, a contributor's port
-([`contrib/dgx-spark.md`](contrib/dgx-spark.md)): the plan treats its unified memory as one pool, and the recipes
-build `sm_121a` on it unless `BLOOMERY_ARCH` names another arch. The release binaries are x86-64 only.
+A DGX Spark (GB10, aarch64, sm_121) is a contributor's port ([`contrib/dgx-spark.md`](contrib/dgx-spark.md)): the
+plan treats its unified memory as one pool, and the recipes build `sm_121a` on it unless `BLOOMERY_ARCH` names another
+arch. It installs the release's GB10 archive where the release carries one, or builds from source (the README's
+[Install](../README.md#dgx-spark-and-other-gb10-machines)).
 
-Only the A6000, the 3090, an RTX 3060 12 GB under WSL2 (running Clef-Flash, its download and its cache), an RTX 5090
-and the Spark have been run; other cards and drivers are untested — please open an issue with `--version` and the
-error text. Costs per part: [`HARDWARE.md`](HARDWARE.md).
+The machines that have run it are in the README's [Hardware](../README.md#hardware) section; an RTX 3060 12 GB under
+WSL2 ran Clef-Flash, its download and its cache. Other cards and drivers are untested: please open an issue with
+`--version` and the error text. Costs per part: [`HARDWARE.md`](HARDWARE.md).
