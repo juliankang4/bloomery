@@ -190,13 +190,14 @@ impl<F: ByteBlocks<Scale = u32>> TileRows for ByteRows<'_, F> {
             )
         };
         let d = F::scale(e, at >> 5);
+        let [v0, v1, v2, v3] = F::values(q);
         // SAFETY: dst is this thread's own 16 bytes of the stage (this fn's
         // contract); the stores are plain, published by the barrier.
         unsafe {
-            *dst = F::value(q) * d;
-            *dst.add(1) = F::value(q >> 8) * d;
-            *dst.add(2) = F::value(q >> 16) * d;
-            *dst.add(3) = F::value(q >> 24) * d;
+            *dst = v0 * d;
+            *dst.add(1) = v1 * d;
+            *dst.add(2) = v2 * d;
+            *dst.add(3) = v3 * d;
         }
     }
 }
@@ -667,15 +668,16 @@ impl<F: ByteBlocks<Scale = u32>> MmaRows for ByteRows<'_, F> {
     #[inline(always)]
     unsafe fn land((lo, hi, e): (u32, u32, u32), dst: *mut u32, at: usize) -> bool {
         let d = F::scale(e, at >> 5);
+        let ([l0, l1, l2, l3], [h0, h1, h2, h3]) = (F::values(lo), F::values(hi));
         let v = [
-            F::value(lo) * d,
-            F::value(lo >> 8) * d,
-            F::value(lo >> 16) * d,
-            F::value(lo >> 24) * d,
-            F::value(hi) * d,
-            F::value(hi >> 8) * d,
-            F::value(hi >> 16) * d,
-            F::value(hi >> 24) * d,
+            l0 * d,
+            l1 * d,
+            l2 * d,
+            l3 * d,
+            h0 * d,
+            h1 * d,
+            h2 * d,
+            h3 * d,
         ];
         // SAFETY: dst is this fetch's 16 bytes (this fn's contract).
         unsafe { land_values(v, dst) }
