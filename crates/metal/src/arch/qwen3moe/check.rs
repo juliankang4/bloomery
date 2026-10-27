@@ -55,6 +55,7 @@ pub const PAGE: u64 = 16 * 1024;
 const ANY: &[SiteTy] = &[
     SiteTy::Q3K,
     SiteTy::Q4K,
+    SiteTy::Iq4Xs,
     SiteTy::Q5K,
     SiteTy::Q6K,
     SiteTy::Q5_0,
