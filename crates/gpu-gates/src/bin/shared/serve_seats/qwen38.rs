@@ -1442,6 +1442,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         None => (mtp, draft_off),
     };
     let (mtp, draft_off) = draft_for_slots(slots, levers.draft(), (mtp, draft_off));
+    // The folder's own MTP layer, opened with the folder above, is the draft both threads read:
+    // the folder is not opened again for it.
+    let own_draft = folder_draft
+        .and_then(|layer| layer.ok().flatten())
+        .filter(|_| draft_path == path);
     // A draft lever set on a server that drafts nothing is refused, with
     // why — asked once the yield below has said its last word, so a draft
     // the plan turns off refuses them the same as one the rule did.
@@ -1519,8 +1524,15 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let mut mtp_inputs = match &head {
         None => None,
         Some(h) => {
-            let draft = open_draft(&draft_path, draft_from)?;
-            Some(MtpInputs::read(&draft, &split, &inputs, h.rows.clone())?)
+            let opened;
+            let draft = match &own_draft {
+                Some(d) => d,
+                None => {
+                    opened = open_draft(&draft_path, draft_from)?;
+                    &opened
+                }
+            };
+            Some(MtpInputs::read(draft, &split, &inputs, h.rows.clone())?)
         }
     };
     // The folder's header goes to the engine thread with its parts; a split's is reopened there.
@@ -1937,6 +1949,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         mtp,
         lookup,
         head,
+        own_draft,
         draft_path,
         draft_from,
         draft_bytes,
@@ -2093,6 +2106,9 @@ struct SeatArgs {
     /// The draft's head under `mtp` (`head_list::head_rows_of`), which the
     /// load prints.
     head: Option<HeadPick>,
+    /// The checkpoint folder's own MTP layer when it is the draft, as the main thread opened it
+    /// with the folder; `None` for a draft file, which the open reads from `draft_path`.
+    own_draft: Option<Split>,
     /// The MTP draft file under `mtp`, and what picked it.
     draft_path: PathBuf,
     draft_from: DraftFrom,
@@ -2267,7 +2283,10 @@ impl Q38 {
                     .head
                     .as_ref()
                     .ok_or("a drafted load with no head picked")?;
-                let draft = open_draft(&a.draft_path, a.draft_from)?;
+                let draft = match a.own_draft {
+                    Some(d) => d,
+                    None => open_draft(&a.draft_path, a.draft_from)?,
+                };
                 let mtp = MtpInputs::read(&draft, model.header(), &inputs, head.rows.clone())?;
                 let machine = a.place.machine(
                     &inputs,
