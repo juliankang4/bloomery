@@ -1488,7 +1488,7 @@ mod cli {
             Some(free) => r.u("card_free", free),
             None => r,
         };
-        let r = record::with_room(r, plan.host.room);
+        let r = record::with_room(r, plan.host.room.as_ref());
         let r = match plan.row_tier()? {
             Some(Device::Host) => r.w("rows", "host"),
             Some(Device::Nvme) => r.w("rows", "nvme"),

@@ -330,8 +330,8 @@ impl Plan<'_> {
     /// the machine's host room and its unified pool. The pool's reading already
     /// leaves out the cards' context self cost; [`workstation::HostNeed`] counts
     /// the cards and the bytes reserved beside the plan, so none is subtracted
-    /// from the room again. The reading and effective room are recorded in
-    /// [`HostTotals::room`].
+    /// from the room again. The reading and effective room, with the reading
+    /// that decided it, are recorded in [`HostTotals::room`].
     ///
     /// A [`workstation::HostRead::Given`] room also sets the host headroom from
     /// the plan's terms at that room. A read room keeps the headroom at the
@@ -341,8 +341,14 @@ impl Plan<'_> {
     pub fn plan_at(&mut self, room: &(u64, workstation::HostRead)) -> u64 {
         let figure = workstation::HostNeed::machine_room(self.machine.host());
         let pool = self.machine.unified().map_or(u64::MAX, |pool| pool.bytes);
-        let planned = workstation::plan_room(room).min(figure).min(pool);
-        self.host.room = Some((room.0, planned));
+        let asked = workstation::plan_room(room);
+        let planned = asked.min(figure).min(pool);
+        let by = if planned < asked {
+            workstation::HostRead::Machine
+        } else {
+            room.1.clone()
+        };
+        self.host.room = Some((room.0, (planned, by)));
         if room.1 == workstation::HostRead::Given {
             self.host.headroom_bytes = workstation::HostNeed::of(self, 0).headroom(planned);
         }
@@ -490,7 +496,7 @@ impl Plan<'_> {
         };
         if let Err(short) = need.check(&(
             workstation::HostNeed::machine_room(host),
-            workstation::HostRead::Given,
+            workstation::HostRead::Machine,
         )) {
             out.push(Violation::HostOver {
                 total: short.need.bytes().saturating_add(short.need.os),

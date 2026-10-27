@@ -3480,9 +3480,9 @@ pub fn with_requantized(r: Record, model: &model::placement::ModelTensors) -> Re
 /// `r` with the host room's reading and the plan room when the plan was made at
 /// one (`HostTotals::room`), the two parts `plan` and `plan38` share; the
 /// caller has put every part the kind lists before `room`.
-pub fn with_room(r: Record, room: Option<(u64, u64)>) -> Record {
+pub fn with_room(r: Record, room: Option<&(u64, (u64, HostRead))>) -> Record {
     match room {
-        Some((read, planned)) => r.u("room", read).u("plan_room", planned),
+        Some((read, (planned, _))) => r.u("room", *read).u("plan_room", *planned),
         None => r,
     }
 }
@@ -3534,7 +3534,7 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
             "arena_slots",
             arena_slots(plan).expect("the arena's slots of a plan the split made"),
         );
-    let r = with_room(r, plan.host.room);
+    let r = with_room(r, plan.host.room.as_ref());
     let r = match machine.cards.first().and_then(|c| c.free_bytes) {
         Some(free) => r.u("card_free", free),
         None => r,
@@ -5384,7 +5384,8 @@ mod tests {
     /// parts reads as absent.
     #[test]
     fn a_plan38_names_the_host_room_it_was_made_at() {
-        let line = |room| {
+        let line = |room: Option<(u64, u64)>| {
+            let room = room.map(|(read, planned)| (read, (planned, HostRead::MemAvailable)));
             let r = Record::new(&PLAN38)
                 .w("place", "cuda0")
                 .w("card", "5090")
@@ -5393,7 +5394,9 @@ mod tests {
                 .u("host_experts", 11_735)
                 .u("card_experts", 12_841)
                 .u("card_free", 31_000_000_000_u64);
-            with_room(r, room).w("why", "whole_does_not_fit").line()
+            with_room(r, room.as_ref())
+                .w("why", "whole_does_not_fit")
+                .line()
         };
         let at = line(Some((60_943_515_648, 60_500_000_000)));
         assert_eq!(

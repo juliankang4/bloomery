@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU64;
 
+use super::workstation::HostShort;
 use super::{PlacementError, Violation};
 
 /// The context a slot is planned at when `--ctx` is unset.
@@ -164,6 +165,19 @@ impl PlacementError {
             }),
             _ => None,
         }
+    }
+}
+
+impl HostShort {
+    /// This refusal as a short host: on a unified pool (the need counts the cards' share), the
+    /// host's room is the pool a context's sequence state takes from, so a smaller context is
+    /// what it asks for. Where each card has memory of its own, `None`.
+    pub fn pool_short(&self) -> Option<Short> {
+        (self.need.cards > 0).then(|| Short {
+            on: Side::Host,
+            need: self.need.bytes(),
+            room: self.available,
+        })
     }
 }
 
@@ -473,6 +487,7 @@ fn largest_held<P, E>(
 mod tests {
     use std::cell::RefCell;
 
+    use super::super::workstation::{HostNeed, HostRead};
     use super::*;
 
     const STEPS: Steps = Steps {
@@ -818,5 +833,34 @@ mod tests {
                 room: 40
             })
         );
+        // A host need past the reading halves where the cards share the pool, and stops
+        // where each card has memory of its own.
+        let need = HostNeed {
+            experts: 0,
+            tables: 0,
+            shadows: 0,
+            reserves: 20,
+            extra: 0,
+            read_ahead: 15,
+            arena: 0,
+            cards: 90,
+            os: 0,
+            card_budget: false,
+        };
+        let host = |need| HostShort {
+            need,
+            available: 120,
+            read: Box::new(HostRead::MemAvailable),
+            floor: None,
+        };
+        assert_eq!(
+            host(need).pool_short(),
+            Some(Short {
+                on: Side::Host,
+                need: 125,
+                room: 120
+            })
+        );
+        assert_eq!(host(HostNeed { cards: 0, ..need }).pool_short(), None);
     }
 }

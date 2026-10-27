@@ -418,7 +418,7 @@ use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
 use model::placement::workstation::{
     CardSpec, HostNeed, HostRead, POINT_ROWS_RESERVE, host_available_read,
 };
-use model::placement::{Machine, Plan, PlanLevers};
+use model::placement::{ArenaFloor, Machine, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file, draft_places};
 use runtime::Target as _;
@@ -1064,11 +1064,14 @@ struct Plans<'a> {
     feed: Feed38,
     /// The ubatch size the seat read ([`Args::ubatch`]), before a context clips it.
     ubatch: usize,
+    /// The checkpoint folder the load reads its card's parts from; `None` for a GGUF file.
+    folder: Option<&'a Folder38>,
 }
 
 impl Plans<'_> {
     /// Whether a plan takes `ctx` positions a sequence serves, or why none
-    /// does.
+    /// does. A folder's plan also holds the least of its parts' reads
+    /// ([`Folder38::least_reads`], [`folder_holds`]).
     fn holds(&self, ctx: usize) -> Result<(), GateError> {
         let ub = self.ubatch.min(ctx);
         let ctx = u64::try_from(ctx)?;
@@ -1080,7 +1083,7 @@ impl Plans<'_> {
             self.mtp,
             self.slots,
         )?;
-        self.inputs.plan_target(
+        let plan = self.inputs.plan_target(
             &machine,
             ctx,
             self.levers,
@@ -1088,7 +1091,10 @@ impl Plans<'_> {
             self.mtp,
             self.slots,
         )?;
-        Ok(())
+        match self.folder {
+            Some(folder) => folder_holds(&plan, folder.least_reads(&plan, CARD38)?),
+            None => Ok(()),
+        }
     }
 
     /// The plan's host need (`HostNeed::bytes`, the NVMe expert tier's
@@ -1168,6 +1174,27 @@ struct Ctx38 {
     line: String,
     /// Whether the default halved from its target: the plan was short there.
     halved: bool,
+}
+
+/// Whether a checkpoint folder's `plan` holds `reads`, the least of its
+/// load's part reads (`HostNeed::read_ahead`), beside its host need at the
+/// room the plan was made at (`HostNeed::check_planned`), its NVMe tier arena
+/// at the floor the load's own check may shrink it to (`HostNeed::grant`,
+/// `ArenaFloor::of`). On a unified pool a shorter context is what that
+/// refusal asks for (`HostShort::pool_short`).
+pub(crate) fn folder_holds(plan: &Plan<'_>, reads: u64) -> Result<(), GateError> {
+    let need = HostNeed::of(plan, 0);
+    HostNeed {
+        read_ahead: reads,
+        arena: if need.arena > 0 {
+            ArenaFloor::of(plan)?.bytes
+        } else {
+            0
+        },
+        ..need
+    }
+    .check_planned(plan)?;
+    Ok(())
 }
 
 /// The seat's context (the module doc) by the family's common choice
@@ -1623,6 +1650,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             slots,
             feed,
             ubatch,
+            folder: folder.as_ref(),
         };
         let ctx = ctx38(&plans, a.ctx)?.ctx;
         let at = u64::try_from(ctx)?;
@@ -1677,6 +1705,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 slots,
                 feed,
                 ubatch,
+                folder: folder.as_ref(),
             };
             if plain.holds(ctx).is_ok() {
                 plain.host(ctx, set)?.2
@@ -1705,6 +1734,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         slots,
         feed,
         ubatch,
+        folder: folder.as_ref(),
     };
     // The unset draft's yield to the context (the module doc): the context
     // comes first, so when the drafted load halved its context, or holds not
@@ -1882,7 +1912,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         Some(free) => line.u("card_free", free),
         None => line,
     };
-    let line = record::with_room(line, plan.host.room);
+    let line = record::with_room(line, plan.host.room.as_ref());
     let line = line
         .csv("devices", record::plan_devices(&machine))
         .w("cuda_order", record::cuda_order());
@@ -3263,5 +3293,238 @@ mod tests {
                 "{e}"
             );
         }
+    }
+    /// A checkpoint folder's plan holds its least part reads where its NVMe
+    /// tier arena shrinks to its floor for them, as the load's own check
+    /// grants (`HostNeed::grant`), and one byte past that room is refused.
+    /// Where each card has memory of its own the refusal stands; on a unified
+    /// pool it is short, so through the seat's context choice an unset
+    /// context halves to the rung that holds and a set one is refused.
+    #[test]
+    fn a_folder_plan_holds_its_reads_on_the_arena_floor() {
+        use bloomery_gpu_gates::generate::{Place, short_in};
+        use model::arch::qwen35moe::place::PlaceError;
+        use model::placement::ctx_ask::DEFAULT_TARGET;
+        use model::placement::workstation::{self, HostNeed, HostRead};
+        use model::placement::{
+            ArenaFloor, KvBytes, ModelTensor, ModelTensors, PlanLevers, Role, plan_host_routed,
+        };
+
+        use super::{Feed38, Place38, Plans, ctx38, folder_holds};
+
+        struct NoKv;
+        impl KvBytes for NoKv {
+            fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+                0
+            }
+        }
+        let (rows, k, experts) = (2560, 640, 8);
+        let model = ModelTensors {
+            tensors: vec![ModelTensor {
+                name: "blk.0.ffn_down_exps.weight".to_string(),
+                shard: 0,
+                layer: Some(0),
+                role: Role::RoutedExperts,
+                ty: gguf::GgmlType::Q8_0,
+                dims: vec![k, rows, experts],
+                file_bytes: k * rows * experts / 32 * 34,
+                gathered_rows: None,
+            }],
+            layers: 1,
+            experts,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let machine = workstation::plan_on(workstation::A6000, 1);
+        let mut plan =
+            plan_host_routed(&model, &machine, 4096, &NoKv, &PlanLevers::default()).expect("plans");
+        let floor = ArenaFloor::of(&plan).expect("the arena's floor").bytes;
+        assert!(floor > 0);
+        plan.host.nvme_arena_bytes = 24 * floor;
+        let reads = 2 * floor;
+        let room = HostNeed::of(&plan, 0).plan_bytes() + floor + reads;
+        assert_eq!(plan.plan_at(&(room, HostRead::Given)), room);
+        // The planned arena beside the reads passes the room; at its floor they fit.
+        let whole = HostNeed {
+            read_ahead: reads,
+            ..HostNeed::of(&plan, 0)
+        };
+        assert!(whole.check_planned(&plan).is_err());
+        folder_holds(&plan, reads).expect("the reads fit on the arena's floor");
+        let e = folder_holds(&plan, reads + 1).expect_err("one byte past the floor's room");
+        assert!(
+            e.to_string()
+                .contains(&format!("the host room is {room} B")),
+            "{e}"
+        );
+        assert_eq!(short_in::<PlaceError>(&e), None);
+
+        // The actual seat checks a folder's reads before choosing its context.
+        use gguf::write::{Layout, TensorDecl};
+        use model::arch::models::{
+            Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate, Residual, Rope,
+            RopeMode,
+        };
+        use model::arch::qwen35moe::place::{Experts, KvLayout, PlanInputs};
+        use model::placement::{RowTableSource, workstation::DeviceInfo};
+
+        let tensor = ModelTensor {
+            name: "blk.0.attn_norm.weight".to_string(),
+            shard: 0,
+            layer: Some(0),
+            role: Role::Attention,
+            ty: gguf::GgmlType::F32,
+            dims: vec![2560],
+            file_bytes: 2560 * 4,
+            gathered_rows: None,
+        };
+        let layout = Layout::new(
+            &[],
+            vec![TensorDecl {
+                name: tensor.name.clone(),
+                dims: tensor.dims.clone(),
+                type_id: tensor.ty.as_u32(),
+                nbytes: tensor.file_bytes,
+            }],
+        )
+        .expect("the header");
+        let header = || gguf::Split::header_only("seat-test".into(), &layout).expect("the header");
+        let folder = super::Folder38::with(header(), header(), None);
+        let spec = ModelSpec {
+            arch: Arch::Qwen4Exp,
+            hidden: 2560,
+            vocab: 8,
+            ctx_train: u32::try_from(DEFAULT_TARGET).expect("context"),
+            rms_eps: 1e-6,
+            layers: vec![LayerSpec {
+                mixer: Mixer::Gqa(Gqa {
+                    heads: 1,
+                    kv_heads: 1,
+                    head_dim: 8,
+                    value_dim: 8,
+                    rope: Rope {
+                        mode: RopeMode::NormTail,
+                        dims: 8,
+                        base: 1e4,
+                        yarn: None,
+                    },
+                    qk_norm: false,
+                    o_norm: false,
+                    out_gate: OutGate::None,
+                    select: None,
+                    window: None,
+                    sinks: false,
+                    value_scale: None,
+                }),
+                ffn: Ffn::Dense {
+                    ff: 640,
+                    act: Act::SwiGlu { limit: None },
+                },
+                residual: Residual::Plain,
+                extras: Vec::new(),
+            }],
+            mtp: Vec::new(),
+            hc: None,
+            engram: None,
+            encoder: None,
+            logit_epilogue: None,
+            chat: ChatSpec {
+                pre: String::new(),
+                template: None,
+                tools: None,
+                reasoning: None,
+            },
+        };
+        let mut inputs = PlanInputs {
+            kv: KvLayout::of_spec(&spec).expect("the stores"),
+            spec,
+            model: ModelTensors {
+                tensors: vec![tensor],
+                layers: 1,
+                experts: 8,
+                experts_used: 2,
+                bf16_words: |_| false,
+            },
+            room: (u64::MAX, HostRead::Given),
+            row_source: RowTableSource::Parts,
+            arena: None,
+        };
+        let card = DeviceInfo {
+            ordinal: 0,
+            name: "GB10".to_string(),
+            total_bytes: 32 << 30,
+            free_bytes: 32 << 30,
+            integrated: true,
+            uuid: [1; 16],
+            pci_bus: "0000:01:00.0".to_string(),
+            held_by: None,
+        };
+        let place = Place38::of(
+            Place::parse("0")
+                .expect("a card")
+                .on(&[card])
+                .expect("census"),
+        );
+        let levers = PlanLevers::default();
+        let half = usize::try_from(DEFAULT_TARGET / 2).expect("context");
+        let machine = place
+            .machine(
+                &inputs,
+                (DEFAULT_TARGET / 2, 1),
+                Experts::Host,
+                &levers,
+                None,
+                1,
+            )
+            .expect("the machine");
+        let plan = inputs
+            .plan_target(
+                &machine,
+                DEFAULT_TARGET / 2,
+                &levers,
+                Experts::Host,
+                None,
+                1,
+            )
+            .expect("the half-context plan");
+        let reads = folder
+            .least_reads(&plan, super::CARD38)
+            .expect("part reads");
+        assert!(reads > 0);
+        let room = HostNeed::of(&plan, 0).bytes() + reads;
+        drop(plan);
+        inputs.room = (room, HostRead::Given);
+        let plans = Plans {
+            inputs: &inputs,
+            place,
+            experts: Experts::Host,
+            levers: &levers,
+            mtp: None,
+            slots: 1,
+            feed: Feed38 {
+                prompt: super::Prompt38::Auto,
+                traced: false,
+            },
+            ubatch: 1,
+            folder: Some(&folder),
+        };
+        plans
+            .holds(half)
+            .expect("exactly enough room for the folder");
+        let target = usize::try_from(DEFAULT_TARGET).expect("context");
+        let e = plans
+            .holds(target)
+            .expect_err("the folder's reads do not fit");
+        assert!(short_in::<PlaceError>(&e).is_some(), "{e}");
+        Plans {
+            folder: None,
+            ..plans
+        }
+        .holds(target)
+        .expect("the plan fits without part reads");
+        let unset = ctx38(&plans, None).expect("halves");
+        assert_eq!(unset.ctx, half);
+        assert!(unset.halved);
+        assert!(ctx38(&plans, Some(target)).is_err());
     }
 }

@@ -234,8 +234,9 @@ impl std::error::Error for FloorShort {}
 
 /// A seat's boxed plan refusal read as a short memory
 /// ([`placement::ctx_ask::PlanRefusal::short`]): the family's error `E` when
-/// the box holds one, else a bare placement error's card reading; `None` when
-/// it is neither, or not short.
+/// the box holds one, else a bare placement error's card reading, else a host
+/// need's on a unified pool ([`placement::workstation::HostShort::pool_short`]);
+/// `None` when it is none of them, or not short.
 #[must_use]
 pub fn short_in<E>(e: &GateError) -> Option<placement::ctx_ask::Short>
 where
@@ -245,7 +246,11 @@ where
         Some(family) => placement::ctx_ask::PlanRefusal::short(family),
         None => e
             .downcast_ref::<placement::PlacementError>()
-            .and_then(placement::PlacementError::card_short),
+            .and_then(placement::PlacementError::card_short)
+            .or_else(|| {
+                e.downcast_ref::<placement::workstation::HostShort>()
+                    .and_then(placement::workstation::HostShort::pool_short)
+            }),
     }
 }
 
