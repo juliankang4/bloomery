@@ -1,0 +1,10 @@
+kind: baseline
+question: what are 0.3.10's headline pp512, pp4096 and decode for MiniMax-M3.1-Flash (UD-Q2_K_XL GGUF and the NVFP4 folder) on both cards, MiniMax-M3.1-Flash GGUF on the RTX 3090 alone, and Nanbeige4.3-33B on the RTX 3090 alone, at the serving defaults on the release tree?
+term: decode tok/s of MiniMax-M3.1-Flash UD-Q2_K_XL at D=512, the release tree's bloomery-serve, RTX A6000 + RTX 3090, --place unset (bp)
+unit: tok/s
+predict: 24.0..34.0
+condition: one lease per model and card set; tools/ref/depth-serve.sh, arms D=512 and D=4096, 2 rounds, DEPTH_SERVE_CTX 4300, N 128, each round a fresh server with every lever unset; two-card rows under BLOOMERY_TIMING_CARDS=a6000+3090, one-card rows on the RTX 3090 at its 250 W cap
+reason: [measured] the M3.1F GGUF toktape at the serving defaults decoded 29.7 tok/s after a long prompt on 0.3.10's candidate code; the NVFP4 folder's 0.3.9 row was 21.03 at D=512, and the 2-bit file reads fewer routed bytes per token than the NVFP4 folder, so its decode sits above that row
+decide-in: write the four numbers per row into the release notes' table with these conditions
+decide-below: under 24.0: read the plan, residency and xstream lines and the witness block before writing a number; compare with the toktape's decode in the same window
+decide-above: beyond 34.0: read the witness block and the plan line before writing a number
