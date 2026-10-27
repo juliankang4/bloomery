@@ -76,14 +76,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 use bloomery_gpu::GpuError;
-use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH, UBATCH_ENV, ubatch_asked};
 use bloomery_gpu::arch::qwen3moe::{Body35, PrefillPath, Qwen35moeModel};
 use bloomery_gpu::media::{ImageSpan, MediaBody};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::arm_screen;
 use bloomery_gpu_gates::generate::{Place, choose_ctx};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::ubatch_pick::Rule;
 use bloomery_gpu_gates::vision_seat::{self, EncoderSeat, TextFacts};
 use bloomery_gpu_gates::{GateError, model_file, ref_model_path};
 use cuda_core::CudaContext;
@@ -99,6 +97,10 @@ use serve::media::{MediaModel, Prepared};
 use tokenizer::Tokenizer;
 
 use crate::{clef_seat, lev_seat};
+
+#[path = "../ubatch_rule.rs"]
+mod ubatch_rule;
+use ubatch_rule::ubatch_rule;
 
 /// The seat's record bin name, the `listening` record's head.
 const WHAT: &str = "bloomery-serve-decide";
@@ -596,9 +598,7 @@ fn work(l: &Load, ready: &Sender<Result<(String, usize), String>>, jobs: &Receiv
             embedding: None,
         };
         let media = image.is_some();
-        // The Qwen body's ubatch lever, as the planner's `ubatch_rule` passes it.
-        let env = ubatch_asked()?.map(|size| (size, UBATCH_ENV));
-        let rule = Rule::of(l.ubatch, env, UBATCH)?;
+        let rule = ubatch_rule(l.ubatch)?;
         let chosen = choose_ctx(
             &file,
             (l.ctx, 1),
