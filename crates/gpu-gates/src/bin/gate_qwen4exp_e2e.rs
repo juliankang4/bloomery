@@ -259,12 +259,12 @@
 //!   ids) by the
 //!   pass path and stream 1 window B (D1K's prefill) by the ubatch path, its
 //!   state hash every per-sequence store, the PLE ring and the lane word,
-//!   `seq_bytes`' derivation the stores, the lane word and the two arena-row
-//!   buffers; and between the harness's halves the body's own: a third
-//!   `add_slots` past the plan is refused by name; a select with a verify
-//!   waiting for its commit is refused by name, moving nothing; and a
-//!   rollback of slot 1 (a verify's commit) leaves slot 0's continuation its
-//!   solo run's.
+//!   `seq_bytes`' derivation the stores, the replay table, the lane word
+//!   and the two arena-row buffers; and between the harness's halves the
+//!   body's own: a third `add_slots` past the plan is refused by name; a
+//!   select with a verify waiting for its commit is refused by name, moving
+//!   nothing; and a rollback of slot 1 (a verify's commit) leaves slot 0's
+//!   continuation its solo run's.
 //! - (z) the PLE table on the NVMe tier: the host plan made with the host's
 //!   room given ([`PlanInputs::room`]) as the host arm's need less one byte,
 //!   so the placement leaves the table on the NVMe tier with its row room
@@ -4587,14 +4587,19 @@ mod gate {
         }
 
         /// The stores ([`Body38::store_bytes`], held to the header's
-        /// derivation by (s)), the lane word (one device word) and the two
+        /// derivation by (s)), the commit's replay table (four u64 words a
+        /// delta layer), the lane word (one device word) and the two
         /// arena-row buffers (`(1 + PASS_ROWS) · STREAMS · HIDDEN` f32).
         fn seq_bytes_derived(&self, m: &Qwen38Model) -> Result<Derived, GateError> {
             let stores = m.body("slots")?.store_bytes();
+            let table = n_gdn() * 4 * 8;
             let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;
             Ok(Derived {
-                bytes: stores + 4 + rows,
-                terms: format!("store_bytes {stores} + the lane word 4 + the arena rows {rows}"),
+                bytes: stores + table + 4 + rows,
+                terms: format!(
+                    "store_bytes {stores} + the replay table {table} + the lane word 4 + the \
+                     arena rows {rows}"
+                ),
             })
         }
 

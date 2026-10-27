@@ -1006,6 +1006,7 @@ mod delta_kernels {
                 n_v,
                 grouped,
                 (m, each, 0),
+                thread::blockIdx_x() as usize,
                 pos,
                 (carry, carried),
                 fault,
@@ -1080,12 +1081,104 @@ mod delta_kernels {
                 n_v,
                 grouped,
                 (m, each, 0),
+                thread::blockIdx_x() as usize,
                 pos,
                 (carry, carried),
                 fault,
                 o,
                 state,
                 stamp,
+            );
+        }
+    }
+
+    /// [`gdn_delta_recovery`]'s replay (`each == 0`) of `n_stores` stores in
+    /// one launch ([`DeltaKernels::enqueue_delta_recovery_layers`]): blocks
+    /// `s·per .. (s + 1)·per`, `per = 8·n_v`, are store `s`'s launch, block
+    /// `b - s·per` of it, on the state, stamps, carry and fault layer of row
+    /// `s` of `table` ([`RecoveryTable`]). A replay reads no `qkv`, `beta` or
+    /// `decay` and writes no `o`, so the stores share none of them.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            lane.len() >= lane_at + 1,
+            lanes >= 3,
+            m * 3 <= 128,
+            table.len() >= 4 * n_stores
+        )
+    )]
+    pub fn gdn_delta_recovery_layers(
+        lane: &[u32],
+        lane_at: u32,
+        lanes: u32,
+        n_k: u32,
+        n_v: u32,
+        grouped: u32,
+        m: u32,
+        table: &[u64],
+        n_stores: u32,
+        carry_len: u32,
+        fault: FaultSink,
+    ) {
+        let per = n_v as usize * (HEAD / COLUMNS_PER_BLOCK);
+        let b = thread::blockIdx_x() as usize;
+        let s = b / per;
+        if s >= n_stores as usize {
+            return; // block-uniform
+        }
+        // SAFETY: s < n_stores, so row s's RECOVERY_ROW words are inside the
+        // table by the launch contract.
+        let row = unsafe { table.get_unchecked(RECOVERY_ROW * s..RECOVERY_ROW * (s + 1)) };
+        let &[state, stamp, carry, layer] = row else {
+            return; // a row is RECOVERY_ROW words
+        };
+        let carried = u32::from(carry != 0);
+        let carry = if carried != 0 {
+            // SAFETY: RecoveryTable::new checked that a nonzero carry address
+            // starts carry_len f32s, 16-byte aligned, that no state or stamp
+            // of the table overlaps; its caller keeps them live and unwritten
+            // by any launch while a replay runs (its Safety section).
+            unsafe { core::slice::from_raw_parts(carry as usize as *const f32, carry_len as usize) }
+        } else {
+            &[]
+        };
+        // SAFETY: RecoveryTable::new checked the layer below LAYER_HEAD.
+        let store_fault = unsafe { fault.at_layer(layer as u32) };
+        // SAFETY: RecoveryTable::new checked row s's state (`lanes` lanes of
+        // the shape, 16-byte aligned) and stamps (`lanes` words), and that
+        // their byte ranges overlap no other state, stamp or carry of the
+        // table; its caller keeps them live and touched by no other launch
+        // while a replay runs (its Safety section). So each block's state
+        // keys and its store's stamps have this launch's one writer as in
+        // `gdn_delta_recovery`; the launcher checks three or more lanes and
+        // m * 3 <= HEAD. The replay reads no qkv, beta or decay and writes no
+        // o, so empty slices and a null o stand for them.
+        unsafe {
+            delta_lanes_body::<DECAY_HEAD, true>(
+                &[],
+                &[],
+                &[],
+                lane,
+                lane_at,
+                lanes,
+                n_k,
+                n_v,
+                grouped,
+                (m, 0, 0),
+                b - s * per,
+                &[],
+                (carry, carried),
+                store_fault,
+                core::ptr::null_mut(),
+                state as usize as *mut f32,
+                stamp as usize as *mut u32,
             );
         }
     }
@@ -1971,6 +2064,7 @@ mod delta_kernels {
                 n_v,
                 grouped,
                 (m, each, row),
+                thread::blockIdx_x() as usize,
                 pos,
                 (qkv, 0),
                 fault,
@@ -2343,18 +2437,19 @@ pub const fn read_lane(c: u32, row: u32, lanes: u32) -> u32 {
 
 /// The loop of one block of `gdn_delta_lanes` and `kda_delta_lanes` (module
 /// doc): [`delta_body`]'s loop for `DECAY` over lane [`read_lane`]`(c, row)`,
-/// `c = lane[lane_at] mod lanes`, with the stamp check and writes and the
-/// carry's count check on block 0's thread 0 and the state stored per row
+/// `c = lane[lane_at] mod lanes`, as the call's block `b` (head `b / 8`),
+/// with the stamp check and writes and the carry's count check on block 0's
+/// thread 0 and the state stored per row
 /// (`each != 0`) or once after the last token. For `DECAY_HEAD` with `carried`, the rows `carry` holds for
 /// `pos[0]` come first, their outputs not written (module doc, "Carry").
 ///
 /// # Safety
 ///
-/// [`delta_body`]'s contract for `DECAY`, and `pos` holds a word, `stamp`
-/// addresses `lanes` writable u32s no other launch touches, `row == 0` when
-/// `each == 0` or `carried != 0`, `row + m <= lanes` when `each != 0`, and
-/// with `carried` `carry` is a whole carry of the shape no launch writes
-/// while this one runs.
+/// [`delta_body`]'s contract for `DECAY`, and `pos` holds a word unless
+/// `RECOVERY && each == 0`. `stamp` addresses `lanes` writable u32s no
+/// other launch touches, `row == 0` when `each == 0` or `carried != 0`,
+/// `row + m <= lanes` when `each != 0`, and with `carried` `carry` is a
+/// whole carry of the shape no launch writes while this one runs.
 #[allow(
     clippy::too_many_arguments,
     reason = "the kernel entry's arguments, forwarded flat"
@@ -2375,6 +2470,7 @@ unsafe fn delta_lanes_body<const DECAY: u32, const RECOVERY: bool>(
     n_v: u32,
     grouped: u32,
     (m, each, row): (u32, u32, u32),
+    b: usize,
     pos: &[u32],
     (carry, carried): (&[f32], u32),
     fault: FaultSink,
@@ -2385,7 +2481,6 @@ unsafe fn delta_lanes_body<const DECAY: u32, const RECOVERY: bool>(
     let tid = thread::threadIdx_x() as usize;
     let lane = tid % 32;
     let j = lane % LANES_PER_COLUMN;
-    let b = thread::blockIdx_x() as usize;
     let blocks_per_head = HEAD / COLUMNS_PER_BLOCK;
     let h = b / blocks_per_head;
     let (n_k, n_v, m) = (n_k as usize, n_v as usize, m as usize);
@@ -2610,6 +2705,136 @@ unsafe fn delta_lanes_body<const DECAY: u32, const RECOVERY: bool>(
     }
 }
 
+/// Words of a [`RecoveryTable`] row: the store's state, stamp and carry
+/// device addresses (0 for a store with no carry) and its fault layer.
+const RECOVERY_ROW: usize = 4;
+
+/// One store a [`RecoveryTable`] names: the buffers of its
+/// [`DeltaKernels::enqueue_delta_recovery`] call and the layer its faults
+/// carry.
+pub struct RecoveryStore<'a> {
+    pub layer: usize,
+    pub state: &'a DeviceBuffer<f32>,
+    pub stamp: &'a DeviceBuffer<u32>,
+    pub carry: Option<&'a DeviceBuffer<f32>>,
+}
+
+/// The stores one [`DeltaKernels::enqueue_delta_recovery_layers`] launch
+/// replays, a row of [`RECOVERY_ROW`] words each, uploaded once.
+pub struct RecoveryTable {
+    words: DeviceBuffer<u64>,
+    stores: usize,
+    lanes: usize,
+    shape: LinearShape,
+}
+
+impl RecoveryTable {
+    /// The table of `stores`, each of `lanes` lanes of `shape`. Refused by
+    /// name: no store, fewer than three lanes, a state, stamp or carry
+    /// shorter than a replay reads, a state or carry not 16-byte aligned,
+    /// a state or stamp whose bytes a replay touches overlap another
+    /// state's, stamp's or carry's (its own store's included), and a layer
+    /// a fault word cannot carry ([`crate::LAYER_HEAD`] or past it). Buffer
+    /// handles may be non-owning windows; distinct base addresses alone do
+    /// not prove that their memory ranges are disjoint, so the check is on
+    /// byte ranges. Load-time only.
+    ///
+    /// # Safety
+    ///
+    /// The table holds the buffers' addresses, not borrows: every buffer
+    /// stays allocated at its address while any launch or captured graph
+    /// using the table can run. No other launch reads or writes a store's
+    /// state or stamps while a replay runs, and no launch writes its carry
+    /// while a replay runs.
+    pub unsafe fn new(
+        stream: &CudaStream,
+        shape: LinearShape,
+        lanes: usize,
+        stores: &[RecoveryStore<'_>],
+    ) -> Result<RecoveryTable, GpuError> {
+        const WHAT: &str = "RecoveryTable::new";
+        shape.check(WHAT)?;
+        let refuse = |detail: String| Err(GpuError::shape(WHAT, detail));
+        if stores.is_empty() || lanes < 3 {
+            return refuse(format!(
+                "{} stores of {lanes} lanes: need a store and 3 or more lanes",
+                stores.len()
+            ));
+        }
+        let state = lanes
+            .checked_mul(shape.state_len())
+            .ok_or_else(|| GpuError::shape(WHAT, "state size overflows usize"))?;
+        let mut words = Vec::with_capacity(RECOVERY_ROW * stores.len());
+        // Byte ranges a replay touches: (store, name, start, end, written).
+        let mut spans: Vec<(usize, &str, u64, u64, bool)> = Vec::with_capacity(3 * stores.len());
+        for (i, st) in stores.iter().enumerate() {
+            let lens = [
+                ("state", st.state.len(), state),
+                ("stamp", st.stamp.len(), lanes),
+            ];
+            let carried = st.carry.map(|c| ("carry", c.len(), shape.carry_len()));
+            if let Some((name, got, need)) = lens
+                .into_iter()
+                .chain(carried)
+                .find(|(_, got, need)| got < need)
+            {
+                return refuse(format!("store {i}: {name}.len() {got} < {need}"));
+            }
+            check_alignment::<U32x4, _>(WHAT, "state", st.state)?;
+            if let Some(c) = st.carry {
+                check_alignment::<U32x4, _>(WHAT, "carry", c)?;
+            }
+            if st.layer >= crate::LAYER_HEAD as usize {
+                return refuse(format!(
+                    "store {i}: layer {} at or past the head's fault layer {}",
+                    st.layer,
+                    crate::LAYER_HEAD
+                ));
+            }
+            // Each count is at most its buffer's len (checked above), so each
+            // range lies inside its buffer and cannot wrap.
+            let at = |p: u64, n: usize| (p, p + 4 * n as u64);
+            let mine = [
+                ("state", at(st.state.cu_deviceptr(), state), true),
+                ("stamp", at(st.stamp.cu_deviceptr(), lanes), true),
+            ]
+            .into_iter()
+            .chain(
+                st.carry
+                    .map(|c| ("carry", at(c.cu_deviceptr(), shape.carry_len()), false)),
+            );
+            for (name, (start, end), written) in mine {
+                if let Some(&(j, other, ..)) = spans
+                    .iter()
+                    .find(|&&(_, _, s, e, w)| (written || w) && start < e && s < end)
+                {
+                    return refuse(format!(
+                        "store {i}: its {name} overlaps store {j}'s {other}"
+                    ));
+                }
+                spans.push((i, name, start, end, written));
+            }
+            words.extend([
+                st.state.cu_deviceptr(),
+                st.stamp.cu_deviceptr(),
+                st.carry.map_or(0, DeviceBuffer::cu_deviceptr),
+                st.layer as u64,
+            ]);
+        }
+        Ok(RecoveryTable {
+            words: DeviceBuffer::from_host(stream, &words)?,
+            stores: stores.len(),
+            lanes,
+            shape,
+        })
+    }
+
+    /// Device bytes: [`RECOVERY_ROW`] u64 words a store.
+    pub(crate) fn bytes(&self) -> usize {
+        self.words.num_bytes()
+    }
+}
+
 /// [`DeltaKernels::enqueue_delta_lanes`]'s arguments: [`DeltaArgs`] over
 /// `lanes` lanes (one decay per value head), the row mode, the call's
 /// positions (`pos[0]` its first) and the store's `lanes` stamps.
@@ -2773,6 +2998,67 @@ impl DeltaKernels {
             ));
         }
         self.enqueue_lanes(stream, args, carry, true)
+    }
+
+    /// The replay of [`DeltaKernels::enqueue_delta_recovery`] (`each ==
+    /// false`) for every store of `table` in one launch: store `s` takes the
+    /// launch's blocks `8·n_v·s ..` and leaves its state, stamps and faults
+    /// as its own replay call would, the lane word `lane[lane_at]` and `m`
+    /// kept rows shared by all. Refused by name: `m` of 0 or past the lanes
+    /// or `HEAD / 3`, a lane word shorter than read. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_delta_recovery_layers(
+        &self,
+        stream: &CudaStream,
+        (lane, lane_at): (&DeviceBuffer<u32>, usize),
+        m: usize,
+        table: &RecoveryTable,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "enqueue_delta_recovery_layers";
+        let RecoveryTable {
+            words,
+            stores,
+            lanes,
+            shape,
+        } = table;
+        if m == 0 || m > *lanes || m > HEAD / 3 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{m} rows over {lanes} lanes: need rows in 1..=min(lanes, {})",
+                    HEAD / 3
+                ),
+            ));
+        }
+        if lane.len() <= lane_at {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("lane.len() {} with lane_at {lane_at}", lane.len()),
+            ));
+        }
+        let per = shape.n_v * (HEAD / COLUMNS_PER_BLOCK);
+        let blocks = stores
+            .checked_mul(per)
+            .ok_or_else(|| GpuError::shape(WHAT, "grid overflows usize"))?;
+        let cfg = LaunchConfig1D::new(launch_u32(WHAT, "grid", blocks)?, BLOCK, 0);
+        let prep = self.module.prepare_gdn_delta_recovery_layers(cfg)?;
+        self.module.gdn_delta_recovery_layers(
+            stream,
+            &prep,
+            lane,
+            launch_u32(WHAT, "lane_at", lane_at)?,
+            launch_u32(WHAT, "lanes", *lanes)?,
+            launch_u32(WHAT, "n_k", shape.n_k)?,
+            launch_u32(WHAT, "n_v", shape.n_v)?,
+            grouped_arg(shape.map),
+            launch_u32(WHAT, "m", m)?,
+            words,
+            launch_u32(WHAT, "stores", *stores)?,
+            launch_u32(WHAT, "carry_len", shape.carry_len())?,
+            fault,
+        )?;
+        Ok(())
     }
 
     fn enqueue_lanes(

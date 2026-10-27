@@ -1224,15 +1224,20 @@ mod gate {
             slot_digest(m)
         }
 
-        /// The stores ([`Body38::store_bytes`]), the lane word (one device
-        /// word) and the two arena-row buffers
+        /// The stores ([`Body38::store_bytes`]), the commit's replay table
+        /// (four u64 words a delta layer), the lane word (one device word)
+        /// and the two arena-row buffers
         /// (`(1 + PASS_ROWS) · PLE_STREAMS · HIDDEN` f32).
         fn seq_bytes_derived(&self, m: &Qwen38Model) -> Result<Derived, GateError> {
             let stores = m.body("slots")?.store_bytes();
+            let table = self.shape.n_gdn() * 4 * 8;
             let rows = (1 + Prompt38::PASS_ROWS) * PLE_STREAMS * HIDDEN * 4;
             Ok(Derived {
-                bytes: stores + 4 + rows,
-                terms: format!("store_bytes {stores} + the lane word 4 + the arena rows {rows}"),
+                bytes: stores + table + 4 + rows,
+                terms: format!(
+                    "store_bytes {stores} + the replay table {table} + the lane word 4 + the \
+                     arena rows {rows}"
+                ),
             })
         }
 
