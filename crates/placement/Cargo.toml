@@ -18,4 +18,5 @@ workspace = true
 bloomery-gguf = { path = "../gguf" }
 bloomery-levers = { path = "../levers" }
 bloomery-models = { path = "../models" }
+bloomery-runtime = { path = "../runtime" }
 thiserror = { workspace = true }

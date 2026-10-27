@@ -1241,6 +1241,12 @@ mod gate {
             })
         }
 
+        fn seq_terms_bytes(&self, _m: &Qwen38Model) -> Result<Option<usize>, GateError> {
+            Ok(Some(usize::try_from(
+                self.inputs.seq_terms(None).bytes(CTX as u64, 1),
+            )?))
+        }
+
         /// H5's planter: the host tier's refusal, through the body's own mut
         /// path to the tier.
         fn plant_refusal(&self, m: &mut Qwen38Model) -> Result<bool, GateError> {

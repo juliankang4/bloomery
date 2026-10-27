@@ -221,9 +221,11 @@ impl KvBytes for Kv38 {
 }
 
 /// A sequence's card bytes beside its stores
-/// (`qwen35moe::place::slot_resident_bytes`): (1 + 8) rows of 4 · 2,560 f32
-/// and a lane word.
-const BESIDE: u64 = 9 * 4 * 2560 * 4 + 4;
+/// (`qwen35moe::place::PlanInputs::seq_terms`): (1 + 8) rows of 4 · 2,560 f32
+/// and a lane word, plus the replay table's row for each delta layer.
+const BESIDE: u64 = ROWS + 4 + 36 * runtime::stores::DELTA_REPLAY_BYTES;
+/// A sequence's step and pass arena rows.
+const ROWS: u64 = 9 * 4 * 2560 * 4;
 
 /// The host bytes one saved sequence state of `ctx` positions holds, the
 /// prompt cache's entry (`qwen35moe::place::PlanInputs::seq_state_bytes`,
@@ -232,12 +234,12 @@ const BESIDE: u64 = 9 * 4 * 2560 * 4 + 4;
 /// 256 B pooled key a pool of four), two checkpoints — the 36 delta layers'
 /// committed state lane, conv ring and carry, 4,093,584 B each, and the PLE
 /// ring, 17 · 4 · 2,560 f32 — and, under the draft, its store (2,048 B a
-/// position), the arena rows ([`BESIDE`] less its lane word) and one point's
-/// hidden row (4 · 2,560 f32).
+/// position), the arena rows ([`ROWS`]) and one point's hidden row
+/// (4 · 2,560 f32).
 fn state38(ctx: u64, drafts: bool) -> u64 {
     let attention = 12 * (ctx * 2304 + ctx.div_ceil(4) * 256);
     let draft = if drafts {
-        ctx * 2048 + BESIDE - 4 + 4 * 2560 * 4
+        ctx * 2048 + ROWS + 4 * 2560 * 4
     } else {
         0
     };

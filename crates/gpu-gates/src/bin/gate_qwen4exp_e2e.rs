@@ -4603,6 +4603,14 @@ mod gate {
             })
         }
 
+        fn seq_terms_bytes(&self, _m: &Qwen38Model) -> Result<Option<usize>, GateError> {
+            let file = open_split()?;
+            let inputs = PlanInputs::describe(&file)?;
+            Ok(Some(usize::try_from(
+                inputs.seq_terms(None).bytes(CTX as u64, 1),
+            )?))
+        }
+
         /// H5's planter ([`SlotsAdapter::plant_refusal`]): the tier through
         /// the body's own mut path.
         fn plant_refusal(&self, m: &mut Qwen38Model) -> Result<bool, GateError> {
@@ -4660,7 +4668,8 @@ mod gate {
     /// lanes, conv ring and carry) and PLE ring (`runtime::stores`'s own
     /// terms, the ones the load holds the allocations to), the lane word
     /// (one device word) and the two arena-row buffers (`(1 + PASS_ROWS) ·
-    /// STREAMS · HIDDEN` f32, `seq38_bytes`' rows term) — and at one slot is
+    /// STREAMS · HIDDEN` f32, `seq38_bytes`' rows term), and the replay
+    /// table (four u64 words per delta layer) — and at one slot is
     /// the plan every other clause loads by.
     fn slots_plan(experts: Experts) -> Result<bool, GateError> {
         let seq = {
@@ -4671,7 +4680,11 @@ mod gate {
             let sel = st::selecting_bytes(N_KV, HEAD, IDX_DIM, POOL, CTX);
             let ple = st::ple_ring_bytes(PLE_TAPS, PLE_DILATION, STREAMS, HIDDEN);
             let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;
-            u64::try_from(n_gdn())? * rec + u64::try_from(n_qsa())? * sel + ple + 4 + rows as u64
+            u64::try_from(n_gdn())? * (rec + 32)
+                + u64::try_from(n_qsa())? * sel
+                + ple
+                + 4
+                + rows as u64
         };
         let file = open_split()?;
         let inputs = PlanInputs::describe(&file)?;
@@ -4703,8 +4716,8 @@ mod gate {
         let ok = same_at_one && grown == seq;
         println!(
             "slots plan: the plan of 2 grows the card's kv class by {grown} (one sequence's \
-             stores, ring, lane word and arena rows: {seq}), and at 1 slot {} the plan the load \
-             always makes {}",
+             stores, ring, replay table, lane word and arena rows: {seq}), and at 1 slot {} \
+             the plan the load always makes {}",
             if same_at_one { "is" } else { "is not" },
             verdict(ok)
         );
