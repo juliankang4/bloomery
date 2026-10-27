@@ -491,12 +491,13 @@ pub trait Engine: Send {
     fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, EngineError> {
         Ok(None)
     }
-    /// Ends the load on every other process that serves part of it (a tier
-    /// node holding its experts), as the engine's Drop would, and frees
-    /// nothing in this process: the server's last call, made once its engine
-    /// thread leaves its loop, which leaves the engine to the process exit.
-    /// The default has no such process.
-    fn close_nodes(&mut self) -> Result<(), EngineError> {
+    /// The server's last call, made once its engine thread leaves its loop,
+    /// which leaves the engine to the process exit: prints the records the
+    /// engine still holds of its last requests, then ends the load on every
+    /// other process that serves part of it (a tier node holding its
+    /// experts) as the engine's Drop would; frees nothing in this process.
+    /// The default holds no record and has no such process.
+    fn close(&mut self) -> Result<(), EngineError> {
         Ok(())
     }
     /// The whole cache as a value [`Engine::resume`] takes back, the cache

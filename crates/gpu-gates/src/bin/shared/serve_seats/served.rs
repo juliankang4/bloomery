@@ -148,6 +148,8 @@ trait Driven<B: ChainBody + 'static> {
     ) -> Result<Committed, SessionError>;
     /// The most rows one pass verifies.
     fn rows(&self) -> usize;
+    /// The width chooser's record for the last request, at the server's stop.
+    fn close(&mut self);
     fn forget(&mut self);
     fn restart(&mut self) -> Result<(), GpuError>;
     fn window(&self) -> usize;
@@ -183,6 +185,10 @@ where
 
     fn rows(&self) -> usize {
         M
+    }
+
+    fn close(&mut self) {
+        super::drafted::print_widths(self);
     }
 
     fn forget(&mut self) {
@@ -281,6 +287,12 @@ impl<B: ChainBody + 'static> ServedSpark<B> {
     /// The target was reset: the draft starts over with it.
     pub fn reset(&mut self) -> Result<(), GateError> {
         Ok(self.window.restart()?)
+    }
+
+    /// The server's stop: the width chooser's record of the last request
+    /// printed, since no prompt call follows it.
+    pub fn close(&mut self) {
+        self.window.close();
     }
 
     /// The positions a request that starts the draft over feeds it before its
@@ -520,6 +532,17 @@ where
             l.forget(slot)?;
         }
         Ok(())
+    }
+
+    /// The server's stop: the width chooser's record of each slot's last
+    /// request printed, the DSpark draft's or the lookup's.
+    pub fn close(&mut self) {
+        if let Some(d) = &mut self.dspark {
+            d.close();
+        }
+        if let Some(l) = &mut self.lookup {
+            l.close();
+        }
     }
 
     /// The draft's window: the positions a request that starts the draft over

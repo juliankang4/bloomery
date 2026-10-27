@@ -283,7 +283,7 @@
 //! most and none while no width beats the plain step, `fixed` the draft's
 //! three ids whole — the greedy ids the plain server's, `pass_rows` 4;
 //! under `cost` a request's `mtp width` record prints at the slot's next
-//! prompt call. A sampling or id-banning request drafts while its slot runs
+//! prompt call, a slot's last request's at the server's stop. A sampling or id-banning request drafts while its slot runs
 //! alone in the round, each kept id its draw from its verified row
 //! (`Seat::pass_sampled`; an id-banning request's draw sets the banned
 //! logits to -inf first), and takes plain steps beside another busy slot.
@@ -2878,7 +2878,10 @@ impl Seat for Q38 {
         }))
     }
 
-    fn close_nodes(&mut self) -> Result<(), GateError> {
+    /// Every slot's draft record printed ([`SlotDrafts::close`]), then the
+    /// tier nodes closed.
+    fn close(&mut self) -> Result<(), GateError> {
+        self.drafts.close();
         Ok(self.s.model_mut().close_nodes()?)
     }
 

@@ -302,7 +302,7 @@ impl<F: Family> Seat for Hybrid<F> {
         Err(format!("a resume: {}", no_cache::<F>()).into())
     }
 
-    fn close_nodes(&mut self) -> Result<(), GateError> {
+    fn close(&mut self) -> Result<(), GateError> {
         Ok(self.s.model_mut().close_nodes()?)
     }
 

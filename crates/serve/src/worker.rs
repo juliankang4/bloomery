@@ -388,7 +388,7 @@ struct Worker {
 /// driver call made while the exit tears the driver's libraries down can
 /// corrupt the process's heap. What the Drop would tell other processes
 /// the thread tells them itself, before the loop's end is published
-/// ([`crate::Engine::close_nodes`]).
+/// ([`crate::Engine::close`]).
 pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
     let n = relock(&sh.board).slots().len();
     let turns = slot.engine.turns().map(|park| {
@@ -437,11 +437,12 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
             error: format!("the engine thread panicked: {}", panic_text(&*p)),
         }),
     };
-    // What the thread still holds is answered with what ended the loop, and
-    // the processes serving part of the load are told it ended.
+    // What the thread still holds is answered with what ended the loop, then
+    // the engine closed: the processes serving part of the load told it
+    // ended, the records of its last requests printed.
     w.close();
-    if let Err(e) = w.slot.engine.close_nodes() {
-        eprintln!("bloomery-serve: closing the engine's nodes: {e}");
+    if let Err(e) = w.slot.engine.close() {
+        eprintln!("bloomery-serve: closing the engine: {e}");
     }
     // The stop's wait on the loop ends here: past this point the thread
     // calls the engine no more, and the engine and the slots' saved states

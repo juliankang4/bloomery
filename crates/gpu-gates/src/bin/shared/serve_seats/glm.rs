@@ -1708,7 +1708,10 @@ impl Seat for Glm {
         }))
     }
 
-    fn close_nodes(&mut self) -> Result<(), GateError> {
+    /// Every slot's draft record printed ([`SlotDrafts::close`]), then the
+    /// tier nodes closed.
+    fn close(&mut self) -> Result<(), GateError> {
+        self.drafted.close();
         Ok(self.s.model_mut().close_nodes()?)
     }
 

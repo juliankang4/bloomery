@@ -979,8 +979,8 @@ enum Cmd {
     Pos,
     /// The residency back to its seed.
     ResidencyReset,
-    /// The load ended on the model's tier nodes ([`Seat::close_nodes`]).
-    CloseNodes,
+    /// The seat's last command ([`Seat::close`]).
+    Close,
     /// Make `slot` the one every later command acts on ([`Seat::select`]).
     Select(usize),
     /// A step of several slots in one command ([`SeatEngine`]'s
@@ -1326,10 +1326,12 @@ pub trait Seat: 'static {
     fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, GateError> {
         Ok(None)
     }
-    /// The load ended on every expert tier's node, nothing freed
-    /// (`serve::Engine::close_nodes`); the default, for a seat whose model
+    /// The server's last call (`serve::Engine::close`), nothing freed: the
+    /// records the seat still holds of its slots' last requests printed (a
+    /// draft's `mtp width`), then the load ended on every expert tier's
+    /// node. The default, for a seat that holds no record and whose model
     /// runs no tier on a node, does nothing.
-    fn close_nodes(&mut self) -> Result<(), GateError> {
+    fn close(&mut self) -> Result<(), GateError> {
         Ok(())
     }
     /// Prints what the server's prompt cache did, as the binary's records.
@@ -1527,10 +1529,10 @@ impl SeatEngine {
                                 Extra::None,
                             ),
                         },
-                        Cmd::CloseNodes => (
-                            g.close_nodes()
+                        Cmd::Close => (
+                            g.close()
                                 .map(|()| 0)
-                                .map_err(|e| format!("closing the tier nodes: {e}")),
+                                .map_err(|e| format!("closing the seat: {e}")),
                             None,
                             Extra::None,
                         ),
@@ -2198,9 +2200,9 @@ fn serve_cmd<S: Seat>(
         | Cmd::StepSlots(..)
         | Cmd::PassSlots(..)
         | Cmd::ResidencyReset
-        | Cmd::CloseNodes => Err(
+        | Cmd::Close => Err(
             "a keep, split, pass, step or pass of several slots, save, resume, slot file's save \
-             or restore, residency reset or close of the tier nodes reached the step loop; the \
+             or restore, residency reset or close of the seat reached the step loop; the \
              engine thread answers it"
                 .to_owned(),
         ),
@@ -2985,8 +2987,8 @@ impl Engine for SeatEngine {
         }
     }
 
-    fn close_nodes(&mut self) -> Result<(), EngineError> {
-        self.link.call(Cmd::CloseNodes).map(|_| ())
+    fn close(&mut self) -> Result<(), EngineError> {
+        self.link.call(Cmd::Close).map(|_| ())
     }
 
     /// The body's rule for the request's reply, asked on the engine thread

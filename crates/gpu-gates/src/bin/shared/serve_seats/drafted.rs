@@ -85,6 +85,9 @@ trait LookupWindow<T> {
     ) -> Result<Committed, GateError>;
     #[cfg(test)]
     fn gate_state(&self) -> runtime::width::GateState;
+    /// The passes the chooser holds no record of yet, taken.
+    #[cfg(test)]
+    fn unprinted(&mut self) -> u64;
 }
 
 impl<T, C> LookupWindow<T> for Speculative<Choosing<Lookup, C>, LOOKUP_ROWS>
@@ -124,6 +127,11 @@ where
     #[cfg(test)]
     fn gate_state(&self) -> runtime::width::GateState {
         self.draft().gate_state()
+    }
+
+    #[cfg(test)]
+    fn unprinted(&mut self) -> u64 {
+        self.draft_mut().take_tally().passes()
     }
 }
 
@@ -331,6 +339,12 @@ impl<T: Target> Lookups<T> {
     pub(crate) fn unpark(&mut self, slot: usize, ctx: &[u32]) -> Result<(), GateError> {
         self.at(slot, Call::Moved)?.rebuild(ctx);
         Ok(())
+    }
+
+    /// The server's stop: every slot's chooser closed, the record of the
+    /// slot's last request printed, since no call follows it.
+    pub(crate) fn close(&mut self) {
+        self.windows.iter_mut().for_each(|w| w.close());
     }
 }
 
@@ -892,6 +906,18 @@ where
         Ok(())
     }
 
+    /// The server's stop: the chooser's record of every slot's last request
+    /// printed (the MTP draft's or the lookup's), since no call follows it
+    /// to close it out.
+    pub(crate) fn close(&mut self) {
+        for spec in self.specs.iter_mut().flatten() {
+            print_widths(spec);
+        }
+        if let Some(l) = &mut self.lookups {
+            l.close();
+        }
+    }
+
     /// `slot`'s draft side of the session's sequence, for a state the seat
     /// saves of that slot ([`MtpDraft::park`]; the turn-off why with it);
     /// `None` without a draft. The state keeps the draft's store and the
@@ -1008,9 +1034,10 @@ pub(crate) fn serves_widths() {
 }
 
 /// The chooser's passes over the request a slot just finished and its state
-/// at the request's end, as its `mtp width` record: nothing under `fixed`,
-/// whose passes are the draft's own, and nothing for a request that ran no
-/// pass. The ds41 seat drains its own drafts the same way.
+/// at the request's end, as its `mtp width` record, printed at the slot's
+/// next call that closes it out or at the server's stop: nothing under
+/// `fixed`, whose passes are the draft's own, and nothing for a request that
+/// ran no pass.
 pub(crate) fn print_widths<D, C: Clock, const M: usize>(spec: &mut Speculative<Choosing<D, C>, M>) {
     record::require(record::groups::drafted::WIDTH, "drafted::print_widths");
     let choosing = spec.draft_mut();
@@ -1320,6 +1347,32 @@ mod tests {
             "the costs read are not the passes' own walls {:?}: {wrong:?}",
             walls()
         );
+    }
+
+    /// The server's stop prints every slot's record of its last request
+    /// ([`Lookups::close`]): no call follows that request to close its
+    /// chooser out, and without the stop its passes go unprinted.
+    #[test]
+    fn the_stop_prints_every_slots_last_request() {
+        let ids: Rc<[u32]> = Rc::new([7_u32]);
+        let unprinted = |stop: bool| {
+            let clock = Rc::new(Cell::new(Duration::ZERO));
+            let mut l = lookups(2, Lookup::RULE, &clock);
+            for slot in 0..2 {
+                let mut t = Position::new(&ids, &clock);
+                t.begin(&mut l, slot);
+                t.pass(&mut l, slot);
+            }
+            if stop {
+                l.close();
+            }
+            l.windows
+                .iter_mut()
+                .map(|w| w.unprinted())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(unprinted(false), [1, 1], "each slot ran one pass");
+        assert_eq!(unprinted(true), [0, 0], "the stop printed every slot's");
     }
 
     /// Two slots that take turns, each a lookup whose proposals the target
