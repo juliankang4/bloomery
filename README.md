@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midagedev/bloomery/releases/tag/v0.3.9">0.3.9 release notes</a> ·
+  <a href="https://github.com/midagedev/bloomery/releases/tag/v0.3.10">0.3.10 release notes</a> ·
   <a href="docs/models.md">Models</a> ·
   <a href="docs/serving.md">Serving</a> ·
   <a href="docs/evaluating.md">Evaluating</a> ·
@@ -27,14 +27,15 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ## What it does
 
 - **Models larger than the cards, and larger than the host's RAM.** The routed experts live on the cards and in host
-  RAM, and the engine moves the experts it calls most onto the card while it runs. 0.3.9 serves Muse Spark Open
-  816B-A42B (225.6 GB of weights) and MiniMax-M3.1-Flash (250.1 GB) on two cards with 72 GB between them. When the RAM
+  RAM, and the engine moves the experts it calls most onto the card while it runs. bloomery serves Muse Spark Open
+  816B-A42B (225.6 GB of weights) and MiniMax-M3.1-Flash (250.1 GB, or 143.9 GB as Unsloth's 2-bit GGUF) on two cards
+  with 72 GB between them. When the RAM
   cannot hold the host's share either, Qwen3.8, GLM-5.3-Flash and DeepSeek-V4.1-Flash page the rest from NVMe.
 - **Checkpoint folders as downloaded.** MiniMax-M3.1-Flash loads from its vendor's NVFP4 safetensors folder, and
   Qwen3.8 from its NVFP4 or FP4-Local folder, with no conversion and no requant. Everything else loads from GGUF.
-- **Apple Silicon.** A Metal backend serves Qwen3.6-35B-A3B on a Mac GPU, from an MLX 4-bit checkpoint or a GGUF
-  file, and runs Ornith-1.5-35B (Q4_K_M, text only); prompts run in batched passes, and a follow-up turn reads only its
-  new messages ([below](#apple-silicon)).
+- **Apple Silicon.** A Metal backend serves Qwen3.6-35B-A3B (Q4_K_M, `UD-Q4_K_XL`, or an MLX 4-bit checkpoint) and
+  Qwen3-30B-A3B (Q4_K_M) on a Mac GPU, and runs Ornith-1.5-35B and MiniCPM-V 4.7 35B-A3B (Q4_K_M, text only); prompts run
+  in batched passes, and a follow-up turn reads only its new messages ([below](#apple-silicon)).
 - **llama-server compatible.** The same HTTP API (OpenAI and Anthropic), GGUF files and flag spellings, including the
   placement flags (`-dev`, `-ts`, `-ngl`, `--cpu-moe`, `-ot`, `--fit`) with llama's meaning. Your client works
   unchanged; Claude Code runs with `ANTHROPIC_BASE_URL=http://localhost:8080`.
@@ -47,20 +48,22 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
   [cuda-oxide](https://github.com/NVIDIA/cuda-rust); the Metal backend's host side is Rust, its kernels Metal
   Shading Language.
 
-## Status (0.3.9)
+## Status (0.3.10)
 
-Two large mixture-of-experts models on one workstation: an RTX A6000 48 GB and an RTX 3090 24 GB (at its 250 W cap),
+Large mixture-of-experts models on one workstation: an RTX A6000 48 GB and an RTX 3090 24 GB (at its 250 W cap),
 32-core AVX2 host, 256 GB of RAM. Serving defaults: `--place` unset (it picks `bp`: the A6000 holds the model's stage,
-the 3090 holds experts, the host runs the rest), every lever unset, no `--parallel`. Means of two rounds, tok/s.
+the 3090 holds experts, the host runs the rest), every lever unset, no `--parallel`, `--ctx-size 4300`. Means of two
+rounds, tok/s.
 
 | Model | Prompt, 512 tokens | Prompt, 4,096 tokens | Decode at depth 512 | Decode at depth 4,096 |
 |---|---|---|---|---|
-| MiniMax-M3.1-Flash, NVFP4 folder | 122.57 | 123.62 | 21.03 | 19.48 |
-| Muse Spark Open 816B-A42B `UD-IQ2_XXS` | 90.40 | 94.90 | 16.65 | 15.74 |
+| MiniMax-M3.1-Flash `UD-Q2_K_XL` (GGUF) | 160.16 | 165.92 | 28.63 | 29.41 |
+| MiniMax-M3.1-Flash, NVFP4 folder | 129.08 | 131.56 | 21.12 | 19.53 |
 
-On MiniMax-M3.1-Flash, 0.3.9's adaptive residency raised decode at depth 512 from 16.52 to 21.97 tok/s, and the host's
-NVFP4 column tile raised the 512-token prompt from 88.35 to 124.19 tok/s (same lease, two rounds each). The release
-notes hold the commits, the release check on the tagged binary, every off cell and the contributors' work.
+On the RTX 3090 alone, the same GGUF runs at 21.36 tok/s decode at depth 512, and Nanbeige4.3-33B `Q4_K_M` loads whole
+on the card (a 512-token prompt at 745.46 tok/s, decode 24.22). Flint 40B-A2.5B (`UD-Q4_K_XL`) loads whole on the
+RTX A6000. The release notes hold the commits, the release check on the tagged binary, every off cell and the
+contributors' work.
 
 ## Install
 
@@ -82,24 +85,24 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.3.9-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.9-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.3.10-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.10-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.3.9](https://github.com/midagedev/bloomery/releases/tag/v0.3.9)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.3.10](https://github.com/midagedev/bloomery/releases/tag/v0.3.10)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ### Apple Silicon
 
-macOS 26.2 or newer; the binaries are signed and notarized. One architecture runs so far (`qwen35moe`). Qwen3.6-35B-A3B
-runs from a Q4_K_M GGUF or from an MLX 4-bit folder that `bloomery-prepare` converts once. Two more Q4_K_M files with its
-shapes run, text only: Ornith-1.5-35B, and MiniCPM-V 4.7 35B-A3B (its `mmproj` is not read) on a build after 0.3.9
-(0.3.9 refuses its vocabulary of 248,144). Sage-A1.5 has the same shapes and has not been run on a Mac yet. A file the
-Metal backend cannot run is refused by name when it opens; Qwen3.6's `UD-Q4_K_XL` (it holds Q8_0 and Q5_K tensors) and
-Qwen3-30B-A3B (architecture `qwen3moe`) are refused today.
+macOS 26.2 or newer; the binaries are signed and notarized. Two architectures run: `qwen35moe` and `qwen3moe`.
+Qwen3.6-35B-A3B runs from a Q4_K_M or `UD-Q4_K_XL` GGUF, or from an MLX 4-bit folder that `bloomery-prepare` converts
+once. Qwen3-30B-A3B-Instruct-2507 runs from its Q4_K_M GGUF. Two more Q4_K_M files with Qwen3.6's shapes run, text only:
+Ornith-1.5-35B, and MiniCPM-V 4.7 35B-A3B (its `mmproj` is not read). Sage-A1.5 has the same shapes and has not been run
+on a Mac yet. A file the Metal backend cannot run is refused by name when it opens. A file whose shapes the kernels take
+but no build has registered compiles its kernels when it opens, and the server says that no gate checked that shape.
 
 ```sh
-# Homebrew, or the same installer as on Linux (bloomery-0.3.9-macos-arm64-metal.tar.gz on the releases page)
+# Homebrew, or the same installer as on Linux (bloomery-0.3.10-macos-arm64-metal.tar.gz on the releases page)
 brew install midagedev/tap/bloomery
 curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/release/install.sh | sh
 
@@ -155,7 +158,7 @@ adaptive residency: [`docs/serving.md`](docs/serving.md).
 | What runs | State |
 |---|---|
 | NVIDIA cards | Compute capability 8.6 or newer, driver R580 or newer (CUDA 13); an older driver is refused at the start. Run here: RTX 3090, RTX A6000, RTX 3060 (WSL2). Run by users: RTX 5090 ([#2](https://github.com/midagedev/bloomery/issues/2)), DGX Spark (GB10, from source: [`docs/contrib/dgx-spark.md`](docs/contrib/dgx-spark.md)), one model across several Sparks. Ada (sm_89): no report yet |
-| Apple Silicon | macOS 26.2 or newer, the release's signed binaries (Homebrew, the installer or the tarball); Qwen3.6-35B-A3B and Ornith-1.5-35B (MiniCPM-V 4.7 on a build after 0.3.9), one slot, text only ([`docs/mac.md`](docs/mac.md)). Run here: M1 Pro, M4 Pro 48 GB. Run by users: M3 Ultra, M5 Ultra ([#593](https://github.com/midagedev/bloomery/issues/593)). On an M5 the prompt's GEMMs run on the neural accelerators, picked by the device |
+| Apple Silicon | macOS 26.2 or newer, the release's signed binaries (Homebrew, the installer or the tarball); Qwen3.6-35B-A3B, Qwen3-30B-A3B, Ornith-1.5-35B and MiniCPM-V 4.7, one slot, text only ([`docs/mac.md`](docs/mac.md)). Run here: M1 Pro, M4 Pro 48 GB. Run by users: M3 Ultra, M5 Ultra ([#593](https://github.com/midagedev/bloomery/issues/593)). On an M5 the prompt's GEMMs run on the neural accelerators, picked by the device |
 | Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel, for the CUDA build; the Metal build runs on Apple Silicon |
 | OS | Linux x86-64 with glibc 2.34 or newer; Windows through WSL2; macOS 26.2 or newer on Apple Silicon. AMD GPUs are not supported yet |
 
@@ -270,7 +273,7 @@ release's check:
 Output is checked layer by layer against ik_llama.cpp (V4.1: PPL 2.2401 against 2.2378, same top token 97.46 %), and
 every gate is shown to fail on its defect before the fix lands ([how](docs/performance.md#how-it-is-verified)).
 
-## Known limits (0.3.9)
+## Known limits (0.3.10)
 
 - DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`). Unset `--place` picks `a`.
 - The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot; `--parallel` above 1 is refused by name.
@@ -280,7 +283,8 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
   types stay on the host.
 - Muse Spark Open always thinks: a turn's first tokens are its reasoning, so a short `max_tokens` can end with empty
   `content`.
-- MiniMax-M3 (not M3.1) was not checked for 0.3.9.
+- MiniMax-M3 (not M3.1) was not checked for 0.3.10; each family's newest model was.
+- Flint's greedy text has no CPU or llama.cpp referee yet; the card path's gates and the serving checks hold it.
 - DeepSeek V4.1 runs routed experts on a card only as Q3_K gate·up with a Q4_K down; other expert types (ISTA-DASLab's
   IQ1_M, IQ2_XXS and IQ2_XS) run on the host tier.
 - GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
