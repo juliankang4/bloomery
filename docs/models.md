@@ -83,8 +83,8 @@ by device, not by name; a list word such as `0+1` names cards by CUDA index (`CU
 matches `nvidia-smi`'s numbering; the qwen38 seat takes `a`, `gate` or `bp` only).
 
 A DGX Spark (GB10, aarch64, sm_121) builds and runs from source, a contributor's port
-([`contrib/dgx-spark.md`](contrib/dgx-spark.md)): the plan treats its unified memory as one pool, and `BLOOMERY_ARCH`
-sets the CUDA arch. The release binaries are x86-64 only.
+([`contrib/dgx-spark.md`](contrib/dgx-spark.md)): the plan treats its unified memory as one pool, and the recipes
+build `sm_121a` on it unless `BLOOMERY_ARCH` names another arch. The release binaries are x86-64 only.
 
 Only the A6000, the 3090, an RTX 3060 12 GB under WSL2 (running Clef-Flash, its download and its cache), an RTX 5090
 and the Spark have been run; other cards and drivers are untested — please open an issue with `--version` and the

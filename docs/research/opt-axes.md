@@ -258,7 +258,7 @@ Status words are the inventory's. "Owned" names who queues it. An enabler that m
 | 48d | V2-Lite norm_quant fusion | D, G | 216 µs `[stated]`. Same class as 48c |
 | 48e | V2-Lite router kept bf16 | E, A | Load-time f32 decode doubles the router bytes `[stated]`. −0.27 ms/layer-sum `[stated, v41-b5 K5]` |
 | 49 | mistral.rs copy list | — | Architecture notes (one GGUF/HF boundary, kernel pairs, CPU KV f16). No single term |
-| 50 | Multi-Spark tensor parallel vs a split | F, A, C | Placement across pools, and small-message latency on the link. A maintainer decision (`dgx-spark.md`) |
+| 50 | Multi-Spark tensor parallel vs a split | F, A, C | Placement across pools, and small-message latency on the link. Both are in the tree: remote expert tiers, and tensor parallel for GLM-5.3-Flash with its step across machines not built (`dgx-spark.md` §9.4) |
 | 51 | LES repack; per-layer mixed precision | F, E | Contiguous batches are F (and then A, if the rate rises). Mixed precision is E. Unitier owns LES. The iPad 2.97 → 9.81 tok/s figure is their claim `[stated]`, not a bloomery measurement |
 
 **3.11–3.17 (inventory 25), each already model-0 in `adaptive-picks.md`.**
@@ -299,7 +299,7 @@ Two kernels, two answers:
 - For projections that call `site::kgemv`, Q4_K uses `enqueue_gemv_q4k` and shares each weight row across all `m` columns. Q5_K uses `enqueue_gemv_q5k_sel` with one zero-id slot per column; each slot reads the row separately, so axis D remains open. Dense FFNs also have per-slot paths: fused Q4_K gate/up and Q4_K/Q6_K down (`plan.rs`, `dispatch.rs`). Reuse depends on the actual entry.
 - Routed gate, up and down at `m ≤ 8` call `enqueue_gate_up` / `enqueue_gemv_q4k_sel` with `n_slots = m * slots` (`dispatch.rs`). `q4k_gemv_sel`'s body is the m = 1 core, `col0 = slot` (`q4k_sel.rs`). Slot `s` reads expert `sel[s]` on its own. Two rows that pick the same expert read it twice. `q4k_gemv_tiles` already reads one expert's row once for up to eight of its slots, and this arm does not call it. The wide arm (`m > 8`) is a different path and does read each weight once (`wide.rs`).
 
-The 2026-09-19 1.69× is not the prediction. The open term is only the routed overlap. Harvest's uniform-routing union for Qwen3.8 is u(5) = 4.80 against 5 row-reads, and the routed term R is 1.52 GB a token `[stated, harvest §2, from dgx-spark.md §8.4]`:
+The 2026-09-19 1.69× is not the prediction. The open term is only the routed overlap. Harvest's uniform-routing union for Qwen3.8 is u(5) = 4.80 against 5 row-reads, and the routed term R is 1.52 GB a token `[stated, harvest §2, from dgx-spark.md §9.7]`:
 
 ```text
 (5 − 4.80) × 1.52 GB = 0.304 GB a 5-row window
@@ -323,7 +323,7 @@ Spark at 200 GB/s: 7.03 ms/window      [derived]
 Spark at 235 GB/s: 5.98 ms/window      [derived]
 ```
 
-The 200–235 GB/s band is the harvest's assumption for the GB10 pool (`dgx-spark.md` §2, via harvest §2), not a new measurement. The harvest's 5.0–8.1 ms/window is their scaling of an A6000 ledger band; the byte arithmetic above is the figure to use for this list. This is a landed default, not a new cut. Confirming it is a same-binary `MTP_HEAD_ROWS=full` against unset, and it needs a Spark. The ws pool has no Spark. Changing the default is a lead decision and is not proposed: the default is already the list.
+The 200–235 GB/s band is the harvest's assumption for the GB10 pool (`dgx-spark.md` §5, via harvest §2), not a new measurement. The harvest's 5.0–8.1 ms/window is their scaling of an A6000 ledger band; the byte arithmetic above is the figure to use for this list. This is a landed default, not a new cut. Confirming it is a same-binary `MTP_HEAD_ROWS=full` against unset, and it needs a Spark. The ws pool has no Spark. Changing the default is a lead decision and is not proposed: the default is already the list.
 
 ### 3. Decode B: two independent sequences, staggered by a layer
 

@@ -2,7 +2,7 @@
 
 bloomery is an LLM inference engine for MoE models that splits the experts between GPU and CPU. Its GPU kernels are Rust, compiled with [cuda-oxide](https://github.com/NVIDIA/cuda-rust). This page shows how a larger project is put together on it: how the kernels are laid out, how the host launches them and how the build is pinned. It is written for people who have finished a first cuda-oxide kernel and want to see the next step.
 
-bloomery is still in active development, and this page describes the tree as it is now. Everything here runs on Ampere (sm_86) only.
+bloomery is still in active development, and this page describes the tree as it is now. Everything here runs on Ampere (sm_86), and on a DGX Spark's GB10 at `sm_121a` ([`contrib/dgx-spark.md`](contrib/dgx-spark.md)).
 
 ## Size
 

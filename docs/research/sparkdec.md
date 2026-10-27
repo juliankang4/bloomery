@@ -139,16 +139,17 @@ the other tails at 0 (§4.3).
   `cooperative` (`cuda-macros/src/lib.rs:1053-1060`) and otherwise go through `launch_kernel_on_stream` → `cuLaunchKernel`
   (`cuda-core/src/simt/mod.rs:102-121`). A kernel of ours could take PDL only by hand-building its parameter array.
   Recorded as `docs/upstream/nvlabs-ledger.md` row 42 (feature gap, not a defect).
-- **Our PTX cannot carry it.** Every recipe builds `--arch sm_86` (`docs/contrib/dgx-spark.md` §6), and `griddepcontrol`
-  needs sm_90. PDL on the Spark rides on the `sm_121` target the maintainers' `archkey`/S2 items add
-  (`docs/contrib/dgx-spark.md` §6). The A6000 and 3090 keep sm_86 PTX: no PDL there, Δ = 0 by construction.
+- **The Spark's PTX can carry it.** `griddepcontrol` needs sm_90. GB10 recipes build `--arch sm_121a`
+  (`docs/contrib/dgx-spark.md` §6), so on the Spark only the launch side above is missing. The A6000 and 3090 keep
+  sm_86 PTX: no PDL there, Δ = 0 by construction.
 - **Graphs keep it.** "Programmatic Dependent Launch can be used in CUDA Graphs via stream capture or directly via edge
   data." ([CUDA programming guide 4.5](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html)).
   The same page: "These APIs require at least compute capability 9.0 to provide overlapping execution", and the wait
   "Will block until all primary kernels the secondary kernel is dependent on have completed" (and flushed).
 - **Since this reading.** `archkey` landed (`232237be`): recipes pass `--arch {{arch}}`, the justfile's `BLOOMERY_ARCH`,
-  whose default is still `sm_86`. LLVM 21 emits `sm_121` PTX and the GB10 driver loads it
-  ([#42](https://github.com/midagedev/bloomery/issues/42)). PDL is closed by measurement (§4.4), so no round uses this.
+  whose unset value is `sm_86`, or `sm_121a` on a GB10 (`tools/arch.sh`). LLVM 21 emits `sm_121` PTX and the GB10
+  driver loads it ([#42](https://github.com/midagedev/bloomery/issues/42)). PDL is closed by measurement (§4.4), so no
+  round uses this.
 
 ### 4.2 `qwen35moe_router_norm`: the kernel defect (lever 1a)
 
