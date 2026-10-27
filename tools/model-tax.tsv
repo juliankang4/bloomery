@@ -89,9 +89,10 @@ crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	4	baseline P 5: MK2 program 
 crates/gpu-gates/src/bin/shared/routed_legs.rs	nemotron	4	baseline P 6: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	21	baseline P 24: MK2 program by body
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	clef	13	baseline S 13: MK9 seat by program
-crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	qwen	12	baseline S 13: MK9 seat by program
+crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	qwen	11	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/served.rs	qwen	1	baseline S 1: MK9 seat by program
 crates/gpu-gates/src/bin/shared/state_back.rs	deepseek	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/gpu-gates/src/bin/shared/ubatch_rule.rs	qwen	1	PIN(2026-10-27) qwen: the -ub flag-over-env rule the qwen3, decide and Qwen3.8 seats share reads the qwen3moe body's ubatch lever (UBATCH, BLOOMERY_QWEN3_UBATCH); a body-neutral prompt-batch field in ModelSpec would take the name out
 crates/gpu-gates/src/bin/shared/vision_taps.rs	clef	1	baseline D 1: media design: VideoRule data per tower (vidcore)
 crates/gpu-gates/src/bin/tier_server.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/tier_server.rs	glm	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)

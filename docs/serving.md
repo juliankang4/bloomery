@@ -150,7 +150,8 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   whole one: that many tokens a prompt ubatch, or a refusal by name with the bytes it needs and a smaller size as
   the remedy; unset, the load takes the largest of 4096, 2048, 1024 and 512 the card holds at the asked context and
   slots, and one `ubatch` line names the sizes it tried; a routed file takes `BLOOMERY_QWEN3_UBATCH` and refuses
-  the flag),
+  the flag. The qwen38 seat takes it too: the most positions one prompt ubatch runs, 1 to 4096, over
+  `BLOOMERY_QWEN3_UBATCH`, else 4096, the same size in the plan and the load, and the `load` line's `ubatch=`),
   `--host/--port`, `--alias`, `--mmproj <file>` and `--no-mmproj` (image input, below).
 - **The model's name** (`/v1/models` `id`, the `model` of every answer, `/props` `model_alias`) is `--alias`, else the
   GGUF's `general.name`, else the seat's own default. llama-server's default is the model file's name; this server

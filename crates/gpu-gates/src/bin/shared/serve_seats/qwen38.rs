@@ -11,7 +11,12 @@
 //!                           [--chat-template-file PATH] [--parallel N]
 //!                           [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]
 //!                           [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
-//!                           [--image-max-tokens N]
+//!                           [--image-max-tokens N] [-ub N | --ubatch-size N]
+//!
+//! `-ub N` (`--ubatch-size`, llama-server's spelling and its `LLAMA_ARG_UBATCH`) is the most
+//! prompt positions one ubatch walk runs, over `BLOOMERY_QWEN3_UBATCH`, else 4096; a size outside
+//! `1..=4096` is refused by name before the model opens. The one size the seat reads plans every
+//! context it asks and sizes the load's ubatch arena, each at most the slot's context.
 //!
 //! `--slot-save-path` names the directory the slot actions answer from, as
 //! llama-server's; without it every slot action is refused. `--ctx` is `--ctx-size` under its family's other spelling. The model is
@@ -359,7 +364,7 @@
 //! `BLOOMERY_RESIDENCY`, `BLOOMERY_XSTREAM`, `BLOOMERY_PREFILL`,
 //! `BLOOMERY_ROUTE_TRACE` and `BLOOMERY_STEP_STATS` (the `slots round` record
 //! a round of several slots prints); the ubatch size
-//! (`BLOOMERY_QWEN3_UBATCH`) is read where the load sizes its arena. The
+//! (`BLOOMERY_QWEN3_UBATCH`, under `-ub`) is read once, with the flags. The
 //! stderr lines named above are records of the kinds
 //! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
 //! kinds and exits.
@@ -369,7 +374,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use app::mtp::{MtpBody, MtpDraft};
-use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
+use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{
     Body38, Folder38, Model38, Prompt38, Seq38, TargetRows, checkpoint_budget38,
     checkpoint_price38, point_row_budget38, seq38_bytes,
@@ -435,15 +440,19 @@ mod qwen38_levers;
 pub(crate) use qwen38_levers::ACTS_ON;
 #[path = "../route_trace38.rs"]
 mod route_trace38;
+#[path = "../ubatch_rule.rs"]
+mod ubatch_rule;
 use super::xstream_rule::{Stage, xstream_rule};
 use route_trace38::{TraceRun, experts_name};
+use ubatch_rule::ubatch_rule;
 
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] [--ctx-size C] [--alias NAME] \
                      [--cache-ram MIB] [--chat-template-file PATH] [--parallel N] \
                      [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
                      [--mmproj FILE | --no-mmproj] [--image-min-tokens N] \
-                     [--image-max-tokens N] [--plan] [--api-key KEY] [--api-key-file FNAME]";
+                     [--image-max-tokens N] [-ub N | --ubatch-size N] [--plan] [--api-key KEY] \
+                     [--api-key-file FNAME]";
 
 /// The context a slot asks before the context is chosen (the placement's
 /// offer, the draft's window): the plan every Qwen3.8 measurement ran at, and
@@ -1053,13 +1062,15 @@ struct Plans<'a> {
     slots: usize,
     /// The prompt feed and the trace, which the unset residency's pool reads.
     feed: Feed38,
+    /// The ubatch size the seat read ([`Args::ubatch`]), before a context clips it.
+    ubatch: usize,
 }
 
 impl Plans<'_> {
     /// Whether a plan takes `ctx` positions a sequence serves, or why none
     /// does.
     fn holds(&self, ctx: usize) -> Result<(), GateError> {
-        let ub = ubatch_for(ctx)?;
+        let ub = self.ubatch.min(ctx);
         let ctx = u64::try_from(ctx)?;
         let machine = self.place.machine(
             self.inputs,
@@ -1095,7 +1106,7 @@ impl Plans<'_> {
         ctx: usize,
         set: Option<(Residency, &str)>,
     ) -> Result<(u64, u64, u64, u64, u64), GateError> {
-        let ub = ubatch_for(ctx)?;
+        let ub = self.ubatch.min(ctx);
         let c = u64::try_from(ctx)?;
         let machine = self.place.machine(
             self.inputs,
@@ -1209,6 +1220,9 @@ struct Args {
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
     api_keys: serve::flag::ApiKeys,
+    /// `-ub` / `--ubatch-size`: the most positions a ubatch walk runs, over
+    /// `BLOOMERY_QWEN3_UBATCH` ([`ubatch_rule`]).
+    ubatch: Option<usize>,
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
 }
@@ -1229,6 +1243,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         park_ram: None,
         vision: vision_seat::Flags::default(),
         api_keys: serve::flag::ApiKeys::default(),
+        ubatch: None,
         plan_only: false,
     };
     let mut it = args.iter().map(|s| s.as_str());
@@ -1260,6 +1275,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
             "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(flag, v)?),
             f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
+            f if serve::flag::UBATCH.contains(&f) => a.ubatch = Some(serve::flag::number(flag, v)?),
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
@@ -1342,6 +1358,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let feed = Feed38::of(&levers)?;
     let mut a = parse_args(args)?;
+    // The one ubatch size the plans and the load take, each clipped to its context.
+    let ubatch = ubatch_rule(a.ubatch)?
+        .asked()
+        .map_or(UBATCH, |ask| ask.size);
     let side = side.read()?;
     // The placement the seat runs by: the flag's word, or unset the common
     // rule's (`Place::choose`) on the census, read once — chosen below, once
@@ -1529,7 +1549,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             offer,
             (
                 u64::try_from(a.ctx.unwrap_or(CTX))?,
-                u64::try_from(ubatch_for(a.ctx.unwrap_or(CTX))?)?,
+                u64::try_from(ubatch.min(a.ctx.unwrap_or(CTX)))?,
             ),
             experts,
             &plan_levers,
@@ -1588,10 +1608,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             mtp: None,
             slots,
             feed,
+            ubatch,
         };
         let ctx = ctx38(&plans, a.ctx)?.ctx;
         let at = u64::try_from(ctx)?;
-        let ub = u64::try_from(ubatch_for(ctx)?)?;
+        let ub = u64::try_from(ubatch.min(ctx))?;
         let machine = place.machine(&inputs, (at, ub), experts, &plan_levers, None, slots)?;
         let plan = inputs.plan_with_slots(&machine, at, &plan_levers, experts, slots)?;
         Ok(vision_seat::Cost::of(&plan, at))
@@ -1641,6 +1662,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 mtp: None,
                 slots,
                 feed,
+                ubatch,
             };
             if plain.holds(ctx).is_ok() {
                 plain.host(ctx, set)?.2
@@ -1668,6 +1690,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         mtp: mtp_inputs.as_ref(),
         slots,
         feed,
+        ubatch,
     };
     // The unset draft's yield to the context (the module doc): the context
     // comes first, so when the drafted load halved its context, or holds not
@@ -1794,7 +1817,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         )
         .into());
     }
-    let ub = ubatch_for(ctx)?;
+    let ub = ubatch.min(ctx);
     let machine = a.place.machine(
         &inputs,
         (u64::try_from(ctx)?, u64::try_from(ub)?),
@@ -1900,6 +1923,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         place: a.place,
         lane: lane.expect("a serving run probed the lane before the plan"),
         ctx,
+        ubatch,
         slots,
         pass,
         experts,
@@ -2038,6 +2062,9 @@ struct SeatArgs {
     lane: Lane,
     /// A slot's context: the stores' rows one sequence serves.
     ctx: usize,
+    /// The ubatch size the seat read, which the load clips to `ctx` as the
+    /// plans did.
+    ubatch: usize,
     /// The resident sequences the plan counted and the load makes
     /// ([`Session::add_slots`] after the captures).
     slots: usize,
@@ -2201,7 +2228,7 @@ impl Q38 {
         let mut inputs = PlanInputs::describe(model.header())?;
         inputs.room = a.room.clone();
         let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.spec)?;
-        let ub = ubatch_for(a.ctx)?;
+        let ub = a.ubatch.min(a.ctx);
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
         // The sequences the load makes pin the body's budget at this context;
         // the plan's machine must reserve at least that.
@@ -3148,5 +3175,41 @@ impl Seat for Q38 {
     /// other note of the prompt cache prints as its line.
     fn note(note: &CacheNote) {
         note_line("bloomery-serve-qwen38", note);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+    use super::ubatch_rule;
+    use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
+
+    /// The seat reads the ubatch flag under both of llama-server's spellings
+    /// (`LLAMA_ARG_UBATCH` reaches it as `--ubatch-size`), and the size it
+    /// takes is the flag's over `BLOOMERY_QWEN3_UBATCH`; a value that is not a
+    /// number, and a size outside the engine's, is refused naming the flag.
+    #[test]
+    fn the_ubatch_flag_is_read_and_its_size_refused_outside_the_engines() {
+        let args = |f: &str, v: &str| [f.to_owned(), v.to_owned()];
+        for f in ["-ub", "--ubatch-size"] {
+            let a = parse_args(&args(f, "48")).unwrap_or_else(|e| panic!("{f}: {e}"));
+            assert_eq!(a.ubatch, Some(48), "{f}");
+        }
+        let Err(e) = parse_args(&args("-ub", "4k")) else {
+            panic!("4k is no size");
+        };
+        assert!(e.to_string().starts_with("-ub \"4k\": "), "{e}");
+        let size = |flag| ubatch_rule(flag).map(|r| r.asked().map(|a| a.size));
+        assert_eq!(size(Some(48)).expect("in range"), Some(48));
+        assert_eq!(size(Some(UBATCH)).expect("the cap"), Some(UBATCH));
+        for bad in [0, UBATCH + 1] {
+            let e = size(Some(bad)).expect_err("outside 1..=UBATCH").to_string();
+            assert!(
+                e.contains(&format!(
+                    "--ubatch-size {bad} is not a ubatch size in 1..={UBATCH}"
+                )),
+                "{e}"
+            );
+        }
     }
 }

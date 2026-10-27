@@ -30,7 +30,6 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH, UBATCH_ENV, ubatch_asked};
 use bloomery_gpu::arch::qwen3moe::{
     Body, Body35, KvQ8, Open35, OpenOpts, Qwen35moeModel, checkpoint_price35,
 };
@@ -59,6 +58,10 @@ use model::placement::{
     self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
     WholeLoad, WholeNeed,
 };
+
+#[path = "ubatch_rule.rs"]
+mod ubatch_rule;
+use ubatch_rule::ubatch_rule;
 
 /// The census readings this module took since the process began: a caller
 /// reads them around a choice of context ([`census_reads`]), so a choice
@@ -864,14 +867,6 @@ impl Whole {
         )
         .into()
     }
-}
-
-/// The rule a dense load settles its prompt ubatch by (the decide seat's backbone probe passes
-/// [`Rule::of`] the same lever): the user's size, `flag` (`-ub`, `--ubatch-size`) over `BLOOMERY_QWEN3_UBATCH`,
-/// else the card's room.
-pub fn ubatch_rule(flag: Option<usize>) -> Result<Rule, GateError> {
-    let env = ubatch_asked()?.map(|size| (size, UBATCH_ENV));
-    Ok(Rule::of(flag, env, UBATCH)?)
 }
 
 /// The refusal of a ubatch flag on a load whose ubatch no verdict settles ([`Rule`]): `what`
