@@ -42,10 +42,11 @@ pub fn plan_in_pool<'a>(
     mut make: impl FnMut(&PlanLevers) -> Result<Plan<'a>, PlacementError>,
 ) -> Result<Plan<'a>, PlacementError> {
     let first = make(levers);
-    let mut short = match &first {
-        Err(PlacementError::HostRoomFloor { room, floor, .. }) => floor.saturating_sub(*room),
+    let (room, floor) = match &first {
+        Err(PlacementError::HostRoomFloor { room, floor, .. }) => (*room, *floor),
         _ => return first,
     };
+    let mut short = floor.saturating_sub(room);
     let (Some(_), card_budget::CardBudget::Unset, Some(card)) = (
         machine.unified(),
         &levers.card_budget_bytes,
@@ -74,6 +75,8 @@ pub fn plan_in_pool<'a>(
                 rounds: round,
                 budget,
                 last: Box::new(refused),
+                room,
+                floor,
             });
         };
         short = floor.saturating_sub(room);
@@ -85,6 +88,8 @@ pub fn plan_in_pool<'a>(
             rounds,
             budget,
             last: Box::new(refused),
+            room,
+            floor,
         }),
     }
 }

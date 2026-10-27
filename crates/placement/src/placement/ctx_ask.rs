@@ -9,8 +9,9 @@
 //! With no `--ctx`, a slot is planned at [`DEFAULT_TARGET`], or the model's
 //! limit where that is less. Only this default steps down, by halves, and
 //! only on a plan whose card cannot hold the load's resident bytes plus that
-//! context's sequence state, or whose host cannot hold what the card then
-//! leaves it where the body has no tier past the host ([`Probe::Short`]); any
+//! context's sequence state, whose unified pool no card share fits, or whose
+//! host cannot hold what the card then leaves it where the body has no tier
+//! past the host ([`Probe::Short`]); any
 //! other refusal is the seat's error as it stands. Callers validate a set context against the
 //! model's limit; here it only caps the default target.
 
@@ -137,11 +138,20 @@ pub fn short_of(violations: &[Violation]) -> Option<Short> {
 impl PlacementError {
     /// This refusal as a short card: a card whose floor (its dense bytes,
     /// KV, context, scratch, reserves and margin) passes its budget or what
-    /// its device had free. Every other refusal, the host's room and the
-    /// NVMe tier's floor among them, is `None`: a smaller context is not
-    /// what it asks for.
+    /// its device had free, or a unified pool no card share of which leaves
+    /// the host its NVMe tier's floor ([`PlacementError::PoolBudget`]: the
+    /// card and the host read one memory, and a context's sequence state is
+    /// part of it), short on the host by the first plan's floor and room.
+    /// Every other refusal, the host's room and the NVMe tier's floor at one
+    /// share among them, is `None`: a smaller context is not what it asks
+    /// for.
     pub fn card_short(&self) -> Option<Short> {
         match self {
+            Self::PoolBudget { room, floor, .. } => Some(Short {
+                on: Side::Host,
+                need: *floor,
+                room: *room,
+            }),
             Self::CardBudgetFloor { budget, floor, .. } => Some(Short {
                 on: Side::Card,
                 need: *floor,
@@ -793,5 +803,20 @@ mod tests {
             })
         );
         assert_eq!(PlacementError::Experts("e".to_string()).card_short(), None);
+        let pool = PlacementError::PoolBudget {
+            rounds: 3,
+            budget: 80,
+            last: Box::new(PlacementError::Experts("e".to_string())),
+            room: 40,
+            floor: 70,
+        };
+        assert_eq!(
+            pool.card_short(),
+            Some(Short {
+                on: Side::Host,
+                need: 70,
+                room: 40
+            })
+        );
     }
 }
