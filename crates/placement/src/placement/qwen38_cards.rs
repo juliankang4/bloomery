@@ -264,7 +264,9 @@ fn stage(spec: CardSpec) -> Card {
         // PIN(2026-10-25): the box gate's `CARD_ROUTE_SCRATCH` row at 4,096 positions, 3,130,740,736 B
         // (was 3,228,766,208): HC's BF16 bottleneck and refusal add 644 B per ubatch position and the
         // ubatch arena's flash rows leave 24,576 [derived: 4,096 · (644 − 24,576) = −98,025,472].
-        scratch_bytes: 3_130_740_736,
+        // PIN(2026-10-28): 3,020,115,968 B: the ubatch arena's query, β·α and one-row indexer rows
+        // leave 27,008 B per ubatch position [derived: 4,096 · 27,008 = 110,624,768].
+        scratch_bytes: 3_020_115_968,
         margin_bytes: spec.margin(),
         granule_bytes: GRANULE,
         free_bytes: spec.free_bytes,
@@ -512,8 +514,12 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
     // the box gate's CARD_PLANS row; was 263 on the first 31 and 39,508,684,800 B. The stage's rope
     // rows (`Kv38::stage_position_bytes`, 1,048,576 B at 4,096) leave the expert budget, so layer
     // 30 gives up one expert of 3,584,000 B [derived: this plan].
+    // PIN(2026-10-28): 264 on the first 17 layers and 263 on the rest, 39,615,590,400 B and
+    // 592,544,256 B of rounding, the box gate's CARD_PLANS row; was 263 on the first 30. The ubatch
+    // arena's query, β·α and one-row indexer rows leave the stage's scratch, 110,624,768 B at 4,096,
+    // which the spread fills with experts and their granules [derived: this plan].
     let want: Vec<u64> = (0..LAYERS)
-        .map(|l| if l < 30 { 263 } else { 262 })
+        .map(|l| if l < 17 { 264 } else { 263 })
         .collect();
     assert_eq!(
         (
@@ -521,7 +527,7 @@ fn q4_on_one_96gb_card_holds_every_routed_expert() {
             a6000.cards[0].expert_bytes,
             a6000.cards[0].rounding_bytes
         ),
-        (&want, 39_505_100_800, 593_981_952)
+        (&want, 39_615_590_400, 592_544_256)
     );
 
     let one = picked("a", &census_96(1))[0];
@@ -664,9 +670,12 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     // PIN(2026-10-25): 35,635,200 B more experts on the card, off the host and both needs; was
     // 41,920,179,200, 70,720,317,440 and 42,457,050,112 B. The ubatch arena's flash rows leave the
     // stage's scratch, 100,663,296 B at 4,096 [derived: the same spread].
+    // PIN(2026-10-28): 196,300,800 B more experts on the card, off the host and both needs; was
+    // 41,884,544,000, 70,684,682,240 and 42,421,414,912 B. The ubatch arena's query, β·α and one-row
+    // indexer rows leave the stage's scratch, 110,624,768 B at 4,096 [derived: the same spread].
     assert_eq!(
         (host.host.expert_bytes, host_need, nvme_need),
-        (41_884_544_000, 70_684_682_240, 42_421_414_912)
+        (41_688_243_200, 70_488_381_440, 42_225_114_112)
     );
     assert_eq!(nvme_need + PLE_TABLE, host_need + ROW_ROOM);
     assert!(nvme_need <= SCOPE_61G && SCOPE_61G < host_need);
@@ -763,12 +772,12 @@ fn two_slots_at_4096_hold_every_routed_expert() {
     assert_eq!((bytes, n_l, host), (Q4_ROUTED, vec![EXPERTS; LAYERS], 0));
 }
 
-/// 252,928 positions a slot on one such card, two sequences and no draft,
+/// 254,976 positions a slot on one such card, two sequences and no draft,
 /// is the last step of 256 whose plan holds at most the plan's margin fewer
 /// card expert bytes than the plan at 4,096
 /// ([`two_slots_at_4096_hold_every_routed_expert`]: every routed byte); the
-/// next step passes it. There 505 experts a layer stay on the card and 336
-/// go to the host.
+/// next step passes it. There 504 or 505 experts a layer stay on the card
+/// and 337 go to the host.
 // PIN(2026-10-21): 252,928 positions (was 252,416), 505 or 506 experts a layer with one at 506 and
 // 335 on the host (was 504 or 505 with 47 at 505 and 337). The card keeps the 24 indexer
 // projections in their words (`indexer_projection`): 37,748,736 B of room, 664 positions of the two
@@ -791,11 +800,15 @@ fn two_slots_at_4096_hold_every_routed_expert() {
 // (`Kv38::stage_position_bytes`, 256 B a position, one copy for both slots): 65,077,248 B at
 // 254,208, 1,140 positions of the two slots' 57,088 B, and the boundary moved five steps of 256
 // within the granules [derived: the plan's own boundary, 254,208 − 252,928 = 1,280].
+// PIN(2026-10-28): 254,976 positions (was 252,928), 504 or 505 experts a layer with 47 at 505 and
+// 337 on the host (was 505 on every layer and 336). The ubatch arena's query, β·α and one-row
+// indexer rows leave the stage's scratch, 110,624,768 B at 4,096, and the boundary moved eight
+// steps of 256 within the granules [derived: the plan's own boundary, 254,976 − 252,928 = 2,048].
 #[test]
 fn two_slots_at_252416_stay_within_the_margin() {
-    let (at, n_l, host) = two_slots(252_928);
+    let (at, n_l, host) = two_slots(254_976);
     assert!(Q4_ROUTED - at <= MARGIN);
-    let (next, _, _) = two_slots(252_928 + 256);
+    let (next, _, _) = two_slots(254_976 + 256);
     assert!(Q4_ROUTED - next > MARGIN);
     let (lo, hi) = (
         *n_l.iter().min().expect("layers"),
@@ -803,7 +816,7 @@ fn two_slots_at_252416_stay_within_the_margin() {
     );
     assert_eq!(
         (lo, hi, n_l.iter().filter(|&&n| n == hi).count(), host),
-        (505, 505, 48, 336)
+        (504, 505, 47, 337)
     );
 }
 
