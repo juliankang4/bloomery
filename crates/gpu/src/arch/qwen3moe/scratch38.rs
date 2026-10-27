@@ -587,8 +587,45 @@ impl WideRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::LANES;
+    use super::{Arena38, LANES, ROUTE_ROWS, RouterDims, geo};
     use crate::linear::delta::{kept_lane, row_lane};
+    use crate::site::ByName;
+    use crate::weights::Weights;
+    use model::arch::models::shape::{MoeShape, rules};
+
+    /// A ubatch walk's arena holds each position the bytes the plan counts
+    /// for it (`place::UBATCH_ARENA_TOKEN_BYTES`), no more and no fewer:
+    /// between [`ROUTE_ROWS`] and `place::UBATCH_PLANNED` rows its router's
+    /// buffers and its selection's run stay one size, so the arena grows by
+    /// its token-major rows alone.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_ubatch_arena_holds_a_position_the_bytes_the_plan_counts() {
+        let gpu = crate::Gpu::new().expect("CUDA device 0");
+        let router = RouterDims::of(MoeShape {
+            rule: rules::SOFTMAX_NORM_GATED,
+            experts: geo::EXPERTS as u32,
+            top_k: geo::N_USED as u32,
+        })
+        .expect("Qwen3.8's router");
+        let w = Weights::default();
+        let by = || ByName::for_sites(&gpu, &w, std::iter::empty::<&str>(), 1).expect("no site");
+        let bytes = |rows: usize| {
+            let a = Arena38::wide(gpu.stream(), router, rows, rows, 8192, (by(), by()))
+                .expect("a ubatch arena");
+            a.bytes() as u64
+        };
+        let plan = model::arch::qwen35moe::place::UBATCH_ARENA_TOKEN_BYTES;
+        let (lo, hi) = (
+            ROUTE_ROWS,
+            model::arch::qwen35moe::place::UBATCH_PLANNED as usize,
+        );
+        let grown = bytes(hi) - bytes(lo);
+        let rows = (hi - lo) as u64;
+        eprintln!("ubatch arena: {grown} B over {rows} rows, the plan counts {plan} B a row");
+        assert_eq!(grown % rows, 0, "the arena grows by whole rows");
+        assert_eq!(grown / rows, plan);
+    }
 
     /// A verify from lane `c` writes its rows into `c, c + 1, …` mod
     /// [`LANES`], every row a lane of its own; keeping `k` rows moves the
