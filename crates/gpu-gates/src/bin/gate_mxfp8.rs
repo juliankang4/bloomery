@@ -28,6 +28,9 @@
 //!   increasing `i`, four fused multiply-adds in byte order per word, then the
 //!   warp butterfly.
 //!
+//! Each gemv also runs on the same columns read through a window that starts
+//! one f32 past a 16-byte boundary (`gemv.x_off4`): the same checks.
+//!
 //! At one column each shape also runs through `site::resident_gemv`
 //! (`decode`), the launch by resident form that glm5next's decode step runs
 //! for every projection (`gpu-glm5next`'s `body::gemv`: the latent layer's
@@ -122,7 +125,7 @@ mod gate {
     };
     use bloomery_gpu::site::{self, SiteTy, SiteWeight, WideIn, WideKernels};
     use bloomery_gpu::weights::Weights;
-    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Window};
     use bloomery_gpu_gates::rounding::check_mma;
     use bloomery_gpu_gates::{GateError, GateRng, checks_failed, verdict, write_gguf};
     use cuda_core::DeviceBuffer;
@@ -132,45 +135,80 @@ mod gate {
     use std::path::Path;
 
     /// A projection: its tensor stem, rows, row width and the
-    /// column counts its gemv runs at.
+    /// column counts its gemv runs at ([`WIDE`] the f32 tile).
     pub(crate) struct Shape {
         pub(crate) stem: &'static str,
         pub(crate) rows: usize,
         pub(crate) k: usize,
-        pub(crate) ms: [usize; 2],
+        pub(crate) ms: &'static [usize],
         pub(crate) seed: u64,
     }
 
     /// A latent attention's `attn_q_b` and `attn_output` and a KDA layer's
     /// `ssm_f_b` (`dims` 1,536 × 16,384, 16,384 × 4,096 and 128 × 8,192,
     /// `dims[0]` the row width): a short row, the row a lane walks in whole
-    /// trips, and the one-word-a-lane row.
+    /// trips, and the one-word-a-lane row. `attn_q_b`'s row is a multiple of
+    /// 512, so its four columns run MXFP8's staged walk.
     pub(crate) const SHAPES: [Shape; 3] = [
         Shape {
             stem: "blk.3.attn_q_b",
             rows: 16_384,
             k: 1536,
-            ms: [1, 3],
+            ms: &[1, 2, 3, 4, WIDE],
             seed: 0x5eed_0801,
         },
         Shape {
             stem: "blk.3.attn_output",
             rows: 4096,
             k: 16_384,
-            ms: [1, 8],
+            ms: &[1, 8, WIDE],
             seed: 0x5eed_0802,
         },
         Shape {
             stem: "blk.4.ssm_f_b",
             rows: 8192,
             k: 128,
-            ms: [1, 2],
+            ms: &[1, 2, WIDE],
             seed: 0x5eed_0803,
         },
     ];
 
     /// Columns of the wide tile.
     const WIDE: usize = 64;
+
+    /// MXFP8 row counts that leave the last block of eight rows partly empty,
+    /// at four columns: the staged walk (`k` a multiple of 512) and, at `k`
+    /// 384, the unstaged one.
+    const TAILS: [Shape; 4] = [
+        Shape {
+            stem: "tail.r1",
+            rows: 1,
+            k: 512,
+            ms: &[4],
+            seed: 0x5eed_0870,
+        },
+        Shape {
+            stem: "tail.r7",
+            rows: 7,
+            k: 512,
+            ms: &[4],
+            seed: 0x5eed_0871,
+        },
+        Shape {
+            stem: "tail.r9",
+            rows: 9,
+            k: 512,
+            ms: &[4],
+            seed: 0x5eed_0872,
+        },
+        Shape {
+            stem: "tail.r9k384",
+            rows: 9,
+            k: 384,
+            ms: &[4],
+            seed: 0x5eed_0873,
+        },
+    ];
 
     /// `rows` MXFP8 rows of `k` values drawn from `seed`: each block's scale
     /// byte uniform on 112..=136, its 32 value bytes uniform over the 254
@@ -370,7 +408,7 @@ mod gate {
                     stem,
                     rows: 8,
                     k: 128,
-                    ms: [1, 3],
+                    ms: &[1, 3, WIDE],
                     seed: 0x5eed_0840,
                 };
                 let mut bytes = Vec::new();
@@ -381,6 +419,18 @@ mod gate {
                 decls.push(decl(&shape_name(&s, tag), ty, (s.rows, s.k), bytes.clone()));
                 extreme.push((ty, tag, s, bytes, x_scale));
             }
+        }
+        let tails: Vec<_> = TAILS
+            .iter()
+            .map(|s| (s, e4m3_bytes(mx, s.rows, s.k, s.seed)))
+            .collect();
+        for (s, bytes) in &tails {
+            decls.push(decl(
+                &shape_name(s, "mxfp8"),
+                mx,
+                (s.rows, s.k),
+                bytes.clone(),
+            ));
         }
         let (n_exp, rpe, sel_k, _) = SEL;
         let stack = |name: &str, ty, bytes| {
@@ -411,6 +461,9 @@ mod gate {
         }
         for (ty, tag, s, bytes, x_scale) in &extreme {
             ok &= e4m3_case(gpu, wide, &split, (*ty, tag, s), bytes, *x_scale)?;
+        }
+        for (s, bytes) in &tails {
+            ok &= e4m3_case(gpu, wide, &split, (mx, "mxfp8", s), bytes, 1.0)?;
         }
         let at = TYPES.len() * SHAPES.len();
         ok &= q8_0_case(gpu, &g32, &split, &decls[at].3)?;
@@ -878,7 +931,7 @@ mod gate {
         site::site(&w, "gate_mxfp8", &name, (rows, k), ty)?;
         let wf = host_rows(file_ty, bytes, rows, k);
         let mut ok = true;
-        for (i, &m) in s.ms.iter().chain(&[WIDE]).enumerate() {
+        for (i, &m) in s.ms.iter().enumerate() {
             let (x, x_dev, mut y_dev) =
                 columns(gpu, (m, k, rows), s.seed ^ (0x1000 + i as u64), x_scale)?;
             let wide = m == WIDE;
@@ -938,7 +991,28 @@ mod gate {
                     &walk,
                 )
             };
-            if !wide && file_ty == GgmlType::MXFP8 {
+            // The same columns from one f32 past a 16-byte boundary give the
+            // same bits: a walk that reads only aligned activations leaves the
+            // NaN sentinel.
+            if !wide {
+                let parent = DeviceBuffer::from_host(stream, &[&[0.0f32][..], &x[..]].concat())?;
+                let x_off = Window::<f32>::of(&parent, 4, m * k)?;
+                let mut y_off = DeviceBuffer::from_host(stream, &vec![f32::NAN; m * rows])?;
+                site::gemv(gpu, g32, (ty, &w, &name), &x_off, m, &mut y_off)?;
+                stream.synchronize()?;
+                let y = y_off.to_host_vec(stream)?;
+                ok &= check(
+                    (tag, "gemv.x_off4"),
+                    &shown,
+                    (&y, &x, k),
+                    &wf,
+                    &|at| (at % wf.len(), at / wf.len()),
+                    &walk,
+                );
+            }
+            // The listed-row clause lists three rows, more than a shorter
+            // matrix may list.
+            if !wide && file_ty == GgmlType::MXFP8 && rows >= 3 {
                 ok &= head_rows_case(gpu, w.e4m3("gate_mxfp8", &name)?, &x_dev, (rows, m), &y)?;
             }
             if m == 1 {
