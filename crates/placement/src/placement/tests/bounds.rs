@@ -1135,6 +1135,56 @@ fn a_unified_pool_holds_card_and_host_together() {
     }
 }
 
+/// A need past the room its plan was made at is refused there, naming
+/// what decided that room: a given room under the machine's caps as
+/// given, the unified pool under a reading's plan room as the machine's
+/// figure, and the machine's figure for a plan made without a room.
+#[test]
+fn a_need_is_held_to_the_room_its_plan_was_made_at() {
+    use workstation::{HOST_DRIFT, HostNeed, HostRead};
+    let model = layered(3);
+    let pool = 1 << 30;
+    let machine = Machine {
+        cards: vec![Card {
+            context_bytes: 1_000,
+            free_bytes: Some(pool),
+            ..bytes_card("pool", 2 * pool, 0..3)
+        }],
+        tiers: Vec::new(),
+        nodes: vec![Node {
+            host: host(),
+            unified: Some(UnifiedPool { bytes: pool }),
+        }],
+    };
+    let mut plan = plan_with(&model, &machine, 4096, &NoKv, None).unwrap();
+    let figure = HostNeed::machine_room(machine.host());
+    let base = HostNeed::of(&plan, 0);
+    let refused = |plan: &Plan<'_>, room: u64| {
+        assert!(base.bytes() < room, "{} >= {room}", base.bytes());
+        let fits = HostNeed {
+            read_ahead: room - base.bytes(),
+            ..base
+        };
+        assert!(fits.check_planned(plan).is_ok());
+        let over = HostNeed {
+            read_ahead: fits.read_ahead + 1,
+            ..base
+        };
+        let short = over.check_planned(plan).unwrap_err();
+        assert_eq!(short.available, room);
+        (over, *short.read)
+    };
+    assert_eq!(refused(&plan, figure).1, HostRead::Machine);
+    let room = plan.plan_at(&(pool - 1000, HostRead::Given));
+    assert_eq!(room, pool - 1000);
+    let (over, read) = refused(&plan, room);
+    assert_eq!(read, HostRead::Given);
+    assert!(over.check(&(figure, HostRead::Machine)).is_ok());
+    let room = plan.plan_at(&(pool + HOST_DRIFT + 1000, HostRead::MemAvailable));
+    assert_eq!(room, pool);
+    assert_eq!(refused(&plan, room).1, HostRead::Machine);
+}
+
 #[test]
 fn plan_room_uses_the_host_and_unified_limits_once() {
     use workstation::{HOST_DRIFT, HostNeed, HostRead, OS_RESERVE};
@@ -1163,7 +1213,12 @@ fn plan_room_uses_the_host_and_unified_limits_once() {
                     let reading = (room, read.clone());
                     let want = workstation::plan_room(&reading).min(host_room).min(pool);
                     assert_eq!(plan.plan_at(&reading), want);
-                    assert_eq!(plan.host.room, Some((room, want)));
+                    let by = if want < workstation::plan_room(&reading) {
+                        HostRead::Machine
+                    } else {
+                        read.clone()
+                    };
+                    assert_eq!(plan.host.room, Some((room, (want, by))));
                     if read == HostRead::Given {
                         assert_eq!(
                             plan.host.headroom_bytes,

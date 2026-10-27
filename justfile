@@ -2479,7 +2479,9 @@ gate-ds41-bind:
 # the route trace takes only the step feed, no MTP draft, one slot and no residency word but off; the step feed takes
 # no MTP draft and no such word; a step-fed prompt is never cut at a message start; the one levers list the server and its
 # gate parse (shared/qwen38_levers.rs) holds exactly the levers the seat reads; the default slot count's floor fallback
-# answers the NVMe tier floor's refusal and a unified pool's PoolBudget, and no other. The shared serve client
+# answers the NVMe tier floor's refusal and a unified pool's PoolBudget, and no other; a checkpoint folder's plan holds
+# its least part reads on the NVMe tier arena's floor, and on a unified pool an unset context halves for them while a
+# set one is refused. The shared serve client
 # holds the reply evidence. Host only, no card or gate lock.
 [group('host')]
 gate-q38-serve-rules:

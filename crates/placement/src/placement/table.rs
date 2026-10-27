@@ -211,10 +211,11 @@ pub struct HostTotals {
     /// ([`expert_nvme_tier`]), the room the split read less the arena and the
     /// plan's host need, since the room binds there.
     pub headroom_bytes: i128,
-    /// The host room the plan was made at: the reading it took and the
-    /// room it was held to ([`Plan::plan_at`], including the machine caps);
-    /// `None` for a plan made without one.
-    pub room: Option<(u64, u64)>,
+    /// The host room the plan was made at: the reading's bytes, and the room
+    /// it was held to ([`Plan::plan_at`], including the machine caps) with
+    /// the reading that decided it, [`workstation::HostRead::Machine`] where
+    /// a cap did; `None` for a plan made without one.
+    pub room: Option<(u64, (u64, workstation::HostRead))>,
 }
 
 impl HostTotals {
@@ -238,9 +239,11 @@ impl HostTotals {
     /// for a plan made without a host room.
     #[must_use]
     pub fn room_clause(&self) -> String {
-        self.room.map_or_else(String::new, |(read, planned)| {
-            format!("; the plan was made at a reading of {read} B (plan room {planned} B)")
-        })
+        self.room
+            .as_ref()
+            .map_or_else(String::new, |(read, (planned, _))| {
+                format!("; the plan was made at a reading of {read} B (plan room {planned} B)")
+            })
     }
 }
 

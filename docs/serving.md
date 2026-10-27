@@ -141,7 +141,8 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   `--cache-ram/-cram` (MiB; `0` turns the prompt cache off; llama-server's `-1`, no limit, is refused by name: the
   cache is host memory beside the load), `--ctx/--ctx-size` (unset, every generative seat and the decide seat take one slot at the lesser of
   262,144 and the file's limit, and halve that while the plan is short of the card — and of the host, where the body
-  keeps no tier past it, or of a unified pool no share of which between the card and the host fits — down to 4,096;
+  keeps no tier past it, or of a unified pool no share of which between the card and the host fits, or that cannot
+  also hold a checkpoint folder's load reading its parts one at a time — down to 4,096;
   one `ctx` line names the rule. A set value is the total the slots split, and
   one that does not fit is refused, never cut. PIN(2026-10-14): `generate::choose_ctx` over `ctx_ask::choose`),
   `--cache-type-k f16|q8_0` (the qwen3

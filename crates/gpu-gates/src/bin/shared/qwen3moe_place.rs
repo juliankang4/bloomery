@@ -643,7 +643,7 @@ impl PlaceQ3 {
             Some(free) => r.u("card_free", free),
             None => r,
         };
-        let r = record::with_room(r, plan.host.room);
+        let r = record::with_room(r, plan.host.room.as_ref());
         let r = match why {
             Some(w) => r.w("why", w),
             None => r,

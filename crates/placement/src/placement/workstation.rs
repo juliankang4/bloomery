@@ -1130,6 +1130,21 @@ impl HostNeed {
         }
     }
 
+    /// [`HostNeed::check`] at the room `plan` was made at, with what decided
+    /// it ([`HostTotals::room`], [`Plan::plan_at`]: the reading's plan room or
+    /// the machine's caps), else at the machine's figure
+    /// ([`HostNeed::machine_room`], [`HostRead::Machine`]) for a plan made
+    /// without one.
+    pub fn check_planned(self, plan: &Plan<'_>) -> Result<(), HostShort> {
+        match &plan.host.room {
+            Some((_, room)) => self.check(room),
+            None => self.check(&(
+                HostNeed::machine_room(plan.machine.host()),
+                HostRead::Machine,
+            )),
+        }
+    }
+
     /// The load's check with an elastic arena: the host room `room` covers the
     /// need and the arena is granted as planned, or the arena shrinks by the
     /// shortfall to a grant of at least `least` (the arena's floor,
@@ -1261,6 +1276,7 @@ impl fmt::Display for HostShort {
                 HostRead::MemAvailable | HostRead::VmStats | HostRead::Cgroup { .. } => {
                     "Free host memory".to_string()
                 }
+                HostRead::Machine => "Ask for a shorter context".to_string(),
             }
         )?;
         if n.extra > 0 {
@@ -1550,6 +1566,10 @@ pub enum HostRead {
     /// A room the caller gave instead of reading this machine (a gate that
     /// plans an arm by the room it names).
     Given,
+    /// The machine's own figure: its host's usable bytes less the OS reserve
+    /// ([`HostNeed::machine_room`]), or its unified pool at plan time, where
+    /// that is under the reading's plan room ([`Plan::plan_at`]).
+    Machine,
 }
 
 impl fmt::Display for HostRead {
@@ -1567,13 +1587,18 @@ impl fmt::Display for HostRead {
                 "given by {} or the caller, not read from this machine",
                 bloomery_levers::HOST_ROOM
             ),
+            HostRead::Machine => write!(
+                f,
+                "the machine's figure, its host's usable bytes less the OS reserve or its unified \
+                 pool, under the reading"
+            ),
         }
     }
 }
 
 impl HostRead {
     /// One word for a `key=value` line: `MemAvailable`, `vmstats`,
-    /// `cgroup:<path>`, or `given`.
+    /// `cgroup:<path>`, `given`, or `machine`.
     #[must_use]
     pub fn word(&self) -> String {
         match self {
@@ -1581,6 +1606,7 @@ impl HostRead {
             HostRead::VmStats => "vmstats".to_string(),
             HostRead::Cgroup { path } => format!("cgroup:{path}"),
             HostRead::Given => "given".to_string(),
+            HostRead::Machine => "machine".to_string(),
         }
     }
 }
@@ -1594,13 +1620,13 @@ impl HostRead {
 pub const HOST_DRIFT: u64 = 512 * MIB;
 
 /// The room a plan is made at, for the room `room` that [`host_room`] (or a
-/// caller) gave: a [`HostRead::Given`] room as given, a read room less
+/// caller) gave: a [`HostRead::Given`] or [`HostRead::Machine`] room as given, a read room less
 /// [`HOST_DRIFT`] (to 0 at most). The one place a read room becomes a
 /// plan's room.
 #[must_use]
 pub fn plan_room(room: &(u64, HostRead)) -> u64 {
     match room.1 {
-        HostRead::Given => room.0,
+        HostRead::Given | HostRead::Machine => room.0,
         HostRead::MemAvailable | HostRead::VmStats | HostRead::Cgroup { .. } => {
             room.0.saturating_sub(HOST_DRIFT)
         }

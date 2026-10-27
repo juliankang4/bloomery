@@ -13,6 +13,7 @@
 
 use gguf::Split;
 use model::part::Source;
+use model::placement::Plan;
 
 use crate::GpuError;
 use crate::host::swap::Residency;
@@ -109,6 +110,15 @@ impl<X> Folder<X> {
             parts: Box::new(PlacedSource { source, in_place }),
             extra,
         }
+    }
+}
+
+impl<X> Folder<X> {
+    /// The least host bytes a load of card `card` of `plan` reads beside the plan's own terms: its
+    /// parts one at a time, with the staging ring. The load's own check counts its read-ahead
+    /// (`HostNeed::read_ahead`) from the same parts at the room it reads, never under this.
+    pub fn least_reads(&self, plan: &Plan<'_>, card: usize) -> Result<u64, GpuError> {
+        self.parts.host_bytes(plan, card, 0)
     }
 }
 
