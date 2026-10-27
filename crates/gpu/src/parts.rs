@@ -9,6 +9,7 @@
 //! and that host, the host reads the rest where the folder stores it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Mutex;
 
 use cuda_core::CudaStream;
 use gguf::{GgmlType, Place, Split, TensorInfo};
@@ -97,15 +98,30 @@ fn load_plan<S: Source + Sync>(
 pub(crate) struct PlacedSource<S> {
     pub(crate) source: S,
     pub(crate) in_place: InPlace,
+    /// The last host bytes answered, with the card, room and card tensors they were planned for:
+    /// a context search asks them of many plans that hold the same tensors on the card, and
+    /// planning the parts checks every part the source makes.
+    pub(crate) last: Mutex<Option<(MemoKey, u64)>>,
 }
+
+/// The card share, the room and the card tensors a least read was planned for.
+type MemoKey = (usize, u64, OnCard);
 
 impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
     fn host_bytes(&self, plan: &Plan<'_>, card: usize, room: u64) -> Result<u64, GpuError> {
-        Ok(
-            LoadPlan::placed(&self.source, plan, card, &self.in_place, room)?
-                .1
-                .host_bytes,
-        )
+        let key = (card, room, OnCard::of_in_place(plan, card, &self.in_place)?);
+        let mut last = self
+            .last
+            .lock()
+            .map_err(|_| refused("a part source's last host bytes lock is poisoned".into()))?;
+        if let Some((held, bytes)) = last.as_ref()
+            && *held == key
+        {
+            return Ok(*bytes);
+        }
+        let bytes = LoadPlan::reading(&self.source, plan, &key.2, room)?.host_bytes;
+        *last = Some((key, bytes));
+        Ok(bytes)
     }
 
     fn load(
@@ -254,12 +270,22 @@ impl LoadPlan {
         room: u64,
     ) -> Result<(OnCard, Self), GpuError> {
         let on = OnCard::of_in_place(plan, card, in_place)?;
+        let read = Self::reading(source, plan, &on, room)?;
+        Ok((on, read))
+    }
+
+    /// The parts of `plan`'s tensors that `on`, a card of it, reads from `source` under `room`.
+    fn reading<S: Source>(
+        source: &S,
+        plan: &Plan<'_>,
+        on: &OnCard,
+        room: u64,
+    ) -> Result<Self, GpuError> {
         let selected = model::part::Filtered {
             source,
             keep: |name: &str| plan.model.tensors.iter().any(|t| t.name == name),
         };
-        let read = Self::new(&selected, |name, _, _| on.take(name), room)?;
-        Ok((on, read))
+        Self::new(&selected, |name, _, _| on.take(name), room)
     }
 }
 
@@ -325,6 +351,7 @@ impl InPlace {
 /// which the host reads there, and a tensor or stack of which this card holds nothing, which the
 /// other cards' loads read. A source fills no host set, so a tensor the plan splits otherwise, or
 /// holds on the host but the source alone makes, is refused by name.
+#[derive(PartialEq)]
 pub struct OnCard {
     held: HashMap<String, OnThisCard>,
     skipped: HashSet<String>,
@@ -332,6 +359,7 @@ pub struct OnCard {
 
 /// A tensor the card holds ([`OnCard`]): the plan's card format and resident bytes, and the
 /// stack's experts the card holds of a split stack (`None` the whole tensor).
+#[derive(PartialEq)]
 struct OnThisCard {
     format: CardFormat,
     bytes: u64,
@@ -1021,5 +1049,79 @@ mod tests {
             e.contains("stack.weight") && e.contains("Mxfp8Planes"),
             "{e}"
         );
+    }
+
+    /// A placed source plans a card's parts once for the plans that hold the same tensors on it
+    /// at one room, as a context search asks of plans at other contexts, and again at another
+    /// room. Mutant: the last answer never read, so the second ask plans the parts again.
+    #[test]
+    fn a_placed_source_plans_a_cards_parts_once_a_room() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use model::placement::{KvBytes, ModelTensors, plan_with, workstation};
+
+        use crate::model::PartsLoad;
+
+        struct NoKv;
+        impl KvBytes for NoKv {
+            fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+                0
+            }
+        }
+        struct Counted(AtomicUsize);
+        impl Source for Counted {
+            type Error = std::io::Error;
+            fn plan<E: std::fmt::Display>(
+                &self,
+                rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
+            ) -> Result<Vec<Planned>, Self::Error> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                let info = TensorInfo {
+                    name: "output.weight".into(),
+                    ty: GgmlType::Q8_0,
+                    dims: vec![256, 16],
+                    offset: 0,
+                    nbytes: 4352,
+                };
+                rule(&info.name, info.ty, &info.dims)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Ok(vec![Planned { at: None, info }])
+            }
+            fn read_bytes(&self, p: &Planned) -> Result<u64, Self::Error> {
+                Ok(p.info.nbytes)
+            }
+            fn read(&self, _: &Planned) -> Result<model::part::Part<'_>, Self::Error> {
+                Err(std::io::Error::other("no read"))
+            }
+        }
+        let model = ModelTensors {
+            tensors: vec![ModelTensor {
+                name: "output.weight".into(),
+                shard: 0,
+                layer: None,
+                role: Role::Head,
+                ty: GgmlType::Q8_0,
+                dims: vec![256, 16],
+                file_bytes: 4352,
+                gathered_rows: None,
+            }],
+            layers: 1,
+            experts: 8,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let machine = workstation::plan_a(1);
+        let plan = |ctx| plan_with(&model, &machine, ctx, &NoKv, None).expect("a plan");
+        let load = PlacedSource {
+            source: Counted(AtomicUsize::new(0)),
+            in_place: InPlace::default(),
+            last: Mutex::default(),
+        };
+        let least = load.host_bytes(&plan(4096), 0, 0).unwrap();
+        assert!(least > 0);
+        assert_eq!(load.host_bytes(&plan(8192), 0, 0).unwrap(), least);
+        assert_eq!(load.source.0.load(Ordering::Relaxed), 1);
+        load.host_bytes(&plan(4096), 0, 1 << 30).unwrap();
+        assert_eq!(load.source.0.load(Ordering::Relaxed), 2);
     }
 }
