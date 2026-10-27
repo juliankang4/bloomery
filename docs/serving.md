@@ -630,10 +630,11 @@ and the model fits) states no need and consults no hook; a set hook is named on 
 
 ## Limits
 
-- **sm_86+** GPUs and NVIDIA driver R580+ (CUDA 13); the prebuilt archive carries sm_86 PTX, compiled for the card
-  at the first start. The release binaries are x86-64 only (x86-64-v3). A DGX Spark (GB10, aarch64) builds from source
-  with `BLOOMERY_ARCH` setting the CUDA arch ([`contrib/dgx-spark.md`](contrib/dgx-spark.md)); the AVX2 kernels stay
-  x86-64 only, and a quant type without an aarch64 kernel runs through a scalar mirror there.
+- **sm_86+** GPUs and NVIDIA driver R580+ (CUDA 13); the x86-64 archive carries sm_86 PTX, compiled for the card
+  at the first start, and x86-64-v3 host code. The GB10 archive (Linux aarch64) carries sm_121a PTX for a DGX Spark;
+  another aarch64 machine builds from source with `BLOOMERY_ARCH` setting the CUDA arch
+  ([`contrib/dgx-spark.md`](contrib/dgx-spark.md)). The AVX2 kernels stay x86-64 only, and a quant type without an
+  aarch64 kernel runs through a scalar mirror there.
 - GLM-5.3 holds at most 16,384 positions a slot (`ORACLE_POSITIONS`): a `--ctx-size` whose share a slot passes it
   is refused at start, and a longer prompt with `exceed_context_size_error`. On a 12–16 GB card the split Qwen3 load's
   unset context halves until the plan fits; the old rule's sitting there measured 2,048 positions a slot at

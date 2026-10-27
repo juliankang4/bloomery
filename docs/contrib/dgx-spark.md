@@ -52,8 +52,8 @@ the RDMA end and the all-gather), the tier server (9.5, items 5 and 6), and the 
 
 ## 2. Build and first run on a Spark
 
-A Spark builds from source (the release archive is x86-64 only), plans its one card against the unified pool, and
-serves any model that fits that pool whole on the card. 2.1 is the build, 2.2 the first placement and the models in
+A Spark installs the release's GB10 archive or builds from source (2.1), plans its one card against the unified pool,
+and serves any model that fits that pool whole on the card. 2.1 is the build, 2.2 the first placement and the models in
 the order to try them, and 2.3 the run path and the measured numbers for Qwen3.8 FP4-Local.
 
 ### 2.1 Build
@@ -80,6 +80,11 @@ scale. Other routed formats keep their activation format, and decode is unchange
 overrides the detected target; set it when invoking recipes from a machine without the target GPU. Other machines keep
 the `sm_86` default.
 
+The release's GB10 archive (`bloomery-<version>-linux-aarch64-cuda-sm121a.tar.gz`) is this build, packed: `sm_121a`
+and the features above, `checkpoint` among them. It needs no toolchain: where a release carries it,
+`tools/release/install.sh` picks it on a GB10 and links `bloomery-serve` into `~/.local/bin`. `just release-build
+<version>` makes it on a GB10, run there with `BLOOMERY_BOX_LOCAL=1`.
+
 ### 2.2 First placement and the models to try
 
 **Smallest first placement: everything on the card, no host tier, no NVMe tier.** Two ways in, both generic already:
@@ -101,9 +106,9 @@ allows. A 64 GB Spark (section 3; announced, not yet shipping) holds only the fi
 NVIDIA publishes Qwen3.8-Flash-Next in two checkpoint folders that a Spark serves as downloaded, with no conversion
 step: `nvidia/Qwen3.8-Flash-Next-NVFP4` (132.7 GB on disk) and `nvidia/Qwen3.8-Flash-Next-FP4-Local` (102.3 GB at
 revision `b9ce18a6`; NVFP4 experts with compressed block scales, MXFP8 and FP8 dense weights,
-[#543](https://github.com/midagedev/bloomery/pull/543)). `bloomery-serve -m <folder>` (a build with the `checkpoint`
-feature, 2.1) holds every routed expert on the GB10 and reads the PLE table from the folder on the NVMe tier
-([`serving.md`](../serving.md), the seats). On the `sm_121a` build the routed experts' prompt products run W4A4 and the
+[#543](https://github.com/midagedev/bloomery/pull/543)). `bloomery-serve -m <folder>` (the GB10 archive or a build
+with the `checkpoint` feature, 2.1) holds every routed expert on the GB10 and reads the PLE table from the folder on
+the NVMe tier ([`serving.md`](../serving.md), the seats). On the `sm_121a` build the routed experts' prompt products run W4A4 and the
 MXFP8 sites W8A8 (2.1). The KV cache is f16: a Qwen3.8 load refuses the q8_0 cache by name
 (`crates/levers/src/registry.rs:1021-1022` at `c21e3b81`). The NVFP4 folder's gate, `gate-gpu-qwen4exp-nvfp4`, runs
 only on a card that holds every expert: set `BLOOMERY_CARD_ALL_EXPERTS=1` there; a smaller card defers it by name.
@@ -1556,7 +1561,7 @@ answers came on 2026-10-10.
 8. **64 GB Spark:** best effort, for the models that fit; not a target.
    *Now: unchanged.*
 9. **An aarch64 release tarball:** P3 or later.
-   *Now: unchanged.*
+   *Now: `tools/release/build.sh` builds the GB10 archive on a GB10 and `install.sh` picks it there (section 2.1).*
 
 Added 2026-10-11:
 
