@@ -310,10 +310,10 @@ impl Mtp38 {
         let rows = file_rows(&plan.draft);
         let mut w = match parts {
             Some(parts) => {
-                let available = model::placement::workstation::host_available()
+                let reading = model::placement::workstation::host_available_read()
                     .map_err(|e| GpuError::plan(WHAT, e))?;
-                let (need, room) = parts.host_need(&rows, 0, 0, available)?;
-                need.check(available).map_err(|e| GpuError::plan(WHAT, e))?;
+                let (need, room) = parts.host_need(&rows, 0, 0, reading.0)?;
+                need.check(&reading).map_err(|e| GpuError::plan(WHAT, e))?;
                 parts.load(stream, &rows, 0, card_dontneed, room)?
             }
             None => Weights::load_placed(stream, draft_file, &rows, 0, card_dontneed)?,

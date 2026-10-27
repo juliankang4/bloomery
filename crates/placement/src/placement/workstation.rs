@@ -1114,22 +1114,23 @@ impl HostNeed {
         i128::from(plan_room(reading)) - i128::from(self.bytes())
     }
 
-    /// `available` bytes (the host's reading, [`host_room`]'s) cover the
-    /// need, or the refusal that names both, each term and what lowers the
-    /// need.
-    pub fn check(self, available: u64) -> Result<(), HostShort> {
-        if self.exact(true) <= u128::from(available) {
+    /// The host room `room` (its bytes and the reading that gave them,
+    /// [`host_room`]'s or a given room) covers the need, or the refusal that
+    /// names both, the reading, each term and what lowers the need.
+    pub fn check(self, room: &(u64, HostRead)) -> Result<(), HostShort> {
+        if self.exact(true) <= u128::from(room.0) {
             Ok(())
         } else {
             Err(HostShort {
                 need: self,
-                available,
+                available: room.0,
+                read: Box::new(room.1.clone()),
                 floor: None,
             })
         }
     }
 
-    /// The load's check with an elastic arena: `available` bytes cover the
+    /// The load's check with an elastic arena: the host room `room` covers the
     /// need and the arena is granted as planned, or the arena shrinks by the
     /// shortfall to a grant of at least `least` (the arena's floor,
     /// `ArenaFloor::bytes`), or the refusal [`HostNeed::check`] would give,
@@ -1137,11 +1138,11 @@ impl HostNeed {
     /// it. A plan with no arena is held exactly as `check` holds it. The one
     /// owner of the arena's shrink: the caller reads the grant, never
     /// recomputes it.
-    pub fn grant(self, available: u64, least: u64) -> Result<ArenaGrant, HostShort> {
+    pub fn grant(self, room: &(u64, HostRead), least: u64) -> Result<ArenaGrant, HostShort> {
         let planned = self.arena;
         let Some(short) = self
             .exact(true)
-            .checked_sub(u128::from(available))
+            .checked_sub(u128::from(room.0))
             .filter(|&s| s > 0)
         else {
             return Ok(ArenaGrant::whole(planned));
@@ -1153,7 +1154,8 @@ impl HostNeed {
             Some(granted) if planned > 0 && granted >= least => Ok(ArenaGrant { planned, granted }),
             _ => Err(HostShort {
                 need: self,
-                available,
+                available: room.0,
+                read: Box::new(room.1.clone()),
                 floor: (planned > 0).then_some(least),
             }),
         }
@@ -1196,12 +1198,17 @@ fn os_reserve(host: &Host) -> u64 {
         .sum()
 }
 
-/// A placed load whose host need passes the host's available bytes
+/// A placed load whose host need passes the host room
 /// ([`HostNeed::check`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostShort {
     pub need: HostNeed,
+    /// The room's bytes.
     pub available: u64,
+    /// The reading that gave the room: the refusal names a given room as
+    /// given, so it does not read as this machine's shortage. Boxed to keep
+    /// the refusal small on the `Ok` path of every check.
+    pub read: Box<HostRead>,
     /// On a refusal of [`HostNeed::grant`] for a plan with an arena: the
     /// floor the arena could not shrink past. `None` from
     /// [`HostNeed::check`], which never shrinks it.
@@ -1212,14 +1219,13 @@ impl fmt::Display for HostShort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let n = &self.need;
         let need = n.bytes();
+        let (available, read) = (self.available, &*self.read);
         write!(
             f,
-            "the host has {} B available (MemAvailable, or the smaller room under a cgroup v2 \
-             limit — host_room's reading), under the {need} B \
+            "the host room is {available} B ({read}), under the {need} B \
              this load needs by {} B: host experts {} B + tables {} B + ring shadows {} B + \
              reserves {} B",
-            self.available,
-            need.saturating_sub(self.available),
+            need.saturating_sub(available),
             n.experts,
             n.tables,
             n.shadows,
@@ -1246,10 +1252,16 @@ impl fmt::Display for HostShort {
         }
         write!(
             f,
-            " − the OS reserve {} B, which MemAvailable leaves out already. Free host memory, or \
-             load by a placement whose cards hold more of the model (V4.1: --place bp holds more \
-             than a, and a more than gate; Qwen3.8: BLOOMERY_QWEN38_EXPERTS=card)",
-            n.os
+            " − the OS reserve {} B, which the room leaves out already. {}, or load by a \
+             placement whose cards hold more of the model (V4.1: --place bp holds more than a, and \
+             a more than gate; Qwen3.8: BLOOMERY_QWEN38_EXPERTS=card)",
+            n.os,
+            match read {
+                HostRead::Given => format!("Raise or unset {}", bloomery_levers::HOST_ROOM),
+                HostRead::MemAvailable | HostRead::VmStats | HostRead::Cgroup { .. } => {
+                    "Free host memory".to_string()
+                }
+            }
         )?;
         if n.extra > 0 {
             write!(f, "; BLOOMERY_RESIDENCY=off drops the churn pool")?;
@@ -1550,7 +1562,11 @@ impl fmt::Display for HostRead {
                 "the room under the cgroup v2 memory limit at /sys/fs/cgroup{path} \
                  (memory.max − memory.current + active_file + inactive_file)"
             ),
-            HostRead::Given => write!(f, "a room the caller gave, not read from this machine"),
+            HostRead::Given => write!(
+                f,
+                "given by {} or the caller, not read from this machine",
+                bloomery_levers::HOST_ROOM
+            ),
         }
     }
 }
@@ -2501,9 +2517,16 @@ mod tests {
         );
     }
 
+    /// A room this machine's `MemAvailable` gave.
+    fn read(bytes: u64) -> (u64, HostRead) {
+        (bytes, HostRead::MemAvailable)
+    }
+
     /// The need is the plan's host terms less the OS reserve; exactly the
     /// available bytes pass, one byte more is refused, and the refusal names
-    /// both figures and the levers that lower the need.
+    /// both figures, the reading that gave the room and the levers that lower
+    /// the need. A room `BLOOMERY_HOST_ROOM` gave is named as given, with the
+    /// lever to raise, not as this machine's shortage.
     #[test]
     fn host_need_is_refused_past_mem_available() {
         let need = HostNeed {
@@ -2519,19 +2542,34 @@ mod tests {
             card_budget: true,
         };
         assert_eq!(need.bytes(), 1260);
-        assert_eq!(need.check(1260), Ok(()));
-        let short = need.check(1259).expect_err("one byte short");
+        assert_eq!(need.check(&read(1260)), Ok(()));
+        let short = need.check(&read(1259)).expect_err("one byte short");
         let text = short.to_string();
         for part in [
-            "1259 B available",
+            "the host room is 1259 B (MemAvailable in /proc/meminfo)",
             "the 1260 B this load needs by 1 B",
             "residency churn pool 50 B",
             "the OS reserve 400 B",
+            "Free host memory",
             "BLOOMERY_RESIDENCY=off",
             "BLOOMERY_CARD_BUDGET",
         ] {
             assert!(text.contains(part), "{part:?} in {text}");
         }
+        assert!(!text.contains(bloomery_levers::HOST_ROOM), "{text}");
+        let given = need
+            .check(&(1259, HostRead::Given))
+            .expect_err("one byte short of the given room")
+            .to_string();
+        for part in [
+            "the host room is 1259 B (given by BLOOMERY_HOST_ROOM or the caller, not read from \
+             this machine)",
+            "the 1260 B this load needs by 1 B",
+            "Raise or unset BLOOMERY_HOST_ROOM",
+        ] {
+            assert!(given.contains(part), "{part:?} in {given}");
+        }
+        assert!(!given.contains("Free host memory"), "{given}");
     }
 
     /// The numbers of the paged Qwen3.8 load that a 32 GB host refused: the
@@ -2559,19 +2597,19 @@ mod tests {
             ..base
         };
         let available = base.bytes() + (1 << 30);
-        assert!(base.check(available).is_ok());
+        assert!(base.check(&read(available)).is_ok());
         let short = need
-            .grant(available, 0)
+            .grant(&read(available), 0)
             .expect_err("owned parts exceed the host limit");
         assert_eq!(short.need.read_ahead, 8 << 30);
         assert!(short.to_string().contains("part read-ahead 8589934592 B"));
-        assert!(need.check(base.bytes() + (8 << 30)).is_ok());
-        assert!(need.check(base.bytes() + (8 << 30) - 1).is_err());
+        assert!(need.check(&read(base.bytes() + (8 << 30))).is_ok());
+        assert!(need.check(&read(base.bytes() + (8 << 30) - 1)).is_err());
         let overflow = HostNeed {
             read_ahead: u64::MAX,
             ..base
         };
-        assert!(overflow.check(u64::MAX).is_err());
+        assert!(overflow.check(&read(u64::MAX)).is_err());
     }
 
     const PAGED_AVAILABLE: u64 = 27_499_458_560;
@@ -2585,7 +2623,7 @@ mod tests {
         assert_eq!(need.bytes(), 27_631_529_984);
         let least = 1 << 30;
         let grant = need
-            .grant(PAGED_AVAILABLE, least)
+            .grant(&read(PAGED_AVAILABLE), least)
             .expect("the arena shrinks");
         assert_eq!(
             grant,
@@ -2599,7 +2637,7 @@ mod tests {
             arena: grant.granted,
             ..need
         };
-        assert_eq!(shrunk.check(PAGED_AVAILABLE), Ok(()));
+        assert_eq!(shrunk.check(&read(PAGED_AVAILABLE)), Ok(()));
     }
 
     /// A shortfall past the arena's room above its floor is refused, naming
@@ -2610,10 +2648,12 @@ mod tests {
         let need = paged_need();
         let least = 4 << 30;
         let room = need.arena - least;
-        let at_floor = need.grant(need.bytes() - room, least).expect("the floor");
+        let at_floor = need
+            .grant(&read(need.bytes() - room), least)
+            .expect("the floor");
         assert_eq!(at_floor.granted, least);
         let past = need
-            .grant(need.bytes() - room - 1, least)
+            .grant(&read(need.bytes() - room - 1), least)
             .expect_err("one byte past the floor");
         assert_eq!(past.floor, Some(least));
         let text = past.to_string();
@@ -2623,10 +2663,15 @@ mod tests {
         );
         let bare = HostNeed { arena: 0, ..need };
         let short = bare.bytes() - 1;
-        let refused = bare.grant(short, least).expect_err("no arena to shrink");
-        assert_eq!(Some(refused), bare.check(short).err());
+        let refused = bare
+            .grant(&read(short), least)
+            .expect_err("no arena to shrink");
+        assert_eq!(Some(&refused), bare.check(&read(short)).err().as_ref());
         assert_eq!(refused.floor, None);
-        assert_eq!(bare.grant(bare.bytes(), least), Ok(ArenaGrant::whole(0)));
+        assert_eq!(
+            bare.grant(&read(bare.bytes()), least),
+            Ok(ArenaGrant::whole(0))
+        );
     }
 
     /// A reading that covers the need grants the arena as planned, whatever
@@ -2637,7 +2682,7 @@ mod tests {
         for available in [need.bytes(), need.bytes() + 1, u64::MAX] {
             for least in [0, 1 << 30, need.arena + 1] {
                 assert_eq!(
-                    need.grant(available, least),
+                    need.grant(&read(available), least),
                     Ok(ArenaGrant::whole(need.arena)),
                     "available {available} floor {least}"
                 );
@@ -2673,11 +2718,11 @@ mod tests {
         assert_eq!(need.bytes(), 61_106_184_192);
         assert_eq!(need.bytes() - UNPAGED_AVAILABLE, UNPAGED_SHORT);
         let short = need
-            .check(UNPAGED_AVAILABLE)
+            .check(&read(UNPAGED_AVAILABLE))
             .expect_err("the reading is short");
         assert_eq!(short.floor, None);
-        assert_eq!(need.grant(UNPAGED_AVAILABLE, 0), Err(short));
-        assert_eq!(need.check(need.bytes()), Ok(()));
+        assert_eq!(need.grant(&read(UNPAGED_AVAILABLE), 0), Err(short));
+        assert_eq!(need.check(&read(need.bytes())), Ok(()));
     }
 
     /// A plan made at a read room holds its need a margin under the
@@ -2700,11 +2745,15 @@ mod tests {
         );
         assert!(at(planned_at - 1) < need, "one byte under pages");
         assert_eq!(
-            unpaged_need().check(planned_at - UNPAGED_SHORT),
+            unpaged_need().check(&read(planned_at - UNPAGED_SHORT)),
             Ok(()),
             "the reporter's drift is under the margin"
         );
-        assert!(unpaged_need().check(planned_at - HOST_DRIFT - 1).is_err());
+        assert!(
+            unpaged_need()
+                .check(&read(planned_at - HOST_DRIFT - 1))
+                .is_err()
+        );
     }
 
     /// An unset residency climb that fills its room exactly still passes the
@@ -2737,11 +2786,11 @@ mod tests {
         let grants = |drop: u64| {
             let available = reading_bytes - drop;
             assert_eq!(
-                load.check(available),
-                load.grant(available, 0).map(|_| ()),
+                load.check(&read(available)),
+                load.grant(&read(available), 0).map(|_| ()),
                 "with no arena, grant is check"
             );
-            load.grant(available, 0)
+            load.grant(&read(available), 0)
         };
         assert_eq!(
             grants(HOST_DRIFT),
@@ -2771,7 +2820,9 @@ mod tests {
             ..climb
         };
         assert!(
-            given_load.grant(reading_bytes - 1, 0).is_err(),
+            given_load
+                .grant(&(reading_bytes - 1, HostRead::Given), 0)
+                .is_err(),
             "a given room keeps no margin"
         );
     }

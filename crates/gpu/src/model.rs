@@ -2312,7 +2312,7 @@ fn placed_pre(
     let t = Instant::now();
     let gpu = Gpu::open_card(&spec.name, spec.device)?;
     let context = t.elapsed();
-    let available = workstation::host_available().map_err(|e| GpuError::plan(what, e))?;
+    let reading = workstation::host_available_read().map_err(|e| GpuError::plan(what, e))?;
     // A plan with an arena may find the host short of its need by less than
     // the arena's room above its floor: the tier is then built over what
     // the reading leaves, never silently — the `nvtier` record names both.
@@ -2325,10 +2325,10 @@ fn placed_pre(
     };
     let (need, room) = match &bytes {
         CardBytes::File => (HostNeed::of(plan, extra_bytes), 0),
-        CardBytes::Parts(parts) => parts.host_need(plan, card, extra_bytes, available)?,
+        CardBytes::Parts(parts) => parts.host_need(plan, card, extra_bytes, reading.0)?,
     };
     let grant = need
-        .grant(available, least)
+        .grant(&reading, least)
         .map_err(|e| GpuError::plan(what, format!("{e}{}", plan.host.room_clause())))?;
     let t = Instant::now();
     let mut weights = match bytes {
