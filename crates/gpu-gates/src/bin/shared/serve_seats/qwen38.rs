@@ -82,7 +82,8 @@
 //! `engine.ctx_verified`), which bounds nothing. One `ctx` line on stderr
 //! names the rule (`set`, `target` or `fitted`, with the target it fitted
 //! under and the memory the context one step above was short of), the slot
-//! context, the slots, their total and the limit with its source.
+//! context, the slots, their total and the limit with its source. The
+//! `setup` line before the address repeats the slot context and its rule.
 //! `--plan` prints the records the decisions before the load make (the `ctx`
 //! line, the `plan` and `residency` records) and exits 0 before the route
 //! trace's directory is made or any model is loaded.
@@ -1849,7 +1850,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             be.per_token
         );
     }
-    let ctx = rule.ctx;
+    let (ctx, ctx_rule) = (rule.ctx, rule.rule);
     // A drafted load's window checked at the context the rule chose — the
     // unset draft's own condition at the default's, the set draft's at any;
     // a draft the yield turned off needs no window (the plain rule's context
@@ -1964,6 +1965,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         ..EngineProps::default()
     };
 
+    let off_why = draft_off.clone();
     let open = SeatArgs {
         place: a.place,
         lane: lane.expect("a serving run probed the lane before the plan"),
@@ -2027,7 +2029,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             side,
         },
     )?;
-    setup38(mtp, lookup, draft_in_folder, (slots, ctx)).eprint();
+    setup38(
+        (mtp, lookup, draft_in_folder),
+        off_why.as_ref(),
+        (slots, ctx, ctx_rule),
+    )
+    .eprint();
     Record::new(&record::LISTENING38)
         .w("place", a.place.name())
         .u("ctx", ctx)
@@ -2039,9 +2046,14 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 }
 
 /// The `setup` record of a server that drafts by `mtp` (its layer a checkpoint folder's when
-/// `in_folder`, else a draft file's) or `lookup` with `slots` resident sequences of `ctx`
-/// positions: the choices and the settings that change them.
-fn setup38(mtp: bool, lookup: bool, in_folder: bool, (slots, ctx): (usize, usize)) -> Record {
+/// `in_folder`, else a draft file's) or `lookup`, or drafts nothing for the reason `off`, with
+/// `slots` resident sequences of `ctx` positions set by `rule`: the choices, why the draft is off
+/// where a rule turned it off, and the settings that change them.
+pub fn setup38(
+    (mtp, lookup, in_folder): (bool, bool, bool),
+    off: Option<&Draft38Off>,
+    (slots, ctx, rule): (usize, usize, Rule),
+) -> Record {
     let r = Record::new(&record::SETUP38);
     let (r, draft) = match (mtp, lookup) {
         (true, _) => (
@@ -2059,10 +2071,25 @@ fn setup38(mtp: bool, lookup: bool, in_folder: bool, (slots, ctx): (usize, usize
             "BLOOMERY_DRAFT=mtp drafts with the MTP layer",
         ),
     };
-    r.u("slots", slots).u("ctx", ctx).w(
-        "change",
-        format!("{draft}; --parallel N sets the slots and --ctx-size N their context"),
-    )
+    let draft = match off.filter(|_| !mtp && !lookup) {
+        // These reasons name their own setting, or a set draft is refused beside them.
+        Some(
+            why @ (Draft38Off::Paged { .. }
+            | Draft38Off::Slots { .. }
+            | Draft38Off::Media
+            | Draft38Off::Folder
+            | Draft38Off::FolderMtp { .. }),
+        ) => format!("the draft is off, {why}"),
+        Some(why) => format!("the draft is off, {why}; {draft}"),
+        None => draft.to_string(),
+    };
+    r.u("slots", slots)
+        .u("ctx", ctx)
+        .w("ctx_rule", rule.word())
+        .w(
+            "change",
+            format!("{draft}; --parallel N sets the slots and --ctx-size N their context"),
+        )
 }
 
 /// The terms of a plan that the seat's records and rules read: the stage
