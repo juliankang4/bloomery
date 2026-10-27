@@ -60,10 +60,22 @@ rounds, tok/s.
 | MiniMax-M3.1-Flash `UD-Q2_K_XL` (GGUF) | 160.16 | 165.92 | 28.63 | 29.41 |
 | MiniMax-M3.1-Flash, NVFP4 folder | 129.08 | 131.56 | 21.12 | 19.53 |
 
-On the RTX 3090 alone, the same GGUF runs at 21.36 tok/s decode at depth 512, and Nanbeige4.3-33B `Q4_K_M` loads whole
-on the card (a 512-token prompt at 745.46 tok/s, decode 24.22). Flint 40B-A2.5B (`UD-Q4_K_XL`) loads whole on the
-RTX A6000. The release notes hold the commits, the release check on the tagged binary, every off cell and the
-contributors' work.
+**One RTX 3090 24 GB** (the A6000 unused): the tagged 0.3.10 tree, the same runner and defaults, `--place` unset,
+speculative drafts on where a model has one. Means of two rounds; four for DeepSeek-V4.1-Flash and Qwen3.8-Flash-Next.
+
+| Model | Where it runs | Prompt, 512 tokens | Prompt, 4,096 tokens | Decode at depth 512 | Decode at depth 4,096 |
+|---|---|---|---|---|---|
+| MiniMax-M3.1-Flash `UD-Q2_K_XL` | card + CPU | 105.16 | 97.56 | 23.41 | 20.40 |
+| Flint 40B-A2.5B `UD-Q4_K_XL` | card + CPU | 879.20 | 750.19 | 87.86 | 85.84 |
+| Nanbeige4.3-33B `Q4_K_M` | the whole model on the card | 745.46 | 693.76 | 24.22 | 23.23 |
+| DeepSeek-V4.1-Flash `Q3_K_M` | card + CPU | 167.41 | 300.46 | 34.73 ¹ | 34.94 |
+| GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | 178.99 | 204.47 | 30.06 | 26.18 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | card + CPU | 736.66 | 1,662.72 ² | 83.36 | 74.34 |
+| Qwen3.6-35B-A3B `Q4_K_M` | the whole model on the card | 5,123.05 | 6,652.24 | 188.31 | 180.68 |
+
+¹ rounds from 31.90 to 40.67 · ² the first round after a load read 1,440.33, the next three 1,735 to 1,739.
+
+The release notes hold the commits, the release check on the tagged binary, every off cell and the contributors' work.
 
 ## Install
 
