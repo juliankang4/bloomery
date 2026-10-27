@@ -154,7 +154,7 @@ use crate::host::tier::TierOpen;
 use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
-use crate::linear::delta::{DeltaArgs, DeltaLanesArgs, carry_fold_host};
+use crate::linear::delta::{RecoveryStore, RecoveryTable, carry_fold_host};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::slots::slot_twice;
 use crate::model::{
@@ -263,6 +263,8 @@ impl SeqView for Seq38 {
 /// runs no row of slot 0, by walking into that buffer ([`stands_in`]).
 pub struct Slot38 {
     stores: Vec<Store38>,
+    /// The commit's replay table over `stores` ([`Body38::recovery`]).
+    recovery: RecoveryTable,
     ple_ring: DeviceBuffer<f32>,
     lane: LaneWord,
     pending: Option<Pending38>,
@@ -343,6 +345,28 @@ fn checkpoint_lens_of(stores: &[Store38]) -> Vec<usize> {
             .filter(|s| matches!(s, Store38::Rec { .. }))
             .count(),
     )
+}
+
+/// The commit's replay table over the delta layers among `stores`, each
+/// under its own layer's fault.
+fn recovery_table(stream: &CudaStream, stores: &[Store38]) -> Result<RecoveryTable, GpuError> {
+    let rows: Vec<RecoveryStore<'_>> = stores
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, s)| match s {
+            Store38::Rec { rec, stamp } => Some(RecoveryStore {
+                layer,
+                state: &rec.state,
+                stamp,
+                carry: rec.carry.as_ref(),
+            }),
+            Store38::Qsa { .. } => None,
+        })
+        .collect();
+    // SAFETY: the stores live in the body beside the table and are never
+    // replaced or reallocated after the load, and the commit's replay is
+    // the only launch on them while it runs (the stream orders the rest).
+    unsafe { RecoveryTable::new(stream, GDN, LANES, &rows) }
 }
 
 /// The bytes one checkpoint of a load of `gdn` delta layers copies: each
@@ -1307,6 +1331,10 @@ pub struct Body38 {
     hybrid: Hybrid<HostRun>,
     plans: Vec<Layer38>,
     stores: Vec<Store38>,
+    /// Every delta store's state, stamps and carry, for the commit's one
+    /// replay launch ([`Body38::commit`]); it moves with `stores` between
+    /// sequences ([`Body38::exchange`]).
+    recovery: RecoveryTable,
     ple_ring: DeviceBuffer<f32>,
     ple: PleHost,
     rope: RopeRows,
@@ -2099,10 +2127,12 @@ impl Body38 {
         // for the `output` it reads; a type no head entry reads is refused by
         // name.
         let head = HeadLaunches::of(w)?;
+        let recovery = recovery_table(stream, &stores)?;
         let mut body = Body38 {
             hybrid,
             plans,
             stores,
+            recovery,
             ple_ring,
             ple,
             rope,
@@ -5202,6 +5232,7 @@ impl ChainBody for Body38 {
 
     fn resident_bytes(&self) -> usize {
         self.store_bytes()
+            + self.recovery.bytes()
             + self.rope.table.num_bytes()
             + self.rope_bytes()
             + self.s.bytes()
@@ -5298,8 +5329,10 @@ impl Slots for Body38 {
             .as_ref()
             .map(|b| b.seq(stream, self.ctx))
             .transpose()?;
+        let recovery = recovery_table(stream, &stores)?;
         let seq = Slot38 {
             stores,
+            recovery,
             ple_ring: DeviceBuffer::zeroed(stream, ple::ring_len(geo::STREAMS))?,
             lane: LaneWord::new(stream, LANES)?,
             pending: None,
@@ -5359,14 +5392,15 @@ impl Slots for Body38 {
         Ok(())
     }
 
-    /// Device bytes one sequence holds: its stores and PLE ring, its lane
-    /// word, its two arena-row buffers, the draft's store on a load with
-    /// one and its rotation table on a media load — the same terms
-    /// [`seq38_bytes`] counts a host park's read of them by, the table
-    /// aside (it is no part of a saved state).
+    /// Device bytes one sequence holds: its stores and PLE ring, its replay
+    /// table, its lane word, its two arena-row buffers, the draft's store on
+    /// a load with one and its rotation table on a media load — the same
+    /// terms [`seq38_bytes`] counts a host park's read of them by, the two
+    /// tables aside (they are no part of a saved state).
     fn seq_bytes(&self) -> usize {
         let arenas = [&self.s, &self.a, &self.wa];
         self.stores.iter().map(Store38::bytes).sum::<usize>()
+            + self.recovery.bytes()
             + self.rope_bytes()
             + self.ple_ring.num_bytes()
             + self.lane.bytes()
@@ -5384,6 +5418,7 @@ impl Body38 {
     /// through (in and back out, the call on it between).
     fn exchange(&mut self, seq: &mut Slot38) {
         std::mem::swap(&mut self.stores, &mut seq.stores);
+        std::mem::swap(&mut self.recovery, &mut seq.recovery);
         std::mem::swap(&mut self.ple_ring, &mut seq.ple_ring);
         std::mem::swap(&mut self.lane, &mut seq.lane);
         std::mem::swap(&mut self.pending, &mut seq.pending);
@@ -5618,34 +5653,13 @@ impl Body38 {
         };
         let kept = (pos - p.pos0) as usize;
         let stream = gpu.stream();
-        let io = self.rp.io(rows)?;
-        let g = &mut self.a.gdn;
-        for (l, store) in self.stores.iter_mut().enumerate() {
-            if let Store38::Rec { rec, stamp } = store {
-                self.k.linear.delta.enqueue_delta_recovery(
-                    stream,
-                    DeltaLanesArgs {
-                        delta: DeltaArgs {
-                            qkv: &g.conv,
-                            beta: &g.beta,
-                            decay: &g.decay,
-                            lane: self.lane.word(),
-                            lane_at: 0,
-                            lanes: rec.lanes,
-                            shape: GDN,
-                            m: kept,
-                            fault: gpu.layer_sink(l)?,
-                            o: &mut g.o,
-                            state: &mut rec.state,
-                        },
-                        each: false,
-                        pos: io.pos0,
-                        stamp,
-                    },
-                    rec.carry.as_ref(),
-                )?;
-            }
-        }
+        self.k.linear.delta.enqueue_delta_recovery_layers(
+            stream,
+            (self.lane.word(), 0),
+            kept,
+            &self.recovery,
+            gpu.unlabelled_sink(),
+        )?;
         self.lane.keep(stream, kept)?;
         if kept < rows {
             self.ple.keep(p.hist, p.pos0, &p.tokens[..kept])?;

@@ -70,6 +70,21 @@ impl FaultSink {
         FaultSink { word, layer }
     }
 
+    /// This sink's word for launches of `layer`: a launch over several
+    /// layers' stores raises each store's faults under its own layer.
+    ///
+    /// # Safety
+    ///
+    /// `layer <= LAYER_NONE`.
+    #[inline(always)]
+    #[must_use]
+    pub unsafe fn at_layer(self, layer: u32) -> FaultSink {
+        FaultSink {
+            word: self.word,
+            layer,
+        }
+    }
+
     /// Raise a fault at `site` for this sink's layer: the first-layer word
     /// becomes the minimum of itself and `(layer << LAYER_SHIFT) | site`, and the
     /// layer's mask takes bit `site`. Device code; any number of threads may

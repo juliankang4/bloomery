@@ -138,8 +138,8 @@ mod gate {
         kda_conv_prep_host,
     };
     use bloomery_gpu::linear::delta::{
-        DeltaArgs, DeltaLanesArgs, DeltaOut, KdaLanesArgs, NEVER, delta_host, kda_delta_host,
-        prompt_work_len,
+        DeltaArgs, DeltaLanesArgs, DeltaOut, KdaLanesArgs, NEVER, RecoveryStore, RecoveryTable,
+        delta_host, kda_delta_host, prompt_work_len,
     };
     use bloomery_gpu::linear::norm_gate::{NormGateArgs, norm_gate_host};
     use bloomery_gpu::linear::out_gate::{OutGateArgs, out_gate_host};
@@ -679,7 +679,10 @@ mod gate {
         let k = LinearKernels::load(gpu.context())?;
         let cx = Ctx { gpu: &gpu, k: &k };
         if recovery_only {
-            let pass = recovery_clauses(&cx, true)?.into_iter().all(|p| p);
+            let pass = recovery_clauses(&cx, true)?
+                .into_iter()
+                .chain(recovery_layers_clauses(&cx, true)?)
+                .all(|p| p);
             return if pass { Ok(()) } else { Err(checks_failed()) };
         }
         if ik_only {
@@ -747,6 +750,9 @@ mod gate {
             tally(pass);
         }
         for pass in recovery_clauses(&cx, false)? {
+            tally(pass);
+        }
+        for pass in recovery_layers_clauses(&cx, false)? {
             tally(pass);
         }
         for pass in kda_lanes_clauses(&cx)? {
@@ -2775,6 +2781,404 @@ mod gate {
                         }
                     }
                 }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One replay launch over several stores
+    /// (`enqueue_delta_recovery_layers`) leaves every store's lanes and
+    /// stamps bit for bit as that store's own replay call does, at each kept
+    /// count, eager and captured, for stores with and without a carry; a
+    /// stamp planted wrong in one store raises the fault its own call raises,
+    /// under its layer. A table whose state or stamp bytes overlap another
+    /// state's, stamp's or carry's is refused by name, windows at different
+    /// addresses included. With `bench`, both replays of 32 stores are timed.
+    fn recovery_layers_clauses(cx: &Ctx<'_>, bench: bool) -> Result<Vec<bool>, GateError> {
+        const LAYERS: [usize; 3] = [3, 7, 30];
+        type Store = (DeviceBuffer<f32>, DeviceBuffer<u32>);
+        type HostStore = (Vec<f32>, Vec<u32>);
+        type Row<'b> = (
+            &'b DeviceBuffer<f32>,
+            &'b DeviceBuffer<u32>,
+            Option<&'b DeviceBuffer<f32>>,
+        );
+        let s = cx.stream();
+        let m = ROW_LANES;
+        let len = K1_SHAPE.state_len();
+        let l = Layer::with(0x6c79_7273, K1_SHAPE);
+        let tk = Tokens::with(m, 0x6c79_7274, K1_SHAPE);
+        let st = Step::of(
+            &conv_host(
+                &l,
+                &tk,
+                &vec![0.0; K1_SHAPE.ring_len()],
+                &positions(0, m),
+                m,
+            ),
+            K1_SHAPE,
+        );
+        let qkv = DeviceBuffer::from_host(s, &st.qkv)?;
+        let beta = DeviceBuffer::from_host(s, &st.beta)?;
+        let decay = DeviceBuffer::from_host(s, &st.decay)?;
+        let pd = DeviceBuffer::from_host(s, &[40u32])?;
+        // A replay reads its position from the record, not the call's word.
+        let commit_pos = DeviceBuffer::from_host(s, &[999u32])?;
+        let c = 1usize;
+        let lw = DeviceBuffer::from_host(s, &[c as u32])?;
+        // Each store recorded by its own verify of m rows from position 40:
+        // store 0 without a carry, the others with the prompt form's carry.
+        let mut recorded = Vec::new();
+        for (i, &layer) in LAYERS.iter().enumerate() {
+            let initial = Lcg(0x6c79_7273 + i as u64).fill(ROW_LANES * len, -0.1, 0.1);
+            let mut stamps = vec![NEVER; ROW_LANES];
+            stamps[c] = 40;
+            let (initial, stamps, carry) = if i == 0 {
+                (initial, stamps, None)
+            } else {
+                let mut before = stamps.clone();
+                before[c] = 37;
+                let (d, sp, carry) = cx.delta_carried(
+                    cx.gpu.unlabelled_sink(),
+                    &st.slice(0, 3),
+                    (&initial, &before, None),
+                    (
+                        LaneCall {
+                            lane: c as u32,
+                            p0: 37,
+                            each: false,
+                        },
+                        Some(prompt_work_len(K1_SHAPE, 3)),
+                        false,
+                    ),
+                    3,
+                )?;
+                (d.state, sp, Some(carry))
+            };
+            let mut state = DeviceBuffer::from_host(s, &initial)?;
+            let mut stamp = DeviceBuffer::from_host(s, &stamps)?;
+            let carry = carry.map(|c| DeviceBuffer::from_host(s, &c)).transpose()?;
+            let mut o = DeviceBuffer::zeroed(s, m * K1_SHAPE.n_v * HEAD)?;
+            cx.k.delta.enqueue_delta_recovery(
+                s,
+                DeltaLanesArgs {
+                    delta: DeltaArgs {
+                        qkv: &qkv,
+                        beta: &beta,
+                        decay: &decay,
+                        lane: &lw,
+                        lane_at: 0,
+                        lanes: ROW_LANES,
+                        shape: K1_SHAPE,
+                        m,
+                        fault: cx.gpu.layer_sink(layer)?,
+                        o: &mut o,
+                        state: &mut state,
+                    },
+                    each: true,
+                    pos: &pd,
+                    stamp: &mut stamp,
+                },
+                carry.as_ref(),
+            )?;
+            recorded.push((layer, state.to_host_vec(s)?, stamp.to_host_vec(s)?, carry));
+        }
+        let clean = cx.gpu.take_fault()?.is_none();
+        let upload = |planted: bool| -> Result<Vec<Store>, GateError> {
+            recorded
+                .iter()
+                .enumerate()
+                .map(|(i, (_, state, stamps, _))| {
+                    let mut stamps = stamps.clone();
+                    if planted && i == 1 {
+                        stamps[c] = 41;
+                    }
+                    Ok((
+                        DeviceBuffer::from_host(s, state)?,
+                        DeviceBuffer::from_host(s, &stamps)?,
+                    ))
+                })
+                .collect()
+        };
+        let table_of = |bufs: &[Store]| {
+            let rows: Vec<RecoveryStore<'_>> = bufs
+                .iter()
+                .zip(&recorded)
+                .map(|((state, stamp), (layer, _, _, carry))| RecoveryStore {
+                    layer: *layer,
+                    state,
+                    stamp,
+                    carry: carry.as_ref(),
+                })
+                .collect();
+            // SAFETY: the buffers outlive every launch of the table, which
+            // runs before they drop, and nothing else writes them meanwhile.
+            unsafe { RecoveryTable::new(s, K1_SHAPE, ROW_LANES, &rows) }
+        };
+        let host = |bufs: &[Store]| -> Result<Vec<HostStore>, GateError> {
+            bufs.iter()
+                .map(|(state, stamp)| Ok((state.to_host_vec(s)?, stamp.to_host_vec(s)?)))
+                .collect()
+        };
+        let mut out = vec![clean];
+        println!(
+            "recovery layers record stores={} clean={clean} {}",
+            LAYERS.len(),
+            verdict(clean)
+        );
+        // Refused by name: a state or stamp whose bytes overlap another
+        // state's, stamp's or carry's, shared or as windows at different
+        // addresses, and a kept count outside 1..=lanes. Accepted: stamps
+        // that only abut, and a carry two stores read.
+        let bufs = upload(false)?;
+        let ((s0, t0), (s1, t1)) = (&bufs[0], &bufs[1]);
+        let pair = |a: Row<'_>, b: Row<'_>| {
+            let rows = [(LAYERS[0], a), (LAYERS[1], b)].map(|(layer, (state, stamp, carry))| {
+                RecoveryStore {
+                    layer,
+                    state,
+                    stamp,
+                    carry,
+                }
+            });
+            // SAFETY: the buffers outlive the table, which is never launched.
+            unsafe { RecoveryTable::new(s, K1_SHAPE, ROW_LANES, &rows) }.map(drop)
+        };
+        let total = ROW_LANES * len;
+        let carry_len = K1_SHAPE.carry_len();
+        let words = DeviceBuffer::<u32>::zeroed(s, 2 * ROW_LANES)?;
+        let stamp_at = |byte| Window::<u32>::of(&words, byte, ROW_LANES);
+        let (tw0, tw1, tw_next) = (stamp_at(0)?, stamp_at(4)?, stamp_at(4 * ROW_LANES)?);
+        let wide = DeviceBuffer::<f32>::zeroed(s, total + carry_len)?;
+        let (sw0, sw16) = (
+            Window::<f32>::of(&wide, 0, total)?,
+            Window::<f32>::of(&wide, 16, total)?,
+        );
+        let cw16 = Window::<f32>::of(&wide, 16, carry_len)?;
+        let tin = Window::<u32>::of(s0, 0, ROW_LANES)?;
+        let shared = recorded[1].3.as_ref();
+        let table = table_of(&bufs)?;
+        let launch = |kept| {
+            cx.k.delta.enqueue_delta_recovery_layers(
+                s,
+                (&lw, 0),
+                kept,
+                &table,
+                cx.gpu.unlabelled_sink(),
+            )
+        };
+        for (what, got, want) in [
+            (
+                "shared stamp",
+                pair((s0, t0, None), (s1, t0, None)),
+                Some("store 1: its stamp overlaps store 0's stamp"),
+            ),
+            (
+                "shared state",
+                pair((s0, t0, None), (s0, t1, None)),
+                Some("store 1: its state overlaps store 0's state"),
+            ),
+            (
+                "stamps 4 bytes apart",
+                pair((s0, &tw0, None), (s1, &tw1, None)),
+                Some("store 1: its stamp overlaps store 0's stamp"),
+            ),
+            (
+                "states 16 bytes apart",
+                pair((&sw0, t0, None), (&sw16, t1, None)),
+                Some("store 1: its state overlaps store 0's state"),
+            ),
+            (
+                "stamp inside a state",
+                pair((s0, t0, None), (s1, &tin, None)),
+                Some("store 1: its stamp overlaps store 0's state"),
+            ),
+            (
+                "carry over another state",
+                pair((&sw0, t0, None), (s1, t1, Some(&cw16))),
+                Some("store 1: its carry overlaps store 0's state"),
+            ),
+            (
+                "carry over its own state",
+                pair((s0, t0, None), (&sw0, t1, Some(&cw16))),
+                Some("store 1: its carry overlaps store 1's state"),
+            ),
+            (
+                "abutting stamps",
+                pair((s0, &tw0, None), (s1, &tw_next, None)),
+                None,
+            ),
+            (
+                "shared carry",
+                pair((s0, t0, shared), (s1, t1, shared)),
+                None,
+            ),
+            ("kept=0", launch(0), Some("need rows in")),
+            ("kept=lanes+1", launch(ROW_LANES + 1), Some("need rows in")),
+        ] {
+            let (named, got) = match (got, want) {
+                (Ok(()), want) => (want.is_none(), "accepted".to_string()),
+                (Err(e), Some(want)) => (e.to_string().contains(want), e.to_string()),
+                (Err(e), None) => (false, e.to_string()),
+            };
+            println!(
+                "recovery layers refusal {what} want={want:?} got={got:?} {}",
+                verdict(named)
+            );
+            out.push(named);
+        }
+        let mut o = DeviceBuffer::zeroed(s, m * K1_SHAPE.n_v * HEAD)?;
+        for kept in 1..=m {
+            for planted in [false, true] {
+                let mut each = upload(planted)?;
+                for ((state, stamp), (layer, _, _, carry)) in each.iter_mut().zip(&recorded) {
+                    cx.k.delta.enqueue_delta_recovery(
+                        s,
+                        DeltaLanesArgs {
+                            delta: DeltaArgs {
+                                qkv: &qkv,
+                                beta: &beta,
+                                decay: &decay,
+                                lane: &lw,
+                                lane_at: 0,
+                                lanes: ROW_LANES,
+                                shape: K1_SHAPE,
+                                m: kept,
+                                fault: cx.gpu.layer_sink(*layer)?,
+                                o: &mut o,
+                                state,
+                            },
+                            each: false,
+                            pos: &commit_pos,
+                            stamp,
+                        },
+                        carry.as_ref(),
+                    )?;
+                }
+                let want_fault = cx.gpu.take_fault()?;
+                let want = host(&each)?;
+                for graph in [false, true] {
+                    let one = upload(planted)?;
+                    let table = table_of(&one)?;
+                    let launch = |stream: &CudaStream| {
+                        cx.k.delta.enqueue_delta_recovery_layers(
+                            stream,
+                            (&lw, 0),
+                            kept,
+                            &table,
+                            cx.gpu.unlabelled_sink(),
+                        )
+                    };
+                    if graph {
+                        cx.gpu.capture(launch)?.launch(s)?;
+                    } else {
+                        launch(s)?;
+                    }
+                    let fault = cx.gpu.take_fault()?;
+                    let got = host(&one)?;
+                    let same = got
+                        .iter()
+                        .zip(&want)
+                        .all(|((a, sa), (b, sb))| bits_equal(a, b) && sa == sb);
+                    let named = if planted {
+                        want_fault
+                            == Some(Fault::at(u32::try_from(LAYERS[1])?, FaultSite::DeltaStamp))
+                    } else {
+                        want_fault.is_none()
+                    };
+                    let pass = same && fault == want_fault && named;
+                    println!(
+                        "recovery layers stores={} kept={kept}/{m} graph={graph} planted={planted} bits={same} fault={fault:?} want={want_fault:?} {}",
+                        LAYERS.len(),
+                        verdict(pass)
+                    );
+                    out.push(pass);
+                }
+            }
+        }
+        if bench {
+            // 32 copies of store 0's record (no carry), replayed again and
+            // again: a replay reads lane c and the record and writes another
+            // lane and its stamp, so every repeat does the same work.
+            let (_, state0, stamps0, _) = &recorded[0];
+            let mut stores = (0..32)
+                .map(|_| {
+                    Ok((
+                        DeviceBuffer::from_host(s, state0)?,
+                        DeviceBuffer::from_host(s, stamps0)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, GateError>>()?;
+            let rows: Vec<RecoveryStore<'_>> = stores
+                .iter()
+                .enumerate()
+                .map(|(layer, (state, stamp))| RecoveryStore {
+                    layer,
+                    state,
+                    stamp,
+                    carry: None,
+                })
+                .collect();
+            // SAFETY: the stores outlive every launch of the table, which
+            // runs before they drop, and nothing else touches them meanwhile.
+            let table = unsafe { RecoveryTable::new(s, K1_SHAPE, ROW_LANES, &rows) }?;
+            drop(rows);
+            let timed = Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT);
+            let start = cx.gpu.context().new_event(timed)?;
+            let end = cx.gpu.context().new_event(timed)?;
+            for round in 0..4 {
+                for fused in if round % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    s.synchronize()?;
+                    start.record(s)?;
+                    if fused {
+                        cx.k.delta.enqueue_delta_recovery_layers(
+                            s,
+                            (&lw, 0),
+                            m,
+                            &table,
+                            cx.gpu.unlabelled_sink(),
+                        )?;
+                    } else {
+                        for (state, stamp) in &mut stores {
+                            cx.k.delta.enqueue_delta_recovery(
+                                s,
+                                DeltaLanesArgs {
+                                    delta: DeltaArgs {
+                                        qkv: &qkv,
+                                        beta: &beta,
+                                        decay: &decay,
+                                        lane: &lw,
+                                        lane_at: 0,
+                                        lanes: ROW_LANES,
+                                        shape: K1_SHAPE,
+                                        m,
+                                        fault: cx.gpu.unlabelled_sink(),
+                                        o: &mut o,
+                                        state,
+                                    },
+                                    each: false,
+                                    pos: &commit_pos,
+                                    stamp,
+                                },
+                                None,
+                            )?;
+                        }
+                    }
+                    end.record(s)?;
+                    end.synchronize()?;
+                    println!(
+                        "recovery layers bench stores=32 kept={m} round={round} fused={fused} ms={}",
+                        start.elapsed_ms(&end)?
+                    );
+                }
+            }
+            if let Some(f) = cx.gpu.take_fault()? {
+                println!("recovery layers bench fault={f:?} {}", verdict(false));
+                out.push(false);
             }
         }
         Ok(out)
