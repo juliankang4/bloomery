@@ -24,9 +24,10 @@ const WHAT: &str = "parts::load";
 
 /// The parts selected by `rule`, read over the pool in runs bounded by owned read and packing
 /// bytes, then staged in plan order. Oversized parts run alone. The placed caller reserves
-/// `LoadPlan::host_bytes` in its host need; standalone loads check the live host reading.
-/// A refusal drains pending copies before freeing device buffers. Under `release`, each
-/// run's source pages are dropped after staging.
+/// `LoadPlan::host_bytes` in its host need. Each run is checked against the live host reading
+/// and, when it does not fit, read in smaller runs down to one part at a time; a part alone over
+/// the reading is refused. A refusal drains pending copies before freeing device buffers. Under
+/// `release`, each run's source pages are dropped after staging.
 pub fn load<S: Source + Sync, E: std::fmt::Display>(
     stream: &CudaStream,
     source: &S,
@@ -129,11 +130,14 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
     }
 }
 
-/// Parts, their bounded parallel reads and the peak owned host bytes reserved before loading.
+/// Parts, their read costs, their bounded parallel reads, the peak owned host bytes reserved
+/// before loading and the least peak, one part at a time.
 struct LoadPlan {
     parts: Vec<Planned>,
+    costs: Vec<(u64, u64)>,
     runs: Vec<(std::ops::Range<usize>, u64)>,
     host_bytes: u64,
+    serial_bytes: u64,
     upload_bytes: usize,
 }
 
@@ -142,23 +146,46 @@ impl LoadPlan {
         &'a self,
         mut available: impl FnMut() -> Result<u64, GpuError> + 'a,
     ) -> impl Iterator<Item = Result<&'a [Planned], GpuError>> + 'a {
-        self.runs.iter().map(move |(range, bytes)| {
-            // The ring is already paid for in the live reading.
-            let live = available()?;
-            if *bytes > live {
-                return Err(refused(format!(
-                    "part read-ahead needs {bytes} B, the host has {live} B available"
-                )));
+        let mut runs = self.runs.iter();
+        let mut left = 0..0;
+        std::iter::from_fn(move || {
+            let mut planned = None;
+            if left.is_empty() {
+                let (range, bytes) = runs.next()?;
+                (left, planned) = (range.clone(), Some(*bytes));
             }
-            Ok(&self.parts[range.clone()])
+            // The ring is already paid for in the live reading.
+            let run = available().and_then(|live| {
+                let (n, bytes) =
+                    read_ahead(&self.parts[left.clone()], &self.costs[left.clone()], live)
+                        .map_err(|e| refused(e.to_string()))?;
+                if bytes > live {
+                    return Err(refused(format!(
+                        "part read-ahead needs {bytes} B, the host has {live} B available"
+                    )));
+                }
+                if let Some(planned) = planned.filter(|_| n < left.len()) {
+                    eprintln!(
+                        "{WHAT}: a read-ahead run of {} parts needs {planned} B, the host has \
+                         {live} B available; it reads in smaller runs",
+                        left.len()
+                    );
+                }
+                let at = left.start;
+                left.start += n;
+                Ok(&self.parts[at..left.start])
+            });
+            Some(run)
         })
     }
 
+    /// Refused unless one part at a time fits `available`; [`Self::checked_runs`] shrinks the
+    /// planned runs to the live reading.
     fn check(&self, available: u64) -> Result<(), GpuError> {
-        if self.host_bytes > available {
+        if self.serial_bytes > available {
             return Err(refused(format!(
                 "part read-ahead needs {} B, the host has {available} B available",
-                self.host_bytes
+                self.serial_bytes
             )));
         }
         Ok(())
@@ -185,7 +212,14 @@ impl LoadPlan {
             costs.push((read, packing));
         }
         let mut runs = Vec::new();
-        let mut host_bytes = 0;
+        let (mut host_bytes, mut serial_bytes) = (0, 0);
+        for at in 0..parts.len() {
+            // A part runs alone under no room.
+            let one = read_ahead(&parts[at..=at], &costs[at..=at], 0)
+                .map_err(|e| refused(e.to_string()))?
+                .1;
+            serial_bytes = serial_bytes.max(one);
+        }
         let mut at = 0;
         while at < parts.len() {
             let (n, bytes) = read_ahead(
@@ -198,15 +232,18 @@ impl LoadPlan {
             host_bytes = host_bytes.max(bytes);
             at += n;
         }
-        if host_bytes > 0 {
-            host_bytes = host_bytes
+        let with_ring = |bytes: u64| match bytes {
+            0 => Ok(0),
+            _ => bytes
                 .checked_add(UploadRing::HOST_MAX)
-                .ok_or_else(|| refused("the parts' read-ahead and ring bytes pass u64".into()))?;
-        }
+                .ok_or_else(|| refused("the parts' read-ahead and ring bytes pass u64".into())),
+        };
         Ok(Self {
             parts,
+            costs,
             runs,
-            host_bytes,
+            host_bytes: with_ring(host_bytes)?,
+            serial_bytes: with_ring(serial_bytes)?,
             upload_bytes,
         })
     }
@@ -577,37 +614,30 @@ mod tests {
             LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 296 * mib).unwrap();
         assert_eq!(shared.runs, [(0..2, 200 * mib)]);
         assert_eq!(shared.host_bytes, 296 * mib);
-        shared.check(296 * mib).unwrap();
-        assert!(shared.check(296 * mib - 1).is_err());
-        assert!(
-            shared
-                .checked_runs(|| Ok(200 * mib))
-                .next()
-                .unwrap()
-                .is_ok()
-        );
-        assert!(
-            shared
-                .checked_runs(|| Ok(200 * mib - 1))
-                .next()
-                .unwrap()
-                .is_err()
-        );
+        shared.check(288 * mib).unwrap();
+        assert!(shared.check(288 * mib - 1).is_err());
         let plan =
             LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 288 * mib).unwrap();
         assert_eq!(plan.runs, [(0..1, 192 * mib), (1..2, 24 * mib)]);
         assert_eq!(plan.host_bytes, 288 * mib);
         plan.check(300 * mib).unwrap();
         assert!(plan.check(288 * mib - 1).is_err());
-        for readings in [[228, 164], [192, 24]] {
-            let mut rooms = readings.into_iter();
-            let runs = plan
+        for (load, readings, lens) in [
+            (&shared, &[200][..], &[2][..]),
+            (&shared, &[199, 199][..], &[1, 1][..]),
+            (&plan, &[228, 164][..], &[1, 1][..]),
+            (&plan, &[192, 24][..], &[1, 1][..]),
+        ] {
+            let mut rooms = readings.iter();
+            let runs = load
                 .checked_runs(|| Ok(rooms.next().unwrap() * mib))
                 .collect::<Result<Vec<_>, _>>()
-                .expect("each remaining run fits its live room");
+                .expect("each run fits its live room, shrunk to it when over");
+            assert_eq!(runs.iter().map(|r| r.len()).collect::<Vec<_>>(), lens);
             assert_eq!(
                 runs.iter()
-                    .map(|r| r[0].info.name.as_str())
+                    .flat_map(|run| run.iter())
+                    .map(|p| p.info.name.as_str())
                     .collect::<Vec<_>>(),
                 ["p64.weight", "p8.weight"]
             );
