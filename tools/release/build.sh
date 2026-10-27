@@ -3,15 +3,22 @@
 # tools/box.sh with the Mac's commit. It builds into its own target dir (target/portable), so the measure runners'
 # target/release is never touched.
 #
+# The release is the building machine's platform (uname -m), one archive each:
+#   - x86_64: bloomery-<v>-linux-x86_64-cuda-sm86, sm_86 PTX the driver compiles for any card of cc 8.6 or newer, host
+#     code for x86-64-v3; built on the box;
+#   - aarch64: bloomery-<v>-linux-aarch64-cuda-sm121a, sm_121a PTX (GB10's native FP4, which loads on cc 12.1 alone),
+#     host code for GB10's cores; built on a GB10 (BLOOMERY_BOX names one, or BLOOMERY_BOX_LOCAL=1 on the Spark itself).
+#
 # The failures it blocks, each checked on the built binaries before anything is packed:
+#   - a binary for another machine than the platform's (its ELF header);
 #   - a binary that needs a glibc newer than GLIBC_FLOOR through a strong (non-WEAK) symbol version, so it would not
 #     start on the oldest distribution the release names;
 #   - a binary that links a shared library outside the allowed set (libcuda must be loaded at run time, never linked);
-#   - host code built for this box's CPU (znver3) instead of x86-64-v3: an instruction past x86-64-v3 outside a
+#   - on x86_64, host code built for this box's CPU (znver3) instead of x86-64-v3: an instruction past x86-64-v3 outside a
 #     function that runs behind a runtime CPU check;
-#   - a binary with no embedded sm_86 PTX, or PTX for another target.
-# The release is one arch's: the archive carries RELEASE_ARCH's PTX and its name says so (cuda-sm86). A BLOOMERY_ARCH naming
-# another arch (tools/arch.sh) ends a build with 64 before anything is built; `--check` reads the binaries and never the variable.
+#   - a binary with no embedded PTX of the platform's arch, or PTX for another target.
+# A BLOOMERY_ARCH naming another arch than the platform's (tools/arch.sh) ends a build with 64 before anything is built;
+# `--check` reads the binaries and never the variable.
 # Usage: tools/release/build.sh <version> <commit>
 #        tools/release/build.sh --check <dir>   (the binary checks alone, on <dir>/<bin>; builds and packs nothing)
 #        tools/release/build.sh --self-test     (the host-code scan on fixture listings; check-recipes runs it)
@@ -33,13 +40,10 @@ else
   COMMIT=${2:?usage: tools/release/build.sh <version> <commit>}
 fi
 
-RELEASE_ARCH=sm_86
-GLIBC_FLOOR=2.34
 BINS=(bloomery-serve)
 # PIN(2026-10-12): permit qdot's Q4_K AVX-512 VNNI bodies; every caller reaches them only when qdot::q4k_avx512 has
 # seen AVX-512 F, BW and VNNI beside the AVX2 kernels' AVX2, FMA and F16C.
 DISPATCHED='^(sha2::sha256::x86::digest_blocks|sha1::compress::x86::digest_blocks|crc32fast::specialized::pclmulqdq::calculate_avx(512|2)|qdot::dot_(q4k_q82x4_tile|lanes)_avx512::<[0-9]+>)$'
-ALLOWED_NEEDED='^(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|ld-linux-x86-64\.so\.2)$'
 
 # scan_past_v3: the listing of `objdump -d -C` on stdin, bytes shown; prints `<count> <function>, first at <address>:
 # <instruction>` for each function outside DISPATCHED that holds an instruction past x86-64-v3:
@@ -171,6 +175,24 @@ if [ -n "$SELF_TEST" ]; then
   exit $?
 fi
 
+# The platform: its archive name, PTX arch, host CPU target, ELF machine, dynamic loader and glibc floor. The x86-64
+# binary's host code is held to x86-64-v3 by the scan below, and its floor is the oldest distribution the release names.
+# The aarch64 one's target is GB10's own cores (rustc's `gb10`): its sm_121a PTX runs on no other machine, and on a GB10
+# the `.cargo` table's `native` names the same CPU, so there is no CPU past the target to scan for; its floor is DGX OS
+# 7's glibc (Ubuntu 24.04), which every GB10 runs.
+case "$(uname -m)" in
+  x86_64)
+    PLATFORM=linux-x86_64-cuda-sm86 RELEASE_ARCH=sm_86 HOST_CPU=x86-64-v3 ELF_MACHINE='Advanced Micro Devices X86-64'
+    LOADER='ld-linux-x86-64\.so\.2' SCAN_V3=1 GLIBC_FLOOR=2.34 ;;
+  aarch64)
+    PLATFORM=linux-aarch64-cuda-sm121a RELEASE_ARCH=sm_121a HOST_CPU=gb10 ELF_MACHINE=AArch64
+    LOADER='ld-linux-aarch64\.so\.1' SCAN_V3= GLIBC_FLOOR=2.39 ;;
+  *)
+    echo "release: no Linux release for $(uname -m); the platforms are x86_64 and aarch64" >&2
+    exit 64 ;;
+esac
+ALLOWED_NEEDED="^(libc\\.so\\.6|libm\\.so\\.6|libgcc_s\\.so\\.1|$LOADER)\$"
+
 if [ -n "$CHECK_ONLY" ]; then
   BIN_DIR=$CHECK_ONLY
 else
@@ -178,16 +200,16 @@ else
   source "$ROOT/tools/arch.sh"
   bloomery_arch release/build.sh || exit $?
   if [ "$ARCH" != "$RELEASE_ARCH" ]; then
-    echo "release: BLOOMERY_ARCH is $ARCH, and the release archive is $RELEASE_ARCH's (its name, cuda-sm86, and the PTX check below): build it with BLOOMERY_ARCH unset" >&2
+    echo "release: BLOOMERY_ARCH is $ARCH, and this machine's release archive is $RELEASE_ARCH's (its name, $PLATFORM, and the PTX check below): build it with BLOOMERY_ARCH unset or $RELEASE_ARCH" >&2
     exit 64
   fi
-  NAME="bloomery-$VERSION-linux-x86_64-cuda-sm86"
+  NAME="bloomery-$VERSION-$PLATFORM"
   DIST="$ROOT/target/release-dist"
   STAGE="$DIST/$NAME"
   export CARGO_TARGET_DIR="$ROOT/target/portable"
   BIN_DIR="$CARGO_TARGET_DIR/release"
   # cargo-oxide appends RUSTFLAGS after the project's extra-rustflags, and rustc keeps the last -C target-cpu.
-  export RUSTFLAGS="-C target-cpu=x86-64-v3"
+  export RUSTFLAGS="-C target-cpu=$HOST_CPU"
   bin_args=()
   for b in "${BINS[@]}"; do bin_args+=(--bin "$b"); done
   # The commit goes to cargo alone: the serve build script reads it, and a running binary never does.
@@ -198,6 +220,12 @@ fail=0
 for b in "${BINS[@]}"; do
   f="$BIN_DIR/$b"
   [ -x "$f" ] || { echo "release: $f was not built" >&2; exit 1; }
+
+  machine=$(readelf -h "$f" | sed -n 's/^ *Machine: *//p')
+  if [ "$machine" != "$ELF_MACHINE" ]; then
+    echo "release: $b is a binary for '$machine', not this platform's '$ELF_MACHINE' ($PLATFORM)" >&2
+    fail=1
+  fi
 
   strong=$(readelf -V "$f" | awk '/Name: GLIBC_/ && /Flags: none/ {sub("GLIBC_", "", $3); print $3}' | sort -V | tail -1)
   if [ "$(printf '%s\n%s\n' "$strong" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
@@ -214,7 +242,8 @@ for b in "${BINS[@]}"; do
   # Instructions past x86-64-v3 may sit only in functions that run behind a runtime CPU check (sha2's and sha1's SHA-NI arms,
   # selected by cpufeatures; crc32fast's AVX-512 and AVX2+VPCLMULQDQ arms under png, selected by is_x86_feature_detected!;
   # qdot's Q4_K AVX-512 VNNI bodies, selected by qdot::q4k_avx512); anywhere else they mean the host code was built for this box's CPU.
-  if ! past_v3=$(objdump -d -C "$f" | scan_past_v3); then
+  past_v3=
+  if [ -n "$SCAN_V3" ] && ! past_v3=$(objdump -d -C "$f" | scan_past_v3); then
     echo "release: $b: the host-code scan failed on its objdump listing" >&2
     fail=1
   elif [ -n "$past_v3" ]; then

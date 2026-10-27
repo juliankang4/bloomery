@@ -6,7 +6,8 @@
 # The value is `sm_` and the capability's digits, with the `a` or `f` suffix cargo-oxide accepts: sm_86, sm_121,
 # sm_121a. Anything else is refused by name, set-and-empty included: a recipe would hand `--arch ` to cargo-oxide.
 # Which archs a tool supports is the tool's own refusal, after this one (the shape pins hold sm_86, sm_121 and sm_121a
-# tables, the occupancy column sm_86's and sm_120/sm_121's limits; narrow-scan and the release archive are sm_86's).
+# tables, the occupancy column sm_86's and sm_120/sm_121's limits; narrow-scan is sm_86's, and the release archive is
+# sm_86's on x86-64 and sm_121a's on a GB10).
 #
 #   bloomery_arch <tool>   ARCH and exported BLOOMERY_ARCH, or the refusal on stderr and 64
 #   bash tools/arch.sh     print that value for the justfile
