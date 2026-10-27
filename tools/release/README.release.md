@@ -12,8 +12,13 @@ measurements and the full README: https://github.com/midagedev/bloomery
 
 ## Requirements
 
-- Linux x86-64 with glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+). The CPU needs AVX2 and FMA (x86-64-v3); AVX-512 is optional.
-- An NVIDIA GPU of compute capability 8.6 or newer: the archive carries sm_86 PTX, which the driver compiles for the
+There are two Linux archives; the installer picks the one for the machine.
+
+- `linux-x86_64-cuda-sm86`: Linux x86-64 with glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL 9+). The CPU needs AVX2 and FMA (x86-64-v3); AVX-512 is optional.
+- `linux-aarch64-cuda-sm121a`: a GB10 (DGX Spark and the other GB10 machines) on DGX OS 7 (Ubuntu 24.04, glibc 2.39). The archive
+  carries sm_121a PTX, which uses GB10's FP4 tensor cores and loads on compute capability 12.1 only; another aarch64
+  GPU builds from source (`docs/BUILD.md`).
+- For the x86-64 archive, an NVIDIA GPU of compute capability 8.6 or newer: the archive carries sm_86 PTX, which the driver compiles for the
   card on first start. Run on an RTX A6000 and an RTX 3090 (driver 615.71, Ubuntu 24.04) and, for Clef-Flash, on an
   RTX 3060 under WSL2 (Windows driver 591.86), where the answers equal the A6000's byte for byte. Other cards and
   drivers are untested.
@@ -24,6 +29,7 @@ measurements and the full README: https://github.com/midagedev/bloomery
   - Clef-Flash: run on a 12 GB card with the `Q3_K_S` file (4.26 GB); the files run from 4.26 GB (`Q3_K_S`) to 9.55 GB (`Q8_0`).
   - Qwen3-30B-A3B and Qwen3.6-35B-A3B at `Q4_K_M`: a 24 GB card whole, or a 12-16 GB card with the routed experts on the CPU (the server plans the split itself when the file does not fit the card's free bytes).
   - V4.1 and GLM-5.3 (their experts partly on the CPU): a 24–48 GB card and a host with 256 GB of RAM; Qwen3.8: a 24–48 GB card and 128 GB of RAM.
+  - A 128 GB GB10: NVIDIA's `Qwen3.8-Flash-Next-FP4-Local` folder as downloaded, every expert on the GPU.
 
 ## Run
 
@@ -39,7 +45,7 @@ extract and run as below inside the WSL shell — the binaries see the GPU throu
 3060 12 GB under WSL2, Windows driver 591.86; the installer runs there too).
 
 ```sh
-tar -xzf bloomery-*-linux-x86_64-cuda-sm86.tar.gz
+tar -xzf bloomery-*-linux-*.tar.gz
 cd bloomery-*/
 
 # A model that fits one 24 GB card, downloaded on first start:
@@ -47,6 +53,9 @@ bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8
 
 # A file you already have:
 bin/bloomery-serve -m /models/Qwen3.6-35B-A3B-Q4_K_M.gguf --port 8080
+
+# On a GB10, a checkpoint folder as downloaded:
+bin/bloomery-serve -m /models/Qwen3.8-Flash-Next-FP4-Local --port 8080
 
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 64}'
