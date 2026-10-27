@@ -1377,6 +1377,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let draft_at = a.flag.unwrap_or(Place38::A);
     let path = ref_model_path()?;
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
+    // A draft path that is a directory is a checkpoint folder's MTP layer, the target's or another's.
+    let draft_in_folder = draft_path.is_dir();
     let draft_looked = draft_places(&path);
     // A checkpoint folder is opened once, here: its header plans as a split's first shard
     // does, its tokenizer is the vocabulary, its MTP layer is the draft's own, and the engine
@@ -1994,6 +1996,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             side,
         },
     )?;
+    setup38(mtp, lookup, draft_in_folder, (slots, ctx)).eprint();
     Record::new(&record::LISTENING38)
         .w("place", a.place.name())
         .u("ctx", ctx)
@@ -2002,6 +2005,33 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         .w("addr", server.local_addr()?)
         .eprint();
     Ok(server.run())
+}
+
+/// The `setup` record of a server that drafts by `mtp` (its layer a checkpoint folder's when
+/// `in_folder`, else a draft file's) or `lookup` with `slots` resident sequences of `ctx`
+/// positions: the choices and the settings that change them.
+fn setup38(mtp: bool, lookup: bool, in_folder: bool, (slots, ctx): (usize, usize)) -> Record {
+    let r = Record::new(&record::SETUP38);
+    let (r, draft) = match (mtp, lookup) {
+        (true, _) => (
+            r.w("draft", "mtp")
+                .w("draft_from", if in_folder { "folder" } else { "file" }),
+            "BLOOMERY_DRAFT=off serves without the draft, BLOOMERY_MTP_DRAFT=FILE drafts from a \
+             draft file",
+        ),
+        (false, true) => (
+            r.w("draft", "lookup"),
+            "BLOOMERY_DRAFT=mtp drafts with the MTP layer",
+        ),
+        (false, false) => (
+            r.w("draft", "off"),
+            "BLOOMERY_DRAFT=mtp drafts with the MTP layer",
+        ),
+    };
+    r.u("slots", slots).u("ctx", ctx).w(
+        "change",
+        format!("{draft}; --parallel N sets the slots and --ctx-size N their context"),
+    )
 }
 
 /// The terms of a plan that the seat's records and rules read: the stage

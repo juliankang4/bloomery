@@ -126,7 +126,10 @@ unless the load prints a `load draft=off` or `draft yield` record. The draft goe
 `--place gate` or `--mmproj`, with stores shorter than one window, on a plan that pages experts, and when its card
 bytes would leave a slot fewer context positions. `BLOOMERY_DRAFT=mtp` keeps it on under `--parallel` above 1 and never
 yields to the context (`crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs:28-31,162-171,236-238,246-264` at
-`c21e3b81`).
+`c21e3b81`). With no `--ctx-size`, each slot asks 262,144 positions and halves while the GB10's one memory pool cannot
+hold the plan, so on one GB10 the FP4-Local checkpoint folder starts under `--parallel 4` without a context flag. Before
+its address the server prints one `setup` line with the draft and where it reads it, the slots, the context each serves,
+and the settings that change them.
 
 The measurement below named a separate draft file instead: the shared Q8_0 draft that
 `unsloth/Qwen3.8-Flash-Next-GGUF` publishes, `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (revision `766911a6`), set

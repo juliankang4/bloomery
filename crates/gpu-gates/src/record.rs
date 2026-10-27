@@ -1868,6 +1868,22 @@ pub static LISTENING38: Kind = Kind {
     ],
 };
 
+/// The Qwen3.8 server's setup as its rules chose it, before its address.
+pub static SETUP38: Kind = Kind {
+    name: "setup38",
+    head: "setup",
+    doc: "The Qwen3.8 server's setup as its rules chose it, printed before its address: the draft (mtp, lookup or off) and, drafting, where its MTP layer comes from (folder, a checkpoint folder; file, a draft file), the resident slots and the context each serves, then the settings that change them.",
+    parts: &[
+        key("draft", Word, ""),
+        opt("draft_from", Word, ""),
+        key("slots", U64, ""),
+        key("ctx", U64, "positions"),
+        lit(" ("),
+        pos("change", Text, ""),
+        lit(")"),
+    ],
+};
+
 /// The GLM server's address.
 pub static LISTENING_GLM: Kind = Kind {
     name: "listening_glm",
@@ -3008,7 +3024,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
     groups::side_seat::SEAT,
     groups::fetch::FETCH,
     groups::fetch::SET,
-    &[&PLAN38, &NEED, &HOST_ONLY, &LISTENING38],
+    &[&PLAN38, &NEED, &HOST_ONLY, &SETUP38, &LISTENING38],
     groups::bind::CACHE,
     groups::drafted::PROMPT,
     &[
