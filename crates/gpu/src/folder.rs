@@ -11,6 +11,8 @@
 //! machine's source reads the experts where the folder stores them, through the located header
 //! (`crate::host::swap_source::FileSwap`).
 
+use std::sync::Mutex;
+
 use gguf::Split;
 use model::part::Source;
 use model::placement::Plan;
@@ -107,7 +109,11 @@ impl<X> Folder<X> {
         let in_place = InPlace::of(&header);
         Folder {
             header,
-            parts: Box::new(PlacedSource { source, in_place }),
+            parts: Box::new(PlacedSource {
+                source,
+                in_place,
+                last: Mutex::default(),
+            }),
             extra,
         }
     }
