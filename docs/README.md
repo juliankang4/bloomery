@@ -17,8 +17,8 @@ in [`docs/bloomery/`](https://github.com/midagedev/rig-log/tree/main/docs/bloome
 | [`serving.md`](serving.md) | llama-server compatibility, the flags, the seats, concurrent requests, drafts, residency, limits |
 | [`models.md`](models.md) | The recommended files and what each model needs in GPU, RAM and disk |
 | [`performance.md`](performance.md) | The numbers' conditions, why it is fast, how it is verified, recorded sessions |
-| [`mac.md`](mac.md) | Apple Silicon: the Metal backend's build, an MLX folder's conversion, the server, its limits |
-| [`BUILD.md`](BUILD.md) | Building from source: the toolchain, the cuda-oxide fork, one command block per model |
+| [`mac.md`](mac.md) | Apple Silicon: install, the Metal backend's build, the files that open, the server, its limits |
+| [`BUILD.md`](BUILD.md) | Building from source: the toolchain, the pinned cuda-oxide and its one carried patch, one command block per model |
 | [`HARDWARE.md`](HARDWARE.md) | What each part of the machine costs in a DeepSeek-V4.1 decode step, and the RAM floor |
 | [`cuda-oxide.md`](cuda-oxide.md) | How the GPU kernels are written in Rust with cuda-oxide |
 | [`upstream/nvlabs-ledger.md`](upstream/nvlabs-ledger.md) | Toolchain defects found in cuda-oxide, cutile-rs and the driver; the pull-request drafts behind them are in rig-log |
