@@ -476,6 +476,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-levers",
  "bloomery-models",
+ "bloomery-runtime",
  "thiserror",
 ]
 

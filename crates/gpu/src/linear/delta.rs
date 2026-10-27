@@ -2707,7 +2707,7 @@ unsafe fn delta_lanes_body<const DECAY: u32, const RECOVERY: bool>(
 
 /// Words of a [`RecoveryTable`] row: the store's state, stamp and carry
 /// device addresses (0 for a store with no carry) and its fault layer.
-const RECOVERY_ROW: usize = 4;
+const RECOVERY_ROW: usize = runtime::stores::DELTA_REPLAY_WORDS;
 
 /// One store a [`RecoveryTable`] names: the buffers of its
 /// [`DeltaKernels::enqueue_delta_recovery`] call and the layer its faults
@@ -2723,6 +2723,7 @@ pub struct RecoveryStore<'a> {
 /// replays, a row of [`RECOVERY_ROW`] words each, uploaded once.
 pub struct RecoveryTable {
     words: DeviceBuffer<u64>,
+    writes: Vec<(u64, u64)>,
     stores: usize,
     lanes: usize,
     shape: LinearShape,
@@ -2823,6 +2824,10 @@ impl RecoveryTable {
         }
         Ok(RecoveryTable {
             words: DeviceBuffer::from_host(stream, &words)?,
+            writes: spans
+                .into_iter()
+                .filter_map(|(_, _, start, end, written)| written.then_some((start, end)))
+                .collect(),
             stores: stores.len(),
             lanes,
             shape,
@@ -3005,7 +3010,8 @@ impl DeltaKernels {
     /// launch's blocks `8·n_v·s ..` and leaves its state, stamps and faults
     /// as its own replay call would, the lane word `lane[lane_at]` and `m`
     /// kept rows shared by all. Refused by name: `m` of 0 or past the lanes
-    /// or `HEAD / 3`, a lane word shorter than read. Asynchronous,
+    /// or `HEAD / 3`, a lane word shorter than read or overlapping any
+    /// replay state or stamp. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_delta_recovery_layers(
         &self,
@@ -3018,6 +3024,7 @@ impl DeltaKernels {
         const WHAT: &str = "enqueue_delta_recovery_layers";
         let RecoveryTable {
             words,
+            writes,
             stores,
             lanes,
             shape,
@@ -3035,6 +3042,13 @@ impl DeltaKernels {
             return Err(GpuError::shape(
                 WHAT,
                 format!("lane.len() {} with lane_at {lane_at}", lane.len()),
+            ));
+        }
+        let at = lane.cu_deviceptr() + 4 * lane_at as u64;
+        if writes.iter().any(|&(start, end)| start <= at && at < end) {
+            return Err(GpuError::shape(
+                WHAT,
+                "lane word overlaps replay state or stamps",
             ));
         }
         let per = shape.n_v * (HEAD / COLUMNS_PER_BLOCK);

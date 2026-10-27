@@ -14,6 +14,11 @@ pub const F32_BYTES: u64 = 4;
 /// Bytes of a u32 word.
 pub const U32_BYTES: u64 = 4;
 
+/// u64 words of a delta replay table row: state, stamp, carry and layer.
+pub const DELTA_REPLAY_WORDS: usize = 4;
+/// Device bytes of one delta replay table row.
+pub const DELTA_REPLAY_BYTES: u64 = (DELTA_REPLAY_WORDS * std::mem::size_of::<u64>()) as u64;
+
 /// The widest call a later call may roll back into, in positions: a ring
 /// keeps its conv's reach plus this many inputs, so a cut anywhere inside a
 /// pass of up to `PASS_ROWS` positions still finds every input its next

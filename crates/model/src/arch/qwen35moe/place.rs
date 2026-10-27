@@ -597,15 +597,26 @@ impl PlanInputs {
     /// What one resident sequence of a load of the file holds on its card
     /// ([`SeqTerms`]): its stores over the file's layers ([`KvLayout`]), the
     /// MTP draft's store on a load that carries `mtp`, and the bytes it holds
-    /// beside them ([`slot_resident_bytes`]).
-    fn seq_terms<'a>(&'a self, mtp: Option<&'a MtpInputs>) -> SeqTerms<'a> {
+    /// beside them ([`slot_resident_bytes`]) and its delta replay table.
+    #[must_use]
+    pub fn seq_terms<'a>(&'a self, mtp: Option<&'a MtpInputs>) -> SeqTerms<'a> {
+        let replay = if program_of(self.spec.arch) == Some(PROGRAM) {
+            self.kv
+                .kinds
+                .iter()
+                .filter(|&&k| k == Kind::DeltaRule)
+                .count() as u64
+                * runtime::stores::DELTA_REPLAY_BYTES
+        } else {
+            0
+        };
         SeqTerms {
             layers: Stores {
                 kv: &self.kv,
                 count: self.model.layers,
             },
             draft: mtp.map(MtpInputs::stores),
-            beside: slot_resident_bytes(&self.spec),
+            beside: slot_resident_bytes(&self.spec) + replay,
         }
     }
 
@@ -1910,7 +1921,7 @@ fn hidden(spec: &ModelSpec) -> usize {
 }
 
 /// Card bytes one resident sequence of a qwen4exp load holds beside its
-/// per-layer stores, its [`SeqTerms::beside`] ([`PlanInputs::seq_terms`]):
+/// per-layer stores, apart from its replay table ([`PlanInputs::seq_terms`]):
 /// the step's one row and the pass's [`PASS_ROWS`] rows of the four streams
 /// — the arena rows a sequence's own draft walks read, held in its own
 /// buffers while the arenas address whichever sequence is live — and the
@@ -3984,7 +3995,7 @@ mod tests {
             slots: u64,
             reserve: u64,
         ) -> Plan<'a> {
-            let rows = slot_resident_bytes(&inputs.spec) * (slots - 1);
+            let rows = (slot_resident_bytes(&inputs.spec) + 96) * (slots - 1);
             let kv = Times {
                 kv: &inputs.kv,
                 slots,
@@ -4049,6 +4060,10 @@ mod tests {
         #[test]
         fn slot_plans_count_every_term_per_slot() {
             let (inputs, machine) = (inputs(), machine());
+            assert_eq!(
+                inputs.seq_terms(None).beside,
+                slot_resident_bytes(&inputs.spec) + 96
+            );
             let mtp =
                 MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
             let levers = PlanLevers::default();

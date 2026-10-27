@@ -3013,6 +3013,50 @@ mod gate {
                 pair((s0, t0, shared), (s1, t1, shared)),
                 None,
             ),
+            (
+                "lane inside a stamp",
+                cx.k.delta.enqueue_delta_recovery_layers(
+                    s,
+                    (t0, c),
+                    1,
+                    &table,
+                    cx.gpu.unlabelled_sink(),
+                ),
+                Some("lane word overlaps replay state or stamps"),
+            ),
+            (
+                "lane inside a state",
+                cx.k.delta.enqueue_delta_recovery_layers(
+                    s,
+                    (&tin, 0),
+                    1,
+                    &table,
+                    cx.gpu.unlabelled_sink(),
+                ),
+                Some("lane word overlaps replay state or stamps"),
+            ),
+            (
+                "lane at the last stamp",
+                cx.k.delta.enqueue_delta_recovery_layers(
+                    s,
+                    (t0, ROW_LANES - 1),
+                    1,
+                    &table,
+                    cx.gpu.unlabelled_sink(),
+                ),
+                Some("lane word overlaps replay state or stamps"),
+            ),
+            (
+                "lane past its buffer",
+                cx.k.delta.enqueue_delta_recovery_layers(
+                    s,
+                    (&lw, 1),
+                    1,
+                    &table,
+                    cx.gpu.unlabelled_sink(),
+                ),
+                Some("lane.len()"),
+            ),
             ("kept=0", launch(0), Some("need rows in")),
             ("kept=lanes+1", launch(ROW_LANES + 1), Some("need rows in")),
         ] {
