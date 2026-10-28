@@ -293,7 +293,11 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # type train's union batch): a534227ca raised its sm_86 spill 484 -> 608 with the BF16 head-norm finish and kept the
 # older jit_local, which a GB10 cannot measure; the entry's PTX is main's (ptx-compare 43073091b: changed none).
 # PIN(2026-10-26): spill 608 -> 536 B and cc 8.6 JIT local 216 -> 184 B, both measured by gate-ptx-spill (sm_86 ptxas 13.3.73). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the PTX of 1507 of 1585 scanned entries moved with it (just canon-check; 1483 of them by `ld.global.nc` loads and the placement they allow).
-generate_ds41   hc_gated_up_mma_mix_4                  536         184
+# PIN(2026-10-29): spill 536 -> 528 B and cc 8.6 JIT local 184 -> 192 B, both measured by gate-ptx-spill (the 3090, driver
+# 615.71.09) on a tree that is main 62c507523 in crates/gpu: generate_ds41 now carries the entry PTX that
+# bloomery-serve's scans carry since dbdef417 (md5 a06fe16f, 13307 lines; 536/184 was its 12380-line PTX). cc 8.6 never
+# launches the entry.
+generate_ds41   hc_gated_up_mma_mix_4                  528         192
 # PIN(2026-10-25): the new entry uses sm_86 ptxas 13.3.73 spill/stack (676/192). The cc 8.6 JIT was not measured (the
 # GB10 JIT reads 88 B of local for this PTX); this new entry's jit_local pin uses the measured ptxas stack frame.
 # PIN(2026-10-26): spill 676 -> 628 B and cc 8.6 JIT local 192 -> 200 B, both measured by gate-ptx-spill (sm_86 ptxas
