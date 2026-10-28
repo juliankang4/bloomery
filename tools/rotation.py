@@ -14,8 +14,9 @@ only in a real-tier batch, and nothing else schedules them. The rotation is that
          tools/gate-batch.sh, grouped by family (the BLOOMERY_MODEL of the recipe's box line, else the default profile: gate-batch.sh's
          family()), the stalest family first, each gate with its predicted wall (the median of its last 5 rows of the times file, 45 s
          where it has none: gate-batch.sh's expected()) and the total. A needs-env gate is listed and the batch defers it, so the list
-         never hides a gate that nothing can run unattended. --with-weekly puts every `weekly-*` recipe first, then the due gates that
-         are not weekly (`just weekly`): one batch, one ledger read, one sitting.
+         never hides a gate that nothing can run unattended. --with-weekly puts every `weekly-*` recipe first, then every CUDA
+         gate on a GGUF input (`mac_gguf_cuda`, the set a mac landing defers) that the list does not already name, then the due
+         gates that are not weekly (`just weekly`): one batch, one ledger read, one sitting.
          The key status comes from one `tools/gate-batch.sh --ledger --dry-run` over the gates stale by date: it reads the box once
          (the manifest, through tools/box.sh) and only when some gate is stale by date. When it cannot, every gate stale by date is
          listed as due with `key unknown` and the reason on stderr: the batch's own ledger check skips any that is green at its key.
@@ -339,6 +340,7 @@ def format_list(
     ledger_path: str,
     times_path: str,
     unknown: str,
+    mac: list[str] | None = None,
 ) -> str:
     runs = [e for e in entries if e.status != "deferred"]
     total = sum(e.wall for e in runs)
@@ -353,9 +355,15 @@ def format_list(
     ]
     if unknown:
         out.append(f"# key status unknown ({unknown}): every gate stale by date is listed; the batch's ledger check skips any green at its key")
-    if weekly:
-        out.append(f"# the {len(weekly)} weekly-* recipes first, then the due gates")
+    mac = list(mac or [])
+    if weekly or mac:
+        note = f"# the {len(weekly)} weekly-* recipes"
+        if mac:
+            note += f" and {len(mac)} CUDA GGUF-input gate(s)"
+        note += " first, then the due gates"
+        out.append(note)
         out += [g.name for g in weekly]
+        out += mac
     for fam, es in by_family([e for e in entries if not (weekly and e.gate.weekly)]):
         wall = sum(e.wall for e in es if e.status != "deferred")
         out.append(f"# family {fam}: {len(es)} gate(s), {wall} s, stalest {'never' if es[0].age is None else age_text(es[0])[len('last green '):]}")
@@ -403,6 +411,8 @@ def load_ledger(path: str) -> tuple[dict[str, dt.datetime], int]:
 
 def cmd_due(args: argparse.Namespace, now: dt.datetime | None = None, key_of: Callable | None = None, rs: dict | None = None) -> int:
     now = now or dt.datetime.now().astimezone()
+    if rs is None:
+        rs = recipes.load_justfile(os.path.join(recipes.ROOT, "justfile"))
     gates = load_gates(args, rs)
     ledger_path = ledger_path_of(args.ledger)
     times_path = times_path_of()
@@ -417,7 +427,11 @@ def cmd_due(args: argparse.Namespace, now: dt.datetime | None = None, key_of: Ca
     if unknown:
         print(f"rotation.py: key status unknown, every gate stale by date is listed: {unknown}", file=sys.stderr)
     weekly = [g for g in gates if g.weekly] if args.with_weekly else []
-    text = format_list(entries, weekly, args.days, args.tier, now, ledger_path, times_path, unknown)
+    # A mac landing defers every CUDA gate on a GGUF input. The weekly list carries that set, and a name already
+    # on it (a weekly recipe, or a gate the rotation already lists) is not written twice.
+    present = {g.name for g in weekly} | {e.gate.name for e in entries}
+    mac = [n for n, _ in recipes.mac_gguf_cuda(rs, recipes.ROOT) if n not in present] if args.with_weekly else []
+    text = format_list(entries, weekly, args.days, args.tier, now, ledger_path, times_path, unknown, mac)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -652,6 +666,34 @@ def self_test() -> int:
             written = open(out_path, encoding="utf-8").read()
             expect(rc == 0 and written.splitlines()[3] == "# the 1 weekly-* recipes first, then the due gates" and "weekly-w" in written
                    and "gate-oldkey" in written and "gate-fresh" not in written, f"cmd_due: the list file written (rc {rc}): {written}")
+            # A CUDA gate on a GGUF fixture is not a rotation gate. The weekly list without the mac union omits it;
+            # due --with-weekly names it once. A checkpoint-folder CUDA gate stays off. A gate already due is not repeated.
+            def bare(text: str) -> list[str]:
+                return [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+
+            gguf_line = "BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/gpu-gate.sh x'"
+            fold_line = "BLOOMERY_MODEL=minimax-m3 ./tools/box.sh 'bash tools/gpu-gate.sh x'"
+            rs_mac = dict(rs2)
+            rs_mac["gate-macgguf"] = rec("gate-macgguf", gguf_line)
+            rs_mac["gate-foldkeep"] = rec("gate-foldkeep", fold_line)
+            rs_mac["gate-never"] = rec("gate-never", gguf_line)
+            plain = format_list(entries, [g for g in gates if g.weekly], 7, "real", now, led, times_path, "")
+            expect("gate-macgguf" not in bare(plain), f"weekly union: without it a CUDA GGUF gate is absent: {bare(plain)}")
+            out_mac = os.path.join(tmp, "due-mac.list")
+            args_mac = argparse.Namespace(days=7.0, ledger=led, tier="real", classes=cls_path, with_weekly=True, out=out_mac)
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = cmd_due(args_mac, now, keys({"gate-fresh": "skip"}), rs_mac)
+            items_mac = bare(open(out_mac, encoding="utf-8").read())
+            expect(rc == 0 and items_mac.count("gate-macgguf") == 1 and items_mac[0] == "weekly-w",
+                   f"weekly union: due --with-weekly names the CUDA GGUF gate once, after the weekly recipes: {items_mac}")
+            expect("gate-foldkeep" not in items_mac, f"weekly union: a checkpoint-folder CUDA gate stays off: {items_mac}")
+            expect(items_mac.count("gate-never") == 1, f"weekly union: a gate already due is not listed twice: {items_mac}")
+            out_off = os.path.join(tmp, "due-off.list")
+            args_off = argparse.Namespace(days=7.0, ledger=led, tier="real", classes=cls_path, with_weekly=False, out=out_off)
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = cmd_due(args_off, now, keys({"gate-fresh": "skip"}), rs_mac)
+            expect(rc == 0 and "gate-macgguf" not in open(out_off, encoding="utf-8").read(),
+                   "weekly union: without --with-weekly the CUDA GGUF gate stays off the due list")
             argsc = argparse.Namespace(days=7.0, ledger=led, classes=cls_path)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
@@ -690,7 +732,7 @@ def main(argv: list[str]) -> int:
         p.add_argument("--classes", help="a saved `tools/gate-batch.sh --tier fixture --classes` (default: run it)")
         if name == "due":
             p.add_argument("--tier", choices=["real"], default="real", help="the tier the list runs in: the real tier, which runs what the fixture tier defers")
-            p.add_argument("--with-weekly", action="store_true", help="every weekly-* recipe first, then the due gates that are not weekly (`just weekly`)")
+            p.add_argument("--with-weekly", action="store_true", help="every weekly-* recipe first, then every CUDA gate on a GGUF input the list does not already name, then the due gates that are not weekly (`just weekly`)")
             p.add_argument("--out", help="write the list to FILE (its first lines to stderr) instead of stdout")
     args = ap.parse_args(argv)
     if args.days < 0:

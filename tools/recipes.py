@@ -17,7 +17,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py why FILE... [--recipe R]...  # every recipe a file selects, with the chain; --recipe R: whether R's key holds it and R's shortest dependency chain to the file's crate
     python3 tools/recipes.py gaps [CRATE...] [--rev REV] [--list]  # per crate: recipes whose key holds a file of it, recipes whose targets reach code of it, the gap; exit 1 on a gap of a pinned crate (KEY_REACH_PINS)
     python3 tools/recipes.py rows              # tools/gate-paths.tsv as narrow() reads it: each `derive` row's gates written out, line for line (cached by tree)
-    python3 tools/recipes.py reach FILE... [--brief] [--row]  # the gates whose targets can run the file's code, each with a chain (--brief: the reason it is kept: a static chain, or the registry row its model files name)
+    python3 tools/recipes.py reach FILE... [--brief] [--row] [--mac-landing]  # the gates whose targets can run the file's code, each with a chain (--brief: the reason; --mac-landing: the list a mac-crate change runs)
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
@@ -43,9 +43,10 @@ The class stage (`--class`, off by default) is the third stage, after select() a
 tools/families.tsv, tools/owners.tsv, read through tools/gate_class.py's loader) say what a gate-* recipe is, and a family gate is kept only
 when the change can have moved it — the family's own file changed, the recipe's own text or one of its own target files changed, the family is
 a representative one and the pick reaches a changed file, or the family was added since the last release tag. The gate it leaves out is printed
-with its reason, in the same `left out` block the ptx-scan stage uses. Without the flag the output is the list of today, byte for byte.
-`release-list` is the release batch's list: every S0 gate (a common or a tooling gate the fixture tier runs), every gate of a representative
-family, the class-staged affected(TAG) and the rotation's due gates.
+with its reason, in the same `left out` block the ptx-scan stage uses. Without the flag that stage is not applied.
+A change whose selecting files all sit under `MAC_CRATES` does not select a CUDA gate on a GGUF input (`mac_landing_deferred`); the gate is
+printed under `deferred`. `release-list` is the release batch's list: every S0 gate (a common or a tooling gate the fixture tier runs), every
+gate of a representative family, the class-staged affected(TAG), the rotation's due gates and every CUDA gate on a GGUF input (`mac_gguf_cuda`).
 
 A recipe's inputs are:
   - the files of every cargo target it builds or tests: the target's own module tree (`mod`,
@@ -2362,14 +2363,18 @@ def cmd_affected(args: argparse.Namespace) -> int:
             stage = class_narrow(picks, changed, ctables, lambda n: class_reach(n, changed, a, b),
                                  families_new_since(ROOT, ctables))
             picks = {n: why for n, why in picks.items() if n in stage.kept}
+        deferred = mac_landing_deferred(sels, picks, b.recipes, b.tree.root) if prefix == GATE_PREFIX else []
+        for n, _reason in deferred:
+            picks.pop(n, None)
         vitems = variant_items(list(picks), a, b, changed, prefix) if prefix == GATE_PREFIX else []
         class_note = f"class-staged: {len(stage.kept)} kept, {len(stage.left_out)} left out" if stage else ""
+        mac_note = f", {len(deferred)} deferred to weekly (CUDA gate, GGUF input)" if deferred else ""
         if narrowed:
             print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected "
-                  f"(narrowed from {len(sels)} by ptx-scan; {class_note}){weekly}")
+                  f"(narrowed from {len(sels)} by ptx-scan; {class_note}){weekly}{mac_note}")
         else:
             print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected"
-                  + (f" ({class_note})" if stage else "") + weekly)
+                  + (f" ({class_note})" if stage else "") + weekly + mac_note)
         if nar is not None:
             for r in nar.full:
                 print(f"narrow: full list — {r}")
@@ -2422,6 +2427,11 @@ def cmd_affected(args: argparse.Namespace) -> int:
                 print(f"left out ({len(stage.left_out)}), each by its reason:")
                 for n, why in stage.left_out.items():
                     print(f"  - {n}  ({why})")
+        if deferred:
+            print(f"deferred ({len(deferred)}), a change under {', '.join(MAC_CRATES)} does not select a CUDA gate on a GGUF input; "
+                  "weekly and the release batch run them:")
+            for n, reason in deferred:
+                print(f"  - {n}  ({reason})")
         print(f"unmapped ({len(unmapped)}):")
         for u in unmapped:
             print(f"  {u}")
@@ -2691,11 +2701,91 @@ def cmd_gaps(args: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
+def _reach_sets(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
+    """`(label, files)` for one `reach` invocation: the positional files, or each line of `--batch` (`LABEL<TAB>files`)."""
+    if not args.batch:
+        if not args.files:
+            raise RecipeError("reach: name a file, or pass --batch")
+        return [("", list(args.files))]
+    sets = []
+    with open(args.batch, encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 2:
+                raise RecipeError(f"reach --batch: a line needs a label and a file: {line.strip()[:80]}")
+            sets.append((parts[0], parts[1:]))
+    if not sets:
+        raise RecipeError(f"reach --batch: {args.batch} has no set")
+    return sets
+
+
+def _print_reach_mac(side: Side, gates: list[str], label: str, files: list[str]) -> None:
+    """The gates that reach any of `files`, then the same list after a mac-crate landing defers CUDA gates on a GGUF input.
+    A gate that reads one of the files as its own target stays."""
+    tree, graph = side.tree, side.graph
+    table = fixture_kind_table(tree.root)
+    rows, cuts = table if table is not None else ({}, set())
+    if label:
+        print(f"SET {label}")
+    reached: dict[str, None] = {}
+    own: set[str] = set()
+    missing = False
+    for f in files:
+        f = _norm(f)
+        if not tree.exists(f):
+            print(f"{f}: not a file of the tree")
+            missing = True
+            continue
+        for n, w in ((n, graph.inputs(n).match(f)) for n in gates):
+            if w and _own_origin(w):
+                own.add(n)
+        for n in dep_reach(tree, graph, gates, f):
+            if n not in NARROW_ALWAYS:
+                reached.setdefault(n, None)
+    kept: list[str] = []
+    deferred: list[tuple[str, str]] = []
+    for n in gates:
+        if n not in reached and n not in own:
+            continue
+        if n in own or table is None:
+            kept.append(n)
+            continue
+        reason = mac_defer_reason(side.recipes, n, rows, cuts, tree.root)
+        if reason and n in reached:
+            deferred.append((n, reason))
+        else:
+            kept.append(n)
+    if missing and not reached and not own:
+        return
+    print(f"OLD {len(reached) + len(own - reached.keys())}")
+    for n in gates:
+        if n in reached or n in own:
+            print(f"  {n}")
+    print(f"KEPT {len(kept)}")
+    for n in kept:
+        print(f"  {n}")
+    print(f"DEFERRED {len(deferred)}")
+    for n, reason in deferred:
+        print(f"  {n}\t{reason}")
+
+
 def cmd_reach(args: argparse.Namespace) -> int:
     """`why`'s files through the derivation (Reach): the gate-* recipes whose targets can run code of each file through
     a dependency edge, each with one chain, and the readers the derivation leaves out by count. `why` lists every
-    recipe that links a file (the crate-grain bound narrow() reads); `reach` is the subset a row must name."""
+    recipe that links a file (the crate-grain bound narrow() reads); `reach` is the subset a row must name.
+    `--mac-landing` prints the list a change under MAC_CRATES runs, and each CUDA gate on a GGUF input it defers."""
     side = make_side(ROOT)
+    if args.mac_landing:
+        gates = [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if n.startswith(GATE_PREFIX)]
+        for label, files in _reach_sets(args):
+            _print_reach_mac(side, gates, label, files)
+        return 0
+    if args.batch:
+        raise RecipeError("reach: --batch is only read with --mac-landing")
+    if not args.files:
+        raise RecipeError("reach: name a file")
     tree, graph = side.tree, side.graph
     gates = [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if n.startswith(GATE_PREFIX)]
     union: dict[str, None] = {}
@@ -3168,6 +3258,164 @@ def _own_origin(why: str) -> bool:
     if "<-" in inner or inner.startswith(("cargo", "tools/box.sh", "profile ", "dep-info")):
         return False
     return True
+
+
+# A change whose selecting files all sit under these crates does not select a CUDA gate whose model input is a
+# GGUF file. That gate is on the weekly list and the release list (`mac_gguf_cuda`). A checkpoint-folder fixture
+# still selects it. A gate that runs no gpu-gate.sh (a host gate, a Metal gate) is not in the set.
+MAC_CRATES = ("embed", "hf", "jinja", "metal", "model-hf", "serve", "tokenizer")
+_PROFILE_MODEL = re.compile(r"(?m)^MODEL=\$\{BLOOMERY_REF_MODEL:-([^}\n]+)\}")
+
+
+def mac_crate_file(path: str) -> bool:
+    """Whether `path` is a file of a crate in `MAC_CRATES`."""
+    parts = path.split("/")
+    return len(parts) >= 2 and parts[0] == "crates" and parts[1] in MAC_CRATES
+
+
+def cuda_recipe(recipe: Recipe) -> bool:
+    """Whether the recipe runs a binary through tools/gpu-gate.sh."""
+    blob = recipe.text + "\n" + "\n".join(recipe.lines)
+    return "gpu-gate.sh" in blob
+
+
+def fixture_cut_dirs(root: str) -> set[str]:
+    """Fixture directories that are checkpoint-folder cuts: `tools/fixture-cuts/<dir>.json` exists."""
+    cut_dir = os.path.join(root, "tools/fixture-cuts")
+    if not os.path.isdir(cut_dir):
+        return set()
+    return {name[:-5] for name in os.listdir(cut_dir) if name.endswith(".json")}
+
+
+def fixture_kind_table(root: str) -> tuple[dict[str, str], set[str]] | None:
+    """`(profile -> fixture dir, the folder-cut dirs)`, or None when the fixture table is not in the tree
+    or has no row. A malformed row is still a named error."""
+    dirs = os.path.join(root, FIXTURE_DIRS)
+    refs = os.path.join(root, REF_PATHS)
+    if not os.path.isfile(dirs) or not os.path.isfile(refs):
+        return None
+    with open(dirs, encoding="utf-8") as fh:
+        dirs_text = fh.read()
+    if not any(line.strip() and not line.startswith("#") for line in dirs_text.splitlines()):
+        return None
+    with open(refs, encoding="utf-8") as fh:
+        refs_text = fh.read()
+    rows, _default = fixture_table(dirs_text, refs_text)
+    return rows, fixture_cut_dirs(root)
+
+
+def recipe_profile(recipes: dict[str, Recipe], name: str) -> str | None:
+    """The first BLOOMERY_MODEL of `name` and its dependencies, else the default profile. None when a recipe's
+    commands do not parse."""
+    seen: set[str] = set()
+
+    def walk(n: str) -> str | None:
+        if n in seen or n not in recipes:
+            return None
+        seen.add(n)
+        try:
+            models = recipe_commands(recipes[n]).models
+        except RecipeError:
+            return ""
+        for model in models:
+            if model:
+                return model
+        for dep in recipes[n].deps:
+            got = walk(dep)
+            if got == "":
+                return ""
+            if got:
+                return got
+        return None
+
+    got = walk(name)
+    if got == "":
+        return None
+    return got or DEFAULT_PROFILE
+
+
+def _self_model_kind(root: str, prof: str) -> str | None:
+    """`file` when a `self` profile's script defaults MODEL to a `.gguf` path. Anything else stays untold."""
+    path = os.path.join(root, "tools/ref/models", f"{prof}.sh")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    m = _PROFILE_MODEL.search(text)
+    if m is None:
+        return None
+    default = m.group(1).strip().strip("\"'")
+    if default.endswith(".gguf"):
+        return "file"
+    return None
+
+
+def gate_fixture_kind(recipes: dict[str, Recipe], name: str, rows: dict[str, str], cuts: set[str], root: str) -> tuple[str | None, str]:
+    """`("folder"|"file"|None, why)`. None means the input kind is not told, and the gate stays on the landing list."""
+    prof = recipe_profile(recipes, name)
+    if prof is None:
+        return None, "the recipe's profile does not parse"
+    direc = rows.get(prof)
+    if direc is None:
+        return None, f"profile {prof} is not in {FIXTURE_DIRS}"
+    if direc == "self":
+        kind = _self_model_kind(root, prof)
+        if kind == "file":
+            return "file", f"profile {prof} has no fixture directory; tools/ref/models/{prof}.sh defaults MODEL to a .gguf file"
+        return None, f"profile {prof} has no fixture file ({FIXTURE_DIRS} row self)"
+    if direc in cuts:
+        return "folder", f"profile {prof} fixture {direc} (tools/fixture-cuts/{direc}.json)"
+    return "file", f"profile {prof} fixture {direc} (no tools/fixture-cuts/{direc}.json: GGUF shards)"
+
+
+def mac_defer_reason(recipes: dict[str, Recipe], name: str, rows: dict[str, str], cuts: set[str], root: str) -> str | None:
+    """Why a mac-crate landing defers `name`, or None when it still runs. A CUDA gate on a GGUF input is deferred;
+    a checkpoint-folder fixture, a host gate and a Metal gate are not."""
+    if name not in recipes or not cuda_recipe(recipes[name]):
+        return None
+    kind, why = gate_fixture_kind(recipes, name, rows, cuts, root)
+    if kind != "file":
+        return None
+    return f"CUDA gate on a GGUF input ({why}); weekly and the release batch run it"
+
+
+def mac_gguf_cuda(recipes: dict[str, Recipe], root: str) -> list[tuple[str, str]]:
+    """Every CUDA `gate-*` recipe whose fixture input is a GGUF file, in justfile order, each with its reason.
+    The weekly list and the release list run these. Empty when the fixture table is not in the tree."""
+    table = fixture_kind_table(root)
+    if table is None:
+        return []
+    rows, cuts = table
+    out = []
+    for name in sorted(recipes, key=lambda n: (recipes[n].line, n)):
+        if not name.startswith(GATE_PREFIX):
+            continue
+        reason = mac_defer_reason(recipes, name, rows, cuts, root)
+        if reason:
+            out.append((name, reason))
+    return out
+
+
+def mac_landing_deferred(sels: list[Selection], picks: dict[str, str], recipes: dict[str, Recipe], root: str) -> list[tuple[str, str]]:
+    """The picks a mac-crate change defers: every selecting file is under `MAC_CRATES`, the hit is not the gate's
+    own target, and `mac_defer_reason` names it. A gate a file outside the table also selects stays."""
+    table = fixture_kind_table(root)
+    if table is None:
+        return []
+    rows, cuts = table
+    by = {s.recipe: s for s in sels}
+    out = []
+    for n in picks:
+        s = by.get(n)
+        if s is None or not s.files or not all(mac_crate_file(f) for f in s.files):
+            continue
+        if _own_origin(s.why):
+            continue
+        reason = mac_defer_reason(recipes, n, rows, cuts, root)
+        if reason:
+            out.append((n, reason))
+    return out
 
 
 # The origins that are not a target's own read: a script the recipe names, a cargo global, a box call's file, a
@@ -11336,9 +11584,56 @@ def key_reach_self_test(expect, side: Side) -> None:
     )
 
 
+def mac_landing_self_test(expect) -> None:
+    """The mac-crate landing rule on a synthetic fixture table: a CUDA gate on a GGUF fixture or a `self` profile whose
+    script defaults MODEL to a .gguf file is deferred; a checkpoint-folder fixture, a host gate and an unknown profile stay."""
+    with tempfile.TemporaryDirectory(prefix="recipes-mac-") as tmp:
+        os.makedirs(os.path.join(tmp, "tools/fixture-cuts"))
+        os.makedirs(os.path.join(tmp, "tools/ref/models"))
+        with open(os.path.join(tmp, FIXTURE_DIRS), "w", encoding="utf-8") as fh:
+            fh.write("deepseek2\tself\nfilefam\tfiledir\nfoldfam\tfolddir\nselfprof\tself\n")
+        with open(os.path.join(tmp, REF_PATHS), "w", encoding="utf-8") as fh:
+            fh.write(': "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deepseek2}}"\n')
+        with open(os.path.join(tmp, "tools/fixture-cuts/folddir.json"), "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+        with open(os.path.join(tmp, "tools/ref/models/selfprof.sh"), "w", encoding="utf-8") as fh:
+            fh.write("MODEL=${BLOOMERY_REF_MODEL:-/models/Self/model.gguf}\n")
+        with open(os.path.join(tmp, "tools/ref/models/deepseek2.sh"), "w", encoding="utf-8") as fh:
+            fh.write("MODEL=${BLOOMERY_REF_MODEL:-/models/Self/dir}\n")
+
+        def rec(name: str, line: str, n: int) -> Recipe:
+            return Recipe(name=name, lines=[line], deps=[], text=line, line=n)
+
+        rs = {
+            "gate-file": rec("gate-file", "BLOOMERY_MODEL=filefam ./tools/box.sh 'bash tools/gpu-gate.sh x'", 1),
+            "gate-fold": rec("gate-fold", "BLOOMERY_MODEL=foldfam ./tools/box.sh 'bash tools/gpu-gate.sh x'", 2),
+            "gate-self": rec("gate-self", "BLOOMERY_MODEL=selfprof ./tools/box.sh 'bash tools/gpu-gate.sh x'", 3),
+            "gate-host": rec("gate-host", "BLOOMERY_MODEL=filefam ./tools/box.sh 'bash tools/gate.sh x'", 4),
+            "gate-wide": rec("gate-wide", "BLOOMERY_MODEL=nopefam ./tools/box.sh 'bash tools/gpu-gate.sh x'", 5),
+            "gate-plain": rec("gate-plain", "./tools/box.sh 'bash tools/gpu-gate.sh x'", 6),
+        }
+        got = dict(mac_gguf_cuda(rs, tmp))
+        expect(set(got) == {"gate-file", "gate-self"}, f"mac: the GGUF CUDA gates are gate-file and gate-self: {sorted(got)}")
+        expect("gate-fold" not in got, f"mac: a checkpoint-folder fixture is not deferred: {sorted(got)}")
+        expect("gate-host" not in got and "gate-wide" not in got, f"mac: a host gate and an unknown profile stay: {sorted(got)}")
+        expect("gate-plain" not in got, f"mac: the default profile's self row with no .gguf default stays: {sorted(got)}")
+        expect(mac_crate_file("crates/hf/src/vocab.rs") and mac_crate_file("crates/model-hf/src/lib.rs")
+               and not mac_crate_file("crates/gpu/src/lib.rs") and not mac_crate_file("justfile"),
+               "mac: the crate table is hf, model-hf and the other named crates, not crates/gpu")
+        kind, why = gate_fixture_kind(rs, "gate-fold", fixture_kind_table(tmp)[0], fixture_kind_table(tmp)[1], tmp)
+        expect(kind == "folder" and "folddir" in why, f"mac: foldfam is a folder fixture: {kind} {why}")
+        bare = os.path.join(tmp, "empty")
+        os.makedirs(os.path.join(bare, "tools/ref"))
+        open(os.path.join(bare, FIXTURE_DIRS), "w", encoding="utf-8").close()
+        open(os.path.join(bare, REF_PATHS), "w", encoding="utf-8").close()
+        expect(fixture_kind_table(bare) is None and mac_gguf_cuda(rs, bare) == [],
+               "mac: a fixture table with no row defers nothing")
+
+
 def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
     """The derivation (Reach) on a synthetic workspace, one file per rule it decides, and the table's check of it on
     the real tree: a draft row that leaves out a gate reaching its files through another lib, and the exceptions."""
+    mac_landing_self_test(expect)
     for source, want in (
         ("#[derive(Clone, Debug, PartialEq)] struct S;", (False, False)),
         ('// #[ctor::ctor]\nconst S: &str = "#[ctor::ctor]";', (False, False)),
@@ -13477,8 +13772,8 @@ def predicted_wall(names: list[str], fixture: dict[str, list[tuple[str, int]]],
 
 def cmd_release_list(args: argparse.Namespace) -> int:
     """The release batch's list: every S0 gate (a common or a tooling gate the fixture tier runs), every gate of
-    a representative family, the class-staged affected(BASE) and the rotation's due gates. One recipe per line,
-    sorted, no duplicate; the counts per part on stderr."""
+    a representative family, the class-staged affected(BASE), the rotation's due gates and every CUDA gate on a
+    GGUF input. One recipe per line, sorted, no duplicate; the counts per part on stderr."""
     changed, a_rev, b_rev, _ = changed_files(args.base)
     tmp = tempfile.mkdtemp(prefix="recipes-release-")
     try:
@@ -13492,9 +13787,10 @@ def cmd_release_list(args: argparse.Namespace) -> int:
                 if row.family and tables.families[row.family].rep == "R"]
         affected = list(class_picks(changed, a, b, tables).kept)
         due = rotation_due(b.tree.root)
+        mac = [n for n, _why in mac_gguf_cuda(b.recipes, b.tree.root)]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    names, counts = release_union({"S0": s0, "R families": reps, "affected": affected, "rotation due": due})
+    names, counts = release_union({"S0": s0, "R families": reps, "affected": affected, "rotation due": due, "mac GGUF": mac})
     for n in names:
         print(n)
     print("release-list: " + ", ".join(f"{k} {v}" for k, v in counts.items()) + f", {len(names)} recipe(s) in all", file=sys.stderr)
@@ -13723,9 +14019,12 @@ def main(argv: list[str]) -> int:
     gp.add_argument("--list", action="store_true", help="name the recipes in each gap")
     rh = sub.add_parser("reach", help="the gate-* recipes whose targets can run code of each FILE through a dependency (the derivation "
                         f"{GATE_PATHS}'s rows are held to), each with one chain")
-    rh.add_argument("files", nargs="+")
+    rh.add_argument("files", nargs="*")
     rh.add_argument("--brief", action="store_true", help="the gates' names without their chains")
     rh.add_argument("--row", action="store_true", help="last, a `derive` row for the files as the table's first two columns")
+    rh.add_argument("--mac-landing", action="store_true",
+                    help="print the landing list for a change under the mac crates: CUDA gates on a GGUF input are deferred, each with its reason")
+    rh.add_argument("--batch", help="with --mac-landing: a file of LABEL<TAB>FILE... lines, one set per line, one tree for all of them")
     k = sub.add_parser("key", help="each ITEM's ledger key: key<TAB>item<TAB>status<TAB>detail")
     k.add_argument("items", nargs="+", metavar="ITEM", help="NAME[@K=V,…][:ARGS], as tools/gate-batch.sh runs it (its lane's card in the env)")
     k.add_argument("--manifest", help="the box manifest (box-manifest's output)")
