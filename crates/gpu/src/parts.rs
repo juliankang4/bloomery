@@ -1174,7 +1174,9 @@ mod tests {
 
     /// A placed source plans a card's parts once for the plans that hold the same tensors on it
     /// at one room, as a context search asks of plans at other contexts, and again at another
-    /// room. Mutant: the last answer never read, so the second ask plans the parts again.
+    /// room or for a plan whose card tensors differ. Mutants: the last answer never read, so the
+    /// second ask plans the parts again; `OnCard` left out of the key, so the larger tensor
+    /// reuses the smaller one's answer.
     #[test]
     fn a_placed_source_plans_a_cards_parts_once_a_room() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1215,15 +1217,15 @@ mod tests {
                 Err(std::io::Error::other("no read"))
             }
         }
-        let model = ModelTensors {
+        let model_of = |rows: u64| ModelTensors {
             tensors: vec![ModelTensor {
                 name: "output.weight".into(),
                 shard: 0,
                 layer: None,
                 role: Role::Head,
                 ty: GgmlType::Q8_0,
-                dims: vec![256, 16],
-                file_bytes: 4352,
+                dims: vec![256, rows],
+                file_bytes: 272 * rows,
                 gathered_rows: None,
             }],
             layers: 1,
@@ -1231,6 +1233,8 @@ mod tests {
             experts_used: 2,
             bf16_words: |_| false,
         };
+        let model = model_of(16);
+        let larger = model_of(32);
         let machine = workstation::plan_a(1);
         let plan = |ctx| plan_with(&model, &machine, ctx, &NoKv, None).expect("a plan");
         let load = PlacedSource {
@@ -1244,5 +1248,9 @@ mod tests {
         assert_eq!(load.source.0.load(Ordering::Relaxed), 1);
         load.host_bytes(&plan(4096), 0, 1 << 30).unwrap();
         assert_eq!(load.source.0.load(Ordering::Relaxed), 2);
+        // A plan that holds other bytes of the tensor on the card is planned again at that room.
+        let other = plan_with(&larger, &machine, 4096, &NoKv, None).expect("a plan");
+        load.host_bytes(&other, 0, 1 << 30).unwrap();
+        assert_eq!(load.source.0.load(Ordering::Relaxed), 3);
     }
 }
