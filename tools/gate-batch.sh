@@ -392,11 +392,15 @@
 # entries once; an old green cannot authorize a narrower new key.
 #   Keys are computed before the lease check. An item whose key is in the ledger does not run: run.log
 # gets `<stem> rc=skip green-at=<commit> <date> lane=<L>`. Every other item runs as without --ledger;
-# one whose final rc is 0 is recorded after its key is computed again (against the same pre-batch box
-# manifest) and found unchanged, so a tree-side input that moved while the batch ran is never recorded
-# as green. Item lines gain `ledger=<state>`: recorded, changed (an input moved during the batch), red, yield (a --round-ledger
-# item that yielded to another batch's GPU hold — nothing ran, nothing recorded),
-# never, unkeyed (no key before the batch, or a recheck that failed — named on stderr), append-failed. The DONE line gains `skipped=<n>`; the exit code counts only the items
+# one whose final rc is 0 is queued for its phase's recheck: one `recipes.py key` call over that phase,
+# against the same pre-batch box manifest. Lanes A and B share a call, started when they end and run
+# while the pack runs; the pack's call runs when the pack ends. Both finish before the DONE line. The
+# item line says `ledger=pending` until the call returns, then a `ledger <stem> <state>` line names the
+# verdict. A key that moved is `changed` and is not recorded; a recheck that failed is `unkeyed`, named
+# on stderr, and is not recorded. States known without a recheck stay on the item line: red, yield (a
+# --round-ledger item that yielded to another batch's GPU hold — nothing ran, nothing recorded), never,
+# unkeyed (no key before the batch). `append-failed` is the recheck's line when the append itself
+# failed. The DONE line gains `skipped=<n>`; the exit code counts only the items
 # that ran. A record names the tree's commit (`<sha12>`, `-dirty` appended for uncommitted files, `unknown` outside a repository,
 # tools/nightly/units.sh's tree_commit); a tree whose `git status` fails ends the batch rc 70 by name before any item runs.
 # --rerun runs every item and still records. --dry-run --ledger prints each item's status and
@@ -677,7 +681,7 @@ disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line,
 # builds on never split across parts), and runs the fixture, the helpers and the locals above and between them itself.
 # `--self-test` starts every part and sums their counts; `--self-test --part K` runs one (K, or `all`: the parts one
 # after another in this process, the serial form). The summary names the three slowest cases.
-SELFTEST_PARTS=18
+SELFTEST_PARTS=19
 self_test() {
   local self t h n=0 bad=0 out rc real_classes part=${1:-all} case_t0=$SECONDS
   gb_part() {
@@ -1205,6 +1209,13 @@ fi
 if [ -n "${BLOOMERY_REMOTE+x}" ]; then printf 'set\t%s\n' "$BLOOMERY_REMOTE" >> "$st/remote.log"
 else printf 'unset\n' >> "$st/remote.log"; fi
 echo "S $*" >> "$st/seq.log"
+# FAKE_AWAIT_RECHECK=1 (the item's env): wait until a phase recheck holds recheck-open, then name this call.
+# A call that does not ask does not wait; one that sees the file overlapped that recheck.
+if [ "${FAKE_AWAIT_RECHECK:-0}" = 1 ]; then
+  k=0
+  while [ ! -e "$st/recheck-open" ] && [ "$k" -lt 50 ]; do sleep 0.1; k=$((k + 1)); done
+fi
+if [ -e "$st/recheck-open" ]; then echo "$*" >> "$st/recheck-seen.log"; fi
 # What an item sees of the batch's hold when it starts: its owner from the env, and the hold file as it stands.
 printf '%s\t%s\t%s\n' "${BLOOMERY_BATCH_OWNER:-none}" "$(head -1 "$st/batch.gpuhold" 2> /dev/null || echo nohold)" "$*" >> "$st/seen.log"
 n=0
@@ -1303,14 +1314,42 @@ if os.environ.get("FAKE_GREEN_FILE"):
     with open(os.environ["FAKE_GREEN_FILE"]) as fh:
         green = {ln.strip() for ln in fh if ln.strip()}
 # FAKE_KEY_SALT: another key for the same item (another model file, say); FAKE_KEY_ERROR=1: the item is unkeyed.
+# A recheck is a key call without --ledger. FAKE_MOVE_ITEM: that item's recheck key differs from its plan key.
+# FAKE_RECHECK_ERROR_ITEM: that item's recheck line is an error. FAKE_RECHECK_RC: the recheck process fails.
+# FAKE_RECHECK_SLEEP: the recheck holds fake-state/recheck-open for that many seconds (the pack's box call can see it).
 salt = os.environ.get("FAKE_KEY_SALT", "")
+kind = "plan" if "--ledger" in a else "recheck"
+d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fake-state")
+os.makedirs(d, exist_ok=True)
+with open(os.path.join(d, "keyinv.log"), "a") as fh:
+    fh.write(kind + "\t" + str(len(items)) + "\t" + " ".join(items) + "\n")
+if kind == "recheck" and os.environ.get("FAKE_RECHECK_RC"):
+    sys.stderr.write("stub recheck failed\n")
+    sys.exit(int(os.environ["FAKE_RECHECK_RC"]))
+if kind == "recheck" and os.environ.get("FAKE_RECHECK_SLEEP"):
+    import time
+    marker = os.path.join(d, "recheck-open")
+    open(marker, "w").close()
+    try:
+        time.sleep(float(os.environ["FAKE_RECHECK_SLEEP"]))
+    finally:
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+move = os.environ.get("FAKE_MOVE_ITEM", "")
+bad = os.environ.get("FAKE_RECHECK_ERROR_ITEM", "")
 for k, it in enumerate(items):
     if os.environ.get("FAKE_KEY_ERROR") == "1":
         print(f"-\t{it}\terror\tstub key error")
+    elif kind == "recheck" and bad and bad in it:
+        sys.stderr.write(f"stub recheck error for {it}\n")
+        print(f"-\t{it}\terror\tstub recheck error")
     elif os.environ.get("FAKE_SKIP") == "1" or f"stub-{it}" in green:
         print(f"stub-{it}\t{it}\tskip\tgreen-at=abc1234 2026-10-08T00:00:00+0900 tree=/x")
     else:
-        print(f"stub-{it}{salt}\t{it}\trun\tstub")
+        extra = "-moved" if kind == "recheck" and move and move in it else ""
+        print(f"stub-{it}{salt}{extra}\t{it}\trun\tstub")
     if pd:
         import os
         os.makedirs(pd, exist_ok=True)
@@ -2218,14 +2257,16 @@ HK
   want_row 'pack: the box-pick item ran' "$t/fake-state/box.log" '$2 ~ /gen_sa/'
   # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
   want_no_row 'pack: the box-pick item took no card env from the pack' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=/ && $2 ~ /gen_sa/'
-  want 'pack: the box-pick item'"'"'s line ends ledger=recorded' "$t/target/c-pk-pick/run.log" '^sr-a6000 rc=0 [0-9]+s try=1 lane=X tier=real ledger=recorded( |$)'
+  want 'pack: the box-pick item'"'"'s line stays pending' "$t/target/c-pk-pick/run.log" '^sr-a6000 rc=0 [0-9]+s try=1 lane=X tier=real ledger=pending( |$)'
+  want 'pack: the box-pick item is recorded when the phase recheck returns' "$t/target/c-pk-pick/run.log" '^ledger sr-a6000 recorded$'
   # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
   mutant_of pk-noguard 's|^      case " \$cards " in \*" \$card "\*) switch_candidate "\$i" "\$card" ;; esac$|      case $card in 3090 \| a6000) switch_candidate "$i" "$card" ;; esac # MUTANT pk-noguard|' '# MUTANT pk-noguard$'
   rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=pk-noguard steal_case pk-pickm "sr-a6000@FAKE_SLEEP=2	B	a6000	2	$d" -- sr-a6000@FAKE_SLEEP=2)
   printf '%s' "$rc" > "$t/rc-pk-pickm"
   # shellcheck disable=SC2016 # a sed or awk program: its dollars are its own
   want_row 'pack mutant: without the guard the box-pick item takes a card env' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=a6000/ && $2 ~ /gen_sa/'
-  want 'pack mutant: … and its line ends ledger=changed' "$t/target/c-pk-pickm/run.log" '^sr-a6000 rc=0 [0-9]+s try=1 lane=X tier=real ledger=changed( |$)'
+  want 'pack mutant: … and its line stays pending' "$t/target/c-pk-pickm/run.log" '^sr-a6000 rc=0 [0-9]+s try=1 lane=X tier=real ledger=pending( |$)'
+  want 'pack mutant: … and the phase recheck reads changed' "$t/target/c-pk-pickm/run.log" '^ledger sr-a6000 changed$'
   # (5) the predicted line's laneX= is the pack's own wall (two fits beside each other, a pair over
   # the budget serial); the dry run names each item's simulated take.
   printf '%s\n' "pk-a	A	3090	5	$d" "pk-b	B	a6000	5	$d" > "$t/times-pkpred.tsv"
@@ -2404,7 +2445,8 @@ HK
   printf '%s' "$rc" > "$t/rc-tier-fx"
   rc_ok 'tier run: a fixture batch ends green' tier-fx 1
   want_row 'tier run: its box call carries BLOOMERY_TIER=fixture' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_TIER=fixture/ && $2 ~ /gen_b$/'
-  want 'tier run: its item line counts the deferred clauses' "$t/target/c-tier-fx/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=fixture deferred=2 ledger=recorded item=steal-bal@FAKE_DEFER=2$'
+  want 'tier run: its item line counts the deferred clauses' "$t/target/c-tier-fx/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=fixture deferred=2 ledger=pending item=steal-bal@FAKE_DEFER=2$'
+  want 'tier run: the phase recheck records it' "$t/target/c-tier-fx/run.log" '^ledger steal-bal recorded$'
   want 'tier run: the DONE line totals them' "$t/target/c-tier-fx/run.log" '^DONE total=1 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2$'
   want 'tier run: the times row is an entry of its own' "$t/times-tier-fx.tsv" "$(printf '^steal-bal@FAKE_DEFER=2,BLOOMERY_TIER=fixture\t')"
   n=$((n + 1))
@@ -2422,7 +2464,8 @@ HK
   rc_ok 'tier run: the same item in the real tier ends green' tier-re 1
   want_no_row 'tier run: … and none of its calls names the tier' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_TIER/'
   want_not 'tier run: … and the DONE line counts no deferrals' "$t/target/c-tier-re/run.log" '^DONE .* deferred='
-  want 'tier run: … though its line does' "$t/target/c-tier-re/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=real deferred=2 ledger=recorded '
+  want 'tier run: … though its line does' "$t/target/c-tier-re/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=real deferred=2 ledger=pending '
+  want 'tier run: … and the phase recheck records it' "$t/target/c-tier-re/run.log" '^ledger steal-bal recorded$'
   fi
   if gb_part 12; then
   # real-only (the header's paragraph): a no-op in the real tier, a deferral in the fixture tier, never a lane, a key or a call.
@@ -3472,7 +3515,8 @@ EOS
   want 'yield: the DONE line counts it in yielded=' "$t/target/c-yield-hold/run.log" '^DONE total=2 red=0 tier=real skipped=0 yielded=1 wall=[0-9]+s'
   want_row 'yield: one call, then no retry — it never starts in a gap the lead leaves' "$t/fake-state/box.log" \
     '$1 ~ /FAKE_HOLD75=leadbatch/ { c++ } END { if (c == 1) print c }'
-  want '  … and the lane moved on to its next item' "$t/target/c-yield-hold/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=real ledger=recorded( |$)'
+  want '  … and the lane moved on to its next item' "$t/target/c-yield-hold/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=real ledger=pending( |$)'
+  want '  … and the phase recheck records it' "$t/target/c-yield-hold/run.log" '^ledger steal-bal recorded$'
   want_not 'yield: no rc 75 line for it' "$t/target/c-yield-hold/run.log" ' rc=75 '
   want_not 'yield: and no ledger record' "$t/rounds-yield-hold.tsv" 'plain-any'
   want_no_row 'yield: no times row for a yielded item' "$t/times-yield-hold.tsv" '$1 ~ /^plain-any@FAKE_HOLD75/' # the seeded plain-any row is the plan's input
@@ -3983,6 +4027,69 @@ EOS
   if grep -Eq '^ *[0-9]+ ' "$t/leak-term-m.res" && [ "$(tail -n 1 "$t/leak-term-m.res")" = 'probe done' ]; then pass 'part exit mutant: without the end of the batches and the wait a part sent TERM leaves its batch running'
   else fail 'part exit mutant: without the end of the batches and the wait a part sent TERM leaves its batch running' "$(cat "$t/leak-term-m.res")"; fi
   fi
+  fi
+  if gb_part 19; then
+  # One recheck process per phase (the lanes, then the pack), not one per green item. The stub counts
+  # each `recipes.py key` call in keyinv.log (`recheck<TAB>N<TAB>items`); FAKE_RECHECK_SLEEP holds
+  # recheck-open so the pack's box call can see the lanes' recheck still running. A red item is not in
+  # either call. The same stub moves one item's recheck key and fails another's: recorded, changed,
+  # unkeyed, and the DONE line's red= and skipped= stay what a per-item recheck would have counted.
+  rc=$(FAKE_RECHECK_SLEEP=1 steal_case bulk-n \
+    "steal-fix	A	3090	2	$d" "plain-any	B	a6000	2	$d" "host@FAKE_RC=1	B	none	2	$d" "sr-a6000	B	a6000	2	$d" \
+    -- steal-fix plain-any 'host@FAKE_RC=1' 'sr-a6000@FAKE_SLEEP=1,FAKE_AWAIT_RECHECK=1')
+  printf '%s' "$rc" > "$t/rc-bulk-n"
+  if [ "$(cat "$t/rc-bulk-n")" = 1 ]; then pass 'bulk: a red item ends the batch rc 1'
+  else fail 'bulk: a red item ends the batch rc 1' "rc=$(cat "$t/rc-bulk-n")"; fi
+  want_count 'bulk: one recheck process for the lanes and one for the pack, not one per item' \
+    "$t/fake-state/keyinv.log" '^recheck	' 2
+  want 'bulk: the lane phase is one call over both green lane items' "$t/fake-state/keyinv.log" \
+    '^recheck	2	.*steal-fix.*plain-any'
+  if grep '^recheck	' "$t/fake-state/keyinv.log" | grep -q 'FAKE_RC=1'; then
+    fail 'bulk: the red lane item is in no recheck' "$(grep '^recheck	' "$t/fake-state/keyinv.log")"
+  else pass 'bulk: the red lane item is in no recheck'; fi
+  want 'bulk: the pack phase is its own call' "$t/fake-state/keyinv.log" '^recheck	1	.*sr-a6000'
+  want 'bulk: the lanes'"'"' recheck was still open when the pack item ran' "$t/fake-state/recheck-seen.log" 'gen_sa'
+  want 'bulk: a green lane item'"'"'s line stays pending' "$t/target/c-bulk-n/run.log" \
+    '^steal-fix rc=0 [0-9]+s try=1 lane=A tier=real ledger=pending$'
+  want 'bulk: the red item'"'"'s line is red at once' "$t/target/c-bulk-n/run.log" \
+    '^host rc=1 [0-9]+s try=1 lane=[AB] tier=real ledger=red item=host@FAKE_RC=1$'
+  want 'bulk: the lane item is recorded when the phase recheck returns' "$t/target/c-bulk-n/run.log" '^ledger steal-fix recorded$'
+  want 'bulk: the other lane item is recorded' "$t/target/c-bulk-n/run.log" '^ledger plain-any recorded$'
+  want 'bulk: the pack item is recorded' "$t/target/c-bulk-n/run.log" '^ledger sr-a6000 recorded$'
+  want_count 'bulk: the ledger holds the three greens and not the red' "$t/rounds-bulk-n.tsv" $'\t(steal-fix|plain-any|sr-a6000)\t' 3
+  want_not 'bulk: the red item is not a ledger row' "$t/rounds-bulk-n.tsv" $'\thost\t'
+  want 'bulk: the DONE line counts the red and no skip, as a per-item recheck would' "$t/target/c-bulk-n/run.log" \
+    '^DONE total=4 red=1 tier=real skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s laneX=[0-9]+s$'
+  rc=$(FAKE_MOVE_ITEM=plain-any steal_case bulk-chg \
+    "steal-fix	A	3090	2	$d" "plain-any	B	a6000	2	$d" "sr-a6000	B	a6000	2	$d" \
+    -- steal-fix plain-any sr-a6000)
+  printf '%s' "$rc" > "$t/rc-bulk-chg"
+  rc_ok 'bulk: a key that moved mid-batch still ends the batch green' bulk-chg 3
+  want 'bulk: the moved item reads changed' "$t/target/c-bulk-chg/run.log" '^ledger plain-any changed$'
+  want 'bulk: an unmoved lane item reads recorded' "$t/target/c-bulk-chg/run.log" '^ledger steal-fix recorded$'
+  want 'bulk: an unmoved pack item reads recorded' "$t/target/c-bulk-chg/run.log" '^ledger sr-a6000 recorded$'
+  want_not 'bulk: a changed item is not a ledger row' "$t/rounds-bulk-chg.tsv" $'\tplain-any\t'
+  want_count 'bulk: the two unmoved items are the ledger rows' "$t/rounds-bulk-chg.tsv" $'\t(steal-fix|sr-a6000)\t' 2
+  want 'bulk: the changed batch'"'"'s DONE line counts no red' "$t/target/c-bulk-chg/run.log" \
+    '^DONE total=3 red=0 tier=real skipped=0 wall=[0-9]+s '
+  rc=$(FAKE_RECHECK_ERROR_ITEM=steal-fix steal_case bulk-unk \
+    "steal-fix	A	3090	2	$d" "plain-any	B	a6000	2	$d" "sr-a6000	B	a6000	2	$d" \
+    -- steal-fix plain-any sr-a6000)
+  printf '%s' "$rc" > "$t/rc-bulk-unk"
+  rc_ok 'bulk: a recheck that fails one item still ends the batch green' bulk-unk 3
+  want 'bulk: the failed recheck is named' "$t/out-bulk-unk.log" 'the key recheck of steal-fix.*failed'
+  want 'bulk: the failed item reads unkeyed' "$t/target/c-bulk-unk/run.log" '^ledger steal-fix unkeyed$'
+  want 'bulk: a sibling of the failed item is recorded' "$t/target/c-bulk-unk/run.log" '^ledger plain-any recorded$'
+  want_not 'bulk: an unkeyed item is not a ledger row' "$t/rounds-bulk-unk.tsv" $'\tsteal-fix\t'
+  want 'bulk: the unkeyed batch'"'"'s DONE line counts no red' "$t/target/c-bulk-unk/run.log" \
+    '^DONE total=3 red=0 tier=real skipped=0 wall=[0-9]+s '
+  rc=$(FAKE_RECHECK_RC=1 steal_case bulk-rc \
+    "steal-fix	A	3090	2	$d" "plain-any	B	a6000	2	$d" -- steal-fix plain-any)
+  printf '%s' "$rc" > "$t/rc-bulk-rc"
+  rc_ok 'bulk: a recheck process that fails still ends the batch green' bulk-rc 2
+  want_count 'bulk: both items of a failed recheck read unkeyed' "$t/target/c-bulk-rc/run.log" '^ledger .* unkeyed$' 2
+  want 'bulk: the process failure is named' "$t/out-bulk-rc.log" 'the key recheck of steal-fix.*failed \(rc=1\)'
+  want_absent 'bulk: a failed recheck records nothing' "$t/rounds-bulk-rc.tsv"
   fi
   # One row per case (seconds, then the name). A miss is a case the summary cannot name.
   [ -f "$t/case-times.tsv" ] || : > "$t/case-times.tsv"
@@ -6025,30 +6132,120 @@ ledger_plan() { # the box manifest, then every candidate's key and status (C_*),
   fi
 }
 
-ledger_record() { # $1 = plan index, $2 = final rc: record a green item whose key did not move; print its state
-  local i=$1 k2 rec
+ledger_emit() { # $1 = stem, $2 = state: the phase recheck's verdict, after the item line's ledger=pending
+  local line="ledger $1 $2"
+  printf '%s\n' "$line" >> "$RUNLOG"
+  printf '%s\n' "$line"
+}
+ledger_mark() { # $1 = plan index, $2 = final rc, $3 = lane: a state known now, or pending for the phase recheck
+  local i=$1 phase=ab dir tmp
   case "${P_LST[$i]}" in
-    never) echo never; return ;;
-    error) echo unkeyed; return ;;
+    never) printf never; return ;;
+    error) printf unkeyed; return ;;
   esac
-  if [ "$2" != 0 ]; then echo red; return; fi
-  # The recheck's failure is named, never read as a moved input: its stderr and a keyless line
-  # (`-<TAB>item<TAB>error<TAB>why`) go to the batch's stderr, and the state is `unkeyed`.
-  local out err=$LWORK/recheck-$i.err rc=0
-  out=$(python3 "$ROOT/tools/recipes.py" key --manifest "$LWORK/box-manifest.txt" --box-env "${BLOOMERY_BOX_ENV:-}" "$(item_of "$i")" 2> "$err") || rc=$?
-  k2=${out%%$'\t'*}
-  if [ "$rc" != 0 ] || [ -z "$k2" ] || [ "$k2" = - ]; then
-    echo "gate-batch: ledger: the key recheck of $(item_of "$i") failed (rc=$rc): $(tail -1 "$err")${out:+ $out}" >&2
-    echo unkeyed
-    return
-  fi
-  if [ "$k2" != "${P_KEY[$i]}" ]; then echo changed; return; fi
-  rec=$(printf '%s\t%s\t%s\t%s\t%s\t%s' "${P_KEY[$i]}" "${P_NAME[$i]}" "$(item_of "$i")" "$COMMIT" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$ROOT")
-  if python3 -c "$PYAPPEND" "$LEDGER_FILE" "$rec" "$LWORK/parts/${P_CI[$i]}.parts" "$LEDGER_PARTS/${P_KEY[$i]}.parts"; then
-    echo recorded
+  if [ "$2" != 0 ]; then printf red; return; fi
+  [ "$3" = X ] && phase=x
+  dir=$LWORK/pending-$phase
+  mkdir -p "$dir"
+  # The lane that ran the item writes the line (a steal's card is that lane's). One write, then a rename,
+  # so a reader never sees a half line. The name is the plan index.
+  tmp=$dir/.$i.$$
+  if printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "${P_STEM[$i]}" "${P_NAME[$i]}" "${P_KEY[$i]}" "${P_CI[$i]}" "$(item_of "$i")" > "$tmp" \
+    && mv "$tmp" "$dir/$i"; then
+    printf pending
   else
-    echo append-failed
+    rm -f "$tmp"
+    echo "gate-batch: ledger: could not queue the recheck of $(item_of "$i")" >&2
+    printf unkeyed
   fi
+}
+# One `recipes.py key` call per phase (ab: lanes A and B, including the chain; x: the pack). The pending
+# directory is renamed away first, so a second call — the end, and a stop — does not record twice.
+# A line is recorded only when its own rechecked key matches. A failure is named, never read as a moved input.
+ledger_recheck_phase() { # $1 = ab | x
+  local phase=$1
+  local src=$LWORK/pending-$phase work=$LWORK/recheck-$phase.pending
+  local base f idx stem name key ci item err out rc n i k2 got why rec line
+  local -a stems=() names=() keys=() cis=() items=() lines=()
+  [ -d "$src" ] || return 0
+  rm -rf "$work"
+  mv "$src" "$work" 2> /dev/null || return 0
+  while IFS= read -r base; do
+    case $base in '' | *[!0-9]*) continue ;; esac
+    f=$work/$base
+    [ -f "$f" ] || continue
+    idx=''; stem=''; name=''; key=''; ci=''; item=''
+    IFS=$'\t' read -r idx stem name key ci item < "$f" || true
+    if [ -z "$stem" ] || [ -z "$name" ] || [ -z "$key" ] || [ -z "$item" ]; then
+      echo "gate-batch: ledger: the pending recheck of index $base is incomplete — not recorded" >&2
+      [ -z "$stem" ] || ledger_emit "$stem" unkeyed
+      continue
+    fi
+    stems+=("$stem"); names+=("$name"); keys+=("$key"); cis+=("$ci"); items+=("$item")
+  done < <(find "$work" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; | sort -n)
+  n=${#items[@]}
+  [ "$n" -gt 0 ] || return 0
+  err=$LWORK/recheck-$phase.err
+  out=''; rc=0
+  out=$(python3 "$ROOT/tools/recipes.py" key --manifest "$LWORK/box-manifest.txt" --box-env "${BLOOMERY_BOX_ENV:-}" "${items[@]}" 2> "$err") || rc=$?
+  if [ "$rc" != 0 ]; then
+    why=$(tail -1 "$err" 2> /dev/null || true)
+    for ((i = 0; i < n; i++)); do
+      echo "gate-batch: ledger: the key recheck of ${items[$i]} failed (rc=$rc): $why" >&2
+      ledger_emit "${stems[$i]}" unkeyed
+    done
+    return 0
+  fi
+  if [ -n "$out" ]; then
+    while IFS= read -r line; do lines+=("$line"); done <<< "$out"
+  fi
+  if [ "${#lines[@]}" -ne "$n" ]; then
+    echo "gate-batch: ledger: the key recheck of phase $phase returned ${#lines[@]} lines for $n items — an item with no line of its own is not recorded" >&2
+  fi
+  why=$(tail -1 "$err" 2> /dev/null || true)
+  for ((i = 0; i < n; i++)); do
+    if [ "$i" -ge "${#lines[@]}" ]; then
+      echo "gate-batch: ledger: the key recheck of ${items[$i]} failed (rc=0): ${why} no key line" >&2
+      ledger_emit "${stems[$i]}" unkeyed
+      continue
+    fi
+    line=${lines[$i]}
+    k2=''; got=''
+    IFS=$'\t' read -r k2 got _ <<< "$line" || true
+    if [ "$got" != "${items[$i]}" ] || [ -z "$k2" ] || [ "$k2" = - ]; then
+      echo "gate-batch: ledger: the key recheck of ${items[$i]} failed (rc=0): ${why}${line:+ $line}" >&2
+      ledger_emit "${stems[$i]}" unkeyed
+      continue
+    fi
+    if [ "$k2" != "${keys[$i]}" ]; then
+      ledger_emit "${stems[$i]}" changed
+      continue
+    fi
+    rec=$(printf '%s\t%s\t%s\t%s\t%s\t%s' "${keys[$i]}" "${names[$i]}" "${items[$i]}" "$COMMIT" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$ROOT")
+    if python3 -c "$PYAPPEND" "$LEDGER_FILE" "$rec" "$LWORK/parts/${cis[$i]}.parts" "$LEDGER_PARTS/${keys[$i]}.parts"; then
+      ledger_emit "${stems[$i]}" recorded
+    else
+      ledger_emit "${stems[$i]}" append-failed
+    fi
+  done
+}
+LEDGER_RECHECK_PID=''
+ledger_recheck_wait() { # the phase call started beside the pack, if one was
+  local p=${LEDGER_RECHECK_PID:-}
+  [ -n "$p" ] || return 0
+  wait "$p" || true
+  LEDGER_RECHECK_PID=''
+}
+ledger_recheck_bg() { # $1 = phase: one call, while the next phase runs
+  [ -d "$LWORK/pending-$1" ] || return 0
+  ledger_recheck_phase "$1" &
+  LEDGER_RECHECK_PID=$!
+}
+ledger_recheck_flush() { # both phases, once: a stop, or the end when no pack overlapped the lanes
+  [ "${LEDGER:-0}" = 1 ] && [ -n "${LWORK:-}" ] || return 0
+  ledger_recheck_wait
+  ledger_recheck_phase ab || true
+  ledger_recheck_phase x || true
 }
 
 if [ -z "$OUT" ]; then
@@ -6159,6 +6356,8 @@ predicted() { # the plan's lane sums, derived from the times file
   else
     how="$how; wall = the longer of A and B, then the pack (laneX=: the cards, the ${PACK_BUDGET} B host budget, m items alone)"
   fi
+  # The recheck is one key call per phase, off these sums. The last phase's call is before DONE.
+  [ "$LEDGER" = 0 ] || how="$how; recheck is off the lane clock (one key call per phase, the last phase's before DONE, not in these sums)"
   echo "gate-batch: predicted $PREDICTED (derived: $how)"
   [ "$SUM_NDEF" = 0 ] || echo "gate-batch: $SUM_NDEF item(s) expected at the ${DEFAULT_S} s default (no row in the times file): $SUM_DEF"
   if [ "$NDT" != 0 ] && [ "$ND_VR" = "$NDT" ]; then
@@ -6320,6 +6519,9 @@ stop() {
     if [ -f "$f" ]; then kill -TERM "$(cat "$f")" 2> /dev/null || true; fi
   done
   reap_boxes
+  # A lane inherits no trap (a background shell resets them). A green item that finished is recorded
+  # here, before canary_done's DONE line — the same items the per-item recheck recorded before the stop.
+  if [ "${BASH_SUBSHELL:-0}" = 0 ]; then ledger_recheck_flush; fi
   if [ -s "$OUT/canary.red" ]; then
     canary_done
     echo "gate-batch: stopped by a red canary item (above); the remote command of an item that was running is cleared by 'just box-gc'; --no-canary runs the batch without the stage" >&2
@@ -6479,7 +6681,7 @@ fi
 # refusal here leaves no run.log, as the start check's does. Every exit from here on — the end, a red batch, die, INT/TERM (stop) —
 # takes it down through the EXIT trap.
 trap stop INT TERM
-trap 'rc=$?; hold_down; output_dir_drop || rc=$?; exit "$rc"' EXIT
+trap 'rc=$?; ledger_recheck_flush; hold_down; output_dir_drop || rc=$?; exit "$rc"' EXIT
 if [ "$HOLD_ON" = 1 ] && [ "$SKIP_N" -lt "$N" ]; then
   hold_up
   hold_beat_loop &
@@ -6675,7 +6877,7 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     # A yielded item records nothing and its rc stays 75 below, so no times row either: it ran nothing.
     [ "$LEDGER" = 0 ] || line="$line ledger=yield"
   else
-    [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_record "$i" "$rc")"
+    [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_mark "$i" "$rc" "$lane")"
   fi
   # The final try's seconds, green or red; a last try still at rc 75 got no lock and ran nothing. A cold
   # build's row goes to COLD_FILE, which no plan reads.
@@ -7203,7 +7405,11 @@ for ((i = 0; i < N; i++)); do
   echo "${P_STEM[$i]} rc=unclaimed lane=${P_LANE[$i]} tier=$TIER" >> "$RUNLOG"
   echo "gate-batch: ${P_STEM[$i]} (lane ${P_LANE[$i]}) was taken by no lane, and every lane has ended" >&2
 done
+# The lanes' recheck overlaps the pack. With no pack it runs here, still one call, before DONE.
+# The pack's recheck is the flush below, after the pack returns.
+if [ "$LEDGER" = 1 ] && has_lane X; then ledger_recheck_bg ab; fi
 if has_lane X; then run_pack; fi
+ledger_recheck_flush
 trap - INT TERM
 start_hook_say
 
