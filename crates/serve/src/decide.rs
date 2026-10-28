@@ -719,7 +719,8 @@ impl DecideServer {
                 answer(&conn, req, w)
             });
         });
-        crate::screen::draw();
+        // The decision server has no slots and no counters for a live view.
+        crate::screen::draw(false);
         // `shared` holds a sender, so the channel cannot close while we wait.
         // An orderly stop never returns: it ends the process once the answers
         // in flight are written.

@@ -1426,7 +1426,7 @@ impl Levers {
     }
 
     /// `BLOOMERY_SCREEN`: a serving seat draws its start screen on a
-    /// terminal.
+    /// terminal, and `d` opens its live view.
     #[must_use]
     pub fn screen(&self) -> bool {
         self.flag(SCREEN)
