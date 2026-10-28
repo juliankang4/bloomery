@@ -1208,7 +1208,7 @@ fn linear<'a>(
     source: (&str, &Placed),
 ) -> Result<Nvfp4, Error> {
     let mut out = Nvfp4::default();
-    let [rows, k] = append(&get, source, &mut out)?;
+    let [rows, k] = append(&get, source, &mut out, 1)?;
     out.dims = vec![k as u64, rows as u64];
     Ok(out)
 }
@@ -1231,9 +1231,9 @@ fn experts<'a>(
         });
     };
     let mut out = Nvfp4::default();
-    let shape = append(&get, first, &mut out)?;
-    for &source in &sources[1..] {
-        let have = append(&get, source, &mut out)?;
+    let shape = append(&get, first, &mut out, sources.len())?;
+    for (i, &source) in sources.iter().enumerate().skip(1) {
+        let have = append(&get, source, &mut out, sources.len() - i)?;
         if have != shape {
             return Err(Error::Shape {
                 name: source.0.to_string(),
@@ -1250,11 +1250,14 @@ fn experts<'a>(
 }
 
 /// Reads the weight of `source` and the two scales its place names, and appends its blocks and
-/// tensor scale to `out`. Returns `[rows, k]`.
+/// tensor scale to `out`, which holds room for the blocks of `left` experts of its shape (it and
+/// the ones after it) once it returns: a stack's blocks are allocated once, at their length.
+/// Returns `[rows, k]`.
 fn append<'a>(
     get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     (weight, placed): (&str, &Placed),
     out: &mut Nvfp4,
+    left: usize,
 ) -> Result<[usize; 2], Error> {
     let scales = scales_of(weight, placed)?;
     let typed = |name: &str, want: Dtype| -> Result<(String, Raw<'a>), Error> {
@@ -1308,9 +1311,10 @@ fn append<'a>(
     let bytes = rows
         .checked_mul(k / 64)
         .and_then(|n| n.checked_mul(36))
+        .and_then(|n| n.checked_mul(left))
         .ok_or_else(|| shape(&wname, "NVFP4 byte count overflows usize".into()))?;
     out.blocks
-        .try_reserve(bytes)
+        .try_reserve_exact(bytes)
         .map_err(|e| shape(&wname, format!("cannot reserve {bytes} NVFP4 bytes: {e}")))?;
     os::advise_huge_within(out.blocks.spare_capacity_mut());
     // Each scale byte's half value, worked out once; a byte that is no scale is refused below.
@@ -1671,10 +1675,14 @@ mod tests {
 
     /// A routed stack of two real experts with different tensor scales: the blocks are each
     /// expert's in expert order, `.scale` holds each expert's own scale, and every row decodes
-    /// to the reference under its expert's scale.
+    /// to the reference under its expert's scale. A stack's blocks are allocated at their length.
+    ///
+    /// FAIL-first: reserving each expert's blocks as it is appended grows three experts' to four.
     #[test]
     fn a_routed_stack_keeps_one_scale_an_expert() {
         let st = fixture();
+        let three = stack(|n| st.raw(n), &[STEMS[0], STEMS[1], STEMS[0]]).unwrap();
+        assert_eq!(three.blocks.capacity(), three.blocks.len());
         let t = stack(|n| st.raw(n), &STEMS).unwrap();
         assert_eq!(t.dims, [2560, 4, 2]);
         let per = t.blocks.len() / 2;
