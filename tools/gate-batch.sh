@@ -953,7 +953,7 @@ cn-ok:
     ./tools/box.sh 'bash tools/gate.sh -p co'
 JF
   # The pack's resource table: a row per solo/solo-real recipe of the fixture justfile above (a
-  # recipe the justfile does not hold — sr-arm arrives in a case below — is ignored), and the pack
+  # recipe the justfile does not hold — sr-arm and sr-pat arrive in cases below — is ignored), and the pack
   # case rows the cases below read (BLOOMERY_PACK_BUDGET shrinks the budget per case).
   cat > "$t/tools/gate-batch-resources.tsv" << 'RT'
 v41-solo	-	1000
@@ -970,6 +970,7 @@ fo-solo	-	1000
 ne-solo	-	1000
 sr-a6000	-	1000
 sr-arm	-	1000
+sr-pat	-	1000
 gate-gpu-glm5next-e2e	-	1000
 gate-gpu-ds41-residency-a	-	1000
 pk-a	-	100
@@ -2420,6 +2421,12 @@ HK
   cp "$t/justfile.good" "$t/justfile"
   printf '%s\n' '' "[group('solo-real')]" 'sr-3090:' "    ./tools/box.sh 'bash tools/gpu-gate.sh other'" >> "$t/justfile"
   check 'tier: solo-real with a 3090-only gpu-gate.sh call: a named error' 65 "recipe sr-3090: \[group\('solo-real'\)\] with its tools/gpu-gate.sh calls are not all .*(forms: 3090)" "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '#!/usr/bin/env bash' 'bash tools/gpu-gate.sh other' > "$t/tools/sr-bare.sh"
+  printf '%s\n' '#!/usr/bin/env bash' 'case "$*" in *"tools/sr-bare.sh"* | *"sr-bare.sh"*) : ;; esac' \
+    'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh other' > "$t/tools/sr-pat.sh"
+  printf '%s\n' '' "[group('solo-real')]" 'sr-pat:' "    ./tools/box.sh 'bash tools/sr-pat.sh'" >> "$t/justfile"
+  check 'tier: solo-real whose script names a 3090-only one in a case pattern alone: placed' 0 '^sr-pat	X	solo' "${gb[@]}" --classes
   cp "$t/justfile.good" "$t/justfile"
   printf '%s\n' '' "[group('solo-real')]" 'sr-none:' "    ./tools/box.sh 'bash tools/gate.sh -p y'" >> "$t/justfile"
   check 'tier: solo-real with no gpu-gate.sh call: a named error' 65 "recipe sr-none: \[group\('solo-real'\)\] with its tools/gpu-gate.sh calls are not all .*(forms: none)" "${gb[@]}" --classes
@@ -4455,7 +4462,8 @@ def takes_lease(path):
 # the timing lease (takes_lease), and does it call tools/gpu-gate.sh — in command position, with the
 # call's card form: `BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}` (balanced), none (the 3090), or
 # any other BLOOMERY_GATE_CARD on the call (a form this runner does not read: refused). A mention in
-# a message (echo, printf, die, fail, say) is not a script the file runs.
+# a message (echo, printf, die, fail, say) is not a script the file runs, nor is a quoted string a glob
+# star touches (a `case` pattern: box.sh's `*"release/build.sh"*` matches a command, it runs none).
 # Both gate runners are leaves: the call's mode owns whether gate.sh reaches the GPU runner.
 # Following gate.sh's conditional body would falsely give its CPU callers a GPU lock. This file's
 # patterns and messages are not followed either (check-recipes runs its --classes). A stub-test
@@ -4463,6 +4471,7 @@ def takes_lease(path):
 # runs the lease and runner code against a lock of its own, and its fixtures hold both on purpose.
 WALK_DEPTH = 6
 BARE = re.compile(r"([A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:sh|bash))\b")
+GLOB_QUOTE = re.compile(r"""(?:^|(?<=[\s|(]))(?:\*(["'])[^"'\n]*\1\*?|(["'])[^"'\n]*\2\*)""")
 GATE_CALL = re.compile(CMD + r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:bash\s+|exec\s+)?[^\s;&|#'\"]*" + GATE_ENTRY, re.M)
 BATCH = "tools/gate-batch.sh"
 RUNNER_SELF = {GPU_GATE, "tools/gate.sh", BATCH}
@@ -4481,7 +4490,7 @@ def script_refs(path, text):
         st = line.strip()
         if not st or st.startswith("#"):
             continue
-        for seg in SEGMENT.split(line):
+        for seg in SEGMENT.split(GLOB_QUOTE.sub("", line)):
             if MESSAGE.match(seg):
                 continue
             for q in SCRIPT.findall(seg) + [os.path.join(sdir, b) for b in BARE.findall(seg)]:
