@@ -272,6 +272,11 @@ forced_exact count pin, the reference gates).
   `BLOOMERY_AB_ORDER=blocks` runs a cross-engine window in engine blocks, each opened by a discarded warm-up process
   (the preheat is then off unless `BLOOMERY_PREHEAT=1`). The `card` witness field prints SM clock, the clock-event
   mask and the power/thermal slowdown counters; `cpu-freq` prints `scaling_cur_freq` over the cores.
+- **A release's headline rows come from the release sitting on the shipped binary.** `just release-sitting`
+  (`tools/release/sitting.sh`) times every cell's arms and runs its first-request checks on the tarball's own
+  `bloomery-serve` (`--binary portable`, equal to the tarball's member by sha256) and writes the verdict
+  `tools/release/publish.sh` looks for; a `--binary tree` verdict is an iteration's, marked `stage=tree`, and no
+  release number.
 - **The line to beat is the reference at its fastest flags, measured interleaved** (`decode-measure.sh` runs ik at
   default and `IK_BEST_FLAGS`); under 1 % is claimable only from `BLOOMERY_AB_IK=1 just ab-decode` rounds.
 - **Matching the reference's sum order can be faster and exact at once.** Read the reference kernel before assuming

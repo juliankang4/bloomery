@@ -4,7 +4,8 @@
 # mistake (gh named the assets from temp filenames and every download URL 404'd).
 #
 #   tools/release/publish.sh <version> [--dry-run] [--no-tap]
-#   tools/release/publish.sh --self-test     (the rotation's refusal on stub rotation.py exits; check-recipes runs it)
+#   tools/release/publish.sh --self-test     (the rotation's refusal on stub rotation.py exits, and step 3a's warnings; check-recipes runs it)
+#   tools/release/publish.sh --sitting-check <tarball> <name> <dir>...   step 3a alone, on the verdicts in each <dir>
 #
 # What it owns, in order:
 #   0. the rotation: `python3 tools/rotation.py check` must be green (every F family has a green ledger row inside the
@@ -19,6 +20,11 @@
 #      the GB10 archive (linux-aarch64-cuda-sm121a) the same way on the GB10 that built
 #      it, named by BLOOMERY_GB10_BOX (unset: the release carries no GB10 archive, and
 #      step 6 says so);
+#   3a. the sitting's verdict (tools/release/sitting.sh): a `stage=portable` verdict, result=green, whose binary_sha256
+#      equals the tarball's <name>/bin/bloomery-serve — the release's headline rows come from the binary it ships. The
+#      box's target/release-dist/<name>.sitting is fetched, and every *.sitting in PUBLISH_SITTING_DIR (when set) is
+#      read too. None that qualifies is a WARNING line naming what is missing (a stage=tree verdict, another binary's,
+#      a red one); it never stops the publish, and the line is the release log's record of it;
 #   3b. the Apple Silicon artifacts, which tools/release/build-mac.sh wrote into this tree's
 #      target/mac-release/dist/ from this commit: their .sha256, build-mac.sh's binary checks
 #      on the unpacked binaries, a Developer ID signature on each, and the commit the
@@ -51,6 +57,49 @@ rotation_gate() {
     esac
 }
 
+# sitting_check <tarball> <name> <dir>...: step 3a. Prints `sitting verdict ok` for a `*.sitting` file in one of the <dir>s that
+# is stage=portable, result=green and has the sha256 of the tarball's <name>/bin/bloomery-serve as its binary_sha256; else a
+# WARNING that names what is missing and each verdict that was read and why it does not count. Always returns 0.
+sitting_check() {
+    local tb=$1 name=$2 tmp msha='' d f n stage res bsha why found='' notes=()
+    shift 2
+    tmp=$(mktemp) || return 0
+    if tar -xzOf "$tb" "$name/bin/bloomery-serve" > "$tmp" 2> /dev/null && [ -s "$tmp" ]; then
+        msha=$(shasum -a 256 "$tmp" | awk '{print $1}')
+    fi
+    rm -f "$tmp"
+    for d in "$@"; do
+        for f in "$d"/*.sitting; do
+            [ -f "$f" ] || continue
+            stage=$(sed -n 's/^stage=//p' "$f" | head -n1)
+            res=$(sed -n 's/^result=//p' "$f" | head -n1)
+            bsha=$(sed -n 's/^binary_sha256=//p' "$f" | head -n1)
+            why=''
+            if [ "$stage" != portable ]; then
+                why="stage=${stage:-none} (a tree verdict is an iteration's, never the release's)"
+            elif [ -z "$msha" ] || [ "$bsha" != "$msha" ]; then
+                why="its binary sha256 ${bsha:-none} is not the tarball's member ${msha:-(unreadable)}"
+            elif [ "$res" != green ]; then
+                why="result=${res:-none}"
+            fi
+            if [ -z "$why" ]; then
+                found=$f
+                break 2
+            fi
+            notes+=("$f: $why")
+        done
+    done
+    if [ -n "$found" ]; then
+        echo "publish.sh: sitting verdict ok: $found (stage=portable, green, binary sha256 $msha is the tarball's member)"
+        return 0
+    fi
+    echo "publish.sh: WARNING: no stage=portable sitting verdict for this tarball's binary (sha256 ${msha:-unreadable}): the headline rows are not from the binary the release ships; run tools/release/sitting.sh --binary portable --tarball <this tarball> on the box (just release-sitting)" >&2
+    for n in ${notes[@]+"${notes[@]}"}; do
+        echo "publish.sh: WARNING:   read $n" >&2
+    done
+    return 0
+}
+
 # --self-test: a copy of this script in a temporary repository with no tag, beside a stub tools/rotation.py that exits with each
 # code. rc 1, 2 and 70 stop at the rotation with a message that names it; rc 0 passes it and stops at the tag check after it, so the
 # rotation is the first step and a green one lets the rest run.
@@ -80,6 +129,49 @@ if [ "${1:-}" = --self-test ]; then
     expect 2 "could not run (rc 2"
     expect 70 "could not run (rc 70"
     expect 0 "does not carry v0.0.0"
+    # The sitting step (3a): a verdict the tarball's member matches passes silently, anything else is a WARNING that names it, and
+    # the status is 0 in every case — publishing is never refused for it.
+    tn=bloomery-0.0.0-linux-x86_64-cuda-sm86
+    mkdir -p "$t/sit/$tn/bin" "$t/v-none"
+    printf 'the shipped binary\n' > "$t/sit/$tn/bin/bloomery-serve"
+    tar -czf "$t/sit/$tn.tar.gz" -C "$t/sit" "$tn"
+    msha=$(shasum -a 256 "$t/sit/$tn/bin/bloomery-serve" | awk '{print $1}')
+    # verdict <dir> <stage> <result> <sha>: the header lines of tools/release/sitting.sh's verdict that the step reads
+    verdict() {
+        mkdir -p "$1"
+        printf 'sitting-verdict 1\nstage=%s\nresult=%s\nbinary_sha256=%s\n\n== round 1 cell 1 rc=0 result=green\n' "$2" "$3" "$4" > "$1/$tn.sitting"
+    }
+    # sit_expect <name> <dir> <text the run must print> <text it must not>: rc 0 and the text
+    sit_expect() {
+        cases=$((cases + 1))
+        rc=0
+        got=$(bash "$t/tools/release/publish.sh" --sitting-check "$t/sit/$tn.tar.gz" "$tn" "$2" 2>&1) || rc=$?
+        case "$rc:$got" in
+            0:*"$3"*) ;;
+            *) echo "publish.sh self-test: sitting $1: rc $rc, want rc 0 with '$3'; got: $got" >&2; fails=$((fails + 1)) ;;
+        esac
+        if [ -n "$4" ]; then
+            case "$got" in
+                *"$4"*) echo "publish.sh self-test: sitting $1: the output holds '$4': $got" >&2; fails=$((fails + 1)) ;;
+            esac
+        fi
+    }
+    verdict "$t/v-ok" portable green "$msha"
+    sit_expect "verdict present" "$t/v-ok" "sitting verdict ok" "WARNING"
+    sit_expect "verdict absent" "$t/v-none" "WARNING: no stage=portable sitting verdict" "sitting verdict ok"
+    verdict "$t/v-tree" tree green "$msha"
+    sit_expect "stage=tree verdict" "$t/v-tree" "stage=tree" "sitting verdict ok"
+    sit_expect "stage=tree verdict warns" "$t/v-tree" "WARNING: no stage=portable sitting verdict" ""
+    verdict "$t/v-sha" portable green 0000
+    sit_expect "another binary's verdict" "$t/v-sha" "is not the tarball's member" "sitting verdict ok"
+    verdict "$t/v-red" portable red "$msha"
+    sit_expect "red verdict" "$t/v-red" "result=red" "sitting verdict ok"
+    # the publish flow calls the step on the tarball it uploads
+    cases=$((cases + 1))
+    grep -q '^sitting_check "\$TMP/\$NAME.tar.gz" "\$NAME"' "$t/tools/release/publish.sh" || {
+        echo "publish.sh self-test: the publish flow does not call sitting_check on the tarball it uploads" >&2
+        fails=$((fails + 1))
+    }
     if [ "$fails" = 0 ]; then
         echo "publish.sh: self-test ok ($cases cases)"
         exit 0
@@ -88,7 +180,14 @@ if [ "${1:-}" = --self-test ]; then
     exit 1
 fi
 
-VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] | --self-test}
+if [ "${1:-}" = --sitting-check ]; then
+    [ $# -ge 4 ] || { echo "usage: tools/release/publish.sh --sitting-check <tarball> <name> <dir>..." >&2; exit 64; }
+    shift
+    sitting_check "$@"
+    exit 0
+fi
+
+VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] | --self-test | --sitting-check <tarball> <name> <dir>...}
 DRY=0; TAP=1
 for a in "${@:2}"; do
     case "$a" in
@@ -160,6 +259,10 @@ GB10_SHA=
 if [ -n "$GB10_BOX" ]; then
     GB10_SHA=$(linux_archive "$GB10_BOX" "$GB10_NAME") || exit 1
 fi
+
+# 3a. the sitting's verdict beside the tarball on the box: its absence is the check's warning, not an error here
+scp -q "$BOX:$REMOTE/target/release-dist/$NAME.sitting" "$TMP/$NAME.sitting" 2> /dev/null || true
+sitting_check "$TMP/$NAME.tar.gz" "$NAME" "$TMP" ${PUBLISH_SITTING_DIR:+"$PUBLISH_SITTING_DIR"}
 
 # 3b. the Apple Silicon artifacts, built here by tools/release/build-mac.sh
 for f in "$MAC_NAME.tar.gz" "$MAC_NAME.tar.gz.sha256"; do

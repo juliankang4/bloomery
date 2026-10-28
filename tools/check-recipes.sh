@@ -369,8 +369,27 @@ blk_releasebuild() { tool_selftest release/build.sh; }
 # installer runs on users' machines only, so its choice is held here.
 blk_releaseinstall() { tool_selftest release/install.sh; }
 # publish.sh's first step: tools/rotation.py check refuses the publish on rc 1 (and on rc 2 or 70, named) before the tag
-# check, on a stub rotation.py in a temporary repository; the script runs on the lead's Mac only at a release.
+# check, on a stub rotation.py in a temporary repository; and its sitting step (3a): a portable verdict of the tarball's own
+# binary is silent, any other is a warning that names it, and the status stays 0; the script runs on the lead's Mac only at a
+# release.
 blk_releasepublish() { tool_selftest release/publish.sh; }
+# sitting.sh is the release sitting's runner: the cells file's faults, round 1 family-major and round 2 reversed with its arms
+# rotated, the red stop and --keep-going, the hold on every exit path, the verdict's fields, the environment a cell sets and the
+# --dry-run wall, on a stub depth-serve.sh and stub checks, then a mutant of each guard that its case must turn red; no box, no
+# card. The release-sitting recipe must call it: a recipe that stops calling it runs no sitting, so the call is held here.
+blk_releasesitting() {
+  local out
+  if ! out=$(bash "$(dirname "$0")/release/sitting.sh" --self-test 2>&1); then
+    printf '%s\n' "$out" >&2
+    echo "check-recipes: the release sitting self-test failed" >&2
+    return 1
+  fi
+  if ! awk '/^release-sitting /{f=1; next} f && /^[^ ]/{exit} f' "$JF" | grep -q 'tools/release/sitting\.sh'; then
+    echo "check-recipes: the release-sitting recipe must run tools/release/sitting.sh" >&2
+    return 1
+  fi
+  printf '%s\n' "${out##*$'\n'}"
+}
 # Every Python tool's own tests, on the Mac and the Linux host nightly (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison (unit pytools.list) fails on one that is not. Each tool is a unit of its own
 # (pytools.K, the K-th line, run from the repository root), so the scheduler bounds them with every other unit.
@@ -1183,7 +1202,7 @@ proc_leg_gpu() {
 }
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish pytools boxqcodes fixturevariants fixturedirs dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are

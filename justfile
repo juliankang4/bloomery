@@ -861,6 +861,17 @@ release-build VERSION:
     ./tools/release/carry.sh
     ./tools/box.sh "bash tools/release/build.sh {{VERSION}} $(git rev-parse --short=12 HEAD)"
 
+# The release sitting (tools/release/sitting.sh's header: the cells file, the order, the hold, the verdict): every cell of the
+# release's table timed and checked on one binary inside one hold. CELLS is a cells file on the box (or under the synced tree);
+# ARGS are the script's: `--binary portable --tarball target/release-dist/bloomery-<v>-linux-x86_64-cuda-sm86.tar.gz` for the
+# release's verdict (the tarball's own bloomery-serve), `--binary tree` for an iteration's (this recipe builds the tree's
+# bloomery-serve first, as depth-serve does), `--dry-run`, `--keep-going`. BLOOMERY_LEASE_CARD (BLOOMERY_BOX_ENV) names the
+# sitting's prediction card; BLOOMERY_HOLD_OWNER (default rel) owns the box-side hold and passes box.sh's guard. The verdict
+# lands beside the tarball (<tarball>.sitting; a tree stage's is target/release-dist/<version>-<tree>-tree.sitting), where
+# tools/release/publish.sh reads it.
+release-sitting VERSION CELLS *ARGS:
+    ./tools/box.sh '{{precheck}} && case " {{ARGS}} " in *" --binary tree "*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve;; esac && bash tools/release/sitting.sh --version {{VERSION}} --cells {{CELLS}} --hold-owner {{env_var_or_default("BLOOMERY_HOLD_OWNER", "rel")}} {{ARGS}}'
+
 build-decode:
     ./tools/box.sh 'cargo build --release -p bloomery-model --bin bloomery-decode'
 
