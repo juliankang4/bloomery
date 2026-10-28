@@ -773,16 +773,22 @@ fn refused(detail: String) -> GpuError {
 mod tests {
     use super::*;
     use model::placement::Role;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Parts are staged in plan order while later parts still read, a staged part's pages are
     /// released once, and a read's refusal stops the stage at that part. The last part's read
     /// waits, at most 10 s, for the first part's stage. A read-ahead of two parts reads four once
-    /// each stage frees its part, and the last part's failed release is the load's error.
+    /// each stage frees its part, holding two read and not yet staged, and the last part's failed
+    /// release is the load's error. Under a live reading short of a second part, one part is held
+    /// at a time; a part alone over it is the load's error.
     /// Mutants: staging in arrival order stages the later, faster reads first; staging once every
     /// read is in leaves the last read waiting until it is refused; a release queued twice or
     /// never changes the released list; a stage that never frees its read-ahead stalls a load,
     /// and the test aborts after 10 s; a release error dropped after the last stage returns `Ok`;
-    /// a reader's or the stage's panic that leaves the other readers waiting stalls its load.
+    /// a reader's or the stage's panic that leaves the other readers waiting stalls its load;
+    /// admitting a part without the held parts, or reading on a `Wait` or a `Short`, holds more
+    /// parts than the peaks; never reading beside a held part holds fewer; a reader's admission
+    /// error not kept as the load's error names a stopped reader instead.
     #[test]
     fn parts_stage_in_order_as_their_reads_arrive() {
         let (finished, watch) = mpsc::channel::<()>();
@@ -808,6 +814,7 @@ mod tests {
             }
             fn read(&self, p: &Planned) -> Result<model::part::Part<'_>, Self::Error> {
                 assert_ne!(p.info.name, "r0", "a read panicked");
+                PEAK.fetch_max(HELD.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                 let i = p.info.offset;
                 std::thread::sleep(std::time::Duration::from_millis(2 * (12 - i)));
                 if i == 8 {
@@ -830,6 +837,14 @@ mod tests {
             }
         }
         static RELEASED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        static HELD: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        let peak_of = |load: &mut dyn FnMut()| {
+            HELD.store(0, Ordering::SeqCst);
+            PEAK.store(0, Ordering::SeqCst);
+            load();
+            PEAK.load(Ordering::SeqCst)
+        };
         let plan = |n: u64, window: u64, name: &str| LoadPlan {
             parts: (0..n)
                 .map(|i| Planned {
@@ -859,37 +874,58 @@ mod tests {
                 staged.send(()).unwrap();
             }
             order.push(p.info.offset);
+            HELD.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         };
+        let (release, keep) = (true, false);
         let whole = plan(9, 36, "p");
         let refusing = plan(12, 48, "p");
         let turning = plan(4, 8, "q");
-        read_staged(&slow, &whole, room, true, &mut stage).unwrap();
+        read_staged(&slow, &whole, room, release, &mut stage).unwrap();
         let mut released = std::mem::take(&mut *RELEASED.lock().unwrap());
         released.sort_unstable();
         assert_eq!(released, (0..9).collect::<Vec<u64>>());
-        let error = read_staged(&slow, &refusing, room, false, &mut stage)
+        let error = read_staged(&slow, &refusing, room, keep, &mut stage)
             .unwrap_err()
             .to_string();
         assert!(error.contains("part 9 refused"), "{error}");
         assert!(RELEASED.lock().unwrap().is_empty());
-        let error = read_staged(&slow, &turning, room, true, &mut stage)
+        let mut error = String::new();
+        let peak = peak_of(&mut || {
+            error = read_staged(&slow, &turning, room, release, &mut stage)
+                .unwrap_err()
+                .to_string();
+        });
+        assert!(error.contains("q3 release refused"), "{error}");
+        assert!(
+            peak == 2 || (peak == 1 && threads::pool().threads() == 1),
+            "the read-ahead of 2 parts held {peak}"
+        );
+        // Parts 0 and 1 need their 3 B of reads and part 0's 2 B packing, over the live 3 B.
+        let mut tight = plan(2, 8, "t");
+        tight.costs = vec![(1, 2), (2, 0)];
+        let short = || Ok((3, HostRead::Given));
+        let peak = peak_of(&mut || {
+            read_staged(&slow, &tight, short, keep, &mut stage).unwrap();
+        });
+        assert_eq!(peak, 1, "a live reading short of two parts held {peak}");
+        let error = read_staged(&slow, &plan(1, 4, "u"), short, keep, &mut stage)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("q3 release refused"), "{error}");
+        assert!(error.contains("part read-ahead needs 4 B"), "{error}");
         let read_panics = plan(2, 8, "r");
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            read_staged(&slow, &read_panics, room, false, &mut stage)
+            read_staged(&slow, &read_panics, room, keep, &mut stage)
         }));
         assert!(unwound.is_err());
         let stage_panics = plan(2, 8, "s");
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            read_staged(&slow, &stage_panics, room, false, |_, _| {
+            read_staged(&slow, &stage_panics, room, keep, |_, _| {
                 panic!("a stage panicked")
             })
         }));
         assert!(unwound.is_err());
-        let want: Vec<u64> = (0..9).chain(0..9).chain(0..4).collect();
+        let want: Vec<u64> = (0..9).chain(0..9).chain(0..4).chain(0..2).collect();
         assert_eq!(order, want);
         let mut released = std::mem::take(&mut *RELEASED.lock().unwrap());
         released.sort_unstable();
@@ -1004,6 +1040,55 @@ mod tests {
         );
         assert!(plan.check(&(plan.host_bytes, HostRead::Given)).is_ok());
         assert!(plan.check(&(plan.host_bytes - 1, HostRead::Given)).is_err());
+    }
+
+    /// A parts load stages every part and drops each part's source pages only under `release`.
+    /// Mutant: the load passing a fixed `release` to its reader loop changes the released list of
+    /// one of the two loads.
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_a_parts_load_releases_its_parts_only_under_release() {
+        struct Small(Mutex<Vec<String>>);
+        impl Source for Small {
+            type Error = std::io::Error;
+            fn plan<E: std::fmt::Display>(
+                &self,
+                _: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
+            ) -> Result<Vec<Planned>, Self::Error> {
+                let part = |name: &str| Planned {
+                    at: None,
+                    info: TensorInfo {
+                        name: name.into(),
+                        ty: GgmlType::F32,
+                        dims: vec![64, 1],
+                        offset: 0,
+                        nbytes: 256,
+                    },
+                };
+                Ok(vec![part("a.weight"), part("b.weight")])
+            }
+            fn read_bytes(&self, p: &Planned) -> Result<u64, Self::Error> {
+                Ok(p.info.nbytes)
+            }
+            fn read(&self, p: &Planned) -> Result<model::part::Part<'_>, Self::Error> {
+                Ok(model::part::Part::made(p.info.clone(), vec![0; 256], None))
+            }
+            fn release(&self, p: &Planned) -> Result<(), Self::Error> {
+                self.0.lock().unwrap().push(p.info.name.clone());
+                Ok(())
+            }
+        }
+        let source = Small(Mutex::new(Vec::new()));
+        let room = (1 << 30, HostRead::Given);
+        let plan = LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), room.0).unwrap();
+        let gpu = crate::Gpu::with_device(0).unwrap();
+        for (release, want) in [(false, vec![]), (true, vec!["a.weight", "b.weight"])] {
+            let w = load_plan(gpu.stream(), &source, &plan, |_| None, release, &room).unwrap();
+            assert_eq!(w.names().collect::<Vec<_>>(), ["a.weight", "b.weight"]);
+            let mut released = std::mem::take(&mut *source.0.lock().unwrap());
+            released.sort_unstable();
+            assert_eq!(released, want);
+        }
     }
 
     /// The rule a load from a part source plans by: a tensor whole on the card is taken in the
