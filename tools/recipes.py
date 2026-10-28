@@ -81,8 +81,17 @@ A recipe's inputs are:
     tools/oxide-host.sh (the host's CPU flags and llc), tools/oxide-backend.sh and its patch when the recipe runs `cargo oxide`. A virtual workspace's Cargo.toml is read by
     table too (`root_moves`): of [workspace], `members`/`exclude` select the recipes that read a package that
     entered or left the workspace (an exclude of a path that held no member selects nothing) and
-    `default-members` the recipes with a cargo line naming no `-p` and no `--workspace`; every other table, and
-    Cargo.lock, rust-toolchain.toml and .cargo/config.toml, select every cargo recipe;
+    `default-members` the recipes with a cargo line naming no `-p` and no `--workspace`; every other table,
+    rust-toolchain.toml and .cargo/config.toml select every cargo recipe. So does Cargo.lock, unless the build for
+    x86_64-unknown-linux-gnu reaches nothing its diff names (`lock_outside`): the packages that appeared, went or
+    took another dependency name, each outside the closure of the workspace members on that target (a member's
+    `[target.<key>]` edge counts by `table_read`; an external package's lock edges are all followed, except one
+    only one side's lock has, which a feature the box does not enable puts there). Such a diff selects no recipe
+    and prints a note naming the packages. A package manifest's `[target.<key>]` table is left out of its view the
+    same way when its `cfg(…)` is false for x86_64-unknown-linux-gnu or its key is another triple; a predicate this tool
+    cannot decide stays, with a note. A recipe that runs tools/mac-gate.sh builds on aarch64-apple-darwin: both rules
+    read that target for it, so a macOS-only change selects the Mac gates and no box gate. The ledger key still hashes
+    Cargo.lock and the manifests whole;
   - its own text in the justfile (a recipe whose text changed is selected), and its dependencies'
     inputs.
 
@@ -263,6 +272,7 @@ WEEKLY_PREFIX = "weekly-"
 # The checks the lead's batches always run; the diff does not pick them.
 ALWAYS = ["check-recipes", "check-rustflags", "check-comments", "check-levers", "check-arch", "check-model-tax", "check", "fmt-check", "lint"]
 CARGO_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]
+LOCK_FILE = "Cargo.lock"
 # The workspace's root manifest: a cargo global every cargo recipe reads, narrowed by table (`root_moves`) where it is a
 # virtual manifest; as a package's own manifest it stays whole.
 ROOT_MANIFEST = "Cargo.toml"
@@ -774,6 +784,7 @@ class Dep:
     optional: bool
     features: list[str]
     default: bool
+    target: str | None = None  # the key of the `[target.<key>]` table it sits in (cargo metadata's `target`); None in a plain table
 
 
 @dataclass
@@ -802,7 +813,9 @@ class Package:
 # no string `name`, or a target key that is not an array of tables, stays shared. Selection
 # (`TableReads`) and the ledger key (`KeyContext._parts`) read the view through `manifest_view` alone;
 # a manifest some input reads whole (a script, a path literal, `include_str!`, a `find`, dep-info) is
-# a file for that recipe, never a view (`ManifestUse.whole`).
+# a file for that recipe, never a view (`ManifestUse.whole`). Selection's view also leaves out the
+# `[target.<key>]` tables a build on the recipe's host does not read (`host`, `table_read`: the box, or the Mac
+# for a recipe that runs MAC_GATE); the key's view keeps them, so an edit of one moves keys and selects nothing.
 TARGET_TABLES = ("bin", "test", "bench", "example")
 Entry = tuple[str, str, str]  # (kind, name, src) of a target whose entry a view keeps
 _TOML_MEMO: dict[tuple[str, str], dict] = {}
@@ -843,10 +856,31 @@ def canon(value) -> str:
     return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
 
 
-def manifest_view(doc: dict, pkg_dir: str, wants: frozenset[Entry] | None) -> dict:
+def table_read(key: str, host: str = "box") -> bool | None:
+    """Whether a build on `host` (HOSTS) reads the `[target.<key>]` tables of a package manifest: a `cfg(…)` key by
+    `eval_cfg` on the host's keys, any other key by being the host's triple. None when the predicate is one this
+    tool cannot decide (`target_feature`, a feature, a form `parse_cfg` does not read)."""
+    triple, keys, names, _ = HOSTS[host]
+    if key.startswith("cfg(") and key.endswith(")"):
+        return eval_cfg(parse_cfg(key[4:-1]), None, keys, names)
+    return key == triple
+
+
+def recipe_host(recipes: dict[str, Recipe], name: str, _seen: frozenset[str] = frozenset()) -> str:
+    """`mac` for a recipe that runs MAC_GATE, itself or through a dependency (its tests run on the Mac, under the Mac's
+    cfg, as `orphan_tests` reads it), else `box`."""
+    r = recipes.get(name)
+    if r is None or name in _seen:
+        return "box"
+    if any(MAC_GATE in line for line in r.lines):
+        return "mac"
+    return "mac" if any(recipe_host(recipes, d, _seen | {name}) == "mac" for d in r.deps) else "box"
+
+
+def manifest_view(doc: dict, pkg_dir: str, wants: frozenset[Entry] | None, host: str | None = None) -> dict:
     """The tables of `doc` a build of the targets `wants` sees (None: the whole document): the shared
     tables, and of each target array the entries it keeps, in canonical order (an array's order is not
-    an input)."""
+    an input). With a `host`, a `[target.<key>]` table that `table_read` says False there is left out."""
     out = {k: v for k, v in doc.items() if not _target_array(k, v)}
     for k in TARGET_TABLES:
         v = doc.get(k)
@@ -854,6 +888,39 @@ def manifest_view(doc: dict, pkg_dir: str, wants: frozenset[Entry] | None) -> di
             kept = sorted((e for e in v if _keeps(e, k, pkg_dir, wants)), key=canon)
             if kept:
                 out[k] = kept
+    if host is not None and isinstance(out.get("target"), dict):
+        tables = {k: v for k, v in out["target"].items() if table_read(k, host) is not False}
+        if tables:
+            out["target"] = tables
+        else:
+            del out["target"]
+    return out
+
+
+def _target_tables(doc: dict | None) -> dict:
+    t = doc.get("target") if doc is not None else None
+    return t if isinstance(t, dict) else {}
+
+
+def target_moves(da: dict | None, db: dict | None) -> list[tuple[str, bool | None]]:
+    """(key, `table_read(key)` on the box) of each `[target.<key>]` table that differs between two parses of a manifest,
+    in key order: what the box's view drops (False) or keeps without knowing (None) of a change. A side with no file
+    has none: the whole file moved."""
+    if da is None or db is None:
+        return []
+    ta, tb = _target_tables(da), _target_tables(db)
+    return [(k, table_read(k)) for k in sorted(set(ta) | set(tb)) if canon(ta.get(k)) != canon(tb.get(k))]
+
+
+def target_notes(f: str, da: dict | None, db: dict | None) -> list[str]:
+    """A note for each `[target.<key>]` table of manifest `f` that changed and is not plainly the box's: one the box's view
+    leaves out, and one it keeps because the predicate is unknown."""
+    out = []
+    for k, verdict in target_moves(da, db):
+        if verdict is False:
+            out.append(f"{f}: [target.{k}] changed, not in the x86_64-linux build")
+        elif verdict is None:
+            out.append(f"{f}: [target.{k}] changed; its predicate is not one this tool can decide for x86_64-linux, so the table stays in the view")
     return out
 
 
@@ -866,13 +933,14 @@ def _by_name(entries: list[dict] | None) -> dict[str, str]:
     return {n: canon(sorted(es)) for n, es in acc.items()}
 
 
-def view_moves(da: dict | None, db: dict | None, pkg_dir: str, wants: frozenset[Entry] | None) -> list[tuple[str, bool]]:
+def view_moves(da: dict | None, db: dict | None, pkg_dir: str, wants: frozenset[Entry] | None, host: str = "box") -> list[tuple[str, bool]]:
     """What moved between two parses of a manifest in the view of `wants`, one (label, own) per table or
     entry — `[features]`, `[[bin]] x (added)` — where `own` is a named entry of a target array, not a shared
-    table. Empty when the view did not move; a side with no file is the whole file."""
+    table. The view is the one a build on `host` sees (`manifest_view`). Empty when the view did not move; a side
+    with no file is the whole file."""
     if da is None or db is None:
         return [("the whole file (" + ("added" if da is None else "removed") + ")", False)] if da is not db else []
-    va, vb = manifest_view(da, pkg_dir, wants), manifest_view(db, pkg_dir, wants)
+    va, vb = manifest_view(da, pkg_dir, wants, host), manifest_view(db, pkg_dir, wants, host)
     out: list[tuple[str, bool]] = []
     for k in sorted(set(va) | set(vb)):
         x, y = va.get(k), vb.get(k)
@@ -1071,6 +1139,7 @@ class Tree:
                         optional=bool(d.get("optional")),
                         features=list(d.get("features") or []),
                         default=bool(d.get("uses_default_features", True)),
+                        target=d.get("target") or None,
                     )
                 )
             targets = [
@@ -2067,7 +2136,10 @@ class TableReads:
     of them (manifest_view). One reader for every place a changed file picks recipes (select, narrow); the
     key reads the same view. `hit` records each answer, which `lines` prints. The root Cargo.toml of a virtual
     workspace is read here too (`root`), by the tables `root_moves` names; a root that is a package's own
-    manifest is a package manifest and a cargo global, whole."""
+    manifest is a package manifest and a cargo global, whole. A recipe sees the `[target.<key>]` tables of its host
+    (`host`: the box, or the Mac for a recipe that runs MAC_GATE), and a Cargo.lock whose diff its host's build does not
+    reach (`lock_outside`, kept in `unreached`) is read by no such recipe (`outside`). `notes` holds the box's lock line
+    and one for each `[target.<key>]` table the box's view leaves out or cannot decide (`select` hands them to `affected`)."""
 
     def __init__(self, changed: list[str], a: Side | None, b: Side):
         self.a, self.b = a, b
@@ -2081,6 +2153,25 @@ class TableReads:
                 self.root = f
                 self.docs[f] = (self._root_doc(a), self._root_doc(b))
         self.seen: dict[str, dict[str, list[tuple[str, bool]] | None]] = {f: {} for f in self.docs}
+        self.notes: list[str] = []
+        self.unreached: dict[str, dict[str, str]] = {}  # changed file -> host -> why a build on that host does not reach it
+        for f, (da, db) in self.docs.items():
+            if f != self.root:
+                self.notes += target_notes(f, da, db)
+        if a is not None and LOCK_FILE in changed:
+            outside = lock_outside(a, b)
+            if outside:
+                self.unreached[LOCK_FILE] = outside
+                if "box" in outside:
+                    self.notes.append(outside["box"])
+
+    def host(self, n: str) -> str:
+        """Where recipe `n` builds, read on both sides: the Mac when either side's recipe runs MAC_GATE (`recipe_host`)."""
+        return "mac" if any(s is not None and recipe_host(s.recipes, n) == "mac" for s in (self.a, self.b)) else "box"
+
+    def outside(self, n: str, f: str) -> bool:
+        """Whether changed file `f` reaches nothing recipe `n` builds on its host: a Cargo.lock whose diff that host does not reach."""
+        return f in self.unreached and self.host(n) in self.unreached[f]
 
     @staticmethod
     def _doc(side: Side, f: str) -> dict | None:
@@ -2145,7 +2236,7 @@ class TableReads:
         return mv
 
     def moved(self, f: str) -> list[tuple[str, bool]]:
-        """The tables of manifest `f` that moved whatever recipe reads it, (label, whether a named entry of a target)."""
+        """The tables of manifest `f` that moved in the box's view whatever recipe reads it, (label, whether a named entry of a target)."""
         da, db = self.docs[f]
         if f == self.root:
             return [(label, False) for label, _ in root_moves(da, db)]
@@ -2174,7 +2265,7 @@ class TableReads:
         if not read:
             return None
         da, db = self.docs[f]
-        mv = view_moves(da, db, os.path.dirname(f), frozenset(wants))
+        mv = view_moves(da, db, os.path.dirname(f), frozenset(wants), self.host(n))
         self.seen[f][n] = mv
         return mv
 
@@ -2186,7 +2277,7 @@ class TableReads:
         why = side.graph.inputs(n).match(f)
         if why is None and f in self.docs and self.a is not None and n in self.a.recipes:
             why = self.a.graph.inputs(n).match(f)
-        if why is None:
+        if why is None or self.outside(n, f):
             return None, None
         mv = self.moves(n, f)
         if mv is None:
@@ -2206,6 +2297,10 @@ class TableReads:
             out.append(f"  {f}: {len(by_table)} recipes read it by table, {len(whole)} whole")
             root = f == self.root
             kinds = root_moves(da, db) if root else [(label, "table") for label, _ in self.moved(f)]
+            if not root:  # a table only a Mac recipe's view moves, then the tables the box's view leaves out: named, selecting no box recipe
+                have = {label for label, _ in kinds}
+                kinds += [(m, "table") for m in sorted({m for mv in by_table.values() for m, _ in mv} - have)]
+                kinds += [(f"[target.{k}] (not in the x86_64-linux build)", "table") for k, v in target_moves(da, db) if v is False]
             for label, kind in kinds or [("nothing (comments or layout only)", "table")]:
                 if kind == "whole":  # a root table that stays whole: every recipe that reads the file
                     sel, pool = whole, whole
@@ -2229,8 +2324,8 @@ def select(changed: list[str], a: Side | None, b: Side, prefix: str, tables: Tab
     names = [n for n in sorted(b.recipes, key=lambda n: b.recipes[n].line) if n.startswith(prefix)]
     hits: dict[str, list[tuple[str, str]]] = {n: [] for n in names}
     mapped: set[str] = set()
-    notes: list[str] = []
     tables = tables if tables is not None else TableReads(changed, a, b)
+    notes: list[str] = list(tables.notes)
     for f in changed:
         if f == "justfile":
             continue
@@ -2260,6 +2355,8 @@ def select(changed: list[str], a: Side | None, b: Side, prefix: str, tables: Tab
         side = b if b.tree.exists(f) or a is None else a
         if f == "justfile":
             hint = "no gate-* recipe text changed"
+        elif f in tables.unreached:
+            hint = "the packages it changes are not in the x86_64-linux build (notes:)"
         elif any(mv is not None for mv in tables.seen.get(f, {}).values()):
             hint = "read by table: no recipe's view of it moved (manifests:)"
         else:
@@ -5717,7 +5814,7 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
             if n not in b.recipes:
                 continue
             for f in changed:
-                if f == "justfile":
+                if f == "justfile" or tables.outside(n, f):
                     continue
                 side = b if b.tree.exists(f) or a is None else a
                 if n in side.recipes and side.graph.inputs(n).match(f) is not None:
@@ -6866,10 +6963,25 @@ def mac_hits(text: str, test: bool | None) -> tuple[tuple[int, str, str], ...]:
     return tuple(hits)
 
 
+LockKey = tuple[str, str, str, str]  # a [[package]] entry's (name, version, source, checksum): a workspace member has no source
+
+
 @dataclass
 class Lock:
     roots: set[str]  # device roots by package name
     deps: dict[str, set[str]]  # package name -> the names it depends on, every version merged
+    entries: dict[LockKey, tuple[str, ...]] = field(default_factory=dict)  # every package -> its dependencies as the file writes them
+    by_name: dict[str, list[LockKey]] = field(default_factory=dict)
+
+    def resolve(self, owner: LockKey, dep: str) -> list[LockKey]:
+        """The packages a dependency string of `owner` names: `name`, `name version` or `name version (source)`, as the file
+        writes it (the version and the source only where the name alone is ambiguous). A string no package matches is a named error."""
+        name, version, source = (dep.split(" ", 2) + ["", ""])[:3]
+        source = source[1:-1] if source.startswith("(") and source.endswith(")") else source
+        hit = [k for k in self.by_name.get(name, ()) if (not version or k[1] == version) and (not source or k[2] == source)]
+        if not hit:
+            raise RecipeError(f"Cargo.lock: {owner[0]} {owner[1]} depends on `{dep}`, which no package of the file is")
+        return hit
 
 
 def load_lock(root: str) -> Lock:
@@ -6879,15 +6991,98 @@ def load_lock(root: str) -> Lock:
     if not os.path.isfile(path):
         raise RecipeError(f"no Cargo.lock in {root} — the device roots and the external closure are read from it")
     with open(path, "rb") as fh:
-        data = tomllib.load(fh)
+        try:
+            data = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as err:
+            raise RecipeError(f"{path} does not parse as TOML ({err})") from err
     roots: set[str] = set()
     deps: dict[str, set[str]] = {}
+    entries: dict[LockKey, tuple[str, ...]] = {}
+    by_name: dict[str, list[LockKey]] = {}
     for p in data.get("package", []):
         name = p["name"]
         if any(s in p.get("source", "") for s in DEVICE_GIT_SOURCES) or name in DEVICE_NAMED_ROOTS:
             roots.add(name)
         deps.setdefault(name, set()).update(d.split(" ", 1)[0] for d in p.get("dependencies", []))
-    return Lock(roots, deps)
+        key = (name, p.get("version", ""), p.get("source", ""), p.get("checksum", ""))
+        entries[key] = tuple(p.get("dependencies", []))
+        by_name.setdefault(name, []).append(key)
+    return Lock(roots, deps, entries, by_name)
+
+
+# ---- Cargo.lock as a selecting input: only what the recipe's host builds ----
+#
+# `affected` reads Cargo.lock as an input of every cargo recipe unless its diff reaches nothing the recipe's host builds
+# (HOSTS: the box, or the Mac for a recipe that runs MAC_GATE). The diff
+# names the packages that appeared or went (a key is name, version, source and checksum) and those on both sides that
+# depend on another set of names (`shlex` on one side and `shlex 1.3.0` on the other is one name). A host reaches what a
+# walk finds from the workspace members over the lock's edges: a member's edge counts when some dependency of that name
+# sits in a plain table or in a `[target.<key>]` table `table_read` does not say False for on that host (all features;
+# normal, build and dev). The lock lists every platform's edges of an external package, so all of them are followed, except a name
+# one side's lock has and the other's has not for a package of the same key: a feature turns an optional dependency on
+# somewhere (`sha2`'s new `sha2-asm`, asked for under an aarch64 table), and nothing says the box enables it. A package
+# of one version changes its box edges only through a feature some manifest asks of it (the recipes that read that
+# manifest are selected by table) or through another package of the diff (which the walk reaches or not by the same
+# rule), so dropping those names loses no box input. When both walks reach the same packages the diff selects no recipe;
+# the key still hashes the file whole.
+
+
+def _dep_names(deps: tuple[str, ...]) -> set[str]:
+    return {d.split(" ", 1)[0] for d in deps}
+
+
+def lock_changed(a: Lock, b: Lock, members: set[str]) -> list[str]:
+    """The external packages the diff of two locks names, as `name version`, sorted. A workspace member is no external
+    package: its own tables are read by `TableReads`."""
+    out: set[str] = set()
+    for k in a.entries.keys() ^ b.entries.keys():
+        if k[2] or k[0] not in members:
+            out.add(f"{k[0]} {k[1]}")
+    for k in a.entries.keys() & b.entries.keys():
+        if (k[2] or k[0] not in members) and _dep_names(a.entries[k]) != _dep_names(b.entries[k]):
+            out.add(f"{k[0]} {k[1]}")
+    return sorted(out)
+
+
+def lock_reach(tree: Tree, lock: Lock, other: Lock, host: str) -> set[LockKey]:
+    """The external packages of `lock` that the workspace members of `tree` reach on `host`, following only the names
+    a package has in both `lock` and `other` (see the block above)."""
+    members = set(tree.packages)
+    seen: set[LockKey] = set()
+    todo: list[LockKey] = []
+
+    def take(keys: list[LockKey]) -> None:
+        for k in keys:
+            if (k[2] or k[0] not in members) and k not in seen:
+                seen.add(k)
+                todo.append(k)
+
+    for m in sorted(members):
+        built = {d.pkg for d in tree.packages[m].deps if d.target is None or table_read(d.target, host) is not False}
+        for k in lock.by_name.get(m, ()):
+            if not k[2]:
+                take([t for dep in lock.entries[k] if dep.split(" ", 1)[0] in built for t in lock.resolve(k, dep)])
+    while todo:
+        k = todo.pop()
+        theirs = other.entries.get(k)
+        common = None if theirs is None else _dep_names(theirs)
+        take([t for dep in lock.entries[k] if common is None or dep.split(" ", 1)[0] in common for t in lock.resolve(k, dep)])
+    return seen
+
+
+def lock_outside(a: Side, b: Side) -> dict[str, str]:
+    """host -> the note `affected` prints, for each host whose build the diff of Cargo.lock does not reach (the two walks
+    reach the same packages). A host missing from the answer reads the file whole, as a global input: a side with no
+    lock, a diff that names no package, and a diff whose packages the host reaches."""
+    if not (a.tree.exists(LOCK_FILE) and b.tree.exists(LOCK_FILE)):
+        return {}
+    la, lb = load_lock(a.tree.root), load_lock(b.tree.root)
+    names = lock_changed(la, lb, set(a.tree.packages) | set(b.tree.packages))
+    if not names:
+        return {}
+    shown = ", ".join(names[:8]) + (f" and {len(names) - 8} more" if len(names) > 8 else "")
+    return {host: f"{LOCK_FILE}: {shown} changed, not in the {label} build" for host, (_, _, _, label) in HOSTS.items()
+            if lock_reach(a.tree, la, lb, host) == lock_reach(b.tree, lb, la, host)}
 
 
 def device_chain(tree: Tree, lock: Lock, name: str) -> str | None:
@@ -7574,6 +7769,7 @@ TEST_RUNNERS = ("gate-", "lab-")
 # that runs tools/mac-gate.sh (MAC_GATE) runs on an Apple Silicon Mac instead, so its tests are read under the
 # Mac's keys (_MAC_CFG_KEYS).
 MAC_GATE = "tools/mac-gate.sh"
+BOX_TARGET = "x86_64-unknown-linux-gnu"
 _BOX_CFG_KEYS = {
     "target_arch": "x86_64",
     "target_os": "linux",
@@ -7584,6 +7780,12 @@ _BOX_CFG_KEYS = {
     "target_endian": "little",
 }
 _BOX_CFG_NAMES = {"unix": True, "windows": False}
+# The two hosts a gate recipe builds on, by name: (triple, cfg keys, cfg names, how a note names the build). A recipe runs on the
+# box unless it runs MAC_GATE (`recipe_host`).
+HOSTS = {
+    "box": (BOX_TARGET, _BOX_CFG_KEYS, _BOX_CFG_NAMES, "x86_64-linux"),
+    "mac": (MAC_TARGET, _MAC_CFG_KEYS, _MAC_CFG_NAMES, "aarch64-macos"),
+}
 # libtest's options. The ones that take a value have one owner, tools/gate.sh's `LIBTEST_VALUE=(…)` line
 # (gate.sh skips their values when it looks for a call's filters, and runs on the box with no Python):
 # this file reads that line; the flags are listed here. An option in neither set is a named error.
@@ -10270,6 +10472,214 @@ def root_manifest_self_test(expect) -> None:
         expect(not nar.full and not nar.picks, f"root: --narrow on pr64-exclude gives full {nar.full}, picks {sorted(nar.picks)}")
         nar = narrow(["Cargo.toml"], a0, build(base.replace('serde = "1"', 'serde = "2"')), [pair], [])
         expect(any("Cargo.toml" in r for r in nar.full), f"root: --narrow on [workspace.dependencies] gives full {nar.full}, not the full list")
+
+
+def lock_view_self_test(expect) -> None:
+    """`[target.<key>]` tables and Cargo.lock read as the build for x86_64-unknown-linux-gnu sees them, on a synthetic
+    workspace (package g: a lib with sha2 and, to build, bindgen; user: a bin linking g). A table whose predicate is false
+    there (aarch64, macos, another triple) selects nothing and a true one still selects; an unknown predicate stays with a
+    note. A lock diff whose packages hang off such a table selects nothing (the shape of PR #902, 2026-10-28: sha2's `asm`
+    feature under an aarch64 table brought sha2-asm, cc, find-msvc-tools and shlex, and 249 of 249 gates were selected);
+    one that bumps or removes a package a member reaches on the box still selects every recipe. A recipe that runs
+    tools/mac-gate.sh reads the same tables and lock for aarch64-apple-darwin: a macOS-only change selects it and no box
+    recipe. The ledger key still moves for every case: it reads the manifests and the lock whole."""
+    import tomllib
+
+    reg = "registry+https://github.com/rust-lang/crates.io-index"
+    gm = "crates/g/Cargo.toml"
+    just = (
+        "gate-g:\n    ./tools/box.sh 'cargo test -p g --lib'\n"
+        "gate-user:\n    ./tools/box.sh 'cargo build -p user --bin user'\n"
+    )
+    just_mac = just + "gate-mac:\n    cargo test -p g --lib && ./tools/mac-gate.sh gate_g\n"
+    every = {"gate-g", "gate-user"}
+    g_base = ('[package]\nname = "g"\nversion = "0.1.0"\n\n[dependencies]\nsha2 = "0.10"\n\n'
+              '[build-dependencies]\nbindgen = "0.7"\n')
+    aarch64 = 'cfg(target_arch = "aarch64")'
+    macos = 'cfg(target_os = "macos")'
+    avx2 = 'cfg(target_feature = "avx2")'
+
+    def table(key: str, body: str) -> str:
+        k = key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else "'" + key + "'"
+        return "\n[target." + k + ".dependencies]\n" + body + "\n"
+
+    def plus(key: str) -> str:
+        return g_base + table(key, 'libc = "0.2"')
+
+    def lock(pkgs: list[tuple[str, str, list[str]]]) -> str:
+        out = "version = 4\n"
+        for name, version, deps in pkgs:
+            out += f'\n[[package]]\nname = "{name}"\nversion = "{version}"\n'
+            if name not in ("g", "user"):
+                out += f'source = "{reg}"\nchecksum = "{name}-{version}"\n'
+            if deps:
+                out += "dependencies = [\n" + "".join(f' "{d}",\n' for d in deps) + "]\n"
+        return out
+
+    pk = [("bindgen", "0.7.0", ["shlex"]), ("cpufeatures", "0.2.17", []), ("digest", "0.10.7", []), ("g", "0.1.0", ["bindgen", "sha2"]),
+          ("sha2", "0.10.9", ["cpufeatures", "digest"]), ("shlex", "1.3.0", []), ("user", "0.1.0", ["g"])]
+    lock0 = lock(pk)
+    # PR #902's lock: sha2 takes sha2-asm, which takes cc; shlex has two versions, so bindgen writes `shlex 1.3.0`
+    asm_lock = lock([("bindgen", "0.7.0", ["shlex 1.3.0"]), ("cc", "1.10.0", ["find-msvc-tools", "shlex 2.0.1"]), ("cpufeatures", "0.2.17", []),
+                     ("digest", "0.10.7", []), ("find-msvc-tools", "0.1.15", []), ("g", "0.1.0", ["bindgen", "sha2"]),
+                     ("sha2", "0.10.9", ["cpufeatures", "digest", "sha2-asm"]), ("sha2-asm", "0.6.4", ["cc"]), ("shlex", "1.3.0", []),
+                     ("shlex", "2.0.1", []), ("user", "0.1.0", ["g"])])
+
+    def bumped(who: str, version: str) -> str:
+        return lock([(n, version if n == who else v, d) for n, v, d in pk])
+
+    no_bindgen = g_base.replace('\n[build-dependencies]\nbindgen = "0.7"\n', "")
+    no_bindgen_lock = lock([(n, v, [x for x in d if x != "bindgen"]) for n, v, d in pk if n not in ("bindgen", "shlex")])
+    serde = g_base.replace('sha2 = "0.10"\n', 'sha2 = "0.10"\nserde = "1"\n')
+    serde_lock = lock([(n, v, d + ["serde"] if n == "g" else d) for n, v, d in pk] + [("serde", "1.0.0", [])])
+    objc = g_base + table(macos, 'objc2 = "0.6"')
+    pk_objc = [(n, v, d + ["objc2"] if n == "g" else d) for n, v, d in pk] + [("objc2", "0.6.0", [])]
+    objc_lock = lock(pk_objc)
+    objc_bump = lock([(n, "0.6.1" if n == "objc2" else v, d) for n, v, d in pk_objc])
+    asm_toml = g_base + table(aarch64, 'sha2 = { version = "0.10", features = ["asm"] }')
+    cases = [
+        # (what, g's manifest on B, Cargo.lock on B, the changed files, the recipes selected)
+        ("an aarch64 table and the lock that follows it", asm_toml, asm_lock, ["Cargo.lock", gm], set()),
+        ("an aarch64 table alone", asm_toml, lock0, [gm], set()),
+        ("the lock of an aarch64 table alone", g_base, asm_lock, ["Cargo.lock"], set()),
+        ("a macOS-only dependency and its lock entry", objc, objc_lock, ["Cargo.lock", gm], set()),
+        ("a bump of a direct dependency", g_base, bumped("sha2", "0.10.10"), ["Cargo.lock"], every),
+        ("a bump of a dependency's dependency", g_base, bumped("digest", "0.10.8"), ["Cargo.lock"], every),
+        ("a build dependency removed", no_bindgen, no_bindgen_lock, ["Cargo.lock", gm], every),
+        ("a dependency added", serde, serde_lock, ["Cargo.lock", gm], every),
+        # the cfg predicates of a target table
+        ("cfg(unix)", plus("cfg(unix)"), lock0, [gm], every),
+        ("cfg(target_os = linux)", plus('cfg(target_os = "linux")'), lock0, [gm], every),
+        ("cfg(not(target_os = macos))", plus('cfg(not(target_os = "macos"))'), lock0, [gm], every),
+        ("cfg(target_os = macos)", plus(macos), lock0, [gm], set()),
+        ("cfg(all(unix, aarch64))", plus('cfg(all(unix, target_arch = "aarch64"))'), lock0, [gm], set()),
+        ("cfg(target_feature = avx2), a predicate it cannot decide", plus(avx2), lock0, [gm], every),
+        # the triples
+        ("the box's triple", plus("x86_64-unknown-linux-gnu"), lock0, [gm], every),
+        ("another triple", plus("aarch64-apple-darwin"), lock0, [gm], set()),
+    ]
+    with tempfile.TemporaryDirectory(prefix="recipes-lockview-") as tmp:
+        mf = os.path.join(tmp, "box-manifest.txt")
+        with open(mf, "w", encoding="utf-8") as fh:
+            fh.write(f"# {MANIFEST_VERSION} host=selftest data=/d\n# end\n")
+        made: list[str] = []
+
+        def deps_of(doc: dict) -> list[dict]:
+            out: list[dict] = []
+
+            def add(tbl: dict, kind: str | None, target: str | None) -> None:
+                for name, spec in tbl.items():
+                    s = spec if isinstance(spec, dict) else {}
+                    out.append({"name": name, "kind": kind, "optional": bool(s.get("optional")), "features": list(s.get("features", [])),
+                                "uses_default_features": s.get("default-features", True), "target": target})
+
+            for section, kind in (("dependencies", None), ("build-dependencies", "build"), ("dev-dependencies", "dev")):
+                add(doc.get(section, {}), kind, None)
+                for key, body in doc.get("target", {}).items():
+                    add(body.get(section, {}), kind, key)
+            return out
+
+        def build(g_toml: str, lock_text: str, justfile: str = just) -> Side:
+            root = os.path.join(tmp, f"t{len(made)}")
+            made.append(root)
+            files = {
+                gm: g_toml,
+                "crates/g/src/lib.rs": "",
+                "crates/user/Cargo.toml": '[package]\nname = "user"\nversion = "0.1.0"\n\n[dependencies]\ng = { path = "../g" }\n',
+                "crates/user/src/main.rs": "fn main() {}\n",
+                "Cargo.lock": lock_text,
+                "tools/mac-gate.sh": "",
+                "justfile": justfile,
+            }
+            for f in BOX_GLOBALS + [f"tools/ref/models/{DEFAULT_PROFILE}.sh"]:
+                files[f] = ""
+            for rel, text in files.items():
+                os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            meta = {
+                "workspace_root": root,
+                "workspace_members": ["g", "user"],
+                "packages": [
+                    {"id": "g", "name": "g", "manifest_path": os.path.join(root, gm), "features": {},
+                     "dependencies": deps_of(tomllib.loads(g_toml)),
+                     "targets": [{"kind": ["lib"], "name": "g", "src_path": os.path.join(root, "crates/g/src/lib.rs")}]},
+                    {"id": "user", "name": "user", "manifest_path": os.path.join(root, "crates/user/Cargo.toml"), "features": {},
+                     "dependencies": [{"name": "g", "kind": None, "optional": False, "features": [], "uses_default_features": True}],
+                     "targets": [{"kind": ["bin"], "name": "user", "src_path": os.path.join(root, "crates/user/src/main.rs")}]},
+                ],
+            }
+            return side_at(root, meta)
+
+        def keys(side: Side) -> dict[str, str]:
+            ctx = KeyContext(side, mf, environ={})
+            out = {}
+            for n in sorted(every):
+                parts, err, _, _ = ctx.parts(n)
+                out[n] = item_key(parts) if err is None else "error: " + err
+            return out
+
+        a = build(g_base, lock0)
+        ka = keys(a)
+        expect(not any(v.startswith("error") for v in ka.values()), f"lock view: base keys {ka}")
+        seen: dict[str, tuple[Side, TableReads, list[Selection], list[str], list[str]]] = {}
+        for what, g_toml, lock_text, changed, want in cases:
+            b = build(g_toml, lock_text)
+            tables = TableReads(changed, a, b)
+            sels, unmapped, notes = select(changed, a, b, GATE_PREFIX, tables)
+            seen[what] = (b, tables, sels, unmapped, notes)
+            got = {x.recipe for x in sels}
+            expect(got == want, f"lock view: {what} selects {sorted(got)}, not {sorted(want)}")
+            kb = keys(b)
+            expect(all(kb[n] != ka[n] for n in every), f"lock view: {what} leaves a ledger key where it was (the key reads the manifests and the lock whole)")
+        # the notes name what the box's view leaves out, what it cannot decide, and the lock's packages
+        _, _, _, unmapped, notes = seen["an aarch64 table and the lock that follows it"]
+        lock_note = next((n for n in notes if n.startswith("Cargo.lock: ")), "")
+        expect(lock_note == "Cargo.lock: cc 1.10.0, find-msvc-tools 0.1.15, sha2 0.10.9, sha2-asm 0.6.4, shlex 2.0.1 changed, not in the x86_64-linux build",
+               f"lock view: the lock's note is {lock_note!r} (bindgen's `shlex 1.3.0` names the package it named before and is no change)")
+        expect(f'{gm}: [target.{aarch64}] changed, not in the x86_64-linux build' in notes, f"lock view: no note for the aarch64 table: {notes}")
+        expect(len(unmapped) == 2 and all("not in the x86_64-linux build" in u or "read by table" in u for u in unmapped),
+               f"lock view: the diff's files are not both printed under unmapped with their reason: {unmapped}")
+        _, _, _, _, notes = seen["cfg(target_feature = avx2), a predicate it cannot decide"]
+        expect(any(f"[target.{avx2}]" in n and "can decide" in n for n in notes), f"lock view: no note for a predicate it cannot decide: {notes}")
+        _, tables, _, _, notes = seen["cfg(target_os = macos)"]
+        expect(any(f"[target.{macos}] changed, not in the x86_64-linux build" in n for n in notes), f"lock view: no note for the macOS table: {notes}")
+        block = "\n".join(tables.lines())
+        expect(f"[target.{macos}] (not in the x86_64-linux build) -> no recipe" in block, f"lock view: the manifests: block of the macOS table is\n{block}")
+        # a diff the box reaches is the lock's own verdict, whatever the manifest selects beside it
+        for what in ("a dependency added", "a build dependency removed", "a bump of a direct dependency"):
+            b = seen[what][0]
+            expect("box" not in lock_outside(a, b), f"lock view: {what} is read as outside the x86_64-linux build")
+        expect(lock_outside(a, a) == {}, "lock view: a lock that did not move is read as outside a build instead of whole")
+        # a recipe that runs tools/mac-gate.sh reads aarch64-apple-darwin: the tables and the packages only a Mac builds select it alone
+        a_m, a_o = build(g_base, lock0, just_mac), build(objc, objc_lock, just_mac)
+        mac_cases = [
+            ("a macOS table and its lock entry", a_m, objc, objc_lock, ["Cargo.lock", gm], {"gate-mac"}),
+            ("an aarch64 table and the lock that follows it", a_m, asm_toml, asm_lock, ["Cargo.lock", gm], {"gate-mac"}),
+            ("a linux table", a_m, plus('cfg(target_os = "linux")'), lock0, [gm], every),
+            ("a bump of a macOS-only package", a_o, objc, objc_bump, ["Cargo.lock"], {"gate-mac"}),
+        ]
+        for what, base, g_toml, lock_text, changed, want in mac_cases:
+            sels, _, _ = select(changed, base, build(g_toml, lock_text, just_mac), GATE_PREFIX)
+            got = {x.recipe for x in sels}
+            expect(got == want, f"lock view: with a Mac recipe, {what} selects {sorted(got)}, not {sorted(want)}")
+        # --narrow reads the same answer: with every scan pair identical, the spill ratchet takes Cargo.lock as its own input
+        # only when the box builds what the diff names
+        lines = ["ptx-scan: mod1 bundle=bloomery-gpu bytes=100",
+                 "ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 modules=1 "
+                 "jit-card=NVIDIA_RTX_A6000 jit-cc=8.6 jit-cuda=13.4",
+                 "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill blk/SM(static) jit_regs jit_local",
+                 f"{'alpha':<24} 256 no 0 0 0 0 12 0 0 6 12 0", "ptx-scan-md5: method=decl1", f"alpha {'1' * 32} 41"]
+        log = os.path.join(tmp, "scan.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        pair = (read_scan(log), read_scan(log))
+        ratchet = just + "gate-ptx-spill:\n    ./tools/box.sh 'cargo test -p g --lib'\n"
+        na = build(g_base, lock0, ratchet)
+        nar = narrow(["Cargo.lock"], na, build(g_base, asm_lock, ratchet), [pair], [])
+        expect(not nar.full and not nar.picks, f"lock view: --narrow gives full {nar.full}, picks {sorted(nar.picks)} for a Cargo.lock outside the x86_64-linux build")
+        nar = narrow(["Cargo.lock"], na, build(g_base, bumped("sha2", "0.10.10"), ratchet), [pair], [])
+        expect("gate-ptx-spill" in nar.picks, f"lock view: --narrow picks {sorted(nar.picks)} for a Cargo.lock the box reaches, not the spill ratchet")
 
 
 def range_base_self_test(expect) -> None:
@@ -13924,6 +14334,7 @@ def self_test(serial: bool = False) -> int:
         ships_self_test(expect)  # the shipped closure and the release feature list
         manifest_self_test(expect)  # a package manifest read by table
         root_manifest_self_test(expect)  # the root Cargo.toml read by table
+        lock_view_self_test(expect)  # [target.<key>] tables and Cargo.lock as the box's build reads them
         range_base_self_test(expect)  # A..B read against the merge base
         module_gate_self_test(expect)  # a module gated by a cargo feature
         memo_self_test(expect)  # the process-wide memo of walks and script closures
