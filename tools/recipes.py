@@ -45,6 +45,11 @@ hold a file outside crates/levers that names a moved row, by its variable or by 
 reads no such file is not selected. Code beside the rows (an item, a helper's body, a non-string const), a row the reader cannot name, rows in
 another order and a text it cannot lex keep the file whole, the `affected:` line saying why, and so does any other file of crates/levers.
 
+Under --narrow a Rust file of a lib's module tree that no row of tools/gate-paths.tsv maps is read by the derivation (`dep_reach`, what `reach`
+prints): the gates whose reach holds a unit of it, the `affected:` line counting such files and a `narrow: derived` block naming each file's gates
+and one chain. A file the derivation cannot read (`derivation_gap`: not Rust source, deleted, a build script, in no lib's module tree; or
+`derivation_empty`: no gate's reach holds a unit of it) keeps the full list, `narrow: full list` naming the file and why.
+
 The class stage (on; `--no-class` turns it off) is the third stage, after select() and narrow(): the class tables (tools/gate-class.tsv,
 tools/families.tsv, tools/owners.tsv, read through tools/gate_class.py's loader) say what a gate-* recipe is, and a family gate is kept only
 when the change can have moved it — the family's own file changed, the recipe's own text or one of its own target files changed, the family is
@@ -2810,8 +2815,9 @@ def cmd_affected(args: argparse.Namespace) -> int:
         lever_why = tables.levers.summary()
         lever_note = f"; {lever_why}" if lever_why else ""
         if narrowed:
+            by_derivation = f"; {len(nar.derived)} files by derivation" if nar.derived else ""
             print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected "
-                  f"(narrowed from {len(sels)} by ptx-scan; {class_note}){weekly}{mac_note}{lever_note}")
+                  f"(narrowed from {len(sels)} by ptx-scan{by_derivation}; {class_note}){weekly}{mac_note}{lever_note}")
         else:
             print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected"
                   + f" ({class_note})" + weekly + mac_note + lever_note)
@@ -2822,6 +2828,9 @@ def cmd_affected(args: argparse.Namespace) -> int:
                 print(f"narrow: ptx-scan {v.line()}")
             for line in nar.files:
                 print(f"narrow: file {line}")
+            for d in nar.derived if narrowed else []:
+                print(f"narrow: derived {d.file}: {len(d.kept)} of {d.linked} gates that link it through a dependency reach it: {' '.join(d.kept)}")
+                print(f"narrow:   one chain, {d.chain}")
 
         def class_rule(n: str) -> str:
             """The class rule that kept a family pick (the common and the tooling ones have nothing to say)."""
@@ -2840,14 +2849,14 @@ def cmd_affected(args: argparse.Namespace) -> int:
             print_triggers(trig, width)
             print("recipes: " + " ".join([*picks, *(i for i, _ in vitems), *(t.recipe for t in trig)]))
             print("always: " + " ".join(ALWAYS))
-            let_out = "; ".join(v.line() for v in nar.verdicts)
+            let_out = "ptx-scan " + "; ".join(v.line() for v in nar.verdicts) + (f", the derivation of {len(nar.derived)} files" if nar.derived else "")
             out = [s.recipe for s in sels if s.recipe not in nar.picks]
             if stage is None:
-                print(f"left out ({len(out)}), each by ptx-scan {let_out}:")
+                print(f"left out ({len(out)}), each by {let_out}:")
                 for n in out:
-                    print(f"  - {n}  (ptx-scan {let_out})")
+                    print(f"  - {n}  ({let_out})")
             else:
-                reasons = [(n, f"ptx-scan {let_out}") for n in out]
+                reasons = [(n, let_out) for n in out]
                 reasons += [(n, why) for n, why in stage.left_out.items()]
                 print(f"left out ({len(reasons)}), each by its reason (--no-class keeps the class stage's gates):")
                 for n, why in reasons:
@@ -3342,7 +3351,10 @@ def cmd_expand(args: argparse.Namespace) -> int:
 #   - when some gate reads it through a dependency edge (a workspace lib a target links, a crate
 #     manifest, a cargo global, box.sh's profile files): the recipes of the rows of
 #     tools/gate-paths.tsv whose glob matches it, all of them (a `derive` row's recipes are the gates the tree derives for
-#     it, written out on read by expanded_table). No row: the full list, naming the file.
+#     it, written out on read by expanded_table). No row: the file's own derivation (dep_reach: the gates whose
+#     reach holds a unit of it, the table's own derivation applied to the file), for a Rust source file of a lib's
+#     module tree that some gate's reach holds; a file the derivation cannot read (derivation_gap: not Rust source, deleted, a
+#     build script, in no lib's module tree, or reached by no gate) keeps the full list, naming the file and why.
 #     A row whose recipes are `*`: the full list, naming the row;
 #   - a file under docs/, a `.card` or a `*.md` needs no row (not a host path);
 #   - the gates of a kernel carrier no scan pair covers, whenever the change touches that carrier's
@@ -6074,11 +6086,49 @@ def kernel_carriers(side: Side, gates: list[str], skip: dict[str, str] | None = 
 
 
 @dataclass
+class Derived:
+    """A changed host file no row maps, narrowed to its derivation: the gates that link it through a dependency edge, the ones
+    whose reach holds a unit of it, and the chain of the one with the fewest steps."""
+
+    file: str
+    linked: int  # the gates that read it through a dependency edge
+    kept: list[str]  # the gates whose reach holds a unit of it, in justfile order
+    chain: str  # reach_chain of the kept gate with the fewest steps
+
+
+@dataclass
 class Narrowed:
     full: list[str]  # reasons the full list stands; empty when the list narrowed
     picks: dict[str, str]  # recipe -> the rule that picked it, in justfile order
     files: list[str]  # one line per changed file: the rule that mapped it
     verdicts: list[ScanVerdict]
+    derived: list[Derived] = field(default_factory=list)  # the files no row maps, each read by the derivation
+
+
+def derivation_gap(side: Side, f: str) -> str | None:
+    """Why the derivation cannot read changed file `f` on `side`, None when it can. The derivation is Reach, the item graph of
+    the lib module trees: it holds a unit of a lib's Rust source. What it cannot place keeps the full list: a file that is not
+    Rust source (a manifest, a cargo global, a data file or a script is read by table, by path literal or by a recipe's own
+    text), one the tree no longer holds, a build script (it runs at build and reaches every gate that reaches its crate) and a
+    Rust file in no lib's module tree."""
+    if not f.endswith(".rs"):
+        return "it is not Rust source: the derivation places units of a lib's module tree"
+    if not side.tree.exists(f):
+        return "the tree read no longer holds it"
+    reach = reach_of(side.tree)
+    if f in reach.builds:
+        return "it is a build script: it runs at build and reaches every gate that reaches its crate"
+    if f not in reach.file_root:
+        return "it is in no lib's module tree: the derivation holds no unit of it"
+    return None
+
+
+def derivation_empty(kept: Iterable[str]) -> str | None:
+    """Why a file no gate's reach holds a unit of is not read as "no gate runs it": a module list, a `cfg` line or dead code
+    changes what compiles, which the item graph does not run."""
+    if next(iter(kept), None) is None:
+        return "no gate's reach holds a unit of it (a module list, a cfg line or dead code): the item graph cannot say what an edit there moves"
+    return None
 
 
 def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLog, ScanLog]], rows: list[PathRow], tables: TableReads | None = None) -> Narrowed:
@@ -6136,9 +6186,23 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
                     pick(n, f"{f} [row {r.line}]")
             rule.append("rows " + " ".join(str(r.line) for r in hit_rows) + f" -> {len({n for r in hit_rows for n in r.gates()})} recipes")
         elif dep:
-            n, w = dep[0]
-            res.full.append(f"{f}: {n} reads it through a dependency ({w}) and no row of {GATE_PATHS} maps it")
-            rule.append("no row")
+            # no row: the gates whose reach holds a unit of the file (the derivation the rows are held to), read on the tree
+            # the change lands in; the spill ratchet has its own rule below
+            gap = derivation_gap(b, f)
+            reached = {} if gap else {n: node for n, node in dep_reach(b.tree, b.graph, gates, f).items() if n not in NARROW_ALWAYS}
+            gap = gap or derivation_empty(reached)
+            if gap:
+                n, w = dep[0]
+                res.full.append(f"{f}: {n} reads it through a dependency ({w}) and no row of {GATE_PATHS} maps it, "
+                                f"and the derivation cannot read it: {gap}")
+                rule.append("no row, not derivable")
+            else:
+                for n in reached:
+                    pick(n, f"{f} [derived]")
+                chains = {n: reach_chain(b.tree, b.graph, n, node) for n, node in reached.items()}
+                shortest = min(chains, key=lambda n: (chains[n].count(" -["), n), default=None)
+                res.derived.append(Derived(f, len(dep), [n for n in gates if n in reached], f"{shortest}: {chains[shortest]}" if shortest else ""))
+                rule.append(f"no row, derived: {len(reached)} of {len(dep)} dependency readers reach it")
         elif not own:
             rule.append("no gate reads it")
         # a manifest whose diff moved only named entries, or the registry whose diff moved only rows, changes no kernel:
@@ -13108,6 +13172,37 @@ def narrow_self_test(expect, side: Side) -> None:
         # own targets of it, so a diff of it alone picks both and no row stands for either
         n = narrow(["tools/ref/clef/suite.jsonl"], side, side, covering, table)
         expect(not n.full and {"gate-gpu-clef-serve", "gate-decision"} <= set(n.picks), f"narrow: Clef's suite alone drops a reader or keeps the full list: {n.full} {sorted(n.picks)}")
+        # a Rust file of a lib's module tree no row maps is read by the derivation: its picks are the gates whose reach holds a
+        # unit of it and the gates that read it as their own target's, not every gate that links its crate
+        from types import SimpleNamespace
+
+        f = "crates/sampler/src/lib.rs"
+        read_by = {m: side.graph.inputs(m).match(f) for m in gates_all}
+        linked = {m for m, w in read_by.items() if w and not _own_origin(w)}
+        own_gates = {m for m, w in read_by.items() if w and _own_origin(w)} - set(NARROW_ALWAYS)
+        reached = {m for m in dep_reach(side.tree, side.graph, gates_all, f) if m not in NARROW_ALWAYS}
+        n = narrow([f], side, side, covering, rows)
+        expect(not n.full and bool(reached) and reached < linked, f"narrow: a row-less lib file keeps the full list, or the derivation is as wide as the crate: {n.full} {len(reached)} of {len(linked)}")
+        expect(set(n.picks) - set(NARROW_ALWAYS) == reached | own_gates, f"narrow: a row-less lib file does not pick its derivation and its own targets: {sorted(set(n.picks) ^ (reached | own_gates))[:6]}")
+        expect(len(n.derived) == 1 and n.derived[0].file == f and n.derived[0].linked == len(linked) and set(n.derived[0].kept) == reached
+               and n.derived[0].chain.split(": ", 1)[0] in reached and "derived: " in n.files[0], f"narrow: a derived file is not recorded with its gates and one chain: {n.derived} {n.files}")
+        # a `*` row keeps the full list for the same file, and a pair that moved keeps it with the file derived
+        n = narrow([f], side, side, covering, [row("crates/sampler/src/**", ["*"], 7)])
+        expect(any(f"{GATE_PATHS}:7" in r for r in n.full) and not n.derived, f"narrow: a `*` row beside a lib file does not keep the full list: {n.full} {n.derived}")
+        n = narrow([f], side, side, [(base, md5), *covering], rows)
+        expect(any("ptx-scan gx: moved beta" in r for r in n.full), f"narrow: a moved pair beside a derived file does not keep the full list: {n.full}")
+        # a file the derivation cannot read keeps the full list, naming the file and the predicate that failed it: a build
+        # script, a module list no gate's reach holds a unit of, a file that is not Rust source
+        for what, f, why in (("a build script", "crates/gpu/build.rs", "it is a build script"),
+                             ("a module list", "crates/chain/src/arch/mod.rs", "no gate's reach holds a unit of it"),
+                             ("the lock file", "Cargo.lock", "it is not Rust source")):
+            n = narrow([f], side, side, covering, rows)
+            expect(len(n.full) == 1 and n.full[0].startswith(f"{f}: ") and "no row of" in n.full[0] and why in n.full[0] and not n.derived,
+                   f"narrow: {what} ({f}) is not kept whole with its reason ({why}): {n.full} {n.derived}")
+        gone = SimpleNamespace(tree=SimpleNamespace(exists=lambda rel: False))
+        expect("no longer holds" in (derivation_gap(gone, "crates/sampler/src/lib.rs") or ""), "narrow: a deleted file does not keep the full list")
+        expect(derivation_gap(side, "crates/sampler/src/lib.rs") is None and derivation_empty(["gate-a"]) is None and derivation_empty([]) is not None,
+               "narrow: the derivation's two predicates read a lib file as derivable and an empty reach as not")
         # a trigger names its weekly recipe and maps nothing: a file only a trigger row matches, which every gate reads
         # through a dependency, keeps the full list; beside a gate row it narrows as that row says
         trig = [row("rust-toolchain.toml", ["weekly-gpu-ds41-serve"], 9)]

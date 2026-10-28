@@ -10,9 +10,10 @@
 #                                        # its family's files, its recipe or its own targets changed, each one left out named with its reason
 #   tools/affected-gates.sh … --narrow --scan BASE_LOG NEW_LOG [--scan …]
 #                                        # narrowed by ptx-scan pairs (base, change) and tools/gate-paths.tsv:
-#                                        # identical or added pairs keep the gates whose own target changed and
-#                                        # the rows the changed files match; a moved pair, no pair or a file no
-#                                        # row maps prints the full list with the reason
+#                                        # identical or added pairs keep the gates whose own target changed, the
+#                                        # rows the changed files match and, for a Rust file no row maps, the gates
+#                                        # its derivation reaches; a moved pair, no pair or a file the derivation
+#                                        # cannot read prints the full list with the reason
 #   just narrow BASE [HEAD | --worktree] [--out DIR]
 #                                        # the same with the scans taken for you (tools/narrow-scan.sh): the bins whose
 #                                        # scans cover every kernel carrier (tools/recipes.py scan-set), built and scanned

@@ -1,10 +1,12 @@
 # The host-path table of `just affected --narrow` (tools/recipes.py, the section above narrow()).
 # glob<TAB>recipes<TAB>why[<TAB>exceptions]. A changed file that some gate reads through a dependency edge (a lib a target links,
-# a manifest, a cargo global) selects the recipes of every row whose glob matches it; `*` keeps the full list; no
-# row keeps the full list and names the file. A file's own target (its bin, its test file, its lib's own tests), a
-# script a recipe names, and the recipe's own text select their recipes without a row, so a row names only the gates
-# that reach the file through a dependency; gate-ptx-spill joins a narrowed list only when a scan pair is not identical
-# or its own inputs moved (tools/recipes.py, narrow()). `**` crosses `/`, `*` does not, `{a,b}` is either.
+# a manifest, a cargo global) selects the recipes of every row whose glob matches it; `*` keeps the full list; no row: the file's
+# own derivation (the gates `python3 tools/recipes.py reach FILE` prints), and a file the derivation cannot read (not Rust source,
+# deleted, a build script, in no lib's module tree, reached by no gate) keeps the full list and names the file and why. A file's
+# own target (its bin, its test file, its lib's own tests), a script a recipe names, and the recipe's own text select their
+# recipes without a row, so a row names only the gates that reach the file through a dependency; gate-ptx-spill joins a
+# narrowed list only when a scan pair is not identical or its own inputs moved (tools/recipes.py, narrow()). `**` crosses
+# `/`, `*` does not, `{a,b}` is either.
 # The recipes column is `*`, gate and weekly names, or `derive [gate-… …] [weekly-… …]`. `derive` stands for the gates the tree derives
 # for the row, which this file does not hold: every gate whose own target names the module the glob stands for, and every gate the
 # derivation says reaches a file the glob matches through another lib, less the row's exceptions (`python3 tools/recipes.py reach FILE…`
