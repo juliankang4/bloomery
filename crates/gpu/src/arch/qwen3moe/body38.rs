@@ -125,7 +125,7 @@ use super::program38::{
 };
 use super::scratch::{Io, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, stamps_at};
 use super::scratch38::{
-    Arena38, LANES, PASS_ROWS, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, no_carry,
+    Arena38, LANES, PASS_ROWS, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, final_res, no_carry,
     store_rule_bytes,
 };
 use super::slot_pass::SlotIn;
@@ -3859,7 +3859,6 @@ impl Body38 {
                 m,
                 pos0: pos as usize,
                 dense,
-                cur: 0,
                 read,
                 stream,
                 media: media.as_mut(),
@@ -4534,14 +4533,13 @@ impl Wrote38 {
 
 /// The streams' buffer of `walk`'s arena (the step's, the pass's, the
 /// ubatch walk's) that holds the target's hidden rows once the walk left
-/// them final ([`TargetRows`]): a walk's current buffer flips once at each
-/// PLE layer past layer 0.
+/// them final ([`TargetRows`]): buffer [`final_res`].
 fn final_streams<'b>(
     plans: &[Layer38],
     [s, a, wa]: [&'b Arena38; 3],
     walk: TargetRows,
 ) -> &'b DeviceBuffer<f32> {
-    let cur = plans.iter().skip(1).filter(|p| p.ple.is_some()).count() % 2;
+    let cur = final_res(plans);
     let arena = match walk {
         TargetRows::Step => s,
         TargetRows::Pass => a,
@@ -4557,7 +4555,7 @@ fn final_streams_mut<'b>(
     [s, a, wa]: [&'b mut Arena38; 3],
     walk: TargetRows,
 ) -> &'b mut DeviceBuffer<f32> {
-    let cur = plans.iter().skip(1).filter(|p| p.ple.is_some()).count() % 2;
+    let cur = final_res(plans);
     let arena = match walk {
         TargetRows::Step => s,
         TargetRows::Pass => a,

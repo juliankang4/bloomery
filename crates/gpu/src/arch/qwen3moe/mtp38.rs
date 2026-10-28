@@ -116,7 +116,9 @@ use crate::fault::Fault;
 use crate::flash_gqa::{GqaArgs, partials_ms_len, partials_v_len_256};
 use crate::gemm::{GemmAct32, GemmRoute};
 use crate::graph::Graph;
-use crate::hc_gated::{Before, HcMatrix, HcScratch, HcWideScratch, SiteWeights, WideMixArgs};
+use crate::hc_gated::{
+    Before, HcMatrix, HcScratch, HcWideScratch, SiteWeights, Streams, WideMixArgs,
+};
 use crate::host::handoff::Places;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};
@@ -2461,7 +2463,7 @@ impl Mtp38 {
         k.hcw.enqueue_mix(
             stream,
             WideMixArgs {
-                res: &mut s.res,
+                res: Streams::F32(&mut s.res),
                 before: Before::Plain,
                 w: SiteWeights {
                     gamma: f32_gain(w, &site.norm)?,

@@ -12,6 +12,14 @@ pub const U: f64 = U_F32 as f64;
 /// f64's unit roundoff, 2^-53.
 pub const U64: f64 = f64::EPSILON / 2.0;
 
+/// BF16's unit roundoff, 2^-8.
+pub use crate::act_rule::BF16_REL as U_BF16;
+
+/// `x` rounded to the nearest BF16, ties to even, as an f32.
+pub fn bf16_round(x: f32) -> f32 {
+    gguf::quant::bf16_bits_to_f32(gguf::quant::fp32_to_bf16_bits(x))
+}
+
 /// `γ(n) = n·u / (1 − n·u)` with f32's `u`: the relative bound on a result
 /// that went through `n` f32 roundings.
 pub fn gamma(n: usize) -> f64 {
@@ -139,7 +147,7 @@ pub fn q8_32_rel() -> f64 {
 /// The bound on a `k`-term dot with both operands rounded to BF16 and F32
 /// accumulation, as a fraction of its terms' absolute sum `Σ|w·x|`.
 pub fn bf16_dot_rel(k: usize) -> f64 {
-    let u = 1.0 / 256.0;
+    let u = U_BF16;
     2.0 * u + u * u + gamma(k)
 }
 

@@ -235,6 +235,8 @@ generate_ds41   hc_gated_mix_4                           0           0
 generate_ds41   hc_gated_mix_4_bf16                      0           0
 generate_ds41   hc_gated_norm_4                          0           0
 generate_ds41   hc_gated_norm_4w                         0           0
+generate_ds41   hc_gated_norm_4w16                       0           0
+generate_ds41   hc_gated_norm_4w16_bf16                  0           0
 generate_ds41   hc_gated_norm_4w_bf16                    0           0
 generate_ds41   hc_gated_up_mix_4x320                    0           0
 # PIN(2026-10-23): the new HC fused entry, ptxas 13.3.73 sm_121 and GB10 driver 595.84.
@@ -331,6 +333,7 @@ generate_ds41   nvfp4_gate_up_sel_cols                   0           0
 generate_ds41   nvfp4_gemv_sel32                         0           0
 generate_ds41   nvfp4_gemv_sel32_cols                    0           0
 generate_ds41   ple_conv                                 0           0
+generate_ds41   ple_conv_bf16                            0           0
 generate_ds41   ple_gate                                 0           0
 generate_ds41   q2_k_rows                                0           0
 generate_ds41   q38_card_shared_add                      0           0

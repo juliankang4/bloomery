@@ -52,7 +52,9 @@
 //! - `gv = value·gate`, one rounding;
 //! - conv: each tap's product rounded, the four summed oldest first, each sum
 //!   rounded (ggml's MUL per tap and ADD chain), then [`silu`];
-//! - `out = x + (gv + conv)`, two roundings.
+//! - `out = x + (gv + conv)`, two roundings; a BF16 `out` (a ubatch walk's
+//!   streams, `hc_gated::Streams`) rounds that value once more, to nearest
+//!   even.
 //!
 //! Every f32 product and sum the contract names is an explicit
 //! round-to-nearest intrinsic on the device: the compiler contracts a plain
@@ -60,7 +62,8 @@
 //!
 //! No silent failure: a key or stream whose sum of squares is not finite,
 //! a dot that is not finite, a gated value whose sum of squares is not
-//! finite (the gate's block), a conv sum or an output that is not finite, or
+//! finite (the gate's block), a conv sum or an output that is not finite (a
+//! BF16 output that rounds to an infinity included), or
 //! a position other than `pos[0] + t` (the conv) raises [`FaultSite::Ple`],
 //! and the values it reaches are NaN, never the zero a vanishing scale or
 //! the ½ a NaN dot's `sgn` would give.
@@ -68,6 +71,7 @@
 use crate::GpuError;
 use crate::elem::{RMS_THREADS, RMS_WARPS, rms_scale, rms_warp_tree};
 use crate::fault::{FaultSink, FaultSite};
+use crate::hc_gated::{Slots, Streams};
 use crate::launch_u32;
 use crate::linear::{PASS_ROWS, butterfly_f32, butterfly_f64, silu};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -322,6 +326,116 @@ unsafe fn tap(
 }
 
 // ---------------------------------------------------------------- kernels
+
+/// Thread `(u, c)` of a [`ple_kernels::ple_conv`] launch, `out` in either
+/// form of the streams ([`Slots`]): the kernel's doc says what it computes.
+///
+/// # Safety
+/// The entry's launch contract holds, `out` holds `m·hc·ROW` values, and
+/// the launch is the contract's 1-D grid of [`CONV_BLOCK`] threads.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+unsafe fn conv_unit<O: Slots>(
+    ngv: &[f32],
+    gv: &[f32],
+    x: &[f32],
+    w: &[f32],
+    pos: &[u32],
+    hc: u32,
+    m: u32,
+    fault: FaultSink,
+    out: &mut O,
+    ring: &mut DisjointSlice<f32>,
+) {
+    let ch = hc as usize * ROW;
+    let m = m as usize;
+    let gid = thread::blockIdx_x() as usize * CONV_BLOCK as usize + thread::threadIdx_x() as usize;
+    if gid >= units(m) * ch {
+        return;
+    }
+    let u = gid / ch;
+    let c = gid - u * ch;
+    let (t0, t1) = if u == 0 {
+        (0, m.min(HIST))
+    } else {
+        (u + HIST - 1, u + HIST)
+    };
+    // SAFETY: c < ch, so TAPS·c + 3 < TAPS·ch <= w.len() (launch
+    // contract).
+    let (w0, w1, w2, w3) = unsafe {
+        (
+            *w.get_unchecked(TAPS * c),
+            *w.get_unchecked(TAPS * c + 1),
+            *w.get_unchecked(TAPS * c + 2),
+            *w.get_unchecked(TAPS * c + 3),
+        )
+    };
+    let ring = ring.as_mut_ptr();
+    // SAFETY: pos holds m >= 1 words by the contract.
+    let p0 = u64::from(unsafe { *pos.get_unchecked(0) });
+    let mut ok = true;
+    let mut t = t0;
+    while t < t1 {
+        // SAFETY: t < m <= pos.len().
+        let pw = unsafe { *pos.get_unchecked(t) };
+        let p = pw as usize;
+        // SAFETY: t < m, c < ch; ngv holds m·ch values and the ring
+        // RING_ROWS·ch; the ring is read only when d > t, which holds only
+        // for t < HIST — unit 0's tokens — before unit 0's writes below.
+        let (i0, i1, i2) = unsafe {
+            (
+                tap(ngv, ring, t, p, 3 * DILATION, c, ch),
+                tap(ngv, ring, t, p, 2 * DILATION, c, ch),
+                tap(ngv, ring, t, p, DILATION, c, ch),
+            )
+        };
+        let at = t * ch + c;
+        // SAFETY: at < m·ch, inside ngv, gv and x by the launch contract.
+        let (i3, gvv, xv) = unsafe {
+            (
+                *ngv.get_unchecked(at),
+                *gv.get_unchecked(at),
+                *x.get_unchecked(at),
+            )
+        };
+        let acc = mul_rn_f32(i0, w0);
+        let acc = add_rn_f32(acc, mul_rn_f32(i1, w1));
+        let acc = add_rn_f32(acc, mul_rn_f32(i2, w2));
+        let acc = add_rn_f32(acc, mul_rn_f32(i3, w3));
+        let o = add_rn_f32(xv, add_rn_f32(gvv, silu(acc)));
+        let good = (u64::from(pw) == p0 + t as u64) & acc.is_finite() & o.is_finite();
+        // SAFETY: at < m·ch values of out; (t, c) is this thread's alone.
+        let held = unsafe { out.store(at, if good { o } else { f32::NAN }) };
+        // A finite value past the stored form's largest is held as an
+        // infinity: a non-finite output, NaN.
+        if good & !held.is_finite() {
+            // SAFETY: the same value of out, this thread's alone.
+            unsafe { out.store(at, f32::NAN) };
+        }
+        ok &= good & held.is_finite();
+        t += 1;
+    }
+    if u == 0 {
+        // `ngv` of the last min(m, RING_ROWS) tokens into their slots,
+        // after every read of the ring above.
+        let mut t = m.saturating_sub(RING_ROWS);
+        while t < m {
+            // SAFETY: t < m <= pos.len().
+            let slot = unsafe { *pos.get_unchecked(t) } as usize % RING_ROWS;
+            // SAFETY: slot < RING_ROWS and c < ch: inside the ring
+            // (RING_ROWS·ch values) and row t of ngv (m·ch values);
+            // channel c of the ring is this thread's alone.
+            unsafe { *ring.add(slot * ch + c) = *ngv.get_unchecked(t * ch + c) };
+            t += 1;
+        }
+    }
+    if !ok {
+        fault.raise(FaultSite::Ple);
+    }
+}
 
 #[cuda_module]
 mod ple_kernels {
@@ -592,89 +706,48 @@ mod ple_kernels {
         mut out: DisjointSlice<f32>,
         mut ring: DisjointSlice<f32>,
     ) {
-        let ch = hc as usize * ROW;
-        let m = m as usize;
-        let gid =
-            thread::blockIdx_x() as usize * CONV_BLOCK as usize + thread::threadIdx_x() as usize;
-        if gid >= units(m) * ch {
-            return;
-        }
-        let u = gid / ch;
-        let c = gid - u * ch;
-        let (t0, t1) = if u == 0 {
-            (0, m.min(HIST))
-        } else {
-            (u + HIST - 1, u + HIST)
-        };
-        // SAFETY: c < ch, so TAPS·c + 3 < TAPS·ch <= w.len() (launch
-        // contract).
-        let (w0, w1, w2, w3) = unsafe {
-            (
-                *w.get_unchecked(TAPS * c),
-                *w.get_unchecked(TAPS * c + 1),
-                *w.get_unchecked(TAPS * c + 2),
-                *w.get_unchecked(TAPS * c + 3),
-            )
-        };
-        let ring = ring.as_mut_ptr();
-        let outp = out.as_mut_ptr();
-        // SAFETY: pos holds m >= 1 words by the contract.
-        let p0 = u64::from(unsafe { *pos.get_unchecked(0) });
-        let mut ok = true;
-        let mut t = t0;
-        while t < t1 {
-            // SAFETY: t < m <= pos.len().
-            let pw = unsafe { *pos.get_unchecked(t) };
-            let p = pw as usize;
-            // SAFETY: t < m, c < ch; ngv holds m·ch values and the ring
-            // RING_ROWS·ch; the ring is read only when d > t, which holds only
-            // for t < HIST — unit 0's tokens — before unit 0's writes below.
-            let (i0, i1, i2) = unsafe {
-                (
-                    tap(ngv, ring, t, p, 3 * DILATION, c, ch),
-                    tap(ngv, ring, t, p, 2 * DILATION, c, ch),
-                    tap(ngv, ring, t, p, DILATION, c, ch),
-                )
-            };
-            let at = t * ch + c;
-            // SAFETY: at < m·ch, inside ngv, gv and x by the launch contract.
-            let (i3, gvv, xv) = unsafe {
-                (
-                    *ngv.get_unchecked(at),
-                    *gv.get_unchecked(at),
-                    *x.get_unchecked(at),
-                )
-            };
-            let acc = mul_rn_f32(i0, w0);
-            let acc = add_rn_f32(acc, mul_rn_f32(i1, w1));
-            let acc = add_rn_f32(acc, mul_rn_f32(i2, w2));
-            let acc = add_rn_f32(acc, mul_rn_f32(i3, w3));
-            let o = add_rn_f32(xv, add_rn_f32(gvv, silu(acc)));
-            let good = (u64::from(pw) == p0 + t as u64) & acc.is_finite() & o.is_finite();
-            // SAFETY: at < m·ch <= out.len(); (t, c) is this thread's alone.
-            unsafe {
-                *outp.add(at) = if good { o } else { f32::NAN };
-            }
-            ok &= good;
-            t += 1;
-        }
-        if u == 0 {
-            // `ngv` of the last min(m, RING_ROWS) tokens into their slots,
-            // after every read of the ring above.
-            let mut t = m.saturating_sub(RING_ROWS);
-            while t < m {
-                // SAFETY: t < m <= pos.len().
-                let slot = unsafe { *pos.get_unchecked(t) } as usize % RING_ROWS;
-                // SAFETY: slot < RING_ROWS and c < ch: inside the ring
-                // (RING_ROWS·ch values) and row t of ngv (m·ch values);
-                // channel c of the ring is this thread's alone.
-                unsafe { *ring.add(slot * ch + c) = *ngv.get_unchecked(t * ch + c) };
-                t += 1;
-            }
-        }
-        if !ok {
-            fault.raise(FaultSite::Ple);
-        }
+        // SAFETY: the launch contract above holds, with its grid.
+        unsafe { conv_unit(ngv, gv, x, w, pos, hc, m, fault, &mut out, &mut ring) };
+    }
+
+    /// [`ple_conv`] writing `out` as BF16 values, each rounded to nearest
+    /// even: a ubatch walk's streams (`hc_gated::Streams`). A finite output
+    /// that rounds past BF16's largest finite value is not finite: NaN, and
+    /// the launch raises.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            m >= 1,
+            ngv.len() >= m * hc * 2560,
+            gv.len() >= m * hc * 2560,
+            x.len() >= m * hc * 2560,
+            w.len() >= 4 * hc * 2560,
+            pos.len() >= m,
+            out.len() >= m * hc * 2560,
+            ring.len() >= 17 * hc * 2560
+        )
+    )]
+    pub fn ple_conv_bf16(
+        ngv: &[f32],
+        gv: &[f32],
+        x: &[f32],
+        w: &[f32],
+        pos: &[u32],
+        hc: u32,
+        m: u32,
+        fault: FaultSink,
+        mut out: DisjointSlice<u16>,
+        mut ring: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract above holds, with its grid.
+        unsafe { conv_unit(ngv, gv, x, w, pos, hc, m, fault, &mut out, &mut ring) };
     }
 }
 
@@ -704,8 +777,9 @@ pub struct PleGateArgs<'a> {
 /// streams `x`, the conv weight `w` (`TAPS·hc·ROW`, tap-fastest as the file
 /// stores `ple_conv1d`), the call's position words `pos` (`m`), the conv's
 /// taps and dilation as the model states them (refused unless [`TAPS`] and
-/// [`DILATION`]), and the outputs: `out` in `x`'s layout, and the ring
-/// ([`ring_len`] values, read and written in place).
+/// [`DILATION`]), and the outputs: `out` in `x`'s layout, as F32 values or
+/// BF16 ones ([`Streams`]), and the ring ([`ring_len`] values, read and
+/// written in place).
 pub struct PleConvArgs<'a> {
     pub ngv: &'a DeviceBuffer<f32>,
     pub gv: &'a DeviceBuffer<f32>,
@@ -717,7 +791,7 @@ pub struct PleConvArgs<'a> {
     pub hc: usize,
     pub m: usize,
     pub fault: FaultSink,
-    pub out: &'a mut DeviceBuffer<f32>,
+    pub out: Streams<'a>,
     pub ring: &'a mut DeviceBuffer<f32>,
 }
 
@@ -819,12 +893,20 @@ impl PleKernels {
         let grid = launch_u32(WHAT, "grid", threads.div_ceil(CONV_BLOCK as usize))?;
         let hc = launch_u32(WHAT, "hc", a.hc)?;
         let m = launch_u32(WHAT, "m", a.m)?;
-        let prep = self
-            .module
-            .prepare_ple_conv(LaunchConfig1D::new(grid, CONV_BLOCK, 0))?;
-        self.module.ple_conv(
-            stream, &prep, a.ngv, a.gv, a.x, a.w, a.pos, hc, m, a.fault, a.out, a.ring,
-        )?;
+        let cfg = LaunchConfig1D::new(grid, CONV_BLOCK, 0);
+        let (ngv, gv, x, w, pos, fault) = (a.ngv, a.gv, a.x, a.w, a.pos, a.fault);
+        match a.out {
+            Streams::F32(out) => {
+                let prep = self.module.prepare_ple_conv(cfg)?;
+                self.module
+                    .ple_conv(stream, &prep, ngv, gv, x, w, pos, hc, m, fault, out, a.ring)?;
+            }
+            Streams::Bf16(out) => {
+                let prep = self.module.prepare_ple_conv_bf16(cfg)?;
+                self.module
+                    .ple_conv_bf16(stream, &prep, ngv, gv, x, w, pos, hc, m, fault, out, a.ring)?;
+            }
+        }
         Ok(())
     }
 

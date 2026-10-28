@@ -12,7 +12,7 @@
 //! ([`store_rule_bytes`]).
 
 use super::body::KvQ8;
-use super::plan38::{GDN, geo};
+use super::plan38::{GDN, Layer38, geo};
 use super::router::{RouterDims, RouterOut};
 use super::scratch::{
     Dims, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, RecStore, fresh_stamps, param_view, put_input,
@@ -222,7 +222,11 @@ pub(super) struct Arena38 {
     pub(super) n_keys: DeviceBuffer<u32>,
     /// The residual streams, `[rows][STREAMS][HIDDEN]`, in two buffers: the
     /// PLE site writes the streams into the other one, and the walk goes on
-    /// from there.
+    /// from there; a walk leaves its last streams in buffer [`final_res`].
+    /// A ubatch walk carries its streams as BF16 values in the first
+    /// `rows·STREAMS·HIDDEN` halfwords of the other buffer, and writes F32
+    /// values into buffer [`final_res`] only where a PLE site reads them and
+    /// where its last combine leaves its last streams.
     pub(super) res: [DeviceBuffer<f32>; 2],
     /// A mix's output (the mixer's input) and a sub-layer's output (the next
     /// combine's input).
@@ -256,6 +260,13 @@ pub(super) struct Arena38 {
     /// ([`Branch`](crate::Branch)) and so share none of its.
     pub(super) by: ByName,
     pub(super) by_fork: ByName,
+}
+
+/// The buffer of [`Arena38::res`] that holds a walk's last streams under
+/// `plans`: a walk starts in buffer 0 and each PLE site past layer 0 moves it
+/// to the other one.
+pub(super) fn final_res(plans: &[Layer38]) -> usize {
+    plans.iter().skip(1).filter(|p| p.ple.is_some()).count() % 2
 }
 
 impl Arena38 {
