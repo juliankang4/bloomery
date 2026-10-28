@@ -74,7 +74,10 @@
 # card lock, so it holds none — printing `[batch-hold]` lines at once and once a minute, inside CARD_BOUND (75 at the bound, as
 # contention is today, with its seconds in a `waited N s for the batch hold` line that tools/gate-batch.sh subtracts). The batch's own
 # items pass. A hold whose mtime is 300 s old is stale (the batch or its link to the box is gone): the run ignores it, saying so once.
-# A hold that cannot be read is read as up, never as free. The name does not match tools/ref/lease-probe.sh's LEASE_HOLDS
+# A hold that cannot be read is read as up, never as free. A run with BLOOMERY_HOLD_YIELD=1 (the items of a round batch,
+# tools/gate-batch.sh --round-ledger) does not wait: the first poll that finds a fresh hold of another owner up ends it with 75,
+# naming the owner (`is up: yielding at the first probe`), holding no lock, so its lane takes its next item at once.
+# The name does not match tools/ref/lease-probe.sh's LEASE_HOLDS
 # (/root/bloomery-*-hold): builds and every non-GPU box command ignore it. The file has one writer, this script:
 #   gpu-gate.sh --gpuhold up|beat|down <owner>   up: put it up (75 while another owner's fresh hold is up; a stale one is taken over);
 #                                                beat: refresh its mtime, never create it (3: gone or another owner's);
@@ -452,7 +455,7 @@ PY
   }
   local gate_args=()
   local gate_env=(env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES
-    -u BLOOMERY_TIER -u CARGO_BUILD_TARGET -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S
+    -u BLOOMERY_TIER -u CARGO_BUILD_TARGET -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_HOLD_YIELD -u BLOOMERY_GATE_BUILD_BOUND -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S
     -u GATE_TEST_PACE -u GATE_TIMEOUT_PID -u STUB_ORDER -u STUB_ID -u STUB_COMPUTE_UUID -u STUB_COMPUTE_RC PATH="$t/bin:$PATH")
   # gate <out file> <BLOOMERY_GATE_CARD> <lease file> [K=V…]: one run of the runner, its rc (TL=<dir>: the dir its locks and its
   # batch hold live in, default the test's own; GB=<s>: its own bound, default the failsafe $fs s, and for a run that takes
@@ -1556,6 +1559,29 @@ PY
     'ok on the 3090 \(asked 3090\)' '!waits' \
     '\[batch-hold\] .*batch\.gpuhold \(owner other\) is stale — not refreshed for [4-9][0-9][0-9] s \(stale at 300 s\)' 'hold lines: 1$'
   case_ 'BLOOMERY_BATCH_OWNER with a character other than letters, digits, _: 64, named' 64 "BLOOMERY_BATCH_OWNER is the batch hold's owner .*got 'a-b'" 3090 "$t/lease" BLOOMERY_BATCH_OWNER=a-b
+  # A round batch's item (BLOOMERY_HOLD_YIELD=1, the header) does not wait the hold out: the first probe that finds it up ends the run 75,
+  # naming the owner, inside the 4 s a waiting run spends on the same hold. A run that passes today still passes with it set: the hold's own
+  # owner, a stale hold, no hold.
+  hold other 0
+  y0=$SECONDS
+  rc=0
+  gate "$t/out" 3090 "$t/lease" BLOOMERY_HOLD_YIELD=1 || rc=$?
+  echo "yielded inside the bound: $([ $((SECONDS - y0)) -lt 4 ] && echo yes || echo no)" >> "$t/out"
+  judge_all 'a round item meets a fresh hold: it yields at the first probe, naming the owner, without waiting' "$rc" 75 \
+    'the batch hold .*batch\.gpuhold \(owner other\) is up: yielding at the first probe .*contention' 'yielded inside the bound: yes$' \
+    '!was still up after' '!waits: a landing batch' '!ok on the'
+  rc=0
+  gate "$t/out" 3090 "$t/lease" BLOOMERY_HOLD_YIELD=1 BLOOMERY_BATCH_OWNER=other || rc=$?
+  judge_all "  … the hold's own batch still passes with it set" "$rc" 0 'ok on the 3090 \(asked 3090\)' '!batch-hold|batch hold'
+  hold other 400
+  rc=0
+  gate "$t/out" 3090 "$t/lease" BLOOMERY_HOLD_YIELD=1 || rc=$?
+  judge_all '  … a stale hold is ignored as before' "$rc" 0 'ok on the 3090 \(asked 3090\)' '!yielding'
+  rm -f "$t/batch.gpuhold"
+  rc=0
+  gate "$t/out" 3090 "$t/lease" BLOOMERY_HOLD_YIELD=1 || rc=$?
+  judge_all '  … no hold, no yield' "$rc" 0 'ok on the 3090 \(asked 3090\)' '!yielding|batch hold'
+  case_ 'BLOOMERY_HOLD_YIELD other than 1 or 0: 64, named' 64 "BLOOMERY_HOLD_YIELD is 1 .*got '2'" 3090 "$t/lease" BLOOMERY_HOLD_YIELD=2
   # The writer: up, beat and down on the file, owner-checked; the wait above reads what it writes.
   hrun up batcha
   judge_all 'gpuhold up: puts the hold up with its owner and the box clock' "$rc" 0 'up: owner batcha$' 'after: owner=batcha since=[0-9]+ age=[0-9]+ fresh=yes$'
@@ -1644,6 +1670,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import tomllib
 
 args = sys.argv[1:]
@@ -1658,11 +1685,14 @@ context["LD_LIBRARY_PATH"] = package + "/native" + (":" + context["LD_LIBRARY_PA
 if os.environ.get("LIB_ARGV"):
     Path(os.environ["LIB_ARGV"]).write_text("".join(arg + "\n" for arg in sys.argv[1:]), encoding="utf-8")
 print("compiler output before capture", flush=True)
+time.sleep(float(os.environ.get("LIB_COMPILE_SLEEP", "0")))
 if os.environ.get("LIB_COMPILED"):
     Path(os.environ["LIB_COMPILED"]).write_text("compiled\n", encoding="utf-8")
 code = int(os.environ.get("LIB_COMPILE_EXIT", "0"))
 if code:
     sys.exit(code)
+if "--no-run" in args:
+    sys.exit(0)
 if "--config" not in args:
     os.chdir(package)
     os.execve(exe, [exe, *test_args], context)
@@ -1831,6 +1861,19 @@ PY
   rc=0
   TL="$t/lib-unopenable" lib_gate "$t/out" 3090 || rc=$?
   judge 'lib path keeps lock-open failure code' "$rc" 69 '.'
+  # The capture call is the build (tools/gate.sh's header): it has a bound of its own, and the card test the run bound. A compile slower
+  # than the run bound but inside the build bound goes through to the test; one past the build bound ends 124 naming the build phase
+  # and starts no test. The compile of the first case outlasts the run bound (5 s) by 3 s.
+  rm -f "$t/started"
+  rc=0
+  lib_gate "$t/out" 3090 BLOOMERY_GATE_BOUND=5 BLOOMERY_GATE_BUILD_BOUND=60 LIB_COMPILE_SLEEP=8 || rc=$?
+  judge 'lib path: a build slower than the run bound, inside the build bound, runs the test' "$rc" 0 '^lib-card='
+  rm -f "$t/started"
+  rc=0
+  lib_gate "$t/out" 3090 BLOOMERY_GATE_BOUND=60 BLOOMERY_GATE_BUILD_BOUND=2 LIB_COMPILE_SLEEP=20 || rc=$?
+  [ ! -e "$t/started" ] && echo child-not-started >> "$t/out"
+  judge_all 'lib path: a build past the build bound ends 124 naming the build phase and starts no test' "$rc" 124 \
+    'GATE TIMED OUT in the build phase after the 2s build bound' '^child-not-started$'
   # A runtime bound and an external signal both stop the child and release the lock.
   for stop in bound kill signal; do
     fifos
@@ -1972,6 +2015,11 @@ esac
 # BLOOMERY_BATCH_OWNER: the owner of the batch hold this run's batch put up (the header); the batch exports it into each item's box env.
 case ${BLOOMERY_BATCH_OWNER:-} in
   *[!A-Za-z0-9_]*) echo "gpu-gate.sh: BLOOMERY_BATCH_OWNER is the batch hold's owner (letters, digits and _) or unset, got '$BLOOMERY_BATCH_OWNER'" >&2; exit 64 ;;
+esac
+# BLOOMERY_HOLD_YIELD: `1` yields to a batch hold at the first probe instead of waiting for it (the header).
+case ${BLOOMERY_HOLD_YIELD:-0} in
+  0 | 1) ;;
+  *) echo "gpu-gate.sh: BLOOMERY_HOLD_YIELD is 1 (yield to a batch hold at the first probe) or 0/unset, got '$BLOOMERY_HOLD_YIELD'" >&2; exit 64 ;;
 esac
 # BLOOMERY_V41_CLASS and BLOOMERY_V41_PRED_S: the V4.1 load queue's class and the calling recipe's predicted wall (the header).
 CLASS=${BLOOMERY_V41_CLASS:-2}
@@ -2348,6 +2396,10 @@ while :; do
     [ -n "$GOT" ] || why=card
   fi
   [ -n "$why" ] || break
+  if [ "$why" = hold ] && [ "${BLOOMERY_HOLD_YIELD:-0}" = 1 ]; then
+    echo "gpu-gate.sh: $NAME: the batch hold $GPU_HOLD (owner $HOLD_OWNER) is up: yielding at the first probe (BLOOMERY_HOLD_YIELD=1), not waiting for it — contention, not a red gate (rc 75)" >&2
+    exit 75
+  fi
   if [ "$why" = hold ] && [ $((HOLD_W - hsaid)) -ge 60 ]; then
     up_s='?'
     [ -z "$HOLD_SINCE" ] || up_s=$(($(date +%s) - HOLD_SINCE))

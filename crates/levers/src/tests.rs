@@ -2447,6 +2447,20 @@ fn gate_bound_is_the_runners_parser() {
     }
 }
 
+/// `BLOOMERY_GATE_BUILD_BOUND` is the same parser's second variable: its row's
+/// default is the parser's, and its kind is the test bound's.
+#[test]
+fn gate_build_bound_is_the_runners_parser() {
+    let row = spec("BLOOMERY_GATE_BUILD_BOUND").expect("a row");
+    let default = GATE_BOUND_PARSER
+        .split_once("${BLOOMERY_GATE_BUILD_BOUND-")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(d, _)| d)
+        .expect("the parser's default");
+    assert_eq!(row.default, Unset::Is(default));
+    assert_eq!(row.kind, spec("BLOOMERY_GATE_BOUND").expect("a row").kind);
+}
+
 /// One line of `tools/levers-direct.txt`: a file, the variables it reads in
 /// place, and the round that converts or removes the read.
 struct AllowLine<'a> {

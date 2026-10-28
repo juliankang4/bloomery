@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# The bound of the gate runners (tools/gate.sh, tools/gpu-gate.sh, tools/host-gate.sh): the seconds
-# a gate's binary may run before `timeout` ends it, BLOOMERY_GATE_BOUND, 900 when unset, and
+# The bounds of the gate runners (tools/gate.sh, tools/gpu-gate.sh, tools/host-gate.sh): the seconds
+# a gate's binary may run before `timeout` ends it, BLOOMERY_GATE_BOUND, 900 when unset, the seconds
+# tools/gate.sh's cargo build may take before it is ended, BLOOMERY_GATE_BUILD_BOUND, 2700 when unset (a
+# build that waits on the build-directory lock and compiles a cold cone is not a hang), and
 # run_bounded, which runs the bounded command so that an ended runner takes it with it (also
 # tools/ref/lease.sh's lease_bounded, under a bound of its own), and lease_stop, the process-group
 # stop shared by run_bounded and the lease runners. Sourced, never executed; one parser, so the
 # three runners take and refuse the same values.
 #
-# The value is a base-10 whole number from 1 up, with no sign and no leading zero; anything else is
+# Each value is a base-10 whole number from 1 up, with no sign and no leading zero; anything else is
 # refused by name, set-and-empty included. GNU timeout reads 0 (00 as well) as no bound at all, so a
 # gate handed one hangs as long as it likes; a value timeout itself refuses (a sign, a word) would end
 # the runner with timeout's 125, reported as a red gate.
@@ -18,15 +20,26 @@
 #   74   bounded: the FIFO named by LEASE_BOUNDED_OUT or LEASE_BOUNDED_ERR got no write end in LEASE_FIFO_TRIES
 #        tries, the command not started
 #
-#   gate_bound <runner>   BOUND=<the value>, or the refusal on stderr and 64
-gate_bound() {
-  local v=${BLOOMERY_GATE_BOUND-900}
-  if ! [[ $v =~ ^[1-9][0-9]*$ ]]; then
-    echo "$1: BLOOMERY_GATE_BOUND is whole seconds from 1 up, base 10 with no sign or leading zero (unset: 900), got '$v'" >&2
+#   gate_bound <runner>        BOUND=<the value>, or the refusal on stderr and 64
+#   gate_build_bound <runner>  BUILD_BOUND=<the value>, or the refusal on stderr and 64
+# __whole_seconds <runner> <variable> <value> <default>: 0 for a base-10 whole number from 1 up, else the named refusal and 64.
+__whole_seconds() {
+  if ! [[ $3 =~ ^[1-9][0-9]*$ ]]; then
+    echo "$1: $2 is whole seconds from 1 up, base 10 with no sign or leading zero (unset: $4), got '$3'" >&2
     return 64
   fi
+}
+gate_bound() {
+  local v=${BLOOMERY_GATE_BOUND-900}
+  __whole_seconds "$1" BLOOMERY_GATE_BOUND "$v" 900 || return $?
   # shellcheck disable=SC2034 # the sourcing runner reads it
   BOUND=$v
+}
+gate_build_bound() {
+  local v=${BLOOMERY_GATE_BUILD_BOUND-2700}
+  __whole_seconds "$1" BLOOMERY_GATE_BUILD_BOUND "$v" 2700 || return $?
+  # shellcheck disable=SC2034 # the sourcing runner reads it
+  BUILD_BOUND=$v
 }
 
 # stop_pid_ok <caller> <pid>: 0 for a pid from 2 up, else a named refusal on stderr and 1, before anything is signalled.
@@ -1111,6 +1124,16 @@ time.sleep(60)' "$t/ended.pg" &
       echo "signals=$(grep -c . "$LOG")"' _ "$self" "$p" 2>&1)
     check "stop-pid-guard-[$p]" "$(grep -E '^(stop|clear) rc=|^signals=' <<< "$out" | tr '\n' ' ')" 'stop rc=70 clear rc=70 signals=0 '
   done
+  # build-bound: gate_build_bound takes what gate_bound takes (a base-10 whole number from 1 up) and names its own variable in the
+  # refusal; unset is 2700; the two bounds do not read each other's variable.
+  for p in '' 0 00 007 +5 -1 ' 5' '5 ' 5x abc 1e3; do
+    out=$(BLOOMERY_GATE_BUILD_BOUND=$p bash -c 'source "$1"; gate_build_bound gate.sh; echo "rc=$?"' _ "$self" 2>&1)
+    check "build-bound-refuses-[$p]" "$(grep -c '^gate.sh: BLOOMERY_GATE_BUILD_BOUND is whole seconds from 1 up' <<< "$out") $(grep '^rc=' <<< "$out")" '1 rc=64'
+  done
+  out=$(env -u BLOOMERY_GATE_BUILD_BOUND bash -c 'source "$1"; gate_build_bound gate.sh; echo "rc=$? bound=$BUILD_BOUND"' _ "$self" 2>&1)
+  check build-bound-default "$out" 'rc=0 bound=2700'
+  out=$(BLOOMERY_GATE_BUILD_BOUND=90 BLOOMERY_GATE_BOUND=3 bash -c 'source "$1"; gate_bound gate.sh && gate_build_bound gate.sh; echo "rc=$? bound=$BOUND build=$BUILD_BOUND"' _ "$self" 2>&1)
+  check build-bound-independent "$out" 'rc=0 bound=3 build=90'
   echo "gate-bound self-test: $([ "$bad" = 0 ] && echo ok || echo FAIL) ($bad failures)"
   [ "$bad" = 0 ]
 }

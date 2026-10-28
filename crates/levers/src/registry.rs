@@ -2167,6 +2167,23 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             script: Some("gate-bound.sh"),
         },
     },
+    LeverSpec {
+        name: "BLOOMERY_GATE_BUILD_BOUND",
+        class: Class::R,
+        kind: Kind::Count {
+            min: 1,
+            max: u64::MAX,
+            trim: false,
+        },
+        default: Unset::Is("2700"),
+        doc: "Seconds `tools/gate.sh` lets its cargo build run before it kills it, apart from \
+              the test's own bound (`BLOOMERY_GATE_BOUND`): a build that waits on the \
+              build-directory lock and compiles a cold cone is slow, not hung. The parser is \
+              `tools/gate-bound.sh`'s, as for the test's bound.",
+        site: Site::Env {
+            script: Some("gate-bound.sh"),
+        },
+    },
     runner(
         "BLOOMERY_GATE_CARD",
         Some("gpu-gate.sh"),
@@ -2283,6 +2300,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         Some("box.sh"),
         "The owner of the hold a sitting put up (`/root/bloomery-<owner>-hold`); a box \
          command that names it passes that hold.",
+    ),
+    runner(
+        "BLOOMERY_HOLD_YIELD",
+        Some("gpu-gate.sh"),
+        "`1`: the run yields to a batch's GPU hold at its first probe (rc 75 naming the \
+         hold's owner) instead of waiting for it; `tools/gate-batch.sh --round-ledger` sets it \
+         in each item's box env. Unset or `0`: the run waits for the hold, as today.",
     ),
     runner(
         "BLOOMERY_HOST_BOUND",

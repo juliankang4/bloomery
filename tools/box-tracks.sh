@@ -7,6 +7,8 @@
 #                                        # 프로세스가 도는(실행 파일이 target/ 아래이거나 cwd가 그 안인) stale도 건너뛴다.
 #                                        # 이름을 안 준 새 stale은 이름을 찍고 건너뛴다. 이름 없는 --remove는 거절(64).
 #   tools/box-tracks.sh --self-test      # 분류와 삭제 선택을 고정 입력으로 검사한다(ssh 없음; check-recipes가 돌린다).
+# 목록 끝에는 박스 루트 드라이브와 /models의 사용률이 한 줄씩 나오고(`use <mount> <n> % of <size> GiB, <free> GiB free`), 어느 쪽이든
+# 90 % 이상이면 `box-tracks: disk <mount> is <n> % used` 줄이 stderr에 나온다. 읽기만 한다 — 지우는 일은 여전히 이름을 준 --remove뿐이다.
 # 막는 실패 둘: 워크트리는 지웠는데 원격 디렉터리(target/ 포함 수백 MB)가 남아 쌓이는 것, 그리고 사람이 읽은
 # 목록과 실제로 지우는 집합이 다른 것 — 목록을 본 뒤 --remove까지 사이에 다른 세션이 워크트리를 지우면, 이름 없이
 # "stale 전부"를 지우던 옛 형태는 그 세션이 아직 쓰려던 박스 디렉터리까지 지웠다.
@@ -57,6 +59,18 @@ select_removals() {
   return $rc
 }
 
+# disk_report: stdin is `df -Pk` of the box root and /models. One `use` line per filesystem, and for each at DISK_WARN_PCT or more a
+# line starting `box-tracks: disk` on stderr: the root drive filling up is what kills a build or a requant half way. Reads only.
+DISK_WARN_PCT=90
+disk_report() {
+  awk -v warn="$DISK_WARN_PCT" '
+    NF >= 6 && $5 ~ /^[0-9]+%$/ {
+      pct = substr($5, 1, length($5) - 1) + 0
+      printf "use    %s %d %% of %.0f GiB, %.0f GiB free\n", $6, pct, $2 / 1048576, $4 / 1048576
+      if (pct >= warn) printf "box-tracks: disk %s is %d %% used (the floor is %d %%): free it before the next build or requant; stale tracks and aux trees above are the cheap ones\n", $6, pct, warn | "cat 1>&2"
+    }'
+}
+
 self_test() {
   local fails=0 table out rc
   local du=$'1.2G\t./bloomery\n300M\t./bloomery-a\n10M\t./bloomery-a-base\n400M\t./bloomery-b\n500M\t./bloomery-c\n20M\t./bloomery-b-base'
@@ -77,6 +91,22 @@ self_test() {
   # 이름 없는 --remove는 거절.
   rc=0; bash "$0" --remove > /dev/null 2>&1 || rc=$?
   check bare-remove-refused "$rc" 64
+  # 디스크 바닥: df -Pk의 고정 입력(한 줄이 가짜 df의 출력). 루트 91 %는 경고, 80 %는 사용률만, 정확히 90 %는 경고, 89 %는 아니다.
+  # /models만 차도 경고하고, 경고는 stderr에 나온다.
+  local hdr='Filesystem 1024-blocks Used Available Capacity Mounted on'
+  df_of() { printf '%s\n/dev/nvme1n1p2 1921724672 %s 100000000 %s%% /\n/dev/nvme0n1 3844000000 1000000000 2000000000 %s%% /models\n' "$hdr" 1 "$1" "$2"; }
+  out=$(disk_report <<< "$(df_of 91 40)" 2>&1)
+  check disk-91-warns "$(grep -c '^box-tracks: disk / is 91 % used' <<< "$out") $(grep -c '^use    / 91 % of 1833 GiB' <<< "$out")" "1 1"
+  out=$(disk_report <<< "$(df_of 80 40)" 2>&1)
+  check disk-80-quiet "$(grep -c '^box-tracks: disk' <<< "$out" || true) $(grep -c '^use    / 80 %' <<< "$out")" "0 1"
+  out=$(disk_report <<< "$(df_of 90 40)" 2>&1)
+  check disk-90-warns "$(grep -c '^box-tracks: disk / is 90 % used' <<< "$out")" 1
+  out=$(disk_report <<< "$(df_of 89 40)" 2>&1)
+  check disk-89-quiet "$(grep -c '^box-tracks: disk' <<< "$out" || true)" 0
+  out=$(disk_report <<< "$(df_of 50 95)" 2>&1)
+  check disk-models-warns "$(grep -c '^box-tracks: disk /models is 95 % used' <<< "$out") $(grep -c '^box-tracks: disk / ' <<< "$out" || true)" "1 0"
+  out=$(disk_report <<< "$(df_of 91 40)" 2> /dev/null)
+  check disk-warning-on-stderr "$(grep -c '^box-tracks: disk' <<< "$out" || true)" 0
   [ "$fails" = 0 ] && echo "box-tracks: self-test ok" || { echo "box-tracks: self-test $fails failed" >&2; return 1; }
 }
 
@@ -99,6 +129,11 @@ live=$(git -C "$HERE" worktree list --porcelain | awk '/^worktree /{print $2}' |
 table=$(ssh "$HOST" "cd ~/repo && du -sh ${MAIN} ${MAIN}-* 2>/dev/null" | classify "$MAIN" "$live")
 awk '{ printf "%-6s %6s  %s%s\n", $1, $2, $3, ($4 != "" ? " (live track " $4 ")" : "") }' <<< "$table"
 nstale=$(awk '$1 == "stale"' <<< "$table" | wc -l | tr -d ' ')
+# The box's root drive and /models: their use, and a warning at the floor. Read only; an unreadable df is named, never silent.
+dfrc=0
+dfout=$(ssh "$HOST" 'df -Pk / /models' 2> /dev/null) || dfrc=$?
+[ -z "$dfout" ] || disk_report <<< "$dfout"
+[ "$dfrc" = 0 ] || echo "box-tracks: disk: df on $HOST ended rc $dfrc, so a filesystem above may be missing" >&2
 if [ $# = 0 ]; then
   echo "$nstale stale — delete by name: tools/box-tracks.sh --remove NAME…"
   exit 0

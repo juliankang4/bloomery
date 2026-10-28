@@ -12,8 +12,13 @@
 #     꼴이었고, echo가 성공하므로 시험 실패든 타임아웃이든 레시피가 0으로 끝났다(같은 날 저녁 리뷰에서
 #     발견; 평범한 시험 실패에도 "TIMED OUT"이 찍혔다). 종료 코드의 소유자는 이 스크립트 하나다:
 #     cargo의 코드를 그대로 돌려주고, 타임아웃 문구는 타임아웃일 때만 찍는다.
-# The bound is BLOOMERY_GATE_BOUND, parsed by tools/gate-bound.sh: a value it refuses ends this runner
-# with 64 before cargo runs.
+# Two bounds, parsed by tools/gate-bound.sh: a value it refuses ends this runner with 64 before cargo runs.
+# BLOOMERY_GATE_BOUND (900) is the test's: its run (a GPU test's is gpu-gate.sh's, after its lock waits).
+# BLOOMERY_GATE_BUILD_BOUND (2700) is the build's: a build that waits on the build-directory lock and then compiles a
+# cold dependency cone is slow, not hung, and must not be killed with its compiler work thrown away. A call without
+# --gpu builds first by its own cargo call (`cargo test … --no-run`: cargo's arguments, before the first `--`) under
+# the build bound, then runs under the run bound; the second call finds everything built (a --doc call has no build call:
+# cargo refuses --no-run with --doc). A build that runs out ends 124 and says it was the build phase; the run never starts.
 # --gpu before --oxide selects one native --lib test target. Its bounded Cargo call compiles
 # outside the card lock and invokes a capture-only target runner, never the test. Cargo owns the
 # executable, arguments, package cwd and runtime environment; a private JSON capture retains them.
@@ -35,9 +40,9 @@
 # printing "running 0 tests" is normal: `--lib --test x -- f` names a test of one target). A call with
 # no filter, or with `--list`, is not judged.
 #
-# Exit codes: cargo's or the GPU test's own (0 green, 101 a test failed, …); 124 or 137 the bound ran
-# out; 64 invalid bound or GPU test selection; 78 a filter matched no test that passed. GPU calls
-# also preserve gpu-gate.sh's refusals (2 missing executable, 69 lock-open failure, 75 contention).
+# Exit codes: cargo's or the GPU test's own (0 green, 101 a test failed or a build failed, …); 124 or 137 a bound ran
+# out (the build's, named, or the run's); 64 invalid bound or GPU test selection; 78 a filter matched no test that passed.
+# GPU calls also preserve gpu-gate.sh's refusals (2 missing executable, 69 lock-open failure, 75 contention).
 set -uo pipefail
 # Cargo's internal target runner: record its execution context, without running the executable.
 if [ "${1:-}" = --capture-test ]; then
@@ -58,6 +63,19 @@ fi
 # shellcheck source=tools/gate-bound.sh
 source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
 gate_bound gate.sh || exit $?
+gate_build_bound gate.sh || exit $?
+# build_bounded <command…>: the build phase under BUILD_BOUND, in this shell (run_bounded's contract); returns its status.
+# The caller ends with it, so a build that ran out or failed never starts the run.
+build_bounded() {
+  run_bounded timeout --kill-after=10 "$BUILD_BOUND" "$@"
+  local rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    echo "GATE TIMED OUT in the build phase after the ${BUILD_BOUND}s build bound (exit $rc, BLOOMERY_GATE_BUILD_BOUND) — no test ran; a gate that hangs is a red gate, not a silent one" >&2
+  elif [ "$rc" -ne 0 ]; then
+    echo "GATE RED (exit $rc) in the build phase — no test ran" >&2
+  fi
+  return "$rc"
+}
 GPU_ARGS=()
 if [ "${1:-}" = --test-locks ]; then
   [ $# -ge 4 ] && [ -d "$2" ] && [ "$3" = --gpu ] || exit 64
@@ -213,9 +231,7 @@ if found:
 PY
   # The CLI runner config for the host triple outranks a runner from the environment or a config file: cargo's call
   # only records the test, and the replay below takes the card lock.
-  run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} --config "$RUNNER_CONFIG" -- ${ARGS[@]+"${ARGS[@]}"}
-  rc=$?
-  [ "$rc" = 0 ] || exit "$rc"
+  build_bounded "${RUN[@]}" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} --config "$RUNNER_CONFIG" -- ${ARGS[@]+"${ARGS[@]}"} || exit $?
   [ -z "$BIN_SIGNAL" ] || exit 143
   RUN=(python3 -c '
 import json
@@ -235,6 +251,21 @@ os.execvpe("bash", ["bash", runner, *runner_args, "--executable", *context["argv
 ' "$CAPTURE" "$GPU_RUNNER" ${GPU_ARGS[@]+"${GPU_ARGS[@]}"})
   ARGS=()
 fi
+# The build phase of a call without --gpu (the --gpu build is the capture call above): its own cargo call under its own bound,
+# cargo's arguments up to the first `--` and --no-run; the libtest arguments after it are the run's. It runs after a filter's
+# FIFO and tee are up (a setup that fails ends 70 before any cargo call), its output straight to this runner's own. A --doc call
+# has none: cargo refuses --no-run with --doc, and a doctest call compiles the library inside its run, under the run bound.
+build_phase() {
+  [ "$GPU" = 0 ] || return 0
+  local a build=()
+  for a in "$@"; do
+    [ "$a" != -- ] || break
+    [ "$a" != --doc ] || return 0
+    build+=("$a")
+  done
+  build_bounded "${RUN[@]}" ${build[@]+"${build[@]}"} --no-run || exit $?
+  [ -z "$BIN_SIGNAL" ] || exit 143
+}
 run_tests() {
   if [ "$GPU" = 1 ]; then
     # gpu-gate.sh owns the runtime bound, after its lock waits.
@@ -244,6 +275,7 @@ run_tests() {
   fi
 }
 if [ "${#FILTERS[@]}" = 0 ] || [ "$LISTING" = 1 ]; then
+  build_phase "$@"
   run_tests
   rc=$?
 else
@@ -267,6 +299,7 @@ else
   tee "$LOG" < "$LOG.out" &
   TEE_PID=$!
   [ -z "$TEE_EXIT" ] || exit "$TEE_EXIT"
+  build_phase "$@"
   run_tests > "$LOG.out"
   rc=$?
   wait "$TEE_PID" || { tee_rc=$?; [ "$rc" -ne 0 ] || rc=$tee_rc; }

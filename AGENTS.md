@@ -62,10 +62,13 @@ reference; what follows is the contract.
     just lab-engram           # the engram IO lab's tests; lab-, not gate-, so no engine landing selects it
     just gate-refset / refset-check   # the reference-set readers and every family's sets in place
 
-- **Bounds and exit codes.** Every `gate-*` recipe runs under `timeout --kill-after=10 900`; the exit code has one
-  owner, `tools/gate.sh`. GPU gate binaries run through `tools/gpu-gate.sh`: it takes a card's gate lock, runs under
-  the same bound (`BLOOMERY_GATE_BOUND`, whole seconds ≥ 1, parsed by `tools/gate-bound.sh`; any other value ends the
-  runner with 64), and returns the binary's code (124/137 timed out, 75 lock contention, 69 a lock file it cannot open).
+- **Bounds and exit codes.** Every `gate-*` recipe runs its tests under `timeout --kill-after=10 900`
+  (`BLOOMERY_GATE_BOUND`) and `tools/gate.sh` runs the cargo build apart under `BLOOMERY_GATE_BUILD_BOUND` (2700): a
+  build that waits on the build-directory lock or compiles a cold cone is slow, not hung, and one past its bound ends
+  124 naming the build phase. Both are whole seconds ≥ 1, parsed by `tools/gate-bound.sh`; any other value ends the
+  runner with 64. The exit code has one owner, `tools/gate.sh`. GPU gate binaries run through `tools/gpu-gate.sh`: it
+  takes a card's gate lock, runs under the run bound, and returns the binary's code (124/137 timed out, 75 lock
+  contention, 69 a lock file it cannot open).
   `just check-recipes` fails on a test recipe with `||` or a bare `cargo test`, on a `--bin`/`--test`/`-p`/feature
   that names nothing, a script not in the tree, a `gate-*` recipe with no cargo target or one that runs its binary with
   `cargo run`, a bin built without its `required-features`, a bin two recipes build into one target dir with different

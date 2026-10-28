@@ -1435,6 +1435,53 @@ run "gate.sh: a log reader that fails after a passing summary ends with its code
   gs PATH="$GS/teefail:$GS/stub:$PATH"
 run "gate.sh: cargo's failure wins over the reader's" 3 'GATE RED \(exit 3\)' gs PATH="$GS/teefail:$GS/stub:$PATH" GS_CARGO_RC=3
 
+# The build and the test run are two cargo calls with a bound each (the gate.sh header): cargo's arguments, before the first `--`, and
+# `--no-run` build under BLOOMERY_GATE_BUILD_BOUND, then the run, with the libtest arguments, under BLOOMERY_GATE_BOUND. These cases
+# need a timeout that ends a command: the host's, or the stand-in at the top of this file (`$GS/stub`'s drops its words). The stub
+# cargo's build call sleeps GS_BUILD_SLEEP seconds and ends GS_BUILD_RC; its run call sleeps GS_RUN_SLEEP and ends GS_RUN_RC.
+mkdir -p "$GS/real"
+cat > "$GS/real/cargo" << 'STUB'
+#!/bin/sh
+echo "cargo $*"
+case " $* " in
+  *" --no-run "*) sleep "${GS_BUILD_SLEEP:-0}"; echo built; exit "${GS_BUILD_RC:-0}" ;;
+esac
+echo run-started
+sleep "${GS_RUN_SLEEP:-0}"
+echo "test result: ok. 1 passed; 0 failed"
+exit "${GS_RUN_RC:-0}"
+STUB
+chmod +x "$GS/real/cargo"
+gsb() { (cd "$GS" && env -u BLOOMERY_ARCH -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_BUILD_BOUND PATH="$GS/real:$PATH" "$@" bash tools/gate.sh "${GS_ARGS[@]}"); }
+GS_ARGS=(-p x --release --lib -- --include-ignored)
+run 'gate.sh: the build is its own cargo call, cargo arguments only and --no-run' 0 '^cargo test -p x --release --lib --no-run$' gsb
+has '  … the run call carries the libtest arguments' '^cargo test -p x --release --lib -- --include-ignored$'
+run 'gate.sh: a build slower than the run bound, inside the build bound, runs the test' 0 '^run-started$' \
+  gsb BLOOMERY_GATE_BOUND=2 BLOOMERY_GATE_BUILD_BOUND=60 GS_BUILD_SLEEP=4
+run 'gate.sh: a run past the run bound ends 124 on the run bound, after its build' 124 'GATE TIMED OUT after the 2s bound \(exit 124\)' \
+  gsb BLOOMERY_GATE_BOUND=2 GS_RUN_SLEEP=30
+has '  … which had finished' '^built$'
+run 'gate.sh: a build past the build bound ends 124 naming the build phase' 124 'GATE TIMED OUT in the build phase after the 2s build bound' \
+  gsb BLOOMERY_GATE_BUILD_BOUND=2 GS_BUILD_SLEEP=30
+if grep -q '^run-started$' "$tmp/out"; then fail '  … and the run never starts' 'the run started' "$tmp/out"; else pass '  … and the run never starts'; fi
+run "gate.sh: a build that fails ends with cargo's code in the build phase and runs nothing" 101 'GATE RED \(exit 101\) in the build phase' \
+  gsb GS_BUILD_RC=101
+if grep -q '^run-started$' "$tmp/out"; then fail '  … and the run never starts' 'the run started' "$tmp/out"; else pass '  … and the run never starts'; fi
+run 'gate.sh: a build bound that is no number is 64, by name, before cargo runs' 64 'gate\.sh: BLOOMERY_GATE_BUILD_BOUND is whole seconds from 1 up' \
+  gsb BLOOMERY_GATE_BUILD_BOUND=0
+if grep -q '^cargo ' "$tmp/out"; then fail '  … and cargo never runs' 'cargo ran' "$tmp/out"; else pass '  … and cargo never runs'; fi
+GS_ARGS=(--oxide -p x --release --lib -- --include-ignored)
+run 'gate.sh: --oxide builds with --no-run behind cargo oxide test, then runs' 0 '^cargo oxide test --arch sm_86 -- -p x --release --lib --no-run$' gsb
+has '  … and its run call' '^cargo oxide test --arch sm_86 -- -p x --release --lib -- --include-ignored$'
+# A --doc call has no build call: cargo refuses --no-run with --doc, so its one call stays under the run bound.
+GS_ARGS=(-p x --release --doc)
+run 'gate.sh: a --doc call is one cargo call, with no --no-run' 0 '^cargo test -p x --release --doc$' gsb
+if grep -q -- '--no-run' "$tmp/out"; then fail '  … and no build call' 'a --no-run call ran' "$tmp/out"; else pass '  … and no build call'; fi
+GS_ARGS=(--oxide -p x --release --doc rope::K)
+run 'gate.sh: --oxide --doc is one call too' 0 '^cargo oxide test --arch sm_86 -- -p x --release --doc rope::K$' gsb
+if grep -q -- '--no-run' "$tmp/out"; then fail '  … and no build call' 'a --no-run call ran' "$tmp/out"; else pass '  … and no build call'; fi
+GS_ARGS=(-p x --release --lib -- f)
+
 # A signal just after tee starts, on either side of publishing its pid, ends the runner before
 # cargo starts and leaves no tee waiting to open the FIFO.
 for gs_window in before-pid after-pid; do
