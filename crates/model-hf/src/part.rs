@@ -244,21 +244,63 @@ impl Source for Checkpoint {
                 && m.sources.len() == 1
                 && !cut
                 && m.step.is_none());
+        let len = |n: &str| -> Result<u64, Error> {
+            let (_, range) = self.folder.file_range(n)?;
+            range
+                .end
+                .checked_sub(range.start)
+                .ok_or_else(|| refuse(name, "stored read bytes pass u64"))
+        };
+        let sum = |a: u64, b: u64| {
+            a.checked_add(b)
+                .ok_or_else(|| refuse(name, "read bytes pass u64"))
+        };
+        // A direct read's buffer is aligned within one more block, and opening a shard for direct
+        // reads probes it with two ([`DirectFile::open`]), one shard at a time.
+        let direct = (3 * DIRECT_ALIGN) as u64;
+        if ty == GgmlType::NVFP4 && p.at.is_none() && m.step.is_none() {
+            // An NVFP4 matrix read whole (`modelopt::normalize`): its stored tensors in one direct
+            // buffer, each compressed block scale decoded to an eighth of its weight's bytes
+            // beside one weight's u16 and u32 parts widened to u32 words, and its blocks
+            // allocated once at their length, with one tensor scale an expert.
+            let (mut bytes, mut words) = (direct, 0u64);
+            for &(source, pl) in &placed {
+                let mut parts = 0u64;
+                for companion in &pl.companions {
+                    let n = len(companion)?;
+                    bytes = sum(bytes, sum(n, (2 * DIRECT_ALIGN) as u64)?)?;
+                    let size = self.folder.raw(companion)?.dtype.size() as u64;
+                    if size > 1 {
+                        let widened = (n / size)
+                            .checked_mul(4)
+                            .ok_or_else(|| refuse(name, "read bytes pass u64"))?;
+                        parts = sum(parts, widened)?;
+                    }
+                }
+                let weight = len(source)?;
+                bytes = sum(bytes, sum(weight, (2 * DIRECT_ALIGN) as u64)?)?;
+                if compressed {
+                    bytes = sum(bytes, weight.div_ceil(8))?;
+                    words = words.max(parts);
+                }
+            }
+            let scales = (placed.len() as u64)
+                .checked_mul(8)
+                .ok_or_else(|| refuse(name, "read bytes pass u64"))?;
+            return sum(sum(bytes, words)?, sum(whole.nbytes, scales)?);
+        }
         // Direct inputs, or growing cut buffers; decoded companion words and widened plain
         // values coexist with them. A step may shrink the tensor, so its pre-step output is
         // bounded from the stored bytes too. Output capacity can grow to twice its length.
-        let mut bytes = 0u64;
+        let mut bytes = direct;
         for n in stored(&placed) {
             let companion = !m.sources.iter().any(|source| source == n);
             let factor = if cut { 2u64 } else { 1 }
                 + u64::from(compressed) * 2
                 + u64::from(m.step.is_some()) * 3
                 + u64::from(widened || companion) * 4;
-            let (_, range) = self.folder.file_range(n)?;
-            bytes = range
-                .end
-                .checked_sub(range.start)
-                .and_then(|n| n.checked_mul(factor))
+            bytes = len(n)?
+                .checked_mul(factor)
                 .and_then(|n| n.checked_add((2 * DIRECT_ALIGN) as u64))
                 .and_then(|n| bytes.checked_add(n))
                 .ok_or_else(|| refuse(name, "stored read bytes pass u64"))?;
@@ -539,6 +581,8 @@ pub(crate) mod tests {
     use hf::modelopt::Plain;
     use hf::quant_config::Format;
     use model::placement::tp::Cut;
+    use std::alloc::{GlobalAlloc, System};
+    use std::cell::Cell;
 
     use crate::test_support::temp_dir;
 
@@ -550,10 +594,11 @@ pub(crate) mod tests {
         (0..n).map(f).collect()
     }
 
-    /// The checkpoint every case reads: an NVFP4 linear, a routed stack of two NVFP4 experts
-    /// with `csf_32x2_v1` scales, MXFP8, FP8 with one scale a 128 by 128 block, BF16, an F32
-    /// vector, and a BF16 matrix the map transposes after normalizing. Values are finite and
-    /// every scale byte a scale.
+    /// The checkpoint every case reads: an NVFP4 linear, routed stacks of two NVFP4 experts with
+    /// `csf_32x2_v1` scales and with `csf` scales (the latter's decoded scales larger than the
+    /// alignment of its stored tensors' direct reads), MXFP8, FP8 with one scale a 128 by 128
+    /// block, BF16, an F32 vector, and a BF16 matrix the map transposes after normalizing. Values
+    /// are finite and every scale byte a scale.
     fn checkpoint(dir: &std::path::Path) -> Checkpoint {
         let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         let e4m3 = |i: usize| (i * 7 % 0x7e) as u8;
@@ -641,6 +686,28 @@ pub(crate) mod tests {
                 f32s(&[0.25 * (e + 1) as f32]),
             ));
         }
+        for e in 0..2 {
+            let p = format!("cf.{e}");
+            t.push((
+                format!("{p}.w"),
+                "U8",
+                vec![1024, 512],
+                bytes(1024 * 512, |i| (i * 13 + e) as u8),
+            ));
+            t.push((
+                format!("{p}.s.nvfp4_csf_fixed"),
+                "U8",
+                vec![64, 528],
+                vec![0x31; 64 * 528],
+            ));
+            t.push((
+                format!("{p}.s.nvfp4_csf_exceptions"),
+                "U32",
+                vec![0],
+                vec![],
+            ));
+            t.push((format!("{p}.t"), "F32", vec![], f32s(&[0.5])));
+        }
         let entries: Vec<_> = t
             .iter()
             .map(|(n, d, s, b)| (n.as_str(), *d, s.as_slice(), b.as_slice()))
@@ -684,6 +751,11 @@ pub(crate) mod tests {
             let t = format!("cs.{e}.t");
             companions.push(&t);
             placed.insert(format!("cs.{e}.w"), place(Format::Nvfp4Csf32, &companions));
+            let p = format!("cf.{e}");
+            let companions =
+                ["s.nvfp4_csf_fixed", "s.nvfp4_csf_exceptions", "t"].map(|c| format!("{p}.{c}"));
+            let companions: Vec<&str> = companions.iter().map(String::as_str).collect();
+            placed.insert(format!("{p}.w"), place(Format::Nvfp4Csf, &companions));
         }
         let plan = Plan {
             placed,
@@ -721,6 +793,10 @@ pub(crate) mod tests {
             (
                 "cs.weight".into(),
                 made(&["cs.0.w", "cs.1.w"], matrix, &[256, 32, 2], None),
+            ),
+            (
+                "cf.weight".into(),
+                made(&["cf.0.w", "cf.1.w"], matrix, &[1024, 1024, 2], None),
             ),
             (
                 "rows.weight".into(),
@@ -1220,6 +1296,59 @@ pub(crate) mod tests {
         }
     }
 
+    thread_local! {
+        // Const-initialized and destructor-free, so the allocator reads them without recursing.
+        static HELD: Cell<i64> = const { Cell::new(0) };
+        static PEAK: Cell<i64> = const { Cell::new(0) };
+    }
+
+    /// The global allocator of this crate's tests: [`System`], counting the
+    /// bytes each thread holds ([`HELD`]) and the most it has held ([`PEAK`]).
+    struct Counting;
+
+    fn count(bytes: i64) {
+        let held = HELD.get() + bytes;
+        HELD.set(held);
+        PEAK.set(PEAK.get().max(held));
+    }
+
+    // SAFETY: both methods forward to `System` with the caller's arguments unchanged; the trait's
+    // reallocation and zeroing go through them.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+            count(l.size() as i64);
+            // SAFETY: the caller meets `alloc`'s contract for `l`, and `System` receives `l`
+            // unchanged.
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+            count(-(l.size() as i64));
+            // SAFETY: `p` came from `alloc` above with layout `l`, so from `System`.
+            unsafe { System.dealloc(p, l) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    /// The most bytes the calling thread holds while `f` runs beyond what it held before, and
+    /// `f`'s value.
+    fn peak<T>(f: impl FnOnce() -> T) -> (u64, T) {
+        let before = HELD.get();
+        PEAK.set(before);
+        let out = f();
+        ((PEAK.get() - before) as u64, out)
+    }
+
+    /// Each part read whole holds at most its read bytes on the reading thread, counted by the
+    /// allocator: stored inputs, decoded and widened scales, scratch and the result. An NVFP4
+    /// matrix's read bytes pass that peak by at most two alignment blocks a stored tensor and the
+    /// three of the direct buffer and its shard's probe, where its shard takes direct reads.
+    ///
+    /// FAIL-first: the `csf` stack's read bytes without its decoded scales, and the BF16 matrix's
+    /// without its direct buffer's alignment and its shard's open probe, fall under their peaks;
+    /// an NVFP4 stack's read bytes by the general bound (its weights thrice, its output four
+    /// times) pass its peak by more than the alignment.
     #[test]
     fn read_peaks_cover_the_owned_inputs_and_results() {
         let dir = temp_dir("read-peak");
@@ -1232,35 +1361,30 @@ pub(crate) mod tests {
             n.dims[1] = 1;
             Ok(())
         }));
+        let (shard, _) = c.folder.file_range("cf.0.w").unwrap();
+        let direct = DirectFile::open(&shard).is_ok();
         let planned = c.plan(|_, _, _| Ok::<_, String>(Take::Whole)).unwrap();
         for p in &planned {
+            let name = &p.info.name;
             let read_bytes = c.read_bytes(p).unwrap();
-            let part = c.read(p).unwrap();
-            let output: u64 = part.spans().iter().map(|s| s.len() as u64).sum();
-            let made = &c.made[&p.info.name];
-            let placed = c.placed(made);
-            let before = modelopt::normalize(|n| c.folder.raw(n), &placed, made.role).unwrap();
-            let output = output.max(before.bytes.capacity() as u64);
-            let stored: u64 = stored(&placed)
-                .map(|n| {
-                    let (_, r) = c.folder.file_range(n).unwrap();
-                    let (_, span, _) = aligned_span(r.start, r.end - r.start);
-                    (span + DIRECT_ALIGN) as u64
-                })
-                .sum();
-            assert!(
-                read_bytes >= stored + output,
-                "{}: {read_bytes} < {}",
-                p.info.name,
-                stored + output
-            );
+            let (held, part) = peak(|| c.read(p).unwrap());
+            drop(part);
+            assert!(read_bytes >= held, "{name}: {read_bytes} < {held}");
+            if p.info.ty == GgmlType::NVFP4 && direct {
+                let stored = stored(&c.placed(&c.made[name])).count() as u64;
+                let align = (2 * stored + 3) * DIRECT_ALIGN as u64;
+                assert!(
+                    read_bytes - held <= align,
+                    "{name}: {read_bytes} passes {held} by more than {align}"
+                );
+            }
         }
         // A BF16 matrix read whole holds its stored copy and its output, none widened.
         let bf = planned.iter().find(|p| p.info.name == "bf.weight").unwrap();
         let s = bf.info.nbytes;
         assert_eq!(
             c.read_bytes(bf).unwrap(),
-            4 * s + 2 * DIRECT_ALIGN as u64 + 8
+            4 * s + 5 * DIRECT_ALIGN as u64 + 8
         );
         let p = planned.iter().find(|p| p.info.name == "v.weight").unwrap();
         c.made.get_mut("v.weight").unwrap().dims = vec![u64::MAX, 2];
