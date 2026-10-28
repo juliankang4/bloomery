@@ -8924,6 +8924,12 @@ mod gate {
                 (128, 73, 64, Native::Pattern),
                 (144, 129, 256, Native::Pattern),
                 (128, 129, 256, Native::Pattern),
+                // live_walk's 1, 2, 4 and 6 fragment arms, varied per slot and K so an
+                // activation row the walk fails to copy cannot match a stale one.
+                (128, 14, 128, Native::Varied),
+                (128, 25, 128, Native::Varied),
+                (128, 49, 128, Native::Varied),
+                (128, 73, 128, Native::Varied),
                 (48, 73, 64, Native::OneHot),
                 (16, 14, 20_480, Native::Pattern),
                 (16, 14, 64, Native::Tiny),

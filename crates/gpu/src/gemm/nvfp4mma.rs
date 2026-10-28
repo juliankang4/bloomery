@@ -988,15 +988,15 @@ macro_rules! product_stages {
             cuda_device::SharedArray::UNINIT;
         static mut C: cuda_device::SharedArray<u32, COLUMN_WORDS, 16> =
             cuda_device::SharedArray::UNINIT;
-        // SAFETY: W, B, S and C are this block's own shared allocations.
-        unsafe {
-            (
-                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W),
-                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B),
-                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S),
-                cuda_device::SharedArray::as_raw_mut_ptr(&raw mut C),
-            )
-        }
+        // SAFETY: W is this block's shared weight allocation.
+        let wp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W) };
+        // SAFETY: B is this block's shared activation allocation.
+        let bp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B) };
+        // SAFETY: S is this block's shared scale allocation.
+        let sp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S) };
+        // SAFETY: C is this block's shared column allocation.
+        let cp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut C) };
+        (wp, bp, sp, cp)
     }};
 }
 
@@ -1492,22 +1492,8 @@ mod native {
         let expert = tiles[2 * tile] as usize;
         let (start, len) = super::super::route::tile_parts(tiles[2 * tile + 1]);
         let (start, len) = (start as usize, len as usize);
-        static mut W: cuda_device::SharedArray<u32, { STAGES * W_STAGE }, 16> =
-            cuda_device::SharedArray::UNINIT;
-        static mut B: cuda_device::SharedArray<u32, { STAGES * B_STAGE }, 16> =
-            cuda_device::SharedArray::UNINIT;
-        static mut S: cuda_device::SharedArray<u32, { STAGES * S_STAGE }, 16> =
-            cuda_device::SharedArray::UNINIT;
-        static mut C: cuda_device::SharedArray<u32, COLUMN_WORDS, 16> =
-            cuda_device::SharedArray::UNINIT;
-        // SAFETY: W is this block's shared weight allocation.
-        let wp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut W) };
-        // SAFETY: B is this block's shared activation allocation.
-        let bp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut B) };
-        // SAFETY: S is this block's shared scale allocation.
-        let sp = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut S) };
-        // SAFETY: C is this block's shared column allocation.
-        let columns = TileColumns(unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut C) });
+        let (wp, bp, sp, cp) = product_stages!();
+        let columns = TileColumns(cp);
         // The SwiGLU tile reuses W once every warp has finished the walk.
         let vp = wp.cast::<f32>();
         let wi = tid / 32;
