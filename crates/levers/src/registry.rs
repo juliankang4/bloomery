@@ -1136,8 +1136,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               or `TERM=dumb` draws it without colour; `COLORTERM=truecolor` (or `24bit`) draws \
               its colours in 24 bits, any other terminal in the 256-colour cube; `TERM=dumb` \
               or a locale whose first set variable of `LC_ALL`, `LC_CTYPE` and `LANG` names \
-              no UTF-8 draws it in plain ASCII. Every seat of `bloomery-serve` acts on it, \
-              and so do the per-model binaries that are its seats.",
+              no UTF-8 draws it in plain ASCII. `on` also lets `d` open the live view \
+              (`serve::live`) while the server serves, on the alternate screen, `q` or `Esc` \
+              closing it; it takes keys only when stdin and stderr are terminals, the process \
+              is the terminal's foreground group and `TERM` is not `dumb`, and only then does \
+              a screen name the key. Every seat of `bloomery-serve` acts on it, and so do the \
+              per-model binaries that are its seats and `bloomery-serve-metal`, which draws \
+              no start screen and names the key on a line of its own.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

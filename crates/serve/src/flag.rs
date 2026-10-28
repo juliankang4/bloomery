@@ -109,6 +109,11 @@ impl ApiKeys {
         Ok(())
     }
 
+    /// Whether no key is set, so every request passes the check.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     /// Whether the request passes the key check: the request's method, path
     /// and the two headers a key can ride on, against this set, as
     /// [the type](ApiKeys) states. A request the set is empty for passes.

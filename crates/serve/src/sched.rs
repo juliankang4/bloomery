@@ -223,6 +223,11 @@ impl<R, A> Board<R, A> {
         self.waiting.len()
     }
 
+    /// The positions every slot's last or running request holds.
+    pub(crate) fn n_past(&self) -> usize {
+        self.slots.iter().map(|s| s.view.n_past).sum()
+    }
+
     /// Slots no request and no action holds.
     pub(crate) fn free(&self) -> usize {
         self.slots.iter().filter(|s| s.state == Use::Free).count()

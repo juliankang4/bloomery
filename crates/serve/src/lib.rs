@@ -34,6 +34,7 @@ pub mod glmxml;
 mod guard;
 pub mod hermes;
 mod http;
+pub mod live;
 pub mod media;
 pub mod mock;
 mod models;

@@ -31,6 +31,9 @@
 //! (`MarkCopies::AtOpen`), so the first request pays nothing the later ones
 //! do not. No prompt cache, no slot files, no image input.
 //!
+//! `BLOOMERY_SCREEN` (on unset) lets `d` open the server's live view on a
+//! terminal (`serve::live`); the start screen is the CUDA seats' alone.
+//!
 //! A bad flag or value is a named error and exit 64; a refusal of the file,
 //! the device or the session is a named error and exit 1; an engine failure
 //! while serving ends the run with exit 70. The body is macOS only;
@@ -115,10 +118,14 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
     }
 
     pub(super) fn run() -> ExitCode {
-        if let Err(e) = bloomery_levers::at_main(&[]) {
-            eprintln!("bloomery-serve-metal: {e}");
-            return ExitCode::from(1);
-        }
+        let levers = match bloomery_levers::at_main(&[bloomery_levers::SCREEN]) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("bloomery-serve-metal: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        serve::live::enable(levers.screen());
         let a = match parse() {
             Ok(a) => a,
             Err(e) => {
