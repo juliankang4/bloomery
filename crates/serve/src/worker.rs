@@ -44,7 +44,7 @@ use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
@@ -55,6 +55,7 @@ use crate::engine::{
 use crate::genloop::{
     Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, ms_since,
 };
+use crate::live::{Ending, Finished, Ring};
 use crate::media::{Held, MediaFeed};
 use crate::sched::{Board, Reserve, SlotView};
 use crate::swap::{Entry, NoRoom, Park, ParkTable, QUANTUM, Turn};
@@ -102,6 +103,30 @@ pub(crate) struct Stats {
     /// [`Park::States`] budget; 0 under [`Park::Ids`], which parks no state).
     pub parked_bytes: u64,
     pub park_budget: u64,
+}
+
+impl Stats {
+    /// The prompt throughput since start, tokens a second over the prompts'
+    /// time: `/metrics`' `prompt_tokens_seconds`.
+    pub(crate) fn prompt_rate(&self) -> f64 {
+        rate(self.n_prompt_total, self.t_prompt_ms_total)
+    }
+
+    /// The generation throughput since start: `/metrics`'
+    /// `predicted_tokens_seconds`.
+    pub(crate) fn decode_rate(&self) -> f64 {
+        rate(self.n_predicted_total, self.t_predicted_ms_total)
+    }
+}
+
+/// `n` tokens over `ms` milliseconds as tokens a second; 0 before any. The
+/// ratio of two counters, so reading it never changes it.
+pub(crate) fn rate(n: u64, ms: f64) -> f64 {
+    if n > 0 && ms > 0.0 {
+        1e3 / ms * n as f64
+    } else {
+        0.0
+    }
 }
 
 /// A request handed to the engine thread.
@@ -157,6 +182,9 @@ pub(crate) struct Shared {
     /// thread.
     pub work: Condvar,
     pub stats: Mutex<Stats>,
+    /// The requests that ended, newest last: the live view's list
+    /// ([`crate::live`]), kept where their counters are booked.
+    pub done: Mutex<Ring>,
     /// The first failure that ended the server ([`Shared::record_fatal`]);
     /// the reason `/health` gives.
     pub fatal: Mutex<Option<String>>,
@@ -196,6 +224,7 @@ impl Shared {
             board: Mutex::new(board),
             work: Condvar::new(),
             stats: Mutex::new(Stats::default()),
+            done: Mutex::new(Ring::default()),
             fatal: Mutex::new(None),
             stopping: Mutex::new(None),
             stop: AtomicBool::new(false),
@@ -590,7 +619,7 @@ impl Worker {
             .iter()
             .chain(self.prompting.iter().map(|p| &p.a));
         for a in held {
-            self.book(a.job.timings());
+            self.book(a.job.timings(), Ending::Stopped);
         }
         self.close();
     }
@@ -972,8 +1001,14 @@ impl Worker {
     }
 
     /// Books an ending request's counters, `/metrics`' totals, from its
-    /// timings `t`; touches no engine and no slot.
-    fn book(&self, t: &Timings) {
+    /// timings `t`, and keeps it with how it ended for the live view;
+    /// touches no engine and no slot.
+    fn book(&self, t: &Timings, ending: Ending) {
+        relock(&self.sh.done).push(Finished {
+            at: SystemTime::now(),
+            timings: t.clone(),
+            ending,
+        });
         let mut s = relock(&self.sh.stats);
         let (pn, dn) = (t.prompt_n as u64, t.predicted_n as u64);
         s.n_prompt_total += pn;
@@ -998,7 +1033,13 @@ impl Worker {
     /// last message.
     fn end_request(&mut self, a: Active, r: Result<Outcome, GenError>) {
         let t = a.job.timings();
-        self.book(t);
+        let ending = match &r {
+            Ok(o) => Ending::Done(o.stop.finish_reason()),
+            Err(GenError::Client(_)) => Ending::ClientClosed,
+            Err(GenError::Engine(_)) => Ending::EngineError,
+            Err(_) => Ending::Error,
+        };
+        self.book(t, ending);
         // An engine failure leaves no state to save; any other end leaves the
         // slot holding what it fed.
         if self.turns.is_none() && !matches!(r, Err(GenError::Engine(_))) {

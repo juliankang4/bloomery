@@ -515,7 +515,8 @@ impl Server {
     /// the process inside [`exit_shutdown`], so every seat's
     /// `Ok(server.run())` is the error paths' alone. Once the listener
     /// serves, the start screen is drawn when a seat armed it
-    /// ([`crate::screen`]).
+    /// ([`crate::screen`]), and the live view takes its keys where it can
+    /// ([`crate::live`]).
     pub fn run(self) -> ServeError {
         // The signals are installed before the listener serves: from the
         // first answer on, Ctrl+C or a kill stops the server the orderly way.
@@ -527,14 +528,30 @@ impl Server {
                 }
             }
         });
+        let addr = self.local_addr();
         let (state, ended) = match self.start() {
             Ok(s) => s,
             Err(e) => return ServeError::Io(e),
         };
-        crate::screen::draw();
+        let live = match addr {
+            Ok(addr) => crate::live::keys().then_some(addr),
+            Err(e) => {
+                eprintln!("bloomery-serve: live view: the address: {e}");
+                None
+            }
+        };
+        if !crate::screen::draw(live.is_some()) && live.is_some() {
+            crate::screen::live_hint();
+        }
+        if let Some(addr) = live {
+            start_live(&state, addr);
+        }
         // `state` holds a sender, so the channel cannot close while we wait.
         match wait_end(&ended, state.fatal_linger) {
-            Ended::Error(e) => e,
+            Ended::Error(e) => {
+                crate::live::restore();
+                e
+            }
             Ended::Stop(cause) => exit_shutdown(&cause, |bound| state.shared.wait_stop(bound)),
         }
     }
@@ -546,6 +563,80 @@ impl Server {
         let addr = self.local_addr()?;
         self.start()?;
         Ok(addr)
+    }
+}
+
+/// Starts the live view of the server `state` listening on `addr`
+/// ([`crate::live`]); a failure is one line on stderr and the server serves on
+/// without it.
+fn start_live(state: &Arc<State>, addr: SocketAddr) {
+    let routes = LISTED
+        .into_iter()
+        .filter(|&(_, p)| p != path::EMBEDDINGS || state.side.is_some())
+        .collect();
+    let now = {
+        let state = Arc::clone(state);
+        Box::new(move || live_now(&state))
+    };
+    let keyed = !state.api_keys.is_empty();
+    if let Err(e) = crate::live::start(addr, state.alias.clone(), routes, keyed, now) {
+        eprintln!("bloomery-serve: live view: {e}; the server serves on without it");
+    }
+}
+
+/// A copy of what the live view shows of `state`, each lock held only to
+/// copy.
+fn live_now(state: &State) -> crate::live::Now {
+    use crate::live::{Phase, Slot, Status};
+    let (slots, queued) = {
+        let b = relock(&state.shared.board);
+        let slots = b
+            .slots()
+            .iter()
+            .map(|s| {
+                let phase = match s.state {
+                    Use::Free => Phase::Idle,
+                    Use::Held => Phase::Held,
+                    Use::Running if s.view.n_decoded == 0 => Phase::Prefill,
+                    Use::Running => Phase::Decode,
+                };
+                Slot {
+                    phase,
+                    n_past: s.view.n_past,
+                    task: s.view.id_task,
+                    n_decoded: s.view.n_decoded,
+                }
+            })
+            .collect();
+        (slots, b.waiting())
+    };
+    let (prompt_rate, decode_rate, cached, evaluated) = {
+        let s = relock(&state.shared.stats);
+        (
+            s.prompt_rate(),
+            s.decode_rate(),
+            s.n_prompt_cached_total,
+            s.n_prompt_total,
+        )
+    };
+    let status = if relock(&state.shared.fatal).is_some() {
+        Status::Failed
+    } else if relock(&state.shared.stopping).is_some() {
+        Status::Stopping
+    } else {
+        Status::Ready
+    };
+    crate::live::Now {
+        status,
+        slots,
+        rates: Vec::new(),
+        queued,
+        room: state.room(),
+        prompt_rate,
+        decode_rate,
+        cached,
+        evaluated,
+        requests: relock(&state.shared.done).newest_first(),
     }
 }
 
@@ -675,6 +766,12 @@ impl SlotQueue {
 }
 
 impl State {
+    /// The positions the slots can hold in all, every slot the whole
+    /// `ctx_max`: the KV cache's room `/metrics`' usage ratio is read against.
+    fn room(&self) -> usize {
+        self.info.ctx_max * self.parallel
+    }
+
     /// Whether a clip can be served: a decoder is there, and the chat model or
     /// the embedding model has a video rule ([`MediaModel::video_rule`]). The
     /// chat path also needs the model's video token, the embedding path its
@@ -936,18 +1033,19 @@ pub(crate) fn install_signals(on_first: impl Fn(Stop) + Send + 'static) {
     if let Err(e) = reader {
         panic!("cannot start the signal reader thread: {e}");
     }
-    arm(libc::SIGINT);
-    arm(libc::SIGTERM);
+    handle(libc::SIGINT, on_signal as *const () as usize);
+    handle(libc::SIGTERM, on_signal as *const () as usize);
 }
 
-/// Registers `on_signal` for `sig` with `SA_RESTART`, so a signal arriving
-/// mid-`accept` or mid-`read` restarts the call instead of failing it: the
-/// stop is carried by the pipe, not by an EINTR.
-fn arm(sig: libc::c_int) {
+/// Registers `action` (a handler, `SIG_DFL` or `SIG_IGN`) for `sig` with
+/// `SA_RESTART`, so a signal arriving mid-`accept` or mid-`read` restarts the
+/// call instead of failing it: the stop is carried by the pipe, not by an
+/// EINTR. Async-signal-safe (`sigaction` only).
+pub(crate) fn handle(sig: libc::c_int, action: libc::sighandler_t) {
     // SAFETY: an all-zero `sigaction` is a valid value — a null handler, an
     // empty mask, no flags — and only the fields set below are changed.
     let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
-    act.sa_sigaction = on_signal as *const () as usize;
+    act.sa_sigaction = action;
     act.sa_flags = libc::SA_RESTART;
     // SAFETY: `act` is fully initialized and a valid `sigaction` for the
     // call; the old action is not asked for.
@@ -962,6 +1060,7 @@ extern "C" fn on_signal(sig: libc::c_int) {
         return;
     };
     if s.taken.swap(true, Ordering::SeqCst) {
+        crate::live::restore_from_signal();
         const LINE: &[u8] =
             b"bloomery-serve: Received second interrupt, terminating immediately.\n";
         // SAFETY: `write` and `_exit` are async-signal-safe; the line is a
@@ -1007,6 +1106,7 @@ pub(crate) enum Waited {
 /// driver call, and the driver torn down beside it can corrupt the heap: the
 /// process then ends at once, stdout flushed first.
 pub(crate) fn exit_shutdown(cause: &Stop, wait: impl FnOnce(Duration) -> Waited) -> ! {
+    crate::live::restore();
     let waited = wait(ENGINE_STOP);
     let ended = waited == Waited::Done;
     eprintln!("{}", stop_line(cause, waited));
@@ -1380,36 +1480,71 @@ fn key_denied(keys: &ApiKeys, req: &mut Request, w: &mut TcpStream) -> io::Resul
     Ok(true)
 }
 
+/// The paths of the routes the live view's Connect tab lists
+/// ([`crate::live`]): each is the first path its arm in [`route`] matches.
+pub(crate) mod path {
+    pub(crate) const HEALTH: &str = "/health";
+    pub(crate) const MODELS: &str = "/v1/models";
+    pub(crate) const PROPS: &str = "/props";
+    pub(crate) const SLOTS: &str = "/slots";
+    pub(crate) const METRICS: &str = "/metrics";
+    pub(crate) const COMPLETION: &str = "/completion";
+    pub(crate) const COMPLETIONS: &str = "/v1/completions";
+    pub(crate) const CHAT: &str = "/v1/chat/completions";
+    pub(crate) const MESSAGES: &str = "/v1/messages";
+    pub(crate) const RESPONSES: &str = "/v1/responses";
+    pub(crate) const EMBEDDINGS: &str = "/v1/embeddings";
+    pub(crate) const TOKENIZE: &str = "/tokenize";
+    pub(crate) const DETOKENIZE: &str = "/detokenize";
+}
+
+/// The routes the live view lists, by method and [`path`].
+pub(crate) const LISTED: [(&str, &str); 13] = [
+    ("GET", path::HEALTH),
+    ("GET", path::MODELS),
+    ("GET", path::PROPS),
+    ("GET", path::SLOTS),
+    ("GET", path::METRICS),
+    ("POST", path::COMPLETION),
+    ("POST", path::COMPLETIONS),
+    ("POST", path::CHAT),
+    ("POST", path::MESSAGES),
+    ("POST", path::RESPONSES),
+    ("POST", path::EMBEDDINGS),
+    ("POST", path::TOKENIZE),
+    ("POST", path::DETOKENIZE),
+];
+
 /// Dispatches one request; `Ok(true)` when the connection may carry another.
 fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let r = match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/health" | "/v1/health") => return health(state, req, w),
-        ("GET", "/v1/models" | "/models") => Ok(models(state)),
-        ("GET", "/props") => Ok(props(state)),
-        ("GET", "/slots") => Ok(slots(state)),
-        ("GET", "/metrics") => return metrics(state, req, w),
+        ("GET", path::HEALTH | "/v1/health") => return health(state, req, w),
+        ("GET", path::MODELS | "/models") => Ok(models(state)),
+        ("GET", path::PROPS) => Ok(props(state)),
+        ("GET", path::SLOTS) => Ok(slots(state)),
+        ("GET", path::METRICS) => return metrics(state, req, w),
         ("POST", p) if p.starts_with("/slots/") => {
             return slot_action(state, req, w, &p["/slots/".len()..]);
         }
         ("POST", "/residency/reset") => return residency_reset(state, req, w),
         ("POST", "/shutdown") => return post_shutdown(state, req, w),
-        ("POST", "/completion" | "/completions") => return completion(state, req, w),
-        ("POST", "/v1/completions") => return oaicompl::completions(state, req, w),
-        ("POST", "/v1/chat/completions" | "/chat/completions") => return chat(state, req, w),
+        ("POST", path::COMPLETION | "/completions") => return completion(state, req, w),
+        ("POST", path::COMPLETIONS) => return oaicompl::completions(state, req, w),
+        ("POST", path::CHAT | "/chat/completions") => return chat(state, req, w),
         ("POST", "/v1/chat/completions/input_tokens" | "/chat/completions/input_tokens") => {
             return oaicompl::count_tokens(state, req, w);
         }
         ("POST", p) if systemone::ROUTES.contains(&p) => return systemone::post(state, req, w),
-        ("POST", "/v1/messages") => return anthropic::messages(state, req, w),
+        ("POST", path::MESSAGES) => return anthropic::messages(state, req, w),
         ("POST", "/v1/messages/count_tokens") => return anthropic::count_tokens(state, req, w),
-        ("POST", "/v1/responses" | "/responses") => return responses::create(state, req, w),
+        ("POST", path::RESPONSES | "/responses") => return responses::create(state, req, w),
         ("POST", "/v1/responses/input_tokens" | "/responses/input_tokens") => {
             return responses::input_tokens(state, req, w);
         }
-        ("POST", "/v1/embeddings") => return embeddings::post(state, req, w, true),
+        ("POST", path::EMBEDDINGS) => return embeddings::post(state, req, w, true),
         ("POST", "/embeddings" | "/embedding") => return embeddings::post(state, req, w, false),
-        ("POST", "/tokenize") => body(req).and_then(|b| tokenize(state, &b)),
-        ("POST", "/detokenize") => body(req).and_then(|b| detokenize(state, &b)),
+        ("POST", path::TOKENIZE) => body(req).and_then(|b| tokenize(state, &b)),
+        ("POST", path::DETOKENIZE) => body(req).and_then(|b| detokenize(state, &b)),
         ("POST", "/apply-template") => body(req).and_then(|b| apply_template(state, &b)),
         ("OPTIONS", _) => {
             http::respond(w, req, 204, "text/plain", &cors_preflight(), b"")?;
@@ -2242,10 +2377,9 @@ fn slots(state: &State) -> Value {
 fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let (busy, deferred, n_past) = {
         let b = relock(&state.shared.board);
-        let n_past: usize = b.slots().iter().map(|s| s.view.n_past).sum();
-        (state.parallel - b.free(), b.waiting(), n_past)
+        (state.parallel - b.free(), b.waiting(), b.n_past())
     };
-    let room = state.info.ctx_max * state.parallel;
+    let room = state.room();
     let kv_ratio = if room > 0 {
         n_past as f64 / room as f64
     } else {
@@ -2254,15 +2388,6 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
     let turns = relock(&state.shared.turns).is_some();
     let text = {
         let s = relock(&state.shared.stats);
-        // Throughput since start: the ratio of the matching `*_total` counters, so a
-        // scrape never changes it and any other window is `rate()` on those counters.
-        let rate = |n: u64, ms: f64| {
-            if n > 0 && ms > 0.0 {
-                1e3 / ms * n as f64
-            } else {
-                0.0
-            }
-        };
         let per_decode = if s.n_decode_total > 0 {
             s.n_busy_slots_total as f64 / s.n_decode_total as f64
         } else {
@@ -2346,13 +2471,13 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 "gauge",
                 "prompt_tokens_seconds",
                 "Average prompt throughput in tokens/s.",
-                rate(s.n_prompt_total, s.t_prompt_ms_total).to_string(),
+                s.prompt_rate().to_string(),
             ),
             (
                 "gauge",
                 "predicted_tokens_seconds",
                 "Average generation throughput in tokens/s.",
-                rate(s.n_predicted_total, s.t_predicted_ms_total).to_string(),
+                s.decode_rate().to_string(),
             ),
             (
                 "gauge",
@@ -4590,6 +4715,50 @@ mod tests {
     /// whatever arrives before that.
     fn roundtrip(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
         super::testserve::roundtrip(addr, method, path, &[], body)
+    }
+
+    /// The live view's copy of a server (`live_now`): a request that ended
+    /// is listed with how it ended and its counts, its slot is idle again,
+    /// the throughput is the `/metrics` totals', and a stop shows as one.
+    #[test]
+    fn the_live_view_copies_the_server() {
+        use crate::live::{Ending, Phase, Status};
+        let (addr, state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let now = super::live_now(&state);
+        assert_eq!(now.status, Status::Ready);
+        assert!(now.requests.is_empty());
+        assert_eq!(now.room, state.room());
+
+        let (status, body) = roundtrip(
+            addr,
+            "POST",
+            super::path::COMPLETION,
+            r#"{"prompt":"ab","n_predict":3}"#,
+        );
+        assert_eq!(status, 200, "{body}");
+        let now = super::live_now(&state);
+        assert_eq!(now.slots.len(), 1);
+        assert_eq!(now.slots[0].phase, Phase::Idle);
+        assert_eq!(now.requests.len(), 1, "the request that ended");
+        let done = &now.requests[0];
+        assert!(matches!(done.ending, Ending::Done(_)), "{:?}", done.ending);
+        assert!(done.timings.predicted_n > 0 && done.timings.n_prompt > 0);
+        let stats = super::relock(&state.shared.stats);
+        assert!(now.decode_rate > 0.0);
+        assert_eq!(now.decode_rate.to_bits(), stats.decode_rate().to_bits());
+        assert_eq!(now.prompt_rate.to_bits(), stats.prompt_rate().to_bits());
+        assert_eq!(
+            (now.cached, now.evaluated),
+            (stats.n_prompt_cached_total, stats.n_prompt_total)
+        );
+        drop(stats);
+
+        let (status, body) = roundtrip(addr, "POST", "/shutdown", "");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(super::live_now(&state).status, Status::Stopping);
     }
 
     /// `POST /shutdown` over a real socket: the 200 with its body reaches the

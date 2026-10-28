@@ -29,4 +29,4 @@
       -H 'Content-Type: application/json' \
       -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 
-   Ctrl+C  stops the server     BLOOMERY_SCREEN=off  hides this screen
+   Ctrl+C  stops the server     BLOOMERY_SCREEN=off  hides this screen     d  opens the live view
