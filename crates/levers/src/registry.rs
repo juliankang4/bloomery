@@ -2732,4 +2732,28 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          row) and runs a counted row the cold tag marks once more (`COLD`, then its row or `FAIL \
          rc=cold`); `0` (unset) runs and prints as before; anything else is refused.",
     ),
+    runner(
+        "BLOOMERY_SESSION_URL",
+        Some("release/pass_checks.py"),
+        "`tools/release/pass_checks.py`: the URL of the live `bloomery-serve` a release sitting's \
+         cell checks, when no URL argument is given.",
+    ),
+    runner(
+        "BLOOMERY_SESSION_PID",
+        Some("release/pass_checks.py"),
+        "`tools/release/pass_checks.py`: the default of `--pid`, that server's process, probed \
+         after every check (alive and not a zombie).",
+    ),
+    runner(
+        "BLOOMERY_SESSION_STDERR",
+        Some("release/pass_checks.py"),
+        "`tools/release/pass_checks.py`: the default of `--stderr`, the file that server's stderr \
+         goes to; its `plan` and `load` records and an off cell's refusal are read from it.",
+    ),
+    runner(
+        "BLOOMERY_SESSION_DIR",
+        Some("release/pass_checks.py"),
+        "`tools/release/pass_checks.py`: the default of `--dir`, where each check's request and \
+         reply are kept, one JSON a check.",
+    ),
 ];

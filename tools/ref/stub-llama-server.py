@@ -16,13 +16,25 @@ STUB_SRV_BADN answers request 2 with one predicted token too few; STUB_SRV_EXIT 
 STUB_SRV_HANG never listens; STUB_SRV_TPS answers its predicted_per_second in place of 20.0;
 STUB_SRV_NOTIMINGS answers with the tokens and no `timings`; STUB_SRV_LISTEN_CTX puts ` ctx=<n>` before the
 `listening on` words, as bloomery-serve's listening record has it (`argv`: the value of --ctx-size, --ctx or -c).
+POST /tokenize answers one token a whitespace-separated word of `content` (STUB_SRV_TOKENIZE_N, that many in its stead).
+POST /v1/chat/completions answers choices[0].message and usage for the last message: its content is a text fixed by the
+prompt (STUB_SRV_DRIFT=1 adds the request number, so a replay differs); STUB_SRV_CHAT_MODE=reasoning puts the text in
+reasoning_content with an empty content, `empty` leaves both empty strings, `null` a null content and no reasoning_content.
+Each chat request appends `<number> <max_tokens> <sha1 of the prompt, 8 hex> <words>` to $TMPDIR/stub-srv-chats. A request
+number counts every /completion and chat request of the process, never /tokenize or a GET: STUB_SRV_FAIL_AT=N answers
+request N with HTTP 500 and the body it would have sent with 200 (the status is the only signal), STUB_SRV_DIE_AT=N ends
+the process at request N with no answer, a `bloomery-serve: engine fault ...` line on stderr and exit 70.
+STUB_SRV_BANNER=1 prints bloomery-serve's start banner on stderr; STUB_SRV_PLAN=<ctx> prints a `plan` and a `load` record
+(records.py's generate_ds41 kinds, --place's word or `unset`) on stderr, the `plan` at the start and the `load` once the
+model would be loaded; STUB_SRV_REFUSE=<text> prints a `place unset` record (under STUB_SRV_PLAN) and
+`bloomery-serve: <text>` on stderr and exits 1 before it loads or listens.
 Under --spec-type (the MTP arm) each answer carries draft_n 4 and draft_n_accepted 3 and the log a `draft acceptance` line; STUB_SRV_NODRAFT drafts nothing. A TERM ends it
 at once, as llama-server's own handler does.
 Under a CUDA_VISIBLE_DEVICES of two cards (the two-card mode) its device lines are ggml_cuda_init's for the
 A6000 and the 3090, as the stub llama-bench's (depth-stub-cards.sh); STUB_SRV_SEE_ONE=1 makes them one card,
 and STUB_SRV_XID=1 leaves an Xid 79 line of the 3090 in $TMPDIR/stub-xid, the stub kernel journal.
 """
-import http.server, json, os, signal, sys, time
+import hashlib, http.server, json, os, signal, sys, time
 signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
 tmp = os.environ.get("TMPDIR", "/tmp")
 if "--help" in sys.argv:
@@ -37,6 +49,15 @@ with open(os.path.join(tmp, "stub-srv-argv"), "a") as f:
 with open(os.path.join(tmp, "stub-srv-pids"), "a") as f:
     f.write(f"{os.getpid()}\n")
 print("build: 1 (stub)", flush=True)
+place = sys.argv[sys.argv.index("--place") + 1] if "--place" in sys.argv else "unset"
+plan_ctx = os.environ.get("STUB_SRV_PLAN", "")
+if os.environ.get("STUB_SRV_BANNER"):
+    print("bloomery-serve: a first start on a new card can compile the GPU code for it (tens of seconds); "
+          "later starts take seconds", file=sys.stderr, flush=True)
+if plan_ctx:
+    print(f"plan place={place} card=Stub ctx_max={plan_ctx} card_experts=1 (1 B) host_experts=0 (0 B) host_shadow=0 B "
+          "n_l=1 on 1 layers card_budget=none paged=0 arena=0 arena_slots=0 room=0 plan_room=0 card_free=0 "
+          "devices=[cuda0] cuda_order=unset requantized=[]", file=sys.stderr, flush=True)
 if "," in os.environ.get("CUDA_VISIBLE_DEVICES", ""):
     if os.environ.get("STUB_SRV_SEE_ONE"):
         print("ggml_cuda_init: found 1 CUDA devices (Total VRAM: 48539 MiB):", flush=True)
@@ -59,8 +80,17 @@ if "on" == (sys.argv[sys.argv.index("-fit") + 1] if "-fit" in sys.argv else "") 
               "load_tensors: offloaded 3/3 layers to GPU", "load_tensors:        CUDA0 model buffer size =    10.00 MiB",
               "load_tensors:   CPU_Mapped model buffer size =     2.00 MiB"):
         print(l, flush=True)
+if os.environ.get("STUB_SRV_REFUSE"):
+    if plan_ctx:
+        print(f"place unset place={place} why=stub tier_experts=0 break_even=0 basis=none", file=sys.stderr, flush=True)
+    print(f"bloomery-serve: {os.environ['STUB_SRV_REFUSE']}", file=sys.stderr, flush=True)
+    sys.exit(1)
 if os.environ.get("STUB_SRV_EXIT"):
     sys.exit(5)
+if plan_ctx:
+    print(f"load resident_bytes=1 shadow=none 0 unified_addressing=0 cards=[cuda0] tier_experts=0 tier_bytes=0 ctx={plan_ctx} "
+          f"layers=1 top_k=1 mode=stub place={place} pin_main=none pinned=false prefill=stub ced=none prefill_refusal= "
+          "group=1 in 0.1 s (runtime value)", file=sys.stderr, flush=True)
 ctx = sys.argv[sys.argv.index("-c") + 1] if "-c" in sys.argv else "0"
 print(f"llama_context: n_ctx                 = {os.environ.get('STUB_SRV_NCTX', ctx)}", flush=True)
 if os.environ.get("STUB_SRV_HANG"):
@@ -75,9 +105,32 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
         self.reply(200 if self.path == "/health" else 404, {"status": "ok"})
+    def chat(self, req, code):
+        msgs = req.get("messages") or [{"content": ""}]
+        prompt = msgs[-1].get("content") or ""
+        digest = hashlib.sha1(prompt.encode()).hexdigest()[:8]
+        with open(os.path.join(tmp, "stub-srv-chats"), "a") as f:
+            f.write(f"{n_req[0]} {req.get('max_tokens')} {digest} {len(prompt.split())}\n")
+        text = f"stub reply {digest}" + (f" request {n_req[0]}" if os.environ.get("STUB_SRV_DRIFT") else "")
+        mode = os.environ.get("STUB_SRV_CHAT_MODE", "content")
+        msg = {"role": "assistant", "content": text, "reasoning_content": ""}
+        if mode == "reasoning": msg.update(content="", reasoning_content=text)
+        elif mode == "empty": msg.update(content="")
+        elif mode == "null": msg = {"role": "assistant", "content": None}
+        usage = {"prompt_tokens": len(prompt.split()), "completion_tokens": len(text.split())}
+        self.reply(code, {"choices": [{"index": 0, "message": msg, "finish_reason": "stop"}], "usage": usage})
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/tokenize":
+            n = int(os.environ.get("STUB_SRV_TOKENIZE_N") or len(str(req.get("content", "")).split()))
+            return self.reply(200, {"tokens": list(range(n))})
         n_req[0] += 1
+        if n_req[0] == int(os.environ.get("STUB_SRV_DIE_AT") or 0):
+            print(f"bloomery-serve: engine fault at request {n_req[0]} (stub)", file=sys.stderr, flush=True)
+            os._exit(70)
+        code = 500 if n_req[0] == int(os.environ.get("STUB_SRV_FAIL_AT") or 0) else 200
+        if self.path == "/v1/chat/completions":
+            return self.chat(req, code)
         with open(os.path.join(tmp, "stub-srv-reqs"), "a") as f:
             f.write(f"{n_req[0]} {len(req['prompt'])} {req['n_predict']} {','.join(map(str, req['prompt']))}\n")
         if n_req[0] in cold:
@@ -95,8 +148,8 @@ class H(http.server.BaseHTTPRequestHandler):
         toks = [1000 + i for i in range(p)]
         if os.environ.get("STUB_SRV_TOKEN1") and p > 1: toks[1] = int(os.environ["STUB_SRV_TOKEN1"])
         if os.environ.get("STUB_SRV_NOTIMINGS"):
-            return self.reply(200, {"tokens": toks})
-        self.reply(200, {"tokens": toks, "timings": t})
+            return self.reply(code, {"tokens": toks})
+        self.reply(code, {"tokens": toks, "timings": t})
 port = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 0
 lctx = os.environ.get("STUB_SRV_LISTEN_CTX", "")
 if lctx == "argv":

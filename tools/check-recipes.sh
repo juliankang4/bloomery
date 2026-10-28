@@ -435,6 +435,7 @@ pytools_list() {
     "tools/ref/source-inspection-test.py --self-test"
     "tools/ref/tier-cost.py --self-test"
     "tools/ref/window-union.py --self-test"
+    "tools/release/pass_checks.py --self-test"
     "tools/review/carry.py --self-test"
     "tools/review/diagnostics.py --self-test"
     "tools/review/labels.py --self-test"
