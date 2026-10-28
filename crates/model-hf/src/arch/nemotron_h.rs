@@ -1448,7 +1448,7 @@ mod tests {
             why.contains("llm_config.model_type") && why.contains("nemotron_h_puzzle"),
             "{why}"
         );
-        let wrapped = json!({"model_type": "nemotron_h_omni", "llm_config": config.clone()});
+        let wrapped = json!({"model_type": "nemotron_h_omni", "llm_config": config});
         let why = parse(&wrapped);
         assert!(
             why.contains("nemotron_h_omni") && why.contains("language_model."),
