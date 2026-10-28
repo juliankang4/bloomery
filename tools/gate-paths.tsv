@@ -7,6 +7,9 @@
 # recipes without a row, so a row names only the gates that reach the file through a dependency; gate-ptx-spill joins a
 # narrowed list only when a scan pair is not identical or its own inputs moved (tools/recipes.py, narrow()). `**` crosses
 # `/`, `*` does not, `{a,b}` is either.
+# A Rust file of a workspace crate whose diff is comments or layout only (equal tokens once both are left out) selects nothing, whatever row
+# maps it (tools/recipes.py, CommentReads); an include macro that names it, a doc comment in a crate whose doctests a gate runs and the
+# lever registry keep their selection.
 # The recipes column is `*`, gate and weekly names, or `derive [gate-… …] [weekly-… …]`. `derive` stands for the gates the tree derives
 # for the row, which this file does not hold: every gate whose own target names the module the glob stands for, and every gate the
 # derivation says reaches a file the glob matches through another lib, less the row's exceptions (`python3 tools/recipes.py reach FILE…`

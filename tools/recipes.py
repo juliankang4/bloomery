@@ -7,7 +7,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
 
     python3 tools/recipes.py check            # the target checks of `just check-recipes`, one feature set a bin, and the plan files records-refresh writes (presence)
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
-    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...] [--no-class]
+    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...] [--no-class] [--no-comment-only]
     python3 tools/recipes.py release-list [TAG | TAG..HEAD] [--wall]  # the release batch's list: the S0 gates, the R families' gates, affected without the F families' gates and the rotation's due gates
     python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
     python3 tools/recipes.py ships [--rev REV] [--base REV] FILE...  # the FILEs inside the shipped closure (tools/release/build.sh's bins at its features), with why; exit 1 when any is (tools/release/late-commit.sh)
@@ -44,6 +44,13 @@ element of its REGISTRY array, or the `&str` const that names one. It selects th
 hold a file outside crates/levers that names a moved row, by its variable or by a const that spells it; a recipe that links the crate and
 reads no such file is not selected. Code beside the rows (an item, a helper's body, a non-string const), a row the reader cannot name, rows in
 another order and a text it cannot lex keep the file whole, the `affected:` line saying why, and so does any other file of crates/levers.
+
+A Rust file of a workspace crate whose two sides have the same tokens once comments and white space are left out selects no gate: both
+`select` and `narrow` skip it, `unmapped` and `narrow: file` print `comment-only, no gate reads it` (`layout-only` when no comment moved),
+and the `affected:` line counts such files (`CommentReads`; `--no-comment-only` turns the rule off). The static tier (`always:`) is not
+touched. A file stays selected, `notes` saying why, when something reads its text or its doc comments: an `include_str!`, `include_bytes!`
+or `include!` names it; a doc comment moved in the lib of a crate whose doctests a gate runs (`--doc`); the lever registry (read by row);
+a file outside every workspace crate; a string or comment that never ends.
 
 Under --narrow a Rust file of a lib's module tree that no row of tools/gate-paths.tsv maps is read by the derivation (`dep_reach`, what `reach`
 prints): the gates whose reach holds a unit of it, the `affected:` line counting such files and a `narrow: derived` block naming each file's gates
@@ -2205,11 +2212,12 @@ class TableReads:
     manifest is a package manifest and a cargo global, whole. A recipe sees the `[target.<key>]` tables of its host
     (`host`: the box, or the Mac for a recipe that runs MAC_GATE), and Cargo.lock by the packages its build reaches
     (`lock`, a `LockDiff`: `outside` is true for a recipe whose closure on its host holds none of the packages the diff
-    moved). A `[lints]` table moves no recipe (`static_moved` names it). `notes` holds one line for each
-    `[target.<key>]` table the box's view leaves out or cannot decide and one for a Cargo.lock the reader keeps whole
-    (`select` hands them to `affected`)."""
+    moved). A `[lints]` table moves no recipe (`static_moved` names it). A Rust file whose diff is comments or layout only
+    selects none (`comments`, a `CommentReads`). `notes` holds one line for each
+    `[target.<key>]` table the box's view leaves out or cannot decide, one for a Cargo.lock the reader keeps whole and
+    one for a comment-only file left whole (`select` hands them to `affected`)."""
 
-    def __init__(self, changed: list[str], a: Side | None, b: Side):
+    def __init__(self, changed: list[str], a: Side | None, b: Side, comment_only: bool = True):
         self.a, self.b = a, b
         self.docs: dict[str, tuple[dict | None, dict | None]] = {}
         self.root: str | None = None
@@ -2225,7 +2233,8 @@ class TableReads:
                 self.docs[f] = (self._root_doc(a), self._root_doc(b))
         self.seen: dict[str, dict[str, list[tuple[str, bool]] | None]] = {f: {} for f in self.docs}
         self.levers = LeverReads(changed, a, b)  # the lever registry, when it is among the changed files and its diff is rows
-        self.notes: list[str] = []
+        self.comments = CommentReads(changed, a, b, comment_only)  # the Rust files whose diff is comments or layout
+        self.notes: list[str] = list(self.comments.notes)
         if self.levers.why_whole is not None:
             self.notes.append(self.levers.summary())
         self.static_moved: list[str] = []  # the lint tables that moved: held by the static tier, selecting no recipe
@@ -2557,9 +2566,10 @@ _RS_TOKEN = re.compile(
 )
 
 
-def _rs_tokens(text: str) -> list[tuple[str, str]]:
+def _rs_tokens(text: str, comments: list[tuple[int, str]] | None = None) -> list[tuple[str, str]]:
     """(kind, text) of each token of Rust source, comments and whitespace left out; a string keeps its quotes and its bytes.
-    An unterminated string or comment is a doubt: the registry is never read past it."""
+    An unterminated string or comment is a doubt: the registry is never read past it. `comments`, when given, receives each
+    comment as (the number of tokens before it, its text)."""
     out: list[tuple[str, str]] = []
     i, n = 0, len(text)
     while i < n:
@@ -2567,6 +2577,8 @@ def _rs_tokens(text: str) -> list[tuple[str, str]]:
         assert m is not None  # `p` matches any character
         kind = m.lastgroup
         if kind in ("ws", "lc"):
+            if kind == "lc" and comments is not None:
+                comments.append((len(out), m.group()))
             i = m.end()
             continue
         if kind == "bc":
@@ -2580,6 +2592,8 @@ def _rs_tokens(text: str) -> list[tuple[str, str]]:
                     j += 1
             if depth:
                 raise LeverDoubt("a block comment never ends")
+            if comments is not None:
+                comments.append((len(out), text[i:j]))
             i = j
             continue
         if kind == "raw":
@@ -2859,6 +2873,159 @@ class LeverReads:
         return out
 
 
+# ---- a Rust file whose diff is comments or layout ----
+#
+# A Rust file whose two sides lex to the same tokens once comments and white space are left out compiles to the same program, so its
+# diff selects no recipe: `CommentReads` holds those files, `select` and `narrow` skip them and print one line each. No gate reads a
+# source line number (`line!`, `column!`, `file!` and `Location::caller` are spelled nowhere in crates/, and a PTX carries no `.loc`).
+# The rule leaves a file whole, naming why in `notes`, when something reads its text or its doc comments:
+#   - an `include_str!`, `include_bytes!` or `include!` in a workspace Rust file names it;
+#   - a doc comment moved in the lib of a package whose doctests a gate-* or weekly-* recipe runs (`--doc`), or while a workspace package
+#     depends on a crate whose macros turn doc comments into output (DOC_READER_CRATES);
+#   - it is the lever registry (`LeverReads` reads it by row) or no file of a workspace package (an excluded crate's reproducer);
+#   - one side has a string or comment that never ends.
+# A comment a tool reads (`// SAFETY:`, `// PIN(`) is read by the static tier (ALWAYS), which this rule does not touch.
+
+COMMENT_ONLY = "comment-only, no gate reads it"
+LAYOUT_ONLY = "layout-only, no gate reads it"
+# The crates whose derives or attribute macros turn doc comments into output (help text, a schema).
+DOC_READER_CRATES = frozenset({"clap", "clap_derive", "structopt", "argh", "bpaf", "schemars", "utoipa", "documented", "poem-openapi", "async-graphql"})
+_INCLUDE_CALL = re.compile(r"\binclude(?:_str|_bytes)?!\s*\(")
+_STRING_LITERAL = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
+
+
+def _is_doc_comment(c: str) -> bool:
+    """Whether comment `c` is a doc comment: `///` (not `////`), `//!`, `/**` (not `/***` or `/**/`) or `/*!`."""
+    if c.startswith("//"):
+        return c.startswith("//!") or (c.startswith("///") and not c.startswith("////"))
+    return c.startswith("/*!") or (c.startswith("/**") and not c.startswith(("/***", "/**/")))
+
+
+@functools.lru_cache(maxsize=256)
+def _rs_stream(text: str) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[int, str], ...]] | None:
+    """(tokens, comments) of Rust source (`_rs_tokens`); None when a string or comment never ends: such a text is no stream to compare."""
+    comments: list[tuple[int, str]] = []
+    try:
+        toks = _rs_tokens(text, comments)
+    except LeverDoubt:
+        return None
+    return tuple(toks), tuple(comments)
+
+
+def comment_diff(a_text: str, b_text: str) -> tuple[str, bool] | None:
+    """What two different texts of one Rust file differ in when their tokens are equal: ("comment", whether a doc comment moved) or
+    ("layout", False). None when the texts are equal, a token differs or either text has a string or comment that never ends."""
+    if a_text == b_text:
+        return None
+    sa, sb = _rs_stream(a_text), _rs_stream(b_text)
+    if sa is None or sb is None or sa[0] != sb[0]:
+        return None
+    if sa[1] == sb[1]:
+        return "layout", False
+    docs = [tuple(c for c in s[1] if _is_doc_comment(c[1])) for s in (sa, sb)]
+    return "comment", docs[0] != docs[1]
+
+
+def _include_args(text: str) -> list[str]:
+    """The argument text of each `include_str!`, `include_bytes!` and `include!` call of Rust source `text`; a call in a comment is none."""
+    if not _INCLUDE_CALL.search(text):
+        return []
+    code, shape = rust_lex(text)
+    out = []
+    for m in _INCLUDE_CALL.finditer(code):
+        depth, j = 1, m.end()
+        while j < len(shape) and depth:
+            depth += (shape[j] == "(") - (shape[j] == ")")
+            j += 1
+        out.append(code[m.end():j - 1])
+    return out
+
+
+class CommentReads:
+    """The changed Rust files of one diff whose two sides differ in comments or layout only: `only` maps each to the line `select` and
+    `narrow` print for it (COMMENT_ONLY, LAYOUT_ONLY). A file the rule leaves whole is in `notes` with its reason. `on` False reads no
+    file as comment-only (`affected --no-comment-only`)."""
+
+    def __init__(self, changed: list[str], a: Side | None, b: Side, on: bool = True):
+        self.only: dict[str, str] = {}
+        self.notes: list[str] = []
+        self.b = b
+        self._includes: tuple[dict[str, str], list[tuple[str, str]]] | None = None
+        self._doctests: dict[str, str] | None = None
+        if not on or a is None:
+            return
+        for f in changed:
+            if not f.endswith(".rs") or not f.startswith(b.tree.pkg_dirs) or not (a.tree.exists(f) and b.tree.exists(f)):
+                continue
+            moved = comment_diff(a.tree.read(f), b.tree.read(f))
+            if moved is None:
+                continue
+            kind, docs = moved
+            why = self._refusal(f, docs)
+            if why is None:
+                self.only[f] = COMMENT_ONLY if kind == "comment" else LAYOUT_ONLY
+            else:
+                self.notes.append(f"{f}: only comments or layout moved, and the file stays selected: {why}")
+
+    def summary(self) -> str:
+        """The clause of the `affected:` line: how many files were read as no change."""
+        return f"comment- or layout-only files (no gate reads them): {len(self.only)}" if self.only else ""
+
+    def _refusal(self, f: str, docs: bool) -> str | None:
+        """Why file `f`, whose diff is comments or layout, still selects what reads it; None when nothing reads what moved."""
+        if f == LEVER_REGISTRY:
+            return "the lever registry is read by row (LeverReads)"
+        exact, tails = self._include_targets()
+        by = exact.get(f) or next((src for tail, src in tails if f == tail or f.endswith("/" + tail)), None)
+        if by is not None:
+            return f"{by} reads its text through include_str!, include_bytes! or include!"
+        if not docs:
+            return None
+        tree = self.b.tree
+        for p in tree.packages.values():
+            for d in p.deps:
+                if d.pkg in DOC_READER_CRATES:
+                    return f"a doc comment moved and {p.name} depends on {d.pkg}, whose macros read doc comments"
+        pkg = max((p for p in tree.packages.values() if f.startswith(p.dir + "/")), key=lambda p: len(p.dir), default=None)
+        lib = pkg.lib() if pkg is not None else None
+        run = self._doctest_runs().get(pkg.name) if pkg is not None else None
+        if run is not None and lib is not None and f in tree.tree_of(lib.src)[0]:
+            return f"a doc comment moved in the lib of {pkg.name}, whose doctests {run} runs"
+        return None
+
+    def _include_targets(self) -> tuple[dict[str, str], list[tuple[str, str]]]:
+        """The files an include macro of a workspace Rust file names, read once: (path -> the file that names it, the literals of a
+        call that builds its path (`concat!`, `env!`) as (a path tail, the file that names it))."""
+        if self._includes is None:
+            tree = self.b.tree
+            exact: dict[str, str] = {}
+            tails: list[tuple[str, str]] = []
+            for pdir in tree.pkg_dirs:
+                for base, dirs, files in os.walk(os.path.join(tree.root, pdir)):
+                    dirs[:] = [d for d in dirs if d != "target"]
+                    for rel in (os.path.relpath(os.path.join(base, n), tree.root) for n in files if n.endswith(".rs")):
+                        for arg in _include_args(tree.read(rel)):
+                            lits = _STRING_LITERAL.findall(arg)
+                            if len(lits) == 1 and arg.strip() == f'"{lits[0]}"' and not lits[0].startswith("/"):
+                                exact.setdefault(os.path.normpath(os.path.join(os.path.dirname(rel), lits[0])), rel)
+                            else:
+                                tails += [(os.path.normpath(s.lstrip("/")), rel) for s in lits if s.strip("/")]
+            self._includes = (exact, tails)
+        return self._includes
+
+    def _doctest_runs(self) -> dict[str, str]:
+        """Package -> a gate-* or weekly-* recipe that runs its doctests, on the tree the change lands in."""
+        if self._doctests is None:
+            out: dict[str, str] = {}
+            for n in sorted(self.b.recipes):
+                if n.startswith((GATE_PREFIX, WEEKLY_PREFIX)):
+                    for p, kind, _, _ in self.b.graph.inputs(n).targets:
+                        if kind == "doctest":
+                            out.setdefault(p, n)
+            self._doctests = out
+        return self._doctests
+
+
 def select(changed: list[str], a: Side | None, b: Side, prefix: str, tables: TableReads | None = None) -> tuple[list[Selection], list[str], list[str]]:
     """(selections in justfile order, unmapped files, notes). A manifest is read by table (`TableReads`)."""
     names = [n for n in sorted(b.recipes, key=lambda n: b.recipes[n].line) if n.startswith(prefix)]
@@ -2867,7 +3034,7 @@ def select(changed: list[str], a: Side | None, b: Side, prefix: str, tables: Tab
     tables = tables if tables is not None else TableReads(changed, a, b)
     notes: list[str] = list(tables.notes)
     for f in changed:
-        if f == "justfile":
+        if f == "justfile" or f in tables.comments.only:
             continue
         side = b if b.tree.exists(f) or a is None else a
         for n in names:
@@ -2898,6 +3065,8 @@ def select(changed: list[str], a: Side | None, b: Side, prefix: str, tables: Tab
             hint = "no gate-* recipe text changed"
         elif f == LOCK_FILE and tables.lock is not None:
             hint = tables.lock_hint()
+        elif f in tables.comments.only:
+            hint = tables.comments.only[f]
         elif any(mv is not None for mv in tables.seen.get(f, {}).values()):
             hint = "read by table: no recipe's view of it moved (manifests:)"
         else:
@@ -2978,13 +3147,13 @@ def cmd_affected(args: argparse.Namespace) -> int:
             notes += attach_depinfo(b.tree, entries)
             if a is not None:
                 attach_depinfo(a.tree, entries)
-        tables = TableReads(changed, a, b)
+        tables = TableReads(changed, a, b, args.comment_only)
         sels, unmapped, more = select(changed, a, b, prefix, tables)
         notes += more
         trows, tnote = trigger_rows(b)
         if tnote:
             notes.append(tnote)
-        trig = weekly_triggers(changed, a, b, trows) if prefix == GATE_PREFIX else []
+        trig = weekly_triggers([f for f in changed if f not in tables.comments.only], a, b, trows) if prefix == GATE_PREFIX else []
         named = {f for t in trig for f in t.files}
         unmapped = [u for u in unmapped if u.split("  (")[0] not in named]
         n_weekly = sum(1 for n in b.recipes if n.startswith(WEEKLY_PREFIX))
@@ -3011,6 +3180,8 @@ def cmd_affected(args: argparse.Namespace) -> int:
         lever_note = f"; {lever_why}" if lever_why else ""
         if tables.static_moved:
             lever_note += f"; {', '.join(tables.static_moved)} moved: a lint level is held by the static tier ({STATIC_TIER}) and selects no gate"
+        if tables.comments.only:
+            lever_note += f"; {tables.comments.summary()}"
         if narrowed:
             by_derivation = f"; {len(nar.derived)} files by derivation" if nar.derived else ""
             print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected "
@@ -6353,6 +6524,10 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
                 pick(n, "new recipe" if a is None or n not in a.recipes else "recipe text")
             res.files.append(f"justfile: the text of {len(moved)} gate recipes" + (f" ({' '.join(moved[:6])}{' …' if len(moved) > 6 else ''})" if moved else ""))
             continue
+        if f in tables.comments.only:
+            # the same program on both sides: no gate runs it, no kernel moved, and the spill ratchet has nothing to read
+            res.files.append(f"{f}: {tables.comments.only[f]}")
+            continue
         side = b if b.tree.exists(f) or a is None else a
         own, dep = [], []
         for n in gates:
@@ -6425,7 +6600,7 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
             if n not in b.recipes:
                 continue
             for f in changed:
-                if f == "justfile" or tables.outside(n, f):
+                if f == "justfile" or f in tables.comments.only or tables.outside(n, f):
                     continue
                 side = b if b.tree.exists(f) or a is None else a
                 if n in side.recipes and side.graph.inputs(n).match(f) is not None:
@@ -11676,7 +11851,7 @@ def range_base_self_test(expect) -> None:
         for branch, rel in (("main", "crates/x/src/lib.rs"), ("feature", "crates/y/src/lib.rs")):
             run("git", "switch", "-q", branch)
             with open(os.path.join(repo, rel), "a", encoding="utf-8") as fh:
-                fh.write("// moved\n")
+                fh.write("pub fn moved() {}\n")  # code: a comment alone selects no gate
             run("git", "commit", "-q", "-am", f"{branch} moves {rel}")
 
         def affected(spec: str) -> tuple[str, list[str]]:
@@ -11695,6 +11870,19 @@ def range_base_self_test(expect) -> None:
                f"range: base..feature (A an ancestor of B) gives {got}, `{head}`")
         head, got = affected("feature..main")
         expect(got == ["gate-x"] and "(merge-base of feature and main)" in head, f"range: feature..main gives {got}, `{head}`")
+        # a commit that adds one comment selects no gate and says why; `--no-comment-only` selects the gate that reads the file
+        run("git", "switch", "-q", "-c", "quiet", "base")
+        with open(os.path.join(repo, "crates/x/src/lib.rs"), "a", encoding="utf-8") as fh:
+            fh.write("// only a comment\n")
+        run("git", "commit", "-q", "-am", "quiet adds a comment")
+        for extra, want in (((), []), (("--no-comment-only",), ["gate-x"])):
+            done = run(sys.executable, "tools/recipes.py", "affected", "base..quiet", "--no-box", "--no-class", *extra)
+            lines = done.stdout.splitlines()
+            got = sorted(m.group(1) for ln in lines if (m := re.match(r"^  (gate-\S+)", ln)))
+            shown = "  crates/x/src/lib.rs  (comment-only, no gate reads it)" in lines
+            counted = "comment- or layout-only files (no gate reads them): 1" in (lines[0] if lines else "")
+            expect(done.returncode == 0 and got == want and shown == (not extra) and counted == (not extra),
+                   f"range: base..quiet{' ' + ' '.join(extra) if extra else ''} gives {got}, unmapped line {shown}, counted {counted}: {done.stderr.strip()[-200:]}")
 
 
 def module_gate_self_test(expect) -> None:
@@ -11785,6 +11973,199 @@ def module_gate_self_test(expect) -> None:
             expect(got == {"gate-lib", "gate-liby", "gate-all"},
                    f"module gate: an attribute brace must leave {rel} test-only, selected {sorted(got)}")
         expect(not side.tree.unresolved, f"module gate: unresolved {side.tree.unresolved[:2]}")
+
+
+def comment_only_self_test(expect) -> None:
+    """A Rust file whose diff is comments or layout selects no gate (`CommentReads`), on a synthetic workspace. Package h (a lib, no
+    doctest recipe) holds one module per case: each comment kind, a nested comment, a lifetime beside a char, a layout change (no gate), and
+    the edits to a string, a raw string, a byte string, a lifetime's code and a name (a gate). Package g (a lib whose doctests gate-doc runs,
+    a bin) holds the files the rule leaves whole: a doc comment in the lib, and the files an include macro names; with a plain comment in
+    the lib, a doc comment in the bin and a commented-out include it still reads no change; the lever registry is always left whole. Every case is also run against a mutant of
+    the rule (the rule stubbed, strings ignored, a char literal that eats a lifetime, each refusal removed), which must turn one red."""
+    just = (
+        "gate-lib:\n    ./tools/box.sh 'cargo test -p g --lib'\n"
+        "gate-doc:\n    ./tools/box.sh 'cargo test -p g --doc'\n"
+        "gate-h:\n    ./tools/box.sh 'cargo test -p h --lib'\n"
+        "gate-levers:\n    ./tools/box.sh 'cargo test -p levers --lib'\n"
+    )
+    registry = "crates/levers/src/registry.rs"
+    h_cases: dict[str, tuple[str, str, str | None]] = {  # module -> (base, head, the line printed for it; None: a gate reads it)
+        "line": ("fn f() {}\n// a\n", "fn f() {}\n// b\n", COMMENT_ONLY),
+        "outer_doc": ("/// a\nfn f() {}\n", "/// b\nfn f() {}\n", COMMENT_ONLY),
+        "inner_doc": ("//! a\nfn f() {}\n", "//! b\nfn f() {}\n", COMMENT_ONLY),
+        "block": ("fn f() {} /* a */\n", "fn f() {} /* b */\n", COMMENT_ONLY),
+        "block_doc": ("/** a */\nfn f() {}\n", "/** b */\nfn f() {}\n", COMMENT_ONLY),
+        "inner_block_doc": ("/*! a */\nfn f() {}\n", "/*! b */\nfn f() {}\n", COMMENT_ONLY),
+        "nested": ("fn f() {} /* a /* b */ c */\n", "fn f() {} /* a /* b */ d */\n", COMMENT_ONLY),
+        "added": ("fn f() {}\n", "// new\nfn f() {}\n", COMMENT_ONLY),
+        "lifetime_char": ("fn f<'a>(x: u8, y: &'a str) -> char { '/' } // c\n", "fn f<'a>(x: u8, y: &'a str) -> char { '/' } // d\n", COMMENT_ONLY),
+        "lifetime_span": ("fn f<'a>(x: u8 /* c */, y: &'a str) {}\n", "fn f<'a>(x: u8 /* d */, y: &'a str) {}\n", COMMENT_ONLY),
+        "char_quote": ("const C: char = '\"'; // a\n", "const C: char = '\"'; // b\n", COMMENT_ONLY),
+        "layout": ("fn f(a: u8,b: u8) -> u8 { a+b }\n", "fn f(\n    a: u8,\n    b: u8\n) -> u8 {\n    a + b\n}\n", LAYOUT_ONLY),
+        "string": ('const S: &str = "// not a comment";\n', 'const S: &str = "// not a comment either";\n', None),
+        "raw_star": ('const S: &str = r#"/* a */"#;\n', 'const S: &str = r#"/* b */"#;\n', None),
+        "raw_hash": ('const S: &str = r##"a "# /* x */"##;\n', 'const S: &str = r##"a "# /* y */"##;\n', None),
+        "bytes": ('const S: &[u8] = b"// a";\n', 'const S: &[u8] = b"// b";\n', None),
+        "string_layout": ('const S: &str = "a\nb";\n', 'const S: &str = "a\n b";\n', None),
+        "lifetime_code": ("fn f<'a>(x: u8, y: &'a str) {}\n", "fn f<'a>(x: u16, y: &'a str) {}\n", None),
+        "code": ("fn f() {}\n", "fn g() {}\n", None),
+        "unterminated": ("fn f() {}\n", "fn f() {}\n/* never ends\n", None),
+    }
+    g_lib = (
+        "mod doc_lib;\nmod plain_g;\nmod inc;\n"
+        'const SELF_TEXT: &str = include_str!("inc.rs");\nconst BYTES: &[u8] = include_bytes!("bytes_src.rs");\n'
+        'include!("items.rs");\n'
+        'const TAIL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tail.rs"));\n'
+        '// const GONE: &str = include_str!("gone.rs");\n'
+    )
+    # file -> (base, head, the line printed for it, a word of the note when the rule leaves it whole, the recipes that then read it)
+    g_cases: dict[str, tuple[str, str, str | None, str, set[str]]] = {
+        "doc_lib": ("/// a\npub fn f() {}\n", "/// b\npub fn f() {}\n", None, "doctests gate-doc runs", {"gate-lib", "gate-doc"}),
+        "plain_g": ("// a\nfn f() {}\n", "// b\nfn f() {}\n", COMMENT_ONLY, "", set()),
+        "bin/gb": ("/// a\nfn main() {}\n", "/// b\nfn main() {}\n", COMMENT_ONLY, "", set()),
+        "inc": ("// a\nfn x() {}\n", "// b\nfn x() {}\n", None, "crates/g/src/lib.rs reads its text", {"gate-lib", "gate-doc"}),
+        "bytes_src": ("// a\n", "// b\n", None, "crates/g/src/lib.rs reads its text", set()),
+        "items": ("fn it() {}\n// a\n", "fn it() {}\n// b\n", None, "crates/g/src/lib.rs reads its text", set()),
+        "tail": ("// a\n", "// b\n", None, "crates/g/src/lib.rs reads its text", set()),
+        "gone": ("// a\n", "// b\n", COMMENT_ONLY, "", set()),
+    }
+    with tempfile.TemporaryDirectory(prefix="recipes-comments-") as tmp:
+        made: list[str] = []
+
+        def build(head: bool, h_deps: tuple[str, ...] = ()) -> Side:
+            root = os.path.join(tmp, f"t{len(made)}")
+            made.append(root)
+            i = 1 if head else 0
+            files = {
+                "crates/g/Cargo.toml": "", "crates/h/Cargo.toml": "", "crates/levers/Cargo.toml": "", "justfile": just, "tools/gate.sh": "",
+                "crates/levers/src/lib.rs": "mod registry;\n", registry: f"// {i}\nfn r() {{}}\n",
+                "crates/g/src/lib.rs": g_lib, "crates/g/src/bin/gb.rs": g_cases["bin/gb"][i],
+                "crates/h/src/lib.rs": "".join(f"mod {m};\n" for m in h_cases) + "mod same;\n" + ("mod added2;\n" if head else "mod removed2;\n"),
+                "crates/h/src/same.rs": "fn s() {}\n",
+                "crates/h/README.md": f"{i}\n",
+                "fuzz/src/lib.rs": f"// {i}\n",
+                ("crates/h/src/added2.rs" if head else "crates/h/src/removed2.rs"): "fn x() {}\n",
+            }
+            files.update({f"crates/h/src/{m}.rs": c[i] for m, c in h_cases.items()})
+            files.update({f"crates/g/src/{m}.rs": c[i] for m, c in g_cases.items() if m != "bin/gb"})
+            for f in BOX_GLOBALS + [f"tools/ref/models/{DEFAULT_PROFILE}.sh"]:
+                files[f] = ""
+            for rel, text in files.items():
+                os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+
+            def pkg(name: str, src: str, kind: str, deps: tuple[str, ...] = ()) -> dict:
+                return {"id": name, "name": name, "manifest_path": os.path.join(root, f"crates/{name}/Cargo.toml"), "features": {},
+                        "dependencies": [{"name": d, "kind": None, "optional": False, "features": [], "uses_default_features": True} for d in deps],
+                        "targets": [{"kind": [kind], "name": name, "src_path": os.path.join(root, f"crates/{name}/src/{src}")}]
+                        + ([{"kind": ["bin"], "name": "gb", "src_path": os.path.join(root, "crates/g/src/bin/gb.rs")}] if name == "g" else [])}
+
+            meta = {"workspace_root": root, "workspace_members": ["g", "h", "levers"],
+                    "packages": [pkg("g", "lib.rs", "lib"), pkg("h", "lib.rs", "lib", h_deps), pkg("levers", "lib.rs", "lib")]}
+            return side_at(root, meta)
+
+        a, b = build(False), build(True)
+        clap_a, clap_b = build(False, ("clap",)), build(True, ("clap",))
+        everything = [f"crates/h/src/{m}.rs" for m in h_cases] + [f"crates/g/src/{m}.rs" for m in g_cases] + [
+            "crates/h/src/same.rs", "crates/h/src/added2.rs", "crates/h/src/removed2.rs", "crates/h/README.md", "fuzz/src/lib.rs", registry]
+
+        def cases(expect) -> None:
+            reads = CommentReads(everything, a, b)
+            for m, (_, _, want) in h_cases.items():
+                f = f"crates/h/src/{m}.rs"
+                expect(reads.only.get(f) == want, f"comment-only: h/{m} reads {reads.only.get(f)!r}, not {want!r}")
+                sels, unmapped, _ = select([f], a, b, GATE_PREFIX, TableReads([f], a, b))
+                if want is None:
+                    expect([x.recipe for x in sels] == ["gate-h"], f"comment-only: h/{m} selects {[x.recipe for x in sels]}, not gate-h")
+                else:
+                    expect(not sels and any(u.startswith(f) and want in u for u in unmapped), f"comment-only: h/{m} selects {[x.recipe for x in sels]}, unmapped {unmapped}")
+            for m, (_, _, want, word, readers) in g_cases.items():
+                f = f"crates/g/src/{m}.rs"
+                expect(reads.only.get(f) == want, f"comment-only: g/{m} reads {reads.only.get(f)!r}, not {want!r}")
+                note = next((n for n in reads.notes if n.startswith(f + ":")), "")
+                expect((word in note) if want is None else not note, f"comment-only: g/{m} note {note!r}, want {word!r}")
+                sels, _, _ = select([f], a, b, GATE_PREFIX, TableReads([f], a, b))
+                if want is None and readers:
+                    expect({x.recipe for x in sels} == readers, f"comment-only: g/{m} selects {sorted(x.recipe for x in sels)}, not {sorted(readers)}")
+                if want is not None:
+                    expect(not sels, f"comment-only: g/{m} selects {[x.recipe for x in sels]}")
+            for f in ("crates/h/src/same.rs", "crates/h/src/added2.rs", "crates/h/src/removed2.rs", "crates/h/README.md", "fuzz/src/lib.rs"):
+                expect(f not in reads.only and not any(n.startswith(f + ":") for n in reads.notes), f"comment-only: {f} (equal, added, removed, not Rust, no crate) was read as comment-only")
+            expect(registry not in reads.only and any(n.startswith(registry + ":") and "lever registry" in n for n in reads.notes),
+                   f"comment-only: a comment moved in the lever registry reads {reads.only.get(registry)!r}, notes {reads.notes}")
+            off = CommentReads(everything, a, b, False)
+            expect(not off.only and not off.notes, f"comment-only: the rule off still reads {sorted(off.only)}")
+            # a crate whose derive reads doc comments: a doc comment moved in any crate is no neutral edit, a plain comment still is
+            clap = CommentReads(["crates/h/src/outer_doc.rs", "crates/h/src/line.rs"], clap_a, clap_b)
+            expect("crates/h/src/outer_doc.rs" not in clap.only and "crates/h/src/line.rs" in clap.only
+                   and any("depends on clap" in n for n in clap.notes), f"comment-only: a doc reader in the workspace: {clap.only}, {clap.notes}")
+
+        cases(expect)
+        # --narrow: a comment-only file picks nothing and prints its line; beside a code edit only the code edit's gates stay
+        log = os.path.join(tmp, "scan.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(["ptx-scan: mod1 bundle=bloomery-gpu bytes=100",
+                                "ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 modules=1 "
+                                "jit-card=NVIDIA_RTX_A6000 jit-cc=8.6 jit-cuda=13.4",
+                                "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill blk/SM(static) jit_regs jit_local",
+                                f"{'alpha':<24} 256 no 0 0 0 0 12 0 0 6 12 0", "ptx-scan-md5: method=decl1", f"alpha {'1' * 32} 41"]) + "\n")
+        pair = (read_scan(log), read_scan(log))
+        quiet_f, code_f = "crates/h/src/line.rs", "crates/h/src/code.rs"
+        nar = narrow([quiet_f], a, b, [pair], [])
+        expect(not nar.full and not nar.picks and nar.files == [f"{quiet_f}: {COMMENT_ONLY}"], f"comment-only: --narrow on a comment-only file: full {nar.full}, picks {nar.picks}, files {nar.files}")
+        nar = narrow([quiet_f, code_f], a, b, [pair], [])
+        expect(not nar.full and set(nar.picks) == {"gate-h"} and nar.files[0] == f"{quiet_f}: {COMMENT_ONLY}" and not nar.files[1].endswith(COMMENT_ONLY),
+               f"comment-only: --narrow beside a code edit: full {nar.full}, picks {sorted(nar.picks)}, files {nar.files}")
+        nar = narrow([quiet_f], a, b, [pair], [], TableReads([quiet_f], a, b, False))
+        expect(set(nar.picks) == {"gate-h"}, f"comment-only: --narrow with the rule off picks {sorted(nar.picks)}, not gate-h")
+
+        # every case against a mutant of the rule: the cases must go red
+        g = globals()
+        real_stream = _rs_stream
+
+        def string_blind(text: str) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[int, str], ...]]:
+            """A lexer that reads a comment wherever `//` or `/*` appears, strings included, and does not nest."""
+            toks: list[tuple[str, str]] = []
+            comments: list[tuple[int, str]] = []
+            pos = 0
+            for m in re.finditer(r"//[^\n]*|/\*.*?\*/", text, re.S):
+                toks += [("p", w) for w in text[pos:m.start()].split()]
+                comments.append((len(toks), m.group()))
+                pos = m.end()
+            toks += [("p", w) for w in text[pos:].split()]
+            return tuple(toks), tuple(comments)
+
+        greedy_char = re.compile(_RS_TOKEN.pattern.replace(r"(?P<chr>b?'(?:\\.[^']*|[^\\'])')", r"(?P<chr>b?'[^']*')"), re.S)
+        mutants: list[tuple[str, list[tuple[dict, str, object]]]] = [
+            ("the rule stubbed out", [(g, "comment_diff", lambda x, y: None)]),
+            ("strings ignored, comments not nested", [(g, "_rs_stream", string_blind)]),
+            ("a char literal that eats a lifetime", [(g, "_RS_TOKEN", greedy_char)]),
+            ("includes not read", [(CommentReads, "_include_targets", lambda self: ({}, []))]),
+            ("doctests not read", [(CommentReads, "_doctest_runs", lambda self: {})]),
+            ("doc comments not told from the others", [(g, "_is_doc_comment", lambda c: False)]),
+            ("doc readers not read", [(g, "DOC_READER_CRATES", frozenset())]),
+            ("the lever registry not refused", [(g, "LEVER_REGISTRY", "crates/levers/src/other.rs")]),
+        ]
+        def put(o: object, k: str, v: object) -> None:
+            if isinstance(o, dict):
+                o[k] = v
+            else:
+                setattr(o, k, v)
+
+        for name, patches in mutants:
+            saved = [(o, k, o[k] if isinstance(o, dict) else getattr(o, k)) for o, k, _ in patches]
+            for o, k, v in patches:
+                put(o, k, v)
+            real_stream.cache_clear()
+            red: list[str] = []
+            try:
+                cases(lambda ok, what: None if ok else red.append(what))
+            finally:
+                for o, k, v in saved:
+                    put(o, k, v)
+                real_stream.cache_clear()
+            expect(bool(red), f"comment-only: the cases stayed green against a mutant ({name})")
 
 
 def key_detectors_self_test(expect, real: Side) -> None:
@@ -15380,6 +15761,7 @@ def self_test(serial: bool = False) -> int:
         oxide_rev_self_test(expect)
         expand_self_test(expect)
         opens_self_test(expect)  # opens: the targets that reach the fixture fence
+        comment_only_self_test(expect)  # a Rust file whose diff is comments or layout selects no gate
 
     def narrow(f: list[str]) -> None:
         expect = _expecting(f)
@@ -15436,6 +15818,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--narrow", action="store_true", help=f"the gates that run the changed host path, when every --scan pair is identical or added (the rule and {GATE_PATHS}: the section above narrow())")
     a.add_argument("--scan", nargs=2, action="append", metavar=("BASE_LOG", "NEW_LOG"), help="a pair of `just ptx-scan <bin>` logs, the base tree's and the change's (repeatable)")
     a.add_argument("--no-class", dest="class_stage", action="store_false", help="turn the class stage off: keep every gate the graph reaches (by default a family gate stays only when the change can have moved it, by the class tables)")
+    a.add_argument("--no-comment-only", dest="comment_only", action="store_false", help="turn the comment-only rule off: a Rust file whose diff is comments or layout selects the gates that read it like any changed file (by default it selects none)")
     ss = sub.add_parser("scan-set", help="the bins whose ptx-scans cover every kernel carrier, one line each: bin<TAB>features<TAB>the carriers it covers (tools/narrow-scan.sh scans them)")
     ss.add_argument("rev", nargs="?", help="the commit to read (a git archive of it); default the working tree")
     ss.add_argument("--ship", action="store_true", help=f"the shipped bins at the release features (tools/release/build.sh) are the first picks; {SCAN_SHIP_ENV}=1 does the same")
