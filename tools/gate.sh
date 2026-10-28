@@ -19,7 +19,12 @@
 # executable, arguments, package cwd and runtime environment; a private JSON capture retains them.
 # Replay enters gpu-gate.sh in that context, so the common runner applies card selection last and
 # alone owns the runtime bound (lock waits are outside it). No second Cargo call runs under the lock.
-# Explicit --target and doctests are refused. Other calls keep their existing cargo-test path.
+# The Cargo call passes no --target: it is the host build every other oxide recipe makes, so `bloomery-gpu` and the
+# rest of the dependency cone are one set of compiled units for all of them (a --target build keys every unit apart,
+# and the whole cone compiles again). The host triple's runner comes from --config, which outranks every other config
+# source. Doctests, an explicit --target and a cross triple from CARGO_BUILD_TARGET, `--config build.target=` or a
+# `[build] target` are refused with 64: a cross triple takes its own runner, or none, and would run the test before
+# the card lock. Other calls keep their existing cargo-test path.
 # The self-test's leading --test-locks DIR forwards gpu-gate.sh's existing isolated-lock fixture.
 #
 # A third failure it closes: a filter that matches nothing. libtest passes a run of 0 tests, so a
@@ -150,9 +155,65 @@ host, runner = sys.argv[1:]
 print("target." + json.dumps(host) + ".runner=" + json.dumps(runner))
 PY
   ) || exit $?
-  # Explicit native target and highest-priority CLI runner config prevent a configured cross
-  # target or runner from executing a test before the card lock is taken.
-  run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} --target "$HOST" --config "$RUNNER_CONFIG" -- ${ARGS[@]+"${ARGS[@]}"}
+  # Without --target cargo builds for the triple the call, the environment or a config names. One other than the host
+  # runs the test through its own runner, or none, before the card lock: refused by name, from the source cargo
+  # reads first (--config, CARGO_BUILD_TARGET, then the config files from the working directory up to $CARGO_HOME).
+  python3 - "$HOST" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} <<'PY' || exit $?
+import os
+import sys
+import tomllib
+from pathlib import Path
+
+host, *args = sys.argv[1:]
+
+
+def configured():
+    for i, arg in enumerate(args):
+        if arg.startswith("--config="):
+            setting = arg[len("--config="):]
+        elif arg == "--config" and i + 1 < len(args):
+            setting = args[i + 1]
+        else:
+            continue
+        key, _, value = setting.partition("=")
+        if key.strip() == "build.target":
+            try:
+                value = tomllib.loads("v = " + value)["v"]
+            except tomllib.TOMLDecodeError:
+                value = value.strip()
+            return "--config build.target", value
+    if os.environ.get("CARGO_BUILD_TARGET"):
+        return "CARGO_BUILD_TARGET", os.environ["CARGO_BUILD_TARGET"]
+    here = Path.cwd()
+    for directory in [d / ".cargo" for d in (here, *here.parents)] + [Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")]:
+        for name in ("config.toml", "config"):
+            path = directory / name
+            if not path.is_file():
+                continue
+            try:
+                with path.open("rb") as stream:
+                    build = tomllib.load(stream).get("build", {})
+            except (OSError, tomllib.TOMLDecodeError) as err:
+                print(f"gate.sh --gpu: cannot read {path}: {err}", file=sys.stderr)
+                sys.exit(64)
+            if "target" in build:
+                return f"[build] target of {path}", build["target"]
+            break
+    return None
+
+
+found = configured()
+if found:
+    where, value = found
+    for triple in value if isinstance(value, list) else [value]:
+        if triple != host:
+            print(f"gate.sh --gpu: {where} names the target {triple}, not the host {host}: its runner, or none, would run the "
+                  "test before the card lock; unset it", file=sys.stderr)
+            sys.exit(64)
+PY
+  # The CLI runner config for the host triple outranks a runner from the environment or a config file: cargo's call
+  # only records the test, and the replay below takes the card lock.
+  run_bounded timeout --kill-after=10 "$BOUND" "${RUN[@]}" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} --config "$RUNNER_CONFIG" -- ${ARGS[@]+"${ARGS[@]}"}
   rc=$?
   [ "$rc" = 0 ] || exit "$rc"
   [ -z "$BIN_SIGNAL" ] || exit 143

@@ -183,9 +183,11 @@ target runner: compilation never executes the test. Cargo owns the executable,
 arguments, package working directory and runtime environment (including native
 library paths); a private temporary capture retains that context and is removed
 on exit. Zero or multiple captured tests are refused with 64. Explicit `--target`
-and doctests are refused; the runner forces the compiler's native target and its
-capture runner rather than allowing a configured cross target or runner to execute
-tests before locking. A preconfigured scalar or environment runner is overridden;
+and doctests are refused. The call passes no `--target`, so the build shares the
+host build's dependency cone. A cross triple from `CARGO_BUILD_TARGET`,
+`--config build.target=` or a `[build] target` is refused with 64, because its own
+runner would execute the test before the lock. The capture runner is a CLI
+`--config` for the host triple. A preconfigured scalar or environment runner is overridden;
 an array-valued runner conflicts with the scalar override and Cargo refuses it
 before either runner executes. Compiler output remains visible, including
 cargo-oxide's non-JSON banners.

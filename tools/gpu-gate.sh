@@ -452,7 +452,7 @@ PY
   }
   local gate_args=()
   local gate_env=(env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES
-    -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S
+    -u BLOOMERY_TIER -u CARGO_BUILD_TARGET -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S
     -u GATE_TEST_PACE -u GATE_TIMEOUT_PID -u STUB_ORDER -u STUB_ID -u STUB_COMPUTE_UUID -u STUB_COMPUTE_RC PATH="$t/bin:$PATH")
   # gate <out file> <BLOOMERY_GATE_CARD> <lease file> [K=V…]: one run of the runner, its rc (TL=<dir>: the dir its locks and its
   # batch hold live in, default the test's own; GB=<s>: its own bound, default the failsafe $fs s, and for a run that takes
@@ -1655,6 +1655,8 @@ exe = os.environ.get("LIB_EXE", os.path.abspath("target/release/lib-test"))
 package = os.path.abspath("package")
 context = dict(os.environ, CARGO_MANIFEST_DIR=package)
 context["LD_LIBRARY_PATH"] = package + "/native" + (":" + context["LD_LIBRARY_PATH"] if context.get("LD_LIBRARY_PATH") else "")
+if os.environ.get("LIB_ARGV"):
+    Path(os.environ["LIB_ARGV"]).write_text("".join(arg + "\n" for arg in sys.argv[1:]), encoding="utf-8")
 print("compiler output before capture", flush=True)
 if os.environ.get("LIB_COMPILED"):
     Path(os.environ["LIB_COMPILED"]).write_text("compiled\n", encoding="utf-8")
@@ -1664,8 +1666,10 @@ if code:
 if "--config" not in args:
     os.chdir(package)
     os.execve(exe, [exe, *test_args], context)
-config = tomllib.loads(args[args.index("--config") + 1])
-target = args[args.index("--target") + 1]
+# Cargo merges every --config; the runner is the one that sets target.<triple>.runner.
+config = next(c for c in (tomllib.loads(args[i + 1]) for i, arg in enumerate(args) if arg == "--config") if "target" in c)
+# Cargo looks the runner up under the triple it builds for: --target's, else the host's.
+target = args[args.index("--target") + 1] if "--target" in args else os.environ.get("LIB_HOST", "x86_64-unknown-linux-gnu")
 runner = [config["target"][target]["runner"]]
 for _ in range(int(os.environ.get("LIB_CAPTURES", "1"))):
     subprocess.run([*runner, exe, *test_args], cwd=package, env=context, check=True)
@@ -1708,14 +1712,15 @@ print("test result: ok. " + os.environ.get("LIB_PASSED", "1") + " passed; 0 fail
 sys.exit(int(os.environ.get("LIB_EXIT", "0")))
 PY
   chmod +x "$t/bin/cargo" "$t/bin/rustc" "$t/tree/target/release/lib-test"
+  local lib_build=() # extra words of the cargo call, between --release and --lib
   lib_gate() {
     local o=$1 c=$2
     shift 2
     (cd "$t/tree" && timeout --kill-after=10 "$((cap + 30))" "${gate_env[@]}" \
       BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$t/lease" BLOOMERY_LEASE_PROC="$t/proc" \
-      LIB_COMPILED="$t/compiled" LIB_STARTED="$t/started" RUSTC="$t/bin/rustc" "$@" \
+      LIB_COMPILED="$t/compiled" LIB_STARTED="$t/started" RUSTC="$t/bin/rustc" CARGO_HOME="$t/cargo-home" "$@" \
       bash -c 'echo "$$" > "$1"; shift; exec bash "$@"' _ "$t/lib-runner" \
-      "${self%/*}/gate.sh" --test-locks "${TL:-$t}" --gpu --oxide -p bloomery-gpu --release --lib -- --include-ignored "${LIB_FILTER:-probe}") > "$o" 2>&1
+      "${self%/*}/gate.sh" --test-locks "${TL:-$t}" --gpu --oxide -p bloomery-gpu --release ${lib_build[@]+"${lib_build[@]}"} --lib -- --include-ignored "${LIB_FILTER:-probe}") > "$o" 2>&1
   }
   # Ordinary binary holds the card: compilation completes, but libtest never starts.
   fifos
@@ -1782,6 +1787,46 @@ PY
         judge 'compile failure or refused input starts no test child' "$rc" "${row##*:}" '^child-not-started$' ;;
     esac
   done
+  # The build is the host build every other oxide recipe makes: no --target (it would key the whole dependency cone apart from
+  # theirs). A cross triple that cargo would still take from the call, the environment or a config is refused by name before cargo runs.
+  rm -f "$t/argv"
+  rc=0
+  lib_gate "$t/out" 3090 LIB_ARGV="$t/argv" || rc=$?
+  { [ -f "$t/argv" ] && sed 's/^/cargo-arg /' "$t/argv"; } >> "$t/out" || echo no-cargo-call >> "$t/out"
+  judge_all 'lib path builds for the host: the cargo call passes no --target' "$rc" 0 '^cargo-arg --config$' '!^cargo-arg --target' '!^no-cargo-call$'
+  local NOTARGET="names the target aarch64-unknown-linux-gnu, not the host x86_64-unknown-linux-gnu"
+  mkdir -p "$t/tree/.cargo"
+  printf '%s\n' '[build]' 'target = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]' > "$t/tree/.cargo/config.toml"
+  for refusal in "build-config-file:\\[build\\] target of .*/\\.cargo/config\\.toml $NOTARGET" "CARGO_BUILD_TARGET:CARGO_BUILD_TARGET $NOTARGET" \
+      "config-flag:--config build\\.target $NOTARGET" "config-flag-pair:--config build\\.target $NOTARGET"; do
+    rm -f "$t/compiled" "$t/started"
+    lib_build=()
+    rc=0
+    case "${refusal%%:*}" in
+      build-config-file) lib_gate "$t/out" 3090 || rc=$? ;;
+      CARGO_BUILD_TARGET) lib_gate "$t/out" 3090 CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu || rc=$? ;;
+      config-flag) lib_build=(--config=build.target=aarch64-unknown-linux-gnu); lib_gate "$t/out" 3090 || rc=$? ;;
+      config-flag-pair) lib_build=(--config 'build.target=["aarch64-unknown-linux-gnu"]'); lib_gate "$t/out" 3090 || rc=$? ;;
+    esac
+    [ ! -e "$t/compiled" ] && echo cargo-not-run >> "$t/out"
+    [ ! -e "$t/started" ] && echo child-not-started >> "$t/out"
+    judge_all "lib path refuses a cross target from ${refusal%%:*}" "$rc" 64 "${refusal#*:}" '^cargo-not-run$' '^child-not-started$'
+  done
+  lib_build=()
+  # The same triple as the host is no cross target; cargo's own order (--config, the environment, the nearest config file) decides which source counts.
+  rc=0
+  lib_gate "$t/out" 3090 CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu || rc=$?
+  judge 'lib path accepts the host triple as CARGO_BUILD_TARGET' "$rc" 0 '^lib-card='
+  printf '%s\n' '[build]' 'target = "aarch64-unknown-linux-gnu"' > "$t/tree/.cargo/config.toml"
+  rc=0
+  lib_gate "$t/out" 3090 CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu || rc=$?
+  judge 'lib path: the environment outranks a cross [build] target' "$rc" 0 '^lib-card='
+  lib_build=(--config 'build.target="x86_64-unknown-linux-gnu"')
+  rc=0
+  lib_gate "$t/out" 3090 || rc=$?
+  lib_build=()
+  judge 'lib path: --config outranks a cross [build] target' "$rc" 0 '^lib-card='
+  rm -rf "$t/tree/.cargo"
   mkdir -p "$t/lib-unopenable/gate.lock"
   rc=0
   TL="$t/lib-unopenable" lib_gate "$t/out" 3090 || rc=$?
